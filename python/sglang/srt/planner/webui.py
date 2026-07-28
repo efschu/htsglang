@@ -47,6 +47,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
+# #272 -- the key solver's payload functions live in their own module; this
+# file only routes to them. Imported at module level (not lazily like the
+# heavy planner modules) because solver_api itself defers its own imports.
+from sglang.srt.planner.solver_api import (
+    key_solver_aggregate_payload,
+    key_solver_model_payload,
+    key_solver_payload,
+)
+
 __all__ = [
     "discover_knobs",
     "detect_hardware",
@@ -75,6 +84,9 @@ __all__ = [
     "bench_probe_payload",
     "bench_run_events",
     "bench_factors_payload",
+    "key_solver_payload",
+    "key_solver_aggregate_payload",
+    "key_solver_model_payload",
     "split_probe_start_payload",
     "split_probe_status_payload",
     "scenario_suggest_payload",
@@ -4521,6 +4533,20 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/bench_factors"):
                 self._json(200, bench_factors_payload(payload))
                 return
+            # #272 key solver. The two LONG paths must be tested before the
+            # short one: this chain matches on prefixes, so a leading
+            # "/api/key_solver" would swallow both "/model" and "/aggregate".
+            # All three payloads are pure reads (card probe, split-probe store,
+            # config.json) -- nothing boots, allocates or measures.
+            if self.path.startswith("/api/key_solver/model"):
+                self._json(200, key_solver_model_payload(payload))
+                return
+            if self.path.startswith("/api/key_solver/aggregate"):
+                self._json(200, key_solver_aggregate_payload(payload))
+                return
+            if self.path.startswith("/api/key_solver"):
+                self._json(200, key_solver_payload(payload))
+                return
             # #270 wizard. /api/wizard/families and /api/wizard/command are
             # distinct prefixes; neither is a prefix of the other, so the
             # order between them does not matter.
@@ -4871,6 +4897,13 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   /* Simple mode's one-line occupancy for a card: the same numbers the
      itemised legend adds up to, without the per-segment breakdown. */
   .segsum { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
+  /* #15: live link throughput per card, each against its own ceiling. */
+  .linkpart { display: inline-flex; align-items: center; gap: 4px;
+              margin-right: var(--s3); }
+  .linkbar { display: inline-block; width: 46px; height: 6px;
+             background: var(--bg-input); border: 1px solid var(--bd-weak);
+             border-radius: 2px; overflow: hidden; vertical-align: middle; }
+  .linkbar i { display: block; height: 100%; background: var(--accent); }
   .segbar { display: flex; height: 14px; border-radius: 2px; overflow: hidden;
             background: var(--bg-input); border: 1px solid var(--bd-weak);
             margin: var(--s1) 0; }
@@ -5010,14 +5043,14 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   /* ---- simple / expert -----------------------------------------------------
      Two densities of the same page, not two different pages. Expert ADDS
      dimensions; it never changes what a control shared by both means. */
-  .vmode { display: flex; border: 1px solid var(--bd-medium);
-           border-radius: var(--radius); overflow: hidden; flex: none; }
-  .vmode .vm { background: var(--bg-elevated); color: var(--fg-muted);
-               border: 0; border-radius: 0; padding: 5px 14px; font: inherit;
-               font-size: var(--t-sm); cursor: pointer; }
-  .vmode .vm.on { background: var(--accent); color: #fff; }
-  .vmode .vm:not(.on):hover { color: var(--fg-strong);
-                              background: var(--selected); filter: none; }
+  /* One opt-in checkbox. A two-way simple/expert pick made the user classify
+     themselves before seeing anything; an unticked box asks nothing. */
+  .vmode { flex: none; }
+  .vmode label { display: flex; align-items: center; gap: var(--s2);
+                 color: var(--fg-muted); font-size: var(--t-sm);
+                 cursor: pointer; white-space: nowrap; }
+  .vmode label:hover { color: var(--fg-strong); }
+  .vmode input[type=checkbox] { width: auto; margin: 0; cursor: pointer; }
   /* Visibility is driven by one class on <body>, so no panel has to know
      which mode it is in and a mode switch touches no backend call. */
   body.mode-simple .expert-only { display: none !important; }
@@ -5252,14 +5285,17 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     <div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
       Every edit re-runs the same planner the server runs. No GPU touched.</div>
   </div>
-  <!-- Simple vs expert. Not a hiding place for broken controls: expert adds
-       dimensions, it never changes what a shared control means. The choice
-       persists, so the page opens the way it was left. -->
+  <!-- One opt-in checkbox, not a two-way "simple / expert" pick. Offering
+       "simple" as a thing to CHOOSE asks the user to classify themselves;
+       an unticked box asks nothing. Expert ADDS dimensions -- it never
+       changes what a shared control means, and it is not a hiding place for
+       broken controls. The choice persists, so the page opens as it was left. -->
   <div class="vmode" id="view_mode">
-    <button id="vm_simple" class="vm" onclick="setViewMode('simple')"
-            title="per-card VRAM as one number, one budget slider per card">simple</button>
-    <button id="vm_expert" class="vm" onclick="setViewMode('expert')"
-            title="the granular VRAM breakdown and every dimension the fork exposes">expert</button>
+    <label id="vm_expert_lbl"
+           title="show the granular VRAM breakdown and every dimension the fork exposes">
+      <input type="checkbox" id="vm_expert"
+             onchange="setViewMode(this.checked?'expert':'simple')">
+      expert view</label>
   </div>
 </div>
 
@@ -5893,15 +5929,28 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     auto-detected on the common local ports &mdash; hand-started servers are
     monitored exactly like managed ones. Charts keep a client-side 60s ring
     buffer; <b>nothing is persisted</b>.</div>
+  <!-- #13 -- the monitor target.
+       There used to be three buttons ("use", "auto", "detect") whose meaning
+       depended on whether the text box happened to be filled: "detect" with
+       text did what "use" did, "detect" without text did what "auto" did, and
+       a wrong address was applied silently, so a typo looked like the page
+       was broken. Two actions, two buttons, and the current mode is written
+       out rather than inferred. -->
   <fieldset>
     <legend>monitor target</legend>
     <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
-      <input id="land_endpoint" placeholder="host:port (blank = managed instance, else auto-detect)" style="max-width:22rem">
-      <button class="mini" onclick="setLandingEndpoint()">use</button>
-      <button class="mini secondary" onclick="clearLandingEndpoint()" title="clear the explicit endpoint; fall back to managed / auto-detect">auto</button>
-      <button class="mini secondary" onclick="detectLandingEndpoint()" title="empty box: sweep the local sglang ports (30000-30100, 8000, 8080). Box filled: verify that host:port.">detect</button>
-      <span id="land_target_note" class="muted">resolving&hellip;</span>
+      <input id="land_endpoint" placeholder="host:port of a running server"
+             style="max-width:22rem" onkeydown="if(event.key==='Enter')landingConnect()">
+      <button class="mini" onclick="landingConnect()"
+        title="check that address and monitor it from now on">Connect</button>
+      <button class="mini secondary" onclick="landingFindServer()"
+        title="sweep the local sglang ports (30000-30100, 8000, 8080) and connect to what is found">Find a server</button>
+      <button class="mini secondary" id="land_unpin" style="display:none"
+        onclick="clearLandingEndpoint()"
+        title="stop monitoring this fixed address; go back to the managed instance or whatever is found automatically">Unpin</button>
     </div>
+    <div id="land_mode" class="muted" style="margin-top:var(--s1)"></div>
+    <div id="land_target_note" class="muted">resolving&hellip;</div>
   </fieldset>
   <!-- Always present, in every state. Living inside the "a server is
        running" container is what let a warning outlive the server it was
@@ -6535,9 +6584,8 @@ function applyViewMode(){
   const m=viewMode();
   document.body.classList.toggle('mode-simple', m==='simple');
   document.body.classList.toggle('mode-expert', m==='expert');
-  for(const k of VIEW_MODES){
-    const b=$('vm_'+k); if(b) b.classList.toggle('on', k===m);
-  }
+  const cb=$('vm_expert');
+  if(cb) cb.checked=(m==='expert');
   // The mode decides which panels are worth computing, so a switch asks for
   // the sections the newly visible panels need.
   scheduleRecompute();
@@ -7808,7 +7856,51 @@ function cardLiveHtml(g){
     +sparkline(key+'_pow',80,18)
     +' &nbsp; SM '+g.sm_clock_mhz+'MHz &nbsp; '+g.temperature_c+'C'
     +' &nbsp; mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G live'
-    +'</div>';
+    +'</div>'
+    +linkLiveHtml(g);
+}
+// #15 -- what is crossing this card's links right now.
+//
+// PCIe is NVML's own ~20 ms sample, so it is a rate and not a counter we have
+// to difference. NVLink counters ARE totals, so the first poll can only store
+// them and a rate appears on the second -- that reads as "pending", never as
+// zero. A card with no NVLink says so instead of reporting 0 GB/s: "no link"
+// and "an idle link" are different facts.
+//
+// Every figure is shown against a ceiling. With a calibration run that is the
+// card's link capability; without one it is the highest value seen so far,
+// which is raised the moment a bigger sample arrives -- so the reading is
+// honest from the first poll and gets sharper as the rig is used.
+function _gbs(v){ return v==null?null:(v<0.01?v.toFixed(3):v.toFixed(2)); }
+function _linkPart(label, tx, rx, max, tip){
+  if(tx==null && rx==null) return '';
+  const sum=(tx||0)+(rx||0);
+  const pct=(max&&max>0)? Math.min(100, sum/max*100) : null;
+  return '<span class="linkpart" title="'+esc(tip||'')+'">'+label+' '
+    +'<b>'+(_gbs(tx)||'--')+'</b>&uarr;/<b>'+(_gbs(rx)||'--')+'</b>&darr; GB/s'
+    +(max? (' <span class="muted">of '+_gbs(max)+'</span>'):'')
+    +(pct!=null? ('<span class="linkbar"><i style="width:'+pct.toFixed(1)+'%"></i></span>'):'')
+    +'</span>';
+}
+function linkLiveHtml(g){
+  let h='';
+  h+=_linkPart('PCIe', g.pcie_tx_gbs, g.pcie_rx_gbs, g.pcie_max_gbs,
+    'Host<->card traffic over PCIe, NVML\'s own short-window sample. '
+    +(g.pcie_gen? ('Link trains to gen '+g.pcie_gen+' x'+g.pcie_width+'. '):'')
+    +'The ceiling is the link capability, or the highest value seen so far '
+    +'when nothing has been calibrated yet.');
+  if(g.nvlink_links>0){
+    h+=(h?' &nbsp; ':'')
+      +((g.nvlink_tx_gbs==null&&g.nvlink_rx_gbs==null)
+        ? '<span class="linkpart muted" title="NVLink counters are totals; a '
+          +'rate needs two samples, so the first poll has none yet.">NVLink '
+          +g.nvlink_links+' links &mdash; rate on the next poll</span>'
+        : _linkPart('NVLink', g.nvlink_tx_gbs, g.nvlink_rx_gbs, g.nvlink_max_gbs,
+            'Card<->card traffic over '+g.nvlink_links+' active NVLink(s).'));
+  }
+  if(!h) return '';
+  return '<div class="cardlive" style="margin:.15rem 0;font-size:.72rem">'
+    +h+'</div>';
 }
 // One card's fine-grained segment bar + legend. Segments come READY-MADE from
 // the placement JSON (id/label/mib/detail/replicated) -- the hover tooltip is
@@ -7828,7 +7920,17 @@ function segBarHtml(c, total, free){
     if(!(sg.mib>0)) continue;
     ((sg.mib/total*100) < 1 ? tiny : main).push(sg);
   }
-  let bar='<div class="segbar">';
+  // SIMPLE mode: one solid fill for everything this configuration occupies,
+  // and the rest of the card empty. No segment boundaries, no colour coding,
+  // nothing to decode -- "how full is this card" is the whole question at
+  // this density. The itemised version below is the expert answer.
+  const usedPct=Math.min(100, Math.max(0, c.total_mib/total*100));
+  let bar='<div class="segbar simple-only" title="'
+    +esc('used '+fmtMib(c.total_mib)+' of '+fmtMib(total)
+         +' · free '+fmtMib(free))+'">'
+    +'<span style="width:'+usedPct.toFixed(2)+'%;background:var(--accent)"></span>'
+    +'</div>';
+  bar+='<div class="segbar expert-only">';
   for(const sg of main){
     const pct=Math.min(100, sg.mib/total*100);
     bar+='<span '+(sg.replicated?'class="hatch" ':'')
@@ -8085,46 +8187,111 @@ function landingEndpoint(){
 function resetLandingRings(){
   window._ring={}; window._stripActive={}; window._stripHit=null;
 }
-function setLandingEndpoint(){
-  try{ localStorage.setItem('land_endpoint', $('land_endpoint').value.trim()); }catch(e){}
+// ---- #13: the monitor target, as two unambiguous actions ------------------
+//
+// The old trio was "use" / "auto" / "detect", and "detect" silently meant two
+// different things depending on whether the box had text in it: with text it
+// duplicated "use", without text it duplicated "auto". On top of that, "use"
+// applied whatever was typed without ever checking it, so a wrong address
+// produced no message at all and the monitor simply sat there -- which is the
+// "it rather doesn't work" part.
+//
+// Now: Connect always means "check what I typed and monitor it", Find a
+// server always means "sweep and connect to what you find", and Unpin appears
+// only when there is something pinned to remove. The mode is printed, not
+// inferred from an input's emptiness.
+
+// One place decides what the mode line and the Unpin button say, so the two
+// can never disagree about whether a target is pinned.
+function renderLandingMode(){
+  const pinned=landingEndpoint();
+  const btn=$('land_unpin'); if(btn) btn.style.display=pinned?'':'none';
+  const el=$('land_mode'); if(!el) return;
+  el.innerHTML = pinned
+    ? 'Pinned to <b>'+esc(pinned)+'</b> &mdash; only this address is monitored.'
+    : 'Automatic: the managed instance if there is one, otherwise a server '
+      +'found on the common local ports.';
+}
+function applyLandingEndpoint(ep){
+  try{
+    if(ep) localStorage.setItem('land_endpoint', ep);
+    else localStorage.removeItem('land_endpoint');
+  }catch(e){}
+  $('land_endpoint').value=ep||'';
+  renderLandingMode();
   resetLandingRings(); landingPoll();
 }
 function clearLandingEndpoint(){
-  try{ localStorage.removeItem('land_endpoint'); }catch(e){}
-  $('land_endpoint').value=''; resetLandingRings(); landingPoll();
+  applyLandingEndpoint('');
+  $('land_target_note').textContent='back to automatic.';
 }
-// 'detect' with something typed in the endpoint box VERIFIES that one target;
-// with the box empty it sweeps the local sglang port range. Same endpoint,
-// same button -- the input decides which of the two the user asked for.
-async function detectLandingEndpoint(){
+// Kept as the name the rest of the page already calls after a successful
+// probe; it now goes through the one apply path.
+function setLandingEndpoint(){
+  applyLandingEndpoint(($('land_endpoint').value||'').trim());
+}
+
+function _landNoMetricsNote(ep){
+  return '<span class="est">Connected to '+esc(ep)+', but it serves no '
+    +'/metrics &mdash; it was started without --enable-metrics, so token '
+    +'rates stay unavailable. Card telemetry still works.</span>';
+}
+
+// Connect: verify the typed address, then pin it. A refusal is REPORTED.
+async function landingConnect(){
   const typed=($('land_endpoint').value||'').trim();
-  $('land_target_note').textContent = typed
-    ? ('probing '+typed+'…') : 'sweeping the local sglang ports…';
+  if(!typed){
+    $('land_target_note').innerHTML='<span class="est">Type a host:port first, '
+      +'or use <b>Find a server</b>.</span>';
+    return;
+  }
+  $('land_target_note').textContent='checking '+typed+'…';
   try{
     const r=await fetch('/api/detect_endpoint',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(typed?{endpoint:typed}:{})});
+      body:JSON.stringify({endpoint:typed})});
     const d=await r.json();
     if(d.endpoint){
-      $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
-      setLandingEndpoint();
-      if(d.metrics===false)
-        $('land_target_note').innerHTML='<span class="est">found '
-          +esc(d.endpoint)+', but it serves no /metrics &mdash; started '
-          +'without --enable-metrics, so live rates stay unavailable.</span>';
-    } else if(d.explicit){
-      $('land_target_note').textContent=d.error||('no sglang server at '+typed);
+      applyLandingEndpoint(d.endpoint.replace(/^https?:\/\//,''));
+      $('land_target_note').innerHTML=(d.metrics===false)
+        ? _landNoMetricsNote(d.endpoint)
+        : 'Connected to <b>'+esc(d.endpoint)+'</b>.';
+    } else {
+      $('land_target_note').innerHTML='<span class="reasons">'
+        +esc(d.error||('No sglang server answered at '+typed+'.'))
+        +' Nothing was changed &mdash; the monitor is still '
+        +(landingEndpoint()?('pinned to '+esc(landingEndpoint())):'on automatic')
+        +'.</span>';
+    }
+  }catch(e){ $('land_target_note').textContent=''+e; }
+}
+
+// Find a server: always a sweep, whatever is in the box.
+async function landingFindServer(){
+  $('land_target_note').textContent='sweeping the local sglang ports…';
+  try{
+    const r=await fetch('/api/detect_endpoint',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d=await r.json();
+    if(d.endpoint){
+      applyLandingEndpoint(d.endpoint.replace(/^https?:\/\//,''));
+      $('land_target_note').innerHTML=(d.metrics===false)
+        ? _landNoMetricsNote(d.endpoint)
+        : 'Found and connected to <b>'+esc(d.endpoint)+'</b>.';
     } else {
       const pr=d.probed||[];
       const span=pr.length>4?(pr[0]+'-'+pr[pr.length-1]+' ('+pr.length+' ports)')
                             :pr.join(', ');
-      $('land_target_note').textContent='nothing reachable on '+span;
+      $('land_target_note').innerHTML='<span class="reasons">No sglang server '
+        +'answered on '+esc(span)+'. If it listens elsewhere, type the address '
+        +'and press Connect.</span>';
     }
   }catch(e){ $('land_target_note').textContent=''+e; }
 }
 async function startLanding(){
   if(window._landTimer) return;
   if(!$('land_endpoint').value) $('land_endpoint').value=landingEndpoint();
+  renderLandingMode();
   await landingPoll();
   window._landTimer=setInterval(landingPoll, LAND_POLL_MS);
 }
@@ -8505,9 +8672,10 @@ async function loadFlagCatalog(){
 // only puts it on the elements; it never composes a sentence of its own, so
 // there is exactly one place to edit when a control's cost changes.
 const STATIC_TIPS={
-  vm_simple:'view_mode.simple', vm_expert:'view_mode.expert',
-  tune_both:'tune.both', tune_maxkv:'tune.maxkv',
-  tune_dec:'tune.dec', tune_enc:'tune.enc',
+  // The tip lands on the LABEL: the checkbox itself is a 13px box and a
+  // tooltip anchored to it is nearly unhoverable. (vm_simple is gone with
+  // the two-way pick; applyStaticTips skips ids that are not on the page.)
+  vm_expert_lbl:'view_mode.expert',
   sv_ctx:'context_length', sv_ctx_slider:'context_length',
   row_sv_ctx:'context_length',
   max_running_requests:'max_running_requests', mrr_slider:'max_running_requests',

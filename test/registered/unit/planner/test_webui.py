@@ -1564,7 +1564,10 @@ class TestV3IndexMarkers(CustomTestCase):
         for token in (
             "view_bench", "/api/bench_probe", "/api/bench_run",
             "/api/share_preview", "/api/share_submit", "/api/detect_endpoint",
-            "land_endpoint", "detectLandingEndpoint", "segbar",
+            # #13: the monitor target's three ambiguous buttons became two
+            # explicit actions; detectLandingEndpoint split into Connect and
+            # Find a server.
+            "land_endpoint", "landingConnect", "landingFindServer", "segbar",
             "renderStartConfig", "normalizeStartConfig", "profile_env_box",
             "renderProfileLaunch", "never persisted, never logged",
         ):
@@ -2463,14 +2466,26 @@ class TestSimpleExpertViews(CustomTestCase):
 class TestTemplatesAreStartingPoints(CustomTestCase):
     """A template moves the starting point; it never fences a control in."""
 
-    def test_tuning_objectives_offered(self):
+    def test_tuning_objectives_are_no_longer_a_second_preset_bar(self):
+        """#7: the objective BUTTONS are gone; the objective itself is not.
+
+        They were the second of two prefabricated starting points sitting in
+        one panel. applyTune stays -- it is how the working-point stops write
+        --rank-perf-tune -- and the flag keeps its own row in the flag
+        surface, so nothing about the knob changed except that it stopped
+        looking like a preset mechanism.
+        """
         html = webui.INDEX_HTML
         for key in ("tune_both", "tune_maxkv", "tune_dec", "tune_enc"):
-            self.assertIn(key, html, key)
-        # the four map onto the fork's own --rank-perf-tune enum
+            self.assertNotIn('id="%s"' % key, html, key)
+        self.assertIn("function applyTune(", html)
+        # the four still map onto the fork's own --rank-perf-tune enum
         from sglang.srt.planner import flags as flagsmod
         allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
         self.assertEqual(allowed, {"both", "dec", "enc", "maxkv"})
+        self.assertEqual(set(_index_script().split("const TUNE_LABELS={")[1]
+                             .split("}")[0].replace("'", "").split(","))
+                         .__len__(), 4)
 
     def test_concurrency_slider_is_not_capped_at_a_constant(self):
         js = _index_script()
@@ -3565,6 +3580,171 @@ class TestReferencePngIsDerived(CustomTestCase):
             ):
                 data = webui._reference_png_bytes()
         self.assertEqual(data, b"\x89PNG\r\n\x1a\n" + b"pinned")
+
+
+class TestMonitorTargetControls(CustomTestCase):
+    """#13: two actions with fixed meanings, not three that swap roles.
+
+    "detect" used to do what "use" did when the box had text and what "auto"
+    did when it did not, and "use" applied an address without ever checking
+    it, so a typo produced no message at all.
+    """
+
+    def test_two_actions_and_an_unpin(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function landingConnect(", html)
+        self.assertIn("function landingFindServer(", html)
+        self.assertIn('id="land_unpin"', html)
+        self.assertNotIn("function detectLandingEndpoint(", html)
+        self.assertNotIn(">use<", html)
+
+    def test_connect_reports_a_refusal_instead_of_applying_it(self):
+        html = webui.INDEX_HTML
+        connect = html.split("async function landingConnect(")[1][:1400]
+        # it probes before it pins
+        self.assertIn("/api/detect_endpoint", connect)
+        self.assertIn("Nothing was changed", connect)
+
+    def test_the_mode_is_written_out_not_inferred(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function renderLandingMode(", html)
+        self.assertIn("Pinned to", html)
+
+
+class TestViewModeIsOneCheckbox(CustomTestCase):
+    """#14: an opt-in checkbox, and a plain bar in the simple density."""
+
+    def test_it_is_a_checkbox_not_a_two_way_pick(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="vm_simple"', html)
+        self.assertIn('type="checkbox" id="vm_expert"', html)
+        # no "simple" button to click, so nobody is asked to classify
+        # themselves before seeing the page
+        self.assertNotIn("setViewMode('simple')\"", html)
+
+    def test_simple_density_gets_one_solid_bar_and_no_breakdown(self):
+        html = webui.INDEX_HTML
+        self.assertIn('class="segbar simple-only"', html)
+        self.assertIn('class="segbar expert-only"', html)
+        # the itemised legend is expert-only, so simple shows no segments
+        self.assertIn('class="seglegend expert-only"', html)
+        self.assertIn('class="segsum simple-only"', html)
+
+
+class TestLinkThroughput(CustomTestCase):
+    """#15: live PCIe / NVLink per card, each against its own ceiling."""
+
+    def setUp(self):
+        from sglang.srt.planner import live_metrics
+
+        live_metrics._LINK_PEAKS.clear()
+        live_metrics._LINK_STATE_PEAKS.clear()
+        live_metrics._NVLINK_LAST.clear()
+
+    tearDown = setUp
+
+    def test_pcie_is_sampled_and_nvlink_absence_is_not_zero(self):
+        from sglang.srt.planner import live_metrics
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return 2_000_000 if kind == 0 else 1_000_000   # KB/s
+
+            def nvmlDeviceGetMaxPcieLinkGeneration(self, h):
+                return 4
+
+            def nvmlDeviceGetMaxPcieLinkWidth(self, h):
+                return 16
+
+            def nvmlDeviceGetCurrPcieLinkGeneration(self, h):
+                return 4
+
+            def nvmlDeviceGetCurrPcieLinkWidth(self, h):
+                return 16
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("no nvlink on this board")
+
+        d = live_metrics._link_fields(_Nvml(), object(), 0, "uuid-a")
+        self.assertAlmostEqual(d["pcie_tx_gbs"], 2.0, places=6)
+        self.assertAlmostEqual(d["pcie_rx_gbs"], 1.0, places=6)
+        self.assertAlmostEqual(d["pcie_max_gbs"], 1.969 * 16, places=3)
+        # "no NVLink" is None, never 0.0 -- they are different facts
+        self.assertIsNone(d["nvlink_tx_gbs"])
+        self.assertEqual(d["nvlink_links"], 0)
+
+    def test_without_calibration_the_ceiling_is_the_highest_seen_so_far(self):
+        from sglang.srt.planner import live_metrics
+
+        rate = {"v": 3_000_000}
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return rate["v"] if kind == 0 else 0
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("none")
+
+            # no link-capability getters at all -> peak is the only ceiling
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        n = _Nvml()
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_max_gbs"], 3.0, places=6)
+        # a bigger sample raises the ceiling in place...
+        rate["v"] = 9_000_000
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_max_gbs"], 9.0, places=6)
+        # ...and a smaller one never lowers it
+        rate["v"] = 1_000_000
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_tx_gbs"], 1.0, places=6)
+        self.assertAlmostEqual(d["pcie_max_gbs"], 9.0, places=6)
+
+    def test_a_measured_peak_outranks_a_lower_capability_figure(self):
+        from sglang.srt.planner import live_metrics
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return 50_000_000 if kind == 0 else 0     # 50 GB/s
+
+            def nvmlDeviceGetMaxPcieLinkGeneration(self, h):
+                return 1
+
+            def nvmlDeviceGetMaxPcieLinkWidth(self, h):
+                return 4
+
+            def nvmlDeviceGetCurrPcieLinkGeneration(self, h):
+                return 1
+
+            def nvmlDeviceGetCurrPcieLinkWidth(self, h):
+                return 4
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("none")
+
+        d = live_metrics._link_fields(_Nvml(), object(), 0, "uuid-c")
+        # capability says 1.0 GB/s; something measured 50. The measurement
+        # wins, so a bar can never read over 100%.
+        self.assertAlmostEqual(d["pcie_max_gbs"], 50.0, places=6)
+
+    def test_the_card_line_renders_the_link_figures(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function linkLiveHtml(", html)
+        self.assertIn("PCIe", html)
+        self.assertIn("linkbar", html)
+        # NVLink pending is a state of its own, not a zero
+        self.assertIn("rate on the next poll", html)
 
 
 class TestLiveBannerStates(CustomTestCase):

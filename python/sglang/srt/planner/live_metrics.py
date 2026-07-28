@@ -99,6 +99,8 @@ __all__ = [
     "HICACHE_HOST_TOTAL_METRIC",
     "GpuLive",
     "read_gpu_live",
+    "link_ceilings",
+    "link_peaks",
     "snapshot",
 ]
 
@@ -152,6 +154,28 @@ class GpuLive:
     mem_used_frac: float           # used / total, 0.0-1.0
     cuda_index: Optional[int] = None
     cuda_index_source: Optional[str] = None
+    #: Link throughput, GB/s, sampled by NVML over its own short window.
+    #: None means "this card cannot report it", which is NOT the same as 0.0
+    #: ("it can, and nothing is moving") -- the UI shows the two differently.
+    pcie_tx_gbs: Optional[float] = None
+    pcie_rx_gbs: Optional[float] = None
+    #: NVLink aggregate over all active links on this card. None on a rig
+    #: without NVLink (this one: every pair is PHB), which is the common case.
+    nvlink_tx_gbs: Optional[float] = None
+    nvlink_rx_gbs: Optional[float] = None
+    nvlink_links: int = 0
+    #: The CEILING each live figure is read against. With a calibration run
+    #: this is the card's link capability; without one it is simply the
+    #: highest value seen so far, raised in place as soon as a bigger sample
+    #: arrives -- so a bar can never exceed 100% and the scale sharpens as the
+    #: rig is used. The link STATE follows the same rule (an idle link
+    #: downtrains to gen 1, so only the highest state observed is kept),
+    #: which is what keeps a chipset-limited card honest: this rig's GPU0
+    #: trains to x4 and is never judged against an x16 figure.
+    pcie_max_gbs: Optional[float] = None
+    pcie_gen: Optional[int] = None
+    pcie_width: Optional[int] = None
+    nvlink_max_gbs: Optional[float] = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -171,6 +195,242 @@ def _nvml_power_limit_w(nvml, h) -> float:
         return float(nvml.nvmlDeviceGetPowerManagementLimit(h)) / 1000.0
     except Exception:
         return 0.0
+
+
+def _nvml_pcie_gbs(nvml, h) -> Tuple[Optional[float], Optional[float]]:
+    """(tx, rx) PCIe throughput in GB/s, or (None, None) when unsupported.
+
+    ``nvmlDeviceGetPcieThroughput`` returns KB/s measured over a ~20 ms window
+    that NVML owns, so this is a genuine sample of what is crossing the link
+    right now -- not a counter we would have to difference ourselves. It is
+    unsupported on some consumer parts and inside some containers, which is
+    why the failure is None rather than 0.0.
+    """
+    out = []
+    for attr in ("NVML_PCIE_UTIL_TX_BYTES", "NVML_PCIE_UTIL_RX_BYTES"):
+        try:
+            kbs = nvml.nvmlDeviceGetPcieThroughput(h, getattr(nvml, attr))
+            out.append(float(kbs) * 1000.0 / 1e9)   # KB/s -> GB/s
+        except Exception:
+            out.append(None)
+    return out[0], out[1]
+
+
+#: Per-lane, per-direction PCIe rate in GB/s, by link generation. These are
+#: the published encoded rates after 8b/10b (gen 1-2) and 128b/130b (gen 3+)
+#: overhead, i.e. what the lane can actually deliver to the device.
+_PCIE_LANE_GBS = {1: 0.250, 2: 0.500, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+
+def _nvml_pcie_ceiling(nvml, h, uuid_key: str = ""):
+    """(max_gbs_per_direction, generation, lane_width) for this card's link.
+
+    A CAPABILITY read, not a measurement: it costs nothing and it is exact.
+
+    The MAXIMUM generation and width are used, not the current ones. An idle
+    card downtrains its link to save power -- on this rig every card reports
+    gen 1 at idle -- so a ceiling taken from the current state would be far
+    too low and the first burst of real traffic would read as several hundred
+    percent of it. The maximum is what the slot and the card can do together,
+    which is the honest thing to judge a live reading against, and it still
+    reflects a card wired below its slot's nominal width.
+    """
+    def _read(name):
+        try:
+            v = int(getattr(nvml, name)(h))
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    # The card's own capability bounds everything...
+    cap_gen = _read("nvmlDeviceGetMaxPcieLinkGeneration")
+    cap_width = _read("nvmlDeviceGetMaxPcieLinkWidth")
+    # ...but the link that is actually TRAINED is what limits this card. On
+    # this rig one GPU sits on a chipset x4 while reporting an x16-capable
+    # card, so the capability alone would overstate its ceiling by 4x. The
+    # current state is unusable on its own (an idle link downtrains to gen 1),
+    # so the HIGHEST state seen so far is what is kept -- the same
+    # highest-observed rule the throughput peaks use, applied to the link.
+    gen = _peak_link(uuid_key, "gen", _read("nvmlDeviceGetCurrPcieLinkGeneration"))
+    width = _peak_link(uuid_key, "width", _read("nvmlDeviceGetCurrPcieLinkWidth"))
+    gen = min(gen, cap_gen) if (gen and cap_gen) else (gen or cap_gen)
+    width = min(width, cap_width) if (width and cap_width) else (width or cap_width)
+    if not gen or not width:
+        return None, gen, width
+    per_lane = _PCIE_LANE_GBS.get(gen)
+    if not per_lane:
+        return None, gen, width
+    return per_lane * width, gen, width
+
+
+def link_ceilings(nvml=None) -> Dict[str, dict]:
+    """Establish the link ceilings ONCE, keyed by card UUID.
+
+    Called by the calibration step, not by the 2 s poll: the negotiated PCIe
+    link and the NVLink topology do not change while a server runs, so
+    re-deriving them every tick would be pure noise. The live path then
+    reports only the current GB/s and reads it against these.
+    """
+    own = nvml is None
+    nvml = nvml or _import_pynvml()
+    try:
+        out: Dict[str, dict] = {}
+        for i in range(nvml.nvmlDeviceGetCount()):
+            h = nvml.nvmlDeviceGetHandleByIndex(i)
+            try:
+                uuid = _norm_uuid(nvml.nvmlDeviceGetUUID(h))
+            except Exception:
+                uuid = str(i)
+            gbs, gen, width = _nvml_pcie_ceiling(nvml, h, uuid)
+            _, _, links = _nvml_nvlink_gbs(nvml, h, i)
+            out[uuid] = {
+                "nvml_index": i,
+                "name": _nvml_name(nvml.nvmlDeviceGetName(h)),
+                "pcie_max_gbs": gbs,
+                "pcie_gen": gen,
+                "pcie_width": width,
+                "nvlink_links": links,
+                # 25 GB/s per direction per link is the NVLink 3/4 figure; the
+                # count is what varies between boards.
+                "nvlink_max_gbs": (25.0 * links) if links else None,
+            }
+        return out
+    finally:
+        if own:
+            try:
+                nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
+#: Observed peaks, per card UUID: {"pcie_tx": gbs, "pcie_rx": ..., ...}.
+#: WITHOUT a calibration ceiling the highest value seen so far IS the ceiling
+#: a live reading is judged against, and it is raised the moment a higher
+#: sample arrives -- so a bar can never read over 100%, and the scale
+#: sharpens as the rig is used instead of waiting on a calibration run.
+#: A calibrated PCIe ceiling, when present, always wins: it is the physical
+#: limit of the negotiated link, while a peak is only what has happened yet.
+_LINK_PEAKS: Dict[str, Dict[str, float]] = {}
+
+#: Highest PCIe link state seen per card ({"gen": n, "width": n}). Separate
+#: from the throughput peaks because it is a link property, not a rate.
+_LINK_STATE_PEAKS: Dict[str, Dict[str, int]] = {}
+
+
+def _peak_link(uuid: str, key: str, value: Optional[int]) -> Optional[int]:
+    """Fold a link-state reading into its running maximum and return it."""
+    d = _LINK_STATE_PEAKS.setdefault(uuid or "?", {})
+    if value and value > d.get(key, 0):
+        d[key] = value
+    return d.get(key) or None
+
+
+def link_peaks() -> Dict[str, Dict[str, float]]:
+    """The observed high-water marks, for the hardware-info panel."""
+    return {k: dict(v) for k, v in _LINK_PEAKS.items()}
+
+
+def _note_peak(uuid: str, key: str, value: Optional[float]) -> Optional[float]:
+    """Fold ``value`` into the running peak and return the peak."""
+    if value is None or value < 0:
+        return _LINK_PEAKS.get(uuid, {}).get(key)
+    d = _LINK_PEAKS.setdefault(uuid, {})
+    # setdefault, not a bare compare-then-assign: a first reading of exactly
+    # 0.0 is entirely normal (an idle direction) and must still ESTABLISH the
+    # entry, or the lookup below has nothing to return.
+    if value > d.setdefault(key, value):
+        d[key] = value
+    return d[key]
+
+
+#: NVLink counters are RAW TOTALS, not rates: NVML reports KiB accumulated
+#: since the counter was last reset. A rate therefore needs two samples and
+#: the wall time between them, which is what this cache is for -- keyed by
+#: (nvml_index, link).
+_NVLINK_LAST: Dict[Tuple[int, int], Tuple[float, int, int]] = {}
+
+
+def _nvml_nvlink_gbs(
+    nvml, h, index: int, now: Optional[float] = None
+) -> Tuple[Optional[float], Optional[float], int]:
+    """(tx_gbs, rx_gbs, active_links) aggregated over this card's NVLinks.
+
+    Returns (None, None, 0) on a rig without NVLink -- which is the normal
+    answer on a consumer box, and is reported as "no NVLink on this card"
+    rather than as 0 GB/s, because those are different facts.
+
+    The first call for a link can only store the counter; a rate appears on
+    the second sample. That is why a fresh dashboard shows NVLink as pending
+    for one poll rather than as zero.
+    """
+    now = time.time() if now is None else now
+    tx_tot = rx_tot = 0
+    live = 0
+    for link in range(18):  # NVML's maximum; inactive links raise and stop us
+        try:
+            if not nvml.nvmlDeviceGetNvLinkState(h, link):
+                continue
+        except Exception:
+            break
+        try:
+            tx = int(nvml.nvmlDeviceGetNvLinkUtilizationCounter(h, link, 0)["tx"])
+            rx = int(nvml.nvmlDeviceGetNvLinkUtilizationCounter(h, link, 0)["rx"])
+        except Exception:
+            continue
+        live += 1
+        tx_tot += tx
+        rx_tot += rx
+    if not live:
+        return None, None, 0
+    key = (index, -1)
+    prev = _NVLINK_LAST.get(key)
+    _NVLINK_LAST[key] = (now, tx_tot, rx_tot)
+    if prev is None:
+        return None, None, live
+    dt = now - prev[0]
+    if dt <= 0:
+        return None, None, live
+    # counters are KiB; a reset (counter went backwards) yields None, not a
+    # negative rate.
+    dtx, drx = tx_tot - prev[1], rx_tot - prev[2]
+    if dtx < 0 or drx < 0:
+        return None, None, live
+    k = 1024.0 / 1e9 / dt
+    return dtx * k, drx * k, live
+
+
+def _link_fields(nvml, h, index: int, uuid: str) -> dict:
+    """Live link throughput plus the ceiling each figure is read against.
+
+    Ceiling policy, in order:
+      1. the negotiated PCIe link (exact, a capability read, established at
+         calibration and unchanging while the machine runs);
+      2. failing that, the highest value observed so far, raised in place the
+         moment a bigger sample arrives.
+
+    NVLink has no cheap capability equivalent per direction, so it always uses
+    the observed peak until a calibration run supplies one.
+    """
+    tx, rx = _nvml_pcie_gbs(nvml, h)
+    ntx, nrx, nlinks = _nvml_nvlink_gbs(nvml, h, index)
+    tx_peak = _note_peak(uuid, "pcie_tx", tx)
+    rx_peak = _note_peak(uuid, "pcie_rx", rx)
+    ntx_peak = _note_peak(uuid, "nvlink_tx", ntx)
+    nrx_peak = _note_peak(uuid, "nvlink_rx", nrx)
+    pcie_max, gen, width = _nvml_pcie_ceiling(nvml, h, uuid)
+    # The observed peak always wins if it is higher: a measurement that
+    # actually happened outranks a capability figure that says it could not.
+    # This is also the whole ceiling when the capability read is unsupported.
+    observed = [v for v in (tx_peak, rx_peak) if v is not None]
+    if observed:
+        pcie_max = max(observed) if pcie_max is None else max(pcie_max, *observed)
+    nv_observed = [v for v in (ntx_peak, nrx_peak) if v is not None]
+    return {
+        "pcie_tx_gbs": tx, "pcie_rx_gbs": rx,
+        "pcie_max_gbs": pcie_max, "pcie_gen": gen, "pcie_width": width,
+        "nvlink_tx_gbs": ntx, "nvlink_rx_gbs": nrx, "nvlink_links": nlinks,
+        "nvlink_max_gbs": (max(nv_observed) if nv_observed else None),
+    }
 
 
 def read_gpu_live(nvml=None) -> List[GpuLive]:
@@ -207,6 +467,7 @@ def read_gpu_live(nvml=None) -> List[GpuLive]:
                 mem_used_mib=used_mib,
                 mem_total_mib=total_mib,
                 mem_used_frac=(used_mib / total_mib if total_mib else 0.0),
+                **_link_fields(nvml, h, i, uuid),
             ))
         _annotate_cuda_indices(out, nvml=nvml, injected=not own)
         return out
