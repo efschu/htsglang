@@ -598,5 +598,251 @@ class TestLaneLending(unittest.TestCase):
         self.assertIn("reclaim", stats)  # reclaim latency
 
 
+class TestPerLaneGraphSharedOutput(unittest.TestCase):
+    """Geteilte-Puffer-Familie, third member: the shared LOGITS buffer.
+
+    Slice C keyed the graph memory POOL by lane (shared intermediates) and the
+    GGUF dequant workspace by lane, and left ``GraphSharedOutput`` -- the
+    next-token-logits destination every captured decode graph writes into --
+    process-wide. Same argument, same failure: a concurrent lane replaying its
+    decode graph while the serving group replays its own gives two writers one
+    address, and the logits the loser reads are the winner's.
+    """
+
+    def setUp(self):
+        reset_context()
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        self._saved = dict(GraphSharedOutput._lane_shared)
+        GraphSharedOutput._lane_shared.clear()
+
+    def tearDown(self):
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        GraphSharedOutput._lane_shared.clear()
+        GraphSharedOutput._lane_shared.update(self._saved)
+        reset_context()
+
+    class _FakeRunner:
+        """Enough of a ModelRunner for ``create_for_model_runner``."""
+
+        device = "cpu"
+
+        def __init__(self, rows=8):
+            from sglang.srt.model_executor.cuda_graph_config import (
+                default_cuda_graph_config,
+            )
+
+            class _A:
+                pass
+
+            self.server_args = _A()
+            self.server_args.cuda_graph_config = default_cuda_graph_config()
+            self.server_args.cuda_graph_config.decode.bs = [1, 2]
+            self._rows = rows
+
+        def max_decode_logits_rows(self):
+            return self._rows
+
+    def test_each_lane_gets_its_own_logits_buffer(self):
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        runner = self._FakeRunner()
+        serving = GraphSharedOutput.create_for_model_runner(runner)
+        self.assertIsNotNone(serving)
+        # Same scope, same buffer: within one lane the graphs are serial with
+        # each other, which is what makes ONE buffer correct there.
+        self.assertIs(GraphSharedOutput.create_for_model_runner(runner), serving)
+
+        with lane_scope(0, None):
+            lane0 = GraphSharedOutput.create_for_model_runner(runner)
+        with lane_scope(1, None):
+            lane1 = GraphSharedOutput.create_for_model_runner(runner)
+
+        self.assertIsNot(lane0, serving)
+        self.assertIsNot(lane1, serving)
+        self.assertIsNot(lane0, lane1)
+
+    def test_the_buffers_are_distinct_storage_not_just_distinct_objects(self):
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        runner = self._FakeRunner()
+        serving = GraphSharedOutput.create_for_model_runner(runner)
+        with lane_scope(0, None):
+            lane0 = GraphSharedOutput.create_for_model_runner(runner)
+        # The aliasing that matters is at the TENSOR, not the holder.
+        a = serving.get_logits_buffer(32, rows=4)
+        b = lane0.get_logits_buffer(32, rows=4)
+        self.assertNotEqual(a.data_ptr(), b.data_ptr())
+        a.fill_(1.0)
+        b.fill_(2.0)
+        self.assertEqual(float(a[0, 0]), 1.0)
+
+    def test_the_serving_group_is_unchanged(self):
+        """The default path must keep exactly one buffer (backward compat)."""
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        runner = self._FakeRunner()
+        first = GraphSharedOutput.create_for_model_runner(runner)
+        second = GraphSharedOutput.create_for_model_runner(self._FakeRunner())
+        self.assertIs(first, second)
+        self.assertEqual(list(GraphSharedOutput._lane_shared), [None])
+
+
+class TestLaneVocabShellSelection(unittest.TestCase):
+    """Contract 5: type is not a unique selector for the target's vocab shells.
+
+    A multimodal target carries more than one vocab-parallel table, and
+    ``modules()`` order decides which one "the first of the right type" is.
+    Picking the companion tower's is silent at bring-up and fails one forward
+    later inside a fused kernel (measured: a cutlass signature dump from
+    ``pre_fc_norm_embedding``, width 1152 against the head's 5120).
+    """
+
+    def _shells(self, widths):
+        import torch.nn as nn
+
+        from sglang.srt.model_executor.dual_group_lane import (
+            LaneLmHeadShell,
+            LaneVocabEmbeddingShell,
+        )
+
+        class _Part(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.embedding_dim = dim
+                self.qweight = None
+
+        target = nn.Module()
+        for i, w in enumerate(widths):
+            target.add_module(f"embed{i}", LaneVocabEmbeddingShell([_Part(w)]))
+            target.add_module(f"head{i}", LaneLmHeadShell([_Part(w)]))
+        return target
+
+    def test_the_language_width_is_chosen_not_the_first_registered(self):
+        from sglang.srt.model_executor.dual_group_lane import (
+            _find_lane_vocab_shells,
+        )
+
+        # Companion tower registered FIRST -- the order that made round 2 fail.
+        target = self._shells([1152, 5120])
+        embed, head = _find_lane_vocab_shells(target, 5120)
+        self.assertEqual(embed.embedding_dim, 5120)
+        self.assertEqual(head.embedding_dim, 5120)
+
+    def test_a_single_shell_is_taken_as_is(self):
+        """Unimodal targets must not need the discriminator at all."""
+        from sglang.srt.model_executor.dual_group_lane import (
+            _find_lane_vocab_shells,
+        )
+
+        target = self._shells([5120])
+        embed, head = _find_lane_vocab_shells(target, 5120)
+        self.assertIsNotNone(embed)
+        self.assertIsNotNone(head)
+
+    def test_an_ambiguous_target_is_refused_loudly(self):
+        from sglang.srt.model_executor.dual_group_lane import (
+            _find_lane_vocab_shells,
+        )
+
+        target = self._shells([5120, 5120])
+        with self.assertRaises(ValueError) as ctx:
+            _find_lane_vocab_shells(target, 5120)
+        self.assertIn("5120", str(ctx.exception))
+
+    def test_no_matching_width_is_refused_rather_than_guessed(self):
+        from sglang.srt.model_executor.dual_group_lane import (
+            _find_lane_vocab_shells,
+        )
+
+        target = self._shells([1152, 2048])
+        with self.assertRaises(ValueError):
+            _find_lane_vocab_shells(target, 5120)
+
+
+class TestLaneTargetVsHeadClassification(unittest.TestCase):
+    """Contracts 6 and 7: the two lane runners need OPPOSITE answers to
+    "is this a draft model?", and both carry ``is_draft_worker=True``.
+
+    Spelled out as ``is_draft_worker and not is_dual_group_lane``, the
+    exemption covered the head too, so the head inherited the target's
+    64-layer geometry: its full-attention call dispatched into the GDN
+    backend (contract 6), and once that was fixed its KV pool had an empty
+    full-attention layer map (contract 7). One property, asked everywhere.
+    """
+
+    class _Runner:
+        def __init__(self, lane, draft):
+            self.is_draft_worker = True
+            self.is_dual_group_lane = lane
+            self.is_dual_group_lane_draft = draft
+
+        @property
+        def is_dual_group_lane_target(self):
+            from sglang.srt.model_executor.model_runner import ModelRunner
+
+            return ModelRunner.is_dual_group_lane_target.fget(self)
+
+    def test_the_lane_target_is_exempt(self):
+        self.assertTrue(self._Runner(lane=True, draft=False).is_dual_group_lane_target)
+
+    def test_the_lane_head_is_not_exempt(self):
+        self.assertFalse(self._Runner(lane=True, draft=True).is_dual_group_lane_target)
+
+    def test_an_ordinary_draft_worker_is_not_exempt(self):
+        self.assertFalse(
+            self._Runner(lane=False, draft=False).is_dual_group_lane_target
+        )
+
+    def test_the_exemption_sites_all_ask_the_property(self):
+        """The three sites must not respell the condition and drift apart."""
+        import inspect
+
+        from sglang.srt.layers.attention import attention_registry
+        from sglang.srt.model_executor import model_runner, model_runner_kv_cache_mixin
+
+        for mod in (attention_registry, model_runner, model_runner_kv_cache_mixin):
+            src = inspect.getsource(mod)
+            # No site may test the lane flag directly against is_draft_worker.
+            self.assertNotIn(
+                'and not getattr(self, "is_dual_group_lane", False)',
+                src,
+                f"{mod.__name__} respells the lane-target condition",
+            )
+            self.assertNotIn(
+                'and not getattr(runner, "is_dual_group_lane", False)',
+                src,
+                f"{mod.__name__} respells the lane-target condition",
+            )
+
+
+class TestLaneSpecDispatch(unittest.TestCase):
+    """The serial tick and the concurrent worker must dispatch the SAME way.
+
+    Round 1 wired the speculative round into the concurrent worker only, so a
+    serial lane built the NEXTN head and then never asked it for a proposal.
+    Serial is the default mode, so the chain was unreachable by default.
+    """
+
+    def test_both_step_paths_route_a_spec_lane_to_the_spec_round(self):
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        for fn in (DualGroupLane.tick, DualGroupLane._step_locked_scope):
+            src = inspect.getsource(fn)
+            self.assertIn("_prefill", src, f"{fn.__name__} lost the prefill arm")
+            self.assertIn(
+                "spec_active", src, f"{fn.__name__} does not consult spec_active"
+            )
+            self.assertIn(
+                "_spec_step", src, f"{fn.__name__} never runs a speculative round"
+            )
+            self.assertIn(
+                "_decode_step", src, f"{fn.__name__} lost the plain decode arm"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

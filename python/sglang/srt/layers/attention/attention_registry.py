@@ -390,13 +390,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "If this is a custom hybrid model, use register_linear_attn_model() "
                     "from sglang.srt.configs.linear_attn_model_registry."
                 )
+        # A dual-group lane TARGET (#274) is constructed as a draft worker
+        # (secondary-runner gates) but runs the FULL model, so it keeps the
+        # real layer routing. The lane's NEXTN HEAD is a draft worker in the
+        # ordinary sense and must NOT take that exemption -- it is an MTP
+        # head, one layer, full attention. Testing `is_dual_group_lane` alone
+        # caught the head too (both flags are set on it) and routed its layer
+        # by the TARGET's 64-layer hybrid map: the head's layer id is absent
+        # from `full_attention_layer_ids`, so its full-attention call landed
+        # in the GDN backend and died on `assert isinstance(mixed_qkv,
+        # torch.Tensor)` -- same shape as contract 1, the head inheriting the
+        # target's geometry.
         if runner.is_draft_worker and not getattr(
-            runner, "is_dual_group_lane", False
+            runner, "is_dual_group_lane_target", False
         ):
             # FIXME: we assume that MTP/NEXTN always use full-attention.
-            # A dual-group lane runner (#274) is constructed as a draft
-            # worker (secondary-runner gates) but runs the FULL model: it
-            # keeps the real layer routing.
             full_attn_layers = [0]
         else:
             full_attn_layers = cfg.full_attention_layer_ids

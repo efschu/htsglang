@@ -3213,7 +3213,7 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=(
                         [0]
                         if self.is_draft_worker
-                        and not getattr(self, "is_dual_group_lane", False)
+                        and not getattr(self, "is_dual_group_lane_target", False)
                         else [
                             i
                             for i in config.full_attention_layer_ids

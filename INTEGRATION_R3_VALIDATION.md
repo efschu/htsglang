@@ -5919,3 +5919,67 @@ Schalenklasse fehlt, Aufwand B1, Laut-Fehler-Zweig greift). Distributed-Suite
 - Diszipliniert gestoppt statt gequetscht (~6 min/Boot, je genau ein Kontrakt);
   --dual-group-lane-spec default aus, alle Slice-C-Belege unberuehrt,
   distributed-Suite 543/16-vorbestehend auf gemergtem HEAD, Marker 0.
+
+## Lane-Spec-Kette Runde 2 (feat/dual-group-lane-spec-r2, Basis b662cc98a3)
+
+- KONTRAKT 4 GELOEST (der offene aus Runde 1): kein fehlender Puffer, sondern
+  ein Zustaendigkeits-Bruch — `check_cuda_graph_backend` fragt die AKTIVEN
+  Args (Bring-up-Scope publiziert die des ZIELS, Graphen AN),
+  `GraphSharedOutput.create_for_model_runner` fragt `model_runner.server_args`
+  (die des KOPFES, Graphen AUS). Fix mit der Slice-C-Maschinerie selbst: der
+  Bring-up des Kopfes laeuft in einem `lane_scope` mit den Args des Kopfes,
+  dann nehmen Decode UND Prefill ihren DISABLED-Frueh-Ausstieg (im Log
+  belegt). `init_prefill_cuda_graph` haette den Kopf sonst auch noch Prefill
+  aufnehmen lassen (Lane nimmt den Draft-Skip bewusst nicht).
+- KONTRAKT 5: Typ ist kein eindeutiger Selektor. Ziel meldet `embed=2`;
+  `modules()`-Reihenfolge entschied, und es traf die Begleit-Tabelle (1152)
+  statt der Sprach-Tabelle (5120) — still, dann ein Cutlass-Signatur-Dump aus
+  `pre_fc_norm_embedding`. Jetzt entscheidet die BREITE (`embedding_dim` ==
+  hidden_size); kein oder mehrfacher Treffer = Bring-up-Fehler mit Satz.
+- KONTRAKTE 6+7, EINE WURZEL: die Ausnahme `is_draft_worker and not
+  is_dual_group_lane` ist auf BEIDE Lane-Runner wahr. Gemeint war nur das
+  ZIEL; der KOPF ist ein gewoehnliches Draft-Modell und erbte so die
+  64-Schichten-Geometrie — erst Full-Attention-Aufruf im GDN-Backend
+  (`assert isinstance(mixed_qkv, ...)`), nach dessen Fix ein KV-Pool mit
+  LEERER Full-Attention-Abbildung. Unterscheidung jetzt EINMAL benannt
+  (`ModelRunner.is_dual_group_lane_target`), alle drei Stellen fragen sie,
+  ein Test verbietet das Wieder-Ausbuchstabieren.
+- ZWEI EIGENE FUNDE: (a) die Kette war im SERIELLEN Modus — dem Default —
+  gar nicht erreichbar, `_spec_step` war nur im nebenlaeufigen Worker
+  verdrahtet; (b) ein abgebrochener Tick gab die Pool-Slots nicht zurueck,
+  und bei mrr 1 machte EIN echter Fehler jeden spaeteren Job an
+  `alloc_req_slots available_size()=0` scheitern (`drop_active()`).
+- KONTRAKT 8 HALB GELOEST, und er ist der Grund fuer das rote Tor:
+  `_verify` las `out.next_token_logits` POSITIONSWEISE, das Feld ist aber
+  `[#SEQUENZ, vocab]` (eine Zeile je Request). Der Beweis stand in den
+  Zahlen: Accept-Laenge exakt 1,000 ueber 63 Runden, also n_accept immer 0,
+  also `preds[1:]` nie indiziert — die Form-Diskrepanz blieb stumm, und das
+  emittierte Token setzte einen verworfenen Schwanz fort (Wiederholungs-
+  schleife). Kandidaten-Logits kommen jetzt aus den FULL-Hidden-States
+  (`_candidate_logits`, rang-lokale Reduktion von `_get_logits`, verweigert
+  sich laut bei TP-All-Gather). Wirkung: Accept 1,000 -> 1,312.
+- OFFEN / UEBERGABE: Tokens ab Index 1 weiterhin falsch — `output_ids[1] ==
+  output_ids[0]`, d.h. `preds[0]` sagt nach `" long"` wieder `" long"`.
+  Das deutet auf einen Versatz Hidden-State-ZEILE gegen Kandidaten-POSITION,
+  nicht mehr auf die Logits-Quelle. Naechster Schritt: einmalige Form-/
+  Positions-Instrumentierung in `_verify` (`hidden_states.shape[0]` gegen
+  `len(cand)`, `extend_start_loc`, `positions`) — nicht weiter raten.
+- TORE: data_ptr 1058 (Ziel) + 16 (Kopf) in JEDEM der 5 Boots gruen;
+  Schalen-Breite 5120 protokolliert; Kette laeuft ohne Abbruch (Boot 5:
+  0 Tick-Fehler, 48 Runden); **Kohaerenz-mit-Spec ROT, erste Abweichung
+  Index 1**. Referenz unabhaengig bestaetigt — `[1248, 1518, 29496, 13, ...]`
+  = `" long before electronics. Early devices such as the abacus,"`, und der
+  VERBAND liefert auf denselben 96 Prompt-Tokens genau das; die Spec-Lane
+  liefert `" long long Brennan, a!! !..."`.
+- ZAHLEN (Boot 5, seriell, Kopf EAGER) — Mechanik-Kosten, KEIN
+  Feature-Ergebnis, weil an einer nicht-kohaerenten Kette erhoben:
+  Prefill 96 Tokens 149,07 ms; 113,61 ms je Spec-RUNDE; Accept 1,312;
+  abgeleitet 86,6 ms je Token gegen die dokumentierte Basis 61,7 ms eager /
+  16,6 ms mit Graphen. Ehrlich: an diesem Arbeitspunkt ein VERLUST, mit zwei
+  benannten strukturellen Gruenden (Kopf eager statt EAGLE-Draft-Graph;
+  Verify ist ein EXTEND gegen einen graph-gefangenen DECODE der Basis).
+- NEBENLAEUFIGER MESSPUNKT BEWUSST NICHT ERHOBEN: eine
+  Kartenaequivalent-Zahl an einer nachweislich falsch rechnenden Kette waere
+  unbenutzbar (Einzelteil-vor-Verbund).
+- `--dual-group-lane-spec` bleibt default aus. Distributed-Suite 555 gruen /
+  16 vorbestehend rot (unveraendert gegen b662cc98a3); 12 neue CPU-Tests.
