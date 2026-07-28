@@ -555,6 +555,41 @@ class TestQualityRoutes(CustomTestCase):
         self.assertEqual(d["shots"], [])
 
 
+class TestQualityHistoryIsGroupedNotASlider(CustomTestCase):
+    """Round 5: the history panel used a single 1-D slider over the flat
+    shot list, so "which model/quant" and "which run of that model/quant"
+    were the same axis -- picking a shot from an older model meant scrubbing
+    past every OTHER model's saved runs first. Rebuilt as two dropdowns:
+    model+quant narrows the list, run picks a specific saved shot within it
+    (newest first). No slider remains.
+    """
+
+    def test_the_slider_is_gone(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="q_slider"', html)
+        self.assertNotIn('id="q_slide_lbl"', html)
+        self.assertNotIn('type="range"', html.split('<div id="view_quality"')[1]
+                          .split('<div id="view_about"')[0])
+
+    def test_two_dropdowns_replace_it(self):
+        html = webui.INDEX_HTML
+        self.assertIn('id="q_hist_mq"', html)
+        self.assertIn('id="q_hist_run"', html)
+        self.assertIn('onchange="onHistModelChange()"', html)
+
+    def test_groups_are_keyed_by_model_and_quant(self):
+        js = _index_script()
+        self.assertIn("function _histKey(s){", js)
+        self.assertIn("s.model", js.split("function _histKey(s){")[1][:200])
+        self.assertIn("s.quant", js.split("function _histKey(s){")[1][:200])
+
+    def test_runs_within_a_group_are_newest_first(self):
+        js = _index_script()
+        body = js[js.index("function onHistModelChange(){"):]
+        body = body[:body.index("\n}")]
+        self.assertIn("idxs.slice().reverse()", body)
+
+
 class TestNewTabsInIndex(CustomTestCase):
     def test_index_has_new_tabs_and_routes(self):
         # PHASE 2 reorg: the Models tab is MERGED into the Runner tab, so its
@@ -879,6 +914,65 @@ class TestLandingSnapshotRoute(CustomTestCase):
         self.assertIn("gpus", d["snapshot"])
         self.assertEqual(d["target"]["kind"], "managed")
         m.assert_called_once()
+
+    def test_concurrent_polls_serialize_the_delta_state(self):
+        """Round 5 bug: rates flashing to zero / few updates landing while a
+        real inference load is running. Root cause: the dashboard is a
+        ThreadingHTTPServer, and the client's poll only ABORTS its own wait
+        on the client side when a scrape runs long -- the server-side
+        request keeps going. A slow /metrics scrape (contended for CPU/IO by
+        real inference work) can therefore still be in flight when the NEXT
+        poll's request starts on a second thread, and without serialization
+        the two requests interleave their read of _LANDING_SNAPSHOT_STATE:
+        whichever call WRITES last wins, even if it read an older baseline,
+        which regresses the stored state and hands the next poll a t_prev
+        that live_metrics._rates() treats as an "out-of-order scrape" --
+        clamped to a hard 0.0. This proves the fix serializes the two calls:
+        the second call must see the first call's already-written state, not
+        the same starting baseline.
+        """
+        webui._set_supervisor(_RunningFakeSupervisor())
+        seen_prev_states = []
+        call_index = [0]
+
+        def fake_snapshot(target, prev_state=None):
+            seen_prev_states.append(prev_state)
+            call_index[0] += 1
+            if call_index[0] == 1:
+                # Simulate a slow scrape (real inference load contending for
+                # it) that is still running when the next poll fires.
+                time.sleep(0.2)
+            return (
+                {"ok": True, "gpus": [], "rates": None, "t": call_index[0]},
+                {"t": call_index[0], "counters": {}},
+            )
+
+        results = []
+
+        def run():
+            results.append(webui.landing_snapshot_payload())
+
+        with mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot", side_effect=fake_snapshot
+        ):
+            t1 = threading.Thread(target=run)
+            t1.start()
+            time.sleep(0.05)  # let t1 acquire the lock and start its "scrape"
+            t2 = threading.Thread(target=run)
+            t2.start()
+            t1.join(timeout=3)
+            t2.join(timeout=3)
+
+        self.assertEqual(len(seen_prev_states), 2)
+        self.assertTrue(all(r["ok"] for r in results))
+        self.assertIsNone(seen_prev_states[0])
+        # Without the lock, t2 would also see None (the same stale baseline
+        # t1 started from) instead of waiting for t1's write.
+        self.assertIsNotNone(
+            seen_prev_states[1],
+            "the second concurrent poll must see the first poll's written "
+            "state, not race it for the same starting baseline",
+        )
 
 
 class TestConfigProfilesRoutes(CustomTestCase):
@@ -1833,6 +1927,44 @@ class TestDeviceIndexSpaces(CustomTestCase):
         self.assertEqual(by_nvml[0]["cuda_index"], 1)
         self.assertEqual(by_nvml[2]["cuda_index"], 2)
 
+    def test_detect_payload_carries_pcie_link_info(self):
+        # Round 5 bug: hardware_from_nvml() has always computed pcie_gen /
+        # pcie_width per card (hardware.py's GpuDescriptor), but the dict
+        # comprehension in detect_hardware() never forwarded them, so the
+        # Hardware step's card list could not show what a card's link
+        # actually trains to -- only the capacity-matrix's "assumes
+        # pcie/nvlink topology, not measured" disclaimer existed, never the
+        # measured fact for THIS rig's asymmetric wiring.
+        from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
+
+        spec = HardwareSpec(
+            gpus=(
+                GpuDescriptor(index=0, name="NVIDIA GeForce RTX 5090",
+                              total_mib=32607, free_mib=30000,
+                              pcie_gen=4, pcie_width=4),
+                GpuDescriptor(index=1, name="NVIDIA GeForce RTX 3080",
+                              total_mib=20480, free_mib=15000,
+                              pcie_gen=4, pcie_width=16),
+            ),
+            source="nvml",
+        )
+        with mock.patch(
+            "sglang.srt.planner.hardware.hardware_from_nvml",
+            return_value=spec,
+        ):
+            d = webui.detect_hardware()
+        self.assertTrue(d["ok"])
+        by_index = {g["index"]: g for g in d["gpus"]}
+        self.assertEqual(by_index[0]["pcie_gen"], 4)
+        self.assertEqual(by_index[0]["pcie_width"], 4)
+        self.assertEqual(by_index[1]["pcie_width"], 16)
+
+    def test_hardware_step_card_row_renders_the_detected_pcie_link(self):
+        html = webui.INDEX_HTML
+        self.assertIn("pcie_gen: g.pcie_gen, pcie_width: g.pcie_width", html)
+        self.assertIn("c.pcie_gen", html)
+        self.assertIn("PCIe ' + c.pcie_gen", html)
+
     def test_gpu_state_rows_annotated_with_cuda_index(self):
         from sglang.srt.planner import device_map as dmod
         from sglang.srt.planner.energy import GpuPowerState
@@ -2211,6 +2343,42 @@ class TestIndexScriptParses(CustomTestCase):
             esprima.parseScript(norm)
         except Exception as e:  # pragma: no cover - only on a real break
             self.fail(f"INDEX_HTML script does not parse: {e}")
+
+
+class TestWizardStaleClearsOnFailureToo(CustomTestCase):
+    """Round 5 bug: the Guide's downstream steps ('hardware'/'goal'/
+    'families'/'command') stayed grey FOREVER whenever the recompute that was
+    supposed to clear them (wizardFamilies/wizardCommand) failed or timed
+    out, because the old code returned from inside the `catch` block before
+    ever reaching the `wizardFresh(...)` call that removes the [data-step]
+    stale band. wizardInvalidate('model') marks those steps stale on every
+    model edit; nothing but a concluded recompute -- success OR failure --
+    may honestly claim they no longer describe "the previous input", so both
+    must un-stale on both outcomes, not only on success.
+    """
+
+    def _fn_body(self, name: str, next_marker: str) -> str:
+        js = _index_script()
+        start = js.index(f"async function {name}(){{")
+        end = js.index(next_marker, start)
+        return js[start:end]
+
+    def test_wizard_families_unstales_on_error(self):
+        body = self._fn_body("wizardFamilies", "function wzCell(c){")
+        catch_block = body[body.index("}catch(e){"):body.index("} finally")]
+        self.assertIn("wizardFresh(", catch_block,
+                       "wizardFamilies' catch block must clear the stale "
+                       "marks on the steps it just (unsuccessfully) redid, "
+                       "else they stay grey with no way to self-heal")
+        # The abort/superseded path must NOT be treated as concluded -- a
+        # newer call is already in flight and owns the eventual un-staling.
+        self.assertIn("if(apiAborted(e)) return;", catch_block)
+
+    def test_wizard_command_unstales_on_error(self):
+        body = self._fn_body("wizardCommand", "const wizardCommandDebounced")
+        catch_block = body[body.index("}catch(e){"):body.index("} finally")]
+        self.assertIn("wizardFresh('command')", catch_block)
+        self.assertIn("if(apiAborted(e)) return;", catch_block)
 
 
 class TestUpdateFoundation(CustomTestCase):
@@ -3417,11 +3585,93 @@ class TestConsolidatedNavigation(CustomTestCase):
         self.assertNotIn('id="view_landscape"', html)
         guide = html[html.index('<div id="view_wizard"'):]
         guide = guide[:guide.index("<script>")]
-        for token in ('id="mx_models"', 'id="mx_rigs"', 'id="mx_cards"',
+        # Round 5 rebuild: the free-text textareas are gone (chips/buttons
+        # only); the matrix itself is kept (see TestCapacityMatrixIsChipDriven
+        # for the verdict) with new, click-only ids.
+        for token in ('id="mx_model_chips"', 'id="mx_rig_live"',
+                      'id="mx_rig_builders"',
                       "doMatrix()", 'id="ls_model"', 'id="ls_quant"',
                       'id="ls_bucket"', 'id="ls_store"', 'id="ls_rigs"',
                       "doLandscape()"):
             self.assertIn(token, guide, token)
+        for gone in ('id="mx_models"', 'id="mx_rigs"', 'id="mx_cards"',
+                     '<textarea id="mx'):
+            self.assertNotIn(gone, guide, gone)
+
+
+class TestCapacityMatrixIsChipDriven(CustomTestCase):
+    """Round 5, point 2: the capacity matrix, evaluated honestly.
+
+    VERDICT: kept. It answers "does model X fit on rig Y, and with how much
+    context?" for SEVERAL checkpoints against SEVERAL rigs at once, including
+    hypothetical ones this box does not have (composed from the GPU-model
+    card library). The families table above answers for ONE model (the
+    ticked one) on THIS live rig only; the planner/expert step answers for
+    ONE model, ONE specific configuration. Neither can compare several
+    checkpoints against several -- possibly hypothetical -- rigs side by
+    side, which is the question this section exists to answer, so it is not
+    a duplicate of either and stays.
+
+    What was actually broken was operability: two freeform textareas
+    ("LABEL=path" / "NAME=card,card,..."), no explanation of what the answer
+    meant. Rebuilt: models are ticked from the discovered-checkpoint list
+    (the same one the model dropdown uses), rigs are composed from the
+    GPU-model card library with +/- buttons, one "Calculate" button, one
+    sentence stating the question. No free-text input remains anywhere in
+    this section.
+    """
+
+    def _matrix_html(self):
+        # Bounded to the matrix's OWN model/rig inputs -- excludes the nested
+        # "per-rig detail" (former Landscape tab) drill-down, which is a
+        # separate, single-model tool the chip requirement never applied to
+        # (ls_model / ls_rigs keep their free-text fields).
+        html = webui.INDEX_HTML
+        start = html.index('<legend>capacity matrix')
+        end = html.index('old "Landscape" tab lived here', start)
+        return html[start:end]
+
+    def test_one_sentence_explanation_present(self):
+        section = self._matrix_html()
+        self.assertIn(
+            "does model X fit on rig Y, and with how much context?", section
+        )
+
+    def test_models_are_chips_from_discovered_checkpoints(self):
+        section = self._matrix_html()
+        self.assertIn('id="mx_model_chips"', section)
+        js = _index_script()
+        self.assertIn("async function loadMxModelChips(){", js)
+        self.assertIn("window._models", js.split(
+            "async function loadMxModelChips(){")[1][:600])
+
+    def test_rigs_are_this_rig_plus_composed_from_card_library(self):
+        section = self._matrix_html()
+        self.assertIn('id="mx_rig_live"', section)
+        self.assertIn("this rig (live)", section)
+        self.assertIn('onclick="mxAddRig()"', section)
+        js = _index_script()
+        self.assertIn("function renderMxRigBuilders(){", js)
+        self.assertIn("window._mxCardLib", js)
+
+    def test_exactly_one_calculate_action(self):
+        section = self._matrix_html()
+        # doMatrix() is wired to exactly one button in this section.
+        self.assertEqual(section.count('onclick="doMatrix()"'), 1)
+
+    def test_no_free_text_input_anywhere_in_the_section(self):
+        section = self._matrix_html()
+        self.assertNotIn("<textarea", section)
+        self.assertNotIn('<input type="text"', section)
+        self.assertNotIn('<input id="mx', section)
+
+    def test_calculate_refuses_with_nothing_ticked_rather_than_silently(self):
+        js = _index_script()
+        start = js.index("async function doMatrix()")
+        body = js[start:start + 900]
+        self.assertIn("tick at least one discovered model", body)
+        self.assertIn('tick "this rig (live)" or add at least one', body)
+        self.assertIn("card to a hypothetical rig", body)
 
 
 class TestPresetsRemoved(CustomTestCase):
@@ -3546,25 +3796,50 @@ class TestWizardOwnsTheFlow(CustomTestCase):
 
 
 class TestStopCollapseIsExplained(CustomTestCase):
-    """#2: identical stop columns are the answer, and the page says so.
+    """#2/#215: identical stop columns are the answer, and the page says so.
 
     Investigated and confirmed as an HONEST COLLAPSE, not a bug: the total
     weight bytes are invariant under an MLP redistribution, so the capacity
     objective is flat across the candidate ladder, and the base split is the
-    strict decode optimum. The backend already flagged it per row; the page
-    did not show it.
+    strict decode optimum (#265). The backend already flagged the EXACT case
+    per row; the page did not show it.
+
+    Round 5 generalized this from an annotation (#215: identical columns
+    stayed drawn, just badged "= base") into a real fold: near-identical
+    stops (within a stated percentage threshold on every priced figure, not
+    only byte-identical ones) are dropped from the table and named in the
+    base column's header + a prose note instead, so a reader comparing
+    several "options" that coincide on this rig sees one card, not several
+    that only differ by a label.
     """
 
     def test_a_collapsed_column_says_so_on_its_head(self):
         html = webui.INDEX_HTML
         self.assertIn("lp-same", html)
-        self.assertIn("p.same_as_baseline&&!p.is_base_split", html)
+        self.assertIn("function withinFoldThreshold(p){", html)
+        # the exact-match case from #215 still folds unconditionally
+        self.assertIn("if(p.same_as_baseline) return true;", html)
+
+    def test_fold_threshold_is_visible_not_just_internal(self):
+        # "<1% difference = folded", stated where the reader can see it, not
+        # only as a magic number inside the JS.
+        html = webui.INDEX_HTML
+        self.assertIn("LP_FOLD_THRESHOLD_PCT = 1", html)
+        self.assertIn("Fold threshold:", html)
+        self.assertIn("folded into its column", html)
 
     def test_the_collapse_is_also_explained_in_prose(self):
         html = webui.INDEX_HTML
         self.assertIn("lp-collapse", html)
         self.assertIn("landed on the same answer", html)
         self.assertIn("--rank-kv-ratio", html)
+
+    def test_only_genuinely_different_stops_get_their_own_column(self):
+        # A stop folds only when EVERY one of its priced deltas vs. the base
+        # is within threshold -- one figure outside it is a real difference
+        # and must keep its own column, not be swallowed into the base's.
+        html = webui.INDEX_HTML
+        self.assertIn("deltas.length>0 && deltas.every(pct=>Math.abs(pct)<LP_FOLD_THRESHOLD_PCT)", html)
 
 
 class TestReferencePngIsDerived(CustomTestCase):
