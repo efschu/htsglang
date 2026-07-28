@@ -1366,3 +1366,11 @@ Four properties worth relying on:
 - **A row that claims to be measured carries numbers.** The store re-runs its
   guard on load, so a hand-edited `~/.cache/sglang/split_probe.jsonl` cannot
   put an invented figure on the page.
+
+### Memory-sizing verdict: 27B-FP8 does NOT boot solo on the 5090 (2026-07-28, final)
+
+Three OOM boots with an identical, context-independent 2.37 GiB failure
+(ctx 16384 and 6144 alike): 25 GiB of weights + draft + pools leave no room
+for KV and graphs on 31.34 GiB. User verdict: solo tests stop permanently;
+this model runs at TP >= 2 only. Do not retry with different fractions or
+context lengths.
