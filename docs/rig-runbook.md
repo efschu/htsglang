@@ -292,6 +292,20 @@ naming what the host does have.
 (MoE expert-offload work), the `*-GGUF` trees (GGUF loader work). Smaller
 smoke-test subjects: `Qwen3.5-4B-GGUF`, `Llama-3.1-8B-Instruct`.
 
+Community `qwen35` GGUFs brought up in task #154, both text-coherent and both
+carrying an `mmproj-*.gguf` (so they boot multimodal, see 4.5.1):
+
+| Tree | Arch | Blocks | Topology that works | Measured |
+|---|---|---|---|---|
+| `Tess-4-27B-GGUF-Q6` | `qwen35` | 64 | TP=1 on the 5090, `--mem-fraction-static 0.93` | 3572 tok/s prefill (cold 8k), 54.8 tok/s decode |
+| `Qwen3.6-40B-Deckard-GGUF-Q6` | `qwen35` | 96 | TP=3 uneven, `--rank-tp-ratio auto` → `[30,17,17]` | 727 tok/s prefill (cold 8k), 35.8 tok/s decode |
+
+Neither ships an MTP/NEXTN block in the backbone file, so both boot without
+speculative decoding. Tess additionally ships `mtp-Tess-4-27B-Q8_0.gguf` as a
+**separate** 18-tensor file (`qwen35.nextn_predict_layers = 1`) — a second
+GGUF, not a block inside the backbone; wiring that into
+`--speculative-draft-model-path` is untested.
+
 ### 4.5 GGUF, TP=1 on the 5090
 
 `--model-path` must point at the **`.gguf` file**, not at the directory that
@@ -328,6 +342,54 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
   it; from `bs>=3` (M>=12) it does. Size memory experiments accordingly.
 - The same `LD_LIBRARY_PATH` nvrtc rule as every other recipe (section 2)
   and `--enable-metrics` (section 3) apply.
+
+### 4.5.1 Community GGUFs need a sibling config.json — and it must match
+
+The bespoke families (`qwen35`, `gemma4`) cannot use transformers' GGUF
+metadata reader, so they read geometry and tokenizer from **sibling files next
+to the `.gguf`** (`config.json`, `tokenizer.json`, …; see
+`utils/hf_transformers/config.py::_peek_bespoke_gguf_arch`). Repos that ship
+the `.gguf` alone — which is most community quantizations, including both
+task-#154 trees — therefore do not boot until those files exist. Borrow them
+from a same-family reference tree:
+
+```bash
+REF="$MODEL_ROOT/unsloth-Qwen3.6-27B-GGUF"
+for f in config.json generation_config.json tokenizer.json tokenizer_config.json \
+         vocab.json merges.txt chat_template.jinja preprocessor_config.json \
+         video_preprocessor_config.json; do
+  ln -sfn "$REF/$f" "$MODEL_ROOT/<your-gguf-tree>/$f"
+done
+```
+
+A borrowed config is only correct as far as the two checkpoints share a
+geometry, and that is exactly where it used to fail silently. Depth-merged
+fine-tunes (DavidAU's `Qwen3.6-40B-Deckard` is a 96-block re-stack of the
+64-block Qwen3.6-27B) match the reference in **every** field except the block
+count. Nothing downstream re-read the file, so the loader built a 64-layer
+model, mapped 64 of the file's 96 blocks, dropped the rest and served fluent
+nonsense — no error anywhere.
+
+`gguf_registry.reconcile_sibling_config` now checks the sibling config against
+the file it claims to describe, on every bespoke-family GGUF boot:
+
+- **Depth** (`<arch>.block_count` vs `num_hidden_layers`) is reconciled in the
+  file's favour, with a `GGUF depth reconciliation:` warning naming both
+  numbers. This is the one difference a depth-merge legitimately has.
+- **Everything else** — `hidden_size`, `intermediate_size`, head counts,
+  `head_dim`, and `vocab_size` against the `token_embd` row count — is a hard
+  `ValueError` naming each disagreeing field and both values. A config that
+  disagrees there belongs to a different model and cannot be repaired by
+  renumbering.
+
+Confirm the line in the log before trusting a depth-merge boot; for Deckard it
+reads `has 96 blocks, sibling config.json declares num_hidden_layers=64`, and
+the loader then reports `qwen35 GGUF name map: 1275 tensors for 96 layers`.
+
+An `mmproj-*.gguf` left in the directory is picked up automatically
+(`detect_gguf_multimodal`) and the model boots multimodal, which costs the
+prefill CUDA graph (`Breakable CUDA graph is incompatible with multimodal
+model`). Both #154 trees ship one. Move it aside for a text-only measurement.
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 

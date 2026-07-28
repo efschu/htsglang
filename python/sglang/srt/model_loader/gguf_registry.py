@@ -21,7 +21,11 @@ cannot create an import cycle.
 from __future__ import annotations
 
 import importlib
+import logging
+import re
 from typing import List, Optional, Tuple, Type
+
+logger = logging.getLogger(__name__)
 
 # (family_name, module_path, adapter_class_name).  Order matters only for the
 # arch-tuple ordering exposed by sibling_config_gguf_archs().
@@ -74,3 +78,196 @@ def sibling_config_gguf_archs() -> Tuple[str, ...]:
             if arch not in archs:
                 archs.append(arch)
     return tuple(archs)
+
+
+# ---------------------------------------------------------------------------
+# Sibling-config reconciliation
+# ---------------------------------------------------------------------------
+# The bespoke families read their geometry from a SIBLING config.json rather
+# than from the GGUF metadata (see sibling_config_gguf_archs).  That config is
+# routinely borrowed from a same-family reference repo, because community
+# quantizations ship the .gguf alone.  A borrowed config is only correct as far
+# as the two checkpoints share a geometry -- and depth-merged fine-tunes (e.g.
+# DavidAU's Qwen3.6-40B, a 96-block re-stack of the 64-block Qwen3.6-27B) share
+# everything EXCEPT the block count.  Nothing downstream re-reads the file, so
+# the mismatch is silent: the loader builds a 64-layer model, maps 64 of the
+# file's 96 blocks and drops the rest, and serves fluent nonsense.
+#
+# The GGUF file is authoritative about its own shape, so reconcile against it:
+# override the depth (that is the one difference a depth-merge legitimately
+# has) and hard-fail on every other geometry disagreement, which cannot be
+# repaired by renumbering and means the sibling config belongs to a different
+# model.
+
+#: GGUF KV suffix (under ``<arch>.``) -> config attribute that must MATCH.
+#: A disagreement here is not reconcilable: fail fast.
+_GEOMETRY_CHECKS: Tuple[Tuple[str, str], ...] = (
+    ("embedding_length", "hidden_size"),
+    ("feed_forward_length", "intermediate_size"),
+    ("attention.head_count", "num_attention_heads"),
+    ("attention.head_count_kv", "num_key_value_heads"),
+    ("attention.key_length", "head_dim"),
+)
+
+
+def _gguf_layer_index(tensor_name: str) -> Optional[int]:
+    m = re.match(r"blk\.(\d+)\.", tensor_name)
+    return int(m.group(1)) if m else None
+
+
+def _rebuild_layer_types(
+    old: List[str], n_layers: int, recurrent: Optional[set]
+) -> Optional[List[str]]:
+    """Extend a sibling config's ``layer_types`` list to ``n_layers`` entries.
+
+    Preferred source is ``recurrent`` -- the set of block indices that carry
+    recurrent (SSM/conv) tensors in the actual file, which is what the adapters
+    classify layers from anyway.  Falls back to tiling the sibling pattern at
+    its own period when the family has no recurrent layers (e.g. gemma4, whose
+    layer_types encode a sliding/full attention cycle instead).
+    """
+    if not old:
+        return None
+    if recurrent:
+        # Two labels: whatever the sibling used at a recurrent position and at
+        # a non-recurrent one.  Reading them off the old list keeps the family's
+        # own spelling instead of hard-coding "linear_attention".
+        rec_label = next((old[i] for i in sorted(recurrent) if i < len(old)), None)
+        non_label = next(
+            (
+                old[i]
+                for i in range(len(old))
+                if i not in recurrent and old[i] != rec_label
+            ),
+            None,
+        )
+        if rec_label is not None and non_label is not None:
+            return [rec_label if i in recurrent else non_label for i in range(n_layers)]
+    # Periodic tiling: smallest period that reproduces the sibling pattern.
+    for period in range(1, len(old) + 1):
+        if all(old[i] == old[i % period] for i in range(len(old))):
+            return [old[i % period] for i in range(n_layers)]
+    return None
+
+
+def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
+    """Reconcile a sibling-config geometry against the GGUF file it describes.
+
+    Mutates ``config``'s text config in place (depth only) and raises
+    ``ValueError`` on a non-reconcilable disagreement.  Best-effort: if the
+    GGUF metadata does not carry a field, that field is simply not checked.
+    """
+    import gguf  # lazy: keeps the registry import-light
+
+    reader = gguf.GGUFReader(gguf_file, "r")
+
+    def kv(suffix: str) -> Optional[int]:
+        """The ``<arch>.<suffix>`` metadata value as an int, or None if it is
+        absent or not a single number.
+
+        Not every family stores these as scalars: gemma4 writes a PER-LAYER
+        ``attention.head_count_kv`` list (the same list that makes
+        transformers' GGUF reader unusable for gemma4 in the first place, see
+        _peek_bespoke_gguf_arch). A uniform list still carries one value and is
+        collapsed; a genuinely per-layer one has no scalar counterpart in the
+        config, so it is skipped rather than guessed at.
+        """
+        field = reader.fields.get(f"{arch}.{suffix}")
+        if field is None:
+            return None
+        try:
+            value = field.contents()
+        except Exception:
+            return None
+        if isinstance(value, (list, tuple)):
+            if not value or len(set(value)) != 1:
+                return None
+            value = value[0]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    text_config = (
+        config.get_text_config() if hasattr(config, "get_text_config") else config
+    )
+
+    mismatches: List[str] = []
+    for suffix, attr in _GEOMETRY_CHECKS:
+        want = kv(suffix)
+        have = getattr(text_config, attr, None)
+        if want is None or not isinstance(have, int) or isinstance(have, bool):
+            continue
+        if have != want:
+            mismatches.append(f"{attr}: config.json says {have}, GGUF says {want}")
+
+    # One pass over the tensor directory: the embedding shape (for the vocab
+    # check) and the recurrent-block set (for layer_types) both come from it.
+    embd = None
+    recurrent = set()
+    for tensor in reader.tensors:
+        if tensor.name == "token_embd.weight":
+            embd = tensor
+        elif "ssm" in tensor.name or "conv1d" in tensor.name:
+            idx = _gguf_layer_index(tensor.name)
+            if idx is not None:
+                recurrent.add(idx)
+
+    # Vocabulary is not in the GGUF KV block as a scalar; take it from the
+    # embedding tensor, whose row count IS the vocabulary.
+    vocab = getattr(text_config, "vocab_size", None)
+    if vocab is not None and embd is not None:
+        file_vocab = int(max(embd.shape[:2]))
+        if int(vocab) != file_vocab:
+            mismatches.append(
+                f"vocab_size: config.json says {vocab}, GGUF token_embd has {file_vocab} rows"
+            )
+
+    # ``block_count`` counts the MTP/NEXTN draft block(s) as blocks: an
+    # MTP-carrying Qwen3.6-27B GGUF reports 65 for a 64-layer model, with the
+    # draft stored as blk.64.  num_hidden_layers counts only the backbone
+    # (the draft lives in mtp_num_hidden_layers), so subtract the draft blocks
+    # before comparing -- otherwise every MTP GGUF looks like a depth-merge
+    # one layer deep and gets a bogus 65th layer.
+    n_blocks = kv("block_count")
+    if n_blocks is not None:
+        n_blocks -= kv("nextn_predict_layers") or 0
+    n_config = getattr(text_config, "num_hidden_layers", None)
+
+    if mismatches:
+        raise ValueError(
+            f"GGUF/config.json geometry mismatch for {gguf_file}:\n  "
+            + "\n  ".join(mismatches)
+            + "\nThe sibling config.json describes a different model. Point "
+            "--model-path at a GGUF whose config.json matches, or supply the "
+            "checkpoint's own config.json next to the .gguf file."
+        )
+
+    if n_blocks is None or n_config is None or int(n_config) == n_blocks:
+        return
+
+    # Depth-only difference: the file wins.
+    old_types = list(getattr(text_config, "layer_types", []) or [])
+    new_types = _rebuild_layer_types(old_types, n_blocks, recurrent)
+    if old_types and new_types is None:
+        raise ValueError(
+            f"GGUF {gguf_file} has {n_blocks} blocks but the sibling "
+            f"config.json declares {n_config} layers, and its layer_types "
+            "pattern could not be extended to the file's depth. Supply the "
+            "checkpoint's own config.json next to the .gguf file."
+        )
+
+    logger.warning(
+        "GGUF depth reconciliation: %s has %d blocks, sibling config.json "
+        "declares num_hidden_layers=%d. Using the file's %d (the rest of the "
+        "geometry matches, so this is a depth-merge of the config's model). "
+        "layer_types rebuilt from the file's %d recurrent block(s).",
+        gguf_file,
+        n_blocks,
+        n_config,
+        n_blocks,
+        len(recurrent),
+    )
+    text_config.num_hidden_layers = n_blocks
+    if new_types is not None:
+        text_config.layer_types = new_types
