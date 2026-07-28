@@ -5149,3 +5149,29 @@ Corner recorded (not chased, synthetic stress): the same engineered pressure spi
 also fired stock retract_decode and hard-aborted the OLDER session (500) — under
 strict FCFS the older session should never be evicted; max_spills=1 was exceeded
 by the dual-front clip trick. Backlog task filed.
+
+## #272 Schluessel-Solver (feat/planner-key-solver, f33aa5ce52)
+
+Gemergt in integration/r3-probe-next2. Marker-Gate 0/0/0/0, merge_rc=0.
+Kern: affines Kostenmodell W_r(u)=A_r+m*u_r => alle vier Ziele als
+min max_r(a_r+b_r*u_r) via Water-Filling auf box-beschraenktem Simplex
+(~0,03 s/Solve). Kollektivterm aus der Paar-Matrix (kein Skalar), Rollen
+als Box-Grenzen (shard/kv_donor/replica), Kombi-Ziele als Constraint-Form
++ 2-Ziel-Pareto mit Knee. Strukturbefund: Sum P_r ist invariant unter dem
+Schluessel — der MLP-Schluessel VERSCHIEBT KV, er erzeugt keinen; maxkv
+greift nur ueber den schwaechsten Rang (dec-vs-maxkv kollabiert ehrlich
+auf einen Punkt statt einer Fake-Front).
+Alle 5 Regressions-Gates bestehen, inkl. Rank-Reuse-Klammer: 27B-Q3 x2
+naiv passt NICHT (5090 um 2560 MiB drueber), mit Shared-Byte-Accounting
+passt es (3189 MiB Luft) — Aggregat 3,07x prognostiziert vs 3,94x gemessen
+(einseitiger Fehler, im Test als Einseitigkeit mit-asserted).
+Tests: 62/62 auf dem Integrationszweig (10 s, CPU-only; erster Lauf ohne
+PYTHONPATH=wt-final/python schlug fehl — venv-sglang hat kein key_solver).
+Volle Planner-Suite beim Agenten: 1285 passed, 64 skipped, nur der
+vorbestehende test_reference_png_static_route-Fail. ruff/codespell/mypy sauber.
+OFFEN: webui-Bindung (3 Dispatch-Zeilen, woertlich in solver_api.py-Docstring
++ Runbook 8.7; Praefix-Reihenfolge beachten) — liegt beim UI-Strang.
+Bewusst abwesend statt erfunden: Kollektiv-/Prefill-Terme ohne Paar-Matrix,
+Host-Term ohne Host-Probe, decode-tok/s ohne split_probe-Baseline (nur Ratio),
+ttft_at_n/session_max nur als benannte Interfaces; GGUF-K-Quants auf bf16
+geplant (fp8-Rate haette Rang 2,4x ueberschaetzt).
