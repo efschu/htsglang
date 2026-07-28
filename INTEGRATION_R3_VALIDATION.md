@@ -6098,3 +6098,33 @@ scripts/probe/results/gdr_window_20260728T183514Z.{tsv,log} (Lauf mit
 sauberem Lock-Ablauf), 183412Z = durch Lock-Kollision ungueltiger Erstlauf.
 Konsequenz: Lauf 2 auf dem PVE-Host (hat /dev/infiniband + alle 3 GPUs;
 Probe-Baum host-seitig /spinning/subvol-999-disk-0/spinning/wt-gdr-window).
+
+## GDR-Fensterlauf (#277) — Lauf 3 HOST: erste echte Daten (2026-07-28)
+
+Vorbedingung Lauf 2->3: Host-Port enp4s0f0np0 hatte nur IPv6-Link-Local ->
+kein RoCEv2-IPv4-GID -> alle Transfers scheiterten. Fix: temporaere IPv4
+169.254.77.1/24 (Laufzeit, nach Lauf entfernt, GID-Tabelle verifiziert
+wiederhergestellt). Schwester-Port (Cross-Rig-Link) unangetastet.
+
+BEFUNDE Lauf 3 (Rohdaten results/gdr_window_20260728T184446Z.*):
+1. Stufe-0-Smoke 5090<->CX-4 VOLL PASS: regcheck (ibv_reg_dmabuf_mr,
+   rkey 0x00177361), target NIC->5090 4/4 Marks / 0 bad_bytes, source
+   5090->NIC 4/4 / 0 — dmabuf-GDR auf GeForce+Stock-Treiber intra-rig
+   BEIDSEITIG byte-belegt.
+2. Leitern @1 MiB (median us): client+gdr 162,6 (rc5090) / 162,5 (rc3080b)
+   / 248,8 (pix) vs client+stage 227,6 / 240,0 / 272,2 — gdr schlaegt
+   stage auf den RC-Armen um ~29 %. AUFFAELLIG: PIX-Arm (3080 hinter
+   Switch) ist im gdr-Modus LANGSAMER als beide RC-Arme — gegen die
+   Switch-besser-Intuition, deckt sich mit der X570-RC-Peer-Faehigkeit.
+3. RO-Verdikt: NULL — +/-Relaxed-Ordering durchweg im Rauschen (z.B.
+   162,60 vs 162,62 us). Flag technisch aktiv (Compile-Probe PASS).
+4. W1 (32-GiB-BAR schiebt Umschlag >64 KiB?): auf den vorhandenen Reihen
+   KEIN Beleg — client+gdr ist ueber die ganze Leiter BAR-neutral
+   (+0,1 % @1 MiB rc5090 vs rc3080b). ABER die diagnostisch wichtigste
+   Reihe fehlt:
+5. BUG im eigenen Probe-Code: gpu_is_server+gdr scheitert auf ALLEN drei
+   Armen identisch mit "WC local protection error" (kartenunabhaengig,
+   +/-RO egal) — Server-Rolle registriert die Payload-MR offenbar ohne
+   die noetigen Access-Flags; der konzeptgleiche Smoke-target-Fall
+   (einfacherer Code) besteht. Fix + Nachmessung nur dieser Reihe steht aus;
+   erst danach ist W1 final und die P4-Transport-Entscheidung faellbar.
