@@ -1551,3 +1551,192 @@ allem Bestand kompatibel sein (Nutzer-Wort). Architektur-Konsequenzen:
 Eingangsdaten kommen aus #278 (Umschlagpunkte je Pfad x Richtung x Karte,
 HOL-p99-Faktor aus dem Mix-Szenario, V5-Serialisierung); Baustart erst nach
 deren Bericht.
+
+PRIO-Nachtrag 12 (Analyse auf Nutzerfrage, 2026-07-28): DYNAMISCHES DUAL —
+Lanes bekommen ihre Ressourcennutzung nicht einmalig beim Start, sondern ein
+Regler verschiebt sie lastabhaengig zur Laufzeit. Schreibtisch-Analyse, kein
+Bau; alle Zahlen aus Slice C (DESIGN_121 §11) und dem GDR-/Hibernate-Bestand.
+
+(1) ABGRENZUNG GEGEN NACHTRAG 4/5 — was wirklich neu ist.
+Nachtrag 4 regelt VRAM, getriggert von LEERLAUF, in drei diskreten Stufen,
+mit Amortisationsschwelle und Hysterese. Nachtrag 5 ordnet den KONFLIKT
+(PD gewinnt), das ist eine statische Prioritaet, kein Regler. Die Nutzer-Idee
+faellt in drei Teile, und nur zwei davon sind neu:
+  (a) VRAM-Achse: dasselbe wie Nachtrag 4, andere Worte. Kein neuer Inhalt.
+  (b) TRIGGER-ACHSE: echte Verschaerfung. Nachtrag 4 leiht, wenn eine Lane
+      IDLE ist; die Idee will umverteilen, wenn eine Lane BESCHAEFTIGT, aber
+      marginal weniger wert ist. Aus "Leerlauf-Schwelle in Sekunden" wird
+      "marginaler Beitrag zum Aggregat" — Nachtrag-4-Leerlauf ist dann der
+      Sonderfall Grenzbeitrag=0. Das ist eine echte Verallgemeinerung.
+  (c) RESSOURCEN-ACHSE (Compute und Bandbreite GETRENNT regelbar): als
+      Hardware-Zuteilung existiert das auf diesem Rig NICHT — siehe (2).
+      Als WORKLOAD-Komposition existiert es, und dann ist es Slice D.
+Ehrliches Fazit zu Frage 1: (b) ist neu, (c) ist neu nur in der Lesart
+"Lastmischung statt Ressourcenzuteilung", (a) ist Bestand.
+
+(2) STELLHEBEL, ehrlich bewertet. Die Lanes sind seit C1/C2 THREADS EINES
+PROZESSES mit eigenem Stream — das entscheidet die halbe Tabelle.
+| Hebel | verfuegbar? | taugt zur Compute/Bandbreiten-Trennung? |
+|---|---|---|
+| Stream-Prioritaet (C2, -3 aus [0,-3]) | ja, gebaut | nein — ordnet nur die Reihenfolge freiwerdender Bloecke, teilt nichts zu |
+| Admission-Yield / Duty an der Korngrenze (C2) | ja, gebaut | nein, aber wirksam: verschiebt ZEITanteil, byte-neutral |
+| MPS `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` | ja, aber PROZESS-gebunden (Client liest es bei Kontext-Erzeugung) | UNBRAUCHBAR fuer Ein-Prozess-Lanes; erzwaenge Rueckbau auf Prozess-Lanes und damit Verlust der geteilten Bytes — der Kern des ganzen Strangs |
+| Green Contexts / SM-Masken (libcuda) | Symbole im Treiber vorhanden (`cuGreenCtxCreate`, `cuDevSmResourceSplitByCount`, `cuCtxFromGreenCtx`, `cuGreenCtxStreamCreate`; Treiber-CUDA 13.2), GeForce-Tauglichkeit + Granularitaet UNGEPRUEFT | einziger echter SM-Zuteiler in EINEM Prozess — aber siehe Graph-Falle in (4) |
+| Verleih-Primitive Stufe 2 (C2) | ja, gebaut, 0,76/2,49 ms | regelt VRAM, nicht Compute |
+| Chunk-/Batch-Groessen-Regler (Scheduler) | billig, teils vorhanden (`--dual-group-lane-speed-dial`) | INDIREKT der staerkste Hebel: Batchgroesse ist der arithmetische-Intensitaets-Regler (Decode bandbreiten- -> rechengebunden), Chunkgroesse zerlegt die SM-saettigende Prefill-Spitze. Preis: nicht byte-neutral, siehe (4) |
+KERNBEFUND: BANDBREITE IST AUF DIESER HARDWARE NICHT ZUTEILBAR. Es gibt kein
+Speicher-QoS auf GeForce (MIG existiert dort nicht, und weder sm86 noch sm120
+bieten Memory-Controller-Partitionierung). Die Bandbreiten-"Zuteilung" kann
+ausschliesslich indirekt entstehen, indem man WAEHLT, welche Lastform wo
+laeuft — Prefill saettigt SM, Decode saettigt Bandbreite (Nachtrag 10 (3),
+gemessen als dir1 +9,7 % gegen Decode-Arm E 1,440). Damit ist die
+interessanteste Lesart der Nutzer-Idee nicht als Ressourcen-Regler baubar,
+sondern nur als LASTMISCHUNGS-Regler. Das ist keine Abwertung: der
+Decode-Arm-Gewinn (+57,5 % gegen +16,0 %) ist genau der Betrag, den die
+richtige Mischung schon heute kauft.
+
+(2b) GEWICHTS-REDUNDANZ-BUDGET JE KARTE (Nutzer-Ergaenzung) — der Vorab-
+Parameter, der den AKTIONSRAUM des Reglers festlegt: wieviel Modell darf eine
+Karte ZUSAETZLICH zum notwendigen Minimum halten (bis zu einem ganzen Modell).
+(a) STUFEN, aus der Nesting-Algebra statt aus dem Bauchgefuehl. Eine
+    Layout-Menge ist ihre Schnittmenge (`partition_cuts` liefert das Cut-Set;
+    Verfeinerung = Obermenge der Cuts). Daraus drei Korrekturen am
+    Bauchgefuehl:
+      - Budget 0 ist NICHT "ein Layout". Wer das FEINSTE je gewuenschte
+        Cut-Set haelt, bekommt jede GROEBERE Aufteilung geschenkt (jeder
+        grobe Shard ist eine Vereinigung feiner Shards) — der gesamte
+        Down-Set der gehaltenen Cuts ist gratis erreichbar.
+      - Bezahlt wird nur UNVERGLEICHBARKEIT: zwei Layouts, deren Cuts an
+        verschiedenen Stellen liegen (das `nesting_hull`-Beispiel [6,2] gegen
+        [7,1] auf [6,1,1] — beide nisten in der Gruppe, in EINANDER bei
+        keinem Unit-Count). Und auch dann nicht ein zweites ganzes Modell:
+        der Preis ist exakt
+          delta = SUMME ueber Karten von ( |A_range VEREINIGT B_range| - |A_range| )
+        also nur die Shards, die ueber die abweichende Schnittkante ragen.
+        Gehalten wird die gemeinsame Verfeinerung (Vereinigung der Cut-Sets),
+        dann sind BEIDE Layouts Vereinigungen gehaltener Shards.
+      - Erst die Voll-Freiheit kostet voll: 1,0 Modell je Karte = jede Karte
+        kann jede Rolle solo (DP-artig).
+    Sinnvolle diskrete Leiter: R0 = feinstes Cut-Set (Down-Set gratis);
+    R1 = R0 + straddle-delta fuer eine BENANNTE zweite Layout-Familie
+    (typisch klein, weil nur Randshards); R2 = Nachtrag-10-Fall (TP2-Haelfte
+    je Karte mit genisteten TP4-Vierteln = 2,0x gegen das TP4-Minimum, dort
+    bereits als "ein Viertel Modellgroesse weniger KV-Raum" beziffert);
+    R3 = 1,0 Modell je Karte. Kontinuierlich ist der Trade nur formal — real
+    springt er an den Cut-Sets, und die Leiter IST die zulaessige Menge.
+(b) UMSCHALTKOSTEN je Stufe:
+      - Bytes gehalten, Layout im Down-Set: Plan-Flip (`_TP_PARTITION_RATIOS`
+        + `segments`, seit C1 kontext-lokal) = Mikrosekunden. Der Preis ist
+        nicht Zeit, sondern GRAPH-SPEICHER: jedes erreichbare Layout braucht
+        sein eigenes Capture-Set und seinen eigenen Pool (C1 gibt Pools je
+        Lane). Umschaltfreiheit kostet also zweimal VRAM — Gewichte plus
+        Graph-Pools.
+      - Bytes NICHT gehalten: Nachladen aus RAM/Disk. Groessenordnung aus
+        Hibernate #89: 8-14 s fuer uneven TP=3 (von 50 s). Das sind drei bis
+        vier Groessenordnungen ueber dem Verleih-Zyklus (3,25 ms) und fuenf
+        ueber einem Plan-Flip. Amortisation bei ~10 s Umschaltpreis und
+        plausiblen 20-50 % Gewinn verlangt MINUTEN stabiles Regime.
+      HARTE FOLGERUNG: der Regler darf ausschliesslich innerhalb der
+      gehaltenen Byte-Menge arbeiten. Alles, was Nachladen verlangt, ist
+      Nachtrag-4-Stufe-3 (Handover #261) und gehoert nicht in die
+      Regelschleife, sondern in den Moduswechsel.
+(c) SOLVER-ANBINDUNG, damit es rechenbar statt gefuehlt ist: das Budget geht
+    zweimal ein. Als BOX-GRENZE ueber `coresident_budgets` — die
+    Redundanz-Bytes sind vorab reserviert (`reserve_mib` bzw. reduziertes
+    `effective_vram_mib` in `PlanInputs`, genau der Parameter, den
+    `_capacity_under` schon variiert), womit die KV-Kapazitaet automatisch
+    gegen die Umschaltfreiheit rechnet. Und als AKTIONSRAUM ueber
+    `nesting_hull(lanes, probes)`: die Kandidaten-Layouts werden als
+    Lane-Keys eingespeist; was nistet, ist gratis erreichbar, was nicht
+    nistet, bekommt das delta aus (a) aufgeschlagen oder faellt raus. Damit
+    wird die Solver-Frage: maximiere E ueber (Lane-Menge, Redundanz-Budget)
+    unter der `coresident_budgets`-Klammer. Das ist dieselbe Pareto-Front wie
+    in Nachtrag 8 (c), nur mit einer zusaetzlichen Achse.
+
+(3) REGLER-SKIZZE.
+SIGNAL: `prefill_wait_ms` ist als Sensor untauglich und der Grund ist bekannt
+— gemessen 0,01 ms, waehrend die Device-Zeit von 583 auf 627-638 ms stieg.
+Es misst Einreihung, die Konkurrenz sitzt aber in der Rechenzeit. Das
+richtige Signal steht schon in der C3-Formel: der ONLINE gemessene
+Degradationsanteil
+    share_c = Rate_c(gemeinsames Fenster) / Rate_c(solo-Boden)
+je Lane, aus CUDA-Events auf dem jeweiligen Lane-Stream gegen die beim Boot
+erhobenen Boeden. Damit ist das Sensorsignal IDENTISCH mit der
+Slice-D-Zielfunktion E = SUMME share_c — der Regler misst genau das, was er
+maximieren soll, und braucht keine Profiler-Zaehler.
+UNTERSCHEIDUNG SM- gegen BANDBREITEN-KONKURRENZ ohne Hardware-Zaehler
+(DCGM-Prof-Metriken sind auf GeForce nicht verlaesslich): die Lastform wird
+ANALYTISCH etikettiert statt gemessen — der Kostenmodell-Pfad
+(`build_cost_model` / `uneven_perf`) kennt aus der Batch-Form FLOPs und
+gelesene Bytes und damit die arithmetische Intensitaet des Schritts. Regel:
+degradieren zwei Schritte hoher Intensitaet gemeinsam -> SM-Konkurrenz
+(dir1-Fall); degradieren zwei Schritte niedriger Intensitaet gemeinsam ->
+Bandbreite. Der Regler braucht also Etikett (analytisch) x Degradation
+(gemessen), beides vorhanden.
+STELLGROESSE + ZEITKONSTANTEN, zwei Schleifen mit verschiedenen Takten:
+  - SCHNELL (byte-neutral, gratis): Admission-Duty und Stream-Prioritaet an
+    der Korngrenze. Kosten praktisch null (64 Yields/32 s = 0,35 % des
+    Fensters, Max 2,17 ms), Takt bis Iterationsgrenze (~33,8 ms Verify) =
+    bis ~30 Hz. Messfenster muss aber ueber dem Rauschboden liegen
+    (A-vs-A-Spannweiten 0,25-0,39 %), also EMA ueber ~1 s.
+  - LANGSAM (kostet, nicht byte-neutral): VRAM-Verleih (Zyklus 3,25 ms,
+    Amortisation ~0,1 s -> hoechstens ~10 Hz sinnvoll, praktisch ~1 Hz) und
+    Chunk-/Batch-Stufen.
+HYSTERESE: wie bei #156 und wie die bestehende 5-s-Leerlaufschwelle —
+Umschalten erst, wenn der geschaetzte E-Gewinn ueber mehrere Fenster stabil
+groesser ist als der Rauschboden PLUS Umschaltkosten; Flaps zaehlen, nicht
+verweigern (der bestehende `refused_min_hold`-Vertrag bleibt).
+
+(4) GEFAHREN, konkret.
+  - GRAPH-KOMPATIBILITAET ist die harte Grenze (Nachtrag-3-Regel). Green
+    Contexts sind der einzige echte SM-Zuteiler, aber ein Graph ist an den
+    Kontext gebunden, in dem er gecaptured wurde: eine SM-Aufteilung zur
+    Laufzeit AENDERN hiesse re-capturen — verboten. Der einzige zulaessige
+    Bau ist eine VORAB gecapturete Leiter weniger fester Splits, deren Preis
+    Graph-Pools mal Sprossenzahl ist. Damit ist auch die Frage "kontinuier-
+    licher Regler?" entschieden: fuer alle Form- und Kontext-Stellgroessen
+    ist der Aktionsraum DISKRET und wird von der Capture-Leiter definiert;
+    kontinuierlich sind nur die schwachen Zeitanteil-Hebel.
+  - DETERMINISMUS: Prioritaet und Duty sind byte-neutral (sie aendern WANN
+    Kernel laufen, nicht welche Formen). Chunk- und Batchgroesse sind es
+    NICHT — andere Kachelung, andere Reduktionsreihenfolge. Daraus die
+    Regel: Form-Stellgroessen duerfen nur an REQUEST-Grenzen wirken,
+    Zeitanteil-Stellgroessen an jeder Korngrenze. Sonst ist die eigene
+    Byte-Gate-Methodik nicht mehr anwendbar.
+  - MESSBARKEIT: E ist nur je REGLER-ZUSTAND definiert. Jedes Fenster muss
+    die Sprossen-Id mitfuehren; ein E ueber ein Fenster mit Sprossenwechsel
+    ist unauswertbar und darf nicht berichtet werden. Das ist Buchfuehrung,
+    kein Bau, aber es muss vor der ersten Messung stehen.
+  - RUECKKOPPLUNG AUF SICH SELBST: der Regler aendert die Last, an der er
+    misst (Selbstkonditionierungs-Falle aus #156). Die Solo-Boeden muessen
+    deshalb aus einem regler-freien Boot stammen und duerfen nicht im
+    laufenden Betrieb nachgezogen werden.
+
+(5) VERDIKT.
+JA, lohnender naechster Schritt — aber NEU GERAHMT: es ist kein neuer
+Ressourcen-Zuteilungs-Mechanismus, sondern SLICE D MIT REGELSCHLEIFE. Der
+Dispatcher steigt vom offenen Router zum geschlossenen Regler auf, E ist
+seine gemessene Zielgroesse, und Nachtrag-4-Leerlauf wird Sonderfall des
+Grenzbeitrag-Triggers. Slice D wird also weder ersetzt noch ergaenzt — er
+bekommt seine Zielfunktion und seinen Aktionsraum praezisiert, plus die
+Budget-Achse aus (2b).
+KLEINSTER FALSIFIZIERBARER SLICE, in dieser Reihenfolge, jeweils Abbruch bei
+Rot:
+  S1 (Buchfuehrung, kein Mechanismus, GPU-leicht): E ONLINE aus den bereits
+     vorhandenen CUDA-Event-Zeiten und den Boot-Boeden je 1-s-Fenster
+     schaetzen und protokollieren. FALSIFIKATOR: wenn die Online-Schaetzung
+     den Rauschboden (0,25-0,39 %) nicht unterbietet, ist KEIN Regler
+     baubar, egal welche Stellhebel es gibt. Billigster Test, kommt zuerst.
+  S2 (20-Zeilen-ctypes-Probe, ein freies Fenster): Green Context mit
+     SM-Split auf sm86 UND sm120 erzeugbar? Welche Granularitaet? Und:
+     ueberlebt ein in einem Green-Context-Stream gecaptureter Graph einen
+     Wechsel der Aufteilung? Entscheidet, ob es ueberhaupt einen SM-Hebel
+     gibt oder ob (2c) endgueltig auf Lastmischung zusammenfaellt.
+  S3 (A/B auf dem bestehenden Slice-C-Stand, kein neuer Code): zwei feste
+     Sprossen der schon gebauten Hebel (Duty/Speed-Dial/Prioritaet) gegen
+     die Festeinstellung, gemessen an der SCHLECHTEN Paarung
+     (Prefill x Prefill, dir1). FALSIFIKATOR: schlaegt keine Sprosse die
+     Festeinstellung um mehr als den Rauschboden, gibt es nichts zu regeln —
+     dann bleibt es beim statischen Dispatcher-Entscheid.
+S1 und S3 brauchen keinen neuen Mechanismus, nur Messung; erst danach
+lohnt Bau. Einreihung: nach der Lane-Spec-Kette, vor Slice-D-Bau.

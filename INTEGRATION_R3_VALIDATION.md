@@ -6164,3 +6164,53 @@ haelt. Nicht getestet (bewusst): Rig-2-GPU-Seite (2080-Ti-Topologie-Defekt,
 sm75 zurueckgestellt), kleine Groessen (BUFSZ fest 2 MiB), Bandbreite.
 Binaries wiederverwendbar: /root/gdr-verify/ (Rig 1), /root/gpurdma_03_transfer
 (Rig 2). #277 damit ABGESCHLOSSEN; P4-Nein-Verdikt unveraendert.
+
+## GDR-Voll-Matrix (#278) — saubere Neumessung, Verdikte V1-V5 (2026-07-28)
+
+Alles vor ~20:14Z kontaminiert (paralleler sglang) -> GESAMTE Matrix
+20:22-20:53Z auf exklusiver Kiste neu (5 s/Punkt, 7 Phasen, 0 IOMMU-Faults
+beide Rigs, Rohdaten wt-gdr-window scripts/probe/results/clean/, Werkzeug
+cb622041ab). Rauschboden ehrlich: Mittel 5,6 %, aber 80-KiB-Punkt BIMODAL
+(16 vs 49 us in identischen Laeufen) — nur Effekte >Faktor 1,5 berichtet.
+
+V1 Richtungsasymmetrie: NUR auf der Switch-Karte (Lesen/Schreiben 1,76x auf
+   3080@05:00.0); Root-Port-Karten symmetrisch (1,05x). 2080 Ti: schreiben
+   95 % vom Draht, lesen 33 %.
+V2 BESTAETIGT mit Pointe: die Karte am GEMEINSAMEN Switch mit der NIC traegt
+   den Aufschlag — "gleicher Switch = besser" ist falsch.
+V3 GEKIPPT: kein Umschlagpunkt, sondern ein BAND 64-80 KiB, bei allen drei
+   Karten identisch (BAR-Groesse irrelevant, konsistent mit W1). Ausserhalb
+   des Bands gewinnt DIREKT ueberall: 20 KiB 1,26x, 1 MiB 1,19x, 4 MiB 1,24x.
+   Uebergabe-Behauptung "3,4x langsamer @1 MiB" FALSIFIZIERT.
+V4 GEKIPPT: 2080 Ti als Quelle UND Ziel PASS mit Byte-Pruefung — §7 war
+   das IOMMU-Symptom.
+V5 BESTAETIGT: NIC-Relay serialisiert — 3 Paare parallel: 2,34x Latenz,
+   Aggregat nur 1,28x (die eine Gen3-x4-NIC ist die Wand). Kein
+   Multi-Paar-Transport.
+DEPTH-VERDIKT (Wire-Sockel abgezogen): das 64-80-KiB-Band ist WEICHER
+   RUECKSTAU — Pipelining-Tiefe >=4 loescht es VOLLSTAENDIG (28,5 -> 11,9 us,
+   identisch mit Draht); bei 1 MiB harter Draht-Deckel, Tiefe wirkungslos.
+   KONSEQUENZ fuer #279: "immer direkt + depth>=4" koennte den Pfad-Split
+   ganz eruebrigen — einfachste Dispatcher-Hypothese zuerst testen.
+MIX/HOL: In-QP-Mix zeigt strukturell kein Blocking (Ping-Pong ohne Queue);
+   NEBENLAST-Arm dafuer deutlich: p99-klein unter 1-MiB-Fremdlast — direkt
+   2,52x, staging 3,64x (intra); cross gdr 0,99x (pruefbeduerftig markiert),
+   cross stage 3,29x. Direktpfad ist im Schwanz durchweg robuster.
+OFFEN: (a) NCCL/System-RAM-Referenz (torch nur im Container — wichtigster
+   Nachtrag: schlaegt NIC-Relay den ECHTEN heutigen Pfad?); (b) echter Bug
+   3080@Switch -> 2080 Ti VRAM<->VRAM "WC remote invalid request error"
+   (reproduzierbar, andere Kombos ok); (c) cross-gdr-0,99x verifizieren.
+
+## Nachtrag 12 (DESIGN_201): dynamisches Dual — Analyse-Verdikt
+
+Es IST Slice D mit Regelschleife, kein neuer Mechanismus. Neu ist nur die
+Trigger-Achse (Grenzbeitrag statt Leerlauf). Bandbreite auf GeForce nicht
+zuteilbar; MPS scheidet aus (Lanes sind Threads EINES Prozesses); Green
+Contexts einziger echter In-Prozess-SM-Zuteiler (GeForce-Tauglichkeit
+ungeprueft); staerkster praktischer Hebel bleibt Batch/Chunk. Redundanz-
+Budget: Down-Set-Einsicht (feinstes Cut-Set haelt alle groeberen gratis,
+bezahlt wird nur Unvergleichbarkeit), Leiter R0-R3, Umschalten nur innerhalb
+gehaltener Bytes (sonst 8-14 s = 4 Groessenordnungen ueber Verleih-Zyklus);
+Solver-Anbindung via nesting_hull + reserve_mib. Reihenfolge: S1 Online-E-
+Schaetzung gegen Rauschboden -> S2 Green-Context-Probe -> S3 A/B zweier
+fester Sprossen. Details in docs/DESIGN_201 Nachtrag 12.
