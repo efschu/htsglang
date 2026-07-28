@@ -5529,3 +5529,43 @@ Operativ relevant bleibt hier nur:
   partition_cuts nimmt deshalb den fertigen Vektor als Split.
 - Tests: 144 gruen (vorher 76+34), alle 5 Gates + beide coresident-Regressionen
   unveraendert (A 240361 / C 342942); ruff/codespell/mypy sauber. Marker 0.
+
+## Wizard v2, GPU-freie Posten (feat/wizard-v2, gemergt) + 4 UI-Punkte
+
+- KIPPPUNKTE (wizard_tipping, /api/wizard/tipping): 4 Schwellen (MLP-
+  Konzentrations-Break-even, decode-knee, Satellit-Break-even-Prefillrate,
+  Link-Raten-Schwelle), je Zeile was-kippt/Herkunft/auf-welcher-Seite;
+  "Jetzt messen" verdrahtet auf VORHANDENE Jobs (split_probe #232,
+  commsuite cross_rig) mit Dauer-/Karten-/Unterbrechungs-Vorschau; Knopf bei
+  belegter Karte deaktiviert MIT Nennung der haltenden PIDs; Karte ohne UUID
+  = busy:null statt false. Herkunft hier: 2 measured / 1 estimate / 9 absent,
+  8 von der Seite startbar.
+- RATEN-LESEPFADE (wizard_links): #212-Konstanten nicht mehr erste Quelle;
+  Leiter Form -> dieses Rig (Paar-Matrix, Comm-Suite-Artefakt) -> Referenz-
+  anker als estimate -> absent+Studie; begangene Sprossen im Payload; REGEL
+  ALS TEST: intra-rig-Paarwert fuellt NIE eine cross-rig-Zelle.
+- OFFLOAD-TIEFE (wizard_offload): Stufen 1.0/0.75/0.5/0.25/0.0 mit Gewinn/
+  Preis/lohnt-fuer; Kaufseite arithmetisch aus dem Plan-Expertenpool (ceil-
+  Rundung OFFENGELEGT); Decode-Preis auf JEDER Stufe ehrlich absent mit
+  Beleg-Zitaten, die benennen was sie NICHT sagen; Rat kippt zwischen
+  "schliesst die Luecke" und "elektiv" je nach Plan-Fit.
+- NVLINK-INSELN (wizard_islands): 3 Familien; auf diesem Rig korrekt "keine
+  Insel-Struktur" + Beschreibungs-Pfad; auf beschriebener Hardware Estimates
+  aus der roofline-Discount-Leiter via getattr (Rename dort bricht einen Test
+  hier statt die Leiter zu forken); Antwort ist RATIO zweier Sprossen, nie
+  vorhergesagte Rate; nie absent-verweigert (Rig-ist-Untergrenze-Regel).
+- LANE-MODELL (wizard_lanes, Nachtrag 8): LaneSet als Liste ab Zeile 1,
+  Prioritaets-KLASSEN, Ko-Residenz paarweise ueber die Menge; Zwei-Arm-
+  Familien mit ZWEI Lanes und leeren Kartenmengen (Kartenzuteilung = #258,
+  bewusst offen); Test lehnt Paar-Signaturen ab.
+- 4 UI-PUNKTE (direkt vom Nutzer an den Agenten): Geladen-Modell-Leiste ueber
+  den Tabs (served name, Quant, echtes max_total_num_tokens, Sessions,
+  Kontext; Unberichtetes sagt "not reported"), falsches Stale-Grau entfernt +
+  Familien rechnen direkt bei Checkpoint-Wahl, eigener Scanning-Zustand,
+  Rejected-Register als breitensichere Karten mit Level-Filter + 3 Kurzzeilen
+  je Eintrag (21), not-default-Zeilen mit Override-Knopf, Blocked ohne
+  Schalter per Konstruktion.
+- Benannte Zonen-Abweichung: Modell-Leiste ist Header-Markup in webui.py
+  (ein selbstumschlossener Block) — Merge trotzdem kollisionsfrei, Marker 0.
+- Tests: 52 neue hermetisch; planner+rigmon auf gemergtem HEAD 1794/64/0;
+  Inline-Seitenskript jetzt syntax-geprueft per Test. Kein GPU-Zugriff.
