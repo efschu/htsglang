@@ -5075,3 +5075,20 @@ the TP=3 production path with the tuned 5090-SHARD configs (N=15872,K=5120 +
 N=5120,K=7936) — expectation honestly bounded by the 68-75 % collective floor; a
 result below the noise floor will be reported as "unter der Nachweisgrenze", with
 the microbench remaining the mechanism-level evidence.
+
+## #255 round 2 — shard-config A/B on the TP=3 production path: E2E at/below the noise floor
+
+Both arms booted the runbook TP=3 recipe cleanly (READY 80/70 s, no OOM, ~7k prefill
+fine). The 5090 rank requests FIVE shapes under auto-performance (7168/5120,
+5120/2688, 15872/5120, 5120/7936, 5120/3072); the tuned set covered only two of
+them. Paired result: two of three decode windows and the prefill inside the
+2.7-4.2 % noise floor; one window showed +11.1 % but its own arm-B window-length
+variance (+6.2 % from 1000->1400 tokens alone) contaminates it — recorded as
+"possible, not isolatable", not as a confirmed gain. accept_length differs slightly
+between arms (2.456 vs 2.672 in w1) — different kernel tilings change fp8
+accumulation order, near-but-not-bit-identical outputs under greedy (known
+Marlin-class behavior). The two covering configs are committed here regardless:
+per-shape tuned tiles are microbench-verified and cannot regress (worst case equal);
+the three missing shapes are queued in the idle tuner and follow the same way.
+E2E verdict for the tuning story stays honest: microbench-level -45.6 %/-17.9 % at
+M=4, production-path effect below the detection limit of this rig's TP=3 setup.
