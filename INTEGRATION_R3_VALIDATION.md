@@ -6214,3 +6214,23 @@ gehaltener Bytes (sonst 8-14 s = 4 Groessenordnungen ueber Verleih-Zyklus);
 Solver-Anbindung via nesting_hull + reserve_mib. Reihenfolge: S1 Online-E-
 Schaetzung gegen Rauschboden -> S2 Green-Context-Probe -> S3 A/B zweier
 fester Sprossen. Details in docs/DESIGN_201 Nachtrag 12.
+
+## NCCL-Referenz (#278-Abschluss): Direktpfad schlaegt den ECHTEN Pfad (2026-07-28)
+
+Intra-rig 5090<->3080, halber Round-Trip, us — NCCL 2.28.9/SHM (kein P2P)
+gegen NIC-Relay (nccl_reference.py in wt-gdr-window, 2cde828c52):
+  20 KiB: NCCL send/recv 37,4 | all_reduce 46,6 | RELAY DIREKT 7,4 (5,08x)
+  80 KiB: 44,3 | 76,7 | 16,6 (2,67x)
+  1 MiB: 220,8 | 326,1 | 169,9 (1,30x)
+Rangfolge klein: direkt < staging < NCCL; bei 1 MiB faellt NIC-Staging
+hinter NCCL zurueck (0,85x). world=3 verteuert nur das Kollektiv, nicht die
+Paarstrecke. LAST-ACHSE (Vorbehalt): NCCL gegen NIC-Fremdstrom fast immun
+(20 KiB 1,16x — benutzt die NIC nicht), Relay-direkt degradiert 2,52x im
+p99 — behaelt netto ~2x Vorsprung; NICHT symmetrisch erhoben (p50 vs p99)
+— fuer #279 beidseitig p99 unter identischer Last nachziehen.
+KONSEQUENZ: "schlaegt der NIC-Umweg den heutigen System-RAM-Pfad" ist mit
+JA beantwortet, am staerksten exakt auf den Kollektivgroessen. Zusammen mit
+depth>=4 (loescht das 64-80-KiB-Band) und V5 (Relay serialisiert bei
+Mehr-Paar) ist die Dispatcher-Datenlage (#279) komplett bis auf die
+symmetrische Last-Messung. Naechstes Fenster: #280 (GPU->GPU-BAR-
+Schreibprobe F1-F4 — wuerde die V5-Wand umgehen: eigener PCIe-Pfad je Paar).
