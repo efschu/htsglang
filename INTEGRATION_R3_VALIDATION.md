@@ -5446,3 +5446,27 @@ Operativ relevant bleibt hier nur:
   den Fremdnutzer des Forks nicht voraussetzen koennen. Damit kein Fork-Feature.
   Wiederaufnahme nur, wenn NORDSTERN (TP=5 cross-rig) wieder aktiv wird UND eine
   Messung Host-Staging als bindend ausweist.
+
+## Guards #268 + #269 (fix/guards-268-269, gemergt)
+
+- #268: assert_expert_offload_quant_supported() VOR dem try/except des
+  Offload-Installers (layer.py _install_expert_offload) — GGUF-MoE/MoeWNA16 +
+  RESIDENT_EXPERT_FRACTION<1 = harter RuntimeError mit Nennung der
+  unterstuetzten Pfade (fp8/GPTQ/AWQ). Vorher wurde der Fehlerfall vom
+  try/except geschluckt und lief still "fully resident" bzw. bei MoeWNA16
+  durch einen nie validierten Slice-Pfad. Deny-List je Klassenname (benanntes
+  Restrisiko: kuenftige MoE-Quants muessen gelistet werden). Per-Layer/
+  per-Rank = dual-group-tauglich.
+- #269: Wurzelursache war NICHT nur der tote Flag — GGUFConfig
+  get_min_capability() stand auf 60 (Pascal, veraltet), dadurch passierte
+  sm75 den vorhandenen #171-Floor ungehindert. Fix: Floor 80 + 
+  supports_current_device() liefert _has_sgl_gguf_kernels (die woertliche
+  Verdrahtung des versprochenen Flags) — kein neuer Callsite, laeuft je Rank
+  VOR dem Gewichts-Load. Doppelter Schutz: numerischer Floor greift auch,
+  falls der Flag-Signalweg versagt.
+- Nebenbefund des Agenten: der Branch-Basisstand trug die #171-common.py-Helper
+  nicht; Cherry-pick d053aaf42e als Voraussetzung — beim Merge kollisionsfrei
+  aufgegangen (common.py auf HEAD bereits vorhanden, 5 Dateien im Diff).
+- Tests: 19 neue hermetische Tests; Regressions-Sweep quantization/
+  model_loader/moe_offload auf dem gemergten HEAD: 228 passed / 5 skipped
+  (GPU-only) / 0 failed. Marker-Gate 0 auf allen drei Kern-Dateien.
