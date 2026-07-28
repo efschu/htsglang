@@ -6340,6 +6340,17 @@ class ServerArgs:
             self._warn_budget_exceeds_free(budgets, mem_info)
             if reserve_was_pinned:
                 self._warn_pinned_reserve_shortfall(reserve_per_gpu, budgets, counts)
+            # Park the DERIVED reserve demand per physical GPU for the
+            # auto-performance ladder (#265). Under 'auto' it is the reserve
+            # itself; under a pinned reserve it is the bar
+            # _warn_pinned_reserve_shortfall already measures against, and
+            # the ladder needs the same number to tell a candidate that
+            # merely costs context from one that leaves a rank unable to fund
+            # its own boot. Computed here because this is the one place that
+            # already holds the per-GPU rank counts.
+            self._derived_rank_auto_reserve_per_gpu = (
+                self._derived_reserve_demand_per_gpu(counts)
+            )
 
         budgets = (
             list(self.rank_gpu_memory_mib)
@@ -7185,6 +7196,26 @@ class ServerArgs:
                     logger.warning("%s", note)
         except Exception as e:  # pragma: no cover - advisory only
             logger.debug("Could not evaluate the budget against free VRAM: %s", e)
+
+    def _derived_reserve_demand_per_gpu(self, counts) -> Dict[int, int]:
+        """``{physical gpu id: derived_rank_auto_reserve_mib}`` for the GPUs
+        this plan uses, or ``{}`` when it cannot be computed.
+
+        The same demand model ``--rank-auto-reserve-mib auto`` installs and
+        ``_warn_pinned_reserve_shortfall`` warns against; parked so the
+        auto-performance ladder can use it without re-deriving it (#265).
+        Failure degrades to an empty mapping: the ladder then reports
+        residual free VRAM without a verdict, which is the pre-#265 behavior.
+        """
+        try:
+            gpu_mem = get_device_memory_capacity(self.device)
+            return {
+                gpu_id: self.derived_rank_auto_reserve_mib(gpu_mem, cnt)
+                for gpu_id, cnt in counts.items()
+            }
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not derive the per-GPU reserve demand: %s", e)
+            return {}
 
     def _warn_pinned_reserve_shortfall(
         self,

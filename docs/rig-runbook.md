@@ -161,6 +161,23 @@ Non-obvious points, each load-bearing:
   derives budgets from NVML totals minus the reserve. An explicit
   `--rank-gpu-memory-mib` is each rank's ENTIRE budget (no hidden safety
   factor) and conflicts with `--mem-fraction-static`.
+- On this rig, at this reserve, `auto-performance` now proposes **no MLP
+  vector at all** and says so ("enc has no effective lever at this operating
+  point", task #265). That is the measured answer, not a regression: the
+  #264 A/B put the shard rebalance at net negative here (prefill +8.2 %,
+  decode step +14.4 %, KV −47.9 %), and the recalibrated decode model
+  (#265) no longer reports the small concentration steps as decode gains.
+  The plan log names which gate bound — floor, decode-knee, or fundability —
+  and only recommends `--rank-perf-loose-ctx-percent` when the floor is the
+  one that did.
+- A candidate marked `UNBOOTABLE` in that log is not a context trade: it
+  leaves a rank below its derived reserve demand, so raising
+  `--rank-perf-loose-ctx-percent` buys an OOM in the first real prefill
+  rather than a slower server. The knob for it is
+  `--rank-auto-reserve-mib` on the named GPU. Measured instance: pinning
+  `--rank-mlp-ratio 6,1,1` needs `4500,2700,2700` where the auto split runs
+  at `3000,2700,2700` (at 3000 rank 0 ends the boot with 0.38 GB free and
+  dies in the first prefill).
 - `setsid` + pid file: so you can later kill exactly this process group and
   nothing else (section 7).
 - Pick the port yourself and check it is free (`ss -ltn`); several agents
