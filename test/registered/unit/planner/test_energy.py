@@ -10,13 +10,18 @@ kWh/1M-token derivation, and the per-card energy structure. The end-to-end
 boot+measure path is exercised by the live validation run, not here.
 """
 
+import os
+import tempfile
 import unittest
+from unittest import mock
 
+from sglang.srt.planner import jtok_counter as jc
 from sglang.srt.planner.energy import (
     BucketMeasurement,
     MeasurementConfig,
     MeasurementResult,
     PowerSampler,
+    _fold_into_jtok_counter,
     validation_config,
 )
 from sglang.srt.planner.results_store import ResultsStore
@@ -120,6 +125,69 @@ class TestMeasuredEntries(unittest.TestCase):
             reloaded = ResultsStore.load(path, strict=True)
         self.assertEqual(len(reloaded), 2)
         self.assertIsNotNone(reloaded.entries()[0].per_card_energy)
+
+
+class TestFoldIntoJtokCounter(unittest.TestCase):
+    """energy.py: main()'s hook that folds a completed MeasurementResult's
+    phase-pure NVML-measured energy into the persistent jtok_counter store
+    (design: joule-per-token counter). No GPU/boot -- a synthetic
+    MeasurementResult built the same way TestMeasuredEntries does."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._store_patch = mock.patch.object(
+            jc, "DEFAULT_JTOK_STORE",
+            os.path.join(self._tmp.name, "jtok_counter.json"),
+        )
+        self._store_patch.start()
+
+    def tearDown(self):
+        self._store_patch.stop()
+        self._tmp.cleanup()
+
+    def _result(self, label="no-MTP baseline"):
+        cfg = validation_config(label=label)
+        ms = [_bm("code", 1, 0.6, 17.5), _bm("code", 16, 0.3, 1.6)]
+        return MeasurementResult(
+            config=cfg, hardware_cards=[(1, "RTX 5090", 32607)],
+            gpu_names_sampled=["RTX 5090"], measurements=ms, idle_watts=330.0,
+            launch_flags=[], label=label,
+        )
+
+    def test_noop_and_no_disk_write_when_disabled(self):
+        fed = _fold_into_jtok_counter([self._result()])
+        self.assertEqual(fed, 0)
+        self.assertFalse(os.path.exists(jc.DEFAULT_JTOK_STORE))
+
+    def test_feeds_store_when_enabled(self):
+        store = jc.JtokCounterStore(enabled=True)
+        store.save(jc.DEFAULT_JTOK_STORE)
+
+        res = self._result()
+        fed = _fold_into_jtok_counter([res])
+        self.assertEqual(fed, len(res.measurements))
+
+        reloaded = jc.JtokCounterStore.load(jc.DEFAULT_JTOK_STORE)
+        rec = reloaded.get("Qwen3.6-27B", "no-MTP baseline", ["local"])
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.sources, [jc.SOURCE_HARNESS])
+        self.assertEqual(rec.mixed_windows, 0)  # harness windows are phase-pure
+        self.assertIsNotNone(rec.j_per_prefill_token())
+        self.assertIsNotNone(rec.j_per_decode_token())
+
+    def test_multiple_results_accumulate_and_lanes_are_a_list(self):
+        store = jc.JtokCounterStore(enabled=True)
+        store.save(jc.DEFAULT_JTOK_STORE)
+
+        r1 = self._result(label="no-MTP baseline")
+        r2 = self._result(label="MTP+adaptive")
+        _fold_into_jtok_counter([r1, r2], lanes=["rigA"])
+
+        reloaded = jc.JtokCounterStore.load(jc.DEFAULT_JTOK_STORE)
+        self.assertEqual(len(reloaded), 2)  # different config_label -> different record
+        rec = reloaded.get("Qwen3.6-27B", "MTP+adaptive", ["rigA"])
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.lanes, ["rigA"])
 
 
 class TestConfig(unittest.TestCase):

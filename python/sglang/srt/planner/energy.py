@@ -1840,7 +1840,38 @@ def main(argv=None) -> int:
         store.save(args.store)
         print(f"\n[energy] ingested {len(entries)} measured rows -> "
               f"{args.store} (total {len(store)} rows).")
+
+    _fold_into_jtok_counter(results.values())
     return 0
+
+
+def _fold_into_jtok_counter(results, lanes=("local",)) -> int:
+    """Fold each completed MeasurementResult's phase-pure NVML-measured energy
+    into the persistent joule-per-token counter (jtok_counter.py), IF its own
+    toggle is on. The toggle lives in that store's own persisted state
+    (flipped from the dashboard's Data tab), not a CLI flag here, so a harness
+    run behaves the same whether launched from ``main()`` or any other caller
+    of ``run_measurement``. A no-op (no disk write at all, returns 0) when
+    disabled. Returns the number of (workload, bucket) measurements folded
+    in, for the caller to report."""
+    from sglang.srt.planner import jtok_counter as jc
+
+    jtok_store = jc.JtokCounterStore.load(jc.DEFAULT_JTOK_STORE)
+    if not jtok_store.enabled:
+        return 0
+    fed = 0
+    for r in results:
+        jc.record_harness_result(
+            jtok_store, model=r.config.served_model_name,
+            config_label=r.label, lanes=list(lanes),
+            measurements=r.measurements,
+        )
+        fed += len(r.measurements)
+    jtok_store.save(jc.DEFAULT_JTOK_STORE)
+    if fed:
+        print(f"[energy] jtok_counter: folded {fed} measured bucket(s) into "
+              f"{jc.DEFAULT_JTOK_STORE}.")
+    return fed
 
 
 if __name__ == "__main__":
