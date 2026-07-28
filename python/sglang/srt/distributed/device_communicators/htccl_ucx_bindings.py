@@ -273,6 +273,10 @@ class UcpLibrary:
                                       ctypes.POINTER(c_vp)]
         L.ucp_config_release.restype = None
         L.ucp_config_release.argtypes = [c_vp]
+        # Present across the whole 1.x line. Declared unconditionally; the
+        # caller only reaches it when a net device was requested explicitly.
+        L.ucp_config_modify.restype = c_int
+        L.ucp_config_modify.argtypes = [c_vp, ctypes.c_char_p, ctypes.c_char_p]
 
         L.ucp_init_version.restype = c_int
         L.ucp_init_version.argtypes = [
@@ -388,9 +392,15 @@ class UcpWorker:
     of; doing it per collective would dominate every decode step.
     """
 
-    def __init__(self, lib: UcpLibrary | None = None, timeout_s: float = 300.0):
+    def __init__(
+        self,
+        lib: UcpLibrary | None = None,
+        timeout_s: float = 300.0,
+        net_devices: str | None = None,
+    ):
         self.lib = lib or UcpLibrary.instance()
         self.timeout_s = timeout_s
+        self.net_devices = net_devices or None
         L = self.lib.lib
 
         config = ctypes.c_void_p()
@@ -401,6 +411,21 @@ class UcpWorker:
             L.ucp_config_read(None, None, ctypes.byref(config)), "ucp_config_read"
         )
         try:
+            if self.net_devices is not None:
+                # Pin THIS context to one link, instead of inheriting whatever
+                # UCX_NET_DEVICES happens to be in the process environment.
+                # The distinction matters on a host with more than one line:
+                # the environment variable is a single process-wide value, so
+                # it cannot express "this endpoint here, that one there",
+                # while a config modified per context can. Left None the call
+                # is skipped entirely and the config is exactly the one the
+                # environment produced -- the unchanged default path.
+                self.lib.check(
+                    L.ucp_config_modify(
+                        config, b"NET_DEVICES", self.net_devices.encode()
+                    ),
+                    f"ucp_config_modify(NET_DEVICES={self.net_devices})",
+                )
             params = UcpParams()
             params.field_mask = UCP_PARAM_FIELD_FEATURES
             params.features = UCP_FEATURE_TAG

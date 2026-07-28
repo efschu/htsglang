@@ -1993,6 +1993,48 @@ class ServerArgs:
     # post-weight-load profiling. None => no profile => 'speed' degrades to
     # 'capacity'.
     rank_kv_speed_weights: Optional[List[int]] = None
+    # -------------------------------------------------------------------------
+    # Per-message-class link selection (task #240)
+    # -------------------------------------------------------------------------
+    collective_net_small: A[
+        Optional[str],
+        Arg(
+            help="Network device carrying the LATENCY class: the HTCCL UCX "
+            "collective plane (UCX_NET_DEVICES spelling, e.g. "
+            "'rocep4s0f1:1', or a comma-separated list, or 'all'). Pins the "
+            "UCX context of this instance to that link instead of leaving it "
+            "to a process-wide UCX_NET_DEVICES, which cannot distinguish two "
+            "instances or two message classes. BRINGS/COSTS: nothing on a "
+            "host with a single line — there the flag only makes the "
+            "existing choice explicit. The payoff is a host with two, where "
+            "a FEC-free link wins small-message latency (measured on the "
+            "reference rig: 1.47 vs 1.58 us for an 8 B message) while a "
+            "wider link wins bulk bandwidth; pointing this at the former and "
+            "--collective-net-bulk at the latter gets both at once. SCOPE: "
+            "small AND large TP collectives share ONE UCX context, so this "
+            "pins the whole collective plane, not only the small messages — "
+            "see docs/rig-runbook.md for what a genuine per-class split "
+            "would require. Requires the HTCCL ucx transport "
+            "(SGLANG_HTCCL=1, SGLANG_HTCCL_TRANSPORT=ucx). Unset: behavior "
+            "is unchanged.",
+        ),
+    ] = None
+    collective_net_bulk: A[
+        Optional[str],
+        Arg(
+            help="Network device carrying the BULK class: the PD-KV / "
+            "HiCache transfers, which are the transfers that have a "
+            "transport of their own. Seeds --disaggregation-ib-device when "
+            "that is unset (the ':port' suffix is dropped, since the IB "
+            "spelling is the bare HCA name); if both are given they must "
+            "agree. Large TP collectives are NOT reached by this flag — they "
+            "ride --collective-net-small's context; setting the two to "
+            "different devices logs that fact rather than pretending "
+            "otherwise. See --collective-net-small for the "
+            "when-is-this-worth-it note and docs/rig-runbook.md for the "
+            "interconnect study. Unset: behavior is unchanged.",
+        ),
+    ] = None
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -4278,6 +4320,11 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
+
+        # Resolve the per-message-class link selection (must run before the
+        # worker processes are spawned: it exports environment variables they
+        # inherit).
+        self._handle_collective_net_env()
 
         # Handle crash dump environment variables (must run before CUDA init).
         self._handle_crash_dump_env()
@@ -10129,6 +10176,151 @@ class ServerArgs:
                 test_params = SamplingParams(**self.preferred_sampling_params)
                 # raises if tokenizer-dependent features used
                 test_params.normalize(None)
+
+    @staticmethod
+    def _known_net_devices() -> set[str]:
+        """Local link names a device string may legitimately name.
+
+        Two namespaces, because the two consumers use different ones: RDMA
+        device names from ``/sys/class/infiniband`` (what UCX_NET_DEVICES and
+        the IB spellings want) and interface names from ``/sys/class/net``
+        (what a TCP/sockets transport wants). Both are read straight from
+        sysfs rather than through a vendor tool, so the check needs no
+        libibverbs, no NVML and no root.
+        """
+        known: set[str] = set()
+        for root in ("/sys/class/infiniband", "/sys/class/net"):
+            try:
+                entries = os.scandir(root)
+            except OSError:
+                continue
+            with entries:
+                # Devices are symlinks to directories; sysfs also parks plain
+                # control files in these directories (net/bonding_masters),
+                # which are not devices and must not be offered as one.
+                known.update(e.name for e in entries if e.is_dir())
+        return known
+
+    def _validate_net_device(self, value: str, flag: str) -> str:
+        """Reject a device this host does not have, while it is still cheap.
+
+        The alternative is a UCX context that comes up on the WRONG link (UCX
+        silently falls back when its device list matches nothing) and a
+        performance result that looks like a measurement rather than a typo.
+        """
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{flag} is empty. Pass a device or omit the flag.")
+        known = self._known_net_devices()
+        unknown = []
+        for entry in value.split(","):
+            entry = entry.strip()
+            if not entry:
+                raise ValueError(
+                    f"{flag}={value!r} has an empty element. Use "
+                    f"'dev' or 'dev:port', comma-separated."
+                )
+            # "all" is UCX's own wildcard; ":port" is the UCX device suffix
+            # and is not part of the sysfs name.
+            if entry == "all":
+                continue
+            if entry.rsplit(":", 1)[0] not in known:
+                unknown.append(entry)
+        if unknown:
+            raise ValueError(
+                f"{flag}={value!r} names device(s) this host does not have: "
+                f"{', '.join(unknown)}. Available: "
+                f"{', '.join(sorted(self._known_net_devices())) or '<none>'} "
+                f"(RDMA devices from /sys/class/infiniband, interfaces from "
+                f"/sys/class/net; the ':<port>' suffix is optional)."
+            )
+        return value
+
+    def _handle_collective_net_env(self):
+        """Resolve --collective-net-small/-bulk onto their carriers.
+
+        Runs in the launching process, before any worker is spawned, so the
+        exported variables are inherited by every rank -- the same mechanism
+        the co-location NCCL defaults use.
+
+        The two flags are NOT symmetric, and that asymmetry is the honest
+        state of the code rather than an oversight:
+
+        * SMALL reaches the HTCCL UCX collective plane, which is one context
+          with one endpoint per peer. Small and large TP collectives run
+          through it together, so pinning it pins both.
+        * BULK reaches the transfers that own a separate transport: PD-KV and
+          HiCache, configured by --disaggregation-ib-device.
+
+        Rendezvous/control traffic is deliberately untouched. It runs on the
+        gloo process group, addressed by --dist-init-addr and
+        GLOO_SOCKET_IFNAME, which take interface names rather than RDMA
+        device names; the reference bring-up keeps that plane on the LAN on
+        purpose, and silently moving it onto an RDMA link would undo that.
+        """
+        if self.collective_net_small is None and self.collective_net_bulk is None:
+            return
+
+        if self.collective_net_small is not None:
+            self.collective_net_small = self._validate_net_device(
+                self.collective_net_small, "--collective-net-small"
+            )
+            if "SGLANG_COLLECTIVE_NET_SMALL" not in os.environ:
+                os.environ["SGLANG_COLLECTIVE_NET_SMALL"] = self.collective_net_small
+            if (
+                envs.SGLANG_HTCCL_TRANSPORT.get() != "ucx"
+                or not envs.SGLANG_HTCCL.get()
+            ):
+                logger.warning(
+                    "--collective-net-small=%s has no effect: it configures "
+                    "the HTCCL ucx collective plane, which is not active "
+                    "(needs SGLANG_HTCCL=1 and SGLANG_HTCCL_TRANSPORT=ucx).",
+                    self.collective_net_small,
+                )
+
+        if self.collective_net_bulk is not None:
+            self.collective_net_bulk = self._validate_net_device(
+                self.collective_net_bulk, "--collective-net-bulk"
+            )
+            if "SGLANG_COLLECTIVE_NET_BULK" not in os.environ:
+                os.environ["SGLANG_COLLECTIVE_NET_BULK"] = self.collective_net_bulk
+            # The IB spelling is the bare HCA name; UCX's ":<port>" suffix is
+            # not part of it.
+            ib = ",".join(
+                e.strip().rsplit(":", 1)[0] for e in self.collective_net_bulk.split(",")
+            )
+            if self.disaggregation_ib_device is None:
+                self.disaggregation_ib_device = ib
+                logger.info(
+                    "Auto-set --disaggregation-ib-device=%s (from "
+                    "--collective-net-bulk=%s).",
+                    ib,
+                    self.collective_net_bulk,
+                )
+            elif self.disaggregation_ib_device != ib:
+                raise ValueError(
+                    f"--collective-net-bulk={self.collective_net_bulk!r} and "
+                    f"--disaggregation-ib-device="
+                    f"{self.disaggregation_ib_device!r} name different "
+                    f"devices for the same bulk transfers. Pass one of them, "
+                    f"or give them the same device."
+                )
+
+        if (
+            self.collective_net_small is not None
+            and self.collective_net_bulk is not None
+            and self.collective_net_small != self.collective_net_bulk
+        ):
+            logger.info(
+                "Per-class link split: latency class (TP collectives) on %s, "
+                "bulk class (PD-KV / HiCache) on %s. LARGE TP collectives "
+                "stay on %s -- they share the single UCX context with the "
+                "small ones, so this instance cannot route them separately "
+                "(see docs/rig-runbook.md).",
+                self.collective_net_small,
+                self.collective_net_bulk,
+                self.collective_net_small,
+            )
 
     def _handle_crash_dump_env(self):
         if not self.crash_dump_folder:

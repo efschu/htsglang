@@ -119,6 +119,32 @@ _FP32_REDUCE = bool(int(os.environ.get("SGLANG_HTCCL_FP32_REDUCE", "1")))
 
 _TIMEOUT_S = float(os.environ.get("SGLANG_HTCCL_UCX_TIMEOUT_S", "300"))
 
+
+def _collective_net_device() -> str | None:
+    """The link this instance's UCX collective plane is pinned to.
+
+    ``SGLANG_COLLECTIVE_NET_SMALL`` (``--collective-net-small``) names it.
+    Unset -> ``None``, and the context is built from the unmodified
+    environment config, i.e. whatever process-wide ``UCX_NET_DEVICES`` says,
+    exactly as before this knob existed.
+
+    Read at construction rather than at import: the flag is exported into the
+    environment during server-args resolution, which happens after this module
+    may already have been imported.
+
+    SCOPE -- this pins the WHOLE collective plane, not just the small
+    messages. The small/large split (classes (a) and (b) in the runbook) lives
+    inside one UCX context with one endpoint per peer, so there is no seam
+    here to route a 512 KiB prefill chunk differently from an 8 KiB decode
+    all-reduce. ``--collective-net-bulk`` therefore reaches the bulk transfers
+    that DO have their own transport (PD-KV / HiCache, via
+    ``--disaggregation-ib-device``) and not this one. See
+    ``docs/rig-runbook.md``.
+    """
+    dev = os.environ.get("SGLANG_COLLECTIVE_NET_SMALL", "").strip()
+    return dev or None
+
+
 # Sub-block size for the pipelined staging copies, in KiB. See
 # ``_staged_copy``: the CPU passes over a chunk are interrupted this often to
 # progress the UCX worker, so the rendezvous handshake for the NEXT chunk can
@@ -295,6 +321,7 @@ class HTCCLUcxTransport:
         progress_bytes: int = _PROGRESS_BYTES,
         pipeline: bool = _PIPELINE,
         ag_ring_bytes: int = _AG_RING_BYTES,
+        net_device: str | None = None,
     ):
         self.cpu_group = cpu_group
         self.device = device
@@ -353,7 +380,10 @@ class HTCCLUcxTransport:
             )
 
         self.lib = UcpLibrary.instance()
-        self.worker = UcpWorker(self.lib, timeout_s=_TIMEOUT_S)
+        self.net_device = _collective_net_device() if net_device is None else net_device
+        self.worker = UcpWorker(
+            self.lib, timeout_s=_TIMEOUT_S, net_devices=self.net_device
+        )
 
         # One collective carries both halves of the rendezvous: the version
         # (checked first) and the worker address (used only if the check
@@ -382,12 +412,17 @@ class HTCCLUcxTransport:
         self.barrier()
         logger.info(
             "HTCCL: ucx transport ready (rank %d/%d, UCX %s, chunk %d MiB, "
-            "ring threshold %d KiB).",
+            "ring threshold %d KiB, net device %s).",
             self.rank,
             self.world_size,
             info["version_string"],
             self.chunk_bytes // (1024 * 1024),
             self.ring_bytes // 1024,
+            # Deliberately NOT rank-uniform, unlike every SGLANG_HTCCL* knob:
+            # the device NAME is per host (rocep4s0f1 here, rocep1s0f1 on the
+            # peer). Only the link the names resolve to has to be the same,
+            # and that is a wiring fact UCX itself reports at wireup.
+            self.net_device or "<from environment>",
         )
 
     # ------------------------------------------------------------------

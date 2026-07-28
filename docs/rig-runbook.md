@@ -228,6 +228,63 @@ matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
   single-host over loopback/shm, so the transport can be exercised intra-rig
   from the container before touching two machines.
 
+### 4.3.1 Putting a message class on a chosen line (`--collective-net-*`)
+
+`UCX_NET_DEVICES` is one process-wide value, so it cannot say "the small
+messages here, the bulk there". Two flags replace it where that matters:
+
+| Flag | Env | Reaches |
+| --- | --- | --- |
+| `--collective-net-small DEV` | `SGLANG_COLLECTIVE_NET_SMALL` | the HTCCL UCX collective context (pinned via `ucp_config_modify(NET_DEVICES)`, not via the process environment) |
+| `--collective-net-bulk DEV` | `SGLANG_COLLECTIVE_NET_BULK` | PD-KV / HiCache — seeds `--disaggregation-ib-device` when that is unset, dropping the `:<port>` suffix |
+
+`DEV` is the `UCX_NET_DEVICES` spelling (`rocep4s0f1:1`, a comma-separated
+list, or `all`). Unset, nothing changes: the context is built from the
+unmodified environment config, exactly as before the flags existed. The value
+is deliberately **not** rank-uniform — unlike every `SGLANG_HTCCL*` knob — as
+the two ends of one link have different local names (`rocep4s0f1` here,
+`rocep1s0f1` on rig 2). What has to match is the wire.
+
+**Which classes are actually separable.** Four classes exist:
+
+| Class | Carrier | Selected by |
+| --- | --- | --- |
+| (a) TP collectives, small (decode / verify all-reduce, gather) | HTCCL UCX context | `--collective-net-small` |
+| (b) TP collectives, large (prefill chunks) | the **same** UCX context | `--collective-net-small` — no separate seam |
+| (c) PD-KV / HiCache bulk | mooncake / nixl transfer engine | `--collective-net-bulk` → `--disaggregation-ib-device` |
+| (d) Rendezvous / control | gloo process group | `--dist-init-addr`, `GLOO_SOCKET_IFNAME` (untouched on purpose) |
+
+(a) and (b) are **not** separable today, and the flag names should not be read
+as claiming otherwise: one `UcpWorker` per rank holds one context and one
+endpoint per peer, and both classes ride it. Setting `small` and `bulk` to
+different devices is legal and useful — it splits (a)+(b) from (c) — and the
+server logs that (b) stays on the `small` link rather than silently implying a
+split that is not there.
+
+Genuine per-class routing inside the collective plane needs a **second UCX
+context**: a second `UcpWorker`, a second address exchange at rendezvous (one
+extra `all_gather_object`), a size-keyed worker selector, and — the part that
+carries the risk — a guarantee that every rank picks the same worker for the
+same collective, since a disagreement deadlocks rather than returning a wrong
+answer. Estimate ~200 lines plus a cross-rig validation pass; roughly a day.
+It is not built. (d) is left alone on purpose: it takes interface names rather
+than RDMA device names, and the reference bring-up deliberately keeps the
+control plane on the 1 GbE LAN.
+
+**Is it worth setting?** On this rig, no: measured 8 B message latency is
+1.47 us on the FEC-free 40G RoCE link vs 1.58 us on the 100G one, and the
+100G link is slot-limited to 3.43 GB/s, so there is no pair of lines where
+splitting wins enough to matter. The flags exist for hosts that do have two
+usable lines, where the latency-optimal link and the bandwidth-optimal link
+are different cards. See the interconnect study for the per-link numbers.
+
+**A typo does not fail loudly by itself.** UCX answers an unavailable device
+with `network device '...' is not available` on stderr and then builds a
+context with *no* network transport — the run completes and reports numbers
+from loopback. That is why both flags reject a device absent from
+`/sys/class/infiniband` and `/sys/class/net` during server-args resolution,
+naming what the host does have.
+
 ### 4.4 Which model for which purpose
 
 `<MODEL_ROOT>` holds the zoo. The default subjects: `Qwen3.6-27B-FP8`

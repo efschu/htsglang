@@ -608,6 +608,26 @@ class Envs:
     # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
     # transport; rank-uniform like every other flag in this block.
     SGLANG_HTCCL_UCX_OVERLAP = EnvBool(False)
+    # --- per-message-class link selection (task #240) ----------------------
+    # Env spelling of --collective-net-small / --collective-net-bulk. Set
+    # either directly or let server-args resolution export it; the flag and
+    # the variable carry the same value, and a value already present in the
+    # environment is never overwritten.
+    #
+    # NOT rank-uniform, unlike the SGLANG_HTCCL* block above: the value is a
+    # local device NAME, and the two ends of a link are normally called
+    # different things (rocep4s0f1 on one host, rocep1s0f1 on the other).
+    # What must match is the wire, not the string.
+    #
+    # SMALL pins the HTCCL UCX collective context (small AND large TP
+    # collectives -- they share one context, see htccl_ucx.py), BULK reaches
+    # the transfers that have a transport of their own: PD-KV / HiCache, by
+    # seeding --disaggregation-ib-device when that is unset. On a host with
+    # one line both are pointless; the payoff is a host with two, where a
+    # FEC-free link wins on small-message latency while a wider one wins on
+    # bulk bandwidth.
+    SGLANG_COLLECTIVE_NET_SMALL = EnvStr(None)
+    SGLANG_COLLECTIVE_NET_BULK = EnvStr(None)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
