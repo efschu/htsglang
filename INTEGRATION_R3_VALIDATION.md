@@ -4895,3 +4895,26 @@ assertions + 18 subtests; 16 red before the fix) and the #264 point added to
 `test_decode_knee_calibration.py`. Full planner suite 1082 passed, 1 skipped,
 1 pre-existing unrelated failure (`test_webui.py::test_reference_png_static_route`,
 red on the untouched tree too).
+
+# #154 — Deckard-40B and Tess-27B Q6 boot; silent-wrongness loader bug fixed
+
+Both are general.architecture=qwen35 (Tess = stock 27B geometry, 64 blocks;
+Deckard = a 96-block depth re-stack). The real work was a loader bug: the
+bespoke families borrow geometry from a sibling config.json and NOTHING
+validated the borrow against the .gguf — Deckard built a 64-layer model out
+of a 96-layer file, dropped 32 blocks, and would have served fluent nonsense
+with no error anywhere. reconcile_sibling_config now reconciles depth in the
+file's favour and hard-fails on any other geometry disagreement. Two traps
+caught by the zoo regression sweep (all 7 bespoke trees): block_count
+INCLUDES the MTP block (65 for a 64-layer MTP model — the runbook's own
+reference recipe would have grown a bogus layer), and gemma4 stores
+head_count_kv as a per-layer list (int() killed every gemma4 GGUF boot).
+
+Numbers: Tess TP=1/5090 3572 tok/s prefill, 54.8 decode; Deckard TP=3 uneven
+[30,17,17] 727 prefill, 35.8 decode; outputs coherent (quoted in report).
+No spec (neither backbone carries an MTP block; Tess ships a separate
+18-tensor mtp gguf — wiring untested). Open edges: sibling files are
+symlinked prerequisites (Qwen3.5-4B/9B + two gemma trees fail the same way,
+pre-existing); both dirs carry mmproj so boots are multimodal (prefill graph
+drops); one unreproduced 52-s idle gap on the first Tess boot, named not
+diagnosed; reconcile has no synthetic-GGUF unit test yet.
