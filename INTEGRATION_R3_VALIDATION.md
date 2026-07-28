@@ -5499,3 +5499,33 @@ Operativ relevant bleibt hier nur:
   + Artefakt-Import, ein Host-Runner-Fenster link_collective_cost ueber 40G
   (Minuten, KEINE Karten — CPU-Tensoren); reach-Formannahme der fernen rigmon
   weiter unbewiesen (Erbe der Etappe 4).
+
+## Solver N-Lane (feat/solver-nlane, gemergt) — Nachtrag-8-Zuarbeit fuer Slice C/D
+
+- MENGENWEISER HUELLBAUM: nesting_bounds_over(N Lanes) + nesting_hull mit
+  HullTree; paarweise bleibt woertlich der N=1-Spezialfall (kein Drift
+  moeglich). NEUE AUSFALL-KLASSE "GESCHWISTER" belegt: zwei Lanes, die je
+  einzeln im selben Grob-Schluessel nesten, nesten NICHT ineinander — am
+  Rig-Beispiel [6,1,1]: [6,2] und [7,1] passieren je den Paar-Check, die
+  Menge faellt bei 106 von 111 Einheitenzahlen. Paarweise Pruefung ist fuer
+  N>2 also KEIN Ersatz der Mengenpruefung (genau die Nachtrag-8-Vermutung).
+- Weitere Verweigerungen mit Grund statt erfundener Ordnung: Richtungs-Flip
+  ueber Dimensionen (grober auf MLP, feiner auf vocab = kein Baum), Zyklen,
+  haengende nests_in, doppelte Schluessel.
+- PRIORITAETSKLASSEN: InstanceSpec.priority_class; coresident_budget_plan
+  liefert Garantie fuer geschuetzte Klassen, Rest-Teilung, benannte
+  starved-Eintraege; Summen-Invarianz als Test gepinnt (Prioritaet VERSCHIEBT
+  Kapazitaet, erschafft keine — Messgewinn in Slice C muss aus Belegung
+  kommen, nicht aus dem Mapping).
+- N-LANE-EINGANG: solve_lanes(lanes, ...) als Bewerter; Struktur-Suche bleibt
+  bewusst Slice D (zwei benannte Grenzen: sequenziell nach Prioritaet geloest,
+  nicht joint-Pareto; Default-Huelle prueft nur die MLP-Dimension —
+  hull_probes fuer attention/GDN/vocab mitgeben, sonst Scheinhuelle).
+- DISKREPANZ zu dual_group.py dokumentiert, nicht dort gefixt: Runtime prueft
+  EINE gegebene Segmentierung, Huelle default IRGENDEINE — mit shared_segments
+  gepinnt 0 Abweichungen ueber alle 497 Einheitenzahlen (Test); Slice B muss
+  seine installierte Segmentierung pinnen, dual_group bleibt Laufzeit-Autoritaet.
+  Zweitbefund: kv_donor-Rolle (0 Einheiten) vs partition_units (>=1 je Rang) —
+  partition_cuts nimmt deshalb den fertigen Vektor als Split.
+- Tests: 144 gruen (vorher 76+34), alle 5 Gates + beide coresident-Regressionen
+  unveraendert (A 240361 / C 342942); ruff/codespell/mypy sauber. Marker 0.
