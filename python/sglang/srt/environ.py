@@ -551,6 +551,11 @@ class Envs:
     # semantics as gloo). The CPU transports synchronize with the host and
     # therefore require --disable-cuda-graph.
     SGLANG_HTCCL_TRANSPORT = EnvStr("device")
+    # #279 path dispatcher (skeleton): size/load-aware path choice with
+    # saturation overflow. Default off; even when on, decisions fall back to
+    # the status-quo #240 class choice until measured rate tables are loaded
+    # (placeholder neutrality), so enabling it is byte-identical today.
+    SGLANG_HTCCL_PATH_DISPATCHER = EnvBool(False)
     # Per-rank shared-memory slot size (MiB) for payload staging.
     SGLANG_HTCCL_SLOT_MIB = EnvInt(64)
     # Chunk size (MiB) of the gloo data-plane pipeline.
