@@ -1083,7 +1083,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_draft_tokens=self.server_args.max_speculative_num_draft_tokens
         )
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
-        return max(capture_bs) * num_tokens_per_bs
+        rows = max(capture_bs) * num_tokens_per_bs
+        if self.dual_group_lane_verify_tokens:
+            # The lane's chain-verify entry emits one logits row per candidate
+            # (#274 round 6). Its runner is non-speculative, so the line above
+            # sizes for one row per slot and the capture would trip the shared
+            # buffer's row assert. Lane-keyed buffer: a concurrent lane grows
+            # its own, the serving group's is untouched.
+            rows = max(capture_bs) * max(
+                num_tokens_per_bs, self.dual_group_lane_verify_tokens
+            )
+        return rows
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -1137,6 +1147,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
         self.graph_shared_output = None
+        # #274 round 6: K+1 when this runner is a dual-group lane TARGET that
+        # speculates, so its decode graph runner adds a chain-verify entry
+        # beside the plain decode ones. Written by the lane bring-up between
+        # construction and init_cuda_graphs(), like
+        # spec_solo_rank_local_graphs. None everywhere else.
+        self.dual_group_lane_verify_tokens: Optional[int] = None
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

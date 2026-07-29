@@ -1158,6 +1158,14 @@ class DualGroupLane:
                     # comparison carries boot-to-boot variance instead of the
                     # one difference it is meant to isolate.
                     "tv_max_accept": job.get("tv_max_accept"),
+                    # Round 6, same reasoning again: False makes this job's
+                    # verify skip its captured graph and run eager, so the
+                    # replay-vs-eager byte gate is one boot rather than two.
+                    "verify_graph": job.get("verify_graph"),
+                    # One extra lm_head per round over all K+1 rows, so it is
+                    # per job: the round that answers the 13-of-96 argmax
+                    # question must not distort the same boot's timing table.
+                    "argmax_check": job.get("argmax_check"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -2386,6 +2394,36 @@ class DualGroupLane:
             return logits.argmax(dim=-1)
         return self._candidate_logits(out.hidden_states).argmax(dim=-1)
 
+    @contextlib.contextmanager
+    def _verify_graph_scope(self, draft_token_num: int, job=None):
+        """Run the verify forward under the lane's VERIFY graph entry.
+
+        Yields True when the forward can replay a graph and False when it
+        stays eager, so the round can report which of the two it paid for
+        rather than leaving that to be inferred from a timing.
+
+        The scope is the ONLY thing that puts the decode graph runner into
+        verify shaping, and it is entered per forward rather than held open:
+        the lane's plain decode step runs between two verify rounds on the same
+        runner and must find it exactly as it was.
+        """
+        runner = getattr(self.runner, "decode_cuda_graph_runner", None)
+        if (
+            # Per-JOB falsifier, not a server flag: the replay-vs-eager byte
+            # gate has to run both arms against the same weights, pools and
+            # captures. Comparing two boots would put boot-to-boot variance
+            # inside a gate whose whole purpose is to catch graph-replay
+            # corruption (a known GGUF family, #52/#53).
+            (job is not None and job.get("verify_graph") is False)
+            or runner is None
+            or getattr(runner, "_lane_verify_tokens", None) != draft_token_num
+            or not getattr(runner, "_lane_verify_captured", False)
+        ):
+            yield False
+            return
+        with runner.lane_verify_shape():
+            yield True
+
     def _verify_by_target_verify(self, job, proposals, n_cached):
         """Verify all K+1 candidates in ONE ``ForwardMode.TARGET_VERIFY``.
 
@@ -2426,15 +2464,35 @@ class DualGroupLane:
         (floor measured first in the same boot), reproducible run to run, and
         its accept length is >= the bridge's on every prompt.
 
-        The default nonetheless stays ``seqdecode``, and the reason is a
-        measurement rather than a doubt: the verify MODE is not the lever.
-        One TARGET_VERIFY forward costs ~68.4 ms against a 16.1 ms
-        graph-captured decode, and a whole round costs 77.0 ms either way
-        (0.2 % apart, under a 0.4 % floor). Speculation on the lane breaks even
-        only above accept 4.78, which K=3 cannot reach. Promote this to the
-        default together with the graph capture that makes it ONE captured
-        forward instead of K+1 -- that is the round where the choice starts
-        paying, and where a second green gate can be taken alongside it.
+        ROUND-6 STATUS: this forward has its own graph capture now (a second
+        decode-runner entry, ``lanetv``), and that is what finally separates
+        the two modes. One TARGET_VERIFY forward went 68.4 -> 27.2 ms
+        (2.5x) and a whole round 77.0 -> 35.9 ms, against 75-96 ms for the
+        ``seqdecode`` bridge, which cannot be captured at all -- it is
+        accept-many separate decode forwards, so its cost RISES with the accept
+        length while this one is flat. On the mode question the answer is now
+        unambiguous, byte-gated, and reproducible run to run.
+
+        On the question of whether the lane should speculate at all it is
+        still no, and the number says so plainly: 35.9 ms per round against
+        16.1 ms per captured decode step is break-even at accept **2.22**
+        (was 4.78), while the measured accept band tops out at 1.76 on the
+        friendliest prompt. The remaining post is the head: K = 3 eager draft
+        forwards are 8.6 ms of the 35.9. Capturing those (the head runs eager
+        by a NAMED GAP -- see _finish_lane_draft_runner_scoped) would take the
+        round to roughly 30 ms and break-even to ~1.9, which is STILL above the
+        measured band. So the head capture is worth doing and is not by itself
+        the thing that would make lane speculation pay here.
+
+        The lever that DOES reach is the chain LENGTH, because the captured
+        verify is ~12.5 ms fixed plus ~3.7 ms per candidate row (16.1 / 21.5 /
+        27.2 ms at 1 / 2 / 4 rows): one extra row costs 0.23 of a decode step,
+        so a shorter chain buys break-even directly. At K = 1 the round is
+        24.8 ms and break-even 1.53, and on predictable content that is
+        14.9 ms/token against 16.2 no-spec -- the first winning measurement
+        this path has produced. It sits ON the threshold rather than above it
+        (the same arm's floor run drew accept 1.43 and lost), so K = 1 is a
+        knob for known workloads, not a new default.
         """
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -2479,8 +2537,23 @@ class DualGroupLane:
         batch.seq_lens_sum = n_cached
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         try:
-            out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+            with self._verify_graph_scope(d, job) as captured:
+                out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+            job["_verify_graph"] = job.get("_verify_graph", 0) + int(captured)
             preds = self._verify_predictions(out, d)
+
+            # The 13-of-96 argmax question from round 4, as a per-JOB switch
+            # rather than the process-wide debug env: the check costs one extra
+            # lm_head over all K+1 rows per round, which would otherwise land
+            # in the same boot's timing table. Off by default; one job carries
+            # it, every other job in the boot stays comparable.
+            if job.get("argmax_check"):
+                alt = self._candidate_logits(out.hidden_states).argmax(dim=-1)
+                rows = job.setdefault("_argmax_rows", [0] * d)
+                for i in range(d):
+                    if int(alt[i].item()) != int(preds[i].item()):
+                        rows[i] += 1
+                job["_argmax_rounds"] = job.get("_argmax_rounds", 0) + 1
 
             n_accept = 0
             for i, prop in enumerate(proposals):
@@ -2561,15 +2634,22 @@ class DualGroupLane:
         """Which verify strategy this round uses.
 
         ``seqdecode`` -- the correctness bridge of round 3 -- unless something
-        explicitly asks for another one. Since round 5 ``target_verify`` is
-        green too, so the tie is no longer broken by correctness but by
-        evidence and by benefit: the bridge has four boots of gate behind it
-        against one, and the two cost the same per round (0.2 % apart, under
-        the floor), so switching today buys nothing and risks something. The
-        switch belongs to the round that captures the verify forward -- see
-        ``_verify_by_target_verify``. ``extend`` remains the measurably wrong
-        batched path of round 1, kept reachable as a live falsifier. Both stay
-        one explicit word away.
+        explicitly asks for another one.
+
+        Round 6 is where that stops being the right default, and the change is
+        deliberately NOT made here: promoting a default is a merge decision,
+        and this branch's job was to produce the evidence for it. The evidence
+        is that captured ``target_verify`` now dominates the bridge on every
+        measured axis -- 35.9 vs 75-96 ms per round, byte-identical to its own
+        eager arm at the vehicle's reproducibility floor, byte-identical to the
+        no-spec trajectory over the 12-token gate on all three prompts, accept
+        length never below the bridge's -- and the bridge cannot be captured at
+        all, because it IS accept-many separate forwards.
+        Recommendation on record: make ``target_verify`` the default verify
+        mode and keep ``seqdecode`` reachable as the fallback flag it has been.
+
+        ``extend`` remains the measurably wrong batched path of round 1, kept
+        reachable as a live falsifier. All three stay one explicit word away.
         """
         return (
             job.get("verify")
@@ -2953,6 +3033,17 @@ class DualGroupLane:
             xs = job.get(key) or []
             if xs:
                 result[label] = round(sum(xs) / len(xs), 3)
+        # How many of the rounds replayed the lane's captured verify graph.
+        # Reported rather than assumed: a verify that silently fell back to
+        # eager is the one way a timing table can look like a regression when
+        # nothing regressed.
+        if accepts and job.get("verify") in (None, "target_verify"):
+            result["verify_graph_rounds"] = job.get("_verify_graph", 0)
+        if job.get("_argmax_rounds"):
+            result["argmax_check"] = {
+                "rounds": job["_argmax_rounds"],
+                "rows_disagreeing": job.get("_argmax_rows"),
+            }
         if job.get("prefill_wall_ms") is not None:
             result["prefill_wall_ms"] = round(job["prefill_wall_ms"], 2)
             result["prefill_wait_ms"] = round(
@@ -3503,6 +3594,20 @@ def _build_lane_under_scope(
 
         runner.alloc_memory_pool()
         runner.init_attention_backends()
+        # #274 round 6: ask the lane target's decode graph runner for a chain-
+        # VERIFY entry beside its plain decode ones. Set here, between
+        # construction and init_cuda_graphs(), for the same reason
+        # spec_solo_rank_local_graphs is: the capture reads it, and the capture
+        # happens inside init_cuda_graphs. Eager lanes and a disabled graph plan
+        # capture nothing at all, so the field would only be misleading there.
+        if (
+            getattr(server_args, "dual_group_lane_spec", False)
+            and getattr(server_args, "dual_group_lane_spec_graph", True)
+            and not server_args.dual_group_lane_eager
+        ):
+            runner.dual_group_lane_verify_tokens = (
+                int(getattr(server_args, "dual_group_lane_spec_steps", 3)) + 1
+            )
         if server_args.dual_group_lane_eager:
             logger.warning(
                 "dual-group lane %d runs EAGER (--dual-group-lane-eager); "

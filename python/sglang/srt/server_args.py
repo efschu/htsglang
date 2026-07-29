@@ -3907,6 +3907,24 @@ class ServerArgs:
             "rig.",
         ),
     ] = 3
+    dual_group_lane_spec_graph: A[
+        bool,
+        Arg(
+            help="Capture the lane's chain VERIFY as its own cuda-graph entry, "
+            "beside the lane's plain decode graphs (#274 round 6). This is what "
+            "makes speculation on the lane able to pay at all: a lane round is "
+            "K eager head forwards plus one verify, and an EAGER verify costs "
+            "roughly what four captured decode steps cost, so the break-even "
+            "accept length sits above what a K=3 chain can reach. Capturing the "
+            "verify moves it into the same band as the decode graphs and puts "
+            "break-even inside the measured accept range. Turn it OFF to fall "
+            "back to the eager verify; the lane's no-spec decode entry is "
+            "unaffected either way (it is a separate graph, captured first and "
+            "not re-recorded). Use --no-dual-group-lane-spec-graph to fall "
+            "back.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
     dual_group_lane_speed_dial: A[
         Optional[float],
         Arg(

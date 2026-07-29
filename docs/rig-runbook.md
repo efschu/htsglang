@@ -1085,6 +1085,30 @@ grain, never mid-kernel.
   `max_total_num_tokens` (81960 either way) because the serving KV is sized
   by the TIGHTEST rank, which is a 3080. On a rig without that asymmetry the
   freed bytes do become serving KV.
+- `--dual-group-lane-spec-graph` (default ON, `--no-...` to disable) captures
+  the lane's chain VERIFY as its own cuda-graph entry next to the lane's plain
+  decode graphs. Measured on this rig (27B-Q3 GGUF, TP=3 uneven, K=3): one
+  verify forward 68.4 -> **27.2 ms**, a whole speculative round 77.0 ->
+  **35.9 ms**. The lane's no-spec decode step is unchanged at 16.1 ms — that is
+  a separate graph, captured first and never re-recorded, and its 12-token
+  trajectory is byte-identical to round 5's on all three gate prompts. Boot
+  line to look for: `dual-group lane: verify graph captured (bs 1, 4 tokens,
+  TARGET_VERIFY, hidden FULL)`. Turning the flag off is the eager fallback and
+  the per-job falsifier (`verify_graph: false` in a lane job) is the byte gate.
+  NOTE the arithmetic before you switch `--dual-group-lane-spec` on for
+  throughput: 35.9 / 16.1 means speculation on the lane pays only above accept
+  **2.22**, and the measured accept band on this vehicle tops out at 1.76.
+- CHAIN LENGTH IS THE LEVER THAT FOLLOWS. A captured verify costs ~12.5 ms
+  fixed plus ~3.7 ms per candidate row (measured: 16.1 / 21.5 / 27.2 ms at
+  1 / 2 / 4 rows), so a shorter chain lowers break-even fast:
+  `--dual-group-lane-spec-steps 1` gives 24.8 ms per round and break-even
+  **1.53**. On predictable content (the `squares` prompt, accept 1.66) that is
+  14.9 ms/token against 16.2 no-spec — a 7.6 % win, and the first one this
+  feature has produced. It is not a safe default: the same arm's second run
+  drew accept 1.43 and landed at 17.4 ms/token. Accept length is
+  content-driven and this operating point sits ON the threshold, so treat
+  `--dual-group-lane-spec --dual-group-lane-spec-steps 1` as a knob for known
+  predictable workloads, not as a general throughput setting.
 - `SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY=0` makes both classes equal
   priority. Escape hatch, not a tuning knob: NCCL collective kernels
   spin-wait, so if the protected lane ever starved a freshly launched
