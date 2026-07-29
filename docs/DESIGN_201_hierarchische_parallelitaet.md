@@ -1901,3 +1901,18 @@ Weitere Anker: Kopf ist bandbreitengebunden (sm120 FP8/Q8: -30 bis -45 %
 Kopf-Forward); sm86-GEMV-Gate FUSED_GEMV_MAX_ROWS=8 < DFLASH-M=16 (Einzeiler
 vor jeder 3080-Messung); groesster verlustfreier Fit-Hebel ist der
 SWA-bewusste KV-Pool (~1890 MiB) — vor jeder Quantisierung ziehen.
+
+Nachtrag-13-Ergaenzung 6 (Nutzer 2026-07-29, Kalt-Drafter-Offload): Der
+NICHT aktive Drafter-Kopf wird zeitweilig in den System-RAM geparkt und beim
+Algo-Wechsel zurueckgeladen — mit CUDA-Graphs und vollem Programm: VA-stabil
+via VMM-Remap (#93-Maschinerie), sodass captured Graphen den Wechsel ohne
+Re-Capture ueberleben; Auslagern via #89-Offload-Pfad. Kosten: Q8_0-DFLASH
+~35-75 ms / NEXTN ~10-30 ms Rueckladen — Wechsel passiert an TURN-Grenzen
+(13c-Politik) und der Wave-in versteckt sich hinter dem Erst-Chunk-Prefill
+=> effektiv gratis; per-Runde-Wechsel bleibt verboten (Hysterese). WIRKUNG:
+Fit zaehlt nur noch max(aktiver Kopf) statt Summe — schliesst exakt die
+525-MiB-Luecke, an der beide Drafter nebeneinander auf der 5090 scheitern
+(R7c-Fit-Tabelle). Resident bleiben beide Graph-Pools (klein); Draft-KV des
+inaktiven Kopfs startet am Turn frisch (kein Posten). Waehlbar analog 13f
+(resident|ram|auto, Messpflicht fuer den Default). Einbau: nach der
+R7c-Boot-Queue, zusammen mit 13f in einem Offload-Slice.
