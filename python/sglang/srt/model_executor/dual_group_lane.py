@@ -1357,6 +1357,14 @@ class DualGroupLane:
                     # per job: the round that answers the 13-of-96 argmax
                     # question must not distort the same boot's timing table.
                     "argmax_check": job.get("argmax_check"),
+                    # Round 7b posten 0, and the same reasoning a fifth time:
+                    # False keeps the head's runaway sequence length -- the
+                    # defect as it stood -- so the fix and the state it fixes
+                    # are measured against each other in ONE boot rather than
+                    # across two, on a quantity (accept length) that is
+                    # content-driven and therefore worst of all to compare
+                    # across boots.
+                    "draft_rollback": job.get("draft_rollback"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -1667,6 +1675,20 @@ class DualGroupLane:
         token = job["_next"]
         batch_d = job["_batch_d"]
         steps = int(job.get("_rung") or self.spec_steps)
+        # Round 7b posten 0, the direct falsifier: the head's own sequence
+        # length against the target's. They must be EQUAL at the top of every
+        # round -- the head's next forward writes the token at target position
+        # ``_kv_len`` -- and any non-zero difference means the head is being
+        # asked about a position the sequence is not at.
+        draft_len = int(batch_d.seq_lens[0].item())
+        job["_round_start"] = draft_len
+        job.setdefault("_draft_lag", []).append(
+            draft_len - int(job.get("_kv_len") or 0)
+        )
+        # Cleared per round: the full-accept catch-up in ``_rollback_draft``
+        # may only ever use THIS round's verify output.
+        job["_verify_hidden"] = None
+        job["_verify_last_token"] = None
         with self._head_graph_scope(job):
             for _ in range(steps):
                 batch_d.input_ids = token.to(torch.int64)
@@ -2891,6 +2913,13 @@ class DualGroupLane:
         job["_kv_len"] = new_len
         job["_hidden"] = out.hidden_states[n_accept : n_accept + 1]
         job["_next"] = preds[n_accept : n_accept + 1]
+        # What ``_rollback_draft`` needs if EVERY proposal was accepted: the
+        # last candidate and the target hidden state of the row before it.
+        # Only this path stashes them -- the seqdecode bridge produces no such
+        # row block, and its full-accept rounds keep the old behaviour.
+        if d >= 2:
+            job["_verify_last_token"] = verify_input.draft_token[d - 1 : d]
+            job["_verify_hidden"] = out.hidden_states[d - 2 : d - 1]
         return emitted, n_accept, ms
 
     def _verify_mode(self, job) -> str:
@@ -3186,12 +3215,26 @@ class DualGroupLane:
         t0 = time.perf_counter()
         proposals = self._propose(job)
         emitted, n_accept, ms = self._verify(job, proposals)
+        self._rollback_draft(job, n_accept)
         round_ms = (time.perf_counter() - t0) * 1000.0
         job["decode_ms"].append(round_ms)
         job.setdefault("_verify_ms", []).append(ms)
         job.setdefault("_propose_ms", []).append(round_ms - ms)
         job["output_ids"].extend(emitted)
         job.setdefault("_accept", []).append(n_accept + 1)
+        # RAW per-position counters, next to the policy's EMA'd ones. The
+        # policy EMAs because it decides from the number and old content must
+        # stop voting; a falsifier wants the whole job weighted equally, and
+        # the reference side (accept_position_probe) counts raw too.
+        rung = int(job.get("_rung") or self.spec_steps)
+        reached = job.setdefault("_pos_reached", {})
+        hits = job.setdefault("_pos_hits", {})
+        for j in range(rung):
+            if j > n_accept:
+                break
+            reached[j] = reached.get(j, 0) + 1
+            if j < n_accept:
+                hits[j] = hits.get(j, 0) + 1
         # Feed the policy AFTER the round, with what the round actually cost
         # and produced. Both halves of the break-even come from here.
         #
@@ -3214,6 +3257,71 @@ class DualGroupLane:
         # decode arm -- what changes is how much work one round completes,
         # which is exactly what the rate is meant to capture.
         self.work_total["decode_tokens"] += len(emitted)
+
+    def _rollback_draft(self, job, n_accept: int) -> None:
+        """Put the head's own sequence back where the target's is.
+
+        Round 7b posten 0. ``_propose`` advances the head by K positions per
+        round; the verify commits ``n_accept + 1``. Nothing put the difference
+        back, so from the second round on the head answered about a position
+        the sequence was not at, over a KV cache holding the rejected
+        proposals -- measured on this vehicle as a lag of up to 299 positions
+        by round 164, growing every round. It had been written down as a
+        bookkeeping note ("the head keeps every proposal it ever made") rather
+        than recognised as a defect, which is why four rounds of measurements
+        carried it.
+
+        The rejected proposals occupy head KV slots ``kept .. K-1`` of this
+        round; they are given back here rather than at job end, which is also
+        what stops the head's pool filling K times faster than the target's.
+
+        FULL ACCEPT is the one case the truncation cannot express on its own:
+        the round then commits ``K + 1`` tokens while the head only ever ran K
+        forwards, so the head is short exactly the bonus token's position. One
+        extra head forward fills it -- input token ``cand[K]`` against the
+        TARGET's hidden state of row ``K-1``, the same pairing every other step
+        uses. It costs a head forward only on rounds where every proposal was
+        accepted, i.e. exactly the rounds that paid for themselves.
+        """
+        batch_d = job.get("_batch_d")
+        if batch_d is None or job.get("draft_rollback") is False:
+            return
+        start = int(job.get("_round_start") or 0)
+        steps = int(job.get("_rung") or self.spec_steps)
+        kept = int(n_accept) + 1
+        idx = int(batch_d.reqs[0].req_pool_idx)
+        pool = batch_d.req_to_token_pool
+
+        if kept > steps:
+            # Full accept: run the missing position rather than leave a hole.
+            hidden = job.get("_verify_hidden")
+            token = job.get("_verify_last_token")
+            if hidden is not None and token is not None:
+                batch_d.input_ids = token.to(torch.int64)
+                batch_d.prepare_for_decode()
+                self._draft_forward(batch_d, hidden)
+                job["_head_forwards"] = job.get("_head_forwards", 0) + 1
+                job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
+            return
+
+        surplus = steps - kept
+        if surplus <= 0:
+            return
+        keep_len = start + kept
+        batch_d.token_to_kv_pool_allocator.free(
+            pool.req_to_token[idx, keep_len : start + steps]
+        )
+        batch_d.seq_lens.fill_(keep_len)
+        if getattr(batch_d, "seq_lens_cpu", None) is not None:
+            batch_d.seq_lens_cpu.fill_(keep_len)
+        if getattr(batch_d, "orig_seq_lens", None) is not None:
+            batch_d.orig_seq_lens.fill_(keep_len)
+        batch_d.seq_lens_sum = None
+        req_d = batch_d.reqs[0]
+        req_d.decode_batch_idx = max(0, int(req_d.decode_batch_idx) - surplus)
+        req_d.kv_committed_len = keep_len
+        req_d.kv_allocated_len = keep_len
+        job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) - surplus
 
     def _decode_step(self, job):
         batch = job["_batch"]
@@ -3384,6 +3492,30 @@ class DualGroupLane:
             result["rungs"] = dict(sorted(hist.items()))
             result["rung_mean"] = round(sum(rungs) / len(rungs), 3)
             result["policy"] = self.spec_policy.stats()
+        # Round 7b posten 0: the per-position curve in raw counts, and the
+        # head's lag against the target. Both are what decides between "the
+        # head is weak" and "the lane's chain feeds it the wrong position".
+        reached = job.get("_pos_reached") or {}
+        if reached:
+            hits = job.get("_pos_hits") or {}
+            result["accept_positions"] = {
+                "reached": dict(sorted(reached.items())),
+                "hits": dict(sorted(hits.items())),
+                "rate": [
+                    round(hits.get(j, 0) / reached[j], 5)
+                    for j in range(max(reached) + 1)
+                    if reached.get(j)
+                ],
+            }
+        lags = job.get("_draft_lag") or []
+        if lags:
+            result["draft_lag"] = {
+                "first": lags[0],
+                "last": lags[-1],
+                "max_abs": max(abs(x) for x in lags),
+                "nonzero_rounds": sum(1 for x in lags if x != 0),
+                "rounds": len(lags),
+            }
         if job.get("_argmax_rounds"):
             result["argmax_check"] = {
                 "rounds": job["_argmax_rounds"],

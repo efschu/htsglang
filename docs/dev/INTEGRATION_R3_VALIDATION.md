@@ -7633,3 +7633,247 @@ und die black-Hunks in `decode_cuda_graph_runner.py` sind vor und nach der
 Aenderung identisch; das neue Modul `lane_spec_policy.py` ist sauber).
 mypy auf `lane_spec_policy.py`: sauber. codespell auf den Python-Dateien
 sauber.
+
+## Lane-Spec-Kette Runde 7b (feat/dual-group-r7b, Basis 8007371e22) — 2026-07-29
+
+Auftrag: Posten 0 = Accept-Saettigungs-Falsifikator (Verband-vs-Lane-
+Positionskurve am SELBEN Kopf), Posten 1 = DFLASH-Kopf-Machbarkeitsrechnung
+(Schreibtisch), Posten 2 = deterministische Turn-Routing-Politik (Nachtraege
+13c/13d/13e). Nutzer-Regel dieser Runde: ALLE Spec-Messungen bei K=3, jede
+Accept-Zahl mit Referenzspalte, per-Position-Kurve in jede Tabelle.
+
+### Posten 0, Verdikt: KEIN Lane-Ketten-Bug — und die Praemisse war falsch
+
+Der Auftrag stand auf der Annahme, der Verband erreiche mit DENSELBEN
+Kopf-Bytes Accept 2,9-3,1, waehrend die Lane bei 43,8/0,8/0 % haengt. Diese
+Annahme ist falsifiziert: die 2,75-2,82 aus `performance_data/04` sind an
+einem ANDEREN Vehikel gemessen (Qwen3.6-27B-FP8, Cross-Algo-Pfad), nicht am
+GGUF-Vehikel dieser Kette. Auf diesem Vehikel liegt der VERBAND selbst bei
+Accept 1,15-1,53.
+
+Instrument: `speculative/accept_position_probe.py` zaehlt im Verband genau die
+Groesse, die `LaneSpecPolicy` seit Runde 7a fuer die Lane fuehrt
+(`reached[j]`/`hits[j]`, roh statt EMA), scharf nur unter
+`SGLANG_ACCEPT_POSITION_PROBE=1`; die Definitionsgleichheit ist ein CPU-Test,
+kein Kommentar. Treiber:
+`scripts/dual_group/lane_accept_probe.py` fuehrt beide Arme aus EINEM Boot auf
+DENSELBEN Token-Ids.
+
+Boot 2, K=3, `verify: target_verify`, Graphen an, 192 Ausgabe-Token:
+
+| Inhalt | Verband p0/p1/p2 | Verband Accept | Lane p0/p1/p2 | Lane Accept | Referenz (FP8-Vehikel) |
+|---|---|---|---|---|---|
+| squares | 51,2 / 6,2 / 0,0 % | 1,534 | 50,0 / 8,1 / 0,0 % | 1,540 | 2,75-2,82 |
+| code | 38,1 / 15,7 / 0,0 % | 1,487 | 33,8 / 10,6 / 0,0 % | 1,374 | 2,75-2,82 |
+| prose | 23,2 / 5,6 / 0,0 % | 1,398 | 40,7 / 1,8 / 0,0 % | 1,415 | 2,75-2,82 |
+
+Boot 1 (Bruecke `seqdecode`, dieselbe Kopf-Kette) zwei weitere Inhalte:
+alphabet Verband 13,7/4,3/0,0 (1,148) gegen Lane 16,5/0,0 (1,165);
+repeat Verband 29,7/11,6/0,0 (1,318) gegen Lane 29,5/4,7/0,0 (1,308).
+
+**Die Lane trifft den Verband auf jedem Inhalt.** Damit ist der Verdacht
+"die Lane-Kette degradiert Positionen >= 2" widerlegt: zwei UNABHAENGIGE
+Implementierungen derselben greedy-Kette (EagleWorkerV2 und die Lane) liefern
+dieselbe Kurve. Die Saettigung sitzt im Kopf, nicht in der Kette.
+
+### Posten 0, Nebenbefund: die Lane hatte den Ketten-Bug trotzdem — nur ohne Wirkung
+
+Die Schreibtisch-Analyse vor dem ersten Boot fand ihn, und er ist echt:
+`_propose` schiebt den Kopf je Runde um K Positionen weiter, der Verify
+committet `n_accept + 1`, und die Differenz hat NIEMAND zurueckgestellt. Der
+Code sagte es sogar selbst — als Buchhaltungsnotiz ("the head keeps every
+proposal it ever made"), nicht als Defekt. Gemessen mit dem neuen
+`draft_lag`-Zaehler: die Sequenzlaenge des Kopfes laeuft der des Ziels ueber
+einen 192-Token-Auftrag um **179-224 Positionen** davon, und seine KV haelt
+jede je verworfene Proposal.
+
+Der Fix (`_rollback_draft`) schneidet den Kopf nach jedem Verify auf die
+akzeptierte Laenge zurueck, gibt die Slots der verworfenen Proposals sofort
+frei und faehrt bei VOLLEM Accept den einen fehlenden Kopf-Forward nach
+(Bonus-Token-Position, gegen das TARGET-Hidden der Zeile davor). Beide Arme
+aus EINEM Boot ueber den Job-Schalter `draft_rollback: false`:
+
+| Inhalt | lag max mit Fix | lag max ohne | Accept mit | Accept ohne | output_ids |
+|---|---|---|---|---|---|
+| squares | 0 | 179 | 1,540 | 1,540 | identisch |
+| code | 0 | 224 | 1,374 | 1,374 | identisch |
+| prose | 0 | 212 | 1,415 | 1,415 | identisch |
+
+Die Positionskurven sind auf die fuenfte Stelle gleich, die 192 Ausgabe-Token
+byte-identisch. **Der Fix aendert an der Ausgabe NICHTS** — der Kopf ist gegen
+seine eigene KV und seine eigene Position praktisch unempfindlich. Das ist
+ehrlich dazuzusagen: gefixt wird er, weil er falsch war und weil er die
+Kopf-KV mit K statt mit `accept+1` je Runde fuellt (auf diesem Vehikel
+Faktor 2,3 zu schnell, also ein Kapazitaetsleck), nicht weil er Accept kostet.
+
+### Posten 0, drittes: die Referenzspalte schlaegt an, und zwar am VERBAND
+
+Nutzer-Regel 2 dieser Runde verlangt, eine Abweichung ueber dem Boden zu
+BENENNEN statt sie als Inhaltsvarianz zu verbuchen. Sie ist gross: Verband
+1,15-1,53 gegen Referenz 2,75-2,82. Vier Ursachen sind gemessen ausgeschlossen:
+
+- **Inhalt**: fuenf Typen (alphabet, squares, repeat, echter Code, echte
+  Prosa), alle im selben Band.
+- **Kontextlaenge**: 42 / 58 / 71 / 147 / 184 / 2000 / 6000 / 9370 Prompt-Token,
+  Accept 1,25-1,35 ueber die ganze Spanne — der Laengen-Arm hebt nichts.
+- **Quantisierung des MTP-Kopfes**: Gegenprobe-Boot mit
+  `Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q6_K` — dort liegt
+  blk.64 VOLLSTAENDIG auf Q6_K statt wie im Messvehikel auf Q3_K/Q4_K
+  (eh_proj dort Q8_0). Ergebnis: Accept 1,14-1,51, Positionskurve
+  13,7-45,3 / 3,7-12,1 / ~0 — **dasselbe Band**. Die Kopf-Praezision ist es
+  nicht.
+- **Fine-Tune**: Basis-Qwen3.6-27B gegen heretic-v2, gleiches Band.
+
+Kumulativ ueber den Q6_K-Boot (770 Runden): `accept_len_hist
+{1: 582, 2: 174, 3: 13, 4: 1}`, `position_accept [0,244  0,074  0,071]`.
+Position 2 ist also KEIN harter Nuller — sie wird nur 14-mal erreicht. Der
+Engpass ist Position 0 mit 24-45 %: fuer Accept 2,8 braeuchte es dort ~65 %.
+
+Offen bleibt genau ein Arm, und er ist der naechste Falsifikator fuer R7c:
+das FP8-Vehikel selbst (`Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP`, 25 GB,
+Serving-Gruppe TP=3, kein Lane noetig, Probe an). Er entscheidet, ob die
+Referenz ueberhaupt auf diesem Rig reproduzierbar ist oder ob sie eine
+Eigenschaft des damaligen Cross-Algo-Aufbaus war.
+
+### Boot-Bilanz: 4 von 6
+
+1. GGUF-Vehikel, Lane + Kopf-Kette, Instrumentierung (beide Kurven, `draft_lag`).
+   Dabei aufgefallen: die Jobs liefen auf der Default-Verify-Bruecke
+   `seqdecode` (Runde 6 hat den Default bewusst nicht umgestellt), also
+   `verify_graph_rounds 0` und 71-95 ms je Runde. Ab Boot 2 explizit
+   `verify: target_verify`, damit 34,0-34,2 ms je Runde und `vgraph` voll —
+   deckungsgleich mit der R7a-Messtabelle (33,8 ms bei K=3).
+2. Rollback-Fix, A/B ueber den Job-Schalter, Byte-Tor.
+3. VERWORFEN: GPTQ-Int4-Gegenprobe (`...MTP-Preserved-GPTQ-Int4`, MTP-Kopf dort
+   BF16) startet mit der Lane-Ratio nicht — `Dimension of size 136 is not a
+   multiple of its unit count 1088`. Kein Ergebnis, als verbrauchter Boot
+   gezaehlt.
+4. Q6_K-Gegenprobe, Serving-Gruppe allein, fuenf Inhalte.
+
+### Posten 1: DFLASH-Lane-Kopf, ehrliche Rechnung — passt heute NICHT
+
+Aus dem Checkpoint gelesen, nicht geschaetzt (die NEXTN-Lehre: 2684 statt
+120 MiB). `qwen3.6-27b-dflash/model.safetensors`, 58 Tensoren, alle BF16:
+
+| Posten | MiB |
+|---|---|
+| `layers.*.mlp.{gate,up,down}_proj` (5 Layer) | 2550,0 |
+| `fc.weight [5120, 25600]` (Fusion der 5 Ziel-Layer) | 250,0 |
+| `layers.*.self_attn.{q,o}_proj` | 400,0 |
+| `layers.*.self_attn.{k,v}_proj` | 100,0 |
+| Normen | ~0,1 |
+| **Summe Gewichte** | **3300,1** |
+
+**Komplement-Schnitt: es gibt keinen.** Der NEXTN-Kopf kostet auf der Lane
+2684 MiB, weil das die Bytes sind, die die ANDEREN Karten halten — die Lane
+nestet in einen Kopf, den die Serving-Gruppe ohnehin faehrt. Eine
+DFLASH-Lane neben einer NEXTN-Serving-Gruppe hat kein solches Gegenstueck:
+die vollen 3300 MiB sind neue Bytes auf der Lane-Karte. Weder Embed noch
+lm_head sind im Checkpoint — DFLASH leiht sie sich vom Ziel, genau wie der
+NEXTN-Kopf, also kein Vokabular-Posten.
+
+Dazu kommen KV und Graphen. Der NEXTN-Kopf: 1 KV-tragende Schicht, 4096 B je
+Token, 400 MiB -> 19200 Token, Graph 0,02 GB. DFLASH hat 5 KV-tragende
+Schichten, also 20480 B je Token roh -> 2000 MiB fuer dieselbe Tiefe; vier der
+fuenf Schichten sind `sliding_attention` mit Fenster 2048, ein SWA-bewusster
+Pool kaeme mit ~110 MiB aus. Also 400-2000 MiB, je nachdem ob der Pool das
+Fenster nutzt, plus ~50 MiB Graphen.
+
+**Gesamt 3750-5350 MiB gegen 1710 MiB frei** (gemessen, Boot 1: nach voller
+Lane-Bringup `avail mem=1.71 GB` auf der 5090). Also 2040-3640 MiB zu wenig.
+Die vier Auswege, mit Preis:
+
+1. **NEXTN auf der Lane durch DFLASH ERSETZEN** statt beide: gibt 2684 MiB
+   Komplement + 400 MiB Kopf-Pool frei, ~3,9 GB verfuegbar gegen 3,75-5,35 GB
+   Bedarf. Traegt NUR in der SWA-bewussten Pool-Variante, und dann knapp.
+2. **DFLASH-Lane auf eine ANDERE Karte** — das ist Nachtrag 13 Punkt 5
+   (Drafter als TP1-Lanes auf verschiedenen Karten) und der natuerliche Ort;
+   verlangt die Freiraum-Messung der beiden 3080 und gehoert nach R7c.
+3. **Rank-0-Budget kuerzen**: NICHT gangbar. Anders als in 4.12 (wo 1444 MiB
+   an Rank 0 die Serving-KV nicht hoben, weil die knappste Karte sie sizt) ist
+   die Serving-KV hier ranglokal ungleich verteilt (gemessen Boot 2: 29463 /
+   26901 / 25620 Token je Rang, Summe 81984). 3,5 GB von Rang 0 nehmen kostet
+   ~57k der 82k Token.
+4. **DFLASH quantisieren**: auf dieser Kiste existiert kein quantisierter
+   DFLASH-Drafter; eine Konversion ist ein eigenes Vorhaben.
+
+**GGUF-Sperren-Verdikt: die alte Drafter-Lane-GGUF-Sperre gilt fuer DFLASH
+NICHT.** `dflash_worker_v2._resolve_lm_head_compute` nimmt einen
+GGUF-residenten, gepackten `lm_head` ueber dessen eigenes `quant_method.apply`
+(gegated durch dasselbe `should_apply_lm_head_quant_method`, das der
+LogitsProcessor benutzt), rechnet also mit demselben `fused_mul_mat_gguf`, den
+der Ziel-Verify faehrt — dieselbe Konstruktion, mit der der NEXTN-Kopf sich
+die gepackten Tabellen des Ziels leiht. Der DFLASH-Drafter selbst ist BF16 und
+braucht keine GGUF-Behandlung.
+
+**Kein Bau in dieser Runde**, wie beauftragt: Posten 0 haette den Bau
+gerechtfertigt, wenn die Lane-Kette der Defekt gewesen waere. Sie war es
+nicht, und ein zweiter Kopf, der 3,3 GB kostet und denselben
+Positions-Engpass an Position 0 haette, ist keine Antwort auf Accept 1,3.
+
+### Posten 2: die Turn-Routing-Politik, gebaut und CPU-gepinnt
+
+`LaneDrafterPolicy` in `lane_spec_policy.py`, EIN Objekt mit drei Aktoren
+(Algorithmus, K, topk als Feld) statt drei Reglern. Regel in der KORRIGIERTEN
+Form von 13d, in Prioritaetsreihenfolge ausgewertet:
+
+1. **LAST zuerst** (13e) — ueber der Schwelle gewinnt der billigere Drafter,
+   und fuer einen Auftrag der geschuetzten Klasse ist das keine Praeferenz,
+   sondern das Prioritaetsversprechen aus Nachtrag 5. Knopf
+   `auto | nextn-under-load | fixed`, Schwelle 0,85 dokumentiert statt
+   getunt (der Sensor kommt aus D4/#279; bis dahin liest die Politik nur, was
+   der Aufrufer hereingibt).
+2. **PROSA ist ein hartes Veto** — kein Turn-Index und keine Kontextlaenge
+   holen DFLASH dort zurueck.
+3. **Code-Inhalt ODER Erst-Request**, sonst NEXTN.
+4. **Kontextfenster**, GELESEN statt hingeschrieben: die Zahl kommt aus
+   `speculative/cross_algo_utils.derive_ctx_gate_threshold`, die sie aus der
+   config.json des DRAFTERS ableitet (Faktor x `sliding_window`, gedeckelt auf
+   `max_position_embeddings`). Damit ist der in FEATURES_VS_UPSTREAM als
+   fehlend gefuehrte Posten "context-length gate from the drafter training
+   config" verdrahtet — nicht neu gebaut, sondern an die vorhandene Stelle
+   angeschlossen; das Politik-Modul bleibt import-frei und nimmt die Zahl als
+   Konstruktor-Argument.
+5. **Accept-Waechter als Netz**, auf Position 0 statt auf der mittleren
+   Accept-Laenge (dieselbe Begruendung, die die Rungs-Politik schon fuehrt).
+
+Die Entscheidung traegt `preferred` UND `algorithm` getrennt: heute ist nur
+die NEXTN-Lane gebaut, die Politik sagt trotzdem, was sie gewollt haette
+("dflash lane not built"). Genau das macht das Routing messbar, BEVOR R7c die
+zweite Lane baut — und verhindert, dass "nicht gebaut" wie "nicht bevorzugt"
+aussieht. Hysterese: ein Algorithmuswechsel ist ein Plan-Flip und braucht das
+volle Fenster.
+
+### CPU-Tore
+
+`test_dual_group_concurrency.py` 110 -> 135:
+`TestLaneDraftRollback` 6, `TestAcceptPositionProbe` 3 (darunter das Tor, das
+Sonde und Lane-Politik als DIESELBE Groesse ausweist), `TestLaneDrafterPolicy`
+16. Alle gruen. ruff/black/isort/codespell auf allen geaenderten Dateien ohne
+Delta (die vorbestehenden Befunde in `server_args.py` / `model_runner.py` sind
+vor und nach der Aenderung identisch); die beiden neuen Module
+`accept_position_probe.py` und `lane_accept_probe.py` sind sauber.
+
+### Offen fuer R7c
+
+- **FP8-Vehikel-Falsifikator** (oben spezifiziert) — er entscheidet, ob die
+  Accept-Referenz 2,75-2,82 auf diesem Rig ueberhaupt existiert. Ohne ihn ist
+  jede weitere Kopf-Arbeit an dieser Kette blind.
+- **Posten 3 (Architektur-vs-Algorithmus-A/B, 13b) NICHT gefahren**, und der
+  Grund ist strukturell, nicht Budget: der Lane-Arm des A/B verlangt eine
+  DFLASH-Lane, und Posten 1 zeigt, dass sie neben der NEXTN-Lane auf dieser
+  Karte nicht existieren kann. Das A/B wird erst mit der Mehrkarten-Platzierung
+  (Nachtrag 13 Punkt 5) baubar.
+- **Verify-Default**: `seqdecode` ist immer noch der Default und hat Boot 1
+  gekostet. Runde 6 hat die Belege fuer `target_verify` geliefert und die
+  Promotion bewusst dem Merge ueberlassen; sie liegt seitdem da.
+- **`_propose` re-seedet die Kopf-KV nicht mit Ziel-Hidden.** Der Verband
+  ueberschreibt in `_draft_extend_for_decode` die KV der akzeptierten Positionen
+  mit den TARGET-Hidden; die Lane laesst dort die selbst erzeugten stehen.
+  Nach dem Rollback-Fix ist das der letzte strukturelle Unterschied der beiden
+  Ketten — auf diesem Vehikel nachweislich folgenlos (die Kurven decken sich),
+  auf einem Vehikel mit gesundem Accept aber die naechste Stelle, an der sie
+  auseinanderlaufen koennten.
+- **Sprossen-Aliasing (#93/#102)** bleibt der aus R7a benannte Posten; er wird
+  erst relevant, wenn eine Sprosse etwas Grosses Eigenes haelt — also mit der
+  DFLASH-Lane, also in R7c.
