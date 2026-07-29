@@ -8760,3 +8760,159 @@ GPU-Restliste (Boot-Queue):
    Latenz je Park-Ziel vs Admissions-Takt.
 4. Aktivitaets-Probe-Kosten auf Device-Tensoren pruefen (heute
    free_slots-Scan je Boundary) und ggf. Host-Spiegel der Belegung.
+
+## KV-Druck-Treppe CPU-Skelett (Erg. 9 + 9b) (feat/kv-pressure-ladder-skeleton, Basis c887e1a3f9) — 2026-07-29
+
+Gegenrichtung zu Erg. 8: laeuft das System performance-optimal (wenige
+Allreduce-Knoten, schnelle Karte) und droht der KV zu platzen, steigt es in N
+voreinstellbaren Treppenstufen Richtung Kapazitaet. Diese Runde baut das
+CPU-Skelett — Stufen-Tabelle, Sensor, Flip-Kontrakt, Uebergabe-Interface —
+und bewegt kein einziges Byte.
+
+- STUFEN-TABELLE (`model_executor/kv_pressure_ladder.py`,
+  `LadderStep` + `PressureLadder`): geordnete Sprossen mit Typ
+  `base | relief | geometry_flip | external`, je Sprosse erwartete
+  KV-Kapazitaet, erwartete Perf-Kosten (relativ zur Basis), Graph-
+  Voraussetzung (`graphs_precaptured`), KV-Uebergabestrategie und
+  Herkunfts-Label (`measured | solver | placeholder` + `source`), letzteres
+  in derselben Ehrlichkeits-Disziplin wie die Ratenprofile des
+  HTCCL-Pfad-Dispatchers. `relief`-Stufen REFERENZIEREN bestehende Features
+  per Name (`dcp_ratio` = --rank-kv-ratio, `kv_spill` = #134/#236,
+  `weightless_rank` = #115, `session_offload`) und implementieren nichts neu.
+  Unsinnige Treppen sind harte Fehler bei der Konstruktion: leere Tabelle,
+  Sprosse 0 nicht `base`, zweite `base`, Typreihenfolge verletzt, doppelte
+  Namen, sinkende bekannte Kapazitaet oder sinkende bekannte Kosten nach
+  oben, `external` unter der Mindest-Hysterese, `relief` mit Uebergabe !=
+  none, `geometry`/`external` mit Uebergabe none.
+- UEBERGABE-INTERFACE (`KvHandover`): `none` ist implementiert (relief-
+  Stufen aendern kein Layout, es gibt nichts zu uebergeben); die drei
+  Design-Optionen `new_tokens_only` / `background_migrate` / `spill_reload`
+  plus die 9b-Variante `anticipatory_shadow` sind NotImplemented-Stubs,
+  deren Docstrings die entscheidenden MESSFRAGEN tragen (gemischtes Serving
+  je Runde, Bus-Rate vs Rundenlaenge in beiden Regimes, Stall-Zeit und
+  Host-RAM-Fit, Delta-Groesse bei Flip vs Staging-Vorlauf,
+  Verwerfungsquote bei Flattern). Punkt 3 der Erg. 9 ist die eine echte
+  offene Entscheidung und bleibt es hier bewusst.
+- SENSOR (`KvPressureSensor`): Wasserstand UND Trend — projizierte
+  Erschoepfung aus einer deterministischen Kleinste-Quadrate-Steigung ueber
+  die Belegungsreihe, nicht der Momentwert. Kein neuer Messpfad: die
+  Schnittstelle nimmt eine Zeitreihe (`OccupancySample`), die vorhandene
+  Scheduler-/token_to_kv_pool-Belegungszaehlung wird spaeter angeschlossen;
+  CPU-Phase = injizierte Reihe. Hysterese asymmetrisch und als solche
+  VALIDIERT: `descend_window > ascend_window` und
+  `abort_stage_window > pre_stage_window` sind harte Konstruktionsfehler,
+  ebenso die Markenordnung `descend < pre_stage < ascend`.
+- PRE-STAGING (Erg. 9b): zweite Marke unterhalb der Flip-Marke. Trend durch
+  die Pre-Stage-Marke startet die SCHATTEN-KOPIE (altes Layout bleibt Quelle
+  der Wahrheit), Abbruch erst nach dem langen Anti-Flatter-Fenster.
+  Plan-Phasen `pre_stage | abort_stage | flip | descend | none`;
+  `abort_stage` traegt nur `discard_items`, keine Rueckkopie und keine
+  Sprossenaenderung — Verwerfen ist gratis. Trifft ein Flip einen warmen
+  Schatten, meldet der Plan `delta_only=True` und Uebergabe
+  `anticipatory_shadow`.
+- FLIP-KONTRAKT (`KvPressureLadder.on_pressure_boundary`) als No-Op-Planer
+  nach dem Muster `on_phase_boundary` / `on_admission_boundary`. Invarianten
+  IM CODE, nicht per Konvention:
+  1. Typreihenfolge `base < relief < geometry_flip < external` in der
+     Tabellen-Validierung — billige Entlastung IMMER vor Geometrie.
+  2. Aufstieg genau eine Sprosse; ein erzwungenes Ziel, das eine
+     relief-Sprosse ueberspringt, ist `KvLadderError` (nennt die
+     uebersprungenen Sprossen).
+  3. Capture-Guard: Flips und Pre-Stages nur an Runden-Grenzen und nie
+     waehrend aktiver Capture (`begin_capture`/`end_capture`, gleicher
+     Kontrakt wie HTCCL-Dispatcher und K-Leiter); Ablehnung = No-Op-Plan
+     mit Grund.
+  4. Stufe ohne vorab captured Graphen ist weder Flip- noch Pre-Stage-Ziel:
+     harter `KvLadderError`, kein stiller Fallback auf eine andere Sprosse.
+  5. Prio-Schutz: geschuetzte Sessions bleiben auf der schnellen Stufe, der
+     Aufstieg listet nur unprotected Sessions; sind alle geschuetzt, wird der
+     Aufstieg mit Grund blockiert statt den Schutz zu brechen.
+  6. `external`-Stufen brauchen N aufeinanderfolgende Aufstiegs-Verdikte
+     (Default 512); eine ruhige Runde setzt die Strecke zurueck.
+- FLAGS, EIGENSTAENDIG ZUWAEHLBAR: `--kv-pressure-ladder` ('auto' =
+  Planner-Tabelle, sonst `<typ>:<name>`-Liste) und `--kv-pressure-pre-stage`
+  (Bool) sind ZWEI Schalter. Treppe an + Staging aus ist eine gueltige
+  Kombination (eigener Testfall: kein `kv_shadow`-Posten wird je genannt,
+  kein `delta_only`); Staging ohne Treppe ist harter Fehler zur
+  Argumentzeit; beides aus = heutiges Verhalten, es wird nichts konstruiert
+  und keine Probe genommen. Dazu Schwellen/Fenster-Flags
+  (`--kv-pressure-ascend-threshold/-window`, `--kv-pressure-descend-*`,
+  `--kv-pressure-pre-stage-*`, `--kv-pressure-abort-stage-window`,
+  `--kv-pressure-horizon-rounds`, `--kv-pressure-external-hysteresis-rounds`)
+  mit frueher Validierung in `ServerArgs._handle_kv_pressure_ladder`.
+- PLANNER-TABELLE (`planner/kv_ladder_table.py`, rein additiv):
+  `build_ladder_table(RigModelProfile)` rechnet die Treppe VORAB je
+  Modell/Rig. Familien-Check ueber die vorhandene Solver-Maschinerie
+  (`key_solver.nesting_hull` mit MLP-Probe) — nesten die Geometrien nicht,
+  waere die "Stufe" ein Gewichts-Reshard und der Bau bricht ab (die
+  [6,2]/[7,1]-Gegenprobe des Solvers ist Testfall). Kapazitaet je
+  Geometrie-Sprosse aus deklarierten Kartengroessen, Budget-Anteil,
+  Gewichts- und KV-Bytes (Label `solver`); fehlende Eingaben ergeben `None`
+  mit benanntem Platzhalter-Label statt einer erfundenen Zahl. Relief-Gewinne
+  und Kosten sind per Default Platzhalter mit Messpflicht-Label; einzige
+  gefuellte Kostenzahl ist die Basis = 1.0 (Definition, nicht Schaetzung).
+  Alle drei Quellen (`capacity_fn`, `relief_gain_fn`, `cost_fn`) sind
+  injizierbar, sodass die Messkette spaeter ohne Codeaenderung einspeist.
+- VERZAHNUNG (Anschlusspunkte benannt, keine Umbauten): kalte Stufen-Graphen
+  sind Posten der BESTEHENDEN Register-Klasse `graph_rungs`
+  (`LadderPlan.required_resident_items`); der 9b-Schatten ist die NEUE
+  Register-Klasse `kv_shadow` (niedrigste Prio auf der Zielkarte,
+  drop-on-demand, Transport als Bus-Arbiter-Verbraucher, Zielplatz via
+  Peer-Grant) — einziger Posten, dessen park/discard gratis ist. Der Sensor
+  hat den Hook-Stil des 13e/#279-Saettigungssignals. KONFLIKTFREIHEIT mit dem
+  Nachbar-Planer (Erg.-8 `on_admission_boundary`): `plan_conflicts()` nennt
+  die Posten, die beide Plaene beruehren (per Konstruktion leer — disjunkte
+  Klassen und Namensraeume), `resolve_plan_priority()` gibt bei echter
+  Kollision deterministisch `admission` (Korrektheit vor Kapazitaet: eine
+  ankommende Session wartet nie auf eine Druckstufe). Beides getestet, inkl.
+  einer kuenstlich kollidierenden Plan-Attrappe.
+- KOMBINIERBARKEIT: kein Feature-Ausschluss ohne benannte harte Grenze. Die
+  einzige im Code stehende strukturelle Grenze ist Invariante 4 (Sprosse ohne
+  captured Graphen) — Graph-Sicherheitskontrakt, keine Politik. Offload-
+  Register, uneven DCP (dessen Token-Ratio die unterste relief-Sprosse IST),
+  Spec/K-Leiter (gleiche Runden-Grenzen, gleicher Capture-Guard) und
+  Prio-Klassen sind explizit mitgedacht.
+
+Tests (alle CPU-hermetisch, ohne GPU/torch.cuda; `CUDA_VISIBLE_DEVICES=99`,
+weil die leere Variante an einem vorbestehenden `test_utils.py`-Indexzugriff
+scheitert):
+`test_kv_pressure_ladder.py` NEU 87 (Step-/Tabellen-Validierung,
+Handover-Interface inkl. Stub-Nachweis, Sensor-Konfiguration, deterministische
+Trend-Projektion, asymmetrische Hysterese in beide Richtungen, Pre-Stage- und
+Abbruch-Marken, Flip-Kontrakt mit allen sechs Invarianten, Flattern-Sequenz
+staged nicht permanent, Treppe-an/Staging-aus als eigener Fall, Register-
+Verdrahtung, Konfliktfreiheit + deterministische Prioritaet, Flag-Parsing,
+ServerArgs-Validierung, Flag-aus = null Verhalten).
+`test_kv_ladder_table.py` NEU 25 (Profil-Validierung, Familien-Check inkl.
+Solver-Gegenprobe, Kapazitaets-Arithmetik, Platzhalter-Labels, Sprossen-
+Reihenfolge, injizierte Messfunktionen, Ende-zu-Ende in den Flip-Kontrakt).
+Bestand gruen: test_offload_register.py 44, test_offload_movement.py 49,
+test_offload_gdn_states.py 38, test_offload_bus_budget.py 15,
+test_dual_group_concurrency.py 152; volle planner-Suite 1644 passed /
+64 skipped. ruff check + ruff format + codespell auf allen beruehrten Dateien
+sauber, mypy auf den beiden neuen Modulen ohne Befund. Die Diffs an
+server_args.py und offload_register.py sind rein additiv (0 geloeschte
+Zeilen).
+
+GPU-/Mess-Restliste (Boot-Queue):
+1. DIE UEBERGABESTRATEGIE — die eine offene Entscheidung. Entscheidende
+   Messungen je Option: (a) new_tokens_only = Rundenkosten des gemischten
+   Servings + Anteil der Zielkapazitaet, der nach dem Flip tatsaechlich frei
+   wird; (b) background_migrate = Seiten/s gegen Rundenlaenge in BEIDEN
+   Regimes (dense-Decode mit brachliegendem Bus vs MoE-Streaming mit
+   umkaempftem Bus) und ob die Migration das Rennen gegen die projizierte
+   Erschoepfung gewinnt; (c) spill_reload = Stall = residente KV-Bytes /
+   (D2H+H2D) plus Host-RAM-Fit; (d) anticipatory_shadow = Delta-Groesse bei
+   Flip gegen Staging-Vorlauf und Verwerfungsquote (gerechnet in
+   verschwendeten Bus-Bytes, nicht in Ereignissen). Entschieden wird ueber
+   das Integral serviced Tokens ueber die Druck-Episode, nicht ueber
+   Einzelwerte.
+2. Anschluss des Sensors an die echte Belegung (Scheduler /
+   token_to_kv_pool) und Setzen der Flag-Defaults aus gemessenen Reihen.
+3. Vorab-Capture der Stufen-Graphen je Sprosse und ihre Registrierung als
+   `graph_rungs`-Posten; erst danach ist Invariante 4 mehr als ein Gate.
+4. `kv_shadow`-Bewegungsroute (Bus-Arbiter-Verbraucher + Peer-Grant); die
+   peer_vram-Seite erst nach dem P2P-Probe-Lauf.
+5. Speisung der Planner-Tabelle mit gemessenen Kapazitaets-/Kostenzahlen
+   (`capacity_fn`/`relief_gain_fn`/`cost_fn`), damit die Sprossen-Reihenfolge
+   nicht nur strukturell, sondern numerisch belegt ist.
