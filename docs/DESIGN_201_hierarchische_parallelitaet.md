@@ -2061,4 +2061,10 @@ waehlbare Politik angelegt, Default konservativ, ENTSCHIEDEN wird nach
 der Messung; (4) wo/wann Allreduce und Broadcast unter diesem P2P laufen,
 ist offen — das Treiber-Update und der Re-Probe-Lauf verraten, was geht;
 NICHTS wird vorab festgezurrt, das Probe-Paket formuliert offene Fragen
-als Messpunkte, nicht als Erwartungen.
+als Messpunkte, nicht als Erwartungen. (5) Auch die 256 MiB selbst sind
+nur die NOMINELLE Obergrenze: ob das Fenster komplett nutzbar ist, zeigt
+erst das laufende geupdatete System (effektiv ggf. weniger, z.B. wegen
+Adressierbarkeit) — die Probe bestimmt die effektiv nutzbare Apertur je
+gerichtetem Paar empirisch (groesste verifiziert beschreibbare
+Zielregion), und das Register konsumiert ausschliesslich diesen
+Effektivwert; nominal vs effektiv werden getrennt ausgewiesen.
