@@ -601,6 +601,142 @@ LANE_LOAD_POLICIES = ("auto", "nextn-under-load", "fixed")
 DEFAULT_LANE_LOAD_THRESHOLD = 0.85
 
 
+# -- drafter quantisation (nachtrag 13g) --------------------------------------
+#
+# The drafter's quantisation is a FREE parameter, not a constant. It trades
+# three things against each other and the balance moves with the target:
+#   - accept quality, which round 7a measured as the binding lever (position 0
+#     is the bottleneck, not the chain length),
+#   - head forward time, which is what a speculative round pays per proposal,
+#   - VRAM, which on a shared card is KV the target does not get.
+#
+# The DEFAULT is "similar to, or slightly better than, the target": a drafter
+# coarser than its target proposes tokens the target will reject, and a drafter
+# far finer than its target buys accept that the target's own coarseness has
+# already thrown away -- while costing the KV that the coarse target needs most.
+# Against a Q3_K_M target that band is Q4..Q6. The whole ladder stays reachable
+# (Q2 for a card with nothing left, BF16 when the card is empty); it is the
+# DEFAULT that is banded, never the choice.
+LANE_DRAFTER_QUANT_LADDER: Tuple[str, ...] = (
+    "q2_k",
+    "q3_k_m",
+    "q4_k_m",
+    "q5_k_m",
+    "q6_k",
+    "q8_0",
+    "fp8",
+    "bf16",
+)
+
+# Bits per weight, INCLUDING each format's block overhead -- what the checkpoint
+# actually costs on the card, not the nominal name. GGUF k-quant figures are the
+# llama.cpp block sizes; fp8 carries per-channel scales that round to nothing at
+# this scale.
+LANE_DRAFTER_QUANT_BPW: Dict[str, float] = {
+    "q2_k": 3.35,
+    "q3_k_m": 3.91,
+    "q4_k_m": 4.85,
+    "q5_k_m": 5.5,
+    "q6_k": 6.5625,
+    "q8_0": 8.5,
+    "fp8": 8.0,
+    "bf16": 16.0,
+}
+
+# How far above the target the default band reaches. Three steps is what turns
+# "Q3_K_M target" into "Q4..Q6 drafter" -- the band the user's rule names.
+LANE_DRAFTER_QUANT_BAND_STEPS = 3
+
+
+def _quant_key(quant: Optional[str]) -> Optional[str]:
+    """Normalise a checkpoint's quantisation name onto the ladder.
+
+    Accepts what the checkpoints and CLI actually say (``Q3_K_M``,
+    ``q3_k_m``, ``fp8_e4m3``, ``bfloat16``) rather than demanding the ladder's
+    spelling, because the caller reads this off a config or a flag.
+    """
+    if not quant:
+        return None
+    q = str(quant).strip().lower().replace("-", "_")
+    if q in LANE_DRAFTER_QUANT_BPW:
+        return q
+    if q.startswith("fp8") or q.startswith("float8"):
+        return "fp8"
+    if q in ("bf16", "bfloat16", "f16", "fp16", "float16", "half", "none"):
+        return "bf16"
+    # Q4_0 / Q4_1 / Q4_K_S and friends collapse onto their K_M sibling: the
+    # band is about precision CLASS, and half a bit does not move a band.
+    for step in LANE_DRAFTER_QUANT_LADDER:
+        if q.startswith(step[:2]):
+            return step
+    return None
+
+
+def drafter_quant_band(target_quant: Optional[str]) -> Tuple[str, ...]:
+    """The DEFAULT candidate steps for a drafter next to ``target_quant``.
+
+    Empty when the target's quantisation is unknown: a band derived from a
+    guess would be a recommendation with no evidence under it, and the caller
+    should then be made to choose explicitly.
+    """
+    key = _quant_key(target_quant)
+    if key is None:
+        return ()
+    i = LANE_DRAFTER_QUANT_LADDER.index(key)
+    return LANE_DRAFTER_QUANT_LADDER[i + 1 : i + 1 + LANE_DRAFTER_QUANT_BAND_STEPS]
+
+
+def drafter_weight_mib(params: int, quant: str, dense_params: int = 0) -> float:
+    """What a drafter of ``params`` weights costs on the card at ``quant``.
+
+    ``dense_params`` are the ones no format quantises (norms and other 1-D
+    tensors); they stay 16-bit in every step of the ladder, so they belong
+    outside the multiplication rather than inside an averaged bits-per-weight.
+    """
+    key = _quant_key(quant)
+    if key is None:
+        raise ValueError(f"unknown drafter quantisation {quant!r}")
+    quantised = max(0, int(params) - int(dense_params))
+    return (quantised * LANE_DRAFTER_QUANT_BPW[key] / 8.0 + dense_params * 2.0) / (
+        1024.0 * 1024.0
+    )
+
+
+def choose_drafter_quant(
+    target_quant: Optional[str],
+    budget_mib: float,
+    params: int,
+    dense_params: int = 0,
+    overhead_mib: float = 0.0,
+    ladder: Sequence[str] = LANE_DRAFTER_QUANT_LADDER,
+) -> Tuple[Optional[str], str]:
+    """Highest step of the DEFAULT band that fits ``budget_mib``.
+
+    Returns ``(quant, why)``; ``quant`` is None when not even the band's
+    coarsest step fits, and the caller is expected to treat that as "this card
+    cannot host this drafter" rather than to reach below the band on its own.
+    Dropping below the band is a real option, but it is a decision about
+    accepting a worse drafter than the target deserves, and that belongs to
+    whoever set the policy -- not to a sizing helper.
+    """
+    band = tuple(q for q in drafter_quant_band(target_quant) if q in ladder)
+    if not band:
+        return None, f"no default band for target quantisation {target_quant!r}"
+    room = float(budget_mib) - float(overhead_mib)
+    for quant in reversed(band):
+        need = drafter_weight_mib(params, quant, dense_params)
+        if need <= room:
+            return quant, (
+                f"{quant} needs {need:.0f} MiB of {room:.0f} MiB usable "
+                f"(band {'/'.join(band)} for target {target_quant})"
+            )
+    cheapest = drafter_weight_mib(params, band[0], dense_params)
+    return None, (
+        f"even {band[0]} needs {cheapest:.0f} MiB and only {room:.0f} MiB is "
+        f"usable (band {'/'.join(band)} for target {target_quant})"
+    )
+
+
 class LaneDrafterDecision:
     """What the policy decided, and why -- the why is not decoration.
 
@@ -610,7 +746,15 @@ class LaneDrafterDecision:
     policy testable and measurable BEFORE the second lane exists.
     """
 
-    __slots__ = ("preferred", "algorithm", "rung", "topk", "reason", "guarded")
+    __slots__ = (
+        "preferred",
+        "algorithm",
+        "rung",
+        "topk",
+        "reason",
+        "guarded",
+        "quant",
+    )
 
     def __init__(
         self,
@@ -620,6 +764,7 @@ class LaneDrafterDecision:
         topk: int = 1,
         reason: str = "",
         guarded: bool = False,
+        quant: Optional[str] = None,
     ):
         self.preferred = preferred
         self.algorithm = algorithm
@@ -627,6 +772,11 @@ class LaneDrafterDecision:
         self.topk = topk
         self.reason = reason
         self.guarded = guarded
+        # Which checkpoint precision the chosen drafter runs at. Carried on the
+        # decision rather than looked up by the caller, because the drafter and
+        # its precision are ONE choice: a round routed to dflash-at-q4 and one
+        # routed to dflash-at-q6 have different accept and different cost.
+        self.quant = quant
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -636,6 +786,7 @@ class LaneDrafterDecision:
             "topk": self.topk,
             "reason": self.reason,
             "guarded": self.guarded,
+            "quant": self.quant,
         }
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -665,6 +816,7 @@ class LaneDrafterPolicy:
         accept_guard_floor: float = 0.25,
         accept_guard_rounds: int = 8,
         default_algorithm: str = LANE_DRAFTER_NEXTN,
+        drafter_quant: Optional[Dict[str, str]] = None,
     ):
         avail = tuple(dict.fromkeys(a for a in available if a))
         if not avail:
@@ -682,6 +834,26 @@ class LaneDrafterPolicy:
         self.accept_guard_floor = float(accept_guard_floor)
         self.accept_guard_rounds = max(1, int(accept_guard_rounds))
         self.current = default_algorithm if default_algorithm in avail else avail[0]
+        # Per-algorithm drafter precision, SET rather than derived: the sizing
+        # helpers above recommend a step, the planner or the operator picks
+        # one, and the policy only reports what it was given. Nothing here
+        # falls back to a hardcoded default -- an unset drafter reports None,
+        # which reads as "whatever the checkpoint is" and never as a claim.
+        self.drafter_quant: Dict[str, str] = {
+            a: q for a, q in dict(drafter_quant or {}).items() if q
+        }
+        unknown = sorted(set(self.drafter_quant) - set(avail))
+        if unknown:
+            raise ValueError(
+                f"drafter_quant names drafters that have no lane: {unknown}; "
+                f"available: {list(avail)}"
+            )
+        bad = sorted(q for q in self.drafter_quant.values() if _quant_key(q) is None)
+        if bad:
+            raise ValueError(
+                f"drafter_quant has unrecognised precisions {bad}; "
+                f"known: {list(LANE_DRAFTER_QUANT_BPW)}"
+            )
         # Hysteresis: how many consecutive rounds have voted for something
         # other than ``current``. A switch needs the whole window.
         self._pending: Optional[str] = None
@@ -812,6 +984,7 @@ class LaneDrafterPolicy:
             topk=int(ctx.get("topk") or 1),
             reason=reason,
             guarded=self.guarded(preferred),
+            quant=self.drafter_quant.get(chosen),
         )
 
     def _apply_hysteresis(self, want: str) -> str:
@@ -843,6 +1016,7 @@ class LaneDrafterPolicy:
         return {
             "available": list(self.available),
             "current": self.current,
+            "drafter_quant": dict(sorted(self.drafter_quant.items())),
             "ctx_gate_tokens": self.ctx_gate_tokens,
             "load_policy": self.load_policy,
             "load_threshold": round(self.load_threshold, 4),

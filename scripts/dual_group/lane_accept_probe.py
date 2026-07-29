@@ -201,6 +201,18 @@ def main() -> int:
         "--tokenizer",
         default="/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-MTP-Q3_K_M-GGUF",
     )
+    ap.add_argument(
+        "--no-lane",
+        action="store_true",
+        help=(
+            "serving group only -- the round 7c posten 0 arm, where the "
+            "question is whether the accept REFERENCE exists on a given "
+            "vehicle at all. A vehicle whose weights do not fit next to a "
+            "lane still answers that question, and demanding a lane there "
+            "would make the falsifier unrunnable on exactly the vehicle it "
+            "is about."
+        ),
+    )
     args = ap.parse_args()
     base = f"http://{args.host}:{args.port}"
 
@@ -225,6 +237,17 @@ def main() -> int:
             "completion_tokens": gen["meta_info"].get("completion_tokens"),
             "spec_accept_length": gen["meta_info"].get("spec_accept_length"),
         }
+
+        if args.no_lane:
+            report["arms"].append(arm)
+            print(f"== {name} ({len(ids)} prompt tokens, K={args.steps})")
+            print(
+                f"   serving accept {arm['serving']['accept_len_mean']}"
+                f"  meta {arm['serving']['spec_accept_length']}"
+                f"  positions {_fmt_curve(arm['serving']['curve'])}"
+            )
+            sys.stdout.flush()
+            continue
 
         # LANE side, same ids, same token count, chain length K.
         arm["lane_arms"] = {}

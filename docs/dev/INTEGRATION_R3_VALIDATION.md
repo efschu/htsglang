@@ -7877,3 +7877,354 @@ vor und nach der Aenderung identisch); die beiden neuen Module
 - **Sprossen-Aliasing (#93/#102)** bleibt der aus R7a benannte Posten; er wird
   erst relevant, wenn eine Sprosse etwas Grosses Eigenes haelt — also mit der
   DFLASH-Lane, also in R7c.
+
+## Lane-Spec-Kette Runde 7c (feat/dual-group-r7c, Basis e9bb8a09bf) — 2026-07-29
+
+Auftrag: Posten 0 = FP8-Vehikel-Falsifikator fuer die Accept-Referenz, Posten 1
+= Mehrkarten-DFLASH (im Lauf der Runde vom Nutzer auf einen QUANTISIERTEN
+DFLASH-Kopf umgelenkt), Posten 2 = `_propose` re-seedet die Kopf-KV nicht mit
+Ziel-Hidden. Nutzer-Regeln dieser Runde: alle Spec-Messungen bei K=3, Referenz-
+spalte je Inhaltstyp, per-Position-Kurve in jeder Tabelle.
+
+**Karten-Status: diese Runde hat KEINEN Boot gefahren.** Der Nutzer hat die
+Karten waehrend der Analysephase selbst gebraucht; die Runde hat einmal
+angemeldet, sofort geyielded (`holder` entfernt, Log-Zeile gesetzt, kein
+Prozess gestartet) und danach ausschliesslich Schreibtischarbeit geliefert.
+Alles unten ist entweder aus Dateien GELESEN oder auf der CPU GEMESSEN; nichts
+ist geschaetzt, und nichts ist auf dem Rig belegt. Das Boot-Budget von 6 ist
+unangetastet.
+
+### Posten 0: die Referenz existiert — und ist an einem anderen Messpfad entstanden
+
+Der Falsifikator ist noch nicht gebootet, aber seine Voraussetzung hat sich beim
+Zurueckverfolgen der Referenz geaendert, und zwar so, dass der Boot jetzt eine
+andere Frage stellt als beauftragt.
+
+**Die 2,75-2,82 sind zwei Zellen einer Tabelle, kein Messpunkt.** Sie stammen
+aus `/root/performance_data/04_speculation_draft/speculation_draft.md:56-60`,
+Primaerquelle `dflash_verdict.md:18,25`, Rohdaten `battery_nextn_r{1,2}.mt.log`.
+Die volle NEXTN-Spalte dieser Batterie spannt **2,61-3,12**; als "Referenzband"
+war 2,75-2,82 also von Anfang an eine Verengung auf die zwei Zellen, die ins
+Diagramm gingen.
+
+Der Boot, der sie erzeugt hat, unterscheidet sich vom R7b-Messpfad in **fuenf**
+Achsen gleichzeitig (`xover_launch_s3.sh:29-32`):
+
+| Achse | Referenzmessung | R7b-Messpfad |
+|---|---|---|
+| Vehikel | Qwen3.6-27B-FP8 | Qwen3.6-27B-Q3_K_M-GGUF |
+| Spec-Pfad | `--speculative-cross-algorithm --...-force nextn` | reines NEXTN |
+| K | `--speculative-adaptive`, k variabel 1-3 | fest K=3 |
+| KV-dtype | fp8_e5m2 | fp8_e4m3 |
+| Inhalt | Multiturn 32k-54k, echte Dateien | 5 kurze Zwangsfortsetzungen |
+
+Ein Boot kann diese fuenf nicht auseinanderhalten. **Es gibt aber bereits eine
+Zelle, die nur EINE Achse bewegt**: `docs/benchmarks/htsglang_tp3.json:87-90`,
+dasselbe FP8-Vehikel, reines NEXTN, K=3, dieselbe Spec-Konfiguration —
+**Accept 3,279 (code) / 2,688 (prose)**. Damit ist die eigentliche Frage des
+Auftrags ("existiert die Referenz auf diesem Rig ueberhaupt, oder war sie eine
+Eigenschaft des Cross-Algo-Aufbaus") schon beantwortet: **sie existiert auch
+ohne Cross-Algo und ohne adaptives K.** Der Cross-Algo-Aufbau ist NICHT die
+Erklaerung.
+
+Damit bleibt als Erklaerung fuer 1,15-1,53 gegen 2,69-3,28 die ZIEL-
+Quantisierung, und der Boot, der das entscheidet, ist:
+
+```
+Vehikel Qwen3.6-27B-FP8 (nicht AEON — siehe unten), Rezept rig-runbook 4.1,
+reines NEXTN, K=3, SGLANG_ACCEPT_POSITION_PROBE=1,
+scripts/dual_group/lane_accept_probe.py --no-lane --steps 3
+--prompts alphabet,squares,repeat,code,prose
+--tokenizer <MODEL_ROOT>/Qwen3.6-27B-FP8
+```
+
+Der `--no-lane`-Arm ist in dieser Runde gebaut worden: das FP8-Vehikel passt
+nicht neben eine Lane (`rig-runbook.md:1034-1036`), und ein Falsifikator, der
+eine Lane verlangt, waere auf genau dem Vehikel unlaufbar, um das es geht.
+
+**Vehikel-Korrektur.** R7b hat `Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP`
+als Falsifikator-Vehikel benannt. Die Referenz wurde am **Basis**-`Qwen3.6-27B-FP8`
+gemessen. Beide Checkpoints tragen denselben MTP-Kopf, byte- und formgleich —
+`recipe.yaml` des AEON sagt es woertlich ("MTP block (mtp.*): grafted verbatim
+from Qwen/Qwen3.6-27B-FP8"). Variable ist allein der Backbone-Fine-Tune. Fuer
+den Falsifikator ist deshalb das Basis-FP8 richtig: es haelt die eine Achse
+fest, die R7b noch nicht kontrolliert hat.
+
+### Posten 0, Nachtrag: die Kopf-Quant-Achse ist SCHMALER zu als R7b sie gefuehrt hat
+
+R7bs Q6_K-Gegenboot spannte Q3 -> Q6 und schloss daraus "Kopf-Praezision ist es
+nicht". Nach der Stichprobenbreite-Regel traegt das nur fuer diese Spanne.
+F16/BF16 wurde nie gefahren. Die Inventur unten sagt, warum das eine echte
+Luecke ist: bei diesem Modell ist der Kopf **425 M Parameter**, also gross genug,
+dass die Quantisierung wehtun KANN.
+
+### Posten 1 (Inventur): welcher Kopf laeuft bei welcher Quantisierung — aus den Dateien
+
+GGUF-Header direkt gelesen (Tensorname + ggml-Typ je Kopf-Tensor), nicht aus
+Modellkarten uebernommen:
+
+| Checkpoint | Body-Typen | Kopf-Typen (blk.64 / nextn) | Kopf MiB |
+|---|---|---|---|
+| Qwen3.6-27B-**Q3_K_M** (unser Vehikel) | Q3_K/Q4_K | **Q3_K 4, Q4_K 3, Q8_0 1, F32 7** | 222 |
+| heretic-v2 MTP-Preserved **Q4_K_M** | Q4_K/Q6_K | Q4_K 6, Q6_K 2, F32 7 | 251 |
+| heretic-v2 MTP-Preserved **Q6_K** | Q6_K/Q8_0 | Q6_K 8, F32 7 | 332 |
+| Tess-4-27B **Q6_K** (Kopf separat) | Q6_K | **Q8_0 8**, F32 7 | 430 |
+| Qwen3.6-35B-A3B **UD-Q3_K_M** | IQ3_XXS/IQ4_XS | **Q8_0**, F32 3 | 9 |
+| gemma-4-26B-A4B (Kopf separat) | — | Q8_0 2 | 9 |
+
+Drei Befunde, alle gegen die Vorannahme:
+
+1. **F16-Koepfe kommen in diesem lokalen Bestand NICHT vor.** Die Praxis
+   "Kopf bei F16 lassen" ist hier nirgends belegt. Was es gibt, ist
+   **Q8_0-Koepfe neben deutlich groeberen Bodies** — Tess (Q8_0-Kopf auf
+   Q6_K-Body) und das 35B-A3B (Q8_0-Kopf auf IQ3_XXS-Body). Die Regel, die
+   die Artefakte tatsaechlich befolgen, ist "Kopf feiner als der Body", nicht
+   "Kopf bei F16".
+2. **Unser Q3_K_M-Vehikel ist der Ausreisser in die andere Richtung**: sein
+   Kopf ist MIT dem Body auf Q3_K/Q4_K heruntergezogen. Eine Ausnahme macht
+   selbst dieses Paket — `blk.64.nextn.eh_proj.weight` liegt auf **Q8_0**,
+   also genau der Tensor, den alle Pakete fein halten.
+3. **Die "kleiner Kopf, Quantisierung lohnt nicht"-Hypothese traegt fuer diese
+   Modellklasse nicht.** Der Qwen3.6-27B-NEXTN-Kopf hat 424.699.392 Parameter;
+   F16 kostet ihn 810 MiB gegen 222 MiB bei Q3_K. Die 588 MiB Differenz sind
+   KV, die das Ziel nicht bekommt. Klein sind die Koepfe, bei denen die Regel
+   gilt: gemma (2-9 MiB) und das 35B-A3B (9 MiB) — dort ist Q8_0 gratis.
+
+**Konsequenz fuer den F16-Kopf-Gegenboot:** er ist als Messung richtig, aber
+auf dem Q3-Vehikel heute nicht fahrbar — es existiert lokal kein GGUF mit
+Q3-Body und F16-Kopf, und aus dem vorhandenen Q3_K-Kopf laesst sich keiner
+zurueckgewinnen. Die zwei gangbaren Wege sind (a) eine Requantisierung aus
+einer BF16-Quelle mit `--tensor-type`-Override auf blk.64, (b) das lokal
+vorhandene `Qwen3.6-27B-AWQ-BF16-INT4`, dessen `mtp.*`-Block laut Index
+`weight_packed`/`weight_scale` fuehrt — also NICHT BF16, damit als F16-Arm
+untauglich. `Huihui-Qwen3.6-27B-abliterated-AWQ-MTP` dagegen fuehrt `mtp.*`
+als dichte `.weight` und hat `mtp` in `modules_to_not_convert` (101 Eintraege):
+**INT4-Body mit unquantisiertem Kopf** — das ist der F16-Kopf-Arm, und er
+liegt bereits auf der Platte.
+
+### Posten 1 (Artefakt): der Q8_0-GGUF-DFLASH-Kopf liegt jetzt lokal
+
+Heruntergeladen nach
+`<MODEL_ROOT>/qwen3.6-27b-dflash-gguf/Qwen3.6-27B-DFlash-Q8_0.gguf`
+(1.849.481.824 B, aus `Ardenzard/Qwen3.6-27B-DFlash-GGUF`, das als einziges
+Repo die volle Leiter F16/Q8_0/Q6_K/Q5_K_M/Q4_K_M/IQ4_XS/IQ4_NL fuehrt — der
+F16-Arm eines spaeteren Kopf-Quant-A/B ist damit ohne zweiten Download da).
+
+Gegenprobe gegen das BF16-Original: **1.730.213.120 Parameter, 58 Tensoren in
+beiden** — es ist derselbe Drafter, nicht eine andere Zusammenstellung.
+
+### Posten 1 (CPU-Tor): die Namenslücke ist SIEBEN Tensoren, nicht ein Adapter
+
+Das Tor wurde gefahren statt geschaetzt: die Namensabbildung, die
+`GGUFModelLoader._get_gguf_weights_map` (`model_loader/loader.py:2193-2238`)
+baut, gegen die tatsaechlichen Tensornamen der heruntergeladenen Datei.
+
+```
+HF-Tensoren: 58   abbildbar ueber die Stock-qwen3-Map: 56   nicht abbildbar: 2
+nicht abbildbar:            fc.weight, hidden_norm.weight
+erwartet, nicht in Datei:   blk.{0..4}.ffn_norm.weight
+in Datei, nicht beansprucht: blk.{0..4}.post_attention_norm.weight,
+                             dflash_fc.weight, dflash_hidden_norm.weight
+```
+
+Die Luecke ist damit **eine Override-Tabelle mit 7 Eintraegen in 3 Klassen**:
+`dflash_fc` -> `fc`, `dflash_hidden_norm` -> `hidden_norm`, und
+`blk.N.post_attention_norm` -> `layers.N.post_attention_layernorm` (die
+Stock-qwen3-Map emittiert dafuer `ffn_norm`). Alle uebrigen 51 Tensoren —
+Attention, MLP, Normen, `output_norm` — treffen ohne Zutun.
+
+Die Schreibtischschaetzung vor diesem Tor lag bei "kompletter GGUF-Adapter,
+250-400 Zeilen". Gemessen sind es ~40 Zeilen Namenstabelle plus **ein echter
+Posten**, der bleibt:
+
+- **`fc` ist ein nacktes `torch.nn.Linear`** (`models/dflash.py:413-415`) und
+  kann keinen gepackten Tensor aufnehmen; `load_weights` prueft dort nur die
+  Shape (`:521-530`). In der Q8_0-Datei ist `dflash_fc.weight [25600, 5120]`
+  auf Q8_0. Das ist der einzige Tensor, der eine Code-Aenderung erzwingt
+  (ReplicatedLinear mit `quant_config` statt `nn.Linear`), und mit 131 M
+  Parametern ist er zu gross zum Ausklammern.
+- Nachrangig, aber notiert: die `prefix`-Strings in `models/dflash.py`
+  (`:144, :151, :296, :305`) sind nicht wurzelqualifiziert — alle 5 Layer
+  melden denselben Prefix, womit per-Layer-Ignore-Listen nicht ausdrueckbar
+  sind; `packed_modules_mapping` fehlt auf `DFlashDraftModel` ganz.
+
+Positiv und ebenfalls geprueft: `DFlashDraftModel` reicht `quant_config`
+sauber durch alle Linears durch (`dflash.py:390-392, 332-336, 137-156,
+291-308`), und `--speculative-draft-model-quantization` existiert samt
+Vererbungsregel (`server_args.py:2823-2829, 5928-5931`). Die Modellseite ist
+also quantisierungsfaehig; nur der Ladepfad und `fc` sind es nicht.
+
+### Posten 1 (Fit): der SWA-Pool ist der Hebel — aber er reicht NICHT fuer zwei Koepfe
+
+Gewichte je Stufe, aus dem Checkpoint-Header gerechnet (1.730.150.400
+quantisierbare + 62.720 dichte Parameter):
+
+| Quant | bpw | MiB |
+|---|---|---|
+| BF16 | 16,00 | 3300 |
+| Q8_0 | 8,50 | 1753 |
+| Q6_K | 6,56 | 1354 |
+| Q5_K_M | 5,50 | 1134 |
+| Q4_K_M | 4,85 | 1000 |
+
+KV-Posten, bei der Tiefe des heutigen NEXTN-Kopf-Pools (400 MiB bei 4096 B je
+Token und einer KV-Schicht = 102.400 Token):
+
+| Pool | MiB |
+|---|---|
+| flach, 5 Schichten (heutiger Zustand) | 2000 |
+| SWA-bewusst (1 full + 4x Fenster 2048) | 432 |
+| **SWA-Hebel** | **1568** |
+
+Fit gegen die einzige gemessene Freiraumzahl (5090, nach voller Lane-Bringup,
+R7b Boot 1: 1710 MiB), Graphen mit 50 MiB angesetzt, Korridor >= 400 MiB frei:
+
+| Quant | NEBEN der NEXTN-Lane, Rest | Korridor | NEXTN-Lane ERSETZT, Rest | Korridor |
+|---|---|---|---|---|
+| BF16 | -2072 | nein | 1012 | JA |
+| Q8_0 | -525 | nein | **2559** | **JA** |
+| Q6_K | -126 | nein | 2958 | JA |
+| Q5_K_M | 94 | nein | 3178 | JA |
+| Q4_K_M | 228 | nein | 3312 | JA |
+
+**Das Verdikt weicht von der Auftragserwartung ab, und zwar in beide
+Richtungen.** Erwartet war "mit SWA-Pool + Q8_0 passt es auch neben der
+NEXTN-Lane". Es passt dort nicht: Q8_0 fehlen 525 MiB, und selbst Q4_K_M
+laesst nur 228 MiB — unter dem 400-MiB-Korridor. Dafuer kippt der SWA-Pool
+zusammen mit Q8_0 die ANDERE Option: R7b hat "NEXTN auf der Lane durch DFLASH
+ersetzen" als "traegt nur knapp" gefuehrt (BF16, ~3,9 GB gegen 3,75-5,35 GB
+Bedarf). Mit Q8_0 und SWA-Pool bleiben dort **2559 MiB** uebrig — aus "knapp"
+wird komfortabel, mit Luft fuer einen tieferen Pool als 102k Token.
+
+Die 3080er sind in dieser Tabelle absichtlich nicht aufgefuehrt: es gibt fuer
+sie keine gemessene Freiraumzahl auf diesem Vehikel, und die ableitbare
+(20480 total - 17780 Budget = 2700 MiB Reserve) ist **kein Freiraum** —
+`rig-runbook.md:153-157` belegt, dass genau diese Reserve im GDN-Prefill-
+Scratch verbraucht wird (bei 2200 ging der Allokator auf 8 MiB herunter und
+OOMte im ersten echten Prefill). Ein DFLASH-Kopf auf einer 3080 muss aus KV
+finanziert werden, nicht aus Reserve. Die Messung dafuer ist ein Ein-Boot-
+Posten (`avail mem` je TP-Rang nach der Lane-Graph-Capture).
+
+### Posten 1 (Platzierung): die Lane kann es heute nicht, der Solo-Pfad kann es
+
+Die Dual-Group-Lane ist an Rang 0 hartverdrahtet
+(`dual_group_lane.py:3757-3760`, `plan_shared_big_rank = 0`), es gibt keinen
+Server-Arg fuer ihre Karte, und ihr Kopf ist per Konstruktion aus den
+VERBANDS-Shards assembliert (`:4010-4016`) — bei DFLASH waere `checked == 0`
+und der Shared-Byte-Vertrag (`:977-987`) bricht per Design ab. Der Umbau
+"DFLASH-Kopf in einer Lane" ist damit ~750-1200 Zeilen ueber 4-6 Dateien.
+
+Der Auftrag verlangt aber "Ziel-Zugriff wie der Solo-Draft-Pfad", und der
+**hat die parametrische Kartenwahl bereits**:
+`--speculative-draft-placement solo --speculative-draft-gpu <cuda-index>`
+(`server_args.py:3009-3035`), Rangaufloesung `speculative_draft_solo_rank`
+(`:5270-5301`), und DFLASH ist dort ausdruecklich im Scope
+(`server_args.py:5346-5352`: "DFLASH goes solo cleanly because its draft is a
+self-drafting block model built weight-TP=1 on the host"). Das Verbot von
+`--speculative-draft-gpu` gilt nur im Cross-Algo-Meta-Worker
+(`cross_algo_utils.py:739`), nicht im reinen DFLASH-Pfad.
+
+**Das ist der Weg ohne grossen Umbau** — und es ist ehrlich dazuzusagen, dass
+er etwas anderes ist als eine zweite nebenlaeufige Lane: der Solo-Drafter
+draftet fuer die SERVING-Gruppe, er ist keine unabhaengige zweite Bahn. Fuer
+das 13b-A/B (Architektur vs. Algorithmus) ist genau das aber der richtige
+Aufbau, weil beide Arme dann dieselbe Serving-Gruppe bedienen.
+
+Vor jeder 3080-Messung ist ausserdem `FUSED_GEMV_MAX_ROWS = 8`
+(`layers/quantization/fp8_dequant_gemv.py:78`) zu heben: DFLASH faehrt M=16,
+der fused Kernel feuert auf sm86 also nicht und der Fallback ist langsamer als
+BF16. Eine Messung vor diesem Einzeiler misst den Fallback, nicht den Kopf.
+
+### Posten 2: die Kopf-KV der akzeptierten Positionen traegt jetzt ZIEL-Hidden
+
+Der letzte strukturelle Unterschied zwischen der Lane-Kette und der des
+Verbands, aus R7bs offener Liste. `_propose` schreibt die Kopf-KV der
+Positionen, die es spekuliert, mit dem HIDDEN DES KOPFES — mehr hat es
+waehrend des Spekulierens nicht. Der Verband laeuft danach mit
+`EagleWorkerV2._draft_extend_for_decode` (`eagle_worker_v2.py:1449-1462`) ueber
+denselben Block und benutzt dort `logits_output.hidden_states` des ZIELS. Die
+Lane liess ihre eigenen stehen.
+
+Der Fix laeuft im selben Schritt wie R7bs Rollback: statt auf `start + kept`
+zu kuerzen, kuerzt `_rollback_draft` auf `start + 1` und laesst die
+akzeptierten Positionen `1 .. kept-1` neu laufen — Token `cand[j]` gegen
+Ziel-Zeile `j-1`, dieselbe Paarung, die jeder andere Kettenschritt benutzt.
+Zwei Nebenwirkungen, beide beabsichtigt:
+
+- **Der Voll-Accept-Sonderfall verschwindet.** R7b brauchte einen eigenen
+  Zweig, um dem Bonus-Token seine fehlende Kopf-Position nachzuziehen. Bei
+  voller Annahme ist `kept-1 == K`, und die letzte der neu gelaufenen
+  Positionen IST die des Bonus-Tokens. Eine Regel statt zwei.
+- **Der Preis skaliert mit dem Accept**, nicht mit K: eine Runde, die nichts
+  annimmt, re-seedet nichts (Position `start` trug schon Ziel-Hidden). Auf
+  diesem Vehikel (Accept ~1,4) sind das ~0,4 Kopf-Forwards je Runde, auf einem
+  Vehikel mit Accept 2,8 rund 1,8. Gemeldet wird er als `reseed_forwards` im
+  Job-Ergebnis, neben `head_forwards`.
+
+Sequentielle Decode-Forwards statt eines gebuendelten Extends: bei K=3 sind es
+1-3 Forwards, jeder auf dem in R7a gefangenen Kopf-Graphen replaybar (2,58 ms),
+waehrend ein Extend ueber 1-3 Zeilen eager laufen muesste. Der Verband zahlt
+einen gebuendelten Extend, weil er einen ganzen Batch traegt; die Lane traegt
+einen Request.
+
+Die Ziel-Zeilen werden **geklont, nicht als View gehalten**. Der Re-Seed setzt
+weitere Forwards ab, bevor er alle Zeilen gelesen hat, und ein View, durch den
+ein spaeterer Forward schreiben kann, ist der Defekt, den dieser Zweig in D2
+(`share_input_buffer`-Pool) und D3 (flashinfer-Workspace) schon zweimal bezahlt
+hat. 4 Zeilen bf16-Hidden sind ~40 KiB je Runde.
+
+Falsifikator-Arm `draft_reseed: false` je Job, aus demselben Grund wie die
+fuenf davor: Accept ist inhaltsgetrieben und darf nicht ueber zwei Boots
+verglichen werden. Die `seqdecode`-Bruecke erzeugt keinen Kandidaten-Zeilenblock
+und behaelt darum ausdruecklich das alte Verhalten — sie soll ein Rueckfallweg
+bleiben, keine zweite, subtil andere Kette.
+
+**Wirkung auf die Ausgabe: ungemessen.** Kein Boot in dieser Runde. Auf diesem
+Vehikel ist die Erwartung "klein bis null" (R7b hat gemessen, dass der Kopf
+gegen seine eigene KV praktisch unempfindlich ist), und genau deshalb gehoert
+die Gegenprobe auf das FP8-Vehikel, wo die Kette ueberhaupt Positionen >= 1
+erreicht.
+
+### Nachtrag 13g: die Drafter-Quantisierung ist ein Feld, keine Konstante
+
+`LaneDrafterPolicy` traegt jetzt `drafter_quant` je Algorithmus, die Entscheidung
+traegt `quant` mit. Nichts daran ist hartkodiert: ein nicht gesetzter Drafter
+meldet `None` ("was der Checkpoint eben ist") und nie eine Praezision, die
+niemand gewaehlt hat; eine Praezision fuer einen Drafter ohne Lane ist ein
+harter Fehler, damit "nicht gebaut" nicht wie "so konfiguriert" aussieht.
+
+Dazu drei Hilfsfunktionen, die die Wahl RECHNEN statt sie zu raten:
+`drafter_quant_band(target)` gibt das Default-Band (die drei Stufen ueber dem
+Ziel — fuer ein Q3_K_M-Ziel also Q4/Q5/Q6), `drafter_weight_mib` den
+Fussabdruck aus Parameterzahl und Format-bpw, `choose_drafter_quant` die
+hoechste Stufe des Bandes, die in ein Budget passt. Unter das Band greift
+diese Funktion **nicht**: das waere die Entscheidung, einen Drafter groeber als
+sein eigenes Ziel zu akzeptieren, und die gehoert dem, der die Politik setzt,
+nicht einem Sizing-Helfer. Ein unbekanntes Ziel liefert ein leeres Band statt
+einer Empfehlung ohne Beleg.
+
+### CPU-Tore
+
+`test_dual_group_concurrency.py` 135 -> 152: `TestLaneDraftReseed` 7,
+`TestLaneDrafterQuant` 10. Alle 152 gruen. Die sechs R7b-`TestLaneDraftRollback`-
+Faelle laufen unveraendert durch — sie stashen keinen Zeilenblock, treffen also
+den Bruecken-Pfad, und dass das ohne Anpassung gilt, ist der Beleg dafuer, dass
+der Re-Seed die Bruecke nicht anfasst.
+
+### Offen fuer D4/#285
+
+- **Der FP8-Boot ist die einzige verbleibende Unbekannte von Posten 0**, und er
+  ist jetzt billiger als beauftragt: die Cross-Algo-Achse ist ueber
+  `htsglang_tp3.json` bereits ausgeschlossen, der Boot muss nur noch dieselben
+  5 Inhalte auf demselben K=3 fahren.
+- **Kopf-Quant-Gegenboot mit unquantisiertem Kopf** ist ohne Konversion
+  fahrbar: `Huihui-Qwen3.6-27B-abliterated-AWQ-MTP` hat INT4-Body und dichten
+  `mtp.*`-Block. Das schliesst die Achse, die R7b nur von Q3 bis Q6 vermessen
+  hat.
+- **`fc` als `nn.Linear`** ist der einzige Code-Blocker zwischen dem
+  heruntergeladenen Q8_0-Kopf und einem Boot-Versuch; die 7-Eintrag-Namenstabelle
+  daneben ist mechanisch.
+- **`FUSED_GEMV_MAX_ROWS = 8`** muss vor jeder sm86-Messung auf 16 — sonst
+  misst man den Fallback.
+- **Freiraum je 3080 auf dem GGUF-Q3-Vehikel** bleibt ungemessen und ist die
+  Eingangsgroesse fuer jede Mehrkarten-Platzierung.

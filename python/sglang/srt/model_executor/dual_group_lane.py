@@ -1365,6 +1365,12 @@ class DualGroupLane:
                     # content-driven and therefore worst of all to compare
                     # across boots.
                     "draft_rollback": job.get("draft_rollback"),
+                    # Round 7c posten 2, and the same reasoning a sixth time:
+                    # False leaves the head's OWN hidden in the KV of the
+                    # accepted positions -- the state before this round's fix --
+                    # so "re-seeded against the target" and "not re-seeded" are
+                    # two arms of ONE boot on the same token ids.
+                    "draft_reseed": job.get("draft_reseed"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -1689,6 +1695,8 @@ class DualGroupLane:
         # may only ever use THIS round's verify output.
         job["_verify_hidden"] = None
         job["_verify_last_token"] = None
+        job["_verify_rows"] = None
+        job["_verify_tokens"] = None
         with self._head_graph_scope(job):
             for _ in range(steps):
                 batch_d.input_ids = token.to(torch.int64)
@@ -2913,13 +2921,23 @@ class DualGroupLane:
         job["_kv_len"] = new_len
         job["_hidden"] = out.hidden_states[n_accept : n_accept + 1]
         job["_next"] = preds[n_accept : n_accept + 1]
-        # What ``_rollback_draft`` needs if EVERY proposal was accepted: the
-        # last candidate and the target hidden state of the row before it.
+        # The whole candidate row block, for ``_rollback_draft``: the accepted
+        # positions have to be re-run against the TARGET's hidden states, and
+        # the full-accept catch-up needs the last candidate on top of that.
         # Only this path stashes them -- the seqdecode bridge produces no such
-        # row block, and its full-accept rounds keep the old behaviour.
+        # row block, and its rounds keep the old behaviour.
+        #
+        # CLONED, not viewed. ``out.hidden_states`` is the verify forward's
+        # output; the re-seed below issues further forwards before it has read
+        # every row, and a view that a later forward may write through is the
+        # shared-buffer defect this branch has already paid for three times
+        # (round D2's share_input_buffer pool, round D3's flashinfer
+        # workspace). 4 rows of bf16 hidden is ~40 KiB per round.
         if d >= 2:
-            job["_verify_last_token"] = verify_input.draft_token[d - 1 : d]
-            job["_verify_hidden"] = out.hidden_states[d - 2 : d - 1]
+            job["_verify_rows"] = out.hidden_states[: d - 1].clone()
+            job["_verify_tokens"] = verify_input.draft_token[:d].clone()
+            job["_verify_last_token"] = job["_verify_tokens"][d - 1 : d]
+            job["_verify_hidden"] = job["_verify_rows"][d - 2 : d - 1]
         return emitted, n_accept, ms
 
     def _verify_mode(self, job) -> str:
@@ -3294,6 +3312,46 @@ class DualGroupLane:
         idx = int(batch_d.reqs[0].req_pool_idx)
         pool = batch_d.req_to_token_pool
 
+        rows = job.get("_verify_rows")
+        tokens = job.get("_verify_tokens")
+        reseed = (
+            job.get("draft_reseed") is not False
+            and kept >= 2
+            and rows is not None
+            and tokens is not None
+            and rows.shape[0] >= kept - 1
+            and tokens.shape[0] >= kept
+        )
+        if reseed:
+            # Round 7c posten 2: re-run the ACCEPTED positions against the
+            # target's hidden states instead of keeping the head's own.
+            #
+            # Positions ``start+1 .. start+kept-1`` were written by _propose
+            # with the head's hidden as input, because that is all the head had
+            # while it was speculating. The verify has since produced the
+            # target's hidden for exactly those rows, and the serving group
+            # uses it: ``EagleWorkerV2._draft_extend_for_decode`` re-runs the
+            # head over the accepted block with ``logits_output.hidden_states``
+            # of the target. Leaving the head's own there was the last
+            # structural difference between the two chains.
+            #
+            # Sequential decode forwards rather than one batched extend: at
+            # K = 3 this is 1-3 forwards, each replayable on the head graph
+            # captured in round 7a (2.58 ms), while an extend over 1-3 rows
+            # would have to run eager. The serving group pays one batched
+            # extend because it carries a whole batch; the lane carries one
+            # request.
+            self._truncate_draft(job, batch_d, pool, idx, start + 1, start + steps)
+            with self._head_graph_scope(job):
+                for j in range(1, kept):
+                    batch_d.input_ids = tokens[j : j + 1].to(torch.int64)
+                    batch_d.prepare_for_decode()
+                    self._draft_forward(batch_d, rows[j - 1 : j])
+                    job["_head_forwards"] = job.get("_head_forwards", 0) + 1
+                    job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
+                    job["_reseed_forwards"] = job.get("_reseed_forwards", 0) + 1
+            return
+
         if kept > steps:
             # Full accept: run the missing position rather than leave a hole.
             hidden = job.get("_verify_hidden")
@@ -3309,10 +3367,21 @@ class DualGroupLane:
         surplus = steps - kept
         if surplus <= 0:
             return
-        keep_len = start + kept
-        batch_d.token_to_kv_pool_allocator.free(
-            pool.req_to_token[idx, keep_len : start + steps]
-        )
+        self._truncate_draft(job, batch_d, pool, idx, start + kept, start + steps)
+
+    def _truncate_draft(self, job, batch_d, pool, idx, keep_len: int, end: int) -> None:
+        """Cut the head's sequence back to ``keep_len`` and give the slots back.
+
+        Both callers need the same five pieces of bookkeeping that
+        ``prepare_for_decode`` would otherwise own (allocator, seq lens on both
+        devices, the request's decode index and its two length fields); doing
+        it in one place is what keeps the re-seed path and the plain rollback
+        from drifting apart.
+        """
+        if end <= keep_len:
+            return
+        surplus = end - keep_len
+        batch_d.token_to_kv_pool_allocator.free(pool.req_to_token[idx, keep_len:end])
         batch_d.seq_lens.fill_(keep_len)
         if getattr(batch_d, "seq_lens_cpu", None) is not None:
             batch_d.seq_lens_cpu.fill_(keep_len)
@@ -3486,6 +3555,12 @@ class DualGroupLane:
         if job.get("_head_forwards"):
             result["head_forwards"] = job["_head_forwards"]
             result["head_graph_forwards"] = job.get("_head_graph", 0)
+            # Round 7c posten 2: how many of those forwards were the re-seed,
+            # i.e. what the alignment with the serving group's chain COSTS.
+            # It is zero on rounds that accepted nothing, so the price scales
+            # with the accept length -- reporting it next to the round time is
+            # what keeps that visible instead of buried in a mean.
+            result["reseed_forwards"] = job.get("_reseed_forwards", 0)
         rungs = job.get("_rungs") or []
         if rungs:
             hist: Dict[int, int] = {}

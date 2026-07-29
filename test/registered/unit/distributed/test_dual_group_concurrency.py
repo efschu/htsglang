@@ -2485,6 +2485,143 @@ class TestLaneDraftRollback(unittest.TestCase):
         self.assertEqual(int(batch_d.seq_lens[0]), 13)
 
 
+class TestLaneDraftReseed(unittest.TestCase):
+    """#274 round 7c posten 2: the accepted positions carry TARGET hidden.
+
+    After round 7b's rollback fix, one structural difference between the lane's
+    chain and the serving group's was left: ``_propose`` writes the head's KV
+    for the accepted positions with the HEAD's own hidden state, because that
+    is all it has while it speculates, while
+    ``EagleWorkerV2._draft_extend_for_decode`` re-runs the head over that same
+    block against the TARGET's hidden. These are the arithmetic and the
+    pairing of closing it, on the CPU.
+    """
+
+    def _lane_and_batch(self, start=10, steps=3, rows=3):
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        class _Fake(DualGroupLane):
+            def __init__(self):
+                self.spec_steps = steps
+                self.draft_runner = None
+
+        lane = _Fake()
+        batch_d = _StubVerifyBatch(start + steps)
+        req = _StubReq()
+        req.decode_batch_idx = steps
+        req.req_pool_idx = 0
+        batch_d.reqs = [req]
+        batch_d.req_to_token_pool.req_to_token[0, : start + steps] = torch.arange(
+            500, 500 + start + steps, dtype=torch.int32
+        )
+        batch_d.prepare_for_decode = lambda: batch_d.seq_lens.add_(1)
+        job = {
+            "_batch_d": batch_d,
+            "_round_start": start,
+            "_rung": steps,
+            "_kv_len_draft": start + steps,
+            # cand = [committed token] + proposals; the verify's row block is
+            # one shorter, since row j predicts candidate j + 1.
+            "_verify_tokens": torch.tensor([40, 41, 42, 43], dtype=torch.int64),
+            "_verify_rows": torch.arange(rows * 4, dtype=torch.float32).reshape(
+                rows, 4
+            ),
+        }
+        seen = []
+        lane._draft_forward = lambda b, hidden: seen.append(
+            (int(b.input_ids[0]), hidden.clone())
+        )
+        return lane, batch_d, job, req, seen
+
+    def test_nothing_accepted_re_seeds_nothing(self):
+        """Position ``start`` was ALREADY written against the target's hidden.
+
+        Its input pair is the previous round's committed token and the
+        previous round's target row -- the lane has always had that one right,
+        so a round that accepts no proposal has nothing to re-seed and must not
+        pay a forward for it.
+        """
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        lane._rollback_draft(job, n_accept=0)
+        self.assertEqual(seen, [])
+        self.assertEqual(int(batch_d.seq_lens[0]), 11)
+        self.assertEqual(batch_d.freed, [[511, 512]])
+        self.assertEqual(job["_kv_len_draft"], 11)
+
+    def test_one_accepted_position_is_re_run_against_the_target_row(self):
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        lane._rollback_draft(job, n_accept=1)
+        # The head speculated 3 positions; all of them past ``start`` go back,
+        # then exactly the accepted one is re-run.
+        self.assertEqual(batch_d.freed, [[511, 512]])
+        self.assertEqual(len(seen), 1)
+        token, hidden = seen[0]
+        # Candidate 1 is proposal 0, the one the verify accepted...
+        self.assertEqual(token, 41)
+        # ...paired with the target row that PREDICTED it, i.e. row 0.
+        self.assertTrue(bool((hidden[0] == job["_verify_rows"][0]).all()))
+        # And the head ends exactly where the target does.
+        self.assertEqual(int(batch_d.seq_lens[0]), 12)
+        self.assertEqual(job["_kv_len_draft"], 12)
+        self.assertEqual(job["_reseed_forwards"], 1)
+
+    def test_the_pairing_is_the_same_one_the_chain_uses_everywhere(self):
+        """Token ``cand[j]`` against target row ``j - 1``, for every j."""
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        lane._rollback_draft(job, n_accept=2)
+        self.assertEqual([t for t, _ in seen], [41, 42])
+        for j, (_, hidden) in enumerate(seen, start=1):
+            self.assertTrue(bool((hidden[0] == job["_verify_rows"][j - 1]).all()))
+        self.assertEqual(int(batch_d.seq_lens[0]), 13)
+
+    def test_full_accept_needs_no_separate_catch_up_any_more(self):
+        """kept == K + 1 is the same rule, not a special case.
+
+        Round 7b filled the bonus token's missing head position with a
+        dedicated branch. The re-seed subsumes it: it re-runs positions
+        ``1 .. kept-1``, and at full accept that is exactly K positions, the
+        last of which IS the bonus token's.
+        """
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        lane._rollback_draft(job, n_accept=3)
+        self.assertEqual([t for t, _ in seen], [41, 42, 43])
+        self.assertEqual(int(batch_d.seq_lens[0]), 14)
+        self.assertEqual(job["_kv_len_draft"], 14)
+
+    def test_the_per_job_falsifier_leaves_the_heads_own_hidden_in_place(self):
+        """Both arms out of ONE boot, on a content-driven quantity."""
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        job["draft_reseed"] = False
+        lane._rollback_draft(job, n_accept=1)
+        self.assertEqual(seen, [])
+        self.assertEqual(int(batch_d.seq_lens[0]), 12)
+        self.assertEqual(batch_d.freed, [[512]])
+
+    def test_a_bridge_that_stashes_no_rows_keeps_the_old_behaviour(self):
+        """``_verify_by_decode`` produces no candidate row block.
+
+        It must not be made to guess one: no rows means no re-seed and the
+        round-7b truncation stands, which is also what keeps the bridge a
+        usable fallback rather than a second, subtly different chain.
+        """
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        job["_verify_rows"] = None
+        job["_verify_tokens"] = None
+        lane._rollback_draft(job, n_accept=1)
+        self.assertEqual(seen, [])
+        self.assertEqual(int(batch_d.seq_lens[0]), 12)
+
+    def test_the_rollback_falsifier_still_disables_everything(self):
+        lane, batch_d, job, req, seen = self._lane_and_batch()
+        job["draft_rollback"] = False
+        lane._rollback_draft(job, n_accept=1)
+        self.assertEqual(seen, [])
+        self.assertEqual(int(batch_d.seq_lens[0]), 13)
+        self.assertEqual(batch_d.freed, [])
+
+
 class TestAcceptPositionProbe(unittest.TestCase):
     """#274 round 7b posten 0: the serving group's per-position counter.
 
@@ -2565,6 +2702,153 @@ class TestAcceptPositionProbe(unittest.TestCase):
             os.environ.pop("SGLANG_ACCEPT_POSITION_PROBE", None)
             if saved is not None:
                 os.environ["SGLANG_ACCEPT_POSITION_PROBE"] = saved
+
+
+class TestLaneDrafterQuant(unittest.TestCase):
+    """#274 round 7c, nachtrag 13g: the drafter's precision is a CHOICE.
+
+    The rule under test is "similar to, or slightly better than, the target":
+    a drafter coarser than its target proposes tokens the target rejects, and
+    one far finer buys accept the target's own coarseness already discarded --
+    while costing the KV a coarse target needs most. So the DEFAULT is a band
+    above the target and the recommendation is the highest step of that band
+    that fits the card. The rest of the ladder stays reachable; what is banded
+    is the default, never the choice.
+    """
+
+    # The rig's DFLASH drafter, read off the checkpoint header rather than
+    # estimated -- the NEXTN lesson (2684 MiB where 120 was assumed).
+    PARAMS = 1_730_213_120
+    DENSE = 62_720  # 1-D norms; no format quantises them
+
+    def test_the_band_for_a_q3_target_is_q4_to_q6(self):
+        from sglang.srt.model_executor.lane_spec_policy import drafter_quant_band
+
+        self.assertEqual(drafter_quant_band("Q3_K_M"), ("q4_k_m", "q5_k_m", "q6_k"))
+        # Spelling is the caller's, not the ladder's: this is read off a
+        # checkpoint config or a CLI flag.
+        self.assertEqual(drafter_quant_band("q3_k_m"), drafter_quant_band("Q3_K_M"))
+
+    def test_the_band_follows_the_target_up_the_ladder(self):
+        from sglang.srt.model_executor.lane_spec_policy import drafter_quant_band
+
+        self.assertEqual(drafter_quant_band("fp8_e4m3"), ("bf16",))
+        self.assertEqual(drafter_quant_band("bf16"), ())
+
+    def test_an_unknown_target_gets_no_band_rather_than_a_guess(self):
+        """A recommendation with no evidence under it is worse than none."""
+        from sglang.srt.model_executor.lane_spec_policy import (
+            choose_drafter_quant,
+            drafter_quant_band,
+        )
+
+        self.assertEqual(drafter_quant_band(None), ())
+        quant, why = choose_drafter_quant(None, 8000.0, self.PARAMS, self.DENSE)
+        self.assertIsNone(quant)
+        self.assertIn("no default band", why)
+
+    def test_the_footprint_matches_the_checkpoint_at_bf16(self):
+        """The ladder's top step must reproduce the measured 3300 MiB."""
+        from sglang.srt.model_executor.lane_spec_policy import drafter_weight_mib
+
+        self.assertAlmostEqual(
+            drafter_weight_mib(self.PARAMS, "bf16", self.DENSE), 3300.1, places=1
+        )
+
+    def test_a_roomy_card_gets_the_top_of_the_band_not_the_top_of_the_ladder(self):
+        """Q6, not Q8 and not BF16: the band is what the default respects."""
+        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+
+        quant, why = choose_drafter_quant(
+            "Q3_K_M", budget_mib=2600.0, params=self.PARAMS, dense_params=self.DENSE
+        )
+        self.assertEqual(quant, "q6_k")
+        self.assertIn("q6_k", why)
+
+    def test_a_tight_card_steps_down_inside_the_band(self):
+        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+
+        # Room for Q4 and Q5 but not Q6 (1354 MiB).
+        quant, _ = choose_drafter_quant(
+            "Q3_K_M", budget_mib=1200.0, params=self.PARAMS, dense_params=self.DENSE
+        )
+        self.assertEqual(quant, "q5_k_m")
+        # Room for Q4 only (1000 MiB).
+        quant, _ = choose_drafter_quant(
+            "Q3_K_M", budget_mib=1050.0, params=self.PARAMS, dense_params=self.DENSE
+        )
+        self.assertEqual(quant, "q4_k_m")
+
+    def test_overhead_is_subtracted_before_the_band_is_walked(self):
+        """KV, graphs and dequant scratch are not weights, and they are real."""
+        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+
+        roomy = dict(target_quant="Q3_K_M", params=self.PARAMS, dense_params=self.DENSE)
+        # 1400 MiB holds Q6 (1354). Take 100 MiB of graphs off the top and it
+        # does not any more, so the band steps down to Q5 (1134).
+        self.assertEqual(choose_drafter_quant(budget_mib=1400.0, **roomy)[0], "q6_k")
+        self.assertEqual(
+            choose_drafter_quant(budget_mib=1400.0, overhead_mib=100.0, **roomy)[0],
+            "q5_k_m",
+        )
+
+    def test_a_card_that_cannot_hold_the_band_says_so_instead_of_dropping_below(self):
+        """Going under the band is a decision, not a sizing fallback.
+
+        Reaching for Q3 or Q2 to make something fit means accepting a drafter
+        coarser than its own target -- that is a policy judgement about
+        expected accept, and a helper that made it silently would hide exactly
+        the trade the operator asked to control.
+        """
+        from sglang.srt.model_executor.lane_spec_policy import choose_drafter_quant
+
+        quant, why = choose_drafter_quant(
+            "Q3_K_M", budget_mib=400.0, params=self.PARAMS, dense_params=self.DENSE
+        )
+        self.assertIsNone(quant)
+        self.assertIn("q4_k_m", why)
+        self.assertIn("400", why)
+
+    def test_the_policy_carries_the_choice_and_reports_it(self):
+        from sglang.srt.model_executor.lane_spec_policy import (
+            LANE_DRAFTER_DFLASH,
+            LANE_DRAFTER_NEXTN,
+            LaneDrafterPolicy,
+        )
+
+        pol = LaneDrafterPolicy(
+            available=(LANE_DRAFTER_NEXTN, LANE_DRAFTER_DFLASH),
+            drafter_quant={LANE_DRAFTER_DFLASH: "Q6_K"},
+            # An algorithm change is a plan flip and needs the full window;
+            # this test is about the precision field, not about hysteresis.
+            hysteresis=1,
+        )
+        d = pol.decide({"content": "code"})
+        self.assertEqual(d.algorithm, LANE_DRAFTER_DFLASH)
+        self.assertEqual(d.quant, "Q6_K")
+        self.assertEqual(d.as_dict()["quant"], "Q6_K")
+        # An unset drafter reports None -- "whatever the checkpoint is", never
+        # a claim about a precision nobody chose.
+        self.assertIsNone(pol.decide({"content": "prose"}).quant)
+        self.assertEqual(pol.stats()["drafter_quant"], {LANE_DRAFTER_DFLASH: "Q6_K"})
+
+    def test_the_policy_rejects_a_quant_for_a_drafter_it_does_not_have(self):
+        from sglang.srt.model_executor.lane_spec_policy import (
+            LANE_DRAFTER_DFLASH,
+            LANE_DRAFTER_NEXTN,
+            LaneDrafterPolicy,
+        )
+
+        with self.assertRaises(ValueError):
+            LaneDrafterPolicy(
+                available=(LANE_DRAFTER_NEXTN,),
+                drafter_quant={LANE_DRAFTER_DFLASH: "q6_k"},
+            )
+        with self.assertRaises(ValueError):
+            LaneDrafterPolicy(
+                available=(LANE_DRAFTER_NEXTN,),
+                drafter_quant={LANE_DRAFTER_NEXTN: "q9_ultra"},
+            )
 
 
 class TestLaneDrafterPolicy(unittest.TestCase):
