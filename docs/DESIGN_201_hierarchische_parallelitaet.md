@@ -1817,3 +1817,27 @@ Paritaet lang). PRAEZISIERTE POLITIK fuer R7b:
 Der Accept-Waechter bleibt als Netz (faengt Prosa-Faelle automatisch, weil
 DFLASH-Acceptance dort kollabiert), aber die Politik muss ihn selten
 brauchen, weil beide Achsen jetzt vorab bekannt sind.
+
+Nachtrag-13-Ergaenzung 3 (Nutzer 2026-07-29, Last-Achse der Drafter-Politik):
+Wenn DFLASH bei einer LASTSPITZE das Gesamtsystem verlangsamen wuerde, wird
+nur NEXTN genommen — und die Regel soll ANPASSBAR sein, wie sie greift.
+Die Drafter-Politik hat damit drei Achsen: Inhalt (Prosa->NEXTN, 13d),
+Kontextlaenge (>Trainingsfenster->NEXTN, 13d), LAST (Spitze->billigerer
+Drafter). Bauweise:
+- SENSOR: die vorhandene Belegungs-/Online-E-Messung (D1/LaneShareMeter-
+  Zaehler) bzw. das gruppenweite Saettigungssignal, das #279 ohnehin braucht
+  — kein neuer Messpfad.
+- AKTOR: Plan-Flip auf der Capture-Leiter (Algo-Sprosse NEXTN statt DFLASH,
+  oder eine K-Sprosse runter bis K=0) — an Runden-Grenzen, mit Hysterese.
+- KONFIGURIERBAR: Politik-Knopf (z.B. --lane-drafter-load-policy =
+  auto | nextn-under-load | fixed) + Schwellwert + Hysterese-Fenster;
+  Default = auto mit dokumentierter Schwelle. Prioritaetsklassen (Nachtrag 5)
+  gehen vor: die geschuetzte Klasse darf nie fuer den Drafter einer anderen
+  Klasse bezahlen.
+- VERWANDT: #141 (Tree-Breite nur bei niedriger Belegung) ist dieselbe Regel
+  fuer topk — beim Bau in R7b als EIN Politik-Objekt mit mehreren Aktoren
+  schneiden (Algo, K, topk), nicht drei getrennte Regler ("alles greift in
+  alles").
+Einbau: R7b (Politik-Objekt bekommt die Last-Eingabe von Anfang an, auch
+wenn der Sensor erst mit D4/#279 scharf wird — Schnittstelle jetzt, Schaerfe
+spaeter).
