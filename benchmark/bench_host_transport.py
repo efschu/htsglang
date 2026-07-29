@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""HTCCL-Host-Transport gegen NCCL, all_reduce, verschraenkt im selben Lauf.
+"""HTCCL gegen NCCL, all_reduce und all_to_all, verschraenkt im selben Lauf.
 
 WOZU
 ====
@@ -12,9 +12,31 @@ Fertigmeldung ueber Flaggen im gepinnten Speicher. Auf diesem Rig lag der
 schlichte gepinnte Host-Weg bei 20 KiB Ping-Pong bei 7,30 us gegen 37,41 us
 fuer NCCL. Dieses Programm prueft, was davon auf der KOLLEKTIV-Ebene ankommt.
 
-    Alle Zeiten sind die VOLLE Operationsdauer eines all_reduce.
-    Ein all_reduce hat keinen "halben Weg". NICHT mit den
-    Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.
+    Alle Zeiten sind die VOLLE Operationsdauer EINER Operation.
+    Weder all_reduce noch all_to_all haben einen "halben Weg". NICHT
+    mit den Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.
+
+WAS GEMESSEN WIRD (--op)
+========================
+``all_reduce``  wie gehabt.
+``all_to_all``  ``all_to_all_single`` entlang Achse 0, in zwei
+                Verteilungsmustern, weil MoE beide erzeugt:
+
+                * ``gleich``: jeder Zielrang bekommt gleich viele Zeilen.
+                * ``schief``: Rang 0 bekommt von JEDEM das ``--schief``-fache
+                  der anderen -- der heisse Experte, der Incast-Fall.
+
+                Die Zeilenbreite kommt aus ``--hidden`` (Elemente je Zeile);
+                die tatsaechlich gemessene Nutzlast wird auf ein Vielfaches
+                von Zeilenbreite mal Rangzahl abgerundet und AUSGEWIESEN.
+``beide``       nacheinander, in einem Lauf.
+
+Fuer all_to_all wird der BAR1-Direktpfad **vor** der Messung gefragt, ob er
+diese Zelle wirklich faehrt (``handles`` plus ``traegt_a2a`` mit dem
+groessten Block ueber alle Paare). Sagt er nein -- typischerweise, weil ein
+schiefer Block die Schlitzgrenze sprengt -- wird die Zelle mit Grund als tot
+gefuehrt und NICHT ersatzweise ueber die gloo-Ebene gemessen und BAR1
+genannt.
 
 MESSDISZIPLIN (eingebaut, nicht optional)
 =========================================
@@ -58,11 +80,15 @@ Watchdog je Rang und Gesamtzeitlimit im Elternprozess.
 AUFRUF
 ======
     python3 benchmark/bench_host_transport.py --devices 1,2
+    python3 benchmark/bench_host_transport.py --devices 1,2,3 \
+        --op all_to_all --backends htccl:bar1,nccl
 
-Weitere Schalter: --sizes, --backends, --secs, --warmup, --rounds, --dtype,
---slot-mib, --completion, --out, --devices. Die Karten muessen frei sein;
-das Programm verdraengt nichts und bricht ab, wenn auf einer Zielkarte mehr
-als --max-used-mib belegt ist.
+Die Rangzahl folgt aus ``--devices``; es sind nicht mehr fest zwei.
+
+Weitere Schalter: --op, --hidden, --schief, --sizes, --backends, --secs,
+--warmup, --rounds, --dtype, --slot-mib, --completion, --out, --devices. Die
+Karten muessen frei sein; das Programm verdraengt nichts und bricht ab, wenn
+auf einer Zielkarte mehr als --max-used-mib belegt ist.
 """
 from __future__ import annotations
 
@@ -98,6 +124,42 @@ DEFAULT_BACKENDS = "htccl:host,nccl"
 
 #: Untergrenze des Vorlaufs je Zelle. Siehe Kopf: ohne Vorlauf Faktor 7,6.
 MIN_WARMUP_S = 3.0
+
+#: Verteilungsmuster fuer all_to_all. all_reduce kennt nur "-".
+MUSTER = ("gleich", "schief")
+
+
+def zellschluessel(cell) -> str:
+    """Eine Zelle als flacher String -- die Kollektive uebertragen dicts.
+
+    ``(op, bytes, muster, backend)``. Absichtlich EINE Funktion und nicht
+    an fuenf Stellen dasselbe f-String: die Verwerfungsabstimmung und die
+    Ergebnisrunde muessen denselben Schluessel bilden, sonst verwirft ein
+    Rang eine Zelle, die der andere weitermisst -- und das ist ein Haenger.
+    """
+    op, nb, muster, be = cell
+    return f"{op}|{nb}|{muster}|{be}"
+
+
+def teilgroessen(zeilen: int, welt: int, muster: str, schief: int) -> list:
+    """Sende-Zeilenzahlen je Zielrang. Auf ALLEN Raengen dieselbe Rechnung.
+
+    ``gleich``: ``zeilen/welt`` an jeden.
+    ``schief``: Rang 0 bekommt das ``schief``-fache der uebrigen -- ein
+    heisser Experte, an den alle gleichzeitig schreiben. Der Rest der
+    Division landet bei Rang 0, damit die Summe exakt ``zeilen`` ist; eine
+    Summe, die nicht aufgeht, waere ein Puffer, der nicht passt.
+    """
+    if muster == "gleich":
+        g = zeilen // welt
+        s = [g] * welt
+    else:
+        gewicht = [schief] + [1] * (welt - 1)
+        summe = sum(gewicht)
+        basis = zeilen // summe
+        s = [g * basis for g in gewicht]
+    s[0] += zeilen - sum(s)
+    return s
 
 
 # ----------------------------------------------------------------------
@@ -154,7 +216,11 @@ def run_rank(a: argparse.Namespace) -> int:
     import torch.distributed as dist
 
     rank = a.rank
-    world = 2
+    # Die Rangzahl folgt aus --devices. Sie war fest 2, waehrend --devices
+    # schon immer eine Liste war: wer drei Ordinals angab, bekam wortlos zwei
+    # Raenge und eine unbenutzte Karte -- und die 3-Rang-Zahlen dieses
+    # Vorhabens stammen deshalb NICHT aus diesem Programm.
+    world = len([x for x in a.devices.split(",") if x.strip()])
     tag = f"r{rank}"
     arm_watchdog(a.max_secs, tag)
 
@@ -262,12 +328,84 @@ def run_rank(a: argparse.Namespace) -> int:
         check_in[nb] = (pattern * (rank + 1)).contiguous()
         check_want[nb] = (pattern * (world * (world + 1) // 2)).contiguous()
 
-    def do_op(nb: int, backend: str, x):
-        """Eine all_reduce-Operation, Rueckgabe ist das Ergebnis."""
+    # ---------------- all_to_all: Geometrie, Puffer, bekannte Antwort ------
+    #
+    # Der Marker eines Blocks ist `sender*world + empfaenger + 1` plus
+    # `0.5 * (spalte % 4)`. Beides ist in bf16 EXAKT darstellbar (die Werte
+    # liegen unter 128, dort ist die Schrittweite 0,5), also ist die Pruefung
+    # ein torch.equal und kein Toleranzvergleich. Der Spaltenanteil ist nicht
+    # Zierde: ohne ihn traegt ein ganzer Block denselben Wert und eine
+    # Vertauschung INNERHALB eines Blocks faellt nicht auf.
+    zeile_elems = int(a.hidden)
+    zeile_bytes = zeile_elems * esize
+    a2a: dict = {}                # (nb, muster) -> dict mit Puffern und Groessen
+    a2a_tot: dict = {}            # (nb, muster) -> tatsaechliche Nutzlast in Byte
+
+    def _marke(sender: int, empfaenger: int) -> int:
+        return sender * world + empfaenger + 1
+
+    if a.op in ("all_to_all", "beide"):
+        spalte = (torch.arange(zeile_elems, device=dev, dtype=torch.int32) % 4)
+        spalte = (spalte.to(torch.float32) * 0.5).to(dtype)
+        for nb in sizes:
+            zeilen = (nb // zeile_bytes // world) * world
+            if zeilen < world:
+                raise SystemExit(
+                    f"ABBRUCH: {nb} B tragen bei --hidden {zeile_elems} und "
+                    f"{world} Raengen keine {world} Zeilen. Groessere --sizes "
+                    f"oder kleineres --hidden."
+                )
+            for muster in MUSTER:
+                ein = teilgroessen(zeilen, world, muster, a.schief)
+                # Was ich empfange, ist Spalte `rank` der Sendematrix. Jeder
+                # Rang rechnet dieselbe Funktion, also braucht es dafuer kein
+                # Kollektiv -- im Messprogramm ist das Muster bekannt.
+                aus = [teilgroessen(zeilen, world, muster, a.schief)[rank]
+                       for _ in range(world)]
+                x = torch.empty((zeilen, zeile_elems), dtype=dtype, device=dev)
+                o = 0
+                for j, n in enumerate(ein):
+                    if n:
+                        x[o:o + n] = spalte + float(_marke(rank, j))
+                    o += n
+                soll = torch.empty((sum(aus), zeile_elems), dtype=dtype,
+                                   device=dev)
+                o = 0
+                for i, n in enumerate(aus):
+                    if n:
+                        soll[o:o + n] = spalte + float(_marke(i, rank))
+                    o += n
+                a2a[(nb, muster)] = {
+                    "ein": ein, "aus": aus, "zeilen": zeilen,
+                    "x": x, "soll": soll,
+                    "null": torch.zeros((zeilen, zeile_elems), dtype=dtype,
+                                        device=dev),
+                    "out": torch.empty((sum(aus), zeile_elems), dtype=dtype,
+                                       device=dev),
+                    "out_check": torch.empty((sum(aus), zeile_elems),
+                                             dtype=dtype, device=dev),
+                    # Groesster Block ueber ALLE Paare -- die Zahl, mit der der
+                    # Direktpfad gefragt wird, ob er diese Zelle faehrt.
+                    "max_block": max(ein) * zeile_bytes,
+                }
+                a2a_tot[(nb, muster)] = zeilen * zeile_bytes
+
+    def do_op(cell, x, out=None):
+        """Eine Operation. Rueckgabe ist das Ergebnis."""
+        op, nb, muster, backend = cell
+        if op == "all_reduce":
+            if backend == "nccl":
+                dist.all_reduce(x, group=nccl_pg)
+                return x
+            return comms[backend].all_reduce(x)
+        g = a2a[(nb, muster)]
         if backend == "nccl":
-            dist.all_reduce(x, group=nccl_pg)
-            return x
-        return comms[backend].all_reduce(x)
+            dist.all_to_all_single(
+                out, x, output_split_sizes=g["aus"],
+                input_split_sizes=g["ein"], group=nccl_pg,
+            )
+            return out
+        return comms[backend].all_to_all_single(out, x, g["aus"], g["ein"])
 
     # Einmal angelegt, nie im Messpfad: ein `torch.cuda.Event()` je Iteration
     # waere genau die Allokation im heissen Pfad, die dieses Programm messen
@@ -283,48 +421,121 @@ def run_rank(a: argparse.Namespace) -> int:
         else:
             torch.cuda.synchronize(dev)
 
-    cells: list[tuple[int, str]] = [(nb, be) for nb in sizes for be in active]
+    ops = ["all_reduce", "all_to_all"] if a.op == "beide" else [a.op]
+    cells: list = []
+    for op in ops:
+        for nb in sizes:
+            for muster in (MUSTER if op == "all_to_all" else ("-",)):
+                for be in active:
+                    cells.append((op, nb, muster, be))
+
+    # ---------------- Vorabsage des Direktpfads fuer all_to_all -----------
+    #
+    # Ein schiefer Block sprengt bei grossen Nutzlasten die Schlitzgrenze.
+    # Dann faellt HTCCLCommunicator.all_to_all_single auf die CPU-Ebene
+    # zurueck -- das ist richtig, aber es waere hier eine Messung der
+    # gloo-Ebene unter dem Namen des Direktpfads. Also vorher fragen und die
+    # Zelle sonst mit Grund verwerfen.
+    for cell in list(cells):
+        op, nb, muster, be = cell
+        if op != "all_to_all" or be == "nccl":
+            continue
+        tr = getattr(comms[be], "transport", None)
+        if tr is None:
+            continue
+        g = a2a[(nb, muster)]
+        grund = ""
+        if not tr.handles("all_to_all", a2a_tot[(nb, muster)]):
+            grund = (
+                f"handles('all_to_all', {a2a_tot[(nb, muster)]}) sagt False"
+            )
+        elif not getattr(tr, "traegt_a2a", lambda _: False)(g["max_block"]):
+            schlitz = getattr(tr, "a2a_schlitz_bytes", lambda: 0)()
+            grund = (
+                f"groesster Block {g['max_block']} B passt nicht in den "
+                f"Schlitz von {schlitz} B"
+            )
+        votes: list = [None] * world
+        dist.all_gather_object(votes, grund, group=gloo_pg)
+        bad = [f"r{i}: {v}" for i, v in enumerate(votes) if v]
+        if bad:
+            cells.remove(cell)
+            dead[f"{be} @ all_to_all/{muster} {a2a_tot[(nb, muster)]} B"] = (
+                "Direktpfad meldet sich ab -- " + "; ".join(bad)
+                + ". Es wird NICHT ersatzweise die CPU-Ebene gemessen. "
+                "Groesseres Fenster: --bar1-fenster-mib erhoehen (der "
+                "a2a-Schlitz ist rund Fenster/(6(R-1)))."
+            )
+    if not cells:
+        log("# ABBRUCH: keine Zelle uebrig, die wirklich gemessen werden kann.")
+        for k, why in dead.items():
+            print(f"# {k}: NICHT gemessen -- {why}", flush=True)
+        raise SystemExit(2)
 
     def series(cell, iters: int, timed: bool) -> list[float]:
-        nb, be = cell
-        x = timing_buf[nb]
-        out: list[float] = []
+        op, nb, muster, be = cell
+        if op == "all_reduce":
+            x, out = timing_buf[nb], None
+        else:
+            g = a2a[(nb, muster)]
+            x, out = g["null"], g["out"]
+        res: list[float] = []
         if not timed:
             for _ in range(iters):
-                do_op(nb, be, x)
+                do_op(cell, x, out)
             wait_done()
-            return out
+            return res
         for _ in range(iters):
             t0 = time.perf_counter()
-            do_op(nb, be, x)
+            do_op(cell, x, out)
             wait_done()
-            out.append((time.perf_counter() - t0) * 1e6)
-        return out
+            res.append((time.perf_counter() - t0) * 1e6)
+        return res
 
     def check(cell) -> str:
         """Bekannt-Antwort-Pruefung. Leerer String = in Ordnung."""
-        nb, be = cell
-        # NCCL rechnet an Platz, HTCCL ausser Platz -- die Kopie liegt
-        # ausserhalb jeder Zeitmessung.
-        x = check_in[nb].clone()
+        op, nb, muster, be = cell
+        if op == "all_reduce":
+            # NCCL rechnet an Platz, HTCCL ausser Platz -- die Kopie liegt
+            # ausserhalb jeder Zeitmessung.
+            x, out, want = check_in[nb].clone(), None, check_want[nb]
+        else:
+            g = a2a[(nb, muster)]
+            # Der Ausgabepuffer wird VOR jeder Pruefung verstellt: ein
+            # Kollektiv, das gar nichts schreibt, sieht sonst wie ein Treffer
+            # aus, sobald der Puffer einmal richtig war.
+            g["out_check"].fill_(-1.0)
+            x, out, want = g["x"], g["out_check"], g["soll"]
         try:
-            got = do_op(nb, be, x)
+            got = do_op(cell, x, out)
             wait_done()
         except Exception as e:  # noqa: BLE001
             return f"{type(e).__name__}: {e}"
-        if got.shape != check_want[nb].shape:
-            return f"Form {tuple(got.shape)} statt {tuple(check_want[nb].shape)}"
-        if not torch.equal(got, check_want[nb]):
-            wrong = int((got != check_want[nb]).sum())
-            first = int((got != check_want[nb]).nonzero()[0][0])
+        if got.shape != want.shape:
+            return f"Form {tuple(got.shape)} statt {tuple(want.shape)}"
+        if not torch.equal(got, want):
+            falsch = got != want
+            wrong = int(falsch.sum())
+            erst = [int(v) for v in falsch.nonzero()[0]]
             return (
-                f"{wrong}/{got.numel()} Elemente falsch, erstes bei {first}: "
-                f"{got[first].item()} statt {check_want[nb][first].item()}"
+                f"{wrong}/{got.numel()} Elemente falsch, erstes bei {erst}: "
+                f"{got[tuple(erst)].item()} statt {want[tuple(erst)].item()}"
             )
         return ""
 
+    def zellbytes(cell) -> int:
+        """Nutzlast EINER Operation. Fuer all_to_all die TATSAECHLICHE.
+
+        Sie ist nicht die angeforderte Groesse: die Zeilenzahl wird auf ein
+        Vielfaches von Zeilenbreite mal Rangzahl abgerundet. Wer die
+        angeforderte Zahl in die MB/s-Spalte schriebe, rechnete mit Bytes,
+        die nie geflossen sind.
+        """
+        op, nb, muster, _ = cell
+        return nb if op == "all_reduce" else a2a_tot[(nb, muster)]
+
     # ---------------- Pilot: FESTE Iterationszahl auf allen Raengen -------
-    log(f"# Pilot ({a.pilot} Iterationen je Zelle, feste Zahl auf beiden Raengen)")
+    log(f"# Pilot ({a.pilot} Iterationen je Zelle, feste Zahl auf allen Raengen)")
     pilot: dict[tuple, float] = {}
     for cell in cells:
         dist.barrier(group=gloo_pg)
@@ -368,15 +579,17 @@ def run_rank(a: argparse.Namespace) -> int:
             verdict[cell] = check(cell)
         votes: list = [None] * world
         dist.all_gather_object(
-            votes, {f"{c[0]}|{c[1]}": v for c, v in verdict.items()}, group=gloo_pg
+            votes,
+            {zellschluessel(c): v for c, v in verdict.items()},
+            group=gloo_pg,
         )
         drop = []
         for cell in live:
-            key = f"{cell[0]}|{cell[1]}"
+            key = zellschluessel(cell)
             why = [f"r{i}: {v[key]}" for i, v in enumerate(votes) if v.get(key)]
             if why:
                 drop.append(cell)
-                dead[f"{cell[1]} @ {cell[0]} B"] = (
+                dead[f"{cell[3]} @ {cell[0]}/{cell[2]} {zellbytes(cell)} B"] = (
                     f"Korrektheit in Runde {rnd + 1} gescheitert -- " + "; ".join(why)
                 )
         for cell in drop:  # gemeinsam beschlossen, also auf allen Raengen gleich
@@ -403,10 +616,10 @@ def run_rank(a: argparse.Namespace) -> int:
     log(f"# Messung fertig in {time.time() - t0:.1f} s")
 
     # ---------------- Ergebnis ----------------
-    res = {c: summarize(v, c[0]) for c, v in lat.items() if v}
+    res = {c: summarize(v, zellbytes(c)) for c, v in lat.items() if v}
     peer: list = [None] * world
     dist.all_gather_object(
-        peer, {f"{c[0]}|{c[1]}": v for c, v in res.items()}, group=gloo_pg
+        peer, {zellschluessel(c): v for c, v in res.items()}, group=gloo_pg
     )
     if rank == 0:
         meta = {
@@ -422,12 +635,23 @@ def run_rank(a: argparse.Namespace) -> int:
             "htccl_slot_mib": os.environ.get("SGLANG_HTCCL_SLOT_MIB", "64 (Vorgabe)"),
             "htccl_host_blocks": os.environ.get("SGLANG_HTCCL_HOST_BLOCKS",
                                                 "32 (Vorgabe)"),
+            "welt": world,
+            "op": a.op,
+            "hidden": a.hidden,
+            "schief_faktor": a.schief,
+            "a2a_geometrie": {
+                f"{nb}|{m}": {
+                    "zeilen": g["zeilen"], "ein": g["ein"], "aus": g["aus"],
+                    "bytes": a2a_tot[(nb, m)], "max_block": g["max_block"],
+                }
+                for (nb, m), g in a2a.items()
+            },
             "tote_varianten": dead,
         }
         for r, o in enumerate([int(x) for x in a.devices.split(",")]):
             q = torch.cuda.get_device_properties(o)
             meta["gpus"].append(f"rank{r}=cuda:{o} {q.name} sm_{q.major}{q.minor}")
-        report(a, sizes, active, res, peer[1], meta)
+        report(a, ops, sizes, active, res, peer, meta, a2a_tot)
 
     for c in comms.values():
         try:
@@ -442,10 +666,11 @@ def run_rank(a: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 # Bericht (nur Rang 0)
 # ----------------------------------------------------------------------
-def report(a, sizes, backends, res, peer_res, meta) -> None:
+def report(a, ops, sizes, backends, res, peer_res, meta, a2a_tot) -> None:
     print()
     print("=" * 78)
-    print("HTCCL-Host-Transport gegen NCCL -- all_reduce, ein Lauf, verschraenkt")
+    print("HTCCL gegen NCCL -- ein Lauf, verschraenkt, "
+          + "/".join(ops))
     print("=" * 78)
     for k, v in meta.items():
         if k == "gpus":
@@ -454,60 +679,90 @@ def report(a, sizes, backends, res, peer_res, meta) -> None:
         elif k == "tote_varianten":
             for kk, vv in v.items():
                 print(f"  NICHT gemessen: {kk} -- {vv}")
+        elif k == "a2a_geometrie":
+            for kk, vv in v.items():
+                print(f"  a2a {kk}: {vv['zeilen']} Zeilen, sende {vv['ein']}, "
+                      f"empfange {vv['aus']}, {vv['bytes']} B, groesster "
+                      f"Block {vv['max_block']} B")
         else:
             print(f"  {k}: {v}")
     if not meta["tote_varianten"]:
         print("  tote Varianten: keine")
     print()
     print("  Alle Zeiten in Mikrosekunden und VOLLE OPERATIONSDAUER.")
-    print("  Ein all_reduce hat keinen halben Weg -- nicht mit den")
-    print("  Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.")
+    print("  Weder all_reduce noch all_to_all haben einen halben Weg --")
+    print("  nicht mit den Punkt-zu-Punkt-Zahlen verrechnen.")
     print("  MB/s = Nutzlast je Operation / p50, keine Busbandbreite.")
-    print("  HTCCL rechnet AUSSER Platz, NCCL AN Platz: HTCCL schreibt")
-    print("  zusaetzlich ein volles Ergebnis. Die Verzerrung geht damit")
+    print("  all_reduce: HTCCL rechnet AUSSER Platz, NCCL AN Platz -- HTCCL")
+    print("  schreibt zusaetzlich ein volles Ergebnis. Die Verzerrung geht")
     print("  gegen HTCCL, nicht fuer HTCCL.")
+    print("  all_to_all: BEIDE ausser Platz, gleiche Teilgroessen, gleiche")
+    print("  Puffer. Der Vergleich ist dort unverzerrt.")
+    print("  Bei --op all_to_all sind die Bytes die TATSAECHLICH gesendeten")
+    print("  (abgerundet auf Zeilenbreite mal Rangzahl), nicht die aus")
+    print("  --sizes angeforderten.")
     print()
 
-    for nb in sizes:
-        rows = [(be, res[(nb, be)]) for be in backends if (nb, be) in res]
-        if not rows:
-            print(f"--- all_reduce, {nb} B: keine Zelle ueberlebt ---\n")
-            continue
-        best = min(r[1]["p50"] for r in rows)
-        ref = dict(rows).get("nccl", {}).get("p50")
-        print(f"--- all_reduce, {nb} B ({nb / 1024:.0f} KiB), {meta['dtype']} "
-              f"---------------------")
-        print(f"{'Backend':<14}{'n':>8}{'p50 us':>10}{'p99 us':>10}{'MB/s':>10}"
-              f"{'x best':>8}{'x NCCL':>9}")
-        for be, r in sorted(rows, key=lambda x: x[1]["p50"]):
-            vs = f"{ref / r['p50']:.2f}" if ref and be != "nccl" else "-"
-            print(f"{be:<14}{r['n']:>8}{r['p50']:>10.2f}{r['p99']:>10.2f}"
-                  f"{r['mbps']:>10.1f}{r['p50'] / best:>8.2f}{vs:>9}")
-        print()
+    def _muster(op):
+        return MUSTER if op == "all_to_all" else ("-",)
+
+    for op in ops:
+        for nb in sizes:
+            for m in _muster(op):
+                zellen = [(be, res[(op, nb, m, be)]) for be in backends
+                          if (op, nb, m, be) in res]
+                echt = nb if op == "all_reduce" else a2a_tot.get((nb, m), nb)
+                titel = (f"--- {op}"
+                         + (f"/{m}" if op == "all_to_all" else "")
+                         + f", {echt} B ({echt / 1024:.0f} KiB), "
+                         + f"{meta['dtype']} ---")
+                if not zellen:
+                    print(f"{titel} keine Zelle ueberlebt\n")
+                    continue
+                best = min(r[1]["p50"] for r in zellen)
+                ref = dict(zellen).get("nccl", {}).get("p50")
+                print(titel)
+                print(f"{'Backend':<14}{'n':>8}{'p50 us':>10}{'p99 us':>10}"
+                      f"{'MB/s':>10}{'x best':>8}{'x NCCL':>9}")
+                for be, r in sorted(zellen, key=lambda x: x[1]["p50"]):
+                    vs = f"{ref / r['p50']:.2f}" if ref and be != "nccl" else "-"
+                    print(f"{be:<14}{r['n']:>8}{r['p50']:>10.2f}"
+                          f"{r['p99']:>10.2f}{r['mbps']:>10.1f}"
+                          f"{r['p50'] / best:>8.2f}{vs:>9}")
+                print()
 
     print("# Maschinenlesbar (VOLLE Operationsdauer, us):")
-    for nb in sizes:
-        for be in backends:
-            r = res.get((nb, be))
-            if not r:
-                continue
-            pr = (peer_res or {}).get(f"{nb}|{be}", {})
-            print(
-                f"HOSTBENCH op=all_reduce backend={be} bytes={nb} "
-                f"dtype={meta['dtype']} n={r['n']} min_us={r['min']:.2f} "
-                f"p50_us={r['p50']:.2f} p90_us={r['p90']:.2f} "
-                f"p99_us={r['p99']:.2f} mean_us={r['mean']:.2f} "
-                f"mbps={r['mbps']:.1f} "
-                f"peer_p50_us={pr.get('p50', float('nan')):.2f} half_rt=no",
-                flush=True,
-            )
+    for op in ops:
+        for nb in sizes:
+            for m in _muster(op):
+                echt = nb if op == "all_reduce" else a2a_tot.get((nb, m), nb)
+                for be in backends:
+                    r = res.get((op, nb, m, be))
+                    if not r:
+                        continue
+                    key = f"{op}|{nb}|{m}|{be}"
+                    # Alle Peers, nicht nur Rang 1: bei drei Raengen ist der
+                    # langsamste Rang die Operationsdauer, und der stand
+                    # bisher nicht im Bericht.
+                    peers = [pr.get(key, {}).get("p50", float("nan"))
+                             for pr in (peer_res or [])]
+                    print(
+                        f"HOSTBENCH op={op} verteilung={m} backend={be} "
+                        f"bytes={echt} dtype={meta['dtype']} n={r['n']} "
+                        f"min_us={r['min']:.2f} p50_us={r['p50']:.2f} "
+                        f"p90_us={r['p90']:.2f} p99_us={r['p99']:.2f} "
+                        f"mean_us={r['mean']:.2f} mbps={r['mbps']:.1f} "
+                        f"peer_p50_us=" + ",".join(f"{x:.2f}" for x in peers)
+                        + " half_rt=no",
+                        flush=True,
+                    )
     for k, v in meta["tote_varianten"].items():
         print(f"HOSTBENCH dead={k!r} reason={v!r}", flush=True)
 
     if a.out:
         blob = {"meta": meta,
-                "rank0": {f"{c[0]}|{c[1]}": v for c, v in res.items()},
-                "rank1": peer_res}
+                "raenge": [{zellschluessel(c): v for c, v in res.items()}]
+                + [dict(pr or {}) for pr in (peer_res or [])[1:]]}
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, "w") as f:
             json.dump(blob, f, indent=1)
@@ -549,7 +804,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--rank", type=int, default=-1, help="intern: Kindprozess")
     ap.add_argument("--devices", default="1,2",
-                    help="CUDA-Ordinals unter PCI_BUS_ID, rank0,rank1")
+                    help="CUDA-Ordinals unter PCI_BUS_ID, ein Rang je Eintrag")
+    ap.add_argument("--op", default="all_reduce",
+                    choices=["all_reduce", "all_to_all", "beide"],
+                    help="welche Kollektive gemessen werden")
+    ap.add_argument("--hidden", type=int, default=512,
+                    help="Elemente je Zeile fuer all_to_all; die Teilgroessen "
+                         "sind Zeilenzahlen, wie bei den MoE-Dispatchern")
+    ap.add_argument("--schief", type=int, default=4,
+                    help="Vielfaches, das Rang 0 im Muster 'schief' von JEDEM "
+                         "bekommt (der heisse Experte)")
     ap.add_argument("--sizes", default=DEFAULT_SIZES)
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
@@ -569,6 +833,12 @@ def main() -> int:
     ap.add_argument("--slot-mib", type=int, default=32,
                     help="SGLANG_HTCCL_SLOT_MIB fuer die Kindprozesse; muss "
                          "mindestens die groesste Nutzlast fassen")
+    ap.add_argument("--bar1-fenster-mib", type=int, default=0,
+                    help="SGLANG_HTCCL_BAR1_FENSTER_MIB fuer die "
+                         "Kindprozesse (0 = Vorgabe des Moduls, 96). Der "
+                         "a2a-Schlitz je gerichtetem Paar ist rund "
+                         "Fenster/(6(R-1)); ein schiefer Block darueber "
+                         "laesst den Direktpfad absagen.")
     ap.add_argument("--max-secs", type=float, default=2400.0,
                     help="harter Watchdog je Rang")
     ap.add_argument("--pg-timeout", type=float, default=180.0)
@@ -600,7 +870,16 @@ def main() -> int:
             f"Slot von {a.slot_mib} MiB. --slot-mib erhoehen."
         )
 
-    devices = [int(x) for x in a.devices.split(",")]
+    devices = [int(x) for x in a.devices.split(",") if x.strip()]
+    if len(devices) < 2:
+        raise SystemExit("ABBRUCH: --devices braucht mindestens zwei Ordinals.")
+    if len(devices) != len(set(devices)):
+        raise SystemExit(
+            f"ABBRUCH: --devices {a.devices} nennt eine Karte doppelt. Zwei "
+            f"Raenge auf derselben Karte messen keinen Transport."
+        )
+    if a.op in ("all_to_all", "beide") and a.schief < 1:
+        raise SystemExit("ABBRUCH: --schief muss mindestens 1 sein.")
     preflight(devices, a.max_used_mib)
 
     env = {**os.environ,
@@ -610,6 +889,8 @@ def main() -> int:
            "SGLANG_HTCCL_SLOT_MIB": str(a.slot_mib),
            "PYTHONPATH": a.sglang_python + ":" + os.environ.get("PYTHONPATH", ""),
            "PYTHONUNBUFFERED": "1"}
+    if a.bar1_fenster_mib:
+        env["SGLANG_HTCCL_BAR1_FENSTER_MIB"] = str(a.bar1_fenster_mib)
     base = [sys.executable, os.path.abspath(__file__)]
     for k, v in vars(a).items():
         if k == "rank":
@@ -619,7 +900,7 @@ def main() -> int:
         if val:
             base += [key, val]
     procs = [subprocess.Popen(base + ["--rank", str(r)], env=env)
-             for r in range(2)]
+             for r in range(len(devices))]
     rc = 0
     deadline = time.time() + a.max_secs + 120
     try:

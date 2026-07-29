@@ -1129,7 +1129,9 @@ class GroupCoordinator:
             f"HTCCL does not implement {op!r}. SGLANG_HTCCL routes TP "
             f"collectives over the vendor-neutral host-staged path, which "
             f"currently covers all_reduce, all_gather(_into_tensor), "
-            f"reduce_scatter(_tensor) and broadcast. {op!r} would fall back "
+            f"reduce_scatter(_tensor), all_to_all_single (equal split and "
+            f"the split-size form via all_to_all_single_v) and broadcast. "
+            f"{op!r} would fall back "
             f"to NCCL, which cannot span a mixed-vendor group -- that is a "
             f"deadlock, not a slowdown. Either avoid the feature that calls "
             f"{op!r} (uneven/variable-size collectives are the usual "
@@ -1194,13 +1196,65 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        # HTCCL zuerst. Ohne diesen Zweig ging all_to_all_single bei aktivem
+        # SGLANG_HTCCL ungebremst auf self.device_group -- also auf genau das
+        # NCCL, das _htccl_unsupported oben als Deadlock-Ursache auf einer
+        # Gruppe ueber zwei Hersteller benennt. Es war bisher folgenlos, weil
+        # die Methode keinen Aufrufer hat; folgenlos ist nicht dasselbe wie
+        # richtig, und ein Haenger meldet sich nicht mit einer Fehlermeldung.
+        if self.htccl_comm is not None:
+            self.htccl_comm.all_to_all_single(output, input)
+            return
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
             output.copy_(input)
             return
+        # Wie bei all_reduce: HTCCL kehrt VOR der Dynamo-Custom-Op-Maschinerie
+        # zurueck. Der Zweig in _all_to_all_single bleibt trotzdem stehen --
+        # er faengt den Weg ueber die registrierte Op ab.
+        if self.htccl_comm is not None:
+            self.htccl_comm.all_to_all_single(output, input)
+            return
         reg_all_to_all_single(output, input, group_name=self.unique_name)
+
+    def all_to_all_single_v(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: Optional[List[int]] = None,
+        input_split_sizes: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """all_to_all_single mit ungleichen Teilgroessen (Zeilen, nicht Bytes).
+
+        Die Form, die MoE braucht: die Zahl der Token je Experte schwankt,
+        also schwankt die Blockgroesse je Zielrang. ``output_split_sizes=None``
+        laesst die Empfangszahlen aus den Sendezahlen ermitteln -- ein
+        all_gather der Zaehlwerte, wie DeepEP es vor dem Dispatch macht
+        (``get_dispatch_layout`` -> ``num_tokens_per_rank``).
+
+        BEWUSST NICHT ueber ``reg_all_to_all_single``: die registrierte
+        Custom-Op hat eine feste Signatur ohne Teilgroessen, und sie um
+        ``Optional[List[int]]`` zu erweitern haette den Schema-Vertrag der
+        bestehenden Op geaendert. Diese Form ist damit nicht opak fuer
+        Dynamo; wer sie unter torch.compile braucht, muss sie ausklammern.
+        """
+        if self.world_size == 1:
+            output.copy_(input)
+            return output
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_to_all_single(
+                output, input, output_split_sizes, input_split_sizes
+            )
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+        )
+        return output
 
     def reduce_scatter(
         self,

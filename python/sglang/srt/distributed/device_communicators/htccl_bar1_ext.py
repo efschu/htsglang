@@ -4,9 +4,12 @@
 Zwei getrennte Erweiterungen, weil sie verschiedene Voraussetzungen haben:
 
 ``htccl_bar1_ext``  (CUDA)
-    Die beiden Kollektiv-Kernel ``netz`` und ``ring``, portiert aus
-    ``/spinning/nvidia-open-595/bar1_kollektiv.cu``. Braucht nur nvcc und
-    torch, laeuft ueberall, wo ``htccl_device`` auch baut.
+    Die Kollektiv-Kernel. ``netz`` und ``ring`` fuer ``all_reduce``, portiert
+    aus ``/spinning/nvidia-open-595/bar1_kollektiv.cu``; dazu ``a2a`` fuer
+    ``all_to_all_single``, das in der Sonde keine Entsprechung hat und
+    deshalb ausdruecklich NICHT portiert, sondern neu geschrieben ist --
+    ungemessen, bis der Messlauf da ist. Braucht nur nvcc und torch, laeuft
+    ueberall, wo ``htccl_device`` auch baut.
 
 ``htccl_bar1_dmabuf_ext``  (nur C++)
     Der dma-buf-Export ueber die RM-Ioctls. Braucht die **Kopfdateien der
@@ -148,6 +151,17 @@ __device__ __forceinline__ u64 flaggeLesen(const u64 *p)
 __device__ __forceinline__ void schreibeU64(void *p, u64 v)
 {
     asm volatile("st.global.wt.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+
+// Einzelbyte, cache-umgehend. Gebraucht NUR im Restpfad von all_to_all: dort
+// kann ein Block an einer Grenze enden, die kein Vielfaches von 16 ist, und
+// die letzten Bytes stammen -- wie der Rest -- per DMA von einer fremden
+// Karte. Ohne .cv laege eine wiederverwendete Cachezeile davor.
+__device__ __forceinline__ unsigned char leseB(const void *p)
+{
+    unsigned int v;
+    asm volatile("ld.global.cv.u8 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return (unsigned char)v;
 }
 
 // Lesefluss fuer den Fall, dass Nutzlast und Flagge an VERSCHIEDENEN
@@ -361,7 +375,11 @@ __device__ __forceinline__ void ringAddiere(const uint4 *__restrict__ in,
 // dauerhaft auseinander: der eine zaehlte den Aufruf, der andere nicht, und
 // jede folgende Flagge stuende an der falschen Stelle.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void rundeSchreiben(const Bar1Args &A, u64 runde)
+// Templatisiert, weil der a2a-Kernel eine eigene Argumentstruktur hat und
+// die Rundenfortschreibung in JEDEM Kernel dieselbe sein muss -- eine zweite
+// Fassung waere genau die Stelle, an der die Raenge auseinanderlaufen.
+template<typename ARGS>
+__device__ __forceinline__ void rundeSchreiben(const ARGS &A, u64 runde)
 {
     *(volatile u64 *)A.rundeDev = runde;
     __threadfence_system();
@@ -640,6 +658,258 @@ __global__ void bar1_ring_kernel(Bar1Args A)
     if (erster) rundeSchreiben(A, runde);
 }
 
+// ---------------------------------------------------------------------------
+// TOPOLOGIE 'a2a' -- all_to_all_single. EIN Schritt, EINE Sperre.
+//
+// Rang r schreibt seinen Block fuer Rang z direkt in dessen Empfangsschlitz,
+// alle Ziele im SELBEN flachen Indexraum (verschiedene Warps schreiben also
+// gleichzeitig an verschiedene Karten), dann eine Sperre, dann liest jeder
+// seine R-1 Schlitze in den Ausgabepuffer. Es gibt keine Reduktion, also auch
+// keinen Datentyp: der Kernel bewegt Bytes. fp8, bf16, int32 -- derselbe Pfad.
+//
+// WARUM DOPPELPUFFER STATT ZWEITER SPERRE
+// ---------------------------------------
+// Mit nur (R-1) Schlitzen duerfte der Sender die naechste Runde nicht
+// beginnen, bevor der Empfaenger die vorige gelesen hat -- die Flagge sagt
+// aber nur "geschrieben", nicht "gelesen". Statt einer zweiten Sperre (die
+// bei MoE-Groessen die Haelfte der Latenz waere) liegen 2(R-1) Schlitze da
+// und die Runde waehlt die Haelfte: par = runde & 1.
+//
+// Der Beweis, dass zwei Haelften reichen: A schreibt in Runde N in die
+// Haelfte N%2. Zuletzt benutzt wurde sie in Runde N-2. A's Kernel der Runde N
+// startet erst, wenn A's Kernel der Runde N-1 fertig ist (ein Strom, in
+// Reihenfolge). Der wurde erst fertig, nachdem A die Flagge von B fuer Runde
+// N-1 gesehen hat. Die setzt B INNERHALB seines Kernels der Runde N-1, der
+// wiederum erst startet, wenn B's Kernel der Runde N-2 fertig ist -- also
+// nachdem B die Haelfte (N-2)%2 = N%2 ausgelesen hat. Damit ist der Schlitz
+// frei, bevor A ihn wieder anfasst.
+//
+// Die Rundennummer liegt im Geraetespeicher (wie bei netz/ring), also
+// entscheidet der KERNEL ueber die Haelfte, nicht der Host -- sonst muesste
+// der Host die Runde kennen und dafuer synchronisieren.
+//
+// Sender und Empfaenger muessen dieselbe Haelfte waehlen, also dieselbe
+// Runde zaehlen. Das ist keine zusaetzliche Annahme: die Flagge TRAEGT die
+// Rundennummer, und gewartet wird auf Gleichheit. Zaehlen zwei Raenge
+// verschieden, kommt die Flagge nie an und der Deckel schlaegt zu -- eine
+// falsche Haelfte kann es ohne eine falsche Flagge nicht geben. Der Fehler
+// ist damit ein gemeldeter Abbruch (ctlStatus = 1) und keine stille
+// Verfaelschung.
+//
+// AUSRICHTUNG
+// -----------
+// Die Zugriffsbreite ist 128 Bit. Ueber PCIe wird deshalb IMMER in
+// 16-Byte-Paketen geschrieben, auch am Blockende: das letzte, unvollstaendige
+// Paket wird aus den vorhandenen Bytes in einem Register zusammengesetzt und
+// als ein Paket abgesetzt. Damit gibt es weder Teilbreitenschreibvorgaenge in
+// eine Write-Combining-Apertur noch einen Lesezugriff hinter das Ende des
+// Eingabetensors. Der Schlitz beginnt auf einer Seitengrenze und ist ein
+// Vielfaches von 16, das aufgerundete Paket trifft also nie den Nachbarn.
+//
+// VEK=1 heisst: alle Blockversaetze UND beide Puffergrundadressen sind
+// 16-Byte-ausgerichtet, der Massenteil laeuft also mit 128-Bit-Zugriffen.
+// VEK=0 ist der Restpfad (Zeilenbreite kein Vielfaches von 16): dann wird
+// jedes Paket byteweise zusammengesetzt. Korrekt, langsam, und ehrlich
+// benannt -- gemessen ist er nicht.
+// ---------------------------------------------------------------------------
+struct A2aArgs {
+    const unsigned char *in;
+    unsigned char       *out;
+    u64          *rundeDev;
+    unsigned int *ctlStatus;
+    unsigned int *abbruchDev;
+    int           R;
+    int           rang;
+    u64           deckelZyklen;
+    long long     schlitz;                 // Schlitzgroesse in Byte
+    long long     sendOff[HTCCL_BAR1_MAX_RANKS];   // Versatz in `in`
+    long long     sendLen[HTCCL_BAR1_MAX_RANKS];
+    long long     recvOff[HTCCL_BAR1_MAX_RANKS];   // Versatz in `out`
+    long long     recvLen[HTCCL_BAR1_MAX_RANKS];
+    unsigned char *zielBasis[HTCCL_BAR1_MAX_RANKS];  // a2a-Bereich des Peers
+    const unsigned char *eigenBasis;                 // eigener a2a-Bereich
+    u64          *flagAn [HTCCL_BAR1_MAX_RANKS];
+    const u64    *flagVon[HTCCL_BAR1_MAX_RANKS];
+};
+
+// Ein 16-Byte-Paket aus hoechstens 16 Bytes zusammensetzen. Der Rest bleibt
+// 0; er landet im Schlitzueberhang und wird vom Empfaenger nie gelesen.
+__device__ __forceinline__ uint4 packeBytes(const unsigned char *q, int n)
+{
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    unsigned char *b = (unsigned char *)&v;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) if (i < n) b[i] = q[i];
+    return v;
+}
+
+// Wohin ich (Rang r) fuer Rang z schreibe: meine Position in dessen
+// aufsteigender Peer-Liste, in der Haelfte `par`. Dieselbe Positionsformel
+// wie bei netz -- NICHT (r < z).
+__device__ __forceinline__ unsigned char *a2aZiel(const A2aArgs &A, int z, int par)
+{
+    const int p = A.rang - (A.rang > z ? 1 : 0);
+    return A.zielBasis[z] + (long long)(par * (A.R - 1) + p) * A.schlitz;
+}
+
+// Woher der Block von Rang s bei mir liegt: dessen Position in MEINER
+// aufsteigender Peer-Liste.
+__device__ __forceinline__ const unsigned char *a2aQuelle(const A2aArgs &A,
+                                                          int s, int par)
+{
+    const int p = s - (s > A.rang ? 1 : 0);
+    return A.eigenBasis + (long long)(par * (A.R - 1) + p) * A.schlitz;
+}
+
+template<int VEK, int LA, int GRID>
+__global__ void bar1_a2a_kernel(A2aArgs A)
+{
+    const long long tid = (GRID == K_GITTER)
+                              ? (long long)blockIdx.x * blockDim.x + threadIdx.x
+                              : (long long)threadIdx.x;
+    const long long nth = (GRID == K_GITTER)
+                              ? (long long)gridDim.x * blockDim.x
+                              : (long long)blockDim.x;
+    const bool erster = (tid == 0);
+    const int  R = A.R, r = A.rang;
+    const u64  runde = *(const volatile u64 *)A.rundeDev + 1ull;
+    const int  par = (int)(runde & 1ull);
+
+    __shared__ int abbruchS;
+    if (GRID == K_1BLK) {
+        if (threadIdx.x == 0) abbruchS = 0;
+        __syncthreads();
+    } else if (erster) {
+        *(volatile unsigned int *)A.abbruchDev = 0u;
+        __threadfence();
+    }
+
+    // Alles, was die inneren Schleifen mit LAUFENDEM Index brauchen, liegt im
+    // gemeinsamen Speicher. Ein dynamisch indiziertes Feld in der
+    // Argumentstruktur zwingt nvcc, den ganzen Parameterblock je Thread in
+    // den local memory zu kopieren -- bei 256 Threads und einer halben
+    // Kilobyte grossen Struktur ist das mehr Verkehr als die Nutzlast. Die
+    // Schlitzadressen werden gleich mit ausgerechnet: sie haengen nur von
+    // (z, par) ab, nicht vom Paket.
+    __shared__ long long sPre[HTCCL_BAR1_MAX_RANKS + 1];
+    __shared__ long long ePre[HTCCL_BAR1_MAX_RANKS + 1];
+    __shared__ long long sLenS[HTCCL_BAR1_MAX_RANKS];
+    __shared__ long long eLenS[HTCCL_BAR1_MAX_RANKS];
+    __shared__ const unsigned char *sQuelle[HTCCL_BAR1_MAX_RANKS];
+    __shared__ unsigned char       *sZiel  [HTCCL_BAR1_MAX_RANKS];
+    __shared__ const unsigned char *eQuelle[HTCCL_BAR1_MAX_RANKS];
+    __shared__ unsigned char       *eZiel  [HTCCL_BAR1_MAX_RANKS];
+    if (threadIdx.x == 0) {
+        sPre[0] = 0; ePre[0] = 0;
+        for (int z = 0; z < R; ++z) {
+            sLenS[z] = A.sendLen[z];
+            eLenS[z] = A.recvLen[z];
+            sQuelle[z] = A.in + A.sendOff[z];
+            eZiel[z]   = A.out + A.recvOff[z];
+            sZiel[z]   = (z == r) ? nullptr : a2aZiel(A, z, par);
+            eQuelle[z] = (z == r) ? nullptr : a2aQuelle(A, z, par);
+            sPre[z + 1] = sPre[z] + ((z == r) ? 0LL : (sLenS[z] + 15LL) / 16LL);
+            ePre[z + 1] = ePre[z] + ((z == r) ? 0LL : (eLenS[z] + 15LL) / 16LL);
+        }
+    }
+    __syncthreads();
+
+    // --- 1. Sendephase: alle Ziele im selben flachen Indexraum -------------
+    {
+        const long long ges = sPre[R];
+        for (long long j = tid; j < ges; j += nth) {
+            int z = 0;
+            while (sPre[z + 1] <= j) ++z;          // R <= 8, also ein kurzer Scan
+            const long long b = (j - sPre[z]) * 16LL;
+            const int rest = (int)((sLenS[z] - b) < 16LL
+                                       ? (sLenS[z] - b) : 16LL);
+            const unsigned char *q = sQuelle[z] + b;
+            uint4 v;
+            if (VEK && rest == 16) v = *(const uint4 *)q;
+            else                   v = packeBytes(q, rest);
+            schreibeV4(sZiel[z] + b, v);
+        }
+    }
+
+    // --- 1b. der eigene Block: rein lokal, ohne Umweg ueber die Apertur ----
+    {
+        const long long n = sLenS[r];
+        const unsigned char *q = sQuelle[r];
+        unsigned char *z = eZiel[r];
+        if (VEK) {
+            const long long p = n / 16LL;
+            for (long long k = tid; k < p; k += nth)
+                *(uint4 *)(z + k * 16LL) = *(const uint4 *)(q + k * 16LL);
+            for (long long k = p * 16LL + tid; k < n; k += nth) z[k] = q[k];
+        } else {
+            for (long long k = tid; k < n; k += nth) z[k] = q[k];
+        }
+    }
+
+    __threadfence_system();
+    barriere<GRID>();
+
+    // --- 2. Die eine Sperre ------------------------------------------------
+    if (erster) {
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            schreibeU64(A.flagAn[z], runde);
+        }
+        __threadfence_system();
+
+        bool ab = false;
+        long long t0 = clock64();
+        for (;;) {
+            bool alle = true;
+            for (int s = 0; s < R; ++s) {
+                if (s == r) continue;
+                if (flaggeLesen<LA>(A.flagVon[s]) != runde) { alle = false; break; }
+            }
+            if (alle) break;
+            if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+        }
+        if (ab) {
+            if (GRID == K_1BLK) abbruchS = 1;
+            else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+        }
+    }
+    barriere<GRID>();
+    {
+        const int abbruch = (GRID == K_1BLK)
+                                ? abbruchS
+                                : (int)*(volatile unsigned int *)A.abbruchDev;
+        if (abbruch) {
+            if (erster) {
+                *A.ctlStatus = 1u;
+                rundeSchreiben(A, runde);
+            }
+            return;
+        }
+    }
+    __threadfence_system();
+
+    // --- 3. Empfangsphase: eigene Schlitze in den Ausgabepuffer ------------
+    {
+        const long long ges = ePre[R];
+        for (long long j = tid; j < ges; j += nth) {
+            int s = 0;
+            while (ePre[s + 1] <= j) ++s;
+            const long long b = (j - ePre[s]) * 16LL;
+            const int rest = (int)((eLenS[s] - b) < 16LL
+                                       ? (eLenS[s] - b) : 16LL);
+            const unsigned char *q = eQuelle[s] + b;
+            unsigned char *z = eZiel[s] + b;
+            if (VEK && rest == 16) {
+                *(uint4 *)z = leseV4(q);
+            } else {
+                for (int i = 0; i < rest; ++i) z[i] = leseB(q + i);
+            }
+        }
+    }
+    barriere<GRID>();
+    if (erster) rundeSchreiben(A, runde);
+}
+
 // ===========================================================================
 // Hostseite
 // ===========================================================================
@@ -861,6 +1131,171 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                         " wird nicht unterstuetzt (float32/float16/bfloat16)");
     }
 }
+
+// ---------------------------------------------------------------------------
+// bar1_all_to_all
+//
+// Kein Datentyp, keine Reduktion, keine Templatisierung ueber Elementtypen:
+// der Kernel bewegt Bytes. Was hereinkommt, sind Byteversaetze und
+// Bytelaengen je Rang -- damit traegt dieselbe Funktion die gleichverteilte
+// und die ungleich geteilte Form (input_split_sizes/output_split_sizes), und
+// fp8 ist einfach ein Byte.
+//
+// `peer_nutz` ist DIESELBE Peer-Zeiger-Tabelle wie bei bar1_all_reduce; der
+// a2a-Bereich liegt als dritter Abschnitt in derselben Empfangsregion
+// (Versatz `off_a2a`). Es wird hier nichts gemappt -- das ist beim Aufbau
+// passiert und nur dort.
+// ---------------------------------------------------------------------------
+static void starteA2a(int vek, int kern, int la, A2aArgs &A, int threads,
+                      long long pakete, cudaStream_t strom)
+{
+#define HTCCL_A2A_STARTE(VEK, LA)                                              \
+    do {                                                                       \
+        if (kern == K_GITTER) {                                                \
+            const void *fn = (const void *)bar1_a2a_kernel<VEK, LA, K_GITTER>; \
+            int n4 = (int)(pakete > 2147483647LL ? 2147483647LL : pakete);     \
+            int g = gitterGroesse(fn, threads, n4);                            \
+            dim3 gd((unsigned)g), bd((unsigned)threads);                       \
+            void *args[1] = { &A };                                            \
+            cudaError_t e = cudaLaunchCooperativeKernel(fn, gd, bd, args, 0,   \
+                                                        strom);                \
+            TORCH_CHECK(e == cudaSuccess,                                      \
+                        "htccl-bar1 a2a: cudaLaunchCooperativeKernel -> ",     \
+                        cudaGetErrorString(e));                                \
+            return;                                                            \
+        }                                                                      \
+        bar1_a2a_kernel<VEK, LA, K_1BLK><<<1, threads, 0, strom>>>(A);         \
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
+                    "htccl-bar1 a2a: Kernelstart fehlgeschlagen");             \
+        return;                                                                \
+    } while (0)
+
+    if (vek) {
+        if (la == LA_MMIO) HTCCL_A2A_STARTE(1, LA_MMIO);
+        else               HTCCL_A2A_STARTE(1, LA_CV);
+    } else {
+        if (la == LA_MMIO) HTCCL_A2A_STARTE(0, LA_MMIO);
+        else               HTCCL_A2A_STARTE(0, LA_CV);
+    }
+#undef HTCCL_A2A_STARTE
+}
+
+void bar1_all_to_all(at::Tensor inp, at::Tensor out,
+                     int64_t rank, int64_t world,
+                     std::vector<int64_t> send_off,
+                     std::vector<int64_t> send_len,
+                     std::vector<int64_t> recv_off,
+                     std::vector<int64_t> recv_len,
+                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_flag,
+                     int64_t eigen_nutz, int64_t eigen_flag,
+                     int64_t schlitz, int64_t off_a2a, int64_t fbasis_a2a,
+                     at::Tensor runde_dev, at::Tensor ctl_dev,
+                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
+                     int64_t ladeform)
+{
+    const int R = (int)world, r = (int)rank;
+    TORCH_CHECK(R >= 2 && R <= HTCCL_BAR1_MAX_RANKS,
+                "htccl-bar1 a2a: world ", R, " ausserhalb 2..",
+                HTCCL_BAR1_MAX_RANKS);
+    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1 a2a: rank ausserhalb");
+    TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
+                "htccl-bar1 a2a: nur zusammenhaengende Tensoren");
+    TORCH_CHECK(inp.scalar_type() == out.scalar_type(),
+                "htccl-bar1 a2a: in und out haben verschiedene Datentypen -- "
+                "all_to_all wandelt nichts um");
+    TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
+                "htccl-bar1 a2a: in und out duerfen nicht dasselbe sein");
+    TORCH_CHECK((int64_t)send_off.size() == world &&
+                (int64_t)send_len.size() == world &&
+                (int64_t)recv_off.size() == world &&
+                (int64_t)recv_len.size() == world &&
+                (int64_t)peer_nutz.size() == world &&
+                (int64_t)peer_flag.size() == world,
+                "htccl-bar1 a2a: eine der Tabellen hat die falsche Laenge");
+    TORCH_CHECK(schlitz > 0 && (schlitz % 16) == 0,
+                "htccl-bar1 a2a: Schlitzgroesse ", schlitz,
+                " ist kein positives Vielfaches von 16");
+
+    const int64_t in_bytes  = (int64_t)inp.numel()  * (int64_t)inp.element_size();
+    const int64_t out_bytes = (int64_t)out.numel() * (int64_t)out.element_size();
+
+    // Die Nahtstellenpruefung. Absichtlich HIER und nicht nur in Python:
+    // die Schlitzgrenze ist die Bedingung, an der die Abbildung wirklich
+    // haengt, und sie wird mit den Zahlen geprueft, mit denen auch gerechnet
+    // wird -- nicht mit einer zweiten Fassung derselben Formel.
+    int64_t max_send = 0;
+    for (int z = 0; z < R; ++z) {
+        TORCH_CHECK(send_len[z] >= 0 && recv_len[z] >= 0 &&
+                    send_off[z] >= 0 && recv_off[z] >= 0,
+                    "htccl-bar1 a2a: negative Teilgroesse bei Rang ", z);
+        TORCH_CHECK(send_off[z] + send_len[z] <= in_bytes,
+                    "htccl-bar1 a2a: Sendeblock ", z, " (", send_off[z], "+",
+                    send_len[z], ") liegt hinter dem Ende des Eingabetensors (",
+                    in_bytes, " Byte)");
+        TORCH_CHECK(recv_off[z] + recv_len[z] <= out_bytes,
+                    "htccl-bar1 a2a: Empfangsblock ", z, " (", recv_off[z], "+",
+                    recv_len[z], ") liegt hinter dem Ende des Ausgabetensors (",
+                    out_bytes, " Byte)");
+        if (z == r) continue;
+        if (send_len[z] > max_send) max_send = send_len[z];
+        TORCH_CHECK(recv_len[z] <= schlitz,
+                    "htccl-bar1 a2a: Empfangsblock von Rang ", z, " ist ",
+                    recv_len[z], " Byte und passt nicht in den Schlitz von ",
+                    schlitz, " Byte. Der Aufrufer haette handles() bzw. "
+                    "traegt_a2a() fragen muessen.");
+    }
+    TORCH_CHECK(max_send <= schlitz,
+                "htccl-bar1 a2a: groesster Sendeblock ", max_send,
+                " Byte passt nicht in den Schlitz von ", schlitz, " Byte.");
+    TORCH_CHECK(send_len[r] == recv_len[r],
+                "htccl-bar1 a2a: der eigene Block ist beim Senden ",
+                send_len[r], " und beim Empfangen ", recv_len[r],
+                " Byte gross -- die Teilgroessen passen nicht zusammen");
+
+    A2aArgs A;
+    std::memset(&A, 0, sizeof(A));
+    A.in           = (const unsigned char *)inp.data_ptr();
+    A.out          = (unsigned char *)out.data_ptr();
+    A.rundeDev     = (u64 *)runde_dev.data_ptr();
+    A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
+    A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    A.R            = R;
+    A.rang         = r;
+    A.deckelZyklen = (u64)deckel_zyklen;
+    A.schlitz      = (long long)schlitz;
+    A.eigenBasis   = (const unsigned char *)((char *)(uintptr_t)eigen_nutz
+                                             + off_a2a);
+
+    // VEK nur, wenn ALLES ausgerichtet ist: beide Grundadressen und jeder
+    // Blockversatz. Ein einziger schiefer Versatz macht den 128-Bit-Ladebefehl
+    // ungueltig, und "meistens ausgerichtet" gibt es nicht.
+    int vek = (((uintptr_t)inp.data_ptr() % 16) == 0 &&
+               ((uintptr_t)out.data_ptr() % 16) == 0) ? 1 : 0;
+    long long pakete = 0;
+    for (int z = 0; z < R; ++z) {
+        A.sendOff[z] = (long long)send_off[z];
+        A.sendLen[z] = (long long)send_len[z];
+        A.recvOff[z] = (long long)recv_off[z];
+        A.recvLen[z] = (long long)recv_len[z];
+        if ((send_off[z] % 16) || (recv_off[z] % 16)) vek = 0;
+        if (z != r) pakete += (A.sendLen[z] + 15LL) / 16LL;
+    }
+    for (int z = 0; z < R; ++z) {
+        if (z == r) continue;
+        A.zielBasis[z] = (unsigned char *)((char *)(uintptr_t)peer_nutz[z]
+                                           + off_a2a);
+        // Eine Flaggenzeile je (Schritt=0, Sender). Ich schreibe beim
+        // Empfaenger in MEINE Zeile und lese bei mir DESSEN Zeile.
+        A.flagAn[z]  = (u64 *)((char *)(uintptr_t)peer_flag[z] +
+                               fbasis_a2a + (size_t)r * 256u);
+        A.flagVon[z] = (const u64 *)((char *)(uintptr_t)eigen_flag +
+                                     fbasis_a2a + (size_t)z * 256u);
+    }
+
+    auto strom = at::cuda::getCurrentCUDAStream().stream();
+    starteA2a(vek, (int)kern, (int)ladeform, A, (int)threads, pakete, strom);
+}
 """
 
 _CPP_SRC = """
@@ -873,6 +1308,20 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
                      int64_t ladeform, int64_t fluss);
+
+void bar1_all_to_all(at::Tensor inp, at::Tensor out,
+                     int64_t rank, int64_t world,
+                     std::vector<int64_t> send_off,
+                     std::vector<int64_t> send_len,
+                     std::vector<int64_t> recv_off,
+                     std::vector<int64_t> recv_len,
+                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_flag,
+                     int64_t eigen_nutz, int64_t eigen_flag,
+                     int64_t schlitz, int64_t off_a2a, int64_t fbasis_a2a,
+                     at::Tensor runde_dev, at::Tensor ctl_dev,
+                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
+                     int64_t ladeform);
 """
 
 
@@ -1145,7 +1594,7 @@ def lade_kollektiv_ext(cpu_group):
             name=name,
             cpp_sources=_CPP_SRC,
             cuda_sources=_CUDA_SRC,
-            functions=["bar1_all_reduce"],
+            functions=["bar1_all_reduce", "bar1_all_to_all"],
             extra_cuda_cflags=flags or None,
             verbose=False,
             build_directory=str(build_dir) if build_dir is not None else None,

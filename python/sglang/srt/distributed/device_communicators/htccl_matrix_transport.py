@@ -71,18 +71,21 @@ def _fenster_bytes() -> int:
 class HTCCLMatrixTransport:
     """Zusammengesetzter Transport: Plan + Unterpfad je Operation und Groesse.
 
-    Heute gibt es genau **einen** Unterpfad (BAR1) und genau **eine**
-    Operation (``all_reduce``). Das ist die ehrliche Fassung: NIC- und
-    System-RAM-Kanten je gerichteter Kante zu mischen ist entworfen
+    Heute gibt es genau **einen** Unterpfad (BAR1) und zwei Operationen
+    (``all_reduce``, ``all_to_all_single``). Das ist die ehrliche Fassung:
+    NIC- und System-RAM-Kanten je gerichteter Kante zu mischen ist entworfen
     (``ENTWURF_PFADMATRIX.md``), aber nicht gemessen, und ein
     Auswahlgeruest fuer Pfade, die es nicht gibt, waere eine Attrappe.
 
-    Die Auswahl, die es wirklich gibt, ist die zwischen den **Kernen**:
-    ``netz`` oder ``ring`` je Groesse, aus dem Plan statt aus einer
-    eingebauten Zahl.
+    Die Auswahl, die es wirklich gibt, ist die zwischen den **Kernen** von
+    ``all_reduce``: ``netz`` oder ``ring`` je Groesse, aus dem Plan statt
+    aus einer eingebauten Zahl. ``all_to_all`` hat keine solche Wahl -- es
+    gibt genau einen Weg -- und wird deshalb ungeplant durchgereicht.
     """
 
-    HTCCL_OPS: frozenset = frozenset({"all_reduce"})
+    HTCCL_OPS: frozenset = frozenset(
+        {"all_reduce", "all_to_all", "all_to_all_single"}
+    )
 
     def __init__(self, cpu_group, device):
         import torch.distributed as dist
@@ -163,13 +166,40 @@ class HTCCLMatrixTransport:
         return self.bar1.handles(op, nbytes)
 
     def htccl_all_reduce(self, comm, inp):
+        self._muss_stehen()
+        return self.bar1.htccl_all_reduce(comm, inp)
+
+    # -- all_to_all --------------------------------------------------------
+    #
+    # Der Planer hat dazu NICHTS zu sagen: er waehlt zwischen den
+    # all_reduce-Zerlegungen (netz/ring/stern/hierarchisch), und all_to_all
+    # hat keine Zerlegung -- es gibt genau einen Weg, jeder schreibt jedem
+    # seinen Block. Deshalb wird hier nur durchgereicht, ohne dass der Plan
+    # gefragt wuerde. Eine Planzeile fuer eine Wahl, die es nicht gibt, waere
+    # eine Attrappe.
+
+    def traegt_a2a(self, groesster_block: int) -> bool:
+        if self.bar1 is None:
+            return False
+        return self.bar1.traegt_a2a(groesster_block)
+
+    def a2a_schlitz_bytes(self) -> int:
+        return 0 if self.bar1 is None else self.bar1.a2a_schlitz_bytes()
+
+    def htccl_all_to_all_single(self, comm, output, inp, sende_bytes,
+                                empfangs_bytes):
+        self._muss_stehen()
+        return self.bar1.htccl_all_to_all_single(
+            comm, output, inp, sende_bytes, empfangs_bytes
+        )
+
+    def _muss_stehen(self) -> None:
         if self.bar1 is None:
             raise NotImplementedError(
                 "Der Matrix-Transport hat heute genau einen Unterpfad (BAR1), "
                 "und der steht nicht. Erreichbar ist diese Zeile nur, wenn "
                 "jemand handles() umgangen hat."
             )
-        return self.bar1.htccl_all_reduce(comm, inp)
 
     def close(self) -> None:
         if self.bar1 is not None:

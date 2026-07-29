@@ -225,6 +225,29 @@ def _build_transport(name: str, cpu_group, device, disabled: bool):
         return None
 
 
+def _zeilen_bytes(t: torch.Tensor) -> int:
+    """Bytes einer Zeile entlang Achse 0. Fuer 1-D ist das ein Element."""
+    n = 1
+    for d in t.shape[1:]:
+        n *= int(d)
+    return n * t.element_size()
+
+
+def _gruppen_max(wert: int, cpu_group) -> int:
+    """Maximum ueber die Gruppe, auf der CPU.
+
+    Nur fuer den Fall gedacht, dass der Aufrufer BEIDE Teilgroessenlisten
+    selbst mitbringt: dann kennt kein Rang die Bloecke der anderen Paare,
+    und die Schlitzentscheidung muss trotzdem rangeinheitlich ausfallen.
+    Ein int64 ueber gloo -- messbar teuer im Verhaeltnis zu einem
+    MoE-Dispatch, aber billiger als ein Haenger, und der gleichverteilte
+    Fall braucht es gar nicht.
+    """
+    t = torch.tensor([int(wert)], dtype=torch.int64)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=cpu_group)
+    return int(t.item())
+
+
 class HTCCLCommunicator:
     """Host-staged collectives over the group's gloo CPU process group."""
 
@@ -472,6 +495,195 @@ class HTCCLCommunicator:
         chunk = moved.shape[0] // self.world_size
         shard = moved[self.rank * chunk : (self.rank + 1) * chunk]
         return shard.movedim(0, dim).contiguous()
+
+    # ------------------------------------------------------------------
+    # all_to_all_single
+    #
+    # WER DAS WIRKLICH RUFT -- nachgesehen, nicht angenommen:
+    #
+    # * `GroupCoordinator.all_to_all_single(output, input)`
+    #   (parallel_state.py:1199 -> :1196) ist die EINZIGE
+    #   torch.distributed-a2a-Stelle im ganzen srt-Baum. Sie ist
+    #   ausser-Ort, gleichverteilt, ohne Teilgroessen, ohne
+    #   scatter/gather-Achse -- und sie hat heute keinen Aufrufer
+    #   (Upstream-Oberflaeche aus #27492).
+    # * Die MoE-Token-Dispatcher rufen NICHT hierher. deepep.py:578
+    #   `buffer.dispatch(...)`, mooncake.py:236, nixl.py:293, moriep.py:724
+    #   und flashinfer.py:259 `moe_a2a.dispatch(...)` gehen an
+    #   torch.distributed vorbei in ihre eigenen Bibliotheken. Deren
+    #   Semantik ist aber genau die ungleich geteilte: sie reichen
+    #   `num_tokens_per_rank`/`num_tokens_per_expert` herein, weil die Zahl
+    #   der Token je Experte schwankt.
+    #
+    # Daraus folgt die Signatur hier: die von `torch.distributed.
+    # all_to_all_single`, also die gleichverteilte Form des einzigen echten
+    # Aufrufers PLUS die Teilgroessen, ohne die MoE nicht abbildbar waere.
+    # Geraten ist daran nichts -- die gleichverteilte Form ist ein
+    # Sonderfall (beide Listen None) und laeuft denselben Weg.
+    # ------------------------------------------------------------------
+
+    def all_to_all_zaehlwerte(self, input_split_sizes) -> list[list[int]]:
+        """Die volle R x R Zaehlwertmatrix aus den eigenen Sendezahlen.
+
+        ``matrix[i][j]`` = was Rang i an Rang j schickt. Ein
+        ``all_gather_object`` ueber die CPU-Gruppe -- genau der Schritt, den
+        DeepEP vor dem Dispatch macht (``get_dispatch_layout`` ->
+        ``num_tokens_per_rank``), und aus demselben Grund: der Empfaenger
+        kann seine Puffergroesse nicht kennen, bevor der Sender gezaehlt hat.
+
+        Das ist ein **Host-Kollektiv**. Es steht vor dem Datenpfad, nicht
+        darin, und es ist der Grund, warum der ungleich geteilte Fall nicht
+        CUDA-Graph-faehig ist. Der gleichverteilte Fall braucht ihn nicht
+        und ist es deshalb.
+        """
+        matrix: list = [None] * self.world_size
+        dist.all_gather_object(
+            matrix, [int(x) for x in input_split_sizes], group=self.cpu_group
+        )
+        return [[int(v) for v in row] for row in matrix]  # type: ignore[union-attr]
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        output_split_sizes=None,
+        input_split_sizes=None,
+    ) -> torch.Tensor:
+        """``torch.distributed.all_to_all_single`` ueber HTCCL.
+
+        Teilt ``input_`` entlang Achse 0 in ``world_size`` Bloecke, schickt
+        Block j an Rang j und legt die empfangenen Bloecke in derselben
+        Reihenfolge in ``output`` ab. ``output`` wird beschrieben und
+        zurueckgegeben.
+
+        ``*_split_sizes`` sind **Zeilenzahlen**, nicht Bytes -- wie bei
+        torch. ``None`` heisst gleichverteilt. Ist nur
+        ``input_split_sizes`` gegeben, werden die Empfangszahlen ueber
+        :meth:`all_to_all_zaehlwerte` beschafft; ``output`` muss dann
+        bereits gross genug sein.
+        """
+        if self.disabled:
+            output.copy_(input_)
+            return output
+        inp = input_.contiguous()
+        if inp.dim() == 0 or output.dim() == 0:
+            raise ValueError("all_to_all_single braucht mindestens eine Achse")
+
+        zeile_elems = 1
+        for d in inp.shape[1:]:
+            zeile_elems *= int(d)
+        zeile_bytes = zeile_elems * inp.element_size()
+        if zeile_bytes != _zeilen_bytes(output):
+            raise ValueError(
+                f"all_to_all_single: Zeilenbreite passt nicht -- Eingabe "
+                f"{zeile_bytes} Byte, Ausgabe {_zeilen_bytes(output)} Byte. "
+                f"Nur Achse 0 wird geteilt."
+            )
+
+        w = self.world_size
+        # Die Zaehlwerte. Reihenfolge: erst besorgen, was der RUECKFALL auch
+        # braucht -- sonst haengt an der Transportwahl, ob ein Kollektiv
+        # laeuft, und das ist genau die Sorte Rangabhaengigkeit, die haengt.
+        matrix = None
+        if input_split_sizes is None:
+            if inp.shape[0] % w:
+                raise ValueError(
+                    f"all_to_all_single ohne input_split_sizes braucht eine "
+                    f"durch {w} teilbare Achse 0, hat aber {inp.shape[0]}."
+                )
+            ein = [inp.shape[0] // w] * w
+        else:
+            ein = [int(x) for x in input_split_sizes]
+            if len(ein) != w or sum(ein) != inp.shape[0]:
+                raise ValueError(
+                    f"input_split_sizes {ein} passt nicht zu Achse 0 = "
+                    f"{inp.shape[0]} bei {w} Raengen."
+                )
+        if output_split_sizes is None:
+            if input_split_sizes is None:
+                if output.shape[0] % w:
+                    raise ValueError(
+                        f"all_to_all_single ohne output_split_sizes braucht "
+                        f"eine durch {w} teilbare Achse 0 der Ausgabe, hat "
+                        f"aber {output.shape[0]}."
+                    )
+                aus = [output.shape[0] // w] * w
+            else:
+                matrix = self.all_to_all_zaehlwerte(ein)
+                aus = [matrix[i][self.rank] for i in range(w)]
+        else:
+            aus = [int(x) for x in output_split_sizes]
+            if len(aus) != w:
+                raise ValueError(f"output_split_sizes hat Laenge {len(aus)}")
+        if sum(aus) > output.shape[0]:
+            raise ValueError(
+                f"Ausgabe traegt {output.shape[0]} Zeilen, empfangen werden "
+                f"aber {sum(aus)}."
+            )
+
+        sende = [n * zeile_bytes for n in ein]
+        empf = [n * zeile_bytes for n in aus]
+        nbytes = sum(sende)
+
+        t = self._select("all_to_all", nbytes)
+        if t is not None and not (
+            hasattr(t, "htccl_all_to_all_single") and hasattr(t, "traegt_a2a")
+        ):
+            # handles() hat zugesagt, aber die Methoden fehlen. Das ist ein
+            # Fehler IM TRANSPORT und kein Laufzeitzustand: er faellt auf
+            # jedem Rang gleich aus, weil die Klasse rangeinheitlich ist.
+            # Also ist der Rueckfall sicher -- und die Warnung nennt den
+            # Schuldigen, statt ihn im Rueckfall verschwinden zu lassen.
+            logger.warning(
+                "HTCCL: Transport %s sagt handles('all_to_all') zu, hat aber "
+                "keine htccl_all_to_all_single/traegt_a2a. Es laeuft die "
+                "CPU-Ebene.", type(t).__name__,
+            )
+            t = None
+        if t is not None:
+            # Die genaue Schlitzpruefung braucht den groessten Block ueber
+            # ALLE Paare, nicht ueber die eigene Zeile -- sonst koennte ein
+            # Rang zusagen und ein anderer absagen, und daraus wird ein
+            # Haenger statt eines Fehlers. Gleichverteilt ist das Maximum auf
+            # jedem Rang dieselbe Zahl und es braucht kein Kollektiv; sonst
+            # kommt es aus der Zaehlwertmatrix oder, wenn der Aufrufer beide
+            # Listen selbst mitgebracht hat, aus einem Maximum ueber die
+            # Gruppe.
+            if input_split_sizes is None and output_split_sizes is None:
+                groesster = max(sende + empf)
+            elif matrix is not None:
+                groesster = max(max(z) for z in matrix) * zeile_bytes
+            else:
+                groesster = _gruppen_max(
+                    max(sende + empf), self.cpu_group
+                )
+            if t.traegt_a2a(groesster):
+                return t.htccl_all_to_all_single(self, output, inp, sende, empf)
+
+        # Rueckfall: dieselbe Zerlegung ueber die CPU-Gruppe. Gepinnt, damit
+        # die beiden Kopien nicht ueber einen pageable-Zwischenpuffer laufen.
+        host_in = torch.empty(inp.shape, dtype=inp.dtype, pin_memory=True)
+        host_in.copy_(inp, non_blocking=False)
+        host_out = torch.empty(
+            (sum(aus),) + tuple(output.shape[1:]),
+            dtype=output.dtype, pin_memory=True,
+        )
+        try:
+            dist.all_to_all_single(
+                host_out, host_in,
+                output_split_sizes=aus, input_split_sizes=ein,
+                group=self.cpu_group,
+            )
+        except (RuntimeError, NotImplementedError) as e:
+            raise NotImplementedError(
+                f"all_to_all_single: weder der BAR1-Direktpfad noch die "
+                f"CPU-Ebene der Gruppe koennen diesen Aufruf fahren ({e}). "
+                f"Kein stiller Rueckfall auf NCCL: auf einer Gruppe ueber "
+                f"zwei Hersteller ist das kein langsamerer Weg, sondern ein "
+                f"Haenger."
+            ) from e
+        output[: sum(aus)].copy_(host_out, non_blocking=False)
+        return output
 
     # ------------------------------------------------------------------
     # out-parameter forms

@@ -108,12 +108,39 @@ rechnen zusaetzlich ``float16`` und ``bfloat16``, weil die Zugriffsbreite
 die Deutung der 16 Byte sich aendert. Eine Zeitmessung dafuer gibt es
 nicht.
 
+``all_to_all``
+--------------
+``all_to_all_single`` laeuft ueber einen **dritten** Kern (``a2a``), der in
+der Sonde keine Entsprechung hat und deshalb nicht portiert, sondern neu
+geschrieben ist. Rang r schreibt seinen Block fuer Rang j direkt in dessen
+Empfangsschlitz -- ein Schritt, alle Sendevorgaenge im selben flachen
+Indexraum, dann **eine** Sperre. Kein Host-Umweg, kein Nachmappen.
+
+Drei Eigenschaften, die ihn von ``all_reduce`` unterscheiden:
+
+* **Keine Reduktion, also kein Datentyp.** Der Kern bewegt Bytes. fp8,
+  bf16, int32, uint8 -- ein Pfad. Dass die sm_86-Karten keine
+  fp8-Umwandlungsbefehle haben (die beginnen bei sm_89), ist hier
+  gegenstandslos.
+* **Ungleiche Teilgroessen sind der Normalfall.** Die Zahl der Token je
+  Experte schwankt; ``sende_bytes``/``empfangs_bytes`` kommen je Rang
+  herein. Passt ein Block nicht in einen Schlitz, meldet sich der
+  Transport ueber ``traegt_a2a`` ab, statt zu scheitern.
+* **Doppelte Schlitze statt zweiter Sperre.** ``2(R-1)`` Schlitze, die
+  Rundennummer waehlt die Haelfte. Begruendung bei ``geometrie`` und beim
+  Kern.
+
+**Ungemessen.** Es gibt fuer diesen Kern bis heute **keine einzige
+Zeitmessung** -- nur den Byte-Beleg (``byte_beleg_a2a``, gleichverteilt und
+schief, jedes Byte, jedes gerichtete Paar). Die Tabelle oben gilt fuer
+``all_reduce`` und ausschliesslich dafuer.
+
 Was hier NICHT drin ist
 -----------------------
 ``all_gather``, ``reduce_scatter`` und ``broadcast``. Sie waeren je eine
-Haelfte der obigen Kernel, aber keine davon ist gemessen -- und in diesem
-Vorhaben zaehlt nur Gemessenes. ``handles`` gibt dafuer ``False`` und die
-``htccl_*``-Methoden erklaeren, was fehlt.
+Haelfte der all_reduce-Kernel, aber keine davon ist gemessen -- und in
+diesem Vorhaben zaehlt nur Gemessenes. ``handles`` gibt dafuer ``False``
+und die ``htccl_*``-Methoden erklaeren, was fehlt.
 """
 
 from __future__ import annotations
@@ -658,24 +685,40 @@ def fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
     raise ValueError(f"unbekannter Algorithmus {algorithmus!r}")
 
 
-def geometrie(welt: int, max_bytes: int) -> dict:
+def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
     """Die Speicherordnung EINER Empfangsregion, fuer beliebiges R.
 
-    Sie traegt beide Verfahren **gleichzeitig**, damit ein Plan je Groesse
-    umschalten kann, ohne dass irgendetwas neu abgebildet wird:
+    Sie traegt alle Verfahren **gleichzeitig**, damit ein Plan je Groesse und
+    je Operation umschalten kann, ohne dass irgendetwas neu abgebildet wird:
 
-    ==========  ================  =========================================
-    Versatz     Inhalt            Groesse
-    ==========  ================  =========================================
-    ``0``       Netz-RS-Schlitze  ``(R-1) * chunk_max``
-    ...         Netz-AG-Schlitze  ``(R-1) * chunk_max``
-    ``off_ring`` Ring-Schlitze    ``2(R-1) * chunk_max``
-    ==========  ================  =========================================
+    ===========  =================  ========================================
+    Versatz      Inhalt             Groesse
+    ===========  =================  ========================================
+    ``0``        Netz-RS-Schlitze   ``(R-1) * chunk_max``
+    ...          Netz-AG-Schlitze   ``(R-1) * chunk_max``
+    ``off_ring`` Ring-Schlitze      ``2(R-1) * chunk_max``
+    ``off_a2a``  a2a-Schlitze       ``2(R-1) * chunk_max``
+    ===========  =================  ========================================
 
     ``chunk_max`` ist auf eine Seite aufgerundet -- ein Schlitz, der auf
     einer Seitengrenze beginnt, kann nie mit dem Nachbarschlitz eine Seite
     teilen, und ein ueberlanger Schreibvorgang trifft dann eine eigene
     Seite statt fremde Nutzlast.
+
+    **Warum a2a 2(R-1) Schlitze braucht und nicht (R-1).** Ein Schlitz je
+    Sender wuerde genuegen, wenn der Sender wuesste, dass der Empfaenger den
+    vorigen Inhalt schon gelesen hat. Die Flagge sagt aber nur
+    "geschrieben". Die Alternativen sind eine zweite Sperre (bei
+    MoE-Groessen die halbe Latenz) oder zwei Haelften, zwischen denen die
+    Rundennummer wechselt. Es sind zwei Haelften; die Begruendung, warum
+    zwei genuegen, steht beim Kernel in ``htccl_bar1_ext.py``.
+
+    **Was das den all_reduce-Weg kostet.** Die Region waechst von
+    ``4(R-1)`` auf ``6(R-1)`` Schlitze, die groesste all_reduce-Nutzlast in
+    einem gegebenen Fenster sinkt also auf zwei Drittel. Keine gemessene
+    Zahl aendert sich dadurch -- nur die Decke, ab der ``handles`` False
+    sagt. Wer sie zurueck will, setzt ``SGLANG_HTCCL_BAR1_A2A=0``; dann ist
+    ``mit_a2a`` False und die Ordnung ist Byte fuer Byte die alte.
     """
     if welt < 2:
         raise ValueError("welt < 2")
@@ -685,28 +728,46 @@ def geometrie(welt: int, max_bytes: int) -> dict:
     schlitze = 2 * (welt - 1)
     off_netz = 0
     off_ring = schlitze * chunk_max
-    region = off_ring + schlitze * chunk_max + SEITE
+    off_a2a = 2 * schlitze * chunk_max
+    region = (3 if mit_a2a else 2) * schlitze * chunk_max + SEITE
     return {
         "chunk_max": chunk_max,
         "off_netz": off_netz,
         "off_ring": off_ring,
+        # -1 heisst ausdruecklich "gibt es nicht" und nicht "liegt bei 0" --
+        # ein Versatz 0 waere der Netz-Bereich.
+        "off_a2a": off_a2a if mit_a2a else -1,
+        "a2a_schlitz": chunk_max if mit_a2a else 0,
         "region_bytes": region,
         "max_bytes": max_bytes,
+        "mit_a2a": bool(mit_a2a),
     }
 
 
-def flaggen_bedarf(welt: int) -> int:
-    """``(2 + 2(R-1)) * R * 256`` Byte.
+def flaggen_bedarf(welt: int, mit_a2a: bool = True) -> int:
+    """``(2 + 2(R-1) [+ 1]) * R * 256`` Byte.
 
     Eine 256-Byte-Zeile je (Topologie, Schritt, Sender): kein False Sharing
     zwischen Sendern, keins zwischen Schritten, keins zwischen Topologien.
-    Netz hat 2 Schritte, Ring ``2(R-1)``. Bei R=8 sind das 32 KiB und damit
-    weit unter einer Allokationsgranularitaet.
+    Netz hat 2 Schritte, Ring ``2(R-1)``, a2a genau **einen**. Bei R=8 sind
+    das 34 KiB und damit weit unter einer Allokationsgranularitaet.
+    """
+    return (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
+
+
+def fbasis_a2a(welt: int) -> int:
+    """Versatz der a2a-Flaggenzeilen in der Flaggenregion.
+
+    Hinter Netz und Ring, damit die beiden gemessenen Topologien Byte fuer
+    Byte dort liegen, wo sie lagen. Dieselbe Rechnung steht im Kernel
+    NICHT noch einmal -- sie wird als Argument hereingereicht, weil eine
+    zweite Fassung genau die Stelle waere, an der Sender und Empfaenger auf
+    verschiedene Zeilen zeigen.
     """
     return (2 + 2 * (welt - 1)) * welt * 256
 
 
-def max_nutzlast(welt: int, region_bytes: int) -> int:
+def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True) -> int:
     """Groesste Nutzlast, deren Schlitze in eine Region dieser Groesse passen.
 
     Umkehrung von :func:`geometrie`. Bewusst konservativ gerundet und
@@ -715,12 +776,12 @@ def max_nutzlast(welt: int, region_bytes: int) -> int:
     """
     if welt < 2 or region_bytes <= SEITE:
         return 0
-    schlitze = 4 * (welt - 1)
+    schlitze = (6 if mit_a2a else 4) * (welt - 1)
     chunk_max = ((region_bytes - SEITE) // schlitze // SEITE) * SEITE
     if chunk_max <= 0:
         return 0
     n = (chunk_max // 16) * welt * 16
-    while n > 0 and geometrie(welt, n)["region_bytes"] > region_bytes:
+    while n > 0 and geometrie(welt, n, mit_a2a)["region_bytes"] > region_bytes:
         n -= welt * 16
     return n
 
@@ -886,9 +947,18 @@ class HTCCLBar1Transport:
     ``False`` -- ohne Ausnahme, ohne Notpfad.
     """
 
-    #: Nur all_reduce. all_gather/reduce_scatter/broadcast waeren je eine
-    #: Haelfte derselben Kerne, sind aber nicht gemessen.
-    HTCCL_OPS: frozenset = frozenset({"all_reduce"})
+    #: all_reduce (gemessen) und all_to_all (eigener Kern, ungemessen).
+    #: all_gather/reduce_scatter/broadcast waeren je eine Haelfte der
+    #: all_reduce-Kerne, sind aber weder portiert noch gemessen.
+    #:
+    #: Beide Schreibweisen von all_to_all stehen hier, weil die Naht in
+    #: htccl.py die Operation unter dem Namen ``all_to_all`` fragt, waehrend
+    #: der einzige echte Aufrufer in sglang (GroupCoordinator, equal split)
+    #: ``all_to_all_single`` heisst. Zwei Namen, ein Weg -- besser als eine
+    #: Umbenennung an der Nahtstelle, die man beim Lesen uebersieht.
+    HTCCL_OPS: frozenset = frozenset(
+        {"all_reduce", "all_to_all", "all_to_all_single"}
+    )
 
     def __init__(self, cpu_group, device, fenster_bytes: int,
                  aktiviert: Optional[bool] = None):
@@ -963,6 +1033,22 @@ class HTCCLBar1Transport:
         )
         self.min_bytes = int(os.environ.get("SGLANG_HTCCL_BAR1_MIN_BYTES", "4096"))
         self.max_bytes = 0
+        # all_to_all belegt einen dritten Schlitzsatz in derselben Region und
+        # kostet damit ein Drittel der groessten all_reduce-Nutzlast (siehe
+        # `geometrie`). Rangeinheitlich wie jede andere SGLANG_HTCCL*-Variable;
+        # 0 stellt die alte Speicherordnung Byte fuer Byte wieder her.
+        self.a2a_an = os.environ.get("SGLANG_HTCCL_BAR1_A2A", "1") not in (
+            "0", "nein", "aus", "false"
+        )
+        #: Erst nach `byte_beleg_a2a` gueltig. Ohne bestandenen Beleg meldet
+        #: sich all_to_all ab -- all_reduce bleibt davon unberuehrt.
+        self._a2a_beleg = False
+        #: Untergrenze fuer all_to_all. Bewusst NICHT `min_bytes` (4096): der
+        #: Reiz von a2a ueber BAR1 liegt gerade bei den kleinen
+        #: MoE-Dispatchbloecken. 16 Byte = ein Paket.
+        self.a2a_min_bytes = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_A2A_MIN_BYTES", "16")
+        )
         try:
             self._baue_auf()
         except BaseException:
@@ -1048,7 +1134,7 @@ class HTCCLBar1Transport:
 
         # 1. Speicherordnung. Aus dem Fenster, das der Aufrufer bewilligt,
         # folgt die groesste Nutzlast -- nicht umgekehrt.
-        max_bytes = max_nutzlast(self.welt, self.fenster_bytes)
+        max_bytes = max_nutzlast(self.welt, self.fenster_bytes, self.a2a_an)
         if max_bytes < self.min_bytes:
             raise Bar1Unverfuegbar(
                 f"Fenster von {self.fenster_bytes // 1024} KiB traegt bei "
@@ -1056,10 +1142,10 @@ class HTCCLBar1Transport:
                 f"Mindestgroesse ist {self.min_bytes}. 4(R-1) Schlitze zu je "
                 f"ceil(N/R) muessen hineinpassen."
             )
-        self._geo = geometrie(self.welt, max_bytes)
+        self._geo = geometrie(self.welt, max_bytes, self.a2a_an)
         self.max_bytes = max_bytes
         region = self._geo["region_bytes"]
-        flaggen = flaggen_bedarf(self.welt)
+        flaggen = flaggen_bedarf(self.welt, self.a2a_an)
 
         # 2. Zwei Empfangsregionen, zwei Exporte. Getrennt, weil die Sonde
         # sie getrennt vermessen hat.
@@ -1131,7 +1217,10 @@ class HTCCLBar1Transport:
             "Byte, Export ueber %s. Ab hier wird im heissen Pfad nichts mehr "
             "gemappt.",
             dauer * 1000, len(self._peers), region / 2**20,
-            f"{4 * (self.welt - 1)} Schlitze", self._geo["chunk_max"] // 1024,
+            f"{(6 if self.a2a_an else 4) * (self.welt - 1)} Schlitze"
+            + (" (davon 2(R-1) fuer all_to_all)" if self.a2a_an
+               else ", all_to_all abgeschaltet"),
+            self._geo["chunk_max"] // 1024,
             max_bytes // 1024, flaggen, weg,
         )
 
@@ -1142,7 +1231,7 @@ class HTCCLBar1Transport:
                                   self._geo["region_bytes"])
         try:
             flag = self._binde_region(peer, ziel_bdf, fremde_fds[1], "Flaggen",
-                                      flaggen_bedarf(self.welt))
+                                      flaggen_bedarf(self.welt, self.a2a_an))
         except BaseException:
             # Die schon gebundene Nutzlastregion wieder los: sie steht noch
             # in keinem PeerZiel und wuerde von close() nicht gefunden.
@@ -1540,6 +1629,8 @@ class HTCCLBar1Transport:
             return False
         if not self._belege_stehen:
             return False
+        if op in ("all_to_all", "all_to_all_single"):
+            return self._handles_a2a(nbytes)
         if nbytes < self.min_bytes or nbytes > self.max_bytes:
             return False
         if nbytes % 16 != 0:
@@ -1616,6 +1707,286 @@ class HTCCLBar1Transport:
         )
         return out
 
+    # -- all_to_all --------------------------------------------------------
+
+    def _handles_a2a(self, nbytes: int) -> bool:
+        """Die GROBE Antwort der Naht fuer ``all_to_all``.
+
+        Sie kennt nur die Gesamtgroesse, nicht die Teilgroessen -- also
+        prueft sie den gleichverteilten Fall. Fuer ungleiche Teilgroessen
+        (bei MoE der Normalfall) entscheidet :meth:`traegt_a2a`, sobald die
+        Zaehlwerte feststehen. Beide Antworten sind rangeinheitlich: diese
+        haengt nur an gruppenweit abgeglichenen Groessen, jene an einem Wert,
+        den der Aufrufer gruppenweit maximiert hereinreicht.
+        """
+        if not self.a2a_an or not self._a2a_beleg:
+            return False
+        geo = self._geo
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+            return False
+        if nbytes < self.a2a_min_bytes:
+            return False
+        if -(-nbytes // self.welt) > geo["a2a_schlitz"]:
+            return False
+        # Derselbe Fensterbegriff wie bei all_reduce: gegen die gruppenweit
+        # KLEINSTE tatsaechlich abgebildete Laenge, nicht gegen die
+        # angeforderte. Redundant, solange der Aufbau durchgelaufen ist --
+        # und genau deshalb billig.
+        if geo["region_bytes"] > self._fenster_minimum:
+            return False
+        return True
+
+    def a2a_schlitz_bytes(self) -> int:
+        """Groesster Block, den EIN gerichtetes Paar tragen kann. 0 = kein a2a."""
+        if not self.a2a_an or not self._a2a_beleg:
+            return 0
+        return int(self._geo.get("a2a_schlitz", 0))
+
+    def traegt_a2a(self, groesster_block: int) -> bool:
+        """Passt der groesste Block ueber ALLE Paare in einen Schlitz?
+
+        ``groesster_block`` muss ein **gruppenweit identischer** Wert sein --
+        das Maximum ueber alle R*R Bloecke, nicht ueber die eigene Zeile.
+        Rechnet ihn jeder Rang nur aus seinen eigenen Teilgroessen, kann ein
+        Rang ins Kollektiv laufen und ein anderer in den Rueckfall, und das
+        Ergebnis ist ein Haenger statt eines Fehlers. Der Aufrufer
+        (``HTCCLCommunicator.all_to_all_single``) maximiert vorher ueber die
+        Gruppe; genau das ist der Grund, warum diese Pruefung nicht in
+        ``handles`` liegt.
+        """
+        if not self.a2a_an or not self._a2a_beleg or not self._auf:
+            return False
+        if groesster_block < 0:
+            return False
+        return groesster_block <= int(self._geo.get("a2a_schlitz", 0))
+
+    def htccl_all_to_all_single(self, comm, output, inp,
+                                sende_bytes, empfangs_bytes):
+        """``all_to_all_single`` ueber den Direktpfad. Ein Schritt, eine Sperre.
+
+        ``sende_bytes[j]`` ist der Block, der an Rang ``j`` geht,
+        ``empfangs_bytes[i]`` der, der von Rang ``i`` kommt -- beides in
+        **Byte**, nicht in Zeilen und nicht in Elementen. Der Kernel bewegt
+        Bytes: es gibt keine Reduktion, also keinen Datentyp. fp8, bf16,
+        int32, uint8 laufen denselben Weg, und die fehlenden
+        fp8-Umwandlungsbefehle der sm_86-Karten sind hier gegenstandslos.
+
+        Der Aufrufer haftet dafuer, dass ``empfangs_bytes[i]`` auf diesem
+        Rang gleich ``sende_bytes[rang]`` auf Rang ``i`` ist. Die Erweiterung
+        prueft, was sie lokal pruefen kann (Puffergrenzen, Schlitzgrenze,
+        eigener Block), aber nicht die Uebereinstimmung ueber die Gruppe --
+        dafuer muesste sie ein Kollektiv fahren, und das waere genau der
+        Host-Sync, den dieser Pfad vermeidet.
+        """
+        if not self._auf or self._ext is None or not self.a2a_an:
+            raise Bar1Unverfuegbar(
+                "htccl_all_to_all_single ohne aufgebauten a2a-Bereich -- "
+                "erreichbar nur, wenn jemand handles() umgangen hat."
+            )
+        R = self.welt
+        if len(sende_bytes) != R or len(empfangs_bytes) != R:
+            raise Bar1Unverfuegbar(
+                f"Teilgroessen haben Laenge {len(sende_bytes)}/"
+                f"{len(empfangs_bytes)}, erwartet sind {R}."
+            )
+        inp = inp.contiguous()
+        if not output.is_contiguous():
+            raise Bar1Unverfuegbar("Ausgabepuffer ist nicht zusammenhaengend")
+
+        sende_off, s = [], 0
+        for n in sende_bytes:
+            sende_off.append(s)
+            s += int(n)
+        empf_off, e = [], 0
+        for n in empfangs_bytes:
+            empf_off.append(e)
+            e += int(n)
+
+        # Der cooperative Mehrblockstart lohnt sich nach derselben Schwelle
+        # wie bei all_reduce -- gemessen ist sie DORT und nur dort; hier ist
+        # sie uebernommen, nicht bestaetigt. Massgeblich ist, was wirklich
+        # ueber PCIe geht, also ohne den eigenen Block.
+        bewegt = sum(int(n) for j, n in enumerate(sende_bytes) if j != self.rank)
+        kern = 1 if bewegt >= self.gitter_ab else 0
+
+        peer_nutz = [0] * R
+        peer_flag = [0] * R
+        for rr, z in self._peers.items():
+            peer_nutz[rr] = z.nutz.dev_ptr
+            peer_flag[rr] = z.flag.dev_ptr
+        peer_nutz[self.rank] = self._eigen[0]
+        peer_flag[self.rank] = self._eigen_flag[0]
+
+        self._ext.bar1_all_to_all(
+            inp, output, int(self.rank), int(R),
+            [int(x) for x in sende_off], [int(x) for x in sende_bytes],
+            [int(x) for x in empf_off], [int(x) for x in empfangs_bytes],
+            peer_nutz, peer_flag,
+            int(self._eigen[0]), int(self._eigen_flag[0]),
+            int(self._geo["a2a_schlitz"]), int(self._geo["off_a2a"]),
+            int(fbasis_a2a(R)),
+            self._runde_dev, self._ctl_dev,
+            int(self.deckel_zyklen), int(self.threads), int(kern),
+            int(self.ladeform),
+        )
+        return output
+
+    @staticmethod
+    def _a2a_marke(quelle: int, ziel: int) -> int:
+        """Ein je gerichtetem Paar verschiedenes Byte, nie 0x00 und nie 0xFF.
+
+        ``0x40 | (quelle*8 + ziel)`` -- fuer R <= 8 ist ``quelle*8+ziel``
+        injektiv und passt in 6 Bit. 0xFF ist die Vorbelegung des
+        Ausgabepuffers, 0x00 die des Empfangsschlitzes; beide sind damit
+        vom Muster unterscheidbar, und ein NICHT geschriebener Block faellt
+        als solcher auf statt zufaellig wie ein Treffer auszusehen.
+        """
+        return 0x40 | ((quelle * 8 + ziel) & 0x3F)
+
+    def byte_beleg_a2a(self) -> bool:
+        """Byte-Beleg fuer ``all_to_all``: jedes Byte, jedes gerichtete Paar.
+
+        Zwei Durchgaenge ueber den ECHTEN Kernel -- nicht ueber ``put``, denn
+        was belegt werden soll, ist der Weg, den die Kollektive nehmen,
+        einschliesslich Schlitzwahl, Haelftenwahl und Sperre:
+
+        1. **gleichverteilt** -- jeder Block gleich gross, alle Versaetze
+           16-Byte-ausgerichtet. Das ist der Vektorpfad des Kernels.
+        2. **schief und krumm** -- Blocklaengen ``block*(1+((q+z)%3)) +
+           ((q*5+z*3)%7)``. Der Faktor macht die Teilgroessen ungleich (der
+           MoE-Normalfall), der Summand macht sie zu Nicht-Vielfachen von 16
+           und schiebt damit jeden folgenden Versatz aus der Ausrichtung --
+           genau der Restpfad, der sonst nie liefe und in dem die letzten
+           Bytes eines Blocks liegen.
+
+        Geprueft wird auf der EMPFANGENDEN Karte gegen den lokalen
+        Ausgabepuffer, Byte fuer Byte, fuer jeden Sender einzeln -- auch fuer
+        den eigenen Block, der gar nicht ueber die Apertur laeuft (sonst
+        faellt ein vertauschter Versatz nicht auf).
+
+        Faellt der Beleg, meldet sich **nur** ``all_to_all`` ab.
+        ``all_reduce`` benutzt andere Schlitze, andere Flaggenzeilen und
+        einen gemessenen Kernel; es mit abzuschalten waere eine
+        Schlussfolgerung, die die Probe nicht hergibt.
+        """
+        import torch.distributed as dist
+
+        self._a2a_beleg = False
+        if not self.a2a_an:
+            logger.info(
+                "HTCCL-BAR1: all_to_all ist per SGLANG_HTCCL_BAR1_A2A=0 "
+                "abgeschaltet -- kein Byte-Beleg, handles() sagt False."
+            )
+            return False
+        if not self._auf or self._ext is None:
+            return False
+
+        R, r = self.welt, self.rank
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        # Der groesste Block des schiefen Durchgangs ist 3*block+6.
+        block = min(8192, (schlitz - 6) // 3)
+        block = (block // 16) * 16
+        if block <= 0:
+            logger.warning(
+                "HTCCL-BAR1: a2a-Schlitz von %d Byte ist zu klein fuer den "
+                "Byte-Beleg. all_to_all meldet sich ab.", schlitz,
+            )
+            return False
+
+        # Ab hier laeuft der Abgleich ueber die Gruppe IN JEDEM Fall. Ein
+        # Rang, der wegen einer lokalen Ausnahme vor dem all_gather_object
+        # aussteigt, laesst die anderen darin stehen -- aus einem
+        # fehlgeschlagenen Beleg wuerde ein Haenger.
+        ok_lokal = True
+        try:
+            ok_lokal = self._a2a_beleg_durchgaenge(block)
+        except Exception as ex:                # noqa: BLE001
+            ok_lokal = False
+            logger.warning("HTCCL-BAR1: a2a-Byte-Beleg abgebrochen: %r", ex)
+
+        traeger: list[object] = [None] * R
+        dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
+        self._a2a_beleg = all(bool(x) for x in traeger)
+        if not self._a2a_beleg:
+            logger.warning(
+                "HTCCL-BAR1: a2a-Byte-Beleg gruppenweit gefallen (Raenge %s). "
+                "handles('all_to_all') gibt False; all_reduce bleibt "
+                "unberuehrt.",
+                [i for i, x in enumerate(traeger) if not x],
+            )
+        return self._a2a_beleg
+
+    def _a2a_beleg_durchgaenge(self, block: int) -> bool:
+        """Die beiden Probedurchgaenge. Rein lokal, ohne Gruppenabgleich.
+
+        **Beide Durchgaenge laufen immer**, auch wenn der erste gefallen ist.
+        In jedem steckt eine ``dist.barrier``; ein Rang, der nach einem
+        Fehlschlag abkuerzt, laesst die anderen in der naechsten Barriere
+        stehen. Aus einem gefallenen Beleg wuerde ein Haenger -- und ein
+        Haenger sagt nicht, was kaputt ist.
+        """
+        import torch
+        import torch.distributed as dist
+
+        R, r = self.welt, self.rank
+        ok_lokal = True
+        for schief in (False, True):
+
+            def laenge(q: int, z: int) -> int:
+                if not schief:
+                    return block
+                return block * (1 + ((q + z) % 3)) + ((q * 5 + z * 3) % 7)
+
+            sende = [laenge(r, z) for z in range(R)]
+            empf = [laenge(q, r) for q in range(R)]
+            inp = torch.empty(sum(sende), dtype=torch.uint8, device=self.device)
+            o = 0
+            for z in range(R):
+                inp[o:o + sende[z]] = self._a2a_marke(r, z)
+                o += sende[z]
+            out = torch.full((sum(empf),), 0xFF, dtype=torch.uint8,
+                             device=self.device)
+            dist.barrier(group=self.cpu_group)
+            gelaufen = True
+            try:
+                self.htccl_all_to_all_single(None, out, inp, sende, empf)
+                torch.cuda.synchronize(self.device)
+            except Exception as ex:            # noqa: BLE001 -- Grund ins Protokoll
+                logger.warning(
+                    "HTCCL-BAR1: a2a-Byte-Beleg (%s) nicht durchfuehrbar: %r",
+                    "schief" if schief else "gleich", ex,
+                )
+                ok_lokal = False
+                gelaufen = False
+            if not gelaufen:
+                continue
+            rueck = out.cpu()
+            o = 0
+            schlecht_ges = 0
+            for q in range(R):
+                soll = self._a2a_marke(q, r)
+                stueck = rueck[o:o + empf[q]]
+                schlecht = int((stueck != soll).sum().item())
+                if schlecht:
+                    ok_lokal = False
+                    schlecht_ges += schlecht
+                    logger.warning(
+                        "HTCCL-BAR1: a2a-Byte-Beleg %d->%d (%s) GEFALLEN: %d "
+                        "von %d Byte falsch. all_to_all meldet sich ab.",
+                        q, r, "schief" if schief else "gleich", schlecht,
+                        empf[q],
+                    )
+                o += empf[q]
+            if not schlecht_ges:
+                # Auch der bestandene Beleg gehoert ins Protokoll -- er ist
+                # die Aussage, auf der jede spaetere Zeitmessung steht.
+                logger.info(
+                    "HTCCL-BAR1: a2a-Byte-Beleg (%s) bestanden: 0 von %d Byte "
+                    "falsch ueber %d Sender.",
+                    "schief" if schief else "gleich", sum(empf), R,
+                )
+        return ok_lokal
+
     def status(self) -> int:
         """``1``, wenn ein Kernel je das Zeitlimit gerissen hat.
 
@@ -1629,11 +2000,11 @@ class HTCCLBar1Transport:
 
     def _kein_kollektiv(self, comm, inp):
         raise NotImplementedError(
-            "Der BAR1-Transport bietet heute nur all_reduce an. all_gather, "
-            "reduce_scatter und broadcast waeren je eine Haelfte derselben "
-            "Kerne -- gemessen ist keine davon, und in diesem Vorhaben zaehlt "
-            "nur Gemessenes. Erreichbar ist diese Zeile nur, wenn jemand "
-            "handles() umgangen hat."
+            "Der BAR1-Transport bietet heute all_reduce und all_to_all an. "
+            "all_gather, reduce_scatter und broadcast waeren je eine Haelfte "
+            "der all_reduce-Kerne -- gemessen ist keine davon, und in diesem "
+            "Vorhaben zaehlt nur Gemessenes. Erreichbar ist diese Zeile nur, "
+            "wenn jemand handles() umgangen hat."
         )
 
     htccl_all_gather = _kein_kollektiv
@@ -1738,4 +2109,18 @@ def baue_bar1(cpu_group, device, fenster_bytes: int) -> Optional[HTCCLBar1Transp
         logger.info("HTCCL-BAR1: Byte-Beleg nicht durchfuehrbar -- %r", e)
         t.close()
         return None
+    # Und derselbe Grundsatz fuer all_to_all -- eigener Kern, eigene
+    # Schlitze, eigene Flaggenzeilen, also eigener Beleg. Er wird NUR
+    # versucht, wenn der all_reduce-Beleg steht: ein Kollektiv ueber eine
+    # Kante, die schon dort Bytes verloren hat, braucht keine zweite Probe.
+    # Faellt er, bleibt all_reduce trotzdem verfuegbar; deshalb wird der
+    # Transport hier auch nicht abgeraeumt.
+    if t._belege_stehen:
+        try:
+            t.byte_beleg_a2a()
+        except Exception as e:
+            logger.info(
+                "HTCCL-BAR1: a2a-Byte-Beleg nicht durchfuehrbar -- %r. "
+                "all_to_all meldet sich ab, all_reduce laeuft weiter.", e,
+            )
     return t
