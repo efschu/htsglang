@@ -78,6 +78,20 @@ Zusaetzlich, je nach Schritt:
   `offload_register_gpu.json` (steht schon im JSON, nicht neu erzeugen)
 * **s08** — `errors` und `neutrality_violations` aus `dispatcher_tables.json`,
   vollstaendig; beide sind kurz und beide sind der Befund
+* **s10-s12 (Host-Schritte)** — das Serverlog liegt auf dem HOST unter
+  `/root/battery-bar1/`, im Lauf-Verzeichnis stehen nur Grep-Ergebnis und Tail.
+  Also:
+  ```bash
+  cat $S/htccl_lines.txt | head -40        # s11: Aufbau, ERREICHT, Riegel
+  cat $S/belege/*.txt | grep ERREICHT      # s12: Arm-Beleg je Punkt
+  tail -40 $S/server.log                   # begrenzter Tail, nicht das Log
+  ```
+  Dazu je Schritt das eine JSON: `driver_state.json` (`missing` nennt genau,
+  was fehlt), `bar1_e2e.json` (`riegel`, `gruppen`, `graph_check`),
+  `prefill_kurve.json` (`abbruch`, `reihenfolge`, `grundlinie_abweichung_pct`).
+  Bei einem Haenger laufen die py-spy-Dumps auf dem Host und landen als
+  `$S/pyspy-host-*.txt`; die zugehoerigen PIDs stehen in `$S/host_pids`.
+  **Host-Locks mit pruefen** — CT999 und Host haben getrennte `/tmp`.
 
 ## 4. Bei einem Haenger: der Stack, vor dem Kill
 
@@ -97,6 +111,10 @@ nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilizatio
 cat <run>/<schritt>/nvidia-smi-after.csv
 ls -d /tmp/gpu-card-*.lock 2>/dev/null && cat /tmp/gpu-card-*/info 2>/dev/null
 cat /spinning/gpu-arb/holder 2>/dev/null
+# Bei s10-s12 zusaetzlich die HOST-Seite -- eigenes /tmp, eigene Locks:
+ssh -i /root/.ssh/id_root@proxmox -o BatchMode=yes -o ConnectTimeout=10 \
+    root@192.168.0.1 'ls -d /tmp/gpu-card-*.lock 2>/dev/null; \
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader'
 ```
 
 Dazu aus `vram_summary.txt` die **MIN-freien MiB je Karte** ueber den ganzen

@@ -157,10 +157,11 @@ PY
 # go stale, so this runs before every step that touches a card, regardless of
 # what any lock or holder file says.
 battery_assert_corridor() {
-    local bad=0 line idx free
+    local bad=0 seen=0 line idx free
     while IFS=, read -r idx total used; do
         idx="${idx// /}"; total="${total// /}"; used="${used// /}"
         [ -z "$idx" ] && continue
+        seen=$((seen + 1))
         free=$((total - used))
         if [ "$free" -lt "$BATTERY_MIN_FREE_MIB" ]; then
             echo "KORRIDOR: Karte $idx nur $free MiB frei (< $BATTERY_MIN_FREE_MIB)" >&2
@@ -168,6 +169,15 @@ battery_assert_corridor() {
         fi
     done < <(nvidia-smi --query-gpu=index,memory.total,memory.used \
              --format=csv,noheader,nounits 2>/dev/null)
+    # No rows is NOT an empty corridor, it is a blind one. A card step that
+    # starts because nvidia-smi said nothing is the worst of both: it runs, and
+    # nobody knows what it ran on. This case is reachable -- s10 reloads the
+    # host driver, and a container whose device nodes went stale afterwards
+    # reports exactly nothing here.
+    if [ "$seen" -eq 0 ]; then
+        echo "KORRIDOR: nvidia-smi liefert keine Karten-Zeile -- keine Sicht auf die Karten" >&2
+        bad=1
+    fi
     if [ "$bad" != 0 ]; then
         nvidia-smi --query-gpu=index,name,memory.used,memory.total \
             --format=csv,noheader >&2
