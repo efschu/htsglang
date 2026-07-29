@@ -189,6 +189,51 @@ STEPS: Tuple[Step, ...] = (
         needs_cards=True,
         locks="battery",
     ),
+    # --- BAR1 block: runs on the PVE HOST over ssh ---------------------------
+    # These three are a chain, unlike s00-s09: s11 needs the patched driver s10
+    # verified, s12 needs the run s11 proved. Their locks="battery" is the
+    # CONTAINER side; the host-side locks are taken by the step scripts through
+    # battery_host.sh, because CT999 and the host have separate /tmp and
+    # neither sees the other's arbitration.
+    Step(
+        step_id="s10_bar1_driver",
+        title="Gepatchter Treiber + Halter auf dem Host: Regkey, Modul-Identitaet, /dev/dmabuf_holder",
+        model="sonnet",
+        script="s10_bar1_driver.sh",
+        check="check_s10_bar1_driver.py",
+        timeout_s=900,
+        expected_min=6,
+        retryable=True,
+        deps=("s00_preflight",),
+        needs_cards=True,
+        locks="battery",
+    ),
+    Step(
+        step_id="s11_bar1_e2e",
+        title="Standardlauf ueber den BAR1-Direktpfad: beide Gruppen ERREICHT=bar1, Smoke, Riegel",
+        model="sonnet",
+        script="s11_bar1_e2e.sh",
+        check="check_s11_bar1_e2e.py",
+        timeout_s=2700,
+        expected_min=25,
+        retryable=True,
+        deps=("s10_bar1_driver",),
+        needs_cards=True,
+        locks="battery",
+    ),
+    Step(
+        step_id="s12_prefill_kurve",
+        title="Multi-Session-Prefill-Kurve 1/4/8/16, bar1 gegen Grundlinie, verschraenkt",
+        model="sonnet",
+        script="s12_prefill_kurve.sh",
+        check="check_s12_prefill_kurve.py",
+        timeout_s=9000,
+        expected_min=70,
+        retryable=False,
+        deps=("s11_bar1_e2e",),
+        needs_cards=True,
+        locks="battery",
+    ),
 )
 
 STEPS_BY_ID: Dict[str, Step] = {s.step_id: s for s in STEPS}

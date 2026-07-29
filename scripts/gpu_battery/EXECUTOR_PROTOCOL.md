@@ -85,11 +85,13 @@ In dieser Reihenfolge, ohne Abweichung:
 ## 4. Die einzige erlaubte Wiederholung
 
 Nur Schritte, die in `BATTERY.md` als **wiederholbar** markiert sind, duerfen
-**genau einmal** unveraendert erneut laufen: s00, s01, s06, s07, s08, s09.
+**genau einmal** unveraendert erneut laufen: s00, s01, s06, s07, s08, s09, s10,
+s11.
 
 Die vier Boots (s02–s05) sind **nicht wiederholbar**. Jeder Start verbraucht
 ein Boot-Fenster aus einem festen Budget, und ein gescheiterter Boot ist ein
-Ergebnis, kein Unfall.
+Ergebnis, kein Unfall. **s12 ist ebenfalls nicht wiederholbar**: der Schritt
+kostet acht Boots, das ist keine unbeaufsichtigte Entscheidung.
 
 Bedingungen fuer den einen Retry:
 
@@ -145,8 +147,10 @@ Schritt.
 
 ### 6b. Ergebnis-Tabelle (NUR haiku-Schritte — Nutzer-Vorgabe 2026-07-29)
 
-Gilt ausschliesslich fuer die als haiku markierten Schritte (s00, s01, s06,
-s07, s08). Sonnet-Boot-Schritte melden weiterhin nur die eine Zeile aus 6.
+Gilt fuer die als haiku markierten Schritte (s00, s01, s06, s07, s08) und
+**ausnahmsweise auch fuer s12** (siehe 6c — der Nutzer will dieser Messung live
+zusehen). Die uebrigen sonnet-Boot-Schritte melden weiterhin nur die eine Zeile
+aus 6.
 
 Nach jedem haiku-Schritt — und auch ZWISCHEN Runden/Teilmessungen eines
 Schritts, wenn dort bereits Ergebnis-Dateien im Artefakt-Verzeichnis
@@ -167,6 +171,59 @@ der Ergebnisse aus, damit der Nutzer live zusehen kann. Regeln:
   den Kontext ziehen, um Zahlen zu extrahieren.
 - Die Tabelle ersetzt nichts: Verdikt-Zeile (6), Checks und Abbruchregeln
   gelten unveraendert.
+
+### 6c. Live-Tabelle bei s12 (der einzige Hintergrundschritt)
+
+s12 laeuft ueber eine Stunde und schreibt nach **jedem** Sessionzahl-Paar
+`zwischentabelle.md` neu. Damit der Nutzer live mitliest, ist s12 der eine
+Schritt, den du im Hintergrund startest und dessen Tabelle du pollst:
+
+```bash
+BATTERY_RUN=$BATTERY_RUN bash run_step.sh s12    # im Hintergrund starten
+# und dann, mit Abstand (z. B. alle 3-5 min), NUR diese Datei lesen:
+cat "$BATTERY_RUN/s12_prefill_kurve/zwischentabelle.md"
+```
+
+Regeln dabei, alle unveraendert aus 6b: nur ausgeben, wenn die Datei existiert
+und Zeilen hat; reine Darstellung, keine Bewertung, kein Vergleich mit einer
+Erwartung; Quelle ist ausschliesslich diese Datei, **niemals** ein Serverlog.
+Ob die Kurve flach bleibt oder steigt, sagst du **nicht** — das Verdikt kommt
+vom Check, die Deutung vom Leser.
+
+Auch hier gilt: nie zwei Schritte gleichzeitig, und nie unbegrenzt warten. Das
+harte Budget aus der Schritt-Tabelle laeuft im Hintergrundlauf weiter.
+
+## 6d. Die drei Host-Schritte (s10-s12)
+
+Diese Schritte steuern den PVE-Host ueber ssh. Was das fuer dich aendert:
+
+* **Zwei Lock-Namensraeume.** Du pruefst am Ende **beide**:
+  ```bash
+  ls -d /tmp/gpu-card-*.lock 2>/dev/null || echo "Container: keine Locks"
+  ssh -i /root/.ssh/id_root@proxmox -o BatchMode=yes -o ConnectTimeout=10 \
+      root@192.168.0.1 'ls -d /tmp/gpu-card-*.lock 2>/dev/null' \
+      || echo "Host: keine Locks"
+  ```
+  Fremde Locks werden auf **keiner** Seite gebrochen.
+* **Jedes ssh mit Frist.** Kein `ssh` ohne `timeout`/`ConnectTimeout`, kein
+  `curl` ohne `-m`. Die Skripte halten sich daran; wenn du selbst eine Zeile
+  absetzt, auch.
+* **py-spy laeuft auf dem HOST**, vor jedem Kill:
+  ```bash
+  ssh -i /root/.ssh/id_root@proxmox -o BatchMode=yes root@192.168.0.1 \
+    '/spinning/subvol-999-disk-0/spinning/htsglang-gpu/.venv/bin/py-spy dump --pid <pid>'
+  ```
+  Die PIDs, die ein Schritt gestartet hat, stehen in
+  `<schritt>/host_pids`. Nur diese, nie ein Muster.
+* **Logs bleiben auf dem Host** (`/root/battery-bar1/`). Die Checks lesen das
+  Grep-Ergebnis und einen begrenzten Tail aus dem Lauf-Verzeichnis. Zieh ein
+  Serverlog **nicht** in deinen Kontext, auch nicht „nur kurz".
+* **Betrachter beenden ist eine Nutzer-Entscheidung.** Meldet s10
+  `BATTERY-STOP ... Prozesse halten die Module`, ist das Ende des Schritts. Du
+  setzt `BAR1_VIEWER_KILL_OK=1` **nur** auf ausdrueckliche Freigabe, und die
+  gilt nur fuer diesen Lauf.
+* **s10 stellt den Treiber nicht zurueck.** Das ist Absicht. `s10_restore.sh`
+  faehrst du nur, wenn es dir ausdruecklich gesagt wird.
 
 ## 7. Abschluss
 
