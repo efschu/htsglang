@@ -897,6 +897,13 @@ class Envs:
     # GEMM, same buffer size R+C, per-expert token sets unchanged). Frozen-after-
     # calibration => self-deterministic. Default False = static [0,R) (unchanged).
     SGLANG_MOE_HOT_RESIDENCY = EnvBool(False)
+    # #286 offload register (DESIGN_201 Nachtrag-13 Erg. 7/7b/7c): enable the
+    # generic VRAM item register's ADAPTERS (registration + size/access
+    # bookkeeping at the item creation sites: capture rungs, drafter heads,
+    # lane workspaces, input-buffer pools). Default False = the adapters are
+    # no-ops and the default path stays byte-identical. CPU phase: bookkeeping
+    # only, no movement.
+    SGLANG_OFFLOAD_REGISTER = EnvBool(False)
     # Number of offload forwards to observe (accumulating per-expert routing
     # counts) before the hot-set is computed, physically installed, and FROZEN.
     # Default 1: freeze right after the first forward (a prefill sees ~all prompt

@@ -4026,6 +4026,44 @@ class ServerArgs:
             "(see --dual-group-lane-share-window-s). 0 disables smoothing.",
         ),
     ] = 1.0
+    lane_offload_profile: A[
+        str,
+        Arg(
+            help="Preset of the #286 offload register (DESIGN_201 "
+            "Nachtrag-13 Erg. 7/7b/7c): which short-term dispensable VRAM "
+            "item classes of the dual lane (graph_rungs, drafter_heads, "
+            "lane_workspaces, cold_lane; experts as the existing class) may "
+            "be parked in system RAM. 'latency' = everything resident "
+            "(default until the measurement phase; flips stay us-fast, "
+            "costs KV headroom). 'capacity' = park aggressively (max "
+            "KV/max-token gain, retrieval latency at turn boundaries). "
+            "'auto' = park what the group-wide saturation signal and the "
+            "measured retrieval/overlap accounting admit. A preset is ONLY "
+            "a bundle of the per-class knobs -- any class set in "
+            "--lane-offload-class-policy overrides the preset for that "
+            "class. Takes effect only with SGLANG_OFFLOAD_REGISTER=1; "
+            "parked items stay retrievable (a latency term for the "
+            "dispatcher, never unavailable).",
+            choices=["latency", "capacity", "auto"],
+        ),
+    ] = "latency"
+    lane_offload_class_policy: A[
+        Optional[str],
+        Arg(
+            help="Per-class overrides of the #286 offload register, beating "
+            "the --lane-offload-profile preset (presets are only bundles of "
+            "these individual knobs). Comma-separated "
+            "<class>=<policy>[:<fraction>] entries, e.g. "
+            "'drafter_heads=ram:0.5,graph_rungs=auto'. Classes: graph_rungs, "
+            "drafter_heads, lane_workspaces, cold_lane, experts. Policies: "
+            "resident (never parked), ram (parkable up to the fraction), "
+            "auto (sensor/measurement decides). The optional fraction 0..1 "
+            "bounds how deep the class may be parked (share of its "
+            "registered bytes; default: resident=0, ram=1, auto=measured). "
+            "Unknown classes/policies and malformed fractions are hard "
+            "errors at argument time.",
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -4467,6 +4505,11 @@ class ServerArgs:
         # kv-session-offload (S1): validate scope, hard-reject the
         # out-of-scope modes up front (same fail-fast rationale as above).
         self._handle_kv_session_offload()
+
+        # #286 offload register: validate the profile + per-class policy
+        # syntax at argument time (unknown class/policy = hard error here,
+        # not at the first park).
+        self._handle_lane_offload_register()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -5261,6 +5304,22 @@ class ServerArgs:
                 "--enable-mixed-chunk (the spill tick must never be folded "
                 "into a mixed batch)."
             )
+
+    def _handle_lane_offload_register(self):
+        """#286 offload register: fail fast on invalid profile / per-class
+        policy syntax. Pure validation -- the register itself is built at
+        runner init (and only with SGLANG_OFFLOAD_REGISTER=1)."""
+        from sglang.srt.model_executor.offload_register import (
+            parse_class_policy_overrides,
+            resolve_class_policies,
+        )
+
+        # Raises ValueError on unknown profile/class/policy/fraction; the
+        # resolved map is discarded here (recomputed at configure time).
+        resolve_class_policies(
+            self.lane_offload_profile,
+            parse_class_policy_overrides(self.lane_offload_class_policy),
+        )
 
     def speculative_draft_solo_active(self) -> bool:
         """True when the draft-solo placement is requested

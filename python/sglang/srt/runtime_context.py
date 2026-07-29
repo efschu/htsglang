@@ -67,6 +67,39 @@ def _buffers_ignore_lane() -> bool:
     return os.environ.get("SGLANG_LANE_SHARED_ATTN_WORKSPACE", "0") == "1"
 
 
+def _note_workspace_in_offload_register(lane, name: str, buf, new: bool) -> None:
+    """#286 offload register, CPU-phase adapter (thin): book the
+    ``(lane, name)`` workspace as a ``lane_workspaces`` item -- registration
+    on creation, access touch on reuse. Bookkeeping only, no movement. Gated
+    behind SGLANG_OFFLOAD_REGISTER (default off => immediate no-op; the
+    default path is byte-unchanged)."""
+    from sglang.srt.model_executor.offload_register import (
+        maybe_register_item,
+        maybe_touch_item,
+        offload_register_enabled,
+    )
+
+    if not offload_register_enabled():
+        return
+    item_id = f"lane_workspace/{lane}/{name}"
+    if new:
+        size = 0
+        if callable(getattr(buf, "numel", None)) and callable(
+            getattr(buf, "element_size", None)
+        ):
+            size = int(buf.numel()) * int(buf.element_size())
+        maybe_register_item(
+            item_id,
+            "lane_workspaces",
+            size,
+            # Empty phase mask = needed in every phase; the turn tier governs
+            # (idle-lane workspaces park at hysteresis boundaries, Erg. 7c).
+            time_constant_tier="turn",
+        )
+    else:
+        maybe_touch_item(item_id)
+
+
 # ---------------------------------------------------------------------------
 # Lane scope (#274 slice C): the de-globalization primitive.
 #
@@ -691,6 +724,7 @@ class RuntimeContext:
         if new:
             buf = factory()
             self.resources.buffers[key] = buf
+        _note_workspace_in_offload_register(lane, name, buf, new)
         if _buffer_pool_debug():
             # Raw registration record, dumped before any analysis: which lane
             # asked for which name, and whether it landed on someone else's

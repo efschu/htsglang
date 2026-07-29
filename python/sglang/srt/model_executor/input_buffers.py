@@ -31,6 +31,37 @@ def _pool_ignores_lane() -> bool:
     return os.environ.get("SGLANG_LANE_SHARED_INPUT_BUFFERS", "0") == "1"
 
 
+def _note_pool_entry_in_offload_register(
+    key: _PoolKey, canonical: torch.Tensor, is_new: bool
+) -> None:
+    """#286 offload register, CPU-phase adapter (thin): book the lane-keyed
+    input-buffer pool entry (D2) as a ``lane_workspaces`` item --
+    registration on first coalesce, access touch on reuse. Bookkeeping only,
+    no movement. Gated behind SGLANG_OFFLOAD_REGISTER (default off =>
+    immediate no-op; the default path is byte-unchanged)."""
+    from sglang.srt.model_executor.offload_register import (
+        maybe_register_item,
+        maybe_touch_item,
+        offload_register_enabled,
+    )
+
+    if not offload_register_enabled():
+        return
+    lane, name, numel, dtype, device = key
+    item_id = f"input_buffer/{lane}/{name}/{numel}/{dtype}/{device}"
+    if is_new:
+        maybe_register_item(
+            item_id,
+            "lane_workspaces",
+            int(canonical.numel()) * int(canonical.element_size()),
+            # Empty phase mask = needed in every phase; the turn tier governs
+            # (idle-lane pools park at hysteresis boundaries, Erg. 7c).
+            time_constant_tier="turn",
+        )
+    else:
+        maybe_touch_item(item_id)
+
+
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     """Coalesce a buffer by ``(lane, name, size, dtype, device)`` into the
     process-wide input-buffer pool.
@@ -81,9 +112,11 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
         new_buffer.device,
     )
     canonical = _forward_input_buffer_pool.get(key, None)
-    if canonical is None:
+    is_new = canonical is None
+    if is_new:
         _forward_input_buffer_pool[key] = new_buffer
         canonical = new_buffer
+    _note_pool_entry_in_offload_register(key, canonical, is_new)
     if _pool_debug():
         # Raw registration record, dumped before any analysis: which lane asked
         # for which key, and whether it landed on someone else's allocation.
