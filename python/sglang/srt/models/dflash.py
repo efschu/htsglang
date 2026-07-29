@@ -21,6 +21,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -36,13 +37,20 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+# Rows a DFLASH drafter proposes per round when the checkpoint does not say.
+# Named because it is not only this model's business: it is the row count the
+# fp8 fused-GEMV gate has to admit, and two files agreeing on 16 by accident is
+# how the drafter ends up silently on the materialise+GEMM fallback (#274
+# round 7c).
+DEFAULT_DFLASH_BLOCK_SIZE = 16
 
 
 def _get_dflash_layer_attention_params(
@@ -410,12 +418,31 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        # ReplicatedLinear rather than nn.Linear, so ``fc`` can take a PACKED
+        # weight. It is by far the largest single tensor in the draft (for
+        # Qwen3.6-27B: [25600, 5120], 131 M of the checkpoint's 1.73 G
+        # parameters), and every quantised DFLASH artefact in the wild ships it
+        # quantised along with the rest -- a bare nn.Linear can only take a
+        # dense one, which made the whole checkpoint unloadable rather than
+        # just this tensor.
+        #
+        # REPLICATED and not column/row-parallel on purpose: ``fc`` consumes the
+        # concatenated target-layer features and produces the draft's hidden
+        # state, which every rank needs in full. It is also the shape that makes
+        # solo placement (draft weight-TP=1 on one host rank) the same code
+        # path as the split one.
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = draft_config.resolve_block_size(default=16)
+        self.block_size = draft_config.resolve_block_size(
+            default=DEFAULT_DFLASH_BLOCK_SIZE
+        )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -427,7 +454,10 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        # ``input_size`` rather than ``in_features``: ReplicatedLinear carries
+        # the logical shape under its own name, and it is the only one that
+        # survives quantisation (a packed weight has no ``in_features``).
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -437,7 +467,9 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        # ReplicatedLinear returns (output, bias); bias is None here (bias=False).
+        projected, _ = self.fc(target_hidden)
+        return self.hidden_norm(projected)
 
     @torch.no_grad()
     def forward(
@@ -515,6 +547,11 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
+                # K-mismatch guard, DENSE PATH ONLY. A packed ``fc.qweight``
+                # carries block bytes, not the logical [out, in] shape, so
+                # there is nothing to compare here; that case is caught on the
+                # first forward by project_target_hidden, which checks the same
+                # quantity against the same config field.
                 if resolved_name.endswith("fc.weight") and tuple(
                     loaded_weight.shape
                 ) != tuple(param.shape):
