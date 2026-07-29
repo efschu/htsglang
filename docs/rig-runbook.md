@@ -1338,6 +1338,160 @@ lane's in `DualGroupLane._finish`.
   `lanes_registered=[None, 0]`.
 
 
+### 4.15 BAR1 direct path: cards writing into each other, no host, no NIC (#288)
+
+`SGLANG_HTCCL_TRANSPORT=bar1` — TP collectives in which every card writes
+straight into its neighbour's memory across the PCIe BAR. Works on 256 MiB
+BARs, i.e. on every GeForce in this rig. **Needs a patched driver and cannot
+run in the development container.** Status: transport measured (1.13-1.34x
+against NCCL at three cards), end-to-end unproven; the acceptance checklist is
+in `docs/dev/INTEGRATION_R3_VALIDATION.md`, section "BAR1-Smallbar-Integration
+(#288)".
+
+#### Why not in the container
+
+`/dev/dmabuf_holder` has major 10, which is not in CT999's device allowlist.
+`mknod` is not enough — it needs a container-config change plus a restart, and
+that is the user's decision. So this recipe runs on the **Proxmox host**
+(section 1.2), where the host Python loads the container venv's
+`site-packages` directly. In a Docker container on the host it works with
+`--device /dev/dmabuf_holder --cap-add SYS_ADMIN --security-opt
+apparmor=unconfined -v /sys:/sys`; without the AppArmor exception you get
+`EACCES` as root on a root-owned file.
+
+#### Preconditions
+
+1. Patched driver with the registry key `RMSmallBarP2PPeerBar1=1`
+2. Kernel module `dmabuf_holder` loaded, `/dev/dmabuf_holder` reachable
+3. `CAP_SYS_ADMIN` — the driver checks `osIsAdministrator()` in the peer
+   mapping branch
+4. `CUDA_HOME` set. On the host it is not, and without it the JIT build fails
+   on `ninja` — a failure that looks like anything but a missing variable
+
+The patch itself is **not in this repo**; it lives in the private
+`efschu/nvidia-smallbar-p2p` (NVIDIA's open kernel modules are MIT/GPLv2, the
+holder module is the fork author's own GPL-2.0 code). This tree only takes the
+header tree PATH, through `SGLANG_HTCCL_BAR1_NV_QUELLE`.
+
+#### Loading the driver
+
+`nvidia_modeset` has to come out too, otherwise `rmmod nvidia` fails with
+"File exists". `nvtop` holds the modules as well — stop it first, and get the
+user's clearance for that; it does not carry over to the next time.
+
+```bash
+source /root/rig-env.sh 2>/dev/null || true
+NV_SRC="${NV_SRC:-<NV_PATCHED_TREE>}"        # patched open-gpu-kernel-modules
+HOLDER="${HOLDER:-<DMABUF_HOLDER_KO>}"       # dmabuf_holder.ko
+PCI_IDS="${PCI_IDS:-<PCI_BDF_LIST>}"         # space-separated, e.g. 0000:05:00.0 ...
+
+for i in 1 2 3 4 5 6; do
+  rmmod nvidia_uvm 2>/dev/null; rmmod nvidia_drm 2>/dev/null
+  rmmod nvidia_modeset 2>/dev/null; rmmod nvidia 2>/dev/null
+  lsmod | grep -q "^nvidia" || break; sleep 3
+done
+for c in $PCI_IDS; do echo 1 > "/sys/bus/pci/devices/$c/reset" 2>/dev/null; done
+sleep 4
+insmod "$NV_SRC/kernel-open/nvidia.ko" \
+  NVreg_RegistryDwords=RMSmallBarP2PPeerBar1=1
+insmod "$NV_SRC/kernel-open/nvidia-uvm.ko"
+lsmod | grep -q "^dmabuf_holder" || insmod "$HOLDER"
+```
+
+Back to stock: the same loop, then `modprobe nvidia nvidia_uvm`.
+
+Checks:
+
+| Question | Command | Answer |
+|---|---|---|
+| Is the key active? | `grep -i "^RegistryDwords:" /proc/driver/nvidia/params` | empty = stock driver. Match exactly `RegistryDwords:` — `RegistryDwordsPerDevice:` is a later line and would overwrite the real one |
+| Which module is loaded? | `strings nvidia.ko \| grep -c SMALLBAR_P2P` | 37 = full patch, 1 = minimal |
+
+#### The switches
+
+All rank-uniform, all under one prefix, so unsetting `SGLANG_HTCCL*` is the
+complete off switch. **Everything is opt-in: without an explicit choice
+nothing changes.**
+
+| Variable | Effect |
+|---|---|
+| `SGLANG_HTCCL=1` | HTCCL at all |
+| `SGLANG_HTCCL_TRANSPORT=bar1\|device\|host\|matrix` | transport choice |
+| `SGLANG_HTCCL_GRAPH_FREIGABE=1` | allows `bar1`/`matrix` under CUDA graphs. **Only after `bar1_graph_check.py` has passed** (section 6.3) |
+| `SGLANG_HTCCL_BAR1_NV_QUELLE=<tree>` | driver headers for the JIT build |
+| `SGLANG_HTCCL_BAR1_FENSTER_MIB[_<GROUP>]` | BAR1 window, settable per communicator group. 96 MiB maps contiguously out of 256 gross |
+| `SGLANG_HTCCL_BAR1_RING_AB` / `_GITTER_AB` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
+| `SGLANG_HTCCL_BAR1_PIPE=1` | pipelined kernel |
+| `SGLANG_HTCCL_BAR1_PIPE_DIREKT=0\|1` | direct mode. Off under capture regardless, loudly — its host-side ring index would be baked per graph |
+| `SGLANG_HTCCL_BAR1_A2A=0` | `all_to_all` off, which also turns `all_gather` off: they share the slot area and the byte proof |
+| `SGLANG_HTCCL_BAR1_AG=0` | `all_gather` off on its own. Default **on**; off means the standard run aborts in graph capture, which is the bug this covered |
+| `SGLANG_HTCCL_BAR1_AG_MAX_RUNDEN` | cap on kernel launches per all_gather (16). Not a window limit |
+
+#### Booting the standard run over the direct path
+
+Section 4.1's recipe, unchanged, plus the HTCCL lines. Anything else stays
+identical — that is what makes the baseline comparable.
+
+```bash
+source /root/rig-env.sh 2>/dev/null || true
+export SGLANG_HTCCL=1
+export SGLANG_HTCCL_TRANSPORT=bar1
+export SGLANG_HTCCL_GRAPH_FREIGABE=1
+export SGLANG_HTCCL_BAR1_NV_QUELLE="${NV_SRC:-<NV_PATCHED_TREE>}"
+export CUDA_HOME="${VENV:-<VENV>}/lib/python3.12/site-packages/nvidia/cu13"
+export TORCH_CUDA_ARCH_LIST="8.6;12.0"
+export MAX_JOBS=4
+```
+
+For the **baseline**, drop exactly the three `SGLANG_HTCCL*` lines and change
+nothing else. Do not set `CUDA_DEVICE_ORDER=PCI_BUS_ID` — `cuda:0` is the 5090
+in the standard run, and the reserve values in 4.1 are written for that order
+(section 6.1).
+
+#### Check programs
+
+```bash
+# The gate for GRAPH_FREIGABE. Five cases, five replays each, byte proof
+# after every one. If one fails, do not set the release switch.
+"$VENV/bin/python" benchmark/bar1_graph_check.py 0,1,2
+
+# Transport against NCCL, interleaved in one run
+"$VENV/bin/python" benchmark/bench_host_transport.py --devices 0,1,2 \
+  --op all_reduce --backends htccl:bar1,nccl --dtype bfloat16
+
+# Diagnosis with a full traceback
+"$VENV/bin/python" benchmark/bar1_diag.py 0,1,2
+```
+
+#### Proving it really ran over bar1
+
+**The transport name in the log is not proof.** `angefordert=bar1` appears on
+failure too. Once, a `tp` group built the direct path in 27 ms while `dcp`
+failed on the holder with ENOMEM and fell back to gloo — and both lines said
+`transport=bar1`. Half of the resulting number was not a bar1 number.
+
+```bash
+grep "HTCCL-BAR1: Aufbau in" "$LOG"   # one line per communicator group
+grep "ERREICHT=" "$LOG"               # angefordert= vs ERREICHT=
+```
+
+With `SGLANG_UNEVEN_DCP=1` there are **two** groups (`tp:0`, `dcp:0`) and
+**both** must report `ERREICHT=bar1`. Queryable at runtime as
+`htccl.gruppen_stand()` / `htccl.stand_zusammenfassung()`. A mixed run is not
+a bar1 measurement and must not be reported as one.
+
+Also: a blown deadline invalidates every number from the run. Check
+`htccl.status()` or grep the log for the timeout message before reporting
+anything.
+
+#### Rank count is proof only from the output
+
+`bench_host_transport.py` derives `world` from `--devices` and prints
+`peer_p50_us` per rank; that list must have as many values as there are
+cards. It once had `world = 2` hard-wired while `--devices` took a list, so a
+table published as "three ranks" was two.
+
+
 ## 5. Credentials
 
 | Credential | Location | Use |
@@ -1392,21 +1546,40 @@ against `nvidia-smi -L` before hardcoding indices anywhere.
 
 ### 6.3 CUDA-graph capability follows the HTCCL transport
 
-Enforced allowlist in `python/sglang/srt/distributed/parallel_state.py`
-(`CAPTURABLE_HTCCL_TRANSPORTS = {"device"}`): only `device` may run inside a
-CUDA-graph capture. `shm`, `gloo`, `ucx`, and any unknown transport name
-(which silently falls back to the gloo plane) host-stage every collective and
-require `--disable-cuda-graph`; a graph-enabled boot with them is rejected at
-startup with the reason. Consequence for measurements: an HTCCL run on a
-CPU-staged transport is always eager — never compare its numbers against a
-graph-enabled NCCL run without saying so.
+Enforced allowlist in `python/sglang/srt/distributed/parallel_state.py`. Ask
+`capturable_transports()`, never the constant — the release switch is added in
+that function, and reading the constant directly makes the switch work in one
+place and not the other.
 
-### 6.4 No P2P, no NVLink
+| Transport | Capturable | Why |
+|---|---|---|
+| `device`, `host` | yes, proven | GPU-driven. Both keep their per-op sequence number in **device** memory and never call a synchronize, so a replay advances it exactly as the first run did. `host` qualifies because of who drives it, not because of where its bytes sit |
+| `bar1`, `matrix` | only with `SGLANG_HTCCL_GRAPH_FREIGABE=1` | GPU-driven and believed capturable, but that was a statement about the code, not the hardware. Do **not** set the switch before `benchmark/bar1_graph_check.py` has passed on free cards (section 4.15) |
+| `shm`, `gloo`, `ucx`, any unknown name | no | host-staged: pinned allocation, `dist.*` on the CPU, `Event.synchronize()`. An unknown name silently becomes the inline gloo plane |
+
+A graph-enabled boot on a host-staged transport is rejected at startup with
+the reason. Consequence for measurements: an HTCCL run on a CPU-staged
+transport is always eager — never compare its numbers against a graph-enabled
+NCCL run without saying so.
+
+Under a capture there is **no fallback**. `htccl._select` refuses loudly
+instead of dropping into the gloo plane, because that plane would run once at
+capture time and never again on replay — wrong numbers without a crash. The
+message names the op, the size, and the ops the transport does cover. If you
+see it, the answer is to cover the op or to drop `--enable-cuda-graph`, not to
+switch transports until the message goes away.
+
+### 6.4 No P2P, no NVLink (unless the BAR1 patch is loaded)
 
 All rig-1 GPU pairs are `PHB` (`nvidia-smi topo -m`), GPU0 sits on a x4 link,
-there is no GPUDirect P2P. NCCL already stages through the host here.
-P2P-oriented tuning knobs do nothing on this rig; do not gate features on
-this rig's weaknesses either — other people's hardware has NVLink.
+and CUDA reports no GPUDirect P2P. NCCL stages through the host here.
+P2P-oriented tuning knobs do nothing on the stock driver; do not gate features
+on this rig's weaknesses either — other people's hardware has NVLink.
+
+The exception is section 4.15: with the small-BAR patch loaded, the cards do
+write directly into each other's memory across PCIe BAR1, without CUDA P2P and
+without a NIC. That is a different mechanism from GPUDirect P2P, it needs a
+patched driver, and it is opt-in.
 
 ### 6.5 The reserve trap (repeated because it keeps biting)
 

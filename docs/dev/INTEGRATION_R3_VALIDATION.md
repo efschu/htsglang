@@ -9011,3 +9011,237 @@ brauchen je ein Urteil und ggf. eine eigene Aufgabe), jedes Tuning im Fenster
 (Sensor an Scheduler, Admissions-Hook, echte State-Set-Bewegung), und eine
 Perf-Regression gegen den Rauschboden (braucht verschraenkte Messung und
 fixierten Takt, nicht 20-Sekunden-Messpunkte).
+
+## BAR1-Smallbar-Integration (#288) auf integration/r3-probe-next2 (2026-07-29)
+
+Zweig `feat/bar1-integration`, Basis `855cc766f0`. Der Strang von
+`probe/gdr-loadsym` (BAR1-Direktpfad ueber kleine PCIe-BARs) ist gemergt, die
+Deckungsluecke `all_gather` geschlossen, drei unabhaengige Fork-Fehler als
+eigene Commits herausgehoben. **Diese Phase war CPU-only**
+(`CUDA_VISIBLE_DEVICES=99` in jedem Lauf); die Karten hat kein Kommando
+angefasst. Was eine Karte noch beweisen muss, steht unten als Checkliste.
+
+### Was gemergt wurde
+
+`htccl_bar1.py` (Transport, Bootstrap, dma-buf, Byte-Beleg),
+`htccl_bar1_ext.py` (Kerne netz/ring/a2a), `htccl_bar1_pipe_ext.py`
+(Pipelining, Schiebefenster, Direkt-Modus), `htccl_host.py`,
+`htccl_matrix.py` + `htccl_matrix_transport.py` (Pfadplaner),
+`token_dispatcher/bar1ep.py` (MoE), `benchmark/bar1_*.py`,
+`bench_host_transport.py`, `bench_moe_dispatch.py`, `scripts/probe/*`.
+
+**Kein Treibercode im Baum.** Der gepatchte NVIDIA-Baum wird ausschliesslich
+als Pfad ueber `SGLANG_HTCCL_BAR1_NV_QUELLE` fuer den JIT-Bau referenziert;
+der Patch selbst bleibt im privaten Repo `efschu/nvidia-smallbar-p2p`.
+Gegengeprueft: kein Dateiname im Merge enthaelt `nvidia`/`osmemdesc`/
+`nvrm_registry`/`kernel-open`, kein `.patch`.
+
+### Die eine echte Konfliktflaeche: `htccl.py::_select`
+
+next2 hatte den #279-Pfad-Dispatcher-Hook, der loadsym-Zweig den lauten
+Riegel fuer ungedeckte Operationen. **Beides lebt**, und die Reihenfolge ist
+der Inhalt der Aufloesung:
+
+1. `handles()` liefert die Klassenwahl (#240),
+2. `refine_transport_choice()` darf sie verfeinern (#279),
+3. **danach** greift der Riegel, auf der ENDGUELTIGEN Wahl.
+
+Der Riegel vor dem Dispatcher haette genau einen Fall durchgelassen: ein
+`HINT_GLOO`, das eine `handles()`-Zusage ueberstimmt — der einzige Weg, auf
+dem eine gemessene Entscheidung unter Aufzeichnung in der host-gestaffelten
+gloo-Ebene landet. Die Platzhalter-Neutralitaet bleibt unberuehrt: ohne
+gemessene Raten ist jede Entscheidung Status quo, und ausserhalb einer
+Aufzeichnung passiert nach Schritt 2 nichts mehr. Belegt durch
+`test_htccl_select_identical_with_and_without_dispatcher` (gruen) und durch
+`TestLoudBarStillGuardsTheRest` (Riegel feuert weiter fuer `reduce_scatter`,
+`all_gather` geht durch).
+
+Die Fehlermeldung des Riegels nennt die gedeckten Operationen jetzt aus
+`HTCCL_OPS` statt aus einer mitgefuehrten Liste — eine Liste im Text waere
+beim naechsten hinzugebauten Kollektiv falsch.
+
+Drei weitere Konflikte, alle mechanisch: `scheduler.py` und `test_utils.py`
+(beide Seiten trugen dieselben Bugfixes, aufgeloest auf die faktorisierten
+Fassungen dieses Zweigs) und `docs/dev/INTEGRATION_R3_VALIDATION.md` (die
+zwei Abschnitte des loadsym-Zweigs stehen ueber den Docs-Zweig laengst auf
+next2; auf next2s Fassung aufgeloest, die die Datei ausserdem unter
+`docs/dev/` haelt statt sie im Wurzelverzeichnis neu anzulegen).
+
+### all_gather: gebaut, ohne neuen Kern
+
+Der Stopper war:
+
+    RuntimeError: HTCCL: 'all_gather' mit 10600448 Byte waehrend einer
+    CUDA-Graph-Aufzeichnung, aber bar1 meldet handles(...) -> False.
+
+Ein all_gather ist die AG-Phase des Netz-Allreduce ohne Reduktion, und genau
+das kann der a2a-Kern schon: er bewegt Bytes, kennt keinen Datentyp und
+bekommt Versaetze und Laengen **je Rang getrennt**. Ein all_gather ist ein
+all_to_all mit konstantem Sendeversatz. Damit kommen der Byte-Beleg je
+gerichtetem Paar, die Haelftenwahl nach Rundenparitaet, der lokale Weg fuer
+den eigenen Block, der Restpfad fuer krumme Laengen und die Grenzpruefungen
+der Erweiterung gratis mit. Die Exportliste der Erweiterung ist unveraendert
+(`bar1_all_reduce`, `bar1_all_to_all`), und ein Test nagelt das fest.
+
+**Runden statt Absage.** Eine Scherbe kann groesser sein als ein Schlitz —
+die gemeldete ist es: 10 600 448 B gegen 8 384 512 B bei 96 MiB Fenster,
+R=3. Sie laeuft in `ceil(Scherbe/Schlitz)` Runden. Eine Absage waere unter
+Aufzeichnung kein langsamerer Weg, sondern gar keiner.
+
+**Graph-Verhalten.** Die Rundenzahl haengt nur an Scherbenvektor und
+Schlitzgroesse, beide gruppenweit gleich und fuer eine aufgezeichnete Form
+konstant; die Zahl der Kernelstarts ist eingebrannt und bei jeder Wiedergabe
+dieselbe. Kein Hostcode entscheidet je Runde etwas. Der Direkt-Modus wird
+bewusst NICHT benutzt: sein hostseitiger Ringindex wird je Graph eingebrannt
+(`_erg_platz`, Punkt 3). Der Abnahmefall IST eine Aufzeichnung, also
+dieselbe konservative Wahl wie beim Allreduce — Schlitz statt Direkt, um den
+Preis eines zusaetzlichen Durchgangs durch den Empfangsschlitz.
+
+**Uneven.** Die Naht selbst ist gleichverteilt (ihr Ergebnis ist
+`(R,) + Form`; die ungleiche Form heisst `all_gatherv` und ist unter HTCCL
+ausdruecklich nicht gedeckt). `ag_plan` nimmt trotzdem einen Laengenvektor:
+unter uneven TP sind ungleiche Scherben der Normalfall, und die Stelle, an
+der Gleichverteilung ANGENOMMEN wird, ist die Stelle, an der ein spaeteres
+`all_gatherv` still falsche Versaetze bekaeme.
+
+`reduce_scatter` und `broadcast` bleiben ungedeckt, mit Grund am
+`HTCCL_OPS`: reduce_scatter braucht eine Reduktion, die der Bytebeweger
+nicht kann; broadcast ist an dieser Naht an Ort, und die Erweiterung lehnt
+`in == out` ab.
+
+### Beim Bauen gefunden
+
+* **`htccl_all_gather = _kein_kollektiv`** stand weiter unten im
+  Klassenkoerper und haette die neue Methode ueberschrieben — eine Zuweisung
+  im Klassenkoerper gewinnt lautlos gegen ein weiter oben stehendes `def`.
+  Jedes all_gather haette `NotImplementedError` geworfen, obwohl `handles()`
+  zugesagt hatte, und es haette wie ein Transportfehler ausgesehen.
+  Gefunden von `ruff` (F811) — der Grund, warum der Lauf vor dem Commit
+  steht und nicht danach.
+* **`_kein_kollektiv(self, comm, inp)`** hatte eine feste Signatur, waehrend
+  die Nahtstellen fuer reduce_scatter und broadcast drei Argumente uebergeben.
+  Die Meldung war hinter einem `TypeError` unerreichbar.
+* **Eine krumme Scherbe kostet den GANZEN Aufruf den schnellen Pfad**, nicht
+  nur das letzte Paket: der Ergebnisversatz von Rang `i` ist `i * Scherbe`,
+  also liegt bei einer Scherbe, die kein Vielfaches von 16 ist, jeder
+  Versatz ausser dem von Rang 0 schief, und die Erweiterung schaltet
+  `VEK=0` fuer den ganzen Aufruf. Eine Test-Zusicherung von mir behauptete
+  das Gegenteil und ist daran gefallen; jetzt so zugesichert und
+  dokumentiert.
+
+### Local-Memory-Spill im netz-Kern: offline gemessen
+
+`bar1_netz_kernel` meldete STACK 64, `bar1_ring_kernel` 0. Ursache ist die
+dynamische Indizierung des Parameterblocks (`A.nzSendRS[z]`): Parameter
+liegen in Konstantenbank 0, die keine dynamische Indizierung kennt, also
+kopiert nvcc die ganze Struktur je THREAD in den local memory. Behoben nach
+dem Muster des a2a- und des gepipelineten Kerns — ein Thread je Block legt
+die Zeigertabellen in `__shared__`, danach indiziert jeder dort;
+`__syncthreads()`, nicht `barriere<GRID>()`, weil gemeinsamer Speicher
+blocklokal ist.
+
+**Ohne Karte belegt**, weil nvcc offline uebersetzt
+(`nvcc -std=c++17 -cubin -arch=sm_86` + `cuobjdump -res-usage`):
+
+| Kernel | vorher | nachher |
+|---|---|---|
+| `bar1_netz_kernel` (bf16) | REG 39/40, **STACK 64**, SHARED 0/4, CONST[2] 64 | REG 37/40, **STACK 0**, SHARED 512/520, CONST[2] 8 |
+| `bar1_ring_kernel` | REG 32/37, STACK 0 | **byteidentisch** |
+| `bar1_a2a_kernel` | REG 40, STACK 0, SHARED 528/536 | **byteidentisch** |
+
+Ob das auf der Karte auch SCHNELLER ist, ist damit nicht gesagt — weniger
+bewegte Bytes sind ein starkes Vorzeichen, keine Messung. Steht in der
+Checkliste.
+
+### Testzahlen (alle `CUDA_VISIBLE_DEVICES=99`)
+
+| Suite | Ergebnis |
+|---|---|
+| `test/registered/unit/distributed/` **vor** dem Merge (855cc766f0) | 16 failed, 891 passed, 8 skipped |
+| `test/registered/unit/distributed/` **nach** allem | 16 failed, **936 passed**, 8 skipped |
+| `test_htccl_path_dispatcher.py` | 46 passed (unveraendert) |
+| `test_htccl_bar1_all_gather.py` (neu) | 31 passed |
+| `test_bar1_strand_is_opt_in.py` (neu) | 9 passed |
+| `test_htccl_bar1_ext_codegen.py` (neu) | 5 passed |
+| `test_help_text_renders.py` (neu, Bugfix 1) | 2 passed |
+| `test_hicache_storage_needs_hierarchical.py` (neu, Bugfix 2) | 4 passed |
+| `test_test_utils_port_offset.py` (neu, Bugfix 3) | 7 passed |
+
+Die 16 Fehlschlaege sind Byte fuer Byte die vorbestehenden
+(`test_dcp_token_vector_collective` 11, `test_uneven_tp_nccl_env` 1,
+`test_vmm_utils` 4). **Kein neuer Fehlschlag.**
+
+Falsifiziert wurden: der `--help`-Absturz (2 failed ohne den Fix, sechs
+Optionen namentlich), der `IndexError` bei `CUDA_VISIBLE_DEVICES=""` (Import
+bricht ab), und die Codegen-Sperre (auf der Vorher-Quelle: kein
+Staging-Block, alle sechs Tabellen im Kernelkoerper indiziert).
+
+`ruff check` auf allem Neuen sauber; in `htccl_bar1.py` bleiben die zwei
+vorbestehenden Befunde, einer weniger als vorher (das F811 oben).
+`ruff format` und `codespell --config .codespellrc` auf allen neuen Dateien
+sauber.
+
+### Was der GPU-Folge-Agent beweisen muss
+
+Reihenfolge ist Absicht: erst das Tor, dann der Nachweis, dass beide
+Gruppen wirklich direkt fahren, dann Bytes, dann erst Zahlen. **Keine
+Zeitmessung vor dem Byte-Beleg.** Vorbedingungen und das Ladekommando fuer
+den gepatchten Treiber stehen in `docs/rig-runbook.md`, Abschnitt "BAR1-
+Direktpfad".
+
+1. **Tor.** `benchmark/bar1_graph_check.py 0,1,2` — alle fuenf Faelle
+   bestanden. Faellt einer, ist `SGLANG_HTCCL_GRAPH_FREIGABE=1` nicht
+   zulaessig, und alles Weitere entfaellt.
+2. **Beide Gruppen erreichen bar1.** Bei `SGLANG_UNEVEN_DCP=1` gibt es zwei
+   Kommunikatorgruppen (`tp:0`, `dcp:0`).
+   `grep "ERREICHT=" lauf.log` muss fuer **beide** `ERREICHT=bar1` zeigen.
+   Der Transportname allein luegt: `angefordert=bar1` erscheint auch bei
+   Ausfall. Eine Messung, in der nur eine Gruppe direkt faehrt, ist gemischt
+   und darf nicht als bar1-Zahl berichtet werden.
+3. **all_gather laeuft wirklich ueber bar1 und liefert die richtigen Bytes.**
+   Das ist der neue Teil und der einzige, den die CPU-Tests nicht abdecken.
+   Rueckgelesen wird ueber einen ANDEREN Weg als geschrieben wurde. Konkret:
+   ein `all_gather` bekannter Muster je Rang, Ergebnis gegen
+   `torch.distributed.all_gather` auf derselben Gruppe. **Beide** Groessen
+   pruefen — eine unterhalb des Schlitzes (eine Runde) und die
+   Abnahmegroesse 10 600 448 B (zwei Runden), weil die Rundenzerlegung der
+   neue Code ist und der Einrundenfall sie gar nicht ausuebt.
+4. **Standardlauf e2e.** Das Kommando aus dem Runbook, unveraendert, mit
+   `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=bar1
+   SGLANG_HTCCL_GRAPH_FREIGABE=1`. Er muss durchlaufen — das ist die
+   eigentliche Abnahme des all_gather. Danach `htccl.status()` bzw.
+   `grep "Zeitlimit"`: ein gerissener Deckel entwertet jede Zahl aus dem
+   Lauf.
+5. **Multi-Session-Prefill-Kurve.** Die Frage, auf die alles hinauslaeuft:
+   ueber den Host-Weg ist der Prefill-Durchsatz ueber 1/4/8/16 Sessions flach
+   (1190/1097/1144/1105/1122 tok/s). Dieselben vier Punkte mit dem
+   Direktpfad, verschraenkt gegen die Grundlinie im selben Fenster gemessen
+   (nicht blockweise, nicht an verschiedenen Tagen). Bleibt sie flach, ist
+   der Gewinn ein Prozentsatz; steigt sie, faellt mit dem Umweg der Deckel.
+   Das Abnahmekriterium des Nutzers steht ueber Einzelprozenten: der groesste
+   Mehrwert muss beim Multi-Session-Parallel-Prefill liegen. Eine Aenderung,
+   die den Decode-Gewinn hebt und den Prefill-Gewinn senkt, ist falsch, auch
+   wenn die Summe steigt.
+6. **Der Spill-Fix, auf der Karte.** `cuobjdump -res-usage <ext>.so | grep -A1
+   bar1_netz_kernel` am JIT-gebauten Objekt (die Offline-Zahlen oben sind
+   `-arch=sm_86`; das Rig baut fuer 8.6 UND 12.0). Dann A/B derselben
+   `all_reduce`-Groessen mit und ohne den Fix — er ist bisher nur
+   *uebersetzt* besser, nicht *gemessen*.
+7. **Die Delle im Mittelfeld, nachgemessen.** Auf dem schnellen x8-Paar
+   verlor der Transport zwischen 1 und 8 MiB (bis 0,81x). Ob der Spill-Fix
+   daran etwas aendert, ist die billigste offene Frage.
+
+Fallen, die dabei gelten:
+
+* **Rangzahl aus der Ausgabe belegen, nicht aus der Kommandozeile.**
+  `bench_host_transport.py` leitet `world` inzwischen aus `--devices` ab
+  (Zeile 223) und gibt `peer_p50_us` je Rang aus — die Liste muss so viele
+  Werte haben wie Karten. Geprueft auf diesem Zweig: der Fix ist drin.
+* **Vorlauf, sonst ist die Zahl falsch** (P-State-Rampe: 726 us ohne, 95 us
+  mit).
+* **Eine Grenze auf einer Zweierpotenz ist verdaechtig**, solange kein
+  eigener Puffer dieselbe Groesse hat.
+* **Konfiguration aendern, um ein Hindernis zu umgehen, tauscht die Frage
+  aus.** CUDA-Graphen abzuschalten, weil etwas unter Aufzeichnung klemmt,
+  misst einen Betriebspunkt, den niemand faehrt. Solche Hindernisse gehoeren
+  gemeldet, nicht geloest.
