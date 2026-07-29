@@ -1784,3 +1784,21 @@ der die 18,9-20,9 % zeigte — bleibt die Regression, liegt sie am Algorithmus
 (DFLASH-Multiturn-Schwaeche); verschwindet sie, lag sie an der Architektur.
 Die Unterscheidung entscheidet, ob R7c DFLASH ueberhaupt als Dauer-Lane
 traegt oder nur als Regime-Werkzeug.
+
+Nachtrag-13-Ergaenzung 2 (Nutzer 2026-07-29, deterministisches Turn-Routing):
+Statt Bandit-Lernen eine DETERMINISTISCHE Politik als Default fuer die
+Drafter-Wahl: ERSTER Request einer Session (kurzer Kontext, mutmasslich
+Coding-Klasse) -> DFLASH; ab Turn 2 / Multiturn -> NEXTN. Begruendung: die
+Turn-Grenze ist ein BEKANNTER Regime-Wechsel — genau der Fall, in dem der
+alte Bandit gewann, nur ohne Lernkosten und ohne Selbstkonditionierung; im
+Lane-Pfad kostet der Wechsel einen Plan-Flip. Datenlage ehrlich: belegt ist
+DFLASH +6 % bei ctx 4096 / Paritaet lang / 18,9-20,9 % hinter NEXTN im
+Multiturn — die Achse Task-Typ (Coding) ist UNGEMESSEN, Ausloeser der Politik
+ist daher Turn-Index + Kontextlaenge, nicht ein Inhalts-Klassifikator.
+ABSICHERUNG: der Accept-Waechter aus R7a (Online-Accept vs Break-even je
+Sprosse) schaltet binnen weniger Runden auf NEXTN zurueck, wenn der Inhalt
+nicht traegt — die Politik beschleunigt die Gewinnerfaelle und kostet in den
+anderen ~einen Flip; ihre Telemetrie liefert nebenbei den Inhaltssplit, der
+die Coding-Hypothese bestaetigt oder kippt. Einbau: R7b (vor dem A/B aus
+Ergaenzung 1 als einfachste Politik; der Bandit bleibt Option fuer
+Regime-Wechsel INNERHALB langer Sessions).
