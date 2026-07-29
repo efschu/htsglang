@@ -4117,6 +4117,135 @@ class ServerArgs:
             "Must be >= 1 (1 = lower on the first below-threshold cycle).",
         ),
     ] = 2
+    kv_pressure_ladder: A[
+        Optional[str],
+        Arg(
+            help="KV pressure ladder (DESIGN_201 Nachtrag-13 Erg. 9): when "
+            "the KV cache threatens to burst, climb in N presettable steps "
+            "from the performance-optimal distribution towards capacity. "
+            "'auto' = the step table is computed once from the rig/model "
+            "profile by the #272 planner. Otherwise a comma-separated, "
+            "climb-ordered list of '<type>:<name>' entries, e.g. "
+            "'relief:dcp_ratio,relief:kv_spill,geometry:tp2'. Types: relief "
+            "(an EXISTING KV-relief feature referenced by name: dcp_ratio, "
+            "kv_spill, weightless_rank, session_offload -- no layout "
+            "change), geometry (a geometry INSIDE the nesting family = a "
+            "plan flip at a round boundary, never a weight reshard), "
+            "external (out-of-family warm standby, the last rung). The "
+            "climb order relief -> geometry -> external is enforced: cheap "
+            "KV relief is always exhausted before a geometry flip. Default: "
+            "unset = ladder off = today's behavior (nothing is constructed, "
+            "no occupancy sample is taken). The CPU phase plans only; the "
+            "KV handover itself is a named, measured-by-decision GPU-phase "
+            "item.",
+        ),
+    ] = None
+    kv_pressure_pre_stage: A[
+        bool,
+        Arg(
+            help="Speculative KV pre-staging of the pressure ladder "
+            "(DESIGN_201 Erg. 9b), selectable INDEPENDENTLY of the ladder "
+            "itself: when occupancy trends through the pre-stage mark (below "
+            "the flip mark), the KV is waved onto the card that is probably "
+            "about to join as a SHADOW COPY while the old layout stays the "
+            "source of truth. On the flip the shadow becomes authoritative "
+            "and only the delta since staging start still moves; if the flip "
+            "does not come, discarding is free (no copy-back). The shadow is "
+            "an offload-register item of class kv_shadow: lowest priority on "
+            "the target card, drop-on-demand, transport through the bus "
+            "budget. Requires --kv-pressure-ladder (there is no rung to "
+            "stage for otherwise). Default off: ladder on + staging off is a "
+            "valid configuration.",
+        ),
+    ] = False
+    kv_pressure_ascend_threshold: A[
+        float,
+        Arg(
+            help="Flip mark of the KV pressure ladder: occupancy fraction "
+            "(0..1] at or above which the ladder climbs. Ascent is "
+            "aggressive on purpose -- bursting costs more than a slower "
+            "rung. The ladder also climbs when the TREND projects exhaustion "
+            "within --kv-pressure-horizon-rounds, whatever the momentary "
+            "level.",
+        ),
+    ] = 0.85
+    kv_pressure_ascend_window: A[
+        int,
+        Arg(
+            help="Rounds the occupancy must stay at or above "
+            "--kv-pressure-ascend-threshold before the ladder climbs, and "
+            "the window the exhaustion trend is fitted over. Short by "
+            "design (the aggressive half of the asymmetric hysteresis).",
+        ),
+    ] = 4
+    kv_pressure_descend_threshold: A[
+        float,
+        Arg(
+            help="Descend mark of the KV pressure ladder: occupancy fraction "
+            "at or below which the ladder goes back down a rung. Must be "
+            "strictly below --kv-pressure-pre-stage-threshold, otherwise the "
+            "ladder would descend while it is still staging.",
+        ),
+    ] = 0.55
+    kv_pressure_descend_window: A[
+        int,
+        Arg(
+            help="Rounds the occupancy must stay at or below "
+            "--kv-pressure-descend-threshold (with a non-rising trend) "
+            "before the ladder descends. Must be LONGER than "
+            "--kv-pressure-ascend-window: descent is the sluggish half of "
+            "the asymmetric hysteresis.",
+        ),
+    ] = 64
+    kv_pressure_pre_stage_threshold: A[
+        float,
+        Arg(
+            help="Pre-stage mark of the KV pressure ladder (Erg. 9b), the "
+            "second water level: strictly between "
+            "--kv-pressure-descend-threshold and "
+            "--kv-pressure-ascend-threshold. Trending through it starts the "
+            "speculative shadow copy (only with --kv-pressure-pre-stage).",
+        ),
+    ] = 0.70
+    kv_pressure_pre_stage_window: A[
+        int,
+        Arg(
+            help="Rounds the occupancy must trend at or above "
+            "--kv-pressure-pre-stage-threshold before staging starts.",
+        ),
+    ] = 3
+    kv_pressure_abort_stage_window: A[
+        int,
+        Arg(
+            help="Rounds the occupancy must stay below "
+            "--kv-pressure-pre-stage-threshold (with a non-rising trend) "
+            "before a staged shadow is discarded. Must be LONGER than "
+            "--kv-pressure-pre-stage-window so that flapping around the "
+            "pre-stage mark does not stage and discard forever. Discarding "
+            "itself is free -- the old layout never stopped being "
+            "authoritative.",
+        ),
+    ] = 32
+    kv_pressure_horizon_rounds: A[
+        int,
+        Arg(
+            help="Projection horizon of the KV pressure sensor: the ladder "
+            "climbs when the occupancy TREND projects the pool exhausted "
+            "within this many rounds, not only when the momentary level is "
+            "high. The pre-stage mark looks twice as far ahead (it acts "
+            "earlier by construction).",
+        ),
+    ] = 32
+    kv_pressure_external_hysteresis_rounds: A[
+        int,
+        Arg(
+            help="Consecutive ascend verdicts an OUT-OF-FAMILY ladder rung "
+            "(external: extra node / remote PP stage, Nachtrag-14 warm "
+            "standby + handover) requires before it may be the target of a "
+            "flip. Long by design: a seconds-time-constant step is the last "
+            "rung, never the first.",
+        ),
+    ] = 512
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -4568,6 +4697,11 @@ class ServerArgs:
         # argument time (nonsense rungs = hard error here, not at the first
         # admission).
         self._handle_gdn_state_set_ladder()
+
+        # Erg. 9/9b KV pressure ladder: validate the step spec, the two
+        # water marks and the asymmetric windows at argument time (a typo
+        # fails the boot, not the first pressure boundary).
+        self._handle_kv_pressure_ladder()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -5402,6 +5536,49 @@ class ServerArgs:
                 f"cycles below the threshold before the rung drops), got "
                 f"{self.gdn_state_set_ladder_hysteresis}."
             )
+
+    def _handle_kv_pressure_ladder(self):
+        """#286 Erg. 9/9b: fail fast on an invalid KV-pressure-ladder
+        configuration.
+
+        Validated here, at argument time: the step spec's syntax, type
+        vocabulary and climb order; the mark ordering descend < pre_stage <
+        ascend; the enforced hysteresis asymmetry (descend window longer than
+        ascend, abort window longer than pre-stage); and the dependency
+        'pre-staging needs a ladder'. The controller itself is built where
+        the runtime attaches the occupancy source -- unset flag = nothing is
+        constructed at all, so the default path is byte-identical."""
+        from sglang.srt.model_executor.kv_pressure_ladder import (
+            KvPressureSensor,
+            parse_kv_pressure_ladder,
+        )
+
+        parse_kv_pressure_ladder(self.kv_pressure_ladder)
+        if self.kv_pressure_pre_stage and not self.kv_pressure_ladder:
+            raise ValueError(
+                "--kv-pressure-pre-stage needs --kv-pressure-ladder: the "
+                "speculative shadow copy is staged FOR a ladder rung, so "
+                "there is nothing to stage without a ladder. The reverse "
+                "combination (ladder on, staging off) is valid and is the "
+                "default."
+            )
+        if self.kv_pressure_external_hysteresis_rounds < 1:
+            raise ValueError(
+                f"--kv-pressure-external-hysteresis-rounds must be >= 1, got "
+                f"{self.kv_pressure_external_hysteresis_rounds}."
+            )
+        # The sensor owns the mark/window contract; constructing one here is
+        # the validation (it raises with the same messages the runtime would).
+        KvPressureSensor(
+            ascend_threshold=self.kv_pressure_ascend_threshold,
+            ascend_window=self.kv_pressure_ascend_window,
+            descend_threshold=self.kv_pressure_descend_threshold,
+            descend_window=self.kv_pressure_descend_window,
+            pre_stage_threshold=self.kv_pressure_pre_stage_threshold,
+            pre_stage_window=self.kv_pressure_pre_stage_window,
+            abort_stage_window=self.kv_pressure_abort_stage_window,
+            horizon_rounds=self.kv_pressure_horizon_rounds,
+        )
 
     def speculative_draft_solo_active(self) -> bool:
         """True when the draft-solo placement is requested

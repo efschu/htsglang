@@ -110,6 +110,17 @@ OFFLOAD_CLASSES = (
     # ladder (offload_gdn_states.SessionSetLadder) via
     # ``on_admission_boundary`` -- never mid-decode.
     "gdn_state_sets",
+    # Erg. 9b: the speculative KV SHADOW COPY of the KV pressure ladder
+    # (kv_pressure_ladder.py). One item per pre-staged ladder rung, living on
+    # the card that is probably about to join. Its distinguishing property:
+    # the OLD layout stays the source of truth while a shadow exists, so this
+    # is the only class whose park/discard is FREE -- there is nothing to
+    # copy back, and the target card may drop it on demand (lowest priority
+    # there). Transport is a bus-arbiter consumer like expert streaming and
+    # KV spill; the target space comes from the peer-budget grant. Planned by
+    # ``KvPressureLadder.on_pressure_boundary``, never by the phase or
+    # admission planners.
+    "kv_shadow",
 )
 
 OFFLOAD_POLICIES = ("resident", "ram", "auto")
