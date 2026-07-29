@@ -2937,8 +2937,10 @@ class DualGroupLane:
         no-spec trajectory over the 12-token gate on all three prompts, accept
         length never below the bridge's -- and the bridge cannot be captured at
         all, because it IS accept-many separate forwards.
-        Recommendation on record: make ``target_verify`` the default verify
-        mode and keep ``seqdecode`` reachable as the fallback flag it has been.
+        ``target_verify`` is the default since R7b's merge (promotion evidence:
+        R6 byte gates over three boots, R7a/R7b gates green, captured it
+        dominates the bridge on every axis); ``seqdecode`` stays reachable as
+        the fallback flag it has been.
 
         ``extend`` remains the measurably wrong batched path of round 1, kept
         reachable as a live falsifier. All three stay one explicit word away.
@@ -2946,7 +2948,7 @@ class DualGroupLane:
         return (
             job.get("verify")
             or os.environ.get("SGLANG_LANE_SPEC_VERIFY")
-            or "seqdecode"
+            or "target_verify"
         )
 
     def _verify(self, job, proposals):

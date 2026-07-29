@@ -1172,15 +1172,14 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         from sglang.srt.model_executor.dual_group_lane import DualGroupLane
 
         # Round 5 made TARGET_VERIFY coherent; round 6 captured it and made it
-        # dominant (35.9 vs 75-96 ms per round). The default still reads
-        # seqdecode HERE because promoting it is a merge decision, not a thing
-        # a measurement branch does to itself -- the recommendation and its
-        # gate evidence live in _verify_mode's docstring. When that merge
-        # happens this assertion flips with it, on purpose: the pair is the
-        # record that the change was chosen rather than drifted into.
-        self.assertEqual(self._lane()._verify_mode({}), "seqdecode")
+        # dominant (35.9 vs 75-96 ms per round); rounds 7a/7b kept every byte
+        # gate green on it. The default was promoted at the R7b merge -- this
+        # assertion flipped with it, on purpose: the pair is the record that
+        # the change was chosen rather than drifted into. seqdecode stays one
+        # explicit word away as the fallback.
+        self.assertEqual(self._lane()._verify_mode({}), "target_verify")
         doc = inspect.getdoc(DualGroupLane._verify_mode) or ""
-        self.assertIn("Recommendation on record", doc)
+        self.assertIn("default since R7b", doc)
 
     def test_target_verify_stays_reachable_but_only_on_request(self):
         self.assertEqual(
