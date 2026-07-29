@@ -2030,3 +2030,22 @@ API-Konsequenz fuer die CPU-Phase (#286): die Posten-Registrierung
 traegt die Phasen-Nutzungs-Maske und die Zeitkonstanten-Stufe von Anfang
 an (Schnittstelle jetzt, Bewegung spaeter); der Scheduler-Hook fuer
 Stufe 2 bleibt in der CPU-Phase ein No-Op.
+NUTZEN-VERDIKT Stufe 2 (Eroerterung 2026-07-29): Auf DIESEM Rig eng
+lastabhaengig — latenz-gebundener bs=1-Decode versteckt je Runde nur
+~150-300 MiB (kleine Posten, Gewinn wenige 100 MiB KV); real wird es
+kapazitaetsgebunden bei langen Phasen (Prefill-Chunks, grosse
+Verify-Batches: GB-Posten versteckbar, jedes MiB = max-Token); bei MoE
+mit Experten-Streaming bekommt Stufe 2 wenig Bus-Budget, auf dense liegt
+der Bus im Decode brach. FREMDE SYSTEME: Nutzen ~ VRAM-Knappheit x
+Bus-Rate / Rundenlaenge — PCIe5-x16 verschiebt die Schwelle ~4x
+(Drafter je Phase bewegbar, je Runde weiterhin nicht); unified memory
+(Apple/Strix Halo/GH200) degeneriert Stufe 2 zu Residenz-Management =
+fast gratis bei maximaler VRAM-Knappheit -> bester Fremdnutzen;
+Datacenter-NVLink koennte trivial, braucht kaum (Voll-Replika). Dieses
+Rig ist Untergrenze, kein Machbarkeitsurteil. P2P-AUSSICHT (Nutzer:
+Treiber-Update mit P2P moeglicherweise bald auch hier): Park-Ziel wird
+waehlbar — Tier-Leiter eigener VRAM -> PEER-VRAM (P2P: ein Hop statt
+zwei, kein Host-Staging, schont Host-RAM-Bandbreite fuer Experten/Spill)
+-> Host-RAM -> Remote-RAM (RDMA #224). Das Bewegungs-Backend-Interface
+traegt das Park-Ziel als Parameter; P2P ist ein zusaetzliches Ziel,
+kein Umbau des Registerkerns.
