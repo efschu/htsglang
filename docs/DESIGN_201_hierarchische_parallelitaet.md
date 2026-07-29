@@ -2084,6 +2084,23 @@ volles Featureset). BAU-PRINZIP (die Reihenfolge ist der Kern):
 4. STUFEN AUSSERHALB DER FAMILIE (zusaetzlicher Knoten, Remote-PP-Stage)
    = Nachtrag-14-Pfad: Warm-Standby + Handover, lange Hysterese,
    Sekunden-Zeitkonstante — letzte Treppenstufe, nicht erste.
+ERGAENZUNG 9b (Nutzer 2026-07-29, spekulatives Vorab-Staging): Kommt die
+Belegung KNAPP VOR eine Treppenstufe, wird der KV VORAB auf die Karte
+gewaved/gespillt, die vermutlich gleich dazukommt — und wieder
+freigegeben, falls der Aufstieg doch nicht eintritt. Bauweise: SCHATTEN-
+KOPIE, das alte Layout bleibt Quelle der Wahrheit; tritt der Flip ein,
+wird der Schatten autoritativ und nur das DELTA seit Staging-Beginn
+bewegt sich noch (Uebergabekosten fast vollstaendig versteckt); tritt er
+nicht ein, ist Verwerfen GRATIS (kein Zurueckkopieren — deshalb ist
+diese Spekulation billig, anders als jede migrierende). Der Schatten
+ist selbst ein Register-Posten (Klasse kv_shadow): niedrigste Prio auf
+der Zielkarte, drop-on-demand wenn die Zielkarte den Platz selbst
+braucht; Transport laeuft durchs Bus-Budget (Arbiter-Verbraucher wie
+Experten/Spill), Zielplatz durch den Peer-Budget-Grant. Sensor bekommt
+dafuer einen ZWEITEN Wasserstand: Pre-Stage-Marke unterhalb der
+Flip-Marke (beide konfigurierbar), Staging startet am Trend durch die
+Pre-Stage-Marke, Abbruch wenn der Trend zurueckfaellt (traege, damit
+Flattern nicht permanent staged/verwirft).
 SENSOR: KV-Belegungs-Wasserstand + TREND (projizierte Erschoepfung, nicht
 Momentwert), Hysterese je Richtung asymmetrisch (Aufstieg aggressiv —
 Platzen ist teurer als eine langsame Stufe; Abstieg traege). Die
