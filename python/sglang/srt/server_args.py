@@ -3951,15 +3951,17 @@ class ServerArgs:
             "The window has to sit above the A-vs-A noise floor of the "
             "underlying rates (0.25-0.39 %), which is what ~1 s buys; shorter "
             "windows measure noise, longer ones smear load changes. "
-            "DEFAULT 0 = OFF, and that is a finding rather than caution: with "
-            "the estimator on, a serving group under a continuous "
-            "2048-token-prefill lane died in the GDN prefill path in 3 of 3 "
-            "runs (store_kvcache index assert), while the same run with it off "
-            "and the same run on the base commit survived 3 of 3. The "
-            "mechanism is not understood and is the first item of slice D2 -- "
-            "until it is, this is an opt-in instrument. 1.0 is the value it "
-            "was validated at (DESIGN_121 §12.1/§12.7). Only allocated when "
-            "--dual-group-lane is set.",
+            "DEFAULT 0 = OFF: the estimator costs work in the scheduler "
+            "thread, directly in front of the serving group's batch launch, "
+            "and its PREFILL-arm reading is known to be quantization-limited "
+            "(one counter tick per finished lane prefill), so it is an opt-in "
+            "instrument rather than always-on telemetry. It is NOT off "
+            "because of the slice-D1 crash: that was a concurrent-lane buffer "
+            "aliasing defect in share_input_buffer, which the estimator only "
+            "made likely by shifting the timing -- found and fixed in slice "
+            "D2 (DESIGN_121 §13). 1.0 is the value it was validated at "
+            "(DESIGN_121 §12.1). Only allocated when --dual-group-lane is "
+            "set.",
         ),
     ] = 0.0
     dual_group_lane_share_ema_s: A[

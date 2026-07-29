@@ -6924,3 +6924,147 @@ lief.
 ruff/black/isort/codespell sauber auf allen neuen Dateien; die
 Ruff-Bestandsfehler in `scheduler.py` und `server_args.py` sind unveraendert
 (88 vorher, 88 nachher).
+
+## #274 Slice D Runde 2, Posten 0 (feat/dual-group-slice-d2, Basis 28f868ec45) — 2026-07-29
+
+Auftrag: die Wurzel des Schaetzer-an-Absturzes aus D1 (§12.7) finden, mit
+Schuldspruch und Gegenbeweis. Regler-Schleife, Dashboard-Tab und
+#279-Andockpunkte gehoeren ausdruecklich NICHT dazu.
+
+### Die Wurzel in drei Saetzen
+
+`share_input_buffer` fasst die CUDA-Graph-Eingabepuffer aller Runner im
+Prozess prozessweit ueber `(name, numel, dtype, device)` zusammen, und die
+Lane duennt ihre Prefill-Sprossenleiter genau auf `chunked_prefill_size` aus
+— also fragen der Prefill-Graph des Verbands und der der Lane DENSELBEN
+Schluessel an und werden gegen DIESELBE `out_cache_loc`-Adresse gefangen.
+Unter `--dual-group-lane-concurrent` spielt die Lane ihren Prefill-Graphen
+auf ihrem eigenen Thread und Stream ab, waehrend der Verband seinen
+abspielt; wer verliert, liest die Slot-Ids des anderen Pools und faellt in
+`SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`.
+Der Schaetzer beruehrt davon NICHTS — er ist reines Python ueber zwei
+Ganzzahlen; er verschiebt nur das Timing an der Korngrenze und macht damit
+ein Kollisionsfenster wahrscheinlich, das ohne ihn seltener getroffen wird.
+
+**SCHULDSPRUCH: latente Race in der Laufzeit, Schaetzer rehabilitiert.**
+
+### Der Beleg, Rohdaten vor der Analyse
+
+Schreibtisch (CPU-Sonde ueber `ServerArgs` + `_lane_server_args_view`, kein
+Boot, keine GPU-Belegung):
+
+    serving prefill max_num_tokens = 2048
+    lane    prefill max_num_tokens = 2048
+    COLLIDE(prefill out_cache_loc key) = True
+
+Rig (`SGLANG_DEBUG_INPUT_BUFFER_POOL=1`, TP0 = die Karte mit der Lane):
+
+    scope=None lane=None out_cache_loc numel=2048 ptr=0x70d27dda4600 new=True
+    scope=0    lane=None out_cache_loc numel=2048 ptr=0x70d27dda4600 new=False
+    scope=None lane=None input_ids     numel=2048 ptr=0x70d4efff8a00 new=True
+    scope=0    lane=None input_ids     numel=2048 ptr=0x70d4efff8a00 new=False
+    scope=None lane=None positions     numel=2048 ptr=0x70d27dda8600 new=True
+    scope=0    lane=None positions     numel=2048 ptr=0x70d27dda8600 new=False
+
+`scope=None` ist der Verband, `scope=0` die Lane, `lane=None` in beiden
+Zeilen ist der alte prozessweite Schluessel — derselbe Zeiger, zwei
+Gruppen. TP1 und TP2 tragen keine Lane und registrieren jeden Schluessel
+genau einmal: die Kollision existiert exakt dort, wo zwei Gruppen auf einer
+Karte sitzen.
+
+Das erklaert auch die ARMABHAENGIGKEIT, die D1 gemessen und nicht erklaeren
+konnte. Im Decode-Arm spielt die Lane je Job EINEN Prefill-Graphen ab und
+danach ~128 Decode-Schritte — das Kollisionsfenster ist winzig, und der
+Schaetzer lief dort in vier Boots stabil. Im Prefill-Arm besteht die
+Lane-Last aus nichts als 2048er-Prefills, also aus einem
+Prefill-Graph-Replay nach dem anderen.
+
+### Boot-Bilanz: 6 von 6
+
+| # | Stand | Zweck | Ergebnis |
+|---|---|---|---|
+| 1 | Alias, Schaetzer AN | Pool-Dump + Reproduktion | OOM in der Lane-Graph-Aufnahme (Rang-0-Budget 22800 ist das SERIELLE Rezept); **Alias-Beleg trotzdem geholt** |
+| 2 | Alias, Schaetzer AN, Budget 21300 | Reproduktion | verworfen: Harness-Fehler (feste Enqueue-Rate liess die Lane-Queue leckend ueber Phasengrenzen wachsen, P4 zeigte P2-Zahlen) |
+| 3 | Alias, Schaetzer AN | Reproduktion, ratenadaptiv | **ueberlebt** 6/6 — Verbands-Prefill nur 1,0 Tok/s |
+| 4 | Alias, Schaetzer AN | Reproduktion, 3 kurze Anfragen | **ueberlebt** 6/6 — Verbands-Prefill 6,1 Tok/s |
+| 5 | Alias, Schaetzer AN | Reproduktion, ~3600-Token-Prompts | **TOT in P2**, `index >= 0 && index < size_limit` |
+| 6 | **FIX**, Schaetzer AN | Gegenbeweis, Harness identisch zu Boot 5 | **ueberlebt 6/6, 0 Asserts** |
+
+### Der Gegenbeweis
+
+Boot 5 und Boot 6 unterscheiden sich in GENAU einer Variablen: dem
+Pool-Schluessel. Gleiche Basis, gleicher Zweig, gleicher Schaetzer (Fenster
+1,0 s), gleiche Last, gleiche Phasenliste.
+
+    Boot 5 (Alias):  P1 ueberlebt (Verbands-Prefill 1394,740 Tok/s) -> P2 TOT
+    Boot 6 (Fix):    P1 1409,484 -> P2 -> P3 -> P4 -> P5 -> P6, 0 Asserts
+
+Der Pool-Dump zeigt den Unterschied direkt, auf TP0:
+
+    Boot 5  scope=None lane=None out_cache_loc ptr=0x72c109da4600 new=True
+            scope=0    lane=None out_cache_loc ptr=0x72c109da4600 new=False
+    Boot 6  scope=None lane=None out_cache_loc ptr=0x7596bdda4600 new=True
+            scope=0    lane=0    out_cache_loc ptr=0x7591d53f0a00 new=True
+                                 same_key_other_lanes=[None]
+
+`same_key_other_lanes=[None]` benennt in Boot 6 genau die Aliasierung, die
+nicht mehr stattfindet.
+
+### Der Fix kostet nichts
+
+Dieselben Groessen ueber Boots MIT Alias (3, 4) und MIT Fix (6):
+
+| Groesse | Boot 3 (Alias) | Boot 4 (Alias) | Boot 6 (Fix) | Spanne |
+|---|---|---|---|---|
+| P2 Lane-Prefill Tok/s | 29,200 | 29,198 | **29,200** | 0,007 % |
+| P4 Lane-Prefill Tok/s | 3159,073 | 3028,271 | **3026,973** | 0,043 % (4 gegen 6) |
+| P2 Lane-Decode Tok/s | 57,465 | 56,028 | 57,574 | 2,7 % |
+
+Die Lane-Prefillrate in P2 ist ueber Alias- und Fix-Boots hinweg auf drei
+Nachkommastellen identisch; die P4-Rate liegt zwischen dem letzten
+Alias-Boot und dem Fix-Boot 0,043 % auseinander, also weit unter dem
+A-vs-A-Boden der Decode-Groessen (2,7 %). Der zusaetzliche Speicherposten des
+Fixes ist ein zweiter Satz Graph-Eingabepuffer je NEBENLAEUFIGER Lane:
+2048 + 79985 int64-Slots x 3 Namen ~ 1,9 MiB.
+
+### Ehrlich dazugesagt
+
+* **Der Gegenbeweis ist 1 Boot mit 6 Phasen, nicht 3 Boots.** Das Budget von
+  6 Boots ging fuer den OOM, den verworfenen Harness-Boot und die drei
+  Reproduktionsstufen drauf. Boot 6 ueberlebt dabei GENAU die Phase, die
+  Boot 5 mit identischer Last getoetet hat, und zusaetzlich die beiden
+  60-s-Prefill-Arm-Phasen unter voller Verbands-Prefill-Saettigung — das ist
+  die schaerfere Bedingung als D1s Reproduzierer.
+* **D1s Zuordnung „im GDN-Prefill des VERBANDS" ist nicht belastbar**, der
+  Absturzort schon. Ein Device-Assert zerstoert den Prozesskontext; gemeldet
+  wird er dort, wo als naechstes synchronisiert wird. Die Richtung, die den
+  Assert ueberhaupt feuern KANN, ist „Verbands-Ids im Lane-Graphen"
+  (Verbandspool ~80 000 Token gegen Lane-Pool 11 200); die Gegenrichtung ist
+  stille KV-Korruption. Beide sind mit demselben Fix erledigt.
+* **Ein zweiter Fall derselben Familie ist gesichtet, nicht behoben**:
+  `zero_flashinfer_workspaces()` nullt beim Request-Ende des VERBANDS jeden
+  registrierten flashinfer-Float-Workspace, auch den der Lane, die gerade
+  rechnet. Kein Assert, sondern stille Zahlen — Kandidat fuer D3.
+
+### CPU-Tore
+
+`test_dual_group_concurrency.py` +4 (nebenlaeufige Lanes trennen sich, ein
+Scope teilt weiter, die Notluke reproduziert den Alias, die SERIELLE Lane
+teilt weiter) -> 71 statt 67. Ueber die fuenf Dual-Group-/Lane-Suiten
+157 passed. `planner` 1619, `webui` 361, `observability`+`entrypoints` 395.
+Die 20 Fehlschlaege in `distributed`/`model_executor` sind unveraendert und
+umgebungsbedingt (sie brauchen freie Karten bzw. eine fehlende
+JIT-Bibliothek) — identische Liste vor und nach der Aenderung.
+ruff/black/isort/codespell sauber auf den geaenderten Dateien; mypy sauber
+auf `input_buffers.py`.
+
+### Posten 4 (per-Chunk-Prefill-Zaehlung): NICHT gebaut, mit Befund
+
+Die D1-Abhilfe „Prefill je CHUNK zaehlen statt je Job" ist kein
+Buchhaltungsumbau. `DualGroupLane._prefill` baut EINE `ScheduleBatch` ueber
+den ganzen Prompt (`set_extend_range(0, len(origin_input_ids))`) und macht
+EINEN Forward; bei 2048-Token-Jobs und `chunked_prefill_size=2048` IST der
+Chunk der Job. Feinere Quanten setzen voraus, dass die Lane ihren Prefill
+tatsaechlich stueckelt — eine Verhaltensaenderung mit eigener Messpflicht
+(Sprossenleiter, ms/Chunk, Auswirkung auf die Lane-Solo-Boeden), kein
+Zaehler-Umzug. Das gehoert als eigener Posten nach D3.
