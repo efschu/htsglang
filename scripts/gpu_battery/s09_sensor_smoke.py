@@ -54,6 +54,23 @@ def http_post(url: str, payload: dict, timeout: float = 300.0) -> dict:
         return json.loads(resp.read().decode())
 
 
+def _memory_usage(info: dict) -> dict:
+    """The memory block out of /get_server_info.
+
+    server_info() splices the ServerArgs and the scheduler info together and
+    puts the per-scheduler snapshot under "internal_states" -- memory_usage
+    lives THERE, not at the top level (Scheduler.get_internal_state). Reading
+    the top level yields {} on every healthy server, which turns the whole
+    step into an unconditional error. Same traversal as
+    scripts/dual_group/lane_accept_probe.py.
+    """
+    for state in info.get("internal_states") or []:
+        usage = state.get("memory_usage")
+        if usage:
+            return usage
+    return info.get("memory_usage") or {}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=30099)
@@ -93,7 +110,7 @@ def main() -> int:
         )
     }
     payload["flags"] = flags
-    memory_usage = info.get("memory_usage") or {}
+    memory_usage = _memory_usage(info)
     capacity = memory_usage.get("token_capacity")
     payload["token_capacity"] = capacity
     payload["memory_usage"] = memory_usage

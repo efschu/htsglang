@@ -1,0 +1,51 @@
+{
+ "schema_version": 3,
+ "kind": "nccl_transport",
+ "timestamp": "2026-07-29T23:26:40.950938",
+ "host": "RIG",
+ "pairs": [
+  {
+   "cuda_pair": [
+    0,
+    1
+   ],
+   "pci_pair": [
+    "0000:05:00.0",
+    "0000:0a:00.0"
+   ],
+   "status": "rank exited 1",
+   "transports": [],
+   "transport_summary": {},
+   "log_tail": "RIG:581133:581133 [0] NCCL INFO Bootstrap timings total 0.018722 (create 0.000014, send 0.000052, recv 0.000114, ring 0.000015, delay 0.000000)\n\n[2026-07-29 23:26:37] RIG:581133:581133 [0] init.cc:904 NCCL WARN Duplicate GPU detected : rank 1 and rank 0 both on CUDA device 5000\nRIG:581133:581133 [0] NCCL INFO init.cc:1582 -> 5\nRIG:581133:581133 [0] NCCL INFO group.cc:76 -> 5 [Async thread]"
+  },
+  {
+   "cuda_pair": [
+    0,
+    2
+   ],
+   "pci_pair": [
+    "0000:05:00.0",
+    "0000:0b:00.0"
+   ],
+   "status": "rank exited 1",
+   "transports": [],
+   "transport_summary": {},
+   "log_tail": "RIG:581215:581215 [0] NCCL INFO Bootstrap timings total 0.022334 (create 0.000012, send 0.000047, recv 0.000115, ring 0.000015, delay 0.000000)\n\n[2026-07-29 23:26:38] RIG:581215:581215 [0] init.cc:904 NCCL WARN Duplicate GPU detected : rank 1 and rank 0 both on CUDA device 5000\nRIG:581215:581215 [0] NCCL INFO init.cc:1582 -> 5\nRIG:581215:581215 [0] NCCL INFO group.cc:76 -> 5 [Async thread]"
+  },
+  {
+   "cuda_pair": [
+    1,
+    2
+   ],
+   "pci_pair": [
+    "0000:0a:00.0",
+    "0000:0b:00.0"
+   ],
+   "status": "rank exited 1",
+   "transports": [],
+   "transport_summary": {},
+   "log_tail": "RIG:581297:581297 [0] NCCL INFO Bootstrap timings total 0.022275 (create 0.000014, send 0.000058, recv 0.000120, ring 0.000015, delay 0.000000)\n\n[2026-07-29 23:26:40] RIG:581297:581297 [0] init.cc:904 NCCL WARN Duplicate GPU detected : rank 1 and rank 0 both on CUDA device a000\nRIG:581297:581297 [0] NCCL INFO init.cc:1582 -> 5\nRIG:581297:581297 [0] NCCL INFO group.cc:76 -> 5 [Async thread]"
+  }
+ ],
+ "_fixture_provenance": "gekuerzte, anonymisierte Kopie eines echten Laufs (gpu-battery-results/2026-07-30_bar1/s01_p2p_reprobe) -- Struktur stammt aus scripts/p2p_readiness/, nicht aus einer Vorstellung davon"
+}

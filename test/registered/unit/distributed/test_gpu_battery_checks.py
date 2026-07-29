@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -31,6 +32,10 @@ REPO_ROOT = os.path.abspath(
 )
 BATTERY = os.path.join(REPO_ROOT, "scripts", "gpu_battery")
 CHECKS = os.path.join(BATTERY, "checks")
+# Shortened, anonymised copies of real run artifacts -- see _copy_real_run.
+FIXTURES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fixtures", "gpu_battery"
+)
 
 sys.path.insert(0, BATTERY)
 
@@ -319,12 +324,18 @@ class TestPreflightCheck:
 
 
 def _capability(**over):
+    """Shaped after scripts/p2p_readiness/capability_matrix.py: rows live under
+    "directed_pairs" and every row carries the DST card's BAR classification.
+    The predecessor of this fixture invented a top-level "pairs" key, which no
+    producer ever wrote -- the check built on it failed every real run."""
+
     def pair(src, dst, **kw):
         row = {
             "src_pci": src,
             "dst_pci": dst,
             "can_access_peer": True,
             "dst_bar1_nominal_bytes": 256 * MIB,
+            "dst_bar1_classification": "windowed",
             "effective_max_single_copy_bytes": 240 * MIB,
             "effective_max_region_chunked_bytes": 250 * MIB,
             "probe_errors": [],
@@ -332,10 +343,23 @@ def _capability(**over):
         row.update(kw)
         return row
 
+    def device(pci):
+        return {
+            "pci_bus_id": pci,
+            "name": "NVIDIA GeForce RTX 3080",
+            "uuid": f"GPU-{pci}",
+            "nvml_index": 0,
+            "cuda_index": 0,
+            "vram_total_bytes": 20 * 1024 * MIB,
+            "bar1_total_bytes": 256 * MIB,
+            "bar1_classification": "windowed",
+        }
+
     payload = {
         "schema_version": 3,
         "kind": "capability_matrix",
-        "pairs": [pair(PCI_A, PCI_B), pair(PCI_B, PCI_A)],
+        "devices": [device(PCI_A), device(PCI_B)],
+        "directed_pairs": [pair(PCI_A, PCI_B), pair(PCI_B, PCI_A)],
     }
     payload.update(over)
     return payload
@@ -346,10 +370,33 @@ def _d2d(**over):
 
     def row(src, dst, mode):
         return {
+            "src": 0,
+            "dst": 1,
             "src_pci": src,
             "dst_pci": dst,
             "mode": mode,
-            "points": [{"size_bytes": s, "median_s": s / 1e10} for s in ladder],
+            "points": [
+                {
+                    "n": 40,
+                    "median_s": s / 1e10,
+                    "p95_s": s / 9e9,
+                    "gib_per_s": 6.0,
+                    "status": "ok",
+                    "size_bytes": s,
+                }
+                for s in ladder
+            ],
+        }
+
+    def leg(src, dst):
+        return {
+            "src": src,
+            "dst": dst,
+            "n": 22,
+            "median_s": 0.09,
+            "p95_s": 0.095,
+            "gib_per_s": 2.0,
+            "status": "ok",
         }
 
     payload = {
@@ -360,6 +407,9 @@ def _d2d(**over):
             row(PCI_B, PCI_A, "direct"),
             row(PCI_A, PCI_B, "staged"),
             row(PCI_B, PCI_A, "staged"),
+        ],
+        "arms": [
+            {"kind": "bidir", "legs": [leg(0, 1), leg(1, 0)], "size_bytes": 192 * MIB},
         ],
     }
     payload.update(over)
@@ -384,6 +434,19 @@ def _nccl_transport(**over):
     return payload
 
 
+def _copy_real_run(tmp_path):
+    """Copy the trimmed real-run artifacts into a step dir.
+
+    Fixtures that were invented rather than derived are what let the schema
+    drift sit undetected, so every artifact under FIXTURES is a shortened,
+    anonymised copy of an actual run and keeps its structure byte-for-byte.
+    """
+    src = os.path.join(FIXTURES, "s01_p2p_reprobe", "results")
+    dst = tmp_path / "results"
+    shutil.copytree(src, dst)
+    return dst
+
+
 def _write_p2p(tmp_path, cap=None, d2d=None, nccl=None):
     results = tmp_path / "results"
     write_json(
@@ -406,28 +469,124 @@ class TestP2PCheck:
     def test_no_results_dir_is_stop(self, tmp_path):
         assert_stop(self.CHECK, tmp_path, self.STEP)
 
+    def test_real_run_artifacts(self, tmp_path):
+        """The check against a COPY OF THE REAL RUN (2026-07-30_bar1), not
+        against a fixture someone imagined.
+
+        This is the regression test for the defect that motivated the fix: the
+        check asserted a top-level "pairs" key that scripts/p2p_readiness/
+        never wrote, so it failed on a perfectly healthy measurement. Both the
+        capability matrix and the d2d bench of that run must pass.
+
+        The run's nccl_transport arm genuinely failed (both ranks landed on the
+        same CUDA device), so the honest verdict on the artifact as a whole is
+        FAIL -- and the reason must name the cause, not just the exit code."""
+        results = _copy_real_run(tmp_path)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "nccl_transport" in line
+        assert "Duplicate GPU detected" in line
+
+        # ... and with only that arm healed, the real artifacts pass.
+        nccl = json.loads((results / "nccl_transport.json").read_text())
+        for row in nccl["pairs"]:
+            row["status"] = "ok"
+            row["transport_summary"] = {"SHM": 2}
+        write_json(results / "nccl_transport.json", nccl)
+        assert_pass(self.CHECK, tmp_path, self.STEP)
+
+    def test_real_capability_matrix_reaches_the_279_loader(self, tmp_path):
+        """The real matrix must not just parse -- it must be SEEN by the
+        loader the dispatcher uses. Before the fix the loader read the same
+        wrong key and returned zero rows, zero errors and zero skips: total
+        silence, indistinguishable from a rig without P2P."""
+        results = _copy_real_run(tmp_path)
+        sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
+        from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+            load_p2p_capability_matrix,
+        )
+
+        payload = json.loads((results / "capability_matrix.json").read_text())
+        res = load_p2p_capability_matrix(payload)
+        assert not res.errors
+        assert len(res.skipped) == len(payload["directed_pairs"])
+
     def test_unmeasured_peer_flag_is_fail(self, tmp_path):
         """None is not False: it means the probe did not run."""
         cap = _capability()
-        cap["pairs"][0]["can_access_peer"] = None
+        cap["directed_pairs"][0]["can_access_peer"] = None
         _write_p2p(tmp_path, cap=cap)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "can_access_peer" in line
+
+    def test_legacy_pairs_key_is_fail(self, tmp_path):
+        """A matrix that puts its rows anywhere but under the producer's key
+        is a matrix nobody downstream will find."""
+        cap = _capability()
+        cap["pairs"] = cap.pop("directed_pairs")
+        _write_p2p(tmp_path, cap=cap)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "directed_pairs" in line
+
+    def test_missing_bar_classification_is_fail(self, tmp_path):
+        cap = _capability()
+        cap["directed_pairs"][0]["dst_bar1_classification"] = "unknown"
+        _write_p2p(tmp_path, cap=cap)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "dst_bar1_classification" in line
+
+    def test_classification_disagreeing_with_devices_is_fail(self, tmp_path):
+        """Row and card survey must describe the same state."""
+        cap = _capability()
+        for row in cap["directed_pairs"]:
+            row["dst_bar1_classification"] = "full"
+            row["dst_bar1_nominal_bytes"] = 32 * 1024 * MIB
+        _write_p2p(tmp_path, cap=cap)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "devices[]" in line
+
+    def test_missing_pressure_arms_is_fail(self, tmp_path):
+        """A ladder measured one copy at a time cannot see what two
+        simultaneous copies do to the same window."""
+        _write_p2p(tmp_path, d2d=_d2d(arms=[]))
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "arms" in line
+
+    def test_failed_point_without_error_is_fail(self, tmp_path):
+        d2d = _d2d()
+        d2d["pairs"][0]["points"][-1] = {
+            "size_bytes": 257 * MIB,
+            "status": "failed",
+        }
+        _write_p2p(tmp_path, d2d=d2d)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "failed" in line
+
+    def test_point_above_aperture_with_error_passes(self, tmp_path):
+        """A copy above the effective aperture is a RESULT, not a defect."""
+        d2d = _d2d()
+        d2d["pairs"][0]["points"][-1] = {
+            "size_bytes": 257 * MIB,
+            "status": "failed",
+            "error": "RuntimeError: mapping failure",
+        }
+        _write_p2p(tmp_path, d2d=d2d)
+        assert_pass(self.CHECK, tmp_path, self.STEP)
 
     def test_p2p_without_effective_aperture_is_fail(self, tmp_path):
         """The failure mode the whole step exists to catch: p2p=True with a
         null effective aperture degrades every consumer to a placeholder while
         looking like a successful run."""
         cap = _capability()
-        cap["pairs"][0]["effective_max_single_copy_bytes"] = None
+        cap["directed_pairs"][0]["effective_max_single_copy_bytes"] = None
         _write_p2p(tmp_path, cap=cap)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "effective_max_single_copy_bytes" in line
 
     def test_no_p2p_anywhere_still_passes(self, tmp_path):
-        """'No P2P' is a legitimate, fully recorded outcome, not a failure."""
+        """'No P2P' is a legitimate, fully recorded outcome, not a failure.
+        This is what the real 2026-07-30 run looks like."""
         cap = _capability()
-        for row in cap["pairs"]:
+        for row in cap["directed_pairs"]:
             row["can_access_peer"] = False
             row["effective_max_single_copy_bytes"] = None
             row["effective_max_region_chunked_bytes"] = None
@@ -436,7 +595,7 @@ class TestP2PCheck:
 
     def test_one_directional_matrix_is_fail(self, tmp_path):
         cap = _capability()
-        cap["pairs"] = cap["pairs"][:1]
+        cap["directed_pairs"] = cap["directed_pairs"][:1]
         _write_p2p(tmp_path, cap=cap)
         assert_fail(self.CHECK, tmp_path, self.STEP)
 
@@ -1168,6 +1327,38 @@ def _write_smoke(tmp_path, payload=None, log="ok\n"):
     )
     (tmp_path / "server.log").write_text(log)
     return tmp_path
+
+
+class TestSensorSmokeProducer:
+    """The probe against a REAL /get_server_info answer.
+
+    server_info() splices ServerArgs and the scheduler snapshot together, and
+    memory_usage sits under internal_states -- not at the top level. Reading
+    the top level returned {} on every healthy server, so the step wrote
+    "keine token_capacity" and returned 1 no matter how the server behaved:
+    unpassable by construction, and invisible to a fixture that put the key
+    where the reader expected it."""
+
+    def _real_info(self):
+        with open(os.path.join(FIXTURES, "s09_sensor_smoke", "server_info.json")) as f:
+            return json.load(f)
+
+    def _memory_usage(self):
+        sys.path.insert(0, BATTERY)
+        from s09_sensor_smoke import _memory_usage
+
+        return _memory_usage
+
+    def test_capacity_from_real_server_info(self):
+        usage = self._memory_usage()(self._real_info())
+        assert usage["token_capacity"] == 453632
+
+    def test_top_level_still_read_as_fallback(self):
+        usage = self._memory_usage()({"memory_usage": {"token_capacity": 7}})
+        assert usage["token_capacity"] == 7
+
+    def test_no_memory_block_stays_empty(self):
+        assert self._memory_usage()({"internal_states": [{}]}) == {}
 
 
 class TestSensorSmokeCheck:
