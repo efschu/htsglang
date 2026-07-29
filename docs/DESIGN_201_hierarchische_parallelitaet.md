@@ -1841,3 +1841,21 @@ Drafter). Bauweise:
 Einbau: R7b (Politik-Objekt bekommt die Last-Eingabe von Anfang an, auch
 wenn der Sensor erst mit D4/#279 scharf wird — Schnittstelle jetzt, Schaerfe
 spaeter).
+
+PRIO-Nachtrag 14 (Nutzer-Eroerterung 2026-07-29, dynamischer RDMA-Arm):
+Bei anhaltender Lastspitze einen Cross-Rig-Arm HINZUSCHALTEN — machbar,
+aber die Physik diktiert die Rolle: NIE als zusaetzlicher TP-Rang (#266:
+~89/202 us je Kollektiv, jeder Token zahlt), sondern lose gekoppelt:
+(a) REPLIKA-LANE (bester Fit): ganze Sessions zurouten, Kopplung null,
+    Draht nur je Uebergabe (~0,3 s/GiB KV; dmabuf schreibt 95 % Drahtrate
+    direkt in VRAM — #278); (b) PD-Satellit (#212, Ungestoertheit);
+    (c) PP-Stage/Spill-Tier (Kapazitaet, nicht Tempo).
+Kernproblem ist SCHNELL-DRAN, nicht schnell-wenn-dran: Kaltstart ~42 s ->
+Warm-Standby aus vorhandenen Teilen (Suspend/Hibernate #89 Resume 8-14 s,
+Handover-Round-Trip #261; offener Rest dort: Live-Uebergabe ohne Stopp).
+Sensor = dasselbe gruppenweite Saettigungssignal wie 13e/#279; Unterschied
+zur Intra-Rig-Elastik ist NUR die Zeitkonstante (Sekunden statt 0,1 s) ->
+lange Hysterese, nur bei anhaltender Spitze. Grenze heute: Rig-2-Waende
+(11 GB, sm75, kein GGUF) — Design vorwaerts, Bau erst nach sm75-Freigabe
+bzw. besserer Remote-Karte. Einordnung: Erweiterung von Nachtrag 4
+(elastische Belegung) auf die Rig-Grenze; kein eigener Slice vor R7/D4.
