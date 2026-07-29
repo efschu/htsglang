@@ -1960,3 +1960,30 @@ mit K-Leiter, Turn-Routing, Draft-Quant-Wahl, Redundanz-Budget und dem
 Latenz-Term kennen, nicht als Nicht-Verfuegbarkeit). Einbau: derselbe
 Offload-Slice wie 13f+13h — das Register ist die Klammer, die beiden
 bestehenden Ergaenzungen werden Eintraege a und b.
+
+Nachtrag-13-Ergaenzung 7b (Nutzer 2026-07-29, Vereinheitlichung mit dem
+Experten-Spill): Das Register wird NICHT als neuer Mechanismus gebaut,
+sondern behandelt seine Posten "quasi wie MoE-Experten-Spill-Offload" —
+alles-greift-in-alles auch auf der Mechanik-Ebene. Der Experten-Offload
+(#77/#123) hat die komplette Maschinerie bereits: Heiss/Kalt-Klassifikation
+mit Residenz-Budget je Karte, H2D-Wave-in HINTER Compute versteckt
+(double-buffered Prefetch #125, Wave-Ordering #254 byte-identisch),
+Spill-Budgets mit Raten-/Volumen-Grenzen und Herabstufung (#236/#242),
+Opferwahl Leerlauf-zuerst, Graph-Kompatibilitaet (#122 decode-graph +
+eager-Hybrid) und den #89/#93-Unterbau (Suspend-Pfad, VA-stabiles Remap).
+Das Register fuehrt also nur NEUE POSTEN-KLASSEN in dieses vorhandene
+Tiering ein (Graph-Sprossen, Drafter-Koepfe, Lane-Workspaces, kalte Lane —
+neben den Experten als bestehender Klasse), statt einen Parallel-Mechanismus
+zu pflegen: EIN generisches VRAM-Posten-Tiering mit Klassen-Registrierung
+(Posten meldet Groesse, Rueckhol-Kosten, Heiss-Kriterium, VA-Stabilitaets-
+Anforderung), EIN Budget-/Politik-Unterbau, EIN Prefetch-/Wave-Pfad.
+Unterschiede bleiben benannt, nicht strukturell: Experten wechseln
+pro Schicht/Welle (ms-Takt, Vorhersage per Router), Register-Posten
+wechseln an Turn-/Hysterese-Grenzen (10e2-10e3 ms) — dieselbe Mechanik,
+andere Zeitkonstante und anderes Heiss-Signal. Gewinn: die Messpflichten
+aus Ergaenzung 7 werden mit der vorhandenen Offload-Telemetrie erhoben,
+und jede kuenftige Verbesserung am Experten-Pfad (z.B. Spill-Tier-
+Quantisierung #126) steht den Register-Klassen strukturell offen, wo sie
+sinnvoll ist. Einbau: der Offload-Slice beginnt mit einem kurzen
+Schnittstellen-Audit des Experten-Offloads (was ist heute schon generisch,
+was expertenspezifisch) statt mit Neubau.
