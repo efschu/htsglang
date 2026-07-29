@@ -211,14 +211,43 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+#: Largest ordinal that may still shift the test port. 7 covers an 8-card
+#: host; beyond that the offset would leave the valid port range.
+_MAX_DEVICE_ORDINAL_OFFSET = 7
+
+
+def _first_visible_device_ordinal() -> int:
+    """First device of CUDA_VISIBLE_DEVICES as an int, else 0.
+
+    The port offset only keeps two concurrent test runs on different cards
+    off each other's ports. It must not be able to break the IMPORT of this
+    module -- and that is exactly what it did:
+
+    * ``CUDA_VISIBLE_DEVICES=""`` -- the usual way to run a test suite with
+      no cards, e.g. while another run holds them -- hit ``""[0]`` and
+      raised ``IndexError: string index out of range`` during collection,
+      before any single test. No test of this tree was runnable without
+      cards, not even one that never touches a GPU.
+    * the UUID form (``CUDA_VISIBLE_DEVICES=GPU-1a2b...``) is equally legal
+      and would have raised ``ValueError`` from ``int("G")``.
+
+    The two cases mean the same thing here: no offset.
+
+    The result is clamped to ``_MAX_DEVICE_ORDINAL_OFFSET``. Reading only
+    the first character used to bound the offset to a single digit as a side
+    effect; parsing the whole ordinal removes that bound, and a placeholder
+    ordinal (``CUDA_VISIBLE_DEVICES=99``, a common "no real card" marker)
+    would otherwise compute a port above 65535.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
+    ordinal = int(raw) if raw.isdigit() else 0
+    return min(ordinal, _MAX_DEVICE_ORDINAL_OFFSET)
+
+
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _first_visible_device_ordinal() * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _first_visible_device_ordinal() * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():

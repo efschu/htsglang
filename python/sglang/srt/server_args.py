@@ -267,6 +267,11 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    # Derselbe Dispatch-Vertrag wie deepep, Transport ueber den
+    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_HTCCL=1
+    # und SGLANG_HTCCL_TRANSPORT=bar1|matrix; ohne das meldet sich die
+    # Auswahl mit Grund ab, statt still auf etwas anderes auszuweichen.
+    "bar1ep",
     "mooncake",
     "nixl",
     "mori",
@@ -1896,7 +1901,7 @@ class ServerArgs:
             "attention over the tokens it owns and at bs=1 the slowest rank "
             "sets the pace. 'dec' therefore also selects --rank-kv-ratio "
             "speed when that flag is left at its default; measured worth "
-            "-24.5 % of the context-dependent part of the decode step at "
+            "-24.5 %% of the context-dependent part of the decode step at "
             "120 k resident tokens (#210). Only valid with --rank-tp-ratio "
             "auto-performance.",
             choices=["both", "dec", "enc", "maxkv"],
@@ -1912,7 +1917,7 @@ class ServerArgs:
             "re-balances the per-rank weight bytes so the MIN-synced KV "
             "token pool grows. The server logs a suggested vector "
             "('restart with SGLANG_UNEVEN_MLP_VECTOR=...') when its "
-            "profiling detects a rebalancing gain > 10%. The environment "
+            "profiling detects a rebalancing gain > 10%%. The environment "
             "variable SGLANG_UNEVEN_MLP_VECTOR takes precedence over this "
             "flag. Requires an active --rank-tp-ratio plan.",
             type_parser=_parse_int_list,
@@ -1951,7 +1956,7 @@ class ServerArgs:
             "pool; attention/KV splits keep following --rank-tp-ratio. "
             "The server's profiling logs a suggested vector ('restart "
             "with SGLANG_UNEVEN_MOE_VECTOR=...') when rebalancing gains "
-            "> 10%. The environment variable SGLANG_UNEVEN_MOE_VECTOR "
+            "> 10%%. The environment variable SGLANG_UNEVEN_MOE_VECTOR "
             "takes precedence over this flag. Requires an active "
             "--rank-tp-ratio plan.",
             type_parser=_parse_int_list,
@@ -1981,8 +1986,8 @@ class ServerArgs:
             "slowest rank sets the pace. Measured (#210, 27B FP8 TP=3 uneven "
             "DCP, 120 k resident tokens, bs=1, no spec): moving the vector "
             "from [2,3,3] to [2,1,1] cut the context-dependent part of the "
-            "decode step by 24.5 % (2.296 -> 1.732 ms, boot-to-boot noise "
-            "floor 1.07 %), worth -2.5 % step time end to end and growing "
+            "decode step by 24.5 %% (2.296 -> 1.732 ms, boot-to-boot noise "
+            "floor 1.07 %%), worth -2.5 %% step time end to end and growing "
             "linearly with resident context. 'speed' needs the per-rank "
             "bandwidth scores, so it requires --rank-tp-ratio "
             "auto-performance; without them it degrades to 'capacity' and "
@@ -2945,7 +2950,7 @@ class ServerArgs:
             "hidden-state captures (DFLASH aux concat + the MTP final hidden) "
             "and the per-round warm-keep of the idle rung alive on every "
             "round, purely so a switch could happen at any moment -- a "
-            "standing ~13-15% tax (measured: pure DFLASH 138 tok/s vs "
+            "standing ~13-15%% tax (measured: pure DFLASH 138 tok/s vs "
             "cross-algo-with-DFLASH 116-120 on code below ctx 4096). ON: the "
             "steady state runs ONLY the active rung's capture and no "
             "warm-keep; both captures (and, because the capture setting is "
@@ -3116,6 +3121,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "bar1ep",
             "mooncake",
             "nixl",
             "mori",
@@ -4004,7 +4010,7 @@ class ServerArgs:
             "floor), E = SUM_c share_c, published as sglang:lane_share / "
             'sglang:lane_share_e and under internal_states[...]["lane_share"]. '
             "The window has to sit above the A-vs-A noise floor of the "
-            "underlying rates (0.25-0.39 %), which is what ~1 s buys; shorter "
+            "underlying rates (0.25-0.39 %%), which is what ~1 s buys; shorter "
             "windows measure noise, longer ones smear load changes. "
             "DEFAULT 0 = OFF: the estimator costs work in the scheduler "
             "thread, directly in front of the serving group's batch launch, "
@@ -9951,6 +9957,26 @@ class ServerArgs:
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if a2a_backend == "bar1ep":
+            # Der Zaehlwerteabgleich vor dem Datenpfad ist ein Host-Kollektiv
+            # (bar1ep.py._zaehlwerte_tauschen) -- derselbe Grund, aus dem
+            # deepep_mode=normal die Graphen abschaltet. Ohne diese Zeile
+            # scheiterte die Aufzeichnung mitten im Capture, weit weg von der
+            # Ursache.
+            logger.warning(
+                "Cuda graph is disabled because moe_a2a_backend=`bar1ep` "
+                "(the token-count exchange before the data path is a host "
+                "collective)."
+            )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if self.deepep_mode != "normal":
+                logger.warning(
+                    "deepep_mode is overridden to `normal` because bar1ep "
+                    "only builds the normal (contiguous) dispatch layout."
+                )
+                self.deepep_mode = "normal"
 
         if a2a_backend == "deepep":
             if self.deepep_mode == "normal":

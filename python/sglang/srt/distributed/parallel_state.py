@@ -229,7 +229,55 @@ def reg_all_to_all_single(
 # know "ucx", so a ucx boot with CUDA graphs enabled passed this guard and
 # then either crashed mid-capture or captured only rank-local regions --
 # silently, which left the graph regime of a cross-rig measurement unknown.
-CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device"})
+#
+# "host" is on the list for the same reason "device" is, and NOT because its
+# bytes sit in host memory -- that is precisely what the other three do too.
+# What decides membership is who drives: htccl_host stages and reduces from
+# two stream-ordered kernels that spin on flags in the pinned segment, never
+# calls a synchronize, and keeps its per-op sequence number in DEVICE memory
+# so a graph replay advances it exactly as the first run did.
+CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device", "host"})
+
+#: Die GPU-getriebenen Transporte, deren Graph-Erfassung geprueft, aber noch
+#: nicht belegt ist. Sie stehen NICHT in der Liste oben -- sie kommen ueber
+#: einen ausdruecklichen Schalter dazu, und nur ueber ihn.
+GRAPH_FREIGABE_TRANSPORTS = frozenset({"bar1", "matrix"})
+
+#: Der Schalter. **Nicht umlegen, bevor `benchmark/bar1_graph_check.py` auf
+#: freien Karten bestanden hat.**
+#:
+#: Warum ein Schalter und nicht einfach zwei weitere Namen in der Liste: was
+#: an bar1 einer Aufzeichnung im Weg stand, ist inzwischen behoben (der
+#: Ausweichriegel in `htccl._select`, die Kernauswahl in
+#: `HTCCLBar1Transport._kern`, der Direkt-Modus in `_erg_platz`) -- aber
+#: "behoben" ist eine Aussage ueber den Code, nicht ueber die Hardware. Der
+#: eine Punkt, der sich ohne Karten nicht klaeren liess, ist, ob der Treiber
+#: `cudaLaunchCooperativeKernel` aus einem Stream-Capture heraus annimmt.
+#: Solange das offen ist, faellt aufgezeichnet die 1blk-Variante, und diese
+#: Zeile bleibt aus.
+_GRAPH_FREIGABE_ENV = "SGLANG_HTCCL_GRAPH_FREIGABE"
+
+
+def graph_freigabe_gesetzt() -> bool:
+    """Ob der Freigabeschalter fuer die GPU-getriebenen Transporte steht."""
+    import os
+
+    return os.environ.get(_GRAPH_FREIGABE_ENV, "0") not in (
+        "0", "nein", "aus", "false", ""
+    )
+
+
+def capturable_transports() -> frozenset:
+    """Die AKTUELL als capturable geltende Menge.
+
+    ``CAPTURABLE_HTCCL_TRANSPORTS`` ist die belegte Grundmenge und bleibt es;
+    diese Funktion ist die Stelle, die den Freigabeschalter dazurechnet. Wer
+    "ist das capturable?" fragt, fragt hier -- nicht die Konstante, sonst
+    wirkt der Schalter an einer Stelle und an der anderen nicht.
+    """
+    if graph_freigabe_gesetzt():
+        return CAPTURABLE_HTCCL_TRANSPORTS | GRAPH_FREIGABE_TRANSPORTS
+    return CAPTURABLE_HTCCL_TRANSPORTS
 
 
 def _enforce_cpu_transport_needs_eager(transport: str) -> None:
@@ -241,7 +289,7 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     transport is known, and only when HTCCL is actually on -- flag off, this
     function is never called.
     """
-    if transport in CAPTURABLE_HTCCL_TRANSPORTS:
+    if transport in capturable_transports():
         return
     try:
         from sglang.srt.runtime_context import get_server_args
@@ -251,14 +299,45 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         return  # no published ServerArgs yet -> nothing to validate against
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
+    if transport in GRAPH_FREIGABE_TRANSPORTS:
+        # Different reason, so a different message. These two are NOT
+        # host-staged: their payload never touches host memory, and their
+        # round counter lives in device memory precisely so a graph replay
+        # advances it instead of reusing a stale value. What is missing is a
+        # MEASUREMENT -- nobody has captured their cooperative launch
+        # (cudaLaunchCooperativeKernel, used above
+        # SGLANG_HTCCL_BAR1_GITTER_AB) into a graph and replayed it. Saying
+        # "host-staged" here would be false, and letting them through on the
+        # strength of an argument would be the assumption this project keeps
+        # getting punished for.
+        #
+        # Was sich seither geaendert hat: die drei Stellen, an denen der
+        # Transport eine Aufzeichnung wirklich nicht ueberlebt haette, sind
+        # behoben (htccl._select laesst nicht mehr still in die gloo-Ebene
+        # ausweichen; HTCCLBar1Transport._kern nimmt aufgezeichnet die
+        # 1blk-Variante; _erg_platz schaltet den Direkt-Modus ab, dessen
+        # Ringplatz sonst eingebrannt wuerde). Offen bleibt genau eine
+        # Messfrage, und dafuer gibt es jetzt ein eigenes Pruefprogramm.
+        raise ValueError(
+            f"SGLANG_HTCCL_TRANSPORT={transport!r} is a GPU-driven transport "
+            "whose CUDA-graph capture is UNMEASURED, not one that is known to "
+            "be uncapturable: it never stages over the host and it keeps its "
+            "round counter in device memory. The code paths that would have "
+            "broken under capture are fixed; what is still missing is the "
+            "PROOF on this hardware. Run "
+            "`python benchmark/bar1_graph_check.py <dev,dev,...>` on free "
+            "cards; if it passes, set "
+            f"{_GRAPH_FREIGABE_ENV}=1 to release this transport for capture. "
+            "Until then pass --disable-cuda-graph to run it eagerly."
+        )
     raise ValueError(
         f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged transport "
         "(shm/gloo stage over CPU memory, ucx stages over pinned host "
         "buffers for RDMA; an unknown name falls back to the gloo plane): "
         "every collective synchronizes with the host, which is illegal "
         "inside a CUDA-graph capture. Pass --disable-cuda-graph, or use "
-        "SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on the "
-        "GPU and IS capturable."
+        "SGLANG_HTCCL_TRANSPORT=device (or =host), which run the collectives "
+        "on the GPU and ARE capturable."
     )
 
 
@@ -530,19 +609,48 @@ class GroupCoordinator:
             # the exact shape of the arm-E crash. Fail at startup, naming the
             # cause, instead.
             _enforce_cpu_transport_needs_eager(envs.SGLANG_HTCCL_TRANSPORT.get())
-            self.htccl_comm = HTCCLCommunicator(
+            # Ueber eine LOKALE Variable, und die Zustandsabfrage weiter
+            # unten auch: `self.htccl_comm` darf nur hinter einem
+            # `is not None` beruehrt werden (test_dispatch_seams_are_all_
+            # none_guarded pinnt das, und zu Recht -- daran haengt, dass
+            # Flag-aus byteidentisch bleibt).
+            _comm = HTCCLCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
+                gruppe=self.unique_name,
             )
-            logger.info(
-                "HTCCL enabled for group '%s' (transport=%s): TP collectives "
-                "run over the vendor-neutral host-staged path instead of "
-                "NCCL. Every SGLANG_HTCCL* env must be identical on all "
-                "ranks; the host-staged transports (shm/gloo/ucx) "
-                "additionally require --disable-cuda-graph.",
-                self.unique_name,
-                envs.SGLANG_HTCCL_TRANSPORT.get(),
-            )
+            self.htccl_comm = _comm
+            # Was ANGEFORDERT war und was ERREICHT wurde -- und zwar getrennt.
+            #
+            # Bis hierher stand in dieser Zeile der angeforderte Name, egal
+            # was daraus geworden war. Am echten Modell mit SGLANG_UNEVEN_DCP
+            # hiess das: 'tp' baute den Direktpfad in 27 ms auf, 'dcp'
+            # scheiterte am Halter mit ENOMEM und fiel auf gloo zurueck --
+            # und beide Zeilen sagten "transport=bar1". Die daraus gewonnene
+            # Zahl war zur Haelfte gar keine bar1-Zahl. Deshalb wird der
+            # Ausfall jetzt zur WARNUNG mit Gruppennamen und Grund, und der
+            # Erfolg nennt ausdruecklich, was wirklich laeuft.
+            angefordert = envs.SGLANG_HTCCL_TRANSPORT.get()
+            stand = getattr(_comm, "stand", {}) or {}
+            erreicht = stand.get("erreicht", angefordert)
+            if stand.get("direkt", True):
+                logger.info(
+                    "HTCCL enabled for group '%s': angefordert=%s, "
+                    "ERREICHT=%s. Every SGLANG_HTCCL* env must be identical "
+                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
+                    "additionally require --disable-cuda-graph.",
+                    self.unique_name, angefordert, erreicht,
+                )
+            else:
+                logger.warning(
+                    "HTCCL group '%s': angefordert=%s, ERREICHT=%s (%s: %s). "
+                    "Diese Gruppe laeuft NICHT ueber %s. Ein Messwert aus "
+                    "diesem Lauf ist gemischt und darf nicht als "
+                    "%s-Wert berichtet werden.",
+                    self.unique_name, angefordert, erreicht,
+                    stand.get("stufe", "?"), stand.get("grund", "?"),
+                    angefordert, angefordert,
+                )
 
         # When HTCCL is active the pynccl communicator is NOT CONSTRUCTED --
         # not merely left unused.
@@ -1163,7 +1271,9 @@ class GroupCoordinator:
             f"HTCCL does not implement {op!r}. SGLANG_HTCCL routes TP "
             f"collectives over the vendor-neutral host-staged path, which "
             f"currently covers all_reduce, all_gather(_into_tensor), "
-            f"reduce_scatter(_tensor) and broadcast. {op!r} would fall back "
+            f"reduce_scatter(_tensor), all_to_all_single (equal split and "
+            f"the split-size form via all_to_all_single_v) and broadcast. "
+            f"{op!r} would fall back "
             f"to NCCL, which cannot span a mixed-vendor group -- that is a "
             f"deadlock, not a slowdown. Either avoid the feature that calls "
             f"{op!r} (uneven/variable-size collectives are the usual "
@@ -1228,13 +1338,65 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        # HTCCL zuerst. Ohne diesen Zweig ging all_to_all_single bei aktivem
+        # SGLANG_HTCCL ungebremst auf self.device_group -- also auf genau das
+        # NCCL, das _htccl_unsupported oben als Deadlock-Ursache auf einer
+        # Gruppe ueber zwei Hersteller benennt. Es war bisher folgenlos, weil
+        # die Methode keinen Aufrufer hat; folgenlos ist nicht dasselbe wie
+        # richtig, und ein Haenger meldet sich nicht mit einer Fehlermeldung.
+        if self.htccl_comm is not None:
+            self.htccl_comm.all_to_all_single(output, input)
+            return
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
             output.copy_(input)
             return
+        # Wie bei all_reduce: HTCCL kehrt VOR der Dynamo-Custom-Op-Maschinerie
+        # zurueck. Der Zweig in _all_to_all_single bleibt trotzdem stehen --
+        # er faengt den Weg ueber die registrierte Op ab.
+        if self.htccl_comm is not None:
+            self.htccl_comm.all_to_all_single(output, input)
+            return
         reg_all_to_all_single(output, input, group_name=self.unique_name)
+
+    def all_to_all_single_v(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: Optional[List[int]] = None,
+        input_split_sizes: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """all_to_all_single mit ungleichen Teilgroessen (Zeilen, nicht Bytes).
+
+        Die Form, die MoE braucht: die Zahl der Token je Experte schwankt,
+        also schwankt die Blockgroesse je Zielrang. ``output_split_sizes=None``
+        laesst die Empfangszahlen aus den Sendezahlen ermitteln -- ein
+        all_gather der Zaehlwerte, wie DeepEP es vor dem Dispatch macht
+        (``get_dispatch_layout`` -> ``num_tokens_per_rank``).
+
+        BEWUSST NICHT ueber ``reg_all_to_all_single``: die registrierte
+        Custom-Op hat eine feste Signatur ohne Teilgroessen, und sie um
+        ``Optional[List[int]]`` zu erweitern haette den Schema-Vertrag der
+        bestehenden Op geaendert. Diese Form ist damit nicht opak fuer
+        Dynamo; wer sie unter torch.compile braucht, muss sie ausklammern.
+        """
+        if self.world_size == 1:
+            output.copy_(input)
+            return output
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_to_all_single(
+                output, input, output_split_sizes, input_split_sizes
+            )
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+        )
+        return output
 
     def reduce_scatter(
         self,

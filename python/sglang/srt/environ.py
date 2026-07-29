@@ -546,10 +546,12 @@ class Envs:
     # flag its peers spin on.
     SGLANG_HTCCL = EnvBool(False)
     # Data plane: "device" (GPU-driven DMA + spin kernels, CUDA-graph
-    # capturable), "shm" (CPU-orchestrated pinned staging), "gloo" (TCP,
-    # also multi-node) or "ucx" (RDMA, multi-node; same host-staged
-    # semantics as gloo). The CPU transports synchronize with the host and
-    # therefore require --disable-cuda-graph.
+    # capturable), "host" (GPU-driven zero-copy over ONE pinned, portable
+    # host segment -- two kernels per op, no host sync, also capturable),
+    # "shm" (CPU-orchestrated pinned staging), "gloo" (TCP, also multi-node)
+    # or "ucx" (RDMA, multi-node; same host-staged semantics as gloo). The
+    # CPU transports synchronize with the host and therefore require
+    # --disable-cuda-graph.
     SGLANG_HTCCL_TRANSPORT = EnvStr("device")
     # #279 path dispatcher (skeleton): size/load-aware path choice with
     # saturation overflow. Default off; even when on, decisions fall back to
@@ -571,6 +573,21 @@ class Envs:
     # integer per rank). Unset -> measured from per-rank slot DMA bandwidth
     # at startup, so a slow PCIe link owns fewer reduce-scatter chunks.
     SGLANG_HTCCL_RSAG_SHARES = EnvStr(None)
+    # --- host transport (pinned portable host memory, GPU-driven) ----------
+    # Per-rank staging slot (MiB). Unset -> inherit SGLANG_HTCCL_SLOT_MIB, so
+    # there is one knob for the common case and a second only when the host
+    # transport should differ. The segment holds TWO slots per rank (the
+    # double buffering that removes a third kernel from every collective),
+    # so it costs 2 x world x this.
+    SGLANG_HTCCL_HOST_SLOT_MIB = EnvStr(None)
+    # Per-ordered-pair send/recv buffer (MiB), also double-buffered. 0
+    # disables point-to-point, and the transport then DECLINES send/recv in
+    # handles() rather than discovering the missing buffer later.
+    SGLANG_HTCCL_HOST_P2P_MIB = EnvInt(4)
+    # Grid width of the host transport's two data kernels. Its payloads are
+    # latency-bound; more blocks buy nothing below ~1 MiB and cost tail
+    # latency. Rank-uniform like every knob in this block.
+    SGLANG_HTCCL_HOST_BLOCKS = EnvInt(32)
     # --- ucx transport (RDMA data plane) -----------------------------------
     # Which libucp to load. Unset -> the system "libucp.so.0". Point this at a
     # side-by-side install to satisfy the transport's version-parity check

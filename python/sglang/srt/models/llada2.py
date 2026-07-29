@@ -302,7 +302,17 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().tp_size
 
-            self.deepep_dispatcher = DeepEPDispatcher(
+            # is_deepep() sagt fuer bar1ep absichtlich True (derselbe
+            # Vertrag); gebaut wird hier aber ein Objekt, und dafuer zaehlt
+            # die Bibliothek. Ohne diese Fallunterscheidung baute
+            # --moe-a2a-backend bar1ep hier stillschweigend DeepEP.
+            if get_moe_a2a_backend().is_bar1ep():
+                from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
+                    Bar1EPDispatcher as _DispatcherKlasse,
+                )
+            else:
+                _DispatcherKlasse = DeepEPDispatcher
+            self.deepep_dispatcher = _DispatcherKlasse(
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
