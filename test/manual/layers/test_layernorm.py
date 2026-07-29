@@ -3,7 +3,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import (
+    Gemma3RMSNorm,
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNorm,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +112,103 @@ class TestGemmaRMSNorm(CustomTestCase):
                 seed=params[4],
             ):
                 self._run_gemma_rms_norm_test(*params)
+
+
+class TestGemma3RMSNorm(CustomTestCase):
+    """Covers Gemma3RMSNorm, whose CUDA path had no test.
+
+    Includes the rank-3 shapes that q_norm/k_norm receive, non-contiguous
+    inputs, and an fp32 weight against half-precision activations -- which is
+    how the module is constructed when it is built outside the loader's
+    `set_default_torch_dtype` context (`nn.Parameter(torch.zeros(dim))`).
+
+    The upstream residual subtest is not carried over: this fork's
+    Gemma3RMSNorm takes no residual argument and no caller passes one, so the
+    fused-add path would be unreachable from serving.
+    """
+
+    DTYPES = [torch.half, torch.bfloat16]
+    NUM_TOKENS = [1, 7, 83, 4096]
+    HIDDEN_SIZES = [256, 768, 1152, 5120, 5126]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _make(self, hidden_size, dtype, seed, weight_fp32):
+        torch.manual_seed(seed)
+        layer = Gemma3RMSNorm(hidden_size)
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        if not weight_fp32:
+            layer.weight.data = layer.weight.data.to(dtype)
+        return layer
+
+    def _check(self, layer, x):
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+        self.assertEqual(out.shape, ref_out.shape)
+        self.assertFalse(torch.isnan(out).any() or torch.isinf(out).any())
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
+
+    def test_gemma3_rms_norm(self):
+        for num_tokens, hidden_size, dtype, seed, weight_fp32 in itertools.product(
+            self.NUM_TOKENS,
+            self.HIDDEN_SIZES,
+            self.DTYPES,
+            self.SEEDS,
+            [True, False],
+        ):
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                seed=seed,
+                weight_fp32=weight_fp32,
+            ):
+                scale = 1 / (2 * hidden_size)
+                x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+                self._check(self._make(hidden_size, dtype, seed, weight_fp32), x)
+
+    def test_gemma3_rms_norm_3d(self):
+        """q_norm / k_norm are called with [tokens, heads, head_dim]."""
+        for num_tokens, heads, head_dim, dtype, weight_fp32 in itertools.product(
+            [1, 37], [1, 4, 8], [128, 256], self.DTYPES, [True, False]
+        ):
+            with self.subTest(
+                num_tokens=num_tokens,
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                weight_fp32=weight_fp32,
+            ):
+                scale = 1 / (2 * head_dim)
+                x = torch.randn(num_tokens, heads, head_dim, dtype=dtype) * scale
+                self._check(self._make(head_dim, dtype, 0, weight_fp32), x)
+
+    def test_gemma3_rms_norm_non_contiguous(self):
+        """A transposed or sliced view must not be assumed contiguous."""
+        for dtype in self.DTYPES:
+            head_dim = 256
+            scale = 1 / (2 * head_dim)
+            layer = self._make(head_dim, dtype, 0, weight_fp32=False)
+
+            # [tokens, heads, head_dim] produced by transposing [heads, tokens, .]
+            base = torch.randn(4, 37, head_dim, dtype=dtype) * scale
+            transposed = base.transpose(0, 1)
+            self.assertFalse(transposed.is_contiguous())
+            with self.subTest(dtype=dtype, case="transposed"):
+                self._check(layer, transposed)
+
+            # a strided slice along the last dimension
+            wide = torch.randn(37, 4, head_dim * 2, dtype=dtype) * scale
+            sliced = wide[..., :head_dim]
+            self.assertFalse(sliced.is_contiguous())
+            with self.subTest(dtype=dtype, case="sliced"):
+                self._check(layer, sliced)
 
 
 class TestLayerNorm(CustomTestCase):
