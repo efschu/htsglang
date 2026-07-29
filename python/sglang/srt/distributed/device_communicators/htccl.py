@@ -100,6 +100,16 @@ def _make_shm_transport(cpu_group, device):
     )
 
 
+def _make_host_transport(cpu_group, device):
+    from sglang.srt.distributed.device_communicators.htccl_host import (
+        HTCCLHostTransport,
+    )
+
+    return HTCCLHostTransport(
+        cpu_group=cpu_group, device=device, slot_bytes=_SLOT_BYTES
+    )
+
+
 def _make_ucx_transport(cpu_group, device):
     from sglang.srt.distributed.device_communicators.htccl_ucx import (
         HTCCLUcxTransport,
@@ -112,6 +122,13 @@ def _make_ucx_transport(cpu_group, device):
 TRANSPORT_REGISTRY = {
     "device": _make_device_transport,
     "shm": _make_shm_transport,
+    # Pinned, portable host memory, driven entirely by two kernels. The name
+    # says where the BYTES live, not who drives: unlike shm/gloo/ucx this one
+    # never synchronizes with the host, so it is capturable like "device".
+    # Its slot geometry follows SGLANG_HTCCL_SLOT_MIB unless
+    # SGLANG_HTCCL_HOST_SLOT_MIB overrides it; the rest of its knobs live in
+    # its own module, because they describe its kernels, not the communicator.
+    "host": _make_host_transport,
     # RDMA data plane for groups that span hosts. Same host-staged semantics
     # as gloo, UCX instead of TCP. Sizing/threshold knobs live in its own
     # module (SGLANG_HTCCL_UCX_*), not here, because they describe the wire,
@@ -120,10 +137,12 @@ TRANSPORT_REGISTRY = {
 }
 
 # Transports that must NOT silently fall back to the gloo plane on failure.
-# The device transport is the one case: the compilation config allowed CUDA
-# graphs on the strength of it, so a CPU-orchestrated replacement would be
-# captured and crash later. Preserved verbatim from the pre-refactor code.
-_NO_FALLBACK = frozenset({"device"})
+# The rule is exactly CAPTURABLE_HTCCL_TRANSPORTS: the compilation config
+# allowed CUDA graphs on the strength of these, so a CPU-orchestrated
+# replacement would be captured and crash later -- and it would crash far from
+# the transport that actually failed to come up. "host" is here for the same
+# reason "device" is, not for a new one.
+_NO_FALLBACK = frozenset({"device", "host"})
 
 
 def _build_transport(name: str, cpu_group, device, disabled: bool):

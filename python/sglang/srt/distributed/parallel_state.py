@@ -229,7 +229,14 @@ def reg_all_to_all_single(
 # know "ucx", so a ucx boot with CUDA graphs enabled passed this guard and
 # then either crashed mid-capture or captured only rank-local regions --
 # silently, which left the graph regime of a cross-rig measurement unknown.
-CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device"})
+#
+# "host" is on the list for the same reason "device" is, and NOT because its
+# bytes sit in host memory -- that is precisely what the other three do too.
+# What decides membership is who drives: htccl_host stages and reduces from
+# two stream-ordered kernels that spin on flags in the pinned segment, never
+# calls a synchronize, and keeps its per-op sequence number in DEVICE memory
+# so a graph replay advances it exactly as the first run did.
+CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device", "host"})
 
 
 def _enforce_cpu_transport_needs_eager(transport: str) -> None:
@@ -257,8 +264,8 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         "buffers for RDMA; an unknown name falls back to the gloo plane): "
         "every collective synchronizes with the host, which is illegal "
         "inside a CUDA-graph capture. Pass --disable-cuda-graph, or use "
-        "SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on the "
-        "GPU and IS capturable."
+        "SGLANG_HTCCL_TRANSPORT=device (or =host), which run the collectives "
+        "on the GPU and ARE capturable."
     )
 
 
