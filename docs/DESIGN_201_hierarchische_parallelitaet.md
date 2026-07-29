@@ -2054,7 +2054,47 @@ kombinierbar mit Phasen-Maske (Stufe 2), Bus-Budget, Prio-Klassen;
 Messpflicht wie ueberall (State-Set-Groesse, Rueckhol-Latenz vs
 Admissions-Takt) vor jedem auto-Default. Einbau: Offload-Slice
 (GPU-Phase), Klasse + Leiter-Flag jetzt benannt.
-NUTZEN-VERDIKT Stufe 2 (Eroerterung 2026-07-29): Auf DIESEM Rig eng
+Nachtrag-13-Ergaenzung 9 (Nutzer 2026-07-29, KV-Druck-Treppe /
+dynamische Geometrie-Stufen): Gegenrichtung zu Ergaenzung 8 — laeuft das
+System in der bis dahin OPTIMALEN Verteilung (wenig Allreduce-Knoten,
+schnelle Karte) und droht der KV-Cache MITTEN in Decode/Prefill zu
+platzen, wird in VOREINSTELLBAREN N TREPPENSTUFEN Richtung Kapazitaet
+aufgestiegen: Layer/Last weiter auf langsamere Karten und/oder weitere
+Knoten. Alles greift ineinander (Graphen, Offload, Wave, uneven DCP,
+volles Featureset). BAU-PRINZIP (die Reihenfolge ist der Kern):
+1. STUFEN INNERHALB DER NESTING-FAMILIE SIND BILLIG: dank Down-Set-
+   Eigenschaft haelt der feinste Schnitt alle groeberen Geometrien
+   GRATIS in denselben Bytes — eine Treppenstufe TP=1-Lane -> TP=2 ->
+   TP=3+uneven-DCP ist ein PLAN-FLIP an Runden-Grenzen (wie die
+   K-Leiter: je Stufe vorab captured Graphen, kalte Stufen-Graphen sind
+   Register-Klasse graph_rungs = RAM-parkbar), KEIN Gewichts-Reshard.
+2. VOR jeder Geometrie-Stufe kommen die billigeren KV-Entlastungen
+   (bestehende Features als untere Treppenstufen): uneven-DCP-Token-
+   Ratio nachziehen, KV-Spill ins RAM (#134/#236), weightless-KV-Rank
+   (#115: KV-Kapazitaet OHNE Layer-Bewegung), Session-Offload. Erst wenn
+   die erschoepft sind, steigt die Geometrie.
+3. DER TEURE KERN IST NICHT DAS GEWICHT, SONDERN DER KV: bestehender KV
+   liegt im Layout der alten Geometrie (Token-/Head-Split). Stufen-
+   Wechsel braucht eine KV-Uebergabestrategie — benannte Optionen, per
+   Stufe waehlbar, ENTSCHIEDEN wird nach Messung: (a) nur NEUE Tokens im
+   neuen Layout ab Chunk-Grenze (alter KV bleibt, gemischtes Serving),
+   (b) Hintergrund-Migration seitenweise (Spill-Maschinerie als
+   Transport), (c) Spill-und-Reload an einer Runden-Grenze. Spiegelbild
+   der offenen #261-Live-Uebergabe — dieselbe Baustelle, intra-Prozess.
+4. STUFEN AUSSERHALB DER FAMILIE (zusaetzlicher Knoten, Remote-PP-Stage)
+   = Nachtrag-14-Pfad: Warm-Standby + Handover, lange Hysterese,
+   Sekunden-Zeitkonstante — letzte Treppenstufe, nicht erste.
+SENSOR: KV-Belegungs-Wasserstand + TREND (projizierte Erschoepfung, nicht
+Momentwert), Hysterese je Richtung asymmetrisch (Aufstieg aggressiv —
+Platzen ist teurer als eine langsame Stufe; Abstieg traege). Die
+Stufen-Tabelle rechnet der Planner (#272-Schluessel-Solver) VORAB je
+Modell/Rig — zur Laufzeit wird nur geflippt, nie geplant. Prio-Klassen:
+geschuetzte Sessions bleiben auf der schnellen Stufe, Aufstieg trifft
+zuerst die unprotected Last. Einbau: Design jetzt; CPU-Skelett
+(Stufen-Tabelle, Sensor-Hook, Flip-Kontrakt, Uebergabe-Interface mit
+offenen Optionen) vorziehbar; scharfer Bau NACH Slice D und der
+R7c-/Mess-Kette — die Uebergabestrategie (Punkt 3) ist die eine echte
+offene Design-Entscheidung und braucht Messwerte. Auf DIESEM Rig eng
 lastabhaengig — latenz-gebundener bs=1-Decode versteckt je Runde nur
 ~150-300 MiB (kleine Posten, Gewinn wenige 100 MiB KV); real wird es
 kapazitaetsgebunden bei langen Phasen (Prefill-Chunks, grosse
