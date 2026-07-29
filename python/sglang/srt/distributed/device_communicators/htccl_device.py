@@ -729,12 +729,20 @@ def _build_flags(vendor: str, arches: list) -> list:
 #: with vendor + arches below; the prefix is what makes the sweep scopeable.
 _EXT_NAME_PREFIX = "htccl_device_ext"
 
-#: Every HTCCL-owned cache entry. htccl_host.py reuses the guard below rather
-#: than growing a second copy of it, so its entries have to be listed here or
-#: the scoped sweep would walk straight past a wreck it is meant to clear --
-#: and a sweep that misses exactly the entry the next boot needs is the same
-#: permanent failure the sweep exists to prevent.
-_EXT_NAME_PREFIXES = (_EXT_NAME_PREFIX, "htccl_host_ext")
+#: Every HTCCL-owned cache entry. htccl_host.py and htccl_bar1_ext.py reuse
+#: the guard below rather than growing a second copy of it, so their entries
+#: have to be listed here or the scoped sweep would walk straight past a wreck
+#: it is meant to clear -- and a sweep that misses exactly the entry the next
+#: boot needs is the same permanent failure the sweep exists to prevent.
+#: htccl_bar1_ext.py builds TWO extensions under two different names
+#: (htccl_bar1_ext_<vendor>_<arches> for the kernels, htccl_bar1_dmabuf_ext
+#: for the driver-ioctl exporter), so both prefixes are listed.
+_EXT_NAME_PREFIXES = (
+    _EXT_NAME_PREFIX,
+    "htccl_host_ext",
+    "htccl_bar1_ext",
+    "htccl_bar1_dmabuf_ext",
+)
 
 #: A finished cpp_extension build. `.pyd` is torch's Windows name for it.
 _EXT_ARTIFACT_SUFFIXES = (".so", ".pyd")

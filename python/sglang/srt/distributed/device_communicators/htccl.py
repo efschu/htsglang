@@ -118,6 +118,45 @@ def _make_ucx_transport(cpu_group, device):
     return HTCCLUcxTransport(cpu_group=cpu_group, device=device)
 
 
+def _make_bar1_transport(cpu_group, device):
+    """The BAR1 direct path on its own -- no planner, no measurement.
+
+    The source card DMAs straight into the target card's BAR1 aperture: no
+    host memory, no NIC, no NCCL. Which of the two ported kernels runs at
+    which size follows the `SGLANG_HTCCL_BAR1_RING_AB` threshold here,
+    because there is no plan to ask. That threshold is a default, not a
+    finding -- between 1 and 16 MiB mesh and ring measured within 1..7 % of
+    each other. Use "matrix" to have that decided by measurement instead.
+
+    `baue_bar1` returns None with a logged reason on any machine that
+    cannot do this (holder module absent, driver regkey unset, byte proof
+    failed). None is not an error here: it selects the inline gloo plane,
+    exactly as an unknown transport name would.
+    """
+    from sglang.srt.distributed.device_communicators.htccl_bar1 import baue_bar1
+    from sglang.srt.distributed.device_communicators.htccl_matrix_transport import (
+        _fenster_bytes,
+    )
+
+    return baue_bar1(cpu_group, device, _fenster_bytes())
+
+
+def _make_matrix_transport(cpu_group, device):
+    """Planner + BAR1 direct path.
+
+    Builds the direct path, hands its ACTUALLY mapped window to the planner
+    as a capability, runs `plan()`, logs `plan.erklaerung()` on rank 0, and
+    feeds the plan back so the kernel choice per size comes from the
+    measurement rather than from a built-in number. htccl_matrix_transport
+    explains why that is the only order that works.
+    """
+    from sglang.srt.distributed.device_communicators.htccl_matrix_transport import (
+        HTCCLMatrixTransport,
+    )
+
+    return HTCCLMatrixTransport(cpu_group=cpu_group, device=device)
+
+
 # name -> factory. "gloo" is intentionally absent: it is the inline plane.
 TRANSPORT_REGISTRY = {
     "device": _make_device_transport,
@@ -134,6 +173,18 @@ TRANSPORT_REGISTRY = {
     # module (SGLANG_HTCCL_UCX_*), not here, because they describe the wire,
     # not the communicator.
     "ucx": _make_ucx_transport,
+    # GPU-to-GPU straight through the target's BAR1 aperture. Neither the
+    # host nor a NIC touches the payload. Needs the relaxed driver guard
+    # (RMSmallBarP2PPeerBar1), the dmabuf_holder module and a passing byte
+    # proof; without any of them it opts out cleanly and the gloo plane
+    # runs. Its knobs (SGLANG_HTCCL_BAR1_*) live in its own module because
+    # they describe its kernels and its BAR1 geometry, not the communicator.
+    "bar1": _make_bar1_transport,
+    # The same direct path, but with the path-matrix planner deciding role,
+    # algorithm and kernel per size from a start-up measurement instead of
+    # from a threshold. Strictly more than "bar1"; "bar1" exists so the
+    # transport can be measured WITHOUT the planner in the loop.
+    "matrix": _make_matrix_transport,
 }
 
 # Transports that must NOT silently fall back to the gloo plane on failure.
@@ -142,6 +193,16 @@ TRANSPORT_REGISTRY = {
 # replacement would be captured and crash later -- and it would crash far from
 # the transport that actually failed to come up. "host" is here for the same
 # reason "device" is, not for a new one.
+#
+# "bar1" and "matrix" are deliberately NOT here, and correspondingly not in
+# CAPTURABLE_HTCCL_TRANSPORTS. Their data path never touches the host and the
+# round number lives in device memory precisely so a replayed graph would not
+# reuse a stale one -- so they are capturable BY CONSTRUCTION. What is missing
+# is a measurement: nobody has captured a cooperative launch
+# (cudaLaunchCooperativeKernel, used above the SGLANG_HTCCL_BAR1_GITTER_AB
+# threshold) into a CUDA graph on this rig and replayed it. Claiming
+# capturability on a construction argument is exactly the kind of plausible
+# assumption that has been failing against this hardware all day.
 _NO_FALLBACK = frozenset({"device", "host"})
 
 

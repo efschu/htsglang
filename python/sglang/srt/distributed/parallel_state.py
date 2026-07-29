@@ -258,6 +258,30 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         return  # no published ServerArgs yet -> nothing to validate against
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
+    if transport in ("bar1", "matrix"):
+        # Different reason, so a different message. These two are NOT
+        # host-staged: their payload never touches host memory, and their
+        # round counter lives in device memory precisely so a graph replay
+        # advances it instead of reusing a stale value. What is missing is a
+        # MEASUREMENT -- nobody has captured their cooperative launch
+        # (cudaLaunchCooperativeKernel, used above
+        # SGLANG_HTCCL_BAR1_GITTER_AB) into a graph and replayed it. Saying
+        # "host-staged" here would be false, and letting them through on the
+        # strength of an argument would be the assumption this project keeps
+        # getting punished for.
+        raise ValueError(
+            f"SGLANG_HTCCL_TRANSPORT={transport!r} is a GPU-driven transport "
+            "whose CUDA-graph capture is UNMEASURED, not one that is known to "
+            "be uncapturable: it never stages over the host and it keeps its "
+            "round counter in device memory. It is kept off the capturable "
+            "list because its large-payload path uses a cooperative launch "
+            "that nobody has captured and replayed on this hardware. Pass "
+            "--disable-cuda-graph to run it eagerly, or "
+            "SGLANG_HTCCL_BAR1_GITTER_AB=<huge> to keep it on the "
+            "single-block launch -- that still leaves capture unmeasured, so "
+            "measure it before adding either name to "
+            "CAPTURABLE_HTCCL_TRANSPORTS."
+        )
     raise ValueError(
         f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged transport "
         "(shm/gloo stage over CPU memory, ucx stages over pinned host "

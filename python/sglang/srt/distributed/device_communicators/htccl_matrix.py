@@ -1399,17 +1399,29 @@ def _fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
     """Gleiche Rechnung wie ``htccl_bar1.fensterbedarf`` -- hier lokal, damit
     der Planer ohne den BAR1-Transport benutzbar (und pruefbar) bleibt.
 
-    Netz: ``R-1`` Schlitze zu ``N/R``, zusammen rund ``N``, unabhaengig von R.
-    Ring: zwei Schlitze zu ``N/R``. Stern: ``R-1`` volle Puffer.
-    Doppelpufferung verdoppelt -- ohne sie gibt es kein Pipelining.
+    **An den portierten Kernen nachgezaehlt**, nicht geschaetzt: Netz und
+    Ring brauchen BEIDE ``2(R-1)`` Schlitze zu ``ceil(N/R)``.
+
+    * Netz: ``R-1`` fuer den Reduce-Scatter und noch einmal ``R-1`` fuer den
+      Allgather. Getrennt, weil zwischen "ich lese meine RS-Schlitze" und
+      "der andere schreibt seinen AG-Chunk" keine Ordnung steht.
+    * Ring: einer je Schritt, und es gibt ``2(R-1)`` Schritte. Zwei Schlitze
+      abwechselnd zu benutzen ginge nur, wenn der Sender den Fortschritt
+      seines NACHFOLGERS beobachtete -- er beobachtet aber nur seinen
+      Vorgaenger.
+    * Stern: ``R-1`` volle Puffer auf der Nabe.
+
+    KORREKTUR: hier stand fuer den Ring ``2*2*anteil``, also vier Schlitze
+    unabhaengig von R. Bei ``R=3`` ist das derselbe Wert (``2(R-1) = 4``)
+    und deshalb nie aufgefallen; ab ``R=4`` war er zu klein. Ein zu kleiner
+    Bedarf laesst einen Algorithmus zur Wahl zu, den die Abbildung nicht
+    traegt -- und der Fehler faellt dann erst im Transport auf.
     """
     if welt < 2:
         return 0
     anteil = -(-nbytes // welt)
-    if algorithmus == "netz" or algorithmus == "hierarchisch":
+    if algorithmus in ("netz", "ring", "hierarchisch"):
         return 2 * (welt - 1) * anteil
-    if algorithmus == "ring":
-        return 2 * 2 * anteil
     if algorithmus == "stern":
         return 2 * (welt - 1) * nbytes
     return 0
