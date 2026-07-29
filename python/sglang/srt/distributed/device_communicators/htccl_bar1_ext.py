@@ -416,6 +416,50 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         __threadfence();
     }
 
+    // -----------------------------------------------------------------------
+    // Die Zeigertabellen zuerst in den gemeinsamen Speicher.
+    //
+    // `A` liegt im Parameterraum, und der kennt keine dynamische
+    // Indizierung. Ein einziges `A.nzSendRS[z]` mit laufendem z zwingt nvcc
+    // deshalb, den GANZEN Parameterblock je Thread in den local memory zu
+    // kopieren -- gemessen an genau diesem Kernel: STACK 64 Byte, waehrend
+    // `bar1_ring_kernel` (feste Indizes) 0 hat. Bei 256 Threads sind das
+    // 16 KiB Umlagerung je Block, bevor ein einziges Nutzbyte fliesst.
+    //
+    // Dieselbe Loesung wie im a2a- und im gepipelineten Kern: ein Thread je
+    // Block schreibt die Tabellen einmal in __shared__, danach indiziert
+    // jeder dynamisch dort. Je Block, nicht je Gitter -- `__syncthreads()`
+    // genuegt und gilt in BEIDEN Kernvarianten; `barriere<GRID>()` waere
+    // hier die falsche Sperre, weil gemeinsamer Speicher blocklokal ist.
+    //
+    // Die Flaggenzeiger stehen mit hier, obwohl nur `erster` sie anfasst:
+    // fuer die Frage, ob der Parameterblock in den local memory muss,
+    // zaehlt, DASS irgendwo dynamisch indiziert wird, nicht von wie vielen
+    // Threads.
+    //
+    // Eintraege mit z == r sind host-seitig 0 und werden nie
+    // dereferenziert; sie werden trotzdem mitkopiert, damit der Index in
+    // allen Tabellen die Rangnummer bleibt.
+    __shared__ uint4       *sSendRS[HTCCL_BAR1_MAX_RANKS];
+    __shared__ uint4       *sSendAG[HTCCL_BAR1_MAX_RANKS];
+    __shared__ const uint4 *sRecvRS[HTCCL_BAR1_MAX_RANKS];
+    __shared__ const uint4 *sRecvAG[HTCCL_BAR1_MAX_RANKS];
+    __shared__ u64         *sFlagAn [2][HTCCL_BAR1_MAX_RANKS];
+    __shared__ const u64   *sFlagVon[2][HTCCL_BAR1_MAX_RANKS];
+    if (threadIdx.x == 0) {
+        for (int z = 0; z < R; ++z) {
+            sSendRS[z] = A.nzSendRS[z];
+            sSendAG[z] = A.nzSendAG[z];
+            sRecvRS[z] = A.nzRecvRS[z];
+            sRecvAG[z] = A.nzRecvAG[z];
+            sFlagAn [0][z] = A.nzFlagAn [0][z];
+            sFlagAn [1][z] = A.nzFlagAn [1][z];
+            sFlagVon[0][z] = A.nzFlagVon[0][z];
+            sFlagVon[1][z] = A.nzFlagVon[1][z];
+        }
+    }
+    __syncthreads();
+
     int offR, lenR;
     chunkGrenzen(n4, r, R, &offR, &lenR);
 
@@ -424,7 +468,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         if (z == r) continue;
         int off, len;
         chunkGrenzen(n4, z, R, &off, &len);
-        sendePhase(A.in + off, A.nzSendRS[z], len, tid, nth);
+        sendePhase(A.in + off, sSendRS[z], len, tid, nth);
     }
     __threadfence_system();
     barriere<GRID>();
@@ -435,9 +479,9 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             if (FLUSS) {
                 int off, len;
                 chunkGrenzen(n4, z, R, &off, &len);
-                leseFluss(A.nzSendRS[z], len);
+                leseFluss(sSendRS[z], len);
             }
-            schreibeU64(A.nzFlagAn[0][z], runde);
+            schreibeU64(sFlagAn[0][z], runde);
         }
         __threadfence_system();
 
@@ -447,7 +491,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             bool alle = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(A.nzFlagVon[0][s]) != runde) { alle = false; break; }
+                if (flaggeLesen<LA>(sFlagVon[0][s]) != runde) { alle = false; break; }
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
@@ -477,22 +521,25 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         // Der Empfangsschlitz traegt NUR den eigenen Chunk, beginnt also bei 0
         // -- der Chunkversatz offR gilt fuer den LOKALEN Puffer, nicht fuer
         // den Schlitz.
-        const uint4 *recv[HTCCL_BAR1_MAX_RANKS];
-        for (int s = 0; s < R; ++s) recv[s] = A.nzRecvRS[s];
-        reduziereNPhase<T>(A.in + offR, A.out + offR, recv, R, r, lenR, tid, nth);
+        //
+        // `sRecvRS` statt einer lokalen Kopie: die Kopie war ein Feld je
+        // THREAD im local memory, und sie war zugleich der Grund, warum der
+        // ganze Parameterblock dorthin musste.
+        reduziereNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
+                           tid, nth);
     }
     barriere<GRID>();
 
     // --- 3. Allgather: der fertige eigene Chunk an alle anderen ------------
-    verteilePhase(A.out + offR, A.nzSendAG, R, r, lenR, tid, nth);
+    verteilePhase(A.out + offR, sSendAG, R, r, lenR, tid, nth);
     __threadfence_system();
     barriere<GRID>();
 
     if (erster) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            if (FLUSS) leseFluss(A.nzSendAG[z], lenR);
-            schreibeU64(A.nzFlagAn[1][z], runde);
+            if (FLUSS) leseFluss(sSendAG[z], lenR);
+            schreibeU64(sFlagAn[1][z], runde);
         }
         __threadfence_system();
 
@@ -502,7 +549,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             bool alle = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(A.nzFlagVon[1][s]) != runde) { alle = false; break; }
+                if (flaggeLesen<LA>(sFlagVon[1][s]) != runde) { alle = false; break; }
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
@@ -531,7 +578,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         if (s == r) continue;
         int off, len;
         chunkGrenzen(n4, s, R, &off, &len);
-        uebernehmePhase(A.out + off, A.nzRecvAG[s], len, tid, nth);
+        uebernehmePhase(A.out + off, sRecvAG[s], len, tid, nth);
     }
     barriere<GRID>();
     if (erster) rundeSchreiben(A, runde);
