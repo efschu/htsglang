@@ -394,6 +394,185 @@ class TestPerLaneInputBufferPool(unittest.TestCase):
         self.assertEqual(serving.data_ptr(), serial_lane.data_ptr())
 
 
+class TestPerLaneAttentionWorkspace(unittest.TestCase):
+    """Geteilte-Puffer-Familie, the flashinfer FLOAT WORKSPACE (#274 slice D3).
+
+    Two defects, one family, found together because the second is only
+    reachable once the first is fixed.
+
+    C1 -- ``RuntimeContext.get_buffer`` was keyed by NAME alone, and every
+    production caller of it is an attention workspace (flashinfer,
+    flashinfer-MLA, trtllm-MLA, trtllm-MHA, DSA, musa-flashattention). A
+    concurrent lane builds a second set of backends in the same process, under
+    ``lane_scope(lane_id)``, and was handed the serving group's 384 MiB
+    scratch: one buffer holding live split-KV partials, two threads, two
+    streams. Nothing asserts -- the loser reads the winner's partials and the
+    attention output is silently wrong.
+
+    C2 -- ``zero_flashinfer_workspaces()`` runs at the SERVING group's request
+    finish and zeroed every registered workspace, because ``_WORKSPACE_BUFFERS``
+    was keyed by ``id()`` and knew no lane. Even with C1 fixed, a lane's own
+    workspace was wiped mid-forward by a foreign thread.
+    """
+
+    def setUp(self):
+        from sglang.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
+
+        _WORKSPACE_BUFFERS.clear()
+        reset_context()
+
+    def tearDown(self):
+        from sglang.srt.layers.attention.flashinfer_backend import _WORKSPACE_BUFFERS
+
+        _WORKSPACE_BUFFERS.clear()
+        os.environ.pop("SGLANG_LANE_SHARED_ATTN_WORKSPACE", None)
+        reset_context()
+
+    @staticmethod
+    def _workspace():
+        import torch
+
+        # Shape is irrelevant to the keying; the production one is
+        # SGLANG_FLASHINFER_WORKSPACE_SIZE bytes of uint8.
+        return torch.empty(1024, dtype=torch.uint8)
+
+    def _alloc(self):
+        from sglang.srt.runtime_context import get_buffer
+
+        return get_buffer("flashinfer_workspace", self._workspace)
+
+    # -- C1: the allocation ------------------------------------------------
+
+    def test_a_concurrent_lane_gets_its_own_attention_workspace(self):
+        serving = self._alloc()
+        with lane_scope(0, None):
+            lane0 = self._alloc()
+        with lane_scope(1, None):
+            lane1 = self._alloc()
+
+        self.assertNotEqual(serving.data_ptr(), lane0.data_ptr())
+        self.assertNotEqual(lane0.data_ptr(), lane1.data_ptr())
+
+    def test_within_one_scope_the_sharing_is_unchanged(self):
+        # The default path: one named buffer per name, which is what every
+        # backend in the serving group relies on.
+        first = self._alloc()
+        second = self._alloc()
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+        with lane_scope(0, None):
+            a = self._alloc()
+            b = self._alloc()
+        self.assertEqual(a.data_ptr(), b.data_ptr())
+
+    def test_a_serial_lane_keeps_sharing(self):
+        # ``DualGroupLane.scope_lane_id`` is None in serial mode: the lane and
+        # the serving group never run at the same time, so sharing is sound and
+        # keeping it is what makes serial byte-for-byte the slice-B mode.
+        serving = self._alloc()
+        with lane_scope(None, None):
+            serial_lane = self._alloc()
+        self.assertEqual(serving.data_ptr(), serial_lane.data_ptr())
+
+    def test_the_escape_hatch_reproduces_the_defect(self):
+        os.environ["SGLANG_LANE_SHARED_ATTN_WORKSPACE"] = "1"
+        serving = self._alloc()
+        with lane_scope(0, None):
+            lane0 = self._alloc()
+        # This IS the bug: one scratch, two concurrent forwards.
+        self.assertEqual(serving.data_ptr(), lane0.data_ptr())
+
+    def test_distinct_names_stay_distinct_within_a_lane(self):
+        from sglang.srt.runtime_context import get_buffer
+
+        with lane_scope(0, None):
+            ws = get_buffer("flashinfer_workspace", self._workspace)
+            other = get_buffer("some_other_workspace", self._workspace)
+        self.assertNotEqual(ws.data_ptr(), other.data_ptr())
+
+    # -- C2: the zeroing ---------------------------------------------------
+
+    def test_serving_zeroing_leaves_a_concurrent_lanes_workspace_alone(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            register_flashinfer_workspace_buffer,
+            zero_flashinfer_workspaces,
+        )
+
+        serving_ws = self._workspace()
+        register_flashinfer_workspace_buffer(serving_ws)
+        serving_ws.fill_(0xCD)
+        lane_ws = self._workspace()
+        with lane_scope(0, None):
+            register_flashinfer_workspace_buffer(lane_ws)
+        lane_ws.fill_(0xAB)  # the lane's in-flight split-KV partials
+
+        # The scheduler thread, a serving request just finished.
+        self.assertEqual(zero_flashinfer_workspaces(), 1)
+        self.assertTrue(bool((serving_ws == 0).all()))
+        self.assertTrue(bool((lane_ws == 0xAB).all()))
+
+    def test_a_lane_zeroes_its_own_and_only_its_own(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            register_flashinfer_workspace_buffer,
+            zero_flashinfer_workspaces,
+        )
+
+        serving_ws = self._workspace()
+        register_flashinfer_workspace_buffer(serving_ws)
+        serving_ws.fill_(0xCD)
+        lane_ws = self._workspace()
+        with lane_scope(0, None):
+            register_flashinfer_workspace_buffer(lane_ws)
+            lane_ws.fill_(0xAB)
+            # DualGroupLane._finish: the lane's own job boundary, which is
+            # where the #50 boot contract is restored for the lane.
+            self.assertEqual(zero_flashinfer_workspaces(), 1)
+
+        self.assertTrue(bool((lane_ws == 0).all()))
+        self.assertTrue(bool((serving_ws == 0xCD).all()))
+
+    def test_the_escape_hatch_reproduces_the_zeroing_defect(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            register_flashinfer_workspace_buffer,
+            zero_flashinfer_workspaces,
+        )
+
+        os.environ["SGLANG_LANE_SHARED_ATTN_WORKSPACE"] = "1"
+        lane_ws = self._workspace()
+        with lane_scope(0, None):
+            register_flashinfer_workspace_buffer(lane_ws)
+        lane_ws.fill_(0xAB)
+
+        # This IS the bug: the serving group's request finish wipes the lane's
+        # live scratch, with no assert anywhere.
+        self.assertEqual(zero_flashinfer_workspaces(), 1)
+        self.assertTrue(bool((lane_ws == 0).all()))
+
+    def test_a_serial_lane_is_zeroed_by_the_serving_group(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            register_flashinfer_workspace_buffer,
+            zero_flashinfer_workspaces,
+        )
+
+        # Serial mode shares the workspace on purpose, so the serving group's
+        # request finish must keep reaching it -- the #50 contract is unchanged
+        # in the mode that must not move.
+        ws = self._workspace()
+        with lane_scope(None, None):
+            register_flashinfer_workspace_buffer(ws)
+        ws.fill_(0xAB)
+        self.assertEqual(zero_flashinfer_workspaces(), 1)
+        self.assertTrue(bool((ws == 0).all()))
+
+    def test_zeroing_an_empty_bucket_is_zero_not_a_key_error(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            zero_flashinfer_workspaces,
+        )
+
+        with lane_scope(3, None):
+            self.assertEqual(zero_flashinfer_workspaces(), 0)
+
+
 class TestCaptureModeIsolation(unittest.TestCase):
     def test_capture_on_one_thread_is_not_capture_on_another(self):
         from sglang.srt.model_executor.runner_utils.capture_mode import (

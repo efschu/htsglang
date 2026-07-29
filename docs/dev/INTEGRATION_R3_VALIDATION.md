@@ -7068,3 +7068,214 @@ Chunk der Job. Feinere Quanten setzen voraus, dass die Lane ihren Prefill
 tatsaechlich stueckelt — eine Verhaltensaenderung mit eigener Messpflicht
 (Sprossenleiter, ms/Chunk, Auswirkung auf die Lane-Solo-Boeden), kein
 Zaehler-Umzug. Das gehoert als eigener Posten nach D3.
+
+## #274 Slice D Runde 3 (feat/dual-group-slice-d3, Basis 7887a03cf4) — 2026-07-29
+
+Auftrag: Posten 0 zuerst — `zero_flashinfer_workspaces` lane-fest machen, mit
+Falsifikator; danach die D2-Gegenbeweis-Wiederholung auf 3/3; Lane-Prefill-
+Chunking nur bei Restbudget. Regler-Schleife, Dashboard-Tab und #279 gehoeren
+ausdruecklich NICHT dazu.
+
+### Posten 0: der Befund war groesser als der Auftrag
+
+D2 hatte gemeldet, die Registry `_WORKSPACE_BUFFERS` sei `id()`-geschluesselt
+und nulle deshalb auch den Workspace einer nebenlaeufigen Lane. Das stimmt.
+Darunter lag aber, dass die Lane gar keinen eigenen Workspace hatte, den man
+haette schuetzen koennen:
+
+**C1** — `RuntimeContext.get_buffer(name, factory)` war ALLEIN nach dem Namen
+geschluesselt, und jeder produktive Aufrufer dieses Akzessors ist ein
+Attention-Workspace (flashinfer, flashinfer-MLA, trtllm-MLA, trtllm-MHA, DSA,
+musa-flashattention). Der Lane-Aufbau laeuft unter `lane_scope(lane_id)`, fragte
+also unter seinem eigenen Scope nach `"flashinfer_workspace"` — und bekam den
+384-MiB-Kratzspeicher des Verbands zurueck. Zwei Threads, zwei Streams, ein
+Puffer mit lebendigen Split-KV-Partials.
+
+**C2** — die von D2 gemeldete Nullung, die auch mit getrennten Puffern noch
+lane-fremd zugeschlagen haette.
+
+Beide melden sich nicht. Kein Assert, sondern still falsche Attention-Zahlen.
+
+### Schreibtisch-Sonde, vor jedem Boot
+
+`/tmp/d3/probe_workspace.py`, geraeteunabhaengig, kein Boot:
+
+    === C1: one named buffer, two lane scopes ===
+      serving lane=None ptr=0x28dc1a80
+      lane    lane=0    ptr=0x28dc1a80
+      SHARED_WORKSPACE(serving, lane0) = True
+    === C2: serving-scope zeroing reaches a lane-private workspace ===
+      zeroed 2 workspaces from the SERVING scope
+      lane workspace SURVIVED (want True) = False
+
+Nach dem Fix kippen beide Verdikte (`False` / `True`), und die Notluke
+`SGLANG_LANE_SHARED_ATTN_WORKSPACE=1` stellt beide Defekte exakt wieder her —
+sie ist der Falsifikator, kein Betriebsmodus.
+
+### Der Falsifikator auf dem Rig
+
+Ein Assert-Reproduzierer wie in D2 ist hier unmoeglich; die beobachtbare
+Groesse muss die AUSGABE der Lane sein. Vier Phasen, eine Auftragsform
+(64-Token-Prompt — kurz, weil Qwen-GDN-Prefill oberhalb ~109 Token nicht
+reproduzierbar ist; `spec: false`), acht Auftraege je Phase:
+A1/A2 Lane solo, B Lane + Verband mit WENIG Request-Enden (512-Token-
+Generierungen), C mit VIELEN (8-Token-Generierungen). B gegen C trennt den
+geteilten Puffer (C1, dauernd aktiv) von der Nullung (C2, nur bei Enden).
+
+**Der Boden ist exakt null, und das ist der Befund, der den Rest erst
+lesbar macht**: die Solo-Bahn der Lane ist ueber BOOTS hinweg byte-identisch
+— alle acht Ordinalpositionen von A1 und A2 stimmen zwischen dem
+scharfgestellten und dem gefixten Boot ueberein, A2 ist achtmal dieselbe
+Bahn. Es gibt keinen A-vs-A-Rauschboden zu verrechnen. (A1 durchlaeuft eine
+deterministische Einlaufleiter, in beiden Boots identisch; Referenz ist
+daher A2, nicht der erste Auftrag nach dem Boot.)
+
+Rohzahlen, abweichende Auftrags-Ordinalzahlen gegen die eingeschwungene
+Solo-Bahn. Jeder Arm ZWEIMAL gefahren, weil die entscheidende Groesse nicht
+die Zahl der Abweichungen ist, sondern ob sie sich reproduziert:
+
+| Boot | B (wenig Enden) | C (viele Enden) | Summe |
+|---|---|---|---|
+| 1 scharfgestellt | [3,4,5,6,7] | [2,3,6] | 8/16 |
+| 6 scharfgestellt, Wiederholung | [6,7] | [3,5,7] | 5/16 |
+| 2 gefixt | [4,5] | [4,5] | 4/16 |
+| 5 gefixt, Wiederholung | [4,5] | [4,5] | 4/16 |
+
+Zeigerbeleg auf TP0 (die Karte mit der Lane), in der Form aus D2:
+
+    Boot 1  scope=None lane=None flashinfer_workspace ptr=0x78440c000000 new=True
+            scope=0    lane=None flashinfer_workspace ptr=0x78440c000000 new=False
+                                 lanes_registered=[None]
+    Boot 2  scope=None lane=None flashinfer_workspace ptr=0x7a2a9c000000 new=False
+            scope=0    lane=0    flashinfer_workspace ptr=0x7a28e4000000 new=True
+                                 same_name_other_lanes=[None]
+                                 lanes_registered=[None, 0]
+
+TP1 und TP2 tragen keine Lane und registrieren jeden Namen genau einmal.
+
+Daraus die eigentliche Aussage, ueber alle 32 Auftraege eines Laufs:
+
+| Arm | Solo-Phasen reproduzierbar | Phasen UNTER LAST reproduzierbar |
+|---|---|---|
+| scharfgestellt | ja | **NEIN** |
+| gefixt | ja | **ja, byte-identisch** |
+
+Der gefixte Lauf ist ueber zwei Boots in allen vier Phasen und allen 32
+Auftraegen byte-identisch, obwohl die Verbandslast zwischen den beiden Boots
+um mehr als 50 % auseinanderlag (Phase B: 33 gegen 50 fertige Anfragen; die
+scharfgestellten Boots lagen bei 59 gegen 14). Der scharfgestellte Lauf ist
+in den Solo-Phasen ebenfalls byte-identisch und in den Lastphasen nicht —
+andere Positionen, andere Anzahl.
+
+**FALSIFIKATOR AUSGELOEST, und der Schuldspruch haengt an der
+Reproduzierbarkeit, nicht an der Zahl.** Eine Abweichung, die sich
+boot-zu-boot unter deutlich anderer Last nicht wiederholt, ist eine Race;
+eine, die sich exakt wiederholt, ist es nicht. Scharfgestellt ist die
+nebenlaeufige Lane unter Verbandslast nichtdeterministisch; gefixt ist sie
+wieder deterministisch. Das ist die Korrektheitsaussage, um die es in
+Posten 0 ging.
+
+Die verbleibenden 4 von 16 des gefixten Arms sind damit KEINE Korruption,
+sondern der deterministische, lastunabhaengige Unterschied zwischen „Lane
+allein" und „Lane neben dem Verband". Offen bleibt, warum dieser
+Unterschied ueberhaupt auf die Bahn durchschlaegt — als Frage an D4
+formuliert und mit einem konkreten naechsten Messschritt versehen
+(DESIGN_121 §13.11 Punkt 0). Die naheliegende Vermutung
+GDN-/Mamba-Slot-Wiederverwendung ist dabei bereits WIDERLEGT: bei
+`max_running_requests=1` bekommt die Lane immer denselben Slot in derselben
+Reihenfolge, und die Solo-Bahn ist byte-identisch.
+
+### VRAM-Posten des Fixes
+
+Ein zweiter Float-Workspace je NEBENLAEUFIGER Lane,
+`SGLANG_FLASHINFER_WORKSPACE_SIZE` gross. Gemessen auf der 5090:
+28871 -> 29283 MiB belegt (+412 MiB inklusive Allokator-Rundung), bei
+UNVERAENDERTEM `--rank-gpu-memory-mib 21300` und 3324 MiB frei. Das
+4.12-Rezept traegt den Posten ohne Aenderung — deshalb konnten die
+Gegenbeweis-Wiederholungen dasselbe Rezept wie D2 fahren, ohne eine zweite
+Variable einzufuehren.
+
+### Posten 1: die Gegenbeweis-Wiederholung steht auf 3/3
+
+D2 hatte den Gegenbeweis ehrlich als EINEN Boot mit sechs Phasen ausgewiesen.
+D3 fuegt zwei Wiederholungen mit demselben Rezept, derselben Phasenliste und
+demselben Schaetzer (Fenster 1,0 s) hinzu — jetzt zusaetzlich mit dem
+D3-Workspace-Fix im Prozess. Alle drei Boots ueberleben 6 von 6 Phasen mit
+NULL Asserts und null Tracebacks:
+
+| Groesse | D2 bootF (1/3) | D3 b3cp2 (2/3) | D3 b4cp3 (3/3) | Spanne |
+|---|---|---|---|---|
+| P2 Lane-Prefill Tok/s | 29,200 | 29,200 | 29,197 | **0,010 %** |
+| P2 Lane-Decode Tok/s | 57,574 | 57,769 | 57,720 | 0,34 % |
+| P4 Lane-Prefill Tok/s | 3026,973 | 2983,905 | 3071,561 | 2,9 % |
+| P5 Lane-Prefill Tok/s | 1306,819 | 1345,058 | 1345,893 | 3,0 % |
+| P6 Lane-Prefill Tok/s | 1318,126 | 1297,089 | 1363,708 | 5,1 % |
+| P1 Verbands-Prefill Tok/s | 1409,484 | 1389,484 | 1410,388 | 1,5 % |
+| P3 Verbands-Prefill Tok/s | 1388,880 | 1426,871 | 1413,721 | 2,7 % |
+
+Die P2-Lane-Prefillrate ist ueber alle drei Boots auf drei Nachkommastellen
+identisch; alles andere liegt innerhalb des A-vs-A-Bodens, den D2 fuer die
+Decode-Groessen mit 2,7 % erhoben hat. **Der D3-Fix kostet damit ebenfalls
+nichts Messbares** — die Boots 2/3 und 3/3 tragen ihn, Boot 1/3 nicht.
+
+### Posten 1, zweiter Teil: Empfehlung zum LaneShareMeter-Default
+
+**Empfehlung: NOCH NICHT auf AN — aber der Grund von D1 ist erledigt und darf
+nicht laenger genannt werden.**
+
+Was sich geaendert hat: D1 hatte das Flag auf AUS gestellt, weil der
+aktivierte Schaetzer den Server im Prefill-Arm 3 von 3 Mal kippte. D2 hat
+gezeigt, dass der Schaetzer daran unbeteiligt war (reines Python ueber zwei
+Ganzzahlen; die Wurzel war der prozessweite `share_input_buffer`-Pool), und
+D3 fuegt zwei weitere Boots mit aktivem Schaetzer hinzu. Stand jetzt:
+**3 Boots, Schaetzer AN, beide Familien-Fixe drin, 0 Asserts.** Die
+Sicherheitsbegruendung fuer AUS ist damit widerlegt.
+
+Was gegen ein sofortiges AN spricht, und beides ist unabhaengig vom Absturz:
+
+1. **Der Preis liegt an der falschen Stelle.** Der Schaetzer arbeitet im
+   Scheduler-Thread unmittelbar vor dem Batch-Start des Verbands. Er ist
+   nie gegen die ms/Runde des Verbands gemessen worden, sondern nur als
+   „kostet Arbeit" beschrieben. Ein Default-AN ohne diese Zahl waere eine
+   Annahme im Auslieferungszustand.
+2. **Die zu messende Groesse ist noch nicht korrekt.** D3 hat gezeigt, dass
+   die nebenlaeufige Lane unter Verbandslast weiterhin von ihrer Solo-Bahn
+   abweicht (Rest-Traeger, DESIGN_121 §13.11 Punkt 0). Ein
+   standardmaessig eingeschaltetes Instrument wuerde eine Groesse als
+   Telemetrie veroeffentlichen, deren Erzeuger noch nicht abgeschlossen ist.
+
+**Konkretes Tor fuer D4**, damit die Frage beim naechsten Mal entschieden
+statt erneut gestellt wird — Default AN, sobald beides gilt:
+(a) der Rest-Traeger ist geschlossen und die Lane trifft unter Last ihre
+Solo-Bahn 16/16, und (b) die Scheduler-Thread-Kosten des Schaetzers sind in
+ms/Runde des Verbands gemessen und liegen unter dem dortigen Rauschboden.
+Bis dahin bleibt es das, was 4.13 beschreibt: ein Instrument, das man fuer
+eine Messung einschaltet.
+
+### Posten 2 (Lane-Prefill-Chunking): Entwurf, nicht gebaut
+
+Das Budget ging fuer Posten 0 (zwei Boots: scharfgestellt und gefixt) und
+Posten 1 (zwei Boots) drauf, plus eine Wiederholung der Rest-Messung. Der
+Entwurf steht in DESIGN_121 §13.10 und benennt die vier Schritte in
+Bau-Reihenfolge: die Chunk-Schleife in `_prefill`, den Zwang, dass die
+Chunk-Groesse eine Sprosse der gefangenen Prefill-Leiter ist, das
+Mitziehen des NEXTN-Kopfes im spekulativen Zweig (der Teil mit dem echten
+Risiko) und die Messpflicht.
+
+### CPU-Tore
+
+`test_dual_group_concurrency.py` +10 (`TestPerLaneAttentionWorkspace`:
+nebenlaeufige Lanes bekommen eigene Workspaces, ein Scope teilt weiter, die
+serielle Lane teilt weiter, die Notluke reproduziert beide Defekte, Namen
+bleiben getrennt, Verbands-Nullung laesst die Lane in Ruhe, die Lane nullt
+nur ihr eigenes, ein leerer Eimer ist 0 statt KeyError) -> 81 statt 71.
+Ueber die fuenf Dual-Group-/Lane-Suiten 167 statt 157.
+`test_runtime_context.py` 63, unveraendert.
+ruff/black/isort: Delta null auf allen geaenderten Python-Dateien (die
+vorbestehenden Befunde in `flashinfer_backend.py` — 31 ruff, 36 black-Hunks
+— sind vor und nach der Aenderung identisch, keiner davon in einem
+geaenderten Bereich). codespell auf den Python-Dateien sauber; auf den
+deutschsprachigen Dokumenten produziert es wie bisher Fehlalarme auf
+deutsche Woerter (Basis 974 Treffer in denselben drei Dateien, danach 1095
+— dieselbe Klasse, proportional zu den neuen Zeilen). mypy auf
+`runtime_context.py`: nur der vorbestehende Befund in Zeile 362.

@@ -1208,6 +1208,56 @@ writers, one buffer, foreign slot ids. The pool is keyed by
   `out_cache_loc numel=<chunked_prefill_size>` pointer appears twice —
   `new=True` from the serving group, `new=False` from the lane.
 
+### 4.14 The lane's attention workspace (#274 slice D3)
+
+Same family as 4.13, one layer down, and it does not announce itself: no
+assert, just wrong attention numbers.
+
+`RuntimeContext.get_buffer(name, factory)` was keyed by NAME alone, and every
+production caller of it is an attention float workspace (flashinfer,
+flashinfer-MLA, trtllm-MLA, trtllm-MHA, DSA, musa-flashattention). A
+concurrent lane builds a second set of backends under `lane_scope(lane_id)`
+and was handed the serving group's 384 MiB scratch — two threads, two
+streams, one buffer of live split-KV partials. On top of that,
+`zero_flashinfer_workspaces()` (the #50 per-request contract, driven by the
+SERVING group's request finish) zeroed every registered workspace, because
+the registry knew no lane. Both are keyed by `current_lane_id()` now, and
+each group restores its own zero contract at its own job boundary — the
+lane's in `DualGroupLane._finish`.
+
+- **VRAM post**: one extra float workspace per CONCURRENT lane,
+  `SGLANG_FLASHINFER_WORKSPACE_SIZE` big. Measured on the 5090: 28871 →
+  29283 MiB used (+412 MiB with allocator rounding), 3324 MiB still free at
+  an UNCHANGED `--rank-gpu-memory-mib 21300`. The 4.12 recipe carries it
+  without a change. Serial lanes pay nothing (they share on purpose).
+- **Reproducer**, if you need the defect back: `SGLANG_LANE_SHARED_ATTN_WORKSPACE=1`
+  restores the process-wide key AND the lane-blind zeroing in one switch.
+- **The instrument is the lane's own output, not a crash.** Run one job
+  shape repeatedly: solo first (that is the floor), then under serving load,
+  and compare `output_ids`. Two things decide whether the run means
+  anything. Keep the prompt UNDER ~109 tokens — Qwen-GDN prefill is not
+  reproducible above that, and it would look exactly like the defect. And
+  take the reference from the SECOND solo phase: the lane walks a
+  deterministic warm-up ladder over its first ~8 jobs and is settled after
+  it. Measured with both: the solo trajectory is byte-identical across
+  BOOTS, so the floor is exactly zero.
+- **Run each arm TWICE — the verdict is reproducibility, not the count.**
+  A deviation that does not repeat across boots under clearly different
+  load is a race; one that repeats exactly is not. Measured: armed, the
+  loaded phases do NOT reproduce between two boots (8/16 deviating jobs at
+  [3,4,5,6,7]+[2,3,6], then 5/16 at [6,7]+[3,5,7]); fixed, all 32 jobs of
+  all four phases are byte-identical between two boots even though the
+  serving load differed by more than 50 %. The residual 4/16 deviation from
+  the SOLO trajectory is therefore not corruption but the deterministic,
+  load-independent difference between running alone and running alongside
+  (DESIGN_121 §13.11 names the open question and the next measurement).
+- **Seeing it directly**: `SGLANG_DEBUG_RUNTIME_BUFFER_POOL=1` logs one line
+  per named-buffer registration and one per workspace registration. On the
+  rank carrying the lane, armed shows `scope=0 lane=None ... new=False` on
+  the serving group's pointer and `lanes_registered=[None]`; fixed shows
+  `scope=0 lane=0 ... new=True`, `same_name_other_lanes=[None]` and
+  `lanes_registered=[None, 0]`.
+
 
 ## 5. Credentials
 
