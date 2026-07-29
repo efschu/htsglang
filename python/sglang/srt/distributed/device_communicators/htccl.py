@@ -161,6 +161,14 @@ class HTCCLCommunicator:
         self.transport = _build_transport(
             _TRANSPORT, cpu_group, device, disabled=self.disabled
         )
+        # #279 path dispatcher (skeleton, flag-gated, default None). With an
+        # empty registry every decision is status quo, so building it does
+        # not change any selection -- see htccl_path_dispatcher.
+        from sglang.srt.distributed.device_communicators.htccl_path_dispatcher import (
+            maybe_build_dispatcher,
+        )
+
+        self._path_dispatcher = None if self.disabled else maybe_build_dispatcher()
         # Dedicated copy stream: D2H of the next chunk overlaps with the
         # CPU-side gloo reduction of the current one.
         self._stream = torch.cuda.Stream(device=device)
@@ -178,9 +186,17 @@ class HTCCLCommunicator:
         between ops the way it did when each site hard-coded its own condition.
         """
         t = self.transport
-        if t is not None and t.handles(op, nbytes):
-            return t
-        return None
+        chosen = t if (t is not None and t.handles(op, nbytes)) else None
+        dispatcher = getattr(self, "_path_dispatcher", None)
+        if dispatcher is not None:
+            # Thin #279 hook onto the existing #240 class choice: status-quo
+            # decisions (today: all of them) return `chosen` unchanged.
+            from sglang.srt.distributed.device_communicators.htccl_path_dispatcher import (  # noqa: E501
+                refine_transport_choice,
+            )
+
+            return refine_transport_choice(dispatcher, op, nbytes, chosen)
+        return chosen
 
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
         """One FRESH output tensor per call — never a shape-keyed cache.

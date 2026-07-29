@@ -8594,3 +8594,90 @@ WIRKLICH GPU-pflichtige Restliste (Boot-Queue):
 4. Messpflichten: Rueckhol-Latenzen je Klasse, PCIe-Raten fuer Arbiter +
    Overlap-Kostenfunktion; Experten-Klasse auf das gemeinsame Backend.
 
+
+## HTCCL-Pfad-Dispatcher-Skelett (#279) (feat/htccl-path-dispatcher-skeleton, Basis 53db42152a) — 2026-07-29
+
+CPU-Skelett des groessen- und lastbewussten Pfad-Dispatchers, komplett ohne
+GPU gebaut/getestet (Baustart der echten Ratentabellen bleibt blockiert auf
+die NCCL/System-RAM-Referenzmessung; deren FORMAT ist jetzt definiert, s.u.).
+
+Gebaut:
+
+- `device_communicators/htccl_path_dispatcher.py`: Pfad-Registry
+  (`PathProfile`: affines Kostenmodell ms(bytes)=base+per_byte*bytes per
+  Least-Squares-Fit, Kapazitaet, effektive Apertur, Herkunfts-Label
+  measured|placeholder je Eintrag) + `PathDispatcher.decide()` je
+  (Nachrichtenklasse, Groesse, Lane, Prio): bester Pfad nach Kosten, bei
+  Saettigung Ueberlauf auf den naechstbesten unsaturierten; alles gesaettigt
+  -> bester Pfad (Drosseln ist Sache des Bus-Arbiters). Saettigung ueber
+  injizierbaren Sensor (`set_saturation_sensor`, dasselbe gruppenweite
+  13e-Signal und Placeholder-Hook-Muster wie im Offload-Register; kein
+  Sensor = ungesaettigt, sichere Richtung).
+- HARTE REGELN, je an genau einer Stelle erzwungen (`_compute_locked` /
+  `decide`/`round_boundary` / `_cost_locked`):
+  1. Placeholder-Neutralitaet: solange irgendein Kandidat einer Klasse
+     placeholder ist (oder die Klasse keine Kandidaten hat) -> STATUS_QUO,
+     d.h. der Aufrufer behaelt die bestehende #240-Klassenwahl; Kostenmodell,
+     Sensor und Latenz-Term werden davor gar nicht konsultiert.
+  2. Graph-Safety (Flip-Kontrakt wie K-Leiter): Entscheide gelatcht je
+     (Lane, Klasse, Prio, Groessenband), Wechsel nur in `round_boundary()`;
+     waehrend aktiver Capture wird `round_boundary()` verweigert (Log),
+     neue Keys in der Capture latchen STATUS_QUO (Replay sieht identische
+     Entscheidung); `end_capture()` ist selbst eine Grenze.
+  3. Prio-Schutz: `protected`-Requests bekommen immer den besten Pfad und
+     werden nie per Ueberlauf auf einen langsameren verdraengt.
+  4. Geparkte Offload-Posten = Latenz-Term: `set_offload_latency_term(
+     OffloadRegister.latency_term_ms)`; Pfade tragen optional eine
+     `offload_class`, deren Park-Latenz in den Kostenvergleich eingeht.
+- Bus-Begriff geteilt, nicht verschmolzen: benannter Adapter
+  `bus_saturation_sensor(arbiter, path_to_consumer)` liest die
+  #286-`BusBudgetArbiter`-Telemetrie (pending_demand) als Sensor.
+- `device_communicators/htccl_path_rates.py`: Lader der drei Quellen, alle
+  konsumieren NUR Effektiv-/Messwerte:
+  1. p2p_readiness: `capability_matrix.json` -> effektive Aperturen je
+     gerichtetem Paar (nominale BAR1-Felder bewusst ignoriert; nur-nominale
+     Zeilen werden uebersprungen), `d2d_bench.json` -> measured-Profile
+     `d2d_direct:`/`host_staged:<src>-><dst>` aus den Median-Leitern
+     (error-Punkte = Ergebnis, kein Abbruch).
+  2. #278-GDR-TSV (11 Spalten `pair..MB_per_s`): `gdr_direct`/`nic_staged`
+     `[+ro]@d<depth>:<src>-><dst>`; median_us ist eine Runde mit depth
+     Nachrichten -> je-Nachricht-Zeit median/depth.
+  3. NCCL-Referenz-FORMAT (`new_nccl_reference_envelope`, schema_version 1,
+     Pflichtfelder je Zeile: op, transport, world, src_pci, dst_pci,
+     size_bytes, iters, p50_us, p99_us, load) — p99 und Last-Arm sind
+     Pflicht (Lehre aus der asymmetrischen p50-vs-p99-Erhebung im
+     #278-Abschluss); idle-Zeilen -> Kostenmodell (p50), Last-Zeilen ->
+     separate `@load=<arm>`-Profile (p99).
+  Fehlende/unlesbare Quellen: LAUT geloggt, placeholder -> Regel 1 haelt die
+  Klassen auf dem Status quo. Fehlerhafte Zeilen sind Eintraege in
+  `LoadResult.errors`, nie Abbrueche.
+- Verdrahtung: `SGLANG_HTCCL_PATH_DISPATCHER=1` (Default aus, environ.py);
+  `HTCCLCommunicator` baut den Dispatcher und fragt ihn in `_select` ueber
+  den duennen Hook `refine_transport_choice` (Status-quo-Entscheide — heute
+  alle — geben die bestehende Wahl unveraendert zurueck; measured-Entscheide
+  wirken nur ueber transport_hint transport|gloo, unwirkbare Hints fallen
+  laut auf den Status quo). Kein Umbau der Transporte.
+
+Tests `test/registered/unit/distributed/test_htccl_path_dispatcher.py`:
+46 Tests, alle gruen. Placeholder-Neutralitaets-Beleg:
+`test_htccl_select_identical_with_and_without_dispatcher` treibt
+`HTCCLCommunicator._select` ueber das komplette Raster (3 Dispatcher-Zustaende
+x 3 Transporte x 4 Ops x 4 Groessen) und verlangt identische Objekt-Identitaet
+der Wahl; dazu `test_sensor_and_latency_never_consulted_under_placeholder`
+(Hooks, die bei Konsultation werfen). Regressionslauf
+`test/registered/unit/distributed/`: 778 passed, 16 failed — identisch das
+dokumentierte vorbestehende Failure-Set (LOCAL_RANK-Umgebung, retry()-
+Timeouts), kein neuer Fehlschlag. ruff/codespell sauber.
+
+NUR mit Karten machbar (Restliste #279):
+1. NCCL/System-RAM-Referenzmessung im definierten Format (beidseitig p99
+   unter identischer Last — der im #278-Abschluss benannte Nachzug).
+2. p2p_readiness-Probe-Lauf nach dem Treiber-Update -> echte Aperturen/
+   Raten einspeisen (`load_rate_tables`), erste measured-Klassenwahl
+   freischalten und die einfachste Dispatcher-Hypothese aus dem
+   Depth-Verdikt ("immer direkt + depth>=4") falsifizieren/bestaetigen.
+3. Verdrahtung der Runden-/Capture-Grenzen an die echten Runner
+   (`round_boundary`/`begin_capture`-Aufrufstellen) + gruppenweiter
+   13e-Sensor (braucht Kollektiv) + Lane-Keys aus der Dual-Gruppen-Runtime.
+4. transport_hint-Belegung je realem Pfad und Messung, ob der Hook-Entscheid
+   selbst unter Graph-Betrieb kostenneutral ist.
