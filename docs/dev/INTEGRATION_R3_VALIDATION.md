@@ -8369,3 +8369,56 @@ und `test_fp8_dequant_gemv.py`.
 - Ob der Q8_0-GGUF-Drafter laedt und kohaerent generiert (C). Das CPU-Tor sagt
   94/94; ein Fehlschlag dort waere neue Information.
 - Was das Re-Seed kostet und bringt (D).
+
+## Offload-Register CPU-Phase (#286) (feat/offload-register-cpu, Basis ef1ccd5af8) — 2026-07-29
+
+Schnittstellen-Audit des Experten-Offloads gemaess Nachtrag-13-Ergaenzung 7b:
+das Register wird NICHT neu gebaut, sondern fuehrt neue Posten-Klassen in das
+vorhandene VRAM-Tiering ein. Dazu zuerst die Inventur, welche Zutat der
+Maschinerie heute generisch ist, welche mit kleinem Umbau generalisierbar,
+und welche expertenspezifisch bleibt. Spalte 5 (Ergaenzung 7c): ob die Zutat
+phasen-tauglich ist (Stufe 2, 10-100 ms) oder an den Layer-/Wellen-Takt
+gebunden.
+
+| Zutat | Ort | Klassifikation | Was fehlt fuers Register | Phasen-Tauglichkeit (7c) |
+|---|---|---|---|---|
+| Heiss/Kalt-Klassifikation + Residenz-Budget (R+C-Slots, resolve) | `layers/moe/expert_offload.py` `ExpertResidencyPlanner` (L362) | EXPERTENSPEZIFISCH in der Signalquelle (Router-topk_ids je Forward), als Muster generalisierbar | klassenneutrales Heiss-Signal; im Register als `hot`-Callable + `touch()`-Hysterese geloest | an Layer-Takt gebunden (pro-Forward-resolve) |
+| Pinned-Host-Pool + async H2D hinter Compute (`install`, `_fetch`, Copy-Stream mit wait_stream in beide Richtungen) | `expert_offload.py` `MoEExpertOffloadCache.install/_fetch` (L812/L910) | GENERISCH heute (einzige Annahme: expert-major dim 0) | posten-neutrale Slice-Schnittstelle (Posten ist EIN Block, kein Row-Pool) — kleiner Umbau | JA: H2D-hinter-Compute ist takt-agnostisch; genau die #125-Mechanik, die Stufe 2 mit Phasen-Granularitaet braucht |
+| Double-Buffer-Prefetch #125 / Wellenordnung #254 (`plan_token_waves`, `plan_expert_waves`, k-Order-Combine) | `expert_offload.py` L210/L271, `_run_waves_expert_major` (L1291) | Prinzip GENERISCH, Implementierung expertenspezifisch (topk-Semantik, Byte-Identitaets-Argument) | Phasen- statt Layer-Granularitaet: der Stufe-2-Hook (`on_phase_boundary`) ist das Register-Gegenstueck | JA — 7c nennt Stufe 1 ausdruecklich als Beweis, dass Phasen-Multiplexing bei richtigem Overlap funktioniert |
+| CUDA-Graph-Tauglichkeit: UVA-Zero-Copy-View des pinned Pools + capturable Remap | `expert_offload.py` `device_view_of_pinned` (L613), `prepare_capturable_remap` (L637) | UVA-View GENERISCH (stable-pointer-Gather fuer jeden pinned Posten); LUT-Remap expertenspezifisch (ID-Achse) | nichts fuer die View; Remap wird nicht gebraucht | JA (Adressen stabil, Inhalt variabel — graph-kompatibel) |
+| Release-/H2D-Telemetrie (`ExpertOffloadRelease`, `ResidencyStats.h2d_bytes`) | `expert_offload.py` L120/L194 | GENERALISIERBAR (Zaehler expert-benannt) | Register fuehrt eigene `OffloadRegisterStats`; Messpflichten (Erg. 4/7) nutzen die vorhandene Offload-Telemetrie | takt-agnostisch |
+| VA-stabiles Remap / taggbare Capture-Pools #93/#102 (per-Tag MemPool + `graph_pool_handle` + pause/resume, Segment-Isolations-Audit, Resume-Reclaim) | `speculative/adaptive_graph_memory.py` `AdaptiveGraphMemoryManager` (L435), `utils/torch_memory_saver_adapter.py` | GENERISCH (nicht expertenspezifisch; heute an Spec-K-States gebunden) | Tag-Namensraum je Register-Posten (`va_stable_required`); das ist der GPU-Phase-Bewegungspfad fuer Sprossen + Koepfe | pause/resume ist ms-Klasse; ob eine Bewegung in eine Phase passt, entscheidet die Overlap-Rechnung (7c-Physik: 1,8-GB-Kopf je Runde NICHT versteckbar) |
+| #89 Suspend-/Hibernate-Pfad (memory-saver-Tags weights/kv/graphs, Disk-Park mit NVML-UUID-Lock) | `managers/scheduler_components/weight_updater.py` (L184/L235/L326), `model_loader/hibernate.py` (L354/L472) | GENERISCH auf Tag-Ebene | lane-scoped Tags (heute prozessweit) fuer die Klasse `cold_lane` | NEIN — s-Klasse, Turn-Tier |
+| Spill-Budgets #236/#242 (Raten-Bucket, Volumen-Grenzen, Cooldown/Anti-Pendel, Herabstufung) | `managers/kv_session_offload.py` `SpillBudgetConfig` (L1279), `SpillRateBucket` (L1442), `_budget_demote` (L2853) | GENERALISIERBAR: Raten-/Volumen-/Cooldown-Muster passt 1:1 auf den PCIe-Bus-als-Posten (7c) | posten-klassen-neutrale Budgetachse (heute KV-Session-verdrahtet); Anschluss an das 13e/#279-Saettigungssignal | Rate-Bucket takt-agnostisch; Herabstufung an Iterations-Takt gebunden |
+| Opferwahl Leerlauf-zuerst + Hysterese/Prio-Schutz | `kv_session_offload.py` `_budget_evaluate_episodes` (L2777); Erg.-7-Invarianten | Muster GENERISCH | im Register als ERZWUNGENE Invarianten (Hysterese-Fenster je Stufe, park()-Ablehnung heisser/prio-geschuetzter Posten) | ja (Invarianten sind takt-parametrisiert) |
+| Router-Signal + Schicht-Wellen-Takt | `expert_offload.py` `run_waves` (topk_ids je Layer) | EXPERTENSPEZIFISCH, bleibt es | nichts — benannter Unterschied per 7b: gleiche Mechanik, andere Zeitkonstante, anderes Heiss-Signal (Phasen-Maske + Turn-Hysterese statt Router) | Stufe 1 selbst |
+
+Gebaut (CPU-testbar, keine GPU-Nutzung):
+
+- `python/sglang/srt/model_executor/offload_register.py`: Klassen-
+  Registrierung (Posten meldet Klasse, Groesse, Rueckhol-Kosten-Schaetzer,
+  Heiss-Kriterium, VA-Stabilitaets-Anforderung, Prio-Klasse, Phasen-Maske,
+  Zeitkonstanten-Stufe wave|phase|turn), Politik je Klasse
+  resident|ram|auto plus Anteils-Regler 0..1, Preset-Aufloesung
+  latency|capacity|auto (Presets sind nur Buendel der Einzelregler),
+  Invarianten IM CODE erzwungen (Hysterese-Fenster je Stufe, heisse Posten,
+  Prio-Schutz, Anteils-Kappe, Overlap-Budget fuer Stufe-2-Kandidaten),
+  Bewegungs-Backend-Interface mit CPU-Fake, Latenz-Term-API fuer den
+  #279-Dispatcher (geparkt = Rueckhol-ms, NIE Nicht-Verfuegbarkeit),
+  Stufe-2-Hook `on_phase_boundary` als No-Op-Planer.
+- ServerArgs: `--lane-offload-profile` (Default latency bis zur Messphase)
+  + `--lane-offload-class-policy` (`klasse=politik[:anteil]`), fruehe
+  Validierung in `_handle_lane_offload_register` (harte Fehler bei
+  unbekannter Klasse/Politik/Anteil).
+- Adapter-Stubs hinter `SGLANG_OFFLOAD_REGISTER=1` (Default aus, Default-
+  Pfad byte-unveraendert): `dual_group_lane.py` (Sprossen je Leiter-Rung,
+  Drafter-Kopf mit Phasen-Maske draft, kalte Lane), `runtime_context.py`
+  `get_buffer` ((lane,name)-Workspaces, D3), `input_buffers.py`
+  (lane-gekeyte Pools, D2) — nur Registrierung + Groessen-/Zugriffs-
+  Buchfuehrung, keine Bewegung.
+
+Offene GPU-Phase-Posten (Boot-Queue): siehe Abschlussbericht des Slices —
+Bewegungs-Backend auf #93-Tag-Pools + #89-Pfad, gemessene Rueckhol-Latenzen
+je Klasse (Messpflicht vor jedem auto/ram-Default), PCIe-Overlap-Raten fuer
+die Stufe-2-Kostenfunktion, lane-scoped memory-saver-Tags, Experten-Klasse
+auf das gemeinsame Backend.

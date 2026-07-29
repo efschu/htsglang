@@ -1308,6 +1308,65 @@ class DualGroupLane:
         # decode-shaped step have different solo floors and may not be
         # averaged into one rate.
         self.work_total = {"prefill_tokens": 0, "decode_tokens": 0}
+        self._register_offload_items()
+
+    def _register_offload_items(self) -> None:
+        """#286 offload register, CPU-phase adapter (thin): book this lane's
+        capture-ladder rungs (Erg. 4) and its drafter head (Erg. 6) as
+        register items -- registration + hot-criterion wiring only, NO
+        movement. Sizes are 0 until the GPU measurement phase feeds the real
+        per-rung pool / head footprints (Messpflicht). Gated behind
+        SGLANG_OFFLOAD_REGISTER (default off => no-op; the default path is
+        byte-unchanged)."""
+        from sglang.srt.model_executor.offload_register import (
+            maybe_register_item,
+            offload_register_enabled,
+        )
+
+        if not offload_register_enabled():
+            return
+        for rung in self.spec_rungs:
+            if rung == 0:
+                # K=0 is the plain no-spec decode entry; it costs no extra
+                # graph pool, so there is nothing to park.
+                continue
+            maybe_register_item(
+                f"lane{self.lane_id}/graph_rung/k{rung}",
+                "graph_rungs",
+                0,
+                # The ACTIVE rung is hot and must stay resident; captured
+                # graphs must survive a park without re-capture, hence the
+                # VA-stability requirement (#93 VMM remap in the GPU phase).
+                hot=lambda k=rung: self.spec_policy.current == k,
+                va_stable_required=True,
+                time_constant_tier="turn",
+            )
+        if self.draft_runner is not None:
+            maybe_register_item(
+                f"lane{self.lane_id}/drafter_head",
+                "drafter_heads",
+                0,
+                # The head is hot while the lane is mid-tick; between jobs it
+                # is the Erg.-6 park candidate. The phase mask records that a
+                # round only needs it during the draft step (Erg. 7c stage-2
+                # interface; the turn tier governs actual parking for now).
+                hot=lambda: self._busy,
+                va_stable_required=True,
+                phase_mask=("draft",),
+                time_constant_tier="turn",
+            )
+        # Class d: the WHOLE cold lane (everything this lane owns alone --
+        # graphs, workspaces, draft-KV remains; the byte-shared weights
+        # belong to the group and are never part of the item). Parked via the
+        # #89 suspend path in the GPU phase.
+        maybe_register_item(
+            f"lane{self.lane_id}/cold_lane",
+            "cold_lane",
+            0,
+            hot=lambda: self._busy or bool(self.jobs) or self.active is not None,
+            va_stable_required=True,
+            time_constant_tier="turn",
+        )
 
     # -- job interface (rank-local; called from the scheduler loop) -------
 
