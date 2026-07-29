@@ -2030,6 +2030,30 @@ API-Konsequenz fuer die CPU-Phase (#286): die Posten-Registrierung
 traegt die Phasen-Nutzungs-Maske und die Zeitkonstanten-Stufe von Anfang
 an (Schnittstelle jetzt, Bewegung spaeter); der Scheduler-Hook fuer
 Stufe 2 bleibt in der CPU-Phase ein No-Op.
+Nachtrag-13-Ergaenzung 8 (Nutzer 2026-07-29, GDN-States als Register-
+Klasse + Regime-Verlagerung): GDN-/Mamba-State-Sets sind ein fixer, nach
+MAX-Sessions dimensionierter VRAM-Posten — laufen weniger Sessions, sind
+die uebrigen Sets totes Gewicht. NEU: Klasse gdn_state_sets im Offload-
+Register mit einstellbarer SESSION-LEITER (z.B. max 4 Sets, absenkbar
+bis 1; Sprossen konfigurierbar, NICHT voll-dynamisch — Wechsel an
+Admissions-Grenzen mit Hysterese, wie die K-Leiter). Park-Ziel gemaess
+Tier-Leiter: auch FREIER PLATZ AUF ANDEREN KARTEN (peer_vram), nicht
+zwingend System-RAM — "besser verteilt je nach Last und Aufgabe". Das
+hebt die bisherige KV-Spill-Grenze "GDN bleibt resident" gezielt auf.
+VERLAGERUNGS-TEIL: der Gewinn "weniger TP-Raenge = weniger Allreduce +
+schnellere Karte" kommt im Wenig-Session-Regime NICHT durch Layer-
+Umverteilung, sondern durch die vorhandene Lane-Mechanik — Routing auf
+die TP=1-Lane der schnellen Karte ueber byte-geteilte Gewichte, null
+Resharding; der durch geparkte GDN-Sets freigewordene VRAM finanziert
+genau die Posten, die diese Lane tragfaehig machen (KV, Graphen,
+Drafter). Echtes Neu-Sharden der Layer ist die teure Reserve-Variante,
+nur falls die Nesting-Geometrie den Zielzustand nicht enthaelt.
+Bei steigender Last: Sets zurueckwaven (Wave-in hinter Admission/
+Erst-Chunk), Routing zurueck auf den Verband. Alles-greift-in-alles:
+kombinierbar mit Phasen-Maske (Stufe 2), Bus-Budget, Prio-Klassen;
+Messpflicht wie ueberall (State-Set-Groesse, Rueckhol-Latenz vs
+Admissions-Takt) vor jedem auto-Default. Einbau: Offload-Slice
+(GPU-Phase), Klasse + Leiter-Flag jetzt benannt.
 NUTZEN-VERDIKT Stufe 2 (Eroerterung 2026-07-29): Auf DIESEM Rig eng
 lastabhaengig — latenz-gebundener bs=1-Decode versteckt je Runde nur
 ~150-300 MiB (kleine Posten, Gewinn wenige 100 MiB KV); real wird es
