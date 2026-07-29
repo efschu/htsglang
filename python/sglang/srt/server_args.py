@@ -4053,15 +4053,34 @@ class ServerArgs:
             help="Per-class overrides of the #286 offload register, beating "
             "the --lane-offload-profile preset (presets are only bundles of "
             "these individual knobs). Comma-separated "
-            "<class>=<policy>[:<fraction>] entries, e.g. "
-            "'drafter_heads=ram:0.5,graph_rungs=auto'. Classes: graph_rungs, "
-            "drafter_heads, lane_workspaces, cold_lane, experts. Policies: "
-            "resident (never parked), ram (parkable up to the fraction), "
-            "auto (sensor/measurement decides). The optional fraction 0..1 "
+            "<class>=<policy>[:<fraction>][@<target>[><target>...]] "
+            "entries, e.g. 'drafter_heads=ram:0.5@peer_vram>host_ram,"
+            "graph_rungs=auto'. Classes: graph_rungs, drafter_heads, "
+            "lane_workspaces, cold_lane, experts. Policies: resident (never "
+            "parked), ram (parkable up to the fraction), auto "
+            "(sensor/measurement decides). The optional fraction 0..1 "
             "bounds how deep the class may be parked (share of its "
             "registered bytes; default: resident=0, ram=1, auto=measured). "
-            "Unknown classes/policies and malformed fractions are hard "
-            "errors at argument time.",
+            "The optional @-suffix overrides the park-target preference "
+            "order of --lane-offload-park-targets for that class (Erg. 7c "
+            "tier ladder). Unknown classes/policies/targets and malformed "
+            "fractions are hard errors at argument time.",
+        ),
+    ] = None
+    lane_offload_park_targets: A[
+        Optional[str],
+        Arg(
+            help="Global park-target preference order of the #286 offload "
+            "register (DESIGN_201 Erg. 7c tier ladder: own_vram = tier 0 / "
+            "stay resident -> peer_vram (P2P, one hop) -> host_ram -> "
+            "remote (#224 stub)). '>'-separated chain of park targets, e.g. "
+            "'peer_vram>host_ram'. Default: host_ram (the measured, proven "
+            "path). peer_vram is used only for directed device pairs whose "
+            "P2P path was PROBED (effective BAR aperture and rate are "
+            "measured figures, never nominal assumptions) AND whose target "
+            "card granted an explicit peer budget; otherwise it degrades to "
+            "host_ram with a log line, never an error. Per class "
+            "overridable via the @-suffix of --lane-offload-class-policy.",
         ),
     ] = None
 
@@ -5311,14 +5330,19 @@ class ServerArgs:
         runner init (and only with SGLANG_OFFLOAD_REGISTER=1)."""
         from sglang.srt.model_executor.offload_register import (
             parse_class_policy_overrides,
+            parse_park_target_order,
             resolve_class_policies,
         )
 
-        # Raises ValueError on unknown profile/class/policy/fraction; the
-        # resolved map is discarded here (recomputed at configure time).
+        # Raises ValueError on unknown profile/class/policy/fraction/target;
+        # the resolved values are discarded here (recomputed at configure
+        # time).
         resolve_class_policies(
             self.lane_offload_profile,
             parse_class_policy_overrides(self.lane_offload_class_policy),
+        )
+        parse_park_target_order(
+            self.lane_offload_park_targets, "--lane-offload-park-targets"
         )
 
     def speculative_draft_solo_active(self) -> bool:

@@ -83,18 +83,29 @@ def _note_workspace_in_offload_register(lane, name: str, buf, new: bool) -> None
         return
     item_id = f"lane_workspace/{lane}/{name}"
     if new:
-        size = 0
-        if callable(getattr(buf, "numel", None)) and callable(
-            getattr(buf, "element_size", None)
-        ):
-            size = int(buf.numel()) * int(buf.element_size())
+        from sglang.srt.model_executor.offload_movement import TensorPayload
+        from sglang.srt.model_executor.offload_register import (
+            maybe_bind_movement_payload,
+        )
+        from sglang.srt.model_executor.offload_sizes import resolve_size_bytes
+
         maybe_register_item(
             item_id,
             "lane_workspaces",
-            size,
+            resolve_size_bytes(buf),
             # Empty phase mask = needed in every phase; the turn tier governs
             # (idle-lane workspaces park at hysteresis boundaries, Erg. 7c).
             time_constant_tier="turn",
+        )
+        # Movement route: plain pinned-pool D2H/H2D (the workspace itself).
+        # Whether a given workspace is graph-captured -- and must therefore
+        # flip to va_stable + a #93 TagPayload instead -- is decided at GPU
+        # wiring time; the backend refuses the tensor route for va_stable
+        # items, so a wrong flip cannot move silently.
+        maybe_bind_movement_payload(
+            item_id,
+            TensorPayload((buf,)),
+            int(getattr(getattr(buf, "device", None), "index", None) or 0),
         )
     else:
         maybe_touch_item(item_id)
