@@ -97,6 +97,13 @@ OFFLOAD_CLASSES = (
 
 OFFLOAD_POLICIES = ("resident", "ram", "auto")
 
+# Erg. 7c park-target tier ladder: own_vram (tier 0 = resident, NOT a park
+# target) -> peer_vram (P2P one-hop) -> host_ram -> remote (#224 stub). The
+# constants live HERE (not in offload_movement) so the policy parser can name
+# them without importing the movement half.
+OWN_VRAM_TIER = "own_vram"
+PARK_TARGETS = ("peer_vram", "host_ram", "remote")
+
 OFFLOAD_PROFILES = ("latency", "capacity", "auto")
 
 # Ergaenzung 7c: the three time-constant tiers of the same mechanic.
@@ -129,10 +136,16 @@ class ClassPolicy:
     the depth will come from the measured per-(class, phase) overlap
     accounting in the GPU phase; until then ``None`` imposes no static cap
     (the mode gate -- sensor for ``auto`` -- is what admits a park at all).
+
+    ``targets`` (Erg. 7c tier ladder) overrides the global park-target
+    preference order (``--lane-offload-park-targets``) for this class; None
+    = use the global order. Syntax on the flag:
+    ``class=mode[:fraction][@target1>target2]``.
     """
 
     mode: str
     fraction: Optional[float]
+    targets: Optional[tuple] = None
 
     def __post_init__(self):
         if self.mode not in OFFLOAD_POLICIES:
@@ -144,6 +157,14 @@ class ClassPolicy:
             raise ValueError(
                 f"offload fraction must be within [0, 1], got {self.fraction}"
             )
+        if self.targets is not None:
+            for target in self.targets:
+                if target not in PARK_TARGETS:
+                    raise ValueError(
+                        f"unknown park target {target!r}; known targets: "
+                        f"{', '.join(PARK_TARGETS)} ({OWN_VRAM_TIER!r} is "
+                        f"tier 0 = stay resident, not a park target)."
+                    )
 
 
 def _default_fraction(mode: str) -> Optional[float]:
@@ -152,7 +173,51 @@ def _default_fraction(mode: str) -> Optional[float]:
     return {"resident": 0.0, "ram": 1.0, "auto": None}[mode]
 
 
+def parse_park_target_order(
+    spec: Optional[str], flag: str, default: tuple = ("host_ram",)
+) -> tuple:
+    """Parse a ``target1>target2`` park-target preference chain (Erg. 7c
+    tier ladder), e.g. ``peer_vram>host_ram``. Hard errors on
+    unknown/duplicate targets and on ``own_vram`` (tier 0 = 'stay resident'
+    is not a park destination)."""
+    if spec is None or not spec.strip():
+        return default
+    order = []
+    for part in spec.split(">"):
+        part = part.strip()
+        if not part:
+            continue
+        if part == OWN_VRAM_TIER:
+            raise ValueError(
+                f"{flag}: {OWN_VRAM_TIER!r} is tier 0 of the ladder (= stay "
+                f"resident) and cannot be a park target; parkable targets: "
+                f"{', '.join(PARK_TARGETS)}."
+            )
+        if part not in PARK_TARGETS:
+            raise ValueError(
+                f"{flag} names unknown park target {part!r}; known targets: "
+                f"{', '.join(PARK_TARGETS)}."
+            )
+        if part in order:
+            raise ValueError(f"{flag} lists park target {part!r} twice.")
+        order.append(part)
+    if not order:
+        return default
+    return tuple(order)
+
+
 def _parse_one_policy(klass: str, spec: str, flag: str) -> ClassPolicy:
+    # Optional per-class park-target suffix: mode[:fraction][@t1>t2].
+    spec, at_sep, target_spec = spec.partition("@")
+    targets = None
+    if at_sep:
+        if not target_spec.strip():
+            raise ValueError(
+                f"{flag} entry {klass}={spec!r}@: empty park-target list; "
+                f"expected @<target>[><target>...] with targets from "
+                f"{', '.join(PARK_TARGETS)}."
+            )
+        targets = parse_park_target_order(target_spec, f"{flag} entry {klass!r}")
     mode, sep, frac_str = spec.partition(":")
     mode = mode.strip()
     if mode not in OFFLOAD_POLICIES:
@@ -161,7 +226,7 @@ def _parse_one_policy(klass: str, spec: str, flag: str) -> ClassPolicy:
             f"known policies: {', '.join(OFFLOAD_POLICIES)}."
         )
     if not sep:
-        return ClassPolicy(mode, _default_fraction(mode))
+        return ClassPolicy(mode, _default_fraction(mode), targets)
     frac_str = frac_str.strip()
     try:
         fraction = float(frac_str)
@@ -174,14 +239,17 @@ def _parse_one_policy(klass: str, spec: str, flag: str) -> ClassPolicy:
             f"{flag} entry {klass}={spec!r}: fraction must be within "
             f"[0, 1], got {fraction}."
         )
-    return ClassPolicy(mode, fraction)
+    return ClassPolicy(mode, fraction, targets)
 
 
 def parse_class_policy_overrides(spec: Optional[str]) -> Dict[str, ClassPolicy]:
-    """Parse ``--lane-offload-class-policy`` (e.g. ``"drafter_heads=ram:0.5,
-    graph_rungs=auto"``) into ``{class: ClassPolicy}``. Hard errors on unknown
-    classes/policies and malformed entries -- this runs at argument time so a
-    typo fails the boot, not the first park."""
+    """Parse ``--lane-offload-class-policy`` (e.g. ``"drafter_heads=
+    ram:0.5@peer_vram>host_ram,graph_rungs=auto"``; entry syntax
+    ``<class>=<policy>[:<fraction>][@<target>[><target>...]]``, the
+    @-suffix being the per-class park-target override of the Erg.-7c tier
+    ladder) into ``{class: ClassPolicy}``. Hard errors on unknown
+    classes/policies/targets and malformed entries -- this runs at argument
+    time so a typo fails the boot, not the first park."""
     flag = "--lane-offload-class-policy"
     if not spec or not spec.strip():
         return {}
@@ -193,9 +261,10 @@ def parse_class_policy_overrides(spec: Optional[str]) -> Dict[str, ClassPolicy]:
         if "=" not in entry:
             raise ValueError(
                 f"{flag} entry {entry!r} is not of the form "
-                f"<class>=<policy>[:<fraction>] (classes: "
-                f"{', '.join(OFFLOAD_CLASSES)}; policies: "
-                f"{', '.join(OFFLOAD_POLICIES)})."
+                f"<class>=<policy>[:<fraction>][@<target>[><target>...]] "
+                f"(classes: {', '.join(OFFLOAD_CLASSES)}; policies: "
+                f"{', '.join(OFFLOAD_POLICIES)}; targets: "
+                f"{', '.join(PARK_TARGETS)})."
             )
         klass, _, policy_spec = entry.partition("=")
         klass, policy_spec = klass.strip(), policy_spec.strip()
@@ -281,6 +350,12 @@ class OffloadItem:
     ``time_constant_tier`` names which clock governs the item: ``wave``
     (existing per-layer expert streaming), ``phase`` (stage-2 phase
     multiplexing), ``turn`` (Ergaenzung-7 hysteresis boundaries).
+
+    ``size_source`` is the item's LIVE size source (see offload_sizes):
+    the object -- or zero-arg callable -- the registered bytes were resolved
+    from. Kept so ``refresh_sizes()`` can re-resolve once the real
+    allocations exist (e.g. after graph capture); on GPU the true figure
+    then appears without any adapter change.
     """
 
     item_id: str
@@ -294,20 +369,33 @@ class OffloadItem:
     time_constant_tier: str = "turn"
     last_access_s: float = 0.0
     parked: bool = False
+    size_source: Optional[object] = None
 
 
 class MovementBackend:
     """Interface of the movement half. The register decides WHETHER an item
-    may move (policy + invariants); the backend does the moving. The GPU-phase
-    backend is the expert-offload machinery (pinned pools, H2D wave behind
-    compute, VMM remap #93 for ``va_stable_required`` items, #89 suspend for
-    ``cold_lane``); the CPU phase ships only the fake below."""
+    may move (policy + invariants); the backend does the moving. The real
+    backend is ``offload_movement.RealMovementBackend`` (pinned pools + H2D
+    behind compute, VMM tag pools #93 for ``va_stable_required`` items, #89
+    suspend for ``cold_lane``, park-target ladder Erg. 7c); the CPU fake
+    below keeps the register hermetically testable.
 
-    def park(self, item: OffloadItem) -> None:
+    ``target`` names a park destination from ``PARK_TARGETS``; None lets the
+    backend's target policy walk the tier ladder.
+    """
+
+    def park(self, item: OffloadItem, target: Optional[str] = None) -> None:
         raise NotImplementedError
 
     def wave_in(self, item: OffloadItem) -> None:
         raise NotImplementedError
+
+    def bind(
+        self, item_id: str, payload: object, source_device: int = 0
+    ) -> None:
+        """Attach an item's movement payload (which route moves it). The
+        base interface accepts and ignores it so adapters may bind
+        unconditionally; the real backend stores it."""
 
 
 class CpuFakeMovementBackend(MovementBackend):
@@ -315,13 +403,21 @@ class CpuFakeMovementBackend(MovementBackend):
 
     def __init__(self):
         self.parked_ids: List[str] = []
+        self.parked_targets: List[Optional[str]] = []
         self.waved_in_ids: List[str] = []
+        self.bound: Dict[str, object] = {}
 
-    def park(self, item: OffloadItem) -> None:
+    def park(self, item: OffloadItem, target: Optional[str] = None) -> None:
         self.parked_ids.append(item.item_id)
+        self.parked_targets.append(target)
 
     def wave_in(self, item: OffloadItem) -> None:
         self.waved_in_ids.append(item.item_id)
+
+    def bind(
+        self, item_id: str, payload: object, source_device: int = 0
+    ) -> None:
+        self.bound[item_id] = payload
 
 
 @dataclass
@@ -411,12 +507,21 @@ class OffloadRegister:
         # direction.
         self._saturation_sensor: Optional[Callable[[], bool]] = None
         self._overlap_budget_fn = overlap_budget_fn
+        # PCIe bus as a budgeted item (Erg. 7c): when attached, the stage-2
+        # planner asks the arbiter IN ADDITION to the overlap cost function.
+        self._bus_arbiter = None
+        self._bus_consumer: str = "stage2_phase"
         self.stats = OffloadRegisterStats()
 
     # --- configuration ------------------------------------------------------
     @property
     def policies(self) -> Dict[str, ClassPolicy]:
         return dict(self._policies)
+
+    @property
+    def backend(self) -> MovementBackend:
+        """The movement backend (adapters use this to bind payloads)."""
+        return self._backend
 
     @property
     def hysteresis_window_s(self) -> float:
@@ -441,6 +546,15 @@ class OffloadRegister:
         with self._lock:
             self._overlap_budget_fn = fn
 
+    def set_bus_arbiter(self, arbiter, consumer: str = "stage2_phase"):
+        """Attach the PCIe bus-budget arbiter (offload_bus_budget). The
+        stage-2 planner then announces each candidate's bytes to the arbiter
+        as consumer ``consumer`` and drops candidates the bus budget does
+        not admit -- the bus is itself a budgeted item (Erg. 7c)."""
+        with self._lock:
+            self._bus_arbiter = arbiter
+            self._bus_consumer = consumer
+
     # --- registration -------------------------------------------------------
     def register(
         self,
@@ -453,10 +567,23 @@ class OffloadRegister:
         prio_protected: bool = False,
         phase_mask: Optional[Iterable[str]] = None,
         time_constant_tier: str = "turn",
+        size_source: Optional[object] = None,
     ) -> OffloadItem:
         """Register one VRAM item. Duplicate ids and unknown classes/tiers
         are hard errors (an adapter registering twice is a lifecycle bug, not
-        a situation to paper over)."""
+        a situation to paper over).
+
+        ``size_source`` (offload_sizes vocabulary: tensor / module / state
+        record / zero-arg callable / ...) supersedes a zero ``size_bytes``
+        and is kept on the item so ``refresh_sizes()`` can re-resolve once
+        the real allocation exists -- on GPU the true figure then appears
+        without any adapter change."""
+        if size_source is not None and not size_bytes:
+            from sglang.srt.model_executor.offload_sizes import (
+                resolve_size_bytes,
+            )
+
+            size_bytes = resolve_size_bytes(size_source)
         if offload_class not in OFFLOAD_CLASSES:
             raise ValueError(
                 f"unknown offload item class {offload_class!r}; known: "
@@ -490,6 +617,7 @@ class OffloadRegister:
             phase_mask=frozenset(phase_mask) if phase_mask else frozenset(),
             time_constant_tier=time_constant_tier,
             last_access_s=self._clock(),
+            size_source=size_source,
         )
         with self._lock:
             if item_id in self._items:
@@ -512,6 +640,34 @@ class OffloadRegister:
             item = self._items.get(item_id)
             if item is not None:
                 item.last_access_s = self._clock()
+
+    def refresh_sizes(self) -> int:
+        """Re-resolve every item registered with a ``size_source`` (adapters
+        register before the real allocations exist, e.g. before graph
+        capture; a later refresh -- lane worker start, post-capture hook --
+        turns the 0 into the true figure). PARKED items keep their park-time
+        size: their bytes ARE the parked bytes. Returns the number of items
+        whose size changed. Sources are evaluated OUTSIDE the lock (they are
+        adapter callables and may take locks of their own)."""
+        from sglang.srt.model_executor.offload_sizes import resolve_size_bytes
+
+        with self._lock:
+            pending = [
+                (item.item_id, item.size_source)
+                for item in self._items.values()
+                if item.size_source is not None and not item.parked
+            ]
+        resolved = [(iid, resolve_size_bytes(src)) for iid, src in pending]
+        changed = 0
+        with self._lock:
+            for item_id, size in resolved:
+                item = self._items.get(item_id)
+                if item is None or item.parked:
+                    continue
+                if item.size_bytes != size:
+                    item.size_bytes = int(size)
+                    changed += 1
+        return changed
 
     # --- queries ------------------------------------------------------------
     def get(self, item_id: str) -> Optional[OffloadItem]:
@@ -626,13 +782,33 @@ class OffloadRegister:
                         "movement not hideable behind neighbour-phase compute"
                     )
                     continue
+                if self._bus_arbiter is not None:
+                    # Erg. 7c: the bus is a budgeted item shared with expert
+                    # streaming and KV spill -- the planner asks the arbiter,
+                    # not only the per-item overlap physics.
+                    grant = self._bus_arbiter.request(
+                        self._bus_consumer, item.size_bytes
+                    )
+                    if not grant.granted:
+                        plan.skipped[item_id] = f"bus budget: {grant.reason}"
+                        continue
                 planned_class_bytes[item.offload_class] = planned + item.size_bytes
                 plan.park_candidates.append(item_id)
         return plan
 
     # --- movement -----------------------------------------------------------
-    def park(self, item_id: str, make_room_for: Optional[str] = None) -> None:
-        """Park one item into RAM, if the policy and every invariant allow it.
+    def park(
+        self,
+        item_id: str,
+        make_room_for: Optional[str] = None,
+        target: Optional[str] = None,
+    ) -> None:
+        """Park one item, if the policy and every invariant allow it.
+
+        ``target`` names a park destination from ``PARK_TARGETS`` (Erg. 7c
+        tier ladder: peer_vram -> host_ram -> remote); None lets the
+        backend's target policy choose (global/per-class preference order,
+        peer_vram degrading to host_ram without a usable P2P path).
 
         Raises ``OffloadRefused`` (a normal 'stays resident' answer) when:
         * the item's class policy is ``resident``;
@@ -645,6 +821,11 @@ class OffloadRegister:
           another item (``make_room_for`` given): the protected class is
           never parked to give someone else its space.
         """
+        if target is not None and target not in PARK_TARGETS:
+            raise ValueError(
+                f"unknown park target {target!r}; known targets: "
+                f"{', '.join(PARK_TARGETS)}."
+            )
         with self._lock:
             item = self._require_locked(item_id)
             if item.parked:
@@ -690,7 +871,7 @@ class OffloadRegister:
                         f"cap {policy.fraction} ({already} B already parked, "
                         f"cap {cap} B)"
                     )
-            self._backend.park(item)
+            self._backend.park(item, target=target)
             item.parked = True
             self.stats.parks += 1
 
@@ -812,6 +993,7 @@ def maybe_register_item(
     prio_protected: bool = False,
     phase_mask: Optional[Iterable[str]] = None,
     time_constant_tier: str = "turn",
+    size_source: Optional[object] = None,
 ) -> Optional[OffloadItem]:
     """Adapter entry point: register an item iff the feature flag is on.
     Re-registration of a known id refreshes the bookkeeping (adapters run at
@@ -831,6 +1013,7 @@ def maybe_register_item(
         prio_protected=prio_protected,
         phase_mask=phase_mask,
         time_constant_tier=time_constant_tier,
+        size_source=size_source,
     )
 
 
@@ -839,3 +1022,25 @@ def maybe_touch_item(item_id: str) -> None:
     reg = get_global_register()
     if reg is not None:
         reg.touch(item_id)
+
+
+def maybe_refresh_item_sizes() -> int:
+    """Adapter entry point: re-resolve live size sources iff the feature
+    flag is on (call at points where real allocations exist, e.g. lane
+    worker start / after graph capture). Returns the changed-item count."""
+    reg = get_global_register()
+    if reg is None:
+        return 0
+    return reg.refresh_sizes()
+
+
+def maybe_bind_movement_payload(
+    item_id: str, payload: object, source_device: int = 0
+) -> None:
+    """Adapter entry point: bind an item's movement payload (offload_movement
+    TensorPayload / TagPayload / SuspendPayload) iff the feature flag is on.
+    On the CPU fake backend this is recording only; the real backend uses it
+    to route the actual movement."""
+    reg = get_global_register()
+    if reg is not None:
+        reg.backend.bind(item_id, payload, source_device)

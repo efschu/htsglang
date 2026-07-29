@@ -8422,3 +8422,87 @@ Bewegungs-Backend auf #93-Tag-Pools + #89-Pfad, gemessene Rueckhol-Latenzen
 je Klasse (Messpflicht vor jedem auto/ram-Default), PCIe-Overlap-Raten fuer
 die Stufe-2-Kostenfunktion, lane-scoped memory-saver-Tags, Experten-Klasse
 auf das gemeinsame Backend.
+
+## Offload-Register GPU-Phase-Vorbau (#286) (feat/offload-register-gpu-prep, Basis 5846cf8ed5) — 2026-07-29
+
+Vorbau-Slice waehrend der GPU-Sperre (Treiber-Update): so viel GPU-Phase wie
+moeglich vorgezogen, komplette Logik CPU-hermetisch (torch.cuda wird in
+keinem Test aufgerufen; alle Device-Beruehrungen hinter injizierbarer
+Schicht).
+
+Gebaut:
+
+- `model_executor/offload_movement.py`: Bewegungs-Backend
+  (`RealMovementBackend`) mit Zustandsmaschine je Posten (resident ->
+  park_in_flight -> parked -> wave_in_flight; Doppel-park = No-Op, wave_in
+  waehrend in-flight-Park joint zuerst; Fehlerpfade: Park-Fehler => resident
+  + Buchung zurueck, Wave-in-Fehler => bleibt parked, nie verschluckt).
+  Drei Routen je Payload: `TensorPayload` (pinned-Pool + async H2D hinter
+  Compute, exakt das `MoEExpertOffloadCache._fetch`-Muster inkl.
+  wait_stream in beide Richtungen), `TagPayload` (#93 Tag-Pools/VMM via
+  torch_memory_saver_adapter, Route fuer va_stable-Posten), `SuspendPayload`
+  (#89-Suspend fuer cold_lane). `CudaDeviceOps` (real, GPU-validierungs-
+  pflichtig) vs `FakeDeviceOps` (hermetisch). CpuFakeMovementBackend bleibt.
+- Park-Ziel-Leiter Erg. 7c: own_vram (Tier 0 = resident) -> peer_vram ->
+  host_ram -> remote (Stub, #224-RDMA-Anschluss benannt). `park()` traegt
+  ein Ziel; Praeferenz-Reihenfolge global (`--lane-offload-park-targets`,
+  Default host_ram) und je Klasse ueberschreibbar (Syntax-Erweiterung
+  `klasse=politik[:anteil][@ziel1>ziel2]`). P2P-Modell nach Nutzer-
+  Korrektur: Faehigkeit je GERICHTETEM Paar (`PeerPathCapability`), Felder
+  aperture_bytes (EFFEKTIV gemessener Wert, nominal nur Info-Feld),
+  bandwidth, window_switch_cost — ALLES Platzhalter bis zum Probe-Lauf nach
+  dem Treiber-Update, keine Konstanten im Code; UNGEMESSENER Pfad wird nie
+  benutzt. Fenster-Politik fuer Posten > Apertur waehlbar reject|chunk,
+  Default konservativ reject — keine der beiden als beschlossen markiert.
+  Ohne nutzbaren Pfad degradiert peer_vram sauber zu host_ram (Log, nie
+  Fehler); asymmetrische Paare getestet. `CapacityLedger`: peer_vram nur
+  mit explizit gewaehrtem Budget der Zielkarte buchbar (kein stilles
+  Wildern im KV-/Verband-Budget); TODO GPU-Phase: Budget-Zufuhr aus der
+  Verband-Buchfuehrung (pool_configurator) + gemeinsame Durchsetzung mit
+  dem KV-Headroom.
+- Echte Posten-Groessen: `offload_sizes.resolve_size_bytes` (Tensor/Modul/
+  Runner/`footprint_bytes`-Record/Mapping/Callable, identitaets-
+  deduplizierend, meta/cpu-sicher); Register-Posten tragen `size_source`,
+  `refresh_sizes()`/`maybe_refresh_item_sizes()` loest live auf (Aufruf am
+  Lane-Worker-Start verdrahtet). Adapter: Rungs aus dem #93-Tag-Record
+  (`footprint_bytes`), Drafter-Kopf aus den Draft-Runner-Parametern,
+  cold_lane = Summe der lane-eigenen Posten (ehrliche Untergrenze);
+  Workspaces/Input-Pools ueber den Resolver. Auf GPU steht damit ohne
+  weitere Aenderung die echte Zahl.
+- PCIe-Bus als budgetierter Posten: `offload_bus_budget.BusBudgetArbiter`
+  (Adapter des #236/#242-Musters; `ByteRateBucket` = Byte-Port des
+  SpillRateBucket-Schuldenmodells). Verbraucher expert_streaming /
+  stage2_phase / kv_spill mit Gewicht + Prio-Klasse; garantierter
+  Gewichts-Anteil = Verhungern-Schutz, Leihen nur aus Idle-Ueberschuss und
+  nie unter fremde Nulllinie, blockiert bei wartender wichtigerer Klasse.
+  Rate injizierbar (`set_measured_rate`), 0 = offenes Budget
+  (byte-identischer Default). Stufe-2-Planer fragt den Arbiter zusaetzlich
+  zur Overlap-Kostenfunktion (`OffloadRegister.set_bus_arbiter`).
+- Payload-Bindung der Adapter (`maybe_bind_movement_payload`): Rungs ->
+  TagPayload (#93-Tag; Arbitrierung mit ensure_active bleibt GPU-Posten),
+  cold_lane -> SuspendPayload mit lane-scoped Tag als benanntem
+  Anschlusspunkt (lane-scoped Saver-Tags bleiben GPU-Posten), Workspaces/
+  Input-Pools -> TensorPayload; Drafter-Kopf bewusst ungebunden (braucht
+  #93-getaggte Kopf-Allokation beim Laden — GPU-Posten; Backend weist
+  Tensor-Route fuer va_stable ab).
+
+Tests (alle CPU-hermetisch): test_offload_movement.py 49, 
+test_offload_bus_budget.py 15, test_offload_register.py 42 -> 44 (Flag- und
+@Ziel-Syntax), test_dual_group_concurrency.py 152 unveraendert gruen;
+Gesamtlauf 260. ruff auf neuen Dateien sauber, Delta auf Altdateien null;
+codespell sauber. Die 4 Fehlschlaege in test_coresidence_budget_mapping.py
+bestehen identisch auf dem Basis-Commit (GPU/NVML-gebunden, Karten
+gesperrt) und sind nicht Teil dieses Slices.
+
+WIRKLICH GPU-pflichtige Restliste (Boot-Queue):
+1. Validierung `CudaDeviceOps` (Copy-Stream-Routen, storage-resize-Park,
+   Tag-/Suspend-Pfad mit echtem Saver) + Wiring am Runner-Init (Backend-
+   Konstruktion aus ServerArgs, Saver-Injektion).
+2. P2P-Probe-Lauf nach Treiber-Update: PeerPathCapability je gerichtetem
+   Paar befuellen (effektive Apertur, Rate, Fensterwechselkosten);
+   Entscheid reject|chunk aus Messung; Allreduce/Broadcast-Frage offen.
+3. Peer-Budget-Zufuhr aus Verband-Buchfuehrung + Durchsetzung mit
+   KV-Headroom; lane-scoped memory-saver-Tags; #93-Tag-Arbitrierung mit
+   ensure_active; getaggte Drafter-Kopf-Allokation beim Laden.
+4. Messpflichten: Rueckhol-Latenzen je Klasse, PCIe-Raten fuer Arbiter +
+   Overlap-Kostenfunktion; Experten-Klasse auf das gemeinsame Backend.

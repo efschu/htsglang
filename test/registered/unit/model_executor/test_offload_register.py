@@ -464,6 +464,23 @@ class TestServerArgsParsing(unittest.TestCase):
             with self.subTest(policy=policy), self.assertRaises(ValueError):
                 args._handle_lane_offload_register()
 
+    def test_park_targets_flag_is_validated(self):
+        args = self._args(lane_offload_park_targets="peer_vram>host_ram")
+        args._handle_lane_offload_register()  # must not raise
+        for bad in ("moon", "own_vram", "host_ram>host_ram"):
+            args = self._args(lane_offload_park_targets=bad)
+            with self.subTest(spec=bad), self.assertRaises(ValueError):
+                args._handle_lane_offload_register()
+
+    def test_class_policy_target_suffix_is_validated(self):
+        args = self._args(
+            lane_offload_class_policy="drafter_heads=ram:0.5@peer_vram>host_ram"
+        )
+        args._handle_lane_offload_register()  # must not raise
+        args = self._args(lane_offload_class_policy="drafter_heads=ram@moon")
+        with self.assertRaises(ValueError):
+            args._handle_lane_offload_register()
+
     def test_cli_roundtrip(self):
         import argparse
 

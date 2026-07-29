@@ -50,13 +50,28 @@ def _note_pool_entry_in_offload_register(
     lane, name, numel, dtype, device = key
     item_id = f"input_buffer/{lane}/{name}/{numel}/{dtype}/{device}"
     if is_new:
+        from sglang.srt.model_executor.offload_movement import TensorPayload
+        from sglang.srt.model_executor.offload_register import (
+            maybe_bind_movement_payload,
+        )
+        from sglang.srt.model_executor.offload_sizes import resolve_size_bytes
+
         maybe_register_item(
             item_id,
             "lane_workspaces",
-            int(canonical.numel()) * int(canonical.element_size()),
+            resolve_size_bytes(canonical),
             # Empty phase mask = needed in every phase; the turn tier governs
             # (idle-lane pools park at hysteresis boundaries, Erg. 7c).
             time_constant_tier="turn",
+        )
+        # Movement route: plain D2H/H2D of the canonical allocation. Input
+        # buffers that are CAPTURED into graphs must flip to va_stable + a
+        # #93 TagPayload at GPU wiring time; the backend refuses the tensor
+        # route for va_stable items, so a wrong flip cannot move silently.
+        maybe_bind_movement_payload(
+            item_id,
+            TensorPayload((canonical,)),
+            int(getattr(getattr(canonical, "device", None), "index", None) or 0),
         )
     else:
         maybe_touch_item(item_id)

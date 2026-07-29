@@ -1310,28 +1310,90 @@ class DualGroupLane:
         self.work_total = {"prefill_tokens": 0, "decode_tokens": 0}
         self._register_offload_items()
 
+    def _rung_size_source(self, rung: int):
+        """Live size source of one capture rung: the #93 tagged-pool state
+        record (``footprint_bytes``: measured paused bytes when available,
+        else noted-tensor bytes). Empty (0) until the rung is captured;
+        ``maybe_refresh_item_sizes()`` at worker start -- and any later
+        post-capture refresh -- turns it into the real figure, so on GPU the
+        true number appears without further change."""
+
+        def source() -> object:
+            try:
+                from sglang.srt.speculative.adaptive_graph_memory import (
+                    AdaptiveGraphMemoryManager,
+                    get_active_manager,
+                )
+
+                mgr = get_active_manager()
+                if mgr is None:
+                    return 0
+                tag = AdaptiveGraphMemoryManager.tag_for_steps(rung)
+                rec = getattr(mgr, "_states", {}).get(tag)
+                return rec if rec is not None else 0
+            except Exception:
+                return 0
+
+        return source
+
+    def _cold_lane_size_source(self):
+        """Live size source of the whole cold lane: the sum of everything
+        this lane alone owns that is ALREADY booked in the register (rungs,
+        drafter head, lane workspaces, lane input-buffer pools). An honest
+        lower bound -- draft-KV remains are not itemized yet (they start
+        fresh at the turn, Erg. 6)."""
+
+        def source() -> int:
+            from sglang.srt.model_executor.offload_register import (
+                get_global_register,
+            )
+
+            reg = get_global_register()
+            if reg is None:
+                return 0
+            own_prefixes = (
+                f"lane{self.lane_id}/graph_rung/",
+                f"lane{self.lane_id}/drafter_head",
+                f"lane_workspace/{self.scope_lane_id}/",
+                f"input_buffer/{self.scope_lane_id}/",
+            )
+            total = 0
+            for klass in ("graph_rungs", "drafter_heads", "lane_workspaces"):
+                for item in reg.items_of_class(klass):
+                    if item.item_id.startswith(own_prefixes):
+                        total += item.size_bytes
+            return total
+
+        return source
+
     def _register_offload_items(self) -> None:
-        """#286 offload register, CPU-phase adapter (thin): book this lane's
-        capture-ladder rungs (Erg. 4) and its drafter head (Erg. 6) as
-        register items -- registration + hot-criterion wiring only, NO
-        movement. Sizes are 0 until the GPU measurement phase feeds the real
-        per-rung pool / head footprints (Messpflicht). Gated behind
-        SGLANG_OFFLOAD_REGISTER (default off => no-op; the default path is
-        byte-unchanged)."""
+        """#286 offload register adapter: book this lane's capture-ladder
+        rungs (Erg. 4), its drafter head (Erg. 6) and the whole cold lane
+        (class d) as register items -- registration, hot-criterion wiring,
+        LIVE size sources and movement-payload binding; the moving itself is
+        the backend's job. Gated behind SGLANG_OFFLOAD_REGISTER (default off
+        => no-op; the default path is byte-unchanged)."""
         from sglang.srt.model_executor.offload_register import (
+            maybe_bind_movement_payload,
             maybe_register_item,
             offload_register_enabled,
+        )
+        from sglang.srt.model_executor.offload_movement import (
+            SuspendPayload,
+            TagPayload,
         )
 
         if not offload_register_enabled():
             return
+        source_device = int(getattr(self.runner, "gpu_id", 0) or 0)
         for rung in self.spec_rungs:
             if rung == 0:
                 # K=0 is the plain no-spec decode entry; it costs no extra
                 # graph pool, so there is nothing to park.
                 continue
+            item_id = f"lane{self.lane_id}/graph_rung/k{rung}"
             maybe_register_item(
-                f"lane{self.lane_id}/graph_rung/k{rung}",
+                item_id,
                 "graph_rungs",
                 0,
                 # The ACTIVE rung is hot and must stay resident; captured
@@ -1340,7 +1402,24 @@ class DualGroupLane:
                 hot=lambda k=rung: self.spec_policy.current == k,
                 va_stable_required=True,
                 time_constant_tier="turn",
+                size_source=self._rung_size_source(rung),
             )
+            try:
+                from sglang.srt.speculative.adaptive_graph_memory import (
+                    AdaptiveGraphMemoryManager,
+                )
+
+                # Movement route of a rung: its #93 tagged capture pool.
+                # GPU-phase wiring note: pausing this tag must be arbitrated
+                # WITH AdaptiveGraphMemoryManager.ensure_active (not behind
+                # its back) -- that arbitration is a named open GPU item.
+                maybe_bind_movement_payload(
+                    item_id,
+                    TagPayload(AdaptiveGraphMemoryManager.tag_for_steps(rung)),
+                    source_device,
+                )
+            except Exception:
+                pass  # no tag vocabulary available (non-spec build)
         if self.draft_runner is not None:
             maybe_register_item(
                 f"lane{self.lane_id}/drafter_head",
@@ -1354,18 +1433,38 @@ class DualGroupLane:
                 va_stable_required=True,
                 phase_mask=("draft",),
                 time_constant_tier="turn",
+                # Live size: the draft runner's model parameters/buffers --
+                # on GPU this resolves to the real head footprint at the
+                # first refresh, without further change.
+                size_source=lambda: self.draft_runner,
             )
+            # No payload bind yet: the head is va_stable_required, so its
+            # route is a #93 TAGGED allocation of the head weights at load
+            # time (VMM remap, Erg. 6). Allocating the head into a tagged
+            # region is an open GPU-phase item; binding a TensorPayload here
+            # would be refused by the backend (and rightly so).
         # Class d: the WHOLE cold lane (everything this lane owns alone --
         # graphs, workspaces, draft-KV remains; the byte-shared weights
         # belong to the group and are never part of the item). Parked via the
-        # #89 suspend path in the GPU phase.
+        # #89 suspend path.
+        cold_id = f"lane{self.lane_id}/cold_lane"
         maybe_register_item(
-            f"lane{self.lane_id}/cold_lane",
+            cold_id,
             "cold_lane",
             0,
             hot=lambda: self._busy or bool(self.jobs) or self.active is not None,
             va_stable_required=True,
             time_constant_tier="turn",
+            size_source=self._cold_lane_size_source(),
+        )
+        # #89 suspend route. The tag below is the named ATTACH POINT for
+        # lane-scoped memory-saver tags; today's tags are process-wide
+        # (weights/kv/graphs), so creating this lane-scoped tag in the saver
+        # is a named open GPU-phase item (audit table).
+        maybe_bind_movement_payload(
+            cold_id,
+            SuspendPayload(tags=(f"lane{self.lane_id}/own",)),
+            source_device,
         )
 
     # -- job interface (rank-local; called from the scheduler loop) -------
@@ -1512,6 +1611,15 @@ class DualGroupLane:
         if self._thread is not None:
             return
         import os
+
+        from sglang.srt.model_executor.offload_register import (
+            maybe_refresh_item_sizes,
+        )
+
+        # #286: by worker start the lane's allocations (rung pools, drafter
+        # head) exist, so the live size sources now resolve to real bytes
+        # (no-op when SGLANG_OFFLOAD_REGISTER is off).
+        maybe_refresh_item_sizes()
 
         low, high = torch.cuda.Stream.priority_range()
         # Escape hatch, not a tuning knob: NCCL's collective kernels
