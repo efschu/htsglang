@@ -817,6 +817,78 @@ def fbasis_a2a(welt: int) -> int:
     return (2 + 2 * (welt - 1)) * welt * 256
 
 
+def ag_plan(laengen, schlitz: int) -> list:
+    """Die Rundenzerlegung eines ``all_gather``. Reine Arithmetik.
+
+    ``laengen[i]`` ist die Scherbe von Rang ``i`` in **Byte**; das Ergebnis
+    ist deren Aneinanderreihung, also ``sum(laengen)`` Byte, mit Rang ``i``
+    bei Versatz ``sum(laengen[:i])``.
+
+    Geliefert wird je Runde eine Liste von ``(sende_versatz, laenge,
+    empfangs_versatz)`` je Rang -- alles in Byte, alles absolut, nichts als
+    Praefixsumme zu erratenden:
+
+    * ``sende_versatz`` zeigt in die EIGENE Scherbe (denselben Ausschnitt
+      fuer jedes Ziel -- genau das unterscheidet all_gather von
+      all_to_all),
+    * ``empfangs_versatz`` in das Ergebnis, also ``basis[i] + k*schlitz``.
+
+    **Warum ueberhaupt Runden.** Eine Scherbe kann groesser sein als ein
+    Schlitz. Der Fehlerfall aus der Uebergabe ist genau der: 10 600 448 Byte
+    all_gather gegen einen a2a-Schlitz von knapp 8 MiB bei 96 MiB Fenster.
+    Statt sich ueber ``handles`` abzumelden -- was unter einer
+    CUDA-Graph-Aufzeichnung den Lauf abbricht, weil es keinen Ausweichweg
+    gibt -- laeuft die Scherbe in ``ceil(max(laengen)/schlitz)`` Runden.
+
+    **Warum das eine Aufzeichnung ueberlebt.** Die Rundenzahl haengt nur an
+    ``laengen`` und ``schlitz``. Beide sind gruppenweit gleich und fuer eine
+    aufgezeichnete Form konstant, die Zahl der Kernelstarts ist also
+    eingebrannt und bei jeder Wiedergabe dieselbe -- dasselbe Argument, mit
+    dem ``htccl_device.all_reduce`` seine Schlitzschleife aufzeichnen darf.
+    Kein Hostcode entscheidet hier je Runde etwas, was sich zwischen
+    Aufzeichnung und Wiedergabe aendern koennte. Das ist der Unterschied zum
+    Direkt-Modus der Pipe, dessen hostseitiger Ringindex genau daran
+    scheitert (siehe ``_erg_platz``).
+
+    **Rangeinheitlich.** Jeder Rang rechnet aus DEMSELBEN ``laengen``-Vektor,
+    also fallen bei allen gleich viele Runden an. Zaehlte ein Rang anders,
+    waere das kein Fehler, sondern ein Haenger: die anderen warteten in der
+    Sperre einer Runde, die er nicht mehr fuehrt.
+
+    **Ungleiche Scherben** sind hier Arithmetik, keine Umschreibung. Die
+    heutige Naht (``HTCCLCommunicator.all_gather``) ist gleichverteilt -- ihr
+    Ergebnis ist ``(R,) + form``, das GEHT nicht ungleich, und die ungleiche
+    Form heisst in sglang ``all_gatherv`` und ist unter HTCCL ausdruecklich
+    nicht gedeckt. Diese Funktion nimmt trotzdem einen Vektor: unter uneven
+    TP sind ungleiche Scherben der Normalfall, und die Stelle, an der eine
+    Gleichverteilung ANGENOMMEN wird, ist die Stelle, an der ein spaeteres
+    ``all_gatherv`` still falsche Versaetze bekommt. Ein Rang, dessen
+    Scherbe frueher endet, bekommt in den restlichen Runden Laenge 0 -- er
+    faehrt die Sperre mit, ohne Bytes zu bewegen.
+    """
+    laengen = [int(x) for x in laengen]
+    if not laengen:
+        return []
+    if schlitz <= 0:
+        raise ValueError(f"Schlitzgroesse {schlitz} ist nicht positiv")
+    if any(n < 0 for n in laengen):
+        raise ValueError(f"negative Scherbenlaenge in {laengen}")
+    basis, acc = [], 0
+    for n in laengen:
+        basis.append(acc)
+        acc += n
+    runden = max(1, -(-max(laengen) // schlitz))
+    plan = []
+    for k in range(runden):
+        eine = []
+        for i, n in enumerate(laengen):
+            a = min(k * schlitz, n)
+            b = min((k + 1) * schlitz, n)
+            eine.append((a, b - a, basis[i] + a))
+        plan.append(eine)
+    return plan
+
+
 def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
                  mit_pipe: bool = False, erg_ring: int = 0) -> int:
     """Groesste Nutzlast, deren Schlitze in eine Region dieser Groesse passen.
@@ -1012,9 +1084,28 @@ class HTCCLBar1Transport:
     ``False`` -- ohne Ausnahme, ohne Notpfad.
     """
 
-    #: all_reduce (gemessen) und all_to_all (eigener Kern, ungemessen).
-    #: all_gather/reduce_scatter/broadcast waeren je eine Haelfte der
-    #: all_reduce-Kerne, sind aber weder portiert noch gemessen.
+    #: all_reduce (gemessen), all_to_all (eigener Kern, ungemessen) und
+    #: all_gather (auf demselben Kern, ungemessen -- siehe
+    #: :meth:`htccl_all_gather`).
+    #:
+    #: ``reduce_scatter`` und ``broadcast`` fehlen weiter, und zwar mit
+    #: Grund, nicht aus Versehen:
+    #:
+    #: * ``reduce_scatter`` braucht eine REDUKTION. Der a2a-Kern bewegt
+    #:   Bytes und kennt keinen Datentyp; er traegt all_gather deshalb
+    #:   gratis und reduce_scatter gar nicht. Die RS-Phase der beiden
+    #:   all_reduce-Kerne koennte es, aber nur als eigener Einsprung mit
+    #:   eigenem Schlitzsatz -- also nicht als Beifang.
+    #: * ``broadcast`` ist in sglang AN ORT (``broadcast(tensor, src)``
+    #:   gibt denselben Tensor zurueck), und die Erweiterung lehnt
+    #:   ``in is out`` ab. Aus dem Beifang wuerde ein Zusatzpuffer plus
+    #:   Kopie -- billiger als ein neuer Kern, aber nicht gratis, und
+    #:   ausser Ort waere es eine andere Zusage als die der Naht.
+    #:
+    #: Fuer beide bleibt der laute Riegel in ``htccl._select`` zustaendig.
+    #: Er nennt die Operation, und weil diese Menge hier die einzige
+    #: Wahrheit darueber ist, was gedeckt ist, kann die Meldung nicht
+    #: veralten.
     #:
     #: Beide Schreibweisen von all_to_all stehen hier, weil die Naht in
     #: htccl.py die Operation unter dem Namen ``all_to_all`` fragt, waehrend
@@ -1022,7 +1113,7 @@ class HTCCLBar1Transport:
     #: ``all_to_all_single`` heisst. Zwei Namen, ein Weg -- besser als eine
     #: Umbenennung an der Nahtstelle, die man beim Lesen uebersieht.
     HTCCL_OPS: frozenset = frozenset(
-        {"all_reduce", "all_to_all", "all_to_all_single"}
+        {"all_reduce", "all_gather", "all_to_all", "all_to_all_single"}
     )
 
     def __init__(self, cpu_group, device, fenster_bytes: int,
@@ -1253,6 +1344,34 @@ class HTCCLBar1Transport:
         #: MoE-Dispatchbloecken. 16 Byte = ein Paket.
         self.a2a_min_bytes = int(
             os.environ.get("SGLANG_HTCCL_BAR1_A2A_MIN_BYTES", "16")
+        )
+        #: all_gather ueber den a2a-Kern. VORGABE AN, und das ist Absicht:
+        #: ohne sie bricht der Standardlauf in der Graph-Aufzeichnung ab
+        #: (der Riegel in htccl._select, richtig und laut). Der Schalter
+        #: existiert, damit der Messende ihn gegen die gloo-Ebene stellen
+        #: kann -- und weil ein neuer Weg im heissen Pfad einen Ausschalter
+        #: haben muss, den man ohne Uebersetzen erreicht. Er greift NUR
+        #: innerhalb von SGLANG_HTCCL_TRANSPORT=bar1|matrix; ohne HTCCL
+        #: aendert er nichts.
+        self.ag_an = os.environ.get("SGLANG_HTCCL_BAR1_AG", "1") not in (
+            "0", "nein", "aus", "false"
+        )
+        #: Untergrenze wie bei a2a und aus demselben Grund: ein Paket. Nicht
+        #: `min_bytes` (4096) -- die all_gather der Spekulations- und
+        #: DP-Attention-Pfade sind klein, und dort ist die Latenz der
+        #: gloo-Ebene am teuersten.
+        self.ag_min_bytes = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_AG_MIN_BYTES", "16")
+        )
+        #: Wieviele Runden eine Scherbe hoechstens kosten darf. Keine
+        #: Fenstergrenze, sondern eine Rundengrenze: je Runde ein
+        #: Kernelstart mit einer Sperre. 16 traegt bei knapp 8 MiB Schlitz
+        #: (96-MiB-Fenster, R=3) eine Scherbe von ~128 MiB und damit jede
+        #: Groesse, die in diesem Modell vorkommt -- die groesste gemessene
+        #: ist 10,6 MB. Darueber meldet sich der Weg ab, statt eine
+        #: Schleife als Transport auszugeben.
+        self.ag_max_runden = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_AG_MAX_RUNDEN", "16")
         )
         try:
             self._baue_auf()
@@ -1954,6 +2073,8 @@ class HTCCLBar1Transport:
             return False
         if op in ("all_to_all", "all_to_all_single"):
             return self._handles_a2a(nbytes)
+        if op == "all_gather":
+            return self._handles_all_gather(nbytes)
         if nbytes < self.min_bytes or nbytes > self.max_bytes:
             return False
         if nbytes % 16 != 0:
@@ -2350,6 +2471,154 @@ class HTCCLBar1Transport:
             )
         return self._pipe_beleg
 
+    # -- all_gather --------------------------------------------------------
+    #
+    # DER STOPPER. Vor dieser Aenderung deckte HTCCL_OPS all_gather nicht,
+    # und der Standardlauf brach ab:
+    #
+    #     RuntimeError: HTCCL: 'all_gather' mit 10600448 Byte waehrend einer
+    #     CUDA-Graph-Aufzeichnung, aber bar1 meldet handles(...) -> False.
+    #
+    # Richtig abgebrochen -- unter HTCCL ist PyNccl nicht gebaut, der
+    # Ausweichweg waere die host-gestaffelte gloo-Ebene, und die laeuft in
+    # einer Aufzeichnung einmal und bei keiner Wiedergabe wieder. Nur ging es
+    # eben nicht.
+    #
+    # WARUM KEIN NEUER KERN. Ein all_gather ist die AG-Phase des
+    # Netz-Allreduce ohne die Reduktion, und genau das kann der a2a-Kern
+    # schon: er bewegt Bytes, kennt keinen Datentyp, und er bekommt
+    # Versaetze und Laengen JE RANG GETRENNT herein. Ein all_gather ist ein
+    # all_to_all, bei dem jedes Ziel denselben Ausschnitt bekommt -- also
+    # dieselbe Tabelle mit ``sende_versatz[z] = const``. Das ist kein
+    # Kunstgriff, sondern die Zusage, die in htccl_bar1_ext.py schon
+    # ausgeschrieben steht ("er hat nie angenommen, dass sie
+    # zusammenhaengen").
+    #
+    # Was das mitbringt, ohne es zu bauen: den Byte-Beleg je gerichtetem
+    # Paar (``byte_beleg_a2a``), die Haelftenwahl nach Rundenparitaet (die
+    # Schlitzwiederverwendung ist damit ohne dritte Sperre sicher), den
+    # lokalen Weg fuer den eigenen Block, den Restpfad fuer Laengen, die
+    # kein Vielfaches von 16 sind, und die Grenzpruefungen der Erweiterung.
+    # Ein zweiter Kern haette jedes dieser Stuecke ein zweites Mal gebraucht
+    # -- und jedes waere eine Stelle, an der die beiden Fassungen
+    # auseinanderlaufen.
+    #
+    # WAS DAS KOSTET, ehrlich: einen Zwischenschlitz. Der Empfaenger liest
+    # aus seinem Schlitz in den Ausgabepuffer, statt dass der Sender direkt
+    # in den Ausgabepuffer schreibt. Ohne Reduktion waere Letzteres
+    # moeglich -- aber nur mit einem abgebildeten Ergebnispuffer, also mit
+    # dem Direkt-Modus der Pipe, und der ueberlebt keine Aufzeichnung
+    # (``_erg_platz``, Punkt 3: der hostseitige Ringindex wird je Graph
+    # eingebrannt, bei erg_ring=2 teilen sich der erste und der dritte
+    # Graph denselben BAR1-Platz). Der Abnahmefall IST eine Aufzeichnung.
+    # Also dieselbe konservative Wahl wie beim Allreduce: Schlitz statt
+    # Direkt, und der Direkt-Modus bleibt ein spaeterer, eigener Schritt
+    # mit eigenem Ergebnisring und eigener Lebensdauerpruefung.
+
+    def _handles_all_gather(self, nbytes: int) -> bool:
+        """``nbytes`` ist die EIGENE Scherbe, nicht das Ergebnis.
+
+        Die Naht fragt mit ``input_.numel() * element_size()``
+        (``htccl.HTCCLCommunicator.all_gather``), also mit der Scherbe. Das
+        Ergebnis ist ``R`` mal so gross und wird hier NICHT geprueft: es
+        liegt im lokalen VRAM, nicht im Fenster.
+
+        Jede Bedingung ist rangeinheitlich, aus demselben Grund wie in
+        :meth:`handles`.
+
+        Ueber den Schlitz hinaus wird NICHT abgelehnt, sondern in Runden
+        zerlegt (:func:`ag_plan`) -- eine Ablehnung waere unter Aufzeichnung
+        ein Abbruch ohne Ausweichweg, und genau daran hing der Stopper.
+        Abgelehnt wird nur, was auch in Runden nicht geht.
+
+        ``nbytes % 16 != 0`` wird ausdruecklich NICHT abgelehnt, anders als
+        bei all_reduce. Der a2a-Kern hat dafuer den Restpfad (``VEK=0``,
+        Paket byteweise zusammengesetzt): korrekt, langsamer, ungemessen.
+        Das ist die richtige Wahl, weil die Alternative unter Aufzeichnung
+        kein langsamerer Weg ist, sondern gar keiner.
+
+        **Was eine krumme Scherbe kostet, genau gesagt:** nicht die letzten
+        15 Byte, sondern alles. Der Ergebnisversatz von Rang ``i`` ist
+        ``i * scherbe``; ist ``scherbe`` kein Vielfaches von 16, liegt jeder
+        Versatz ausser dem von Rang 0 schief, und die Erweiterung schaltet
+        auf ``VEK=0`` fuer den GANZEN Aufruf (sie prueft alle Versaetze
+        gemeinsam, htccl_bar1_ext.py: "meistens ausgerichtet gibt es
+        nicht"). Wer eine langsame Zahl sieht, sollte das zuerst pruefen,
+        bevor er sie dem Transport zuschreibt.
+        """
+        if not self.ag_an:
+            return False
+        # Derselbe Bereich, derselbe Kern, derselbe Byte-Beleg. Ohne den
+        # a2a-Bereich (SGLANG_HTCCL_BAR1_A2A=0) gibt es auch kein all_gather
+        # -- gesagt, nicht still angenommen.
+        if not self.a2a_an or not self._a2a_beleg:
+            return False
+        geo = self._geo
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+            return False
+        if nbytes <= 0:
+            return False
+        if nbytes < self.ag_min_bytes:
+            return False
+        # Derselbe Fensterbegriff wie bei all_reduce und a2a: gegen die
+        # gruppenweit KLEINSTE tatsaechlich abgebildete Laenge.
+        if geo["region_bytes"] > self._fenster_minimum:
+            return False
+        # Eine Decke gibt es trotzdem, und sie ist keine Fenstergrenze,
+        # sondern eine Rundengrenze: jede Runde ist ein Kernelstart mit einer
+        # Sperre, und beliebig viele davon je Kollektiv waere kein Transport,
+        # sondern eine Schleife. Rangeinheitlich, weil nbytes es ist.
+        if -(-nbytes // int(geo["a2a_schlitz"])) > self.ag_max_runden:
+            return False
+        return True
+
+    def ag_runden(self, nbytes: int) -> int:
+        """Rundenzahl fuer eine Scherbe von ``nbytes`` -- fuer Protokoll/Test."""
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        if schlitz <= 0:
+            return 0
+        return max(1, -(-int(nbytes) // schlitz))
+
+    def htccl_all_gather(self, comm, inp, dim: int = -1):
+        """``all_gather`` ueber den Direktpfad, notfalls in mehreren Runden.
+
+        Ergebnisform und Achsenbehandlung sind Byte fuer Byte die der Naht
+        (``htccl.HTCCLCommunicator.all_gather``) und die von
+        ``htccl_device.all_gather``: erst ``(R,) + form``, dann
+        ``movedim(0, dim)``, dann zusammenlegen. Nicht neu gedacht --
+        derselbe Ausdruck, damit ein Transportwechsel nichts an den Zahlen
+        aendert.
+        """
+        import torch
+
+        if not self._auf or self._ext is None or not self.a2a_an:
+            raise Bar1Unverfuegbar(
+                "htccl_all_gather ohne aufgebauten a2a-Bereich -- erreichbar "
+                "nur, wenn jemand handles() umgangen hat."
+            )
+        if dim < 0:
+            dim += inp.dim()
+        inp = inp.contiguous()
+        form = tuple(inp.size())
+        scherbe = inp.numel() * inp.element_size()
+        out = torch.empty((self.welt,) + form, dtype=inp.dtype,
+                          device=inp.device)
+        # Gleichverteilt, weil die Naht es ist -- aber als VEKTOR an
+        # ag_plan, nicht als Annahme in der Arithmetik. Die Begruendung
+        # steht bei ag_plan.
+        plan = ag_plan([scherbe] * self.welt, int(self._geo["a2a_schlitz"]))
+        flach = out.view(-1)
+        for runde in plan:
+            s_off = [runde[self.rank][0]] * self.welt
+            s_len = [runde[self.rank][1]] * self.welt
+            e_off = [x[2] for x in runde]
+            e_len = [x[1] for x in runde]
+            self.htccl_all_to_all_single(
+                comm, flach, inp, s_len, e_len, s_off, e_off,
+            )
+        out = out.movedim(0, dim)
+        return out.reshape(form[:dim] + (self.welt * form[dim],) + form[dim + 1:])
+
     # -- all_to_all --------------------------------------------------------
 
     def _handles_a2a(self, nbytes: int) -> bool:
@@ -2670,16 +2939,32 @@ class HTCCLBar1Transport:
             return 0
         return int(self._ctl_dev[0].item())
 
-    def _kein_kollektiv(self, comm, inp):
+    def _kein_kollektiv(self, comm, *args, **kwargs):
+        """Der Platzhalter fuer die weiter ungedeckten Kollektive.
+
+        ``*args`` ist kein Bequemlichkeitszeichen: die Nahtstellen rufen mit
+        verschiedenen Signaturen (``htccl_reduce_scatter(comm, inp, dim)``,
+        ``htccl_broadcast(comm, tensor, src)``). Mit dem frueheren festen
+        ``(self, comm, inp)`` kam bei beiden ein ``TypeError`` heraus, bevor
+        diese Meldung ueberhaupt zum Zug kam -- der Text war also unerreichbar
+        und die Ursache stand nirgends.
+        """
         raise NotImplementedError(
-            "Der BAR1-Transport bietet heute all_reduce und all_to_all an. "
-            "all_gather, reduce_scatter und broadcast waeren je eine Haelfte "
-            "der all_reduce-Kerne -- gemessen ist keine davon, und in diesem "
-            "Vorhaben zaehlt nur Gemessenes. Erreichbar ist diese Zeile nur, "
-            "wenn jemand handles() umgangen hat."
+            f"Der BAR1-Transport deckt {', '.join(sorted(self.HTCCL_OPS))} "
+            f"ab. reduce_scatter braucht eine Reduktion (der a2a-Kern bewegt "
+            f"Bytes und traegt deshalb all_gather gratis, reduce_scatter gar "
+            f"nicht), broadcast ist an dieser Naht an Ort und die Erweiterung "
+            f"lehnt in==out ab. Erreichbar ist diese Zeile nur, wenn jemand "
+            f"handles() umgangen hat."
         )
 
-    htccl_all_gather = _kein_kollektiv
+    # all_gather ist NICHT mehr hier. Die Zuweisung stand bis zur Einfuehrung
+    # von htccl_all_gather in dieser Liste und haette die neue Methode
+    # ueberschrieben -- eine Zuweisung im Klassenkoerper gewinnt gegen ein
+    # weiter oben stehendes `def` desselben Namens, lautlos. Ruff (F811) hat
+    # es gefunden; ohne den Lauf haette jedes all_gather ein
+    # NotImplementedError geworfen, obwohl handles() zugesagt hatte, und der
+    # Riegel haette wie ein Transportfehler ausgesehen.
     htccl_reduce_scatter = _kein_kollektiv
     htccl_broadcast = _kein_kollektiv
 

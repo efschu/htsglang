@@ -434,6 +434,20 @@ def _transport_name(t) -> str:
     return type(t).__name__
 
 
+def _gedeckte_ops(t) -> str:
+    """Die Operationen, die ``t`` ueberhaupt anbietet -- aus DER Quelle.
+
+    Gelesen wird ``HTCCL_OPS`` des Transports selbst, nie eine im Fehlertext
+    mitgefuehrte Liste. Eine Liste im Text waere genau die Sorte Zusage, die
+    beim naechsten hinzugebauten Kollektiv veraltet, und dann sagt die
+    Meldung "es fehlt X", waehrend X laengst da ist und etwas anderes klemmt.
+    """
+    ops = getattr(t, "HTCCL_OPS", None)
+    if not ops:
+        return "unbekannt (der Transport nennt kein HTCCL_OPS)"
+    return ", ".join(sorted(str(o) for o in ops))
+
+
 def _zeilen_bytes(t: torch.Tensor) -> int:
     """Bytes einer Zeile entlang Achse 0. Fuer 1-D ist das ein Element."""
     n = 1
@@ -566,7 +580,10 @@ class HTCCLCommunicator:
                     f"hat auf die gloo-Ebene entschieden"
                 )
             else:
-                grund = f"{_transport_name(t)} meldet handles({op!r}, {nbytes}) -> False"
+                grund = (
+                    f"{_transport_name(t)} meldet handles({op!r}, {nbytes}) "
+                    f"-> False; gedeckt sind dort {_gedeckte_ops(t)}"
+                )
             raise RuntimeError(
                 f"HTCCL: {op!r} mit {nbytes} Byte waehrend einer "
                 f"CUDA-Graph-Aufzeichnung, aber {grund}. Der Ausweichweg ist "
