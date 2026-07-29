@@ -633,6 +633,16 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+
+            # #195 (collective family): custom-allreduce enablement must be
+            # rank-uniform, because it later gates group collectives (the
+            # graph-buffer registration in ca_comm.capture()'s exit, and the
+            # dispatch decision in all_reduce). The block we are in is entered
+            # on a rank-uniform condition (should_build_custom_allreduce reads
+            # only constructor args and env that must be launch-uniform), so
+            # every rank of the group arrives here and the agreement below is
+            # balanced.
+            self._harmonize_ca_comm_enablement()
         elif use_custom_allreduce and self.world_size > 1:
             # HTCCL active. Skipping is the point: the constructor's
             # nvlink probe is a COLLECTIVE that only the ranks with
@@ -731,6 +741,61 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
+
+    def _harmonize_ca_comm_enablement(self):
+        """#195 (collective family, sibling of #194/#94): force custom-allreduce
+        enablement to the GROUP consensus, so no later collective is gated on a
+        rank-local state.
+
+        `ca_comm.disabled` (and `ca_comm is None` after a construction
+        exception) is rank-local: sgl_kernel import success, the cached can_p2p
+        verdict, and any constructor exception are all per-process facts. Yet
+        that state later decides whether a rank enters GROUP collectives -- the
+        graph-buffer registration in ca_comm.capture()'s exit and the custom-AR
+        arm of all_reduce dispatch. If it diverges, the enabled ranks wait in a
+        broadcast the disabled ranks never join (the #194 measurement: both
+        GPUs 0% util, logs frozen, py-spy shows one rank inside
+        broadcast_object_list) -- or worse, an enabled rank captures a custom-AR
+        kernel that spins on peer flags a disabled peer never sets.
+
+        Rule (same as _harmonize_cuda_graph_plan for graph plans): gather each
+        rank's verdict once, at construction time -- the one point where every
+        rank of the group is provably present -- and on divergence DISABLE for
+        everyone, loudly. On a homogeneous group the gathered values are equal
+        and nothing changes.
+
+        Deliberately NOT freeing the disabled communicator's buffers here:
+        v2's obj.free() takes the group and may itself collect, and only the
+        ranks with a live object could enter it -- the same unbalanced shape
+        this fix removes. Holding a few MB on a misconfigured rank is the
+        balanced choice; the warning names the ranks so the misconfiguration
+        gets fixed instead.
+        """
+        local_ok = self.ca_comm is not None and not getattr(
+            self.ca_comm, "disabled", True
+        )
+        gathered: List[Optional[bool]] = [None] * self.world_size
+        torch.distributed.all_gather_object(
+            gathered, bool(local_ok), group=self.cpu_group
+        )
+        if all(gathered) or not any(gathered):
+            return
+        enabled_ranks = [r for r, ok in zip(self.ranks, gathered) if ok]
+        disabled_ranks = [r for r, ok in zip(self.ranks, gathered) if not ok]
+        logger.warning(
+            "Custom allreduce enablement diverges across group '%s' "
+            "(enabled on ranks %s, unavailable on ranks %s); disabling it on "
+            "every rank so no collective is gated on a rank-local state. "
+            "Fix the unavailable ranks (sgl_kernel build, P2P probe cache) or "
+            "pass --disable-custom-all-reduce to make this deliberate.",
+            self.unique_name,
+            enabled_ranks,
+            disabled_ranks,
+        )
+        if self.ca_comm is not None:
+            self.ca_comm.disabled = True
+            if hasattr(self.ca_comm, "original_disabled"):
+                self.ca_comm.original_disabled = True
 
     @contextmanager
     def graph_capture(
