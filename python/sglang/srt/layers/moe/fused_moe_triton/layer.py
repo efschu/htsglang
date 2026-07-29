@@ -98,6 +98,13 @@ def _get_deepep_comm_group(a2a_backend):
     if a2a_backend.is_mori():
         group = get_tp_group()
 
+    elif a2a_backend.is_bar1ep():
+        # Der BAR1-Direktpfad haengt an get_tp_group().htccl_comm -- Peer-
+        # Zeiger-Tabelle und Schlitze gibt es nur fuer diese Gruppe. Eine
+        # andere Gruppe waere ein Haenger, kein Fehler; deshalb steht dieser
+        # Zweig hier und nicht als Sonderfall im Dispatcher.
+        group = get_tp_group().device_group
+
     elif _is_npu:
         group = get_moe_ep_group().device_group
 
@@ -121,6 +128,24 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
+        # bar1ep faellt hier unter is_deepep(): derselbe Vertrag, dieselben
+        # Argumente, dasselbe Ausgabeformat. Welche Klasse gebaut wird,
+        # entscheidet MaybeTboDeepEPDispatcher -- das ist die einzige Stelle,
+        # die ein Objekt baut.
+        if a2a_backend.is_bar1ep():
+            from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
+                bar1ep_verfuegbar,
+            )
+
+            ok, grund = bar1ep_verfuegbar()
+            if not ok:
+                # Kein stiller Rueckfall: wer bar1ep gewaehlt hat, bekommt
+                # entweder BAR1 oder einen Grund. Ein Ausweichen auf DeepEP
+                # oder die gloo-Ebene saehe in der Messung aus wie BAR1.
+                raise NotImplementedError(
+                    f"--moe-a2a-backend bar1ep ist auf diesem Rechner nicht "
+                    f"verfuegbar: {grund}"
+                )
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
