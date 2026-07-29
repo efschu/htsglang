@@ -1103,14 +1103,63 @@ grain, never mid-kernel.
 - CHAIN LENGTH IS THE LEVER THAT FOLLOWS. A captured verify costs ~12.5 ms
   fixed plus ~3.7 ms per candidate row (measured: 16.1 / 21.5 / 27.2 ms at
   1 / 2 / 4 rows), so a shorter chain lowers break-even fast:
-  `--dual-group-lane-spec-steps 1` gives 24.8 ms per round and break-even
-  **1.53**. On predictable content (the `squares` prompt, accept 1.66) that is
-  14.9 ms/token against 16.2 no-spec — a 7.6 % win, and the first one this
-  feature has produced. It is not a safe default: the same arm's second run
-  drew accept 1.43 and landed at 17.4 ms/token. Accept length is
+  `--dual-group-lane-spec-steps 1` gives 24.0 ms per round and break-even
+  **1.48** (24.8 / 1.53 before the head graph below). On predictable content
+  (the `squares` prompt, accept 1.66) that is 14.7 ms/token against 16.2
+  no-spec — a 9.3 % win. It is not a safe default: other draws of the same arm
+  land at accept 1.36-1.43 and 17.4-17.6 ms/token. Accept length is
   content-driven and this operating point sits ON the threshold, so treat
   `--dual-group-lane-spec --dual-group-lane-spec-steps 1` as a knob for known
-  predictable workloads, not as a general throughput setting.
+  predictable workloads, not as a general throughput setting — or let
+  `--dual-group-lane-spec-adaptive` take that decision per round (below).
+- `--dual-group-lane-spec-head-graph` (default ON, `--no-...` to disable)
+  captures the lane's NEXTN HEAD forward, which round 6 had to leave eager: the
+  generic decode capture builds `spec_info=None` and an MTP forward
+  dereferences it. The head's own runner now builds a real `EagleDraftInput`
+  over a static hidden-states buffer and gets its DECODE phase back (prefill
+  stays off). Measured: one head forward 3.46 -> **2.58 ms**, a K=1 round
+  24.95 -> **23.91 ms**. The head's shape does not depend on K, so ONE head
+  graph serves every rung. VRAM: **~20 MiB**. Boot line:
+  `dual-group lane: NEXTN head graph captured (bs [1], 1 token, DECODE,
+  hidden LAST, EagleDraftInput)`. Per-job falsifier for the byte gate:
+  `head_graph: false`.
+- `--dual-group-lane-spec-rungs 0,1,2,3` captures a LADDER of chain lengths
+  up front — one verify graph per rung, all at bs 1 — so switching K is a
+  graph-key flip at a round boundary and never a re-capture. K=0 is the lane's
+  existing plain decode entry and costs no extra graph; each further rung costs
+  **~15 MiB** (measured: the lane target's capture block 0.08 -> 0.11 GB for
+  three verify rungs; whole-card occupancy unchanged within allocator noise,
+  ~1.0 GiB still free on the 5090). Unset keeps exactly one rung, i.e. the
+  pre-ladder behaviour and its VRAM.
+  TWO SILENT DEFECTS ONLY A LADDER EXPOSES, both fixed here, both invisible
+  with a single verify shape because the boot-time constant happens to be
+  right: the GDN verify stride came from `max_num_tokens // max_bs` (the
+  WIDEST rung, so narrow rungs advanced the recurrent state over too many
+  rows — no assert, wrong tokens), and the flashinfer verify wrappers were
+  keyed by `bs` alone (every rung overwrote the previous one's wrappers, and
+  flashinfer latches `_max_total_num_rows` on a wrapper's first plan).
+- `--dual-group-lane-spec-adaptive` picks K per round from the measured
+  acceptance, and the criterion is MARGINAL, not average:
+  `P(first j proposals all accepted) * t_decode > t_row`, with `t_decode` the
+  measured K=0 round and `t_row` the measured cost of one more chain step. An
+  average criterion (ms/token per rung against a break-even) is wrong here
+  because accept saturates: it ranks K=1 above K=0 on `squares` where the
+  measurement says the opposite. `P(...)` comes from per-position counters, and
+  those carry the finding of round 7a on this vehicle: position 0 is accepted
+  **43.8 %** of the time, position 1 **0.8 %**, position 2 never. The head
+  reliably gets ONE token, so every rung above K=1 is structurally out of
+  reach and the policy settles on K=0-1. Measured adaptive vs the best fixed
+  rung: 16.18 vs 16.19 (squares) and 16.19 vs 16.16 (alphabet) ms/token at 192
+  tokens — it matches the best rung on both contents; the only cost is a
+  warm-up of `--dual-group-lane-spec-adaptive-hysteresis` rounds on the
+  configured default rung (+5 % over a 64-token job, gone by 192).
+  Read the decision in `/get_server_info` →
+  `dual_group_lanes[i]["spec"]["policy"]`: `position_accept`,
+  `marginal_gain_ms`, `marginal_cost_ms`, `marginal_depth`.
+  **The gates must not price the policy**: a job with `verify_graph: false` or
+  `head_graph: false` is a falsifier arm (68 ms eager verify against 21 ms
+  captured) and is deliberately not observed. Running the byte gates first and
+  the adaptive arm second in the same boot used to poison the cost model.
 - `SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY=0` makes both classes equal
   priority. Escape hatch, not a tuning knob: NCCL collective kernels
   spin-wait, so if the protected lane ever starved a freshly launched

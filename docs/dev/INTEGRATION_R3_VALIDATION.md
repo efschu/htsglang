@@ -7279,3 +7279,357 @@ deutschsprachigen Dokumenten produziert es wie bisher Fehlalarme auf
 deutsche Woerter (Basis 974 Treffer in denselben drei Dateien, danach 1095
 — dieselbe Klasse, proportional zu den neuen Zeilen). mypy auf
 `runtime_context.py`: nur der vorbestehende Befund in Zeile 362.
+
+## Lane-Spec-Kette Runde 7a (feat/dual-group-r7a, Basis b8e633c533) — 2026-07-29
+
+Auftrag (DESIGN_201 Nachtrag 13, Punkte 1-3, NUR NEXTN): den Kopf des
+NEXTN-Kopfs graph-fangen, K als vorab captured LEITER bauen, K adaptiv
+waehlen. Reihenfolge nach Nutzer-Vorgabe: EINE Sprosse (K=1) zuerst
+vollstaendig mit allen Byte-Toren, dann die uebrigen als Replikation mit
+Kontrakt-Nachweis, dann EINMAL die volle Messtabelle, dann die Politik.
+
+### 1. Der Kopf-Capture: die benannte Luecke aus Runde 6 ist zu
+
+Runde 6 liess den Kopf eager und benannte den Grund: der generische
+Decode-Capture baut `spec_info=None`, ein MTP-Forward dereferenziert
+`forward_batch.spec_info.hidden_states`. Der Fix ist NICHT, den Kopf durch den
+`EAGLEDraftCudaGraphRunner` zu routen — der faengt die ganze
+topk/Baum/Sampling-Draftschleife, die die greedy-topk-1-Kette der Lane nicht
+hat und die man wieder aufmachen muesste. Er ist ein gezielter Zweig in
+`get_spec_info`, der ein echtes `EagleDraftInput` ueber einem STATISCHEN
+Hidden-States-Puffer baut, plus die Decode-Phase, die auf der Args-View des
+Kopfes wieder eingeschaltet wird (Prefill bleibt aus: die Extend-Formen des
+Kopfes folgen dem Prompt und sind keine feste Leiter, und sein Prefill ist EIN
+Forward je JOB gegen K je RUNDE).
+
+Drei Dinge daran sind die eigentliche Arbeit, und jedes hat einen Boot
+gekostet oder gespart:
+
+- **Der Puffer ist ein Graph-EINGANG.** Die Hidden States kommen aus dem
+  vorigen Forward; der Capture haelt einen festen `_lane_draft_hidden`, in den
+  `load_batch` je Replay hineinkopiert. Bewusst NICHT ueber `share_buffers()`:
+  der prozessweite Pool ist seit D2/D3 (lane,name)-geschluesselt, aber ein
+  privater Tensor kann ueberhaupt nicht aliasen, und das ist der dritte Fall
+  derselben Fehlerfamilie.
+- **`alloc_memory_pool` re-initialisiert den Block der Graph-Runner-Felder**,
+  in dem das Capture-Flag liegt, und laeuft INNERHALB der Kopf-Bringup. Vor
+  dem Aufruf gesetzt wird es still ueberschrieben — und der Fehler ist dann
+  nicht "Flag fehlt", sondern woertlich die Luecke aus Runde 6, also sieht es
+  aus, als waere der Fix nie gemacht worden. Gemessen, Boot 1.
+- **Capture- und Replay-Seite des Graph-SCHLUESSELS muessen aus derselben
+  Regel kommen.** Replay leitet sein Label aus `_wl_variant_label` ab, die
+  Capture-Schleife reicht die LoRA-Variante durch (ohne LoRA: None). Der Kopf
+  wurde also unter `None` aufgenommen und unter `lanedraft` gesucht:
+  `KeyError: ShapeKey(size=1, variant_label='lanedraft')` beim ersten
+  Kopf-Forward, NACH einem Boot, der einen erfolgreichen Capture geloggt hat.
+  Gemessen, Boot 2.
+
+### 2. Byte-Tore an der EINEN Sprosse K=1 (Boot 3), alle in einem Boot
+
+| Tor | alphabet | squares | repeat |
+|---|---|---|---|
+| Boden No-Spec vs. No-Spec | gruen | gruen | gruen |
+| `target_verify` gegen sich selbst | gruen | gruen | gruen |
+| **Kopf-Graph vs. Kopf-EAGER** | **gruen** | **gruen** | **gruen** |
+| Verify-Graph vs. Verify-EAGER (R6-Tor nachgezogen) | gruen | gruen | gruen |
+| alles Graph vs. alles EAGER | gruen | gruen | gruen |
+| `target_verify` vs. No-Spec | gruen | (*) | gruen |
+| **No-Spec-Bahn der Lane vs. RUNDE 6** | **gruen** | **gruen** | **gruen** |
+
+(*) dasselbe Laengenende-Artefakt wie in Runde 5/6.
+Das Instrument belegt beide Seiten: `head_graph_forwards == head_forwards` in
+den Graph-Armen, `0` in den Kopf-eager-Armen; `verify_graph_rounds ==
+spec_rounds` unveraendert. Die letzte Zeile ist das Regressionstor: die
+No-Spec-Bahn ist byte-identisch mit der aus Runde 6 (und damit ueber Runde 5
+hinweg), auf allen drei Prompts — der Kopf-Capture hat den Decode-Eintrag der
+Lane nicht angefasst.
+
+Zahlen zum Kopf, 64 Ausgabe-Token, seriell, Lane-Budget 1600:
+
+| K=1 | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+|---|---|---|---|---|---|
+| alphabet, Kopf EAGER | 24,956 | 21,501 | 3,455 | 1,105 | 22,585 |
+| alphabet, Kopf GRAPH | **23,908** | 21,330 | **2,579** | 1,125 | 21,252 |
+| squares, Kopf EAGER | 24,946 | 21,518 | 3,428 | 1,488 | 16,765 |
+| squares, Kopf GRAPH | **24,304** | 21,590 | **2,714** | 1,658 | **14,659** |
+
+Der Kopf-Forward faellt von 3,46 auf 2,58 ms (−25 %), die Runde um 4,2 %,
+der Break-even von 1,53 (R6) auf **1,48-1,51**. Auf squares gewinnt K=1 in
+DIESEM Boot in beiden Ziehungen (14,659 und 14,555 ms/Token gegen 16,15
+no-spec, −9,3 %) — Runde 6 hatte hier eine Ziehung ueber und eine unter der
+Schwelle.
+
+### 3. Die K-Leiter: zwei stille Defekte, die erst die Leiter aufdeckt
+
+Beide sind Eigenschaften des Codes, nicht der Lane, und beide waren mit EINER
+Verify-Form nicht sichtbar, weil dort die Boot-Konstante zufaellig stimmt.
+
+**L1 — die GDN-Verify-Schrittweite kam aus der Boot-Konstante.**
+`MambaAttnBackendBase.init_cuda_graph_state` leitet EINE Verify-Schrittweite
+aus `max_num_tokens // max_bs` ab. Mit Leiter ist das die BREITESTE Sprosse,
+also bekamen die schmalen Sprossen deren Schrittweite: der gefangene
+GDN-Verify schob den rekurrenten Zustand ueber 4 Zeilen, wo der Batch 2 hatte.
+Kein Assert, nur falsche Tokens — gemessen: K=1 wich mit Leiter bei Index 1
+vom eigenen Eager-Arm ab, waehrend K=3, dessen Schrittweite zufaellig passte,
+byte-gruen blieb. Der EAGER-Pfad liest seit jeher
+`spec_info.draft_token_num`; der Graph-Pfad stellt jetzt dieselbe Frage.
+
+**L2 — die flashinfer-Verify-Wrapper waren nur nach `bs` geschluesselt.**
+Jede Sprosse ist bs=1, also ueberschrieb jede die Wrapper der vorigen. Der
+ueberlebende Satz war die zuletzt aufgenommene Sprosse, und jede Sprosse
+plante ihr Replay durch ihn; flashinfer verriegelt `_max_total_num_rows` beim
+ERSTEN Plan eines Wrappers, also starb die 3-Zeilen-Sprosse mit
+`The total number of rows in qo_indptr 3 in cuda graph mode cannot exceed the
+number of rows set during initialization 2`. Schluessel ist jetzt
+`(bs, draft_token_num)`; ohne Leiter ist `num_tokens` eine Funktion von `bs`,
+der Schluessel gewinnt also nur eine redundante Komponente.
+(Dieselbe Struktur steht unveraendert in `flashinfer_mla_backend.py` — dort
+gibt es heute keine Leiter, aber eine kuenftige haette denselben Defekt.)
+
+### 4. Kontrakt je Sprosse (Boot 5, in Boot 6 unabhaengig wiederholt)
+
+Je Sprosse nur der Kontrakt, nicht das volle Messprogramm — die Leiter ist
+eine Replikation desselben Bauteils mit anderer Konstante:
+
+| K | Flip erreicht sie | `verify_graph_rounds`/`spec_rounds` | Kopf-Graph/Kopf-Forwards | Graph vs. EAGER | vs. No-Spec |
+|---|---|---|---|---|---|
+| 0 | 11/11 Runden | — (Plain-Decode-Eintrag) | — | gruen | gruen |
+| 1 | 11/11 | 11/11 | 11/11 | gruen | gruen |
+| 2 | 11/11 | 11/11 | 22/22 | gruen | gruen |
+| 3 | 11/11 | 11/11 | 33/33 | gruen | gruen |
+
+Boden No-Spec-vs-No-Spec gruen, No-Spec-Bahn gegen Runde 6 gruen (zweiter
+bzw. dritter unabhaengiger Boot).
+
+**VRAM-Preis der Leiter, gemessen auf der 5090:** der Capture-Block des
+Lane-Ziels waechst von 0,08 GB (eine Sprosse) auf 0,11 GB (drei
+Verify-Sprossen) — **~15 MiB je zusaetzlicher Sprosse**. Der Kopf-Graph kostet
+**0,02 GB**. K=0 kostet NICHTS: das ist der Plain-Decode-Eintrag, den die Lane
+schon hat. Kartenbelegung 31621 MiB (eine Sprosse) gegen 31573-31593 MiB
+(volle Leiter) von 32607 — innerhalb des Allokator-Rauschens, ~1,0 GiB frei.
+Die volle Leiter {0,1,2,3} passt also; ausgeduennt werden muss nichts.
+**Flip-Kosten:** ein Sprossenwechsel ist ein Graph-Key-Wechsel und beruehrt
+nur vier Skalare (`lane_verify_shape`); es gibt keinen Re-Capture-Pfad, und
+der Kopf-Graph ist formunabhaengig von K — EIN Kopfgraph bedient jede Sprosse.
+
+### 5. Messtabelle, einmal, als die Leiter stand (Boot 5, 64 Token, seriell)
+
+| alphabet | ms/Runde | Verify | Kopf | Accept | ms/Token |
+|---|---|---|---|---|---|
+| no-spec | 16,171 | — | — | — | **16,171** |
+| K=0 (Leiter-Sprosse) | 16,160 | — | — | — | 16,160 |
+| K=1 | 24,245 | 21,557 | 2,688 | 1,086 | 22,325 |
+| K=2 | 27,988 | 23,405 | 4,583 | 1,125 | 24,878 |
+| K=3 | 33,640 | 27,210 | 6,430 | 1,105 | 30,443 |
+
+| squares | ms/Runde | Verify | Kopf | Accept | ms/Token |
+|---|---|---|---|---|---|
+| no-spec | 16,228 | — | — | — | 16,228 |
+| K=0 | 16,188 | — | — | — | **16,188** |
+| K=1 | 24,172 | 21,531 | 2,641 | 1,400 | 17,266 |
+| K=2 | 28,094 | 23,497 | 4,597 | 1,455 | 19,309 |
+| K=3 | 34,271 | 27,611 | 6,659 | 1,548 | 22,139 |
+
+Jede Zeile mit Wiederholung gefahren; die Wiederholungen liegen auf 0,1-1,3 %.
+**Das Bild, das die Leiter sichtbar macht: Accept SAETTIGT.** alphabet
+1,086 / 1,125 / 1,105 bei K=1/2/3 — praktisch flach. squares
+1,400 / 1,455 / 1,548 — wachsend, aber deutlich sublinear. Positionsweise
+gelesen (q_j = Accept(K=j) − Accept(K=j−1)): squares 0,400 / 0,055 / 0,093,
+alphabet 0,086 / 0,039 / ~0. Die ZWEITE Kettenposition traegt auf beiden
+Inhalten fast nichts.
+Und: **der Schritt K=0 -> K=1 ist der teure** (8,0 ms), die spaeteren kosten
+3,7 und 5,7. K=0 ist eben kein Ein-Zeilen-Verify, sondern der Decode-Graph.
+
+### 6. Adaptives K: das Kriterium ist MARGINAL, nicht durchschnittlich
+
+Nutzer-Vorgabe, und die Messung oben ist genau ihr Beleg: ein Kriterium ueber
+den DURCHSCHNITT (ms/Token je Sprosse gegen einen Break-even) rankt auf
+squares K=1 vor K=0, obwohl die Tabelle K=0 als besser ausweist. Das
+marginale Kriterium fragt stattdessen je Zeile:
+
+    Zeile j lohnt  <=>  P(die ersten j Vorschlaege alle akzeptiert) * t_decode > t_zeile
+
+mit `t_decode` = gemessene K=0-Runde und `t_zeile` = gemessene Differenz
+benachbarter Sprossen (Fit ueber die VERIFY-Sprossen, wo das Paar fehlt — K=0
+liegt nicht auf dieser Geraden). Auf squares: 0,400 x 16,19 = 6,5 ms gegen
+8,0 ms Kosten -> Zeile 1 lohnt NICHT, K=0. Auf der hohen squares-Ziehung
+(q1 = 0,658): 10,6 gegen 8,0 -> K=1. Auf alphabet: 0,086 x 16,17 = 1,4 gegen
+8,1 -> K=0. Genau das erwartete Verhalten.
+
+`P(erste j akzeptiert)` kommt aus PER-POSITION-Zaehlern, nicht aus der
+Invertierung einer mittleren Accept-Laenge: ein Kopf, dessen erster Vorschlag
+meist stimmt und dessen dritter nie, hat dieselbe mittlere Accept-Laenge wie
+einer, der gleichmaessig abfaellt — und nur die Positionssicht trennt die
+beiden, also genau der Fall, fuer den das Grenzkriterium da ist. Der
+Kipppunkt wird auf die naechste vorhandene Sprosse ABGERUNDET (Leiter
+{0,1,3}, Kipppunkt 2 -> Sprosse 1). Hysterese unveraendert.
+
+### 6b. Adaptives K gemessen — und ein Messfehler, der die Politik entlarvte
+
+**Erster Lauf war kontaminiert, und die Politik hat es selbst ausgewiesen.**
+Die Kontrakt-Phase desselben Boots faehrt jede Sprosse ZWEIMAL: einmal
+gefangen und einmal als EAGER-Falsifikator. Ein eager Verify kostet 68 ms
+gegen 21 ms gefangen — und diese Runden landeten im Kosten-EMA der Sprosse.
+Die Politik glaubte danach `round_ms {0: 16,1, 1: 77,1, 2: 75,2, 3: 52,7}`
+gegen gemessene Graph-Kosten von 24 / 28 / 34 und blieb auf K=0, aus einem
+Grund, der mit dem Inhalt nichts zu tun hat. Der Befund kam aus der
+Politik-Telemetrie selbst (`marginal_cost_ms {1: 60,9}`), nicht aus einem
+Absturz. **Fix: eine Runde mit `verify_graph: false` oder `head_graph: false`
+wird nicht mehr beobachtet** — die Diagnose-Arme sind ausdruecklich nicht der
+Arbeitspunkt, also duerfen sie ihn nicht bepreisen. CPU-Test dazu.
+
+Das Kostenmodell wurde danach OHNE neuen Boot auf sauberen (gefangenen)
+Sprossen-Runden nachgezogen und die adaptive Messung wiederholt:
+
+    round_ms  {0: 16,13  1: 23,94  2: 27,75  3: 33,82}   (== Messtabelle)
+    position_accept  {0: 0,438   1: 0,0079   2: 0,000}
+    marginal_gain    {1: 7,10    2: 0,056    3: 0,000}
+    marginal_cost    {1: 7,73    2: 3,82     3: 6,06}
+    -> marginal_depth 0
+
+**Der eigentliche Befund dieser Runde steht in der mittleren Zeile.** Die
+ZWEITE Kettenposition wird auf squares in **0,8 %** der Runden akzeptiert, die
+dritte nie. Der NEXTN-Kopf dieses GGUF-Vehikels trifft praktisch nur EINEN
+Token. Damit ist jede Sprosse ueber K=1 strukturell unerreichbar, unabhaengig
+vom Inhalt, und die Saettigung, die das Grenzkriterium erwartet, ist hier
+nicht mild, sondern total. Ein Durchschnittskriterium haette das nie gezeigt:
+die mittlere Accept-Laenge steigt von 1,44 (K=1) auf 1,44 (K=3) — flach, aber
+nicht null, und ohne Positionssicht nicht als Saettigung lesbar.
+
+Sprossen sauber, squares, je zwei Ziehungen (Re-Teach-Runden, 64 Token):
+
+| K | ms/Runde | Verify | Kopf | Accept | ms/Token |
+|---|---|---|---|---|---|
+| 1 | 24,262 / 23,989 | 21,53 / 21,39 | 2,73 / 2,60 | 1,537 / 1,362 | **15,785** / 17,613 |
+| 2 | 28,059 / 27,863 | 23,46 / 23,31 | 4,60 / 4,55 | 1,684 / 1,600 | 16,662 / 17,414 |
+| 3 | 33,819 / 34,159 | 27,27 / 27,41 | 6,55 / 6,74 | 1,432 / 1,432 | 23,617 / 23,854 |
+
+Gegen einen K=0-Boden von 16,13-16,33 ms/Token: K=1 liegt mit 15,79 einmal
+darueber und mit 17,61 einmal darunter. Der Arbeitspunkt sitzt weiterhin AUF
+der Schwelle, jetzt bei Break-even 1,48-1,51 statt 1,53.
+
+Adaptiv gegen die beste feste Sprosse, beide Inhalte:
+
+| Inhalt | adaptiv 64 Tok | adaptiv 64 (Boden) | adaptiv 192 Tok | beste feste Sprosse | Sprossen-Histogramm |
+|---|---|---|---|---|---|
+| squares | 17,044 | 16,322 | **16,182** | K=0: 16,188 | {0: 191} bzw. {0: 58, 3: 3} |
+| alphabet | 16,243 | 16,191 | **16,194** | K=0: 16,160 | {0: 191} |
+
+**Punkt 4b des Auftrags ist erfuellt**: der adaptive Modus erreicht auf BEIDEN
+Inhalten die beste feste Sprosse innerhalb des Bodens (die K=0-Sprosse selbst
+streut ueber 16,13-16,33). Der einzige Aufschlag ist der Einlauf: die ersten
+Runden laufen auf der konfigurierten Default-Sprosse, bis die Hysterese
+umlegt — sichtbar in `{0: 58, 3: 3}` und in den 17,044 ms des 64-Token-Laufs
+(+5 %), amortisiert bei 192 Token (16,182 gegen 16,19 Boden).
+
+**Punkt 4c, Verdikt ohne Beschoenigung: NEIN.** Die Lane gewinnt mit adaptivem
+K auf squares NICHT deutlich — auf diesem Boot ist die beste Sprosse dort
+K=0, also gar keine Spekulation. Was adaptives K liefert, ist die andere
+Haelfte: es nimmt auf keinem Inhalt die VERLIERENDE Seite einer Schwelle, die
+inhaltsgetrieben um den Break-even schwankt (Runde 6: eine Ziehung 14,94, die
+naechste 17,40 ms/Token). Der Gewinn ist die entfernte Downside, nicht ein
+gehobener Durchschnitt. **Damit auch keine Promotion-Empfehlung fuer
+`--dual-group-lane-spec` als Default** (Punkt 5): das Flag bleibt, was es ist.
+Empfohlen wird stattdessen: WENN es eingeschaltet wird, dann mit
+`--dual-group-lane-spec-rungs 0,1 --dual-group-lane-spec-adaptive` — die
+Leiter kostet ~15 MiB, K=0 kostet nichts, und die Politik nimmt dann den
+Verlust nicht mit.
+
+Der Hebel liegt nachweislich woanders: bei 0,8 % Akzeptanz auf Position 2 ist
+nicht die Kettenlaenge das Problem, sondern die Kopf-QUALITAET auf diesem
+Vehikel. Das ist der erste Posten fuer R7b.
+
+### 7. Warum Eigenbau statt der Upstream-Tier-Maschinerie
+
+Geprueft (Wiederverwendungs-Pflicht): `AdaptiveController` +
+`SpecRuntimeState` in `speculative/adaptive_runtime_state.py` bauen genau die
+Form, die die Leiter braucht — vorab captured je Tier, Swap an
+Runden-Grenzen, EMA-getriebene Wahl. Sie passen aus zwei konkreten Gruenden
+nicht auf die Lane:
+
+1. **Ein Tier ist dort ein KOMPLETTER Ressourcensatz**: eigener
+   Target-Attention-Backend (`init_new_workspace=True`), eigener
+   `DecodeCudaGraphRunner`, eigener Draft-Backend + Draft-Extend-Runner je
+   Tier. Die Lane-Konstruktion aus Runde 6 ruht auf dem Gegenteil — EIN
+   Runner, EIN Backend, EIN `init_cuda_graph_state`-Schnitt, der Verify als
+   ZUSAETZLICHER Eintrag —, weil ein zweiter Runner `init_cuda_graph_state`
+   erneut auf demselben Backend riefe und die Puffer neu schnitte, in die die
+   Lane-Decode-Graphen zeigen. Der Preis waere ausserdem ein
+   384-MiB-flashinfer-Workspace (der D3-Posten) plus ein voller Graph-Pool je
+   Sprosse gegen die ~15 MiB des Eintrags-Ansatzes — auf einer Karte mit
+   ~1 GiB frei ist das kein Geschmacksunterschied.
+2. **Der Controller haengt an einem Spec-WORKER, den die Lane nicht hat.**
+   Das Protokoll verlangt `build_adaptive_runtime_state` /
+   `apply_runtime_state`, implementiert von `EagleWorkerV2` &co ueber ihre
+   `_draft_worker`/`_target_worker`-Paare, und gefuettert aus
+   `on_verify_complete` im Verify-Pfad des Verbands. Die Args-View der Lane
+   CLEART `speculative_algorithm` (genau der Punkt aus Runde 6: Un-Clearen
+   loescht den Plain-Decode-Eintrag der Lane), es gibt also keinen
+   EagleWorker, kein Draft-Extend-Stadium und kein Objekt, dem man das
+   Protokoll geben koennte.
+
+Uebernommen ist bewusst die FORM (vorab captured, Flip nie Re-Capture,
+breiteste Sprosse zuerst aufnehmen); nicht uebernommen ist das
+Entscheidungskriterium, weil das dort die mittlere Accept-Laenge ist — genau
+der Durchschnitt, den Abschnitt 6 verwirft.
+
+### 7b. #93/#102-Aliasing fuer die Sprossen: geprueft, NICHT gebaut, begruendet
+
+Die Sprossen sind wechselseitig exklusiv (immer nur eine replayed), also der
+Idealfall der vorhandenen Graph-State-Offload-Maschinerie. Geprueft wurde
+`speculative/adaptive_graph_memory.py` (#93 physisches Remap, #102 taggbare
+Capture-Pools). Zwei Gruende, es hier NICHT zu bauen:
+
+1. **Der Posten, den es einspart, existiert auf der Lane nicht.** Die
+   1,5 -> 0,3 GB je State aus #102 sind eine Aussage ueber einen VOLLEN
+   `SpecRuntimeState`: eigener 384-MiB-flashinfer-Workspace, eigene Backends,
+   eigener Capture-Pool JE TIER. Die Eintrags-Leiter der Lane vermeidet genau
+   das per Konstruktion — alle Sprossen teilen EIN Backend, EINEN Workspace,
+   EINEN Capture-Pool; verschieden ist nur der aufgenommene Graph. Gemessen
+   bleiben ~15 MiB je Sprosse gegen ~1,0 GiB frei. Aliasing wuerde Bytes
+   adressieren, die die Lane gar nicht doppelt allokiert; die
+   Leiter-Summe IST hier schon nahe am Maximum.
+2. **Anschliessbar waere es nicht trivial, und zwar an derselben Stelle wie
+   D2/D3.** Der Manager ist PROZESSWEIT (`_ACTIVE_MANAGER`, angelegt vom
+   ersten `AdaptiveController`), und `tagged_state_alloc` /
+   `note_state_tensor` / `capture_pool_override` lesen ihn global. Eine
+   nebenlaeufige Lane, die waehrend eines Serving-State-Baus taggt, taggt in
+   dessen Region — exakt die Geteilte-Puffer-Familie, zum vierten Mal. Dazu
+   kommt, dass `resolve_adaptive_graph_memory_mode` fuer die Lane
+   konstruktionsbedingt `resident` liefert: es gated auf
+   `server_args.speculative_adaptive`, und die Args-View der Lane cleart
+   `speculative_algorithm`. Lane-tauglich waere der Manager erst mit
+   (lane, steps)-Keying, also dem D2/D3-Fix ein weiteres Mal — kein
+   Verdrahtungs-, sondern ein Umbauposten.
+
+**Als Posten benannt fuer R7b/D4**, nicht in dieser Runde erzwungen. Er wird
+relevant, sobald eine Sprosse etwas Grosses EIGENES haelt (z. B. eine
+DFLASH-Sprosse mit eigenem Kopf-Checkpoint) — dann ist die Leiter-Summe nicht
+mehr ~ Maximum und das Aliasing zahlt.
+
+**RAM-Offload ganzer kalter Sprossen** (Zurueckwaven, ms-Klasse) ist
+ausdruecklich keine Alternative zum Obigen und war nicht Auftrag: er passt zur
+Zeitskala eines HYSTERESE-Wechsels (alle N Runden), nicht zu einem Flip je
+Runde, den die Leiter mit einem Graph-Key erledigt. Als Design-Notiz
+eingeordnet, ohne Messung.
+
+Byte-Tore gelten unveraendert je Sprosse (Replay-vs-eager, Abschnitt 4) — auch
+fuer eine kuenftig aliasierte Leiter, weil Aliasing die aufgenommenen Kernel
+nicht anfasst, nur ihre Seiten.
+
+### 8. CPU-Tore und Werkzeuge
+
+`test_dual_group_concurrency.py` 81 -> 110 (`TestLaneHeadGraphEntry` 6,
+`TestLaneSpecRungLadder` 8, `TestLaneSpecPolicy` 10, plus die beiden
+Leiter-Defekte L1/L2 als eigene Tests). Ueber distributed/ + model_executor/
+820 gruen gegen 793 auf der Basis, bei identischen 20 roten
+(umgebungsgebunden: `test_vmm_utils` LOCAL_RANK, `test_uneven_tp_nccl_env`
+MPS-Pipe, `test_dcp_token_vector_collective` und
+`test_coresidence_budget_mapping` retry — vor und nach der Aenderung
+dieselben, auf der Basis gegengeprueft).
+ruff/black/isort: Delta null auf allen geaenderten Dateien (die
+vorbestehenden 329 ruff-Befunde in `server_args.py`, 5 in `model_runner.py`
+und die black-Hunks in `decode_cuda_graph_runner.py` sind vor und nach der
+Aenderung identisch; das neue Modul `lane_spec_policy.py` ist sauber).
+mypy auf `lane_spec_policy.py`: sauber. codespell auf den Python-Dateien
+sauber.

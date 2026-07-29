@@ -226,10 +226,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # _wl_block_graph / _sess_block_graph flags by hand for the same reason;
     # defaults on the class are the version of that which cannot be forgotten
     # by the next subclass.
-    _lane_verify_tokens: Optional[int] = None
-    _lane_verify_active: bool = False
-    _lane_verify_captured: bool = False
+    # Round 7a turns the single verify entry into a LADDER: a sorted tuple of
+    # candidate-row counts (K+1 per rung), one captured graph each. The active
+    # field holds the rung currently in scope (an int, never 0) rather than a
+    # bool, so the variant label can name it; None means no lane verify is in
+    # scope. ``_lane_verify_captured`` is the SET of rungs that were actually
+    # recorded -- a rung whose capture was thinned away must not be replayed.
+    _lane_verify_tokens: Optional[tuple] = None
+    _lane_verify_active: Optional[int] = None
+    _lane_verify_captured: frozenset = frozenset()
     LANE_VERIFY_VARIANT = "lanetv"
+    # Round 7a: the lane's NEXTN HEAD. Its every decode forward is an MTP
+    # forward, so unlike the verify there is no second shape to protect on
+    # this runner -- the flag is set for the runner's whole life and the one
+    # captured entry IS the draft entry.
+    _lane_draft_capture: bool = False
+    _lane_draft_captured: bool = False
+    _lane_draft_hidden: Optional[torch.Tensor] = None
+    LANE_DRAFT_VARIANT = "lanedraft"
 
     def __init__(
         self,
@@ -330,14 +344,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # targeted instead: everything above stays as it was, and the verify
         # gets its own capture pass under a temporary shape swap (the S5
         # spill-tick pattern below, run in the other direction).
-        self._lane_verify_tokens: Optional[int] = getattr(
+        _lane_verify_rungs = getattr(
             model_runner, "dual_group_lane_verify_tokens", None
         )
-        # True only inside the verify capture pass and inside the lane's
-        # replay scope; every predicate that has to tell the two entries apart
-        # reads it. Default False -> byte-inert for every other deployment.
-        self._lane_verify_active = False
-        self._lane_verify_captured = False
+        self._lane_verify_tokens: Optional[tuple] = (
+            tuple(sorted({int(n) for n in _lane_verify_rungs}))
+            if _lane_verify_rungs
+            else None
+        )
+        # Set only inside a verify capture pass and inside the lane's replay
+        # scope, and then to the RUNG (candidate-row count) in scope; every
+        # predicate that has to tell the entries apart reads it. Default None
+        # -> byte-inert for every other deployment.
+        self._lane_verify_active = None
+        self._lane_verify_captured = frozenset()
+        # Round 7a: this runner is the lane's NEXTN head and its decode entry
+        # has to carry a real EagleDraftInput. Byte-inert everywhere else
+        # (False), which is every runner except the lane head's.
+        self._lane_draft_capture = bool(
+            getattr(model_runner, "dual_group_lane_draft_capture", False)
+        )
+        self._lane_draft_captured = False
+        self._lane_draft_hidden = None
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -422,7 +450,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # the captured set, or the GGUF dispatch can pick a different
             # kernel on replay than the capture recorded. (Round 5's defect was
             # in that same <= 8-row MMVQ window, so this is not hypothetical.)
-            _register_gguf_decode_buckets([self._lane_verify_tokens], 1)
+            # Round 7a: every rung of the ladder, for the same reason.
+            _register_gguf_decode_buckets(self._lane_verify_tokens, 1)
 
         # S5 spill-tick graph: UNLIKE the weightless block-decode (which IS the
         # decode and reshapes every capture bucket to bs=1), the spill tick is a
@@ -492,8 +521,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # ``max_num_tokens // max_bs`` (MambaAttnBackendBase.
             # init_cuda_graph_state), so anything else hands the GDN verify a
             # query-start-loc ladder of the wrong step.
+            # Round 7a: the WIDEST rung of the ladder sets the width, for
+            # exactly the reason above -- the buffers are cut once and every
+            # rung is recorded against them.
             self.max_num_token = self.max_bs * max(
-                self.num_tokens_per_bs, self._lane_verify_tokens
+                self.num_tokens_per_bs, *self._lane_verify_tokens
             )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
@@ -560,6 +592,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
+        if self._lane_draft_capture:
+            # #274 round 7a: the ONE static input the generic decode buffers do
+            # not carry, because no non-speculative decode has it -- the MTP
+            # head reads its previous-layer hidden states off
+            # ``spec_info.hidden_states`` and concatenates them with the token
+            # embedding. It is a graph INPUT, so it has to be a fixed address
+            # that the round copies into, exactly like input_ids.
+            #
+            # Allocated OUTSIDE share_buffers() on purpose: the process-wide
+            # coalescing pool is keyed by (lane, name) since slice D2/D3, but a
+            # private tensor cannot be aliased by anything at all, and this is
+            # the third member of a bug family (#274 D2/D3) about returned
+            # buffers. Nothing else wants this shape, so there is no saving to
+            # give up.
+            self._lane_draft_hidden = torch.zeros(
+                (self.max_num_token, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.model_config.dtype,
+                device=self.device,
+            )
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -690,8 +741,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # #274 round 6: the lane verify shares ShapeKey.size with the
             # plain bs=1 decode graph, so the variant is the only thing that
             # keeps the two entries apart. Only set while the lane holds the
-            # shape scope.
-            return self.LANE_VERIFY_VARIANT
+            # shape scope. Round 7a: and the RUNGS share it with each other,
+            # so the rung's row count is part of the label -- without it the
+            # ladder would be one key and the last capture would win.
+            return f"{self.LANE_VERIFY_VARIANT}{self._lane_verify_active}"
+        if self._lane_draft_capture:
+            # #274 round 7a: the lane head's only entry. A distinct label
+            # rather than the default None costs nothing and makes a head
+            # graph impossible to confuse with a target decode graph in a
+            # log or a dump.
+            return self.LANE_DRAFT_VARIANT
         if self._wl_block_graph:
             rung = self._wl_attn._wl_graph_replay_blocks
             assert rung is not None, (
@@ -719,6 +778,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # lane's no-spec entry has to stay exactly the graph it was.
         if self._lane_verify_active:
             return self.lane_verify_can_replay(forward_batch)
+
+        # #274 round 7a: the lane's NEXTN head answers for itself for the
+        # mirror-image reason -- its batch carries an EagleDraftInput whose
+        # hidden states are the graph's second input, and a batch without one
+        # (there is none on this runner today, but a future caller is not
+        # bound by that) must stay eager rather than replay a graph against a
+        # stale hidden buffer.
+        if self._lane_draft_capture:
+            return self.lane_draft_can_replay(forward_batch)
 
         # kv-session-offload: the spill tick streams host-resident KV
         # blockwise. S5: run it as a captured graph when the spill-graph flag
@@ -1248,13 +1316,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
+                # #274 round 7a: the two sides of the graph key have to be
+                # computed by the SAME rule. Replay derives its label from
+                # ``_wl_variant_label``; capture takes whatever is passed in
+                # here, which for the plain loop is the LoRA variant (None on
+                # every deployment without LoRA). The lane head's replay label
+                # is ``lanedraft``, so a capture under None records a key the
+                # replay can never find -- measured, boot 2 of round 7a, a
+                # ``KeyError: ShapeKey(size=1, variant_label='lanedraft')`` on
+                # the first head forward. Resolving through the same helper
+                # closes that by construction; for every runner without a lane
+                # entry the label is the LoRA variant exactly as before, so
+                # every other deployment is byte-inert.
+                capture_label = (
+                    self.LANE_DRAFT_VARIANT
+                    if self._lane_draft_capture
+                    else variant_label
+                )
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(bs, forward, stream_idx, capture_label)
 
             # S5 spill-tick graph: an ADDITIONAL bs=1 capture pass, one graph
             # per rung (largest-first for memory-pool reuse). PORT of the
@@ -1287,8 +1372,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # K+1 tokens, TARGET_VERIFY, hidden mode FULL -- an ADDITIONAL
             # pass, captured after the plain decode graphs of this bs so those
             # are recorded exactly as they were before this existed.
+            # Round 7a: one such pass PER RUNG of the K ladder, widest first
+            # (memory-pool reuse, the same ordering argument as the bs loop).
+            # All rungs are captured up front so a rung change at runtime is a
+            # key flip and never a re-capture.
             if self._lane_verify_tokens and bs == 1:
-                self._lane_capture_verify(bs, stream_idx)
+                captured = set(self._lane_verify_captured)
+                for rung in sorted(self._lane_verify_tokens, reverse=True):
+                    self._lane_capture_verify(bs, stream_idx, rung)
+                    captured.add(rung)
+                self._lane_verify_captured = frozenset(captured)
+
+        if self._lane_draft_capture:
+            # #274 round 7a: the head's entries are the ordinary decode
+            # captures of the loop above (this runner has no second shape);
+            # what the flag records is that they exist, so a forward before
+            # capture -- the eager warmup -- cannot admit itself to a graph
+            # that is not there yet.
+            self._lane_draft_captured = True
+            logger.info(
+                "dual-group lane: NEXTN head graph captured (bs %s, 1 token, "
+                "DECODE, hidden LAST, EagleDraftInput).",
+                self.capture_bs,
+            )
 
     def _sess_capture_one_spill_rung(
         self, bs, forward, stream_idx, rung
@@ -1360,7 +1466,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # -- #274 round 6: the dual-group lane's verify entry -------------------
 
     @contextlib.contextmanager
-    def lane_verify_shape(self):
+    def lane_verify_shape(self, num_tokens: Optional[int] = None):
         """Put this runner into the lane's VERIFY shape for the duration.
 
         Capture and replay have to agree on four things -- forward mode, tokens
@@ -1381,6 +1487,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         group's runner can also be put into.
         """
         assert self._lane_verify_tokens, "no lane verify entry on this runner"
+        # Round 7a: which RUNG. Defaulting to the widest keeps a caller that
+        # predates the ladder (and every single-rung deployment) on exactly the
+        # entry it had.
+        if num_tokens is None:
+            num_tokens = max(self._lane_verify_tokens)
+        assert num_tokens in self._lane_verify_tokens, (
+            f"lane verify rung {num_tokens} is not on this runner's ladder "
+            f"{self._lane_verify_tokens}"
+        )
         saved = (
             self.capture_forward_mode,
             self.num_tokens_per_bs,
@@ -1388,9 +1503,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._lane_verify_active,
         )
         self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-        self.num_tokens_per_bs = self._lane_verify_tokens
+        self.num_tokens_per_bs = num_tokens
         self.capture_hidden_mode = CaptureHiddenMode.FULL
-        self._lane_verify_active = True
+        self._lane_verify_active = num_tokens
         try:
             yield
         finally:
@@ -1407,24 +1522,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         The lane's chain is a fixed K+1 tokens at bs 1; a batch of any other
         shape has no graph here and must stay eager rather than be padded into
         one (padding a verify would change which candidate rows exist).
+
+        Round 7a: the rung in scope must be one that was actually RECORDED.
+        A ladder that was thinned (or a rung whose capture raised) leaves the
+        entry missing, and replaying the neighbouring rung's graph would be a
+        silent wrong answer rather than a slow one.
         """
         return (
-            self._lane_verify_captured
+            self._lane_verify_active in self._lane_verify_captured
             and forward_batch.batch_size == 1
             and forward_batch.forward_mode.is_target_verify()
-            and forward_batch.input_ids.numel() == self._lane_verify_tokens
+            and forward_batch.input_ids.numel() == self._lane_verify_active
         )
 
-    def _lane_capture_verify(self, bs: int, stream_idx: Optional[int]) -> None:
-        """Record the lane's verify graph (bs 1, K+1 tokens, TARGET_VERIFY).
+    def _lane_capture_verify(
+        self, bs: int, stream_idx: Optional[int], num_tokens: Optional[int] = None
+    ) -> None:
+        """Record one rung of the lane's verify ladder (bs 1, TARGET_VERIFY).
 
         Mirrors ``_sess_capture_one_spill_rung`` and runs its swap the other
         way round: that pass forces a SPECULATIVE runner down to plain decode
         shaping for one extra graph, this one lifts a PLAIN runner to verify
         shaping for one extra graph. Both restore what they found.
         """
-        num_tokens = self._lane_verify_tokens
-        with self.lane_verify_shape():
+        if num_tokens is None:
+            num_tokens = max(self._lane_verify_tokens)
+        with self.lane_verify_shape(num_tokens):
             with torch_compile_decoration.patch_model(
                 self.model_runner.model,
                 bs in self.compile_bs,
@@ -1432,14 +1555,62 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 self.capture_one_shape(
-                    bs, forward, stream_idx, self.LANE_VERIFY_VARIANT
+                    bs, forward, stream_idx, f"{self.LANE_VERIFY_VARIANT}{num_tokens}"
                 )
-        self._lane_verify_captured = True
         logger.info(
             "dual-group lane: verify graph captured (bs 1, %d tokens, "
             "TARGET_VERIFY, hidden FULL) beside the lane's decode graphs.",
             num_tokens,
         )
+
+    # -- #274 round 7a: the dual-group lane's NEXTN head entry --------------
+
+    def lane_draft_can_replay(self, forward_batch: ForwardBatch) -> bool:
+        """Is THIS batch the lane head's captured draft forward?
+
+        The head's live batch is a plain bs<=max_bs DECODE carrying an
+        ``EagleDraftInput``. The hidden states are a graph INPUT copied into a
+        fixed address by ``_lane_draft_load_hidden``; a batch that carries none
+        has nothing to copy, so it must stay eager rather than replay against
+        whatever the last round left in the buffer.
+        """
+        return (
+            self._lane_draft_captured
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.batch_size <= self.max_bs
+            and getattr(forward_batch.spec_info, "hidden_states", None) is not None
+        )
+
+    def _lane_draft_spec_info(self, num_tokens: int):
+        """The capture-time stand-in for the lane head's ``EagleDraftInput``.
+
+        This is the whole of the named gap round 6 left open: the generic
+        decode capture builds ``spec_info=None`` and an MTP forward
+        dereferences it (``forward_batch.spec_info.hidden_states``), so the
+        head could not be captured at all. It carries only what the MTP forward
+        reads -- the previous hidden states and the hidden mode -- because
+        everything else on ``EagleDraftInput`` belongs to the tree/topk
+        machinery the lane's chain deliberately does not have.
+        """
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        return EagleDraftInput(
+            hidden_states=self._lane_draft_hidden[:num_tokens],
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
+    def _lane_draft_load_hidden(self, forward_batch: ForwardBatch) -> None:
+        """Copy the round's hidden states into the captured graph's input.
+
+        The replay counterpart of ``_lane_draft_spec_info``. Only the REAL
+        rows are written; padded slots are not read by the head any more than
+        padded input_ids are.
+        """
+        hidden = getattr(forward_batch.spec_info, "hidden_states", None)
+        if hidden is None:
+            return
+        rows = hidden.shape[0]
+        self._lane_draft_hidden[:rows].copy_(hidden)
 
     def _lane_verify_spec_info(self, num_tokens: int):
         """The capture-time stand-in for the lane's ``EagleVerifyInput``.
@@ -1721,6 +1892,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # #274 round 7a: the lane head's second graph INPUT. Before anything
+        # else, and before the pre-planned early return below, because both
+        # paths replay the same graph and both need the hidden states at the
+        # captured address.
+        if self._lane_draft_capture:
+            self._lane_draft_load_hidden(forward_batch)
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1983,6 +2161,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # a maskless causal kernel for a chain-masked forward.
         if self._lane_verify_active:
             return self._lane_verify_spec_info(num_tokens)
+        # #274 round 7a: the lane's NEXTN head, and the reason its capture was
+        # a named gap until now -- this branch is what stops the fall-through
+        # to None that an MTP forward dereferences.
+        if self._lane_draft_capture:
+            return self._lane_draft_spec_info(num_tokens)
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
