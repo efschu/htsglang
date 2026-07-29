@@ -24,6 +24,17 @@ depth FRACTION 0..1, Ergaenzung 7c):
                          experts stays with the expert-offload machinery in
                          this phase (wiring both through one backend is a
                          GPU-phase item).
+* ``gdn_state_sets``  -- GDN-/Mamba session state SETS (Erg. 8): one item per
+                         session slot across all GDN layers. The pool is
+                         dimensioned for MAX sessions; with fewer running
+                         sessions the surplus sets are dead weight and
+                         parkable (host RAM or peer VRAM). Turn-class time
+                         constant with its OWN boundary type: moves happen at
+                         ADMISSION boundaries, planned by the session-set
+                         ladder (``on_admission_boundary``), with the
+                         invariant that an arriving session NEVER meets a
+                         parked set (raise before admission, lower with
+                         hysteresis).
 
 Three TIME-CONSTANT TIERS of the same mechanic (Ergaenzung 7c):
 
@@ -93,6 +104,12 @@ OFFLOAD_CLASSES = (
     "lane_workspaces",
     "cold_lane",
     "experts",
+    # Erg. 8: GDN-/Mamba state SETS. One item = ONE session slot across all
+    # GDN layers (not the whole pool). Turn-class time constant, but its
+    # moves happen at ADMISSION boundaries, planned by the session-set
+    # ladder (offload_gdn_states.SessionSetLadder) via
+    # ``on_admission_boundary`` -- never mid-decode.
+    "gdn_state_sets",
 )
 
 OFFLOAD_POLICIES = ("resident", "ram", "auto")
@@ -437,6 +454,35 @@ class PhaseBoundaryPlan:
 
 
 @dataclass
+class AdmissionBoundaryPlan:
+    """What the session-set ladder WOULD move at one admission boundary
+    (Erg. 8).
+
+    Same pattern as ``PhaseBoundaryPlan``: in the CPU phase
+    ``on_admission_boundary`` plans and moves NOTHING; the GPU phase executes
+    ``park_candidates`` / ``wave_in_candidates`` through the movement
+    backend. Deterministic: parks pick the highest set ids first, wave-ins
+    the lowest parked ids first; ``skipped`` maps every considered-but-
+    rejected item to its reason.
+
+    ``needed_sets`` is ``running_sessions + incoming`` (what correctness
+    requires resident); ``target_sets`` is the ladder's answer (>=
+    needed_sets, capped at the registered set count). The invariant "an
+    arriving session never meets a parked set" is enforced here in code:
+    wave-ins are unconditional and sized so that after the plan at least
+    ``min(needed_sets, total sets)`` sets are resident.
+    """
+
+    running_sessions: int
+    incoming: int
+    needed_sets: int = 0
+    target_sets: int = 0
+    park_candidates: List[str] = field(default_factory=list)
+    wave_in_candidates: List[str] = field(default_factory=list)
+    skipped: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class OffloadRegisterStats:
     """Accounting the CPU-phase adapters feed (size/access bookkeeping only)."""
 
@@ -445,6 +491,7 @@ class OffloadRegisterStats:
     park_refusals: int = 0
     wave_ins: int = 0
     phase_plans: int = 0
+    admission_plans: int = 0
 
 
 class OffloadRegister:
@@ -511,6 +558,10 @@ class OffloadRegister:
         # planner asks the arbiter IN ADDITION to the overlap cost function.
         self._bus_arbiter = None
         self._bus_consumer: str = "stage2_phase"
+        # Erg. 8: the session-set ladder governing the gdn_state_sets class.
+        # None = ladder off (today's behavior: every set stays resident and
+        # on_admission_boundary plans nothing).
+        self._session_ladder = None
         self.stats = OffloadRegisterStats()
 
     # --- configuration ------------------------------------------------------
@@ -545,6 +596,18 @@ class OffloadRegister:
         hideable compute; measured in the GPU phase, faked in tests)."""
         with self._lock:
             self._overlap_budget_fn = fn
+
+    def set_session_ladder(self, ladder) -> None:
+        """Attach the Erg.-8 session-set ladder
+        (``offload_gdn_states.SessionSetLadder``) that plans the
+        ``gdn_state_sets`` class at admission boundaries. ``None`` detaches
+        (= ladder off, every set stays resident)."""
+        with self._lock:
+            self._session_ladder = ladder
+
+    @property
+    def session_ladder(self):
+        return self._session_ladder
 
     def set_bus_arbiter(self, arbiter, consumer: str = "stage2_phase"):
         """Attach the PCIe bus-budget arbiter (offload_bus_budget). The
@@ -794,6 +857,127 @@ class OffloadRegister:
                         continue
                 planned_class_bytes[item.offload_class] = planned + item.size_bytes
                 plan.park_candidates.append(item_id)
+        return plan
+
+    # --- admission-boundary hook (Erg. 8; plans only, moves nothing) --------
+    def on_admission_boundary(
+        self, running_sessions: int, incoming: int = 0
+    ) -> AdmissionBoundaryPlan:
+        """Plan the ``gdn_state_sets`` moves for one admission boundary.
+
+        Called BEFORE the ``incoming`` sessions are admitted (same no-op
+        pattern as ``on_phase_boundary``: the plan is returned, nothing is
+        moved in the CPU phase). The attached session ladder answers with the
+        target resident-set count; this method turns it into a deterministic
+        park/wave-in plan over the registered set items.
+
+        Invariant, enforced HERE in code (and again by the ladder's target
+        arithmetic): an arriving session never meets a parked set. Wave-ins
+        are unconditional (retrieval is never refused) and cover at least
+        ``min(running + incoming, total sets)``; parking never plans below
+        that line. Raising is immediate (correctness before savings); the
+        ladder applies its lowering hysteresis internally.
+
+        Deterministic: parks pick the highest set ids first (skipping hot /
+        policy-refused sets with a recorded reason), wave-ins the lowest
+        parked ids first.
+        """
+        if running_sessions < 0 or incoming < 0:
+            raise ValueError("running_sessions and incoming must be >= 0")
+        plan = AdmissionBoundaryPlan(running_sessions, incoming)
+        with self._lock:
+            self.stats.admission_plans += 1
+            items = sorted(
+                (
+                    i
+                    for i in self._items.values()
+                    if i.offload_class == "gdn_state_sets"
+                ),
+                key=lambda i: i.item_id,
+            )
+            total = len(items)
+            needed = running_sessions + incoming
+            needed_resident = min(needed, total)
+            plan.needed_sets = needed
+            ladder = self._session_ladder
+            if ladder is None:
+                # Ladder off = today's behavior: every set stays resident.
+                # Correctness half still applies: if sets are parked (e.g. a
+                # manual park), wave back whatever an admission would hit.
+                target = total
+            else:
+                target = min(int(ladder.on_admission_cycle(needed)), total)
+            # The ladder must never answer below the correctness line; do not
+            # trust it blindly (enforced invariant, not caller discipline).
+            target = max(target, needed_resident)
+            plan.target_sets = target
+
+            resident = [i for i in items if not i.parked]
+            parked = [i for i in items if i.parked]
+
+            # Raise: wave the lowest parked ids back in, up to the target.
+            shortfall = target - len(resident)
+            for item in parked[: max(0, shortfall)]:
+                plan.wave_in_candidates.append(item.item_id)
+
+            # Lower: park the highest resident ids, but never below target
+            # (>= needed_resident), and only sets every invariant admits.
+            excess = len(resident) - target
+            if excess > 0 and ladder is not None:
+                now = self._clock()
+                planned = 0
+                planned_bytes = 0
+                policy = self._policies["gdn_state_sets"]
+                for item in reversed(resident):
+                    if planned >= excess:
+                        break
+                    if policy.mode == "resident":
+                        plan.skipped[item.item_id] = "class policy is 'resident'"
+                        continue
+                    if policy.mode == "auto":
+                        sensor = self._saturation_sensor
+                        if sensor is None or not sensor():
+                            plan.skipped[item.item_id] = (
+                                "auto policy without saturation pressure"
+                            )
+                            continue
+                    if item.hot():
+                        # HOT = the set belongs to an active session; it is
+                        # never parked, whatever the ladder says.
+                        plan.skipped[item.item_id] = "hot (active session)"
+                        continue
+                    age_s = now - item.last_access_s
+                    if age_s < self._hysteresis_window_s:
+                        plan.skipped[item.item_id] = (
+                            f"inside the {self._hysteresis_window_s:.3f}s "
+                            f"turn hysteresis window"
+                        )
+                        continue
+                    cap = self._fraction_cap_locked("gdn_state_sets")
+                    if cap is not None:
+                        already = self._parked_bytes_locked("gdn_state_sets")
+                        if already + planned_bytes + item.size_bytes > cap:
+                            plan.skipped[item.item_id] = (
+                                f"class fraction cap ({policy.fraction}) "
+                                f"exhausted"
+                            )
+                            continue
+                    plan.park_candidates.append(item.item_id)
+                    planned += 1
+                    planned_bytes += item.size_bytes
+
+            resident_after = (
+                len(resident)
+                - len(plan.park_candidates)
+                + len(plan.wave_in_candidates)
+            )
+            if resident_after < needed_resident:
+                raise RuntimeError(
+                    f"admission-boundary plan violates the resident-set "
+                    f"invariant: {resident_after} resident after the plan, "
+                    f"{needed_resident} needed for {needed} sessions "
+                    f"({total} sets registered) -- this is a planner bug."
+                )
         return plan
 
     # --- movement -----------------------------------------------------------

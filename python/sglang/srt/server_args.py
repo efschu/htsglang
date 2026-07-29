@@ -4032,7 +4032,8 @@ class ServerArgs:
             help="Preset of the #286 offload register (DESIGN_201 "
             "Nachtrag-13 Erg. 7/7b/7c): which short-term dispensable VRAM "
             "item classes of the dual lane (graph_rungs, drafter_heads, "
-            "lane_workspaces, cold_lane; experts as the existing class) may "
+            "lane_workspaces, cold_lane, gdn_state_sets; experts as the "
+            "existing class) may "
             "be parked in system RAM. 'latency' = everything resident "
             "(default until the measurement phase; flips stay us-fast, "
             "costs KV headroom). 'capacity' = park aggressively (max "
@@ -4056,7 +4057,8 @@ class ServerArgs:
             "<class>=<policy>[:<fraction>][@<target>[><target>...]] "
             "entries, e.g. 'drafter_heads=ram:0.5@peer_vram>host_ram,"
             "graph_rungs=auto'. Classes: graph_rungs, drafter_heads, "
-            "lane_workspaces, cold_lane, experts. Policies: resident (never "
+            "lane_workspaces, cold_lane, experts, gdn_state_sets. Policies: "
+            "resident (never "
             "parked), ram (parkable up to the fraction), auto "
             "(sensor/measurement decides). The optional fraction 0..1 "
             "bounds how deep the class may be parked (share of its "
@@ -4083,6 +4085,38 @@ class ServerArgs:
             "overridable via the @-suffix of --lane-offload-class-policy.",
         ),
     ] = None
+    gdn_state_set_ladder: A[
+        Optional[str],
+        Arg(
+            help="Session-set ladder of the gdn_state_sets offload-register "
+            "class (#286, DESIGN_201 Erg. 8). The GDN/Mamba state pool is "
+            "dimensioned for MAX sessions; with fewer running sessions the "
+            "surplus per-session state sets are dead weight. Comma-separated "
+            "strictly-descending rung list of RESIDENT set counts, e.g. "
+            "'4,2,1': the active rung is the number of resident sets, the "
+            "rest are parked (host RAM or peer VRAM per the park-target "
+            "ladder). Rung changes happen ONLY at admission boundaries: "
+            "lowering after --gdn-state-set-ladder-hysteresis consecutive "
+            "below-threshold admission cycles, raising immediately and "
+            "BEFORE the admission that needs the next set (an arriving "
+            "session never meets a parked set; above the top rung the "
+            "target follows the session count, correctness before "
+            "savings). Default: unset = ladder off, every set stays "
+            "resident (today's behavior). Takes effect only with "
+            "SGLANG_OFFLOAD_REGISTER=1; movement is a GPU-phase item, the "
+            "CPU phase plans only.",
+        ),
+    ] = None
+    gdn_state_set_ladder_hysteresis: A[
+        int,
+        Arg(
+            help="Lowering hysteresis of --gdn-state-set-ladder, in "
+            "admission cycles: the rung drops only after this many "
+            "CONSECUTIVE admission boundaries wanting a lower rung "
+            "(anti-thrash at session churn). Raising is always immediate. "
+            "Must be >= 1 (1 = lower on the first below-threshold cycle).",
+        ),
+    ] = 2
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -4529,6 +4563,11 @@ class ServerArgs:
         # syntax at argument time (unknown class/policy = hard error here,
         # not at the first park).
         self._handle_lane_offload_register()
+
+        # #286 Erg. 8: validate the gdn_state_sets session ladder at
+        # argument time (nonsense rungs = hard error here, not at the first
+        # admission).
+        self._handle_gdn_state_set_ladder()
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -5344,6 +5383,25 @@ class ServerArgs:
         parse_park_target_order(
             self.lane_offload_park_targets, "--lane-offload-park-targets"
         )
+
+    def _handle_gdn_state_set_ladder(self):
+        """#286 Erg. 8: fail fast on an invalid --gdn-state-set-ladder spec
+        (non-integer / non-positive / non-descending rungs) or hysteresis.
+        Pure validation -- the ladder itself is built when the pool registers
+        its state sets (and only with SGLANG_OFFLOAD_REGISTER=1); the
+        pool-size fit of the top rung is checked there, where the pool size
+        is known."""
+        from sglang.srt.model_executor.offload_gdn_states import (
+            parse_gdn_state_set_ladder,
+        )
+
+        parse_gdn_state_set_ladder(self.gdn_state_set_ladder)
+        if self.gdn_state_set_ladder_hysteresis < 1:
+            raise ValueError(
+                f"--gdn-state-set-ladder-hysteresis must be >= 1 (admission "
+                f"cycles below the threshold before the rung drops), got "
+                f"{self.gdn_state_set_ladder_hysteresis}."
+            )
 
     def speculative_draft_solo_active(self) -> bool:
         """True when the draft-solo placement is requested

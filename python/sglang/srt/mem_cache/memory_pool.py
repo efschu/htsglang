@@ -685,6 +685,29 @@ class MambaPool:
             )
         maybe_poison_pool_data(poison_tensors, "mamba pool")
 
+        # #286 Erg. 8: book each session state SET (one slot across all GDN
+        # layers) as a gdn_state_sets offload-register item. Gated behind
+        # SGLANG_OFFLOAD_REGISTER (default off => no-op, the default path is
+        # byte-identical); registration + size bookkeeping only, no movement.
+        self._maybe_register_offload_state_sets()
+
+    def _maybe_register_offload_state_sets(self):
+        """Thin Erg.-8 adapter: registration is delegated to
+        offload_gdn_states (per-set live size from the real tensor shapes,
+        hot = active session via the allocator probe, va_stable required,
+        session ladder from --gdn-state-set-ladder when configured)."""
+        from sglang.srt.model_executor.offload_register import (
+            offload_register_enabled,
+        )
+
+        if not offload_register_enabled():
+            return
+        from sglang.srt.model_executor.offload_gdn_states import (
+            register_mamba_state_sets,
+        )
+
+        register_mamba_state_sets(self)
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -1121,6 +1144,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=mamba_size,
             device=device,
         )
+        # #286 Erg. 8: wire the state-set hot criterion to the slot
+        # allocator (active session = unparkable set). Flag-gated no-op;
+        # until attached every set reports hot -- the safe direction.
+        from sglang.srt.model_executor.offload_gdn_states import (
+            attach_state_set_activity_probe,
+        )
+
+        attach_state_set_activity_probe(self.mamba_pool, self.mamba_allocator)
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         # Optional int8 checkpoint pool: the radix caches states here (int8) instead

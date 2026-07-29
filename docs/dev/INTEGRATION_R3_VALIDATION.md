@@ -8681,3 +8681,82 @@ NUR mit Karten machbar (Restliste #279):
    13e-Sensor (braucht Kollektiv) + Lane-Keys aus der Dual-Gruppen-Runtime.
 4. transport_hint-Belegung je realem Pfad und Messung, ob der Hook-Entscheid
    selbst unter Graph-Betrieb kostenneutral ist.
+
+## gdn_state_sets CPU-Phase, Erg. 8 (feat/gdn-state-register-class, Basis cb34e56059) — 2026-07-29
+
+GDN-/Mamba-State-Sets als Offload-Register-Klasse (DESIGN_201 Nachtrag-13
+Ergaenzung 8): der State-Pool ist nach MAX-Sessions dimensioniert; bei
+weniger laufenden Sessions sind die uebrigen Sets totes Gewicht und parkbar
+(System-RAM oder peer_vram gemaess Park-Ziel-Leiter). Der freigewordene VRAM
+finanziert im Wenig-Session-Regime die TP=1-Lane-Posten (Routing statt
+Reshard; das Routing selbst ist nicht Teil dieses Slices).
+
+Gebaut (CPU-hermetisch, kein torch.cuda):
+
+- Klasse `gdn_state_sets` in der Register-Enumeration
+  (`offload_register.py`). Posten-Granularitaet = EIN State-SET (ein
+  Session-Slot ueber alle GDN-Layer), nie der ganze Pool. Zeitkonstanten-
+  Stufe turn, aber mit eigenem Grenz-Typ ADMISSION: bewegt wird nur an
+  Admissions-Grenzen, geplant von der Session-Leiter.
+- SESSION-LEITER (`offload_gdn_states.SessionSetLadder`, Kontrakt analog
+  K-Leiter): konfigurierbare, streng absteigende Sprossen
+  (`--gdn-state-set-ladder`, z.B. `4,2,1`; Default unset = Leiter aus =
+  heutiges Verhalten, alle Sets resident). Aktive Sprosse = Anzahl
+  residenter Sets. ABSENKEN erst nach `--gdn-state-set-ladder-hysteresis`
+  aufeinanderfolgenden Admissions-Zyklen unter der Schwelle (Default 2);
+  ANHEBEN sofort und VOR der Admission, die das naechste Set braucht.
+  Oberhalb der Top-Sprosse folgt das Ziel der Session-Zahl (Korrektheit
+  vor Ersparnis; Sprossen deckeln Komfort, nie Sessions), Untergrenze =
+  unterste Sprosse.
+- ADMISSIONS-HOOK `OffloadRegister.on_admission_boundary(running_sessions,
+  incoming)` (gleiches No-Op-Muster wie `on_phase_boundary`): liefert
+  deterministisch den `AdmissionBoundaryPlan` (Parks = hoechste freie
+  Set-Ids zuerst, Wave-ins = niedrigste geparkte zuerst, `skipped` mit
+  Grund je abgelehntem Set), bewegt in der CPU-Phase nichts. INVARIANTE im
+  Code erzwungen (nicht Aufrufer-Disziplin): eine ankommende Session trifft
+  NIE ein geparktes Set — Ziel >= running+incoming auch zwischen Sprossen,
+  Wave-ins bedingungslos, Park nie unter die Korrektheitslinie, plus
+  Schlusspruefung im Planer (RuntimeError bei Verletzung). Heisse Sets
+  (aktive Session) und Politik-/Hysterese-/Anteils-Gates werden wie in
+  `park()` gespiegelt.
+- ADAPTER am MambaPool (`memory_pool.py`, hinter SGLANG_OFFLOAD_REGISTER=1,
+  Default-Pfad byte-unveraendert): je Session-Slot 1..size ein Item
+  (Slot 0 = Dummy-Padding-Ziel, bleibt resident), `va_stable_required`
+  (Kernel/Graphs adressieren die Pool-Tensoren -> #93-Route),
+  Set-Groesse LIVE aus den echten Tensor-Shapes
+  (`mamba_state_set_nbytes`: conv + temporal + ReplaySSM-Ringe, Layout
+  [layers, slots, ...] -> Set-Anteil = nbytes/slots; Spec-Intermediates
+  ausgeschlossen wie im Transfer-Inventar; Ermittler injizierbar,
+  meta/cpu-Fakes in Tests). Heiss-Kriterium ueber Allocator-Probe
+  (`attach_state_set_activity_probe` am HybridReqToTokenPool: aktiv =
+  nicht in free_slots); ohne Probe gilt JEDES Set als heiss (sichere
+  Richtung). Leiter-Anbindung aus den globalen ServerArgs beim
+  Registrieren (max_sets = Pool-Groesse).
+- ServerArgs: `--gdn-state-set-ladder` + `--gdn-state-set-ladder-hysteresis`
+  mit frueher Validierung (`_handle_gdn_state_set_ladder`: unsinnige
+  Sprossen/Hysterese = harter Fehler zur Argumentzeit).
+
+Tests (alle CPU-hermetisch, CUDA_VISIBLE_DEVICES=""):
+`test_offload_gdn_states.py` NEU 38 (Leiter-Parsing/-Validierung,
+Plateau-/Hysterese-Kontrakt, deterministische Plaene, CPU-Phase bewegt
+nichts, Invariante ueber eine volle Churn-Sequenz mit Plan-Ausfuehrung,
+Heiss-Schutz inkl. park()-Ablehnung, Groessenmodell mit Fakes+meta-Tensoren,
+Adapter auf echtem CPU-MambaPool, Flag-aus = null Verhalten, ServerArgs).
+Bestand: test_offload_register.py 44, test_offload_movement.py 49,
+test_offload_bus_budget.py 15, test_dual_group_concurrency.py 152 — alle
+gruen. mem_cache-Suiten (test_mamba_unittest, test_mamba_checkpoint_interval,
+test_unified_mamba_views): identisches 27-Failure-Set vor und nach der
+Aenderung (vorbestehend, CUDA-registrierte Tests in CPU-erzwungener
+Umgebung), 16 passed / 8 skipped unveraendert. ruff + codespell auf allen
+beruehrten Dateien sauber.
+
+GPU-Restliste (Boot-Queue):
+1. Bewegungs-Backend-Route der Sets: #93-getaggte (VA-stabile) Allokation
+   der Pool-Tensoren bzw. per-Set-Payload, damit park/wave_in echte Bytes
+   bewegt; peer_vram-Ziel erst nach dem P2P-Probe-Lauf.
+2. Verdrahtung des Admissions-Hooks an den Scheduler (Aufrufstelle an der
+   Admission, Plan-Ausfuehrung hinter Erst-Chunk-Prefill verstecken).
+3. Messpflicht vor jedem auto/ram-Default: Set-Groesse real, Rueckhol-
+   Latenz je Park-Ziel vs Admissions-Takt.
+4. Aktivitaets-Probe-Kosten auf Device-Tensoren pruefen (heute
+   free_slots-Scan je Boundary) und ggf. Host-Spiegel der Belegung.
