@@ -2100,7 +2100,13 @@ Experten/Spill), Zielplatz durch den Peer-Budget-Grant. Sensor bekommt
 dafuer einen ZWEITEN Wasserstand: Pre-Stage-Marke unterhalb der
 Flip-Marke (beide konfigurierbar), Staging startet am Trend durch die
 Pre-Stage-Marke, Abbruch wenn der Trend zurueckfaellt (traege, damit
-Flattern nicht permanent staged/verwirft).
+Flattern nicht permanent staged/verwirft). OPTIONALITAET (Nutzer
+2026-07-29, ausdruecklich): Treppe UND Pre-Staging sind je EIGENSTAENDIG
+zuwaehlbar (Treppe ohne Staging moeglich; beides aus = heutiges Verhalten
+byte-unveraendert); volles Alles-greift-in-alles — Graphen (Capture-Guard:
+keine Stufe ohne vorab captured Graphen als Flip-Ziel), Offload-Register,
+Wave/Overlap, uneven DCP, Spec/K-Leiter, Prio-Klassen; kein Ausschluss
+ohne benannte harte Grenze.
 SENSOR: KV-Belegungs-Wasserstand + TREND (projizierte Erschoepfung, nicht
 Momentwert), Hysterese je Richtung asymmetrisch (Aufstieg aggressiv —
 Platzen ist teurer als eine langsame Stufe; Abstieg traege). Die
