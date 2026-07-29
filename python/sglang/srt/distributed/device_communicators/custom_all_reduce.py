@@ -184,6 +184,23 @@ class CustomAllreduce:
         The main responsibility of this context manager is the
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
+
+        #195 (collective family, sibling of #194/#94): the registration at the
+        end of this context is a GROUP collective (a per-rank
+        broadcast_object_list over the whole group), while entry into this
+        context can be RANK-LOCAL -- a solo-placed draft runner or a dual-group
+        lane captures its graphs alone (spec_solo_rank_local_graphs), and the
+        piecewise/eager peers never open this context. A group collective must
+        never be entered on a rank-local condition, so two things make the
+        exit rank-uniform:
+
+        1. `self.disabled` is rank-uniform by construction: GroupCoordinator
+           harmonises enablement across the group right after building this
+           communicator (_harmonize_ca_comm_enablement), so a rank whose init
+           failed forces every rank to `disabled` before the first capture.
+        2. register_graph_buffers() itself skips -- on every rank, without a
+           collective -- when this capture recorded no custom-allreduce call.
+           That is the rank-local-capture case; see the comment there.
         """
         try:
             self._IS_CAPTURING = True
@@ -232,13 +249,31 @@ class CustomAllreduce:
         ops.register_buffer(self._ptr, inp, handles, offsets)
 
     def register_graph_buffers(self):
+        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+        if len(offset) == 0:
+            # #195: nothing went through custom allreduce during this capture,
+            # so there is nothing to register -- and the exchange below is a
+            # GROUP collective that must not be entered from a capture the
+            # rest of the group is not in.
+            #
+            # This emptiness check is the rank-uniform derivation the
+            # collective family requires:
+            # * A captured custom-AR call is itself a group collective, so in
+            #   a group-uniform capture every rank records the same call
+            #   sequence (the graph-plan harmonisation exists to enforce
+            #   exactly that) -- the count is identical on all ranks, and the
+            #   exchange is entered by all ranks or by none.
+            # * A RANK-LOCAL capture (solo draft, dual-group lane) cannot
+            #   contain a group collective, so the lone rank sees a zero count
+            #   and skips -- nobody is left waiting in broadcast_object_list.
+            # Skipping the empty exchange is behaviour-preserving: registering
+            # zero buffers was a no-op on every backend.
+            return
         if _is_hip:
-            handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
-            handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.

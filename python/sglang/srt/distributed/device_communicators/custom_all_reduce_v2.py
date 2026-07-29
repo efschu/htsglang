@@ -100,6 +100,14 @@ class CustomAllReduceV2:
 
     @contextmanager
     def capture(self):
+        # #195 (collective family, sibling of #194/#94): the registration
+        # after the yield is a GROUP collective (all_gather over the group),
+        # while entry into this context can be RANK-LOCAL (solo draft /
+        # dual-group lane captures). Both gates below are rank-uniform:
+        # `self.disabled` is harmonised group-wide at init by
+        # GroupCoordinator._harmonize_ca_comm_enablement, and the
+        # empty-capture skip is derived from the captured graph itself --
+        # see the comment at the skip.
         if self.disabled:
             yield
             return
@@ -112,7 +120,18 @@ class CustomAllReduceV2:
             not torch.cuda.is_current_stream_capturing()
         ), "Cannot register graph inputs while capturing CUDA graph"
         raw_ptrs = self.obj.get_graph_capture_ptrs()
-        if raw_ptrs and is_vmm_pointer(raw_ptrs[0]):
+        if not raw_ptrs:
+            # #195: no custom-AR call was captured, so there is nothing to
+            # register. A captured custom-AR call is a group collective, so
+            # in a group-uniform capture every rank records the same calls
+            # and this skip is taken by all ranks or by none; in a
+            # RANK-LOCAL capture the lone rank takes it and never enters
+            # the group-wide all_gather below. Previously an empty capture
+            # still walked into _register_graph_inputs_ipc's collectives,
+            # which is exactly the conditional group entry this family of
+            # hangs is made of.
+            return
+        if is_vmm_pointer(raw_ptrs[0]):
             self._vmm_graph_input_manager.register_graph_inputs()
         else:
             self._register_graph_inputs_ipc()

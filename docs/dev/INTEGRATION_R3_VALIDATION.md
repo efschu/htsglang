@@ -8422,3 +8422,90 @@ Bewegungs-Backend auf #93-Tag-Pools + #89-Pfad, gemessene Rueckhol-Latenzen
 je Klasse (Messpflicht vor jedem auto/ram-Default), PCIe-Overlap-Raten fuer
 die Stufe-2-Kostenfunktion, lane-scoped memory-saver-Tags, Experten-Klasse
 auf das gemeinsame Backend.
+
+## P2P-Readiness-Vorbau (fix/p2p-readiness, Basis 5846cf8ed5) — 2026-07-29
+
+Kontext: Auf dem Rig laeuft ein Treiber-Update mit erwartetem GPUDirect-P2P
+— in besonderer Form: die beiden 3080 behalten das kleine 256-MiB-BAR1-
+Fenster, die 5090 hat volles 32-GiB-BAR. Alle bisherigen Platzierungs-/
+Transportentscheide beruhen auf "kein P2P". Dieser Vorbau (komplett ohne
+GPU gebaut und getestet) liefert (A) den Vorab-Fix des P2P-gegateten #195
+und (B) ein schluesselfertiges Re-Probe-Paket.
+
+### A. #195: register_graph_buffers — Gruppen-Kollektiv in rank-lokaler Capture
+
+Vierte-plus Sichtung der Kollektiv-Familie (#194, #94): eine RANK-LOKALE
+Bedingung entschied, ob ein GRUPPEN-Kollektiv betreten wird. Zwei Achsen:
+
+1. `ca_comm.capture()`-Eintritt ist rank-lokal (Solo-Draft-Runner,
+   Dual-Group-Lane: `spec_solo_rank_local_graphs`); das `__exit__` lief in
+   `register_graph_buffers` -> `broadcast_object_list` ueber die GANZE
+   Gruppe (v2: `all_gather`). Bereits im #194-Commit als separater Bug
+   protokolliert; ohne P2P war der Pfad tot, mit P2P wird er scharf.
+2. `disabled` selbst ist rank-lokal (sgl_kernel-Import, can_p2p-Cache,
+   Konstruktor-Exception) und gatete das Kollektiv.
+
+Fix (rank-uniforme Ableitung, NIE ein konditionales Kollektiv):
+- `custom_all_reduce.py` + `custom_all_reduce_v2.py`: Leere Captures
+  (kein aufgezeichneter Custom-AR-Call) ueberspringen die Registrierung
+  OHNE Kollektiv. Ein aufgezeichneter Custom-AR-Call ist selbst ein
+  Gruppen-Kollektiv — in uniformen Captures ist der Zaehler auf allen
+  Raengen gleich (alle tauschen oder keiner), in rank-lokalen Captures 0
+  (der Solo-Rang wartet auf niemanden). Leere Registrierung war vorher ein
+  No-Op — uniformer Fall verhaltensidentisch.
+- `parallel_state.py` `_harmonize_ca_comm_enablement()`: Enablement wird
+  zur Konstruktionszeit (einziger Punkt mit beweisbar vollstaendiger
+  Gruppe) per all_gather geeinigt; Divergenz -> ueberall disabled, laut,
+  mit Rangliste. Kein Freigeben der Puffer des Verlierers (v2 `obj.free`
+  nimmt die Gruppe und waere selbst unbalanciert).
+
+Divergenz-Audit der capture()-Aufrufer: decode-/prefill-CUDA-Graph-Runner
+unter Solo-Placement (#194-Szenario), Dual-Group-Lane-Runner
+(dual_group_lane.py setzt `spec_solo_rank_local_graphs`), Eagle/DFLASH-
+Draft-Runner, vit_cuda_graph_runner (direkter `ca_comm.capture()`).
+Verbleibend dokumentiert, nicht gefixt: die vmm-vs-ipc-Weiche in v2 waehlt
+ZWISCHEN zwei Kollektiven anhand des lokalen Allokator-Typs — launch-
+uniform per Konstruktion, notiert fuer den Fall abweichender
+Allocator-Konfiguration je Rang.
+
+Tests (hermetisch, CPU, kein torch.cuda-Aufruf):
+`test/registered/unit/distributed/test_ca_capture_register_uniform.py`
+— 13 Tests, simulierte Gruppen-Rendezvous mit Haenger-Detektor.
+Falsifikator: auf dem Stand VOR dem Fix 8 failed / 5 passed (die
+Divergenz-Faelle schlagen an), mit Fix 13 passed. Regressionsdiff
+`test/registered/unit/distributed/`: identisches 16-Failure-Set vor und
+nach dem Fix (alle vorbestehend: LOCAL_RANK-Umgebung u.ae.), 715 passed.
+
+### B. Re-Probe-Paket scripts/p2p_readiness/
+
+Ein Aufruf nach dem Update, wenige Minuten, keine sglang-Boots:
+
+    bash scripts/p2p_readiness/run_all.sh [--baseline <altes nccl-json>]
+
+- `capability_matrix.py`: je geordnetem Paar `cudaDeviceCanAccessPeer`,
+  BAR1-Erhebung je Karte (NVML/nvidia-smi/lspci, als NOMINELLE Obergrenze
+  gelabelt, voll vs gefenstert) UND die EFFEKTIV nutzbare Apertur je
+  gerichtetem Paar: groesste verifiziert peer-beschreibbare Zielregion
+  (Muster rein, zurueckgelesen) und groesster Ein-Stueck-Transfer, per
+  Wachstums-+Binaersuche; Mapping-Fehler ab Groesse X sind Messergebnis,
+  kein Abbruch. Nachgelagerte Konsumenten nutzen NUR die Effektivwerte.
+- `d2d_bench.py`: direkte D2D-Kopie vs Host-Staging, Leiter 64 KiB–1 GiB,
+  die die 256-MiB-Fenstergrenze eng klammert (255/256/257 MiB); Median+p95;
+  Druck-Arme nach #278-Methodik: bidirektional je Paar plus dual-window
+  (EINE Quelle simultan in BEIDE 3080-Fenster).
+- `nccl_transport_check.py`: 2-Rang-all_reduce je Paar in gepinnten
+  Subprozessen, NCCL_DEBUG=INFO-Transport-Grep (P2P/SHM/NET),
+  --baseline-Diff.
+- `verdict_diff.md`: offene Fragen als MESSPUNKTE (kein "sollte jetzt"),
+  plus die acht "kein P2P"-Altverdikte (NCCL-Pfad/NVLS, Custom-AR inaktiv,
+  #278-GDR-Matrix, #279-Ratentabellen, Planner-Paar-Matrix, Erg.-7c-Leiter,
+  P2P-Hebel-Einschaetzung, NORDSTern-Boden) mit Fundort und pruefendem
+  Messpunkt.
+- `run_all.sh`: Orchestrierung + GPU-Arbitrierung (/tmp/gpu-card-N.lock als
+  VERZEICHNIS mit Info-Datei, mkdir-atomar, holder+Herzschlag; fremde Locks
+  werden NIE gebrochen). Karten ueberall PCI-identifiziert
+  (Device-Order-Falle torch != NVML).
+
+Heute nur gebaut + Trockentest (Parsing, Lock-Kontrakt, Argumente, dry-run
+aller Skripte, ohne CUDA):
+`test/registered/unit/distributed/test_p2p_readiness_scripts.py` — 17 Tests.
