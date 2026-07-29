@@ -1026,12 +1026,17 @@ class HTCCLBar1Transport:
     )
 
     def __init__(self, cpu_group, device, fenster_bytes: int,
-                 aktiviert: Optional[bool] = None):
+                 aktiviert: Optional[bool] = None, gruppe: str = ""):
         import torch
         import torch.distributed as dist
 
         self.cpu_group = cpu_group
         self.device = device
+        #: Name der Kommunikatorgruppe ("tp", "dcp", ...). Er steht hier,
+        #: weil BAR1 eine PROZESSWEITE Ressource ist: was diese Gruppe
+        #: festnagelt, fehlt der naechsten. Ohne den Namen liesse sich weder
+        #: buchen noch sagen, wer den Platz hat.
+        self.gruppe = gruppe
         self.rank = dist.get_rank(cpu_group)
         self.welt = dist.get_world_size(cpu_group)
         self.fenster_bytes = int(fenster_bytes)
@@ -1092,6 +1097,27 @@ class HTCCLBar1Transport:
         self.gitter_ab = int(
             os.environ.get("SGLANG_HTCCL_BAR1_GITTER_AB", str(4 << 20))
         )
+        # Darf die cooperative Variante WAEHREND einer CUDA-Graph-Aufzeichnung
+        # gestartet werden? Vorgabe NEIN -- und das ist eine Vorsichtsregel,
+        # keine festgestellte Unvertraeglichkeit.
+        #
+        # Was die Kopfdateien auf diesem Rig hergeben (CUDA 12.9):
+        # `CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2` ist ausdruecklich "Valid for
+        # graph nodes, launches" (cuda.h:2043, driver_types.h:3800) -- ein
+        # cooperative Start ist als Graphknoten also DARSTELLBAR. Ob der
+        # Treiber ihn auch aus einem Stream-Capture heraus als solchen Knoten
+        # aufnimmt, steht dort NICHT, und die Kopfdateien sind alles, was
+        # ohne freie Karten zu haben ist. `benchmark/bar1_graph_check.py`
+        # beantwortet genau diese Frage und weist den Fehlercode aus.
+        #
+        # Bis dahin kostet die Vorsicht im Decode nichts: dort liegen die
+        # Nutzlasten unter `gitter_ab`, also faellt ohnehin `1blk`. Die
+        # Umschaltung greift nur oberhalb der Schwelle, und dort ist sie
+        # sichtbar (einmaliger Protokolleintrag), nicht still.
+        self.graph_gitter = os.environ.get(
+            "SGLANG_HTCCL_BAR1_GRAPH_GITTER", "0"
+        ) not in ("0", "nein", "aus", "false")
+        self._graph_gitter_gemeldet = False
         # Notschwelle netz->ring, falls kein Plan hereingereicht wird.
         self.ring_ab = int(
             os.environ.get("SGLANG_HTCCL_BAR1_RING_AB", str(1 << 20))
@@ -1196,6 +1222,13 @@ class HTCCLBar1Transport:
         self.pipe_direkt = os.environ.get(
             "SGLANG_HTCCL_BAR1_PIPE_DIREKT", "1"
         ) not in ("0", "nein", "aus", "false")
+        # Direkt-Modus WAEHREND einer Graph-Aufzeichnung. Vorgabe AUS, und
+        # anders als beim Kern ist das hier kein Vorbehalt, sondern eine
+        # Herleitung -- die Begruendung steht bei `_erg_platz`.
+        self.pipe_direkt_graph = os.environ.get(
+            "SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH", "0"
+        ) not in ("0", "nein", "aus", "false")
+        self._direkt_graph_gemeldet = False
         # Wieviele Ergebnispuffer der Ring haelt. Kostet L*max_bytes im
         # BAR-Fenster; 2 ist das Minimum, mit dem Runde n nicht in den
         # Puffer schreibt, den der Aufrufer aus Runde n-1 noch haelt.
@@ -1289,9 +1322,40 @@ class HTCCLBar1Transport:
         self._halter = Halter()
 
         eigener_bdf = bdf_der_karte(self.device)
+        # BDF und Fenstervorschlag in EINEM all_gather. Der Vorschlag muss
+        # mit, weil die Karten der Gruppe verschieden grosse Aperturen haben
+        # (3080: 256 MiB brutto) und in einem Prozess mit zwei Gruppen
+        # ausserdem verschieden viel davon schon vergeben ist. Eine je Rang
+        # verschiedene Region waere eine je Rang verschiedene Schlitzordnung
+        # -- also nicht ein Fehler, sondern Schreibvorgaenge an die falsche
+        # Stelle. Deshalb: gruppenweites MINIMUM, und das entscheidet.
         gesammelt: list[object] = [None] * self.welt
-        dist.all_gather_object(gesammelt, eigener_bdf, group=self.cpu_group)
-        self.bdfs = [str(x) for x in gesammelt]
+        dist.all_gather_object(
+            gesammelt, (eigener_bdf, int(self.fenster_bytes)),
+            group=self.cpu_group,
+        )
+        self.bdfs = [str(x[0]) for x in gesammelt]      # type: ignore[index]
+        vorschlaege = [int(x[1]) for x in gesammelt]    # type: ignore[index]
+        gemeinsam = min(vorschlaege)
+        if gemeinsam != self.fenster_bytes:
+            logger.warning(
+                "HTCCL-BAR1: Fenstervorschlaege je Rang %s MiB -- massgeblich "
+                "ist das gruppenweite Minimum %d MiB. Dieser Rang haette "
+                "%d MiB gekonnt. Die Region ist rangeinheitlich, weil die "
+                "Schlitzversaetze in beiden Kernen aus ihr gerechnet werden.",
+                [v // 2**20 for v in vorschlaege], gemeinsam // 2**20,
+                self.fenster_bytes // 2**20,
+            )
+        if gemeinsam <= 0:
+            raise Bar1Unverfuegbar(
+                "gruppenweit sind 0 Byte BAR1-Fenster uebrig. Ein anderer "
+                "Kommunikator dieses Prozesses hat die Apertur belegt; die "
+                "Rechnung dazu steht in der Warnung von "
+                "htccl_matrix_transport.fenster_fuer. Entweder der anderen "
+                "Gruppe weniger geben (SGLANG_HTCCL_BAR1_FENSTER_MIB_<NAME>) "
+                "oder diese Gruppe ausdruecklich ueber NCCL fahren lassen."
+            )
+        self.fenster_bytes = gemeinsam
 
         # 0. Die Kerne. Zuerst, weil ein fehlgeschlagener Bau billiger
         # abzubrechen ist als eine halb aufgebaute Peer-Tabelle.
@@ -1440,6 +1504,15 @@ class HTCCLBar1Transport:
 
         dist.barrier(group=self.cpu_group)
         self._auf = True
+        # In die Kasse. Erst JETZT, weil erst jetzt feststeht, dass die
+        # Apertur den Platz wirklich hergegeben hat -- eine Buchung vor dem
+        # Halter waere eine Zusage auf Verdacht, und der ENOMEM der zweiten
+        # Gruppe kaeme dann von einer Reservierung, die es gar nicht gibt.
+        from sglang.srt.distributed.device_communicators import (
+            htccl_matrix_transport as _kasse,
+        )
+
+        _kasse.kasse_eintragen(self.device, self.gruppe, region + flaggen)
         dauer = time.perf_counter() - t0
         logger.info(
             "HTCCL-BAR1: Aufbau in %.0f ms, %d Peer-Ziele, Region %.1f MiB je "
@@ -1452,6 +1525,14 @@ class HTCCLBar1Transport:
                else ", all_to_all abgeschaltet"),
             self._geo["chunk_max"] // 1024,
             max_bytes // 1024, flaggen, weg,
+        )
+        # Und die Kasse mit ausgeben. Ohne sie ist die naechste Gruppe, die
+        # mit ENOMEM scheitert, wieder auf Raten angewiesen.
+        logger.info(
+            "HTCCL-BAR1: BAR1-Kasse dieser Karte nach Gruppe %r: %s.",
+            self.gruppe or "<ohne Namen>",
+            ", ".join(f"{g or '<ohne Namen>'}: {b / 2**20:.1f} MiB"
+                      for g, b in _kasse.kasse_stand(self.device)),
         )
 
     def _binde_peer(self, peer: int, fremde_fds: list) -> PeerZiel:
@@ -1908,6 +1989,49 @@ class HTCCLBar1Transport:
             return False
         return True
 
+    def _kern(self, bewegt: int, schwelle: int, wo: str) -> int:
+        """``1`` = cooperative Mehrblockstart (``gitter``), ``0`` = ``1blk``.
+
+        **Die eine Stelle, an der diese Wahl faellt** -- vorher rechnete jedes
+        der drei Kollektive `bewegt >= schwelle` selbst nach, und eine
+        Aufzeichnungsregel haette man an drei Stellen einbauen und an einer
+        vergessen koennen.
+
+        Zwei Eingaben, beide rangeinheitlich: die Groesse (gruppenweit gleich)
+        und die Schwelle (Umgebungsvariable). Dazu, wenn gerade aufgezeichnet
+        wird, der Vorbehalt gegen den cooperative Start.
+
+        Zur Rangeinheitlichkeit der Aufzeichnung: sie ist es, weil der
+        Graph-Laeufer auf allen Raengen dieselben Formen in derselben
+        Reihenfolge aufzeichnet. Waere sie es nicht, haetten wir bereits ein
+        groesseres Problem als die Kernvariante -- ein Rang im Kollektiv, der
+        andere nicht, also ein Haenger.
+        """
+        if bewegt < schwelle:
+            return 0
+        if self.graph_gitter:
+            return 1
+        from sglang.srt.distributed.device_communicators.htccl import (
+            graph_erfassung_laeuft,
+        )
+
+        if not graph_erfassung_laeuft():
+            return 1
+        if not self._graph_gitter_gemeldet:
+            self._graph_gitter_gemeldet = True
+            logger.warning(
+                "HTCCL-BAR1: %s mit %d Byte laege ueber der gitter-Schwelle "
+                "(%d Byte), wird aber waehrend einer CUDA-Graph-Aufzeichnung "
+                "auf die 1blk-Variante gelegt. Ob cudaLaunchCooperativeKernel "
+                "sich aufzeichnen laesst, ist auf diesem Rig NICHT gemessen; "
+                "benchmark/bar1_graph_check.py beantwortet es. Faellt der "
+                "Beleg zugunsten von gitter aus, hebt "
+                "SGLANG_HTCCL_BAR1_GRAPH_GITTER=1 diesen Vorbehalt auf. "
+                "Dieser Hinweis erscheint einmal je Rang.",
+                wo, bewegt, schwelle,
+            )
+        return 0
+
     def htccl_all_reduce(self, comm, inp):
         """Summen-Allreduce ueber ``netz`` oder ``ring``, ausser Ort.
 
@@ -1937,8 +2061,9 @@ class HTCCLBar1Transport:
         out = torch.empty_like(inp)
         # 'gitter' ist der cooperative Mehrblockstart. Die Schwelle ist
         # gemessen (ab 4 MiB gewinnt er), aber sie ist eine Zahl aus EINEM
-        # Rig -- deshalb steht sie in einer Umgebungsvariablen.
-        kern = 1 if nbytes >= self.gitter_ab else 0
+        # Rig -- deshalb steht sie in einer Umgebungsvariablen. Unter
+        # Graph-Aufzeichnung entscheidet zusaetzlich `_kern`.
+        kern = self._kern(nbytes, self.gitter_ab, "all_reduce")
         peer_nutz = [0] * self.welt
         peer_flag = [0] * self.welt
         for r, z in self._peers.items():
@@ -2062,6 +2187,62 @@ class HTCCLBar1Transport:
 
         if not self.pipe_direkt or self._geo.get("off_erg", -1) < 0:
             return None
+        # -- Aufzeichnung -------------------------------------------------
+        #
+        # Unter Stream-Capture ist der Direkt-Modus AUS. Das ist keine
+        # Vorsicht, sondern eine Herleitung; sie steht hier ausgeschrieben,
+        # weil sie sonst nirgends nachlesbar waere.
+        #
+        # Diese Methode ist HOSTCODE. Sie laeuft beim Aufzeichnen genau
+        # einmal und bei keiner Wiedergabe wieder. Der gewaehlte Ringplatz
+        # `_erg_i`, der daraus gerechnete Zeiger und die `peer_erg`-Tabelle
+        # des Kerns werden in den Graphen eingebrannt. Drei Folgen, und die
+        # dritte ist die gefaehrliche:
+        #
+        # 1. Der Ring entartet je Graph auf EINEN Platz. Fuer sich genommen
+        #    ist das nur graphueblich (ein Graph hat feste Ausgabepuffer).
+        # 2. Die Lebensdauerpruefung unten -- der schwache Verweis -- greift
+        #    bei Wiedergabe NICHT MEHR, weil kein Hostcode laeuft. Wer den
+        #    Ergebnistensor ueber eine Wiedergabe hinaus haelt, bekommt ihn
+        #    unter der Hand ueberschrieben, und zwar ohne den Abbruch, den
+        #    diese Methode im eager-Betrieb ausloest. Genau der Fehlerfall,
+        #    den die Pruefung verhindern soll, kaeme durch die Aufzeichnung
+        #    zurueck.
+        # 3. Und das ist der stille: bei MEHREREN aufgezeichneten Graphen
+        #    (sglang zeichnet je Stapelgroesse einen auf) laeuft `_erg_i`
+        #    ueber die Ringplaetze weiter. Mit der Vorgabe `erg_ring = 2`
+        #    ist beim dritten Graphen Platz 0 wieder an der Reihe. Haelt der
+        #    Graph-Laeufer den Ausgabetensor des ersten Graphen noch -- was
+        #    er tut --, bricht es hier ab, mitten in der Aufzeichnung. Haelt
+        #    er ihn NICHT mehr, teilen sich zwei aufgezeichnete Graphen
+        #    denselben BAR1-Platz, und wer sie abwechselnd wiedergibt,
+        #    bekommt vom einen die Zahlen des anderen. Kein Absturz.
+        #
+        # Der Ausweg ist billig: ohne Direkt-Modus liefert `_pipe_all_reduce`
+        # einen `torch.empty_like`, der waehrend der Aufzeichnung aus dem
+        # privaten Speicherbecken des Graphen kommt und damit ohnehin eine
+        # feste Adresse hat -- der Kern faehrt seinen `direkt=0`-Weg, der
+        # derselbe gemessene Kontrollpfad ist. Es kostet den gesparten
+        # VRAM-Durchgang, nicht die Richtigkeit.
+        from sglang.srt.distributed.device_communicators.htccl import (
+            graph_erfassung_laeuft,
+        )
+
+        if graph_erfassung_laeuft() and not self.pipe_direkt_graph:
+            if not self._direkt_graph_gemeldet:
+                self._direkt_graph_gemeldet = True
+                logger.warning(
+                    "HTCCL-BAR1-PIPE: Direkt-Modus waehrend einer "
+                    "CUDA-Graph-Aufzeichnung abgeschaltet -- der Ringplatz "
+                    "wuerde eingebrannt und die Lebensdauerpruefung liefe bei "
+                    "keiner Wiedergabe mehr. netz_pipe faehrt aufgezeichnet "
+                    "den direkt=0-Weg. SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 "
+                    "hebt das auf; wer das setzt, muss den Ergebnistensor "
+                    "innerhalb derselben Wiedergabe verbrauchen und darf "
+                    "hoechstens SGLANG_HTCCL_BAR1_PIPE_ERG_RING Graphen "
+                    "aufzeichnen. Dieser Hinweis erscheint einmal je Rang."
+                )
+            return None
         ring = int(self._geo["erg_ring"])
         i = (self._erg_i + 1) % ring
         alt = self._erg_lebt[i]
@@ -2093,7 +2274,7 @@ class HTCCLBar1Transport:
         direkt = out is not None
         if not direkt:
             out = torch.empty_like(inp)
-        kern = 1 if nbytes >= self.pipe_gitter_ab else 0
+        kern = self._kern(nbytes, self.pipe_gitter_ab, "netz_pipe")
         peer_nutz = [0] * self.welt
         peer_flag = [0] * self.welt
         peer_erg = [0] * self.welt
@@ -2298,7 +2479,7 @@ class HTCCLBar1Transport:
         # sie uebernommen, nicht bestaetigt. Massgeblich ist, was wirklich
         # ueber PCIe geht, also ohne den eigenen Block.
         bewegt = sum(int(n) for j, n in enumerate(sende_bytes) if j != self.rank)
-        kern = 1 if bewegt >= self.gitter_ab else 0
+        kern = self._kern(bewegt, self.gitter_ab, "all_to_all_single")
 
         peer_nutz = [0] * R
         peer_flag = [0] * R
@@ -2513,6 +2694,17 @@ class HTCCLBar1Transport:
         lebenden Abbildung weg.
         """
         self._auf = False
+        # Zuerst austragen: der Platz ist ab hier auf dem Weg zurueck, und
+        # eine Kasse, die nach einem `close` noch belegt meldet, wuerde eine
+        # spaeter gebaute Gruppe grundlos kuerzen.
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                htccl_matrix_transport as _kasse,
+            )
+
+            _kasse.kasse_austragen(self.device, self.gruppe)
+        except Exception:
+            pass
         for z in self._peers.values():
             for a in (z.nutz, z.flag):
                 if self._cuda is not None:
@@ -2569,7 +2761,9 @@ class HTCCLBar1Transport:
         self._schritt_dev = None
 
 
-def baue_bar1(cpu_group, device, fenster_bytes: int) -> Optional[HTCCLBar1Transport]:
+def baue_bar1(cpu_group, device, fenster_bytes: int,
+              bericht: Optional[dict] = None,
+              gruppe: str = "") -> Optional[HTCCLBar1Transport]:
     """Fabrik mit sauberem Rueckfall.
 
     ``None`` heisst: dieser Rechner kann den Direktpfad nicht, mit
@@ -2580,27 +2774,57 @@ def baue_bar1(cpu_group, device, fenster_bytes: int) -> Optional[HTCCLBar1Transp
     ``fenster_bytes`` ist die **angeforderte** Groesse der Empfangsregion je
     Rang. Was daraus wirklich wird, sagt danach
     ``transport.fenster_minimum()`` -- und nur das gehoert in den Planer.
+
+    ``bericht`` ist der GRUND, und er ist kein Beiwerk. Bisher endete jeder
+    Ausfall in einem ``logger.info`` und einem ``None``, und der Aufrufer
+    protokollierte danach ungerührt "transport=bar1". Genau so ist eine
+    Messung entwertet worden: die tp-Gruppe fuhr ueber BAR1, die
+    dcp-Gruppe ueber gloo, und das Protokoll sah in beiden Faellen gleich
+    aus. Wer ``bericht`` mitgibt, bekommt hier ``grund`` und ``stufe``
+    ("aufbau", "byte_beleg") hineingeschrieben und kann daraus eine laute
+    Meldung machen.
     """
+    if bericht is None:
+        bericht = {}
+
+    def _aus(stufe: str, text: str):
+        bericht["stufe"] = stufe
+        bericht["grund"] = text
+        return None
+
     try:
-        t = HTCCLBar1Transport(cpu_group, device, fenster_bytes)
+        t = HTCCLBar1Transport(cpu_group, device, fenster_bytes, gruppe=gruppe)
     except Bar1Unverfuegbar as e:
         logger.info("HTCCL-BAR1: Direktpfad nicht verfuegbar -- %s", e)
-        return None
+        return _aus("aufbau", str(e))
     except NotImplementedError as e:
         logger.info("HTCCL-BAR1: Direktpfad braucht Treiberarbeit -- %s", e)
-        return None
+        return _aus("aufbau", f"Treiberarbeit noetig: {e}")
     except Exception as e:                 # ein halber Aufbau bleibt nicht stehen
         logger.info("HTCCL-BAR1: Aufbau fehlgeschlagen -- %r", e)
-        return None
+        return _aus("aufbau", f"{type(e).__name__}: {e}")
     # Der Byte-Beleg gehoert zum Aufbau, nicht zur Kuer: ohne ihn ist
     # `handles` gesperrt. Auf diesem Rig meldete der Treiber fuer ein Paar
     # Peer-Zugriff und lieferte 4096 von 1048576 Byte.
     try:
-        t.byte_beleg_alle()
+        belege = t.byte_beleg_alle()
     except Exception as e:
         logger.info("HTCCL-BAR1: Byte-Beleg nicht durchfuehrbar -- %r", e)
         t.close()
-        return None
+        return _aus("byte_beleg", f"nicht durchfuehrbar: {type(e).__name__}: {e}")
+    if not t._belege_stehen:
+        # Bisher kam der Transport hier UNVERSEHRT heraus und meldete sich
+        # erst spaeter ueber `handles` ab -- also lief jedes Kollektiv still
+        # ueber die gloo-Ebene, waehrend das Protokoll "transport=bar1"
+        # sagte. Der Grund gehoert dem Aufrufer gemeldet, nicht verschwiegen.
+        gefallen = sorted(k for k, v in belege.items() if not v)
+        bericht["stufe"] = "byte_beleg"
+        bericht["grund"] = (
+            f"Byte-Beleg gefallen fuer die gerichteten Paare {gefallen}. "
+            f"handles() sagt zu allem False; jedes Kollektiv dieser Gruppe "
+            f"laeuft ueber die gloo-Ebene."
+        )
+        bericht["haelt_belegt"] = True
     # Und derselbe Grundsatz fuer all_to_all -- eigener Kern, eigene
     # Schlitze, eigene Flaggenzeilen, also eigener Beleg. Er wird NUR
     # versucht, wenn der all_reduce-Beleg steht: ein Kollektiv ueber eine

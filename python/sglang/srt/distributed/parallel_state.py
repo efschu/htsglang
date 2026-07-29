@@ -238,6 +238,47 @@ def reg_all_to_all_single(
 # so a graph replay advances it exactly as the first run did.
 CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device", "host"})
 
+#: Die GPU-getriebenen Transporte, deren Graph-Erfassung geprueft, aber noch
+#: nicht belegt ist. Sie stehen NICHT in der Liste oben -- sie kommen ueber
+#: einen ausdruecklichen Schalter dazu, und nur ueber ihn.
+GRAPH_FREIGABE_TRANSPORTS = frozenset({"bar1", "matrix"})
+
+#: Der Schalter. **Nicht umlegen, bevor `benchmark/bar1_graph_check.py` auf
+#: freien Karten bestanden hat.**
+#:
+#: Warum ein Schalter und nicht einfach zwei weitere Namen in der Liste: was
+#: an bar1 einer Aufzeichnung im Weg stand, ist inzwischen behoben (der
+#: Ausweichriegel in `htccl._select`, die Kernauswahl in
+#: `HTCCLBar1Transport._kern`, der Direkt-Modus in `_erg_platz`) -- aber
+#: "behoben" ist eine Aussage ueber den Code, nicht ueber die Hardware. Der
+#: eine Punkt, der sich ohne Karten nicht klaeren liess, ist, ob der Treiber
+#: `cudaLaunchCooperativeKernel` aus einem Stream-Capture heraus annimmt.
+#: Solange das offen ist, faellt aufgezeichnet die 1blk-Variante, und diese
+#: Zeile bleibt aus.
+_GRAPH_FREIGABE_ENV = "SGLANG_HTCCL_GRAPH_FREIGABE"
+
+
+def graph_freigabe_gesetzt() -> bool:
+    """Ob der Freigabeschalter fuer die GPU-getriebenen Transporte steht."""
+    import os
+
+    return os.environ.get(_GRAPH_FREIGABE_ENV, "0") not in (
+        "0", "nein", "aus", "false", ""
+    )
+
+
+def capturable_transports() -> frozenset:
+    """Die AKTUELL als capturable geltende Menge.
+
+    ``CAPTURABLE_HTCCL_TRANSPORTS`` ist die belegte Grundmenge und bleibt es;
+    diese Funktion ist die Stelle, die den Freigabeschalter dazurechnet. Wer
+    "ist das capturable?" fragt, fragt hier -- nicht die Konstante, sonst
+    wirkt der Schalter an einer Stelle und an der anderen nicht.
+    """
+    if graph_freigabe_gesetzt():
+        return CAPTURABLE_HTCCL_TRANSPORTS | GRAPH_FREIGABE_TRANSPORTS
+    return CAPTURABLE_HTCCL_TRANSPORTS
+
 
 def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     """Reject a host-staged HTCCL transport while CUDA graphs are enabled.
@@ -248,7 +289,7 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     transport is known, and only when HTCCL is actually on -- flag off, this
     function is never called.
     """
-    if transport in CAPTURABLE_HTCCL_TRANSPORTS:
+    if transport in capturable_transports():
         return
     try:
         from sglang.srt.runtime_context import get_server_args
@@ -258,7 +299,7 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         return  # no published ServerArgs yet -> nothing to validate against
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
-    if transport in ("bar1", "matrix"):
+    if transport in GRAPH_FREIGABE_TRANSPORTS:
         # Different reason, so a different message. These two are NOT
         # host-staged: their payload never touches host memory, and their
         # round counter lives in device memory precisely so a graph replay
@@ -269,18 +310,25 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         # "host-staged" here would be false, and letting them through on the
         # strength of an argument would be the assumption this project keeps
         # getting punished for.
+        #
+        # Was sich seither geaendert hat: die drei Stellen, an denen der
+        # Transport eine Aufzeichnung wirklich nicht ueberlebt haette, sind
+        # behoben (htccl._select laesst nicht mehr still in die gloo-Ebene
+        # ausweichen; HTCCLBar1Transport._kern nimmt aufgezeichnet die
+        # 1blk-Variante; _erg_platz schaltet den Direkt-Modus ab, dessen
+        # Ringplatz sonst eingebrannt wuerde). Offen bleibt genau eine
+        # Messfrage, und dafuer gibt es jetzt ein eigenes Pruefprogramm.
         raise ValueError(
             f"SGLANG_HTCCL_TRANSPORT={transport!r} is a GPU-driven transport "
             "whose CUDA-graph capture is UNMEASURED, not one that is known to "
             "be uncapturable: it never stages over the host and it keeps its "
-            "round counter in device memory. It is kept off the capturable "
-            "list because its large-payload path uses a cooperative launch "
-            "that nobody has captured and replayed on this hardware. Pass "
-            "--disable-cuda-graph to run it eagerly, or "
-            "SGLANG_HTCCL_BAR1_GITTER_AB=<huge> to keep it on the "
-            "single-block launch -- that still leaves capture unmeasured, so "
-            "measure it before adding either name to "
-            "CAPTURABLE_HTCCL_TRANSPORTS."
+            "round counter in device memory. The code paths that would have "
+            "broken under capture are fixed; what is still missing is the "
+            "PROOF on this hardware. Run "
+            "`python benchmark/bar1_graph_check.py <dev,dev,...>` on free "
+            "cards; if it passes, set "
+            f"{_GRAPH_FREIGABE_ENV}=1 to release this transport for capture. "
+            "Until then pass --disable-cuda-graph to run it eagerly."
         )
     raise ValueError(
         f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged transport "
@@ -561,19 +609,48 @@ class GroupCoordinator:
             # the exact shape of the arm-E crash. Fail at startup, naming the
             # cause, instead.
             _enforce_cpu_transport_needs_eager(envs.SGLANG_HTCCL_TRANSPORT.get())
-            self.htccl_comm = HTCCLCommunicator(
+            # Ueber eine LOKALE Variable, und die Zustandsabfrage weiter
+            # unten auch: `self.htccl_comm` darf nur hinter einem
+            # `is not None` beruehrt werden (test_dispatch_seams_are_all_
+            # none_guarded pinnt das, und zu Recht -- daran haengt, dass
+            # Flag-aus byteidentisch bleibt).
+            _comm = HTCCLCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
+                gruppe=self.unique_name,
             )
-            logger.info(
-                "HTCCL enabled for group '%s' (transport=%s): TP collectives "
-                "run over the vendor-neutral host-staged path instead of "
-                "NCCL. Every SGLANG_HTCCL* env must be identical on all "
-                "ranks; the host-staged transports (shm/gloo/ucx) "
-                "additionally require --disable-cuda-graph.",
-                self.unique_name,
-                envs.SGLANG_HTCCL_TRANSPORT.get(),
-            )
+            self.htccl_comm = _comm
+            # Was ANGEFORDERT war und was ERREICHT wurde -- und zwar getrennt.
+            #
+            # Bis hierher stand in dieser Zeile der angeforderte Name, egal
+            # was daraus geworden war. Am echten Modell mit SGLANG_UNEVEN_DCP
+            # hiess das: 'tp' baute den Direktpfad in 27 ms auf, 'dcp'
+            # scheiterte am Halter mit ENOMEM und fiel auf gloo zurueck --
+            # und beide Zeilen sagten "transport=bar1". Die daraus gewonnene
+            # Zahl war zur Haelfte gar keine bar1-Zahl. Deshalb wird der
+            # Ausfall jetzt zur WARNUNG mit Gruppennamen und Grund, und der
+            # Erfolg nennt ausdruecklich, was wirklich laeuft.
+            angefordert = envs.SGLANG_HTCCL_TRANSPORT.get()
+            stand = getattr(_comm, "stand", {}) or {}
+            erreicht = stand.get("erreicht", angefordert)
+            if stand.get("direkt", True):
+                logger.info(
+                    "HTCCL enabled for group '%s': angefordert=%s, "
+                    "ERREICHT=%s. Every SGLANG_HTCCL* env must be identical "
+                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
+                    "additionally require --disable-cuda-graph.",
+                    self.unique_name, angefordert, erreicht,
+                )
+            else:
+                logger.warning(
+                    "HTCCL group '%s': angefordert=%s, ERREICHT=%s (%s: %s). "
+                    "Diese Gruppe laeuft NICHT ueber %s. Ein Messwert aus "
+                    "diesem Lauf ist gemischt und darf nicht als "
+                    "%s-Wert berichtet werden.",
+                    self.unique_name, angefordert, erreicht,
+                    stand.get("stufe", "?"), stand.get("grund", "?"),
+                    angefordert, angefordert,
+                )
 
         # When HTCCL is active the pynccl communicator is NOT CONSTRUCTED --
         # not merely left unused.

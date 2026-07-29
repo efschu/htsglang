@@ -376,7 +376,16 @@ class Scheduler(
         self._cross_schedule_mode = cross_switching_active(server_args)
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        # The storage-prefetch path lives on the HiCache tree caches only; a
+        # plain (Mamba)RadixCache has no hicache_* attributes. Keying this off
+        # the backend name ALONE made _prefetch_kvcache dereference
+        # tree_cache.hicache_storage_pass_prefix_keys on a MambaRadixCache and
+        # kill every scheduler on the first request whenever a storage backend
+        # was configured while --enable-hierarchical-cache was off.
+        self.enable_hicache_storage = (
+            server_args.hicache_storage_backend is not None
+            and server_args.enable_hierarchical_cache
+        )
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache

@@ -211,14 +211,31 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+def _first_visible_device_ordinal() -> int:
+    """Erstes Geraet aus CUDA_VISIBLE_DEVICES als Zahl, sonst 0.
+
+    Der Portversatz soll nur verhindern, dass zwei gleichzeitige Testlaeufe
+    auf verschiedenen Karten denselben Port greifen. Er darf den IMPORT
+    dieses Moduls nicht zum Scheitern bringen -- und genau das tat er:
+
+    * ``CUDA_VISIBLE_DEVICES=""`` (die uebliche Art, einen Testlauf ohne
+      Karten zu fahren, etwa waehrend ein anderer Lauf sie haelt) traf auf
+      ``""[0]`` und warf ``IndexError: string index out of range``, beim
+      Einsammeln, vor jedem einzelnen Test. Damit war ohne Karten KEIN Test
+      dieses Baums lauffaehig, auch keiner, der nie eine anfasst.
+    * Eine UUID-Form (``CUDA_VISIBLE_DEVICES=GPU-1a2b...``) ist ebenfalls
+      zulaessig und haette ``int("G")`` geworfen.
+
+    Beide Faelle heissen hier dasselbe: kein Versatz.
+    """
+    roh = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
+    return int(roh) if roh.isdigit() else 0
+
+
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _first_visible_device_ordinal() * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _first_visible_device_ordinal() * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
