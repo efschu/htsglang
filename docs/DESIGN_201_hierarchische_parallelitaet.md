@@ -1877,3 +1877,15 @@ Schichtung damit final: (1) Gewichte byte-geteilt (Nesting), (2) Sprossen-
 States physisch aliased (~max statt Summe, #93/#102), (3) kalte Sprossen
 RAM-parkbar (waehlbar). Einbau: R7b/D4 zusammen mit der Politik; R7a liefert
 nur die Aliasing-Pruefung + Design-Notiz.
+
+Nachtrag-13-Ergaenzung 5 (Nutzer 2026-07-29, Draft-Quant-Wahlregel):
+Ein 16-bit-Draft neben einem klein-quantisierten GGUF-Ziel ist ein
+Nice-to-show-Sonderfall ohne echten Mehrwert — als integrierte Option ok,
+nie als Default. REGEL: Der Draft-Kopf laeuft DEFAULT in AEHNLICHER oder
+LEICHT BESSERER Quantisierung als das Hauptmodell (Q3/Q4-Ziel -> Q4-Q6-Kopf;
+FP8-Ziel -> FP8/BF16-Kopf), FREI WAEHLBAR ueber die volle Leiter (Q2..BF16)
+— die Wahl ist eine Qualitaet(Accept)/Geschwindigkeit(Kopf-Forward)/
+max-Token(VRAM->KV)-Abwaegung, die der Planner je Karte rechnen kann
+(Fit-Tabelle je Quant-Stufe). Alles-greift-in-alles: kombinierbar mit
+Lane-Platzierung, K-Leiter, Turn-Routing, Redundanz-Budget; kein Ausschluss
+ohne benannte harte Grenze.
