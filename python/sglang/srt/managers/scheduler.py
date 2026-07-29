@@ -305,6 +305,33 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def derive_enable_hicache_storage(server_args: ServerArgs) -> bool:
+    """Whether the scheduler may drive the HiCache storage-prefetch path.
+
+    Both halves are required, and the second one used to be missing.
+
+    The prefetch path (``Scheduler._prefetch_kvcache``) reaches into
+    ``tree_cache.hicache_storage_pass_prefix_keys`` and
+    ``tree_cache.prefetch_from_storage``. Those attributes exist on the
+    HiCache tree caches only (``hiradix_cache``, ``hi_mamba_radix_cache``,
+    ``unified_radix_cache`` after ``init_hicache``) -- and which tree cache
+    gets built is decided by ``enable_hierarchical_cache`` alone
+    (``mem_cache/registry.py``), never by the storage backend.
+
+    Keying the flag off ``hicache_storage_backend is not None`` ALONE
+    therefore armed the prefetch path against a plain ``RadixCache`` /
+    ``MambaRadixCache`` whenever a storage backend was configured while
+    ``--enable-hierarchical-cache`` was off. The result was an
+    ``AttributeError`` inside the first request of every scheduler process --
+    all of them, at once, with a traceback that pointed at the cache instead
+    of at the configuration.
+    """
+    return (
+        server_args.hicache_storage_backend is not None
+        and server_args.enable_hierarchical_cache
+    )
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -378,7 +405,7 @@ class Scheduler(
         self._cross_schedule_mode = cross_switching_active(server_args)
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hicache_storage = derive_enable_hicache_storage(server_args)
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
