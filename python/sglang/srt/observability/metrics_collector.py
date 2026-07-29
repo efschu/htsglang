@@ -414,6 +414,45 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Multi-group runtime (#274 slice D): online card equivalents
+        # =================================================================
+        # share_c = rate_c(shared window) / rate_c(solo floor); E = SUM_c.
+        # E = 1.0 means the classes split one card exactly, E > 1.0 means
+        # there was real overlap.  Both are EMAs over ~1 s windows and are
+        # only published for windows in which every busy class had a ready
+        # floor for the arm it was running -- a window without that is
+        # dropped rather than reported as a smaller number.
+        self.lane_share = Gauge(
+            name="sglang:lane_share",
+            documentation=(
+                "Per-class degradation share of the multi-group runtime: the "
+                "class's work rate in a shared window divided by its solo "
+                "floor. 1.0 = undisturbed. `lane_class` is `serving` or "
+                "`lane<id>`."
+            ),
+            labelnames=[*labels.keys(), "lane_class"],
+            multiprocess_mode="mostrecent",
+        )
+        self.lane_share_e = Gauge(
+            name="sglang:lane_share_e",
+            documentation=(
+                "Card equivalents E = SUM of sglang:lane_share over the "
+                "classes that were busy in the window."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.lane_share_floor = Gauge(
+            name="sglang:lane_share_floor",
+            documentation=(
+                "Solo floor (work per second) a class's share is measured "
+                "against, per `lane_class` and `arm`."
+            ),
+            labelnames=[*labels.keys(), "lane_class", "arm"],
+            multiprocess_mode="mostrecent",
+        )
+
+        # =================================================================
         # Speculative decoding
         # =================================================================
         self.spec_accept_length = Gauge(
@@ -1244,6 +1283,29 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     mode=mode,
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
+
+    def log_lane_share(self, window) -> None:
+        """Publish one closed window of the online card-equivalent estimator.
+
+        Only complete SHARED windows move the share/E gauges: a dropped or
+        floor-less window has no defined E, and publishing a partial sum as
+        if it were one is how a controller would end up steering on noise.
+        Floors are published for every window, because they are the thing a
+        reader needs to judge whether a share is meaningful at all.
+        """
+        for row in window.classes:
+            if row.floor is None or row.arm is None:
+                continue
+            self.lane_share_floor.labels(
+                **self.labels, lane_class=row.key, arm=row.arm
+            ).set(row.floor)
+        if window.kind != "shared" or window.e is None:
+            return
+        for row in window.classes:
+            if row.share is None:
+                continue
+            self.lane_share.labels(**self.labels, lane_class=row.key).set(row.share)
+        self.lane_share_e.labels(**self.labels).set(window.e)
 
     def increment_forward_execution_seconds(
         self,

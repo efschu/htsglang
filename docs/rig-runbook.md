@@ -1119,6 +1119,70 @@ grain, never mid-kernel.
   prefill is not byte-reproducible beyond that (upstream, every backend), so
   a long-prompt comparison measures the model, not the runtime.
 
+### 4.13 Reading card equivalents ONLINE (#274 slice D, S1)
+
+**OFF by default, and that is a finding, not caution** — see the box at the
+end of this section. `--dual-group-lane-share-window-s 1.0` turns it on.
+
+Once on, it is the offline measurement of 4.12 done from inside the server,
+once per window:
+
+    share_c = rate_c(shared window) / rate_c(solo floor)      per class
+    E       = SUM_c share_c
+
+Two flags, both only allocated when a lane exists:
+
+```bash
+--dual-group-lane-share-window-s 1.0    # window length; 0 (default) = OFF
+--dual-group-lane-share-ema-s    1.0    # EMA time constant, 0 = no smoothing
+```
+
+Where to read it:
+
+- Prometheus: `sglang:lane_share{lane_class="serving"|"lane0"}`,
+  `sglang:lane_share_e`, `sglang:lane_share_floor{lane_class,arm}`.
+- `/get_server_info` → `internal_states[i]["lane_share"]`: floors, EMAs,
+  window counts and the last 16 windows verbatim. The raw counters it
+  differences are next to it under `lane_share_counters` (serving side) and
+  in `dual_group_lanes[i]["work_total"]` (lane side), so an external
+  instrument can difference the SAME numbers over its own window.
+
+Four properties that decide how to read it:
+
+- **Floors come from SOLO windows only** — windows in which exactly one class
+  did work. Drive a solo phase per class before expecting an `e_ema`; until a
+  class has `floor_min_windows` (3) of them the shared windows report
+  `dropped: "no_floor:..."` rather than a smaller E.
+- **A window with two ARMS is dropped, not averaged.** A prefill-shaped and a
+  decode-shaped step have different floors, so a window in which a class did
+  both is `dropped: "mixed_arms:..."`. This is not rare: each lane job starts
+  with a prefill, so SHORT lane jobs drop most windows. Use
+  `max_new_tokens` ≳ 100 when the online number is what you want, and read
+  `counts` to see how many windows survived.
+- **Shared windows never move a floor**, and `freeze_floors()` /
+  `load_floors()` exist so a future controller cannot re-learn the
+  denominator of the quantity it is steering.
+- **Every window carries its rung id** (the controller state). Slice D1 has
+  no controller and the rung is always `static`; a window across a rung
+  change is dropped, because E is only defined per rung.
+
+**Why it is off by default.** With the estimator ON, a serving group under a
+continuous 2048-token-prefill lane died in the serving group's GDN prefill
+path (`store_kvcache`, `Assertion 'index >= 0 && index < size_limit'`) in
+3 of 3 runs at 60 s per phase. The same run with `--dual-group-lane-share-
+window-s 0`, and the same run on the base commit, survived 3 of 3 and produce
+numbers identical to three decimals. Counters, estimator cost and pool sizing
+are all ruled out; the mechanism is not. Until it is found (DESIGN_121 §12.7),
+this is an opt-in instrument — and the DECODE arm, where it was validated,
+ran it in four boots without incident. If you turn it on, do not drive the
+lane with long prefills.
+
+- **Reproducer**, if you want to work on it: the 4.12 concurrent recipe with
+  `--dual-group-lane-budget-mib 700`, then a 60 s phase in which the lane is
+  fed back-to-back 2048-token prefill jobs (`"spec": false`,
+  `max_new_tokens: 1`) while `/generate` runs back-to-back 128-token
+  requests. It dies 40-60 s in.
+
 
 ## 5. Credentials
 

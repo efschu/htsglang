@@ -1544,6 +1544,161 @@ class TestPriorityClasses(CustomTestCase):
         self.assertEqual(flat, plan.budgets)
 
 
+class TestPrioritySumInvariance(CustomTestCase):
+    """#274 slice D: the sum invariance of the priority classes, pinned over
+    EVERY permutation rather than over one graded example.
+
+    PRIO-Nachtrag 5 says priority SHIFTS capacity and creates none, and the
+    whole multi-group runtime rests on it: the co-residence bracket is what
+    tells a lane set whether it fits, and if the answer moved with the policy
+    then the bracket would be a policy statement rather than a property of the
+    card.  Addendum 11 (3) carries the same invariant forward to the path
+    dispatcher, so it is worth a falsifier that cannot be satisfied by one
+    lucky ordering.
+
+    What is pinned, precisely:
+      * the SUM of the awarded MiB over the lanes on a card is invariant under
+        every assignment of priority classes;
+      * ``_award_leftover`` conserves the card's leftover EXACTLY (the plan
+        level only differs by the ``int()`` truncation of the per-rank share);
+      * the invariant survives the starved case, where a class is reached with
+        nothing left;
+      * and it is not vacuous -- the DIVISION between lanes really does move.
+    """
+
+    _KEYS = ("pd", "main", "extra")
+
+    @staticmethod
+    def _est(key, weights, other, share="d"):
+        return ks.InstanceEstimate(
+            key=key,
+            kind="serving",
+            local=True,
+            feasible=True,
+            reasons=[],
+            prefill_tok_s=1000.0,
+            decode_tok_s=50.0,
+            max_kv_tokens=10000.0,
+            weights_mib=dict(weights),
+            other_mib=dict(other),
+            posts_mib={},
+            share_group=share,
+        )
+
+    @staticmethod
+    def _spec(key, gpus, budgets, prio=0):
+        return ks.InstanceSpec(
+            key=key,
+            model_path="/nonexistent",
+            tp_size=len(gpus),
+            rank_gpu_id=list(gpus),
+            budgets_mib=list(budgets),
+            share_group="d",
+            priority_class=prio,
+        )
+
+    def _plan(self, prios, *, total=32000, budget=14000, gpus=(0,), totals=None):
+        specs = [
+            self._spec(k, list(gpus), [budget] * len(gpus), p)
+            for k, p in zip(self._KEYS, prios)
+        ]
+        ests = [
+            self._est(k, {g: 3000 for g in gpus}, {g: 1000 for g in gpus})
+            for k in self._KEYS
+        ]
+        return ks.coresident_budget_plan(
+            specs,
+            ests,
+            totals if totals is not None else {g: total for g in gpus},
+            shared_process=True,
+        )
+
+    @staticmethod
+    def _handed(plan):
+        return sum(sum(v) for v in plan.budgets.values())
+
+    # -- the class assignments worth sweeping ----------------------------
+    # Every permutation of a graded order (who is protected), plus every
+    # coarser grouping (ties), plus the flat case. product() over three
+    # classes covers all of them at 27 solves, which is cheap and exhaustive
+    # rather than representative.
+    def _assignments(self):
+        return list(product((0, 1, 2), repeat=3))
+
+    def test_the_sum_is_invariant_under_every_class_assignment(self):
+        sums = {p: self._handed(self._plan(p)) for p in self._assignments()}
+        lo, hi = min(sums.values()), max(sums.values())
+        self.assertAlmostEqual(
+            lo,
+            hi,
+            delta=3,
+            msg=(
+                "priority changed the total handed out; lowest "
+                f"{min(sums, key=sums.get)} -> {lo:.1f}, highest "
+                f"{max(sums, key=sums.get)} -> {hi:.1f}"
+            ),
+        )
+
+    def test_the_sum_is_invariant_across_ranks_too(self):
+        # Three lanes on THREE shared cards: the per-rank int() truncation is
+        # the only thing that may differ, so the tolerance grows with ranks
+        # and with nothing else.
+        sums = [
+            self._handed(self._plan(p, gpus=(0, 1, 2))) for p in self._assignments()
+        ]
+        self.assertAlmostEqual(min(sums), max(sums), delta=9)
+
+    def test_the_sum_is_invariant_when_a_class_is_starved(self):
+        # 24000 total against three lanes asking 20000 each: the last class
+        # gets nothing, and the card's total is still the card's total.
+        plans = [self._plan(p, total=24000, budget=20000) for p in self._assignments()]
+        self.assertTrue(any(pl.starved for pl in plans))
+        sums = [self._handed(pl) for pl in plans]
+        self.assertAlmostEqual(min(sums), max(sums), delta=3)
+
+    def test_the_award_step_conserves_the_leftover_exactly(self):
+        # Below the plan level there is no truncation, so the conservation is
+        # exact rather than within a rounding delta.
+        here = [self._est(k, {0: 3000}, {0: 1000}) for k in self._KEYS]
+        want = {"pd": 9000.0, "main": 7000.0, "extra": 5000.0}
+        for prios in self._assignments():
+            klass = dict(zip(self._KEYS, prios))
+            for leftover in (0.0, 4000.0, 21000.0, 40000.0):
+                got, _rows, _starved = ks._award_leftover(here, want, klass, leftover)
+                self.assertAlmostEqual(
+                    sum(got.values()),
+                    leftover,
+                    places=6,
+                    msg=f"klass={klass} leftover={leftover}",
+                )
+                self.assertTrue(all(v >= -1e-9 for v in got.values()))
+
+    def test_the_invariant_is_not_vacuous(self):
+        # If priority moved nothing, the invariant above would be trivially
+        # true and would pin nothing at all.
+        flat = self._plan((0, 0, 0))
+        graded = self._plan((0, 1, 2))
+        self.assertNotEqual(flat.budgets, graded.budgets)
+        self.assertGreater(graded.budgets["pd"][0], graded.budgets["extra"][0])
+
+    def test_usable_context_is_NOT_claimed_invariant(self):
+        # The honest counterpart, pinned so nobody generalizes the invariant
+        # past what it says: capacity in TOKENS is min(sum P, 64 x min P),
+        # which is not linear, so moving MiB between lanes can move the token
+        # total even though the MiB total is fixed.  It takes an UNEVEN rig to
+        # show it -- with one rank per lane the min and the sum coincide and
+        # the nonlinearity has nowhere to bite, which is itself worth knowing.
+        rig = {0: 32607, 1: 20480, 2: 20480}
+        caps = []
+        sums = []
+        for prios in ((0, 0, 0), (0, 1, 2)):
+            plan = self._plan(prios, gpus=(0, 1, 2), budget=9000, totals=rig)
+            caps.append(sum(min(sum(v), 64 * min(v)) for v in plan.budgets.values()))
+            sums.append(self._handed(plan))
+        self.assertAlmostEqual(sums[0], sums[1], delta=9)  # MiB: invariant
+        self.assertNotAlmostEqual(caps[0], caps[1], delta=3)  # tokens: not
+
+
 # ---------------------------------------------------------------------------
 # 7e. The N-lane entry point
 # ---------------------------------------------------------------------------

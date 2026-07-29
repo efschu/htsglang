@@ -724,6 +724,7 @@ class SchedulerBatchResultProcessor:
         )
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        self.metrics_reporter.gen_tokens_total += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(),

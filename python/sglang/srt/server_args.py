@@ -3941,6 +3941,34 @@ class ServerArgs:
             "resolved values are logged.",
         ),
     ] = None
+    dual_group_lane_share_window_s: A[
+        float,
+        Arg(
+            help="Window length of the ONLINE card-equivalent estimator "
+            "(#274 slice D): share_c = rate_c(shared window) / rate_c(solo "
+            "floor), E = SUM_c share_c, published as sglang:lane_share / "
+            'sglang:lane_share_e and under internal_states[...]["lane_share"]. '
+            "The window has to sit above the A-vs-A noise floor of the "
+            "underlying rates (0.25-0.39 %), which is what ~1 s buys; shorter "
+            "windows measure noise, longer ones smear load changes. "
+            "DEFAULT 0 = OFF, and that is a finding rather than caution: with "
+            "the estimator on, a serving group under a continuous "
+            "2048-token-prefill lane died in the GDN prefill path in 3 of 3 "
+            "runs (store_kvcache index assert), while the same run with it off "
+            "and the same run on the base commit survived 3 of 3. The "
+            "mechanism is not understood and is the first item of slice D2 -- "
+            "until it is, this is an opt-in instrument. 1.0 is the value it "
+            "was validated at (DESIGN_121 §12.1/§12.7). Only allocated when "
+            "--dual-group-lane is set.",
+        ),
+    ] = 0.0
+    dual_group_lane_share_ema_s: A[
+        float,
+        Arg(
+            help="Time constant of the EMA over the estimator's windows "
+            "(see --dual-group-lane-share-window-s). 0 disables smoothing.",
+        ),
+    ] = 1.0
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
