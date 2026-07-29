@@ -326,6 +326,9 @@ def transformer_nesting_probes(
     num_experts: Optional[int] = None,
     linear_attn_units: Optional[int] = None,
     vocab_units: Optional[int] = None,
+    moe_intermediate_size: Optional[int] = None,
+    weight_block_size: Optional[Sequence[int]] = None,
+    quant_method: Optional[str] = None,
 ) -> List[NestingProbe]:
     """The probes a dense/GDN/MoE transformer actually needs.
 
@@ -334,6 +337,20 @@ def transformer_nesting_probes(
     group's installed vector, so this cannot drift from what the layers do.
     That is also why the geometry is asked twice: those helpers switch on
     ``kv_heads < tp_size``, and the two groups have different sizes.
+
+    The same discipline applies to BLOCK-QUANTIZED weights (#274 families
+    slice B).  An FP8 checkpoint with ``weight_block_size`` cannot be split
+    inside a quantization block, so the layers re-express the element-granular
+    MLP/MoE families in block units (``_quant_block_aligned_units``).  A
+    nesting verdict computed on the RAW unit count is then a verdict about a
+    partition the layers never perform: for intermediate 17408 with block 128
+    the raw count is 1088 and the real one 136, and the two disagree in both
+    directions over a swept ratio grid -- including the dangerous one, where
+    the raw count says "nested" and the block count says "not".  So the block
+    size is asked of the checkpoint and applied here, exactly as at
+    construction.  The scale grids (``ceil(out/block_n)`` etc.) need no probe
+    of their own: they carry the SAME unit count as the weight by
+    construction, which is why one aligned probe covers both.
     """
     import math
 
@@ -341,8 +358,28 @@ def transformer_nesting_probes(
         ACTIVATION_VEC_ELEMS,
         attn_q_partition_groups,
         attn_q_partition_units,
+        block_aligned_units,
         scoped_tp_partition_ratios,
     )
+
+    block_n = block_k = None
+    if weight_block_size and len(weight_block_size) == 2:
+        block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+        if quant_method == "gguf":
+            # GGUF quantizes along the INPUT dim only; an output-dim split
+            # never cuts a block, and coarsening on its nominal [256,256]
+            # would wrongly merge fine-grained head units (see
+            # _quant_block_aligned_units).
+            block_n = None
+
+    def _aligned(total, units, what, family):
+        probes = []
+        for block, axis in ((block_n, "output"), (block_k, "input")):
+            u = block_aligned_units(total, units, block)
+            if not any(p.units == u and p.family == family for p in probes):
+                label = what if u == units else f"{what} ({axis} quant blocks)"
+                probes.append(NestingProbe(what=label, units=u, family=family))
+        return probes
 
     big_ratio = plan.big_ratio
     fast_ratio = plan.fast_ratio
@@ -368,16 +405,30 @@ def transformer_nesting_probes(
         )
     ]
     if intermediate_size:
-        probes.append(
-            NestingProbe(
-                what="MLP intermediate",
-                units=intermediate_size
-                // math.gcd(intermediate_size, ACTIVATION_VEC_ELEMS),
-                family="mlp",
+        probes.extend(
+            _aligned(
+                intermediate_size,
+                intermediate_size // math.gcd(intermediate_size, ACTIVATION_VEC_ELEMS),
+                "MLP intermediate",
+                "mlp",
             )
         )
     if num_experts:
         probes.append(NestingProbe(what="MoE experts", units=num_experts, family="moe"))
+    if moe_intermediate_size:
+        # The MoE family shards the per-expert INTERMEDIATE dimension whenever
+        # the expert dimension itself is not the shard axis (everything except
+        # the GGUF expert-shard path). Its unit count is not num_experts, so it
+        # needs its own probe.
+        probes.extend(
+            _aligned(
+                moe_intermediate_size,
+                moe_intermediate_size
+                // math.gcd(moe_intermediate_size, ACTIVATION_VEC_ELEMS),
+                "MoE per-expert intermediate",
+                "moe",
+            )
+        )
     if linear_attn_units:
         probes.append(
             NestingProbe(

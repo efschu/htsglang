@@ -981,14 +981,19 @@ keine Messung; LUECKE = Baustein fehlt nachweislich.
 
 | Feature | hybrid-GDN dense GGUF | dense ohne GDN (Llama-Klasse) | MoE | MoE-GGUF |
 |---|---|---|---|---|
-| Komplement-Loader + data_ptr-Gate | **GEHT** (1058 Ids) | gebaut-ungemessen (nur der GDN-Zweig entfaellt) | **LUECKE** (Experten-Schalen) | **LUECKE** |
-| Huellbaum + Schalen | **GEHT** (465 Schalen) | gebaut-ungemessen | **LUECKE** | **LUECKE** |
-| Lane-Pools / Lane-Prefill | **GEHT** | gebaut-ungemessen (einfacher: keine Mamba-Slots) | gebaut-ungemessen | gebaut-ungemessen |
-| Lane-Graphen | **GEHT** | gebaut-ungemessen | gebaut-ungemessen | gebaut-ungemessen |
-| Nebenlaeufigkeit (C2) | **GEHT** (E 1,13/1,44) | gebaut-ungemessen | gebaut-ungemessen | gebaut-ungemessen |
+| Komplement-Loader + data_ptr-Gate | **GEHT** (1058 Ids) | **GEHT** (195 Ids, Llama-3.1-8B, 11.18) | s. 11.20 | **LUECKE** |
+| Huellbaum + Schalen | **GEHT** (465 Schalen) | **GEHT** (130 Schalen + 65 Aliase) | s. 11.20 | **LUECKE** |
+| Lane-Pools / Lane-Prefill | **GEHT** | **GEHT** (12800 Lane-Token @ 1600 MiB) | s. 11.20 | gebaut-ungemessen |
+| Lane-Graphen | **GEHT** | **GEHT** | s. 11.20 | gebaut-ungemessen |
+| Nebenlaeufigkeit (C2) | **GEHT** (E 1,13/1,44) | **GEHT** (E 1,284, Decode-Last) | s. 11.20 | gebaut-ungemessen |
 | Verleih-Stufe 2 | **GEHT** (2,49 ms) | gebaut-ungemessen | gebaut-ungemessen | gebaut-ungemessen |
-| NEXTN-Kopf auf der Lane | s. 11.13 | gebaut-ungemessen | **LUECKE** (Experten im Kopf) | **LUECKE** |
-| Nesting-Check der Experten-Achse | n/a | n/a | gebaut-ungemessen | gebaut-ungemessen |
+| NEXTN-Kopf auf der Lane | s. 11.13 | gebaut-ungemessen (kein lokales dense-MTP-Vehikel) | **LUECKE** (Experten im Kopf) | **LUECKE** |
+| Nesting-Check der Experten-Achse | n/a | n/a | gebaut, jetzt auch fuer die Intermediate-Achse (11.19) | gebaut-ungemessen |
+| Block-quant-Achse im Vor-Boot-Check | n/a (GGUF-Ausnahme) | n/a | s. 11.19 | n/a |
+
+Stand nach dem Familien-Slice (11.18-11.20). Die dense-Spalte war vorher
+durchgaengig "gebaut-ungemessen" — und genau ein Eintrag darin war FALSCH,
+nicht bloss ungemessen (11.18).
 
 #### Die benannte LUECKE: Experten-Schalen im Komplement-Loader
 
@@ -1537,3 +1542,209 @@ Aufnehmen des breakable-Prefill-Graphen der Lane in ein CUDA-OOM — der eigene
 Graph-Memory-Pool der Nebenlaeufigkeit kommt oben drauf. 700 MiB Lane-Budget
 traegt. Das ist derselbe Korridor, den 4.11 fuer den seriellen Fall nennt, nur
 enger.
+
+### 11.18 Familien-Slice Arm A: dense ohne GDN (feat/dual-group-families)
+
+Vehikel Llama-3.1-8B-Instruct (bf16, 14,96 GiB, 32 q / 8 kv Koepfe,
+intermediate 14336, Vokabular 128256), Verband TP=3 auf 5090 + 2x 3080,
+`--rank-tp-ratio 2,1,1 --rank-mlp-ratio 6,1,1 --rank-vocab-ratio 6,1,1`,
+Lane auf der 5090 (Rang 0).
+
+#### Der Analogieschluss war falsch — genau in der Zeile, die "gebaut-ungemessen" hiess
+
+Der Komplement-Loader nestet fuer dense sauber (Vor-Boot-Praedikat,
+`scripts/dual_group/lane_plan_probe.py`), die GDN-Zweige sind echte No-Ops
+(`composed=0`, `composed_vec=0` im Boot-Log). Der Bau ist trotzdem in einem
+CUDA-OOM gestorben, und zwar an einer Stelle, die auf dem GGUF-Vehikel
+strukturell unsichtbar war:
+
+`_build_hull` baute die volle Huelle mit ECHTEM Speicher. Die Begruendung im
+Code war korrekt, aber familienspezifisch: quantisierte grosse Gewichte sind
+lazy initialisierte Parameter, also kostet eine echte Huelle bei GGUF/FP8 nur
+ein paar MiB. Eine UNQUANTISIERTE Familie legt in `unquant.py create_weights`
+das ganze Modell mit `torch.empty` an — 14,96 GiB, auf der Lane-Karte, OBEN
+DRAUF auf den Verbands-Shard und das Komplement, nur damit
+`assemble_lane_shells` sie Sekunden spaeter wieder wegwirft. Auf diesem Rig
+ist das der Unterschied zwischen einer Lane, die bootet, und einem OOM in der
+ersten Attention-Schicht der Huelle.
+
+Fix: `hull_needs_real_storage(model_config)` — echt nur fuer
+Linear-Attention-Familien (dort haelt `RadixLinearAttention` bei der
+Konstruktion Views auf conv/`dt_bias`/`A_log`, die in-place gefuellt werden
+muessen), sonst meta. Der meta-Pfad war fuer den NEXTN-Kopf schon da; neu ist
+`_fill_hull_buffers`, das jeden auf meta verbliebenen BUFFER (Rotary-Caches
+usw. — alle repliziert, keiner traegt einen TP-Shard) auf die Speicher des
+Verbandsbaums zeigen laesst und alles Uebrige laut ablehnt. Ohne diesen
+zweiten Schritt ueberlebt ein meta-Buffer die Assembly still und faellt einen
+Forward spaeter im Kernel um.
+
+#### Kontrakt und Tore (Boot mit `--dual-group-lane`, seriell)
+
+    dual-group lane target model assembled (hull on meta): shells column=64
+    row=64 embed=1 lm_head=1 moe=0 composed=0; params aliased=65
+    composed_vec=0 buffers=0; shared-byte gate PASSED (195 data_ptr identities).
+
+**195 data_ptr-Identitaeten** ist die dense-Zielzahl (GGUF-Hybrid: 1058).
+Lane-Gewichtsposten 4972 MiB, Lane-Pool 12800 Token bei 1600 MiB.
+
+| Tor | Ergebnis |
+|---|---|
+| A-vs-A-Boden (No-Spec, 12 Token, 3 Prompts) | keine Divergenz auf allen drei — der Boden ist sauber |
+| Kohaerenz Lane vs. Verband (greedy, 12 Token) | **byte-identisch** auf allen drei Prompts |
+| Seriell vs. nebenlaeufig (Lane-Output-Ids) | **byte-identisch** |
+
+Die Kohaerenz faellt hier SCHAERFER aus als auf dem GGUF-Vehikel: dort war
+das Urteil "kohaerent und konsistent", hier ist die Lane-Trajektorie exakt
+die des TP=3-Verbands. Damit ist die #196-Klasse (weightless Lane auf dense
+still falsch) fuer diesen Mechanismus gegengeprueft: eine
+Pool-Doppelzaehlung oder ein falsch geschnittener Shard koennte diese
+Byte-Gleichheit nicht produzieren.
+
+#### Nebenlaeufigkeit, ein Messpunkt
+
+`--dual-group-lane-concurrent --dual-group-lane-budget-mib 700`,
+Decode-foermige Lane-Last, 160 Token je Arm:
+
+| Groesse | solo | im geteilten Fenster |
+|---|---|---|
+| Lane, ms/Decode-Schritt | 10,673 | 17,286 |
+| Verband, tok/s | 109,17 | 72,77 (4 Proben) |
+
+`share_serving` 0,667 + `share_lane` 0,617 = **E = 1,284**. Das liegt im
+Band des GGUF-Vehikels (1,13 prefill-foermig / 1,44 decode-foermig); die
+Nebenlaeufigkeitsaussage traegt also familienuebergreifend.
+
+#### GDN-Maschinerie auf dense: zwei Weichen, nicht null
+
+Der Assembly-Pfad ist No-Op (belegt: `composed=0`, `composed_vec=0`). Der
+SPEKULATIVE Pfad war es nicht:
+
+* `_verify_state_buffers` lehnte jede Familie ohne `MambaPool.SpeculativeState`
+  ab — richtig fuer einen hybriden Pool ohne Spekulationsachse, falsch fuer
+  eine Familie ganz OHNE Rekurrenz: dort gibt es nichts zurueckzurollen. Jetzt
+  liefert der Fall `None` statt einer Ablehnung; die laute Ablehnung bleibt
+  fuer den hybriden Fall.
+* Der Commit `update_mamba_state_after_mtp_verify` haengt jetzt an einem
+  `getattr` auf das BACKEND (das die Puffer besitzt), nicht an einem
+  Config-Flag.
+
+Beides ist CPU-getestet (`TestFamilyNoOp`), auf dem Rig aber UNGEMESSEN:
+Llama-3.1-8B hat keinen MTP/NEXTN-Kopf, und ein dense Vehikel mit Kopf liegt
+lokal nicht. Das ist der ehrliche Stand dieser Zeile.
+
+### 11.19 Familien-Slice Arm B: FP8 — die Skalenachse, aus dem Checkpoint
+
+Der zweikartige FP8-Lauf (EVAL_272 Kandidat A) bleibt, was 11.10 sagt: er
+braucht ECHTE Lane-Kollektive und ist ein eigener Bau. Die EINKARTIGE
+FP8-Lane ist auf diesem Rig rechnerisch tot und bleibt es — Qwen3.6-27B-FP8
+traegt 28,75 GiB Gewichte, die Lane-Karte hat 31,34 GiB nutzbar, und die
+echte Huelle kommt bei FP8 zwar lazy, aber Verbands-Pools und Lane-Pools
+kommen nicht. Was in dieser Runde ging, ist die Frage, die 11.10 bewusst
+OFFEN gelassen hat, statt sie zu raten.
+
+#### Der Entscheid: die Achse ist die Blockachse, und sie steht im Checkpoint
+
+`Qwen3.6-27B-FP8/config.json` traegt `quantization_config.weight_block_size
+= [128, 128]` bei `intermediate_size = 17408`. Damit gilt:
+
+* rohe MLP-Einheit = 16 Elemente (der Aktivierungsvektor) -> **1088 Einheiten**,
+* ein block-quantisiertes Gewicht darf nur auf einer 128er-Grenze geteilt
+  werden -> die Schichten rechnen in **136 Einheiten**
+  (`_quant_block_aligned_units`, `lcm(16,128) = 128`).
+
+Die Skalengitter (`ceil(out/block_n)` x `ceil(in/block_k)`) brauchen KEINE
+eigene Probe: sie tragen per Konstruktion dieselbe Einheitenzahl wie das
+Gewicht (`FusedMoE._moe_src_start`: "works for weight AND block-scale grids
+because moe_tp_units divides both"). Eine block-aligned Probe deckt beide ab.
+
+#### Warum das ein Kontrakt ist und keine Kosmetik
+
+Der Vor-Boot-Nesting-Check hat bisher die ROHE Einheitenzahl geprueft — also
+eine Partition, die die Schichten bei block-quantisiertem FP8 nie ausfuehren.
+Ueber ein durchgekaemmtes Ratio-Gitter (Basis- und Familienvektoren 1..12,
+Laenge 3) widersprechen sich die beiden Urteile in **283612** Paaren, in
+BEIDEN Richtungen — darunter die gefaehrliche: `base=[1,1,1] mlp=[1,1,9]`
+nestet roh und nestet block-aligned NICHT. Ungeprueft haette der Boot-Check
+"genestet" gemeldet, waehrend die Schichten anders schneiden — genau die
+still-falsche Byte-Teilung, gegen die das Gate existiert.
+
+Umgesetzt: `block_aligned_units` in `distributed/utils.py` ist ab jetzt die
+EINE Regel; `_quant_block_aligned_units` (Schichtkonstruktion) und
+`transformer_nesting_probes` (Vor-Boot-Check) rufen dieselbe Funktion.
+`derive_lane_plan` liest `weight_block_size` aus der Checkpoint-Config und
+reicht sie durch, zusammen mit `moe_intermediate_size` — die MoE-Familie
+sharded ausserhalb des GGUF-Expertenpfads die Per-Experten-Intermediate-Achse,
+deren Einheitenzahl NICHT `num_experts` ist und die bisher gar keine Probe
+hatte. Die GGUF-Ausnahme (nur Input-Dim quantisiert, Output-Dim nie
+vergroebern) ist mitgezogen.
+
+Gepinnt in `test_dual_group_fp8_loader.py::TestBlockAlignedNestingAxis`
+(5 Tests, u.a. der beidseitige Widerspruchsbeleg) — zusaetzlich zu den 9
+Schreibtisch-Tests von 11.10.
+
+Offen und benannt: der zweikartige Lauf (Lane-Kollektive), und eine
+FP8-Lane-Messung auf dem Rig. Es gibt lokal keinen FP8-Checkpoint, der klein
+genug fuer eine einkartige Lane waere.
+
+### 11.20 Familien-Slice Arm C: die fuenfte Schalenklasse
+
+#### Gebaut: `LaneFusedMoEShell`
+
+Die Luecke, die 11.12 benannt hat, ist geschlossen — und faellt kleiner aus,
+als die Aufwandsschaetzung dort vermutet hat, weil die Experten-Achse gar
+nicht die richtige Abstraktionsebene ist. Der tragende Satz:
+
+> Ein `FusedMoE`-Rang liefert in BEIDEN Shard-Modi einen PARTIALSUMMANDEN
+> derselben vollbreiten Ausgabe.
+
+Bei Experten-Dim-Sharding besitzt jeder Rang einen disjunkten Expertenbereich
+und steuert fuer fremde Experten exakt 0 bei (sie routen auf den
+Null-Padding-Experten); bei Intermediate-Dim-Sharding rechnet jeder Rang eine
+Scheibe des inneren GEMM jedes Experten. Genau deshalb kombiniert EINE
+All-Reduce beide Faelle — und deshalb ist der lokale Ersatz die ADDITION,
+dieselbe Substitution wie bei `LaneRowParallelShell`. Die Schale muss die
+Experten-Achse also nie selbst zusammensetzen; sie muss nur die Reduce
+ersetzen.
+
+Dafuer wurde `FusedMoE.forward_local` abgespalten (`forward_impl` ohne die
+Gruppen-All-Reduce, die dort jetzt aufsitzt). Kein Mutieren von
+`reduce_results` an den Modulen des VERBANDS — das waere unter
+Nebenlaeufigkeit ein Rennen und wuerde die Serving-Gruppe beschaedigen.
+
+Die Routing-Entscheidung faellt EINMAL: `topk_output` kommt aus dem
+replizierten Router der Huelle ueber die globale Expertennummerierung und
+geht unveraendert an jedes Teil, das es genauso lokal uebersetzt wie im
+Verband. Die Taxonomie prueft `FusedMoE` VOR den Linear-Zweigen (eine
+EP-Subklasse ist immer noch ein `FusedMoE`, ihre Expertentensoren duerfen
+nie in eine Linear-Schale fallen). Das data_ptr-Gate greift ohne Zutun: es
+laeuft ueber `named_parameters()` des geteilten Teils, also auch ueber
+`w13_weight`/`w2_weight` und deren Skalen.
+
+CPU-gepinnt in `TestMoEShell` (5 Tests: lokale Reduce, gemeinsames globales
+Routing, Geometrie-Durchreichung, laute Ablehnung eines Teils ohne
+`forward_local`, Existenz des Einsprungpunkts).
+
+#### Nicht erreicht: der Rig-Bringup. Und warum, ohne Beschoenigung
+
+Es gibt auf diesem Rig derzeit KEIN non-GGUF-MoE-Vehikel, das bis zum
+Lane-Bau kommt. Alle drei Kandidaten scheitern VOR ihm, jeder aus einem
+anderen, benannten Grund:
+
+| Vehikel | Groesse | Woran es scheitert |
+|---|---|---|
+| Qwen3.6-35B-A3B-FP8 (gebrieft) | 34,89 GiB | passt nicht auf die 31,34-GiB-Lane-Karte — die Lane braucht die vollen Gewichte einmal, das ist arithmetisch aus |
+| gemma-4-26B-A4B-it-AWQ-4bit | 16,01 GiB | TP=3: 2 kv-Koepfe erzwingen REPLICATED-KV, womit Nesting nach §3.2 UNDEFINIERT ist (nicht verletzt). TP=2: der VERBAND stirbt in der Aktivierungs-Vektorbreite |
+| Qwen3.5-35B-A3B-GPTQ-Int4 | 20 GiB | der VERBAND stirbt in `moe_wna16_marlin_gemm`: `hidden_states` bf16 gegen `w1_scale` fp16 |
+
+Keiner dieser drei Fehler beruehrt die Lane. Das ist die ehrliche Lesart:
+die Schalenklasse ist gebaut und in ihrer Kernbehauptung getestet, aber der
+data_ptr-Beleg an echten Expertentensoren und das Kohaerenz-Tor stehen aus.
+
+**Naechster Schritt, konkret:** Qwen3.6-35B-A3B-AWQ-4bit (23,25 GiB, der
+moe_wna16-Pfad, den #83 fuer uneven TP repariert hat) bei TP=2 auf
+5090 + 3080. Rechnung vorab: 23,25 GiB Gewichte einmal auf der Lane-Karte
+lassen ~8 GiB fuer beide Pool-Saetze — machbar, aber eng, also mit kleinem
+`--context-length` und `--max-running-requests 1` anfangen. Faellt auch der
+aus, ist der naechste ehrliche Schritt ein MoE-Vehikel, das der VERBAND
+zuerst allein tragen muss (§ "Einzelteil vor Verbund"), nicht ein weiterer
+Lane-Versuch.

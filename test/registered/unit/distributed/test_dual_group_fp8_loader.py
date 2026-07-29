@@ -45,6 +45,7 @@ arithmetic is dtype-blind.
 
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -223,3 +224,99 @@ class TestFp8ScaleAxes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBlockAlignedNestingAxis(unittest.TestCase):
+    """#274 families slice B: the lane's PRE-BOOT check must use the axis the
+    FP8 layers really partition, not the raw element-granular one.
+
+    Derived from the checkpoint, not guessed: Qwen3.6-27B-FP8 carries
+    ``weight_block_size = [128, 128]`` and ``intermediate_size = 17408``.
+    The MLP family's raw unit is 16 elements (the activation vector), so the
+    raw unit count is 1088 -- but a block-quantized weight can only be cut on
+    a 128-element boundary, so the layers re-express it as 17408/128 = 136.
+    """
+
+    CHECKPOINT_INTERMEDIATE = 17408
+    CHECKPOINT_BLOCK = [128, 128]
+
+    def test_the_axis_comes_out_of_the_checkpoint_block_size(self):
+        from sglang.srt.distributed.utils import (
+            ACTIVATION_VEC_ELEMS,
+            block_aligned_units,
+        )
+
+        total = self.CHECKPOINT_INTERMEDIATE
+        raw = total // math.gcd(total, ACTIVATION_VEC_ELEMS)
+        self.assertEqual(raw, 1088)
+        self.assertEqual(
+            block_aligned_units(total, raw, self.CHECKPOINT_BLOCK[0]), 136
+        )
+
+    def test_layer_construction_and_the_probe_use_the_same_rule(self):
+        from sglang.srt.distributed.utils import block_aligned_units
+        from sglang.srt.layers.linear import _quant_block_aligned_units
+
+        class _Cfg:
+            weight_block_size = TestBlockAlignedNestingAxis.CHECKPOINT_BLOCK
+
+            def get_name(self):
+                return "fp8"
+
+        total = self.CHECKPOINT_INTERMEDIATE
+        self.assertEqual(
+            _quant_block_aligned_units(total, 1088, _Cfg(), 0),
+            block_aligned_units(total, 1088, self.CHECKPOINT_BLOCK[0]),
+        )
+
+    def test_head_granular_families_are_not_coarsened(self):
+        from sglang.srt.distributed.utils import block_aligned_units
+
+        # 32 kv-head units of 128 elements each: already whole blocks.
+        self.assertEqual(block_aligned_units(4096, 32, 128), 32)
+
+    def test_the_two_verdicts_genuinely_disagree(self):
+        """The reason this is a contract and not a cosmetic refactor."""
+        from sglang.srt.distributed.dual_group import (
+            NestedGroupPlan,
+            NestingProbe,
+            derive_nested_plan,
+            nesting_failures,
+        )
+
+        def nests(base, fam, units):
+            p0 = derive_nested_plan(tuple(base))
+            plan = NestedGroupPlan(
+                big_ratio=p0.big_ratio,
+                segments=p0.segments,
+                family_ratios=(("mlp", tuple(fam)),),
+            )
+            return not nesting_failures(
+                plan, [NestingProbe(what="mlp", units=units, family="mlp")]
+            )
+
+        # raw says nested, block-aligned says NOT -- the dangerous direction:
+        # the boot check would pass while the layers split differently.
+        self.assertTrue(nests([1, 1, 1], [1, 1, 9], 1088))
+        self.assertFalse(nests([1, 1, 1], [1, 1, 9], 136))
+        # and the other way round, so neither is a conservative superset.
+        self.assertFalse(nests([1, 1, 1], [1, 3, 11], 1088))
+        self.assertTrue(nests([1, 1, 1], [1, 3, 11], 136))
+
+    def test_gguf_output_axis_is_exempt(self):
+        from sglang.srt.distributed.dual_group import transformer_nesting_probes
+        from sglang.srt.distributed.dual_group import derive_nested_plan
+
+        plan = derive_nested_plan((2, 1, 1))
+        probes = transformer_nesting_probes(
+            plan,
+            num_attention_heads=32,
+            num_kv_heads=8,
+            intermediate_size=self.CHECKPOINT_INTERMEDIATE,
+            weight_block_size=[256, 256],
+            quant_method="gguf",
+        )
+        mlp = [p.units for p in probes if p.family == "mlp"]
+        # GGUF quantizes along the INPUT dim only, so the output-dim family
+        # keeps its raw units; the input-dim probe is the coarsened one.
+        self.assertIn(1088, mlp)
