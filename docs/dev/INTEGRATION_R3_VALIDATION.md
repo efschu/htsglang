@@ -8916,3 +8916,98 @@ GPU-/Mess-Restliste (Boot-Queue):
 5. Speisung der Planner-Tabelle mit gemessenen Kapazitaets-/Kostenzahlen
    (`capacity_fn`/`relief_gain_fn`/`cost_fn`), damit die Sprossen-Reihenfolge
    nicht nur strukturell, sondern numerisch belegt ist.
+
+## GPU-Testbatterie-Runbook (feat/gpu-battery-runbook, Basis 05b911d365) — 2026-07-29
+
+Gebaut waehrend der GPU-Sperre (Treiber-Update), ohne eine einzige Karte zu
+beruehren. Zweck: die aufgelaufenen GPU-Restlisten der CPU-Slices (#286
+Offload-Register, #279 Pfad-Dispatcher, Erg. 8 gdn_state_sets, Erg. 9/9b
+KV-Druck-Treppe, P2P-Re-Probe, R7c-Boot-Queue) so spezifizieren, dass ein
+GUENSTIGES Modell sie mechanisch abfaehrt — haiku fuer reine Skript-Schritte,
+sonnet fuer Boot-Schritte — und die Bugfixe danach ein Implementierungsagent
+uebernimmt. Der Executor urteilt nie: jede Entscheidung steckt vorab in einem
+Check-Skript.
+
+`scripts/gpu_battery/`:
+
+- **BATTERY.md** — zehn Schritte, ~3 h 28 min Kartenzeit, je mit Executor-
+  Modell, copy-paste-faehigem Kommando, Vorbedingungen, maschinellem
+  Erfolgskriterium, Abbruchkriterium, Artefaktpfaden und Zeitbudget:
+  S0 Preflight → S1 P2P-Re-Probe → S2 Boot A (**REPORT-GATE**) → S3 Boot B →
+  S4 Boot C → S5 Boot D → S6 NCCL-Referenz → S7 Offload-Register-GPU →
+  S8 Dispatcher-Tabellen (CPU) → S9 gdn/KV-Leiter-Smoke.
+- **battery_steps.py** — die EINE autoritative Schritttabelle (Modell, Skript,
+  Check, hartes Timeout, Wiederholbarkeit, Artefakt-Abhaengigkeiten,
+  Lock-Eigentuemer, Report-Gate). BATTERY.md, `run_step.sh`, die Wiederaufnahme
+  und die Trockentests lesen dieselbe Tabelle; ein nur in Prosa beschriebener
+  Schritt existiert nicht.
+- **battery_state.py** — Wiederaufnahme und Auswahl. **Gruene Schritte laufen
+  per Default nicht erneut**; `--only/--from/--to/--skip` waehlen aus,
+  `--force <ids>` erzwingt einen Wiederholungslauf bei berechtigtem Zweifel
+  (explizit, protokolliert als neuer Versuch mit `history`, nicht durch
+  Loeschen von Artefakten). Abhaengigkeiten sind ARTEFAKT-Abhaengigkeiten: S8
+  laesst sich Wochen spaeter allein nachfahren, ohne einen Boot zu wiederholen.
+  Fehlende Voraussetzung = `BLOCKED`, nie stilles Ueberspringen.
+- **run_step.sh** — das eine Kommando je Schritt: Wiederaufnahme-Gate,
+  VRAM-Korridor (>= 400 MiB frei je Karte), Lock-Nahme gemaess Tabelle
+  (`battery` | `tool` — S1 nimmt sie ueber `run_all.sh` selbst, ein haltendes
+  `run_step.sh` wuerde das Werkzeug an der eigenen Lock-Nahme abbrechen lassen
+  | `none`), Lauf unter hartem Timeout, **py-spy-Dump jedes registrierten
+  Prozesses VOR dem Kill**, Freigabe, Check, Verdikt nach `state.json`.
+  Serverlogs landen in Dateien, nie im Agenten-Kontext.
+- **checks/** — je Schritt ein Check-Skript, CPU-only, hermetisch, mit genau
+  EINER Ausgabezeile (`BATTERY-PASS|FAIL|STOP <schritt>[: Grund]`) und
+  Exit-Code 0/1/2. STOP = Umgebung/Vorbedingung (nichts gelernt), FAIL =
+  echtes Testversagen (geht an den Fixer). Geprueft wird INHALT, nicht der
+  Exit-Code — u. a.: Accept-**Positionskurve** vorhanden und 0..K-1 abgedeckt
+  (ein Mittelwert ist strukturell blind fuer eine Positions-Pathologie) plus
+  Referenzspalte je Pflicht 7 gegen `htsglang_tp3.json:87-90`; **effektive**
+  Apertur-Felder befuellt, wo `can_access_peer` wahr ist; NCCL-Referenz gegen
+  `new_nccl_reference_envelope` schema-validiert inkl. p99 >= p50, symmetrischer
+  Last-Achse ueber dieselben Schluessel und beider send_recv-Richtungen;
+  `device_ops == CudaDeviceOps` und Zustandsfolge enthaelt wirklich `parked`;
+  Placeholder-Neutralitaet mit WERFENDEN Sensor-/Latenz-Hooks, damit „nicht
+  konsultiert" bewiesen und nicht vermutet ist. Zusaetzlich laden die Checks
+  die Artefakte mit den ECHTEN #279-Ladern — eine Datei, die nur im Check
+  parst, hat niemandem geholfen.
+- **Messungen, die es noch nicht gab**: `s06_nccl_reference.py` (Rate-Quelle 3
+  des Dispatchers, beidseitig p50+p99, idle- und Last-Arm, gerichtete
+  send_recv), `s07_offload_register_gpu.py` (alle drei Bewegungsrouten
+  tensor/tag/suspend, echte Groessen ueber `resolve_size_bytes`,
+  Rueckhol-Latenzen je Klasse, `latency_term_ms`),
+  `s08_dispatcher_tables.py` (Tabellen laden + Neutralitaets-Nachweis),
+  `s09_sensor_smoke.py` (Leiter-Flags auf echtem Boot, Sensor an echter
+  `sglang:token_usage`-Belegung).
+- **EXECUTOR_PROTOCOL.md** — strikt: sequenziell, nach jedem Schritt Check, bei
+  FAIL/STOP sofort anhalten, nichts debuggen, nichts aendern, max. EIN Retry
+  und nur bei als wiederholbar markierten Schritten (die vier Boots nie —
+  jeder Start verbraucht ein Boot-Fenster), fremde Locks nie brechen, kein
+  breites `pkill`, kein unbegrenztes Warten, Zeitbudget-Ueberschreitung = STOP.
+- **HANDOFF_TEMPLATE.md** — Pflicht-Beweise je FAIL (Artefakt- und Logpfade mit
+  `grep -n`-Zeilen statt Logs, py-spy-Dumps, nvidia-smi-Snapshot, MIN-freie MiB
+  je Karte, Karten-Identitaetstabelle, exaktes Kommando und Zeitstempel, die
+  gebrochene Check-Bedingung), damit der Fixer ohne Neu-Lauf startet — und die
+  Wiederaufnahme-Kommandos, damit der Fix keinen gruenen Boot kostet.
+
+Trockentests `test/registered/unit/distributed/test_gpu_battery_checks.py`:
+121 Tests, alle gruen, CPU-hermetisch (keine Karte, kein Server, kein Lock).
+Jeder Check wird als SUBPROZESS gegen synthetische PASS/FAIL/STOP-Fixtures
+gefahren, weil der Vertrag „genau eine Zeile plus Exit-Code" nur so getestet
+wird und nicht bloss die Logik dahinter. Zwei Eigenschaften ueber ALLE Checks
+parametrisiert: ein leeres Schrittverzeichnis ergibt nie PASS, und ein
+kaputtes Artefakt ergibt ein Verdikt statt eines Tracebacks. Dazu die
+Ergebnis-Toleranzen als eigene Faelle — der falsifizierende Boot-A-Ausgang,
+abweichende `output_ids` in Boot D, inkohaerenter Output in Boot C und ein Rig
+ganz ohne P2P sind ERGEBNISSE und muessen PASS ergeben; zwei davon waren beim
+ersten Durchlauf FAIL und wurden gefixt. `ruff check` + `ruff format` sauber,
+`mypy` auf den drei neuen Modulen ohne Befund; codespell meldet nur korrekte
+deutsche Woerter, wie bei den vorhandenen deutschsprachigen Dokumenten.
+
+Bewusst NICHT in der Batterie, mit Begruendung: Bewertung von Messwerten
+(Deutung ist Leserarbeit und darf nicht in einem Skript stillschweigend
+fallen), das Fuellen von `verdict_diff.md` (die acht „kein P2P"-Altverdikte
+brauchen je ein Urteil und ggf. eine eigene Aufgabe), jedes Tuning im Fenster
+(Ratio, `RESERVE_HOST`, Kontext), Verdrahtungen, die es noch nicht gibt
+(Sensor an Scheduler, Admissions-Hook, echte State-Set-Bewegung), und eine
+Perf-Regression gegen den Rauschboden (braucht verschraenkte Messung und
+fixierten Takt, nicht 20-Sekunden-Messpunkte).
