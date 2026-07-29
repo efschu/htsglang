@@ -2049,3 +2049,16 @@ zwei, kein Host-Staging, schont Host-RAM-Bandbreite fuer Experten/Spill)
 -> Host-RAM -> Remote-RAM (RDMA #224). Das Bewegungs-Backend-Interface
 traegt das Park-Ziel als Parameter; P2P ist ein zusaetzliches Ziel,
 kein Umbau des Registerkerns.
+P2P-PRAEZISIERUNG (Nutzer 2026-07-29): Das kommende P2P ist ein
+BESONDERES — nicht ueber grosses volles Resizable-BAR, sondern bei den
+3080ern gleichzeitig ueber das kleine 256-MiB-BAR-Fenster (5090: volles
+32-GiB-BAR). Konsequenzen: (1) Peer-VRAM-Faehigkeit ist je GERICHTETEM
+Paar asymmetrisch (zur 3080 durchs Fenster, zur 5090 voll); (2) die
+Ziel-Beschreibung traegt aperture_bytes/Bandbreite/Fensterkosten als
+PROBE-BEFUELLTE Parameter, keine Konstanten im Code; (3) Umgang mit
+gefensterten Zielen (Apertur-Chunking vs Ablehnung>Apertur) wird als
+waehlbare Politik angelegt, Default konservativ, ENTSCHIEDEN wird nach
+der Messung; (4) wo/wann Allreduce und Broadcast unter diesem P2P laufen,
+ist offen — das Treiber-Update und der Re-Probe-Lauf verraten, was geht;
+NICHTS wird vorab festgezurrt, das Probe-Paket formuliert offene Fragen
+als Messpunkte, nicht als Erwartungen.
