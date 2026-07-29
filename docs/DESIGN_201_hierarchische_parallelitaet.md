@@ -1767,3 +1767,20 @@ Schnitt: R7a = volle Capture-Kette + K-Leiter + adaptives K (NEXTN);
 R7b = DFLASH-Lane-Kopf + Algo-Adaption; R7c = Multi-Drafter auf N Karten
 (mit Entscheider). Reihenfolge R7a vor D4 (Nutzer-Zug), R7b/c danach bzw.
 nach Machbarkeitsrechnung.
+
+Nachtrag-13-Ergaenzung (Nutzer 2026-07-29, Cross-Algo-Regression neu pruefen):
+Der ALTE Gleichzeitig-Pfad (--speculative-cross-algorithm*: beide Drafter
+resident im SELBEN Runner, pro Batch per Bandit umgeschaltet) trug eine
+dokumentierte Regression: Umschaltkosten (gewinnt nur bei Regime-Wechseln),
+DFLASH 18,9-20,9 % hinter NEXTN im Multiturn-Regime, Selbstkonditionierungs-
+Falle. HYPOTHESE (Nutzer): der neue Lane-Pfad entfernt die Mechanismen —
+eigene Lanes mit vorab captured Eintraegen (Plan-Flip statt Formwechsel/
+Lazy-Capture), lane-keyed Zustand (D2/D3-Familie), Platzierung auf
+unterschiedlichen Karten (Spreizungs-Entscheider), echte Parallelitaet statt
+Zeit-Multiplex. Das ist per Register-Regel ein legitimer Neu-Test-Grund
+(entfernter Mechanismus, nicht neues Gefuehl). PFLICHT-A/B in R7b/c: alter
+Cross-Algo-Leiter-Pfad vs Lane-Koexistenz auf DEMSELBEN Multiturn-Inhalt,
+der die 18,9-20,9 % zeigte — bleibt die Regression, liegt sie am Algorithmus
+(DFLASH-Multiturn-Schwaeche); verschwindet sie, lag sie an der Architektur.
+Die Unterscheidung entscheidet, ob R7c DFLASH ueberhaupt als Dauer-Lane
+traegt oder nur als Regime-Werkzeug.
