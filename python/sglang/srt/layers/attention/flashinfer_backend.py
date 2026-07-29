@@ -1355,6 +1355,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
             )
 
+        # #274 round 7a: the verify wrapper key, computed on BOTH paths (it
+        # used to be needed only at capture). See _verify_cg_key.
+        verify_key = self._verify_cg_key(bs, forward_mode, spec_info)
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
@@ -1386,7 +1389,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[verify_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -1398,7 +1401,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[verify_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
@@ -1958,6 +1961,30 @@ class FlashInferAttnBackend(AttentionBackend):
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
 
+    def _verify_cg_key(self, bs: int, forward_mode, spec_info):
+        """Key for ``prefill_cuda_graph_metadata`` (#274 round 7a).
+
+        It used to be ``bs`` alone, and that is right exactly while a runner
+        captures ONE verify shape per bs. A chain-length LADDER captures
+        several at the same bs -- 2, 3 and 4 candidate rows on the dual-group
+        lane -- and every rung then overwrote the previous rung's wrappers. The
+        surviving set was whichever rung was captured last, so every rung
+        re-planned through it; flashinfer latches ``_max_total_num_rows`` on a
+        wrapper's first plan, so a 3-row rung died with "the total number of
+        rows in qo_indptr 3 ... cannot exceed ... 2" (measured, #274 round 7a
+        boot 4).
+
+        The row count comes from ``spec_info.draft_token_num`` -- the same
+        source the eager path uses for its query-start-loc stride, and present
+        on both the capture stand-in and the live verify. Anything without one
+        (DLLM extend, and any caller whose view carries no spec_info) keeps the
+        plain ``bs`` key, so nothing outside a verify ladder changes.
+        """
+        rows = None
+        if forward_mode.is_target_verify():
+            rows = getattr(spec_info, "draft_token_num", None)
+        return (bs, int(rows)) if rows else bs
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
@@ -1997,7 +2024,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not self.uneven_dcp
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            # #274 round 7a: keyed by (bs, num_tokens), not by bs alone.
+            # A chain-length LADDER captures several verify shapes at the SAME
+            # bs -- 2, 3 and 4 candidate rows here -- and a bs-only key made
+            # every rung overwrite the previous one's wrappers. The surviving
+            # set was the last rung captured, so every rung's replay re-planned
+            # through it: flashinfer latches ``_max_total_num_rows`` on its
+            # first plan, so a 3-row rung then died with "the total number of
+            # rows in qo_indptr 3 ... cannot exceed ... 2" (measured, boot 4).
+            # For every runner without a ladder num_tokens is a function of bs,
+            # so the key merely gains a redundant component.
+            self.prefill_cuda_graph_metadata[
+                self._verify_cg_key(bs, forward_mode, spec_info)
+            ] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )

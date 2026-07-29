@@ -3925,6 +3925,61 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
+    dual_group_lane_spec_head_graph: A[
+        bool,
+        Arg(
+            help="Capture the lane's NEXTN HEAD forward as a cuda graph "
+            "(#274 round 7a). The head is the other half of a speculative "
+            "lane round: K eager head forwards next to one captured verify. "
+            "Capturing it needs a real EagleDraftInput at capture time -- the "
+            "generic decode capture builds spec_info=None and an MTP forward "
+            "dereferences it -- which is what this flag enables on the head's "
+            "own runner. The head's shape does not depend on K, so ONE head "
+            "graph serves every rung of the chain-length ladder. Use "
+            "--no-dual-group-lane-spec-head-graph for the eager fallback and "
+            "the per-job byte gate (head_graph: false).",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
+    dual_group_lane_spec_rungs: A[
+        Optional[str],
+        Arg(
+            help="Chain-length LADDER of the lane's speculation as a "
+            "comma-separated list of K values (#274 round 7a), e.g. "
+            "'0,1,2,3'. Every rung is captured UP FRONT (one verify graph "
+            "each; the head graph is shared), so switching rungs at a round "
+            "boundary is a graph-key flip and never a re-capture. K=0 is the "
+            "lane's existing no-spec decode entry and costs no extra graph. "
+            "Unset (the default) keeps exactly one rung -- the value of "
+            "--dual-group-lane-spec-steps -- which is the pre-ladder "
+            "behaviour, VRAM included. Each additional rung costs one more "
+            "graph pool on the lane's card, so pick the rungs the workload "
+            "actually uses rather than the full range.",
+        ),
+    ] = None
+    dual_group_lane_spec_adaptive: A[
+        bool,
+        Arg(
+            help="Pick the lane's chain length K per round from the measured "
+            "accept rate instead of pinning it (#274 round 7a). Requires "
+            "--dual-group-lane-spec-rungs with at least two rungs. The policy "
+            "compares each rung's own measured ms/round against the accept "
+            "length it predicts for that rung and takes the best predicted "
+            "ms/token; the break-evens are the ones this boot measured, not "
+            "constants. Switching is damped by "
+            "--dual-group-lane-spec-adaptive-hysteresis.",
+        ),
+    ] = False
+    dual_group_lane_spec_adaptive_hysteresis: A[
+        int,
+        Arg(
+            help="How many consecutive rounds the adaptive K policy must "
+            "prefer a different rung before it switches. Accept length is "
+            "content-driven and noisy around the break-even, so a policy "
+            "without damping flaps between rungs and pays the transition "
+            "instead of the gain.",
+        ),
+    ] = 4
     dual_group_lane_speed_dial: A[
         Optional[float],
         Arg(
@@ -6793,6 +6848,34 @@ class ServerArgs:
                 if self.dual_group_lane_spec_steps < 1:
                     raise ValueError(
                         "--dual-group-lane-spec-steps must be >= 1."
+                    )
+                # Round 7a: the ladder is parsed once, here, so a malformed
+                # rung list fails at argument time rather than at capture time
+                # (a capture failure costs a model load to find out about).
+                from sglang.srt.model_executor.lane_spec_policy import (
+                    parse_lane_spec_rungs,
+                )
+
+                rungs = parse_lane_spec_rungs(self.dual_group_lane_spec_rungs)
+                if rungs is not None and self.dual_group_lane_spec_adaptive:
+                    if len(rungs) < 2:
+                        raise ValueError(
+                            "--dual-group-lane-spec-adaptive needs at least "
+                            "two rungs in --dual-group-lane-spec-rungs; with "
+                            "one rung there is nothing to adapt between."
+                        )
+                if rungs is None and self.dual_group_lane_spec_adaptive:
+                    raise ValueError(
+                        "--dual-group-lane-spec-adaptive requires "
+                        "--dual-group-lane-spec-rungs (the rungs it may "
+                        "choose between must be captured up front; the "
+                        "policy never triggers a re-capture)."
+                    )
+                if self.dual_group_lane_spec_adaptive_hysteresis < 1:
+                    raise ValueError(
+                        "--dual-group-lane-spec-adaptive-hysteresis must be "
+                        ">= 1 (1 means switch as soon as another rung looks "
+                        "better)."
                     )
         elif self.dual_group_lane_spec:
             raise ValueError(

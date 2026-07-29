@@ -1102,7 +1102,7 @@ class TestLaneSpecDispatch(unittest.TestCase):
                 "_job_spec_on", src, f"{fn.__name__} does not consult _job_spec_on"
             )
             self.assertIn(
-                "_spec_step", src, f"{fn.__name__} never runs a speculative round"
+                "_spec_round", src, f"{fn.__name__} never runs a speculative round"
             )
             self.assertIn(
                 "_decode_step", src, f"{fn.__name__} lost the plain decode arm"
@@ -1506,7 +1506,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
     between the two.
     """
 
-    def _runner(self, *, verify_tokens=4, captured=True, max_bs=1, ntpb=1):
+    def _runner(self, *, verify_tokens=(4,), captured=None, max_bs=1, ntpb=1):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
@@ -1520,9 +1520,13 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         r.capture_hidden_mode = CaptureHiddenMode.NULL
         r.num_tokens_per_bs = ntpb
         r.max_bs = max_bs
-        r._lane_verify_tokens = verify_tokens
-        r._lane_verify_active = False
-        r._lane_verify_captured = captured
+        r._lane_verify_tokens = tuple(verify_tokens)
+        r._lane_verify_active = None
+        r._lane_verify_captured = (
+            frozenset(verify_tokens) if captured is None else frozenset(captured)
+        )
+        r._lane_draft_capture = False
+        r._lane_draft_captured = False
         r._wl_block_graph = False
         r._sess_block_graph = False
         return r
@@ -1583,7 +1587,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
             self.assertEqual(r.capture_forward_mode, ForwardMode.TARGET_VERIFY)
             self.assertEqual(r.num_tokens_per_bs, 4)
             self.assertEqual(r.capture_hidden_mode, CaptureHiddenMode.FULL)
-        self.assertFalse(r._lane_verify_active)
+        self.assertIsNone(r._lane_verify_active)
         self.assertEqual(r.capture_forward_mode, ForwardMode.DECODE)
         self.assertEqual(r.num_tokens_per_bs, 1)
         self.assertEqual(r.capture_hidden_mode, CaptureHiddenMode.NULL)
@@ -1602,7 +1606,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with r.lane_verify_shape():
                 raise RuntimeError("verify blew up")
-        self.assertFalse(r._lane_verify_active)
+        self.assertIsNone(r._lane_verify_active)
         self.assertEqual(r.capture_forward_mode, ForwardMode.DECODE)
         self.assertEqual(r.num_tokens_per_bs, 1)
 
@@ -1618,7 +1622,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         r = self._runner()
         self.assertIsNone(r._wl_variant_label(None))
         with r.lane_verify_shape():
-            self.assertEqual(r._wl_variant_label(None), r.LANE_VERIFY_VARIANT)
+            self.assertEqual(r._wl_variant_label(None), r.LANE_VERIFY_VARIANT + "4")
         self.assertIsNone(r._wl_variant_label(None))
 
     def test_admission_is_shape_exact_and_never_pads(self):
@@ -1633,7 +1637,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
             self.assertFalse(r.can_run_graph(self._batch(verify=False)))
 
     def test_nothing_captured_means_eager_not_a_key_error(self):
-        r = self._runner(captured=False)
+        r = self._runner(captured=())
         with r.lane_verify_shape():
             self.assertFalse(r.can_run_graph(self._batch()))
 
@@ -1650,7 +1654,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
 
         lane = DualGroupLane.__new__(DualGroupLane)
         lane.runner = type(
-            "R", (), {"decode_cuda_graph_runner": self._runner(verify_tokens=4)}
+            "R", (), {"decode_cuda_graph_runner": self._runner(verify_tokens=(4,))}
         )()
         with lane._verify_graph_scope(5) as captured:
             self.assertFalse(captured)
@@ -1706,7 +1710,7 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         # and the token count reaches the GGUF dispatch, so a replay cannot
         # pick a different kernel than the capture recorded (round 5's defect
         # lived in exactly that <= 8-row window).
-        self.assertIn("_register_gguf_decode_buckets([self._lane_verify_tokens]", src)
+        self.assertIn("_register_gguf_decode_buckets(self._lane_verify_tokens", src)
 
     def test_the_shared_logits_buffer_grows_for_the_lane_only(self):
         from types import SimpleNamespace
@@ -1721,12 +1725,660 @@ class TestLaneVerifyGraphEntry(unittest.TestCase):
         with mock.patch.object(
             mr_mod, "get_batch_sizes_to_capture", return_value=([1], [])
         ):
-            mr.dual_group_lane_verify_tokens = 4
+            mr.dual_group_lane_verify_tokens = (4,)
             self.assertEqual(ModelRunner.max_decode_logits_rows(mr), 4)
             # Nothing else grows: without the lane field this is the row count
             # it always was, so the serving group's shared buffer is untouched.
             mr.dual_group_lane_verify_tokens = None
             self.assertEqual(ModelRunner.max_decode_logits_rows(mr), 1)
+
+
+class TestLaneHeadGraphEntry(unittest.TestCase):
+    """#274 round 7a: the lane's NEXTN HEAD as a captured entry.
+
+    Round 6 left this as a NAMED GAP with a reason: the generic decode capture
+    builds ``spec_info=None`` and an MTP forward dereferences it. These tests
+    pin the branch that closes it, and pin that it stays confined to the head's
+    own runner -- the lane target's plain decode entry is byte-green over six
+    rounds and this round is not allowed to reach it.
+    """
+
+    def _head_runner(self, *, captured=True, max_bs=1, hidden=8):
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.capture_forward_mode = ForwardMode.DECODE
+        r.capture_hidden_mode = CaptureHiddenMode.NULL
+        r.num_tokens_per_bs = 1
+        r.max_bs = max_bs
+        r.max_num_token = max_bs
+        r._lane_verify_tokens = None
+        r._lane_verify_active = None
+        r._lane_verify_captured = frozenset()
+        r._lane_draft_capture = True
+        r._lane_draft_captured = captured
+        r._lane_draft_hidden = torch.zeros((max_bs, hidden))
+        r._wl_block_graph = False
+        r._sess_block_graph = False
+        return r
+
+    def _draft_batch(self, *, bs=1, hidden_rows=1, hidden=8, decode=True):
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        fb = type("FB", (), {})()
+        fb.batch_size = bs
+        fb.forward_mode = ForwardMode.DECODE if decode else ForwardMode.TARGET_VERIFY
+        fb.input_ids = torch.zeros(bs, dtype=torch.int64)
+        fb.replace_embeds = None
+        fb.spec_info = type("SI", (), {})()
+        fb.spec_info.hidden_states = (
+            None
+            if hidden_rows is None
+            else torch.arange(hidden_rows * hidden, dtype=torch.float).view(
+                hidden_rows, hidden
+            )
+        )
+        return fb
+
+    def test_the_capture_stand_in_is_a_real_draft_input(self):
+        """The whole of the round-6 gap, in one predicate.
+
+        Without this branch ``get_spec_info`` falls through to None and the MTP
+        forward dies on ``spec_info.hidden_states``. With it the capture sees a
+        real ``EagleDraftInput`` whose hidden states are the STATIC buffer the
+        replay copies into -- a graph input, not a per-round object.
+        """
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        r = self._head_runner()
+        spec = r.get_spec_info(1)
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.capture_hidden_mode, CaptureHiddenMode.LAST)
+        self.assertEqual(spec.hidden_states.data_ptr(), r._lane_draft_hidden.data_ptr())
+
+    def test_the_hidden_states_are_copied_not_aliased(self):
+        """The replay writes THROUGH to the captured address.
+
+        Aliasing (rebinding ``spec_info.hidden_states`` to the live tensor)
+        would leave the captured graph reading its own stale buffer -- the
+        classic shared-buffer failure of this feature (#274 D2/D3), which does
+        not announce itself.
+        """
+        r = self._head_runner()
+        fb = self._draft_batch()
+        before = r._lane_draft_hidden.data_ptr()
+        r._lane_draft_load_hidden(fb)
+        self.assertEqual(r._lane_draft_hidden.data_ptr(), before)
+        self.assertTrue(
+            bool((r._lane_draft_hidden[0] == fb.spec_info.hidden_states[0]).all())
+        )
+
+    def test_admission_needs_a_captured_graph_and_hidden_states(self):
+        r = self._head_runner()
+        self.assertTrue(r.can_run_graph(self._draft_batch()))
+        # No hidden states -> nothing to copy -> eager, not a stale replay.
+        self.assertFalse(r.can_run_graph(self._draft_batch(hidden_rows=None)))
+        # Not a decode -> not this entry.
+        self.assertFalse(r.can_run_graph(self._draft_batch(decode=False)))
+        # Nothing captured yet (the eager warmup, or --no-...-head-graph).
+        self.assertFalse(
+            self._head_runner(captured=False).can_run_graph(self._draft_batch())
+        )
+
+    def test_the_head_entry_carries_its_own_variant(self):
+        r = self._head_runner()
+        self.assertEqual(r._wl_variant_label(None), r.LANE_DRAFT_VARIANT)
+
+    def test_capture_and_replay_derive_the_same_variant(self):
+        """The two sides of the graph key, and boot 2 of round 7a is why.
+
+        Replay derives its label from ``_wl_variant_label``; the plain capture
+        loop passes the LoRA variant straight through, which is None without
+        LoRA. Under the head that recorded ``variant_label=None`` and looked up
+        ``variant_label='lanedraft'`` -- a KeyError on the first head forward,
+        AFTER a boot that logged a successful capture. A label mismatch is
+        invisible at capture time by construction, so the invariant is pinned
+        here instead.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        src = inspect.getsource(DecodeCudaGraphRunner._capture_one_stream)
+        self.assertIn("capture_label = (", src)
+        self.assertIn("self.LANE_DRAFT_VARIANT", src)
+        r = self._head_runner()
+        capture_label = r.LANE_DRAFT_VARIANT if r._lane_draft_capture else None
+        self.assertEqual(capture_label, r._wl_variant_label(None))
+
+    def test_the_per_job_eager_falsifier_restores(self):
+        """``head_graph: false`` is a per-JOB gate and restores unconditionally.
+
+        Per job, not per process, for the same reason as round 6's
+        ``verify_graph``: the replay arm and the eager arm of the byte gate have
+        to come from ONE boot.
+        """
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        runner = self._head_runner()
+        lane.draft_runner = type("R", (), {"decode_cuda_graph_runner": runner})()
+        with lane._head_graph_scope({"head_graph": False}):
+            self.assertFalse(runner._lane_draft_captured)
+        self.assertTrue(runner._lane_draft_captured)
+        with self.assertRaises(RuntimeError):
+            with lane._head_graph_scope({"head_graph": False}):
+                raise RuntimeError("head blew up")
+        self.assertTrue(runner._lane_draft_captured)
+        # Absent key: nothing is touched at all.
+        with lane._head_graph_scope({}):
+            self.assertTrue(runner._lane_draft_captured)
+
+    def test_only_the_decode_phase_is_given_back_to_the_head(self):
+        """PREFILL stays disabled, and that is a decision, not an omission.
+
+        The head's extend shapes follow the target's prompt (no fixed ladder)
+        and its prefill is one forward per JOB against K per ROUND -- the time
+        is not there, and a capture would be another VRAM post for it.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+        from sglang.srt.model_executor.dual_group_lane import (
+            _disable_graph_phases,
+            _enable_decode_graph_phase,
+        )
+
+        args = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=Backend.FULL),
+                prefill=SimpleNamespace(backend=Backend.FULL),
+            )
+        )
+        _disable_graph_phases(args)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        _enable_decode_graph_phase(args)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        # The legacy booleans move WITH the phase config: contract 4 is what
+        # happens when the two readers disagree.
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertFalse(args.disable_decode_cuda_graph)
+        self.assertTrue(args.disable_prefill_cuda_graph)
+        del Phase
+
+    def test_the_capture_flag_is_set_after_the_pool_not_before(self):
+        """ORDERING, and it cost boot 1 of round 7a to learn.
+
+        ``alloc_memory_pool`` re-inits the whole block of graph-runner fields
+        that ``dual_group_lane_draft_capture`` lives in (the same block that
+        holds ``dual_group_lane_verify_tokens``), and it runs inside the head's
+        scoped bring-up. A flag written before that call is silently gone by
+        the time the capture reads it -- and the failure is not a missing flag
+        but round 6's named gap verbatim, ``'NoneType' object has no attribute
+        'hidden_states'``, i.e. it looks like the fix was never made.
+        """
+        import inspect
+
+        from sglang.srt.model_executor import dual_group_lane as dgl
+
+        src = inspect.getsource(dgl._finish_lane_draft_runner_scoped)
+        pool = src.index("alloc_memory_pool")
+        flag = src.index("dual_group_lane_draft_capture")
+        graphs = src.index("init_cuda_graphs")
+        self.assertLess(pool, flag, "capture flag set before the pool re-init")
+        self.assertLess(flag, graphs, "capture flag set after the capture")
+        # And the outer function must NOT set it (that is the trap).
+        outer = inspect.getsource(dgl._finish_lane_draft_runner)
+        self.assertNotIn(
+            "draft_runner.dual_group_lane_draft_capture = True",
+            outer,
+            "the flag is set where alloc_memory_pool will undo it",
+        )
+
+
+class TestLaneSpecRungLadder(unittest.TestCase):
+    """#274 round 7a: K as a ladder of PRE-CAPTURED entries.
+
+    The contract under test is that a rung change is a graph-key flip and
+    never a re-capture: capture happens once, at boot, for every configured
+    rung, and the runtime only ever selects among them.
+    """
+
+    def _runner(self, rungs=(2, 3, 4), captured=None):
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.capture_forward_mode = ForwardMode.DECODE
+        r.capture_hidden_mode = CaptureHiddenMode.NULL
+        r.num_tokens_per_bs = 1
+        r.max_bs = 1
+        r._lane_verify_tokens = tuple(rungs)
+        r._lane_verify_active = None
+        r._lane_verify_captured = frozenset(rungs if captured is None else captured)
+        r._lane_draft_capture = False
+        r._lane_draft_captured = False
+        r._wl_block_graph = False
+        r._sess_block_graph = False
+        return r
+
+    def _batch(self, tokens):
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        fb = type("FB", (), {})()
+        fb.batch_size = 1
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        fb.input_ids = torch.zeros(tokens, dtype=torch.int64)
+        fb.replace_embeds = None
+        return fb
+
+    def test_every_rung_gets_its_own_graph_key(self):
+        """One label for the whole ladder would let the last capture win.
+
+        Every rung is bs 1 and every rung is TARGET_VERIFY, so ``ShapeKey.size``
+        is 1 for all of them; the variant is the entire discriminator, exactly
+        as it was between the verify and the plain decode entry in round 6.
+        """
+        r = self._runner()
+        labels = set()
+        for rung in r._lane_verify_tokens:
+            with r.lane_verify_shape(rung):
+                labels.add(r._wl_variant_label(None))
+        self.assertEqual(len(labels), len(r._lane_verify_tokens))
+
+    def test_a_rung_flip_never_recaptures(self):
+        """Selecting a rung touches state, not the backend.
+
+        The property is structural: ``lane_verify_shape`` swaps four scalars
+        and nothing else, and the capture entry point is only reachable from
+        ``_capture_one_stream``. If a flip could re-record, the lane's rounds
+        would pay a capture at every policy switch.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        src = inspect.getsource(DecodeCudaGraphRunner.lane_verify_shape)
+        for forbidden in ("capture_one_shape", "self.capture(", "cleanup"):
+            self.assertNotIn(forbidden, src)
+        # And every rung is recorded up front, in ONE pass over the ladder.
+        cap = inspect.getsource(DecodeCudaGraphRunner._capture_one_stream)
+        self.assertIn("for rung in sorted(self._lane_verify_tokens", cap)
+
+    def test_admission_is_per_rung_and_against_what_was_captured(self):
+        r = self._runner(rungs=(2, 4), captured=(4,))
+        with r.lane_verify_shape(4):
+            self.assertTrue(r.can_run_graph(self._batch(4)))
+            self.assertFalse(r.can_run_graph(self._batch(2)))
+        with r.lane_verify_shape(2):
+            # Configured but NOT recorded (a thinned ladder, or a capture that
+            # raised): eager, never the neighbour's graph.
+            self.assertFalse(r.can_run_graph(self._batch(2)))
+
+    def test_the_shape_scope_refuses_a_rung_off_the_ladder(self):
+        r = self._runner(rungs=(2, 4))
+        with self.assertRaises(AssertionError):
+            with r.lane_verify_shape(3):
+                pass
+
+    def test_the_lane_scope_picks_the_rung_it_is_asked_for(self):
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        runner = self._runner(rungs=(2, 4))
+        lane.runner = type("R", (), {"decode_cuda_graph_runner": runner})()
+        for d in (2, 4):
+            with lane._verify_graph_scope(d) as captured:
+                self.assertTrue(captured)
+                self.assertEqual(runner._lane_verify_active, d)
+        with lane._verify_graph_scope(3) as captured:
+            self.assertFalse(captured)
+
+    def test_k_zero_is_the_plain_decode_entry_not_a_one_row_verify(self):
+        """K=0 costs no graph, because it already has one.
+
+        The ladder's cheapest rung is the lane's existing no-spec decode entry.
+        Recording a one-row TARGET_VERIFY for it would be a second graph AND a
+        different kernel for the same work.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
+
+        args = SimpleNamespace(
+            dual_group_lane_spec_rungs="0,1,3", dual_group_lane_spec_steps=3
+        )
+        self.assertEqual(resolve_lane_spec_rungs(args), (0, 1, 3))
+        verify_rungs = tuple(k + 1 for k in resolve_lane_spec_rungs(args) if k >= 1)
+        self.assertEqual(verify_rungs, (2, 4))
+
+    def test_the_gdn_verify_stride_follows_the_batch_not_the_boot(self):
+        """Ladder defect 1, and it was SILENT: no assert, just wrong tokens.
+
+        ``MambaAttnBackendBase.init_cuda_graph_state`` derives ONE verify
+        stride from ``max_num_tokens // max_bs``. That is the widest rung once
+        a ladder exists, so the narrow rungs' captured GDN verify advanced the
+        recurrent state over 4 rows where the batch had 2. Measured: with the
+        ladder on, K=1 diverged from its own eager arm at index 1 while K=3 --
+        whose stride happened to match -- stayed byte-green.
+
+        The eager path has always read ``spec_info.draft_token_num``; the graph
+        path now asks the same question.
+        """
+        import torch
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            MambaAttnBackendBase,
+        )
+
+        b = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
+        b.device = torch.device("cpu")
+        b._cuda_graph_max_bs = 1
+        b.cached_cuda_graph_verify_query_start_loc = torch.tensor(
+            [0, 4], dtype=torch.int32
+        )
+        b._verify_query_start_loc_by_rows = {
+            4: b.cached_cuda_graph_verify_query_start_loc
+        }
+        self.assertEqual(list(b._verify_query_start_loc(4)), [0, 4])
+        self.assertEqual(list(b._verify_query_start_loc(2)), [0, 2])
+        self.assertEqual(list(b._verify_query_start_loc(3)), [0, 3])
+        # Unknown / absent row count keeps the boot-time buffer, so a caller
+        # that never had a draft_token_num behaves exactly as before.
+        self.assertEqual(list(b._verify_query_start_loc(None)), [0, 4])
+        # And the cache is a cache: the same rung is not rebuilt.
+        self.assertIs(b._verify_query_start_loc(2), b._verify_query_start_loc(2))
+
+    def test_the_verify_wrapper_key_separates_the_rungs(self):
+        """Ladder defect 2, and it was LOUD but late.
+
+        ``prefill_cuda_graph_metadata`` was keyed by bs alone, so every rung of
+        the ladder (all bs=1) overwrote the previous rung's flashinfer
+        wrappers. flashinfer latches ``_max_total_num_rows`` on a wrapper's
+        first plan, so the surviving rung's capacity became everyone's:
+        "the total number of rows in qo_indptr 3 ... cannot exceed ... 2".
+        """
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        key = FlashInferAttnBackend._verify_cg_key
+        b = object()
+        si4 = type("SI", (), {"draft_token_num": 4})()
+        si2 = type("SI", (), {"draft_token_num": 2})()
+        tv = ForwardMode.TARGET_VERIFY
+        self.assertNotEqual(key(b, 1, tv, si4), key(b, 1, tv, si2))
+        self.assertEqual(key(b, 1, tv, si4), (1, 4))
+        # Everything that is not a verify keeps the plain bs key, so no other
+        # deployment's dict changes shape.
+        self.assertEqual(key(b, 1, ForwardMode.DECODE, si4), 1)
+        self.assertEqual(key(b, 3, tv, None), 3)
+
+    def test_an_unset_ladder_is_the_pre_ladder_shape(self):
+        """Opt-in, because every rung is another graph pool on the lane's card."""
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.dual_group_lane import resolve_lane_spec_rungs
+
+        args = SimpleNamespace(
+            dual_group_lane_spec_rungs=None, dual_group_lane_spec_steps=3
+        )
+        self.assertEqual(resolve_lane_spec_rungs(args), (3,))
+
+
+class TestLaneSpecPolicy(unittest.TestCase):
+    """#274 round 7a: the adaptive-K policy, on the CPU.
+
+    Everything it decides is arithmetic over numbers the lane hands it, so the
+    hysteresis, the break-evens and the extrapolation can be argued about here
+    rather than at the cost of a boot.
+    """
+
+    def _policy(self, **kw):
+        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+
+        kw.setdefault("rungs", (0, 1, 2, 3))
+        kw.setdefault("adaptive", True)
+        return LaneSpecPolicy(**kw)
+
+    def test_the_rung_list_parses_and_rejects_junk(self):
+        from sglang.srt.model_executor.lane_spec_policy import parse_lane_spec_rungs
+
+        self.assertEqual(parse_lane_spec_rungs("0,1,2,3"), (0, 1, 2, 3))
+        self.assertEqual(parse_lane_spec_rungs(" 3 , 1 ,3"), (1, 3))
+        self.assertIsNone(parse_lane_spec_rungs(None))
+        self.assertIsNone(parse_lane_spec_rungs(""))
+        with self.assertRaises(ValueError):
+            parse_lane_spec_rungs("1,x")
+        with self.assertRaises(ValueError):
+            parse_lane_spec_rungs("1,-2")
+
+    def test_a_static_policy_answers_one_number(self):
+        p = self._policy(adaptive=False, default_rung=3)
+        for _ in range(10):
+            self.assertEqual(p.choose(), 3)
+            p.observe(3, 36.0, 2)
+
+    def test_a_pin_beats_everything_and_does_not_become_the_resting_state(self):
+        p = self._policy()
+        self.assertEqual(p.choose({"rung": 1}), 1)
+        self.assertEqual(p.current, 1)
+        # Off-ladder pins are honoured (the lane falls back to the eager
+        # verify) but must not park the policy on a rung it cannot replay.
+        self.assertEqual(p.choose({"rung": 7}), 7)
+        self.assertEqual(p.current, 1)
+
+    def test_the_probe_phase_visits_every_rung_before_comparing(self):
+        """Break-evens come from THIS boot, so every rung has to be measured.
+
+        A policy that compared a measured rung against an unmeasured one would
+        be comparing a measurement with a constant, which is the thing round 7a
+        exists to stop doing.
+        """
+        p = self._policy(probe_rounds=2)
+        seen = []
+        for _ in range(8):
+            k = p.choose()
+            seen.append(k)
+            p.observe(k, 16.0 + 6.0 * k, 1 + k // 2)
+        self.assertEqual(set(seen[:8]) & {0, 1, 2, 3}, {0, 1, 2, 3})
+        self.assertEqual(p.stats()["reason"] in ("probe", "hold", "switch"), True)
+
+    def test_accept_is_read_per_position_so_saturation_is_visible(self):
+        """PER-POSITION, because saturation is the thing that has to be seen.
+
+        A head whose first proposal is usually right and whose third never is
+        has the SAME mean accept length as one that degrades evenly, and only
+        the per-position view tells them apart -- which is exactly the case the
+        marginal criterion exists to catch (prose saturates after a position or
+        two, so every further row is pure cost while the average still creeps
+        up).
+        """
+        p = self._policy(probe_rounds=0, accept_ema=1.0)
+        # A chain of 3 that accepts 2 and is rejected at the third: positions
+        # 0 and 1 hit, position 2 evaluated and missed.
+        for _ in range(5):
+            p.observe(3, 36.0, 3)
+        self.assertEqual(p.position_accept(0), 0.999)
+        self.assertEqual(p.position_accept(1), 0.999)
+        self.assertEqual(p.position_accept(2), 0.0)
+        # The reach probability collapses at the saturated position; the mean
+        # accept length does not show that at all.
+        self.assertAlmostEqual(p.reach_probability(2), 0.998, places=3)
+        self.assertAlmostEqual(p.reach_probability(3), 0.0, places=6)
+        self.assertEqual(p.predicted_accept(0), 1.0)
+
+    def test_the_criterion_is_marginal_not_average(self):
+        """The rule, on the boot-5 numbers, and why the average is wrong.
+
+        Costs 16.16 / 24.24 / 27.99 / 33.64 ms at K = 0 / 1 / 2 / 3. On
+        `squares` the first proposal was accepted ~40 % of the time, and the
+        AVERAGE ms/token ranks K=1 best. The MARGIN asks whether the first
+        row's 8.1 ms buys more than 0.40 x 16.2 = 6.5 ms of decode step -- it
+        does not, and the measured table agrees (K=0 16.19 vs K=1 17.27).
+        """
+        p = self._policy(probe_rounds=0, cost_ema=1.0, accept_ema=1.0)
+        for k, ms in ((0, 16.16), (1, 24.24), (2, 27.99), (3, 33.64)):
+            p.observe(k, ms, 1)
+        # The K=0 step is NOT on the verify line: 8.1 ms against 3.7 and 5.7.
+        self.assertAlmostEqual(p.marginal_cost(1), 8.08, places=2)
+        self.assertAlmostEqual(p.marginal_cost(2), 3.75, places=2)
+        self.assertAlmostEqual(p.t_decode, 16.16, places=3)
+        p._pos_reached = {0: 1.0, 1: 1.0, 2: 1.0}
+        p._pos_hits = {0: 0.40, 1: 0.0, 2: 0.0}
+        self.assertEqual(p.marginal_depth(), 0)
+        # Raise the FIRST position past its own margin and the chain grows by
+        # exactly one: the second position still never lands, so depth stops
+        # there. That is the whole difference from an average criterion, which
+        # would keep rewarding a rung whose extra rows never pay.
+        p._pos_hits = {0: 0.66, 1: 0.0, 2: 0.0}
+        self.assertEqual(p.marginal_depth(), 1)
+        # And a chain that does NOT saturate keeps growing on the same costs --
+        # but only while the COMPOUND reach still pays: at a flat 0.66 the
+        # third row is reached 0.29 of the time, worth 4.6 ms against its
+        # 5.7 ms, so the margin stops at 2 without any saturation at all.
+        p._pos_hits = {0: 0.66, 1: 0.66, 2: 0.66}
+        self.assertEqual(p.marginal_depth(), 2)
+
+    def test_the_flip_point_rounds_down_to_an_available_rung(self):
+        """{0, 1, 3} with a flip at depth 2 answers 1, not 3.
+
+        Rounding up would run two chain steps the margin already rejected.
+        """
+        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+
+        p = LaneSpecPolicy((0, 1, 3), adaptive=True)
+        self.assertEqual(p._rung_at_or_below(2, (0, 1, 3)), 1)
+        self.assertEqual(p._rung_at_or_below(3, (0, 1, 3)), 3)
+        self.assertEqual(p._rung_at_or_below(0, (0, 1, 3)), 0)
+        # A ladder whose shortest rung is above the flip falls back to that
+        # shortest rung rather than to nothing.
+        self.assertEqual(p._rung_at_or_below(0, (1, 3)), 1)
+
+    def test_the_cost_of_an_unvisited_rung_is_fitted_over_verify_rungs_only(self):
+        """Affine in the row count, and K=0 is deliberately not on the line.
+
+        K=0 is the plain DECODE graph, not a one-row verify; including it in
+        the slope spreads the expensive first step over the whole ladder and
+        makes every rung look equally priced.
+        """
+        p = self._policy(probe_rounds=0, cost_ema=1.0)
+        p.observe(0, 16.0, 1)
+        p.observe(1, 24.0, 1)
+        p.observe(3, 36.0, 1)
+        # rows 2 -> 24, rows 4 -> 36  =>  6 ms per chain step over the VERIFY
+        # rungs, and the K=0 point does not drag the slope.
+        self.assertAlmostEqual(p.marginal_cost(2), 6.0, places=6)
+        self.assertAlmostEqual(p.predicted_round_ms(2), 30.0, places=6)
+
+    def test_hysteresis_damps_a_flapping_challenger(self):
+        p = self._policy(probe_rounds=0, hysteresis=3, cost_ema=1.0, accept_ema=1.0)
+        p.current = 3
+        for k, ms in ((0, 16.0), (1, 22.0), (2, 26.0), (3, 30.0)):
+            p.observe(k, ms, 1)
+        # First position accepted 80 % of the time, second never: the margin
+        # flips at depth 1 and stays there.
+        p._pos_reached = {0: 1.0, 1: 1.0}
+        p._pos_hits = {0: 0.80, 1: 0.0}
+        self.assertEqual(p.marginal_depth(), 1)
+        self.assertEqual(p.choose(), 3, "switched on the first look")
+        self.assertEqual(p.choose(), 3)
+        self.assertEqual(p.choose(), 1, "never switched despite a stable winner")
+        self.assertEqual(p.stats()["switches"], 1)
+
+    def test_a_gain_inside_the_margin_does_not_extend_the_chain(self):
+        """A row whose gain only ties its cost is not worth the transition."""
+        p = self._policy(
+            rungs=(0, 1),
+            probe_rounds=0,
+            hysteresis=1,
+            cost_ema=1.0,
+            accept_ema=1.0,
+            margin=0.2,
+        )
+        p.observe(0, 16.0, 1)
+        p.observe(1, 24.0, 1)
+        p._pos_reached = {0: 1.0}
+        # 8.0 ms cost; 0.52 x 16 = 8.32 ms gain -- better, but inside the 20 %
+        # margin, so the chain stays at 0.
+        p._pos_hits = {0: 0.52}
+        self.assertEqual(p.marginal_depth(), 0)
+        p._pos_hits = {0: 0.70}
+        self.assertEqual(p.marginal_depth(), 1)
+
+    def test_the_k_zero_rung_is_cost_evidence_only(self):
+        """A plain decode step is not a rejected proposal.
+
+        Folding K=0 rounds into the acceptance counters as failures would drag
+        the estimate down for a reason that has nothing to do with the head.
+        """
+        p = self._policy(probe_rounds=0, accept_ema=1.0)
+        p.observe(1, 22.0, 2)
+        before = (dict(p._pos_hits), dict(p._pos_reached))
+        for _ in range(5):
+            p.observe(0, 16.0, 1)
+        self.assertEqual((dict(p._pos_hits), dict(p._pos_reached)), before)
+        self.assertEqual(p.stats()["round_n"][0], 5)
+
+    def test_a_falsifier_round_is_not_priced_into_the_policy(self):
+        """The byte gates must not teach the policy what a round costs.
+
+        The gates run the same rungs with the graphs switched OFF, and an eager
+        verify costs 68 ms against the captured 21 ms. Those rounds landed in
+        the per-rung cost EMA and the policy then believed K=1 cost 77 ms per
+        round -- measured, round 7a boot 6: ``round_ms {0: 16.1, 1: 77.1,
+        2: 75.2, 3: 52.7}`` against measured graph costs of 24 / 28 / 34, so it
+        pinned itself to K=0 for a reason that had nothing to do with content.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        src = inspect.getsource(DualGroupLane._spec_step)
+        self.assertIn('job.get("verify_graph") is False', src)
+        self.assertIn('job.get("head_graph") is False', src)
+        # And the observe call is on the other side of that branch.
+        skip = src.index('job.get("verify_graph") is False')
+        obs = src.index("self.spec_policy.observe")
+        self.assertLess(skip, obs, "the falsifier check comes after observe()")
+
+    def test_the_policy_takes_a_context_for_round_7b(self):
+        """The turn-routing seam, pinned so the next round does not move it.
+
+        Round 7b routes by TURN (first request one algorithm, multiturn
+        another), and an algorithm need not offer every rung. That restriction
+        arrives as a ctx, not as a second decision site next to this one.
+        """
+        p = self._policy(probe_rounds=0)
+        self.assertEqual(p.candidate_rungs({"rungs": [0, 1]}), (0, 1))
+        self.assertEqual(p.candidate_rungs(None), (0, 1, 2, 3))
+        # An empty intersection falls back to the full ladder rather than
+        # returning nothing to choose from.
+        self.assertEqual(p.candidate_rungs({"rungs": [9]}), (0, 1, 2, 3))
 
 
 if __name__ == "__main__":

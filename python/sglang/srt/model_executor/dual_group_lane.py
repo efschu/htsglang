@@ -1251,6 +1251,9 @@ class DualGroupLane:
         concurrent: bool = False,
         draft_runner=None,
         spec_steps: int = 3,
+        spec_rungs=None,
+        spec_adaptive: bool = False,
+        spec_hysteresis: int = 4,
     ):
         self.lane_id = lane_id
         self.plan = plan
@@ -1259,6 +1262,23 @@ class DualGroupLane:
         # None. Its presence is what turns a lane step into a verify round.
         self.draft_runner = draft_runner
         self.spec_steps = int(spec_steps)
+        # #274 round 7a: the chain-length LADDER and the policy that walks it.
+        # ``spec_rungs`` None means the pre-ladder behaviour -- one rung, the
+        # configured spec_steps -- and the policy then only ever answers with
+        # that one value, so the round shape is unchanged.
+        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+
+        self.spec_rungs: Tuple[int, ...] = (
+            tuple(spec_rungs) if spec_rungs else (int(spec_steps),)
+        )
+        self.spec_policy = LaneSpecPolicy(
+            self.spec_rungs,
+            adaptive=bool(spec_adaptive),
+            hysteresis=int(spec_hysteresis),
+            default_rung=(
+                int(spec_steps) if int(spec_steps) in self.spec_rungs else None
+            ),
+        )
         self.jobs: List[Dict[str, Any]] = []
         self.active: Optional[Dict[str, Any]] = None
         self.results: List[Dict[str, Any]] = []
@@ -1322,6 +1342,17 @@ class DualGroupLane:
                     # verify skip its captured graph and run eager, so the
                     # replay-vs-eager byte gate is one boot rather than two.
                     "verify_graph": job.get("verify_graph"),
+                    # Round 7a, three more of the same kind. ``spec_steps``
+                    # PINS a rung for this job (that is how each rung of the
+                    # ladder gets its own measured row from one boot);
+                    # ``adaptive`` overrides the server flag either way, so
+                    # the adaptive arm and the fixed arms it is judged against
+                    # come from ONE boot; ``head_graph`` False makes this job's
+                    # head forwards eager, which is the head's replay-vs-eager
+                    # byte gate.
+                    "spec_steps": job.get("spec_steps"),
+                    "adaptive": job.get("adaptive"),
+                    "head_graph": job.get("head_graph"),
                     # One extra lm_head per round over all K+1 rows, so it is
                     # per job: the round that answers the 13-of-96 argmax
                     # question must not distort the same boot's timing table.
@@ -1366,7 +1397,15 @@ class DualGroupLane:
             "spec": (
                 None
                 if self.draft_runner is None
-                else {"algorithm": "nextn-chain", "steps": self.spec_steps}
+                else {
+                    "algorithm": "nextn-chain",
+                    "steps": self.spec_steps,
+                    # Round 7a: the ladder and the policy walking it, so an
+                    # external instrument can read the rung the lane is on
+                    # without differencing per-job results.
+                    "rungs": list(self.spec_rungs),
+                    "policy": self.spec_policy.stats(),
+                }
             ),
         }
         if self._admission_waits:
@@ -1471,7 +1510,7 @@ class DualGroupLane:
             if job["prefill_ms"] is None:
                 self._prefill(job)
             elif self._job_spec_on(job):
-                self._spec_step(job)
+                self._spec_round(job)
             else:
                 self._decode_step(job)
         if len(job["output_ids"]) >= job["max_new_tokens"] or (
@@ -1514,7 +1553,7 @@ class DualGroupLane:
                 # into the worker path only, so a SERIAL lane assembled the
                 # NEXTN head and then never asked it for a proposal -- the
                 # chain was unreachable in the very mode that is the default.
-                self._spec_step(job)
+                self._spec_round(job)
             else:
                 self._decode_step(job)
         if len(job["output_ids"]) >= job["max_new_tokens"] or (
@@ -1604,6 +1643,15 @@ class DualGroupLane:
         fb = ForwardBatch.init_new(batch_d, self.draft_runner)
         fb.spec_info = spec
         fb.capture_hidden_mode = CaptureHiddenMode.LAST
+        # Round 7a: did this forward replay the head's captured graph? Asked
+        # of the runner that decides it, not inferred from a timing -- a head
+        # that silently fell back to eager is the one way the round-7a table
+        # can look like a regression when nothing regressed (the same argument
+        # as ``verify_graph_rounds`` in round 6).
+        graph_runner = getattr(self.draft_runner, "decode_cuda_graph_runner", None)
+        self._head_graph_last = bool(
+            graph_runner is not None and graph_runner.lane_draft_can_replay(fb)
+        )
         out = self.draft_runner.forward(fb).logits_output
         return out
 
@@ -1618,15 +1666,43 @@ class DualGroupLane:
         hidden = job["_hidden"]
         token = job["_next"]
         batch_d = job["_batch_d"]
-        for _ in range(self.spec_steps):
-            batch_d.input_ids = token.to(torch.int64)
-            batch_d.prepare_for_decode()
-            out = self._draft_forward(batch_d, hidden)
-            token = out.next_token_logits.argmax(dim=-1)
-            hidden = out.hidden_states
-            proposals.append(int(token[0].item()))
-            job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
+        steps = int(job.get("_rung") or self.spec_steps)
+        with self._head_graph_scope(job):
+            for _ in range(steps):
+                batch_d.input_ids = token.to(torch.int64)
+                batch_d.prepare_for_decode()
+                out = self._draft_forward(batch_d, hidden)
+                job["_head_graph"] = job.get("_head_graph", 0) + int(
+                    getattr(self, "_head_graph_last", False)
+                )
+                job["_head_forwards"] = job.get("_head_forwards", 0) + 1
+                token = out.next_token_logits.argmax(dim=-1)
+                hidden = out.hidden_states
+                proposals.append(int(token[0].item()))
+                job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
         return proposals
+
+    @contextlib.contextmanager
+    def _head_graph_scope(self, job):
+        """Let a job run its head forwards EAGER (``head_graph: false``).
+
+        The head's replay-vs-eager byte gate, per job for the same reason the
+        verify's is (round 6): both arms have to come from ONE boot, or the
+        gate carries boot-to-boot variance instead of the single difference it
+        exists to isolate. Suppressing the capture flag is the whole mechanism
+        -- ``can_run_graph`` reads it and the forward falls back to the eager
+        runner -- and it is restored unconditionally.
+        """
+        runner = getattr(self.draft_runner, "decode_cuda_graph_runner", None)
+        if job is None or job.get("head_graph") is not False or runner is None:
+            yield
+            return
+        saved = runner._lane_draft_captured
+        runner._lane_draft_captured = False
+        try:
+            yield
+        finally:
+            runner._lane_draft_captured = saved
 
     def _make_batch(self, job, runner=None):
         from array import array
@@ -2589,12 +2665,16 @@ class DualGroupLane:
             # corruption (a known GGUF family, #52/#53).
             (job is not None and job.get("verify_graph") is False)
             or runner is None
-            or getattr(runner, "_lane_verify_tokens", None) != draft_token_num
-            or not getattr(runner, "_lane_verify_captured", False)
+            # Round 7a: the ladder makes this a membership test rather than an
+            # equality one -- and it is tested against what was CAPTURED, not
+            # against what was configured, so a rung that was thinned away or
+            # whose capture raised falls back to eager instead of replaying a
+            # neighbour's graph.
+            or draft_token_num not in getattr(runner, "_lane_verify_captured", ())
         ):
             yield False
             return
-        with runner.lane_verify_shape():
+        with runner.lane_verify_shape(draft_token_num):
             yield True
 
     def _verify_by_target_verify(self, job, proposals, n_cached):
@@ -3049,6 +3129,48 @@ class DualGroupLane:
         job["_req"] = batch.reqs[0]
         job["_req_pool_idx"] = int(batch.reqs[0].req_pool_idx)
 
+    def _choose_rung(self, job) -> int:
+        """The chain length for the NEXT round of this job.
+
+        The whole of the ladder's runtime side: everything below it is already
+        captured, so this returns a number and nothing re-records. Per-job
+        overrides are applied to the policy object rather than around it,
+        because the policy is what R7b extends and a second decision site
+        outside it would be a second thing to keep in step.
+        """
+        ctx: Dict[str, Any] = {}
+        adaptive = job.get("adaptive")
+        if adaptive is not None:
+            self.spec_policy.adaptive = (
+                bool(adaptive) and len(self.spec_policy.rungs) > 1
+            )
+        if job.get("spec_steps") is not None:
+            ctx["rung"] = int(job["spec_steps"])
+        return int(self.spec_policy.choose(ctx))
+
+    def _spec_round(self, job):
+        """One round of the lane's speculative decode, at the policy's rung.
+
+        K = 0 is a rung like any other and is the lane's PLAIN decode step --
+        the entry that has been byte-green since round 5 and that the ladder is
+        explicitly not allowed to disturb. Routing K = 0 here rather than
+        forcing a one-proposal chain is what makes "speculation off" reachable
+        from inside a speculative job, which is what an adaptive policy needs
+        in order to be able to lose gracefully.
+        """
+        rung = self._choose_rung(job)
+        job.setdefault("_rungs", []).append(rung)
+        if rung <= 0:
+            self._decode_step(job)
+            # The plain decode step is this boot's measurement of the K = 0
+            # rung's cost -- the break-even denominator, measured rather than
+            # taken from a table. The falsifier arms do not change this step
+            # (it has no verify and no head forward), so it is always evidence.
+            self.spec_policy.observe(0, job["decode_ms"][-1], 1)
+            return
+        job["_rung"] = rung
+        self._spec_step(job)
+
     def _spec_step(self, job):
         """One speculative round on the lane: K proposals, one verify.
 
@@ -3070,6 +3192,24 @@ class DualGroupLane:
         job.setdefault("_propose_ms", []).append(round_ms - ms)
         job["output_ids"].extend(emitted)
         job.setdefault("_accept", []).append(n_accept + 1)
+        # Feed the policy AFTER the round, with what the round actually cost
+        # and produced. Both halves of the break-even come from here.
+        #
+        # A FALSIFIER round is not evidence, and leaving that out cost a
+        # measurement: the byte gates run the same rungs with the graphs
+        # switched off, an eager verify costs 68 ms against the captured
+        # 21 ms, and those rounds landed in the per-rung cost EMA. The policy
+        # then believed K=1 cost 77 ms per round and pinned itself to K=0 for
+        # a reason that has nothing to do with the content (measured, round 7a
+        # boot 6: round_ms {0: 16.1, 1: 77.1, 2: 75.2, 3: 52.7} against
+        # measured graph costs of 24 / 28 / 34). The diagnostic arms are
+        # deliberately not the operating point, so they must not price it.
+        if job.get("verify_graph") is False or job.get("head_graph") is False:
+            job["_policy_skipped"] = job.get("_policy_skipped", 0) + 1
+        else:
+            self.spec_policy.observe(
+                int(job.get("_rung") or self.spec_steps), round_ms, n_accept + 1
+            )
         # A speculative round emits accept+1 tokens, so the ARM is the same
         # decode arm -- what changes is how much work one round completes,
         # which is exactly what the rate is meant to capture.
@@ -3228,6 +3368,22 @@ class DualGroupLane:
         # nothing regressed.
         if accepts and job.get("verify") in (None, "target_verify"):
             result["verify_graph_rounds"] = job.get("_verify_graph", 0)
+        # Round 7a: the head's counterpart, plus which rungs the job actually
+        # ran. The rung histogram is what makes an adaptive job's number
+        # readable at all -- an adaptive ms/token is a mixture, and reporting
+        # the mixture weights is the difference between a measurement and an
+        # anecdote.
+        if job.get("_head_forwards"):
+            result["head_forwards"] = job["_head_forwards"]
+            result["head_graph_forwards"] = job.get("_head_graph", 0)
+        rungs = job.get("_rungs") or []
+        if rungs:
+            hist: Dict[int, int] = {}
+            for k in rungs:
+                hist[k] = hist.get(k, 0) + 1
+            result["rungs"] = dict(sorted(hist.items()))
+            result["rung_mean"] = round(sum(rungs) / len(rungs), 3)
+            result["policy"] = self.spec_policy.stats()
         if job.get("_argmax_rounds"):
             result["argmax_check"] = {
                 "rounds": job["_argmax_rounds"],
@@ -3540,6 +3696,48 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
         )
 
 
+def resolve_lane_spec_rungs(server_args) -> Tuple[int, ...]:
+    """The lane's chain-length ladder as a sorted tuple of K values (#274 R7a).
+
+    Unset ``--dual-group-lane-spec-rungs`` resolves to the single configured
+    ``--dual-group-lane-spec-steps``, which is the pre-ladder shape down to the
+    VRAM: one verify graph, one operating point. The ladder is opt-in because
+    each additional rung is another graph pool on the lane's card, and that is
+    a post the operator has to be able to decline.
+    """
+    from sglang.srt.model_executor.lane_spec_policy import parse_lane_spec_rungs
+
+    rungs = parse_lane_spec_rungs(
+        getattr(server_args, "dual_group_lane_spec_rungs", None)
+    )
+    if rungs:
+        return rungs
+    return (int(getattr(server_args, "dual_group_lane_spec_steps", 3)),)
+
+
+def _enable_decode_graph_phase(args) -> None:
+    """Re-enable ONLY the decode cuda-graph phase on a lane args view.
+
+    The inverse of the ``_disable_graph_phases`` below, applied to the lane's
+    NEXTN head after that call, and deliberately not a parameter of it: the
+    head's PREFILL graph must stay off (its extend shapes follow the target's
+    prompt and are not a fixed ladder), and a single function that could do
+    either would make the difference easy to lose.
+
+    The three legacy booleans are set as well as the phase backend, because
+    ``check_cuda_graph_backend`` reads the phase config while other call sites
+    still read ``disable_cuda_graph`` -- contract 4 in
+    ``_finish_lane_draft_runner`` is exactly what happens when the two
+    disagree.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+    args.disable_cuda_graph = False
+    args.disable_decode_cuda_graph = False
+    args.disable_prefill_cuda_graph = True
+    getattr(args.cuda_graph_config, Phase.DECODE).backend = Backend.FULL
+
+
 def _disable_graph_phases(args) -> None:
     """Turn every cuda-graph phase off on a lane args view (in place)."""
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
@@ -3679,6 +3877,36 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
     # decided BEFORE the scope below publishes this args view.
     _disable_graph_phases(draft_runner.server_args)
 
+    # #274 round 7a: and then the DECODE phase is given back, which is the
+    # whole of the head-capture opening. Round 6 left the head eager for a
+    # named reason -- the generic decode capture builds ``spec_info=None`` and
+    # an MTP forward dereferences it -- so the capture had to be disabled
+    # wholesale. The runner-side fix (``_lane_draft_spec_info``) removes that
+    # reason, and this is where the phase is re-enabled for it. PREFILL stays
+    # off: the head's extend shapes follow the target's prompt, they are not a
+    # fixed ladder, and the head's prefill is one forward per JOB against K per
+    # round -- the time is not there.
+    head_graph = bool(
+        getattr(draft_runner.server_args, "dual_group_lane_spec_head_graph", True)
+    ) and not bool(getattr(draft_runner.server_args, "dual_group_lane_eager", False))
+    if head_graph:
+        _enable_decode_graph_phase(draft_runner.server_args)
+        # The RUNNER-side flag is set inside the scoped bring-up below, not
+        # here, and that is not a style choice: ``alloc_memory_pool`` re-inits
+        # the block of graph-runner fields this one lives in (the same block
+        # that holds ``dual_group_lane_verify_tokens``), and it runs inside
+        # that call. Setting it here is silently undone -- measured, boot 1 of
+        # round 7a, which reproduced round 6's named gap verbatim
+        # (``'NoneType' object has no attribute 'hidden_states'``) because the
+        # capture then saw the field as False. The lane TARGET already obeys
+        # this ordering; the head now does too.
+    else:
+        logger.warning(
+            "dual-group lane %d NEXTN head runs EAGER "
+            "(--no-dual-group-lane-spec-head-graph or --dual-group-lane-eager).",
+            lane_id,
+        )
+
     # CONTRACT 4, SOLVED: the head's bring-up runs under the HEAD's args view,
     # not the lane target's.
     #
@@ -3698,9 +3926,12 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
     # graphs against the target's plan too.
     #
     # Re-entering the Slice-C overlay with the head's args makes the two agree
-    # -- both phases hit their DISABLED early return, nothing is captured, and
-    # no shared-output buffer is dereferenced. This is the same mechanism, and
-    # the same reasoning, as the comment on the enclosing scope: helpers read
+    # -- and round 7a is where that agreement starts EARNING something rather
+    # than merely preventing a crash: with the head's decode phase enabled
+    # above, both readers now see ENABLED, so the shared-output buffer is
+    # created and the head's one decode graph is captured; prefill still sees
+    # DISABLED on both sides and is still skipped. This is the same mechanism,
+    # and the same reasoning, as the comment on the enclosing scope: helpers read
     # the ACTIVE args, so the active args must be the ones belonging to the
     # runner being brought up. The whole body is inside it (not just the graph
     # call) so pool sizing and backend init see the head's plan as well --
@@ -3722,7 +3953,7 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
     # decides which graph pool / per-lane buffer the head lands in, and it
     # must not drift from the scope the lane will forward under).
     with lane_scope(current_lane_id(), draft_runner.server_args):
-        _finish_lane_draft_runner_scoped(draft_runner, lane_id)
+        _finish_lane_draft_runner_scoped(draft_runner, lane_id, head_graph=head_graph)
 
     logger.info(
         "dual-group lane %d NEXTN head ready: max_total_num_tokens=%d.",
@@ -3731,33 +3962,40 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
     )
 
 
-def _finish_lane_draft_runner_scoped(draft_runner, lane_id):
+def _finish_lane_draft_runner_scoped(draft_runner, lane_id, head_graph: bool = False):
     """Pools, backends and graphs of the head, under the head's args view."""
     with lane_geometry_override(1, 0):
         draft_runner.alloc_memory_pool()
         draft_runner.init_attention_backends()
+        # #274 round 7a: BETWEEN the pool and the capture, exactly like the
+        # lane target's ``dual_group_lane_verify_tokens``. ``alloc_memory_pool``
+        # re-inits the graph-runner field block, so anything written before it
+        # is gone by the time the capture reads it.
+        if head_graph:
+            draft_runner.dual_group_lane_draft_capture = True
         # init_cuda_graphs() is called even though the head runs eager: it
         # also builds the EAGER phase runner, without which forward dispatch
         # has no `eager_runner` at all (measured: AttributeError on the
         # head's first forward). Every graph phase is DISABLED in the active
         # view, so this builds the dispatcher and captures nothing.
+        # THE NAMED GAP OF ROUND 6 IS CLOSED HERE (#274 round 7a). It was:
+        # the head's decode graph would be captured by the plain
+        # DecodeCudaGraphRunner, which builds a dummy batch with
+        # spec_info=None -- and an MTP forward reads
+        # forward_batch.spec_info.hidden_states, so the capture died on a
+        # NoneType. The fix is NOT to route the head through the EAGLE draft
+        # graph runner (that runner captures the whole topk/tree/sampling draft
+        # loop, which the lane's greedy topk-1 chain does not have and would
+        # have to be undone again); it is one targeted branch in
+        # ``get_spec_info`` that builds a real EagleDraftInput over a static
+        # hidden-states buffer, plus this decode phase being enabled above.
+        #
+        # init_cuda_graphs() is called even when the head runs eager: it also
+        # builds the EAGER phase runner, without which forward dispatch has no
+        # `eager_runner` at all (measured: AttributeError on the head's first
+        # forward). With the head graph off, every phase is DISABLED in the
+        # active view and this builds the dispatcher and captures nothing.
         draft_runner.init_cuda_graphs()
-        # NAMED GAP, not an oversight: the head runs EAGER.
-        # Its decode graph would be captured by the plain DecodeCudaGraphRunner,
-        # which builds a dummy batch with spec_info=None -- and an MTP forward
-        # reads forward_batch.spec_info.hidden_states, so the capture dies on
-        # a NoneType. The serving group avoids this by capturing drafts
-        # through the EAGLE-specific draft graph runner, which knows to build
-        # an EagleDraftInput. Routing the lane's head there is the follow-on;
-        # until then the head is one layer of eager against a graph-captured
-        # target, which is where the time actually is.
-        logger.warning(
-            "dual-group lane %d NEXTN head runs EAGER: the generic decode "
-            "capture builds spec_info=None and an MTP forward dereferences "
-            "it. Needs the EAGLE draft graph runner -- named gap, not an "
-            "end state.",
-            lane_id,
-        )
 
 
 def _build_lane_under_scope(
@@ -3827,14 +4065,19 @@ def _build_lane_under_scope(
         # spec_solo_rank_local_graphs is: the capture reads it, and the capture
         # happens inside init_cuda_graphs. Eager lanes and a disabled graph plan
         # capture nothing at all, so the field would only be misleading there.
+        # Round 7a: a LADDER of such entries, one per configured rung. K = 0 is
+        # deliberately absent from it -- that rung IS the plain decode entry
+        # this runner already captured, so it costs no graph and must not be
+        # re-recorded as a one-row verify.
+        lane_rungs = resolve_lane_spec_rungs(server_args)
         if (
             getattr(server_args, "dual_group_lane_spec", False)
             and getattr(server_args, "dual_group_lane_spec_graph", True)
             and not server_args.dual_group_lane_eager
         ):
-            runner.dual_group_lane_verify_tokens = (
-                int(getattr(server_args, "dual_group_lane_spec_steps", 3)) + 1
-            )
+            verify_rungs = tuple(k + 1 for k in lane_rungs if k >= 1)
+            if verify_rungs:
+                runner.dual_group_lane_verify_tokens = verify_rungs
         if server_args.dual_group_lane_eager:
             logger.warning(
                 "dual-group lane %d runs EAGER (--dual-group-lane-eager); "
@@ -3855,6 +4098,13 @@ def _build_lane_under_scope(
         concurrent=concurrent,
         draft_runner=draft_runner,
         spec_steps=int(getattr(server_args, "dual_group_lane_spec_steps", 3)),
+        spec_rungs=lane_rungs,
+        spec_adaptive=bool(
+            getattr(server_args, "dual_group_lane_spec_adaptive", False)
+        ),
+        spec_hysteresis=int(
+            getattr(server_args, "dual_group_lane_spec_adaptive_hysteresis", 4)
+        ),
     )
     lend_mib = int(getattr(server_args, "dual_group_lane_lend_mib", 0) or 0)
     if lend_mib > 0:

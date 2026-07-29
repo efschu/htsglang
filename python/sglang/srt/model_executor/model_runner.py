@@ -1090,8 +1090,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # sizes for one row per slot and the capture would trip the shared
             # buffer's row assert. Lane-keyed buffer: a concurrent lane grows
             # its own, the serving group's is untouched.
+            # Round 7a: the widest rung of the ladder decides.
             rows = max(capture_bs) * max(
-                num_tokens_per_bs, self.dual_group_lane_verify_tokens
+                num_tokens_per_bs, *self.dual_group_lane_verify_tokens
             )
         return rows
 
@@ -1152,7 +1153,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # beside the plain decode ones. Written by the lane bring-up between
         # construction and init_cuda_graphs(), like
         # spec_solo_rank_local_graphs. None everywhere else.
-        self.dual_group_lane_verify_tokens: Optional[int] = None
+        #
+        # Round 7a makes it the K LADDER: a tuple of candidate-row counts
+        # (K+1 per rung), one captured entry each, so a rung change at runtime
+        # is a graph-key flip rather than a re-capture.
+        self.dual_group_lane_verify_tokens: Optional[Tuple[int, ...]] = None
+        # #274 round 7a: True when this runner is the dual-group lane's NEXTN
+        # HEAD. Its decode capture then builds a real EagleDraftInput instead
+        # of the None an MTP forward dereferences. False everywhere else.
+        self.dual_group_lane_draft_capture: bool = False
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

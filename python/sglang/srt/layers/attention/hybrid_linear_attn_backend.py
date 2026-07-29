@@ -51,6 +51,18 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        # #274 round 7a: one cached verify query-start-loc PER candidate-row
+        # count. ``init_cuda_graph_state`` derives a single stride from
+        # ``max_num_tokens // max_bs``, which is right exactly while a runner
+        # captures ONE verify shape. A chain-length ladder captures several
+        # (2 / 3 / 4 rows here), and they all share these buffers, so the
+        # narrow rungs were handed the widest rung's stride -- the GDN verify
+        # then advanced its recurrent state over 4 rows where the batch had 2.
+        # Silent: no assert, just wrong tokens (measured, boot 4 of round 7a:
+        # K=1 diverged from its own eager arm at index 1 while K=3, whose
+        # stride happened to match, stayed byte-green).
+        self._verify_query_start_loc_by_rows: dict = {}
+        self._cuda_graph_max_bs: int = 0
         self.conv_states_shape: tuple[int, int] = None
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
@@ -402,6 +414,40 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        # #274 round 7a: keep the boot-time stride as the default entry and
+        # let anything else be minted on demand (see _verify_query_start_loc).
+        self._cuda_graph_max_bs = max_bs
+        self._verify_query_start_loc_by_rows = {
+            draft_token_num: self.cached_cuda_graph_verify_query_start_loc
+        }
+
+    def _verify_query_start_loc(self, rows: Optional[int]) -> torch.Tensor:
+        """The cuda-graph verify query-start-loc for a batch of ``rows`` per slot.
+
+        The graph path used to read ONE boot-time arange while the eager path
+        derives its stride from ``spec_info.draft_token_num`` per batch (see
+        ``_forward_metadata``). Those agree exactly while a runner captures a
+        single verify shape and disagree the moment it captures a ladder of
+        them -- so the graph path now asks the same question the eager path
+        does, and the boot-time buffer is simply the first cache entry.
+
+        Cached per row count rather than built per call: this runs inside the
+        replay-prep of every verify round, and the ladder has a handful of
+        rungs, not an open set.
+        """
+        if not rows or rows <= 0:
+            return self.cached_cuda_graph_verify_query_start_loc
+        buf = self._verify_query_start_loc_by_rows.get(rows)
+        if buf is None:
+            buf = torch.arange(
+                0,
+                self._cuda_graph_max_bs * rows + 1,
+                step=rows,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._verify_query_start_loc_by_rows[rows] = buf
+        return buf
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
@@ -432,8 +478,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
+            # Round 7a: the stride is this SHAPE's row count, not the runner's
+            # widest one -- a ladder captures several verify shapes against
+            # these shared buffers.
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                self._verify_query_start_loc(
+                    getattr(spec_info, "draft_token_num", None)
+                )[: bs + 1]
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -583,13 +634,18 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
+            # Round 7a: same per-shape stride as the capture side. The padded
+            # branch below already read ``spec_info.draft_token_num`` for its
+            # fill value, so this makes the two halves of the same buffer agree
+            # on where the row count comes from.
+            verify_qsl = self._verify_query_start_loc(
+                getattr(spec_info, "draft_token_num", None)
+            )
             if num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
+                self.query_start_loc_list[bs - 1].copy_(verify_qsl[: bs + 1])
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                    verify_qsl[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
