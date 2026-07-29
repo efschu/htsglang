@@ -678,14 +678,21 @@ def fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
     if welt < 2:
         return 0
     anteil = -(-nbytes // welt)          # aufrunden
-    if algorithmus in ("netz", "ring", "hierarchisch"):
+    # ``netz_pipe`` steht hier bei netz und ring, weil sein Bereich genauso
+    # gross ist: 2*T*(R-1) Schlitze zu je chunk_max/T, also wieder
+    # 2(R-1)*chunk_max. Die GENAUE Zahl -- mit dem Verschnitt aus dem
+    # Abrunden der Schlitzgroesse -- rechnet
+    # ``htccl_bar1_pipe_ext.pipe_fensterbedarf``; sie ist kleiner und wird
+    # in ``handles`` zusaetzlich geprueft.
+    if algorithmus in ("netz", "netz_pipe", "ring", "hierarchisch"):
         return 2 * (welt - 1) * anteil
     if algorithmus == "stern":
         return 2 * (welt - 1) * nbytes
     raise ValueError(f"unbekannter Algorithmus {algorithmus!r}")
 
 
-def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
+def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
+              mit_pipe: bool = False, erg_ring: int = 0) -> dict:
     """Die Speicherordnung EINER Empfangsregion, fuer beliebiges R.
 
     Sie traegt alle Verfahren **gleichzeitig**, damit ein Plan je Groesse und
@@ -698,6 +705,7 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
     ...          Netz-AG-Schlitze   ``(R-1) * chunk_max``
     ``off_ring`` Ring-Schlitze      ``2(R-1) * chunk_max``
     ``off_a2a``  a2a-Schlitze       ``2(R-1) * chunk_max``
+    ``off_pipe`` netz_pipe-Schlitze ``2(R-1) * chunk_max``
     ===========  =================  ========================================
 
     ``chunk_max`` ist auf eine Seite aufgerundet -- ein Schlitz, der auf
@@ -719,6 +727,20 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
     Zahl aendert sich dadurch -- nur die Decke, ab der ``handles`` False
     sagt. Wer sie zurueck will, setzt ``SGLANG_HTCCL_BAR1_A2A=0``; dann ist
     ``mit_a2a`` False und die Ordnung ist Byte fuer Byte die alte.
+
+    **Warum netz_pipe einen EIGENEN Bereich bekommt und nicht den von
+    netz.** Die Bereiche der Verfahren muessen paarweise disjunkt sein, und
+    zwar nicht nur innerhalb eines Aufrufs. Wenn Rang A seine Runde ``n``
+    beendet, kann Rang B den Allgather-Schlitz dieser Runde noch lesen --
+    A wartet vor dem Ende nur auf B's Flagge, nicht auf B's Lesevorgang.
+    Bei ``netz`` faellt das nicht auf, weil A's naechster Schreibvorgang in
+    die RS-Haelfte geht und B in der AG-Haelfte liest. Ein ``netz_pipe``,
+    der den ganzen Netz-Bereich benutzte, traefe die AG-Haelfte sofort.
+    Ein eigener Bereich macht die Frage gegenstandslos.
+
+    Der Bereich wird nur angelegt, wenn ``mit_pipe`` gesetzt ist
+    (``SGLANG_HTCCL_BAR1_PIPE=1``); ohne ihn ist die Ordnung Byte fuer Byte
+    die gemessene.
     """
     if welt < 2:
         raise ValueError("welt < 2")
@@ -729,7 +751,18 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
     off_netz = 0
     off_ring = schlitze * chunk_max
     off_a2a = 2 * schlitze * chunk_max
-    region = (3 if mit_a2a else 2) * schlitze * chunk_max + SEITE
+    from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
+        erg_stride_bytes,
+    )
+
+    saetze = 2 + (1 if mit_a2a else 0)
+    off_pipe = saetze * schlitze * chunk_max
+    if mit_pipe:
+        saetze += 1
+    off_erg = saetze * schlitze * chunk_max
+    ring = int(erg_ring) if mit_pipe else 0
+    erg_stride = erg_stride_bytes(max_bytes) if ring > 0 else 0
+    region = off_erg + ring * erg_stride + SEITE
     return {
         "chunk_max": chunk_max,
         "off_netz": off_netz,
@@ -738,21 +771,38 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True) -> dict:
         # ein Versatz 0 waere der Netz-Bereich.
         "off_a2a": off_a2a if mit_a2a else -1,
         "a2a_schlitz": chunk_max if mit_a2a else 0,
+        "off_pipe": off_pipe if mit_pipe else -1,
+        "off_erg": off_erg if ring > 0 else -1,
+        "erg_stride": erg_stride,
+        "erg_ring": ring,
         "region_bytes": region,
         "max_bytes": max_bytes,
         "mit_a2a": bool(mit_a2a),
+        "mit_pipe": bool(mit_pipe),
     }
 
 
-def flaggen_bedarf(welt: int, mit_a2a: bool = True) -> int:
-    """``(2 + 2(R-1) [+ 1]) * R * 256`` Byte.
+def flaggen_bedarf(welt: int, mit_a2a: bool = True,
+                   mit_pipe: bool = False) -> int:
+    """``(2 + 2(R-1) [+ 1]) * R * 256`` Byte, plus ``4 R * 256`` fuer die Pipe.
 
     Eine 256-Byte-Zeile je (Topologie, Schritt, Sender): kein False Sharing
     zwischen Sendern, keins zwischen Schritten, keins zwischen Topologien.
     Netz hat 2 Schritte, Ring ``2(R-1)``, a2a genau **einen**. Bei R=8 sind
     das 34 KiB und damit weit unter einer Allokationsgranularitaet.
+
+    ``netz_pipe`` haengt vier Zeilen je Rang hinten an (``tailRS``,
+    ``tailAG``, ``headRS``, ``headAG``) -- **unabhaengig von K und T**, weil
+    es ein Schiebefenster mit einem Zaehler je Verbindung ist und nicht eine
+    Flagge je Chunk. Hinten angehaengt, damit jeder bestehende
+    Zeilenversatz Byte fuer Byte bleibt.
     """
-    return (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
+    from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
+        pipe_flaggen_zusatz,
+    )
+
+    grund = (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
+    return grund + (pipe_flaggen_zusatz(welt) if mit_pipe else 0)
 
 
 def fbasis_a2a(welt: int) -> int:
@@ -767,21 +817,36 @@ def fbasis_a2a(welt: int) -> int:
     return (2 + 2 * (welt - 1)) * welt * 256
 
 
-def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True) -> int:
+def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
+                 mit_pipe: bool = False, erg_ring: int = 0) -> int:
     """Groesste Nutzlast, deren Schlitze in eine Region dieser Groesse passen.
 
     Umkehrung von :func:`geometrie`. Bewusst konservativ gerundet und
     danach gegengerechnet -- eine Umkehrung, die um eine Seite danebenliegt,
-    faellt sonst erst im heissen Pfad auf.
+    faellt sonst erst im heissen Pfad auf. Die Gegenrechnung ist genau der
+    Grund, warum hier keine zweite Fassung der Faktorenrechnung stehen
+    muss: ``geometrie`` selbst hat das letzte Wort.
     """
     if welt < 2 or region_bytes <= SEITE:
         return 0
-    schlitze = (6 if mit_a2a else 4) * (welt - 1)
-    chunk_max = ((region_bytes - SEITE) // schlitze // SEITE) * SEITE
+    # 2 Saetze fuer netz, 2 fuer ring, je 2 fuer a2a und die Pipe -- also 4
+    # als Sockel, nicht 2. Ausgeschrieben statt als "(6 wenn a2a sonst 4)",
+    # damit der vierte Summand nicht wieder in einer Zahl verschwindet.
+    schlitze = (4 + (2 if mit_a2a else 0) + (2 if mit_pipe else 0)) * (welt - 1)
+    ring = int(erg_ring) if mit_pipe else 0
+    # Der Ergebnisring kostet ``L * roundup(N, SEITE)``, und ``N`` ist
+    # ``chunk_max * R``. In Einheiten von chunk_max sind das ``L * R``
+    # zusaetzliche Einheiten zu den ``schlitze`` -- deshalb steht der Ring
+    # hier IM NENNER und nicht als Abzug. Ein Abzug haette den Anfangswert
+    # so weit danebengelegt, dass die Gegenrechnung unten in
+    # 32-Byte-Schritten haette heruntersuchen muessen.
+    nenner = schlitze + ring * welt
+    chunk_max = ((region_bytes - SEITE) // nenner // SEITE) * SEITE
     if chunk_max <= 0:
         return 0
     n = (chunk_max // 16) * welt * 16
-    while n > 0 and geometrie(welt, n, mit_a2a)["region_bytes"] > region_bytes:
+    while n > 0 and geometrie(welt, n, mit_a2a, mit_pipe,
+                              ring)["region_bytes"] > region_bytes:
         n -= welt * 16
     return n
 
@@ -1043,6 +1108,69 @@ class HTCCLBar1Transport:
         #: Erst nach `byte_beleg_a2a` gueltig. Ohne bestandenen Beleg meldet
         #: sich all_to_all ab -- all_reduce bleibt davon unberuehrt.
         self._a2a_beleg = False
+
+        # -- netz_pipe (gepipelinetes Netz, htccl_bar1_pipe_ext) ------------
+        # AUS als Vorgabe. Eingeschaltet belegt es einen weiteren Schlitzsatz
+        # und vier Flaggenzeilen je Rang; ausgeschaltet ist jede Zahl und
+        # jeder Versatz dieses Moduls Byte fuer Byte der gemessene.
+        self.pipe_an = os.environ.get("SGLANG_HTCCL_BAR1_PIPE", "0") not in (
+            "0", "nein", "aus", "false"
+        )
+        # Fenstertiefe T. 4 aus NCCL: NCCL_STEPS 8 (src/include/device.h:26)
+        # geteilt durch ALLREDUCE_SLICESTEPS 2 (src/include/collectives.h:19)
+        # ergibt vier Scheiben im Fenster. T=2 ist das Minimum, das ueberhaupt
+        # pipelinet; T=1 verklemmt (siehe htccl_bar1_pipe_ext).
+        self.pipe_t = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_T", "4"))
+        # Chunkzahl K. 0 = automatisch aus `pipe_chunk_bytes`.
+        self.pipe_k = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_K", "0"))
+        # Zielgroesse eines Chunks bei automatischem K. 256 KiB: bei 1 MiB
+        # braucht `netz` laut MESSUNG_ALLES_IM_SELBEN_LAUF.md 330,30 us und
+        # die Leerrunde 25,74 us -- ein 256-KiB-Chunk kostet also rund 82 us
+        # Uebertragung gegen rund 26 us Umlauf. Drei Raenge, Rig 1; auf zwei
+        # Karten am x8-Port ungemessen, deshalb eine Stellgroesse.
+        self.pipe_chunk_bytes = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_CHUNK_BYTES", str(256 << 10))
+        )
+        self.pipe_k_max = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_K_MAX", "64"))
+        # Empfaengerquittung (head). 1 = an. Aus gemessen zeigt, was das
+        # Schiebefenster kostet; aus GEFAHREN darf sie nur, wer den
+        # Zeitplanbeweis in htccl_bar1_pipe_ext gelesen hat.
+        self.pipe_quittung = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_QUITTUNG", "1")
+        )
+        # Ab dieser Nutzlast wird netz_pipe statt netz gefahren. 256 KiB, weil
+        # darunter ein einziger Chunk uebrigbliebe und die Pipe dann nur die
+        # Buchfuehrung des Netzes waere.
+        self.pipe_ab = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_AB", str(256 << 10))
+        )
+        # Direkt-Modus: der Allgather schreibt in den Ergebnispuffer des
+        # Empfaengers statt in einen Schlitz, den der Empfaenger danach
+        # auslesen und umkopieren muesste. Vorgabe AN, sobald die Pipe an
+        # ist -- das ist der Punkt der Pipe. 0 ist der Kontrollversuch mit
+        # derselben Speicherordnung.
+        self.pipe_direkt = os.environ.get(
+            "SGLANG_HTCCL_BAR1_PIPE_DIREKT", "1"
+        ) not in ("0", "nein", "aus", "false")
+        # Wieviele Ergebnispuffer der Ring haelt. Kostet L*max_bytes im
+        # BAR-Fenster; 2 ist das Minimum, mit dem Runde n nicht in den
+        # Puffer schreibt, den der Aufrufer aus Runde n-1 noch haelt.
+        self.pipe_erg_ring = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_ERG_RING", "2")
+        )
+        #: Erst nach `byte_beleg_pipe` gueltig.
+        self._pipe_beleg = False
+        self._pipe_ext = None
+        self._schritt_dev = None
+        #: Laufender Index im Ergebnisring. HOSTSEITIG und rangeinheitlich,
+        #: weil jeder Rang dieselbe Folge von Kollektiven sieht (SPMD) --
+        #: dieselbe Annahme, auf der schon `algorithmus_fuer` steht. Der
+        #: Kern kann ihn NICHT selbst waehlen: der Host muss den
+        #: Ergebnistensor bauen, bevor der Kern laeuft.
+        self._erg_i = -1
+        #: Schwache Verweise auf die zuletzt herausgegebenen
+        #: Ergebnistensoren, je Ringplatz. Sie sind die Lebensdauerpruefung.
+        self._erg_lebt: list = []
         #: Untergrenze fuer all_to_all. Bewusst NICHT `min_bytes` (4096): der
         #: Reiz von a2a ueber BAR1 liegt gerade bei den kleinen
         #: MoE-Dispatchbloecken. 16 Byte = ein Paket.
@@ -1132,9 +1260,41 @@ class HTCCLBar1Transport:
                 f"Die Kollektiv-Erweiterung liess sich nicht uebersetzen: {e}"
             ) from e
 
+        # 0b. Der gepipelinete Kern, wenn er eingeschaltet ist. Ein
+        # fehlgeschlagener Bau schaltet ihn ab, statt den ganzen Transport zu
+        # verlieren -- netz und ring sind davon unberuehrt.
+        if self.pipe_an:
+            from sglang.srt.distributed.device_communicators import (
+                htccl_bar1_pipe_ext,
+            )
+
+            try:
+                self._pipe_ext = htccl_bar1_pipe_ext.lade_pipe_ext(self.cpu_group)
+            except Exception as e:
+                logger.warning(
+                    "HTCCL-BAR1: die gepipelinete Erweiterung liess sich nicht "
+                    "uebersetzen (%s). netz_pipe faellt aus; netz und ring "
+                    "laufen unveraendert weiter.", e,
+                )
+                self.pipe_an = False
+                self._pipe_ext = None
+
         # 1. Speicherordnung. Aus dem Fenster, das der Aufrufer bewilligt,
         # folgt die groesste Nutzlast -- nicht umgekehrt.
-        max_bytes = max_nutzlast(self.welt, self.fenster_bytes, self.a2a_an)
+        if not self.pipe_an or not self.pipe_direkt:
+            self.pipe_erg_ring = 0
+        elif self.pipe_erg_ring < 2:
+            raise Bar1Unverfuegbar(
+                f"SGLANG_HTCCL_BAR1_PIPE_ERG_RING={self.pipe_erg_ring}: der "
+                f"Direkt-Modus braucht mindestens zwei Ergebnispuffer. Mit "
+                f"einem einzigen schriebe Runde n in genau den Puffer, den "
+                f"der Aufrufer aus Runde n-1 noch in der Hand haelt -- ein "
+                f"still ueberschriebener Ergebnistensor, also falsche Zahlen "
+                f"ohne Absturz. Wer den Ring nicht will, schaltet mit "
+                f"SGLANG_HTCCL_BAR1_PIPE_DIREKT=0 den Direkt-Modus ab."
+            )
+        max_bytes = max_nutzlast(self.welt, self.fenster_bytes, self.a2a_an,
+                                 self.pipe_an, self.pipe_erg_ring)
         if max_bytes < self.min_bytes:
             raise Bar1Unverfuegbar(
                 f"Fenster von {self.fenster_bytes // 1024} KiB traegt bei "
@@ -1142,10 +1302,12 @@ class HTCCLBar1Transport:
                 f"Mindestgroesse ist {self.min_bytes}. 4(R-1) Schlitze zu je "
                 f"ceil(N/R) muessen hineinpassen."
             )
-        self._geo = geometrie(self.welt, max_bytes, self.a2a_an)
+        self._geo = geometrie(self.welt, max_bytes, self.a2a_an, self.pipe_an,
+                              self.pipe_erg_ring)
+        self._erg_lebt = [None] * max(0, self.pipe_erg_ring)
         self.max_bytes = max_bytes
         region = self._geo["region_bytes"]
-        flaggen = flaggen_bedarf(self.welt, self.a2a_an)
+        flaggen = flaggen_bedarf(self.welt, self.a2a_an, self.pipe_an)
 
         # 2. Zwei Empfangsregionen, zwei Exporte. Getrennt, weil die Sonde
         # sie getrennt vermessen hat.
@@ -1207,6 +1369,13 @@ class HTCCLBar1Transport:
         # nie von einem Peer angefasst.
         self._runde_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
+        # Absoluter Chunkzaehler des Schiebefensters. Getrennt vom
+        # Rundenzaehler, weil er um K je Aufruf waechst und nur von
+        # netz_pipe fortgeschrieben wird -- er ist der Bezug, gegen den die
+        # head/tail-Zeilen der Peers verglichen werden, und muss deshalb
+        # ueber Aufrufe hinweg absolut bleiben. Rangeinheitlich, weil jeder
+        # Rang dieselbe Folge von Aufrufen mit demselben K sieht.
+        self._schritt_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
 
         dist.barrier(group=self.cpu_group)
         self._auf = True
@@ -1231,7 +1400,8 @@ class HTCCLBar1Transport:
                                   self._geo["region_bytes"])
         try:
             flag = self._binde_region(peer, ziel_bdf, fremde_fds[1], "Flaggen",
-                                      flaggen_bedarf(self.welt, self.a2a_an))
+                                      flaggen_bedarf(self.welt, self.a2a_an,
+                                                     self.pipe_an))
         except BaseException:
             # Die schon gebundene Nutzlastregion wieder los: sie steht noch
             # in keinem PeerZiel und wuerde von close() nicht gefunden.
@@ -1411,7 +1581,7 @@ class HTCCLBar1Transport:
         return self._fenster_minimum
 
     def algorithmus_fuer(self, nbytes: int) -> str:
-        """``netz`` oder ``ring`` fuer diese Groesse.
+        """``netz``, ``netz_pipe`` oder ``ring`` fuer diese Groesse.
 
         Vorrang hat der Plan aus ``htccl_matrix.py``, wenn einer
         hereingereicht wurde (``setze_plan``). Er ist gruppenweit
@@ -1423,13 +1593,24 @@ class HTCCLBar1Transport:
         Netz und Ring in der Sonde 1 bis 7 Prozent auseinander, und der
         Befund dazu sagt ausdruecklich "keine saubere Schwelle -- der
         Planer sollte das messen, nicht einbauen".
+
+        **DIE EINE STELLE, an der netz_pipe gewaehlt wird.** Der Planer
+        kennt ``netz_pipe`` nicht und soll ihn vorerst auch nicht kennen:
+        seine Kostenmodelle sind an den zwei gemessenen Topologien geeicht.
+        Solange ``SGLANG_HTCCL_BAR1_PIPE`` aus ist -- und das ist die
+        Vorgabe --, gibt diese Methode Buchstabe fuer Buchstabe dieselbe
+        Antwort wie bisher.
         """
         if self._plan is not None:
             a = self._plan.algorithmus_fuer(nbytes)
             # 'stern' und 'hierarchisch' sind hier nicht portiert; sie
             # kommen ueber handles() gar nicht bis hierher.
-            return a
-        return "ring" if nbytes >= self.ring_ab else "netz"
+        else:
+            a = "ring" if nbytes >= self.ring_ab else "netz"
+        if (self.pipe_an and a == "netz" and nbytes >= self.pipe_ab
+                and self._pipe_k(nbytes) is not None):
+            return "netz_pipe"
+        return a
 
     def setze_plan(self, plan) -> None:
         """Den Plan des Matrix-Planers uebernehmen.
@@ -1651,9 +1832,11 @@ class HTCCLBar1Transport:
         if groesster_chunk > self._geo["chunk_max"]:
             return False
         algo = self.algorithmus_fuer(nbytes)
-        if algo not in ("netz", "ring"):
+        if algo not in ("netz", "netz_pipe", "ring"):
             # 'stern' und 'hierarchisch' sind hier nicht portiert. Kein
             # stilles Ausweichen auf 'netz'.
+            return False
+        if algo == "netz_pipe" and not self._pipe_traegt(nbytes):
             return False
         # Und derselbe Bedarf noch einmal in der Waehrung des Planers, gegen
         # die gruppenweit KLEINSTE tatsaechlich abgebildete Laenge. Redundant,
@@ -1682,6 +1865,14 @@ class HTCCLBar1Transport:
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
         algo = self.algorithmus_fuer(nbytes)
+        if algo == "netz_pipe":
+            k = self._pipe_k(nbytes)
+            if k is None:
+                raise Bar1Unverfuegbar(
+                    "netz_pipe ohne passende Chunkzahl -- erreichbar nur, "
+                    "wenn jemand handles() umgangen hat."
+                )
+            return self._pipe_all_reduce(inp, k)
         out = torch.empty_like(inp)
         # 'gitter' ist der cooperative Mehrblockstart. Die Schwelle ist
         # gemessen (ab 4 MiB gewinnt er), aber sie ist eine Zahl aus EINEM
@@ -1706,6 +1897,216 @@ class HTCCLBar1Transport:
             int(self.ladeform), int(self.fluss),
         )
         return out
+
+    # -- netz_pipe ---------------------------------------------------------
+    #
+    # Alles, was ueber die Wahl hinausgeht, steht in htccl_bar1_pipe_ext:
+    # der Kern, die Schlitz- und Zaehlergeometrie, die Chunkplanung und der
+    # Byte-Beleg. Hier stehen nur die drei Zeilen, mit denen der Transport
+    # sie einsetzt.
+
+    def _pipe_k(self, nbytes: int):
+        """Chunkzahl fuer diese Nutzlast, oder ``None``.
+
+        Rangeinheitlich: jeder Eingang ist gruppenweit gleich. ``None``
+        heisst "traegt der gepipelinete Weg nicht" und fuehrt in
+        ``handles`` zu False -- nicht zu einem stillen Ausweichen.
+
+        **Gemerkt je Groesse.** ``pipe_plan`` rechnet die Zerlegung ueber
+        alle (Chunk, Rang)-Paare durch -- absichtlich, statt mit einer
+        geschlossenen Zweitfassung --, und das gehoert nicht in den heissen
+        Pfad. ``handles`` und ``htccl_all_reduce`` fragen je Kollektiv; die
+        Groessen wiederholen sich.
+        """
+        if not self.pipe_an or self._pipe_ext is None:
+            return None
+        if self._geo.get("off_pipe", -1) < 0:
+            return None
+        merk = getattr(self, "_pipe_k_merk", None)
+        if merk is None:
+            merk = {}
+            self._pipe_k_merk = merk
+        if nbytes in merk:
+            return merk[nbytes]
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
+            pipe_plan,
+        )
+
+        k = pipe_plan(
+            int(nbytes), int(self.welt), int(self._geo["chunk_max"]),
+            int(self.pipe_t), int(self.pipe_k), int(self.pipe_chunk_bytes),
+            int(self.pipe_k_max),
+        )
+        merk[nbytes] = k
+        return k
+
+    def _pipe_traegt(self, nbytes: int) -> bool:
+        """Fenstergrenze fuer ``netz_pipe`` -- gerechnet, nicht angenommen.
+
+        Der Bedarf ist ``2 T (R-1)`` Schlitze zu je ``chunk_max/T``,
+        gerechnet in ``pipe_fensterbedarf``. Geprueft wird gegen die
+        gruppenweit KLEINSTE **tatsaechlich abgebildete** Laenge
+        (``_fenster_minimum``), nicht gegen die Bruttogroesse aus sysfs und
+        nicht gegen die angeforderte Region: massgeblich ist, was der
+        Halter je Peer wirklich zusammenhaengend in BAR1 vorgefunden hat.
+        Passt es nicht, meldet sich dieser Weg ueber ``handles`` ab.
+        """
+        if not self._pipe_beleg:
+            return False
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
+            erg_ring_bytes,
+            pipe_fensterbedarf,
+        )
+
+        off = int(self._geo.get("off_pipe", -1))
+        if off < 0:
+            return False
+        noetig = off + pipe_fensterbedarf(
+            self.welt, int(self._geo["chunk_max"]), int(self.pipe_t)
+        )
+        # Und der Ergebnisring obendrauf: L * roundup(max_bytes, SEITE). Er
+        # liegt HINTER den Schlitzen, also ist der Bedarf der Versatz des
+        # Rings plus seine Laenge -- nicht das Maximum von beidem.
+        if int(self._geo.get("off_erg", -1)) >= 0:
+            noetig = max(noetig, int(self._geo["off_erg"]) + erg_ring_bytes(
+                int(self.max_bytes), int(self._geo["erg_ring"])
+            ))
+        return noetig <= self._fenster_minimum
+
+    def _erg_platz(self, inp):
+        """Naechster Ergebnispuffer im Ring, als Tensor -- oder ``None``.
+
+        ``None`` heisst "kein Direkt-Modus"; der Aufrufer nimmt dann
+        ``torch.empty_like``. Sichtbar, nicht still.
+
+        **Die Lebensdauerpruefung.** Der Ring vergibt Platz ``i`` reihum.
+        Bevor Platz ``i`` neu beschrieben wird, muss der Tensor, den dieser
+        Platz vor ``L`` Runden herausgegeben hat, tot sein. Geprueft wird
+        das mit einem schwachen Verweis: lebt er noch, haelt ihn jemand, und
+        ihn zu ueberschreiben hiesse, dem Aufrufer unter der Hand andere
+        Zahlen in einen Tensor zu schreiben, den er fuer fertig haelt --
+        falsche Ergebnisse ohne Absturz, der schlimmste denkbare Fehler
+        dieses Vorhabens. Deshalb bricht es hier mit Grund ab und weicht
+        nicht still aus.
+
+        **Was diese Pruefung NICHT abdeckt** und was deshalb hier steht: sie
+        sieht Python-Verweise, nicht laufende Kernel. Solange Ergebnis und
+        Folgeschicht auf DEMSELBEN Strom liegen -- und das tun sie in
+        sglang --, ordnet der Strom die Zugriffe. Wer den Ergebnistensor auf
+        einem anderen Strom weiterverarbeitet, muss selbst synchronisieren;
+        der Direkt-Modus gehoert dann abgeschaltet
+        (``SGLANG_HTCCL_BAR1_PIPE_DIREKT=0``).
+        """
+        import weakref
+
+        if not self.pipe_direkt or self._geo.get("off_erg", -1) < 0:
+            return None
+        ring = int(self._geo["erg_ring"])
+        i = (self._erg_i + 1) % ring
+        alt = self._erg_lebt[i]
+        if alt is not None and alt() is not None:
+            raise Bar1Unverfuegbar(
+                f"Direkt-Modus: der Ergebnispuffer {i} von vor {ring} Runden "
+                f"wird noch gehalten. Ihn jetzt zu beschreiben, hiesse einen "
+                f"Tensor zu veraendern, den der Aufrufer fuer fertig haelt. "
+                f"Entweder den Ring vergroessern "
+                f"(SGLANG_HTCCL_BAR1_PIPE_ERG_RING) oder den Direkt-Modus "
+                f"abschalten (SGLANG_HTCCL_BAR1_PIPE_DIREKT=0). Kein stilles "
+                f"Ausweichen: ein ueberschriebenes Ergebnis faellt sonst "
+                f"nirgends auf."
+            )
+        ptr = (self._eigen[0] + int(self._geo["off_erg"])
+               + i * int(self._geo["erg_stride"]))
+        out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
+        self._erg_lebt[i] = weakref.ref(out)
+        self._erg_i = i
+        return out
+
+    def _pipe_all_reduce(self, inp, k: int):
+        """Ein Aufruf des gepipelineten Kerns. Ausser Ort, wie netz/ring."""
+        import torch
+
+        inp = inp.contiguous()
+        nbytes = inp.numel() * inp.element_size()
+        out = self._erg_platz(inp)
+        direkt = out is not None
+        if not direkt:
+            out = torch.empty_like(inp)
+        kern = 1 if nbytes >= self.gitter_ab else 0
+        peer_nutz = [0] * self.welt
+        peer_flag = [0] * self.welt
+        peer_erg = [0] * self.welt
+        for r, z in self._peers.items():
+            peer_nutz[r] = z.nutz.dev_ptr
+            peer_flag[r] = z.flag.dev_ptr
+        peer_nutz[self.rank] = self._eigen[0]
+        peer_flag[self.rank] = self._eigen_flag[0]
+        if direkt:
+            # DERSELBE Ringplatz bei jedem Rang. Das ist keine Annahme ueber
+            # den Nachbarn, sondern dieselbe SPMD-Voraussetzung, auf der
+            # jedes Kollektiv dieses Moduls steht: alle Raenge sehen
+            # dieselbe Folge von Aufrufen. Der Kern prueft ausserdem, dass
+            # der eigene Eintrag wirklich `out` ist.
+            versatz = (int(self._geo["off_erg"])
+                       + self._erg_i * int(self._geo["erg_stride"]))
+            for r in range(self.welt):
+                peer_erg[r] = peer_nutz[r] + versatz
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
+            pipe_fbasis,
+            pipe_schlitz_bytes,
+        )
+
+        self._pipe_ext.bar1_netz_pipe(
+            inp, out, int(self.rank), int(self.welt),
+            peer_nutz, peer_flag, peer_erg,
+            int(self._eigen[0]), int(self._eigen_flag[0]),
+            int(pipe_schlitz_bytes(int(self._geo["chunk_max"]), int(self.pipe_t))),
+            int(self._geo["off_pipe"]),
+            int(pipe_fbasis(self.welt, self.a2a_an)),
+            int(k), int(self.pipe_t), int(self.pipe_quittung),
+            1 if direkt else 0,
+            self._runde_dev, self._schritt_dev, self._ctl_dev,
+            int(self.deckel_zyklen), int(self.threads), int(kern),
+            int(self.ladeform),
+        )
+        return out
+
+    def byte_beleg_pipe(self, runden: int = 0) -> bool:
+        """Byte-Beleg fuer ``netz_pipe``. Ohne ihn meldet sich der Weg ab.
+
+        Getrennt von ``byte_beleg_alle``, weil er etwas anderes prueft: der
+        Paarbeleg zeigt, dass Bytes ankommen; dieser zeigt, dass die
+        Schlitz-Wiederverwendung ueber mehrere Runden traegt. Der zweite
+        Punkt ist der gefaehrlichere, und er faellt in einer Einzelrunde
+        nicht auf.
+        """
+        from sglang.srt.distributed.device_communicators import (
+            htccl_bar1_pipe_ext,
+        )
+
+        if not self.pipe_an or self._pipe_ext is None:
+            self._pipe_beleg = False
+            return False
+        # Vorlaeufig durchlassen, damit der Beleg selbst laufen kann; die
+        # endgueltige Antwort steht unten. `handles` fragt waehrenddessen
+        # niemand -- der Beleg laeuft beim Aufbau, vor dem ersten Kollektiv.
+        self._pipe_beleg = True
+        try:
+            ok = htccl_bar1_pipe_ext.byte_beleg_pipe(self, runden)
+        except Exception as e:
+            logger.warning(
+                "HTCCL-BAR1-PIPE: der Byte-Beleg ist mit %r abgebrochen. "
+                "netz_pipe meldet sich ab; netz und ring bleiben unberuehrt.",
+                e,
+            )
+            ok = False
+        self._pipe_beleg = bool(ok)
+        if not ok:
+            logger.warning(
+                "HTCCL-BAR1-PIPE: Byte-Beleg nicht bestanden -- netz_pipe "
+                "meldet sich ueber handles() ab."
+            )
+        return self._pipe_beleg
 
     # -- all_to_all --------------------------------------------------------
 
@@ -1761,7 +2162,8 @@ class HTCCLBar1Transport:
         return groesster_block <= int(self._geo.get("a2a_schlitz", 0))
 
     def htccl_all_to_all_single(self, comm, output, inp,
-                                sende_bytes, empfangs_bytes):
+                                sende_bytes, empfangs_bytes,
+                                sende_versatz=None, empfangs_versatz=None):
         """``all_to_all_single`` ueber den Direktpfad. Ein Schritt, eine Sperre.
 
         ``sende_bytes[j]`` ist der Block, der an Rang ``j`` geht,
@@ -1770,6 +2172,18 @@ class HTCCLBar1Transport:
         Bytes: es gibt keine Reduktion, also keinen Datentyp. fp8, bf16,
         int32, uint8 laufen denselben Weg, und die fehlenden
         fp8-Umwandlungsbefehle der sm_86-Karten sind hier gegenstandslos.
+
+        ``sende_versatz`` / ``empfangs_versatz`` sind **optional** und in
+        Byte. ``None`` heisst: die Praefixsumme der Laengen, also die
+        lueckenlose Aneinanderreihung, die ``torch.distributed.
+        all_to_all_single`` meint -- Byte fuer Byte der bisherige Weg.
+        Angegeben werden sie von einem Aufrufer, der aus EINEM stehenden
+        Puffer nur ein Stueck je Block bewegen will, ohne vorher umzukopieren:
+        genau das braucht der MoE-Dispatcher, wenn ein Block groesser ist als
+        der Schlitz und deshalb ueber mehrere Runden geht. Der Kernel selbst
+        kennt beide Faelle schon -- er bekommt Versaetze und Laengen getrennt
+        herein und hat nie angenommen, dass sie zusammenhaengen; nur diese
+        Naht hat die Versaetze bisher selbst gerechnet.
 
         Der Aufrufer haftet dafuer, dass ``empfangs_bytes[i]`` auf diesem
         Rang gleich ``sende_bytes[rang]`` auf Rang ``i`` ist. Die Erweiterung
@@ -1793,14 +2207,30 @@ class HTCCLBar1Transport:
         if not output.is_contiguous():
             raise Bar1Unverfuegbar("Ausgabepuffer ist nicht zusammenhaengend")
 
-        sende_off, s = [], 0
-        for n in sende_bytes:
-            sende_off.append(s)
-            s += int(n)
-        empf_off, e = [], 0
-        for n in empfangs_bytes:
-            empf_off.append(e)
-            e += int(n)
+        if sende_versatz is None:
+            sende_off, s = [], 0
+            for n in sende_bytes:
+                sende_off.append(s)
+                s += int(n)
+        else:
+            if len(sende_versatz) != R:
+                raise Bar1Unverfuegbar(
+                    f"sende_versatz hat Laenge {len(sende_versatz)}, "
+                    f"erwartet sind {R}."
+                )
+            sende_off = [int(x) for x in sende_versatz]
+        if empfangs_versatz is None:
+            empf_off, e = [], 0
+            for n in empfangs_bytes:
+                empf_off.append(e)
+                e += int(n)
+        else:
+            if len(empfangs_versatz) != R:
+                raise Bar1Unverfuegbar(
+                    f"empfangs_versatz hat Laenge {len(empfangs_versatz)}, "
+                    f"erwartet sind {R}."
+                )
+            empf_off = [int(x) for x in empfangs_versatz]
 
         # Der cooperative Mehrblockstart lohnt sich nach derselben Schwelle
         # wie bei all_reduce -- gemessen ist sie DORT und nur dort; hier ist
@@ -2075,6 +2505,7 @@ class HTCCLBar1Transport:
                     setattr(self, eig, (0, 0, 0))
         self._runde_dev = None
         self._ctl_dev = None
+        self._schritt_dev = None
 
 
 def baue_bar1(cpu_group, device, fenster_bytes: int) -> Optional[HTCCLBar1Transport]:
@@ -2123,4 +2554,17 @@ def baue_bar1(cpu_group, device, fenster_bytes: int) -> Optional[HTCCLBar1Transp
                 "HTCCL-BAR1: a2a-Byte-Beleg nicht durchfuehrbar -- %r. "
                 "all_to_all meldet sich ab, all_reduce laeuft weiter.", e,
             )
+        # Und derselbe Grundsatz noch einmal fuer netz_pipe: eigener Kern,
+        # eigene Schlitze, eigene Zaehlerzeilen, also eigener Beleg -- und
+        # zwar einer ueber MEHRERE Runden, weil die Schlitz-Wiederverwendung
+        # in einer Einzelrunde gar nicht drankommt. Faellt er, bleiben netz
+        # und ring verfuegbar.
+        if t.pipe_an:
+            try:
+                t.byte_beleg_pipe()
+            except Exception as e:
+                logger.info(
+                    "HTCCL-BAR1: pipe-Byte-Beleg nicht durchfuehrbar -- %r. "
+                    "netz_pipe meldet sich ab, netz und ring laufen weiter.", e,
+                )
     return t
