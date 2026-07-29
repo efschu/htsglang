@@ -1,0 +1,134 @@
+{
+ "schema_version": 3,
+ "kind": "capability_matrix",
+ "timestamp": "2026-07-29T23:21:10.818407",
+ "host": "RIG",
+ "versions": {
+  "driver": "595.58.03",
+  "nccl": "2.28.9",
+  "torch": "2.11.0+cu130"
+ },
+ "devices": [
+  {
+   "pci_bus_id": "0000:05:00.0",
+   "name": "NVIDIA GeForce RTX 3080",
+   "uuid": "GPU-00000000-0000-0000-0000-000000000000",
+   "nvml_index": 0,
+   "cuda_index": 0,
+   "vram_total_bytes": 21474836480,
+   "bar1_total_bytes": 268435456,
+   "bar1_classification": "windowed"
+  },
+  {
+   "pci_bus_id": "0000:0a:00.0",
+   "name": "NVIDIA GeForce RTX 5090",
+   "uuid": "GPU-00000001-0000-0000-0000-000000000000",
+   "nvml_index": 1,
+   "cuda_index": 1,
+   "vram_total_bytes": 34190917632,
+   "bar1_total_bytes": 34359738368,
+   "bar1_classification": "full"
+  },
+  {
+   "pci_bus_id": "0000:0b:00.0",
+   "name": "NVIDIA GeForce RTX 3080",
+   "uuid": "GPU-00000002-0000-0000-0000-000000000000",
+   "nvml_index": 2,
+   "cuda_index": 2,
+   "vram_total_bytes": 21474836480,
+   "bar1_total_bytes": 268435456,
+   "bar1_classification": "windowed"
+  }
+ ],
+ "lspci": {
+  "0000:05:00.0": {
+   "raw_region_sizes": [
+    268435456,
+    33554432,
+    16777216
+   ]
+  },
+  "0000:0a:00.0": {
+   "raw_region_sizes": [
+    34359738368,
+    67108864,
+    33554432
+   ]
+  },
+  "0000:0b:00.0": {
+   "raw_region_sizes": [
+    268435456,
+    33554432,
+    16777216
+   ]
+  }
+ },
+ "topo_raw": "\t\u001b[4mGPU0\tGPU1\tGPU2\tNIC0\tNIC1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPHB\tPHB\tPIX\tPIX\t0-31\t0\t\tN/A\nGPU1\tPHB\t X \tPHB\tPHB\tPHB\t0-31\t0\t\tN/A\nGPU2\tPHB\tPHB\t X \tPHB\tPHB\t0-31\t0\t\tN/A\nNIC0\tPIX\tPHB\tPHB\t X \tPIX\t\t\t\t\n",
+ "directed_pairs": [
+  {
+   "src_pci": "0000:05:00.0",
+   "dst_pci": "0000:0a:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 34359738368,
+   "dst_bar1_classification": "full",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  },
+  {
+   "src_pci": "0000:05:00.0",
+   "dst_pci": "0000:0b:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 268435456,
+   "dst_bar1_classification": "windowed",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  },
+  {
+   "src_pci": "0000:0a:00.0",
+   "dst_pci": "0000:05:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 268435456,
+   "dst_bar1_classification": "windowed",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  },
+  {
+   "src_pci": "0000:0a:00.0",
+   "dst_pci": "0000:0b:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 268435456,
+   "dst_bar1_classification": "windowed",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  },
+  {
+   "src_pci": "0000:0b:00.0",
+   "dst_pci": "0000:05:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 268435456,
+   "dst_bar1_classification": "windowed",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  },
+  {
+   "src_pci": "0000:0b:00.0",
+   "dst_pci": "0000:0a:00.0",
+   "can_access_peer": false,
+   "dst_bar1_nominal_bytes": 34359738368,
+   "dst_bar1_classification": "full",
+   "effective_max_single_copy_bytes": null,
+   "effective_max_region_chunked_bytes": null,
+   "probe_errors": []
+  }
+ ],
+ "notes": [
+  "bar1_total_bytes is the NOMINAL upper bound; consumers must use effective_max_* only",
+  "probe_errors are measurements (aperture limits), not failures"
+ ],
+ "_fixture_provenance": "gekuerzte, anonymisierte Kopie eines echten Laufs (gpu-battery-results/2026-07-30_bar1/s01_p2p_reprobe) -- Struktur stammt aus scripts/p2p_readiness/, nicht aus einer Vorstellung davon"
+}

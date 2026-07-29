@@ -90,6 +90,13 @@ def placeholder_profile(name: str, source: str = "missing source") -> PathProfil
 P2P_CAPABILITY_KIND = "capability_matrix"
 P2P_D2D_KIND = "d2d_bench"
 
+# capability_matrix.py writes its ordered rows under "directed_pairs". The
+# legacy name is still read so an older artifact stays loadable, but a payload
+# carrying NEITHER key is an error rather than an empty result: a silently
+# empty aperture table leaves every direct path unbounded and is
+# indistinguishable from "this rig has no P2P".
+P2P_CAPABILITY_ROW_KEYS = ("directed_pairs", "pairs")
+
 
 def _check_envelope(payload: dict, expected_kind: str, res: LoadResult) -> bool:
     if not isinstance(payload, dict):
@@ -108,22 +115,42 @@ def _check_envelope(payload: dict, expected_kind: str, res: LoadResult) -> bool:
     return True
 
 
+def capability_matrix_rows(payload: dict) -> Tuple[str, List[dict]]:
+    """(key, rows) for a capability matrix, or ("", []) when it carries none.
+
+    One place knows what the producer calls its rows, so a consumer cannot
+    quietly read a key that was never written.
+    """
+    for key in P2P_CAPABILITY_ROW_KEYS:
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return key, rows
+    return "", []
+
+
 def load_p2p_capability_matrix(payload: dict) -> LoadResult:
     """Effective apertures per directed pair. NOMINAL fields
     (``dst_bar1_nominal_bytes`` etc.) are ignored by design."""
     res = LoadResult()
     if not _check_envelope(payload, P2P_CAPABILITY_KIND, res):
         return res
-    for i, row in enumerate(payload.get("pairs", [])):
+    key, rows = capability_matrix_rows(payload)
+    if not key:
+        res.errors.append(
+            f"{P2P_CAPABILITY_KIND}: no rows under any of "
+            f"{P2P_CAPABILITY_ROW_KEYS} (keys present: {sorted(payload)})"
+        )
+        return res
+    for i, row in enumerate(rows):
         src = row.get("src_pci")
         dst = row.get("dst_pci")
         if not src or not dst:
-            res.errors.append(f"pairs[{i}]: missing src_pci/dst_pci")
+            res.errors.append(f"{key}[{i}]: missing src_pci/dst_pci")
             continue
         eff = row.get("effective_max_single_copy_bytes")
         if eff is None:
             res.skipped.append(
-                f"pairs[{i}] {src}->{dst}: no effective aperture measured "
+                f"{key}[{i}] {src}->{dst}: no effective aperture measured "
                 "(nominal-only rows are not consumed)"
             )
             continue

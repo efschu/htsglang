@@ -121,7 +121,10 @@ def main() -> int:
         "kind": "offload_register_gpu",
         "schema_version": 1,
         "timestamp": datetime.datetime.now().isoformat(),
-        "device_ops": "CudaDeviceOps",
+        # Filled from the object that is actually built further down. A literal
+        # here would make the check that guards against a FakeDeviceOps fallback
+        # assert its own constant.
+        "device_ops": None,
         "device": {
             "cuda_index": big,
             "name": props.name,
@@ -154,6 +157,7 @@ def main() -> int:
         payload["memory_saver"] = f"unavailable: {exc!r}"
 
     device_ops = CudaDeviceOps(memory_saver_adapter=saver)
+    payload["device_ops"] = type(device_ops).__name__
     policies = resolve_class_policies("auto")
     backend = RealMovementBackend(
         device_ops=device_ops,

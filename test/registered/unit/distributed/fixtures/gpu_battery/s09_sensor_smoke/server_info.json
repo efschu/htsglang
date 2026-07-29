@@ -1,0 +1,19 @@
+{
+ "gdn_state_set_ladder": null,
+ "gdn_state_set_ladder_hysteresis": 2,
+ "kv_pressure_ladder": null,
+ "kv_pressure_pre_stage": false,
+ "version": "0.0.0.dev15138+g3dbdb6473",
+ "internal_states": [
+  {
+   "memory_usage": {
+    "weight": 12.63,
+    "kvcache": 6.49,
+    "token_capacity": 453632,
+    "graph": 0.62
+   },
+   "last_gen_throughput": 85.77322296118592
+  }
+ ],
+ "_fixture_provenance": "gekuerzte Kopie von gpu-battery-results/2026-07-30_bar1/s02_boot_a/server_info.json -- Antwort eines echten /get_server_info"
+}

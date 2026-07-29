@@ -429,11 +429,11 @@ class TestRefineTransportChoice(CustomTestCase):
 class TestP2PReadinessParsers(CustomTestCase):
     """Source 1: only EFFECTIVE values are consumed."""
 
-    def _capability_payload(self):
+    def _capability_payload(self, rows_key="directed_pairs"):
         return {
             "schema_version": 3,
             "kind": "capability_matrix",
-            "pairs": [
+            rows_key: [
                 {
                     "src_pci": "01:00.0",
                     "dst_pci": "05:00.0",
@@ -462,6 +462,23 @@ class TestP2PReadinessParsers(CustomTestCase):
         res = load_p2p_capability_matrix({"kind": "d2d_bench", "schema_version": 3})
         self.assertFalse(res.apertures)
         self.assertTrue(res.errors)
+
+    def test_capability_matrix_legacy_pairs_key(self):
+        """Older artifacts wrote "pairs"; they stay loadable."""
+        res = load_p2p_capability_matrix(self._capability_payload(rows_key="pairs"))
+        self.assertEqual(res.apertures, {("01:00.0", "05:00.0"): 224 * MIB})
+
+    def test_capability_matrix_without_any_row_key_is_an_error(self):
+        """The defect this guards: the loader read a key the producer had
+        never written and returned zero apertures, zero errors and zero skips.
+        A rig with no P2P looks exactly like that, so nothing downstream --
+        not the dispatcher, not the s08 check -- could tell the two apart."""
+        res = load_p2p_capability_matrix(
+            {"kind": "capability_matrix", "schema_version": 3, "rows": []}
+        )
+        self.assertFalse(res.apertures)
+        self.assertTrue(res.errors)
+        self.assertIn("directed_pairs", res.errors[0])
 
     def test_d2d_bench_profiles_and_error_points(self):
         payload = {
@@ -660,7 +677,7 @@ class TestLoadRateTables(CustomTestCase):
                     {
                         "schema_version": 3,
                         "kind": "capability_matrix",
-                        "pairs": [
+                        "directed_pairs": [
                             {
                                 "src_pci": "01:00.0",
                                 "dst_pci": "05:00.0",

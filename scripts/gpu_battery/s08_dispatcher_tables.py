@@ -74,6 +74,7 @@ def main() -> int:
         PathProfile,
     )
     from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+        capability_matrix_rows,
         load_rate_tables,
     )
 
@@ -82,16 +83,15 @@ def main() -> int:
 
     # How many directed pairs can do peer access at all. Without a single one
     # there are legitimately no apertures, and demanding some would turn "this
-    # rig has no P2P" -- a fully recorded outcome -- into a failure.
+    # rig has no P2P" -- a fully recorded outcome -- into a failure. The row key
+    # comes from the loader so this counter cannot drift away from the producer
+    # and disarm the aperture gate in check_s08 by always counting zero.
     peer_pairs = 0
     if os.path.exists(cap):
         try:
             with open(cap) as f:
-                peer_pairs = sum(
-                    1
-                    for row in (json.load(f).get("pairs") or [])
-                    if row.get("can_access_peer")
-                )
+                _, cap_rows = capability_matrix_rows(json.load(f))
+            peer_pairs = sum(1 for row in cap_rows if row.get("can_access_peer"))
         except (OSError, json.JSONDecodeError):
             peer_pairs = 0
 
