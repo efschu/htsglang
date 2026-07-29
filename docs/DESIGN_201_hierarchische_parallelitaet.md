@@ -1987,3 +1987,46 @@ Quantisierung #126) steht den Register-Klassen strukturell offen, wo sie
 sinnvoll ist. Einbau: der Offload-Slice beginnt mit einem kurzen
 Schnittstellen-Audit des Experten-Offloads (was ist heute schon generisch,
 was expertenspezifisch) statt mit Neubau.
+
+Nachtrag-13-Ergaenzung 7c (Nutzer 2026-07-29, Phasen-Multiplexing):
+Die naechste Verallgemeinerung nach der Zeitachse: auch INNERHALB einer
+Runde wird fast nie alles gleichzeitig gebraucht. Beispiel des Nutzers:
+nachdem der Drafter gelaufen ist, ist sein ganzer VRAM fuer den Rest der
+Runde "frei" — darauf koennte man zurueckholen, was der Verify-Schritt
+braucht. Das gilt fuer JEDE Lastverteilung: der Arbeits-Satz je Schritt
+ist eine Teilmenge des Residenten; alles ausserhalb ist waehrenddessen
+voll oder teilweise ("so weit man eben moechte") in den System-RAM
+auslagerbar. Damit hat das Register DREI ZEITKONSTANTEN-STUFEN derselben
+Mechanik:
+  Stufe 1 SCHICHT/WELLE (ms, Bestand): Experten-Streaming je Layer hinter
+    Compute (#125-Double-Buffer, #254-Wellenordnung) — der Beweis, dass
+    Phasen-Multiplexing bei richtigem Overlap funktioniert (6601-Tok-
+    Prefill 3,38 s statt >55 min).
+  Stufe 2 PHASE (10-100 ms, NEU): Posten tragen eine PHASEN-NUTZUNGS-MASKE
+    (draft | verify | prefill | ...); der Register-Scheduler waved aus, was
+    die naechste Phase nicht braucht, und holt hinter dem Compute der
+    laufenden Phase zurueck, was die naechste braucht — exakt die
+    #125-Mechanik, nur mit Phasen- statt Layer-Granularitaet. Das
+    subsumiert die "phasen-multiplexten VRAM-Slots" aus #140.
+  Stufe 3 TURN/HYSTERESE (s, Ergaenzung 7): kalte Sprossen, inaktiver
+    Drafter, idle-Lane-Workspaces, kalte Lane.
+EHRLICHE PHYSIK (Pflicht im Design, damit niemand Stufe 2 als Freibrief
+liest): Budget je Phase ist bytes_bewegt / PCIe-Rate vs. versteckbare
+Compute-Zeit der Nachbarphase. Auf diesem Rig (x8/x4-Slots, kein P2P) sind
+das grob 12-25 GB/s — ein 1,8-GB-Drafter je Runde hin UND zurueck ist bei
+~25-30 ms Rundenzeit NICHT versteckbar (>=140 ms Draht), wohl aber kleine
+Posten (Workspaces, einzelne Sprossen-States, Aktivierungs-Puffer) oder
+grosse Posten bei LANGEN Phasen (Prefill-Chunks, grosse Verify-Batches,
+Experten-Wellen). Der Regler "wie tief" ist deshalb je Klasse ein ANTEIL
+(0..voll), und die auto-Politik nimmt nur mit, was die gemessene
+Overlap-Rechnung traegt — dieselbe Messpflicht wie in Ergaenzung 7, jetzt
+je (Klasse, Phase). Mehrdimensional zum Preis anderer Dimensionen: was
+Stufe 2 an residentem VRAM spart (mehr KV/max-Token), bezahlt es mit
+PCIe-Auslastung, die sonst Experten-Streaming oder KV-Spill (#134/#236)
+gehoert — der Bus wird damit selbst ein budgetierter Posten, den die
+Politik zwischen den Verbrauchern aufteilt (gleiche Klammer wie das
+Saettigungssignal aus 13e/#279, das kuenftig auch die PCIe-Seite kennt).
+API-Konsequenz fuer die CPU-Phase (#286): die Posten-Registrierung
+traegt die Phasen-Nutzungs-Maske und die Zeitkonstanten-Stufe von Anfang
+an (Schnittstelle jetzt, Bewegung spaeter); der Scheduler-Hook fuer
+Stufe 2 bleibt in der CPU-Phase ein No-Op.
