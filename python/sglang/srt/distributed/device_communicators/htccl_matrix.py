@@ -90,6 +90,7 @@ import logging
 import math
 import os
 import pathlib
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -211,6 +212,11 @@ def _pruefe_schluessel(gegeben: Iterable[str], erlaubt: set[str], wo: str) -> No
             f"in der Konfiguration ist genau die Sorte Fehler, nach der man "
             f"spaeter Leistung sucht, die per Konfiguration abgeschaltet war.)"
         )
+
+
+#: Eine PCI-Adresse, mit oder ohne Domaene. Dient als Probe gegen alles,
+#: was nur wie eine aussieht (etwa eine blosse Busnummer).
+_IST_BDF = re.compile(r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
 
 
 def _norm_bdf(s: str) -> str:
@@ -2257,12 +2263,21 @@ def bdf_der_karte(device) -> str:
     ordinal = device.index if hasattr(device, "index") else int(device)
     if ordinal is None:
         ordinal = torch.cuda.current_device()
-    # Bevorzugt der Weg ohne ctypes, wenn torch ihn anbietet.
+    # Zuerst ohne ctypes, wenn torch die Felder anbietet. ACHTUNG:
+    # `props.pci_bus_id` ist die BUSNUMMER als int (aus cudaDeviceProp.pciBusID),
+    # NICHT die Adresszeichenkette -- str() darauf ergibt "10" und damit einen
+    # sysfs-Pfad, den es nicht gibt. Die Adresse entsteht erst aus Domaene,
+    # Bus und Slot; eine Funktionsnummer fuehrt cudaDeviceProp nicht, GPUs
+    # sitzen auf .0.
     try:
         props = torch.cuda.get_device_properties(ordinal)
-        bus_id = getattr(props, "pci_bus_id", None)
-        if bus_id:
-            return _norm_bdf(str(bus_id))
+        dom = getattr(props, "pci_domain_id", None)
+        bus = getattr(props, "pci_bus_id", None)
+        slot = getattr(props, "pci_device_id", None)
+        if isinstance(bus, str) and _IST_BDF.match(bus.strip()):
+            return _norm_bdf(bus)
+        if None not in (dom, bus, slot):
+            return _norm_bdf(f"{int(dom):04x}:{int(bus):02x}:{int(slot):02x}.0")
     except Exception:
         pass
     try:

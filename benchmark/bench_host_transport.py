@@ -91,6 +91,8 @@ HTCCL_BACKENDS = {
     "htccl:host": ("host", "HTCCLHostTransport"),
     "htccl:device": ("device", "HTCCLDeviceTransport"),
     "htccl:shm": ("shm", "HTCCLShmTransport"),
+    "htccl:bar1": ("bar1", "HTCCLBar1Transport"),
+    "htccl:matrix": ("matrix", "HTCCLMatrixTransport"),
 }
 DEFAULT_BACKENDS = "htccl:host,nccl"
 

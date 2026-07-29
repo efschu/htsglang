@@ -300,7 +300,14 @@ class _Cuda:
         return int(fd.value)
 
     def memset_d8(self, dptr: int, wert: int, n: int) -> None:
-        self._d("cuMemsetD8", ctypes.c_ulonglong(dptr), ctypes.c_ubyte(wert),
+        # ``cuMemsetD8_v2``, NICHT ``cuMemsetD8``. In cuda.h ist der kurze
+        # Name ein Makro auf die _v2-Form; ueber dlsym/ctypes bekommt man
+        # dagegen den alten ABI-Einsprung mit 32-Bit-CUdeviceptr, und der
+        # antwortet auf einem heutigen Treiber mit 201 (invalid device
+        # context) -- auch wenn ein Kontext aktuell ist (nachgemessen:
+        # cuCtxGetCurrent liefert einen gueltigen Kontext, cuMemsetD8 -> 201,
+        # cuMemsetD8_v2 -> 0). Das gilt fuer jede _v2-Funktion der Treiber-API.
+        self._d("cuMemsetD8_v2", ctypes.c_ulonglong(dptr), ctypes.c_ubyte(wert),
                 ctypes.c_size_t(n))
 
     def dmabuf_fd(self, dptr: int, handle: int, groesse: int,
@@ -466,7 +473,46 @@ class Halter:
         und ``nv_dma_map_peer`` greift auf ``->resource[]`` zu
         (nv-dma.c:749); ein Geraet ohne eingebettetes ``struct pci_dev``
         wuerde dort ausserhalb des Objekts lesen.
+
+        Zwei Durchgaenge, falls noetig: das Modul traegt die WAHRE Zahl der
+        sg-Eintraege in ``arg.nents`` ein, kopiert aber hoechstens
+        ``max_entries`` davon heraus (dmabuf_holder.c:216). Eine
+        abgeschnittene Tabelle sieht aus wie eine kurze zusammenhaengende
+        Strecke -- der Aufbau scheiterte dadurch an einer Fenstergrenze, die
+        es gar nicht gibt. Wer mehr Eintraege meldet als hineinpassten,
+        bekommt einen zweiten Halt mit passendem Puffer; der erste bleibt
+        so lange stehen, damit die BAR1-Abbildung dazwischen nie faellt.
         """
+        handle_, eintraege, total_len, nents = self._halte_einmal(
+            dmabuf_fd, bdf, max_eintraege
+        )
+        if nents > max_eintraege:
+            alt = handle_
+            try:
+                handle_, eintraege, total_len, nents2 = self._halte_einmal(
+                    dmabuf_fd, bdf, nents
+                )
+            finally:
+                self.gib_frei(alt)
+            if nents2 > nents:
+                self.gib_frei(handle_)
+                raise Bar1Unverfuegbar(
+                    f"Der Halter meldet {nents2} sg-Eintraege, angefordert "
+                    f"waren {nents} -- die Tabelle waechst zwischen zwei "
+                    f"Haltevorgaengen. Ohne vollstaendige Tabelle ist die "
+                    f"zusammenhaengende Laenge nicht bestimmbar."
+                )
+        if not eintraege:
+            raise Bar1Unverfuegbar(
+                "Der Halter meldet 0 sg-Eintraege -- die Abbildung ist leer. "
+                "Ohne sg-Adresse ist der BAR1-Versatz nicht bestimmbar; der "
+                "Musterscan waere der Rueckfall, er gehoert aber nicht in "
+                "einen Transport."
+            )
+        return handle_, eintraege, total_len
+
+    def _halte_einmal(self, dmabuf_fd: int, bdf: str,
+                      max_eintraege: int) -> tuple[int, list[SgEintrag], int, int]:
         dom, bus, slot, func = _zerlege_bdf(bdf)
         puffer = ctypes.create_string_buffer(16 * max_eintraege)
         arg = bytearray(struct.pack(
@@ -485,20 +531,14 @@ class Halter:
             ) from e
         werte = struct.unpack(_HOLD_FMT, bytes(arg))
         handle_, nents, _dmabuf_size, total_len = werte[10], werte[11], werte[12], werte[13]
+        self._handles.append(handle_)
         eintraege = []
-        roh = bytes(puffer.raw[: 16 * min(nents, max_eintraege)])
-        for i in range(min(nents, max_eintraege)):
+        gueltig = min(nents, max_eintraege)
+        roh = bytes(puffer.raw[: 16 * gueltig])
+        for i in range(gueltig):
             a, l = struct.unpack_from("=QQ", roh, 16 * i)
             eintraege.append(SgEintrag(a, l))
-        self._handles.append(handle_)
-        if not eintraege:
-            raise Bar1Unverfuegbar(
-                "Der Halter meldet 0 sg-Eintraege -- die Abbildung ist leer. "
-                "Ohne sg-Adresse ist der BAR1-Versatz nicht bestimmbar; der "
-                "Musterscan waere der Rueckfall, er gehoert aber nicht in "
-                "einen Transport."
-            )
-        return handle_, eintraege, int(total_len)
+        return handle_, eintraege, int(total_len), int(nents)
 
     def gib_frei(self, handle_: int) -> None:
         # Aus der Liste nehmen, BEVOR der Ioctl laeuft: sonst gibt
@@ -958,7 +998,10 @@ class HTCCLBar1Transport:
         try:
             with open("/proc/driver/nvidia/params") as f:
                 for z in f:
-                    if z.startswith("RegistryDwords"):
+                    # Genau "RegistryDwords:" -- nicht "RegistryDwordsPerDevice:",
+                    # das sonst als spaetere Zeile die echte ueberschreibt und
+                    # einen gesetzten Regkey als leer meldet.
+                    if z.startswith("RegistryDwords:"):
                         aus["regkeys"] = z.strip()
         except OSError:
             pass
@@ -1194,14 +1237,45 @@ class HTCCLBar1Transport:
             abb.close()
             self._halter.gib_frei(handle_)
             ps = self.patchstand()
+            if not ps["smallbar_p2p_peerbar1"]:
+                grund = (
+                    f"Das ist der erwartete Ausgang OHNE den geweiteten Guard: "
+                    f"der Regkey RMSmallBarP2PPeerBar1 hat die Vorgabe 0 und "
+                    f"muss ueber NVreg_RegistryDwords gesetzt werden. "
+                    f"Gefunden: {ps['regkeys'] or '<leer>'}."
+                )
+            else:
+                # Der Regkey steht. Dann ist der Guard NICHT mehr der
+                # wahrscheinliche Ablehner -- und die Verwechslung war teuer.
+                # Vor dem Bereichs-Guard sitzt in
+                # osCreateOsDescriptorFromIoMemory eine zweite Huerde: der
+                # Zweig _PEER_MAP_OVERRIDE_REQUIRED verlangt
+                # peerMappingOverride ODER osIsAdministrator(), und
+                # osIsAdministrator() ist auf Linux capable(CAP_SYS_ADMIN)
+                # (os-interface.c:380 -> nv-linux.h:499). Ein Docker-Container
+                # laeuft als root, hat CAP_SYS_ADMIN aber NICHT in der
+                # Vorgabemenge -- der Aufruf scheitert dann als
+                # NV_ERR_INSUFFICIENT_PERMISSIONS, was hier als cudaError 800
+                # (cudaErrorNotPermitted) ankommt.
+                grund = (
+                    f"Der Regkey steht ({ps['regkeys']}), der Bereichs-Guard "
+                    f"ist es also nicht. Naechster Verdacht in dieser "
+                    f"Reihenfolge: (1) CAP_SYS_ADMIN fehlt dem Prozess -- "
+                    f"osCreateOsDescriptorFromIoMemory verlangt im Zweig "
+                    f"_PEER_MAP_OVERRIDE_REQUIRED entweder "
+                    f"peerMappingOverride oder osIsAdministrator(), und das "
+                    f"ist capable(CAP_SYS_ADMIN); im Container also "
+                    f"'--cap-add SYS_ADMIN' bzw. NVreg_RegistryDwords um "
+                    f"PeerMappingOverride=1 ergaenzen. (2) der Bereich liegt "
+                    f"nicht vollstaendig in der BAR1-Apertur des Peers. "
+                    f"Welcher von beiden es war, sagt das Kernellog "
+                    f"eindeutig: 'permission denied, allowPeermapping=0' "
+                    f"gegen 'SMALLBAR_P2P: DENY ...'."
+                )
             raise Bar1Unverfuegbar(
                 f"cudaHostRegister(IoMemory) auf die {was}region von Rang "
-                f"{peer} ({ziel_bdf}) fehlgeschlagen: {e}. Das ist der erwartete "
-                f"Ausgang OHNE den geweiteten Guard: der Regkey "
-                f"RMSmallBarP2PPeerBar1 hat die Vorgabe 0 und muss ueber "
-                f"NVreg_RegistryDwords gesetzt werden. Gefunden: "
-                f"{ps['regkeys'] or '<leer>'}. Der Transport meldet sich ab, "
-                f"er erzwingt nichts."
+                f"{peer} ({ziel_bdf}) fehlgeschlagen: {e}. {grund} "
+                f"Der Transport meldet sich ab, er erzwingt nichts."
             ) from e
         dev = self._cuda.dev_ptr(host - vorlauf)
         return Abbildung(
@@ -1318,7 +1392,15 @@ class HTCCLBar1Transport:
                     self._cuda.memcpy(rueck.data_ptr(), self._eigen[0], n)
                     schlecht = int((rueck != marke).sum().item())
                     ok = schlecht == 0
-                    if not ok:
+                    if ok:
+                        # Auch der bestandene Beleg gehoert ins Protokoll:
+                        # "0 von N Byte falsch" ist die Aussage, auf der jede
+                        # spaetere Zeitmessung steht.
+                        logger.info(
+                            "HTCCL-BAR1: Byte-Beleg %d->%d bestanden: 0 von "
+                            "%d Byte falsch.", quelle, ziel, n,
+                        )
+                    else:
                         logger.warning(
                             "HTCCL-BAR1: Byte-Beleg %d->%d GEFALLEN: %d von %d "
                             "Byte falsch. Diese Kante wird gestrichen, "
