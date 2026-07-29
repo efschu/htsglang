@@ -1802,3 +1802,18 @@ anderen ~einen Flip; ihre Telemetrie liefert nebenbei den Inhaltssplit, der
 die Coding-Hypothese bestaetigt oder kippt. Einbau: R7b (vor dem A/B aus
 Ergaenzung 1 als einfachste Politik; der Bandit bleibt Option fuer
 Regime-Wechsel INNERHALB langer Sessions).
+
+Nachtrag-13-Korrektur (Nutzer 2026-07-29): Die Aussage in Ergaenzung 2, die
+Task-Typ-Achse sei ungemessen, war FALSCH — Code vs Prosa wurde gemessen,
+und DFLASH ist auf PROSA ultra schlecht. Zweitens hat der Laengen-Abfall
+eine KAUSALE Erklaerung: der DFLASH-Drafter wurde nur bis Kontext 4096
+trainiert, dahinter flacht die Acceptance ab (das erklaert +6 % @4k /
+Paritaet lang). PRAEZISIERTE POLITIK fuer R7b:
+  DFLASH nur wenn (Coding-Inhalt ODER Erst-Request) UND Kontext <~4096
+  (Grenze aus der Drafter-Trainingskonfiguration LESEN, nicht hartkodieren
+  — das ist exakt das in FEATURES_VS_UPSTREAM als fehlend gelistete
+  "context-length gate from the drafter training config", es wird in R7b
+  verdrahtet); sonst NEXTN.
+Der Accept-Waechter bleibt als Netz (faengt Prosa-Faelle automatisch, weil
+DFLASH-Acceptance dort kollabiert), aber die Politik muss ihn selten
+brauchen, weil beide Achsen jetzt vorab bekannt sind.
