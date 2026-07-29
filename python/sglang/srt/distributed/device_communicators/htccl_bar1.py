@@ -1116,22 +1116,66 @@ class HTCCLBar1Transport:
         self.pipe_an = os.environ.get("SGLANG_HTCCL_BAR1_PIPE", "0") not in (
             "0", "nein", "aus", "false"
         )
-        # Fenstertiefe T. 4 aus NCCL: NCCL_STEPS 8 (src/include/device.h:26)
-        # geteilt durch ALLREDUCE_SLICESTEPS 2 (src/include/collectives.h:19)
-        # ergibt vier Scheiben im Fenster. T=2 ist das Minimum, das ueberhaupt
-        # pipelinet; T=1 verklemmt (siehe htccl_bar1_pipe_ext).
+        # RINGTIEFE T -- Schlitze je Phase und Verbindung. 4 aus NCCL:
+        # NCCL_STEPS 8 (src/include/device.h:26) geteilt durch
+        # ALLREDUCE_SLICESTEPS 2 (src/include/collectives.h:19).
         self.pipe_t = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_T", "4"))
+        # ZEITPLAN-VORLAUF P -- um wieviele Schleifenrunden das Senden dem
+        # Reduzieren vorauslaeuft. GETRENNT von der Ringtiefe, und darin
+        # liegt die Zeitentkopplung: der Empfaenger darf um `T - P + 1`
+        # Schleifenrunden zurueckliegen, bevor der Sender blockiert. Mit
+        # P = T waere das genau EINE Runde, also faktisch Gleichschritt --
+        # und auf einem Rig mit x4-, x8- und x8-Anbindung und drei
+        # verschiedenen Kartenmodellen ist der Versatz zwischen ungleich
+        # schnellen Raengen genau das, was das Fenster absorbieren soll.
+        # P = 2 ist das Minimum, das ueberhaupt pipelinet; mit T = 4 sind es
+        # drei Runden Versatz.
+        self.pipe_vorlauf = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_VORLAUF", "2")
+        )
         # Chunkzahl K. 0 = automatisch aus `pipe_chunk_bytes`.
         self.pipe_k = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_K", "0"))
-        # Zielgroesse eines Chunks bei automatischem K. 256 KiB: bei 1 MiB
-        # braucht `netz` laut MESSUNG_ALLES_IM_SELBEN_LAUF.md 330,30 us und
-        # die Leerrunde 25,74 us -- ein 256-KiB-Chunk kostet also rund 82 us
-        # Uebertragung gegen rund 26 us Umlauf. Drei Raenge, Rig 1; auf zwei
-        # Karten am x8-Port ungemessen, deshalb eine Stellgroesse.
+        # Zielgroesse eines Chunks bei automatischem K.
+        #
+        # 1 MiB, gerechnet statt geraten. Je Schleifenrunde fallen zwei
+        # Sperren an; bei der cooperative Variante ist das `grid.sync()`.
+        # Der Leerlauf ist `2*t_sync*(K+P)` (Sperren) plus
+        # `(P-1)*T_leitung/K` (Anlauf der Pipeline), minimal bei
+        # `K = sqrt((P-1)*T_leitung/(2*t_sync))`. Bei 16 MiB und zwei
+        # Raengen sind `T_leitung` rund 1985 us (33,55 MB ueber die
+        # gemessene Duplexdecke von 16,90 GB/s), mit P=2 und t_sync=3 us
+        # also K ~ 18 -- rund 1 MiB je Chunk.
+        #
+        # UNGEMESSEN: `t_sync` fuer `grid.sync()` ist auf diesem Rig nicht
+        # gemessen; 3 us ist eine Annahme. Traegt die 1blk-Variante -- und
+        # KORREKTUR_BANDBREITE.md misst mit 256 Threads in EINEM Block
+        # bereits 12,64 GB/s, also die volle Schreibrate --, dann kostet die
+        # Sperre rund 0,1 us und das optimale K ist rund fuenfmal groesser.
+        # Das ist die erste Achse der Messreihe.
         self.pipe_chunk_bytes = int(
-            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_CHUNK_BYTES", str(256 << 10))
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_CHUNK_BYTES", str(1 << 20))
         )
         self.pipe_k_max = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_K_MAX", "64"))
+        # EIGENE 1blk/gitter-Schwelle fuer die Pipe.
+        #
+        # Getrennt von `gitter_ab`, weil die Rechnung fuer die Pipe anders
+        # ausgeht: `netz` zahlt zwei `grid.sync()` je Kollektiv, die Pipe
+        # zahlt zwei je SCHLEIFENRUNDE, also 2(K+P) statt 2. Und der Grund,
+        # aus dem die cooperative Variante bei `netz` ab 4 MiB gewinnt, gilt
+        # fuer den Datenweg gar nicht: KORREKTUR_BANDBREITE.md misst die
+        # Schreibrate in die Peer-BAR ueber 1 bis 16 Bloecke und 32 bis 1024
+        # Threads mit 12,6-12,7 GB/s -- ohne Streuung. 256 Threads in EINEM
+        # Block erreichen bereits die volle Rate. Mehr Bloecke helfen der
+        # Leitung nicht; sie helfen nur der lokalen Reduktion, deren
+        # cache-umgehende Ladevorgaenge Nebenlaeufigkeit brauchen.
+        #
+        # Vorgabe deshalb wie bisher (kein stiller Unterschied), aber als
+        # eigener Hebel: nach der obigen Rechnung sollte die Pipe mit 1blk
+        # besser fahren, und das ist die erste Frage der Messreihe.
+        self.pipe_gitter_ab = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_GITTER_AB",
+                           str(self.gitter_ab))
+        )
         # Empfaengerquittung (head). 1 = an. Aus gemessen zeigt, was das
         # Schiebefenster kostet; aus GEFAHREN darf sie nur, wer den
         # Zeitplanbeweis in htccl_bar1_pipe_ext gelesen hat.
@@ -1281,6 +1325,23 @@ class HTCCLBar1Transport:
 
         # 1. Speicherordnung. Aus dem Fenster, das der Aufrufer bewilligt,
         # folgt die groesste Nutzlast -- nicht umgekehrt.
+        if self.pipe_an and not (2 <= self.pipe_vorlauf <= self.pipe_t):
+            raise Bar1Unverfuegbar(
+                f"SGLANG_HTCCL_BAR1_PIPE_VORLAUF={self.pipe_vorlauf} passt "
+                f"nicht zu T={self.pipe_t}: erlaubt ist 2 <= P <= T. P=1 "
+                f"verklemmt (Senden und Verbrauch eines Chunks fielen in "
+                f"dieselbe Schleifenrunde), P>T liesse den Zeitplan die "
+                f"Schlitze ueberholen."
+            )
+        if self.pipe_an:
+            logger.info(
+                "HTCCL-BAR1-PIPE: Ringtiefe T=%d, Vorlauf P=%d -- ein Peer "
+                "darf um %d Schleifenrunden zurueckliegen, bevor der Sender "
+                "blockiert. Direkt-Modus %s, Ergebnisring L=%d.",
+                self.pipe_t, self.pipe_vorlauf,
+                self.pipe_t - self.pipe_vorlauf + 1,
+                "an" if self.pipe_direkt else "aus", self.pipe_erg_ring,
+            )
         if not self.pipe_an or not self.pipe_direkt:
             self.pipe_erg_ring = 0
         elif self.pipe_erg_ring < 2:
@@ -2032,7 +2093,7 @@ class HTCCLBar1Transport:
         direkt = out is not None
         if not direkt:
             out = torch.empty_like(inp)
-        kern = 1 if nbytes >= self.gitter_ab else 0
+        kern = 1 if nbytes >= self.pipe_gitter_ab else 0
         peer_nutz = [0] * self.welt
         peer_flag = [0] * self.welt
         peer_erg = [0] * self.welt
@@ -2063,8 +2124,8 @@ class HTCCLBar1Transport:
             int(pipe_schlitz_bytes(int(self._geo["chunk_max"]), int(self.pipe_t))),
             int(self._geo["off_pipe"]),
             int(pipe_fbasis(self.welt, self.a2a_an)),
-            int(k), int(self.pipe_t), int(self.pipe_quittung),
-            1 if direkt else 0,
+            int(k), int(self.pipe_t), int(self.pipe_vorlauf),
+            int(self.pipe_quittung), 1 if direkt else 0,
             self._runde_dev, self._schritt_dev, self._ctl_dev,
             int(self.deckel_zyklen), int(self.threads), int(kern),
             int(self.ladeform),

@@ -187,10 +187,12 @@ class HTCCLMatrixTransport:
         return 0 if self.bar1 is None else self.bar1.a2a_schlitz_bytes()
 
     def htccl_all_to_all_single(self, comm, output, inp, sende_bytes,
-                                empfangs_bytes):
+                                empfangs_bytes, sende_versatz=None,
+                                empfangs_versatz=None):
         self._muss_stehen()
         return self.bar1.htccl_all_to_all_single(
-            comm, output, inp, sende_bytes, empfangs_bytes
+            comm, output, inp, sende_bytes, empfangs_bytes,
+            sende_versatz, empfangs_versatz,
         )
 
     def _muss_stehen(self) -> None:

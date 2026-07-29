@@ -524,7 +524,8 @@ struct PipeArgs {
     int          R;
     int          rang;
     int          K;            // Chunkzahl dieses Aufrufs
-    int          TT;           // Fenstertiefe = Schlitzklassen je Phase
+    int          TT;           // Ringtiefe = Schlitzklassen je Phase
+    int          PP;           // Zeitplan-Vorlauf, 2 <= PP <= TT
     int          quittung;     // 1 = head veroeffentlichen (Vorgabe)
     long long    schlitz4;     // Schlitzgroesse in 128-Bit-Paketen
     long long    klasse4;      // Abstand zweier Schlitzklassen = (R-1)*schlitz4
@@ -564,7 +565,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                         ? (int)(gridDim.x * blockDim.x)
                         : (int)blockDim.x;
     const bool erster = (tid == 0);
-    const int  n4 = A.n4, R = A.R, r = A.rang, K = A.K, TT = A.TT;
+    const int  n4 = A.n4, R = A.R, r = A.rang, K = A.K, TT = A.TT, PP = A.PP;
     const u64  runde  = *(const volatile u64 *)A.rundeDev + 1ull;
     const u64  basis  = *(const volatile u64 *)A.schrittDev;
 
@@ -669,21 +670,43 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
 
     // -- Schleife -----------------------------------------------------------
     //
-    // Drei Stufen, um TT-1 bzw. TT Schleifenrunden versetzt:
+    // Drei Stufen, um PP-1 bzw. PP Schleifenrunden versetzt:
     //
     //   cs = i        Reduce-Scatter-Stueck von Chunk cs an alle Peers
-    //   cr = i-(TT-1) Chunk cr reduzieren UND das Ergebnis sofort verteilen
-    //   cg = i-TT     Allgather-Stuecke von Chunk cg uebernehmen
+    //   cr = i-(PP-1) Chunk cr reduzieren UND das Ergebnis sofort verteilen
+    //   cg = i-PP     Allgather-Stuecke von Chunk cg uebernehmen
     //
-    // Ein Rang schiebt also Chunk i hinaus, waehrend er Chunk i-TT+1
-    // reduziert und Chunk i-TT einsammelt. Zwischen den Stufen steht KEINE
+    // Ein Rang schiebt also Chunk i hinaus, waehrend er Chunk i-PP+1
+    // reduziert und Chunk i-PP einsammelt. Zwischen den Stufen steht KEINE
     // gitterweite Sperre je Phase mehr; die beiden Sperren je Schleifenrunde
     // trennen nur "erster hat gewartet" von "alle arbeiten" und "alle sind
     // fertig" von "erster veroeffentlicht".
-    for (int i = 0; i < K + TT; ++i) {
+    //
+    // WARUM VORLAUF UND RINGTIEFE GETRENNT SIND
+    // -----------------------------------------
+    // Sie waren erst dasselbe (PP == TT), und das war ein Entwurfsfehler.
+    // Die Fensterbedingung fuer das Senden von Chunk i verlangt, dass der
+    // Empfaenger Chunk i-TT verbraucht hat; verbraucht wird er bei ihm in
+    // Schleifenrunde (i-TT)+(PP-1). Der Empfaenger darf also um
+    //
+    //     TT - PP + 1  Schleifenrunden
+    //
+    // zurueckliegen, bevor der Sender blockiert. Mit PP == TT ist das genau
+    // EINE Runde -- der Ring waere TT Schlitze tief, aber der Zeitplan
+    // verbraeuchte sie sofort wieder, und zwei ungleich schnelle Karten
+    // liefen faktisch im Gleichschritt. Genau die zeitliche Entkopplung, die
+    // dem Host-Weg seine einzige echte Staerke gibt (der Sender kippt ins
+    // RAM und ist fertig), waere damit verschenkt.
+    //
+    // Mit PP = 2 (dem Minimum, das ueberhaupt pipelinet) und TT = 4 sind es
+    // drei Runden Versatz. Das ist NCCLs Bauform: acht Schritte im Ring
+    // (NCCL_STEPS, src/include/device.h:26) gegen zwei Schritte je Scheibe
+    // (ALLREDUCE_SLICESTEPS, src/include/collectives.h:19) -- Ringtiefe und
+    // Vorlauf sind auch dort verschiedene Zahlen.
+    for (int i = 0; i < K + PP; ++i) {
         const int cs = i;
-        const int cr = i - (TT - 1);
-        const int cg = i - TT;
+        const int cr = i - (PP - 1);
+        const int cg = i - PP;
         // SCHLITZKLASSE AUS DEM ABSOLUTEN SCHRITT, nicht aus dem Chunkindex
         // dieses Aufrufs. Mit `c % TT` verschoebe sich die Zuordnung
         // Klasse <-> Schlitz an jeder Rundengrenze, an der K kein Vielfaches
@@ -966,15 +989,15 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     std::vector<int64_t> peer_erg,
                     int64_t eigen_nutz, int64_t eigen_flag,
                     int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
-                    int64_t k_chunks, int64_t tiefe, int64_t quittung,
-                    int64_t direkt,
+                    int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
+                    int64_t quittung, int64_t direkt,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
                     at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
                     int64_t ladeform)
 {
     const int R = (int)world, r = (int)rank;
-    const int K = (int)k_chunks, TT = (int)tiefe;
+    const int K = (int)k_chunks, TT = (int)tiefe, PP = (int)vorlauf;
     TORCH_CHECK(R >= 2 && R <= HTCCL_PIPE_MAX_RANKS,
                 "htccl-bar1 pipe: world ", R, " ausserhalb 2..",
                 HTCCL_PIPE_MAX_RANKS);
@@ -991,15 +1014,20 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                 (int64_t)peer_flag.size() == world &&
                 (int64_t)peer_erg.size() == world,
                 "htccl-bar1 pipe: Peer-Tabelle hat die falsche Laenge");
-    // TT >= 2: bei TT == 1 fielen das Senden von Chunk c und sein Verbrauch
+    // PP >= 2: bei PP == 1 fielen das Senden von Chunk c und sein Verbrauch
     // in dieselbe Schleifenrunde, und die Wartebedingung stuende VOR der
     // Veroeffentlichung, auf die sie wartet -- ein Selbstblock, den kein
     // Zeitdeckel zu einem Fehler macht, sondern nur zu einem langsamen.
+    // PP <= TT: der Ring muss mindestens so tief sein wie der Vorlauf, sonst
+    // ueberholt der Zeitplan die Schlitze.
     TORCH_CHECK(TT >= 2 && TT <= HTCCL_PIPE_MAX_TIEFE,
-                "htccl-bar1 pipe: Tiefe ", TT, " ausserhalb 2..",
+                "htccl-bar1 pipe: Ringtiefe ", TT, " ausserhalb 2..",
                 HTCCL_PIPE_MAX_TIEFE);
+    TORCH_CHECK(PP >= 2 && PP <= TT,
+                "htccl-bar1 pipe: Vorlauf ", PP, " ausserhalb 2..", TT,
+                " -- er darf die Ringtiefe nicht ueberschreiten");
     TORCH_CHECK(K >= TT, "htccl-bar1 pipe: K=", K, " < T=", TT,
-                " -- weniger Chunks als Fenstertiefe");
+                " -- weniger Chunks als Ringtiefe");
     TORCH_CHECK(schlitz > 0 && (schlitz % 16) == 0,
                 "htccl-bar1 pipe: Schlitzgroesse ", schlitz,
                 " ist kein positives Vielfaches von 16");
@@ -1050,6 +1078,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     A.rang         = r;
     A.K            = K;
     A.TT           = TT;
+    A.PP           = PP;
     A.quittung     = (int)quittung;
     A.direkt       = (int)direkt;
     A.deckelZyklen = (u64)deckel_zyklen;
@@ -1151,8 +1180,8 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     std::vector<int64_t> peer_erg,
                     int64_t eigen_nutz, int64_t eigen_flag,
                     int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
-                    int64_t k_chunks, int64_t tiefe, int64_t quittung,
-                    int64_t direkt,
+                    int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
+                    int64_t quittung, int64_t direkt,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
                     at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
