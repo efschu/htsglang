@@ -2190,3 +2190,60 @@ nicht die Komponente.** Eine Verbandslast, die „ausgelastet" aussieht
 praktisch nicht an. Kurze Anfragen mit mehreren gleichzeitig sind hier die
 richtige Last, lange Generierungen die falsche — genau umgekehrt zu dem, was
 „Serverlast" intuitiv heisst.
+
+### 13.6 Der Gegenbeweis, und was ihn erst moeglich gemacht hat
+
+Drei Reproduktionsversuche, jeder eine Aenderung, alle mit
+`SGLANG_LANE_SHARED_INPUT_BUFFERS=1` (Alias wiederhergestellt) und
+Schaetzer AN:
+
+| Boot | Verbandslast | Verbands-Prefill | Ergebnis |
+|---|---|---|---|
+| 3 | 1 Anfrage, 256 Token Ausgabe | 1,0 Tok/s in P5 | **ueberlebt**, alle 6 Phasen |
+| 4 | 3 Anfragen, 48 Token Ausgabe | 6,1 Tok/s in P5 | **ueberlebt**, alle 6 Phasen |
+| 5 | 3 Anfragen, ~3600-Token-PROMPT, 16 Token Ausgabe | **1394,7 Tok/s in P1** | **TOT in P2** |
+
+Boot 5 ist der Reproduzierer, und er folgt direkt aus §13.4: der geteilte
+Puffer ist `chunked_prefill_size` lang, aber eine 44-Token-Anfrage beschreibt
+nur seine ersten 44 Slots. Erst ein Prompt, der die volle Chunk-Laenge
+belegt, laesst den VERBAND denselben Puffer vollstaendig schreiben, den die
+Lane vollstaendig schreibt. Danach faellt der Assert sofort:
+
+    kvcache.cuh:112: store_kvcache(...) [kElementBytes = 2048, kSplit = 4,
+    kUsePDL = true, T = signed long]: block: [0,0,0], thread: [64,0,0]
+    Assertion `index >= 0 && index < size_limit` failed.
+
+gemeldet im `prefill_cuda_graph_runner.execute` des Verbands, ueber
+`breakable_cuda_graph.replay` — dieselbe Stelle wie in D1.
+
+METHODISCHE LEHRE, und sie ist der eigentliche Zusatzertrag: Boot 3 und 4
+sahen wie „Volllast" aus (der Verband hielt 11-13 Decode-Token/s unter einer
+saettigenden Lane) und ruehrten den Pfad unter Test praktisch nicht an. Eine
+Race an einer geteilten Ressource wird von der Saettigung DER RESSOURCE
+ausgeloest, nicht von der Auslastung der Komponente. Wer einen
+Reproduzierer baut, muss die Last an der Ressource messen — hier
+`prefill_tokens/s` — und nicht an der Komponente.
+
+### 13.7 Offen fuer Runde 3
+
+0. **Zweiter Fall derselben Familie, gesichtet und NICHT behoben.**
+   `zero_flashinfer_workspaces()` wird beim Request-Ende des VERBANDS
+   gerufen und nullt JEDEN registrierten flashinfer-Float-Workspace —
+   auch den einer nebenlaeufigen Lane, die in diesem Moment rechnet. Die
+   Registry (`_WORKSPACE_BUFFERS`) ist nach `id()` geschluesselt, kennt also
+   keine Lane. Kein Assert, sondern falsche Zahlen; der Zero-Kontrakt aus
+   #50 laesst sich lane-lokal machen, ohne ihn aufzugeben.
+1. **Per-Chunk-Prefill-Zaehlung (D1 §12.8 Punkt 2) ist kein Zaehler-Umzug.**
+   `_prefill` baut EINE Batch ueber den ganzen Prompt und macht EINEN
+   Forward; bei 2048er-Jobs und `chunked_prefill_size=2048` ist der Chunk
+   der Job. Feinere Quanten verlangen, dass die Lane ihren Prefill wirklich
+   stueckelt — Verhaltensaenderung mit eigener Messpflicht, nicht Buchhaltung.
+2. **Der Gegenbeweis steht auf EINEM Boot mit sechs Phasen**, nicht auf drei
+   Boots. Er ueberlebt genau die Phase, die den Alias-Boot mit identischer
+   Last getoetet hat, und zusaetzlich zwei 60-s-Prefill-Arm-Phasen unter
+   voller Verbands-Prefill-Saettigung. Wer Budget hat, wiederholt ihn.
+3. **Die Sprossenleiter der Lane bleibt an `chunked_prefill_size` geklebt.**
+   Der Fix macht die Kollision harmlos, er beseitigt nicht, dass beide
+   Gruppen dieselben Formen anfragen. Wer spaeter mehr als eine
+   nebenlaeufige Lane baut, zahlt den Puffersatz je Lane — ~1,9 MiB, klein,
+   aber linear.

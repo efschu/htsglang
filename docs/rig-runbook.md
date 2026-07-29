@@ -1189,8 +1189,19 @@ writers, one buffer, foreign slot ids. The pool is keyed by
   `SGLANG_LANE_SHARED_INPUT_BUFFERS=1` (restores the process-wide key) on the
   4.12 concurrent recipe with `--dual-group-lane-budget-mib 700`, then a 60 s
   phase in which the lane is fed back-to-back 2048-token prefill jobs
-  (`"spec": false`, `max_new_tokens: 1`) while `/generate` runs back-to-back
-  requests.
+  (`"spec": false`, `max_new_tokens: 1`) while `/generate` runs several
+  concurrent requests **with prompts at least `chunked_prefill_size` long and
+  a unique prefix each** (short generations, e.g. 16 tokens).
+  **The prompt length is the whole trick**, and getting it wrong cost two
+  boots: the shared buffer is one `chunked_prefill_size`-long
+  `out_cache_loc`, and a 44-token request only ever writes its first 44
+  slots. Two runs with short prompts survived all six phases at 1.0 and
+  6.1 serving prefill-tokens/s; raising the prompt to ~3600 tokens took that
+  to 1394.7 tokens/s and killed the server in the second phase. Measure the
+  load at the SHARED RESOURCE (`prefill_tokens/s`), not at the component —
+  a serving group holding 11-13 decode-tokens/s looks busy and touches the
+  prefill path barely at all. The unique prefix matters too: an identical
+  prompt is served from the radix cache and performs no prefill.
 - **Seeing the aliasing directly**: `SGLANG_DEBUG_INPUT_BUFFER_POOL=1` logs
   one line per pool registration (scope, lane, name, numel, dtype, device,
   pointer, whether it is new). On the rank carrying the lane the same
