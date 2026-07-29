@@ -15,7 +15,7 @@ import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import torch
 
@@ -199,25 +199,66 @@ class PrefillMetadata:
 FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 
 # Every allocated flashinfer float workspace (the shared global one, private
-# init_new_workspace ones, the dedicated full-CG prefill one). Weak refs: the
-# registry must not extend buffer lifetimes across re-inits. Keyed by id()
-# in a WeakValueDictionary instead of a WeakSet: WeakSet membership falls
-# back to elementwise Tensor.__eq__ on hash collisions ("Boolean value of
-# Tensor ... is ambiguous").
-_WORKSPACE_BUFFERS: "weakref.WeakValueDictionary[int, torch.Tensor]" = (
-    weakref.WeakValueDictionary()
-)
+# init_new_workspace ones, the dedicated full-CG prefill one), grouped BY LANE
+# (#274). Within a lane, keyed by id() in a WeakValueDictionary instead of a
+# WeakSet: WeakSet membership falls back to elementwise Tensor.__eq__ on hash
+# collisions ("Boolean value of Tensor ... is ambiguous"). Weak refs: the
+# registry must not extend buffer lifetimes across re-inits.
+#
+# The lane grouping is what makes the #50 zeroing contract safe next to a
+# CONCURRENT dual-group lane. Zeroing is driven by the SERVING group's request
+# finish; a process-wide registry means that memset also lands on the
+# workspace of a lane that is forwarding at that moment, on another thread and
+# another stream, with live split-KV partials in it. Nothing asserts — the
+# lane's attention simply returns wrong numbers. Keyed by lane, each group
+# restores its OWN boot contract at its OWN job boundary (the lane's is
+# DualGroupLane._finish), so #50 is kept rather than traded away.
+_WORKSPACE_BUFFERS: Dict[
+    Optional[int], "weakref.WeakValueDictionary[int, torch.Tensor]"
+] = {}
+
+
+def _workspace_lane() -> Optional[int]:
+    """Registry key of the group in scope: the lane, or ``None`` for the
+    serving group and for a SERIAL lane (``scope_lane_id is None``, which
+    shares the serving group's workspaces by design and never runs at the same
+    time as it).
+
+    ``SGLANG_LANE_SHARED_ATTN_WORKSPACE=1`` collapses every group onto the
+    ``None`` bucket, which is verbatim the pre-#274 behaviour: one registry,
+    zeroed wholesale from the scheduler thread. It is the falsifier for this
+    fix, not an operating mode (see runtime_context._buffers_ignore_lane).
+    """
+    from sglang.srt.runtime_context import _buffers_ignore_lane, current_lane_id
+
+    return None if _buffers_ignore_lane() else current_lane_id()
 
 
 def register_flashinfer_workspace_buffer(buf: torch.Tensor) -> torch.Tensor:
     """Track a flashinfer float-workspace allocation for the per-request
-    zeroing contract (see zero_flashinfer_workspaces)."""
-    _WORKSPACE_BUFFERS[id(buf)] = buf
+    zeroing contract (see zero_flashinfer_workspaces), under the lane in
+    scope at allocation time."""
+    lane = _workspace_lane()
+    bucket = _WORKSPACE_BUFFERS.get(lane)
+    if bucket is None:
+        bucket = weakref.WeakValueDictionary()
+        _WORKSPACE_BUFFERS[lane] = bucket
+    bucket[id(buf)] = buf
+    if os.environ.get("SGLANG_DEBUG_RUNTIME_BUFFER_POOL", "0") == "1":
+        logger.info(
+            "flashinfer-workspace-registry: lane=%s ptr=0x%x bytes=%d "
+            "lanes_registered=%s",
+            lane,
+            buf.data_ptr(),
+            buf.numel() * buf.element_size(),
+            sorted(_WORKSPACE_BUFFERS, key=lambda k: (k is not None, k)),
+        )
     return buf
 
 
 def zero_flashinfer_workspaces() -> int:
-    """Zero every registered flashinfer float workspace; returns the count.
+    """Zero this group's registered flashinfer float workspaces; returns the
+    count.
 
     Root fix for #50's cross-request nondeterminism: the fa2 split-KV
     kernels' partial/merge scratch lives in these persistent workspaces,
@@ -236,11 +277,21 @@ def zero_flashinfer_workspaces() -> int:
     finished request — negligible against request latency. Within-request
     residue remains, but it is a deterministic function of the request
     itself, so run-to-run bit-stability is unaffected.
+
+    SCOPED TO THE GROUP IN SCOPE (#274): the caller zeroes what it owns and
+    nothing else. On the scheduler thread that is the serving group's set; on
+    a concurrent lane's worker thread (DualGroupLane._finish) it is that
+    lane's. Zeroing another group's workspace while it forwards is silent
+    corruption, not a race that announces itself — see _WORKSPACE_BUFFERS.
     """
     from sglang.srt.speculative.adaptive_graph_memory import is_paused_tensor
 
+    bucket = _WORKSPACE_BUFFERS.get(_workspace_lane())
+    if bucket is None:
+        return 0
+
     n = 0
-    for buf in list(_WORKSPACE_BUFFERS.values()):
+    for buf in list(bucket.values()):
         # A workspace belonging to a paused adaptive runtime state is
         # physically unmapped; touching it would fault. Its zero-contract is
         # restored by the adaptive graph-memory manager at resume time

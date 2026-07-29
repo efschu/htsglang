@@ -41,11 +41,30 @@ from __future__ import annotations
 
 import contextvars
 import dataclasses
+import logging
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+_logger = logging.getLogger(__name__)
+
+
+def _buffer_pool_debug() -> bool:
+    return os.environ.get("SGLANG_DEBUG_RUNTIME_BUFFER_POOL", "0") == "1"
+
+
+def _buffers_ignore_lane() -> bool:
+    """Escape hatch that restores the pre-#274 process-wide ``get_buffer`` key.
+
+    It exists so the defect stays reproducible on demand — a concurrent lane
+    handed the serving group's attention workspace — and is the falsifier for
+    the fix, not an operating mode. Sibling of
+    ``SGLANG_LANE_SHARED_INPUT_BUFFERS`` (slice D2).
+    """
+    return os.environ.get("SGLANG_LANE_SHARED_ATTN_WORKSPACE", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -635,13 +654,63 @@ class RuntimeContext:
         return stream
 
     def get_buffer(self, name: str, factory: Any) -> Any:
-        """Named process-level persistent buffer: get-or-create via
-        ``factory()``, shared by name (the keyed-lazy pattern of the
-        persistent buffers / named streams)."""
-        buf = self.resources.buffers.get(name)
-        if buf is None:
+        """Named persistent buffer: get-or-create via ``factory()``, shared by
+        ``(lane, name)`` (the keyed-lazy pattern of the persistent buffers /
+        named streams).
+
+        KEYED BY LANE (#274), because every production caller of this accessor
+        is an attention WORKSPACE — the flashinfer / flashinfer-MLA /
+        trtllm-MLA / trtllm-MHA / DSA / musa-flashattention float workspaces.
+        Those hold a forward's split-KV partials and its merge schedule, i.e.
+        live per-forward scratch, and they were shared by NAME alone. The
+        safety argument was the same one ``share_input_buffer`` carried: the
+        forwards that use them are sequential.
+
+        A concurrent dual-group lane breaks it the same way. The lane's
+        bring-up builds a second full set of attention backends in the SAME
+        process on the SAME card and runs under ``lane_scope(lane_id)``
+        (``dual_group_lane._build_lane_under_scope``), so it asked for
+        ``"flashinfer_workspace"`` and was handed the serving group's tensor —
+        one 384-512 MiB scratch, two threads, two streams, both writing.
+        Unlike the input-buffer collision this one raises nothing: the loser
+        reads the winner's partials and the attention output is silently
+        wrong.
+
+        The serving group is ``None`` and keeps exactly one buffer per name, so
+        the default path and the SERIAL lane mode (``scope_lane_id is None``,
+        deliberately shared) are unchanged; a concurrent lane gets its own.
+
+        ``resources.buffers`` entries managed directly by their owners rather
+        than through this accessor (``lora_moe_runner_marlin``'s marlin
+        workspace) keep their own raw string keys and are untouched.
+        """
+        lane = None if _buffers_ignore_lane() else _LANE_SCOPE.get().lane_id
+        key = (lane, name)
+        buf = self.resources.buffers.get(key)
+        new = buf is None
+        if new:
             buf = factory()
-            self.resources.buffers[name] = buf
+            self.resources.buffers[key] = buf
+        if _buffer_pool_debug():
+            # Raw registration record, dumped before any analysis: which lane
+            # asked for which name, and whether it landed on someone else's
+            # allocation.
+            cross = [
+                k[0]
+                for k in self.resources.buffers
+                if isinstance(k, tuple) and k[1:] == key[1:] and k[0] != lane
+            ]
+            data_ptr = getattr(buf, "data_ptr", None)
+            _logger.info(
+                "runtime-buffer-pool: scope=%s lane=%s name=%s ptr=0x%x new=%s "
+                "same_name_other_lanes=%s",
+                _LANE_SCOPE.get().lane_id,
+                lane,
+                name,
+                data_ptr() if callable(data_ptr) else 0,
+                new,
+                cross,
+            )
         return buf
 
     @property

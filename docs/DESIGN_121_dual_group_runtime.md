@@ -2247,3 +2247,215 @@ Reproduzierer baut, muss die Last an der Ressource messen — hier
    Gruppen dieselben Formen anfragen. Wer spaeter mehr als eine
    nebenlaeufige Lane baut, zahlt den Puffersatz je Lane — ~1,9 MiB, klein,
    aber linear.
+
+### 13.8 Der dritte Fall der Familie: der flashinfer-Float-Workspace
+
+D2 hat den Fall gesichtet und nicht behoben (§13.7 Punkt 0). Beim Nachgehen
+lag darunter ein zweiter, groesserer Befund — die Lane hatte gar keinen
+eigenen Workspace, den man haette schuetzen koennen.
+
+**C1, die Zuteilung.** `RuntimeContext.get_buffer(name, factory)` ist ein
+benannter Prozess-Puffer und war ALLEIN nach dem Namen geschluesselt. Jeder
+produktive Aufrufer dieses Akzessors ist ein Attention-Workspace:
+
+    flashinfer_backend        get_buffer("flashinfer_workspace", ...)
+    flashinfer_mla_backend    get_buffer(...)
+    trtllm_mla_backend        get_buffer(...)
+    trtllm_mha_backend        get_buffer(...)
+    dsa_backend               get_buffer(...)
+    musa/flashattention       get_buffer(...)
+
+Diese Puffer halten die Split-KV-Teilergebnisse und den Merge-Plan EINES
+Forwards, also lebendigen Kratzspeicher. Ihr Sicherheitsargument war
+dasselbe, das `share_input_buffer` trug: die Forwards, die sie benutzen,
+laufen nacheinander. Der Aufbau der Lane baut einen zweiten vollstaendigen
+Satz Attention-Backends im SELBEN Prozess auf DERSELBEN Karte und laeuft
+dabei unter `lane_scope(lane_id)` (`_build_lane_under_scope`) — die Lane
+fragte also unter ihrem eigenen Scope nach `"flashinfer_workspace"` und
+bekam den Puffer des Verbands zurueck. 384 MiB Kratzspeicher, zwei Threads,
+zwei Streams, beide schreibend.
+
+**C2, die Nullung.** `zero_flashinfer_workspaces()` laeuft beim Request-Ende
+des VERBANDS und nullte jeden registrierten Workspace, weil
+`_WORKSPACE_BUFFERS` nach `id()` geschluesselt war. Auch mit getrennten
+Puffern haette ein fremder Thread den Kratzspeicher einer rechnenden Lane
+mitten im Forward geloescht.
+
+Beide Wege enden nicht in einem Assert. Der Verlierer liest die Partials des
+Gewinners, und die Attention gibt still falsche Zahlen zurueck — die
+gefaehrlichere Haelfte der Familie.
+
+**Der Fix.** `get_buffer` ist nach `(lane, name)` geschluesselt, die
+Registry nach Lane gruppiert, und jede Gruppe stellt ihren #50-Boot-Kontrakt
+an ihrer EIGENEN Auftragsgrenze wieder her: der Verband beim Request-Ende
+(Scheduler, unveraendert), die Lane in `DualGroupLane._finish`. Der
+Zero-Kontrakt aus #50 wird damit lane-lokal gemacht, nicht aufgegeben. Der
+Verband ist `None` und behaelt genau einen Puffer je Name, die SERIELLE Lane
+ebenfalls (`scope_lane_id is None`, geteilt mit Absicht) — Default-Pfad und
+serieller Modus sind unveraendert.
+
+**Preis.** Ein zweiter Float-Workspace je NEBENLAEUFIGER Lane,
+`SGLANG_FLASHINFER_WORKSPACE_SIZE` gross. Auf dem Messfahrzeug 384 MiB;
+gemessen auf der 5090 als 28871 -> 29283 MiB belegt (+412 MiB inklusive
+Allokator-Rundung), bei unveraendertem `--rank-gpu-memory-mib 21300` und
+3324 MiB frei. Das Rezept aus 4.12 traegt den Posten ohne Aenderung.
+
+### 13.9 Der Falsifikator, und was er ueber das Instrument gelehrt hat
+
+Ein Assert-Reproduzierer wie in D2 geht hier nicht: der Defekt meldet sich
+nicht. Die beobachtbare Groesse muss die AUSGABE der Lane sein, gegen sich
+selbst verglichen. Vier Phasen, eine Auftragsform (64-Token-Prompt — kurz mit
+Absicht, weil der Qwen-GDN-Prefill oberhalb ~109 Token nicht reproduzierbar
+ist und sonst als Stoergroesse in das Instrument liefe; `spec: false`, damit
+kein spekulativer Pfad Varianz beitraegt):
+
+| Phase | Last | Zweck |
+|---|---|---|
+| A1 | Lane solo | Referenz |
+| A2 | Lane solo | der A-vs-A-BODEN |
+| B  | Lane + Verband, WENIG Request-Enden (512-Token-Generierungen) | trennt C1 von C2 |
+| C  | Lane + Verband, VIELE Request-Enden (8-Token-Generierungen) | beide Wege aktiv |
+
+Der Boden ist echt, und das ist der Befund, der das Instrument erst
+brauchbar macht: **die Solo-Bahn der Lane ist ueber BOOTS hinweg
+byte-identisch** — alle acht Ordinalpositionen von A1 und A2 stimmen
+zwischen dem scharfgestellten und dem gefixten Boot ueberein, und A2 ist
+achtmal dieselbe Bahn. Es gibt also keinen A-vs-A-Rauschboden, gegen den
+eine Abweichung erst verrechnet werden muesste; jede Abweichung unter Last
+ist Signal.
+
+A1 durchlaeuft dabei eine deterministische Einlaufleiter (vier Bahnen in
+Paaren, in beiden Boots identisch) und ist ab A2 eingeschwungen. Als
+Referenz taugt daher A2, nicht A1 — der erste Auftrag nach dem Boot ist
+kein Bezugspunkt.
+
+**Ergebnis, Rohzahlen vor der Analyse.** Jeder Arm zweimal gefahren, weil die
+entscheidende Groesse nicht die ZAHL der Abweichungen ist, sondern ob sie
+sich reproduziert (abweichende Auftrags-Ordinalzahlen gegen die
+eingeschwungene Solo-Bahn):
+
+| Boot | B (wenig Enden) | C (viele Enden) | Summe |
+|---|---|---|---|
+| 1 scharfgestellt (`SGLANG_LANE_SHARED_ATTN_WORKSPACE=1`) | [3,4,5,6,7] | [2,3,6] | 8/16 |
+| 6 scharfgestellt, Wiederholung | [6,7] | [3,5,7] | 5/16 |
+| 2 gefixt | [4,5] | [4,5] | 4/16 |
+| 5 gefixt, Wiederholung | [4,5] | [4,5] | 4/16 |
+
+und daraus die eigentliche Aussage, ueber alle 32 Auftraege eines Laufs:
+
+| Arm | Solo-Phasen reproduzierbar | Phasen UNTER LAST reproduzierbar |
+|---|---|---|
+| scharfgestellt | ja | **NEIN** |
+| gefixt | ja | **ja, byte-identisch** |
+
+Der gefixte Lauf ist ueber zwei Boots in allen vier Phasen und allen 32
+Auftraegen byte-identisch, OBWOHL die Verbandslast zwischen den beiden Boots
+um mehr als 50 % auseinanderlag (Phase B: 33 gegen 50 fertige Anfragen).
+Der scharfgestellte Lauf ist es in den Solo-Phasen ebenfalls und in den
+Lastphasen nicht — andere Positionen, andere Anzahl.
+
+**Das ist der Schuldspruch, und er haengt an der Reproduzierbarkeit, nicht
+an der Zahl.** Eine Abweichung, die sich boot-zu-boot unter deutlich
+anderer Last nicht wiederholt, ist eine Race; eine, die sich exakt
+wiederholt, ist es nicht. Scharfgestellt ist die Lane unter Last
+nichtdeterministisch, gefixt ist sie wieder deterministisch.
+
+Die verbleibenden 4 von 16 des gefixten Arms sind daher KEINE Korruption:
+sie sind der deterministische, lastunabhaengige Unterschied zwischen „Lane
+laeuft allein" und „Lane laeuft neben dem Verband" — Nebenlaeufigkeit
+aendert Belegung und Kornung der Kernel auf eine stabile Weise. Als offener
+Punkt bleibt, WARUM dieser Unterschied ueberhaupt auf die Bahn durchschlaegt
+(§13.11 Punkt 0); als Korrektheitsfrage der Lane ist er geschlossen, weil er
+reproduzierbar ist.
+
+Der Zeigerbeleg daneben, auf TP0 (die Karte mit der Lane), in derselben Form
+wie D2:
+
+    scharf   scope=None lane=None flashinfer_workspace ptr=0x78440c000000 new=True
+             scope=0    lane=None flashinfer_workspace ptr=0x78440c000000 new=False
+                        lanes_registered=[None]
+    gefixt   scope=None lane=None flashinfer_workspace ptr=0x7a2a9c000000 new=False
+             scope=0    lane=0    flashinfer_workspace ptr=0x7a28e4000000 new=True
+                        same_name_other_lanes=[None]  lanes_registered=[None, 0]
+
+TP1 und TP2 tragen keine Lane und registrieren jeden Namen genau einmal: die
+Aliasierung existiert exakt dort, wo zwei Gruppen auf einer Karte sitzen.
+
+**EHRLICH DAZUGESAGT.** Die Stichprobe ist acht Auftraege je Phase und zwei
+Boots je Arm. Fuer die getroffene Aussage — „unter Last reproduzierbar oder
+nicht" — reicht das, weil der Solo-Boden exakt null ist und die
+scharfgestellten Laeufe in zwei von zwei Fallen an verschiedenen Stellen
+abweichen. Fuer eine RATE der Restabweichung reicht es nicht, und sie wird
+hier auch nicht behauptet.
+
+### 13.10 Lane-Prefill-Chunking (D2-Posten 4): Entwurf statt halbem Bau
+
+`DualGroupLane._prefill` baut EINE `ScheduleBatch` ueber den ganzen Prompt
+(`_make_batch` -> `req.set_extend_range(len(req.prefix_indices),
+len(req.origin_input_ids))`) und macht EINEN Forward. Bei 2048er-Auftraegen
+und `chunked_prefill_size=2048` IST der Chunk der Job — eine per-Chunk-
+Zaehlung hat heute nichts zu zaehlen.
+
+Was ein echtes Chunking verlangt, in der Reihenfolge, in der es zu bauen
+waere:
+
+1. **Die Schleife.** `_prefill` iteriert ueber
+   `range(len(prefix_indices), len(origin_input_ids), chunk)` und setzt je
+   Runde `set_extend_range(start, min(start + chunk, n))`; `prefix_indices`
+   waechst um den fertigen Teil mit. Nur der LETZTE Chunk erzeugt ein
+   `next_token_ids`, die vorherigen schreiben ausschliesslich KV. Der
+   Zaehler `work_total["prefill_tokens"]` wandert von der Job- auf die
+   Chunk-Grenze und ist damit die eigentliche Ausbeute des Postens.
+2. **Der Sprossenleiter-Zwang.** Die Lane hat gefangene Prefill-Graphen fuer
+   ihre Stufen; eine Chunk-Groesse ausserhalb der Leiter faellt auf eager
+   zurueck. Die Chunk-Groesse ist also kein freier Parameter, sondern muss
+   eine Sprosse sein — oder die Leiter wird um sie erweitert, mit dem
+   entsprechenden Aufnahme- und VRAM-Posten.
+3. **Der spekulative Zweig.** Bei `spec: true` primt `_prefill` zusaetzlich
+   den NEXTN-Kopf ueber denselben Prompt, mit dem um eine Position
+   verschobenen Eingang. Der Kopf muss chunkweise mitgezogen werden, sonst
+   attendiert er ueber einen KV, den es noch nicht gibt. Das ist der Teil
+   mit dem echten Risiko.
+4. **Die Messpflicht.** Chunk-Groesse gegen ms/Chunk und gegen die
+   Prefill-Rate vorher/nachher; Kohaerenz-Gate (byte-identische Bahn gegen
+   den ungestueckelten Prefill, kein Argument, sondern eine Messung); die
+   Solo-Boeden der Lane neu erheben, weil sich die Kornung des Instruments
+   aendert.
+
+Der Gewinn ist eine feinere Korngrenze fuer den Regler und eine ehrliche
+per-Chunk-Zaehlung. Der Preis ist ein zusaetzlicher Forward-Aufruf je Chunk
+und ein beruehrter spekulativer Primer-Pfad. Das ist eine
+Verhaltensaenderung mit eigener Messpflicht und gehoert als eigener Posten
+gebaut, nicht als Anhaengsel.
+
+### 13.11 Offen fuer Runde 4
+
+0. **Warum die Lane unter Last ueberhaupt eine andere Bahn faehrt, obwohl
+   sie es reproduzierbar tut.** Nach dem Fix weichen 4 von 16 Auftraegen
+   unter Verbandslast von der Solo-Bahn ab, an denselben Ordinalpositionen,
+   ueber zwei Boots byte-identisch und unabhaengig davon, ob die
+   Verbandslast 33 oder 50 Anfragen beendet hat. Das ist keine Race mehr
+   (die Reproduzierbarkeit schliesst sie aus), aber es ist auch nicht
+   nichts: die Lane sollte neben dem Verband dieselben Zahlen rechnen wie
+   allein. Die Suche hat eine scharfe Randbedingung — alles, was die Lane
+   bei jedem Auftrag GLEICH tut, ist als Traeger raus, weil die Solo-Bahn
+   byte-identisch ist. Das schliesst insbesondere die Wiederverwendung des
+   GDN-/Mamba-Zustandsslots aus (`_finish` gibt ihn mit
+   `free_mamba_cache(req)` ohne Nullung frei, aber bei
+   `max_running_requests=1` immer denselben, in derselben Reihenfolge).
+   Uebrig bleibt, was die ANWESENHEIT des Verbands deterministisch
+   veraendert: eine belegungsabhaengige Kernel-Kornung (Split-KV-Partition,
+   Tiling, Reduktionsreihenfolge), die stabil kippt, sobald weniger SMs
+   frei sind. Naechster Schritt ist eine Messung, keine weitere Vermutung:
+   den ersten abweichenden Auftrag mit `SGLANG_SPEC_STATE_HASH` gegen den
+   Solo-Lauf schichtweise diffen und den Traeger benennen, statt ihn zu
+   erraten.
+1. **Die Stichprobe ist acht Auftraege je Phase.** Fuer eine Aussage ueber
+   die RATE der Restabweichung ist das zu schmal; fuer die Aussage „es gibt
+   noch einen Traeger" reicht es, weil der Solo-Boden exakt null ist.
+2. **Per-Chunk-Prefill-Zaehlung**: Entwurf in §13.10, nicht gebaut.
+3. **`get_buffer` ist jetzt lane-fest, `resources.buffers` nicht ueberall.**
+   Der Marlin-LoRA-Workspace (`lora_moe_runner_marlin`) verwaltet seinen
+   Eintrag mit einem rohen Namensschluessel am Akzessor vorbei. Er liegt
+   nicht im Lane-Pfad, ist damit heute harmlos, und ist der naechste Ort,
+   an dem dieselbe Frage gestellt werden muss, sobald er es doch tut.

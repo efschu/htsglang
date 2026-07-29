@@ -42,6 +42,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -3246,6 +3247,7 @@ class DualGroupLane:
             if not self.jobs:
                 self._busy = False
                 self._idle_since = time.monotonic()
+        self._zero_lane_workspaces()
         logger.info(
             "dual-group lane %d job done: prefill %d tokens in %.1f ms "
             "(%.1f ms/1k), %d decode steps, mean %.2f ms/step.",
@@ -3256,6 +3258,43 @@ class DualGroupLane:
             result["decode_steps"],
             result["decode_ms_mean"] or 0.0,
         )
+
+    def _zero_lane_workspaces(self) -> None:
+        """Restore the #50 flashinfer boot contract for THIS lane's
+        workspaces, at this lane's job boundary.
+
+        The serving group does this at request finish (Scheduler, guarded by
+        SGLANG_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST). Before #274 slice D3
+        that call zeroed every registered workspace in the process, so a
+        concurrent lane's scratch was wiped mid-forward by a foreign thread;
+        the registry is keyed by lane now, which fixes the corruption and, on
+        its own, would leave the lane with no zeroing at all. A lane job is
+        the lane's request, so it is the right boundary: the counterpart runs
+        here, on the lane's own thread, inside the lane scope, and reaches
+        exactly this lane's bucket.
+
+        A SERIAL lane keeps ``scope_lane_id is None`` and shares the serving
+        group's workspaces deliberately; zeroing them at a lane job boundary
+        would change the serving group's behaviour in a mode that is meant to
+        be byte-for-byte slice B, so it is skipped there.
+        """
+        from sglang.srt.environ import envs
+
+        if self.scope_lane_id is None:
+            return
+        if not envs.SGLANG_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST.get():
+            return
+        fi_mod = sys.modules.get("sglang.srt.layers.attention.flashinfer_backend")
+        if fi_mod is None:
+            return
+        try:
+            with torch.cuda.stream(self.stream):
+                fi_mod.zero_flashinfer_workspaces()
+        except Exception:
+            logger.exception(
+                "dual-group lane %d: zeroing its flashinfer workspaces failed.",
+                self.lane_id,
+            )
 
 
 class LaneLending:
