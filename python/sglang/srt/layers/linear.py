@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import itertools
-import math
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -184,22 +183,9 @@ def _quant_block_aligned_units(
     block = getattr(quant_config, "weight_block_size", None)
     if not block:
         return units
-    b = block[block_idx]
-    if total % b != 0:
-        # Dimension is not block-quantizable at all (e.g. tiny GDN
-        # projections) — the quant method's own skip/validation logic
-        # owns this case; do not coarsen.
-        return units
-    unit_elems = total // units
-    if unit_elems % b == 0:
-        return units
-    lcm = math.lcm(unit_elems, b)
-    if total % lcm != 0:
-        raise ValueError(
-            f"Cannot align uneven-TP units (unit={unit_elems} elems) of a "
-            f"{total}-wide dimension to the weight quant block {b}."
-        )
-    return total // lcm
+    from sglang.srt.distributed.utils import block_aligned_units
+
+    return block_aligned_units(total, units, block[block_idx])
 
 
 class LinearBase(torch.nn.Module):

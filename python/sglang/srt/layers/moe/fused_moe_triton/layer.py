@@ -1452,6 +1452,22 @@ class FusedMoE(torch.nn.Module):
             return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        final_hidden_states = self.forward_local(hidden_states, topk_output)
+        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_local(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        """This rank's contribution, WITHOUT the group all-reduce.
+
+        Both shard modes of this layer produce a partial sum of the same
+        full-width output -- disjoint experts under expert-dim sharding,
+        partial per-expert GEMMs under intermediate-dim sharding -- which is
+        why one all-reduce combines either of them. Splitting that reduce off
+        is what lets the dual-group lane replace it with a LOCAL sum over the
+        resident shards (#274 families slice C), the same substitution
+        LaneRowParallelShell performs for a row-parallel linear.
+        """
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1484,9 +1500,6 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
-
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 

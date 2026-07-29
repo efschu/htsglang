@@ -163,6 +163,12 @@ def derive_lane_plan(server_args, model_config) -> NestedGroupPlan:
     vocab_size = getattr(model_config, "vocab_size", None)
     if vocab_size:
         vocab_units = (vocab_size + padding - 1) // padding
+    # The quantization block size comes from the CHECKPOINT, not from a
+    # guess: it is what decides in how coarse a unit the layers will really
+    # partition the MLP/MoE dimensions (#274 families slice B).
+    quant_cfg = getattr(model_config.hf_config, "quantization_config", None) or {}
+    if not isinstance(quant_cfg, dict):
+        quant_cfg = getattr(quant_cfg, "__dict__", {}) or {}
     probes = transformer_nesting_probes(
         plan,
         num_attention_heads=model_config.num_attention_heads,
@@ -171,6 +177,9 @@ def derive_lane_plan(server_args, model_config) -> NestedGroupPlan:
         num_experts=num_experts,
         linear_attn_units=linear_attn_units,
         vocab_units=vocab_units,
+        moe_intermediate_size=getattr(cfg, "moe_intermediate_size", None),
+        weight_block_size=quant_cfg.get("weight_block_size"),
+        quant_method=getattr(model_config, "quantization", None),
     )
     check_nesting(plan, probes)
     logger.info("dual-group lane plan verified: %s", plan.describe())
@@ -265,6 +274,64 @@ class LaneRowParallelShell(nn.Module):
             out = out + bias
             bias = None
         return out, (bias if self.skip_bias_add else None)
+
+
+class LaneFusedMoEShell(nn.Module):
+    """Full-width MoE forward over N sharded expert parts (#274 slice, arm C).
+
+    The fifth shell class, and the only one that is not a linear layer. The
+    expert tensors (``w13_weight``/``w2_weight`` plus their scales, packed
+    weights and expert maps) never pass through the
+    ``output_partition_sizes`` / ``input_size_per_partition`` interface the
+    other shells stand on, which is why the taxonomy could not carry them.
+
+    What it CAN stand on is the shape of the collective. A ``FusedMoE`` rank
+    always produces a PARTIAL SUM of the same full-width output, in both shard
+    modes:
+
+    * expert-dim sharding -- each rank owns a disjoint expert range and
+      contributes zero for foreign experts (they route to the zero-padding
+      expert),
+    * intermediate-dim sharding -- each rank computes a slice of every
+      expert's inner GEMM.
+
+    One all-reduce combines either of them, so the local substitution is the
+    same one ``LaneRowParallelShell`` performs: call each part's
+    ``forward_local`` (which is ``forward_impl`` with the group all-reduce
+    split off) and add. Exact, not an approximation -- the addition is the
+    one the collective would have performed.
+
+    The routing decision is NOT re-derived here. ``topk_output`` is computed
+    once by the hull's replicated router over the global expert numbering and
+    handed to every part unchanged; each part translates it to its own local
+    numbering exactly as it does when it runs in the serving group.
+    """
+
+    def __init__(self, parts: Sequence[nn.Module]):
+        super().__init__()
+        if not parts:
+            raise ValueError("LaneFusedMoEShell: no parts.")
+        missing = [p for p in parts if not hasattr(p, "forward_local")]
+        if missing:
+            raise ValueError(
+                "LaneFusedMoEShell: part module "
+                f"{type(missing[0]).__name__} has no forward_local(); the "
+                "lane cannot split its group all-reduce off and would sum "
+                "already-reduced outputs."
+            )
+        self._lane_parts = tuple(parts)
+        p0 = parts[0]
+        # Read-only geometry the surrounding block asks the experts about.
+        for attr in ("num_experts", "top_k", "hidden_size", "layer_id"):
+            if hasattr(p0, attr):
+                setattr(self, attr, getattr(p0, attr))
+
+    def forward(self, hidden_states, topk_output, **kwargs):
+        out = None
+        for p in self._lane_parts:
+            piece = p.forward_local(hidden_states, topk_output)
+            out = piece if out is None else out + piece
+        return out
 
 
 class LaneVocabEmbeddingShell(nn.Module):
@@ -382,6 +449,7 @@ def assemble_lane_shells(
     a silently wrong forward.
     """
     from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
@@ -389,7 +457,14 @@ def assemble_lane_shells(
 
     part_dicts = [_module_dict(m) for m in part_models]
     hull_modules = list(hull.named_modules())
-    counts = {"column": 0, "row": 0, "embedding": 0, "lm_head": 0, "composed": 0}
+    counts = {
+        "column": 0,
+        "row": 0,
+        "embedding": 0,
+        "lm_head": 0,
+        "composed": 0,
+        "moe": 0,
+    }
     composed_prefixes: List[str] = []
 
     def parts_for(name: str) -> List[nn.Module]:
@@ -412,7 +487,13 @@ def assemble_lane_shells(
     for name, module in hull_modules:
         if not name:
             continue
-        if isinstance(module, ParallelLMHead):
+        if isinstance(module, FusedMoE):
+            # Before the linear branches on purpose: an EP subclass of
+            # FusedMoE is still a FusedMoE, and its expert tensors must never
+            # fall through to a linear shell.
+            set_by_name(name, LaneFusedMoEShell(parts_for(name)))
+            counts["moe"] += 1
+        elif isinstance(module, ParallelLMHead):
             set_by_name(name, LaneLmHeadShell(parts_for(name)))
             counts["lm_head"] += 1
         elif isinstance(module, VocabParallelEmbedding):
@@ -655,15 +736,78 @@ def _load_complement_model(
     return model.eval()
 
 
-def _build_hull(lane_runner, device=None) -> nn.Module:
-    """Construct the full-width hull tree on the TARGET device.
+def hull_needs_real_storage(model_config) -> bool:
+    """Whether the hull must be built with real storage rather than on meta.
 
-    Deliberately NOT on meta: quantized big weights are lazily-initialized
-    parameters (no storage) either way, while the small REAL tensors the
-    build creates (GDN conv weights, dt_bias/A_log, norms) are exactly the
-    storages that RadixLinearAttention captures views of at construction --
-    building them real lets the assembly fill them IN-PLACE instead of
-    re-plumbing captured references.  Measured cost: a few MiB.
+    The real build exists for ONE reason: ``RadixLinearAttention`` captures
+    views of its conv weight / ``dt_bias`` / ``A_log`` Parameter objects at
+    construction time, so those have to be real for
+    ``_compose_column_weights_inplace`` to fill them in place instead of
+    re-plumbing captured references.  Only linear-attention (GDN/mamba)
+    families have such tensors.
+
+    For every other family the choice is not cosmetic, it decides whether the
+    lane can exist at all.  A quantized family's big weights are
+    lazily-initialized parameters, so a real hull costs a few MiB either way
+    -- which is why the GGUF vehicle never noticed.  An UNQUANTIZED family
+    (dense bf16 Llama class) allocates the entire full-width model with
+    ``torch.empty`` in ``create_weights``, and that allocation lands on the
+    lane card ON TOP of the serving shard and the complement, only to be
+    dropped again by ``assemble_lane_shells`` moments later.  On this rig
+    that transient peak is the difference between a lane that boots and a
+    CUDA OOM in the hull's first attention layer (#274 families slice A).
+    """
+    cfg = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    if cfg is None:
+        return True
+    return bool(
+        getattr(cfg, "gdn_tp_units", None)
+        or getattr(cfg, "linear_num_key_heads", None)
+        or getattr(cfg, "linear_attn_config", None)
+        or getattr(cfg, "mamba_d_ssm", None)
+    )
+
+
+def _fill_hull_buffers(hull: nn.Module, shared_model: nn.Module) -> int:
+    """Give every meta BUFFER of a meta-built hull the shared tree's storage.
+
+    ``_finalize_hull_params`` walks parameters only.  Buffers (rotary caches,
+    norm scales registered as buffers, ...) are replicated by construction --
+    none of them carries a TP shard -- so the shared tree's counterpart is
+    the right one by name.  Anything left on meta is a hard error: a meta
+    buffer survives assembly silently and fails one forward later inside a
+    kernel.
+    """
+    shared_buffers = dict(shared_model.named_buffers())
+    filled = 0
+    for name, buf in list(hull.named_buffers()):
+        if buf is None or buf.device.type != "meta":
+            continue
+        sb = shared_buffers.get(name)
+        if sb is None or sb.shape != buf.shape:
+            raise ValueError(
+                f"dual-group lane: hull buffer {name!r} (shape "
+                f"{tuple(buf.shape)}) is still on meta and has no replicated "
+                f"counterpart in the shared tree (found "
+                f"{None if sb is None else tuple(sb.shape)}). It would be "
+                "read with no storage at all."
+            )
+        parent_name, _, attr = name.rpartition(".")
+        parent = hull.get_submodule(parent_name) if parent_name else hull
+        setattr(parent, attr, sb)
+        filled += 1
+    return filled
+
+
+def _build_hull(lane_runner, device=None) -> nn.Module:
+    """Construct the full-width hull tree, on meta unless the family forbids it.
+
+    See ``hull_needs_real_storage``: linear-attention families need real
+    storage for the captured conv views, everything else is built on meta so
+    that an unquantized full-width hull never allocates a second copy of the
+    model on the lane card.
     """
     from sglang.srt.model_loader.loader import (
         _get_quantization_config,
@@ -821,9 +965,11 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
     # lane target's shells replace immediately. Everything the head's hull
     # still needs real is replicated and is aliased onto the shared tree's
     # storage by _finalize_hull_params.
-    hull = _build_hull(lane_runner, device="meta" if kind == "draft" else None)
+    on_meta = kind == "draft" or not hull_needs_real_storage(lane_runner.model_config)
+    hull = _build_hull(lane_runner, device="meta" if on_meta else None)
     counts = assemble_lane_shells(hull, part_models)
     fill = _finalize_hull_params(hull, host_runner.model, part_models)
+    fill["buffers"] = _fill_hull_buffers(hull, host_runner.model) if on_meta else 0
 
     shared_ranks = plan.shared_fast_ranks
     checked = 0
@@ -839,17 +985,21 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
             "lane would compute on copies, not on the serving rank's bytes."
         )
     logger.info(
-        "dual-group lane %s model assembled: shells column=%d row=%d embed=%d "
-        "lm_head=%d composed=%d; params aliased=%d composed_vec=%d; "
-        "shared-byte gate PASSED (%d data_ptr identities).",
+        "dual-group lane %s model assembled (hull on %s): shells column=%d "
+        "row=%d embed=%d lm_head=%d moe=%d composed=%d; params aliased=%d "
+        "composed_vec=%d buffers=%d; shared-byte gate PASSED (%d data_ptr "
+        "identities).",
         kind,
+        "meta" if on_meta else "device",
         counts["column"],
         counts["row"],
         counts["embedding"],
         counts["lm_head"],
+        counts["moe"],
         counts["composed"],
         fill["aliased"],
         fill["composed_vec"],
+        fill["buffers"],
         checked,
     )
 
@@ -2339,11 +2489,21 @@ class DualGroupLane:
         failures -- an ``AttributeError`` deep inside the kernel, and an
         out-of-bounds step index that would read another request's state --
         into one sentence at the call site.
+
+        A model family WITHOUT recurrent state (dense Llama-class, MoE without
+        a linear-attention branch) has nothing to roll back: rejecting a
+        candidate only frees its KV slots, which the caller does anyway. Such
+        a pool carries no ``mamba_pool`` at all, and that case returns None
+        rather than refusing -- the refusal above is about a hybrid pool built
+        without the speculative axis, not about the absence of recurrence.
         """
         from sglang.srt.mem_cache.memory_pool import MambaPool
 
         pool = self.runner.req_to_token_pool
-        cache = getattr(getattr(pool, "mamba_pool", None), "mamba_cache", None)
+        mamba_pool = getattr(pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return None
+        cache = getattr(mamba_pool, "mamba_cache", None)
         if not isinstance(cache, MambaPool.SpeculativeState):
             raise ValueError(
                 "dual-group lane verify: the lane's mamba pool carries no "
@@ -2597,14 +2757,24 @@ class DualGroupLane:
             # makes the tree a chain, so the accepted node's tree step is just
             # accept_len - 1 == n_accept. mamba_track_* stay None: the lane has
             # no radix cache, hence no prefix-cache tracking points.
-            self.runner.attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=torch.tensor(
-                    [n_accept], dtype=torch.int64, device=device
-                ),
-                mamba_track_indices=None,
-                mamba_steps_to_track=None,
-                model=self.runner.model,
+            #
+            # Families without recurrence never enter here: their backend has
+            # no such method, and there is no state that the rejected steps
+            # could have advanced (see _verify_state_buffers). The guard is on
+            # the backend, not on a config flag, because the backend is what
+            # owns the buffers.
+            commit_state = getattr(
+                self.runner.attn_backend, "update_mamba_state_after_mtp_verify", None
             )
+            if commit_state is not None:
+                commit_state(
+                    last_correct_step_indices=torch.tensor(
+                        [n_accept], dtype=torch.int64, device=device
+                    ),
+                    mamba_track_indices=None,
+                    mamba_steps_to_track=None,
+                    model=self.runner.model,
+                )
         finally:
             batch.spec_info = None
             batch.forward_mode = ForwardMode.DECODE

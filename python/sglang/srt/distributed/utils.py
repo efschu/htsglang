@@ -914,6 +914,41 @@ def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
 ACTIVATION_VEC_ELEMS = 16
 
 
+def block_aligned_units(total: int, units: Optional[int], block: Optional[int]):
+    """Coarsen an element-granular unit family to whole weight-quant blocks.
+
+    The one rule, in one place: a block-quantized weight (FP8 with
+    ``weight_block_size``, AWQ/GPTQ groups) can only be split where a whole
+    quantization block ends, so a family whose unit is FINER than the block
+    has to be re-expressed in units of ``lcm(unit_elems, block)``.  Families
+    that are already block-multiples (head-granular ones) pass through.
+
+    Both ``_quant_block_aligned_units`` (layer construction) and the lane's
+    nesting probes call this, and they must: a nesting verdict computed on
+    the raw unit count says nothing about a dimension the layers partition
+    in block units.  Those two verdicts genuinely disagree -- for
+    intermediate 17408 with ``weight_block_size [128,128]`` the raw count is
+    1088 and the real one 136, and a swept ratio grid finds both directions
+    of disagreement, including "raw says nested, blocks say not".
+    """
+    if units is None or not block:
+        return units
+    if total % block != 0:
+        # Dimension is not block-quantizable at all -- the quant method's own
+        # skip/validation logic owns this case.
+        return units
+    unit_elems = total // units
+    if unit_elems % block == 0:
+        return units
+    lcm = math.lcm(unit_elems, block)
+    if total % lcm != 0:
+        raise ValueError(
+            f"Cannot align uneven-TP units (unit={unit_elems} elems) of a "
+            f"{total}-wide dimension to the weight quant block {block}."
+        )
+    return total // lcm
+
+
 def assert_activation_aligned_shards(
     total: int,
     tp_size: int,

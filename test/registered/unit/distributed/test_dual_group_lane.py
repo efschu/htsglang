@@ -28,7 +28,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.model_executor.dual_group_lane import (
+    DualGroupLane,
     LaneColumnParallelShell,
+    LaneFusedMoEShell,
     LaneRowParallelShell,
     assemble_lane_shells,
     verify_shared_bytes,
@@ -295,6 +297,106 @@ class TestAssembly(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             verify_shared_bytes(hull, shared, 0)
         self.assertIn("data_ptr", str(ctx.exception).replace("storage", "data_ptr"))
+
+
+class _MoEPart(nn.Module):
+    """A FusedMoE stand-in: contributes a partial sum of the full output."""
+
+    def __init__(self, scale, num_experts=8, top_k=2, hidden_size=H):
+        super().__init__()
+        self.scale = scale
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.seen = []
+
+    def forward_local(self, hidden_states, topk_output):
+        self.seen.append(topk_output)
+        return hidden_states * self.scale
+
+
+class TestMoEShell(unittest.TestCase):
+    """#274 families slice C: the fifth shell class.
+
+    The claim is narrow and checkable: a FusedMoE rank emits a PARTIAL SUM of
+    the full-width output in both shard modes, so the lane's local stand-in
+    for the group all-reduce is the same addition -- and the routing decision
+    is made ONCE, over the global expert numbering, and handed to every part
+    unchanged.
+    """
+
+    def test_shell_is_the_local_reduce_over_parts(self):
+        parts = [_MoEPart(2.0), _MoEPart(3.0), _MoEPart(5.0)]
+        shell = LaneFusedMoEShell(parts)
+        x = torch.randn(4, H)
+        torch.testing.assert_close(shell(x, "topk"), x * 10.0)
+
+    def test_every_part_sees_the_same_global_routing(self):
+        parts = [_MoEPart(1.0), _MoEPart(1.0)]
+        shell = LaneFusedMoEShell(parts)
+        shell(torch.randn(2, H), "the-global-topk")
+        for p in parts:
+            self.assertEqual(p.seen, ["the-global-topk"])
+
+    def test_geometry_is_taken_from_the_parts(self):
+        shell = LaneFusedMoEShell([_MoEPart(1.0, num_experts=128, top_k=4)])
+        self.assertEqual(shell.num_experts, 128)
+        self.assertEqual(shell.top_k, 4)
+
+    def test_a_part_that_cannot_split_its_reduce_is_refused(self):
+        class _Reduced(nn.Module):
+            def forward(self, h, t):  # no forward_local
+                return h
+
+        with self.assertRaises(ValueError) as ctx:
+            LaneFusedMoEShell([_MoEPart(1.0), _Reduced()])
+        self.assertIn("forward_local", str(ctx.exception))
+
+    def test_fused_moe_exposes_the_split_reduce_entry_point(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        self.assertTrue(hasattr(FusedMoE, "forward_local"))
+
+
+class _FakeRunner:
+    def __init__(self, pool):
+        self.req_to_token_pool = pool
+
+
+class _PoolNoMamba:
+    pass
+
+
+class _PoolWithMamba:
+    class _Mamba:
+        mamba_cache = object()
+
+    mamba_pool = _Mamba()
+
+
+class TestFamilyNoOp(unittest.TestCase):
+    """#274 families slice A: the GDN branches must be NO-OPs, not crashes.
+
+    ``_verify_state_buffers`` is the one place in the lane's speculative path
+    that dereferences the recurrent pool. A dense (or MoE-without-GDN) family
+    has no recurrent state at all, so there is nothing a rejected candidate
+    could have advanced -- that must return quietly. A HYBRID pool that was
+    simply built without the speculative axis is a different situation and
+    still has to refuse loudly.
+    """
+
+    def _lane(self, pool):
+        lane = DualGroupLane.__new__(DualGroupLane)
+        lane.runner = _FakeRunner(pool)
+        return lane
+
+    def test_family_without_recurrence_needs_no_verify_state(self):
+        self.assertIsNone(self._lane(_PoolNoMamba())._verify_state_buffers(4))
+
+    def test_hybrid_pool_without_the_speculative_axis_still_refuses(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._lane(_PoolWithMamba())._verify_state_buffers(4)
+        self.assertIn("SpeculativeState", str(ctx.exception))
 
 
 if __name__ == "__main__":

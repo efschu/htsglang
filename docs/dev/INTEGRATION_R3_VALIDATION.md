@@ -6672,3 +6672,134 @@ Code: gpu2gpu_bar.c auf probe/gdr-window.
   `__init__` zu fahren -> AttributeError in der Draft-Aufnahme des VERBANDS,
   nicht der Lane). Boot 2 trug Tore, Tabelle und beide Argmax-Jobs, Boot 3
   und 4 das gepaarte E, Boot 5 die Kettenlaengen-Achse.
+
+## #274 Familien-Slice (feat/dual-group-families, Basis 77c025b2f7) — 2026-07-29
+
+Auftrag: die Mehrfach-Gruppen-Runtime von der EINEN gemessenen Familie
+(hybrid-GDN dense GGUF) auf dense-ohne-GDN, FP8 und MoE bringen. Reihenfolge
+billigste Falsifikation zuerst. Buchfuehrung in DESIGN_121 §11.18-11.20.
+
+### Boot-Bilanz: 8 Starts, davon 4 mit GPU-Belegung
+
+| # | Arm | Ergebnis |
+|---|---|---|
+| 1 | A dense | CUDA-OOM beim Komplement (Rang-0-Budget 26000 zu gross) |
+| 2 | A dense | CUDA-OOM in der HUELLE — der eigentliche Befund, s.u. |
+| 3 | A dense | **gruen**, alle Tore |
+| 4 | A dense nebenlaeufig | **gruen**, E-Messpunkt |
+| 5 | C MoE (Gemma-4) | Vor-Flug-Reject: Gemma4 nimmt kein flashinfer (0 s GPU) |
+| 6 | C MoE (Gemma-4) | Vor-Flug-Reject: 2 kv-Koepfe bei TP=3 verlangen uneven DCP (0 s GPU) |
+| 7 | C MoE (Gemma-4, TP=2) | Laufzeitfehler im VERBAND (Aktivierungs-Vektorbreite), vor dem Lane-Bau |
+| 8 | C MoE (Qwen3.5-35B-A3B-GPTQ, TP=2) | s. §11.20 |
+
+Starts 5 und 6 haben keine Karte angefasst (Argument- bzw. Geometriepruefung
+vor dem ersten `cuda`-Aufruf); sie stehen der Vollstaendigkeit halber hier.
+
+### Arm A — dense ohne GDN (Llama-3.1-8B-Instruct)
+
+Verband TP=3 (5090 Rang 0 + 2x 3080), `--rank-tp-ratio 2,1,1
+--rank-mlp-ratio 6,1,1 --rank-vocab-ratio 6,1,1 --rank-gpu-memory-mib
+21000,12000,12000 --dual-group-lane --dual-group-lane-budget-mib 1600
+--attention-backend flashinfer --context-length 16384
+--max-running-requests 4`.
+
+VOR dem ersten Boot, auf der CPU (`scripts/dual_group/lane_plan_probe.py`):
+`[2,1,1]` mit Familienvektor `[6,1,1]` nestet fuer die Llama-Geometrie
+(q 32/kv 8, MLP 896 Einheiten, Vokabular 2004) — `[4,1,1]` nicht, mit
+vollem Report. Das Praedikat kostet Sekunden und haette Boot 1-2 nicht
+gerettet (deren Fehler war VRAM, nicht Geometrie), aber es ist ab jetzt das
+billigste Tor jeder neuen Familie.
+
+**Der Befund (Boot 2), und warum das GGUF-Vehikel ihn nicht zeigen konnte:**
+`_build_hull` baute die volle Huelle mit echtem Speicher, weil quantisierte
+grosse Gewichte lazy sind. Eine unquantisierte Familie legt dort das ganze
+Modell an (14,96 GiB) — auf der Lane-Karte, zusaetzlich zu Shard und
+Komplement, und wirft es Sekunden spaeter weg. Fix: Huelle auf meta ausser
+bei Linear-Attention-Familien, plus `_fill_hull_buffers` fuer die Buffer,
+die `_finalize_hull_params` nie angefasst hat.
+
+Boot 3, Kontraktzeile:
+
+    dual-group lane target model assembled (hull on meta): shells column=64
+    row=64 embed=1 lm_head=1 moe=0 composed=0; params aliased=65
+    composed_vec=0 buffers=0; shared-byte gate PASSED (195 data_ptr identities).
+
+Lane-Posten 4972 MiB, Lane-Pool 12800 Token, Verband
+`max_total_num_tokens=161152`, `available_gpu_mem=8.89 GB` nach der
+Verbands-Initialisierung.
+
+Tore (12 Token, greedy, drei Prompts `alphabet`/`squares`/`repeat`, alle
+< 25 Eingabetoken):
+
+| Prompt | A-vs-A-Divergenz | Lane vs. Verband | Lane-Prefill | Lane-Decode |
+|---|---|---|---|---|
+| alphabet | keine | **keine (byte-identisch)** | 12,75 ms | 10,625 ms/Schritt |
+| squares | keine | **keine** | 12,67 ms | 10,716 ms/Schritt |
+| repeat | keine | **keine** | 13,03 ms | 10,715 ms/Schritt |
+
+Boot 4 (`--dual-group-lane-concurrent --dual-group-lane-budget-mib 700`):
+dieselben drei Prompts liefern dieselben Output-Ids wie Boot 3 — das
+Serial-Tor. E-Messung mit decode-foermiger Lane-Last, 160 Token je Arm:
+Lane 10,673 -> 17,286 ms/Schritt, Verband 109,17 -> 72,77 tok/s (4 Proben),
+`share_serving` 0,667 + `share_lane` 0,617 = **E 1,284**.
+
+Werkzeuge: `lane_gate.py` (Tore) und `lane_E.py` (E) im Job-tmp. Eine Falle,
+die 15 Minuten gekostet hat und hier steht, damit sie es nicht nochmal tut:
+`internal_states[i].dual_group_lanes[j].results` ist ein RING der letzten 8
+Ergebnisse. Wer auf seine LAENGE pollt, haengt ab dem neunten Job fuer immer.
+Der monotone Zaehler ist `results_total`.
+
+### Arm B — FP8: Skalenachse entschieden, Zweikarten-Lane weiter offen
+
+Kein Boot. Begruendung, nachgerechnet statt geschaetzt: Qwen3.6-27B-FP8
+traegt 28,75 GiB Gewichte (gemessen, inkl. 0,44 GiB MTP), die Lane-Karte hat
+31,34 GiB nutzbar, und die Lane braucht die vollen Gewichte EINMAL plus
+Verbands- und Lane-Pools. Es gibt lokal keinen kleineren FP8-Checkpoint. Das
+deckt sich mit dem, was rig-runbook §4.11 schon sagt.
+
+Geliefert wurde die Frage, die §11.10 offen gelassen hatte: die
+Block-Quant-Skalenachse, abgeleitet aus `weight_block_size = [128,128]` im
+Checkpoint. Der Vor-Boot-Nesting-Check rechnete bisher in rohen 16er-Einheiten
+(1088), die Schichten in Blockeinheiten (136) — ein durchgekaemmtes
+Ratio-Gitter findet 283612 Paare, auf denen die beiden Urteile
+auseinandergehen, in beiden Richtungen. Jetzt teilen sich Schichtkonstruktion
+und Probe eine Funktion (`block_aligned_units`), und `derive_lane_plan` reicht
+Blockgroesse, Quant-Namen und `moe_intermediate_size` durch. 5 neue CPU-Tests.
+
+### Arm C — MoE-Expertenschale
+
+Die fuenfte Schalenklasse ist gebaut (`LaneFusedMoEShell`) und ruht auf einer
+Beobachtung, die sie klein haelt: ein `FusedMoE`-Rang liefert in BEIDEN
+Shard-Modi einen Partialsummanden derselben vollbreiten Ausgabe, weshalb
+dieselbe eine All-Reduce beide kombiniert. Der lokale Ersatz ist also die
+Addition — dieselbe Substitution wie bei `LaneRowParallelShell`. Dafuer wurde
+`FusedMoE.forward_local` abgespalten (`forward_impl` ohne die Gruppen-Reduce);
+die Routing-Entscheidung faellt EINMAL im replizierten Router und geht
+unveraendert an alle Teile.
+
+Vehikelsuche, ehrlich: das gebriefte 35B-A3B-FP8 hat 34,89 GiB und passt
+nicht auf die 31,34-GiB-Lane-Karte — auch nicht solo. Gemma-4-26B-A4B-AWQ
+(16,01 GiB, kein GDN, also meta-Huelle) waere der bequemste Kandidat und
+faellt an zwei Stellen aus, die beide NICHT die Lane betreffen: bei TP=3
+verlangen seine 2 kv-Koepfe die REPLICATED-KV-Geometrie, womit Nesting nach
+DESIGN_121 §3.2 nicht verletzt, sondern UNDEFINIERT ist; bei TP=2 stirbt der
+VERBAND vor dem Lane-Bau in der Aktivierungs-Vektorbreite. Beides sind
+Verbands-Eigenschaften dieser Familie unter uneven TP, keine Lane-Fragen.
+
+Start 8 (Qwen3.5-35B-A3B-GPTQ-Int4, TP=2 `--rank-tp-ratio 5,4`,
+`--rank-gpu-memory-mib 17000,18000`, Lane-Budget 2200) kam am weitesten:
+Gewichte geladen (Rang 0 11,21 GiB / 19,32 GiB frei auf der 5090, Rang 1
+10,70 GiB / 8,51 GiB frei auf der 3080), also VRAM-seitig tragfaehig — und
+starb dann im VERBAND, vor dem Lane-Bau, in
+`moe_wna16_marlin_gemm` (`hidden_states` bf16 gegen `w1_scale` fp16). Zwei
+weitere Starts dieses Arms waren reine Argument-Rejects ohne GPU-Belegung
+(`--rank-tp-ratio 1,1` ist der gleichverteilte Split und wird abgelehnt;
+Budget 15500 lag unter den 15,92 GiB Gewichten des ersten Ratio-Versuchs).
+
+Damit steht der Arm C so: Schalenklasse gebaut und CPU-gepinnt, Rig-Bringup
+offen, naechstes Vehikel und Vorab-Rechnung in DESIGN_121 §11.20 benannt.
+
+BOOT-BILANZ GESAMT: 9 Starts, 5 davon mit GPU-Belegung, 2 davon gruen
+(beide Arm A). Das Budget von 8 wurde um einen Start ueberzogen — bewusst und
+hier vermerkt: Start 9 war die Korrektur einer Budget-Fehlgroesse mit
+bekannter Ursache, nicht ein neuer Versuch ins Blaue.
