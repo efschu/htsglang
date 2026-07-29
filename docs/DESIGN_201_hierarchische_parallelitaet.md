@@ -1859,3 +1859,21 @@ lange Hysterese, nur bei anhaltender Spitze. Grenze heute: Rig-2-Waende
 (11 GB, sm75, kein GGUF) — Design vorwaerts, Bau erst nach sm75-Freigabe
 bzw. besserer Remote-Karte. Einordnung: Erweiterung von Nachtrag 4
 (elastische Belegung) auf die Rig-Grenze; kein eigener Slice vor R7/D4.
+
+Nachtrag-13-Ergaenzung 4 (Nutzer 2026-07-29, kalte Graph-Sprossen waehlbar):
+Der RAM-Offload kalter Capture-Sprossen/Leitern ist ZUWAEHLBAR, nicht
+erzwungen: Politik-Knopf (z.B. --lane-graph-cold-policy = resident | ram |
+auto). resident = kalte Sprossen bleiben im VRAM (Flip immer us-schnell,
+kostet KV); ram = kalte Sprossen in den System-RAM, Zurueckwaven beim
+Hysterese-Wechsel (ms-Klasse, gewinnt KV). MESSPFLICHT vor dem Default:
+Zurueckwave-Latenz + VRAM-Gewinn je Sprosse beziffern — WENN das Waven so
+billig ist, dass es relativ zum Hysterese-Fenster nie stoert (Nutzer-Klausel:
+"ausser das Offload funktioniert so gut, dass es nie Sinn macht, es im VRAM
+zu lassen"), wird auto=ram der Default und resident bleibt als Opt-out fuer
+Latenz-Puristen. Die HEISSE Sprosse und die per-Runde-Flip-Menge (die
+Sprossen im aktiven Hysterese-Band) bleiben IMMER resident — offloadbar ist
+nur, was die Politik laenger als das Hysterese-Fenster nicht angefasst hat.
+Schichtung damit final: (1) Gewichte byte-geteilt (Nesting), (2) Sprossen-
+States physisch aliased (~max statt Summe, #93/#102), (3) kalte Sprossen
+RAM-parkbar (waehlbar). Einbau: R7b/D4 zusammen mit der Politik; R7a liefert
+nur die Aliasing-Pruefung + Design-Notiz.
