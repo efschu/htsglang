@@ -8228,3 +8228,144 @@ der Re-Seed die Bruecke nicht anfasst.
   misst man den Fallback.
 - **Freiraum je 3080 auf dem GGUF-Q3-Vehikel** bleibt ungemessen und ist die
   Eingangsgroesse fuer jede Mehrkarten-Platzierung.
+
+## Runde 7c, Fortsetzung: der Boot-Queue-Vorlauf (weiter 0 Boots) — 2026-07-29
+
+Die Karten blieben beim Nutzer. Diese Fortsetzung macht die drei Dinge fertig,
+die sonst waehrend eines Boot-Fensters haetten passieren muessen — und genau das
+ist der Punkt: ein Fenster ist der teuerste Ort, um einen Tippfehler zu finden.
+
+### Der fc-Blocker ist zu
+
+`DFlashDraftModel.fc` war ein nacktes `nn.Linear` und konnte darum keinen
+gepackten Tensor aufnehmen. Es ist der groesste einzelne Tensor des
+Checkpoints (`[25600, 5120]`, 131 M der 1,73 G Parameter), also nicht
+auslassbar. Jetzt `ReplicatedLinear` mit `quant_config`.
+
+REPLIZIERT und nicht spalten-/zeilenparallel: `fc` verbraucht die
+konkatenierten Ziel-Layer-Features und erzeugt den Draft-Hidden-State, den
+jeder Rang vollstaendig braucht. Das ist zugleich die Form, die den
+Solo-Platzierungs-Pfad (Draft weight-TP=1 auf einem Host-Rang) und den
+Split-Pfad denselben Code laufen laesst.
+
+Drei Aufrufstellen zogen mit: `self.fc.in_features` -> `self.fc.input_size`
+(ein gepackter Tensor hat kein `in_features`), `self.fc(x)` -> `self.fc(x)[0]`
+(ReplicatedLinear gibt `(out, bias)` zurueck), und die K-Mismatch-Pruefung in
+`load_weights` ist jetzt ausdruecklich NUR fuer den dichten Pfad — ein gepacktes
+`fc.qweight` traegt Blockbytes, keine logische Form, und derselbe Fehler faellt
+im ersten Forward in `project_target_hidden` auf.
+
+Gegengeprueft, dass nichts Bestehendes kippt: ohne `quant_config` entsteht
+weiterhin `fc.weight` mit `(5120, 25600)`, mit GGUF-`quant_config` entstehen
+`fc.qweight` + `fc.qweight_type`. Beides ist ein Testfall.
+
+### Die Namenslücke: sieben Namen, als eigene Datei
+
+`model_loader/gguf_dflash.py`. Weder generischer Pfad noch Registry-Familie,
+und beides aus einem benennbaren Grund:
+
+- Der GENERISCHE Pfad leitet seine HF-Namen aus
+  `AutoModelForCausalLM.from_config` ab. Ein DFLASH-Draft-Config deklariert
+  `architectures: ["DFlashDraftModel"]` und mappt `AutoModel` — nicht
+  `AutoModelForCausalLM`. Die Instanziierung kann dort nicht gelingen.
+- Die REGISTRY dispatcht auf `model_type`, und der Draft-Config sagt
+  `model_type: "qwen3"`. Ein Eintrag dort wuerde jedes gewoehnliche
+  Qwen3-GGUF mitfangen. Dispatch laeuft deshalb ueber die ARCHITEKTUR.
+
+Die Map wird aus `num_hidden_layers` generiert (14 Zeilen Tabelle), nicht aus
+einem Modell entdeckt. Statt drei Ausnahmen auf eine Stock-Map zu legen, steht
+sie ganz da — sie ist exakt und ohne GPU gegen die Datei pruefbar.
+
+### Das Tor, das ein Boot-Fenster spart
+
+Auf der CPU gefahren, auf dem META-Device, also ohne VRAM und ohne Gewichte:
+
+| Stufe | Ergebnis |
+|---|---|
+| Tensoren in der Datei | 58 |
+| von der Map beansprucht | 58 / 58, kein Rest auf beiden Seiten |
+| HF-Namen vs. BF16-Checkpoint-Index | deckungsgleich |
+| Namen, die der Loader ausgibt | 94 (36 gepackt x2, 22 F32 x1) |
+| davon in `load_weights` aufgeloest | **94 / 94** |
+
+Die 94 laufen durch dieselbe Stacked-Parameter-Aufloesung wie im Betrieb: q/k/v
+fusionieren zu `qkv_proj`, gate/up zu `gate_up_proj`. Dtypes sind mitgepinnt
+(36 Q8_0 / 22 F32, `dflash_fc` gepackt, jede Norm F32) — das ist der Beleg
+dafuer, dass `fc` ein harter Blocker war und keine Stilfrage.
+
+### FUSED_GEMV_MAX_ROWS 8 -> 16
+
+Ein DFLASH-Drafter schlaegt keinen Token je Runde vor, sondern einen BLOCK von
+16. Bei 8 fiel jede Draft-Runde aus dem fused fp8-GEMV heraus in
+materialise+GEMM — eine Messung von "DFLASH auf einer fp8-Karte" waere eine
+Messung des Fallbacks gewesen. 16 bleibt Decode-Form: ein Draft-Block, eine
+Anfrage tief, nicht ein Serving-Batch.
+
+`BLOCK_M` im Kernel ist bereits 16, das Tor war die einzige Bremse. Zwei Tests
+halten die beiden Zahlen jetzt aneinander: das Tor muss den Blockdefault
+zulassen, und es darf `BLOCK_M` nicht ueberschreiten (das waere eine
+Korrektheitsfrage, keine Performancefrage). Der Blockdefault ist dafuer als
+`DEFAULT_DFLASH_BLOCK_SIZE` benannt worden, statt dass zwei Dateien sich
+zufaellig auf 16 einigen.
+
+### Die Boot-Queue
+
+`scripts/dual_group/r7c/`, vier Rezepte plus `common.sh` und eine README mit
+Reihenfolgebegruendung. Jedes Rezept loest die Kartenreihenfolge zur Laufzeit
+auf (CUDA- und NVML-Ordnung unterscheiden sich hier), bricht ab wenn eine Karte
+ueber 500 MiB liegt, setzt und raeumt `holder`, und **sampelt die freien MiB je
+Karte alle 5 s** (Queue-Punkt 4) — das ist die Eingangsgroesse, die jeder
+Mehrkarten-Platzierung fehlt, und sie kostet in einem ohnehin laufenden Boot
+nichts. Waehrend des Laufs gesampelt, nicht am Ende: der Spitzenwert entscheidet
+ueber die Passung, der Ruhezustand versteckt den Prefill-Scratch, fuer den die
+2700-MiB-Reserve existiert.
+
+| Boot | Vehikel | Was sich bewegt | Fenster |
+|---|---|---|---|
+| A | Qwen3.6-27B-FP8 (Basis) | Ziel-Quantisierung | ~35 min |
+| B | Huihui-AWQ-MTP (INT4-Body, BF16-Kopf) | NUR Kopf-Praezision | ~40 min |
+| C | GGUF-Q3 + DFLASH-Q8_0 solo auf einer 3080 | Drafter-Architektur + Platzierung | ~45 min |
+| D | GGUF-Q3 + NEXTN + Lane | Re-Seed an/aus | ~30 min |
+
+A zuerst, weil nur sein Ausgang aendert, was die anderen bedeuten. B zweitens,
+weil es die andere Haelfte derselben Frage ist: A bewegt die Ziel-Quantisierung
+mit dem Kopf im Schlepptau, B haelt das Ziel grob und hebt NUR den Kopf. Einzeln
+trennt keines von beiden "Kopf-Praezision" von "Ziel-Praezision".
+
+**Der Kopf-Arm ist aus dem Checkpoint gelesen, nicht angenommen**: alle 15
+`mtp.*`-Tensoren des Huihui-AWQ sind BF16 (424.699.392 Parameter, 810 MiB) auf
+einem AWQ-INT4-Body, `mtp` steht in `modules_to_not_convert`. Damit ist der
+F16-Kopf-Arm, den R7b nur bis Q6 vermessen hatte, ohne jede Konversion fahrbar.
+
+**Boot C kann die Lane nicht mittragen**, anders als im Auftrag angenommen: der
+NEXTN-Kopf der Lane nistet in dem Kopf, den die SERVING-Gruppe ohnehin faehrt —
+das ist der Grund, warum er 2684 statt 3300+ MiB kostet. Eine Serving-Gruppe,
+die mit DFLASH draftet, baut keinen NEXTN-Kopf, neben den die Lane nisten
+koennte. Das Re-Seed-A/B ist deshalb Boot D. Vier statt drei Boots, Budget 6.
+
+### Vorflug: jedes Flag geparst, bevor eine Karte laeuft
+
+Alle vier Startzeilen einmal durch `ServerArgs.add_cli_args` + `from_cli_args`
+geschickt. Ergebnis: 4/4 sauber, inklusive Boot C mit
+`--speculative-algorithm DFLASH --speculative-draft-placement solo
+--speculative-draft-gpu 1` — das heisst, `_handle_dflash` und
+`_handle_speculative_draft_placement` akzeptieren die Kombination, und der
+No-Rebuild-Pfad ist nicht nur gelesen, sondern validiert. Ein Flagfehler haette
+sonst ein Fenster gekostet.
+
+### CPU-Tore
+
+193 gruen ueber die drei betroffenen Dateien (`test_dual_group_concurrency` 152,
+`test_gguf_dflash_name_map` 14 neu, `test_fp8_dequant_gemv` 27), dazu 124 in
+`test_boot_constructor_integrity` / `test_kv_session_offload_unit` gegen die
+`fc`-Aenderung. ruff/black/isort/codespell ohne neue Befunde; die neun
+verbleibenden ruff-Meldungen liegen in vorbestehenden Zeilen von `loader.py`
+und `test_fp8_dequant_gemv.py`.
+
+### Was jetzt noch ein Boot ist, und nur ein Boot
+
+- Ob die Accept-Referenz auf dem FP8-Vehikel reproduziert (A).
+- Ob Kopf- oder Ziel-Praezision der Hebel ist (A+B).
+- Ob der Q8_0-GGUF-Drafter laedt und kohaerent generiert (C). Das CPU-Tor sagt
+  94/94; ein Fehlschlag dort waere neue Information.
+- Was das Re-Seed kostet und bringt (D).

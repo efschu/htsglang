@@ -50,6 +50,7 @@ the two:
 an off-switch on the fallback lane, not a second enable: the fused path is still
 reachable only where ``fp8_needs_dequant_fallback()`` already put us.
 """
+
 from __future__ import annotations
 
 import logging
@@ -75,7 +76,16 @@ except Exception:  # noqa: BLE001 - absence is a supported state, not an error
 # a DECODE optimisation, and prefill deliberately keeps the existing path --
 # that is the measured asymmetry (-69.9% decode vs -8.1% prefill) expressed as
 # code rather than as a comment.
-FUSED_GEMV_MAX_ROWS = 8
+#
+# 8 -> 16 (#274 round 7c): a DFLASH drafter proposes a whole BLOCK per round,
+# and its block size is 16 (``block_size`` in the draft config, and the value
+# every released Qwen3.6 DFLASH export carries). At 8 the drafter's own decode
+# rounds fell off the fused path entirely and took the materialise+GEMM
+# fallback -- so a measurement of "DFLASH on an fp8 card" would have been a
+# measurement of the fallback. 16 is a draft BLOCK, not a serving batch: it is
+# still decode-shaped work, one request deep, which is what the kernel's
+# asymmetry is about.
+FUSED_GEMV_MAX_ROWS = 16
 
 # Tile geometry for the PER-CHANNEL kernel, chosen by measurement on the two
 # healthy cards available (RTX 3080 sm86, RTX 5090 sm120) over the real 4B shape
@@ -117,13 +127,24 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fp8_block_dequant_gemv(
-        X, W, S, Y,
-        M, K, N,
-        stride_xm, stride_ym,
-        stride_wn, stride_wk,
-        stride_sn, stride_sk,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        BN: tl.constexpr, BK: tl.constexpr,
+        X,
+        W,
+        S,
+        Y,
+        M,
+        K,
+        N,
+        stride_xm,
+        stride_ym,
+        stride_wn,
+        stride_wk,
+        stride_sn,
+        stride_sk,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
     ):
         """y[n] = sum_k x[k] * (w[n,k] * s[n//BN, k//BK]), w stored as e4m3 bytes.
 
@@ -150,27 +171,33 @@ if _HAS_TRITON:
 
             b = tl.load(
                 W + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                mask=m2, other=0,
+                mask=m2,
+                other=0,
             ).to(tl.int32)
             sgn = 1.0 - 2.0 * ((b >> 7) & 1).to(tl.float32)
             e = (b >> 3) & 0xF
             m = (b & 0x7).to(tl.float32)
             w = sgn * tl.where(
                 e == 0,
-                m * (0.015625 / 8.0),                    # 2^-6 / 8
+                m * (0.015625 / 8.0),  # 2^-6 / 8
                 (1.0 + m / 8.0) * tl.exp2((e - 7).to(tl.float32)),
             )
             s = tl.load(
-                S + (offs_n[:, None] // BN) * stride_sn
-                  + (offs_k[None, :] // BK) * stride_sk,
-                mask=m2, other=0.0,
+                S
+                + (offs_n[:, None] // BN) * stride_sn
+                + (offs_k[None, :] // BK) * stride_sk,
+                mask=m2,
+                other=0.0,
             ).to(tl.float32)
-            wq = w * s                                    # (BLOCK_N, BLOCK_K)
+            wq = w * s  # (BLOCK_N, BLOCK_K)
 
             x = tl.load(
                 X + offs_m[:, None] * stride_xm + offs_k[None, :],
-                mask=mask_m[:, None] & mask_k[None, :], other=0.0,
-            ).to(tl.float32)                              # (BLOCK_M, BLOCK_K)
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(
+                tl.float32
+            )  # (BLOCK_M, BLOCK_K)
             # tl.dot, NOT a broadcast product: an earlier version used
             # tl.sum(x[:, None, :] * wq[None, :, :], axis=2), which materialises
             # a (BLOCK_M, BLOCK_N, BLOCK_K) intermediate in registers and
@@ -184,14 +211,22 @@ if _HAS_TRITON:
             mask=mask_m[:, None] & mask_n[None, :],
         )
 
-
     @triton.jit
     def _fp8_channel_dequant_gemv(
-        X, W, S, Y,
-        M, K, N,
-        stride_xm, stride_ym,
-        stride_wn, stride_wk,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        X,
+        W,
+        S,
+        Y,
+        M,
+        K,
+        N,
+        stride_xm,
+        stride_ym,
+        stride_wn,
+        stride_wk,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """y[m,n] = s[n] * sum_k x[m,k] * w[n,k], w stored as e4m3 bytes.
 
@@ -220,7 +255,8 @@ if _HAS_TRITON:
 
             b = tl.load(
                 W + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                mask=mask_n[:, None] & mask_k[None, :], other=0,
+                mask=mask_n[:, None] & mask_k[None, :],
+                other=0,
             ).to(tl.int32)
             # e4m3fn: 1 sign | 4 exponent (bias 7) | 3 mantissa, no inf.
             #   e > 0 : (-1)^s * 2^(e-7) * (1 + m/8)
@@ -230,13 +266,14 @@ if _HAS_TRITON:
             m = (b & 0x7).to(tl.float32)
             w = sgn * tl.where(
                 e == 0,
-                m * (0.015625 / 8.0),                    # 2^-6 / 8
+                m * (0.015625 / 8.0),  # 2^-6 / 8
                 (1.0 + m / 8.0) * tl.exp2((e - 7).to(tl.float32)),
             )
 
             x = tl.load(
                 X + offs_m[:, None] * stride_xm + offs_k[None, :],
-                mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
             ).to(tl.float32)
             acc += tl.dot(x, tl.trans(w))
 
@@ -385,12 +422,24 @@ def fused_block_dequant_gemv(
     BLOCK_N, BLOCK_K = 64, 128
     grid = (triton.cdiv(N, BLOCK_N),)
     _fp8_block_dequant_gemv[grid](
-        x2, w_u8, scale, y,
-        M, K, N,
-        x2.stride(0), y.stride(0),
-        w_u8.stride(0), w_u8.stride(1),
-        scale.stride(0), scale.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BN=bn, BK=bk,
+        x2,
+        w_u8,
+        scale,
+        y,
+        M,
+        K,
+        N,
+        x2.stride(0),
+        y.stride(0),
+        w_u8.stride(0),
+        w_u8.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        BN=bn,
+        BK=bk,
         num_warps=4,
     )
     if squeeze:
@@ -447,11 +496,20 @@ def fused_channel_dequant_gemv(
     BLOCK_N, BLOCK_K = CHANNEL_BLOCK_N, CHANNEL_BLOCK_K
     grid = (triton.cdiv(N, BLOCK_N),)
     _fp8_channel_dequant_gemv[grid](
-        x2, w_u8, s, y,
-        M, K, N,
-        x2.stride(0), y.stride(0),
-        w_u8.stride(0), w_u8.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        x2,
+        w_u8,
+        s,
+        y,
+        M,
+        K,
+        N,
+        x2.stride(0),
+        y.stride(0),
+        w_u8.stride(0),
+        w_u8.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
         num_warps=CHANNEL_NUM_WARPS,
     )
     if squeeze:

@@ -104,8 +104,10 @@ class TestFusedAccuracyBand(unittest.TestCase):
         N, K = w.shape
         x = torch.randn(K, device="cuda", dtype=torch.bfloat16)
 
-        gt = (w.to(torch.float32).view(N // bn, bn, K // bk, bk)
-              * s.view(s.shape[0], 1, s.shape[1], 1)).view(N, K) @ x.float()
+        gt = (
+            w.to(torch.float32).view(N // bn, bn, K // bk, bk)
+            * s.view(s.shape[0], 1, s.shape[1], 1)
+        ).view(N, K) @ x.float()
 
         fused = fused_block_dequant_gemv(x, w, s, [bn, bk], torch.bfloat16)
         self.assertIsNotNone(fused, "fused path should apply for a 1-row input")
@@ -113,11 +115,14 @@ class TestFusedAccuracyBand(unittest.TestCase):
             x, dequant_fp8_block_weight(w, s, [bn, bk], torch.bfloat16)
         )
 
-        rel = lambda v: ((v.float() - gt).abs() / gt.abs().clamp_min(1e-6)).mean().item()
+        rel = (
+            lambda v: ((v.float() - gt).abs() / gt.abs().clamp_min(1e-6)).mean().item()
+        )
         r_fused, r_mat = rel(fused), rel(mat)
         # The band: the fused path must be no worse than what it replaces.
         self.assertLessEqual(
-            r_fused, r_mat * 1.1,
+            r_fused,
+            r_mat * 1.1,
             f"fused rel err {r_fused:.5f} worse than materialise {r_mat:.5f}",
         )
         self.assertLess(r_fused, 0.05, "fused path is not merely worse, it is wrong")
@@ -126,8 +131,10 @@ class TestFusedAccuracyBand(unittest.TestCase):
         w, s, bn, bk = _mk(seed=3)
         N, K = w.shape
         x = torch.randn(K, device="cuda", dtype=torch.float16)
-        gt = (w.to(torch.float32).view(N // bn, bn, K // bk, bk)
-              * s.view(s.shape[0], 1, s.shape[1], 1)).view(N, K) @ x.float()
+        gt = (
+            w.to(torch.float32).view(N // bn, bn, K // bk, bk)
+            * s.view(s.shape[0], 1, s.shape[1], 1)
+        ).view(N, K) @ x.float()
         fused = fused_block_dequant_gemv(x, w, s, [bn, bk], torch.float16)
         rel = ((fused.float() - gt).abs() / gt.abs().clamp_min(1e-6)).mean().item()
         self.assertLess(rel, 0.05)
@@ -164,18 +171,24 @@ class TestDispatch(unittest.TestCase):
         got = fused_block_dequant_gemv(x, w, s, [bn, bk], torch.bfloat16)
         self.assertIsNotNone(got, "multi-row decode must take the fused path")
         self.assertEqual(tuple(got.shape), (4, N))
-        gt = x.float() @ (
-            w.to(torch.float32).view(N // bn, bn, K // bk, bk)
-            * s.view(s.shape[0], 1, s.shape[1], 1)
-        ).view(N, K).t()
+        gt = (
+            x.float()
+            @ (
+                w.to(torch.float32).view(N // bn, bn, K // bk, bk)
+                * s.view(s.shape[0], 1, s.shape[1], 1)
+            )
+            .view(N, K)
+            .t()
+        )
         rel = ((got.float() - gt).abs() / gt.abs().clamp_min(1e-6)).mean().item()
         self.assertLess(rel, 0.05, f"multi-row result wrong, mean rel err {rel}")
 
     @unittest.skipUnless(CUDA, "needs a GPU")
     def test_too_many_rows_declines(self):
         w, s, bn, bk = _mk()
-        x = torch.randn(FUSED_GEMV_MAX_ROWS + 1, w.shape[1], device="cuda",
-                        dtype=torch.bfloat16)
+        x = torch.randn(
+            FUSED_GEMV_MAX_ROWS + 1, w.shape[1], device="cuda", dtype=torch.bfloat16
+        )
         self.assertIsNone(fused_block_dequant_gemv(x, w, s, [bn, bk], torch.bfloat16))
 
     @unittest.skipUnless(CUDA, "needs a GPU")
@@ -413,7 +426,9 @@ class TestFusedGemvEnvSwitch(unittest.TestCase):
         wb, sb, bn, bk = _mk()
         xb = torch.randn(wb.shape[1], device="cuda", dtype=torch.bfloat16)
         self.assertFalse(fused_gemv_applicable(xb, wb))
-        self.assertIsNone(fused_block_dequant_gemv(xb, wb, sb, [bn, bk], torch.bfloat16))
+        self.assertIsNone(
+            fused_block_dequant_gemv(xb, wb, sb, [bn, bk], torch.bfloat16)
+        )
 
         wc, sc = _mk_channel(seed=21)
         xc = torch.randn(wc.shape[1], device="cuda", dtype=torch.bfloat16)
@@ -436,3 +451,65 @@ class TestFusedGemvEnvSwitch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRowGateCoversADraftBlock(unittest.TestCase):
+    """#274 round 7c: the row gate has to admit a whole DFLASH draft block.
+
+    A DFLASH drafter does not propose one token per round, it proposes a BLOCK
+    -- 16 rows for every released Qwen3.6 DFLASH export. With the gate at 8,
+    every one of the drafter's decode rounds fell through to materialise+GEMM,
+    so a measurement of "DFLASH on an fp8 card" would have measured the
+    fallback rather than the kernel. The gate is still a DECODE gate: 16 rows
+    is one request's draft block, not a serving batch.
+    """
+
+    def test_the_gate_admits_a_full_draft_block(self):
+        from sglang.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
+
+        self.assertGreaterEqual(
+            FUSED_GEMV_MAX_ROWS,
+            DEFAULT_DFLASH_BLOCK_SIZE,
+            "the fused fp8 GEMV declines a whole DFLASH draft block; every "
+            "draft round would silently take the materialise+GEMM fallback",
+        )
+
+    def test_the_kernel_tile_covers_the_gate(self):
+        """BLOCK_M is the tl.dot minimum, and it must not be exceeded.
+
+        The gate and the kernel's row tile are two numbers that have to move
+        together: a gate above BLOCK_M would hand the kernel more rows than one
+        tile covers, which is a correctness question and not a performance one.
+        """
+        import inspect
+
+        import sglang.srt.layers.quantization.fp8_dequant_gemv as mod
+
+        src = inspect.getsource(mod)
+        block_ms = {
+            int(line.split("=")[1].split("#")[0].strip())
+            for line in src.splitlines()
+            if line.strip().startswith("BLOCK_M =")
+        }
+        self.assertTrue(block_ms, "no BLOCK_M found to check the gate against")
+        for bm in block_ms:
+            self.assertLessEqual(FUSED_GEMV_MAX_ROWS, bm)
+
+    @unittest.skipUnless(CUDA, "needs a GPU")
+    def test_a_draft_block_dispatches_to_the_fused_path(self):
+        from sglang.srt.models.dflash import DEFAULT_DFLASH_BLOCK_SIZE
+
+        w, _s, K = _mk()[0], None, 256
+        w = torch.randn(512, K, device="cuda").to(torch.float8_e4m3fn)
+        if not fused_gemv_enabled():
+            self.skipTest("fused path disabled in this environment")
+        self.assertTrue(
+            fused_gemv_applicable(
+                torch.randn(DEFAULT_DFLASH_BLOCK_SIZE, K, device="cuda"), w
+            )
+        )
+        self.assertFalse(
+            fused_gemv_applicable(
+                torch.randn(FUSED_GEMV_MAX_ROWS + 1, K, device="cuda"), w
+            )
+        )

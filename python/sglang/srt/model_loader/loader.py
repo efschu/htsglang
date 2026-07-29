@@ -2269,12 +2269,22 @@ class GGUFModelLoader(BaseModelLoader):
         # unquantized_module_prefixes / transform_stream / mmproj_path). Model
         # types outside the registry keep the generic HF-state_dict path
         # unchanged (create_gguf_adapter returns None).
+        # A DFLASH draft checkpoint is dispatched on its ARCHITECTURE, ahead of
+        # the model_type registry: its config says model_type "qwen3", so a
+        # registry entry would swallow every plain Qwen3 GGUF, and the generic
+        # path cannot help either (it derives names from
+        # AutoModelForCausalLM.from_config, which a DFlashDraftModel is not).
+        from sglang.srt.model_loader.gguf_dflash import (
+            build_dflash_name_map,
+            is_dflash_gguf_config,
+        )
         from sglang.srt.model_loader.gguf_registry import create_gguf_adapter
 
-        gguf_adapter = create_gguf_adapter(
-            model_config.hf_config, local_model_path
-        )
-        if gguf_adapter is not None:
+        gguf_adapter = create_gguf_adapter(model_config.hf_config, local_model_path)
+        if is_dflash_gguf_config(model_config.hf_config):
+            gguf_adapter = None
+            gguf_weights_map = build_dflash_name_map(model_config.hf_config)
+        elif gguf_adapter is not None:
             gguf_weights_map = gguf_adapter.build_name_map()
         else:
             gguf_weights_map = self._get_gguf_weights_map(model_config)
@@ -2291,7 +2301,20 @@ class GGUFModelLoader(BaseModelLoader):
         # the GGUF (create_gguf_adapter would re-parse it). Parked in the
         # manifest by the write path.
         _gguf_unquantized_prefixes: List[str] = []
-        if gguf_adapter is not None and quant_config is not None:
+        if is_dflash_gguf_config(model_config.hf_config) and quant_config is not None:
+            # Every DFLASH export keeps its norms F32, so they must stay dense
+            # or the loader would look for a `qweight` the file does not hold.
+            # They are RMSNorm today (no quant method, hence already dense), so
+            # this is a guard against a future export, not a fix for this one.
+            from sglang.srt.model_loader.gguf_dflash import (
+                dflash_unquantized_module_prefixes,
+            )
+
+            for prefix in dflash_unquantized_module_prefixes(model_config.hf_config):
+                _gguf_unquantized_prefixes.append(prefix)
+                if prefix not in quant_config.modules_to_not_convert:
+                    quant_config.modules_to_not_convert.append(prefix)
+        elif gguf_adapter is not None and quant_config is not None:
             # GDN in_proj_ba (and any other F32-in-GGUF projection) must be built
             # unquantized so the plain-`weight` tensor loads (see adapter).
             for prefix in gguf_adapter.unquantized_module_prefixes():
