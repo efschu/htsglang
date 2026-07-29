@@ -541,3 +541,318 @@ class LaneSpecPolicy:
                 if (c := self.marginal_cost(j)) is not None or True
             },
         }
+
+
+# ======================================================================
+# Turn routing: WHICH DRAFTER, and the load axis (#274 round 7b)
+# ======================================================================
+#
+# DESIGN_201 nachtrag 13c/13d/13e, built as ONE object with several actuators
+# rather than three regulators, because they all read the same round and would
+# otherwise contradict each other at the same boundary. The actuators are:
+#
+#   * ALGORITHM -- nextn | dflash. A lane per algorithm (nachtrag 13, point 5);
+#     switching is a plan flip on the capture ladder, never a re-capture.
+#   * RUNG (K) -- delegated to LaneSpecPolicy above, which owns the margin.
+#   * TOPK -- carried as a FIELD and deliberately not wired. #141 is the same
+#     rule for tree width (widen only when occupancy is low), and the lane's
+#     topk > 1 is a measured loss under uneven DCP (register entry #76), so the
+#     field exists to keep the three actuators in one object and nothing reads
+#     it yet.
+#
+# The routing rule is DETERMINISTIC, not a bandit. The turn boundary is a KNOWN
+# regime change -- exactly where the old cross-algo bandit won -- so it can be
+# taken without learning cost and without the self-conditioning trap that
+# measurement carried (register entry: cross-algo bandit #156).
+#
+# The rule, in the corrected form of nachtrag 13d (the earlier version claimed
+# the task-type axis was unmeasured; it is measured, and DFLASH is very poor on
+# prose):
+#
+#     DFLASH  <=  (content is code OR this is the first request of a session)
+#                 AND content is not prose
+#                 AND context length < the drafter's training window
+#                 AND the load axis is not asking for the cheaper drafter
+#     otherwise NEXTN.
+#
+# The context bound is READ, never written down: ``derive_ctx_gate_threshold``
+# in speculative/cross_algo_utils.py already derives it from the DRAFTER's
+# config.json (sliding window x factor, capped at max_position_embeddings) and
+# is the single place that knows the z-lab recipe. This policy takes the number
+# as a constructor argument so the module keeps its no-sglang-import property.
+#
+# The accept guard is the NET, not the mechanism: both content axes are known
+# up front now, so the guard should rarely fire. It exists because DFLASH's
+# acceptance collapses on content the two axes misclassify, and the collapse is
+# visible in the per-position counters within a few rounds.
+
+
+LANE_DRAFTER_NEXTN = "nextn"
+LANE_DRAFTER_DFLASH = "dflash"
+
+LANE_LOAD_POLICIES = ("auto", "nextn-under-load", "fixed")
+
+# Occupancy above which the load axis asks for the cheaper drafter. Documented
+# rather than tuned: the sensor is the group-wide saturation signal D4/#279
+# builds (the LaneShareMeter card-equivalent counters of slice D1), and until
+# it is sharp the threshold is only ever compared against a value the caller
+# passes in. 0.85 is the point at which slice C measured the serving group's
+# own decode already contending for SMs.
+DEFAULT_LANE_LOAD_THRESHOLD = 0.85
+
+
+class LaneDrafterDecision:
+    """What the policy decided, and why -- the why is not decoration.
+
+    ``preferred`` is what the rule asked for, ``algorithm`` is what the lane
+    can actually run. They differ whenever the preferred drafter has no lane
+    built (today: always, for DFLASH), and reporting both is what makes the
+    policy testable and measurable BEFORE the second lane exists.
+    """
+
+    __slots__ = ("preferred", "algorithm", "rung", "topk", "reason", "guarded")
+
+    def __init__(
+        self,
+        preferred: str,
+        algorithm: str,
+        rung: Optional[int] = None,
+        topk: int = 1,
+        reason: str = "",
+        guarded: bool = False,
+    ):
+        self.preferred = preferred
+        self.algorithm = algorithm
+        self.rung = rung
+        self.topk = topk
+        self.reason = reason
+        self.guarded = guarded
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "preferred": self.preferred,
+            "algorithm": self.algorithm,
+            "rung": self.rung,
+            "topk": self.topk,
+            "reason": self.reason,
+            "guarded": self.guarded,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"LaneDrafterDecision({self.as_dict()})"
+
+
+class LaneDrafterPolicy:
+    """Deterministic turn routing across the lane's drafters.
+
+    Stateful over a boot for two reasons only: the hysteresis window (an
+    algorithm change is a plan flip, and flapping between two lanes costs more
+    than either choice) and the accept guard's per-algorithm evidence.
+
+    ``available`` is the set of algorithms that actually have a lane. It is a
+    constructor argument rather than something inferred, because "the DFLASH
+    lane was not built" and "the DFLASH lane failed" must not look the same to
+    a policy that would otherwise silently keep preferring it.
+    """
+
+    def __init__(
+        self,
+        available: Sequence[str] = (LANE_DRAFTER_NEXTN,),
+        ctx_gate_tokens: Optional[int] = None,
+        load_policy: str = "auto",
+        load_threshold: float = DEFAULT_LANE_LOAD_THRESHOLD,
+        hysteresis: int = 4,
+        accept_guard_floor: float = 0.25,
+        accept_guard_rounds: int = 8,
+        default_algorithm: str = LANE_DRAFTER_NEXTN,
+    ):
+        avail = tuple(dict.fromkeys(a for a in available if a))
+        if not avail:
+            raise ValueError("LaneDrafterPolicy needs at least one available drafter")
+        if load_policy not in LANE_LOAD_POLICIES:
+            raise ValueError(
+                f"--lane-drafter-load-policy must be one of {LANE_LOAD_POLICIES}; "
+                f"got {load_policy!r}"
+            )
+        self.available: Tuple[str, ...] = avail
+        self.ctx_gate_tokens = None if ctx_gate_tokens is None else int(ctx_gate_tokens)
+        self.load_policy = load_policy
+        self.load_threshold = float(load_threshold)
+        self.hysteresis = max(1, int(hysteresis))
+        self.accept_guard_floor = float(accept_guard_floor)
+        self.accept_guard_rounds = max(1, int(accept_guard_rounds))
+        self.current = default_algorithm if default_algorithm in avail else avail[0]
+        # Hysteresis: how many consecutive rounds have voted for something
+        # other than ``current``. A switch needs the whole window.
+        self._pending: Optional[str] = None
+        self._pending_n = 0
+        self._decisions = 0
+        self._switches = 0
+        self._reasons: Dict[str, int] = {}
+        # Accept guard evidence, per algorithm: rounds seen and how often
+        # position 0 was accepted. Raw counts -- the guard is a safety net and
+        # should answer to the whole run, not to the last few rounds.
+        self._guard_rounds: Dict[str, int] = {}
+        self._guard_hits: Dict[str, int] = {}
+        self._guarded: set = set()
+
+    # -- evidence ------------------------------------------------------
+
+    def observe(self, algorithm: str, position0_accepted: bool) -> None:
+        """One speculative round of ``algorithm``: was proposal 0 accepted?
+
+        Position 0 rather than the mean accept length, for the reason the rung
+        policy already documents: a mean cannot separate a head that is right
+        once from one that degrades evenly, and the guard is about the former.
+        """
+        self._guard_rounds[algorithm] = self._guard_rounds.get(algorithm, 0) + 1
+        if position0_accepted:
+            self._guard_hits[algorithm] = self._guard_hits.get(algorithm, 0) + 1
+        if (
+            algorithm != LANE_DRAFTER_NEXTN
+            and self._guard_rounds[algorithm] >= self.accept_guard_rounds
+            and self.position0_accept(algorithm) < self.accept_guard_floor
+        ):
+            self._guarded.add(algorithm)
+
+    def position0_accept(self, algorithm: str) -> float:
+        n = self._guard_rounds.get(algorithm, 0)
+        if n <= 0:
+            return 1.0
+        return self._guard_hits.get(algorithm, 0) / n
+
+    def guarded(self, algorithm: str) -> bool:
+        return algorithm in self._guarded
+
+    # -- the rule ------------------------------------------------------
+
+    def preferred_algorithm(self, ctx: Dict[str, Any]) -> Tuple[str, str]:
+        """The rule of nachtrag 13d/13e, evaluated in priority order.
+
+        Order matters and is the priority-class promise of nachtrag 5 first:
+        a protected request never pays for another class's drafter, so a
+        protected round under load takes the cheap drafter before any content
+        argument is even looked at.
+        """
+        load = ctx.get("load")
+        content = (ctx.get("content") or "").lower() or None
+        turn = ctx.get("turn_index")
+        ctx_len = ctx.get("context_len")
+
+        if self.load_policy == "fixed":
+            return self.current, "load-policy fixed"
+
+        # LOAD, first: the actuator of nachtrag 13e. Under a peak the cheaper
+        # drafter wins regardless of content, and for a protected request that
+        # is not a preference but the priority promise.
+        if load is not None and float(load) >= self.load_threshold:
+            if self.load_policy in ("auto", "nextn-under-load"):
+                why = "load>=%.2f" % self.load_threshold
+                if ctx.get("protected"):
+                    why += " (protected class)"
+                return LANE_DRAFTER_NEXTN, why
+
+        # PROSE is a hard veto: DFLASH is measured very poor there, and no
+        # turn index or context length redeems it.
+        if content == "prose":
+            return LANE_DRAFTER_NEXTN, "prose content"
+
+        first_request = turn is not None and int(turn) <= 0
+        if not (content == "code" or first_request):
+            return LANE_DRAFTER_NEXTN, "neither code content nor first request"
+
+        # CONTEXT WINDOW, read from the drafter's own config by the caller.
+        # None means the drafter declared nothing usable and the gate is off --
+        # the same convention derive_ctx_gate_threshold uses.
+        if (
+            self.ctx_gate_tokens is not None
+            and ctx_len is not None
+            and int(ctx_len) >= self.ctx_gate_tokens
+        ):
+            return (
+                LANE_DRAFTER_NEXTN,
+                f"context {int(ctx_len)} >= drafter window {self.ctx_gate_tokens}",
+            )
+
+        if self.guarded(LANE_DRAFTER_DFLASH):
+            return (
+                LANE_DRAFTER_NEXTN,
+                "accept guard: dflash position-0 acceptance %.3f < %.2f"
+                % (
+                    self.position0_accept(LANE_DRAFTER_DFLASH),
+                    self.accept_guard_floor,
+                ),
+            )
+
+        why = "code content" if content == "code" else "first request"
+        return LANE_DRAFTER_DFLASH, why
+
+    def decide(self, ctx: Optional[Dict[str, Any]] = None) -> LaneDrafterDecision:
+        """Route ONE round. Cheap by construction: comparisons, no model."""
+        ctx = dict(ctx or {})
+        self._decisions += 1
+        preferred, reason = self.preferred_algorithm(ctx)
+
+        # AVAILABILITY, after the rule and not inside it. The rule's answer is
+        # what R7c's second lane will make effective; recording it now is what
+        # lets the policy be measured before that lane exists.
+        if preferred in self.available:
+            chosen = self._apply_hysteresis(preferred)
+        else:
+            chosen = (
+                self.current if self.current in self.available else self.available[0]
+            )
+            reason += f"; {preferred} lane not built"
+
+        self._reasons[reason] = self._reasons.get(reason, 0) + 1
+        return LaneDrafterDecision(
+            preferred=preferred,
+            algorithm=chosen,
+            rung=ctx.get("rung"),
+            topk=int(ctx.get("topk") or 1),
+            reason=reason,
+            guarded=self.guarded(preferred),
+        )
+
+    def _apply_hysteresis(self, want: str) -> str:
+        """A switch needs ``hysteresis`` consecutive votes.
+
+        An algorithm change is a plan flip between two lanes; it is cheap but
+        not free, and the axis it follows (turn boundaries, load peaks) is
+        precisely the one that produces short bursts of disagreement.
+        """
+        if want == self.current:
+            self._pending = None
+            self._pending_n = 0
+            return self.current
+        if self._pending == want:
+            self._pending_n += 1
+        else:
+            self._pending = want
+            self._pending_n = 1
+        if self._pending_n >= self.hysteresis:
+            self.current = want
+            self._pending = None
+            self._pending_n = 0
+            self._switches += 1
+        return self.current
+
+    # -- reporting -----------------------------------------------------
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "available": list(self.available),
+            "current": self.current,
+            "ctx_gate_tokens": self.ctx_gate_tokens,
+            "load_policy": self.load_policy,
+            "load_threshold": round(self.load_threshold, 4),
+            "hysteresis": self.hysteresis,
+            "decisions": self._decisions,
+            "switches": self._switches,
+            "reasons": dict(sorted(self._reasons.items())),
+            "guarded": sorted(self._guarded),
+            "position0_accept": {
+                a: round(self.position0_accept(a), 4)
+                for a in sorted(self._guard_rounds)
+            },
+        }

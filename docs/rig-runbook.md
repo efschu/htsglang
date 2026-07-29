@@ -1160,6 +1160,36 @@ grain, never mid-kernel.
   `head_graph: false` is a falsifier arm (68 ms eager verify against 21 ms
   captured) and is deliberately not observed. Running the byte gates first and
   the adaptive arm second in the same boot used to poison the cost model.
+- **THE ACCEPT BAND ON THIS VEHICLE IS ~1.3, AND THAT IS THE SERVING GROUP'S
+  NUMBER, NOT THE LANE'S** (#274 round 7b). Measured with
+  `SGLANG_ACCEPT_POSITION_PROBE=1` and
+  `scripts/dual_group/lane_accept_probe.py`, which puts both per-position
+  curves side by side out of ONE boot on the same token ids, at K = 3:
+  serving 51.2 / 6.2 / 0.0 % against lane 50.0 / 8.1 / 0.0 % (squares),
+  38.1 / 15.7 / 0.0 vs 33.8 / 10.6 / 0.0 (code), 23.2 / 5.6 / 0.0 vs
+  40.7 / 1.8 / 0.0 (prose). The lane matches the serving group on every
+  content, so the saturation is the HEAD's, not the lane chain's.
+  The 2.75-2.82 accept in `performance_data/04` is a DIFFERENT vehicle
+  (Qwen3.6-27B-FP8, cross-algo path); do not carry it into a GGUF measurement
+  as a baseline. Ruled out as causes on this vehicle: content (5 types),
+  context length (42-9370 prompt tokens), MTP-head quantisation (a Q6_K head
+  measures the same band as this Q3_K one) and fine-tune. The bottleneck is
+  position 0 at 24-45 %; accept 2.8 would need ~65 % there.
+- `draft_rollback: false` is a per-job falsifier for round 7b's chain fix.
+  `_propose` advances the head by K per round and the verify commits
+  `accept + 1`; nothing put the difference back, so the head's sequence ran
+  179-224 positions ahead of the target's over a 192-token job and its KV kept
+  every rejected proposal. Fixed; the falsifier keeps the old behaviour so
+  both arms come from one boot. Measured effect on the OUTPUT: none -- the
+  192 output ids are identical either way and the position curves agree to
+  five digits. What the fix buys is correctness and the head's KV filling at
+  `accept + 1` per round instead of K (2.3x too fast on this vehicle).
+  Read `draft_lag` in the lane job result to see it.
+- **The lane's verify default is still `seqdecode`**, the round-3 correctness
+  bridge -- not the captured `target_verify`. A measurement that forgets to
+  pass `"verify": "target_verify"` per job silently gets the eager bridge:
+  71-95 ms per round and `verify_graph_rounds 0`, against 34.0-34.2 ms with
+  the graph. Round 7b lost a boot to exactly that.
 - `SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY=0` makes both classes equal
   priority. Escape hatch, not a tuning knob: NCCL collective kernels
   spin-wait, so if the protected lane ever starved a freshly launched

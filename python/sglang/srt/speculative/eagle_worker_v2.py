@@ -49,6 +49,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import accept_position_probe
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -2700,6 +2701,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             weightless_recv=_wl_worker,
         )
         new_seq_lens = batch.seq_lens + accept_lens
+        # Round 7b posten 0: the serving group's PER-POSITION acceptance, so it
+        # can be put next to the lane's. Off unless the probe env is set, and
+        # the D2H it costs is the reason -- a diagnostic must not price the
+        # measurement it is the reference for.
+        if accept_position_probe.probe_enabled() and not batch.forward_mode.is_idle():
+            accept_position_probe.record_accept_lens(
+                accept_lens.tolist(), self.speculative_num_steps
+            )
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
             "clear_unaccepted_c128_draft_states",

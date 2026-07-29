@@ -2381,5 +2381,330 @@ class TestLaneSpecPolicy(unittest.TestCase):
         self.assertEqual(p.candidate_rungs({"rungs": [9]}), (0, 1, 2, 3))
 
 
+class TestLaneDraftRollback(unittest.TestCase):
+    """#274 round 7b posten 0: the head's sequence follows the target's.
+
+    ``_propose`` advances the head by K per round and the verify commits
+    ``n_accept + 1``. Nothing put the difference back, so from the second
+    round on the head answered about a position the sequence was not at, over
+    a KV cache still holding every rejected proposal -- measured on the rig as
+    a lag of 179-224 positions over a 192-token job. These are the arithmetic
+    of the fix, on the CPU.
+    """
+
+    def _lane_and_batch(self, start=10, steps=3):
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        class _Fake(DualGroupLane):
+            def __init__(self):
+                self.spec_steps = steps
+
+        lane = _Fake()
+        batch_d = _StubVerifyBatch(start + steps)
+        req = _StubReq()
+        req.decode_batch_idx = steps
+        req.req_pool_idx = 0
+        batch_d.reqs = [req]
+        batch_d.req_to_token_pool.req_to_token[0, : start + steps] = torch.arange(
+            500, 500 + start + steps, dtype=torch.int32
+        )
+        job = {
+            "_batch_d": batch_d,
+            "_round_start": start,
+            "_rung": steps,
+            "_kv_len_draft": start + steps,
+        }
+        return lane, batch_d, job, req
+
+    def test_a_rejected_chain_gives_its_slots_and_its_positions_back(self):
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        # Nothing accepted: the round commits 1 token, the head ran 3.
+        lane._rollback_draft(job, n_accept=0)
+        self.assertEqual(int(batch_d.seq_lens[0]), 11)
+        self.assertEqual(int(batch_d.seq_lens_cpu[0]), 11)
+        self.assertEqual(job["_kv_len_draft"], 11)
+        self.assertEqual(req.kv_committed_len, 11)
+        # Exactly the two rejected proposals' slots came back.
+        self.assertEqual(batch_d.freed, [[511, 512]])
+
+    def test_a_partly_accepted_chain_keeps_the_accepted_positions(self):
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        lane._rollback_draft(job, n_accept=1)
+        self.assertEqual(int(batch_d.seq_lens[0]), 12)
+        self.assertEqual(batch_d.freed, [[512]])
+
+    def test_a_fully_accepted_chain_needs_no_truncation(self):
+        """kept == K: the head is exactly where the target is, nothing to do."""
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        lane._rollback_draft(job, n_accept=2)
+        self.assertEqual(int(batch_d.seq_lens[0]), 13)
+        self.assertEqual(batch_d.freed, [])
+
+    def test_the_per_job_falsifier_leaves_the_defect_in_place(self):
+        """Both arms have to come from ONE boot, or the gate carries variance."""
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        job["draft_rollback"] = False
+        lane._rollback_draft(job, n_accept=0)
+        self.assertEqual(int(batch_d.seq_lens[0]), 13)
+        self.assertEqual(batch_d.freed, [])
+
+    def test_full_accept_runs_the_one_missing_head_forward(self):
+        """kept == K + 1: the bonus token has no head position yet.
+
+        The head ran K forwards, the round committed K + 1 tokens, so exactly
+        one position is missing and one head forward fills it -- against the
+        TARGET's hidden state of the row before it, the same pairing every
+        other chain step uses.
+        """
+        import torch
+
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        seen = {}
+
+        def _fwd(b, hidden):
+            seen["hidden"] = hidden
+            seen["input_ids"] = b.input_ids
+
+        lane._draft_forward = _fwd
+        batch_d.prepare_for_decode = lambda: batch_d.seq_lens.add_(1)
+        job["_verify_last_token"] = torch.tensor([77], dtype=torch.int64)
+        job["_verify_hidden"] = torch.zeros((1, 4))
+        job["_kv_len_draft"] = 13
+        lane._rollback_draft(job, n_accept=3)
+        self.assertEqual(int(seen["input_ids"][0]), 77)
+        self.assertEqual(job["_kv_len_draft"], 14)
+        self.assertEqual(int(batch_d.seq_lens[0]), 14)
+        self.assertEqual(batch_d.freed, [])
+
+    def test_full_accept_without_a_stashed_row_does_not_guess(self):
+        """The seqdecode bridge produces no row block, so it stashes nothing."""
+        lane, batch_d, job, req = self._lane_and_batch(start=10, steps=3)
+        lane._draft_forward = lambda *a, **k: self.fail("must not forward")
+        lane._rollback_draft(job, n_accept=3)
+        self.assertEqual(int(batch_d.seq_lens[0]), 13)
+
+
+class TestAcceptPositionProbe(unittest.TestCase):
+    """#274 round 7b posten 0: the serving group's per-position counter.
+
+    The whole point of the probe is that it produces the SAME quantity the
+    lane's policy reports, so the two curves can be laid next to each other.
+    That equivalence is asserted here rather than assumed.
+    """
+
+    def setUp(self):
+        from sglang.srt.speculative import accept_position_probe
+
+        accept_position_probe.reset()
+
+    def test_a_greedy_chain_only_evaluates_up_to_the_first_rejection(self):
+        from sglang.srt.speculative import accept_position_probe as probe
+
+        # accept_len 1 == bonus token only, i.e. proposal 0 rejected.
+        probe.record_accept_lens([1, 1, 2, 4], num_proposals=3)
+        snap = probe.snapshot()
+        # Position 0 was evaluated by all four rounds, 2 of them accepted it.
+        self.assertEqual(snap["position_reached"][0], 4)
+        self.assertEqual(snap["position_hits"][0], 2)
+        # Position 1 only by the two rounds that got past position 0.
+        self.assertEqual(snap["position_reached"][1], 2)
+        # Position 2 only by the accept_len 4 round, which accepted it.
+        self.assertEqual(snap["position_reached"][2], 1)
+        self.assertEqual(snap["position_hits"][2], 1)
+        self.assertEqual(snap["accept_len_mean"], 2.0)
+
+    def test_it_agrees_with_the_lane_policys_definition(self):
+        """Same rounds, same evaluated/accepted bookkeeping in both counters.
+
+        The lane EMAs (it decides from the number, so old content must stop
+        voting) and the probe counts raw, so the two cannot be compared as
+        rates. What CAN be compared -- and what makes the two curves the same
+        quantity -- is the per-round rule: which positions a greedy chain
+        evaluates, and which of those it accepts. Driven one round at a time
+        with the EMA weight at 1.0, the policy's rate IS that round's hit flag.
+        """
+        from sglang.srt.model_executor.lane_spec_policy import LaneSpecPolicy
+        from sglang.srt.speculative import accept_position_probe as probe
+
+        for accept_len in (1, 2, 3, 4):
+            probe.reset()
+            probe.record_accept_lens([accept_len], num_proposals=3)
+            pol = LaneSpecPolicy((3,), adaptive=False, accept_ema=1.0)
+            pol.observe(3, 20.0, accept_len)
+            snap = probe.snapshot()
+            for j in range(3):
+                evaluated = snap["position_reached"].get(j, 0) == 1
+                self.assertEqual(
+                    evaluated,
+                    pol.position_accept(j) is not None,
+                    f"position {j} evaluated disagrees at accept_len {accept_len}",
+                )
+                if evaluated:
+                    # The policy clamps a rate of 1 to 0.999 on purpose (an
+                    # unbounded chain must never look free to the margin), so
+                    # the comparison is of the DECISION, not of the last digit.
+                    self.assertAlmostEqual(
+                        snap["position_hits"].get(j, 0),
+                        pol.position_accept(j),
+                        places=2,
+                        msg=f"position {j} hit disagrees at accept_len {accept_len}",
+                    )
+
+    def test_the_probe_is_off_unless_asked_for(self):
+        import os
+
+        from sglang.srt.speculative import accept_position_probe as probe
+
+        saved = os.environ.pop("SGLANG_ACCEPT_POSITION_PROBE", None)
+        try:
+            self.assertFalse(probe.probe_enabled())
+            os.environ["SGLANG_ACCEPT_POSITION_PROBE"] = "1"
+            self.assertTrue(probe.probe_enabled())
+        finally:
+            os.environ.pop("SGLANG_ACCEPT_POSITION_PROBE", None)
+            if saved is not None:
+                os.environ["SGLANG_ACCEPT_POSITION_PROBE"] = saved
+
+
+class TestLaneDrafterPolicy(unittest.TestCase):
+    """#274 round 7b posten 2: deterministic turn routing (nachtrag 13c-13e).
+
+    One object, three actuators, no learning. Every rule below is a sentence
+    from the nachtrag turned into a comparison, which is why it can be argued
+    about without a boot.
+    """
+
+    def _policy(self, **kw):
+        from sglang.srt.model_executor.lane_spec_policy import LaneDrafterPolicy
+
+        kw.setdefault("available", ("nextn", "dflash"))
+        kw.setdefault("ctx_gate_tokens", 8192)
+        kw.setdefault("hysteresis", 1)
+        return LaneDrafterPolicy(**kw)
+
+    def test_first_request_in_a_short_context_prefers_dflash(self):
+        p = self._policy()
+        d = p.decide({"turn_index": 0, "context_len": 512})
+        self.assertEqual(d.preferred, "dflash")
+        self.assertEqual(d.algorithm, "dflash")
+
+    def test_multiturn_goes_to_nextn(self):
+        p = self._policy()
+        d = p.decide({"turn_index": 3, "context_len": 512})
+        self.assertEqual(d.preferred, "nextn")
+        self.assertIn("first request", d.reason)
+
+    def test_code_content_keeps_dflash_past_the_first_turn(self):
+        p = self._policy()
+        d = p.decide({"turn_index": 7, "context_len": 512, "content": "code"})
+        self.assertEqual(d.preferred, "dflash")
+
+    def test_prose_is_a_hard_veto_even_on_the_first_request(self):
+        """13d correction: DFLASH is measured very poor on prose."""
+        p = self._policy()
+        d = p.decide({"turn_index": 0, "context_len": 128, "content": "prose"})
+        self.assertEqual(d.preferred, "nextn")
+        self.assertEqual(d.reason, "prose content")
+
+    def test_the_context_bound_is_read_not_written_down(self):
+        """The gate is whatever the caller derived from the drafter config."""
+        p = self._policy(ctx_gate_tokens=4096)
+        self.assertEqual(
+            p.decide({"turn_index": 0, "context_len": 4095}).preferred, "dflash"
+        )
+        self.assertEqual(
+            p.decide({"turn_index": 0, "context_len": 4096}).preferred, "nextn"
+        )
+        # A drafter that declares nothing usable lifts the gate entirely.
+        q = self._policy(ctx_gate_tokens=None)
+        self.assertEqual(
+            q.decide({"turn_index": 0, "context_len": 10**6}).preferred, "dflash"
+        )
+
+    def test_a_load_peak_takes_the_cheaper_drafter(self):
+        p = self._policy(load_threshold=0.8)
+        self.assertEqual(
+            p.decide({"turn_index": 0, "context_len": 128, "load": 0.5}).preferred,
+            "dflash",
+        )
+        d = p.decide({"turn_index": 0, "context_len": 128, "load": 0.9})
+        self.assertEqual(d.preferred, "nextn")
+        self.assertIn("load>=", d.reason)
+
+    def test_a_protected_request_under_load_says_so(self):
+        """Nachtrag 5: the protected class never pays for another's drafter."""
+        p = self._policy(load_threshold=0.8)
+        d = p.decide(
+            {"turn_index": 0, "context_len": 128, "load": 0.95, "protected": True}
+        )
+        self.assertIn("protected class", d.reason)
+
+    def test_fixed_load_policy_never_moves(self):
+        p = self._policy(load_policy="fixed", default_algorithm="nextn")
+        d = p.decide({"turn_index": 0, "context_len": 128, "load": 0.99})
+        self.assertEqual(d.preferred, "nextn")
+        self.assertEqual(d.reason, "load-policy fixed")
+
+    def test_an_unknown_load_policy_is_rejected_at_construction(self):
+        with self.assertRaises(ValueError):
+            self._policy(load_policy="sometimes")
+
+    def test_the_accept_guard_is_the_net(self):
+        p = self._policy(accept_guard_rounds=4, accept_guard_floor=0.25)
+        for _ in range(4):
+            p.observe("dflash", position0_accepted=False)
+        d = p.decide({"turn_index": 0, "context_len": 128})
+        self.assertEqual(d.preferred, "nextn")
+        self.assertIn("accept guard", d.reason)
+
+    def test_the_guard_does_not_fire_on_a_healthy_drafter(self):
+        p = self._policy(accept_guard_rounds=4, accept_guard_floor=0.25)
+        for i in range(8):
+            p.observe("dflash", position0_accepted=i % 4 != 0)
+        self.assertFalse(p.guarded("dflash"))
+        self.assertEqual(
+            p.decide({"turn_index": 0, "context_len": 128}).preferred, "dflash"
+        )
+
+    def test_hysteresis_needs_a_whole_window_before_it_flips(self):
+        p = self._policy(hysteresis=3, default_algorithm="nextn")
+        short = {"turn_index": 0, "context_len": 128}
+        self.assertEqual(p.decide(short).algorithm, "nextn")
+        self.assertEqual(p.decide(short).algorithm, "nextn")
+        self.assertEqual(p.decide(short).algorithm, "dflash")
+        self.assertEqual(p.stats()["switches"], 1)
+
+    def test_a_preference_for_a_lane_that_does_not_exist_is_recorded_not_taken(self):
+        """Today's state: NEXTN only, and the policy still says what it wanted.
+
+        This is what makes the routing measurable before R7c builds the second
+        lane -- and what stops "not built" looking like "not preferred".
+        """
+        p = self._policy(available=("nextn",))
+        d = p.decide({"turn_index": 0, "context_len": 128})
+        self.assertEqual(d.preferred, "dflash")
+        self.assertEqual(d.algorithm, "nextn")
+        self.assertIn("lane not built", d.reason)
+
+    def test_topk_is_carried_and_not_wired(self):
+        """#141 lives in the same object; nothing reads the field yet."""
+        p = self._policy()
+        self.assertEqual(p.decide({"turn_index": 0, "context_len": 1}).topk, 1)
+        self.assertEqual(
+            p.decide({"turn_index": 0, "context_len": 1, "topk": 4}).topk, 4
+        )
+
+    def test_stats_report_the_decision_mix(self):
+        p = self._policy()
+        p.decide({"turn_index": 0, "context_len": 128})
+        p.decide({"turn_index": 2, "context_len": 128})
+        st = p.stats()
+        self.assertEqual(st["decisions"], 2)
+        self.assertEqual(st["ctx_gate_tokens"], 8192)
+        self.assertEqual(sum(st["reasons"].values()), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

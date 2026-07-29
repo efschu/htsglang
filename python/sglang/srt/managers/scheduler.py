@@ -4590,6 +4590,14 @@ class Scheduler(
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
 
+        # Round 7b posten 0: the serving group's per-position acceptance curve,
+        # in the same shape the lane's policy reports, so the two can be read
+        # next to each other. Present only when the probe env is set.
+        from sglang.srt.speculative import accept_position_probe
+
+        if accept_position_probe.probe_enabled():
+            ret["spec_accept_positions"] = accept_position_probe.snapshot()
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
