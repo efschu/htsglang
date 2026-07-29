@@ -1889,3 +1889,15 @@ max-Token(VRAM->KV)-Abwaegung, die der Planner je Karte rechnen kann
 (Fit-Tabelle je Quant-Stufe). Alles-greift-in-alles: kombinierbar mit
 Lane-Platzierung, K-Leiter, Turn-Routing, Redundanz-Budget; kein Ausschluss
 ohne benannte harte Grenze.
+
+Nachtrag-13g-Anker (Recherche 2026-07-29, docs/EVAL_dflash_fp8.md): Fuer
+DFLASH konkret gemessen (Community, dieser Drafter): Q8_0 = F16-Qualitaet
+(36-45 % Accept), Q4_K_M bricht auf 28-29 % ein — der Einbruch sitzt in den
+4 SWA-Schichten. DFLASH-Default daher Q8_0 (1,75-1,85 GB statt 3,47 F16);
+der Q6_K-NEXTN-Lokalbeleg traegt nur fuer die 8-bit-Klasse (1 Schicht, keine
+SWA), nicht als Freibrief nach unten. FP8-DFLASH existiert oeffentlich NICHT;
+Eigenbau (llm-compressor W8A8 per-channel) nur falls Q8_0-GGUF-Weg scheitert.
+Weitere Anker: Kopf ist bandbreitengebunden (sm120 FP8/Q8: -30 bis -45 %
+Kopf-Forward); sm86-GEMV-Gate FUSED_GEMV_MAX_ROWS=8 < DFLASH-M=16 (Einzeiler
+vor jeder 3080-Messung); groesster verlustfreier Fit-Hebel ist der
+SWA-bewusste KV-Pool (~1890 MiB) — vor jeder Quantisierung ziehen.
