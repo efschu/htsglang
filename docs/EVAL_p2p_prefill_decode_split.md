@@ -36,6 +36,18 @@ bringt P2P, **3080er nur ueber das kleine 256-MiB-BAR-Fenster, 5090 volles
    Kollektivboden im TP-Prefill (+20 bis +69 % geschaetzt, harte Decke +213 %)
    und die neue Tier-Sprosse *peer-VRAM* fuer KALTE KV-Posten. Fuer heisse
    KV-Seiten bleibt Peer-VRAM unbrauchbar (Rechnung in §5.3).
+6. **Die 5090 ist im Decode gegen ihre Rechendecke halb leer (46-51 % der
+   GEMM-Power), gegen die Speicherdecke aber zu 61-68 % belegt** — und die
+   Leerzeit ist verschraenkte Lock-Step-Wartezeit, kein auffuellbarer Block.
+   Mehr Layer darauf ist zweimal gefahren worden: **+2,8 % (unter der
+   Nachweisgrenze) und −13,7 %**. Was die Leerzeit wirklich fuellt, ist Batch
+   (427 Tok/s @bs16), Spekulation (2,89x) und eine zweite nebenlaeufige Lane
+   (E 1,440) — §4.1.
+7. **Das Optimum ist vierachsig, und die vier Optima liegen auseinander:**
+   Compute 5,19:1:1 · Bandbreite 2,35:1:1 · Latenz/Hops TP=1 solo · max-KV
+   ~1:1:1. Heute faehrt `auto-performance` den Kompromiss 1,74:1:1. **P2P
+   verschiebt keines dieser Optima** — es hebt die Prefill-Kurve parallel an
+   (Niveau-Hebel, kein Struktur-Hebel) — §4.2.
 
 ---
 
@@ -210,6 +222,243 @@ falsches Verhaeltnis, und ein Mechanismus, der Stufenzeiten addiert statt
 Bandbreiten (DESIGN_201 §3.3: "PP ist per Konstruktion exakt S-mal schlechter
 als ideales TP"). Der Layer-Split verdient sich seinen Platz nur ueber
 **Kapazitaet**, nie ueber Tempo.
+
+---
+
+## 4.1 Die 5090 ist im Decode zur Haelfte leer — was bringt "mehr Layer drauf"?
+
+Nutzerfrage 2026-07-29. Die Beobachtung stimmt, aber sie stimmt gegen eine
+andere Achse als vermutet, und die Gegenprobe ist bereits zweimal gefahren
+worden.
+
+### 4.1.1 Woher die "50 %" kommen — und woher NICHT
+
+**Nicht aus `utilization.gpu`.** Der Zaehler liest im Decode **90-93 % auf allen
+drei Karten**, in beiden A/B-Armen; er ist ausdruecklich als Wait-Proxy
+unbrauchbar protokolliert (Decode-Kernel sind klein und Rueckenn an Ruecken, der
+Zaehler saettigt). Die sensitive Achse ist Board-Power.
+
+Gegen die eigenen Kalibrierungsanker je Karte (#154: idle / membw / GEMM):
+
+| Karte | idle | membw-Anker | GEMM-Anker | Decode gemessen | vs GEMM | vs membw |
+|---|---:|---:|---:|---:|---:|---:|
+| **5090** | 47,8 W | 434 W | **576 W** | 265 W (#148) / 278-293 W (rankwait) | **46-51 %** | 61-68 % |
+| 3080 | 73,2 W | 303 W | 319 W | 276 W | **87 %** | 91 % |
+| 3080 | 72,5 W | 290 W | 319 W | 276 W | 87 % | 95 % |
+
+**Das ist die "50 %": die 5090 liegt im Decode bei ~46-51 % ihrer eigenen
+GEMM-Decke, die 3080er bei 87 %.** Gegen die *Speicher*-Decke ist der Abstand
+deutlich kleiner (61-68 % gegen 91-95 %). Genau diese Signatur — weit von der
+Rechendecke, naeher an der Speicherdecke, und beides nicht ausgereizt — ist ein
+**latenzgebundener** Arbeitspunkt: zu wenig gleichzeitige Speicheranfragen, um
+GDDR7 zu saettigen, und um Groessenordnungen zu wenig Arithmetik fuer die SMs.
+
+Zweiter Punkt, der die Frage entschaerft: die 5090 traegt heute schon **46,5 %
+Compute-Share** statt der gleichverteilten 33,3 % (`--rank-mlp-ratio [6,1,1]`,
+auto-performance) — und zieht dabei bei bs=16 die **wenigste** Leistung
+(222 W gegen je ~240 W der 3080er) und ist in **jedem** Batch-Bucket und in
+beiden Spec-Konfigurationen die J/Token-effizienteste Karte (bs=1 5,96 gegen
+5,93/6,05; bs=16 0,51 gegen 0,59/0,60). Die Konzentration hat also schon
+stattgefunden.
+
+### 4.1.2 Die Leerzeit ist kein Block, den man auffuellen kann
+
+Innerhalb eines Lock-Step-TP-Schritts ist die Leerzeit **verschraenkt**, nicht
+zusammenhaengend:
+
+* Waehrend des MLP-Segments (217,7 us) **idlen die 3080er** — gemessen
+  451/454 ms von 1600 ms Span (28 %) spinnend in NCCL-Kerneln, "by design",
+  weil `[6,1,1]` das MLP auf die 5090 konzentriert.
+* Den **Takt** setzt trotzdem GPU2 (3080): *"under lock-step TP the slowest rank
+  sets the pace, and that rank is GPU2"* — also das Attention-/KV-Segment.
+
+Mehr Layer auf die 5090 verlaengert damit **genau das Segment, in dem die
+3080er ohnehin warten**, und verkuerzt das Segment nicht, das bindet. Der
+Gewinn tritt erst ein, wenn die Segmente sich ausgleichen — und darueber
+hinaus wird die 5090 selbst zum Taktgeber [[langsamster-rang-taktgeber]].
+
+### 4.1.3 Zwei bereits gefahrene Gegenproben in genau diese Richtung
+
+| A/B | was verschoben | Effekt Decode | Nebenkosten |
+|---|---|---:|---|
+| `rankwait` capacity `[2,3,3]` → perf `[2,1,1]` | KV-Share der 5090 **verdoppelt** | **73,84 → 75,89 Tok/s = +2,8 %** | 5090 +5,5 % Leistungsaufnahme; Effekt liegt unter dem eigenen Aufloesungsvermoegen des A/B (≤3 % "by construction" nicht aufloesbar) |
+| #264 Prefill-Rebalance auf `6,1,1` | MLP noch haerter konzentriert | **−13,7 %** (ms/Verify +14,4 %) | Kontext **−47,9 %**; Prefill e2e trotzdem +8,2 % → **verworfen** |
+
+**Beide Male hat sich die Arbeit nachweislich bewegt** (die 5090 zieht messbar
+mehr Leistung), und beide Male ist daraus **kein** Systemdurchsatz geworden.
+Das ist der belastbarste Teil der Antwort: die Richtung ist nicht unerprobt,
+sie ist erprobt und hat nicht bezahlt.
+
+### 4.1.4 Was das Modell an Restpotenzial sagt — und wo die Luecke liegt
+
+Lock-Step-Optimum ist `s_r ∝ c_r`. Heute `s_5090 = 46,5 %`;
+bandbreitenproportional waeren `1,79/3,31 = 54,1 %`, compute-proportional
+(sm120 ~2,4x sm86) ~54,5 % — beide Achsen zeigen auf **~54 %**.
+
+```
+heute      t_5090 = 0,465·W/1,79 = 0,2598·W ;  t_3080 = 0,2675·W/0,76 = 0,3520·W  → max 0,3520·W
+balanciert t_5090 = 0,541·W/1,79 = 0,3022·W ;  t_3080 = 0,2295·W/0,76 = 0,3020·W  → max 0,3021·W
+Gewinn auf dem Rechensegment: 1,165  →  +16,5 %
+```
+
+Bei einem Rechenanteil von ~60 % am Decode-Schritt sind das **+5 bis +10 %
+e2e** — gegen gemessene +2,8 % (unter der Nachweisgrenze) und −13,7 %. Die
+Luecke zwischen Modell und Messung hat zwei benannte Ursachen, und keine davon
+ist "mehr Layer":
+
+1. **Die Split-Achsen sind an die KV-Kapazitaet gekoppelt** — `6,1,1` kostet
+   47,9 % Kontext, und der Verbands-KV wird ohnehin vom knappsten Rang
+   dimensioniert (die 1444 MiB, die der Speed-Dial auf der 5090 freigibt,
+   bewegen `max_total_num_tokens` nicht).
+2. **Die 5090 faehrt einen handicapten Kernel-Pfad**: 44 % ihrer
+   Decode-Kernelzeit laufen durch das Triton-`_w8a8_block_fp8_matmul`, waehrend
+   die 3080er cutlass/cublas nutzen — im Validierungsprotokoll als *"the largest
+   single-rank lever currently known on this rig"* gefuehrt. Solange das steht,
+   ist mehr Arbeit auf der 5090 mehr Arbeit im langsamen Pfad.
+
+### 4.1.5 Der Lastfall — hier dreht sich ein Teil der Antwort
+
+Die Nutzerfrage zielt ausdruecklich auf den Lastfall, und dort verschiebt sich
+das Bild in **drei** Punkten zugunsten der 5090 — aber nur einer davon ist
+"mehr Layer":
+
+| Hebel im Lastfall | gemessen | warum er die 5090-Leerzeit wirklich fuellt |
+|---|---:|---|
+| **Batch statt Layer** | 40 → **427 Tok/s** (bs=1 → bs=16), 5090 dabei effizienteste Karte in jedem Bucket | GEMM-`M` waechst; genau das saettigt die leeren SMs. FP8 skaliert 1→8 Sessions **7,2x** (fast linear) |
+| **Spekulation (MTP/adaptive)** | 40,3 → **90,7 / 116,3 Tok/s** (2,25x / 2,89x), Board-Power 640 statt 729 W | Verify ist ein mehrzeiliger Forward = kuenstlicher Batch. Groesster gemessener Wandler von 5090-Leerzeit in Token |
+| **zweite nebenlaeufige Lane auf derselben Karte** | Kartenaequivalent **E 1,440** (Decode-Lane) gegen 0,914 seriell = **+57,5 %** | Die Luecke wird von einer *unabhaengigen* Last gefuellt statt von mehr Layern derselben Lock-Step-Runde |
+| mehr Layer/Shard auf die 5090 | +2,8 % (unter Nachweisgrenze) / −13,7 % | verlaengert das Segment, in dem die 3080er ohnehin warten (§4.1.2) |
+
+Und der P2P-Bezug, weil das hier die eigentliche Frage des Dokuments ist:
+**das Kollektivbudget waechst mit der Last** — 15,8 % (single) auf **23,6 %
+(dual)** der kritischen GPU-Zeit. Der Decode-Hebel von P2P ist im Lastfall
+also groesser als bei bs=1:
+
+| Arbeitspunkt | Kollektivbudget | P2P-Decode-Aussicht |
+|---|---:|---:|
+| bs=1 | 15,8 % | **+5 bis +12 %** |
+| Lastfall (dual/concurrency) | 23,6 % | **+8 bis +18 %** |
+
+### 4.1.6 Antwort in einem Satz
+
+Die 5090 ist im Decode gegen ihre **Rechendecke** halb leer, gegen die
+**Speicherdecke** aber zu ~2/3 belegt, und ihre Leerzeit ist verschraenkte
+Lock-Step-Wartezeit statt eines auffuellbaren Blocks — mehr Layer verlaengern
+deshalb das falsche Segment (gemessen +2,8 % bzw. −13,7 %), waehrend Batch,
+Spekulation und eine zweite nebenlaeufige Lane dieselbe Leerzeit nachweislich
+in Durchsatz umsetzen (bis 427 Tok/s, 2,89x, E 1,440). Der einzige noch offene
+"mehr Arbeit auf die 5090"-Posten ist die Verschiebung von 46,5 % auf ~54 %
+Compute-Share (Modell: +5-10 % e2e) — und der ist erst sinnvoll, **nachdem**
+der cutlass-FP8-Pfad fuer sm120 den 44-%-Triton-Anteil abgeloest hat.
+
+---
+
+## 4.2 Das Optimum ist vierachsig — und die vier Optima zeigen auseinander
+
+Nutzerpraezisierung 2026-07-29: es gibt je ein Optimum fuer *auslastbares
+Compute*, fuer *Speicherbandbreite*, fuer *Latenz/Hops* — je nach Phase
+verschieden gewichtet — und beim Prefill zusaetzlich abhaengig davon, **welchen
+max-KV man ueberhaupt haben will**. Genau so ist es, und die vier Optima liegen
+auf diesem Rig nachweislich an vier verschiedenen Stellen.
+
+### 4.2.1 Die Kalibrierung der Achsen (aus gemessenen Punkten, nicht aus Datenblatt)
+
+Aus #252 (Compute-Zeit je Rang, 2048er-Chunk) und dem gemessenen Compute-Share
+0,4648 des Energie-Datensatzes:
+
+```
+5090:  s = 0,465  →  196,6 ms   →   t5(s) = 422,8 ms · s
+3080:  s = 0,2675 →  586,5 ms   →   t3(s) = 2192,5 ms · s
+                    Compute-Kapazitaetsverhaeltnis  5090 : 3080 = 5,19 : 1
+                    Bandbreitenverhaeltnis (Datenblatt) 1,79/0,76 = 2,35 : 1
+```
+
+Das Compute-Verhaeltnis ist **mehr als doppelt so gespreizt wie das
+Bandbreitenverhaeltnis** — daher kommt der ganze Konflikt.
+
+### 4.2.2 Die vier Optima, ausgerechnet
+
+| Achse | Zielfunktion | Optimum | `s_5090` | Verhaeltnis |
+|---|---|---|---:|---|
+| **Compute (Prefill)** | `min max_r s_r·W/c_r` | `s ∝ c` | **0,722** | **5,19 : 1 : 1** |
+| **Bandbreite (Decode)** | `min max_r s_r·W/b_r` | `s ∝ b` | **0,541** | **2,35 : 1 : 1** |
+| **Latenz / Hops** | `min N_koll·τ(N)` bzw. `min H·(142+249 us)` | wenigste Raenge | — | **TP=1, solo** |
+| **max KV** | `max N·min_r (V_r − fix_r(s_r) − s_r·W)` | `min` Scratch, `max` Headroom des knappsten Rangs | **~0,33** | **~1 : 1 : 1**, alle Karten |
+| *heute (auto-performance)* | — | — | *0,465* | *1,74 : 1 : 1* |
+| *Nutzer-Vorschlag* | — | — | *0,667* | *4 : 1 : 1* |
+
+Der Grund fuer die KV-Zeile ist gemessen und nicht modelliert: der Prefill-
+Scratch **skaliert mit dem MLP-Shard** (`6,1,1` bootet nicht mehr bei Reserve
+3000, braucht 4500,2700,2700), und der Verbands-KV wird vom **knappsten Rang**
+dimensioniert. Konzentration kostet damit doppelt: mehr Scratch auf der
+Zielkarte, weniger Headroom-Minimum ueber die Gruppe. Belegt durch die
+gemessenen **−47,9 % Kontext** bei `6,1,1`.
+
+### 4.2.3 Der Trade-off als durchgerechnete Kurve
+
+`Fenster = max(422,8·s5 ; 1096,3·(1−s5)) + Kollektivboden 1251 ms` (der Boden ist
+nach #264 gegen Umverteilung immun), Decode als Bandbreitenmodell mit
+Compute-Anteil ~60 % am Schritt, Kontext linear zwischen den zwei gemessenen
+Punkten (0,465 → 883k; 0,750 → 460k) interpoliert:
+
+| `s_5090` | Verhaeltnis | max-Compute | **Prefill Tok/s** | **Decode vs Optimum** | **max KV (Token)** |
+|---:|---|---:|---:|---:|---:|
+| 0,333 | 1:1:1 (even) | 731,0 ms | 1033 | −21 % | **~1.079k** |
+| **0,465** | **1,74:1:1 (heute)** | **586,5 ms** | **1114** | **−8 %** | **883k (gemessen)** |
+| 0,541 | 2,35:1:1 (**Decode-Opt**) | 503,2 ms | 1167 | **Optimum** | ~770k |
+| 0,667 | 4:1:1 (Nutzer) | 365,2 ms | 1267 | −12 % | ~583k |
+| **0,722** | **5,19:1:1 (Prefill-Opt)** | **305,1 ms** | **1316** | **−17 %** | **~502k** |
+| 0,750 | 6:1:1 (#264, gefahren) | 317,1 ms | 1327 | −19 % (**gemessen −13,7 % ggue. heute**) | **460k (gemessen)** |
+
+**Validierung des Modells an der einen Zeile, die wirklich gefahren wurde:**
+bei `s5 = 0,75` sagt das Bandbreitenmodell **−11,7 %** Decode gegenueber heute
+voraus, #264 hat **−13,7 %** gemessen. Zwei Prozentpunkte Abweichung auf einer
+unabhaengig hergeleiteten Kurve — die Achsen sind richtig kalibriert.
+
+**Die Kurve liest sich so:** von even bis Prefill-Optimum gewinnt der Prefill
+**+27 %** und der Kontext verliert **−53 %**; der Decode hat sein eigenes
+Optimum mittendrin bei 0,541 und faellt nach **beiden** Seiten ab. Es gibt
+keinen Punkt, an dem zwei der drei gleichzeitig optimal sind.
+
+### 4.2.4 Was das praktisch heisst — drei Regeln
+
+1. **Der max-KV, den man haben will, ist der Eingabeparameter, nicht das
+   Ergebnis.** Er waehlt den zulaessigen `s5`-Bereich, und erst darin darf man
+   das Phasenoptimum suchen. Wer 883k Token braucht, darf `s5 ≤ 0,465` — dann
+   ist der Prefill auf ≤1114 Tok/s gedeckelt, egal was die Compute-Achse sagt.
+   Wer mit 500k auskommt, kauft damit +18 % Prefill und zahlt 9 % Decode.
+2. **Latenz-Optimum und KV-Optimum sind diametral** (TP=1 gegen TP=3 even) —
+   das ist keine Unschoenheit, das **ist** die KV-Druck-Treppe aus Erg. 9: man
+   faehrt so lange auf der latenzoptimalen Sprosse, wie der KV es zulaesst, und
+   steigt bei Druck in Richtung Kapazitaetsoptimum. Die Treppe ist damit exakt
+   die Trajektorie durch dieses vierachsige Feld, nicht ein separates Feature.
+3. **Ein einziges `s` kann Prefill und Decode nicht gleichzeitig bedienen** —
+   die Optima liegen 0,541 gegen 0,722 auseinander. Die Aufloesung ist nicht ein
+   Kompromisswert, sondern **zwei gleichzeitige Geometrien auf denselben Bytes**
+   (§6): eine prefill-konzentrierte Lane und ein bandbreiten-balancierter
+   Decode-Verband, byte-geteilt ueber das Nesting. Der Kompromisswert 0,465, den
+   `auto-performance` heute waehlt, ist genau das Symptom dafuer, dass die
+   Runtime bisher **ein** `s` waehlen muss.
+
+### 4.2.5 Wo P2P in dieses Feld eingreift
+
+Auf **eine** der vier Achsen, und zwar auf die, die heute alles dominiert:
+
+| Achse | Wirkung von P2P |
+|---|---|
+| Compute | **keine** — Kernel-Zeit je Rang bleibt, wie sie ist |
+| Bandbreite (kartenintern) | **keine** — GDDR-Rate aendert sich nicht |
+| **Latenz / Kollektive** | **die einzige** — Boden 1251 ms von 1837,6 ms; −25 bis −60 % geschaetzt |
+| max KV | **indirekt**: neue Tier-Sprosse peer-VRAM fuer kalte Posten, ~+10 % Pool (§5.3) |
+
+**Die Konsequenz ist die interessanteste Aussage dieses Abschnitts:** weil P2P
+nur den Kollektivboden senkt und der Boden ein **additiver, `s`-unabhaengiger**
+Term ist, verschiebt P2P **kein einziges der vier Optima** — es hebt die ganze
+Prefill-Kurve parallel an. Bei einem um 40 % gesenkten Boden lauten dieselben
+Zeilen: even 1300, heute 1516, Decode-Opt 1631, 4:1:1 1899, Prefill-Opt 2010
+Tok/s. Die Rangfolge und alle Trade-off-Verhaeltnisse bleiben identisch. **P2P
+ist damit ein Niveau-Hebel, kein Struktur-Hebel** — es macht jede Wahl in
+dieser Tabelle besser, aber es aendert nicht, welche man treffen sollte.
 
 ---
 
