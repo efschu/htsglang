@@ -14,6 +14,7 @@ Two things are being protected:
 CPU only: nothing here constructs a real transport or touches a device.
 """
 
+import os
 import unittest
 
 from sglang.srt.distributed.device_communicators import htccl as htccl_mod
@@ -209,8 +210,44 @@ class TestFallbackPolicy(CustomTestCase):
         finally:
             TRANSPORT_REGISTRY["shm"] = saved
 
-    def test_device_is_the_only_no_fallback_transport(self):
-        self.assertEqual(htccl_mod._NO_FALLBACK, frozenset({"device"}))
+    def test_no_fallback_is_exactly_the_capturable_set(self):
+        """The rule, not a copy of today's answer.
+
+        This used to assert `_NO_FALLBACK == {"device"}` and had been failing
+        silently-in-the-red ever since `host` joined the capturable
+        transports: it pinned a VALUE where the module states a RULE ("the
+        rule is exactly CAPTURABLE_HTCCL_TRANSPORTS"). A test that has to be
+        edited every time the rule is correctly applied is a test that will
+        be edited without being read.
+
+        So assert the rule against its own source, on both sides of the
+        release switch.
+        """
+        import sglang.srt.distributed.parallel_state as ps
+
+        saved = os.environ.get("SGLANG_HTCCL_GRAPH_FREIGABE")
+        try:
+            os.environ["SGLANG_HTCCL_GRAPH_FREIGABE"] = "0"
+            self.assertEqual(
+                {n for n in TRANSPORT_REGISTRY if htccl_mod._kein_ausweichen(n)},
+                set(ps.capturable_transports()),
+            )
+            self.assertEqual(set(ps.capturable_transports()), {"device", "host"})
+
+            # Released, bar1/matrix must ALSO stop falling back -- released
+            # for capture and still able to swap itself for the gloo plane
+            # would be the worst pairing of the two.
+            os.environ["SGLANG_HTCCL_GRAPH_FREIGABE"] = "1"
+            self.assertEqual(
+                {n for n in TRANSPORT_REGISTRY if htccl_mod._kein_ausweichen(n)},
+                set(ps.capturable_transports()),
+            )
+            self.assertIn("bar1", ps.capturable_transports())
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_HTCCL_GRAPH_FREIGABE", None)
+            else:
+                os.environ["SGLANG_HTCCL_GRAPH_FREIGABE"] = saved
 
 
 class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):

@@ -267,6 +267,11 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    # Derselbe Dispatch-Vertrag wie deepep, Transport ueber den
+    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_HTCCL=1
+    # und SGLANG_HTCCL_TRANSPORT=bar1|matrix; ohne das meldet sich die
+    # Auswahl mit Grund ab, statt still auf etwas anderes auszuweichen.
+    "bar1ep",
     "mooncake",
     "nixl",
     "mori",
@@ -3116,6 +3121,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "bar1ep",
             "mooncake",
             "nixl",
             "mori",
@@ -9951,6 +9957,26 @@ class ServerArgs:
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if a2a_backend == "bar1ep":
+            # Der Zaehlwerteabgleich vor dem Datenpfad ist ein Host-Kollektiv
+            # (bar1ep.py._zaehlwerte_tauschen) -- derselbe Grund, aus dem
+            # deepep_mode=normal die Graphen abschaltet. Ohne diese Zeile
+            # scheiterte die Aufzeichnung mitten im Capture, weit weg von der
+            # Ursache.
+            logger.warning(
+                "Cuda graph is disabled because moe_a2a_backend=`bar1ep` "
+                "(the token-count exchange before the data path is a host "
+                "collective)."
+            )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if self.deepep_mode != "normal":
+                logger.warning(
+                    "deepep_mode is overridden to `normal` because bar1ep "
+                    "only builds the normal (contiguous) dispatch layout."
+                )
+                self.deepep_mode = "normal"
 
         if a2a_backend == "deepep":
             if self.deepep_mode == "normal":

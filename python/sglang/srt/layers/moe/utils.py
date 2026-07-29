@@ -29,6 +29,11 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    # Derselbe Dispatch-Vertrag wie DEEPEP (Normalform, Ausgabeformat
+    # DEEPEP_NORMAL), anderer Transport: der BAR1-Direktpfad statt der
+    # DeepEP-Bibliothek. Siehe token_dispatcher/bar1ep.py. Opt-in; ohne
+    # ausdrueckliche Wahl aendert sich nichts.
+    BAR1EP = "bar1ep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
@@ -50,7 +55,30 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.NONE
 
     def is_deepep(self):
+        """DeepEP-Vertrag -- NICHT "die DeepEP-Bibliothek".
+
+        ``bar1ep`` gehoert bewusst hierher. Diese Abfrage steht an ueber
+        fuenfzig Stellen im Modellbaum und entscheidet dort **nicht**, welche
+        Bibliothek ruft, sondern ob die Schicht ueberhaupt ueber einen
+        Dispatcher geht (z.B. qwen3_moe.py:336 ``forward_normal`` vs
+        ``forward_deepep``, ep_moe/layer.py:275 ``get_moe_impl_class``,
+        utils.py ``is_deepep_class_backend``). Gaebe ``bar1ep`` hier False,
+        liefe die MoE-Schicht an ihrem eigenen Dispatcher vorbei -- genau der
+        Fehler, wegen dem das a2a in der HTCCL-Naht wirkungslos blieb.
+
+        Wer wirklich die DeepEP-Bibliothek meint (also den Bau von
+        ``DeepEPDispatcher``/``DeepEPBuffer``), fragt :meth:`is_deepep_native`.
+        Das sind genau die Stellen, die ein Objekt bauen -- nicht die, die
+        eine Wegentscheidung treffen.
+        """
+        return self in (MoeA2ABackend.DEEPEP, MoeA2ABackend.BAR1EP)
+
+    def is_deepep_native(self):
+        """Die DeepEP-Bibliothek selbst, ohne ``bar1ep``."""
         return self == MoeA2ABackend.DEEPEP
+
+    def is_bar1ep(self):
+        return self == MoeA2ABackend.BAR1EP
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
@@ -77,6 +105,7 @@ class MoeA2ABackend(Enum):
         return self in (
             MoeA2ABackend.NONE,
             MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.BAR1EP,
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
@@ -354,10 +383,14 @@ def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
-    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune).
+
+    ``is_deepep_native``, nicht ``is_deepep``: dieser Pfad haengt an DeepEPs
+    Low-Latency-Ausgabeform, und ``bar1ep`` baut nur die Normalform.
+    """
     return (
         get_moe_runner_backend().is_flashinfer_cutedsl()
-        and get_moe_a2a_backend().is_deepep()
+        and get_moe_a2a_backend().is_deepep_native()
     )
 
 

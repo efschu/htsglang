@@ -230,6 +230,7 @@ def _first_visible_device_ordinal() -> int:
       cards, not even one that never touches a GPU.
     * the UUID form (``CUDA_VISIBLE_DEVICES=GPU-1a2b...``) is equally legal
       and would have raised ``ValueError`` from ``int("G")``.
+
     The two cases mean the same thing here: no offset.
 
     The result is clamped to ``_MAX_DEVICE_ORDINAL_OFFSET``. Reading only

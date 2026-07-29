@@ -104,7 +104,7 @@ def test_import_does_not_initialize_cuda():
 
         comm_dir = pathlib.Path(sys.argv[1])
         assert not torch.cuda.is_initialized(), "torch import alone initialized CUDA"
-        for name in ("htccl", "htccl_shm", "htccl_device"):
+        for name in ("htccl", "htccl_shm", "htccl_device", "htccl_host"):
             spec = importlib.util.spec_from_file_location(
                 f"_htccl_probe_{name}", comm_dir / f"{name}.py"
             )
@@ -391,7 +391,7 @@ def test_all_htccl_envs_are_registered():
     shows up in the env dump and cannot be silently misspelled."""
     declared = set(_env_defaults())
     read = set()
-    for name in ("htccl", "htccl_shm", "htccl_device"):
+    for name in ("htccl", "htccl_shm", "htccl_device", "htccl_host"):
         for node in ast.walk(ast.parse((_COMM_DIR / f"{name}.py").read_text())):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 if node.value.startswith("SGLANG_HTCCL"):
