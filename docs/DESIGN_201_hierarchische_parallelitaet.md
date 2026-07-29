@@ -2155,3 +2155,20 @@ Adressierbarkeit) — die Probe bestimmt die effektiv nutzbare Apertur je
 gerichtetem Paar empirisch (groesste verifiziert beschreibbare
 Zielregion), und das Register konsumiert ausschliesslich diesen
 Effektivwert; nominal vs effektiv werden getrennt ausgewiesen.
+EVAL-ZEIGER (2026-07-29): Ueberschlags-Analyse in
+docs/EVAL_p2p_prefill_decode_split.md (Commits 06edd676c4 + b0a8017bf4).
+Kernaussage: P2P ist auf diesem Rig ein NIVEAU-Hebel, kein
+STRUKTUR-Hebel — es senkt nur den additiven, split-unabhaengigen
+Kollektivboden (Prefill-Kurve parallel hoch, +20..+69 % auf TP=3),
+verschiebt aber KEINES der vier Split-Optima (Compute 5,19:1:1 |
+Bandbreite 2,35:1:1 | Latenz TP=1 | max-KV ~even; heutiger
+auto-performance-Kompromiss 1,74:1:1). KEINE Feature-/Solver-/
+Geometrie-Entscheidung wartet deshalb auf P2P. Folgerungen dort
+im Detail: max-KV ist EINGABE-Parameter des Solvers (waehlt den
+zulaessigen Split-Bereich), die Erg.-9-Treppe IST die Trajektorie
+zwischen Latenz- und KV-Optimum, und die Unvereinbarkeit von
+Prefill- (0,722) und Decode-Optimum (0,541) in EINEM s ist ein
+unabhaengiges Argument fuer die Doppel-Geometrie auf geteilten
+Bytes. Einzige entscheidende Probe-Frage: laufen Allreduce/
+Broadcast unter diesem P2P geraetedirekt (daran haengen die
++20..+69 %); Apertur/Fenster sind demgegenueber nachrangig.
