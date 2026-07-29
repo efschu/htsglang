@@ -1740,3 +1740,30 @@ Rot:
      dann bleibt es beim statischen Dispatcher-Entscheid.
 S1 und S3 brauchen keinen neuen Mechanismus, nur Messung; erst danach
 lohnt Bau. Einreihung: nach der Lane-Spec-Kette, vor Slice-D-Bau.
+
+PRIO-Nachtrag 13 (Nutzer 2026-07-29, Spec-Vollausbau auf der Lane):
+Spec auf der Lane wird VOLL graph-captured und voll-featured — kein
+Kompromiss-Spec (Bekraeftigung von Nachtrag 3). Zielbild in Nutzerworten:
+Rig NICHT voll ausgelastet -> eine "Single"-Session bekommt MEHR Leistung
+(Lane-Spec beschleunigt sie); Rig voll -> mehr paralleler Durchsatz. Immer
+full-graph, full-features. Konkrete Vorgaben:
+(1) VOLLE CAPTURE-KETTE: Verify (R6, fertig) + Head/Draft-Forwards (die
+    benannte spec_info=None-Luecke) + gesamte Spec-Runde als Graph.
+(2) K NICHT NUR 1: K-Sprossen-Leiter K∈{0,1,2,3,...} als VORAB captured
+    Eintraege (diskrete Capture-Leiter, D1-Verdikt), Wechsel = Plan-Flip,
+    nie Re-Capture; Preis Graph-Pools x Sprossen explizit budgetieren.
+(3) ADAPTIVES K: Online-Accept (existiert je Runde) gegen die gemessenen
+    Break-evens je Sprosse (K=1: 1,53; K=3: 2,22; mit Head-Capture tiefer),
+    Wiederverwendung der #156-Acceptance-Leiter (NEXTN<->DFLASH-Switch),
+    Hysterese gegen Flattern, Wechsel an Runden-Grenzen.
+(4) DFLASH ZUSAETZLICH ZU NEXTN als Lane-Drafter: eigener Komplement-Posten
+    (Machbarkeit zuerst — NEXTN-Kopf war 2684 MiB statt geschaetzter 120;
+    DFLASH-Kopfgroesse ehrlich rechnen), Algo-adaptiv via #156.
+(5) MULTI-DRAFTER-PLATZIERUNG: DFLASH und NEXTN jeweils als TP1- ODER
+    TP2-Lane auf UNTERSCHIEDLICHEN Karten — das ist die N>2-Konfiguration
+    (Nachtrag 8) auf der Drafter-Achse; Spreizungs-Entscheider (D1) waehlt
+    die Platzierung nach der SM-Saettigungs-Zielfunktion.
+Schnitt: R7a = volle Capture-Kette + K-Leiter + adaptives K (NEXTN);
+R7b = DFLASH-Lane-Kopf + Algo-Adaption; R7c = Multi-Drafter auf N Karten
+(mit Entscheider). Reihenfolge R7a vor D4 (Nutzer-Zug), R7b/c danach bzw.
+nach Machbarkeitsrechnung.
