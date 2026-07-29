@@ -6485,3 +6485,190 @@ Code: gpu2gpu_bar.c auf probe/gdr-window.
   neue pinnen den Kontrakt (`local_row_split` gibt kontigue Scheiben heraus und
   kopiert nicht, wo die Scheibe schon dicht ist), zwei bestehende wurden auf den
   Runde-5-Stand nachgezogen.
+
+## Lane-Spec-Kette Runde 6 (feat/dual-group-lane-spec-r6, Basis d44dba4cad)
+
+- DER LANE-VERIFY IST GRAPH-GEFANGEN, als ZWEITER Capture-Eintrag NEBEN den
+  Decode-Graphen der Lane, nicht an ihrer Stelle. Ein Eintrag `lanetv`: bs 1,
+  K+1 = 4 Tokens, `ForwardMode.TARGET_VERIFY`, `CaptureHiddenMode.FULL`.
+  Gebaut nach dem einzigen Vorbild im Repo (der S5-Spill-Tick-Pass), nur in die
+  andere Richtung: der S5-Pass drueckt einen SPEKULATIVEN Runner fuer einen
+  Extra-Graphen auf Plain-Decode-Form herunter, dieser hebt einen PLAIN Runner
+  fuer einen Extra-Graphen auf Verify-Form hoch. Beide stellen wieder her, was
+  sie vorgefunden haben.
+- WIE DER CAPTURE-ZWEIG GEZIELT GEOEFFNET WURDE. Die Args-View cleart
+  `speculative_algorithm` WEITERHIN, und das ist die Pointe, nicht ein
+  Versaeumnis: Un-Clearen ist keine Capture-Aenderung, es kippt
+  `decode_num_tokens_per_bs` auf K+1 und `capture_forward_mode` auf
+  TARGET_VERIFY fuer den GANZEN Runner — der Verify-Eintrag entstuende dann
+  nicht NEBEN dem Decode-Eintrag, sondern AN SEINER STELLE. Die Lane faehrt
+  aber weiter echte Decode-Schritte (jeder No-Spec-Job, jeder Job mit Spec
+  aus). Stattdessen ein eigenes Feld (`ModelRunner.dual_group_lane_verify_
+  tokens`, gesetzt zwischen Konstruktion und `init_cuda_graphs()` wie
+  `spec_solo_rank_local_graphs`) und ein Scope, der genau vier Skalare tauscht
+  (Forward-Mode, Tokens je Slot, Hidden-Mode, Graph-Key-Variante) und sie
+  unbedingt zurueckstellt.
+- WARUM DER NO-SPEC-EINTRAG UNVERAENDERT IST, konstruktiv und nicht per
+  Hoffnung: er wird VOR dem Verify-Eintrag aufgenommen, aus demselben Runner,
+  mit denselben Puffern; der Verify traegt eine eigene Key-Variante (`lanetv`)
+  gegen die Kollision auf `ShapeKey.size == 1`; und `can_run_graph` kehrt fuer
+  einen Lane-Verify FRUEH zurueck — sonst haette der FULL-Hidden-Mode-Batch
+  ueber `recapture_if_needed` JEDEN Decode-Graphen abgerissen und in FULL neu
+  aufgenommen. Die Puffer werden EINMAL geschnitten, auf `max_bs * max(1, K+1)`
+  (Produkt, nicht Maximum: der Mamba-Backend liest seine Verify-Breite als
+  `max_num_tokens // max_bs` zurueck), weil ein zweiter
+  `init_cuda_graph_state`-Aufruf die Puffer neu schnitte, in die die
+  Decode-Graphen bereits zeigen.
+- BYTE-TORE, alle in EINEM Boot, Boden jeweils zuerst (12 Tokens):
+
+  | Tor | alphabet | squares | repeat |
+  |---|---|---|---|
+  | Boden No-Spec vs. No-Spec | gruen | gruen | gruen |
+  | `target_verify` (Graph) gegen sich selbst | gruen | gruen | gruen |
+  | **Graph-Replay vs. EAGER-`target_verify`** | **gruen** | **gruen** | **gruen** |
+  | `target_verify` (Graph) vs. No-Spec | gruen | gruen* | gruen |
+  | `seqdecode` vs. No-Spec | gruen | gruen* | gruen |
+  | `tv` vs. `sd` | gruen | gruen | gruen |
+  | **No-Spec-Bahn der Lane vs. RUNDE 5** | **gruen** | **gruen** | **gruen** |
+
+  (*) dasselbe Laengen-Artefakt wie in Runde 5: bei Accept 2,0 emittiert eine
+  Runde ueber `max_new_tokens` hinaus, der Vergleich stoesst ans Laengenende;
+  die byte-gruene Bruecke liefert denselben Wert.
+  Die letzte Zeile ist das eigentliche Regressionstor dieser Runde: die
+  No-Spec-Bahn ist BYTE-IDENTISCH mit der aus Runde 5 (und ueber Runde 4
+  hinweg), auf allen drei Prompts. Der Graph-Replay-Zaehler belegt beide
+  Seiten: `verify_graph_rounds == spec_rounds` im Graph-Arm, `0` im
+  Eager-Arm — das Instrument misst, was es zu messen behauptet.
+- WIE WEIT DAS TOR TRAEGT, ehrlich gemessen statt extrapoliert. Ueber 32
+  Tokens trennen sich Graph- und Eager-Arm bei Index 16 (alphabet) bzw. 22
+  (squares). Das ist KEIN Replay-Befund, sondern der Reproduzierbarkeits-Boden
+  dieses Vehikels, im selben Boot mitgemessen: die NO-SPEC-Bahn trennt sich von
+  SICH SELBST bei 16 (alphabet) und 22 (squares), der eager-`target_verify`-Arm
+  von sich selbst bei 16 bzw. 19. Graph gegen Eager liegt also AUF oder UEBER
+  dem Boden — ein Urteil unterhalb des Bodens waere keins ([[GDN-Prefill-
+  Nichtdeterminismus]], Runde 4 lokalisierte den alphabet-Punkt bereits auf
+  Index 16 und wies ihn dem PREFILL zu).
+- ZAHLEN, zwei Inhaltstypen, ganze Runde gemessen, Boden mitgefahren
+  (105 bzw. 126 Prompt-Token, 64 Ausgabe-Token, TP=3 uneven, GGUF Q3_K_M,
+  Lane-Budget 1600, seriell):
+
+  | alphabet | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+  |---|---|---|---|---|---|
+  | No-Spec (graph-gefangen) | 16,122 | — | — | — | **16,122** |
+  | No-Spec (Boden) | 16,152 | — | — | — | 16,152 |
+  | `seqdecode` (Default) | 75,173 | 66,847 | 8,326 | 1,105 | 68,030 |
+  | `target_verify` EAGER | 77,540 | 68,822 | 8,718 | 1,125 | 68,924 |
+  | **`target_verify` GRAPH** | **35,862** | **27,228** | 8,634 | 1,105 | **32,454** |
+  | `target_verify` GRAPH (Boden) | 35,969 | 27,313 | 8,656 | 1,145 | 31,414 |
+
+  | squares | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+  |---|---|---|---|---|---|
+  | No-Spec (graph-gefangen) | 16,147 | — | — | — | **16,147** |
+  | No-Spec (Boden) | 16,236 | — | — | — | 16,236 |
+  | `seqdecode` (Default) | 95,996 | 87,589 | 8,407 | 1,455 | 65,977 |
+  | `target_verify` EAGER | 78,573 | 69,721 | 8,852 | 1,561 | 50,335 |
+  | **`target_verify` GRAPH** | **35,942** | **27,269** | 8,673 | 1,757 | **20,456** |
+  | `target_verify` GRAPH (Boden) | 36,039 | 27,269 | 8,770 | 1,684 | 21,401 |
+
+  RAUSCHBODEN: No-Spec 0,19 % (alphabet) / 0,55 % (squares); `target_verify`
+  GRAPH gegen sich selbst 0,30 % / 0,27 %. Der Verify-Wert ist ueber beide
+  Prompts auf 0,15 % stabil (27,23 / 27,27) — er haengt an der Form, nicht am
+  Inhalt, was er als Fixposten ausweist.
+- VERDIKT JE INHALTSTYP, ohne Beschoenigung. Der Capture ist der groesste
+  Einzelgewinn dieser Feature-Kette: Verify 68,4 -> 27,2 ms (2,5x), Runde
+  77,0 -> 35,9 ms, ms/Token 68,9 -> 32,5 (alphabet) bzw. 50,3 -> 20,5
+  (squares). Break-even faellt von **4,78 auf 2,22** (35,9/16,1; auf beiden
+  Prompts derselbe Wert, 2,224 und 2,226). Und trotzdem: SPEC GEWINNT AUF
+  KEINEM DER BEIDEN INHALTSTYPEN. squares erreicht Accept 1,757 und damit
+  20,5 ms/Token gegen 16,1 no-spec (1,27x langsamer), alphabet 1,105 und
+  32,5 gegen 16,1 (2,01x langsamer). Die R5-Prognose "Break-even 1,54, auf
+  squares bereits ein Gewinn" beruhte auf der Annahme, ein gefangener Verify
+  koste so viel wie ein gefangener Decode-Schritt (~16,2 ms). Er kostet 27,2 —
+  vier Zeilen durch den GGUF-MMVQ-Kernel sind 1,69 Decode-Schritte, nicht
+  einer. Die Annahme war der Fehler, nicht die Messung.
+- DER KOPF, beziffert statt vertagt-ohne-Zahl. Die K = 3 eager Draft-Forwards
+  sind 8,634-8,770 ms der Runde. Selbst wenn ein Capture sie auf ~3 ms
+  druecken wuerde, faellt die Runde nur auf ~30,3 ms und der Break-even auf
+  **~1,88** — immer noch UEBER dem gemessenen Accept-Band (Spitze 1,757). Der
+  Kopf-Capture ist also lohnend und ist NICHT die Sache, die Lane-Spekulation
+  auf diesem Vehikel bezahlen liesse. Gebaut wurde er nicht: der Kopf haengt an
+  einem benannten Loch (die generische Decode-Aufnahme baut `spec_info=None`,
+  ein MTP-Forward dereferenziert es), das eine eigene Draft-Capture-Bauweise
+  braucht — R7, mit dieser Zahl im Briefing.
+- PROMOTION-EMPFEHLUNG (nicht selbst gemergt, wie beauftragt). Zwei getrennte
+  Entscheidungen, und sie fallen unterschiedlich aus:
+  1. `target_verify` ALS VERIFY-DEFAULT: **ja**. Gefangen dominiert es die
+     Bruecke auf jeder gemessenen Achse (35,9 gegen 75-96 ms je Runde, Accept
+     nie darunter, byte-gruen gegen den eigenen Eager-Arm und gegen die
+     No-Spec-Bahn), und die Bruecke ist strukturell nicht fangbar — sie IST
+     accept-viele Einzel-Forwards, ihre Kosten STEIGEN mit der Accept-Laenge
+     (squares: 96 ms), waehrend der Verify flach ist. `seqdecode` bleibt als
+     Rueckfall-Flag erreichbar.
+  2. `--dual-group-lane-spec` ALS DEFAULT: **nein**, unveraendert aus. Bei
+     Break-even 2,22 gegen ein Accept-Band von 1,0-1,76 kostet Spekulation auf
+     diesem Vehikel Durchsatz. Das Flag bleibt, was es ist: einschaltbar, mit
+     der Rechnung im Runbook daneben.
+- 13/96-ARGMAX-CHECK NACHGEZOGEN, und er ist NICHT verschwunden. Als
+  Pro-JOB-Schalter gebaut (nicht als Prozess-Env), damit die zusaetzliche
+  lm_head-Anwendung je Runde nicht in der Timing-Tabelle desselben Boots
+  landet. Ergebnis ueber 45 Runden mit Graph: Zeile 0 einmal, Zeile 1 13x,
+  Zeile 2 17x, Zeile 3 8x uneins. Derselbe Job EAGER, 44 Runden: 0 / 14 / 10 /
+  8. Damit ist die Frage aus Runde 4 beantwortet, wenn auch anders als erhofft:
+  die Uneinigkeit ist KEIN Graph-Artefakt und war auch kein Artefakt der
+  kaputten Zeilen — sie ist der Unterschied zwischen den beiden Quellen selbst,
+  also zwischen `next_token_logits` (was der TARGET_VERIFY-Forward liefert) und
+  einer ZWEITEN lm_head-Anwendung auf dieselben Hidden States. Genommen wird
+  die erste, und die ist gegen das Decode-Orakel byte-belegt (Runde 5). Der
+  Befund ist damit kein Fehler im Pfad, sondern eine Warnung an den FALLBACK in
+  `_verify_predictions`: der greift nur, wenn die Zeilenzahl nicht passt, und
+  er ist messbar NICHT aequivalent — er darf nie stillschweigend zum
+  Normalpfad werden.
+- NEBENLAEUFIGKEITS-PUNKT E NEU ERHOBEN, gepaarte Boots (identisch ausser dem
+  Nebenlaeufigkeits-Schalter), Lane-Budget 700 MiB, 45-s-Fenster, Lane-Jobs
+  ausdruecklich auf `target_verify` (also auf dem gefangenen Verify):
+
+  | Modus | share_Verband | share_Lane | **E** |
+  |---|---|---|---|
+  | seriell | 40,2 -> 19,6 tok/s (0,495) | 25,70 -> 16,13 tok/s (0,627) | **1,123** |
+  | nebenlaeufig | 39,9 -> 33,2 tok/s (0,840) | 24,92 -> 17,53 tok/s (0,704) | **1,544** |
+
+  DER SCHRUMPF-VORBEHALT AUS RUNDE 4 IST EINGETRETEN UND IST JETZT BEZIFFERT:
+  +77,4 % (1,069 -> 1,897, eager) wird zu **+37,5 %** (1,123 -> 1,544,
+  gefangen). Der Grund steht in der Tabelle: ein EAGER Lane-Tick enthaelt viel
+  CPU-Startzeit, die der Verband einsammeln konnte; ein gefangener Tick ist
+  GPU-dicht, also ist weniger einzusammeln. Fuer DESIGN_121 zaehlt dieser
+  Wert, nicht der aus Runde 4.
+  WAS DABEI NICHT UNTERGEHEN DARF: E ist ein VERHAELTNIS zu den Solo-Raten,
+  und die Solo-Rate der Lane ist von 12,80 auf 25,70 tok/s gestiegen (Faktor
+  2,0). Absolut liefert die nebenlaeufige Konfiguration jetzt 33,2 + 17,5
+  tok/s gegen 35,2 + 10,4 in Runde 4 — der kleinere Faktor sitzt auf einem
+  deutlich groesseren Nenner.
+- KETTENLAENGE ALS EIGENE ACHSE (Zusatzbefund, ein Boot): der gefangene Verify
+  kostet 16,1 ms bei 1 Token (das ist der Decode-Graph), 21,5 ms bei 2 und
+  27,2 ms bei 4 — also rund 12,5 ms fix plus 3,7 ms je Zeile. Eine
+  zusaetzliche Kandidatenzeile kostet damit 0,23 Decode-Schritte, und der
+  Break-even faellt mit kuerzerer Kette:
+
+  | K | Verify (ms) | Kopf (ms) | Runde (ms) | Break-even | gemessenes Accept (squares) |
+  |---|---|---|---|---|---|
+  | 3 | 27,27 | 8,67 | 35,94 | 2,22 | 1,757 / 1,684 |
+  | 1 | 21,46 | 3,31 | 24,77 | **1,53** | **1,658 / 1,432** |
+
+  K = 1, squares, gefangen: **14,94 ms/Token gegen 16,16 no-spec** — der erste
+  Messpunkt der ganzen Kette, an dem Lane-Spekulation GEWINNT (7,6 %). Der
+  Boden desselben Arms im selben Boot liegt allerdings bei Accept 1,432 und
+  damit 17,40 ms/Token, also auf der anderen Seite. Ehrliches Verdikt: K = 1
+  bringt den Arbeitspunkt AUF die Schwelle, nicht sicher darueber — die
+  Accept-Laenge schwankt inhaltsgetrieben um den Break-even. Auf alphabet
+  (Accept 1,016) verliert auch K = 1 klar (24,50 gegen 16,14). Die Tore sind
+  auch in diesem Boot gruen (Replay vs. eager byte-identisch auf beiden
+  Prompts, No-Spec-Bahn byte-identisch zu Runde 5 — dritter unabhaengiger
+  Boot). Und der Argmax-Check faellt bei K = 1 auf 1/1 Uneinigkeiten in 44
+  Runden gegen 1/13/17/8 bei K = 3, was zur Lesart "zwei lm_head-Anwendungen
+  auf einer flachen Verteilung" passt.
+- BOOT-BILANZ: 5 von 6. Boot 1 fiel auf einen eigenen Fehler (die
+  Capture-Felder waren Instanz- statt Klassenattribute, und
+  `EAGLEDraftCudaGraphRunner` erbt `_capture_one_stream` ohne dieses
+  `__init__` zu fahren -> AttributeError in der Draft-Aufnahme des VERBANDS,
+  nicht der Lane). Boot 2 trug Tore, Tabelle und beide Argmax-Jobs, Boot 3
+  und 4 das gepaarte E, Boot 5 die Kettenlaengen-Achse.

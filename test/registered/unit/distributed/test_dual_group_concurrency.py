@@ -898,13 +898,20 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         return DualGroupLane.__new__(DualGroupLane)
 
     def test_default_is_the_coherent_strategy(self):
-        # Round 5 made TARGET_VERIFY coherent (the row-parallel shell was
-        # handing a stride-blind GGUF kernel a strided activation) and still
-        # did NOT promote it: the two modes cost the same per round, 0.2 %
-        # apart under a 0.4 % floor, and the bridge has four boots of gate
-        # behind it against one. The switch belongs to the round that captures
-        # the verify forward, when it starts buying something.
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        # Round 5 made TARGET_VERIFY coherent; round 6 captured it and made it
+        # dominant (35.9 vs 75-96 ms per round). The default still reads
+        # seqdecode HERE because promoting it is a merge decision, not a thing
+        # a measurement branch does to itself -- the recommendation and its
+        # gate evidence live in _verify_mode's docstring. When that merge
+        # happens this assertion flips with it, on purpose: the pair is the
+        # record that the change was chosen rather than drifted into.
         self.assertEqual(self._lane()._verify_mode({}), "seqdecode")
+        doc = inspect.getdoc(DualGroupLane._verify_mode) or ""
+        self.assertIn("Recommendation on record", doc)
 
     def test_target_verify_stays_reachable_but_only_on_request(self):
         self.assertEqual(
@@ -957,7 +964,10 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         from sglang.srt.model_executor.dual_group_lane import DualGroupLane
 
         doc = inspect.getdoc(DualGroupLane._verify_by_target_verify) or ""
-        self.assertIn("4.78", doc)
+        # Round 6 captured the forward and moved the number: 4.78 -> 2.22. The
+        # docstring has to carry the CURRENT one, or a future reader promotes
+        # the flag against a break-even that no longer exists.
+        self.assertIn("2.22", doc)
         self.assertIn("graph capture", doc)
         # And the root cause, so nobody re-derives it from the symptom.
         self.assertIn("local_row_split", doc)
@@ -1213,6 +1223,241 @@ class TestLaneTargetVerifyRound(unittest.TestCase):
         lane._verify_by_target_verify(job, [3, 5, 6], 10)
         row = job["_batch"].req_to_token_pool.req_to_token[0]
         self.assertEqual(row[10:14].tolist(), [100, 101, 102, 103])
+
+
+class TestLaneVerifyGraphEntry(unittest.TestCase):
+    """#274 round 6: the lane's verify as a SECOND capture entry.
+
+    The lane's plain decode entry is the thing under protection here. It has
+    been byte-green for five rounds, and every plausible way to give the verify
+    a graph either deletes it (un-clearing ``speculative_algorithm`` on the args
+    view re-shapes the whole runner to TARGET_VERIFY) or re-records it (a FULL
+    hidden-mode batch reaching ``recapture_if_needed`` tears down every captured
+    decode graph and captures them again). These tests pin the narrow path
+    between the two.
+    """
+
+    def _runner(self, *, verify_tokens=4, captured=True, max_bs=1, ntpb=1):
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.capture_forward_mode = ForwardMode.DECODE
+        r.capture_hidden_mode = CaptureHiddenMode.NULL
+        r.num_tokens_per_bs = ntpb
+        r.max_bs = max_bs
+        r._lane_verify_tokens = verify_tokens
+        r._lane_verify_active = False
+        r._lane_verify_captured = captured
+        r._wl_block_graph = False
+        r._sess_block_graph = False
+        return r
+
+    def _batch(self, *, bs=1, tokens=4, verify=True):
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        fb = type("FB", (), {})()
+        fb.batch_size = bs
+        fb.forward_mode = ForwardMode.TARGET_VERIFY if verify else ForwardMode.DECODE
+        fb.input_ids = torch.zeros(tokens, dtype=torch.int64)
+        fb.replace_embeds = None
+        return fb
+
+    def test_the_args_view_still_clears_the_algorithm(self):
+        """The opening is targeted, and this is what "targeted" means.
+
+        Round 6's brief was to stop the lane args view clearing
+        ``speculative_algorithm`` for the CAPTURE branch. It is cleared here as
+        before, and the capture branch is opened by a field of its own instead
+        -- because un-clearing it is not a capture-only change: it flips
+        ``decode_num_tokens_per_bs`` to K+1 and ``capture_forward_mode`` to
+        TARGET_VERIFY for the WHOLE runner, which does not add the verify entry,
+        it replaces the decode entry with it. The lane still runs plain decode
+        steps (every no-spec job, and every job with speculation off), so that
+        entry has to survive.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.dual_group_lane import _lane_server_args_view
+
+        args = SimpleNamespace(
+            speculative_algorithm="NEXTN",
+            speculative_draft_model_path="p",
+            speculative_cross_algorithm=True,
+            dual_group_lane_budget_mib=1600,
+            dual_group_lane_max_requests=1,
+            dual_group_lane_speed_dial=None,
+            dual_group_lane_eager=False,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[16, 32, 64], max_bs=64)
+            ),
+        )
+        view = _lane_server_args_view(args)
+        self.assertIsNone(view.speculative_algorithm)
+
+    def test_the_shape_scope_swaps_and_restores(self):
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+
+        r = self._runner()
+        with r.lane_verify_shape():
+            self.assertTrue(r._lane_verify_active)
+            self.assertEqual(r.capture_forward_mode, ForwardMode.TARGET_VERIFY)
+            self.assertEqual(r.num_tokens_per_bs, 4)
+            self.assertEqual(r.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertFalse(r._lane_verify_active)
+        self.assertEqual(r.capture_forward_mode, ForwardMode.DECODE)
+        self.assertEqual(r.num_tokens_per_bs, 1)
+        self.assertEqual(r.capture_hidden_mode, CaptureHiddenMode.NULL)
+
+    def test_the_shape_scope_restores_on_a_raising_forward(self):
+        """A verify that throws must not leave the decode path mis-shaped.
+
+        Without the restore the next plain decode step would compute
+        ``raw_num_token = bs * 4`` and look up a graph key that does not exist
+        -- a KeyError one forward away from the real error, which is how a
+        one-line failure becomes an unreadable one.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        r = self._runner()
+        with self.assertRaises(RuntimeError):
+            with r.lane_verify_shape():
+                raise RuntimeError("verify blew up")
+        self.assertFalse(r._lane_verify_active)
+        self.assertEqual(r.capture_forward_mode, ForwardMode.DECODE)
+        self.assertEqual(r.num_tokens_per_bs, 1)
+
+    def test_the_two_entries_are_told_apart_by_the_variant_only(self):
+        """Both entries key on ShapeKey.size 1; the variant is the whole key.
+
+        ``_capture_graph_size`` returns the padded BS for a non-ragged decode
+        runner, and the lane's verify is bs 1 exactly like its decode graph. If
+        the variant did not differ, the second capture would overwrite the first
+        under the same key and the lane's no-spec path would silently start
+        replaying a TARGET_VERIFY graph.
+        """
+        r = self._runner()
+        self.assertIsNone(r._wl_variant_label(None))
+        with r.lane_verify_shape():
+            self.assertEqual(r._wl_variant_label(None), r.LANE_VERIFY_VARIANT)
+        self.assertIsNone(r._wl_variant_label(None))
+
+    def test_admission_is_shape_exact_and_never_pads(self):
+        r = self._runner()
+        with r.lane_verify_shape():
+            self.assertTrue(r.can_run_graph(self._batch()))
+            # A shorter chain is NOT padded into the captured entry: padding a
+            # verify would change which candidate rows exist.
+            self.assertFalse(r.can_run_graph(self._batch(tokens=3)))
+            self.assertFalse(r.can_run_graph(self._batch(tokens=8)))
+            self.assertFalse(r.can_run_graph(self._batch(bs=2)))
+            self.assertFalse(r.can_run_graph(self._batch(verify=False)))
+
+    def test_nothing_captured_means_eager_not_a_key_error(self):
+        r = self._runner(captured=False)
+        with r.lane_verify_shape():
+            self.assertFalse(r.can_run_graph(self._batch()))
+
+    def test_the_lane_scope_yields_false_without_a_captured_entry(self):
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        lane.runner = type("R", (), {"decode_cuda_graph_runner": None})()
+        with lane._verify_graph_scope(4) as captured:
+            self.assertFalse(captured)
+
+    def test_the_lane_scope_refuses_a_chain_of_another_length(self):
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        lane.runner = type(
+            "R", (), {"decode_cuda_graph_runner": self._runner(verify_tokens=4)}
+        )()
+        with lane._verify_graph_scope(5) as captured:
+            self.assertFalse(captured)
+        with lane._verify_graph_scope(4) as captured:
+            self.assertTrue(captured)
+
+    def test_the_capture_stand_in_carries_a_real_chain_mask(self):
+        """flashinfer picks its mask mode by BUFFER PRESENCE, not by content.
+
+        ``_create_prefill_wrappers`` binds ``custom_mask_buf`` only when the
+        capture-time ``spec_info`` carries a ``custom_mask``. A stand-in without
+        one records a causal kernel, and the live chain-masked round then
+        replays it -- a wrong answer, not a crash. So the stand-in is built by
+        the same builder the live round uses.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import (
+            build_lane_chain_verify_input,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        src = inspect.getsource(DecodeCudaGraphRunner._lane_verify_spec_info)
+        self.assertIn("build_lane_chain_verify_input", src)
+        spec = build_lane_chain_verify_input([0] * 4, 7)
+        self.assertIsNotNone(spec.custom_mask)
+        self.assertEqual(spec.custom_mask.numel(), 4 * (7 + 4))
+        self.assertEqual(spec.draft_token_num, 4)
+
+    def test_the_widths_are_cut_once_for_the_widest_entry(self):
+        """One sizing for both entries, and it is a PRODUCT, not a max.
+
+        The mamba backend reads its per-slot verify width back out of the pair
+        it is handed as ``max_num_tokens // max_bs``, so ``max(max_bs, K+1)``
+        would give the GDN verify a query-start-loc ladder of step 1 while the
+        forward runs K+1 rows per slot. Re-cutting the buffers per entry is the
+        other tempting shortcut and is worse: the decode graphs already hold
+        pointers into the first cut.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        src = inspect.getsource(DecodeCudaGraphRunner.__init__)
+        self.assertIn(
+            "self.max_num_token = self.max_bs * max(",
+            src,
+        )
+        # and the token count reaches the GGUF dispatch, so a replay cannot
+        # pick a different kernel than the capture recorded (round 5's defect
+        # lived in exactly that <= 8-row window).
+        self.assertIn("_register_gguf_decode_buckets([self._lane_verify_tokens]", src)
+
+    def test_the_shared_logits_buffer_grows_for_the_lane_only(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.model_executor import model_runner as mr_mod
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        mr = ModelRunner.__new__(ModelRunner)
+        mr.server_args = SimpleNamespace(max_speculative_num_draft_tokens=None)
+        mr.decode_num_tokens_per_bs = lambda **_kw: 1
+        with mock.patch.object(
+            mr_mod, "get_batch_sizes_to_capture", return_value=([1], [])
+        ):
+            mr.dual_group_lane_verify_tokens = 4
+            self.assertEqual(ModelRunner.max_decode_logits_rows(mr), 4)
+            # Nothing else grows: without the lane field this is the row count
+            # it always was, so the serving group's shared buffer is untouched.
+            mr.dual_group_lane_verify_tokens = None
+            self.assertEqual(ModelRunner.max_decode_logits_rows(mr), 1)
 
 
 if __name__ == "__main__":
