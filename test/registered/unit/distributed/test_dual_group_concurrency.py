@@ -24,6 +24,7 @@ CPU only -- these are properties of the scoping mechanism, not of any kernel.
 
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 
@@ -302,6 +303,95 @@ class TestPerLaneDequantWorkspace(unittest.TestCase):
             self.assertNotEqual(_dequant_ws_key(torch.float16, device), old_key)
         with lane_scope(1, None):
             self.assertNotEqual(_dequant_ws_key(torch.float16, device), old_key)
+
+
+class TestPerLaneInputBufferPool(unittest.TestCase):
+    """Geteilte-Puffer-Familie, the CUDA-graph INPUT buffers (#274 slice D2).
+
+    ``share_input_buffer`` coalesces every graph runner's ``input_ids`` /
+    ``positions`` / ``out_cache_loc`` by (name, numel, dtype, device), and its
+    safety argument is the same sequential one: the buffers are filled
+    immediately before each replay and the forwards are mutually exclusive.
+
+    A concurrent lane is the case that breaks it, and it is not a hypothetical
+    collision: the lane's breakable-prefill tier ladder tops out at the serving
+    group's ``chunked_prefill_size``, so the two runners request an IDENTICAL
+    key and both graphs are captured against one address. The loser's
+    ``store_kvcache`` then reads slot ids belonging to the other group's pool
+    -- the ``index >= 0 && index < size_limit`` device assert of DESIGN_121
+    §12.7.
+    """
+
+    def setUp(self):
+        from sglang.srt.model_executor.input_buffers import (
+            _forward_input_buffer_pool,
+        )
+
+        _forward_input_buffer_pool.clear()
+
+    def tearDown(self):
+        from sglang.srt.model_executor.input_buffers import (
+            _forward_input_buffer_pool,
+        )
+
+        _forward_input_buffer_pool.clear()
+        os.environ.pop("SGLANG_LANE_SHARED_INPUT_BUFFERS", None)
+        reset_context()
+
+    @staticmethod
+    def _out_cache_loc():
+        import torch
+
+        # The measured vehicle's shape: 2048 x int64, the serving group's
+        # chunked_prefill_size and the top of the lane's thinned tier ladder.
+        return torch.zeros(2048, dtype=torch.int64)
+
+    def test_a_concurrent_lane_does_not_land_on_the_serving_buffer(self):
+        from sglang.srt.model_executor.input_buffers import share_input_buffer
+
+        serving = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        with lane_scope(0, None):
+            lane0 = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        with lane_scope(1, None):
+            lane1 = share_input_buffer("out_cache_loc", self._out_cache_loc())
+
+        self.assertNotEqual(serving.data_ptr(), lane0.data_ptr())
+        self.assertNotEqual(lane0.data_ptr(), lane1.data_ptr())
+
+    def test_within_one_scope_the_sharing_is_unchanged(self):
+        from sglang.srt.model_executor.input_buffers import share_input_buffer
+
+        # The default path: the serving group's own runners still coalesce,
+        # which is the whole point of the pool.
+        first = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        second = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+        with lane_scope(0, None):
+            a = share_input_buffer("out_cache_loc", self._out_cache_loc())
+            b = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        self.assertEqual(a.data_ptr(), b.data_ptr())
+
+    def test_the_escape_hatch_reproduces_the_defect(self):
+        from sglang.srt.model_executor.input_buffers import share_input_buffer
+
+        os.environ["SGLANG_LANE_SHARED_INPUT_BUFFERS"] = "1"
+        serving = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        with lane_scope(0, None):
+            lane0 = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        # This IS the bug: one address, two concurrent writers.
+        self.assertEqual(serving.data_ptr(), lane0.data_ptr())
+
+    def test_a_serial_lane_keeps_sharing(self):
+        from sglang.srt.model_executor.input_buffers import share_input_buffer
+
+        # ``DualGroupLane.scope_lane_id`` is None in serial mode, so the serial
+        # path stays byte-for-byte the slice-B path -- the gate slice C was not
+        # allowed to move.
+        serving = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        with lane_scope(None, None):
+            serial_lane = share_input_buffer("out_cache_loc", self._out_cache_loc())
+        self.assertEqual(serving.data_ptr(), serial_lane.data_ptr())
 
 
 class TestCaptureModeIsolation(unittest.TestCase):

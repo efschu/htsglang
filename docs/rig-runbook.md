@@ -82,6 +82,8 @@ definitions in `python/sglang/srt/environ.py`).
 | `CUDA_VISIBLE_DEVICES` | `99` (desk work only) | makes CUDA see no devices when the cards are occupied by other agents. Never set it for launches that use `--rank-gpu-id`: the mapping addresses the full device view |
 | `SGLANG_HTCCL` | `1` only for HTCCL runs | routes TP collectives over HTCCL instead of NCCL (default off = byte-identical stock dispatch). Required for cross-vendor (NVIDIA+AMD) groups; forceable on homogeneous groups for testing |
 | `SGLANG_HTCCL_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_HTCCL_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_HTCCL_UCX_CHUNK_MIB` (4), `SGLANG_HTCCL_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_HTCCL_UCX_AG_RING_KIB` (32; the all_gather ring, 0 disables it), `SGLANG_HTCCL_UCX_GRAIN_ELEMS` (32768; largest host-side pass kept on the calling thread, 0 restores the unchunked passes), `SGLANG_HTCCL_UCX_TIMEOUT_S` (300), `SGLANG_HTCCL_UCX_OVERLAP` (off) |
+| `SGLANG_DEBUG_INPUT_BUFFER_POOL` | `1` for diagnosis only | logs one line per CUDA-graph input-buffer pool registration (scope, lane, name, numel, dtype, device, pointer, new/adopted). This is how you see two groups landing on one buffer; noisy, never for measurements |
+| `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 
 ## 3. Mandatory boot flags
@@ -1166,22 +1168,34 @@ Four properties that decide how to read it:
   no controller and the rung is always `static`; a window across a rung
   change is dropped, because E is only defined per rung.
 
-**Why it is off by default.** With the estimator ON, a serving group under a
-continuous 2048-token-prefill lane died in the serving group's GDN prefill
-path (`store_kvcache`, `Assertion 'index >= 0 && index < size_limit'`) in
-3 of 3 runs at 60 s per phase. The same run with `--dual-group-lane-share-
-window-s 0`, and the same run on the base commit, survived 3 of 3 and produce
-numbers identical to three decimals. Counters, estimator cost and pool sizing
-are all ruled out; the mechanism is not. Until it is found (DESIGN_121 §12.7),
-this is an opt-in instrument — and the DECODE arm, where it was validated,
-ran it in four boots without incident. If you turn it on, do not drive the
-lane with long prefills.
+**Why it is off by default.** It costs work in the scheduler thread, directly
+in front of the serving group's batch launch, and its PREFILL-arm reading is
+quantization-limited by construction (the lane counter ticks once per finished
+prefill, ~0.68 s at 2048 tokens, against a ~1 s window). That makes it an
+instrument you switch on for a measurement, not always-on telemetry.
 
-- **Reproducer**, if you want to work on it: the 4.12 concurrent recipe with
-  `--dual-group-lane-budget-mib 700`, then a 60 s phase in which the lane is
-  fed back-to-back 2048-token prefill jobs (`"spec": false`,
-  `max_new_tokens: 1`) while `/generate` runs back-to-back 128-token
-  requests. It dies 40-60 s in.
+**It is NOT off because of the slice-D1 crash — that one is found and fixed.**
+Slice D1 measured the estimator killing a serving group under a continuous
+2048-token-prefill lane in 3 of 3 runs (`store_kvcache`, `Assertion
+'index >= 0 && index < size_limit'`). The estimator was not the cause: it is
+pure Python over two counters and touches no state. The cause was
+`share_input_buffer` coalescing the CUDA-graph input buffers process-wide,
+so the lane's breakable-prefill graph and the serving group's were CAPTURED
+against one `out_cache_loc` address on the shared card — two concurrent
+writers, one buffer, foreign slot ids. The pool is keyed by
+`current_lane_id()` since slice D2 (DESIGN_121 §13).
+
+- **Reproducer**, if you need the defect back: set
+  `SGLANG_LANE_SHARED_INPUT_BUFFERS=1` (restores the process-wide key) on the
+  4.12 concurrent recipe with `--dual-group-lane-budget-mib 700`, then a 60 s
+  phase in which the lane is fed back-to-back 2048-token prefill jobs
+  (`"spec": false`, `max_new_tokens: 1`) while `/generate` runs back-to-back
+  requests.
+- **Seeing the aliasing directly**: `SGLANG_DEBUG_INPUT_BUFFER_POOL=1` logs
+  one line per pool registration (scope, lane, name, numel, dtype, device,
+  pointer, whether it is new). On the rank carrying the lane the same
+  `out_cache_loc numel=<chunked_prefill_size>` pointer appears twice —
+  `new=True` from the serving group, `new=False` from the lane.
 
 
 ## 5. Credentials

@@ -2039,3 +2039,154 @@ mitten in der Diagnose nachgeruestet werden — das kostete einen Boot.
 5. **Mehr als zwei Lanes auf einer Karte** ist unvermessen und wird als
    solches gemeldet; die erste Messung dafuer waere zwei Lanes plus Verband
    auf der 5090.
+
+## 13. Slice D Runde 2, Posten 0 (feat/dual-group-slice-d2, Basis 28f868ec45)
+
+### 13.1 DIE WURZEL: zwei Graphen, EIN out_cache_loc
+
+Der Schaetzer ist unschuldig. Er beruehrt keinen Zustand — er liest zwei
+monotone Zaehler und rechnet in reinem Python. Was er aendert, ist
+ausschliesslich das TIMING an der Korngrenze. Das reicht, weil darunter ein
+harter Zustandsfehler liegt, der ohne ihn nur seltener getroffen wird:
+
+`share_input_buffer` (`model_executor/input_buffers.py`) fasst die
+Graph-Eingabepuffer JEDES Runners im Prozess ueber den Schluessel
+`(name, numel, dtype, device)` zusammen. Sein Sicherheitsargument stand
+woertlich im Docstring:
+
+> „Cross-runner sharing is safe because those buffers are filled immediately
+> before each replay and the forwards that use them are sequential /
+> mutually exclusive."
+
+Genau diese Voraussetzung hebt `--dual-group-lane-concurrent` auf. Und die
+Kollision ist kein Zufall, sondern strukturell: die Lane duennt ihre
+Prefill-Sprossenleiter auf `(16 … 2048)` aus, also endet sie bei
+`chunked_prefill_size` — demselben Wert, bei dem die Prefill-Leiter des
+Verbands endet. Beide Runner fragen damit denselben Schluessel an.
+
+Am Schreibtisch vorhergesagt (CPU-Sonde ueber `ServerArgs` +
+`_lane_server_args_view`, ohne Boot):
+
+    serving prefill max_num_tokens = 2048
+    lane    prefill max_num_tokens = 2048
+    COLLIDE(prefill out_cache_loc key) = True
+
+Am Rig belegt (Boot 1, `SGLANG_DEBUG_INPUT_BUFFER_POOL=1`, Rohdaten vor der
+Analyse gedumpt). Auf TP0 — der Karte, die die Lane traegt — erscheint
+derselbe Schluessel ZWEIMAL mit DEMSELBEN Zeiger, einmal vom Verband
+angelegt und einmal von der Lane uebernommen:
+
+    TP0 out_cache_loc numel=2048 ptr=0x7689b1dd4c00 new=True    <- Verband
+    TP0 out_cache_loc numel=2048 ptr=0x7689b1dd4c00 new=False   <- Lane
+    TP0 input_ids     numel=2048 ptr=0x768ddfff8400 new=True/False
+    TP0 positions     numel=2048 ptr=0x7689b1dd8c00 new=True/False
+
+TP1 und TP2 tragen keine Lane und registrieren jeden Schluessel genau
+einmal — die Kollision existiert exakt dort, wo zwei Gruppen auf einer Karte
+sitzen.
+
+Damit ist der Absturz erklaert, und zwar vollstaendig:
+
+1. Beide Prefill-Graphen werden gegen DIESELBE Adresse GEFANGEN. Ein
+   gefangener Graph traegt die Adresse, nicht den Tensor — ein spaeteres
+   Umhaengen des Python-Objekts hilft nicht mehr.
+2. Im nebenlaeufigen Betrieb spielt die Lane ihren Prefill-Graphen auf ihrem
+   eigenen Thread und Stream ab, waehrend der Verband seinen abspielt. Zwei
+   Schreiber, ein Puffer.
+3. Wer verliert, liest die Slot-Ids des anderen. Die Pools sind verschieden
+   gross (Verband 79985 Token, Lane 11200), also sind die fremden Ids
+   ausserhalb der eigenen Grenze — und `store_kvcache` prueft genau das:
+   `SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`.
+
+Und es erklaert die ARMABHAENGIGKEIT, die D1 gemessen und nicht erklaeren
+konnte: im DECODE-Arm spielt die Lane pro Job genau EINEN Prefill-Graphen ab
+und danach 128 Decode-Schritte — das Kollisionsfenster ist winzig, und der
+Schaetzer lief dort in vier Boots stabil. Im PREFILL-Arm besteht die
+Lane-Last aus nichts als 2048er-Prefills, also aus einem
+Prefill-Graph-Replay nach dem anderen — das Fenster ist dauernd offen.
+
+### 13.2 Der Schuldspruch, und warum er nicht anders lauten kann
+
+LATENTE RACE IN DER LAUFZEIT, nicht Schaetzer-Zustand. Drei unabhaengige
+Belege:
+
+* Der Schaetzer beruehrt keinen Zustand, der in diesen Pfad fuehrt. Er ist
+  reines Python ueber zwei Ganzzahlen (`lane_share.py` importiert kein
+  torch). D1 hatte Zaehler, Kosten und Dimensionierung bereits
+  ausgeschlossen; was uebrig blieb, war Latenz.
+* Die Kollision ist VOM SCHAETZER UNABHAENGIG nachweisbar: die CPU-Sonde und
+  der Boot-1-Pool-Dump zeigen sie bei ausgeschaltetem wie eingeschaltetem
+  Schaetzer, weil sie zur CAPTURE-Zeit entsteht — lange bevor der erste
+  Zaehler gelesen wird.
+* Der Gegenbeweis ist konstruktiv: derselbe Schaetzer, dieselben Fenster,
+  dieselbe Last — nur die Puffer-Identitaet geaendert — und der Absturz
+  verschwindet (§13.4).
+
+Der Befund gehoert damit in die Geteilte-Puffer-Familie, und er ist ihr
+vierter Fall auf demselben Muster: ein zurueckgegebener Puffer plus eine
+Reihenfolge-Annahme, die nur im Kommentar steht. Die drei vorherigen
+(Graph-Memory-Pool, GGUF-Dequant-Workspace, `GraphSharedOutput`) wurden in
+Slice C je einzeln auf `current_lane_id()` umgeschluesselt. Der
+Eingabepuffer-Pool blieb prozessweit — er stand nicht auf der Liste, weil er
+nicht wie eine Ressource aussieht, sondern wie eine Optimierung.
+
+### 13.3 Der Fix
+
+`share_input_buffer` schluesselt zusaetzlich nach `current_lane_id()` —
+dieselbe Identitaet, die Graph-Pool, Dequant-Workspace und
+`GraphSharedOutput` schon benutzen, mit derselben Konsequenz:
+
+* Verband = `None` -> genau ein Satz Puffer, Default-Pfad unveraendert.
+* SERIELLE Lane = `None` (`DualGroupLane.scope_lane_id`) -> weiter geteilt,
+  weil die sequentielle Praemisse dort gilt; das Slice-B-Byte-Tor bewegt
+  sich nicht.
+* NEBENLAEUFIGE Lane = Lane-Id -> eigener Satz Puffer. Der Preis steht neben
+  dem schon benannten Preis der Nebenlaeufigkeit (eigener Capture-Pool,
+  eigener Dequant-Workspace) und ist mit ~1,3 MiB je Lane (2048+79985
+  int64-Slots x 3 Namen) die kleinste Position davon.
+
+`SGLANG_LANE_SHARED_INPUT_BUFFERS=1` stellt den alten prozessweiten
+Schluessel wieder her. Das ist kein Betriebsmodus, sondern der Falsifikator:
+der Defekt bleibt auf Knopfdruck reproduzierbar, und der CPU-Test pinnt
+beide Richtungen.
+
+### 13.4 Welche Richtung knallt, und welche schweigt
+
+Der Puffer ist EINER je Achse, nicht einer je Sprosse: `build_prefill_registry`
+legt `out_cache_loc` in voller Laenge `max_num_tokens` an, und jedes Replay
+schreibt nur `[:raw_num_tokens]` und nullt den Rest. JEDER Verbands-Prefill,
+auch ein 44-Token-Prompt, schreibt also in den Kopf DESSELBEN
+2048-Slot-Puffers, den die Lane fuer ihren 2048er-Prefill vollstaendig
+beschreibt.
+
+Daraus folgen zwei Richtungen mit sehr verschiedenem Verhalten:
+
+* **Verbands-Ids in den Lane-Graphen** — der Verbandspool fasst ~80 000
+  Token, die Lane 11 200. Fremde Ids liegen fast immer ueber der Grenze der
+  Lane, also FEUERT der Assert. Das ist der laute Fall, und der, den D1 als
+  Absturz gesehen hat. Ein Device-Assert zerstoert den Kontext des ganzen
+  Prozesses; welcher Host-Thread ihn meldet, haengt daran, wer als naechstes
+  synchronisiert — die D1-Zuordnung „im GDN-Prefill des VERBANDS" ist
+  deshalb nicht belastbar, der Absturzort ist es.
+* **Lane-Ids in den Verbands-Graphen** — Lane-Ids sind klein und liegen
+  INNERHALB der Verbandsgrenze. Der Assert schweigt, der Verband schreibt
+  seine KV in fremde Slots. Das ist der gefaehrlichere Fall: stille
+  KV-Korruption ohne jedes Signal. Er ist mit demselben Fix erledigt.
+
+### 13.5 Der Ausloeser ist der VERBANDS-Prefill, nicht die Lane-Last
+
+Boot 3 (Alias wiederhergestellt, Schaetzer AN, voller Prefill-Arm) hat NICHT
+gekippt — und das ist kein Gegenbeweis, sondern eine Vorhersage des
+Mechanismus, die sich pruefen laesst. Die Kollision braucht ZWEI gleichzeitige
+Prefill-Replays. Die Lane lieferte ihre Seite (2879 Prefill-Token/s, also
+etwa alle 0,7 s ein 2048er-Replay), der Verband aber nicht: unter einer Last
+aus wenigen langen Generierungen kam er auf **1,0 Prefill-Token/s** — etwa
+ein Prefill je Minute.
+
+Daraus die Regel fuer jeden Reproduzierer dieser Familie, und sie ist
+allgemeiner als dieser Bug: **die Last muss die geteilte RESSOURCE saettigen,
+nicht die Komponente.** Eine Verbandslast, die „ausgelastet" aussieht
+(11,5 Decode-Token/s unter Volllast der Lane), ruehrt den Prefill-Pfad
+praktisch nicht an. Kurze Anfragen mit mehreren gleichzeitig sind hier die
+richtige Last, lange Generierungen die falsche — genau umgekehrt zu dem, was
+„Serverlast" intuitiv heisst.

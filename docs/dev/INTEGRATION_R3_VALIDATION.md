@@ -6924,3 +6924,57 @@ lief.
 ruff/black/isort/codespell sauber auf allen neuen Dateien; die
 Ruff-Bestandsfehler in `scheduler.py` und `server_args.py` sind unveraendert
 (88 vorher, 88 nachher).
+
+## #274 Slice D Runde 2, Posten 0 (feat/dual-group-slice-d2, Basis 28f868ec45) — 2026-07-29
+
+Auftrag: die Wurzel des Schaetzer-an-Absturzes aus D1 (§12.7) finden, mit
+Schuldspruch und Gegenbeweis. Regler-Schleife, Dashboard-Tab und
+#279-Andockpunkte gehoeren ausdruecklich NICHT dazu.
+
+### Die Wurzel in drei Saetzen
+
+`share_input_buffer` fasst die CUDA-Graph-Eingabepuffer aller Runner im
+Prozess prozessweit ueber `(name, numel, dtype, device)` zusammen, und die
+Lane duennt ihre Prefill-Sprossenleiter genau auf `chunked_prefill_size` aus
+— also fragen der Prefill-Graph des Verbands und der der Lane DENSELBEN
+Schluessel an und werden gegen DIESELBE `out_cache_loc`-Adresse gefangen.
+Unter `--dual-group-lane-concurrent` spielt die Lane ihren Prefill-Graphen
+auf ihrem eigenen Thread und Stream ab, waehrend der Verband seinen
+abspielt; wer verliert, liest die Slot-Ids des anderen Pools und faellt in
+`SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`.
+Der Schaetzer beruehrt davon NICHTS — er ist reines Python ueber zwei
+Ganzzahlen; er verschiebt nur das Timing an der Korngrenze und macht damit
+ein Kollisionsfenster wahrscheinlich, das ohne ihn seltener getroffen wird.
+
+**SCHULDSPRUCH: latente Race in der Laufzeit, Schaetzer rehabilitiert.**
+
+### Der Beleg, Rohdaten vor der Analyse
+
+Schreibtisch (CPU-Sonde ueber `ServerArgs` + `_lane_server_args_view`, kein
+Boot, keine GPU-Belegung):
+
+    serving prefill max_num_tokens = 2048
+    lane    prefill max_num_tokens = 2048
+    COLLIDE(prefill out_cache_loc key) = True
+
+Rig (`SGLANG_DEBUG_INPUT_BUFFER_POOL=1`, TP0 = die Karte mit der Lane):
+
+    scope=None lane=None out_cache_loc numel=2048 ptr=0x70d27dda4600 new=True
+    scope=0    lane=None out_cache_loc numel=2048 ptr=0x70d27dda4600 new=False
+    scope=None lane=None input_ids     numel=2048 ptr=0x70d4efff8a00 new=True
+    scope=0    lane=None input_ids     numel=2048 ptr=0x70d4efff8a00 new=False
+    scope=None lane=None positions     numel=2048 ptr=0x70d27dda8600 new=True
+    scope=0    lane=None positions     numel=2048 ptr=0x70d27dda8600 new=False
+
+`scope=None` ist der Verband, `scope=0` die Lane, `lane=None` in beiden
+Zeilen ist der alte prozessweite Schluessel — derselbe Zeiger, zwei
+Gruppen. TP1 und TP2 tragen keine Lane und registrieren jeden Schluessel
+genau einmal: die Kollision existiert exakt dort, wo zwei Gruppen auf einer
+Karte sitzen.
+
+Das erklaert auch die ARMABHAENGIGKEIT, die D1 gemessen und nicht erklaeren
+konnte. Im Decode-Arm spielt die Lane je Job EINEN Prefill-Graphen ab und
+danach ~128 Decode-Schritte — das Kollisionsfenster ist winzig, und der
+Schaetzer lief dort in vier Boots stabil. Im Prefill-Arm besteht die
+Lane-Last aus nichts als 2048er-Prefills, also aus einem
+Prefill-Graph-Replay nach dem anderen.
