@@ -6803,3 +6803,124 @@ BOOT-BILANZ GESAMT: 9 Starts, 5 davon mit GPU-Belegung, 2 davon gruen
 (beide Arm A). Das Budget von 8 wurde um einen Start ueberzogen — bewusst und
 hier vermerkt: Start 9 war die Korrektur einer Budget-Fehlgroesse mit
 bekannter Ursache, nicht ein neuer Versuch ins Blaue.
+
+## #274 Slice D Runde 1 (feat/dual-group-slice-d1, Basis 2d48ea0608) — 2026-07-29
+
+Auftrag: vier schmale Posten in fester Reihenfolge, kein Dispatcher, kein
+Regler. Buchfuehrung in DESIGN_121 §12.
+
+### Boot-Bilanz: 6 von 6, jeder eine Aenderung
+
+| # | Zweck | Ergebnis |
+|---|---|---|
+| 1 | S1 + A/B, 1-s-Fenster, 45-s-Phasen | **gruen**, alle 7 Phasen |
+| 2 | dieselbe Messung mit 4-s-Fenstern | Decode-Arm 0 auswertbare Fenster (Befund); tot im Prefill-Arm |
+| 3 | Wiederholung Boot-1-Flags, 60-s-Phasen | tot im Prefill-Arm (2. Reproduktion) |
+| 4 | **Basis 2d48ea0608**, Prefill-Arm 60 s | gruen 2/2 — der Kreuzversuch |
+| 5 | Zweig mit Schaetzer AUS, Prefill-Arm 60 s | gruen 2/2, Basiszahlen auf 3 Nachkommastellen |
+| 6 | Zweig mit verbilligtem Schaetzer | tot im Prefill-Arm (3. Reproduktion) |
+
+Die Green-Context-Sonde lief ohne Server (ctypes, Sekunden) und zaehlt nicht
+als Boot.
+
+### 1. S1 — Online-E gegen den Rauschboden: GRUEN im Decode-Arm
+
+Gebaut: `srt/model_executor/lane_share.py` (`LaneShareMeter`, reines Python,
+CPU-testbar), gespeist an der Korngrenze des Zwei-Klassen-Schedulers,
+veroeffentlicht als `sglang:lane_share{lane_class}` / `sglang:lane_share_e`
+und unter `internal_states[i]["lane_share"]`. Beide Instrumente lesen
+DIESELBEN monotonen Zaehler; sie unterscheiden sich nur in der Fensterung.
+
+| Phase | OFFLINE E | ONLINE Median E (n) | Delta |
+|---|---|---|---|
+| P2 shared decode | 1,5289 | 1,5210 (24) | −0,51 % |
+| P3 shared decode (Wdh.) | 1,5091 | 1,5157 (34) | +0,43 % |
+
+    A-vs-A OFFLINE 1,31 % · A-vs-A ONLINE 0,35 %
+    Boeden: Verband 40,134 tok/s (boot-zu-boot 40,134/40,165/40,262 = 0,32 %),
+    Lane decode 30,428 tok/s
+
+Der Falsifikator aus DESIGN_201 Nachtrag 12 ist NICHT ausgeloest: die
+Online-Schaetzung unterbietet den Rauschboden und ist stabiler als die
+Referenz. Ein Regler ist auf dieser Signalqualitaet baubar.
+
+GRENZE, mitgemessen: im PREFILL-Arm trifft sie nicht (+4,2 % / −11,7 %),
+weil der Zaehler einmal je FERTIGEM 2048er-Prefill (~0,68 s) steigt und ein
+1-s-Fenster damit ein oder zwei Quanten enthaelt. Die naheliegende Abhilfe
+(laengeres Fenster) ist in Boot 2 gemessen und WIDERLEGT: bei 4 s enthaelt
+praktisch jedes Fenster einen Armwechsel, der Decode-Arm liefert dann null
+auswertbare Fenster. Regel: Fenster >> Arbeitsquantum UND << Armwechsel-
+Abstand; wo es kein solches Fenster gibt, hilft nur feinere Buchfuehrung
+(Prefill je Chunk).
+
+### 2. Spreizungs-Entscheider v1 + A/B an dir1
+
+`srt/planner/spread.py`: Etikett analytisch (`2·params·tokens/weight_bytes`
+gegen `gemm_tflops/membw` der Karte), Paar-Matrix nur als Tie-Break,
+Machbarkeit ueber einen `feasible`-Callback in `coresident_budget_plan`
+statt einer zweiten VRAM-Regel. Unvermessene Regime (2 SM-Lanes auf einer
+Karte, >2 Lanes) liefern `expected_e = None` mit Grund.
+HTTP: `POST /api/key_solver/spread`. Planner-TAB nicht gebaut (eigenes
+Ticket des UI-Strangs).
+
+A/B auf dem Rig, EIN Boot, Boeden zuerst, je zweimal:
+
+| Arm | Verband share | Lane share | **E** | A-vs-A |
+|---|---|---|---|---|
+| decode-foermig (Wahl des Entscheiders) | 0,8011 / 0,8115 | 0,7278 / 0,6976 | **1,5289 / 1,5091** | 1,31 % |
+| 2048er-Prefill (dir1, schlechte Paarung) | 0,2634 / 0,4613 | 0,9920 / 0,7273 | **1,2553 / 1,1886** | 5,6 % |
+
+**+24,3 % Aggregat** fuer die gewaehlte Paarung — reproduziert die
+Slice-C-Ordnung (1,440 gegen 1,130 = +27,4 %) auf einer anderen
+Lane-Konfiguration, ist also eine unabhaengige Bestaetigung der
+Zielfunktion. Der Preis der schlechten Paarung wird ueberwiegend vom Verband
+bezahlt (0,26–0,46 seines Bodens gegen 0,80–0,81).
+
+### 3. Summen-Invarianz: gruen, 6 Tests
+
+`TestPrioritySumInvariance` in `test_key_solver.py`: alle 27
+Klassenbelegungen (`product((0,1,2), repeat=3)`), eine Karte und drei
+Karten, der Hunger-Fall, `_award_leftover` exakt konservierend fuer vier
+Restgroessen, plus zwei Gegenproben (die Aufteilung bewegt sich; die
+nutzbare Kontext-Zahl ist NICHT invariant, sichtbar nur auf ungleichem Rig).
+
+### 4. S2 — Green Contexts: gehen, sind aber kein Laufzeit-Regler
+
+`scripts/dual_group/green_ctx_probe.py`, reine Treibersonde, Treiber-CUDA
+13.2, alle Symbole vorhanden.
+
+* erzeugbar auf **sm120 UND sm86**; Granularitaet **8 SM** (5090, 170 gesamt)
+  bzw. **2 SM** (3080, 68 gesamt);
+* die Maske WIRKT: eager kostet 8 statt 88 SM das 4,51-fache (5090), 2 statt
+  34 SM das 12,5–13,1-fache (3080);
+* ein in der breiten Maske GEFANGENER Graph laeuft auf dem schmalen Stream
+  exakt gleich schnell wie auf dem breiten (1,281/1,281 ms bzw.
+  2,976/2,976 ms) — er traegt die Ressourcen SEINES Aufnahme-Kontexts;
+* nach `cuGreenCtxDestroy` des Aufnahme-Kontexts: `CUDA_ERROR_CONTEXT_IS_
+  DESTROYED`.
+
+VERDIKT: der einzige echte SM-Zuteiler in einem Prozess, aber pro Sprosse
+ein eigener Capture. Nachtrag 12 (4) bestaetigt: der Aktionsraum ist die
+diskrete Capture-Leiter, Preis Graph-Pools × Sprossen, und jeder Kontext
+muss leben, solange ein unter ihm gefangener Graph abgespielt werden kann.
+
+### 5. Der Befund, der das Flag auf AUS stellt
+
+Der eingeschaltete Schaetzer kippt den Server im Prefill-Arm reproduzierbar
+(Boots 2/3/6), Basis und Schaetzer-aus ueberleben (Boots 4/5). Absturzstelle
+immer `store_kvcache` im GDN-Prefill des VERBANDS,
+`Assertion 'index >= 0 && index < size_limit'`. Zaehler, Schaetzerkosten und
+Dimensionierung sind ausgeschlossen; der Mechanismus nicht.
+`--dual-group-lane-share-window-s` ist deshalb **DEFAULT 0 (aus)**, der
+Schaetzer ist opt-in, und der Mechanismus ist Posten 0 von D2 (drei benannte
+Kreuzversuche in DESIGN_121 §12.8). Alle S1-Zahlen oben stammen aus
+Decode-Arm-Laeufen mit eingeschaltetem Schaetzer, wo er in vier Boots stabil
+lief.
+
+### CPU-Tore
+
+`test_lane_share.py` (21), `test_spread.py` (21),
+`test_key_solver.py::TestPrioritySumInvariance` (6), `test_webui.py` (361).
+ruff/black/isort/codespell sauber auf allen neuen Dateien; die
+Ruff-Bestandsfehler in `scheduler.py` und `server_args.py` sind unveraendert
+(88 vorher, 88 nachher).

@@ -1748,3 +1748,294 @@ lassen ~8 GiB fuer beide Pool-Saetze — machbar, aber eng, also mit kleinem
 aus, ist der naechste ehrliche Schritt ein MoE-Vehikel, das der VERBAND
 zuerst allein tragen muss (§ "Einzelteil vor Verbund"), nicht ein weiterer
 Lane-Versuch.
+
+## 12. Slice D Runde 1 (feat/dual-group-slice-d1, Basis 2d48ea0608)
+
+Slice D ist die Intelligenz-Schicht: WO laufen welche Lasten, und ab wann
+verschiebt ein Regler zur Laufzeit. Runde 1 baut bewusst KEINEN Dispatcher
+und KEINEN Regler, sondern die vier Stuecke, die vorher da sein muessen —
+und eines davon kann alles Weitere killen, also kommt es zuerst.
+
+### 12.1 S1 — die Online-E-Schaetzung, gegen den Rauschboden
+
+Der Regler-Entwurf aus DESIGN_201 Nachtrag 12 (3) haengt an genau einer
+Frage: laesst sich `E` ONLINE, je ~1-s-Fenster, so genau schaetzen, dass ein
+Regler darauf steuern koennte? Wenn nein, ist kein Regler baubar, egal
+welche Stellhebel es gibt.
+
+GEBAUT: `srt/model_executor/lane_share.py` — `LaneShareMeter`, reines
+Python, kein torch, komplett CPU-testbar. Er bekommt je Klasse MONOTONE
+Arbeitszaehler, schliesst alle `--dual-group-lane-share-window-s` Sekunden
+ein Fenster und rechnet `share_c = Rate_c(Fenster) / Rate_c(Solo-Boden)`,
+`E = SUMME share_c`. Gespeist wird er im Zwei-Klassen-Scheduler
+(`Scheduler._lane_share_sample` am selben Korngrenzen-Punkt wie
+`_dual_group_lane_tick`), veroeffentlicht wird er als
+`sglang:lane_share{lane_class}` / `sglang:lane_share_e` und unter
+`internal_states[i]["lane_share"]`.
+
+Vier Regeln stecken im Code, weil jede von ihnen schon einmal eine Messung
+gekippt hat:
+
+1. ARBEIT JE WANDSEKUNDE, nie die selbstgemeldete Schrittzeit (§11.17 —
+   so gerechnet kam E = 1,23 fuer eine per Konstruktion nullsummige
+   Betriebsart heraus).
+2. EIN ARM JE FENSTER. Prefill- und decode-foermige Schritte haben
+   verschiedene Boeden; ein Fenster, in dem eine Klasse beides tat, wird
+   VERWORFEN und gezaehlt, nicht gemittelt.
+3. BOEDEN NUR AUS SOLO-FENSTERN, und einfrierbar (`freeze_floors` /
+   `load_floors`) — die Selbstkonditionierungs-Falle aus Nachtrag 12 (4).
+4. JEDES FENSTER TRAEGT SEINE SPROSSEN-ID. E ist nur je Reglerzustand
+   definiert; ein Fenster ueber einen Sprossenwechsel ist unauswertbar und
+   wird verworfen. Runde 1 hat keinen Regler, die Sprosse ist konstant —
+   die Buchfuehrung steht trotzdem VOR der ersten Messung, wie verlangt.
+
+GEMESSEN (Boot 1, R6-Vehikel: 27B-Q3_K_M-GGUF, TP=3 uneven `2,1,1` /
+`6,1,1`, Lane auf der 5090, Lane-Budget 700, nebenlaeufig, Lane-Jobs
+`target_verify`, 128 Ausgabe-Token; Fenster 1,0 s; 45-s-Phasen; Boeden
+zuerst, im selben Boot). Beide Instrumente lesen DIESELBEN Zaehler, sie
+unterscheiden sich nur in der Fensterung — genau die Groesse, die S1 prueft:
+
+| Phase | OFFLINE share (Verband/Lane) | OFFLINE E | ONLINE Median E (n) | Delta |
+|---|---|---|---|---|
+| P2 shared decode | 0,8011 / 0,7278 | **1,5289** | **1,5210** (24) | −0,51 % |
+| P3 shared decode (Wdh.) | 0,8115 / 0,6976 | **1,5091** | **1,5157** (34) | +0,43 % |
+
+    Boeden: Verband 40,134 tok/s, Lane 30,428 tok/s (Solo-Phasen)
+    A-vs-A OFFLINE: 1,5289 vs 1,5091 = 1,31 % Spannweite
+    A-vs-A ONLINE : 1,5210 vs 1,5157 = 0,35 % Spannweite
+
+S1-VERDIKT: **GRUEN auf dem Decode-Arm.** Die Online-Schaetzung trifft die
+Offline-Zahl desselben Boots auf ≤0,51 %, und das liegt UNTER dem
+A-vs-A-Boden des Referenzinstruments (1,31 %). Die Online-Schaetzung ist
+dabei die STABILERE von beiden (0,35 % gegen 1,31 %) — sie mittelt ueber
+Fenster statt ueber eine Phase. Gegen den historischen R6-Punkt 1,544 liegt
+sie 1,5 % darunter; dazwischen liegen ein anderer Boot und eine andere
+Job-Laenge (128 statt 32 Ausgabe-Token), also ist das kein Instrumenten-
+Befund. Der Falsifikator aus Nachtrag 12 ist damit NICHT ausgeloest: ein
+Regler ist auf dieser Signalqualitaet baubar.
+
+DIE GRENZE, und sie ist der eigentliche Zusatzertrag von S1. Auf dem
+PREFILL-Arm trifft die Online-Schaetzung NICHT: +4,2 % / −11,7 % gegen
+offline, bei einer Fensterstreuung p10–p90 von 0,77–1,66. Die Ursache ist
+kein Rauschen, sondern QUANTISIERUNG: der Lane-Zaehler steigt einmal je
+FERTIGEM Prefill, und ein 2048er-Prefill dauert ~0,68 s. In einem
+1-s-Fenster liegen also ein oder zwei Quanten — ±50 % allein aus der
+Abzaehlung. Regel daraus, und sie gehoert in jedes Regler-Briefing: das
+Messfenster muss mehrere Arbeitsquanten enthalten. Ein Decode-Token (33 ms)
+erfuellt das bei 1 s dreissigfach, ein ganzer Prefill nicht.
+
+Boot 2 hat die naheliegende Abhilfe „laengeres Fenster" geprueft und WIDERLEGT:
+mit 4-s-Fenstern lieferte der DECODE-Arm ueberhaupt kein auswertbares Fenster
+mehr (0 von 31), weil bei 4 s praktisch jedes Fenster einen ARMWECHSEL
+enthaelt — jeder Lane-Job beginnt mit einem Prefill, jede Verbands-Anfrage
+auch. Die nutzbare Fensterquote ist damit `1 − (Armwechsel-Rate × Fenster)`,
+und die beiden Anforderungen ziehen gegeneinander: das Fenster muss VIEL
+GROESSER als das Arbeitsquantum und VIEL KLEINER als der Armwechsel-Abstand
+sein. Auf diesem Vehikel gibt es fuer den Prefill-Arm kein solches Fenster.
+Die Abhilfe ist deshalb nicht die Fensterlaenge, sondern feinere Buchfuehrung:
+Prefill je CHUNK zaehlen statt je Job (offen, §12.8).
+
+Nebenbefund zu den BOEDEN: der online gelernte Verbands-Boden liegt bei
+42,62 tok/s gegen 40,13 tok/s aus der Phasenrechnung. Kein Widerspruch,
+sondern dieselbe Regel 2 von der anderen Seite — die Online-Boeden stammen
+nur aus reinen Decode-Fenstern, die Phasenzahl enthaelt auch die
+Request-Prefills. Zaehler und Nenner verschieben sich gemeinsam, deshalb
+stimmen die SHARES trotzdem ueberein. Wer Online- und Offline-Boeden
+mischt, bekommt einen Fehler von ~6 %.
+
+### 12.2 Der Spreizungs-Entscheider v1
+
+`srt/planner/spread.py`. Der Schluessel-Solver sagt in seiner eigenen
+Scope-Zeile, dass er Lanes nie erfindet und dass die Aufzaehlung von
+Lane-STRUKTUREN der Suchraum von Slice D ist. Genau dieser eine Schritt ist
+gebaut: gegeben N Lanes mit Lastform-Etikett und ein Rig, waehle die
+KARTEN-Zuordnung.
+
+ZIELFUNKTION, gemessen statt angenommen (§11.5): dieselbe Karte, dieselben
+zwei Klassen, nur die Lane-Lastform unterschiedlich, ergab E = 1,130 mit
+SM-saettigendem 2048er-Prefill und E = 1,440 mit decode-foermiger Lane.
+Regel: **KEINE SM-SAETTIGENDE LAST AUF EINE KARTE, DIE SCHON EINE LANE
+TRAEGT.**
+
+EINGANGSGROESSEN, beide schon vorhanden, beide dieselben, die #279 nutzen
+wird:
+* ETIKETT, ANALYTISCH (Nachtrag 12 (3), weil DCGM-Prof-Metriken auf GeForce
+  nicht verlaesslich sind): `intensity = 2·params·tokens / weight_bytes`
+  gegen `balance = gemm_tflops / membw` der Karte. Beide Operanden stehen in
+  `KeyCostModel` bzw. `RigRates`. Sanity: 5090 fp8 balance 341 FLOP/Byte;
+  ein Q3-Checkpoint (~0,44 Byte/Param) kippt bei ~75 Token — Verify (4)
+  bandbreitengebunden, 2048er-Prefill SM-saettigend. Die Schrittbreite IST
+  der Regler, nicht das Modell.
+* PAAR-MATRIX (#213) — ausschliesslich als TIE-BREAK zwischen gleich
+  bewerteten Belegungen, nie gegen die Lastform. `pair_bandwidth_from_probe`
+  ist die einzige Uebersetzung UUID → Karten-Index.
+
+WAS DER ENTSCHEIDER NICHT BEHAUPTET: fuer zwei SM-saettigende Lanes auf
+EINER Karte und fuer drei-und-mehr Lanes auf einer Karte gibt es keine
+Messung. Beide Faelle werden fuer die RANGFOLGE konservativ behandelt
+(nach oben durch den 1,130-Punkt begrenzt), liefern aber `expected_e =
+None` mit Grund — dieselbe measured/estimate/absent-Disziplin wie die
+Solver-Zellen. Die Machbarkeit bleibt beim Solver: `spread_plan(feasible=…)`
+konsultiert `coresident_budget_plan`/`coexistence`, statt eine zweite
+VRAM-Regel zu bauen, die widersprechen kann.
+
+### 12.3 A/B-Belegung an der dir1-Konstellation (Boot 1)
+
+Auf diesem Rig hat der Entscheider bei der KARTEN-Wahl kaum Freiheit — die
+volle Lane passt nur auf die 5090. Die Zielfunktion laesst sich trotzdem am
+Rig pruefen, denn sie ist eine Aussage ueber PAARUNGEN: gleiche Karten,
+gleiche Klassen, nur die Lastform der Lane wechselt. Genau das ist die
+dir1-Konstellation. Beide Arme in EINEM Boot, Boeden zuerst, je zweimal:
+
+| Arm | Verband share | Lane share | **E** | A-vs-A |
+|---|---|---|---|---|
+| decode-foermig (Wahl des Entscheiders) | 0,8011 / 0,8115 | 0,7278 / 0,6976 | **1,5289 / 1,5091** | 1,31 % |
+| 2048er-Prefill (die schlechte Paarung) | 0,2634 / 0,4613 | 0,9920 / 0,7273 | **1,2553 / 1,1886** | 5,6 % |
+
+    Mittel 1,519 gegen 1,222 = **+24,3 % Aggregat** fuer die gewaehlte
+    Paarung, gegen A-vs-A-Boeden von 1,3 % und 5,6 %.
+
+Das reproduziert die Slice-C-Ordnung (1,440 gegen 1,130 = +27,4 %) auf einer
+ANDEREN Lane-Konfiguration (gefangener Verify, Budget 700, 128er-Jobs) —
+eine unabhaengige Bestaetigung der Zielfunktion, nicht dieselbe Messung
+zweimal. Und die geschuetzte Klasse zeigt dieselbe Geschichte von der
+anderen Seite: unter der decode-foermigen Lane haelt der Verband 0,80–0,81
+seines Bodens, unter der prefill-foermigen faellt er auf 0,26–0,46. Der
+Preis der schlechten Paarung wird ueberwiegend vom Verband bezahlt.
+
+### 12.4 Summen-Invarianz der Prioritaetsklassen (CPU-Tor)
+
+Nachtrag 5 sagt, Prioritaet VERSCHIEBT Kapazitaet und erzeugt keine.
+Bisher stand dafuer EIN abgestuftes Beispiel gegen den flachen Fall.
+`TestPrioritySumInvariance` pinnt es jetzt ueber ALLE 27 Klassenbelegungen
+(`product((0,1,2), repeat=3)`) und an vier Stellen:
+
+* Summe der Budgets je Karte invariant (Toleranz = Raenge, wegen `int()`);
+* dasselbe ueber drei geteilte Karten;
+* dasselbe im HUNGER-Fall, in dem eine Klasse mit nichts erreicht wird;
+* `_award_leftover` konserviert den Rest EXAKT (dort gibt es keine
+  Trunkierung), fuer vier Restgroessen von 0 bis ueber den Bedarf;
+* nicht vakuum: die AUFTEILUNG bewegt sich nachweislich;
+* und die ehrliche Gegenprobe — die nutzbare KONTEXT-Zahl ist NICHT
+  invariant, weil `min(sum P, 64·min P)` nicht linear ist. Sie zeigt sich
+  erst auf einem UNGLEICHEN Rig; bei einem Rang je Lane fallen Minimum und
+  Summe zusammen und die Nichtlinearitaet hat keinen Angriffspunkt.
+
+### 12.5 S2 — Green Contexts, Verdikt
+
+`scripts/dual_group/green_ctx_probe.py`, reine ctypes-Treibersonde (kein
+torch, kein eigener Kernel; die gefangene Arbeit ist `cuMemsetD32Async`,
+deren Ergebnis geprueft wird — ein Graph, der „lief" ohne zu rechnen, kann
+nicht durchkommen). Treiber-CUDA 13.2 (`cuDriverGetVersion` 13020), alle
+Symbole vorhanden.
+
+| Frage | sm120 (5090) | sm86 (3080, beide) |
+|---|---|---|
+| Green Context erzeugbar | ja | ja |
+| SM-Granularitaet | **8 SM** (170 gesamt) | **2 SM** (68 gesamt) |
+| Beispiel-Leiter | 19×8 (Rest 18), 10×16, 3×48, 1×88 | 34×2, 17×4, 8×8, 4×16, 2×34 |
+| SM-Maske wirkt (eager) | 8 SM sind **4,51×** langsamer als 88 | 2 SM sind **12,5–13,1×** langsamer als 34 |
+| Graph aus Ctx A in Ctx-B-Stream startbar | ja, rechnet | ja, rechnet |
+| …laeuft er unter B's Maske? | **NEIN** | **NEIN** |
+| Graph nach `cuGreenCtxDestroy(A)` | `CUDA_ERROR_CONTEXT_IS_DESTROYED` | dito |
+
+Die entscheidende Zeile ist die vorletzte, und sie ist gemessen, nicht
+geschlossen: eager kostet die schmale Maske das 4,5- bis 13-fache, ein in
+der BREITEN Maske gefangener Graph aber laeuft auf dem schmalen Stream
+exakt gleich schnell wie auf dem breiten (5090: 1,281 ms gegen 1,281 ms;
+3080: 2,976 ms gegen 2,976 ms — auf drei Nachkommastellen identisch,
+waehrend die eager-Referenz 5,778 bzw. 37,3 ms braucht). Der Graph traegt
+die Ressourcen SEINES Aufnahme-Kontexts; der startende Stream ist Dekoration.
+
+VERDIKT: Green Contexts sind auf GeForce sm86 UND sm120 ein ECHTER
+SM-Zuteiler in EINEM Prozess — der einzige, den es hier gibt. Aber sie sind
+kein Laufzeit-Regler fuer gefangene Arbeit. Wer die SM-Aufteilung einer Lane
+aendern will, braucht einen im Ziel-Kontext GEFANGENEN Graphen. Damit ist
+Nachtrag 12 (4) bestaetigt statt bloss befuerchtet: der Aktionsraum ist die
+diskrete Capture-Leiter, ihr Preis ist Graph-Pools × Sprossen, und jeder
+Kontext muss leben, solange ein unter ihm gefangener Graph noch abgespielt
+werden koennte. Kontinuierlich bleiben nur die schwachen Zeitanteil-Hebel
+(Duty, Stream-Prioritaet).
+
+### 12.7 DER BEFUND, DER DAS FLAG AUF AUS STELLT
+
+Der eingeschaltete Online-Schaetzer KIPPT DEN SERVER im Prefill-Arm. Das ist
+kein Verdacht, sondern ein Kreuzversuch mit sechs Boots:
+
+| Boot | Stand | Fenster | Phasen | Prefill-Arm (P5/P6, je 2048er-Lane-Prefills) |
+|---|---|---|---|---|
+| 1 | Zweig | 1,0 s | 45 s | ueberlebt, aber P5 degradiert (Verband 10,57 statt 18,1 tok/s) |
+| 2 | Zweig | 4,0 s | 60 s | **TOT in P5** |
+| 3 | Zweig | 1,0 s | 60 s | **TOT in P5** |
+| 4 | **Basis 2d48ea0608** | — | 60 s | gruen: P5 18,10 / 2252,9 · P6 18,19 / 2231,1 |
+| 5 | Zweig, `--dual-group-lane-share-window-s 0` | aus | 60 s | gruen: P5 18,12 / 2255,0 · P6 18,06 / 2246,9 |
+| 6 | Zweig, verbilligter Schaetzer | 1,0 s | 60 s | **TOT in P5** |
+
+Boot 5 reproduziert die Basiszahlen auf drei Nachkommastellen — der Zweig
+OHNE den Schaetzer IST die Basis. Damit ist der Schaetzer die einzige
+verbleibende Variable.
+
+DIE ABSTURZSTELLE, immer dieselbe: `store_kvcache` im GDN-Prefill-Pfad des
+VERBANDS, `Assertion 'index >= 0 && index < size_limit' failed`, ausgeloest im
+gefangenen (breakable) Prefill-Graphen, nicht in der Lane. `max_total_num_
+tokens` ist auf Basis und Zweig identisch (71462), es ist also keine
+Dimensionierungsaenderung.
+
+WAS BEREITS AUSGESCHLOSSEN IST:
+* die ZAEHLER — `work_total`, `gen_tokens_total`, `prefill_tokens_total`
+  laufen in Boot 5 unveraendert mit, nur der Schaetzer ist aus;
+* die KOSTEN im Scheduler-Thread — Boot 6 fuhr mit vorserialisierter Historie
+  (`snapshot()` ist eine Slice statt einer Neuserialisierung) und einem
+  Ratenbegrenzer vor dem Sampler (ein float-Vergleich statt Sample-Bau je
+  Iteration) und starb genauso;
+* eine Dimensionierungs- oder Speicheraenderung (s.o.).
+
+WAS OFFEN BLEIBT, ehrlich: der Mechanismus. Drei benannte Kandidaten, keiner
+belegt — (a) die zusaetzliche Scheduler-Latenz legt einen LATENTEN Fehler im
+GDN-Prefill unter extremer Verhungerung frei (der Verband liegt in dieser
+Phase ohnehin bei 0,26–0,46 seines Bodens); (b) die Veroeffentlichung neuer
+Prometheus-LABEL-Kombinationen — die Prefill-Arm-Etiketten entstehen erst in
+P4/P5, also genau dort, wo es kippt — nimmt im Multiprocess-Modus Sperren und
+legt mmap-Dateien an; (c) das groessere `get_internal_state`-Payload
+veraendert die Zustellzeit der Statusabfragen, an denen die Messschleife
+haengt. Ein Kreuzversuch je Kandidat ist der erste Posten von D2.
+
+KONSEQUENZ, sofort umgesetzt: `--dual-group-lane-share-window-s` ist
+**DEFAULT 0, also AUS**. Der Schaetzer ist ein OPT-IN-Instrument, bis der
+Mechanismus verstanden ist. Alle S1-Zahlen oben stammen aus Laeufen mit
+eingeschaltetem Schaetzer im DECODE-Arm, wo er in allen vier Boots stabil
+lief — sie stehen unveraendert. Wer ihn einschaltet, sollte den Prefill-Arm
+meiden oder mit dem Reproduzierer rechnen.
+
+Nebenbei ein Instrumenten-Grundsatz, den dieser Befund teuer bezahlt hat: ein
+Messinstrument braucht einen AUS-Schalter, sonst laesst es sich als Ursache
+von nichts ausschliessen. Der Schalter existierte anfangs nicht und musste
+mitten in der Diagnose nachgeruestet werden — das kostete einen Boot.
+
+### 12.8 Offen fuer Runde 2
+
+0. **Der Mechanismus hinter §12.7** — der Schaetzer bleibt aus, bis er
+   gefunden ist. Kreuzversuche in der Reihenfolge (b), (c), (a): Prometheus-
+   Publikation abschalten und Sampler behalten; `snapshot()` aus
+   `get_internal_state` nehmen und Publikation behalten; beide aus und nur
+   `observe()` laufen lassen. Drei Boots, jeder eine Aenderung.
+1. **Die Regelschleife selbst.** S1 gruen heisst „das Signal traegt", nicht
+   „der Regler ist gebaut". Es fehlen: Sprossen-Definition (welche festen
+   Duty/Speed-Dial-Stufen), Hysterese gegen den gemessenen Boden plus
+   Umschaltkosten, und die `rung`-Verdrahtung von `_lane_rung()` (heute
+   konstant `"static"`).
+2. **Der Prefill-Arm des Schaetzers.** Prefill je CHUNK zaehlen statt je Job
+   (`_prefill`). Die Alternative „laengeres Fenster" ist in Boot 2 gemessen
+   und widerlegt (§12.1).
+3. **Dashboard-Bindung.** Der HTTP-Punkt `/api/key_solver/spread` ist da und
+   getestet; der Planner-TAB (Eingabemaske, Darstellung der Paar-Matrix,
+   Verknuepfung mit `solve_lanes`) ist NICHT gebaut und ist ein eigenes
+   Ticket des UI-Strangs.
+4. **#279-Andockpunkte.** Der Entscheider konsumiert bereits Etikett +
+   Paar-Matrix und liefert `assignment` je Lane. Was fehlt: das
+   GRUPPENWEITE Saettigungssignal aus Nachtrag 11 (2) — der Dispatcher
+   aggregiert Queue-Tiefen ueber Lanes, der Entscheider sieht heute nur
+   Lastformen.
+5. **Mehr als zwei Lanes auf einer Karte** ist unvermessen und wird als
+   solches gemeldet; die erste Messung dafuer waere zwei Lanes plus Verband
+   auf der 5090.

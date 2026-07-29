@@ -250,6 +250,17 @@ class SchedulerMetricsReporter:
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        # Same tokens, never reset.  ``num_generated_tokens`` is zeroed every
+        # logging interval and by ``reset_metrics``, so it cannot be
+        # differenced over a measurement window.  The online card-equivalent
+        # estimator (#274 slice D, S1) needs the serving group's work as a
+        # MONOTONE counter, exactly like the lane's ``work_total``.
+        self.gen_tokens_total = 0
+        # The serving group's PREFILL arm, monotone for the same reason. It is
+        # reported separately rather than folded in: a prefill-shaped and a
+        # decode-shaped step have different solo floors, so a window carrying
+        # both has no defined share and is dropped instead of averaged.
+        self.prefill_tokens_total = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
@@ -528,6 +539,7 @@ class SchedulerMetricsReporter:
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
+        self.gen_tokens_total += num_correct_drafts
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -677,6 +689,14 @@ class SchedulerMetricsReporter:
         a subclass may override it."""
         return ""
 
+    def log_lane_share(self, window) -> None:
+        """Multi-group runtime (#274 slice D): forward one closed estimator
+        window to the collector.  A no-op without metrics, so the caller does
+        not have to know whether they are on."""
+        if not self.enable_metrics or self.metrics_collector is None:
+            return
+        self.metrics_collector.log_lane_share(window)
+
     def reset_metrics(self):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -707,6 +727,9 @@ class SchedulerMetricsReporter:
             graphed=can_run_cuda_graph,
         )
         self.rank_prefill_log.flush()
+        # Before the logging-rank gate: the online estimator runs on the rank
+        # that carries the lanes, which is not necessarily the logging rank.
+        self.prefill_tokens_total += int(prefill_stats.log_input_tokens or 0)
 
         if (
             not self.is_stats_logging_rank

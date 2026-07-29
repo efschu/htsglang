@@ -55,6 +55,7 @@ from sglang.srt.planner.solver_api import (
     key_solver_aggregate_payload,
     key_solver_model_payload,
     key_solver_payload,
+    key_solver_spread_payload,
 )
 
 __all__ = [
@@ -88,6 +89,7 @@ __all__ = [
     "key_solver_payload",
     "key_solver_aggregate_payload",
     "key_solver_model_payload",
+    "key_solver_spread_payload",
     "split_probe_start_payload",
     "split_probe_status_payload",
     "scenario_suggest_payload",
@@ -5346,6 +5348,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/key_solver/aggregate"):
                 self._json(200, key_solver_aggregate_payload(payload))
+                return
+            # #274 slice D: WHICH CARDS each lane runs on, as opposed to what
+            # the key on a given card set should be. Same prefix rule.
+            if self.path.startswith("/api/key_solver/spread"):
+                self._json(200, key_solver_spread_payload(payload))
                 return
             if self.path.startswith("/api/key_solver"):
                 self._json(200, key_solver_payload(payload))

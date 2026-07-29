@@ -65,6 +65,7 @@ __all__ = [
     "key_solver_payload",
     "key_solver_aggregate_payload",
     "key_solver_model_payload",
+    "key_solver_spread_payload",
     "cached_card_probe",
 ]
 
@@ -416,3 +417,91 @@ def key_solver_model_payload(payload: Optional[dict] = None) -> dict:
             cost="one cold boot to READY plus a prefill and a decode window",
         ).to_json(),
     }
+
+
+def key_solver_spread_payload(payload: Optional[dict] = None) -> dict:
+    """``POST /api/key_solver/spread`` -- the spreading decider (#274 slice D).
+
+    WHICH CARDS each lane runs on, as opposed to what the key solver answers
+    (what the KEY on a given card set should be).  Pure read: it consults the
+    cached card probe for the pair matrix and computes nothing on a GPU.
+
+    Body::
+
+        {"cards": [0, 1, 2],                       # required
+         "max_lanes_per_card": int|null,
+         "lanes": [
+           {"key": str,                            # required
+            "label": "sm"|"bw"|"unknown",          # or give intensity+balance
+            "intensity_flop_per_byte": float,      # optional, labels the lane
+            "balance_flop_per_byte": float,        #   together with the above
+            "cards": [int],                        # pin it, or leave out
+            "card_count": int = 1,
+            "allowed_cards": [int],
+            "priority_class": int = 0},
+           ...]}
+
+    A lane may be labelled directly or by its two numbers; giving neither is
+    allowed and yields ``unknown``, which is ranked pessimistically and
+    reports no expected E rather than a guess.
+    """
+    from sglang.srt.planner import spread as _spread
+
+    p = dict(payload or {})
+    cards = [int(c) for c in (p.get("cards") or [])]
+    if not cards:
+        return {"ok": False, "reasons": ["no cards given"]}
+    rows = p.get("lanes") or []
+    if not rows:
+        return {"ok": False, "reasons": ["no lanes given"]}
+
+    loads: List[Any] = []
+    try:
+        for row in rows:
+            label = str(row.get("label") or "").strip()
+            intensity = row.get("intensity_flop_per_byte")
+            balance = row.get("balance_flop_per_byte")
+            if not label:
+                label = _spread.label_from_intensity(
+                    None if intensity is None else float(intensity),
+                    None if balance is None else float(balance),
+                )
+            loads.append(
+                _spread.LaneLoad(
+                    key=str(row["key"]),
+                    label=label,
+                    cards=tuple(int(c) for c in (row.get("cards") or [])),
+                    card_count=int(row.get("card_count") or 1),
+                    allowed_cards=tuple(
+                        int(c) for c in (row.get("allowed_cards") or [])
+                    ),
+                    intensity=None if intensity is None else float(intensity),
+                    balance=None if balance is None else float(balance),
+                    priority_class=int(row.get("priority_class") or 0),
+                )
+            )
+    except (KeyError, TypeError, ValueError) as e:
+        return {"ok": False, "reasons": [f"malformed lane list: {e}"]}
+
+    probe = cached_card_probe()
+    pairs = (
+        _spread.pair_bandwidth_from_probe(probe, cards) if probe is not None else None
+    )
+    mlpc = p.get("max_lanes_per_card")
+    answer = _spread.spread_plan(
+        loads,
+        cards,
+        max_lanes_per_card=None if mlpc is None else int(mlpc),
+        pair_bandwidth_gbs=pairs,
+    )
+    out: Dict[str, Any] = answer.to_json()
+    out["objective"] = _spread.describe_objective()
+    out["lanes"] = [ld.to_json() for ld in loads]
+    out["pair_matrix"] = "card probe" if pairs else "absent"
+    if probe is None:
+        out.setdefault("reasons", []).append(
+            "no card probe on disk: ties between equally-scored placements "
+            "were broken arbitrarily instead of by link bandwidth"
+        )
+        out["remeasure"] = _card_probe_remedy()
+    return out

@@ -339,6 +339,8 @@ class Scheduler(
         # Multi-group runtime (#274): in-process lanes over shared bytes.
         # Empty on every default path and on every non-shared rank.
         self.dual_group_lanes = []
+        self.lane_share_meter = None
+        self._lane_share_next_t = 0.0
         self._kv_arrival_ct = 0
         self.init_soft_watchdog(server_args)
 
@@ -608,6 +610,25 @@ class Scheduler(
             )
 
             self.dual_group_lanes = build_dual_group_lanes(self)
+
+            # Online card-equivalent estimator (#274 slice D, S1). Built only
+            # where lanes exist, so the default path never allocates it and
+            # never samples anything.
+            from sglang.srt.model_executor.lane_share import LaneShareMeter
+
+            share_window = float(
+                getattr(self.server_args, "dual_group_lane_share_window_s", 1.0)
+            )
+            # 0 turns the instrument off completely: no sampling, no snapshot
+            # in get_internal_state, no gauges. An instrument that cannot be
+            # switched off cannot be ruled out as the cause of anything.
+            if share_window > 0:
+                self.lane_share_meter = LaneShareMeter(
+                    window_s=share_window,
+                    ema_s=float(
+                        getattr(self.server_args, "dual_group_lane_share_ema_s", 1.0)
+                    ),
+                )
 
         # kv-session-offload (S1): FCFS host-spill of the youngest session
         # under KV pressure. Must init before the batch-result processor
@@ -4463,6 +4484,7 @@ class Scheduler(
         """
         if not self.dual_group_lanes:
             return
+        self._lane_share_sample()
         for lane in self.dual_group_lanes:
             if not lane.concurrent:
                 if lane.has_work:
@@ -4480,6 +4502,55 @@ class Scheduler(
                         lane.drop_active()
                 continue
             self._dual_group_admit(lane)
+
+    def _lane_share_sample(self) -> None:
+        """Feed one sample to the online card-equivalent estimator.
+
+        Called at the same grain boundary as the two-class scheduler, which
+        is the only place that sees BOTH classes' counters on one clock.
+
+        The rung id is the controller state a window was measured under.
+        Slice D1 builds no controller, so it is constant here -- the argument
+        exists because DESIGN_201 addendum 12 (4) requires the bookkeeping to
+        be in place BEFORE the first measurement, not retrofitted after one.
+        """
+        meter = self.lane_share_meter
+        if meter is None:
+            return
+        # One float compare on the overwhelming majority of iterations. The
+        # meter would return None anyway until its window is up, but BUILDING
+        # the samples for it would not be free, and this call sits directly in
+        # front of the serving group's batch launch -- everything spent here
+        # is spent by the serving group (DESIGN_121 §12.7).
+        now = time.perf_counter()
+        if now < self._lane_share_next_t:
+            return
+        self._lane_share_next_t = now + meter.window_s * 0.25
+        from sglang.srt.model_executor.lane_share import ClassSample
+
+        samples = [
+            ClassSample(
+                "serving",
+                {
+                    "decode_tokens": self.metrics_reporter.gen_tokens_total,
+                    "prefill_tokens": self.metrics_reporter.prefill_tokens_total,
+                },
+            )
+        ]
+        for lane in self.dual_group_lanes:
+            samples.append(ClassSample(f"lane{lane.lane_id}", dict(lane.work_total)))
+        try:
+            win = meter.observe(now, samples, rung=self._lane_rung())
+        except Exception:
+            logger.exception("lane share meter failed; disabling it for this boot.")
+            self.lane_share_meter = None
+            return
+        if win is not None:
+            self.metrics_reporter.log_lane_share(win)
+
+    def _lane_rung(self) -> str:
+        """Identity of the controller state the current window runs under."""
+        return "static"
 
     def _dual_group_admit(self, lane) -> None:
         """One grain-boundary admission decision for a concurrent lane."""
@@ -4531,6 +4602,19 @@ class Scheduler(
         # the lanes; other ranks report an empty list).
         if self.dual_group_lanes:
             ret["dual_group_lanes"] = [lane.stats() for lane in self.dual_group_lanes]
+        if self.lane_share_meter is not None:
+            ret["lane_share"] = self.lane_share_meter.snapshot()
+            # The estimator's own inputs, so an external instrument can
+            # difference the SAME counters over its own window and the two
+            # can only differ in the windowing -- which is the thing under
+            # test, and would be unfalsifiable if each side counted its own way.
+            ret["lane_share_counters"] = {
+                "serving": {
+                    "decode_tokens": self.metrics_reporter.gen_tokens_total,
+                    "prefill_tokens": self.metrics_reporter.prefill_tokens_total,
+                },
+                "t": time.perf_counter(),
+            }
 
         # This field is not serializable.
         ret.pop("model_config", None)

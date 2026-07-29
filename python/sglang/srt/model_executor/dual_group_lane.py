@@ -1278,6 +1278,15 @@ class DualGroupLane:
         self.results_total = 0
         self.prefill_tokens_total = 0
         self.decode_steps_total = 0
+        # Fine-grained monotone work counters for the online card-equivalent
+        # estimator (#274 slice D, S1).  The three counters above are bumped
+        # at JOB FINISH, which is the wrong grain for a 1-second window: a
+        # 32-token decode job takes over a second, so a window sees either 0
+        # or a whole job.  These are bumped the moment the work COMPLETES,
+        # and they are kept separate per ARM because a prefill-shaped and a
+        # decode-shaped step have different solo floors and may not be
+        # averaged into one rate.
+        self.work_total = {"prefill_tokens": 0, "decode_tokens": 0}
 
     # -- job interface (rank-local; called from the scheduler loop) -------
 
@@ -1344,6 +1353,9 @@ class DualGroupLane:
             "results_total": self.results_total,
             "prefill_tokens_total": self.prefill_tokens_total,
             "decode_steps_total": self.decode_steps_total,
+            # Per-arm work completed, bumped at completion rather than at job
+            # finish -- the numerator of share_lane (see lane_share.py).
+            "work_total": dict(self.work_total),
             "results": self.results[-8:],
             "weight_added_mib": getattr(
                 self.runner, "dual_group_lane_weight_added_mib", None
@@ -3027,6 +3039,7 @@ class DualGroupLane:
         # shows up in DEVICE time is SM competition; one that shows up only
         # in the wall/device GAP is submission granularity.
         job["prefill_wall_ms"] = self._last_wall_ms
+        self.work_total["prefill_tokens"] += len(job["input_ids"])
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_batch"] = batch
         job["_next"] = next_token_ids
@@ -3056,6 +3069,10 @@ class DualGroupLane:
         job.setdefault("_propose_ms", []).append(round_ms - ms)
         job["output_ids"].extend(emitted)
         job.setdefault("_accept", []).append(n_accept + 1)
+        # A speculative round emits accept+1 tokens, so the ARM is the same
+        # decode arm -- what changes is how much work one round completes,
+        # which is exactly what the rate is meant to capture.
+        self.work_total["decode_tokens"] += len(emitted)
 
     def _decode_step(self, job):
         batch = job["_batch"]
@@ -3065,6 +3082,7 @@ class DualGroupLane:
         job["decode_ms"].append(ms)
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_next"] = next_token_ids
+        self.work_total["decode_tokens"] += 1
 
     def drop_active(self) -> None:
         """Abandon the active job AND give its pool slots back.
