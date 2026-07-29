@@ -1916,3 +1916,47 @@ Fit zaehlt nur noch max(aktiver Kopf) statt Summe — schliesst exakt die
 inaktiven Kopfs startet am Turn frisch (kein Posten). Waehlbar analog 13f
 (resident|ram|auto, Messpflicht fuer den Default). Einbau: nach der
 R7c-Boot-Queue, zusammen mit 13f in einem Offload-Slice.
+
+Nachtrag-13-Ergaenzung 7 (Nutzer 2026-07-29, generalisiertes Kurzzeit-
+Offload-Inventar): Nicht nur der Drafter — ALLES, was waehrend der Dual-Lane
+kurzfristig entbehrlich ist, ist RAM-parkbar, und zwar GRANULAR einstellbar
+je nachdem, in welche Dimension man optimieren will. Die Ergaenzungen 4 und 6
+sind damit zwei Eintraege eines gemeinsamen OFFLOAD-REGISTERS, nicht zwei
+Einzelfeatures. Inventar der Posten-Klassen (je Klasse eigener Regler
+resident | ram | auto):
+  a. GRAPH-SPROSSEN: kalte Capture-Sprossen der K-/Algo-Leiter (Ergaenzung 4;
+     ~15 MiB/Sprosse plus Pool-Anteile).
+  b. DRAFTER-KOEPFE: der inaktive Algo-Kopf (Ergaenzung 6; Q8_0-DFLASH
+     1,75-1,85 GB — der groesste Einzelposten, schliesst die 525-MiB-Luecke).
+  c. LANE-WORKSPACES: (lane,name)-gekeyte flashinfer-/Dequant-Workspaces
+     einer Lane, die laenger als das Hysterese-Fenster idle ist (D3 hat sie
+     pro Lane getrennt: +412 MiB auf der 5090 — genau dieser Posten wird
+     rueckholbar statt dauerhaft bezahlt). Gleiches gilt fuer die
+     lane-gekeyten Input-Buffer-Pools (D2).
+  d. GANZE KALTE LANE: eine Lane ohne anstehende Arbeit als Ganzes parken
+     (Suspend-Pfad memory-saver/#89) — die Byte-geteilten Gewichte bleiben
+     natuerlich resident (gehoeren dem Verband), geparkt wird nur, was der
+     Lane allein gehoert (Graphen, Workspaces, Draft-KV-Reste).
+INVARIANTEN (fuer alle Klassen gleich): VA-Stabilitaet via VMM-Remap
+(#93-Maschinerie), damit captured Graphen jedes Parken/Zurueckwaven ohne
+Re-Capture ueberleben; offloadbar ist NUR, was die Politik laenger als das
+Hysterese-Fenster nicht angefasst hat (heisse Sprosse, aktiver Kopf,
+aktive-Lane-Workspaces IMMER resident); Wave-in versteckt sich hinter
+bekannten Grenzen (Turn-Grenze, Erst-Chunk-Prefill); Prioritaetsklassen
+(Nachtrag 5) gehen vor — die geschuetzte Klasse wird nie geparkt, um einer
+anderen Platz zu machen.
+DIMENSIONS-PRESETS statt Einzelknopf-Zwang: die vier Regler sind einzeln
+setzbar (volle Granularitaet), aber es gibt benannte Presets fuer die
+Optimierungsrichtung: --lane-offload-profile = latency (alles resident,
+Flips us-schnell, kostet KV) | capacity (aggressiv parken, maximaler
+KV/max-Token-Gewinn) | balanced/auto (Sensor = dasselbe gruppenweite
+Saettigungs-/Belegungssignal wie 13e/#279; parkt nach gemessener
+Rueckhol-Latenz relativ zum Hysterese-Fenster). MESSPFLICHT vor jedem
+auto-Default je Klasse: Rueckhol-Latenz + VRAM-Gewinn beziffern (Klausel aus
+Ergaenzung 4 gilt klassenweise — ist das Waven einer Klasse so billig, dass
+es nie stoert, wird ram ihr Default). Alles-greift-in-alles: kombinierbar
+mit K-Leiter, Turn-Routing, Draft-Quant-Wahl, Redundanz-Budget und dem
+#279-Dispatcher (der Dispatcher muss den Zustand "Posten geparkt" als
+Latenz-Term kennen, nicht als Nicht-Verfuegbarkeit). Einbau: derselbe
+Offload-Slice wie 13f+13h — das Register ist die Klammer, die beiden
+bestehenden Ergaenzungen werden Eintraege a und b.
