@@ -143,6 +143,31 @@ Nach jedem Schritt genau eine Zeile:
 Kein Zwischenkommentar, keine Vermutung, keine Prognose fuer den naechsten
 Schritt.
 
+### 6b. Ergebnis-Tabelle (NUR haiku-Schritte — Nutzer-Vorgabe 2026-07-29)
+
+Gilt ausschliesslich fuer die als haiku markierten Schritte (s00, s01, s06,
+s07, s08). Sonnet-Boot-Schritte melden weiterhin nur die eine Zeile aus 6.
+
+Nach jedem haiku-Schritt — und auch ZWISCHEN Runden/Teilmessungen eines
+Schritts, wenn dort bereits Ergebnis-Dateien im Artefakt-Verzeichnis
+liegen — gib zusaetzlich zur Verdikt-Zeile eine kompakte Markdown-Tabelle
+der Ergebnisse aus, damit der Nutzer live zusehen kann. Regeln:
+
+- NUR wenn Ergebnisse existieren (results-JSON/TSV im Schritt-Verzeichnis).
+  Keine Ergebnisse -> keine Tabelle, keine Platzhalter-Tabelle.
+- Inhalt: die numerischen Kennzahlen der Ergebnis-Dateien des Schritts,
+  eine Zeile je Messpunkt/Paar, Spalten = Feldnamen wie sie in der Datei
+  stehen (nichts umbenennen, nichts umrechnen). Bei Leitern die Groesse
+  als erste Spalte. Maximal ~20 Zeilen; mehr Punkte -> die ersten und
+  letzten Zeilen plus eine Zeile "... (N weitere, siehe <datei>)".
+- REINE DARSTELLUNG: keine Bewertung, keine Auffaelligkeits-Markierung,
+  keine Interpretation, kein Vergleich mit Erwartungen — das Urteil kommt
+  ausschliesslich vom Check-Skript.
+- Quelle sind die persistierten Dateien, NIEMALS Server-/Skript-Logs in
+  den Kontext ziehen, um Zahlen zu extrahieren.
+- Die Tabelle ersetzt nichts: Verdikt-Zeile (6), Checks und Abbruchregeln
+  gelten unveraendert.
+
 ## 7. Abschluss
 
 Wenn alle geplanten Schritte PASS oder SKIP sind:
