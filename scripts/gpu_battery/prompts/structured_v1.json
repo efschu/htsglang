@@ -1,0 +1,184 @@
+{
+  "name": "structured_v1",
+  "schema": 1,
+  "purpose": "Structured-output prompt set for the DFLASH-vs-NEXTN arm (s16). DFLASH is known to be weak on prose and to earn its acceptance on repetitive, format-constrained content; this set is that content axis, split into three classes that are never averaged together.",
+  "independence": "Every prompt is self-contained. No prompt refers to, continues or quotes the output of another prompt, and the harness never feeds a model output back in as a follow-up prompt. This is a hard rule from the #156 self-conditioning trap: a ladder measured on its own output measures the ladder, not the workload.",
+  "determinism": "Run at temperature 0. The prompts pin the output format hard (\"output only ...\", \"no explanation\") so that the per-point output validation checks format fidelity rather than politeness of the preamble.",
+  "language_mix": "German and English are mixed on purpose, in roughly the ratio of the real load on this rig. Language is recorded per prompt so a per-language split stays possible; it is NOT a reporting axis by default.",
+  "classes": {
+    "code_completion": "Small, concrete Python and Bash functions. Validated by parsing the extracted code.",
+    "json_schema": "A schema is given in the prompt, the answer must be strict JSON. Validated by json.loads plus a required-key check.",
+    "list_table": "Lists and markdown tables with a pinned row count. Validated by counting rows of the requested kind."
+  },
+  "prompts": [
+    {
+      "id": "code_py_01",
+      "class": "code_completion",
+      "lang": "en",
+      "max_new_tokens": 320,
+      "validator": {"kind": "python_syntax", "min_chars": 40},
+      "prompt": "Write a single Python function `chunk_list(items, size)` that splits a list into consecutive chunks of at most `size` elements and returns a list of lists. Raise ValueError if `size` is smaller than 1. Include type hints and a one-line docstring. Output only the function inside one ```python code block, no explanation."
+    },
+    {
+      "id": "code_py_02",
+      "class": "code_completion",
+      "lang": "de",
+      "max_new_tokens": 320,
+      "validator": {"kind": "python_syntax", "min_chars": 40},
+      "prompt": "Schreibe eine einzelne Python-Funktion `parse_mib(text: str) -> int`, die Zeichenketten wie \"2048MiB\", \"2 GiB\" oder \"512 KiB\" in eine ganzzahlige Anzahl MiB umrechnet und bei unbekannter Einheit ValueError wirft. Mit Typannotationen und einem einzeiligen Docstring. Gib nur die Funktion in einem ```python-Block aus, keine Erklaerung."
+    },
+    {
+      "id": "code_py_03",
+      "class": "code_completion",
+      "lang": "en",
+      "max_new_tokens": 384,
+      "validator": {"kind": "python_syntax", "min_chars": 60},
+      "prompt": "Write a Python class `RingBuffer` with `__init__(self, capacity: int)`, `push(self, value)` and `to_list(self)`. Pushing into a full buffer overwrites the oldest value; `to_list` returns the values in insertion order, oldest first. No imports. Output only the class inside one ```python code block, no explanation."
+    },
+    {
+      "id": "code_sh_01",
+      "class": "code_completion",
+      "lang": "en",
+      "max_new_tokens": 288,
+      "validator": {"kind": "bash_syntax", "min_chars": 40},
+      "prompt": "Write a POSIX-compatible bash function `wait_for_port` that takes a port and a timeout in seconds, polls with `ss -ltn` once per second, returns 0 as soon as the port listens and returns 1 when the timeout expires. Use `set -u` style discipline and quote every expansion. Output only the function inside one ```bash code block, no explanation."
+    },
+    {
+      "id": "code_sh_02",
+      "class": "code_completion",
+      "lang": "de",
+      "max_new_tokens": 288,
+      "validator": {"kind": "bash_syntax", "min_chars": 40},
+      "prompt": "Schreibe eine Bash-Funktion `freier_vram_mib`, die per `nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits` den freien Speicher jeder Karte liest und den kleinsten Wert auf stdout ausgibt. Fehlt nvidia-smi, soll die Funktion 2 zurueckgeben und nichts ausgeben. Gib nur die Funktion in einem ```bash-Block aus, keine Erklaerung."
+    },
+    {
+      "id": "code_sh_03",
+      "class": "code_completion",
+      "lang": "en",
+      "max_new_tokens": 288,
+      "validator": {"kind": "bash_syntax", "min_chars": 40},
+      "prompt": "Write a bash function `rotate_logs` that takes a directory and a count N, keeps the N newest `*.log` files in it and deletes the rest. It must handle filenames with spaces and must never delete anything outside the given directory. Output only the function inside one ```bash code block, no explanation."
+    },
+    {
+      "id": "json_01",
+      "class": "json_schema",
+      "lang": "en",
+      "max_new_tokens": 320,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "object",
+        "required_keys": ["gpu_index", "name", "vram_total_mib", "vram_free_mib", "ranks"]
+      },
+      "prompt": "Emit one JSON object that matches exactly this schema, with plausible values for an NVIDIA RTX 5090 hosting two tensor-parallel ranks:\n{\"gpu_index\": int, \"name\": string, \"vram_total_mib\": int, \"vram_free_mib\": int, \"ranks\": [int]}\nOutput strict JSON only. No markdown, no comments, no trailing text."
+    },
+    {
+      "id": "json_02",
+      "class": "json_schema",
+      "lang": "de",
+      "max_new_tokens": 320,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "object",
+        "required_keys": ["modell", "quantisierung", "tp_size", "kv_cache_dtype", "kontextlaenge"]
+      },
+      "prompt": "Gib genau ein JSON-Objekt aus, das diesem Schema entspricht, mit plausiblen Werten fuer einen Serverstart eines 27B-Modells in FP8 auf drei Karten:\n{\"modell\": string, \"quantisierung\": string, \"tp_size\": int, \"kv_cache_dtype\": string, \"kontextlaenge\": int}\nAusgabe ausschliesslich striktes JSON. Kein Markdown, keine Kommentare, kein Text davor oder danach."
+    },
+    {
+      "id": "json_03",
+      "class": "json_schema",
+      "lang": "en",
+      "max_new_tokens": 448,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "object",
+        "required_keys": ["run_id", "arm", "points"]
+      },
+      "prompt": "Emit one JSON object matching this schema, describing a benchmark run with exactly three measurement points:\n{\"run_id\": string, \"arm\": string, \"points\": [{\"batch_size\": int, \"tok_per_s\": number, \"ms_per_verify\": number, \"accept_len\": number}]}\nOutput strict JSON only. No markdown, no comments, no trailing text."
+    },
+    {
+      "id": "json_04",
+      "class": "json_schema",
+      "lang": "de",
+      "max_new_tokens": 448,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "object",
+        "required_keys": ["auftrag", "schritte"]
+      },
+      "prompt": "Gib genau ein JSON-Objekt aus, das diesem Schema entspricht und einen Wartungsauftrag mit vier Schritten beschreibt:\n{\"auftrag\": string, \"schritte\": [{\"nummer\": int, \"titel\": string, \"dauer_minuten\": int, \"werkzeug\": string}]}\nAusgabe ausschliesslich striktes JSON. Kein Markdown, keine Kommentare, kein Text davor oder danach."
+    },
+    {
+      "id": "json_05",
+      "class": "json_schema",
+      "lang": "en",
+      "max_new_tokens": 384,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "array",
+        "min_items": 4,
+        "item_required_keys": ["id", "severity", "component", "message"]
+      },
+      "prompt": "Emit a JSON array of exactly four log-event objects, each matching:\n{\"id\": int, \"severity\": string, \"component\": string, \"message\": string}\nSeverity is one of \"info\", \"warning\", \"error\". Output strict JSON only. No markdown, no comments, no trailing text."
+    },
+    {
+      "id": "json_06",
+      "class": "json_schema",
+      "lang": "en",
+      "max_new_tokens": 384,
+      "validator": {
+        "kind": "json_object",
+        "top_level": "object",
+        "required_keys": ["host", "cards", "interconnect"]
+      },
+      "prompt": "Emit one JSON object matching this schema for a workstation with three GPUs and no NVLink:\n{\"host\": string, \"cards\": [{\"index\": int, \"model\": string, \"vram_gib\": int}], \"interconnect\": {\"nvlink\": boolean, \"p2p\": boolean, \"topology\": string}}\nOutput strict JSON only. No markdown, no comments, no trailing text."
+    },
+    {
+      "id": "list_01",
+      "class": "list_table",
+      "lang": "en",
+      "max_new_tokens": 384,
+      "validator": {"kind": "rows", "row_kind": "table", "min_rows": 6},
+      "prompt": "Produce a markdown table with the header `| flag | unit | default | effect |` and exactly six data rows describing six common tensor-parallel server flags. Output only the table, no heading and no explanation."
+    },
+    {
+      "id": "list_02",
+      "class": "list_table",
+      "lang": "de",
+      "max_new_tokens": 384,
+      "validator": {"kind": "rows", "row_kind": "table", "min_rows": 5},
+      "prompt": "Erzeuge eine Markdown-Tabelle mit der Kopfzeile `| Karte | VRAM (GiB) | Speicherbandbreite (GB/s) | Rechenleistung (TFLOPS) |` und genau fuenf Datenzeilen zu fuenf verschiedenen NVIDIA-Consumer-Karten. Gib nur die Tabelle aus, keine Ueberschrift, keine Erklaerung."
+    },
+    {
+      "id": "list_03",
+      "class": "list_table",
+      "lang": "en",
+      "max_new_tokens": 320,
+      "validator": {"kind": "rows", "row_kind": "numbered", "min_rows": 8},
+      "prompt": "List exactly eight steps for bringing up a tensor-parallel inference server on a fresh machine, as a numbered list `1.` to `8.`, one short imperative sentence per step. Output only the list, no heading and no explanation."
+    },
+    {
+      "id": "list_04",
+      "class": "list_table",
+      "lang": "de",
+      "max_new_tokens": 320,
+      "validator": {"kind": "rows", "row_kind": "numbered", "min_rows": 8},
+      "prompt": "Nenne genau acht Schritte, um einen OOM-Absturz beim Modellstart einzugrenzen, als nummerierte Liste `1.` bis `8.`, je Schritt ein kurzer Imperativsatz. Gib nur die Liste aus, keine Ueberschrift, keine Erklaerung."
+    },
+    {
+      "id": "list_05",
+      "class": "list_table",
+      "lang": "en",
+      "max_new_tokens": 320,
+      "validator": {"kind": "rows", "row_kind": "bullet", "min_rows": 7},
+      "prompt": "Give exactly seven bullet points, each starting with `- `, naming one measurable symptom of a saturated PCIe link during multi-GPU inference. One line per bullet, no sub-bullets. Output only the bullets, no heading and no explanation."
+    },
+    {
+      "id": "list_06",
+      "class": "list_table",
+      "lang": "de",
+      "max_new_tokens": 384,
+      "validator": {"kind": "rows", "row_kind": "table", "min_rows": 6},
+      "prompt": "Erzeuge eine Markdown-Tabelle mit der Kopfzeile `| Groesse | Einheit | typischer Wert | Messquelle |` und genau sechs Datenzeilen zu Kenngroessen eines Dekodierschritts (zum Beispiel Schrittdauer, Akzeptanzlaenge, Durchsatz). Gib nur die Tabelle aus, keine Ueberschrift, keine Erklaerung."
+    }
+  ]
+}
