@@ -13658,3 +13658,206 @@ war nach dem dritten Boot aufgebraucht, und das Briefing gibt den Arm nur bei
 >= 10 min Restbudget frei. Er ist in `run_arm.sh` fertig hinterlegt
 (`bash run_arm.sh fair`) und kostet nach dieser Vorarbeit ~6 min Kartenzeit:
 85 s Boot plus 240 s Bench.
+
+## Fair-Arm k=3 (#707) (Kartenfenster 2026-07-30, 22:36-22:52 UTC)
+
+Der im vorangegangenen Fenster nicht mehr bezahlbare zweite Arm, nachgeholt.
+`bash run_arm.sh fair` aus `2026-07-30_vllm_fair/`, unveraendert: dasselbe
+#707-Checkpoint (AEON-Ultimate-Uncensored-FP8-MTP), dieselbe club-3090-eigene
+`bench.sh` (3 Warmups + 5 Laeufe je Klasse), derselbe Split
+(tp=3, `--rank-gpu-id 0,1,2`, `auto-performance`, Reserve 5200,4200,4200,
+KV 7,3,3, fp8-KV, 32k, chunked 2048, HTCCL/bar1, solo-Draft). Der einzige
+Unterschied zum Arm `voll` ist der weggelassene adaptive-k-Block; der Boot-Log
+belegt ihn als `speculative_adaptive=False`, `speculative_adaptive_config=None`
+bei `speculative_num_draft_tokens=4`, also festes k=3 — genau die Form, in der
+der vLLM-Lauf von #707 gefahren ist.
+
+Boot 69 s, Bench 186 s, Arm gesamt 255 s.
+
+### Die Zahlen
+
+| Klasse | Arm | decode_TPS | CV | TTFT | vs vLLM #707 |
+|---|---|---:|---:|---:|---:|
+| narrative | voll (k bis 5) | 84,26 ± 3,16 | 3,7 % | 151 ms | +22,8 % |
+| narrative | **fair (k=3)** | **83,69 ± 1,88** | 2,2 % | 154 ms | **+22,0 %** |
+| code | voll (k bis 5) | 111,04 ± 3,94 | 3,5 % | 160 ms | +24,9 % |
+| code | **fair (k=3)** | **108,25 ± 2,46** | 2,3 % | 154 ms | **+21,8 %** |
+
+Referenz vLLM auf demselben Rig mit demselben Checkpoint: narrative 68,6,
+code 88,9 decode_TPS.
+
+Akzeptanzlaenge des Fair-Arms aus `/metrics`: 2,0 nach narrative, 3,3 nach
+code, 3,525 nach den Samples — gedeckelt durch k=3, wie erwartet.
+
+Output-Validierung: beide Samples kohaerent (narrative unique-word-Ratio
+0,504, code 0,539; laengster identischer Zeilenlauf jeweils 1).
+
+### Was der Arm isoliert
+
+Der adaptive-k-Anteil an den +22 bis +25 % ist **klein bis nicht nachweisbar**.
+Auf narrative liegen die Arme 0,7 % auseinander, bei CV 2,2 % bzw. 3,7 % also
+klar innerhalb der Streuung beider Arme. Auf code sind es 2,5 %, ebenfalls
+innerhalb der zusammengenommenen Streuung, aber am Rand — vorzeichenrichtig
+zugunsten des Vollprogramms und zu klein, um aus n=5 als Effekt behauptet zu
+werden.
+
+Damit faellt praktisch der **gesamte** Abstand zum vLLM-Lauf auf Engine,
+Placement und Transport bei gleichem k: der Fair-Arm allein liegt +22,0 %
+(narrative) und +21,8 % (code) ueber #707. Die adaptive Leiter ist auf diesem
+Arbeitspunkt (bs=1, 27B-FP8, TP=3 gemischt) kein Traeger des Ergebnisses.
+
+Nebenbefund gegen die Vermutung des Vorgaengerfensters: der Fair-Arm bootet mit
+5200,4200,4200 ohne Nacharbeit und braucht die Zusatzreserve nicht, die die
+`high-accept`-Leiter erzwungen hat. Der dort gemessene Mehrbedarf gehoert also
+zur Leiter, nicht zum #707-Checkpoint.
+
+Rohdaten: `/spinning/gpu-battery-results/2026-07-30_fair311/fair_arm_raw/`
+(bench-Ausgaben, `/metrics`-Klammern, Samples, Boot-Skript, Boot-Beleg),
+Tabelle in `2026-07-30_vllm_fair/summary.json`.
+
+## #311 fp8-DFLASH solo bs=1 (Kartenfenster 2026-07-30, 22:41-22:52 UTC)
+
+**Die These ist falsifiziert, und zwar mit umgekehrtem Vorzeichen.** Erwartet
+war: der fp8-quantisierte Drafter halbiert das Draft-Gewicht, die Runde faellt
+von 44 auf ~38 ms, die Akzeptanz haelt, und DFLASH gewinnt bei bs=1 erstmals.
+Gemessen wurde: die Akzeptanz haelt weitgehend, aber die Runde wird **laenger**,
+nicht kuerzer.
+
+### Vorabpruefung (Code, ohne Karte): die Quantisierung trifft nur den Drafter
+
+`--speculative-draft-model-quantization` erreicht das Target nicht. Die
+Verzweigung liegt in `ModelConfig.from_server_args`
+(`python/sglang/srt/configs/model_config.py:566`):
+
+```python
+quantization = (
+    server_args.speculative_draft_model_quantization
+    if is_draft_model
+    else server_args.quantization
+)
+```
+
+und `is_draft_model` kommt aus `tp_worker._init_model_config`
+(`python/sglang/srt/managers/tp_worker.py:378`) als `self.is_draft_worker`
+durch. Der Draft-Worker wird mit `is_draft_worker=True` gebaut
+(`speculative/draft_worker_common.py:108`), der Target-Worker nicht; das Feld
+`speculative_draft_model_quantization` wird auf dem Target-Pfad nirgends
+gelesen. `server_args.py:6402` setzt es nur dann auf die Target-Quantisierung,
+wenn der Nutzer es *nicht* angegeben hat — ein explizites `fp8` ueberschreibt
+also nichts am Target. Der Boot-Beleg bestaetigt das zur Laufzeit:
+`quantization=None` (das FP8-Target baut aus seiner eigenen
+`quantization_config`) bei `speculative_draft_model_quantization='fp8'`.
+
+### Vehikel und Kontrolle
+
+Rezept ist das Solo-Paar-Fenster (#285) byte fuer byte: Target
+Qwen3.6-27B-FP8, Drafter `qwen3.6-27b-dflash` (bf16-Checkpoint), MLP-Vektor
+63,37,36, Reserve 3000,2700,2700, 16k Kontext, `max-running-requests` 8,
+`S16_MIN_MAX_NEW_TOKENS=768`, Fenster 32 s, bs=1, drei Klassen, beide Arme
+`--speculative-draft-placement solo`. Hinzu kommt auf dem DFLASH-Arm genau
+eine Flagge: `--speculative-draft-model-quantization fp8`.
+
+**Der KV-Pool ist gepinnt statt kalibriert.** Beide Arme dieses Fensters
+laufen auf `--max-total-tokens 163920`, dem Pool der NEXTN-Arme von #285.
+Der fp8-Drafter gibt Gewichtsspeicher frei und haette sonst einen groesseren
+Pool bekommen als der Arm, gegen den er gelesen wird — der s14-Fehler. Der Pin
+kann nur nach unten angleichen, kann den fp8-Arm also nicht schmeicheln, und
+spart den Kalibrierboot, der in einem 30-Minuten-Fenster nicht bezahlbar ist.
+Beide Boot-Belege zeigen `max_total_num_tokens=163920`.
+
+**Der A-vs-A-Boden wurde nicht neu erhoben, sondern seine Uebertragbarkeit
+geprueft.** Zwei zusaetzliche Boots haette das Fenster nicht getragen; statt
+dessen laeuft der NEXTN-solo-Arm hier ein zweites Mal als Stetigkeitsprobe
+gegen sein eigenes Ergebnis von vor einer Stunde:
+
+| Klasse | NEXTN-solo #285 | NEXTN-solo hier | Abweichung |
+|---|---:|---:|---:|
+| code_completion | 34,08 | 33,44 | −1,89 % |
+| json_schema | 33,09 | 32,86 | −0,71 % |
+| list_table | 34,23 | 34,11 | −0,35 % |
+
+Alle drei liegen innerhalb des in #285 gemessenen A-vs-A-Bodens von 2,24 %
+(ms/Verify). Das Instrument liest also gleich, und der Boden wie die
+DFLASH-bf16-Referenz jenes Fensters sind hier verwendbar. Waeren sie es nicht,
+waere der Kreuzvergleich hinfaellig gewesen und nichts weiter.
+
+### Die Zahlen (bs=1, Boden 2,24 % auf ms/Verify und tick tok/s)
+
+**ms/Verify** (kleiner ist besser)
+
+| Klasse | NEXTN solo | DFLASH bf16 | DFLASH fp8 | fp8 vs bf16 | fp8 vs NEXTN |
+|---|---:|---:|---:|---:|---:|
+| code_completion | 33,44 | 43,90 | 48,75 | **+11,05 %** | +45,79 % |
+| json_schema | 32,86 | 44,14 | 49,35 | **+11,79 %** | +50,17 % |
+| list_table | 34,11 | 43,99 | 45,75 | **+4,00 %** | +34,13 % |
+
+**tick tok/s** (groesser ist besser)
+
+| Klasse | NEXTN solo | DFLASH bf16 | DFLASH fp8 | fp8 vs bf16 | fp8 vs NEXTN |
+|---|---:|---:|---:|---:|---:|
+| code_completion | 119,62 | 91,12 | 82,05 | −9,95 % | −31,41 % |
+| json_schema | 121,73 | 90,62 | 81,06 | −10,54 % | −33,41 % |
+| list_table | 117,27 | 68,20 | 65,58 | −3,84 % | −44,08 % |
+
+**Akzeptanzlaenge** (`meta_info`, gepoolt — die entscheidende Kontrollgroesse)
+
+| Klasse | NEXTN solo | DFLASH bf16 | DFLASH fp8 | fp8 vs bf16 | fp8 vs NEXTN |
+|---|---:|---:|---:|---:|---:|
+| code_completion | 3,03 | 4,71 | 4,60 | −2,33 % | +51,63 % |
+| json_schema | 3,41 | 5,60 | 5,37 | −4,16 % | +57,37 % |
+| list_table | 3,28 | 4,42 | 4,62 | +4,53 % | +40,62 % |
+
+**Gueltiger Anteil**
+
+| Klasse | NEXTN solo | DFLASH bf16 | DFLASH fp8 |
+|---|---:|---:|---:|
+| code_completion | 0,75 | 0,71 | 0,71 |
+| json_schema | 0,83 | 1,00 | 0,80 |
+| list_table | 1,00 | 1,00 | 1,00 |
+
+`code_completion` zaehlt auf beiden DFLASH-Armen nicht (0,71 < 0,75, in beiden
+Fenstern identisch, `python_syntax`/`bash_syntax`) und steht nur zur
+Vollstaendigkeit in den Tabellen.
+
+### Verdikt
+
+**Der Akzeptanzvorteil von DFLASH ueberlebt die fp8-Quantisierung des
+Drafters.** Gegen NEXTN bleiben +40 bis +57 % Akzeptanzlaenge stehen, gegenueber
+dem bf16-Drafter bewegt sich die Akzeptanz zwischen −4,2 % und +4,5 %. Nur der
+json_schema-Verlust von 4,16 % liegt ausserhalb des #285-Bodens fuer diese
+Groesse (0,18 %) und ist damit ein echter, wenn auch kleiner Rueckgang.
+
+**Die Runde wird davon nicht schneller, sondern langsamer.** Statt der
+erwarteten 44 → ~38 ms misst der fp8-Arm 45,7 bis 49,3 ms, also 4,0 bis 11,8 %
+**ueber** dem bf16-Arm — jede der drei Klassen ausserhalb des 2,24-%-Bodens.
+Der halbierte Drafter kauft bei bs=1 nichts, weil dort kein
+Speicherbandbreiten-Engpass zu loesen ist: eine Sequenz, ein Draft-Block, der
+Drafter ist latenzgebunden. Die Dequantisierung pro Draft-Schritt kommt oben
+drauf. (Das ist die naheliegende Erklaerung der Richtung, nicht ein in diesem
+Fenster gemessener Befund — belegt ist die Richtung, nicht ihre Ursache.)
+
+**Das bs=1-Verdikt aus #285 bleibt damit unveraendert und wird eher haerter.**
+DFLASH-solo verliert gegen NEXTN-solo bei bs=1 auf allen drei
+Strukturklassen — mit bf16-Drafter um 28 bis 33 % (ms/Verify), mit
+fp8-Drafter um 34 bis 50 %. Die fp8-Variante ist damit fuer bs=1 kein
+Kandidat; ihr einziger belegter Gewinn ist Draft-Speicher, den dieser
+Arbeitspunkt nicht braucht.
+
+Empfehlung: Nachtrag ins Verworfenes-Register — *fp8-quantisierter
+DFLASH-Drafter zur Beschleunigung des bs=1-Arbeitspunkts*, falsifiziert am
+2026-07-30 in diesem Fenster, Vorzeichen umgekehrt zur These. Offen und
+ausdruecklich **nicht** verworfen bleibt fp8-Draft als reine
+Speichermassnahme sowie sein Verhalten bei groesserem bs, wo der
+Bandbreitenanteil ueberhaupt erst existiert; beides ist hier nicht gemessen.
+
+### Kartenzeit und Leistung
+
+Fenster 22:36:49-22:52 UTC, 15 min von 30 min Budget verbraucht, drei Boots
+(fair 69 s, dflash_fp8 107 s, nextn 105 s). Leistungsaufnahme ueber 180
+Abtastungen je Karte: GPU0 173,6 W Mittel / 285,7 W Spitze, GPU1 (5090)
+164,9 W / 329,9 W, GPU2 151,7 W / 261,9 W. Karten nach dem Fenster bei 0 MiB,
+lokale und Host-Locks freigegeben, gpu-arb auf FREI.
+
+Rohdaten: `/spinning/gpu-battery-results/2026-07-30_fair311/s16_dflash_fp8/`
+(Punkte, Belege, Samples, Boot-Skripte), Arm-Skripte
+`s16_solo_dflash_fp8.sh` und `s16_solo_nextn_control.sh` daneben.
