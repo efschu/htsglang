@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -41,7 +41,7 @@ def _jit_compress_norm_rope_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_module(
     head_dim: int,
     dtype_buffer: torch.dtype,
@@ -65,7 +65,7 @@ def _jit_compress_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_128_online_module(head_dim: int) -> Module:
     assert head_dim == 512
     args = make_cpp_args(head_dim, is_arch_support_pdl())
@@ -84,7 +84,7 @@ def _jit_compress_128_online_module(head_dim: int) -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_plan_module() -> Module:
     return load_jit(
         make_name(f"compress_plan"),

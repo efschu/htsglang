@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.jit_kernel.utils import (
+    cache_once_per_arch,
+    load_jit,
+    override_jit_cuda_arch,
+)
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -57,7 +61,7 @@ def _q8kv8_cuda_flags() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
     with override_jit_cuda_arch(9, 0, "a"):
         return load_jit(

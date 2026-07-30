@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -16,7 +16,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_rope_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
@@ -27,7 +27,7 @@ def _jit_fused_rope_module():
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_main_q_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -45,7 +45,7 @@ def _jit_main_q_norm_rope_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_main_k_norm_rope_flashmla_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -64,7 +64,7 @@ def _jit_main_k_norm_rope_flashmla_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -80,7 +80,7 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
 
 # V3.2 lays q out as [rope | nope] (V4 is [nope | rope]) -> kRopeFirst=true, and
 # drops the Hadamard rotation (kHadamard=false).
-@cache_once
+@cache_once_per_arch
 def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
     return load_jit(
@@ -93,7 +93,7 @@ def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(

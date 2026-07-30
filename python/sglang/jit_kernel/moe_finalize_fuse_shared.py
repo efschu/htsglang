@@ -4,10 +4,10 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_module():
     return load_jit(
         "moe_finalize_fuse_shared",

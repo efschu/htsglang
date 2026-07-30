@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     load_jit,
     make_cpp_args,
     override_jit_cuda_arch,
@@ -41,7 +41,7 @@ def _mxfp8_arch_env():
     return override_jit_cuda_arch(major, minor, suffix="a")
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_es_sm100_mxfp8_blockscaled_group_quant(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     with _mxfp8_arch_env():
@@ -62,7 +62,7 @@ def _jit_es_sm100_mxfp8_blockscaled_group_quant(dtype: torch.dtype) -> Module:
         )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_es_sm100_mxfp8_blockscaled_moe_group_gemm(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     with _mxfp8_arch_env():

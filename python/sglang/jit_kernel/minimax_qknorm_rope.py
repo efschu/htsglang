@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, List, Sequence, Tuple
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 _MAX_GROUPS = 4
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_module(pos_dtype, head_dim, rope_dim) -> Module:
     args = make_cpp_args(pos_dtype, head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(

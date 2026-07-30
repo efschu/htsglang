@@ -4,14 +4,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_per_tensor_quant_fp8_module(is_static: bool, dtype: torch.dtype) -> Module:
     args = make_cpp_args(is_static, dtype)
     return load_jit(

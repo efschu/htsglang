@@ -6,14 +6,14 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.jit_kernel.dsv4.utils import make_name
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_online_c128_mtp_module(
     head_dim: int, seq_dtype: torch.dtype, req_dtype: torch.dtype
 ) -> Module:

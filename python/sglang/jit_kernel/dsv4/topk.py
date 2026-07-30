@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
@@ -15,7 +15,7 @@ from sglang.jit_kernel.utils import (
 from .utils import make_name
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_topk_v1_module(topk: int):
     args = make_cpp_args(is_arch_support_pdl())
     assert topk in (512, 1024), "Only support topk=512 or 1024"
@@ -28,7 +28,7 @@ def _jit_topk_v1_module(topk: int):
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_topk_v2_module():
     # v2 is universal: topk (<= 2048) is a runtime argument, not a compile-time
     # constant, so a single module serves every k.

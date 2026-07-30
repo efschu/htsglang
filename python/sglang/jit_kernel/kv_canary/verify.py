@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Final
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -351,7 +351,7 @@ def launch_canary_verify_kernel(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_canary_verify_module(check_verify_expected_token: bool) -> Module:
     args = make_cpp_args(check_verify_expected_token)
     return load_jit(

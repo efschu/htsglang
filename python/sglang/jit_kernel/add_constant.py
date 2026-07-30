@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_add_constant_module(constant: int) -> Module:
     args = make_cpp_args(constant)
     return load_jit(

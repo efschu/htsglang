@@ -3,7 +3,7 @@
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -12,7 +12,7 @@ from sglang.jit_kernel.utils import (
 _CUDA_FILE = "deepseek_v32/indexer_k.cuh"
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_k_indexer_norm_rope_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -25,7 +25,7 @@ def _jit_k_indexer_norm_rope_module(dtype: torch.dtype):
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_k_indexer_norm_rope_store_module(dtype: torch.dtype, page_size: int):
     args = make_cpp_args(dtype, is_arch_support_pdl(), page_size)
     return load_jit(

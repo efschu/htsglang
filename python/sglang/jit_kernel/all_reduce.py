@@ -8,7 +8,7 @@ import tvm_ffi
 from tvm_ffi import Module
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -95,7 +95,7 @@ if TYPE_CHECKING:
             ...
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
@@ -107,7 +107,7 @@ def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> M
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
@@ -119,7 +119,7 @@ def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> M
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_parallel_qknorm_module(
     dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
 ) -> Module:
@@ -137,7 +137,7 @@ def _jit_fused_parallel_qknorm_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
     module = load_jit(
         "custom_all_reduce_base",

@@ -33,14 +33,24 @@ def _load_native_hash_module() -> Any:
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
+            isa = "avx2"
+        else:
+            isa = "baseline"
+        # The instruction set belongs in the extension NAME, not only in the
+        # flags: torch keys its build directory on the name, and that directory
+        # is host-global. An -mavx2 build reached from a cache volume shared
+        # with a host without AVX2 is an illegal instruction, and the reverse is
+        # a silent slowdown -- the same class as the arch tag missing from the
+        # JIT kernel cache key in jit_kernel/utils.py.
+        libname = f"hicache_hash_cpp_{isa}"
         # This callsite is where an abandoned torch build lock was first seen
         # stalling a run for 18 minutes with the .so already built. The guard
         # tells baton_health which sources the artifact must be newer than, so
         # such a lock is recognised as orphaned on the first poll instead of
         # waited on forever.
-        with jit_build_guard("hicache_hash_cpp", sources=sources):
+        with jit_build_guard(libname, sources=sources):
             return load(
-                name="hicache_hash_cpp",
+                name=libname,
                 sources=sources,
                 extra_cflags=extra_cflags,
                 extra_ldflags=["-lcrypto"],

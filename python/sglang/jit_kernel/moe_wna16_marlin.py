@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 _MAX_THREAD_N = 256
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     return load_jit(

@@ -11,7 +11,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     _assert_contiguous,
     _build_real_kv_source_abi,
 )
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -250,7 +250,7 @@ def launch_canary_write_kernel(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_canary_write_module() -> Module:
     return load_jit(
         "kv_canary_write",

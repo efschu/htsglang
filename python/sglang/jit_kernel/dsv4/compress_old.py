@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_common_module() -> Module:
     return load_jit(
         make_name("common"),
@@ -27,7 +27,7 @@ def _jit_common_module() -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_128_online_plan_module() -> Module:
     """Host-side plan generator for online compress 128 (no template args)."""
     return load_jit(
@@ -39,7 +39,7 @@ def _jit_compress_128_online_plan_module() -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_128_online_module(head_dim: int) -> Module:
     """Online compress 128 kernel: ring_size=1, per-index (max, sum, kv) state."""
     args = make_cpp_args(head_dim, is_arch_support_pdl())
@@ -56,7 +56,7 @@ def _jit_compress_128_online_module(head_dim: int) -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -73,7 +73,7 @@ def _jit_norm_rope_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_compress_module(
     head_dim: int,
     dtype_in: torch.dtype,

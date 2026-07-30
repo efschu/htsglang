@@ -15,7 +15,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_metadata_copy_module(
     forward_mode: int, has_real_page_table: bool, has_flashmla: bool
 ):
@@ -58,7 +58,7 @@ def _jit_fused_metadata_copy_module(
         raise
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_metadata_copy_multi_module(
     has_real_page_table: bool, has_flashmla: bool
 ):

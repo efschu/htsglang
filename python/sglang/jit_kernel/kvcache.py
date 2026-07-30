@@ -7,6 +7,7 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_kvcache_module(row_bytes: int) -> Module:
     args = make_cpp_args(row_bytes, is_arch_support_pdl())
     return load_jit(

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -32,7 +32,7 @@ def is_supported_rmsnorm_hf_hidden_size(hidden_size: int) -> bool:
     return hidden_size >= _CTA_BLOCK_SIZE and hidden_size % _CTA_BLOCK_SIZE == 0
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_rmsnorm_hf_module(hidden_size: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
     kernel_cls = (

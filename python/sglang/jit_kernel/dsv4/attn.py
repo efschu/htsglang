@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
@@ -15,7 +15,7 @@ from sglang.jit_kernel.utils import (
 from .utils import make_name
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_metadata_module():
     return load_jit(
         make_name("metadata"),
@@ -24,7 +24,7 @@ def _jit_metadata_module():
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_store_module(
     name: Literal["flashmla", "indexer"],
     input_dtype: torch.dtype,

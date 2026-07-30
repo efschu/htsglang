@@ -7,7 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.jit_kernel.utils import (
+    cache_once,
+    cache_once_per_arch,
+    is_arch_support_pdl,
+    load_jit,
+)
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
@@ -21,7 +26,7 @@ _SCORING_FUNC_MAP = {
 }
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_moe_fused_gate_module() -> Module:
     return load_jit(
         "moe_fused_gate",
