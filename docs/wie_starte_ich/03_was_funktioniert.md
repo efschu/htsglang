@@ -18,8 +18,8 @@ Repo-Wurzel. Hier die Kurzfassung fuer den Standardlauf-Kontext.
 ## Validiert, aber NICHT Teil des Standardlaufs (nur auf Auftrag)
 
 - GGUF-Modelle (Q3/Q4/Q6/Q8) inkl. MoE, uneven TP=3 — eigene Rezepte im Runbook.
-- DFLASH als Solo-Draft auf der 5090 (eigener Pfad; Multiturn schwaecher als NEXTN).
-- Adaptive k / Algo-Switch NEXTN<->DFLASH (Spezialwerkzeug fuer Regime-Wechsel).
+- DFLASH (Upstream seit sglang PR #31840, 2026-07-27); unser Fork-Delta: GGUF lm_head für Drafters, Solo-Draft-KV-Pool, Platzierungsflag. Solo-Platzierung auf der 5090 via `--speculative-draft-placement solo` (eigener Pfad; Multiturn schwächer als NEXTN auf strukturiertem Output, siehe docs/dev/TASK_285_DFLASH_STRUCTURED.md).
+- Adaptive draft-Länge (Upstream seit sglang, basiert auf AdaptiveController); unser Fork-Delta: Erweiterung auf mehrere Achsen (Algorithmus NEXTN↔DFLASH, topk, Geometrie), Cross-Algo-Leiter #156.
 - Experten-Offload (MoE-Modelle), KV-Spill ins RAM, Suspend/Hibernate (#89).
 - PD-Disaggregation, Cross-Rig-PP (braucht PVE-Host, nicht Container).
 - Dual-Lane/Mehrfach-Gruppen (Forschungsstand — NICHT ohne Operator-Briefing).
