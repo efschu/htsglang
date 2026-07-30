@@ -177,6 +177,84 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+#: Marlin's fused-MoE thread tile. w13's n (= 2 * I) and w2's k (= I) both
+#: have to be multiples of it, which is a weaker requirement than the dense
+#: GEMM's min_thread_k = 128.
+MOE_MARLIN_TILE = 64
+
+
+def moe_uneven_tp_units(intermediate_size: int, quant_config) -> int:
+    """Unit count for the expert intermediate dimension under an uneven shard
+    plan (`--rank-tp-ratio`).
+
+    The units are the indivisible packets the plan distributes, so they have
+    to be as fine as the weight format allows while still landing every cut
+    on a boundary the kernels accept. Returns the element-granular count when
+    no quantization constrains the dimension; that is also the value the even
+    split and the no-plan path effectively use, since units are only consulted
+    under an installed plan.
+    """
+    block = getattr(quant_config, "weight_block_size", None) if quant_config else None
+    group = getattr(quant_config, "group_size", None) if quant_config else None
+
+    if block and group and int(group) > 0:
+        from sglang.srt.layers.quantization.marlin_utils import (
+            GPTQ_MARLIN_MIN_THREAD_K,
+        )
+
+        if block[0] == math.lcm(int(group), GPTQ_MARLIN_MIN_THREAD_K):
+            # A group-quantized config (AWQ / AutoRound) carries no real weight
+            # block: its weight_block_size is the group size folded with the
+            # DENSE Marlin K tile, and that is coarser than this path needs.
+            # Expert ffn sizes are small (A3B 512), so the dense block would
+            # leave 4 units for 3+ ranks and distort the ratio. Use the group
+            # branch below, which derives the finest grain the experts allow.
+            block = None
+
+    if block and intermediate_size % block[0] == 0:
+        # Block-quantized experts (FP8 with weight_block_size, GGUF): one unit
+        # count divides both the weight grid and the scale grid.
+        return intermediate_size // block[0]
+
+    if group and int(group) > 0:
+        # Group-quantized MoE (AWQ/GPTQ wna16, e.g. A3B AWQ group=32): shard
+        # cuts must land on group boundaries, exactly like the block case —
+        # element-granular units would hand ranks non-group-aligned
+        # intermediate shards, which MoeWNA16Method.create_weights rejects
+        # (group_size >= 32 assert after halving). When the CONFIG group size
+        # does not divide the intermediate size (e.g. Gemma-4-26B-A4B: 704
+        # with AWQ group 128), mirror MoeWNA16Method.create_weights' halving
+        # (128 -> 64 -> 32) so the unit granularity matches the effective
+        # runtime group size.
+        g = int(group)
+        while g >= 32 and intermediate_size % g:
+            g //= 2
+        if g >= 32:
+            return intermediate_size // g
+        return intermediate_size
+
+    ct_map = getattr(quant_config, "target_scheme_map", None)
+    if ct_map:
+        # compressed-tensors group-quantized experts (e.g. Gemma-4-26B-A4B
+        # pack-quantized INT4 group 32): shard cuts must land on
+        # lcm(group sizes, MOE_MARLIN_TILE) boundaries. The dense-path
+        # 128-K-tile coarsening of _group_size_block would be too coarse here
+        # (704 % 128 != 0). No group-quantized scheme -> units stay
+        # element-granular (fp8/channel schemes have their own paths).
+        group_sizes = set()
+        for scheme in ct_map.values():
+            weights = scheme.get("weights") if isinstance(scheme, dict) else None
+            g = getattr(weights, "group_size", None)
+            if g and int(g) > 0:
+                group_sizes.add(int(g))
+        if group_sizes:
+            g = math.lcm(*group_sizes, MOE_MARLIN_TILE)
+            if intermediate_size % g == 0:
+                return intermediate_size // g
+
+    return intermediate_size
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -261,10 +339,9 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
         # Uneven TP (--rank-tp-ratio): partition the expert intermediate
-        # size by the shard plan in quant-block units (128er FP8 blocks),
-        # so every rank's share stays block-aligned. One unit count
-        # divides both the weight grid and the scale grid. Without a
-        # plan this is the classic even split.
+        # size by the shard plan in whole quant units (see
+        # moe_uneven_tp_units), so every rank's share stays aligned for the
+        # weight format in use. Without a plan this is the classic even split.
         #
         # The expert weights form the "moe" family
         # (--rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR): together with
@@ -272,48 +349,7 @@ class FusedMoE(torch.nn.Module):
         # of the KV-pool self-calibration. Without an installed moe
         # vector the family falls back to the base plan (bit-identical
         # to before).
-        _moe_units = intermediate_size
-        _block = getattr(quant_config, "weight_block_size", None) if quant_config else None
-        _group = getattr(quant_config, "group_size", None) if quant_config else None
-        if _block and intermediate_size % _block[0] == 0:
-            _moe_units = intermediate_size // _block[0]
-        elif _group and _group > 0:
-            # Group-quantized MoE (AWQ/GPTQ wna16, e.g. A3B AWQ group=32):
-            # shard cuts must land on group boundaries, exactly like the
-            # FP8 block case above — element-granular units would hand
-            # ranks non-group-aligned intermediate shards, which
-            # MoeWNA16Method.create_weights rejects (group_size >= 32
-            # assert after halving). When the CONFIG group size does not
-            # divide the intermediate size (e.g. Gemma-4-26B-A4B: 704 with
-            # AWQ group 128), mirror MoeWNA16Method.create_weights' halving
-            # (128 -> 64 -> 32) so the unit granularity matches the
-            # effective runtime group size. Even split and no-plan paths
-            # are untouched (units are only consulted under a shard plan).
-            _g = _group
-            while _g >= 32 and intermediate_size % _g:
-                _g //= 2
-            if _g >= 32:
-                _moe_units = intermediate_size // _g
-        elif (_ct_map := getattr(quant_config, "target_scheme_map", None)):
-            # compressed-tensors group-quantized experts (e.g.
-            # Gemma-4-26B-A4B pack-quantized INT4 group 32): shard cuts
-            # must land on lcm(group sizes, 64) boundaries — 64 is the
-            # Marlin fused-MoE tile requirement (w13 n = 2*I and w2 k = I
-            # both need I % 64 == 0; the dense-path 128-K-tile coarsening
-            # of _group_size_block would be too coarse here, e.g.
-            # 704 % 128 != 0). No group-quantized scheme -> units stay
-            # element-granular (fp8/channel schemes have their own paths).
-            _gs = set()
-            for _scheme in _ct_map.values():
-                _w = _scheme.get("weights") if isinstance(_scheme, dict) else None
-                _g = getattr(_w, "group_size", None)
-                if _g and int(_g) > 0:
-                    _gs.add(int(_g))
-            if _gs:
-                _g = math.lcm(*_gs, 64)
-                if intermediate_size % _g == 0:
-                    _moe_units = intermediate_size // _g
-        self.moe_tp_units = _moe_units
+        self.moe_tp_units = moe_uneven_tp_units(intermediate_size, quant_config)
         self.moe_tp_family = "moe"
         # GGUF MoE under an uneven plan: shard along the EXPERT dim instead
         # of the intermediate dim. The intermediate dim of w2 is the ggml
@@ -367,7 +403,7 @@ class FusedMoE(torch.nn.Module):
                 intermediate_size,
                 self.moe_tp_size,
                 self.moe_tp_rank,
-                _moe_units,
+                self.moe_tp_units,
                 self.moe_tp_family,
             )
         else:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -16,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
+    GPTQ_MARLIN_MIN_THREAD_K,
     check_marlin_supported,
     check_marlin_supports_layer,
     check_moe_marlin_supports_layer,
@@ -57,6 +59,41 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 
+def awq_uneven_tp_block(group_size: int) -> List[int]:
+    """Uneven-TP shard block for an AWQ config (`--rank-tp-ratio`).
+
+    AWQ groups `group_size` input channels under one scale and executes
+    through the Marlin (wNa16) GEMM, so a per-rank shard boundary is only
+    valid where BOTH constraints hold: a whole group ends, and the shard is
+    a multiple of Marlin's thread tile. Coarsening to
+    ``lcm(group_size, GPTQ_MARLIN_MIN_THREAD_K)`` satisfies both at once —
+    min_thread_k=128 dominates min_thread_n=64, so the same value keeps the
+    column-parallel OUTPUT dim tile-valid too.
+
+    Exposing it as ``weight_block_size`` is what makes the existing uneven-TP
+    machinery (`_quant_block_aligned_units` / `tp_partition_size`) fire; an
+    AWQ config that stays silent gets an element-granular split and produces
+    shards Marlin rejects, e.g. Qwen3.6-27B intermediate 17408 over the
+    weights [29607, 17780, 17780] -> gate_up output_size_per_partition 9504,
+    which is not divisible by min_thread_n = 64.
+
+    Both dims carry the same value so a column-parallel OUTPUT split
+    (gate_up) lands on the same boundary as its coupled row-parallel INPUT
+    split (down) — they partition the same intermediate dimension and must
+    coarsen identically. Mirrors ``AutoRoundConfig`` and
+    ``CompressedTensorsConfig._group_size_block``.
+
+    Inert without an installed ratio plan: the even-TP path never consults
+    the unit family.
+    """
+    block = (
+        math.lcm(int(group_size), GPTQ_MARLIN_MIN_THREAD_K)
+        if group_size and int(group_size) > 0
+        else GPTQ_MARLIN_MIN_THREAD_K
+    )
+    return [block, block]
+
+
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
     """Fused-aware skip check for AWQ `modules_to_not_convert`.
 
@@ -95,6 +132,8 @@ class AWQConfig(QuantizationConfig):
         self.group_size = group_size
         self.zero_point = zero_point
         self.modules_to_not_convert = modules_to_not_convert or []
+        # Uneven-TP group + Marlin-tile alignment; see awq_uneven_tp_block.
+        self.weight_block_size = awq_uneven_tp_block(group_size)
 
         if self.weight_bits != 4:
             raise ValueError(
@@ -255,6 +294,8 @@ class AWQMarlinConfig(QuantizationConfig):
         self.weight_bits = weight_bits
         self.modules_to_not_convert = modules_to_not_convert or []
         self.full_config = full_config
+        # Uneven-TP group + Marlin-tile alignment; see awq_uneven_tp_block.
+        self.weight_block_size = awq_uneven_tp_block(group_size)
 
         if self.weight_bits not in self.TYPE_MAP:
             raise ValueError(
