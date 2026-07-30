@@ -170,13 +170,13 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
             continue
         fi
 
-        # ERREICHT= per group BEFORE any number, same rule as s13: an arm whose
+        # ACHIEVED= per group BEFORE any number, same rule as s13: an arm whose
         # second communicator group quietly fell back is a mixed point, and a
         # decode graph that silently did not get captured would otherwise be
         # reported as a graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "CUDA graph begin" \
             "CUDA graph end" \

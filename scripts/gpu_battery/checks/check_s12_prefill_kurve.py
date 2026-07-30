@@ -9,7 +9,7 @@ Verified:
     and two afternoons; blockwise measurement is the one methodological error
     that cannot be repaired afterwards,
   * each point's boot ran the arm it claims. For bar1: every communicator group
-    reports ERREICHT=bar1 -- the requested name says bar1 even when the group
+    reports ACHIEVED=bar1 -- the requested name says bar1 even when the group
     fell back to gloo, and one mixed group makes the point a mixed point. For
     the baseline: NO HTCCL group at all,
   * a decode point at bs=1 and one at bs=16 per arm,
@@ -168,7 +168,7 @@ def check(step_dir: str) -> None:
                 raise CheckFail(
                     f"bar1 boot at {entry.get('sessions')} sessions: group "
                     f"{foreign[0].get('gruppe')!r} runs "
-                    f"ERREICHT={foreign[0].get('erreicht')!r} -- gemischter Punkt, "
+                    f"ACHIEVED={foreign[0].get('erreicht')!r} -- gemischter Punkt, "
                     "not a bar1 point"
                 )
 

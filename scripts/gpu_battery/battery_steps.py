@@ -210,7 +210,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s11_bar1_e2e",
-        title="Standard run over the BAR1 direct path: both groups ERREICHT=bar1, smoke, locks",
+        title="Standard run over the BAR1 direct path: both groups ACHIEVED=bar1, smoke, locks",
         model="sonnet",
         script="s11_bar1_e2e.sh",
         check="check_s11_bar1_e2e.py",

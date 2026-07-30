@@ -173,7 +173,7 @@ host_grep_into "$HOSTLOG" "$DIR/htccl_lines.txt" \
     "HTCCL-BAR1: Aufbau in" \
     "BAR1-Kasse dieser Karte nach Gruppe" \
     "HTCCL enabled for group" \
-    "ERREICHT=" \
+    "ACHIEVED=" \
     "waehrend einer CUDA-Graph-Aufzeichnung" \
     "CUDA out of memory" \
     "torch.OutOfMemoryError" \

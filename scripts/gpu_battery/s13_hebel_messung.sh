@@ -241,14 +241,14 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
             continue
         fi
 
-        # ERREICHT= per group BEFORE any number: an arm whose second
+        # ACHIEVED= per group BEFORE any number: an arm whose second
         # communicator group quietly fell back is a mixed point, not a point.
         # The prefill-graph lines go into the same file -- an arm that asks for
         # the prefill graph and silently does not get it would otherwise be
         # reported as a prefill-graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "HTCCL-BAR1-PIPE:" \
             "Disable prefill CUDA graph" \

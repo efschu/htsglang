@@ -117,7 +117,7 @@ def report_state(gruppe: str, requested: str, achieved: str,
         # data contract: python/sglang/srt/distributed/parallel_state.py
         # (outside this translation task's scope) reads them back via
         # ``stand.get("erreicht", ...)`` to build its own
-        # "angefordert=%s, ERREICHT=%s" log line, and several
+        # "requested=%s, ACHIEVED=%s" log line, and several
         # scripts/gpu_battery/checks/*.py + test_gpu_battery_checks_bar1.py
         # consumers key off these exact strings too. Renaming them here
         # without also touching every one of those out-of-scope files would

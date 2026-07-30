@@ -386,7 +386,7 @@ whether it boots.
 * **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `GRAPH_FREIGABE=1`
   without that proof yields numbers from an operating point nobody can defend.
 * **Success** `check_s11_bar1_e2e.py`: all gate cases of the gate passed;
-  `ERREICHT=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
+  `ACHIEVED=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
   (`tp:0`, `dcp:0`), and one of them on gloo makes the run a mixed one (which
   happened exactly once and cost a whole measurement); per group one
   `HTCCL-BAR1: Aufbau in` line; smoke answer coherent (the numbers 1..20 in
@@ -433,7 +433,7 @@ it.
 * **Success** `check_s12_prefill_kurve.py`: one number in **both** arms per
   planned session count; the arms really did alternate (otherwise FAIL
   "blockwise"); **the transport proof per point** — bar1 points with all groups
-  on `ERREICHT=bar1`, baseline points without a single HTCCL group; one decode
+  on `ACHIEVED=bar1`, baseline points without a single HTCCL group; one decode
   point per arm at bs=1 and bs=16; one persisted output sample per arm (a fast
   garbage run looks good in a throughput table); and the **baseline
   reproduces** the known numbers within `±5%`.

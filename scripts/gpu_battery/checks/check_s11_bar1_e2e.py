@@ -21,7 +21,7 @@ reporting:
      else down with it, and reporting one of those instead means reporting the
      consequence while the cause is two fields away. That is exactly how a run
      whose capture aborted got reported as "no ERREICHT line in the log",
-  6. per-group attainment. EVERY communicator group must report ERREICHT=bar1.
+  6. per-group attainment. EVERY communicator group must report ACHIEVED=bar1.
      The requested transport name says bar1 either way; it is not evidence. One
      group on bar1 and one on gloo is a MIXED run: correct-looking, and its
      numbers may not be reported as bar1 numbers,
@@ -142,7 +142,7 @@ def check(step_dir: str) -> None:
     groups = payload.get("gruppen") or []
     if not groups:
         raise CheckFail(
-            "not a single 'ERREICHT=' line in the log (sources: "
+            "not a single 'ACHIEVED=' line in the log (sources: "
             f"{payload['log_quellen']}, {payload.get('log_zeilen')} lines) -- "
             "without it the arm of the measurement is unsupported (the "
             "requested transport name reads bar1 even on a fallback)"
@@ -159,7 +159,7 @@ def check(step_dir: str) -> None:
         if not_bar1:
             g = not_bar1[0]
             raise CheckFail(
-                f"group {g.get('gruppe')!r} runs ERREICHT={g.get('erreicht')!r} "
+                f"group {g.get('gruppe')!r} runs ACHIEVED={g.get('erreicht')!r} "
                 f"(angefordert {g.get('angefordert')!r}) while "
                 f"{payload.get('gruppen_bar1')} run on bar1 -- ein gemischter "
                 "Lauf, whose numbers do not count as bar1 numbers"

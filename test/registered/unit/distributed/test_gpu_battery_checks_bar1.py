@@ -54,16 +54,16 @@ from s12_prefill_kurve import tabelle, zusammenfassen  # noqa: E402
 # parallel_state.py:638 / htccl.py:645 and htccl_bar1.py:1518 / :1530, with the
 # "<lineno>:" prefix that grep -n puts in front of them.
 LOG_GROUP_OK = (
-    "412:[2026-07-30 03:11:02] HTCCL enabled for group 'tp:0': angefordert=bar1, "
-    "ERREICHT=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the "
+    "412:[2026-07-30 03:11:02] HTCCL enabled for group 'tp:0': requested=bar1, "
+    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the "
     "host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph."
 )
 LOG_GROUP_OK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL enabled for group 'dcp:0': angefordert=bar1, "
-    "ERREICHT=bar1. Every SGLANG_HTCCL* env must be identical on all ranks."
+    "418:[2026-07-30 03:11:02] HTCCL enabled for group 'dcp:0': requested=bar1, "
+    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks."
 )
 LOG_GROUP_FALLBACK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL group 'dcp:0': angefordert=bar1, ERREICHT=gloo "
+    "418:[2026-07-30 03:11:02] HTCCL group 'dcp:0': requested=bar1, ACHIEVED=gloo "
     "(aufbau: Bar1Unverfuegbar: Halter meldet ENOMEM). Diese Gruppe laeuft NICHT "
     "ueber bar1. Ein Messwert aus diesem Lauf ist gemischt und darf nicht als "
     "bar1-Wert berichtet werden."
@@ -90,20 +90,20 @@ LOG_RIEGEL = (
 
 GRAPH_CHECK_OK = """BAR1-Graph-Beleg: Geraete [0, 1, 2], 3 Raenge
 --- Fall 'einfach' ----------------------------------------
-    => BESTANDEN
+    => PASSED
 ==============================================================
 Zusammenfassung
 ==============================================================
-  BESTANDEN  [Gate]  einfach
-  BESTANDEN  [Gate]  two-graphs
-  BESTANDEN  [Gate]  wechselnde-form
-  BESTANDEN  [Gate]  reservation
-  BESTANDEN  [Info]  gitter
+  PASSED  [Gate]  einfach
+  PASSED  [Gate]  two-graphs
+  PASSED  [Gate]  wechselnde-form
+  PASSED  [Gate]  reservation
+  PASSED  [Info]  gitter
 
 Alle Gate-Faelle bestanden.
 """
 GRAPH_CHECK_FALLEN = GRAPH_CHECK_OK.replace(
-    "  BESTANDEN  [Gate]  two-graphs", "  GEFALLEN   [Gate]  two-graphs"
+    "  PASSED  [Gate]  two-graphs", "  FAILED  [Gate]  two-graphs"
 ).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: two-graphs.")
 
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
@@ -740,7 +740,7 @@ class TestE2ECheck:
     def test_under_provisioned_smoke_has_its_own_verdict(self, tmp_path):
         """It must never read as a transport finding.
 
-        This is the 2026-07-30 outcome: 9x ERREICHT=bar1, no bolt, a full
+        This is the 2026-07-30 outcome: 9x ACHIEVED=bar1, no bolt, a full
         boot -- and a smoke that spent its budget on a thinking preamble.
         Reporting that as "incoherent" invites the reading that bar1
         corrupted the output, which the byte proofs rule out.
@@ -932,7 +932,7 @@ class TestAgainstTheGreenTransportRun:
     """Attempt 3, on the card: the transport side really carried the run.
 
     The counterpart to the fixture above. Same day, same step, after the
-    broadcast coverage landed: nine ERREICHT=bar1 lines over world:0, tp:0
+    broadcast coverage landed: nine ACHIEVED=bar1 lines over world:0, tp:0
     and dcp:0, no bolt, and all SEVEN gate cases passed -- including
     `broadcast` and `broadcast-two-graphs`, which is the on-card proof
     that a broadcast survives capture and replay.

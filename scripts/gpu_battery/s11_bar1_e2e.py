@@ -7,13 +7,13 @@ card, a socket or ssh, which is what makes it testable against fixtures.
 
 Three extractions carry the step:
 
-  * the graph gate. bar1_graph_check.py prints one BESTANDEN/GEFALLEN line per
+  * the graph gate. bar1_graph_check.py prints one PASSED/FAILED line per
     case with a [Gate]/[Info] marker and exits 0 only when every gate case
     passed. Both are recorded: the exit code alone would hide WHICH case fell.
   * per-group attainment. parallel_state logs "HTCCL enabled for group '<x>':
-    angefordert=<a>, ERREICHT=<e>" on success and the same pair as a WARNING on
+    requested=<a>, ACHIEVED=<e>" on success and the same pair as a WARNING on
     fallback. The requested name is worthless -- it says bar1 either way. Only
-    ERREICHT counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
+    ACHIEVED counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
     are two (tp:0, dcp:0), and a run where one of them fell back to gloo is a
     mixed measurement, not a bar1 measurement.
   * the coverage bolt. htccl._select raises rather than falling back to the
@@ -124,8 +124,8 @@ MUELL_MIN_ZEICHEN = 20
 LOG_QUELLEN = ("htccl_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
-    r"group '(?P<gruppe>[^']+)': angefordert=(?P<angefordert>[^,\s]+),\s*"
-    r"ERREICHT=(?P<erreicht>[A-Za-z0-9_\-]+)"
+    r"group '(?P<gruppe>[^']+)': requested=(?P<angefordert>[^,\s]+),\s*"
+    r"ACHIEVED=(?P<erreicht>[A-Za-z0-9_\-]+)"
 )
 RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<gruppe>[^']+)'")
 RE_AUFBAU = re.compile(r"HTCCL-BAR1: Aufbau in\s+(?P<ms>[0-9.]+)\s*ms")
@@ -134,7 +134,7 @@ RE_RIEGEL = re.compile(
     r"CUDA-Graph-Aufzeichnung"
 )
 RE_GATE_CASE = re.compile(
-    r"^\s*(?P<marke>BESTANDEN|GEFALLEN)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
+    r"^\s*(?P<marke>PASSED|FAILED)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
 )
 
 FATAL_MARKERS = (
@@ -177,7 +177,7 @@ def parse_graph_check(step_dir: str) -> dict:
                 {
                     "name": m.group("name"),
                     "gate": m.group("art") == "Gate",
-                    "ok": m.group("marke") == "BESTANDEN",
+                    "ok": m.group("marke") == "PASSED",
                 }
             )
     gates = [c for c in cases if c["gate"]]

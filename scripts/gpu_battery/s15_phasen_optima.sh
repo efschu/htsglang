@@ -259,7 +259,7 @@ for ROW in "${ARM_TABLE[@]}"; do
         "max_total_num_tokens" \
         "KV Cache is allocated" \
         "HTCCL enabled for group" \
-        "ERREICHT=" \
+        "ACHIEVED=" \
         "Disable prefill CUDA graph"
 
     s15_power_start "$ARM"

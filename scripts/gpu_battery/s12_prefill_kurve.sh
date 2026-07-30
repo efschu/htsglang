@@ -131,7 +131,7 @@ for N in $SESSIONS; do
         # communicator group really got.
         host_grep_into "$HOSTLOG" "$DIR/belege/${SEQ}_${ARM}_${N}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "waehrend einer CUDA-Graph-Aufzeichnung"
 

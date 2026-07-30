@@ -104,7 +104,7 @@ def load_evidence(step_dir: str) -> dict:
             pg = "off (auto-disable)"
         out[(arm, rnd)] = {
             "bar1_gruppen": text.count("HTCCL-BAR1: Aufbau in"),
-            "erreicht": len(re.findall(r"ERREICHT=", text)),
+            "erreicht": len(re.findall(r"ACHIEVED=", text)),
             "pipe_zeilen": text.count("HTCCL-BAR1-PIPE:"),
             "vorrat_leer": "Graph-Vorrat des Ergebnisrings ist erschoepft" in text,
             "prefill_graph": pg,

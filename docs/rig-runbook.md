@@ -1466,18 +1466,18 @@ in the standard run, and the reserve values in 4.1 are written for that order
 
 #### Proving it really ran over bar1
 
-**The transport name in the log is not proof.** `angefordert=bar1` appears on
+**The transport name in the log is not proof.** `requested=bar1` appears on
 failure too. Once, a `tp` group built the direct path in 27 ms while `dcp`
 failed on the holder with ENOMEM and fell back to gloo — and both lines said
 `transport=bar1`. Half of the resulting number was not a bar1 number.
 
 ```bash
 grep "HTCCL-BAR1: Aufbau in" "$LOG"   # one line per communicator group
-grep "ERREICHT=" "$LOG"               # angefordert= vs ERREICHT=
+grep "ACHIEVED=" "$LOG"               # requested= vs ACHIEVED=
 ```
 
 With `SGLANG_UNEVEN_DCP=1` there are **two** groups (`tp:0`, `dcp:0`) and
-**both** must report `ERREICHT=bar1`. Queryable at runtime as
+**both** must report `ACHIEVED=bar1`. Queryable at runtime as
 `htccl.gruppen_stand()` / `htccl.stand_zusammenfassung()`. A mixed run is not
 a bar1 measurement and must not be reported as one.
 

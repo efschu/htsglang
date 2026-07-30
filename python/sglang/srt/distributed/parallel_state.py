@@ -649,15 +649,15 @@ class GroupCoordinator:
             erreicht = stand.get("erreicht", angefordert)
             if stand.get("direkt", True):
                 logger.info(
-                    "HTCCL enabled for group '%s': angefordert=%s, "
-                    "ERREICHT=%s. Every SGLANG_HTCCL* env must be identical "
+                    "HTCCL enabled for group '%s': requested=%s, "
+                    "ACHIEVED=%s. Every SGLANG_HTCCL* env must be identical "
                     "on all ranks; the host-staged transports (shm/gloo/ucx) "
                     "additionally require --disable-cuda-graph.",
                     self.unique_name, angefordert, erreicht,
                 )
             else:
                 logger.warning(
-                    "HTCCL group '%s': angefordert=%s, ERREICHT=%s (%s: %s). "
+                    "HTCCL group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
                     "Diese Gruppe laeuft NICHT ueber %s. Ein Messwert aus "
                     "diesem Lauf ist gemischt und darf nicht als "
                     "%s-Wert berichtet werden.",
