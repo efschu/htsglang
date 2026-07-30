@@ -1,54 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HTCCL-Transport ``matrix``: Planer plus BAR1-Direktpfad.
+"""HTCCL ``matrix`` transport: planner plus BAR1 direct path.
 
-Die Naht, die dieses Modul schliesst
-------------------------------------
-``htccl_matrix.py`` plant, ``htccl_bar1.py`` transportiert. Zwischen beiden
-fehlte bisher das Stueck, das
+The seam this module closes
+----------------------------
+``htccl_matrix.py`` plans, ``htccl_bar1.py`` transports. Between the two,
+the piece that was missing until now is the one that
 
-1. den Direktpfad aufbaut (``baue_bar1``),
-2. dessen **tatsaechliche** Faehigkeit als ``fenster_bytes`` in den Planer
-   reicht -- das Minimum ueber alle Ziele und alle Raenge, nicht die
-   Bruttogroesse aus sysfs und nicht die angeforderte Groesse,
-3. ``plan()`` ruft und ``plan.erklaerung()`` auf Rang 0 protokolliert,
-4. den Plan an den Direktpfad zurueckgibt, damit ``handles`` und die
-   Kernwahl je Groesse aus derselben Quelle kommen.
+1. builds the direct path (``build_bar1``),
+2. feeds its **actual** capacity into the planner as ``fenster_bytes`` --
+   the minimum across all destinations and all ranks, not the raw size
+   from sysfs and not the requested size,
+3. calls ``plan()`` and logs ``plan.explanation()`` on rank 0,
+4. hands the plan back to the direct path, so that ``handles`` and the
+   per-size kernel choice come from the same source.
 
-Die Reihenfolge ist nicht beliebig. Der Planer schliesst Algorithmen aus,
-deren Fensterbedarf die Abbildung sprengt (``plane(..., fenster_bytes=)``);
-diese Zahl kennt erst der aufgebaute Transport. Umgekehrt braucht der
-Transport den Plan, um je Groesse Netz oder Ring zu waehlen. Also: erst
-bauen, dann planen, dann den Plan hereinreichen.
+The order here is not arbitrary. The planner excludes algorithms whose
+window requirement would overrun the mapping (``plan_collective(...,
+fenster_bytes=)``); that number is only known once the transport has been
+built. Conversely, the transport needs the plan to choose mesh or ring per
+size. Hence: build first, then plan, then feed the plan back in.
 
-Warum der Direktpfad zugleich der Messfuehler ist
-------------------------------------------------
-``HTCCLBar1Transport`` erfuellt das ``Fuehler``-Protokoll
-(``name``/``eigenlast``/``eigenlast_duplex``/``paar``/``paar_empfang``).
-Steht er, misst der Planer **echte gerichtete Kanten** statt der
-Eigenlast-Schaetzung. Steht er nicht, faellt der Planer auf die Eigenlast
-zurueck und schreibt das in die Erklaerung -- er tut nicht so, als haette
-er die Kante gemessen.
+Why the direct path doubles as the measurement sensor
+------------------------------------------------------
+``HTCCLBar1Transport`` implements the ``Sensor`` protocol
+(``name``/``self_load``/``self_load_duplex``/``pair``/``pair_receive``).
+When it is up, the planner measures **real directed edges** instead of
+estimating from self-load. When it is not, the planner falls back to the
+self-load estimate and records that in the explanation -- it does not
+pretend to have measured the edge.
 
-Was passiert, wenn der Direktpfad fehlt
----------------------------------------
-Dann meldet dieser Transport ``handles(...) == False`` fuer alles. Der
-Planer laeuft trotzdem und protokolliert seine Erklaerung -- die Wahl von
-Rollen und Algorithmus ist auch fuer die anderen Transporte eine
-Information. Aber es wird nichts ueber einen Pfad geschickt, den es nicht
-gibt.
+What happens when the direct path is unavailable
+---------------------------------------------------
+Then this transport reports ``handles(...) == False`` for everything. The
+planner still runs and logs its explanation -- the choice of roles and
+algorithm is useful information for the other transports too. But nothing
+is sent over a path that does not exist.
 
-Ein- und ausschalten
---------------------
-Nichts davon passiert ohne ausdrueckliche Wahl:
+Turning it on and off
+-----------------------
+None of this happens without an explicit choice:
 
-* ``SGLANG_HTCCL_TRANSPORT=matrix`` waehlt diesen Transport,
-  ``SGLANG_HTCCL_TRANSPORT=bar1`` den nackten Direktpfad ohne Planer.
-  Vorgabe bleibt ``device``; ohne Umschalten aendert sich nichts.
-* ``SGLANG_HTCCL_MATRIX_DIRECT=0`` schaltet den Direktpfad ab, der Planer
-  laeuft weiter.
-* ``SGLANG_HTCCL_BAR1_FENSTER_MIB`` (Vorgabe 96) ist die **angeforderte**
-  Regionsgroesse je Rang. 96 MiB, weil die vermessene Region 90,69 MiB
-  gross ist und in das 256-MiB-BAR1 einer RTX 3080 passt.
+* ``SGLANG_HTCCL_TRANSPORT=matrix`` selects this transport,
+  ``SGLANG_HTCCL_TRANSPORT=bar1`` selects the bare direct path without a
+  planner. The default remains ``device``; nothing changes unless you
+  switch it.
+* ``SGLANG_HTCCL_MATRIX_DIRECT=0`` disables the direct path; the planner
+  keeps running.
+* ``SGLANG_HTCCL_BAR1_WINDOW_MIB`` (default 96) is the **requested**
+  region size per rank. 96 MiB, because the measured region is 90.69 MiB
+  and fits inside the 256 MiB BAR1 of an RTX 3080.
 """
 
 from __future__ import annotations
@@ -57,25 +57,29 @@ import logging
 import os
 from typing import Optional
 
+from sglang.srt.distributed.device_communicators import (
+    htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+)
+
 logger = logging.getLogger(__name__)
 
-#: Angeforderte Empfangsregion je Rang, in MiB.
-FENSTER_MIB_VORGABE = 96
+#: Requested receive-region size per rank, in MiB.
+WINDOW_MIB_DEFAULT = 96
 
-#: Was in BAR1 unangetastet bleibt. RM belegt selbst einen Teil der
-#: Apertur, und die Zahl aus sysfs ist BRUTTO. 32 MiB ist eine Vorgabe und
-#: keine Messaussage -- wer NVML hat, braucht sie gar nicht, weil dann die
-#: echte freie Groesse bekannt ist.
-RESERVE_MIB_VORGABE = 32
+#: What stays untouched in BAR1. RM itself occupies part of the aperture,
+#: and the number from sysfs is GROSS. 32 MiB is a default, not a
+#: measurement -- whoever has NVML doesn't need it at all, because then the
+#: real free size is already known.
+RESERVE_MIB_DEFAULT = 32
 
-#: Fensterkasse: je Geraeteordinal die Liste ``(gruppe, bytes)``, die dieser
-#: PROZESS bereits in BAR1 festgenagelt hat.
+#: Window ledger: per device ordinal, the list of ``(gruppe, bytes)``
+#: entries this PROCESS has already pinned in BAR1.
 #:
-#: Es gibt sie, weil die erste Gruppe bisher nahm, was sie wollte. Mit
-#: ``SGLANG_UNEVEN_DCP=1`` gibt es zwei Kommunikatorgruppen; ``tp`` griff
-#: sich 96 MiB, und ``dcp`` bekam vom Halter ein nacktes ``[Errno 12]``.
-#: Ein ENOMEM aus einem Ioctl sagt nicht, WER den Platz hat. Diese Tabelle
-#: sagt es.
+#: It exists because the first group used to simply take whatever it
+#: wanted. With ``SGLANG_UNEVEN_DCP=1`` there are two communicator groups;
+#: ``tp`` grabbed 96 MiB, and ``dcp`` got a bare ``[Errno 12]`` from the
+#: holder. An ENOMEM from an ioctl doesn't say WHO holds the space. This
+#: table does.
 _KASSE: dict[int, list[tuple[str, int]]] = {}
 
 
@@ -88,58 +92,58 @@ def _ordinal(device) -> int:
     return int(torch.cuda.current_device())
 
 
-def _gruppen_schluessel(gruppe: str) -> str:
-    """``dcp`` -> ``DCP``, ``tp:0`` -> ``TP_0``. Fuer den Variablennamen."""
+def _group_key(gruppe: str) -> str:
+    """``dcp`` -> ``DCP``, ``tp:0`` -> ``TP_0``. For the variable name."""
     return "".join(c if c.isalnum() else "_" for c in gruppe).upper()
 
 
-def _angefordert(gruppe: str) -> tuple[int, str]:
-    """Die angeforderte Regionsgroesse dieser Gruppe, und woher sie kommt.
+def _requested(gruppe: str) -> tuple[int, str]:
+    """The requested region size for this group, and where it came from.
 
-    **Je Gruppe getrennt einstellbar, und das ist der Kern der Sache.** Die
-    Gruppen tragen verschiedene Nachrichten: die tp-Gruppe im Prefill 20 MiB
-    (chunked_prefill_size 2048 x hidden 5120 x 2 B), die dcp-Gruppe etwas
-    ganz anderes. Ihnen dieselbe Region zu geben heisst, entweder der einen
-    zu wenig oder der anderen zu viel zu geben -- und BAR1 ist auf einer
-    3080 mit 256 MiB brutto zu knapp fuer "zu viel".
+    **Independently configurable per group, and that's the whole point.**
+    Different groups carry different messages: the tp group carries 20 MiB
+    during prefill (chunked_prefill_size 2048 x hidden 5120 x 2 B), while
+    the dcp group carries something else entirely. Giving them the same
+    region means giving one too little or the other too much -- and on a
+    3080 with 256 MiB gross, BAR1 is too tight to afford "too much".
 
-    ``SGLANG_HTCCL_BAR1_FENSTER_MIB_DCP=16`` setzt die dcp-Gruppe herunter,
-    ohne die tp-Gruppe anzufassen.
+    ``SGLANG_HTCCL_BAR1_WINDOW_MIB_DCP=16`` turns the dcp group's window
+    down without touching the tp group's.
     """
-    eigen = f"SGLANG_HTCCL_BAR1_FENSTER_MIB_{_gruppen_schluessel(gruppe)}"
+    eigen = f"SGLANG_HTCCL_BAR1_FENSTER_MIB_{_group_key(gruppe)}"
     if gruppe and eigen in os.environ:
         return int(os.environ[eigen]) * 1024 * 1024, eigen
     return (
-        int(os.environ.get("SGLANG_HTCCL_BAR1_FENSTER_MIB",
-                           str(FENSTER_MIB_VORGABE))) * 1024 * 1024,
-        "SGLANG_HTCCL_BAR1_FENSTER_MIB",
+        int(os.environ.get("SGLANG_HTCCL_BAR1_WINDOW_MIB",
+                           str(WINDOW_MIB_DEFAULT))) * 1024 * 1024,
+        "SGLANG_HTCCL_BAR1_WINDOW_MIB",
     )
 
 
-def bar1_frei(device) -> tuple[Optional[int], int, str]:
-    """``(frei, brutto, quelle)`` der BAR1-Apertur dieser Karte.
+def bar1_free(device) -> tuple[Optional[int], int, str]:
+    """``(frei, brutto, source)`` for this card's BAR1 aperture.
 
-    ``frei`` ist ``None``, wenn es sich nicht ermitteln liess -- dann muss
-    der Aufrufer mit ``brutto`` minus Reserve rechnen und das auch sagen.
-    Geraten wird hier nichts.
+    ``frei`` is ``None`` when it could not be determined -- in that case
+    the caller must compute from ``brutto`` minus reserve, and say so.
+    Nothing is guessed here.
 
-    NVML (``nvmlDeviceGetBAR1MemoryInfo``) ist die einzige Quelle, die
-    ``used``/``free`` wirklich kennt; sysfs kennt nur die Bruttogroesse der
-    Apertur, und wieviel davon RM selbst belegt, steht dort nirgends. Das
-    ist genau die Luecke, in die der ENOMEM des Halters faellt.
+    NVML (``nvmlDeviceGetBAR1MemoryInfo``) is the only source that truly
+    knows ``used``/``free``; sysfs only knows the aperture's gross size,
+    and how much of that RM itself occupies is recorded nowhere. That is
+    exactly the gap the holder's ENOMEM falls into.
     """
     brutto = 0
     try:
         from sglang.srt.distributed.device_communicators.htccl_bar1 import (
-            bar1_fenster,
+            bar1_window,
         )
         from sglang.srt.distributed.device_communicators.htccl_matrix import (
-            bdf_der_karte,
+            bdf_of_card,
         )
 
-        brutto = bar1_fenster(bdf_der_karte(device)).groesse
+        brutto = bar1_window(bdf_of_card(device)).groesse
     except Exception as e:
-        logger.debug("HTCCL-BAR1: BAR1-Bruttogroesse nicht aus sysfs (%r)", e)
+        logger.debug("HTCCL-BAR1: could not get BAR1 gross size from sysfs (%r)", e)
     try:
         import pynvml
 
@@ -151,15 +155,15 @@ def bar1_frei(device) -> tuple[Optional[int], int, str]:
         finally:
             pynvml.nvmlShutdown()
     except Exception as e:
-        logger.debug("HTCCL-BAR1: NVML liefert keine BAR1-Belegung (%r)", e)
-    return None, brutto, "sysfs-brutto"
+        logger.debug("HTCCL-BAR1: NVML did not provide BAR1 usage (%r)", e)
+    return None, brutto, "sysfs-gross"
 
 
-def kasse_eintragen(device, gruppe: str, bytes_: int) -> None:
+def ledger_credit(device, gruppe: str, bytes_: int) -> None:
     _KASSE.setdefault(_ordinal(device), []).append((gruppe, int(bytes_)))
 
 
-def kasse_austragen(device, gruppe: str) -> None:
+def ledger_debit(device, gruppe: str) -> None:
     posten = _KASSE.get(_ordinal(device))
     if not posten:
         return
@@ -169,105 +173,105 @@ def kasse_austragen(device, gruppe: str) -> None:
             return
 
 
-def kasse_stand(device) -> list[tuple[str, int]]:
+def ledger_balance(device) -> list[tuple[str, int]]:
     return list(_KASSE.get(_ordinal(device), []))
 
 
-def fenster_fuer(gruppe: str, device) -> int:
-    """Die Regionsgroesse, die diese Gruppe auf DIESEM Rang anfordern darf.
+def window_for(gruppe: str, device) -> int:
+    """The region size this group is allowed to request on THIS rank.
 
-    Der lokale VORSCHLAG, nicht die Entscheidung: die Karten der Gruppe
-    haben verschieden grosse Aperturen (3080 mit 256 MiB, 5090 mit deutlich
-    mehr), und eine je Rang verschiedene Region waere eine je Rang
-    verschiedene Schlitzordnung -- also falsche Adressen statt eines
-    Fehlers. Das Minimum ueber die Gruppe zieht ``_baue_auf``.
+    A local PROPOSAL, not the final decision: the group's cards have
+    apertures of different sizes (3080 with 256 MiB, 5090 with
+    considerably more), and a per-rank-different region would mean a
+    per-rank-different slot layout -- i.e. wrong addresses instead of a
+    clean error. ``_build_up`` takes the minimum across the group.
 
-    Gerechnet wird gegen das, was WIRKLICH frei ist, abzueglich dessen, was
-    dieser Prozess in anderen Gruppen bereits festgenagelt hat. Die
-    Verkleinerung wird protokolliert, mit der Rechnung -- eine stille
-    Verkleinerung waere schlimmer als der ENOMEM: sie senkt still die
-    groesste tragbare Nutzlast, und Nachrichten darueber fallen ohne einen
-    einzigen Hinweis auf die gloo-Ebene zurueck.
+    Computed against what is REALLY free, minus what this process has
+    already pinned in other groups. Any shrinkage is logged, along with
+    the arithmetic behind it -- a silent shrinkage would be worse than the
+    ENOMEM: it quietly lowers the largest payload this group can carry,
+    and messages about it fall back to the gloo layer without a single
+    hint.
     """
-    angefordert, quelle = _angefordert(gruppe)
-    frei, brutto, woher = bar1_frei(device)
+    requested, source = _requested(gruppe)
+    frei, brutto, woher = bar1_free(device)
     reserve = int(os.environ.get("SGLANG_HTCCL_BAR1_RESERVE_MIB",
-                                 str(RESERVE_MIB_VORGABE))) * 1024 * 1024
-    schon = sum(b for _, b in kasse_stand(device))
+                                 str(RESERVE_MIB_DEFAULT))) * 1024 * 1024
+    schon = sum(b for _, b in ledger_balance(device))
 
     if frei is None:
         if brutto <= 0:
             logger.info(
-                "HTCCL-BAR1: BAR1-Groesse dieser Karte unbekannt (weder NVML "
-                "noch sysfs). Es wird angefordert, was %s sagt (%d MiB); "
-                "reicht die Apertur nicht, meldet sich der Halter mit ENOMEM.",
-                quelle, angefordert // 2**20,
+                "HTCCL-BAR1: BAR1 size of this card is unknown (neither "
+                "NVML nor sysfs). Requesting what %s says (%d MiB); if the "
+                "aperture isn't big enough, the holder will report ENOMEM.",
+                source, requested // 2**20,
             )
-            return angefordert
-        # sysfs kennt nur BRUTTO. Was RM selbst belegt, steht dort nicht --
-        # deshalb muss hier die eigene Buchfuehrung abgezogen werden, und
-        # deshalb ist diese Schaetzung optimistisch. Genau daran ist die
-        # zweite Gruppe mit ENOMEM gescheitert.
-        deckel = brutto - reserve - schon
+            return requested
+        # sysfs only knows the GROSS size. What RM itself occupies isn't
+        # recorded there -- which is why our own ledger has to be
+        # subtracted here, and why this estimate is optimistic. This is
+        # exactly what tripped up the second group with ENOMEM.
+        cap = brutto - reserve - schon
         rechnung = (
-            f"BAR1 brutto laut sysfs {brutto // 2**20} MiB - Reserve "
-            f"{reserve // 2**20} MiB - in diesem Prozess bereits "
-            f"festgenagelt {schon // 2**20} MiB = {max(deckel, 0) // 2**20} "
-            f"MiB. ACHTUNG: sysfs kennt nur die Bruttoapertur; was RM selbst "
-            f"belegt, ist darin NICHT abgezogen. Ohne NVML ist diese Zahl "
-            f"eine Obergrenze, keine Zusage."
+            f"BAR1 gross per sysfs {brutto // 2**20} MiB - reserve "
+            f"{reserve // 2**20} MiB - already pinned by this process "
+            f"{schon // 2**20} MiB = {max(cap, 0) // 2**20} "
+            f"MiB. NOTE: sysfs only knows the gross aperture size; what RM "
+            f"itself occupies is NOT subtracted from it. Without NVML this "
+            f"number is an upper bound, not a guarantee."
         )
     else:
-        # NVML kennt `used` -- darin steckt bereits, was dieser Prozess in
-        # anderen Gruppen festgenagelt hat. `schon` deshalb NICHT noch
-        # einmal abziehen; es steht unten nur zur Zuordnung dabei.
-        deckel = frei - reserve
+        # NVML knows `used` -- that already includes what this process has
+        # pinned in other groups. So `schon` must NOT be subtracted again
+        # here; it only appears below for attribution.
+        cap = frei - reserve
         rechnung = (
-            f"frei laut NVML {frei // 2**20} MiB - Reserve "
-            f"{reserve // 2**20} MiB = {max(deckel, 0) // 2**20} MiB "
-            f"(darin bereits enthalten, was dieser Prozess haelt: "
-            f"{', '.join(f'{g}: {b // 2**20} MiB' for g, b in kasse_stand(device)) or 'nichts'})"
+            f"free per NVML {frei // 2**20} MiB - reserve "
+            f"{reserve // 2**20} MiB = {max(cap, 0) // 2**20} MiB "
+            f"(already includes what this process holds: "
+            f"{', '.join(f'{g}: {b // 2**20} MiB' for g, b in ledger_balance(device)) or 'nothing'})"
         )
 
-    if deckel >= angefordert:
-        return angefordert
+    if cap >= requested:
+        return requested
 
     logger.warning(
-        "HTCCL-BAR1: Gruppe %r fordert %d MiB (%s), nutzbar sind aber nur "
-        "%d MiB. %s Die Anforderung wird auf %d MiB gekuerzt, und das SENKT "
-        "die groesste tragbare Nutzlast dieser Gruppe -- Nachrichten "
-        "darueber fallen ohne weiteren Hinweis auf die gloo-Ebene zurueck. "
-        "Wer das nicht will, setzt SGLANG_HTCCL_BAR1_FENSTER_MIB_%s "
-        "ausdruecklich, gibt der anderen Gruppe weniger, oder laesst diese "
-        "Gruppe bewusst ueber NCCL fahren.",
-        gruppe or "<ohne Namen>", angefordert // 2**20, quelle,
-        max(deckel, 0) // 2**20, rechnung, max(deckel, 0) // 2**20,
-        _gruppen_schluessel(gruppe),
+        "HTCCL-BAR1: group %r requests %d MiB (%s), but only %d MiB is "
+        "usable. %s The request is being clipped to %d MiB, which LOWERS "
+        "the largest payload this group can carry -- messages about it "
+        "fall back to the gloo layer without further notice. Anyone who "
+        "doesn't want that should set SGLANG_HTCCL_BAR1_FENSTER_MIB_%s "
+        "explicitly, give the other group less, or deliberately let this "
+        "group run over NCCL.",
+        gruppe or "<ohne Namen>", requested // 2**20, source,
+        max(cap, 0) // 2**20, rechnung, max(cap, 0) // 2**20,
+        _group_key(gruppe),
     )
-    return max(deckel, 0)
+    return max(cap, 0)
 
 
-def _fenster_bytes() -> int:
-    """Die alte, gruppenlose Form. Nur noch fuer Aufrufer ohne Gruppennamen
-    (``benchmark/bar1_diag.py``, ``benchmark/bar1_graph_check.py``): dort
-    gibt es genau eine Gruppe, also auch nichts aufzuteilen."""
-    return int(os.environ.get("SGLANG_HTCCL_BAR1_FENSTER_MIB",
-                              str(FENSTER_MIB_VORGABE))) * 1024 * 1024
+def _window_bytes() -> int:
+    """The old, group-less form. Only still used by callers without a
+    group name (``benchmark/bar1_diag.py``, ``benchmark/bar1_graph_check.py``):
+    there is exactly one group there, so there is nothing to split."""
+    return int(os.environ.get("SGLANG_HTCCL_BAR1_WINDOW_MIB",
+                              str(WINDOW_MIB_DEFAULT))) * 1024 * 1024
 
 
 class HTCCLMatrixTransport:
-    """Zusammengesetzter Transport: Plan + Unterpfad je Operation und Groesse.
+    """Composite transport: plan plus one sub-path per operation and size.
 
-    Heute gibt es genau **einen** Unterpfad (BAR1) und zwei Operationen
-    (``all_reduce``, ``all_to_all_single``). Das ist die ehrliche Fassung:
-    NIC- und System-RAM-Kanten je gerichteter Kante zu mischen ist entworfen
-    (``ENTWURF_PFADMATRIX.md``), aber nicht gemessen, und ein
-    Auswahlgeruest fuer Pfade, die es nicht gibt, waere eine Attrappe.
+    Today there is exactly **one** sub-path (BAR1) and two operations
+    (``all_reduce``, ``all_to_all_single``). This is the honest version:
+    mixing NIC and system-RAM edges per directed edge has been designed
+    (``ENTWURF_PFADMATRIX.md``) but not measured, and building a selection
+    scaffold for paths that don't exist would be a mock-up.
 
-    Die Auswahl, die es wirklich gibt, ist die zwischen den **Kernen** von
-    ``all_reduce``: ``netz`` oder ``ring`` je Groesse, aus dem Plan statt
-    aus einer eingebauten Zahl. ``all_to_all`` hat keine solche Wahl -- es
-    gibt genau einen Weg -- und wird deshalb ungeplant durchgereicht.
+    The choice that genuinely exists is between the **kernels** of
+    ``all_reduce``: ``mesh`` or ``ring`` per size, taken from the plan
+    instead of a hardcoded number. ``all_to_all`` has no such choice --
+    there is exactly one way to do it -- so it is passed through unplanned.
     """
 
     HTCCL_OPS: frozenset = frozenset(
@@ -278,11 +282,11 @@ class HTCCLMatrixTransport:
         import torch.distributed as dist
 
         from sglang.srt.distributed.device_communicators.htccl_bar1 import (
-            baue_bar1,
+            build_bar1,
         )
         from sglang.srt.distributed.device_communicators.htccl_matrix import (
-            HTCCLMatrixPlaner,
-            lade_konfig,
+            HTCCLMatrixPlanner,
+            load_config,
         )
 
         self.cpu_group = cpu_group
@@ -291,129 +295,129 @@ class HTCCLMatrixTransport:
         self.rank = dist.get_rank(cpu_group)
         self.welt = dist.get_world_size(cpu_group)
 
-        # 1. Direktpfad. `None` heisst: diese Maschine kann ihn nicht, mit
-        #    protokolliertem Grund. Kein Werfen -- der Planer ist auch ohne
-        #    ihn nuetzlich. Der GRUND wird aber festgehalten: ein Planer ohne
-        #    Direktpfad sagt zu allem `handles -> False`, und dann laeuft
-        #    jedes Kollektiv ueber die gloo-Ebene, waehrend das Protokoll
-        #    "transport=matrix" meldet. Genau diese Verwechslung hat eine
-        #    Messung entwertet.
+        # 1. Direct path. `None` means: this machine can't have it, with a
+        #    logged reason. No raising -- the planner is useful even
+        #    without it. But the REASON is recorded: a planner without a
+        #    direct path answers `handles -> False` to everything, and
+        #    then every collective runs over the gloo layer while the log
+        #    reports "transport=matrix". Exactly this mix-up once
+        #    invalidated a measurement.
         bericht: dict = {}
-        self.bar1 = baue_bar1(
-            cpu_group, device, fenster_fuer(gruppe, device), bericht,
+        self.bar1 = build_bar1(
+            cpu_group, device, window_for(gruppe, device), bericht,
             gruppe=gruppe,
         )
         if bericht.get("haelt_belegt") and self.bar1 is not None:
-            # Er steht, traegt aber nichts (Byte-Beleg gefallen). Abraeumen
-            # statt liegenlassen: er haelt sonst die BAR1-Seiten fest, die
-            # die naechste Gruppe braucht.
+            # It's up, but not carrying anything (byte proof failed). Tear
+            # it down instead of leaving it lying around: otherwise it
+            # keeps holding the BAR1 pages the next group needs.
             self.bar1.close()
             self.bar1 = None
         self.bar1_grund = bericht.get("grund", "")
         self.bar1_stufe = bericht.get("stufe", "")
 
-        # 2. Faehigkeit an den Planer. Minimum ueber ALLE Ziele und alle
-        #    Raenge; `None` heisst "unbekannt" und schliesst nichts aus --
-        #    ausdruecklich nicht "unbegrenzt".
-        fenster = self.bar1.fenster_minimum() if self.bar1 is not None else None
+        # 2. Capability, fed to the planner. Minimum over ALL destinations
+        #    and all ranks; `None` means "unknown" and rules nothing out --
+        #    explicitly NOT "unlimited".
+        window = self.bar1.window_minimum() if self.bar1 is not None else None
 
-        # 3. Planen. Der Direktpfad ist zugleich der Paar-Fuehler, wenn er
-        #    steht: dann misst der Planer echte gerichtete Kanten.
-        planer = HTCCLMatrixPlaner(
-            cpu_group, device, konfig=lade_konfig(),
-            fuehler=self.bar1, fenster_bytes=fenster,
+        # 3. Plan. The direct path doubles as the pair sensor when it's
+        #    up: then the planner measures real directed edges.
+        planer = HTCCLMatrixPlanner(
+            cpu_group, device, config=load_config(),
+            fuehler=self.bar1, fenster_bytes=window,
         )
         self.plan = planer.plan()
 
-        # 4. Erklaerung. Pflichtausgabe und nicht an ein Debug-Flag
-        #    gebunden -- ohne sie debuggt niemand auf fremder Hardware.
-        #    Nur auf Rang 0, weil der Plan gruppenweit identisch ist (die
-        #    Pruefsumme ist beim Planen abgeglichen worden) und R Kopien
-        #    desselben Blocks das Protokoll unlesbar machen.
+        # 4. Explanation. Mandatory output, not gated behind a debug flag
+        #    -- without it, nobody can debug this on unfamiliar hardware.
+        #    Rank 0 only, because the plan is identical across the group
+        #    (the checksum was reconciled while planning) and R copies of
+        #    the same block would make the log unreadable.
         if self.rank == 0:
-            logger.info("%s", self.plan.erklaerung())
+            logger.info("%s", self.plan.explanation())
 
-        # 5. Plan zurueck in den Direktpfad: ab hier waehlt er Netz oder
-        #    Ring aus derselben Quelle, aus der der Planer sie begruendet.
+        # 5. Feed the plan back into the direct path: from here on it
+        #    picks mesh or ring from the same source the planner used to
+        #    justify the choice.
         if self.bar1 is not None:
-            self.bar1.setze_plan(self.plan)
+            self.bar1.set_plan(self.plan)
             logger.info(
-                "HTCCL-Matrix: Direktpfad steht. Abgebildetes Fenster "
-                "gruppenweit %d KiB, groesste Nutzlast %d KiB, Leiter: %s.",
-                (fenster or 0) // 1024, self.bar1.max_bytes // 1024,
+                "HTCCL-Matrix: direct path is up. Mapped window "
+                "%d KiB group-wide, largest payload %d KiB, ladder: %s.",
+                (window or 0) // 1024, self.bar1.max_bytes // 1024,
                 ", ".join(
-                    (f"bis {s.max_bytes // 1024} KiB" if s.max_bytes > 0
-                     else "darueber") + f": {s.algorithmus}"
+                    (f"up to {s.max_bytes // 1024} KiB" if s.max_bytes > 0
+                     else "above that") + f": {s.algorithmus}"
                     for s in self.plan.leiter
                 ),
             )
         else:
             logger.info(
-                "HTCCL-Matrix: kein Direktpfad -- der Plan ist protokolliert, "
-                "aber handles() gibt fuer alles False. Es wird nichts ueber "
-                "einen Pfad geschickt, den es nicht gibt."
+                "HTCCL-Matrix: no direct path -- the plan is logged, but "
+                "handles() returns False for everything. Nothing is sent "
+                "over a path that doesn't exist."
             )
 
-    # -- Transport-Naht ----------------------------------------------------
+    # -- Transport seam ------------------------------------------------------
 
     def handles(self, op: str, nbytes: int) -> bool:
-        """Genau dann, wenn ein Unterpfad die Operation wirklich fahren kann.
+        """True exactly when a sub-path can actually run the operation.
 
-        Die Entscheidung wird an den Unterpfad weitergereicht statt hier
-        nachgebaut: eine zweite Fassung derselben Bedingung waere die
-        Stelle, an der die beiden auseinanderlaufen -- und ein Transport,
-        der zusagt und dann scheitert, ist schlechter als einer, der sich
-        abmeldet.
+        The decision is delegated to the sub-path instead of being
+        reconstructed here: a second copy of the same condition would be
+        exactly where the two could drift apart -- and a transport that
+        says yes and then fails is worse than one that declines up front.
         """
         if op not in self.HTCCL_OPS or self.bar1 is None:
             return False
         return self.bar1.handles(op, nbytes)
 
     def htccl_all_reduce(self, comm, inp):
-        self._muss_stehen()
+        self._must_hold()
         return self.bar1.htccl_all_reduce(comm, inp)
 
     # -- all_to_all --------------------------------------------------------
     #
-    # Der Planer hat dazu NICHTS zu sagen: er waehlt zwischen den
-    # all_reduce-Zerlegungen (netz/ring/stern/hierarchisch), und all_to_all
-    # hat keine Zerlegung -- es gibt genau einen Weg, jeder schreibt jedem
-    # seinen Block. Deshalb wird hier nur durchgereicht, ohne dass der Plan
-    # gefragt wuerde. Eine Planzeile fuer eine Wahl, die es nicht gibt, waere
-    # eine Attrappe.
+    # The planner has NOTHING to say about this: it chooses between the
+    # all_reduce decompositions (mesh/ring/star/hierarchical), and
+    # all_to_all has no decomposition -- there is exactly one way to do
+    # it, everyone writes their block to everyone else. So this is passed
+    # straight through here, without consulting the plan. A plan line for
+    # a choice that doesn't exist would be a mock-up.
 
-    def traegt_a2a(self, groesster_block: int) -> bool:
+    def supports_a2a(self, groesster_block: int) -> bool:
         if self.bar1 is None:
             return False
-        return self.bar1.traegt_a2a(groesster_block)
+        return self.bar1.supports_a2a(groesster_block)
 
-    def a2a_schlitz_bytes(self) -> int:
-        return 0 if self.bar1 is None else self.bar1.a2a_schlitz_bytes()
+    def a2a_slot_bytes(self) -> int:
+        return 0 if self.bar1 is None else self.bar1.a2a_slot_bytes()
 
     def htccl_all_to_all_single(self, comm, output, inp, sende_bytes,
                                 empfangs_bytes, sende_versatz=None,
                                 empfangs_versatz=None, kern_last=None,
                                 runden=None):
-        self._muss_stehen()
+        self._must_hold()
         return self.bar1.htccl_all_to_all_single(
             comm, output, inp, sende_bytes, empfangs_bytes,
             sende_versatz, empfangs_versatz, kern_last=kern_last,
             runden=runden,
         )
 
-    def a2a_runden_fuer(self, groesster_block: int) -> int:
-        """Durchgereicht wie traegt_a2a -- eine zweite Fassung waere die
-        Stelle, an der die beiden auseinanderlaufen."""
+    def a2a_rounds_for(self, groesster_block: int) -> int:
+        """Passed through the same way as supports_a2a -- a second copy
+        would be exactly where the two could drift apart."""
         if self.bar1 is None:
             return 0
-        return self.bar1.a2a_runden_fuer(groesster_block)
+        return self.bar1.a2a_rounds_for(groesster_block)
 
-    def _muss_stehen(self) -> None:
+    def _must_hold(self) -> None:
         if self.bar1 is None:
             raise NotImplementedError(
-                "Der Matrix-Transport hat heute genau einen Unterpfad (BAR1), "
-                "und der steht nicht. Erreichbar ist diese Zeile nur, wenn "
-                "jemand handles() umgangen hat."
+                "The matrix transport today has exactly one sub-path "
+                "(BAR1), and it isn't up. This line is only reachable if "
+                "someone bypassed handles()."
             )
 
     def close(self) -> None:

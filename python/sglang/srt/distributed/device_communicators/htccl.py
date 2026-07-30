@@ -38,6 +38,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators import (
+    htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+)
+
 logger = logging.getLogger(__name__)
 
 # Chunk size for the D2H -> gloo -> H2D pipeline. Small enough to
@@ -64,13 +68,13 @@ _TRANSPORT = os.environ.get("SGLANG_HTCCL_TRANSPORT", "device")
 _SLOT_BYTES = int(os.environ.get("SGLANG_HTCCL_SLOT_MIB", "64")) * 1024 * 1024
 
 
-class Bar1Ausgefallen(RuntimeError):
-    """Der Direktpfad ist nicht zustande gekommen -- MIT Grund.
+class Bar1Failed(RuntimeError):
+    """The direct path failed to come up -- WITH a reason.
 
-    Der Unterschied zu einem stillen ``None`` ist der ganze Punkt: ein
-    ``None`` waehlt die gloo-Ebene und sieht danach aus wie ein Erfolg. Diese
-    Ausnahme traegt den Grund bis zu ``_build_transport``, das ihn in eine
-    Warnung und in ``_STAND`` schreibt.
+    The difference from a silent ``None`` is the whole point: a ``None``
+    selects the gloo plane and afterwards looks like success. This
+    exception carries the reason through to ``_build_transport``, which
+    writes it into a warning and into ``_STAND``.
     """
 
     def __init__(self, grund: str, stufe: str = "aufbau"):
@@ -79,26 +83,27 @@ class Bar1Ausgefallen(RuntimeError):
         self.stufe = stufe
 
 
-#: Was je Gruppe WIRKLICH laeuft. Schluessel ist der Gruppenname
+#: What ACTUALLY runs per group. Keyed by group name
 #: (``GroupCoordinator.unique_name``: "tp", "dcp", ...).
 #:
-#: Es gibt diese Tabelle, weil die Protokollzeile "HTCCL enabled for group
-#: 'X' (transport=bar1)" den ANGEFORDERTEN Namen nannte und nicht den
-#: erreichten. Am echten Modell hiess das: tp lief ueber BAR1, dcp fiel mit
-#: ENOMEM auf gloo zurueck, beide Zeilen sahen gleich aus, und die daraus
-#: gewonnene Zahl (22,83 tok/s) war teils gar kein BAR1-Wert. Ein Messwert,
-#: dessen Arm man dem Protokoll nicht ansieht, ist kein Messwert.
+#: This table exists because the log line "HTCCL enabled for group 'X'
+#: (transport=bar1)" used to name the REQUESTED transport, not the one
+#: actually achieved. On the real model that meant: tp ran over BAR1, dcp
+#: fell back to gloo with ENOMEM, both log lines looked identical, and the
+#: throughput number derived from that run (22.83 tok/s) was in part not a
+#: BAR1 number at all. A measurement whose arm can't be read off the log
+#: is not a measurement.
 _STAND: dict[str, dict] = {}
 
 
-def melde_stand(gruppe: str, angefordert: str, erreicht: str,
+def report_state(gruppe: str, requested: str, achieved: str,
                 grund: str = "", stufe: str = "") -> dict:
-    """Eintragen, was diese Gruppe wirklich fahren wird.
+    """Record what this group will actually run on.
 
-    Ein Eintrag je Gruppenname. Namenlose Gruppen (die es in sglang nicht
-    gibt -- ``GroupCoordinator.unique_name`` ist immer gesetzt) bekommen
-    einen durchnummerierten Ersatznamen, damit zwei von ihnen sich nicht
-    gegenseitig ueberschreiben und eine davon unsichtbar wird.
+    One entry per group name. Nameless groups (which don't actually occur
+    in sglang -- ``GroupCoordinator.unique_name`` is always set) get a
+    numbered placeholder name, so that two of them don't overwrite each
+    other and one silently disappears.
     """
     schluessel = gruppe
     if not schluessel:
@@ -107,44 +112,54 @@ def melde_stand(gruppe: str, angefordert: str, erreicht: str,
             i += 1
         schluessel = f"<ohne Namen #{i}>"
     eintrag = {
+        # NOTE: these dict keys stay in German ("gruppe", "angefordert",
+        # "erreicht", "grund", "stufe") on purpose. They are a cross-file
+        # data contract: python/sglang/srt/distributed/parallel_state.py
+        # (outside this translation task's scope) reads them back via
+        # ``stand.get("erreicht", ...)`` to build its own
+        # "angefordert=%s, ERREICHT=%s" log line, and several
+        # scripts/gpu_battery/checks/*.py + test_gpu_battery_checks_bar1.py
+        # consumers key off these exact strings too. Renaming them here
+        # without also touching every one of those out-of-scope files would
+        # silently break that log line and every check that parses it.
         "gruppe": schluessel,
-        "angefordert": angefordert,
-        "erreicht": erreicht,
+        "angefordert": requested,
+        "erreicht": achieved,
         "grund": grund,
         "stufe": stufe,
-        "direkt": erreicht == angefordert and erreicht not in ("gloo", ""),
+        "direkt": achieved == requested and achieved not in ("gloo", ""),
     }
     _STAND[schluessel] = eintrag
     return eintrag
 
 
-def gruppen_stand() -> dict[str, dict]:
-    """Welche Gruppen wirklich ueber den angeforderten Transport laufen.
+def group_state() -> dict[str, dict]:
+    """Which groups actually run over the requested transport.
 
-    Abfragbar gemacht und nicht nur protokolliert: ein Messprogramm soll das
-    PRUEFEN koennen, statt Protokollzeilen zu lesen.
+    Made queryable, not just logged: a measurement program should be able
+    to CHECK this, instead of parsing log lines.
     """
     return dict(_STAND)
 
 
-def stand_zusammenfassung() -> str:
-    """Eine Zeile je Gruppe, fuer das Protokoll und fuer den Messbericht."""
+def state_summary() -> str:
+    """One line per group, for the log and for the measurement report."""
     if not _STAND:
-        return "HTCCL: keine Gruppe gemeldet."
+        return "HTCCL: no group reported."
     zeilen = []
     for name, e in sorted(_STAND.items()):
         if e["direkt"]:
             zeilen.append(f"  {name}: {e['erreicht']}")
         else:
             zeilen.append(
-                f"  {name}: {e['erreicht']} (ANGEFORDERT WAR "
+                f"  {name}: {e['erreicht']} (REQUESTED WAS "
                 f"{e['angefordert']}; {e['stufe']}: {e['grund']})"
             )
     voll = all(e["direkt"] for e in _STAND.values())
-    kopf = ("HTCCL: alle Gruppen fahren den angeforderten Transport."
+    kopf = ("HTCCL: all groups are running the requested transport."
             if voll else
-            "HTCCL: NICHT alle Gruppen fahren den angeforderten Transport -- "
-            "eine Messung ueber diese Konfiguration ist gemischt.")
+            "HTCCL: NOT all groups are running the requested transport -- "
+            "a measurement over this configuration is mixed.")
     return kopf + "\n" + "\n".join(zeilen)
 
 
@@ -207,27 +222,27 @@ def _make_bar1_transport(cpu_group, device, gruppe: str = ""):
 
     The source card DMAs straight into the target card's BAR1 aperture: no
     host memory, no NIC, no NCCL. Which of the two ported kernels runs at
-    which size follows the `SGLANG_HTCCL_BAR1_RING_AB` threshold here,
+    which size follows the `SGLANG_HTCCL_BAR1_RING_THRESHOLD` threshold here,
     because there is no plan to ask. That threshold is a default, not a
     finding -- between 1 and 16 MiB mesh and ring measured within 1..7 % of
     each other. Use "matrix" to have that decided by measurement instead.
 
-    `baue_bar1` returns None with a logged reason on any machine that
+    `build_bar1` returns None with a logged reason on any machine that
     cannot do this (holder module absent, driver regkey unset, byte proof
     failed). None is not an error here: it selects the inline gloo plane,
     exactly as an unknown transport name would.
     """
-    from sglang.srt.distributed.device_communicators.htccl_bar1 import baue_bar1
+    from sglang.srt.distributed.device_communicators.htccl_bar1 import build_bar1
     from sglang.srt.distributed.device_communicators.htccl_matrix_transport import (
-        fenster_fuer,
+        window_for,
     )
 
     bericht: dict = {}
-    t = baue_bar1(cpu_group, device, fenster_fuer(gruppe, device), bericht,
+    t = build_bar1(cpu_group, device, window_for(gruppe, device), bericht,
                   gruppe=gruppe)
     if t is None or bericht.get("haelt_belegt"):
-        raise Bar1Ausgefallen(
-            bericht.get("grund", "ohne gemeldeten Grund"),
+        raise Bar1Failed(
+            bericht.get("grund", "no reason reported"),
             stufe=bericht.get("stufe", "unbekannt"),
         )
     return t
@@ -237,7 +252,7 @@ def _make_matrix_transport(cpu_group, device, gruppe: str = ""):
     """Planner + BAR1 direct path.
 
     Builds the direct path, hands its ACTUALLY mapped window to the planner
-    as a capability, runs `plan()`, logs `plan.erklaerung()` on rank 0, and
+    as a capability, runs `plan()`, logs `plan.explanation()` on rank 0, and
     feeds the plan back so the kernel choice per size comes from the
     measurement rather than from a built-in number. htccl_matrix_transport
     explains why that is the only order that works.
@@ -248,13 +263,13 @@ def _make_matrix_transport(cpu_group, device, gruppe: str = ""):
 
     t = HTCCLMatrixTransport(cpu_group=cpu_group, device=device, gruppe=gruppe)
     if t.bar1 is None:
-        # Der Planer allein ist kein Transport: `handles` gaebe fuer alles
-        # False, und jedes Kollektiv liefe ueber die gloo-Ebene -- bei einem
-        # Protokoll, das "transport=matrix" sagt. Genau die Verwechslung,
-        # die hier zu reparieren ist.
-        grund = getattr(t, "bar1_grund", "") or "ohne gemeldeten Grund"
+        # The planner alone is not a transport: `handles` would return
+        # False for everything, and every collective would run over the
+        # gloo layer -- while the log says "transport=matrix". Exactly the
+        # mix-up this is meant to fix.
+        grund = getattr(t, "bar1_grund", "") or "no reason reported"
         t.close()
-        raise Bar1Ausgefallen(grund, stufe=getattr(t, "bar1_stufe", "aufbau"))
+        raise Bar1Failed(grund, stufe=getattr(t, "bar1_stufe", "aufbau"))
     return t
 
 
@@ -300,21 +315,21 @@ TRANSPORT_REGISTRY = {
 # round number lives in device memory precisely so a replayed graph would not
 # reuse a stale one -- so they are capturable BY CONSTRUCTION. What is missing
 # is a measurement: nobody has captured a cooperative launch
-# (cudaLaunchCooperativeKernel, used above the SGLANG_HTCCL_BAR1_GITTER_AB
+# (cudaLaunchCooperativeKernel, used above the SGLANG_HTCCL_BAR1_GRID_THRESHOLD
 # threshold) into a CUDA graph on this rig and replayed it. Claiming
 # capturability on a construction argument is exactly the kind of plausible
 # assumption that has been failing against this hardware all day.
 _NO_FALLBACK = frozenset({"device", "host"})
 
 
-def _kein_ausweichen(name: str) -> bool:
-    """Ob ``name`` bei einem Aufbaufehler werfen muss statt auszuweichen.
+def _no_fallback(name: str) -> bool:
+    """Whether ``name`` must raise on a build failure instead of falling back.
 
-    Die Regel ist unveraendert "genau die capturable Menge" -- nur wird sie
-    jetzt bei ``parallel_state`` erfragt statt hier ein zweites Mal
-    hingeschrieben. Sonst wirkte der Freigabeschalter an einer Stelle und an
-    der anderen nicht, und bar1 waere freigegeben UND wiche still nach gloo
-    aus: die schlechteste denkbare Verbindung der beiden.
+    The rule is unchanged -- "exactly the capturable set" -- only it is now
+    looked up from ``parallel_state`` instead of being written out a second
+    time here. Otherwise the enable switch could apply in one place and not
+    the other, and bar1 could end up BOTH enabled AND silently falling back
+    to gloo: the worst possible combination of the two.
     """
     if name in _NO_FALLBACK:
         return True
@@ -326,14 +341,14 @@ def _kein_ausweichen(name: str) -> bool:
         return False
 
 
-def _ruf_fabrik(factory, cpu_group, device, gruppe: str):
-    """Die Fabrik aufrufen, mit Gruppennamen nur wenn sie ihn annimmt.
+def _invoke_factory(factory, cpu_group, device, gruppe: str):
+    """Call the factory, passing the group name only if it accepts one.
 
-    Zwei Fabriken (bar1, matrix) brauchen ihn -- fuer die Fenstergroesse je
-    Gruppe. Die anderen und jede von aussen registrierte Fabrik haben
-    weiterhin die zweistellige Form. Geprueft wird die Signatur, nicht ein
-    ``TypeError`` abgefangen: ein TypeError AUS der Fabrik heraus saehe
-    genauso aus und wuerde stillschweigend als "alte Form" gedeutet.
+    Two factories (bar1, matrix) need it -- for the per-group window size.
+    The others, and any externally registered factory, still use the
+    two-argument form. The signature is inspected rather than catching a
+    ``TypeError``: a TypeError raised FROM the factory would look
+    identical and would silently be misread as "old form".
     """
     import inspect
 
@@ -349,66 +364,66 @@ def _ruf_fabrik(factory, cpu_group, device, gruppe: str):
 def _build_transport(name: str, cpu_group, device, disabled: bool,
                      gruppe: str = ""):
     if disabled:
-        melde_stand(gruppe, name, "keiner (world_size 1)")
+        report_state(gruppe, name, "none (world_size 1)")
         return None
     factory = TRANSPORT_REGISTRY.get(name)
     if factory is None:
-        melde_stand(gruppe, name, "gloo",
-                    grund="kein solcher Name in TRANSPORT_REGISTRY",
+        report_state(gruppe, name, "gloo",
+                    grund="no such name in TRANSPORT_REGISTRY",
                     stufe="auswahl")
         return None  # "gloo" or an unknown name -> inline data plane
-    if _kein_ausweichen(name):
-        t = _ruf_fabrik(factory, cpu_group, device, gruppe)
-        melde_stand(gruppe, name, name)
+    if _no_fallback(name):
+        t = _invoke_factory(factory, cpu_group, device, gruppe)
+        report_state(gruppe, name, name)
         return t
     try:
-        t = _ruf_fabrik(factory, cpu_group, device, gruppe)
+        t = _invoke_factory(factory, cpu_group, device, gruppe)
     except Exception as e:
         stufe = getattr(e, "stufe", "aufbau")
         grund = getattr(e, "grund", f"{type(e).__name__}: {e}")
-        melde_stand(gruppe, name, "gloo", grund=grund, stufe=stufe)
-        # WARNING, nicht INFO, und mit Gruppennamen. Der Ausfall EINER Gruppe
-        # ist kein Randfall: er macht jede Messung ueber diesen Lauf zu einer
-        # gemischten, und genau das ist heute unbemerkt passiert.
+        report_state(gruppe, name, "gloo", grund=grund, stufe=stufe)
+        # WARNING, not INFO, and with the group name. One group failing is
+        # not an edge case: it turns any measurement over this run into a
+        # mixed one, and that is exactly what happened here unnoticed.
         logger.warning(
-            "HTCCL: Gruppe %r bekommt den angeforderten Transport %r NICHT "
-            "(%s: %s). Diese Gruppe faehrt ueber die host-gestaffelte "
-            "gloo-Ebene. Jede Messung ueber diesen Lauf ist damit gemischt "
-            "und darf NICHT als %r-Wert berichtet werden.",
+            "HTCCL: group %r does NOT get the requested transport %r "
+            "(%s: %s). This group runs over the host-staged gloo layer. "
+            "Any measurement over this run is therefore mixed and must "
+            "NOT be reported as a %r number.",
             gruppe or "<ohne Namen>", name, stufe, grund, name,
         )
         return None
     if t is None:
-        melde_stand(gruppe, name, "gloo",
-                    grund="Fabrik lieferte None ohne Grund", stufe="aufbau")
+        report_state(gruppe, name, "gloo",
+                    grund="factory returned None without a reason", stufe="aufbau")
         logger.warning(
-            "HTCCL: Gruppe %r bekommt den angeforderten Transport %r nicht "
-            "(die Fabrik lieferte None). gloo-Ebene.",
+            "HTCCL: group %r does not get the requested transport %r "
+            "(the factory returned None). gloo layer.",
             gruppe or "<ohne Namen>", name,
         )
         return None
-    melde_stand(gruppe, name, name)
+    report_state(gruppe, name, name)
     return t
 
 
-def graph_erfassung_laeuft() -> bool:
-    """``True``, solange der AKTUELLE Strom in einen CUDA-Graphen aufgezeichnet
-    wird.
+def graph_capture_running() -> bool:
+    """``True`` while the CURRENT stream is being captured into a CUDA graph.
 
-    **Eine** Definition, hier und nicht je Modul nachgebaut: sie entscheidet
-    an drei Stellen (Ausweichriegel unten, Kernvariante und Direkt-Modus in
-    ``htccl_bar1``), und zwei Fassungen derselben Frage waeren die Stelle, an
-    der sie auseinanderlaufen.
+    **One** definition, here rather than reimplemented per module: it
+    decides at three places (the fallback gate below, kernel variant, and
+    direct mode in ``htccl_bar1``), and two versions of the same question
+    would be exactly where they drift apart.
 
-    RANGEINHEITLICH nur, soweit die Aufzeichnung es ist -- und das ist sie in
-    sglang: der Graph-Laeufer zeichnet auf allen Raengen dieselben Formen in
-    derselben Reihenfolge auf. Wer diese Funktion benutzt, um eine
-    KOLLEKTIVE Entscheidung zu treffen, verlaesst sich genau darauf; wo das
-    nicht gilt, ist die Entscheidung falsch am Platz.
+    UNIFORM ACROSS RANKS only insofar as the capture itself is -- and in
+    sglang it is: the graph runner records the same shapes in the same
+    order on every rank. Anyone using this function to make a COLLECTIVE
+    decision is relying on exactly that; where it doesn't hold, the
+    decision is misplaced.
 
-    Nie eine Ausnahme: ohne initialisiertes CUDA wirft
-    ``is_current_stream_capturing`` (``cudaErrorNoDevice``), und diese Frage
-    darf keinen Aufrufer umbringen, der sie nur vorsorglich stellt.
+    Never raises: without an initialized CUDA context,
+    ``is_current_stream_capturing`` throws (``cudaErrorNoDevice``), and this
+    question must never take down a caller who is only asking it as a
+    precaution.
     """
     try:
         if not torch.cuda.is_available() or not torch.cuda.is_initialized():
@@ -419,52 +434,52 @@ def graph_erfassung_laeuft() -> bool:
 
 
 def _transport_name(t) -> str:
-    """Der Name eines Transports fuer Fehlertexte, ohne je selbst zu werfen.
+    """The name of a transport for error messages, without ever raising itself.
 
-    ``name()`` ist die Zusage der Transport-Schnittstelle, aber ein Transport,
-    der gerade als Ursache einer Fehlermeldung benannt werden soll, ist der
-    letzte, dem man einen Aufruf zutrauen sollte.
+    ``name()`` is a promise of the transport interface, but a transport
+    that is currently being named as the CAUSE of an error message is the
+    last one that should be trusted with a call.
     """
     try:
         holen = getattr(t, "name", None)
         if callable(holen):
             return str(holen())
-    except Exception:  # noqa: BLE001 - ein Name darf nie der Grund sein
+    except Exception:  # noqa: BLE001 - a name must never itself be the cause
         pass
     return type(t).__name__
 
 
 def _gedeckte_ops(t) -> str:
-    """Die Operationen, die ``t`` ueberhaupt anbietet -- aus DER Quelle.
+    """The operations ``t`` actually offers -- straight from THE source.
 
-    Gelesen wird ``HTCCL_OPS`` des Transports selbst, nie eine im Fehlertext
-    mitgefuehrte Liste. Eine Liste im Text waere genau die Sorte Zusage, die
-    beim naechsten hinzugebauten Kollektiv veraltet, und dann sagt die
-    Meldung "es fehlt X", waehrend X laengst da ist und etwas anderes klemmt.
+    Reads ``HTCCL_OPS`` off the transport itself, never a list carried
+    along in the error text. A list in the text would be exactly the kind
+    of promise that goes stale the next time a collective is added, and
+    then the message says "X is missing" while X has long been present and
+    something else is actually stuck.
     """
     ops = getattr(t, "HTCCL_OPS", None)
     if not ops:
-        return "unbekannt (der Transport nennt kein HTCCL_OPS)"
+        return "unknown (the transport declares no HTCCL_OPS)"
     return ", ".join(sorted(str(o) for o in ops))
 
 
-def _zeilen_bytes(t: torch.Tensor) -> int:
-    """Bytes einer Zeile entlang Achse 0. Fuer 1-D ist das ein Element."""
+def _row_bytes(t: torch.Tensor) -> int:
+    """Bytes of one row along axis 0. For 1-D that's a single element."""
     n = 1
     for d in t.shape[1:]:
         n *= int(d)
     return n * t.element_size()
 
 
-def _gruppen_max(wert: int, cpu_group) -> int:
-    """Maximum ueber die Gruppe, auf der CPU.
+def _group_max(wert: int, cpu_group) -> int:
+    """Maximum across the group, on the CPU.
 
-    Nur fuer den Fall gedacht, dass der Aufrufer BEIDE Teilgroessenlisten
-    selbst mitbringt: dann kennt kein Rang die Bloecke der anderen Paare,
-    und die Schlitzentscheidung muss trotzdem rangeinheitlich ausfallen.
-    Ein int64 ueber gloo -- messbar teuer im Verhaeltnis zu einem
-    MoE-Dispatch, aber billiger als ein Haenger, und der gleichverteilte
-    Fall braucht es gar nicht.
+    Only meant for the case where the caller brings BOTH split-size lists
+    itself: then no rank knows the other pairs' blocks, and the slot
+    decision must still come out uniform across ranks. An int64 over gloo
+    -- measurably expensive relative to a MoE dispatch, but cheaper than a
+    hang, and the evenly-split case doesn't need it at all.
     """
     t = torch.tensor([int(wert)], dtype=torch.int64)
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=cpu_group)
@@ -486,17 +501,17 @@ class HTCCLCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
-        #: (Operation, Groessenklasse), fuer die der laute Rueckfallhinweis
-        #: schon heraus ist. Je Gruppe eigen, weil die Deckung je Gruppe
-        #: verschieden sein kann: tp und dcp bekommen verschieden grosse
-        #: Fenster, und was in der einen passt, muss in der anderen nicht.
+        #: (Operation, size class) pairs for which the loud fallback
+        #: notice has already gone out. Kept per group, because coverage
+        #: can differ per group: tp and dcp get differently sized windows,
+        #: and what fits in one doesn't have to fit in the other.
         self._rueckfall_gemeldet: set = set()
         self.transport = _build_transport(
             _TRANSPORT, cpu_group, device, disabled=self.disabled, gruppe=gruppe,
         )
-        #: Was diese Gruppe WIRKLICH faehrt -- nicht, was angefordert war.
-        #: Namenlos heisst: der Eintrag, den `_build_transport` gerade
-        #: angelegt hat, also der zuletzt eingefuegte.
+        #: What this group ACTUALLY runs on -- not what was requested.
+        #: Nameless means: the entry `_build_transport` just created, i.e.
+        #: the most recently inserted one.
         self.stand = (
             _STAND.get(gruppe, {}) if gruppe
             else (list(_STAND.values())[-1] if _STAND else {})
@@ -525,40 +540,39 @@ class HTCCLCommunicator:
         at every dispatch site, so op coverage can no longer differ silently
         between ops the way it did when each site hard-coded its own condition.
 
-        **Und genau hier faellt der Ausweichriegel.** Ein ``None`` heisst
-        "gloo-Ebene", und die gloo-Ebene ist host-gestaffelt: gepinnte
-        Allokation, ``dist.*`` auf der CPU, ``Event.synchronize()``. Innerhalb
-        einer CUDA-Graph-Aufzeichnung ist das entweder ein Abbruch mit einem
-        Fehler, der nach etwas ganz anderem aussieht -- oder, schlimmer, eine
-        CPU-Reduktion, die EINMAL zur Aufzeichnungszeit laeuft und bei jeder
-        Wiedergabe fehlt: falsche Zahlen ohne Absturz.
+        **And this is exactly where the fallback gate comes in.** A
+        ``None`` means "gloo layer", and the gloo layer is host-staged:
+        pinned allocation, ``dist.*`` on the CPU, ``Event.synchronize()``.
+        Inside a CUDA graph capture that is either an abort with an error
+        that looks like something else entirely -- or, worse, a CPU
+        reduction that runs ONCE at capture time and is missing on every
+        replay: wrong numbers with no crash.
 
-        Das ist kein hypothetischer Fall. Ein Transport wie ``bar1`` deckt
-        nicht jede Operation ab (``HTCCL_OPS`` in ``htccl_bar1.py``) und sagt
-        selbst zu einer gedeckten unterhalb von ``min_bytes``, bei
-        ``nbytes % 16 != 0`` oder oberhalb des abgebildeten Fensters ``False``.
-        Unter Aufzeichnung landete jeder dieser Faelle lautlos in der Schleife
-        weiter unten.
+        This is not a hypothetical case. A transport like ``bar1`` does not
+        cover every operation (``HTCCL_OPS`` in ``htccl_bar1.py``) and
+        itself answers ``False`` for a covered one below ``min_bytes``, at
+        ``nbytes % 16 != 0``, or above the mapped window. Under capture,
+        every one of these cases used to land silently in the loop further
+        below.
 
-        Deshalb: unter Aufzeichnung gibt es kein Ausweichen, sondern eine
-        Ansage mit Grund.
+        Hence: under capture there is no falling back, only an
+        announcement with a reason.
 
-        **Zwei Mechanismen, in dieser Reihenfolge.** Der #279-Pfad-Dispatcher
-        darf die Klassenwahl noch verfeinern, der Riegel huetet danach die
-        ENDGUELTIGE Wahl:
+        **Two mechanisms, in this order.** The #279 path dispatcher may
+        still refine the class choice; the gate then guards the FINAL
+        choice:
 
-        1. ``handles`` liefert die Klassenwahl (#240).
-        2. ``refine_transport_choice`` verfeinert sie (#279). Ohne gemessene
-           Raten ist jede Entscheidung Status quo, gibt also unveraendert
-           zurueck -- die Platzhalter-Neutralitaet, die
-           ``test_htccl_path_dispatcher.py`` festnagelt, bleibt exakt erhalten,
-           weil ausserhalb einer Aufzeichnung nach Schritt 2 nichts mehr
-           passiert.
-        3. Erst dann der Riegel. Die Reihenfolge ist nicht beliebig: ein
-           ``HINT_GLOO`` kann die Wahl auch dann noch auf ``None`` setzen, wenn
-           ``handles`` zugesagt hatte. Vor dem Dispatcher haette der Riegel
-           genau diesen einen Fall durchgelassen -- den einzigen, in dem eine
-           gemessene Entscheidung unter Aufzeichnung in die gloo-Ebene fuehrt.
+        1. ``handles`` supplies the class choice (#240).
+        2. ``refine_transport_choice`` refines it (#279). Without measured
+           rates every decision is status quo, i.e. it returns unchanged --
+           the placeholder-neutrality that ``test_htccl_path_dispatcher.py``
+           pins down remains exactly intact, because outside a capture
+           nothing further happens after step 2.
+        3. Only then the gate. The order is not arbitrary: a ``HINT_GLOO``
+           can still set the choice back to ``None`` even after ``handles``
+           had said yes. Before the dispatcher existed, the gate would have
+           let through exactly this one case -- the only one where a
+           measured decision leads into the gloo layer under capture.
         """
         t = self.transport
         chosen = t if (t is not None and t.handles(op, nbytes)) else None
@@ -571,31 +585,31 @@ class HTCCLCommunicator:
             )
 
             chosen = refine_transport_choice(dispatcher, op, nbytes, chosen)
-        if chosen is None and t is not None and not graph_erfassung_laeuft():
-            # DIE EHRLICHKEITSREGEL: Rueckfall ist in Ordnung, lautlos nicht.
+        if chosen is None and t is not None and not graph_capture_running():
+            # THE HONESTY RULE: falling back is fine, doing it silently is not.
             #
-            # Ausserhalb einer Aufzeichnung ist die gloo-Ebene ein gangbarer,
-            # nur langsamerer Weg -- deshalb bricht hier nichts ab. Aber ein
-            # Transport, der fuer eine Groesse aussteigt, waehrend das
-            # Protokoll "transport=bar1" sagt, entwertet jede Messung, die
-            # danach genommen wird. Genau das waere beim Prefill passiert:
-            # ab 2457 Token je Batch sagt bar1 zu all_reduce False, und mit
-            # `chunked_prefill_size` 4096 oder 8192 haette der Direktpfad
-            # dort ohne eine einzige Zeile ausgesetzt.
+            # Outside a capture, the gloo layer is a viable, just slower,
+            # path -- so nothing aborts here. But a transport that opts out
+            # for a given size while the log says "transport=bar1"
+            # invalidates any measurement taken afterwards. That is exactly
+            # what happened during prefill: from 2457 tokens per batch
+            # onward, bar1 answers False for all_reduce, and with a
+            # `chunked_prefill_size` of 4096 or 8192 the direct path would
+            # have quietly dropped out there without a single log line.
             #
-            # EINMAL je (Operation, Groessenklasse) und Gruppe, nicht je
-            # Aufruf: im heissen Pfad laufen dieselben Groessen tausendfach,
-            # und eine Warnung je Kollektiv waere ein Log-Sturm, den niemand
-            # liest. Die Groessenklasse ist der Zweierlogarithmus -- fein
-            # genug, dass eine neue Betriebsgroesse auffaellt, grob genug,
-            # dass Rauschen nicht jedes Mal eine neue Zeile erzeugt.
+            # Once per (operation, size class) and group, not per call: in
+            # the hot path the same sizes recur thousands of times, and a
+            # warning per collective would be a log storm nobody reads. The
+            # size class is the base-2 logarithm -- fine enough that a new
+            # operating size stands out, coarse enough that noise doesn't
+            # produce a new line every time.
             klasse = int(nbytes).bit_length()
             schluessel = (op, klasse)
-            # Traege angelegt, nicht vorausgesetzt: den Kommunikator gibt es
-            # auch als `__new__`-Attrappe (Tests, und der Pfad-Dispatcher
-            # baut sich einen), und ein Hinweis, der am fehlenden Merker
-            # stirbt, waere ein neuer Fehler an der Stelle, an der gerade
-            # einer geschlossen wird.
+            # Created lazily, not assumed to exist: the communicator also
+            # exists as a `__new__` stand-in (tests, and the path
+            # dispatcher builds itself one), and a warning that dies on the
+            # missing marker would be a new failure right at the point
+            # where one is currently being closed off.
             gemeldet = getattr(self, "_rueckfall_gemeldet", None)
             if gemeldet is None:
                 gemeldet = set()
@@ -603,53 +617,53 @@ class HTCCLCommunicator:
             if schluessel not in gemeldet:
                 gemeldet.add(schluessel)
                 grund = ""
-                warum = getattr(t, "warum_nicht", None)
+                warum = getattr(t, "why_not", None)
                 if callable(warum):
                     try:
                         grund = warum(op, nbytes) or ""
                     except Exception as e:      # noqa: BLE001
-                        grund = f"(Grund nicht ermittelbar: {e!r})"
+                        grund = f"(reason could not be determined: {e!r})"
                 logger.warning(
-                    "HTCCL[%s]: %s deckt %r mit %d Byte NICHT -- Rueckfall "
-                    "auf die host-gestaffelte Ebene. Gedeckt sind dort %s.%s "
-                    "Diese Meldung erscheint einmal je Operation und "
-                    "Groessenklasse; die Zahlen dieses Laufs sind fuer diese "
-                    "Groesse KEINE %s-Zahlen.",
+                    "HTCCL[%s]: %s does NOT cover %r at %d bytes -- falling "
+                    "back to the host-staged layer. Covered there: %s.%s "
+                    "This message appears once per operation and size "
+                    "class; this run's numbers for this size are NOT %s "
+                    "numbers.",
                     getattr(self, "gruppe", "?"), _transport_name(t), op,
                     nbytes, _gedeckte_ops(t),
-                    f" Grund: {grund}." if grund else "",
+                    f" Reason: {grund}." if grund else "",
                     _transport_name(t),
                 )
-        if chosen is None and graph_erfassung_laeuft():
-            # Der Riegel sitzt hinter dem Dispatcher, nicht davor: er huetet
-            # die ENDGUELTIGE Wahl. Ein ``HINT_GLOO`` kann `chosen` auch dann
-            # noch auf None setzen, wenn `handles` zugesagt hatte -- und genau
-            # dieser Fall waere sonst der eine, der unter Aufzeichnung
-            # ungeriegelt in die gloo-Ebene faellt.
+        if chosen is None and graph_capture_running():
+            # The gate sits behind the dispatcher, not in front of it: it
+            # guards the FINAL choice. A ``HINT_GLOO`` can still set
+            # `chosen` back to None even after `handles` had said yes --
+            # and this is exactly the one case that would otherwise fall
+            # through ungated into the gloo layer during capture.
             if t is None:
-                grund = "es ist ueberhaupt kein Transport aufgebaut"
+                grund = "no transport is built at all"
             elif t.handles(op, nbytes):
                 grund = (
-                    f"{_transport_name(t)} kann es, aber der Pfad-Dispatcher "
-                    f"hat auf die gloo-Ebene entschieden"
+                    f"{_transport_name(t)} can do it, but the path dispatcher "
+                    f"decided on the gloo layer"
                 )
             else:
                 grund = (
-                    f"{_transport_name(t)} meldet handles({op!r}, {nbytes}) "
-                    f"-> False; gedeckt sind dort {_gedeckte_ops(t)}"
+                    f"{_transport_name(t)} reports handles({op!r}, {nbytes}) "
+                    f"-> False; covered there: {_gedeckte_ops(t)}"
                 )
             raise RuntimeError(
-                f"HTCCL: {op!r} mit {nbytes} Byte waehrend einer "
-                f"CUDA-Graph-Aufzeichnung, aber {grund}. Der Ausweichweg ist "
-                f"die host-gestaffelte gloo-Ebene (gepinnte Allokation, "
-                f"dist.* auf der CPU, Event.synchronize()) -- die laeuft "
-                f"EINMAL beim Aufzeichnen und bei keiner Wiedergabe wieder. "
-                f"Das gaebe falsche Zahlen ohne Absturz, also bricht es hier "
-                f"ab. Abhilfe: --disable-cuda-graph, oder einen Transport "
-                f"waehlen, der diese Operation in dieser Groesse wirklich "
-                f"fahren kann (SGLANG_HTCCL_TRANSPORT=device deckt "
-                f"all_reduce/all_gather/reduce_scatter/broadcast lueckenlos "
-                f"ab)."
+                f"HTCCL: {op!r} with {nbytes} bytes during a CUDA graph "
+                f"capture, but {grund}. The fallback path is the "
+                f"host-staged gloo layer (pinned allocation, dist.* on the "
+                f"CPU, Event.synchronize()) -- which runs ONCE at capture "
+                f"time and not at all on replay. That would produce wrong "
+                f"numbers without a crash, so this aborts instead. Fix: "
+                f"--disable-cuda-graph, or choose a transport that can "
+                f"genuinely run this operation at this size "
+                f"(SGLANG_HTCCL_TRANSPORT=device covers "
+                f"all_reduce/all_gather/reduce_scatter/broadcast "
+                f"completely)."
             )
         return chosen
 
@@ -867,42 +881,41 @@ class HTCCLCommunicator:
     # ------------------------------------------------------------------
     # all_to_all_single
     #
-    # WER DAS WIRKLICH RUFT -- nachgesehen, nicht angenommen:
+    # WHO ACTUALLY CALLS THIS -- checked, not assumed:
     #
     # * `GroupCoordinator.all_to_all_single(output, input)`
-    #   (parallel_state.py:1199 -> :1196) ist die EINZIGE
-    #   torch.distributed-a2a-Stelle im ganzen srt-Baum. Sie ist
-    #   ausser-Ort, gleichverteilt, ohne Teilgroessen, ohne
-    #   scatter/gather-Achse -- und sie hat heute keinen Aufrufer
-    #   (Upstream-Oberflaeche aus #27492).
-    # * Die MoE-Token-Dispatcher rufen NICHT hierher. deepep.py:578
+    #   (parallel_state.py:1199 -> :1196) is the ONLY torch.distributed a2a
+    #   call site in the whole srt tree. It is out-of-place, evenly split,
+    #   with no split sizes and no scatter/gather axis -- and today it has
+    #   no caller (upstream surface from #27492).
+    # * The MoE token dispatchers do NOT call in here. deepep.py:578
     #   `buffer.dispatch(...)`, mooncake.py:236, nixl.py:293, moriep.py:724
-    #   und flashinfer.py:259 `moe_a2a.dispatch(...)` gehen an
-    #   torch.distributed vorbei in ihre eigenen Bibliotheken. Deren
-    #   Semantik ist aber genau die ungleich geteilte: sie reichen
-    #   `num_tokens_per_rank`/`num_tokens_per_expert` herein, weil die Zahl
-    #   der Token je Experte schwankt.
+    #   and flashinfer.py:259 `moe_a2a.dispatch(...)` bypass
+    #   torch.distributed and go straight to their own libraries. Their
+    #   semantics are, however, precisely the unevenly split kind: they
+    #   pass in `num_tokens_per_rank`/`num_tokens_per_expert`, because the
+    #   token count per expert varies.
     #
-    # Daraus folgt die Signatur hier: die von `torch.distributed.
-    # all_to_all_single`, also die gleichverteilte Form des einzigen echten
-    # Aufrufers PLUS die Teilgroessen, ohne die MoE nicht abbildbar waere.
-    # Geraten ist daran nichts -- die gleichverteilte Form ist ein
-    # Sonderfall (beide Listen None) und laeuft denselben Weg.
+    # From this follows the signature here: that of `torch.distributed.
+    # all_to_all_single`, i.e. the evenly-split form used by the one real
+    # caller, PLUS the split sizes, without which MoE could not be
+    # represented. Nothing here is guessed -- the evenly-split form is a
+    # special case (both lists None) and takes the same path.
     # ------------------------------------------------------------------
 
     def all_to_all_zaehlwerte(self, input_split_sizes) -> list[list[int]]:
-        """Die volle R x R Zaehlwertmatrix aus den eigenen Sendezahlen.
+        """The full R x R count matrix, from each rank's own send counts.
 
-        ``matrix[i][j]`` = was Rang i an Rang j schickt. Ein
-        ``all_gather_object`` ueber die CPU-Gruppe -- genau der Schritt, den
-        DeepEP vor dem Dispatch macht (``get_dispatch_layout`` ->
-        ``num_tokens_per_rank``), und aus demselben Grund: der Empfaenger
-        kann seine Puffergroesse nicht kennen, bevor der Sender gezaehlt hat.
+        ``matrix[i][j]`` = what rank i sends to rank j. An
+        ``all_gather_object`` over the CPU group -- exactly the step DeepEP
+        takes before dispatch (``get_dispatch_layout`` ->
+        ``num_tokens_per_rank``), and for the same reason: the receiver
+        cannot know its buffer size before the sender has counted.
 
-        Das ist ein **Host-Kollektiv**. Es steht vor dem Datenpfad, nicht
-        darin, und es ist der Grund, warum der ungleich geteilte Fall nicht
-        CUDA-Graph-faehig ist. Der gleichverteilte Fall braucht ihn nicht
-        und ist es deshalb.
+        This is a **host collective**. It sits in front of the data path,
+        not inside it, and it is the reason the unevenly split case is not
+        CUDA-graph-capable. The evenly-split case doesn't need it, and is
+        capturable precisely because of that.
         """
         matrix: list = [None] * self.world_size
         dist.all_gather_object(
@@ -917,63 +930,63 @@ class HTCCLCommunicator:
         output_split_sizes=None,
         input_split_sizes=None,
     ) -> torch.Tensor:
-        """``torch.distributed.all_to_all_single`` ueber HTCCL.
+        """``torch.distributed.all_to_all_single`` over HTCCL.
 
-        Teilt ``input_`` entlang Achse 0 in ``world_size`` Bloecke, schickt
-        Block j an Rang j und legt die empfangenen Bloecke in derselben
-        Reihenfolge in ``output`` ab. ``output`` wird beschrieben und
-        zurueckgegeben.
+        Splits ``input_`` along axis 0 into ``world_size`` blocks, sends
+        block j to rank j, and places the received blocks into ``output``
+        in the same order. ``output`` is written in place and returned.
 
-        ``*_split_sizes`` sind **Zeilenzahlen**, nicht Bytes -- wie bei
-        torch. ``None`` heisst gleichverteilt. Ist nur
-        ``input_split_sizes`` gegeben, werden die Empfangszahlen ueber
-        :meth:`all_to_all_zaehlwerte` beschafft; ``output`` muss dann
-        bereits gross genug sein.
+        ``*_split_sizes`` are **row counts**, not bytes -- same as in
+        torch. ``None`` means evenly split. If only ``input_split_sizes``
+        is given, the receive counts are obtained via
+        :meth:`all_to_all_zaehlwerte`; ``output`` must already be large
+        enough in that case.
         """
         if self.disabled:
             output.copy_(input_)
             return output
         inp = input_.contiguous()
         if inp.dim() == 0 or output.dim() == 0:
-            raise ValueError("all_to_all_single braucht mindestens eine Achse")
+            raise ValueError("all_to_all_single requires at least one axis")
 
         zeile_elems = 1
         for d in inp.shape[1:]:
             zeile_elems *= int(d)
         zeile_bytes = zeile_elems * inp.element_size()
-        if zeile_bytes != _zeilen_bytes(output):
+        if zeile_bytes != _row_bytes(output):
             raise ValueError(
-                f"all_to_all_single: Zeilenbreite passt nicht -- Eingabe "
-                f"{zeile_bytes} Byte, Ausgabe {_zeilen_bytes(output)} Byte. "
-                f"Nur Achse 0 wird geteilt."
+                f"all_to_all_single: row width mismatch -- input "
+                f"{zeile_bytes} bytes, output {_row_bytes(output)} bytes. "
+                f"Only axis 0 is split."
             )
 
         w = self.world_size
-        # Die Zaehlwerte. Reihenfolge: erst besorgen, was der RUECKFALL auch
-        # braucht -- sonst haengt an der Transportwahl, ob ein Kollektiv
-        # laeuft, und das ist genau die Sorte Rangabhaengigkeit, die haengt.
+        # The counts. Order: fetch what the FALLBACK also needs first --
+        # otherwise whether a collective runs at all would hinge on the
+        # transport choice, and that is exactly the kind of rank dependency
+        # that hangs.
         matrix = None
         if input_split_sizes is None:
             if inp.shape[0] % w:
                 raise ValueError(
-                    f"all_to_all_single ohne input_split_sizes braucht eine "
-                    f"durch {w} teilbare Achse 0, hat aber {inp.shape[0]}."
+                    f"all_to_all_single without input_split_sizes requires "
+                    f"an axis 0 divisible by {w}, but got {inp.shape[0]}."
                 )
             ein = [inp.shape[0] // w] * w
         else:
             ein = [int(x) for x in input_split_sizes]
             if len(ein) != w or sum(ein) != inp.shape[0]:
                 raise ValueError(
-                    f"input_split_sizes {ein} passt nicht zu Achse 0 = "
-                    f"{inp.shape[0]} bei {w} Raengen."
+                    f"input_split_sizes {ein} does not match axis 0 = "
+                    f"{inp.shape[0]} for {w} ranks."
                 )
         if output_split_sizes is None:
             if input_split_sizes is None:
                 if output.shape[0] % w:
                     raise ValueError(
-                        f"all_to_all_single ohne output_split_sizes braucht "
-                        f"eine durch {w} teilbare Achse 0 der Ausgabe, hat "
-                        f"aber {output.shape[0]}."
+                        f"all_to_all_single without output_split_sizes "
+                        f"requires an axis 0 of the output divisible by "
+                        f"{w}, but got {output.shape[0]}."
                     )
                 aus = [output.shape[0] // w] * w
             else:
@@ -982,11 +995,11 @@ class HTCCLCommunicator:
         else:
             aus = [int(x) for x in output_split_sizes]
             if len(aus) != w:
-                raise ValueError(f"output_split_sizes hat Laenge {len(aus)}")
+                raise ValueError(f"output_split_sizes has length {len(aus)}")
         if sum(aus) > output.shape[0]:
             raise ValueError(
-                f"Ausgabe traegt {output.shape[0]} Zeilen, empfangen werden "
-                f"aber {sum(aus)}."
+                f"output holds {output.shape[0]} rows, but {sum(aus)} "
+                f"are being received."
             )
 
         sende = [n * zeile_bytes for n in ein]
@@ -995,49 +1008,48 @@ class HTCCLCommunicator:
 
         t = self._select("all_to_all", nbytes)
         if t is not None and not (
-            hasattr(t, "htccl_all_to_all_single") and hasattr(t, "traegt_a2a")
+            hasattr(t, "htccl_all_to_all_single") and hasattr(t, "supports_a2a")
         ):
-            # handles() hat zugesagt, aber die Methoden fehlen. Das ist ein
-            # Fehler IM TRANSPORT und kein Laufzeitzustand: er faellt auf
-            # jedem Rang gleich aus, weil die Klasse rangeinheitlich ist.
-            # Also ist der Rueckfall sicher -- und die Warnung nennt den
-            # Schuldigen, statt ihn im Rueckfall verschwinden zu lassen.
+            # handles() said yes, but the methods are missing. That is a
+            # bug IN THE TRANSPORT, not a runtime condition: it fails the
+            # same way on every rank, because the class is uniform across
+            # ranks. So the fallback is safe -- and the warning names the
+            # culprit instead of letting it disappear into the fallback.
             logger.warning(
-                "HTCCL: Transport %s sagt handles('all_to_all') zu, hat aber "
-                "keine htccl_all_to_all_single/traegt_a2a. Es laeuft die "
-                "CPU-Ebene.", type(t).__name__,
+                "HTCCL: transport %s reports handles('all_to_all') as yes, "
+                "but has no htccl_all_to_all_single/supports_a2a. Running "
+                "the CPU layer.", type(t).__name__,
             )
             t = None
         if t is not None:
-            # Die genaue Schlitzpruefung braucht den groessten Block ueber
-            # ALLE Paare, nicht ueber die eigene Zeile -- sonst koennte ein
-            # Rang zusagen und ein anderer absagen, und daraus wird ein
-            # Haenger statt eines Fehlers. Gleichverteilt ist das Maximum auf
-            # jedem Rang dieselbe Zahl und es braucht kein Kollektiv; sonst
-            # kommt es aus der Zaehlwertmatrix oder, wenn der Aufrufer beide
-            # Listen selbst mitgebracht hat, aus einem Maximum ueber die
-            # Gruppe.
+            # The exact slot check needs the largest block across ALL
+            # pairs, not just this rank's own row -- otherwise one rank
+            # could say yes and another no, turning this into a hang
+            # instead of an error. When evenly split, the maximum is the
+            # same number on every rank and needs no collective;
+            # otherwise it comes from the count matrix, or, if the caller
+            # brought both lists itself, from a maximum across the group.
             if input_split_sizes is None and output_split_sizes is None:
                 groesster = max(sende + empf)
             elif matrix is not None:
                 groesster = max(max(z) for z in matrix) * zeile_bytes
             else:
-                groesster = _gruppen_max(
+                groesster = _group_max(
                     max(sende + empf), self.cpu_group
                 )
-            if t.traegt_a2a(groesster):
-                # Die Rundenzahl faellt aus dem GRUPPENWEIT groessten Block,
-                # den wir gerade ausgerechnet haben -- nicht aus der eigenen
-                # Zeile, die je Rang anders ist. Ein Transport ohne diese
-                # Auskunft faehrt wie bisher eine Runde.
-                holen = getattr(t, "a2a_runden_fuer", None)
+            if t.supports_a2a(groesster):
+                # The round count follows from the GROUP-WIDE largest
+                # block we just computed -- not from this rank's own row,
+                # which differs per rank. A transport without this
+                # information runs a single round, as before.
+                holen = getattr(t, "a2a_rounds_for", None)
                 runden = holen(groesster) if callable(holen) else None
                 return t.htccl_all_to_all_single(
                     self, output, inp, sende, empf, runden=runden
                 )
 
-        # Rueckfall: dieselbe Zerlegung ueber die CPU-Gruppe. Gepinnt, damit
-        # die beiden Kopien nicht ueber einen pageable-Zwischenpuffer laufen.
+        # Fallback: the same decomposition over the CPU group. Pinned, so
+        # the two copies don't go through a pageable intermediate buffer.
         host_in = torch.empty(inp.shape, dtype=inp.dtype, pin_memory=True)
         host_in.copy_(inp, non_blocking=False)
         host_out = torch.empty(
@@ -1052,11 +1064,10 @@ class HTCCLCommunicator:
             )
         except (RuntimeError, NotImplementedError) as e:
             raise NotImplementedError(
-                f"all_to_all_single: weder der BAR1-Direktpfad noch die "
-                f"CPU-Ebene der Gruppe koennen diesen Aufruf fahren ({e}). "
-                f"Kein stiller Rueckfall auf NCCL: auf einer Gruppe ueber "
-                f"zwei Hersteller ist das kein langsamerer Weg, sondern ein "
-                f"Haenger."
+                f"all_to_all_single: neither the BAR1 direct path nor the "
+                f"group's CPU layer can run this call ({e}). No silent "
+                f"fallback to NCCL: on a group spanning two vendors, that "
+                f"is not a slower path, it is a hang."
             ) from e
         output[: sum(aus)].copy_(host_out, non_blocking=False)
         return output
