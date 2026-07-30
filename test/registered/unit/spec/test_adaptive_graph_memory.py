@@ -133,6 +133,7 @@ def _offload_init(self, mode="offload"):
     self._swap_ordinal = 0
     self.last_swap_ms = None
     self._tp_cpu_group = None
+    self._server_args = None
     self._adapter = FakeAdapter()
     agm._ACTIVE_MANAGER = self
 
@@ -759,6 +760,52 @@ class TestStage2IntWorkspaceTagging(unittest.TestCase):
         with _mock_cuda(free_bytes=(100 + 512 + 1) << 20):
             mgr.finalize_boot(initial_steps=3)
 
+    def test_reserve_error_names_the_derived_demand_as_a_suggestion(self):
+        """#313: the shortfall alone leaves the operator guessing which
+        number to raise; the error also carries what the sizing path would
+        derive for this rank."""
+        mgr = _offload_manager()
+        mgr._server_args = SimpleNamespace(
+            ladder_reserve_boot_suggestion=lambda shortfall, tp_rank: (
+                f"SUGGESTION shortfall={shortfall} rank={tp_rank}"
+            )
+        )
+        n = agm.MIN_TAGGED_BYTES // 4
+        with _mock_cuda():
+            with mgr.build_state(2):
+                with agm.tagged_state_alloc(nbytes=n * 4):
+                    t = torch.zeros(n, dtype=torch.int32)
+                agm.note_state_tensor(t)
+            mgr.pause_after_build(2)
+        mgr._states["adaptive_state_k2"].paused_bytes = 918 << 20
+        # The 2026-07-30 constellation: 1376 MiB free against 918 + 512.
+        with _mock_cuda(free_bytes=1376 << 20):
+            with self.assertRaises(RuntimeError) as ctx:
+                mgr.finalize_boot(initial_steps=3)
+        msg = str(ctx.exception)
+        self.assertIn("at least 54 MiB", msg)
+        self.assertIn("SUGGESTION shortfall=54", msg)
+
+    def test_reserve_error_survives_a_broken_suggestion(self):
+        """A diagnostic must never replace the error it decorates."""
+        mgr = _offload_manager()
+
+        def _boom(shortfall, tp_rank):
+            raise RuntimeError("no NVML here")
+
+        mgr._server_args = SimpleNamespace(ladder_reserve_boot_suggestion=_boom)
+        n = agm.MIN_TAGGED_BYTES // 4
+        with _mock_cuda():
+            with mgr.build_state(2):
+                with agm.tagged_state_alloc(nbytes=n * 4):
+                    t = torch.zeros(n, dtype=torch.int32)
+                agm.note_state_tensor(t)
+            mgr.pause_after_build(2)
+        mgr._states["adaptive_state_k2"].paused_bytes = 918 << 20
+        with _mock_cuda(free_bytes=1376 << 20):
+            with self.assertRaisesRegex(RuntimeError, "serving transient margin"):
+                mgr.finalize_boot(initial_steps=3)
+
     def test_small_int_workspace_stays_resident(self):
         tag_fn = self._helper()
         mgr = _offload_manager()
@@ -912,6 +959,120 @@ class TestHighAcceptProfile(unittest.TestCase):
         for _ in range(60):
             slot.update([2.6])
         self.assertEqual(slot.current_steps, 3)
+
+
+class TestLadderReserveDemand(unittest.TestCase):
+    """#313: the ladder names its own reserve posts.
+
+    The consumer is the sizing path (--rank-auto-reserve-mib auto); the
+    wiring itself is covered in test_uneven_tp_args.py. Here only the model:
+    which rungs are charged, how they reduce, and what the ledger says.
+    """
+
+    def _args(self, **overrides):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        kwargs = dict(
+            model_path="dummy",
+            tp_size=3,
+            speculative_algorithm="NEXTN",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_adaptive=True,
+            speculative_adaptive_config="high-accept",
+        )
+        kwargs.update(overrides)
+        args = ServerArgs(**kwargs)
+        args.cuda_graph_config = default_cuda_graph_config()
+        args._apply_gpu_mem_capacity_defaults(32768.0)
+        return args
+
+    def test_no_ladder_no_demand(self):
+        self.assertIsNone(
+            agm.estimate_ladder_reserve_demand(
+                self._args(speculative_adaptive=False, speculative_adaptive_config=None)
+            )
+        )
+
+    def test_single_rung_ladder_has_nothing_beyond_the_boot_rung(self):
+        # A ladder whose only rung is the boot rung builds no extra state,
+        # so it costs nothing beyond what the base capture term charges.
+        args = self._args(speculative_adaptive_config=None, speculative_num_steps=1)
+        with mock.patch(
+            "sglang.srt.speculative.adaptive_spec_params."
+            "resolve_candidate_steps_from_config",
+            return_value=[1],
+        ):
+            self.assertIsNone(agm.estimate_ladder_reserve_demand(args))
+
+    def test_posts_cover_every_built_rung_and_skip_the_boot_rung(self):
+        demand = agm.estimate_ladder_reserve_demand(self._args())
+        self.assertEqual([p.rung for p in demand.posts], [1, 2, 4, 5])
+        self.assertEqual(demand.boot_rung, 3)
+        # Each rung: the private flashinfer workspace (384 MiB default) plus
+        # its captured tokens at the #68 coefficient (decode max_bs 24 x
+        # (k + 1) draft tokens x 2 MiB; NEXTN captures target-verify only).
+        self.assertEqual(
+            [(p.workspace_mib, p.capture_mib) for p in demand.posts],
+            [(384, 96), (384, 144), (384, 240), (384, 288)],
+        )
+
+    def test_offload_rule_is_peak_rung_plus_margin(self):
+        demand = agm.estimate_ladder_reserve_demand(self._args())
+        self.assertEqual(demand.peak.rung, 5)
+        self.assertEqual(demand.peak.total_mib, 672)
+        self.assertEqual(demand.margin_mib, 512)
+        self.assertEqual(demand.total_mib, 672 + 512)
+
+    def test_resident_rule_is_the_sum_of_the_rungs(self):
+        demand = agm.estimate_ladder_reserve_demand(
+            self._args(speculative_adaptive_graph_memory="resident")
+        )
+        self.assertTrue(demand.resident)
+        # Every rung stays materialized, and the boot-time margin check that
+        # only the offload path runs does not apply.
+        self.assertEqual(demand.margin_mib, 0)
+        self.assertEqual(demand.total_mib, sum(p.total_mib for p in demand.posts))
+        self.assertEqual(demand.total_mib, 480 + 528 + 624 + 672)
+
+    def test_colocated_ranks_scale_only_the_capture_posts(self):
+        args = self._args()
+        one = agm.estimate_ladder_reserve_demand(args, colocated_ranks=1)
+        two = agm.estimate_ladder_reserve_demand(args, colocated_ranks=2)
+        self.assertEqual(two.peak.workspace_mib, one.peak.workspace_mib)
+        self.assertEqual(two.peak.capture_mib, 2 * one.peak.capture_mib)
+
+    def test_deterministic_inference_raises_the_workspace_post(self):
+        # The flashinfer backend sets the workspace to 2 GiB at backend init,
+        # long after this estimate runs; mirroring the rule here keeps the
+        # reserve from missing 1.6 GiB per rung.
+        demand = agm.estimate_ladder_reserve_demand(
+            self._args(enable_deterministic_inference=True)
+        )
+        self.assertEqual(demand.peak.workspace_mib, 2048)
+
+    def test_no_decode_graph_means_no_capture_post(self):
+        args = self._args(disable_cuda_graph=True)
+        demand = agm.estimate_ladder_reserve_demand(args)
+        self.assertEqual([p.capture_mib for p in demand.posts], [0, 0, 0, 0])
+        # The per-rung workspaces are allocated regardless of graph capture.
+        self.assertEqual(demand.total_mib, 384 + 512)
+
+    def test_ledger_names_every_post(self):
+        ledger = agm.estimate_ladder_reserve_demand(self._args()).ledger()
+        for fragment in (
+            "+1184 MiB",
+            "peak built rung k5 = 672 MiB",
+            "flashinfer workspace 384",
+            "graph capture 288",
+            "k1=480",
+            "serving margin 512 MiB",
+            "boot rung k3 is already charged",
+        ):
+            self.assertIn(fragment, ledger)
 
 
 if __name__ == "__main__":

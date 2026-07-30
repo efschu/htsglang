@@ -201,15 +201,30 @@ post-map free memory OOMing at a 24k deep prefill and 1367 MiB surviving.
 
 T102 GPU validation (rig: 5090 + 2x3080, Qwen3.6-27B-FP8 NEXTN TP=3
 uneven): per-state untagged residue 1.0-1.5 GB -> 0.18-0.22 GB (pauseable
-k5 footprint 960 MiB = scratch 424 + int-ws 184 + capture pool 352); the
-high-accept [1..5] profile boots at the STANDARD reserve with KV capacity
-identical to the static/default-set number (261120 vs 38848 at +2400 MiB
-reserve before); ~2315 forced swaps/rank with per-swap TP rank-sync
-asserts clean; 9/9 byte-identity vs Stage-1 offload at matched KV/DCP
-geometry, vs the pre-Stage-2 default-set artifact, and for the untouched
-adaptive-OFF path. Swap latency: organic avg 40-51 ms, max 85 ms (vs
-14 ms Stage-1 -- the price of remapping+zeroing ~1 GB per swap; ~0.5%
-overhead at the 0.1/s organic swap rate).
+k5 footprint 960 MiB = scratch 424 + int-ws 184 + capture pool 352); in
+THAT geometry (this rig, NEXTN TP=3 uneven, TP-SPLIT draft, the default
+KV vector) the high-accept [1..5] profile boots at the standard reserve
+with KV capacity identical to the static/default-set number (261120 vs
+38848 at +2400 MiB reserve before); ~2315 forced swaps/rank with TP
+rank-sync asserts clean; 9/9 byte-identity vs Stage-1 offload at matched
+KV/DCP geometry, vs the pre-Stage-2 default-set artifact, and for the
+untouched adaptive-OFF path. Swap latency: organic avg 40-51 ms, max
+85 ms (vs 14 ms Stage-1 -- the price of remapping+zeroing ~1 GB per swap;
+~0.5% overhead at the 0.1/s organic swap rate).
+
+"Boots at the standard reserve" is a statement about that geometry, not a
+property of the profile. The 2026-07-30 #707 window falsified it for
+KV 7,3,3 + ``--chunked-prefill-size 2048`` +
+``--speculative-draft-placement solo`` on rank 0: the same [1..5] profile
+missed this check by 54 MiB at the standard bar1_hi reserve (1376 MiB free
+vs 918 MiB adaptive_state_k5 + 512 MiB margin) and wanted ~700 MiB more on
+the rank holding the solo draft. Two terms that geometry adds and the T102
+one does not: the solo rank carries the UNSHARDED draft plus every
+draft-family graph set of every rung, and a 7,3,3 KV vector concentrates
+the pool on that same rank. The reserve a ladder needs is therefore
+per-geometry and is now DERIVED rather than assumed -- see
+``estimate_ladder_reserve_demand`` below, which ``--rank-auto-reserve-mib
+auto`` charges to the GPU hosting the solo draft rank.
 
 Modes
 -----
@@ -233,6 +248,7 @@ Modes
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -379,6 +395,176 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
     return "offload"
 
 
+# ----------------------------------------------------------------------
+# Reserve demand of the ladder itself (#313)
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LadderRungPost:
+    """Estimated pauseable VRAM of ONE ladder rung, itemized.
+
+    The two items are the only ones an operator-visible constant already
+    covers, and they are the two that dominate the measured decomposition
+    (T102, k5: scratch 424 MiB of which 384 is the workspace, int-ws 184,
+    capture pool 352):
+
+    * ``workspace_mib`` -- the rung's PRIVATE flashinfer float workspace
+      (``init_new_workspace=True``), sized by
+      ``SGLANG_FLASHINFER_WORKSPACE_SIZE``. One per rung: the draft and
+      target backends of a rung share the registered buffer.
+    * ``capture_mib`` -- the rung's captured tokens at the #68 coefficient
+      of 2 MiB per captured token, i.e. the same graph-memory model
+      ``derived_rank_auto_reserve_mib`` charges for the boot rung, applied
+      at this rung's draft-token width.
+
+    NOT itemized, deliberately: the per-rung int workspaces (8 MiB per
+    (backend, role, wrapper-slot), a count that only exists once the
+    backends are built) and the kv_indices / custom_mask buffers. Adding
+    them would mean reverse-engineering constants from two measurements,
+    which is the defect ``pinned_reserve_shortfall_note`` exists to expose.
+    The estimate is therefore a FLOOR of the true rung footprint; what
+    lifts the total over the observed need is the serving margin, which is
+    charged once on top (see LadderReserveDemand).
+    """
+
+    rung: int
+    workspace_mib: int
+    capture_mib: int
+
+    @property
+    def total_mib(self) -> int:
+        return self.workspace_mib + self.capture_mib
+
+
+@dataclass(frozen=True)
+class LadderReserveDemand:
+    """What the adaptive ladder itself needs on top of the boot rung.
+
+    ``posts`` covers the rungs the controller BUILDS, i.e. the candidate
+    set minus the boot rung: the boot rung's graph set is the statically
+    registered one that ``derived_rank_auto_reserve_mib`` already charges
+    through its captured-token term, so charging it again here would
+    double-count it.
+
+    The reduction rule follows the mode's reserve rule (see the module
+    docstring): offload maps at most ONE built rung at a time and
+    ``finalize_boot`` additionally demands the serving margin on top of it,
+    so the demand is max(rung) + margin; resident keeps every built rung
+    materialized, so it is the sum and there is no boot-time margin check.
+    """
+
+    posts: tuple
+    boot_rung: int
+    margin_mib: int
+    resident: bool
+
+    @property
+    def peak(self) -> Optional[LadderRungPost]:
+        return max(self.posts, key=lambda p: p.total_mib) if self.posts else None
+
+    @property
+    def total_mib(self) -> int:
+        if not self.posts:
+            return 0
+        if self.resident:
+            return sum(p.total_mib for p in self.posts) + self.margin_mib
+        peak = self.peak
+        return peak.total_mib + self.margin_mib
+
+    def ledger(self) -> str:
+        """One-line itemization, #260 style: every post named with its
+        number, so the log says WHY the reserve grew and by how much."""
+        if not self.posts:
+            return "adaptive ladder: no rung beyond the boot rung, +0 MiB"
+        rungs = ", ".join(f"k{p.rung}={p.total_mib}" for p in self.posts)
+        if self.resident:
+            body = (
+                f"sum of all built rungs ({rungs}) "
+                f"= {sum(p.total_mib for p in self.posts)} MiB"
+            )
+        else:
+            peak = self.peak
+            body = (
+                f"peak built rung k{peak.rung} = {peak.total_mib} MiB "
+                f"(flashinfer workspace {peak.workspace_mib} + graph capture "
+                f"{peak.capture_mib}); other built rungs {rungs}"
+            )
+        return (
+            f"adaptive ladder: +{self.total_mib} MiB = {body} + serving "
+            f"margin {self.margin_mib} MiB "
+            f"(SGLANG_ADAPTIVE_SERVING_MARGIN_MIB); boot rung k{self.boot_rung} "
+            "is already charged by the captured-token term"
+        )
+
+
+def estimate_ladder_reserve_demand(
+    server_args: ServerArgs, colocated_ranks: int = 1
+) -> Optional[LadderReserveDemand]:
+    """The ladder's own reserve demand, or None when there is no ladder.
+
+    Called from the sizing path (``--rank-auto-reserve-mib auto``, #68)
+    BEFORE any GPU work, so it may only read server args and environment --
+    the same constraint ``resolve_adaptive_graph_memory_mode`` runs under.
+
+    The mode is read from the REQUESTED flag rather than resolved: the
+    resolution depends on args that are still unset this early (the
+    attention backend most of all), and reading it here would make the
+    reserve depend on argument-handler ordering. 'auto' is modelled as
+    offload, the mode it reaches whenever its prerequisites hold; a boot
+    that degrades to resident gets a demand that UNDERSTATES the sum rule,
+    which is the pre-#313 situation (ladder charged nothing at all) and
+    never a regression against it.
+    """
+    if not getattr(server_args, "speculative_adaptive", False):
+        return None
+    from sglang.srt.speculative.adaptive_spec_params import (
+        adaptive_algorithm_key,
+        resolve_candidate_steps_from_config,
+    )
+
+    rungs = resolve_candidate_steps_from_config(
+        cfg_path=server_args.speculative_adaptive_config,
+        algorithm=adaptive_algorithm_key(server_args),
+    )
+    boot_rung = int(server_args.speculative_num_steps or 0)
+    built = [k for k in rungs if k != boot_rung]
+    if not built:
+        return None
+
+    from sglang.srt.environ import envs
+
+    workspace_mib = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() >> 20
+    if getattr(server_args, "enable_deterministic_inference", False):
+        # The flashinfer backend raises the workspace to 2 GiB for
+        # deterministic inference (it calls envs...set() at backend init,
+        # i.e. long after this estimate); mirror the same rule here so the
+        # reserve does not silently miss 1.6 GiB per rung.
+        workspace_mib = max(workspace_mib, 2048)
+    posts = tuple(
+        LadderRungPost(
+            rung=k,
+            workspace_mib=workspace_mib,
+            capture_mib=(
+                server_args.speculative_capture_tokens(num_draft_tokens=k + 1)
+                * 2
+                * colocated_ranks
+            ),
+        )
+        for k in built
+    )
+    resident = (
+        getattr(server_args, "speculative_adaptive_graph_memory", "auto") == "resident"
+    )
+    margin_mib = 0 if resident else envs.SGLANG_ADAPTIVE_SERVING_MARGIN_MIB.get()
+    return LadderReserveDemand(
+        posts=posts,
+        boot_rung=boot_rung,
+        margin_mib=margin_mib,
+        resident=resident,
+    )
+
+
 @dataclass
 class _StateRecord:
     tag: str
@@ -440,9 +626,12 @@ class AdaptiveGraphMemoryManager:
     is a pure pointer swap in the worker).
     """
 
-    def __init__(self, mode: str, tp_cpu_group=None):
+    def __init__(self, mode: str, tp_cpu_group=None, server_args=None):
         assert mode in ("resident",) + OFFLOAD_MODES, mode
         self.mode = mode
+        # Optional, diagnostics only: lets the boot reserve check name the
+        # DERIVED demand for this rank instead of only the shortfall (#313).
+        self._server_args = server_args
         self._states: dict[str, _StateRecord] = {}
         self._pools: dict[str, "torch.cuda.MemPool"] = {}
         # Stage 2: per-tag PRIVATE cuda-graph capture pools (graph_pool_handle
@@ -756,6 +945,9 @@ class AdaptiveGraphMemoryManager:
 
         margin_bytes = envs.SGLANG_ADAPTIVE_SERVING_MARGIN_MIB.get() << 20
         if free_bytes < max_bytes + margin_bytes:
+            shortfall_mib = int(
+                math.ceil((max_bytes + margin_bytes - free_bytes) / (1 << 20))
+            )
             raise RuntimeError(
                 "Adaptive graph memory offload: free device memory with all "
                 f"candidate states paused ({free_bytes / (1 << 20):.0f} MiB) "
@@ -767,14 +959,36 @@ class AdaptiveGraphMemoryManager:
                 f"{max(0, free_bytes - max_bytes) / (1 << 20):.0f} MiB for "
                 "eager-forward transients -> late runtime OOM instead of "
                 "this early error. Increase the graph/KV reserve by at least "
-                f"{(max_bytes + margin_bytes - free_bytes) / (1 << 20):.0f} "
-                "MiB, shrink the candidate set, or use "
+                f"{shortfall_mib} MiB, shrink the candidate set, or use "
                 "--speculative-adaptive-graph-memory resident."
+                + self._reserve_suggestion(shortfall_mib)
             )
         self._finalized = True
         # Map the initial state (a registered baseline has no tag and needs
         # no resume; a BUILT initial state does).
         self.ensure_active(initial_steps)
+
+    def _reserve_suggestion(self, shortfall_mib: int) -> str:
+        """Trailing sentence for the boot reserve error that names the
+        DERIVED reserve demand of this rank, or "" when it is not knowable
+        here (#313). Never raises: a diagnostic must not replace the error
+        it decorates."""
+        if self._server_args is None:
+            return ""
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:  # pragma: no cover - no process group in unit tests
+            tp_rank = None
+        try:
+            note = self._server_args.ladder_reserve_boot_suggestion(
+                shortfall_mib, tp_rank
+            )
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not build the reserve suggestion: %s", e)
+            return ""
+        return f" {note}" if note else ""
 
     def _audit_segment_isolation(self) -> None:
         """Every noted tensor must live in a segment created during its own

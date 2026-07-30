@@ -13861,3 +13861,100 @@ lokale und Host-Locks freigegeben, gpu-arb auf FREI.
 Rohdaten: `/spinning/gpu-battery-results/2026-07-30_fair311/s16_dflash_fp8/`
 (Punkte, Belege, Samples, Boot-Skripte), Arm-Skripte
 `s16_solo_dflash_fp8.sh` und `s16_solo_nextn_control.sh` daneben.
+
+## #313: Die Leiter finanziert ihre eigenen Sprossen (CPU-Fenster 2026-07-30/31)
+
+Der Nachbau des 54-MiB-Befunds aus dem #707-Fenster als Ableitung statt als
+Handaufschlag. Zwei Fenster hatten belegt: die `high-accept`-Leiter [1..5]
+bootet unter KV 7,3,3 + chunked 2048 + Solo-Draft auf Rang 0 nicht bei der
+Standard-`bar1_hi`-Reserve (4500,4200,4200) — 1376 MiB frei gegen 918 MiB
+`adaptive_state_k5` + 512 MiB Marge —, und der Mehrbedarf gehoert der LEITER,
+nicht dem Modell (AEON mit festem k=3 bootet bei 5200er Reserve unauffaellig).
+
+### Was abgeleitet wird
+
+Die Leiter benennt ihre Posten selbst (`estimate_ladder_reserve_demand` in
+`adaptive_graph_memory.py`), der Sizing-Pfad zieht sie ein:
+
+* je gebauter Sprosse (Kandidatenmenge **ohne** die Boot-Sprosse, die der
+  bestehende Captured-Token-Term schon traegt): privater flashinfer-Float-
+  Workspace (`SGLANG_FLASHINFER_WORKSPACE_SIZE`, 384 MiB; 2048 unter
+  deterministischer Inferenz) + Capture-Posten dieser Sprosse zum
+  #68-Koeffizienten (2 MiB je gefangenem Token, Breite `k+1`);
+* Reduktion nach der Regel des Modus: offload = max(eine Sprosse) + Serving-
+  Marge, resident = Summe aller Sprossen (dort laeuft die Boot-Pruefung nicht);
+* verbucht auf **genau eine** GPU: die des Solo-Draft-Rangs
+  (`ladder_reserve_gpu_id`). Dort ist der Aufwand asymmetrisch — der Rang
+  haelt den ungeteilten Draft und alle Draft-Graph-Familien jeder Sprosse.
+  Split-Placement bleibt bewusst bei der Vor-#313-Ableitung: kein
+  Split-Boot war je zu knapp, und jede GPU aufzublasen kostete KV ohne Beleg.
+
+Fuer die #707-Geometrie (Referenz-Rig, TP=3, NEXTN, decode max_bs 24, chunked
+2048): 4160 → **5344 MiB** auf GPU 0 (+1184 = Sprosse k5 672 [Workspace 384 +
+Capture 288] + Marge 512), die beiden 20-GiB-Karten unveraendert bei 4160. Der
+Boot, der mit 4500 um 54 MiB scheiterte, rechnet sich damit selbst ueber die
+5200, die von Hand getragen haben. Das Log nennt die Posten im #260-Ledger-Stil.
+
+Nicht modelliert und ausdruecklich benannt: die Int-Workspaces (8 MiB je
+(Backend, Rolle, Wrapper-Slot) — die Zahl existiert erst nach dem Bau) und die
+kv_indices/custom_mask-Puffer. Die Schaetzung ist damit ein **Boden** der
+echten Sprossengroesse (672 gegen gemessene 918); ueber den echten Bedarf hebt
+sie die einmal oben aufgeschlagene Serving-Marge. Konstanten aus zwei
+Messungen rueckzurechnen waere genau der Defekt, den
+`pinned_reserve_shortfall_note` seit #250 anprangert.
+
+### Kein stilles Aufblasen
+
+Eine EXPLIZITE `--rank-auto-reserve-mib` gilt unveraendert weiter. Sie erfaehrt
+jetzt aber, was sie verfehlt: die Startup-Warnung nennt den leiterbewussten
+abgeleiteten Bedarf samt Ledger (`4500 MiB auf GPU 0 … 5344 MiB … short by
+844`), und die Boot-Pruefung in `finalize_boot` haengt an ihren Fehlbetrag eine
+Empfehlung mit konkreter Zahl (`… PINNED 4500 … 'auto' would derive 5344 …
+raise this entry to at least 4554 MiB`) statt nur der fehlenden MiB.
+
+Der abgeleitete Bedarf je GPU geht ueber `reserve_demand_per_gpu` in einer
+einzigen Funktion an alle drei Verbraucher (installierte Reserve, Pinned-
+Warnung, #265-Fundability-Referenz), damit sie nicht auseinanderlaufen.
+
+### Belege
+
+Hermetisch, CPU-only: 12 neue Tests in
+`test/registered/unit/server_args/test_uneven_tp_args.py` (54-MiB-Konstellation
+aus echter Schaetzung **und** aus gemockten Ist-Posten 918+512 → +1430 MiB, also
+>= 972; Split- und Nicht-Leiter-Pfad byte-gleich zur Vor-#313-Ableitung; Budgets,
+Pinned-Pfad, Boot-Empfehlung) und 11 in
+`test/registered/unit/spec/test_adaptive_graph_memory.py` (Posten-Modell,
+offload- vs. resident-Regel, Ledger, Co-Location, Fehler-Dekoration).
+`test_uneven_tp_args.py` 121/121, `planner`+`spec`+Ratchets 2345 passed bei
+unveraenderter Fehlermenge gegen die Basis (14, alle umgebungsbedingt: kein
+CUDA, kein `sgl_kernel`, kein `torch_memory_saver`).
+
+GPU-Beleg steht aus. Kommando fuer das naechste Kartenfenster — derselbe
+`voll`-Arm aus `/spinning/gpu-battery-results/2026-07-30_vllm_fair/`, exakt
+zwei Aenderungen an `run_arm.sh`:
+
+1. `--rank-auto-reserve-mib 5200,4200,4200` → `--rank-auto-reserve-mib auto`;
+2. Arbeitsbaum: `cd /spinning/wt-final` und `hw=$(host_path
+   /spinning/wt-final)` auf einen Checkout von `fix/ladder-reserve-derivation`
+   zeigen lassen (`/spinning/wt-final` selbst **nicht** umschalten).
+
+Also, nach dem Kopieren des Skripts:
+
+```
+cd /spinning/gpu-battery-results/2026-07-30_vllm_fair
+sed -e 's#--rank-auto-reserve-mib 5200,4200,4200#--rank-auto-reserve-mib auto#' \
+    -e 's#/spinning/wt-final#/spinning/wt-ladder-reserve#g' \
+    run_arm.sh > run_arm_313.sh && chmod +x run_arm_313.sh
+bash run_arm_313.sh voll
+```
+
+Erwartung: Boot ohne Handaufschlag (die 54-MiB-Konstellation von heute), im
+Log `--rank-auto-reserve-mib auto: derived reserve per GPU {0: 5344, 1: 4160,
+2: 4160} MiB` gefolgt von `GPU 0 hosts the solo draft rank 0 -- adaptive
+ladder: +1184 MiB = peak built rung k5 = 672 MiB (flashinfer workspace 384 +
+graph capture 288) … + serving margin 512 MiB`, und
+`Adaptive graph memory offload: … free after pausing all states` deutlich
+ueber 1430 MiB. Gegenprobe im selben Fenster, falls Zeit bleibt: derselbe Arm
+mit `--rank-auto-reserve-mib 4500,4200,4200` muss weiterhin mit den 54 MiB
+scheitern — jetzt aber mit der Empfehlung `raise this entry to at least 4554
+MiB` in der Fehlermeldung.
