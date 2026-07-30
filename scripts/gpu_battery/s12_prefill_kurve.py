@@ -648,7 +648,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mode", choices=("messen", "zusammenfassen"), required=True)
     ap.add_argument("--port", type=int, default=30030)
-    ap.add_argument("--arm", choices=ARME, default="bar1")
+    # Free string, not `choices=ARME`. s12 itself only ever passes the two
+    # names in ARME, and its summary still keys off ARME -- but the same
+    # measurement driver is what #293 step 2 (s13) points at seven arms with,
+    # and a closed choice list there would mean a second copy of this file.
+    ap.add_argument("--arm", default="bar1")
     ap.add_argument("--sessions", type=int, default=1)
     ap.add_argument("--folge", type=int, default=0)
     ap.add_argument("--out-dir", default=".")
