@@ -239,16 +239,28 @@ Rueckhol-Latenzen je Klasse (#286-Restliste 1 und 4).
   lane_workspaces/kv_shadow/experts, `tag` (#93-Tag-Pools ueber den echten
   memory-saver) fuer graph_rungs/gdn_state_sets, `suspend` (#89) fuer
   cold_lane. Je Posten 256 MiB, 5 park/wave_in-Zyklen, p50/p99.
+  Der Park wird EXPLIZIT angefordert: das Register parkt bedarfsgesteuert, und
+  unter `auto` verweigert `park()` ohne Saettigungsdruck — korrekt, aber dann
+  misst der Lauf das Tor statt der Bewegung. Die Sonde setzt deshalb jede
+  gemessene Klasse ueber den granularen Klassen-Knopf
+  (`--lane-offload-class-policy`-Syntax) auf `ram` und legt die aufgeloeste
+  Policy-Karte ins Artefakt. Die Planphase (`--dry-run`) faehrt denselben
+  Ablauf gegen `FakeDeviceOps` — ohne Karte, als Selbsttest der Sonde.
 * **Erfolg** `check_s07_offload_register_gpu.py`: `device_ops ==
   "CudaDeviceOps"` (eine Validierung mit FakeDeviceOps validiert nichts);
   **alle drei Routen** gruen; je Zeile eine echte Groesse, die
   `resolve_size_bytes` bestaetigt; Zustandsfolge enthaelt wirklich `parked`
   (ein still no-oppender Park gibt dasselbe zurueck wie ein arbeitender);
   Rueckhol-Latenz > 0 ueber ≥3 Zyklen; null park/wave_in-Fehler;
-  `latency_term_ms` erhoben — genau diese Zahl liest der #279-Dispatcher.
+  Negativkontrolle verweigert (ein Posten bleibt auf `auto` ohne Sensor und
+  muss abgelehnt werden — sonst belegt der Lauf nicht, dass die explizite
+  Policy den Park zugelassen hat); `latency_term_ms` erhoben — genau diese
+  Zahl liest der #279-Dispatcher.
 * **Abbruch** memory-saver nicht verfuegbar = STOP (zwei von drei Routen waeren
   ungetestet, und ein gruenes Verdikt auf einem Drittel des Registers waere
-  schlimmer als keines).
+  schlimmer als keines). Der memory-saver braucht seinen Preload-Hook in
+  LD_PRELOAD, sonst stirbt jede `region()`; die Sonde setzt ihn selbst und
+  startet sich einmal neu (LD_PRELOAD liest der Linker beim Prozessstart).
 * **Artefakte** `s07_offload_register_gpu/offload_register_gpu.json`
 
 ### S8 — `s08_dispatcher_tables` · haiku · ~3 min · wiederholbar · **CPU-only**

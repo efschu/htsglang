@@ -1495,6 +1495,15 @@ def _offload(**over):
             "wave_in_failures": 0,
         },
         "latency_term_ms": {"lane_workspaces": 58.0},
+        "negative_control": {
+            "policy": "auto",
+            "sensor": "none",
+            "refused": True,
+            "error": (
+                "OffloadRefused: park refused: class 'lane_workspaces' policy is "
+                "'auto' and the saturation sensor reports no pressure"
+            ),
+        },
     }
     payload.update(over)
     return payload
@@ -1567,6 +1576,208 @@ class TestOffloadRegisterCheck:
     def test_missing_latency_term_is_fail(self, tmp_path):
         write_json(tmp_path / "offload_register_gpu.json", _offload(latency_term_ms={}))
         assert_fail(self.CHECK, tmp_path, self.STEP)
+
+    def test_missing_negative_control_is_stop(self, tmp_path):
+        """Without the control the rows do not say whether the explicit class
+        policy admitted the park or whether 'auto' stopped gating."""
+        payload = _offload()
+        payload.pop("negative_control")
+        write_json(tmp_path / "offload_register_gpu.json", payload)
+        assert_stop(self.CHECK, tmp_path, self.STEP)
+
+    def test_unrefused_negative_control_is_fail(self, tmp_path):
+        payload = _offload()
+        payload["negative_control"]["refused"] = False
+        write_json(tmp_path / "offload_register_gpu.json", payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "Negativkontrolle" in line
+
+
+class TestOffloadRegisterProbe:
+    """The producer behind s07, driven without a card.
+
+    The 2026-07-30 run measured nothing: the probe registered its items with
+    the default 'auto' policy, which parks only under saturation pressure, so
+    all six classes answered OffloadRefused in 8 s. The probe now asks for its
+    parks through the register's own per-class knob -- and proves in the same
+    run that the gate it stepped around is still closed for everyone else.
+    """
+
+    def _probe(self):
+        sys.path.insert(0, BATTERY)
+        import s07_offload_register_gpu
+
+        return s07_offload_register_gpu
+
+    def _dry_run(self, tmp_path):
+        s07 = self._probe()
+        out = tmp_path / "offload_register_gpu.json"
+        rc = s07.main(["--dry-run", "--out", str(out), "--cycles", "4"])
+        assert rc == 0
+        return s07, json.loads(out.read_text())
+
+    def test_dry_run_cycles_every_route_and_fills_the_rates(self, tmp_path):
+        _, payload = self._dry_run(tmp_path)
+        assert payload["routes"] == {"tensor": "ok", "tag": "ok", "suspend": "ok"}
+        assert [r["offload_class"] for r in payload["rows"]] == [
+            "lane_workspaces",
+            "kv_shadow",
+            "experts",
+            "graph_rungs",
+            "gdn_state_sets",
+            "cold_lane",
+        ]
+        for row in payload["rows"]:
+            assert row["status"] == "ok", row
+            assert row["iters"] == 4
+            assert row["wave_in_gb_per_s"] > 0, row
+            assert row["park_ms_p50"] is not None
+            assert "parked" in row["state_sequence"]
+            assert "resident" in row["state_sequence"]
+        assert payload["stats"]["parks"] == 24
+        assert payload["stats"]["park_failures"] == 0
+        assert payload["stats"]["wave_in_failures"] == 0
+
+    def test_measured_classes_are_parked_by_an_explicit_policy(self, tmp_path):
+        """'ram' is the register's documented explicit knob; 'auto' is the
+        sensor-gated default the measurement must not depend on."""
+        _, payload = self._dry_run(tmp_path)
+        modes = {k: v["mode"] for k, v in payload["class_policies"].items()}
+        for row in payload["rows"]:
+            assert modes[row["offload_class"]] == "ram", modes
+        assert modes["drafter_heads"] == "auto", "unbeteiligte Klassen bleiben auto"
+
+    def test_negative_control_still_refuses_auto_without_pressure(self, tmp_path):
+        _, payload = self._dry_run(tmp_path)
+        control = payload["negative_control"]
+        assert control["refused"] is True
+        assert "OffloadRefused" in control["error"]
+        assert "saturation sensor reports no pressure" in control["error"]
+
+    def test_latency_term_is_the_measured_retrieval_not_a_constant(self, tmp_path):
+        """The #279 dispatcher reads this number; registering 0.0 would hand
+        it a guess dressed as a measurement."""
+        _, payload = self._dry_run(tmp_path)
+        assert payload["latency_term_ms"]
+        for offload_class, term in payload["latency_term_ms"].items():
+            assert term > 0, (offload_class, term)
+
+    def test_dry_run_artifact_is_not_accepted_as_a_validation(self, tmp_path):
+        """The plan phase writes a real envelope; only the device layer name
+        keeps it from passing as a card run."""
+        self._dry_run(tmp_path)
+        assert_fail(
+            "check_s07_offload_register_gpu.py", tmp_path, "s07_offload_register_gpu"
+        )
+
+    def test_plan_phase_needs_no_out(self, capsys):
+        """The step's plan phase runs --dry-run without --out; a required
+        --out turned that into an argparse error in the step log."""
+        s07 = self._probe()
+        assert s07.main(["--dry-run"]) == 0
+        assert "Plan:" in capsys.readouterr().out
+
+    def test_out_is_required_for_a_real_run(self):
+        s07 = self._probe()
+        with pytest.raises(SystemExit) as exc:
+            s07.main([])
+        assert exc.value.code == 2
+
+    def test_preload_reexec_happens_once_and_carries_the_hook(self):
+        """LD_PRELOAD is read by the linker at process start: the tag and
+        suspend routes cannot be repaired in-process, only by re-exec."""
+        s07 = self._probe()
+        calls = []
+        env = {}
+        note = s07.maybe_reexec_for_memory_saver(
+            env,
+            ["probe.py", "--out", "x.json"],
+            lambda exe, argv: calls.append((exe, argv)),
+            path_fn=lambda: "/pkg/torch_memory_saver_cpp.so",
+            libdir_fn=lambda: "/pkg/nvidia/cu13/lib",
+        )
+        assert note == "reexec"
+        assert env["LD_PRELOAD"] == "/pkg/torch_memory_saver_cpp.so"
+        # Without the runtime's directory the re-exec kills the interpreter
+        # itself, not the probe: the hook NEEDs libcudart.so.<major>.
+        assert env["LD_LIBRARY_PATH"] == "/pkg/nvidia/cu13/lib"
+        assert len(calls) == 1
+        assert calls[0][1][1:] == ["probe.py", "--out", "x.json"]
+        # The guard the re-execed process sees: no second exec.
+        assert (
+            s07.maybe_reexec_for_memory_saver(
+                env,
+                [],
+                lambda *a: calls.append(a),
+                path_fn=lambda: "/pkg/x.so",
+                libdir_fn=lambda: "/pkg/lib",
+            )
+            == "reexec"
+        )
+        assert len(calls) == 1
+
+    def test_inherited_preload_is_left_alone(self):
+        s07 = self._probe()
+        env = {"LD_PRELOAD": "/other/torch_memory_saver_cpp_cu12.so"}
+        note = s07.maybe_reexec_for_memory_saver(
+            env,
+            [],
+            lambda *a: pytest.fail("kein exec noetig"),
+            path_fn=lambda: "/x.so",
+            libdir_fn=lambda: "/lib",
+        )
+        assert note == "inherited"
+
+    def test_unresolvable_hook_is_reported_not_raised(self):
+        """No memory saver = two routes untested; that is a STOP downstream,
+        not a crash here."""
+        s07 = self._probe()
+
+        def boom():
+            raise RuntimeError("kein Wheel")
+
+        note = s07.maybe_reexec_for_memory_saver(
+            {},
+            [],
+            lambda *a: pytest.fail("kein exec"),
+            path_fn=boom,
+            libdir_fn=lambda: "/lib",
+        )
+        assert note.startswith("unavailable: RuntimeError")
+
+    def test_unresolvable_libcudart_does_not_preload(self):
+        """A preload whose libcudart cannot be resolved does not fail the
+        probe, it fails the interpreter (rc 127, no artifact at all)."""
+        s07 = self._probe()
+        env = {}
+        note = s07.maybe_reexec_for_memory_saver(
+            env,
+            [],
+            lambda *a: pytest.fail("kein exec ohne libcudart"),
+            path_fn=lambda: "/pkg/hook.so",
+            libdir_fn=lambda: None,
+        )
+        assert note.startswith("unavailable: libcudart")
+        assert "LD_PRELOAD" not in env
+
+    def test_libcudart_dir_comes_from_the_live_process_map(self, tmp_path):
+        """This venv maps a cu12 AND a cu13 runtime; the hook is built for
+        one major, so the directory is picked by that major, not by order."""
+        s07 = self._probe()
+        maps = tmp_path / "maps"
+        maps.write_text(
+            "7f00-7f01 r-xp 0 00:1f 1 /venv/nvidia/cuda_runtime/lib/libcudart.so.12\n"
+            "7f02-7f03 r-xp 0 00:1f 2 /venv/nvidia/cu13/lib/libcudart.so.13\n"
+        )
+        torch = pytest.importorskip("torch")
+        major = str(getattr(torch.version, "cuda", "") or "").split(".")[0]
+        if major not in ("12", "13"):
+            pytest.skip(f"CUDA-Major {major!r} nicht in der Fixture")
+        expected = {
+            "12": "/venv/nvidia/cuda_runtime/lib",
+            "13": "/venv/nvidia/cu13/lib",
+        }[major]
+        assert s07.cuda_runtime_lib_dir(str(maps)) == expected
 
 
 # ---------------------------------------------------------------------------
