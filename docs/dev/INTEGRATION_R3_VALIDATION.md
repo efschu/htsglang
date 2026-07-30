@@ -12758,3 +12758,30 @@ Fuer das naechste Fenster vorbereitet:
 3. **`scripts/gpu_battery` traegt noch die alten HTCCL-Env-Namen** (in #295
    bewusst zurueckgestellt, Nachzug nach #303).
 4. **Posten 3 unverandert offen.**
+
+### Herkunftsvermerk: `/spinning/wt-final` bewegte sich waehrend des Fensters
+
+Der Arbeitsbaum stand beim Fensterbeginn auf `e1b17fe8ea`, waehrend der
+Messungen liefen dort zwei Merges ein: **#303** (`7f21cea498`, 20:49:25Z) und
+**#290** (`56dcf57cea`, 21:01:03Z). Der erste faellt in das Fenster hinein —
+zwischen Torlauf (20:46-20:50Z) und den Ceiling-Boots (ab 20:52Z).
+
+Geprueft, welche Pfade sich dabei geaendert haben: `git diff --name-only
+e1b17fe8ea..56dcf57cea` ergibt 15 Dateien, und
+`git diff --stat e1b17fe8ea..HEAD -- python/sglang/srt/managers/
+python/sglang/srt/distributed/ benchmark/` ist **leer**. Weder
+`bar1_graph_check.py` und der HTCCL-Baum (Posten 1) noch
+`admission_limiter.py`, `scheduler.py` und `server_args.py` (Posten 2) sind
+angefasst worden. Die Zahlen oben stehen.
+
+Zwei Beruehrungen ohne Wirkung auf das Ergebnis, der Vollstaendigkeit halber:
+`uneven_perf.py` (der #303-Sondenfix) liegt auf genau dem Pfad, den der
+gepinnte `--rank-mlp-ratio` umgeht — die Boots nehmen den Pin-Ausstieg vor der
+Sonde, mit und ohne Fix. `scripts/gpu_battery/battery_host.sh` hat sich
+ebenfalls geaendert; der Torlauf hatte es um 20:46Z bereits eingelesen, die
+Ceiling-Boots lasen die neuere Fassung.
+
+Folge fuer die Zusammenfuehrung: dieser Bericht haengt an der Fassung des
+Dokuments von `e1b17fe8ea` und enthaelt den #303-Abschnitt nicht. Beim Merge
+von `probe/fenster3` ist das ein reiner Anhang-Konflikt in
+`INTEGRATION_R3_VALIDATION.md`, beide Abschnitte bleiben.
