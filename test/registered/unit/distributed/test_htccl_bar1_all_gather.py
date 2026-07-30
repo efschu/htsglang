@@ -50,7 +50,11 @@ def _stub(**kw):
     t.ag_an = True
     t.a2a_an = True
     t._a2a_beleg = True
-    t.ag_min_bytes = 16
+    # Die ausgelieferte Vorgabe. Hier stand 16, und der Stub stimmte damit
+    # mit einem Wert ueberein, den der broadcast-Zwilling als Fehler
+    # entlarvt hat: der Standardlauf schickt Kollektive UNTER einem
+    # 16-Byte-Paket, und unter Aufzeichnung ist eine Absage ein Abbruch.
+    t.ag_min_bytes = 1
     t.ag_max_runden = 16
     # broadcast rides the same kernel but has its own switch and its own
     # byte proof. This is the all_gather stub: it says no to broadcast, so
@@ -335,10 +339,18 @@ class TestHandlesGate(CustomTestCase):
         """Against the smallest length actually mapped group-wide."""
         self.assertFalse(_stub(_fenster_minimum=1 << 20)._handles_all_gather(65536))
 
-    def test_below_the_floor_and_at_zero(self):
+    def test_only_the_empty_shard_is_below_the_floor(self):
+        """No floor beyond "non-empty" -- the twin of the broadcast fix.
+
+        ``_handles_all_gather(8) is False`` used to be asserted here, which
+        made a copied threshold look like a decision. It was the same 16 as
+        the broadcast path had, with the same absent reason: the kernel
+        assembles an incomplete packet in a register, so a shard under 16
+        bytes is one ragged packet, not an unsupported case.
+        """
         self.assertFalse(_stub()._handles_all_gather(0))
-        self.assertFalse(_stub()._handles_all_gather(8))
-        self.assertTrue(_stub()._handles_all_gather(16))
+        for n in (1, 4, 8, 12, 15, 16):
+            self.assertTrue(_stub()._handles_all_gather(n), msg=f"{n} B")
 
     def test_round_cap(self):
         """Not a window limit -- a limit on kernel launches per collective."""

@@ -1413,12 +1413,22 @@ class HTCCLBar1Transport:
         self.ag_an = os.environ.get("SGLANG_HTCCL_BAR1_AG", "1") not in (
             "0", "nein", "aus", "false"
         )
-        #: Untergrenze wie bei a2a und aus demselben Grund: ein Paket. Nicht
-        #: `min_bytes` (4096) -- die all_gather der Spekulations- und
-        #: DP-Attention-Pfade sind klein, und dort ist die Latenz der
-        #: gloo-Ebene am teuersten.
+        #: Untergrenze: **1 Byte**. Hier stand aus demselben Grund wie beim
+        #: broadcast eine 16 ("ein Paket", aus a2a uebernommen), und sie ist
+        #: aus demselben Grund weg. Der Befund kam beim broadcast (12 Byte
+        #: aus dem Standardlauf, von der 16 abgelehnt); all_gather hat
+        #: dieselbe Struktur, dieselbe Aufzeichnungslage und denselben
+        #: Restpfad im Kern -- eine 12-Byte-Scherbe waere unter Aufzeichnung
+        #: genauso abgebrochen. Die Schwelle hier stehen zu lassen, waere
+        #: gewesen, den Zwilling eines gerade belegten Absturzes wissentlich
+        #: liegen zu lassen.
+        #:
+        #: Nicht `min_bytes` (4096) und erst recht nicht mehr: die
+        #: all_gather der Spekulations- und DP-Attention-Pfade sind klein,
+        #: und dort ist die Latenz der gloo-Ebene am teuersten -- wenn es sie
+        #: denn ueberhaupt gibt, was unter Aufzeichnung nicht der Fall ist.
         self.ag_min_bytes = int(
-            os.environ.get("SGLANG_HTCCL_BAR1_AG_MIN_BYTES", "16")
+            os.environ.get("SGLANG_HTCCL_BAR1_AG_MIN_BYTES", "1")
         )
         #: Wieviele Runden eine Scherbe hoechstens kosten darf. Keine
         #: Fenstergrenze, sondern eine Rundengrenze: je Runde ein
@@ -1439,13 +1449,33 @@ class HTCCLBar1Transport:
         self.bc_an = os.environ.get("SGLANG_HTCCL_BAR1_BC", "1") not in (
             "0", "nein", "aus", "false"
         )
-        #: Untergrenze wie bei a2a und all_gather: ein Paket. Sie ist hier
-        #: besonders niedrig anzusetzen -- der Fall, der diesen Weg noetig
-        #: gemacht hat, ist 128 Byte gross. Eine Untergrenze, die ihn
-        #: ausschliesst, ist unter Aufzeichnung kein langsamerer Weg,
-        #: sondern gar keiner.
+        #: Untergrenze: **1 Byte**, also gar keine. Hier stand 16 ("ein
+        #: Paket"), aus a2a abgeschrieben, und das war falsch -- der
+        #: Standardlauf sendet broadcast mit 12 BYTE, und der ist daran
+        #: gescheitert, nachdem der 128-Byte-Fall gerade durchgekommen war.
+        #:
+        #: Die 16 hatte keinen technischen Grund. Der Kern schreibt zwar in
+        #: 16-Byte-Paketen, setzt das letzte, unvollstaendige aber aus den
+        #: vorhandenen Bytes in einem Register zusammen (``packeBytes``) --
+        #: ein 12-Byte-Block ist EIN solches Paket, kein Sonderfall. Der
+        #: Schlitz beginnt auf einer Seitengrenze und ist ein Vielfaches von
+        #: 16, die vier Fuellbytes landen also im eigenen Schlitz; die
+        #: Empfangsphase schreibt byteweise genau ``rest`` Bytes, laeuft dem
+        #: Ausgabepuffer also nicht davon. Bei a2a ist die 16 eine Aussage
+        #: ueber die Paketgranularitaet der Bloecke, hier war sie eine
+        #: uebernommene Zahl.
+        #:
+        #: Und sie war die falsche SORTE Grenze: eine Untergrenze ist eine
+        #: Lohnt-sich-Schwelle gegen die gloo-Ebene, aber unter einer
+        #: CUDA-Graph-Aufzeichnung gibt es keine gloo-Ebene, sondern nur den
+        #: Abbruch. Genau das stand hier schon als Begruendung und wurde von
+        #: der Zahl daneben widerlegt.
+        #:
+        #: Gedeckt ist damit alles von 1 Byte bis
+        #: ``a2a_schlitz * bc_max_runden``. Wer den Knopf hochdreht, lehnt
+        #: bewusst ab; still passiert das nicht mehr.
         self.bc_min_bytes = int(
-            os.environ.get("SGLANG_HTCCL_BAR1_BC_MIN_BYTES", "16")
+            os.environ.get("SGLANG_HTCCL_BAR1_BC_MIN_BYTES", "1")
         )
         #: Rundengrenze wie bei all_gather, aus demselben Grund: je Runde
         #: ein Kernelstart mit einer Sperre.
@@ -2768,6 +2798,16 @@ class HTCCLBar1Transport:
         abgelehnt -- der a2a-Kern hat den Restpfad. Beides aus demselben
         Grund wie bei :meth:`_handles_all_gather`: unter Aufzeichnung ist
         eine Absage ein Abbruch.
+
+        **Der gedeckte Bereich ist ``1 .. a2a_schlitz * bc_max_runden``**,
+        lueckenlos. Das ist keine Umschreibung, sondern die Lehre aus dem
+        zweiten Anlauf: der erste deckte broadcast, lehnte aber 12 Byte ab
+        (Untergrenze 16, aus a2a abgeschrieben), und genau die 12 Byte
+        schickt der Standardlauf. Eine Groesse in diesem Bereich still mit
+        ``False`` zu beantworten heisst unter Aufzeichnung, den Lauf
+        abzubrechen -- wenn hier je wieder eine Schwelle eingezogen wird,
+        gehoert der Grund dazu, den ``_kein_kollektiv`` fuer
+        reduce_scatter auch nennt.
         """
         if not self.bc_an:
             return False
@@ -2900,9 +2940,19 @@ class HTCCLBar1Transport:
         # Ueber den Schlitz hinaus, aber nicht knapp: 16 Byte Rest in der
         # zweiten Runde treffen zusaetzlich den Restpfad des Kerns.
         gross = schlitz + 16
+        # UNTER einem Paket. Das ist der Fall, an dem der erste Anlauf
+        # vorbeigelaufen ist: die Untergrenze stand auf 16, der
+        # Standardlauf schickt 12, und der Beleg fuhr nur Groessen, die die
+        # Grenze ohnehin nahm -- er konnte den Fehler also gar nicht sehen.
+        # 12 Byte belegen den einen Weg, den keine andere Groesse hier geht:
+        # ein einziges, unvollstaendiges Paket, in einem Register
+        # zusammengesetzt und byteweise wieder ausgelesen.
+        winzig = 12
 
         ok_lokal = True
-        for src, n in [(s, klein) for s in range(R)] + [(0, gross)]:
+        for src, n in ([(s, klein) for s in range(R)]
+                       + [(s, winzig) for s in range(R)]
+                       + [(0, gross)]):
             # Jeder Rang startet mit SEINER Marke. Fuer die Quelle ist das
             # schon der Sollwert, fuer alle anderen ein davon
             # unterscheidbares Byte -- ein broadcast, der gar nichts bewegt,

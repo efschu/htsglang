@@ -164,11 +164,16 @@ FAELLE = [
     {
         "name": "broadcast",
         "kollektiv": "broadcast",
-        "zweck": "Der Fall aus der Uebergabe: 128 Byte broadcast im "
-                 "Draft-Graphen. Jeder Rang einmal Quelle, damit keine "
-                 "Kante ungeprueft bleibt.",
+        "zweck": "Die Faelle aus dem Standardlauf: 12 und 128 Byte "
+                 "broadcast im Draft-Graphen. Jeder Rang einmal Quelle, "
+                 "damit keine Kante ungeprueft bleibt.",
         "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40)},
-        "groessen": [128, 64 << 10],
+        # 12 steht vorn und nicht aus Ordnungsliebe: der erste Anlauf deckte
+        # 128 und lehnte 12 ab (Untergrenze 16), und weil das Tor nur 128
+        # fuhr, ging es gruen durch, waehrend der Standardlauf abbrach. Eine
+        # Groesse UNTER einem 16-Byte-Paket gehoert seitdem in jeden
+        # broadcast-Fall.
+        "groessen": [12, 128, 64 << 10],
         "gate": True,
     },
     {
@@ -178,7 +183,7 @@ FAELLE = [
                  "Ein geteilter Schlitz oder eine eingebrannte Haelfte faellt "
                  "erst hier auf.",
         "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40)},
-        "groessen": [128, 64 << 10],
+        "groessen": [12, 128, 64 << 10],
         "verschraenkt": True,
         "gate": True,
     },

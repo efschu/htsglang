@@ -58,7 +58,11 @@ def _stub(rank: int = 0, welt: int = 3, **kw):
     t.a2a_an = True
     t._a2a_beleg = True
     t._bc_beleg = True
-    t.bc_min_bytes = 16
+    # Die AUSGELIEFERTEN Vorgaben, nicht runde Zahlen: dass der Stub sie
+    # wirklich spiegelt, nagelt TestTheShippedFloor am Quelltext fest. Ein
+    # Stub mit einer bequemeren Untergrenze haette den 12-Byte-Abbruch
+    # genauso wenig gesehen wie der erste Beleg.
+    t.bc_min_bytes = 1
     t.bc_max_runden = 16
     t._fenster_minimum = 96 << 20
     t._geo = {
@@ -220,6 +224,71 @@ class TestBcPlanArithmetic(CustomTestCase):
         self.assertEqual(bc_plan(0, 16), [])
 
 
+def _tabellen(welt, nbytes, src, slot=8 << 20):
+    """The tables of EVERY rank for the same call.
+
+    Module level on purpose: the size ladder needs the same construction
+    and reaching into another TestCase for it would tie the two together
+    by inheritance rather than by the thing they share.
+    """
+    aus = {}
+    for r in range(welt):
+        t = _stub(rank=r, welt=welt, a2a_schlitz=slot)
+        tensor = torch.full((nbytes,), r + 1, dtype=torch.uint8)
+        _, aufrufe = _fahre(t, tensor, src)
+        aus[r] = aufrufe
+    return aus
+
+
+def _lauf(welt, nbytes, src, slot):
+    daten = {
+        r: bytes(((r * 251 + k * 17) % 256) for k in range(nbytes))
+        for r in range(welt)
+    }
+    transporte = {r: _stub(rank=r, welt=welt, a2a_schlitz=slot)
+                  for r in range(welt)}
+    puffer = {r: torch.frombuffer(bytearray(daten[r]), dtype=torch.uint8)
+              for r in range(welt)}
+    tabellen, ergebnisse = {}, {}
+    for r in range(welt):
+        ergebnisse[r], tabellen[r] = _fahre(
+            transporte[r], puffer[r].clone(), src
+        )
+    # Was ueber die Apertur ging, ist im Rekorder nicht passiert: hier
+    # nachgezogen, aus der Tabelle des SENDERS gelesen und in die des
+    # EMPFAENGERS geschrieben -- eine vertauschte Zeile faellt damit auf.
+    for k in range(len(tabellen[0])):
+        for empf in range(welt):
+            for send in range(welt):
+                if send == empf:
+                    continue
+                n = tabellen[empf][k]["e_len"][send]
+                if not n:
+                    continue
+                a = tabellen[send][k]["s_off"][empf]
+                b = tabellen[empf][k]["e_off"][send]
+                ergebnisse[empf][b:b + n] = torch.frombuffer(
+                    bytearray(daten[send][a:a + n]), dtype=torch.uint8
+                )
+    return daten, ergebnisse
+
+
+def _pruefe_alle_halten_die_quelle(fall, welt, nbytes, src, slot):
+    """Every rank must end up holding the source's bytes. Byte for byte.
+
+    Takes the test case rather than being a method, because both the
+    protocol class and the size ladder need it and neither owns it.
+    """
+    daten, ergebnisse = _lauf(welt, nbytes, src, slot)
+    for r in range(welt):
+        fall.assertEqual(
+            bytes(ergebnisse[r].numpy().tobytes()),
+            daten[src],
+            msg=f"rank {r} holds the wrong bytes "
+                f"(welt={welt} src={src} n={nbytes} slot={slot})",
+        )
+
+
 class TestTheTableItBuilds(CustomTestCase):
     """The a2a table for a broadcast, checked where it is really decided.
 
@@ -231,18 +300,9 @@ class TestTheTableItBuilds(CustomTestCase):
     host sync this path exists to avoid.
     """
 
-    def _tabellen(self, welt, nbytes, src, slot=8 << 20):
-        """The tables of EVERY rank for the same call."""
-        aus = {}
-        for r in range(welt):
-            t = _stub(rank=r, welt=welt, a2a_schlitz=slot)
-            tensor = torch.full((nbytes,), r + 1, dtype=torch.uint8)
-            _, aufrufe = _fahre(t, tensor, src)
-            aus[r] = aufrufe
-        return aus
 
     def test_only_the_source_sends(self):
-        tabellen = self._tabellen(3, 4096, src=1)
+        tabellen = _tabellen(3, 4096, src=1)
         for r, aufrufe in tabellen.items():
             (ruf,) = aufrufe
             if r == 1:
@@ -251,13 +311,13 @@ class TestTheTableItBuilds(CustomTestCase):
                 self.assertEqual(ruf["s_len"], [0] * 3)
 
     def test_exactly_one_receive_block_is_nonzero(self):
-        for r, aufrufe in self._tabellen(3, 4096, src=2).items():
+        for r, aufrufe in _tabellen(3, 4096, src=2).items():
             (ruf,) = aufrufe
             self.assertEqual(ruf["e_len"], [0, 0, 4096])
 
     def test_the_send_offset_is_constant_across_destinations(self):
         """Every destination gets the SAME slice -- that is the broadcast."""
-        for aufrufe in self._tabellen(4, 3 * (8 << 20), src=0).values():
+        for aufrufe in _tabellen(4, 3 * (8 << 20), src=0).values():
             for ruf in aufrufe:
                 self.assertEqual(len(set(ruf["s_off"])), 1)
 
@@ -269,7 +329,7 @@ class TestTheTableItBuilds(CustomTestCase):
         """
         for welt in (2, 3, 8):
             for src in range(welt):
-                tabellen = self._tabellen(welt, 5000, src)
+                tabellen = _tabellen(welt, 5000, src)
                 runden = len(tabellen[0])
                 for k in range(runden):
                     for r in range(welt):
@@ -285,14 +345,14 @@ class TestTheTableItBuilds(CustomTestCase):
         """``send_len[r] == recv_len[r]`` -- the extension asserts this."""
         for welt in (2, 3):
             for src in range(welt):
-                for r, aufrufe in self._tabellen(welt, 5000, src).items():
+                for r, aufrufe in _tabellen(welt, 5000, src).items():
                     for ruf in aufrufe:
                         self.assertEqual(ruf["s_len"][r], ruf["e_len"][r])
 
     def test_the_round_count_is_the_same_on_every_rank(self):
         # 3 volle Schlitze und ein Rest von 7 Byte -- vier Runden, und der
         # Rest ist eine davon, keine Zugabe.
-        tabellen = self._tabellen(3, 3 * (8 << 20) + 7, src=2)
+        tabellen = _tabellen(3, 3 * (8 << 20) + 7, src=2)
         self.assertEqual({len(a) for a in tabellen.values()}, {4})
 
     def test_the_kernel_variant_is_decided_group_uniformly(self):
@@ -302,7 +362,7 @@ class TestTheTableItBuilds(CustomTestCase):
         everywhere else -- the same collective would run as a cooperative
         launch on one rank and as a single block on the others.
         """
-        tabellen = self._tabellen(3, 4096, src=1)
+        tabellen = _tabellen(3, 4096, src=1)
         lasten = {ruf["kern_last"] for a in tabellen.values() for ruf in a}
         self.assertEqual(lasten, {4096 * 2})
 
@@ -312,7 +372,7 @@ class TestTheTableItBuilds(CustomTestCase):
         The kernel's send and receive phases sit around ONE barrier; a
         buffer that is both would already be overwritten in the second.
         """
-        for aufrufe in self._tabellen(3, 4096, src=0).values():
+        for aufrufe in _tabellen(3, 4096, src=0).values():
             for ruf in aufrufe:
                 self.assertIsNot(ruf["in"], ruf["out"])
                 self.assertNotEqual(
@@ -328,65 +388,23 @@ class TestAgainstAReference(CustomTestCase):
     The reference is: everybody holds the source's bytes.
     """
 
-    def _lauf(self, welt, nbytes, src, slot):
-        daten = {
-            r: bytes(((r * 251 + k * 17) % 256) for k in range(nbytes))
-            for r in range(welt)
-        }
-        transporte = {r: _stub(rank=r, welt=welt, a2a_schlitz=slot)
-                      for r in range(welt)}
-        puffer = {r: torch.frombuffer(bytearray(daten[r]), dtype=torch.uint8)
-                  for r in range(welt)}
-        tabellen, ergebnisse = {}, {}
-        for r in range(welt):
-            ergebnisse[r], tabellen[r] = _fahre(
-                transporte[r], puffer[r].clone(), src
-            )
-        # Was ueber die Apertur ging, ist im Rekorder nicht passiert: hier
-        # nachgezogen, aus der Tabelle des SENDERS gelesen und in die des
-        # EMPFAENGERS geschrieben -- eine vertauschte Zeile faellt damit auf.
-        for k in range(len(tabellen[0])):
-            for empf in range(welt):
-                for send in range(welt):
-                    if send == empf:
-                        continue
-                    n = tabellen[empf][k]["e_len"][send]
-                    if not n:
-                        continue
-                    a = tabellen[send][k]["s_off"][empf]
-                    b = tabellen[empf][k]["e_off"][send]
-                    ergebnisse[empf][b:b + n] = torch.frombuffer(
-                        bytearray(daten[send][a:a + n]), dtype=torch.uint8
-                    )
-        return daten, ergebnisse
-
-    def _assert_all_ranks_hold_the_source(self, welt, nbytes, src, slot):
-        daten, ergebnisse = self._lauf(welt, nbytes, src, slot)
-        for r in range(welt):
-            self.assertEqual(
-                bytes(ergebnisse[r].numpy().tobytes()),
-                daten[src],
-                msg=f"rank {r} holds the wrong bytes "
-                    f"(welt={welt} src={src} n={nbytes} slot={slot})",
-            )
-
     def test_single_round_every_source(self):
         for src in range(3):
-            self._assert_all_ranks_hold_the_source(3, 64, src, 256)
+            _pruefe_alle_halten_die_quelle(self, 3, 64, src, 256)
 
     def test_multi_round_every_source(self):
         for src in range(3):
-            self._assert_all_ranks_hold_the_source(3, 300, src, 64)
+            _pruefe_alle_halten_die_quelle(self, 3, 300, src, 64)
 
     def test_ragged_tail(self):
-        self._assert_all_ranks_hold_the_source(3, 301, 1, 64)
+        _pruefe_alle_halten_die_quelle(self, 3, 301, 1, 64)
 
     def test_world_two_and_eight(self):
-        self._assert_all_ranks_hold_the_source(2, 200, 1, 64)
-        self._assert_all_ranks_hold_the_source(8, 129, 7, 16)
+        _pruefe_alle_halten_die_quelle(self, 2, 200, 1, 64)
+        _pruefe_alle_halten_die_quelle(self, 8, 129, 7, 16)
 
     def test_the_handover_size(self):
-        self._assert_all_ranks_hold_the_source(3, ABNAHME_BYTES, 0, 8384512)
+        _pruefe_alle_halten_die_quelle(self, 3, ABNAHME_BYTES, 0, 8384512)
 
 
 class TestInPlaceContract(CustomTestCase):
@@ -470,10 +488,18 @@ class TestHandlesGate(CustomTestCase):
     def test_needs_the_window(self):
         self.assertFalse(_stub(_fenster_minimum=1 << 20)._handles_broadcast(65536))
 
-    def test_below_the_floor_and_at_zero(self):
+    def test_only_the_empty_payload_is_below_the_floor(self):
+        """There is no floor beyond "non-empty" -- and that is the fix.
+
+        16 used to stand here ("one packet", copied from a2a). The standard
+        run sends a 12-byte broadcast; it was refused while the 128-byte
+        case from the first crash went through, so the coverage looked
+        complete and the run still died.
+        """
         self.assertFalse(_stub()._handles_broadcast(0))
-        self.assertFalse(_stub()._handles_broadcast(8))
-        self.assertTrue(_stub()._handles_broadcast(16))
+        self.assertFalse(_stub()._handles_broadcast(-1))
+        for n in (1, 4, 8, 12, 15, 16):
+            self.assertTrue(_stub()._handles_broadcast(n), msg=f"{n} B")
 
     def test_round_cap(self):
         t = _stub(a2a_schlitz=1024, bc_max_runden=4)
@@ -493,6 +519,122 @@ class TestHandlesGate(CustomTestCase):
         self.assertFalse(t.handles("reduce_scatter", 65536))
         self.assertFalse(t.handles("nonsense", 65536))
         self.assertTrue(t.handles("all_gather", 65536))
+
+
+#: Die Leiter, an der jede neue Bedingung dieses Pfades gemessen wird --
+#: von einem Byte bis eine Runde ueber den Schlitz. ``slot`` ist klein
+#: gewaehlt, damit die Byte-Simulation je Groesse bezahlbar bleibt; die
+#: Verhaeltnisse (unter einem Paket, ueber einem Paket, genau ein Schlitz,
+#: einer drueber) sind dieselben wie bei 8 MiB.
+_SLOT = 1024
+_LEITER = (1, 4, 12, 128, 1024 - 1, 1024, 1024 + 1, 4096)
+
+
+class TestTheShippedFloor(CustomTestCase):
+    """The default in the SOURCE, not the one the stub is convenient with.
+
+    The first attempt had both: a stub that said 16 and a shipped default of
+    16, agreeing with each other and with nothing else. What broke was a
+    12-byte broadcast from the standard run, and no test could see it
+    because every test asked the same wrong number.
+    """
+
+    def _default(self, name: str) -> str:
+        import re
+        from pathlib import Path
+
+        import sglang.srt.distributed.device_communicators.htccl_bar1 as mod
+
+        text = Path(mod.__file__).read_text(encoding="utf-8")
+        treffer = re.search(
+            r"""os\.environ\.get\(\s*["']%s["']\s*,\s*["'](\d+)["']""" % name,
+            text,
+        )
+        self.assertIsNotNone(treffer, msg=f"{name} nicht im Quelltext")
+        return treffer.group(1)
+
+    def test_broadcast_floor_is_one_byte(self):
+        self.assertEqual(self._default("SGLANG_HTCCL_BAR1_BC_MIN_BYTES"), "1")
+
+    def test_all_gather_floor_is_one_byte(self):
+        """The twin of the same bug, and it was live.
+
+        all_gather had the identical 16 from the identical copy, the same
+        ragged-tail path in the kernel and the same "no fallback under
+        capture" situation. A 12-byte shard would have aborted a run the
+        same way.
+        """
+        self.assertEqual(self._default("SGLANG_HTCCL_BAR1_AG_MIN_BYTES"), "1")
+
+    def test_the_stub_mirrors_the_shipped_floor(self):
+        self.assertEqual(
+            str(_stub().bc_min_bytes),
+            self._default("SGLANG_HTCCL_BAR1_BC_MIN_BYTES"),
+        )
+
+
+class TestTheSizeLadder(CustomTestCase):
+    """One byte to one round past the slot -- gate, plan and bytes each.
+
+    Three questions per size, because they fail in different places: does
+    the transport SAY yes, does the round decomposition cover the payload,
+    and do the bytes actually arrive. The 12-byte case had a yes for two of
+    them and a no for the first, which is why the run died with a coverage
+    message rather than wrong data.
+    """
+
+    def _stub(self, rank=0, welt=3):
+        return _stub(rank=rank, welt=welt, a2a_schlitz=_SLOT)
+
+    def test_the_gate_says_yes_to_every_rung(self):
+        for n in _LEITER:
+            self.assertTrue(
+                self._stub().handles("broadcast", n), msg=f"{n} B abgelehnt"
+            )
+
+    def test_the_plan_covers_every_rung_exactly_once(self):
+        for n in _LEITER:
+            plan = bc_plan(n, _SLOT)
+            gesehen = []
+            for versatz, laenge in plan:
+                self.assertGreater(laenge, 0, msg=f"{n} B: Leerrunde")
+                self.assertLessEqual(laenge, _SLOT, msg=f"{n} B")
+                gesehen.extend(range(versatz, versatz + laenge))
+            self.assertEqual(gesehen, list(range(n)), msg=f"{n} B")
+
+    def test_the_round_count_matches_the_gate(self):
+        for n in _LEITER:
+            self.assertEqual(
+                len(bc_plan(n, _SLOT)), self._stub().bc_runden(n), msg=f"{n} B"
+            )
+
+    def test_the_rung_below_one_packet_is_a_single_ragged_round(self):
+        """12 bytes: one incomplete packet, and nothing else.
+
+        This is the rung the kernel treats specially (assemble in a
+        register, read back byte by byte) and the one no other size on the
+        ladder exercises.
+        """
+        self.assertEqual(bc_plan(12, _SLOT), [(0, 12)])
+        self.assertEqual(self._stub().bc_runden(12), 1)
+
+    def test_every_rung_delivers_the_right_bytes(self):
+        for n in _LEITER:
+            for src in range(3):
+                _pruefe_alle_halten_die_quelle(self, 3, n, src, _SLOT)
+
+    def test_every_rung_keeps_the_pairwise_contract(self):
+        """Per round: ``e_len[i]`` here == ``s_len[rank]`` on rank ``i``."""
+        for n in _LEITER:
+            tabellen = _tabellen(3, n, src=1, slot=_SLOT)
+            for k in range(len(tabellen[0])):
+                for r in range(3):
+                    for i in range(3):
+                        self.assertEqual(
+                            tabellen[r][k]["e_len"][i],
+                            tabellen[i][k]["s_len"][r],
+                            msg=f"n={n} runde={k} r={r} i={i}",
+                        )
 
 
 class TestLoudBar(CustomTestCase):
@@ -533,15 +675,42 @@ class TestLoudBar(CustomTestCase):
         self.assertIn("broadcast", text)
         self.assertIn("all_gather", text)
 
-    def test_a_broadcast_below_the_floor_still_raises(self):
-        """The bar is not disarmed by the coverage, only narrowed."""
+    def test_a_broadcast_past_the_round_cap_still_raises(self):
+        """The bar is not disarmed by the coverage, only narrowed.
+
+        This used to read "below the floor" and used 8 bytes -- and that is
+        precisely what was wrong: the floor refused sizes the stack really
+        sends. What is left above the bar is a NAMED limit (more rounds than
+        `bc_max_runden` would make the transport a loop), not a threshold
+        somebody copied.
+        """
         from sglang.srt.distributed.device_communicators import htccl as mod
 
-        c = self._comm(_stub())
+        t = _stub(a2a_schlitz=1024, bc_max_runden=4)
+        c = self._comm(t)
         with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
             with self.assertRaises(RuntimeError) as ctx:
-                mod.HTCCLCommunicator._select(c, "broadcast", 8)
+                mod.HTCCLCommunicator._select(c, "broadcast", 1024 * 4 + 1)
         self.assertIn("broadcast", str(ctx.exception))
+
+    def test_the_twelve_byte_case_from_the_standard_run_passes(self):
+        """The whole point of the follow-up.
+
+        The first attempt put broadcast in the coverage list, and the bar
+        still fired -- with a message that named broadcast as covered. That
+        reads like a contradiction and was one: coverage is not the op, it
+        is the op AND the size.
+        """
+        from sglang.srt.distributed.device_communicators import htccl as mod
+
+        t = _stub()
+        c = self._comm(t)
+        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+            for n in (1, 4, 12, 128):
+                self.assertIs(
+                    mod.HTCCLCommunicator._select(c, "broadcast", n), t,
+                    msg=f"{n} B",
+                )
 
 
 if __name__ == "__main__":
