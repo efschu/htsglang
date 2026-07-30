@@ -64,6 +64,10 @@ from sglang.srt.distributed.utils import (
     get_tp_partition_ratios,
     scoped_tp_partition_ratios,
 )
+from sglang.srt.managers.admission_limiter import (
+    AdmissionLimiter,
+    admission_limiter_scope,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -1258,6 +1262,10 @@ class DualGroupLane:
         self.lane_id = lane_id
         self.plan = plan
         self.runner = runner
+        # #287: the lane's OWN concurrency knob, built lazily in
+        # ``admission_limiter``. Per lane on purpose -- a serving-group
+        # throttle must not reach into the lane and vice versa.
+        self._admission_limiter = None
         # Speculation on the lane (#274 slice C): the NEXTN head runner, or
         # None. Its presence is what turns a lane step into a verify round.
         self.draft_runner = draft_runner
@@ -1767,8 +1775,28 @@ class DualGroupLane:
         from sglang.srt.runtime_context import lane_scope
 
         with lane_scope(self.scope_lane_id, self.runner.server_args):
-            with lane_geometry_override(1, 0):
-                yield
+            with admission_limiter_scope(self.admission_limiter):
+                with lane_geometry_override(1, 0):
+                    yield
+
+    @property
+    def admission_limiter(self) -> AdmissionLimiter:
+        """The lane's own admission limit (#287).
+
+        The lane is dimensioned by --dual-group-lane-max-requests, so that
+        value is both its ceiling and its start; the auto controller stays
+        off because a PD prefill lane's concurrency is a placement decision,
+        not a pressure response. It exists as a separate instance so that a
+        read inside the lane's scope resolves to the LANE's number and never
+        to the serving group's -- the same de-globalization the config
+        overlay does one line above.
+        """
+        if self._admission_limiter is None:
+            self._admission_limiter = AdmissionLimiter(
+                max(1, int(self.runner.server_args.dual_group_lane_max_requests)),
+                lane_id=self.lane_id,
+            )
+        return self._admission_limiter
 
     @property
     def scope_lane_id(self) -> Optional[int]:

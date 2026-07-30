@@ -71,6 +71,23 @@ class SchedulerLoadInquirer:
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
+    def effective_max_running_requests(self) -> int:
+        """Concurrency this worker currently accepts, for /v1/loads.
+
+        #287: ``max_running_requests`` is the CEILING the pools were built
+        for; a router that reads it while the worker has throttled itself
+        would keep aiming at capacity that is not on offer. The limiter is
+        resolved through the lane context, so a lane reports its own number.
+        Without a ceiling the limiter holds exactly ``max_running_requests``
+        and this reports what it reported before.
+        """
+        from sglang.srt.managers.admission_limiter import current_admission_limiter
+
+        limiter = current_admission_limiter()
+        if limiter is None:
+            return self.max_running_requests
+        return min(self.max_running_requests, limiter.current)
+
     def get_num_waiting_uncached_tokens(self) -> int:
         """Get uncached input tokens waiting for prefill compute."""
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -192,7 +209,7 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
-            max_running_requests=self.max_running_requests,
+            max_running_requests=self.effective_max_running_requests(),
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),

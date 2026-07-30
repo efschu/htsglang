@@ -837,6 +837,70 @@ class ServerArgs:
     max_running_requests: A[
         Optional[int], "The maximum number of running requests."
     ] = None
+    max_running_requests_ceiling: A[
+        Optional[int],
+        Arg(
+            help="Upper bound of the DYNAMIC concurrent-session limit (#287). "
+            "The state pools -- KV pool, mamba/GDN slot table, the decode "
+            "CUDA-graph capture set -- are dimensioned for THIS value, while "
+            "the effective admission limit floats below it at runtime: "
+            "throttling admission is a counter update, rebuilding a pool is "
+            "not. --max-running-requests then becomes the START value of that "
+            "float (it must not exceed the ceiling); unset, the float starts "
+            "at the ceiling. The limit is lowered automatically under KV "
+            "pressure (before the retraction fallback discards sessions), "
+            "raised again only after --admission-release-hysteresis "
+            "consecutive samples of pool occupancy at or below "
+            "--admission-release-low, and can be set directly through "
+            "/set_internal_state {'effective_max_running_requests': N}. "
+            "The decode CUDA-graph capture bound is widened to the ceiling "
+            "so the whole declared range stays captured (graph memory grows "
+            "with it; pin --cuda-graph-max-bs-decode to override). "
+            "Default: unset = no ceiling, no float, today's behavior "
+            "byte-identical (the limiter is a passive holder of "
+            "max_running_requests and the admission arithmetic is unchanged).",
+        ),
+    ] = None
+    admission_floor: A[
+        int,
+        Arg(
+            help="Lowest value the dynamic admission limit (#287) may float "
+            "down to. The throttle never goes below this, so a server under "
+            "sustained pressure keeps serving at least this many sessions "
+            "concurrently instead of serializing. Only in effect with "
+            "--max-running-requests-ceiling.",
+        ),
+    ] = 1
+    admission_throttle_high: A[
+        float,
+        Arg(
+            help="Pool-occupancy fraction (0..1] at or above which the "
+            "dynamic admission limit (#287) is lowered. Deliberately high: "
+            "the limiter is the last cheap step before retraction, not a "
+            "general-purpose governor. Only in effect with "
+            "--max-running-requests-ceiling.",
+        ),
+    ] = 0.90
+    admission_release_low: A[
+        float,
+        Arg(
+            help="Pool-occupancy fraction at or below which the dynamic "
+            "admission limit (#287) may be raised again. Must be strictly "
+            "below --admission-throttle-high; the gap between the two marks "
+            "is the hysteresis band in which the limit simply holds. Only in "
+            "effect with --max-running-requests-ceiling.",
+        ),
+    ] = 0.70
+    admission_release_hysteresis: A[
+        int,
+        Arg(
+            help="Consecutive samples at or below --admission-release-low "
+            "required before the dynamic admission limit (#287) is raised. "
+            "Lowering is immediate, raising needs proof -- raising on a "
+            "momentary dip is how a throttle becomes a thrash loop. Must be "
+            ">= 1. Only in effect with --max-running-requests-ceiling.",
+        ),
+    ] = 8
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -4634,6 +4698,11 @@ class ServerArgs:
         # or it over-provisions the mamba pool and OOMs at pool init.
         self.max_running_requests_user_set = self.max_running_requests is not None
 
+        # #287: must run before any handler reads max_running_requests, since
+        # this is where the ceiling takes that field over as the DIMENSIONING
+        # value and the user's figure becomes the float's start.
+        self._handle_max_running_requests_ceiling()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -5541,6 +5610,85 @@ class ServerArgs:
                 f"--gdn-state-set-ladder-hysteresis must be >= 1 (admission "
                 f"cycles below the threshold before the rung drops), got "
                 f"{self.gdn_state_set_ladder_hysteresis}."
+            )
+
+    def _handle_max_running_requests_ceiling(self):
+        """#287: turn --max-running-requests-ceiling into the dimensioning
+        value and the user's --max-running-requests into the float's start.
+
+        The rewrite is what makes the rest of the feature a small patch:
+        ``_resolve_max_num_reqs`` -- and through it ``req_to_token_pool``, the
+        mamba/GDN slot table, the hybrid KV token caps and (via
+        ``req_to_token_pool.size``) the decode capture set -- all read
+        ``max_running_requests``, so pointing that field at the ceiling sizes
+        every pool for the ceiling without touching a single sizing site. The
+        start value is carried separately in ``max_running_requests_start``
+        and consumed by the scheduler's ``AdmissionLimiter``.
+
+        Unset ceiling = ``max_running_requests_start`` stays None, no limiter
+        is armed, and the field keeps whatever the user (or a later hook) put
+        in it -- today's behavior, byte-identical."""
+        self.max_running_requests_start = None
+        if self.max_running_requests_ceiling is None:
+            return
+
+        ceiling = int(self.max_running_requests_ceiling)
+        if ceiling < 1:
+            raise ValueError(
+                f"--max-running-requests-ceiling must be >= 1, got {ceiling}."
+            )
+        if self.max_running_requests is not None:
+            start = int(self.max_running_requests)
+            if start < 1:
+                raise ValueError(
+                    f"--max-running-requests must be >= 1 when a ceiling is "
+                    f"set, got {start}."
+                )
+            if start > ceiling:
+                raise ValueError(
+                    f"--max-running-requests ({start}) exceeds "
+                    f"--max-running-requests-ceiling ({ceiling}). With a "
+                    f"ceiling the former is the START of a limit that floats "
+                    f"BELOW the latter; a start above the ceiling has no "
+                    f"meaning. Raise the ceiling or lower the start."
+                )
+            self.max_running_requests_start = start
+        # From here on the field IS the ceiling -- the dimensioning value.
+        # With no explicit start the float simply begins at the top and only
+        # ever floats down under pressure.
+        self.max_running_requests = ceiling
+        # The ceiling is an explicit operator concurrency target, so the
+        # demand-driven sizing paths must treat it as user-set (they do not
+        # trust an auto-defaulted max_running_requests).
+        self.max_running_requests_user_set = True
+
+        if self.admission_floor < 1:
+            raise ValueError(
+                f"--admission-floor must be >= 1, got {self.admission_floor}."
+            )
+        if self.admission_floor > ceiling:
+            raise ValueError(
+                f"--admission-floor ({self.admission_floor}) exceeds "
+                f"--max-running-requests-ceiling ({ceiling}): the admission "
+                f"limit would have no range to float in."
+            )
+        if not 0.0 < self.admission_throttle_high <= 1.0:
+            raise ValueError(
+                f"--admission-throttle-high must be in (0, 1], got "
+                f"{self.admission_throttle_high}."
+            )
+        if not 0.0 < self.admission_release_low < self.admission_throttle_high:
+            raise ValueError(
+                f"--admission-release-low ({self.admission_release_low}) must "
+                f"be in (0, --admission-throttle-high="
+                f"{self.admission_throttle_high}). Equal marks make the "
+                f"controller flap on every sample; the gap between them is "
+                f"the hysteresis band."
+            )
+        if self.admission_release_hysteresis < 1:
+            raise ValueError(
+                f"--admission-release-hysteresis must be >= 1, got "
+                f"{self.admission_release_hysteresis}."
             )
 
     def _handle_kv_pressure_ladder(self):
@@ -8136,6 +8284,7 @@ class ServerArgs:
         prefill_cuda_graph_config = self.cuda_graph_config.prefill
 
         self._apply_gpu_mem_capacity_defaults(gpu_mem)
+        self._widen_decode_capture_to_session_ceiling(decode_cuda_graph_config)
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
@@ -8369,6 +8518,41 @@ class ServerArgs:
         ):
             return 2 * 1024
         return 0.0
+
+    def _widen_decode_capture_to_session_ceiling(self, decode_cuda_graph_config):
+        """#287: make the decode capture set cover the DECLARED concurrency.
+
+        ``cuda_graph_config.decode.max_bs`` defaults to a GPU-memory tier and
+        knows nothing about how many sessions the operator intends to run. A
+        batch above the largest captured size falls back to eager -- which is
+        exactly the regime a session ceiling exists to serve, so the top of
+        the declared range would be the slowest part of it.
+
+        Only when a ceiling is set and the operator has not pinned the bound
+        themselves; graph memory grows with the bound, and that headroom is
+        their call (``--cuda-graph-max-bs-decode`` overrides). The runtime
+        still clamps the captured list to ``req_to_token_pool.size``, so
+        overshooting here can only be filtered away, never over-capture."""
+        if (
+            self.max_running_requests_ceiling is None
+            or self.cuda_graph_max_bs_decode is not None
+            or decode_cuda_graph_config.bs is not None
+            or self.device == "cpu"
+        ):
+            return
+        dp_size = self.dp_size if self.enable_dp_attention else 1
+        wanted = max(1, int(self.max_running_requests_ceiling) // max(1, dp_size))
+        current = int(decode_cuda_graph_config.max_bs or 0)
+        if current >= wanted:
+            return
+        logger.info(
+            "Raising the decode CUDA-graph capture bound from %d to %d so the "
+            "captured range covers the session ceiling; graph memory grows "
+            "with it. Pin --cuda-graph-max-bs-decode to override.",
+            current,
+            wanted,
+        )
+        decode_cuda_graph_config.max_bs = wanted
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """

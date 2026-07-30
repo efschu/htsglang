@@ -19,11 +19,11 @@ THE STEP TABLE (``PressureLadder``). An ordered ladder of ``LadderStep``s:
 * ``base``          -- rung 0, the performance-optimal state the server boots
                        in. Exactly one, always index 0.
 * ``relief``        -- an EXISTING KV-relief feature, referenced BY NAME
-                       (``RELIEF_FEATURES``), never reimplemented here:
-                       uneven-DCP token ratio, KV spill to host RAM
-                       (#134/#236), the weightless KV rank (#115), session
-                       offload. No KV layout change, hence handover
-                       ``none``.
+                       (``RELIEF_FEATURES``), never reimplemented here: the
+                       floating admission cap (#287), uneven-DCP token ratio,
+                       KV spill to host RAM (#134/#236), the weightless KV
+                       rank (#115), session offload. No KV layout change,
+                       hence handover ``none``.
 * ``geometry_flip`` -- a geometry INSIDE the nesting family. Thanks to the
                        down-set property the finest cut already holds every
                        coarser geometry in the SAME bytes, so this is a plan
@@ -149,6 +149,8 @@ STEP_TYPE_ORDER: Dict[str, int] = {
 #: user-facing flag / issue the step switches -- this module never implements
 #: any of them, it only orders them into the ladder.
 RELIEF_FEATURES: Dict[str, str] = {
+    "admission_cap": "--max-running-requests-ceiling (#287, the floating "
+    "concurrent-session limit; throttles the inflow, moves no KV)",
     "dcp_ratio": "--rank-kv-ratio (uneven-DCP KV-token ownership vector)",
     "kv_spill": "KV spill to host RAM (#134/#236 spill machinery)",
     "weightless_rank": "--weightless-kv-fastlane (#115, KV capacity without "
@@ -159,6 +161,11 @@ RELIEF_FEATURES: Dict[str, str] = {
 #: Canonical cheapness order of the relief features (cheapest first). A table
 #: generator uses it so the same rig always produces the same ladder.
 RELIEF_ORDER: Tuple[str, ...] = (
+    # Cheapest rung of the whole ladder and the only one that is an actuator
+    # rather than a data movement: lowering the admission limit is a counter
+    # update, it copies nothing and it discards nothing. It is therefore the
+    # first thing tried under pressure and the last thing given back.
+    "admission_cap",
     "dcp_ratio",
     "kv_spill",
     "weightless_rank",

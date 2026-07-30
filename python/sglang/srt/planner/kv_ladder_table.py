@@ -28,9 +28,10 @@ WHAT IT COMPUTES, AND FROM WHAT:
 
 * THE RUNGS. Base = the profile's first (coarsest, fastest) geometry. Then
   the enabled relief features in their canonical cheapness order
-  (``RELIEF_ORDER``): DCP token ratio, KV spill, weightless rank, session
-  offload -- referenced by name, never implemented here. Then the remaining
-  geometries, coarse to fine. Then the out-of-family (Nachtrag-14) steps.
+  (``RELIEF_ORDER``): admission cap, DCP token ratio, KV spill, weightless
+  rank, session offload -- referenced by name, never implemented here. Then
+  the remaining geometries, coarse to fine. Then the out-of-family
+  (Nachtrag-14) steps.
   The resulting order is exactly the one ``PressureLadder`` enforces, so the
   generator cannot produce a table the runtime would reject.
 
