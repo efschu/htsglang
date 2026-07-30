@@ -10378,3 +10378,101 @@ Logs gezogen:
 
 Accept liegt in beiden Armen bei 2,4-2,9 bei k=3 — NEXTN lief, und die
 Decode-Zahlen sind mit Spekulation gemessen, nicht ohne.
+
+## #293 Schritt 2: Mehrrunden fuer all_reduce und all_to_all (2026-07-30)
+
+Antwort auf den Nebenbefund von Schritt 1: **`chunked_prefill_size` > 2456
+haette den BAR1-Pfad im Prefill still abgeschaltet.** Der Kipp-Punkt ist
+jetzt keiner mehr.
+
+### Implementierungsform: kein neuer Kernel
+
+Nach demselben Muster wie `ag_plan` und `bc_plan`, das dieselbe Frage fuer
+all_gather und broadcast schon beantwortet hat.
+
+* **`ar_plan(nbytes, chunk_max, welt)`** -- eine Runde ist ein
+  VOLLSTAENDIGES all_reduce ueber einen Ausschnitt. Derselbe Kern, dieselbe
+  Zerlegung in `welt` Scherben, nur weniger Bytes je Start.
+  `htccl_all_reduce` schneidet den flachen Puffer in Sichten (Versatz und
+  Laenge sind Vielfache von 16, die Ausrichtung bleibt also erhalten) und
+  ruft den bisherigen Rumpf, der unveraendert als
+  `_all_reduce_eine_runde` daneben steht. Bei einer Runde ist der Weg
+  Buchstabe fuer Buchstabe der alte.
+* **`a2a_runden(groesster_block, schlitz)`** -- die Rundenzahl faellt aus
+  dem GRUPPENWEIT groessten Block, den die Naht ohnehin schon ausrechnet
+  (`HTCCLCommunicator.all_to_all_single`), und wird als Parameter
+  hereingereicht. Aus der eigenen Zeile gerechnet waere sie rangabhaengig,
+  und ein Rang mit einer Runde weniger laesst die anderen in der Sperre
+  stehen. `htccl_all_to_all_single` ist jetzt der Wrapper mit der Schleife,
+  `_a2a_eine_runde` der bisherige Rumpf. all_gather und broadcast rufen
+  ohne `runden` und laufen unveraendert.
+
+**Gleichmaessig verteilt, nicht bis zum Anschlag gefuellt.** Der
+naheliegende Weg -- jede Runde voll, der Rest in die letzte -- erzeugt einen
+Schwanz, der beliebig klein werden kann, und der Wirt besteht auf
+`n4 >= R` (ein 128-Bit-Paket je Rang, `TORCH_CHECK`). Eine Restrunde von 16
+Byte bei drei Raengen waere kein langsamer Fall, sondern ein Abbruch.
+Gleichmaessig verteilt liegt die kleinste Runde hoechstens EIN Paket unter
+der groessten; ein Test faehrt genau die Nutzlast, die den kurzen Schwanz
+erzeugt haette.
+
+Die Rundenzahl haengt allein an `nbytes`, `chunk_max` und `welt`. Alle drei
+sind gruppenweit gleich und fuer eine aufgezeichnete Form konstant -- die
+Zahl der Kernelstarts ist eingebrannt, also graph-sicher. Dasselbe Argument
+wie bei ag/bc.
+
+### Deckungsbereich, vorher und nachher
+
+Geometrie des Laufs: Schlitz/`chunk_max` 8188 KiB, R=3, also
+`chunk_max*welt` = 25 153 536 Byte je Runde.
+
+| Tokens/Batch | Bytes | vorher | nachher |
+|---:|---:|---|---|
+| 2048 (Arbeitspunkt) | 20 971 520 | 1 Runde | 1 Runde, unveraendert |
+| 2456 (letzter passender) | 25 149 440 | 1 Runde | 1 Runde |
+| **2457** | 25 159 680 | **False, stiller Rueckfall** | **2 Runden** |
+| **4096** | 41 943 040 | **False, stiller Rueckfall** | **2 Runden** |
+| **8192** | 83 886 080 | **False, stiller Rueckfall** | **4 Runden** |
+
+Vorher: `min_bytes .. chunk_max*welt` (25,1 MB). Nachher lueckenlos
+`min_bytes .. chunk_max*welt*ar_max_runden` = 402 MB bei Vorgabe 16 Runden.
+Fuer all_to_all analog: `a2a_schlitz` -> `a2a_schlitz*a2a_max_runden`.
+Was darueber liegt, wird mit BENANNTEM Grund abgelehnt (Rundengrenze), nicht
+still.
+
+### Die Ehrlichkeitsregel, ab jetzt fuer jede Groesse
+
+Rueckfall ist in Ordnung, lautlos nicht. Ausserhalb einer Aufzeichnung ist
+die gloo-Ebene ein gangbarer, nur langsamerer Weg -- deshalb bricht dort
+nichts ab. Aber ein Transport, der fuer eine Groesse aussteigt, waehrend das
+Protokoll "transport=bar1" sagt, entwertet jede Zahl, die danach genommen
+wird. Genau das waere im Prefill passiert.
+
+`htccl._select` meldet den Rueckfall jetzt mit Operation, Bytezahl, Gruppe,
+gedeckter Menge und -- ueber das neue `warum_nicht(op, nbytes)` des
+Transports -- dem GRUND. Einmal je (Operation, Groessenklasse) und Gruppe:
+im heissen Pfad laufen dieselben Groessen tausendfach, und eine Warnung je
+Kollektiv waere ein Log-Sturm, den niemand liest. Die Groessenklasse ist der
+Zweierlogarithmus -- fein genug, dass ein neuer Betriebspunkt auffaellt.
+`warum_nicht` entscheidet nichts; liegt sie einmal daneben, ist der Schaden
+ein ungenauer Satz im Protokoll, waehrend ein stiller Rueckfall eine
+Messung kostet.
+
+Der Hinweis gilt fuer JEDE Operation und jeden Transport, nicht nur fuer
+diesen einen Fall -- er sitzt im `_select`-Pfad, nicht an der Groesse.
+
+### Testzahlen
+
+| Suite | Ergebnis |
+|---|---|
+| `test_htccl_bar1_allreduce_rounds.py` (neu) | 38 passed |
+| `test/registered/unit/distributed/` | 20 failed / 1259 passed / 8 skipped |
+| auf `7adb1bdf4a` | 20 failed / 1221 passed / 8 skipped -- dieselben 20 |
+
+Die 20 sind die bekannten 16 plus vier in `test_s12_log_analyse.py`, die
+schon auf der Basis rot sind. Fehlermengen gegeneinander gestellt, nicht nur
+gezaehlt: keine neue.
+
+**Kein Spill-Beleg faellig** -- `htccl_bar1_ext.py` ist nicht angefasst
+(`git diff --quiet` darauf), es gibt keinen neuen Kernel und keine geaenderte
+Kernquelle. Die Aenderung liegt vollstaendig in der Naht.
