@@ -99,6 +99,25 @@ WARMUP_PROMPT = (
 )
 WARMUP_MAX_NEW_TOKENS = 96
 
+# Floor under every prompt's own max_new_tokens, applied identically to every
+# arm and every class. The per-prompt budgets in structured_v1.json (288-448)
+# were sized for the bare answer, but the target is a REASONING checkpoint: it
+# opens with a <think> block and only then emits the code or the JSON object.
+# When that preamble is long the budget runs out mid-thought, the answer never
+# reaches its closing brace, and the validator rejects a generation that was
+# not wrong but merely cut off -- measured on the first arm of the #285 window:
+# valid share 0.33 for code and 0.60 for JSON, against 1.00 for the list class
+# whose answers are short enough to fit either way. The failures were the
+# prompts whose think block was long and the passes were the ones the model
+# answered with an empty <think></think>, which is the signature of a truncated
+# budget and not of a model that cannot produce the format.
+#
+# This is a floor and never a cap: a prompt asking for more than the floor
+# keeps its own value. Raising it lengthens every request on BOTH arms alike,
+# so it moves the working point (fewer requests per window) but not the
+# comparison. Unset = the prompt file's own budgets, unchanged.
+MIN_MAX_NEW_TOKENS = int(os.environ.get("S16_MIN_MAX_NEW_TOKENS", "0") or 0)
+
 # How many raw answers per point land on disk. Enough to read, small enough to
 # keep in the run directory next to everything else.
 SAMPLES_PER_POINT = 3
@@ -463,8 +482,9 @@ class Pool:
                     {
                         "text": p["prompt"],
                         "sampling_params": {
-                            "max_new_tokens": int(
-                                p.get("max_new_tokens", self.default_max_new)
+                            "max_new_tokens": max(
+                                int(p.get("max_new_tokens", self.default_max_new)),
+                                MIN_MAX_NEW_TOKENS,
                             ),
                             "temperature": 0,
                         },

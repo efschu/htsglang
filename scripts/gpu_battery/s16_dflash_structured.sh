@@ -121,6 +121,18 @@ MAX_TOTAL_TOKENS="${S16_MAX_TOTAL_TOKENS:-}"
 # produces. Identical on every arm, so it cannot move the comparison.
 LOG_INTERVAL="${S16_LOG_INTERVAL:-1}"
 
+# Optional pin for the uneven-MLP weight vector, applied IDENTICALLY to every
+# arm. `--rank-tp-ratio auto-performance` calls the stage-0 hardware probe
+# whenever no profile for the CURRENT PROFILE_VERSION is cached, and #303 has
+# that probe sitting out its full 600 s subprocess timeout in the pairwise
+# link-matrix rendezvous -- once per boot, on a window that boots six times.
+# Pinning the vector takes the documented pin path, which returns before
+# get_hardware_profile and skips probe and optimizer both. The pin cannot move
+# the comparison: it is the same vector on both arms, so it lands in the boot
+# recipe that is held fixed, not in the difference being read. Empty = the
+# unmodified auto-performance path.
+MLP_VECTOR="${S16_MLP_VECTOR:-}"
+
 # The speculative block per algorithm, and it is the ONLY thing the arms differ
 # in. NEXTN: the 3-step chain of the reference recipe. DFLASH: block size 16,
 # the drafter's own verify window, split placement (the default) so the
@@ -188,12 +200,14 @@ HOSTPID=""
 # and the reserve vector is written for that order.
 s16_write_boot_script() {
     local out="$1" spec="$2" hostlog="$3" hostpid="$4" port="$5"
-    local hv hw hm hcache pin=""
+    local hv hw hm hcache pin="" mlpenv=""
     hv="$(host_path "$VENV")" || return 2
     hw="$(host_path "${S16_HOST_WT:-$WT}")" || return 2
     hm="$(host_path "$TARGET")" || return 2
     hcache="$(host_path "${BAR1_EXTCACHE:-/spinning/torch-ext-cache}")" || return 2
     [ -n "$MAX_TOTAL_TOKENS" ] && pin="--max-total-tokens $MAX_TOTAL_TOKENS"
+    [ -n "$MLP_VECTOR" ] && mlpenv="SGLANG_UNEVEN_MLP_VECTOR=$MLP_VECTOR \\
+"
 
     cat > "$out" <<EOF
 #!/usr/bin/env bash
@@ -205,7 +219,7 @@ cd $hw
 PYTHONPATH=$hw/python:$hv/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=$hv/lib/python3.12/site-packages/nvidia/cu13/lib \\
 CUDA_HOME=$hv/lib/python3.12/site-packages/nvidia/cu13 \\
-SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 \\
+${mlpenv}SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 \\
 SGLANG_MAMBA_SSM_DTYPE=bfloat16 FLASHINFER_DISABLE_VERSION_CHECK=1 \\
 TORCH_EXTENSIONS_DIR=$hcache \\
 TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
