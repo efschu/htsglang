@@ -47,6 +47,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from s11_bar1_e2e import RE_GROUP  # noqa: E402  one regex, one place
+from s12_log_analyse import (  # noqa: E402  one parser, one place
+    decode_tick_aggregat,
+    im_fenster,
+    parse_decode,
+)
 
 KIND = "bar1_prefill_kurve"
 SCHEMA_VERSION = 1
@@ -226,6 +231,40 @@ def messe_prefill(
     }
 
 
+def ernte_ticks(server_log: str, von: float, bis: float, batch: int) -> dict:
+    """The scheduler's own decode ticks for the window a decode point ran in.
+
+    Why this exists at all. The request level and the tick level answer two
+    different questions and the 2026-07-30 run only ever recorded the first:
+
+    * ACCEPT was None in every one of the eight points. `meta_info` is opt-in on
+      the chat endpoint (`protocol.py` `return_meta_info: bool = False`), and
+      the accept request never asked for it. The scheduler logs `accept len` on
+      every tick no matter who asked.
+    * THE RATE was the request level's: tokens of a stream over the wall clock
+      of that stream, prefill and queue included. That reported 32 tok/s at
+      bs=1 where the decode loop was turning over 77-83.
+
+    Neither number replaces the other, so both are kept and both are labelled.
+    """
+    out = {"tick_quelle": server_log or None}
+    if not server_log or not os.path.exists(server_log):
+        out["tick_fehler"] = "kein Serverlog"
+        return out
+    try:
+        with open(server_log, errors="replace") as f:
+            ticks = parse_decode(f)
+    except OSError as exc:
+        out["tick_fehler"] = f"{type(exc).__name__}: {exc}"
+        return out
+    # Prefixed, because `ms_pro_token` exists on both levels and an unprefixed
+    # merge would silently replace the request-level number with the tick one --
+    # exactly the conflation this fix is about.
+    agg = decode_tick_aggregat(im_fenster(ticks, von, bis), batch)
+    out.update({f"tick_{k}": v for k, v in agg.items()})
+    return out
+
+
 def messe_decode(port: int, batch: int, seconds: float) -> dict:
     results: list = []
     lock = threading.Lock()
@@ -325,7 +364,10 @@ def modus_messen(args) -> int:
     decode = []
     if args.with_decode:
         for batch in DECODE_BATCHES:
-            decode.append(messe_decode(args.port, batch, args.point_seconds))
+            von = time.time()
+            punkt_decode = messe_decode(args.port, batch, args.point_seconds)
+            punkt_decode.update(ernte_ticks(args.server_log, von, time.time(), batch))
+            decode.append(punkt_decode)
 
     punkt = {
         "folge": args.folge,
@@ -542,6 +584,10 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
     }
 
 
+def _zahl(v, nk: int) -> str:
+    return "None" if not isinstance(v, (int, float)) else format(v, f".{nk}f")
+
+
 def tabelle(payload: dict) -> str:
     """The live table, rendered from the persisted points. Pure presentation:
     no marking, no comparison with an expectation, no verdict."""
@@ -561,17 +607,25 @@ def tabelle(payload: dict) -> str:
         )
     dec = payload.get("decode") or []
     if dec:
+        # Two levels, both named. The tick columns are what the decode loop
+        # turns over; the request column is tokens over the wall clock of a
+        # whole stream and therefore carries prefill and queue with it. They
+        # differ by more than a factor of two, so an unlabelled "decode tok/s"
+        # column is not a number anybody can use.
         lines += [
             "",
-            "| arm | bs | decode tok/s | ms/Token | accept |",
-            "|---|---:|---:|---:|---:|",
+            "| arm | bs | tok/s (Tick) | ms/Token (Tick) | accept (Tick) "
+            "| Ticks | tok/s (Anfrage) |",
+            "|---|---:|---:|---:|---:|---:|---:|",
         ]
         for d in dec[-8:]:
             lines.append(
                 f"| {d.get('arm')} | {d.get('batch')} "
-                f"| {d.get('decode_tok_s') if d.get('decode_tok_s') is None else format(d['decode_tok_s'], '.1f')} "
-                f"| {d.get('ms_pro_token') if d.get('ms_pro_token') is None else format(d['ms_pro_token'], '.2f')} "
-                f"| {d.get('spec_accept_length')} |"
+                f"| {_zahl(d.get('tick_gen_tok_s_median'), 1)} "
+                f"| {_zahl(d.get('tick_ms_pro_token'), 2)} "
+                f"| {_zahl(d.get('tick_accept_len_median'), 2)} "
+                f"| {_zahl(d.get('tick_ticks_gewertet'), 0)} "
+                f"| {_zahl(d.get('decode_tok_s'), 1)} |"
             )
     return "\n".join(lines) + "\n"
 
@@ -603,6 +657,12 @@ def main() -> int:
     ap.add_argument("--warmup-seconds", type=float, default=8.0)
     ap.add_argument("--prompt-tokens", type=int, default=2048)
     ap.add_argument("--with-decode", type=int, default=1)
+    ap.add_argument(
+        "--server-log",
+        default="",
+        help="Pfad des Serverlogs AUF DEM HOST -- daraus kommen accept len und "
+        "die Tick-Rate des Decodes, die auf Anfrageebene nicht zu haben sind",
+    )
     ap.add_argument(
         "--tol-pct",
         type=float,

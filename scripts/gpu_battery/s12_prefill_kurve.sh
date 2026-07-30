@@ -91,7 +91,7 @@ set -uo pipefail
   --mode messen --port $PORT --out-dir $DIR_HOST \\
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
   --prompt-tokens $PROMPT_TOKENS \\
-  --arm "\$1" --sessions "\$2" --folge "\$3"
+  --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4"
 EOF
 chmod +x "$DIR/remote_messen.sh"
 
@@ -135,8 +135,12 @@ for N in $SESSIONS; do
             "HTCCL-BAR1: Aufbau in" \
             "waehrend einer CUDA-Graph-Aufzeichnung"
 
+        # The server log goes along: accept len and the tick rate of the decode
+        # only exist in the scheduler's own lines. Read live, while the server
+        # still runs -- after the kill the file is still there, but the run
+        # directory is not where it lives.
         host_run_script 900 "$DIR/remote_messen.sh" "$ARM" "$N" "$FOLGE" \
-            >> "$DIR/messen.log" 2>&1
+            "$HOSTLOG" >> "$DIR/messen.log" 2>&1
         MRC=$?
         echo "  Messung rc=$MRC"
 

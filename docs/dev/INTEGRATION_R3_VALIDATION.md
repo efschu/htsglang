@@ -10130,7 +10130,11 @@ Direktpfad wieder staerker machen) und ist an den gemessenen 0,997 / 1,009
 gefallen. Die Kontentions-Hypothese fuehrt jetzt: der Gewinn bei 1 Session
 verschwindet, sobald mehrere Raenge um denselben BAR1-Pfad konkurrieren.
 Task #293 nimmt das auf, erster Schritt ist eine Compute/Wait-Analyse aus
-den bereits vorliegenden s12-Logs, keine neue Messung.
+den bereits vorliegenden s12-Logs, keine neue Messung. Dieser Schritt ist
+inzwischen gefahren und praezisiert die Formulierung oben: die Kontention
+sitzt nicht im BAR1-Pfad, sondern in einer gemeinsamen Decke, die beide
+Arme ab vier Sessions auf dasselbe Niveau zwingt — siehe Abschnitt
+"#293 Schritt 1: Wait-Analyse der s12-Logs" am Ende dieser Datei.
 
 Reproduktions-Nebenbefund: die Grundlinie dieses Laufs liegt ca. 8 % ueber
 der Grundlinie der Uebergabe-Referenz. Das ist Umgebungsdrift, keine
@@ -10170,3 +10174,207 @@ umgekehrt.
 - `htccl_matrix_transport.HTCCL_OPS`-Luecke: `all_gather` fehlt dort;
   vorbestehend, nicht durch dieses Fenster eingefuehrt.
 - sm120-Gitter REG 40 -> 48 noch zu messen.
+
+## #293 Schritt 1: Wait-Analyse der s12-Logs (2026-07-30)
+
+Aus den Serverlogs des s12-Laufs vom selben Tag, ohne neue Messung und ohne
+Karte. Werkzeug: `scripts/gpu_battery/s12_log_analyse.py`, Tests
+`test/registered/unit/distributed/test_s12_log_analyse.py` gegen echte
+Logzeilen (Herkunft in `fixtures/gpu_battery/s12_wait_analyse/PROVENIENZ.md`).
+
+Die Frage war, warum das Verhaeltnis bar1/Grundlinie von 1,143 bei einer
+Session auf 0,997 bei acht faellt: Groesseneffekt oder Kontention. Die
+`Prefill rank batch`-Zeilen tragen seit #252 die CollectiveClock-Trennung
+`gpu-ms: X (compute Y, wait Z)` je Rang, und Kollektivzeit faellt dort
+vollstaendig in `wait`. Messfenster je Punkt sind die letzten N Grossbatches
+vor der Decode-Phase, N aus der Anfragezahl des Punktes selbst — Warmup und
+Punkt loggen identisch, und das ist die einzige Grenze, die das Log hergibt.
+
+### compute/wait je Rang und Sessionzahl
+
+| Arm | Sess. | TP0 compute | TP0 wait | TP1 compute | TP1 wait | TP2 compute | TP2 wait | gpu-ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bar1 | 1 | 143,9 | 1053,8 | 547,2 | 652,6 | 519,0 | 681,9 | 1200,8 |
+| bar1 | 4 | 149,6 | 1607,2 | 562,0 | 1195,9 | 548,7 | 1208,2 | 1763,5 |
+| bar1 | 8 | 149,6 | 1635,8 | 564,0 | 1220,1 | 553,0 | 1232,2 | 1785,2 |
+| bar1 | 16 | 149,6 | 1640,4 | 573,3 | 1218,2 | 566,0 | 1228,6 | 1789,5 |
+| Grundlinie | 1 | 146,0 | 1266,7 | 547,1 | 867,2 | 542,8 | 879,7 | 1413,4 |
+| Grundlinie | 4 | 149,7 | 1622,7 | 560,0 | 1212,3 | 551,5 | 1220,8 | 1771,8 |
+| Grundlinie | 8 | 149,7 | 1632,3 | 568,0 | 1214,5 | 554,2 | 1227,7 | 1781,7 |
+| Grundlinie | 16 | 149,8 | 1637,2 | 569,2 | 1217,4 | 567,1 | 1221,3 | 1787,0 |
+
+Alles in Millisekunden je Prefill-Batch, Median ueber das Messfenster.
+Wait-Anteile (Summe wait / Summe gpu-ms) 1 -> 8 Sessions:
+
+| Rang | bar1 | Grundlinie |
+|---|---|---|
+| TP0 | 86,6 % -> 91,5 % (+4,9 pp) | 88,1 % -> 91,1 % (+3,0 pp) |
+| TP1 | 53,8 % -> 67,8 % (+14,0 pp) | 60,3 % -> 67,2 % (+6,9 pp) |
+| TP2 | 56,1 % -> 68,4 % (+12,3 pp) | 61,2 % -> 67,9 % (+6,7 pp) |
+
+### Die Kernfrage: ja, ueberproportional — aber nicht ueber die Grundlinie hinaus
+
+Der Zuwachs der Wartezeit von 1 auf 8 Sessions, auf dem rechenkritischen Rang
+TP1: bar1 652,6 -> 1220,1 ms (+87,0 %), Grundlinie 867,2 -> 1214,5 ms
+(+40,0 %). Faktor 2,2 im relativen Zuwachs, auf TP2 (+80,7 % gegen +39,6 %)
+und TP0 (+55,2 % gegen +28,9 %) dasselbe Bild. Die Antwort auf die gestellte
+Frage ist damit ja.
+
+Der zweite Teil derselben Zahlen entscheidet aber, was das heisst:
+
+| Sessions | gpu-ms bar1 | gpu-ms Grundlinie | Delta | wait TP1 bar1 | wait TP1 Grundlinie | Delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1200,7 | 1413,4 | **-212,7** | 652,6 | 867,2 | **-214,6** |
+| 4 | 1763,4 | 1771,8 | -8,4 | 1195,9 | 1212,3 | -16,4 |
+| 8 | 1785,1 | 1781,5 | +3,5 | 1220,1 | 1214,5 | +5,6 |
+| 16 | 1789,5 | 1787,0 | +2,5 | 1218,2 | 1217,4 | +0,8 |
+
+Bei einer Session sitzt der gesamte bar1-Vorsprung in `wait` und nirgends
+sonst: 212,7 ms weniger Batchzeit, davon 214,6 ms weniger Wartezeit, bei
+identischer Rechenzeit (143,9 gegen 146,0 ms auf TP0, 547,2 gegen 547,1 auf
+TP1). Das ist die saubere Bestaetigung, dass die CollectiveClock misst, was
+sie messen soll.
+
+Ab vier Sessions landen beide Arme auf demselben absoluten Niveau, dreimal
+unabhaengig: 0,5 % / 0,2 % / 0,1 % Abstand in der Batchzeit. Eine
+transportspezifische Kontention muesste bar1 UEBER die Grundlinie tragen; sie
+traegt ihn exakt AUF sie. Der ueberproportionale Zuwachs ist damit die
+Arithmetik des schnelleren Arms, der seinen Vorsprung an eine gemeinsame Decke
+verliert, und kein Beleg dafuer, dass der BAR1-Pfad unter Nebenlaeufigkeit
+langsamer wird als der Host-Pfad.
+
+`compute` waechst dabei auf keinem Rang und in keinem Arm um mehr als 5 %
+(TP1 bar1 547,2 -> 573,3, Grundlinie 547,1 -> 569,2). Ueber 96 % des
+Batchzeit-Zuwachses beider Arme steckt in `wait`.
+
+### Chunkgroessen: der Groesseneffekt ist ausgeschlossen, nicht abgewaehlt
+
+| Arm | Sess. | Grossbatches | #new-token max | #chunks max | all_reduce Byte | Runden | Belegung |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bar1 | 1 | 11 | 2048 | 1 | 20 971 520 | 1 | 95 % |
+| bar1 | 4 | 10 | 2048 | 1 | 20 971 520 | 1 | 118 % |
+| bar1 | 8 | 14 | 2048 | 1 | 20 971 520 | 1 | 111 % |
+| bar1 | 16 | 23 | 2048 | 1 | 20 971 520 | 1 | 106 % |
+| Grundlinie | 1 | 10 | 2048 | 1 | 20 971 520 | 1 | 103 % |
+| Grundlinie | 4 | 10 | 2048 | 1 | 20 971 520 | 1 | 113 % |
+| Grundlinie | 8 | 14 | 2048 | 1 | 20 971 520 | 1 | 110 % |
+| Grundlinie | 16 | 22 | 2048 | 1 | 20 971 520 | 1 | 104 % |
+
+`chunked_prefill_size=2048` deckelt jeden Prefill-Batch, `#chunks` ist in
+allen acht Punkten 1, und die Prompts liegen bei ~2048 Token. Die reale
+Kollektivgroesse ist deshalb bei 1 wie bei 16 Sessions dieselbe: 2048 x 5120 x
+2 Byte = 20,0 MiB je all_reduce. Mehr Sessions erzeugen mehr Batches, nicht
+groessere. Ein Groesseneffekt kann die Kompression also nicht erklaeren, und
+das Solo-Groessenprofil ist an dieser Stelle gar nicht der richtige Massstab —
+die 4-MiB-Delle liegt eine Groessenordnung neben dem tatsaechlichen
+Arbeitspunkt. Der groessenrichtige Vergleichswert ist der 1-Session-Punkt
+dieses Laufs selbst, bei exakt 20 MiB gemessen: 24,7 % weniger Wartezeit auf
+TP1.
+
+Die Restposten unter 1000 Token in denselben Fenstern sind die Chunk-Reste
+ueberlanger Prompts (ein 2055-Token-Prompt hinterlaesst einen 7-Token-Batch),
+1 bis 7 Stueck je Punkt. Zu wenige, um daraus eine eigene Aussage zu ziehen.
+
+### Rundenzahl: konstant 1, und der Kipp-Punkt wurde nie beruehrt
+
+Aus der Aufbau-Zeile: Region 96,0 MiB je Rang, 12 Schlitze, Schlitz 8188 KiB,
+groesste Nutzlast 24564 KiB. BAR1 zerlegt ein all_reduce in `welt` gleich
+grosse Scherben (Reduce-Scatter, dann All-Gather), die Scherbe muss in einen
+Schlitz passen:
+
+* Scherbe bei 2048 Token: 20 971 520 / 3 = 6 990 507 Byte = 6,67 MiB.
+* Schlitz: 8188 KiB = 7,996 MiB. `ceil(6,67 / 7,996) = 1` Runde.
+* Kipp-Punkt: Nutzlast > 3 x 8188 KiB = 25 153 536 Byte, also **> 2456 Token
+  je Batch**.
+
+Kein Punkt des Laufs kam in die Naehe; die Rundenzahl ist in allen acht
+Punkten 1. Mehrrunden sind als Mechanismus damit ausgeschlossen — und zwar
+doppelt, denn oberhalb der groessten Nutzlast gibt es gar keine zweite Runde:
+`htccl_bar1` meldet dort `handles() == False`, und die Nutzlast verlaesst den
+Direktpfad zurueck auf den Basistransport. Das ist der eigentlich wichtige
+Nebenbefund dieses Abschnitts: **`chunked_prefill_size` > 2456 wuerde den
+BAR1-Pfad im Prefill still abschalten.** Bei 2048 bleiben 20 % Luft, bei den
+in sglang ueblichen 4096 oder 8192 waere der Direktpfad im Prefill weg, ohne
+dass irgendeine Zeile das meldet.
+
+### Verdikt
+
+**Gemischt, mit klarer Hauptaussage.**
+
+* **Kontention BELEGT** in dem Sinn, den die Frage stellte: der wait-Anteil
+  des bar1-Arms waechst von 1 auf 8 Sessions rund doppelt so schnell wie der
+  der Grundlinie, auf allen drei Raengen.
+* **BAR1-spezifische Kontention NICHT belegt.** Beide Arme enden auf
+  demselben absoluten Niveau (0,1-0,5 % Abstand bei 4, 8 und 16 Sessions).
+  Der Direktpfad wird unter Last nicht schlechter als der Host-Pfad, er wird
+  nur nicht mehr besser.
+* **Groesseneffekt und Rundenzahl AUSGESCHLOSSEN**, nicht bloss
+  unwahrscheinlich: Kollektivgroesse und Rundenzahl sind ueber die ganze
+  Sessionachse konstant.
+
+**Wo.** Ausschliesslich im Prefill, im `wait`-Term, auf allen drei Raengen.
+Der Decode desselben Laufs behaelt den bar1-Vorsprung in jedem Boot
+unveraendert (tickbasiert bei bs=16: 443,7 / 442,6 / 438,8 / 432,8 tok/s
+gegen 417,6 / 412,6 / 407,0 / 415,7, also +6,4 % im Mittel, ohne jede
+Kompression entlang der Sessionachse). Der Decode faehrt Kollektive von
+16 x 5120 x 2 = 160 KiB gegen die 20 MiB des Prefills — dieselbe Karte,
+dasselbe BAR1, gegenteiliges Verhalten.
+
+**Was die Decke ist, sagt diese Analyse nicht.** Ausgeschlossen sind:
+Kollektivgroesse, Rundenzahl, BAR1-Rueckfall, Arithmetik (compute flach) und
+die Transportidentitaet (beide Arme identisch an der Decke). Der Kandidat fuer
+Schritt 2 steht in der Belegungsspalte: ab vier Sessions summieren sich die
+Batchzeiten eines Fensters auf 104-118 % seiner Wanduhr, die Batches
+ueberlappen sich also. Damit ist ein `gpu-ms` unter Last nicht mehr die Latenz
+eines Batches, sondern die Periode der Pipeline, und alles, was die Periode
+kostet, faellt in `wait`. Der naechste Schnitt muss deshalb an einer Groesse
+ansetzen, die diese Verwechslung nicht zulaesst — Kollektivzeit je Kollektiv
+statt je Batch. Der Zahlenwert der Decke, ~1786 ms je 2048-Token-Batch =
+1147 tok/s, deckt sich mit der veroeffentlichten NCCL-Host-Referenz, die schon
+vor BAR1 ueber 1 bis 16 Sessions flach bei 1105-1190 tok/s lag. Die Decke ist
+aelter als der Direktpfad.
+
+### Strukturbefund nebenbei: die TP-Aufteilung ist im Prefill schief
+
+Unabhaengig von Arm und Sessionzahl rechnet TP0 143,9-149,8 ms an demselben
+Batch, an dem TP1 und TP2 519,0-573,3 ms rechnen — Faktor 3,8. TP0 wartet
+dadurch 86,6-91,5 % jedes Prefill-Batches. `--rank-tp-ratio auto-performance`
+ist auf den Decode getrimmt und laesst im Prefill rund 420 ms je Batch auf
+TP0 liegen. Das ist doppelt so viel wie der gesamte Transportvorsprung, den
+BAR1 bei einer Session holt (213 ms), und es faellt in beiden Armen an.
+Eigener Posten, groesser als der, um den es hier ging.
+
+### Harness-Luecke geschlossen (im selben Zug)
+
+Die s12-Zusammenfassung des Laufs meldete `accept: None` in allen acht
+Punkten und eine Decode-Rate auf Anfrageebene (32 tok/s bei bs=1), waehrend
+die Decode-Schleife 77-94 tok/s umschlug. Beides war Messvorrichtung, nicht
+Befund:
+
+* `meta_info` ist auf dem Chat-Endpunkt opt-in (`return_meta_info: bool =
+  False`), und die Accept-Anfrage hat es nie angefordert. Der Scheduler loggt
+  `accept len` auf jedem Tick ohnehin.
+* Eine Rate auf Anfrageebene teilt die Token eines Stroms durch dessen ganze
+  Wanduhr, Prefill und Warteschlange eingerechnet.
+
+`s12_prefill_kurve.py` bekommt dafuer `--server-log` und erntet nach jedem
+Decode-Punkt die Scheduler-Ticks seines eigenen Zeitfensters: Median ueber die
+Ticks, Ticks unter 20 tok/s als Warmup verworfen (der erste Tick eines Stroms
+traegt dessen Prefill). Die Tabelle nennt beide Ebenen getrennt — `tok/s
+(Tick)` und `tok/s (Anfrage)` —, weil sie sich um mehr als Faktor zwei
+unterscheiden. Die Tick-Werte des vorliegenden Laufs, nachtraeglich aus den
+Logs gezogen:
+
+| Arm | Sess. | bs=1 tok/s | bs=1 accept | bs=16 tok/s | bs=16 accept |
+|---|---:|---:|---:|---:|---:|
+| bar1 | 1 | 93,7 | 2,83 | 443,7 | 2,90 |
+| bar1 | 4 | 83,9 | 2,55 | 442,6 | 2,85 |
+| bar1 | 8 | 77,6 | 2,60 | 438,8 | 2,78 |
+| bar1 | 16 | 79,3 | 2,54 | 432,8 | 2,76 |
+| Grundlinie | 1 | 88,2 | 2,90 | 417,6 | 2,77 |
+| Grundlinie | 4 | 74,3 | 2,35 | 412,6 | 2,94 |
+| Grundlinie | 8 | 77,1 | 2,45 | 407,0 | 2,80 |
+| Grundlinie | 16 | 76,0 | 2,64 | 415,7 | 2,78 |
+
+Accept liegt in beiden Armen bei 2,4-2,9 bei k=3 — NEXTN lief, und die
+Decode-Zahlen sind mit Spekulation gemessen, nicht ohne.
