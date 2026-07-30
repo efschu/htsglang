@@ -472,14 +472,20 @@ def lade_fatal(step_dir: str, arm, sessions) -> dict:
     boots that each died in a prefill OOM could still hand in throughput
     numbers and pass -- the only step in the battery without a fatal gate.
     An EMPTY file is the healthy case: the grep found nothing.
+
+    Lines the server QUOTED from a helper subprocess it caught and recovered
+    from (the stage-0 hardware probe) are skipped: a traceback in there is
+    evidence about the helper, not about this boot -- see
+    check_common.QUOTED_SUBLOG_PREFIX, keep the literals in step.
     """
+    quoted_prefix = "[probe-subprocess] "
     name = f"logs/{arm}_{sessions}.fatal.txt"
     path = os.path.join(step_dir, name)
     if not os.path.exists(path):
         return {"fatal_erhoben": False, "fatal": None}
     with open(path, errors="replace") as f:
         for lineno, line in enumerate(f, 1):
-            if line.strip():
+            if line.strip() and quoted_prefix not in line:
                 return {
                     "fatal_erhoben": True,
                     "fatal": f"{name}:{lineno}: {' '.join(line.split())[:200]}",

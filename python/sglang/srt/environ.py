@@ -518,6 +518,18 @@ class Envs:
     # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
     # auto-performance, ignoring the cached profile under ~/.cache/sglang.
     SGLANG_PERF_REPROBE = EnvBool(False)
+    # Wall-clock cap (seconds) on the WHOLE stage-0 probe subprocess.
+    SGLANG_PERF_PROBE_TIMEOUT_S = EnvFloat(600.0)
+    # Wall-clock cap (seconds) on the NETWORK phase of the stage-0 probe (the
+    # pairwise NCCL link matrix). The phase joins a process group, so it is
+    # the one part of the probe that can wait on something other than this
+    # rig's own hardware; without a cap it inherits torch's 600 s default
+    # process-group timeout and charges it to every boot. On expiry the probe
+    # keeps the per-card measurements, stores the reason next to the empty
+    # link table, and returns.
+    SGLANG_PERF_PROBE_LINK_TIMEOUT_S = EnvFloat(45.0)
+    # Skip the link matrix entirely (per-card measurements only).
+    SGLANG_PERF_PROBE_SKIP_LINKS = EnvBool(False)
     # Refit seam for the parse-time cost model (uneven_perf.PerfCalibration).
     # The stage-0 probe MEASURES per-card GEMM/membw/GEMV rates on every
     # machine; the four scalars below are the model's FITTED/ASSUMED

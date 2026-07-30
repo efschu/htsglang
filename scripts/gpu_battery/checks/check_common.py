@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -146,11 +147,41 @@ FATAL_LOG_MARKERS = (
     "Traceback (most recent call last)",
 )
 
+# A server log also QUOTES the logs of helper subprocesses it ran, caught and
+# recovered from -- the stage-0 hardware probe above all. Those quoted lines
+# are evidence about a handled failure, not a symptom of the boot: a
+# deliberately killed probe puts a full traceback into the server log while the
+# server goes on to serve, and scoring that as a boot failure is how the #289
+# evidence run produced a phantom BATTERY-FAIL (#303 part 4).
+#
+# Two ways a quoted block is recognised, because logs already on disk cannot be
+# re-emitted:
+#   1. the emitter's own marker, prefixed to every quoted line
+#      (uneven_perf.QUOTED_SUBLOG_PREFIX -- keep the two literals in step);
+#   2. structurally: sglang stamps its own lines with "[YYYY-MM-DD HH:MM:SS]",
+#      so a block that starts at a line announcing a handled subprocess failure
+#      and runs until the next stamped line is quoted material.
+QUOTED_SUBLOG_PREFIX = "[probe-subprocess] "
+
+#: Substrings that OPEN a quoted subprocess block in an sglang server log.
+QUOTED_SUBLOG_OPENERS = ("auto-performance: hardware probe failed",)
+
+_SERVER_LOG_STAMP = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]")
+
+
+def _is_server_line(line: str) -> bool:
+    """Whether the line is the server's own, i.e. carries its timestamp."""
+    return bool(_SERVER_LOG_STAMP.match(line))
+
 
 def scan_log_for_fatals(
     path: str, what: str, markers: Sequence[str] = FATAL_LOG_MARKERS
 ) -> Optional[str]:
     """Return the first fatal marker found with its line number, or None.
+
+    Lines belonging to a QUOTED subprocess log are skipped -- see
+    ``QUOTED_SUBLOG_PREFIX``. A marker in there says a helper process died and
+    the server reported it; the boot itself is judged by its own lines.
 
     The log itself is never returned -- only the one line that matters. The
     handoff quotes the path plus this line; the bugfixer greps the file.
@@ -159,7 +190,18 @@ def scan_log_for_fatals(
         return None
     try:
         with open(path, errors="replace") as f:
+            in_quoted_block = False
             for lineno, line in enumerate(f, 1):
+                if QUOTED_SUBLOG_PREFIX in line:
+                    continue
+                if in_quoted_block:
+                    # The quoted block ends at the server's next own line.
+                    if not _is_server_line(line):
+                        continue
+                    in_quoted_block = False
+                if any(opener in line for opener in QUOTED_SUBLOG_OPENERS):
+                    in_quoted_block = True
+                    continue
                 for marker in markers:
                     if marker in line:
                         return f"{path}:{lineno}: {_one_line(line)[:200]}"
