@@ -238,7 +238,7 @@ for ROW in "${ARM_TABLE[@]}"; do
 
     if ! s15_wait_for_server "$PORT" "$SERVER_PID" 480; then
         host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}.booterror.txt" \
-            "Bar1Unverfuegbar" "ColdBuildWindowError" "CUDA out of memory" \
+            "Bar1Unavailable" "ColdBuildWindowError" "CUDA out of memory" \
             "torch.OutOfMemoryError" "NCCL error" "Capture cuda graph failed" \
             "UNBOOTABLE" "Received sigquit"
         host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 200

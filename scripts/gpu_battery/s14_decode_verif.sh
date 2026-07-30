@@ -158,7 +158,7 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
 
         if ! s14_warte_auf_server "$PORT" "$SERVER_PID" 600; then
             host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}.bootfehler.txt" \
-                "Bar1Unverfuegbar" "ColdBuildWindowError" "CUDA out of memory" \
+                "Bar1Unavailable" "ColdBuildWindowError" "CUDA out of memory" \
                 "torch.OutOfMemoryError" "NCCL error" "Capture cuda graph failed" \
                 "Received sigquit"
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 200
@@ -177,11 +177,11 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: Aufbau in" \
+            "HTCCL-BAR1: setup in" \
             "CUDA graph begin" \
             "CUDA graph end" \
             "Disable cuda graph" \
-            "waehrend einer CUDA-Graph-Aufzeichnung"
+            "during a CUDA graph capture"
 
         MRC=0
         for BS in $BS_LIST; do

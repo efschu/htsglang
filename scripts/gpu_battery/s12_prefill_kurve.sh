@@ -132,8 +132,8 @@ for N in $SESSIONS; do
         host_grep_into "$HOSTLOG" "$DIR/belege/${SEQ}_${ARM}_${N}.txt" \
             "HTCCL enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: Aufbau in" \
-            "waehrend einer CUDA-Graph-Aufzeichnung"
+            "HTCCL-BAR1: setup in" \
+            "during a CUDA graph capture"
 
         # The server log goes along: accept len and the tick rate of the decode
         # only exist in the scheduler's own lines. Read live, while the server

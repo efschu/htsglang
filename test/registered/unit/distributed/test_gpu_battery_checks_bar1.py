@@ -38,7 +38,9 @@ BATTERY = os.path.join(REPO_ROOT, "scripts", "gpu_battery")
 CHECKS = os.path.join(BATTERY, "checks")
 
 sys.path.insert(0, BATTERY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import _bar1_marker_source as _src  # noqa: E402
 from battery_steps import STEPS_BY_ID  # noqa: E402
 from s10_bar1_driver import compose as s10_compose  # noqa: E402
 from s10_bar1_driver import desired_state_reached  # noqa: E402
@@ -50,61 +52,51 @@ from s11_bar1_e2e import (  # noqa: E402
 )
 from s12_prefill_kurve import tabelle, zusammenfassen  # noqa: E402
 
-# The lines the code really writes. Copied from
-# parallel_state.py:638 / htccl.py:645 and htccl_bar1.py:1518 / :1530, with the
-# "<lineno>:" prefix that grep -n puts in front of them.
-LOG_GROUP_OK = (
-    "412:[2026-07-30 03:11:02] HTCCL enabled for group 'tp:0': requested=bar1, "
-    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the "
-    "host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph."
+# The lines the code really writes -- built from the ACTUAL format strings in
+# parallel_state.py / htccl.py / htccl_bar1.py / benchmark/bar1_graph_check.py
+# via _bar1_marker_source.py, not retyped. #315: this file's fixtures used to
+# be hand-typed and had drifted onto the German wording #295 moved the
+# emitters away from -- both sides matched each other and nothing noticed.
+# Deriving them from source instead makes that drift impossible: a wrong
+# render here can only mean the source itself changed, which is exactly what
+# should make this file (and test_bar1_marker_coupling.py) fail loudly.
+#
+# The "<lineno>:" prefix is grep -n's, not the emitter's; it stays hand-added.
+LOG_GROUP_OK = "412:[2026-07-30 03:11:02] " + _src.render_group_ok_line(
+    group="tp:0"
 )
-LOG_GROUP_OK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL enabled for group 'dcp:0': requested=bar1, "
-    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks."
+LOG_GROUP_OK_DCP = "418:[2026-07-30 03:11:02] " + _src.render_group_ok_line(
+    group="dcp:0"
 )
-LOG_GROUP_FALLBACK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL group 'dcp:0': requested=bar1, ACHIEVED=gloo "
-    "(setup: Bar1Unverfuegbar: Halter meldet ENOMEM). This group does NOT run "
-    "over bar1. A measurement from this run is mixed and must not be reported "
-    "as a bar1 value."
+LOG_GROUP_FALLBACK_DCP = "418:[2026-07-30 03:11:02] " + _src.render_group_fallback_line(
+    group="dcp:0", achieved="gloo", stage="setup",
+    reason="Bar1Unavailable: the holder reports ENOMEM",
 )
-LOG_AUFBAU = (
-    "400:[2026-07-30 03:11:01] HTCCL-BAR1: Aufbau in 27 ms, 2 Peer-Ziele, Region "
-    "24.0 MiB je Rang (8 Schlitze), Schlitz 512 KiB, groesste Nutzlast 20480 KiB, "
-    "Flaggen 256 Byte, Export ueber dma-buf. Ab hier wird im heissen Pfad nichts "
-    "mehr gemappt."
+LOG_AUFBAU = "400:[2026-07-30 03:11:01] " + _src.render_setup_line(
+    dauer_ms=27, peer_targets=2, region_mib=24.0, slots_desc="8 slots",
+    slot_kib=512, payload_kib=20480, flags_bytes=256, export="dma-buf",
 )
-LOG_KASSE_TP = (
-    "401:[2026-07-30 03:11:01] HTCCL-BAR1: BAR1-Kasse dieser Karte nach Gruppe "
-    "'tp:0': tp:0: 24.0 MiB."
+LOG_KASSE_TP = "401:[2026-07-30 03:11:01] " + _src.render_ledger_line(
+    group="tp:0", balance="tp:0: 24.0 MiB",
 )
-LOG_KASSE_DCP = (
-    "409:[2026-07-30 03:11:01] HTCCL-BAR1: BAR1-Kasse dieser Karte nach Gruppe "
-    "'dcp:0': tp:0: 24.0 MiB, dcp:0: 24.0 MiB."
+LOG_KASSE_DCP = "409:[2026-07-30 03:11:01] " + _src.render_ledger_line(
+    group="dcp:0", balance="tp:0: 24.0 MiB, dcp:0: 24.0 MiB",
 )
-LOG_RIEGEL = (
-    "902:RuntimeError: HTCCL: 'all_gather' mit 10600448 Byte waehrend einer "
-    "CUDA-Graph-Aufzeichnung, aber bar1 meldet handles('all_gather', 10600448) -> "
-    "False. Der Ausweichweg ist die host-gestaffelte gloo-Ebene."
+LOG_RIEGEL = "902:RuntimeError: " + _src.render_riegel_message(
+    op="all_gather", nbytes=10600448,
+    grund="bar1 reports handles('all_gather', 10600448) -> False",
 )
 
-GRAPH_CHECK_OK = """BAR1-Graph-Beleg: Geraete [0, 1, 2], 3 Raenge
---- Fall 'einfach' ----------------------------------------
-    => PASSED
-==============================================================
-Zusammenfassung
-==============================================================
-  PASSED  [Gate]  einfach
-  PASSED  [Gate]  two-graphs
-  PASSED  [Gate]  wechselnde-form
-  PASSED  [Gate]  reservation
-  PASSED  [Info]  gitter
-
-Alle Gate-Faelle bestanden.
-"""
-GRAPH_CHECK_FALLEN = GRAPH_CHECK_OK.replace(
-    "  PASSED  [Gate]  two-graphs", "  FAILED  [Gate]  two-graphs"
-).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: two-graphs.")
+GRAPH_CHECK_OK = _src.render_graph_check_transcript()
+GRAPH_CHECK_FALLEN = _src.render_graph_check_transcript(
+    gate_cases=(
+        ("einfach", True, True),
+        ("two-graphs", True, False),
+        ("wechselnde-form", True, True),
+        ("reservation", True, True),
+        ("gitter", False, True),
+    )
+)
 
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
 #: Die Fortsetzung, die /generate auf "1 2 3 4" liefern muss. Ab 5, weil die
@@ -726,7 +718,7 @@ class TestE2ECheck:
     def test_setup_only_for_one_group_is_fail(self, tmp_path):
         _write_e2e(tmp_path, _e2e(aufbau_gruppen=["tp:0"]))
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
-        assert "Aufbau" in line
+        assert "setup" in line
 
     def test_incoherent_smoke_is_fail(self, tmp_path):
         payload = _e2e()

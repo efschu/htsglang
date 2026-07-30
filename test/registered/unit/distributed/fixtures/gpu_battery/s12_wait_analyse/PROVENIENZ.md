@@ -21,3 +21,16 @@ Die Zahlen, die `test_s12_log_analyse.py` gegen diese Dateien prueft, sind
 dieselben, die im Abschnitt "#293 Schritt 1" von
 `docs/dev/INTEGRATION_R3_VALIDATION.md` stehen. Wer eine davon aendert, muss
 die andere mitaendern -- das ist der Zweck der Kopplung.
+
+## Task #315 addendum (2026-07-30)
+
+The capture predates the #295 German-to-English translation of
+`htccl_bar1.py`. The three `HTCCL-BAR1: Aufbau in ...` lines at the top of
+`bar1_1.log` and `bar1_8.log` were mechanically retranslated in place to the
+current `HTCCL-BAR1: setup in ...` wording via
+`test/registered/unit/distributed/_bar1_marker_source.py`, with every
+captured number (ms, MiB, KiB, byte count, rank, timestamp) kept unchanged.
+`grep -E "Prefill rank batch|Decode batch|HTCCL-BAR1: Aufbau"` above is the
+capture command as it was actually run on 2026-07-30; a re-capture today
+would grep for `"HTCCL-BAR1: setup"` instead. The `Prefill rank batch` /
+`Decode batch` lines are untouched.

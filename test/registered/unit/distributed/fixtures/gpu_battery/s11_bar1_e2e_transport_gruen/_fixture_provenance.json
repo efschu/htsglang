@@ -6,5 +6,6 @@
   "erzeuger": "scripts/gpu_battery/s11_bar1_e2e.sh",
   "warum": "Der Gegenpol zur Fixture s11_bar1_e2e (Anlauf 1, Capture-Abbruch): hier ist die TRANSPORTSEITE gruen -- 9x ACHIEVED=bar1 ueber world:0/tp:0/dcp:0, kein Riegel, alle sieben Gate-Faelle bestanden (inkl. broadcast und broadcast-zwei-graphen) -- und der einzige Mangel steckt im Smoke selbst. An dieser Datei muss der Check jede Transportpruefung passieren und erst am Smoke halten; ein Verdikt, das hier nach Transportfehler klaenge, waere falsch.",
   "befund": "smoke.json ist die Chat-Antwort mit Denk-Praeambel bei Temperatur 0: finish_reason=length, 128 Token im Denktext verbraucht, meta_info=None (auf dem Chat-Pfad opt-in via return_meta_info). Genau der Anlass fuer die Umstellung des Smoke auf /generate.",
-  "dateien": ["server.log", "graph_check.txt", "graph_check_rc.txt", "smoke.json"]
+  "dateien": ["server.log", "graph_check.txt", "graph_check_rc.txt", "smoke.json"],
+  "task_315_note": "The capture predates the #295 German-to-English translation of htccl_bar1.py/htccl.py. The BAR1-specific lines (setup/ledger) were mechanically retranslated in place to the current emitter wording via _bar1_marker_source.py, with every captured number (ms, MiB, KiB, byte counts, ranks, timestamps) kept unchanged. Everything else in server.log is untouched."
 }

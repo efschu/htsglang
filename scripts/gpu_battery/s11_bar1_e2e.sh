@@ -8,8 +8,8 @@
 # That bolt is the acceptance scenario of the parallel integration. Until
 # all_gather exists in htccl_bar1, the standard run aborts with
 #
-#   RuntimeError: HTCCL: 'all_gather' mit <n> Byte waehrend einer
-#   CUDA-Graph-Aufzeichnung, aber bar1 meldet handles(...) -> False.
+#   RuntimeError: HTCCL: 'all_gather' with <n> bytes during a CUDA graph
+#   capture, but bar1 reports handles(...) -> False.
 #
 # loudly and with a reason, which is correct behaviour and a FAIL of this step
 # at the same time. The check gives it its own wording so nobody has to read a
@@ -170,11 +170,11 @@ host_ssh_for 60 "curl -sf -m 20 http://127.0.0.1:$PORT/get_server_info" \
 # --- harvest the log evidence, then shut down ------------------------------
 echo "== Evidence out of the server log (stays on the host) =="
 host_grep_into "$HOSTLOG" "$DIR/htccl_lines.txt" \
-    "HTCCL-BAR1: Aufbau in" \
-    "BAR1-Kasse dieser Karte nach Gruppe" \
+    "HTCCL-BAR1: setup in" \
+    "BAR1 ledger of this card after group" \
     "HTCCL enabled for group" \
     "ACHIEVED=" \
-    "waehrend einer CUDA-Graph-Aufzeichnung" \
+    "during a CUDA graph capture" \
     "CUDA out of memory" \
     "torch.OutOfMemoryError" \
     "NCCL error" \

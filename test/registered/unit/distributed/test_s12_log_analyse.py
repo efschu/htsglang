@@ -35,7 +35,9 @@ FIXTURES = os.path.join(
 )
 
 sys.path.insert(0, BATTERY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import _bar1_marker_source as _src  # noqa: E402
 from s12_log_analyse import (  # noqa: E402
     auswerten,
     belegung,
@@ -74,12 +76,14 @@ ZEILE_DECODE_WARMUP = (
     "accept rate: 0.78, cuda graph: True, gen throughput (token/s): 3.37, "
     "#queue-req: 0"
 )
-ZEILE_AUFBAU = (
-    "[2026-07-30 13:44:02 TP2] HTCCL-BAR1: Aufbau in 324 ms, 2 Peer-Ziele, "
-    "Region 96.0 MiB je Rang (12 Schlitze (davon 2(R-1) fuer all_to_all)), "
-    "Schlitz 8188 KiB, groesste Nutzlast 24564 KiB, Flaggen 5376 Byte, Export "
-    "ueber NV_ESC_EXPORT_TO_DMABUF_FD. Ab hier wird im heissen Pfad nichts "
-    "mehr gemappt."
+# #315: built from the ACTUAL htccl_bar1.py format string via
+# _bar1_marker_source.py, not retyped -- this used to be the German wording
+# #295 moved the emitter away from, matching only itself and RE_BAR1_SETUP's
+# equally-stale pattern.
+ZEILE_AUFBAU = "[2026-07-30 13:44:02 TP2] " + _src.render_setup_line(
+    dauer_ms=324, peer_targets=2, region_mib=96.0,
+    slots_desc="12 slots (of which 2(R-1) for all_to_all)",
+    slot_kib=8188, payload_kib=24564,
 )
 # A line that carries no split, from before #252. It must not parse as a batch
 # with wait 0 -- that would read as "no collective time at all".

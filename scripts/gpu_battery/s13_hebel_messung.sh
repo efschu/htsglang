@@ -229,7 +229,7 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # skipped, the run goes on.
         if ! s13_warte_auf_server "$PORT" "$SERVER_PID" 600; then
             host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}.bootfehler.txt" \
-                "Bar1Unverfuegbar" "ColdBuildWindowError" "CUDA out of memory" \
+                "Bar1Unavailable" "ColdBuildWindowError" "CUDA out of memory" \
                 "torch.OutOfMemoryError" "NCCL error" "Capture cuda graph failed" \
                 "Received sigquit"
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 200
@@ -249,13 +249,14 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: Aufbau in" \
+            "HTCCL-BAR1: setup in" \
             "HTCCL-BAR1-PIPE:" \
             "Disable prefill CUDA graph" \
             "disabling prefill CUDA graph" \
             "prefill CUDA graph begin" \
             "prefill CUDA graph end" \
-            "waehrend einer CUDA-Graph-Aufzeichnung"
+            "during a CUDA graph capture" \
+            "the graph pool of the result ring is exhausted"
 
         MRC=0
         for P in $POINTS; do
