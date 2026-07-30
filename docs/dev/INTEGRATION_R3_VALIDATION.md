@@ -11265,3 +11265,180 @@ collective.py` 11, `test_s12_log_analyse.py` 4, `test_uneven_tp_nccl_env.py`
 **Kein Spill-Beleg faellig**: `htccl_bar1_ext.py` unberuehrt, `_CUDA_SRC` in
 `htccl_bar1_pipe_ext.py` unveraendert (Zeichen fuer Zeichen gegen HEAD
 verglichen), kein neuer Kernel.
+
+## #293 Schritt 3: Verifikation nach den Hebel-Fixes (2026-07-30)
+
+Kartenlauf gegen `b1270630fa` (enthaelt die Hebel-Fixes `af3c6e2385`), Rig 1,
+TP=3 uneven auf 5090 + 2x 3080, NEXTN-Spec und Decode-Graphen in jedem Arm,
+Prefill-Graph nur in den pg-Armen. Rohdaten in
+`/spinning/gpu-battery-results/2026-07-30_hebel_verif/`.
+
+9 Arme x 2 verschraenkte Runden, 36 Punkte, **kein Arm uebersprungen, kein
+Punkt gefehlt**.
+
+### Vorbedingung: der Erweiterungs-Cache war schaal
+
+Der gecachte `htccl_bar1_pipe_ext`-`.so` stammte von 13:20:04, Fix 2 aendert
+genau diese Quelle um 15:29:59. Ein Lauf dagegen haette **vorfixigen Code
+gemessen** und es nicht gemerkt. Der dmabuf-`.so` war ebenfalls aelter als
+seine Quelle. Alle drei Cache-Verzeichnisse beiseitegelegt und kalt neu
+gebaut; erst danach eine Zahl. (`befunde/jit_cache_gate.txt`)
+
+### Tore vor der ersten Zahl
+
+* **9 von 9 Gate-Faellen bestanden**, dazu der Info-Fall `gitter` -- auf frisch
+  gebautem Code. `Zeitlimit`-Zahl 0. (`phaseA/gate_zusammenfassung.txt`)
+* **Byte-Belege nach Fix 2 wiederholt**, weil Fix 2 die Speicherordnung des
+  Pipe-Pfads aendert: 6/6 gerichtete Paare sauber, sowohl schlicht als auch
+  unter `PIPE=1 DIREKT=1 DIREKT_GRAPH=1 ERG_RING=5`. Der Gate-Fall
+  `pipe-direkt` liest ueber den **Host** zurueck statt ueber den L2 der
+  Empfaengerkarte -- der zweite Lesepfad ist hier keine Formalie, der L2 ist
+  mit eingehenden PCIe-Schreibvorgaengen nicht kohaerent.
+  (`phaseA/byte_belege.txt`)
+* **ERREICHT je Gruppe**: 45 von 45 `ERREICHT=bar1` ueber die fuenf bar1-Arme
+  einer Runde, 0 auf den NCCL-Armen. Der Transportname luegt nicht in diesem
+  Lauf.
+
+### Rauschboden zuerst
+
+A-gegen-A derselben Konfiguration ueber die zwei Runden:
+**s=1: 2,71 %, s=8: 3,18 %** (Median aller Spannen 1,27 %). Der Boden liegt
+deutlich hoeher als die 1,15 % des Laufs vom 2026-07-30. Alles unterhalb
+davon wird hier nicht als Befund berichtet.
+
+### Die Zahlen
+
+Prefill-Durchsatz, Mittel beider Runden, Verhaeltnis gegen den NCCL-Anker
+desselben Rezepts:
+
+| Arm | tok/s s=1 | vs. nccl | tok/s s=8 | vs. nccl | Prefill-Graph |
+|---|---:|---:|---:|---:|---|
+| nccl (Anker) | 1328,6 | ~1,000 | 1158,2 | ~1,000 | aus |
+| bar1 | 1523,6 | 1,147 | 1317,4 | **1,137** | aus |
+| bar1_hi | 1581,7 | 1,191 | 1355,0 | **1,170** | aus |
+| bar1cp4096a | 1629,2 | 1,226 | 1365,5 | 1,179 | aus |
+| ncclcp4096a | 1421,1 | 1,070 | 1229,7 | 1,062 | aus |
+| bar1pg_hi (gitter) | 1574,4 | 1,185 | 1332,0 | 1,150 | AN |
+| bar1pgvorbehalt_hi | 1341,0 | ~1,009 | 1147,2 | ~0,991 | AN |
+| bar1pipe | 1522,9 | 1,146 | 1255,6 | 1,084 | aus |
+| bar1direkt | 1477,7 | 1,112 | 875,6 | **0,756** | aus |
+
+### 1. Post-Merge-Sanity: 1,140 steht
+
+`bar1` gegen den Anker: **1,137 bei s=8** gegen 1,140 im Lauf vom 2026-07-30.
+Abstand 0,3 % bei einem Boden von 3,18 % -- die Zahl hat sich nicht bewegt.
+**Keine Regression durch Fix 2 oder Fix 3.**
+
+### 2. Gitter-A/B: der groesste Einzelposten bestaetigt sich
+
+Beide Arme unterscheiden sich in nichts als `SGLANG_HTCCL_BAR1_GRAPH_GITTER`:
+
+| | s=1 | s=8 |
+|---|---:|---:|
+| `bar1pg_hi` (gitter, jetzt Vorgabe unter GRAPH_FREIGABE) | 1574,4 | 1332,0 |
+| `bar1pgvorbehalt_hi` (`GRAPH_GITTER=0`) | 1341,0 | 1147,2 |
+| **Gewinn** | **+17,4 %** | **+16,1 %** |
+
+Der Falsifikator sagte ~+16 % voraus; bei s=8 kommt **+16,1 %** heraus, auf
+die Nachkommastelle. Fuenffach ueber dem Boden. Fix 1 traegt.
+
+Bemerkenswert daneben: mit gitter ist der Prefill-Graph nicht mehr teuer.
+`bar1pg_hi` (1332,0) und `bar1_hi` (1355,0) liegen 1,7 % auseinander, also
+innerhalb des Bodens -- der Graph ist neutral, nicht negativ. Ohne gitter
+kostete er den ganzen Vorsprung (0,991 gegen den Anker).
+
+### 3. Die 4096er-Chunks: der Hauptkandidat traegt bei s=8 NICHT
+
+Der s=8-Punkt fehlte bisher, weil die Reserve fuers 2048er-Rezept gepinnt war.
+Die Machbarkeitsrechnung stand vor dem Boot (`befunde/machbarkeit_cp4096.txt`):
+das Bedarfsmodell im Code leitet bei `chunked_prefill_size=4096`
+**7232 MiB je Rang** her gegen 4160 bei 2048; die gepinnten 2700 waren um
+4532 MiB zu knapp. Mit `--rank-auto-reserve-mib auto` **bootet der Arm und
+liefert beide Punkte**.
+
+Und dann sagt er das Gegenteil der Erwartung. Die +22,6 % aus dem letzten
+Fenster reproduzieren sich als 1,226 bei s=1 -- aber diese Zahl misst drei
+Dinge auf einmal. Aufgetrennt, jeweils gegen den passenden Kontrollarm:
+
+| Hebel | s=1 | s=8 | Boden |
+|---|---:|---:|---:|
+| Transport (bar1/nccl, gleiches Rezept) | +14,7 % | **+13,7 %** | |
+| Reserve (bar1_hi/bar1) | +3,8 % | +2,9 % | unter Boden |
+| Chunk 4096 (bar1cp4096a/bar1_hi) | +3,0 % | **+0,8 %** | 2,71 / 3,18 % |
+
+**Bei s=8 ist der Chunk-Hebel mit +0,8 % ein Viertel des Bodens -- keine
+Aussage.** Bei s=1 liegt er mit +3,0 % knapp ueber dem Boden und ist damit
+bestenfalls schwach. Die urspruenglichen +22,6 % waren fast vollstaendig der
+Transport, nicht der Chunk.
+
+Der Preis ist dagegen konkret: `auto` nimmt jeder 3080 rund 4,5 GiB
+KV-Pool ab. **Beste Konfiguration ist damit `bar1_hi`** -- Chunk 2048,
+Reserve 4500,4200,4200 -- mit 1,170 gegen den Anker bei s=8, statistisch
+gleichauf mit `bar1cp4096a` (1,179) und ohne dessen KV-Verlust.
+
+### 4. Direktmodus: bootet zum ersten Mal, und kostet 24 %
+
+**Der Boot-Befund ist positiv.** Im letzten Fenster fuhr der Arm gar nicht
+hoch (`ERG_EAGER_PLAETZE=2` konstant); jetzt bootet er, misst beide Punkte
+und besteht die beiden neuen Gate-Faelle. Fix 3 tut, was er sollte.
+
+**Die Zahl ist es nicht.** Bei s=8 faellt der Arm auf 875,6 tok/s = **0,756
+gegen den Anker**, also 30 % unter `bar1pipe` und 34 % unter `bar1`. Der
+Wait-Anteil auf TP1 steigt auf 75,1 % (gegen 64,5 % Pipe, 62,2 % bar1).
+
+Die Ursache steht in der Fenstergeometrie, und sie belegt zugleich Fix 2:
+
+| Arm | Schlitz | groesste Nutzlast |
+|---|---:|---:|
+| `bar1` (ohne Pipe) | 8188 KiB | 24564 KiB |
+| `bar1pipe` (Fix 2) | **7736 KiB** | 23208 KiB |
+| `bar1direkt` (`ERG_RING=5`) | 3436 KiB | **10308 KiB** |
+
+Die 7736 KiB sind exakt der Wert, den Fix 2 vorhergesagt hat (vorher 6140).
+Der Ergebnisring des Direktmodus wird aber aus **demselben** Fenster bezahlt
+wie das Bulk-Kollektiv: die groesste Nutzlast faellt auf 10308 KiB, und das
+Kollektiv des Standardlaufs ist 20 MiB. Jedes Bulk-`all_reduce` braucht damit
+mindestens zwei Runden.
+
+Dem steht kein Gegenwert gegenueber, denn **der Direktmodus greift im
+Standardlauf nie**: der Graph-Vorrat ist mit 3 von 3 Plaetzen sofort
+erschoepft, die 2 eager-Plaetze haelt der Aufrufer, `Vorrat leer = ja` in
+beiden Runden -- alles faellt auf `direkt=0` zurueck. Der Arm zahlt das
+Fenster und bekommt den gesparten VRAM-Durchgang nicht.
+
+`SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER` blieb bei der Vorgabe 2. Es hochzudrehen
+kann diesen Befund nicht drehen: eager-Plaetze kaemen aus dem ohnehin leeren
+Graph-Vorrat, und die bindende Groesse ist nicht die Platzzahl, sondern das
+Fenster. Wer den graphfesten Direktmodus messen will, braucht ein
+**groesseres BAR1-Fenster**, nicht mehr Ringplaetze.
+
+### 5. Die Pipe selbst: Fix 2 holt ein Drittel zurueck, kein Gewinn
+
+`bar1pipe` gegen `bar1` bei s=8: vorher -7,5 %, jetzt **-4,7 %** (1255,6
+gegen 1317,4). Fix 2 wirkt messbar in die richtige Richtung, aber der
+Pipe-Pfad bleibt gegenueber dem schlichten bar1-Weg negativ. Ehrlich: kein
+Hebel.
+
+### Decode am selben Boot (Beifang, s=8)
+
+Der Prefill war die Frage; die Decode-Ticks sind trotzdem eindeutig:
+
+| Arm | bs=16 tok/s | bs=16 ms/Verify |
+|---|---:|---:|
+| nccl | 345,4 | 9,09 |
+| bar1_hi | 474,2 | 6,07 |
+| bar1cp4096a | 481,4 | 5,87 |
+
+**ms/Verify 6,07 gegen 9,09** -- Faktor 1,50 auf dem Taktgeber der
+Decode-Runde, aus einem Lauf, der auf Prefill ausgelegt war. Das verdient
+eine eigene Messung mit Decode als Hauptpunkt.
+
+### Was steht, was nicht
+
+* Fix 1 traegt: **+16,1 % bei s=8**, auf die Nachkommastelle wie vorhergesagt.
+* Fix 2 traegt: Schlitz 7736 KiB wie berechnet, Pipe-Defizit -7,5 % -> -4,7 %.
+* Fix 3 traegt als Boot-Fix: der Direktmodus faehrt. Als Hebel ist er auf
+  diesem Rig **negativ** (0,756) und greift ohne groesseres Fenster gar nicht.
+* Der 4096er-Chunk ist bei s=8 **kein Hebel** (+0,8 %, unter dem Boden). Die
+  frueheren +22,6 % waren der Transport.
+* Beste Konfiguration: **`bar1_hi`, 1,170 gegen NCCL bei s=8.**

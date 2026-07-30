@@ -68,6 +68,22 @@ ARME_TABELLE=(
     "bar1pipe|bar1|SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT=0|"
     "bar1direkt|bar1|SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 SGLANG_HTCCL_BAR1_PIPE_ERG_RING=5|"
     "bar1cp4096|bar1||--chunked-prefill-size 4096"
+    # --- 4096-token chunks with a reserve that funds them -------------------
+    # `bar1cp4096` above measures at sessions=1 and dies at sessions=8, and the
+    # startup warning had already named the reason: the pinned 3000,2700,2700
+    # comes from a 2048-token recipe, while the demand model derives 7232 MiB
+    # per rank at chunked_prefill_size=4096 (runtime/activation 7040 + CUDA
+    # graph capture 192). Short by 4232/4532/4532 MiB, and the shortfall
+    # surfaces as an OOM in the first real prefill rather than at startup.
+    #
+    # `auto` is the value the warning itself recommends: the demand model sizes
+    # the reserve for the configured chunk instead of a pin carried over from a
+    # different recipe. A bigger reserve moves memory out of the KV pool, so
+    # these arms are NOT comparable with the pinned arms above -- like the _hi
+    # block, they bring their own matched baseline. The NCCL arm carries the
+    # identical recipe so the ratio measures the transport and not the reserve.
+    "bar1cp4096a|bar1||--chunked-prefill-size 4096 --rank-auto-reserve-mib auto"
+    "ncclcp4096a|grundlinie||--chunked-prefill-size 4096 --rank-auto-reserve-mib auto"
     "ncclpg|grundlinie||--cuda-graph-backend-prefill breakable"
     "bar1pg|bar1||--cuda-graph-backend-prefill breakable"
     # --- Prefill-Graph mit einer Reserve, die ihn auch bezahlt --------------
