@@ -793,18 +793,18 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
 
 def flaggen_bedarf(welt: int, mit_a2a: bool = True,
                    mit_pipe: bool = False) -> int:
-    """``(2 + 2(R-1) [+ 1]) * R * 256`` Byte, plus ``4 R * 256`` fuer die Pipe.
+    """``(2 + 2(R-1) [+ 1]) * R * 256`` Byte, plus ``5 R * 256`` fuer die Pipe.
 
     Eine 256-Byte-Zeile je (Topologie, Schritt, Sender): kein False Sharing
     zwischen Sendern, keins zwischen Schritten, keins zwischen Topologien.
     Netz hat 2 Schritte, Ring ``2(R-1)``, a2a genau **einen**. Bei R=8 sind
     das 34 KiB und damit weit unter einer Allokationsgranularitaet.
 
-    ``netz_pipe`` haengt vier Zeilen je Rang hinten an (``tailRS``,
-    ``tailAG``, ``headRS``, ``headAG``) -- **unabhaengig von K und T**, weil
-    es ein Schiebefenster mit einem Zaehler je Verbindung ist und nicht eine
-    Flagge je Chunk. Hinten angehaengt, damit jeder bestehende
-    Zeilenversatz Byte fuer Byte bleibt.
+    ``netz_pipe`` haengt fuenf Zeilen je Rang hinten an (``tailRS``,
+    ``tailAG``, ``headRS``, ``headAG``, ``ergBereit``) -- **unabhaengig von
+    K und T**, weil es ein Schiebefenster mit einem Zaehler je Verbindung
+    ist und nicht eine Flagge je Chunk. Hinten angehaengt, damit jeder
+    bestehende Zeilenversatz Byte fuer Byte bleibt.
     """
     from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
         pipe_flaggen_zusatz,
@@ -1370,9 +1370,13 @@ class HTCCLBar1Transport:
         self.pipe_direkt = os.environ.get(
             "SGLANG_HTCCL_BAR1_PIPE_DIREKT", "1"
         ) not in ("0", "nein", "aus", "false")
-        # Direkt-Modus WAEHREND einer Graph-Aufzeichnung. Vorgabe AUS, und
-        # anders als beim Kern ist das hier kein Vorbehalt, sondern eine
-        # Herleitung -- die Begruendung steht bei `_erg_platz`.
+        # Direkt-Modus WAEHREND einer Graph-Aufzeichnung. Vorgabe AUS --
+        # nicht weil er nicht ginge, sondern weil er die Speicherordnung
+        # aendert (Flaggenfamilie 4) und einen groesseren Ergebnisring
+        # verlangt. Eingeschaltet gilt: je aufgezeichneter Aufrufstelle EIN
+        # reservierter Ringplatz aus dem Vorrat oberhalb der eager-Plaetze,
+        # dazu der Freigabe-Handschlag im Kern. Die Herleitung steht bei
+        # `_erg_platz` und in `htccl_bar1_pipe_ext.erg_aufteilung`.
         self.pipe_direkt_graph = os.environ.get(
             "SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH", "0"
         ) not in ("0", "nein", "aus", "false")
@@ -1387,6 +1391,7 @@ class HTCCLBar1Transport:
         self._pipe_beleg = False
         self._pipe_ext = None
         self._schritt_dev = None
+        self._erg_gen_dev = None
         #: Laufender Index im Ergebnisring. HOSTSEITIG und rangeinheitlich,
         #: weil jeder Rang dieselbe Folge von Kollektiven sieht (SPMD) --
         #: dieselbe Annahme, auf der schon `algorithmus_fuer` steht. Der
@@ -1396,6 +1401,17 @@ class HTCCLBar1Transport:
         #: Schwache Verweise auf die zuletzt herausgegebenen
         #: Ergebnistensoren, je Ringplatz. Sie sind die Lebensdauerpruefung.
         self._erg_lebt: list = []
+        #: Aufteilung des Ergebnisrings in eager- und Graph-Plaetze. Steht
+        #: fest, bevor der erste Aufruf laeuft (`erg_aufteilung`), damit der
+        #: Graph-Vorrat nie einen Platz greifen kann, dessen eager-Tensor der
+        #: Aufrufer noch haelt.
+        self._erg_eager_plaetze = 0
+        self._erg_graph_plaetze = 0
+        #: Wieviele Graph-Plaetze schon vergeben sind. Waechst nur; ein
+        #: einmal vergebener Platz kehrt nicht zurueck, weil von hier aus
+        #: nicht feststellbar ist, ob der zugehoerige Graph noch lebt.
+        self._erg_graph_vergeben = 0
+        self._erg_graph_leer_gemeldet = False
         #: Untergrenze fuer all_to_all. Bewusst NICHT `min_bytes` (4096): der
         #: Reiz von a2a ueber BAR1 liegt gerade bei den kleinen
         #: MoE-Dispatchbloecken. 16 Byte = ein Paket.
@@ -1662,7 +1678,25 @@ class HTCCLBar1Transport:
             )
         self._geo = geometrie(self.welt, max_bytes, self.a2a_an, self.pipe_an,
                               self.pipe_erg_ring)
-        self._erg_lebt = [None] * max(0, self.pipe_erg_ring)
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
+            erg_aufteilung,
+        )
+
+        self._erg_eager_plaetze, self._erg_graph_plaetze = erg_aufteilung(
+            self.pipe_erg_ring, self.pipe_direkt_graph
+        )
+        self._erg_lebt = [None] * max(0, self._erg_eager_plaetze)
+        if self.pipe_direkt_graph:
+            logger.info(
+                "HTCCL-BAR1-PIPE: graphfester Direkt-Modus, Ergebnisring L=%d "
+                "aufgeteilt in %d eager-Plaetze und %d Graph-Plaetze. Jede "
+                "aufgezeichnete Aufrufstelle nimmt EINEN Graph-Platz und gibt "
+                "ihn nicht zurueck; ist der Vorrat leer, faehrt die "
+                "Aufzeichnung den direkt=0-Weg. Mehr Graphen brauchen ein "
+                "groesseres SGLANG_HTCCL_BAR1_PIPE_ERG_RING.",
+                self.pipe_erg_ring, self._erg_eager_plaetze,
+                self._erg_graph_plaetze,
+            )
         self.max_bytes = max_bytes
         region = self._geo["region_bytes"]
         flaggen = flaggen_bedarf(self.welt, self.a2a_an, self.pipe_an)
@@ -1734,6 +1768,15 @@ class HTCCLBar1Transport:
         # ueber Aufrufe hinweg absolut bleiben. Rangeinheitlich, weil jeder
         # Rang dieselbe Folge von Aufrufen mit demselben K sieht.
         self._schritt_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
+        # Generationszaehler des graphfesten Direkt-Modus. Ebenfalls LOKAL im
+        # VRAM: lokale Zugriffe sind mit den eigenen Lesevorgaengen kohaerent,
+        # und nur die PEER-Sicht auf den Zaehlerstand braucht das
+        # Flaggenprotokoll -- die traegt die Flaggenfamilie 4 im Fenster.
+        # Auf dem Geraet und nicht im Host, weil er bei jeder
+        # Graph-Wiedergabe weiterzaehlen muss; ein Hostzaehler wird beim
+        # Aufzeichnen eingebrannt und steht danach still.
+        self._erg_gen_dev = torch.zeros(1, dtype=torch.int64,
+                                        device=self.device)
 
         dist.barrier(group=self.cpu_group)
         self._auf = True
@@ -2396,8 +2439,45 @@ class HTCCLBar1Transport:
             ))
         return noetig <= self._fenster_minimum
 
+    def erg_fenster(self) -> Optional[tuple[int, int]]:
+        """``(anfang, laenge)`` des Ergebnisrings im eigenen Fenster.
+
+        Fuer Belege, die pruefen wollen, ob ein Ergebnistensor WIRKLICH im
+        exportierten Fenster liegt -- also ob der Direkt-Modus tatsaechlich
+        gefahren ist. Ohne diese Auskunft muesste ein Beleg in die
+        Innereien greifen, und ein Beleg, der still den Kontrollpfad misst,
+        belegt nichts (Messdisziplin, Regel 5).
+
+        ``None`` heisst: es gibt keinen Ergebnisring, also kann kein Aufruf
+        direkt gefahren sein.
+        """
+        off = int(self._geo.get("off_erg", -1)) if self._geo else -1
+        if off < 0 or not self._eigen[0]:
+            return None
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
+            erg_ring_bytes,
+        )
+
+        laenge = erg_ring_bytes(int(self.max_bytes),
+                                int(self._geo["erg_ring"]))
+        return int(self._eigen[0]) + off, int(laenge)
+
     def _erg_platz(self, inp):
-        """Naechster Ergebnispuffer im Ring, als Tensor -- oder ``None``.
+        """Ergebnispuffer und Besitzangaben -- oder ``None``.
+
+        Rueckgabe ``(tensor, platz, slack)``:
+
+        ``tensor``  der Ergebnispuffer, ein Tensor UEBER dem Fenster,
+        ``platz``   sein Ringplatz -- der Aufrufer braucht ihn, um die
+                    ``peer_erg``-Tabelle zu bauen,
+        ``slack``   nach wievielen Generationen dieser Platz wieder
+                    beschrieben wird; ``0`` heisst "Handschlag aus".
+
+        **Warum als Rueckgabe und nicht als Feld.** Der Platz gehoert zu
+        genau diesem Puffer. Als Objektfeld waere er ein zurueckgegebener
+        Puffer mit einer Reihenfolgeannahme, die nur im Kommentar steht --
+        die Fehlerfamilie, die diesen Transport schon zweimal getroffen hat.
+        Wer den Tensor hat, hat den Platz dazu.
 
         ``None`` heisst "kein Direkt-Modus"; der Aufrufer nimmt dann
         ``torch.empty_like``. Sichtbar, nicht still.
@@ -2426,71 +2506,102 @@ class HTCCLBar1Transport:
             return None
         # -- Aufzeichnung -------------------------------------------------
         #
-        # Unter Stream-Capture ist der Direkt-Modus AUS. Das ist keine
-        # Vorsicht, sondern eine Herleitung; sie steht hier ausgeschrieben,
-        # weil sie sonst nirgends nachlesbar waere.
-        #
         # Diese Methode ist HOSTCODE. Sie laeuft beim Aufzeichnen genau
-        # einmal und bei keiner Wiedergabe wieder. Der gewaehlte Ringplatz
-        # `_erg_i`, der daraus gerechnete Zeiger und die `peer_erg`-Tabelle
-        # des Kerns werden in den Graphen eingebrannt. Drei Folgen, und die
-        # dritte ist die gefaehrliche:
+        # einmal und bei keiner Wiedergabe wieder. Der gewaehlte Ringplatz,
+        # der daraus gerechnete Zeiger und die `peer_erg`-Tabelle des Kerns
+        # werden in den Graphen eingebrannt. Drei Folgen hat das, und sie
+        # sind der Grund fuer die Aufteilung des Rings:
         #
-        # 1. Der Ring entartet je Graph auf EINEN Platz. Fuer sich genommen
-        #    ist das nur graphueblich (ein Graph hat feste Ausgabepuffer).
+        # 1. Der Platz eines aufgezeichneten Aufrufs steht fest. Fuer sich
+        #    genommen ist das nur graphueblich -- ein Graph hat feste
+        #    Ausgabepuffer.
         # 2. Die Lebensdauerpruefung unten -- der schwache Verweis -- greift
-        #    bei Wiedergabe NICHT MEHR, weil kein Hostcode laeuft. Wer den
-        #    Ergebnistensor ueber eine Wiedergabe hinaus haelt, bekommt ihn
-        #    unter der Hand ueberschrieben, und zwar ohne den Abbruch, den
-        #    diese Methode im eager-Betrieb ausloest. Genau der Fehlerfall,
-        #    den die Pruefung verhindern soll, kaeme durch die Aufzeichnung
-        #    zurueck.
-        # 3. Und das ist der stille: bei MEHREREN aufgezeichneten Graphen
-        #    (sglang zeichnet je Stapelgroesse einen auf) laeuft `_erg_i`
-        #    ueber die Ringplaetze weiter. Mit der Vorgabe `erg_ring = 2`
-        #    ist beim dritten Graphen Platz 0 wieder an der Reihe. Haelt der
-        #    Graph-Laeufer den Ausgabetensor des ersten Graphen noch -- was
-        #    er tut --, bricht es hier ab, mitten in der Aufzeichnung. Haelt
-        #    er ihn NICHT mehr, teilen sich zwei aufgezeichnete Graphen
-        #    denselben BAR1-Platz, und wer sie abwechselnd wiedergibt,
-        #    bekommt vom einen die Zahlen des anderen. Kein Absturz.
+        #    bei Wiedergabe nicht mehr, weil kein Hostcode laeuft. Fuer einen
+        #    fest reservierten Graph-Platz braucht sie das auch nicht: der
+        #    Platz gehoert genau dieser einen Aufrufstelle und wird von
+        #    keiner anderen angefasst. Was sie NICHT ersetzt, ist der
+        #    Abstand zwischen zwei Wiedergaben DESSELBEN Platzes -- den
+        #    traegt der Freigabe-Handschlag im Kern (Flaggenfamilie 4,
+        #    `ergSlack = 1`).
+        # 3. Der stille Fehler war: mit einem frei laufenden Ringindex
+        #    laufen mehrere Aufzeichnungen (sglang zeichnet je Stapelgroesse
+        #    eine auf) ueber dieselben Plaetze. Zwei Graphen teilen sich dann
+        #    einen BAR1-Platz, und wer sie abwechselnd wiedergibt, bekommt
+        #    vom einen die Zahlen des anderen. Kein Absturz. Genau das
+        #    beseitigt der Vorrat: ein Graph-Platz wird EINMAL vergeben und
+        #    nie wieder.
         #
-        # Der Ausweg ist billig: ohne Direkt-Modus liefert `_pipe_all_reduce`
-        # einen `torch.empty_like`, der waehrend der Aufzeichnung aus dem
-        # privaten Speicherbecken des Graphen kommt und damit ohnehin eine
-        # feste Adresse hat -- der Kern faehrt seinen `direkt=0`-Weg, der
-        # derselbe gemessene Kontrollpfad ist. Es kostet den gesparten
+        # Ist der Vorrat leer, faellt der Aufruf auf `direkt=0` zurueck --
+        # gemeldet, nicht still, und korrekt: `direkt=0` ist derselbe
+        # gemessene Kontrollpfad, sein `torch.empty_like` kommt waehrend der
+        # Aufzeichnung aus dem privaten Speicherbecken des Graphen und hat
+        # damit ohnehin eine feste Adresse. Es kostet den gesparten
         # VRAM-Durchgang, nicht die Richtigkeit.
         from sglang.srt.distributed.device_communicators.htccl import (
             graph_erfassung_laeuft,
         )
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
+            erg_eager_platz,
+            erg_graph_platz,
+        )
 
-        if graph_erfassung_laeuft() and not self.pipe_direkt_graph:
-            if not self._direkt_graph_gemeldet:
-                self._direkt_graph_gemeldet = True
-                logger.warning(
-                    "HTCCL-BAR1-PIPE: Direkt-Modus waehrend einer "
-                    "CUDA-Graph-Aufzeichnung abgeschaltet -- der Ringplatz "
-                    "wuerde eingebrannt und die Lebensdauerpruefung liefe bei "
-                    "keiner Wiedergabe mehr. netz_pipe faehrt aufgezeichnet "
-                    "den direkt=0-Weg. SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 "
-                    "hebt das auf; wer das setzt, muss den Ergebnistensor "
-                    "innerhalb derselben Wiedergabe verbrauchen und darf "
-                    "hoechstens SGLANG_HTCCL_BAR1_PIPE_ERG_RING Graphen "
-                    "aufzeichnen. Dieser Hinweis erscheint einmal je Rang."
-                )
+        if graph_erfassung_laeuft():
+            if not self.pipe_direkt_graph:
+                if not self._direkt_graph_gemeldet:
+                    self._direkt_graph_gemeldet = True
+                    logger.warning(
+                        "HTCCL-BAR1-PIPE: Direkt-Modus waehrend einer "
+                        "CUDA-Graph-Aufzeichnung abgeschaltet (Vorgabe). "
+                        "netz_pipe faehrt aufgezeichnet den direkt=0-Weg. "
+                        "SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 schaltet den "
+                        "graphfesten Weg ein: reservierter Ringplatz je "
+                        "Aufrufstelle plus Freigabe-Handschlag im Kern. "
+                        "Dieser Hinweis erscheint einmal je Rang."
+                    )
+                return None
+            i = erg_graph_platz(self._erg_graph_vergeben,
+                                self._erg_eager_plaetze,
+                                self._erg_graph_plaetze)
+            if i is None:
+                if not self._erg_graph_leer_gemeldet:
+                    self._erg_graph_leer_gemeldet = True
+                    logger.warning(
+                        "HTCCL-BAR1-PIPE: der Graph-Vorrat des "
+                        "Ergebnisrings ist erschoepft (%d von %d Plaetzen "
+                        "vergeben, L=%d). Diese und jede weitere "
+                        "aufgezeichnete Aufrufstelle faehrt den "
+                        "direkt=0-Weg -- richtig, aber ohne den gesparten "
+                        "VRAM-Durchgang. Mehr Plaetze gibt es mit einem "
+                        "groesseren SGLANG_HTCCL_BAR1_PIPE_ERG_RING, und "
+                        "jeder Platz kostet %d Byte im BAR1-Fenster.",
+                        self._erg_graph_vergeben, self._erg_graph_plaetze,
+                        int(self._geo["erg_ring"]),
+                        int(self._geo["erg_stride"]),
+                    )
+                return None
+            # KEIN schwacher Verweis: dieser Platz gehoert ab jetzt genau
+            # dieser Aufrufstelle. Ihn spaeter noch einmal zu vergeben, waere
+            # der Fehler -- und genau deshalb waechst der Zaehler nur.
+            self._erg_graph_vergeben += 1
+            ptr = (self._eigen[0] + int(self._geo["off_erg"])
+                   + i * int(self._geo["erg_stride"]))
+            out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
+            return out, i, 1
+
+        # -- eager ---------------------------------------------------------
+        if self._erg_eager_plaetze < 2:
             return None
-        ring = int(self._geo["erg_ring"])
-        i = (self._erg_i + 1) % ring
+        i = erg_eager_platz(self._erg_i, self._erg_eager_plaetze)
         alt = self._erg_lebt[i]
         if alt is not None and alt() is not None:
             raise Bar1Unverfuegbar(
-                f"Direkt-Modus: der Ergebnispuffer {i} von vor {ring} Runden "
-                f"wird noch gehalten. Ihn jetzt zu beschreiben, hiesse einen "
-                f"Tensor zu veraendern, den der Aufrufer fuer fertig haelt. "
-                f"Entweder den Ring vergroessern "
-                f"(SGLANG_HTCCL_BAR1_PIPE_ERG_RING) oder den Direkt-Modus "
-                f"abschalten (SGLANG_HTCCL_BAR1_PIPE_DIREKT=0). Kein stilles "
+                f"Direkt-Modus: der Ergebnispuffer {i} von vor "
+                f"{self._erg_eager_plaetze} Runden wird noch gehalten. Ihn "
+                f"jetzt zu beschreiben, hiesse einen Tensor zu veraendern, "
+                f"den der Aufrufer fuer fertig haelt. Entweder den Ring "
+                f"vergroessern (SGLANG_HTCCL_BAR1_PIPE_ERG_RING) oder den "
+                f"Direkt-Modus abschalten "
+                f"(SGLANG_HTCCL_BAR1_PIPE_DIREKT=0). Kein stilles "
                 f"Ausweichen: ein ueberschriebenes Ergebnis faellt sonst "
                 f"nirgends auf."
             )
@@ -2499,7 +2610,15 @@ class HTCCLBar1Transport:
         out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
         self._erg_lebt[i] = weakref.ref(out)
         self._erg_i = i
-        return out
+        # Der Handschlag laeuft eager nur mit, wenn der graphfeste Modus an
+        # ist. Ohne ihn bleibt der Kern Byte fuer Byte der gemessene -- die
+        # Flaggenfamilie 4 wird dann nie angefasst. Mit ihm ist der Slack die
+        # Zahl der eager-Plaetze, die Bedingung also praktisch immer schon
+        # erfuellt; sie kostet einen Schreibvorgang und einen LOKALEN
+        # Lesevorgang je Aufruf und haelt die Flaggen mit den aufgezeichneten
+        # Aufrufen im selben Zaehlwerk.
+        slack = self._erg_eager_plaetze if self.pipe_direkt_graph else 0
+        return out, i, slack
 
     def _pipe_all_reduce(self, inp, k: int):
         """Ein Aufruf des gepipelineten Kerns. Ausser Ort, wie netz/ring."""
@@ -2507,10 +2626,12 @@ class HTCCLBar1Transport:
 
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
-        out = self._erg_platz(inp)
-        direkt = out is not None
-        if not direkt:
-            out = torch.empty_like(inp)
+        platz = self._erg_platz(inp)
+        direkt = platz is not None
+        if direkt:
+            out, erg_slot, erg_slack = platz
+        else:
+            out, erg_slot, erg_slack = torch.empty_like(inp), -1, 0
         kern = self._kern(nbytes, self.pipe_gitter_ab, "netz_pipe")
         peer_nutz = [0] * self.welt
         peer_flag = [0] * self.welt
@@ -2527,7 +2648,7 @@ class HTCCLBar1Transport:
             # dieselbe Folge von Aufrufen. Der Kern prueft ausserdem, dass
             # der eigene Eintrag wirklich `out` ist.
             versatz = (int(self._geo["off_erg"])
-                       + self._erg_i * int(self._geo["erg_stride"]))
+                       + erg_slot * int(self._geo["erg_stride"]))
             for r in range(self.welt):
                 peer_erg[r] = peer_nutz[r] + versatz
         from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
@@ -2543,8 +2664,9 @@ class HTCCLBar1Transport:
             int(self._geo["off_pipe"]),
             int(pipe_fbasis(self.welt, self.a2a_an)),
             int(k), int(self.pipe_t), int(self.pipe_vorlauf),
-            int(self.pipe_quittung), 1 if direkt else 0,
-            self._runde_dev, self._schritt_dev, self._ctl_dev,
+            int(self.pipe_quittung), 1 if direkt else 0, int(erg_slack),
+            self._runde_dev, self._schritt_dev, self._erg_gen_dev,
+            self._ctl_dev,
             int(self.deckel_zyklen), int(self.threads), int(kern),
             int(self.ladeform),
         )
@@ -2623,13 +2745,13 @@ class HTCCLBar1Transport:
     # aus seinem Schlitz in den Ausgabepuffer, statt dass der Sender direkt
     # in den Ausgabepuffer schreibt. Ohne Reduktion waere Letzteres
     # moeglich -- aber nur mit einem abgebildeten Ergebnispuffer, also mit
-    # dem Direkt-Modus der Pipe, und der ueberlebt keine Aufzeichnung
-    # (``_erg_platz``, Punkt 3: der hostseitige Ringindex wird je Graph
-    # eingebrannt, bei erg_ring=2 teilen sich der erste und der dritte
-    # Graph denselben BAR1-Platz). Der Abnahmefall IST eine Aufzeichnung.
-    # Also dieselbe konservative Wahl wie beim Allreduce: Schlitz statt
-    # Direkt, und der Direkt-Modus bleibt ein spaeterer, eigener Schritt
-    # mit eigenem Ergebnisring und eigener Lebensdauerpruefung.
+    # dem Ergebnisring der Pipe. Seit dem graphfesten Direkt-Modus
+    # (``_erg_platz``: reservierter Ringplatz je aufgezeichneter
+    # Aufrufstelle, Freigabe-Handschlag im Kern) ist das kein Ausschluss
+    # mehr, sondern eine offene Erweiterung -- der a2a-Kern kennt den
+    # Handschlag nicht, und ein all_gather braucht einen eigenen
+    # Ergebnisring in der Groesse des VOLLEN Ergebnisses, nicht der
+    # Scherbe. Bis dahin: Schlitz statt Direkt.
 
     def _handles_all_gather(self, nbytes: int) -> bool:
         """``nbytes`` ist die EIGENE Scherbe, nicht das Ergebnis.
@@ -3445,6 +3567,7 @@ class HTCCLBar1Transport:
         self._runde_dev = None
         self._ctl_dev = None
         self._schritt_dev = None
+        self._erg_gen_dev = None
 
 
 def baue_bar1(cpu_group, device, fenster_bytes: int,

@@ -53,6 +53,19 @@ Was genau geprueft wird
    Aufzeichnung, die bei der Wiedergabe nichts mehr bewegt, laesst also das
    eigene Muster stehen -- und das ist von dem der Quelle unterscheidbar.
 
+6. **Der Direkt-Modus unter Aufzeichnung.** Fall ``pipe-direkt`` zeichnet
+   drei Graphen auf, von denen jeder einen reservierten Ringplatz im
+   BAR1-Fenster bekommt, und gibt sie verschraenkt wieder. Dazu zwei
+   Nachweise, die die anderen Faelle nicht brauchen: der Ergebnistensor
+   muss WIRKLICH im Fenster liegen (sonst hat der Fall den
+   ``direkt=0``-Kontrollpfad gemessen und nichts belegt), und
+   zurueckgelesen wird zusaetzlich ueber den Host statt ueber den L2 der
+   Empfaengerkarte -- ein anderer Weg zu denselben Bytes, weil derselbe Weg
+   einen defekten Pfad verdecken wuerde. Fall
+   ``pipe-direkt-vorrat-leer`` ist die Negativkontrolle dazu: ohne
+   Graph-Plaetze muss jeder aufgezeichnete Aufruf auf ``direkt=0``
+   zurueckfallen und trotzdem stimmen.
+
 Jeder Fall laeuft in FRISCHEN Prozessen. Eine misslungene Aufzeichnung
 laesst den Strom im Capture-Zustand zurueck und macht alles danach
 unbrauchbar; ein Fall, der einen anderen vergiftet, waere kein Beleg.
@@ -146,20 +159,48 @@ FAELLE = [
     },
     {
         "name": "pipe-direkt",
-        "zweck": "Der Direkt-Modus AUFGEZEICHNET, mit ausdruecklich "
-                 "aufgehobenem Vorbehalt und zwei Graphen. Erwartet wird, "
-                 "dass er auffaellt -- kein Gate, sondern der Beleg fuer "
-                 "die Begruendung in _erg_platz.",
+        "zweck": "Der Direkt-Modus AUFGEZEICHNET: drei Graphen, drei "
+                 "reservierte Ringplaetze, verschraenkt wiedergegeben. "
+                 "Zusaetzlich wird ueber einen ANDEREN Lesepfad "
+                 "zurueckgelesen (Host statt Geraet) und belegt, dass der "
+                 "Ergebnistensor wirklich im BAR1-Fenster liegt.",
         "umgebung": {
             "SGLANG_HTCCL_BAR1_PIPE": "1",
             "SGLANG_HTCCL_BAR1_PIPE_DIREKT": "1",
             "SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH": "1",
+            # 2 eager + 3 Graph-Plaetze. Ohne die drei oben waere der Vorrat
+            # leer und jeder aufgezeichnete Aufruf fiele auf direkt=0
+            # zurueck -- der Fall wuerde dann bestehen, ohne den
+            # Direkt-Modus je gefahren zu haben. Deshalb prueft `direkt`
+            # unten die Lage des Ergebnistensors nach.
+            "SGLANG_HTCCL_BAR1_PIPE_ERG_RING": "5",
+            "SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40),
+            "SGLANG_HTCCL_BAR1_PIPE_GITTER_AB": str(1 << 40),
+        },
+        "groessen": [512 << 10, 640 << 10, 768 << 10],
+        "verschraenkt": True,
+        "direkt": "alle",
+        "gate": True,
+    },
+    {
+        "name": "pipe-direkt-vorrat-leer",
+        "zweck": "Negativkontrolle zum Fall davor: derselbe Aufbau, aber "
+                 "ein Ring ohne Graph-Plaetze (L=2). Jeder aufgezeichnete "
+                 "Aufruf MUSS auf direkt=0 zurueckfallen und trotzdem die "
+                 "richtigen Bytes liefern -- ein Rueckfall, der falsche "
+                 "Zahlen liefert, waere schlimmer als gar keiner.",
+        "umgebung": {
+            "SGLANG_HTCCL_BAR1_PIPE": "1",
+            "SGLANG_HTCCL_BAR1_PIPE_DIREKT": "1",
+            "SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH": "1",
+            "SGLANG_HTCCL_BAR1_PIPE_ERG_RING": "2",
             "SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40),
             "SGLANG_HTCCL_BAR1_PIPE_GITTER_AB": str(1 << 40),
         },
         "groessen": [512 << 10, 768 << 10],
         "verschraenkt": True,
-        "gate": False,
+        "direkt": "keiner",
+        "gate": True,
     },
     {
         "name": "broadcast",
@@ -298,13 +339,69 @@ def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
     return graph, puffer
 
 
+def _im_fenster(t, tensor) -> bool:
+    """Liegt ``tensor`` im exportierten Ergebnisring dieses Rangs?
+
+    Das ist die Antwort auf "ist der Direkt-Modus wirklich gefahren". Der
+    Transportname und die Umgebungsvariable sagen nur, was ANGEFORDERT war;
+    ob der Ringplatz auch vergeben wurde, steht allein an der Adresse des
+    Ergebnistensors. Ohne diese Pruefung koennte ein Fall bestehen, der in
+    Wahrheit durchgehend den ``direkt=0``-Kontrollpfad gemessen hat
+    (Messdisziplin, Regel 5: nie still auf einen anderen Weg zurueckfallen).
+    """
+    fenster = t.erg_fenster()
+    if fenster is None:
+        return False
+    anfang, laenge = fenster
+    p = int(tensor.data_ptr())
+    return anfang <= p < anfang + laenge
+
+
+def _rueckgelesen_ueber_host(ausgabe, soll_cpu) -> tuple[int, str]:
+    """Byte-Beleg ueber einen ANDEREN Lesepfad als den geschriebenen.
+
+    Messdisziplin, Regel 3: "Muster schreiben, ueber einen **anderen** Weg
+    zurueckleseen, jedes Byte vergleichen. Nimmt die Ruecklesung denselben
+    Weg wie das Schreiben, verdeckt ein defekter Pfad seinen eigenen
+    Fehler."
+
+    Geschrieben wird hier vom Rechenkern der Nachbarkarte per PCIe in die
+    BAR1-Apertur. Der Vergleich davor liest dieselben Bytes mit einem
+    Geraetekernel -- also ueber den L2 der Empfaengerkarte, und genau dieser
+    L2 ist mit eingehenden PCIe-Schreibvorgaengen NICHT kohaerent
+    (BEFUND_L2_NICHT_KOHAERENT.md). Diese zweite Ruecklesung geht statt
+    dessen ueber die Host-Kopie: eine DMA-Leseanforderung des Hosts an
+    dieselbe Region, ein anderer Weg zu denselben Bytes.
+
+    Der Sollwert kommt als CPU-Tensor herein, damit die Berechnung des
+    Erwarteten nicht selbst wieder ueber die Karte laeuft.
+    """
+    ist = ausgabe.detach().to("cpu", copy=True)
+    falsch = torch.ne(ist, soll_cpu)
+    n = int(falsch.sum().item())
+    if n == 0:
+        return 0, ""
+    erste = int(falsch.nonzero()[0].item())
+    return n, (
+        f"Host-Ruecklesung: {n} von {ist.numel()} Elementen falsch, erstes "
+        f"bei {erste}: ist {float(ist[erste]):.1f}, soll "
+        f"{float(soll_cpu[erste]):.1f}"
+    )
+
+
 def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
-                    kollektiv: str = "all_reduce"):
+                    kollektiv: str = "all_reduce", direkt_erwartung=None):
     """Aufzeichnen, wiedergeben, nach JEDER Wiedergabe belegen.
 
     ``kollektiv`` waehlt, WAS aufgezeichnet wird. Die Wiedergabe- und
     Belegschleife ist fuer beide dieselbe -- was sich unterscheidet, ist der
     Sollwert und die Frage, ob Ein- und Ausgabe derselbe Puffer sind.
+
+    ``direkt_erwartung`` ist ``None`` (egal), ``"alle"`` (jeder
+    aufgezeichnete Ergebnistensor muss im BAR1-Fenster liegen) oder
+    ``"keiner"`` (keiner darf). Sie wird beim Aufzeichnen geprueft, also
+    bevor eine einzige Wiedergabe gelaufen ist -- ein Fall, der den
+    Direkt-Modus gar nicht erreicht hat, soll nicht erst am Ende auffallen.
     """
     graphen = []
     for n_bytes in groessen:
@@ -330,9 +427,27 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
             continue
         algo = t.algorithmus_fuer(n_bytes)
         graph, eingabe, ausgabe = _zeichne_auf(t, n, rang, geraet)
+        im_fenster = _im_fenster(t, ausgabe)
         protokoll.append(
-            f"aufgezeichnet: {n_bytes} Byte, Algorithmus {algo!r}"
+            f"aufgezeichnet: {n_bytes} Byte, Algorithmus {algo!r}, "
+            f"Ergebnistensor {'IM' if im_fenster else 'NICHT im'} BAR1-Fenster"
         )
+        if direkt_erwartung == "alle" and not im_fenster:
+            raise AssertionError(
+                f"{n_bytes} Byte: der Ergebnistensor liegt NICHT im "
+                f"BAR1-Fenster, der Direkt-Modus ist also nicht gefahren. "
+                f"Dieser Fall haette den direkt=0-Kontrollpfad gemessen und "
+                f"bestanden, ohne die Frage zu beantworten. Ursache "
+                f"pruefen: Graph-Vorrat des Ergebnisrings "
+                f"(SGLANG_HTCCL_BAR1_PIPE_ERG_RING), "
+                f"SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH."
+            )
+        if direkt_erwartung == "keiner" and im_fenster:
+            raise AssertionError(
+                f"{n_bytes} Byte: der Ergebnistensor liegt im BAR1-Fenster, "
+                f"obwohl der Graph-Vorrat leer sein sollte. Die Aufteilung "
+                f"des Ergebnisrings stimmt nicht."
+            )
         graphen.append((n_bytes, n, graph, eingabe, ausgabe, None))
 
     if not graphen:
@@ -354,9 +469,11 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
             eingabe.copy_(_muster(n, rang, runde, geraet))
             if src is None:
                 soll = _soll(n, welt, runde, geraet)
+                soll_cpu = _soll(n, welt, runde, "cpu")
                 wer = ""
             else:
                 soll = _muster(n, src, runde, geraet)
+                soll_cpu = _muster(n, src, runde, "cpu")
                 wer = f", src={src}"
             torch.cuda.synchronize(geraet)
             dist.barrier()
@@ -367,9 +484,17 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
                 raise AssertionError(
                     f"Wiedergabe {runde} von {n_bytes} Byte{wer}: {text}"
                 )
+            wege = "Geraet"
+            if direkt_erwartung is not None:
+                schlecht, text = _rueckgelesen_ueber_host(ausgabe, soll_cpu)
+                if schlecht:
+                    raise AssertionError(
+                        f"Wiedergabe {runde} von {n_bytes} Byte{wer}: {text}"
+                    )
+                wege = "Geraet+Host"
             protokoll.append(
                 f"Wiedergabe {runde}, {n_bytes} Byte{wer}: 0 von {n} "
-                f"Elementen falsch"
+                f"Elementen falsch ({wege})"
             )
             dist.barrier()
 
@@ -449,7 +574,7 @@ def arbeiter(lokal: int, devs: list, port: str, fall: dict, ablage: str) -> None
                 )
         _pruefe_graphen(
             t, fall["groessen"], fall.get("verschraenkt", False),
-            rang, welt, geraet, protokoll, kollektiv,
+            rang, welt, geraet, protokoll, kollektiv, fall.get("direkt"),
         )
         ergebnis["ok"] = True
     except BaseException as e:
