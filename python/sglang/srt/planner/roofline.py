@@ -654,8 +654,40 @@ def _profile_for(library, name):
     return None
 
 
+def _stage0_fp8_lane_by_uuid():
+    """{gpu_uuid: (fp8_lane_tflops, lane_name)} from the stage-0 profile.
+
+    The stage-0 probe (``uneven_perf``, PROFILE_VERSION 3+) times every fp8
+    GEMM lane a card can reach — native ``_scaled_mm``, weight-only Marlin,
+    W8A16 dequant — in the order the serving path tries them. That covers the
+    case the #213 card probe cannot: a card with no fp8 TENSOR path still runs
+    an fp8 checkpoint, through Marlin or dequant, and reporting ``None`` for it
+    puts the whole rig back on bf16 numbers.
+    """
+    out = {}
+    try:
+        from sglang.srt.uneven_perf import (
+            LANE_BF16,
+            _FORMAT_LANES,
+            get_cached_hardware_profile,
+        )
+
+        profile, _ = get_cached_hardware_profile()
+        if profile is None:
+            return out
+        for uuid, ent in (profile.get("gpus") or {}).items():
+            lanes = ent.get("gemm_lanes") or {}
+            for lane in _FORMAT_LANES.get("fp8", ()):
+                if lane in lanes and lane != LANE_BF16:
+                    out[uuid] = (float(lanes[lane]), lane)
+                    break
+    except Exception:
+        pass
+    return out
+
+
 def _measured_by_index(hardware, measured_scores):
-    """{gpu_index: (membw_gbs, gemm_bf16_tflops, gemm_fp8_tflops_or_None)}.
+    """{gpu_index: (membw_gbs, gemm_bf16_tflops, gemm_fp8_tflops_or_None, lane)}.
 
     Preference: match the live rig's cached probe by GPU **UUID** (the profile
     is keyed by UUID, and ``HardwareSpec`` carries the NVML UUID per card) — this
@@ -663,19 +695,29 @@ def _measured_by_index(hardware, measured_scores):
     would fall into. ``measured_scores`` (advantage.MeasuredCardScore) is folded
     in as a secondary source for indices the UUID match didn't cover.
 
-    The fp8 slot is filled only by the #213 card probe, which measures it; the
-    stage-0 profile has no fp8 GEMM and leaves it None, which keeps an fp8 plan
-    on the nameplate fp8 figure rather than on a bf16 number wearing an fp8
+    The fp8 slot takes the #213 card probe's native fp8 GEMM where it exists,
+    and otherwise the stage-0 profile's fp8 LANE for that card — which is a
+    measurement too, of the weight-only kernel the card actually runs. It stays
+    ``None`` only when neither probe priced an fp8 path on that card, and then
+    the caller falls back to bf16 rather than to a number wearing the wrong
     label.
     """
+    lane_by_uuid = _stage0_fp8_lane_by_uuid()
+
+    def _lane_for(uuid):
+        return lane_by_uuid.get(uuid or "") or (None, None)
+
     out = {}
     for s in measured_scores or []:
         mb = getattr(s, "membw_gbs", None)
         gf = getattr(s, "gemm_tflops", None)
         if mb and gf:
-            out[s.gpu_index] = (
-                float(mb), float(gf), getattr(s, "gemm_fp8_tflops", None)
-            )
+            fp8 = getattr(s, "gemm_fp8_tflops", None)
+            lane_tflops, lane_name = _lane_for(getattr(s, "uuid", None))
+            if fp8:
+                out[s.gpu_index] = (float(mb), float(gf), float(fp8), "fp8")
+            else:
+                out[s.gpu_index] = (float(mb), float(gf), lane_tflops, lane_name)
     # UUID-matched live probe (authoritative when this IS the booted rig).
     if hardware.source in ("pynvml", "nvidia-smi", "nvml"):
         try:
@@ -685,17 +727,19 @@ def _measured_by_index(hardware, measured_scores):
             if profile is not None:
                 by_uuid = profile.get("gpus", {})
                 for g in hardware.gpus:
-                    ent = by_uuid.get(getattr(g, "uuid", None) or "")
+                    uuid = getattr(g, "uuid", None) or ""
+                    ent = by_uuid.get(uuid)
                     if ent and ent.get("membw_gbs") and ent.get("gemm_tflops"):
                         out[g.index] = (
                             float(ent["membw_gbs"]),
                             float(ent["gemm_tflops"]),
-                            None,
+                            *_lane_for(uuid),
                         )
         except Exception:
             pass
-        # The card probe measures the same two rates plus fp8, so it wins
-        # where it exists. Same UUID match, applied last.
+        # The card probe measures the same two rates plus the NATIVE fp8 GEMM,
+        # so it wins where it exists. Same UUID match, applied last; a card
+        # with no native fp8 path keeps the stage-0 lane rather than losing it.
         try:
             from sglang.srt.rigmon.card_probe import load_card_probe
 
@@ -703,12 +747,17 @@ def _measured_by_index(hardware, measured_scores):
             if cprobe is not None:
                 by_uuid = cprobe.by_uuid()
                 for g in hardware.gpus:
-                    c = by_uuid.get(getattr(g, "uuid", None) or "")
+                    uuid = getattr(g, "uuid", None) or ""
+                    c = by_uuid.get(uuid)
                     if c and c.membw_gbs and c.gemm_bf16_tflops:
+                        if c.gemm_fp8_tflops:
+                            fp8_slot = (float(c.gemm_fp8_tflops), "fp8")
+                        else:
+                            fp8_slot = _lane_for(uuid)
                         out[g.index] = (
                             float(c.membw_gbs),
                             float(c.gemm_bf16_tflops),
-                            c.gemm_fp8_tflops,
+                            *fp8_slot,
                         )
         except Exception:
             pass
@@ -741,11 +790,13 @@ def _rank_peaks(model, hardware, library, measured_scores, dtype):
 
         flops = flops_src = None
         if ms is not None and dtype == "fp8" and ms[2]:
-            # An fp8 plan priced on the card's own fp8 GEMM rate (#213). Only
-            # taken when that rate was actually measured on THIS card: on a
-            # card with no fp8 tensor path there is nothing to measure, and
-            # the bf16 figure below is then the honest ceiling.
-            flops, flops_src = float(ms[2]), "measured(fp8)"
+            # An fp8 plan priced on the fp8 GEMM lane THIS card runs: the
+            # native tensor path where it exists (#213), otherwise the
+            # weight-only Marlin or W8A16 dequant lane the stage-0 probe timed
+            # on it. Only ever a measurement; when no lane was priced on this
+            # card the bf16 figure below is the honest ceiling.
+            flops = float(ms[2])
+            flops_src = f"measured({ms[3] or 'fp8'})"
         elif ms is not None:
             # The measured GEMM probe is one bf16 number; it is the real
             # achievable compute, so it wins over the dtype-specific nameplate.
