@@ -52,6 +52,10 @@ FATAL_MARKERS = (
     "torch.OutOfMemoryError",
     "NCCL error",
     "Watchdog caught collective operation timeout",
+    # A boot killed by a plain traceback -- no OOM, no NCCL error -- is just as
+    # dead. The shell already harvests this marker (s11_bar1_e2e.sh) and
+    # check_common.FATAL_MARKERS carries it for every other step.
+    "Traceback (most recent call last)",
 )
 
 

@@ -407,6 +407,29 @@ def lade_beleg(step_dir: str, folge, arm, sessions) -> dict:
     return out
 
 
+def lade_fatal(step_dir: str, arm, sessions) -> dict:
+    """The fatal harvest of ONE boot.
+
+    s12_prefill_kurve.sh greps every boot's host log for OOM / NCCL error /
+    traceback into logs/<arm>_<n>.fatal.txt. Nothing read that file, so eight
+    boots that each died in a prefill OOM could still hand in throughput
+    numbers and pass -- the only step in the battery without a fatal gate.
+    An EMPTY file is the healthy case: the grep found nothing.
+    """
+    name = f"logs/{arm}_{sessions}.fatal.txt"
+    path = os.path.join(step_dir, name)
+    if not os.path.exists(path):
+        return {"fatal_erhoben": False, "fatal": None}
+    with open(path, errors="replace") as f:
+        for lineno, line in enumerate(f, 1):
+            if line.strip():
+                return {
+                    "fatal_erhoben": True,
+                    "fatal": f"{name}:{lineno}: {' '.join(line.split())[:200]}",
+                }
+    return {"fatal_erhoben": True, "fatal": None}
+
+
 def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
     punkte = lade_punkte(step_dir)
     kurven: dict = {arm: {} for arm in ARME}
@@ -426,6 +449,7 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
             "prefill_tok_s": rate,
         }
         eintrag.update(lade_beleg(step_dir, p.get("folge"), arm, sessions))
+        eintrag.update(lade_fatal(step_dir, arm, sessions))
         reihenfolge.append(eintrag)
         for d in p.get("decode") or []:
             entry = dict(d)
@@ -469,6 +493,27 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
         ),
         "punkte": len(punkte),
         "reihenfolge": reihenfolge,
+        # One list, so the check does not have to walk the boots to find out
+        # whether any of them died. Empty means every harvest came back clean.
+        "fatal": [
+            {
+                "folge": e.get("folge"),
+                "arm": e.get("arm"),
+                "sessions": e.get("sessions"),
+                "zeile": e["fatal"],
+            }
+            for e in reihenfolge
+            if e.get("fatal")
+        ],
+        "fatal_ungeprueft": [
+            {
+                "folge": e.get("folge"),
+                "arm": e.get("arm"),
+                "sessions": e.get("sessions"),
+            }
+            for e in reihenfolge
+            if not e.get("fatal_erhoben")
+        ],
         "kurven": {
             arm: {str(k): v for k, v in sorted(d.items())} for arm, d in kurven.items()
         },

@@ -267,9 +267,19 @@ def _preflight(**over):
         "locks_held": [],
         "required_files": {"/x": True},
         "tools": {"nvidia-smi": True, "py-spy": True, "curl": True},
+        # s00_preflight.sh records the operator-level holder file; None means
+        # /spinning/gpu-arb/holder does not exist.
+        "arb_holder": None,
     }
     payload.update(over)
     return payload
+
+
+# The real line shape of /spinning/gpu-arb/holder.
+ARB_LINE = (
+    "session={session}  cards=0,1,2  purpose=274-r7c-boot-b-dense-head  "
+    "since=2026-07-29T23:32:20Z"
+)
 
 
 class TestPreflightCheck:
@@ -296,6 +306,27 @@ class TestPreflightCheck:
         payload["cards"][0]["cuda_index"] = None
         write_json(tmp_path / "preflight.json", payload)
         assert_stop(self.CHECK, tmp_path, self.STEP)
+
+    def test_own_arbitration_window_passes(self, tmp_path):
+        """The operator's own window is what authorises the battery."""
+        payload = _preflight(arb_holder=ARB_LINE.format(session="operator"))
+        write_json(tmp_path / "preflight.json", payload)
+        assert_pass(self.CHECK, tmp_path, self.STEP)
+
+    def test_foreign_arbitration_holder_is_stop(self, tmp_path):
+        """The card locks only cover sessions that take them; the holder file
+        is the cross-session window, and it was recorded and then read by
+        nobody."""
+        payload = _preflight(arb_holder=ARB_LINE.format(session="agent-lane-r7c"))
+        write_json(tmp_path / "preflight.json", payload)
+        line = assert_stop(self.CHECK, tmp_path, self.STEP)
+        assert "agent-lane-r7c" in line
+
+    def test_unreadable_arbitration_holder_is_stop(self, tmp_path):
+        payload = _preflight(arb_holder="<unreadable>")
+        write_json(tmp_path / "preflight.json", payload)
+        line = assert_stop(self.CHECK, tmp_path, self.STEP)
+        assert "session" in line
 
     def test_foreign_lock_is_stop(self, tmp_path):
         payload = _preflight(
@@ -457,6 +488,79 @@ def _write_p2p(tmp_path, cap=None, d2d=None, nccl=None):
         results / "nccl_transport.json", nccl if nccl is not None else _nccl_transport()
     )
     return results
+
+
+class _FakeTensor:
+    def __getitem__(self, idx):
+        return self
+
+    def item(self):
+        return 2.0
+
+
+class TestNcclTransportWorkerPinning:
+    """The producer behind s01's third artifact, pinned without a card.
+
+    Both ranks used to call set_device(0) while CUDA_VISIBLE_DEVICES listed
+    BOTH cards of the pair, so two ranks landed on one device and NCCL refused
+    the communicator outright ("Duplicate GPU detected"). The 2026-07-30 run
+    recorded exactly that for all three pairs. torch is faked here, so the
+    pinning is falsifiable on a machine with no GPU at all."""
+
+    def _drive(self, rank):
+        import types
+
+        calls = []
+        torch_stub = types.ModuleType("torch")
+        torch_stub.float32 = "float32"
+        torch_stub.cuda = types.SimpleNamespace(
+            set_device=lambda dev: calls.append(("set_device", dev)),
+            synchronize=lambda: calls.append(("synchronize", None)),
+        )
+
+        def ones(_n, dtype=None, device=None):
+            calls.append(("ones", device))
+            return _FakeTensor()
+
+        torch_stub.ones = ones
+        dist_stub = types.ModuleType("torch.distributed")
+        dist_stub.init_process_group = lambda backend, rank, world_size: calls.append(
+            ("init_process_group", rank)
+        )
+        dist_stub.all_reduce = lambda t: calls.append(("all_reduce", None))
+        dist_stub.destroy_process_group = lambda: calls.append(("destroy", None))
+        torch_stub.distributed = dist_stub
+
+        p2p = os.path.join(REPO_ROOT, "scripts", "p2p_readiness")
+        sys.path.insert(0, p2p)
+        saved = {k: sys.modules.get(k) for k in ("torch", "torch.distributed")}
+        sys.modules["torch"] = torch_stub
+        sys.modules["torch.distributed"] = dist_stub
+        try:
+            import nccl_transport_check
+
+            rc = nccl_transport_check.worker(rank)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = value
+        return rc, calls
+
+    @pytest.mark.parametrize("rank", (0, 1))
+    def test_rank_pins_its_own_card(self, rank):
+        rc, calls = self._drive(rank)
+        assert rc == 0
+        assert ("set_device", rank) in calls
+        assert ("ones", f"cuda:{rank}") in calls
+
+    def test_device_is_pinned_before_the_communicator_is_built(self):
+        """NCCL reads the current device while building the communicator; a
+        set_device afterwards is a set_device too late."""
+        _, calls = self._drive(1)
+        order = [name for name, _ in calls]
+        assert order.index("set_device") < order.index("init_process_group")
 
 
 class TestP2PCheck:
@@ -841,7 +945,10 @@ def _reseed(**over):
     def arm(accept, reseed_forwards):
         return {
             "accept_len_mean": accept,
-            "curve": {"0": 0.5},
+            # A LIST, the way boot_d_lane_reseed.sh copies it out of
+            # accept_positions["rate"] -- not the dict this fixture used to
+            # invent while no check looked at the field.
+            "curve": [0.61, 0.38, 0.19],
             "decode_ms_mean": 41.2,
             "head_forwards": 100,
             "reseed_forwards": reseed_forwards,
@@ -906,6 +1013,40 @@ class TestBootDCheck:
         reseed["arms"][0]["arms"]["True"]["reseed_forwards"] = None
         _write_boot_d(tmp_path, reseed=reseed)
         assert_fail(self.CHECK, tmp_path, self.STEP)
+
+    def test_zero_spec_rounds_is_fail(self, tmp_path):
+        """An accept mean over zero proposal rounds is not a small number, it
+        is no number -- and the whole A/B is read off exactly that."""
+        reseed = _reseed()
+        reseed["arms"][0]["arms"]["False"]["spec_rounds"] = 0
+        _write_boot_d(tmp_path, reseed=reseed)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "spec_rounds" in line
+
+    def test_missing_curve_is_fail(self, tmp_path):
+        reseed = _reseed()
+        reseed["arms"][1]["arms"]["True"]["curve"] = None
+        _write_boot_d(tmp_path, reseed=reseed)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "Positionskurve" in line
+
+    def test_short_curve_is_fail(self, tmp_path):
+        """K=3 means three positions; two of them is a curve with a hole."""
+        reseed = _reseed()
+        reseed["arms"][0]["arms"]["True"]["curve"] = [0.6, 0.3]
+        _write_boot_d(tmp_path, reseed=reseed)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "Positionen" in line
+
+    def test_dict_curve_still_accepted(self, tmp_path):
+        """JSON string keys are what the other probes emit; both shapes are a
+        curve."""
+        reseed = _reseed()
+        for row in reseed["arms"]:
+            for arm in row["arms"].values():
+                arm["curve"] = {"0": 0.6, "1": 0.35, "2": 0.18}
+        _write_boot_d(tmp_path, reseed=reseed)
+        assert_pass(self.CHECK, tmp_path, self.STEP)
 
     def test_missing_artifact_without_log_is_stop(self, tmp_path):
         assert_stop(self.CHECK, tmp_path, self.STEP)

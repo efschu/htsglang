@@ -23,6 +23,13 @@ from check_common import CheckStop, load_json, require_envelope, run_check  # no
 
 STEP = "s00_preflight"
 
+# Two arbitration mechanisms exist on this rig and they are not the same: the
+# battery takes /tmp/gpu-card-N.lock, while /spinning/gpu-arb/holder is the
+# operator-level file the r7c recipes write. Only the operator's own window
+# authorises the battery to run; anyone else's holder is a foreign session
+# whose boot the battery would run straight into.
+ARB_OWN_SESSION = "operator"
+
 
 def check(step_dir: str) -> None:
     payload = load_json(os.path.join(step_dir, "preflight.json"), "preflight.json")
@@ -67,6 +74,8 @@ def check(step_dir: str) -> None:
             f"{len(held)} Karten-Lock(s) fremd gehalten, erstes: {held[0].get('info')}"
         )
 
+    _check_arbitration(payload)
+
     missing = [p for p, ok in (payload.get("required_files") or {}).items() if not ok]
     if missing:
         raise CheckStop(f"{len(missing)} Pflichtdatei(en) fehlen, erste: {missing[0]}")
@@ -82,6 +91,35 @@ def check(step_dir: str) -> None:
         raise CheckStop("Treiberversion nicht ermittelbar")
     if not payload.get("torch") or not payload.get("nccl"):
         raise CheckStop("torch/NCCL-Version nicht ermittelbar")
+
+
+def _check_arbitration(payload: dict) -> None:
+    """The cross-session holder in /spinning/gpu-arb/holder.
+
+    The card locks only cover sessions that take them; the holder file is what
+    an r7c boot in another session writes. It was recorded by the preflight and
+    then read by nobody, so a foreign session's window did not stop the
+    battery -- and both would be on the cards at once.
+
+    Line shape: ``session=<name>  cards=0,1,2  purpose=...  since=...``.
+    """
+    holder = payload.get("arb_holder")
+    if not holder:
+        return
+    fields = dict(tok.split("=", 1) for tok in str(holder).split() if "=" in tok)
+    session = fields.get("session")
+    if session == ARB_OWN_SESSION:
+        return
+    if session is None:
+        raise CheckStop(
+            f"/spinning/gpu-arb/holder ohne session=-Feld: {str(holder)[:120]} -- "
+            "unklarer Halter wird nicht ueberfahren"
+        )
+    raise CheckStop(
+        f"/spinning/gpu-arb/holder haelt session={session} "
+        f"(cards={fields.get('cards')}, purpose={fields.get('purpose')}) -- "
+        "fremdes Fenster, die Batterie startet nicht hinein"
+    )
 
 
 def main() -> int:

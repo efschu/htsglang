@@ -15,6 +15,9 @@ Verified:
   * a decode point at bs=1 and one at bs=16 per arm,
   * an output sample per arm is persisted. A fast garbage run looks good in a
     throughput table (Messregel 5),
+  * no boot died on an OOM / NCCL error / traceback. Eight boots that each
+    broke off in a prefill OOM still hand in throughput numbers, and without
+    this gate the table looks exactly like a healthy one,
   * the baseline reproduces the known host-path numbers within the tolerance.
     It does not: STOP -- this environment is not the one those numbers came
     from, and comparing against them would be comparing two rigs.
@@ -52,6 +55,31 @@ MIN_SAMPLE_CHARS = 50
 
 def _rate(payload: dict, arm: str, sessions: int):
     return (payload.get("kurven") or {}).get(arm, {}).get(str(sessions))
+
+
+def _check_fatal(payload: dict) -> None:
+    """The fatal harvest per boot. A missing field is a FAIL, not a pass:
+    "nobody looked" and "nothing found" must not produce the same verdict."""
+    if "fatal" not in payload:
+        raise CheckFail(
+            "prefill_kurve.json fuehrt kein fatal-Feld -- die Fatal-Ernte der "
+            "Boots (logs/*.fatal.txt) wurde gar nicht ausgewertet"
+        )
+    ungeprueft = payload.get("fatal_ungeprueft") or []
+    if ungeprueft:
+        first = ungeprueft[0]
+        raise CheckFail(
+            f"{len(ungeprueft)} Boot(s) ohne Fatal-Ernte, erster: "
+            f"{first.get('arm')}/{first.get('sessions')} Sessions -- ohne die "
+            "Datei ist 'kein Fatal' nicht belegt, nur unbekannt"
+        )
+    fatal = payload.get("fatal") or []
+    if fatal:
+        first = fatal[0]
+        raise CheckFail(
+            f"{len(fatal)} Boot(s) mit Fatal, erster {first.get('arm')}/"
+            f"{first.get('sessions')} Sessions -- {first.get('zeile')}"
+        )
 
 
 def check(step_dir: str) -> None:
@@ -103,6 +131,8 @@ def check(step_dir: str) -> None:
                 f"{a.get('sessions')} und {b.get('sessions')} Sessions) -- "
                 "blockweise gemessen, damit ist der Vergleich nicht verschraenkt"
             )
+
+    _check_fatal(payload)
 
     # --- did each boot run the arm it claims? -------------------------------
     for eintrag in reihenfolge:

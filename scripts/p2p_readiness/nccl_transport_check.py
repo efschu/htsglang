@@ -48,13 +48,20 @@ def free_port():
 
 
 def worker(rank: int) -> int:
-    """Runs INSIDE the pinned subprocess: rank 0/1, one small all_reduce."""
+    """Runs INSIDE the pinned subprocess: rank 0/1, one small all_reduce.
+
+    CUDA_VISIBLE_DEVICES lists BOTH cards of the pair, so the rank picks its
+    own card out of that pair -- rank 0 -> cuda:0, rank 1 -> cuda:1. Pinning
+    both ranks to cuda:0 puts two ranks on one device and NCCL refuses the
+    communicator outright ("Duplicate GPU detected"), which is what the
+    2026-07-30 run recorded for all three pairs.
+    """
     import torch
     import torch.distributed as dist
 
+    torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=2)
-    torch.cuda.set_device(0)  # pinned by CUDA_VISIBLE_DEVICES: always cuda:0
-    t = torch.ones(1024 * 256, dtype=torch.float32, device="cuda:0")
+    t = torch.ones(1024 * 256, dtype=torch.float32, device=f"cuda:{rank}")
     dist.all_reduce(t)
     torch.cuda.synchronize()
     ok = float(t[0].item()) == 2.0
