@@ -60,15 +60,26 @@ source ./common.sh
 
 TARGET_DIR="$MODEL_ROOT/Qwen3.6-27B-MTP-Q3_K_M-GGUF"
 TARGET="$TARGET_DIR/Qwen3.6-27B-Q3_K_M.gguf"
-DRAFT="$MODEL_ROOT/qwen3.6-27b-dflash-gguf"
+# The drafter is passed as the .gguf FILE, not as its directory. A GGUF target
+# resolves load_format=gguf (server_args._handle_load_format via
+# check_gguf_file), and the draft worker inherits that load format, so the
+# drafter goes through GGUFModelLoader._prepare_weights
+# (model_loader/loader.py:2187), which is os.path.isfile() or ValueError. The
+# directory form died there after ~2.5 min of target load:
+# "qwen3.6-27b-dflash-gguf is not a file." The sibling config.json is still
+# read -- get_config rewrites a .gguf path to its parent directory for the
+# bespoke qwen35 arch (utils/hf_transformers/config.py:266-270) -- which is why
+# the directory keeps its own existence check below.
+DRAFT_DIR="$MODEL_ROOT/qwen3.6-27b-dflash-gguf"
+DRAFT="$DRAFT_DIR/Qwen3.6-27B-DFlash-Q8_0.gguf"
 PORT="${PORT:-30079}"
 CTX="${CTX:-16384}"
 LOG="${LOG:-/tmp/r7c-boot-c.server.log}"
 OUT="${OUT:-/tmp/r7c-boot-c}"
 mkdir -p "$OUT"
 
-require_file "$DRAFT/config.json" "$DRAFT/config.json fehlt" || exit 1
-require_file "$DRAFT/Qwen3.6-27B-DFlash-Q8_0.gguf" "Q8_0-GGUF fehlt" || exit 1
+require_file "$DRAFT_DIR/config.json" "$DRAFT_DIR/config.json fehlt" || exit 1
+require_file "$DRAFT" "Q8_0-GGUF fehlt: $DRAFT" || exit 1
 
 assert_cards_free || exit 1
 # Argument, not a pipe: `load_card_order | tee` would set CUDA_BIG/CUDA_SMALL
