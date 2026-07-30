@@ -305,13 +305,32 @@ battery_stop_harvest() {
 # Never an unbounded wait inside a single call: every curl carries -m and the
 # loop carries a budget. An agent that blocks forever in one bash call is a
 # wedged agent, not a patient one.
-battery_wait_for_server() {  # $1 = port, $2 = budget_s
-    local port="$1" budget="${2:-900}" t0
+#
+# The budget is an upper bound, not a schedule: a server that has already
+# exited will never answer the port, and waiting the rest out costs the window
+# the step was given. Pass the server pid to end the wait at the crash instead
+# of at the timeout (round 7c boot C: loader crash 04:46, collected 05:14).
+battery_wait_for_server() {  # $1 = port, $2 = budget_s, $3 = optional server pid
+    local port="$1" budget="${2:-900}" pid="${3:-}" t0 state
     t0=$(date +%s)
     while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
         if curl -sf -m 5 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
             echo "server up nach $(( $(date +%s) - t0 ))s"
             return 0
+        fi
+        # After the health probe, so a server that answered and exited in the
+        # same iteration still counts as up. A pid bash has already reaped
+        # fails `kill -0`; an unreaped one is a zombie and needs /proc.
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            echo "Serverprozess $pid nach $(( $(date +%s) - t0 ))s tot" >&2
+            return 1
+        fi
+        if [ -n "$pid" ]; then
+            state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)"
+            if [ "$state" = "Z" ]; then
+                echo "Serverprozess $pid nach $(( $(date +%s) - t0 ))s tot (Zombie)" >&2
+                return 1
+            fi
         fi
         sleep 10
     done

@@ -55,7 +55,7 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-if ! battery_wait_for_server "$PORT" 900; then
+if ! battery_wait_for_server "$PORT" 900 "$SERVER_PID"; then
     echo "Server nicht oben -- Dump und Abbruch"
     cleanup
     exit 1

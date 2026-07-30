@@ -206,6 +206,10 @@ print(f"\n({len(rows)} Samples)")
 PY
 }
 
+# Pid file of the most recent launch_server, read by wait_for_server. Empty
+# before the first launch and in a dry run, where nothing is started.
+LAUNCH_PIDFILE=""
+
 # Starts the launcher in the background, or -- in a dry run -- prints the fully
 # assembled command and starts nothing. Every recipe routes its launch through
 # here so the dry run covers the exact flags a real boot would pass, including
@@ -219,15 +223,46 @@ launch_server() {  # $1 = server log, $2 = pid file, rest = command + flags
   fi
   setsid "$@" > "$log" 2>&1 &
   echo $! > "$pidfile"
+  # Remembered so wait_for_server can watch the process, not just the port.
+  # `setsid CMD &` from a non-job-control script does not fork -- the recorded
+  # pid IS the launcher, which is what the recipes already kill at the end.
+  LAUNCH_PIDFILE="$pidfile"
 }
 
-wait_for_server() {  # $1 = port, $2 = timeout_s
-  local port="$1" budget="${2:-1800}" t0
+# True while the pid in $1 is a live process. A pid that bash has already
+# reaped fails `kill -0`; one it has not reaped yet is a zombie, which passes
+# `kill -0` and has to be read out of /proc.
+_pid_alive() {  # $1 = pid
+  local pid="$1" state
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)"
+  [ "$state" = "Z" ] && return 1
+  return 0
+}
+
+# $3 defaults to the last launch_server's pid file; passing an explicit empty
+# string ("" rather than nothing) waits on the port alone.
+wait_for_server() {  # $1 = port, $2 = timeout_s, $3 = pidfile
+  local port="$1" budget="${2:-1800}" pidfile="${3-${LAUNCH_PIDFILE:-}}" t0 pid
   t0=$(date +%s)
   while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
     if curl -sf -m 5 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
       echo "server up nach $(( $(date +%s) - t0 ))s"
       return 0
+    fi
+    # A dead server will never answer the port, so sitting out the rest of the
+    # budget only burns the window: round 7c's boot C crashed in the drafter
+    # load at 04:46 and was collected at 05:14, 28 minutes of polling a process
+    # that no longer existed. Checked only AFTER the health probe, so a server
+    # that answered and exited within the same iteration still counts as up.
+    if [ -n "$pidfile" ] && [ -s "$pidfile" ]; then
+      pid="$(cat "$pidfile" 2>/dev/null)"
+      if [ -n "$pid" ] && ! _pid_alive "$pid"; then
+        echo "ABBRUCH: Serverprozess $pid nach $(( $(date +%s) - t0 ))s tot --" \
+             "der Port wird nie antworten" >&2
+        return 1
+      fi
     fi
     sleep 10
   done

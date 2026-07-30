@@ -146,6 +146,67 @@ class TestR7cRecipeDryRun(CustomTestCase):
                     f"--speculative-draft-gpu {card[len('cuda:') :]}", proc.stdout
                 )
 
+    def test_boot_c_passes_the_drafter_as_a_gguf_file(self):
+        """The drafter path must be the .gguf FILE, never its directory.
+
+        A GGUF target resolves load_format=gguf, the draft worker inherits it,
+        and GGUFModelLoader._prepare_weights (model_loader/loader.py) is
+        `os.path.isfile(path) or ValueError`. The directory form cost a boot
+        window: the server crashed 2.5 minutes into the target load with
+        "qwen3.6-27b-dflash-gguf is not a file."
+        """
+        for label, big, small, names in _CARD_ORDERS:
+            with self.subTest(cards=label):
+                proc = _dry_run("boot_c_dflash_solo_q8.sh", big, small, names)
+                self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+                launch = [
+                    line
+                    for line in proc.stdout.splitlines()
+                    if line.startswith("DRY RUN LAUNCH:")
+                ]
+                self.assertEqual(len(launch), 1, msg=proc.stdout)
+                flags = launch[0].split()
+                self.assertIn("--speculative-draft-model-path", flags)
+                draft = flags[flags.index("--speculative-draft-model-path") + 1]
+                self.assertTrue(
+                    draft.endswith(".gguf"),
+                    msg=(
+                        "--speculative-draft-model-path must name the .gguf "
+                        f"file the GGUF loader opens, got {draft!r}"
+                    ),
+                )
+                # The target is a GGUF file too -- that is what makes the draft
+                # worker inherit load_format=gguf in the first place.
+                self.assertIn("--model-path", flags)
+                self.assertTrue(
+                    flags[flags.index("--model-path") + 1].endswith(".gguf")
+                )
+
+    def test_wait_for_server_watches_the_server_process(self):
+        """A dead server must end the wait, not run out the budget.
+
+        Boot C's crash landed at 04:46 and was collected at 05:14: the readiness
+        loop polled a port belonging to a process that no longer existed for 28
+        minutes. Checked on the source because the loop needs a real server to
+        exercise.
+        """
+        common = (_R7C / "common.sh").read_text()
+        body = common.split("wait_for_server()", 1)
+        self.assertEqual(len(body), 2, msg="wait_for_server not found in common.sh")
+        self.assertIn(
+            "_pid_alive",
+            body[1].split("\n}\n", 1)[0],
+            msg=(
+                "wait_for_server polls only the port -- a crashed server is "
+                "waited out to the full budget."
+            ),
+        )
+        self.assertIn(
+            "LAUNCH_PIDFILE",
+            common,
+            msg="launch_server must record its pid file for wait_for_server",
+        )
+
     def test_no_recipe_pipes_load_card_order(self):
         """The source form of the bug, kept out by a ratchet.
 
