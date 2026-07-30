@@ -7,11 +7,29 @@ Usage:
 
 import unittest
 
-from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+from sglang.srt.utils.auth import (
+    AuthLevel,
+    _get_auth_level_from_app_and_scope,
+    app_has_admin_force_endpoints,
+    auth_level,
+    decide_request_auth,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+
+
+def _minimal_scope(path: str) -> dict:
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+    }
 
 
 class TestHttpServerAdminAuth(unittest.TestCase):
@@ -291,6 +309,61 @@ class TestHttpServerAdminAuth(unittest.TestCase):
                     ).allowed,
                     msg=f"expected allowed for {path=} with {keys=}",
                 )
+
+
+class TestAuthLevelRouteIntrospection(unittest.TestCase):
+    """`_get_auth_level_from_app_and_scope` / `app_has_admin_force_endpoints`
+    walk `app.routes` looking for the decorated endpoint. Endpoints
+    registered via `app.include_router()` (like `/v1/loads`) can be
+    represented, on some FastAPI versions, as a single aggregate route that
+    matches its whole sub-tree but exposes neither `.path` nor `.endpoint`
+    directly (see the sibling `AttributeError` fix for
+    `sglang.srt.utils.common._get_fastapi_request_path`). Before the fix,
+    that silently made `@auth_level(...)`-decorated endpoints behind
+    `include_router()` fall back to `AuthLevel.NORMAL` -- a silent
+    privilege *widening*, not a crash, which is why it's covered
+    separately here.
+    """
+
+    def _build_app(self):
+        from fastapi import APIRouter, FastAPI
+
+        app = FastAPI()
+
+        @app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        sub_router = APIRouter()
+
+        @sub_router.get("/v1/loads")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def get_loads():
+            return {"loads": []}
+
+        app.include_router(sub_router)
+        return app
+
+    def test_included_router_endpoint_auth_level_is_detected(self):
+        app = self._build_app()
+        scope = _minimal_scope("/v1/loads")
+
+        level = _get_auth_level_from_app_and_scope(app, scope)
+
+        self.assertEqual(level, AuthLevel.ADMIN_FORCE)
+
+    def test_included_router_endpoint_counts_toward_admin_force_check(self):
+        app = self._build_app()
+
+        self.assertTrue(app_has_admin_force_endpoints(app))
+
+    def test_directly_registered_endpoint_still_defaults_to_normal(self):
+        app = self._build_app()
+        scope = _minimal_scope("/health")
+
+        level = _get_auth_level_from_app_and_scope(app, scope)
+
+        self.assertEqual(level, AuthLevel.NORMAL)
 
 
 if __name__ == "__main__":

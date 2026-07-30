@@ -35,6 +35,27 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_effective_routes(routes: Any) -> Any:
+    """Expand routes registered via `include_router()` into their leaf routes.
+
+    Some FastAPI versions represent an `include_router()`-registered
+    sub-router as a single aggregate route object (a private
+    `_IncludedRouter`) that matches its whole sub-tree but does not itself
+    expose `.endpoint`/`.path`. Such routes do expose a public
+    `effective_route_contexts()` method that yields the fully-resolved leaf
+    routes, so duck-type on that instead of hard-coding any private class
+    name. Duplicated (rather than imported) from
+    `sglang.srt.utils.common._iter_effective_routes` to keep this module's
+    documented zero-torch-import, unit-test-friendly footprint.
+    """
+    for route in routes:
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            yield from effective_route_contexts()
+        else:
+            yield route
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
@@ -46,7 +67,7 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
         app, "routes", []
     )
 
-    for route in routes:
+    for route in _iter_effective_routes(routes):
         try:
             match, child_scope = route.matches(scope)
         except Exception:
@@ -64,7 +85,7 @@ def app_has_admin_force_endpoints(app: Any) -> bool:
     routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
         app, "routes", []
     )
-    for route in routes:
+    for route in _iter_effective_routes(routes):
         endpoint = getattr(route, "endpoint", None)
         if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
             return True
