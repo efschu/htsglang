@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     get_jit_cuda_arch,
     is_arch_support_pdl,
     is_hip_runtime,
@@ -28,7 +28,7 @@ def _fast_math_flags() -> list[str]:
     return ["--use_fast_math"]
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_activation_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(

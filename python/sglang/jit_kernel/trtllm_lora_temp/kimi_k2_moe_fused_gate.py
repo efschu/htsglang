@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_kimi_k2_moe_fused_gate_module() -> Module:
     return load_jit(
         "kimi_k2_moe_fused_gate",

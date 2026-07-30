@@ -7,6 +7,7 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype)
     return load_jit(
@@ -54,7 +55,7 @@ def _rmsnorm_kernel_class(hidden_size: int) -> str:
     return "RMSNormKernel"
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
     kernel_class = f"{_rmsnorm_kernel_class(hidden_size)}<{args}>"
@@ -70,7 +71,7 @@ def is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_size: int) -> bool:
     return hidden_size > 0 and hidden_size % 16 == 0 and hidden_size <= 8192
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_add_rmsnorm_module(
     dtype: torch.dtype, cast_x_before_out_mul: bool
 ) -> Module:
@@ -83,7 +84,7 @@ def _jit_fused_add_rmsnorm_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     return load_jit(

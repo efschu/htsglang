@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 _GROUP_SIZE = 128
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_module(in_dtype: torch.dtype, use_pdl: bool) -> Module:
     args = make_cpp_args(in_dtype, use_pdl)
     return load_jit(

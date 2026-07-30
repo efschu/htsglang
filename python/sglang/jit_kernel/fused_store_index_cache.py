@@ -15,6 +15,7 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_dsa_fused_store_module(
     key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
 ) -> Module:

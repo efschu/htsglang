@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 SUPPORTED_GROUP_TOPK = (128, 160, 192, 224, 256, 512)
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_kpool_topk_transform_module(group_topk: int) -> Module:
     """Compile and cache the kpool top-k transform module for a given group_topk."""
     assert group_topk in SUPPORTED_GROUP_TOPK, (

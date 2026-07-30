@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from sglang.jit_kernel.utils import CPP_DTYPE_MAP as OUTPUT_DTYPE_MAP
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_per_token_group_quant_8bit_module(
     dtype: torch.dtype, output_type: torch.dtype, group_size: int
 ) -> Module:

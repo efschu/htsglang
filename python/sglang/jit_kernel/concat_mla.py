@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_concat_mla_k_module() -> Module:
     return load_jit(
         "concat_mla_k",
@@ -19,7 +19,7 @@ def _jit_concat_mla_k_module() -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_concat_mla_absorb_q_module() -> Module:
     return load_jit(
         "concat_mla_absorb_q",

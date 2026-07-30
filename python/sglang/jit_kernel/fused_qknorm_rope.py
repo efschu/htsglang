@@ -5,14 +5,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, cache_once_per_arch, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_qknorm_rope_module(head_dim: int, is_neox: bool, yarn: bool) -> Module:
     return load_jit(
         "fused_qknorm_rope",

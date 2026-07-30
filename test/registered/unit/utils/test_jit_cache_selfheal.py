@@ -239,38 +239,53 @@ class TestLoadJitEndToEnd(CustomTestCase):
     code.
     """
 
-    def _run(self, marker, prepare):
+    @staticmethod
+    def _drive(root, marker, built):
+        """Run the real load_jit against `root` with a stubbed compiler."""
         from unittest import mock
 
         import tvm_ffi.cpp
 
         from sglang.jit_kernel import utils as jit_utils
 
+        def fake_load_inline(module_name, *a, build_directory=None, **kw):
+            built.append(module_name)
+            Path(build_directory).mkdir(parents=True, exist_ok=True)
+            (Path(build_directory) / f"{module_name}.so").write_bytes(b"\x7fELF")
+            return f"module:{module_name}"
+
+        jit_utils._jit_cache_swept = False
+        try:
+            with mock.patch.dict(
+                os.environ, {"TVM_FFI_CACHE_DIR": str(root)}, clear=False
+            ):
+                with mock.patch.object(tvm_ffi.cpp, "load_inline", fake_load_inline):
+                    return jit_utils.load_jit(marker)
+        finally:
+            jit_utils._jit_cache_swept = False
+
+    def _entry_name(self, marker):
+        """The directory load_jit will use, learned rather than predicted.
+
+        The key is composed from the sources, the architecture, the toolchain
+        and the flag set; a test that re-derives it would only pin its own copy
+        of that composition. One throwaway build tells us the real answer.
+        """
+        with TemporaryDirectory() as scratch:
+            self._drive(scratch, marker, [])
+            entries = [p.name for p in Path(scratch).iterdir() if p.is_dir()]
+            self.assertEqual(len(entries), 1, entries)
+            return entries[0]
+
+    def _run(self, marker, prepare):
+        name = f"sgl_kernel_jit_{marker}"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            name = f"sgl_kernel_jit_{marker}"
-            entry = root / jit_utils._jit_build_dir_name(name)
+            entry = root / self._entry_name(marker)
             prepare(entry, name)
 
             built = []
-
-            def fake_load_inline(module_name, *a, build_directory=None, **kw):
-                built.append(module_name)
-                Path(build_directory).mkdir(parents=True, exist_ok=True)
-                (Path(build_directory) / f"{module_name}.so").write_bytes(b"\x7fELF")
-                return f"module:{module_name}"
-
-            jit_utils._jit_cache_swept = False
-            try:
-                with mock.patch.dict(
-                    os.environ, {"TVM_FFI_CACHE_DIR": str(root)}, clear=False
-                ):
-                    with mock.patch.object(
-                        tvm_ffi.cpp, "load_inline", fake_load_inline
-                    ):
-                        result = jit_utils.load_jit(marker)
-            finally:
-                jit_utils._jit_cache_swept = False
+            result = self._drive(root, marker, built)
             # Snapshot inside the TemporaryDirectory: it is gone after this.
             names = {p.name for p in entry.iterdir()} if entry.is_dir() else set()
             so_bytes = {

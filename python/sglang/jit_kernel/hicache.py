@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 DEFAULT_BLOCK_QUOTA = 2
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
     args = make_cpp_args(
         element_size,
@@ -36,7 +36,7 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_hicache_staged_module(
     *, element_size: int, unroll: int, block_quota: int
 ) -> Module:

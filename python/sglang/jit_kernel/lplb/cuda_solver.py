@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     get_jit_cuda_arch,
     load_jit,
     make_cpp_args,
@@ -40,7 +40,7 @@ def _sm_ver() -> int:
     return arch.major * 100 + arch.minor * 10
 
 
-@cache_once
+@cache_once_per_arch
 def _ipm_module(
     nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int
 ) -> Module:
@@ -117,7 +117,7 @@ def solve_ipm(
     return result
 
 
-@cache_once
+@cache_once_per_arch
 def _prep_module(
     nc: int,
     nv: int,
@@ -162,7 +162,7 @@ def prep_lp_inputs(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _post_module(
     num_logical: int,
     max_copies: int,
@@ -200,7 +200,7 @@ def extract_log2phy_prob(
     module.lp_post(log2phy_prob, x, t1, phy_single, phy_replicated, log2phy)
 
 
-@cache_once
+@cache_once_per_arch
 def _dispatch_module(max_copies: int, block_dim: int) -> Module:
     args = make_cpp_args(max_copies, block_dim)
     return load_jit(

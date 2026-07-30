@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
@@ -13,7 +13,7 @@ from sglang.jit_kernel.utils import (
 from .utils import make_name
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_mask_topk_module():
     return load_jit(
         make_name("mask_topk"),
@@ -22,7 +22,7 @@ def _jit_mask_topk_module():
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_hash_topk_module():
     args = make_cpp_args("act_sqrt_softplus", is_arch_support_pdl())
     return load_jit(
@@ -33,7 +33,7 @@ def _jit_hash_topk_module():
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
     args = make_cpp_args(quant_group_size, is_arch_support_pdl())
     return load_jit(
@@ -44,7 +44,7 @@ def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_silu_mul_quant_varlen_module(
     quant_group_size: int,
     scale_ue8m0: bool,
@@ -67,7 +67,7 @@ def _jit_silu_mul_quant_varlen_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_silu_mul_quant_contig_module(
     quant_group_size: int,
     scale_ue8m0: bool,
@@ -90,7 +90,7 @@ def _jit_silu_mul_quant_contig_module(
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(

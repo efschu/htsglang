@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     return load_jit(

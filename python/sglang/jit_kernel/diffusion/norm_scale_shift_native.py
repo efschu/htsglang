@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -58,7 +58,7 @@ def _row_bf16(t, device: torch.device):
     return row if _aligned(row) else None
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_norm_scale_shift_module() -> Module:
     return load_jit(
         "qwen_image_norm_scale_shift_native",

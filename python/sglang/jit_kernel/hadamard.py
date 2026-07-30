@@ -4,14 +4,19 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    KERNEL_PATH,
+    cache_once_per_arch,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_hadamard_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     hadamard_include_dir = (KERNEL_PATH / "csrc" / "fast-hadamard-transform").resolve()

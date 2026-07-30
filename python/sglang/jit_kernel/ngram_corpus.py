@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import tvm_ffi
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 
 _MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
 
@@ -23,7 +23,7 @@ def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
     return tokens_flat, offsets_t
 
 
-@cache_once
+@cache_once_per_arch
 def get_ngram_corpus_cls():
     module = load_jit(
         "ngram_corpus",

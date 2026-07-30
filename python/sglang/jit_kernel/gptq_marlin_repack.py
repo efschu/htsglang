@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once_per_arch, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 _TILE_SIZE = 16
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_gptq_marlin_repack_module() -> Module:
     return load_jit(
         "gptq_marlin_repack",

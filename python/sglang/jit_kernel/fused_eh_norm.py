@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -19,7 +19,7 @@ def is_supported_fused_eh_norm_hidden_size(hidden_size: int) -> bool:
     return hidden_size > 256 and hidden_size <= 8192 and hidden_size % 256 == 0
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_eh_norm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
     return load_jit(

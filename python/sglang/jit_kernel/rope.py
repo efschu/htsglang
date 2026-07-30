@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import (
-    cache_once,
+    cache_once_per_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_rotary_embedding_module() -> Module:
     return load_jit(
         "rotary_embedding",
@@ -26,7 +26,7 @@ def _jit_rotary_embedding_module() -> Module:
     )
 
 
-@cache_once
+@cache_once_per_arch
 def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype)
     return load_jit(

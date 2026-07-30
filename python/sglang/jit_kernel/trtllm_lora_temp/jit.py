@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from sglang.jit_kernel.utils import get_jit_target_archs, get_jit_vendor
+
 
 def _data_dir() -> Path:
     return Path(__file__).resolve().parent / "data"
@@ -54,8 +56,19 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
         supported_major_versions=[10, 12]
     )
 
+    # flashinfer keys its JIT cache on this name alone -- the artefact lands in
+    # $FLASHINFER_JIT_DIR/<name>/<name>.so, a host-global directory shared by
+    # every checkout and every process on the box. `nvcc_flags` above already
+    # differs per architecture (CompilationContext unions the VISIBLE devices'
+    # capabilities), so without the architecture in the name two processes that
+    # see different cards write one entry and the loser runs the winner's cubin.
+    # That is the same defect as the tvm-ffi entry in jit_kernel/utils.py and as
+    # #208 in srt/utils/cute_dsl_arch.py; the fix shape is the same too.
+    arch_tag = "_".join(a.replace(".", "") for a in get_jit_target_archs()) or "unknown"
+    spec_name = f"sgl_fused_moe_trtllm_sm100_{get_jit_vendor()}_arch_{arch_tag}"
+
     return gen_jit_spec(
-        "sgl_fused_moe_trtllm_sm100",
+        spec_name,
         [
             flashinfer_csrc_dir / "nv_internal/cpp/kernels/quantization.cu",
             flashinfer_csrc_dir / "nv_internal/cpp/common/envUtils.cpp",
