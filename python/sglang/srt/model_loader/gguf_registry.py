@@ -12,6 +12,11 @@ Adding a family = write the adapter module (emit tables + hooks + its verbatim
 ``loader.py`` (uses :func:`create_gguf_adapter`) or to the config-peek (uses
 :func:`sibling_config_gguf_archs`) are needed.
 
+Not every checkpoint that needs the sibling config.json is a family: one whose
+``model_type`` is shared with a whole generic family (the DFLASH drafter is
+``qwen3``) must dispatch on its GGUF architecture instead, and contributes its
+arch through ``_ARCH_ONLY_SIBLING_CONTRIBUTORS``.
+
 Import discipline: this module stays import-light (importlib only).  The adapter
 modules — which pull in torch/gguf — are imported LAZILY inside the functions so
 importing the registry (e.g. from the early config-peek path) is cheap and
@@ -32,6 +37,22 @@ logger = logging.getLogger(__name__)
 _FAMILIES: Tuple[Tuple[str, str, str], ...] = (
     ("qwen35", "sglang.srt.model_loader.gguf_qwen35", "Qwen35GGUFAdapter"),
     ("gemma4", "sglang.srt.model_loader.gguf_gemma4", "Gemma4GGUFAdapter"),
+)
+
+# (module_path, attribute) of checkpoints that need the sibling config.json but
+# are NOT families: they dispatch on the HF ARCHITECTURE rather than on
+# model_type, so they have no MODEL_TYPE_TO_ARCH to harvest.
+#
+# The DFLASH drafter is the case this exists for. Its config carries
+# ``model_type: "qwen3"``, so registering it in _FAMILIES would capture every
+# plain Qwen3 GGUF as well (gguf_dflash.py states this); its GGUF header, on
+# the other hand, says "dflash-draft" and is unambiguous. The two halves were
+# split before: the WEIGHT loader dispatches on the architecture and works, but
+# the architecture is only readable once the sibling config.json has been read,
+# and nothing routed the config peek there -- so the drafter died in
+# transformers' GGUF reader before its own loader ever ran.
+_ARCH_ONLY_SIBLING_CONTRIBUTORS: Tuple[Tuple[str, str], ...] = (
+    ("sglang.srt.model_loader.gguf_dflash", "DFLASH_GGUF_ARCHS"),
 )
 
 
@@ -69,12 +90,18 @@ def create_gguf_adapter(hf_config, gguf_file: str):
 def sibling_config_gguf_archs() -> Tuple[str, ...]:
     """The set of GGUF ``general.architecture`` strings whose config/tokenizer
     must be read from the sibling files (config.json / tokenizer.json) instead
-    of the GGUF metadata — i.e. the union of every bespoke family's GGUF archs.
-    Used by the config/tokenizer peek in ``utils/hf_transformers``.
+    of the GGUF metadata — the union of every bespoke family's GGUF archs plus
+    the arch-dispatched contributors. Used by the config/tokenizer peek in
+    ``utils/hf_transformers``.
     """
     archs: List[str] = []
     for _family_name, cls in _iter_adapter_classes():
         for arch in cls.MODEL_TYPE_TO_ARCH.values():
+            if arch not in archs:
+                archs.append(arch)
+    for module_path, attr in _ARCH_ONLY_SIBLING_CONTRIBUTORS:
+        module = importlib.import_module(module_path)
+        for arch in getattr(module, attr):
             if arch not in archs:
                 archs.append(arch)
     return tuple(archs)
