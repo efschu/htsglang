@@ -48,16 +48,20 @@ PUNKTE="${S13_PUNKTE:-1:0 8:1}"
 # lever on top of it is an environment variable or a server argument, so that
 # an arm can never accidentally change the transport as a side effect.
 #
-# `bar1pipe` carries SGLANG_HTCCL_BAR1_PIPE_DIREKT=0 on purpose. The bare
-# SGLANG_HTCCL_BAR1_PIPE=1 -- pipe with the direct mode at its default 1 and
-# the result ring at its default 2 -- DOES NOT BOOT this model: the decode
-# graph capture warmup runs several all_reduce call sites back to back, the
-# two eager result slots are still held, and `_erg_platz` raises
-# Bar1Unverfuegbar rather than overwrite a buffer the caller still owns. That
-# is the ring doing its job, not a bug, but it means the pipe lever can only
-# be measured either without the direct mode (this arm) or with a ring big
-# enough for the graph (the next one). Evidence:
-# 2026-07-30_hebel/befunde/bar1pipe_bootfehler.txt
+# `bar1pipe` carries SGLANG_HTCCL_BAR1_PIPE_DIREKT=0 on purpose: it is the
+# control arm for the pipe WITHOUT the result ring, so the pipe's own cost in
+# the BAR1 window can be read off against `bar1`.
+#
+# In the 2026-07-30 run the bare SGLANG_HTCCL_BAR1_PIPE=1 did not boot at all:
+# the decode graph capture warmup runs several all_reduce call sites back to
+# back, the two eager result slots were still held, and `_erg_platz` raised
+# Bar1Unverfuegbar rather than overwrite a buffer the caller still owns
+# (2026-07-30_hebel/befunde/bar1pipe_bootfehler.txt). Both halves of that are
+# fixed since: the eager path looks for a free slot instead of only checking
+# the next one, falls back to direkt=0 with a notice when every slot is held,
+# and the number of eager slots is SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER instead of
+# a constant. How many the standard run needs is still UNMEASURED -- read
+# `erg_eager_voll` in the log before raising it.
 ARME_TABELLE=(
     "nccl|grundlinie||"
     "bar1|bar1||"
@@ -80,15 +84,16 @@ ARME_TABELLE=(
     "nccl_hi|grundlinie||--rank-auto-reserve-mib 4500,4200,4200"
     "bar1_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200"
     "ncclpg_hi|grundlinie||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
+    # Der Vorbehalt ist gefallen: seine Vorgabe kommt seit den Hebel-Fixes
+    # aus SGLANG_HTCCL_GRAPH_FREIGABE, und die steht in jedem bar1-Boot.
+    # `bar1pg_hi` ist damit der Arm MIT gitter; der Kontrollarm daneben holt
+    # den Vorbehalt ausdruecklich zurueck. Die Rollen der beiden Zeilen sind
+    # gegenueber dem Lauf vom 2026-07-30 also vertauscht, die Zahlen bleiben
+    # vergleichbar: bar1pg_hi entspricht dem damaligen bar1pggitter_hi
+    # (1576,0 / 1337,2), bar1pgvorbehalt_hi dem damaligen bar1pg_hi
+    # (1321,6 / 1151,6).
     "bar1pg_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
-    # Der Falsifikator zum Befund des pg-Blocks. `bar1pg_hi` verliert den
-    # ganzen BAR1-Vorsprung, und sein Log nennt den Grund selbst: waehrend
-    # einer Graph-Aufzeichnung wird der gitter-Kern auf die 1blk-Variante
-    # gelegt, weil ein Vorbehalt sagt, cudaLaunchCooperativeKernel sei
-    # aufgezeichnet ungemessen. Phase A DIESES Laufs hat genau das gemessen
-    # (Fall 'gitter' bestanden). Faellt der Vorbehalt, muss der Vorsprung
-    # zurueckkommen -- und wenn nicht, ist die Erklaerung falsch.
-    "bar1pggitter_hi|bar1|SGLANG_HTCCL_BAR1_GRAPH_GITTER=1|--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
+    "bar1pgvorbehalt_hi|bar1|SGLANG_HTCCL_BAR1_GRAPH_GITTER=0|--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
 )
 # A caller may narrow the list; the names must match column 1.
 S13_NUR="${S13_NUR:-}"

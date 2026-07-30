@@ -177,6 +177,48 @@ class Bar1Unverfuegbar(RuntimeError):
     """
 
 
+#: Die Werte, die in diesem Transport als "aus" gelten. Wortgleich mit
+#: ``parallel_state.graph_freigabe_gesetzt`` -- die beiden entscheiden ueber
+#: dieselbe Sache und duerfen nicht verschieden lesen.
+_AUS = ("0", "nein", "aus", "false", "")
+
+
+def _an(wert: Optional[str]) -> bool:
+    """Ob eine Umgebungsvariable als gesetzt gilt."""
+    return wert is not None and wert not in _AUS
+
+
+def graph_gitter_vorgabe(umgebung=None) -> bool:
+    """Darf der cooperative Start UNTER einer Graph-Aufzeichnung fallen?
+
+    **Abgeleitet, nicht eigenstaendig.** Die Frage, ob
+    ``cudaLaunchCooperativeKernel`` sich auf diesem Rig aufzeichnen laesst,
+    ist dieselbe Frage, die ueber ``SGLANG_HTCCL_GRAPH_FREIGABE`` entscheidet
+    -- und sie wird von demselben Tor beantwortet
+    (``benchmark/bar1_graph_check.py``, Fall ``gitter``). Ein eigener
+    Opt-in-Schalter daneben hiess: das Tor besteht, die Freigabe steht, und
+    der Kern faellt trotzdem auf ``1blk`` zurueck. Genau das hat in der
+    Hebel-Messung zu #293 den ganzen BAR1-Vorsprung gekostet, sobald der
+    Prefill aufgezeichnet wurde (1334,5 -> 1151,6 tok/s bei acht Sessions;
+    der Falsifikator mit ``SGLANG_HTCCL_BAR1_GRAPH_GITTER=1`` holte 1337,2
+    zurueck, also +16,1 %).
+
+    ``SGLANG_HTCCL_BAR1_GRAPH_GITTER`` bleibt als Uebersteuerung in BEIDE
+    Richtungen: gesetzt erlaubt sie den cooperative Start auch ohne
+    Freigabe (so faehrt der Gate-Fall ``gitter`` selbst), auf ``0`` gesetzt
+    stellt sie den alten Vorbehalt wieder her (so faehrt der Gate-Fall
+    ``vorbehalt``). Nur wenn sie GAR NICHT gesetzt ist, entscheidet die
+    Freigabe.
+    """
+    import os as _os
+
+    umgebung = _os.environ if umgebung is None else umgebung
+    eigen = umgebung.get("SGLANG_HTCCL_BAR1_GRAPH_GITTER")
+    if eigen is not None:
+        return eigen not in _AUS
+    return _an(umgebung.get("SGLANG_HTCCL_GRAPH_FREIGABE"))
+
+
 # ===========================================================================
 # CUDA-Bindungen (ctypes) -- nur, was der Aufbau braucht
 # ===========================================================================
@@ -687,12 +729,13 @@ def fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
     if welt < 2:
         return 0
     anteil = -(-nbytes // welt)          # aufrunden
-    # ``netz_pipe`` steht hier bei netz und ring, weil sein Bereich genauso
-    # gross ist: 2*T*(R-1) Schlitze zu je chunk_max/T, also wieder
-    # 2(R-1)*chunk_max. Die GENAUE Zahl -- mit dem Verschnitt aus dem
-    # Abrunden der Schlitzgroesse -- rechnet
-    # ``htccl_bar1_pipe_ext.pipe_fensterbedarf``; sie ist kleiner und wird
-    # in ``handles`` zusaetzlich geprueft.
+    # ``netz_pipe`` steht hier bei netz und ring, weil diese Funktion nach
+    # dem Bedarf EINER Nutzlast fragt und die Pipe dafuer dieselben
+    # 2(R-1)*ceil(N/R) Byte bewegt. Was sie im Fenster wirklich BELEGT, ist
+    # etwas anderes: ``2 T (R-1)`` Schlitze zu je einer Chunkstueckgroesse,
+    # gerechnet in ``htccl_bar1_pipe_ext.pipe_fensterbedarf`` und in
+    # ``handles`` zusaetzlich geprueft. Diese Zahl haengt an
+    # ``pipe_chunk_bytes``, nicht an der Nutzlast.
     if algorithmus in ("netz", "netz_pipe", "ring", "hierarchisch"):
         return 2 * (welt - 1) * anteil
     if algorithmus == "stern":
@@ -701,7 +744,8 @@ def fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
 
 
 def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
-              mit_pipe: bool = False, erg_ring: int = 0) -> dict:
+              mit_pipe: bool = False, erg_ring: int = 0,
+              pipe_bereich: int = 0) -> dict:
     """Die Speicherordnung EINER Empfangsregion, fuer beliebiges R.
 
     Sie traegt alle Verfahren **gleichzeitig**, damit ein Plan je Groesse und
@@ -714,7 +758,7 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
     ...          Netz-AG-Schlitze   ``(R-1) * chunk_max``
     ``off_ring`` Ring-Schlitze      ``2(R-1) * chunk_max``
     ``off_a2a``  a2a-Schlitze       ``2(R-1) * chunk_max``
-    ``off_pipe`` netz_pipe-Schlitze ``2(R-1) * chunk_max``
+    ``off_pipe`` netz_pipe-Schlitze ``pipe_bereich`` (absolut)
     ===========  =================  ========================================
 
     ``chunk_max`` ist auf eine Seite aufgerundet -- ein Schlitz, der auf
@@ -750,6 +794,24 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
     Der Bereich wird nur angelegt, wenn ``mit_pipe`` gesetzt ist
     (``SGLANG_HTCCL_BAR1_PIPE=1``); ohne ihn ist die Ordnung Byte fuer Byte
     die gemessene.
+
+    **Warum der Pipe-Bereich als absolute Bytezahl hereinkommt.** Er war
+    ein voller Schlitzsatz wie Netz, Ring und a2a, also
+    ``2(R-1) * chunk_max``. Das war zu grosszuegig: ein Pipe-Schlitz traegt
+    ein Stueck eines CHUNKS, und wie gross ein Chunk wird, entscheidet
+    ``pipe_chunk_bytes`` und nicht die groesste Nutzlast. Der volle
+    Schlitzsatz hat den all_reduce-Schlitz bei R=3 von 8188 auf 6140 KiB
+    gedrueckt und damit den Kipp-Punkt von 2456 auf 1842 Token -- unter den
+    Arbeitspunkt von 2048; das ist der Verlust von 7,5 %, den die
+    Hebel-Messung zu #293 dem Pipe-Arm zugeschrieben hat (dort noch dem
+    Ergebnisring, was nicht stimmte: der Arm fuhr
+    ``PIPE_DIREKT=0`` und damit ``erg_ring = 0``).
+
+    Der Bedarf des Bereichs haengt an ``pipe_chunk_bytes``, ``T`` und ``R``
+    -- an nichts, was aus ``max_bytes`` folgt. Damit ist er eine Konstante
+    in der Fixpunktrechnung von :func:`max_nutzlast` statt eines weiteren
+    Nenners. ``pipe_bereich = 0`` behaelt den alten Zuschnitt, damit eine
+    Geometrie ohne diese Angabe Byte fuer Byte die alte bleibt.
     """
     if welt < 2:
         raise ValueError("welt < 2")
@@ -766,9 +828,14 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
 
     saetze = 2 + (1 if mit_a2a else 0)
     off_pipe = saetze * schlitze * chunk_max
-    if mit_pipe:
-        saetze += 1
-    off_erg = saetze * schlitze * chunk_max
+    # Der Pipe-Bereich: die hereingereichte absolute Zahl, sonst der alte
+    # volle Schlitzsatz. Auf eine Seite aufgerundet, damit der Ergebnisring
+    # dahinter wieder auf einer Seitengrenze beginnt.
+    pipe_bereich = int(pipe_bereich) if mit_pipe else 0
+    if mit_pipe and pipe_bereich <= 0:
+        pipe_bereich = schlitze * chunk_max
+    pipe_bereich = ((pipe_bereich + SEITE - 1) // SEITE) * SEITE if pipe_bereich else 0
+    off_erg = off_pipe + pipe_bereich
     ring = int(erg_ring) if mit_pipe else 0
     erg_stride = erg_stride_bytes(max_bytes) if ring > 0 else 0
     region = off_erg + ring * erg_stride + SEITE
@@ -781,6 +848,7 @@ def geometrie(welt: int, max_bytes: int, mit_a2a: bool = True,
         "off_a2a": off_a2a if mit_a2a else -1,
         "a2a_schlitz": chunk_max if mit_a2a else 0,
         "off_pipe": off_pipe if mit_pipe else -1,
+        "pipe_bereich": pipe_bereich,
         "off_erg": off_erg if ring > 0 else -1,
         "erg_stride": erg_stride,
         "erg_ring": ring,
@@ -1028,7 +1096,8 @@ def bc_plan(nbytes: int, schlitz: int) -> list:
 
 
 def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
-                 mit_pipe: bool = False, erg_ring: int = 0) -> int:
+                 mit_pipe: bool = False, erg_ring: int = 0,
+                 pipe_bereich: int = 0) -> int:
     """Groesste Nutzlast, deren Schlitze in eine Region dieser Groesse passen.
 
     Umkehrung von :func:`geometrie`. Bewusst konservativ gerundet und
@@ -1039,10 +1108,19 @@ def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
     """
     if welt < 2 or region_bytes <= SEITE:
         return 0
+    # Der Pipe-Bereich ist eine ABSOLUTE Zahl, sobald er hereingereicht wird
+    # -- er haengt an `pipe_chunk_bytes`, T und R, nicht an `chunk_max`.
+    # Deshalb wird er abgezogen und steht nicht im Nenner. Ohne Angabe
+    # bleibt der alte Zuschnitt (ein voller Schlitzsatz, also 2(R-1) im
+    # Nenner).
+    absolut = int(pipe_bereich) if (mit_pipe and pipe_bereich > 0) else 0
+    if absolut:
+        absolut = ((absolut + SEITE - 1) // SEITE) * SEITE
     # 2 Saetze fuer netz, 2 fuer ring, je 2 fuer a2a und die Pipe -- also 4
     # als Sockel, nicht 2. Ausgeschrieben statt als "(6 wenn a2a sonst 4)",
     # damit der vierte Summand nicht wieder in einer Zahl verschwindet.
-    schlitze = (4 + (2 if mit_a2a else 0) + (2 if mit_pipe else 0)) * (welt - 1)
+    schlitze = (4 + (2 if mit_a2a else 0)
+                + (2 if (mit_pipe and not absolut) else 0)) * (welt - 1)
     ring = int(erg_ring) if mit_pipe else 0
     # Der Ergebnisring kostet ``L * roundup(N, SEITE)``, und ``N`` ist
     # ``chunk_max * R``. In Einheiten von chunk_max sind das ``L * R``
@@ -1051,12 +1129,15 @@ def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
     # so weit danebengelegt, dass die Gegenrechnung unten in
     # 32-Byte-Schritten haette heruntersuchen muessen.
     nenner = schlitze + ring * welt
-    chunk_max = ((region_bytes - SEITE) // nenner // SEITE) * SEITE
+    rest = region_bytes - SEITE - absolut
+    if rest <= 0:
+        return 0
+    chunk_max = (rest // nenner // SEITE) * SEITE
     if chunk_max <= 0:
         return 0
     n = (chunk_max // 16) * welt * 16
-    while n > 0 and geometrie(welt, n, mit_a2a, mit_pipe,
-                              ring)["region_bytes"] > region_bytes:
+    while n > 0 and geometrie(welt, n, mit_a2a, mit_pipe, ring,
+                              absolut)["region_bytes"] > region_bytes:
         n -= welt * 16
     return n
 
@@ -1329,25 +1410,18 @@ class HTCCLBar1Transport:
             os.environ.get("SGLANG_HTCCL_BAR1_GITTER_AB", str(4 << 20))
         )
         # Darf die cooperative Variante WAEHREND einer CUDA-Graph-Aufzeichnung
-        # gestartet werden? Vorgabe NEIN -- und das ist eine Vorsichtsregel,
-        # keine festgestellte Unvertraeglichkeit.
+        # gestartet werden? Die Vorgabe kommt aus SGLANG_HTCCL_GRAPH_FREIGABE
+        # -- dieselbe Freigabe, dasselbe Tor (`bar1_graph_check.py`, Fall
+        # `gitter`). Die Herleitung steht bei `graph_gitter_vorgabe`.
         #
         # Was die Kopfdateien auf diesem Rig hergeben (CUDA 12.9):
         # `CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2` ist ausdruecklich "Valid for
         # graph nodes, launches" (cuda.h:2043, driver_types.h:3800) -- ein
-        # cooperative Start ist als Graphknoten also DARSTELLBAR. Ob der
-        # Treiber ihn auch aus einem Stream-Capture heraus als solchen Knoten
-        # aufnimmt, steht dort NICHT, und die Kopfdateien sind alles, was
-        # ohne freie Karten zu haben ist. `benchmark/bar1_graph_check.py`
-        # beantwortet genau diese Frage und weist den Fehlercode aus.
-        #
-        # Bis dahin kostet die Vorsicht im Decode nichts: dort liegen die
-        # Nutzlasten unter `gitter_ab`, also faellt ohnehin `1blk`. Die
-        # Umschaltung greift nur oberhalb der Schwelle, und dort ist sie
-        # sichtbar (einmaliger Protokolleintrag), nicht still.
-        self.graph_gitter = os.environ.get(
-            "SGLANG_HTCCL_BAR1_GRAPH_GITTER", "0"
-        ) not in ("0", "nein", "aus", "false")
+        # cooperative Start ist als Graphknoten also DARSTELLBAR. Dass der
+        # Treiber ihn auch aus einem Stream-Capture heraus annimmt, ist auf
+        # diesem Rig zweifach belegt: Gate-Fall `gitter` bestanden und die
+        # Hebel-Messung zu #293 (Phase A) mit demselben Ergebnis.
+        self.graph_gitter = graph_gitter_vorgabe()
         self._graph_gitter_gemeldet = False
         # Notschwelle netz->ring, falls kein Plan hereingereicht wird.
         self.ring_ab = int(
@@ -1413,6 +1487,23 @@ class HTCCLBar1Transport:
             os.environ.get("SGLANG_HTCCL_BAR1_PIPE_CHUNK_BYTES", str(1 << 20))
         )
         self.pipe_k_max = int(os.environ.get("SGLANG_HTCCL_BAR1_PIPE_K_MAX", "64"))
+        # Groesse EINES Pipe-Schlitzes in KiB. 0 = aus `pipe_chunk_bytes`
+        # gerechnet (`pipe_schlitz_vorgabe`), und das ist die Vorgabe.
+        #
+        # Der Bereich, den die Pipe im BAR1-Fenster belegt, ist
+        # `2 T (R-1) * schlitz`. Frueher war er ein voller Schlitzsatz wie
+        # Netz, Ring und a2a, also aus `chunk_max` abgeleitet -- und damit
+        # aus der groessten Nutzlast statt aus der Chunkgroesse, die ein
+        # Schlitz wirklich tragen muss. Bei R=3, T=4 und 96 MiB Fenster
+        # waren das 32 MiB Bereich fuer 5,4 MiB Bedarf, und die Differenz
+        # fehlte dem all_reduce-Schlitz (8188 -> 6140 KiB). Wer den Schlitz
+        # ausdruecklich groesser will, deckt damit groessere Nutzlasten bei
+        # kleinem K ab und bezahlt es mit demselben Fenster.
+        self.pipe_schlitz_kib = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_SCHLITZ_KIB", "0")
+        )
+        #: Steht erst im Aufbau fest (aus `pipe_schlitz_kib` oder gerechnet).
+        self.pipe_schlitz = 0
         # EIGENE 1blk/gitter-Schwelle fuer die Pipe.
         #
         # Getrennt von `gitter_ab`, weil die Rechnung fuer die Pipe anders
@@ -1470,6 +1561,21 @@ class HTCCLBar1Transport:
         self.pipe_erg_ring = int(
             os.environ.get("SGLANG_HTCCL_BAR1_PIPE_ERG_RING", "2")
         )
+        # Wieviele Plaetze des Rings der EAGER-Weg behaelt. Vorgabe 2, also
+        # unveraendert. Der Knopf existiert, weil die Zahl eine Eigenschaft
+        # des Aufrufers ist: sie muss so gross sein, wie der Aufrufer
+        # gleichzeitig Ergebnisse am Leben haelt. Beim graphfesten
+        # Direkt-Modus faellt der Fehler im Aufzeichnungs-WARMUP an, und das
+        # laeuft eager -- ein groesseres SGLANG_HTCCL_BAR1_PIPE_ERG_RING
+        # vergibt dort ausschliesslich Graph-Plaetze und hilft nicht.
+        from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
+            ERG_EAGER_PLAETZE,
+        )
+
+        self.pipe_erg_eager = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER",
+                           str(ERG_EAGER_PLAETZE))
+        )
         #: Erst nach `byte_beleg_pipe` gueltig.
         self._pipe_beleg = False
         self._pipe_ext = None
@@ -1484,6 +1590,19 @@ class HTCCLBar1Transport:
         #: Schwache Verweise auf die zuletzt herausgegebenen
         #: Ergebnistensoren, je Ringplatz. Sie sind die Lebensdauerpruefung.
         self._erg_lebt: list = []
+        #: Laufende Nummer der eager-Direktaufrufe und die Nummer, bei der
+        #: ein Platz zuletzt vergeben wurde. Daraus faellt der
+        #: Wiederverwendungsabstand, den der Freigabe-Handschlag als
+        #: ``ergSlack`` braucht -- bei strenger Rotation ist er die Zahl der
+        #: eager-Plaetze, beim Ueberspringen eines belegten Platzes weniger.
+        self._erg_zaehler = 0
+        self._erg_zuletzt: list = []
+        #: Wie oft ein eager-Aufruf keinen freien Platz fand und deshalb
+        #: ``direkt=0`` gefahren ist. Gemeldet wird einmal je Rang; der
+        #: Zaehler bleibt, damit "einmal beim Warmup" und "in jedem Aufruf"
+        #: unterscheidbar sind.
+        self._erg_eager_voll = 0
+        self._erg_eager_voll_gemeldet = False
         #: Aufteilung des Ergebnisrings in eager- und Graph-Plaetze. Steht
         #: fest, bevor der erste Aufruf laeuft (`erg_aufteilung`), damit der
         #: Graph-Vorrat nie einen Platz greifen kann, dessen eager-Tensor der
@@ -1742,29 +1861,65 @@ class HTCCLBar1Transport:
                 f"dieselbe Schleifenrunde), P>T liesse den Zeitplan die "
                 f"Schlitze ueberholen."
             )
+        pipe_bereich = 0
         if self.pipe_an:
+            from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
+                pipe_bereich_bytes,
+                pipe_schlitz_vorgabe,
+            )
+
+            if self.pipe_schlitz_kib > 0:
+                self.pipe_schlitz = (self.pipe_schlitz_kib * 1024 // 16) * 16
+            else:
+                self.pipe_schlitz = pipe_schlitz_vorgabe(
+                    self.welt, self.pipe_chunk_bytes
+                )
+            if self.pipe_schlitz <= 0:
+                raise Bar1Unverfuegbar(
+                    f"Pipe-Schlitzgroesse {self.pipe_schlitz} Byte ist nicht "
+                    f"brauchbar (aus SGLANG_HTCCL_BAR1_PIPE_SCHLITZ_KIB="
+                    f"{self.pipe_schlitz_kib} bzw. PIPE_CHUNK_BYTES="
+                    f"{self.pipe_chunk_bytes} bei {self.welt} Raengen)."
+                )
+            pipe_bereich = pipe_bereich_bytes(
+                self.welt, self.pipe_t, self.pipe_schlitz
+            )
             logger.info(
                 "HTCCL-BAR1-PIPE: Ringtiefe T=%d, Vorlauf P=%d -- ein Peer "
                 "darf um %d Schleifenrunden zurueckliegen, bevor der Sender "
-                "blockiert. Direkt-Modus %s, Ergebnisring L=%d.",
+                "blockiert. Direkt-Modus %s, Ergebnisring L=%d, Pipe-Schlitz "
+                "%d KiB (%s), Pipe-Bereich %.1f MiB.",
                 self.pipe_t, self.pipe_vorlauf,
                 self.pipe_t - self.pipe_vorlauf + 1,
                 "an" if self.pipe_direkt else "aus", self.pipe_erg_ring,
+                self.pipe_schlitz // 1024,
+                "gesetzt" if self.pipe_schlitz_kib > 0
+                else f"aus Chunkziel {self.pipe_chunk_bytes // 1024} KiB",
+                pipe_bereich / 2**20,
             )
         if not self.pipe_an or not self.pipe_direkt:
             self.pipe_erg_ring = 0
-        elif self.pipe_erg_ring < 2:
+        elif self.pipe_erg_eager < 2:
             raise Bar1Unverfuegbar(
-                f"SGLANG_HTCCL_BAR1_PIPE_ERG_RING={self.pipe_erg_ring}: der "
-                f"Direkt-Modus braucht mindestens zwei Ergebnispuffer. Mit "
-                f"einem einzigen schriebe Runde n in genau den Puffer, den "
+                f"SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER={self.pipe_erg_eager}: der "
+                f"Direkt-Modus braucht mindestens zwei eager-Ergebnispuffer. "
+                f"Mit einem einzigen schriebe Runde n in genau den Puffer, den "
                 f"der Aufrufer aus Runde n-1 noch in der Hand haelt -- ein "
                 f"still ueberschriebener Ergebnistensor, also falsche Zahlen "
                 f"ohne Absturz. Wer den Ring nicht will, schaltet mit "
                 f"SGLANG_HTCCL_BAR1_PIPE_DIREKT=0 den Direkt-Modus ab."
             )
+        elif self.pipe_erg_ring < self.pipe_erg_eager:
+            raise Bar1Unverfuegbar(
+                f"SGLANG_HTCCL_BAR1_PIPE_ERG_RING={self.pipe_erg_ring} ist "
+                f"kleiner als SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER="
+                f"{self.pipe_erg_eager}. Der Ring haelt die eager-Plaetze und "
+                f"den Graph-Vorrat zusammen; er kann nicht kleiner sein als "
+                f"sein eager-Teil."
+            )
         max_bytes = max_nutzlast(self.welt, self.fenster_bytes, self.a2a_an,
-                                 self.pipe_an, self.pipe_erg_ring)
+                                 self.pipe_an, self.pipe_erg_ring,
+                                 pipe_bereich)
         if max_bytes < self.min_bytes:
             raise Bar1Unverfuegbar(
                 f"Fenster von {self.fenster_bytes // 1024} KiB traegt bei "
@@ -1773,15 +1928,16 @@ class HTCCLBar1Transport:
                 f"ceil(N/R) muessen hineinpassen."
             )
         self._geo = geometrie(self.welt, max_bytes, self.a2a_an, self.pipe_an,
-                              self.pipe_erg_ring)
+                              self.pipe_erg_ring, pipe_bereich)
         from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
             erg_aufteilung,
         )
 
         self._erg_eager_plaetze, self._erg_graph_plaetze = erg_aufteilung(
-            self.pipe_erg_ring, self.pipe_direkt_graph
+            self.pipe_erg_ring, self.pipe_direkt_graph, self.pipe_erg_eager
         )
         self._erg_lebt = [None] * max(0, self._erg_eager_plaetze)
+        self._erg_zuletzt = [None] * max(0, self._erg_eager_plaetze)
         if self.pipe_direkt_graph:
             logger.info(
                 "HTCCL-BAR1-PIPE: graphfester Direkt-Modus, Ergebnisring L=%d "
@@ -2512,11 +2668,14 @@ class HTCCLBar1Transport:
             logger.warning(
                 "HTCCL-BAR1: %s mit %d Byte laege ueber der gitter-Schwelle "
                 "(%d Byte), wird aber waehrend einer CUDA-Graph-Aufzeichnung "
-                "auf die 1blk-Variante gelegt. Ob cudaLaunchCooperativeKernel "
-                "sich aufzeichnen laesst, ist auf diesem Rig NICHT gemessen; "
-                "benchmark/bar1_graph_check.py beantwortet es. Faellt der "
-                "Beleg zugunsten von gitter aus, hebt "
-                "SGLANG_HTCCL_BAR1_GRAPH_GITTER=1 diesen Vorbehalt auf. "
+                "auf die 1blk-Variante gelegt -- weil der Vorbehalt "
+                "ausdruecklich mit SGLANG_HTCCL_BAR1_GRAPH_GITTER=0 gesetzt "
+                "ist oder SGLANG_HTCCL_GRAPH_FREIGABE nicht steht. Das "
+                "kostet: in der Hebel-Messung zu #293 waren es 16,1 %% "
+                "Prefill-Durchsatz, sobald der Prefill aufgezeichnet wurde. "
+                "Der cooperative Start IST auf diesem Rig aufzeichenbar "
+                "(benchmark/bar1_graph_check.py, Fall 'gitter'); mit "
+                "gesetzter Freigabe faellt der Vorbehalt von selbst. "
                 "Dieser Hinweis erscheint einmal je Rang.",
                 wo, bewegt, schwelle,
             )
@@ -2646,7 +2805,7 @@ class HTCCLBar1Transport:
         )
 
         k = pipe_plan(
-            int(nbytes), int(self.welt), int(self._geo["chunk_max"]),
+            int(nbytes), int(self.welt), int(self.pipe_schlitz),
             int(self.pipe_t), int(self.pipe_k), int(self.pipe_chunk_bytes),
             int(self.pipe_k_max),
         )
@@ -2675,7 +2834,7 @@ class HTCCLBar1Transport:
         if off < 0:
             return False
         noetig = off + pipe_fensterbedarf(
-            self.welt, int(self._geo["chunk_max"]), int(self.pipe_t)
+            self.welt, int(self.pipe_t), int(self.pipe_schlitz)
         )
         # Und der Ergebnisring obendrauf: L * roundup(max_bytes, SEITE). Er
         # liegt HINTER den Schlitzen, also ist der Bedarf der Versatz des
@@ -2788,7 +2947,8 @@ class HTCCLBar1Transport:
             graph_erfassung_laeuft,
         )
         from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (  # noqa: E501
-            erg_eager_platz,
+            erg_eager_freier_platz,
+            erg_eager_slack,
             erg_graph_platz,
         )
 
@@ -2836,35 +2996,74 @@ class HTCCLBar1Transport:
             return out, i, 1
 
         # -- eager ---------------------------------------------------------
+        #
+        # Gesucht wird der naechste FREIE Platz, nicht nur der naechste
+        # geprueft. Vorher stand hier ein harter Abbruch, sobald der eine
+        # Nachfolger noch gehalten wurde -- und genau daran ist der
+        # graphfeste Direkt-Modus in der Hebel-Messung zu #293 nicht
+        # hochgekommen: der Fehler fiel im Aufzeichnungs-WARMUP an, das eager
+        # laeuft, und `SGLANG_HTCCL_BAR1_PIPE_ERG_RING` half nicht, weil ein
+        # groesserer Ring nur Graph-Plaetze vergibt.
+        #
+        # Der Abbruch war die falsche Antwort auf die richtige Sorge. Was
+        # nicht passieren darf, ist das Beschreiben eines gehaltenen Puffers.
+        # Sind ALLE eager-Plaetze gehalten, ist die richtige Antwort
+        # dieselbe wie beim erschoepften Graph-Vorrat ein paar Zeilen weiter
+        # oben: `direkt=0`, gemeldet und gezaehlt. Das ist der gemessene
+        # Kontrollpfad und kostet den gesparten VRAM-Durchgang, nicht die
+        # Richtigkeit. Wieviele Plaetze ein bestimmter Aufrufer braucht, sagt
+        # `SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER`.
         if self._erg_eager_plaetze < 2:
             return None
-        i = erg_eager_platz(self._erg_i, self._erg_eager_plaetze)
-        alt = self._erg_lebt[i]
-        if alt is not None and alt() is not None:
-            raise Bar1Unverfuegbar(
-                f"Direkt-Modus: der Ergebnispuffer {i} von vor "
-                f"{self._erg_eager_plaetze} Runden wird noch gehalten. Ihn "
-                f"jetzt zu beschreiben, hiesse einen Tensor zu veraendern, "
-                f"den der Aufrufer fuer fertig haelt. Entweder den Ring "
-                f"vergroessern (SGLANG_HTCCL_BAR1_PIPE_ERG_RING) oder den "
-                f"Direkt-Modus abschalten "
-                f"(SGLANG_HTCCL_BAR1_PIPE_DIREKT=0). Kein stilles "
-                f"Ausweichen: ein ueberschriebenes Ergebnis faellt sonst "
-                f"nirgends auf."
-            )
+        belegt = [
+            v is not None and v() is not None for v in self._erg_lebt
+        ]
+        i = erg_eager_freier_platz(
+            self._erg_i, self._erg_eager_plaetze, belegt
+        )
+        if i is None:
+            self._erg_eager_voll += 1
+            if not self._erg_eager_voll_gemeldet:
+                self._erg_eager_voll_gemeldet = True
+                logger.warning(
+                    "HTCCL-BAR1-PIPE: alle %d eager-Ergebnisplaetze werden "
+                    "noch vom Aufrufer gehalten. Dieser Aufruf faehrt den "
+                    "direkt=0-Weg -- richtig, aber ohne den gesparten "
+                    "VRAM-Durchgang. Der Aufrufer haelt mehr Ergebnisse "
+                    "gleichzeitig am Leben, als der eager-Teil des Rings "
+                    "Plaetze hat; mehr gibt es mit "
+                    "SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER (und einem "
+                    "SGLANG_HTCCL_BAR1_PIPE_ERG_RING mindestens dieser "
+                    "Groesse). Jeder Platz kostet %d Byte im BAR1-Fenster. "
+                    "Dieser Hinweis erscheint einmal je Rang; wie oft es "
+                    "wirklich passiert, steht in erg_eager_voll.",
+                    self._erg_eager_plaetze,
+                    int(self._geo["erg_stride"]),
+                )
+            return None
         ptr = (self._eigen[0] + int(self._geo["off_erg"])
                + i * int(self._geo["erg_stride"]))
         out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
-        self._erg_lebt[i] = weakref.ref(out)
-        self._erg_i = i
         # Der Handschlag laeuft eager nur mit, wenn der graphfeste Modus an
         # ist. Ohne ihn bleibt der Kern Byte fuer Byte der gemessene -- die
-        # Flaggenfamilie 4 wird dann nie angefasst. Mit ihm ist der Slack die
-        # Zahl der eager-Plaetze, die Bedingung also praktisch immer schon
-        # erfuellt; sie kostet einen Schreibvorgang und einen LOKALEN
-        # Lesevorgang je Aufruf und haelt die Flaggen mit den aufgezeichneten
-        # Aufrufen im selben Zaehlwerk.
-        slack = self._erg_eager_plaetze if self.pipe_direkt_graph else 0
+        # Flaggenfamilie 4 wird dann nie angefasst. Mit ihm ist der Slack der
+        # TATSAECHLICHE Wiederverwendungsabstand dieses Platzes: bei strenger
+        # Rotation die Zahl der eager-Plaetze wie bisher, nach einem
+        # uebersprungenen Platz weniger. Ein zu grosser Slack waere die
+        # schwaechere Wartebedingung, also die gefaehrliche Richtung.
+        slack = (
+            erg_eager_slack(i, self._erg_zaehler, self._erg_zuletzt,
+                            self._erg_eager_plaetze)
+            if self.pipe_direkt_graph else 0
+        )
+        self._erg_lebt[i] = weakref.ref(out)
+        # Vermerkt wird die Nummer DIESES Aufrufs, nicht die des naechsten:
+        # der Abstand zur naechsten Benutzung desselben Platzes ist die
+        # Differenz zweier Aufrufnummern, und bei strenger Rotation ueber L
+        # Plaetze ist sie damit genau L.
+        self._erg_zuletzt[i] = self._erg_zaehler
+        self._erg_zaehler += 1
+        self._erg_i = i
         return out, i, slack
 
     def _pipe_all_reduce(self, inp, k: int):
@@ -2900,14 +3099,13 @@ class HTCCLBar1Transport:
                 peer_erg[r] = peer_nutz[r] + versatz
         from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
             pipe_fbasis,
-            pipe_schlitz_bytes,
         )
 
         self._pipe_ext.bar1_netz_pipe(
             inp, out, int(self.rank), int(self.welt),
             peer_nutz, peer_flag, peer_erg,
             int(self._eigen[0]), int(self._eigen_flag[0]),
-            int(pipe_schlitz_bytes(int(self._geo["chunk_max"]), int(self.pipe_t))),
+            int(self.pipe_schlitz),
             int(self._geo["off_pipe"]),
             int(pipe_fbasis(self.welt, self.a2a_an)),
             int(k), int(self.pipe_t), int(self.pipe_vorlauf),

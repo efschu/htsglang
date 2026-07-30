@@ -10949,6 +10949,12 @@ Aufbau-Zeile beider Arme:
 | `bar1` | 8188 KiB | 24564 KiB | 2456 Token |
 | `bar1pipe` | **6140 KiB** | 18420 KiB | **1842 Token** |
 
+> **Korrektur (siehe "die drei Hebel-Fixes" weiter unten): nicht der
+> Ergebnisring.** Der Arm fuhr `PIPE_DIREKT=0`, und ohne Direkt-Modus ist der
+> Ring null. Die 6140 KiB fallen aus dem zusaetzlichen SCHLITZSATZ der Pipe
+> (Nenner 12 -> 16 in `max_nutzlast`), und zwar auf das Byte. Die Zahlen und
+> der Befund dieses Abschnitts bleiben gueltig; nur die Ursache lag daneben.
+
 Der Ergebnisring der Pipe nimmt sich seinen Anteil am BAR1-Fenster, der
 Schlitz schrumpft um 25 %, der Kipp-Punkt faellt von 2456 auf 1842 Token --
 **unter den Arbeitspunkt von 2048**. Der 20-MiB-all_reduce, der ohne Pipe in
@@ -10987,6 +10993,11 @@ zwei weitere all_reduce hinweg am Leben, und genau davor schuetzt der Ring. Er
 tut, was er soll; er ist zu klein fuer diesen Aufrufer. **Das ist der konkrete
 naechste Schritt fuer #292**: `ERG_EAGER_PLAETZE` beschreibt eine Eigenschaft
 des Aufrufers, nicht des Transports.
+
+> **Erledigt (siehe "die drei Hebel-Fixes" weiter unten)**, mit einem Zusatz:
+> der harte Abbruch war die zweite Haelfte des Problems. Der eager-Pfad sucht
+> jetzt einen freien Platz und faehrt `direkt=0`, wenn alle gehalten werden --
+> gemeldet und gezaehlt statt abgebrochen.
 
 ### Befund 4: `chunked_prefill_size 4096` -- der Nebenbefund von Schritt 1 ist erledigt
 
@@ -11071,6 +11082,12 @@ laesst, sobald irgendetwas den Prefill aufzeichnet.** Der Vorbehalt sitzt in
 16,1 % liegen weit ueber jedem Boden dieses Laufs, aber die Zahl selbst hat
 noch keine eigene A-gegen-A-Wiederholung.
 
+> **Erledigt (siehe "die drei Hebel-Fixes" weiter unten).** Die Vorgabe von
+> `SGLANG_HTCCL_BAR1_GRAPH_GITTER` kommt jetzt aus
+> `SGLANG_HTCCL_GRAPH_FREIGABE`. Die fehlende A-gegen-A-Wiederholung bleibt
+> offen; `bar1pg_hi` und `bar1pgvorbehalt_hi` in `s13_hebel_messung.sh` sind
+> das Paar, mit dem sie zu holen ist.
+
 ### Verdikt: welcher Hebel wie viel bringt
 
 Am Primaerpunkt (sessions=8), gemessen gegen `bar1`-Standard, Boden 1,15 %:
@@ -11104,3 +11121,147 @@ falsche Frage: beim cp4096-Arm sagte das Feld `nein`, waehrend das Log keinen
 Rueckfall kennt. Korrigiert auf die Rundenzahl; die alte Groesse bleibt als
 `einrundig`, weil der Kipp-Punkt aus ihr kommt und sie genau das ist, was sich
 unter der Pipe aendert.
+
+## #293 Schritt 2: die drei Hebel-Fixes (2026-07-30)
+
+Die Antworten auf die drei Posten des Messlaufs oben. Kein Kernelquelltext
+angefasst (`_CUDA_SRC` in `htccl_bar1_pipe_ext.py` Byte fuer Byte gleich,
+`htccl_bar1_ext.py` unberuehrt) -- alles liegt in der Naht und in der
+Speicherordnung. Hermetisch geprueft in
+`test/registered/unit/distributed/test_htccl_bar1_hebel_fixes.py` (37 Faelle).
+
+### Fix 1: der gitter-Vorbehalt haengt jetzt an der Graph-Freigabe
+
+`SGLANG_HTCCL_BAR1_GRAPH_GITTER` war ein eigener Opt-in neben
+`SGLANG_HTCCL_GRAPH_FREIGABE`, obwohl beide dieselbe Frage stellen und
+dasselbe Tor sie beantwortet (`benchmark/bar1_graph_check.py`, Fall
+`gitter`). Damit konnte das Tor bestehen, die Freigabe stehen -- und
+`HTCCLBar1Transport._kern` trotzdem auf `1blk` zurueckfallen. Das war der
+groesste Einzelposten des Laufs: 16,1 % bei acht Sessions, sobald irgendetwas
+den Prefill aufzeichnet.
+
+Die Vorgabe kommt jetzt aus der Freigabe (`graph_gitter_vorgabe`), die eigene
+Variable bleibt als Uebersteuerung in BEIDE Richtungen. Beide Richtungen
+werden gebraucht: der Gate-Fall `gitter` faehrt den cooperative Start ohne
+Freigabe, der Gate-Fall `vorbehalt` den Rueckfall mit stehender Freigabe --
+letzterer traegt deshalb jetzt ein ausdrueckliches
+`SGLANG_HTCCL_BAR1_GRAPH_GITTER=0`, sonst haette er je nach Umgebung des
+Aufrufers etwas anderes geprueft.
+
+In `s13_hebel_messung.sh` tauschen die beiden pg-Arme damit die Rollen:
+`bar1pg_hi` ist der Arm MIT gitter (entspricht dem bisherigen
+`bar1pggitter_hi`, 1576,0 / 1337,2), `bar1pgvorbehalt_hi` holt den Vorbehalt
+ausdruecklich zurueck (bisher `bar1pg_hi`, 1321,6 / 1151,6).
+
+### Fix 2: der Schlitz -- und eine Zurechnung, die nicht stimmte
+
+**Befund 2 oben schreibt den Verlust von 7,5 % dem Ergebnisring zu. Das ist
+falsch.** Der Pipe-Arm fuhr `SGLANG_HTCCL_BAR1_PIPE_DIREKT=0`, und damit ist
+der Ring null (`htccl_bar1.py`: `if not self.pipe_an or not self.pipe_direkt:
+self.pipe_erg_ring = 0`). Reserviert wird er nur, wenn der Direkt-Modus ihn
+benutzt; die im Auftrag vermutete Reservierung ohne Nutzung gibt es nicht.
+
+Die 6140 KiB fallen aus etwas anderem, und zwar auf das Byte:
+`max_nutzlast` teilt das Fenster durch die Zahl der Schlitze, und der
+netz_pipe-Bereich war ein voller Schlitzsatz wie Netz, Ring und a2a.
+
+| | Nenner | `(96 MiB - 4096) / Nenner`, auf Seite ab | Kipp-Punkt |
+|---|---:|---:|---:|
+| ohne Pipe | 12 | **8188 KiB** | 2456 Token |
+| mit Pipe, alter Zuschnitt | 16 | **6140 KiB** | 1842 Token |
+| mit Pipe, neuer Zuschnitt | 12, minus 5,34 MiB | **7736 KiB** | 2320 Token |
+
+Der volle Schlitzsatz war zu grosszuegig. Ein Pipe-Schlitz traegt ein STUECK
+eines CHUNKS; wie gross ein Chunk wird, entscheidet `pipe_chunk_bytes` und
+nicht `max_bytes`. Bei R=3, T=4 und 1 MiB Chunkziel sind das 342 KiB je
+Schlitz und `2 T (R-1) = 16` Schlitze, also 5,34 MiB Bereich -- gegen 32 MiB,
+die der Schlitzsatz belegte.
+
+Der Bereich ist damit eine ABSOLUTE Bytezahl (`pipe_schlitz_vorgabe`,
+`pipe_bereich_bytes`) und haengt an nichts, was aus dem Fenster folgt. In der
+Fixpunktrechnung von `max_nutzlast` ist er deshalb ein Abzug statt eines
+weiteren Nenners. Von den 2048 KiB, die der alte Zuschnitt gekostet hat,
+kommen 1596 zurueck (78 %), und der Kipp-Punkt liegt mit 2320 Token wieder
+UEBER dem Arbeitspunkt von 2048 -- der 20-MiB-all_reduce faehrt eine Runde
+statt zwei.
+
+Ein zu knapper Schlitz kann keine falschen Zahlen erzeugen: `pipe_plan` sucht
+sein K aufsteigend und prueft jedes mit `groesstes_stueck4` gegen den Schlitz,
+`handles()` meldet sich sonst ab, und der Kern prueft dieselbe Bedingung noch
+einmal mit `TORCH_CHECK`. Geprueft ist ausserdem, dass es dazu gar nicht
+kommt: fuer jede Nutzlast zwischen `pipe_ab` und `max_bytes` findet sich ein
+K, und es bleibt das natuerliche (`nbytes / chunk_ziel`).
+
+`SGLANG_HTCCL_BAR1_PIPE_SCHLITZ_KIB` setzt den Schlitz ausdruecklich;
+`pipe_bereich = 0` in `geometrie`/`max_nutzlast` behaelt den alten Zuschnitt
+Byte fuer Byte.
+
+**Offen und benannt:** die Speicherordnung des PIPE-Pfades aendert sich damit.
+Der Byte-Beleg `byte_beleg_pipe` und die Byte-Belege aus Phase A gehoeren
+wiederholt, bevor der Pipe-Arm wieder gemessen wird. Der Vorgabepfad
+(`SGLANG_HTCCL_BAR1_PIPE=0`) ist unberuehrt -- ohne `mit_pipe` rechnet
+`geometrie` dieselben Zahlen wie vorher.
+
+### Fix 3: der eager-Teil des Ergebnisrings
+
+**Wurzel, so weit sie ohne Karte reicht.** Der Abbruch
+(`Bar1Unverfuegbar: der Ergebnispuffer 1 von vor 2 Runden wird noch
+gehalten`) faellt im eager-Pfad von `_erg_platz`. Zwei Stuecke griffen
+ineinander:
+
+1. `erg_aufteilung` gab dem eager-Teil die KONSTANTE `ERG_EAGER_PLAETZE = 2`;
+   jeder groessere `SGLANG_HTCCL_BAR1_PIPE_ERG_RING` vergab ausschliesslich
+   Graph-Plaetze. Der Fehler faellt aber im Aufzeichnungs-WARMUP an, und das
+   laeuft eager. Deshalb half `ERG_RING=5` nicht und `ERG_RING=50` haette es
+   auch nicht.
+2. Der eager-Pfad pruefte nur den EINEN Rotationsnachfolger und brach ab,
+   sobald der noch gehalten wurde -- statt einen freien Platz zu suchen oder
+   auszuweichen.
+
+**Wieviele Plaetze der Standardlauf wirklich braucht, ist NICHT gemessen** und
+laesst sich ohne Karte nicht messen. Deshalb bleibt die Vorgabe bei zwei; eine
+geratene groessere Zahl waere kein besserer Wert, nur ein teurerer (jeder
+Platz kostet `roundup(max_bytes, 4096)` im BAR1-Fenster).
+
+Gefixt ist stattdessen beides an der Wurzel:
+
+* `erg_aufteilung(ring, graphfest, eager_plaetze)` -- die eager-Zahl ist ein
+  Parameter, gesetzt ueber `SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER`. Sie beschreibt
+  eine Eigenschaft des AUFRUFERS (wieviele Ergebnisse er gleichzeitig am Leben
+  haelt), nicht des Transports.
+* `erg_eager_freier_platz` sucht reihum den naechsten FREIEN Platz. Sind alle
+  belegt, faehrt der Aufruf `direkt=0` -- gemeldet (einmal je Rang) und
+  gezaehlt (`_erg_eager_voll`), also unterscheidbar zwischen "einmal beim
+  Warmup" und "in jedem Aufruf". Das ist dieselbe Antwort, die der
+  erschoepfte Graph-Vorrat ein paar Zeilen weiter oben schon gibt, und sie
+  ist korrekt: `direkt=0` ist der gemessene Kontrollpfad und kostet den
+  gesparten VRAM-Durchgang, nicht die Richtigkeit. Was verboten bleibt --
+  einen gehaltenen Puffer zu beschreiben -- passiert dabei gerade nicht.
+* Der Freigabe-Handschlag bekommt den TATSAECHLICHEN
+  Wiederverwendungsabstand als `ergSlack` (`erg_eager_slack`) statt der Zahl
+  der Plaetze. Bei strenger Rotation ist das dieselbe Zahl wie bisher; nach
+  einem uebersprungenen Platz ist sie kleiner. Ein zu GROSSER Slack waere die
+  schwaechere Wartebedingung, also die gefaehrliche Richtung.
+
+Damit sollte der Direktmodus booten -- und zwar auch das blanke
+`SGLANG_HTCCL_BAR1_PIPE=1`, das an derselben Stelle scheiterte. **Auf der
+Karte ist das ungeprueft.**
+
+### Testzahlen
+
+| Suite | Ergebnis |
+|---|---|
+| `test_htccl_bar1_hebel_fixes.py` (neu) | 37 passed |
+| `test_htccl_bar1_pipe_direkt_graph.py` | 48 passed |
+| `test_htccl_bar1_allreduce_rounds.py` | 38 passed |
+| `test_htccl_bar1_broadcast.py` | 54 passed |
+| `test_htccl_bar1_all_gather.py` | 31 passed |
+| `test/registered/unit/distributed/` | 20 failed / 1344 passed / 8 skipped |
+
+Die 20 sind dieselben wie oben, Datei fuer Datei: `test_dcp_token_vector_
+collective.py` 11, `test_s12_log_analyse.py` 4, `test_uneven_tp_nccl_env.py`
+1, `test_vmm_utils.py` 4. Keine neue.
+
+**Kein Spill-Beleg faellig**: `htccl_bar1_ext.py` unberuehrt, `_CUDA_SRC` in
+`htccl_bar1_pipe_ext.py` unveraendert (Zeichen fuer Zeichen gegen HEAD
+verglichen), kein neuer Kernel.

@@ -214,32 +214,57 @@ def pipe_fbasis(welt: int, mit_a2a: bool = True) -> int:
     return (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
 
 
-def pipe_schlitz_bytes(chunk_max: int, tiefe: int) -> int:
-    """Groesse EINES Pipe-Schlitzes.
+def pipe_schlitz_vorgabe(welt: int, chunk_ziel_bytes: int) -> int:
+    """Die Schlitzgroesse, die der gepipelinete Weg wirklich braucht.
 
-    Der Pipe-Bereich ist genau **ein Schlitzsatz** gross, also
-    ``2(R-1) * chunk_max`` Byte -- dieselbe Groesse, die Netz, Ring und a2a
-    je fuer sich belegen. Darin liegen ``2 * T * (R-1)`` Schlitze
-    (``T(R-1)`` je Phase, zwei Phasen), also
+    Ein Schlitz traegt EIN Stueck EINES Chunks, also ``chunk / R``. Wie
+    gross ein Chunk wird, sagt ``pipe_chunk_bytes`` (die Zielgroesse, aus
+    der :func:`pipe_plan` sein ``K`` ableitet) -- nicht die groesste
+    Nutzlast des Transports. Der Bedarf haengt damit an der ZIELGROESSE und
+    ist von ``max_bytes`` unabhaengig, und genau diese Unabhaengigkeit
+    macht die Geometrie ausrechenbar: der Pipe-Bereich ist eine absolute
+    Bytezahl und kein Bruchteil des Fensters mehr.
 
-        ``schlitz = chunk_max / T``, auf 16 Byte **abgerundet**.
+    Auf 16 Byte aufgerundet, weil die Zugriffsbreite 128 Bit ist: ein
+    Schlitz, dessen Groesse kein Vielfaches von 16 waere, brauchte einen
+    schiefen Anfang fuer den naechsten.
 
-    Abgerundet und nicht aufgerundet, weil die Summe der Schlitze in den
-    Bereich passen muss und nicht umgekehrt. 16 Byte, weil die
-    Zugriffsbreite 128 Bit ist: ein Schlitz, dessen Groesse kein Vielfaches
-    von 16 waere, brauchte einen schiefen Anfang fuer den naechsten. Der
-    Bereichsanfang liegt auf einer Seitengrenze (``chunk_max`` ist ein
-    Vielfaches von ``SEITE``), also ist jeder Schlitzanfang
-    16-Byte-ausgerichtet.
+    **Was hier vorher stand und warum es weg ist.** Der Pipe-Bereich war ein
+    voller Schlitzsatz wie Netz, Ring und a2a, die Schlitzgroesse also
+    ``chunk_max / T`` -- aus der groessten Nutzlast abgeleitet statt aus der
+    Chunkgroesse, die ein Schlitz wirklich tragen muss. Bei R=3, T=4 und dem
+    96-MiB-Fenster dieses Rigs waren das 2047 KiB je Schlitz gegen 342 KiB
+    Bedarf: 32 MiB Bereich fuer 5,4 MiB, und die Differenz fehlte dem
+    all_reduce-Schlitz. Das war der gemessene Verlust von 7,5 % im Pipe-Arm
+    der Hebel-Messung zu #293 (Schlitz 8188 -> 6140 KiB, Kipp-Punkt
+    2456 -> 1842 Token, also unter den Arbeitspunkt von 2048).
+
+    **Warum ein zu kleiner Schlitz nicht gefaehrlich ist.**
+    :func:`pipe_plan` sucht sein ``K`` aufsteigend und prueft jedes mit
+    :func:`groesstes_stueck4` gegen den Schlitz; findet es keins, meldet
+    sich der Weg ueber ``handles()`` ab, und der Kern prueft dieselbe
+    Bedingung noch einmal mit ``TORCH_CHECK``. Ein knapper Schlitz kostet
+    Deckungsbereich, nie Richtigkeit. Nach oben deckt er
+    ``k_max * chunk_ziel_bytes`` ab -- bei 64 Chunks zu 1 MiB also 64 MiB
+    und damit weit mehr, als das Fenster dieses Rigs als Nutzlast traegt.
     """
-    if tiefe < 1:
+    if welt < 2:
         return 0
-    return (chunk_max // tiefe // 16) * 16
+    stueck = -(-int(chunk_ziel_bytes) // int(welt))
+    return ((stueck + 15) // 16) * 16
 
 
-def pipe_bereich_bytes(welt: int, chunk_max: int) -> int:
-    """Bytes, die der Pipe-Bereich in der Empfangsregion belegt."""
-    return 2 * (welt - 1) * chunk_max
+def pipe_bereich_bytes(welt: int, tiefe: int, schlitz: int) -> int:
+    """Bytes, die der Pipe-Bereich in der Empfangsregion belegt.
+
+    ``2 * T * (R-1)`` Schlitze, auf eine Seite aufgerundet -- damit der
+    Bereich, der HINTER dem Pipe-Bereich beginnt (der Ergebnisring), wieder
+    auf einer Seitengrenze anfaengt. Der Anfang des Pipe-Bereichs liegt
+    ohnehin auf einer Seitengrenze, also ist jeder Schlitzanfang
+    16-Byte-ausgerichtet, solange ``schlitz`` es ist.
+    """
+    roh = 2 * int(tiefe) * (int(welt) - 1) * int(schlitz)
+    return ((roh + SEITE - 1) // SEITE) * SEITE
 
 
 #: Seitengroesse. Bewusst eine eigene Konstante und kein Import aus
@@ -253,13 +278,25 @@ SEITE = 4096
 ERG_RING_VORGABE = 2
 
 #: Wieviele Ringplaetze der eager-Weg behaelt, wenn der graphfeste
-#: Direkt-Modus eingeschaltet ist. Genau zwei -- die Herleitung dafuer steht
-#: bei :func:`erg_aufteilung`, und sie ist dieselbe, aus der
-#: :data:`ERG_RING_VORGABE` zwei ist.
+#: Direkt-Modus eingeschaltet ist -- die VORGABE, nicht mehr die Zahl.
+#:
+#: Zwei ist das Minimum, unter dem Runde ``n`` in den Puffer schriebe, den
+#: der Aufrufer aus Runde ``n-1`` noch haelt; dieselbe Herleitung, aus der
+#: :data:`ERG_RING_VORGABE` zwei ist. Zwei ist aber KEINE Aussage darueber,
+#: wieviele Ergebnisse ein bestimmter Aufrufer gleichzeitig am Leben haelt --
+#: und genau daran ist der graphfeste Direktmodus in der Hebel-Messung zu
+#: #293 gescheitert: das Aufzeichnungs-Warmup des Standardlaufs haelt mehr
+#: als zwei, ``SGLANG_HTCCL_BAR1_PIPE_ERG_RING`` half nicht, weil ein
+#: groesserer Ring ausschliesslich GRAPH-Plaetze vergab. Die Zahl ist
+#: deshalb ein Parameter (``SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER``) und keine
+#: Konstante mehr. Die Vorgabe bleibt zwei: wieviele der Standardlauf
+#: wirklich braucht, ist nicht gemessen, und eine geratene groessere Zahl
+#: waere kein besserer Wert, sondern nur ein teurerer.
 ERG_EAGER_PLAETZE = 2
 
 
-def erg_aufteilung(ring: int, graphfest: bool) -> tuple[int, int]:
+def erg_aufteilung(ring: int, graphfest: bool,
+                   eager_plaetze: int = ERG_EAGER_PLAETZE) -> tuple[int, int]:
     """``(eager_plaetze, graph_plaetze)`` fuer einen Ring der Groesse ``ring``.
 
     Reine Arithmetik, damit sie ohne Karte pruefbar ist. Sie ist die
@@ -272,11 +309,18 @@ def erg_aufteilung(ring: int, graphfest: bool) -> tuple[int, int]:
 
     **Mit** ``graphfest`` wird der Ring statisch geteilt:
 
-    * die ersten :data:`ERG_EAGER_PLAETZE` Plaetze rotieren weiter fuer
+    * die ersten ``eager_plaetze`` Plaetze rotieren weiter fuer
       eager-Aufrufe,
     * alle darueber liegenden Plaetze sind ein Vorrat, aus dem eine
       Graph-Aufzeichnung je Aufrufstelle EINEN Platz nimmt und ihn nicht
       mehr zurueckgibt.
+
+    ``eager_plaetze`` ist ein Parameter und keine Konstante, weil es eine
+    Eigenschaft des AUFRUFERS beschreibt -- wieviele Ergebnisse er
+    gleichzeitig am Leben haelt -- und nicht eine des Transports. Bei
+    :data:`ERG_EAGER_PLAETZE` festgenagelt vergab jeder groessere Ring
+    ausschliesslich Graph-Plaetze, waehrend das Aufzeichnungs-WARMUP, das
+    eager laeuft, an genau der eager-Zahl scheiterte.
 
     **Statisch und nicht mitwachsend**, und das ist der Punkt: haette der
     Vorrat sich aus dem oberen Ende des eager-Bereichs bedient, sobald eine
@@ -290,11 +334,12 @@ def erg_aufteilung(ring: int, graphfest: bool) -> tuple[int, int]:
     der Fehler, den :data:`ERG_RING_VORGABE` gerade verhindert.
     """
     ring = max(0, int(ring))
+    eager = max(0, int(eager_plaetze))
     if not graphfest:
         return ring, 0
-    if ring <= ERG_EAGER_PLAETZE:
+    if ring <= eager:
         return ring, 0
-    return ERG_EAGER_PLAETZE, ring - ERG_EAGER_PLAETZE
+    return eager, ring - eager
 
 
 def erg_eager_platz(voriger: int, eager_plaetze: int) -> int:
@@ -306,6 +351,64 @@ def erg_eager_platz(voriger: int, eager_plaetze: int) -> int:
     if eager_plaetze <= 0:
         raise ValueError("eager-Ring ohne Plaetze")
     return (int(voriger) + 1) % int(eager_plaetze)
+
+
+def erg_eager_freier_platz(voriger: int, eager_plaetze: int,
+                           belegt) -> Optional[int]:
+    """Der naechste FREIE eager-Platz nach ``voriger``, oder ``None``.
+
+    ``belegt[i]`` sagt, ob der Tensor, den Platz ``i`` zuletzt herausgegeben
+    hat, noch lebt. Reihum ab ``voriger + 1``, damit die Reihenfolge bei
+    freien Plaetzen Zug fuer Zug die alte bleibt -- der erste Kandidat ist
+    genau der, den :func:`erg_eager_platz` liefert.
+
+    **Warum ueberhaupt gesucht wird.** Vorher wurde nur der eine
+    Nachfolger geprueft und bei belegtem Platz hart abgebrochen. Der
+    Nachfolger ist aber der am laengsten unbenutzte, also der
+    wahrscheinlichste Kandidat -- nicht der einzige. Haelt der Aufrufer
+    gerade den einen und den anderen nicht, ist ein Abbruch schlicht falsch.
+
+    ``None`` heisst "alle Plaetze werden noch gehalten". Dann faehrt der
+    Aufruf ``direkt=0``, gemeldet und mit derselben Begruendung wie beim
+    erschoepften Graph-Vorrat: ``direkt=0`` ist der gemessene Kontrollpfad,
+    er kostet den gesparten VRAM-Durchgang und nicht die Richtigkeit. Was
+    NICHT passieren darf, ist das Beschreiben eines gehaltenen Puffers --
+    und genau das passiert hier nicht.
+    """
+    if eager_plaetze <= 0:
+        raise ValueError("eager-Ring ohne Plaetze")
+    L = int(eager_plaetze)
+    for schritt in range(L):
+        i = (int(voriger) + 1 + schritt) % L
+        if not belegt[i]:
+            return i
+    return None
+
+
+def erg_eager_slack(platz: int, zaehler: int, zuletzt, eager_plaetze: int) -> int:
+    """Wieviele Direkt-Aufrufe seit der letzten Benutzung von ``platz``.
+
+    Der Kern wartet mit ``ergSlack`` darauf, dass der Peer die Generation
+    ``ZIEL - ergSlack + 1`` betreten hat -- ein GROESSERER Slack ist die
+    SCHWAECHERE Bedingung. Er muss deshalb eine Untergrenze des
+    tatsaechlichen Wiederverwendungsabstands sein, nie eine Obergrenze.
+
+    Bei strenger Rotation ueber ``L`` Plaetze ist der Abstand genau ``L``,
+    und das ist der Wert, der hier herauskommt -- Zug fuer Zug der
+    gemessene. Sobald :func:`erg_eager_freier_platz` einen Platz
+    ueberspringt, ist er kleiner, und dann muss auch der Slack kleiner sein.
+    Gedeckelt auf ``L``, weil ein groesserer Wert die Bedingung nur
+    schwaecht und nichts gewinnt; mindestens ``1``, weil ``0`` den
+    Handschlag ganz abschaltet.
+
+    ``zuletzt[i] is None`` heisst "noch nie benutzt" -- dann gibt es nichts
+    zu ueberschreiben und ``L`` ist zulaessig.
+    """
+    L = max(1, int(eager_plaetze))
+    vorher = zuletzt[int(platz)]
+    if vorher is None:
+        return L
+    return max(1, min(L, int(zaehler) - int(vorher)))
 
 
 def erg_graph_platz(vergeben: int, eager_plaetze: int,
@@ -355,15 +458,18 @@ def erg_ring_bytes(max_bytes: int, ring: int) -> int:
     return max(0, int(ring)) * erg_stride_bytes(max_bytes)
 
 
-def pipe_fensterbedarf(welt: int, chunk_max: int, tiefe: int) -> int:
+def pipe_fensterbedarf(welt: int, tiefe: int, schlitz: int) -> int:
     """Der **gerechnete** Bedarf: ``2 * T * (R-1)`` Schlitze.
 
-    Nicht "ein Schlitzsatz, passt schon". Diese Zahl geht in
-    ``handles()`` gegen die TATSAECHLICH abgebildete Laenge, und sie ist
-    kleiner oder gleich :func:`pipe_bereich_bytes` -- die Differenz ist der
-    Verschnitt aus dem Abrunden in :func:`pipe_schlitz_bytes`.
+    Nicht "ein Schlitzsatz, passt schon". Diese Zahl geht in ``handles()``
+    gegen die TATSAECHLICH abgebildete Laenge, und sie ist kleiner oder
+    gleich :func:`pipe_bereich_bytes` -- die Differenz ist der Verschnitt
+    aus dem Aufrunden auf eine Seite. Sie ist zugleich genau der Bereich,
+    den der Kern anfasst: der AG-Ring beginnt bei ``T(R-1)*schlitz``, und
+    die hoechste Adresse darin ist ``ringBytes + (T-1)*(R-1)*schlitz +
+    (R-1)*schlitz``.
     """
-    return 2 * tiefe * (welt - 1) * pipe_schlitz_bytes(chunk_max, tiefe)
+    return 2 * int(tiefe) * (int(welt) - 1) * int(schlitz)
 
 
 def _chunk_grenzen(n: int, j: int, teile: int) -> tuple[int, int]:
@@ -400,7 +506,7 @@ def groesstes_stueck4(n4: int, welt: int, k: int) -> int:
     return gr
 
 
-def pipe_plan(nbytes: int, welt: int, chunk_max: int, tiefe: int,
+def pipe_plan(nbytes: int, welt: int, schlitz: int, tiefe: int,
               k_wunsch: int, chunk_ziel_bytes: int,
               k_max: int = 64) -> Optional[int]:
     """Die Chunkzahl ``K`` fuer diese Nutzlast, oder ``None``.
@@ -410,17 +516,15 @@ def pipe_plan(nbytes: int, welt: int, chunk_max: int, tiefe: int,
     rechnen.
 
     **Rangeinheitlich.** Jeder Eingang ist gruppenweit gleich (``nbytes``
-    und ``welt`` ohnehin, ``chunk_max`` aus dem Aufbau, der Rest aus
+    und ``welt`` ohnehin, ``schlitz`` aus dem Aufbau, der Rest aus
     rangeinheitlichen Umgebungsvariablen). Zwei Raenge duerfen hier nie
     verschieden antworten.
 
     Zwei Bedingungen, beide hart:
 
     1. ``K >= T``. Bei ``K < T`` gaebe es Schlitzklassen, die nie belegt
-       werden -- harmlos --, aber die Schlitzgroesse ist ``chunk_max/T``,
-       waehrend das groesste Stueck mit ``1/K`` schrumpft; bei ``K < T``
-       passt es nicht. Ausserdem ist ``T >= 2`` erzwungen (siehe
-       :data:`MIN_TIEFE`).
+       werden, und der Kern verlangt es ohnehin (``TORCH_CHECK(K >= TT)``).
+       Ausserdem ist ``T >= 2`` erzwungen (siehe :data:`MIN_TIEFE`).
     2. Das groesste Stueck muss in einen Schlitz passen. Geprueft mit
        :func:`groesstes_stueck4`, also mit der Zerlegung selbst.
 
@@ -438,8 +542,8 @@ def pipe_plan(nbytes: int, welt: int, chunk_max: int, tiefe: int,
     n4 = nbytes // 16
     if tiefe < MIN_TIEFE or tiefe > MAX_TIEFE:
         return None
-    schlitz = pipe_schlitz_bytes(chunk_max, tiefe)
-    if schlitz <= 0:
+    schlitz = int(schlitz)
+    if schlitz <= 0 or schlitz % 16:
         return None
     obergrenze = min(k_max, MAX_CHUNKS, max(1, n4 // welt))
     if obergrenze < tiefe:
@@ -1566,7 +1670,7 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
     welt = transport.welt
     rang = transport.rank
     geraet = transport.device
-    chunk_max = int(transport._geo["chunk_max"])
+    schlitz = int(transport.pipe_schlitz)
     max_bytes = int(transport.max_bytes)
 
     # Groessen: absichtlich krumm. 16*R*T ist die kleinste, bei der jeder
@@ -1608,7 +1712,6 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
         # Behauptung 1, nachgerechnet statt geglaubt: keine Chunk- oder
         # Stueckgrenze faellt auf eine Adresse, die kein Vielfaches von 16
         # ist, und kein Stueck sprengt den Schlitz.
-        schlitz = pipe_schlitz_bytes(chunk_max, tiefe)
         for c in range(k):
             coff, clen = _chunk_grenzen(n4, c, k)
             if (coff * 16) % 16 or (clen * 16) % 16:

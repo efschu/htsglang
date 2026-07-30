@@ -1421,6 +1421,7 @@ nothing changes.**
 | `SGLANG_HTCCL_BAR1_NV_QUELLE=<tree>` | driver headers for the JIT build |
 | `SGLANG_HTCCL_BAR1_FENSTER_MIB[_<GROUP>]` | BAR1 window, settable per communicator group. 96 MiB maps contiguously out of 256 gross |
 | `SGLANG_HTCCL_BAR1_RING_AB` / `_GITTER_AB` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
+| `SGLANG_HTCCL_BAR1_GRAPH_GITTER=0\|1` | cooperative launch **under capture**. Unset it and the default follows `SGLANG_HTCCL_GRAPH_FREIGABE` — same gate, same question (`bar1_graph_check.py`, case `gitter`). Forcing it to `0` restores the old reservation and costs 16.1 % prefill throughput once anything captures the prefill (#293 lever run) |
 | `SGLANG_HTCCL_BAR1_PIPE=1` | pipelined kernel |
 | `SGLANG_HTCCL_BAR1_PIPE_DIREKT=0\|1` | direct mode. Off under capture regardless, loudly — its host-side ring index would be baked per graph |
 | `SGLANG_HTCCL_BAR1_A2A=0` | `all_to_all` off, which also turns `all_gather` off: they share the slot area and the byte proof |
