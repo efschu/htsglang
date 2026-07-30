@@ -55,14 +55,29 @@ if ! host_locks_acquire "$BATTERY_STEP"; then
     exit 2
 fi
 SERVER_PID=""
+# Der Aufraeumpfad. Er liest ZWEI Quellen (Variable und Pidfile auf dem Host)
+# und prueft nach, ob der Prozess wirklich weg ist -- beides, weil er am
+# 2026-07-30 stillschweigend nichts getan hat: SERVER_PID enthielt die
+# Bootmeldung samt pid, `kill -0` scheiterte daran, und das galt als "nichts
+# zu toeten". Der Server ueberlebte den Lauf, hielt drei Karten und den
+# dmabuf-Halter, und der naechste Anlauf lief gegen ihn.
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        host_dump_and_kill "$SERVER_PID" "$DIR/pyspy-host-server.txt"
-        SERVER_PID=""
-    fi
+    bar1_kill_host_server "$SERVER_PID" "$HOSTPID" "$DIR/pyspy-host-server.txt" || true
+    SERVER_PID=""
     host_locks_release
 }
 trap cleanup EXIT INT TERM
+
+# --- keine Altlast? --------------------------------------------------------
+# VOR dem Tor, nicht erst vor dem Boot: schon das Graph-Tor baut BAR1-Regionen
+# auf und bekommt vom Halter ENOMEM, wenn die Karten noch belegt sind. Genau
+# so sind in Anlauf 4 alle sieben Faelle in 106 s durchgefallen -- ein
+# Ergebnis, das wie ein Befund ueber bar1 aussah und einer ueber das
+# Aufraeumen war.
+if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
+    compose
+    exit 2
+fi
 
 # --- gate: can the direct path be captured in a CUDA graph? -----------------
 cat > "$DIR/remote_graph_check.sh" <<EOF
@@ -93,8 +108,13 @@ echo "== Standardlauf, Arm bar1 =="
 bar1_write_boot_script "$DIR/remote_boot_bar1.sh" bar1 "$HOSTLOG" "$HOSTPID" "$PORT" || {
     compose; exit 2; }
 SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_bar1.sh" "$HOSTPID")" || SERVER_PID=""
-if [ -z "$SERVER_PID" ]; then
-    echo "Server-Start lieferte keine pid"
+# Nicht nur "nicht leer": eine Zahl. Ein pid, der keiner ist, faellt sonst
+# erst im Aufraeumpfad auf, und dort sieht er aus wie ein toter Prozess.
+if ! bar1_pid_ok "$SERVER_PID"; then
+    echo "Server-Start lieferte keinen brauchbaren pid ('$SERVER_PID')"
+    SERVER_PID=""
+    # Der Server KANN trotzdem laufen -- die Pidfile auf dem Host ist die
+    # zweite Quelle, und genau dafuer nimmt cleanup sie.
     host_tail_into "$HOSTLOG" "$DIR/server.log" 400
     compose
     exit 1
@@ -103,7 +123,7 @@ echo "Host-pid $SERVER_PID"
 echo "$SERVER_PID" > "$DIR/host_pids"
 
 if ! host_wait_for_server "$PORT" 900; then
-    host_dump_and_kill "$SERVER_PID" "$DIR/pyspy-host-server.txt"
+    bar1_kill_host_server "$SERVER_PID" "$HOSTPID" "$DIR/pyspy-host-server.txt" || true
     SERVER_PID=""
     host_tail_into "$HOSTLOG" "$DIR/server.log" 400
     compose
@@ -128,9 +148,16 @@ fi
 #    spec_accept_length, das dieser Schritt braucht.
 #
 # Fortsetzungs-Prompt statt Anweisung: "1 2 3 4" fortzusetzen ist keine
-# Aufgabe, ueber die sich nachdenken laesst. Das Kriterium bleibt mechanisch
-# (wieviele der Zahlen 5..20 stehen in Folge da), und 512 Token sind
-# Luft genug, dass die Grenze nie die Antwort abschneidet.
+# Aufgabe, ueber die sich nachdenken laesst. 512 Token sind Luft genug, dass
+# die Grenze nie die Antwort abschneidet.
+#
+# Was das Kriterium daraus liest, ist NICHT "hat er brav bis 20 gezaehlt".
+# Anlauf 4 zaehlte " 5 6 7 8 9 10" korrekt weiter und driftete dann in einen
+# russischen Forumtext -- die Charakteristik einer rohen Fortsetzung ohne
+# Anweisung, kein Schaden. Geprueft wird deshalb (a) ein Anker aus vier
+# unmittelbar und lueckenlos richtigen Zahlen und (b) dass der Text
+# wohlgeformt ist (druckbar, keine Tokenschleife). Die Begruendung samt der
+# am Artefakt gemessenen Schwellen steht in s11_bar1_e2e.py.
 echo "== Smoke-Request (/generate, Fortsetzung) =="
 host_ssh_for 180 "curl -s -m 120 http://127.0.0.1:$PORT/generate \
   -H 'Content-Type: application/json' -d '{\"text\": \"1 2 3 4\", \

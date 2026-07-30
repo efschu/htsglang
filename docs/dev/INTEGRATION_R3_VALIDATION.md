@@ -9953,3 +9953,128 @@ damit ihn niemand neu herausfinden muss.
 zwei Klassen gegen ECHTE Artefakte: Anlauf 1 (Capture-Abbruch, Verdikt
 nennt den Riegel) und Anlauf 3 (Transport gruen, Verdikt haelt am Smoke und
 enthaelt kein Wort, das nach Transportfehler klingt).
+
+## Anlauf 4: das Aufraeumleck, und ein Kriterium, das den falschen Gegenstand mass (2026-07-30)
+
+### Wurzel, aus dem Artefakt und nicht aus einer Vermutung
+
+Anlauf 4 fiel am Graph-Tor durch -- `DMABUF_HOLDER_IOC_HOLD` ENOMEM, alle
+sieben Faelle rot in 106 s -- und sein Smoke wurde vom Server des Anlaufs 3
+beantwortet, der noch lief und alle drei Karten hielt. Beides sah aus wie
+ein Befund ueber bar1 und war einer ueber das Aufraeumen.
+
+Die Ursache ist eine fehlende Umleitung, und `host_pids` desselben Laufs
+beweist sie -- 31 Byte, zwei Zeilen:
+
+    gestartet, pid 1962637
+    1962637
+
+`bar1_boot_start` liefert den pid ueber **stdout** und rief
+`host_run_script` ohne Umleitung. Das Bootskript sagt zum Schluss
+"gestartet, pid <n>", `host_run_script` reicht das durch, und die
+Kommandosubstitution des Aufrufers sammelte beides ein. Von da an lief
+alles Weitere sauber ins Leere:
+
+* `host_dump_and_kill` fragte `kill -0 <dieser Salat>`, bekam einen Fehler
+  und nahm den fruehen Ausstieg "da ist nichts, also auch nichts zu
+  toeten";
+* der Server ueberlebte damit **jeden** Ausgang des Skripts -- das
+  Abraeumen am Ende, den EXIT-trap, alles;
+* er hielt die Karten samt dmabuf-Anhaftungen, und der naechste Anlauf lief
+  gegen ihn.
+
+Dieselbe Familie wie der r7c-Befund "load_card_order durch eine Pipe": eine
+Funktion, die ihren Rueckgabewert ueber stdout liefert, darf auf stdout
+nichts anderes zulassen. Der Fix kostet ein `>&2`.
+
+### Gebaut, in vier Lagen
+
+1. **`>&2` in `bar1_boot_start`.** Die Wurzel. Die Bootmeldung geht nach
+   stderr, nicht ins Nichts -- sie ist die Stelle, an der ein
+   fehlgeschlagener Boot gelesen wird.
+2. **`bar1_pid_ok`.** `kill -0` kann einen kaputten pid nicht von einem
+   toten Prozess unterscheiden; diese Pruefung kann es. Sie steht an jedem
+   Uebergabepunkt.
+3. **`bar1_kill_host_server`** mit ZWEI Quellen (Variable, dann die Pidfile
+   auf dem Host) und einem Blick danach. Die zweite Quelle deckt das
+   Zeitfenster ab, in dem ein Skript zwischen Boot und Zuweisung stirbt --
+   ohne sie ist genau das ein Leck. Der Blick danach macht aus einem
+   angestossenen Kill einen belegten.
+4. **`bar1_altlast_pruefen`** vor dem Tor, in s11 UND s12. Drei
+   Tripdraehte, weil jeder allein blind ist: Port, `launch_server`-Prozesse
+   und Kartenbelegung. **Der Test toetet nichts.** Was auf diesen Karten
+   laeuft, muss nicht von uns sein, und ein breites `pkill` waere genau der
+   Blast-Radius, den die Rig-Regeln ausschliessen. Er benennt, und der
+   Aufrufer bricht ab: ein benannter Abbruch ist ein Befund, ein Lauf gegen
+   einen Zombie sind falsche Zahlen.
+
+In s12 wiegt das schwerer als in s11: acht Boots sind acht Gelegenheiten,
+einen Server stehenzulassen, und acht Messpunkte am selben Prozess waeren
+eine Kurve ueber nichts.
+
+**Falsifikator, gefahren:** mit zurueckgedrehtem `>&2` gehen vier Tests rot,
+darunter die direkte Reproduktion des verschmutzten pid. Ohne diese Probe
+waere der Test nur eine Behauptung.
+
+### Das Smoke-Kriterium mass Gehorsam, nicht Intaktheit
+
+Anlauf 4 setzte " 5 6 7 8 9 10" korrekt fort und driftete dann in einen
+kohaerenten russischen Forumbeitrag ueber den Anschluss eines
+Drehstrommotors. Das ist die Charakteristik einer **rohen Fortsetzung ohne
+Anweisung** -- kein Schaden am Modell. Echte Korruption liefert keine sechs
+richtigen Zahlen und danach wohlgeformte Prosa.
+
+Das alte Mass (15 der Zahlen 5..20 irgendwo in Folge) verlangte Gehorsam
+ueber 16 Zahlen und meldete 10: sechs echte, vier aus Ziffern des
+Forumtexts (220В, 1450, Datumsangaben). Ein streuender Zaehler findet in
+Fliesstext immer irgendetwas -- genau so kamen vorher schon die 3 aus den
+Aufzaehlungspunkten der Denk-Praeambel zustande.
+
+Neu, zweiteilig:
+
+* **(a) Anker.** Vier Zahlen, die UNMITTELBAR am Textanfang und lueckenlos
+  folgen. Kein Streuen: "0/10" direkt hinter der 10 darf nicht als 11
+  durchgehen, nur weil spaeter irgendwo eine 11 steht. Das prueft die eine
+  Frage, die dieser Schritt beantworten kann -- kommen fuer ein
+  determiniertes Praefix die richtigen Token heraus.
+  Vier und nicht sechs, obwohl sechs gemessen sind: eine einzelne
+  Beobachtung rechtfertigt keine Schwelle auf ihrem eigenen Wert. Der
+  Abstand, auf den es ankommt, ist der zwischen 0 und 4.
+* **(b) Muell-Pruefung** auf dem ganzen Abschnitt: druckbare Zeichen,
+  Wortvielfalt (erst ab 30 Worten, darunter ist sie Rauschen) und keine
+  kurze Einheit, die sich unmittelbar dutzendfach wiederholt. Was hier
+  NICHT geprueft wird, ist Sinn -- ein unbestellter Forumbeitrag ist ein
+  voellig intaktes Sprachmodell-Ergebnis.
+
+**Jede Schwelle ist am echten Artefakt geeicht**, nicht geschaetzt
+(Fixture `s11_bar1_e2e_generate_drift/`, Herkunft daneben):
+
+| Kennzahl | gemessen (Anlauf 4) | Schwelle |
+|---|---|---|
+| Anker | 6 | >= 4 |
+| druckbare Zeichen | 1,0000 | >= 0,98 |
+| Wortvielfalt | 0,4348 | >= 0,15 (Tokenschleife liegt bei ~0,01) |
+| max. unmittelbare Wiederholung | 3 | < 10 |
+
+Der laengere Zahlen-Anker im Prompt war die Alternative und ist bewusst
+NICHT gewaehlt: dass er weiter traegt, liesse sich ohne Karte nicht zeigen,
+und eine Schwelle auf eine unbelegte Annahme zu stellen ist dasselbe
+Problem noch einmal. Der Prompt bleibt "1 2 3 4".
+
+Die streuende Zahl bleibt als **Kennzahl** im Artefakt (`zahlen_in_folge`),
+weil an ihr die beiden Fehlschluesse haengen und wer sie im Protokoll
+wiedersieht, sie einordnen koennen soll. Kriterium ist sie nicht mehr.
+`unterprovisioniert` setzt jetzt voraus, dass der ANKER gefehlt hat: eine
+Antwort, die erst nach korrekt fortgesetzten Zahlen abdriftet, ist ein
+bestandener Smoke und kein unter-provisionierter.
+
+`schema_version` 3 -> 4.
+
+### Testzahlen
+
+| Suite | Ergebnis |
+|---|---|
+| `test_bar1_host_cleanup.py` (neu, bash-getrieben) | 22 passed |
+| `test_gpu_battery_checks_bar1.py` | 122 passed (+10) |
+| `test/registered/unit/distributed/` | 16 failed / 1186 passed / 8 skipped |
+| auf `3413e0306b` | 16 failed / 1154 passed / 8 skipped -- dieselben 16 |

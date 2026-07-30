@@ -75,7 +75,7 @@ def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "bar1_e2e.json")
     classify_missing_result(step_dir, "bar1_e2e", path, "bar1_e2e.json")
     payload = load_json(path, "bar1_e2e.json")
-    require_envelope(payload, KIND, "bar1_e2e.json", 3)
+    require_envelope(payload, KIND, "bar1_e2e.json", 4)
 
     if not payload.get("reachable"):
         raise CheckStop(
