@@ -53,14 +53,14 @@ def check(step_dir: str) -> None:
     )
     if not text.strip():
         raise CheckFail(
-            "boot_c: loader_lines.txt ist leer -- keine Spur eines geladenen "
-            "DFLASH-Drafters im Serverlog"
+            "boot_c: loader_lines.txt is empty -- no trace of a loaded DFLASH "
+            "drafter in the server log"
         )
     lowered = text.lower()
     if "dflash" not in lowered and "draft" not in lowered:
         raise CheckFail(
-            "boot_c: loader_lines.txt nennt weder dflash noch draft -- der "
-            "Drafter-Pfad ist nicht gelaufen"
+            "boot_c: loader_lines.txt names neither dflash nor draft -- the drafter "
+            "path never ran"
         )
 
 

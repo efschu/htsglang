@@ -12,7 +12,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ./battery_common.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="$WT/python:${PYTHONPATH:-}"
@@ -20,7 +20,7 @@ export PYTHONPATH="$WT/python:${PYTHONPATH:-}"
 echo "== Plan =="
 "$PY" "$BATTERY_DIR/s06_nccl_reference.py" --dry-run
 
-echo "== Messung =="
+echo "== measurement =="
 # --timeout is the budget for ONE pair, both ranks together. Three pairs at 480s
 # stay inside the step's 1800s budget with room for the stack dumps and the
 # write-out, so a wedged pair is answered by this script and not by the outer

@@ -17,7 +17,7 @@ every reason why:
   not a transport difference, and with three samples nothing separates the two.
 * NO STEADY WORKING POINT. The requests prefill, ramp and finish inside the
   measured seconds, so the window contains the transition and not the loop.
-* NO CONTEXT. The prosa prompt is ~50 tokens, so decode runs at a KV length no
+* NO CONTEXT. The prose prompt is ~50 tokens, so decode runs at a KV length no
   real workload has.
 
 This file measures the decode loop instead:
@@ -79,7 +79,9 @@ SCHEMA_VERSION = 1
 
 # The filler vocabulary is fixed and the RNG is seeded from a constant, so the
 # prompt is byte-identical for every arm, every round and every batch size. The
-# content axis is not what this window varies.
+# content axis is not what this window varies. It stays GERMAN for the same
+# reason: it is measurement input, and translating it would change the
+# workload of every comparison against an earlier run.
 _WORDS = (
     "die messung zeigt einen deutlichen unterschied zwischen der erwartung und "
     "dem befund auf dieser maschine denn der weg ueber den hauptspeicher kostet "
@@ -173,28 +175,28 @@ def _metrics_snapshot(port: int) -> dict:
     return out
 
 
-def _server_context_tokens(port: int, vorgabe: int) -> int:
+def _server_context_tokens(port: int, fallback: int) -> int:
     """The server's own context length, or the recipe's value.
 
     Read rather than assumed because the cap on max_new_tokens hangs off it,
     and a cap that is too large produces an empty measurement (see above).
     """
-    for pfad in ("/get_server_info", "/get_model_info"):
+    for path in ("/get_server_info", "/get_model_info"):
         try:
-            body = json.loads(_get(port, pfad, timeout=20))
+            body = json.loads(_get(port, path, timeout=20))
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             continue
-        stapel = [body]
-        while stapel:
-            knoten = stapel.pop()
-            if isinstance(knoten, dict):
-                wert = knoten.get("context_length") or knoten.get("max_context_length")
-                if isinstance(wert, int) and wert > 0:
-                    return wert
-                stapel.extend(v for v in knoten.values() if isinstance(v, (dict, list)))
-            elif isinstance(knoten, list):
-                stapel.extend(v for v in knoten if isinstance(v, (dict, list)))
-    return vorgabe
+        stack = [body]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                value = node.get("context_length") or node.get("max_context_length")
+                if isinstance(value, int) and value > 0:
+                    return value
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return fallback
 
 
 class Stream:
@@ -292,7 +294,7 @@ class Stream:
         return out
 
 
-def _tick_aggregat(ticks: list, bs: int, rand_verwerfen: int = 1) -> dict:
+def _tick_aggregate(ticks: list, bs: int, drop_edges: int = 1) -> dict:
     """Per-tick decode metrics of ONE window, at exactly this batch size.
 
     Two differences to ``decode_tick_aggregat`` in s12, and both are what makes
@@ -306,27 +308,27 @@ def _tick_aggregat(ticks: list, bs: int, rand_verwerfen: int = 1) -> dict:
       that contains any of them did not hold its working point, and that has to
       show up in the point rather than in a quietly smaller sample.
     """
-    passend = [t for t in ticks if t["running_req"] == bs]
-    fremd = len(ticks) - len(passend)
-    kern = passend[rand_verwerfen:-rand_verwerfen] if rand_verwerfen else passend
-    if len(kern) < 2:
-        kern = passend
-    if not kern:
+    matching = [t for t in ticks if t["running_req"] == bs]
+    foreign = len(ticks) - len(matching)
+    core = matching[drop_edges:-drop_edges] if drop_edges else matching
+    if len(core) < 2:
+        core = matching
+    if not core:
         return {"ticks_fenster": len(ticks), "ticks_bs": 0, "ticks_gewertet": 0}
-    rate = [t["gen_tok_s"] for t in kern]
-    accept = [t["accept_len"] for t in kern]
+    rate = [t["gen_tok_s"] for t in core]
+    accept = [t["accept_len"] for t in core]
     rate_med = statistics.median(rate)
     accept_med = statistics.median(accept)
     out = {
         "ticks_fenster": len(ticks),
-        "ticks_bs": len(passend),
-        "ticks_fremde_bs": fremd,
-        "ticks_gewertet": len(kern),
+        "ticks_bs": len(matching),
+        "ticks_fremde_bs": foreign,
+        "ticks_gewertet": len(core),
         "gen_tok_s_median": rate_med,
         "gen_tok_s_min": min(rate),
         "gen_tok_s_max": max(rate),
         "accept_len_median": accept_med,
-        "cuda_graph": all(t["cuda_graph"] for t in kern),
+        "cuda_graph": all(t["cuda_graph"] for t in core),
     }
     if len(rate) > 2:
         out["gen_tok_s_stdev"] = statistics.stdev(rate)
@@ -340,7 +342,7 @@ def _tick_aggregat(ticks: list, bs: int, rand_verwerfen: int = 1) -> dict:
     return out
 
 
-def _ernte_ticks(server_log: str, von: float, bis: float, bs: int) -> dict:
+def _harvest_ticks(server_log: str, start: float, end: float, bs: int) -> dict:
     if not server_log or not os.path.exists(server_log):
         return {"tick_fehler": "kein Serverlog", "tick_quelle": server_log or None}
     try:
@@ -348,13 +350,13 @@ def _ernte_ticks(server_log: str, von: float, bis: float, bs: int) -> dict:
             ticks = parse_decode(f)
     except OSError as exc:
         return {"tick_fehler": f"{type(exc).__name__}: {exc}"}
-    fenster = im_fenster(ticks, von, bis)
+    window = im_fenster(ticks, start, end)
     out = {"tick_quelle": server_log}
-    out.update({f"tick_{k}": v for k, v in _tick_aggregat(fenster, bs).items()})
+    out.update({f"tick_{k}": v for k, v in _tick_aggregate(window, bs).items()})
     return out
 
 
-def messe_punkt(args) -> dict:
+def measure_point(args) -> dict:
     stop = threading.Event()
     prompt0 = _prompt(args.context_tokens, 0)
 
@@ -428,7 +430,7 @@ def messe_punkt(args) -> dict:
     time.sleep(2.0)
     probe: dict = {}
     try:
-        antwort = _post(
+        answer = _post(
             args.port,
             "/generate",
             {
@@ -441,7 +443,7 @@ def messe_punkt(args) -> dict:
             },
             timeout=120,
         )
-        meta = (antwort.get("meta_info") or {}) if isinstance(antwort, dict) else {}
+        meta = (answer.get("meta_info") or {}) if isinstance(answer, dict) else {}
         probe = {
             k: meta.get(k)
             for k in (
@@ -454,13 +456,13 @@ def messe_punkt(args) -> dict:
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         probe = {"fehler": f"{type(exc).__name__}: {exc}"}
 
-    je_strom = [s.between(t0_mono, t1_mono) for s in streams]
-    tokens = sum(d.get("d_tokens") or 0 for d in je_strom)
-    verify = sum(d.get("d_verify_ct") or 0 for d in je_strom)
-    accepts = [d["accept_len"] for d in je_strom if d.get("accept_len")]
-    spanne = t1_mono - t0_mono
+    per_stream = [s.between(t0_mono, t1_mono) for s in streams]
+    tokens = sum(d.get("d_tokens") or 0 for d in per_stream)
+    verify = sum(d.get("d_verify_ct") or 0 for d in per_stream)
+    accepts = [d["accept_len"] for d in per_stream if d.get("accept_len")]
+    span = t1_mono - t0_mono
 
-    punkt = {
+    point = {
         "kind": KIND,
         "schema": SCHEMA_VERSION,
         "folge": args.folge,
@@ -475,7 +477,7 @@ def messe_punkt(args) -> dict:
         "ramp_seconds": args.ramp_seconds,
         "ramp_vollstaendig": ramp_ok,
         "window_seconds": args.window_seconds,
-        "fenster_spanne_s": spanne,
+        "fenster_spanne_s": span,
         "fenster_von": t0_wall,
         "fenster_bis": t1_wall,
         "metriken_vor": m0,
@@ -484,21 +486,21 @@ def messe_punkt(args) -> dict:
         # marks. Independent of the scheduler's own accounting and of the log.
         "klient_tokens": tokens,
         "klient_verify_ct": verify,
-        "klient_tok_s": (tokens / spanne) if spanne > 0 and tokens else None,
+        "klient_tok_s": (tokens / span) if span > 0 and tokens else None,
         "klient_accept_len_median": statistics.median(accepts) if accepts else None,
         "klient_accept_len_gesamt": (tokens / verify) if verify else None,
-        "klient_stroeme": len([d for d in je_strom if d.get("n", 0) >= 2]),
+        "klient_stroeme": len([d for d in per_stream if d.get("n", 0) >= 2]),
         "probe_accept_bs1": probe,
         "meta_info_getragen": all(s.meta_seen for s in streams),
         "fehler": [s.error for s in streams if s.error][:3],
-        "je_strom": je_strom,
+        "je_strom": per_stream,
     }
-    punkt.update(_ernte_ticks(args.server_log, t0_wall, t1_wall, args.bs))
+    point.update(_harvest_ticks(args.server_log, t0_wall, t1_wall, args.bs))
 
     # Let the batch drain before the next point. A point that starts while the
     # previous streams are still being torn down measures the teardown.
     time.sleep(args.drain_seconds)
-    return punkt
+    return point
 
 
 def main(argv=None) -> int:
@@ -517,26 +519,26 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    punkt = messe_punkt(args)
+    point = measure_point(args)
     with open(os.path.join(args.out_dir, "decode_punkte.jsonl"), "a") as f:
-        f.write(json.dumps(punkt) + "\n")
+        f.write(json.dumps(point) + "\n")
 
     print(
-        f"punkt {args.arm}/bs={args.bs}: "
-        f"tick {punkt.get('tick_gen_tok_s_median')} tok/s, "
-        f"accept {punkt.get('tick_accept_len_median')}, "
-        f"ms/Verify {punkt.get('tick_ms_pro_verify')}, "
-        f"ticks {punkt.get('tick_ticks_gewertet')}/{punkt.get('tick_ticks_bs')} "
-        f"(fremde bs: {punkt.get('tick_ticks_fremde_bs')}), "
-        f"klient {punkt.get('klient_tok_s')} tok/s, "
-        f"probe accept {(punkt.get('probe_accept_bs1') or {}).get('spec_accept_length')}"
+        f"point {args.arm}/bs={args.bs}: "
+        f"tick {point.get('tick_gen_tok_s_median')} tok/s, "
+        f"accept {point.get('tick_accept_len_median')}, "
+        f"ms/Verify {point.get('tick_ms_pro_verify')}, "
+        f"ticks {point.get('tick_ticks_gewertet')}/{point.get('tick_ticks_bs')} "
+        f"(foreign bs: {point.get('tick_ticks_fremde_bs')}), "
+        f"client {point.get('klient_tok_s')} tok/s, "
+        f"probe accept {(point.get('probe_accept_bs1') or {}).get('spec_accept_length')}"
     )
     # A point without a tick rate is not a point: the window held no usable
     # scheduler line, and reporting the client rate alone would hide that.
-    if punkt.get("tick_gen_tok_s_median") is None:
-        for err in punkt.get("fehler") or []:
-            print(f"  Fehler: {err}", file=sys.stderr)
-        print(f"  tick_fehler: {punkt.get('tick_fehler')}", file=sys.stderr)
+    if point.get("tick_gen_tok_s_median") is None:
+        for err in point.get("fehler") or []:
+            print(f"  error: {err}", file=sys.stderr)
+        print(f"  tick_fehler: {point.get('tick_fehler')}", file=sys.stderr)
         return 1
     return 0
 

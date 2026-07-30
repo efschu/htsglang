@@ -31,7 +31,7 @@ source ./battery_common.sh
 source ./battery_host.sh
 source ./_bar1_host_boot.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing}"
 PORT="${BAR1_PORT}"
 CONTEXT_TOKENS="${S14_CONTEXT_TOKENS:-2048}"
 # What --context-length in the boot recipe pins. The driver reads the server's
@@ -40,10 +40,10 @@ MODEL_CONTEXT="${S14_MODEL_CONTEXT:-32768}"
 RAMP_S="${S14_RAMP_SECONDS:-6}"
 WINDOW_S="${S14_WINDOW_SECONDS:-15}"
 DRAIN_S="${S14_DRAIN_SECONDS:-5}"
-RUNDEN="${S14_RUNDEN:-1}"
-RUNDE_START="${S14_RUNDE_START:-1}"
+ROUNDS="${S14_RUNDEN:-1}"
+ROUND_START="${S14_RUNDE_START:-1}"
 # Batch sizes in the order they run inside one boot.
-BS_LISTE="${S14_BS:-16 1 4 8 16}"
+BS_LIST="${S14_BS:-16 1 4 8 16}"
 
 # The reserve both arms share. Pinned in one place so the anchor can never
 # drift away from the arm it anchors.
@@ -52,7 +52,7 @@ RESERVE="--rank-auto-reserve-mib 4500,4200,4200"
 LOGARG="--decode-log-interval ${S14_LOG_INTERVAL:-10}"
 
 # name | transport arm | extra env | extra server args
-ARME_TABELLE=(
+ARM_TABLE=(
     "nccl_hi|grundlinie||$RESERVE $LOGARG"
     "bar1_hi|bar1||$RESERVE $LOGARG"
 )
@@ -63,11 +63,11 @@ DIR_HOST="$(host_path "$DIR")" || exit 2
 DRIVER_HOST="$(host_path "$BATTERY_DIR/s14_decode_punkt.py")" || exit 2
 
 if ! host_reachable; then
-    echo "STOP: Host $BAR1_HOST nicht erreichbar"; exit 2
+    echo "STOP: host $BAR1_HOST not reachable"; exit 2
 fi
 if ! bar1_require_integration; then exit 2; fi
 if ! host_locks_acquire "${BATTERY_STEP:-s14}"; then
-    echo "STOP: Host-Locks nicht zu bekommen"
+    echo "STOP: host locks not obtainable"
     echo "Host-Locks fremd gehalten -- nicht gebrochen" > "$DIR/blocked.txt"
     exit 2
 fi
@@ -81,17 +81,17 @@ s14_warte_auf_server() {  # $1 = port, $2 = host pid, $3 = budget_s
     while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
         if host_ssh_for 40 "curl -sf -m 5 http://127.0.0.1:$port/health >/dev/null" \
             >/dev/null 2>&1; then
-            echo "Host-Server oben nach $(( $(date +%s) - t0 ))s"
+            echo "host server up after $(( $(date +%s) - t0 ))s"
             return 0
         fi
         if ! host_ssh_for 40 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; then
-            echo "Host-Server $pid ist gestorben, bevor er antwortete " \
-                 "(nach $(( $(date +%s) - t0 ))s)" >&2
+            echo "host server $pid died before it ever answered " \
+                 "(after $(( $(date +%s) - t0 ))s)" >&2
             return 2
         fi
         sleep 10
     done
-    echo "Host-Server nicht oben in ${budget}s" >&2
+    echo "host server not up within ${budget}s" >&2
     return 1
 }
 
@@ -115,13 +115,13 @@ set -uo pipefail
 EOF
 chmod +x "$DIR/remote_decode.sh"
 
-FOLGE=0
-ABBRUCH=""
+SEQ=0
+ABORT=""
 
-for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
-    for ZEILE in "${ARME_TABELLE[@]}"; do
-        NAME="${ZEILE%%|*}"
-        REST="${ZEILE#*|}"
+for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
+    for ROW in "${ARM_TABLE[@]}"; do
+        NAME="${ROW%%|*}"
+        REST="${ROW#*|}"
         TARM="${REST%%|*}"
         REST="${REST#*|}"
         EENV="${REST%%|*}"
@@ -131,27 +131,27 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             case " $S14_NUR " in *" $NAME "*) ;; *) continue ;; esac
         fi
 
-        ARM="${NAME}_r${RUNDE}"
+        ARM="${NAME}_r${ROUND}"
         HOSTLOG="$BAR1_HOST_LOGDIR/s14.$ARM.log"
         HOSTPID="$BAR1_HOST_LOGDIR/s14.$ARM.pid"
-        echo "== Runde $RUNDE, Arm $NAME (Transport $TARM) =="
+        echo "== round $ROUND, arm $NAME (transport $TARM) =="
 
         if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
-            ABBRUCH="Altlast vor $ARM"; break
+            ABORT="leftover server before $ARM"; break
         fi
 
         BAR1_EXTRA_ENV="$EENV" BAR1_EXTRA_ARGS="$EARGS" \
             bar1_write_boot_script "$DIR/remote_boot_${ARM}.sh" "$TARM" \
                 "$HOSTLOG" "$HOSTPID" "$PORT" \
-            || { ABBRUCH="Bootskript $ARM"; break; }
+            || { ABORT="boot script $ARM"; break; }
 
         SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_${ARM}.sh" "$HOSTPID")" \
             || SERVER_PID=""
         if ! bar1_pid_ok "$SERVER_PID"; then
             SERVER_PID=""
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 200
-            echo "ohne pid" > "$DIR/logs/${ARM}.bootfehler.txt"
-            echo "  ARM UEBERSPRUNGEN: Server-Start ohne pid"
+            echo "no pid" > "$DIR/logs/${ARM}.bootfehler.txt"
+            echo "  ARM SKIPPED: server start without a pid"
             continue
         fi
         echo "$SERVER_PID" >> "$DIR/host_pids"
@@ -165,18 +165,18 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             bar1_kill_host_server "$SERVER_PID" "$HOSTPID" \
                 "$DIR/pyspy-host-$SERVER_PID.txt" || true
             SERVER_PID=""
-            echo "  ARM UEBERSPRUNGEN: Server nicht oben (Grund in logs/${ARM}.bootfehler.txt)"
+            echo "  ARM SKIPPED: server never came up (reason in logs/${ARM}.bootfehler.txt)"
             sleep 20
             continue
         fi
 
-        # ERREICHT= per group BEFORE any number, same rule as s13: an arm whose
+        # ACHIEVED= per group BEFORE any number, same rule as s13: an arm whose
         # second communicator group quietly fell back is a mixed point, and a
         # decode graph that silently did not get captured would otherwise be
         # reported as a graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "CUDA graph begin" \
             "CUDA graph end" \
@@ -184,15 +184,15 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             "waehrend einer CUDA-Graph-Aufzeichnung"
 
         MRC=0
-        for BS in $BS_LISTE; do
-            FOLGE=$((FOLGE + 1))
-            echo "   Punkt bs=$BS"
-            host_run_script 600 "$DIR/remote_decode.sh" "$ARM" "$BS" "$FOLGE" \
+        for BS in $BS_LIST; do
+            SEQ=$((SEQ + 1))
+            echo "   point bs=$BS"
+            host_run_script 600 "$DIR/remote_decode.sh" "$ARM" "$BS" "$SEQ" \
                 "$HOSTLOG" >> "$DIR/messen.log" 2>&1
             RC=$?
             [ "$RC" != 0 ] && MRC=$RC
         done
-        echo "  Messung rc=$MRC"
+        echo "  measurement rc=$MRC"
 
         host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}.fatal.txt" \
             "CUDA out of memory" "torch.OutOfMemoryError" "NCCL error" \
@@ -205,19 +205,19 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
         sleep 20
 
         if [ "$MRC" != 0 ]; then
-            printf 'Messung rc=%s\n' "$MRC" > "$DIR/logs/${ARM}.messfehler.txt"
-            echo "  PUNKT FEHLT: Messung rc=$MRC (Grund in logs/${ARM}.fatal.txt)"
+            printf 'measurement rc=%s\n' "$MRC" > "$DIR/logs/${ARM}.messfehler.txt"
+            echo "  POINT MISSING: measurement rc=$MRC (reason in logs/${ARM}.fatal.txt)"
         fi
     done
-    [ -n "$ABBRUCH" ] && break
-    echo "== Runde $RUNDE fertig =="
+    [ -n "$ABORT" ] && break
+    echo "== round $ROUND done =="
 done
 
 cleanup
 trap - EXIT INT TERM
 
-if [ -n "$ABBRUCH" ]; then
-    echo "abgebrochen: $ABBRUCH" | tee "$DIR/abbruch.txt"
+if [ -n "$ABORT" ]; then
+    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
     exit 1
 fi
 exit 0

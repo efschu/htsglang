@@ -648,12 +648,13 @@ def main() -> int:
         for d in zeilen:
             for z in d["protokoll"]:
                 print(f"    [r{d['rang']}] {z}")
-        # NOTE: "BESTANDEN"/"GEFALLEN" stay in German on purpose -- this
-        # exact marker text is regex-parsed by
-        # scripts/gpu_battery/s11_bar1_e2e.py (out of this task's scope),
-        # which is not being touched in this pass. Renaming it here without
-        # updating that consumer in the same commit would silently break it.
-        print(f"    => {'BESTANDEN' if ok else 'GEFALLEN'}"
+        # NOTE: "PASSED"/"FAILED" is a cross-file marker text, regex-parsed
+        # by scripts/gpu_battery/s11_bar1_e2e.py and matched by the gpu_battery
+        # checks and their fixtures. It was translated from the former German
+        # "BESTANDEN"/"GEFALLEN" together with every one of those consumers in
+        # a single commit -- renaming it again without doing the same would
+        # silently break them.
+        print(f"    => {'PASSED' if ok else 'FAILED'}"
               + (f": {grund}" if grund else ""))
         print()
         stand.append((fall["name"], fall.get("gate", True), ok, grund))
@@ -662,7 +663,7 @@ def main() -> int:
     print("Summary")
     print("=" * 62)
     for name, gate, ok, grund in stand:
-        marke = "BESTANDEN" if ok else "GEFALLEN "
+        marke = "PASSED" if ok else "FAILED"
         print(f"  {marke}  {'[Gate]' if gate else '[Info]'}  {name}"
               + (f"  -- {grund[:80]}" if grund else ""))
 

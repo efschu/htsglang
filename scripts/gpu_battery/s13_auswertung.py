@@ -31,35 +31,35 @@ import re
 import statistics
 import sys
 
-REFERENZ = "nccl"
+REFERENCE = "nccl"
 
 
-def arm_und_runde(name: str) -> tuple:
+def arm_and_round(name: str) -> tuple:
     m = re.match(r"^(.*)_r(\d+)$", name or "")
     if not m:
         return (name, 0)
     return (m.group(1), int(m.group(2)))
 
 
-def lade_punkte(step_dir: str) -> list:
-    pfad = os.path.join(step_dir, "punkte.jsonl")
+def load_points(step_dir: str) -> list:
+    path = os.path.join(step_dir, "punkte.jsonl")
     out = []
-    if not os.path.exists(pfad):
+    if not os.path.exists(path):
         return out
-    with open(pfad, errors="replace") as f:
-        for zeile in f:
-            zeile = zeile.strip()
-            if not zeile:
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                out.append(json.loads(zeile))
+                out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
     return out
 
 
-def lade_wait(step_dir: str) -> dict:
-    """{(arm, runde): [rang-aggregate]} out of wait/*.json."""
+def load_wait(step_dir: str) -> dict:
+    """{(arm, round): [per-rank aggregate]} out of wait/*.json."""
     out: dict = {}
     d = os.path.join(step_dir, "wait")
     if not os.path.isdir(d):
@@ -73,13 +73,17 @@ def lade_wait(step_dir: str) -> dict:
         except (OSError, json.JSONDecodeError):
             continue
         for w in payload.get("wait") or []:
-            arm, runde = arm_und_runde(w.get("arm"))
-            out.setdefault((arm, runde), []).append(w)
+            arm, rnd = arm_and_round(w.get("arm"))
+            out.setdefault((arm, rnd), []).append(w)
     return out
 
 
-def lade_belege(step_dir: str) -> dict:
-    """{(arm, runde): {'bar1_gruppen': n, 'prefill_graph': str}}."""
+def load_evidence(step_dir: str) -> dict:
+    """{(arm, round): {'bar1_gruppen': n, 'prefill_graph': str}}.
+
+    The keys stay German because they are the artifact's field names, and the
+    substrings counted below are log lines the server writes, matched verbatim.
+    """
     out: dict = {}
     d = os.path.join(step_dir, "belege")
     if not os.path.isdir(d):
@@ -87,20 +91,20 @@ def lade_belege(step_dir: str) -> dict:
     for name in sorted(os.listdir(d)):
         if not name.endswith(".txt"):
             continue
-        arm, runde = arm_und_runde(name[:-4])
+        arm, rnd = arm_and_round(name[:-4])
         try:
             with open(os.path.join(d, name), errors="replace") as f:
                 text = f.read()
         except OSError:
             continue
-        pg = "aus"
+        pg = "off"
         if "prefill CUDA graph end" in text or "prefill CUDA graph begin" in text:
-            pg = "AN"
+            pg = "ON"
         elif "isabling prefill CUDA graph" in text or "Disable prefill CUDA" in text:
-            pg = "aus (auto-disable)"
-        out[(arm, runde)] = {
+            pg = "off (auto-disable)"
+        out[(arm, rnd)] = {
             "bar1_gruppen": text.count("HTCCL-BAR1: Aufbau in"),
-            "erreicht": len(re.findall(r"ERREICHT=", text)),
+            "erreicht": len(re.findall(r"ACHIEVED=", text)),
             "pipe_zeilen": text.count("HTCCL-BAR1-PIPE:"),
             "vorrat_leer": "Graph-Vorrat des Ergebnisrings ist erschoepft" in text,
             "prefill_graph": pg,
@@ -108,59 +112,59 @@ def lade_belege(step_dir: str) -> dict:
     return out
 
 
-def sammle(punkte: list) -> dict:
-    """{(arm, sessions): {runde: {...}}}"""
+def collect(points: list) -> dict:
+    """{(arm, sessions): {round: {...}}}"""
     out: dict = {}
-    for p in punkte:
-        arm, runde = arm_und_runde(p.get("arm"))
+    for p in points:
+        arm, rnd = arm_and_round(p.get("arm"))
         sess = p.get("sessions")
         rate = (p.get("prefill") or {}).get("prefill_tok_s")
-        eintrag = {"prefill_tok_s": rate}
+        entry = {"prefill_tok_s": rate}
         for d in p.get("decode") or []:
             bs = d.get("batch")
-            eintrag[f"tick_tok_s_bs{bs}"] = d.get("tick_gen_tok_s_median")
-            eintrag[f"accept_bs{bs}"] = d.get("tick_accept_len_median")
-            eintrag[f"ms_verify_bs{bs}"] = d.get("tick_ms_pro_verify")
-        out.setdefault((arm, sess), {})[runde] = eintrag
+            entry[f"tick_tok_s_bs{bs}"] = d.get("tick_gen_tok_s_median")
+            entry[f"accept_bs{bs}"] = d.get("tick_accept_len_median")
+            entry[f"ms_verify_bs{bs}"] = d.get("tick_ms_pro_verify")
+        out.setdefault((arm, sess), {})[rnd] = entry
     return out
 
 
-def _mittel(werte: list):
-    werte = [w for w in werte if isinstance(w, (int, float))]
-    if not werte:
+def _mean(values: list):
+    values = [w for w in values if isinstance(w, (int, float))]
+    if not values:
         return None
-    return sum(werte) / len(werte)
+    return sum(values) / len(values)
 
 
-def _spanne_pct(werte: list):
+def _spread_pct(values: list):
     """Relative spread of repeated measurements of the SAME configuration."""
-    werte = [w for w in werte if isinstance(w, (int, float))]
-    if len(werte) < 2:
+    values = [w for w in values if isinstance(w, (int, float))]
+    if len(values) < 2:
         return None
-    m = _mittel(werte)
+    m = _mean(values)
     if not m:
         return None
-    return (max(werte) - min(werte)) / m * 100.0
+    return (max(values) - min(values)) / m * 100.0
 
 
 def _f(v, nk=1):
     return "-" if not isinstance(v, (int, float)) else format(v, f".{nk}f")
 
 
-def bericht(step_dir: str) -> str:
-    punkte = lade_punkte(step_dir)
-    daten = sammle(punkte)
-    wait = lade_wait(step_dir)
-    belege = lade_belege(step_dir)
+def report(step_dir: str) -> str:
+    points = load_points(step_dir)
+    data = collect(points)
+    wait = load_wait(step_dir)
+    evidence = load_evidence(step_dir)
 
-    arme = []
-    for arm, _ in sorted(daten):
-        if arm not in arme:
-            arme.append(arm)
-    sessions = sorted({s for _, s in daten if isinstance(s, int)})
-    runden = sorted({r for d in daten.values() for r in d})
+    arms = []
+    for arm, _ in sorted(data):
+        if arm not in arms:
+            arms.append(arm)
+    sessions = sorted({s for _, s in data if isinstance(s, int)})
+    rounds = sorted({r for d in data.values() for r in d})
 
-    zeilen = []
+    lines = []
 
     # --- noise floor first, because it decides what may be reported ---------
     # PER SESSION COUNT, not one number for the whole table. The two points
@@ -169,156 +173,160 @@ def bericht(step_dir: str) -> str:
     # not have the same repeatability. Folding them into one maximum would
     # hold the tight point (0,2-0,8 % at eight sessions) to the loose point's
     # floor and throw away real differences.
-    spannen = []
-    boden_je_sess: dict = {}
-    for (arm, sess), je_runde in sorted(daten.items()):
-        s = _spanne_pct([e.get("prefill_tok_s") for e in je_runde.values()])
+    spreads = []
+    floor_per_sess: dict = {}
+    for (arm, sess), per_round in sorted(data.items()):
+        s = _spread_pct([e.get("prefill_tok_s") for e in per_round.values()])
         if s is not None:
-            spannen.append((s, arm, sess))
-            boden_je_sess[sess] = max(boden_je_sess.get(sess, 0.0), s)
-    boden = max((s for s, _, _ in spannen), default=None)
-    median_spanne = statistics.median([s for s, _, _ in spannen]) if spannen else None
+            spreads.append((s, arm, sess))
+            floor_per_sess[sess] = max(floor_per_sess.get(sess, 0.0), s)
+    floor = max((s for s, _, _ in spreads), default=None)
+    median_spread = statistics.median([s for s, _, _ in spreads]) if spreads else None
 
-    zeilen.append("### Rauschboden (A gegen A, derselbe Arm ueber die Runden)")
-    zeilen.append("")
-    zeilen.append("| Arm | Sess. | " + " | ".join(f"R{r}" for r in runden) + " | Spanne % |")
-    zeilen.append("|---|---:|" + "---:|" * (len(runden) + 1))
-    for (arm, sess), je_runde in sorted(daten.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        werte = [je_runde.get(r, {}).get("prefill_tok_s") for r in runden]
-        zeilen.append(
-            f"| {arm} | {sess} | "
-            + " | ".join(_f(w) for w in werte)
-            + f" | {_f(_spanne_pct(werte), 2)} |"
-        )
-    zeilen.append("")
-    zeilen.append(
-        f"Groesste A-gegen-A-Spanne insgesamt: **{_f(boden, 2)} %**, "
-        f"Median der Spannen {_f(median_spanne, 2)} %. "
-        "Massstab ist aber der Boden DES JEWEILIGEN PUNKTES: "
-        + ", ".join(
-            f"{s} Session(s) {_f(b, 2)} %" for s, b in sorted(boden_je_sess.items())
-        )
-        + ". Ein Verhaeltnis, das weniger als diesen Boden von 1,000 abweicht, "
-        "ist unten mit `~` markiert und ist keine Aussage."
+    lines.append("### Noise floor (A vs. A, the same arm across the rounds)")
+    lines.append("")
+    lines.append(
+        "| Arm | Sess. | " + " | ".join(f"R{r}" for r in rounds) + " | Spread % |"
     )
-    zeilen.append("")
+    lines.append("|---|---:|" + "---:|" * (len(rounds) + 1))
+    for (arm, sess), per_round in sorted(data.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        values = [per_round.get(r, {}).get("prefill_tok_s") for r in rounds]
+        lines.append(
+            f"| {arm} | {sess} | "
+            + " | ".join(_f(w) for w in values)
+            + f" | {_f(_spread_pct(values), 2)} |"
+        )
+    lines.append("")
+    lines.append(
+        f"Largest A-vs-A spread overall: **{_f(floor, 2)} %**, "
+        f"median of the spreads {_f(median_spread, 2)} %. The yardstick, "
+        "though, is the floor OF THE POINT IN QUESTION: "
+        + ", ".join(
+            f"{s} session(s) {_f(b, 2)} %" for s, b in sorted(floor_per_sess.items())
+        )
+        + ". A ratio that differs from 1.000 by less than that floor is "
+        "marked with `~` below and is not a statement."
+    )
+    lines.append("")
 
     # --- the main table ----------------------------------------------------
-    zeilen.append("### Arm x Sessions: Prefill-Durchsatz und Verhaeltnis zu NCCL")
-    zeilen.append("")
-    kopf = "| Arm |"
-    trenn = "|---|"
+    lines.append("### Arm x sessions: prefill throughput and ratio to NCCL")
+    lines.append("")
+    head = "| Arm |"
+    sep = "|---|"
     for sess in sessions:
-        kopf += f" tok/s (s={sess}) | vs. nccl |"
-        trenn += "---:|---:|"
-    kopf += " Prefill-Graph | BAR1-Gruppen |"
-    trenn += "---|---:|"
-    zeilen.append(kopf)
-    zeilen.append(trenn)
+        head += f" tok/s (s={sess}) | vs. nccl |"
+        sep += "---:|---:|"
+    head += " prefill graph | BAR1 groups |"
+    sep += "---|---:|"
+    lines.append(head)
+    lines.append(sep)
 
-    for arm in arme:
-        zeile = f"| {arm} |"
+    for arm in arms:
+        line = f"| {arm} |"
         for sess in sessions:
-            je_runde = daten.get((arm, sess), {})
-            m = _mittel([e.get("prefill_tok_s") for e in je_runde.values()])
-            ref = _mittel(
+            per_round = data.get((arm, sess), {})
+            m = _mean([e.get("prefill_tok_s") for e in per_round.values()])
+            ref = _mean(
                 [
                     e.get("prefill_tok_s")
-                    for e in daten.get((REFERENZ, sess), {}).values()
+                    for e in data.get((REFERENCE, sess), {}).values()
                 ]
             )
             if m is None or not ref:
-                zeile += f" {_f(m)} | - |"
+                line += f" {_f(m)} | - |"
                 continue
             v = m / ref
-            marke = ""
-            grenze = boden_je_sess.get(sess)
-            if grenze is not None and abs(v - 1.0) * 100.0 < grenze:
-                marke = "~"
-            zeile += f" {_f(m)} | {marke}{v:.3f} |"
-        bel = belege.get((arm, runden[0] if runden else 1), {})
-        zeile += f" {bel.get('prefill_graph', '-')} | {bel.get('bar1_gruppen', '-')} |"
-        zeilen.append(zeile)
-    zeilen.append("")
+            mark = ""
+            limit = floor_per_sess.get(sess)
+            if limit is not None and abs(v - 1.0) * 100.0 < limit:
+                mark = "~"
+            line += f" {_f(m)} | {mark}{v:.3f} |"
+        ev = evidence.get((arm, rounds[0] if rounds else 1), {})
+        line += f" {ev.get('prefill_graph', '-')} | {ev.get('bar1_gruppen', '-')} |"
+        lines.append(line)
+    lines.append("")
 
     # --- compute / wait per rank ------------------------------------------
-    zeilen.append("### compute / wait je Rang am Primaerpunkt (sessions=8)")
-    zeilen.append("")
-    zeilen.append(
-        "| Arm | Runde | TP0 comp | TP0 wait | TP1 comp | TP1 wait | "
-        "TP2 comp | TP2 wait | gpu-ms TP1 | wait-Anteil TP1 |"
+    lines.append("### compute / wait per rank at the primary point (sessions=8)")
+    lines.append("")
+    lines.append(
+        "| Arm | Round | TP0 comp | TP0 wait | TP1 comp | TP1 wait | "
+        "TP2 comp | TP2 wait | gpu-ms TP1 | wait share TP1 |"
     )
-    zeilen.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for arm in arme:
-        for runde in runden:
-            rows = wait.get((arm, runde))
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for arm in arms:
+        for rnd in rounds:
+            rows = wait.get((arm, rnd))
             if not rows:
                 continue
-            je_rang = {r.get("rang"): r for r in rows}
-            zelle = []
-            for rang in (0, 1, 2):
-                r = je_rang.get(rang) or {}
-                zelle.append(_f(r.get("compute_ms_median")))
-                zelle.append(_f(r.get("wait_ms_median")))
-            tp1 = je_rang.get(1) or {}
-            anteil = tp1.get("wait_anteil")
-            zeilen.append(
-                f"| {arm} | {runde} | "
-                + " | ".join(zelle)
+            per_rank = {r.get("rang"): r for r in rows}
+            cells = []
+            for rank in (0, 1, 2):
+                r = per_rank.get(rank) or {}
+                cells.append(_f(r.get("compute_ms_median")))
+                cells.append(_f(r.get("wait_ms_median")))
+            tp1 = per_rank.get(1) or {}
+            share = tp1.get("wait_anteil")
+            lines.append(
+                f"| {arm} | {rnd} | "
+                + " | ".join(cells)
                 + f" | {_f(tp1.get('gpu_ms_median'))} | "
-                + (f"{anteil * 100:.1f} %" if isinstance(anteil, float) else "-")
+                + (f"{share * 100:.1f} %" if isinstance(share, float) else "-")
                 + " |"
             )
-    zeilen.append("")
+    lines.append("")
 
     # --- decode -----------------------------------------------------------
-    zeilen.append("### Decode-Ticks am selben Boot (sessions=8)")
-    zeilen.append("")
-    zeilen.append(
+    lines.append("### Decode ticks from the same boot (sessions=8)")
+    lines.append("")
+    lines.append(
         "| Arm | bs=1 tok/s | bs=1 accept | bs=16 tok/s | bs=16 accept | "
         "bs=16 ms/Verify |"
     )
-    zeilen.append("|---|---:|---:|---:|---:|---:|")
-    for arm in arme:
-        je_runde = daten.get((arm, 8), {})
-        if not je_runde:
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for arm in arms:
+        per_round = data.get((arm, 8), {})
+        if not per_round:
             continue
         def mm(key):
-            return _mittel([e.get(key) for e in je_runde.values()])
-        zeilen.append(
+            return _mean([e.get(key) for e in per_round.values()])
+        lines.append(
             f"| {arm} | {_f(mm('tick_tok_s_bs1'))} | {_f(mm('accept_bs1'), 2)} | "
             f"{_f(mm('tick_tok_s_bs16'))} | {_f(mm('accept_bs16'), 2)} | "
             f"{_f(mm('ms_verify_bs16'), 2)} |"
         )
-    zeilen.append("")
+    lines.append("")
 
     # --- evidence ---------------------------------------------------------
-    zeilen.append("### Belege je Boot")
-    zeilen.append("")
-    zeilen.append(
-        "| Arm | Runde | ERREICHT-Zeilen | BAR1-Aufbau | PIPE-Zeilen | "
-        "Vorrat leer | Prefill-Graph |"
+    lines.append("### Evidence per boot")
+    lines.append("")
+    # `ERREICHT` and `Aufbau` name the server log lines that were counted --
+    # the marker text itself, not a translated description of it.
+    lines.append(
+        "| Arm | Round | ERREICHT lines | BAR1 Aufbau | PIPE lines | "
+        "graph pool empty | prefill graph |"
     )
-    zeilen.append("|---|---:|---:|---:|---:|---|---|")
-    for arm in arme:
-        for runde in runden:
-            b = belege.get((arm, runde))
+    lines.append("|---|---:|---:|---:|---:|---|---|")
+    for arm in arms:
+        for rnd in rounds:
+            b = evidence.get((arm, rnd))
             if not b:
                 continue
-            zeilen.append(
-                f"| {arm} | {runde} | {b['erreicht']} | {b['bar1_gruppen']} | "
-                f"{b['pipe_zeilen']} | {'ja' if b['vorrat_leer'] else 'nein'} | "
+            lines.append(
+                f"| {arm} | {rnd} | {b['erreicht']} | {b['bar1_gruppen']} | "
+                f"{b['pipe_zeilen']} | {'yes' if b['vorrat_leer'] else 'no'} | "
                 f"{b['prefill_graph']} |"
             )
-    zeilen.append("")
-    return "\n".join(zeilen)
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--step-dir", required=True)
     args = ap.parse_args()
-    print(bericht(args.step_dir))
+    print(report(args.step_dir))
     return 0
 
 

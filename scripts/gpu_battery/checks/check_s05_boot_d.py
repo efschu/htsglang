@@ -57,23 +57,23 @@ def check(step_dir: str) -> None:
 
     arms = report.get("arms")
     if not isinstance(arms, list) or not arms:
-        raise CheckFail("boot_d: reseed.json hat keine arms")
+        raise CheckFail("boot_d: reseed.json has no arms")
     by_prompt = {a.get("prompt"): a for a in arms if isinstance(a, dict)}
 
     absent = [p for p in PROMPTS if p not in by_prompt]
     if absent:
-        raise CheckFail(f"boot_d: Prompts ohne Arm: {','.join(absent)}")
+        raise CheckFail(f"boot_d: prompts without an arm: {','.join(absent)}")
 
     for prompt in PROMPTS:
         row = by_prompt[prompt]
         sub = row.get("arms")
         if not isinstance(sub, dict):
-            raise CheckFail(f"boot_d/{prompt}: kein arms-Block")
+            raise CheckFail(f"boot_d/{prompt}: no arms block")
         for key in ("True", "False"):
             if key not in sub:
                 raise CheckFail(
-                    f"boot_d/{prompt}: Arm reseed={key} fehlt -- ein A/B mit einem "
-                    "Arm ist kein A/B"
+                    f"boot_d/{prompt}: arm reseed={key} is missing -- an A/B with one "
+                    "arm is not an A/B"
                 )
             arm = sub[key]
             require_number(
@@ -92,26 +92,28 @@ def check(step_dir: str) -> None:
             positions = curve_positions(arm.get("curve"))
             if positions is None:
                 raise CheckFail(
-                    f"boot_d/{prompt}/{key}: keine Accept-Positionskurve "
-                    f"(curve={arm.get('curve')!r}) -- der Mittelwert allein ist "
-                    "blind fuer eine Positions-Pathologie"
+                    f"boot_d/{prompt}/{key}: no per-position accept curve, no "
+                    f"Positionskurve (curve={arm.get('curve')!r}) -- the mean alone "
+                    "is blind to a positional pathology"
                 )
             if len(positions) < STEPS_K:
                 raise CheckFail(
-                    f"boot_d/{prompt}/{key}: Positionskurve deckt "
-                    f"{len(positions)} von {STEPS_K} Positionen ab"
+                    f"boot_d/{prompt}/{key}: Positionskurve covers "
+                    f"{len(positions)} of {STEPS_K} Positionen"
                 )
             if 0 not in positions:
-                raise CheckFail(f"boot_d/{prompt}/{key}: Position 0 fehlt in der Kurve")
+                raise CheckFail(
+                    f"boot_d/{prompt}/{key}: position 0 is missing from the curve"
+                )
         if sub["True"].get("reseed_forwards") is None:
             raise CheckFail(
-                f"boot_d/{prompt}: reseed_forwards fehlt im Re-Seed-Arm -- nicht "
-                "belegbar, dass der Arm ueberhaupt re-seedet hat"
+                f"boot_d/{prompt}: reseed_forwards is missing on the re-seed arm -- "
+                "nothing proves the arm re-seeded at all"
             )
         if not isinstance(row.get("output_identical"), bool):
             raise CheckFail(
-                f"boot_d/{prompt}: output_identical ist {row.get('output_identical')!r}, "
-                "kein Bool"
+                f"boot_d/{prompt}: output_identical is "
+                f"{row.get('output_identical')!r}, not a bool"
             )
 
     check_vram_summary(step_dir, "boot_d")

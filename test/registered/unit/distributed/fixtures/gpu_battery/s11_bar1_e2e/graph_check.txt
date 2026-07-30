@@ -1,9 +1,9 @@
 Zusammenfassung
-  BESTANDEN  [Gate]  1blk-klein
-  BESTANDEN  [Gate]  1blk-gross
-  BESTANDEN  [Info]  gitter
-  BESTANDEN  [Gate]  vorbehalt
-  BESTANDEN  [Gate]  zwei-graphen
-  BESTANDEN  [Gate]  pipe
-  GEFALLEN   [Info]  pipe-direkt  -- process 2 terminated with exit code 1
+  PASSED  [Gate]  1blk-klein
+  PASSED  [Gate]  1blk-gross
+  PASSED  [Info]  gitter
+  PASSED  [Gate]  vorbehalt
+  PASSED  [Gate]  zwei-graphen
+  PASSED  [Gate]  pipe
+  FAILED  [Info]  pipe-direkt  -- process 2 terminated with exit code 1
 Alle Gate-Faelle bestanden.

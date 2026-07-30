@@ -99,11 +99,11 @@ EOF
 }
 
 # bar1_boot_start <container path of boot script> -> echoes the host pid
-# bar1_pid_ok <string> -- wahr nur fuer eine schlichte positive Ganzzahl.
+# bar1_pid_ok <string> -- true only for a plain positive integer.
 #
-# Es gibt sie, weil ein "pid", der keiner ist, in `kill` nicht auffaellt,
-# sondern durchrutscht: `kill -0 gestartet, pid 1962637` scheitert wie ein
-# toter Prozess, und der Aufraeumpfad hielt das fuer "nichts zu tun".
+# It exists because a "pid" that is none does not stand out in `kill`, it
+# slips through: `kill -0 gestartet, pid 1962637` fails the same way a dead
+# process does, and the cleanup path took that for "nothing to do".
 bar1_pid_ok() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;
@@ -114,161 +114,160 @@ bar1_pid_ok() {
 
 # bar1_boot_start <container path of boot script> <host pidfile> -> pid on stdout
 #
-# DIE UMLEITUNG NACH STDERR IST DER PUNKT, nicht Kosmetik. `host_run_script`
-# reicht die Ausgabe des entfernten Skripts durch, und das Bootskript sagt zum
-# Schluss "gestartet, pid <n>". Der Aufrufer liest diese Funktion per
-# Kommandosubstitution -- also landete BEIDES in der Variablen:
+# THE REDIRECTION TO STDERR IS THE POINT, not cosmetics. `host_run_script`
+# passes the remote script's output through, and the boot script says
+# "gestartet, pid <n>" as its last word. The caller reads this function by
+# command substitution -- so BOTH ended up in the variable:
 #
 #     SERVER_PID='gestartet, pid 1962637
 #     1962637'
 #
-# Das ist keine Vermutung; genau so steht es in host_pids des Laufs vom
-# 2026-07-30 (31 Byte, zwei Zeilen). Die Folgen reichten weit ueber einen
-# haesslichen Wert hinaus: `host_dump_and_kill` fragte `kill -0 <dieser
-# Salat>`, bekam einen Fehler und nahm den frueher Ausstieg "da ist nichts,
-# also auch nichts zu toeten". Der Server ueberlebte JEDEN Ausgang des
-# Skripts -- Aufraeumen am Ende, trap auf EXIT, alles --, hielt die drei
-# Karten samt dmabuf-Anhaftungen, und der naechste Anlauf lief gegen ihn:
-# sein Graph-Tor bekam ENOMEM vom Halter, und sein Smoke wurde vom Server des
-# VORIGEN Anlaufs beantwortet.
+# That is not a guess; it is exactly what host_pids of the 2026-07-30 run
+# holds (31 bytes, two lines). The consequences went far beyond an ugly
+# value: `host_dump_and_kill` asked `kill -0 <that salad>`, got an error and
+# took its early exit "there is nothing there, so nothing to kill". The
+# server survived EVERY exit the script had -- cleanup at the end, the EXIT
+# trap, all of them -- held the three cards along with their dmabuf
+# attachments, and the next attempt ran against it: its graph gate got ENOMEM
+# from the holder, and its smoke was answered by the server of the PREVIOUS
+# attempt.
 #
-# Dieselbe Familie wie der r7c-Befund "load_card_order durch eine Pipe": eine
-# Funktion, die ihren Rueckgabewert ueber stdout liefert, darf auf stdout
-# nichts anderes zulassen. Es kostet ein `>&2`.
+# Same family as the r7c finding "load_card_order through a pipe": a function
+# that returns its value on stdout must not let anything else onto stdout. It
+# costs one `>&2`.
 bar1_boot_start() {
     local script="$1" hostpid="$2" pid
     host_run_script 180 "$script" >&2 || return 1
     pid="$(host_ssh_for 60 "cat $hostpid 2>/dev/null")"
     pid="${pid//[^0-9]/}"
     if ! bar1_pid_ok "$pid"; then
-        echo "kein brauchbarer Host-pid in $hostpid (gelesen: '$pid')" >&2
+        echo "kein brauchbarer Host-pid in $hostpid (read: '$pid')" >&2
         return 1
     fi
     printf '%s\n' "$pid"
     return 0
 }
 
-# bar1_altlast_pruefen <port> -- laeuft vom vorigen Anlauf noch etwas?
+# bar1_altlast_pruefen <port> -- is anything from the previous attempt still
+# running?
 #
-# EIN ssh-Umlauf, drei Fragen, keine Nebenwirkung: dieser Test toetet nichts.
-# Er benennt nur, was er findet, und der Aufrufer bricht ab. Warum nicht
-# aufraeumen: was auf diesen Karten laeuft, muss nicht von uns sein
-# (Fremdsitzung), und ein breites `pkill python` waere genau der
-# Blast-Radius, den die Rig-Regeln ausschliessen. Ein benannter Abbruch ist
-# ein Befund; ein Lauf gegen einen Zombie sind falsche Zahlen.
+# ONE ssh round trip, three questions, no side effect: this test kills
+# nothing. It only names what it finds, and the caller aborts. Why it does not
+# clean up: whatever runs on those cards need not be ours (a foreign session),
+# and a broad `pkill python` would be exactly the blast radius the rig rules
+# rule out. A named abort is a finding; a run against a zombie is wrong
+# numbers.
 #
-# Drei Tripdraehte, weil jeder allein blind ist:
-#   * der Port sagt nichts ueber Prozesse, die schon abgestuerzt sind und die
-#     Karten trotzdem halten,
-#   * die Prozessliste sagt nichts ueber einen Server, der unter anderem
-#     Namen laeuft,
-#   * der Kartenbelegung ist egal, wer sie haelt -- und genau das ist die
-#     Bedingung, an der der Aufbau der BAR1-Region wirklich haengt (der
-#     Halter meldete ENOMEM).
+# Three tripwires, because each one alone is blind:
+#   * the port says nothing about processes that have already crashed and are
+#     holding the cards anyway,
+#   * the process list says nothing about a server running under a different
+#     name,
+#   * the card occupancy does not care who holds it -- and that is exactly the
+#     condition building the BAR1 region really depends on (the holder
+#     reported ENOMEM).
 BAR1_ALTLAST_MIB="${BAR1_ALTLAST_MIB:-2000}"
 bar1_altlast_pruefen() {
-    local port="$1" bericht="${2:-}" roh belegt proc vram schlimm=""
-    # Ein Bericht von einem FRUEHEREN, gescheiterten Anlauf im selben
-    # Schrittverzeichnis darf einen jetzt sauberen Durchlauf nicht ueberleben.
-    # Genau das geschah am 2026-07-30: Anlauf 5 schrieb hier "Altlast:
-    # launch_server-Prozesse=4" (echte, damals noch sterbende Prozesse eines
-    # vorigen Anlaufs), zehn Minuten spaeter lief Anlauf 6 komplett gruen --
-    # aber compose() las denselben, nie geleerten Bericht und entwertete den
-    # gruenen Lauf mit einem Befund, der zu einem laengst abgeschlossenen
-    # Anlauf gehoerte. Das Verdikt eines Laufs kommt aus SEINEN EIGENEN
-    # Artefakten, nie aus einer Reste von einem anderen. Erst raeumen, dann
-    # pruefen; geschrieben wird der Bericht unten nur wieder, wenn DIESER
-    # Durchlauf selbst etwas findet.
-    [ -n "$bericht" ] && rm -f "$bericht"
-    roh="$(host_ssh_for 90 "
+    local port="$1" report="${2:-}" raw busy proc vram bad=""
+    # A report from an EARLIER, failed attempt in the same step directory must
+    # not survive into a run that is now clean. That is exactly what happened
+    # on 2026-07-30: attempt 5 wrote "Altlast:launch_server-Prozesse=4" here
+    # (real processes of a previous attempt, still dying at the time), ten
+    # minutes later attempt 6 ran fully green -- but compose() read the same
+    # report, never cleared, and devalued the green run with a finding that
+    # belonged to an attempt long since finished. A run's verdict comes out of
+    # ITS OWN artifacts, never out of a remnant of another one. Clear first,
+    # then check; the report below is only written again if THIS run finds
+    # something itself.
+    [ -n "$report" ] && rm -f "$report"
+    raw="$(host_ssh_for 90 "
         echo \"PORT=\$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
                         | grep -c ':$port ' )\";
         echo \"PROC=\$(pgrep -c -f '[s]glang.launch_server' 2>/dev/null || echo 0)\";
-        # Bracket-Idiom [s]glang statt sglang: pgrep -f matcht gegen die volle
-        # Kommandozeile, und die eigene ssh-Session traegt das Suchmuster als
-        # Text (dieser hier eingebettete Heredoc). Ohne die Klammer zaehlt
-        # sich die Pruefung selbst mit und meldet Alt-Prozesse auf einem
-        # leeren Host.
+        # Bracket idiom [s]glang instead of the plain name: pgrep -f matches
+        # against the full command line, and our own ssh session carries the
+        # search pattern as text (this embedded heredoc). Without the bracket
+        # the check counts itself and reports leftover processes on an empty
+        # host.
         echo \"VRAM=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
                        2>/dev/null | tr '\n' ',')\";
     " 2>/dev/null)" || {
-        echo "STOP: Altlast-Pruefung nicht durchfuehrbar (Host nicht erreichbar)" >&2
+        echo "STOP: leftover check not possible (host not reachable)" >&2
         return 2
     }
-    belegt="$(printf '%s\n' "$roh" | sed -n 's/^PORT=//p' | tail -1)"
-    proc="$(printf '%s\n' "$roh" | sed -n 's/^PROC=//p' | tail -1)"
-    vram="$(printf '%s\n' "$roh" | sed -n 's/^VRAM=//p' | tail -1)"
-    [ -n "$belegt" ] || belegt=0
+    busy="$(printf '%s\n' "$raw" | sed -n 's/^PORT=//p' | tail -1)"
+    proc="$(printf '%s\n' "$raw" | sed -n 's/^PROC=//p' | tail -1)"
+    vram="$(printf '%s\n' "$raw" | sed -n 's/^VRAM=//p' | tail -1)"
+    [ -n "$busy" ] || busy=0
     [ -n "$proc" ] || proc=0
 
-    [ "$belegt" -gt 0 ] 2>/dev/null && schlimm="$schlimm Port-$port-belegt"
-    [ "$proc" -gt 0 ] 2>/dev/null && schlimm="$schlimm launch_server-Prozesse=$proc"
+    [ "$busy" -gt 0 ] 2>/dev/null && bad="$bad Port-$port-belegt"
+    [ "$proc" -gt 0 ] 2>/dev/null && bad="$bad launch_server-Prozesse=$proc"
     local i=0 mib
     local IFS=,
     for mib in $vram; do
         mib="${mib// /}"
         [ -z "$mib" ] && continue
         if [ "$mib" -gt "$BAR1_ALTLAST_MIB" ] 2>/dev/null; then
-            schlimm="$schlimm GPU$i=${mib}MiB"
+            bad="$bad GPU$i=${mib}MiB"
         fi
         i=$((i + 1))
     done
     unset IFS
 
-    if [ -n "$schlimm" ]; then
-        echo "STOP: Altlast von einem vorherigen Anlauf --$schlimm" >&2
-        echo "Die Karten oder der Port sind nicht frei. Ein Lauf dagegen misst" >&2
-        echo "den alten Server, nicht diesen. Erst aufraeumen (nur EIGENE pids" >&2
-        echo "aus host_pids), dann neu starten." >&2
-        [ -n "$bericht" ] && printf 'Altlast:%s\n' "$schlimm" > "$bericht"
+    if [ -n "$bad" ]; then
+        echo "STOP: Altlast von einem vorherigen Anlauf --$bad" >&2
+        echo "The cards or the port are not free. A run against that measures" >&2
+        echo "the old server, not this one. Clean up first (only OUR OWN pids" >&2
+        echo "from host_pids), then start again." >&2
+        [ -n "$report" ] && printf 'Altlast:%s\n' "$bad" > "$report"
         return 1
     fi
-    echo "Altlast-Pruefung: Port frei, keine launch_server-Prozesse, Karten unter ${BAR1_ALTLAST_MIB} MiB"
+    echo "leftover check: port free, no launch_server processes, cards below ${BAR1_ALTLAST_MIB} MiB"
     return 0
 }
 
 # bar1_kill_host_server <pid or empty> <host pidfile> <dump path>
 #
-# Der Aufraeumpfad, und er hat ZWEI Quellen fuer den pid. Die Variable des
-# Aufrufers ist die erste; stirbt das Skript zwischen Boot und Zuweisung, ist
-# sie leer, waehrend auf dem Host laengst ein Server laeuft -- dann gilt die
-# Pidfile, die das Bootskript selbst geschrieben hat. Ohne die zweite Quelle
-# ist genau das Zeitfenster ein Leck.
+# The cleanup path, and it has TWO sources for the pid. The caller's variable
+# is the first; if the script dies between boot and assignment it is empty
+# while a server has long been running on the host -- then the pidfile the
+# boot script wrote itself applies. Without the second source that very window
+# is a leak.
 BAR1_KILL_NACHSCHAU_TIMEOUT_S="${BAR1_KILL_NACHSCHAU_TIMEOUT_S:-15}"
 BAR1_KILL_NACHSCHAU_POLL_S="${BAR1_KILL_NACHSCHAU_POLL_S:-1}"
 bar1_kill_host_server() {
-    local pid="${1:-}" hostpid="${2:-}" dump="${3:-}" datei_pid=""
+    local pid="${1:-}" hostpid="${2:-}" dump="${3:-}" file_pid=""
     if ! bar1_pid_ok "$pid" && [ -n "$hostpid" ]; then
-        datei_pid="$(host_ssh_for 60 "cat $hostpid 2>/dev/null")" || datei_pid=""
-        datei_pid="${datei_pid//[^0-9]/}"
-        bar1_pid_ok "$datei_pid" && pid="$datei_pid"
+        file_pid="$(host_ssh_for 60 "cat $hostpid 2>/dev/null")" || file_pid=""
+        file_pid="${file_pid//[^0-9]/}"
+        bar1_pid_ok "$file_pid" && pid="$file_pid"
     fi
     bar1_pid_ok "$pid" || return 0
     host_dump_and_kill "$pid" "${dump:-/dev/null}"
-    # NACHSEHEN, bounded. Ein Kill, den niemand nachprueft, ist eine Absicht --
-    # aber eine SOFORTIGE, einmalige Nachschau ist blind gegen die normale
-    # Zeitspanne zwischen SIGTERM und dem tatsaechlichen Verschwinden aus der
-    # Prozessliste. Genau dieser Lag war die Ursache, als ein noch
-    # sterbender (nicht mehr lebender, nur noch nicht abgemeldeter) Server
-    # den naechsten Anlauf an dessen Altlast-Pruefung haengen liess: die
-    # Nachschau urteilte sofort "lebt noch", ohne der normalen Ausstiegszeit
-    # eine Chance zu geben. Bounded gewartet statt sofort geurteilt --
-    # stirbt der Prozess innerhalb der Frist, gilt er als abgeraeumt; stirbt
-    # er NICHT, bleibt es bei der ehrlichen (und immer schon vom Aufrufer
-    # nicht als Lauf-STOP behandelten) Meldung "lebt noch".
-    local versuche=$(( BAR1_KILL_NACHSCHAU_TIMEOUT_S / BAR1_KILL_NACHSCHAU_POLL_S ))
-    [ "$versuche" -lt 1 ] && versuche=1
+    # LOOK AFTERWARDS, bounded. A kill nobody verifies is an intention -- but
+    # an IMMEDIATE, one-shot look is blind to the normal span between SIGTERM
+    # and the actual disappearance from the process list. That lag was the
+    # cause when a still-dying server (no longer alive, just not yet
+    # deregistered) left the next attempt hanging at its leftover check: the
+    # look judged "still alive" straight away, without giving the normal exit
+    # time a chance. Bounded waiting instead of judging on the spot -- if the
+    # process dies within the deadline it counts as cleaned up; if it does
+    # NOT, the honest report "still alive" stands (and the caller has never
+    # treated that as a STOP for the run).
+    local tries=$(( BAR1_KILL_NACHSCHAU_TIMEOUT_S / BAR1_KILL_NACHSCHAU_POLL_S ))
+    [ "$tries" -lt 1 ] && tries=1
     local i=0
     while host_ssh_for 60 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; do
         i=$((i + 1))
-        if [ "$i" -ge "$versuche" ]; then
-            echo "WARNUNG: Host-pid $pid lebt nach dem Abraeumen noch (nach ~${BAR1_KILL_NACHSCHAU_TIMEOUT_S}s Wartefrist)." >&2
-            echo "Der naechste Anlauf wird an der Altlast-Pruefung haengen bleiben." >&2
+        if [ "$i" -ge "$tries" ]; then
+            echo "WARNING: host pid $pid lebt nach dem Abraeumen noch (after ~${BAR1_KILL_NACHSCHAU_TIMEOUT_S}s grace period)." >&2
+            echo "The next attempt will hang at the leftover check." >&2
             return 1
         fi
         sleep "$BAR1_KILL_NACHSCHAU_POLL_S"
     done
-    echo "Host-Server $pid abgeraeumt."
+    echo "host server $pid abgeraeumt."
     return 0
 }
 
@@ -285,10 +284,10 @@ bar1_require_integration() {
         [ -f "$wt/$f" ] || missing="$missing $f"
     done
     if [ -n "$missing" ]; then
-        echo "STOP: BAR1-Integration fehlt in $wt --$missing" >&2
-        echo "BAR1_HOST_WT auf den Arbeitsbaum mit der BAR1-Integration setzen." >&2
+        echo "STOP: BAR1 integration missing in $wt --$missing" >&2
+        echo "Point BAR1_HOST_WT at the worktree that has the BAR1 integration." >&2
         if [ -n "${BATTERY_STEP_DIR:-}" ]; then
-            printf 'fehlt in %s:%s\n' "$wt" "$missing" \
+            printf 'missing in %s:%s\n' "$wt" "$missing" \
                 > "$BATTERY_STEP_DIR/integration_missing.txt"
         fi
         return 2

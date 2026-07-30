@@ -20,8 +20,8 @@ validation of the register:
   suspend  #89 suspend, for cold_lane.
 
 WHY THE LATENCY NUMBERS MATTER MORE THAN THE PASS: every auto/ram default in
-the register carries a measurement obligation ("Messpflicht vor jedem
-auto/ram-Default"). Until a class has a measured retrieval latency, its
+the register carries a measurement obligation ("measure before every
+auto/ram default"). Until a class has a measured retrieval latency, its
 latency term for the #279 dispatcher is a guess, and a guessed latency term
 silently decides placements. This step produces those numbers; it does not
 decide the defaults.
@@ -187,7 +187,9 @@ def maybe_reexec_for_memory_saver(
         # Preloading a hook whose libcudart cannot be resolved does not fail
         # the probe, it fails the INTERPRETER (rc 127, no artifact at all).
         # Reporting the two routes as untested is the honest answer.
-        return "unavailable: libcudart des Hooks nicht auffindbar"
+        # The prefix "unavailable: libcudart" is asserted on by
+        # test_gpu_battery_checks.py.
+        return "unavailable: libcudart of the hook could not be located"
     environ["LD_PRELOAD"] = f"{path}:{preloaded}" if preloaded else path
     lib_path = environ.get("LD_LIBRARY_PATH", "")
     if libdir not in lib_path.split(":"):
@@ -227,7 +229,7 @@ class _DryRunEnv:
         self.device_index = 0
         self.device_info = {
             "cuda_index": None,
-            "name": "dry-run (keine Karte)",
+            "name": "dry-run (no card)",
             "pci_bus_id": None,
             "total_mib": None,
         }
@@ -252,7 +254,7 @@ class _CudaEnv:
 
         self._torch = torch
         if not torch.cuda.is_available():
-            raise RuntimeError("torch.cuda nicht verfuegbar")
+            raise RuntimeError("torch.cuda not available")
 
         # The card is resolved, never assumed. The biggest one carries the
         # test because it is the only one with room for three parked items at
@@ -549,30 +551,31 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--out",
-        help="Artefaktpfad; ausserhalb von --dry-run erforderlich",
+        help="artifact path; required outside of --dry-run",
     )
     ap.add_argument("--cycles", type=int, default=CYCLES)
     ap.add_argument("--item-mib", type=int, default=ITEM_BYTES // MIB)
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="ganzer Ablauf gegen FakeDeviceOps, ohne Karte (Planphase)",
+        help="the whole run against FakeDeviceOps, without a card (plan phase)",
     )
     args = ap.parse_args(argv)
     if not args.dry_run and not args.out:
-        ap.error("--out wird ausserhalb von --dry-run benoetigt")
+        ap.error("--out is required outside of --dry-run")
 
     sys.path.insert(0, repo_python_path())
 
     if args.dry_run:
         print(
-            "Plan: eine Karte (die groesste, zur Laufzeit per PCI aufgeloest), "
-            "CudaDeviceOps + RealMovementBackend; je Route (tensor|tag|suspend) "
-            f"ein Posten von {args.item_mib} MiB, {args.cycles} park/wave_in-Zyklen, "
-            "p50/p99 je Klasse; echte Groessen ueber resolve_size_bytes; "
-            f"expliziter Park ueber die Klassen-Policy '{MEASUREMENT_CLASS_POLICY}' "
-            "plus Negativkontrolle (auto ohne Druck muss verweigern). "
-            "Dieser Lauf fuehrt genau das gegen FakeDeviceOps aus -- ohne Karte."
+            "Plan: one card (the biggest, resolved at runtime over PCI), "
+            "CudaDeviceOps + RealMovementBackend; per route "
+            f"(tensor|tag|suspend) one item of {args.item_mib} MiB, "
+            f"{args.cycles} park/wave_in cycles, p50/p99 per class; real sizes "
+            "through resolve_size_bytes; explicit park through the class "
+            f"policy '{MEASUREMENT_CLASS_POLICY}' plus a Negativkontrolle "
+            "(auto without pressure must refuse). This run does exactly that "
+            "against FakeDeviceOps -- without a card."
         )
         env = _DryRunEnv()
     else:
@@ -593,7 +596,7 @@ def main(argv=None) -> int:
             f.write("\n")
 
     print(
-        f"{'Klasse':<18} {'Route':<8} {'MiB':>6} {'park p50':>9} {'wave p50':>9} {'GB/s':>7}"
+        f"{'class':<18} {'route':<8} {'MiB':>6} {'park p50':>9} {'wave p50':>9} {'GB/s':>7}"
     )
     for row in payload["rows"]:
         print(
@@ -604,12 +607,12 @@ def main(argv=None) -> int:
         )
     control = payload["negative_control"]
     print(
-        f"Negativkontrolle (auto ohne Druck): "
-        f"{'verweigert' if control['refused'] else 'NICHT verweigert'} "
+        f"Negativkontrolle (auto without pressure): "
+        f"{'refused' if control['refused'] else 'did NOT refuse'} "
         f"-- {control['error']}"
     )
     if args.out:
-        print(f"geschrieben: {args.out}")
+        print(f"written: {args.out}")
     return 0
 
 

@@ -30,17 +30,17 @@ source ./battery_common.sh
 source ./battery_host.sh
 source ./_bar1_host_boot.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing}"
 PORT="${BAR1_PORT}"
 POINT_S="${S13_POINT_SECONDS:-15}"
 WARMUP_S="${S13_WARMUP_SECONDS:-8}"
 PROMPT_TOKENS="${S13_PROMPT_TOKENS:-2048}"
-RUNDEN="${S13_RUNDEN:-2}"
+ROUNDS="${S13_RUNDEN:-2}"
 # The round number goes into the arm label, so a run that continues an earlier
 # one must not restart the count and overwrite its points.
-RUNDE_START="${S13_RUNDE_START:-1}"
+ROUND_START="${S13_RUNDE_START:-1}"
 # sessions:with_decode, in the order they run inside one boot.
-PUNKTE="${S13_PUNKTE:-1:0 8:1}"
+POINTS="${S13_PUNKTE:-1:0 8:1}"
 
 # name | transport arm | extra env | extra server args
 #
@@ -62,7 +62,7 @@ PUNKTE="${S13_PUNKTE:-1:0 8:1}"
 # and the number of eager slots is SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER instead of
 # a constant. How many the standard run needs is still UNMEASURED -- read
 # `erg_eager_voll` in the log before raising it.
-ARME_TABELLE=(
+ARM_TABLE=(
     "nccl|grundlinie||"
     "bar1|bar1||"
     "bar1pipe|bar1|SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT=0|"
@@ -86,28 +86,28 @@ ARME_TABELLE=(
     "ncclcp4096a|grundlinie||--chunked-prefill-size 4096 --rank-auto-reserve-mib auto"
     "ncclpg|grundlinie||--cuda-graph-backend-prefill breakable"
     "bar1pg|bar1||--cuda-graph-backend-prefill breakable"
-    # --- Prefill-Graph mit einer Reserve, die ihn auch bezahlt --------------
-    # Die vier Arme oben teilen sich `--rank-auto-reserve-mib 3000,2700,2700`.
-    # Diese Pins stammen aus einem Rezept OHNE Prefill-Graphen, und der Graph
-    # laesst sich zwar einschalten, aber nicht daraus bezahlen: beide
-    # pg-Arme kommen bis `Capture target prefill CUDA graph` und sterben dort
-    # an einem OOM auf einer 20-GB-Karte. Eine hoehere Reserve verschiebt
-    # Speicher aus dem KV-Pool in den Laufzeitanteil und ist damit NICHT mit
-    # den Armen oben vergleichbar -- deshalb bringt dieser Block seine EIGENEN
-    # zwei Kontrollarme mit, die sich von den pg-Armen in nichts als dem
-    # Prefill-Graphen unterscheiden. Verglichen wird innerhalb des Blocks.
-    # Das zweite Vorkommen von --rank-auto-reserve-mib gewinnt (argparse).
+    # --- prefill graph with a reserve that actually pays for it -------------
+    # The four arms above share `--rank-auto-reserve-mib 3000,2700,2700`. Those
+    # pins come from a recipe WITHOUT a prefill graph, and while the graph can
+    # be switched on, it cannot be paid for out of that: both pg arms get as
+    # far as `Capture target prefill CUDA graph` and die there in an OOM on a
+    # 20 GB card. A larger reserve moves memory out of the KV pool into the
+    # runtime share and is therefore NOT comparable with the arms above --
+    # which is why this block brings its OWN two control arms, differing from
+    # the pg arms in nothing but the prefill graph. The comparison happens
+    # inside the block. The second occurrence of --rank-auto-reserve-mib wins
+    # (argparse).
     "nccl_hi|grundlinie||--rank-auto-reserve-mib 4500,4200,4200"
     "bar1_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200"
     "ncclpg_hi|grundlinie||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
-    # Der Vorbehalt ist gefallen: seine Vorgabe kommt seit den Hebel-Fixes
-    # aus SGLANG_HTCCL_GRAPH_FREIGABE, und die steht in jedem bar1-Boot.
-    # `bar1pg_hi` ist damit der Arm MIT gitter; der Kontrollarm daneben holt
-    # den Vorbehalt ausdruecklich zurueck. Die Rollen der beiden Zeilen sind
-    # gegenueber dem Lauf vom 2026-07-30 also vertauscht, die Zahlen bleiben
-    # vergleichbar: bar1pg_hi entspricht dem damaligen bar1pggitter_hi
-    # (1576,0 / 1337,2), bar1pgvorbehalt_hi dem damaligen bar1pg_hi
-    # (1321,6 / 1151,6).
+    # The reservation is gone: since the lever fixes its default comes from
+    # SGLANG_HTCCL_GRAPH_FREIGABE, and that is set in every bar1 boot.
+    # `bar1pg_hi` is therefore the arm WITH the grid; the control arm next to
+    # it explicitly puts the reservation back. The roles of the two rows are
+    # thus swapped relative to the 2026-07-30 run, while the numbers stay
+    # comparable: bar1pg_hi corresponds to the bar1pggitter_hi of back then
+    # (1576.0 / 1337.2), bar1pgvorbehalt_hi to the bar1pg_hi of back then
+    # (1321.6 / 1151.6).
     "bar1pg_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
     "bar1pgvorbehalt_hi|bar1|SGLANG_HTCCL_BAR1_GRAPH_GITTER=0|--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
 )
@@ -120,11 +120,11 @@ DRIVER_HOST="$(host_path "$BATTERY_DIR/s12_prefill_kurve.py")" || exit 2
 ANALYSE_HOST="$(host_path "$BATTERY_DIR/s12_log_analyse.py")" || exit 2
 
 if ! host_reachable; then
-    echo "STOP: Host $BAR1_HOST nicht erreichbar"; exit 2
+    echo "STOP: host $BAR1_HOST not reachable"; exit 2
 fi
 if ! bar1_require_integration; then exit 2; fi
 if ! host_locks_acquire "${BATTERY_STEP:-s13}"; then
-    echo "STOP: Host-Locks nicht zu bekommen"
+    echo "STOP: host locks not obtainable"
     echo "Host-Locks fremd gehalten -- nicht gebrochen" > "$DIR/blocked.txt"
     exit 2
 fi
@@ -143,17 +143,17 @@ s13_warte_auf_server() {  # $1 = port, $2 = host pid, $3 = budget_s
     while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
         if host_ssh_for 40 "curl -sf -m 5 http://127.0.0.1:$port/health >/dev/null" \
             >/dev/null 2>&1; then
-            echo "Host-Server oben nach $(( $(date +%s) - t0 ))s"
+            echo "host server up after $(( $(date +%s) - t0 ))s"
             return 0
         fi
         if ! host_ssh_for 40 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; then
-            echo "Host-Server $pid ist gestorben, bevor er antwortete " \
-                 "(nach $(( $(date +%s) - t0 ))s)" >&2
+            echo "host server $pid died before it ever answered " \
+                 "(after $(( $(date +%s) - t0 ))s)" >&2
             return 2
         fi
         sleep 10
     done
-    echo "Host-Server nicht oben in ${budget}s" >&2
+    echo "host server not up within ${budget}s" >&2
     return 1
 }
 
@@ -178,13 +178,13 @@ set -uo pipefail
 EOF
 chmod +x "$DIR/remote_messen.sh"
 
-FOLGE=0
-ABBRUCH=""
+SEQ=0
+ABORT=""
 
-for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
-    for ZEILE in "${ARME_TABELLE[@]}"; do
-        NAME="${ZEILE%%|*}"
-        REST="${ZEILE#*|}"
+for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
+    for ROW in "${ARM_TABLE[@]}"; do
+        NAME="${ROW%%|*}"
+        REST="${ROW#*|}"
         TARM="${REST%%|*}"
         REST="${REST#*|}"
         EENV="${REST%%|*}"
@@ -194,30 +194,30 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             case " $S13_NUR " in *" $NAME "*) ;; *) continue ;; esac
         fi
 
-        ARM="${NAME}_r${RUNDE}"
-        FOLGE=$((FOLGE + 1))
+        ARM="${NAME}_r${ROUND}"
+        SEQ=$((SEQ + 1))
         HOSTLOG="$BAR1_HOST_LOGDIR/s13.$ARM.log"
         HOSTPID="$BAR1_HOST_LOGDIR/s13.$ARM.pid"
-        echo "== [$FOLGE] Runde $RUNDE, Arm $NAME (Transport $TARM) =="
+        echo "== [$SEQ] round $ROUND, arm $NAME (transport $TARM) =="
 
         # No run against the leftovers of the previous boot -- with this many
         # boots a stale server would silently answer for several arms.
         if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
-            ABBRUCH="Altlast vor $ARM"; break
+            ABORT="leftover server before $ARM"; break
         fi
 
         BAR1_EXTRA_ENV="$EENV" BAR1_EXTRA_ARGS="$EARGS" \
             bar1_write_boot_script "$DIR/remote_boot_${ARM}.sh" "$TARM" \
                 "$HOSTLOG" "$HOSTPID" "$PORT" \
-            || { ABBRUCH="Bootskript $ARM"; break; }
+            || { ABORT="boot script $ARM"; break; }
 
         SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_${ARM}.sh" "$HOSTPID")" \
             || SERVER_PID=""
         if ! bar1_pid_ok "$SERVER_PID"; then
             SERVER_PID=""
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}.tail.txt" 200
-            echo "ohne pid" > "$DIR/logs/${ARM}.bootfehler.txt"
-            echo "  ARM UEBERSPRUNGEN: Server-Start ohne pid"
+            echo "no pid" > "$DIR/logs/${ARM}.bootfehler.txt"
+            echo "  ARM SKIPPED: server start without a pid"
             continue
         fi
         echo "$SERVER_PID" >> "$DIR/host_pids"
@@ -236,19 +236,19 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             bar1_kill_host_server "$SERVER_PID" "$HOSTPID" \
                 "$DIR/pyspy-host-$SERVER_PID.txt" || true
             SERVER_PID=""
-            echo "  ARM UEBERSPRUNGEN: Server nicht oben (Grund in logs/${ARM}.bootfehler.txt)"
+            echo "  ARM SKIPPED: server never came up (reason in logs/${ARM}.bootfehler.txt)"
             sleep 20
             continue
         fi
 
-        # ERREICHT= per group BEFORE any number: an arm whose second
+        # ACHIEVED= per group BEFORE any number: an arm whose second
         # communicator group quietly fell back is a mixed point, not a point.
         # The prefill-graph lines go into the same file -- an arm that asks for
         # the prefill graph and silently does not get it would otherwise be
         # reported as a prefill-graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "HTCCL-BAR1-PIPE:" \
             "Disable prefill CUDA graph" \
@@ -258,16 +258,16 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
             "waehrend einer CUDA-Graph-Aufzeichnung"
 
         MRC=0
-        for P in $PUNKTE; do
+        for P in $POINTS; do
             N="${P%%:*}"
             WD="${P##*:}"
-            echo "   Punkt sessions=$N decode=$WD"
-            host_run_script 900 "$DIR/remote_messen.sh" "$ARM" "$N" "$FOLGE" \
+            echo "   point sessions=$N decode=$WD"
+            host_run_script 900 "$DIR/remote_messen.sh" "$ARM" "$N" "$SEQ" \
                 "$HOSTLOG" "$WD" >> "$DIR/messen.log" 2>&1
             MRC=$?
             [ "$MRC" != 0 ] && break
         done
-        echo "  Messung rc=$MRC"
+        echo "  measurement rc=$MRC"
 
         host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}.fatal.txt" \
             "CUDA out of memory" "torch.OutOfMemoryError" "NCCL error" \
@@ -295,19 +295,19 @@ for RUNDE in $(seq "$RUNDE_START" $((RUNDE_START + RUNDEN - 1))); do
         # chunked_prefill_size=2048 and the GDN prefill scratch scales with the
         # chunk. Both halves of that are results.
         if [ "$MRC" != 0 ]; then
-            printf 'Messung rc=%s\n' "$MRC" > "$DIR/logs/${ARM}.messfehler.txt"
-            echo "  PUNKT FEHLT: Messung rc=$MRC (Grund in logs/${ARM}.fatal.txt)"
+            printf 'measurement rc=%s\n' "$MRC" > "$DIR/logs/${ARM}.messfehler.txt"
+            echo "  POINT MISSING: measurement rc=$MRC (reason in logs/${ARM}.fatal.txt)"
         fi
     done
-    [ -n "$ABBRUCH" ] && break
-    echo "== Runde $RUNDE fertig =="
+    [ -n "$ABORT" ] && break
+    echo "== round $ROUND done =="
 done
 
 cleanup
 trap - EXIT INT TERM
 
-if [ -n "$ABBRUCH" ]; then
-    echo "abgebrochen: $ABBRUCH" | tee "$DIR/abbruch.txt"
+if [ -n "$ABORT" ]; then
+    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
     exit 1
 fi
 exit 0

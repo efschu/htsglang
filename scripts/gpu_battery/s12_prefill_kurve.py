@@ -54,20 +54,27 @@ from s12_log_analyse import (  # noqa: E402  one parser, one place
 )
 
 KIND = "bar1_prefill_kurve"
-SCHEMA_VERSION = 1
+#: 2: the per-point transport evidence under `gruppen` renamed its keys from
+#: German to English (`gruppe`/`angefordert`/`erreicht` ->
+#: `group`/`requested`/`achieved`), in step with s11_bar1_e2e.RE_GROUP and
+#: htccl.py's report_state(). A schema-1 artifact spells them in German, so
+#: every point would read back as having no HTCCL group at all -- which the
+#: arm check would misread as "baseline". Rejecting it by version is the
+#: point: re-run the step rather than read a stale artifact.
+SCHEMA_VERSION = 2
 
 # The baseline over the host path, from MESSUNG_PREFILL_ANTEIL.md and
 # 02_WAS_ERREICHT_IST.md: "1190/1097/1144/1105/1122 tok/s" over 1, 2, 4, 8 and
 # 16 sessions. The three published points are 1190,7 / 1143,7 / 1122,4 at 1, 4
 # and 16; 1097 and 1105 are the two that were filled in afterwards, which fixes
 # the mapping of the five numbers to the five session counts.
-GRUNDLINIE_BEKANNT = {1: 1190.7, 2: 1097.0, 4: 1143.7, 8: 1105.0, 16: 1122.4}
-GRUNDLINIE_QUELLE = (
-    "MESSUNG_PREFILL_ANTEIL.md / 02_WAS_ERREICHT_IST.md (Host-Weg, NCCL, "
-    "Qwen3.6-27B-FP8 tp3, Rauschboden 0,47 %)"
+BASELINE_KNOWN = {1: 1190.7, 2: 1097.0, 4: 1143.7, 8: 1105.0, 16: 1122.4}
+BASELINE_SOURCE = (
+    "MESSUNG_PREFILL_ANTEIL.md / 02_WAS_ERREICHT_IST.md (host path, NCCL, "
+    "Qwen3.6-27B-FP8 tp3, noise floor 0.47 %)"
 )
 
-ARME = ("bar1", "grundlinie")
+ARMS = ("bar1", "grundlinie")
 DECODE_BATCHES = (1, 16)
 
 
@@ -85,13 +92,17 @@ def _decode_batches(args) -> tuple:
         return DECODE_BATCHES
     return tuple(int(part.strip()) for part in str(raw).split(",") if part.strip())
 
-PROSA = (
+# The prompt and the filler corpus stay GERMAN on purpose: they are
+# measurement input, not prose. Both arms have to see byte-identical prompts,
+# and every recorded output_sample of every past run was generated from
+# exactly these bytes -- translating them would silently change the workload.
+PROSE = (
     "Erklaere in ruhigem, sachlichem Ton, wie ein Rechner mehrere Aufgaben "
     "gleichzeitig bearbeitet, und woran man merkt, dass er dabei an eine "
     "Grenze stoesst."
 )
 
-_WORTE = (
+_WORDS = (
     "die messung zeigt einen deutlichen unterschied zwischen der erwartung und "
     "dem befund auf dieser maschine denn der weg ueber den hauptspeicher kostet "
     "zeit die niemand sieht solange die karten wenig zu tun haben und erst unter "
@@ -155,7 +166,7 @@ def _flush_cache(port: int) -> str:
                 return f"{path}:{resp.status}"
         except (urllib.error.URLError, OSError) as exc:
             return f"{path}:{exc}"
-    return "nicht aufgerufen"
+    return "not called"
 
 
 def _prompt(unique: str, target_tokens: int) -> str:
@@ -165,7 +176,7 @@ def _prompt(unique: str, target_tokens: int) -> str:
     (session, round); unique so the radix cache cannot serve any of it."""
     rng = random.Random(unique)
     words = int(target_tokens / 1.3)
-    body = " ".join(rng.choice(_WORTE) for _ in range(words))
+    body = " ".join(rng.choice(_WORDS) for _ in range(words))
     return f"[{unique}] {body}"
 
 
@@ -174,13 +185,13 @@ def _prompt(unique: str, target_tokens: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def messe_prefill(
+def measure_prefill(
     port: int, arm: str, sessions: int, seconds: float, target_tokens: int
 ) -> dict:
     rows: list = []
     lock = threading.Lock()
     stop_at = time.monotonic() + seconds
-    fehler: list = []
+    errors: list = []
 
     def worker(slot: int) -> None:
         i = 0
@@ -200,7 +211,7 @@ def messe_prefill(
                 answer = _post(port, "/v1/chat/completions", payload, timeout=180)
             except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
                 with lock:
-                    fehler.append(f"{type(exc).__name__}: {exc}")
+                    errors.append(f"{type(exc).__name__}: {exc}")
                 return
             t1 = time.monotonic()
             usage = answer.get("usage") or {}
@@ -221,32 +232,32 @@ def messe_prefill(
     for t in threads:
         t.join(timeout=seconds + 240)
 
-    gute = [r for r in rows if isinstance(r.get("prompt_tokens"), int)]
-    if not gute:
+    good = [r for r in rows if isinstance(r.get("prompt_tokens"), int)]
+    if not good:
         return {
             "requests": 0,
             "prefill_tok_s": None,
-            "fehler": fehler[:3] or ["keine Antwort mit prompt_tokens"],
+            "fehler": errors[:3] or ["no answer carrying prompt_tokens"],
         }
-    erste = min(r["start"] for r in gute)
-    letzte = max(r["ende"] for r in gute)
-    wall = letzte - erste
-    tokens = sum(r["prompt_tokens"] for r in gute)
-    latenzen = sorted((r["ende"] - r["start"]) * 1000.0 for r in gute)
+    first = min(r["start"] for r in good)
+    last = max(r["ende"] for r in good)
+    wall = last - first
+    tokens = sum(r["prompt_tokens"] for r in good)
+    latencies = sorted((r["ende"] - r["start"]) * 1000.0 for r in good)
     return {
-        "requests": len(gute),
+        "requests": len(good),
         "prompt_tokens_total": tokens,
-        "prompt_tokens_mean": tokens / len(gute),
+        "prompt_tokens_mean": tokens / len(good),
         "wall_s": wall,
         "prefill_tok_s": (tokens / wall) if wall > 0 else None,
-        "latenz_ms_p50": statistics.median(latenzen),
-        "latenz_ms_max": latenzen[-1],
-        "fehler": fehler[:3],
-        "roh": gute,
+        "latenz_ms_p50": statistics.median(latencies),
+        "latenz_ms_max": latencies[-1],
+        "fehler": errors[:3],
+        "roh": good,
     }
 
 
-def ernte_ticks(server_log: str, von: float, bis: float, batch: int) -> dict:
+def ernte_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
     """The scheduler's own decode ticks for the window a decode point ran in.
 
     Why this exists at all. The request level and the tick level answer two
@@ -275,12 +286,12 @@ def ernte_ticks(server_log: str, von: float, bis: float, batch: int) -> dict:
     # Prefixed, because `ms_pro_token` exists on both levels and an unprefixed
     # merge would silently replace the request-level number with the tick one --
     # exactly the conflation this fix is about.
-    agg = decode_tick_aggregat(im_fenster(ticks, von, bis), batch)
+    agg = decode_tick_aggregat(im_fenster(ticks, start, end), batch)
     out.update({f"tick_{k}": v for k, v in agg.items()})
     return out
 
 
-def messe_decode(port: int, batch: int, seconds: float) -> dict:
+def measure_decode(port: int, batch: int, seconds: float) -> dict:
     results: list = []
     lock = threading.Lock()
     deadline = time.monotonic() + seconds
@@ -288,7 +299,7 @@ def messe_decode(port: int, batch: int, seconds: float) -> dict:
     def worker() -> None:
         payload = {
             "model": "default",
-            "messages": [{"role": "user", "content": PROSA}],
+            "messages": [{"role": "user", "content": PROSE}],
             "max_tokens": 256,
             "temperature": 0,
             "stream": True,
@@ -308,31 +319,31 @@ def messe_decode(port: int, batch: int, seconds: float) -> dict:
     for t in threads:
         t.join(timeout=seconds + 240)
 
-    gute = [r for r in results if r.get("chunks")]
-    if not gute:
+    good = [r for r in results if r.get("chunks")]
+    if not good:
         return {
             "batch": batch,
             "decode_tok_s": None,
-            "fehler": [r.get("fehler") for r in results][:3] or ["keine Stromantwort"],
+            "fehler": [r.get("fehler") for r in results][:3] or ["no streamed answer"],
         }
-    erster = min(r["chunks"][0] for r in gute)
-    letzter = max(r["chunks"][-1] for r in gute)
-    tokens = sum(len(r["chunks"]) - 1 for r in gute)
-    span = letzter - erster
+    first = min(r["chunks"][0] for r in good)
+    last = max(r["chunks"][-1] for r in good)
+    tokens = sum(len(r["chunks"]) - 1 for r in good)
+    span = last - first
     rate = (tokens / span) if span > 0 and tokens > 0 else None
 
     # One non-streaming request for the accept length: meta_info rides on the
     # complete response, and spec_accept_length is the only honest accept
     # number (never spec_ema_accept_len from the log).
     accept = None
-    sample = gute[0]["text"][:400]
+    sample = good[0]["text"][:400]
     try:
         answer = _post(
             port,
             "/v1/chat/completions",
             {
                 "model": "default",
-                "messages": [{"role": "user", "content": PROSA}],
+                "messages": [{"role": "user", "content": PROSE}],
                 "max_tokens": 64,
                 "temperature": 0,
             },
@@ -344,11 +355,11 @@ def messe_decode(port: int, batch: int, seconds: float) -> dict:
             sample = ((choice.get("message") or {}).get("content") or "")[:400]
     except (urllib.error.URLError, OSError, json.JSONDecodeError, IndexError) as exc:
         accept = None
-        sample = sample or f"(keine Antwort: {type(exc).__name__}: {exc})"
+        sample = sample or f"(no answer: {type(exc).__name__}: {exc})"
 
     return {
         "batch": batch,
-        "requests": len(gute),
+        "requests": len(good),
         "tokens": tokens,
         "span_s": span,
         "decode_tok_s": rate,
@@ -360,31 +371,31 @@ def messe_decode(port: int, batch: int, seconds: float) -> dict:
     }
 
 
-def modus_messen(args) -> int:
+def mode_measure(args) -> int:
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     flush = _flush_cache(args.port)
     if args.warmup_seconds > 0:
-        messe_prefill(
+        measure_prefill(
             args.port, args.arm, args.sessions, args.warmup_seconds, args.prompt_tokens
         )
         _flush_cache(args.port)
 
-    prefill = messe_prefill(
+    prefill = measure_prefill(
         args.port, args.arm, args.sessions, args.point_seconds, args.prompt_tokens
     )
-    roh = prefill.pop("roh", [])
+    raw = prefill.pop("roh", [])
 
     decode = []
     if args.with_decode:
         for batch in _decode_batches(args):
-            von = time.time()
-            punkt_decode = messe_decode(args.port, batch, args.point_seconds)
-            punkt_decode.update(ernte_ticks(args.server_log, von, time.time(), batch))
-            decode.append(punkt_decode)
+            start = time.time()
+            point_decode = measure_decode(args.port, batch, args.point_seconds)
+            point_decode.update(ernte_ticks(args.server_log, start, time.time(), batch))
+            decode.append(point_decode)
 
-    punkt = {
+    point = {
         "folge": args.folge,
         "arm": args.arm,
         "sessions": args.sessions,
@@ -392,24 +403,25 @@ def modus_messen(args) -> int:
         "flush_cache": flush,
         "point_seconds": args.point_seconds,
         "prompt_tokens_ziel": args.prompt_tokens,
-        "inhalt": "fuellprosa, je Anfrage eindeutiger Kopf",
+        "inhalt": "filler prose, unique head per request",
         "prefill": prefill,
         "decode": decode,
     }
     with open(os.path.join(out_dir, "punkte.jsonl"), "a") as f:
-        f.write(json.dumps(punkt) + "\n")
+        f.write(json.dumps(point) + "\n")
     with open(os.path.join(out_dir, f"roh_{args.arm}_{args.sessions}.jsonl"), "w") as f:
-        for row in roh:
+        for row in raw:
             f.write(json.dumps(row) + "\n")
     print(
-        f"punkt {args.arm}/{args.sessions}: "
-        f"{prefill.get('prefill_tok_s')} tok/s aus {prefill.get('requests')} Anfragen"
+        f"point {args.arm}/{args.sessions}: "
+        f"{prefill.get('prefill_tok_s')} tok/s from "
+        f"{prefill.get('requests')} requests"
     )
     # A point without a rate is not a point. Returning 0 here would let the
     # orchestrator keep booting arms against a server that answers nothing.
     if prefill.get("prefill_tok_s") is None:
         for err in prefill.get("fehler") or []:
-            print(f"  Fehler: {err}", file=sys.stderr)
+            print(f"  error: {err}", file=sys.stderr)
         return 1
     return 0
 
@@ -419,25 +431,25 @@ def modus_messen(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def lade_punkte(step_dir: str) -> list:
+def load_points(step_dir: str) -> list:
     path = os.path.join(step_dir, "punkte.jsonl")
-    punkte: list = []
+    points: list = []
     if not os.path.exists(path):
-        return punkte
+        return points
     with open(path, errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                punkte.append(json.loads(line))
+                points.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    punkte.sort(key=lambda p: p.get("folge", 0))
-    return punkte
+    points.sort(key=lambda p: p.get("folge", 0))
+    return points
 
 
-def lade_beleg(step_dir: str, folge, arm, sessions) -> dict:
+def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
     """What the boot behind a point REALLY ran.
 
     The transport name in the log says bar1 either way -- that cost a whole
@@ -456,15 +468,15 @@ def lade_beleg(step_dir: str, folge, arm, sessions) -> dict:
             if m:
                 out["gruppen"].append(
                     {
-                        "gruppe": m.group("gruppe"),
-                        "angefordert": m.group("angefordert"),
-                        "erreicht": m.group("erreicht"),
+                        "group": m.group("group"),
+                        "requested": m.group("requested"),
+                        "achieved": m.group("achieved"),
                     }
                 )
     return out
 
 
-def lade_fatal(step_dir: str, arm, sessions) -> dict:
+def load_fatal(step_dir: str, arm, sessions) -> dict:
     """The fatal harvest of ONE boot.
 
     s12_prefill_kurve.sh greps every boot's host log for OOM / NCCL error /
@@ -494,68 +506,68 @@ def lade_fatal(step_dir: str, arm, sessions) -> dict:
 
 
 def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
-    punkte = lade_punkte(step_dir)
-    kurven: dict = {arm: {} for arm in ARME}
-    decode_punkte: list = []
-    reihenfolge = []
-    for p in punkte:
+    points = load_points(step_dir)
+    curves: dict = {arm: {} for arm in ARMS}
+    decode_points: list = []
+    order = []
+    for p in points:
         arm = p.get("arm")
         sessions = p.get("sessions")
         rate = (p.get("prefill") or {}).get("prefill_tok_s")
-        if arm in kurven and isinstance(sessions, int):
-            kurven[arm][sessions] = rate
-        eintrag = {
+        if arm in curves and isinstance(sessions, int):
+            curves[arm][sessions] = rate
+        record = {
             "folge": p.get("folge"),
             "arm": arm,
             "sessions": sessions,
             "zeit": p.get("zeit"),
             "prefill_tok_s": rate,
         }
-        eintrag.update(lade_beleg(step_dir, p.get("folge"), arm, sessions))
-        eintrag.update(lade_fatal(step_dir, arm, sessions))
-        reihenfolge.append(eintrag)
+        record.update(load_evidence(step_dir, p.get("folge"), arm, sessions))
+        record.update(load_fatal(step_dir, arm, sessions))
+        order.append(record)
         for d in p.get("decode") or []:
             entry = dict(d)
             entry["arm"] = arm
             entry["sessions_des_boots"] = sessions
-            decode_punkte.append(entry)
+            decode_points.append(entry)
 
-    abweichung = {}
-    for sessions, rate in kurven.get("grundlinie", {}).items():
-        bekannt = GRUNDLINIE_BEKANNT.get(sessions)
-        if bekannt and isinstance(rate, (int, float)):
-            abweichung[str(sessions)] = (rate - bekannt) / bekannt * 100.0
+    deviation = {}
+    for sessions, rate in curves.get("grundlinie", {}).items():
+        known = BASELINE_KNOWN.get(sessions)
+        if known and isinstance(rate, (int, float)):
+            deviation[str(sessions)] = (rate - known) / known * 100.0
 
-    verhaeltnis = {}
-    for sessions, rate in kurven.get("bar1", {}).items():
-        base = kurven.get("grundlinie", {}).get(sessions)
+    ratio = {}
+    for sessions, rate in curves.get("bar1", {}).items():
+        base = curves.get("grundlinie", {}).get(sessions)
         if base and isinstance(rate, (int, float)) and base > 0:
-            verhaeltnis[str(sessions)] = rate / base
+            ratio[str(sessions)] = rate / base
 
-    def _kurz(name: str):
-        pfad = os.path.join(step_dir, name)
-        if not os.path.exists(pfad):
+    def _short(name: str):
+        path = os.path.join(step_dir, name)
+        if not os.path.exists(path):
             return None
-        with open(pfad, errors="replace") as f:
-            return " ".join(f.read().split())[:200] or "ohne Grund"
+        with open(path, errors="replace") as f:
+            return " ".join(f.read().split())[:200] or "no reason given"
 
     return {
         "kind": KIND,
         "schema_version": SCHEMA_VERSION,
-        "arme": list(ARME),
+        "arme": list(ARMS),
         "sessions_geplant": plan,
-        "abbruch": _kurz("abbruch.txt"),
+        "abbruch": _short("abbruch.txt"),
         # A step that never got the cards must not be diagnosed through the
         # empty artifacts it left behind.
-        "blockiert": _kurz("blocked.txt"),
+        "blockiert": _short("blocked.txt"),
         "host_erreichbar": not os.path.exists(
             os.path.join(step_dir, "host_unreachable.txt")
         ),
         "integration_vorhanden": not os.path.exists(
             os.path.join(step_dir, "integration_missing.txt")
         ),
-        "punkte": len(punkte),
-        "reihenfolge": reihenfolge,
+        "punkte": len(points),
+        "reihenfolge": order,
         # One list, so the check does not have to walk the boots to find out
         # whether any of them died. Empty means every harvest came back clean.
         "fatal": [
@@ -565,7 +577,7 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
                 "sessions": e.get("sessions"),
                 "zeile": e["fatal"],
             }
-            for e in reihenfolge
+            for e in order
             if e.get("fatal")
         ],
         "fatal_ungeprueft": [
@@ -574,28 +586,28 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
                 "arm": e.get("arm"),
                 "sessions": e.get("sessions"),
             }
-            for e in reihenfolge
+            for e in order
             if not e.get("fatal_erhoben")
         ],
         "kurven": {
-            arm: {str(k): v for k, v in sorted(d.items())} for arm, d in kurven.items()
+            arm: {str(k): v for k, v in sorted(d.items())} for arm, d in curves.items()
         },
-        "decode": decode_punkte,
-        "grundlinie_bekannt": {str(k): v for k, v in GRUNDLINIE_BEKANNT.items()},
-        "grundlinie_quelle": GRUNDLINIE_QUELLE,
-        "grundlinie_abweichung_pct": abweichung,
+        "decode": decode_points,
+        "grundlinie_bekannt": {str(k): v for k, v in BASELINE_KNOWN.items()},
+        "grundlinie_quelle": BASELINE_SOURCE,
+        "grundlinie_abweichung_pct": deviation,
         "toleranz_pct": tol_pct,
-        "verhaeltnis_bar1_zu_grundlinie": verhaeltnis,
+        "verhaeltnis_bar1_zu_grundlinie": ratio,
         "output_samples": {
             arm: next(
                 (
                     d.get("output_sample")
-                    for d in decode_punkte
+                    for d in decode_points
                     if d.get("arm") == arm and d.get("output_sample")
                 ),
                 None,
             )
-            for arm in ARME
+            for arm in ARMS
         },
         "rohdaten": (
             sorted(f for f in os.listdir(step_dir) if f.startswith("roh_"))
@@ -605,7 +617,7 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
     }
 
 
-def _zahl(v, nk: int) -> str:
+def _num(v, nk: int) -> str:
     return "None" if not isinstance(v, (int, float)) else format(v, f".{nk}f")
 
 
@@ -616,7 +628,7 @@ def tabelle(payload: dict) -> str:
         "| sessions | bar1 tok/s | grundlinie tok/s | bar1/grundlinie |",
         "|---:|---:|---:|---:|",
     ]
-    sessions = sorted({int(s) for arm in ARME for s in payload["kurven"].get(arm, {})})
+    sessions = sorted({int(s) for arm in ARMS for s in payload["kurven"].get(arm, {})})
     for s in sessions:
         a = payload["kurven"].get("bar1", {}).get(str(s))
         b = payload["kurven"].get("grundlinie", {}).get(str(s))
@@ -633,6 +645,10 @@ def tabelle(payload: dict) -> str:
         # whole stream and therefore carries prefill and queue with it. They
         # differ by more than a factor of two, so an unlabelled "decode tok/s"
         # column is not a number anybody can use.
+        #
+        # The column labels stay verbatim: test_s12_log_analyse.py asserts
+        # "tok/s (Tick)" and "tok/s (Anfrage)", and "ms/Token" is the name
+        # s12 defines for the whole battery (s14 re-reads it bit-for-bit).
         lines += [
             "",
             "| arm | bs | tok/s (Tick) | ms/Token (Tick) | accept (Tick) "
@@ -642,16 +658,16 @@ def tabelle(payload: dict) -> str:
         for d in dec[-8:]:
             lines.append(
                 f"| {d.get('arm')} | {d.get('batch')} "
-                f"| {_zahl(d.get('tick_gen_tok_s_median'), 1)} "
-                f"| {_zahl(d.get('tick_ms_pro_token'), 2)} "
-                f"| {_zahl(d.get('tick_accept_len_median'), 2)} "
-                f"| {_zahl(d.get('tick_ticks_gewertet'), 0)} "
-                f"| {_zahl(d.get('decode_tok_s'), 1)} |"
+                f"| {_num(d.get('tick_gen_tok_s_median'), 1)} "
+                f"| {_num(d.get('tick_ms_pro_token'), 2)} "
+                f"| {_num(d.get('tick_accept_len_median'), 2)} "
+                f"| {_num(d.get('tick_ticks_gewertet'), 0)} "
+                f"| {_num(d.get('decode_tok_s'), 1)} |"
             )
     return "\n".join(lines) + "\n"
 
 
-def modus_zusammenfassen(args) -> int:
+def mode_summarize(args) -> int:
     os.makedirs(args.step_dir, exist_ok=True)
     plan = [int(x) for x in str(args.sessions_plan).replace(",", " ").split()]
     payload = zusammenfassen(args.step_dir, args.tol_pct, plan)
@@ -690,8 +706,8 @@ def main() -> int:
     ap.add_argument(
         "--server-log",
         default="",
-        help="Pfad des Serverlogs AUF DEM HOST -- daraus kommen accept len und "
-        "die Tick-Rate des Decodes, die auf Anfrageebene nicht zu haben sind",
+        help="path of the server log ON THE HOST -- accept len and the decode "
+        "tick rate come from there, neither is available at request level",
     )
     ap.add_argument(
         "--tol-pct",
@@ -701,16 +717,16 @@ def main() -> int:
     ap.add_argument(
         "--sessions-plan",
         default=os.environ.get("S12_SESSIONS", "1 4 8 16"),
-        help="welche Sessionzahlen der Lauf abfahren SOLL -- der Check misst "
-        "Vollstaendigkeit dagegen",
+        help="which session counts the run is SUPPOSED to walk -- the check "
+        "measures completeness against this",
     )
     args = ap.parse_args()
     if args.point_seconds > 60:
-        print("point-seconds > 60 s -- gegen die Zeitbox-Regel", file=sys.stderr)
+        print("point-seconds > 60 s -- against the time-box rule", file=sys.stderr)
         return 2
     if args.mode == "messen":
-        return modus_messen(args)
-    return modus_zusammenfassen(args)
+        return mode_measure(args)
+    return mode_summarize(args)
 
 
 if __name__ == "__main__":

@@ -37,60 +37,59 @@ def check(step_dir: str) -> None:
 
     errors = payload.get("inventory_errors") or []
     if errors:
-        raise CheckStop(f"Karten-Inventar meldet {len(errors)} Fehler: {errors[0]}")
+        raise CheckStop(f"card inventory reports {len(errors)} error(s): {errors[0]}")
 
     cards = payload.get("cards") or []
     if len(cards) < 2:
-        raise CheckStop(
-            f"nur {len(cards)} Karte(n) sichtbar, die Batterie braucht >= 2"
-        )
+        raise CheckStop(f"only {len(cards)} card(s) visible, the battery needs >= 2")
 
     min_free = int(payload.get("min_free_mib") or 400)
     for card in cards:
         for field in ("pci_bus_id", "uuid", "nvml_index", "name"):
             if not card.get(field) and card.get(field) != 0:
-                raise CheckStop(f"Karte ohne {field}: {card}")
+                raise CheckStop(f"card without {field}: {card}")
         if card.get("cuda_index") is None:
             raise CheckStop(
-                f"Karte {card.get('pci_bus_id')} hat keinen CUDA-Index -- "
-                "der NVML<->CUDA-Join per PCI ist fehlgeschlagen"
+                f"card {card.get('pci_bus_id')} has no CUDA index -- "
+                "the NVML<->CUDA join by PCI address failed"
             )
         free = card.get("vram_free_mib")
         if not isinstance(free, int):
-            raise CheckStop(f"Karte {card.get('pci_bus_id')} ohne freie MiB")
+            raise CheckStop(f"card {card.get('pci_bus_id')} without free MiB")
         if free < min_free:
             raise CheckStop(
-                f"Karte {card.get('nvml_index')} ({card.get('name')}) nur {free} MiB "
-                f"frei, Korridor verlangt >= {min_free}"
+                f"card {card.get('nvml_index')} ({card.get('name')}) has only {free} "
+                f"MiB free, the corridor demands >= {min_free}"
             )
 
     cuda_indices = [c["cuda_index"] for c in cards]
     if len(set(cuda_indices)) != len(cuda_indices):
-        raise CheckStop(f"CUDA-Indizes nicht eindeutig: {cuda_indices}")
+        raise CheckStop(f"CUDA indices are not unique: {cuda_indices}")
 
     held = payload.get("locks_held") or []
     if held:
         raise CheckStop(
-            f"{len(held)} Karten-Lock(s) fremd gehalten, erstes: {held[0].get('info')}"
+            f"{len(held)} card lock(s) held by someone else, first: "
+            f"{held[0].get('info')}"
         )
 
     _check_arbitration(payload)
 
     missing = [p for p, ok in (payload.get("required_files") or {}).items() if not ok]
     if missing:
-        raise CheckStop(f"{len(missing)} Pflichtdatei(en) fehlen, erste: {missing[0]}")
+        raise CheckStop(f"{len(missing)} required file(s) missing, first: {missing[0]}")
 
     tools = payload.get("tools") or {}
     for tool in ("nvidia-smi", "curl", "py-spy"):
         if not tools.get(tool):
             raise CheckStop(
-                f"Werkzeug {tool} fehlt -- ohne es ist kein Schritt sauber fahrbar"
+                f"tool {tool} is missing -- without it no step can be run cleanly"
             )
 
     if not payload.get("driver"):
-        raise CheckStop("Treiberversion nicht ermittelbar")
+        raise CheckStop("driver version could not be determined")
     if not payload.get("torch") or not payload.get("nccl"):
-        raise CheckStop("torch/NCCL-Version nicht ermittelbar")
+        raise CheckStop("torch/NCCL version could not be determined")
 
 
 def _check_arbitration(payload: dict) -> None:
@@ -112,13 +111,13 @@ def _check_arbitration(payload: dict) -> None:
         return
     if session is None:
         raise CheckStop(
-            f"/spinning/gpu-arb/holder ohne session=-Feld: {str(holder)[:120]} -- "
-            "unklarer Halter wird nicht ueberfahren"
+            f"/spinning/gpu-arb/holder without a session= field: {str(holder)[:120]} "
+            "-- an unclear holder does not get run over"
         )
     raise CheckStop(
-        f"/spinning/gpu-arb/holder haelt session={session} "
+        f"/spinning/gpu-arb/holder is held by session={session} "
         f"(cards={fields.get('cards')}, purpose={fields.get('purpose')}) -- "
-        "fremdes Fenster, die Batterie startet nicht hinein"
+        "someone else's window, the battery does not start into it"
     )
 
 

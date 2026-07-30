@@ -9,10 +9,10 @@
 # step collects. IT DOES NOT GRADE IT: flat and rising are both results, and
 # the check has no opinion about which one happened.
 #
-# INTERLEAVED, not blockwise (Messregel 5): per session count the bar1 arm and
-# the baseline arm run back to back, then the next session count. Eight boots
-# for four points per arm, and that is the price of not comparing two different
-# afternoons. Blockwise would be one boot per arm and worthless.
+# INTERLEAVED, not blockwise (measurement rule 5): per session count the bar1
+# arm and the baseline arm run back to back, then the next session count.
+# Eight boots for four points per arm, and that is the price of not comparing
+# two different afternoons. Blockwise would be one boot per arm and worthless.
 #
 # The two arms differ in EXACTLY the three SGLANG_HTCCL* variables. The boot
 # script is generated from one template for both, so they cannot drift.
@@ -28,7 +28,7 @@ source ./battery_common.sh
 source ./battery_host.sh
 source ./_bar1_host_boot.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start through run_step.sh}"
 PORT="${BAR1_PORT}"
 SESSIONS="${S12_SESSIONS:-1 4 8 16}"
 POINT_S="${S12_POINT_SECONDS:-15}"
@@ -44,7 +44,7 @@ summarize() {
 }
 
 if ! host_reachable; then
-    echo "STOP: Host $BAR1_HOST nicht erreichbar"
+    echo "STOP: host $BAR1_HOST not reachable"
     echo "unreachable" > "$DIR/host_unreachable.txt"
     summarize
     exit 2
@@ -54,17 +54,17 @@ if ! bar1_require_integration; then
     exit 2
 fi
 if ! host_locks_acquire "$BATTERY_STEP"; then
-    echo "STOP: Host-Locks nicht zu bekommen"
+    echo "STOP: host locks not obtainable"
     echo "Host-Locks fremd gehalten -- nicht gebrochen" > "$DIR/blocked.txt"
     summarize
     exit 2
 fi
 
 SERVER_PID=""
-# ACHT Boots in diesem Schritt, also acht Gelegenheiten, einen Server
-# stehenzulassen. Derselbe Aufraeumpfad wie in s11 und aus demselben Anlass:
-# `bar1_boot_start` gab die Bootmeldung mit auf stdout, `kill -0` scheiterte
-# daran, und das galt als "nichts zu toeten".
+# EIGHT boots in this step, so eight chances to leave a server standing. The
+# same cleanup path as in s11, and for the same reason: `bar1_boot_start` used
+# to put the boot message on stdout too, `kill -0` choked on it, and that
+# counted as "nothing to kill".
 cleanup() {
     bar1_kill_host_server "$SERVER_PID" "${HOSTPID:-}" \
         "$DIR/pyspy-host-cleanup.txt" || true
@@ -73,8 +73,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Kein Lauf gegen die Altlast eines vorherigen Anlaufs. Hier waere sie noch
-# teurer als in s11: acht Boots messen dann acht Mal den falschen Server.
+# No run against the leftovers of an earlier attempt. Here they would cost even
+# more than in s11: eight boots would measure the wrong server eight times.
 if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
     summarize
     exit 2
@@ -95,24 +95,24 @@ set -uo pipefail
 EOF
 chmod +x "$DIR/remote_messen.sh"
 
-FOLGE=0
-ABBRUCH=""
+SEQ=0
+ABORT=""
 
 for N in $SESSIONS; do
     for ARM in bar1 grundlinie; do
-        FOLGE=$((FOLGE + 1))
+        SEQ=$((SEQ + 1))
         HOSTLOG="$BAR1_HOST_LOGDIR/s12.$ARM.$N.log"
         HOSTPID="$BAR1_HOST_LOGDIR/s12.$ARM.$N.pid"
-        echo "== [$FOLGE] Arm $ARM, $N Session(s) =="
+        echo "== [$SEQ] arm $ARM, $N session(s) =="
 
         bar1_write_boot_script "$DIR/remote_boot_${ARM}_${N}.sh" "$ARM" \
-            "$HOSTLOG" "$HOSTPID" "$PORT" || { ABBRUCH="Bootskript $ARM/$N"; break; }
+            "$HOSTLOG" "$HOSTPID" "$PORT" || { ABORT="boot script $ARM/$N"; break; }
         SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_${ARM}_${N}.sh" "$HOSTPID")" \
             || SERVER_PID=""
         if ! bar1_pid_ok "$SERVER_PID"; then
             SERVER_PID=""
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.tail.txt" 200
-            ABBRUCH="Server-Start $ARM/$N ohne pid"
+            ABORT="server start $ARM/$N without pid"
             break
         fi
         echo "$SERVER_PID" >> "$DIR/host_pids"
@@ -123,15 +123,15 @@ for N in $SESSIONS; do
             bar1_kill_host_server "$cleanup_pid" "$HOSTPID" \
                 "$DIR/pyspy-host-$cleanup_pid.txt" || true
             SERVER_PID=""
-            ABBRUCH="Server $ARM/$N nicht oben"
+            ABORT="server $ARM/$N never came up"
             break
         fi
 
         # The arm's own evidence, BEFORE the numbers: which transport each
         # communicator group really got.
-        host_grep_into "$HOSTLOG" "$DIR/belege/${FOLGE}_${ARM}_${N}.txt" \
+        host_grep_into "$HOSTLOG" "$DIR/belege/${SEQ}_${ARM}_${N}.txt" \
             "HTCCL enabled for group" \
-            "ERREICHT=" \
+            "ACHIEVED=" \
             "HTCCL-BAR1: Aufbau in" \
             "waehrend einer CUDA-Graph-Aufzeichnung"
 
@@ -139,19 +139,19 @@ for N in $SESSIONS; do
         # only exist in the scheduler's own lines. Read live, while the server
         # still runs -- after the kill the file is still there, but the run
         # directory is not where it lives.
-        host_run_script 900 "$DIR/remote_messen.sh" "$ARM" "$N" "$FOLGE" \
+        host_run_script 900 "$DIR/remote_messen.sh" "$ARM" "$N" "$SEQ" \
             "$HOSTLOG" >> "$DIR/messen.log" 2>&1
         MRC=$?
-        echo "  Messung rc=$MRC"
+        echo "  measurement rc=$MRC"
 
         host_grep_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.fatal.txt" \
             "CUDA out of memory" "torch.OutOfMemoryError" "NCCL error" \
             "Traceback (most recent call last)"
         host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.tail.txt" 200
 
-        # Nachgeprueft abraeumen, nicht nur angestossen: ein Server, der den
-        # naechsten Boot ueberlebt, macht aus acht Messpunkten acht Messungen
-        # desselben Prozesses.
+        # Cleaned up and then verified, not merely kicked off: a server that
+        # survives into the next boot turns eight measured points into eight
+        # measurements of the same process.
         bar1_kill_host_server "$SERVER_PID" "$HOSTPID" \
             "$DIR/pyspy-host-$SERVER_PID.txt" || true
         SERVER_PID=""
@@ -159,25 +159,25 @@ for N in $SESSIONS; do
         sleep 20
 
         if [ "$MRC" != 0 ]; then
-            ABBRUCH="Messung $ARM/$N rc=$MRC"
+            ABORT="measurement $ARM/$N rc=$MRC"
             break
         fi
     done
 
     # 6b applies to this sonnet step as well: after every pair the table is
     # rewritten from the persisted points, so the run can be watched live.
-    echo "== Zwischenstand nach $N Session(s) =="
+    echo "== interim state after $N session(s) =="
     summarize
 
-    [ -n "$ABBRUCH" ] && break
+    [ -n "$ABORT" ] && break
 done
 
 cleanup
 trap - EXIT INT TERM
 
 summarize
-if [ -n "$ABBRUCH" ]; then
-    echo "abgebrochen: $ABBRUCH" | tee "$DIR/abbruch.txt"
+if [ -n "$ABORT" ]; then
+    echo "aborted: $ABORT" | tee "$DIR/abbruch.txt"
     exit 1
 fi
 exit 0

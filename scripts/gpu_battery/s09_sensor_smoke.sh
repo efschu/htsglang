@@ -13,7 +13,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ./battery_common.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
 PORT="${PORT:-30099}"
 MODEL="${SMOKE_MODEL:-$MODEL_ROOT/Qwen3.5-4B}"
 LOG="$DIR/server.log"
@@ -30,7 +30,7 @@ print(max(range(torch.cuda.device_count()),
           key=lambda i: torch.cuda.get_device_properties(i).total_memory))
 PY
 )"
-echo "Smoke-Karte: cuda:$CUDA_BIG"
+echo "smoke card: cuda:$CUDA_BIG"
 export CUDA_VISIBLE_DEVICES="$CUDA_BIG"
 
 cd "$WT"
@@ -56,7 +56,7 @@ cleanup() {
 trap cleanup INT TERM
 
 if ! battery_wait_for_server "$PORT" 900 "$SERVER_PID"; then
-    echo "Server nicht oben -- Dump und Abbruch"
+    echo "server not up -- dump and abort"
     cleanup
     exit 1
 fi

@@ -4106,29 +4106,29 @@ def build_bar1(cpu_group, device, fenster_bytes: int,
     caller then went on to log "transport=bar1" regardless. That is
     exactly how a measurement was devalued once: the tp group ran over
     BAR1, the dcp group over gloo, and the log looked the same in both
-    cases. Whoever passes ``bericht`` gets ``grund`` and ``stufe``
-    ("aufbau", "byte_proof") written into it here and can turn that into a
+    cases. Whoever passes ``bericht`` gets ``reason`` and ``stage``
+    ("setup", "byte_proof") written into it here and can turn that into a
     loud message.
     """
     if bericht is None:
         bericht = {}
 
-    def _aus(stufe: str, text: str):
-        bericht["stufe"] = stufe
-        bericht["grund"] = text
+    def _aus(stage: str, text: str):
+        bericht["stage"] = stage
+        bericht["reason"] = text
         return None
 
     try:
         t = HTCCLBar1Transport(cpu_group, device, fenster_bytes, gruppe=gruppe)
     except Bar1Unavailable as e:
         logger.info("HTCCL-BAR1: direct path not available -- %s", e)
-        return _aus("aufbau", str(e))
+        return _aus("setup", str(e))
     except NotImplementedError as e:
         logger.info("HTCCL-BAR1: direct path needs driver work -- %s", e)
-        return _aus("aufbau", f"driver work needed: {e}")
+        return _aus("setup", f"driver work needed: {e}")
     except Exception as e:                 # a half-built setup is not left standing
         logger.info("HTCCL-BAR1: setup failed -- %r", e)
-        return _aus("aufbau", f"{type(e).__name__}: {e}")
+        return _aus("setup", f"{type(e).__name__}: {e}")
     # The byte-level proof is part of setup, not an optional extra: without
     # it, `handles` is locked. On this rig, the driver reported peer
     # access for one pair and delivered 4096 of 1,048,576 bytes.
@@ -4144,8 +4144,8 @@ def build_bar1(cpu_group, device, fenster_bytes: int,
         # over the gloo tier while the log said "transport=bar1". The
         # reason belongs reported to the caller, not withheld.
         gefallen = sorted(k for k, v in belege.items() if not v)
-        bericht["stufe"] = "byte_proof"
-        bericht["grund"] = (
+        bericht["stage"] = "byte_proof"
+        bericht["reason"] = (
             f"Byte-level proof failed for the directed pairs {gefallen}. "
             f"handles() says False for everything; every collective in "
             f"this group runs over the gloo tier."

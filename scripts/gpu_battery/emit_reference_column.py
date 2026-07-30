@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit the reference column for an r7c accept boot.
 
-Pflicht 7 of the r7c queue: every accept number in these boots is reported
+Duty 7 of the r7c queue: every accept number in these boots is reported
 AGAINST the reference -- 2.688 (prose) / 3.279 (code), the same FP8 vehicle at
 pure NEXTN and K=3, docs/benchmarks/htsglang_tp3.json:87-90. Not against
 2.75-2.82: that pair is two cells of a five-axis cross-algo battery and is not
@@ -43,7 +43,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not os.path.exists(args.accept):
-        print(f"kein {args.accept} -- keine Referenzspalte moeglich", file=sys.stderr)
+        print(f"no {args.accept} -- no reference column possible", file=sys.stderr)
         return 1
 
     with open(args.accept) as f:
@@ -79,10 +79,10 @@ def main() -> int:
         "timestamp": datetime.datetime.now().isoformat(),
         "reference_source": REFERENCE_SOURCE,
         "reference_note": (
-            "gleiches FP8-Vehikel, reines NEXTN, K=3. Nicht 2.75-2.82 (zwei "
-            "Zellen einer fuenfachsigen Cross-Algo-Batterie, kein Vergleich "
-            "fuer eine K=3-Messung). Das andere Ende der Skala ist das eigene "
-            "Band der GGUF-Q3-Serving-Gruppe, 1.15-1.53 (Runde 7b)."
+            "same FP8 vehicle, pure NEXTN, K=3. Not 2.75-2.82 (two cells of "
+            "a five-axis cross-algo battery, not a comparison for a K=3 "
+            "measurement). The other end of the scale is the GGUF-Q3 serving "
+            "group's own band, 1.15-1.53 (round 7b)."
         ),
         "k": report.get("steps"),
         "tokens": report.get("tokens"),
@@ -93,13 +93,13 @@ def main() -> int:
         json.dump(payload, f, indent=2)
         f.write("\n")
 
-    print(f"{'Prompt':<10} {'gemessen':>10} {'Referenz':>10} {'Verhaeltnis':>12}")
+    print(f"{'prompt':<10} {'measured':>10} {'reference':>10} {'ratio':>12}")
     for row in rows:
         print(
             f"{str(row['prompt']):<10} {str(row['measured']):>10} "
             f"{str(row['reference']):>10} {str(row['ratio']):>12}"
         )
-    print(f"geschrieben: {args.out}")
+    print(f"written: {args.out}")
     return 0
 
 

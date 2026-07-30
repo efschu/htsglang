@@ -313,8 +313,8 @@ class HTCCLMatrixTransport:
             # keeps holding the BAR1 pages the next group needs.
             self.bar1.close()
             self.bar1 = None
-        self.bar1_grund = bericht.get("grund", "")
-        self.bar1_stufe = bericht.get("stufe", "")
+        self.bar1_reason = bericht.get("reason", "")
+        self.bar1_stage = bericht.get("stage", "")
 
         # 2. Capability, fed to the planner. Minimum over ALL destinations
         #    and all ranks; `None` means "unknown" and rules nothing out --

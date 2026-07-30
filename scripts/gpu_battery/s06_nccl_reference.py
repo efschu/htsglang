@@ -133,10 +133,10 @@ def iters_for(nbytes: int) -> int:
 def parse_sizes(text: str):
     sizes = tuple(int(x) for x in text.replace(" ", "").split(",") if x)
     if not sizes:
-        raise ValueError("leere Groessenleiter")
+        raise ValueError("empty size ladder")
     for s in sizes:
         if s < 4 or s % 4:
-            raise ValueError(f"Groesse {s}: kein Vielfaches von 4 Byte")
+            raise ValueError(f"size {s}: not a multiple of 4 bytes")
     return sizes
 
 
@@ -144,9 +144,9 @@ def parse_arms(text: str):
     arms = tuple(x for x in text.replace(" ", "").split(",") if x)
     unknown = [a for a in arms if a not in (IDLE_ARM, LOAD_ARM)]
     if unknown:
-        raise ValueError(f"unbekannte Arme {unknown}")
+        raise ValueError(f"unknown arms {unknown}")
     if not arms:
-        raise ValueError("kein Arm ausgewaehlt")
+        raise ValueError("no arm selected")
     return arms
 
 
@@ -193,7 +193,7 @@ def read_progress(path: str) -> str:
         with open(path) as f:
             return f.read().strip()
     except OSError:
-        return "kein Fortschritt vermerkt"
+        return "no progress recorded"
 
 
 def p2p_readiness_path() -> str:
@@ -242,20 +242,22 @@ def _rank_local_checks(rank: int, progress: str) -> str:
     sys.path.insert(0, p2p_readiness_path())
     from p2p_common import cuda_pci_bus_id
 
-    note_progress(progress, "rank-lokal: Sichtbarkeit")
+    note_progress(progress, "rank-local: visibility")
     visible = torch.cuda.device_count()
     if visible != 1:
         raise PreconditionFailed(
             RC_DEVICE_COUNT,
-            f"Rang {rank}: {visible} Karten sichtbar, erwartet genau 1 "
+            # "erwartet genau 1" is asserted on by
+            # test_gpu_battery_checks.py; the marker stays, the rest does not.
+            f"rank {rank}: {visible} cards visible, erwartet genau 1 "
             f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}). "
-            "Zwei sichtbare Karten sind der 2026-07-30-Haenger: der Barrier "
-            "faellt auf rank modulo 2 zurueck, die Nutzlast liegt auf cuda:0.",
+            "Two visible cards are the 2026-07-30 hang: the barrier falls "
+            "back to rank modulo 2, the payload sits on cuda:0.",
         )
 
     torch.cuda.set_device(0)
 
-    note_progress(progress, "rank-lokal: CUDA-Sonde")
+    note_progress(progress, "rank-local: CUDA probe")
     probe = torch.ones(4096, dtype=torch.float32, device="cuda:0")
     probe.mul_(2.0)
     total = float(probe.sum().item())
@@ -265,18 +267,19 @@ def _rank_local_checks(rank: int, progress: str) -> str:
     if total != 8192.0:
         raise PreconditionFailed(
             RC_LOCAL_PROBE,
-            f"Rang {rank}: rangeigene CUDA-Sonde liefert {total}, erwartet 8192.0",
+            f"rank {rank}: rank-local CUDA probe returns {total}, expected 8192.0",
         )
 
-    note_progress(progress, "rank-lokal: Kartenidentitaet")
+    # "Kartenidentitaet" is asserted on by test_gpu_battery_checks.py.
+    note_progress(progress, "rank-local: Kartenidentitaet")
     own = cuda_pci_bus_id(0)
     expected = os.environ[f"BATTERY_PCI_{rank}"]
     if own != expected:
         raise PreconditionFailed(
             RC_DEVICE_IDENTITY,
-            f"Rang {rank}: cuda:0 zeigt auf {own}, der Elternprozess hat {expected} "
-            "zugeteilt -- CUDA- und NVML-Reihenfolge sind auf diesem Rig "
-            "verschieden, die Zuteilung kam nicht an",
+            f"rank {rank}: cuda:0 points at {own}, the parent assigned "
+            f"{expected} -- CUDA order and NVML order differ on this rig, the "
+            "assignment did not arrive",
         )
     return own
 
@@ -286,7 +289,7 @@ def worker(rank: int, out_path: str) -> int:
     try:
         return _worker(rank, out_path)
     except PreconditionFailed as exc:
-        note_progress(f"{out_path}.rank{rank}.progress", f"Abbruch: {exc}")
+        note_progress(f"{out_path}.rank{rank}.progress", f"abort: {exc}")
         print(str(exc), file=sys.stderr, flush=True)
         return exc.rc
 
@@ -325,8 +328,8 @@ def _worker(rank: int, out_path: str) -> int:
     if peer_pci == own_pci:
         raise PreconditionFailed(
             RC_SAME_CARD,
-            f"Rang {rank}: beide Raenge auf {own_pci} -- eine Karte kann nicht "
-            "zwei Raenge einer Gruppe tragen",
+            f"rank {rank}: both ranks on {own_pci} -- one card cannot carry "
+            "two ranks of one group",
         )
 
     note_progress(progress, "init_process_group")
@@ -467,13 +470,13 @@ def _worker(rank: int, out_path: str) -> int:
     # Rank 1 owns the rows it timed (the sender side of its direction), so both
     # ranks write and the parent merges. A single writer would silently drop
     # one direction.
-    note_progress(progress, "schreibe Fragment")
+    note_progress(progress, "writing the fragment")
     with open(f"{out_path}.rank{rank}", "w") as f:
         json.dump(rows, f)
 
     dist.barrier()
     dist.destroy_process_group()
-    note_progress(progress, "fertig")
+    note_progress(progress, "done")
     return 0
 
 
@@ -512,7 +515,7 @@ def pyspy_dump(pid: int, path: str) -> None:
     exe = shutil.which("py-spy") or (venv_exe if os.path.exists(venv_exe) else None)
     if exe is None:
         with open(path, "w") as f:
-            f.write("py-spy nicht gefunden -- kein Dump moeglich\n")
+            f.write("py-spy not found -- no dump possible\n")
         return
     try:
         with open(path, "w") as f:
@@ -525,7 +528,7 @@ def pyspy_dump(pid: int, path: str) -> None:
             )
     except (OSError, subprocess.SubprocessError) as exc:
         with open(path, "a") as f:
-            f.write(f"py-spy fehlgeschlagen: {exc}\n")
+            f.write(f"py-spy failed: {exc}\n")
 
 
 def worker_argv(rank: int, frag_path: str):
@@ -644,9 +647,11 @@ def run_pair(cuda_ids, pci_ids, frag_path, timeout_s, log_prefix, sizes, arms):
             proc = procs[rank]
             pyspy_dump(proc.pid, f"{log_prefix}.rank{rank}.pyspy.txt")
             step = read_progress(f"{frag_path}.rank{rank}.progress")
-            where.append(f"Rang {rank} bei {step}")
+            # "Rang <n>" is asserted on by test_gpu_battery_checks.py.
+            where.append(f"Rang {rank} at {step}")
         for proc in procs:
             terminate_own_group(proc)
+        # The exact wording is asserted on by test_gpu_battery_checks.py.
         status = f"timeout nach {timeout_s}s"
         detail = "; ".join(where)
 
@@ -656,7 +661,7 @@ def run_pair(cuda_ids, pci_ids, frag_path, timeout_s, log_prefix, sizes, arms):
             with open(path, errors="replace") as f:
                 logs.append(f.read())
         except OSError as exc:
-            logs.append(f"[Log {path} nicht lesbar: {exc}]")
+            logs.append(f"[log {path} not readable: {exc}]")
     for rank in (0, 1):
         try:
             os.unlink(f"{frag_path}.rank{rank}.progress")
@@ -694,13 +699,13 @@ def main() -> int:
     ap.add_argument(
         "--sizes",
         default=None,
-        help="komma-separierte Byte-Groessen statt der vollen Leiter "
-        "(Kurzbeleg: --sizes 65536,1048576)",
+        help="comma-separated byte sizes instead of the full ladder "
+        "(short evidence run: --sizes 65536,1048576)",
     )
     ap.add_argument(
         "--arms",
         default=None,
-        help=f"komma-separierte Arme statt beider ({IDLE_ARM},{LOAD_ARM})",
+        help=f"comma-separated arms instead of both ({IDLE_ARM},{LOAD_ARM})",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -713,12 +718,12 @@ def main() -> int:
 
     if args.dry_run:
         print(
-            "Plan: je ungeordnetem Kartenpaar zwei Subprozesse mit je GENAU "
-            "EINER sichtbaren Karte (CUDA_VISIBLE_DEVICES=<eine Karte>, "
-            f"NCCL_DEBUG=INFO); je Arm ({', '.join(arms)}) all_reduce ueber die "
-            f"Leiter {[s // KIB for s in sizes]} KiB plus send_recv in BEIDE "
-            "Richtungen; p50 UND p99 je Zeile; Ausgabe im "
-            "nccl_reference-Envelope (schema_version 1)."
+            "Plan: per unordered card pair, two subprocesses with EXACTLY "
+            "ONE visible card each (CUDA_VISIBLE_DEVICES=<one card>, "
+            f"NCCL_DEBUG=INFO); per arm ({', '.join(arms)}) all_reduce over "
+            f"the ladder {[s // KIB for s in sizes]} KiB plus send_recv in "
+            "BOTH directions; p50 AND p99 per row; output in the "
+            "nccl_reference envelope (schema_version 1)."
         )
         return 0
 
@@ -736,23 +741,23 @@ def main() -> int:
 
     n = cuda_device_count()
     if n < 2:
-        print(f"brauche >= 2 Karten, gefunden {n}", file=sys.stderr)
+        print(f"need >= 2 cards, found {n}", file=sys.stderr)
         return 4
     idx_pci = {i: cuda_pci_bus_id(i) for i in range(n)}
 
     payload = new_nccl_reference_envelope()
     payload["host"] = os.uname().nodename
     payload["timing_conventions"] = {
-        "op_duration": "Dauer des Kollektivs, CUDA-Events auf Rang 0",
+        "op_duration": "duration of the collective, CUDA events on rank 0",
         "directed_ack_round_trip": (
-            "gerichtete Nutzlast plus 4-Byte-Ack, auf dem Sender gemessen; der "
-            "konstante Ack-Anteil steht je Zeile in baseline_ack_us und landet "
-            "im affinen Fit im base-Term"
+            "directed payload plus a 4-byte ack, timed on the sender; the "
+            "constant ack share is recorded per row in baseline_ack_us and "
+            "lands in the base term of the affine fit"
         ),
     }
     payload["load_arms"] = {
-        IDLE_ARM: "keine Fremdlast",
-        LOAD_ARM: "durchgehender 64-MiB-pinned-Host<->Device-Strom auf beiden Karten",
+        IDLE_ARM: "no foreign load",
+        LOAD_ARM: "continuous 64 MiB pinned-host <-> device stream on both cards",
     }
     payload["pairs_status"] = []
 
@@ -811,13 +816,13 @@ def main() -> int:
                 failed = True
             # Partial result on disk before the next pair can eat the budget.
             write_payload(payload, all_rows, args.out)
-            line = f"{idx_pci[a]} <-> {idx_pci[b]}: {status}, {len(rows)} Zeilen, {transports}"
+            line = f"{idx_pci[a]} <-> {idx_pci[b]}: {status}, {len(rows)} rows, {transports}"
             if detail:
                 line += f" -- {detail}"
             print(line, flush=True)
 
     write_payload(payload, all_rows, args.out)
-    print(f"geschrieben: {args.out} ({len(all_rows)} Zeilen); NCCL-Log: {log_path}")
+    print(f"written: {args.out} ({len(all_rows)} rows); NCCL log: {log_path}")
     return 1 if failed else 0
 
 

@@ -81,6 +81,9 @@ def parse_cards(path: str) -> list:
 
 
 def patch_level(count: object) -> str:
+    # The returned tokens are a data contract: check_s10_bar1_driver.py and
+    # test_gpu_battery_checks_bar1.py compare against "voll"/"minimal"
+    # verbatim, so the enumeration stays German.
     try:
         n = int(str(count).strip())
     except (TypeError, ValueError):
@@ -129,6 +132,7 @@ def compose(step_dir: str, phase: str = "after") -> dict:
             "nvidia_modeset": state.get("mod_nvidia_modeset", ""),
             "dmabuf_holder": state.get("mod_dmabuf_holder", ""),
         },
+        # "ja" is what the host probe writes and what the fixtures feed.
         "dmabuf_dev_present": state.get("dmabuf_dev") == "ja",
         "dmabuf_major": state.get("dmabuf_major", ""),
         "cards": parse_cards(os.path.join(host, f"cards_{phase}.csv")),
@@ -148,22 +152,23 @@ def desired_state_reached(payload: dict) -> tuple:
     """What s11 and s12 actually need. Returns (ok, list of missing pieces)."""
     missing = []
     if not payload.get("reachable"):
-        missing.append("Host nicht erreichbar")
+        missing.append("host not reachable")
     if not payload.get("regkey_present"):
-        missing.append("Regkey nicht in /proc/driver/nvidia/params")
+        missing.append("Regkey not in /proc/driver/nvidia/params")
     if payload.get("patch_level") != "voll":
-        missing.append(f"Patch-Stand {payload.get('patch_level')!r}, erwartet 'voll'")
+        # "Patch-Stand" is asserted on by test_gpu_battery_checks_bar1.py.
+        missing.append(f"Patch-Stand {payload.get('patch_level')!r}, expected 'voll'")
     if not payload.get("module_identity_matches"):
-        missing.append("srcversion des geladenen Moduls passt nicht zur .ko")
+        missing.append("srcversion of the loaded module does not match the .ko")
     if not payload.get("dmabuf_holder_loaded"):
-        missing.append("dmabuf_holder nicht geladen")
+        missing.append("dmabuf_holder not loaded")
     if not payload.get("dmabuf_dev_present"):
-        missing.append("/dev/dmabuf_holder fehlt")
+        missing.append("/dev/dmabuf_holder is missing")
     # "" = not loaded, "0" = loaded and unused. See the note in compose().
     if payload["modules"].get("nvidia_uvm", "") == "":
-        missing.append("nvidia_uvm nicht geladen")
+        missing.append("nvidia_uvm not loaded")
     if len(payload.get("cards") or []) < 3:
-        missing.append(f"nur {len(payload.get('cards') or [])} Karten enumeriert")
+        missing.append(f"only {len(payload.get('cards') or [])} cards enumerated")
     return (not missing, missing)
 
 
@@ -173,7 +178,7 @@ def main() -> int:
     ap.add_argument(
         "--gate-only",
         action="store_true",
-        help="nur pruefen, ob der Sollzustand schon vorliegt (0 = ja, 3 = nein)",
+        help="only check whether the desired state is already there (0 = yes, 3 = no)",
     )
     args = ap.parse_args()
 
@@ -181,7 +186,7 @@ def main() -> int:
         payload = compose(args.step_dir, phase="before")
         ok, missing = desired_state_reached(payload)
         for item in missing:
-            print(f"  fehlt: {item}")
+            print(f"  missing: {item}")
         return 0 if ok else 3
 
     payload = compose(args.step_dir, phase="after")
@@ -193,10 +198,11 @@ def main() -> int:
         json.dump(payload, f, indent=2)
         f.write("\n")
     print(
-        f"driver_state.json geschrieben ({'Sollzustand' if ok else 'unvollstaendig'})"
+        f"driver_state.json written "
+        f"({'desired state' if ok else 'incomplete'})"
     )
     for item in missing:
-        print(f"  fehlt: {item}")
+        print(f"  missing: {item}")
     return 0 if ok else 1
 
 

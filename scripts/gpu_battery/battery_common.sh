@@ -145,7 +145,7 @@ with open(sys.argv[1], "w") as f:
 for c in out["cards"]:
     print(
         f"  nvml:{c['nvml_index']} cuda:{c['cuda_index']} {c['pci_bus_id']} "
-        f"{c['name']}  frei {c['vram_free_mib']} / {c['vram_total_mib']} MiB"
+        f"{c['name']}  free {c['vram_free_mib']} / {c['vram_total_mib']} MiB"
     )
 for e in out["errors"]:
     print(f"  ERROR {e}")
@@ -164,7 +164,7 @@ battery_assert_corridor() {
         seen=$((seen + 1))
         free=$((total - used))
         if [ "$free" -lt "$BATTERY_MIN_FREE_MIB" ]; then
-            echo "KORRIDOR: Karte $idx nur $free MiB frei (< $BATTERY_MIN_FREE_MIB)" >&2
+            echo "CORRIDOR: card $idx has only $free MiB free (< $BATTERY_MIN_FREE_MIB)" >&2
             bad=1
         fi
     done < <(nvidia-smi --query-gpu=index,memory.total,memory.used \
@@ -175,7 +175,7 @@ battery_assert_corridor() {
     # host driver, and a container whose device nodes went stale afterwards
     # reports exactly nothing here.
     if [ "$seen" -eq 0 ]; then
-        echo "KORRIDOR: nvidia-smi liefert keine Karten-Zeile -- keine Sicht auf die Karten" >&2
+        echo "CORRIDOR: nvidia-smi returns no card row -- no view of the cards" >&2
         bad=1
     fi
     if [ "$bad" != 0 ]; then
@@ -206,7 +206,7 @@ battery_acquire_locks() {  # $1 = step id (goes into the info file)
     local step="$1" n i lock
     n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')" || n=0
     if [ "${n:-0}" -lt 1 ]; then
-        echo "STOP: keine GPU sichtbar (nvidia-smi -L leer)" >&2
+        echo "STOP: no GPU visible (nvidia-smi -L is empty)" >&2
         return 2
     fi
     for i in $(seq 0 $((n - 1))); do
@@ -221,9 +221,9 @@ battery_acquire_locks() {  # $1 = step id (goes into the info file)
             } > "$lock/info"
             BATTERY_HELD_LOCKS+=("$lock")
         else
-            echo "STOP: $lock ist belegt:" >&2
+            echo "STOP: $lock is held:" >&2
             sed 's/^/    /' "$lock/info" 2>/dev/null >&2
-            echo "fremde Locks werden nie gebrochen -- Operator fragen." >&2
+            echo "foreign locks are never broken -- ask the operator." >&2
             battery_release_locks
             return 2
         fi
@@ -248,7 +248,7 @@ battery_locks_are_free() {
     for i in $(seq 0 $((${n:-0} - 1))); do
         lock="/tmp/gpu-card-$i.lock"
         if [ -d "$lock" ]; then
-            echo "STOP: $lock ist belegt:" >&2
+            echo "STOP: $lock is held:" >&2
             sed 's/^/    /' "$lock/info" 2>/dev/null >&2
             return 2
         fi
@@ -268,7 +268,7 @@ battery_dump_and_kill() {  # $1 = pid, $2 = dump path
     elif [ -x "$VENV/bin/py-spy" ]; then
         timeout 60 "$VENV/bin/py-spy" dump --pid "$pid" > "$dump" 2>&1 || true
     else
-        echo "py-spy nicht gefunden -- kein Dump moeglich" > "$dump"
+        echo "py-spy not found -- no dump possible" > "$dump"
     fi
     kill "$pid" 2>/dev/null
     sleep 5
@@ -315,25 +315,25 @@ battery_wait_for_server() {  # $1 = port, $2 = budget_s, $3 = optional server pi
     t0=$(date +%s)
     while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
         if curl -sf -m 5 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-            echo "server up nach $(( $(date +%s) - t0 ))s"
+            echo "server up after $(( $(date +%s) - t0 ))s"
             return 0
         fi
         # After the health probe, so a server that answered and exited in the
         # same iteration still counts as up. A pid bash has already reaped
         # fails `kill -0`; an unreaped one is a zombie and needs /proc.
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-            echo "Serverprozess $pid nach $(( $(date +%s) - t0 ))s tot" >&2
+            echo "server process $pid dead after $(( $(date +%s) - t0 ))s" >&2
             return 1
         fi
         if [ -n "$pid" ]; then
             state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)"
             if [ "$state" = "Z" ]; then
-                echo "Serverprozess $pid nach $(( $(date +%s) - t0 ))s tot (Zombie)" >&2
+                echo "server process $pid dead after $(( $(date +%s) - t0 ))s (zombie)" >&2
                 return 1
             fi
         fi
         sleep 10
     done
-    echo "server nicht oben in ${budget}s" >&2
+    echo "server not up within ${budget}s" >&2
     return 1
 }

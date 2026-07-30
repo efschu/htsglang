@@ -7,13 +7,13 @@ card, a socket or ssh, which is what makes it testable against fixtures.
 
 Three extractions carry the step:
 
-  * the graph gate. bar1_graph_check.py prints one BESTANDEN/GEFALLEN line per
+  * the graph gate. bar1_graph_check.py prints one PASSED/FAILED line per
     case with a [Gate]/[Info] marker and exits 0 only when every gate case
     passed. Both are recorded: the exit code alone would hide WHICH case fell.
   * per-group attainment. parallel_state logs "HTCCL enabled for group '<x>':
-    angefordert=<a>, ERREICHT=<e>" on success and the same pair as a WARNING on
+    requested=<a>, ACHIEVED=<e>" on success and the same pair as a WARNING on
     fallback. The requested name is worthless -- it says bar1 either way. Only
-    ERREICHT counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
+    ACHIEVED counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
     are two (tp:0, dcp:0), and a run where one of them fell back to gloo is a
     mixed measurement, not a bar1 measurement.
   * the coverage bolt. htccl._select raises rather than falling back to the
@@ -58,83 +58,90 @@ import re
 import sys
 
 KIND = "bar1_e2e"
-#: 2: `log_quellen` / `log_zeilen` kamen dazu, und die Beweislage wird nicht
-#: mehr nur aus `htccl_lines.txt` gelesen. Ein aelteres Artefakt darf hier
-#: nicht durchrutschen -- es traegt die Felder nicht, an denen der Check
-#: "niemand hat geschaut" von "nichts gefunden" unterscheidet.
-#: 3: der Smoke laeuft ueber /generate statt /v1/chat/completions, und
-#: `smoke` traegt dafuer `endpunkt`, `finish_reason`, `zahlen_erwartet`,
-#: `spec_verify_ct` und `unterprovisioniert`. Aus demselben Grund: ohne
-#: `endpunkt` liest ein Check nicht, WORAUF die Kohaerenzzahl sich bezieht.
-#: 4: das Kriterium misst nicht mehr Gehorsam, sondern ob das Sprachmodell
-#: intakt ist -- `anker_zahlen`, `muell_befunde`, `lm_intakt` und die
-#: Kennzahlen dazu. Ein Artefakt nach Schema 3 traegt die Felder nicht, und
-#: sein `kohaerent` bedeutete etwas anderes als das gleichnamige hier.
-SCHEMA_VERSION = 4
+#: 2: `log_quellen` / `log_zeilen` were added, and the evidence is no longer
+#: read from `htccl_lines.txt` alone. An older artifact must not slip through
+#: here -- it does not carry the fields the check uses to tell "nobody
+#: looked" from "nothing was found".
+#: 3: the smoke goes over /generate instead of /v1/chat/completions, and
+#: `smoke` therefore carries `endpunkt`, `finish_reason`, `zahlen_erwartet`,
+#: `spec_verify_ct` and `unterprovisioniert`. Same reason: without
+#: `endpunkt` a check cannot read WHAT the coherence number refers to.
+#: 4: the criterion no longer measures obedience but whether the language
+#: model is intact -- `anker_zahlen`, `muell_befunde`, `lm_intakt` and the
+#: metrics behind them. A schema-3 artifact does not carry those fields, and
+#: its `kohaerent` meant something other than the field of that name here.
+#: 5: the per-group entries under `gruppen` renamed their keys from German to
+#: English -- `gruppe`/`angefordert`/`erreicht` became `group`/`requested`/
+#: `achieved`, in step with htccl.py's report_state(). A schema-4 artifact
+#: still spells them in German, so every group would read back as empty and
+#: the transport check would pass on nothing. Rejecting it by version is the
+#: point: re-run the step rather than read a stale artifact through the new
+#: names.
+SCHEMA_VERSION = 5
 
-#: Der Fortsetzungs-Prompt, den s11_bar1_e2e.sh an /generate schickt. Er
-#: steht hier UND dort; dass die beiden zusammenpassen, nagelt
-#: test_gpu_battery_checks_bar1.py am Quelltext der Schrittdatei fest --
-#: sonst zaehlte der Parser eine Folge, die der Request nie angestossen hat.
+#: The continuation prompt s11_bar1_e2e.sh sends to /generate. It lives here
+#: AND there; test_gpu_battery_checks_bar1.py pins the two together against
+#: the source of the step script -- otherwise the parser would count a
+#: sequence the request never asked for.
 SMOKE_PROMPT = "1 2 3 4"
-#: Die erste Zahl, die die Fortsetzung liefern muss -- unmittelbar hinter dem
-#: Prompt. Was im Prompt steht, ist kein Beleg fuer die Antwort.
+#: The first number the continuation has to produce -- immediately after the
+#: prompt. What the prompt itself says is no evidence about the answer.
 ZAHLEN_VON = 5
 ZAHLEN_BIS = 20
 
-#: Wieviele Zahlen UNMITTELBAR und LUECKENLOS folgen muessen.
+#: How many numbers must follow IMMEDIATELY and WITHOUT A GAP.
 #:
-#: Hier stand 15, und das hat den falschen Gegenstand gemessen. Anlauf 4 zaehlte
-#: korrekt " 5 6 7 8 9 10" weiter und driftete dann in einen kohaerenten
-#: russischen Forumtext -- rohe Fortsetzungs-Charakteristik eines Basispfades
-#: ohne Anweisung, kein Schaden am Modell. Die 15 verlangten Gehorsam ueber 16
-#: Zahlen; was dieser Schritt wissen will, ist etwas anderes: kommen fuer ein
-#: determiniertes Praefix die RICHTIGEN Token heraus, und ist der Rest
-#: wohlgeformter Text. Echte Korruption sieht anders aus -- sie liefert keine
-#: sechs richtigen Zahlen und danach Non-Sequitur-Muell.
+#: This used to be 15, and it measured the wrong thing. Attempt 4 counted
+#: " 5 6 7 8 9 10" on correctly and then drifted into a coherent Russian
+#: forum post -- the raw continuation characteristic of a base path with no
+#: instruction, not damage to the model. The 15 demanded obedience over 16
+#: numbers; what this step wants to know is something else: does a determined
+#: prefix produce the RIGHT tokens, and is the rest well-formed text? Real
+#: corruption looks different -- it does not deliver six correct numbers and
+#: then non-sequitur garbage.
 #:
-#: 4 und nicht 6, obwohl 6 gemessen sind: eine einzelne Beobachtung
-#: rechtfertigt keine Schwelle auf ihrem eigenen Wert. Der Abstand, auf den es
-#: ankommt, ist der zwischen 0 und 4 -- ein kaputtes Kollektiv liefert nicht
-#: vier korrekte Zahlen und verunglueckt dann.
+#: 4 and not 6, even though 6 were measured: a single observation does not
+#: justify a threshold at its own value. The distance that matters is the one
+#: between 0 and 4 -- a broken collective does not deliver four correct
+#: numbers and then come off the rails.
 ANKER_MIN = 4
 
-#: Muell-Schwellen. JEDE ist an dem echten Artefakt von Anlauf 4 geeicht
-#: (smoke.json, 1055 Zeichen), nicht geschaetzt -- die gemessenen Werte stehen
-#: dahinter. Ein Test faehrt genau dieses Artefakt und verlangt, dass es
-#: besteht.
-#: gemessen 1.0000
+#: Garbage thresholds. EVERY one is calibrated against the real artifact of
+#: attempt 4 (smoke.json, 1055 characters), not guessed -- the measured values
+#: are noted with each. A test drives exactly that artifact and requires it to
+#: pass.
+#: measured 1.0000
 MUELL_DRUCKBAR_MIN = 0.98
-#: gemessen 0.435 (der Forumtext wiederholt einen Block, das ist Web-Text und
-#: kein Defekt). Eine Tokenschleife liegt bei ~0.01 -- der Abstand ist gross,
-#: die Schwelle liegt bewusst weit unter dem gemessenen Wert.
+#: measured 0.435 (the forum post repeats a block; that is web text, not a
+#: defect). A token loop sits at ~0.01 -- the distance is large, so the
+#: threshold is deliberately far below the measured value.
 MUELL_VIELFALT_MIN = 0.15
-#: Unter so wenigen Worten ist die Vielfalt Rauschen und wird nicht geprueft.
+#: Below that few words the diversity is noise and is not checked.
 MUELL_VIELFALT_AB_WORTEN = 30
-#: gemessen 3 ("###"). Eine Entartung wiederholt eine kurze Einheit dutzendfach.
+#: measured 3 ("###"). A degeneration repeats a short unit dozens of times.
 MUELL_WDH_MAX = 10
 MUELL_EINHEIT_MAX = 32
-#: Kuerzer als das ist keine Antwort, ueber die sich etwas sagen laesst.
+#: Shorter than this is not an answer anything can be said about.
 MUELL_MIN_ZEICHEN = 20
 
-#: Woraus die Beweislage gelesen wird, in dieser Reihenfolge. `htccl_lines.txt`
-#: ist der vollstaendige grep und steht deshalb vorn; `server.log` ist der
-#: begrenzte Auszug, den die Schrittdatei auf JEDEM Weg schreibt -- auch auf
-#: denen, die vor dem grep abbiegen.
+#: Where the evidence is read from, in this order. `htccl_lines.txt` is the
+#: complete grep result and therefore comes first; `server.log` is the bounded
+#: excerpt the step script writes on EVERY path -- including the ones that
+#: branch off before the grep.
 LOG_QUELLEN = ("htccl_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
-    r"group '(?P<gruppe>[^']+)': angefordert=(?P<angefordert>[^,\s]+),\s*"
-    r"ERREICHT=(?P<erreicht>[A-Za-z0-9_\-]+)"
+    r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
+    r"ACHIEVED=(?P<achieved>[A-Za-z0-9_\-]+)"
 )
-RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<gruppe>[^']+)'")
+RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<group>[^']+)'")
 RE_AUFBAU = re.compile(r"HTCCL-BAR1: Aufbau in\s+(?P<ms>[0-9.]+)\s*ms")
 RE_RIEGEL = re.compile(
     r"HTCCL: '(?P<op>[A-Za-z0-9_]+)' mit (?P<bytes>\d+) Byte waehrend einer "
     r"CUDA-Graph-Aufzeichnung"
 )
 RE_GATE_CASE = re.compile(
-    r"^\s*(?P<marke>BESTANDEN|GEFALLEN)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
+    r"^\s*(?P<marke>PASSED|FAILED)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
 )
 
 FATAL_MARKERS = (
@@ -177,79 +184,79 @@ def parse_graph_check(step_dir: str) -> dict:
                 {
                     "name": m.group("name"),
                     "gate": m.group("art") == "Gate",
-                    "ok": m.group("marke") == "BESTANDEN",
+                    "ok": m.group("marke") == "PASSED",
                 }
             )
     gates = [c for c in cases if c["gate"]]
-    fallen = [c["name"] for c in gates if not c["ok"]]
+    failed = [c["name"] for c in gates if not c["ok"]]
     return {
         "rc": rc,
         "cases": len(cases),
         "gate_cases": len(gates),
-        "gefallen": fallen,
-        "alle_bestanden": bool(gates) and not fallen and rc == 0,
+        "gefallen": failed,
+        "alle_bestanden": bool(gates) and not failed and rc == 0,
         "zusammenfassung_vorhanden": any("Zusammenfassung" in line for line in lines),
     }
 
 
-def _ohne_grep_praefix(line: str) -> str:
-    """Der Inhalt einer Zeile, unabhaengig davon, wer sie geerntet hat.
+def _without_grep_prefix(line: str) -> str:
+    """The content of a line, regardless of who harvested it.
 
-    ``grep -n`` stellt "<lineno>:" voran, ``tail`` nicht. Dieselbe Logzeile
-    sieht in den beiden Quellen deshalb verschieden aus, obwohl sie dieselbe
-    ist -- ohne diese Normalisierung zaehlte `aufbau_lines` sie doppelt.
+    ``grep -n`` puts "<lineno>:" in front, ``tail`` does not. The same log
+    line therefore looks different in the two sources even though it is the
+    same one -- without this normalisation `aufbau_lines` counted it twice.
     """
     return " ".join(re.sub(r"^\d+:", "", line).split())
 
 
-def sammle_log_zeilen(step_dir: str) -> tuple:
-    """Alle geernteten Logzeilen, entdoppelt, plus die Quellen, die es gab.
+def collect_log_lines(step_dir: str) -> tuple:
+    """All harvested log lines, deduplicated, plus the sources that existed.
 
-    Die Quellenliste ist das eigentliche Ergebnis: eine leere Zeilenliste
-    heisst mit ihr "nichts gefunden", ohne sie "niemand hat geschaut". Das
-    sind zwei Befunde, und nur einer davon ist ein Messergebnis.
+    The source list is the actual result: with it, an empty line list means
+    "nothing found"; without it, "nobody looked". Those are two findings, and
+    only one of them is a measurement.
     """
-    quellen = []
-    zeilen = []
-    gesehen = set()
+    sources = []
+    lines = []
+    seen = set()
     for name in LOG_QUELLEN:
-        pfad = os.path.join(step_dir, name)
-        if not os.path.exists(pfad):
+        path = os.path.join(step_dir, name)
+        if not os.path.exists(path):
             continue
-        quellen.append(name)
-        for line in read_lines(pfad):
-            schluessel = _ohne_grep_praefix(line)
-            if not schluessel or schluessel in gesehen:
+        sources.append(name)
+        for line in read_lines(path):
+            key = _without_grep_prefix(line)
+            if not key or key in seen:
                 continue
-            gesehen.add(schluessel)
-            zeilen.append(line)
-    return zeilen, quellen
+            seen.add(key)
+            lines.append(line)
+    return lines, sources
 
 
 def parse_log_evidence(step_dir: str) -> dict:
-    lines, quellen = sammle_log_zeilen(step_dir)
-    gruppen: dict = {}
-    kasse_gruppen = []
-    aufbau = []
-    riegel = None
+    lines, sources = collect_log_lines(step_dir)
+    groups: dict = {}
+    ledger_groups = []
+    setup_ms = []
+    bolt = None
     fatal = None
     for line in lines:
         m = RE_GROUP.search(line)
         if m:
-            gruppen[m.group("gruppe")] = {
-                "gruppe": m.group("gruppe"),
-                "angefordert": m.group("angefordert"),
-                "erreicht": m.group("erreicht"),
+            groups[m.group("group")] = {
+                "group": m.group("group"),
+                "requested": m.group("requested"),
+                "achieved": m.group("achieved"),
             }
         m = RE_KASSE.search(line)
-        if m and m.group("gruppe") not in kasse_gruppen:
-            kasse_gruppen.append(m.group("gruppe"))
+        if m and m.group("group") not in ledger_groups:
+            ledger_groups.append(m.group("group"))
         m = RE_AUFBAU.search(line)
         if m:
-            aufbau.append(float(m.group("ms")))
+            setup_ms.append(float(m.group("ms")))
         m = RE_RIEGEL.search(line)
-        if m and riegel is None:
-            riegel = {
+        if m and bolt is None:
+            bolt = {
                 "op": m.group("op"),
                 "bytes": int(m.group("bytes")),
                 "zeile": " ".join(line.split())[:300],
@@ -260,95 +267,95 @@ def parse_log_evidence(step_dir: str) -> dict:
                     fatal = " ".join(line.split())[:300]
                     break
     return {
-        "gruppen": sorted(gruppen.values(), key=lambda g: g["gruppe"]),
-        "aufbau_gruppen": kasse_gruppen,
-        "aufbau_lines": len(aufbau),
-        "aufbau_ms": aufbau,
-        "riegel": riegel,
+        "gruppen": sorted(groups.values(), key=lambda g: g["group"]),
+        "aufbau_gruppen": ledger_groups,
+        "aufbau_lines": len(setup_ms),
+        "aufbau_ms": setup_ms,
+        "riegel": bolt,
         "fatal": fatal,
-        "log_quellen": quellen,
+        "log_quellen": sources,
         "log_zeilen": len(lines),
     }
 
 
-def zaehle_in_folge(text: str, von: int, bis: int) -> int:
-    """Wieviele der Zahlen ``von..bis`` IRGENDWO in dieser Reihenfolge stehen.
+def count_in_order(text: str, start: int, end: int) -> int:
+    """How many of the numbers ``start..end`` appear SOMEWHERE in that order.
 
-    Der alte Zaehler, und er bleibt nur fuer die Chat-Form stehen (die endet
-    ohnehin in einem STOP). Warum er als Kriterium nicht taugt: er sagt
-    nichts darueber, WOHER die Treffer kommen. Am 2026-07-30 meldete er 3
-    fuer eine Antwort, die gar nicht gezaehlt hat -- die Treffer waren die
-    Aufzaehlungspunkte "1.", "2.", "3." einer Denk-Praeambel. Und in Anlauf 4
-    meldete er 10 fuer eine Antwort, deren erste sechs Zahlen richtig waren
-    und deren Rest russischer Forumtext ist: die restlichen vier Treffer sind
-    Ziffern aus "220В", "1450" und Datumsangaben. Ein Zaehler, der ueber den
-    ganzen Text streut, findet in Fliesstext immer irgendetwas.
+    The old counter, kept only for the chat shape (which ends in a STOP
+    anyway). Why it does not work as a criterion: it says nothing about
+    WHERE the hits come from. On 2026-07-30 it reported 3 for an answer that
+    never counted at all -- the hits were the bullet points "1.", "2.", "3."
+    of a thinking preamble. And in attempt 4 it reported 10 for an answer
+    whose first six numbers were right and whose remainder is Russian forum
+    text: the other four hits are digits out of "220В", "1450" and dates. A
+    counter that scatters over the whole text always finds something in
+    prose.
 
-    Das Kriterium ist deshalb :func:`anker_folge` -- unmittelbar und
-    lueckenlos.
+    The criterion is therefore :func:`anchor_run` -- immediate and without
+    gaps.
     """
     pos = 0
-    treffer = 0
-    for n in range(von, bis + 1):
-        stelle = text.find(str(n), pos)
-        if stelle < 0:
+    hits = 0
+    for n in range(start, end + 1):
+        at = text.find(str(n), pos)
+        if at < 0:
             continue
-        treffer += 1
-        pos = stelle + len(str(n))
-    return treffer
+        hits += 1
+        pos = at + len(str(n))
+    return hits
 
 
-def anker_folge(text: str, von: int) -> tuple:
-    """``(Anzahl, Resttext)`` -- die Zahlen UNMITTELBAR am Textanfang.
+def anchor_run(text: str, start: int) -> tuple:
+    """``(count, remainder)`` -- the numbers IMMEDIATELY at the start.
 
-    Gezaehlt wird, wieviele Zahlen ab ``von`` lueckenlos und in Folge ganz
-    vorn stehen, getrennt nur durch Zwischenraum. Beim ersten Bruch ist
-    Schluss; was danach kommt, ist der Resttext und wird nicht mehr auf
-    Zahlen abgesucht.
+    Counts how many numbers from ``start`` on stand right at the front, in
+    order and without a gap, separated only by whitespace. The first break
+    ends it; whatever follows is the remainder and is not searched for
+    numbers any more.
 
-    **Das ist der Unterschied zwischen "gehorcht" und "rechnet richtig".**
-    Ein Basispfad ohne Anweisung setzt eine Zahlenfolge ein Stueck weit fort
-    und driftet dann in das, woran ihn das Praefix erinnert -- das ist die
-    Charakteristik der rohen Fortsetzung, kein Defekt. Was der Anker prueft,
-    ist die eine Frage, die dieser Schritt beantworten kann: kommen fuer ein
-    determiniertes Praefix die richtigen Token heraus? Ein zerschossenes
-    Kollektiv liefert die nicht.
+    **This is the difference between "obeyed" and "computes correctly".** A
+    base path with no instruction continues a number sequence for a while and
+    then drifts into whatever the prefix reminds it of -- that is the
+    characteristic of a raw continuation, not a defect. What the anchor
+    checks is the one question this step can answer: does a determined prefix
+    produce the right tokens? A shot-up collective does not deliver them.
 
-    Streuende Suche waere hier falsch: "0/10" direkt hinter der 10 (so steht
-    es im Artefakt von Anlauf 4) darf nicht als 11 durchgehen, nur weil
-    irgendwo spaeter eine 11 auftaucht.
+    A scattering search would be wrong here: "0/10" right behind the 10 (that
+    is how the artifact of attempt 4 reads) must not pass as an 11 just
+    because an 11 shows up somewhere later.
     """
-    n = von
+    n = start
     rest = text
-    treffer = 0
+    hits = 0
     while True:
         m = re.match(r"\s*(\d+)", rest)
         if m is None or int(m.group(1)) != n:
             break
-        treffer += 1
+        hits += 1
         n += 1
         rest = rest[m.end():]
-    return treffer, rest
+    return hits, rest
 
 
-def _max_wiederholung(text: str) -> int:
-    """Wie oft sich eine kurze Einheit UNMITTELBAR hintereinander wiederholt.
+def _max_repetition(text: str) -> int:
+    """How often a short unit repeats IMMEDIATELY back to back.
 
-    Der Muell-Test, der Entartung von Web-Text trennt. Eine Tokenschleife
-    wiederholt dieselben paar Zeichen dutzendfach am Stueck; ein Forumtext,
-    der einen zitierten Block ein zweites Mal bringt, tut das nicht
-    unmittelbar und nicht kurz. Gemessen am Artefakt von Anlauf 4: 3 ("###").
+    The garbage test that separates degeneration from web text. A token loop
+    repeats the same few characters dozens of times in a row; a forum post
+    that carries a quoted block a second time does not do so immediately and
+    not in a short unit. Measured against the artifact of attempt 4: 3
+    ("###").
     """
     text = text[:4000]
     best = 0
-    for laenge in range(1, MUELL_EINHEIT_MAX + 1):
+    for length in range(1, MUELL_EINHEIT_MAX + 1):
         i = 0
-        while i + laenge <= len(text):
-            einheit = text[i:i + laenge]
+        while i + length <= len(text):
+            unit = text[i:i + length]
             n = 1
-            while text[i + n * laenge:i + (n + 1) * laenge] == einheit:
+            while text[i + n * length:i + (n + 1) * length] == unit:
                 n += 1
-                if n > 64:            # genug, um "entartet" zu sagen
+                if n > 64:            # enough to call it degenerate
                     return n
             if n > best:
                 best = n
@@ -356,65 +363,67 @@ def _max_wiederholung(text: str) -> int:
     return best
 
 
-def muell_pruefung(text: str) -> tuple:
-    """``(Befunde, Kennzahlen)`` -- ist der Text wohlgeformt oder Muell?
+def garbage_check(text: str) -> tuple:
+    """``(findings, metrics)`` -- is the text well-formed, or garbage?
 
-    Drei Fragen, absichtlich stumpf und ohne Meinung darueber, WORUEBER der
-    Text spricht. Was hier NICHT geprueft wird, ist Sinn: ein russischer
-    Forumbeitrag ueber Drehstrommotoren ist ein voellig intaktes
-    Sprachmodell-Ergebnis, auch wenn ihn niemand bestellt hat.
+    Three questions, deliberately blunt and with no opinion about WHAT the
+    text talks about. What is NOT checked here is sense: a Russian forum post
+    about three-phase motors is a perfectly intact language-model result,
+    even if nobody ordered it.
 
-    Jede Schwelle ist am echten Artefakt von Anlauf 4 geeicht; die gemessenen
-    Werte stehen bei den Konstanten.
+    Every threshold is calibrated against the real artifact of attempt 4; the
+    measured values are noted at the constants.
+
+    The finding strings themselves stay German: out-of-scope unit tests match
+    on "druckbare", "Wortvielfalt" and "Tokenschleife".
     """
-    befunde = []
-    kennzahlen = {}
-    knapp = text.strip()
-    if len(knapp) < MUELL_MIN_ZEICHEN:
-        befunde.append(f"nur {len(knapp)} Zeichen Text")
-        return befunde, kennzahlen
+    findings = []
+    metrics = {}
+    trimmed = text.strip()
+    if len(trimmed) < MUELL_MIN_ZEICHEN:
+        findings.append(f"nur {len(trimmed)} Zeichen Text")
+        return findings, metrics
 
-    druckbar = sum(1 for c in text if c.isprintable() or c in "\n\t")
-    anteil = druckbar / len(text)
-    kennzahlen["druckbar_anteil"] = round(anteil, 4)
-    if anteil < MUELL_DRUCKBAR_MIN:
-        befunde.append(
-            f"nur {anteil:.3f} druckbare Zeichen (< {MUELL_DRUCKBAR_MIN})"
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\t")
+    share = printable / len(text)
+    metrics["druckbar_anteil"] = round(share, 4)
+    if share < MUELL_DRUCKBAR_MIN:
+        findings.append(
+            f"nur {share:.3f} druckbare Zeichen (< {MUELL_DRUCKBAR_MIN})"
         )
 
-    worte = text.split()
-    if len(worte) >= MUELL_VIELFALT_AB_WORTEN:
-        vielfalt = len(set(worte)) / len(worte)
-        kennzahlen["wort_vielfalt"] = round(vielfalt, 4)
-        if vielfalt < MUELL_VIELFALT_MIN:
-            befunde.append(
-                f"Wortvielfalt {vielfalt:.3f} (< {MUELL_VIELFALT_MIN}) -- "
-                f"{len(set(worte))} verschiedene von {len(worte)} Worten"
+    words = text.split()
+    if len(words) >= MUELL_VIELFALT_AB_WORTEN:
+        diversity = len(set(words)) / len(words)
+        metrics["wort_vielfalt"] = round(diversity, 4)
+        if diversity < MUELL_VIELFALT_MIN:
+            findings.append(
+                f"Wortvielfalt {diversity:.3f} (< {MUELL_VIELFALT_MIN}) -- "
+                f"{len(set(words))} verschiedene von {len(words)} Worten"
             )
 
-    wdh = _max_wiederholung(text)
-    kennzahlen["max_wiederholung"] = wdh
-    if wdh >= MUELL_WDH_MAX:
-        befunde.append(
-            f"eine kurze Einheit wiederholt sich {wdh}x unmittelbar "
+    repeats = _max_repetition(text)
+    metrics["max_wiederholung"] = repeats
+    if repeats >= MUELL_WDH_MAX:
+        findings.append(
+            f"eine kurze Einheit wiederholt sich {repeats}x unmittelbar "
             f"(>= {MUELL_WDH_MAX}) -- Tokenschleife"
         )
-    return befunde, kennzahlen
+    return findings, metrics
 
 
 def parse_smoke(step_dir: str) -> dict:
-    """Coherence, mechanically -- und aus der Antwort, die der Schritt wirklich holt.
+    """Coherence, mechanically -- out of the answer the step really fetches.
 
-    Gelesen wird die /generate-Form (``{"text": ..., "meta_info": {...}}``).
-    Die Chat-Form wird weiter verstanden, damit ein Artefakt aus einem
-    aelteren Lauf nicht als "unlesbar" durchgeht, sondern als das, was es
-    ist -- aber sie ist nicht mehr das, was der Schritt anfordert. Warum,
-    steht in s11_bar1_e2e.sh am Request.
+    What is read is the /generate shape (``{"text": ..., "meta_info":
+    {...}}``). The chat shape is still understood, so that an artifact from
+    an older run does not pass as "unreadable" but as what it is -- but it is
+    no longer what the step asks for. The reasoning sits at the request in
+    s11_bar1_e2e.sh.
 
-    ``spec_accept_length`` kommt aus ``meta_info`` und AUSDRUECKLICH nicht
-    aus ``spec_ema_accept_len``: das ist ein geglaetteter Verlauf, nicht die
-    Akzeptanzlaenge dieser Anfrage, und die beiden zu verwechseln ist eine
-    bekannte Messfalle.
+    ``spec_accept_length`` comes from ``meta_info`` and EXPLICITLY not from
+    ``spec_ema_accept_len``: that is a smoothed curve, not this request's
+    acceptance length, and confusing the two is a known measurement trap.
     """
     path = os.path.join(step_dir, "smoke.json")
     out: dict = {
@@ -441,10 +450,10 @@ def parse_smoke(step_dir: str) -> dict:
         with open(path, errors="replace") as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        out["error"] = f"smoke.json nicht lesbar: {exc}"
+        out["error"] = f"smoke.json not readable: {exc}"
         return out
     if not isinstance(payload, dict):
-        out["error"] = "smoke.json ist kein JSON-Objekt"
+        out["error"] = "smoke.json is not a JSON object"
         return out
     if payload.get("error") or payload.get("object") == "error":
         out["error"] = " ".join(str(payload.get("error") or payload).split())[:200]
@@ -452,14 +461,14 @@ def parse_smoke(step_dir: str) -> dict:
 
     meta: dict = {}
     if isinstance(payload.get("text"), str):
-        # /generate: Text und meta_info liegen oben, ohne Wenn und Aber.
+        # /generate: text and meta_info sit at the top, no ifs and buts.
         out["endpunkt"] = "generate"
         text = payload["text"]
         meta = payload.get("meta_info") or {}
-        von, bis = ZAHLEN_VON, ZAHLEN_BIS
+        start, end = ZAHLEN_VON, ZAHLEN_BIS
     else:
-        # Chat-Form. Sie zaehlt ab 1, weil dort kein Prompt fortgesetzt wird
-        # -- ein aelteres Artefakt soll dieselbe Zahl ergeben wie damals.
+        # Chat shape. It counts from 1, because no prompt is continued there
+        # -- an older artifact should yield the same number it did back then.
         out["endpunkt"] = "chat"
         try:
             choice = payload["choices"][0]
@@ -467,65 +476,62 @@ def parse_smoke(step_dir: str) -> dict:
             meta = choice.get("meta_info") or {}
         except (KeyError, IndexError, TypeError) as exc:
             out["error"] = (
-                f"Antwort ist weder /generate (text) noch Chat "
+                f"answer is neither /generate (text) nor chat "
                 f"(choices[0].message.content): {exc}"
             )
             return out
-        von, bis = 1, 20
-        out["zahlen_erwartet"] = bis - von + 1
+        start, end = 1, 20
+        out["zahlen_erwartet"] = end - start + 1
 
     out["content_prefix"] = text[:300]
     out["spec_accept_length"] = meta.get("spec_accept_length")
     out["spec_verify_ct"] = meta.get("spec_verify_ct")
-    ende = meta.get("finish_reason")
-    if isinstance(ende, dict):
-        ende = ende.get("type")
-    if ende is None and out["endpunkt"] == "chat":
+    finish = meta.get("finish_reason")
+    if isinstance(finish, dict):
+        finish = finish.get("type")
+    if finish is None and out["endpunkt"] == "chat":
         try:
-            ende = payload["choices"][0].get("finish_reason")
+            finish = payload["choices"][0].get("finish_reason")
         except (KeyError, IndexError, TypeError):
-            ende = None
-    out["finish_reason"] = ende
+            finish = None
+    out["finish_reason"] = finish
 
-    # Die streuende Zaehlung bleibt als KENNZAHL im Artefakt -- sie ist die
-    # Zahl, an der die beiden Fehlschluesse haengen (Praeambel-Punkte,
-    # Ziffern aus Fliesstext), und wer sie spaeter im Protokoll sieht, soll
-    # sie wiederfinden. Kriterium ist sie nicht mehr.
-    out["zahlen_in_folge"] = zaehle_in_folge(text, von, bis)
+    # The scattering count stays in the artifact as a METRIC -- it is the
+    # number both wrong conclusions hang on (preamble bullets, digits out of
+    # prose), and whoever sees it in the log later should be able to find it
+    # again. It is no longer the criterion.
+    out["zahlen_in_folge"] = count_in_order(text, start, end)
 
-    # (a) Der Anker: kommen fuer ein determiniertes Praefix die richtigen
-    #     Token heraus?
-    treffer, rest = anker_folge(text, von)
-    out["anker_zahlen"] = treffer
+    # (a) The anchor: does a determined prefix produce the right tokens?
+    hits, rest = anchor_run(text, start)
+    out["anker_zahlen"] = hits
     out["anker_min"] = ANKER_MIN
     out["drift_zeichen"] = len(rest.strip())
-    anker_ok = treffer >= ANKER_MIN
+    anchor_ok = hits >= ANKER_MIN
 
-    # (b) Und ist der Rest wohlgeformter Text? Geprueft wird der GANZE
-    #     Abschnitt, nicht nur der Drift: eine Antwort, die exakt die Zahlen
-    #     enthaelt und dann aufhoert, hat keinen Drift und ist trotzdem in
-    #     Ordnung.
-    befunde, kennzahlen = muell_pruefung(text)
-    out["muell_befunde"] = befunde
-    out.update(kennzahlen)
+    # (b) And is the rest well-formed text? The WHOLE section is checked, not
+    #     just the drift: an answer that carries exactly the numbers and then
+    #     stops has no drift and is fine all the same.
+    findings, metrics = garbage_check(text)
+    out["muell_befunde"] = findings
+    out.update(metrics)
 
-    out["lm_intakt"] = bool(anker_ok and not befunde)
-    # `kohaerent` bleibt als Name im Artefakt, weil der Check und die
-    # Auswertung ihn tragen -- aber er bedeutet jetzt "LM intakt" und nicht
-    # mehr "hat gehorcht". Das ist die Aenderung, um die es geht.
+    out["lm_intakt"] = bool(anchor_ok and not findings)
+    # `kohaerent` keeps its name in the artifact because the check and the
+    # analysis carry it -- but it now means "LM intact" and no longer "it
+    # obeyed". That is the change this is about.
     out["kohaerent"] = out["lm_intakt"]
 
-    # Der benannte Zustand: zusammenhaengender Text, das Token-Budget bis
-    # zum Anschlag verbraucht, und die Zahlen kamen trotzdem NIE. Das ist
-    # kein Transportfehler und keine Korruption, sondern ein Smoke, dessen
-    # Budget woanders hingegangen ist -- der Fall vom 2026-07-30 (Denk-
-    # Praeambel). Er setzt jetzt voraus, dass der ANKER gefehlt hat: driftet
-    # die Antwort erst NACH korrekt fortgesetzten Zahlen ab, ist sie kein
-    # unter-provisionierter Smoke, sondern ein bestandener.
+    # The named state: coherent text, the token budget spent to the stop, and
+    # the numbers still never came. That is not a transport fault and not
+    # corruption but a smoke whose budget went elsewhere -- the 2026-07-30
+    # case (thinking preamble). It now requires that the ANCHOR was missing:
+    # if the answer only drifts AFTER correctly continued numbers, it is not
+    # an under-provisioned smoke but a passing one.
     out["unterprovisioniert"] = bool(
-        not anker_ok
-        and not befunde
-        and ende == "length"
+        not anchor_ok
+        and not findings
+        and finish == "length"
         and len(text.strip()) >= 200
     )
     return out
@@ -556,10 +562,10 @@ def compose(step_dir: str, port: int, host_log: str) -> dict:
     }
     payload.update(parse_log_evidence(step_dir))
     payload["gruppen_bar1"] = sorted(
-        g["gruppe"] for g in payload["gruppen"] if g["erreicht"] == "bar1"
+        g["group"] for g in payload["gruppen"] if g["achieved"] == "bar1"
     )
     payload["gruppen_ausgewichen"] = sorted(
-        g["gruppe"] for g in payload["gruppen"] if g["erreicht"] != g["angefordert"]
+        g["group"] for g in payload["gruppen"] if g["achieved"] != g["requested"]
     )
     return payload
 
@@ -577,10 +583,10 @@ def main() -> int:
         json.dump(payload, f, indent=2)
         f.write("\n")
     print(
-        f"bar1_e2e.json geschrieben: Gruppen bar1={payload['gruppen_bar1']}, "
-        f"ausgewichen={payload['gruppen_ausgewichen']}, "
-        f"Aufbau-Zeilen={payload['aufbau_lines']}, "
-        f"Riegel={'ja' if payload['riegel'] else 'nein'}"
+        f"bar1_e2e.json written: groups on bar1={payload['gruppen_bar1']}, "
+        f"fell back={payload['gruppen_ausgewichen']}, "
+        f"setup lines={payload['aufbau_lines']}, "
+        f"bolt={'yes' if payload['riegel'] else 'no'}"
     )
     return 0
 

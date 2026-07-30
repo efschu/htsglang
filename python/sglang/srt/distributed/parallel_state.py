@@ -634,36 +634,36 @@ class GroupCoordinator:
                 gruppe=self.unique_name,
             )
             self.htccl_comm = _comm
-            # Was ANGEFORDERT war und was ERREICHT wurde -- und zwar getrennt.
+            # What was REQUESTED and what was ACHIEVED -- kept apart.
             #
-            # Bis hierher stand in dieser Zeile der angeforderte Name, egal
-            # was daraus geworden war. Am echten Modell mit SGLANG_UNEVEN_DCP
-            # hiess das: 'tp' baute den Direktpfad in 27 ms auf, 'dcp'
-            # scheiterte am Halter mit ENOMEM und fiel auf gloo zurueck --
-            # und beide Zeilen sagten "transport=bar1". Die daraus gewonnene
-            # Zahl war zur Haelfte gar keine bar1-Zahl. Deshalb wird der
-            # Ausfall jetzt zur WARNUNG mit Gruppennamen und Grund, und der
-            # Erfolg nennt ausdruecklich, was wirklich laeuft.
-            angefordert = envs.SGLANG_HTCCL_TRANSPORT.get()
+            # Until now this line named the requested transport, whatever had
+            # actually come of it. On the real model with SGLANG_UNEVEN_DCP
+            # that meant: 'tp' brought the direct path up in 27 ms, 'dcp'
+            # failed at the holder with ENOMEM and fell back to gloo -- and
+            # both lines said "transport=bar1". Half of the number won from
+            # that run was not a bar1 number at all. So the failure is now a
+            # WARNING carrying the group name and the reason, and the success
+            # says explicitly what is really running.
+            requested = envs.SGLANG_HTCCL_TRANSPORT.get()
             stand = getattr(_comm, "stand", {}) or {}
-            erreicht = stand.get("erreicht", angefordert)
-            if stand.get("direkt", True):
+            achieved = stand.get("achieved", requested)
+            if stand.get("direct", True):
                 logger.info(
-                    "HTCCL enabled for group '%s': angefordert=%s, "
-                    "ERREICHT=%s. Every SGLANG_HTCCL* env must be identical "
+                    "HTCCL enabled for group '%s': requested=%s, "
+                    "ACHIEVED=%s. Every SGLANG_HTCCL* env must be identical "
                     "on all ranks; the host-staged transports (shm/gloo/ucx) "
                     "additionally require --disable-cuda-graph.",
-                    self.unique_name, angefordert, erreicht,
+                    self.unique_name, requested, achieved,
                 )
             else:
                 logger.warning(
-                    "HTCCL group '%s': angefordert=%s, ERREICHT=%s (%s: %s). "
-                    "Diese Gruppe laeuft NICHT ueber %s. Ein Messwert aus "
-                    "diesem Lauf ist gemischt und darf nicht als "
-                    "%s-Wert berichtet werden.",
-                    self.unique_name, angefordert, erreicht,
-                    stand.get("stufe", "?"), stand.get("grund", "?"),
-                    angefordert, angefordert,
+                    "HTCCL group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
+                    "This group does NOT run over %s. A measurement from "
+                    "this run is mixed and must not be reported as a "
+                    "%s value.",
+                    self.unique_name, requested, achieved,
+                    stand.get("stage", "?"), stand.get("reason", "?"),
+                    requested, requested,
                 )
 
         # When HTCCL is active the pynccl communicator is NOT CONSTRUCTED --

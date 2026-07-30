@@ -68,21 +68,21 @@ def check(step_dir: str) -> None:
     require_envelope(payload, "nccl_reference", "nccl_reference.json", 1)
 
     # The pair status comes first: an aborted pair explains the missing rows,
-    # and "keine rows" would report the consequence instead of the cause. The
+    # and "no rows" would report the consequence instead of the cause. The
     # producer writes its partial result after every pair, so a step that ran
     # out of budget leaves exactly this file.
     for status in payload.get("pairs_status") or []:
         if status.get("status") != "ok":
             detail = status.get("detail")
             raise CheckFail(
-                f"Paar {status.get('pci_pair')}: status {status.get('status')!r}"
+                f"pair {status.get('pci_pair')}: status {status.get('status')!r}"
                 + (f" ({detail})" if detail else "")
-                + " -- eine abgebrochene Messung ist keine Referenz"
+                + " -- an aborted measurement is not a reference"
             )
 
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
-        raise CheckFail("nccl_reference.json hat keine rows")
+        raise CheckFail("nccl_reference.json has no rows")
 
     arms = defaultdict(set)
     directions = defaultdict(set)
@@ -90,23 +90,23 @@ def check(step_dir: str) -> None:
         absent = missing_fields(row, MANDATORY)
         if absent:
             raise CheckFail(
-                f"rows[{i}]: Pflichtfelder fehlen {absent} -- der Lader verwirft "
-                "solche Zeilen, die Datei laedt dann als leer"
+                f"rows[{i}]: mandatory fields missing {absent} -- the loader drops "
+                "rows like that, so the file then loads as empty"
             )
         for field in ("p50_us", "p99_us"):
             if not is_number(row[field]):
-                raise CheckFail(f"rows[{i}]: {field} ist {row[field]!r}, keine Zahl")
+                raise CheckFail(f"rows[{i}]: {field} is {row[field]!r}, not a number")
         if row["p99_us"] < row["p50_us"]:
             raise CheckFail(
                 f"rows[{i}] ({row['op']} {row['size_bytes']}B {row['load']}): "
                 f"p99 {row['p99_us']} < p50 {row['p50_us']}"
             )
         if not is_number(row["iters"]) or row["iters"] < 1:
-            raise CheckFail(f"rows[{i}]: iters ist {row['iters']!r}")
+            raise CheckFail(f"rows[{i}]: iters is {row['iters']!r}")
         if row["transport"] in (None, ""):
             raise CheckFail(
-                f"rows[{i}]: transport ist leer -- ohne den NCCL_DEBUG-Befund ist "
-                "die Zeile nicht zuordenbar"
+                f"rows[{i}]: transport is empty -- without the NCCL_DEBUG finding "
+                "the row cannot be attributed to anything"
             )
 
         key = (
@@ -121,32 +121,32 @@ def check(step_dir: str) -> None:
 
     load_arms = {arm for arms_set in arms.values() for arm in arms_set}
     if "idle" not in load_arms:
-        raise CheckFail("kein idle-Arm -- ohne ihn gibt es kein Kostenmodell")
+        raise CheckFail("no idle arm -- without one there is no cost model")
     named_load = load_arms - {"idle"}
     if not named_load:
         raise CheckFail(
-            "kein benannter Last-Arm -- die Last-Achse ist Pflicht im Schema und "
-            "der Grund, warum das Format ueberhaupt festgelegt wurde"
+            "no named Last-Arm -- the load axis is mandatory in the schema and the "
+            "whole reason the format was pinned down in the first place"
         )
 
     incomplete = [k for k, v in arms.items() if not ({"idle"} | named_load) <= v]
     if incomplete:
         key = incomplete[0]
         raise CheckFail(
-            f"{len(incomplete)} Schluessel nur teilweise bearmt, z.B. "
-            f"{key[0]} {key[1]} {key[2]}B -- die Last-Achse muss symmetrisch "
-            "ueber dieselben Schluessel liegen"
+            f"{len(incomplete)} key(s) only partly armed, e.g. "
+            f"{key[0]} {key[1]} {key[2]}B -- the load axis has to lie symmetrisch "
+            "over the same keys"
         )
 
     if not directions:
         raise CheckFail(
-            "keine send_recv-Zeilen -- nur symmetrische Kollektive "
-            "mitteln die Asymmetrie des Rigs weg"
+            "no send_recv rows -- symmetric collectives alone average away the "
+            "rig's asymmetry"
         )
     for pair, seen in directions.items():
         if len(seen) < 2:
             raise CheckFail(
-                f"send_recv fuer {pair} nur in einer Richtung gemessen ({sorted(seen)})"
+                f"send_recv for {pair} measured in one Richtung only ({sorted(seen)})"
             )
 
     _check_loadable(payload)
@@ -159,16 +159,16 @@ def _check_loadable(payload: dict) -> None:
             load_nccl_reference,
         )
     except Exception as exc:
-        raise CheckStop(f"htccl_path_rates nicht importierbar: {exc}") from exc
+        raise CheckStop(f"htccl_path_rates not importable: {exc}") from exc
 
     res = load_nccl_reference(payload)
     if res.errors:
-        raise CheckFail(f"vom #279-Lader abgelehnt: {res.errors[0]}")
+        raise CheckFail(f"rejected by the #279 loader: {res.errors[0]}")
     if not res.profiles:
-        raise CheckFail("der #279-Lader baut NULL Profile aus der Datei")
+        raise CheckFail("the #279 loader builds ZERO profiles from the file")
     measured = [p for p in res.profiles if p.provenance == "measured"]
     if not measured:
-        raise CheckFail("kein einziges measured-Profil aus der Referenz")
+        raise CheckFail("not a single measured profile out of the reference")
 
 
 def main() -> int:

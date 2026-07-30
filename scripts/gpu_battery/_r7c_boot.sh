@@ -20,7 +20,7 @@ set -uo pipefail
 
 run_r7c_boot() {  # $1 = letter (a|b|c|d), $2 = recipe file name
     local letter="$1" recipe="$2"
-    local dir="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+    local dir="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
     local tmp_out="/tmp/r7c-boot-$letter"
     local tmp_log="/tmp/r7c-boot-$letter.server.log"
     local pidfile="/tmp/r7c-boot-$letter.pid"
@@ -35,26 +35,26 @@ run_r7c_boot() {  # $1 = letter (a|b|c|d), $2 = recipe file name
 
     battery_harvest_pidfile "$pidfile" "$dir/pids"
 
-    echo "== Rezept $recipe (unveraendert) mit WT=$WT =="
+    echo "== recipe $recipe (unmodified) with WT=$WT =="
     WT="$WT" REPO_ROOT="$REPO_ROOT" VENV="$VENV" MODEL_ROOT="$MODEL_ROOT" \
         bash "$WT/scripts/dual_group/r7c/$recipe"
     local rc=$?
     battery_stop_harvest
 
-    echo "== Ergebnisse einsammeln =="
+    echo "== collecting results =="
     if [ -d "$tmp_out" ]; then
         cp -a "$tmp_out/." "$dir/" 2>/dev/null
     else
-        echo "WARNUNG: $tmp_out existiert nicht -- das Rezept hat nichts geschrieben"
+        echo "WARNING: $tmp_out does not exist -- the recipe wrote nothing"
     fi
     [ -f "$tmp_log" ] && cp "$tmp_log" "$dir/server.log"
 
     # The card order the recipe resolved at runtime, kept next to the result:
     # every --rank-gpu-id in the log is only readable against it.
-    [ -f "$dir/cards.txt" ] && echo "Kartenreihenfolge:" && cat "$dir/cards.txt"
+    [ -f "$dir/cards.txt" ] && echo "card order:" && cat "$dir/cards.txt"
 
     ls -la "$dir"
-    echo "Rezept rc=$rc"
+    echo "recipe rc=$rc"
     return "$rc"
 }
 

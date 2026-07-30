@@ -1,66 +1,66 @@
-# Uebergabe an den Fixer
+# Handover to the fixer
 
-Auszufuellen bei jedem FAIL oder STOP, bevor der Executor endet.
+To be filled in on every FAIL or STOP, before the executor ends.
 
-Das Ziel ist eine einzige Eigenschaft: **der Fixer beginnt ohne einen neuen
-Lauf.** Ein Bericht, der ihn zwingt, den Boot zu wiederholen, hat das Boot-
-Fenster zweimal gekostet und nichts gespart. Alles unten Aufgefuehrte ist zum
-Zeitpunkt des Fehlschlags vorhanden — spaeter ist es teilweise weg.
+The goal is a single property: **the fixer starts without a new run.** A
+report that forces them to repeat the boot has spent the boot window twice and
+saved nothing. Everything listed below is available at the moment of the
+failure — later, some of it is gone.
 
-Bei mehreren Fehlschlaegen: pro Fehlschlag ein Block.
+With several failures: one block per failure.
 
 ---
 
-## Kopf
+## Header
 
-| Feld | Wert |
+| Field | Value |
 |---|---|
-| Lauf-Verzeichnis | `BATTERY_RUN=` |
-| Worktree / Commit | `WT=` / `git -C $WT rev-parse HEAD` |
-| Schritt | z. B. `s04_boot_c` |
-| Verdikt | FAIL oder STOP |
-| Verdikt-Zeile | die vollstaendige `BATTERY-…`-Zeile, woertlich |
-| Zeitstempel Start / Ende | ISO, aus `state.json` |
-| Dauer / Budget | `<dauer>s` von `<timeout_s>s` |
-| Versuch | 1 oder 2 (aus `state.json`, `attempts`) |
-| Treiber / torch / NCCL | aus `s00_preflight/preflight.json` |
+| Run directory | `BATTERY_RUN=` |
+| Worktree / commit | `WT=` / `git -C $WT rev-parse HEAD` |
+| Step | e.g. `s04_boot_c` |
+| Verdict | FAIL or STOP |
+| Verdict line | the complete `BATTERY-…` line, verbatim |
+| Timestamp start / end | ISO, from `state.json` |
+| Duration / budget | `<duration>s` out of `<timeout_s>s` |
+| Attempt | 1 or 2 (from `state.json`, `attempts`) |
+| Driver / torch / NCCL | from `s00_preflight/preflight.json` |
 
-## 1. Exaktes Kommando
+## 1. The exact command
 
-Woertlich, mit gesetzter Umgebung — so, wie es lief:
+Verbatim, with the environment as it was set — the way it ran:
 
 ```bash
-BATTERY_RUN=<…> WT=<…> bash run_step.sh <schritt>
+BATTERY_RUN=<…> WT=<…> bash run_step.sh <step>
 ```
 
-Abweichende Variablen (`P2P_BASELINE`, `GDR_TSV`, `SMOKE_MODEL`, `PORT`, …)
-nennen. Keine gesetzt: ausdruecklich „keine".
+Name any deviating variables (`P2P_BASELINE`, `GDR_TSV`, `SMOKE_MODEL`,
+`PORT`, …). None set: say "none" explicitly.
 
-## 2. Artefakte
+## 2. Artifacts
 
-Alle Pfade absolut. Die Datei, an der der Check haengengeblieben ist, zuerst.
+All paths absolute. The file the check got stuck on comes first.
 
-| Datei | Bedeutung | vorhanden |
+| File | Meaning | present |
 |---|---|---|
-| `<run>/<schritt>/step.log` | stdout/stderr des Schrittskripts | ja/nein |
-| `<run>/<schritt>/server.log` | Serverlog (bei Boot-Schritten) | ja/nein |
-| `<run>/<schritt>/<ergebnis>.json` | das gepruefte Artefakt | ja/nein |
-| `<run>/<schritt>/vram.csv`, `vram_summary.txt` | MIN-frei je Karte | ja/nein |
-| `<run>/<schritt>/cards.txt` | zur Laufzeit aufgeloeste Kartenreihenfolge | ja/nein |
-| `<run>/<schritt>/pyspy-*.txt` | Stack-Dumps (bei Haenger) | ja/nein |
-| `<run>/<schritt>/check.err` | stderr des Checks | ja/nein |
-| `<run>/state.json` | Verdikte, Versuche, Historie | ja |
+| `<run>/<step>/step.log` | stdout/stderr of the step script | yes/no |
+| `<run>/<step>/server.log` | server log (for boot steps) | yes/no |
+| `<run>/<step>/<result>.json` | the artifact that was checked | yes/no |
+| `<run>/<step>/vram.csv`, `vram_summary.txt` | MIN free per card | yes/no |
+| `<run>/<step>/cards.txt` | card order resolved at runtime | yes/no |
+| `<run>/<step>/pyspy-*.txt` | stack dumps (on a hang) | yes/no |
+| `<run>/<step>/check.err` | stderr of the check | yes/no |
+| `<run>/state.json` | verdicts, attempts, history | yes |
 
-**Fehlt eine Datei, ist ihr Fehlen der Befund** — als solchen melden, nicht als
-Formfehler.
+**If a file is missing, its absence is the finding** — report it as such, not
+as a formality.
 
-## 3. Log-Beweis: die Zeilen, nicht das Log
+## 3. Log evidence: the lines, not the log
 
-Nie ein ganzes Log einfuegen. Diese Greps laufen lassen und je Treffer die
-Zeile mit Zeilennummer zitieren (`grep -n`, maximal fuenf Zeilen Kontext):
+Never paste a whole log. Run these greps and quote each hit with its line
+number (`grep -n`, at most five lines of context):
 
 ```bash
-S=<run>/<schritt>
+S=<run>/<step>
 grep -n "CUDA out of memory\|torch.OutOfMemoryError" $S/server.log | head -5
 grep -n "Traceback (most recent call last)" $S/server.log | head -5
 grep -n "NCCL error\|Watchdog caught collective" $S/server.log | head -5
@@ -68,107 +68,106 @@ grep -n -iE "error|assert|refus|reject" $S/step.log | head -20
 tail -40 $S/server.log
 ```
 
-Zusaetzlich, je nach Schritt:
+In addition, depending on the step:
 
-* **s04_boot_c** — der Tensorname, an dem der Drafter-Load scheiterte:
+* **s04_boot_c** — the tensor name the drafter load failed on:
   `grep -n -iE "dflash|draft|tensor|key" $S/loader_lines.txt | head -20`
-* **s01 / s06** — die NCCL-Transportwahl:
+* **s01 / s06** — the NCCL transport choice:
   `grep -n -E "via (P2P|SHM|NET)" $S/results/run.log $S/nccl_debug.log | head -20`
-* **s07** — das `traceback`-Feld der fehlgeschlagenen Zeile in
-  `offload_register_gpu.json` (steht schon im JSON, nicht neu erzeugen)
-* **s08** — `errors` und `neutrality_violations` aus `dispatcher_tables.json`,
-  vollstaendig; beide sind kurz und beide sind der Befund
-* **s10-s12 (Host-Schritte)** — das Serverlog liegt auf dem HOST unter
-  `/root/battery-bar1/`, im Lauf-Verzeichnis stehen nur Grep-Ergebnis und Tail.
-  Also:
+* **s07** — the `traceback` field of the failed row in
+  `offload_register_gpu.json` (it is already in the JSON, do not regenerate it)
+* **s08** — `errors` and `neutrality_violations` from `dispatcher_tables.json`,
+  in full; both are short and both are the finding
+* **s10-s12 (host steps)** — the server log lives on the HOST under
+  `/root/battery-bar1/`; the run directory holds only the grep result and a
+  tail. So:
   ```bash
-  cat $S/htccl_lines.txt | head -40        # s11: Aufbau, ERREICHT, Riegel
-  cat $S/belege/*.txt | grep ERREICHT      # s12: Arm-Beleg je Punkt
-  tail -40 $S/server.log                   # begrenzter Tail, nicht das Log
+  cat $S/htccl_lines.txt | head -40        # s11: setup, ERREICHT, bolt
+  cat $S/belege/*.txt | grep ERREICHT      # s12: arm proof per point
+  tail -40 $S/server.log                   # bounded tail, not the log
   ```
-  Dazu je Schritt das eine JSON: `driver_state.json` (`missing` nennt genau,
-  was fehlt), `bar1_e2e.json` (`riegel`, `gruppen`, `graph_check`),
-  `prefill_kurve.json` (`abbruch`, `reihenfolge`, `grundlinie_abweichung_pct`).
-  Bei einem Haenger laufen die py-spy-Dumps auf dem Host und landen als
-  `$S/pyspy-host-*.txt`; die zugehoerigen PIDs stehen in `$S/host_pids`.
-  **Host-Locks mit pruefen** — CT999 und Host haben getrennte `/tmp`.
+  Plus the one JSON per step: `driver_state.json` (`missing` names exactly
+  what is absent), `bar1_e2e.json` (`riegel`, `gruppen`, `graph_check`),
+  `prefill_kurve.json` (`abbruch`, `reihenfolge`,
+  `grundlinie_abweichung_pct`). On a hang, the py-spy dumps run on the host
+  and land as `$S/pyspy-host-*.txt`; the matching PIDs are in `$S/host_pids`.
+  **Check the host locks too** — CT999 and the host have separate `/tmp`.
 
-## 4. Bei einem Haenger: der Stack, vor dem Kill
+## 4. On a hang: the stack, before the kill
 
-`run_step.sh` dumpt bei Zeitueberschreitung jeden registrierten Prozess nach
-`<schritt>/pyspy-<pid>.txt`. Diese Dumps gehoeren in die Uebergabe — ein
-Haenger ohne Stack muss reproduziert werden, ein gedumpter nicht.
+On a timeout, `run_step.sh` dumps every registered process to
+`<step>/pyspy-<pid>.txt`. Those dumps belong in the handover — a hang without
+a stack has to be reproduced, a dumped one does not.
 
-Fehlt ein Dump, obwohl der Schritt haengte: sagen, warum (py-spy nicht
-installiert, Prozess schon weg, PID nicht registriert). Das ist selbst ein
-Befund ueber die Batterie.
+If a dump is missing even though the step hung: say why (py-spy not
+installed, process already gone, PID not registered). That is itself a finding
+about the battery.
 
-## 5. Kartenzustand zum Zeitpunkt des Fehlschlags
+## 5. Card state at the moment of failure
 
 ```bash
 nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu \
-           --format=csv > <run>/<schritt>/nvidia-smi-after.csv
-cat <run>/<schritt>/nvidia-smi-after.csv
+           --format=csv > <run>/<step>/nvidia-smi-after.csv
+cat <run>/<step>/nvidia-smi-after.csv
 ls -d /tmp/gpu-card-*.lock 2>/dev/null && cat /tmp/gpu-card-*/info 2>/dev/null
 cat /spinning/gpu-arb/holder 2>/dev/null
-# Bei s10-s12 zusaetzlich die HOST-Seite -- eigenes /tmp, eigene Locks:
+# For s10-s12, the HOST side as well -- its own /tmp, its own locks:
 ssh -i /root/.ssh/id_root@proxmox -o BatchMode=yes -o ConnectTimeout=10 \
     root@192.168.0.1 'ls -d /tmp/gpu-card-*.lock 2>/dev/null; \
     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader'
 ```
 
-Dazu aus `vram_summary.txt` die **MIN-freien MiB je Karte** ueber den ganzen
-Lauf. Bei allem, was nach Speicher riecht, ist das die erste Zahl, die der
-Fixer braucht — und die einzige, die nachtraeglich nicht mehr erhebbar ist.
+Plus, from `vram_summary.txt`, the **MIN free MiB per card** over the whole
+run. For anything that smells of memory, that is the first number the fixer
+needs — and the only one that cannot be collected after the fact.
 
-## 6. Karten-Identitaet
+## 6. Card identity
 
-Aus `s00_preflight/preflight.json` bzw. `<schritt>/cards.txt`: je Karte
-NVML-Index, CUDA-Index, PCI-Adresse, UUID, Name.
+From `s00_preflight/preflight.json` or `<step>/cards.txt`: per card the NVML
+index, CUDA index, PCI address, UUID, name.
 
-Ohne diese Tabelle ist jeder Kartenindex im Bericht mehrdeutig — die CUDA- und
-die NVML-Reihenfolge unterscheiden sich auf diesem Rig, und die Zuordnung kann
-sich mit Treiber oder Boot verschieben.
+Without that table every card index in the report is ambiguous — the CUDA and
+the NVML order differ on this rig, and the mapping can shift with the driver
+or a boot.
 
-## 7. Was der Check konkret bemaengelt hat
+## 7. What the check actually objected to
 
-Die Verdikt-Zeile woertlich, dazu ein Satz, welche Bedingung im Check-Skript
-gebrochen ist (Datei und Funktion, z. B.
-`checks/check_common.py::check_accept_artifact`, Bedingung „Positionskurve
-deckt 0..K-1 ab"). Der Fixer soll die Assertion lesen koennen, ohne sie zu
-suchen.
+The verdict line verbatim, plus one sentence on which condition in the check
+script was broken (file and function, e.g.
+`checks/check_common.py::check_accept_artifact`, condition "position curve
+covers 0..K-1"). The fixer should be able to read the assertion without having
+to hunt for it.
 
-## 8. Was NICHT gemacht wurde
+## 8. What was NOT done
 
-Ausdruecklich auflisten, damit der Fixer nichts doppelt vermutet:
+List this explicitly so the fixer does not guess at anything twice:
 
-* Retry: ja/nein (und wenn ja: unveraendert?)
-* Rezepte/Skripte veraendert: **nein** (falls doch: sofort melden, das
-  Ergebnis ist dann nicht vergleichbar)
-* Prozesse gekillt: welche PIDs, mit oder ohne Dump
-* Nachgelagerte Schritte: nicht gefahren (welche)
+* Retry: yes/no (and if yes: unchanged?)
+* Recipes/scripts modified: **no** (if they were: report it immediately, the
+  result is then not comparable)
+* Processes killed: which PIDs, with or without a dump
+* Downstream steps: not run (which ones)
 
-## 9. Wiederaufnahme fuer den Fixer
+## 9. Resuming, for the fixer
 
-Der Fixer setzt nach dem Fix genau hier wieder an — ohne die gruenen Schritte
-zu wiederholen:
+After the fix the fixer picks up exactly here — without repeating the green
+steps:
 
 ```bash
-export BATTERY_RUN=<dasselbe Lauf-Verzeichnis>
+export BATTERY_RUN=<the same run directory>
 cd <WT>/scripts/gpu_battery
 /spinning/htsglang-gpu/.venv/bin/python battery_state.py plan
-bash run_step.sh <der gescheiterte Schritt>
+bash run_step.sh <the step that failed>
 ```
 
-Gruen gewordene Schritte bleiben gruen. Besteht nach dem Fix Zweifel an einem
-frueheren gruenen Schritt, wird er ausdruecklich erzwungen — nicht durch
-Loeschen von Artefakten:
+Steps that went green stay green. If after the fix there is doubt about an
+earlier green step, it is forced explicitly — not by deleting artifacts:
 
 ```bash
-bash run_step.sh <schritt> --force
+bash run_step.sh <step> --force
 ```
 
-Aktuellen Stand jederzeit:
+Current state at any time:
 
 ```bash
 /spinning/htsglang-gpu/.venv/bin/python battery_state.py status

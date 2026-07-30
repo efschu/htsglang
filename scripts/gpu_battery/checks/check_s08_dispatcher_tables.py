@@ -51,66 +51,64 @@ def check(step_dir: str) -> None:
         entry = sources.get(name) or {}
         if not entry.get("exists"):
             raise CheckStop(
-                f"Quelle {name} fehlt ({entry.get('path')}) -- ohne sie ist der "
-                "Lauf nicht von einem Lauf ganz ohne Karten unterscheidbar"
+                f"source {name} is missing ({entry.get('path')}) -- without it the "
+                "run is indistinguishable from a run with no cards at all"
             )
 
     errors = payload.get("errors") or []
     if errors:
-        raise CheckFail(f"{len(errors)} Lader-Fehler, erster: {errors[0]}")
+        raise CheckFail(f"{len(errors)} loader error(s), first: {errors[0]}")
 
     profiles = payload.get("profiles") or {}
     if not profiles.get("measured"):
         raise CheckFail(
-            "null measured-Profile -- die frischen Quellen sind still zu "
-            "Platzhaltern degradiert"
+            "zero measured profiles -- the fresh sources were silently degraded to "
+            "Platzhalter"
         )
     # Apertures exist only where peer access does. On a rig without P2P their
     # absence is the correct result, not a gap.
     if payload.get("peer_capable_pairs") and not payload.get("apertures"):
         raise CheckFail(
-            "null effektive Aperturen trotz peer-faehiger Paare -- die capability "
-            "matrix hat nichts beigetragen und jeder direkte Pfad ist unbegrenzt"
+            "zero effective apertures despite peer-capable pairs -- the capability "
+            "matrix contributed nothing and every direct path is unbounded"
         )
 
     violations = payload.get("neutrality_violations") or []
     if violations:
         first = violations[0]
         raise CheckFail(
-            f"{len(violations)} Verstoss/Verstoesse gegen die Platzhalter-"
-            f"Neutralitaet, erster: {first.get('violation')}"
+            f"{len(violations)} violation(s) of Platzhalter neutrality, first: "
+            f"{first.get('violation')}"
         )
     if payload.get("sensor_consulted_under_placeholder"):
         raise CheckFail(
-            "der Saettigungs-Sensor wurde unter einem Platzhalter-Kandidaten "
-            "konsultiert -- harte Regel 1 verlangt, dass er davor gar nicht "
-            "befragt wird"
+            "the saturation sensor was consulted under a Platzhalter candidate -- "
+            "hard rule 1 demands that it not be asked at all before that point"
         )
     if payload.get("latency_consulted_under_placeholder"):
         raise CheckFail(
-            "der Offload-Latenz-Term wurde unter einem Platzhalter-Kandidaten "
-            "konsultiert"
+            "the offload latency term was consulted under a Platzhalter candidate"
         )
 
     decisions = payload.get("decisions") or []
     if not decisions:
-        raise CheckFail("keine Entscheide protokolliert")
+        raise CheckFail("no decisions recorded")
     contaminated = [
         d for d in decisions if d.get("message_class") == "battery_contaminated"
     ]
     if not contaminated:
-        raise CheckFail("die kontaminierte Klasse wurde gar nicht befragt")
+        raise CheckFail("the contaminated class was never asked at all")
     for d in contaminated:
         if not d.get("status_quo"):
             raise CheckFail(
-                f"kontaminierte Klasse entschied {d.get('path')!r} bei "
+                f"contaminated class decided {d.get('path')!r} at "
                 f"{d.get('nbytes')} B (protected={d.get('protected')})"
             )
 
     if not payload.get("measured_class_decided_paths"):
         raise CheckFail(
-            "die vollstaendig gemessene Klasse entschied nirgends einen echten "
-            "Pfad -- die Tabellen wurden geladen und dann ignoriert"
+            "the fully measured class never decided a real path anywhere -- the "
+            "tables were loaded and then ignored"
         )
 
 

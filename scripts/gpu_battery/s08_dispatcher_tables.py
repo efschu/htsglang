@@ -153,11 +153,11 @@ def main() -> int:
 
     def sensor(path_name):
         trap["sensor"] = True
-        raise ConsultedError(f"Saettigungs-Sensor fuer {path_name} konsultiert")
+        raise ConsultedError(f"saturation sensor consulted for {path_name}")
 
     def latency_term(offload_class):
         trap["latency"] = True
-        raise ConsultedError(f"Latenz-Term fuer {offload_class} konsultiert")
+        raise ConsultedError(f"latency term consulted for {offload_class}")
 
     decisions = []
     violations = []
@@ -202,8 +202,8 @@ def main() -> int:
                 violations.append(
                     {
                         **row,
-                        "violation": "Klasse mit Platzhalter-Kandidat hat NICHT "
-                        "auf den Status quo entschieden",
+                        "violation": "class with a Platzhalter candidate did "
+                        "NOT decide the status quo",
                     }
                 )
 
@@ -246,12 +246,12 @@ def main() -> int:
         json.dump(payload, f, indent=2)
         f.write("\n")
 
-    print(f"Profile: {len(measured)} measured, {len(placeholders)} placeholder")
-    print(f"Aperturen: {len(result.apertures)}")
-    print(f"Lader-Fehler: {len(result.errors)}")
-    print(f"Neutralitaets-Verstoesse: {len(violations)}")
-    print(f"gemessene Klasse entschied Pfade: {sorted(measured_paths) or 'keine'}")
-    print(f"geschrieben: {args.out}")
+    print(f"profiles: {len(measured)} measured, {len(placeholders)} placeholder")
+    print(f"apertures: {len(result.apertures)}")
+    print(f"loader errors: {len(result.errors)}")
+    print(f"neutrality violations: {len(violations)}")
+    print(f"measured class decided paths: {sorted(measured_paths) or 'none'}")
+    print(f"written: {args.out}")
     return 0
 
 

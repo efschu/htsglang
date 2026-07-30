@@ -81,7 +81,7 @@ def check(step_dir: str) -> None:
     results = os.path.join(step_dir, "results")
     if not os.path.isdir(results):
         raise CheckStop(
-            f"kein results-Verzeichnis ({results}) -- run_all.sh ist nicht gelaufen"
+            f"no results directory ({results}) -- run_all.sh never ran"
         )
 
     cap = load_json(
@@ -106,8 +106,8 @@ def _check_capability(cap: dict) -> bool:
     pairs = cap.get(CAPABILITY_ROWS_KEY)
     if not isinstance(pairs, list) or not pairs:
         raise CheckFail(
-            f"capability_matrix.json hat keine {CAPABILITY_ROWS_KEY} "
-            f"(Top-Level-Schluessel: {sorted(cap)})"
+            f"capability_matrix.json has no {CAPABILITY_ROWS_KEY} "
+            f"(top-level keys: {sorted(cap)})"
         )
 
     directed = set()
@@ -116,32 +116,32 @@ def _check_capability(cap: dict) -> bool:
         where = f"capability_matrix {CAPABILITY_ROWS_KEY}[{i}]"
         src, dst = row.get("src_pci"), row.get("dst_pci")
         if not src or not dst:
-            raise CheckFail(f"{where}: src_pci/dst_pci fehlt")
+            raise CheckFail(f"{where}: src_pci/dst_pci missing")
         directed.add((src, dst))
         if row.get("can_access_peer") is None:
             raise CheckFail(
-                f"capability_matrix {src}->{dst}: can_access_peer ist None -- "
-                "die Sonde ist nicht gelaufen (None ist nicht False)"
+                f"capability_matrix {src}->{dst}: can_access_peer is None -- "
+                "the probe never ran (None is not False)"
             )
         # The dst BAR classification travels with the DIRECTED row because the
         # constraint is the target's window, not the source's.
         klass = row.get("dst_bar1_classification")
         if klass not in BAR_CLASSES:
             raise CheckFail(
-                f"capability_matrix {src}->{dst}: dst_bar1_classification ist "
-                f"{klass!r}, erwartet eine von {BAR_CLASSES} -- ohne sie ist die "
-                "Zeile nicht gegen die Gegenrichtung lesbar"
+                f"capability_matrix {src}->{dst}: dst_bar1_classification is "
+                f"{klass!r}, expected one of {BAR_CLASSES} -- without it the row "
+                "cannot be read against the opposite direction"
             )
         nominal = row.get("dst_bar1_nominal_bytes")
         if not isinstance(nominal, int) or isinstance(nominal, bool) or nominal <= 0:
             raise CheckFail(
-                f"capability_matrix {src}->{dst}: dst_bar1_nominal_bytes ist "
-                f"{nominal!r} -- die Klassifikation {klass!r} haengt an dieser Zahl"
+                f"capability_matrix {src}->{dst}: dst_bar1_nominal_bytes is "
+                f"{nominal!r} -- the {klass!r} classification hangs on that number"
             )
         if not isinstance(row.get("probe_errors"), list):
             raise CheckFail(
-                f"capability_matrix {src}->{dst}: probe_errors fehlt oder ist keine "
-                "Liste -- Sondenfehler sind Messergebnisse und muessen dastehen"
+                f"capability_matrix {src}->{dst}: probe_errors is missing or not a "
+                "list -- probe errors are measurement results and have to be there"
             )
         if row.get("can_access_peer"):
             p2p_pairs.append(row)
@@ -151,8 +151,8 @@ def _check_capability(cap: dict) -> bool:
     for src, dst in list(directed):
         if (dst, src) not in directed:
             raise CheckFail(
-                f"capability_matrix: Paar {dst}->{src} fehlt, die Matrix ist nicht "
-                "gerichtet vollstaendig"
+                f"capability_matrix: pair {dst}->{src} is missing, the matrix is not "
+                "complete in both directions"
             )
 
     # The per-row classification is a copy of the target card's; if the two
@@ -166,13 +166,13 @@ def _check_capability(cap: dict) -> bool:
         dev = by_pci.get(row["dst_pci"])
         if dev is None:
             raise CheckFail(
-                f"capability_matrix: dst {row['dst_pci']} kommt in devices[] nicht "
-                "vor -- Matrix und Kartenerhebung passen nicht zusammen"
+                f"capability_matrix: dst {row['dst_pci']} does not appear in "
+                "devices[] -- matrix and card survey do not match"
             )
         if dev.get("bar1_classification") != row["dst_bar1_classification"]:
             raise CheckFail(
-                f"capability_matrix {row['src_pci']}->{row['dst_pci']}: Zeile sagt "
-                f"{row['dst_bar1_classification']!r}, devices[] sagt "
+                f"capability_matrix {row['src_pci']}->{row['dst_pci']}: the row says "
+                f"{row['dst_bar1_classification']!r}, devices[] says "
                 f"{dev.get('bar1_classification')!r}"
             )
 
@@ -185,17 +185,17 @@ def _check_capability(cap: dict) -> bool:
             value = row.get(field)
             if value is None:
                 raise CheckFail(
-                    f"capability_matrix {src}->{dst}: {field} ist None, obwohl "
-                    "can_access_peer True -- die effektive Apertur wurde nicht gemessen"
+                    f"capability_matrix {src}->{dst}: {field} is None even though "
+                    "can_access_peer is True -- the effective aperture was not measured"
                 )
             if not isinstance(value, int) or value < 0:
                 raise CheckFail(
-                    f"capability_matrix {src}->{dst}: {field} ist {value!r}"
+                    f"capability_matrix {src}->{dst}: {field} is {value!r}"
                 )
         if row["effective_max_single_copy_bytes"] == 0 and not row.get("probe_errors"):
             raise CheckFail(
-                f"capability_matrix {src}->{dst}: effektive Apertur 0 ohne einen "
-                "einzigen probe_error -- das ist kein Messergebnis, sondern eine Luecke"
+                f"capability_matrix {src}->{dst}: effective aperture 0 without a "
+                "single probe_error -- that is not a measurement, that is a gap"
             )
 
     return bool(p2p_pairs)
@@ -204,36 +204,36 @@ def _check_capability(cap: dict) -> bool:
 def _check_d2d(d2d: dict) -> None:
     pairs = d2d.get("pairs")
     if not isinstance(pairs, list) or not pairs:
-        raise CheckFail("d2d_bench.json hat keine pairs")
+        raise CheckFail("d2d_bench.json has no pairs")
     modes = set()
     for i, row in enumerate(pairs):
         if not row.get("src_pci") or not row.get("dst_pci"):
-            raise CheckFail(f"d2d_bench pairs[{i}]: src_pci/dst_pci fehlt")
+            raise CheckFail(f"d2d_bench pairs[{i}]: src_pci/dst_pci missing")
         mode = row.get("mode")
         if mode not in ("direct", "staged"):
-            raise CheckFail(f"d2d_bench pairs[{i}]: mode ist {mode!r}")
+            raise CheckFail(f"d2d_bench pairs[{i}]: mode is {mode!r}")
         modes.add(mode)
         label = f"d2d_bench {row['src_pci']}->{row['dst_pci']} ({mode})"
         points = row.get("points") or []
         if len(points) < 4:
-            raise CheckFail(f"{label}: nur {len(points)} Leiterpunkte")
+            raise CheckFail(f"{label}: only {len(points)} ladder points")
         bracket_seen = set()
         for j, pt in enumerate(points):
             size = pt.get("size_bytes")
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-                raise CheckFail(f"{label}: points[{j}].size_bytes ist {size!r}")
+                raise CheckFail(f"{label}: points[{j}].size_bytes is {size!r}")
             if size % MIB == 0 and size // MIB in BRACKET_MIB:
                 bracket_seen.add(size // MIB)
             status = pt.get("status")
             if status not in ("ok", "failed"):
-                raise CheckFail(f"{label}: points[{j}].status ist {status!r}")
+                raise CheckFail(f"{label}: points[{j}].status is {status!r}")
             # A failed point is a RESULT (above the effective aperture); it must
             # say why. An ok point must carry the number it was measured for.
             if status == "failed":
                 if not pt.get("error"):
                     raise CheckFail(
-                        f"{label}: points[{j}] ist failed ohne error -- ein Punkt "
-                        "ohne Grund ist keine Messung"
+                        f"{label}: points[{j}] is failed without an error -- a point "
+                        "without a reason is not a measurement"
                     )
             else:
                 require_number(pt.get("median_s"), f"{label}: points[{j}].median_s")
@@ -241,14 +241,14 @@ def _check_d2d(d2d: dict) -> None:
         # about the pair that stepped over it.
         if not set(BRACKET_MIB) <= bracket_seen:
             raise CheckFail(
-                f"{label}: die 255/256/257-MiB-Klammer fehlt (gefunden: "
-                f"{sorted(bracket_seen)}) -- der Knick an der Fenstergrenze ist "
-                "die Messung"
+                f"{label}: the 255/256/257-MiB-Klammer is missing (found: "
+                f"{sorted(bracket_seen)}) -- the knee at the window boundary IS "
+                "the measurement"
             )
     if "direct" not in modes or "staged" not in modes:
         raise CheckFail(
-            f"d2d_bench: nur Modi {sorted(modes)} -- direkt gegen Host-Staging ist "
-            "die Frage, ein Modus allein beantwortet sie nicht"
+            f"d2d_bench: only mode(s) {sorted(modes)} -- direct against host staging "
+            "is the question, and one mode alone does not answer it"
         )
     _check_d2d_arms(d2d)
 
@@ -261,24 +261,24 @@ def _check_d2d_arms(d2d: dict) -> None:
     arms = d2d.get("arms")
     if not isinstance(arms, list) or not arms:
         raise CheckFail(
-            "d2d_bench.json hat keine arms -- die Druckarme (bidir/dual-window) "
-            "sind die einzige Messung unter gleichzeitiger Aperturlast"
+            "d2d_bench.json has no arms -- the pressure arms (bidir/dual-window) are "
+            "the only measurement taken under simultaneous aperture load"
         )
     for i, arm in enumerate(arms):
         kind = arm.get("kind")
         if not kind:
-            raise CheckFail(f"d2d_bench arms[{i}]: kind fehlt")
+            raise CheckFail(f"d2d_bench arms[{i}]: kind missing")
         legs = arm.get("legs")
         if not isinstance(legs, list) or len(legs) < 2:
             raise CheckFail(
-                f"d2d_bench arms[{i}] ({kind}): {len(legs or [])} Leg(s) -- ein Arm "
-                "mit weniger als zwei gleichzeitigen Kopien ist kein Druckarm"
+                f"d2d_bench arms[{i}] ({kind}): {len(legs or [])} leg(s) -- an arm "
+                "with fewer than two simultaneous copies is not a pressure arm"
             )
         for j, leg in enumerate(legs):
             status = leg.get("status")
             if status not in ("ok", "failed"):
                 raise CheckFail(
-                    f"d2d_bench arms[{i}] ({kind}) legs[{j}]: status ist {status!r}"
+                    f"d2d_bench arms[{i}] ({kind}) legs[{j}]: status is {status!r}"
                 )
             if status == "ok":
                 require_number(
@@ -290,19 +290,19 @@ def _check_d2d_arms(d2d: dict) -> None:
 def _check_nccl(nccl: dict) -> None:
     pairs = nccl.get("pairs")
     if not isinstance(pairs, list) or not pairs:
-        raise CheckFail("nccl_transport.json hat keine pairs")
+        raise CheckFail("nccl_transport.json has no pairs")
     for row in pairs:
         status = row.get("status")
         if status != "ok":
             raise CheckFail(
-                f"nccl_transport {row.get('pci_pair')}: status {status!r} -- ein "
-                f"Timeout oder Absturz ist kein Transportbefund; "
+                f"nccl_transport {row.get('pci_pair')}: status {status!r} -- a "
+                f"timeout or a crash is not a transport finding; "
                 f"{_nccl_cause(row)}"
             )
         if not row.get("transport_summary"):
             raise CheckFail(
-                f"nccl_transport {row.get('pci_pair')}: leeres transport_summary, "
-                "der NCCL_DEBUG-Grep hat nichts gefunden"
+                f"nccl_transport {row.get('pci_pair')}: empty transport_summary, the "
+                "NCCL_DEBUG grep found nothing"
             )
 
 
@@ -327,8 +327,8 @@ def _nccl_cause(row: dict) -> str:
     for marker in _NCCL_CAUSE_MARKERS:
         for line in tail.splitlines():
             if marker in line:
-                return f"Ursache laut log_tail: {line.strip()[:180]}"
-    return "log_tail nennt keine Ursache"
+                return f"cause according to log_tail: {line.strip()[:180]}"
+    return "log_tail names no cause"
 
 
 def _check_loadable(cap: dict, d2d: dict, any_p2p: bool) -> None:
@@ -339,28 +339,28 @@ def _check_loadable(cap: dict, d2d: dict, any_p2p: bool) -> None:
             load_p2p_d2d_bench,
         )
     except Exception as exc:  # an unimportable consumer is an env problem
-        raise CheckStop(f"htccl_path_rates nicht importierbar: {exc}") from exc
+        raise CheckStop(f"htccl_path_rates not importable: {exc}") from exc
 
     cap_res = load_p2p_capability_matrix(cap)
     if cap_res.errors:
         raise CheckFail(
-            f"capability_matrix vom #279-Lader abgelehnt: {cap_res.errors[0]}"
+            f"capability_matrix rejected by the #279 loader: {cap_res.errors[0]}"
         )
     # Apertures only exist where peer access does. A rig where NCCL picks no
     # P2P for any pair is a fully recorded outcome -- demanding an aperture
     # there would turn the honest answer into a failure.
     if any_p2p and not cap_res.apertures:
         raise CheckFail(
-            "capability_matrix ergibt beim #279-Lader NULL Aperturen, obwohl "
-            "Peer-Zugriff gemessen wurde -- nur nominale Zeilen werden "
-            "uebersprungen, damit bleibt der Dispatcher auf Platzhaltern"
+            "capability_matrix yields ZERO apertures in the #279 loader even though "
+            "peer access was measured -- purely nominal rows get skipped, which "
+            "leaves the dispatcher on placeholders"
         )
 
     d2d_res = load_p2p_d2d_bench(d2d)
     if d2d_res.errors:
-        raise CheckFail(f"d2d_bench vom #279-Lader abgelehnt: {d2d_res.errors[0]}")
+        raise CheckFail(f"d2d_bench rejected by the #279 loader: {d2d_res.errors[0]}")
     if not d2d_res.profiles:
-        raise CheckFail("d2d_bench ergibt beim #279-Lader NULL Profile")
+        raise CheckFail("d2d_bench yields ZERO profiles in the #279 loader")
 
 
 def main() -> int:

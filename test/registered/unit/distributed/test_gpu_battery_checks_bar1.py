@@ -54,19 +54,19 @@ from s12_prefill_kurve import tabelle, zusammenfassen  # noqa: E402
 # parallel_state.py:638 / htccl.py:645 and htccl_bar1.py:1518 / :1530, with the
 # "<lineno>:" prefix that grep -n puts in front of them.
 LOG_GROUP_OK = (
-    "412:[2026-07-30 03:11:02] HTCCL enabled for group 'tp:0': angefordert=bar1, "
-    "ERREICHT=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the "
+    "412:[2026-07-30 03:11:02] HTCCL enabled for group 'tp:0': requested=bar1, "
+    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the "
     "host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph."
 )
 LOG_GROUP_OK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL enabled for group 'dcp:0': angefordert=bar1, "
-    "ERREICHT=bar1. Every SGLANG_HTCCL* env must be identical on all ranks."
+    "418:[2026-07-30 03:11:02] HTCCL enabled for group 'dcp:0': requested=bar1, "
+    "ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks."
 )
 LOG_GROUP_FALLBACK_DCP = (
-    "418:[2026-07-30 03:11:02] HTCCL group 'dcp:0': angefordert=bar1, ERREICHT=gloo "
-    "(aufbau: Bar1Unverfuegbar: Halter meldet ENOMEM). Diese Gruppe laeuft NICHT "
-    "ueber bar1. Ein Messwert aus diesem Lauf ist gemischt und darf nicht als "
-    "bar1-Wert berichtet werden."
+    "418:[2026-07-30 03:11:02] HTCCL group 'dcp:0': requested=bar1, ACHIEVED=gloo "
+    "(setup: Bar1Unverfuegbar: Halter meldet ENOMEM). This group does NOT run "
+    "over bar1. A measurement from this run is mixed and must not be reported "
+    "as a bar1 value."
 )
 LOG_AUFBAU = (
     "400:[2026-07-30 03:11:01] HTCCL-BAR1: Aufbau in 27 ms, 2 Peer-Ziele, Region "
@@ -90,20 +90,20 @@ LOG_RIEGEL = (
 
 GRAPH_CHECK_OK = """BAR1-Graph-Beleg: Geraete [0, 1, 2], 3 Raenge
 --- Fall 'einfach' ----------------------------------------
-    => BESTANDEN
+    => PASSED
 ==============================================================
 Zusammenfassung
 ==============================================================
-  BESTANDEN  [Gate]  einfach
-  BESTANDEN  [Gate]  two-graphs
-  BESTANDEN  [Gate]  wechselnde-form
-  BESTANDEN  [Gate]  reservation
-  BESTANDEN  [Info]  gitter
+  PASSED  [Gate]  einfach
+  PASSED  [Gate]  two-graphs
+  PASSED  [Gate]  wechselnde-form
+  PASSED  [Gate]  reservation
+  PASSED  [Info]  gitter
 
 Alle Gate-Faelle bestanden.
 """
 GRAPH_CHECK_FALLEN = GRAPH_CHECK_OK.replace(
-    "  BESTANDEN  [Gate]  two-graphs", "  GEFALLEN   [Gate]  two-graphs"
+    "  PASSED  [Gate]  two-graphs", "  FAILED  [Gate]  two-graphs"
 ).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: two-graphs.")
 
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
@@ -478,7 +478,7 @@ class TestDriverCompose:
 def _e2e(**over) -> dict:
     payload = {
         "kind": "bar1_e2e",
-        "schema_version": 4,
+        "schema_version": 5,
         "host": "192.168.0.1",
         "reachable": True,
         "integration_present": True,
@@ -494,8 +494,8 @@ def _e2e(**over) -> dict:
             "alle_bestanden": True,
         },
         "gruppen": [
-            {"gruppe": "dcp:0", "angefordert": "bar1", "erreicht": "bar1"},
-            {"gruppe": "tp:0", "angefordert": "bar1", "erreicht": "bar1"},
+            {"group": "dcp:0", "requested": "bar1", "achieved": "bar1"},
+            {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
         ],
         "gruppen_bar1": ["dcp:0", "tp:0"],
         "gruppen_ausgewichen": [],
@@ -635,8 +635,8 @@ class TestE2ECheck:
             tmp_path,
             _e2e(
                 gruppen=[
-                    {"gruppe": "dcp:0", "angefordert": "bar1", "erreicht": "gloo"},
-                    {"gruppe": "tp:0", "angefordert": "bar1", "erreicht": "bar1"},
+                    {"group": "dcp:0", "requested": "bar1", "achieved": "gloo"},
+                    {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
                 ],
                 gruppen_bar1=["tp:0"],
                 gruppen_ausgewichen=["dcp:0"],
@@ -711,7 +711,7 @@ class TestE2ECheck:
         _write_e2e(
             tmp_path,
             _e2e(
-                gruppen=[{"gruppe": "tp:0", "angefordert": "bar1", "erreicht": "bar1"}],
+                gruppen=[{"group": "tp:0", "requested": "bar1", "achieved": "bar1"}],
                 gruppen_bar1=["tp:0"],
                 aufbau_gruppen=["tp:0"],
             ),
@@ -740,7 +740,7 @@ class TestE2ECheck:
     def test_under_provisioned_smoke_has_its_own_verdict(self, tmp_path):
         """It must never read as a transport finding.
 
-        This is the 2026-07-30 outcome: 9x ERREICHT=bar1, no bolt, a full
+        This is the 2026-07-30 outcome: 9x ACHIEVED=bar1, no bolt, a full
         boot -- and a smoke that spent its budget on a thinking preamble.
         Reporting that as "incoherent" invites the reading that bar1
         corrupted the output, which the byte proofs rule out.
@@ -803,8 +803,8 @@ class TestE2EParsing:
             )
         )
         out = parse_log_evidence(str(tmp_path))
-        assert [g["gruppe"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
-        assert all(g["erreicht"] == "bar1" for g in out["gruppen"])
+        assert [g["group"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
+        assert all(g["achieved"] == "bar1" for g in out["gruppen"])
         assert out["aufbau_gruppen"] == ["tp:0", "dcp:0"]
         assert out["aufbau_lines"] == 1
         assert out["riegel"] is None
@@ -814,10 +814,10 @@ class TestE2EParsing:
             "\n".join([LOG_GROUP_OK, LOG_GROUP_FALLBACK_DCP])
         )
         out = parse_log_evidence(str(tmp_path))
-        by_name = {g["gruppe"]: g for g in out["gruppen"]}
-        assert by_name["tp:0"]["erreicht"] == "bar1"
-        assert by_name["dcp:0"]["erreicht"] == "gloo"
-        assert by_name["dcp:0"]["angefordert"] == "bar1"
+        by_name = {g["group"]: g for g in out["gruppen"]}
+        assert by_name["tp:0"]["achieved"] == "bar1"
+        assert by_name["dcp:0"]["achieved"] == "gloo"
+        assert by_name["dcp:0"]["requested"] == "bar1"
 
     def test_plain_traceback_is_a_fatal(self, tmp_path):
         """A boot killed by a traceback -- no OOM, no NCCL error -- is just as
@@ -865,7 +865,7 @@ class TestE2EParsing:
         )
         out = parse_log_evidence(str(tmp_path))
         assert out["log_quellen"] == ["server.log"]
-        assert [g["gruppe"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
+        assert [g["group"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
         assert out["aufbau_lines"] == 1
 
     def test_no_log_file_at_all_is_visible_as_such(self, tmp_path):
@@ -909,10 +909,10 @@ class TestAgainstTheRealS11Log:
     def test_the_evidence_is_found_in_the_real_log(self, tmp_path):
         out = parse_log_evidence(str(self._step_dir(tmp_path)))
         assert out["log_quellen"] == ["server.log"]
-        assert [g["gruppe"] for g in out["gruppen"]] == [
+        assert [g["group"] for g in out["gruppen"]] == [
             "dcp:0", "tp:0", "world:0",
         ]
-        assert all(g["erreicht"] == "bar1" for g in out["gruppen"])
+        assert all(g["achieved"] == "bar1" for g in out["gruppen"])
         assert out["riegel"]["op"] == "broadcast"
         assert out["riegel"]["bytes"] == 128
         assert "Traceback" in out["fatal"]
@@ -932,7 +932,7 @@ class TestAgainstTheGreenTransportRun:
     """Attempt 3, on the card: the transport side really carried the run.
 
     The counterpart to the fixture above. Same day, same step, after the
-    broadcast coverage landed: nine ERREICHT=bar1 lines over world:0, tp:0
+    broadcast coverage landed: nine ACHIEVED=bar1 lines over world:0, tp:0
     and dcp:0, no bolt, and all SEVEN gate cases passed -- including
     `broadcast` and `broadcast-two-graphs`, which is the on-card proof
     that a broadcast survives capture and replay.
@@ -1349,8 +1349,8 @@ def _kurve(**over) -> dict:
             folge += 1
             gruppen = (
                 [
-                    {"gruppe": "tp:0", "angefordert": "bar1", "erreicht": "bar1"},
-                    {"gruppe": "dcp:0", "angefordert": "bar1", "erreicht": "bar1"},
+                    {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
+                    {"group": "dcp:0", "requested": "bar1", "achieved": "bar1"},
                 ]
                 if arm == "bar1"
                 else []
@@ -1369,7 +1369,7 @@ def _kurve(**over) -> dict:
             )
     payload = {
         "kind": "bar1_prefill_kurve",
-        "schema_version": 1,
+        "schema_version": 2,
         "arme": ["bar1", "grundlinie"],
         "sessions_geplant": plan,
         "abbruch": None,
@@ -1493,17 +1493,17 @@ class TestPrefillKurveCheck:
 
     def test_bar1_point_with_a_gloo_group_is_fail(self, tmp_path):
         payload = _kurve()
-        payload["reihenfolge"][0]["gruppen"][1]["erreicht"] = "gloo"
+        payload["reihenfolge"][0]["gruppen"][1]["achieved"] = "gloo"
         _write_kurve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
-        assert "gemischter Punkt" in line
+        assert "mixed point" in line
 
     def test_baseline_point_with_htccl_is_fail(self, tmp_path):
         """The baseline arm differs in exactly three variables; if it sees
         HTCCL at all, the two arms are not the two arms."""
         payload = _kurve()
         payload["reihenfolge"][1]["gruppen"] = [
-            {"gruppe": "tp:0", "angefordert": "bar1", "erreicht": "bar1"}
+            {"group": "tp:0", "requested": "bar1", "achieved": "bar1"}
         ]
         _write_kurve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
@@ -1644,7 +1644,7 @@ class TestPrefillKurveSummary:
             1310.0 / 1190.0
         )
         assert abs(payload["grundlinie_abweichung_pct"]["1"]) < 0.1
-        assert payload["reihenfolge"][0]["gruppen"][0]["erreicht"] == "bar1"
+        assert payload["reihenfolge"][0]["gruppen"][0]["achieved"] == "bar1"
         assert payload["reihenfolge"][1]["gruppen"] == []
         assert payload["fatal"] == []
         assert payload["fatal_ungeprueft"] == []

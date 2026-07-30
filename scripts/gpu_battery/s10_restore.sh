@@ -28,18 +28,18 @@ OUT="${BATTERY_STEP_DIR:-/tmp/s10_restore.$$}"
 mkdir -p "$OUT"
 
 if ! host_reachable; then
-    echo "STOP: Host $BAR1_HOST nicht erreichbar"
+    echo "STOP: host $BAR1_HOST not reachable"
     exit 2
 fi
 
-echo "== Wer benutzt die Karten? =="
+echo "== who is using the cards? =="
 host_ssh_for 60 'nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader' \
     > "$OUT/compute_apps.csv" 2>/dev/null
 APPS="$(host_count_nonempty "$OUT/compute_apps.csv")"
 if [ "$APPS" -gt 0 ] && [ "$FORCE" != 1 ]; then
-    echo "STOP: $APPS Rechenprozess(e) auf den Karten:"
+    echo "STOP: $APPS compute process(es) on the cards:"
     cat "$OUT/compute_apps.csv"
-    echo "Erst beenden lassen, dann erneut (oder --force, wenn der Operator das so will)."
+    echo "Let them finish first, then retry (or --force, if the operator wants it that way)."
     exit 2
 fi
 
@@ -48,9 +48,10 @@ host_ssh_for 60 'ps -eo pid,user,comm,args --no-headers > /tmp/bar1-ps.snap; \
     > "$OUT/holders.txt" 2>/dev/null
 HOLDERS="$(host_count_nonempty "$OUT/holders.txt")"
 if [ "$HOLDERS" -gt 0 ] && [ "$FORCE" != 1 ]; then
+    # "Prozesse halten die Module" is a fixed marker downstream.
     echo "STOP: Prozesse halten die Module:"
     cat "$OUT/holders.txt"
-    echo "Dieses Skript beendet keine Betrachter -- das ist eine Nutzer-Entscheidung."
+    echo "This script terminates no viewers -- that is a user decision."
     exit 2
 fi
 
@@ -65,7 +66,7 @@ for i in 1 2 3 4 5 6; do
   sleep 3
 done
 if lsmod | grep -q "^nvidia"; then
-  echo "FEHLER: nvidia laesst sich nicht entladen"; lsmod | grep "^nvidia"; exit 3
+  echo "ERROR: nvidia will not unload"; lsmod | grep "^nvidia"; exit 3
 fi
 PCIS=$(lspci -Dn -d 10de: | awk '$2 ~ /^030[02]:/ {print $1}')
 for c in $PCIS; do echo 1 > /sys/bus/pci/devices/$c/reset 2>/dev/null; done
@@ -76,16 +77,16 @@ nvidia-smi >/dev/null 2>&1
 # Empty RegistryDwords is the proof that the stock module is back.
 grep -i "^RegistryDwords:" /proc/driver/nvidia/params
 cat /sys/module/nvidia/srcversion 2>/dev/null
-echo "Serientreiber geladen"
+echo "stock driver loaded"
 EOF
 
-echo "== Serientreiber laden =="
+echo "== loading the stock driver =="
 host_run_script 420 "$OUT/remote_restore.sh" 2>&1 | tee "$OUT/restore.log"
 RC=${PIPESTATUS[0]}
 
-echo "== Zustand =="
+echo "== state =="
 host_ssh_for 60 'grep -i "^RegistryDwords:" /proc/driver/nvidia/params; lsmod | grep -E "^nvidia|^dmabuf"' \
     2>&1 | tee "$OUT/state.txt"
 
-echo "rc=$RC  Artefakte: $OUT"
+echo "rc=$RC  artifacts: $OUT"
 exit "$RC"
