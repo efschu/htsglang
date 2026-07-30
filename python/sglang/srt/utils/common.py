@@ -2765,13 +2765,33 @@ def add_prometheus_track_response_middleware(app):
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
+def _iter_effective_routes(routes):
+    """Expand routes registered via `app.include_router()` into their leaf routes.
+
+    Some FastAPI versions represent an included sub-router as a single
+    aggregate route object (e.g. a private `_IncludedRouter`) that matches
+    its whole sub-tree but does not itself expose a per-request `.path`.
+    Such routes do expose a public `effective_route_contexts()` method that
+    yields the fully-resolved (prefix-applied) leaf routes, so we duck-type
+    on that instead of hard-coding any private class name.
+    """
+    for route in routes:
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            yield from effective_route_contexts()
+        else:
+            yield route
+
+
 def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
-    for route in request.app.routes:
+    for route in _iter_effective_routes(request.app.routes):
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            path = getattr(route, "path", None)
+            if path is not None:
+                return path, True
 
     return request.url.path, False
 
