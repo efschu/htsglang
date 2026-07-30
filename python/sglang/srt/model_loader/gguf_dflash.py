@@ -34,8 +34,23 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Architectures whose checkpoint is a DFLASH draft (no embedding, no lm_head:
-# the drafter borrows both from its target).
+# the drafter borrows both from its target).  These are HF ``architectures``
+# entries, i.e. they are only visible once the config has been READ.
 DFLASH_ARCHITECTURES = ("DFlashDraftModel", "DFlashLagunaForCausalLM")
+
+# GGUF ``general.architecture`` strings of the same checkpoints -- the name in
+# the FILE HEADER, which is what is available BEFORE any config is read.
+#
+# Everything above dispatches on the HF architecture, and can only do so
+# because the sibling config.json was read in the first place. That read is not
+# automatic: transformers' GGUF reader does not know "dflash-draft" and raises
+# "GGUF model with architecture dflash-draft is not supported yet" when handed
+# the file, exactly as it does for qwen35/gemma4. The config peek
+# (utils/hf_transformers/config.py: _peek_bespoke_gguf_arch) routes those
+# around it by reading the sibling config.json instead, and it decides from
+# this header string. Exported here so gguf_registry can add it to
+# sibling_config_gguf_archs() without importing this module eagerly.
+DFLASH_GGUF_ARCHS = ("dflash-draft",)
 
 # Per-layer tensors: GGUF local name -> HF local name, both under their own
 # layer prefix.  Every entry here was confirmed present in the released Q8_0

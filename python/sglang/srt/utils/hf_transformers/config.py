@@ -47,15 +47,16 @@ def _set_architectures(config, arch_name):
 
 
 def _peek_bespoke_gguf_arch(gguf_path: str) -> Optional[str]:
-    """Return the GGUF ``general.architecture`` if it is one of the bespoke
-    families that need the sibling-config.json workaround (Qwen3.5/3.6
-    hybrids, Gemma-4), else None. Reads only the GGUF header (cheap).
+    """Return the GGUF ``general.architecture`` if it is one of the checkpoints
+    that need the sibling-config.json workaround (Qwen3.5/3.6 hybrids, Gemma-4,
+    the DFLASH drafter), else None. Reads only the GGUF header (cheap).
 
-    The set of bespoke GGUF archs is the single source of truth in
+    The set of these GGUF archs is the single source of truth in
     ``model_loader.gguf_registry`` (transformers' GGUF reader rejects
-    qwen35/qwen35moe outright and crashes on gemma4: it derives a per-layer
-    num_key_value_heads LIST that the strict Gemma4TextConfig rejects). Imported
-    lazily so this early-config path stays cheap and cycle-free."""
+    qwen35/qwen35moe and dflash-draft outright and crashes on gemma4: it derives
+    a per-layer num_key_value_heads LIST that the strict Gemma4TextConfig
+    rejects). Imported lazily so this early-config path stays cheap and
+    cycle-free."""
     try:
         import gguf
 
