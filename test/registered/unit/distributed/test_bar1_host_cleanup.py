@@ -53,6 +53,9 @@ set -uo pipefail
 : "${STUB_ALTLAST_REAL:=}"              # gesetzt: die PORT/PROC/VRAM-Zeile
                                          # wirklich lokal ausfuehren statt die
                                          # STUB_ALTLAST-Buchstaben zurueckzugeben.
+: "${STUB_KILL0_SEQ:=}"                  # z.B. "0,0,1": erst zweimal "lebt
+                                         # noch", dann tot -- stellt den
+                                         # verzoegerten Tod nach.
 
 # --- Stubs fuer die Host-Ebene ---------------------------------------------
 host_path() { printf '%s\n' "$1"; }
@@ -61,10 +64,23 @@ host_path() { printf '%s\n' "$1"; }
 # des entfernten Skripts durch. Der Stub tut dasselbe.
 host_run_script() { echo "@@CHATTER@@"; return 0; }
 
+_STUB_KILL0_IDX=0
+
 host_ssh_for() {
     local budget="$1" cmd="$2"
     case "$cmd" in
-        *"kill -0"*)  return "$STUB_KILL0_RC" ;;
+        *"kill -0"*)
+            if [ -n "$STUB_KILL0_SEQ" ]; then
+                local IFS=,
+                local -a folge=($STUB_KILL0_SEQ)
+                unset IFS
+                local letzter=$((${#folge[@]} - 1))
+                local idx=$_STUB_KILL0_IDX
+                [ "$idx" -gt "$letzter" ] && idx=$letzter
+                _STUB_KILL0_IDX=$((_STUB_KILL0_IDX + 1))
+                return "${folge[$idx]}"
+            fi
+            return "$STUB_KILL0_RC" ;;
         cat*)         printf '%s\n' "$STUB_PIDFILE_INHALT"; return 0 ;;
         *PORT=*)
             if [ -n "$STUB_ALTLAST_REAL" ]; then
@@ -215,8 +231,15 @@ class TestCleanupReallyKills(CustomTestCase):
 
     def test_a_survivor_is_reported_loudly(self):
         """A kill nobody checked is an intention, and the intention was
-        already there when the server outlived the run."""
-        fertig, protokoll = _lauf("kill_server", "4242", STUB_KILL0_RC=0)
+        already there when the server outlived the run.
+
+        Timeout/poll shrunk to keep this fast -- the bound itself (its
+        default 15s/1s) is exercised by TestBoundedKillNachschau below.
+        """
+        fertig, protokoll = _lauf(
+            "kill_server", "4242", STUB_KILL0_RC=0,
+            BAR1_KILL_NACHSCHAU_TIMEOUT_S=1, BAR1_KILL_NACHSCHAU_POLL_S=1,
+        )
         self.assertIn("DUMP_AND_KILL[4242]", protokoll)
         self.assertIn("lebt nach dem Abraeumen noch", fertig.stderr)
         self.assertIn("RC!=0", fertig.stdout)
@@ -225,6 +248,45 @@ class TestCleanupReallyKills(CustomTestCase):
         fertig, _ = _lauf("kill_server", "4242", STUB_KILL0_RC=1)
         self.assertIn("abgeraeumt", fertig.stdout)
         self.assertNotIn("RC!=0", fertig.stdout)
+
+
+class TestBoundedKillNachschau(CustomTestCase):
+    """The race from 2026-07-30, reproduced through the pid, not the host.
+
+    A single, instant ``kill -0`` right after the kill is blind to the
+    ordinary gap between SIGTERM and the process actually leaving the
+    process table -- that gap is exactly what let a still-dying (not
+    foreign, not stuck -- just not yet reaped) server read as "lebt noch"
+    and seed the STOP the next attempt's altlast check hit minutes later.
+    """
+
+    def test_a_delayed_death_within_the_bound_still_counts_as_cleaned(self):
+        """Kill sent, process dies delayed: the verdict stays a clean
+        "abgeraeumt", not a survivor report."""
+        fertig, protokoll = _lauf(
+            "kill_server", "4242", STUB_KILL0_SEQ="0,0,1",
+            BAR1_KILL_NACHSCHAU_TIMEOUT_S=5, BAR1_KILL_NACHSCHAU_POLL_S=1,
+        )
+        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
+        self.assertIn("abgeraeumt", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+        self.assertNotIn("RC!=0", fertig.stdout)
+        self.assertNotIn("lebt nach dem Abraeumen noch", fertig.stderr)
+
+    def test_a_process_that_never_dies_is_reported_as_its_own_state(self):
+        """Not within the bound: an honest "Aufraeumen unvollstaendig" state
+        (the existing "lebt noch"/RC!=0 wording) -- and specifically NOT the
+        Altlast-STOP wording that would retroactively devalue a run. The
+        caller (s11/s12 cleanup()) already treats this as non-fatal
+        (`|| true`); this test pins that the message itself never claims
+        "Altlast"."""
+        fertig, protokoll = _lauf(
+            "kill_server", "4242", STUB_KILL0_SEQ="0,0,0,0,0",
+            BAR1_KILL_NACHSCHAU_TIMEOUT_S=2, BAR1_KILL_NACHSCHAU_POLL_S=1,
+        )
+        self.assertIn("DUMP_AND_KILL[4242]", protokoll)
+        self.assertIn("lebt nach dem Abraeumen noch", fertig.stderr)
+        self.assertNotIn("STOP: Altlast von einem vorherigen Anlauf", fertig.stderr)
+        self.assertIn("RC!=0", fertig.stdout)
 
 
 class TestLeftoverDetection(CustomTestCase):
@@ -277,6 +339,53 @@ class TestLeftoverDetection(CustomTestCase):
             "altlast", STUB_ALTLAST="PORT=1\nPROC=9\nVRAM=20000, 20000, 20000,\n"
         )
         self.assertEqual(protokoll.strip(), "")
+
+
+class TestStaleBerichtDoesNotSurviveACleanPass(CustomTestCase):
+    """The 2026-07-30 finding, exactly: Anlauf 5 wrote 'Altlast:
+    launch_server-Prozesse=4' to blocked.txt. Ten minutes later Anlauf 6 ran
+    completely clean -- but compose() still read that same, never-cleared
+    file and turned a green run into a STOP for a finding that belonged to
+    a run already over. The verdict of a completed step has to come from
+    THAT step's own artifacts, never a leftover from a different attempt.
+    """
+
+    def _bericht_pfad(self):
+        return pathlib.Path("/tmp/blocked")
+
+    def test_a_stale_report_does_not_survive_a_clean_pass(self):
+        bericht = self._bericht_pfad()
+        bericht.write_text("Altlast:launch_server-Prozesse=4\n")
+        try:
+            fertig, _ = _lauf(
+                "altlast",
+                STUB_ALTLAST="PORT=0\nPROC=0\nVRAM=12, 8, 10,\n",
+            )
+            self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+            self.assertFalse(
+                bericht.exists(),
+                msg="ein sauberer Durchlauf muss den alten Bericht loeschen, "
+                    "nicht liegen lassen",
+            )
+        finally:
+            bericht.unlink(missing_ok=True)
+
+    def test_a_failing_pass_overwrites_a_stale_report_with_its_own_finding(self):
+        """The file must still do its job for a run that IS blocked -- just
+        with THIS run's own finding, not a mix with an older one."""
+        bericht = self._bericht_pfad()
+        bericht.write_text("Altlast:GPU2=30000MiB\n")
+        try:
+            fertig, _ = _lauf(
+                "altlast",
+                STUB_ALTLAST="PORT=0\nPROC=4\nVRAM=12, 8, 10,\n",
+            )
+            self.assertIn("ALTLAST", fertig.stdout)
+            inhalt = bericht.read_text()
+            self.assertIn("launch_server-Prozesse=4", inhalt)
+            self.assertNotIn("GPU2=30000MiB", inhalt)
+        finally:
+            bericht.unlink(missing_ok=True)
 
 
 class TestPgrepSelfMatchTrap(CustomTestCase):

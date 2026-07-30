@@ -148,6 +148,18 @@ bar1_boot_start() {
 BAR1_ALTLAST_MIB="${BAR1_ALTLAST_MIB:-2000}"
 bar1_altlast_pruefen() {
     local port="$1" bericht="${2:-}" roh belegt proc vram schlimm=""
+    # Ein Bericht von einem FRUEHEREN, gescheiterten Anlauf im selben
+    # Schrittverzeichnis darf einen jetzt sauberen Durchlauf nicht ueberleben.
+    # Genau das geschah am 2026-07-30: Anlauf 5 schrieb hier "Altlast:
+    # launch_server-Prozesse=4" (echte, damals noch sterbende Prozesse eines
+    # vorigen Anlaufs), zehn Minuten spaeter lief Anlauf 6 komplett gruen --
+    # aber compose() las denselben, nie geleerten Bericht und entwertete den
+    # gruenen Lauf mit einem Befund, der zu einem laengst abgeschlossenen
+    # Anlauf gehoerte. Das Verdikt eines Laufs kommt aus SEINEN EIGENEN
+    # Artefakten, nie aus einer Reste von einem anderen. Erst raeumen, dann
+    # pruefen; geschrieben wird der Bericht unten nur wieder, wenn DIESER
+    # Durchlauf selbst etwas findet.
+    [ -n "$bericht" ] && rm -f "$bericht"
     roh="$(host_ssh_for 90 "
         echo \"PORT=\$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
                         | grep -c ':$port ' )\";
@@ -202,6 +214,8 @@ bar1_altlast_pruefen() {
 # sie leer, waehrend auf dem Host laengst ein Server laeuft -- dann gilt die
 # Pidfile, die das Bootskript selbst geschrieben hat. Ohne die zweite Quelle
 # ist genau das Zeitfenster ein Leck.
+BAR1_KILL_NACHSCHAU_TIMEOUT_S="${BAR1_KILL_NACHSCHAU_TIMEOUT_S:-15}"
+BAR1_KILL_NACHSCHAU_POLL_S="${BAR1_KILL_NACHSCHAU_POLL_S:-1}"
 bar1_kill_host_server() {
     local pid="${1:-}" hostpid="${2:-}" dump="${3:-}" datei_pid=""
     if ! bar1_pid_ok "$pid" && [ -n "$hostpid" ]; then
@@ -211,13 +225,29 @@ bar1_kill_host_server() {
     fi
     bar1_pid_ok "$pid" || return 0
     host_dump_and_kill "$pid" "${dump:-/dev/null}"
-    # NACHSEHEN. Ein Kill, den niemand nachprueft, ist eine Absicht -- und die
-    # Absicht war schon da, als der Server den Lauf ueberlebte.
-    if host_ssh_for 60 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; then
-        echo "WARNUNG: Host-pid $pid lebt nach dem Abraeumen noch." >&2
-        echo "Der naechste Anlauf wird an der Altlast-Pruefung haengen bleiben." >&2
-        return 1
-    fi
+    # NACHSEHEN, bounded. Ein Kill, den niemand nachprueft, ist eine Absicht --
+    # aber eine SOFORTIGE, einmalige Nachschau ist blind gegen die normale
+    # Zeitspanne zwischen SIGTERM und dem tatsaechlichen Verschwinden aus der
+    # Prozessliste. Genau dieser Lag war die Ursache, als ein noch
+    # sterbender (nicht mehr lebender, nur noch nicht abgemeldeter) Server
+    # den naechsten Anlauf an dessen Altlast-Pruefung haengen liess: die
+    # Nachschau urteilte sofort "lebt noch", ohne der normalen Ausstiegszeit
+    # eine Chance zu geben. Bounded gewartet statt sofort geurteilt --
+    # stirbt der Prozess innerhalb der Frist, gilt er als abgeraeumt; stirbt
+    # er NICHT, bleibt es bei der ehrlichen (und immer schon vom Aufrufer
+    # nicht als Lauf-STOP behandelten) Meldung "lebt noch".
+    local versuche=$(( BAR1_KILL_NACHSCHAU_TIMEOUT_S / BAR1_KILL_NACHSCHAU_POLL_S ))
+    [ "$versuche" -lt 1 ] && versuche=1
+    local i=0
+    while host_ssh_for 60 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge "$versuche" ]; then
+            echo "WARNUNG: Host-pid $pid lebt nach dem Abraeumen noch (nach ~${BAR1_KILL_NACHSCHAU_TIMEOUT_S}s Wartefrist)." >&2
+            echo "Der naechste Anlauf wird an der Altlast-Pruefung haengen bleiben." >&2
+            return 1
+        fi
+        sleep "$BAR1_KILL_NACHSCHAU_POLL_S"
+    done
     echo "Host-Server $pid abgeraeumt."
     return 0
 }
