@@ -13086,3 +13086,24 @@ protokolliert wurde. Die Weitergabe ist in
 `scripts/gpu_battery/s16_dflash_structured.sh` nachgezogen; ohne diesen Fix
 waere dieses Fenster mit derselben Denkblock-Falle heimgekommen wie das
 `split`-Fenster.
+
+### Herkunftsvermerk: `/spinning/wt-final` bewegte sich waehrend des Fensters
+
+Wie in Fenster 3 geprueft, weil es wieder passiert ist. Der Arbeitsbaum stand
+beim Fensterbeginn (21:19:23Z) auf `461cf8d40c`, waehrend der Messungen liefen
+dort zwei Commits ein: `20a52751c9` (Merge `probe/303-beleg`, 21:22:16Z) und
+`04a1c98433` (Doku, 21:32:29Z). Der erste faellt zwischen den DFLASH-Arm und
+die drei NEXTN-Arme.
+
+`git diff --name-only 461cf8d40c..04a1c98433` ergibt **zwei Dateien**:
+`FEATURES_VS_UPSTREAM.md` und `docs/dev/INTEGRATION_R3_VALIDATION.md`. Kein
+Laufzeitpfad (`speculative/`, `managers/`, `distributed/`, `model_executor/`,
+`layers/`, `server_args.py`) und kein Batteriepfad (`scripts/gpu_battery/`)
+ist angefasst worden. Der DFLASH-Arm hat seine Importe vor `20a52751c9`
+gezogen, die NEXTN-Arme danach — bei einem reinen Doku-Delta ohne Wirkung.
+Die Zahlen oben stehen.
+
+Folge fuer die Zusammenfuehrung: dieser Bericht haengt an der Fassung des
+Dokuments von `461cf8d40c`. Beim Merge von `probe/solo-paar` ist das ein
+reiner Anhang-Konflikt in `INTEGRATION_R3_VALIDATION.md`, beide Abschnitte
+bleiben.
