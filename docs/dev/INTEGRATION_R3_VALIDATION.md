@@ -12654,3 +12654,272 @@ Flags unveraendert gegenueber `s03_boot_b` / `s04_boot_c`, also mit
 
 Zu erheben: die drei Bootdauern, die Zeile `auto-performance (...)` mit der
 Quelle, `probe_seconds`, und bei Boot 2 der Inhalt von `notes`.
+
+---
+
+## Fenster 3: #295-Gate-Sanity, #287-Ceiling-Beleg, Solo-Placement bs=1
+
+Basis `e1b17fe8ea`. Kartenfenster 2026-07-30 20:45:28Z-21:01:17Z UTC
+(15 min 49 s von 45 min Budget), Rohdaten in
+`/spinning/gpu-battery-results/2026-07-30_fenster3/`. Leistungsprotokoll ueber
+das ganze Fenster (`power.csv`, 90 Punkte je Karte): GPU0 20/294 W, GPU1
+15/273 W, GPU2 19/293 W (Leerlauf/Spitze), Speicherspitzen 18519 / 32039 /
+18375 MiB.
+
+Ergebnis vorweg: **Posten 1 und 2 vollstaendig belegt, Posten 3 AUSSTEHEND**
+(nicht angefangen, nicht halb gemessen — siehe Abschnitt 3).
+
+### 1. #295-Gate-Sanity: die Uebersetzung haelt auf der Karte
+
+`benchmark/bar1_graph_check.py 0,1,2` auf dem PVE-Host, JIT kalt
+(`graph_check.txt`, rc=0). Der kalte Bau kostete rund 2 min im ersten Fall
+(`1blk-small`); der gesamte Torlauf 4 min 30 s.
+
+| Fall | Art | Ergebnis |
+|---|---|---|
+| `1blk-small` | Gate | BESTANDEN |
+| `1blk-large` | Gate | BESTANDEN |
+| `grid` | Info | BESTANDEN |
+| `reservation` | Gate | BESTANDEN |
+| `two-graphs` | Gate | BESTANDEN |
+| `pipe` | Gate | BESTANDEN |
+| `pipe-direct` | Gate | BESTANDEN |
+| `pipe-direct-pool-empty` | Gate | BESTANDEN |
+| `broadcast` | Gate | BESTANDEN |
+| `broadcast-two-graphs` | Gate | BESTANDEN |
+
+**10/10, davon 9 Gate-Faelle und der Info-Fall `grid`** — dieselbe Passzahl wie
+vor der Uebersetzung, unter den NEUEN englischen Fallnamen. Der kooperative
+Start ist weiterhin capture-faehig, die Reservierung in
+`HTCCLBar1Transport._kernel` bleibt damit fuer sich genommen gegenstandslos.
+Die bar1-abhaengigen Posten waren also nicht zu stoppen.
+
+Nebenbefund, kein Blocker: `scripts/gpu_battery/_bar1_host_boot.sh` schreibt
+weiterhin die ALTEN Env-Namen (`SGLANG_HTCCL_GRAPH_FREIGABE`,
+`SGLANG_HTCCL_BAR1_NV_QUELLE`) — genau der in #295 bewusst zurueckgestellte
+Teil. Sie funktionieren ueber `htccl_env_compat.py` mit je einer
+Deprecation-Warnung; jeder Boot dieses Fensters lief darueber.
+
+### 2. #287-Ceiling-Beleg (Programm aus dem Merge-Commit `bf4c457981`)
+
+#### 2.0 Machbarkeits-Fixposten: das programmierte 8/64 passt auf diesem Rig nicht
+
+Der im Programm genannte Punkt `--max-running-requests 8
+--max-running-requests-ceiling 64` ist auf diesem Rig **nicht bootbar**, und
+zwar aus einem physikalischen Grund, nicht wegen eines Fehlers in #287: das
+Ceiling dimensioniert den Mamba-State-Pool, und der waechst linear mit ihm.
+Zwei abgebrochene Boots, beide mit der eigenen, praezisen Fehlermeldung des
+Budgetpfads (`p2_ceiling/fixposten_fehlversuche.txt`):
+
+* Ceiling 64, Reserve 4500,4200,4200 → rank 2 (ein 3080): Mamba + spekulativer
+  Zwischenzustand + Prefill-Reserve 7.98 GiB auf 8.47 GiB Gewichte, zusammen
+  **559 MiB ueber dem 16280-MiB-Budget**, vor dem ersten KV-Token.
+* Ceiling 32, Reserve 4500,3200,3200 → rank 1 (ein 3080): **407 MiB ueber dem
+  17280-MiB-Budget**.
+
+Getragen hat **Ceiling 16 mit Start 4** bei der unveraenderten bar1_hi-Reserve
+4500,4200,4200 — also exakt die Pooldimensionierung des erprobten
+Standardrezepts (dessen `--max-running-requests 16` wird durch das Ceiling
+ersetzt, nicht ergaenzt), HEALTHY nach 70 s. Die Aussage von #287 haengt nicht
+an den absoluten Zahlen, sondern an der Trennung von Dimensionierung (16) und
+Zulassung (4), und die ist bei 4/16 genauso pruefbar wie bei 8/64. Fuer ein
+echtes 8/64 auf diesem Rig muesste das Ceiling die Mamba-Slots nicht mehr
+mitziehen oder die 3080er duerften keine Slots halten — beides ausserhalb des
+#287-Schnitts. **Als offene Frage notiert, nicht als #287-Fehler.**
+
+Boot-Rezept des tragenden Laufs (Port 30041, Arm `bar1`, gepinnter Anker-Vektor
+statt `auto-performance`-Sonde wegen #303):
+
+```
+--rank-auto-reserve-mib 4500,4200,4200 --decode-log-interval 1
+--rank-mlp-ratio 63,37,36 --rank-kv-ratio 7,3,3
+--max-running-requests 4 --max-running-requests-ceiling 16
+--admission-throttle-high 0.30 --admission-release-low 0.10
+```
+
+Die abgesenkte Drosselmarke (0.30 statt Vorgabe) ist der einzige Eingriff und
+betrifft ausschliesslich Teil c: sie macht den KV-Druck in einem Lauf von
+Sekunden erreichbar. Teile a, b und d sind davon unberuehrt.
+
+#### 2.a Pools und Capture-Menge folgen dem Ceiling, die Zulassung dem Startwert
+
+Aus dem Bootprotokoll (`p2_ceiling/a_boot_markers.txt`):
+
+```
+[TP0] Dynamic admission limit: ceiling=16, start=4, floor=1 (throttle>=0.30,
+      release<=0.10 x8). State pools are dimensioned for the ceiling; the
+      limit floats below it.
+[TP0] max_total_num_tokens=433017, chunked_prefill_size=2048,
+      max_prefill_tokens=16384, max_running_requests=16, context_len=32768
+[TP0/1/2] Capture target verify CUDA graph begin. backend=full,
+      num_tokens_per_bs=4, bs=[1,2,3,4,5,6,7,8,10,12,14,16]
+```
+
+`max_running_requests=16` in der Dimensionierungszeile ist das Ceiling — das
+Feld ist genau dazu umgeschrieben worden. Die Capture-Liste laeuft bis **16**,
+nicht bis zum Zulassungsstart 4. Gleichzeitig meldet `/get_server_info`:
+
+```
+max_running_requests            = 16    (das Ceiling, Dimensionierungswert)
+max_running_requests_ceiling    = 16
+max_running_requests_start      = 4
+effective_max_running_requests_per_dp = 4
+admission_limiter = {"current":4,"ceiling":16,"floor":1,"start":4,
+                     "auto":true,"last_reason":"init",
+                     "throttle_count":0,"release_count":0}
+```
+
+Damit ist a belegt: **Pools und Capture-bs-Liste auf 16, Zulassung auf 4.**
+
+Praezisierung zum Programmpunkt: die Zeile *"Raising the decode CUDA-graph
+capture bound"* erscheint hier NICHT, und das ist richtig. Die abgeleitete
+Decode-Obergrenze lag bereits bei 24 (> Ceiling 16), also greift der
+Fruehausstieg `current >= wanted`. Dass die Capture-Menge dem Ceiling folgt,
+belegt in dieser Konfiguration die Klammerung auf `req_to_token_pool.size`,
+sichtbar an der `bs=[...16]`-Liste, nicht die Anhebungszeile.
+
+#### 2.b Live-Float ueber `/set_internal_state`
+
+`p2_ceiling/b_float.txt`, jeweils mit Rueckleseschritt:
+
+| Aufruf | Antwort | `effective_...per_dp` | `last_reason` |
+|---|---|---|---|
+| `{"effective_max_running_requests":2}` | `[true]` | 2 | `api` |
+| `... 12` | `[true]` | 12 | `api` |
+| `... 17` | `[false]` | **12 (unveraendert)** | `api` |
+| `... 8` | `[true]` | 8 | `api` |
+
+17 > Ceiling 16 wird **abgelehnt**, ohne stilles Klemmen: der Wert bleibt auf
+den zuvor gesetzten 12 stehen. Jeder angenommene Aufruf hinterlaesst auf allen
+drei Raengen die Protokollzeile `Admission limit set to N (ceiling 16).`
+
+**Negativbefund, nicht #287-verursacht:** `/v1/loads` antwortet auf diesem
+Build durchgaengig mit `500 Internal Server Error`,
+`AttributeError: '_IncludedRouter' object has no attribute 'path'`. Das ist ein
+Routen-Introspektionsfehler des Endpunkts selbst und tritt in jedem der vier
+Rueckleseschritte gleich auf, auch im Regressionsboot ohne die neuen Flags. Der
+Teilanspruch *"`/v1/loads` folgt"* ist damit in diesem Fenster **nicht
+pruefbar** und bleibt AUSSTEHEND; der Endpunkt ist vorher zu reparieren.
+
+#### 2.c Druckszenario: die Drossel kommt vor der Ruecknahme — und ersetzt sie hier ganz
+
+16 gleichzeitige Sitzungen, je 12601 Kontexttoken (`ignore_eos`, 512 neue
+Token), Zulassung vorher per API auf das Ceiling 16 geoeffnet. Belegung
+16 x 12601 = 201 616 von 433 017 Token = **0.466**, also deutlich ueber der
+Marke 0.30. Abtastung des Limiters alle 0.5 s (`p2_ceiling/pressure.json`,
+58 Punkte):
+
+```
+t=0.08 s   api          current=16
+t=1.14 s   kv_pressure  current=9      <- Drossel greift
+...        (Absenkung bis auf den Boden 1)
+t=15.25 s  release      current=2      <- Erholung nach Lastabfall
+Ende       current=16,  throttle_count=15, release_count=15
+```
+
+Und die entscheidende Zaehlung: `grep -c 'Retract requests'` im Serverprotokoll
+ergibt **0 vorher und 0 nachher** (`retract_before.txt`, `retract_after.txt`).
+Die Wassermarken-Stufe hat die Ruecknahme nicht nur zeitlich vorweggenommen,
+sondern in diesem Lauf **vollstaendig verhindert** — es gab keine
+`KV cache pool is full. Retract requests.`-Zeile, vor der die Drossel haette
+stehen koennen. `last_reason` wurde entsprechend nie `pre_retract`; die harte
+zweite Stufe wurde nicht gebraucht. Das ist ein staerkerer Beleg als der
+programmierte Reihenfolgevergleich, aber ein anderer: **die geforderte
+Reihenfolge zweier Protokollzeilen konnte nicht gemessen werden, weil die
+zweite Zeile nie entstand.**
+
+Erholung: die Freigabe laeuft in `observe()` und damit nur, solange ueberhaupt
+dekodiert wird. Ein blosses Leerlauffenster nach der Last belegt nichts — der
+Lauf haengt deshalb eine einzelne leichte Anfrage an, und unter dieser steigt
+das Limit vom Boden 1 in 15 Freigabeschritten auf das Ceiling 16 zurueck.
+
+#### 2.d Regressionsboot ohne die neuen Flags
+
+Gleiches Rezept, nur ohne `--max-running-requests-ceiling` /
+`--admission-*`; das Basisrezept liefert `--max-running-requests 16`, also
+dieselbe Dimensionierung. HEALTHY nach 69 s (gegen 70 s), Kernmarker
+(`p2d_regression/summary.txt`):
+
+| Marker | mit Ceiling (4/16) | ohne Flags |
+|---|---|---|
+| `max_total_num_tokens` | 433017 | **433017** |
+| `max_running_requests` (Dimensionierung) | 16 | 16 |
+| Capture-bs-Liste | `[1..16]` | **identisch `[1..16]`** |
+| `Dynamic admission limit`-Zeile | vorhanden | **0 Treffer** |
+| `admission_limiter.auto` | `true` | **`false`** |
+| `effective_..._per_dp` | 4 | 16 (= Dimensionierungswert) |
+| `max_running_requests_ceiling` / `_start` | 16 / 4 | `null` / `null` |
+
+Der Limiter ist ohne Ceiling ein passiver Halter des Dimensionierungswerts:
+`get_num_allocatable_reqs` sieht dieselbe Zahl wie bisher, kein Pfad kann sich
+bewegen. **Unveraendertes Verhalten belegt.**
+
+### 3. Solo-Placement-Paar fuer die bs=1-DFLASH-Frage (#285-Vorbehalt) — AUSSTEHEND
+
+**Nicht gemessen. Kein Teilergebnis, keine Zahl.** Der Posten steht in der
+Prioritaetsreihenfolge hinten und wurde nach der Abbruchordnung fallen
+gelassen: Posten 2 kostete drei Boots statt einem (zwei davon an der
+Fixposten-Rechnung aus 2.0 gescheitert), und ein s16-Solo-Paar braucht
+Kalibrierboot plus zwei Armboots plus die A-vs-A-Runde 0 — im verbliebenen
+Budget nicht abschliessbar, und ein halb gemessenes Paar waere gegen den
+#285-Vorbehalt wertlos gewesen.
+
+Das Verdikt aus dem letzten Lauf (DFLASH −29 bis −40 % ms/Verify unter
+`split`) bleibt damit unangetastet und weiterhin ausdruecklich **nur fuer
+`--speculative-draft-placement split` belegt**.
+
+Fuer das naechste Fenster vorbereitet:
+
+* Vor dem Boot ist der Fixposten fuer `solo` zu rechnen, nicht zu schaetzen.
+  Dieses Fenster hat zweimal gezeigt, dass die 3080er der bindende Rang sind
+  und die Meldung des Budgetpfads die fehlenden MiB exakt benennt — dieselbe
+  Rechnung gilt fuer DFLASH-`solo`, das die Drafter-Gewichte auf der 5090
+  buendelt und die Verteilung damit in die andere Richtung kippt.
+* Reservevorbehalt 3000,2700,2700 aus dem letzten Lauf bleibt bestehen.
+* `S16_MIN_MAX_NEW_TOKENS` setzen (Denkblock-Falle). Der Druckversuch in 2.c
+  ist dafuer ein unabhaengiger Beleg: der erste Anlauf lieferte mit
+  `max_new_tokens=512` genau **1** Token je Anfrage und damit gar keine
+  Dekodierphase — dieselbe Familie von Messfalle, nur an anderer Stelle.
+* KV-Pool auf beiden Armen pinnen (Kalibrierboot DFLASH zuerst,
+  `S16_MAX_TOTAL_TOKENS`).
+
+### Offene Punkte aus diesem Fenster
+
+1. **`/v1/loads` ist kaputt** (`AttributeError: '_IncludedRouter' object has no
+   attribute 'path'`), unabhaengig von #287. Blockiert den Lastteil jeder
+   kuenftigen Zulassungsmessung.
+2. **Ceiling x Mamba-Slots auf kleinen Karten.** Ein Sitzungs-Ceiling deutlich
+   ueber der Kartenkapazitaet ist auf diesem Rig unerreichbar, weil das Ceiling
+   den Mamba-State-Pool mitzieht. Genau das ist der Regimewechsel, fuer den ein
+   Ceiling gedacht ist — die Frage gehoert priorisiert, gehoert aber nicht in
+   den #287-Schnitt.
+3. **`scripts/gpu_battery` traegt noch die alten HTCCL-Env-Namen** (in #295
+   bewusst zurueckgestellt, Nachzug nach #303).
+4. **Posten 3 unverandert offen.**
+
+### Herkunftsvermerk: `/spinning/wt-final` bewegte sich waehrend des Fensters
+
+Der Arbeitsbaum stand beim Fensterbeginn auf `e1b17fe8ea`, waehrend der
+Messungen liefen dort zwei Merges ein: **#303** (`7f21cea498`, 20:49:25Z) und
+**#290** (`56dcf57cea`, 21:01:03Z). Der erste faellt in das Fenster hinein —
+zwischen Torlauf (20:46-20:50Z) und den Ceiling-Boots (ab 20:52Z).
+
+Geprueft, welche Pfade sich dabei geaendert haben: `git diff --name-only
+e1b17fe8ea..56dcf57cea` ergibt 15 Dateien, und
+`git diff --stat e1b17fe8ea..HEAD -- python/sglang/srt/managers/
+python/sglang/srt/distributed/ benchmark/` ist **leer**. Weder
+`bar1_graph_check.py` und der HTCCL-Baum (Posten 1) noch
+`admission_limiter.py`, `scheduler.py` und `server_args.py` (Posten 2) sind
+angefasst worden. Die Zahlen oben stehen.
+
+Zwei Beruehrungen ohne Wirkung auf das Ergebnis, der Vollstaendigkeit halber:
+`uneven_perf.py` (der #303-Sondenfix) liegt auf genau dem Pfad, den der
+gepinnte `--rank-mlp-ratio` umgeht — die Boots nehmen den Pin-Ausstieg vor der
+Sonde, mit und ohne Fix. `scripts/gpu_battery/battery_host.sh` hat sich
+ebenfalls geaendert; der Torlauf hatte es um 20:46Z bereits eingelesen, die
+Ceiling-Boots lasen die neuere Fassung.
+
+Folge fuer die Zusammenfuehrung: dieser Bericht haengt an der Fassung des
+Dokuments von `e1b17fe8ea` und enthaelt den #303-Abschnitt nicht. Beim Merge
+von `probe/fenster3` ist das ein reiner Anhang-Konflikt in
+`INTEGRATION_R3_VALIDATION.md`, beide Abschnitte bleiben.
