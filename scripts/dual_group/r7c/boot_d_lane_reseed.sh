@@ -46,21 +46,22 @@ source ./common.sh
 TARGET_DIR="$MODEL_ROOT/Qwen3.6-27B-MTP-Q3_K_M-GGUF"
 TARGET="$TARGET_DIR/Qwen3.6-27B-Q3_K_M.gguf"
 PORT="${PORT:-30080}"
-LOG=/tmp/r7c-boot-d.server.log
-OUT=/tmp/r7c-boot-d
+LOG="${LOG:-/tmp/r7c-boot-d.server.log}"
+OUT="${OUT:-/tmp/r7c-boot-d}"
 mkdir -p "$OUT"
 # The inline driver below reads these out of the environment.
 export WT PORT MODEL_ROOT OUT TARGET_DIR
 
 assert_cards_free || exit 1
-load_card_order | tee "$OUT/cards.txt"
+load_card_order "$OUT/cards.txt" || exit 1
 claim_cards "274-r7c-boot-d-lane-reseed"
 trap 'stop_vram_sampler; release_cards "boot D abgebrochen"; exit 1' INT TERM
 start_vram_sampler "$OUT/vram.csv"
 export SGLANG_ACCEPT_POSITION_PROBE=1
 
-cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+cd "$WT" || exit 1
+launch_server "$LOG" /tmp/r7c-boot-d.pid \
+  "$VENV/bin/python" -m sglang.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 \
@@ -74,9 +75,14 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --dual-group-lane --dual-group-lane-budget-mib 1600 \
   --dual-group-lane-spec --dual-group-lane-spec-steps 3 \
   --enable-metrics \
-  --host 127.0.0.1 --port "$PORT" \
-  > "$LOG" 2>&1 &
-echo $! > /tmp/r7c-boot-d.pid
+  --host 127.0.0.1 --port "$PORT"
+
+if dry_run; then
+  stop_vram_sampler
+  release_cards "boot D dry run"
+  echo "DRY RUN ok: boot D"
+  exit 0
+fi
 
 if ! wait_for_server "$PORT" 1500; then
   echo "--- letzte 40 Zeilen Serverlog (nur bei Abbruch) ---" >&2

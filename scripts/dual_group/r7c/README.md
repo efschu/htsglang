@@ -98,3 +98,27 @@ live in.
 - **The 5090 arm of boot C is one variable away**: `DRAFT_GPU=$CUDA_BIG`. Worth
   it only if the 3080 arm shows the drafter working — placement is the second
   question, not the first.
+
+## Dry run, before the window opens
+
+`R7C_DRY_RUN=1` walks any recipe from the top to the launch line without a GPU,
+without touching the arbitration files and without starting a server. It prints
+the fully assembled launch command instead, so everything the recipe derived at
+runtime — boot C's drafter card and its per-rank reserve string above all — is
+readable before a boot window is spent on it.
+
+```
+R7C_DRY_RUN=1 R7C_CARDS_FILE=/path/to/recorded-cards.txt \
+  bash scripts/dual_group/r7c/boot_c_dflash_solo_q8.sh
+```
+
+`R7C_CARDS_FILE` feeds a recorded `resolve_cards` output in place of the live
+query; without it the dry run still asks the real cards. Missing model files
+are a warning in a dry run and an abort in a real one.
+
+This exists because round 7c's boot C spent a window to fail at
+`CUDA_SMALL: unbound variable` — the call site piped `load_card_order` into
+`tee`, so the resolver ran in a pipeline subshell and its assignments never
+reached the recipe, while the echoed lines still made the log look correct.
+`test/registered/unit/test_r7c_recipe_dry_run.py` now runs all four recipes
+through the dry run under `bash -u`, against two different card orders.

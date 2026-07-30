@@ -41,12 +41,12 @@ source ./common.sh
 
 PORT="${PORT:-30077}"
 TOKENS="${TOKENS:-192}"
-LOG=/tmp/r7c-boot-a.server.log
-OUT=/tmp/r7c-boot-a
+LOG="${LOG:-/tmp/r7c-boot-a.server.log}"
+OUT="${OUT:-/tmp/r7c-boot-a}"
 mkdir -p "$OUT"
 
 assert_cards_free || exit 1
-load_card_order | tee "$OUT/cards.txt"
+load_card_order "$OUT/cards.txt" || exit 1
 claim_cards "274-r7c-boot-a-fp8-referenz"
 trap 'stop_vram_sampler; release_cards "boot A abgebrochen"; exit 1' INT TERM
 
@@ -56,8 +56,9 @@ start_vram_sampler "$OUT/vram.csv"
 # nothing that the comparison cares about (raw counters, no extra forward).
 export SGLANG_ACCEPT_POSITION_PROBE=1
 
-cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+cd "$WT" || exit 1
+launch_server "$LOG" /tmp/r7c-boot-a.pid \
+  "$VENV/bin/python" -m sglang.launch_server \
   --model-path "$MODEL_ROOT/Qwen3.6-27B-FP8" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
   --rank-auto-reserve-mib 3000,2700,2700 \
@@ -66,9 +67,14 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --enable-metrics \
-  --host 127.0.0.1 --port "$PORT" \
-  > "$LOG" 2>&1 &
-echo $! > /tmp/r7c-boot-a.pid
+  --host 127.0.0.1 --port "$PORT"
+
+if dry_run; then
+  stop_vram_sampler
+  release_cards "boot A dry run"
+  echo "DRY RUN ok: boot A"
+  exit 0
+fi
 
 if ! wait_for_server "$PORT" 1500; then
   stop_vram_sampler
