@@ -141,6 +141,22 @@ _PROFILE_VERSION_FIELDS: Dict[int, Tuple[str, ...]] = {
 #: instead of silently substituting a number.
 PROFILE_NOTES_KEY = "notes"
 
+#: The two classes a reason recorded through ``_profile_note`` can carry
+#: (task #310). The #303 mechanic ("an absent measurement stores why") was
+#: built for facts about the CARD -- a lane that genuinely cannot run on that
+#: architecture -- and every existing note is one of those. But a reason can
+#: also describe the PROBING INTERPRETER rather than the hardware (missing
+#: sgl_kernel, a mock fallback standing in for it, ...): that is not evidence
+#: about the card and must never be written into a cache file that is keyed
+#: by GPU UUID and read back on every future boot, on any interpreter.
+#:
+#: ``NOTE_CLASS_CARD`` (the default, and the only class every note used
+#: before this task) is persisted exactly as before. ``NOTE_CLASS_ENVIRONMENT``
+#: is logged and then DROPPED -- ``_profile_note`` does not write it into the
+#: profile at all.
+NOTE_CLASS_CARD = "card_note"
+NOTE_CLASS_ENVIRONMENT = "environment_error"
+
 #: Probe shapes (model-relevant): GEMM = one chunked-prefill MLP matmul
 #: (2048 tokens x 5120 x 17408 bf16), MEMBW = a decode-style weight-streaming
 #: GEMV over a ~1.3 GB bf16 matrix (the lm_head-class shape of m20).
@@ -627,8 +643,22 @@ def probe_groups_for_fields(fields: Sequence[str]) -> List[str]:
     ]
 
 
-def _profile_note(profile: dict, key: str, reason: str) -> None:
-    """Record WHY ``key`` is absent from ``profile``."""
+def _profile_note(
+    profile: dict, key: str, reason: str, note_class: str = NOTE_CLASS_CARD
+) -> None:
+    """Record WHY ``key`` is absent from ``profile`` -- unless ``reason`` is a
+    ``NOTE_CLASS_ENVIRONMENT`` fact, which is logged and NEVER persisted (see
+    the class docstrings above ``NOTE_CLASS_CARD``): a missing dependency in
+    the interpreter that happened to run the probe says nothing about the
+    card and must not survive into the cached file for the next reader."""
+    if note_class == NOTE_CLASS_ENVIRONMENT:
+        logger.warning(
+            "auto-performance probe: %s (environment fact, not recorded in "
+            "the profile -- %s is a per-card cache keyed by GPU UUID)",
+            reason,
+            key,
+        )
+        return
     profile.setdefault(PROFILE_NOTES_KEY, {})[key] = reason
 
 
@@ -881,6 +911,65 @@ def _bench_gemm_w8a16_tflops(dev) -> Tuple[Optional[float], str]:
     finally:
         del w, scale, x
         torch.cuda.empty_cache()
+
+
+class ProbeEnvironmentError(RuntimeError):
+    """The probe's OWN interpreter is missing something the ``lanes`` group
+    needs to measure honestly -- as opposed to a genuine per-card GEMM
+    failure (task #310).
+
+    ``LANE_FP8_MARLIN`` (``_bench_gemm_fp8_marlin_tflops``) runs through
+    ``marlin_utils_fp8``, which resolves its scalar types via
+    ``sglang.srt.layers.quantization.utils.get_scalar_types()``. That helper
+    falls back to a ``MockScalarTypes`` stand-in when ``sgl_kernel`` is not
+    importable -- needed elsewhere so an sgl_kernel-less import does not
+    explode -- and the Marlin lane then calls real sgl_kernel APIs
+    (``b_q_type.id``) against that mock, gets an ``AttributeError``, and the
+    lane probe's ``except Exception`` catches it and returns it as the lane's
+    REASON: ``"fp8 Marlin GEMM did not run: AttributeError: ..."``. That
+    string is indistinguishable, downstream, from a genuine architecture
+    limitation -- so a venv without sgl_kernel silently wrote "this card
+    cannot do fp8 Marlin" into the cached profile for EVERY card, including
+    ones (e.g. an sm89+ card) that run the lane natively. Once cached, the
+    wrong verdict survives until someone notices the number is off and
+    manually re-probes.
+
+    So this is a hard, up-front gate: an interpreter without real sgl_kernel
+    scalar types must not run the ``lanes`` group AT ALL, and must not write
+    a profile -- raised before ``run_probe`` touches a single card."""
+
+
+def _check_lane_probe_environment() -> None:
+    """Refuse to probe the ``lanes`` group unless THIS interpreter has real
+    sgl_kernel scalar types. See ``ProbeEnvironmentError`` for why a missing
+    or mocked sgl_kernel must abort the whole probe rather than be recorded
+    as a card fact."""
+    interpreter = sys.executable
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError as ex:
+        raise ProbeEnvironmentError(
+            "the 'lanes' probe group needs sgl_kernel, which is not "
+            f"importable in {interpreter} ({type(ex).__name__}: {ex}). Run "
+            "the probe with the interpreter sglang actually serves from (its "
+            "venv ships sgl_kernel), or pass --groups with 'lanes' left out "
+            "to measure only the groups this interpreter can measure "
+            "honestly."
+        ) from ex
+
+    from sglang.srt.layers.quantization.utils import get_scalar_types
+
+    _, probed_scalar_types = get_scalar_types()
+    if type(probed_scalar_types).__name__ == "MockScalarTypes":
+        raise ProbeEnvironmentError(
+            f"sgl_kernel is importable in {interpreter}, but "
+            "sglang.srt.layers.quantization.utils.get_scalar_types() still "
+            "returned its MockScalarTypes fallback -- sgl_kernel.scalar_type "
+            "did not load cleanly in this interpreter. Same risk as a "
+            "missing sgl_kernel (a lane failure here would be an "
+            "environment artifact mis-recorded as a card fact), so the "
+            "'lanes' probe group refuses to run here."
+        )
 
 
 #: lane -> probe. Every entry returns ``(tflops or None, note)``; a lane that
@@ -1380,6 +1469,14 @@ def run_probe(
 #: scripts/gpu_battery/checks/check_common.py.
 QUOTED_SUBLOG_PREFIX = "[probe-subprocess] "
 
+#: Marker the subprocess entry point prints in front of a ``ProbeEnvironmentError``
+#: (task #310), so ``_run_probe_subprocess`` can tell "this interpreter is
+#: missing something the probe needs" apart from an ordinary probe crash. The
+#: distinction matters one level up: a lazy top-up that fails for this reason
+#: must record its gap as ``NOTE_CLASS_ENVIRONMENT`` (logged, never
+#: persisted), not ``NOTE_CLASS_CARD`` (persisted) -- see ``_migrated_profile``.
+PROBE_ENV_ERROR_PREFIX = "PROBE_ENVIRONMENT_ERROR: "
+
 
 def _quote_sublog(text: str, limit: int = 2000) -> str:
     """Prefix every line of a captured subprocess log with the marker above."""
@@ -1395,7 +1492,13 @@ def _probe_timeout_s() -> float:
 
 def _run_probe_subprocess(path: str, groups: Optional[Sequence[str]]) -> Optional[str]:
     """Run the probe in its own process (so the launcher stays free of CUDA
-    contexts). Returns None on success, or a one-line reason on failure."""
+    contexts). Returns None on success, or a one-line reason on failure.
+
+    A failure caused by ``ProbeEnvironmentError`` (task #310: the interpreter
+    is missing something the probe needs, not a card fact) is returned with
+    ``PROBE_ENV_ERROR_PREFIX`` kept in front of it, so a caller that records
+    the failure as a profile note (``_migrated_profile``) can classify it as
+    ``NOTE_CLASS_ENVIRONMENT`` rather than ``NOTE_CLASS_CARD``."""
     cmd = [sys.executable, "-m", "sglang.srt.uneven_perf", "--probe", "--out", path]
     if groups:
         cmd += ["--groups", ",".join(groups)]
@@ -1410,12 +1513,23 @@ def _run_probe_subprocess(path: str, groups: Optional[Sequence[str]]) -> Optiona
     except Exception as e:
         return f"{type(e).__name__}: {e}"
     if proc.returncode != 0:
+        stderr = proc.stderr or proc.stdout or ""
         logger.warning(
             "auto-performance: hardware probe failed (rc=%d); the quoted lines "
             "below are the PROBE's log, not this server's:\n%s",
             proc.returncode,
-            _quote_sublog(proc.stderr or proc.stdout or ""),
+            _quote_sublog(stderr),
         )
+        env_line = next(
+            (
+                line
+                for line in stderr.splitlines()
+                if line.startswith(PROBE_ENV_ERROR_PREFIX)
+            ),
+            None,
+        )
+        if env_line is not None:
+            return env_line
         return f"probe subprocess exited with rc={proc.returncode}"
     return None
 
@@ -1487,6 +1601,12 @@ def _migrated_profile(
                     f"({topped.get('probe_seconds', '?')} s)",
                 )
             failure = "top-up wrote no readable profile"
+        # A failure that carries PROBE_ENV_ERROR_PREFIX is a fact about the
+        # interpreter that ran the top-up subprocess (task #310), not about
+        # any card -- log it, but do not let it survive into the profile
+        # file (see NOTE_CLASS_ENVIRONMENT / _profile_note).
+        is_env_error = failure.startswith(PROBE_ENV_ERROR_PREFIX)
+        note_class = NOTE_CLASS_ENVIRONMENT if is_env_error else NOTE_CLASS_CARD
         for field in gaps:
             _profile_note(
                 profile,
@@ -1494,6 +1614,7 @@ def _migrated_profile(
                 f"added in profile version {PROFILE_VERSION}; the lazy top-up "
                 f"probe did not run ({failure}). Re-probe with "
                 f"SGLANG_PERF_REPROBE=1 to measure it.",
+                note_class=note_class,
             )
         logger.warning(
             "auto-performance: the lazy top-up probe failed (%s); keeping the "
@@ -4636,6 +4757,18 @@ if __name__ == "__main__":
                 parser.error(f"--groups needs an existing base profile at {out}")
             with open(out) as f:
                 base = json.load(f)
+        # Environment pre-check, at the probe's actual entry point, BEFORE
+        # run_probe touches a single card or writes anything (task #310): the
+        # 'lanes' group's fp8 Marlin lane needs real sgl_kernel scalar types,
+        # and an interpreter without them must abort loud rather than have
+        # its AttributeErrors recorded as card-level GEMM failures.
+        effective_groups = groups if groups is not None else list(_PROBE_GROUP_FIELDS)
+        if PROBE_GROUP_LANES in effective_groups:
+            try:
+                _check_lane_probe_environment()
+            except ProbeEnvironmentError as ex:
+                print(f"{PROBE_ENV_ERROR_PREFIX}{ex}", file=sys.stderr)
+                sys.exit(1)
         prof = run_probe(out, groups=groups, base=base)
         print(json.dumps(prof, indent=1))
     else:
