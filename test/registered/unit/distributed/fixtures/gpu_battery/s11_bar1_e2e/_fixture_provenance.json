@@ -1,0 +1,10 @@
+{
+  "kind": "fixture_provenance",
+  "schema_version": 1,
+  "_fixture_provenance": "gekuerzte Kopie eines ECHTEN Laufs (gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e/server.log, 400-Zeilen-Auszug des Hostlogs). Behalten wurden die drei ERREICHT-Bloecke (world:0, tp:0, dcp:0), die Aufbau- und Kassenzeilen und der ERSTE Absturzblock; die beiden baugleichen Absturzbloecke der anderen Raenge und die dazwischenliegenden Ladezeilen sind gestrichen. Kein Wort ist umgeschrieben -- die Zeilenform stammt vom Erzeuger, nicht aus einer Vorstellung davon.",
+  "quelle": "gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e/server.log",
+  "erzeuger": "scripts/gpu_battery/s11_bar1_e2e.sh (host_tail_into, 400 Zeilen)",
+  "warum": "Der Check meldete an diesem Lauf 'keine einzige ERREICHT-Zeile im Log', obwohl das Log sie traegt: der Erzeuger las ausschliesslich htccl_lines.txt, und die Datei entsteht erst NACH einem geglueckten Serverstart. Diese Datei ist die Gegenprobe -- an ihr muss der Check am Capture-Abbruch scheitern, nicht an der leeren Beweislage.",
+  "dateien": ["server.log", "graph_check.txt", "graph_check_rc.txt"],
+  "dateien_hinweis": "graph_check.txt ist auf die Zusammenfassungszeilen desselben Laufs gekuerzt (64 KiB Ablauftext gestrichen); graph_check_rc.txt ist unveraendert."
+}

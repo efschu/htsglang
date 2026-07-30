@@ -60,6 +60,11 @@ cover/
 
 # Django stuff:
 *.log
+# Ausnahme: die Batterie-Fixtures sind gekuerzte Kopien ECHTER
+# Laufprotokolle (Herkunft je Verzeichnis in _fixture_provenance.json). Ohne
+# sie pruefte der s11-Test eine erfundene Logform statt der, die der Erzeuger
+# wirklich schreibt -- und genau daran ist er schon einmal vorbeigelaufen.
+!test/registered/unit/distributed/fixtures/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

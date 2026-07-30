@@ -43,6 +43,16 @@ Was genau geprueft wird
    oberhalb der gitter-Schwelle unter Aufzeichnung wirklich auf ``1blk``
    ausweicht, statt zu scheitern.
 
+5. **Nicht nur all_reduce.** Der Abbruch, der diesen Weg noetig gemacht
+   hat, kam von einem ``broadcast`` mit 128 Byte im Draft-Graphen -- nicht
+   von einem all_reduce. Die Faelle ``broadcast`` und
+   ``broadcast-zwei-graphen`` fahren deshalb genau dieses Kollektiv, in
+   genau dieser Groesse, und zwar mit JEDEM Rang einmal als Quelle. Die
+   Pruefung ist dort schaerfer als beim all_reduce: ein Nicht-Quellen-Rang
+   startet mit SEINEM Muster im Puffer, und der ist an Ort. Eine
+   Aufzeichnung, die bei der Wiedergabe nichts mehr bewegt, laesst also das
+   eigene Muster stehen -- und das ist von dem der Quelle unterscheidbar.
+
 Jeder Fall laeuft in FRISCHEN Prozessen. Eine misslungene Aufzeichnung
 laesst den Strom im Capture-Zustand zurueck und macht alles danach
 unbrauchbar; ein Fall, der einen anderen vergiftet, waere kein Beleg.
@@ -151,6 +161,27 @@ FAELLE = [
         "verschraenkt": True,
         "gate": False,
     },
+    {
+        "name": "broadcast",
+        "kollektiv": "broadcast",
+        "zweck": "Der Fall aus der Uebergabe: 128 Byte broadcast im "
+                 "Draft-Graphen. Jeder Rang einmal Quelle, damit keine "
+                 "Kante ungeprueft bleibt.",
+        "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40)},
+        "groessen": [128, 64 << 10],
+        "gate": True,
+    },
+    {
+        "name": "broadcast-zwei-graphen",
+        "kollektiv": "broadcast",
+        "zweck": "Zwei broadcast-Aufzeichnungen, abwechselnd wiedergegeben. "
+                 "Ein geteilter Schlitz oder eine eingebrannte Haelfte faellt "
+                 "erst hier auf.",
+        "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": str(1 << 40)},
+        "groessen": [128, 64 << 10],
+        "verschraenkt": True,
+        "gate": True,
+    },
 ]
 
 
@@ -229,30 +260,80 @@ def _zeichne_auf(t, n: int, rang: int, geraet):
     return graph, eingabe, ausgabe
 
 
-def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll):
-    """Aufzeichnen, wiedergeben, nach JEDER Wiedergabe belegen."""
+def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
+    """Dasselbe fuer ``broadcast`` -- und der ist AN ORT.
+
+    Ein- und Ausgabe sind derselbe Puffer, weil die Naht das so zusagt
+    (``broadcast(tensor, src)`` gibt denselben Tensor zurueck). Genau
+    deshalb ist die Wiedergabe hier schaerfer zu pruefen als beim
+    all_reduce: der Puffer wird vor jeder Wiedergabe mit dem Muster DIESES
+    Ranges gefuellt, und wenn die Wiedergabe nichts bewegt, steht es
+    danach noch da.
+
+    ``src`` steht zur Aufzeichnungszeit fest und geht als Kernelargument
+    mit -- das ist die Bedingung, unter der ein broadcast ueberhaupt
+    aufzeichenbar ist.
+    """
+    puffer = _muster(n, rang, 0, geraet)
+
+    strom = torch.cuda.Stream(device=geraet)
+    strom.wait_stream(torch.cuda.current_stream(geraet))
+    with torch.cuda.stream(strom):
+        for _ in range(3):
+            t.htccl_broadcast(None, puffer, src)
+    torch.cuda.current_stream(geraet).wait_stream(strom)
+    torch.cuda.synchronize(geraet)
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        t.htccl_broadcast(None, puffer, src)
+    torch.cuda.synchronize(geraet)
+    dist.barrier()
+    return graph, puffer
+
+
+def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
+                    kollektiv: str = "all_reduce"):
+    """Aufzeichnen, wiedergeben, nach JEDER Wiedergabe belegen.
+
+    ``kollektiv`` waehlt, WAS aufgezeichnet wird. Die Wiedergabe- und
+    Belegschleife ist fuer beide dieselbe -- was sich unterscheidet, ist der
+    Sollwert und die Frage, ob Ein- und Ausgabe derselbe Puffer sind.
+    """
     graphen = []
     for n_bytes in groessen:
         n = n_bytes // 4                       # float32
-        if not t.handles("all_reduce", n_bytes):
+        if not t.handles(kollektiv, n_bytes):
             protokoll.append(
-                f"UEBERSPRUNGEN {n_bytes} Byte: handles() -> False "
-                f"(Fenster {t.fenster_minimum()} Byte, max_bytes "
+                f"UEBERSPRUNGEN {n_bytes} Byte ({kollektiv}): handles() -> "
+                f"False (Fenster {t.fenster_minimum()} Byte, max_bytes "
                 f"{t.max_bytes} Byte, min_bytes {t.min_bytes}). Kein "
                 f"Befund, sondern eine Groesse, die dieser Weg nicht faehrt."
             )
+            continue
+        if kollektiv == "broadcast":
+            # Jeder Rang einmal Quelle: sonst bliebe genau die Kante
+            # ungeprueft, ueber die im Ernstfall der Draft-Pick laeuft.
+            for src in range(welt):
+                graph, puffer = _zeichne_auf_broadcast(t, n, rang, geraet, src)
+                protokoll.append(
+                    f"aufgezeichnet: broadcast, {n_bytes} Byte, src={src}, "
+                    f"{t.bc_runden(n_bytes)} Runden"
+                )
+                graphen.append((n_bytes, n, graph, puffer, puffer, src))
             continue
         algo = t.algorithmus_fuer(n_bytes)
         graph, eingabe, ausgabe = _zeichne_auf(t, n, rang, geraet)
         protokoll.append(
             f"aufgezeichnet: {n_bytes} Byte, Algorithmus {algo!r}"
         )
-        graphen.append((n_bytes, n, graph, eingabe, ausgabe))
+        graphen.append((n_bytes, n, graph, eingabe, ausgabe, None))
 
     if not graphen:
         raise RuntimeError(
-            "kein einziger Graph aufgezeichnet -- alle Groessen dieses "
-            "Falles wurden von handles() abgelehnt"
+            f"kein einziger Graph aufgezeichnet ({kollektiv}) -- alle "
+            f"Groessen dieses Falles wurden von handles() abgelehnt"
         )
 
     # Wiedergabe. Verschraenkt heisst: Runde fuer Runde ALLE Graphen, damit
@@ -264,25 +345,31 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll):
                     for g in graphen])
 
     for folge in folgen:
-        for runde, (n_bytes, n, graph, eingabe, ausgabe) in folge:
+        for runde, (n_bytes, n, graph, eingabe, ausgabe, src) in folge:
             eingabe.copy_(_muster(n, rang, runde, geraet))
+            if src is None:
+                soll = _soll(n, welt, runde, geraet)
+                wer = ""
+            else:
+                soll = _muster(n, src, runde, geraet)
+                wer = f", src={src}"
             torch.cuda.synchronize(geraet)
             dist.barrier()
             graph.replay()
             torch.cuda.synchronize(geraet)
-            schlecht, text = _vergleiche(ausgabe, _soll(n, welt, runde, geraet))
+            schlecht, text = _vergleiche(ausgabe, soll)
             if schlecht:
                 raise AssertionError(
-                    f"Wiedergabe {runde} von {n_bytes} Byte: {text}"
+                    f"Wiedergabe {runde} von {n_bytes} Byte{wer}: {text}"
                 )
             protokoll.append(
-                f"Wiedergabe {runde}, {n_bytes} Byte: 0 von {n} Elementen "
-                f"falsch"
+                f"Wiedergabe {runde}, {n_bytes} Byte{wer}: 0 von {n} "
+                f"Elementen falsch"
             )
             dist.barrier()
 
-    for _, _, graph, _, _ in graphen:
-        del graph
+    for eintrag in graphen:
+        del eintrag
 
 
 # ===========================================================================
@@ -339,9 +426,25 @@ def arbeiter(lokal: int, devs: list, port: str, fall: dict, ablage: str) -> None
                 "Byte-Beleg von netz_pipe gefallen -- dieser Fall braucht "
                 "ihn, sonst waehlt algorithmus_fuer netz_pipe gar nicht"
             )
+        kollektiv = fall.get("kollektiv", "all_reduce")
+        if kollektiv == "broadcast":
+            # Der Transport wird hier direkt gebaut, nicht ueber `baue_bar1`
+            # -- also stehen die Belege, die die Fabrik sonst fuehrt, noch
+            # nicht. broadcast haengt an beiden: am a2a-Beleg (derselbe
+            # Kern, dieselben Schlitze) und am eigenen.
+            if not t.byte_beleg_a2a():
+                raise RuntimeError(
+                    "a2a-Byte-Beleg gefallen -- broadcast faehrt auf diesem "
+                    "Kern, ohne ihn sagt handles() False"
+                )
+            if not t.byte_beleg_broadcast():
+                raise RuntimeError(
+                    "broadcast-Byte-Beleg gefallen -- ein Graph ueber einen "
+                    "Weg, der Bytes verliert, belegt gar nichts"
+                )
         _pruefe_graphen(
             t, fall["groessen"], fall.get("verschraenkt", False),
-            rang, welt, geraet, protokoll,
+            rang, welt, geraet, protokoll, kollektiv,
         )
         ergebnis["ok"] = True
     except BaseException as e:

@@ -52,6 +52,10 @@ def _stub(**kw):
     t._a2a_beleg = True
     t.ag_min_bytes = 16
     t.ag_max_runden = 16
+    # broadcast rides the same kernel but has its own switch and its own
+    # byte proof. This is the all_gather stub: it says no to broadcast, so
+    # that "the other ops are unaffected" really tests the other branch.
+    t.bc_an = False
     t._fenster_minimum = 96 << 20
     t._geo = {
         "off_a2a": 4096,
@@ -80,17 +84,19 @@ class TestOpRegistration(CustomTestCase):
     def test_all_gather_method_exists(self):
         self.assertTrue(callable(HTCCLBar1Transport.htccl_all_gather))
 
-    def test_reduce_scatter_and_broadcast_stay_uncovered(self):
-        """Not an oversight -- the loud bar is the intended answer for them.
+    def test_reduce_scatter_stays_uncovered(self):
+        """Not an oversight -- the loud bar is the intended answer for it.
 
         reduce_scatter needs a reduction, which the byte-moving a2a kernel
-        cannot do. broadcast is in-place at this seam and the extension
-        rejects ``in is out``. If either is ever added, this test goes red
-        and the module docstring plus the bar's message get revisited
-        together.
+        cannot do. If it is ever added, this test goes red and the module
+        docstring plus the bar's message get revisited together.
+
+        broadcast used to be listed here too, for a second reason (in-place
+        at this seam, and the extension rejects ``in is out``). That reason
+        turned out to cost one scratch buffer and one local copy, not a
+        kernel -- see test_htccl_bar1_broadcast.py.
         """
         self.assertNotIn("reduce_scatter", HTCCLBar1Transport.HTCCL_OPS)
-        self.assertNotIn("broadcast", HTCCLBar1Transport.HTCCL_OPS)
 
     def test_ops_and_methods_agree(self):
         """Every claimed op has a method; no method claims an op it lacks."""
@@ -341,7 +347,12 @@ class TestHandlesGate(CustomTestCase):
         self.assertFalse(t._handles_all_gather(1024 * 4 + 1))
 
     def test_the_other_ops_are_unaffected(self):
-        """The new branch must not change what handles() said before."""
+        """The new branch must not change what handles() said before.
+
+        broadcast is covered by now, but on its own gate (``_bc_beleg``),
+        which this stub deliberately does not set -- the all_gather branch
+        must not answer for it.
+        """
         t = _stub()
         self.assertFalse(t.handles("reduce_scatter", 65536))
         self.assertFalse(t.handles("broadcast", 65536))

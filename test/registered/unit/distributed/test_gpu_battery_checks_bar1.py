@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -42,6 +43,7 @@ from battery_steps import STEPS_BY_ID  # noqa: E402
 from s10_bar1_driver import compose as s10_compose  # noqa: E402
 from s10_bar1_driver import desired_state_reached  # noqa: E402
 from s11_bar1_e2e import (  # noqa: E402
+    compose,
     parse_graph_check,
     parse_log_evidence,
     parse_smoke,
@@ -473,7 +475,7 @@ class TestDriverCompose:
 def _e2e(**over) -> dict:
     payload = {
         "kind": "bar1_e2e",
-        "schema_version": 1,
+        "schema_version": 2,
         "host": "192.168.0.1",
         "reachable": True,
         "integration_present": True,
@@ -499,6 +501,8 @@ def _e2e(**over) -> dict:
         "aufbau_ms": [27.0, 31.0],
         "riegel": None,
         "fatal": None,
+        "log_quellen": ["htccl_lines.txt", "server.log"],
+        "log_zeilen": 42,
         "smoke": {
             "vorhanden": True,
             "content_prefix": SMOKE_TEXT,
@@ -633,6 +637,63 @@ class TestE2ECheck:
         _write_e2e(tmp_path, _e2e(gruppen=[], gruppen_bar1=[]))
         assert_fail(self.CHECK, tmp_path, self.STEP)
 
+    def test_no_harvested_log_is_a_stop_not_a_fail(self, tmp_path):
+        """"Nobody looked" is not "nothing was there".
+
+        A step directory without a single harvested log line says nothing
+        about the run. Reporting it as FAIL would blame the run for a gap in
+        the harvest -- the same conflation the s12 fatal gate was split up
+        for.
+        """
+        _write_e2e(
+            tmp_path,
+            _e2e(gruppen=[], gruppen_bar1=[], log_quellen=[], log_zeilen=0),
+        )
+        line = assert_stop(self.CHECK, tmp_path, self.STEP)
+        assert "niemand hat geschaut" in line
+
+    def test_old_artifact_is_rejected_by_its_schema_version(self, tmp_path):
+        """The producer that only ever read htccl_lines.txt is not readable.
+
+        Its artifacts are empty on exactly the runs worth diagnosing, and an
+        empty artifact from that producer is indistinguishable from a clean
+        one. The schema bump makes that loud instead of plausible.
+        """
+        payload = _e2e()
+        payload["schema_version"] = 1
+        del payload["log_quellen"]
+        _write_e2e(tmp_path, payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "schema_version" in line
+
+    def test_missing_log_quellen_at_the_right_schema_is_a_stop(self, tmp_path):
+        """Belt and braces: the field is what the check reads, not the number."""
+        payload = _e2e()
+        del payload["log_quellen"]
+        _write_e2e(tmp_path, payload)
+        line = assert_stop(self.CHECK, tmp_path, self.STEP)
+        assert "log_quellen" in line
+
+    def test_a_dead_boot_is_reported_before_its_fallout(self, tmp_path):
+        """Cause before consequence.
+
+        A boot that died takes the ERREICHT lines, the setup lines and the
+        smoke request with it. Whichever of those the check happens to reach
+        first is the consequence; the traceback is the cause.
+        """
+        _write_e2e(
+            tmp_path,
+            _e2e(
+                gruppen=[],
+                gruppen_bar1=[],
+                aufbau_lines=0,
+                aufbau_gruppen=[],
+                fatal="Traceback (most recent call last):",
+            ),
+        )
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "Fatal im Serverlog" in line
+
     def test_missing_group_is_fail(self, tmp_path):
         _write_e2e(
             tmp_path,
@@ -730,6 +791,91 @@ class TestE2EParsing:
         out = parse_log_evidence(str(tmp_path))
         assert out["riegel"]["op"] == "all_gather"
         assert out["riegel"]["bytes"] == 10600448
+
+    def test_server_log_alone_carries_the_evidence(self, tmp_path):
+        """The file the shell writes on EVERY path, including the aborts.
+
+        htccl_lines.txt is the grep result, harvested only after the server
+        answered. On the run this test is built from it never existed, and
+        the parser -- which read that file and nothing else -- reported an
+        empty evidence list for a log that carried three ERREICHT lines, the
+        bolt and the traceback.
+        """
+        (tmp_path / "server.log").write_text(
+            "\n".join(
+                [
+                    LOG_GROUP_OK.split(":", 1)[1],
+                    LOG_KASSE_TP.split(":", 1)[1],
+                    LOG_AUFBAU.split(":", 1)[1],
+                    LOG_GROUP_OK_DCP.split(":", 1)[1],
+                    LOG_KASSE_DCP.split(":", 1)[1],
+                ]
+            )
+            + "\n"
+        )
+        out = parse_log_evidence(str(tmp_path))
+        assert out["log_quellen"] == ["server.log"]
+        assert [g["gruppe"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
+        assert out["aufbau_lines"] == 1
+
+    def test_no_log_file_at_all_is_visible_as_such(self, tmp_path):
+        out = parse_log_evidence(str(tmp_path))
+        assert out["log_quellen"] == []
+        assert out["log_zeilen"] == 0
+        assert out["gruppen"] == []
+
+    def test_the_two_sources_do_not_double_count(self, tmp_path):
+        """grep prefixes the line number, tail does not -- same line, twice."""
+        (tmp_path / "htccl_lines.txt").write_text(LOG_AUFBAU + "\n")
+        (tmp_path / "server.log").write_text(LOG_AUFBAU.split(":", 1)[1] + "\n")
+        out = parse_log_evidence(str(tmp_path))
+        assert out["log_quellen"] == ["htccl_lines.txt", "server.log"]
+        assert out["aufbau_lines"] == 1
+
+
+class TestAgainstTheRealS11Log:
+    """The check driven against the ACTUAL log of the run that reported
+    'no ERREICHT line at all'.
+
+    The point of this class is that the fixture is not written from an idea
+    of what the log looks like -- it is a shortened copy of
+    gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e/server.log, provenance
+    in _fixture_provenance.json next to it. Against that file the check has
+    to name the CAUSE (the capture aborted on an uncovered broadcast), not
+    the consequence.
+    """
+
+    CHECK, STEP = "check_s11_bar1_e2e.py", "s11_bar1_e2e"
+    FIXTURE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "fixtures", "gpu_battery", "s11_bar1_e2e",
+    )
+
+    def _step_dir(self, tmp_path):
+        for name in ("server.log", "graph_check.txt", "graph_check_rc.txt"):
+            shutil.copy(os.path.join(self.FIXTURE, name), str(tmp_path / name))
+        return tmp_path
+
+    def test_the_evidence_is_found_in_the_real_log(self, tmp_path):
+        out = parse_log_evidence(str(self._step_dir(tmp_path)))
+        assert out["log_quellen"] == ["server.log"]
+        assert [g["gruppe"] for g in out["gruppen"]] == [
+            "dcp:0", "tp:0", "world:0",
+        ]
+        assert all(g["erreicht"] == "bar1" for g in out["gruppen"])
+        assert out["riegel"]["op"] == "broadcast"
+        assert out["riegel"]["bytes"] == 128
+        assert "Traceback" in out["fatal"]
+
+    def test_the_check_fails_on_the_cause(self, tmp_path):
+        step_dir = self._step_dir(tmp_path)
+        payload = compose(str(step_dir), 30030, "/root/battery-bar1/s11.server.log")
+        write_json(step_dir / "bar1_e2e.json", payload)
+        line = assert_fail(self.CHECK, step_dir, self.STEP)
+        assert "RIEGEL" in line
+        assert "broadcast" in line
+        # And explicitly NOT the consequence it used to report.
+        assert "ERREICHT" not in line
 
     def test_graph_gate_summary_is_read_case_by_case(self, tmp_path):
         """The exit code alone would hide WHICH case fell, and a gate whose

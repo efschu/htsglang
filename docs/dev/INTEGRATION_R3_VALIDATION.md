@@ -9189,9 +9189,11 @@ Zeitmessung vor dem Byte-Beleg.** Vorbedingungen und das Ladekommando fuer
 den gepatchten Treiber stehen in `docs/rig-runbook.md`, Abschnitt "BAR1-
 Direktpfad".
 
-1. **Tor.** `benchmark/bar1_graph_check.py 0,1,2` — alle fuenf Faelle
-   bestanden. Faellt einer, ist `SGLANG_HTCCL_GRAPH_FREIGABE=1` nicht
-   zulaessig, und alles Weitere entfaellt.
+1. **Tor.** `benchmark/bar1_graph_check.py 0,1,2` — alle **sieben**
+   Gate-Faelle bestanden (fuenf wie bisher, dazu `broadcast` und
+   `broadcast-zwei-graphen`). Faellt einer, ist
+   `SGLANG_HTCCL_GRAPH_FREIGABE=1` nicht zulaessig, und alles Weitere
+   entfaellt.
 2. **Beide Gruppen erreichen bar1.** Bei `SGLANG_UNEVEN_DCP=1` gibt es zwei
    Kommunikatorgruppen (`tp:0`, `dcp:0`).
    `grep "ERREICHT=" lauf.log` muss fuer **beide** `ERREICHT=bar1` zeigen.
@@ -9206,6 +9208,15 @@ Direktpfad".
    pruefen — eine unterhalb des Schlitzes (eine Runde) und die
    Abnahmegroesse 10 600 448 B (zwei Runden), weil die Rundenzerlegung der
    neue Code ist und der Einrundenfall sie gar nicht ausuebt.
+3b. **broadcast laeuft wirklich ueber bar1 und liefert die richtigen Bytes.**
+   Der Stopper des s11-Laufs vom 2026-07-30 sass hier, nicht beim
+   all_gather: `handles('broadcast', 128) -> False` waehrend der
+   Draft-Graph aufgezeichnet wurde. Dasselbe Vorgehen wie bei 3: mit einem
+   ANDEREN Weg zurueckgelesen als geschrieben wurde. Der Bootselbsttest
+   (`byte_beleg_broadcast`) faehrt jede Quelle einmal und einen Fall ueber
+   dem Schlitz; im Log steht je Kante eine Zeile
+   `broadcast-Byte-Beleg <src>-><r> bestanden`. Fehlt sie, hat sich
+   broadcast abgemeldet und der Riegel schlaegt spaeter wieder zu.
 4. **Standardlauf e2e.** Das Kommando aus dem Runbook, unveraendert, mit
    `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=bar1
    SGLANG_HTCCL_GRAPH_FREIGABE=1`. Er muss durchlaufen — das ist die
@@ -9666,3 +9677,116 @@ compressed-tensors, also heute auf sm86 gesperrt.
 4. **Trifft die uneven-TP-Teilbarkeit fuer die real gefahrenen Vektoren?**
    Ohne GPU pruefbar: `partition_sizes` gegen `K`, `K/2`, `K/16` fuer die
    Zielmodelle durchrechnen.
+
+## broadcast ueber BAR1 + s11-Check auf die reale Logform (2026-07-30)
+
+### Der Anlass, aus einem echten Boot
+
+Der s11-Lauf (`gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e`) starb beim
+Aufzeichnen des DRAFT-Graphen (`eagle_worker_v2.init_cuda_graphs` ->
+`parallel_state.py:1760` -> `htccl.py:1044` -> `_select:587`):
+
+    RuntimeError: HTCCL: 'broadcast' mit 128 Byte waehrend einer
+    CUDA-Graph-Aufzeichnung, aber bar1 meldet handles('broadcast', 128)
+    -> False; gedeckt sind dort all_gather, all_reduce, all_to_all,
+    all_to_all_single.
+
+Der Riegel hat richtig gefeuert: der Ausweichweg waere die gloo-Ebene, und
+die laeuft einmal beim Aufzeichnen und bei keiner Wiedergabe wieder.
+
+### Gebaut: dieselbe a2a-Tabelle, mit genau einem Sender
+
+Kein neuer Kernel — die CUDA-Quelle ist **byteidentisch** zur Basis
+(`diff` des extrahierten `_CUDA_SRC` gegen `bf5841d2ff`). Ein broadcast ist
+ein all_to_all, in dem nur `src` eine Zeile fuellt (`sende_bytes[z] = n`,
+konstanter `sende_versatz`), alle anderen ueberall 0. Nutzlast > Schlitz
+laeuft in `ceil(n/schlitz)` Runden (`bc_plan`) — und die Rundenzahl ist
+gruppenweit gleich, weil sie allein an `n` und dem Schlitz haengt, nicht
+daran, wieviel dieser Rang sendet. Der Preis ist ein Zwischenpuffer plus
+eine lokale Kopie (die Naht ist an Ort, die Erweiterung lehnt `in is out`
+ab); bei 128 Byte ist das nicht messbar.
+
+Zwei Dinge, die nicht offensichtlich sind und im Code stehen:
+
+* **`kern_last`.** Die gitter/1blk-Wahl haengt sonst an "wieviel sende ICH"
+  — bei genau einem Sender faellt sie je Rang anders aus. Der Aufrufer
+  reicht deshalb einen gruppenweit gleichen Wert herein.
+* **Eigener Byte-Beleg.** `byte_beleg_broadcast` faehrt jede Quelle einmal
+  (jede gerichtete Kante) und einen Fall ueber dem Schlitz. Der Sollwert
+  wird lokal aus der Quellrangnummer gerechnet und das Ergebnis nach einer
+  gewoehnlichen D2H-Kopie geprueft — der Empfaenger erfaehrt die erwarteten
+  Bytes also nie ueber den Weg, der gerade geprueft wird.
+
+Deckungsmenge `HTCCL_OPS` vorher: `all_reduce, all_gather, all_to_all,
+all_to_all_single`. Nachher: dieselben plus `broadcast`. `reduce_scatter`
+bleibt hinterm Riegel (es braucht eine Reduktion, der a2a-Kern bewegt
+Bytes). Die Riegelmeldung leitet die Menge aus `HTCCL_OPS` ab und war
+deshalb ohne Zutun aktuell. `htccl_matrix_transport.HTCCL_OPS` bleibt
+unveraendert — dort fehlt schon all_gather, das ist eine eigene,
+vorbestehende Luecke.
+
+### Der zweite Fund: der s11-Check meldete die Folge, nicht die Ursache
+
+`check_s11_bar1_e2e.py` sagte "keine einzige ERREICHT-Zeile im Log",
+waehrend `server.log` drei davon traegt. Wurzel:
+`s11_bar1_e2e.parse_log_evidence` las **ausschliesslich**
+`htccl_lines.txt` — die grep-Ernte, die `s11_bar1_e2e.sh` erst NACH einem
+geglueckten Serverstart schreibt (Zeile 130). Auf jedem Abbruchweg
+(`host_wait_for_server` scheitert) schreibt die Schrittdatei nur
+`server.log` und springt zu `compose`; `read_lines` gibt fuer die fehlende
+Datei `[]` zurueck, und das Artefakt meldete leer statt laut. Dieselbe
+Familie wie der s01-Befund `htccl_path_rates` (Lader las eine Form, die der
+Erzeuger nicht schreibt, und war still-null).
+
+Gefixt: beide Dateien werden gelesen (`LOG_QUELLEN`), auf ihrem Inhalt
+entdoppelt (grep stellt `<lineno>:` voran, tail nicht — sonst zaehlte
+`aufbau_lines` doppelt), und `log_quellen`/`log_zeilen` stehen im Artefakt,
+damit "niemand hat geschaut" und "nichts gefunden" zwei Antworten sind.
+`schema_version` 1 -> 2, damit ein Artefakt des alten Erzeugers nicht
+plausibel durchrutscht. Der Fatal-Test steht jetzt direkt hinter dem Riegel
+statt am Ende — ein toter Boot reisst Smoke, Aufbauzeilen und
+ERREICHT-Zeilen mit.
+
+Gegen das ECHTE Log (Fixture
+`test/registered/unit/distributed/fixtures/gpu_battery/s11_bar1_e2e/`, mit
+`_fixture_provenance.json`) scheitert der Check jetzt am Capture-Abbruch:
+
+    BATTERY-FAIL s11_bar1_e2e: RIEGEL: htccl._select hat 'broadcast' mit
+    128 Byte waehrend einer CUDA-Graph-Aufzeichnung abgebrochen ...
+
+### Testzahlen (alle `CUDA_VISIBLE_DEVICES=99`)
+
+| Suite | Ergebnis |
+|---|---|
+| `test/registered/unit/distributed/` vor (bf5841d2ff) | 16 failed, 1073 passed, 8 skipped |
+| `test/registered/unit/distributed/` nach | 16 failed, **1126 passed**, 8 skipped |
+| `test_htccl_bar1_broadcast.py` (neu) | 44 passed |
+| `test_gpu_battery_checks_bar1.py` | 94 passed (+9) |
+| `test_htccl_bar1_all_gather.py` | unveraendert gruen |
+
+Die 16 Fehlschlaege sind dieselben wie auf `bf5841d2ff` (nachgemessen im
+Basis-Worktree: `test_dcp_token_vector_collective` 11,
+`test_uneven_tp_nccl_env` 1, `test_vmm_utils` 4).
+
+### Spill-Beleg, offline (ohne Karte)
+
+`_CUDA_SRC` extrahiert, `nvcc -std=c++17 -cubin` fuer **sm_86 und sm_120**
+(`MAX_JOBS=4`), dann `cuobjdump -res-usage`:
+
+| Kernel | sm_86 | sm_120 |
+|---|---|---|
+| `bar1_a2a_kernel` (traegt broadcast) | REG 40, **STACK 0**, SHARED 528/536 | REG 40, **STACK 0**, SHARED 1552/1560 |
+| `bar1_netz_kernel` | REG 38/40, STACK 0, SHARED 512/520 | REG 42, STACK 0, SHARED 1536/1544 |
+| `bar1_ring_kernel` | REG 32/37, STACK 0 | REG 30/32, STACK 0 |
+
+`grep -c "STACK:[1-9]"` ist auf beiden Architekturen **0** — kein Kernel
+spillt. Erwartungsgemaess, denn die CUDA-Quelle ist unveraendert; belegt
+wurde es trotzdem, weil "unveraendert" eine Behauptung ist, bis der
+Uebersetzer sie bestaetigt.
+
+### Was der GPU-Folge-Agent zusaetzlich beweisen muss
+
+Punkt 1 (jetzt sieben Gate-Faelle) und Punkt 3b der Liste oben. Der
+s11-Neulauf ist der eigentliche Beleg: er faehrt `bar1_graph_check` samt
+den beiden broadcast-Faellen und danach den Standardlauf, der vorher genau
+hier abgebrochen ist.

@@ -20,6 +20,24 @@ Three extractions carry the step:
     host-staged gloo level during a graph capture. It is extracted as its own
     field, with op and size, because it is the expected failure of the current
     integration and needs to be distinguishable from any other crash.
+
+WHICH FILE THE EVIDENCE IS READ FROM, and why that is not a detail. This used
+to read `htccl_lines.txt` alone -- the grep result the step script harvests
+AFTER the server has answered. On every early exit (server never came up,
+capture aborted) the shell writes only `server.log` and jumps to compose, so
+that one file did not exist. `read_lines` returns [] for a missing file, so
+the artifact reported "no group line, no bolt, no fatal" for a run whose log
+carried all three, and the check then failed on the CONSEQUENCE (no ERREICHT
+line) instead of the CAUSE (the capture aborted). Exactly the s01 pattern:
+a loader that reads a shape the producer does not write, and is silently
+empty rather than loud.
+
+Both files are read now, and which ones existed is recorded (`log_quellen`).
+"nobody harvested a log" and "the log holds nothing" are then two different
+answers rather than one empty list. The two files overlap -- the grep result
+carries grep's "<lineno>:" prefix, the tail does not -- so lines are
+deduplicated on their content, without which `aufbau_lines` would count the
+same setup line twice.
 """
 
 from __future__ import annotations
@@ -31,7 +49,17 @@ import re
 import sys
 
 KIND = "bar1_e2e"
-SCHEMA_VERSION = 1
+#: 2: `log_quellen` / `log_zeilen` kamen dazu, und die Beweislage wird nicht
+#: mehr nur aus `htccl_lines.txt` gelesen. Ein aelteres Artefakt darf hier
+#: nicht durchrutschen -- es traegt die Felder nicht, an denen der Check
+#: "niemand hat geschaut" von "nichts gefunden" unterscheidet.
+SCHEMA_VERSION = 2
+
+#: Woraus die Beweislage gelesen wird, in dieser Reihenfolge. `htccl_lines.txt`
+#: ist der vollstaendige grep und steht deshalb vorn; `server.log` ist der
+#: begrenzte Auszug, den die Schrittdatei auf JEDEM Weg schreibt -- auch auf
+#: denen, die vor dem grep abbiegen.
+LOG_QUELLEN = ("htccl_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
     r"group '(?P<gruppe>[^']+)': angefordert=(?P<angefordert>[^,\s]+),\s*"
@@ -96,8 +124,42 @@ def parse_graph_check(step_dir: str) -> dict:
     }
 
 
+def _ohne_grep_praefix(line: str) -> str:
+    """Der Inhalt einer Zeile, unabhaengig davon, wer sie geerntet hat.
+
+    ``grep -n`` stellt "<lineno>:" voran, ``tail`` nicht. Dieselbe Logzeile
+    sieht in den beiden Quellen deshalb verschieden aus, obwohl sie dieselbe
+    ist -- ohne diese Normalisierung zaehlte `aufbau_lines` sie doppelt.
+    """
+    return " ".join(re.sub(r"^\d+:", "", line).split())
+
+
+def sammle_log_zeilen(step_dir: str) -> tuple:
+    """Alle geernteten Logzeilen, entdoppelt, plus die Quellen, die es gab.
+
+    Die Quellenliste ist das eigentliche Ergebnis: eine leere Zeilenliste
+    heisst mit ihr "nichts gefunden", ohne sie "niemand hat geschaut". Das
+    sind zwei Befunde, und nur einer davon ist ein Messergebnis.
+    """
+    quellen = []
+    zeilen = []
+    gesehen = set()
+    for name in LOG_QUELLEN:
+        pfad = os.path.join(step_dir, name)
+        if not os.path.exists(pfad):
+            continue
+        quellen.append(name)
+        for line in read_lines(pfad):
+            schluessel = _ohne_grep_praefix(line)
+            if not schluessel or schluessel in gesehen:
+                continue
+            gesehen.add(schluessel)
+            zeilen.append(line)
+    return zeilen, quellen
+
+
 def parse_log_evidence(step_dir: str) -> dict:
-    lines = read_lines(os.path.join(step_dir, "htccl_lines.txt"))
+    lines, quellen = sammle_log_zeilen(step_dir)
     gruppen: dict = {}
     kasse_gruppen = []
     aufbau = []
@@ -136,6 +198,8 @@ def parse_log_evidence(step_dir: str) -> dict:
         "aufbau_ms": aufbau,
         "riegel": riegel,
         "fatal": fatal,
+        "log_quellen": quellen,
+        "log_zeilen": len(lines),
     }
 
 
