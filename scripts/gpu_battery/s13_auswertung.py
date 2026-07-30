@@ -7,7 +7,7 @@ Reads three kinds of artifact out of one step directory and prints markdown:
                       as a suffix ("bar1pipe_r2")
   wait/<arm>.json     the compute/wait split of that boot's primary point,
                       produced on the host by s12_log_analyse
-  belege/<arm>.txt    the ERREICHT lines and the prefill-graph lines of that
+  belege/<arm>.txt    the ACHIEVED lines and the prefill-graph lines of that
                       boot -- evidence, not numbers
 
 THE NOISE FLOOR IS COMPUTED, NOT ASSUMED. Every arm ran in every round, so the
@@ -103,10 +103,12 @@ def load_evidence(step_dir: str) -> dict:
         elif "isabling prefill CUDA graph" in text or "Disable prefill CUDA" in text:
             pg = "off (auto-disable)"
         out[(arm, rnd)] = {
-            "bar1_gruppen": text.count("HTCCL-BAR1: Aufbau in"),
+            "bar1_gruppen": text.count("HTCCL-BAR1: setup in"),
             "erreicht": len(re.findall(r"ACHIEVED=", text)),
             "pipe_zeilen": text.count("HTCCL-BAR1-PIPE:"),
-            "vorrat_leer": "Graph-Vorrat des Ergebnisrings ist erschoepft" in text,
+            "vorrat_leer": (
+                "the graph pool of the result ring is exhausted" in text
+            ),
             "prefill_graph": pg,
         }
     return out
@@ -301,10 +303,10 @@ def report(step_dir: str) -> str:
     # --- evidence ---------------------------------------------------------
     lines.append("### Evidence per boot")
     lines.append("")
-    # `ERREICHT` and `Aufbau` name the server log lines that were counted --
+    # `ACHIEVED` and `setup` name the server log lines that were counted --
     # the marker text itself, not a translated description of it.
     lines.append(
-        "| Arm | Round | ERREICHT lines | BAR1 Aufbau | PIPE lines | "
+        "| Arm | Round | ACHIEVED lines | BAR1 setup | PIPE lines | "
         "graph pool empty | prefill graph |"
     )
     lines.append("|---|---:|---:|---:|---:|---|---|")

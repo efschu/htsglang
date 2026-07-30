@@ -389,16 +389,15 @@ whether it boots.
   `ACHIEVED=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
   (`tp:0`, `dcp:0`), and one of them on gloo makes the run a mixed one (which
   happened exactly once and cost a whole measurement); per group one
-  `HTCCL-BAR1: Aufbau in` line; smoke answer coherent (the numbers 1..20 in
+  `HTCCL-BAR1: setup in` line; smoke answer coherent (the numbers 1..20 in
   sequence, **counted**, not judged) and `spec_accept_length` a number; no
   OOM/NCCL/watchdog in the grepped log.
 * **The bolt as a special case** `htccl._select` aborts **loudly** instead of
   silently falling back to the host-staged gloo layer under a graph capture.
   As long as `all_gather` is missing from `htccl_bar1`, the standard run ends
   with
-  `RuntimeError: HTCCL: 'all_gather' mit <n> Byte waehrend einer
-  CUDA-Graph-Aufzeichnung ...` (all_gather with n bytes during a CUDA graph
-  capture). The check reports that as its **own FAIL message** carrying
+  `RuntimeError: HTCCL: 'all_gather' with <n> bytes during a CUDA graph
+  capture ...`. The check reports that as its **own FAIL message** carrying
   `RIEGEL`, the operation and the size — correct behaviour of the code and a
   FAIL of this step at the same time. This is exactly the scenario the
   parallel BAR1 integration signs off.

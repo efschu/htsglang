@@ -14,7 +14,7 @@ decide it without booting a card again:
   slower shows up in ``wait`` and nowhere else.
 * the same lines carry ``#new-token``, which IS the collective size: one
   all_reduce per layer collective over ``new_token x hidden x 2`` bytes.
-* the ``HTCCL-BAR1: Aufbau`` line carries the slot geometry, so the round
+* the ``HTCCL-BAR1: setup`` line carries the slot geometry, so the round
   decomposition of a given payload is arithmetic, not a guess.
 
 Nothing here judges. It parses, aggregates and prints; the verdict is written
@@ -45,7 +45,7 @@ import sys
 # The lines the server really writes.
 #   scheduler.py           -- "Prefill rank batch, ..." (the #252 split)
 #   scheduler.py           -- "Decode batch, ..."
-#   htccl_bar1.py:1751     -- "HTCCL-BAR1: Aufbau in ..."
+#   htccl_bar1.py:2045     -- "HTCCL-BAR1: setup in ..."
 RE_PREFILL_RANK = re.compile(
     r"\[(?P<zeit>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) TP(?P<rang>\d+)\] "
     r"Prefill rank batch, #new-token: (?P<new_token>\d+), "
@@ -60,11 +60,16 @@ RE_DECODE = re.compile(
     r"cuda graph: (?P<cuda_graph>\w+), "
     r"gen throughput \(token/s\): (?P<gen_tok_s>[\d.]+)"
 )
+# #315: this used to match "Aufbau in ... Peer-Ziele ... Region ... je Rang
+# (... Schlitze ...), Schlitz ... KiB, groesste Nutzlast ... KiB" -- the
+# German wording #295 moved htccl_bar1.py's setup line away from. Dead on
+# every real run since; see test_bar1_marker_coupling.py.
 RE_BAR1_SETUP = re.compile(
-    r"HTCCL-BAR1: Aufbau in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) Peer-Ziele, "
-    r"Region (?P<region_mib>[\d.]+) MiB je Rang \((?P<schlitze>\d+) Schlitze"
-    r".*?\), Schlitz (?P<schlitz_kib>\d+) KiB, "
-    r"groesste Nutzlast (?P<max_nutzlast_kib>\d+) KiB"
+    r"HTCCL-BAR1: setup in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) peer "
+    r"targets, region (?P<region_mib>[\d.]+) MiB per rank "
+    r"\((?P<schlitze>\d+) slots"
+    r".*?\), slot (?P<schlitz_kib>\d+) KiB, "
+    r"largest payload (?P<max_nutzlast_kib>\d+) KiB"
 )
 
 # Ticks below this generation rate are the first tick of a stream, where the
@@ -126,7 +131,7 @@ def parse_decode(lines) -> list:
 
 
 def parse_bar1_geometrie(lines) -> dict | None:
-    """The BAR1 slot geometry of the FIRST Aufbau line, or None.
+    """The BAR1 slot geometry of the FIRST setup line, or None.
 
     First and not last on purpose: a boot builds one region per communicator
     group, and the group that carries the prefill all_reduce is the widest one.
@@ -163,7 +168,7 @@ def runden(payload_bytes: int, slot_bytes: int, welt: int) -> int:
 
     BAR1 splits an all_reduce into ``welt`` equal shards (reduce-scatter, then
     all-gather); the shard has to fit a slot. ``max_nutzlast = welt * slot``
-    -- the field name the Aufbau line uses -- is where the shard stops
+    -- the field name the setup line uses -- is where the shard stops
     fitting in ONE pass.
 
     That used to be the end of the path: above it ``handles()`` said False and

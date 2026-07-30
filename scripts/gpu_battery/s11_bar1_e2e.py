@@ -134,11 +134,17 @@ RE_GROUP = re.compile(
     r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
     r"ACHIEVED=(?P<achieved>[A-Za-z0-9_\-]+)"
 )
-RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<group>[^']+)'")
-RE_AUFBAU = re.compile(r"HTCCL-BAR1: Aufbau in\s+(?P<ms>[0-9.]+)\s*ms")
+#: #315: these three used to spell "Aufbau"/"Kasse"/"waehrend einer
+#: CUDA-Graph-Aufzeichnung" -- the German wording #295 moved htccl_bar1.py and
+#: htccl.py away from. Dead on every real run since, hidden by fixtures that
+#: were never re-captured either; see test_bar1_marker_coupling.py, which
+#: checks these regexes against the actual emitter source so the next rename
+#: fails loudly instead of quietly.
+RE_KASSE = re.compile(r"BAR1 ledger of this card after group '(?P<group>[^']+)'")
+RE_AUFBAU = re.compile(r"HTCCL-BAR1: setup in\s+(?P<ms>[0-9.]+)\s*ms")
 RE_RIEGEL = re.compile(
-    r"HTCCL: '(?P<op>[A-Za-z0-9_]+)' mit (?P<bytes>\d+) Byte waehrend einer "
-    r"CUDA-Graph-Aufzeichnung"
+    r"HTCCL: '(?P<op>[A-Za-z0-9_]+)' with (?P<bytes>\d+) bytes during a "
+    r"CUDA graph capture"
 )
 RE_GATE_CASE = re.compile(
     r"^\s*(?P<marke>PASSED|FAILED)\s*\[(?P<art>Gate|Info)\]\s*(?P<name>\S+)"
@@ -195,7 +201,9 @@ def parse_graph_check(step_dir: str) -> dict:
         "gate_cases": len(gates),
         "gefallen": failed,
         "alle_bestanden": bool(gates) and not failed and rc == 0,
-        "zusammenfassung_vorhanden": any("Zusammenfassung" in line for line in lines),
+        # #315: bar1_graph_check.py's header was "Zusammenfassung", moved to
+        # "Summary" together with PASSED/FAILED in commit 896a443222.
+        "zusammenfassung_vorhanden": any("Summary" in line for line in lines),
     }
 
 

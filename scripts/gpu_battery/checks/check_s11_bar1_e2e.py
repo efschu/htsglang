@@ -168,14 +168,14 @@ def check(step_dir: str) -> None:
     ledger_groups = payload.get("aufbau_gruppen") or []
     if not payload.get("aufbau_lines"):
         raise CheckFail(
-            "no 'HTCCL-BAR1: Aufbau in' line -- no rank actually built a BAR1 "
+            "no 'HTCCL-BAR1: setup in' line -- no rank actually built a BAR1 "
             "region"
         )
     for prefix in REQUIRED_GROUP_PREFIXES:
         if not any(str(name).startswith(prefix) for name in ledger_groups):
             raise CheckFail(
-                f"no BAR1-Aufbau evidenced for group {prefix!r} (built: "
-                f"{ledger_groups}) -- the ERREICHT line on its own is written "
+                f"no BAR1 setup evidenced for group {prefix!r} (built: "
+                f"{ledger_groups}) -- the ACHIEVED line on its own is written "
                 "before the aperture has committed"
             )
 
