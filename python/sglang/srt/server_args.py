@@ -1916,7 +1916,13 @@ class ServerArgs:
             "derived_rank_auto_reserve_mib). When several ranks share one "
             "physical GPU, the largest reserve among them applies to that "
             "GPU (the derived capture term additionally scales with the "
-            "number of co-located ranks). Covers the CUDA context plus "
+            "number of co-located ranks). With an adaptive step ladder "
+            "(--speculative-adaptive) and --speculative-draft-placement "
+            "solo, 'auto' additionally charges the ladder's own demand -- "
+            "the rungs it builds beyond the boot rung plus the serving "
+            "margin its boot check enforces -- to the GPU hosting the solo "
+            "draft rank, itemized in the startup log. Covers the CUDA "
+            "context plus "
             "allocations that appear lazily after KV sizing (NCCL buffers, "
             "attention workspaces, captured graphs, prefill activations). A "
             "pinned numeric value REPLACES the derived demand model, "
@@ -7082,16 +7088,29 @@ class ServerArgs:
                 # capture term scales with the co-located rank count).
                 # See derived_rank_auto_reserve_mib for the formula.
                 gpu_mem = get_device_memory_capacity(self.device)
-                reserve_per_gpu: Dict[int, int] = {
-                    gpu_id: self.derived_rank_auto_reserve_mib(gpu_mem, cnt)
-                    for gpu_id, cnt in counts.items()
-                }
+                reserve_per_gpu: Dict[int, int] = self.reserve_demand_per_gpu(
+                    gpu_mem, counts
+                )
                 logger.info(
                     "--rank-auto-reserve-mib auto: derived reserve per GPU "
                     "%s MiB (runtime reserve + captured-token graph "
                     "demand x co-located ranks; #68).",
                     {g: r for g, r in sorted(reserve_per_gpu.items())},
                 )
+                # #313 ledger: when a rung ladder is charged, the log names
+                # every post of it -- a reserve that grows silently is the
+                # same defect as one that is too small.
+                ladder_gpu = self.ladder_reserve_gpu_id()
+                if ladder_gpu is not None:
+                    demand = self.ladder_reserve_demand(counts[ladder_gpu])
+                    if demand is not None and demand.total_mib:
+                        logger.info(
+                            "--rank-auto-reserve-mib auto: GPU %d hosts the "
+                            "solo draft rank %d -- %s.",
+                            ladder_gpu,
+                            self.speculative_draft_solo_rank(),
+                            demand.ledger(),
+                        )
             else:
                 # --rank-auto-reserve-mib: single value for every GPU, or one
                 # value per rank (aligned with --rank-gpu-id).
@@ -7902,7 +7921,9 @@ class ServerArgs:
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
 
-    def speculative_capture_token_multiplier(self) -> int:
+    def speculative_capture_token_multiplier(
+        self, num_draft_tokens: Optional[int] = None
+    ) -> int:
         """Captured tokens per decode-graph batch-size unit, summed over the
         CUDA-graph families a config actually captures (#68).
 
@@ -7915,15 +7936,87 @@ class ServerArgs:
           * draft-extend    at num_draft_tokens tokens per bs,
         so the captured-token demand per bs unit is 2*D + 1 (D=4 -> 9x the
         stock estimate). Draft-model-less speculative algorithms (ngram
-        family) capture only target-verify -> D. Non-speculative -> 1."""
+        family) capture only target-verify -> D. Non-speculative -> 1.
+
+        *num_draft_tokens* overrides D. Only the adaptive ladder passes it
+        (#313): each of its rungs captures the same graph families at its
+        own draft-token width, so a rung's demand is this multiplier
+        evaluated at ``k + 1`` rather than at the boot width."""
         if self.speculative_algorithm is None:
             return 1
-        d = self.speculative_num_draft_tokens or 1
+        d = num_draft_tokens or self.speculative_num_draft_tokens or 1
         if self.speculative_draft_model_path is not None:
             return 2 * d + 1
         return d
 
-    def derived_rank_auto_reserve_mib(self, gpu_mem, colocated_ranks: int = 1) -> int:
+    def speculative_capture_tokens(self, num_draft_tokens: Optional[int] = None) -> int:
+        """Total captured tokens across all graph families of ONE rank
+        (0 when no decode graph is captured). ``decode_max_bs *
+        speculative_capture_token_multiplier()``; see #68."""
+        decode_cfg = self.cuda_graph_config.decode
+        if self.disable_cuda_graph or decode_cfg.backend == Backend.DISABLED:
+            return 0
+        return int(decode_cfg.max_bs or 0) * self.speculative_capture_token_multiplier(
+            num_draft_tokens
+        )
+
+    def ladder_reserve_gpu_id(self) -> Optional[int]:
+        """Physical GPU that carries the adaptive ladder's own reserve
+        demand, or None when no GPU does (#313).
+
+        Charged to exactly one GPU, and only under
+        ``--speculative-draft-placement solo``: that is where the ladder's
+        cost is ASYMMETRIC. The solo rank runs the UNSHARDED draft, so its
+        per-rung graph set carries the full draft-decode and draft-extend
+        families plus a private flashinfer workspace, while a split rank
+        holds 1/tp of the same tensors on top of a target-verify set the
+        base captured-token term already sizes. Split placement therefore
+        keeps the pre-#313 derivation unchanged -- no split boot has been
+        observed short, and inflating every GPU's reserve on a model that no
+        measurement backs would spend KV capacity for nothing.
+        """
+        if not self.speculative_adaptive or not self.speculative_draft_solo_active():
+            return None
+        if not self.rank_gpu_id:
+            return None
+        try:
+            rank = self.speculative_draft_solo_rank()
+        except ValueError:
+            # --speculative-draft-gpu names no rank's device.
+            # _handle_speculative_draft_placement rejects that by name; a
+            # reserve derivation must not preempt it with its own error.
+            return None
+        if rank is None or not 0 <= rank < len(self.rank_gpu_id):
+            return None
+        return self.rank_gpu_id[rank]
+
+    def ladder_reserve_demand(self, colocated_ranks: int = 1):
+        """``LadderReserveDemand`` for the GPU hosting the solo draft rank,
+        or None (no ladder, no solo placement, or not computable).
+
+        The ladder owns its own posts -- this only forwards to them, so the
+        sizing path and the boot-time check cannot disagree about what a
+        rung costs. Any failure degrades to None: a reserve derivation must
+        never be the reason a boot fails.
+        """
+        if self.ladder_reserve_gpu_id() is None:
+            return None
+        try:
+            from sglang.srt.speculative.adaptive_graph_memory import (
+                estimate_ladder_reserve_demand,
+            )
+
+            return estimate_ladder_reserve_demand(self, colocated_ranks)
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not estimate the adaptive ladder demand: %s", e)
+            return None
+
+    def derived_rank_auto_reserve_mib(
+        self,
+        gpu_mem,
+        colocated_ranks: int = 1,
+        hosts_solo_draft: bool = False,
+    ) -> int:
         """--rank-auto-reserve-mib 'auto' (#68): derive the per-GPU headroom
         from the actual demand instead of a flat constant.
 
@@ -7934,6 +8027,7 @@ class ServerArgs:
 
           reserve = runtime_reserve
                   + capture_tokens * 2 MiB * colocated_ranks
+                  + ladder_demand            (hosts_solo_draft only)
 
         where
           * runtime_reserve = 512 + activation_tokens * 1.5 + tp*pp/8*1024
@@ -7947,20 +8041,29 @@ class ServerArgs:
             from _handle_gpu_memory_settings;
           * colocated_ranks scales the capture term when several ranks
             share the physical GPU (each rank process captures its own
-            graphs; the runtime reserve stays shared per-GPU as before).
+            graphs; the runtime reserve stays shared per-GPU as before);
+          * ladder_demand (#313) is the adaptive ladder's OWN demand,
+            charged only to the GPU named by ladder_reserve_gpu_id() --
+            the rungs the controller builds beyond the boot rung, plus the
+            serving margin its boot check enforces. Everything above sizes
+            ONE graph set; a ladder keeps several, and the #707 window
+            measured what that costs (54 MiB short at the standard
+            reserve). See estimate_ladder_reserve_demand.
         """
         # Resolve the same capacity-tier defaults the stock path applies
         # later (idempotent), so chunked_prefill_size / decode max_bs exist.
         self._apply_gpu_mem_capacity_defaults(gpu_mem)
         runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
-        decode_cfg = self.cuda_graph_config.decode
-        if self.disable_cuda_graph or decode_cfg.backend == Backend.DISABLED:
-            capture_tokens = 0
-        else:
-            capture_tokens = int(decode_cfg.max_bs or 0) * (
-                self.speculative_capture_token_multiplier()
+        capture_tokens = self.speculative_capture_tokens()
+        ladder_mib = 0
+        if hosts_solo_draft:
+            demand = self.ladder_reserve_demand(colocated_ranks)
+            ladder_mib = demand.total_mib if demand is not None else 0
+        return int(
+            math.ceil(
+                runtime_reserve + capture_tokens * 2 * colocated_ranks + ladder_mib
             )
-        return int(math.ceil(runtime_reserve + capture_tokens * 2 * colocated_ranks))
+        )
 
     def _gdn_linear_attention_dims(self) -> Optional[Tuple[int, int, int, int, int]]:
         """``(num_k_heads, num_v_heads, head_k_dim, head_v_dim, itemsize)`` of
@@ -8144,6 +8247,22 @@ class ServerArgs:
         except Exception as e:  # pragma: no cover - advisory only
             logger.debug("Could not evaluate the budget against free VRAM: %s", e)
 
+    def reserve_demand_per_gpu(self, gpu_mem, counts) -> Dict[int, int]:
+        """``{physical gpu id: derived reserve demand MiB}`` for *counts*
+        (``{gpu id: co-located rank count}``).
+
+        The one place that decides WHICH GPU carries the adaptive ladder's
+        own demand, so the installed reserve, the pinned-reserve advisory
+        and the #265 fundability reference cannot drift apart (#313).
+        """
+        ladder_gpu = self.ladder_reserve_gpu_id()
+        return {
+            gpu_id: self.derived_rank_auto_reserve_mib(
+                gpu_mem, cnt, hosts_solo_draft=(gpu_id == ladder_gpu)
+            )
+            for gpu_id, cnt in counts.items()
+        }
+
     def _derived_reserve_demand_per_gpu(self, counts) -> Dict[int, int]:
         """``{physical gpu id: derived_rank_auto_reserve_mib}`` for the GPUs
         this plan uses, or ``{}`` when it cannot be computed.
@@ -8156,10 +8275,7 @@ class ServerArgs:
         """
         try:
             gpu_mem = get_device_memory_capacity(self.device)
-            return {
-                gpu_id: self.derived_rank_auto_reserve_mib(gpu_mem, cnt)
-                for gpu_id, cnt in counts.items()
-            }
+            return self.reserve_demand_per_gpu(gpu_mem, counts)
         except Exception as e:  # pragma: no cover - advisory only
             logger.debug("Could not derive the per-GPU reserve demand: %s", e)
             return {}
@@ -8189,6 +8305,7 @@ class ServerArgs:
                     gpu_mem,
                     counts[gpu_id],
                     budgets[tp_rank] / total_budget,
+                    hosts_solo_draft=(gpu_id == self.ladder_reserve_gpu_id()),
                 )
                 if note is not None:
                     logger.warning("%s", note)
@@ -8202,6 +8319,7 @@ class ServerArgs:
         gpu_mem,
         colocated_ranks: int,
         head_share: float,
+        hosts_solo_draft: bool = False,
     ) -> Optional[str]:
         """Diagnostic for a PINNED ``--rank-auto-reserve-mib`` that is below
         what ``auto`` would have derived, or None when it covers it.
@@ -8225,11 +8343,21 @@ class ServerArgs:
         any such threshold would be a constant reverse-engineered from two
         measurements, which is the defect this diagnostic exists to expose.
         """
-        derived = self.derived_rank_auto_reserve_mib(gpu_mem, colocated_ranks)
+        derived = self.derived_rank_auto_reserve_mib(
+            gpu_mem, colocated_ranks, hosts_solo_draft=hosts_solo_draft
+        )
         if pinned_mib >= derived:
             return None
         runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
-        capture_reserve = derived - runtime_reserve
+        ladder = (
+            self.ladder_reserve_demand(colocated_ranks) if hosts_solo_draft else None
+        )
+        ladder_mib = ladder.total_mib if ladder is not None else 0
+        # The pinned value replaces every derived post, the ladder included,
+        # so the itemization keeps them apart instead of folding the ladder
+        # into the capture term (#313).
+        ladder_note = f" + {ladder.ledger()}" if ladder_mib else ""
+        capture_reserve = derived - runtime_reserve - ladder_mib
         scratch = self.gdn_prefill_scratch_mib(head_share)
         scratch_note = (
             "not applicable (no GDN/linear-attention layers in this " "checkpoint)"
@@ -8247,13 +8375,77 @@ class ServerArgs:
             f"term charges it: runtime/activation reserve "
             f"{runtime_reserve:.0f} MiB + CUDA-graph capture "
             f"{capture_reserve:.0f} MiB (captured tokens across all graph "
-            f"families x {colocated_ranks} co-located rank(s)); of the "
+            f"families x {colocated_ranks} co-located rank(s))"
+            f"{ladder_note}; of the "
             f"activation part the GDN prefill scratch alone is "
             f"{scratch_note}. The KV pool takes whatever the reserve does not "
             f"hold back, so the shortfall surfaces as an OOM in the first "
             f"real prefill, not at startup. Pass "
             f"--rank-auto-reserve-mib auto to derive it, or raise the pinned "
             f"value."
+        )
+
+    def pinned_rank_auto_reserve_mib(self, tp_rank: int) -> Optional[int]:
+        """The PINNED ``--rank-auto-reserve-mib`` entry that applies to
+        *tp_rank*, or None under 'auto' / an unparsable value."""
+        raw = self.rank_auto_reserve_mib
+        if raw is None or str(raw) == "auto":
+            return None
+        try:
+            values = [int(part) for part in str(raw).split(",")]
+        except ValueError:
+            return None
+        if len(values) == 1:
+            return values[0]
+        if 0 <= tp_rank < len(values):
+            return values[tp_rank]
+        return None
+
+    def ladder_reserve_boot_suggestion(
+        self, shortfall_mib: int, tp_rank: Optional[int]
+    ) -> Optional[str]:
+        """Concrete remedy for a rank whose adaptive ladder does not fit,
+        naming the DERIVED demand instead of only the shortfall (#313).
+
+        The boot-time check knows the exact missing bytes but nothing about
+        how the reserve was sized; this side knows the demand model. An
+        explicit reserve keeps standing -- it is the operator's number and
+        nothing here overrides it -- but the message now says which number
+        would have covered the ladder.
+        """
+        if tp_rank is None or not self.rank_gpu_id:
+            return None
+        if not 0 <= tp_rank < len(self.rank_gpu_id):
+            return None
+        gpu_id = self.rank_gpu_id[tp_rank]
+        colocated = sum(1 for g in self.rank_gpu_id if g == gpu_id)
+        pinned = self.pinned_rank_auto_reserve_mib(tp_rank)
+        try:
+            gpu_mem = get_device_memory_capacity(self.device)
+            derived = self.derived_rank_auto_reserve_mib(
+                gpu_mem,
+                colocated,
+                hosts_solo_draft=(gpu_id == self.ladder_reserve_gpu_id()),
+            )
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not derive the reserve for the boot note: %s", e)
+            return None
+        demand = self.ladder_reserve_demand(colocated)
+        ledger = f" Ladder posts: {demand.ledger()}." if demand is not None else ""
+        if pinned is None:
+            return (
+                f"Rank {tp_rank} runs on physical GPU {gpu_id} with a DERIVED "
+                f"reserve of {derived} MiB (--rank-auto-reserve-mib auto). "
+                f"Raise it by at least {shortfall_mib} MiB with an explicit "
+                f"--rank-auto-reserve-mib entry (>= {derived + shortfall_mib} "
+                f"MiB for this rank).{ledger}"
+            )
+        return (
+            f"Rank {tp_rank} runs on physical GPU {gpu_id} with a PINNED "
+            f"--rank-auto-reserve-mib entry of {pinned} MiB; that value stands "
+            f"as passed. 'auto' would derive {derived} MiB for this GPU. Pass "
+            f"--rank-auto-reserve-mib auto, or raise this entry to at least "
+            f"{pinned + shortfall_mib} MiB.{ledger}"
         )
 
     def _handle_gpu_memory_settings(self, gpu_mem):

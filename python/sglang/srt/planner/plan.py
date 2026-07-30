@@ -104,6 +104,9 @@ def _make_view(plan_inputs) -> _ServerArgsView:
     view.speculative_capture_token_multiplier = (
         ServerArgs.speculative_capture_token_multiplier.__get__(view)
     )
+    view.speculative_capture_tokens = ServerArgs.speculative_capture_tokens.__get__(
+        view
+    )
     view.derived_rank_auto_reserve_mib = (
         ServerArgs.derived_rank_auto_reserve_mib.__get__(view)
     )
@@ -112,7 +115,13 @@ def _make_view(plan_inputs) -> _ServerArgsView:
 
 def auto_reserve_mib(plan_inputs, gpu_mem_mib: int, colocated_ranks: int) -> int:
     """The server's ``--rank-auto-reserve-mib auto`` value (#68) for one
-    physical GPU, computed by the REAL ServerArgs formula."""
+    physical GPU, computed by the REAL ServerArgs formula.
+
+    Without the adaptive-ladder term (#313): a plan carries no adaptive
+    config and no draft placement, so the ladder's rungs are not knowable
+    here. A plan for a ladder boot therefore reads LOW by that GPU's ladder
+    demand, which the boot itself derives and logs.
+    """
     view = _make_view(plan_inputs)
     return int(view.derived_rank_auto_reserve_mib(gpu_mem_mib, colocated_ranks))
 

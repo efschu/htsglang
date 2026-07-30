@@ -238,7 +238,9 @@ class AdaptiveController:
             if server_args is not None
             else "resident"
         )
-        self.graph_memory = AdaptiveGraphMemoryManager(mode=mode)
+        self.graph_memory = AdaptiveGraphMemoryManager(
+            mode=mode, server_args=server_args
+        )
         log_info_on_rank0(
             logger, f"Adaptive graph memory mode: {self.graph_memory.mode}"
         )

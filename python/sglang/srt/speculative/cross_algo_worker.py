@@ -633,7 +633,7 @@ class CrossAlgoWorker(BaseSpecWorker):
         mode = resolve_adaptive_graph_memory_mode(self.server_args)
         if mode not in OFFLOAD_MODES:
             return None
-        mgr = AdaptiveGraphMemoryManager(mode=mode)
+        mgr = AdaptiveGraphMemoryManager(mode=mode, server_args=self.server_args)
         log_info_on_rank0(
             logger,
             f"Cross-algo: created graph-memory manager (mode={mgr.mode}) for "

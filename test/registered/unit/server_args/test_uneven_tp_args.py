@@ -1091,6 +1091,258 @@ class TestPinnedReserveShortfall(CustomTestCase):
         )
 
 
+class TestLadderReserveDerivation(CustomTestCase):
+    """#313: the adaptive step ladder funds its own rungs.
+
+    The constellation is the #707 window of 2026-07-30 on the reference rig
+    (1x 32 GiB + 2x 20 GiB, TP=3, NEXTN, high-accept ladder [1..5],
+    chunked_prefill_size 2048, solo draft on rank 0). At the standard
+    bar1_hi reserve (4500,4200,4200) the boot check missed the largest
+    state by 54 MiB: 1376 MiB free with every rung paused against 918 MiB
+    (adaptive_state_k5) + 512 MiB serving margin. 5200 on rank 0 carried
+    it. Before this fix the derived demand was 4160 MiB on every GPU --
+    the ladder itself was charged nothing at all.
+    """
+
+    TIER_GPU_MEM = 32768.0
+    # The 2026-07-30 measurements this class reasons against.
+    MEASURED_K5_FOOTPRINT_MIB = 918
+    MEASURED_MARGIN_MIB = 512
+    OBSERVED_SHORTFALL_MIB = 54
+    STANDARD_RANK0_RESERVE_MIB = 4500
+    # Derived demand WITHOUT any ladder term (the pre-#313 number).
+    BASE_DEMAND_MIB = 4160
+
+    def _args(self, **overrides):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+
+        kwargs = dict(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="auto",
+            speculative_algorithm="NEXTN",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_adaptive=True,
+            speculative_adaptive_config="high-accept",
+            speculative_draft_placement="solo",
+        )
+        kwargs.update(overrides)
+        args = make_args(**kwargs)
+        args.cuda_graph_config = default_cuda_graph_config()
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        return args
+
+    def _mocked_measured_posts(self, args):
+        """Patch the ladder's own posts to the MEASURED k5 footprint, so the
+        derivation is exercised against the numbers the rig produced rather
+        than against its own estimate."""
+        from sglang.srt.speculative.adaptive_graph_memory import (
+            LadderReserveDemand,
+            LadderRungPost,
+        )
+
+        demand = LadderReserveDemand(
+            posts=(
+                LadderRungPost(rung=4, workspace_mib=384, capture_mib=240),
+                # 918 MiB = the measured adaptive_state_k5 footprint
+                # (scratch 424 + int-ws 184 + capture pool 352, rounded as
+                # the boot check reported it).
+                LadderRungPost(rung=5, workspace_mib=566, capture_mib=352),
+            ),
+            boot_rung=3,
+            margin_mib=self.MEASURED_MARGIN_MIB,
+            resident=False,
+        )
+        return patch.object(type(args), "ladder_reserve_demand", return_value=demand)
+
+    # -- the derivation --------------------------------------------------
+
+    def test_ladder_is_charged_only_to_the_solo_draft_gpu(self):
+        args = self._args()
+        self.assertEqual(args.ladder_reserve_gpu_id(), 0)
+        demand = args.reserve_demand_per_gpu(self.TIER_GPU_MEM, {0: 1, 1: 1, 2: 1})
+        self.assertGreater(demand[0], self.BASE_DEMAND_MIB)
+        self.assertEqual(demand[1], self.BASE_DEMAND_MIB)
+        self.assertEqual(demand[2], self.BASE_DEMAND_MIB)
+
+    def test_estimated_posts_fund_the_707_constellation(self):
+        """The ladder's own estimate (no mock): peak rung k5 = flashinfer
+        workspace 384 + graph capture 24 bs x 6 draft tokens x 2 MiB = 672,
+        plus the 512 MiB serving margin -> 4160 + 1184 = 5344 MiB, which
+        clears the 4554 MiB the rig actually wanted."""
+        args = self._args()
+        derived = args.derived_rank_auto_reserve_mib(
+            self.TIER_GPU_MEM, 1, hosts_solo_draft=True
+        )
+        self.assertEqual(derived, 5344)
+        self.assertGreaterEqual(
+            derived,
+            self.STANDARD_RANK0_RESERVE_MIB + self.OBSERVED_SHORTFALL_MIB,
+        )
+
+    def test_measured_posts_propose_at_least_972_mib_on_rank_0(self):
+        """With the ladder's posts mocked to what the rig measured, the
+        derivation adds the whole boot-check requirement (918 + 512) -- more
+        than the 972 MiB that covers the observed 54 MiB miss with the
+        headroom the working 5200 MiB reserve had."""
+        args = self._args()
+        with self._mocked_measured_posts(args):
+            derived = args.derived_rank_auto_reserve_mib(
+                self.TIER_GPU_MEM, 1, hosts_solo_draft=True
+            )
+        extra = derived - self.BASE_DEMAND_MIB
+        self.assertEqual(
+            extra, self.MEASURED_K5_FOOTPRINT_MIB + self.MEASURED_MARGIN_MIB
+        )
+        self.assertGreaterEqual(extra, 972)
+        self.assertGreaterEqual(
+            derived,
+            self.STANDARD_RANK0_RESERVE_MIB + self.OBSERVED_SHORTFALL_MIB,
+        )
+
+    def test_colocated_ranks_scale_the_capture_posts(self):
+        args = self._args()
+        one = args.derived_rank_auto_reserve_mib(
+            self.TIER_GPU_MEM, 1, hosts_solo_draft=True
+        )
+        two = args.derived_rank_auto_reserve_mib(
+            self.TIER_GPU_MEM, 2, hosts_solo_draft=True
+        )
+        # Each co-located rank process captures its own graphs; the
+        # workspace/margin posts are per rank as well, but only the capture
+        # term is scaled here -- so the ladder part grows by exactly the
+        # peak rung's capture post.
+        self.assertEqual(two - one, (24 * 6 * 2) + (24 * 4 * 2))
+
+    # -- regression protection -------------------------------------------
+
+    def test_split_placement_keeps_the_pre_313_derivation(self):
+        args = self._args(speculative_draft_placement="split")
+        self.assertIsNone(args.ladder_reserve_gpu_id())
+        self.assertEqual(
+            args.reserve_demand_per_gpu(self.TIER_GPU_MEM, {0: 1, 1: 1, 2: 1}),
+            {0: self.BASE_DEMAND_MIB, 1: self.BASE_DEMAND_MIB, 2: self.BASE_DEMAND_MIB},
+        )
+
+    def test_no_adaptive_ladder_keeps_the_pre_313_derivation(self):
+        args = self._args(speculative_adaptive=False, speculative_adaptive_config=None)
+        self.assertIsNone(args.ladder_reserve_gpu_id())
+        self.assertEqual(
+            args.reserve_demand_per_gpu(self.TIER_GPU_MEM, {0: 1, 1: 1, 2: 1}),
+            {0: self.BASE_DEMAND_MIB, 1: self.BASE_DEMAND_MIB, 2: self.BASE_DEMAND_MIB},
+        )
+
+    def test_no_speculation_at_all_keeps_the_pre_313_derivation(self):
+        args = self._args(
+            speculative_algorithm=None,
+            speculative_num_steps=None,
+            speculative_num_draft_tokens=None,
+            speculative_adaptive=False,
+            speculative_adaptive_config=None,
+            speculative_draft_placement=None,
+        )
+        self.assertIsNone(args.ladder_reserve_gpu_id())
+        for reserve in args.reserve_demand_per_gpu(
+            self.TIER_GPU_MEM, {0: 1, 1: 1, 2: 1}
+        ).values():
+            # 3968 runtime reserve + 24 captured tokens x 2 MiB.
+            self.assertEqual(reserve, 4016)
+
+    def test_budgets_follow_the_ladder_aware_reserve(self):
+        args = self._args()
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=self.TIER_GPU_MEM,
+            create=True,
+        ):
+            run_handler(args)
+        # GPU 0 (32 GiB) now holds back 5344 instead of 4160 MiB; the two
+        # 20 GiB cards are untouched.
+        self.assertEqual(
+            args.rank_gpu_memory_mib, [32768 - 5344, 20480 - 4160, 20480 - 4160]
+        )
+
+    # -- an explicit reserve keeps standing, and is told what it misses ---
+
+    def test_pinned_reserve_is_not_inflated_but_names_the_derived_demand(self):
+        # 4000 on the two 20 GiB cards is below their (unchanged) 4160 MiB
+        # demand, so their note fires too and can be compared against GPU 0's.
+        args = self._args(rank_auto_reserve_mib="4500,4000,4000")
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=self.TIER_GPU_MEM,
+            create=True,
+        ), patch.object(server_args_module, "logger") as mock_logger:
+            run_handler(args)
+        # The pinned vector stands, exactly as passed.
+        self.assertEqual(
+            args.rank_gpu_memory_mib, [32768 - 4500, 20480 - 4000, 20480 - 4000]
+        )
+        notes = [
+            str(call.args[1] if len(call.args) > 1 else call.args[0])
+            for call in mock_logger.warning.call_args_list
+        ]
+        gpu0 = [n for n in notes if "4500 MiB on GPU 0" in n]
+        self.assertEqual(len(gpu0), 1)
+        self.assertIn("5344 MiB", gpu0[0])  # the ladder-aware derived demand
+        self.assertIn("short by 844 MiB", gpu0[0])
+        self.assertIn("adaptive ladder: +1184 MiB", gpu0[0])
+        self.assertIn("peak built rung k5", gpu0[0])
+        self.assertIn("serving margin 512 MiB", gpu0[0])
+        self.assertIn("--rank-auto-reserve-mib auto", gpu0[0])
+        # The 20 GiB cards host no ladder: their note keeps the old items
+        # and the old (4160 MiB) bar.
+        gpu1 = [n for n in notes if "4000 MiB on GPU 1" in n]
+        self.assertEqual(len(gpu1), 1)
+        self.assertIn("4160 MiB", gpu1[0])
+        self.assertIn("short by 160 MiB", gpu1[0])
+        self.assertNotIn("adaptive ladder", gpu1[0])
+
+    def test_boot_suggestion_for_a_pinned_reserve(self):
+        args = self._args(rank_auto_reserve_mib="4500,4200,4200")
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=self.TIER_GPU_MEM,
+            create=True,
+        ):
+            note = args.ladder_reserve_boot_suggestion(
+                self.OBSERVED_SHORTFALL_MIB, tp_rank=0
+            )
+        self.assertIn("PINNED", note)
+        self.assertIn("4500 MiB", note)
+        self.assertIn("that value stands as passed", note)
+        self.assertIn("5344 MiB", note)
+        self.assertIn("at least 4554 MiB", note)
+        self.assertIn("peak built rung k5", note)
+
+    def test_boot_suggestion_under_auto(self):
+        args = self._args()
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=self.TIER_GPU_MEM,
+            create=True,
+        ):
+            note = args.ladder_reserve_boot_suggestion(
+                self.OBSERVED_SHORTFALL_MIB, tp_rank=0
+            )
+        self.assertIn("DERIVED reserve of 5344 MiB", note)
+        self.assertIn("at least 54 MiB", note)
+        self.assertIn(">= 5398 MiB", note)
+
+    def test_boot_suggestion_degrades_without_a_rank(self):
+        args = self._args()
+        self.assertIsNone(args.ladder_reserve_boot_suggestion(54, tp_rank=None))
+        self.assertIsNone(args.ladder_reserve_boot_suggestion(54, tp_rank=9))
+
+
 if __name__ == "__main__":
     unittest.main()
 
