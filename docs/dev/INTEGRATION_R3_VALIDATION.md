@@ -12298,3 +12298,221 @@ entfernt, `gpu-arb`-Fenster geschlossen, Leistungs-Logger beendet.
 3. **Der fp8-Marlin-Kernel fehlt fuer sm_86 im JIT-Cache** und der Fehlertext
    zeigt auf einen fremden Worktree. Bis das gerichtet ist, ist jede
    3080-fp8-Zahl dieses Rigs ein unterer Wert.
+
+## #285 DFLASH strukturiert (s16) — Fenster 2026-07-30
+
+Die Frage dieses Fensters ist eng: **lohnt DFLASH bei kurzem strukturiertem
+Output (Code / JSON / Listen) gegen NEXTN — je Klasse, nie gemittelt?** Die
+Fork-Doku behauptet seit #156, DFLASH sei auf Prosa schwach und verdiene sich
+seine Akzeptanz auf formatgebundenem Text; gemessen worden war das nie auf
+Code, JSON oder Tabellen. Der Aufbau (`s16_*`, Runbook
+`docs/dev/TASK_285_DFLASH_STRUCTURED.md`) ist dafuer gebaut: FP8-Vehikel statt
+GGUF, Split-Placement auf beiden Armen, verschraenkt nach Runden, A-vs-A-Boden
+zuerst, jeder Punkt ausgabe-validiert.
+
+### Abweichungen vom Runbook-Rezept, und warum jede noetig war
+
+Alle drei Abweichungen liegen im Boot-Rezept, das auf beiden Armen identisch
+ist. Keine liegt in der Differenz, die gelesen wird.
+
+1. **MLP-Vektor gepinnt (`SGLANG_UNEVEN_MLP_VECTOR=63,37,36`).** Das Welle-2-
+   Fenster hat den Posten hinterlassen, dass die Stage-0-Sonde seit
+   `PROFILE_VERSION` 2 -> 3 bei jedem `auto-performance`-Boot 600 s im
+   NCCL-Link-Rendezvous verbrennt. Auf dem Host lag genau ein Profil,
+   `hw_profile-124a7190f860.json`, und dessen Schluessel gehoert zu
+   `PROFILE_VERSION` 2 — der Code dieses Worktrees steht auf 3, der Cache war
+   also ungueltig und die Sonde waere sechsmal gelaufen (60 min fuer ein
+   40-min-Fenster). Der gepinnte Vektor nimmt den dokumentierten Pin-Pfad, der
+   vor `get_hardware_profile()` zurueckkehrt. Belegt: Boot in 97-142 s statt
+   600 s + Boot, `rank_mlp_ratio=[63, 37, 36]` im `server_args`-Log jedes Arms.
+   Dafuer noetig war eine kleine Ergaenzung am Orchestrator
+   (`S16_MLP_VECTOR`), die die Env-Zeile in das generierte Boot-Skript setzt.
+2. **Reserve 3000,2700,2700 statt 4500,4200,4200.** Das Runbook nennt die
+   Reserve als offenes Risiko ("hat noch nie mit einem DFLASH-Drafter
+   geboote"), und genau daran ist der erste Kalibrierboot gescheitert: unter
+   `--rank-gpu-memory-mib` blieb auf allen drei Raengen **kein einziges Byte**
+   fuer den KV-Cache — Rang 0 fehlten 837 MiB, Rang 1 873 MiB, Rang 2 713 MiB,
+   bevor der erste KV-Token belegt war. Die 3080-Reserve steht damit auf ihrem
+   harten Boden 2700; die 5090 geht auf 3000.
+3. **`--max-running-requests` 8 statt 16 und `--context-length` 16384 statt
+   32768.** Auch nach der Reserve-Senkung war der Fixkostenblock zu gross: der
+   Mamba-State-Pool skaliert mit `max_running_requests`, die
+   Prefill-Aktivierungsreserve mit dem Kontext. Beide Werte sind fuer diesen
+   Lastfall ohnehin ueberdimensioniert — die groesste gemessene Batchgroesse
+   ist 8, und die strukturierten Prompts samt Antwort bleiben weit unter 16k.
+
+Nach diesen drei Aenderungen bootet der DFLASH-Arm sauber:
+`max_total_num_tokens=164040`. Dieser Wert ist per `S16_MAX_TOTAL_TOKENS` auf
+**beide** Arme gepinnt, damit der NEXTN-Arm nicht mit dem groesseren Pool
+antritt, den er ohne Drafter-Gewichte haette.
+
+### Der Boden zuerst, und warum er enger aussieht als er ist
+
+Runde 0 bootet das NEXTN-Rezept zweimal unter zwei Namen. Auf `ms/Verify`
+liegen die beiden Boots je Zelle 0,6-4,8 % auseinander, auf `Accept
+(meta_info)` 0,0-1,6 % — letzteres, weil bei Temperatur 0 und gepinnter
+Prompt-Reihenfolge beide Boots bitgleiche Antworten erzeugen und der
+Client-Accept damit eine deterministische Groesse ist.
+
+**Der A-vs-A-Boden aus zwei Boots unterschaetzt die Streuung.** Der dritte
+Boot desselben Rezepts (`nextn_r1`) liefert auf `list_table` bs=1
+93,61 tick-tok/s gegen 120,96 und 118,83 der beiden Boden-Arme — 22 %
+auseinander, wo der Boden 1,8 % behauptet. Die Ursache steht in den
+Tick-Rohdaten und ist keine Regression: die Tick-Verteilung dieser Zelle ist
+schwer-schwaenzig (sd 37,7 tok/s bei min 4,3 / max 158,3, auf allen drei
+Boots praktisch gleich), und der *Median* ueber ~450 Ticks springt darin.
+Praktische Folge fuer diese Tabelle: **`ms/Verify` und `Accept` sind die
+belastbaren Achsen, der Median der tick-tok/s bei bs=1 ist es nicht.** Ein
+Boden aus genau zwei Boots ist auf einer solchen Verteilung ein Glueckswurf;
+kuenftige Fenster brauchen dort drei.
+
+### Die Zahlen, je Klasse und Batchgroesse
+
+Vier Arme, 24 Punkte. Positiv = DFLASH besser.
+
+| Klasse | bs | Metrik | floor_a | floor_b | nextn_r1 | dflash_r1 | DFLASH vs NEXTN |
+|---|---|---|---|---|---|---|---|
+| code_completion | 1 | ms/Verify | 32,18 | 32,63 | 33,97 | 43,97 | **-29,4 %** |
+| code_completion | 1 | tick tok/s | 124,30 | 122,58 | 117,74 | 68,23 | -42,1 % |
+| code_completion | 1 | Accept (meta_info) | 3,151 | 3,151 | 3,209 | 4,410 | **+37,4 %** |
+| code_completion | 1 | Valid-Quote | 0,33 | 0,33 | 0,50 | 0,60 | +20,0 % |
+| code_completion | 8 | ms/Verify | 7,73 | 8,10 | 7,86 | 20,10 | **-155,5 %** |
+| code_completion | 8 | tick tok/s | 420,26 | 401,09 | 413,24 | 248,80 | -39,8 % |
+| code_completion | 8 | Accept (meta_info) | 3,262 | 3,199 | 3,289 | 5,036 | **+53,1 %** |
+| code_completion | 8 | Valid-Quote | 0,55 | 0,58 | 0,67 | 1,00 | +50,0 % |
+| json_schema | 1 | ms/Verify | 32,49 | 32,69 | 32,68 | 44,65 | **-36,6 %** |
+| json_schema | 1 | tick tok/s | 123,11 | 122,38 | 122,40 | 89,58 | -26,8 % |
+| json_schema | 1 | Accept (meta_info) | 3,403 | 3,403 | 3,403 | 6,049 | **+77,7 %** |
+| json_schema | 1 | Valid-Quote | 0,60 | 0,60 | 0,60 | 0,75 | +25,0 % |
+| json_schema | 8 | ms/Verify | 7,75 | 7,83 | 7,97 | 19,34 | **-142,6 %** |
+| json_schema | 8 | tick tok/s | 435,85 | 431,66 | 424,10 | 235,84 | -44,4 % |
+| json_schema | 8 | Accept (meta_info) | 3,414 | 3,380 | 3,371 | 5,521 | **+63,8 %** |
+| json_schema | 8 | Valid-Quote | 0,67 | 0,57 | 0,38 | 0,67 | +77,8 % |
+| list_table | 1 | ms/Verify | 33,07 | 33,66 | 32,05 | 44,93 | **-40,2 %** |
+| list_table | 1 | tick tok/s | 120,96 | 118,83 | 93,61 | 66,77 | -28,7 % |
+| list_table | 1 | Accept (meta_info) | 3,071 | 3,071 | 3,071 | 4,255 | **+38,5 %** |
+| list_table | 1 | Valid-Quote | 1,00 | 1,00 | 1,00 | 1,00 | 0,0 % |
+| list_table | 8 | ms/Verify | 7,74 | 7,97 | 8,39 | 19,32 | **-130,2 %** |
+| list_table | 8 | tick tok/s | 387,59 | 376,18 | 357,43 | 184,25 | -48,5 % |
+| list_table | 8 | Accept (meta_info) | 2,967 | 3,015 | 2,950 | AUSGEFALLEN | - |
+
+### Verdikt je Klasse
+
+**Auf allen drei Klassen und beiden Batchgroessen: DFLASH lohnt nicht.** Das
+Verdikt ist in keiner Zelle knapp — die `ms/Verify`-Differenzen liegen
+zwischen 29 % und 156 % gegen einen Boden von 0,6-4,8 %, also um den Faktor 6
+bis 32 ueber der Nachweisgrenze dieses Instruments.
+
+| Klasse | bs=1 | bs=8 |
+|---|---|---|
+| code_completion | lohnt nicht (-29,4 % ms/Verify) | lohnt nicht (-155,5 %) |
+| json_schema | lohnt nicht (-36,6 %) | lohnt nicht (-142,6 %) |
+| list_table | lohnt nicht (-40,2 %) | lohnt nicht (-130,2 %) |
+
+Der interessante Teil ist, **woran** es scheitert, denn die Fork-Behauptung
+ist nicht einfach falsch:
+
+* **Auf der Accept-Achse ist die Behauptung bestaetigt.** DFLASH akzeptiert
+  auf formatgebundenem Text deutlich mehr Tokens je Verify als NEXTN:
+  +37,4 % (Code bs=1), +53,1 % (Code bs=8), +77,7 % (JSON bs=1), +63,8 %
+  (JSON bs=8), +38,5 % (Listen bs=1). In absoluten Zahlen 4,3-6,0 gegen
+  3,0-3,4. Der Drafter *ist* auf dieser Textsorte der bessere Rater, und zwar
+  klar und in jeder Klasse.
+* **Auf der Zeitachse verliert es das wieder, mehrfach.** Der hoehere Accept
+  kostet mehr, als er einbringt: ein Verify-Schritt dauert bei bs=1 rund
+  44-45 ms statt 32-34 ms, bei bs=8 rund 19-20 ms statt 7,7-8,4 ms. Bei bs=8
+  ist der Schritt also **zweieinhalbmal** so teuer, waehrend der Accept nur
+  rund anderthalbmal so hoch ist. Netto bleiben 27-49 % weniger Durchsatz.
+* Die Skalierung ueber die Batchgroesse ist dabei das eigentliche Problem:
+  von bs=1 auf bs=8 faellt NEXTNs `ms/Verify` um Faktor ~4,1, DFLASHs nur um
+  Faktor ~2,3. Der DFLASH-Verify-Schritt profitiert also deutlich schlechter
+  vom Batching. Warum, sagt dieses Fenster nicht — das ist die naechste Frage,
+  nicht dieses Ergebnis.
+
+Damit praezisiert sich der Doku-Stand: *"DFLASH verdient sich seine Akzeptanz
+auf formatgebundenem Text"* stimmt woertlich und ist hier zum ersten Mal auf
+Code/JSON/Listen belegt — aber die verdiente Akzeptanz reicht auf diesem Rig
+nicht, um die Schrittkosten zu bezahlen. Es gibt in diesem Messfeld keinen
+Arbeitspunkt, an dem DFLASH gegen NEXTN gewinnt.
+
+### Negativbefunde und Instrumentenfehler, ehrlich benannt
+
+1. **Nur 9 der 24 Punkte zaehlen nach der Validierungsregel — und die Ursache
+   ist ein Harness-Defekt, kein Modellbefund.** Die Prompt-Datei gibt je Prompt
+   ein `max_new_tokens` von 288-448 vor, bemessen fuer die blosse Antwort. Das
+   Ziel ist aber ein Reasoning-Checkpoint: es schreibt erst einen
+   `<think>`-Block und danach den Code bzw. das JSON-Objekt. Ist der Block
+   lang, ist das Budget vor der schliessenden Klammer aufgebraucht und der
+   Validator verwirft eine Ausgabe, die nicht falsch, sondern abgeschnitten
+   ist. Die Signatur ist eindeutig: die *gueltigen* Antworten sind die mit
+   leerem `<think></think>`, die ungueltigen die mit langem Denkvorlauf. Die
+   Klasse `list_table` hat mit 0,78-1,00 die hoechste Valid-Quote, weil ihre
+   Antworten kurz genug sind, um in beiden Faellen zu passen.
+   `s16_structured_point.py` bekommt dafuer `S16_MIN_MAX_NEW_TOKENS`, eine
+   Untergrenze unter alle Prompt-Budgets — in diesem Fenster nur eingebaut,
+   **nicht mehr gemessen** (Kartenbudget).
+   Die Zeitachsen sind davon nicht betroffen: `ms/Verify` und Accept messen die
+   Dekodier-Mechanik, unabhaengig davon, ob die Antwort geparst hat, und der
+   Defekt trifft beide Arme identisch. Die Verdikte oben stehen deshalb, aber
+   sie stehen auf der Zeit- und Accept-Achse, nicht auf der Valid-Quote.
+2. **Ein Punkt ist komplett ausgefallen: `dflash_r1` bs=8 `list_table`.**
+   `no request completed inside the window` — DFLASH ist auf der laengsten
+   Antwortklasse langsam genug, dass im (auf 14 s verkuerzten) Fenster keine
+   einzige Anfrage fertig wurde. Die Tick-Achse dieses Punktes existiert
+   (184,25 tok/s, `ms/Verify` 19,32, Accept-Tick 3,56), Client-Accept und
+   Valid-Quote fehlen. Der Ausfall ist selbst ein Befund ueber die
+   DFLASH-Geschwindigkeit, aber er ist eine Luecke in der Tabelle und wird
+   nicht als Null verrechnet.
+3. **Zwei Fehler im Analyse-Skript, beide gefunden und behoben.**
+   `RE_MAXTOK` traf sowohl `max_total_num_tokens=164040` (realisiert) als auch
+   `global max_total_num_tokens 222336` (die Uneven-DCP-Meldung *vor* der
+   Hybrid-Mamba-Deckelung) und nahm davon das Maximum. Ergebnis war die
+   Falschmeldung *"KV pool spread across arms: 36,5 %"* fuer Arme, deren
+   realisierte Pools 164040 und 163920 gross waren — 0,07 % auseinander und
+   absichtlich gepinnt. Der naechste Leser haette einen bereits korrekten Lauf
+   wiederholt. Behoben: die `=`-Form gewinnt, und die Spread-Warnung bekommt
+   eine Toleranz von 1 %, weil ein gepinnter Pool je Arm auf dessen eigenes
+   Page-Raster rundet.
+4. **Die zweite Vergleichsrunde ist AUSSTEHEND.** Geplant waren zwei
+   verschraenkte Runden; gemessen wurde eine. Das Kartenbudget von 40 min ging
+   an den fehlgeschlagenen ersten Kalibrierboot (Reserve) und an eine
+   Lock-Uebergabe; als die vier Arme standen, war fuer zwei weitere Arme
+   (~9,3 min) zu wenig sicherer Rest. Damit fehlt die Boot-zu-Boot-Streuung der
+   *Vergleichs*arme; sie ist durch drei Boots des NEXTN-Rezepts nur fuer die
+   NEXTN-Seite belegt. Angesichts von Differenzen um Faktor 6-32 ueber dem
+   Boden aendert das die Richtung des Verdikts nicht, aber es fehlt.
+5. **Nicht gemessen und nicht behauptet:** GGUF als Vehikel (#290 haette in der
+   Differenz gelegen), Solo-Placement des Drafters (#153/#155), laengere
+   Kontexte als 16k, andere Batchgroessen als 1 und 8.
+
+### Kartenzeit und Rig-Hygiene
+
+30 min von 40 min Budget verbraucht (Lock 19:49:53 UTC bis Freigabe 20:20
+UTC). Davon: 112 s fehlgeschlagener Kalibrierboot (Reserve zu hoch), 195 s
+erfolgreicher Kalibrierboot, 1201 s Hauptlauf, Rest Ruestzeit. Boots lagen
+nach dem MLP-Pin bei 71-142 s statt der 600 s + Boot, die die haengende
+Stage-0-Sonde gekostet haette.
+
+Leistungsaufnahme ueber das ganze Fenster (359 Messpunkte je Karte, 5-s-Takt):
+GPU0 (3080) Mittel 147,2 W / Spitze 312,2 W, GPU1 (5090) Mittel 111,7 W /
+Spitze 280,1 W, GPU2 (3080) Mittel 126,7 W / Spitze 291,1 W. Dass die 5090 im
+Mittel die *niedrigste* Leistung zieht, passt zum bekannten Bild des
+langsamsten Rangs als Taktgeber.
+
+Nach dem Fenster: keine `launch_server`-Prozesse auf dem Host, alle drei
+Karten auf 0 MiB, Host- und Container-Locks freigegeben, `gpu-arb`-Fenster
+wieder geoeffnet, Leistungs-Logger beendet.
+
+### Was dieses Fenster hinterlaesst
+
+1. **DFLASH ist auf diesem Rig fuer strukturierten Output kein Kandidat.** Die
+   Frage ist damit fuer Code/JSON/Listen bei bs=1 und bs=8 beantwortet, und
+   zwar negativ trotz klar besserer Akzeptanz.
+2. **Die offene Anschlussfrage ist die Batch-Skalierung des
+   DFLASH-Verify-Schritts** (Faktor 2,3 statt 4,1 von bs=1 auf bs=8). Wenn dort
+   etwas zu holen ist, verschiebt sich das Bild bei bs=8 am staerksten.
+3. **Vor dem naechsten s16-Lauf: `S16_MIN_MAX_NEW_TOKENS` setzen** (Vorschlag
+   1024), sonst misst die Valid-Quote weiter den Denkvorlauf statt der
+   Formattreue.
+4. **Ein A-vs-A-Boden aus zwei Boots reicht auf tick-tok/s nicht.** Drei Boots,
+   oder die Achse als nicht belastbar markieren.

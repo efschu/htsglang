@@ -35,10 +35,26 @@ import re
 import statistics
 import sys
 
+# The REALIZED KV capacity is the one the scheduler prints as
+# "max_total_num_tokens=<n>". The uneven-DCP sizing message says
+# "global max_total_num_tokens <n>" as well, but that figure is taken BEFORE
+# the hybrid mamba/attention cap is applied and is therefore larger -- 222336
+# against a realized 164040 on the #285 window. Matching both spellings and
+# then taking max() reported the pre-cap number and raised a "KV pool spread
+# 36.5 %" alarm for two arms whose realized pools were 164040 and 163920, i.e.
+# 0.07 % apart and pinned on purpose. The equals form is the realized value, so
+# it wins whenever it is present; the loose form stays as a fallback for a log
+# that never got that far.
+RE_MAXTOK_FINAL = re.compile(r"max_total_num_tokens=(\d+)")
 RE_MAXTOK = re.compile(r"max_total_num_tokens[= ](\d+)")
 RE_SPEC_ALGO = re.compile(r"speculative_algorithm[=:' ]+([A-Za-z0-9_]+)")
 
 FLOOR_ARMS = ("floor_a", "floor_b")
+
+#: Per-arm KV pools this far apart still count as "the same pinned pool" (see
+#: capacity_table): the pin is a token count and each arm rounds it to its own
+#: page grid.
+KV_POOL_SPREAD_TOLERANCE_PCT = 1.0
 
 # Metric key -> (label, source field in the point, "lower is better"?)
 METRICS = (
@@ -78,7 +94,7 @@ def load_proof(step_dir: str, arm: str) -> dict:
         return info
     with open(path, errors="replace") as f:
         text = f.read()
-    tok = RE_MAXTOK.findall(text)
+    tok = RE_MAXTOK_FINAL.findall(text) or RE_MAXTOK.findall(text)
     if tok:
         info["max_total_num_tokens"] = max(int(t) for t in tok)
     m = RE_SPEC_ALGO.search(text)
@@ -286,14 +302,28 @@ def capacity_table(step_dir: str, points: list, out) -> None:
             file=out,
         )
     known = [v for v in caps.values() if isinstance(v, int)]
+    # A pinned pool does not come out bit-identical on every arm: the pin is a
+    # token count, and each arm rounds it to its own page/unit grid. On the
+    # #285 window that put DFLASH at 164040 against 163920 for the NEXTN arms,
+    # 0.07 % apart and pinned on purpose. Calling that "the arms did not run the
+    # same pool" would send the next reader off to repeat a run that was already
+    # correct, so the alarm needs a tolerance and the exact figure is printed
+    # either way.
     if len(known) >= 2 and max(known) != min(known):
         spread = (max(known) - min(known)) / max(known) * 100.0
-        print(
-            f"\nKV pool spread across arms: {spread:.1f} %. The arms did not run "
-            "the same pool; pin S16_MAX_TOTAL_TOKENS to the smaller capacity and "
-            "repeat before quoting a decode verdict.",
-            file=out,
-        )
+        if spread <= KV_POOL_SPREAD_TOLERANCE_PCT:
+            print(
+                f"\nKV pool equal across arms within rounding: spread "
+                f"{spread:.2f} % (<= {KV_POOL_SPREAD_TOLERANCE_PCT} %).",
+                file=out,
+            )
+        else:
+            print(
+                f"\nKV pool spread across arms: {spread:.1f} %. The arms did not "
+                "run the same pool; pin S16_MAX_TOTAL_TOKENS to the smaller "
+                "capacity and repeat before quoting a decode verdict.",
+                file=out,
+            )
     elif known:
         print("\nKV pool identical across arms.", file=out)
 
