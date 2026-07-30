@@ -11442,3 +11442,288 @@ eine eigene Messung mit Decode als Hauptpunkt.
 * Der 4096er-Chunk ist bei s=8 **kein Hebel** (+0,8 %, unter dem Boden). Die
   frueheren +22,6 % waren der Transport.
 * Beste Konfiguration: **`bar1_hi`, 1,170 gegen NCCL bei s=8.**
+
+## #296 Phasen-Optima statisch (Treppen-Extrema) (2026-07-30)
+
+Wiedereroeffnung des Registereintrags **„Phasen-dualer MLP-Split"**
+(DESIGN_201, Nutzer-Diskussion 2026-07-28). Begruendung: BAR1 hat den
+Kollektivboden gesenkt (#293: 1,170 bei s=8), und die Design-Notiz sagt, der
+Gewinn eines phasen-dualen Splits skaliert INVERS zum Boden. Der Falsifikator
+vom 2026-07-28 hatte die Praemisse offen gelassen — Schere 5,3-5,7 %, aber
+komplett vom Prefill getragen, Decode-Nachteil 2,50 % UNTER dem Rauschboden,
+also 0. Der Entscheidungsweg dort: „zeigt die Replikation doch Decode-Kosten →
+Phasen-dual-Praemisse lebt wieder."
+
+Dieser Lauf misst die beiden STATISCHEN Extrema, nicht einen moderaten
+Kompromissvektor, und liefert nebenbei die von #294 geforderte n>=10-Decode-
+Stichprobe (erreicht: 84-118 Ticks je Punkt).
+
+Rohdaten: `/spinning/gpu-battery-results/2026-07-30_phasen_optima/`
+(`tabellen.md`, `s15_phasen_optima/{punkte.jsonl,wait,proofs,power,logs}`),
+Schritt `scripts/gpu_battery/s15_phasen_optima.sh`, Auswertung
+`scripts/gpu_battery/s15_auswertung.py`.
+
+### Die Arme, und woher die Vektoren kommen
+
+Alle sechs Arme teilen EINEN Basisplan (`--rank-tp-ratio auto-performance`,
+das auf diesem Rig den reinen VRAM-auto-Split 28107,16280,16280 waehlt — jeder
+MLP-Konzentrationskandidat faellt am Decode-Knie-Waechter durch). Sie
+unterscheiden sich in genau zwei gepinnten Vektoren, `--rank-mlp-ratio` und
+`--rank-kv-ratio`, plus dem Transport. Reserve `4500,4200,4200` und
+`--decode-log-interval 1` liegen unveraendert auf jedem Arm.
+
+| # | Arm | MLP-Gewichtssplit | KV-Tokensplit | Transport |
+|---|---|---|---|---|
+| 1 | Anker | auto (Einheiten 63,37,36) | 7,3,3 | BAR1 |
+| 2 | Prefill-Optimum | 10,1,1 | 7,3,3 | BAR1 |
+| 3 | Decode-Optimum | 7,3,3 | 7,3,3 | BAR1 |
+| 4 | Decode-Optimum + ausgeglichenes DCP | 7,3,3 | 1,1,1 | BAR1 |
+| 5 | Prefill-Optimum, NCCL | 10,1,1 | 7,3,3 | NCCL |
+| 6 | Decode-Optimum, NCCL | 7,3,3 | 7,3,3 | NCCL |
+
+**FP8-Objective-Befund (CPU-Vorpruefung, `befunde/fp8_objective_audit.md`).**
+Im `enc`-Pfad steckt KEIN Datenblattwert — `_bench_gemm_tflops` ist eine echte
+getimte Messung. Sie misst aber das FALSCHE FORMAT: dichtes **bf16**, waehrend
+der Checkpoint FP8 ist. Die Kartenprobe #213 hat beide Bahnen laengst gemessen:
+5090 `gemm_fp8_tflops` 566,88 gegen 3080 `gemm_fp8_tflops` **null** mit
+„compute capability 8.6 has no fp8 tensor path (needs 8.9+)", bf16 65,57. Der
+Planner sieht damit 232,4/61,4 = **3,79**, die reale FP8-Bahn liegt bei
+566,88/65,58 = **8,64** — und 65,58 ist fuer die 3080 eine OBERGRENZE, weil der
+dequantisierende Upconvert die reine bf16-Tensorkern-Rate nicht ueberschreiten
+kann. Das Objective unterschaetzt die 5090 also um mindestens Faktor 2,3. Fuer
+die Ratio-Ableitung wurden wie gefordert die Probewerte direkt genommen:
+8,64:1:1 landet auf dem 136-Einheiten-MLP-Gitter bei ~113,11,12 — das ist
+exakt der Top-Kandidat `10,1,1`, den der Optimierer selbst enumeriert und nur
+am Decode-Knie ablehnt. Die Briefing-Rueckfalllinien (6:2:2 / 7:3:3) waren
+nicht noetig. Auf der Decode-Seite braucht es die Korrektur nicht: gemessene
+1664 vs 718 GB/s = 7:3:3, derselbe Vektor, den der Planner als KV-SPEED
+WEIGHTS ausgibt.
+
+Machbarkeits-Fixposten vor dem ersten Boot gerechnet (32,0 KiB/Token,
+128 MiB je MLP-Einheit aus dem Planner-Hinweis abgeleitet): vorhergesagte
+`max_total_num_tokens` fuer den Anker 432991, gemessen **433017** — 0,006 %
+daneben. Alle vier BAR1-Arme waren als bootbar vorhergesagt und sind gebootet.
+
+### Prefill (tok/s) und TTFT
+
+Boden wiederverwendet aus `2026-07-30_hebel_verif`: s=1 **2,71 %**,
+s=8 **3,18 %**. `~` = innerhalb des Bodens, keine Aussage.
+
+| Arm | s=1 | vs Anker | s=8 | vs Anker | TTFT p50 s=1 | TTFT p50 s=8 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 Anker | 1582,2 | ~1,000 | 1353,8 | ~1,000 | 1247,9 ms | 10908,5 ms |
+| 2 Prefill-Opt | 1797,0 | **1,136** | 1546,5 | **1,142** | 1166,9 ms | 9402,6 ms |
+| 3 Decode-Opt | 1592,8 | ~1,007 | 1375,8 | ~1,016 | 1312,3 ms | 11189,8 ms |
+| 4 Decode-Opt + KV 1,1,1 | 1688,9 | 1,067 | 1417,6 | 1,047 | 1185,0 ms | 10072,6 ms |
+| 5 Prefill-Opt NCCL | — | — | 1348,3 | ~0,996 | — | 10817,8 ms |
+| 6 Decode-Opt NCCL | — | — | 1238,3 | 0,915 | — | 12648,6 ms |
+
+Der Anker reproduziert den `bar1_hi`-Referenzpunkt aus dem Vorlauf auf
+0,2 % genau (1353,8 gegen 1355,0 bei s=8, 1582,2 gegen 1581,7 bei s=1) — das
+Rezept ist dasselbe, `--decode-log-interval 1` kostet den Prefill nichts.
+
+### Decode am s=8-Boot — ms/Verify ist das Mass
+
+Boden ms/Verify **2,72 %** (#294). tick-tok/s und Accept schwanken gemeinsam
+um ~7,5 %, stehen deshalb nur nachrichtlich in der Tabelle und tragen kein
+Verdikt. Niedriger ist besser.
+
+| Arm | bs=1 ms/V | vs Anker | bs=1 tok/s | acc | n | bs=8 ms/V | vs Anker | bs=8 tok/s | acc | n |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 Anker | 30,31 | ~1,000 | 99,0 | 3,00 | 118 | 6,59 | ~1,000 | 397,4 | 2,62 | 85 |
+| 2 Prefill-Opt | 36,66 | **1,209** | 81,8 | 3,00 | 110 | 7,33 | **1,111** | 375,2 | 2,75 | 84 |
+| 3 Decode-Opt | 32,46 | 1,071 | 123,2 | 4,00 | 103 | 6,70 | ~1,016 | 410,4 | 2,75 | 90 |
+| 4 Decode-Opt + KV 1,1,1 | 31,48 | 1,038 | 95,3 | 3,00 | 117 | 6,67 | ~1,012 | 431,8 | 2,88 | 87 |
+| 5 Prefill-Opt NCCL | 38,04 | 1,255 | 78,9 | 3,00 | 114 | 8,27 | 1,254 | 316,8 | 2,62 | 92 |
+| 6 Decode-Opt NCCL | 32,78 | 1,081 | 91,5 | 3,00 | 113 | 8,06 | 1,222 | 349,5 | 2,81 | 86 |
+
+### Die Praemisse lebt: der Decode-Preis ist diesmal sichtbar
+
+Der Falsifikator vom 2026-07-28 hatte bei einem MODERATEN Vektor (2,5,2,
++9,6 Einheiten auf die 5090) einen Decode-Nachteil von 2,50 % gemessen und
+damit unter dem Boden. Am EXTREMUM ist er es nicht mehr: `10,1,1` kauft
+**+14,2 % Prefill** (4,5-fache des Bodens) fuer **+11,1 % ms/Verify** bei bs=8
+und **+20,9 %** bei bs=1 (4,1- bzw. 7,7-fache des Bodens). Damit ist genau die
+Bedingung erfuellt, die der Registereintrag als Wiederbelebung benannt hat:
+der Gewinn ist NICHT kostenlos statisch mitzunehmen, es gibt eine echte
+Phasenschere.
+
+### Negativbefund: der bandbreiten-proportionale Split ist NICHT das Decode-Optimum
+
+Arm 3 (`7,3,3`, exakt die gemessene Speicherbandbreite) ist im Decode
+**schlechter als der Anker** — bs=1 +7,1 % ms/Verify, ueber dem Boden; bs=8
++1,6 %, innerhalb. Der rohe Bandbreitenschluessel schiesst also ueber. Der
+Planner sagt das selbst voraus und rechnet es vor: sein Decode-Roofline-Divisor
+komprimiert die gemessenen GEMV-Raten mit dem Residual-Exponenten 0,5 zu
+EFFEKTIVEN Bandbreitenanteilen 42,2/28,9/28,9 % = 1,46:1:1, waehrend roh
+7:3:3 = 2,33:1:1 waere. Der heutige auto-Split liegt bei 1,72:1:1 und damit
+naeher am effektiven Optimum als der rohe Bandbreitenvektor.
+
+**Konsequenz fuer die Treppe: das Decode-Extremum ist der ANKER, nicht ein
+neuer Vektor.** Die operative Treppe hat damit die Sprossen
+`auto` (Decode) ↔ `10,1,1` (Prefill), nicht `7,3,3` ↔ `10,1,1`.
+
+### Kreuzkosten — die Obergrenze der dynamischen Treppe (#274/#287)
+
+Wie beauftragt zuerst die Spreizung Arm 2 gegen Arm 3:
+
+* Prefill s=8: 1546,5 gegen 1375,8 tok/s — das Decode-Optimum kostet
+  **11,0 %** Prefill (Boden 3,18 %).
+* Decode bs=8 ms/Verify: 7,33 gegen 6,70 ms — das Prefill-Optimum kostet
+  **9,4 %** der Verify-Runde (Boden 2,72 %).
+
+Da Arm 3 nach dem Negativbefund oben nicht das Decode-Optimum ist, ist die
+OPERATIVE Spreizung die gegen den Anker: **+14,2 % Prefill gegen +11,1 %
+ms/Verify** bei bs=8, bei bs=1 **+13,6 % Prefill gegen +20,9 % ms/Verify**.
+
+Beides ist die OBERGRENZE dessen, was eine dynamische Treppe ernten kann: es
+ist, was ein perfekter, kostenfreier Wechsel zwischen zwei statischen Extrema
+brächte. Eine echte Treppe zahlt Umschaltkosten obendrauf und landet strikt
+darunter. Wer die Zahl als Ertragsprognose fuer #274/#287 liest, liest sie
+falsch.
+
+### Transport-Unabhaengigkeit (Arme 5 und 6) — und die Boden-These bestaetigt
+
+Die beiden NCCL-Zwillinge tragen identische Splits wie ihre BAR1-Partner. Der
+Vergleich Arm 5 gegen Arm 6 ist die Phasenschere UNTER NCCL, komplett
+innerhalb dieses Laufs:
+
+| Groesse | unter BAR1 (Arm 2 vs 3) | unter NCCL (Arm 5 vs 6) |
+|---|---:|---:|
+| Prefill-Spreizung s=8 | **+12,4 %** | **+8,9 %** |
+| Decode-Spreizung bs=8 ms/Verify | **+9,4 %** | +2,6 % (im Boden) |
+
+Die Phasen-Optima tragen also transportunabhaengig — die Richtung ist unter
+NCCL dieselbe —, aber die Schere ist unter dem hoeheren Kollektivboden
+**deutlich kleiner**, und die Decode-Haelfte verschwindet unter NCCL sogar
+ganz im Rauschen. Das ist die quantitative Bestaetigung der Design-Notiz „der
+Gewinn skaliert invers zum Kollektivanteil", innerhalb eines Laufs gemessen
+statt deduziert. Es ist zugleich die Erklaerung dafuer, warum der Eintrag
+ueberhaupt geschlossen war: vor BAR1 war die Schere kleiner als heute.
+
+### compute/wait je Rang am s=8-Prefillpunkt — der quantitative Test
+
+| Arm | TP0 comp | TP0 wait | TP1 comp | TP1 wait | TP2 comp | TP2 wait | wait-Anteil TP0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 Anker | 153,4 | 1366,0 | 536,1 | 983,0 | 544,4 | 976,0 | 89,6 % |
+| 2 Prefill-Opt | 224,9 | 1086,9 | 309,1 | 1001,6 | 311,8 | 998,5 | 82,6 % |
+| 3 Decode-Opt | 169,4 | 1297,8 | 494,5 | 973,0 | 516,1 | 955,1 | 88,3 % |
+| 4 Decode-Opt + KV 1,1,1 | 167,8 | 1283,1 | 495,2 | 955,6 | 513,5 | 932,8 | 88,1 % |
+| 5 Prefill-Opt NCCL | 224,1 | 1279,8 | 304,9 | 1198,8 | 309,5 | 1195,5 | 84,8 % |
+| 6 Decode-Opt NCCL | 169,1 | 1510,2 | 483,2 | 1194,2 | 489,4 | 1184,0 | 89,5 % |
+
+Das ist der Test der Wiedereroeffnungs-These, und er faellt positiv aus. Die
+Rechen-Unwucht des Ankers ist **3,5:1** (153,4 ms auf der 5090 gegen 536-544 ms
+auf den 3080ern) — die starke Karte wartet 89,6 % ihrer GPU-Zeit. Das
+Prefill-Optimum drueckt die Unwucht auf **1,38:1** (224,9 gegen 309-312) und
+holt 7 Punkte aus TP0s Wartezeit. Genau dieser Anteil ist das, was nach dem
+Transportfix noch im `wait` steckt und was ein Phasensplit ueberhaupt heben
+kann.
+
+Zwei Dinge sind daran wichtig:
+
+* **Auch bei 10,1,1 ist die 5090 noch UNTERLASTET** (224,9 gegen ~310 ms). Der
+  Rest ist strukturell: nur die MLP-Familie bewegt sich, GDN-Mixer, Attention
+  und Embeddings folgen dem festen Basisplan. Das compute-proportionale FP8-
+  Optimum liegt also JENSEITS von 10,1,1 und ist mit dem MLP-Hebel allein nicht
+  erreichbar — was die 8,64:1:1 aus der Vorpruefung von der anderen Seite
+  bestaetigt.
+* **Der Transportboden ist der Rest**, den kein Split anfasst: Arm 5 hat
+  praktisch dieselbe compute-Verteilung wie Arm 2 (224,1/304,9/309,5), aber
+  193 ms mehr Wartezeit auf TP0.
+
+### KV-Platzierung isoliert (Arm 4 minus Arm 3)
+
+Beide Arme tragen denselben Gewichtssplit, die Differenz ist reine
+DCP-Tokenplatzierung.
+
+* bs=1 ms/Verify: 31,48 gegen 32,46 = **-3,0 %** (knapp ueber dem Boden)
+* bs=8 ms/Verify: 6,67 gegen 6,70 = -0,4 % (**im Boden**, keine Aussage)
+
+Der KV-Hop-Effekt ist damit klein und nur bei bs=1 ueberhaupt sichtbar — und
+er zeigt in die Gegenrichtung der Erwartung: das AUSGEGLICHENE DCP ist im
+Decode leicht besser als der bandbreiten-gewichtete Tokensplit. Bezahlt wird
+das teuer: `max_total_num_tokens` faellt von 363480 auf 170099, also
+**-53 % Kontext fuer -3,0 % ms/Verify bei bs=1**. Als Handel ist das schlecht;
+als Messung schliesst es die KV-Platzierung als Erklaerung fuer die
+Phasenschere aus — die Schere sitzt im GEWICHTS-Split, nicht im Tokensplit.
+
+### KV-Kapazitaet, Leistung, J/Token
+
+| Arm | max_total_num_tokens | vs Anker | mittlere Rig-Leistung | Power-States | J/Token (bs=8) |
+|---|---:|---:|---:|---|---:|
+| 1 Anker | 433017 | 1,00 | 635,0 W | P2:140, P1:70 | 1,60 |
+| 2 Prefill-Opt | 69784 | **0,16** | 621,8 W | P2:134, P1:67 | 1,66 |
+| 3 Decode-Opt | 363480 | 0,84 | 594,2 W | P2:136, P1:68 | 1,45 |
+| 4 Decode-Opt + KV 1,1,1 | 170099 | 0,39 | 612,4 W | P2:138, P1:69 | 1,42 |
+| 5 Prefill-Opt NCCL | 69901 | 0,16 | 549,3 W | P2:108, P1:54 | 1,73 |
+| 6 Decode-Opt NCCL | 363597 | 0,84 | 557,4 W | P2:106, P1:53 | 1,60 |
+
+**Der Kontextpreis des Prefill-Extremums ist der eigentliche Ledger-Posten:
+84 % des Kontexts** (433017 → 69784 Token). Das ist kein Nebeneffekt, sondern
+die Waehrung, in der die Gewichtskonzentration bezahlt wird — sie verdraengt
+KV-Pool auf der 5090. Fuer eine dynamische Treppe ist das das entscheidende
+Argument gegen ein statisches Prefill-Optimum und FUER die Delta-Duplikation
+aus DESIGN_201: der Phasenwechsel darf den KV-Pool nicht mitbewegen.
+
+J/Token ist eine NAEHERUNG: das Leistungsfenster deckt den ganzen Arm ab
+(beide Punkte und die Luecken dazwischen), die Rate ist die bs=8-Tickrate. Die
+Zahlen vergleichen Arme miteinander, nicht gegen ein absolutes Energiebudget.
+Richtung: die decode-nahen Arme sind sparsamer (1,42-1,45), das
+Prefill-Extremum und NCCL teurer (1,66-1,73).
+
+### Was NICHT gemessen wurde
+
+* Keine zweite Runde, also **kein eigener A-gegen-A-Boden** dieses Laufs. Alle
+  Verhaeltnisse oben stehen gegen WIEDERVERWENDETE Boeden (Prefill 2,71/3,18 %
+  aus `2026-07-30_hebel_verif`, ms/Verify 2,72 % aus #294). Der #294-Boden ist
+  bei bs=16 erhoben und wird hier auf bs=1 und bs=8 angewandt — die beste
+  verfuegbare Schaetzung, kein am Punkt gemessener Boden.
+* Kein s=4, keine NCCL-Gegenarme fuer Anker und Arm 4, keine Inhaltsachse
+  (alle Arme sehen byte-identische Fuellprosa; die Accept-Spalte schwankt
+  entsprechend inhaltlich und traegt deshalb kein Verdikt).
+* Der Punkt „Decode-Optimum" ist nur fuer den ROHEN Bandbreitenvektor
+  falsifiziert. Der vom Planner vorhergesagte effektive Vektor (1,46:1:1,
+  also etwa `3,2,2`) wurde NICHT gebootet — er ist der offene Kandidat fuer
+  ein Decode-Extremum unterhalb des Ankers.
+
+### Kartenzeit
+
+| Anlauf | Kartenzeit | Ergebnis |
+|---|---:|---|
+| 1 | 284 s | Abbruch nach dem Anker-Boot an einem `set -u`-Fehler im Power-Logger, keine Punkte |
+| 2 | 386 s | Anker vollstaendig, dann bewusst gestoppt: Decode-Stichprobe n=1..3 Ticks |
+| 3 | 985 s | **6/6 Arme vollstaendig** |
+| Summe | **1655 s = 27,6 min** | von 2400 s (40 min) Budget |
+
+Anlauf 2 wurde nicht wegen eines Fehlers gestoppt, sondern weil die
+Decode-Stichprobe nicht interpretierbar war: ein Decode-Punkt endet, wenn
+seine 256 angeforderten Token erzeugt sind (2,8 s bei bs=1, 5,0 s bei bs=8),
+nicht an der Zeitbox — die Tickzahl haengt also allein am
+`--decode-log-interval`, und der Standardwert 40 laesst 1-3 Logzeilen im
+Fenster. Gegen einen 2,72-%-Boden ist das keine Stichprobe. Mit Intervall 1
+liegen dieselben Punkte bei 84-118 Ticks. Die Zeile liegt seither identisch
+auf jedem Arm inklusive der NCCL-Zwillinge; sie kann das absolute Niveau
+gegenueber frueheren Laeufen minimal verschieben (eine Logzeile je
+Decode-Schritt, ~0,7 % einer 7-ms-Runde), nicht aber den Vergleich innerhalb
+dieser Tabelle — und der Anker-Prefill zeigt gegen den Vorlauf 0,2 %
+Abweichung, also keine sichtbare Verschiebung.
+
+Karten nach dem Lauf freigegeben: alle drei auf 0 MiB, Host- und
+CT999-Locks entfernt, `gpu-arb`-Fenster geschlossen.
+
+### Verdikt
+
+1. Das **Prefill-Extremum ist real und gross**: +14,2 % bei s=8, +13,6 % bei
+   s=1, dazu -13,8 % TTFT — weit ueber jedem Boden.
+2. Es ist **nicht kostenlos**: +11,1 % ms/Verify bei bs=8, +20,9 % bei bs=1.
+   Damit lebt die Phasen-dual-Praemisse aus DESIGN_201 wieder; der Eintrag ist
+   hiermit aus dem Verworfenen-Register zurueckgeholt.
+3. Das **Decode-Extremum ist der heutige auto-Split**, nicht der rohe
+   Bandbreitenvektor — `7,3,3` ist im Decode schlechter als der Anker.
+4. Die **Obergrenze der dynamischen Treppe** liegt damit bei +14,2 % Prefill
+   gegen 11,1 % Decode (bs=8), abzueglich Umschaltkosten.
+5. Der **KV-Hop ist nicht die Schere**: ausgeglichenes DCP bringt -3,0 % nur
+   bei bs=1 und kostet 53 % Kontext.
+6. Der **Kontextpreis** des Prefill-Extremums (-84 %) ist das staerkste
+   Argument fuer die Delta-Duplikation statt eines statischen Vektorwechsels.
