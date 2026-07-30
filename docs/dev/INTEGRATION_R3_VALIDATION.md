@@ -9790,3 +9790,65 @@ Punkt 1 (jetzt sieben Gate-Faelle) und Punkt 3b der Liste oben. Der
 s11-Neulauf ist der eigentliche Beleg: er faehrt `bar1_graph_check` samt
 den beiden broadcast-Faellen und danach den Standardlauf, der vorher genau
 hier abgebrochen ist.
+
+### Nachschlag: 12 Byte (2026-07-30)
+
+Der s11-Neulauf hat den Check-Fix bestaetigt (das Verdikt nennt jetzt die
+Ursache) und eine Restluecke freigelegt: der Standardlauf sendet broadcast
+auch mit **12 Byte**, und `handles('broadcast', 12)` war `False` — waehrend
+die Meldung broadcast als gedeckt auffuehrte. Das liest sich wie ein
+Widerspruch und war einer: Deckung ist nicht die Operation, sondern die
+Operation UND die Groesse.
+
+**Wurzel, an genau einer Bedingung:** `bc_min_bytes` stand auf 16.
+Nachgefahren wurde jede Bedingung von `_handles_broadcast` einzeln — 1, 4,
+8, 12 und 15 Byte scheiterten ausschliesslich an `nbytes < bc_min_bytes`,
+alles andere (Belege, Fenster, Rundengrenze) sagte ja. Ab 16 ging alles
+durch, deshalb kam der 128-Byte-Fall aus dem ersten Absturz auch vorbei.
+
+Die 16 hatte **keinen technischen Grund**. Sie war aus `a2a_min_bytes`
+uebernommen, wo sie eine Aussage ueber die Paketgranularitaet der Bloecke
+ist. Der Kern selbst kennt Groessen unter einem Paket auf allen drei Wegen:
+
+* Sendephase: `(sLenS[z]+15)/16` ergibt fuer 12 Byte ein Paket, `rest=12`,
+  `packeBytes(q,12)` liest genau 12 Byte und schreibt einen vollen uint4 in
+  den Schlitz — der ist seitenausgerichtet und ein Vielfaches von 16, die
+  vier Fuellbytes bleiben also im eigenen Schlitz.
+* Empfangsphase: `rest=12` nimmt den Byte-Pfad und schreibt exakt 12 Byte —
+  kein Ueberlauf eines 12-Byte-Ausgabetensors.
+* Eigener Block (1b): `p = n/16 = 0`, danach die Byte-Schleife.
+
+Es war ausserdem die falsche SORTE Grenze: eine Untergrenze ist eine
+Lohnt-sich-Schwelle gegen die gloo-Ebene, und unter Aufzeichnung gibt es
+keine gloo-Ebene, sondern nur den Abbruch. Genau das stand als Begruendung
+neben der Zahl, die es widerlegte.
+
+**Gefixt:** `bc_min_bytes` 16 -> 1. Gedeckt ist damit lueckenlos
+`1 .. a2a_schlitz * bc_max_runden`; was darueber hinaus abgelehnt wird, hat
+einen benannten Grund (Rundengrenze), keinen stillen.
+
+**Derselbe Fehler beim Zwilling, und er war scharf:** `ag_min_bytes` stand
+aus derselben Kopie auf 16. all_gather hat dieselbe Struktur, dieselbe
+Aufzeichnungslage und denselben Restpfad — eine 12-Byte-Scherbe waere
+genauso abgebrochen. Ebenfalls auf 1. Das ist eine Vorgabenaenderung ueber
+den gemeldeten Fall hinaus; sie steht hier, damit sie sichtbar ist und
+zurueckgedreht werden kann, falls sie unerwuenscht ist.
+
+**Warum es kein Test gesehen hat**, und was dagegen jetzt steht: der Stub
+sagte 16, der Quelltext sagte 16, und beide Belege (`byte_beleg_broadcast`,
+das Graph-Tor) fuhren nur Groessen, die die Schwelle ohnehin nahmen. Drei
+Zeugen, eine Zahl, kein Widerspruch. Neu:
+
+* `TestTheShippedFloor` liest die Vorgabe aus dem QUELLTEXT statt aus dem
+  Stub und prueft zusaetzlich, dass der Stub sie spiegelt.
+* `TestTheSizeLadder` faehrt 1, 4, 12, 128, slot-1, slot, slot+1 und
+  4096 Byte durch Tor, Rundenplan, Rundenzahl, Byte-Simulation und den
+  Paarvertrag.
+* `byte_beleg_broadcast` faehrt zusaetzlich 12 Byte je Quelle — der Weg,
+  den keine andere Groesse dort geht (ein einziges unvollstaendiges Paket).
+* Die beiden Graph-Tor-Faelle fahren 12 Byte an erster Stelle.
+
+**Testzahlen:** `test/registered/unit/distributed/` 16 failed / **1136
+passed** / 8 skipped (auf `157dad9466`: 16 failed / 1126 passed / 8
+skipped, dieselben 16). `test_htccl_bar1_broadcast.py` 54 passed (+10),
+`test_htccl_bar1_all_gather.py` 31 passed.
