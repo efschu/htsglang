@@ -67,16 +67,22 @@ def check(step_dir: str) -> None:
     payload = load_json(path, "nccl_reference.json")
     require_envelope(payload, "nccl_reference", "nccl_reference.json", 1)
 
+    # The pair status comes first: an aborted pair explains the missing rows,
+    # and "keine rows" would report the consequence instead of the cause. The
+    # producer writes its partial result after every pair, so a step that ran
+    # out of budget leaves exactly this file.
+    for status in payload.get("pairs_status") or []:
+        if status.get("status") != "ok":
+            detail = status.get("detail")
+            raise CheckFail(
+                f"Paar {status.get('pci_pair')}: status {status.get('status')!r}"
+                + (f" ({detail})" if detail else "")
+                + " -- eine abgebrochene Messung ist keine Referenz"
+            )
+
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         raise CheckFail("nccl_reference.json hat keine rows")
-
-    for status in payload.get("pairs_status") or []:
-        if status.get("status") != "ok":
-            raise CheckFail(
-                f"Paar {status.get('pci_pair')}: status {status.get('status')!r} -- "
-                "eine abgebrochene Messung ist keine Referenz"
-            )
 
     arms = defaultdict(set)
     directions = defaultdict(set)

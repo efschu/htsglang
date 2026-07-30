@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -1176,6 +1177,278 @@ class TestNcclReferenceCheck:
     def test_wrong_schema_version_is_fail(self, tmp_path):
         write_json(tmp_path / "nccl_reference.json", _nccl_reference(schema_version=2))
         assert_fail(self.CHECK, tmp_path, self.STEP)
+
+
+# ---------------------------------------------------------------------------
+# s06 producer: pair launch, timeout, logging
+# ---------------------------------------------------------------------------
+
+
+def _import_s06():
+    sys.path.insert(0, BATTERY)
+    import s06_nccl_reference
+
+    return s06_nccl_reference
+
+
+# A stand-in rank. It leaves a breadcrumb, then does what the argument says,
+# so the parent's timeout, logging and kill paths are testable without a card.
+STANDIN = """
+import os, sys, time
+frag, rank, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(f"{frag}.rank{rank}.progress", "w") as f:
+    f.write("idle/all_reduce/65536B\\n")
+    f.flush()
+    os.fsync(f.fileno())
+if mode == "flood":
+    sys.stderr.write("MARKER\\n" + "x" * (512 * 1024) + "\\nSCHLUSS\\n")
+    sys.stderr.flush()
+    sys.exit(0)
+sys.stderr.write("MARKER\\n")
+sys.stderr.flush()
+time.sleep(600)
+"""
+
+
+class TestS06PairLaunch:
+    """The producer behind s06, driven with a stand-in child.
+
+    The 2026-07-30 run wedged for 20 minutes and left a 0-byte NCCL log, an
+    empty pid list and no result file. Every one of those four properties is
+    pinned here, CPU-only.
+    """
+
+    def _run_pair(self, s06, tmp_path, mode, timeout_s, monkeypatch):
+        frag = str(tmp_path / "ref.json.frag.0-1")
+        monkeypatch.setattr(
+            s06,
+            "worker_argv",
+            lambda rank, frag_path: [
+                sys.executable,
+                "-c",
+                STANDIN,
+                frag_path,
+                str(rank),
+                mode,
+            ],
+        )
+        monkeypatch.setenv("BATTERY_STEP_DIR", str(tmp_path))
+        (tmp_path / "pids").write_text("")
+        return s06.run_pair(
+            (0, 1),
+            (PCI_A, PCI_B),
+            frag,
+            timeout_s,
+            str(tmp_path / "seg"),
+            (64 * 1024,),
+            ("idle",),
+        )
+
+    def test_each_rank_sees_exactly_one_card(self, tmp_path, monkeypatch):
+        """The hang itself: both ranks saw BOTH cards, so both payloads landed
+        on the first one while barrier() fell back to rank % 2 and built its
+        communicator on two different ones."""
+        s06 = _import_s06()
+        seen = []
+
+        class _Fake:
+            pid = os.getpid()
+            returncode = 0
+
+            def __init__(self, argv, **kw):
+                seen.append(kw)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(s06.subprocess, "Popen", _Fake)
+        monkeypatch.setattr(s06, "register_pid", lambda pid: None)
+        s06.run_pair(
+            (2, 5),
+            (PCI_A, PCI_B),
+            str(tmp_path / "frag"),
+            10,
+            str(tmp_path / "seg"),
+            (64 * 1024,),
+            ("idle",),
+        )
+        visible = [kw["env"]["CUDA_VISIBLE_DEVICES"] for kw in seen]
+        assert visible == ["2", "5"], visible
+        for kw in seen:
+            assert kw["start_new_session"] is True
+            assert kw["stdout"] is not s06.subprocess.PIPE
+            assert kw["stderr"] is s06.subprocess.STDOUT
+
+    def test_child_output_is_not_read_through_an_unattended_pipe(
+        self, tmp_path, monkeypatch
+    ):
+        """A PIPE nobody reads holds 64 KiB and then blocks the writer. The
+        previous version waited on rank 0 first, so rank 1 could sit in a full
+        pipe for the whole timeout. Half a MiB of NCCL_DEBUG output must pass
+        through without the child stalling."""
+        s06 = _import_s06()
+        status, detail, log = self._run_pair(s06, tmp_path, "flood", 60, monkeypatch)
+        assert status == "ok", (status, detail)
+        assert log.count("MARKER") == 2
+        assert log.count("SCHLUSS") == 2
+        assert len(log) > 1024 * 1024
+
+    def test_timeout_binds_the_hang_and_names_where_it_stood(
+        self, tmp_path, monkeypatch
+    ):
+        s06 = _import_s06()
+        t0 = time.monotonic()
+        status, detail, log = self._run_pair(s06, tmp_path, "hang", 3, monkeypatch)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 60, elapsed
+        assert status == "timeout nach 3s", status
+        # honest partial result: which rank, and where it stood
+        assert "Rang 0" in detail and "Rang 1" in detail
+        assert "idle/all_reduce/65536B" in detail
+        assert "MARKER" in log
+        pids = [int(x) for x in (tmp_path / "pids").read_text().split() if x.strip()]
+        assert len(pids) == 2
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and any(_alive(p) for p in pids):
+            time.sleep(0.2)
+        assert not any(_alive(p) for p in pids), "Kinder leben nach dem Timeout"
+
+    def test_timeout_writes_a_pyspy_dump_before_the_kill(self, tmp_path, monkeypatch):
+        s06 = _import_s06()
+        self._run_pair(s06, tmp_path, "hang", 3, monkeypatch)
+        for rank in (0, 1):
+            dump = tmp_path / f"seg.rank{rank}.pyspy.txt"
+            assert dump.exists(), f"kein Dump fuer Rang {rank}"
+            assert dump.read_text().strip()
+
+    def test_killpg_only_ever_targets_a_group_this_parent_created(self, monkeypatch):
+        """Blast radius: a pgid that is not the child's own pid belongs to
+        somebody else's session and must never receive a group signal."""
+        s06 = _import_s06()
+        killed = []
+        monkeypatch.setattr(s06.os, "killpg", lambda pgid, sig: killed.append(pgid))
+        monkeypatch.setattr(s06.os, "getpgid", lambda pid: 4242)
+
+        class _Foreign:
+            pid = 1234
+            terminated = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                pass
+
+        proc = _Foreign()
+        s06.terminate_own_group(proc)
+        assert killed == []
+        assert proc.terminated
+
+    def test_partial_payload_is_written_after_every_pair(self, tmp_path):
+        s06 = _import_s06()
+        out = tmp_path / "nccl_reference.json"
+        payload = {
+            "schema_version": 1,
+            "kind": "nccl_reference",
+            "pairs_status": [
+                {
+                    "pci_pair": [PCI_A, PCI_B],
+                    "status": "timeout nach 600s",
+                    "detail": "Rang 1 bei idle/all_reduce/65536B",
+                    "rows": 0,
+                }
+            ],
+        }
+        s06.write_payload(payload, [], str(out))
+        assert not (tmp_path / "nccl_reference.json.tmp").exists()
+        # The honest fragment is a FAIL with a reason, not a missing artifact.
+        line = assert_fail(
+            "check_s06_nccl_reference.py", tmp_path, "s06_nccl_reference"
+        )
+        assert "timeout" in line
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class TestS06WorkerPreconditions:
+    """Rank-local before collective: everything decidable without the peer is
+    decided first, so a dead or wrongly pinned peer ends as a named error
+    instead of a wedge inside a collective."""
+
+    def _torch_stub(self, device_count, pci):
+        import types
+
+        torch_stub = types.ModuleType("torch")
+        torch_stub.float32 = "float32"
+        torch_stub.cuda = types.SimpleNamespace(
+            device_count=lambda: device_count,
+            set_device=lambda dev: None,
+            synchronize=lambda: None,
+            empty_cache=lambda: None,
+        )
+
+        class _T:
+            def mul_(self, _v):
+                return self
+
+            def sum(self):
+                return self
+
+            def item(self):
+                return 8192.0
+
+        torch_stub.ones = lambda *a, **kw: _T()
+        return torch_stub, pci
+
+    def _drive(self, monkeypatch, device_count, own_pci, assigned_pci):
+        s06 = _import_s06()
+        torch_stub, _ = self._torch_stub(device_count, own_pci)
+        monkeypatch.setitem(sys.modules, "torch", torch_stub)
+        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts", "p2p_readiness"))
+        import p2p_common
+
+        monkeypatch.setattr(p2p_common, "cuda_pci_bus_id", lambda dev: own_pci)
+        monkeypatch.setenv("BATTERY_PCI_0", assigned_pci)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+        return s06
+
+    def test_two_visible_cards_is_a_named_error(self, tmp_path, monkeypatch):
+        s06 = self._drive(monkeypatch, 2, PCI_A, PCI_A)
+        with pytest.raises(s06.PreconditionFailed) as exc:
+            s06._rank_local_checks(0, str(tmp_path / "p"))
+        assert exc.value.rc == s06.RC_DEVICE_COUNT
+        assert "erwartet genau 1" in str(exc.value)
+
+    def test_wrong_card_is_a_named_error(self, tmp_path, monkeypatch):
+        s06 = self._drive(monkeypatch, 1, PCI_B, PCI_A)
+        with pytest.raises(s06.PreconditionFailed) as exc:
+            s06._rank_local_checks(0, str(tmp_path / "p"))
+        assert exc.value.rc == s06.RC_DEVICE_IDENTITY
+
+    def test_correct_pinning_passes_and_leaves_a_breadcrumb(
+        self, tmp_path, monkeypatch
+    ):
+        s06 = self._drive(monkeypatch, 1, PCI_A, PCI_A)
+        progress = str(tmp_path / "p")
+        assert s06._rank_local_checks(0, progress) == PCI_A
+        assert "Kartenidentitaet" in open(progress).read()
 
 
 # ---------------------------------------------------------------------------

@@ -21,10 +21,14 @@ echo "== Plan =="
 "$PY" "$BATTERY_DIR/s06_nccl_reference.py" --dry-run
 
 echo "== Messung =="
+# --timeout is the budget for ONE pair, both ranks together. Three pairs at 480s
+# stay inside the step's 1800s budget with room for the stack dumps and the
+# write-out, so a wedged pair is answered by this script and not by the outer
+# kill -- which loses the partial result the script writes after every pair.
 "$PY" "$BATTERY_DIR/s06_nccl_reference.py" \
     --out "$DIR/nccl_reference.json" \
     --log "$DIR/nccl_debug.log" \
-    --timeout 600
+    --timeout 480
 RC=$?
 
 echo "rc=$RC"
