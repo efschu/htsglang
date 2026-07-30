@@ -898,6 +898,89 @@ def ag_plan(laengen, schlitz: int) -> list:
     return plan
 
 
+def ar_plan(nbytes: int, chunk_max: int, welt: int) -> list:
+    """Die Rundenzerlegung eines ``all_reduce``. Reine Arithmetik.
+
+    Geliefert wird je Runde ein ``(versatz, laenge)`` in **Byte**. Jede Runde
+    ist ein vollstaendiges all_reduce ueber einen Ausschnitt des Puffers --
+    derselbe Kern, dieselbe Zerlegung in ``welt`` Scherben, nur auf weniger
+    Bytes.
+
+    **Warum es sie gibt.** Der Kern zerlegt eine Nutzlast in ``welt`` gleich
+    grosse Scherben (Reduce-Scatter, dann All-Gather), und die Scherbe muss
+    in einen Schlitz passen. Bis hierher hiess "passt nicht" schlicht
+    ``handles() == False``, und die Nutzlast fiel auf den Basistransport
+    zurueck. Der Kipp-Punkt liegt beim Standardlauf bei 2456 Token je Batch
+    (Scherbe 6,67 MiB gegen Schlitz 7,996 MiB, 20 % Luft); mit den in sglang
+    ueblichen ``chunked_prefill_size`` 4096 oder 8192 waere der Direktpfad im
+    Prefill lautlos weg gewesen. Dieselbe Antwort wie bei all_gather und
+    broadcast: in Runden zerlegen statt absagen.
+
+    **Gleichmaessig verteilt, nicht bis zum Anschlag gefuellt.** Naheliegend
+    waere, jede Runde bis ``chunk_max*welt`` zu fuellen und den Rest in die
+    letzte zu legen. Das erzeugt einen Schwanz, der beliebig klein werden
+    kann -- und die Erweiterung besteht auf ``n4 >= R`` (ein 128-Bit-Paket je
+    Rang, ``TORCH_CHECK`` im Wirt). Eine Restrunde von 16 Byte bei drei
+    Raengen waere kein langsamer Fall, sondern ein Abbruch. Gleichmaessig
+    verteilt kann die kleinste Runde nur um EIN Paket unter der groessten
+    liegen.
+
+    **Rangeinheitlich und aufzeichnungsfest.** Die Rundenzahl haengt allein
+    an ``nbytes``, ``chunk_max`` und ``welt``. Alle drei sind gruppenweit
+    gleich und fuer eine aufgezeichnete Form konstant, die Zahl der
+    Kernelstarts ist also eingebrannt -- dasselbe Argument wie bei
+    :func:`ag_plan` und :func:`bc_plan`.
+    """
+    nbytes = int(nbytes)
+    if welt < 2:
+        raise ValueError(f"welt {welt} ist kleiner als 2")
+    if chunk_max < 16:
+        raise ValueError(f"chunk_max {chunk_max} traegt kein Paket")
+    if nbytes < 0:
+        raise ValueError(f"negative Nutzlast {nbytes}")
+    if nbytes % 16:
+        raise ValueError(f"Nutzlast {nbytes} ist kein Vielfaches von 16")
+    if nbytes == 0:
+        return []
+    pakete = nbytes // 16
+    # Pakete je Rang und Runde -- die Groesse, an der der Schlitz haengt.
+    je_rang_max = chunk_max // 16
+    max_pakete = je_rang_max * welt
+    runden = -(-pakete // max_pakete)
+    basis, rest = divmod(pakete, runden)
+    plan = []
+    versatz = 0
+    for k in range(runden):
+        p = basis + (1 if k < rest else 0)
+        laenge = p * 16
+        plan.append((versatz, laenge))
+        versatz += laenge
+    return plan
+
+
+def a2a_runden(groesster_block: int, schlitz: int) -> int:
+    """Rundenzahl fuer ein ``all_to_all``, aus dem GROESSTEN Block.
+
+    ``groesster_block`` ist das Maximum ueber alle ``R*R`` Bloecke, nicht
+    ueber die eigene Zeile -- die Naht rechnet es gruppenweit aus, bevor sie
+    fragt (``HTCCLCommunicator.all_to_all_single``). Genau deshalb kann die
+    Rundenzahl daraus fallen und ist trotzdem auf allen Raengen gleich: aus
+    der eigenen Zeile gerechnet waere sie es nicht, und ein Rang, der eine
+    Runde weniger faehrt, laesst die anderen in der Sperre stehen.
+
+    Jede Runde bewegt aus jedem Block hoechstens einen Schlitz voll, am
+    Stueck und mit konstantem Versatz ``k*schlitz``. Bloecke, die frueher zu
+    Ende sind, tragen in den restlichen Runden Laenge 0 -- sie fahren die
+    Sperre mit, ohne Bytes zu bewegen. Dasselbe Muster wie bei
+    :func:`ag_plan`.
+    """
+    if schlitz <= 0:
+        raise ValueError(f"Schlitzgroesse {schlitz} ist nicht positiv")
+    if groesster_block < 0:
+        raise ValueError(f"negativer Block {groesster_block}")
+    return max(1, -(-int(groesster_block) // int(schlitz)))
+
+
 def bc_plan(nbytes: int, schlitz: int) -> list:
     """Die Rundenzerlegung eines ``broadcast``. Reine Arithmetik.
 
@@ -1497,6 +1580,19 @@ class HTCCLBar1Transport:
         #: ein Kernelstart mit einer Sperre.
         self.bc_max_runden = int(
             os.environ.get("SGLANG_HTCCL_BAR1_BC_MAX_RUNDEN", "16")
+        )
+        #: Rundengrenze fuer all_reduce und all_to_all -- dieselbe Sorte
+        #: Grenze wie ag/bc und aus demselben Grund: je Runde ein
+        #: Kernelstart mit einer Sperre, und beliebig viele davon je
+        #: Kollektiv waere kein Transport, sondern eine Schleife. 16 traegt
+        #: bei 8188-KiB-Schlitz und R=3 eine all_reduce-Nutzlast von
+        #: ~384 MiB und damit jede Groesse, die in diesem Modell vorkommt --
+        #: der Arbeitspunkt des Standardlaufs sind 20 MiB.
+        self.ar_max_runden = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_AR_MAX_RUNDEN", "16")
+        )
+        self.a2a_max_runden = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_A2A_MAX_RUNDEN", "16")
         )
         #: Erst nach `byte_beleg_broadcast` gueltig. Eigener Merker, obwohl
         #: derselbe Kern laeuft: faellt der broadcast-Beleg, ist das kein
@@ -2234,40 +2330,154 @@ class HTCCLBar1Transport:
             return self._handles_all_gather(nbytes)
         if op == "broadcast":
             return self._handles_broadcast(nbytes)
-        if nbytes < self.min_bytes or nbytes > self.max_bytes:
+        return self._handles_all_reduce(nbytes)
+
+    def _handles_all_reduce(self, nbytes: int) -> bool:
+        """``all_reduce``, jetzt in Runden statt mit einer Obergrenze.
+
+        Was sich geaendert hat und warum: bis hierher endete diese Antwort
+        bei ``groesster_chunk > chunk_max`` mit False, und die Nutzlast fiel
+        auf den Basistransport zurueck. Der Kipp-Punkt liegt beim
+        Standardlauf bei 2456 Token je Batch -- ``chunked_prefill_size``
+        4096 oder 8192, beides in sglang ueblich, haette den Direktpfad im
+        Prefill abgeschaltet, ohne dass eine Zeile es meldet. Statt einer
+        Absage laeuft die Nutzlast in ``ceil``-Runden (:func:`ar_plan`), wie
+        all_gather und broadcast es laengst tun.
+
+        Jede Bedingung ist rangeinheitlich, aus demselben Grund wie in
+        :meth:`handles`: sie haengt nur an gruppenweit gleichen Groessen.
+        """
+        if nbytes < self.min_bytes:
             return False
         if nbytes % 16 != 0:
             # Die Zugriffsbreite ist 128 Bit; ein Rest waere ein zweiter,
-            # ungemessener Pfad im Kernel.
+            # ungemessener Pfad im Kernel. Die Erweiterung besteht darauf
+            # (TORCH_CHECK im Wirt), das ist keine Vorsichtsregel hier.
             return False
         if nbytes // 16 < self.welt:
             # Weniger als ein Paket je Rang -- die Chunkzerlegung liesse
-            # Raenge leer ausgehen.
+            # Raenge leer ausgehen, und der Wirt lehnt es ab.
             return False
-        # Passt der GROESSTE Chunk in einen Schlitz? Das ist die Bedingung,
-        # an der die Abbildung wirklich haengt -- geprueft, nicht aus
-        # `nbytes <= max_bytes` gefolgert. Die Erweiterung rechnet sie ein
-        # zweites Mal, dort aber mit chunkGrenzen selbst statt mit dieser
-        # Formel: eine Naht, die auf beiden Seiten mit derselben falschen
-        # Formel geprueft wuerde, faellt nicht auf.
-        groesster_chunk = -(-(nbytes // 16) // self.welt) * 16
-        if groesster_chunk > self._geo["chunk_max"]:
+        chunk_max = int(self._geo.get("chunk_max", 0))
+        if chunk_max < 16:
             return False
-        algo = self.algorithmus_fuer(nbytes)
-        if algo not in ("netz", "netz_pipe", "ring"):
-            # 'stern' und 'hierarchisch' sind hier nicht portiert. Kein
-            # stilles Ausweichen auf 'netz'.
+        # Die Rundengrenze ersetzt die alte Groessenobergrenze. Sie ist
+        # keine Fenstergrenze, sondern eine Grenze fuer Kernelstarts.
+        runden = ar_plan(nbytes, chunk_max, self.welt)
+        if len(runden) > self.ar_max_runden:
             return False
-        if algo == "netz_pipe" and not self._pipe_traegt(nbytes):
+        # Geprueft wird die GROESSTE Runde. Sie ist die einzige, die
+        # scheitern koennte -- und sie ist gruppenweit dieselbe.
+        groesste = max(laenge for _, laenge in runden)
+        if groesste > self.max_bytes:
             return False
-        # Und derselbe Bedarf noch einmal in der Waehrung des Planers, gegen
-        # die gruppenweit KLEINSTE tatsaechlich abgebildete Laenge. Redundant,
-        # solange der Aufbau durchgelaufen ist -- und genau deshalb billig:
-        # die Zeile faellt auf, wenn jemand die Regionsgroesse anfasst, ohne
-        # den Fensterbegriff mitzuziehen.
-        if fensterbedarf(algo, nbytes, self.welt) > self._fenster_minimum:
+        # Passt der GROESSTE Chunk EINER RUNDE in einen Schlitz? Das ist die
+        # Bedingung, an der die Abbildung wirklich haengt -- geprueft, nicht
+        # aus `nbytes <= max_bytes` gefolgert. Die Erweiterung rechnet sie
+        # ein zweites Mal, dort aber mit chunkGrenzen selbst statt mit
+        # dieser Formel: eine Naht, die auf beiden Seiten mit derselben
+        # falschen Formel geprueft wuerde, faellt nicht auf.
+        groesster_chunk = -(-(groesste // 16) // self.welt) * 16
+        if groesster_chunk > chunk_max:
             return False
+        # Der Algorithmus faellt JE RUNDE, also wird er je Runde geprueft.
+        # Bei einer Runde ist das Buchstabe fuer Buchstabe die alte Frage.
+        for _, laenge in runden:
+            algo = self.algorithmus_fuer(laenge)
+            if algo not in ("netz", "netz_pipe", "ring"):
+                # 'stern' und 'hierarchisch' sind hier nicht portiert. Kein
+                # stilles Ausweichen auf 'netz'.
+                return False
+            if algo == "netz_pipe" and not self._pipe_traegt(laenge):
+                return False
+            # Und derselbe Bedarf noch einmal in der Waehrung des Planers,
+            # gegen die gruppenweit KLEINSTE tatsaechlich abgebildete
+            # Laenge. Redundant, solange der Aufbau durchgelaufen ist -- und
+            # genau deshalb billig: die Zeile faellt auf, wenn jemand die
+            # Regionsgroesse anfasst, ohne den Fensterbegriff mitzuziehen.
+            if fensterbedarf(algo, laenge, self.welt) > self._fenster_minimum:
+                return False
         return True
+
+    def ar_runden(self, nbytes: int) -> int:
+        """Rundenzahl fuer ``nbytes`` -- fuer Protokoll und Test."""
+        chunk_max = int(self._geo.get("chunk_max", 0))
+        if chunk_max < 16 or nbytes <= 0 or nbytes % 16:
+            return 0
+        return len(ar_plan(nbytes, chunk_max, self.welt))
+
+    def warum_nicht(self, op: str, nbytes: int) -> str:
+        """Warum ``handles`` fuer diese Groesse False sagt -- in Worten.
+
+        Nur fuer die Meldung, nie fuer eine Entscheidung. Deshalb darf sie
+        auch grob sein: sie nennt die ERSTE Bedingung, die faellt, und
+        beantwortet damit die Frage, die im Log wirklich gestellt wird --
+        "liegt das an der Groesse, am Fenster oder daran, dass der Weg gar
+        nicht aufgebaut ist".
+
+        Sie ist bewusst KEINE zweite Fassung von ``handles``: sie
+        entscheidet nichts, und wenn sie einmal danebenliegt, ist der
+        Schaden ein ungenauer Satz im Protokoll. Ein stiller Rueckfall
+        dagegen kostet eine Messung.
+        """
+        if op not in self.HTCCL_OPS:
+            return f"{op} steht nicht in HTCCL_OPS"
+        if not self._auf or self._ext is None:
+            return "der Direktpfad ist nicht aufgebaut"
+        if not self._belege_stehen:
+            return "der Byte-Beleg je Paar steht nicht"
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        chunk_max = int(self._geo.get("chunk_max", 0))
+        if op in ("all_to_all", "all_to_all_single"):
+            if not self.a2a_an:
+                return "all_to_all ist per SGLANG_HTCCL_BAR1_A2A=0 abgeschaltet"
+            if not self._a2a_beleg:
+                return "der a2a-Byte-Beleg steht nicht"
+            if nbytes < self.a2a_min_bytes:
+                return f"{nbytes} Byte liegen unter a2a_min_bytes ({self.a2a_min_bytes})"
+            n = a2a_runden(-(-nbytes // self.welt), schlitz) if schlitz else 0
+            if n > self.a2a_max_runden:
+                return (f"braeuchte {n} Runden bei Schlitz {schlitz} Byte, "
+                        f"erlaubt sind {self.a2a_max_runden}")
+        elif op == "all_gather":
+            if not self.ag_an:
+                return "all_gather ist per SGLANG_HTCCL_BAR1_AG=0 abgeschaltet"
+            if not self._a2a_beleg:
+                return "der a2a-Byte-Beleg steht nicht (all_gather faehrt darauf)"
+            if nbytes < self.ag_min_bytes:
+                return f"{nbytes} Byte liegen unter ag_min_bytes ({self.ag_min_bytes})"
+            if schlitz and -(-nbytes // schlitz) > self.ag_max_runden:
+                return (f"braeuchte {-(-nbytes // schlitz)} Runden bei Schlitz "
+                        f"{schlitz} Byte, erlaubt sind {self.ag_max_runden}")
+        elif op == "broadcast":
+            if not self.bc_an:
+                return "broadcast ist per SGLANG_HTCCL_BAR1_BC=0 abgeschaltet"
+            if not self._bc_beleg:
+                return "der broadcast-Byte-Beleg steht nicht"
+            if nbytes < self.bc_min_bytes:
+                return f"{nbytes} Byte liegen unter bc_min_bytes ({self.bc_min_bytes})"
+            if schlitz and -(-nbytes // schlitz) > self.bc_max_runden:
+                return (f"braeuchte {-(-nbytes // schlitz)} Runden bei Schlitz "
+                        f"{schlitz} Byte, erlaubt sind {self.bc_max_runden}")
+        else:
+            if nbytes < self.min_bytes:
+                return f"{nbytes} Byte liegen unter min_bytes ({self.min_bytes})"
+            if nbytes % 16:
+                return (f"{nbytes} Byte sind kein Vielfaches von 16 -- die "
+                        f"Zugriffsbreite des Kerns ist 128 Bit")
+            if nbytes // 16 < self.welt:
+                return (f"{nbytes} Byte sind weniger als ein 128-Bit-Paket je "
+                        f"Rang ({self.welt})")
+            if chunk_max >= 16:
+                n = len(ar_plan(nbytes, chunk_max, self.welt))
+                if n > self.ar_max_runden:
+                    return (f"braeuchte {n} Runden bei Chunkgrenze {chunk_max} "
+                            f"Byte, erlaubt sind {self.ar_max_runden}")
+        if self._geo.get("region_bytes", 0) > self._fenster_minimum:
+            return (f"die Region ({self._geo.get('region_bytes')} Byte) passt "
+                    f"nicht in das gruppenweit kleinste abgebildete Fenster "
+                    f"({self._fenster_minimum} Byte)")
+        return ""
 
     def _kern(self, bewegt: int, schwelle: int, wo: str) -> int:
         """``1`` = cooperative Mehrblockstart (``gitter``), ``0`` = ``1blk``.
@@ -2327,6 +2537,43 @@ class HTCCLBar1Transport:
                 "htccl_all_reduce ohne aufgebauten Transport -- erreichbar "
                 "nur, wenn jemand handles() umgangen hat."
             )
+        inp = inp.contiguous()
+        nbytes = inp.numel() * inp.element_size()
+        chunk_max = int(self._geo.get("chunk_max", 0))
+        plan = ar_plan(nbytes, chunk_max, self.welt) if chunk_max >= 16 else []
+        if len(plan) > 1:
+            # MEHRERE RUNDEN. Jede ist ein vollstaendiges all_reduce ueber
+            # einen Ausschnitt -- kein neuer Kern, keine andere Zerlegung,
+            # nur weniger Bytes je Start. Die Rundenzahl kommt aus `ar_plan`
+            # und haengt allein an gruppenweit gleichen Groessen; sie ist
+            # damit fuer eine aufgezeichnete Form eingebrannt.
+            #
+            # Die Ausschnitte sind Sichten auf den flachen Puffer, keine
+            # Kopien: `versatz` und `laenge` sind Vielfache von 16, also
+            # bleibt jede Sicht 16-Byte-ausgerichtet, worauf der Wirt
+            # besteht.
+            ergebnis = torch.empty_like(inp)
+            flach_ein = inp.view(-1)
+            flach_aus = ergebnis.view(-1)
+            eg = inp.element_size()
+            for versatz, laenge in plan:
+                teil = self._all_reduce_eine_runde(
+                    flach_ein[versatz // eg:(versatz + laenge) // eg]
+                )
+                flach_aus[versatz // eg:(versatz + laenge) // eg].copy_(teil)
+            return ergebnis
+        return self._all_reduce_eine_runde(inp)
+
+    def _all_reduce_eine_runde(self, inp):
+        """EIN Kernelstart. Der bisherige Rumpf, unveraendert.
+
+        Herausgeloest, damit die Rundenschleife darueber nichts von der
+        Algorithmuswahl, der Pipe oder der Zeigertabelle wissen muss -- und
+        damit der Einrundenfall Buchstabe fuer Buchstabe derselbe Weg
+        bleibt wie vorher.
+        """
+        import torch
+
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
         algo = self.algorithmus_fuer(nbytes)
@@ -3143,7 +3390,13 @@ class HTCCLBar1Transport:
             return False
         if nbytes < self.a2a_min_bytes:
             return False
-        if -(-nbytes // self.welt) > geo["a2a_schlitz"]:
+        # Ueber den Schlitz hinaus wird NICHT abgelehnt, sondern in Runden
+        # zerlegt -- dieselbe Antwort wie bei all_reduce, all_gather und
+        # broadcast. Die grobe Zahl hier ist der gleichverteilte Fall; die
+        # genaue Rundenzahl faellt in `traegt_a2a`, sobald der gruppenweit
+        # groesste Block feststeht.
+        if a2a_runden(-(-nbytes // self.welt),
+                      int(geo["a2a_schlitz"])) > self.a2a_max_runden:
             return False
         # Derselbe Fensterbegriff wie bei all_reduce: gegen die gruppenweit
         # KLEINSTE tatsaechlich abgebildete Laenge, nicht gegen die
@@ -3175,12 +3428,86 @@ class HTCCLBar1Transport:
             return False
         if groesster_block < 0:
             return False
-        return groesster_block <= int(self._geo.get("a2a_schlitz", 0))
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        if schlitz <= 0:
+            return False
+        # Passt er nicht in EINEN Schlitz, laeuft er in mehreren Runden --
+        # abgelehnt wird nur, was auch in Runden nicht geht.
+        return a2a_runden(groesster_block, schlitz) <= self.a2a_max_runden
+
+    def a2a_runden_fuer(self, groesster_block: int) -> int:
+        """Rundenzahl, die der Aufrufer an ``htccl_all_to_all_single`` gibt.
+
+        Sie faellt aus dem GRUPPENWEIT groessten Block, den die Naht ohnehin
+        schon ausgerechnet hat -- nicht aus der eigenen Zeile. Aus der
+        eigenen Zeile waere sie rangabhaengig, und ein Rang mit einer Runde
+        weniger laesst die anderen in der Sperre stehen.
+        """
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        if schlitz <= 0:
+            return 0
+        return a2a_runden(groesster_block, schlitz)
 
     def htccl_all_to_all_single(self, comm, output, inp,
                                 sende_bytes, empfangs_bytes,
                                 sende_versatz=None, empfangs_versatz=None,
-                                kern_last=None):
+                                kern_last=None, runden=None):
+        """Wrapper mit Rundenschleife. Ein Schritt oder mehrere, je nach Block.
+
+        ``runden`` kommt vom Aufrufer und ist GRUPPENWEIT gleich -- die Naht
+        rechnet sie aus dem groessten Block ueber alle Paare
+        (:meth:`a2a_runden_fuer`). ``None`` heisst eine Runde und ist damit
+        Buchstabe fuer Buchstabe der bisherige Weg; genau so rufen
+        :meth:`htccl_all_gather` und :meth:`htccl_broadcast`, die ihre
+        Ausschnitte schon selbst geschnitten haben.
+
+        Was eine Runde bewegt: aus jedem Block hoechstens einen Schlitz
+        voll, am Stueck, ab Versatz ``k*schlitz``. Bloecke, die frueher zu
+        Ende sind, tragen Laenge 0 -- sie fahren die Sperre mit, ohne Bytes
+        zu bewegen. Dasselbe Muster wie bei ag_plan, und aus demselben
+        Grund: die Rundenzahl darf nicht daran haengen, wieviel DIESER Rang
+        zu tun hat.
+        """
+        n = 1 if runden is None else max(1, int(runden))
+        if n == 1:
+            return self._a2a_eine_runde(
+                comm, output, inp, sende_bytes, empfangs_bytes,
+                sende_versatz, empfangs_versatz, kern_last,
+            )
+        schlitz = int(self._geo["a2a_schlitz"])
+        s_basis = list(sende_versatz) if sende_versatz is not None else None
+        e_basis = list(empfangs_versatz) if empfangs_versatz is not None else None
+        if s_basis is None:
+            s_basis, acc = [], 0
+            for laenge in sende_bytes:
+                s_basis.append(acc)
+                acc += int(laenge)
+        if e_basis is None:
+            e_basis, acc = [], 0
+            for laenge in empfangs_bytes:
+                e_basis.append(acc)
+                acc += int(laenge)
+        for k in range(n):
+            s_len = [
+                min(schlitz, max(0, int(laenge) - k * schlitz))
+                for laenge in sende_bytes
+            ]
+            e_len = [
+                min(schlitz, max(0, int(laenge) - k * schlitz))
+                for laenge in empfangs_bytes
+            ]
+            self._a2a_eine_runde(
+                comm, output, inp, s_len, e_len,
+                [b + k * schlitz for b in s_basis],
+                [b + k * schlitz for b in e_basis],
+                kern_last,
+            )
+        return output
+
+    def _a2a_eine_runde(self, comm, output, inp,
+                        sende_bytes, empfangs_bytes,
+                        sende_versatz=None, empfangs_versatz=None,
+                        kern_last=None):
         """``all_to_all_single`` ueber den Direktpfad. Ein Schritt, eine Sperre.
 
         ``sende_bytes[j]`` ist der Block, der an Rang ``j`` geht,

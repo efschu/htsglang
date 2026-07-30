@@ -392,12 +392,21 @@ class HTCCLMatrixTransport:
 
     def htccl_all_to_all_single(self, comm, output, inp, sende_bytes,
                                 empfangs_bytes, sende_versatz=None,
-                                empfangs_versatz=None):
+                                empfangs_versatz=None, kern_last=None,
+                                runden=None):
         self._muss_stehen()
         return self.bar1.htccl_all_to_all_single(
             comm, output, inp, sende_bytes, empfangs_bytes,
-            sende_versatz, empfangs_versatz,
+            sende_versatz, empfangs_versatz, kern_last=kern_last,
+            runden=runden,
         )
+
+    def a2a_runden_fuer(self, groesster_block: int) -> int:
+        """Durchgereicht wie traegt_a2a -- eine zweite Fassung waere die
+        Stelle, an der die beiden auseinanderlaufen."""
+        if self.bar1 is None:
+            return 0
+        return self.bar1.a2a_runden_fuer(groesster_block)
 
     def _muss_stehen(self) -> None:
         if self.bar1 is None:

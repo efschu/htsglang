@@ -486,6 +486,11 @@ class HTCCLCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
+        #: (Operation, Groessenklasse), fuer die der laute Rueckfallhinweis
+        #: schon heraus ist. Je Gruppe eigen, weil die Deckung je Gruppe
+        #: verschieden sein kann: tp und dcp bekommen verschieden grosse
+        #: Fenster, und was in der einen passt, muss in der anderen nicht.
+        self._rueckfall_gemeldet: set = set()
         self.transport = _build_transport(
             _TRANSPORT, cpu_group, device, disabled=self.disabled, gruppe=gruppe,
         )
@@ -566,6 +571,55 @@ class HTCCLCommunicator:
             )
 
             chosen = refine_transport_choice(dispatcher, op, nbytes, chosen)
+        if chosen is None and t is not None and not graph_erfassung_laeuft():
+            # DIE EHRLICHKEITSREGEL: Rueckfall ist in Ordnung, lautlos nicht.
+            #
+            # Ausserhalb einer Aufzeichnung ist die gloo-Ebene ein gangbarer,
+            # nur langsamerer Weg -- deshalb bricht hier nichts ab. Aber ein
+            # Transport, der fuer eine Groesse aussteigt, waehrend das
+            # Protokoll "transport=bar1" sagt, entwertet jede Messung, die
+            # danach genommen wird. Genau das waere beim Prefill passiert:
+            # ab 2457 Token je Batch sagt bar1 zu all_reduce False, und mit
+            # `chunked_prefill_size` 4096 oder 8192 haette der Direktpfad
+            # dort ohne eine einzige Zeile ausgesetzt.
+            #
+            # EINMAL je (Operation, Groessenklasse) und Gruppe, nicht je
+            # Aufruf: im heissen Pfad laufen dieselben Groessen tausendfach,
+            # und eine Warnung je Kollektiv waere ein Log-Sturm, den niemand
+            # liest. Die Groessenklasse ist der Zweierlogarithmus -- fein
+            # genug, dass eine neue Betriebsgroesse auffaellt, grob genug,
+            # dass Rauschen nicht jedes Mal eine neue Zeile erzeugt.
+            klasse = int(nbytes).bit_length()
+            schluessel = (op, klasse)
+            # Traege angelegt, nicht vorausgesetzt: den Kommunikator gibt es
+            # auch als `__new__`-Attrappe (Tests, und der Pfad-Dispatcher
+            # baut sich einen), und ein Hinweis, der am fehlenden Merker
+            # stirbt, waere ein neuer Fehler an der Stelle, an der gerade
+            # einer geschlossen wird.
+            gemeldet = getattr(self, "_rueckfall_gemeldet", None)
+            if gemeldet is None:
+                gemeldet = set()
+                self._rueckfall_gemeldet = gemeldet
+            if schluessel not in gemeldet:
+                gemeldet.add(schluessel)
+                grund = ""
+                warum = getattr(t, "warum_nicht", None)
+                if callable(warum):
+                    try:
+                        grund = warum(op, nbytes) or ""
+                    except Exception as e:      # noqa: BLE001
+                        grund = f"(Grund nicht ermittelbar: {e!r})"
+                logger.warning(
+                    "HTCCL[%s]: %s deckt %r mit %d Byte NICHT -- Rueckfall "
+                    "auf die host-gestaffelte Ebene. Gedeckt sind dort %s.%s "
+                    "Diese Meldung erscheint einmal je Operation und "
+                    "Groessenklasse; die Zahlen dieses Laufs sind fuer diese "
+                    "Groesse KEINE %s-Zahlen.",
+                    getattr(self, "gruppe", "?"), _transport_name(t), op,
+                    nbytes, _gedeckte_ops(t),
+                    f" Grund: {grund}." if grund else "",
+                    _transport_name(t),
+                )
         if chosen is None and graph_erfassung_laeuft():
             # Der Riegel sitzt hinter dem Dispatcher, nicht davor: er huetet
             # die ENDGUELTIGE Wahl. Ein ``HINT_GLOO`` kann `chosen` auch dann
@@ -972,7 +1026,15 @@ class HTCCLCommunicator:
                     max(sende + empf), self.cpu_group
                 )
             if t.traegt_a2a(groesster):
-                return t.htccl_all_to_all_single(self, output, inp, sende, empf)
+                # Die Rundenzahl faellt aus dem GRUPPENWEIT groessten Block,
+                # den wir gerade ausgerechnet haben -- nicht aus der eigenen
+                # Zeile, die je Rang anders ist. Ein Transport ohne diese
+                # Auskunft faehrt wie bisher eine Runde.
+                holen = getattr(t, "a2a_runden_fuer", None)
+                runden = holen(groesster) if callable(holen) else None
+                return t.htccl_all_to_all_single(
+                    self, output, inp, sende, empf, runden=runden
+                )
 
         # Rueckfall: dieselbe Zerlegung ueber die CPU-Gruppe. Gepinnt, damit
         # die beiden Kopien nicht ueber einen pageable-Zwischenpuffer laufen.
