@@ -44,7 +44,11 @@ guard is a model, and a reader has to be able to disagree with it.
 The MLP vector is derived from a MEASURED hardware profile (stage-0
 micro-probe: per-card GEMM + memory-bandwidth score, pairwise NCCL link
 matrix), cached under ~/.cache/sglang keyed by (sorted GPU UUIDs, driver
-version) so the probe runs once per rig. The chosen vector is printed as a
+version) so the probe runs once per rig. The GEMM score is taken in the
+checkpoint's OWN weight format, per card and per lane -- a dense bf16 number
+reports the wrong compute RATIO for a quantized checkpoint, which is what the
+prefill objective is made of (#296); see the "GEMM lanes" block below. The
+chosen vector is printed as a
 PINNABLE hint (same UX as SGLANG_UNEVEN_TOKEN_VECTOR): passing
 ``--rank-tp-ratio auto --rank-mlp-ratio <vector>`` reproduces the split with
 no probe and no optimizer. SGLANG_PERF_REPROBE=1 forces a re-probe.
@@ -78,7 +82,11 @@ logger = logging.getLogger(__name__)
 #: 2: per-GPU membw_read_gbs / membw_copy_gbs / membw_gemv_gbs added. Cached
 #: v1 profiles carry no GEMV rate, so they re-probe rather than silently fall
 #: back to the streaming peak as the decode divisor.
-PROFILE_VERSION = 2
+#: 3: per-GPU gemm_lanes / gemm_lane_notes added -- the GEMM probe measured in
+#: the QUANTIZED formats a checkpoint actually runs in, not only dense bf16.
+#: A v2 profile carries no lane, so an fp8 plan on one falls back to bf16 with
+#: a named warning rather than silently scoring the ranks in the wrong format.
+PROFILE_VERSION = 3
 PROFILE_CACHE_DIR = os.path.expanduser("~/.cache/sglang")
 
 #: Probe shapes (model-relevant): GEMM = one chunked-prefill MLP matmul
@@ -86,6 +94,17 @@ PROFILE_CACHE_DIR = os.path.expanduser("~/.cache/sglang")
 #: GEMV over a ~1.3 GB bf16 matrix (the lm_head-class shape of m20).
 _PROBE_GEMM_M, _PROBE_GEMM_K, _PROBE_GEMM_N = 2048, 5120, 17408
 _PROBE_GEMV_ROWS, _PROBE_GEMV_K = 131072, 5120
+#: Warmup / timed iterations shared by every GEMM lane below. One setting for
+#: all of them on purpose: the prefill objective reads a RATIO between lanes
+#: and between cards, and a ratio between two differently-timed measurements
+#: is not one.
+_PROBE_GEMM_WARMUP, _PROBE_GEMM_ITERS = 10, 60
+#: Weight-scale block of the fp8 lanes, ``[block_n, block_k]``. Block-scaled
+#: e4m3 is what the fp8 checkpoints on this fork's rigs ship (Qwen3.6-27B-FP8:
+#: ``weight_block_size [128, 128]``), and the block size is not free: it sets
+#: the scale traffic the Marlin and dequant lanes pay per output tile. Both
+#: probe dimensions divide it exactly, so the lanes measure the aligned path.
+_PROBE_FP8_BLOCK = (128, 128)
 
 # ---------------------------------------------------------------------------
 # Capacity-prediction constants (calibrated against the M22/M23 boot logs of
@@ -234,6 +253,18 @@ _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #: (see _bench_membw_rates), which is the size of the effect being chased.
 #: Closing this the rest of the way means timing the ACTUAL quantized kernels
 #: per lane, which is a per-lane, per-checkpoint measurement, not a constant.
+#:
+#: The PREFILL side now does exactly that (see the GEMM lanes below), and the
+#: decode side deliberately does not follow it here. Two reasons, both about
+#: evidence rather than effort. The lanes measure a GEMM at M=2048; a bs=1
+#: decode step reads weights at M=1, where the same kernels sit at a different
+#: fraction of DRAM peak and the dequant lane's per-forward expansion is
+#: amortized over one token instead of a block (measured on this rig: forcing
+#: the dequant fallback costs 8.1 % of prefill and 69.9 % of decode). And this
+#: exponent was FITTED against the dense GEMV divisor on four measured points;
+#: swapping the divisor without refitting would keep the number and change
+#: what it means. A decode-shaped quantized probe plus a refit is the way to
+#: close it, and it is its own campaign.
 #:
 #: Sample width: ONE rig (5090 + 2x 3080, PCIe, no P2P) and one checkpoint
 #: family (FP8 dense, sm_120 native lane against sm_86 Marlin upconvert).
@@ -479,28 +510,283 @@ def profile_cache_path(uuids: Sequence[str], driver: str) -> str:
     return os.path.join(PROFILE_CACHE_DIR, f"hw_profile-{digest}.json")
 
 
-def _bench_gemm_tflops(dev) -> float:
+# ---------------------------------------------------------------------------
+# GEMM lanes: the matmul a checkpoint's weights actually run through.
+#
+# A quantized checkpoint does not compute at the card's dense bf16 rate, and
+# the gap is card-specific. The prefill objective consumes a compute RATIO
+# between ranks, so a probe in the wrong format does not just shift the scale
+# -- it reports the wrong ratio. Measured on the reference rig (#213 card
+# probe): the 5090 (sm_120) does 232.0 bf16 TFLOPS and 566.9 fp8 TFLOPS, the
+# 3080s (sm_86) have no fp8 tensor path at all. Scoring both cards in bf16
+# gives 3.79 where the fp8 checkpoint runs at 8.6+, and the optimizer then
+# proposes a 6,2,2-class split against a measured optimum of 10,1,1 (#296).
+#
+# Each lane is a MEASUREMENT or nothing. A card with no native fp8 unit still
+# runs the checkpoint -- through Marlin, or through the dequant fallback --
+# and those lanes are probed rather than estimated or left null. There is no
+# datasheet number and no substitute constant anywhere on this path.
+# ---------------------------------------------------------------------------
+
+#: Dense bf16 matmul. The lane of an unquantized checkpoint, and the named
+#: fallback for any format that has no lane table yet.
+LANE_BF16 = "bf16"
+#: Native fp8 e4m3 tensor cores via ``torch._scaled_mm`` (sm89+, Hopper,
+#: Blackwell, MI300+).
+LANE_FP8_NATIVE = "fp8_native"
+#: Weight-only fp8 through ``gptq_marlin_gemm``. This is what sglang's dense
+#: fp8 linear takes on sm80..88 -- see
+#: ``fp8_utils.can_auto_enable_marlin_fp8`` -- so on an Ampere card serving an
+#: fp8 checkpoint it is THE lane, not a curiosity.
+LANE_FP8_MARLIN = "fp8_marlin"
+#: Weight-only fp8 through dequantise-to-compute-dtype + dense matmul. The
+#: route sglang takes when no fp8 GEMM of any kind is reachable, and the route
+#: SGLANG_DETERMINISTIC_FP8_GEMM forces on sm80..88 (fp8 Marlin is run-to-run
+#: nondeterministic there, #190). Weights stay fp8 in VRAM and are expanded
+#: per forward, so at a prefill shape the expansion amortizes over the whole
+#: token block -- which is exactly the shape this probe measures.
+LANE_FP8_W8A16 = "fp8_w8a16"
+
+#: Checkpoint compute format -> the lanes a card may take for it, in the order
+#: the serving path tries them (fp8: native, then Marlin, then dequant --
+#: mirroring ``fp8_utils.fp8_needs_dequant_fallback``). The dispatch takes the
+#: FIRST lane that measured on that card, so a mixed rig scores each card on
+#: the lane that card will run.
+#:
+#: This table is the extension point. AWQ / GPTQ-Marlin and GGUF are NOT
+#: covered here: their lanes are different kernels (``gptq_marlin_gemm`` at 4
+#: bits with a group-scale grid, MMQ/MMVQ for ggml types) and each needs its
+#: own probe and its own evidence. A format with no entry falls back to the
+#: bf16 lane WITH A WARNING -- never silently, because a bf16 number wearing a
+#: quantized label is the defect this table exists to fix.
+_FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
+    "bf16": (LANE_BF16,),
+    "fp8": (LANE_FP8_NATIVE, LANE_FP8_MARLIN, LANE_FP8_W8A16),
+}
+
+#: Human-readable lane names for the plan log.
+_LANE_LABELS = {
+    LANE_BF16: "dense bf16",
+    LANE_FP8_NATIVE: "fp8 native (_scaled_mm)",
+    LANE_FP8_MARLIN: "fp8 Marlin (weight-only)",
+    LANE_FP8_W8A16: "fp8 W8A16 dequant",
+}
+
+
+def _time_gemm_tflops(dev, fn) -> float:
+    """Timed TFLOPS for one GEMM lane at the probe shape.
+
+    ``fn`` performs a single ``(M, K) x (K, N)`` product; the FLOP count is the
+    same for every lane, so the returned numbers are directly comparable."""
     import torch
 
-    a = torch.randn(_PROBE_GEMM_M, _PROBE_GEMM_K, dtype=torch.bfloat16, device=dev)
-    b = torch.randn(_PROBE_GEMM_K, _PROBE_GEMM_N, dtype=torch.bfloat16, device=dev)
-    fn = lambda: a @ b
-    for _ in range(10):
+    for _ in range(_PROBE_GEMM_WARMUP):
         fn()
     torch.cuda.synchronize(dev)
     s = torch.cuda.Event(enable_timing=True)
     e = torch.cuda.Event(enable_timing=True)
-    iters = 60
     s.record(torch.cuda.current_stream(dev))
-    for _ in range(iters):
+    for _ in range(_PROBE_GEMM_ITERS):
         fn()
     e.record(torch.cuda.current_stream(dev))
     torch.cuda.synchronize(dev)
-    ms = s.elapsed_time(e) / iters
+    ms = s.elapsed_time(e) / _PROBE_GEMM_ITERS
     flops = 2.0 * _PROBE_GEMM_M * _PROBE_GEMM_K * _PROBE_GEMM_N
-    del a, b
-    torch.cuda.empty_cache()
     return flops / (ms / 1e3) / 1e12
+
+
+def _bench_gemm_tflops(dev) -> float:
+    """Dense bf16 GEMM throughput (TFLOPS) at the probe shape."""
+    import torch
+
+    a = torch.randn(_PROBE_GEMM_M, _PROBE_GEMM_K, dtype=torch.bfloat16, device=dev)
+    b = torch.randn(_PROBE_GEMM_K, _PROBE_GEMM_N, dtype=torch.bfloat16, device=dev)
+    try:
+        return _time_gemm_tflops(dev, lambda a=a, b=b: a @ b)
+    finally:
+        del a, b
+        torch.cuda.empty_cache()
+
+
+def _fp8_block_scale_shape(rows: int, cols: int) -> Tuple[int, int]:
+    """Block-scale grid for a ``(rows, cols)`` fp8 weight, ``[block_n, block_k]``
+    applied to the two dimensions in that order."""
+    bn, bk = _PROBE_FP8_BLOCK
+    return (rows + bn - 1) // bn, (cols + bk - 1) // bk
+
+
+def _bench_gemm_fp8_native_tflops(dev) -> Tuple[Optional[float], str]:
+    """Native fp8 e4m3 GEMM via ``torch._scaled_mm``, or ``(None, why)``.
+
+    Per-tensor scales with ``use_fast_accum=True``: the configuration the fp8
+    serving path uses, so the number prices the kernel that would actually run
+    rather than a slower reference variant. Asked FUNCTIONALLY -- the lane is
+    attempted, not inferred from a capability integer -- because the integer is
+    ambiguous across vendors (gfx900 reports (9, 0), the same value as Hopper;
+    see ``fp8_utils.fp8_native_gemm_available``)."""
+    import torch
+
+    if not hasattr(torch, "_scaled_mm"):
+        return None, "this torch build has no torch._scaled_mm"
+    a = b = scale = None
+    try:
+        a = torch.randn(
+            _PROBE_GEMM_M, _PROBE_GEMM_K, dtype=torch.bfloat16, device=dev
+        ).to(torch.float8_e4m3fn)
+        # Column-major right operand: _scaled_mm requires mat2 to be
+        # transposed-contiguous, and building it any other way fails at the
+        # first call rather than measuring something.
+        b = (
+            torch.randn(_PROBE_GEMM_N, _PROBE_GEMM_K, dtype=torch.bfloat16, device=dev)
+            .to(torch.float8_e4m3fn)
+            .t()
+        )
+        scale = torch.ones((), dtype=torch.float32, device=dev)
+
+        def fn(a=a, b=b, scale=scale):
+            return torch._scaled_mm(
+                a, b, scale, scale, out_dtype=torch.bfloat16, use_fast_accum=True
+            )
+
+        return _time_gemm_tflops(dev, fn), ""
+    except Exception as ex:
+        return None, f"native fp8 GEMM did not run: {type(ex).__name__}: {ex}"
+    finally:
+        del a, b, scale
+        torch.cuda.empty_cache()
+
+
+def _bench_gemm_fp8_marlin_tflops(dev) -> Tuple[Optional[float], str]:
+    """Weight-only fp8 through the Marlin GEMM, or ``(None, why)``.
+
+    Built with the SAME helpers the serving path uses
+    (``marlin_utils_fp8.prepare_fp8_layer_for_marlin`` to repack the weight and
+    permute the block scales, ``apply_fp8_marlin_linear`` to run it), so the
+    measurement prices that kernel and not a re-implementation of it. On
+    sm80..88 this is the lane a dense fp8 linear takes by default, which is
+    what makes it the honest compute score for an Ampere rank serving an fp8
+    checkpoint."""
+    import torch
+
+    layer = None
+    x = None
+    try:
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            apply_fp8_marlin_linear,
+            prepare_fp8_layer_for_marlin,
+        )
+    except Exception as ex:
+        return None, f"fp8 Marlin kernels unavailable: {type(ex).__name__}: {ex}"
+    try:
+        k, n = _PROBE_GEMM_K, _PROBE_GEMM_N
+        layer = torch.nn.Module()
+        layer.orig_dtype = torch.bfloat16
+        layer.input_size_per_partition = k
+        layer.output_size_per_partition = n
+        layer.weight_block_size = list(_PROBE_FP8_BLOCK)
+        # size_k_first layout: the checkpoint's (k, n) weight, block scales on
+        # the (k // block_k, ceil(n / block_n)) grid the preparer expects.
+        layer.weight = torch.nn.Parameter(
+            torch.randn(k, n, dtype=torch.bfloat16, device=dev).to(
+                torch.float8_e4m3fn
+            ),
+            requires_grad=False,
+        )
+        n_blocks, k_blocks = _fp8_block_scale_shape(n, k)
+        layer.weight_scale = torch.nn.Parameter(
+            torch.ones((k_blocks, n_blocks), dtype=torch.float32, device=dev),
+            requires_grad=False,
+        )
+        prepare_fp8_layer_for_marlin(layer, size_k_first=True)
+        x = torch.randn(_PROBE_GEMM_M, k, dtype=torch.bfloat16, device=dev)
+
+        def fn(layer=layer, x=x, n=n, k=k):
+            return apply_fp8_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=n,
+                size_k=k,
+                bias=None,
+            )
+
+        return _time_gemm_tflops(dev, fn), ""
+    except Exception as ex:
+        return None, f"fp8 Marlin GEMM did not run: {type(ex).__name__}: {ex}"
+    finally:
+        del layer, x
+        torch.cuda.empty_cache()
+
+
+def _bench_gemm_w8a16_tflops(dev) -> Tuple[Optional[float], str]:
+    """Weight-only fp8 through the DEQUANT lane, or ``(None, why)``.
+
+    The weight stays fp8 in VRAM and is expanded to the compute dtype per
+    forward, then a dense matmul runs on the card's bf16 units -- measured with
+    the serving helper (``fp8_utils.dequant_fp8_block_weight``) rather than a
+    stand-in, so the block-scale traffic and the temporary are both in the
+    timing. The expansion is per FORWARD, not per token, so a prefill-shaped
+    probe amortizes it over the whole token block; that is the shape the
+    prefill objective needs, and it is why this lane is only mildly behind
+    Marlin at prefill (measured -8.1 % on the reference rig) while it is far
+    behind at batch-1 decode (-69.9 %, see ``fp8_utils._DequantCache``)."""
+    import torch
+
+    w = scale = x = None
+    try:
+        from sglang.srt.layers.quantization.fp8_utils import dequant_fp8_block_weight
+    except Exception as ex:
+        return None, f"fp8 dequant helper unavailable: {type(ex).__name__}: {ex}"
+    try:
+        k, n = _PROBE_GEMM_K, _PROBE_GEMM_N
+        # Serving orientation: weight (n, k), activations (m, k) -> F.linear.
+        w = torch.randn(n, k, dtype=torch.bfloat16, device=dev).to(
+            torch.float8_e4m3fn
+        )
+        n_blocks, k_blocks = _fp8_block_scale_shape(n, k)
+        scale = torch.ones((n_blocks, k_blocks), dtype=torch.float32, device=dev)
+        x = torch.randn(_PROBE_GEMM_M, k, dtype=torch.bfloat16, device=dev)
+        block = list(_PROBE_FP8_BLOCK)
+
+        def fn(w=w, scale=scale, x=x, block=block):
+            wd = dequant_fp8_block_weight(w, scale, block, torch.bfloat16)
+            return torch.nn.functional.linear(x, wd)
+
+        return _time_gemm_tflops(dev, fn), ""
+    except Exception as ex:
+        return None, f"fp8 W8A16 dequant GEMM did not run: {type(ex).__name__}: {ex}"
+    finally:
+        del w, scale, x
+        torch.cuda.empty_cache()
+
+
+#: lane -> probe. Every entry returns ``(tflops or None, note)``; a lane that
+#: cannot run on a card stores its REASON, never a substitute number.
+_LANE_PROBES = {
+    LANE_FP8_NATIVE: _bench_gemm_fp8_native_tflops,
+    LANE_FP8_MARLIN: _bench_gemm_fp8_marlin_tflops,
+    LANE_FP8_W8A16: _bench_gemm_w8a16_tflops,
+}
+
+
+def _bench_gemm_lanes(dev) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """Every quantized GEMM lane this card can run, at the probe shape.
+
+    Returns ``({lane: tflops}, {lane: why_absent})``. The dense bf16 lane is
+    not in here -- it is ``gemm_tflops``, probed unconditionally. Lanes are
+    measured for every card regardless of which checkpoint is being planned:
+    the profile is cached per RIG, and re-probing it per checkpoint would cost
+    a probe on every boot that changes the model."""
+    values: Dict[str, float] = {}
+    notes: Dict[str, str] = {}
+    for lane, probe in _LANE_PROBES.items():
+        tflops, note = probe(dev)
+        if tflops is not None:
+            values[lane] = round(tflops, 2)
+        else:
+            notes[lane] = note
+    return values, notes
 
 
 def _time_best_gbs(dev, fn, moved_bytes: float, iters: int = 40) -> float:
@@ -663,12 +949,19 @@ def run_probe(out_path: str) -> dict:
         dev = torch.device(f"cuda:{g['cuda_index']}")
         torch.cuda.set_device(dev)
         gemm = _bench_gemm_tflops(dev)
+        lane_tflops, lane_notes = _bench_gemm_lanes(dev)
         rates = _bench_membw_rates(dev)
         per_gpu[g["uuid"]] = {
             "name": g["name"],
             "cuda_index": g["cuda_index"],
             "total_mib": g["total_mib"],
             "gemm_tflops": round(gemm, 2),
+            # Quantized GEMM lanes, and the reason for each one that is
+            # absent. The prefill objective picks per card by the checkpoint's
+            # format (see rank_gemm_scores); a missing lane must read as a
+            # missing MEASUREMENT, which is why the note is stored next to it.
+            "gemm_lanes": lane_tflops,
+            "gemm_lane_notes": lane_notes,
             # Unchanged meaning and unchanged consumers: the card's streaming
             # bandwidth score.
             "membw_gbs": round(rates.streaming_peak_gbs, 1),
@@ -759,7 +1052,8 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
     reason = "forced by SGLANG_PERF_REPROBE=1" if force else "no cached profile"
     logger.info(
         "auto-performance: running the stage-0 hardware micro-probe (%s; "
-        "GEMM + memory-bandwidth per card, pairwise NCCL link matrix; "
+        "GEMM per card in every reachable lane (bf16 + the quantized ones) "
+        "+ memory bandwidth, pairwise NCCL link matrix; "
         "a few seconds, cached to %s afterwards)...",
         reason,
         path,
@@ -806,6 +1100,137 @@ def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
         except Exception:
             pass
     return None, gpus
+
+
+# ---------------------------------------------------------------------------
+# Format dispatch: checkpoint quantization -> per-card compute lane.
+# ---------------------------------------------------------------------------
+
+
+def _quant_config(cfg: dict) -> dict:
+    """The checkpoint's ``quantization_config``, from the top level or from
+    ``text_config`` (where VL checkpoints keep it). ``{}`` when unquantized."""
+    qc = cfg.get("quantization_config")
+    if not qc:
+        text = cfg.get("text_config")
+        if isinstance(text, dict):
+            qc = text.get("quantization_config")
+    return qc or {}
+
+
+def _is_fp8_like(method: str, fmt: str) -> bool:
+    """Whether a ``(quant_method, format)`` pair denotes an fp8 weight scheme.
+
+    One predicate, two consumers: the byte model (``_config_quant_bpp``, which
+    charges 1 B/weight for these) and the lane dispatch below. Splitting them
+    would let the planner size a checkpoint as fp8 while scoring it as
+    something else."""
+    return method == "fp8" or "float8" in method or "float" in fmt or "fp8" in fmt
+
+
+def checkpoint_compute_format(model_path: Optional[str]) -> Tuple[str, str]:
+    """``(format key, one-line description)`` for the checkpoint's weight format.
+
+    The key indexes ``_FORMAT_LANES``. ``"bf16"`` for an unquantized
+    checkpoint (its lane IS the dense probe, so the default path is unchanged);
+    ``"fp8"`` for fp8-like schemes; otherwise the scheme's own name, which has
+    no lane table and therefore takes the warned bf16 fallback.
+
+    Read from the checkpoint's own config, never from the repo or path name:
+    a directory called ``...-FP8`` that ships int4 weights would otherwise be
+    scored on a lane it never runs."""
+    if _is_gguf_model(model_path):
+        return "gguf", "GGUF (ggml k-quant / legacy types)"
+    try:
+        cfg = _load_checkpoint_config(model_path)
+    except Exception as ex:
+        return (
+            "unknown",
+            f"unreadable checkpoint config ({type(ex).__name__}: {ex})",
+        )
+    qc = _quant_config(cfg)
+    if not qc:
+        return "bf16", "unquantized (no quantization_config)"
+    method = str(qc.get("quant_method") or "").lower()
+    fmt = str(qc.get("format") or qc.get("fmt") or "").lower()
+    if _is_fp8_like(method, fmt):
+        block = qc.get("weight_block_size")
+        shape = f", weight_block_size {block}" if block else ""
+        return "fp8", f"fp8 (quant_method={method or '?'}, fmt={fmt or '?'}{shape})"
+    return (
+        method or "unknown",
+        f"quant_method={method or '?'}, format={fmt or '?'}",
+    )
+
+
+def rank_gemm_scores(
+    entries: Sequence[dict], fmt: str
+) -> Tuple[List[float], List[str], List[str]]:
+    """Per-rank compute score in the checkpoint's OWN format.
+
+    Returns ``(scores, lane labels, warnings)``. For each rank the first lane
+    of ``_FORMAT_LANES[fmt]`` that the profile has a measurement for on that
+    card wins, mirroring the order the serving path tries them. Cards on the
+    same rig can land on different lanes -- that is the point: an fp8
+    checkpoint runs on sm_120 tensor cores on one card and through a
+    weight-only lane on the next, and the ratio between those two is what the
+    prefill objective is made of.
+
+    Two fallbacks, both LOUD, because the failure they guard against is a bf16
+    number silently wearing a quantized label:
+
+    * the format has no lane table (AWQ / GPTQ / GGUF today);
+    * the format has one but the profile measured none of its lanes on this
+      card (a profile written before the lanes existed, or every lane refused
+      on that architecture).
+
+    Both fall back to the dense bf16 score, which is the pre-existing
+    behaviour, so the fallback path is a warning about accuracy and never a
+    behaviour change."""
+    lanes = _FORMAT_LANES.get(fmt)
+    scores: List[float] = []
+    labels: List[str] = []
+    warnings: List[str] = []
+    if lanes is None:
+        for entry in entries:
+            scores.append(float(entry["gemm_tflops"]))
+            labels.append(_LANE_LABELS[LANE_BF16])
+        warnings.append(
+            f"checkpoint format '{fmt}' has no GEMM lane table: the prefill "
+            "objective is scoring every rank on the DENSE BF16 probe, which "
+            "is the wrong format for this checkpoint and compresses the "
+            "card-to-card compute ratio (measured on the reference rig: 3.79 "
+            "in bf16 against 8.64 for the same cards on an fp8 checkpoint). "
+            "The chosen MLP vector is a lower bound on the concentration this "
+            "rig wants; pin --rank-mlp-ratio if you have measured better."
+        )
+        return scores, labels, warnings
+
+    for entry in entries:
+        # The dense lane is always available -- it IS ``gemm_tflops``, probed
+        # unconditionally -- so it is not carried in the per-card lane map.
+        available = dict(entry.get("gemm_lanes") or {})
+        available[LANE_BF16] = float(entry["gemm_tflops"])
+        chosen = next((lane for lane in lanes if lane in available), None)
+        if chosen is None:
+            scores.append(float(entry["gemm_tflops"]))
+            labels.append(_LANE_LABELS[LANE_BF16] + " (fallback)")
+            notes = entry.get("gemm_lane_notes") or {}
+            detail = "; ".join(
+                f"{lane}: {notes.get(lane, 'not probed')}" for lane in lanes
+            )
+            warnings.append(
+                f"{entry.get('name', 'GPU')}: no {fmt} GEMM lane measured on "
+                f"this card ({detail}) -- scoring it on the DENSE BF16 probe "
+                "instead. Re-run with SGLANG_PERF_REPROBE=1 if the profile "
+                "predates the lane probes; otherwise this rank's compute "
+                "score is in the wrong format and the ratio it forms with the "
+                "other ranks is understated."
+            )
+        else:
+            scores.append(float(available[chosen]))
+            labels.append(_LANE_LABELS.get(chosen, chosen))
+    return scores, labels, warnings
 
 
 def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[int]:
@@ -1233,6 +1658,18 @@ def _is_gguf_model(model_path: Optional[str]) -> bool:
     return p.lower().endswith(".gguf") or os.path.isfile(p)
 
 
+def _load_checkpoint_config(model_path: str) -> dict:
+    """The checkpoint's config dict, HF directory or GGUF file alike.
+
+    GGUF checkpoints are a single .gguf FILE, not a directory with a
+    config.json -- read the fields (and per-family quant bytes) from the GGUF
+    header instead of crashing on ``open(model_path/'config.json')``."""
+    if _is_gguf_model(model_path):
+        return _gguf_config_and_families(model_path)
+    with open(os.path.join(model_path, "config.json")) as f:
+        return json.load(f)
+
+
 def _gguf_mmproj_bytes(model_path: Optional[str]) -> int:
     """On-disk bytes of the ``mmproj-*.gguf`` vision-encoder sidecar that ships
     beside a GGUF text checkpoint (0 when none). Added to the resident weight
@@ -1619,11 +2056,7 @@ def _config_quant_bpp(cfg: dict, is_moe: bool) -> Optional[Dict[str, float]]:
         remainder inside the sizing tolerance; the on-disk anchor sizes the
         exact mix whenever the weight shards are present.
     """
-    qc = cfg.get("quantization_config")
-    if not qc:
-        text = cfg.get("text_config")
-        if isinstance(text, dict):
-            qc = text.get("quantization_config")
+    qc = _quant_config(cfg)
     if not qc:
         return None
 
@@ -1641,10 +2074,10 @@ def _config_quant_bpp(cfg: dict, is_moe: bool) -> Optional[Dict[str, float]]:
         if str(key).startswith("-:"):
             regex_pats.append(str(key)[2:])
 
-    # Bytes/param for the quantized (non-excluded) families.
-    fp8_like = (
-        method == "fp8" or "float" in fmt or "fp8" in fmt or "float8" in method
-    )
+    # Bytes/param for the quantized (non-excluded) families. Same predicate
+    # the lane dispatch uses, so a checkpoint cannot be SIZED as fp8 and
+    # SCORED as something else.
+    fp8_like = _is_fp8_like(method, fmt)
     if fp8_like:
         # e4m3/e5m2 weights are 1 B; block (weight_block_size) or per-channel
         # fp32 scales add a negligible per-param overhead.
@@ -1951,15 +2384,7 @@ class PerfCostModel:
                     self.kv_cell_bytes = b / t
                     break
 
-    @staticmethod
-    def _load_config(model_path: str) -> dict:
-        # GGUF checkpoints are a single .gguf FILE, not a directory with a
-        # config.json -- read the fields (and per-family quant bytes) from the
-        # GGUF header instead of crashing on open(model_path/'config.json').
-        if _is_gguf_model(model_path):
-            return _gguf_config_and_families(model_path)
-        with open(os.path.join(model_path, "config.json")) as f:
-            return json.load(f)
+    _load_config = staticmethod(_load_checkpoint_config)
 
     @staticmethod
     def _quant_group_size(quant_cfg: dict) -> Optional[int]:
@@ -3099,6 +3524,7 @@ def apply_auto_performance(server_args) -> None:
     # part of the cache key -- but a hand-edited profile can).
     rank_scores_gemv: Optional[List[float]] = []
     rank_names: List[str] = []
+    rank_entries: List[dict] = []
     for gid in server_args.rank_gpu_id:
         entry = profile["gpus"].get(uuid_by_idx.get(gid, ""), None)
         if entry is None:
@@ -3107,7 +3533,7 @@ def apply_auto_performance(server_args) -> None:
             )
             emit()
             return
-        rank_scores_gemm.append(entry["gemm_tflops"])
+        rank_entries.append(entry)
         rank_scores_bw.append(entry["membw_gbs"])
         gemv = entry.get("membw_gemv_gbs")
         if gemv is None:
@@ -3115,6 +3541,20 @@ def apply_auto_performance(server_args) -> None:
         elif rank_scores_gemv is not None:
             rank_scores_gemv.append(float(gemv))
         rank_names.append(entry["name"])
+
+    # Compute score per rank, in the checkpoint's OWN weight format. The
+    # prefill objective is a compute RATIO between ranks, and the ratio the
+    # dense bf16 probe reports is not the ratio a quantized checkpoint runs at
+    # -- on the reference rig, 3.79 in bf16 against 8.64 for the same two
+    # cards on the fp8 checkpoint they actually serve (#296).
+    quant_fmt, quant_desc = checkpoint_compute_format(server_args.model_path)
+    rank_scores_gemm, rank_gemm_lanes, gemm_warnings = rank_gemm_scores(
+        rank_entries, quant_fmt
+    )
+    lines.append(f"checkpoint weight format: {quant_desc}")
+    for w in gemm_warnings:
+        logger.warning("auto-performance: %s", w)
+        lines.append("WARNING: " + w)
     for r in range(server_args.tp_size):
         gemv_txt = (
             f", decode GEMV {rank_scores_gemv[r]:.0f} GB/s"
@@ -3123,7 +3563,7 @@ def apply_auto_performance(server_args) -> None:
         )
         lines.append(
             f"rank {r} -> GPU {server_args.rank_gpu_id[r]} ({rank_names[r]}): "
-            f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS, "
+            f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS [{rank_gemm_lanes[r]}], "
             f"membw {rank_scores_bw[r]:.0f} GB/s{gemv_txt}"
         )
     links = profile.get("links") or {}

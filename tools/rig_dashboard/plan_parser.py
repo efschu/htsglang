@@ -103,8 +103,12 @@ def parse_plan_lines(lines) -> dict:
                 }
             continue
 
+        # The GEMM figure carries the LANE it was measured in from #298a
+        # ("[fp8 native (_scaled_mm)]"); older logs have no bracket, so the
+        # group is optional and the dashboard keeps parsing both.
         m = re.match(
-            r"rank (\d+) -> GPU (\d+) \(([^)]+)\): GEMM ([\d.]+) TFLOPS, membw ([\d.]+) GB/s",
+            r"rank (\d+) -> GPU (\d+) \(([^)]+)\): GEMM ([\d.]+) TFLOPS"
+            r"(?: \[(.+?)\])?, membw ([\d.]+) GB/s",
             body,
         )
         if m:
@@ -114,7 +118,8 @@ def parse_plan_lines(lines) -> dict:
                     "gpu_index": int(m.group(2)),
                     "name": m.group(3),
                     "gemm_tflops": float(m.group(4)),
-                    "membw_gbs": float(m.group(5)),
+                    "gemm_lane": m.group(5),
+                    "membw_gbs": float(m.group(6)),
                 }
             )
             continue
