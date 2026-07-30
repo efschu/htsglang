@@ -12856,6 +12856,10 @@ bewegen. **Unveraendertes Verhalten belegt.**
 
 ### 3. Solo-Placement-Paar fuer die bs=1-DFLASH-Frage (#285-Vorbehalt) — AUSSTEHEND
 
+> Nachgeholt in einem eigenen Fenster, siehe Abschnitt
+> "#285-Nachtrag: Solo-Placement bs=1" am Ende dieses Dokuments. Der Rest
+> dieses Abschnitts bleibt als Stand von Fenster 3 stehen.
+
 **Nicht gemessen. Kein Teilergebnis, keine Zahl.** Der Posten steht in der
 Prioritaetsreihenfolge hinten und wurde nach der Abbruchordnung fallen
 gelassen: Posten 2 kostete drei Boots statt einem (zwei davon an der
@@ -13159,3 +13163,183 @@ diesem Fenster gibt es kein solches Segment mehr.
 4. **#290 ist auf der GPU bestaetigt, zweifach.** Bootfrei durch den
    Kernel-Check (1,71 GiB gepackt, alle vier Modulklassen innerhalb 0,0074
    relativem Fehler) und im Serving durch s04 (Accept 2,95-9,60 statt 1,00).
+
+## #285-Nachtrag: Solo-Placement bs=1
+
+Der aus Fenster 3 gefallene Posten 3, nachgeholt in einem eigenen Fenster
+(2026-07-30, 21:19-21:38Z). Rohdaten:
+`/spinning/gpu-battery-results/2026-07-30_solo_paar/`.
+
+**Die Frage.** Unter `split` verliert DFLASH bei bs=1 −29 bis −40 % ms/Verify
+gegen NEXTN. Die naheliegende Erklaerung war das Placement selbst: DFLASHs
+grosser Drafter wird ueber drei Karten geschert und zahlt je Draft-Runde
+TP-Kollektive, waehrend der winzige NEXTN-Kopf davon kaum getroffen wird.
+Traegt diese Erklaerung, muss der Rueckstand unter
+`--speculative-draft-placement solo` deutlich schrumpfen.
+
+### Aufbau
+
+Vier Boots, alle mit `--speculative-draft-placement solo` (im Serverlog aller
+vier Arme belegt), bs=1, alle drei Inhaltsklassen. Rezept sonst byteweise das
+des `split`-Fensters aus `2026-07-30_dflash_structured/s16_full.sh`: gleiches
+Ziel (Qwen3.6-27B-FP8), `--rank-mlp-ratio` auf den Anker 63,37,36 gepinnt,
+Reserve 3000,2700,2700, Kontext 16384, `max-running-requests` 8,
+`decode-log-interval` 1. Ein gueltiges v3-Profil lag im Cache (nach dem
+#303-Fix, geprueft); der Pin wurde trotzdem gesetzt, weil er das
+`split`-Fenster reproduziert und die Sonde ohnehin umgeht.
+
+Der DFLASH-Arm war zugleich der Kalibrierboot: sein eigener realisierter Pool
+ist der Pin der drei NEXTN-Arme. Er kam auf **164040** — exakt der Wert des
+`split`-Fensters, weil die Hybrid-Mamba-Deckelung (251264 -> 164040) und nicht
+das Placement die Kapazitaet bindet. Pool-Spread ueber alle vier Arme 0,07 %.
+Das spart den separaten Kalibrierboot, den die Fenster-3-Notiz noch
+eingeplant hatte.
+
+Zwei bewusste Abweichungen, auf **beiden** Armen identisch, damit die
+Denkblock-Falle nicht wieder alle Code- und JSON-Zellen frisst:
+`S16_MIN_MAX_NEW_TOKENS=768` (Boden, nie Deckel) und Fenster 32 s statt 14 s,
+weil die laengeren Anfragen sonst zu zweit in ein 14-s-Fenster passen.
+ms/Verify ist eine Rate je Tick, die Fensterlaenge kauft nur Stichprobe.
+Die Massnahme wirkt: **11 von 12 Punkten zaehlen** (im `split`-Fenster waren
+es bei bs=1 drei von zwoelf).
+
+### Boden (A-vs-A, dieselbe NEXTN-solo-Rezeptur zweimal)
+
+| Klasse | ms/Verify | tick tok/s | Accept (tick) | Accept (meta_info) | gueltiger Anteil |
+|---|---|---|---|---|---|
+| code_completion | 2,24 % | 2,24 % | 0,00 % | 0,00 % | 0,00 % |
+| json_schema | 0,74 % | 0,74 % | 0,00 % | 0,18 % | 4,08 % |
+| list_table | 0,74 % | 0,74 % | 0,00 % | 0,00 % | 0,00 % |
+
+Abgeleitetes Tor: **ms/Verify 2,24 %**. Enger als der Boden des
+`split`-Fensters (2,99 %), gemessen in diesem Fenster und nicht geliehen.
+
+### Die Zahlen, solo, bs=1
+
+| Klasse | NEXTN ms/V | DFLASH ms/V | Delta | NEXTN tok/s | DFLASH tok/s | NEXTN Accept | DFLASH Accept |
+|---|---|---|---|---|---|---|---|
+| code_completion | 34,08 | 43,90 \* | −28,8 % \* | 117,37 | 91,12 \* | 3,03 | 4,71 \* |
+| json_schema | 33,09 | 44,14 | **−33,4 %** | 120,87 | 90,62 | 3,42 | 5,60 |
+| list_table | 34,23 | 43,99 | **−28,5 %** | 116,85 | 68,19 | 3,28 | 4,41 |
+
+Accept = `meta_info`, gepoolt. \* Der DFLASH-Punkt `code_completion` zaehlt
+nicht: gueltiger Anteil 0,71 < 0,75 (ein Python- und ein Bash-Syntaxfehler bei
+sieben Anfragen im Fenster). Er steht hier als Rohbeobachtung, nicht als
+Befund — die drei NEXTN-Arme derselben Klasse kamen auf 0,75 und zaehlen.
+
+### Vergleich gegen `split`, dieselbe Klasse, dieselbe Batchgroesse
+
+| Klasse | split NEXTN | split DFLASH | split Delta | solo Delta |
+|---|---|---|---|---|
+| code_completion | 33,97 | 43,97 † | −29,4 % † | −28,8 % \* |
+| json_schema | 32,68 | 44,65 † | −36,6 % † | −33,4 % |
+| list_table | 32,05 | 44,93 | **−40,2 %** | **−28,5 %** |
+
+† Im `split`-Fenster fielen die Code- und JSON-Zellen bei bs=1 durch den
+Validator (Denkblock-Falle); nur `list_table` zaehlte dort. Die
+`split`-Deltas dieser beiden Zeilen sind Rohbeobachtungen aus denselben
+Rohdaten, keine gezaehlten Punkte.
+
+**Verdikt: das Verdikt steht.** Der Rueckstand schrumpft, aber er schrumpft
+nicht deutlich und er dreht nirgends. Er liegt solo bei −28,5 bis −33,4 %
+gegen −29,4 bis −40,2 % split, in jeder Klasse um ein Vielfaches ueber dem
+2,24-%-Boden, und DFLASH gewinnt bei bs=1 keine einzige Klasse — weder in
+ms/Verify noch in tok/s.
+
+### Warum er schrumpft, ist nicht, warum man dachte
+
+Die Erklaerung, die den Nachtrag ausgeloest hat, traegt nicht. Zerlegt man die
+Bewegung in die beiden Arme statt in die Differenz:
+
+| Arm | Klasse | split | solo | Aenderung |
+|---|---|---|---|---|
+| DFLASH | code_completion | 43,97 | 43,90 | −0,2 % |
+| DFLASH | json_schema | 44,65 | 44,14 | −1,1 % |
+| DFLASH | list_table | 44,93 | 43,99 | −2,1 % |
+| NEXTN | code_completion | 33,97 | 34,08 | +0,3 % |
+| NEXTN | json_schema | 32,68 | 33,09 | +1,3 % |
+| NEXTN | list_table | 32,05 | 34,23 | +6,8 % |
+
+**DFLASH gewinnt durch solo nichts, was ueber dem Boden liegt.** Alle drei
+Aenderungen des DFLASH-Arms sind ≤ 2,24 %. Der Drafter hoert auf, ueber drei
+Karten geschert zu werden, laeuft unzerteilt auf der 5090 und spart alle
+Draft-Kollektive — und die Verify-Runde kostet danach dasselbe. Damit ist die
+Hypothese falsifiziert: was DFLASH bei bs=1 kostet, sind nicht die
+TP-Kollektive des Drafters. Sie kann es strukturell auch kaum sein, denn
+DFLASH faehrt `num_steps=1` mit Blockgroesse 16, also **eine** Draft-Vorwaerts
+je Runde und nicht sechzehn; die Kollektive, die solo entfallen, waren nie die
+Mehrzahl.
+
+Der Grossteil der Verschiebung von −40,2 auf −28,5 % steckt im NEXTN-Arm, und
+davon wiederum in genau einer Zelle: `list_table` unter split ist der einzige
+NEXTN-Punkt beider Fenster mit Accept 3,0 statt 4,0 (tick), tok/s 93,61 statt
+der sonst durchgehenden 117-124. Die −40,2-%-Schlagzeile des `split`-Fensters
+ruht auf dieser einen untypischen Zelle. Ueber alle drei Klassen gemittelt
+bewegt sich der Rueckstand von rund −35 % auf rund −30 % — eine Bewegung in
+der Groessenordnung des Klassenspreads, kein Regimewechsel.
+
+### Was DFLASH solo trotzdem kann
+
+Die Accept-Laenge ist real und deutlich besser: +55 % (code, ungezaehlt),
++64 % (json), +35 % (list) gegen NEXTN, bei einem Accept-Boden von 0,18 %.
+DFLASH nimmt je Runde spuerbar mehr Token an. Die Runde ist nur so viel
+teurer (44 gegen 33 ms), dass der Vorteil bei bs=1 vollstaendig aufgezehrt
+wird. Das ist derselbe Befund wie unter split, jetzt auf drei statt einer
+Klasse belegt und mit einem engeren Boden.
+
+### Vorbehalt, der bleibt
+
+Die beiden Fenster teilen das Rezept, aber nicht den Arbeitspunkt: der
+Token-Boden 768 und das 32-s-Fenster verlaengern die Sequenzen gegenueber dem
+`split`-Lauf. Die **Deltas innerhalb** eines Fensters sind davon unberuehrt —
+beide Arme sehen denselben Arbeitspunkt. Die **absoluten** Zahlen ueber
+Fenstergrenzen hinweg tragen diesen Unterschied mit; die Tabelle "Warum er
+schrumpft" ist deshalb als Richtungsaussage zu lesen und nicht als
+Prozentwert auf zwei Stellen. Was sie sicher zeigt, ist das Vorzeichen und die
+Groessenordnung: DFLASH bewegt sich nicht, NEXTN ein wenig.
+
+### Kartenzeit und Rig-Hygiene
+
+1105 s von 1500 s Budget, vier Boots (70-90 s je Boot), keine Wiederholung,
+kein OOM, kein Abbruch. Karten nach dem Fenster auf 0 MiB, Locks und
+`gpu-arb`-Fenster freigegeben.
+
+Leistung ueber das Fenster (`power.csv`, 5-s-Takt, NVML-Reihenfolge):
+3080 #0 Median 179 W / max 290 W, 83 °C max; 5090 Median 117 W / max 333 W,
+76 °C max; 3080 #2 Median 161 W / max 260 W, 87 °C max. Spitzenbelegung
+16483 / 30021 / 15097 MiB. Die 3080er bleiben mit ~4,0 und ~5,4 GiB frei
+deutlich unter ihrer Kapazitaet — Folge des auf 164040 gepinnten Pools und des
+gepinnten MLP-Vektors, beides bewusst fuer die Vergleichbarkeit und nicht als
+Betriebspunkt.
+
+### Werkzeugbefund nebenbei
+
+`S16_MIN_MAX_NEW_TOKENS` ist eine Umgebungsvariable, die
+`s16_structured_point.py` selbst liest — aber das erzeugte
+`remote_measure.sh` reichte sie nie ueber ssh weiter. Wer sie exportierte,
+mass unveraendert den ungebodenten Arbeitspunkt, ohne dass irgendwo etwas
+protokolliert wurde. Die Weitergabe ist in
+`scripts/gpu_battery/s16_dflash_structured.sh` nachgezogen; ohne diesen Fix
+waere dieses Fenster mit derselben Denkblock-Falle heimgekommen wie das
+`split`-Fenster.
+
+### Herkunftsvermerk: `/spinning/wt-final` bewegte sich waehrend des Fensters
+
+Wie in Fenster 3 geprueft, weil es wieder passiert ist. Der Arbeitsbaum stand
+beim Fensterbeginn (21:19:23Z) auf `461cf8d40c`, waehrend der Messungen liefen
+dort zwei Commits ein: `20a52751c9` (Merge `probe/303-beleg`, 21:22:16Z) und
+`04a1c98433` (Doku, 21:32:29Z). Der erste faellt zwischen den DFLASH-Arm und
+die drei NEXTN-Arme.
+
+`git diff --name-only 461cf8d40c..04a1c98433` ergibt **zwei Dateien**:
+`FEATURES_VS_UPSTREAM.md` und `docs/dev/INTEGRATION_R3_VALIDATION.md`. Kein
+Laufzeitpfad (`speculative/`, `managers/`, `distributed/`, `model_executor/`,
+`layers/`, `server_args.py`) und kein Batteriepfad (`scripts/gpu_battery/`)
+ist angefasst worden. Der DFLASH-Arm hat seine Importe vor `20a52751c9`
+gezogen, die NEXTN-Arme danach — bei einem reinen Doku-Delta ohne Wirkung.
+Die Zahlen oben stehen.
+
+Folge fuer die Zusammenfuehrung: dieser Bericht haengt an der Fassung des
+Dokuments von `461cf8d40c`. Beim Merge von `probe/solo-paar` ist das ein
+reiner Anhang-Konflikt in `INTEGRATION_R3_VALIDATION.md`, beide Abschnitte
+bleiben.
