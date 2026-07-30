@@ -84,6 +84,43 @@ Was NICHT uebernommen ist und warum
   **ungeprueft**, und auf diesem Rig ist belegt, dass der L2 mit
   eingehenden PCIe-Schreibvorgaengen nicht kohaerent ist
   (``BEFUND_L2_NICHT_KOHAERENT.md``). Ohne Beleg nicht gebaut.
+
+Der Direkt-Modus und die Graph-Wiedergabe
+-----------------------------------------
+Der Direkt-Modus (``SGLANG_HTCCL_BAR1_PIPE_DIREKT``) laesst den Rechenkern
+das Ergebnis nicht in einen Schlitz legen, aus dem der Empfaenger es
+umkopiert, sondern direkt in dessen ERGEBNISPUFFER schreiben. Dieser Puffer
+liegt in der exportierten Region -- er ist ein Ringplatz, und der
+Ergebnistensor, den ``all_reduce`` zurueckgibt, ist ein ``from_blob`` genau
+darueber. Wer den Platz waehlt, bestimmt also die Adresse eines Tensors, den
+der Aufrufer in die Hand bekommt; der Platz kann deshalb NICHT im Kern
+gewuerfelt werden, sondern muss hostseitig feststehen, bevor der Kern laeuft.
+
+Genau daran hing die Graph-Faehigkeit. Ein frei laufender Ringindex wird
+beim Aufzeichnen eingebrannt, und mehrere Aufzeichnungen laufen ueber
+dieselben Plaetze -- zwei Graphen teilen sich dann einen BAR1-Platz und
+liefern beim abwechselnden Wiedergeben die Zahlen des jeweils anderen.
+
+Die Loesung sind zwei Stuecke, und sie gehoeren zusammen:
+
+1. **Besitz statt Rotation** (:func:`erg_aufteilung`). Der Ring wird
+   statisch geteilt: zwei Plaetze rotieren weiter fuer eager-Aufrufe, alles
+   darueber ist ein Vorrat, aus dem jede aufgezeichnete Aufrufstelle EINEN
+   Platz nimmt und nicht zurueckgibt. Damit kann keine zweite Aufzeichnung
+   denselben Platz bekommen.
+2. **Freigabe-Handschlag** (Flaggenfamilie 4, ``ergBereit``). Ein
+   reservierter Platz wird bei JEDER Wiedergabe neu beschrieben; der
+   Abstand, den der eager-Ring mit seinen zwei Plaetzen von selbst
+   herstellt, ist damit weg. Jeder Rang veroeffentlicht deshalb beim
+   Betreten eines Direkt-Aufrufs seine **Generation** -- "mein
+   Ergebnisplatz ist frei" -- und wer in einen fremden Ergebnisplatz
+   schreiben will, wartet darauf. Der Generationszaehler liegt im LOKALEN
+   VRAM und wird vom KERN fortgeschrieben, nicht vom Host: bei einer
+   Wiedergabe laeuft kein Hostcode, ein hostseitiger Zaehler stuende still.
+
+Beides ist aus, solange ``SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH`` nicht
+gesetzt ist. Der Kern faehrt dann Byte fuer Byte den gemessenen Weg und
+fasst die Flaggenfamilie 4 nirgends an.
 """
 
 from __future__ import annotations
@@ -127,9 +164,9 @@ MAX_TIEFE = 8
 
 
 def pipe_flaggen_zusatz(welt: int) -> int:
-    """Zusaetzliche Flaggenbytes fuer ``netz_pipe``: ``4 * R * 256``.
+    """Zusaetzliche Flaggenbytes fuer ``netz_pipe``: ``5 * R * 256``.
 
-    Vier Familien zu je einer 256-Byte-Zeile je Rang:
+    Fuenf Familien zu je einer 256-Byte-Zeile je Rang:
 
     ==== ================= ============================================
     Fam. Name              geschrieben von / gelesen von
@@ -138,7 +175,14 @@ def pipe_flaggen_zusatz(welt: int) -> int:
     1    ``tailAG``        Erzeuger des AG-Chunks / dessen Empfaenger
     2    ``headRS``        Verbraucher des RS-Chunks / dessen Erzeuger
     3    ``headAG``        Verbraucher des AG-Chunks / dessen Erzeuger
+    4    ``ergBereit``     jeder Rang beim Betreten eines Direkt-Aufrufs /
+                           jeder, der in dessen Ergebnispuffer schreibt
     ==== ================= ============================================
+
+    Familie 4 ist der Freigabe-Handschlag des graphfesten Direkt-Modus
+    (:data:`ERG_EAGER_PLAETZE`). Sie liegt HINTER den vier alten Zeilen,
+    also bleibt jeder bestehende Zeilenversatz Byte fuer Byte, was er war;
+    ohne Direkt-Modus wird sie nie beschrieben und nie gelesen.
 
     **Unabhaengig von K und T.** Das ist der eigentliche Gewinn des
     Schiebefensters gegenueber "eine Flagge je (Chunk, Sender)": dort waere
@@ -148,7 +192,14 @@ def pipe_flaggen_zusatz(welt: int) -> int:
     256 Byte je Zeile, wie ueberall in diesem Transport: kein False Sharing
     zwischen Sendern, keins zwischen Familien.
     """
-    return 4 * welt * 256
+    return 5 * welt * 256
+
+
+#: Familienindex von ``ergBereit`` in der Pipe-Flaggenregion. Als Konstante,
+#: weil Kern und Hostseite dieselbe Zahl brauchen und eine zweite Fassung
+#: genau die Stelle waere, an der Sender und Empfaenger auf verschiedene
+#: Zeilen zeigen.
+ERG_BEREIT_FAMILIE = 4
 
 
 def pipe_fbasis(welt: int, mit_a2a: bool = True) -> int:
@@ -200,6 +251,82 @@ SEITE = 4096
 #: Runde ``n`` nicht in den Puffer schreibt, den der Aufrufer aus Runde
 #: ``n-1`` noch in der Hand haelt.
 ERG_RING_VORGABE = 2
+
+#: Wieviele Ringplaetze der eager-Weg behaelt, wenn der graphfeste
+#: Direkt-Modus eingeschaltet ist. Genau zwei -- die Herleitung dafuer steht
+#: bei :func:`erg_aufteilung`, und sie ist dieselbe, aus der
+#: :data:`ERG_RING_VORGABE` zwei ist.
+ERG_EAGER_PLAETZE = 2
+
+
+def erg_aufteilung(ring: int, graphfest: bool) -> tuple[int, int]:
+    """``(eager_plaetze, graph_plaetze)`` fuer einen Ring der Groesse ``ring``.
+
+    Reine Arithmetik, damit sie ohne Karte pruefbar ist. Sie ist die
+    Besitzordnung des Ergebnisrings, und sie steht hier statt verstreut im
+    Transport, weil ein Platz, ueber dessen Eigentuemer zwei Stellen
+    verschieden denken, zu vertauschten Ergebnissen ohne Absturz fuehrt.
+
+    **Ohne** ``graphfest`` (Vorgabe) gehoert der GANZE Ring dem eager-Weg und
+    rotiert wie bisher -- Byte fuer Byte das gemessene Verhalten.
+
+    **Mit** ``graphfest`` wird der Ring statisch geteilt:
+
+    * die ersten :data:`ERG_EAGER_PLAETZE` Plaetze rotieren weiter fuer
+      eager-Aufrufe,
+    * alle darueber liegenden Plaetze sind ein Vorrat, aus dem eine
+      Graph-Aufzeichnung je Aufrufstelle EINEN Platz nimmt und ihn nicht
+      mehr zurueckgibt.
+
+    **Statisch und nicht mitwachsend**, und das ist der Punkt: haette der
+    Vorrat sich aus dem oberen Ende des eager-Bereichs bedient, sobald eine
+    Aufzeichnung laeuft, koennte er einen Platz greifen, dessen eager-Tensor
+    der Aufrufer noch haelt. Die Grenze steht deshalb fest, bevor der erste
+    Aufruf laeuft.
+
+    Reicht der Ring nicht fuer beides, gibt es **null** Graph-Plaetze --
+    nicht etwa einen eager-Platz weniger. Der Aufrufer meldet das laut und
+    faehrt den ``direkt=0``-Weg; ein eager-Ring unter zwei Plaetzen waere
+    der Fehler, den :data:`ERG_RING_VORGABE` gerade verhindert.
+    """
+    ring = max(0, int(ring))
+    if not graphfest:
+        return ring, 0
+    if ring <= ERG_EAGER_PLAETZE:
+        return ring, 0
+    return ERG_EAGER_PLAETZE, ring - ERG_EAGER_PLAETZE
+
+
+def erg_eager_platz(voriger: int, eager_plaetze: int) -> int:
+    """Der naechste eager-Ringplatz nach ``voriger``.
+
+    Ausgelagert, damit die Monotonie- und Modulo-Zusage ohne Karte geprueft
+    werden kann. ``voriger = -1`` ist der Anfangszustand.
+    """
+    if eager_plaetze <= 0:
+        raise ValueError("eager-Ring ohne Plaetze")
+    return (int(voriger) + 1) % int(eager_plaetze)
+
+
+def erg_graph_platz(vergeben: int, eager_plaetze: int,
+                    graph_plaetze: int) -> Optional[int]:
+    """Der ``vergeben``-te Graph-Platz, oder ``None`` wenn der Vorrat leer ist.
+
+    Die Graph-Plaetze liegen HINTER den eager-Plaetzen und werden
+    aufsteigend vergeben. Ein einmal vergebener Platz wird nie wieder
+    ausgegeben: welcher aufgezeichnete Graph noch lebt, ist von hier aus
+    nicht feststellbar, und ein zweimal vergebener Platz waere genau der
+    Fehler, den der graphfeste Modus beseitigen soll -- zwei Aufzeichnungen,
+    die sich einen BAR1-Platz teilen und beim abwechselnden Wiedergeben die
+    Zahlen des jeweils anderen liefern.
+
+    ``None`` heisst: dieser Aufruf faehrt ``direkt=0``. Das ist kein stiller
+    Rueckfall -- der Aufrufer meldet ihn -- und es ist korrekt, weil
+    ``direkt=0`` derselbe gemessene Kontrollpfad ist.
+    """
+    if int(vergeben) >= int(graph_plaetze):
+        return None
+    return int(eager_plaetze) + int(vergeben)
 
 
 def erg_stride_bytes(max_bytes: int) -> int:
@@ -518,6 +645,13 @@ struct PipeArgs {
     uint4       *out;
     u64         *rundeDev;
     u64         *schrittDev;   // absoluter Chunkzaehler, ueberlebt den Aufruf
+    // Generationszaehler des Direkt-Modus. LOKALER VRAM, nicht im Fenster:
+    // ein lokaler Zaehler ist mit den eigenen Lesevorgaengen kohaerent, und
+    // nur die Peer-SICHT auf ihn braucht das Flaggenprotokoll. Er liegt auf
+    // dem GERAET, weil er bei jeder Graph-Wiedergabe weiterzaehlen muss --
+    // ein hostseitiger Zaehler wird beim Aufzeichnen eingebrannt und steht
+    // bei der Wiedergabe still.
+    u64         *ergGenDev;
     unsigned int *ctlStatus;
     unsigned int *abbruchDev;
     int          n4;
@@ -532,6 +666,12 @@ struct PipeArgs {
     u64          deckelZyklen;
 
     int          direkt;       // 1 = Allgather schreibt in den Ergebnispuffer
+    // Freigabe-Handschlag des Direkt-Modus. 0 = aus (das gemessene
+    // Altverhalten, Flaggenfamilie 4 wird nie angefasst). > 0 = an, und die
+    // Zahl ist der ABSTAND IN GENERATIONEN, nach dem ein Ergebnisplatz
+    // wiederverwendet wird: 1 fuer einen fest reservierten Graph-Platz,
+    // sonst die Zahl der eager-Ringplaetze.
+    int          ergSlack;
 
     // Nutzlastschlitze, Klasse 0. Klasse t liegt bei + t*klasse4.
     uint4       *sendRS[HTCCL_PIPE_MAX_RANKS];
@@ -550,6 +690,11 @@ struct PipeArgs {
     const u64   *tailVon[2][HTCCL_PIPE_MAX_RANKS];  // lokal, von Sender s
     u64         *headAn [2][HTCCL_PIPE_MAX_RANKS];  // ich -> Erzeuger s
     const u64   *headVon[2][HTCCL_PIPE_MAX_RANKS];  // lokal, von Empfaenger z
+
+    // Freigabe des Ergebnisplatzes (Flaggenfamilie 4). Dieselbe Richtung wie
+    // tail/head: geschrieben wird beim Peer, gelesen wird lokal.
+    u64         *ergBereitAn [HTCCL_PIPE_MAX_RANKS]; // ich -> Peer z
+    const u64   *ergBereitVon[HTCCL_PIPE_MAX_RANKS]; // lokal, von Peer z
 };
 
 // ===========================================================================
@@ -568,6 +713,15 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     const int  n4 = A.n4, R = A.R, r = A.rang, K = A.K, TT = A.TT, PP = A.PP;
     const u64  runde  = *(const volatile u64 *)A.rundeDev + 1ull;
     const u64  basis  = *(const volatile u64 *)A.schrittDev;
+    // Der Handschlag laeuft nur, wenn beides zusammenkommt: Direkt-Modus UND
+    // ein Slack-Wert. Beides ist gruppeneinheitlich, also treten entweder
+    // alle Raenge in den Handschlag ein oder keiner -- ein Rang, der ihn
+    // ausliesse, waehrend die anderen auf seine Flagge warten, waere ein
+    // Haenger und kein falsches Ergebnis.
+    const bool ergHand = (A.direkt != 0) && (A.ergSlack > 0);
+    const u64  ergGen  = ergHand
+                             ? (*(const volatile u64 *)A.ergGenDev + 1ull)
+                             : 0ull;
 
     // Alles, was mit LAUFENDEM Index indiziert wird, in den gemeinsamen
     // Speicher. Ein dynamisch indiziertes Feld der Argumentstruktur zwingt
@@ -587,6 +741,9 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     __shared__ const u64   *sHeadVon[2][HTCCL_PIPE_MAX_RANKS];
     __shared__ u64          sTailC[2][HTCCL_PIPE_MAX_RANKS];
     __shared__ u64          sHeadC[2][HTCCL_PIPE_MAX_RANKS];
+    __shared__ u64         *sBereitAn [HTCCL_PIPE_MAX_RANKS];
+    __shared__ const u64   *sBereitVon[HTCCL_PIPE_MAX_RANKS];
+    __shared__ u64          sBereitC  [HTCCL_PIPE_MAX_RANKS];
     __shared__ int          abbruchS;
 
     if (threadIdx.x == 0) {
@@ -607,6 +764,14 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                 sTailC[ph][i] = basis;
                 sHeadC[ph][i] = basis;
             }
+            sBereitAn [i] = A.ergBereitAn [i];
+            sBereitVon[i] = A.ergBereitVon[i];
+            // Anfangswert 0 und NICHT `ergGen - 1`: der optimistische
+            // Anfangswert waere genau die Annahme, die der Handschlag
+            // pruefen soll. Es kostet EINE lokale Leseoperation je Peer und
+            // je Aufruf -- die Zeile liegt im eigenen VRAM, nicht hinter
+            // PCIe.
+            sBereitC  [i] = 0ull;
         }
         abbruchS = 0;
     }
@@ -615,6 +780,23 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     if (GRID == K_GITTER && erster) {
         *(volatile unsigned int *)A.abbruchDev = 0u;
         __threadfence();
+    }
+
+    // -- Freigabe veroeffentlichen, so frueh wie moeglich -------------------
+    //
+    // "Ich bin in Generation g eingetreten." Weil dieser Kern auf demselben
+    // Strom liegt wie alles, was das Ergebnis der Generation g-1 gelesen
+    // hat, sagt das Eintreten zugleich: mein Ergebnisplatz ist frei. Der
+    // Peer darf ab jetzt hineinschreiben.
+    //
+    // Vor der Sperre und vor der Schleife, damit die PCIe-Laufzeit (rund
+    // 3 us, BEFUND_L2_UMGEHBAR.md) hinter der Reduce-Scatter-Phase
+    // verschwindet. Gewartet wird erst, wenn der erste Direktschreibvorgang
+    // ansteht -- also PP-1 Schleifenrunden spaeter.
+    if (ergHand && erster) {
+        for (int z = 0; z < R; ++z)
+            if (z != r) schreibeU64(sBereitAn[z], ergGen);
+        __threadfence_system();
     }
     barriere<GRID>();
 
@@ -667,6 +849,47 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             }                                                                  \
         }                                                                      \
     } while (0)
+
+    // Der Peer z hat seinen Ergebnisplatz fuer Generation ZIEL freigegeben.
+    //
+    // Der Platz wird alle ``ergSlack`` Generationen wiederverwendet; wer in
+    // Generation ZIEL hineinschreibt, ueberschreibt also den Inhalt der
+    // Generation ``ZIEL - ergSlack``. Freigegeben ist der, sobald z in
+    // Generation ``ZIEL - ergSlack + 1`` eingetreten ist. Dieselbe
+    // unsigned-sichere Form wie bei PIPE_WARTE_FENSTER: der Slack steht auf
+    // der LINKEN Seite, damit ZIEL < ergSlack nicht unterlaeuft.
+    //
+    // Warum es diese Bedingung ueberhaupt braucht und die AG-Quittung nicht
+    // reicht: bei ``ergSlack >= 2`` folgt sie aus dem AG-Fenster (der
+    // Vorgaenger liegt zwei Aufrufe zurueck, und schon EIN Aufruf Abstand
+    // ist durch tail/head erzwungen). Bei einem fest reservierten
+    // Graph-Platz ist ``ergSlack == 1``: derselbe Platz wird bei JEDER
+    // Wiedergabe neu beschrieben, und dann gibt es keinen Abstand mehr, den
+    // das AG-Fenster erzwingen koennte.
+#define PIPE_WARTE_ERGFREI(ZIEL)                                               \
+    do {                                                                       \
+        const u64 _z = (ZIEL);                                                 \
+        const u64 _sl = (u64)(A.ergSlack - 1);                                 \
+        long long _t0 = clock64();                                             \
+        for (;;) {                                                             \
+            bool _alle = true;                                                 \
+            for (int _q = 0; _q < R; ++_q) {                                   \
+                if (_q == r) continue;                                         \
+                if (sBereitC[_q] + _sl < _z) {                                 \
+                    sBereitC[_q] = flaggeLesen<LA>(sBereitVon[_q]);            \
+                    if (sBereitC[_q] + _sl < _z) { _alle = false; break; }     \
+                }                                                              \
+            }                                                                  \
+            if (_alle) break;                                                  \
+            if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
+        }                                                                      \
+    } while (0)
+
+    // Einmal je Aufruf, nicht je Schleifenrunde: die Bedingung haengt an der
+    // Generation, und die aendert sich innerhalb eines Aufrufs nicht. Nur
+    // Thread 0 wertet sie aus, also genuegt eine gewoehnliche lokale
+    // Variable.
+    bool ergFreiGesehen = !ergHand;
 
     // -- Schleife -----------------------------------------------------------
     //
@@ -728,6 +951,13 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             if (!abbruchS && cr >= 0 && cr < K) {
                                     PIPE_WARTE_DATEN  (0, basis + (u64)cr + 1ull);
                 if (!abbruchS)      PIPE_WARTE_FENSTER(1, basis + (u64)cr + 1ull);
+                // Erst hier, unmittelbar vor dem ersten Direktschreibvorgang
+                // dieses Aufrufs -- die Reduce-Scatter-Runden davor haben die
+                // Flaggen der Peers bereits ueber die Leitung gebracht.
+                if (!abbruchS && !ergFreiGesehen) {
+                    PIPE_WARTE_ERGFREI(ergGen);
+                    ergFreiGesehen = true;
+                }
             }
             if (!abbruchS && cg >= 0) PIPE_WARTE_DATEN(1, basis + (u64)cg + 1ull);
             if (abbruchS && GRID == K_GITTER) {
@@ -748,6 +978,13 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                     *A.ctlStatus = 1u;
                     *(volatile u64 *)A.rundeDev   = runde;
                     *(volatile u64 *)A.schrittDev = basis + (u64)K;
+                    // AUCH im Abbruchfall. Der Generationszaehler muss
+                    // gruppeneinheitlich bleiben; ein Rang, der ihn beim
+                    // Abbruch stehen liesse, waehrend ein anderer ihn
+                    // weiterzaehlt, wartete beim naechsten Aufruf auf eine
+                    // Generation, die nie kommt. Dieselbe Ueberlegung wie
+                    // bei rundeDev und schrittDev direkt darueber.
+                    if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
                     __threadfence_system();
                 }
                 return;
@@ -897,10 +1134,12 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     if (erster) {
         *(volatile u64 *)A.rundeDev   = runde;
         *(volatile u64 *)A.schrittDev = basis + (u64)K;
+        if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
         __threadfence_system();
     }
 #undef PIPE_WARTE_DATEN
 #undef PIPE_WARTE_FENSTER
+#undef PIPE_WARTE_ERGFREI
 }
 
 // ===========================================================================
@@ -990,9 +1229,9 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     int64_t eigen_nutz, int64_t eigen_flag,
                     int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
                     int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
-                    int64_t quittung, int64_t direkt,
+                    int64_t quittung, int64_t direkt, int64_t erg_slack,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
-                    at::Tensor ctl_dev,
+                    at::Tensor erg_gen_dev, at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
                     int64_t ladeform)
 {
@@ -1081,6 +1320,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     A.PP           = PP;
     A.quittung     = (int)quittung;
     A.direkt       = (int)direkt;
+    A.ergSlack     = (int)erg_slack;
     A.deckelZyklen = (u64)deckel_zyklen;
     A.schlitz4     = (long long)(schlitz / 16);
     A.klasse4      = (long long)(R - 1) * A.schlitz4;
@@ -1146,6 +1386,35 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
         }
     }
 
+    // Familie 4: der Freigabe-Handschlag. Nur eingerichtet, wenn er auch
+    // laeuft -- ohne ihn bleiben die Zeiger null und der Kern fasst die
+    // Familie nirgends an, also ist der Weg Byte fuer Byte der gemessene.
+    TORCH_CHECK(erg_slack >= 0,
+                "htccl-bar1 pipe: erg_slack ", erg_slack, " ist negativ");
+    if (direkt && erg_slack > 0) {
+        TORCH_CHECK(erg_gen_dev.scalar_type() == at::kLong &&
+                    erg_gen_dev.numel() >= 1,
+                    "htccl-bar1 pipe: erg_gen_dev muss ein int64-Tensor mit "
+                    "mindestens einem Element sein");
+        A.ergGenDev = (u64 *)erg_gen_dev.data_ptr();
+        for (int q = 0; q < R; ++q) {
+            if (q == r) continue;
+            char *pf = (char *)(uintptr_t)peer_flag[q] + fbasis_pipe;
+            char *ef = (char *)(uintptr_t)eigen_flag   + fbasis_pipe;
+            A.ergBereitAn [q] = (u64 *)(pf + (size_t)(4 * R + r) * 256u);
+            A.ergBereitVon[q] = (const u64 *)(ef + (size_t)(4 * R + q) * 256u);
+        }
+    } else {
+        // Ohne Direkt-Modus ist ein Slack sinnlos, und ein sinnloser Wert,
+        // der stillschweigend ignoriert wird, ist die Stelle, an der jemand
+        // spaeter Wirkung vermutet, wo keine ist.
+        TORCH_CHECK(erg_slack == 0 || direkt,
+                    "htccl-bar1 pipe: erg_slack ", erg_slack,
+                    " ohne Direkt-Modus -- der Handschlag schuetzt einen "
+                    "Ergebnisplatz, den es in diesem Aufruf nicht gibt");
+        A.ergSlack = 0;
+    }
+
     auto strom = at::cuda::getCurrentCUDAStream().stream();
     // Das Gitter wird nach dem GROESSTEN CHUNK bemessen, nicht nach der
     // ganzen Nutzlast: mehr Bloecke als ein Chunk Arbeit hat, warten nur an
@@ -1181,9 +1450,9 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     int64_t eigen_nutz, int64_t eigen_flag,
                     int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
                     int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
-                    int64_t quittung, int64_t direkt,
+                    int64_t quittung, int64_t direkt, int64_t erg_slack,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
-                    at::Tensor ctl_dev,
+                    at::Tensor erg_gen_dev, at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
                     int64_t ladeform);
 """

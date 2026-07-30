@@ -10378,3 +10378,351 @@ Logs gezogen:
 
 Accept liegt in beiden Armen bei 2,4-2,9 bei k=3 — NEXTN lief, und die
 Decode-Zahlen sind mit Spekulation gemessen, nicht ohne.
+
+## BAR1-Direktmodus graphfest (#292) (feat/bar1-direct-graph, Basis 46b1eedd66) — 2026-07-30
+
+Der Direktmodus der Pipe (`SGLANG_HTCCL_BAR1_PIPE_DIREKT`) laesst sich jetzt
+aufzeichnen. **Diese Phase war CPU-only** (`CUDA_VISIBLE_DEVICES=99` in jedem
+Lauf, auch in der nvcc-Extraktion); die Karten hat kein Kommando angefasst.
+Was eine Karte noch beweisen muss, steht unten als Kommandoliste.
+
+### Ist-Befund: wie der Direktmodus wirklich funktioniert
+
+Die Auftragsbeschreibung nahm an, der Fensterschlitz werde hostseitig
+durchgezaehlt und als Kernelargument uebergeben. Das stimmt — aber es ist
+**nicht** der Schlitzring der Nutzlast. Der ist laengst geraeteresident:
+`schrittDev` ist ein absoluter Chunkzaehler im lokalen VRAM, der Kern rechnet
+seine Schlitzklasse selbst als `(basis + c) mod T`, und `basis` liest er beim
+Start vom Geraet. Dieser Teil war nie das Problem.
+
+Hostseitig durchgezaehlt wird der **Ergebnisring**: `_erg_platz` waehlt je
+Aufruf `i = (i+1) % L`, baut daraus einen Zeiger und gibt ihn als
+`peer_erg`-Tabelle in den Kern. Und dieser Zaehler ist aus einem Grund
+hostseitig, der sich nicht wegoptimieren laesst: **der Ergebnisplatz IST der
+Ausgabetensor.** `all_reduce` arbeitet ausser Platz, der Transport bestimmt
+also, wo das Ergebnis liegt, und gibt einen `at::from_blob` ueber den
+Ringplatz zurueck. Wer den Platz waehlt, waehlt die Adresse eines Tensors,
+den der Aufrufer in die Hand bekommt. Ein Kern, der sich seinen Platz per
+Atomic selbst zieht, schriebe an eine Adresse, die der zurueckgegebene
+Tensor nicht kennt.
+
+**Damit ist der urspruengliche Entwurf — Slot-Index per geraeteresidentem
+Atomic — an dieser Stelle nicht baubar.** Die geraeteresidente Zaehlung ist
+trotzdem noetig, nur fuer etwas anderes: fuer die **Generation** im
+Freigabeprotokoll. Der Befund kam vor dem Entwurf, der Entwurf danach.
+
+### Zwei Fehlerbilder, zwei Massnahmen
+
+**P1, Adresse.** Ein frei laufender Ringindex wird beim Aufzeichnen
+eingebrannt, und mehrere Aufzeichnungen laufen ueber dieselben Plaetze
+(sglang zeichnet je Stapelgroesse eine auf). Zwei Graphen teilen sich dann
+einen BAR1-Platz und liefern beim abwechselnden Wiedergeben die Zahlen des
+jeweils anderen. Kein Absturz.
+
+Massnahme: **Besitz statt Rotation** (`erg_aufteilung`). Der Ring wird
+STATISCH geteilt — zwei Plaetze rotieren weiter eager, alles darueber ist ein
+Vorrat, aus dem jede aufgezeichnete Aufrufstelle EINEN Platz nimmt und nicht
+zurueckgibt. Statisch und nicht mitwachsend: haette sich der Vorrat bei
+laufender Aufzeichnung aus dem oberen Ende des eager-Bereichs bedient,
+koennte er einen Platz greifen, dessen eager-Tensor der Aufrufer noch haelt.
+
+Ist der Vorrat leer, faellt der Aufruf gemeldet auf `direkt=0` zurueck. Das
+ist korrekt (derselbe gemessene Kontrollpfad) und nicht still — der
+`pipe-direkt-vorrat-leer`-Fall im Graph-Beleg prueft genau diesen Rueckfall.
+
+**P2, Freigabe.** Ein reservierter Platz wird bei JEDER Wiedergabe neu
+beschrieben. Der Abstand, den der eager-Ring mit `L = 2` von selbst
+herstellt, ist damit weg — und dieser Abstand war es, der bisher die
+Sicherheit trug: bei `L = 2` liegt der Vorgaenger zwei Aufrufe zurueck,
+waehrend das AG-Fenster (`head`/`tail`) schon EINEN Aufruf Abstand zwischen
+den Raengen erzwingt. Bei einem reservierten Platz ist der Wiederverwendungs-
+abstand 1, und dann kann Rang A in den Ergebnisplatz von Rang B schreiben,
+waehrend B den Inhalt der vorigen Wiedergabe noch nicht verbraucht hat.
+
+Massnahme: **Freigabe-Handschlag**, Flaggenfamilie 4 (`ergBereit`), nach
+derselben Mechanik wie `tail`/`head` — geschrieben wird beim Peer, gelesen
+wird lokal, weil ein Lesevorgang aus einer fremden BAR ein Umlauf waere.
+Jeder Rang veroeffentlicht beim Kernelstart seine Generation ("mein
+Ergebnisplatz ist frei", und das ist eine Tatsache, kein Versprechen: auf
+demselben Strom liegt jeder Verbraucher des vorigen Ergebnisses vor diesem
+Kernelstart). Gewartet wird erst unmittelbar vor dem ersten Direktschreib-
+vorgang, also PP-1 Schleifenrunden spaeter — die PCIe-Laufzeit von rund 3 us
+(BEFUND_L2_UMGEHBAR.md) verschwindet hinter der Reduce-Scatter-Phase.
+
+Bedingung, unsigned-sicher wie bei `PIPE_WARTE_FENSTER`:
+
+    gesehen[z] + (ergSlack - 1) >= generation
+
+`ergSlack` ist der Wiederverwendungsabstand: 1 fuer einen reservierten
+Graph-Platz, sonst die Zahl der eager-Plaetze.
+
+### Warum der Zaehler geraeteresident ist
+
+Der Generationszaehler liegt in `_erg_gen_dev`, einem int64-Tensor im
+**lokalen** VRAM jedes Rangs, und wird vom **Kern** fortgeschrieben. Beide
+Eigenschaften sind erzwungen, nicht gewaehlt:
+
+* **Geraet statt Host**, weil bei einer Graph-Wiedergabe kein Hostcode
+  laeuft. Ein hostseitiger Zaehler wird beim Aufzeichnen eingebrannt und
+  steht danach still — die Wartebedingung spraeche bei jeder Wiedergabe ueber
+  dieselbe Generation und wuerde damit gegenstandslos.
+* **Lokaler VRAM statt Fenster**, weil lokale Zugriffe mit den eigenen
+  Lesevorgaengen kohaerent sind. Nur die PEER-Sicht auf den Zaehlerstand
+  braucht das Flaggenprotokoll, und die traegt Familie 4.
+
+Fortgeschrieben wird er mit einem gewoehnlichen Store aus Thread 0, nicht mit
+`atomicAdd` — es gibt genau einen Schreiber je Rang, ein Atomic haette hier
+nur Kosten und keinen Nutzen. Dieselbe Bauform wie `rundeDev` und
+`schrittDev` daneben. **Auch im Abbruchpfad** wird er fortgeschrieben: ein
+Rang, der ihn beim Zeitdeckel stehen liesse, waehrend ein anderer weiter
+zaehlt, wartete beim naechsten Aufruf auf eine Generation, die nie kommt.
+
+Gruppeneinheitlichkeit ist Voraussetzung und folgt aus SPMD — dieselbe
+Annahme, auf der `schrittDev` schon steht. Weicht sie ab, ist die Folge ein
+**Haenger** (py-spy-findbar), kein falsches Ergebnis; ein Test haelt das
+fest.
+
+### Default unveraendert
+
+`SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH` bleibt auf 0. Dann:
+
+* liefert `erg_aufteilung` den GANZEN Ring an den eager-Weg, die Rotation ist
+  Byte fuer Byte die alte,
+* uebergibt der Transport `erg_slack = 0`, der Kern setzt `ergHand = false`
+  und fasst Familie 4 nirgends an,
+* lehnt `_erg_platz` den Direktmodus unter Aufzeichnung weiter ab, mit
+  derselben einmaligen Meldung je Rang.
+
+Die Flaggenregion waechst von `4 R * 256` auf `5 R * 256` Byte — bei R=3 also
+um 768 Byte. Die neue Familie liegt HINTER den vier alten, also bleibt jeder
+bestehende Zeilenversatz Byte fuer Byte, was er war; `pipe_fbasis` und
+`fbasis_a2a` sind unberuehrt, und ein Test nagelt das fest.
+
+### Uebersetzungs- und Spill-Beleg (ohne Karte)
+
+`scripts/probe/bar1_pipe_spill.sh 86 120` — extrahiert `_CUDA_SRC` als Text,
+uebersetzt mit `nvcc -std=c++17 -cubin` und liest `cuobjdump -res-usage`.
+Ausgefuehrt wird nichts; `CUDA_VISIBLE_DEVICES=99`.
+
+| Bogen | Variante | vorher | nachher |
+|---|---|---|---|
+| sm_86 | 1blk | REG 42, **STACK 0**, SHARED 1092, CONST 1296 | REG 42/44, **STACK 0**, SHARED 1284, CONST 1432 |
+| sm_86 | gitter | REG 40/47, **STACK 0** | REG 40, **STACK 0** |
+| sm_120 | 1blk | REG 40, **STACK 0**, SHARED 2116, CONST 1840 | REG 40, **STACK 0**, SHARED 2308, CONST 1976 |
+| sm_120 | gitter | REG 40, **STACK 0** | REG **48**, **STACK 0** |
+
+**Kein Local-Memory-Spill** — das war die Frage, und sie ist mit 0 in allen
+zwoelf Instanziierungen beantwortet. Die neuen Zeigertabellen werden wie die
+bestehenden von Thread 0 in `__shared__` gelegt; SHARED waechst um genau
+192 Byte (3 Tabellen x 8 Raenge x 8 Byte), CONST um den Zuwachs des
+Parameterblocks.
+
+**Offen und ehrlich:** auf sm_120 steigt die Registerzahl der gitter-Variante
+von 40 auf 48. Das kann die Belegung druecken. Es ist kein Spill, und die
+Gitterbreite wird zur Laufzeit aus
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` bestimmt, faengt sich also
+selbst — aber ob es messbar kostet, entscheidet eine Karte, nicht diese
+Tabelle. Steht in der Kommandoliste.
+
+### Testzahlen (alle `CUDA_VISIBLE_DEVICES=99`)
+
+| Suite | Ergebnis |
+|---|---|
+| `test_htccl_bar1_pipe_direkt_graph.py` (neu) | **48 passed** |
+| `test_htccl_bar1_broadcast.py` | 54 passed |
+| `test_htccl_bar1_all_gather.py` | 31 passed |
+| `test_gpu_battery_checks_bar1.py` | 122 passed |
+| `test/registered/unit/distributed/` auf der Basis 46b1eedd66 | 16 failed, 1192 passed, 8 skipped |
+| `test/registered/unit/distributed/` mit diesem Zweig | 16 failed, **1240 passed**, 8 skipped |
+
+Die 16 Fehlschlaege sind Byte fuer Byte die vorbestehenden
+(`test_dcp_token_vector_collective` 11, `test_uneven_tp_nccl_env` 1,
+`test_vmm_utils` 4) — auf der Basis nachgemessen, nicht angenommen.
+**Kein neuer Fehlschlag**, und der Zuwachs von 1192 auf 1240 ist genau die
+neue Datei.
+
+Was die 48 Tests abdecken: die Ringaufteilung (Vorgabe = ganzer Ring eager;
+eager nie unter zwei; Summe deckt den Ring), die Schlitzarithmetik
+(Monotonie, Modulo, Wrap, Wiederverwendungsabstand = Platzzahl, Graph-Plaetze
+aufsteigend und disjunkt zu den eager-Plaetzen, leerer Vorrat), die
+Flaggenregion (fuenf Familien, Zeilen disjunkt und 256-Byte-ausgerichtet,
+`pipe_fbasis`/`fbasis_a2a` unbewegt), die Besitzordnung an der Naht
+(`_erg_platz` gibt Platz und Slack MIT dem Puffer zurueck statt als Feld —
+Regel "geteilte Puffer"), ungleiche Fenstergroessen (256-MiB-BAR gegen volles
+Fenster: mehr Ringplaetze kosten Nutzlast monoton, und der kleine Fall traegt
+einen Vorrat von 3), sowie sieben Quelltextzusicherungen am Kern.
+
+**Koexistenz mit broadcast** (Abschnitt 8 der Testdatei, nach dem Rebase auf
+46b1eedd66 dazugekommen). broadcast und der Direktmodus sind die beiden
+Nutzer dieses Fensters, die Bytes ueber Aufrufe hinweg BESITZEN, und sie tun
+es nach zwei verschiedenen Regeln: broadcast ist ein Ein-Sender-a2a und
+schreibt in die a2a-Schlitze (`off_a2a + (par*(R-1)+p) * a2a_schlitz`, geliehen
+je Runde), der Direktmodus reserviert Ergebnisplaetze (`off_erg + i*stride`)
+fuer die Lebensdauer einer Aufzeichnung und gibt sie nie zurueck. Ein
+gemeinsames Byte waere kein Absturz, sondern eine broadcast-Runde, die das
+Ergebnis ueberschreibt, das ein wiedergegebener Graph gleich zurueckgibt.
+Geprueft wird deshalb, statt es anzunehmen:
+
+* kein reservierter Platz teilt ein Byte mit einem a2a-Schlitz, ueber
+  R ∈ {2,3,4,8} × Nutzlast ∈ {16 KiB, 512 KiB, 8 MiB} × Ring ∈ {2,3,5,8};
+* `bc_plan` schneidet jede Nutzlast so, dass keine Runde mehr als einen
+  Schlitz traegt — erst das macht den a2a-Block zur genauen Ausdehnung von
+  broadcast statt zu einer Untergrenze;
+* die Koexistenz als Hauptbuch durchgespielt: drei Aufrufstellen nehmen ihre
+  Plaetze, dazwischen laufen broadcasts wachsender Groesse durch die a2a-
+  Haelften, und nach jedem Schreibvorgang muss das Buch denselben Eigentuemer
+  nennen;
+* Flaggenseite: die a2a-Zeilen (`fbasis_a2a`) und die `ergBereit`-Zeilen
+  (`pipe_fbasis` + Familie 4) fallen nie zusammen, und Familie 4 liegt
+  vollstaendig im Budget, das `flaggen_bedarf` anfordert.
+
+**Negativkontrollen** (ohne sie belegen die Tests nichts):
+
+* `test_without_the_handshake_a_reserved_slot_is_run_over` — dieselbe
+  Simulation mit `handschlag=False` und `slack=1` laeuft in die Verletzung.
+  Der Handschlag ist also die Ursache des Bestehens, nicht ein Beiwerk.
+* `test_the_eager_ring_survives_without_the_handshake` — bei `slack=2` traegt
+  es auch OHNE Handschlag. Das ist die Begruendung dafuer, dass der
+  Vorgabepfad keinen neuen Verkehr braucht.
+* Quelltextzusicherungen gegen die VORHER-Quelle (`git show HEAD:...`):
+  **6 von 7 fallen**. Die siebte (`A.ergBereit*` nur im Staging-Block) ist auf
+  der alten Quelle trivial wahr, weil es die Felder dort nicht gibt — sie ist
+  eine Regressionssperre, keine Unterscheidung, und das steht so da.
+* Koexistenz, Nutzlastseite: ein Ergebnisring, der so liegt, wie ihn die
+  Ordnung VOR a2a hingelegt haette (hinter netz und ring), faellt genau auf
+  den Block, in den broadcast schreibt — `test_a_layout_that_forgot_the_a2a_
+  set_is_caught_by_the_same_check` verlangt, dass die Kollisionspruefung das
+  meldet. Gegengeprueft am echten Quelltext: mit `off_erg = (saetze-2) *
+  schlitze * chunk_max` fallen vier der neun Koexistenztests.
+* Koexistenz, Flaggenseite: mit `pipe_flaggen_zusatz = 4 * welt * 256` (dem
+  Wert vor #292) liefen die `ergBereit`-Zeilen aus der angeforderten
+  Flaggenregion heraus; drei Tests fallen dann, darunter die Budgetpruefung.
+
+`ruff check` auf allem Neuen sauber; in `htccl_bar1.py` bleiben die zwei
+vorbestehenden Befunde (E741, F841), keiner davon in geaendertem Code.
+`ruff format` auf der neuen Testdatei sauber (die beiden bestehenden Dateien
+waren schon vorher nicht formatiert, daran wurde nichts geaendert).
+`codespell` meldet auf allen deutschsprachigen Dateien dieses Strangs
+Falschtreffer auf deutschen Woertern — auf der Vorher-Quelle genauso, also
+unveraendert und nicht neu.
+
+### Rebase auf 46b1eedd66
+
+Der Zweig lag auf 88283644ce; seither sind bar1-broadcast, der
+tiny-Floor-Fix und die Batterie-Skript-Fixes gemergt. Aufgeloest wurde
+inhaltlich, nicht mechanisch:
+
+* `htccl_bar1.py` verschmilzt ohne Konflikt, und das ist nachgerechnet und
+  nicht geglaubt: das Delta (Merge ↔ Integrationsstand) ist Zeile fuer Zeile
+  dasselbe wie das Delta (mein Commit ↔ alte Basis). broadcast fasst die
+  Flaggenregion nicht an — es faehrt auf den bestehenden a2a-Zeilen
+  (`fbasis_a2a`) —, waehrend Familie 4 hinter den Pipe-Zeilen liegt. Die
+  Basen bleiben damit konsistent, und Abschnitt 8 der Testdatei haelt das
+  fest.
+* `bar1_graph_check.py` kollidierte an drei Stellen, alle additiv: die
+  Fallbeschreibung im Modulkopf (broadcast wird Punkt 5, der Direktmodus
+  Punkt 6), die Signatur von `_pruefe_graphen` (jetzt `kollektiv` UND
+  `direkt_erwartung`, vorher hatte jede Seite genau eins) und die
+  Protokollzeile der Wiedergabe (`src=` aus broadcast, `(Geraet+Host)` aus
+  dem Direktmodus). Die Host-Ruecklesung rechnet ihren Sollwert seitdem aus
+  demselben Zweig wie die Geraete-Ruecklesung, sonst haette sie fuer einen
+  broadcast den all_reduce-Sollwert verglichen.
+* `INTEGRATION_R3_VALIDATION.md`: beide Seiten haengen nur an; der
+  Konflikt entstand daran, dass beide Abschnitte eine Ueberschrift
+  "Testzahlen" tragen. Aufgeloest als reine Aneinanderreihung.
+
+Die Fallliste zaehlt danach **neun Gate-Faelle** (fuenf alte, zwei aus dem
+broadcast-Merge, zwei aus diesem Zweig) plus `gitter` als Info-Fall.
+
+### Was die GPU-Phase noch beweisen muss
+
+Reihenfolge ist Absicht: erst der Byte-Beleg, dann Zahlen. **Keine
+Zeitmessung vor dem Byte-Beleg.**
+
+Ausfuehrbar, mit Host-Pfaden, Sperrprotokoll und Abbruchkriterien:
+`scripts/probe/direktmodus_gpu_phase.md`. Was hier folgt, ist die
+Begruendung dazu.
+
+1. **Der Graph-Beleg, alle Gate-Faelle.**
+
+       cd <worktree> && PYTHONPATH=$PWD/python \
+         /spinning/htsglang-gpu/.venv/bin/python benchmark/bar1_graph_check.py 0,1,2
+
+   Neu sind `pipe-direkt` (drei Graphen, drei reservierte Ringplaetze,
+   verschraenkt wiedergegeben, `SGLANG_HTCCL_BAR1_PIPE_ERG_RING=5`) und
+   `pipe-direkt-vorrat-leer` (L=2, jeder aufgezeichnete Aufruf MUSS auf
+   `direkt=0` zurueckfallen und trotzdem stimmen). Beide sind Gate. Der
+   Direktfall prueft zusaetzlich zweierlei, was die anderen Faelle nicht
+   brauchen:
+   * dass der Ergebnistensor WIRKLICH im BAR1-Fenster liegt (`erg_fenster()`)
+     — sonst haette der Fall den `direkt=0`-Kontrollpfad gemessen und
+     bestanden, ohne die Frage zu beantworten;
+   * eine zweite Ruecklesung ueber den **Host** statt ueber den L2 der
+     Empfaengerkarte (Messdisziplin, Regel 3: ein anderer Weg zu denselben
+     Bytes, weil derselbe Weg einen defekten Pfad verdecken wuerde). Der L2
+     ist mit eingehenden PCIe-Schreibvorgaengen nicht kohaerent, also ist
+     genau hier ein zweiter Weg mehr als Formalie.
+
+   Nur einzelne Faelle:
+
+       ... benchmark/bar1_graph_check.py 0,1,2 29593 pipe-direkt,pipe-direkt-vorrat-leer
+
+2. **Der Byte-Beleg der Pipe im Direktmodus, eager.** Vor dem Graphen, weil
+   ein gefallener eager-Beleg jede Graph-Zahl entwertet:
+
+       SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT=1 \
+       SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 SGLANG_HTCCL_BAR1_PIPE_ERG_RING=5 \
+         ... benchmark/bar1_diag.py 0,1,2
+
+   Damit laeuft der Handschlag auch eager mit (`ergSlack = 2`) und die
+   Flaggenfamilie 4 wird zum ersten Mal auf echter Hardware beschrieben.
+
+3. **Der Deckel.** Nach jedem Lauf `htccl.status()` bzw. `grep "Zeitlimit"`.
+   Der Handschlag ist eine neue Wartebedingung; ein gerissener Zeitdeckel
+   dort ist der erste Verdacht, wenn etwas haengt, und er entwertet jede
+   Zahl aus dem Lauf. Erwartet wird 0.
+
+4. **Registerzahl auf sm_120, gemessen statt uebersetzt.**
+
+       /usr/local/cuda/bin/cuobjdump -res-usage <jit>/htccl_bar1_pipe_ext_cuda_*.so \
+         | grep -A1 bar1_netz_pipe_kernel
+
+   am JIT-gebauten Objekt (das Rig baut fuer 8.6 UND 12.0), dann A/B
+   derselben `all_reduce`-Groessen mit `SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=0`
+   und `=1` im selben Lauf, verschraenkt. Die Frage ist, ob die 40->48
+   Register der gitter-Variante messbar kosten.
+
+5. **Was der Direktmodus einbringt, endlich gemessen.** Er ist bis heute
+   uebersetzt und ungemessen. `SGLANG_HTCCL_BAR1_PIPE_DIREKT=0` gegen `=1`,
+   gleiche Groessen, verschraenkt, mit Vorlauf (P-State-Rampe: 726 us ohne,
+   95 us mit). Erwartet wird ein gesparter VRAM-Durchgang beim Empfaenger;
+   gegen den PCIe-Engpass ist das wenig, also ist ein Nullbefund ein
+   moegliches und berichtenswertes Ergebnis.
+
+6. **Standardlauf e2e** mit `SGLANG_HTCCL_GRAPH_FREIGABE=1` und dem
+   graphfesten Direktmodus. Zu erwarten ist, dass der Graph-Vorrat bei einem
+   echten Modell (viele Aufrufstellen je Graph, viele Graphen) schnell leer
+   ist und der Rest `direkt=0` faehrt — die Meldung dazu erscheint einmal je
+   Rang und nennt die Zahlen. Das ist der ehrliche Rahmen des Features: der
+   graphfeste Direktmodus traegt eine BESCHRAENKTE Zahl aufgezeichneter
+   Aufrufstellen, und jeder Platz kostet `roundup(max_bytes, 4096)` Byte im
+   BAR1-Fenster.
+
+### Offene Punkte, ehrlich
+
+* **Der Vorrat skaliert nicht auf ein ganzes Modell.** sglang zeichnet je
+  Stapelgroesse einen Graphen auf, und jeder enthaelt ein `all_reduce` je
+  Schicht. Ein reservierter Platz je Aufrufstelle waere ein Vielfaches
+  dessen, was ein 256-MiB-BAR hergibt. Innerhalb EINES Graphen waere ein
+  gemeinsamer Platz durch die Stromordnung gedeckt; ueber Graphen hinweg
+  nicht, und von hier aus ist nicht feststellbar, welcher Fall vorliegt.
+  Die konservative Wahl kostet Leistung, nie Richtigkeit. Ein spaeterer
+  Schritt koennte den Vorrat je Aufzeichnung statt je Aufrufstelle vergeben,
+  wenn der Aufrufer die Graph-Identitaet mitgibt.
+* **`all_gather` faehrt weiter ohne Direktmodus.** Der a2a-Kern kennt den
+  Handschlag nicht, und ein all_gather braeuchte einen Ergebnisring in der
+  Groesse des VOLLEN Ergebnisses statt der Scherbe.
+* **Der Handschlag ist auf CPU simuliert, nicht auf der Karte gemessen.**
+  Die Simulation zeigt die Bedingung und ihren Falsifikator; sie sagt nichts
+  ueber die Laufzeit der Flagge. Punkt 3 der Kommandoliste ist deshalb ein
+  Gate, kein Zusatz.
