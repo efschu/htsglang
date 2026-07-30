@@ -12,6 +12,11 @@ Verified:
     decode_ms_mean, so a missing timing makes the boot worthless,
   * reseed_forwards is recorded on the re-seed arm, i.e. the arm actually
     re-seeded rather than silently behaving like the control,
+  * spec_rounds > 0 in BOTH arms -- a spec path that never proposed measured
+    nothing, and its accept mean is then an average over no rounds,
+  * the per-position accept curve exists in both arms and covers positions
+    0..K-1. A mean is structurally blind to a positional pathology, and this
+    boot compares two means against each other,
   * output_identical is present as a boolean,
   * no OOM / NCCL error / traceback in the server log.
 
@@ -32,6 +37,7 @@ from check_common import (  # noqa: E402
     CheckFail,
     check_vram_summary,
     classify_missing_result,
+    curve_positions,
     load_json,
     require_number,
     run_check,
@@ -40,6 +46,8 @@ from check_common import (  # noqa: E402
 
 STEP = "s05_boot_d"
 PROMPTS = ("squares", "code", "prose")
+# The job body runs boot D at spec_steps=3 (boot_d_lane_reseed.sh).
+STEPS_K = 3
 
 
 def check(step_dir: str) -> None:
@@ -74,6 +82,27 @@ def check(step_dir: str) -> None:
             require_number(
                 arm.get("decode_ms_mean"), f"boot_d/{prompt}/{key}: decode_ms_mean"
             )
+            # An accept mean over zero rounds is not a small number, it is no
+            # number -- and both arms of the A/B are read off exactly that.
+            require_number(
+                arm.get("spec_rounds"),
+                f"boot_d/{prompt}/{key}: spec_rounds",
+                minimum=1,
+            )
+            positions = curve_positions(arm.get("curve"))
+            if positions is None:
+                raise CheckFail(
+                    f"boot_d/{prompt}/{key}: keine Accept-Positionskurve "
+                    f"(curve={arm.get('curve')!r}) -- der Mittelwert allein ist "
+                    "blind fuer eine Positions-Pathologie"
+                )
+            if len(positions) < STEPS_K:
+                raise CheckFail(
+                    f"boot_d/{prompt}/{key}: Positionskurve deckt "
+                    f"{len(positions)} von {STEPS_K} Positionen ab"
+                )
+            if 0 not in positions:
+                raise CheckFail(f"boot_d/{prompt}/{key}: Position 0 fehlt in der Kurve")
         if sub["True"].get("reseed_forwards") is None:
             raise CheckFail(
                 f"boot_d/{prompt}: reseed_forwards fehlt im Re-Seed-Arm -- nicht "

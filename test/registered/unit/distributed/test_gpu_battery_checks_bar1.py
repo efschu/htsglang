@@ -708,6 +708,23 @@ class TestE2EParsing:
         assert by_name["dcp:0"]["erreicht"] == "gloo"
         assert by_name["dcp:0"]["angefordert"] == "bar1"
 
+    def test_plain_traceback_is_a_fatal(self, tmp_path):
+        """A boot killed by a traceback -- no OOM, no NCCL error -- is just as
+        dead. The shell harvests the marker; FATAL_MARKERS used to drop it, so
+        exactly that death passed the fatal gate."""
+        (tmp_path / "htccl_lines.txt").write_text(
+            LOG_GROUP_OK
+            + "\n910:Traceback (most recent call last):\n"
+            + '911:  File "server.py", line 1, in <module>\n'
+        )
+        out = parse_log_evidence(str(tmp_path))
+        assert out["fatal"] is not None
+        assert "Traceback" in out["fatal"]
+
+    def test_clean_log_has_no_fatal(self, tmp_path):
+        (tmp_path / "htccl_lines.txt").write_text(LOG_GROUP_OK + "\n")
+        assert parse_log_evidence(str(tmp_path))["fatal"] is None
+
     def test_bolt_is_extracted_with_op_and_size(self, tmp_path):
         (tmp_path / "htccl_lines.txt").write_text(LOG_RIEGEL + "\n")
         out = parse_log_evidence(str(tmp_path))
@@ -801,6 +818,8 @@ def _kurve(**over) -> dict:
                     "zeit": "2026-07-30T04:00:00",
                     "beleg_vorhanden": True,
                     "gruppen": gruppen,
+                    "fatal_erhoben": True,
+                    "fatal": None,
                 }
             )
     payload = {
@@ -813,6 +832,8 @@ def _kurve(**over) -> dict:
         "integration_vorhanden": True,
         "punkte": 8,
         "reihenfolge": reihenfolge,
+        "fatal": [],
+        "fatal_ungeprueft": [],
         "kurven": {
             "bar1": {"1": 1310.0, "4": 1520.0, "8": 1690.0, "16": 1740.0},
             "grundlinie": {str(k): v for k, v in BEKANNT.items()},
@@ -950,6 +971,38 @@ class TestPrefillKurveCheck:
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "Beleg" in line
 
+    def test_boot_with_a_fatal_is_fail(self, tmp_path):
+        """Eight boots that each died in a prefill OOM still hand in a
+        throughput table, and without this gate it looks like a healthy one."""
+        payload = _kurve()
+        payload["fatal"] = [
+            {
+                "folge": 3,
+                "arm": "bar1",
+                "sessions": 4,
+                "zeile": "logs/bar1_4.fatal.txt:1: torch.OutOfMemoryError: CUDA "
+                "out of memory",
+            }
+        ]
+        _write_kurve(tmp_path, payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "OutOfMemoryError" in line
+
+    def test_boot_without_a_fatal_harvest_is_fail(self, tmp_path):
+        payload = _kurve()
+        payload["fatal_ungeprueft"] = [{"folge": 2, "arm": "grundlinie", "sessions": 1}]
+        _write_kurve(tmp_path, payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "ohne Fatal-Ernte" in line
+
+    def test_artifact_without_a_fatal_field_is_fail(self, tmp_path):
+        """A producer that never harvested must not read like a clean run."""
+        payload = _kurve()
+        del payload["fatal"]
+        _write_kurve(tmp_path, payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "fatal" in line
+
     def test_missing_decode_point_is_fail(self, tmp_path):
         payload = _kurve()
         payload["decode"] = [d for d in payload["decode"] if d["batch"] != 16]
@@ -984,12 +1037,13 @@ class TestPrefillKurveSummary:
     """punkte.jsonl -> summary -> live table, without a server."""
 
     @staticmethod
-    def _punkte(tmp_path, punkte, belege=True):
+    def _punkte(tmp_path, punkte, belege=True, fatal=""):
         with open(tmp_path / "punkte.jsonl", "w") as f:
             for p in punkte:
                 f.write(json.dumps(p) + "\n")
         if belege:
             os.makedirs(tmp_path / "belege", exist_ok=True)
+            os.makedirs(tmp_path / "logs", exist_ok=True)
             for p in punkte:
                 name = f"{p['folge']}_{p['arm']}_{p['sessions']}.txt"
                 text = (
@@ -998,6 +1052,11 @@ class TestPrefillKurveSummary:
                     else ""
                 )
                 (tmp_path / "belege" / name).write_text(text)
+                # The shell's grep leaves an EMPTY file behind when it found
+                # nothing -- that is the healthy case, not a missing harvest.
+                (
+                    tmp_path / "logs" / f"{p['arm']}_{p['sessions']}.fatal.txt"
+                ).write_text(fatal)
         return tmp_path
 
     @staticmethod
@@ -1042,6 +1101,31 @@ class TestPrefillKurveSummary:
         assert abs(payload["grundlinie_abweichung_pct"]["1"]) < 0.1
         assert payload["reihenfolge"][0]["gruppen"][0]["erreicht"] == "bar1"
         assert payload["reihenfolge"][1]["gruppen"] == []
+        assert payload["fatal"] == []
+        assert payload["fatal_ungeprueft"] == []
+
+    def test_summary_surfaces_a_boot_that_died(self, tmp_path):
+        """The harvest existed on disk from the start; nothing read it, so
+        eight boots that each died in a prefill OOM still handed in numbers."""
+        self._punkte(
+            tmp_path,
+            [
+                self._punkt(1, "bar1", 1, 1310.0),
+                self._punkt(2, "grundlinie", 1, 1190.0),
+            ],
+            fatal="884:torch.OutOfMemoryError: CUDA out of memory. Tried 2.00 GiB\n",
+        )
+        payload = zusammenfassen(str(tmp_path), 5.0, [1])
+        assert len(payload["fatal"]) == 2
+        assert "OutOfMemoryError" in payload["fatal"][0]["zeile"]
+        assert payload["fatal_ungeprueft"] == []
+
+    def test_summary_marks_a_boot_without_a_harvest(self, tmp_path):
+        """Nobody looked and nothing found must not read the same."""
+        self._punkte(tmp_path, [self._punkt(1, "bar1", 1, 1310.0)], belege=False)
+        payload = zusammenfassen(str(tmp_path), 5.0, [1])
+        assert payload["fatal"] == []
+        assert len(payload["fatal_ungeprueft"]) == 1
 
     def test_table_renders_both_arms_without_judging(self, tmp_path):
         self._punkte(

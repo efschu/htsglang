@@ -235,7 +235,7 @@ def check_accept_artifact(
         if rounds is not None:
             require_number(rounds, f"{boot}/{prompt}: rounds", minimum=1)
         curve = serving.get("curve")
-        positions = _curve_positions(curve)
+        positions = curve_positions(curve)
         if positions is None:
             raise CheckFail(
                 f"{boot}/{prompt}: keine Accept-Positionskurve (curve={curve!r}) -- "
@@ -288,7 +288,7 @@ def classify_missing_result(
     )
 
 
-def _curve_positions(curve: Any) -> Optional[Dict[int, float]]:
+def curve_positions(curve: Any) -> Optional[Dict[int, float]]:
     """The probe reports the curve as {position: rate}; JSON turns the keys
     into strings. A list is accepted too. Returns None when there is no usable
     curve at all."""
