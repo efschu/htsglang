@@ -95,16 +95,16 @@ GRAPH_CHECK_OK = """BAR1-Graph-Beleg: Geraete [0, 1, 2], 3 Raenge
 Zusammenfassung
 ==============================================================
   BESTANDEN  [Gate]  einfach
-  BESTANDEN  [Gate]  zwei-graphen
+  BESTANDEN  [Gate]  two-graphs
   BESTANDEN  [Gate]  wechselnde-form
-  BESTANDEN  [Gate]  vorbehalt
+  BESTANDEN  [Gate]  reservation
   BESTANDEN  [Info]  gitter
 
 Alle Gate-Faelle bestanden.
 """
 GRAPH_CHECK_FALLEN = GRAPH_CHECK_OK.replace(
-    "  BESTANDEN  [Gate]  zwei-graphen", "  GEFALLEN   [Gate]  zwei-graphen"
-).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: zwei-graphen.")
+    "  BESTANDEN  [Gate]  two-graphs", "  GEFALLEN   [Gate]  two-graphs"
+).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: two-graphs.")
 
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
 #: Die Fortsetzung, die /generate auf "1 2 3 4" liefern muss. Ab 5, weil die
@@ -602,13 +602,13 @@ class TestE2ECheck:
                     "rc": 1,
                     "cases": 5,
                     "gate_cases": 4,
-                    "gefallen": ["zwei-graphen"],
+                    "gefallen": ["two-graphs"],
                     "alle_bestanden": False,
                 }
             ),
         )
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
-        assert "zwei-graphen" in line
+        assert "two-graphs" in line
 
     def test_the_bolt_gets_its_own_verdict(self, tmp_path):
         """The all_gather coverage gap is the acceptance scenario of the
@@ -934,7 +934,7 @@ class TestAgainstTheGreenTransportRun:
     The counterpart to the fixture above. Same day, same step, after the
     broadcast coverage landed: nine ERREICHT=bar1 lines over world:0, tp:0
     and dcp:0, no bolt, and all SEVEN gate cases passed -- including
-    `broadcast` and `broadcast-zwei-graphen`, which is the on-card proof
+    `broadcast` and `broadcast-two-graphs`, which is the on-card proof
     that a broadcast survives capture and replay.
 
     What this class pins is the verdict SHAPE for that run: every transport
@@ -1015,7 +1015,7 @@ class TestAgainstTheGreenTransportRun:
         (tmp_path / "graph_check.txt").write_text(GRAPH_CHECK_FALLEN)
         (tmp_path / "graph_check_rc.txt").write_text("1\n")
         out = parse_graph_check(str(tmp_path))
-        assert out["gefallen"] == ["zwei-graphen"]
+        assert out["gefallen"] == ["two-graphs"]
         assert out["alle_bestanden"] is False
 
     def test_gate_that_never_ran_reports_zero_cases(self, tmp_path):

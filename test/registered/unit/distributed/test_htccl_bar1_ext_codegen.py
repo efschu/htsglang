@@ -1,4 +1,4 @@
-"""The netz kernel must not index the parameter block dynamically.
+"""The mesh kernel must not index the parameter block dynamically.
 
 Kernel parameters live in constant bank 0, which has no dynamic indexing.
 One ``A.nzSendRS[z]`` with a running ``z`` therefore makes nvcc copy the
@@ -9,7 +9,7 @@ kernel with ``nvcc -cubin -arch=sm_86`` plus ``cuobjdump -res-usage``:
     after    bar1_netz_kernel   REG:37-40  STACK:0    SHARED:512-520
 
 ``bar1_ring_kernel`` (fixed indices) had STACK:0 all along, which is what
-made the netz number stand out. The a2a and pipelined kernels avoid it the
+made the mesh number stand out. The a2a and pipelined kernels avoid it the
 same way this fix does: one thread per block stages the pointer tables into
 shared memory, then everyone indexes there.
 
@@ -94,7 +94,7 @@ def _kernel_body(src: str, name: str) -> str:
     raise AssertionError(f"unbalanced braces in {name}")
 
 
-class TestNetzKernelHasNoParamSpill(CustomTestCase):
+class TestMeshKernelHasNoParamSpill(CustomTestCase):
     def setUp(self):
         self.src = _cuda_src()
         self.body = _kernel_body(self.src, "bar1_netz_kernel")

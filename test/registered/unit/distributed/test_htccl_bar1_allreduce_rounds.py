@@ -25,7 +25,7 @@ from unittest import mock
 
 from sglang.srt.distributed.device_communicators.htccl_bar1 import (
     HTCCLBar1Transport,
-    a2a_runden,
+    a2a_rounds,
     ar_plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -34,15 +34,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-#: Die Geometrie des Laufs, aus der Aufbau-Zeile: Region 96,0 MiB je Rang,
-#: 12 Schlitze, Schlitz 8188 KiB, groesste Nutzlast 24564 KiB.
+#: The geometry of the run, from the setup line: region 96.0 MiB per rank,
+#: 12 slots, slot 8188 KiB, largest payload 24564 KiB.
 CHUNK_MAX = 8188 * 1024
 SCHLITZ = CHUNK_MAX
 WELT = 3
-#: Verborgene Breite und Elementgroesse des Modells -- damit die Leiter in
-#: TOKEN gelesen werden kann, so wie die Analyse sie aufschreibt.
+#: Hidden width and element size of the model -- so the ladder can be read
+#: in TOKENS, the way the analysis writes it.
 HIDDEN, ELEM = 5120, 2
-#: Der Kipp-Punkt, ausgerechnet: Nutzlast > 3 x 8188 KiB.
+#: The tipping point, computed: payload > 3 x 8188 KiB.
 KIPP_TOKEN = 2456
 
 
@@ -96,38 +96,38 @@ class TestArPlanArithmetic(CustomTestCase):
     def _pruefe(self, nbytes, chunk_max=CHUNK_MAX, welt=WELT):
         plan = ar_plan(nbytes, chunk_max, welt)
         gesehen = []
-        for versatz, laenge in plan:
-            self.assertGreater(laenge, 0)
-            self.assertEqual(laenge % 16, 0, msg="Runde ist kein Vielfaches von 16")
-            self.assertEqual(versatz % 16, 0, msg="Versatz ist nicht ausgerichtet")
-            # Der Wirt besteht auf einem 128-Bit-Paket JE RANG (TORCH_CHECK
-            # n4 >= R). Eine Restrunde darunter waere kein langsamer Fall,
-            # sondern ein Abbruch.
+        for versatz, length in plan:
+            self.assertGreater(length, 0)
+            self.assertEqual(length % 16, 0, msg="round is not a multiple of 16")
+            self.assertEqual(versatz % 16, 0, msg="offset is not aligned")
+            # The host insists on a 128-bit packet PER RANK (TORCH_CHECK
+            # n4 >= R). A remainder round below that would not be a slow
+            # case, it would be an abort.
             self.assertGreaterEqual(
-                laenge // 16, welt, msg=f"Runde {laenge} B unter einem Paket je Rang"
+                length // 16, welt, msg=f"round {length} B under one packet per rank"
             )
-            scherbe = -(-(laenge // 16) // welt) * 16
-            self.assertLessEqual(scherbe, chunk_max, msg="Scherbe passt nicht")
-            gesehen.extend(range(versatz, versatz + laenge))
+            scherbe = -(-(length // 16) // welt) * 16
+            self.assertLessEqual(scherbe, chunk_max, msg="shard does not fit")
+            gesehen.extend(range(versatz, versatz + length))
         self.assertEqual(gesehen, list(range(nbytes)))
         return plan
 
     def test_the_working_point_stays_one_round(self):
-        """2048 Token, 20,0 MiB -- der gemessene Arbeitspunkt.
+        """2048 tokens, 20.0 MiB -- the measured working point.
 
-        Er darf sich nicht aendern: dieselbe eine Runde wie vorher, sonst
-        waeren alle Zahlen des Laufs auf einmal nicht mehr vergleichbar.
+        This must not change: the same single round as before, otherwise
+        all the run's numbers would suddenly no longer be comparable.
         """
         self.assertEqual(len(self._pruefe(_bytes(2048))), 1)
 
     def test_the_documented_tipping_point(self):
-        """2456 Token passen noch, 2457 nicht mehr -- und laufen jetzt."""
+        """2456 tokens still fit, 2457 no longer do -- and now they run."""
         self.assertEqual(len(self._pruefe(_bytes(KIPP_TOKEN))), 1)
         self.assertEqual(len(self._pruefe(_bytes(KIPP_TOKEN + 1))), 2)
 
     def test_the_usual_chunked_prefill_sizes(self):
-        """Die beiden Groessen, bei denen bar1 im Prefill still ausgesetzt
-        haette."""
+        """The two sizes at which bar1 would have silently sat out
+        prefill."""
         self.assertEqual(len(self._pruefe(_bytes(4096))), 2)
         self.assertEqual(len(self._pruefe(_bytes(8192))), 4)
 
@@ -136,28 +136,29 @@ class TestArPlanArithmetic(CustomTestCase):
             self._pruefe(_bytes(token))
 
     def test_rounds_are_evenly_distributed(self):
-        """Nicht bis zum Anschlag fuellen: der Schwanz waere sonst beliebig
-        klein, und der Wirt lehnt eine Runde unter einem Paket je Rang ab."""
+        """Don't fill to the brim: the tail would otherwise be arbitrarily
+        small, and the host rejects a round under one packet per rank."""
         for nbytes in (_bytes(2457), _bytes(4096) + 16, 25153536 + 16):
             plan = self._pruefe(nbytes)
-            laengen = [laenge for _, laenge in plan]
-            # Hoechstens ein Paket Unterschied zwischen groesster und
-            # kleinster Runde.
+            laengen = [length for _, length in plan]
+            # At most one packet of difference between the largest and
+            # smallest round.
             self.assertLessEqual(max(laengen) - min(laengen), 16, msg=str(nbytes))
 
     def test_a_tail_of_one_packet_cannot_happen(self):
-        """Der Fall, den die Gleichverteilung ausschliesst.
+        """The case the even distribution rules out.
 
-        Bis zum Anschlag gefuellt haette diese Nutzlast eine Restrunde von
-        16 Byte ergeben -- ein Paket, bei drei Raengen ein Abbruch im Wirt.
+        Filled to the brim, this payload would have produced a remainder
+        round of 16 bytes -- one packet, which the host aborts on with
+        three ranks.
         """
         plan = self._pruefe(25153536 + 16)
         self.assertEqual(len(plan), 2)
-        self.assertTrue(all(laenge // 16 >= WELT for _, laenge in plan))
+        self.assertTrue(all(length // 16 >= WELT for _, length in plan))
 
     def test_the_round_count_is_group_uniform(self):
-        """Die Graph-Bedingung. Sie haengt an nbytes, chunk_max und welt --
-        an nichts, was je Rang verschieden ist."""
+        """The graph condition. It depends on nbytes, chunk_max and welt --
+        on nothing that differs per rank."""
         nbytes = _bytes(8192)
         zahlen = {len(ar_plan(nbytes, CHUNK_MAX, WELT)) for _ in range(8)}
         self.assertEqual(zahlen, {4})
@@ -187,36 +188,36 @@ class TestArPlanAgainstAReference(CustomTestCase):
             r: [((r * 31 + i * 7) % 251) for i in range(nbytes // 4)]
             for r in range(welt)
         }
-        # 0xEE-Analogon: was keine Runde beruehrt, bleibt erkennbar falsch.
+        # 0xEE analogue: whatever no round touches stays recognizably wrong.
         ergebnis = [-1] * (nbytes // 4)
-        for versatz, laenge in ar_plan(nbytes, chunk_max, welt):
-            a, b = versatz // 4, (versatz + laenge) // 4
+        for versatz, length in ar_plan(nbytes, chunk_max, welt):
+            a, b = versatz // 4, (versatz + length) // 4
             for i in range(a, b):
                 ergebnis[i] = sum(daten[r][i] for r in range(welt))
-        soll = [sum(daten[r][i] for r in range(welt)) for i in range(nbytes // 4)]
-        return ergebnis, soll
+        expected = [sum(daten[r][i] for r in range(welt)) for i in range(nbytes // 4)]
+        return ergebnis, expected
 
     def test_one_round(self):
-        ist, soll = self._simulate(_bytes(2048), WELT, CHUNK_MAX)
-        self.assertEqual(ist, soll)
+        actual, expected = self._simulate(_bytes(2048), WELT, CHUNK_MAX)
+        self.assertEqual(actual, expected)
 
     def test_many_rounds(self):
         for token in (2457, 4096, 8192):
-            ist, soll = self._simulate(_bytes(token), WELT, CHUNK_MAX)
-            self.assertEqual(ist, soll, msg=f"{token} Token")
+            actual, expected = self._simulate(_bytes(token), WELT, CHUNK_MAX)
+            self.assertEqual(actual, expected, msg=f"{token} tokens")
 
     def test_small_geometry_many_rounds(self):
-        """Kleine Zahlen, damit die Rundenlogik selbst geprueft wird und
-        nicht nur die Arithmetik grosser Vielfacher."""
-        ist, soll = self._simulate(4096, 3, 64)
-        self.assertEqual(ist, soll)
+        """Small numbers, so the round logic itself gets checked, not just
+        the arithmetic of large multiples."""
+        actual, expected = self._simulate(4096, 3, 64)
+        self.assertEqual(actual, expected)
 
     def test_no_element_is_written_twice_or_skipped(self):
         for nbytes in (4096, 4096 + 16, 65536):
             plan = ar_plan(nbytes, 64, 3)
             beruehrt = []
-            for versatz, laenge in plan:
-                beruehrt.extend(range(versatz, versatz + laenge))
+            for versatz, length in plan:
+                beruehrt.extend(range(versatz, versatz + length))
             self.assertEqual(beruehrt, list(range(nbytes)), msg=str(nbytes))
 
 
@@ -224,39 +225,39 @@ class TestA2aRounds(CustomTestCase):
     """The same answer for all_to_all, from the group-wide largest block."""
 
     def test_a_block_inside_the_slot_is_one_round(self):
-        self.assertEqual(a2a_runden(SCHLITZ, SCHLITZ), 1)
-        self.assertEqual(a2a_runden(1, SCHLITZ), 1)
+        self.assertEqual(a2a_rounds(SCHLITZ, SCHLITZ), 1)
+        self.assertEqual(a2a_rounds(1, SCHLITZ), 1)
 
     def test_a_block_over_the_slot_is_split(self):
-        self.assertEqual(a2a_runden(SCHLITZ + 1, SCHLITZ), 2)
-        self.assertEqual(a2a_runden(SCHLITZ * 4, SCHLITZ), 4)
+        self.assertEqual(a2a_rounds(SCHLITZ + 1, SCHLITZ), 2)
+        self.assertEqual(a2a_rounds(SCHLITZ * 4, SCHLITZ), 4)
 
     def test_zero_is_still_one_round(self):
-        """Alle Bloecke leer heisst trotzdem: die Sperre wird gefahren."""
-        self.assertEqual(a2a_runden(0, SCHLITZ), 1)
+        """All blocks empty still means: the barrier still runs."""
+        self.assertEqual(a2a_rounds(0, SCHLITZ), 1)
 
     def test_the_count_comes_from_the_group_wide_maximum(self):
-        """Aus der eigenen Zeile gerechnet waere sie rangabhaengig -- und
-        ein Rang mit einer Runde weniger ist ein Haenger, kein Fehler."""
+        """Computed from a rank's own row it would be rank-dependent -- and
+        a rank with one fewer round is a hang, not a bug."""
         eigene_zeilen = [SCHLITZ // 2, SCHLITZ * 3, SCHLITZ]
         gruppenweit = max(eigene_zeilen)
-        zahlen = {a2a_runden(gruppenweit, SCHLITZ) for _ in eigene_zeilen}
+        zahlen = {a2a_rounds(gruppenweit, SCHLITZ) for _ in eigene_zeilen}
         self.assertEqual(zahlen, {3})
 
     def test_rejects_nonsense(self):
         with self.assertRaises(ValueError):
-            a2a_runden(16, 0)
+            a2a_rounds(16, 0)
         with self.assertRaises(ValueError):
-            a2a_runden(-1, 16)
+            a2a_rounds(-1, 16)
 
     def test_the_gate_follows_the_round_cap(self):
         t = _stub(a2a_max_runden=4, a2a_schlitz=1024)
-        self.assertTrue(t.traegt_a2a(1024 * 4))
-        self.assertFalse(t.traegt_a2a(1024 * 4 + 1))
+        self.assertTrue(t.supports_a2a(1024 * 4))
+        self.assertFalse(t.supports_a2a(1024 * 4 + 1))
 
     def test_the_transport_reports_the_count_for_the_seam(self):
         t = _stub(a2a_schlitz=1024)
-        self.assertEqual(t.a2a_runden_fuer(1024 * 3), 3)
+        self.assertEqual(t.a2a_rounds_for(1024 * 3), 3)
 
 
 class TestHandlesGate(CustomTestCase):
@@ -265,10 +266,10 @@ class TestHandlesGate(CustomTestCase):
     def test_the_working_point_is_covered_as_before(self):
         t = _stub()
         self.assertTrue(t.handles("all_reduce", _bytes(2048)))
-        self.assertEqual(t.ar_runden(_bytes(2048)), 1)
+        self.assertEqual(t.ar_rounds(_bytes(2048)), 1)
 
     def test_over_the_tipping_point_is_now_covered(self):
-        """VORHER: handles() -> False und ein stiller Rueckfall."""
+        """BEFORE: handles() -> False and a silent fallback."""
         t = _stub()
         for token in (KIPP_TOKEN + 1, 4096, 8192):
             self.assertTrue(
@@ -282,12 +283,12 @@ class TestHandlesGate(CustomTestCase):
         self.assertFalse(t.handles("all_reduce", je_runde * 16 + 16))
 
     def test_the_hard_host_conditions_still_reject(self):
-        """Was der Wirt nicht faehrt, faehrt auch die Naht nicht."""
+        """What the host does not run, the seam does not run either."""
         t = _stub()
-        self.assertFalse(t.handles("all_reduce", 4096 + 1))    # kein Vielfaches von 16
-        self.assertFalse(t.handles("all_reduce", 32))          # unter min_bytes
+        self.assertFalse(t.handles("all_reduce", 4096 + 1))    # not a multiple of 16
+        self.assertFalse(t.handles("all_reduce", 32))          # below min_bytes
         winzig = _stub(min_bytes=16)
-        self.assertFalse(winzig.handles("all_reduce", 32))     # < ein Paket je Rang
+        self.assertFalse(winzig.handles("all_reduce", 32))     # < one packet per rank
 
     def test_a_round_that_would_not_fit_the_window_is_refused(self):
         t = _stub(_fenster_minimum=1 << 20)
@@ -301,7 +302,7 @@ class TestHandlesGate(CustomTestCase):
 
 
 class TestLoudFallbackNotice(CustomTestCase):
-    """Rueckfall ist erlaubt, lautlos nicht.
+    """Falling back is allowed, doing it silently is not.
 
     Outside a capture the gloo plane is a slower but usable path, so nothing
     aborts. But a transport that quietly steps aside for one size while the
@@ -324,7 +325,7 @@ class TestLoudFallbackNotice(CustomTestCase):
     def _select(self, c, op, nbytes):
         from sglang.srt.distributed.device_communicators import htccl as mod
 
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: False):
+        with mock.patch.object(mod, "graph_capture_running", lambda: False):
             return mod.HTCCLCommunicator._select(c, op, nbytes)
 
     def test_an_uncovered_size_is_announced_with_op_bytes_and_reason(self):
@@ -337,11 +338,11 @@ class TestLoudFallbackNotice(CustomTestCase):
         self.assertIn("reduce_scatter", text)
         self.assertIn("65536", text)
         self.assertIn("tp:0", text)
-        self.assertIn("Rueckfall", text)
-        self.assertIn("Grund:", text)
+        self.assertIn("falling back", text)
+        self.assertIn("Reason:", text)
 
     def test_a_covered_size_says_nothing(self):
-        """Die Negativkontrolle. Ein Hinweis, der immer kommt, ist keiner."""
+        """The negative control. A notice that always fires is not one."""
         c = self._comm(_stub())
         logger = logging.getLogger(
             "sglang.srt.distributed.device_communicators.htccl"
@@ -353,8 +354,8 @@ class TestLoudFallbackNotice(CustomTestCase):
         warnung.assert_not_called()
 
     def test_the_size_that_used_to_fall_through_silently_is_now_covered(self):
-        """Der Anlassfall: 4096 Token Prefill. Kein Hinweis, weil kein
-        Rueckfall -- das ist der Punkt der Runden."""
+        """The original trigger case: 4096-token prefill. No notice,
+        because no fallback -- that is the whole point of the rounds."""
         c = self._comm(_stub())
         logger = logging.getLogger(
             "sglang.srt.distributed.device_communicators.htccl"
@@ -364,7 +365,7 @@ class TestLoudFallbackNotice(CustomTestCase):
         warnung.assert_not_called()
 
     def test_it_speaks_once_per_op_and_size_class(self):
-        """Im heissen Pfad laufen dieselben Groessen tausendfach."""
+        """In the hot path the same sizes recur a thousandfold."""
         c = self._comm(_stub())
         logger = logging.getLogger(
             "sglang.srt.distributed.device_communicators.htccl"
@@ -373,13 +374,13 @@ class TestLoudFallbackNotice(CustomTestCase):
             for _ in range(50):
                 self._select(c, "reduce_scatter", 65536)
             self.assertEqual(warnung.call_count, 1)
-            # Eine andere Groessenklasse ist ein neuer Betriebspunkt.
+            # A different size class is a new operating point.
             self._select(c, "reduce_scatter", 65536 * 64)
             self.assertEqual(warnung.call_count, 2)
 
     def test_each_group_speaks_for_itself(self):
-        """tp und dcp bekommen verschieden grosse Fenster -- was in der
-        einen passt, muss in der anderen nicht."""
+        """tp and dcp get differently sized windows -- what fits in one
+        need not fit in the other."""
         logger = logging.getLogger(
             "sglang.srt.distributed.device_communicators.htccl"
         )
@@ -389,43 +390,43 @@ class TestLoudFallbackNotice(CustomTestCase):
             self.assertEqual(warnung.call_count, 2)
 
     def test_under_capture_the_bar_still_wins(self):
-        """Unter Aufzeichnung gibt es keinen Rueckfall, also auch keinen
-        Hinweis darauf -- dort bricht es ab, und das bleibt so."""
+        """Under capture there is no fallback, hence no notice about one
+        either -- it aborts there instead, and that stays that way."""
         from sglang.srt.distributed.device_communicators import htccl as mod
 
         c = self._comm(_stub())
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             with self.assertRaises(RuntimeError):
                 mod.HTCCLCommunicator._select(c, "reduce_scatter", 65536)
 
 
-class TestWarumNicht(CustomTestCase):
+class TestWhyNot(CustomTestCase):
     """The reason text. Diagnostic only -- it decides nothing."""
 
     def test_a_covered_size_has_no_reason(self):
         t = _stub()
-        self.assertEqual(t.warum_nicht("all_reduce", _bytes(2048)), "")
+        self.assertEqual(t.why_not("all_reduce", _bytes(2048)), "")
 
     def test_an_unaligned_payload_says_so(self):
         t = _stub()
-        self.assertIn("Vielfaches von 16", t.warum_nicht("all_reduce", 4097))
+        self.assertIn("multiple of 16", t.why_not("all_reduce", 4097))
 
     def test_too_many_rounds_names_the_cap(self):
         t = _stub(ar_max_runden=2)
-        grund = t.warum_nicht("all_reduce", _bytes(8192))
-        self.assertIn("Runden", grund)
-        self.assertIn("erlaubt sind 2", grund)
+        grund = t.why_not("all_reduce", _bytes(8192))
+        self.assertIn("rounds", grund)
+        self.assertIn("2 are allowed", grund)
 
     def test_an_op_outside_the_coverage_says_so(self):
-        self.assertIn("HTCCL_OPS", _stub().warum_nicht("reduce_scatter", 4096))
+        self.assertIn("HTCCL_OPS", _stub().why_not("reduce_scatter", 4096))
 
     def test_a_transport_that_is_not_up_says_so(self):
         t = _stub(_auf=False)
-        self.assertIn("nicht aufgebaut", t.warum_nicht("all_reduce", 4096))
+        self.assertIn("not set up", t.why_not("all_reduce", 4096))
 
     def test_a_switched_off_op_says_which_switch(self):
         t = _stub(bc_an=False)
-        self.assertIn("SGLANG_HTCCL_BAR1_BC", t.warum_nicht("broadcast", 128))
+        self.assertIn("SGLANG_HTCCL_BAR1_BC", t.why_not("broadcast", 128))
 
 
 if __name__ == "__main__":

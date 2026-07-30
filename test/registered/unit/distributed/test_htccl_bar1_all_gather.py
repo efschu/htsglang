@@ -4,8 +4,8 @@ Context. Before this, ``HTCCLBar1Transport.HTCCL_OPS`` covered only
 ``all_reduce`` and ``all_to_all``, and the standard run died during CUDA
 graph capture::
 
-    RuntimeError: HTCCL: 'all_gather' mit 10600448 Byte waehrend einer
-    CUDA-Graph-Aufzeichnung, aber bar1 meldet handles(...) -> False.
+    RuntimeError: HTCCL: 'all_gather' with 10600448 bytes during a
+    CUDA graph capture, but bar1 reports handles(...) -> False.
 
 Correctly -- under HTCCL PyNccl is not built, the fallback is the
 host-staged gloo plane, and that runs once at capture time and never again
@@ -50,10 +50,10 @@ def _stub(**kw):
     t.ag_an = True
     t.a2a_an = True
     t._a2a_beleg = True
-    # Die ausgelieferte Vorgabe. Hier stand 16, und der Stub stimmte damit
-    # mit einem Wert ueberein, den der broadcast-Zwilling als Fehler
-    # entlarvt hat: der Standardlauf schickt Kollektive UNTER einem
-    # 16-Byte-Paket, und unter Aufzeichnung ist eine Absage ein Abbruch.
+    # The shipped default. This used to be 16, and the stub agreed with a
+    # value its broadcast twin exposed as a bug: the standard run sends
+    # collectives UNDER one 16-byte packet, and under capture a refusal is
+    # an abort.
     t.ag_min_bytes = 1
     t.ag_max_runden = 16
     # broadcast rides the same kernel but has its own switch and its own
@@ -319,7 +319,7 @@ class TestHandlesGate(CustomTestCase):
         """The whole point. Rejecting would abort a capture, not slow it."""
         t = _stub(a2a_schlitz=4096)
         self.assertTrue(t._handles_all_gather(4096 * 4))
-        self.assertEqual(t.ag_runden(4096 * 4), 4)
+        self.assertEqual(t.ag_rounds(4096 * 4), 4)
 
     def test_unaligned_shard_is_accepted(self):
         """Unlike all_reduce: the a2a kernel has a byte path for the tail."""
@@ -389,7 +389,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
 
         t = _stub()
         c = self._comm(t)
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             with self.assertRaises(RuntimeError) as ctx:
                 mod.HTCCLCommunicator._select(c, "reduce_scatter", 4096)
         text = str(ctx.exception)
@@ -405,7 +405,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
 
         t = _stub(a2a_schlitz=8384512)
         c = self._comm(t)
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             self.assertIs(
                 mod.HTCCLCommunicator._select(c, "all_gather", ABNAHME_BYTES),
                 t,
@@ -415,7 +415,7 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
         from sglang.srt.distributed.device_communicators import htccl as mod
 
         c = self._comm(_stub())
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: False):
+        with mock.patch.object(mod, "graph_capture_running", lambda: False):
             self.assertIsNone(mod.HTCCLCommunicator._select(c, "reduce_scatter", 4096))
 
 
