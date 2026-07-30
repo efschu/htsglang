@@ -166,13 +166,24 @@ def tabelle_verhaeltnis(punkte: list, arm_a: str, arm_b: str) -> str:
         if not va.get("median") or not vb.get("median"):
             continue
         faktor = vb["median"] / va["median"]
-        boden = max(
-            (va.get("spanne_rel") or 0.0),
-            (vb.get("spanne_rel") or 0.0),
-        )
-        # The difference has to clear the floor of the noisier of the two arms;
-        # the floor is a relative spread, so the comparison is on |faktor - 1|.
-        ueber = "ja" if abs(faktor - 1.0) > boden else "NEIN"
+        # A single sample has no spread, and _spanne reports 0.0 for it. Taking
+        # that as a floor would clear every difference against a floor of zero,
+        # which is the opposite of what a floor is for: a point without a
+        # repetition has NO floor and says so.
+        spannen = [
+            s["spanne_rel"]
+            for s in (va, vb)
+            if s.get("n", 0) >= 2 and s.get("spanne_rel") is not None
+        ]
+        if len(spannen) < 2:
+            boden_text, ueber = "-", "?"
+        else:
+            # The difference has to clear the floor of the noisier of the two
+            # arms; the floor is a relative spread, so the comparison is on
+            # |faktor - 1|.
+            boden = max(spannen)
+            boden_text = _fmt(100.0 * boden, 2) + " %"
+            ueber = "ja" if abs(faktor - 1.0) > boden else "NEIN"
         z.append(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 bs,
@@ -184,7 +195,7 @@ def tabelle_verhaeltnis(punkte: list, arm_a: str, arm_b: str) -> str:
                 _fmt((ra["median"] / rb["median"]) if ra.get("median") and rb.get("median") else None, 3),
                 _fmt(aa.get("median")),
                 _fmt(ab.get("median")),
-                _fmt(100.0 * boden, 2) + " %",
+                boden_text,
                 ueber,
             )
         )
