@@ -95,6 +95,7 @@ Everything else, ordered by how much a rig of identical GPUs (1/2/4/8 cards) gai
 | [20](#f20) | Session KV spill | Exp, Boot-checked | partial | partial | partial | partial |
 | [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
 | [16](#f16) | Fast-lane priority scheduling | Built | partial | partial | no | no |
+| [29](#f29) | Dynamic concurrent-session limit | Built | no | no | no | no |
 | [25](#f25) | Per-message-class link selection | Cross-checked | no | no | no | no |
 | [26](#f26) | Prefill satellite (cross-host PD for hybrid GDN) | Boot-checked | yes (base) | yes (base) | no | no |
 
@@ -1182,6 +1183,39 @@ batch, with a reserved-heavy-slots floor and heavy-aging; default off. Flags:
 
 **Upstream:** sglang already has priority scheduling and preemption; the reserved-floor fast-lane
 class is the addition.
+
+<a id="f29"></a>
+### 29. Dynamic concurrent-session limit
+
+`--max-running-requests-ceiling` splits the single `--max-running-requests` number into two: the
+ceiling sizes the state pools (KV pool, mamba/GDN slot table, decode CUDA-graph capture set), and
+the effective admission limit floats below it at runtime. Throttling admission is a counter
+update; rebuilding a pool is not, so the expensive dimension is fixed at boot and the cheap one
+moves. `--max-running-requests` becomes the start of the float. The decode CUDA-graph capture bound
+is widened to the ceiling as well, so the top of the declared range does not silently fall back to
+eager (`--cuda-graph-max-bs-decode` overrides; graph memory grows with the bound).
+
+The limit is lowered under KV pressure and, critically, lowered **before** the retraction fallback
+discards sessions that already hold state — the inflow is throttled instead of the stock being
+killed. Raising it again requires `--admission-release-hysteresis` consecutive samples of pool
+occupancy at or below `--admission-release-low` (`--admission-throttle-high`,
+`--admission-floor` complete the band). The pressure sample is built from replicated quantities
+only (held tokens of the running batch against the min-reduced `max_total_num_tokens`), so every
+rank reaches the same verdict without a collective — a rank-local occupancy would diverge under
+asymmetric DCP and desync the group.
+
+The limit is also settable at runtime:
+`POST /set_internal_state {"server_args": {"effective_max_running_requests": N}}`, rejected outside
+`[floor, ceiling]`. It is per group/lane, published through a context variable rather than a module
+global, so a dual-group lane carries its own; the #236 spill budget's session-count regler reads the
+same value instead of keeping a second one. Registered as the cheapest relief rung of the KV
+pressure ladder (`admission_cap`) — the only rung that is an actuator rather than a data movement.
+
+Default: unset = no ceiling, no float, unchanged behavior. **Built** — no hardware boot.
+
+**Upstream:** sglang's `max_running_requests` is a single static number that both sizes the pools
+and caps admission; `pp_max_micro_batch_size` is runtime-settable but bounded by it and carries no
+pressure feedback.
 
 <a id="f25"></a>
 ### 25. Per-message-class link selection

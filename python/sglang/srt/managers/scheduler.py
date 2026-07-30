@@ -82,6 +82,14 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.admission_limiter import (
+    AdmissionLimiter,
+    AdmissionLimitError,
+    replicated_pool_usage,
+    resolve_admission_start,
+    set_admission_limiter,
+    throttle_before_retract,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1046,6 +1054,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # #287: self.max_running_requests is now the CEILING the pools were
+        # built for (ServerArgs rewrote the field; the resolver may have cut
+        # it further for KV capacity). The limit that admission honours
+        # floats below it and lives in the limiter.
+        self.init_admission_limiter()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2103,6 +2116,53 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
         )
 
+    def init_admission_limiter(self) -> None:
+        """Build this group's floating admission limit (#287).
+
+        ``self.max_running_requests`` at this point is the RESOLVED ceiling
+        (per dp worker): the value the pools, the mamba slot table and the
+        decode capture set were dimensioned for. Without
+        --max-running-requests-ceiling the limiter is a passive holder of
+        exactly that value, so ``get_num_allocatable_reqs`` and the prefill
+        adder see the same number they see today.
+
+        The limiter is per group/lane and is published into a context
+        variable (#274 Slice C1 idiom) so distant readers -- the #236 spill
+        budget today, the #242 latency classes later -- resolve to their own
+        lane's value instead of a shared singleton.
+        """
+        sa = self.server_args
+        ceiling = int(self.max_running_requests)
+        start = resolve_admission_start(
+            ceiling,
+            getattr(sa, "max_running_requests_start", None),
+            dp_size=sa.dp_size if sa.enable_dp_attention else 1,
+            floor=sa.admission_floor,
+        )
+        self.admission_limiter = AdmissionLimiter(
+            ceiling,
+            start,
+            floor=min(sa.admission_floor, ceiling),
+            throttle_high=sa.admission_throttle_high,
+            release_low=sa.admission_release_low,
+            release_hysteresis=sa.admission_release_hysteresis,
+            auto=sa.max_running_requests_ceiling is not None,
+            lane_id=None,
+        )
+        set_admission_limiter(self.admission_limiter)
+        if self.admission_limiter.auto and self.ps.tp_rank == 0:
+            logger.info(
+                "Dynamic admission limit: ceiling=%d, start=%d, floor=%d "
+                "(throttle>=%.2f, release<=%.2f x%d). State pools are "
+                "dimensioned for the ceiling; the limit floats below it.",
+                self.admission_limiter.ceiling,
+                self.admission_limiter.current,
+                self.admission_limiter.floor,
+                self.admission_limiter.throttle_high,
+                self.admission_limiter.release_low,
+                self.admission_limiter.release_hysteresis,
+            )
+
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
             kv_events_config=self.server_args.kv_events_config,
@@ -3150,7 +3210,16 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
+        # #287: the floating admission limit joins the existing bounds as one
+        # more min(). Without --max-running-requests-ceiling the limiter holds
+        # the same max_running_requests that pp_max_micro_batch_size was
+        # derived from (max_running_requests // pp_size <= it), so the min is
+        # inert and this is the stock expression.
+        limit = min(
+            get_server_args().pp_max_micro_batch_size,
+            self.admission_limiter.current,
+        )
+        res = limit - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3323,7 +3392,9 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
-            max_running_requests=self.max_running_requests,
+            # #287: the adder is an ADMISSION consumer, so it gets the
+            # floating limit, not the ceiling the pools were built for.
+            max_running_requests=self.admission_limiter.current,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
@@ -3556,6 +3627,33 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
+        # #287: one pressure sample per decode round. This is the EARLY half
+        # of the throttle -- lowering here, at the water mark, is what keeps
+        # the pre-retraction throttle below from ever being reached in the
+        # common case; it is also the only place the limit is raised again,
+        # and only after --admission-release-hysteresis consecutive samples
+        # of genuinely free headroom. Not sampled at all unless the auto
+        # controller is armed, so the default path is untouched.
+        #
+        # RANK-UNIFORM by construction. pool_stats' token_usage would be the
+        # obvious source and is the wrong one: it derives from THIS rank's
+        # physical available_size, and under uneven DCP the ranks' pools
+        # differ, so a per-rank usage gives per-rank verdicts -> divergent
+        # admission -> divergent batches -> collective desync. The running
+        # batch's held tokens and max_total_num_tokens are both replicated,
+        # so this sample is identical on every rank with no collective. It
+        # also measures the right thing: tokens held by live requests are the
+        # non-reclaimable occupancy, while the radix cache's evictable
+        # remainder is not pressure.
+        if self.admission_limiter.auto:
+            self.admission_limiter.observe(
+                replicated_pool_usage(
+                    sum(req.seqlen for req in batch.reqs),
+                    self.max_total_num_tokens,
+                ),
+                batch.batch_size(),
+            )
+
         # Check if decode out of memory.
         # kv-session-offload (S1): on OOM, first try to SPILL a session to
         # host (FCFS, youngest-sufficient victim) -- it keeps decoding from
@@ -3593,6 +3691,16 @@ class Scheduler(
                 kv_full_retract_flag = False
         else:
             kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag:
+            # #287 THROTTLE BEFORE RETRACT. Retraction still runs -- it is the
+            # only thing that frees tokens for the step that is about to
+            # start. What the throttle prevents is the loop after it: the
+            # slots retraction just freed are handed straight back to the
+            # waiting queue on the next prefill pass, and the same pressure
+            # then discards the next victim. Lowering the inflow first turns a
+            # repeated discard into a single one. A no-op unless the auto
+            # controller is armed by --max-running-requests-ceiling.
+            throttle_before_retract(self.admission_limiter, batch.batch_size())
         if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
@@ -4606,7 +4714,11 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
-        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # #287: the effective figure is the limiter's floating value. Without
+        # a ceiling the limiter holds max_running_requests, so this key keeps
+        # reporting exactly what it reported before.
+        ret["effective_max_running_requests_per_dp"] = self.admission_limiter.current
+        ret["admission_limiter"] = self.admission_limiter.snapshot()
 
         if (
             not self.spec_algorithm.is_none()
@@ -4670,6 +4782,10 @@ class Scheduler(
                 # "repeat": K}). A command, not a server arg; ranks without
                 # the addressed lane treat it as a no-op success.
                 "dual_group_lane_prefill",
+                # #287: move THIS group's floating admission limit. A command
+                # on the lane-local limiter, not a server arg -- the ceiling
+                # the pools were built for stays where it is.
+                "effective_max_running_requests",
             ]
         )
 
@@ -4679,6 +4795,13 @@ class Scheduler(
                 logging.warning(f"Updating {k} is not supported.")
                 if_success = False
                 break
+            elif k == "effective_max_running_requests":
+                try:
+                    self.admission_limiter.set_limit(v)
+                except AdmissionLimitError as e:
+                    logging.warning(f"Updating {k} to {v} is rejected: {e}")
+                    if_success = False
+                    break
             elif k == "pp_max_micro_batch_size" and (
                 v > self.max_running_requests // self.ps.pp_size or v < 1
             ):
@@ -4735,6 +4858,15 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            # #287: already applied to the lane-local limiter in the
+            # validation loop above (that is where it can still be rejected);
+            # keep it out of the server-args override.
+            if remaining.pop("effective_max_running_requests", None) is not None:
+                logger.info(
+                    "Admission limit set to %d (ceiling %d).",
+                    self.admission_limiter.current,
+                    self.admission_limiter.ceiling,
+                )
             # Multi-group runtime (#274): lane job -- a command, not a server
             # arg. Only the rank carrying the addressed lane enqueues; every
             # other rank no-ops successfully (the control message is

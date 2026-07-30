@@ -51,6 +51,11 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.admission_limiter import (
+    current_admission_limiter,
+    spill_session_cap,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -2734,6 +2739,19 @@ class KVSessionOffloadManager:
         if self._budget_bucket is not None:
             self._budget_bucket.consume(int(spilled_tokens))
 
+    def budget_session_cap(self) -> int:
+        """Concurrent-spilled-session cap in force, 0 = uncapped.
+
+        #287: the #236 ``budget_max_sessions`` regler and the floating
+        admission limit bound the same quantity, so the spill path reads the
+        limiter instead of keeping a second number -- a server that has
+        throttled itself down to N sessions must not keep more than N parked
+        on the host. Rank-uniform: the limiter only ever moves on replicated
+        inputs, so every rank answers the same cap here (a rank-divergent
+        spill verdict is the desync this file guards against everywhere).
+        """
+        return spill_session_cap(self._budget.max_sessions, current_admission_limiter())
+
     def _budget_admission_check(self, spill_tokens: int) -> Optional[str]:
         """Budget verdict for a candidate DECODE spill of ``spill_tokens``
         host tokens; returns the violated regler (decline -> stock
@@ -2741,7 +2759,7 @@ class KVSessionOffloadManager:
         total, pre, dec, _ = self._budget_resident_volumes()
         sess_after = int(spill_tokens) + self._budget_gdn_eq
         reason = budget_admission_violation(
-            self._budget,
+            self._budget._replace(max_sessions=self.budget_session_cap()),
             n_open_slots=len(self.spills),
             spill_tokens=int(spill_tokens),
             phase="decode",
@@ -3010,7 +3028,8 @@ class KVSessionOffloadManager:
         if getattr(self, "_budget_armed", False):
             cfg = self._budget
             closed = False
-            if cfg.max_sessions > 0 and len(self.spills) >= cfg.max_sessions:
+            session_cap = self.budget_session_cap()
+            if session_cap > 0 and len(self.spills) >= session_cap:
                 closed = True
             elif cfg.has_volume:
                 total, pre, _dec, _ = self._budget_resident_volumes()
@@ -3147,10 +3166,8 @@ class KVSessionOffloadManager:
         if fast_pressure is None:
             fast_pressure = self._fast_lane_pressure(batch.reqs)
         budget_armed = getattr(self, "_budget_armed", False)
-        if budget_armed and (
-            self._budget.max_sessions > 0
-            and len(self.spills) >= self._budget.max_sessions
-        ):
+        session_cap = self.budget_session_cap()
+        if session_cap > 0 and len(self.spills) >= session_cap:
             # #236 breadth regler: at the session-count budget, decline before
             # any victim work -- stock retraction handles the pressure, today's
             # no-free-region behaviour.
