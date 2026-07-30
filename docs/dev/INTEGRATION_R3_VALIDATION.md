@@ -13526,3 +13526,135 @@ rund 12 s, und dort stehen die Spitzen.
    still zu einem Lane-Ausfall pro Karte statt zu einem Umgebungsfehler. Jede
    Lane-Messung, die nicht in der GPU-venv laeuft, schreibt damit falsche
    Kartenbefunde ins Profil.
+
+## Fairer vLLM-Vergleich (#707-Verfahren) (Kartenfenster 2026-07-30, 22:04-22:31 UTC)
+
+Der erste Fork-gegen-vLLM-Punkt, bei dem Inhalt UND Metrik dieselben sind wie
+im Referenzlauf. Rohdaten: `/spinning/gpu-battery-results/2026-07-30_vllm_fair/`.
+Basis `40d9054c43` (enthaelt `ee2d00e522`; die Differenz der beiden ist
+ausschliesslich diese Datei, kein Laufzeitcode).
+
+**Referenz.** club-3090 Issue #707 vom 14.07., dieses Rig, vLLM, TP=3:
+decode_TPS **code 88,9 / narrative 68,6**, MTP-Accept 2,85 (k=3 fest).
+
+### Warum das Verfahren nicht nachgebaut, sondern aufgerufen wird
+
+Gemessen hat `scripts/bench.sh` aus club-3090 — **unveraendert aufgerufen**,
+nicht nachprogrammiert. Das ist der Kern der Fairness: die Referenzzahl ist
+das Ergebnis genau dieses Skripts, und eine Nachbildung wuerde unsere
+Arithmetik gegen ihre stellen statt unsere Engine gegen ihre. Der Wrapper
+`host_bench.sh` liegt ausschliesslich *um* den Aufruf herum (Accept-Klammer
+ueber `/metrics`, ein Volltext-Sample je Klasse) und fasst keinen gemessenen
+Lauf an.
+
+Das Skript wird je Klasse einmal aufgerufen (`ONLY=narr`, dann `ONLY=code`)
+statt einmal fuer beide. Die Arbeit ist identisch — `run_set()` macht seine
+drei Warmups ohnehin je Klasse —, aber so ist die `/metrics`-Klammer um eine
+Klasse auch wirklich die Accept-Laenge dieser Klasse.
+
+Verfahren also wie #707: narrative 1000 Tok, code 800 Tok, temp 0,6,
+top_p 0,95, `enable_thinking=false`, 3 Warmups + 5 Messlaeufe je Klasse,
+decode_TPS = Tokens/(Wall−TTFT), bs=1.
+
+### Das Vehikel: das #707-Checkpoint selbst
+
+`Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP`, nicht das sonst in dieser
+Batterie gefahrene `Qwen3.6-27B-FP8`. Die beiden sind strukturell deckungs-
+gleich (gleiche Architektur, 64 Layer, hidden 5120, vocab 248320, fp8,
+1606 Tensoren, derselbe 22-Tensor-`mtp.*`-Kopf), das Rezept traegt also
+unveraendert hinueber — aber es sind verschiedene Finetunes, und Accept-Laenge
+wie Ausgabeinhalt sind Finetune-Eigenschaften. Mit dem anderen Checkpoint
+haetten wir Finetunes verglichen und Engines behauptet.
+
+### Rezept (Arm `voll`, Vollprogramm)
+
+bar1-Transport, `--rank-tp-ratio auto-performance`, KV 7,3,3, fp8-KV
+(`fp8_e4m3`), Solo-Draft NEXTN (`--speculative-draft-placement solo`,
+num-steps 3 / topk 1 / draft-tokens 4), adaptives k ueber
+`--speculative-adaptive --speculative-adaptive-config high-accept` (Leiter
+bis k=5), CUDA-Graphen, `--chunked-prefill-size 2048`, Kontext 32768,
+`max-running-requests` 16. Realisierter Pool `max_total_num_tokens` 233064.
+
+### Zwei Fehlboots, und was sie belegen
+
+Beide sind Befunde, keine Betriebsunfaelle, und beide haengen an der Reserve
+des Rangs 0 — nicht am AEON-Checkpoint und nicht an bar1.
+
+**Anlauf 1, Reserve `3000,2700,2700`** (der s16-Wert, faelschlich statt des
+`bar1_hi`-Werts aus s13/s15 genommen): Rang 0 stirbt mit SIGKILL waehrend des
+Graph-Capture, Rang 1 und 2 drehen danach im Kollektiv weiter — 100 % SM ohne
+PCIe-Verkehr, das klassische Bild „ein Rang faellt rank-lokal aus, der Rest
+wartet im Kollektiv". Das Serverlog benennt die Ursache selbst, lange vor dem
+Tod:
+
+    fundability reference: residual free VRAM at the VRAM-auto split
+    [3000, 5964, 7483] MiB per rank, against the derived reserve demand
+    [4160, 4160, 4160] MiB
+
+Rang 0 ist um 1160 MiB unterfundiert und geht mit `avail mem=1,35 GB` ins
+Capture (Rang 1: 3,67 GB, Rang 2: 4,91 GB). Der Fehler war meiner: die
+`bar1_hi`-Rezeptur aus s13/s15 traegt `4500,4200,4200`, und genau diese
+Differenz finanziert die Leiter.
+
+**Anlauf 2, Reserve `4500,4200,4200`**: Rang 0 jetzt finanziert (Residual 4500
+gegen Bedarf 4160), und die adaptive Leiter meldet ihre eigene Grenze sauber
+statt zu haengen:
+
+    Adaptive graph memory offload: free device memory with all candidate
+    states paused (1376 MiB) is below the largest state's mapped footprint
+    (918 MiB, adaptive_state_k5) plus the serving transient margin (512 MiB)
+
+1376 gegen 1430 MiB — **54 MiB zu wenig**. Der Merksatz daraus: die
+`high-accept`-Leiter [1..5] boote nicht bei der Standard-`bar1_hi`-Reserve,
+sondern braucht auf dem Rang, der den Solo-Draft haelt, rund 700 MiB mehr.
+Die Doku in `adaptive_graph_memory.py` (Zeile 205) sagt „boots at the STANDARD
+reserve" — das galt fuer die dort validierte Geometrie, nicht fuer diese
+(KV 7,3,3 + chunked 2048 + Solo-Draft auf Rang 0).
+
+**Anlauf 3, Reserve `5200,4200,4200`**: ready nach 85 s, Bench sauber
+durchgelaufen. Dass die Fehlboots nach dem ersten nur noch ~100 s brauchten
+(warme JIT-Caches), ist der Grund, warum die Diagnose ueberhaupt ins Fenster
+passte.
+
+### Die Zahlen (Arm `voll`, n=5 je Klasse, bs=1)
+
+| Klasse | decode_TPS Mittel ± Std | CV | TTFT | Accept | vLLM #707 | Verdikt |
+|---|---|---|---|---|---|---|
+| narrative | **84,26 ± 3,16** | 3,7 % | 151 ms | 2,1 | 68,6 | **+22,8 %** |
+| code | **111,04 ± 3,94** | 3,5 % | 160 ms | 3,85 | 88,9 | **+24,9 %** |
+
+wall_TPS derselben Laeufe: narrative 83,20 (CV 3,7 %), code 108,26 (CV 3,3 %).
+Der Abstand zwischen wall und decode ist bei diesen kurzen Prompts klein
+(TTFT ~150 ms), beide Metriken tragen also dasselbe Verdikt.
+
+**Zum Accept:** `sglang:spec_accept_length` ist ein Gauge, also ein
+Momentanwert beim Abgriff und kein Mittel ueber die fuenf Laeufe. Die beiden
+Werte sind daher Groessenordnung, nicht Messpunkt — sie reproduzieren aber die
+bekannte Inhaltsabhaengigkeit (Code deutlich ueber Prosa) und liegen mit 3,85
+auf Code klar ueber der Referenz-2,85, was bei einer Leiter bis k=5 auch zu
+erwarten ist.
+
+**Output-Validierung:** je Klasse ein vollstaendiges Sample gesichert
+(`raw/sample.voll.*.json`). Beide kohaerent — narrative als gegliederter
+Essay (unique-word-Ratio 0,54), code als lauffaehig strukturierte
+quicksort-Implementierung mit Docstring (0,507); laengster Lauf identischer
+Wiederholzeilen jeweils < 4. Kein Lauf als kontaminiert markiert.
+
+**Leistungsaufnahme ueber das Fenster** (329 Abtastungen je Karte):
+GPU0 106,5 W Mittel / 298,1 W Spitze, GPU1 (5090) 122,0 W / 326,4 W,
+GPU2 99,6 W / 264,1 W.
+
+### Was dieser Punkt sagt — und was nicht
+
+Auf dem Inhalt und der Metrik von #707 liegt das Vollprogramm des Forks
+**rund ein Viertel ueber dem vLLM-Lauf desselben Rigs mit demselben
+Checkpoint**, auf beiden Inhaltsklassen und bei einem CV unter 4 %.
+
+Der Anteil, der auf Engine, Placement und Transport entfaellt, ist damit
+**noch nicht isoliert**: das Vollprogramm faehrt adaptives k bis 5, der
+vLLM-Lauf k=3 fest. Genau dafuer war der zweite Arm (`fair`, identisch bis auf
+festes k=3) vorgesehen. Er wurde **nicht gemessen** — das 35-Minuten-Budget
+war nach dem dritten Boot aufgebraucht, und das Briefing gibt den Arm nur bei
+>= 10 min Restbudget frei. Er ist in `run_arm.sh` fertig hinterlegt
+(`bash run_arm.sh fair`) und kostet nach dieser Vorarbeit ~6 min Kartenzeit:
+85 s Boot plus 240 s Bench.
