@@ -741,7 +741,7 @@ unchanged by construction.
 
 *merged after this row was first written; see the integration validation record's Design B / "#189: per-channel fp8 fused GEMV" sections.
 
-**Upstream:** sglang requires a native GEMM or Marlin (sm80+); no dequant fallback.
+**Upstream:** sglang serves fp8 on sm80+ through fp8 Marlin — itself a W8A16 dequant-in-kernel path, with machinery shared with vLLM's `CompressedTensorsW8A16Fp8`. The fork delta is strictly the coverage BELOW and OUTSIDE that floor: sm75/Turing, gfx900, and mixed-vendor groups (upstream refuses to serve fp8 there), plus the functional capability probe replacing the capability-number gate, the fused dequant-GEMV kernel (#189), and the determinism pairing (#192).
 
 <a id="f11"></a>
 ### 11. Cross-architecture speculative determinism
