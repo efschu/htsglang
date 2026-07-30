@@ -70,7 +70,14 @@ KIND = "bar1_e2e"
 #: model is intact -- `anker_zahlen`, `muell_befunde`, `lm_intakt` and the
 #: metrics behind them. A schema-3 artifact does not carry those fields, and
 #: its `kohaerent` meant something other than the field of that name here.
-SCHEMA_VERSION = 4
+#: 5: the per-group entries under `gruppen` renamed their keys from German to
+#: English -- `gruppe`/`angefordert`/`erreicht` became `group`/`requested`/
+#: `achieved`, in step with htccl.py's report_state(). A schema-4 artifact
+#: still spells them in German, so every group would read back as empty and
+#: the transport check would pass on nothing. Rejecting it by version is the
+#: point: re-run the step rather than read a stale artifact through the new
+#: names.
+SCHEMA_VERSION = 5
 
 #: The continuation prompt s11_bar1_e2e.sh sends to /generate. It lives here
 #: AND there; test_gpu_battery_checks_bar1.py pins the two together against
@@ -124,10 +131,10 @@ MUELL_MIN_ZEICHEN = 20
 LOG_QUELLEN = ("htccl_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
-    r"group '(?P<gruppe>[^']+)': requested=(?P<angefordert>[^,\s]+),\s*"
-    r"ACHIEVED=(?P<erreicht>[A-Za-z0-9_\-]+)"
+    r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
+    r"ACHIEVED=(?P<achieved>[A-Za-z0-9_\-]+)"
 )
-RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<gruppe>[^']+)'")
+RE_KASSE = re.compile(r"BAR1-Kasse dieser Karte nach Gruppe '(?P<group>[^']+)'")
 RE_AUFBAU = re.compile(r"HTCCL-BAR1: Aufbau in\s+(?P<ms>[0-9.]+)\s*ms")
 RE_RIEGEL = re.compile(
     r"HTCCL: '(?P<op>[A-Za-z0-9_]+)' mit (?P<bytes>\d+) Byte waehrend einer "
@@ -236,14 +243,14 @@ def parse_log_evidence(step_dir: str) -> dict:
     for line in lines:
         m = RE_GROUP.search(line)
         if m:
-            groups[m.group("gruppe")] = {
-                "gruppe": m.group("gruppe"),
-                "angefordert": m.group("angefordert"),
-                "erreicht": m.group("erreicht"),
+            groups[m.group("group")] = {
+                "group": m.group("group"),
+                "requested": m.group("requested"),
+                "achieved": m.group("achieved"),
             }
         m = RE_KASSE.search(line)
-        if m and m.group("gruppe") not in ledger_groups:
-            ledger_groups.append(m.group("gruppe"))
+        if m and m.group("group") not in ledger_groups:
+            ledger_groups.append(m.group("group"))
         m = RE_AUFBAU.search(line)
         if m:
             setup_ms.append(float(m.group("ms")))
@@ -260,7 +267,7 @@ def parse_log_evidence(step_dir: str) -> dict:
                     fatal = " ".join(line.split())[:300]
                     break
     return {
-        "gruppen": sorted(groups.values(), key=lambda g: g["gruppe"]),
+        "gruppen": sorted(groups.values(), key=lambda g: g["group"]),
         "aufbau_gruppen": ledger_groups,
         "aufbau_lines": len(setup_ms),
         "aufbau_ms": setup_ms,
@@ -555,10 +562,10 @@ def compose(step_dir: str, port: int, host_log: str) -> dict:
     }
     payload.update(parse_log_evidence(step_dir))
     payload["gruppen_bar1"] = sorted(
-        g["gruppe"] for g in payload["gruppen"] if g["erreicht"] == "bar1"
+        g["group"] for g in payload["gruppen"] if g["achieved"] == "bar1"
     )
     payload["gruppen_ausgewichen"] = sorted(
-        g["gruppe"] for g in payload["gruppen"] if g["erreicht"] != g["angefordert"]
+        g["group"] for g in payload["gruppen"] if g["achieved"] != g["requested"]
     )
     return payload
 

@@ -68,14 +68,14 @@ MIN_ORDERED_NUMBERS = 15
 
 
 def _group_for(prefix: str, groups: list) -> list:
-    return [g for g in groups if str(g.get("gruppe", "")).startswith(prefix)]
+    return [g for g in groups if str(g.get("group", "")).startswith(prefix)]
 
 
 def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "bar1_e2e.json")
     classify_missing_result(step_dir, "bar1_e2e", path, "bar1_e2e.json")
     payload = load_json(path, "bar1_e2e.json")
-    require_envelope(payload, KIND, "bar1_e2e.json", 4)
+    require_envelope(payload, KIND, "bar1_e2e.json", 5)
 
     if not payload.get("reachable"):
         raise CheckStop(
@@ -152,15 +152,15 @@ def check(step_dir: str) -> None:
         if not found:
             raise CheckFail(
                 f"no group {prefix!r} in the log (reported: "
-                f"{[g.get('gruppe') for g in groups]}) -- with "
+                f"{[g.get('group') for g in groups]}) -- with "
                 "SGLANG_UNEVEN_DCP=1 both tp and dcp have to show up"
             )
-        not_bar1 = [g for g in found if g.get("erreicht") != "bar1"]
+        not_bar1 = [g for g in found if g.get("achieved") != "bar1"]
         if not_bar1:
             g = not_bar1[0]
             raise CheckFail(
-                f"group {g.get('gruppe')!r} runs ACHIEVED={g.get('erreicht')!r} "
-                f"(angefordert {g.get('angefordert')!r}) while "
+                f"group {g.get('group')!r} runs ACHIEVED={g.get('achieved')!r} "
+                f"(requested {g.get('requested')!r}) while "
                 f"{payload.get('gruppen_bar1')} run on bar1 -- ein gemischter "
                 "Lauf, whose numbers do not count as bar1 numbers"
             )

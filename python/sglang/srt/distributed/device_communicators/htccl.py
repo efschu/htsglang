@@ -77,10 +77,10 @@ class Bar1Failed(RuntimeError):
     writes it into a warning and into ``_STAND``.
     """
 
-    def __init__(self, grund: str, stufe: str = "aufbau"):
-        super().__init__(grund)
-        self.grund = grund
-        self.stufe = stufe
+    def __init__(self, reason: str, stage: str = "setup"):
+        super().__init__(reason)
+        self.reason = reason
+        self.stage = stage
 
 
 #: What ACTUALLY runs per group. Keyed by group name
@@ -97,7 +97,7 @@ _STAND: dict[str, dict] = {}
 
 
 def report_state(gruppe: str, requested: str, achieved: str,
-                grund: str = "", stufe: str = "") -> dict:
+                reason: str = "", stage: str = "") -> dict:
     """Record what this group will actually run on.
 
     One entry per group name. Nameless groups (which don't actually occur
@@ -112,22 +112,22 @@ def report_state(gruppe: str, requested: str, achieved: str,
             i += 1
         schluessel = f"<ohne Namen #{i}>"
     eintrag = {
-        # NOTE: these dict keys stay in German ("gruppe", "angefordert",
-        # "erreicht", "grund", "stufe") on purpose. They are a cross-file
-        # data contract: python/sglang/srt/distributed/parallel_state.py
-        # (outside this translation task's scope) reads them back via
-        # ``stand.get("erreicht", ...)`` to build its own
-        # "requested=%s, ACHIEVED=%s" log line, and several
-        # scripts/gpu_battery/checks/*.py + test_gpu_battery_checks_bar1.py
-        # consumers key off these exact strings too. Renaming them here
-        # without also touching every one of those out-of-scope files would
-        # silently break that log line and every check that parses it.
-        "gruppe": schluessel,
-        "angefordert": requested,
-        "erreicht": achieved,
-        "grund": grund,
-        "stufe": stufe,
-        "direkt": achieved == requested and achieved not in ("gloo", ""),
+        # NOTE: these dict keys are a cross-file data contract.
+        # python/sglang/srt/distributed/parallel_state.py reads them back
+        # via ``stand.get("achieved", ...)`` to build its own
+        # "requested=%s, ACHIEVED=%s" log line, and
+        # scripts/gpu_battery/s11_bar1_e2e.py rebuilds a lookalike dict with
+        # the same spellings by regex-scanning that log line. Change a key
+        # here only together with those consumers -- and with the
+        # ``SCHEMA_VERSION`` of every gpu_battery artifact that persists it
+        # (bar1_e2e.json, prefill_kurve.json), so a stale artifact is
+        # rejected loudly instead of silently read as empty.
+        "group": schluessel,
+        "requested": requested,
+        "achieved": achieved,
+        "reason": reason,
+        "stage": stage,
+        "direct": achieved == requested and achieved not in ("gloo", ""),
     }
     _STAND[schluessel] = eintrag
     return eintrag
@@ -148,14 +148,14 @@ def state_summary() -> str:
         return "HTCCL: no group reported."
     zeilen = []
     for name, e in sorted(_STAND.items()):
-        if e["direkt"]:
-            zeilen.append(f"  {name}: {e['erreicht']}")
+        if e["direct"]:
+            zeilen.append(f"  {name}: {e['achieved']}")
         else:
             zeilen.append(
-                f"  {name}: {e['erreicht']} (REQUESTED WAS "
-                f"{e['angefordert']}; {e['stufe']}: {e['grund']})"
+                f"  {name}: {e['achieved']} (REQUESTED WAS "
+                f"{e['requested']}; {e['stage']}: {e['reason']})"
             )
-    voll = all(e["direkt"] for e in _STAND.values())
+    voll = all(e["direct"] for e in _STAND.values())
     kopf = ("HTCCL: all groups are running the requested transport."
             if voll else
             "HTCCL: NOT all groups are running the requested transport -- "
@@ -242,8 +242,8 @@ def _make_bar1_transport(cpu_group, device, gruppe: str = ""):
                   gruppe=gruppe)
     if t is None or bericht.get("haelt_belegt"):
         raise Bar1Failed(
-            bericht.get("grund", "no reason reported"),
-            stufe=bericht.get("stufe", "unbekannt"),
+            bericht.get("reason", "no reason reported"),
+            stage=bericht.get("stage", "unknown"),
         )
     return t
 
@@ -267,9 +267,9 @@ def _make_matrix_transport(cpu_group, device, gruppe: str = ""):
         # False for everything, and every collective would run over the
         # gloo layer -- while the log says "transport=matrix". Exactly the
         # mix-up this is meant to fix.
-        grund = getattr(t, "bar1_grund", "") or "no reason reported"
+        reason = getattr(t, "bar1_reason", "") or "no reason reported"
         t.close()
-        raise Bar1Failed(grund, stufe=getattr(t, "bar1_stufe", "aufbau"))
+        raise Bar1Failed(reason, stage=getattr(t, "bar1_stage", "setup"))
     return t
 
 
@@ -369,8 +369,8 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
     factory = TRANSPORT_REGISTRY.get(name)
     if factory is None:
         report_state(gruppe, name, "gloo",
-                    grund="no such name in TRANSPORT_REGISTRY",
-                    stufe="auswahl")
+                    reason="no such name in TRANSPORT_REGISTRY",
+                    stage="selection")
         return None  # "gloo" or an unknown name -> inline data plane
     if _no_fallback(name):
         t = _invoke_factory(factory, cpu_group, device, gruppe)
@@ -379,9 +379,9 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
     try:
         t = _invoke_factory(factory, cpu_group, device, gruppe)
     except Exception as e:
-        stufe = getattr(e, "stufe", "aufbau")
-        grund = getattr(e, "grund", f"{type(e).__name__}: {e}")
-        report_state(gruppe, name, "gloo", grund=grund, stufe=stufe)
+        stage = getattr(e, "stage", "setup")
+        reason = getattr(e, "reason", f"{type(e).__name__}: {e}")
+        report_state(gruppe, name, "gloo", reason=reason, stage=stage)
         # WARNING, not INFO, and with the group name. One group failing is
         # not an edge case: it turns any measurement over this run into a
         # mixed one, and that is exactly what happened here unnoticed.
@@ -390,12 +390,12 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
             "(%s: %s). This group runs over the host-staged gloo layer. "
             "Any measurement over this run is therefore mixed and must "
             "NOT be reported as a %r number.",
-            gruppe or "<ohne Namen>", name, stufe, grund, name,
+            gruppe or "<ohne Namen>", name, stage, reason, name,
         )
         return None
     if t is None:
         report_state(gruppe, name, "gloo",
-                    grund="factory returned None without a reason", stufe="aufbau")
+                    reason="factory returned None without a reason", stage="setup")
         logger.warning(
             "HTCCL: group %r does not get the requested transport %r "
             "(the factory returned None). gloo layer.",

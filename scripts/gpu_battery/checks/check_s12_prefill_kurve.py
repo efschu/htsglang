@@ -89,7 +89,7 @@ def check(step_dir: str) -> None:
     if not os.path.exists(path):
         raise CheckStop(f"prefill_kurve.json missing ({path}) -- the step never ran")
     payload = load_json(path, "prefill_kurve.json")
-    require_envelope(payload, KIND, "prefill_kurve.json", 1)
+    require_envelope(payload, KIND, "prefill_kurve.json", 2)
 
     if not payload.get("host_erreichbar"):
         raise CheckStop("host unreachable -- nothing was measured")
@@ -147,7 +147,7 @@ def check(step_dir: str) -> None:
             if groups:
                 raise CheckFail(
                     f"Grundlinie boot at {entry.get('sessions')} sessions reports "
-                    f"HTCCL groups {[g.get('gruppe') for g in groups]} -- the "
+                    f"HTCCL groups {[g.get('group') for g in groups]} -- the "
                     "baseline must not see a single SGLANG_HTCCL* variable"
                 )
             continue
@@ -157,18 +157,18 @@ def check(step_dir: str) -> None:
                 "single ERREICHT line -- HTCCL was not on"
             )
         for prefix in REQUIRED_GROUP_PREFIXES:
-            hits = [g for g in groups if str(g.get("gruppe", "")).startswith(prefix)]
+            hits = [g for g in groups if str(g.get("group", "")).startswith(prefix)]
             if not hits:
                 raise CheckFail(
                     f"bar1 boot at {entry.get('sessions')} sessions without group "
-                    f"{prefix!r} (reported: {[g.get('gruppe') for g in groups]})"
+                    f"{prefix!r} (reported: {[g.get('group') for g in groups]})"
                 )
-            foreign = [g for g in hits if g.get("erreicht") != "bar1"]
+            foreign = [g for g in hits if g.get("achieved") != "bar1"]
             if foreign:
                 raise CheckFail(
                     f"bar1 boot at {entry.get('sessions')} sessions: group "
-                    f"{foreign[0].get('gruppe')!r} runs "
-                    f"ACHIEVED={foreign[0].get('erreicht')!r} -- gemischter Punkt, "
+                    f"{foreign[0].get('group')!r} runs "
+                    f"ACHIEVED={foreign[0].get('achieved')!r} -- mixed point, "
                     "not a bar1 point"
                 )
 

@@ -54,7 +54,14 @@ from s12_log_analyse import (  # noqa: E402  one parser, one place
 )
 
 KIND = "bar1_prefill_kurve"
-SCHEMA_VERSION = 1
+#: 2: the per-point transport evidence under `gruppen` renamed its keys from
+#: German to English (`gruppe`/`angefordert`/`erreicht` ->
+#: `group`/`requested`/`achieved`), in step with s11_bar1_e2e.RE_GROUP and
+#: htccl.py's report_state(). A schema-1 artifact spells them in German, so
+#: every point would read back as having no HTCCL group at all -- which the
+#: arm check would misread as "baseline". Rejecting it by version is the
+#: point: re-run the step rather than read a stale artifact.
+SCHEMA_VERSION = 2
 
 # The baseline over the host path, from MESSUNG_PREFILL_ANTEIL.md and
 # 02_WAS_ERREICHT_IST.md: "1190/1097/1144/1105/1122 tok/s" over 1, 2, 4, 8 and
@@ -461,9 +468,9 @@ def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
             if m:
                 out["gruppen"].append(
                     {
-                        "gruppe": m.group("gruppe"),
-                        "angefordert": m.group("angefordert"),
-                        "erreicht": m.group("erreicht"),
+                        "group": m.group("group"),
+                        "requested": m.group("requested"),
+                        "achieved": m.group("achieved"),
                     }
                 )
     return out
