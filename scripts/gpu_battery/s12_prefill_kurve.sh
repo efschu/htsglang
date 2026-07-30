@@ -61,14 +61,24 @@ if ! host_locks_acquire "$BATTERY_STEP"; then
 fi
 
 SERVER_PID=""
+# ACHT Boots in diesem Schritt, also acht Gelegenheiten, einen Server
+# stehenzulassen. Derselbe Aufraeumpfad wie in s11 und aus demselben Anlass:
+# `bar1_boot_start` gab die Bootmeldung mit auf stdout, `kill -0` scheiterte
+# daran, und das galt als "nichts zu toeten".
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        host_dump_and_kill "$SERVER_PID" "$DIR/pyspy-host-$SERVER_PID.txt"
-        SERVER_PID=""
-    fi
+    bar1_kill_host_server "$SERVER_PID" "${HOSTPID:-}" \
+        "$DIR/pyspy-host-cleanup.txt" || true
+    SERVER_PID=""
     host_locks_release
 }
 trap cleanup EXIT INT TERM
+
+# Kein Lauf gegen die Altlast eines vorherigen Anlaufs. Hier waere sie noch
+# teurer als in s11: acht Boots messen dann acht Mal den falschen Server.
+if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
+    summarize
+    exit 2
+fi
 
 # The measurement driver runs ON THE HOST (stdlib only, host python) because
 # the server listens on the host's loopback. It writes straight into the run
@@ -99,7 +109,8 @@ for N in $SESSIONS; do
             "$HOSTLOG" "$HOSTPID" "$PORT" || { ABBRUCH="Bootskript $ARM/$N"; break; }
         SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_${ARM}_${N}.sh" "$HOSTPID")" \
             || SERVER_PID=""
-        if [ -z "$SERVER_PID" ]; then
+        if ! bar1_pid_ok "$SERVER_PID"; then
+            SERVER_PID=""
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.tail.txt" 200
             ABBRUCH="Server-Start $ARM/$N ohne pid"
             break
@@ -109,7 +120,8 @@ for N in $SESSIONS; do
         if ! host_wait_for_server "$PORT" 900; then
             host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.tail.txt" 200
             cleanup_pid="$SERVER_PID"
-            host_dump_and_kill "$cleanup_pid" "$DIR/pyspy-host-$cleanup_pid.txt"
+            bar1_kill_host_server "$cleanup_pid" "$HOSTPID" \
+                "$DIR/pyspy-host-$cleanup_pid.txt" || true
             SERVER_PID=""
             ABBRUCH="Server $ARM/$N nicht oben"
             break
@@ -133,7 +145,11 @@ for N in $SESSIONS; do
             "Traceback (most recent call last)"
         host_tail_into "$HOSTLOG" "$DIR/logs/${ARM}_${N}.tail.txt" 200
 
-        host_dump_and_kill "$SERVER_PID" "$DIR/pyspy-host-$SERVER_PID.txt"
+        # Nachgeprueft abraeumen, nicht nur angestossen: ein Server, der den
+        # naechsten Boot ueberlebt, macht aus acht Messpunkten acht Messungen
+        # desselben Prozesses.
+        bar1_kill_host_server "$SERVER_PID" "$HOSTPID" \
+            "$DIR/pyspy-host-$SERVER_PID.txt" || true
         SERVER_PID=""
         # The next boot must not race the dying one for VRAM.
         sleep 20

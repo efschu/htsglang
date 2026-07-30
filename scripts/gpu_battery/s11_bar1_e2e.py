@@ -66,21 +66,56 @@ KIND = "bar1_e2e"
 #: `smoke` traegt dafuer `endpunkt`, `finish_reason`, `zahlen_erwartet`,
 #: `spec_verify_ct` und `unterprovisioniert`. Aus demselben Grund: ohne
 #: `endpunkt` liest ein Check nicht, WORAUF die Kohaerenzzahl sich bezieht.
-SCHEMA_VERSION = 3
+#: 4: das Kriterium misst nicht mehr Gehorsam, sondern ob das Sprachmodell
+#: intakt ist -- `anker_zahlen`, `muell_befunde`, `lm_intakt` und die
+#: Kennzahlen dazu. Ein Artefakt nach Schema 3 traegt die Felder nicht, und
+#: sein `kohaerent` bedeutete etwas anderes als das gleichnamige hier.
+SCHEMA_VERSION = 4
 
 #: Der Fortsetzungs-Prompt, den s11_bar1_e2e.sh an /generate schickt. Er
 #: steht hier UND dort; dass die beiden zusammenpassen, nagelt
 #: test_gpu_battery_checks_bar1.py am Quelltext der Schrittdatei fest --
 #: sonst zaehlte der Parser eine Folge, die der Request nie angestossen hat.
 SMOKE_PROMPT = "1 2 3 4"
-#: Die Zahlen, die die Fortsetzung liefern muss. Beginnt bei 5, also hinter
-#: dem Prompt: was im Prompt steht, ist kein Beleg fuer die Antwort.
+#: Die erste Zahl, die die Fortsetzung liefern muss -- unmittelbar hinter dem
+#: Prompt. Was im Prompt steht, ist kein Beleg fuer die Antwort.
 ZAHLEN_VON = 5
 ZAHLEN_BIS = 20
-#: Wieviele davon in Folge dastehen muessen. Unveraendert 15 -- geaendert hat
-#: sich der Nenner (16 statt 20), weil die ersten vier Zahlen jetzt im Prompt
-#: stehen und nicht mehr mitzaehlen duerfen.
-MIN_ZAHLEN_IN_FOLGE = 15
+
+#: Wieviele Zahlen UNMITTELBAR und LUECKENLOS folgen muessen.
+#:
+#: Hier stand 15, und das hat den falschen Gegenstand gemessen. Anlauf 4 zaehlte
+#: korrekt " 5 6 7 8 9 10" weiter und driftete dann in einen kohaerenten
+#: russischen Forumtext -- rohe Fortsetzungs-Charakteristik eines Basispfades
+#: ohne Anweisung, kein Schaden am Modell. Die 15 verlangten Gehorsam ueber 16
+#: Zahlen; was dieser Schritt wissen will, ist etwas anderes: kommen fuer ein
+#: determiniertes Praefix die RICHTIGEN Token heraus, und ist der Rest
+#: wohlgeformter Text. Echte Korruption sieht anders aus -- sie liefert keine
+#: sechs richtigen Zahlen und danach Non-Sequitur-Muell.
+#:
+#: 4 und nicht 6, obwohl 6 gemessen sind: eine einzelne Beobachtung
+#: rechtfertigt keine Schwelle auf ihrem eigenen Wert. Der Abstand, auf den es
+#: ankommt, ist der zwischen 0 und 4 -- ein kaputtes Kollektiv liefert nicht
+#: vier korrekte Zahlen und verunglueckt dann.
+ANKER_MIN = 4
+
+#: Muell-Schwellen. JEDE ist an dem echten Artefakt von Anlauf 4 geeicht
+#: (smoke.json, 1055 Zeichen), nicht geschaetzt -- die gemessenen Werte stehen
+#: dahinter. Ein Test faehrt genau dieses Artefakt und verlangt, dass es
+#: besteht.
+#: gemessen 1.0000
+MUELL_DRUCKBAR_MIN = 0.98
+#: gemessen 0.435 (der Forumtext wiederholt einen Block, das ist Web-Text und
+#: kein Defekt). Eine Tokenschleife liegt bei ~0.01 -- der Abstand ist gross,
+#: die Schwelle liegt bewusst weit unter dem gemessenen Wert.
+MUELL_VIELFALT_MIN = 0.15
+#: Unter so wenigen Worten ist die Vielfalt Rauschen und wird nicht geprueft.
+MUELL_VIELFALT_AB_WORTEN = 30
+#: gemessen 3 ("###"). Eine Entartung wiederholt eine kurze Einheit dutzendfach.
+MUELL_WDH_MAX = 10
+MUELL_EINHEIT_MAX = 32
+#: Kuerzer als das ist keine Antwort, ueber die sich etwas sagen laesst.
+MUELL_MIN_ZEICHEN = 20
 
 #: Woraus die Beweislage gelesen wird, in dieser Reihenfolge. `htccl_lines.txt`
 #: ist der vollstaendige grep und steht deshalb vorn; `server.log` ist der
@@ -231,15 +266,20 @@ def parse_log_evidence(step_dir: str) -> dict:
 
 
 def zaehle_in_folge(text: str, von: int, bis: int) -> int:
-    """Wieviele der Zahlen ``von..bis`` in DIESER Reihenfolge im Text stehen.
+    """Wieviele der Zahlen ``von..bis`` IRGENDWO in dieser Reihenfolge stehen.
 
-    Eine Zahl, keine Meinung -- das war schon die Absicht und bleibt sie. Was
-    dazugelernt wurde: der Zaehler sagt nichts darueber, WOHER die Treffer
-    kommen. Im Lauf vom 2026-07-30 meldete er 3 fuer eine Antwort, die gar
-    nicht gezaehlt hat -- die Treffer waren die Aufzaehlungspunkte "1.",
-    "2.", "3." einer Denk-Praeambel. Deshalb faengt der Bereich jetzt bei 5
-    an (die Fortsetzung von "1 2 3 4"): die kleinen Ziffern, die in jedem
-    beliebigen Fliesstext vorkommen, zaehlen nicht mehr mit.
+    Der alte Zaehler, und er bleibt nur fuer die Chat-Form stehen (die endet
+    ohnehin in einem STOP). Warum er als Kriterium nicht taugt: er sagt
+    nichts darueber, WOHER die Treffer kommen. Am 2026-07-30 meldete er 3
+    fuer eine Antwort, die gar nicht gezaehlt hat -- die Treffer waren die
+    Aufzaehlungspunkte "1.", "2.", "3." einer Denk-Praeambel. Und in Anlauf 4
+    meldete er 10 fuer eine Antwort, deren erste sechs Zahlen richtig waren
+    und deren Rest russischer Forumtext ist: die restlichen vier Treffer sind
+    Ziffern aus "220В", "1450" und Datumsangaben. Ein Zaehler, der ueber den
+    ganzen Text streut, findet in Fliesstext immer irgendetwas.
+
+    Das Kriterium ist deshalb :func:`anker_folge` -- unmittelbar und
+    lueckenlos.
     """
     pos = 0
     treffer = 0
@@ -250,6 +290,110 @@ def zaehle_in_folge(text: str, von: int, bis: int) -> int:
         treffer += 1
         pos = stelle + len(str(n))
     return treffer
+
+
+def anker_folge(text: str, von: int) -> tuple:
+    """``(Anzahl, Resttext)`` -- die Zahlen UNMITTELBAR am Textanfang.
+
+    Gezaehlt wird, wieviele Zahlen ab ``von`` lueckenlos und in Folge ganz
+    vorn stehen, getrennt nur durch Zwischenraum. Beim ersten Bruch ist
+    Schluss; was danach kommt, ist der Resttext und wird nicht mehr auf
+    Zahlen abgesucht.
+
+    **Das ist der Unterschied zwischen "gehorcht" und "rechnet richtig".**
+    Ein Basispfad ohne Anweisung setzt eine Zahlenfolge ein Stueck weit fort
+    und driftet dann in das, woran ihn das Praefix erinnert -- das ist die
+    Charakteristik der rohen Fortsetzung, kein Defekt. Was der Anker prueft,
+    ist die eine Frage, die dieser Schritt beantworten kann: kommen fuer ein
+    determiniertes Praefix die richtigen Token heraus? Ein zerschossenes
+    Kollektiv liefert die nicht.
+
+    Streuende Suche waere hier falsch: "0/10" direkt hinter der 10 (so steht
+    es im Artefakt von Anlauf 4) darf nicht als 11 durchgehen, nur weil
+    irgendwo spaeter eine 11 auftaucht.
+    """
+    n = von
+    rest = text
+    treffer = 0
+    while True:
+        m = re.match(r"\s*(\d+)", rest)
+        if m is None or int(m.group(1)) != n:
+            break
+        treffer += 1
+        n += 1
+        rest = rest[m.end():]
+    return treffer, rest
+
+
+def _max_wiederholung(text: str) -> int:
+    """Wie oft sich eine kurze Einheit UNMITTELBAR hintereinander wiederholt.
+
+    Der Muell-Test, der Entartung von Web-Text trennt. Eine Tokenschleife
+    wiederholt dieselben paar Zeichen dutzendfach am Stueck; ein Forumtext,
+    der einen zitierten Block ein zweites Mal bringt, tut das nicht
+    unmittelbar und nicht kurz. Gemessen am Artefakt von Anlauf 4: 3 ("###").
+    """
+    text = text[:4000]
+    best = 0
+    for laenge in range(1, MUELL_EINHEIT_MAX + 1):
+        i = 0
+        while i + laenge <= len(text):
+            einheit = text[i:i + laenge]
+            n = 1
+            while text[i + n * laenge:i + (n + 1) * laenge] == einheit:
+                n += 1
+                if n > 64:            # genug, um "entartet" zu sagen
+                    return n
+            if n > best:
+                best = n
+            i += 1
+    return best
+
+
+def muell_pruefung(text: str) -> tuple:
+    """``(Befunde, Kennzahlen)`` -- ist der Text wohlgeformt oder Muell?
+
+    Drei Fragen, absichtlich stumpf und ohne Meinung darueber, WORUEBER der
+    Text spricht. Was hier NICHT geprueft wird, ist Sinn: ein russischer
+    Forumbeitrag ueber Drehstrommotoren ist ein voellig intaktes
+    Sprachmodell-Ergebnis, auch wenn ihn niemand bestellt hat.
+
+    Jede Schwelle ist am echten Artefakt von Anlauf 4 geeicht; die gemessenen
+    Werte stehen bei den Konstanten.
+    """
+    befunde = []
+    kennzahlen = {}
+    knapp = text.strip()
+    if len(knapp) < MUELL_MIN_ZEICHEN:
+        befunde.append(f"nur {len(knapp)} Zeichen Text")
+        return befunde, kennzahlen
+
+    druckbar = sum(1 for c in text if c.isprintable() or c in "\n\t")
+    anteil = druckbar / len(text)
+    kennzahlen["druckbar_anteil"] = round(anteil, 4)
+    if anteil < MUELL_DRUCKBAR_MIN:
+        befunde.append(
+            f"nur {anteil:.3f} druckbare Zeichen (< {MUELL_DRUCKBAR_MIN})"
+        )
+
+    worte = text.split()
+    if len(worte) >= MUELL_VIELFALT_AB_WORTEN:
+        vielfalt = len(set(worte)) / len(worte)
+        kennzahlen["wort_vielfalt"] = round(vielfalt, 4)
+        if vielfalt < MUELL_VIELFALT_MIN:
+            befunde.append(
+                f"Wortvielfalt {vielfalt:.3f} (< {MUELL_VIELFALT_MIN}) -- "
+                f"{len(set(worte))} verschiedene von {len(worte)} Worten"
+            )
+
+    wdh = _max_wiederholung(text)
+    kennzahlen["max_wiederholung"] = wdh
+    if wdh >= MUELL_WDH_MAX:
+        befunde.append(
+            f"eine kurze Einheit wiederholt sich {wdh}x unmittelbar "
+            f"(>= {MUELL_WDH_MAX}) -- Tokenschleife"
+        )
+    return befunde, kennzahlen
 
 
 def parse_smoke(step_dir: str) -> dict:
@@ -276,6 +420,11 @@ def parse_smoke(step_dir: str) -> dict:
         "finish_reason": None,
         "zahlen_in_folge": 0,
         "zahlen_erwartet": ZAHLEN_BIS - ZAHLEN_VON + 1,
+        "anker_zahlen": 0,
+        "anker_min": ANKER_MIN,
+        "drift_zeichen": 0,
+        "muell_befunde": [],
+        "lm_intakt": False,
         "kohaerent": False,
         "unterprovisioniert": False,
         "error": None,
@@ -332,16 +481,46 @@ def parse_smoke(step_dir: str) -> dict:
             ende = None
     out["finish_reason"] = ende
 
-    treffer = zaehle_in_folge(text, von, bis)
-    out["zahlen_in_folge"] = treffer
-    out["kohaerent"] = treffer >= MIN_ZAHLEN_IN_FOLGE
+    # Die streuende Zaehlung bleibt als KENNZAHL im Artefakt -- sie ist die
+    # Zahl, an der die beiden Fehlschluesse haengen (Praeambel-Punkte,
+    # Ziffern aus Fliesstext), und wer sie spaeter im Protokoll sieht, soll
+    # sie wiederfinden. Kriterium ist sie nicht mehr.
+    out["zahlen_in_folge"] = zaehle_in_folge(text, von, bis)
+
+    # (a) Der Anker: kommen fuer ein determiniertes Praefix die richtigen
+    #     Token heraus?
+    treffer, rest = anker_folge(text, von)
+    out["anker_zahlen"] = treffer
+    out["anker_min"] = ANKER_MIN
+    out["drift_zeichen"] = len(rest.strip())
+    anker_ok = treffer >= ANKER_MIN
+
+    # (b) Und ist der Rest wohlgeformter Text? Geprueft wird der GANZE
+    #     Abschnitt, nicht nur der Drift: eine Antwort, die exakt die Zahlen
+    #     enthaelt und dann aufhoert, hat keinen Drift und ist trotzdem in
+    #     Ordnung.
+    befunde, kennzahlen = muell_pruefung(text)
+    out["muell_befunde"] = befunde
+    out.update(kennzahlen)
+
+    out["lm_intakt"] = bool(anker_ok and not befunde)
+    # `kohaerent` bleibt als Name im Artefakt, weil der Check und die
+    # Auswertung ihn tragen -- aber er bedeutet jetzt "LM intakt" und nicht
+    # mehr "hat gehorcht". Das ist die Aenderung, um die es geht.
+    out["kohaerent"] = out["lm_intakt"]
+
     # Der benannte Zustand: zusammenhaengender Text, das Token-Budget bis
-    # zum Anschlag verbraucht, und die Zahlen kamen trotzdem nicht. Das ist
+    # zum Anschlag verbraucht, und die Zahlen kamen trotzdem NIE. Das ist
     # kein Transportfehler und keine Korruption, sondern ein Smoke, dessen
-    # Budget woanders hingegangen ist -- der Fall vom 2026-07-30. Er
-    # bekommt einen eigenen Namen, damit ihn niemand als bar1-Befund liest.
+    # Budget woanders hingegangen ist -- der Fall vom 2026-07-30 (Denk-
+    # Praeambel). Er setzt jetzt voraus, dass der ANKER gefehlt hat: driftet
+    # die Antwort erst NACH korrekt fortgesetzten Zahlen ab, ist sie kein
+    # unter-provisionierter Smoke, sondern ein bestandener.
     out["unterprovisioniert"] = bool(
-        not out["kohaerent"] and ende == "length" and len(text.strip()) >= 200
+        not anker_ok
+        and not befunde
+        and ende == "length"
+        and len(text.strip()) >= 200
     )
     return out
 

@@ -478,7 +478,7 @@ class TestDriverCompose:
 def _e2e(**over) -> dict:
     payload = {
         "kind": "bar1_e2e",
-        "schema_version": 3,
+        "schema_version": 4,
         "host": "192.168.0.1",
         "reachable": True,
         "integration_present": True,
@@ -515,6 +515,11 @@ def _e2e(**over) -> dict:
             "finish_reason": "length",
             "zahlen_in_folge": 16,
             "zahlen_erwartet": 16,
+            "anker_zahlen": 16,
+            "anker_min": 4,
+            "drift_zeichen": 0,
+            "muell_befunde": [],
+            "lm_intakt": True,
             "kohaerent": True,
             "unterprovisioniert": False,
             "error": None,
@@ -1020,7 +1025,13 @@ class TestAgainstTheGreenTransportRun:
         assert out["gate_cases"] == 0
         assert out["alle_bestanden"] is False
 
-    def test_smoke_coherence_is_counted_not_judged(self, tmp_path):
+    def test_the_chat_shape_is_still_parseable(self, tmp_path):
+        """Alte Artefakte bleiben LESBAR -- sie werden nur nicht bewertet.
+
+        Die Chat-Form endet im Check bei einem STOP. Dass der Parser sie
+        trotzdem versteht, ist der Unterschied zwischen "wir bewerten das
+        nicht" und "wir koennen es nicht mehr oeffnen".
+        """
         write_json(
             tmp_path / "smoke.json",
             {
@@ -1033,18 +1044,9 @@ class TestAgainstTheGreenTransportRun:
             },
         )
         out = parse_smoke(str(tmp_path))
+        assert out["endpunkt"] == "chat"
         assert out["zahlen_in_folge"] == 20
-        assert out["kohaerent"] is True
         assert out["spec_accept_length"] == 2.87
-
-    def test_smoke_garbage_is_not_coherent(self, tmp_path):
-        write_json(
-            tmp_path / "smoke.json",
-            {"choices": [{"message": {"content": "!!! !!! !!!"}, "meta_info": {}}]},
-        )
-        out = parse_smoke(str(tmp_path))
-        assert out["kohaerent"] is False
-        assert out["spec_accept_length"] is None
 
     def test_error_response_is_reported(self, tmp_path):
         write_json(tmp_path / "smoke.json", {"object": "error", "error": "no model"})
@@ -1052,14 +1054,35 @@ class TestAgainstTheGreenTransportRun:
         assert out["error"]
 
 
-class TestGenerateSmoke:
-    """The /generate form -- the one the step really asks for now.
+#: Abwechslungsreiche Prosa fuer die Negativkontrollen. KEIN wiederholter
+#: Satz: eine Kontrolle, die aus "Satz " * 30 gebaut ist, faellt IMMER ueber
+#: die Tokenschleifen-Pruefung und beweist damit nichts ueber die Bedingung,
+#: die sie eigentlich isolieren wollte. Beim ersten Anlauf dieser Tests ist
+#: genau das passiert.
+_PROSA = " ".join(
+    f"Der {w} Gedanke fuehrt uns zu einer weiteren Betrachtung ueber {z}."
+    for w, z in zip(
+        "erste zweite dritte vierte fuenfte sechste siebte achte neunte "
+        "zehnte elfte zwoelfte".split(),
+        "Netzwerke Kerne Puffer Register Karten Fenster Ringe Schlitze "
+        "Flaggen Runden Sperren Belege".split(),
+    )
+)
 
-    Two things drove the switch, both from the run of 2026-07-30: the chat
-    template answered a temperature-0 request with a thinking preamble and
-    spent the whole token budget on it, and `meta_info` is opt-in on the
-    chat path (`return_meta_info`, default False) so the accept length was
-    structurally unreadable there.
+
+class TestGenerateSmoke:
+    """The criterion: is the LM intact -- not did it obey.
+
+    Attempt 4 continued " 5 6 7 8 9 10" correctly at temperature 0 and then
+    drifted into a coherent Russian forum post about wiring a three-phase
+    motor. That is the characteristic of a raw continuation with no
+    instruction, not damage: the old bar ("15 numbers in order") measured
+    obedience and failed a healthy model. Real corruption does not produce
+    six correct numbers and then well-formed prose.
+
+    So: (a) an anchor of correct numbers IMMEDIATELY after the prompt, and
+    (b) the text passes blunt garbage tests. Nothing here judges MEANING --
+    an unbidden forum post is a perfectly intact language-model result.
     """
 
     def _schreibe(self, tmp_path, text, meta=None):
@@ -1069,7 +1092,7 @@ class TestGenerateSmoke:
         )
         return parse_smoke(str(tmp_path))
 
-    def test_a_clean_continuation_is_coherent(self, tmp_path):
+    def test_a_clean_continuation_is_intact(self, tmp_path):
         out = self._schreibe(
             tmp_path,
             SMOKE_FORTSETZUNG,
@@ -1077,88 +1100,126 @@ class TestGenerateSmoke:
              "finish_reason": {"type": "length"}},
         )
         assert out["endpunkt"] == "generate"
-        assert out["zahlen_in_folge"] == 16
-        assert out["zahlen_erwartet"] == 16
-        assert out["kohaerent"] is True
-        assert out["unterprovisioniert"] is False
+        assert out["anker_zahlen"] >= 16
+        assert out["lm_intakt"] is True
+        assert out["muell_befunde"] == []
         assert out["spec_accept_length"] == 2.87
         assert out["spec_verify_ct"] == 41
         assert out["finish_reason"] == "length"
 
-    def test_finish_reason_length_alone_is_not_a_failure(self, tmp_path):
-        """A continuation prompt has no reason to stop -- `length` is normal.
+    def test_drift_after_a_good_anchor_passes(self, tmp_path):
+        """The whole point of the rework, in miniature."""
+        out = self._schreibe(
+            tmp_path, " 5 6 7 8 9 10 " + _PROSA,
+            {"finish_reason": {"type": "length"}},
+        )
+        assert out["anker_zahlen"] == 6
+        assert out["lm_intakt"] is True
+        assert out["unterprovisioniert"] is False
 
-        Making `length` a failure by itself would turn the expected outcome
-        of this smoke into a red verdict.
-        """
+    def test_finish_reason_length_alone_is_not_a_failure(self, tmp_path):
+        """A continuation prompt has no reason to stop -- `length` is normal."""
         out = self._schreibe(
             tmp_path, SMOKE_FORTSETZUNG, {"finish_reason": {"type": "length"}}
         )
-        assert out["kohaerent"] is True
-        assert out["unterprovisioniert"] is False
+        assert out["lm_intakt"] is True
+
+    def test_the_anchor_must_be_immediate(self, tmp_path):
+        """A 5 somewhere in the prose is not a continuation.
+
+        The scattering counter would find 5..20 spread over any long text;
+        that is how it reported 10 for attempt 4 and 3 for the thinking
+        preamble. The anchor starts at character one.
+        """
+        out = self._schreibe(tmp_path, _PROSA + " 5 6 7 8 9 10")
+        assert out["anker_zahlen"] == 0
+        assert out["lm_intakt"] is False
+
+    def test_a_wrong_number_breaks_the_anchor_immediately(self, tmp_path):
+        """"0/10" right after the 10 must not pass as an 11.
+
+        Verbatim from attempt 4: the drift begins with "10 0/10". A search
+        that skips ahead would score that as a hit.
+        """
+        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 0/10 " + _PROSA)
+        assert out["anker_zahlen"] == 6
 
     def test_the_prompt_numbers_do_not_count(self, tmp_path):
-        """Echoing "1 2 3 4" proves nothing -- the count starts at 5."""
-        out = self._schreibe(tmp_path, "1 2 3 4")
-        assert out["zahlen_in_folge"] == 0
-        assert out["kohaerent"] is False
+        """Echoing "1 2 3 4" proves nothing -- the anchor starts at 5."""
+        out = self._schreibe(tmp_path, "1 2 3 4 " + _PROSA)
+        assert out["anker_zahlen"] == 0
+        assert out["lm_intakt"] is False
 
-    def test_a_numbered_list_no_longer_scores(self, tmp_path):
-        """The 2026-07-30 false positive, in miniature.
+    # -- Negativkontrollen: jede isoliert EINE Bedingung ------------------
 
-        The old counter reported 3 for a thinking preamble, because it
-        matched the list markers "1.", "2.", "3.". Starting the range at 5
-        takes the small digits of ordinary prose out of the count.
+    def test_a_token_loop_is_garbage_even_with_a_good_anchor(self, tmp_path):
+        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + "ja ja " * 100)
+        assert out["anker_zahlen"] == 6
+        assert out["lm_intakt"] is False
+        assert any("Tokenschleife" in b for b in out["muell_befunde"])
+
+    def test_unprintable_noise_is_garbage(self, tmp_path):
+        """Isolated: varied, non-repeating, but not printable text."""
+        import random
+
+        rnd = random.Random(7)
+        rauschen = "".join(chr(rnd.randrange(1, 32)) for _ in range(400))
+        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + rauschen)
+        assert out["lm_intakt"] is False
+        assert any("druckbare" in b for b in out["muell_befunde"])
+
+    def test_low_vocabulary_is_garbage(self, tmp_path):
+        """Isolated: printable, no immediate loop, but almost no vocabulary."""
+        worte = ["alpha", "beta"] * 60
+        # Umgestellt, damit sich keine kurze Einheit UNMITTELBAR wiederholt.
+        text = " ".join(worte[::2] + worte[1::2])
+        out = self._schreibe(tmp_path, " 5 6 7 8 9 10 " + text)
+        assert out["lm_intakt"] is False
+        assert any("Wortvielfalt" in b for b in out["muell_befunde"])
+
+    def test_an_empty_answer_is_garbage(self, tmp_path):
+        out = self._schreibe(tmp_path, "")
+        assert out["lm_intakt"] is False
+        assert out["muell_befunde"]
+
+    def test_clean_prose_alone_is_not_garbage_but_has_no_anchor(self, tmp_path):
+        """The control that keeps the garbage tests honest.
+
+        Well-formed text with no continuation must fail on the ANCHOR and
+        report no garbage -- otherwise the garbage tests are just a second,
+        vaguer way of saying the same thing.
         """
-        praeambel = (
-            "Here's a thinking process:\n\n1.  **Analyze User Input:**\n"
-            "   - Language: German\n\n2.  **Identify Core Task:**\n"
-            "   - Generate a sequence.\n\n3.  **Determine Output Format:**\n"
-        )
-        out = self._schreibe(tmp_path, praeambel)
-        assert out["zahlen_in_folge"] == 0
-        assert out["kohaerent"] is False
+        out = self._schreibe(tmp_path, _PROSA)
+        assert out["muell_befunde"] == []
+        assert out["anker_zahlen"] == 0
+        assert out["lm_intakt"] is False
 
     def test_the_named_under_provisioned_state(self, tmp_path):
-        """Coherent text, budget spent, numbers never arrived."""
+        """Coherent text, budget spent, the numbers never started."""
         out = self._schreibe(
-            tmp_path,
-            "Let me think about this carefully. " * 20,
-            {"finish_reason": {"type": "length"}},
+            tmp_path, _PROSA, {"finish_reason": {"type": "length"}}
         )
-        assert out["kohaerent"] is False
+        assert out["lm_intakt"] is False
         assert out["unterprovisioniert"] is True
 
-    def test_short_garbage_is_not_under_provisioned(self, tmp_path):
-        """Negative control: the named state must not swallow every failure.
-
-        An empty or tiny answer is a different fault, and calling it
-        "under-provisioned" would hide it behind a reassuring word.
-        """
-        for text in ("", "!!!", "5"):
-            out = self._schreibe(
-                tmp_path, text, {"finish_reason": {"type": "length"}}
-            )
-            assert out["unterprovisioniert"] is False, text
-
-    def test_long_coherent_text_that_stopped_is_not_under_provisioned(self, tmp_path):
-        """Negative control on the other axis: it needs finish=length.
-
-        A model that stopped on its own had the budget and did not use it
-        for the task -- that is incoherence, not under-provisioning.
-        """
+    def test_garbage_is_never_called_under_provisioned(self, tmp_path):
+        """The reassuring name must not cover a real fault."""
         out = self._schreibe(
-            tmp_path,
-            "Let me think about this carefully. " * 20,
-            {"finish_reason": {"type": "stop"}},
+            tmp_path, "ja ja " * 100, {"finish_reason": {"type": "length"}}
         )
-        assert out["kohaerent"] is False
+        assert out["unterprovisioniert"] is False
+
+    def test_a_good_anchor_is_never_called_under_provisioned(self, tmp_path):
+        """Attempt 4 must not be filed under "budget went elsewhere"."""
+        out = self._schreibe(
+            tmp_path, " 5 6 7 8 9 10 " + _PROSA,
+            {"finish_reason": {"type": "length"}},
+        )
         assert out["unterprovisioniert"] is False
 
     def test_the_accept_length_comes_from_meta_info_only(self, tmp_path):
-        """NOT spec_ema_accept_len -- that is a smoothed curve, not this
-        request's acceptance length, and confusing the two is a known
-        measurement trap."""
+        """NOT spec_ema_accept_len -- a smoothed curve, not this request's
+        acceptance length, and confusing the two is a known trap."""
         out = self._schreibe(
             tmp_path, SMOKE_FORTSETZUNG, {"spec_ema_accept_len": 3.4}
         )
@@ -1169,6 +1230,56 @@ class TestGenerateSmoke:
         out = parse_smoke(str(tmp_path))
         assert out["error"]
         assert "generate" in out["error"]
+
+
+class TestAgainstTheRealDriftAnswer:
+    """The artifact the old bar failed, driven verbatim.
+
+    Not a reconstruction: this is smoke.json of attempt 4, text and
+    meta_info byte for byte, provenance next to it. Every garbage threshold
+    is calibrated against these numbers, so this test is what stops someone
+    from tightening one until a healthy answer goes red again.
+    """
+
+    FIXTURE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "fixtures", "gpu_battery", "s11_bar1_e2e_generate_drift",
+    )
+
+    def _out(self, tmp_path):
+        shutil.copy(os.path.join(self.FIXTURE, "smoke.json"),
+                    str(tmp_path / "smoke.json"))
+        return parse_smoke(str(tmp_path))
+
+    def test_the_real_drift_answer_passes(self, tmp_path):
+        out = self._out(tmp_path)
+        assert out["endpunkt"] == "generate"
+        assert out["anker_zahlen"] == 6
+        assert out["muell_befunde"] == []
+        assert out["lm_intakt"] is True
+        assert out["unterprovisioniert"] is False
+
+    def test_the_old_scattering_count_would_have_failed_it(self, tmp_path):
+        """Kept as a number, so the reason stays visible in the artifact.
+
+        10 of 16 -- six real, four digits out of the Russian prose. That is
+        why the scattering count is a metric here and not the criterion.
+        """
+        out = self._out(tmp_path)
+        assert out["zahlen_in_folge"] == 10
+        assert out["zahlen_in_folge"] < 15
+
+    def test_the_measured_numbers_match_the_thresholds(self, tmp_path):
+        """The calibration, spelled out where a tightening would break it."""
+        out = self._out(tmp_path)
+        assert out["druckbar_anteil"] == 1.0
+        assert out["wort_vielfalt"] > 0.4
+        assert out["max_wiederholung"] == 3
+
+    def test_the_spec_path_was_alive(self, tmp_path):
+        out = self._out(tmp_path)
+        assert out["spec_accept_length"] > 3.0
+        assert out["spec_verify_ct"] == 165
 
 
 class TestSmokeContractWithTheStepScript:

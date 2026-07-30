@@ -79,16 +79,141 @@ EOF
 }
 
 # bar1_boot_start <container path of boot script> -> echoes the host pid
+# bar1_pid_ok <string> -- wahr nur fuer eine schlichte positive Ganzzahl.
+#
+# Es gibt sie, weil ein "pid", der keiner ist, in `kill` nicht auffaellt,
+# sondern durchrutscht: `kill -0 gestartet, pid 1962637` scheitert wie ein
+# toter Prozess, und der Aufraeumpfad hielt das fuer "nichts zu tun".
+bar1_pid_ok() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+        0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# bar1_boot_start <container path of boot script> <host pidfile> -> pid on stdout
+#
+# DIE UMLEITUNG NACH STDERR IST DER PUNKT, nicht Kosmetik. `host_run_script`
+# reicht die Ausgabe des entfernten Skripts durch, und das Bootskript sagt zum
+# Schluss "gestartet, pid <n>". Der Aufrufer liest diese Funktion per
+# Kommandosubstitution -- also landete BEIDES in der Variablen:
+#
+#     SERVER_PID='gestartet, pid 1962637
+#     1962637'
+#
+# Das ist keine Vermutung; genau so steht es in host_pids des Laufs vom
+# 2026-07-30 (31 Byte, zwei Zeilen). Die Folgen reichten weit ueber einen
+# haesslichen Wert hinaus: `host_dump_and_kill` fragte `kill -0 <dieser
+# Salat>`, bekam einen Fehler und nahm den frueher Ausstieg "da ist nichts,
+# also auch nichts zu toeten". Der Server ueberlebte JEDEN Ausgang des
+# Skripts -- Aufraeumen am Ende, trap auf EXIT, alles --, hielt die drei
+# Karten samt dmabuf-Anhaftungen, und der naechste Anlauf lief gegen ihn:
+# sein Graph-Tor bekam ENOMEM vom Halter, und sein Smoke wurde vom Server des
+# VORIGEN Anlaufs beantwortet.
+#
+# Dieselbe Familie wie der r7c-Befund "load_card_order durch eine Pipe": eine
+# Funktion, die ihren Rueckgabewert ueber stdout liefert, darf auf stdout
+# nichts anderes zulassen. Es kostet ein `>&2`.
 bar1_boot_start() {
     local script="$1" hostpid="$2" pid
-    host_run_script 180 "$script" || return 1
+    host_run_script 180 "$script" >&2 || return 1
     pid="$(host_ssh_for 60 "cat $hostpid 2>/dev/null")"
     pid="${pid//[^0-9]/}"
-    if [ -z "$pid" ]; then
-        echo "kein Host-pid in $hostpid" >&2
+    if ! bar1_pid_ok "$pid"; then
+        echo "kein brauchbarer Host-pid in $hostpid (gelesen: '$pid')" >&2
         return 1
     fi
     printf '%s\n' "$pid"
+    return 0
+}
+
+# bar1_altlast_pruefen <port> -- laeuft vom vorigen Anlauf noch etwas?
+#
+# EIN ssh-Umlauf, drei Fragen, keine Nebenwirkung: dieser Test toetet nichts.
+# Er benennt nur, was er findet, und der Aufrufer bricht ab. Warum nicht
+# aufraeumen: was auf diesen Karten laeuft, muss nicht von uns sein
+# (Fremdsitzung), und ein breites `pkill python` waere genau der
+# Blast-Radius, den die Rig-Regeln ausschliessen. Ein benannter Abbruch ist
+# ein Befund; ein Lauf gegen einen Zombie sind falsche Zahlen.
+#
+# Drei Tripdraehte, weil jeder allein blind ist:
+#   * der Port sagt nichts ueber Prozesse, die schon abgestuerzt sind und die
+#     Karten trotzdem halten,
+#   * die Prozessliste sagt nichts ueber einen Server, der unter anderem
+#     Namen laeuft,
+#   * der Kartenbelegung ist egal, wer sie haelt -- und genau das ist die
+#     Bedingung, an der der Aufbau der BAR1-Region wirklich haengt (der
+#     Halter meldete ENOMEM).
+BAR1_ALTLAST_MIB="${BAR1_ALTLAST_MIB:-2000}"
+bar1_altlast_pruefen() {
+    local port="$1" bericht="${2:-}" roh belegt proc vram schlimm=""
+    roh="$(host_ssh_for 90 "
+        echo \"PORT=\$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
+                        | grep -c ':$port ' )\";
+        echo \"PROC=\$(pgrep -c -f 'sglang.launch_server' 2>/dev/null || echo 0)\";
+        echo \"VRAM=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+                       2>/dev/null | tr '\n' ',')\";
+    " 2>/dev/null)" || {
+        echo "STOP: Altlast-Pruefung nicht durchfuehrbar (Host nicht erreichbar)" >&2
+        return 2
+    }
+    belegt="$(printf '%s\n' "$roh" | sed -n 's/^PORT=//p' | tail -1)"
+    proc="$(printf '%s\n' "$roh" | sed -n 's/^PROC=//p' | tail -1)"
+    vram="$(printf '%s\n' "$roh" | sed -n 's/^VRAM=//p' | tail -1)"
+    [ -n "$belegt" ] || belegt=0
+    [ -n "$proc" ] || proc=0
+
+    [ "$belegt" -gt 0 ] 2>/dev/null && schlimm="$schlimm Port-$port-belegt"
+    [ "$proc" -gt 0 ] 2>/dev/null && schlimm="$schlimm launch_server-Prozesse=$proc"
+    local i=0 mib
+    local IFS=,
+    for mib in $vram; do
+        mib="${mib// /}"
+        [ -z "$mib" ] && continue
+        if [ "$mib" -gt "$BAR1_ALTLAST_MIB" ] 2>/dev/null; then
+            schlimm="$schlimm GPU$i=${mib}MiB"
+        fi
+        i=$((i + 1))
+    done
+    unset IFS
+
+    if [ -n "$schlimm" ]; then
+        echo "STOP: Altlast von einem vorherigen Anlauf --$schlimm" >&2
+        echo "Die Karten oder der Port sind nicht frei. Ein Lauf dagegen misst" >&2
+        echo "den alten Server, nicht diesen. Erst aufraeumen (nur EIGENE pids" >&2
+        echo "aus host_pids), dann neu starten." >&2
+        [ -n "$bericht" ] && printf 'Altlast:%s\n' "$schlimm" > "$bericht"
+        return 1
+    fi
+    echo "Altlast-Pruefung: Port frei, keine launch_server-Prozesse, Karten unter ${BAR1_ALTLAST_MIB} MiB"
+    return 0
+}
+
+# bar1_kill_host_server <pid or empty> <host pidfile> <dump path>
+#
+# Der Aufraeumpfad, und er hat ZWEI Quellen fuer den pid. Die Variable des
+# Aufrufers ist die erste; stirbt das Skript zwischen Boot und Zuweisung, ist
+# sie leer, waehrend auf dem Host laengst ein Server laeuft -- dann gilt die
+# Pidfile, die das Bootskript selbst geschrieben hat. Ohne die zweite Quelle
+# ist genau das Zeitfenster ein Leck.
+bar1_kill_host_server() {
+    local pid="${1:-}" hostpid="${2:-}" dump="${3:-}" datei_pid=""
+    if ! bar1_pid_ok "$pid" && [ -n "$hostpid" ]; then
+        datei_pid="$(host_ssh_for 60 "cat $hostpid 2>/dev/null")" || datei_pid=""
+        datei_pid="${datei_pid//[^0-9]/}"
+        bar1_pid_ok "$datei_pid" && pid="$datei_pid"
+    fi
+    bar1_pid_ok "$pid" || return 0
+    host_dump_and_kill "$pid" "${dump:-/dev/null}"
+    # NACHSEHEN. Ein Kill, den niemand nachprueft, ist eine Absicht -- und die
+    # Absicht war schon da, als der Server den Lauf ueberlebte.
+    if host_ssh_for 60 "kill -0 $pid 2>/dev/null" >/dev/null 2>&1; then
+        echo "WARNUNG: Host-pid $pid lebt nach dem Abraeumen noch." >&2
+        echo "Der naechste Anlauf wird an der Altlast-Pruefung haengen bleiben." >&2
+        return 1
+    fi
+    echo "Host-Server $pid abgeraeumt."
     return 0
 }
 
