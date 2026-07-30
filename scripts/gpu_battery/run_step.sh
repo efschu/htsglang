@@ -31,14 +31,14 @@ STEP_TOKEN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force" ;;
-        -*) echo "unbekanntes Argument: $1" >&2; exit 2 ;;
+        -*) echo "unknown argument: $1" >&2; exit 2 ;;
         *) STEP_TOKEN="$1" ;;
     esac
     shift
 done
 
 if [ -z "$STEP_TOKEN" ]; then
-    echo "Aufruf: BATTERY_RUN=<dir> bash run_step.sh <step> [--force]" >&2
+    echo "usage: BATTERY_RUN=<dir> bash run_step.sh <step> [--force]" >&2
     exit 2
 fi
 
@@ -47,7 +47,7 @@ STATE="$PY $BATTERY_DIR/battery_state.py --run-dir $RUN"
 
 STEP="$("$PY" "$BATTERY_DIR/battery_state.py" field "$STEP_TOKEN" step_id 2>/dev/null)"
 if [ -z "$STEP" ]; then
-    echo "BATTERY-STOP $STEP_TOKEN: unbekannter Schritt (siehe BATTERY.md)"
+    echo "BATTERY-STOP $STEP_TOKEN: unknown step (see BATTERY.md)"
     exit 2
 fi
 
@@ -86,15 +86,15 @@ finish() {  # $1 = verdict, $2 = line, $3 = reason
         --started "$STARTED" --duration-s "$dur" >/dev/null
     echo "$2"
     if [ "$1" = "PASS" ] && [ "$REPORT_GATE" = "1" ]; then
-        echo "BATTERY-GATE $STEP: REPORT-GATE -- anhalten und das Ergebnis melden, bevor der naechste Schritt startet"
+        echo "BATTERY-GATE $STEP: REPORT-GATE -- stop and report the result before the next step starts"
     fi
-    echo "(Dauer ${dur}s, erwartet ~$((EXPECTED_MIN * 60))s, Budget ${TIMEOUT_S}s, Artefakte $STEP_DIR)"
+    echo "(took ${dur}s, expected ~$((EXPECTED_MIN * 60))s, budget ${TIMEOUT_S}s, artifacts $STEP_DIR)"
 }
 
 # --- corridor ---------------------------------------------------------------
 if [ "$NEEDS_CARDS" = "1" ]; then
     if ! battery_assert_corridor 2>"$STEP_DIR/corridor.txt"; then
-        finish STOP "BATTERY-STOP $STEP: VRAM-Korridor rot, weniger als $BATTERY_MIN_FREE_MIB MiB frei auf mindestens einer Karte" "Korridor"
+        finish STOP "BATTERY-STOP $STEP: VRAM corridor red, less than $BATTERY_MIN_FREE_MIB MiB free on at least one card" "corridor"
         exit 2
     fi
 fi
@@ -103,7 +103,7 @@ fi
 case "$LOCKS" in
     battery)
         if ! battery_acquire_locks "$STEP"; then
-            finish STOP "BATTERY-STOP $STEP: Karten-Lock fremd gehalten, wird nicht gebrochen" "Lock"
+            finish STOP "BATTERY-STOP $STEP: card lock held by someone else, not broken" "lock"
             exit 2
         fi
         ;;
@@ -111,7 +111,7 @@ case "$LOCKS" in
         # The step's own tool takes the locks. Holding them here would make it
         # abort on its own acquisition, so we only verify they are free.
         if ! battery_locks_are_free; then
-            finish STOP "BATTERY-STOP $STEP: Karten-Lock fremd gehalten, wird nicht gebrochen" "Lock"
+            finish STOP "BATTERY-STOP $STEP: card lock held by someone else, not broken" "lock"
             exit 2
         fi
         ;;
@@ -132,7 +132,7 @@ if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then
         battery_dump_and_kill "$pid" "$STEP_DIR/pyspy-$pid.txt"
     done < "$STEP_DIR/pids"
     battery_release_locks
-    finish STOP "BATTERY-STOP $STEP: Zeitbudget ${TIMEOUT_S}s ueberschritten, $n Prozess(e) gedumpt und beendet" "Timeout"
+    finish STOP "BATTERY-STOP $STEP: time budget ${TIMEOUT_S}s exceeded, $n process(es) dumped and killed" "timeout"
     exit 2
 fi
 
@@ -142,7 +142,7 @@ battery_release_locks
 LINE="$("$PY" "$BATTERY_DIR/checks/$CHECK" --step-dir "$STEP_DIR" 2>"$STEP_DIR/check.err")"
 CRC=$?
 if [ -z "$LINE" ]; then
-    LINE="BATTERY-STOP $STEP: Check hat keine Zeile ausgegeben (siehe $STEP_DIR/check.err)"
+    LINE="BATTERY-STOP $STEP: the check printed no line (see $STEP_DIR/check.err)"
     CRC=2
 fi
 

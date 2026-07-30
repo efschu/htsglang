@@ -18,7 +18,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ./battery_common.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
 RESULTS="$DIR/results"
 mkdir -p "$RESULTS"
 
@@ -31,9 +31,9 @@ export PYTHON="$PY"
 BASELINE_ARGS=()
 if [ -n "${P2P_BASELINE:-}" ] && [ -f "${P2P_BASELINE}" ]; then
     BASELINE_ARGS=(--baseline "$P2P_BASELINE")
-    echo "Baseline: $P2P_BASELINE"
+    echo "baseline: $P2P_BASELINE"
 else
-    echo "Baseline: keine (Diff-Spalte bleibt leer, das ist zulaessig)"
+    echo "baseline: none (the diff column stays empty, which is allowed)"
 fi
 
 bash "$WT/scripts/p2p_readiness/run_all.sh" \
@@ -51,6 +51,6 @@ for f in capability_matrix.json d2d_bench.json nccl_transport.json run.log verdi
 done
 
 echo "run_all.sh rc=$RC"
-echo "Artefakte:"
+echo "artifacts:"
 ls -la "$RESULTS"
 exit "$RC"

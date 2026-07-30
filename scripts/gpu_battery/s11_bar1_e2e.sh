@@ -27,7 +27,7 @@ source ./battery_common.sh
 source ./battery_host.sh
 source ./_bar1_host_boot.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start through run_step.sh}"
 PORT="${BAR1_PORT}"
 HOST_WT="${BAR1_HOST_WT:-$WT}"
 HOSTLOG="$BAR1_HOST_LOGDIR/s11.server.log"
@@ -38,7 +38,7 @@ compose() { "$PY" "$BATTERY_DIR/s11_bar1_e2e.py" --step-dir "$DIR" --port "$PORT
             --host-log "$HOSTLOG"; }
 
 if ! host_reachable; then
-    echo "STOP: Host $BAR1_HOST nicht erreichbar"
+    echo "STOP: host $BAR1_HOST not reachable"
     echo "unreachable" > "$DIR/host_unreachable.txt"
     compose
     exit 2
@@ -49,18 +49,18 @@ if ! bar1_require_integration; then
 fi
 
 if ! host_locks_acquire "$BATTERY_STEP"; then
-    echo "STOP: Host-Locks nicht zu bekommen"
+    echo "STOP: cannot acquire the host locks"
     echo "Host-Locks fremd gehalten -- nicht gebrochen" > "$DIR/blocked.txt"
     compose
     exit 2
 fi
 SERVER_PID=""
-# Der Aufraeumpfad. Er liest ZWEI Quellen (Variable und Pidfile auf dem Host)
-# und prueft nach, ob der Prozess wirklich weg ist -- beides, weil er am
-# 2026-07-30 stillschweigend nichts getan hat: SERVER_PID enthielt die
-# Bootmeldung samt pid, `kill -0` scheiterte daran, und das galt als "nichts
-# zu toeten". Der Server ueberlebte den Lauf, hielt drei Karten und den
-# dmabuf-Halter, und der naechste Anlauf lief gegen ihn.
+# The cleanup path. It reads TWO sources (the variable and the pidfile on the
+# host) and checks afterwards that the process is really gone -- both, because
+# on 2026-07-30 it silently did nothing: SERVER_PID held the boot message
+# together with the pid, `kill -0` failed on that, and that counted as
+# "nothing to kill". The server survived the run, held three cards and the
+# dmabuf holder, and the next attempt ran against it.
 cleanup() {
     bar1_kill_host_server "$SERVER_PID" "$HOSTPID" "$DIR/pyspy-host-server.txt" || true
     SERVER_PID=""
@@ -68,12 +68,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- keine Altlast? --------------------------------------------------------
-# VOR dem Tor, nicht erst vor dem Boot: schon das Graph-Tor baut BAR1-Regionen
-# auf und bekommt vom Halter ENOMEM, wenn die Karten noch belegt sind. Genau
-# so sind in Anlauf 4 alle sieben Faelle in 106 s durchgefallen -- ein
-# Ergebnis, das wie ein Befund ueber bar1 aussah und einer ueber das
-# Aufraeumen war.
+# --- nothing left over? -----------------------------------------------------
+# BEFORE the gate, not just before the boot: the graph gate already builds
+# BAR1 regions and gets ENOMEM from the holder while the cards are still
+# occupied. That is exactly how all seven cases fell in 106 s in attempt 4 --
+# a result that looked like a finding about bar1 and was one about cleanup.
 if ! bar1_altlast_pruefen "$PORT" "$DIR/blocked.txt"; then
     compose
     exit 2
@@ -98,23 +97,23 @@ TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
 EOF
 chmod +x "$DIR/remote_graph_check.sh"
 
-echo "== Tor: bar1_graph_check =="
+echo "== Gate: bar1_graph_check =="
 host_run_script 1200 "$DIR/remote_graph_check.sh" > "$DIR/graph_check.txt" 2>&1
 echo "$?" > "$DIR/graph_check_rc.txt"
 tail -n 12 "$DIR/graph_check.txt"
 
 # --- the standard run ------------------------------------------------------
-echo "== Standardlauf, Arm bar1 =="
+echo "== Standard run, arm bar1 =="
 bar1_write_boot_script "$DIR/remote_boot_bar1.sh" bar1 "$HOSTLOG" "$HOSTPID" "$PORT" || {
     compose; exit 2; }
 SERVER_PID="$(bar1_boot_start "$DIR/remote_boot_bar1.sh" "$HOSTPID")" || SERVER_PID=""
-# Nicht nur "nicht leer": eine Zahl. Ein pid, der keiner ist, faellt sonst
-# erst im Aufraeumpfad auf, und dort sieht er aus wie ein toter Prozess.
+# Not merely "not empty": a number. A pid that is none otherwise only shows up
+# in the cleanup path, and there it looks like a dead process.
 if ! bar1_pid_ok "$SERVER_PID"; then
-    echo "Server-Start lieferte keinen brauchbaren pid ('$SERVER_PID')"
+    echo "server start returned no usable pid ('$SERVER_PID')"
     SERVER_PID=""
-    # Der Server KANN trotzdem laufen -- die Pidfile auf dem Host ist die
-    # zweite Quelle, und genau dafuer nimmt cleanup sie.
+    # The server CAN be running all the same -- the pidfile on the host is the
+    # second source, and that is exactly what cleanup takes it for.
     host_tail_into "$HOSTLOG" "$DIR/server.log" 400
     compose
     exit 1
@@ -131,34 +130,33 @@ if ! host_wait_for_server "$PORT" 900; then
 fi
 
 # --- smoke: coherence and a live spec path ---------------------------------
-# ZWEI Gruende, warum das /generate ist und nicht /v1/chat/completions.
+# TWO reasons why this is /generate and not /v1/chat/completions.
 #
-# 1. DAS CHAT-TEMPLATE. Der Lauf vom 2026-07-30 hat denselben Request bei
-#    Temperatur 0 mit einer Denk-Praeambel beantwortet ("Here's a thinking
-#    process: 1. Analyze User Input ...") statt zu zaehlen. Die 128 Token
-#    waren davon verbraucht (finish_reason=length), die Zahlen kamen nie
-#    dran -- und der Kohaerenzzaehler meldete 3, weil er die
-#    Aufzaehlungspunkte DER PRAEAMBEL fuer die Antwort hielt. /generate
-#    schickt den Text ohne Template durch; eine Praeambel kann dort nicht
-#    entstehen, statt sie mit einem Schalter abzustellen, dessen
-#    Unterstuetzung am Template des Modells haengt.
-# 2. meta_info. Auf dem Chat-Pfad ist es opt-in (protocol.py:723
-#    return_meta_info=False, serving_chat.py:1376 gibt sonst None), auf
-#    /generate kommt es immer mit -- und nur dort steht
-#    spec_accept_length, das dieser Schritt braucht.
+# 1. THE CHAT TEMPLATE. The run of 2026-07-30 answered the very same request
+#    at temperature 0 with a thinking preamble ("Here's a thinking process:
+#    1. Analyze User Input ...") instead of counting. The 128 tokens went on
+#    that (finish_reason=length), the numbers never got their turn -- and the
+#    coherence counter reported 3, because it took the bullet points OF THE
+#    PREAMBLE for the answer. /generate puts the text through without a
+#    template; a preamble cannot arise there at all, rather than switching it
+#    off with a flag whose support depends on the model's template.
+# 2. meta_info. On the chat path it is opt-in (protocol.py:723
+#    return_meta_info=False, serving_chat.py:1376 returns None otherwise); on
+#    /generate it always comes along -- and only there sits
+#    spec_accept_length, which this step needs.
 #
-# Fortsetzungs-Prompt statt Anweisung: "1 2 3 4" fortzusetzen ist keine
-# Aufgabe, ueber die sich nachdenken laesst. 512 Token sind Luft genug, dass
-# die Grenze nie die Antwort abschneidet.
+# A continuation prompt instead of an instruction: continuing "1 2 3 4" is not
+# a task anyone can think about. 512 tokens is enough air that the limit never
+# truncates the answer.
 #
-# Was das Kriterium daraus liest, ist NICHT "hat er brav bis 20 gezaehlt".
-# Anlauf 4 zaehlte " 5 6 7 8 9 10" korrekt weiter und driftete dann in einen
-# russischen Forumtext -- die Charakteristik einer rohen Fortsetzung ohne
-# Anweisung, kein Schaden. Geprueft wird deshalb (a) ein Anker aus vier
-# unmittelbar und lueckenlos richtigen Zahlen und (b) dass der Text
-# wohlgeformt ist (druckbar, keine Tokenschleife). Die Begruendung samt der
-# am Artefakt gemessenen Schwellen steht in s11_bar1_e2e.py.
-echo "== Smoke-Request (/generate, Fortsetzung) =="
+# What the criterion reads out of it is NOT "did it dutifully count to 20".
+# Attempt 4 continued " 5 6 7 8 9 10" correctly and then drifted into a
+# Russian forum post -- the characteristic of a raw continuation with no
+# instruction, not damage. What is checked is therefore (a) an anchor of four
+# immediately and gaplessly correct numbers and (b) that the text is
+# well-formed (printable, no token loop). The reasoning, together with the
+# thresholds measured against the artifact, sits in s11_bar1_e2e.py.
+echo "== Smoke request (/generate, continuation) =="
 host_ssh_for 180 "curl -s -m 120 http://127.0.0.1:$PORT/generate \
   -H 'Content-Type: application/json' -d '{\"text\": \"1 2 3 4\", \
   \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 512}}' \
@@ -170,7 +168,7 @@ host_ssh_for 60 "curl -sf -m 20 http://127.0.0.1:$PORT/get_server_info" \
     > "$DIR/server_info.json" 2>/dev/null
 
 # --- harvest the log evidence, then shut down ------------------------------
-echo "== Belege aus dem Serverlog (bleibt auf dem Host) =="
+echo "== Evidence out of the server log (stays on the host) =="
 host_grep_into "$HOSTLOG" "$DIR/htccl_lines.txt" \
     "HTCCL-BAR1: Aufbau in" \
     "BAR1-Kasse dieser Karte nach Gruppe" \

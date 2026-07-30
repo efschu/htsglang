@@ -52,59 +52,59 @@ MIN_CARDS = 3
 def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "driver_state.json")
     if not os.path.exists(path):
-        raise CheckStop(
-            f"driver_state.json fehlt ({path}) -- der Schritt ist nicht gelaufen"
-        )
+        raise CheckStop(f"driver_state.json missing ({path}) -- the step never ran")
     payload = load_json(path, "driver_state.json")
     require_envelope(payload, KIND, "driver_state.json", 1)
 
     if not payload.get("reachable"):
         raise CheckStop(
-            f"Host {payload.get('host') or '?'} nicht erreichbar -- ueber ssh wurde "
-            "nichts erhoben, also ist auch nichts geprueft"
+            f"host {payload.get('host') or '?'} unreachable -- nothing was collected "
+            "over ssh, so nothing was checked either"
         )
 
     blocked = payload.get("blocked")
     if blocked:
         first = " ".join(str(blocked).split())[:180]
         raise CheckStop(
-            f"Eingriff blockiert, nichts angefasst: {first} "
-            "(Betrachter beenden ist eine Nutzer-Entscheidung: BAR1_VIEWER_KILL_OK=1)"
+            f"intervention blocked, nothing touched: {first} "
+            "(ending a viewer is the user's call: BAR1_VIEWER_KILL_OK=1)"
         )
 
     apps = payload.get("compute_apps") or []
     if apps:
-        raise CheckStop(f"{len(apps)} Rechenprozess(e) auf den Karten: {apps[0][:120]}")
+        raise CheckStop(
+            f"{len(apps)} compute process(es) on the cards: {apps[0][:120]}"
+        )
 
     if not payload.get("regkey_present"):
         raise CheckFail(
-            f"Regkey {payload.get('regkey_expected')!r} steht nicht in "
-            f"/proc/driver/nvidia/params (Zeile: {payload.get('regkey_line')!r}) -- "
-            "der Peer-BAR1-Zweig ist aus"
+            f"Regkey {payload.get('regkey_expected')!r} does not appear in "
+            f"/proc/driver/nvidia/params (line: {payload.get('regkey_line')!r}) -- "
+            "the peer-BAR1 branch is switched off"
         )
 
     level = payload.get("patch_level")
     if level != "voll":
         raise CheckFail(
-            f"Patch-Stand {level!r} (strings SMALLBAR_P2P = "
-            f"{payload.get('strings_smallbar')!r}, erwartet {STRINGS_FULL}) -- "
-            "der minimale Patch traegt den Direktpfad nicht"
+            f"patch level {level!r} (strings SMALLBAR_P2P = "
+            f"{payload.get('strings_smallbar')!r}, expected {STRINGS_FULL}) -- "
+            "the minimal patch does not carry the direct path"
         )
 
     if not payload.get("module_identity_matches"):
         raise CheckFail(
-            f"srcversion des geladenen Moduls {payload.get('srcversion_loaded')!r} "
-            f"passt nicht zur .ko {payload.get('srcversion_file')!r} -- geladen ist "
-            "ein anderes Modul als das gepatchte, die Regkey-Zeile allein belegt "
-            "nur einen Parameter"
+            f"srcversion of the loaded module {payload.get('srcversion_loaded')!r} "
+            f"does not match the .ko {payload.get('srcversion_file')!r} -- what is "
+            "loaded is a different module than the patched one, and the regkey line "
+            "alone only proves a parameter"
         )
 
     if not payload.get("dmabuf_holder_loaded"):
-        raise CheckFail("dmabuf_holder ist nicht geladen -- ohne Halter kein Export")
+        raise CheckFail("dmabuf_holder is not loaded -- no holder, no export")
     if not payload.get("dmabuf_dev_present"):
         raise CheckFail(
-            "/dev/dmabuf_holder fehlt, obwohl das Modul geladen ist -- der Export "
-            "scheitert erst spaeter, mitten im Aufbau"
+            "/dev/dmabuf_holder is missing even though the module is loaded -- the "
+            "export only fails later, in the middle of the setup"
         )
 
     modules = payload.get("modules") or {}
@@ -112,19 +112,19 @@ def check(step_dir: str) -> None:
     # with nobody using it yet. Testing truthiness would call a fresh insmod a
     # missing module.
     if modules.get("nvidia_uvm", "") == "":
-        raise CheckFail("nvidia_uvm ist nicht geladen -- ohne UVM kein CUDA")
+        raise CheckFail("nvidia_uvm is not loaded -- no UVM, no CUDA")
 
     cards = payload.get("cards") or []
     if len(cards) < MIN_CARDS:
         raise CheckFail(
-            f"nur {len(cards)} von {MIN_CARDS} Karten enumerieren -- eine Karte ist "
-            "nach dem PCI-Reset nicht zurueckgekommen"
+            f"only {len(cards)} of {MIN_CARDS} cards enumerate -- one card did not "
+            "come back from its PCI-Reset"
         )
     for card in cards:
         if not card.get("uuid") or not card.get("pci_bus_id"):
             raise CheckFail(
-                f"Karte ohne UUID oder PCI-Adresse: {card!r} -- jede spaetere "
-                "Kartenaussage waere unbelegt"
+                f"card without a UUID or a PCI address: {card!r} -- every later "
+                "statement about a card would be unsupported"
             )
 
 

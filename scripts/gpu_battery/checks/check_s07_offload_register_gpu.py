@@ -62,30 +62,30 @@ def check(step_dir: str) -> None:
 
     if payload.get("device_ops") != "CudaDeviceOps":
         raise CheckFail(
-            f"device_ops ist {payload.get('device_ops')!r} -- eine Validierung mit "
-            "FakeDeviceOps validiert nichts"
+            f"device_ops is {payload.get('device_ops')!r} -- a validation run on "
+            "FakeDeviceOps validates nothing"
         )
 
     device = payload.get("device") or {}
     if not device.get("pci_bus_id") or device.get("cuda_index") is None:
-        raise CheckStop("die benutzte Karte ist nicht per PCI benannt")
+        raise CheckStop("the card that was used is not named by PCI address")
 
     routes = payload.get("routes") or {}
     for route in REQUIRED_ROUTES:
         status = routes.get(route)
         if status is None:
-            raise CheckStop(f"Route {route} wurde nicht einmal versucht")
+            raise CheckStop(f"route {route} was not even attempted")
         if status == "unavailable":
             raise CheckStop(
-                f"Route {route} nicht verfuegbar ({payload.get('memory_saver')}) -- "
-                "zwei von drei Routen ungetestet, das ist kein gruener Lauf"
+                f"route {route} unavailable ({payload.get('memory_saver')}) -- two "
+                "of three routes untested, that is not a green run"
             )
         if status != "ok":
-            raise CheckFail(f"Route {route}: {status}")
+            raise CheckFail(f"route {route}: {status}")
 
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
-        raise CheckFail("keine rows -- es wurde kein Posten bewegt")
+        raise CheckFail("no rows -- not a single item was moved")
 
     seen_routes = set()
     for row in rows:
@@ -97,16 +97,16 @@ def check(step_dir: str) -> None:
         require_number(row.get("size_bytes"), f"{label}: size_bytes", minimum=1)
         if not row.get("size_source_matches"):
             raise CheckFail(
-                f"{label}: resolve_size_bytes weicht von der echten Tensor-Groesse ab "
-                "-- die Buchfuehrung des Registers waere falsch"
+                f"{label}: resolve_size_bytes disagrees with the tensor's real size "
+                "-- the register's accounting would be wrong"
             )
 
         require_number(row.get("iters"), f"{label}: iters", minimum=MIN_CYCLES)
         wave = require_number(row.get("wave_in_ms_p50"), f"{label}: wave_in_ms_p50")
         if wave <= 0:
             raise CheckFail(
-                f"{label}: Rueckhol-Latenz {wave} ms -- eine Bewegung, die keine Zeit "
-                "kostet, hat keine Bytes bewegt"
+                f"{label}: retrieval latency {wave} ms -- a movement that costs no "
+                "time moved no bytes"
             )
         require_number(row.get("park_ms_p50"), f"{label}: park_ms_p50")
         if is_number(row.get("wave_in_ms_p99")) and row["wave_in_ms_p99"] < wave:
@@ -115,43 +115,45 @@ def check(step_dir: str) -> None:
         states = row.get("state_sequence") or []
         if "parked" not in states:
             raise CheckFail(
-                f"{label}: Zustandsfolge {states} enthaelt nie 'parked' -- der Park "
-                "war ein stiller No-Op"
+                f"{label}: state sequence {states} never contains 'parked' -- the "
+                "park was a silent No-Op"
             )
         if "resident" not in states:
-            raise CheckFail(f"{label}: Zustandsfolge {states} enthaelt nie 'resident'")
+            raise CheckFail(
+                f"{label}: state sequence {states} never contains 'resident'"
+            )
 
     missing = [r for r in REQUIRED_ROUTES if r not in seen_routes]
     if missing:
-        raise CheckFail(f"keine Zeile fuer Route(n) {missing}")
+        raise CheckFail(f"no row for route(s) {missing}")
 
     stats = payload.get("stats") or {}
     for field in ("park_failures", "wave_in_failures"):
         value = stats.get(field)
         if value is None:
-            raise CheckStop(f"Bewegungs-Telemetrie ohne {field}")
+            raise CheckStop(f"movement telemetry without {field}")
         if value:
             raise CheckFail(f"{field} = {value}")
     if not stats.get("parks"):
-        raise CheckFail("die Bewegungs-Telemetrie zaehlt null parks")
+        raise CheckFail("the movement telemetry counts zero parks")
 
     control = payload.get("negative_control")
     if not isinstance(control, dict) or "refused" not in control:
         raise CheckStop(
-            "keine Negativkontrolle im Artefakt -- damit belegt der Lauf nicht, "
-            "dass die explizite Klassen-Policy den Park zugelassen hat"
+            "no Negativkontrolle in the artifact -- so the run does not prove that "
+            "it was the explicit class policy that allowed the park"
         )
     if not control.get("refused"):
         raise CheckFail(
-            "Negativkontrolle: 'auto' ohne Saettigungsdruck hat den Park NICHT "
-            f"verweigert ({control.get('error')})"
+            "Negativkontrolle: 'auto' without saturation pressure did NOT refuse the "
+            f"park ({control.get('error')})"
         )
 
     terms = payload.get("latency_term_ms") or {}
     if not terms:
         raise CheckFail(
-            "kein latency_term_ms erhoben -- genau diese Zahl liest der "
-            "#279-Dispatcher, und ohne sie bleibt sie geraten"
+            "no latency_term_ms collected -- this is exactly the number the #279 "
+            "dispatcher reads, and without it the number stays a guess"
         )
 
 

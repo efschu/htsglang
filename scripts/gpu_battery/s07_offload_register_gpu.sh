@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 source ./battery_common.sh
 
-DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR fehlt -- ueber run_step.sh starten}"
+DIR="${BATTERY_STEP_DIR:?BATTERY_STEP_DIR missing -- start via run_step.sh}"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="$WT/python:${PYTHONPATH:-}"
@@ -17,12 +17,12 @@ export SGLANG_OFFLOAD_REGISTER=1
 # hermetically has no business touching the card in the next line.
 echo "== Plan =="
 if ! "$PY" "$BATTERY_DIR/s07_offload_register_gpu.py" --dry-run; then
-    echo "STOP: die Sonde scheitert schon hermetisch (--dry-run) -- keine Karte anfassen" >&2
+    echo "STOP: the probe already fails hermetically (--dry-run) -- do not touch a card" >&2
     echo "rc=2"
     exit 2
 fi
 
-echo "== Messung =="
+echo "== measurement =="
 "$PY" "$BATTERY_DIR/s07_offload_register_gpu.py" --out "$DIR/offload_register_gpu.json"
 RC=$?
 

@@ -20,50 +20,53 @@ import os
 import statistics
 import sys
 
-METRIKEN = (
+# The metric LABELS stay verbatim. `ms/Verify` is the name s12 defines for the
+# whole battery, `ms/Schritt` is its sibling, and every table in the validation
+# doc is quoted under those two names.
+METRICS = (
     ("tick_ms_pro_verify", "ms/Verify"),
     ("tick_gen_tok_s_median", "tok/s (tick)"),
-    ("klient_tok_s", "tok/s (klient)"),
+    ("klient_tok_s", "tok/s (client)"),
     ("tick_accept_len_median", "accept"),
     ("tick_ms_pro_schritt", "ms/Schritt"),
 )
 
 
-def lade(pfad: str) -> list:
-    punkte = []
-    if not os.path.exists(pfad):
-        return punkte
-    with open(pfad, errors="replace") as f:
-        for zeile in f:
-            zeile = zeile.strip()
-            if not zeile:
+def load(path: str) -> list:
+    points = []
+    if not os.path.exists(path):
+        return points
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                punkte.append(json.loads(zeile))
+                points.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return punkte
+    return points
 
 
-def _arm_basis(arm: str) -> str:
+def _arm_base(arm: str) -> str:
     """`bar1_hi_r2` -> `bar1_hi`. The round belongs to the sample, not the arm."""
     return arm.rsplit("_r", 1)[0] if "_r" in arm else arm
 
 
-def _spanne(werte: list) -> dict:
-    werte = [w for w in werte if isinstance(w, (int, float))]
-    if not werte:
+def _spread(values: list) -> dict:
+    values = [w for w in values if isinstance(w, (int, float))]
+    if not values:
         return {"n": 0}
-    med = statistics.median(werte)
+    med = statistics.median(values)
     out = {
-        "n": len(werte),
+        "n": len(values),
         "median": med,
-        "min": min(werte),
-        "max": max(werte),
-        "spanne_rel": (max(werte) - min(werte)) / med if med else None,
+        "min": min(values),
+        "max": max(values),
+        "spanne_rel": (max(values) - min(values)) / med if med else None,
     }
-    if len(werte) > 2:
-        out["stdev_rel"] = statistics.stdev(werte) / med if med else None
+    if len(values) > 2:
+        out["stdev_rel"] = statistics.stdev(values) / med if med else None
     return out
 
 
@@ -71,27 +74,28 @@ def _fmt(x, nk=2) -> str:
     if x is None:
         return "-"
     if isinstance(x, bool):
-        return "ja" if x else "NEIN"
+        return "yes" if x else "NO"
     if isinstance(x, float):
         return f"{x:.{nk}f}"
     return str(x)
 
 
-def tabelle_punkte(punkte: list) -> str:
+def table_points(points: list) -> str:
     z = [
-        "| Arm | bs | Wdh | ms/Verify | ms/Schritt | tok/s tick | tok/s klient "
-        "| accept (tick) | accept (klient) | Ticks gew./bs | fremde bs | Graph |",
+        "| Arm | bs | Rep | ms/Verify | ms/Schritt | tok/s tick | tok/s client "
+        "| accept (tick) | accept (client) | ticks counted/bs | foreign bs "
+        "| Graph |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    zaehler: dict = {}
-    for p in sorted(punkte, key=lambda q: (q.get("arm", ""), q.get("folge", 0))):
+    counter: dict = {}
+    for p in sorted(points, key=lambda q: (q.get("arm", ""), q.get("folge", 0))):
         key = (p.get("arm"), p.get("bs"))
-        zaehler[key] = zaehler.get(key, 0) + 1
+        counter[key] = counter.get(key, 0) + 1
         z.append(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {} | {} |".format(
                 p.get("arm"),
                 p.get("bs"),
-                zaehler[key],
+                counter[key],
                 _fmt(p.get("tick_ms_pro_verify")),
                 _fmt(p.get("tick_ms_pro_schritt"), 1),
                 _fmt(p.get("tick_gen_tok_s_median"), 1),
@@ -107,21 +111,21 @@ def tabelle_punkte(punkte: list) -> str:
     return "\n".join(z)
 
 
-def tabelle_boden(punkte: list) -> str:
+def table_floor(points: list) -> str:
     """Repeat spread per (arm, bs). This is the floor, and it comes first."""
-    gruppen: dict = {}
-    for p in punkte:
-        gruppen.setdefault((_arm_basis(p.get("arm", "")), p.get("bs")), []).append(p)
+    groups: dict = {}
+    for p in points:
+        groups.setdefault((_arm_base(p.get("arm", "")), p.get("bs")), []).append(p)
     z = [
-        "| Arm | bs | Wdh | Metrik | Median | min | max | Spanne (max-min)/Median "
-        "| rel. Stdev |",
+        "| Arm | bs | Rep | Metric | Median | min | max "
+        "| Spread (max-min)/median | rel. stdev |",
         "|---|---:|---:|---|---:|---:|---:|---:|---:|",
     ]
-    for (arm, bs), gruppe in sorted(gruppen.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0)):
-        if len(gruppe) < 2:
+    for (arm, bs), group in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0)):
+        if len(group) < 2:
             continue
-        for feld, name in METRIKEN:
-            s = _spanne([g.get(feld) for g in gruppe])
+        for field, name in METRICS:
+            s = _spread([g.get(field) for g in group])
             if s.get("n", 0) < 2:
                 continue
             z.append(
@@ -137,66 +141,66 @@ def tabelle_boden(punkte: list) -> str:
                     _fmt(100.0 * s["stdev_rel"], 2) + " %" if s.get("stdev_rel") is not None else "-",
                 )
             )
-    return "\n".join(z) if len(z) > 2 else "(keine Wiederholung im Lauf)"
+    return "\n".join(z) if len(z) > 2 else "(no repeat in this run)"
 
 
-def tabelle_verhaeltnis(punkte: list, arm_a: str, arm_b: str) -> str:
+def table_ratio(points: list, arm_a: str, arm_b: str) -> str:
     """arm_a against arm_b per batch size, with both floors next to the ratio."""
-    je: dict = {}
-    for p in punkte:
-        je.setdefault((_arm_basis(p.get("arm", "")), p.get("bs")), []).append(p)
-    bs_werte = sorted({bs for (_, bs) in je if bs is not None})
+    per: dict = {}
+    for p in points:
+        per.setdefault((_arm_base(p.get("arm", "")), p.get("bs")), []).append(p)
+    bs_values = sorted({bs for (_, bs) in per if bs is not None})
     z = [
-        f"| bs | ms/Verify {arm_a} | ms/Verify {arm_b} | Faktor | tok/s {arm_a} "
-        f"| tok/s {arm_b} | Faktor | accept {arm_a} | accept {arm_b} "
-        "| Boden ms/Verify (max beider Arme) | ueber Boden |",
+        f"| bs | ms/Verify {arm_a} | ms/Verify {arm_b} | Factor | tok/s {arm_a} "
+        f"| tok/s {arm_b} | Factor | accept {arm_a} | accept {arm_b} "
+        "| floor ms/Verify (max of both arms) | above floor |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for bs in bs_werte:
-        a = je.get((arm_a, bs)) or []
-        b = je.get((arm_b, bs)) or []
+    for bs in bs_values:
+        a = per.get((arm_a, bs)) or []
+        b = per.get((arm_b, bs)) or []
         if not a or not b:
             continue
-        va = _spanne([p.get("tick_ms_pro_verify") for p in a])
-        vb = _spanne([p.get("tick_ms_pro_verify") for p in b])
-        ra = _spanne([p.get("tick_gen_tok_s_median") for p in a])
-        rb = _spanne([p.get("tick_gen_tok_s_median") for p in b])
-        aa = _spanne([p.get("tick_accept_len_median") for p in a])
-        ab = _spanne([p.get("tick_accept_len_median") for p in b])
+        va = _spread([p.get("tick_ms_pro_verify") for p in a])
+        vb = _spread([p.get("tick_ms_pro_verify") for p in b])
+        ra = _spread([p.get("tick_gen_tok_s_median") for p in a])
+        rb = _spread([p.get("tick_gen_tok_s_median") for p in b])
+        aa = _spread([p.get("tick_accept_len_median") for p in a])
+        ab = _spread([p.get("tick_accept_len_median") for p in b])
         if not va.get("median") or not vb.get("median"):
             continue
-        faktor = vb["median"] / va["median"]
-        # A single sample has no spread, and _spanne reports 0.0 for it. Taking
+        factor = vb["median"] / va["median"]
+        # A single sample has no spread, and _spread reports 0.0 for it. Taking
         # that as a floor would clear every difference against a floor of zero,
         # which is the opposite of what a floor is for: a point without a
         # repetition has NO floor and says so.
-        spannen = [
+        spreads = [
             s["spanne_rel"]
             for s in (va, vb)
             if s.get("n", 0) >= 2 and s.get("spanne_rel") is not None
         ]
-        if len(spannen) < 2:
-            boden_text, ueber = "-", "?"
+        if len(spreads) < 2:
+            floor_text, above = "-", "?"
         else:
             # The difference has to clear the floor of the noisier of the two
             # arms; the floor is a relative spread, so the comparison is on
-            # |faktor - 1|.
-            boden = max(spannen)
-            boden_text = _fmt(100.0 * boden, 2) + " %"
-            ueber = "ja" if abs(faktor - 1.0) > boden else "NEIN"
+            # |factor - 1|.
+            floor = max(spreads)
+            floor_text = _fmt(100.0 * floor, 2) + " %"
+            above = "yes" if abs(factor - 1.0) > floor else "NO"
         z.append(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 bs,
                 _fmt(va["median"]),
                 _fmt(vb["median"]),
-                _fmt(faktor, 3),
+                _fmt(factor, 3),
                 _fmt(ra.get("median"), 1),
                 _fmt(rb.get("median"), 1),
                 _fmt((ra["median"] / rb["median"]) if ra.get("median") and rb.get("median") else None, 3),
                 _fmt(aa.get("median")),
                 _fmt(ab.get("median")),
-                boden_text,
-                ueber,
+                floor_text,
+                above,
             )
         )
     return "\n".join(z)
@@ -210,26 +214,26 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="")
     args = p.parse_args(argv)
 
-    punkte = lade(os.path.join(args.step_dir, "decode_punkte.jsonl"))
-    if not punkte:
-        print("keine Punkte in decode_punkte.jsonl", file=sys.stderr)
+    points = load(os.path.join(args.step_dir, "decode_punkte.jsonl"))
+    if not points:
+        print("no points in decode_punkte.jsonl", file=sys.stderr)
         return 1
 
-    teile = [
-        f"### Rauschboden -- Wiederholungen desselben Arms ({len(punkte)} Punkte)",
+    parts = [
+        f"### Noise floor -- repeats of the same arm ({len(points)} points)",
         "",
-        tabelle_boden(punkte),
+        table_floor(points),
         "",
-        "### Punkte einzeln",
+        "### The points one by one",
         "",
-        tabelle_punkte(punkte),
+        table_points(points),
         "",
-        f"### {args.arm_a} gegen {args.arm_b}",
+        f"### {args.arm_a} against {args.arm_b}",
         "",
-        tabelle_verhaeltnis(punkte, args.arm_a, args.arm_b),
+        table_ratio(points, args.arm_a, args.arm_b),
         "",
     ]
-    text = "\n".join(teile)
+    text = "\n".join(parts)
     print(text)
     if args.out:
         with open(args.out, "w") as f:

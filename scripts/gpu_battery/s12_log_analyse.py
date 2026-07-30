@@ -46,7 +46,7 @@ import sys
 #   scheduler.py           -- "Prefill rank batch, ..." (the #252 split)
 #   scheduler.py           -- "Decode batch, ..."
 #   htccl_bar1.py:1751     -- "HTCCL-BAR1: Aufbau in ..."
-RE_PREFILL_RANG = re.compile(
+RE_PREFILL_RANK = re.compile(
     r"\[(?P<zeit>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) TP(?P<rang>\d+)\] "
     r"Prefill rank batch, #new-token: (?P<new_token>\d+), "
     r"#cached-token: (?P<cached_token>\d+), #chunks: (?P<chunks>\d+), "
@@ -60,7 +60,7 @@ RE_DECODE = re.compile(
     r"cuda graph: (?P<cuda_graph>\w+), "
     r"gen throughput \(token/s\): (?P<gen_tok_s>[\d.]+)"
 )
-RE_BAR1_AUFBAU = re.compile(
+RE_BAR1_SETUP = re.compile(
     r"HTCCL-BAR1: Aufbau in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) Peer-Ziele, "
     r"Region (?P<region_mib>[\d.]+) MiB je Rang \((?P<schlitze>\d+) Schlitze"
     r".*?\), Schlitz (?P<schlitz_kib>\d+) KiB, "
@@ -76,7 +76,7 @@ WARMUP_TICK_TOK_S = 20.0
 # chunk remainders of a prompt that did not fit one chunk (a 2055-token prompt
 # at chunked_prefill_size=2048 leaves a 7-token batch) and the short prompts of
 # the decode phase.
-GROSSBATCH_TOKEN = 1000
+LARGE_BATCH_TOKEN = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -84,23 +84,23 @@ GROSSBATCH_TOKEN = 1000
 # ---------------------------------------------------------------------------
 
 
-def _zahlen(m: re.Match, ganz: tuple, dezimal: tuple = ()) -> dict:
+def _numbers(m: re.Match, integers: tuple, decimals: tuple = ()) -> dict:
     d = m.groupdict()
-    for k in ganz:
+    for k in integers:
         d[k] = int(d[k])
-    for k in dezimal:
+    for k in decimals:
         d[k] = float(d[k])
     return d
 
 
-def parse_prefill_rang(zeilen) -> list:
+def parse_prefill_rang(lines) -> list:
     """Every ``Prefill rank batch`` line, in file order, one dict per rank."""
     out = []
-    for zeile in zeilen:
-        m = RE_PREFILL_RANG.search(zeile)
+    for line in lines:
+        m = RE_PREFILL_RANK.search(line)
         if m:
             out.append(
-                _zahlen(
+                _numbers(
                     m,
                     ("rang", "new_token", "cached_token", "chunks"),
                     ("gpu_ms", "compute_ms", "wait_ms"),
@@ -109,13 +109,13 @@ def parse_prefill_rang(zeilen) -> list:
     return out
 
 
-def parse_decode(zeilen) -> list:
+def parse_decode(lines) -> list:
     """Every ``Decode batch`` line. One per scheduler tick, not per request."""
     out = []
-    for zeile in zeilen:
-        m = RE_DECODE.search(zeile)
+    for line in lines:
+        m = RE_DECODE.search(line)
         if m:
-            d = _zahlen(
+            d = _numbers(
                 m,
                 ("rang", "running_req"),
                 ("accept_len", "accept_rate", "gen_tok_s"),
@@ -125,16 +125,16 @@ def parse_decode(zeilen) -> list:
     return out
 
 
-def parse_bar1_geometrie(zeilen) -> dict | None:
+def parse_bar1_geometrie(lines) -> dict | None:
     """The BAR1 slot geometry of the FIRST Aufbau line, or None.
 
     First and not last on purpose: a boot builds one region per communicator
     group, and the group that carries the prefill all_reduce is the widest one.
     """
-    for zeile in zeilen:
-        m = RE_BAR1_AUFBAU.search(zeile)
+    for line in lines:
+        m = RE_BAR1_SETUP.search(line)
         if m:
-            return _zahlen(
+            return _numbers(
                 m,
                 ("peers", "schlitze", "schlitz_kib", "max_nutzlast_kib"),
                 ("aufbau_ms", "region_mib"),
@@ -158,12 +158,13 @@ def kollektiv_bytes(new_token: int, hidden: int, elem_bytes: int = 2) -> int:
     return new_token * hidden * elem_bytes
 
 
-def runden(nutzlast_bytes: int, schlitz_bytes: int, welt: int) -> int:
+def runden(payload_bytes: int, slot_bytes: int, welt: int) -> int:
     """Rounds a payload needs, given one slot per peer.
 
     BAR1 splits an all_reduce into ``welt`` equal shards (reduce-scatter, then
-    all-gather); the shard has to fit a slot. ``max_nutzlast = welt *
-    schlitz`` is where the shard stops fitting in ONE pass.
+    all-gather); the shard has to fit a slot. ``max_nutzlast = welt * slot``
+    -- the field name the Aufbau line uses -- is where the shard stops
+    fitting in ONE pass.
 
     That used to be the end of the path: above it ``handles()`` said False and
     the payload left over the base transport. Since ``ar_plan`` (the
@@ -171,10 +172,10 @@ def runden(nutzlast_bytes: int, schlitz_bytes: int, welt: int) -> int:
     the payload is cut into this many rounds and stays on the direct path. A
     value > 1 therefore means "more rounds", not "not on this path at all".
     """
-    if schlitz_bytes <= 0 or welt <= 0:
+    if slot_bytes <= 0 or welt <= 0:
         return 0
-    scherbe = -(-nutzlast_bytes // welt)
-    return -(-scherbe // schlitz_bytes)
+    shard = -(-payload_bytes // welt)
+    return -(-shard // slot_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +184,7 @@ def runden(nutzlast_bytes: int, schlitz_bytes: int, welt: int) -> int:
 
 
 def punkt_fenster(
-    rows: list, requests: int, min_new_token: int = GROSSBATCH_TOKEN
+    rows: list, requests: int, min_new_token: int = LARGE_BATCH_TOKEN
 ) -> dict:
     """The last ``requests`` large batches per rank -- the measured point.
 
@@ -193,13 +194,13 @@ def punkt_fenster(
     request is one large batch. Counting from the back is therefore exact for
     the point and drops the warmup, which is what the counting is for.
     """
-    je_rang: dict = {}
+    per_rank: dict = {}
     for r in rows:
         if r["new_token"] >= min_new_token:
-            je_rang.setdefault(r["rang"], []).append(r)
+            per_rank.setdefault(r["rang"], []).append(r)
     if requests > 0:
-        je_rang = {k: v[-requests:] for k, v in je_rang.items()}
-    return je_rang
+        per_rank = {k: v[-requests:] for k, v in per_rank.items()}
+    return per_rank
 
 
 def wait_aggregat(batches: list) -> dict:
@@ -225,15 +226,15 @@ def wait_aggregat(batches: list) -> dict:
     }
 
 
-def im_fenster(rows: list, von: float, bis: float) -> list:
-    """Rows whose log timestamp falls into [von, bis], both epoch seconds.
+def im_fenster(rows: list, start: float, end: float) -> list:
+    """Rows whose log timestamp falls into [start, end], both epoch seconds.
 
     The scheduler stamps whole LOCAL seconds, so the window is widened by one
     second on each side: a tick logged at 13:44:59,7 prints 13:44:59 and would
     otherwise fall out of a window that opened at 13:44:59,2.
     """
-    a = datetime.datetime.fromtimestamp(von - 1.0)
-    b = datetime.datetime.fromtimestamp(bis + 1.0)
+    a = datetime.datetime.fromtimestamp(start - 1.0)
+    b = datetime.datetime.fromtimestamp(end + 1.0)
     out = []
     for r in rows:
         t = datetime.datetime.strptime(r["zeit"], "%Y-%m-%d %H:%M:%S")
@@ -255,13 +256,13 @@ def belegung(batches: list) -> dict:
     if len(batches) < 2:
         return {"batches": len(batches)}
     t = [datetime.datetime.strptime(b["zeit"], "%Y-%m-%d %H:%M:%S") for b in batches]
-    spanne = (max(t) - min(t)).total_seconds()
-    summe = sum(b["gpu_ms"] for b in batches) / 1000.0
+    span = (max(t) - min(t)).total_seconds()
+    total = sum(b["gpu_ms"] for b in batches) / 1000.0
     return {
         "batches": len(batches),
-        "spanne_s": spanne,
-        "gpu_s_summe": summe,
-        "belegung": (summe / spanne) if spanne > 0 else None,
+        "spanne_s": span,
+        "gpu_s_summe": total,
+        "belegung": (total / span) if span > 0 else None,
     }
 
 
@@ -303,77 +304,77 @@ def decode_tick_aggregat(
 # ---------------------------------------------------------------------------
 
 
-def lade_punkte(pfad: str) -> dict:
+def lade_punkte(path: str) -> dict:
     """(arm, sessions) -> the point, from punkte.jsonl."""
     out: dict = {}
-    if not pfad or not os.path.exists(pfad):
+    if not path or not os.path.exists(path):
         return out
-    with open(pfad, errors="replace") as f:
-        for zeile in f:
-            zeile = zeile.strip()
-            if not zeile:
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                p = json.loads(zeile)
+                p = json.loads(line)
             except json.JSONDecodeError:
                 continue
             out[(p.get("arm"), p.get("sessions"))] = p
     return out
 
 
-def auswerten(quellen: list, punkte: dict, hidden: int, welt: int) -> dict:
-    """quellen: [(arm, sessions, pfad)] -> one payload with every table in it."""
-    zeilen_je_punkt = {}
+def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
+    """sources: [(arm, sessions, path)] -> one payload with every table in it."""
+    lines_per_point = {}
     geo = None
-    for arm, sessions, pfad in quellen:
-        with open(pfad, errors="replace") as f:
-            zeilen = f.readlines()
-        zeilen_je_punkt[(arm, sessions)] = zeilen
-        geo = geo or parse_bar1_geometrie(zeilen)
+    for arm, sessions, path in sources:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+        lines_per_point[(arm, sessions)] = lines
+        geo = geo or parse_bar1_geometrie(lines)
 
     wait: list = []
-    groessen: list = []
+    sizes: list = []
     decode: list = []
-    for (arm, sessions), zeilen in sorted(zeilen_je_punkt.items()):
-        punkt = punkte.get((arm, sessions)) or {}
-        requests = ((punkt.get("prefill") or {}).get("requests")) or 0
-        batches = parse_prefill_rang(zeilen)
-        fenster = punkt_fenster(batches, requests)
-        for rang in sorted(fenster):
-            agg = wait_aggregat(fenster[rang])
-            agg.update({"arm": arm, "sessions": sessions, "rang": rang})
+    for (arm, sessions), lines in sorted(lines_per_point.items()):
+        point = points.get((arm, sessions)) or {}
+        requests = ((point.get("prefill") or {}).get("requests")) or 0
+        batches = parse_prefill_rang(lines)
+        window = punkt_fenster(batches, requests)
+        for rank in sorted(window):
+            agg = wait_aggregat(window[rank])
+            agg.update({"arm": arm, "sessions": sessions, "rang": rank})
             wait.append(agg)
-        alle_tp0 = [b for b in batches if b["rang"] == 0]
-        gross = [b for b in fenster.get(0, [])]
-        if gross:
-            nt_max = max(b["new_token"] for b in gross)
-            groessen.append(
+        all_tp0 = [b for b in batches if b["rang"] == 0]
+        large = [b for b in window.get(0, [])]
+        if large:
+            nt_max = max(b["new_token"] for b in large)
+            sizes.append(
                 {
                     "arm": arm,
                     "sessions": sessions,
-                    "batches": len(gross),
+                    "batches": len(large),
                     "new_token_median": statistics.median(
-                        b["new_token"] for b in gross
+                        b["new_token"] for b in large
                     ),
                     "new_token_max": nt_max,
-                    "chunks_max": max(b["chunks"] for b in alle_tp0),
+                    "chunks_max": max(b["chunks"] for b in all_tp0),
                     "kleine_batches": len(
-                        [b for b in alle_tp0 if b["new_token"] < 1000]
+                        [b for b in all_tp0 if b["new_token"] < 1000]
                     ),
                     "nutzlast_bytes": kollektiv_bytes(nt_max, hidden),
                 }
             )
-            groessen[-1].update(belegung(gross))
-        ticks = parse_decode(zeilen)
+            sizes[-1].update(belegung(large))
+        ticks = parse_decode(lines)
         for bs in sorted({t["running_req"] for t in ticks}):
             d = decode_tick_aggregat(ticks, bs)
             d.update({"arm": arm, "sessions": sessions, "running_req": bs})
             decode.append(d)
 
-    schlitz_bytes = (geo or {}).get("schlitz_kib", 0) * 1024
-    max_nutzlast = (geo or {}).get("max_nutzlast_kib", 0) * 1024
-    for g in groessen:
-        g["runden"] = runden(g["nutzlast_bytes"], schlitz_bytes, welt)
+    slot_bytes = (geo or {}).get("schlitz_kib", 0) * 1024
+    max_payload = (geo or {}).get("max_nutzlast_kib", 0) * 1024
+    for g in sizes:
+        g["runden"] = runden(g["nutzlast_bytes"], slot_bytes, welt)
         # "Does the direct path carry this payload at all" -- and since
         # ar_plan that question is answered by the ROUND PLAN, not by the
         # single-pass ceiling. The old predicate (`nutzlast <= max_nutzlast`)
@@ -383,19 +384,19 @@ def auswerten(quellen: list, punkte: dict, hidden: int, welt: int) -> dict:
         # contains not one fallback line, while this field said "nein".
         # The runtime's own honesty rule is the cross-check -- every fallback
         # is reported by `warum_nicht()`, and there were none.
-        g["traegt_bar1"] = g["runden"] >= 1 if schlitz_bytes else None
+        g["traegt_bar1"] = g["runden"] >= 1 if slot_bytes else None
         # Kept because it is the number the tipping point is derived from,
         # and it is what changes when the pipe takes its share of the window.
         g["einrundig"] = (
-            g["nutzlast_bytes"] <= max_nutzlast if max_nutzlast else None
+            g["nutzlast_bytes"] <= max_payload if max_payload else None
         )
     return {
         "hidden": hidden,
         "welt": welt,
         "bar1_geometrie": geo,
-        "kipp_token": (max_nutzlast // (hidden * 2)) if max_nutzlast else None,
+        "kipp_token": (max_payload // (hidden * 2)) if max_payload else None,
         "wait": wait,
-        "groessen": groessen,
+        "groessen": sizes,
         "decode": decode,
     }
 
@@ -405,51 +406,55 @@ def _f(v, nk=1):
 
 
 def tabellen(payload: dict) -> str:
-    zeilen = ["### compute/wait je Rang (Messfenster des Punktes)", ""]
-    zeilen += [
-        "| Arm | Sessions | Rang | Batches | compute ms | wait ms | gpu-ms | wait-Anteil |",
+    # The heading is kept verbatim: test_s12_log_analyse.py asserts the
+    # substring "compute/wait je Rang" against this script's stdout, and the
+    # validation doc quotes the section by that name.
+    lines = ["### compute/wait je Rang (measurement window of the point)", ""]
+    lines += [
+        "| Arm | Sessions | Rank | Batches | compute ms | wait ms | gpu-ms "
+        "| wait share |",
         "|---|---:|---|---:|---:|---:|---:|---:|",
     ]
     for w in payload["wait"]:
         if not w.get("n"):
             continue
-        zeilen.append(
+        lines.append(
             f"| {w['arm']} | {w['sessions']} | TP{w['rang']} | {w['n']} "
             f"| {_f(w['compute_ms_median'])} | {_f(w['wait_ms_median'])} "
             f"| {_f(w['gpu_ms_median'])} "
             f"| {_f(w['wait_anteil'] * 100)} % |"
         )
-    zeilen += ["", "### Chunkgroessen und Kollektivgroessen", ""]
-    zeilen += [
-        "| Arm | Sessions | Grossbatches | #new-token Median | #new-token max "
-        "| #chunks max | all_reduce Byte | Runden | traegt BAR1 | Belegung |",
+    lines += ["", "### Chunk sizes and collective sizes", ""]
+    lines += [
+        "| Arm | Sessions | Large batches | #new-token median | #new-token max "
+        "| #chunks max | all_reduce bytes | Rounds | on BAR1 | Occupancy |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for g in payload["groessen"]:
-        bel = g.get("belegung")
-        zeilen.append(
+        occ = g.get("belegung")
+        lines.append(
             f"| {g['arm']} | {g['sessions']} | {g['batches']} "
             f"| {_f(g['new_token_median'], 0)} | {g['new_token_max']} "
             f"| {g['chunks_max']} | {g['nutzlast_bytes']} | {g['runden']} "
-            f"| {'ja' if g['traegt_bar1'] else 'nein'} "
-            f"| {'-' if bel is None else format(bel * 100, '.0f') + ' %'} |"
+            f"| {'yes' if g['traegt_bar1'] else 'no'} "
+            f"| {'-' if occ is None else format(occ * 100, '.0f') + ' %'} |"
         )
-    zeilen += ["", "### Decode je Tick (nicht je Anfrage)", ""]
-    zeilen += [
-        "| Arm | Sessions | bs | Ticks | gewertet | accept len | gen tok/s "
+    lines += ["", "### Decode per tick (not per request)", ""]
+    lines += [
+        "| Arm | Sessions | bs | Ticks | counted | accept len | gen tok/s "
         "| ms/Token | ms/Verify |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for d in payload["decode"]:
         if not d.get("ticks_gewertet"):
             continue
-        zeilen.append(
+        lines.append(
             f"| {d['arm']} | {d['sessions']} | {d['running_req']} | {d['ticks']} "
             f"| {d['ticks_gewertet']} | {_f(d['accept_len_median'], 2)} "
             f"| {_f(d['gen_tok_s_median'])} | {_f(d['ms_pro_token'], 2)} "
             f"| {_f(d['ms_pro_verify'], 2)} |"
         )
-    return "\n".join(zeilen) + "\n"
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
@@ -467,18 +472,18 @@ def main() -> int:
     ap.add_argument("--json", default="", help="write the payload here as well")
     args = ap.parse_args()
 
-    quellen = []
+    sources = []
     for spec in args.log:
-        teile = spec.split(":", 2)
-        if len(teile) != 3:
-            print(f"--log braucht ARM:SESSIONS:PFAD, bekam {spec!r}", file=sys.stderr)
+        parts = spec.split(":", 2)
+        if len(parts) != 3:
+            print(f"--log needs ARM:SESSIONS:PFAD, got {spec!r}", file=sys.stderr)
             return 2
-        quellen.append((teile[0], int(teile[1]), teile[2]))
-    if not quellen:
-        print("kein --log angegeben", file=sys.stderr)
+        sources.append((parts[0], int(parts[1]), parts[2]))
+    if not sources:
+        print("no --log given", file=sys.stderr)
         return 2
 
-    payload = auswerten(quellen, lade_punkte(args.punkte), args.hidden, args.welt)
+    payload = auswerten(sources, lade_punkte(args.punkte), args.hidden, args.welt)
     if args.json:
         with open(args.json, "w") as f:
             json.dump(payload, f, indent=2)

@@ -79,38 +79,38 @@ def run_check(step: str, fn: Callable[[], Optional[str]]) -> int:
 
 def load_json(path: str, what: str) -> dict:
     if not os.path.exists(path):
-        raise CheckStop(f"{what} fehlt ({path})")
+        raise CheckStop(f"{what} missing ({path})")
     try:
         with open(path) as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        raise CheckStop(f"{what} nicht lesbar ({path}): {exc}") from exc
+        raise CheckStop(f"{what} not readable ({path}): {exc}") from exc
     if not isinstance(payload, dict):
-        raise CheckStop(f"{what} ist kein JSON-Objekt ({path})")
+        raise CheckStop(f"{what} is not a JSON object ({path})")
     return payload
 
 
 def read_text(path: str, what: str) -> str:
     if not os.path.exists(path):
-        raise CheckStop(f"{what} fehlt ({path})")
+        raise CheckStop(f"{what} missing ({path})")
     try:
         with open(path, errors="replace") as f:
             return f.read()
     except OSError as exc:
-        raise CheckStop(f"{what} nicht lesbar ({path}): {exc}") from exc
+        raise CheckStop(f"{what} not readable ({path}): {exc}") from exc
 
 
 def require_envelope(
     payload: dict, kind: str, what: str, schema_version: Any = None
 ) -> None:
     if payload.get("kind") != kind:
-        raise CheckFail(f"{what}: kind ist {payload.get('kind')!r}, erwartet {kind!r}")
+        raise CheckFail(f"{what}: kind is {payload.get('kind')!r}, expected {kind!r}")
     if "schema_version" not in payload:
-        raise CheckFail(f"{what}: schema_version fehlt")
+        raise CheckFail(f"{what}: schema_version missing")
     if schema_version is not None and payload["schema_version"] != schema_version:
         raise CheckFail(
             f"{what}: schema_version {payload['schema_version']!r}, "
-            f"erwartet {schema_version!r}"
+            f"expected {schema_version!r}"
         )
 
 
@@ -124,9 +124,9 @@ def is_number(value: Any) -> bool:
 
 def require_number(value: Any, what: str, minimum: Optional[float] = None) -> float:
     if not is_number(value):
-        raise CheckFail(f"{what} ist {value!r}, keine Zahl")
+        raise CheckFail(f"{what} is {value!r}, not a number")
     if minimum is not None and value < minimum:
-        raise CheckFail(f"{what} ist {value}, erwartet >= {minimum}")
+        raise CheckFail(f"{what} is {value}, expected >= {minimum}")
     return float(value)
 
 
@@ -255,22 +255,22 @@ def check_accept_artifact(
 
     arms = report.get("arms")
     if not isinstance(arms, list) or not arms:
-        raise CheckFail(f"{boot}: accept.json hat keine arms")
+        raise CheckFail(f"{boot}: accept.json has no arms")
 
     by_prompt = {a.get("prompt"): a for a in arms if isinstance(a, dict)}
     absent = [p for p in prompts if p not in by_prompt]
     if absent:
-        raise CheckFail(f"{boot}: Prompts ohne Arm: {','.join(absent)}")
+        raise CheckFail(f"{boot}: prompts without an arm: {','.join(absent)}")
 
     for prompt in prompts:
         arm = by_prompt[prompt]
         serving = arm.get("serving")
         if not isinstance(serving, dict):
-            raise CheckFail(f"{boot}/{prompt}: kein serving-Block")
+            raise CheckFail(f"{boot}/{prompt}: no serving block")
         if serving.get("accept_len_mean") is None:
             raise CheckFail(
-                f"{boot}/{prompt}: accept_len_mean ist None -- Spec-Pfad laeuft "
-                "nicht oder die Sonde ist aus"
+                f"{boot}/{prompt}: accept_len_mean is None -- the spec path is not "
+                "running, or the probe is off"
             )
         require_number(serving["accept_len_mean"], f"{boot}/{prompt}: accept_len_mean")
         rounds = serving.get("rounds")
@@ -280,16 +280,17 @@ def check_accept_artifact(
         positions = curve_positions(curve)
         if positions is None:
             raise CheckFail(
-                f"{boot}/{prompt}: keine Accept-Positionskurve (curve={curve!r}) -- "
-                "der Mittelwert allein ist blind fuer eine Positions-Pathologie"
+                f"{boot}/{prompt}: no per-position accept curve, no Positionskurve "
+                f"(curve={curve!r}) -- the mean alone is blind to a positional "
+                "pathology"
             )
         if len(positions) < steps_k:
             raise CheckFail(
-                f"{boot}/{prompt}: Positionskurve deckt {len(positions)} von "
-                f"{steps_k} Positionen ab"
+                f"{boot}/{prompt}: Positionskurve covers {len(positions)} of "
+                f"{steps_k} Positionen"
             )
         if 0 not in positions:
-            raise CheckFail(f"{boot}/{prompt}: Position 0 fehlt in der Kurve")
+            raise CheckFail(f"{boot}/{prompt}: position 0 is missing from the curve")
 
     check_reference_column(step_dir, boot, prompts)
     check_vram_summary(step_dir, boot)
@@ -319,14 +320,14 @@ def classify_missing_result(
     log_path = os.path.join(step_dir, "server.log")
     if not os.path.exists(log_path):
         raise CheckStop(
-            f"{boot}: weder {what} noch server.log -- das Rezept ist nicht gelaufen"
+            f"{boot}: neither {what} nor server.log -- the recipe never ran"
         )
     fatal = scan_log_for_fatals(log_path, f"{boot}: server.log")
     if fatal:
-        raise CheckFail(f"{boot}: kein {what}, Serverlog nennt {fatal}")
+        raise CheckFail(f"{boot}: no {what}, the server log names {fatal}")
     raise CheckFail(
-        f"{boot}: kein {what}, aber ein server.log ({log_path}) -- Server kam nicht hoch "
-        "oder die Sonde brach ab"
+        f"{boot}: no {what}, but a server.log ({log_path}) -- the server never came "
+        "up, or the probe broke off"
     )
 
 
@@ -355,7 +356,7 @@ def curve_positions(curve: Any) -> Optional[Dict[int, float]]:
 
 
 def check_reference_column(step_dir: str, boot: str, prompts: Sequence[str]) -> None:
-    """Pflicht 7 of the r7c README: every accept number is reported AGAINST
+    """Obligation 7 of the r7c README: every accept number is reported AGAINST
     the reference, not on its own. The emitter writes the join; this verifies
     it exists, names its source and covers the prompts that have a reference."""
     path = os.path.join(step_dir, "reference_column.json")
@@ -368,16 +369,16 @@ def check_reference_column(step_dir: str, boot: str, prompts: Sequence[str]) -> 
     )
     if payload.get("reference_source") != REFERENCE_SOURCE:
         raise CheckFail(
-            f"{boot}: reference_column nennt Quelle "
-            f"{payload.get('reference_source')!r}, erwartet {REFERENCE_SOURCE!r}"
+            f"{boot}: reference_column names source "
+            f"{payload.get('reference_source')!r}, expected {REFERENCE_SOURCE!r}"
         )
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
-        raise CheckFail(f"{boot}: reference_column.json hat keine rows")
+        raise CheckFail(f"{boot}: reference_column.json has no rows")
     by_prompt = {r.get("prompt"): r for r in rows if isinstance(r, dict)}
     for prompt in prompts:
         if prompt not in by_prompt:
-            raise CheckFail(f"{boot}: reference_column ohne Zeile fuer {prompt}")
+            raise CheckFail(f"{boot}: reference_column has no line for {prompt}")
         row = by_prompt[prompt]
         require_number(row.get("measured"), f"{boot}/{prompt}: measured")
         if prompt in REFERENCE_ACCEPT:
@@ -385,7 +386,7 @@ def check_reference_column(step_dir: str, boot: str, prompts: Sequence[str]) -> 
             if row.get("reference") != expected:
                 raise CheckFail(
                     f"{boot}/{prompt}: Referenzwert {row.get('reference')!r}, "
-                    f"erwartet {expected}"
+                    f"expected {expected}"
                 )
             require_number(row.get("ratio"), f"{boot}/{prompt}: ratio")
 
@@ -405,8 +406,8 @@ def check_vram_summary(step_dir: str, boot: str) -> None:
             rows += 1
     if rows < 1:
         raise CheckFail(
-            f"{boot}: vram_summary.txt enthaelt keine Karten-Zeile "
-            "(MIN-frei je Karte nicht erhoben)"
+            f"{boot}: vram_summary.txt contains no card line "
+            "(MIN free per card was never collected)"
         )
 
 

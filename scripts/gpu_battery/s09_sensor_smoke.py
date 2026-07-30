@@ -227,14 +227,14 @@ def main() -> int:
         )
 
     _write(args.out, payload)
-    print(f"Flags: {flags}")
+    print(f"flags: {flags}")
     print(
-        f"Kapazitaet: {capacity} Token; {len(samples)} Belegungs-Samples, "
+        f"capacity: {capacity} tokens; {len(samples)} occupancy samples, "
         f"max {payload['occupancy_max']}"
     )
-    print(f"Generierung identisch: {payload['generation_identical']}")
-    print(f"Sensor-Verdikt: {(payload.get('reading') or {}).get('verdict')}")
-    print(f"geschrieben: {args.out}")
+    print(f"generation identical: {payload['generation_identical']}")
+    print(f"sensor verdict: {(payload.get('reading') or {}).get('verdict')}")
+    print(f"written: {args.out}")
     return 0
 
 

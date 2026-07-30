@@ -59,60 +59,60 @@ def check(step_dir: str) -> None:
     require_envelope(payload, "sensor_smoke", "sensor_smoke.json", 1)
 
     if payload.get("error"):
-        raise CheckFail(f"Sonde meldet: {payload['error']}")
+        raise CheckFail(f"the probe reports: {payload['error']}")
 
     flags = payload.get("flags") or {}
     for flag in REQUIRED_FLAGS:
         if flag not in flags:
-            raise CheckFail(f"get_server_info kennt {flag} nicht")
+            raise CheckFail(f"get_server_info does not know {flag}")
         if flags[flag] in (None, "", False) and flag != "kv_pressure_pre_stage":
             raise CheckFail(
-                f"{flag} kam als {flags[flag]!r} zurueck -- der Wert hat den "
-                "Scheduler nicht erreicht"
+                f"{flag} came back as {flags[flag]!r} -- the value never reached "
+                "the scheduler"
             )
     if flags.get("kv_pressure_pre_stage") is not True:
         raise CheckFail(
-            f"kv_pressure_pre_stage ist {flags.get('kv_pressure_pre_stage')!r}, "
-            "obwohl das Flag gesetzt wurde"
+            f"kv_pressure_pre_stage is {flags.get('kv_pressure_pre_stage')!r} even "
+            "though the flag was set"
         )
 
     if not payload.get("generation_nonempty"):
-        raise CheckFail("mindestens eine Generierung war leer")
+        raise CheckFail("at least one generation was empty")
     if not payload.get("generation_identical"):
         raise CheckFail(
-            "zwei identische Greedy-Generierungen unterscheiden sich -- die "
-            "Leiter-Flags sind nicht inert"
+            "two identical greedy generations differ -- the ladder flags are not "
+            "inert"
         )
 
     samples = payload.get("samples") or 0
     if samples < MIN_SAMPLES:
         raise CheckFail(
-            f"nur {samples} Belegungs-Samples (mindestens {MIN_SAMPLES} noetig, "
-            "sonst gibt es keinen Trend zu fitten)"
+            f"only {samples} occupancy samples (at least {MIN_SAMPLES} needed, "
+            "otherwise there is no Trend to fit)"
         )
     occ_max = payload.get("occupancy_max")
     if not is_number(occ_max) or occ_max <= 0:
         raise CheckFail(
-            f"maximale Belegung {occ_max!r} -- die Last hat den Pool nie erreicht, "
-            "der Sensor bekam eine Nulllinie"
+            f"maximum occupancy {occ_max!r} -- the load never reached the pool, the "
+            "sensor was fed a flat zero line"
         )
 
     reading = payload.get("reading")
     if not isinstance(reading, dict):
-        raise CheckFail("der Sensor hat keine Lesung geliefert")
+        raise CheckFail("the sensor produced no reading")
     if not reading.get("verdict"):
-        raise CheckFail("die Lesung hat kein Verdikt")
+        raise CheckFail("the reading has no verdict")
     if not is_number(reading.get("occupancy")):
-        raise CheckFail(f"Lesung ohne Belegung: {reading.get('occupancy')!r}")
+        raise CheckFail(f"reading without an occupancy: {reading.get('occupancy')!r}")
     if reading.get("trend_tokens_per_round") is None:
         raise CheckFail(
-            "kein Trend in der Lesung -- die projizierte Erschoepfung ist der "
-            "eigentliche Sensor, der Momentwert nicht"
+            "no Trend in the reading -- the projected exhaustion is the actual "
+            "sensor, the instantaneous value is not"
         )
     if payload.get("reading_deterministic") is not True:
         raise CheckFail(
-            "dieselbe Reihe ergibt zweimal verschiedene Lesungen -- der "
-            "Kleinste-Quadrate-Trend ist nicht deterministisch"
+            "the same series yields two different readings -- the least-squares "
+            "trend is not deterministic"
         )
 
     fatal = scan_log_for_fatals(

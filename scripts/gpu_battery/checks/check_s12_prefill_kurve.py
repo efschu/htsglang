@@ -14,7 +14,7 @@ Verified:
     the baseline: NO HTCCL group at all,
   * a decode point at bs=1 and one at bs=16 per arm,
   * an output sample per arm is persisted. A fast garbage run looks good in a
-    throughput table (Messregel 5),
+    throughput table (measurement rule 5),
   * no boot died on an OOM / NCCL error / traceback. Eight boots that each
     broke off in a prefill OOM still hand in throughput numbers, and without
     this gate the table looks exactly like a healthy one,
@@ -47,7 +47,9 @@ from check_common import (  # noqa: E402
 
 STEP = "s12_prefill_kurve"
 KIND = "bar1_prefill_kurve"
-ARME = ("bar1", "grundlinie")
+# Arm names as the producer writes them into the artifact -- "grundlinie" is a
+# value in prefill_kurve.json, not prose, so it stays as it is.
+ARMS = ("bar1", "grundlinie")
 DECODE_BATCHES = (1, 16)
 REQUIRED_GROUP_PREFIXES = ("tp", "dcp")
 MIN_SAMPLE_CHARS = 50
@@ -62,168 +64,164 @@ def _check_fatal(payload: dict) -> None:
     "nobody looked" and "nothing found" must not produce the same verdict."""
     if "fatal" not in payload:
         raise CheckFail(
-            "prefill_kurve.json fuehrt kein fatal-Feld -- die Fatal-Ernte der "
-            "Boots (logs/*.fatal.txt) wurde gar nicht ausgewertet"
+            "prefill_kurve.json carries no fatal field -- the boots' fatal harvest "
+            "(logs/*.fatal.txt) was never evaluated at all"
         )
-    ungeprueft = payload.get("fatal_ungeprueft") or []
-    if ungeprueft:
-        first = ungeprueft[0]
+    unharvested = payload.get("fatal_ungeprueft") or []
+    if unharvested:
+        first = unharvested[0]
         raise CheckFail(
-            f"{len(ungeprueft)} Boot(s) ohne Fatal-Ernte, erster: "
-            f"{first.get('arm')}/{first.get('sessions')} Sessions -- ohne die "
-            "Datei ist 'kein Fatal' nicht belegt, nur unbekannt"
+            f"{len(unharvested)} boot(s) ohne Fatal-Ernte, first: "
+            f"{first.get('arm')}/{first.get('sessions')} sessions -- without that "
+            "file, 'no fatal' is not proven, only unknown"
         )
     fatal = payload.get("fatal") or []
     if fatal:
         first = fatal[0]
         raise CheckFail(
-            f"{len(fatal)} Boot(s) mit Fatal, erster {first.get('arm')}/"
-            f"{first.get('sessions')} Sessions -- {first.get('zeile')}"
+            f"{len(fatal)} boot(s) with a fatal, first {first.get('arm')}/"
+            f"{first.get('sessions')} sessions -- {first.get('zeile')}"
         )
 
 
 def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "prefill_kurve.json")
     if not os.path.exists(path):
-        raise CheckStop(
-            f"prefill_kurve.json fehlt ({path}) -- der Schritt ist nicht gelaufen"
-        )
+        raise CheckStop(f"prefill_kurve.json missing ({path}) -- the step never ran")
     payload = load_json(path, "prefill_kurve.json")
     require_envelope(payload, KIND, "prefill_kurve.json", 1)
 
     if not payload.get("host_erreichbar"):
-        raise CheckStop("Host nicht erreichbar -- es wurde nichts gemessen")
+        raise CheckStop("host unreachable -- nothing was measured")
     if not payload.get("integration_vorhanden"):
         raise CheckStop(
-            "die BAR1-Integration liegt nicht im Arbeitsbaum unter Test -- "
-            "BAR1_HOST_WT setzen"
+            "the BAR1 integration is not in the worktree under test -- set "
+            "BAR1_HOST_WT"
         )
     if payload.get("blockiert"):
-        raise CheckStop(f"Schritt blockiert: {payload['blockiert']}")
+        raise CheckStop(f"step blocked, blockiert={payload['blockiert']}")
 
     plan = payload.get("sessions_geplant") or []
     if not plan:
-        raise CheckStop("kein Sessionplan im Ergebnis -- nichts zu pruefen")
+        raise CheckStop("no session plan in the result -- nothing to check")
 
     # --- completeness --------------------------------------------------------
-    abbruch = payload.get("abbruch")
+    aborted = payload.get("abbruch")
     for sessions in plan:
-        for arm in ARME:
+        for arm in ARMS:
             rate = _rate(payload, arm, sessions)
             if not is_number(rate) or rate <= 0:
                 raise CheckFail(
-                    f"kein Durchsatz fuer Arm {arm!r} bei {sessions} Session(s) "
-                    f"(Wert {rate!r})"
-                    + (f"; Lauf abgebrochen: {abbruch}" if abbruch else "")
+                    f"no throughput for arm {arm!r} at {sessions} session(s) "
+                    f"(value {rate!r})"
+                    + (f"; run aborted: {aborted}" if aborted else "")
                 )
 
     # --- interleaved, not blockwise -----------------------------------------
-    reihenfolge = payload.get("reihenfolge") or []
-    if len(reihenfolge) < 2 * len(plan):
+    order = payload.get("reihenfolge") or []
+    if len(order) < 2 * len(plan):
         raise CheckFail(
-            f"nur {len(reihenfolge)} Messpunkte fuer {2 * len(plan)} erwartete "
-            "(je Sessionzahl zwei Arme)"
+            f"only {len(order)} measured points for {2 * len(plan)} expected "
+            "(two arms per session count)"
         )
-    for a, b in zip(reihenfolge, reihenfolge[1:]):
+    for a, b in zip(order, order[1:]):
         if a.get("arm") == b.get("arm"):
             raise CheckFail(
-                f"zwei gleiche Arme hintereinander ({a.get('arm')} bei "
-                f"{a.get('sessions')} und {b.get('sessions')} Sessions) -- "
-                "blockweise gemessen, damit ist der Vergleich nicht verschraenkt"
+                f"two identical arms back to back ({a.get('arm')} at "
+                f"{a.get('sessions')} and {b.get('sessions')} sessions) -- measured "
+                "blockweise, so the comparison is not interleaved"
             )
 
     _check_fatal(payload)
 
     # --- did each boot run the arm it claims? -------------------------------
-    for eintrag in reihenfolge:
-        arm = eintrag.get("arm")
-        if not eintrag.get("beleg_vorhanden"):
+    for entry in order:
+        arm = entry.get("arm")
+        if not entry.get("beleg_vorhanden"):
             raise CheckFail(
-                f"kein Transport-Beleg fuer {arm}/{eintrag.get('sessions')} -- "
-                "ohne ihn ist der Arm des Messwerts unbelegt"
+                f"no transport Beleg for {arm}/{entry.get('sessions')} -- without "
+                "it the measured value's arm is unsupported"
             )
-        gruppen = eintrag.get("gruppen") or []
+        groups = entry.get("gruppen") or []
         if arm == "grundlinie":
-            if gruppen:
+            if groups:
                 raise CheckFail(
-                    f"Grundlinien-Boot bei {eintrag.get('sessions')} Sessions "
-                    f"meldet HTCCL-Gruppen {[g.get('gruppe') for g in gruppen]} -- "
-                    "die Grundlinie darf keine SGLANG_HTCCL*-Variable sehen"
+                    f"Grundlinie boot at {entry.get('sessions')} sessions reports "
+                    f"HTCCL groups {[g.get('gruppe') for g in groups]} -- the "
+                    "baseline must not see a single SGLANG_HTCCL* variable"
                 )
             continue
-        if not gruppen:
+        if not groups:
             raise CheckFail(
-                f"bar1-Boot bei {eintrag.get('sessions')} Sessions meldet keine "
-                "einzige ERREICHT-Zeile -- HTCCL war nicht an"
+                f"bar1 boot at {entry.get('sessions')} sessions reports not a "
+                "single ERREICHT line -- HTCCL was not on"
             )
         for prefix in REQUIRED_GROUP_PREFIXES:
-            treffer = [
-                g for g in gruppen if str(g.get("gruppe", "")).startswith(prefix)
-            ]
-            if not treffer:
+            hits = [g for g in groups if str(g.get("gruppe", "")).startswith(prefix)]
+            if not hits:
                 raise CheckFail(
-                    f"bar1-Boot bei {eintrag.get('sessions')} Sessions ohne Gruppe "
-                    f"{prefix!r} (gemeldet: {[g.get('gruppe') for g in gruppen]})"
+                    f"bar1 boot at {entry.get('sessions')} sessions without group "
+                    f"{prefix!r} (reported: {[g.get('gruppe') for g in groups]})"
                 )
-            fremd = [g for g in treffer if g.get("erreicht") != "bar1"]
-            if fremd:
+            foreign = [g for g in hits if g.get("erreicht") != "bar1"]
+            if foreign:
                 raise CheckFail(
-                    f"bar1-Boot bei {eintrag.get('sessions')} Sessions: Gruppe "
-                    f"{fremd[0].get('gruppe')!r} faehrt "
-                    f"ERREICHT={fremd[0].get('erreicht')!r} -- gemischter Punkt, "
-                    "kein bar1-Punkt"
+                    f"bar1 boot at {entry.get('sessions')} sessions: group "
+                    f"{foreign[0].get('gruppe')!r} runs "
+                    f"ERREICHT={foreign[0].get('erreicht')!r} -- gemischter Punkt, "
+                    "not a bar1 point"
                 )
 
     # --- decode points -------------------------------------------------------
     decode = payload.get("decode") or []
-    for arm in ARME:
+    for arm in ARMS:
         for batch in DECODE_BATCHES:
-            treffer = [
+            hits = [
                 d
                 for d in decode
                 if d.get("arm") == arm
                 and d.get("batch") == batch
                 and is_number(d.get("decode_tok_s"))
             ]
-            if not treffer:
-                raise CheckFail(f"kein Decode-Punkt fuer Arm {arm!r} bei bs={batch}")
+            if not hits:
+                raise CheckFail(f"no decode point for arm {arm!r} at bs={batch}")
 
     # --- output samples ------------------------------------------------------
     samples = payload.get("output_samples") or {}
-    for arm in ARME:
+    for arm in ARMS:
         sample = samples.get(arm)
         if not sample or len(str(sample)) < MIN_SAMPLE_CHARS:
             raise CheckFail(
-                f"kein Ausgabe-Sample fuer Arm {arm!r} persistiert "
-                f"({str(sample)[:40]!r}) -- ein schneller Muell-Lauf sieht in "
-                "einer Durchsatztabelle gut aus"
+                f"no output Sample persisted for arm {arm!r} "
+                f"({str(sample)[:40]!r}) -- a fast garbage run looks good in a "
+                "throughput table"
             )
 
     # --- does the baseline reproduce? ---------------------------------------
     tol = payload.get("toleranz_pct")
     if not is_number(tol):
         tol = 5.0
-    abw = payload.get("grundlinie_abweichung_pct") or {}
-    bekannt = payload.get("grundlinie_bekannt") or {}
-    schlimmster = None
+    deviation = payload.get("grundlinie_abweichung_pct") or {}
+    known = payload.get("grundlinie_bekannt") or {}
+    worst = None
     for sessions in plan:
         key = str(sessions)
-        if key not in bekannt:
+        if key not in known:
             continue
-        if key not in abw:
+        if key not in deviation:
             raise CheckStop(
-                f"keine Abweichung gegen den bekannten Grundlinienwert bei "
-                f"{sessions} Session(s) berechnet"
+                f"no deviation against the known baseline value computed at "
+                f"{sessions} session(s)"
             )
-        if schlimmster is None or abs(abw[key]) > abs(abw[schlimmster]):
-            schlimmster = key
-    if schlimmster is not None and abs(abw[schlimmster]) > tol:
+        if worst is None or abs(deviation[key]) > abs(deviation[worst]):
+            worst = key
+    if worst is not None and abs(deviation[worst]) > tol:
         raise CheckStop(
-            f"Grundlinie reproduziert nicht: bei {schlimmster} Session(s) "
-            f"{_fmt(_rate(payload, 'grundlinie', int(schlimmster)))} statt "
-            f"{bekannt[schlimmster]} tok/s ({abw[schlimmster]:+.1f} %, erlaubt "
-            f"+-{tol} %) -- diese Umgebung ist nicht die, aus der die bekannten "
-            f"Zahlen stammen ({payload.get('grundlinie_quelle')})"
+            f"Grundlinie reproduziert nicht: at {worst} session(s) "
+            f"{_fmt(_rate(payload, 'grundlinie', int(worst)))} instead of "
+            f"{known[worst]} tok/s ({deviation[worst]:+.1f} %, allowed "
+            f"+-{tol} %) -- this environment is not the one the known numbers came "
+            f"from ({payload.get('grundlinie_quelle')})"
         )
 
 

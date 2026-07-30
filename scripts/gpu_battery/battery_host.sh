@@ -51,7 +51,7 @@ BAR1_EXTCACHE="${BAR1_EXTCACHE:-/spinning/htccl_extcache_host}"
 BAR1_PORT="${BAR1_PORT:-30030}"
 
 # Terminating a viewer is a USER decision and it does not carry over between
-# runs (05_FALLEN: "Freigabe des Nutzers einholen, sie gilt nicht dauerhaft").
+# runs (05_FALLEN: get the user's approval, it does not hold permanently).
 # Default off: the step stops and names the pids instead of killing anything.
 BAR1_VIEWER_KILL_OK="${BAR1_VIEWER_KILL_OK:-0}"
 
@@ -65,7 +65,7 @@ host_path() {
     local p="$1"
     case "$p" in
         /*) printf '%s%s\n' "$BAR1_HOST_SUBVOL" "$p" ;;
-        *) echo "host_path: nur absolute Pfade ($p)" >&2; return 1 ;;
+        *) echo "host_path: absolute paths only ($p)" >&2; return 1 ;;
     esac
 }
 
@@ -145,7 +145,7 @@ host_locks_acquire() {  # $1 = step id
     local step="$1" n i lock info
     n="$(host_lock_count)"
     if [ "${n:-0}" -lt 1 ]; then
-        echo "STOP: der Host meldet keine GPU (nvidia-smi -L leer)" >&2
+        echo "STOP: the host reports no GPU (nvidia-smi -L is empty)" >&2
         return 2
     fi
     for i in $(seq 0 $((n - 1))); do
@@ -156,9 +156,9 @@ host_locks_acquire() {  # $1 = step id
             BATTERY_HOST_LOCKS+=("$lock")
         else
             info="$(host_ssh_for 60 "cat $lock/info 2>/dev/null" 2>/dev/null)"
-            echo "STOP: Host-Lock $lock ist belegt:" >&2
+            echo "STOP: host lock $lock is held:" >&2
             printf '%s\n' "$info" | sed 's/^/    /' >&2
-            echo "fremde Locks werden nie gebrochen -- Operator fragen." >&2
+            echo "foreign locks are never broken -- ask the operator." >&2
             host_locks_release
             return 2
         fi
@@ -205,12 +205,12 @@ host_wait_for_server() {  # $1 = port, $2 = budget_s
     while [ $(( $(date +%s) - t0 )) -lt "$budget" ]; do
         if host_ssh_for 40 "curl -sf -m 5 http://127.0.0.1:$port/health >/dev/null" \
             >/dev/null 2>&1; then
-            echo "Host-Server oben nach $(( $(date +%s) - t0 ))s"
+            echo "host server up after $(( $(date +%s) - t0 ))s"
             return 0
         fi
         sleep 10
     done
-    echo "Host-Server nicht oben in ${budget}s" >&2
+    echo "host server not up within ${budget}s" >&2
     return 1
 }
 

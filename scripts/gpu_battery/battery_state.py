@@ -12,8 +12,8 @@ invocation reads it.
 
   * RESUME IS THE DEFAULT. A step whose recorded verdict is PASS is skipped
     with a SKIP line naming when it passed.
-  * --force <ids> re-runs green steps anyway. That is the "berechtigter
-    Zweifel" path, and it is explicit, per step, and logged as a new attempt.
+  * --force <ids> re-runs green steps anyway. That is the "justified doubt"
+    path, and it is explicit, per step, and logged as a new attempt.
   * --only / --from / --to / --skip select what runs at all.
   * Dependencies are ARTIFACT dependencies, not ordering. s08 needs the s01
     and s06 files; it does not need the boots. A resume can therefore run s08
@@ -69,7 +69,7 @@ def load_state(run_dir: str) -> dict:
         payload = json.load(f)
     if payload.get("kind") != STATE_KIND:
         raise SystemExit(
-            f"{path}: kind {payload.get('kind')!r}, erwartet {STATE_KIND!r}"
+            f"{path}: kind {payload.get('kind')!r}, expected {STATE_KIND!r}"
         )
     payload.setdefault("steps", {})
     return payload
@@ -167,7 +167,7 @@ def plan(
         # step as BLOCKED and stall a resume on a step that is done.
         if recorded == VERDICT_PASS and not rerun_all and step_id not in forced_set:
             when = state["steps"][step_id].get("finished", "?")
-            rows.append((step_id, "SKIP", f"schon PASS am {when}"))
+            rows.append((step_id, "SKIP", f"already PASS on {when}"))
             continue
 
         unmet = [
@@ -177,16 +177,18 @@ def plan(
         ]
         if unmet:
             rows.append(
-                (step_id, "BLOCKED", f"Voraussetzung nicht PASS: {','.join(unmet)}")
+                (step_id, "BLOCKED", f"dependency not PASS: {','.join(unmet)}")
             )
             continue
 
         if recorded == VERDICT_PASS:
-            reason = "erzwungener Wiederholungslauf trotz PASS"
+            # "trotz PASS" is asserted on by test_gpu_battery_checks.py --
+            # the marker stays German, the rest of the line does not.
+            reason = "forced re-run trotz PASS"
         elif recorded:
-            reason = f"letzter Stand {recorded}"
+            reason = f"last verdict {recorded}"
         else:
-            reason = "noch nicht gelaufen"
+            reason = "not run yet"
         rows.append((step_id, "RUN", reason))
         will_run.add(step_id)
     return rows
@@ -202,12 +204,12 @@ def cmd_init(args) -> int:
     if os.path.exists(state_path(args.run_dir)):
         state = load_state(args.run_dir)
         print(
-            f"state vorhanden: {state_path(args.run_dir)} (erstellt {state.get('created')})"
+            f"state exists: {state_path(args.run_dir)} (created {state.get('created')})"
         )
     else:
         state = new_state(args.run_dir)
         save_state(args.run_dir, state)
-        print(f"state angelegt: {state_path(args.run_dir)}")
+        print(f"state created: {state_path(args.run_dir)}")
     return 0
 
 
@@ -230,8 +232,8 @@ def cmd_plan(args) -> int:
         )
     blocked = [sid for sid, action, _ in rows if action == "BLOCKED"]
     print(
-        f"\n{len(to_run)} Schritt(e) zu fahren, geschaetzt "
-        f"{total_expected_min(to_run)} min; {len(blocked)} blockiert"
+        f"\n{len(to_run)} step(s) to run, estimated "
+        f"{total_expected_min(to_run)} min; {len(blocked)} blocked"
     )
     return 0
 
@@ -255,7 +257,7 @@ def cmd_gate(args) -> int:
 
 def cmd_record(args) -> int:
     if args.verdict not in VERDICTS:
-        raise SystemExit(f"unbekanntes Verdikt {args.verdict!r}, erlaubt: {VERDICTS}")
+        raise SystemExit(f"unknown verdict {args.verdict!r}, allowed: {VERDICTS}")
     state = load_state(args.run_dir)
     step_id = resolve_ids(args.step)[0]
     prev = state["steps"].get(step_id, {})
@@ -278,7 +280,7 @@ def cmd_record(args) -> int:
     state["steps"][step_id] = entry
     state["updated"] = entry["finished"]
     save_state(args.run_dir, state)
-    print(f"{step_id}: {args.verdict} (Versuch {entry['attempts']})")
+    print(f"{step_id}: {args.verdict} (attempt {entry['attempts']})")
     return 0
 
 
@@ -286,7 +288,7 @@ def cmd_status(args) -> int:
     state = load_state(args.run_dir)
     print(f"run:    {state.get('run_id')}  ({state.get('run_dir')})")
     print(f"commit: {state.get('commit')}")
-    print(f"{'Schritt':<26} {'Verdikt':<8} {'Versuche':>8}  {'fertig':<20} Grund")
+    print(f"{'step':<26} {'verdict':<8} {'attempts':>8}  {'finished':<20} reason")
     done_min = 0
     for step_id in STEP_ORDER:
         entry = state.get("steps", {}).get(step_id, {})
@@ -298,12 +300,12 @@ def cmd_status(args) -> int:
             f"{str(entry.get('finished', '-')):<20} {entry.get('reason', '')[:60]}"
         )
     total = total_expected_min()
-    print(f"\ngruen: {done_min} von {total} min Schrittzeit")
+    print(f"\ngreen: {done_min} of {total} min of step time")
     open_ids = [i for i in STEP_ORDER if verdict_of(state, i) != VERDICT_PASS]
     if open_ids:
-        print(f"offen: {', '.join(open_ids)} (~{total_expected_min(open_ids)} min)")
+        print(f"open: {', '.join(open_ids)} (~{total_expected_min(open_ids)} min)")
     else:
-        print("offen: nichts -- die Batterie ist durch")
+        print("open: nothing -- the battery is done")
     return 0
 
 
@@ -333,8 +335,8 @@ def main() -> int:
     p.add_argument("--from", dest="from")
     p.add_argument("--to")
     p.add_argument("--skip")
-    p.add_argument("--force", help="Schritte, die trotz PASS erneut gefahren werden")
-    p.add_argument("--rerun-all", action="store_true", help="alles neu, ignoriert PASS")
+    p.add_argument("--force", help="steps to run again even though they are PASS")
+    p.add_argument("--rerun-all", action="store_true", help="run everything, ignore PASS")
     p.add_argument("--format", choices=("table", "ids"), default="table")
     p.set_defaults(func=cmd_plan)
 
@@ -362,7 +364,7 @@ def main() -> int:
 
     args = ap.parse_args()
     if not args.run_dir and args.cmd != "field":
-        raise SystemExit("--run-dir oder BATTERY_RUN noetig")
+        raise SystemExit("--run-dir or BATTERY_RUN required")
     return args.func(args)
 
 

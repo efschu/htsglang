@@ -60,7 +60,7 @@ class Step:
 STEPS: Tuple[Step, ...] = (
     Step(
         step_id="s00_preflight",
-        title="Preflight: Karten-Identitaet (PCI/UUID), Korridor, Locks, Pflichtdateien",
+        title="Preflight: card identity (PCI/UUID), corridor, locks, required files",
         model="haiku",
         script="s00_preflight.sh",
         check="check_s00_preflight.py",
@@ -73,7 +73,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s01_p2p_reprobe",
-        title="P2P-Re-Probe nach Treiber-Update (capability matrix, d2d, NCCL-Transport)",
+        title="P2P re-probe after the driver update (capability matrix, d2d, NCCL transport)",
         model="haiku",
         script="s01_p2p_reprobe.sh",
         check="check_s01_p2p_reprobe.py",
@@ -86,7 +86,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s02_boot_a",
-        title="R7c Boot A -- FP8-Referenz, der Ein-Achsen-Falsifikator",
+        title="R7c boot A -- FP8 reference, the single-axis falsifier",
         model="sonnet",
         script="s02_boot_a.sh",
         check="check_s02_boot_a.py",
@@ -100,7 +100,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s03_boot_b",
-        title="R7c Boot B -- AWQ mit BF16-Kopf, die Kopf-vs-Ziel-Achse",
+        title="R7c boot B -- AWQ with a BF16 head, the head-vs-target axis",
         model="sonnet",
         script="s03_boot_b.sh",
         check="check_s03_boot_b.py",
@@ -113,7 +113,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s04_boot_c",
-        title="R7c Boot C -- DFLASH-Q8_0-Drafter solo auf einer 3080",
+        title="R7c boot C -- DFLASH Q8_0 drafter solo on one 3080",
         model="sonnet",
         script="s04_boot_c.sh",
         check="check_s04_boot_c.py",
@@ -126,7 +126,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s05_boot_d",
-        title="R7c Boot D -- Lane-Re-Seed A/B, die bekannte Konfiguration",
+        title="R7c boot D -- lane re-seed A/B, the known configuration",
         model="sonnet",
         script="s05_boot_d.sh",
         check="check_s05_boot_d.py",
@@ -139,7 +139,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s06_nccl_reference",
-        title="NCCL/System-RAM-Referenzmessung im #279-Format (p50+p99, idle+Last)",
+        title="NCCL / system-RAM reference measurement in #279 format (p50+p99, idle+load)",
         model="haiku",
         script="s06_nccl_reference.sh",
         check="check_s06_nccl_reference.py",
@@ -152,7 +152,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s07_offload_register_gpu",
-        title="Offload-Register auf GPU: CudaDeviceOps, echte Posten-Groessen, Rueckhol-Latenzen",
+        title="Offload register on GPU: CudaDeviceOps, real entry sizes, fetch-back latencies",
         model="haiku",
         script="s07_offload_register_gpu.sh",
         check="check_s07_offload_register_gpu.py",
@@ -165,7 +165,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s08_dispatcher_tables",
-        title="Dispatcher-Ratentabellen laden + Placeholder-Neutralitaet nachpruefen (CPU)",
+        title="Load the dispatcher rate tables + re-check placeholder neutrality (CPU)",
         model="haiku",
         script="s08_dispatcher_tables.sh",
         check="check_s08_dispatcher_tables.py",
@@ -178,7 +178,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s09_sensor_smoke",
-        title="gdn-/KV-Druck-Leiter-Smoke: Flags booten, Sensor frisst echte Belegung",
+        title="gdn / KV pressure ladder smoke: boot the flags, sensor consumes real occupancy",
         model="sonnet",
         script="s09_sensor_smoke.sh",
         check="check_s09_sensor_smoke.py",
@@ -197,7 +197,7 @@ STEPS: Tuple[Step, ...] = (
     # neither sees the other's arbitration.
     Step(
         step_id="s10_bar1_driver",
-        title="Gepatchter Treiber + Halter auf dem Host: Regkey, Modul-Identitaet, /dev/dmabuf_holder",
+        title="Patched driver + holder on the host: Regkey, module identity, /dev/dmabuf_holder",
         model="sonnet",
         script="s10_bar1_driver.sh",
         check="check_s10_bar1_driver.py",
@@ -210,7 +210,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s11_bar1_e2e",
-        title="Standardlauf ueber den BAR1-Direktpfad: beide Gruppen ERREICHT=bar1, Smoke, Riegel",
+        title="Standard run over the BAR1 direct path: both groups ERREICHT=bar1, smoke, locks",
         model="sonnet",
         script="s11_bar1_e2e.sh",
         check="check_s11_bar1_e2e.py",
@@ -223,7 +223,7 @@ STEPS: Tuple[Step, ...] = (
     ),
     Step(
         step_id="s12_prefill_kurve",
-        title="Multi-Session-Prefill-Kurve 1/4/8/16, bar1 gegen Grundlinie, verschraenkt",
+        title="Multi-session prefill curve 1/4/8/16, bar1 against the baseline, interleaved",
         model="sonnet",
         script="s12_prefill_kurve.sh",
         check="check_s12_prefill_kurve.py",
@@ -269,7 +269,7 @@ def resolve_ids(spec: str) -> List[str]:
         if len(matches) == 1:
             out.append(matches[0])
         elif not matches:
-            raise KeyError(f"unbekannter Schritt: {token!r}")
+            raise KeyError(f"unknown step: {token!r}")
         else:
-            raise KeyError(f"mehrdeutiger Schritt {token!r}: {matches}")
+            raise KeyError(f"ambiguous step {token!r}: {matches}")
     return out

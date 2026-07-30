@@ -1,470 +1,465 @@
-# GPU-Testbatterie
+# GPU test battery
 
-Dreizehn Schritte, ~5 h 09 min Kartenzeit, jeder mit einem maschinellen
-Erfolgskriterium. Gebaut, damit ein guenstiges Modell sie mechanisch abfahren
-kann: Schritt ausfuehren, Check laufen lassen, PASS = weiter, FAIL/STOP =
-anhalten und strukturiert melden. Der Executor urteilt nie. Jede Entscheidung
-steckt vorab in einem Check-Skript.
+Thirteen steps, ~5 h 09 min of card time, each with a machine-checkable
+success criterion. Built so a cheap model can drive it mechanically: run the
+step, run the check, PASS = continue, FAIL/STOP = halt and report in
+structured form. The executor never judges. Every decision sits in a check
+script up front.
 
-Wer die Batterie faehrt, liest **EXECUTOR_PROTOCOL.md** — das hier ist die
-Referenz, das Protokoll ist die Anweisung.
+Whoever drives the battery reads **EXECUTOR_PROTOCOL.md** — this file is the
+reference, the protocol is the instruction.
 
 ---
 
-## Einmal vorbereiten
+## One-time setup
 
 ```bash
 export BATTERY_RUN=/spinning/gpu-battery-results/$(date +%Y-%m-%d_%H%M)
-export WT=/spinning/wt-gpu-battery              # der Worktree unter Test
+export WT=/spinning/wt-gpu-battery              # the worktree under test
 mkdir -p "$BATTERY_RUN"
 cd "$WT/scripts/gpu_battery"
 /spinning/htsglang-gpu/.venv/bin/python battery_state.py --run-dir "$BATTERY_RUN" init
 ```
 
-`BATTERY_RUN` ist die Klammer um alles: Artefakte, Logs, Zustand. Ein zweiter
-Lauf am selben Tag bekommt ein eigenes Verzeichnis, eine WIEDERAUFNAHME
-bekommt das alte.
+`BATTERY_RUN` is the bracket around everything: artifacts, logs, state. A
+second run on the same day gets its own directory; a RESUME gets the old one.
 
-## Jeder Schritt, immer gleich
+## Every step, always the same
 
 ```bash
-BATTERY_RUN=$BATTERY_RUN bash run_step.sh <schritt>
+BATTERY_RUN=$BATTERY_RUN bash run_step.sh <step>
 ```
 
-`run_step.sh` macht in dieser Reihenfolge und ohne Rueckfrage: Wiederaufnahme-
-Gate, VRAM-Korridor, Locks nehmen (oder bewusst nicht), Schritt unter hartem
-Timeout, py-spy-Dump vor jedem Kill bei Zeitueberschreitung, Locks freigeben,
-Check, Verdikt in `state.json` schreiben, Verdikt-Zeile ausgeben.
+`run_step.sh` does the following, in this order and without asking: resume
+gate, VRAM corridor, take locks (or deliberately not), run the step under a
+hard timeout, py-spy dump before every kill on a timeout, release locks, run
+the check, write the verdict into `state.json`, print the verdict line.
 
-Exit-Code 0 = PASS oder SKIP, 1 = FAIL, 2 = STOP.
+Exit code 0 = PASS or SKIP, 1 = FAIL, 2 = STOP.
 
 ---
 
-## Wiederaufnahme und Auswahl
+## Resume and selection
 
-Gruene Schritte werden **per Default nicht wiederholt**. Ein Lauf, der bei
-Schritt 6 abbrach, wird nach dem Bugfix so fortgesetzt:
+Green steps are **not repeated by default**. A run that aborted at step 6 is
+continued after the bugfix like this:
 
 ```bash
-export BATTERY_RUN=/spinning/gpu-battery-results/<der alte Lauf>
-bash run_step.sh s06        # macht bei s06 weiter, s00-s05 bleiben gruen
+export BATTERY_RUN=/spinning/gpu-battery-results/<the old run>
+bash run_step.sh s06        # continues at s06, s00-s05 stay green
 ```
 
-Was gefahren wird, ist frei waehlbar. Der Plan sagt vorher, was passieren
-wuerde:
+What gets run is freely selectable. The plan says in advance what would
+happen:
 
 ```bash
 PY=/spinning/htsglang-gpu/.venv/bin/python
-$PY battery_state.py plan                       # alles Offene
-$PY battery_state.py plan --only s01,s06,s08    # nur diese drei
-$PY battery_state.py plan --from s06            # ab hier
-$PY battery_state.py plan --to s05              # nur die Boot-Queue
-$PY battery_state.py plan --skip s03,s04        # ohne die teuren Boots
-$PY battery_state.py status                     # was steht wo
+$PY battery_state.py plan                       # everything still open
+$PY battery_state.py plan --only s01,s06,s08    # just these three
+$PY battery_state.py plan --from s06            # from here on
+$PY battery_state.py plan --to s05              # just the boot queue
+$PY battery_state.py plan --skip s03,s04        # without the expensive boots
+$PY battery_state.py status                     # what stands where
 ```
 
-**Berechtigter Zweifel an einem gruenen Schritt** — ein gruener Lauf, dem man
-nach einem Fix oder einem Treiberwechsel nicht mehr traut — wird ausdruecklich
-erzwungen, nicht durch Loeschen von Dateien:
+**Legitimate doubt about a green step** — a green run nobody trusts any more
+after a fix or a driver change — is forced explicitly, not by deleting files:
 
 ```bash
-bash run_step.sh s02 --force          # laeuft trotz PASS erneut
+bash run_step.sh s02 --force          # runs again despite PASS
 $PY battery_state.py plan --force s02,s03
-$PY battery_state.py plan --rerun-all # alles noch einmal
+$PY battery_state.py plan --rerun-all # everything once more
 ```
 
-Jeder Wiederholungslauf zaehlt in `state.json` als neuer Versuch und schiebt
-das alte Verdikt in `history`. Ein erzwungener Lauf ist damit im Nachhinein von
-einem Erstlauf unterscheidbar.
+Every repeat run counts in `state.json` as a new attempt and pushes the old
+verdict into `history`. A forced run is therefore distinguishable after the
+fact from a first run.
 
-**Abhaengigkeiten sind Artefakt-Abhaengigkeiten, keine Reihenfolge.** s08
-braucht die Dateien von s01 und s06 — sonst nichts. Es laesst sich Wochen
-spaeter allein nachfahren, ohne einen einzigen Boot zu wiederholen. Ein Schritt,
-dessen Voraussetzung nicht PASS ist, meldet `BLOCKED` statt still zu laufen.
+**Dependencies are artifact dependencies, not an ordering.** s08 needs the
+files from s01 and s06 — nothing else. It can be run on its own weeks later
+without repeating a single boot. A step whose precondition is not PASS
+reports `BLOCKED` instead of running silently.
 
-**Ausnahme: der BAR1-Block (s10-s12) ist eine Kette.** Ohne gepatchten Treiber
-gibt es keinen Direktpfad, und ohne einen Lauf, der belegt ueber ihn ging, gibt
-es keine Kurve zu messen. s11 setzt s10 PASS voraus, s12 setzt s11 PASS voraus.
-s00-s09 haengen umgekehrt an **keinem** BAR1-Schritt: die Batterie bleibt auf
-einem Serientreiber vollstaendig fahrbar.
+**Exception: the BAR1 block (s10-s12) is a chain.** Without the patched
+driver there is no direct path, and without a run that demonstrably went over
+it there is no curve to measure. s11 requires s10 PASS, s12 requires s11
+PASS. Conversely, s00-s09 hang off **no** BAR1 step: the battery stays fully
+drivable on a stock driver.
 
 ---
 
-## Die Schritte
+## The steps
 
-Reihenfolge wie unten. Karten-Identitaet wird ueberall zur Laufzeit ueber
-PCI/NVML aufgeloest; nirgends steht ein fester Index.
+Order as below. Card identity is resolved at runtime via PCI/NVML
+everywhere; nowhere is there a fixed index.
 
-### S0 — `s00_preflight` · haiku · ~3 min · wiederholbar
+### S0 — `s00_preflight` · haiku · ~3 min · repeatable
 
-Karten-Inventar (PCI, UUID, NVML↔CUDA-Join), VRAM-Korridor, Lock-Zustand,
-Pflichtdateien, Treiber-/torch-/NCCL-Version.
+Card inventory (PCI, UUID, NVML↔CUDA join), VRAM corridor, lock state,
+mandatory files, driver/torch/NCCL version.
 
-* **Vorbedingung** keine. Dies ist die Vorbedingung aller anderen.
-* **Kommando** `bash run_step.sh s00`
-* **Erfolg** `check_s00_preflight.py`: ≥2 Karten, jede mit PCI+UUID+CUDA-Index
-  (der PCI-Join MUSS gelingen — ohne ihn meint jeder spaeter genannte
-  Kartenindex moeglicherweise ein anderes Stueck Silizium), jede ≥400 MiB frei,
-  kein fremdes Lock, alle Pflichtdateien da, nvidia-smi/curl/py-spy vorhanden.
-* **Abbruch** jeder Befund hier ist STOP, nie FAIL: es wurde noch nichts
-  getestet, also kann nichts fehlgeschlagen sein.
-* **Artefakte** `s00_preflight/preflight.json`, `inventory.json`
+* **Precondition** none. This is the precondition for all the others.
+* **Command** `bash run_step.sh s00`
+* **Success** `check_s00_preflight.py`: ≥2 cards, each with PCI+UUID+CUDA
+  index (the PCI join MUST succeed — without it, every card index named
+  later may mean a different piece of silicon), each with ≥400 MiB free, no
+  foreign lock, all mandatory files present, nvidia-smi/curl/py-spy
+  available.
+* **Abort** every finding here is STOP, never FAIL: nothing has been tested
+  yet, so nothing can have failed.
+* **Artifacts** `s00_preflight/preflight.json`, `inventory.json`
 
-### S1 — `s01_p2p_reprobe` · haiku · ~10 min · wiederholbar
+### S1 — `s01_p2p_reprobe` · haiku · ~10 min · repeatable
 
-Das Re-Probe-Paket nach dem Treiber-Update: capability matrix → d2d bench →
-NCCL-Transport-Check.
+The re-probe package after the driver update: capability matrix → d2d bench →
+NCCL transport check.
 
-* **Vorbedingung** s00 PASS. **Locks nimmt run_all.sh selbst** — run_step.sh
-  prueft nur, dass sie frei sind. Wuerde es sie halten, braeche das Werkzeug
-  an der eigenen Lock-Nahme ab.
-* **Kommando** `bash run_step.sh s01`
-  (optional `P2P_BASELINE=<altes nccl_transport.json>` fuer die Diff-Spalte)
-* **Erfolg** `check_s01_p2p_reprobe.py`: Envelopes stimmen; `can_access_peer`
-  fuer JEDES gerichtete Paar entschieden (None ≠ False); wo Peer-Zugriff moeglich
-  ist, sind die **effektiven Apertur-Felder befuellt** (die nominellen 256 MiB
-  sind eine Obergrenze, keine Nutzbarkeitszusage, und jeder Konsument ignoriert
-  sie); die 255/256/257-MiB-Klammer liegt in der Leiter; jedes NCCL-Paar hat
-  einen Transportbefund; und die Dateien werden mit den **echten
-  #279-Ladern** geladen — null Aperturen oder null Profile ist FAIL.
-* **Abbruch** Timeout/Absturz eines Paares = FAIL. Kein results-Verzeichnis =
-  STOP.
-* **Nicht bewertet** ob P2P anspringt. „Nirgends P2P" ist ein vollstaendig
-  erhobenes Ergebnis. `verdict_diff.md` fuellt der Leser, nicht der Executor.
-* **Artefakte** `s01_p2p_reprobe/results/{capability_matrix,d2d_bench,nccl_transport}.json`,
+* **Precondition** s00 PASS. **run_all.sh takes the locks itself** —
+  run_step.sh only checks that they are free. If it held them, the tool would
+  abort on its own lock acquisition.
+* **Command** `bash run_step.sh s01`
+  (optionally `P2P_BASELINE=<old nccl_transport.json>` for the diff column)
+* **Success** `check_s01_p2p_reprobe.py`: envelopes are correct;
+  `can_access_peer` decided for EVERY directed pair (None ≠ False); where peer
+  access is possible, the **effective aperture fields are populated** (the
+  nominal 256 MiB is an upper bound, not a usability guarantee, and every
+  consumer ignores it); the 255/256/257 MiB bracket is in the ladder; every
+  NCCL pair has a transport finding; and the files load with the **real #279
+  loaders** — zero apertures or zero profiles is FAIL.
+* **Abort** timeout/crash of a pair = FAIL. No results directory = STOP.
+* **Not judged** whether P2P engages. "No P2P anywhere" is a fully collected
+  result. `verdict_diff.md` is filled in by the reader, not the executor.
+* **Artifacts** `s01_p2p_reprobe/results/{capability_matrix,d2d_bench,nccl_transport}.json`,
   `run.log`, `verdict_diff.md`
 
-### S2 — `s02_boot_a` · sonnet · ~35 min · NICHT wiederholbar · **REPORT-GATE**
+### S2 — `s02_boot_a` · sonnet · ~35 min · NOT repeatable · **REPORT GATE**
 
-r7c Boot A, Qwen3.6-27B-FP8: der Ein-Achsen-Falsifikator. A ist zuerst, weil
-als einziger Boot sein Ausgang aendert, was die anderen bedeuten.
+r7c boot A, Qwen3.6-27B-FP8: the single-axis falsifier. A goes first because
+it is the only boot whose outcome changes what the others mean.
 
-* **Vorbedingung** s00 PASS, Korridor gruen, Locks frei.
-* **Kommando** `bash run_step.sh s02`
-* **Erfolg** `check_s02_boot_a.py`: Arm fuer alle fuenf Inhalte
-  (alphabet, squares, repeat, code, prose); `accept_len_mean` je Arm eine echte
-  Zahl (None ist das eigene Abbruchkriterium des Rezepts: Sonde aus oder
-  Spec-Pfad laeuft nicht); `rounds > 0`; **Positionskurve vorhanden** und
-  Positionen 0..K-1 abgedeckt; **Referenzspalte** vorhanden und mit Quelle
-  benannt; MIN-freie-MiB je Karte erhoben; kein OOM/NCCL/Traceback im Log.
-* **Abbruch** Server nicht oben, OOM, Traceback = FAIL (der Boot lief und hat
-  etwas gesagt). Kein server.log = STOP (das Rezept lief gar nicht).
-* **Nicht bewertet** die HOEHE der Accept-Zahlen. Reproduktion (2,6–3,3,
-  Position 0 ~65 %) und Falsifikation (~1,5, Position 0 24–45 %) sind beide
-  Ergebnisse.
-* **REPORT-GATE** Nach S2 wird angehalten und berichtet, PASS oder nicht,
-  bevor S3 startet. So steht es in der R7c-Queue.
-* **Artefakte** `s02_boot_a/{accept.json,accept.txt,reference_column.json,vram.csv,vram_summary.txt,cards.txt,server_info.json,server.log,step.log}`
+* **Precondition** s00 PASS, corridor green, locks free.
+* **Command** `bash run_step.sh s02`
+* **Success** `check_s02_boot_a.py`: an arm for all five contents (alphabet,
+  squares, repeat, code, prose); `accept_len_mean` a real number per arm
+  (None is the recipe's own abort criterion: probe off, or the spec path is
+  not running); `rounds > 0`; **position curve present** and positions 0..K-1
+  covered; **reference column** present and named with its source; MIN free
+  MiB per card collected; no OOM/NCCL/traceback in the log.
+* **Abort** server not up, OOM, traceback = FAIL (the boot ran and said
+  something). No server.log = STOP (the recipe never ran at all).
+* **Not judged** the HEIGHT of the accept numbers. Reproduction (2.6–3.3,
+  position 0 ~65%) and falsification (~1.5, position 0 24–45%) are both
+  results.
+* **REPORT GATE** After S2 the run halts and reports, PASS or not, before S3
+  starts. That is how the R7c queue specifies it.
+* **Artifacts** `s02_boot_a/{accept.json,accept.txt,reference_column.json,vram.csv,vram_summary.txt,cards.txt,server_info.json,server.log,step.log}`
 
-### S3 — `s03_boot_b` · sonnet · ~40 min · NICHT wiederholbar
+### S3 — `s03_boot_b` · sonnet · ~40 min · NOT repeatable
 
-r7c Boot B, Huihui-AWQ-MTP (INT4-Koerper, BF16-Kopf): die zweite Haelfte von
-As Frage. A bewegt die Ziel-Quantisierung, B hebt nur den Kopf.
+r7c boot B, Huihui-AWQ-MTP (INT4 body, BF16 head): the second half of A's
+question. A moves the target quantization, B lifts only the head.
 
-* **Vorbedingung** s00 PASS. (Artefakt-seitig unabhaengig von S2; die
-  Reihenfolge ist inhaltlich, nicht technisch.)
-* **Kommando** `bash run_step.sh s03`
-* **Erfolg / Abbruch** wie S2.
-* **Vorab bekanntes Risiko** AWQ × uneven TP × MTP wurde auf diesem Branch nie
-  gebootet. Lehnt der Load die Form ab, ist das EIN verbrauchter Boot und die
-  Antwort lautet „nicht auf diesem Vehikel". Der Executor tunt die Ratio nicht
-  im Fenster — das waere ein anderes Experiment.
-* **Artefakte** wie S2, unter `s03_boot_b/`
+* **Precondition** s00 PASS. (Artifact-wise independent of S2; the ordering
+  is about content, not technology.)
+* **Command** `bash run_step.sh s03`
+* **Success / abort** as in S2.
+* **Known risk up front** AWQ × uneven TP × MTP has never been booted on this
+  branch. If the load rejects the shape, that is ONE spent boot and the answer
+  is "not on this vehicle". The executor does not tune the ratio inside the
+  window — that would be a different experiment.
+* **Artifacts** as in S2, under `s03_boot_b/`
 
-### S4 — `s04_boot_c` · sonnet · ~45 min · NICHT wiederholbar
+### S4 — `s04_boot_c` · sonnet · ~45 min · NOT repeatable
 
-r7c Boot C, GGUF-Q3-Ziel plus quantisierter DFLASH-Q8_0-Drafter solo auf einer
-3080. Dritter, weil der Boot mit der hoechsten Retry-Wahrscheinlichkeit — und
-ein Retry ist billiger, wenn die Accept-Fragen geklaert sind.
+r7c boot C, GGUF-Q3 target plus a quantized DFLASH-Q8_0 drafter solo on one
+3080. Third, because it is the boot with the highest retry probability — and a
+retry is cheaper once the accept questions are settled.
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s04`
-* **Erfolg** wie S2, **plus**: `loader_lines.txt` belegt einen geladenen
-  Drafter. Ein Server, der nur auf dem Ziel hochkam, bestuende alle
-  Accept-Pruefungen und haette Cs Frage trotzdem nicht beantwortet.
-* **Abbruch** Drafter-Load wirft auf einen Tensornamen → FAIL, Name melden.
-  OOM auf der Wirtskarte → FAIL; `RESERVE_HOST` anzuheben ist Sache des
-  NAECHSTEN Laufs, nicht eines Retries im Fenster.
-* **Ausdruecklich kein Abbruch** inkohaerenter Output. Das ist ein Ergebnis.
-* **Artefakte** wie S2 plus `loader_lines.txt`, unter `s04_boot_c/`
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s04`
+* **Success** as in S2, **plus**: `loader_lines.txt` proves a loaded drafter.
+  A server that only came up on the target would pass every accept check and
+  still not have answered C's question.
+* **Abort** drafter load throws on a tensor name → FAIL, report the name. OOM
+  on the host card → FAIL; raising `RESERVE_HOST` is the business of the NEXT
+  run, not of a retry inside the window.
+* **Explicitly not an abort** incoherent output. That is a result.
+* **Artifacts** as in S2 plus `loader_lines.txt`, under `s04_boot_c/`
 
-### S5 — `s05_boot_d` · sonnet · ~30 min · NICHT wiederholbar
+### S5 — `s05_boot_d` · sonnet · ~30 min · NOT repeatable
 
-r7c Boot D, Lane-Re-Seed A/B auf der Runde-7b-Konfiguration. Der eine Boot,
-von dem bekannt ist, dass er hochkommt.
+r7c boot D, lane re-seed A/B on the round-7b configuration. The one boot that
+is known to come up.
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s05`
-* **Erfolg** `check_s05_boot_d.py`: drei Inhalte (squares, code, prose),
-  **beide** Arme je Inhalt (ein A/B mit einem Arm ist kein A/B),
-  `accept_len_mean` und `decode_ms_mean` in beiden Armen echte Zahlen (der
-  Preis ist der Punkt des Boots und steht in `decode_ms_mean`),
-  `reseed_forwards` im Re-Seed-Arm gesetzt, `output_identical` als Bool
-  vorhanden; MIN-frei je Karte; kein Fatal im Log.
-* **Ausdruecklich kein Fehler** `output_identical == False`. Das IST die
-  Messung.
-* **Artefakte** `s05_boot_d/{reseed.json,reseed.txt,vram_summary.txt,server.log,…}`
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s05`
+* **Success** `check_s05_boot_d.py`: three contents (squares, code, prose),
+  **both** arms per content (an A/B with one arm is not an A/B),
+  `accept_len_mean` and `decode_ms_mean` real numbers in both arms (the price
+  is the point of this boot and it lives in `decode_ms_mean`),
+  `reseed_forwards` set in the re-seed arm, `output_identical` present as a
+  bool; MIN free per card; no fatal in the log.
+* **Explicitly not an error** `output_identical == False`. That IS the
+  measurement.
+* **Artifacts** `s05_boot_d/{reseed.json,reseed.txt,vram_summary.txt,server.log,…}`
 
-### S6 — `s06_nccl_reference` · haiku · ~15 min · wiederholbar
+### S6 — `s06_nccl_reference` · haiku · ~15 min · repeatable
 
-Die NCCL-/System-RAM-Referenzmessung im #279-Format
+The NCCL / system-RAM reference measurement in #279 format
 (`new_nccl_reference_envelope`, schema_version 1).
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s06`
-* **Was gemessen wird** je Kartenpaar, in gepinnten Subprozessen: `all_reduce`
-  ueber die Leiter 64 KiB / 1 MiB / 8 MiB / 64 MiB und `send_recv` in **beide**
-  Richtungen, je in zwei Armen (`idle` und `host_stream_64mib`), **p50 UND p99
-  in jeder Zeile**. Beidseitig, weil der #278-Abschluss genau daran scheiterte,
-  dass die Last-Achse p50-gegen-p99 asymmetrisch erhoben war und damit
-  unbrauchbar wurde.
-* **Erfolg** `check_s06_nccl_reference.py`: Envelope korrekt; jede Zeile hat
-  alle zehn Pflichtfelder (eine Zeile mit neun wird vom Lader verworfen, eine
-  Datei aus solchen Zeilen laedt als leer); p99 ≥ p50; `transport` gefuellt;
-  beide Arme ueber DIESELBEN (op, Paar, Groesse)-Schluessel; `send_recv` in
-  beiden Richtungen je Paar; und `load_nccl_reference()` liefert measured-
-  Profile ohne Fehler.
-* **Abbruch** abgebrochenes Paar = FAIL.
-* **Artefakte** `s06_nccl_reference/{nccl_reference.json,nccl_debug.log}`
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s06`
+* **What is measured** per card pair, in pinned subprocesses: `all_reduce`
+  over the ladder 64 KiB / 1 MiB / 8 MiB / 64 MiB and `send_recv` in **both**
+  directions, each in two arms (`idle` and `host_stream_64mib`), **p50 AND p99
+  in every row**. Both directions, because the #278 wrap-up failed on exactly
+  this: the load axis had been collected asymmetrically, p50 against p99, and
+  became unusable.
+* **Success** `check_s06_nccl_reference.py`: envelope correct; every row has
+  all ten mandatory fields (a row with nine is discarded by the loader, and a
+  file made of such rows loads as empty); p99 ≥ p50; `transport` populated;
+  both arms over the SAME (op, pair, size) keys; `send_recv` in both
+  directions per pair; and `load_nccl_reference()` returns measured profiles
+  without error.
+* **Abort** an aborted pair = FAIL.
+* **Artifacts** `s06_nccl_reference/{nccl_reference.json,nccl_debug.log}`
 
-### S7 — `s07_offload_register_gpu` · haiku · ~12 min · wiederholbar
+### S7 — `s07_offload_register_gpu` · haiku · ~12 min · repeatable
 
-Offload-Register auf echtem Silizium: `CudaDeviceOps`, echte Posten-Groessen,
-Rueckhol-Latenzen je Klasse (#286-Restliste 1 und 4).
+The offload register on real silicon: `CudaDeviceOps`, real item sizes,
+fetch-back latencies per class (#286 remainder items 1 and 4).
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s07`
-* **Was laeuft** alle drei Bewegungsrouten auf der groessten Karte (zur
-  Laufzeit aufgeloest): `tensor` (pinned Pool + async H2D) fuer
-  lane_workspaces/kv_shadow/experts, `tag` (#93-Tag-Pools ueber den echten
-  memory-saver) fuer graph_rungs/gdn_state_sets, `suspend` (#89) fuer
-  cold_lane. Je Posten 256 MiB, 5 park/wave_in-Zyklen, p50/p99.
-  Der Park wird EXPLIZIT angefordert: das Register parkt bedarfsgesteuert, und
-  unter `auto` verweigert `park()` ohne Saettigungsdruck — korrekt, aber dann
-  misst der Lauf das Tor statt der Bewegung. Die Sonde setzt deshalb jede
-  gemessene Klasse ueber den granularen Klassen-Knopf
-  (`--lane-offload-class-policy`-Syntax) auf `ram` und legt die aufgeloeste
-  Policy-Karte ins Artefakt. Die Planphase (`--dry-run`) faehrt denselben
-  Ablauf gegen `FakeDeviceOps` — ohne Karte, als Selbsttest der Sonde.
-* **Erfolg** `check_s07_offload_register_gpu.py`: `device_ops ==
-  "CudaDeviceOps"` (eine Validierung mit FakeDeviceOps validiert nichts);
-  **alle drei Routen** gruen; je Zeile eine echte Groesse, die
-  `resolve_size_bytes` bestaetigt; Zustandsfolge enthaelt wirklich `parked`
-  (ein still no-oppender Park gibt dasselbe zurueck wie ein arbeitender);
-  Rueckhol-Latenz > 0 ueber ≥3 Zyklen; null park/wave_in-Fehler;
-  Negativkontrolle verweigert (ein Posten bleibt auf `auto` ohne Sensor und
-  muss abgelehnt werden — sonst belegt der Lauf nicht, dass die explizite
-  Policy den Park zugelassen hat); `latency_term_ms` erhoben — genau diese
-  Zahl liest der #279-Dispatcher.
-* **Abbruch** memory-saver nicht verfuegbar = STOP (zwei von drei Routen waeren
-  ungetestet, und ein gruenes Verdikt auf einem Drittel des Registers waere
-  schlimmer als keines). Der memory-saver braucht seinen Preload-Hook in
-  LD_PRELOAD, sonst stirbt jede `region()`; die Sonde setzt ihn selbst und
-  startet sich einmal neu (LD_PRELOAD liest der Linker beim Prozessstart).
-* **Artefakte** `s07_offload_register_gpu/offload_register_gpu.json`
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s07`
+* **What runs** all three movement routes on the largest card (resolved at
+  runtime): `tensor` (pinned pool + async H2D) for
+  lane_workspaces/kv_shadow/experts, `tag` (#93 tag pools over the real
+  memory-saver) for graph_rungs/gdn_state_sets, `suspend` (#89) for cold_lane.
+  256 MiB per item, 5 park/wave_in cycles, p50/p99.
+  The park is requested EXPLICITLY: the register parks on demand, and under
+  `auto` `park()` refuses without saturation pressure — correct, but then the
+  run measures the gate instead of the movement. The probe therefore sets
+  every measured class to `ram` via the granular per-class knob
+  (`--lane-offload-class-policy` syntax) and puts the resolved policy map into
+  the artifact. The planning phase (`--dry-run`) runs the same sequence
+  against `FakeDeviceOps` — without a card, as a self-test of the probe.
+* **Success** `check_s07_offload_register_gpu.py`: `device_ops ==
+  "CudaDeviceOps"` (a validation with FakeDeviceOps validates nothing); **all
+  three routes** green; a real size per row, confirmed by
+  `resolve_size_bytes`; the state sequence really contains `parked` (a
+  silently no-op'ing park returns the same thing as a working one); fetch-back
+  latency > 0 over ≥3 cycles; zero park/wave_in errors; the negative control
+  refused (one item stays on `auto` without a sensor and must be rejected —
+  otherwise the run does not prove that it was the explicit policy that
+  allowed the park); `latency_term_ms` collected — this is exactly the number
+  the #279 dispatcher reads.
+* **Abort** memory-saver unavailable = STOP (two of three routes would be
+  untested, and a green verdict on a third of the register would be worse than
+  none). The memory-saver needs its preload hook in LD_PRELOAD, otherwise
+  every `region()` dies; the probe sets it itself and restarts once (the
+  linker reads LD_PRELOAD at process start).
+* **Artifacts** `s07_offload_register_gpu/offload_register_gpu.json`
 
-### S8 — `s08_dispatcher_tables` · haiku · ~3 min · wiederholbar · **CPU-only**
+### S8 — `s08_dispatcher_tables` · haiku · ~3 min · repeatable · **CPU-only**
 
-Die gemessenen Ratentabellen in den #279-Dispatcher laden und die
-Placeholder-Neutralitaet nachpruefen.
+Load the measured rate tables into the #279 dispatcher and verify placeholder
+neutrality.
 
-* **Vorbedingung** s01 UND s06 PASS. Keine Karte, kein Lock, kein Korridor.
-* **Kommando** `bash run_step.sh s08` (optional `GDR_TSV=<#278-Matrix>`)
-* **Erfolg** `check_s08_dispatcher_tables.py`: alle drei Quellen vorhanden und
-  fehlerfrei geladen; >0 measured-Profile UND >0 effektive Aperturen (null
-  Aperturen heisst: die capability matrix hat nichts beigetragen und jeder
-  direkte Pfad ist unbegrenzt — die stille Variante des Fehlers); die absichtlich
-  platzhalter-kontaminierte Klasse entscheidet ueberall STATUS_QUO, auch fuer
-  `protected`; **Saettigungs-Sensor und Latenz-Term wurden dabei NICHT
-  konsultiert** (die Sonden-Hooks WERFEN bei Beruehrung, damit „nicht
-  konsultiert" bewiesen und nicht vermutet ist); und die vollstaendig gemessene
-  Klasse entscheidet mindestens einmal einen echten Pfad — sonst wurden die
-  Tabellen geladen und ignoriert.
-* **Warum der Schritt existiert** `load_rate_tables` degradiert fehlende
-  Quellen laut, aber fehlerfrei zu Platzhaltern, und Regel 1 haelt dann alles
-  auf dem Status quo. Zur Laufzeit richtig — hier nicht von einem Lauf ganz
-  ohne Karten unterscheidbar. Und: die Neutralitaet wurde bisher NUR mit
-  Platzhaltern getestet. Erst jetzt gibt es measured-Kandidaten, die die Regel
-  verletzen koennten.
-* **Artefakte** `s08_dispatcher_tables/dispatcher_tables.json`
+* **Precondition** s01 AND s06 PASS. No card, no lock, no corridor.
+* **Command** `bash run_step.sh s08` (optionally `GDR_TSV=<#278 matrix>`)
+* **Success** `check_s08_dispatcher_tables.py`: all three sources present and
+  loaded without error; >0 measured profiles AND >0 effective apertures (zero
+  apertures means the capability matrix contributed nothing and every direct
+  path is unbounded — the silent variant of the failure); the deliberately
+  placeholder-contaminated class decides STATUS_QUO everywhere, including for
+  `protected`; **the saturation sensor and the latency term were NOT consulted
+  while doing so** (the probe hooks THROW on contact, so that "not consulted"
+  is proven and not assumed); and the fully measured class decides at least
+  one real path — otherwise the tables were loaded and ignored.
+* **Why this step exists** `load_rate_tables` degrades missing sources loudly,
+  but without error, to placeholders, and rule 1 then holds everything at the
+  status quo. Correct at runtime — but indistinguishable here from a run with
+  no cards at all. And: neutrality has so far been tested ONLY with
+  placeholders. Only now are there measured candidates that could violate the
+  rule.
+* **Artifacts** `s08_dispatcher_tables/dispatcher_tables.json`
 
-### S9 — `s09_sensor_smoke` · sonnet · ~15 min · wiederholbar
+### S9 — `s09_sensor_smoke` · sonnet · ~15 min · repeatable
 
-gdn-/KV-Druck-Leiter: Flags auf einem echten Boot, Sensor an echter Belegung.
-Kleines Modell (Qwen3.5-4B), eine Karte, TP=1.
+gdn/KV pressure ladders: flags on a real boot, sensor against real occupancy.
+Small model (Qwen3.5-4B), one card, TP=1.
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s09`
-* **Erfolg** `check_s09_sensor_smoke.py`: alle vier Leiter-Flags kommen von
-  `/get_server_info` zurueck (Argument-Validierung ist CPU-getestet — neu ist,
-  dass die Werte den Scheduler erreichen); zwei identische Greedy-Generierungen
-  sind identisch (die Leitern sollen inert sein); ≥20 Belegungs-Samples aus
-  `sglang:token_usage` mit Maximum > 0 (eine Nulllinie hiesse, die Last hat den
-  Pool nie erreicht); der Sensor liefert eine Lesung mit Verdikt, endlicher
-  Belegung und Trend — und zweimal dieselbe aus derselben Reihe.
-* **Ausdruecklich NICHT getestet** die Verdrahtung des Sensors an die
-  Scheduler-Belegung und jede echte Bewegung von State-Sets oder KV. Beides
-  existiert noch nicht; es sind die offenen Posten, die diese Zahlen
-  vorbereiten.
-* **Artefakte** `s09_sensor_smoke/{sensor_smoke.json,server_info.json,server.log}`
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s09`
+* **Success** `check_s09_sensor_smoke.py`: all four ladder flags come back
+  from `/get_server_info` (argument validation is CPU-tested — what is new is
+  that the values reach the scheduler); two identical greedy generations are
+  identical (the ladders are supposed to be inert); ≥20 occupancy samples from
+  `sglang:token_usage` with a maximum > 0 (a flat zero line would mean the load
+  never reached the pool); the sensor returns a reading with a verdict, a
+  finite occupancy and a trend — and twice the same one from the same series.
+* **Explicitly NOT tested** the wiring of the sensor to scheduler occupancy,
+  and any real movement of state sets or KV. Neither exists yet; they are the
+  open items these numbers prepare.
+* **Artifacts** `s09_sensor_smoke/{sensor_smoke.json,server_info.json,server.log}`
 
 ---
 
-## Der BAR1-Block (s10-s12) — laeuft auf dem PVE-HOST
+## The BAR1 block (s10-s12) — runs on the PVE HOST
 
-Diese drei Schritte fahren nicht dort, wo die Batterie fahrt. Der gepatchte
-Treiber, das Halter-Modul und `/dev/dmabuf_holder` liegen auf dem PVE-Host;
-CT999 kann das Halter-Gerat nicht einmal oeffnen (Major 10 steht nicht in der
-Device-Allowlist des Containers). Die Schritte steuern den Host also ueber ssh,
-waehrend Batterie, Zustand und Artefakte im Container bleiben.
+These three steps do not run where the battery runs. The patched driver, the
+holder module and `/dev/dmabuf_holder` live on the PVE host; CT999 cannot even
+open the holder device (major 10 is not in the container's device allowlist).
+So the steps drive the host over ssh, while battery, state and artifacts stay
+in the container.
 
-Was daraus folgt und in jedem der drei Skripte steht:
+What follows from that, and what is written in each of the three scripts:
 
-* **Zwei `/tmp`-Namensraeume.** `/tmp/gpu-card-N.lock` in CT999 und das
-  gleichnamige Verzeichnis auf dem Host sind **verschiedene** Locks. Deshalb
-  werden beide genommen: die Container-Seite von `run_step.sh`
-  (`locks="battery"`), die Host-Seite vom Schritt selbst ueber
-  `battery_host.sh`. Ein fremdes Lock wird auf **keiner** Seite gebrochen.
-* **Jedes ssh hat eine Frist.** Ein blockierendes ssh in einem Bash-Aufruf
-  macht den Executor handlungsunfaehig, ohne dass es jemand sieht.
-  `host_ssh` traegt immer `timeout`, `ConnectTimeout` und Keepalives.
-* **py-spy laeuft auf dem HOST**, vor jedem Kill, aus dem Container-venv (der
-  Host hat kein eigenes). Getoetet wird nur die eigene Prozessgruppe, nie ein
-  Muster.
-* **Serverlogs bleiben auf dem Host** (`/root/battery-bar1/`). In das
-  Lauf-Verzeichnis kommen das Grep-Ergebnis und ein begrenzter Tail — nie das
-  ganze Log, nie in den Kontext eines Agenten.
-* **Pfadabbildung.** Das Wurzel-Dateisystem des Containers ist auf dem Host
-  `/spinning/subvol-999-disk-0`, in beide Richtungen beschreibbar. Deshalb
-  schreibt der Messtreiber auf dem Host direkt in das Lauf-Verzeichnis — nur so
-  ist die Live-Tabelle von s12 live.
+* **Two `/tmp` namespaces.** `/tmp/gpu-card-N.lock` in CT999 and the
+  identically named directory on the host are **different** locks. Both are
+  therefore taken: the container side by `run_step.sh` (`locks="battery"`),
+  the host side by the step itself via `battery_host.sh`. A foreign lock is
+  broken on **neither** side.
+* **Every ssh has a deadline.** A blocking ssh inside a bash call leaves the
+  executor unable to act without anyone seeing it. `host_ssh` always carries
+  `timeout`, `ConnectTimeout` and keepalives.
+* **py-spy runs on the HOST**, before every kill, out of the container venv
+  (the host has none of its own). Only the step's own process group is killed,
+  never a pattern.
+* **Server logs stay on the host** (`/root/battery-bar1/`). What lands in the
+  run directory is the grep result and a bounded tail — never the whole log,
+  never in an agent's context.
+* **Path mapping.** The container's root filesystem is
+  `/spinning/subvol-999-disk-0` on the host, writable in both directions. That
+  is why the measurement driver on the host writes straight into the run
+  directory — it is the only way s12's live table is live.
 
-Umgebungsvariablen (alle mit Vorgabe, alle in `battery_host.sh` dokumentiert):
-`BAR1_HOST`, `BAR1_HOST_KEY`, `BAR1_HOST_SUBVOL`, `BAR1_HOST_WT`,
-`BAR1_NV_SOURCE`, `BAR1_HOLDER_KO`, `BAR1_EXTCACHE`, `BAR1_PORT`,
-`BAR1_VIEWER_KILL_OK`, `S12_SESSIONS`, `S12_POINT_SECONDS`,
+Environment variables (all with a default, all documented in
+`battery_host.sh`): `BAR1_HOST`, `BAR1_HOST_KEY`, `BAR1_HOST_SUBVOL`,
+`BAR1_HOST_WT`, `BAR1_NV_SOURCE`, `BAR1_HOLDER_KO`, `BAR1_EXTCACHE`,
+`BAR1_PORT`, `BAR1_VIEWER_KILL_OK`, `S12_SESSIONS`, `S12_POINT_SECONDS`,
 `S12_BASELINE_TOL_PCT`.
 
-### S10 — `s10_bar1_driver` · sonnet · ~6 min · wiederholbar
+### S10 — `s10_bar1_driver` · sonnet · ~6 min · repeatable
 
-Gepatchter Treiber plus Vorbedingungen des Direktpfads. Rezept aus
-`04_BETRIEB.md` der P2P-Uebergabe, mit einem bewussten Unterschied: die
-PCI-Adressen fuer den Reset werden zur Laufzeit aus `lspci` aufgeloest statt
-hineingeschrieben — Enumeration verschiebt sich zwischen Boots und
-Treiberzustaenden.
+Patched driver plus the direct path's preconditions. Recipe from
+`04_BETRIEB.md` of the P2P handover, with one deliberate difference: the PCI
+addresses for the reset are resolved at runtime from `lspci` instead of being
+written in — enumeration shifts between boots and driver states.
 
-* **Vorbedingung** s00 PASS.
-* **Kommando** `bash run_step.sh s10`
-* **Idempotent** Liegt das gepatchte Modul schon **mit** Regkey und Halter vor,
-  wird nichts entladen: der Schritt prueft und vermerkt
-  `reload_performed=false`. Den Treiber zu wechseln, um zu zeigen, dass man ihn
-  wechseln kann, wuerde genau den Zustand kosten, den s11 und s12 brauchen.
-* **Erfolg** `check_s10_bar1_driver.py`: Regkey in
+* **Precondition** s00 PASS.
+* **Command** `bash run_step.sh s10`
+* **Idempotent** If the patched module is already in place **with** regkey and
+  holder, nothing is unloaded: the step checks and records
+  `reload_performed=false`. Swapping the driver just to show that it can be
+  swapped would cost exactly the state s11 and s12 need.
+* **Success** `check_s10_bar1_driver.py`: regkey in
   `/proc/driver/nvidia/params`; `strings nvidia.ko | grep -c SMALLBAR_P2P` = 37
-  (voller Patch, nicht die 1 des minimalen); **die srcversion des GELADENEN
-  Moduls stimmt mit der der `.ko` ueberein** — die Regkey-Zeile allein belegt
-  nur einen Parameter, nicht die Identitaet des Moduls; `dmabuf_holder` geladen
-  **und** `/dev/dmabuf_holder` da; `nvidia_uvm` geladen; alle drei Karten
-  enumerieren mit UUID und PCI-Adresse.
-* **Abbruch** Host nicht erreichbar, Rechenprozesse auf den Karten, oder
-  Betrachter halten die Module = STOP (Umgebung). Fehlender Regkey, minimaler
-  Patch, fremdes Modul, fehlender Halter, verlorene Karte = FAIL.
-* **Betrachter** `nvtop` und Verwandte halten die Module. Sie werden **nur** mit
-  `BAR1_VIEWER_KILL_OK=1` beendet, und diese Freigabe gilt **nicht dauerhaft**
-  (05_FALLEN). Ohne sie haelt der Schritt an und nennt die PIDs.
-* **Rueckstellung** Die Batterie endet per Default **ohne** Rueckstellung: s11
-  und s12 laufen unter dem Patch, und die NCCL-Koexistenz ist gemessen
-  (37,11 / 64,65 / 359,35 µs gegen 37,89 / 65,25 / 357,63 µs — alle innerhalb
-  der Streuung). Wer den Serientreiber zurueck will:
-  `bash s10_restore.sh` — eigenes Kommando, kein Batterie-Schritt.
-* **Artefakte** `s10_bar1_driver/{driver_state.json,remote_probe.sh,remote_reload.sh,host/*}`
+  (the full patch, not the 1 of the minimal one); **the srcversion of the
+  LOADED module matches that of the `.ko`** — the regkey line on its own proves
+  a parameter, not the module's identity; `dmabuf_holder` loaded **and**
+  `/dev/dmabuf_holder` present; `nvidia_uvm` loaded; all three cards enumerate
+  with UUID and PCI address.
+* **Abort** host unreachable, compute processes on the cards, or viewers
+  holding the modules = STOP (environment). Missing regkey, minimal patch,
+  foreign module, missing holder, lost card = FAIL.
+* **Viewers** `nvtop` and its relatives hold the modules. They are terminated
+  **only** with `BAR1_VIEWER_KILL_OK=1`, and that clearance is **not
+  permanent** (05_FALLEN). Without it the step halts and names the PIDs.
+* **Restore** The battery ends by default **without** a restore: s11 and s12
+  run under the patch, and NCCL coexistence has been measured (37.11 / 64.65 /
+  359.35 µs against 37.89 / 65.25 / 357.63 µs — all within the spread).
+  Whoever wants the stock driver back: `bash s10_restore.sh` — its own
+  command, not a battery step.
+* **Artifacts** `s10_bar1_driver/{driver_state.json,remote_probe.sh,remote_reload.sh,host/*}`
 
-### S11 — `s11_bar1_e2e` · sonnet · ~25 min · wiederholbar
+### S11 — `s11_bar1_e2e` · sonnet · ~25 min · repeatable
 
-Ein Standardlauf ueber den Direktpfad, Ende zu Ende. Die Frage ist **nicht**, ob
-er bootet.
+One standard run over the direct path, end to end. The question is **not**
+whether it boots.
 
-* **Vorbedingung** s10 PASS. Die BAR1-Integration muss im Arbeitsbaum unter Test
-  liegen (`htccl_bar1.py`, `benchmark/bar1_graph_check.py`), sonst STOP mit dem
-  Hinweis auf `BAR1_HOST_WT`.
-* **Kommando** `bash run_step.sh s11`
-* **Tor zuerst** `benchmark/bar1_graph_check.py 0,1,2`. `GRAPH_FREIGABE=1` ohne
-  diesen Beleg ergibt Zahlen von einem Betriebspunkt, den niemand verteidigen
-  kann.
-* **Erfolg** `check_s11_bar1_e2e.py`: alle Gate-Faelle des Tors bestanden;
-  **je Gruppe** `ERREICHT=bar1` — mit `SGLANG_UNEVEN_DCP=1` sind es zwei
-  (`tp:0`, `dcp:0`), und eine davon auf gloo macht den Lauf gemischt (genau das
-  ist einmal passiert und hat eine ganze Messung gekostet); je Gruppe eine
-  `HTCCL-BAR1: Aufbau in`-Zeile; Smoke-Antwort kohaerent (die Zahlen 1..20 in
-  Folge, **gezaehlt**, nicht beurteilt) und `spec_accept_length` als Zahl; kein
-  OOM/NCCL/Watchdog im gegreppten Log.
-* **Der Riegel als Sonderfall** `htccl._select` bricht **laut** ab, statt unter
-  einer Graph-Aufzeichnung still auf die host-gestaffelte gloo-Ebene
-  auszuweichen. Solange `all_gather` in `htccl_bar1` fehlt, endet der
-  Standardlauf mit
+* **Precondition** s10 PASS. The BAR1 integration must be present in the
+  working tree under test (`htccl_bar1.py`, `benchmark/bar1_graph_check.py`),
+  otherwise STOP with a pointer to `BAR1_HOST_WT`.
+* **Command** `bash run_step.sh s11`
+* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `GRAPH_FREIGABE=1`
+  without that proof yields numbers from an operating point nobody can defend.
+* **Success** `check_s11_bar1_e2e.py`: all gate cases of the gate passed;
+  `ERREICHT=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
+  (`tp:0`, `dcp:0`), and one of them on gloo makes the run a mixed one (which
+  happened exactly once and cost a whole measurement); per group one
+  `HTCCL-BAR1: Aufbau in` line; smoke answer coherent (the numbers 1..20 in
+  sequence, **counted**, not judged) and `spec_accept_length` a number; no
+  OOM/NCCL/watchdog in the grepped log.
+* **The bolt as a special case** `htccl._select` aborts **loudly** instead of
+  silently falling back to the host-staged gloo layer under a graph capture.
+  As long as `all_gather` is missing from `htccl_bar1`, the standard run ends
+  with
   `RuntimeError: HTCCL: 'all_gather' mit <n> Byte waehrend einer
-  CUDA-Graph-Aufzeichnung ...`. Der Check gibt das als **eigene FAIL-Meldung**
-  mit `RIEGEL`, Operation und Groesse aus — richtiges Verhalten des Codes und
-  ein FAIL dieses Schritts zugleich. Genau dieses Szenario nimmt die parallele
-  BAR1-Integration ab.
-* **Nicht bewertet** die HOEHE von `spec_accept_length`, die Aufbaudauer, jeder
-  Durchsatz.
-* **Artefakte** `s11_bar1_e2e/{bar1_e2e.json,graph_check.txt,htccl_lines.txt,smoke.json,server_info.json,server.log,remote_*.sh}`
+  CUDA-Graph-Aufzeichnung ...` (all_gather with n bytes during a CUDA graph
+  capture). The check reports that as its **own FAIL message** carrying
+  `RIEGEL`, the operation and the size — correct behaviour of the code and a
+  FAIL of this step at the same time. This is exactly the scenario the
+  parallel BAR1 integration signs off.
+* **Not judged** the HEIGHT of `spec_accept_length`, the setup duration, any
+  throughput.
+* **Artifacts** `s11_bar1_e2e/{bar1_e2e.json,graph_check.txt,htccl_lines.txt,smoke.json,server_info.json,server.log,remote_*.sh}`
 
-### S12 — `s12_prefill_kurve` · sonnet · ~70 min · NICHT wiederholbar
+### S12 — `s12_prefill_kurve` · sonnet · ~70 min · NOT repeatable
 
-**Die** Messung. Ueber den Host-Weg ist die Prefill-Kurve flach
-(1190/1097/1144/1105/1122 tok/s ueber 1/2/4/8/16 Sessions) bei 65-90 %
-Kollektivzeit — mehr Sessions bringen nichts, weil die Kollektive saettigen,
-nicht die Rechenwerke. Ist der Deckel der Umweg, faellt er mit ihm.
+**The** measurement. Over the host path the prefill curve is flat
+(1190/1097/1144/1105/1122 tok/s over 1/2/4/8/16 sessions) at 65-90% collective
+time — more sessions buy nothing, because it is the collectives that saturate,
+not the compute units. If the detour is the ceiling, the ceiling falls with
+it.
 
-* **Vorbedingung** s11 PASS.
-* **Kommando** `bash run_step.sh s12`
-* **Verschraenkt, nicht blockweise** Je Sessionzahl laufen bar1 und Grundlinie
-  hintereinander (A,B,A,B), dann die naechste Sessionzahl. Acht Boots fuer vier
-  Punkte je Arm — das ist der Preis dafuer, nicht zwei Nachmittage zu
-  vergleichen (Messregel 5). Blockweise waere je Arm ein Boot und wertlos.
-* **Die Arme unterscheiden sich in genau drei Variablen**
-  (`SGLANG_HTCCL`, `SGLANG_HTCCL_TRANSPORT`, `SGLANG_HTCCL_GRAPH_FREIGABE`,
-  dazu die Treiberquelle). Beide Bootskripte kommen aus **einer** Vorlage, damit
-  sie nicht auseinanderlaufen; ein Test diffed sie und laesst genau zwei
-  Zeilen Unterschied zu.
-* **Was gemessen wird** je Arm und Sessionzahl 1/4/8/16 ein Prefill-Punkt
-  (Zeitbox 15 s, Vorlauf 8 s, Zaehler ist `prompt_tokens` **aus der Antwort**,
-  je Anfrage ein eindeutiger Kopf plus `/flush_cache`, damit nicht der
-  Radix-Cache gemessen wird), dazu je Boot ein Decode-Punkt bei bs=1 und bs=16
-  mit `ms/Token`, `ms/Verify` und `spec_accept_length`. Rohzeilen je Anfrage
-  werden persistiert, nicht nur die Endzahl.
-* **Erfolg** `check_s12_prefill_kurve.py`: je geplanter Sessionzahl eine Zahl in
-  **beiden** Armen; die Arme haben wirklich abgewechselt (sonst FAIL
-  „blockweise"); **je Punkt der Transport-Beleg** — bar1-Punkte mit allen
-  Gruppen auf `ERREICHT=bar1`, Grundlinien-Punkte ohne jede HTCCL-Gruppe; je Arm
-  ein Decode-Punkt bei bs=1 und bs=16; je Arm ein persistiertes Ausgabe-Sample
-  (ein schneller Muell-Lauf sieht in einer Durchsatztabelle gut aus); und die
-  **Grundlinie reproduziert** die bekannten Zahlen innerhalb `±5 %`.
-* **Abbruch** Reproduziert die Grundlinie nicht, ist das **STOP**: diese
-  Umgebung ist nicht die, aus der die bekannten Zahlen stammen. Vorbehalt dazu:
-  die bekannten Werte stammen aus einem **anderen** Messprogramm. Reisst das
-  Tor, ist der erste Verdacht das Messprogramm, nicht das Rig — deshalb STOP
-  (Operator entscheidet) und nicht FAIL, und deshalb ist die Toleranz ueber
-  `S12_BASELINE_TOL_PCT` einstellbar. Der A/B-Vergleich selbst haengt daran
-  nicht: beide Arme werden mit demselben Programm gemessen.
-* **Ausdruecklich NICHT bewertet** ob die Kurve flach bleibt oder steigt, und um
-  wieviel bar1 die Grundlinie schlaegt. Flach ist ein Befund, steigend ist ein
-  Befund. Ein Check, der das beurteilte, entschiede die Frage, fuer die die
-  Messung existiert. Das Ergebnis-JSON traegt beide Kurven nebeneinander.
-* **Live mitlesen** Nach jedem Sessionzahl-Paar wird
-  `zwischentabelle.md` aus den persistierten Punkten neu geschrieben. Der
-  Executor gibt sie aus (EXECUTOR_PROTOCOL 6b/6c).
-* **Nicht abgedeckt** Rechen- gegen Wartezeit je Rang. Das braucht den Profiler
-  und ist eine eigene Uebung.
-* **Artefakte** `s12_prefill_kurve/{prefill_kurve.json,zwischentabelle.md,punkte.jsonl,roh_*.jsonl,belege/*,logs/*,remote_*.sh}`
+* **Precondition** s11 PASS.
+* **Command** `bash run_step.sh s12`
+* **Interleaved, not blockwise** Per session count, bar1 and baseline run back
+  to back (A,B,A,B), then the next session count. Eight boots for four points
+  per arm — that is the price of not comparing two different afternoons
+  (measurement rule 5). Blockwise would be one boot per arm, and worthless.
+* **The arms differ in exactly three variables** (`SGLANG_HTCCL`,
+  `SGLANG_HTCCL_TRANSPORT`, `SGLANG_HTCCL_GRAPH_FREIGABE`, plus the driver
+  source). Both boot scripts come from **one** template so they cannot drift
+  apart; a test diffs them and allows exactly two lines of difference.
+* **What is measured** per arm and session count 1/4/8/16 one prefill point
+  (time box 15 s, warm-up 8 s, the counter is `prompt_tokens` **from the
+  response**, a unique head per request plus `/flush_cache` so that the radix
+  cache is not what gets measured), plus per boot one decode point at bs=1 and
+  bs=16 with `ms/Token`, `ms/Verify` and `spec_accept_length`. Raw per-request
+  rows are persisted, not just the final number.
+* **Success** `check_s12_prefill_kurve.py`: one number in **both** arms per
+  planned session count; the arms really did alternate (otherwise FAIL
+  "blockwise"); **the transport proof per point** — bar1 points with all groups
+  on `ERREICHT=bar1`, baseline points without a single HTCCL group; one decode
+  point per arm at bs=1 and bs=16; one persisted output sample per arm (a fast
+  garbage run looks good in a throughput table); and the **baseline
+  reproduces** the known numbers within `±5%`.
+* **Abort** If the baseline does not reproduce, that is **STOP**: this
+  environment is not the one the known numbers came from. Caveat: the known
+  values come from a **different** measurement program. If the gate breaks, the
+  first suspect is the measurement program, not the rig — hence STOP (the
+  operator decides) and not FAIL, and hence the tolerance is adjustable via
+  `S12_BASELINE_TOL_PCT`. The A/B comparison itself does not depend on it:
+  both arms are measured with the same program.
+* **Explicitly NOT judged** whether the curve stays flat or rises, and by how
+  much bar1 beats the baseline. Flat is a finding, rising is a finding. A check
+  that judged it would decide the very question the measurement exists for. The
+  result JSON carries both curves side by side.
+* **Read along live** After each session-count pair, `zwischentabelle.md` is
+  rewritten from the persisted points. The executor prints it
+  (EXECUTOR_PROTOCOL 6b/6c).
+* **Not covered** compute versus wait time per rank. That needs the profiler
+  and is an exercise of its own.
+* **Artifacts** `s12_prefill_kurve/{prefill_kurve.json,zwischentabelle.md,punkte.jsonl,roh_*.jsonl,belege/*,logs/*,remote_*.sh}`
 
 ---
 
-## Zeitbudget
+## Time budget
 
-| Schritt | Modell | erwartet | hartes Budget |
+| Step | Model | expected | hard budget |
 |---|---|---:|---:|
 | s00_preflight | haiku | 3 min | 5 min |
 | s01_p2p_reprobe | haiku | 10 min | 30 min |
@@ -479,39 +474,37 @@ nicht die Rechenwerke. Ist der Deckel der Umweg, faellt er mit ihm.
 | s10_bar1_driver | sonnet | 6 min | 15 min |
 | s11_bar1_e2e | sonnet | 25 min | 45 min |
 | s12_prefill_kurve | sonnet | 70 min | 150 min |
-| **Summe** | | **5 h 09 min** | |
+| **Total** | | **5 h 09 min** | |
 
-Die harten Budgets liegen deutlich ueber den Erwartungen, damit ein langsamer
-Load nicht mit einem Haenger verwechselt wird. Ueberschreitung ist STOP, nie ein
-Grund, laenger zu warten — mit py-spy-Dump jedes registrierten Prozesses vor
-dem Kill.
+The hard budgets sit well above the expectations so that a slow load is not
+mistaken for a hang. An overrun is STOP, never a reason to wait longer — with
+a py-spy dump of every registered process before the kill.
 
-## Was die Batterie bewusst NICHT tut
+## What the battery deliberately does NOT do
 
-* **Sie bewertet keine Messwerte.** Kein Check hat eine Meinung zu einer
-  Accept-Hoehe, einer Bandbreite oder ob P2P anspringt. Geprueft wird, dass die
-  Messung stattgefunden hat, vollstaendig ist und von ihrem echten Konsumenten
-  geladen werden kann. Die Deutung ist Leserarbeit — deshalb ist sie nicht in
-  einem Skript vergraben, das sie stillschweigend faellt.
-* **Sie fuellt `verdict_diff.md` nicht.** Die acht „kein P2P"-Altverdikte
-  brauchen ein Urteil je Zeile; ein ueberworfenes Verdikt bekommt eine eigene
-  Aufgabe, bevor Platzierungs-Code angefasst wird. Diese Datei protokolliert
-  das Delta, sie autorisiert keine Umbauten.
-* **Sie tunt nichts im Fenster.** Kein Ratio, kein `RESERVE_HOST`, kein
-  Kontext. Ein Boot, der die Form ablehnt, ist ein verbrauchter Boot mit einer
-  Antwort — kein Startpunkt fuer Parametersuche.
-* **Sie testet keine Verdrahtung, die es nicht gibt.** Sensor an Scheduler
-  (Erg. 9), Admissions-Hook am Scheduler (Erg. 8), echte Bewegung der
-  GDN-State-Sets: alles offene Posten. Sie zu „testen" hiesse, ein gruenes
-  Verdikt fuer nicht vorhandenen Code zu vergeben.
-* **Sie faehrt keine Perf-Regression.** ms/Runde gegen einen Rauschboden ist
-  eine eigene, laengere Uebung mit verschraenkter Messung und fixiertem Takt.
-  Eine Batterie mit 20-Sekunden-Messpunkten kann sie nicht liefern und soll es
-  nicht vorgeben. **s12 ist die eine Ausnahme** und traegt den Preis dafuer:
-  acht Boots, verschraenkte Arme, ein Reproduktions-Tor gegen die bekannte
-  Grundlinie — und trotzdem kein Urteil ueber die Form der Kurve.
-* **Sie stellt den Treiber nicht zurueck.** Nach s10 bleibt der gepatchte
-  Treiber geladen; das ist Absicht und belegt (NCCL-Koexistenz gemessen).
-  `s10_restore.sh` ist ein Operator-Kommando, kein Schrittende.
-* **Sie bricht keine fremden Locks** und killt nichts, was sie nicht selbst
-  gestartet hat.
+* **It does not judge measured values.** No check has an opinion on an accept
+  height, a bandwidth, or whether P2P engages. What is checked is that the
+  measurement took place, is complete, and can be loaded by its real consumer.
+  Interpretation is the reader's work — which is why it is not buried in a
+  script that passes it silently.
+* **It does not fill in `verdict_diff.md`.** The eight "no P2P" legacy
+  verdicts need a judgement per line; an overturned verdict gets a task of its
+  own before any placement code is touched. That file records the delta, it
+  does not authorize rebuilds.
+* **It tunes nothing inside the window.** No ratio, no `RESERVE_HOST`, no
+  context. A boot that rejects the shape is a spent boot with an answer — not
+  a starting point for a parameter search.
+* **It does not test wiring that does not exist.** Sensor to scheduler
+  (addendum 9), admission hook on the scheduler (addendum 8), real movement of
+  the GDN state sets: all open items. "Testing" them would mean handing out a
+  green verdict for code that is not there.
+* **It does not run a perf regression.** ms/round against a noise floor is its
+  own, longer exercise with interleaved measurement and a fixed clock. A
+  battery with 20-second measurement points cannot deliver that and should not
+  pretend to. **s12 is the one exception** and pays the price for it: eight
+  boots, interleaved arms, a reproduction gate against the known baseline —
+  and still no verdict on the shape of the curve.
+* **It does not restore the driver.** After s10 the patched driver stays
+  loaded; that is intentional and backed by evidence (NCCL coexistence
+  measured). `s10_restore.sh` is an operator command, not the end of a step.
+* **It breaks no foreign locks** and kills nothing it did not start itself.

@@ -21,7 +21,7 @@ source ./battery_common.sh
 STEP=s00_preflight
 DIR="$(battery_step_dir "$STEP")" || exit 2
 
-echo "== Karten-Inventar (PCI/UUID, NVML<->CUDA-Join) =="
+echo "== card inventory (PCI/UUID, NVML<->CUDA join) =="
 battery_card_inventory "$DIR/inventory.json"
 
 "$PY" - "$DIR" "$WT" "$VENV" "$MODEL_ROOT" "$BATTERY_MIN_FREE_MIB" <<'PY'
@@ -101,18 +101,18 @@ with open(os.path.join(step_dir, "preflight.json"), "w") as f:
     f.write("\n")
 
 missing = [p for p, ok in payload["required_files"].items() if not ok]
-print(f"Pflichtdateien: {len(required) - len(missing)}/{len(required)} vorhanden")
+print(f"required files: {len(required) - len(missing)}/{len(required)} present")
 for p in missing:
-    print(f"  FEHLT {p}")
-print(f"gehaltene Karten-Locks: {len(locks_held)}")
+    print(f"  MISSING {p}")
+print(f"card locks held: {len(locks_held)}")
 print(f"arb holder: {payload['arb_holder']}")
 PY
 
-echo "== VRAM-Korridor =="
+echo "== VRAM corridor =="
 if battery_assert_corridor; then
-    echo "Korridor gruen (>= $BATTERY_MIN_FREE_MIB MiB frei je Karte)"
+    echo "corridor green (>= $BATTERY_MIN_FREE_MIB MiB free per card)"
 else
-    echo "Korridor ROT -- der Check meldet STOP"
+    echo "corridor RED -- the check will report STOP"
 fi
 
-echo "fertig: $DIR"
+echo "done: $DIR"
