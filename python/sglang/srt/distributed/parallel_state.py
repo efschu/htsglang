@@ -255,12 +255,26 @@ GRAPH_FREIGABE_TRANSPORTS = frozenset({"bar1", "matrix"})
 #: `cudaLaunchCooperativeKernel` aus einem Stream-Capture heraus annimmt.
 #: Solange das offen ist, faellt aufgezeichnet die 1blk-Variante, und diese
 #: Zeile bleibt aus.
-_GRAPH_FREIGABE_ENV = "SGLANG_HTCCL_GRAPH_FREIGABE"
+_GRAPH_FREIGABE_ENV = "SGLANG_HTCCL_GRAPH_ENABLE"
 
 
 def graph_freigabe_gesetzt() -> bool:
     """Ob der Freigabeschalter fuer die GPU-getriebenen Transporte steht."""
     import os
+
+    # NOTE (task #295, HTCCL env var rename): SGLANG_HTCCL_GRAPH_FREIGABE was
+    # renamed to SGLANG_HTCCL_GRAPH_ENABLE. This function re-reads
+    # os.environ live on every call (by design -- callers may set the env
+    # var at runtime, not just before import), so the alias must be
+    # re-resolved on every call too, not just once at import time -- an
+    # import-time-only resolution would miss an old name set AFTER this
+    # module was first imported. Calling resolve_env_aliases() here keeps
+    # this reader in agreement with htccl_bar1.graph_grid_default(),
+    # regardless of which htccl module happened to import first or when
+    # the caller sets the env var.
+    from sglang.srt.distributed.device_communicators import htccl_env_compat
+
+    htccl_env_compat.resolve_env_aliases()
 
     return os.environ.get(_GRAPH_FREIGABE_ENV, "0") not in (
         "0", "nein", "aus", "false", ""

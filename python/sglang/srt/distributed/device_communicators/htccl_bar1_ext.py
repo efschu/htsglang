@@ -1,59 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native Anteile des BAR1-Direkttransports.
+"""Native pieces of the BAR1 direct transport.
 
-Zwei getrennte Erweiterungen, weil sie verschiedene Voraussetzungen haben:
+Two separate extensions, because they have different requirements:
 
 ``htccl_bar1_ext``  (CUDA)
-    Die Kollektiv-Kernel. ``netz`` und ``ring`` fuer ``all_reduce``, portiert
-    aus ``/spinning/nvidia-open-595/bar1_kollektiv.cu``; dazu ``a2a`` fuer
-    ``all_to_all_single``, das in der Sonde keine Entsprechung hat und
-    deshalb ausdruecklich NICHT portiert, sondern neu geschrieben ist --
-    ungemessen, bis der Messlauf da ist. Braucht nur nvcc und torch, laeuft
-    ueberall, wo ``htccl_device`` auch baut.
+    The collective kernels. ``mesh`` and ``ring`` for ``all_reduce``, ported
+    from ``/spinning/nvidia-open-595/bar1_kollektiv.cu``; plus ``a2a`` for
+    ``all_to_all_single``, which has no counterpart in the probe and is
+    therefore deliberately NOT ported but newly written -- unmeasured until
+    the benchmark run exists. Needs only nvcc and torch, builds anywhere
+    ``htccl_device`` also builds.
 
-``htccl_bar1_dmabuf_ext``  (nur C++)
-    Der dma-buf-Export ueber die RM-Ioctls. Braucht die **Kopfdateien der
-    quelloffenen NVIDIA-Kernelmodule**; ohne sie wird er nicht gebaut und
-    der Transport meldet sich ab. Aus Python ist der Weg nicht nachbaubar:
-    ``NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD`` und
-    ``NV_ESC_EXPORT_TO_DMABUF_FD`` verlangen die UAPI-Strukturen
-    (``nvos.h``, ``nv-ioctl.h``, ``class/cl0000.h``), und deren Groessen und
-    Feldversaetze sind versionsgebunden.
+``htccl_bar1_dmabuf_ext``  (C++ only)
+    The dma-buf export via the RM ioctls. Needs the **headers of the
+    open-source NVIDIA kernel modules**; without them it isn't built and
+    the transport declines. This path can't be reconstructed from Python:
+    ``NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD`` and
+    ``NV_ESC_EXPORT_TO_DMABUF_FD`` require the UAPI structures
+    (``nvos.h``, ``nv-ioctl.h``, ``class/cl0000.h``), and their sizes and
+    field offsets are version-bound.
 
-Was aus der Sonde uebernommen ist und was sich geaendert hat
+What was taken from the probe, and what changed
 ------------------------------------------------------------
-UEBERNOMMEN, moeglichst buchstaeblich: ``schreibeV4`` (``st.global.wt``),
-``leseV4`` (``ld.global.cv``), ``flaggeLesen`` (``ld.mmio.relaxed.sys`` bzw.
-``ld.global.cv``), ``leseFluss``, ``barriere<GRID>``, die Schrittfolge und
-die Sperrenzahl beider Kernel, die Chunkgeometrie (Rest auf die vorderen
-Chunks), die Flaggenzeilen zu 256 Byte je (Topologie, Schritt, Sender) und
-die Gittergroessenrechnung.
+TAKEN OVER, as literally as possible: ``schreibeV4`` (``st.global.wt``),
+``leseV4`` (``ld.global.cv``), ``flaggeLesen`` (``ld.mmio.relaxed.sys`` or
+``ld.global.cv``), ``leseFluss``, ``barriere<GRID>``, the step sequence and
+the barrier count of both kernels, the chunk geometry (remainder onto the
+leading chunks), the 256-byte-per-rank flag lines (topology, step, sender),
+and the grid-size computation.
 
-GEAENDERT, jeweils mit Grund:
+CHANGED, each with its reason:
 
-* **Beliebiges R statt fest drei.** ``RANGE_N`` war eine
-  Uebersetzungskonstante; hier ist ``R`` ein Feld der Argumentstruktur. Die
-  Schleifen laufen ueber ``R``, die Felder sind auf
-  ``HTCCL_BAR1_MAX_RANKS`` dimensioniert.
-* **Datentypen.** Die Sonde rechnete ausschliesslich ``float``. Hier ist
-  die Reduktion ueber ``float``/``half``/``bfloat16`` templatisiert. Die
-  **Zugriffsbreite bleibt 128 Bit** (``uint4``) -- das ist die Eigenschaft,
-  an der die Messung haengt, nicht der Elementtyp. Der ``float``-Pfad ist
-  bitgleich zur Sonde.
-* **Keine Selbstpruefung.** ``sollWert``/``basisWert``/``fehlerZahl`` waren
-  Messwerkzeug der Sonde (sie kannte ihre Eingabe). Ein Transport kennt sie
-  nicht; die Pruefung ist ersatzlos entfallen statt durch eine Attrappe
-  ersetzt zu werden. Der Byte-Beleg beim Aufbau bleibt.
-* **Kein Rundenterm ``rt``.** Ebenfalls Messwerkzeug (er machte die Nutzlast
-  je Runde verschieden, damit ein liegengebliebener Puffer auffaellt).
-* **Rundennummer im Geraetespeicher.** Die Sonde reichte ``runde`` je Start
-  als Wert herein. Das ueberlebt keine CUDA-Graph-Aufzeichnung -- ein
-  aufgezeichneter Start wiederholte ewig dieselbe Zahl und jede Flagge
-  stuende sofort. Die Runde liegt deshalb in einem Geraetewort und wird im
-  Kernel gelesen und am Ende fortgeschrieben, genau wie ``htccl_device`` es
-  mit seiner Folgenummer macht.
-* **Keine Phasenuhr.** ``%globaltimer``-Stempel und der Ablageschreibvorgang
-  am Kernelende gehoeren in die Sonde, nicht in den heissen Pfad.
+* **Arbitrary R instead of a fixed three.** ``RANGE_N`` was a compile-time
+  constant; here ``R`` is a field of the argument struct. The loops run
+  over ``R``, and the arrays are sized to
+  ``HTCCL_BAR1_MAX_RANKS``.
+* **Data types.** The probe computed exclusively in ``float``. Here the
+  reduction is templated over ``float``/``half``/``bfloat16``. The
+  **access width stays 128 bits** (``uint4``) -- that is the property the
+  measurement depends on, not the element type. The ``float`` path is
+  bit-identical to the probe.
+* **No self-check.** ``sollWert``/``basisWert``/``fehlerZahl`` were
+  measurement tooling of the probe (it knew its own input). A transport
+  does not know its input; the check was dropped without replacement
+  rather than faked. The byte-level verification at setup time remains.
+* **No round term ``rt``.** Also measurement tooling (it made the payload
+  differ per round so a stale buffer would stand out).
+* **Round number in device memory.** The probe passed ``round`` in as a
+  value on every launch. That doesn't survive CUDA graph capture -- a
+  captured launch would replay the same number forever and every flag
+  would appear satisfied immediately. The round therefore lives in a
+  device word, is read by the kernel, and is advanced at the end, exactly
+  the way ``htccl_device`` does it with its sequence number.
+* **No phase clock.** ``%globaltimer`` timestamps and the end-of-kernel
+  logging write belong in the probe, not on the hot path.
 """
 
 from __future__ import annotations
@@ -64,23 +64,27 @@ import pathlib
 import time
 from typing import Optional
 
+from sglang.srt.distributed.device_communicators import (
+    htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+)
+
 logger = logging.getLogger(__name__)
 
 _ext = None
 _dmabuf_ext = None
-_dmabuf_grund = ""
+_dmabuf_reason = ""
 
-#: Groesster Verbund, fuer den die Argumentfelder Platz haben. Acht, weil
-#: die Struktur damit rund 1 KiB gross bleibt und sicher in den 4-KiB-Bereich
-#: fuer Kernelparameter passt.
+#: Largest rank group for which the argument arrays have room. Eight,
+#: because that keeps the struct around 1 KiB and safely within the 4 KiB
+#: region for kernel parameters.
 MAX_RANGE = 8
 
-#: Wo die Kopfdateien der quelloffenen Kernelmodule liegen. Rangeinheitlich
-#: wie jede andere SGLANG_HTCCL*-Variable.
-NV_QUELLE_VORGABE = "/spinning/nvidia-open-595"
+#: Where the headers of the open-source kernel modules live. Rank-uniform
+#: like every other SGLANG_HTCCL* variable.
+NV_SOURCE_DEFAULT = "/spinning/nvidia-open-595"
 
-#: Unterverzeichnisse relativ dazu -- exakt die drei, mit denen
-#: sonden/dmabuf_p2p_probe.cpp uebersetzt wird.
+#: Subdirectories relative to that root -- exactly the three that
+#: sonden/dmabuf_p2p_probe.cpp is compiled against.
 NV_INCLUDES = (
     "kernel-open/common/inc",
     "src/common/sdk/nvidia/inc",
@@ -89,7 +93,7 @@ NV_INCLUDES = (
 
 
 # ===========================================================================
-# Kernelquelltext
+# Kernel source
 # ===========================================================================
 
 _CUDA_SRC = r"""
@@ -105,20 +109,20 @@ namespace cg = cooperative_groups;
 #define HTCCL_BAR1_MAX_RANKS 8
 #define HTCCL_BAR1_MAX_STEPS (2 * (HTCCL_BAR1_MAX_RANKS - 1))
 
-// Kernvarianten, unveraendert aus der Sonde.
+// Kernel variants, unchanged from the probe.
 #define K_1BLK   0
 #define K_GITTER 1
-// Ladeform der Flagge. LA_MMIO ist die einzige echte Cache-Umgehung und die
-// Vorgabe der Sonde (Lauf-Feld uncachedLeseart = LA_MMIO).
+// Flag load mode. LA_MMIO is the only genuine cache bypass and the probe's
+// default (run field uncachedLeseart = LA_MMIO).
 #define LA_CV    0
 #define LA_MMIO  2
 
 using u64 = unsigned long long;
 
 // ---------------------------------------------------------------------------
-// Zugriffe, die keine Cache-Stufe verschlucken darf. Buchstaeblich aus
-// bar1_kollektiv.cu: die Bytes kommen per DMA von einer FREMDEN Karte in den
-// Framebuffer, eine wiederverwendete Cachezeile zeigt den alten Stand.
+// Accesses that must not let a cache stage swallow them. Taken literally
+// from bar1_kollektiv.cu: the bytes arrive via DMA from a FOREIGN card into
+// the framebuffer, and a reused cache line would show the stale state.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ uint4 leseV4(const void *p)
 {
@@ -153,10 +157,10 @@ __device__ __forceinline__ void schreibeU64(void *p, u64 v)
     asm volatile("st.global.wt.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
 
-// Einzelbyte, cache-umgehend. Gebraucht NUR im Restpfad von all_to_all: dort
-// kann ein Block an einer Grenze enden, die kein Vielfaches von 16 ist, und
-// die letzten Bytes stammen -- wie der Rest -- per DMA von einer fremden
-// Karte. Ohne .cv laege eine wiederverwendete Cachezeile davor.
+// Single byte, cache-bypassing. Needed ONLY in the remainder path of
+// all_to_all: there a block can end at a boundary that isn't a multiple of
+// 16, and the last bytes come -- like the rest -- via DMA from a foreign
+// card. Without .cv, a reused cache line would sit in front of them.
 __device__ __forceinline__ unsigned char leseB(const void *p)
 {
     unsigned int v;
@@ -164,11 +168,11 @@ __device__ __forceinline__ unsigned char leseB(const void *p)
     return (unsigned char)v;
 }
 
-// Lesefluss fuer den Fall, dass Nutzlast und Flagge an VERSCHIEDENEN
-// PCIe-Zielen liegen. Bleibt uebernommen, wird von diesem Transport aber
-// nicht benutzt (beide liegen auf derselben Zielkarte, Reihenfolge je
-// Requester/Completer-Paar gilt); der Schalter existiert, damit die
-// Quittungsart spaeter ohne Codeaenderung geprueft werden kann.
+// Read flush for the case where payload and flag sit on DIFFERENT PCIe
+// targets. Kept for continuity, but not used by this transport (both sit on
+// the same target card, and per-requester/completer-pair ordering holds);
+// the switch exists so the acknowledgement style can be tested later
+// without a code change.
 __device__ __forceinline__ void leseFluss(const uint4 *peerRecv, int n4)
 {
     if (n4 <= 0) return;
@@ -178,11 +182,11 @@ __device__ __forceinline__ void leseFluss(const uint4 *peerRecv, int n4)
 }
 
 // ---------------------------------------------------------------------------
-// Elementweise Addition INNERHALB eines 128-Bit-Pakets.
+// Element-wise addition WITHIN a 128-bit packet.
 //
-// Die Sonde kannte nur float4. Die Zugriffsbreite bleibt hier dieselbe --
-// geaendert hat sich nur, wie die 16 Byte gedeutet werden. Fuer float ist der
-// erzeugte Code identisch zur Sonde.
+// The probe only knew float4. The access width stays the same here -- what
+// changed is only how the 16 bytes are interpreted. For float, the
+// generated code is identical to the probe.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ unsigned int addF(unsigned int a, unsigned int b)
 {
@@ -205,8 +209,9 @@ __device__ __forceinline__ unsigned int addBF2(unsigned int a, unsigned int b)
     __nv_bfloat162 z = __hadd2(x, y);
     return *(const unsigned int *)&z;
 #else
-    // Vor sm_80 gibt es keine bf16-Rechenwerke. Ueber float, damit derselbe
-    // Quelltext uebersetzt -- gemessen wurde bf16 nur auf sm_86 und sm_120.
+    // Before sm_80 there are no bf16 arithmetic units. Routed through float
+    // so the same source still compiles -- bf16 was only measured on sm_86
+    // and sm_120.
     const __nv_bfloat16 *x = (const __nv_bfloat16 *)&a;
     const __nv_bfloat16 *y = (const __nv_bfloat16 *)&b;
     __nv_bfloat16 r[2];
@@ -247,11 +252,11 @@ __device__ __forceinline__ uint4 addV4<__nv_bfloat16>(uint4 a, uint4 b)
 }
 
 // ---------------------------------------------------------------------------
-// Chunkgeometrie. Chunk j von n4 Paketen ueber R Raenge; der Rest n4 % R geht
-// auf die VORDEREN Chunks. Unveraendert aus der Sonde, nur R statt RANGE_N.
-// Dieselbe Rechnung steht host-seitig noch einmal in der Nahtstellenpruefung
-// (bar1_all_reduce): eine Naht, die auf beiden Seiten mit DERSELBEN falschen
-// Formel geprueft wuerde, faellt nicht auf.
+// Chunk geometry. Chunk j out of n4 packets over R ranks; the remainder
+// n4 % R goes onto the LEADING chunks. Unchanged from the probe, just R
+// instead of RANGE_N. The same computation appears once more host-side in
+// the seam check (bar1_all_reduce): a seam checked on both sides with THE
+// SAME wrong formula would never surface.
 // ---------------------------------------------------------------------------
 __device__ __host__ __forceinline__ void chunkGrenzen(int n4, int j, int R,
                                                       int *off, int *len)
@@ -263,21 +268,21 @@ __device__ __host__ __forceinline__ void chunkGrenzen(int n4, int j, int R,
 }
 
 // ---------------------------------------------------------------------------
-// Argumente. Eine Struktur, damit der cooperative Start und der normale
-// <<< >>>-Start nachweislich dasselbe uebergeben.
+// Arguments. One struct, so the cooperative launch and the normal <<< >>>
+// launch provably pass the same thing.
 // ---------------------------------------------------------------------------
 struct Bar1Args {
-    const uint4 *in;          // lokal, VRAM
-    uint4       *out;         // lokal, VRAM
-    u64         *rundeDev;    // ein Wort, lokal: die laufende Rundennummer
-    unsigned int *ctlStatus;  // 1 = Zeitlimit gerissen
-    unsigned int *abbruchDev; // nur K_GITTER: gitterweites Abbruchbit
+    const uint4 *in;          // local, VRAM
+    uint4       *out;         // local, VRAM
+    u64         *rundeDev;    // one word, local: the running round number
+    unsigned int *ctlStatus;  // 1 = time limit exceeded
+    unsigned int *abbruchDev; // K_GITTER only: grid-wide abort bit
     int          n4;
     int          R;
     int          rang;
     u64          deckelZyklen;
 
-    // netz: indiziert nach RANGNUMMER, eigener Eintrag bleibt leer.
+    // mesh: indexed by RANK NUMBER, own entry stays empty.
     uint4       *nzSendRS[HTCCL_BAR1_MAX_RANKS];
     uint4       *nzSendAG[HTCCL_BAR1_MAX_RANKS];
     const uint4 *nzRecvRS[HTCCL_BAR1_MAX_RANKS];
@@ -285,7 +290,7 @@ struct Bar1Args {
     u64         *nzFlagAn [2][HTCCL_BAR1_MAX_RANKS];
     const u64   *nzFlagVon[2][HTCCL_BAR1_MAX_RANKS];
 
-    // ring: indiziert nach SCHRITT, 0 .. 2*(R-1)-1.
+    // ring: indexed by STEP, 0 .. 2*(R-1)-1.
     uint4       *rgSend   [HTCCL_BAR1_MAX_STEPS];
     const uint4 *rgRecv   [HTCCL_BAR1_MAX_STEPS];
     u64         *rgFlagAn [HTCCL_BAR1_MAX_STEPS];
@@ -293,7 +298,7 @@ struct Bar1Args {
 };
 
 // ---------------------------------------------------------------------------
-// Barriere -- der einzige Unterschied zwischen den Kernvarianten.
+// Barrier -- the only difference between the kernel variants.
 // ---------------------------------------------------------------------------
 template<int GRID>
 __device__ __forceinline__ void barriere(void)
@@ -303,10 +308,10 @@ __device__ __forceinline__ void barriere(void)
 }
 
 // ---------------------------------------------------------------------------
-// Phasen. Alle Kernel benutzen dieselben.
+// Phases. All kernels use the same ones.
 // ---------------------------------------------------------------------------
 
-// Eigenen Beitrag per DMA in den Empfangsschlitz der Zielkarte.
+// Write own contribution via DMA into the target card's receive slot.
 __device__ __forceinline__ void sendePhase(const uint4 *__restrict__ in,
                                            uint4 *peerRecv,
                                            int n4, int tid, int nth)
@@ -314,9 +319,9 @@ __device__ __forceinline__ void sendePhase(const uint4 *__restrict__ in,
     for (int j = tid; j < n4; j += nth) schreibeV4(peerRecv + j, in[j]);
 }
 
-// Ein Stueck an ALLE Peers, in EINER Schleife -- damit das Ergebnis nur
-// einmal aus dem lokalen VRAM gelesen wird (verteilePhase der Sonde,
-// verallgemeinert von zwei Zielen auf R-1).
+// One piece to ALL peers, in ONE loop -- so the result is read from local
+// VRAM only once (the probe's distribute phase, generalized from two
+// targets to R-1).
 __device__ __forceinline__ void verteilePhase(const uint4 *__restrict__ erg,
                                               uint4 *const *ziel,
                                               int R, int rang,
@@ -331,8 +336,8 @@ __device__ __forceinline__ void verteilePhase(const uint4 *__restrict__ erg,
     }
 }
 
-// Lokal ueber den eigenen Beitrag und ALLE R-1 empfangenen reduzieren.
-// (reduziere3Phase der Sonde, verallgemeinert.)
+// Reduce locally over the own contribution and ALL R-1 received ones.
+// (the probe's reduce3 phase, generalized.)
 template<typename T>
 __device__ __forceinline__ void reduziereNPhase(const uint4 *__restrict__ in,
                                                 uint4 *out,
@@ -350,14 +355,14 @@ __device__ __forceinline__ void reduziereNPhase(const uint4 *__restrict__ in,
     }
 }
 
-// Empfangenes uebernehmen (uebernehmePhase der Sonde, ohne die Pruefung).
+// Adopt what was received (the probe's adopt phase, without the check).
 __device__ __forceinline__ void uebernehmePhase(uint4 *out, const uint4 *recv,
                                                 int n4, int tid, int nth)
 {
     for (int j = tid; j < n4; j += nth) out[j] = leseV4(recv + j);
 }
 
-// Ring-Reduce-Scatter, Empfangsschritt: eigener Beitrag plus Teilsumme.
+// Ring reduce-scatter, receive step: own contribution plus partial sum.
 template<typename T>
 __device__ __forceinline__ void ringAddiere(const uint4 *__restrict__ in,
                                             uint4 *out, const uint4 *recv,
@@ -367,32 +372,32 @@ __device__ __forceinline__ void ringAddiere(const uint4 *__restrict__ in,
 }
 
 // ---------------------------------------------------------------------------
-// Rundennummer.
+// Round number.
 //
-// Gelesen von JEDEM Thread am Kernelanfang (uniformer Wert, ein L2-Treffer),
-// fortgeschrieben vom global ersten Thread am Kernelende -- auch auf dem
-// Abbruchpfad. Wuerde bei Abbruch nicht fortgeschrieben, liefen die Raenge
-// dauerhaft auseinander: der eine zaehlte den Aufruf, der andere nicht, und
-// jede folgende Flagge stuende an der falschen Stelle.
+// Read by EVERY thread at kernel start (a uniform value, one L2 hit),
+// advanced by the globally first thread at kernel end -- including on the
+// abort path. If it weren't advanced on abort, the ranks would drift apart
+// permanently: one would count the call, the other wouldn't, and every
+// subsequent flag would land at the wrong slot.
 // ---------------------------------------------------------------------------
-// Templatisiert, weil der a2a-Kernel eine eigene Argumentstruktur hat und
-// die Rundenfortschreibung in JEDEM Kernel dieselbe sein muss -- eine zweite
-// Fassung waere genau die Stelle, an der die Raenge auseinanderlaufen.
+// Templated because the a2a kernel has its own argument struct and the
+// round advance must be identical in EVERY kernel -- a second version would
+// be exactly the place where the ranks drift apart.
 template<typename ARGS>
-__device__ __forceinline__ void rundeSchreiben(const ARGS &A, u64 runde)
+__device__ __forceinline__ void rundeSchreiben(const ARGS &A, u64 round)
 {
-    *(volatile u64 *)A.rundeDev = runde;
+    *(volatile u64 *)A.rundeDev = round;
     __threadfence_system();
 }
 
 // ---------------------------------------------------------------------------
-// TOPOLOGIE 'netz' -- Reduce-Scatter + Allgather ueber ALLE Paare, zwei
-// Sperren. Aufbau unveraendert aus ar3_netz_kernel; die festen Raenge a und b
-// sind durch Schleifen ueber alle Peers ersetzt.
+// TOPOLOGY 'mesh' -- reduce-scatter + allgather over ALL pairs, two
+// barriers. Structure unchanged from ar3_netz_kernel; the fixed ranks a and
+// b are replaced by loops over all peers.
 //
-// GETRENNTE SCHLITZE FUER RS UND AG: zwischen "ich lese meine RS-Schlitze"
-// und "der andere schreibt seinen AG-Chunk" steht keine Ordnung. Mit einem
-// gemeinsamen Schlitzsatz braeuchte es eine dritte Sperre.
+// SEPARATE SLOTS FOR RS AND AG: there is no ordering between "I read my RS
+// slots" and "the other side writes its AG chunk". With a shared slot set
+// this would need a third barrier.
 // ---------------------------------------------------------------------------
 template<typename T, int LA, int FLUSS, int GRID>
 __global__ void bar1_netz_kernel(Bar1Args A)
@@ -405,7 +410,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
                         : (int)blockDim.x;
     const bool erster = (tid == 0);
     const int  n4 = A.n4, R = A.R, r = A.rang;
-    const u64  runde = *(const volatile u64 *)A.rundeDev + 1ull;
+    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
 
     __shared__ int abbruchS;
     if (GRID == K_1BLK) {
@@ -417,29 +422,30 @@ __global__ void bar1_netz_kernel(Bar1Args A)
     }
 
     // -----------------------------------------------------------------------
-    // Die Zeigertabellen zuerst in den gemeinsamen Speicher.
+    // The pointer tables go into shared memory first.
     //
-    // `A` liegt im Parameterraum, und der kennt keine dynamische
-    // Indizierung. Ein einziges `A.nzSendRS[z]` mit laufendem z zwingt nvcc
-    // deshalb, den GANZEN Parameterblock je Thread in den local memory zu
-    // kopieren -- gemessen an genau diesem Kernel: STACK 64 Byte, waehrend
-    // `bar1_ring_kernel` (feste Indizes) 0 hat. Bei 256 Threads sind das
-    // 16 KiB Umlagerung je Block, bevor ein einziges Nutzbyte fliesst.
+    // `A` lives in parameter space, which doesn't support dynamic indexing.
+    // A single `A.nzSendRS[z]` with a running z therefore forces nvcc to
+    // copy the WHOLE parameter block into local memory per thread --
+    // measured on exactly this kernel: STACK 64 bytes, versus 0 for
+    // `bar1_ring_kernel` (fixed indices). At 256 threads that's 16 KiB of
+    // shuffling per block before a single payload byte moves.
     //
-    // Dieselbe Loesung wie im a2a- und im gepipelineten Kern: ein Thread je
-    // Block schreibt die Tabellen einmal in __shared__, danach indiziert
-    // jeder dynamisch dort. Je Block, nicht je Gitter -- `__syncthreads()`
-    // genuegt und gilt in BEIDEN Kernvarianten; `barriere<GRID>()` waere
-    // hier die falsche Sperre, weil gemeinsamer Speicher blocklokal ist.
+    // Same fix as in the a2a kernel and the pipelined kernel: one thread per
+    // block writes the tables into __shared__ once, after which everyone
+    // indexes dynamically from there. Per block, not per grid --
+    // `__syncthreads()` suffices and holds in BOTH kernel variants;
+    // `barriere<GRID>()` would be the wrong barrier here, because shared
+    // memory is block-local.
     //
-    // Die Flaggenzeiger stehen mit hier, obwohl nur `erster` sie anfasst:
-    // fuer die Frage, ob der Parameterblock in den local memory muss,
-    // zaehlt, DASS irgendwo dynamisch indiziert wird, nicht von wie vielen
-    // Threads.
+    // The flag pointers are included here even though only `erster` touches
+    // them: what determines whether the parameter block must go to local
+    // memory is THAT something is indexed dynamically anywhere, not by how
+    // many threads.
     //
-    // Eintraege mit z == r sind host-seitig 0 und werden nie
-    // dereferenziert; sie werden trotzdem mitkopiert, damit der Index in
-    // allen Tabellen die Rangnummer bleibt.
+    // Entries with z == r are 0 host-side and are never dereferenced; they
+    // are still copied along so that the index stays the rank number in
+    // every table.
     __shared__ uint4       *sSendRS[HTCCL_BAR1_MAX_RANKS];
     __shared__ uint4       *sSendAG[HTCCL_BAR1_MAX_RANKS];
     __shared__ const uint4 *sRecvRS[HTCCL_BAR1_MAX_RANKS];
@@ -463,7 +469,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
     int offR, lenR;
     chunkGrenzen(n4, r, R, &offR, &lenR);
 
-    // --- 1. Reduce-Scatter: Chunk z an Rang z ------------------------------
+    // --- 1. Reduce-scatter: chunk z to rank z ------------------------------
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
         int off, len;
@@ -481,7 +487,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
                 chunkGrenzen(n4, z, R, &off, &len);
                 leseFluss(sSendRS[z], len);
             }
-            schreibeU64(sFlagAn[0][z], runde);
+            schreibeU64(sFlagAn[0][z], round);
         }
         __threadfence_system();
 
@@ -491,7 +497,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             bool alle = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(sFlagVon[0][s]) != runde) { alle = false; break; }
+                if (flaggeLesen<LA>(sFlagVon[0][s]) != round) { alle = false; break; }
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
@@ -509,28 +515,28 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         if (abbruch) {
             if (erster) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, runde);
+                rundeSchreiben(A, round);
             }
             return;
         }
     }
     __threadfence_system();
 
-    // --- 2. eigenen Chunk reduzieren --------------------------------------
+    // --- 2. reduce own chunk ------------------------------------------------
     {
-        // Der Empfangsschlitz traegt NUR den eigenen Chunk, beginnt also bei 0
-        // -- der Chunkversatz offR gilt fuer den LOKALEN Puffer, nicht fuer
-        // den Schlitz.
+        // The receive slot carries ONLY the own chunk, so it starts at 0 --
+        // the chunk offset offR applies to the LOCAL buffer, not to the
+        // slot.
         //
-        // `sRecvRS` statt einer lokalen Kopie: die Kopie war ein Feld je
-        // THREAD im local memory, und sie war zugleich der Grund, warum der
-        // ganze Parameterblock dorthin musste.
+        // `sRecvRS` instead of a local copy: the copy was a per-THREAD array
+        // in local memory, and it was also the reason the whole parameter
+        // block had to go there.
         reduziereNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
                            tid, nth);
     }
     barriere<GRID>();
 
-    // --- 3. Allgather: der fertige eigene Chunk an alle anderen ------------
+    // --- 3. Allgather: the finished own chunk to everyone else --------------
     verteilePhase(A.out + offR, sSendAG, R, r, lenR, tid, nth);
     __threadfence_system();
     barriere<GRID>();
@@ -539,7 +545,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
             if (FLUSS) leseFluss(sSendAG[z], lenR);
-            schreibeU64(sFlagAn[1][z], runde);
+            schreibeU64(sFlagAn[1][z], round);
         }
         __threadfence_system();
 
@@ -549,7 +555,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             bool alle = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(sFlagVon[1][s]) != runde) { alle = false; break; }
+                if (flaggeLesen<LA>(sFlagVon[1][s]) != round) { alle = false; break; }
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
@@ -567,7 +573,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         if (abbruch) {
             if (erster) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, runde);
+                rundeSchreiben(A, round);
             }
             return;
         }
@@ -581,13 +587,13 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         uebernehmePhase(A.out + off, sRecvAG[s], len, tid, nth);
     }
     barriere<GRID>();
-    if (erster) rundeSchreiben(A, runde);
+    if (erster) rundeSchreiben(A, round);
 }
 
 // ---------------------------------------------------------------------------
-// TOPOLOGIE 'ring' -- Ring-Reduce-Scatter + Ring-Allgather, 2*(R-1) Sperren.
-// Gesendet wird IMMER an (r+1)%R, empfangen IMMER von (r-1+R)%R.
-// Unveraendert aus ar3_ring_kernel, nur RANGE_N -> A.R und ohne Pruefung.
+// TOPOLOGY 'ring' -- ring reduce-scatter + ring allgather, 2*(R-1) barriers.
+// Always sends to (r+1)%R, always receives from (r-1+R)%R.
+// Unchanged from ar3_ring_kernel, only RANGE_N -> A.R and without the check.
 // ---------------------------------------------------------------------------
 template<typename T, int LA, int FLUSS, int GRID>
 __global__ void bar1_ring_kernel(Bar1Args A)
@@ -600,7 +606,7 @@ __global__ void bar1_ring_kernel(Bar1Args A)
                         : (int)blockDim.x;
     const bool erster = (tid == 0);
     const int  n4 = A.n4, R = A.R, r = A.rang;
-    const u64  runde = *(const volatile u64 *)A.rundeDev + 1ull;
+    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
 
     __shared__ int abbruchS;
     if (GRID == K_1BLK) {
@@ -611,30 +617,30 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         __threadfence();
     }
 
-    // ------------------------- Reduce-Scatter ------------------------------
+    // ------------------------- Reduce-scatter -------------------------------
     for (int s = 0; s < R - 1; ++s) {
-        const int cs = (r - s + 2 * R) % R;         // gesendeter Chunk
-        const int cr = (r - s - 1 + 2 * R) % R;     // empfangener Chunk
+        const int cs = (r - s + 2 * R) % R;         // chunk sent
+        const int cr = (r - s - 1 + 2 * R) % R;     // chunk received
         int offS, lenS, offE, lenE;
         chunkGrenzen(n4, cs, R, &offS, &lenS);
         chunkGrenzen(n4, cr, R, &offE, &lenE);
 
-        // Schritt 0 sendet den eigenen Beitrag, jeder weitere die im vorigen
-        // Schritt gebildete Teilsumme.
-        const uint4 *quelle = (s == 0) ? (A.in + offS)
+        // Step 0 sends the own contribution, every further step the partial
+        // sum formed in the previous step.
+        const uint4 *source = (s == 0) ? (A.in + offS)
                                        : (const uint4 *)(A.out + offS);
-        sendePhase(quelle, A.rgSend[s], lenS, tid, nth);
+        sendePhase(source, A.rgSend[s], lenS, tid, nth);
         __threadfence_system();
         barriere<GRID>();
 
         if (erster) {
             if (FLUSS) leseFluss(A.rgSend[s], lenS);
-            schreibeU64(A.rgFlagAn[s], runde);
+            schreibeU64(A.rgFlagAn[s], round);
             __threadfence_system();
 
             bool ab = false;
             long long t0 = clock64();
-            while (flaggeLesen<LA>(A.rgFlagVon[s]) != runde) {
+            while (flaggeLesen<LA>(A.rgFlagVon[s]) != round) {
                 if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
             }
             if (ab) {
@@ -648,7 +654,7 @@ __global__ void bar1_ring_kernel(Bar1Args A)
                                     ? abbruchS
                                     : (int)*(volatile unsigned int *)A.abbruchDev;
             if (abbruch) {
-                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, runde); }
+                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, round); }
                 return;
             }
         }
@@ -658,11 +664,11 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         barriere<GRID>();
     }
 
-    // --------------------------- Allgather ---------------------------------
+    // --------------------------- Allgather -----------------------------------
     for (int s = 0; s < R - 1; ++s) {
-        const int sl = (R - 1) + s;                 // Schlitz + Flaggenzeile
-        const int cs = (r + 1 - s + 2 * R) % R;     // gesendeter Chunk
-        const int cr = (r - s + 2 * R) % R;         // uebernommener Chunk
+        const int sl = (R - 1) + s;                 // slot + flag line
+        const int cs = (r + 1 - s + 2 * R) % R;     // chunk sent
+        const int cr = (r - s + 2 * R) % R;         // chunk adopted
         int offS, lenS, offE, lenE;
         chunkGrenzen(n4, cs, R, &offS, &lenS);
         chunkGrenzen(n4, cr, R, &offE, &lenE);
@@ -673,12 +679,12 @@ __global__ void bar1_ring_kernel(Bar1Args A)
 
         if (erster) {
             if (FLUSS) leseFluss(A.rgSend[sl], lenS);
-            schreibeU64(A.rgFlagAn[sl], runde);
+            schreibeU64(A.rgFlagAn[sl], round);
             __threadfence_system();
 
             bool ab = false;
             long long t0 = clock64();
-            while (flaggeLesen<LA>(A.rgFlagVon[sl]) != runde) {
+            while (flaggeLesen<LA>(A.rgFlagVon[sl]) != round) {
                 if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
             }
             if (ab) {
@@ -692,7 +698,7 @@ __global__ void bar1_ring_kernel(Bar1Args A)
                                     ? abbruchS
                                     : (int)*(volatile unsigned int *)A.abbruchDev;
             if (abbruch) {
-                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, runde); }
+                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, round); }
                 return;
             }
         }
@@ -702,62 +708,60 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         barriere<GRID>();
     }
 
-    if (erster) rundeSchreiben(A, runde);
+    if (erster) rundeSchreiben(A, round);
 }
 
 // ---------------------------------------------------------------------------
-// TOPOLOGIE 'a2a' -- all_to_all_single. EIN Schritt, EINE Sperre.
+// TOPOLOGY 'a2a' -- all_to_all_single. ONE step, ONE barrier.
 //
-// Rang r schreibt seinen Block fuer Rang z direkt in dessen Empfangsschlitz,
-// alle Ziele im SELBEN flachen Indexraum (verschiedene Warps schreiben also
-// gleichzeitig an verschiedene Karten), dann eine Sperre, dann liest jeder
-// seine R-1 Schlitze in den Ausgabepuffer. Es gibt keine Reduktion, also auch
-// keinen Datentyp: der Kernel bewegt Bytes. fp8, bf16, int32 -- derselbe Pfad.
+// Rank r writes its block for rank z directly into that rank's receive
+// slot, all targets in the SAME flat index space (so different warps write
+// to different cards at the same time), then a barrier, then everyone reads
+// its R-1 slots into the output buffer. There is no reduction and hence no
+// data type: the kernel moves bytes. fp8, bf16, int32 -- the same path.
 //
-// WARUM DOPPELPUFFER STATT ZWEITER SPERRE
-// ---------------------------------------
-// Mit nur (R-1) Schlitzen duerfte der Sender die naechste Runde nicht
-// beginnen, bevor der Empfaenger die vorige gelesen hat -- die Flagge sagt
-// aber nur "geschrieben", nicht "gelesen". Statt einer zweiten Sperre (die
-// bei MoE-Groessen die Haelfte der Latenz waere) liegen 2(R-1) Schlitze da
-// und die Runde waehlt die Haelfte: par = runde & 1.
+// WHY A DOUBLE BUFFER INSTEAD OF A SECOND BARRIER
+// ------------------------------------------------
+// With only (R-1) slots, the sender would not be allowed to start the next
+// round before the receiver had read the previous one -- but the flag only
+// says "written", not "read". Instead of a second barrier (which at MoE
+// sizes would be half the latency), there are 2(R-1) slots and the round
+// picks the half: par = round & 1.
 //
-// Der Beweis, dass zwei Haelften reichen: A schreibt in Runde N in die
-// Haelfte N%2. Zuletzt benutzt wurde sie in Runde N-2. A's Kernel der Runde N
-// startet erst, wenn A's Kernel der Runde N-1 fertig ist (ein Strom, in
-// Reihenfolge). Der wurde erst fertig, nachdem A die Flagge von B fuer Runde
-// N-1 gesehen hat. Die setzt B INNERHALB seines Kernels der Runde N-1, der
-// wiederum erst startet, wenn B's Kernel der Runde N-2 fertig ist -- also
-// nachdem B die Haelfte (N-2)%2 = N%2 ausgelesen hat. Damit ist der Schlitz
-// frei, bevor A ihn wieder anfasst.
+// The proof that two halves suffice: A writes into half N%2 in round N. It
+// was last used in round N-2. A's kernel for round N only starts once A's
+// kernel for round N-1 is finished (one stream, in order). That one only
+// finished after A had seen B's flag for round N-1. B sets that flag
+// INSIDE its kernel for round N-1, which in turn only starts once B's
+// kernel for round N-2 is finished -- i.e. after B has read out half
+// (N-2)%2 = N%2. So the slot is free before A touches it again.
 //
-// Die Rundennummer liegt im Geraetespeicher (wie bei netz/ring), also
-// entscheidet der KERNEL ueber die Haelfte, nicht der Host -- sonst muesste
-// der Host die Runde kennen und dafuer synchronisieren.
+// The round number lives in device memory (as with mesh/ring), so the
+// KERNEL decides the half, not the host -- otherwise the host would have to
+// know the round and synchronize for it.
 //
-// Sender und Empfaenger muessen dieselbe Haelfte waehlen, also dieselbe
-// Runde zaehlen. Das ist keine zusaetzliche Annahme: die Flagge TRAEGT die
-// Rundennummer, und gewartet wird auf Gleichheit. Zaehlen zwei Raenge
-// verschieden, kommt die Flagge nie an und der Deckel schlaegt zu -- eine
-// falsche Haelfte kann es ohne eine falsche Flagge nicht geben. Der Fehler
-// ist damit ein gemeldeter Abbruch (ctlStatus = 1) und keine stille
-// Verfaelschung.
+// Sender and receiver must pick the same half, i.e. count the same round.
+// That is not an extra assumption: the flag CARRIES the round number, and
+// the wait is for equality. If two ranks count differently, the flag never
+// arrives and the timeout cap fires -- a wrong half cannot occur without a
+// wrong flag. The failure is therefore a reported abort (ctlStatus = 1),
+// never silent corruption.
 //
-// AUSRICHTUNG
-// -----------
-// Die Zugriffsbreite ist 128 Bit. Ueber PCIe wird deshalb IMMER in
-// 16-Byte-Paketen geschrieben, auch am Blockende: das letzte, unvollstaendige
-// Paket wird aus den vorhandenen Bytes in einem Register zusammengesetzt und
-// als ein Paket abgesetzt. Damit gibt es weder Teilbreitenschreibvorgaenge in
-// eine Write-Combining-Apertur noch einen Lesezugriff hinter das Ende des
-// Eingabetensors. Der Schlitz beginnt auf einer Seitengrenze und ist ein
-// Vielfaches von 16, das aufgerundete Paket trifft also nie den Nachbarn.
+// ALIGNMENT
+// ---------
+// The access width is 128 bits. Over PCIe, writes are therefore ALWAYS done
+// in 16-byte packets, even at the end of a block: the last, incomplete
+// packet is assembled from the available bytes in a register and issued as
+// one packet. That means there are neither partial-width writes into a
+// write-combining aperture, nor a read past the end of the input tensor.
+// The slot begins on a page boundary and is a multiple of 16, so the
+// rounded-up packet never hits the neighbor.
 //
-// VEK=1 heisst: alle Blockversaetze UND beide Puffergrundadressen sind
-// 16-Byte-ausgerichtet, der Massenteil laeuft also mit 128-Bit-Zugriffen.
-// VEK=0 ist der Restpfad (Zeilenbreite kein Vielfaches von 16): dann wird
-// jedes Paket byteweise zusammengesetzt. Korrekt, langsam, und ehrlich
-// benannt -- gemessen ist er nicht.
+// VEK=1 means: all block offsets AND both buffer base addresses are
+// 16-byte-aligned, so the bulk of the traffic runs with 128-bit accesses.
+// VEK=0 is the remainder path (row width not a multiple of 16): then every
+// packet is assembled byte by byte. Correct, slow, and honestly named --
+// it has not been measured.
 // ---------------------------------------------------------------------------
 struct A2aArgs {
     const unsigned char *in;
@@ -768,19 +772,19 @@ struct A2aArgs {
     int           R;
     int           rang;
     u64           deckelZyklen;
-    long long     schlitz;                 // Schlitzgroesse in Byte
-    long long     sendOff[HTCCL_BAR1_MAX_RANKS];   // Versatz in `in`
+    long long     slot;                 // slot size in bytes
+    long long     sendOff[HTCCL_BAR1_MAX_RANKS];   // offset in `in`
     long long     sendLen[HTCCL_BAR1_MAX_RANKS];
-    long long     recvOff[HTCCL_BAR1_MAX_RANKS];   // Versatz in `out`
+    long long     recvOff[HTCCL_BAR1_MAX_RANKS];   // offset in `out`
     long long     recvLen[HTCCL_BAR1_MAX_RANKS];
-    unsigned char *zielBasis[HTCCL_BAR1_MAX_RANKS];  // a2a-Bereich des Peers
-    const unsigned char *eigenBasis;                 // eigener a2a-Bereich
+    unsigned char *zielBasis[HTCCL_BAR1_MAX_RANKS];  // peer's a2a region
+    const unsigned char *eigenBasis;                 // own a2a region
     u64          *flagAn [HTCCL_BAR1_MAX_RANKS];
     const u64    *flagVon[HTCCL_BAR1_MAX_RANKS];
 };
 
-// Ein 16-Byte-Paket aus hoechstens 16 Bytes zusammensetzen. Der Rest bleibt
-// 0; er landet im Schlitzueberhang und wird vom Empfaenger nie gelesen.
+// Assemble a 16-byte packet from at most 16 bytes. The remainder stays 0;
+// it lands in the slot's overhang and is never read by the receiver.
 __device__ __forceinline__ uint4 packeBytes(const unsigned char *q, int n)
 {
     uint4 v = make_uint4(0u, 0u, 0u, 0u);
@@ -790,22 +794,22 @@ __device__ __forceinline__ uint4 packeBytes(const unsigned char *q, int n)
     return v;
 }
 
-// Wohin ich (Rang r) fuer Rang z schreibe: meine Position in dessen
-// aufsteigender Peer-Liste, in der Haelfte `par`. Dieselbe Positionsformel
-// wie bei netz -- NICHT (r < z).
+// Where I (rank r) write for rank z: my position in that rank's ascending
+// peer list, within half `par`. The same position formula as in mesh --
+// NOT (r < z).
 __device__ __forceinline__ unsigned char *a2aZiel(const A2aArgs &A, int z, int par)
 {
     const int p = A.rang - (A.rang > z ? 1 : 0);
-    return A.zielBasis[z] + (long long)(par * (A.R - 1) + p) * A.schlitz;
+    return A.zielBasis[z] + (long long)(par * (A.R - 1) + p) * A.slot;
 }
 
-// Woher der Block von Rang s bei mir liegt: dessen Position in MEINER
-// aufsteigender Peer-Liste.
+// Where rank s's block for me sits: its position in MY ascending peer
+// list.
 __device__ __forceinline__ const unsigned char *a2aQuelle(const A2aArgs &A,
                                                           int s, int par)
 {
     const int p = s - (s > A.rang ? 1 : 0);
-    return A.eigenBasis + (long long)(par * (A.R - 1) + p) * A.schlitz;
+    return A.eigenBasis + (long long)(par * (A.R - 1) + p) * A.slot;
 }
 
 template<int VEK, int LA, int GRID>
@@ -819,8 +823,8 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
                               : (long long)blockDim.x;
     const bool erster = (tid == 0);
     const int  R = A.R, r = A.rang;
-    const u64  runde = *(const volatile u64 *)A.rundeDev + 1ull;
-    const int  par = (int)(runde & 1ull);
+    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
+    const int  par = (int)(round & 1ull);
 
     __shared__ int abbruchS;
     if (GRID == K_1BLK) {
@@ -831,13 +835,12 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         __threadfence();
     }
 
-    // Alles, was die inneren Schleifen mit LAUFENDEM Index brauchen, liegt im
-    // gemeinsamen Speicher. Ein dynamisch indiziertes Feld in der
-    // Argumentstruktur zwingt nvcc, den ganzen Parameterblock je Thread in
-    // den local memory zu kopieren -- bei 256 Threads und einer halben
-    // Kilobyte grossen Struktur ist das mehr Verkehr als die Nutzlast. Die
-    // Schlitzadressen werden gleich mit ausgerechnet: sie haengen nur von
-    // (z, par) ab, nicht vom Paket.
+    // Everything the inner loops need with a RUNNING index goes into shared
+    // memory. A dynamically indexed field in the argument struct forces
+    // nvcc to copy the whole parameter block into local memory per thread --
+    // at 256 threads and a half-kilobyte-sized struct that's more traffic
+    // than the payload itself. The slot addresses are computed right away:
+    // they only depend on (z, par), not on the packet.
     __shared__ long long sPre[HTCCL_BAR1_MAX_RANKS + 1];
     __shared__ long long ePre[HTCCL_BAR1_MAX_RANKS + 1];
     __shared__ long long sLenS[HTCCL_BAR1_MAX_RANKS];
@@ -861,12 +864,12 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
     }
     __syncthreads();
 
-    // --- 1. Sendephase: alle Ziele im selben flachen Indexraum -------------
+    // --- 1. Send phase: all targets in the same flat index space -----------
     {
         const long long ges = sPre[R];
         for (long long j = tid; j < ges; j += nth) {
             int z = 0;
-            while (sPre[z + 1] <= j) ++z;          // R <= 8, also ein kurzer Scan
+            while (sPre[z + 1] <= j) ++z;          // R <= 8, so a short scan
             const long long b = (j - sPre[z]) * 16LL;
             const int rest = (int)((sLenS[z] - b) < 16LL
                                        ? (sLenS[z] - b) : 16LL);
@@ -878,7 +881,7 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         }
     }
 
-    // --- 1b. der eigene Block: rein lokal, ohne Umweg ueber die Apertur ----
+    // --- 1b. own block: purely local, no detour through the aperture -------
     {
         const long long n = sLenS[r];
         const unsigned char *q = sQuelle[r];
@@ -896,11 +899,11 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
     __threadfence_system();
     barriere<GRID>();
 
-    // --- 2. Die eine Sperre ------------------------------------------------
+    // --- 2. The one barrier --------------------------------------------------
     if (erster) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            schreibeU64(A.flagAn[z], runde);
+            schreibeU64(A.flagAn[z], round);
         }
         __threadfence_system();
 
@@ -910,7 +913,7 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
             bool alle = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(A.flagVon[s]) != runde) { alle = false; break; }
+                if (flaggeLesen<LA>(A.flagVon[s]) != round) { alle = false; break; }
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
@@ -928,14 +931,14 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         if (abbruch) {
             if (erster) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, runde);
+                rundeSchreiben(A, round);
             }
             return;
         }
     }
     __threadfence_system();
 
-    // --- 3. Empfangsphase: eigene Schlitze in den Ausgabepuffer ------------
+    // --- 3. Receive phase: own slots into the output buffer -----------------
     {
         const long long ges = ePre[R];
         for (long long j = tid; j < ges; j += nth) {
@@ -954,18 +957,18 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         }
     }
     barriere<GRID>();
-    if (erster) rundeSchreiben(A, runde);
+    if (erster) rundeSchreiben(A, round);
 }
 
 // ===========================================================================
-// Hostseite
+// Host side
 // ===========================================================================
 
-// Gittergroesse der Variante 'gitter'. Zwei Deckel, beide notwendig
-// (unveraendert aus der Sonde):
-//   1. Nie mehr Bloecke, als GLEICHZEITIG resident sein koennen -- sonst
-//      wartet grid.sync() auf einen Block, der gar nicht laeuft.
-//   2. Mehr Bloecke als Arbeit ist sinnlos: ceil(n4/threads).
+// Grid size for the 'grid' variant. Two caps, both necessary (unchanged
+// from the probe):
+//   1. Never more blocks than can be resident SIMULTANEOUSLY -- otherwise
+//      grid.sync() waits on a block that isn't even running.
+//   2. More blocks than there is work is pointless: ceil(n4/threads).
 static int gitterGroesse(const void *fn, int threads, int n4)
 {
     int proSM = 0;
@@ -986,9 +989,8 @@ static int gitterGroesse(const void *fn, int threads, int n4)
     return g;
 }
 
-// Startet den gewaehlten Kernel. Die Ladeform der Flagge, der Lesefluss und
-// die Barrierenart sind Template-Argumente -- in den Warteschleifen bleibt
-// kein Zweig uebrig.
+// Launches the chosen kernel. Flag load mode, read flush, and barrier kind
+// are template arguments -- no branch is left over in the wait loops.
 template<typename T>
 static void starte(int algo, int kern, int la, int fluss, Bar1Args &A,
                    int threads, cudaStream_t strom)
@@ -1009,7 +1011,7 @@ static void starte(int algo, int kern, int la, int fluss, Bar1Args &A,
         }                                                                      \
         KERNFN<T, LA, FL, K_1BLK><<<1, threads, 0, strom>>>(A);                \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
-                    "htccl-bar1: Kernelstart fehlgeschlagen");                 \
+                    "htccl-bar1: kernel launch failed");                       \
         return;                                                                \
     } while (0)
 
@@ -1033,10 +1035,10 @@ static void starte(int algo, int kern, int la, int fluss, Bar1Args &A,
 // ---------------------------------------------------------------------------
 // bar1_all_reduce
 //
-// `peer_nutz` / `peer_flag` tragen je Rang den GERAETEZEIGER DIESER Karte auf
-// die BAR1-Region des Ziels; der eigene Eintrag ist der lokale Zeiger auf die
-// eigene Region. Die Schlitzversaetze werden hier gerechnet, nicht in Python:
-// derselbe Code, der sie in die Kernelargumente schreibt, prueft sie auch.
+// `peer_nutz` / `peer_flag` carry, per rank, THIS card's device pointer into
+// the target's BAR1 region; the own entry is the local pointer to the own
+// region. The slot offsets are computed here, not in Python: the same code
+// that writes them into the kernel arguments also checks them.
 // ---------------------------------------------------------------------------
 void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world, int64_t algo,
@@ -1050,33 +1052,33 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= HTCCL_BAR1_MAX_RANKS,
-                "htccl-bar1: world ", R, " ausserhalb 2..", HTCCL_BAR1_MAX_RANKS);
-    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1: rank ausserhalb");
-    TORCH_CHECK(algo == 0 || algo == 1, "htccl-bar1: algo 0=netz 1=ring");
+                "htccl-bar1: world ", R, " outside 2..", HTCCL_BAR1_MAX_RANKS);
+    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1: rank out of range");
+    TORCH_CHECK(algo == 0 || algo == 1, "htccl-bar1: algo 0=mesh 1=ring");
     TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
-                "htccl-bar1: nur zusammenhaengende Tensoren");
+                "htccl-bar1: only contiguous tensors");
     TORCH_CHECK(inp.numel() == out.numel() && inp.scalar_type() == out.scalar_type(),
-                "htccl-bar1: in und out passen nicht zusammen");
+                "htccl-bar1: in and out do not match");
     TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
-                "htccl-bar1: in und out duerfen nicht dasselbe sein -- der Ring "
-                "liest 'in' noch, waehrend er 'out' fortschreibt");
+                "htccl-bar1: in and out must not be the same -- the ring "
+                "still reads 'in' while it writes 'out'");
     TORCH_CHECK((int64_t)peer_nutz.size() == world &&
                 (int64_t)peer_flag.size() == world,
-                "htccl-bar1: Peer-Tabelle hat die falsche Laenge");
+                "htccl-bar1: peer table has the wrong length");
 
     const size_t nbytes = (size_t)inp.numel() * (size_t)inp.element_size();
     TORCH_CHECK(nbytes % 16 == 0,
-                "htccl-bar1: Nutzlast ", nbytes, " ist kein Vielfaches von 16 "
-                "Byte -- die Zugriffsbreite ist 128 Bit");
+                "htccl-bar1: payload ", nbytes, " is not a multiple of 16 "
+                "bytes -- the access width is 128 bits");
     TORCH_CHECK(((uintptr_t)inp.data_ptr() % 16) == 0 &&
                 ((uintptr_t)out.data_ptr() % 16) == 0,
-                "htccl-bar1: Puffer nicht auf 16 Byte ausgerichtet");
+                "htccl-bar1: buffer not aligned to 16 bytes");
     const int n4 = (int)(nbytes / 16);
-    TORCH_CHECK(n4 >= R, "htccl-bar1: weniger als ein 128-Bit-Paket je Rang");
+    TORCH_CHECK(n4 >= R, "htccl-bar1: fewer than one 128-bit packet per rank");
 
-    // Nahtstellenpruefung: der GROESSTE Chunk muss in einen Schlitz passen.
-    // Absichtlich hier und nicht nur in Python -- gerechnet wird mit
-    // chunkGrenzen selbst, nicht mit einer zweiten Fassung der Formel.
+    // Seam check: the LARGEST chunk must fit in a slot. Deliberately here
+    // and not only in Python -- computed with chunkGrenzen itself, not with
+    // a second version of the formula.
     {
         int maxLen = 0;
         for (int j = 0; j < R; ++j) {
@@ -1085,9 +1087,9 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
             if (len > maxLen) maxLen = len;
         }
         TORCH_CHECK((int64_t)maxLen * 16 <= chunk_max,
-                    "htccl-bar1: groesster Chunk ", (int64_t)maxLen * 16,
-                    " Byte passt nicht in den Schlitz von ", chunk_max,
-                    " Byte. Der Aufrufer haette handles() fragen muessen.");
+                    "htccl-bar1: largest chunk ", (int64_t)maxLen * 16,
+                    " bytes does not fit in the slot of ", chunk_max,
+                    " bytes. The caller should have asked handles().");
     }
 
     Bar1Args A;
@@ -1104,9 +1106,9 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
 
     const int schritte_netz = 2;
     const int schritte_ring = 2 * (R - 1);
-    // FSLOT(topo, schritt, sender) = FBASIS[topo] + (schritt*R + sender)*256,
-    // FBASIS = { 0, 2*R*256 }. Unveraendert aus der Sonde, nur ohne die
-    // beiden dort zusaetzlich vermessenen Topologien.
+    // FSLOT(topo, step, sender) = FBASIS[topo] + (step*R + sender)*256,
+    // FBASIS = { 0, 2*R*256 }. Unchanged from the probe, just without the
+    // two additional topologies it also measured.
     const size_t fbasis_netz = 0;
     const size_t fbasis_ring = (size_t)schritte_netz * (size_t)R * 256u;
 #define FSLOT(BASIS, SCHRITT, SENDER) \
@@ -1115,8 +1117,8 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     if (algo == 0) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            // Meine Position in der aufsteigenden Peer-Liste des Empfaengers z.
-            // NICHT (r < z) -- siehe die Herleitung in der Sonde.
+            // My position in the ascending peer list of receiver z.
+            // NOT (r < z) -- see the derivation in the probe.
             const size_t p = (size_t)(r - (r > z ? 1 : 0));
             char *zb = (char *)(uintptr_t)peer_nutz[z];
             A.nzSendRS[z] = (uint4 *)(zb + off_netz +
@@ -1174,24 +1176,23 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                                   strom);
             break;
         default:
-            TORCH_CHECK(false, "htccl-bar1: Datentyp ", inp.scalar_type(),
-                        " wird nicht unterstuetzt (float32/float16/bfloat16)");
+            TORCH_CHECK(false, "htccl-bar1: data type ", inp.scalar_type(),
+                        " is not supported (float32/float16/bfloat16)");
     }
 }
 
 // ---------------------------------------------------------------------------
 // bar1_all_to_all
 //
-// Kein Datentyp, keine Reduktion, keine Templatisierung ueber Elementtypen:
-// der Kernel bewegt Bytes. Was hereinkommt, sind Byteversaetze und
-// Bytelaengen je Rang -- damit traegt dieselbe Funktion die gleichverteilte
-// und die ungleich geteilte Form (input_split_sizes/output_split_sizes), und
-// fp8 ist einfach ein Byte.
+// No data type, no reduction, no templating over element types: the kernel
+// moves bytes. What comes in are byte offsets and byte lengths per rank --
+// so the same function carries both the evenly-split and the unevenly-split
+// form (input_split_sizes/output_split_sizes), and fp8 is simply a byte.
 //
-// `peer_nutz` ist DIESELBE Peer-Zeiger-Tabelle wie bei bar1_all_reduce; der
-// a2a-Bereich liegt als dritter Abschnitt in derselben Empfangsregion
-// (Versatz `off_a2a`). Es wird hier nichts gemappt -- das ist beim Aufbau
-// passiert und nur dort.
+// `peer_nutz` is the SAME peer pointer table as in bar1_all_reduce; the a2a
+// region sits as a third section in the same receive region (offset
+// `off_a2a`). Nothing is mapped here -- that happened during setup, and
+// only there.
 // ---------------------------------------------------------------------------
 static void starteA2a(int vek, int kern, int la, A2aArgs &A, int threads,
                       long long pakete, cudaStream_t strom)
@@ -1213,7 +1214,7 @@ static void starteA2a(int vek, int kern, int la, A2aArgs &A, int threads,
         }                                                                      \
         bar1_a2a_kernel<VEK, LA, K_1BLK><<<1, threads, 0, strom>>>(A);         \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
-                    "htccl-bar1 a2a: Kernelstart fehlgeschlagen");             \
+                    "htccl-bar1 a2a: kernel launch failed");                   \
         return;                                                                \
     } while (0)
 
@@ -1236,69 +1237,69 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      std::vector<int64_t> peer_nutz,
                      std::vector<int64_t> peer_flag,
                      int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t schlitz, int64_t off_a2a, int64_t fbasis_a2a,
+                     int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
                      int64_t ladeform)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= HTCCL_BAR1_MAX_RANKS,
-                "htccl-bar1 a2a: world ", R, " ausserhalb 2..",
+                "htccl-bar1 a2a: world ", R, " outside 2..",
                 HTCCL_BAR1_MAX_RANKS);
-    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1 a2a: rank ausserhalb");
+    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1 a2a: rank out of range");
     TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
-                "htccl-bar1 a2a: nur zusammenhaengende Tensoren");
+                "htccl-bar1 a2a: only contiguous tensors");
     TORCH_CHECK(inp.scalar_type() == out.scalar_type(),
-                "htccl-bar1 a2a: in und out haben verschiedene Datentypen -- "
-                "all_to_all wandelt nichts um");
+                "htccl-bar1 a2a: in and out have different data types -- "
+                "all_to_all does not convert anything");
     TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
-                "htccl-bar1 a2a: in und out duerfen nicht dasselbe sein");
+                "htccl-bar1 a2a: in and out must not be the same");
     TORCH_CHECK((int64_t)send_off.size() == world &&
                 (int64_t)send_len.size() == world &&
                 (int64_t)recv_off.size() == world &&
                 (int64_t)recv_len.size() == world &&
                 (int64_t)peer_nutz.size() == world &&
                 (int64_t)peer_flag.size() == world,
-                "htccl-bar1 a2a: eine der Tabellen hat die falsche Laenge");
-    TORCH_CHECK(schlitz > 0 && (schlitz % 16) == 0,
-                "htccl-bar1 a2a: Schlitzgroesse ", schlitz,
-                " ist kein positives Vielfaches von 16");
+                "htccl-bar1 a2a: one of the tables has the wrong length");
+    TORCH_CHECK(slot > 0 && (slot % 16) == 0,
+                "htccl-bar1 a2a: slot size ", slot,
+                " is not a positive multiple of 16");
 
     const int64_t in_bytes  = (int64_t)inp.numel()  * (int64_t)inp.element_size();
     const int64_t out_bytes = (int64_t)out.numel() * (int64_t)out.element_size();
 
-    // Die Nahtstellenpruefung. Absichtlich HIER und nicht nur in Python:
-    // die Schlitzgrenze ist die Bedingung, an der die Abbildung wirklich
-    // haengt, und sie wird mit den Zahlen geprueft, mit denen auch gerechnet
-    // wird -- nicht mit einer zweiten Fassung derselben Formel.
+    // The seam check. Deliberately HERE and not only in Python: the slot
+    // boundary is the condition the mapping actually depends on, and it is
+    // checked with the same numbers used for the computation -- not with a
+    // second version of the same formula.
     int64_t max_send = 0;
     for (int z = 0; z < R; ++z) {
         TORCH_CHECK(send_len[z] >= 0 && recv_len[z] >= 0 &&
                     send_off[z] >= 0 && recv_off[z] >= 0,
-                    "htccl-bar1 a2a: negative Teilgroesse bei Rang ", z);
+                    "htccl-bar1 a2a: negative split size at rank ", z);
         TORCH_CHECK(send_off[z] + send_len[z] <= in_bytes,
-                    "htccl-bar1 a2a: Sendeblock ", z, " (", send_off[z], "+",
-                    send_len[z], ") liegt hinter dem Ende des Eingabetensors (",
-                    in_bytes, " Byte)");
+                    "htccl-bar1 a2a: send block ", z, " (", send_off[z], "+",
+                    send_len[z], ") lies past the end of the input tensor (",
+                    in_bytes, " bytes)");
         TORCH_CHECK(recv_off[z] + recv_len[z] <= out_bytes,
-                    "htccl-bar1 a2a: Empfangsblock ", z, " (", recv_off[z], "+",
-                    recv_len[z], ") liegt hinter dem Ende des Ausgabetensors (",
-                    out_bytes, " Byte)");
+                    "htccl-bar1 a2a: receive block ", z, " (", recv_off[z], "+",
+                    recv_len[z], ") lies past the end of the output tensor (",
+                    out_bytes, " bytes)");
         if (z == r) continue;
         if (send_len[z] > max_send) max_send = send_len[z];
-        TORCH_CHECK(recv_len[z] <= schlitz,
-                    "htccl-bar1 a2a: Empfangsblock von Rang ", z, " ist ",
-                    recv_len[z], " Byte und passt nicht in den Schlitz von ",
-                    schlitz, " Byte. Der Aufrufer haette handles() bzw. "
-                    "traegt_a2a() fragen muessen.");
+        TORCH_CHECK(recv_len[z] <= slot,
+                    "htccl-bar1 a2a: receive block from rank ", z, " is ",
+                    recv_len[z], " bytes and does not fit in the slot of ",
+                    slot, " bytes. The caller should have asked handles() "
+                    "or supports_a2a().");
     }
-    TORCH_CHECK(max_send <= schlitz,
-                "htccl-bar1 a2a: groesster Sendeblock ", max_send,
-                " Byte passt nicht in den Schlitz von ", schlitz, " Byte.");
+    TORCH_CHECK(max_send <= slot,
+                "htccl-bar1 a2a: largest send block ", max_send,
+                " bytes does not fit in the slot of ", slot, " bytes.");
     TORCH_CHECK(send_len[r] == recv_len[r],
-                "htccl-bar1 a2a: der eigene Block ist beim Senden ",
-                send_len[r], " und beim Empfangen ", recv_len[r],
-                " Byte gross -- die Teilgroessen passen nicht zusammen");
+                "htccl-bar1 a2a: the own block is ",
+                send_len[r], " bytes when sending and ", recv_len[r],
+                " bytes when receiving -- the split sizes do not match");
 
     A2aArgs A;
     std::memset(&A, 0, sizeof(A));
@@ -1310,13 +1311,13 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
     A.R            = R;
     A.rang         = r;
     A.deckelZyklen = (u64)deckel_zyklen;
-    A.schlitz      = (long long)schlitz;
+    A.slot      = (long long)slot;
     A.eigenBasis   = (const unsigned char *)((char *)(uintptr_t)eigen_nutz
                                              + off_a2a);
 
-    // VEK nur, wenn ALLES ausgerichtet ist: beide Grundadressen und jeder
-    // Blockversatz. Ein einziger schiefer Versatz macht den 128-Bit-Ladebefehl
-    // ungueltig, und "meistens ausgerichtet" gibt es nicht.
+    // VEK only when EVERYTHING is aligned: both base addresses and every
+    // block offset. A single misaligned offset makes the 128-bit load
+    // instruction invalid, and there is no such thing as "mostly aligned".
     int vek = (((uintptr_t)inp.data_ptr() % 16) == 0 &&
                ((uintptr_t)out.data_ptr() % 16) == 0) ? 1 : 0;
     long long pakete = 0;
@@ -1332,8 +1333,8 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
         if (z == r) continue;
         A.zielBasis[z] = (unsigned char *)((char *)(uintptr_t)peer_nutz[z]
                                            + off_a2a);
-        // Eine Flaggenzeile je (Schritt=0, Sender). Ich schreibe beim
-        // Empfaenger in MEINE Zeile und lese bei mir DESSEN Zeile.
+        // One flag line per (step=0, sender). I write into MY line at the
+        // receiver and read THEIR line locally.
         A.flagAn[z]  = (u64 *)((char *)(uintptr_t)peer_flag[z] +
                                fbasis_a2a + (size_t)r * 256u);
         A.flagVon[z] = (const u64 *)((char *)(uintptr_t)eigen_flag +
@@ -1365,7 +1366,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      std::vector<int64_t> peer_nutz,
                      std::vector<int64_t> peer_flag,
                      int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t schlitz, int64_t off_a2a, int64_t fbasis_a2a,
+                     int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
                      int64_t ladeform);
@@ -1373,7 +1374,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
 
 
 # ===========================================================================
-# dma-buf-Export ueber die RM-Ioctls
+# dma-buf export via the RM ioctls
 # ===========================================================================
 
 _DMABUF_SRC = r"""
@@ -1389,9 +1390,9 @@ _DMABUF_SRC = r"""
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-// UAPI der quelloffenen NVIDIA-Kernelmodule. Die Include-Pfade werden beim
-// Uebersetzen hereingereicht; fehlen sie, wird diese Erweiterung gar nicht
-// erst gebaut und der Transport meldet sich ab.
+// UAPI of the open-source NVIDIA kernel modules. The include paths are
+// passed in at compile time; if they're missing, this extension isn't
+// built in the first place and the transport declines.
 #include <nvtypes.h>
 #include <nvos.h>
 #include <nv-ioctl.h>
@@ -1407,17 +1408,17 @@ static int nvIoctl(int fd, int nr, void *p, size_t size)
                           (unsigned)size), p);
 }
 
-// Portiert aus sonden/dmabuf_p2p_probe.cpp::nvExportToDmabuf().
+// Ported from sonden/dmabuf_p2p_probe.cpp::nvExportToDmabuf().
 //
-// Rueckgabe: { dmabuf_fd, ctl_fd, dev_fd }. Die beiden letzten MUESSEN offen
-// bleiben, solange der dma-buf benutzt wird: an ctl_fd haengt der RM-Client,
-// der das importierte Speicherobjekt besitzt. Wird er geschlossen, gibt RM
-// das Objekt frei und der dma-buf zeigt ins Leere. Deshalb gibt diese
-// Funktion sie heraus, statt sie stillschweigend lecken zu lassen -- der
-// Aufrufer haelt sie und schliesst sie beim Abbau.
+// Return value: { dmabuf_fd, ctl_fd, dev_fd }. The last two MUST stay open
+// as long as the dma-buf is in use: ctl_fd is where the RM client that owns
+// the imported memory object hangs off of. If it's closed, RM frees the
+// object and the dma-buf points into nothing. That's why this function
+// hands them out instead of silently leaking them -- the caller holds them
+// and closes them on teardown.
 //
-// objfd = fd aus cuMemExportToShareableHandle(POSIX_FILE_DESCRIPTOR)
-// pci_bus = CU_DEVICE_ATTRIBUTE_PCI_BUS_ID der EXPORTIERENDEN Karte
+// objfd = fd from cuMemExportToShareableHandle(POSIX_FILE_DESCRIPTOR)
+// pci_bus = CU_DEVICE_ATTRIBUTE_PCI_BUS_ID of the EXPORTING card
 std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
                                         int64_t size)
 {
@@ -1432,13 +1433,13 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
         std::snprintf(fehler, sizeof(fehler), __VA_ARGS__);                    \
         if (devFd >= 0) close(devFd);                                          \
         if (ctlFd >= 0) close(ctlFd);                                          \
-        TORCH_CHECK(false, "htccl-bar1 dma-buf-Export: ", fehler);             \
+        TORCH_CHECK(false, "htccl-bar1 dma-buf export: ", fehler);             \
     } while (0)
 
     ctlFd = open("/dev/nvidiactl", O_RDWR);
     if (ctlFd < 0) NVX_FAIL("open(/dev/nvidiactl): %s", std::strerror(errno));
 
-    {   // Versions-Handshake
+    {   // Version handshake
         nv_ioctl_rm_api_version_t v;
         char buf[256] = {0}, ver[64] = {0};
         std::memset(&v, 0, sizeof(v));
@@ -1468,11 +1469,11 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
             }
         }
         if (!found)
-            NVX_FAIL("PCI-Bus 0x%02x nicht in NV_ESC_CARD_INFO",
+            NVX_FAIL("PCI bus 0x%02x not found in NV_ESC_CARD_INFO",
                      (unsigned)pci_bus);
     }
 
-    {   // eigener RM-Client
+    {   // own RM client
         NVOS21_PARAMETERS a;
         std::memset(&a, 0, sizeof(a));
         a.hClass = NV01_ROOT;
@@ -1507,7 +1508,7 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
             NVX_FAIL("RM_ALLOC(device) status=0x%x", (unsigned)a.status);
     }
 
-    {   // Objekt-fd in den eigenen Client importieren
+    {   // import the object fd into our own client
         NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS p;
         NVOS54_PARAMETERS c;
         std::memset(&p, 0, sizeof(p)); std::memset(&c, 0, sizeof(c));
@@ -1532,7 +1533,7 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
 
         nv_ioctl_export_to_dma_buf_fd_t p;
         std::memset(&p, 0, sizeof(p));
-        p.fd           = -1;               // -1 = neuen dma-buf erzeugen
+        p.fd           = -1;               // -1 = create a new dma-buf
         p.hClient      = hClient;
         p.totalObjects = 1;
         p.numObjects   = 1;
@@ -1561,46 +1562,44 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
 }
 """
 
-# Bewusst KEIN getrennter Deklarationsblock wie bei der CUDA-Erweiterung:
-# `load_inline` haengt cpp_sources in der uebergebenen Reihenfolge aneinander,
-# und eine Deklaration mit std::vector VOR den #includes uebersetzt nicht.
-# Die Definition allein genuegt, pybind braucht nichts weiter.
+# Deliberately NO separate declaration block like for the CUDA extension:
+# `load_inline` concatenates cpp_sources in the order passed in, and a
+# declaration with std::vector BEFORE the #includes won't compile. The
+# definition alone is enough, pybind needs nothing more.
 
 
 # ===========================================================================
-# Uebersetzen
+# Compiling
 # ===========================================================================
 
 
-def nv_include_pfade() -> Optional[list]:
-    """Die drei Include-Verzeichnisse des Treiberbaums, oder ``None``.
+def nv_include_paths() -> Optional[list]:
+    """The three include directories of the driver tree, or ``None``.
 
-    ``None`` heisst: der Baum ist hier nicht da. Kein Raten und keine
-    mitgelieferte Kopie der UAPI-Strukturen -- deren Feldversaetze sind
-    versionsgebunden, und eine falsch geratene Struktur schickt Muell in
-    einen Kernel-Ioctl.
+    ``None`` means: the tree isn't present here. No guessing and no bundled
+    copy of the UAPI structures -- their field offsets are version-bound,
+    and a wrongly guessed struct sends garbage into a kernel ioctl.
     """
-    wurzel = os.environ.get("SGLANG_HTCCL_BAR1_NV_QUELLE", NV_QUELLE_VORGABE)
+    wurzel = os.environ.get("SGLANG_HTCCL_BAR1_NV_SOURCE", NV_SOURCE_DEFAULT)
     p = pathlib.Path(wurzel)
     pfade = [p / t for t in NV_INCLUDES]
     fehlend = [str(x) for x in pfade if not x.is_dir()]
     if fehlend:
         return None
-    # Ein Kopfdatei-Stichprobentest: das Verzeichnis kann existieren und
-    # trotzdem der falsche Baum sein.
+    # A header spot-check: the directory can exist and still be the wrong
+    # tree.
     if not (pfade[1] / "nvos.h").is_file():
         return None
     return [str(x) for x in pfade]
 
 
-def lade_kollektiv_ext(cpu_group):
-    """Die CUDA-Erweiterung mit den Kernen ``netz`` und ``ring``.
+def load_collective_ext(cpu_group):
+    """The CUDA extension with the ``mesh`` and ``ring`` kernels.
 
-    Cache-Hygiene, Bogenaufloesung und Baumarke kommen aus ``htccl_device``:
-    dieselbe Mechanik, ein eigener Name. Der Name traegt Hersteller und
-    Boegen, weil torch sein Bauverzeichnis nur nach dem Namen schluesselt --
-    ohne das bekaeme ein Rang eine .so gereicht, die seine Karte nicht
-    ausfuehren kann.
+    Cache hygiene, arch resolution, and the build tag come from
+    ``htccl_device``: same mechanism, own name. The name carries vendor and
+    arches, because torch keys its build directory only by the name --
+    without that, a rank could be handed a .so its card cannot run.
     """
     global _ext
     if _ext is not None:
@@ -1618,20 +1617,19 @@ def lade_kollektiv_ext(cpu_group):
     vendor = _local_vendor()
     if vendor != "cuda":
         raise RuntimeError(
-            f"HTCCL-BAR1: der Direktpfad ist NVIDIA-eigen (BAR1-Apertur, "
-            f"dma-buf-Export ueber die RM-Ioctls, PTX-Einschuebe wie "
-            f"ld.mmio.relaxed.sys). Dieser Rang meldet {vendor!r}. Es gibt "
-            f"keine hipify-Uebersetzung dieser Zeilen, und eine vorzutaeuschen "
-            f"waere schlimmer als die Absage."
+            f"HTCCL-BAR1: the direct path is NVIDIA-specific (BAR1 aperture, "
+            f"dma-buf export via the RM ioctls, PTX inline asm such as "
+            f"ld.mmio.relaxed.sys). This rank reports {vendor!r}. There is "
+            f"no hipify translation of these lines, and faking one would be "
+            f"worse than declining."
         )
     by_vendor = _resolve_build_arches(cpu_group)
     arches = by_vendor.get(vendor, [])
     flags = _build_flags(vendor, arches)
-    # KEIN -rdc=true und kein -lcudadevrt: die Sonde uebersetzt dieselben
-    # cooperative-groups-Aufrufe ohne beides (Bauzeile im Kopf von
-    # bar1_kollektiv.cu). Getrennte Uebersetzung braeuchte hier ein
-    # Geraete-Linken, das load_inline nicht macht -- und sie wird nicht
-    # gebraucht.
+    # NO -rdc=true and no -lcudadevrt: the probe compiles the same
+    # cooperative-groups calls without either (build line in the header of
+    # bar1_kollektiv.cu). Separate compilation would need device linking
+    # here, which load_inline doesn't do -- and it isn't needed.
     name = "htccl_bar1_ext_" + vendor
     if arches:
         name += "_" + "_".join(a.replace(".", "") for a in arches)
@@ -1647,38 +1645,37 @@ def lade_kollektiv_ext(cpu_group):
             build_directory=str(build_dir) if build_dir is not None else None,
         )
     logger.info(
-        "HTCCL-BAR1: Kollektiv-Erweiterung %r fuer Boegen %s in %.1f s gebaut.",
-        name, ",".join(arches) or "<torch-Vorgabe>", time.time() - t0,
+        "HTCCL-BAR1: collective extension %r built for arches %s in %.1f s.",
+        name, ",".join(arches) or "<torch default>", time.time() - t0,
     )
     return _ext
 
 
-def lade_dmabuf_ext():
-    """Die C++-Erweiterung fuer den dma-buf-Export, oder ``None``.
+def load_dmabuf_ext():
+    """The C++ extension for the dma-buf export, or ``None``.
 
-    ``None`` mit protokolliertem Grund, wenn der Treiberbaum fehlt. Der
-    Aufrufer versucht vorher ``cuMemGetHandleForAddressRange``; nur wenn der
-    scheitert -- auf GeForce meldet der Treiber
-    ``CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0`` -- wird dieser Weg
-    gebraucht.
+    ``None`` with a logged reason if the driver tree is missing. The caller
+    tries ``cuMemGetHandleForAddressRange`` first; only if that fails -- on
+    GeForce the driver reports
+    ``CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0`` -- is this path needed.
     """
-    global _dmabuf_ext, _dmabuf_grund
+    global _dmabuf_ext, _dmabuf_reason
     if _dmabuf_ext is not None:
         return _dmabuf_ext
-    if _dmabuf_grund:
+    if _dmabuf_reason:
         return None
 
-    pfade = nv_include_pfade()
+    pfade = nv_include_paths()
     if pfade is None:
-        _dmabuf_grund = (
-            f"Die Kopfdateien der quelloffenen NVIDIA-Kernelmodule liegen "
-            f"nicht unter "
-            f"{os.environ.get('SGLANG_HTCCL_BAR1_NV_QUELLE', NV_QUELLE_VORGABE)!r} "
-            f"(erwartet: {', '.join(NV_INCLUDES)}). Ohne sie ist "
-            f"NV_ESC_EXPORT_TO_DMABUF_FD nicht aufrufbar. Pfad ueber "
-            f"SGLANG_HTCCL_BAR1_NV_QUELLE setzen."
+        _dmabuf_reason = (
+            f"The headers of the open-source NVIDIA kernel modules are not "
+            f"under "
+            f"{os.environ.get('SGLANG_HTCCL_BAR1_NV_SOURCE', NV_SOURCE_DEFAULT)!r} "
+            f"(expected: {', '.join(NV_INCLUDES)}). Without them, "
+            f"NV_ESC_EXPORT_TO_DMABUF_FD cannot be called. Set the path via "
+            f"SGLANG_HTCCL_BAR1_NV_SOURCE."
         )
-        logger.info("HTCCL-BAR1: %s", _dmabuf_grund)
+        logger.info("HTCCL-BAR1: %s", _dmabuf_reason)
         return None
 
     from torch.utils.cpp_extension import load_inline
@@ -1699,16 +1696,16 @@ def lade_dmabuf_ext():
                 verbose=False,
                 build_directory=str(build_dir) if build_dir is not None else None,
             )
-    except Exception as e:                     # Uebersetzungsfehler ist ein Grund
-        _dmabuf_grund = f"Uebersetzung fehlgeschlagen: {e}"
-        logger.info("HTCCL-BAR1: dma-buf-Erweiterung nicht gebaut -- %s", e)
+    except Exception as e:                     # a compile error is itself a reason
+        _dmabuf_reason = f"Compilation failed: {e}"
+        logger.info("HTCCL-BAR1: dma-buf extension not built -- %s", e)
         return None
     logger.info(
-        "HTCCL-BAR1: dma-buf-Erweiterung in %.1f s gebaut (Treiberbaum %s).",
+        "HTCCL-BAR1: dma-buf extension built in %.1f s (driver tree %s).",
         time.time() - t0, pfade[0],
     )
     return _dmabuf_ext
 
 
-def dmabuf_grund() -> str:
-    return _dmabuf_grund
+def dmabuf_reason() -> str:
+    return _dmabuf_reason

@@ -15,7 +15,7 @@ numbers back. No crash.
 
 Two pieces fix it, and they belong together:
 
-1. **Ownership instead of rotation** (``erg_aufteilung``): the ring is split
+1. **Ownership instead of rotation** (``result_slot_split``): the ring is split
    statically. Two slots keep rotating for eager calls, everything above is
    a pool from which each captured call site takes ONE slot and never
    returns it.
@@ -44,20 +44,20 @@ from sglang.srt.distributed.device_communicators.htccl_bar1 import (
     HTCCLBar1Transport,
     bc_plan,
     fbasis_a2a,
-    flaggen_bedarf,
-    geometrie,
-    max_nutzlast,
+    flags_requirement,
+    geometry,
+    max_payload,
 )
 from sglang.srt.distributed.device_communicators.htccl_bar1_pipe_ext import (
     ERG_BEREIT_FAMILIE,
     ERG_EAGER_PLAETZE,
-    erg_aufteilung,
-    erg_eager_platz,
-    erg_graph_platz,
-    erg_ring_bytes,
-    erg_stride_bytes,
+    result_slot_split,
+    result_eager_slot,
+    result_graph_slot,
+    result_ring_bytes,
+    result_stride_bytes,
     pipe_fbasis,
-    pipe_flaggen_zusatz,
+    pipe_flags_extra,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -76,15 +76,15 @@ _PIPE_EXT = (
 # ===========================================================================
 
 
-class TestErgAufteilung(CustomTestCase):
+class TestResultSlotSplit(CustomTestCase):
     def test_off_by_default_the_whole_ring_stays_eager(self):
         """The measured behaviour, byte for byte: no capture pool at all."""
         for ring in (0, 1, 2, 3, 8, 64):
-            self.assertEqual(erg_aufteilung(ring, False), (ring, 0))
+            self.assertEqual(result_slot_split(ring, False), (ring, 0))
 
     def test_on_the_eager_side_keeps_exactly_two(self):
         for ring in (3, 4, 5, 8, 64):
-            eager, graph = erg_aufteilung(ring, True)
+            eager, graph = result_slot_split(ring, True)
             self.assertEqual(eager, ERG_EAGER_PLAETZE)
             self.assertEqual(graph, ring - ERG_EAGER_PLAETZE)
 
@@ -97,14 +97,14 @@ class TestErgAufteilung(CustomTestCase):
         overwritten result the ring exists to prevent.
         """
         for ring in (0, 1, 2):
-            eager, graph = erg_aufteilung(ring, True)
+            eager, graph = result_slot_split(ring, True)
             self.assertEqual(graph, 0)
             self.assertEqual(eager, ring)
 
     def test_the_two_sides_are_disjoint_and_cover_the_ring(self):
         for ring in range(0, 12):
             for fest in (False, True):
-                eager, graph = erg_aufteilung(ring, fest)
+                eager, graph = result_slot_split(ring, fest)
                 self.assertEqual(eager + graph, ring, (ring, fest))
                 self.assertGreaterEqual(eager, 0)
                 self.assertGreaterEqual(graph, 0)
@@ -115,18 +115,18 @@ class TestErgAufteilung(CustomTestCase):
 # ===========================================================================
 
 
-class TestSlotArithmetik(CustomTestCase):
+class TestSlotArithmetic(CustomTestCase):
     def test_eager_rotates_monotonically_modulo_and_wraps(self):
         for plaetze in (2, 3, 5):
             i = -1
-            gesehen = []
+            seen = []
             for _ in range(4 * plaetze):
-                i = erg_eager_platz(i, plaetze)
-                gesehen.append(i)
-            self.assertEqual(gesehen[:plaetze], list(range(plaetze)))
+                i = result_eager_slot(i, plaetze)
+                seen.append(i)
+            self.assertEqual(seen[:plaetze], list(range(plaetze)))
             # Wrap: after `plaetze` steps the sequence repeats exactly.
-            self.assertEqual(gesehen[plaetze : 2 * plaetze], list(range(plaetze)))
-            self.assertTrue(all(0 <= x < plaetze for x in gesehen))
+            self.assertEqual(seen[plaetze : 2 * plaetze], list(range(plaetze)))
+            self.assertTrue(all(0 <= x < plaetze for x in seen))
 
     def test_eager_reuse_distance_is_the_number_of_slots(self):
         """The property the lifetime check rests on, stated as a number.
@@ -139,7 +139,7 @@ class TestSlotArithmetik(CustomTestCase):
             i = -1
             folge = []
             for _ in range(6 * plaetze):
-                i = erg_eager_platz(i, plaetze)
+                i = result_eager_slot(i, plaetze)
                 folge.append(i)
             for k, platz in enumerate(folge):
                 spaeter = folge[k + 1 : k + plaetze]
@@ -147,29 +147,29 @@ class TestSlotArithmetik(CustomTestCase):
 
     def test_eager_without_slots_is_an_error_not_a_zero(self):
         with self.assertRaises(ValueError):
-            erg_eager_platz(-1, 0)
+            result_eager_slot(-1, 0)
 
     def test_graph_slots_are_handed_out_once_ascending_and_then_run_out(self):
         eager, graph = 2, 3
         vergeben = []
         for k in range(graph):
-            platz = erg_graph_platz(k, eager, graph)
+            platz = result_graph_slot(k, eager, graph)
             self.assertIsNotNone(platz)
             vergeben.append(platz)
         self.assertEqual(vergeben, [2, 3, 4])
         self.assertEqual(len(set(vergeben)), len(vergeben))
         for k in range(graph, graph + 4):
-            self.assertIsNone(erg_graph_platz(k, eager, graph))
+            self.assertIsNone(result_graph_slot(k, eager, graph))
 
     def test_graph_slots_never_touch_the_eager_slots(self):
         for ring in range(3, 10):
-            eager, graph = erg_aufteilung(ring, True)
+            eager, graph = result_slot_split(ring, True)
             eager_menge = set(range(eager))
             for k in range(graph):
-                self.assertNotIn(erg_graph_platz(k, eager, graph), eager_menge)
+                self.assertNotIn(result_graph_slot(k, eager, graph), eager_menge)
 
     def test_an_empty_pool_yields_none_from_the_first_request_on(self):
-        self.assertIsNone(erg_graph_platz(0, 2, 0))
+        self.assertIsNone(result_graph_slot(0, 2, 0))
 
 
 # ===========================================================================
@@ -177,17 +177,17 @@ class TestSlotArithmetik(CustomTestCase):
 # ===========================================================================
 
 
-class TestFlaggenRegion(CustomTestCase):
+class TestFlagsRegion(CustomTestCase):
     def test_five_families_now_and_the_fifth_is_ergbereit(self):
         for welt in (2, 3, 8):
-            self.assertEqual(pipe_flaggen_zusatz(welt), 5 * welt * 256)
+            self.assertEqual(pipe_flags_extra(welt), 5 * welt * 256)
         self.assertEqual(ERG_BEREIT_FAMILIE, 4)
 
     def test_the_pipe_base_did_not_move(self):
-        """Growing the pipe families must not shift netz, ring or a2a.
+        """Growing the pipe families must not shift mesh, ring or a2a.
 
         The pipe rows sit BEHIND everything else, so their count enters
-        ``flaggen_bedarf`` but never ``pipe_fbasis`` -- and never
+        ``flags_requirement`` but never ``pipe_fbasis`` -- and never
         ``fbasis_a2a``. A shift here would point sender and receiver at
         different rows, which is a wrong number rather than a crash.
         """
@@ -210,15 +210,15 @@ class TestFlaggenRegion(CustomTestCase):
                 zeilen.append(versatz)
         self.assertEqual(len(set(zeilen)), len(zeilen))
         # And all of them inside the budget the transport allocates.
-        bedarf = flaggen_bedarf(welt, True, True)
+        bedarf = flags_requirement(welt, True, True)
         self.assertLessEqual(max(zeilen) + 256, bedarf)
 
     def test_without_the_pipe_the_budget_is_unchanged(self):
         for welt in (2, 3, 8):
             for a2a in (False, True):
                 self.assertEqual(
-                    flaggen_bedarf(welt, a2a, False),
-                    flaggen_bedarf(welt, a2a, True) - pipe_flaggen_zusatz(welt),
+                    flags_requirement(welt, a2a, False),
+                    flags_requirement(welt, a2a, True) - pipe_flags_extra(welt),
                 )
 
 
@@ -227,11 +227,11 @@ class TestFlaggenRegion(CustomTestCase):
 # ===========================================================================
 
 
-class Verletzung(AssertionError):
+class Violation(AssertionError):
     """A rank wrote over a slot generation the owner had not released."""
 
 
-class Fenster:
+class Window:
     """A pure-Python replay of the ``ergBereit`` protocol.
 
     Deliberately NOT a mock of the kernel: it models only the four things
@@ -248,22 +248,22 @@ class Fenster:
     consumer of the previous result is ordered before its next call.
     """
 
-    def __init__(self, welt: int, slack: int, handschlag: bool = True):
+    def __init__(self, welt: int, slack: int, handshake: bool = True):
         self.welt = welt
         self.slack = slack
-        self.handschlag = handschlag
+        self.handshake = handshake
         #: local, device-resident generation counter per rank
         self.gen = [0] * welt
-        #: gesehen[r][z] -- what r has read from z's row in r's own window
-        self.gesehen = [[0] * welt for _ in range(welt)]
+        #: seen[r][z] -- what r has read from z's row in r's own window
+        self.seen = [[0] * welt for _ in range(welt)]
         #: which generation currently sits in each rank's result slot
-        self.inhalt = [0] * welt
+        self.content = [0] * welt
         #: highest generation each rank has finished consuming
-        self.verbraucht = [0] * welt
-        self.wartend: set = set()
+        self.consumed = [0] * welt
+        self.waiting: set = set()
 
     # -- the three kernel steps ------------------------------------------
-    def betreten(self, r: int) -> None:
+    def enter(self, r: int) -> None:
         """Kernel start: bump the generation and publish it to all peers.
 
         Entering generation ``g`` means every consumer of generation
@@ -271,55 +271,54 @@ class Fenster:
         assumption.
         """
         self.gen[r] += 1
-        self.verbraucht[r] = self.gen[r] - 1
-        if not self.handschlag:
+        self.consumed[r] = self.gen[r] - 1
+        if not self.handshake:
             return
         for z in range(self.welt):
             if z != r:
-                self.gesehen[z][r] = self.gen[r]
+                self.seen[z][r] = self.gen[r]
 
-    def darf_schreiben(self, r: int) -> bool:
+    def may_write(self, r: int) -> bool:
         """The wait condition, evaluated once per call."""
-        if not self.handschlag:
+        if not self.handshake:
             return True
         g = self.gen[r]
         return all(
-            self.gesehen[r][z] + self.slack - 1 >= g for z in range(self.welt) if z != r
+            self.seen[r][z] + self.slack - 1 >= g for z in range(self.welt) if z != r
         )
 
-    def schreiben(self, r: int) -> None:
+    def write(self, r: int) -> None:
         """Write generation ``gen[r]`` into every peer's result slot."""
         g = self.gen[r]
         for z in range(self.welt):
             if z == r:
                 continue
             ueberschrieben = g - self.slack
-            if ueberschrieben > self.verbraucht[z]:
-                raise Verletzung(
-                    f"Rang {r} schreibt Generation {g} in den Platz von "
-                    f"Rang {z} und ueberbuegelt damit Generation "
-                    f"{ueberschrieben}, die {z} erst bis {self.verbraucht[z]} "
-                    f"verbraucht hat"
+            if ueberschrieben > self.consumed[z]:
+                raise Violation(
+                    f"rank {r} writes generation {g} into rank {z}'s slot "
+                    f"and thereby overwrites generation {ueberschrieben}, "
+                    f"which {z} has only consumed up to {self.consumed[z]}"
                 )
-            self.inhalt[z] = g
+            self.content[z] = g
 
-    def aufruf(self, r: int) -> bool:
+    def call(self, r: int) -> bool:
         """One whole call of rank ``r``. ``False`` = blocked on the wait."""
-        if r in self.wartend:
-            if not self.darf_schreiben(r):
+        if r in self.waiting:
+            if not self.may_write(r):
                 return False
-            self.wartend.discard(r)
-            self.schreiben(r)
+            self.waiting.discard(r)
+            self.write(r)
             return True
-        self.betreten(r)
-        if not self.darf_schreiben(r):
-            self.wartend.add(r)
+        self.enter(r)
+        if not self.may_write(r):
+            self.waiting.add(r)
             return False
-        self.schreiben(r)
+        self.write(r)
         return True
 
 
-class TestFreigabeHandschlag(CustomTestCase):
+class TestReleaseHandshake(CustomTestCase):
     def test_a_slow_peer_cannot_be_run_over(self):
         """One rank races ahead as far as the protocol lets it.
 
@@ -328,22 +327,22 @@ class TestFreigabeHandschlag(CustomTestCase):
         """
         for welt in (2, 3):
             for slack in (1, 2, 3):
-                f = Fenster(welt, slack)
-                schnell = 0
-                blockiert = 0
+                f = Window(welt, slack)
+                fast = 0
+                blocked = 0
                 for _ in range(50):
-                    if not f.aufruf(schnell):
-                        blockiert += 1
+                    if not f.call(fast):
+                        blocked += 1
                         # The slow rank does one call, then the fast one
                         # gets going again.
                         for z in range(1, welt):
-                            f.aufruf(z)
-                        f.aufruf(schnell)
+                            f.call(z)
+                        f.call(fast)
                 self.assertGreater(
-                    blockiert,
+                    blocked,
                     0,
-                    f"slack={slack}: die Wartebedingung hat nie gegriffen, "
-                    f"der Fall prueft dann gar nichts",
+                    f"slack={slack}: the wait condition never triggered, "
+                    f"so this case tests nothing at all",
                 )
 
     def test_without_the_handshake_a_reserved_slot_is_run_over(self):
@@ -354,10 +353,10 @@ class TestFreigabeHandschlag(CustomTestCase):
         generation the peer has not consumed -- the silent wrong number
         this whole construction exists to prevent.
         """
-        f = Fenster(2, slack=1, handschlag=False)
-        with self.assertRaises(Verletzung):
+        f = Window(2, slack=1, handshake=False)
+        with self.assertRaises(Violation):
             for _ in range(5):
-                f.aufruf(0)
+                f.call(0)
 
     def test_the_eager_ring_survives_without_the_handshake(self):
         """Why the default path needs no new traffic, stated as a test.
@@ -367,10 +366,10 @@ class TestFreigabeHandschlag(CustomTestCase):
         simulation shows the second call of slack is what carries it: at
         ``slack = 2`` a rank one call ahead is still safe.
         """
-        f = Fenster(2, slack=2, handschlag=False)
+        f = Window(2, slack=2, handshake=False)
         for _ in range(20):
-            f.aufruf(0)
-            f.aufruf(1)
+            f.call(0)
+            f.call(1)
         self.assertEqual(f.gen, [20, 20])
 
     def test_wrap_around_of_the_generation_counter_is_not_a_special_case(self):
@@ -378,21 +377,21 @@ class TestFreigabeHandschlag(CustomTestCase):
 
         A per-round counter would leave a gap exactly at the round
         boundary. This checks the arithmetic stays consistent far from
-        zero, which is where a comparison written as ``gesehen >= g -
+        zero, which is where a comparison written as ``seen >= g -
         slack + 1`` would underflow if it were not kept on the left.
         """
-        f = Fenster(3, slack=1)
+        f = Window(3, slack=1)
         f.gen = [10**9] * 3
-        f.verbraucht = [10**9] * 3
+        f.consumed = [10**9] * 3
         for _ in range(30):
-            offen = set(range(3))
-            for _versuch in range(10):
-                for r in sorted(offen):
-                    if f.aufruf(r):
-                        offen.discard(r)
-                if not offen:
+            open_set = set(range(3))
+            for _attempt in range(10):
+                for r in sorted(open_set):
+                    if f.call(r):
+                        open_set.discard(r)
+                if not open_set:
                     break
-            self.assertFalse(offen, "verklemmt statt fertig")
+            self.assertFalse(open_set, "deadlocked instead of finished")
         self.assertEqual(f.gen, [10**9 + 30] * 3)
 
     def test_a_rank_that_skips_the_handshake_deadlocks_rather_than_lies(self):
@@ -404,10 +403,10 @@ class TestFreigabeHandschlag(CustomTestCase):
         the decision to run the direct mode has to be group-uniform, which
         it is, because it follows from the SPMD call sequence alone.
         """
-        f = Fenster(2, slack=1)
-        f.betreten(0)  # rank 0 enters, publishes
+        f = Window(2, slack=1)
+        f.enter(0)  # rank 0 enters, publishes
         # rank 1 never enters -> rank 0 must not be allowed to write
-        self.assertFalse(f.darf_schreiben(0))
+        self.assertFalse(f.may_write(0))
 
 
 # ===========================================================================
@@ -415,7 +414,7 @@ class TestFreigabeHandschlag(CustomTestCase):
 # ===========================================================================
 
 
-class TestUngleicheFenster(CustomTestCase):
+class TestUnequalWindows(CustomTestCase):
     """3080 with a 256 MiB BAR against a 5090 with the full aperture.
 
     The ring is group-uniform -- every rank maps the same layout -- so the
@@ -429,7 +428,7 @@ class TestUngleicheFenster(CustomTestCase):
     def test_more_ring_slots_cost_payload_monotonically(self):
         vorher = None
         for ring in (2, 3, 4, 5, 8):
-            n = max_nutzlast(3, self.KLEIN, True, True, ring)
+            n = max_payload(3, self.KLEIN, True, True, ring)
             self.assertGreater(n, 0, f"ring={ring}")
             if vorher is not None:
                 self.assertLess(n, vorher, f"ring={ring} kostet nichts?")
@@ -438,37 +437,37 @@ class TestUngleicheFenster(CustomTestCase):
     def test_the_small_window_still_carries_a_capture_pool(self):
         """The concrete question for this rig, answered with a number."""
         ring = 5
-        n = max_nutzlast(3, self.KLEIN, True, True, ring)
-        eager, graph = erg_aufteilung(ring, True)
+        n = max_payload(3, self.KLEIN, True, True, ring)
+        eager, graph = result_slot_split(ring, True)
         self.assertEqual((eager, graph), (2, 3))
         self.assertGreaterEqual(
             n,
             64 << 10,
-            "ein Ring mit Graph-Vorrat drueckt die groesste Nutzlast unter "
-            "64 KiB -- dann traegt der Weg die Abnahmegroessen nicht mehr",
+            "a ring with a graph pool pushes the largest payload under "
+            "64 KiB -- and then the path no longer carries the handover sizes",
         )
 
     def test_the_ring_cost_is_charged_against_the_mapped_length(self):
         for ring in (2, 5):
-            n = max_nutzlast(3, self.KLEIN, True, True, ring)
-            self.assertLessEqual(erg_ring_bytes(n, ring), self.KLEIN)
+            n = max_payload(3, self.KLEIN, True, True, ring)
+            self.assertLessEqual(result_ring_bytes(n, ring), self.KLEIN)
 
     def test_the_big_window_carries_strictly_more(self):
         self.assertGreater(
-            max_nutzlast(3, self.GROSS, True, True, 5),
-            max_nutzlast(3, self.KLEIN, True, True, 5),
+            max_payload(3, self.GROSS, True, True, 5),
+            max_payload(3, self.KLEIN, True, True, 5),
         )
 
 
 # ===========================================================================
-# 6. Ownership at the seam: _erg_platz
+# 6. Ownership at the seam: _result_slot
 # ===========================================================================
 
 
 def _stub(**kw):
     """A transport instance without ``__init__``.
 
-    Only the fields ``_erg_platz`` reads. Anything not set here stays
+    Only the fields ``_result_slot`` reads. Anything not set here stays
     absent on purpose: a new condition reading a new field then fails
     loudly instead of being silently skipped.
     """
@@ -499,19 +498,19 @@ def _stub(**kw):
 
 def _ohne_erfassung():
     return mock.patch(
-        "sglang.srt.distributed.device_communicators.htccl.graph_erfassung_laeuft",
+        "sglang.srt.distributed.device_communicators.htccl.graph_capture_running",
         lambda: False,
     )
 
 
 def _mit_erfassung():
     return mock.patch(
-        "sglang.srt.distributed.device_communicators.htccl.graph_erfassung_laeuft",
+        "sglang.srt.distributed.device_communicators.htccl.graph_capture_running",
         lambda: True,
     )
 
 
-class TestErgPlatzBesitz(CustomTestCase):
+class TestResultSlotOwnership(CustomTestCase):
     def test_the_slot_comes_back_with_the_buffer_not_as_a_field(self):
         """No returned buffer whose ordering lives only in a comment.
 
@@ -521,7 +520,7 @@ class TestErgPlatzBesitz(CustomTestCase):
         """
         t = _stub()
         with _ohne_erfassung():
-            erg = t._erg_platz(object())
+            erg = t._result_slot(object())
         self.assertIsInstance(erg, tuple)
         self.assertEqual(len(erg), 3)
         _out, platz, slack = erg
@@ -533,7 +532,7 @@ class TestErgPlatzBesitz(CustomTestCase):
         plaetze = []
         with _ohne_erfassung():
             for _ in range(5):
-                _out, platz, slack = t._erg_platz(object())
+                _out, platz, slack = t._result_slot(object())
                 plaetze.append(platz)
                 self.assertEqual(slack, 0)
         self.assertEqual(plaetze, [0, 1, 0, 1, 0])
@@ -541,13 +540,13 @@ class TestErgPlatzBesitz(CustomTestCase):
     def test_eager_gets_a_slack_only_when_the_graph_mode_is_on(self):
         t = _stub(pipe_direkt_graph=True)
         with _ohne_erfassung():
-            _out, _platz, slack = t._erg_platz(object())
+            _out, _platz, slack = t._result_slot(object())
         self.assertEqual(slack, t._erg_eager_plaetze)
 
     def test_capture_without_the_flag_still_refuses(self):
         t = _stub()
         with _mit_erfassung():
-            self.assertIsNone(t._erg_platz(object()))
+            self.assertIsNone(t._result_slot(object()))
 
     def test_capture_reserves_one_slot_per_call_site_with_slack_one(self):
         t = _stub(
@@ -558,7 +557,7 @@ class TestErgPlatzBesitz(CustomTestCase):
         plaetze = []
         with _mit_erfassung():
             for _ in range(3):
-                _out, platz, slack = t._erg_platz(object())
+                _out, platz, slack = t._result_slot(object())
                 plaetze.append(platz)
                 self.assertEqual(slack, 1)
         self.assertEqual(plaetze, [2, 3, 4])
@@ -570,15 +569,15 @@ class TestErgPlatzBesitz(CustomTestCase):
             _erg_graph_plaetze=2,
             _geo={"off_erg": 4096, "erg_stride": 1 << 20, "erg_ring": 4},
         )
-        gesehen = []
+        seen = []
         with _mit_erfassung():
             for _ in range(2):
-                _out, platz, _slack = t._erg_platz(object())
-                gesehen.append(platz)
+                _out, platz, _slack = t._result_slot(object())
+                seen.append(platz)
         with _ohne_erfassung():
             for _ in range(6):
-                _out, platz, _slack = t._erg_platz(object())
-                self.assertNotIn(platz, gesehen)
+                _out, platz, _slack = t._result_slot(object())
+                self.assertNotIn(platz, seen)
 
     def test_an_exhausted_pool_falls_back_to_direkt_zero_not_to_a_shared_slot(self):
         t = _stub(
@@ -587,9 +586,9 @@ class TestErgPlatzBesitz(CustomTestCase):
             _geo={"off_erg": 4096, "erg_stride": 1 << 20, "erg_ring": 3},
         )
         with _mit_erfassung():
-            self.assertIsNotNone(t._erg_platz(object()))
-            self.assertIsNone(t._erg_platz(object()))
-            self.assertIsNone(t._erg_platz(object()))
+            self.assertIsNotNone(t._result_slot(object()))
+            self.assertIsNone(t._result_slot(object()))
+            self.assertIsNone(t._result_slot(object()))
 
     def test_the_pointer_follows_the_slot(self):
         t = _stub(
@@ -598,8 +597,8 @@ class TestErgPlatzBesitz(CustomTestCase):
             _geo={"off_erg": 4096, "erg_stride": 1 << 20, "erg_ring": 5},
         )
         with _mit_erfassung():
-            t._erg_platz(object())
-            t._erg_platz(object())
+            t._result_slot(object())
+            t._result_slot(object())
         zeiger = [c.args[0] for c in t._pipe_ext.bar1_erg_tensor.call_args_list]
         self.assertEqual(
             zeiger,
@@ -609,9 +608,9 @@ class TestErgPlatzBesitz(CustomTestCase):
     def test_direkt_off_short_circuits_everything(self):
         t = _stub(pipe_direkt=False)
         with _ohne_erfassung():
-            self.assertIsNone(t._erg_platz(object()))
+            self.assertIsNone(t._result_slot(object()))
         with _mit_erfassung():
-            self.assertIsNone(t._erg_platz(object()))
+            self.assertIsNone(t._result_slot(object()))
 
 
 # ===========================================================================
@@ -647,11 +646,11 @@ def _ohne_kommentare(text: str) -> str:
 
 def _kernel_koerper(src: str) -> str:
     anfang = src.index("__global__ void bar1_netz_pipe_kernel")
-    ende = src.index("// Hostseite")
-    return _ohne_kommentare(src[anfang:ende])
+    end = src.index("// Hostseite")
+    return _ohne_kommentare(src[anfang:end])
 
 
-class TestKernelQuelltext(CustomTestCase):
+class TestKernelSourceText(CustomTestCase):
     def test_the_declaration_and_the_definition_agree(self):
         """A signature that drifts between .cpp and .cu links but misbinds.
 
@@ -664,22 +663,22 @@ class TestKernelQuelltext(CustomTestCase):
             self.assertIn(name, _cuda_src(), name)
 
     def test_the_new_pointer_tables_are_only_read_while_staging(self):
-        """Same rule as the netz kernel: no dynamic indexing of ``A``.
+        """Same rule as the mesh kernel: no dynamic indexing of ``A``.
 
         Kernel parameters live in constant bank 0, which has no dynamic
         indexing. One ``A.ergBereitAn[z]`` with a running ``z`` in the body
         makes nvcc copy the WHOLE parameter block into local memory, per
-        thread -- measured on this codebase as STACK 64 on the netz kernel.
+        thread -- measured on this codebase as STACK 64 on the mesh kernel.
         """
         koerper = _kernel_koerper(_cuda_src())
         stelle = koerper.index("__syncthreads();")
         rumpf = koerper[stelle:]
-        for feld in ("ergBereitAn", "ergBereitVon"):
+        for field in ("ergBereitAn", "ergBereitVon"):
             self.assertNotIn(
-                f"A.{feld}",
+                f"A.{field}",
                 rumpf,
-                f"A.{feld} wird ausserhalb des Staging-Blocks indiziert -- "
-                f"das legt den Parameterblock in den local memory",
+                f"A.{field} is indexed outside the staging block -- "
+                f"that puts the parameter block into local memory",
             )
 
     def test_the_generation_counter_is_advanced_on_both_exits(self):
@@ -700,8 +699,8 @@ class TestKernelQuelltext(CustomTestCase):
         """Order is the content here, so it is asserted rather than assumed."""
         koerper = _kernel_koerper(_cuda_src())
         warte = koerper.index("PIPE_WARTE_ERGFREI(ergGen)")
-        schreiben = koerper.index("schreibeV4(sErgAn[z] + ziel, s)")
-        self.assertLess(warte, schreiben)
+        write = koerper.index("schreibeV4(sErgAn[z] + ziel, s)")
+        self.assertLess(warte, write)
 
     def test_the_publish_stands_before_the_loop(self):
         koerper = _kernel_koerper(_cuda_src())
@@ -740,24 +739,24 @@ class TestKernelQuelltext(CustomTestCase):
 
 
 def _a2a_belegung(geo: dict, welt: int) -> list:
-    """Every ``(anfang, laenge)`` the a2a kernel can write in one region.
+    """Every ``(anfang, length)`` the a2a kernel can write in one region.
 
     Straight from the address formula in ``htccl_bar1_ext.a2aZiel``: two
     halves ``par``, ``R-1`` peer positions ``p``, one slot each. broadcast
     reaches exactly these, never more -- it is that kernel with a different
     table.
     """
-    schlitz = int(geo["a2a_schlitz"])
+    slot = int(geo["a2a_schlitz"])
     basis = int(geo["off_a2a"])
     return [
-        (basis + (par * (welt - 1) + p) * schlitz, schlitz)
+        (basis + (par * (welt - 1) + p) * slot, slot)
         for par in (0, 1)
         for p in range(welt - 1)
     ]
 
 
 def _erg_belegung(geo: dict, plaetze) -> list:
-    """``(anfang, laenge)`` of the given result-ring slots."""
+    """``(anfang, length)`` of the given result-ring slots."""
     basis = int(geo["off_erg"])
     stride = int(geo["erg_stride"])
     return [(basis + int(i) * stride, stride) for i in plaetze]
@@ -773,13 +772,13 @@ def _kollisionen(links: list, rechts: list) -> list:
     return treffer
 
 
-class TestBroadcastNebenDemErgebnisring(CustomTestCase):
+class TestBroadcastAlongsideTheResultRing(CustomTestCase):
     RINGE = (2, 3, 5, 8)
     WELTEN = (2, 3, 4, 8)
     NUTZLASTEN = (16 << 10, 512 << 10, 8 << 20)
 
     def _geo(self, welt: int, max_bytes: int, ring: int) -> dict:
-        geo = geometrie(welt, max_bytes, True, True, ring)
+        geo = geometry(welt, max_bytes, True, True, ring)
         self.assertGreaterEqual(geo["off_a2a"], 0)
         self.assertGreaterEqual(geo["off_erg"], 0)
         return geo
@@ -790,7 +789,7 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
             for max_bytes in self.NUTZLASTEN:
                 for ring in self.RINGE:
                     geo = self._geo(welt, max_bytes, ring)
-                    eager, graph = erg_aufteilung(ring, True)
+                    eager, graph = result_slot_split(ring, True)
                     self.assertEqual(eager + graph, ring)
                     treffer = _kollisionen(
                         _a2a_belegung(geo, welt),
@@ -799,7 +798,7 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
                     self.assertEqual(
                         treffer, [],
                         f"R={welt}, max_bytes={max_bytes}, ring={ring}: "
-                        f"a2a-Schlitz und Ergebnisplatz teilen sich Bytes",
+                        f"a2a slot and result slot share bytes",
                     )
 
     def test_a_broadcast_of_any_size_stays_inside_one_a2a_slot_per_round(self):
@@ -813,13 +812,13 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
         for welt in self.WELTEN:
             for max_bytes in self.NUTZLASTEN:
                 geo = self._geo(welt, max_bytes, 5)
-                schlitz = int(geo["a2a_schlitz"])
-                for nbytes in (12, 128, schlitz - 1, schlitz,
-                               schlitz + 1, 7 * schlitz + 3):
-                    plan = bc_plan(nbytes, schlitz)
-                    self.assertEqual(sum(laenge for _, laenge in plan), nbytes)
-                    for _, laenge in plan:
-                        self.assertLessEqual(laenge, schlitz)
+                slot = int(geo["a2a_schlitz"])
+                for nbytes in (12, 128, slot - 1, slot,
+                               slot + 1, 7 * slot + 3):
+                    plan = bc_plan(nbytes, slot)
+                    self.assertEqual(sum(length for _, length in plan), nbytes)
+                    for _, length in plan:
+                        self.assertLessEqual(length, slot)
 
     def test_a_capture_run_interleaved_with_broadcasts_keeps_every_owner(self):
         """The coexistence itself, walked as a ledger rather than argued.
@@ -831,12 +830,12 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
         """
         welt, max_bytes, ring = 3, 512 << 10, 5
         geo = self._geo(welt, max_bytes, ring)
-        eager, graph = erg_aufteilung(ring, True)
+        eager, graph = result_slot_split(ring, True)
         besitzer: dict = {}
 
         def belege(intervalle, wer):
-            for anfang, laenge in intervalle:
-                for seite in range(anfang, anfang + laenge, 4096):
+            for anfang, length in intervalle:
+                for seite in range(anfang, anfang + length, 4096):
                     voriger = besitzer.get(seite)
                     if voriger is not None and voriger != wer:
                         self.fail(
@@ -847,7 +846,7 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
 
         vergeben = 0
         for aufrufstelle in range(3):
-            platz = erg_graph_platz(vergeben, eager, graph)
+            platz = result_graph_slot(vergeben, eager, graph)
             self.assertIsNotNone(platz)
             vergeben += 1
             belege(_erg_belegung(geo, [platz]), f"graph{aufrufstelle}")
@@ -858,13 +857,13 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
         # And the eager result slots, which rotate the whole time.
         voriger = -1
         for _ in range(2 * eager + 1):
-            voriger = erg_eager_platz(voriger, eager)
+            voriger = result_eager_slot(voriger, eager)
             belege(_erg_belegung(geo, [voriger]), f"eager{voriger}")
 
     def test_the_result_ring_begins_behind_the_last_a2a_slot(self):
         """Disjoint because of the ORDER, and the order is the invariant.
 
-        ``geometrie`` counts sets: netz, ring, a2a, pipe, and only then the
+        ``geometry`` counts sets: mesh, ring, a2a, pipe, and only then the
         result ring. Whoever adds a set has to add it to that count too --
         this is the assertion that notices when they do not.
         """
@@ -885,17 +884,17 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
         """The falsifier: the disjointness check has to have teeth.
 
         The mutant is the plausible mistake, not an arbitrary one. A result
-        ring appended by the layout as it stood before a2a existed -- netz,
+        ring appended by the layout as it stood before a2a existed -- mesh,
         ring, then whatever comes next -- lands on exactly the block
-        broadcast writes into. ``geometrie`` avoids that by counting sets;
+        broadcast writes into. ``geometry`` avoids that by counting sets;
         the check from the first test has to say so when the count is off.
         """
         welt, max_bytes, ring = 3, 512 << 10, 5
         geo = self._geo(welt, max_bytes, ring)
         schlitze = 2 * (welt - 1)
         for vergessen, off_erg in (
-            ("a2a und Pipe", 2 * schlitze * geo["chunk_max"]),
-            ("nur a2a", 3 * schlitze * geo["chunk_max"]),
+            ("a2a and pipe", 2 * schlitze * geo["chunk_max"]),
+            ("a2a only", 3 * schlitze * geo["chunk_max"]),
         ):
             falsch = dict(geo)
             falsch["off_erg"] = off_erg
@@ -904,11 +903,11 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
             treffer = _kollisionen(
                 _a2a_belegung(geo, welt), _erg_belegung(falsch, range(ring))
             )
-            if vergessen == "a2a und Pipe":
+            if vergessen == "a2a and pipe":
                 self.assertTrue(
                     treffer,
-                    "der Mutant kollidiert nicht mit den a2a-Schlitzen -- "
-                    "dann prueft der Test oben nichts",
+                    "the mutant does not collide with the a2a slots -- "
+                    "then the test above checks nothing",
                 )
             else:
                 # Forgetting only a2a puts the ring on the PIPE block. Still
@@ -924,7 +923,7 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
         """Not only against a2a: the ring's own slots must not overlap."""
         for max_bytes in self.NUTZLASTEN:
             geo = self._geo(3, max_bytes, 5)
-            self.assertEqual(geo["erg_stride"], erg_stride_bytes(max_bytes))
+            self.assertEqual(geo["erg_stride"], result_stride_bytes(max_bytes))
             self.assertGreaterEqual(geo["erg_stride"], max_bytes)
             self.assertEqual(
                 _kollisionen(
@@ -935,7 +934,7 @@ class TestBroadcastNebenDemErgebnisring(CustomTestCase):
             )
 
 
-class TestFlaggenKoexistenz(CustomTestCase):
+class TestFlagCoexistence(CustomTestCase):
     """The second region the two features share: the flag rows."""
 
     def test_the_a2a_row_and_the_ergbereit_row_are_never_the_same_line(self):
@@ -952,7 +951,7 @@ class TestFlaggenKoexistenz(CustomTestCase):
 
     def test_every_ergbereit_row_fits_in_the_budget_that_is_allocated(self):
         for welt in (2, 3, 4, 8):
-            bedarf = flaggen_bedarf(welt, True, True)
+            bedarf = flags_requirement(welt, True, True)
             letzte = (pipe_fbasis(welt, True)
                       + (ERG_BEREIT_FAMILIE * welt + welt - 1) * 256)
             self.assertLessEqual(letzte + 256, bedarf)
@@ -961,13 +960,13 @@ class TestFlaggenKoexistenz(CustomTestCase):
         """The falsifier for the flag side.
 
         Family 4 was added by the direct mode; the four older rows were left
-        where they were. Had ``pipe_flaggen_zusatz`` stayed at ``4 R * 256``,
+        where they were. Had ``pipe_flags_extra`` stayed at ``4 R * 256``,
         the ergBereit rows would run past the end of the allocated flag
         region -- into whatever the allocator put there. The check above has
         to notice that, otherwise it only restates the formula.
         """
         for welt in (2, 3, 4, 8):
-            alt = flaggen_bedarf(welt, True, True) - welt * 256
+            alt = flags_requirement(welt, True, True) - welt * 256
             letzte = (pipe_fbasis(welt, True)
                       + (ERG_BEREIT_FAMILIE * welt + welt - 1) * 256)
             self.assertGreater(letzte + 256, alt)

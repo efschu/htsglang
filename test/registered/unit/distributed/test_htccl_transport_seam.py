@@ -229,7 +229,7 @@ class TestFallbackPolicy(CustomTestCase):
         try:
             os.environ["SGLANG_HTCCL_GRAPH_FREIGABE"] = "0"
             self.assertEqual(
-                {n for n in TRANSPORT_REGISTRY if htccl_mod._kein_ausweichen(n)},
+                {n for n in TRANSPORT_REGISTRY if htccl_mod._no_fallback(n)},
                 set(ps.capturable_transports()),
             )
             self.assertEqual(set(ps.capturable_transports()), {"device", "host"})
@@ -239,7 +239,7 @@ class TestFallbackPolicy(CustomTestCase):
             # would be the worst pairing of the two.
             os.environ["SGLANG_HTCCL_GRAPH_FREIGABE"] = "1"
             self.assertEqual(
-                {n for n in TRANSPORT_REGISTRY if htccl_mod._kein_ausweichen(n)},
+                {n for n in TRANSPORT_REGISTRY if htccl_mod._no_fallback(n)},
                 set(ps.capturable_transports()),
             )
             self.assertIn("bar1", ps.capturable_transports())

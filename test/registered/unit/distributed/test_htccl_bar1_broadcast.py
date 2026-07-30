@@ -4,9 +4,9 @@ Context. Before this, ``HTCCLBar1Transport.HTCCL_OPS`` covered all_reduce,
 all_to_all and all_gather, and the standard run died while capturing the
 DRAFT graph::
 
-    RuntimeError: HTCCL: 'broadcast' mit 128 Byte waehrend einer
-    CUDA-Graph-Aufzeichnung, aber bar1 meldet handles('broadcast', 128)
-    -> False; gedeckt sind dort all_gather, all_reduce, all_to_all,
+    RuntimeError: HTCCL: 'broadcast' with 128 bytes during a
+    CUDA graph capture, but bar1 reports handles('broadcast', 128)
+    -> False; covered there are all_gather, all_reduce, all_to_all,
     all_to_all_single.
 
 128 bytes. Not the bandwidth was missing, the coverage was -- and under
@@ -24,7 +24,7 @@ a pure function, ``htccl_broadcast`` is driven against a stub that records the
 tables it would have handed to the kernel, and those tables are then checked
 against a reference broadcast AND against each other. What a GPU still has to
 prove is benchmark/bar1_graph_check.py, cases ``broadcast`` and
-``broadcast-zwei-graphen``.
+``broadcast-two-graphs``.
 """
 
 import unittest
@@ -58,10 +58,10 @@ def _stub(rank: int = 0, welt: int = 3, **kw):
     t.a2a_an = True
     t._a2a_beleg = True
     t._bc_beleg = True
-    # Die AUSGELIEFERTEN Vorgaben, nicht runde Zahlen: dass der Stub sie
-    # wirklich spiegelt, nagelt TestTheShippedFloor am Quelltext fest. Ein
-    # Stub mit einer bequemeren Untergrenze haette den 12-Byte-Abbruch
-    # genauso wenig gesehen wie der erste Beleg.
+    # The SHIPPED defaults, not round numbers: that the stub really
+    # mirrors them is pinned down against the source by
+    # TestTheShippedFloor. A stub with a more convenient floor would have
+    # missed the 12-byte abort just as much as the first proof did.
     t.bc_min_bytes = 1
     t.bc_max_runden = 16
     t._fenster_minimum = 96 << 20
@@ -122,7 +122,7 @@ class TestOpRegistration(CustomTestCase):
     def test_broadcast_method_is_not_the_placeholder(self):
         """The F811 trap, nailed down.
 
-        ``htccl_broadcast = _kein_kollektiv`` used to stand in the class
+        ``htccl_broadcast = _no_collective`` used to stand in the class
         body, BELOW where the real method now is. A plain assignment in a
         class body wins against a ``def`` of the same name further up --
         silently. That is exactly how all_gather would have raised
@@ -131,7 +131,7 @@ class TestOpRegistration(CustomTestCase):
         """
         self.assertIsNot(
             HTCCLBar1Transport.htccl_broadcast,
-            HTCCLBar1Transport._kein_kollektiv,
+            HTCCLBar1Transport._no_collective,
         )
         self.assertEqual(
             HTCCLBar1Transport.htccl_broadcast.__name__, "htccl_broadcast"
@@ -142,7 +142,7 @@ class TestOpRegistration(CustomTestCase):
         self.assertNotIn("reduce_scatter", HTCCLBar1Transport.HTCCL_OPS)
         self.assertIs(
             HTCCLBar1Transport.htccl_reduce_scatter,
-            HTCCLBar1Transport._kein_kollektiv,
+            HTCCLBar1Transport._no_collective,
         )
 
     def test_ops_and_methods_agree(self):
@@ -159,7 +159,7 @@ class TestOpRegistration(CustomTestCase):
         """It reads HTCCL_OPS, so adding an op cannot leave it stale."""
         t = _stub()
         with self.assertRaises(NotImplementedError) as ctx:
-            HTCCLBar1Transport._kein_kollektiv(t, None, None, 0)
+            HTCCLBar1Transport._no_collective(t, None, None, 0)
         text = str(ctx.exception)
         self.assertIn("broadcast", text)
         self.assertIn("reduce_scatter", text)
@@ -171,11 +171,11 @@ class TestBcPlanArithmetic(CustomTestCase):
     def _check_coverage(self, nbytes, slot):
         plan = bc_plan(nbytes, slot)
         seen = []
-        for versatz, laenge in plan:
-            self.assertGreater(laenge, 0)
-            self.assertLessEqual(laenge, slot, msg="a round must fit one slot")
-            self.assertLessEqual(versatz + laenge, nbytes)
-            seen.extend(range(versatz, versatz + laenge))
+        for versatz, length in plan:
+            self.assertGreater(length, 0)
+            self.assertLessEqual(length, slot, msg="a round must fit one slot")
+            self.assertLessEqual(versatz + length, nbytes)
+            seen.extend(range(versatz, versatz + length))
         self.assertEqual(
             seen, list(range(nbytes)), msg=f"{nbytes} bytes not covered once"
         )
@@ -195,7 +195,7 @@ class TestBcPlanArithmetic(CustomTestCase):
         self.assertEqual(len(self._check_coverage(8, 4)), 2)
 
     def test_a_payload_just_over_the_slot(self):
-        """The case byte_beleg_broadcast drives: slot + 16."""
+        """The case byte_proof_broadcast drives: slot + 16."""
         plan = self._check_coverage(4096 + 16, 4096)
         self.assertEqual(plan, [(0, 4096), (4096, 16)])
 
@@ -254,9 +254,9 @@ def _lauf(welt, nbytes, src, slot):
         ergebnisse[r], tabellen[r] = _fahre(
             transporte[r], puffer[r].clone(), src
         )
-    # Was ueber die Apertur ging, ist im Rekorder nicht passiert: hier
-    # nachgezogen, aus der Tabelle des SENDERS gelesen und in die des
-    # EMPFAENGERS geschrieben -- eine vertauschte Zeile faellt damit auf.
+    # Whatever crossed the aperture did not happen in the recorder: it is
+    # replayed here, read from the SENDER's table and written into the
+    # RECEIVER's -- so a swapped row shows up.
     for k in range(len(tabellen[0])):
         for empf in range(welt):
             for send in range(welt):
@@ -337,7 +337,7 @@ class TestTheTableItBuilds(CustomTestCase):
                             self.assertEqual(
                                 tabellen[r][k]["e_len"][i],
                                 tabellen[i][k]["s_len"][r],
-                                msg=f"welt={welt} src={src} runde={k} "
+                                msg=f"welt={welt} src={src} round={k} "
                                     f"r={r} i={i}",
                             )
 
@@ -350,8 +350,8 @@ class TestTheTableItBuilds(CustomTestCase):
                         self.assertEqual(ruf["s_len"][r], ruf["e_len"][r])
 
     def test_the_round_count_is_the_same_on_every_rank(self):
-        # 3 volle Schlitze und ein Rest von 7 Byte -- vier Runden, und der
-        # Rest ist eine davon, keine Zugabe.
+        # 3 full slots and a remainder of 7 bytes -- four rounds, and the
+        # remainder is one of them, not an extra.
         tabellen = _tabellen(3, 3 * (8 << 20) + 7, src=2)
         self.assertEqual({len(a) for a in tabellen.values()}, {4})
 
@@ -420,7 +420,7 @@ class TestInPlaceContract(CustomTestCase):
         """``reshape(-1)`` copies there, so the result has to be copied back."""
         t = _stub(rank=0, welt=3)
         gross = torch.zeros((8, 4), dtype=torch.uint8)
-        sicht = gross[:, ::2]                     # nicht zusammenhaengend
+        sicht = gross[:, ::2]                     # not contiguous
         sicht.copy_(torch.arange(16, dtype=torch.uint8).reshape(8, 2))
         ergebnis, _ = _fahre(t, sicht, 0)
         self.assertIs(ergebnis, sicht)
@@ -436,7 +436,7 @@ class TestInPlaceContract(CustomTestCase):
         ergebnis, aufrufe = _fahre(t, tensor, 0)
         self.assertEqual(tuple(ergebnis.shape), (4, 8))
         self.assertEqual(ergebnis.dtype, torch.int64)
-        # 32 Elemente x 8 Byte -- der Kern rechnet in BYTE, nicht in Elementen.
+        # 32 elements x 8 bytes -- the kernel counts in BYTES, not elements.
         self.assertEqual(aufrufe[0]["s_len"][0], 256)
 
     def test_an_empty_tensor_is_a_no_op(self):
@@ -448,12 +448,12 @@ class TestInPlaceContract(CustomTestCase):
 
     def test_a_source_outside_the_group_is_refused(self):
         from sglang.srt.distributed.device_communicators.htccl_bar1 import (
-            Bar1Unverfuegbar,
+            Bar1Unavailable,
         )
 
         t = _stub(rank=0, welt=3)
         for src in (-1, 3, 99):
-            with self.assertRaises(Bar1Unverfuegbar):
+            with self.assertRaises(Bar1Unavailable):
                 _fahre(t, torch.zeros(64, dtype=torch.uint8), src)
 
 
@@ -469,7 +469,7 @@ class TestHandlesGate(CustomTestCase):
         """The whole point. Rejecting would abort a capture, not slow it."""
         t = _stub(a2a_schlitz=4096)
         self.assertTrue(t._handles_broadcast(4096 * 4))
-        self.assertEqual(t.bc_runden(4096 * 4), 4)
+        self.assertEqual(t.bc_rounds(4096 * 4), 4)
 
     def test_unaligned_payload_is_accepted(self):
         """Unlike all_reduce: the a2a kernel has a byte path for the tail."""
@@ -521,11 +521,11 @@ class TestHandlesGate(CustomTestCase):
         self.assertTrue(t.handles("all_gather", 65536))
 
 
-#: Die Leiter, an der jede neue Bedingung dieses Pfades gemessen wird --
-#: von einem Byte bis eine Runde ueber den Schlitz. ``slot`` ist klein
-#: gewaehlt, damit die Byte-Simulation je Groesse bezahlbar bleibt; die
-#: Verhaeltnisse (unter einem Paket, ueber einem Paket, genau ein Schlitz,
-#: einer drueber) sind dieselben wie bei 8 MiB.
+#: The ladder against which every new condition of this path is measured --
+#: from one byte to one round past the slot. ``slot`` is chosen small so
+#: the byte simulation stays affordable per size; the ratios (below one
+#: packet, above one packet, exactly one slot, one over) are the same as
+#: at 8 MiB.
 _SLOT = 1024
 _LEITER = (1, 4, 12, 128, 1024 - 1, 1024, 1024 + 1, 4096)
 
@@ -550,7 +550,7 @@ class TestTheShippedFloor(CustomTestCase):
             r"""os\.environ\.get\(\s*["']%s["']\s*,\s*["'](\d+)["']""" % name,
             text,
         )
-        self.assertIsNotNone(treffer, msg=f"{name} nicht im Quelltext")
+        self.assertIsNotNone(treffer, msg=f"{name} not in source")
         return treffer.group(1)
 
     def test_broadcast_floor_is_one_byte(self):
@@ -589,23 +589,23 @@ class TestTheSizeLadder(CustomTestCase):
     def test_the_gate_says_yes_to_every_rung(self):
         for n in _LEITER:
             self.assertTrue(
-                self._stub().handles("broadcast", n), msg=f"{n} B abgelehnt"
+                self._stub().handles("broadcast", n), msg=f"{n} B rejected"
             )
 
     def test_the_plan_covers_every_rung_exactly_once(self):
         for n in _LEITER:
             plan = bc_plan(n, _SLOT)
             gesehen = []
-            for versatz, laenge in plan:
-                self.assertGreater(laenge, 0, msg=f"{n} B: Leerrunde")
-                self.assertLessEqual(laenge, _SLOT, msg=f"{n} B")
-                gesehen.extend(range(versatz, versatz + laenge))
+            for versatz, length in plan:
+                self.assertGreater(length, 0, msg=f"{n} B: empty round")
+                self.assertLessEqual(length, _SLOT, msg=f"{n} B")
+                gesehen.extend(range(versatz, versatz + length))
             self.assertEqual(gesehen, list(range(n)), msg=f"{n} B")
 
     def test_the_round_count_matches_the_gate(self):
         for n in _LEITER:
             self.assertEqual(
-                len(bc_plan(n, _SLOT)), self._stub().bc_runden(n), msg=f"{n} B"
+                len(bc_plan(n, _SLOT)), self._stub().bc_rounds(n), msg=f"{n} B"
             )
 
     def test_the_rung_below_one_packet_is_a_single_ragged_round(self):
@@ -616,7 +616,7 @@ class TestTheSizeLadder(CustomTestCase):
         ladder exercises.
         """
         self.assertEqual(bc_plan(12, _SLOT), [(0, 12)])
-        self.assertEqual(self._stub().bc_runden(12), 1)
+        self.assertEqual(self._stub().bc_rounds(12), 1)
 
     def test_every_rung_delivers_the_right_bytes(self):
         for n in _LEITER:
@@ -633,7 +633,7 @@ class TestTheSizeLadder(CustomTestCase):
                         self.assertEqual(
                             tabellen[r][k]["e_len"][i],
                             tabellen[i][k]["s_len"][r],
-                            msg=f"n={n} runde={k} r={r} i={i}",
+                            msg=f"n={n} round={k} r={r} i={i}",
                         )
 
 
@@ -655,7 +655,7 @@ class TestLoudBar(CustomTestCase):
 
         t = _stub(a2a_schlitz=8384512)
         c = self._comm(t)
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             self.assertIs(
                 mod.HTCCLCommunicator._select(c, "broadcast", ABNAHME_BYTES),
                 t,
@@ -665,7 +665,7 @@ class TestLoudBar(CustomTestCase):
         from sglang.srt.distributed.device_communicators import htccl as mod
 
         c = self._comm(_stub())
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             with self.assertRaises(RuntimeError) as ctx:
                 mod.HTCCLCommunicator._select(c, "reduce_scatter", 4096)
         text = str(ctx.exception)
@@ -688,7 +688,7 @@ class TestLoudBar(CustomTestCase):
 
         t = _stub(a2a_schlitz=1024, bc_max_runden=4)
         c = self._comm(t)
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             with self.assertRaises(RuntimeError) as ctx:
                 mod.HTCCLCommunicator._select(c, "broadcast", 1024 * 4 + 1)
         self.assertIn("broadcast", str(ctx.exception))
@@ -705,7 +705,7 @@ class TestLoudBar(CustomTestCase):
 
         t = _stub()
         c = self._comm(t)
-        with mock.patch.object(mod, "graph_erfassung_laeuft", lambda: True):
+        with mock.patch.object(mod, "graph_capture_running", lambda: True):
             for n in (1, 4, 12, 128):
                 self.assertIs(
                     mod.HTCCLCommunicator._select(c, "broadcast", n), t,

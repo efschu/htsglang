@@ -1,94 +1,96 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""HTCCL gegen NCCL, all_reduce und all_to_all, verschraenkt im selben Lauf.
+"""HTCCL against NCCL, all_reduce and all_to_all, interleaved in the same run.
 
-WOZU
-====
-Der Host-Transport (`SGLANG_HTCCL_TRANSPORT=host`, siehe
-python/sglang/srt/distributed/device_communicators/htccl_host.py) bewegt die
-Nutzlast ueber EIN gepinntes, portables Host-Segment und wird komplett von
-zwei Kerneln getrieben -- kein Host-Sync, keine Allokation im heissen Pfad,
-Fertigmeldung ueber Flaggen im gepinnten Speicher. Auf diesem Rig lag der
-schlichte gepinnte Host-Weg bei 20 KiB Ping-Pong bei 7,30 us gegen 37,41 us
-fuer NCCL. Dieses Programm prueft, was davon auf der KOLLEKTIV-Ebene ankommt.
+WHY
+===
+The host transport (`SGLANG_HTCCL_TRANSPORT=host`, see
+python/sglang/srt/distributed/device_communicators/htccl_host.py) moves the
+payload over ONE pinned, portable host segment and is driven entirely by two
+kernels -- no host sync, no allocation in the hot path, completion signaled
+via flags in pinned memory. On this rig the plain pinned host path measured
+7.30 us against 37.41 us for NCCL at 20 KiB ping-pong. This program checks
+how much of that arrives at the COLLECTIVE level.
 
-    Alle Zeiten sind die VOLLE Operationsdauer EINER Operation.
-    Weder all_reduce noch all_to_all haben einen "halben Weg". NICHT
-    mit den Punkt-zu-Punkt-Zahlen (halber Round-trip) verrechnen.
+    All times are the FULL operation duration of ONE operation. Neither
+    all_reduce nor all_to_all has a "half path". Do NOT compare these
+    against point-to-point numbers (half round-trip).
 
-WAS GEMESSEN WIRD (--op)
+WHAT IS MEASURED (--op)
 ========================
-``all_reduce``  wie gehabt.
-``all_to_all``  ``all_to_all_single`` entlang Achse 0, in zwei
-                Verteilungsmustern, weil MoE beide erzeugt:
+``all_reduce``  as usual.
+``all_to_all``  ``all_to_all_single`` along axis 0, in two
+                distribution patterns, because MoE produces both:
 
-                * ``gleich``: jeder Zielrang bekommt gleich viele Zeilen.
-                * ``schief``: Rang 0 bekommt von JEDEM das ``--schief``-fache
-                  der anderen -- der heisse Experte, der Incast-Fall.
+                * ``gleich`` ("equal"): every destination rank gets the
+                  same number of rows.
+                * ``schief`` ("skewed"): rank 0 gets ``--schief`` times as
+                  many rows from EVERY sender as the others do -- the hot
+                  expert, the incast case.
 
-                Die Zeilenbreite kommt aus ``--hidden`` (Elemente je Zeile);
-                die tatsaechlich gemessene Nutzlast wird auf ein Vielfaches
-                von Zeilenbreite mal Rangzahl abgerundet und AUSGEWIESEN.
-``beide``       nacheinander, in einem Lauf.
+                The row width comes from ``--hidden`` (elements per row);
+                the actually measured payload is rounded down to a
+                multiple of row width times rank count, and REPORTED as
+                such.
+``beide`` ("both")  one after the other, in a single run.
 
-Fuer all_to_all wird der BAR1-Direktpfad **vor** der Messung gefragt, ob er
-diese Zelle wirklich faehrt (``handles`` plus ``traegt_a2a`` mit dem
-groessten Block ueber alle Paare). Sagt er nein -- typischerweise, weil ein
-schiefer Block die Schlitzgrenze sprengt -- wird die Zelle mit Grund als tot
-gefuehrt und NICHT ersatzweise ueber die gloo-Ebene gemessen und BAR1
-genannt.
+For all_to_all, the BAR1 direct path is asked **before** the measurement
+whether it genuinely runs this cell (``handles`` plus ``supports_a2a`` with
+the largest block over all pairs). If it says no -- typically because a
+skewed block exceeds the slot limit -- the cell is carried as dead, with a
+reason, and is NOT measured over the gloo layer instead and reported as BAR1.
 
-MESSDISZIPLIN (eingebaut, nicht optional)
-=========================================
-* **Vorlauf ist Pflicht.** Ohne ihn wurden auf diesem Rig 726 us statt 95 us
-  gemessen -- Faktor 7,6 allein aus der P-State-Rampe. Das Vorlaufbudget je
-  Zelle ist auf mindestens 3 s festgenagelt; ein kleinerer --warmup wird
-  hochgesetzt und das Hochsetzen gemeldet.
-* **Verschraenkt, nicht blockweise.** Je Runde eine kurze Serie pro Zelle,
-  Reihenfolge je Runde rotiert. Drift, Fremdlast und Taktverhalten treffen
-  damit alle Backends gleich.
-* **Erst Korrektheit, dann Zeit.** Jede Runde beginnt mit einer
-  Bekannt-Antwort-Pruefung je Zelle. Wer sie nicht besteht, wird ab dieser
-  Runde nicht mehr gemessen und im Bericht mit Grund gefuehrt.
-* **Tote Varianten mit Grund, nie stiller Rueckfall.** Kommt ein Transport
-  nicht hoch, oder ist der aktive Transport nicht der angeforderte (htccl.py
-  faellt bei manchen Namen still auf die gloo-Inline-Ebene zurueck), wird das
-  Backend auf ALLEN Raengen verworfen und der Grund gedruckt. Es wird nie
-  ersatzweise etwas anderes gemessen und als das Angeforderte ausgegeben.
+MEASUREMENT DISCIPLINE (built in, not optional)
+=================================================
+* **Warmup is mandatory.** Without it, this rig measured 726 us instead of
+  95 us -- a factor of 7.6 from the P-state ramp alone. The warmup budget
+  per cell is pinned to at least 3 s; a smaller --warmup is raised, and the
+  raise is reported.
+* **Interleaved, not block-wise.** Each round runs a short series per cell,
+  with the order rotated per round. That way drift, external load and clock
+  behavior hit every backend equally.
+* **Correctness first, then timing.** Every round starts with a
+  known-answer check per cell. Whichever cell fails it is no longer measured
+  from that round on, and is carried in the report with a reason.
+* **Dead variants with a reason, never a silent fallback.** If a transport
+  fails to come up, or the active transport is not the one requested
+  (htccl.py silently falls back to the gloo inline layer for some names),
+  the backend is dropped on ALL ranks and the reason is printed. Something
+  else is never measured as a substitute and reported as the one requested.
 
-VERGLEICHBARKEIT, ehrlich
+COMPARABILITY, honestly
 =========================
-* HTCCL `all_reduce` ist AUSSER-PLATZ (liefert einen neuen Tensor), NCCLs
-  `dist.all_reduce` ist AN-PLATZ. Der Host-Transport schreibt also zusaetzlich
-  ein volles Ergebnis in einen frischen Puffer. Der Vergleich ist damit, wenn
-  ueberhaupt, zu Ungunsten von HTCCL verzerrt -- nicht zu seinen Gunsten.
-* Die Fertigmeldung im Messpfad ist fuer BEIDE Backends dieselbe:
-  `--completion sync` (Vorgabe) ruft `torch.cuda.synchronize`,
-  `--completion event` pollt ein `cuda.Event`. Der Transport selbst
-  synchronisiert nie mit dem Host; der Messpfad tut es nur, um einen
-  Zeitstempel zu bekommen, und fuer alle Backends identisch.
+* HTCCL's `all_reduce` is OUT-OF-PLACE (returns a new tensor), NCCL's
+  `dist.all_reduce` is IN-PLACE. The host transport therefore additionally
+  writes a full result into a fresh buffer. If anything, the comparison is
+  skewed AGAINST HTCCL -- not in its favor.
+* The completion signal in the measurement path is the same for BOTH
+  backends: `--completion sync` (default) calls `torch.cuda.synchronize`,
+  `--completion event` polls a `cuda.Event`. The transport itself never
+  synchronizes with the host; the measurement path only does so to get a
+  timestamp, and does so identically for every backend.
 
-DEADLOCK-VORSICHT
-=================
-In diesem Projekt gab es bereits einen Deadlock, weil jeder Rang seine
-Rundenzahl lokal hochrechnete. Hier gilt: Pilotlauf mit FESTER, fuer alle
-Raenge identischer Iterationszahl; Rang 0 rechnet daraus den Plan und
-verteilt ihn per broadcast_object_list; jede Verwerfung eines Backends wird
-per all_gather_object gemeinsam beschlossen. Dazu gloo-Timeout, harter
-Watchdog je Rang und Gesamtzeitlimit im Elternprozess.
+DEADLOCK CAUTION
+================
+This project already had a deadlock once, because every rank computed its
+own round count locally. Here the rule is: a pilot run with a FIXED
+iteration count identical across all ranks; rank 0 computes the plan from
+it and distributes it via broadcast_object_list; every backend dropout is
+decided jointly via all_gather_object. On top of that: a gloo timeout, a
+hard watchdog per rank, and an overall time limit in the parent process.
 
-AUFRUF
-======
+INVOCATION
+==========
     python3 benchmark/bench_host_transport.py --devices 1,2
     python3 benchmark/bench_host_transport.py --devices 1,2,3 \
         --op all_to_all --backends htccl:bar1,nccl
 
-Die Rangzahl folgt aus ``--devices``; es sind nicht mehr fest zwei.
+The rank count follows from ``--devices``; it is no longer fixed at two.
 
-Weitere Schalter: --op, --hidden, --schief, --sizes, --backends, --secs,
---warmup, --rounds, --dtype, --slot-mib, --completion, --out, --devices. Die
-Karten muessen frei sein; das Programm verdraengt nichts und bricht ab, wenn
-auf einer Zielkarte mehr als --max-used-mib belegt ist.
+Other flags: --op, --hidden, --schief, --sizes, --backends, --secs,
+--warmup, --rounds, --dtype, --slot-mib, --completion, --out, --devices. The
+cards must be free; the program does not preempt anything and aborts if more
+than --max-used-mib is in use on a target card.
 """
 from __future__ import annotations
 
@@ -433,7 +435,7 @@ def run_rank(a: argparse.Namespace) -> int:
     #
     # Ein schiefer Block sprengt bei grossen Nutzlasten die Schlitzgrenze.
     # Dann faellt HTCCLCommunicator.all_to_all_single auf die CPU-Ebene
-    # zurueck -- das ist richtig, aber es waere hier eine Messung der
+    # zurueck -- das ist richtig, aber es waere hier eine Measurement der
     # gloo-Ebene unter dem Namen des Direktpfads. Also vorher fragen und die
     # Zelle sonst mit Grund verwerfen.
     for cell in list(cells):
@@ -449,11 +451,11 @@ def run_rank(a: argparse.Namespace) -> int:
             grund = (
                 f"handles('all_to_all', {a2a_tot[(nb, muster)]}) sagt False"
             )
-        elif not getattr(tr, "traegt_a2a", lambda _: False)(g["max_block"]):
-            schlitz = getattr(tr, "a2a_schlitz_bytes", lambda: 0)()
+        elif not getattr(tr, "supports_a2a", lambda _: False)(g["max_block"]):
+            slot = getattr(tr, "a2a_slot_bytes", lambda: 0)()
             grund = (
                 f"groesster Block {g['max_block']} B passt nicht in den "
-                f"Schlitz von {schlitz} B"
+                f"Schlitz von {slot} B"
             )
         votes: list = [None] * world
         dist.all_gather_object(votes, grund, group=gloo_pg)
@@ -463,7 +465,7 @@ def run_rank(a: argparse.Namespace) -> int:
             dead[f"{be} @ all_to_all/{muster} {a2a_tot[(nb, muster)]} B"] = (
                 "Direktpfad meldet sich ab -- " + "; ".join(bad)
                 + ". Es wird NICHT ersatzweise die CPU-Ebene gemessen. "
-                "Groesseres Fenster: --bar1-fenster-mib erhoehen (der "
+                "Groesseres Fenster: --bar1-window-mib erhoehen (der "
                 "a2a-Schlitz ist rund Fenster/(6(R-1)))."
             )
     if not cells:
@@ -567,7 +569,7 @@ def run_rank(a: argparse.Namespace) -> int:
     log(f"# Vorlauf fertig in {time.time() - t0:.1f} s "
         f"(Budget {a.warmup:.1f} s je Zelle)")
 
-    # ---------------- Messung, verschraenkt ----------------
+    # ---------------- Measurement, verschraenkt ----------------
     lat: dict[tuple, list[float]] = {c: [] for c in cells}
     live = list(cells)
     t0 = time.time()
@@ -611,9 +613,9 @@ def run_rank(a: argparse.Namespace) -> int:
             print(f"# Runde {rnd + 1}/{a.rounds} nach {time.time() - t0:.1f} s",
                   flush=True)
         if time.time() - t0 > a.secs * len(cells) * 3 + 60:
-            log("# Zeitbudget erschoepft, Messung wird hier beendet.")
+            log("# Zeitbudget erschoepft, Measurement wird hier beendet.")
             break
-    log(f"# Messung fertig in {time.time() - t0:.1f} s")
+    log(f"# Measurement fertig in {time.time() - t0:.1f} s")
 
     # ---------------- Ergebnis ----------------
     res = {c: summarize(v, zellbytes(c)) for c, v in lat.items() if v}
@@ -833,8 +835,8 @@ def main() -> int:
     ap.add_argument("--slot-mib", type=int, default=32,
                     help="SGLANG_HTCCL_SLOT_MIB fuer die Kindprozesse; muss "
                          "mindestens die groesste Nutzlast fassen")
-    ap.add_argument("--bar1-fenster-mib", type=int, default=0,
-                    help="SGLANG_HTCCL_BAR1_FENSTER_MIB fuer die "
+    ap.add_argument("--bar1-window-mib", type=int, default=0,
+                    help="SGLANG_HTCCL_BAR1_WINDOW_MIB fuer die "
                          "Kindprozesse (0 = Vorgabe des Moduls, 96). Der "
                          "a2a-Schlitz je gerichtetem Paar ist rund "
                          "Fenster/(6(R-1)); ein schiefer Block darueber "
@@ -890,7 +892,7 @@ def main() -> int:
            "PYTHONPATH": a.sglang_python + ":" + os.environ.get("PYTHONPATH", ""),
            "PYTHONUNBUFFERED": "1"}
     if a.bar1_fenster_mib:
-        env["SGLANG_HTCCL_BAR1_FENSTER_MIB"] = str(a.bar1_fenster_mib)
+        env["SGLANG_HTCCL_BAR1_WINDOW_MIB"] = str(a.bar1_fenster_mib)
     base = [sys.executable, os.path.abspath(__file__)]
     for k, v in vars(a).items():
         if k == "rank":

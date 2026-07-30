@@ -1,85 +1,84 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HTCCL-Pfadmatrix: der Planer.
+"""HTCCL path matrix: the planner.
 
-Der Planer misst beim Start die **gerichteten** Kanten des Verbundes und
-leitet daraus Rollen, Domaenen, Algorithmus, Chunkgroesse, Aufteilung und
-einen Fan-in-Staffelplan ab.
+At startup, the planner measures the **directed** edges of the ensemble
+and derives from them roles, domains, algorithm, chunk size, split, and a
+fan-in staging schedule.
 
-Vier Grundsaetze, die den ganzen Aufbau tragen:
+Four principles carry the whole design:
 
-1. **Gemessen, nicht abgeleitet.** Es wird keine ``lspci``-Breite als
-   Wahrheit genommen. ``lspci`` sagt x8; ob die Kante 12,7 GB/s traegt,
-   entscheidet die Messung. Die Linkbreite darf hoechstens als
-   Startschaetzung dienen und wird deshalb nur fuer *Unentschieden*
-   (Ringreihenfolge) und fuer die Plausibilitaetsmeldung gelesen, nie als
-   Entscheidungsgrundlage.
-2. **Faehigkeit und Politik getrennt.** Was die Hardware kann, wird
-   gemessen (``Messung``); was benutzt wird, wird konfiguriert
-   (``HtcclKonfig``). Beides beruehrt sich erst in ``plane()``.
-3. **Erklaerbar.** ``Plan.erklaerung()`` gibt die gemessenen Kapazitaeten,
-   die daraus folgenden Rollen und den gewaehlten Algorithmus samt
-   Vorhersagezeiten aus. Ohne das debuggt niemand auf fremder Hardware.
-4. **Auf jeder Ebene ueberstimmbar.** Planer aus, einzelne Rolle
-   festnageln, Domaenen von Hand, Algorithmus erzwingen, Chunk erzwingen,
-   Aufteilung erzwingen -- und das ist zugleich der einzige Weg, den Planer
-   gegen sich selbst zu messen.
+1. **Measured, not derived.** No ``lspci`` width is taken as truth.
+   ``lspci`` says x8; whether the edge actually carries 12.7 GB/s is
+   decided by the measurement. The link width may serve, at most, as a
+   starting estimate, and is therefore only read for *tie-breaks* (ring
+   ordering) and for the plausibility report, never as a basis for a
+   decision.
+2. **Capability and policy are kept separate.** What the hardware can do
+   is measured (``Measurement``); what gets used is configured
+   (``HtcclConfig``). The two only meet in ``plan_collective()``.
+3. **Explainable.** ``Plan.explanation()`` prints the measured
+   capacities, the roles that follow from them, and the chosen algorithm
+   together with predicted times. Without this, nobody can debug this on
+   unfamiliar hardware.
+4. **Overridable at every level.** Planner off, pin an individual role,
+   set domains by hand, force the algorithm, force the chunk size, force
+   the split -- and this is also the only way to measure the planner
+   against itself.
 
-**Der Eintrag gehoert an die gerichtete Kante (Quelle->Ziel), nicht an die
-Verbindung.** PCIe ist vollduplex, Aus- und Eingang sind getrennte
-Budgets; die Zuordnung darf asymmetrisch sein.
+**The entry belongs to the directed edge (source->destination), not to
+the link.** PCIe is full duplex, outbound and inbound are separate
+budgets; the assignment is allowed to be asymmetric.
 
-Entscheidungsregeln und ihre Belege
------------------------------------
-Alle vier stammen aus Messungen dieses Rigs; die Belege stehen in
-``/spinning/nvidia-smallbar-p2p/MESSUNG_NEBENLAEUFIGKEIT.md``. Sie sind
-hier als *Modell* codiert, dessen Parameter aus der Startmessung kommen --
-nicht als eingebaute Zahlen.
+Decision rules and their evidence
+------------------------------------
+All four come from measurements on this rig; the evidence lives in
+``/spinning/nvidia-smallbar-p2p/MESSUNG_NEBENLAEUFIGKEIT.md``. Here they
+are encoded as a *model* whose parameters come from the startup
+measurement -- not as hardcoded numbers.
 
-R1  **Netz gegen Ring.** Unterhalb der Saettigung ist die Gleichzeitigkeit
-    des Netzes gratis (gemessener Quotient 0,99 bei 20 KiB), und das Netz
-    braucht nur 2 statt 2(R-1) Schritte -> Netz. An der Saettigung bringt
-    die Gleichzeitigkeit nichts (1,03x bei 1 MiB) **und** die Aufteilung
-    ist gleichmaessig statt proportional, verschenkt also die schnellen
-    Kanten -> Ring. Codiert in ``_zeit_netz`` / ``_zeit_ring``: der
-    Netz-Term teilt den gemessenen Fan-in-Deckel *gleichmaessig* je Quelle
-    auf, der Ring-Term nicht.
+R1  **Mesh vs. ring.** Below saturation, the mesh's concurrency is free
+    (measured ratio 0.99 at 20 KiB), and the mesh needs only 2 steps
+    instead of 2(R-1) -> mesh. At saturation, concurrency buys nothing
+    (1.03x at 1 MiB) **and** the split is even rather than proportional,
+    so it wastes the fast edges -> ring. Encoded in ``_time_mesh`` /
+    ``_time_ring``: the mesh term splits the measured fan-in cap *evenly*
+    per source, the ring term does not.
 
-R2  **Blaetter.** Wessen gemessene Kapazitaet deutlich unter dem Median
-    liegt, traegt keinen Transitverkehr. Liegen alle gleichauf, gibt es
-    keine Blaetter und es bleibt beim flachen Verfahren. Schwelle
-    ``blatt_schwelle`` (Vorgabe 0,6 x Median).
+R2  **Leaves.** Whoever's measured capacity sits clearly below the
+    median carries no transit traffic. If everyone is roughly level,
+    there are no leaves and the flat scheme is kept. Threshold
+    ``blatt_schwelle`` (default 0.6 x median).
 
-R3  **Fan-in-Deckel.** In keine Karte gehen mehr als der gemessene Deckel
-    hinein, unabhaengig von der Zahl der Quellen (dieses Rig: ~13 GB/s).
-    Der Deckel wird **gleichmaessig je Quelle** aufgeteilt, nicht
-    proportional -- die x8-Quelle fiel von 12,81 auf 6,75 GB/s, die
-    x4-Quelle behielt ihre 6,46. Folge: eine schnelle und eine langsame
-    Karte nie gleichzeitig ins selbe Ziel schreiben lassen, sondern
-    staffeln (``Plan.staffeln``).
+R3  **Fan-in cap.** No card receives more than its measured cap,
+    regardless of the number of sources (this rig: ~13 GB/s). The cap is
+    split **evenly per source**, not proportionally -- the x8 source
+    dropped from 12.81 to 6.75 GB/s, the x4 source kept its 6.46. Hence:
+    never let a fast and a slow card write into the same destination at
+    the same time; stagger them instead (``Plan.staffeln``).
 
-R4  **Vollduplex verdoppelt nicht.** Bei Saettigung faellt jede Richtung
-    auf ~65 %, Summe 1,32x. Unterhalb der Saettigung ist es fast gratis
-    (0,99 bei 20 KiB). Der Faktor wird gemessen (``Messung.duplex``) und
-    geht als Ueberlappungsgutschrift in die Pipelining-Rechnung ein --
-    nirgends steht eine 2 im Code.
+R4  **Full duplex does not double.** At saturation each direction drops
+    to ~65%, sum 1.32x. Below saturation it is nearly free (0.99 at
+    20 KiB). The factor is measured (``Measurement.duplex``) and enters
+    the pipelining calculation as an overlap credit -- nowhere in the code
+    is there a hardcoded 2.
 
-Was der Planer NICHT tut
-------------------------
-Er waehlt keinen Pfad je Kante (BAR1 / NIC / System-RAM). Das ist Aufgabe
-des zusammengesetzten Transports (``htccl_bar1.py`` liefert einen der
-Unterpfade). Der Planer beantwortet die davon getrennte Frage: welche
-*Rolle* hat jeder Rang und mit welchem *Algorithmus* wird zerlegt. Die
-beiden Ebenen treffen sich ueber ``Fuehler``: wer einen echten
-Punkt-zu-Punkt-Pfad hat, reicht ihn als Paar-Fuehler herein und bekommt
-echte Kantenmessungen statt der Eigenlast-Schaetzung.
+What the planner does NOT do
+--------------------------------
+It does not choose a path per edge (BAR1 / NIC / system RAM). That is the
+job of the composite transport (``htccl_bar1.py`` supplies one of the
+sub-paths). The planner answers the separate question: which *role* does
+each rank have, and with which *algorithm* is the collective decomposed.
+The two levels meet via ``Sensor``: whoever has a real point-to-point path
+hands it in as a pair sensor and gets real edge measurements instead of
+the self-load estimate.
 
-Rangeinheitlichkeit
+Rank uniformity
 -------------------
-Der Plan MUSS auf jedem Rang identisch sein -- die SPMD-Annahme der
-Kollektive haengt daran. Deshalb: messen, Rohwerte quantisiert per
-``all_gather_object`` teilen, jeder Rang rechnet aus **denselben** Daten
-mit demselben Code, danach Abgleich der Planpruefsumme ueber die Gruppe.
-Weicht ein Rang ab, ist das ein benannter Startfehler, keine Warnung.
+The plan MUST be identical on every rank -- the collectives' SPMD
+assumption depends on it. Hence: measure, share the quantized raw values
+via ``all_gather_object``, every rank computes from the **same** data with
+the same code, then reconcile the plan checksum across the group. If a
+rank diverges, that is a named startup error, not a warning.
 """
 
 from __future__ import annotations
@@ -96,89 +95,94 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
+from sglang.srt.distributed.device_communicators import (
+    htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+)
+
 logger = logging.getLogger(__name__)
 
-# Fingerabdruck-Bestandteil: aendert sich die Planlogik, ist ein alter
-# Zwischenspeicher ungueltig, auch wenn die Hardware dieselbe ist.
+# Fingerprint component: if the planning logic changes, an old cache
+# entry becomes invalid even when the hardware is the same.
 PLANER_VERSION = 1
 
-# Vorgabe-Groessenleiter der Messung, in KiB. Die drei Punkte sind die
-# Betriebspunkte, um die es geht: Decode (20), Uebergang (80), Prefill (1024).
+# Default size ladder for the measurement, in KiB. The three points are
+# the operating regimes that matter: decode (20), transition (80),
+# prefill (1024).
 VORGABE_GROESSEN_KIB = (20, 80, 1024)
 
-ALGORITHMEN = ("netz", "ring", "stern", "hierarchisch")
+ALGORITHMEN = ("mesh", "ring", "star", "hierarchisch")
 PLANER_MODI = ("auto", "fest", "aus")
 NIC_MODI = ("nie", "bei_bedarf", "immer")
 ROLLEN = ("blatt", "domaene", "nabe")
 
 # ---------------------------------------------------------------------------
-# Referenzwerte dieses Rigs -- NUR zur Plausibilitaetsmeldung.
+# Reference values for this rig -- ONLY for the plausibility report.
 #
-# Sie gehen in KEINE Entscheidung ein. Weicht eine Startmessung stark ab,
-# wird das protokolliert, damit ein kaputter Messaufbau auffaellt, bevor er
-# als Rig-Eigenheit durchgeht. Beleg: MESSUNG_NEBENLAEUFIGKEIT.md.
+# They feed into NO decision. If a startup measurement deviates sharply,
+# that is logged, so a broken measurement setup stands out instead of
+# passing as a rig quirk. Evidence: MESSUNG_NEBENLAEUFIGKEIT.md.
 # ---------------------------------------------------------------------------
-_BELEG_FANIN_GBPS = 13.16          # Deckel bei 1 MiB, zwei Quellen
-_BELEG_DUPLEX_SUMME_1MIB = 1.32    # Summe beider Richtungen / eine Richtung
+_BELEG_FANIN_GBPS = 13.16          # cap at 1 MiB, two sources
+_BELEG_DUPLEX_SUMME_1MIB = 1.32    # sum of both directions / one direction
 _BELEG_DUPLEX_SUMME_20KIB = 1.47
 
 
 # ===========================================================================
-# Konfiguration
+# Configuration
 # ===========================================================================
 
 
-class KonfigFehler(ValueError):
-    """Benannter Fehler in der Konfiguration -- nie stillschweigend geheilt."""
+class ConfigError(ValueError):
+    """A named configuration error -- never silently healed."""
 
 
 @dataclass(frozen=True)
-class MessKonfig:
-    """Was der Planer beim Start misst und wie lange er dafuer darf."""
+class MeasureConfig:
+    """What the planner measures at startup, and how long it's allowed to take."""
 
     groessen_kib: tuple[int, ...] = VORGABE_GROESSEN_KIB
     wiederholungen: int = 32
     vorlauf: int = 8
-    # Obergrenze fuer die gesamte Startmessung. Wird sie ueberschritten,
-    # duennt der Planer die Groessenleiter und dann die Wiederholungen aus
-    # und protokolliert das -- er bricht NICHT ab und rechnet auch nicht
-    # heimlich mit weniger Belegen weiter, ohne es zu sagen.
+    # Ceiling for the entire startup measurement. If it's exceeded, the
+    # planner thins out the size ladder and then the repetition count,
+    # and logs it -- it does NOT abort, and it does not quietly keep going
+    # with fewer samples without saying so.
     budget_ms: float = 2000.0
-    # Fan-in (R3) und Duplex (R4) kosten eigene Runden. Abschaltbar, weil
-    # sie nur mit einem Paar-Fuehler echte Werte liefern.
+    # Fan-in (R3) and duplex (R4) cost their own rounds. Can be disabled,
+    # because they only produce real values with a pair sensor.
     fanin: bool = True
     duplex: bool = True
-    # Zwischenspeicher der Matrix samt Fingerabdruck. None = Vorgabepfad.
+    # Cache of the matrix plus its fingerprint. None = default path.
     cache: Optional[str] = None
     cache_aus: bool = False
 
 
 @dataclass(frozen=True)
-class KollektivKonfig:
-    planer: str = "auto"                 # auto | fest | aus
-    algorithmus: str = "auto"            # auto | netz | ring | stern | hierarchisch
+class CollectiveConfig:
+    planer: str = "auto"                 # auto | fest | aus  (auto | fixed | off)
+    algorithmus: str = "auto"            # auto | mesh | ring | star | hierarchisch (hierarchical)
     chunk_kib: Optional[int] = None      # None == "auto"
-    blatt_schwelle: float = 0.6          # Kapazitaet < 0,6 x Median -> Blatt
-    aufteilung: Any = "auto"             # auto | gleich | proportional | {bdf: [...]}
-    rollen: Mapping[str, str] = field(default_factory=dict)      # bdf -> Rolle
-    domaenen: tuple[tuple[str, ...], ...] = ()                   # Listen von BDFs
-    # R3: innerhalb einer Fan-in-Welle duerfen sich die Quellkapazitaeten
-    # hoechstens um diesen Faktor unterscheiden. Darueber wird gestaffelt.
+    blatt_schwelle: float = 0.6          # capacity < 0.6 x median -> leaf
+    aufteilung: Any = "auto"             # auto | gleich | proportional | {bdf: [...]}  (auto | even | proportional)
+    roles: Mapping[str, str] = field(default_factory=dict)      # bdf -> role
+    domaenen: tuple[tuple[str, ...], ...] = ()                   # lists of BDFs
+    # R3: within one fan-in wave, source capacities may differ by at most
+    # this factor. Beyond it, they get staggered.
     staffel_verhaeltnis: float = 1.5
-    # Anteil der gemessenen Kapazitaet, ab dem eine Kante als gesaettigt
-    # gilt. Nur fuer die Erklaerung/Meldung -- die Wahl selbst faellt ueber
-    # den Kostenvergleich, nicht ueber diese Schwelle.
+    # Fraction of the measured capacity above which an edge counts as
+    # saturated. Only used for the explanation/report -- the actual
+    # decision is made via the cost comparison, not via this threshold.
     saettigung_anteil: float = 0.75
-    mess: MessKonfig = field(default_factory=MessKonfig)
+    mess: MeasureConfig = field(default_factory=MeasureConfig)
 
 
 @dataclass(frozen=True)
-class HtcclKonfig:
-    kollektiv: KollektivKonfig = field(default_factory=KollektivKonfig)
-    nic: str = "nie"                     # nie | bei_bedarf | immer
+class HtcclConfig:
+    kollektiv: CollectiveConfig = field(default_factory=CollectiveConfig)
+    nic: str = "nie"                     # nie | bei_bedarf | immer  (never | on_demand | always)
 
 
-# -- Datei -----------------------------------------------------------------
+# -- File --------------------------------------------------------------
 
 _MESS_SCHLUESSEL = {
     "groessen_kib", "wiederholungen", "vorlauf", "budget_ms",
@@ -186,7 +190,7 @@ _MESS_SCHLUESSEL = {
 }
 _KOLLEKTIV_SCHLUESSEL = {
     "planer", "algorithmus", "chunk_kib", "blatt_schwelle", "aufteilung",
-    "rollen", "domaenen", "staffel_verhaeltnis", "saettigung_anteil", "mess",
+    "roles", "domaenen", "staffel_verhaeltnis", "saettigung_anteil", "mess",
 }
 _WURZEL_SCHLUESSEL = {"kollektiv", "nic"}
 
@@ -200,46 +204,47 @@ def _bool(wert: Any, wo: str) -> bool:
             return True
         if s in ("0", "nein", "false", "aus", "no"):
             return False
-    raise KonfigFehler(f"{wo}: {wert!r} ist kein Wahrheitswert")
+    raise ConfigError(f"{wo}: {wert!r} is not a boolean value")
 
 
-def _pruefe_schluessel(gegeben: Iterable[str], erlaubt: set[str], wo: str) -> None:
+def _check_key(gegeben: Iterable[str], erlaubt: set[str], wo: str) -> None:
     unbekannt = sorted(set(gegeben) - erlaubt)
     if unbekannt:
-        raise KonfigFehler(
-            f"{wo}: unbekannte Schluessel {unbekannt}; erlaubt sind "
-            f"{sorted(erlaubt)}. (Ein stillschweigend ignorierter Tippfehler "
-            f"in der Konfiguration ist genau die Sorte Fehler, nach der man "
-            f"spaeter Leistung sucht, die per Konfiguration abgeschaltet war.)"
+        raise ConfigError(
+            f"{wo}: unknown keys {unbekannt}; allowed are "
+            f"{sorted(erlaubt)}. (A silently ignored typo in the "
+            f"configuration is exactly the kind of bug that later sends "
+            f"someone hunting for performance that was switched off by "
+            f"configuration.)"
         )
 
 
-#: Eine PCI-Adresse, mit oder ohne Domaene. Dient als Probe gegen alles,
-#: was nur wie eine aussieht (etwa eine blosse Busnummer).
+#: A PCI address, with or without a domain. Serves as a probe against
+#: anything that merely looks like one (e.g. a bare bus number).
 _IST_BDF = re.compile(r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
 
 
 def _norm_bdf(s: str) -> str:
-    """``05:00.0`` und ``0000:05:00.0`` sind derselbe Schluessel."""
+    """``05:00.0`` and ``0000:05:00.0`` are the same key."""
     s = str(s).strip().lower()
     if s.count(":") == 1:
         s = "0000:" + s
     return s
 
 
-def _lies_datei(pfad: str) -> dict:
+def _read_file(pfad: str) -> dict:
     p = pathlib.Path(pfad).expanduser()
     if not p.is_file():
-        raise KonfigFehler(f"Konfigurationsdatei {pfad!r} existiert nicht")
+        raise ConfigError(f"config file {pfad!r} does not exist")
     text = p.read_text()
     daten: Any
     if p.suffix.lower() in (".yaml", ".yml"):
         try:
             import yaml
-        except ImportError as e:  # pragma: no cover - PyYAML ist Projektabhaengigkeit
-            raise KonfigFehler(
-                f"{pfad}: YAML angefordert, aber PyYAML fehlt ({e}). "
-                f"JSON (.json) geht ohne Zusatzpaket."
+        except ImportError as e:  # pragma: no cover - PyYAML is a project dependency
+            raise ConfigError(
+                f"{pfad}: YAML requested, but PyYAML is missing ({e}). "
+                f"JSON (.json) works without an extra package."
             ) from e
         daten = yaml.safe_load(text)
     else:
@@ -247,27 +252,27 @@ def _lies_datei(pfad: str) -> dict:
     if daten is None:
         return {}
     if not isinstance(daten, dict):
-        raise KonfigFehler(f"{pfad}: erwartet wird eine Abbildung, nicht {type(daten)}")
-    # Sowohl `htccl: {...}` als auch der blanke Teilbaum sind zulaessig.
+        raise ConfigError(f"{pfad}: expected a mapping, not {type(daten)}")
+    # Both `htccl: {...}` and the bare subtree are accepted.
     if set(daten) == {"htccl"}:
         daten = daten["htccl"] or {}
     elif "htccl" in daten:
         daten = daten["htccl"] or {}
     if not isinstance(daten, dict):
-        raise KonfigFehler(f"{pfad}: `htccl` muss eine Abbildung sein")
+        raise ConfigError(f"{pfad}: `htccl` must be a mapping")
     return daten
 
 
-def _aus_abbildung(basis: HtcclKonfig, d: Mapping[str, Any], wo: str) -> HtcclKonfig:
-    _pruefe_schluessel(d, _WURZEL_SCHLUESSEL, wo)
+def _from_mapping(basis: HtcclConfig, d: Mapping[str, Any], wo: str) -> HtcclConfig:
+    _check_key(d, _WURZEL_SCHLUESSEL, wo)
     koll = basis.kollektiv
     nic = basis.nic
     if "nic" in d:
         nic = str(d["nic"]).strip().lower().replace("-", "_")
     kd = d.get("kollektiv") or {}
     if not isinstance(kd, Mapping):
-        raise KonfigFehler(f"{wo}.kollektiv muss eine Abbildung sein")
-    _pruefe_schluessel(kd, _KOLLEKTIV_SCHLUESSEL, f"{wo}.kollektiv")
+        raise ConfigError(f"{wo}.kollektiv must be a mapping")
+    _check_key(kd, _KOLLEKTIV_SCHLUESSEL, f"{wo}.kollektiv")
     aend: dict[str, Any] = {}
     if "planer" in kd:
         aend["planer"] = str(kd["planer"]).strip().lower()
@@ -283,26 +288,26 @@ def _aus_abbildung(basis: HtcclKonfig, d: Mapping[str, Any], wo: str) -> HtcclKo
     if "saettigung_anteil" in kd:
         aend["saettigung_anteil"] = float(kd["saettigung_anteil"])
     if "aufteilung" in kd:
-        aend["aufteilung"] = _lies_aufteilung(kd["aufteilung"], f"{wo}.kollektiv")
-    if "rollen" in kd:
-        r = kd["rollen"] or {}
+        aend["aufteilung"] = _read_split(kd["aufteilung"], f"{wo}.kollektiv")
+    if "roles" in kd:
+        r = kd["roles"] or {}
         if not isinstance(r, Mapping):
-            raise KonfigFehler(f"{wo}.kollektiv.rollen muss eine Abbildung sein")
-        aend["rollen"] = {
+            raise ConfigError(f"{wo}.kollektiv.roles must be a mapping")
+        aend["roles"] = {
             _norm_bdf(k): str(v).strip().lower() for k, v in r.items()
         }
     if "domaenen" in kd:
         dom = kd["domaenen"] or []
         if not isinstance(dom, Sequence) or isinstance(dom, (str, bytes)):
-            raise KonfigFehler(f"{wo}.kollektiv.domaenen muss eine Liste von Listen sein")
+            raise ConfigError(f"{wo}.kollektiv.domaenen must be a list of lists")
         aend["domaenen"] = tuple(
             tuple(_norm_bdf(x) for x in gruppe) for gruppe in dom
         )
     if "mess" in kd:
         md = kd["mess"] or {}
         if not isinstance(md, Mapping):
-            raise KonfigFehler(f"{wo}.kollektiv.mess muss eine Abbildung sein")
-        _pruefe_schluessel(md, _MESS_SCHLUESSEL, f"{wo}.kollektiv.mess")
+            raise ConfigError(f"{wo}.kollektiv.mess must be a mapping")
+        _check_key(md, _MESS_SCHLUESSEL, f"{wo}.kollektiv.mess")
         maend: dict[str, Any] = {}
         if "groessen_kib" in md:
             maend["groessen_kib"] = tuple(int(x) for x in md["groessen_kib"])
@@ -317,53 +322,53 @@ def _aus_abbildung(basis: HtcclKonfig, d: Mapping[str, Any], wo: str) -> HtcclKo
         if "cache" in md:
             maend["cache"] = None if md["cache"] is None else str(md["cache"])
         aend["mess"] = replace(koll.mess, **maend)
-    return HtcclKonfig(kollektiv=replace(koll, **aend), nic=nic)
+    return HtcclConfig(kollektiv=replace(koll, **aend), nic=nic)
 
 
-def _lies_aufteilung(v: Any, wo: str) -> Any:
+def _read_split(v: Any, wo: str) -> Any:
     if isinstance(v, str):
         s = v.strip().lower()
         if s in ("auto", "gleich", "proportional"):
             return s
-        raise KonfigFehler(
-            f"{wo}.aufteilung: {v!r} unbekannt "
-            f"(auto | gleich | proportional | Abbildung BDF -> Gewichte)"
+        raise ConfigError(
+            f"{wo}.aufteilung: {v!r} unknown "
+            f"(auto | gleich | proportional | mapping BDF -> weights)"
         )
     if isinstance(v, Mapping):
         aus: dict[str, tuple[float, ...]] = {}
         for k, gew in v.items():
             if not isinstance(gew, Sequence) or isinstance(gew, (str, bytes)):
-                raise KonfigFehler(f"{wo}.aufteilung[{k!r}]: Liste von Gewichten erwartet")
+                raise ConfigError(f"{wo}.aufteilung[{k!r}]: expected a list of weights")
             g = tuple(float(x) for x in gew)
             if not g or any(x < 0 for x in g) or sum(g) <= 0:
-                raise KonfigFehler(f"{wo}.aufteilung[{k!r}]: Gewichte muessen >= 0 sein, Summe > 0")
+                raise ConfigError(f"{wo}.aufteilung[{k!r}]: weights must be >= 0, sum > 0")
             aus[_norm_bdf(k)] = g
         return aus
-    raise KonfigFehler(f"{wo}.aufteilung: {v!r} nicht lesbar")
+    raise ConfigError(f"{wo}.aufteilung: {v!r} not parseable")
 
 
-# -- Umgebung --------------------------------------------------------------
+# -- Environment -------------------------------------------------------------
 #
-# Reihenfolge: Vorgabe < Datei < Umgebungsvariable. Die Umgebung gewinnt
-# immer, weil sie der Weg ist, einen Lauf ohne Dateiaenderung gegen sich
-# selbst zu messen.
+# Order: default < file < environment variable. The environment always
+# wins, because it is the way to measure a run against itself without
+# changing any file.
 
 _ENV_PRAEFIX = "SGLANG_HTCCL_"
 
 
-def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
-    """Vorgabe < Datei (``SGLANG_HTCCL_KONFIG``) < Umgebung.
+def load_config(env: Optional[Mapping[str, str]] = None) -> HtcclConfig:
+    """Default < file (``SGLANG_HTCCL_CONFIG``) < environment.
 
-    RANGEINHEITLICHKEIT: liest ausschliesslich prozessglobalen Zustand, der
-    auf allen Raengen gleich ist (Umgebung, Datei). Nichts hierin darf je
-    vom Rang abhaengen -- sonst planen zwei Raenge verschieden und die
-    SPMD-Annahme der Kollektive faellt.
+    RANK UNIFORMITY: reads exclusively process-global state that is the
+    same on every rank (environment, file). Nothing in here may ever
+    depend on the rank -- otherwise two ranks would plan differently and
+    the collectives' SPMD assumption would collapse.
     """
     env = os.environ if env is None else env
-    k = HtcclKonfig()
+    k = HtcclConfig()
     pfad = env.get(_ENV_PRAEFIX + "KONFIG")
     if pfad:
-        k = _aus_abbildung(k, _lies_datei(pfad), wo=pfad)
+        k = _from_mapping(k, _read_file(pfad), wo=pfad)
 
     ueber: dict[str, Any] = {}
     kueber: dict[str, Any] = {}
@@ -373,8 +378,8 @@ def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
         return env.get(_ENV_PRAEFIX + name)
 
     if (v := _e("NIC")) is not None or (v := _e("MATRIX_NIC")) is not None:
-        # `MATRIX_NIC` ist der in ENTWURF_HTCCL_TRANSPORT.md genannte Name;
-        # `bei-bedarf` dort, `bei_bedarf` hier -- beide werden akzeptiert.
+        # `MATRIX_NIC` is the name used in ENTWURF_HTCCL_TRANSPORT.md;
+        # `bei-bedarf` there, `bei_bedarf` here -- both are accepted.
         ueber["nic"] = v.strip().lower().replace("-", "_")
     if (v := _e("PLANER")) is not None:
         kueber["planer"] = v.strip().lower()
@@ -390,11 +395,11 @@ def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
         kueber["saettigung_anteil"] = float(v)
     if (v := _e("AUFTEILUNG")) is not None:
         s = v.strip()
-        kueber["aufteilung"] = _lies_aufteilung(
-            json.loads(s) if s.startswith("{") else s, "SGLANG_HTCCL_AUFTEILUNG"
+        kueber["aufteilung"] = _read_split(
+            json.loads(s) if s.startswith("{") else s, "SGLANG_HTCCL_SPLIT"
         )
     if (v := _e("ROLLEN")) is not None:
-        # "0000:05:00.0=blatt,0000:0a:00.0=domaene" oder JSON
+        # "0000:05:00.0=blatt,0000:0a:00.0=domaene" or JSON
         s = v.strip()
         if s.startswith("{"):
             roh = json.loads(s)
@@ -404,15 +409,15 @@ def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
                 if not teil.strip():
                     continue
                 if "=" not in teil:
-                    raise KonfigFehler(
-                        f"SGLANG_HTCCL_ROLLEN: {teil!r} hat kein '='; erwartet "
-                        f"'<bdf>=<rolle>[,<bdf>=<rolle>]' oder JSON"
+                    raise ConfigError(
+                        f"SGLANG_HTCCL_ROLES: {teil!r} has no '='; expected "
+                        f"'<bdf>=<role>[,<bdf>=<role>]' or JSON"
                     )
                 bdf, rolle = teil.split("=", 1)
                 roh[bdf] = rolle
-        kueber["rollen"] = {_norm_bdf(a): str(b).strip().lower() for a, b in roh.items()}
+        kueber["roles"] = {_norm_bdf(a): str(b).strip().lower() for a, b in roh.items()}
     if (v := _e("DOMAENEN")) is not None:
-        # "05:00.0+0b:00.0;0a:00.0" oder JSON-Liste von Listen
+        # "05:00.0+0b:00.0;0a:00.0" or a JSON list of lists
         s = v.strip()
         if s.startswith("["):
             roh = json.loads(s)
@@ -428,13 +433,13 @@ def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
     if (v := _e("MESS_BUDGET_MS")) is not None:
         mueber["budget_ms"] = float(v)
     if (v := _e("MESS_FANIN")) is not None:
-        mueber["fanin"] = _bool(v, "SGLANG_HTCCL_MESS_FANIN")
+        mueber["fanin"] = _bool(v, "SGLANG_HTCCL_MEASURE_FANIN")
     if (v := _e("MESS_DUPLEX")) is not None:
-        mueber["duplex"] = _bool(v, "SGLANG_HTCCL_MESS_DUPLEX")
+        mueber["duplex"] = _bool(v, "SGLANG_HTCCL_MEASURE_DUPLEX")
     if (v := _e("MATRIX_CACHE")) is not None:
         mueber["cache"] = v
     if (v := _e("MATRIX_CACHE_AUS")) is not None:
-        mueber["cache_aus"] = _bool(v, "SGLANG_HTCCL_MATRIX_CACHE_AUS")
+        mueber["cache_aus"] = _bool(v, "SGLANG_HTCCL_MATRIX_CACHE_OFF")
 
     koll = k.kollektiv
     if mueber:
@@ -442,108 +447,110 @@ def lade_konfig(env: Optional[Mapping[str, str]] = None) -> HtcclKonfig:
     if kueber:
         koll = replace(koll, **kueber)
     k = replace(k, kollektiv=koll, **ueber)
-    _validiere(k)
+    _validate(k)
     return k
 
 
-def _validiere(k: HtcclKonfig) -> None:
+def _validate(k: HtcclConfig) -> None:
     if k.nic not in NIC_MODI:
-        raise KonfigFehler(f"nic={k.nic!r} unbekannt; erlaubt {list(NIC_MODI)}")
+        raise ConfigError(f"nic={k.nic!r} unknown; allowed {list(NIC_MODI)}")
     c = k.kollektiv
     if c.planer not in PLANER_MODI:
-        raise KonfigFehler(f"kollektiv.planer={c.planer!r}; erlaubt {list(PLANER_MODI)}")
+        raise ConfigError(f"kollektiv.planer={c.planer!r}; allowed {list(PLANER_MODI)}")
     if c.algorithmus != "auto" and c.algorithmus not in ALGORITHMEN:
-        raise KonfigFehler(
-            f"kollektiv.algorithmus={c.algorithmus!r}; erlaubt "
+        raise ConfigError(
+            f"kollektiv.algorithmus={c.algorithmus!r}; allowed "
             f"{['auto', *ALGORITHMEN]}"
         )
     if not 0.0 < c.blatt_schwelle <= 1.0:
-        raise KonfigFehler(
-            f"kollektiv.blatt_schwelle={c.blatt_schwelle} muss in (0, 1] liegen "
-            f"(Anteil am Median; 1.0 heisst 'alles unter dem Median ist Blatt')"
+        raise ConfigError(
+            f"kollektiv.blatt_schwelle={c.blatt_schwelle} must lie in (0, 1] "
+            f"(fraction of the median; 1.0 means 'everything below the "
+            f"median is a leaf')"
         )
     if c.staffel_verhaeltnis < 1.0:
-        raise KonfigFehler("kollektiv.staffel_verhaeltnis muss >= 1 sein")
+        raise ConfigError("kollektiv.staffel_verhaeltnis must be >= 1")
     if not 0.0 < c.saettigung_anteil <= 1.0:
-        raise KonfigFehler("kollektiv.saettigung_anteil muss in (0, 1] liegen")
+        raise ConfigError("kollektiv.saettigung_anteil must lie in (0, 1]")
     if c.chunk_kib is not None and c.chunk_kib <= 0:
-        raise KonfigFehler("kollektiv.chunk_kib muss > 0 sein oder 'auto'")
-    for bdf, rolle in c.rollen.items():
+        raise ConfigError("kollektiv.chunk_kib must be > 0 or 'auto'")
+    for bdf, rolle in c.roles.items():
         if rolle not in ROLLEN:
-            raise KonfigFehler(
-                f"kollektiv.rollen[{bdf!r}]={rolle!r}; erlaubt {list(ROLLEN)}"
+            raise ConfigError(
+                f"kollektiv.roles[{bdf!r}]={rolle!r}; allowed {list(ROLLEN)}"
             )
     m = c.mess
     if not m.groessen_kib or any(g <= 0 for g in m.groessen_kib):
-        raise KonfigFehler("kollektiv.mess.groessen_kib: positive Werte erwartet")
+        raise ConfigError("kollektiv.mess.groessen_kib: expected positive values")
     if m.wiederholungen <= 0 or m.vorlauf < 0:
-        raise KonfigFehler("kollektiv.mess.wiederholungen > 0, vorlauf >= 0")
+        raise ConfigError("kollektiv.mess.wiederholungen > 0, vorlauf >= 0")
     if m.budget_ms <= 0:
-        raise KonfigFehler("kollektiv.mess.budget_ms muss > 0 sein")
+        raise ConfigError("kollektiv.mess.budget_ms must be > 0")
     if c.planer == "aus" and c.algorithmus == "auto":
-        raise KonfigFehler(
-            "kollektiv.planer=aus verlangt einen festen kollektiv.algorithmus "
-            "-- 'aus' + 'auto' heisst 'nicht messen und trotzdem waehlen', und "
-            "das gibt es nicht. Kein stiller Rueckfall."
+        raise ConfigError(
+            "kollektiv.planer=aus requires a fixed kollektiv.algorithmus -- "
+            "'aus' + 'auto' would mean 'don't measure, but still choose', "
+            "and that doesn't exist. No silent fallback."
         )
     if c.planer == "fest" and c.mess.cache_aus:
-        raise KonfigFehler(
-            "kollektiv.planer=fest braucht den Zwischenspeicher; "
-            "mess.cache_aus=1 nimmt ihm die einzige Quelle. Gemeint ist "
-            "vermutlich planer=auto."
+        raise ConfigError(
+            "kollektiv.planer=fest needs the cache; mess.cache_aus=1 takes "
+            "away its only source. You probably mean planer=auto."
         )
 
 
 # ===========================================================================
-# Fuehler: was gemessen wird
+# Sensor: what gets measured
 # ===========================================================================
 
 
-class Fuehler(Protocol):
-    """Messfuehler des Planers.
+class Sensor(Protocol):
+    """The planner's measurement probe.
 
-    Zwei Auspraegungen, absichtlich getrennt:
+    Two forms, deliberately kept separate:
 
-    ``eigenlast``   misst die eigene PCIe-Anbindung (GPU <-> gepinnter
-                    Host-Speicher) und braucht keinen Peer-Pfad. Immer
-                    verfuegbar, liefert **Knotenkapazitaeten** je Richtung.
-    ``paar``        misst die gerichtete Kante Rang->Rang ueber den echten
-                    Punkt-zu-Punkt-Pfad. Nur verfuegbar, wenn ein Transport
-                    ihn liefert (``htccl_bar1``). Liefert **Kantenkapazitaeten**.
+    ``self_load``   measures this rank's own PCIe link (GPU <-> pinned
+                    host memory) and needs no peer path. Always
+                    available, delivers **node capacities** per
+                    direction.
+    ``pair``        measures the directed rank->rank edge over a real
+                    point-to-point path. Only available if a transport
+                    supplies one (``htccl_bar1``). Delivers **edge
+                    capacities**.
 
-    Ein Fuehler, der ``paar`` nicht kann, gibt ``None`` zurueck; der Planer
-    faellt dann auf die Eigenlast-Schaetzung zurueck und schreibt das in die
-    Erklaerung. Er tut NICHT so, als haette er die Kante gemessen.
+    A sensor that cannot do ``pair`` returns ``None``; the planner then
+    falls back to the self-load estimate and records that in the
+    explanation. It does NOT pretend to have measured the edge.
     """
 
     def name(self) -> str: ...
 
-    def eigenlast(self, nbytes: int, richtung: str) -> float:
-        """GB/s. ``richtung`` ist ``"aus"`` (D2H) oder ``"ein"`` (H2D)."""
+    def self_load(self, nbytes: int, richtung: str) -> float:
+        """GB/s. ``richtung`` is ``"aus"`` (D2H) or ``"ein"`` (H2D)."""
         ...
 
-    def eigenlast_duplex(self, nbytes: int) -> Optional[float]:
-        """Summe beider Richtungen gleichzeitig, GB/s. ``None`` wenn nicht messbar."""
+    def self_load_duplex(self, nbytes: int) -> Optional[float]:
+        """Sum of both directions running simultaneously, GB/s. ``None`` if not measurable."""
         ...
 
-    def paar(self, ziel: int, nbytes: int) -> Optional[float]:
-        """GB/s von *diesem* Rang zum Rang ``ziel``. ``None`` = kein Paarpfad."""
+    def pair(self, ziel: int, nbytes: int) -> Optional[float]:
+        """GB/s from *this* rank to rank ``ziel``. ``None`` = no pair path."""
         ...
 
-    def paar_empfang(self, quelle: int, nbytes: int) -> None:
-        """Gegenstueck zu ``paar`` auf der Zielseite (nur Synchronisation)."""
+    def pair_receive(self, source: int, nbytes: int) -> None:
+        """Counterpart to ``pair`` on the destination side (synchronization only)."""
         ...
 
 
-class EigenlastFuehler:
-    """Vorgabe-Fuehler: misst die eigene Anbindung, ohne jeden Peer-Pfad.
+class SelfLoadSensor:
+    """Default sensor: measures the rank's own link, with no peer path at all.
 
-    Das ist eine echte Messung dieser Karte an diesem Steckplatz -- nicht
-    die ``lspci``-Breite. Ihre Grenze ist eine andere: sie misst GPU <->
-    Host, nicht GPU <-> GPU. Eine Kante ueber einen Switch-Uplink oder
-    ueber zwei Root-Complexe kann deutlich langsamer sein als das Minimum
-    der beiden Knotenraten. Der Planer markiert daraus abgeleitete Kanten
-    deshalb als ``quelle="eigenlast"``, und die Erklaerung sagt es.
+    This is a genuine measurement of this card in this slot -- not the
+    ``lspci`` width. Its limitation is a different one: it measures GPU
+    <-> host, not GPU <-> GPU. An edge that crosses a switch uplink or two
+    root complexes can be considerably slower than the minimum of the two
+    nodes' rates. The planner therefore marks edges derived from it as
+    ``source="self_load"``, and the explanation says so.
     """
 
     def __init__(self, device, max_bytes: int = 4 << 20,
@@ -553,8 +560,9 @@ class EigenlastFuehler:
         self.device = device
         self._torch = torch
         self._max_bytes = max_bytes
-        # None = die groessenabhaengige Vorgabe (kleine Nachrichten brauchen
-        # mehr Runden, sonst misst man die Uhr statt die Leitung).
+        # None = the size-dependent default (small messages need more
+        # rounds, otherwise you end up measuring the clock instead of the
+        # link).
         self._reps = wiederholungen
         self._dev = torch.empty(max_bytes, dtype=torch.uint8, device=device)
         self._host = torch.empty(max_bytes, dtype=torch.uint8, pin_memory=True)
@@ -563,74 +571,74 @@ class EigenlastFuehler:
         self._s2 = torch.cuda.Stream(device=device)
 
     def name(self) -> str:
-        return "eigenlast"
+        return "self_load"
 
     def _lauf(self, nbytes: int, richtung: str, n: int) -> None:
         d = self._dev[:nbytes]
         h = self._host[:nbytes]
         for _ in range(n):
             if richtung == "aus":
-                h.copy_(d, non_blocking=True)   # D2H == Ausgang der Karte
+                h.copy_(d, non_blocking=True)   # D2H == card's outbound direction
             else:
-                d.copy_(h, non_blocking=True)   # H2D == Eingang der Karte
+                d.copy_(h, non_blocking=True)   # H2D == card's inbound direction
 
-    def eigenlast(self, nbytes: int, richtung: str) -> float:
+    def self_load(self, nbytes: int, richtung: str) -> float:
         torch = self._torch
         nbytes = min(nbytes, self._max_bytes)
         self._lauf(nbytes, richtung, 8)
         torch.cuda.synchronize(self.device)
-        n = self._reps or _wiederholungen_fuer(nbytes)
+        n = self._reps or _repeats_for(nbytes)
         t0 = time.perf_counter()
         self._lauf(nbytes, richtung, n)
         torch.cuda.synchronize(self.device)
         dt = time.perf_counter() - t0
         return (n * nbytes) / dt / 1e9 if dt > 0 else 0.0
 
-    def eigenlast_duplex(self, nbytes: int) -> Optional[float]:
-        """R4 gemessen, nicht angenommen: beide Richtungen gleichzeitig.
+    def self_load_duplex(self, nbytes: int) -> Optional[float]:
+        """R4 measured, not assumed: both directions at once.
 
-        Zwei Stroeme auf zwei Streams, damit die Kopiermaschinen wirklich
-        parallel laufen. Rueckgabe ist die *Summe* beider Richtungen; der
-        Planer bildet daraus den Duplexfaktor gegen die Summe der
-        Einzelraten. Auf diesem Rig war die Summe bei 1 MiB 1,32x einer
-        Richtung -- also gerade nicht 2x.
+        Two transfers on two streams, so the copy engines genuinely run in
+        parallel. Returns the *sum* of both directions; the planner
+        derives the duplex factor from that against the sum of the
+        individual rates. On this rig, the sum at 1 MiB was 1.32x one
+        direction -- i.e. deliberately not 2x.
         """
         torch = self._torch
         nbytes = min(nbytes, self._max_bytes)
         d = self._dev[:nbytes]
         h1 = self._host[:nbytes]
         h2 = self._host2[:nbytes]
-        n = self._reps or _wiederholungen_fuer(nbytes)
+        n = self._reps or _repeats_for(nbytes)
 
-        def runde(k: int) -> None:
+        def round(k: int) -> None:
             for _ in range(k):
                 with torch.cuda.stream(self._s1):
                     h1.copy_(d, non_blocking=True)
                 with torch.cuda.stream(self._s2):
                     d.copy_(h2, non_blocking=True)
 
-        runde(8)
+        round(8)
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
-        runde(n)
+        round(n)
         torch.cuda.synchronize(self.device)
         dt = time.perf_counter() - t0
         return (2 * n * nbytes) / dt / 1e9 if dt > 0 else None
 
-    def paar(self, ziel: int, nbytes: int) -> Optional[float]:
-        return None   # kein Punkt-zu-Punkt-Pfad -- ehrlich statt geschaetzt
+    def pair(self, ziel: int, nbytes: int) -> Optional[float]:
+        return None   # no point-to-point path -- honest rather than estimated
 
-    def paar_empfang(self, quelle: int, nbytes: int) -> None:
+    def pair_receive(self, source: int, nbytes: int) -> None:
         return None
 
 
-def _wiederholungen_fuer(nbytes: int) -> int:
-    """Mehr Wiederholungen bei kleinen Nachrichten.
+def _repeats_for(nbytes: int) -> int:
+    """More repetitions for small messages.
 
-    Die 20-KiB-Zeilen der Referenzmessung liegen trotz 64 Wiederholungen
-    nahe an der Aufloesung der Uhr; unter ~64 Runden sind die Prozentzahlen
-    dort Rauschen. Grosse Nachrichten brauchen sie nicht und wuerden das
-    Zeitbudget auffressen.
+    The reference measurement's 20-KiB rows sit close to clock resolution
+    even at 64 repetitions; below ~64 rounds the percentages there are
+    noise. Large messages don't need that many and it would eat into the
+    time budget.
     """
     if nbytes <= 64 * 1024:
         return 64
@@ -640,99 +648,99 @@ def _wiederholungen_fuer(nbytes: int) -> int:
 
 
 # ===========================================================================
-# Messung: das Ergebnis der Startvermessung
+# Measurement: the result of the startup measurement
 # ===========================================================================
 
 
 @dataclass
-class Messung:
-    """Rohbefund. Enthaelt nur Gemessenes, keine Politik.
+class Measurement:
+    """Raw findings. Contains only what was measured, no policy.
 
-    Alle Raten in GB/s (10^9 Byte/s, wie im uebrigen Repo).
+    All rates in GB/s (10^9 bytes/s, as elsewhere in the repo).
     """
 
     welt: int
-    groessen: tuple[int, ...]                      # Bytes
-    bdfs: tuple[str, ...]                          # je Rang
-    namen: tuple[str, ...]                         # je Rang (Kartenname)
-    fuehler: str                                   # welcher Fuehler mass
-    # Knotenraten je Rang und Groesse.
-    aus: dict[int, list[float]] = field(default_factory=dict)     # rang -> je Groesse
+    groessen: tuple[int, ...]                      # bytes
+    bdfs: tuple[str, ...]                          # per rank
+    namen: tuple[str, ...]                         # per rank (card name)
+    fuehler: str                                   # which sensor measured
+    # Node rates per rank and size.
+    aus: dict[int, list[float]] = field(default_factory=dict)     # rank -> per size
     ein: dict[int, list[float]] = field(default_factory=dict)
     duplex_summe: dict[int, list[float]] = field(default_factory=dict)
-    # Kantenraten, wenn ein Paar-Fuehler da war: (von, nach) -> je Groesse
+    # Edge rates, if a pair sensor was present: (from, to) -> per size
     kante: dict[tuple[int, int], list[float]] = field(default_factory=dict)
-    # R3: Fan-in-Deckel je Ziel und Groesse, plus Anteile je Quelle.
+    # R3: fan-in cap per destination and size, plus shares per source.
     fanin_deckel: dict[int, list[float]] = field(default_factory=dict)
     fanin_anteile: dict[tuple[int, int], list[float]] = field(default_factory=dict)
-    # Aus der Groessenleiter angepasste Gerade t(N) = latenz + N/rate,
-    # je Rang: Startkosten eines Schrittes in Sekunden.
+    # Line t(N) = latency + N/rate fitted from the size ladder, per rank:
+    # the startup cost of one step, in seconds.
     latenz_s: dict[int, float] = field(default_factory=dict)
-    # Geteilte Engpaesse: um wieviel eine Kante langsamer wird, wenn ALLE
-    # Paare gleichzeitig reden (Netz) statt nur eines (Ring). 1,0 heisst
-    # "keine Behinderung" UND ist zugleich der Wert fuer "nicht gemessen"
-    # -- welches von beiden gilt, sagt `netz_faktor_gemessen`.
+    # Shared bottlenecks: by how much an edge slows down when ALL pairs
+    # talk at once (mesh) instead of just one (ring). 1.0 means "no
+    # interference" AND is also the value for "not measured" -- which of
+    # the two applies is told by `netz_faktor_gemessen`.
     #
-    # Das ist der Term, an dem die Ring-gewinnt-Hypothese haengt: ein Netz
-    # zwingt JEDES Paar zu reden, also auch ueber Switch-Uplinks und
-    # NUMA-Spruenge, waehrend ein nach Topologie geordneter Ring geteilte
-    # Engpaesse nur einmal je Runde quert. Per-Kanten-Kapazitaeten allein
-    # koennen das nicht abbilden -- sie sind je Kante einzeln gemessen.
+    # This is the term the ring-wins hypothesis hinges on: a mesh forces
+    # EVERY pair to talk, including across switch uplinks and NUMA hops,
+    # while a topology-ordered ring crosses shared bottlenecks only once
+    # per round. Per-edge capacities alone cannot capture this -- they are
+    # each measured on their own edge.
     netz_faktor: list[float] = field(default_factory=list)
     netz_faktor_gemessen: bool = False
     dauer_s: float = 0.0
     hinweise: list[str] = field(default_factory=list)
 
-    # -- abgeleitete Sichten (kein Zustand) ---------------------------------
+    # -- derived views (no state) --------------------------------------
 
-    def kap(self, von: int, nach: int, gi: int) -> float:
-        """Gerichtete Kapazitaet Rang->Rang bei Groesse ``groessen[gi]``.
+    def capacity(self, von: int, nach: int, gi: int) -> float:
+        """Directed rank->rank capacity at size ``groessen[gi]``.
 
-        Gemessene Kante gewinnt. Sonst die Eigenlast-Schaetzung
-        ``min(Ausgang der Quelle, Eingang des Ziels)`` -- ausdruecklich eine
-        **Obergrenze**, weil sie geteilte Engpaesse (Switch-Uplink, zweiter
-        Root-Complex) nicht sehen kann.
+        A measured edge wins. Otherwise the self-load estimate
+        ``min(source's outbound, destination's inbound)`` -- explicitly an
+        **upper bound**, because it cannot see shared bottlenecks (switch
+        uplink, a second root complex).
         """
         e = self.kante.get((von, nach))
         if e is not None:
             return e[gi]
         return min(self.aus[von][gi], self.ein[nach][gi])
 
-    def kante_gemessen(self, von: int, nach: int) -> bool:
+    def edge_measured(self, von: int, nach: int) -> bool:
         return (von, nach) in self.kante
 
-    def deckel(self, nach: int, gi: int) -> float:
+    def cap(self, nach: int, gi: int) -> float:
         d = self.fanin_deckel.get(nach)
         if d is not None:
             return d[gi]
         return self.ein[nach][gi]
 
-    def deckel_gemessen(self, nach: int) -> bool:
+    def cap_measured(self, nach: int) -> bool:
         return nach in self.fanin_deckel
 
-    def netz_strafe(self, gi: int) -> float:
-        """Faktor auf den Netz-Uebertragungsterm. >= 1."""
+    def mesh_penalty(self, gi: int) -> float:
+        """Factor applied to the mesh transfer term. >= 1."""
         if not self.netz_faktor or gi >= len(self.netz_faktor):
             return 1.0
         return max(1.0, self.netz_faktor[gi])
 
-    def duplex_faktor(self, rang: int, gi: int) -> float:
-        """Summe beider Richtungen / groessere Einzelrichtung. 1,0 = kein Gewinn."""
+    def duplex_factor(self, rang: int, gi: int) -> float:
+        """Sum of both directions / larger single direction. 1.0 = no gain."""
         d = self.duplex_summe.get(rang)
         if d is None:
             return 1.0
         einzeln = max(self.aus[rang][gi], self.ein[rang][gi])
         return d[gi] / einzeln if einzeln > 0 else 1.0
 
-    def schritt_s(self) -> float:
-        """Startkosten eines Kollektivschrittes, Sekunden (Median ueber Raenge)."""
+    def step_s(self) -> float:
+        """Startup cost of one collective step, in seconds (median across ranks)."""
         if not self.latenz_s:
             return 0.0
         return statistics.median(self.latenz_s.values())
 
-    def als_dict(self) -> dict:
+    def as_dict(self) -> dict:
         d = asdict(self)
-        # Tupel-Schluessel sind nicht JSON-faehig.
+        # Tuple keys aren't JSON-safe.
         d["kante"] = {f"{a}->{b}": v for (a, b), v in self.kante.items()}
         d["fanin_anteile"] = {f"{a}->{b}": v for (a, b), v in self.fanin_anteile.items()}
         d["aus"] = {str(k): v for k, v in self.aus.items()}
@@ -743,12 +751,12 @@ class Messung:
         return d
 
     @staticmethod
-    def aus_dict(d: Mapping[str, Any]) -> "Messung":
-        def paar(s: str) -> tuple[int, int]:
+    def from_dict(d: Mapping[str, Any]) -> "Measurement":
+        def pair(s: str) -> tuple[int, int]:
             a, b = s.split("->")
             return int(a), int(b)
 
-        m = Messung(
+        m = Measurement(
             welt=int(d["welt"]),
             groessen=tuple(int(x) for x in d["groessen"]),
             bdfs=tuple(d["bdfs"]),
@@ -760,10 +768,10 @@ class Messung:
         m.aus = {int(k): list(v) for k, v in d["aus"].items()}
         m.ein = {int(k): list(v) for k, v in d["ein"].items()}
         m.duplex_summe = {int(k): list(v) for k, v in d.get("duplex_summe", {}).items()}
-        m.kante = {paar(k): list(v) for k, v in d.get("kante", {}).items()}
+        m.kante = {pair(k): list(v) for k, v in d.get("kante", {}).items()}
         m.fanin_deckel = {int(k): list(v) for k, v in d.get("fanin_deckel", {}).items()}
         m.fanin_anteile = {
-            paar(k): list(v) for k, v in d.get("fanin_anteile", {}).items()
+            pair(k): list(v) for k, v in d.get("fanin_anteile", {}).items()
         }
         m.latenz_s = {int(k): float(v) for k, v in d.get("latenz_s", {}).items()}
         m.netz_faktor = [float(x) for x in d.get("netz_faktor", [])]
@@ -772,13 +780,13 @@ class Messung:
 
 
 def _quant(x: float) -> float:
-    """Quantisieren, bevor entschieden wird.
+    """Quantize before deciding.
 
-    Der Plan muss auf allen Raengen bitgleich herauskommen. Die Rohwerte
-    kommen zwar als identische ``float`` ueber ``all_gather_object`` an,
-    aber eine Entscheidungsschwelle, die auf der 12. Nachkommastelle
-    kippt, ist trotzdem ein Zufallsgenerator. Drei Nachkommastellen in
-    GB/s sind rund 1 MB/s -- weit unter jeder Messstreuung.
+    The plan must come out bit-identical on every rank. The raw values do
+    arrive as identical ``float``s via ``all_gather_object``, but a
+    decision threshold that flips on the 12th decimal digit is a random
+    number generator regardless. Three decimal digits in GB/s is about
+    1 MB/s -- well below any measurement noise.
     """
     if not math.isfinite(x):
         return 0.0
@@ -786,18 +794,18 @@ def _quant(x: float) -> float:
 
 
 # ===========================================================================
-# Der Plan
+# The plan
 # ===========================================================================
 
 
 @dataclass(frozen=True)
-class Stufe:
-    """Eine Stufe der Groessenleiter: bis ``max_bytes`` gilt ``algorithmus``."""
+class Stage:
+    """One stage of the size ladder: up to ``max_bytes``, ``algorithmus`` applies."""
 
-    von_bytes: int                       # kleinste Groesse, fuer die gemessen wurde
-    max_bytes: int                       # inklusive; -1 == "und alles darueber"
+    von_bytes: int                       # smallest size this was measured for
+    max_bytes: int                       # inclusive; -1 == "and everything above"
     algorithmus: str
-    vorhersage_s: Mapping[str, float]    # algorithmus -> vorhergesagte Zeit
+    vorhersage_s: Mapping[str, float]    # algorithm -> predicted time
     grund: str
 
 
@@ -805,40 +813,40 @@ class Stufe:
 class Plan:
     welt: int
     bdfs: tuple[str, ...]
-    rollen: tuple[str, ...]                     # je Rang
-    domaene: tuple[int, ...]                    # Raenge der Reduktionsdomaene
+    roles: tuple[str, ...]                     # per rank
+    domaene: tuple[int, ...]                    # ranks of the reduction domain
     blaetter: tuple[int, ...]
-    eltern: Mapping[int, tuple[int, ...]]       # Blatt -> Domaenenknoten
-    aufteilung: Mapping[int, tuple[int, ...]]   # Blatt -> Promille je Elternteil
+    eltern: Mapping[int, tuple[int, ...]]       # leaf -> domain nodes
+    aufteilung: Mapping[int, tuple[int, ...]]   # leaf -> per-mille share per parent
     ringfolge: tuple[int, ...]
-    leiter: tuple[Stufe, ...]
+    leiter: tuple[Stage, ...]
     chunk_bytes: int
-    staffeln: Mapping[int, tuple[tuple[int, ...], ...]]   # Ziel -> Wellen von Quellen
+    staffeln: Mapping[int, tuple[tuple[int, ...], ...]]   # destination -> waves of sources
     konfig_zusammenfassung: Mapping[str, Any]
-    messung: Optional[Messung] = None
-    quelle: str = "gemessen"                    # gemessen | zwischenspeicher | fest
+    messung: Optional[Measurement] = None
+    source: str = "gemessen"                    # gemessen | zwischenspeicher | fest  (measured | cached | fixed)
 
-    # -- Abfragen, die ein Transport braucht --------------------------------
+    # -- queries a transport needs ---------------------------------------
 
-    def algorithmus_fuer(self, nbytes: int) -> str:
+    def algorithm_for(self, nbytes: int) -> str:
         for stufe in self.leiter:
             if stufe.max_bytes < 0 or nbytes <= stufe.max_bytes:
                 return stufe.algorithmus
         return self.leiter[-1].algorithmus
 
-    def ist_blatt(self, rang: int) -> bool:
-        return self.rollen[rang] == "blatt"
+    def is_leaf(self, rang: int) -> bool:
+        return self.roles[rang] == "blatt"
 
-    def pruefsumme(self) -> str:
-        """Fingerabdruck der *Entscheidungen*, nicht der Rohmessung.
+    def checksum(self) -> str:
+        """Fingerprint of the *decisions*, not of the raw measurement.
 
-        Bewusst ohne ``messung``: die Rohwerte weichen zwischen Raengen um
-        Messrauschen ab, sobald jeder Rang eigene Zahlen beisteuert. Was
-        uebereinstimmen MUSS, ist der Plan.
+        Deliberately without ``messung``: the raw values differ between
+        ranks by measurement noise once every rank contributes its own
+        numbers. What MUST agree is the plan.
         """
         kern = {
             "welt": self.welt,
-            "rollen": list(self.rollen),
+            "roles": list(self.roles),
             "domaene": list(self.domaene),
             "blaetter": list(self.blaetter),
             "eltern": {str(k): list(v) for k, v in sorted(self.eltern.items())},
@@ -855,35 +863,36 @@ class Plan:
 
     # -- Erklaerung ---------------------------------------------------------
 
-    def erklaerung(self) -> str:
-        """Menschenlesbar: was gemessen, was gefolgert, was gewaehlt wurde.
+    def explanation(self) -> str:
+        """Human-readable: what was measured, what was inferred, what was chosen.
 
-        Ohne diesen Block debuggt niemand auf fremder Hardware -- deshalb
-        ist er Pflichtausgabe und nicht an ein Debug-Flag gebunden.
+        Without this block, nobody can debug this on unfamiliar hardware
+        -- which is why it's mandatory output and not gated behind a
+        debug flag.
         """
         z: list[str] = []
         a = z.append
         a("=" * 78)
-        a(f"HTCCL-Pfadmatrix: Plan {self.pruefsumme()} ({self.quelle}), "
-          f"{self.welt} Raenge")
+        a(f"HTCCL path matrix: plan {self.checksum()} ({self.source}), "
+          f"{self.welt} ranks")
         a("=" * 78)
         m = self.messung
         if m is not None:
-            a(f"Fuehler: {m.fuehler}   Messdauer: {m.dauer_s * 1000:.0f} ms")
+            a(f"Sensor: {m.fuehler}   Measurement duration: {m.dauer_s * 1000:.0f} ms")
             a("")
-            a("-- gemessene Knotenraten (GB/s, Ausgang/Eingang je Groesse) --")
-            a("   Die sysfs-Spalte steht NUR zum Vergleich da und geht in "
-              "keine Entscheidung ein:")
-            a("   sagt sie x8 und die Messung 6 GB/s, ist entweder die Karte "
-              "heruntergetaktet")
-            a("   oder der Messaufbau kaputt -- lspci ist Startschaetzung, "
-              "nicht Wahrheit.")
-            kopf = "  Rang  Karte                  sysfs   " + "".join(
+            a("-- measured node rates (GB/s, outbound/inbound per size) --")
+            a("   The sysfs column is shown ONLY for comparison and feeds "
+              "into no decision:")
+            a("   if it says x8 and the measurement says 6 GB/s, either the "
+              "card is downclocked")
+            a("   or the measurement setup is broken -- lspci is a starting "
+              "estimate, not truth.")
+            kopf = "  Rank  Card                   sysfs   " + "".join(
                 f"{_kib(g):>18}" for g in m.groessen
             )
             a(kopf)
             for r in range(self.welt):
-                lb = linkbreite(self.bdfs[r])
+                lb = link_width(self.bdfs[r])
                 lbs = f"x{lb[0]}" if lb else "?"
                 zeile = (f"  {r:>4}  {self.bdfs[r]:<14}{m.namen[r][:8]:<8}"
                          f"{lbs:<8}")
@@ -892,26 +901,26 @@ class Plan:
                 a(zeile)
             if m.duplex_summe:
                 a("")
-                a("-- Vollduplex (Summe beider Richtungen / staerkere Einzelrichtung) --")
-                a("   R4: gemessen, nicht angenommen. 1,00 = Gegenrichtung ist gratis "
-                  "nicht vorhanden;")
-                a("   2,00 waere die naive Erwartung. Referenz dieses Rigs: "
-                  f"{_BELEG_DUPLEX_SUMME_20KIB:.2f}x bei 20 KiB, "
-                  f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}x bei 1 MiB.")
+                a("-- full duplex (sum of both directions / stronger single direction) --")
+                a("   R4: measured, not assumed. 1.00 = the reverse direction "
+                  "isn't free at all;")
+                a("   2.00 would be the naive expectation. Reference for this rig: "
+                  f"{_BELEG_DUPLEX_SUMME_20KIB:.2f}x at 20 KiB, "
+                  f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}x at 1 MiB.")
                 for r in range(self.welt):
                     if r not in m.duplex_summe:
                         continue
                     werte = "  ".join(
-                        f"{_kib(g)}: {m.duplex_faktor(r, gi):.2f}x"
+                        f"{_kib(g)}: {m.duplex_factor(r, gi):.2f}x"
                         for gi, g in enumerate(m.groessen)
                     )
-                    a(f"  Rang {r}: {werte}")
+                    a(f"  Rank {r}: {werte}")
             a("")
-            a("-- gerichtete Kantenkapazitaeten (GB/s) --")
-            a("   'M' = am Paar gemessen, 'S' = Schaetzung min(Ausgang, Eingang) "
-              "aus der Eigenlast")
+            a("-- directed edge capacities (GB/s) --")
+            a("   'M' = measured on the pair, 'S' = estimate min(outbound, "
+              "inbound) from self-load")
             for gi, g in enumerate(m.groessen):
-                a(f"  bei {_kib(g)}:")
+                a(f"  at {_kib(g)}:")
                 a("        " + "".join(f"{'->' + str(j):>12}" for j in range(self.welt)))
                 for i in range(self.welt):
                     zeile = f"    {i:>2}  "
@@ -919,64 +928,64 @@ class Plan:
                         if i == j:
                             zeile += f"{'-':>12}"
                         else:
-                            mark = "M" if m.kante_gemessen(i, j) else "S"
-                            zeile += f"{m.kap(i, j, gi):>10.2f}{mark}"
+                            mark = "M" if m.edge_measured(i, j) else "S"
+                            zeile += f"{m.capacity(i, j, gi):>10.2f}{mark}"
                     a(zeile)
             a("")
-            a("-- Fan-in-Deckel je Ziel (GB/s) --")
-            a("   R3: in keine Karte geht mehr hinein als der Deckel, egal von "
-              "wie vielen Quellen.")
-            a(f"   Referenz dieses Rigs: {_BELEG_FANIN_GBPS:.2f} GB/s bei 1 MiB "
-              "mit zwei Quellen.")
+            a("-- fan-in cap per destination (GB/s) --")
+            a("   R3: no card receives more than the cap, regardless of how "
+              "many sources.")
+            a(f"   Reference for this rig: {_BELEG_FANIN_GBPS:.2f} GB/s at 1 MiB "
+              "with two sources.")
             for j in range(self.welt):
-                mark = "gemessen" if m.deckel_gemessen(j) else "aus Eingangsrate geschaetzt"
+                mark = "measured" if m.cap_measured(j) else "estimated from inbound rate"
                 werte = "  ".join(
-                    f"{_kib(g)}: {m.deckel(j, gi):.2f}" for gi, g in enumerate(m.groessen)
+                    f"{_kib(g)}: {m.cap(j, gi):.2f}" for gi, g in enumerate(m.groessen)
                 )
-                a(f"  Ziel {j} ({self.bdfs[j]}): {werte}   [{mark}]")
-            a(f"  Schrittkosten (Startkosten je Kollektivschritt): "
-              f"{m.schritt_s() * 1e6:.2f} us")
+                a(f"  Destination {j} ({self.bdfs[j]}): {werte}   [{mark}]")
+            a(f"  Step cost (startup cost per collective step): "
+              f"{m.step_s() * 1e6:.2f} us")
             a("")
-            a("-- geteilte Engpaesse: Strafe des Netzes gegen den Ring --")
+            a("-- shared bottlenecks: mesh penalty vs. the ring --")
             if m.netz_faktor_gemessen:
-                a("   Gemessen: alle Paare gleichzeitig gegen ein Paar allein. "
-                  ">1 heisst, das Netz")
-                a("   verliert an Uplinks/NUMA-Spruengen, die eine "
-                  "Kantenkapazitaet nicht sieht.")
+                a("   Measured: all pairs simultaneously vs. one pair alone. "
+                  ">1 means the mesh")
+                a("   loses to uplinks/NUMA hops that a per-edge capacity "
+                  "cannot see.")
             else:
-                a("   NICHT GEMESSEN -- auf 1,0 gesetzt. Bei 1,0 bewegen Netz "
-                  "und Ring dieselben")
-                a("   Bytes durch denselben Deckel, und das Netz gewinnt "
-                  "dann immer ueber die")
-                a("   Schrittzahl. Der Ring kann hier nur ueber die "
-                  "Fenstergrenze gewaehlt werden.")
+                a("   NOT MEASURED -- set to 1.0. At 1.0, mesh and ring move "
+                  "the same")
+                a("   bytes through the same cap, and the mesh then always "
+                  "wins on step")
+                a("   count. Here the ring can only be chosen via the "
+                  "window limit.")
             werte = "  ".join(
-                f"{_kib(g)}: {m.netz_strafe(gi):.2f}x"
+                f"{_kib(g)}: {m.mesh_penalty(gi):.2f}x"
                 for gi, g in enumerate(m.groessen)
             )
             a(f"  {werte}")
             for h in m.hinweise:
                 a(f"  ! {h}")
         else:
-            a("Keine Messung (Planer aus oder fest konfiguriert).")
+            a("No measurement (planner off or fixed configuration).")
 
         a("")
-        a("-- Rollen (R2: Kapazitaet < blatt_schwelle x Median -> Blatt) --")
+        a("-- roles (R2: capacity < blatt_schwelle x median -> leaf) --")
         for r in range(self.welt):
             zusatz = ""
             if r in self.eltern:
                 el = ", ".join(str(x) for x in self.eltern[r])
                 anteile = "/".join(f"{p / 10:.0f}%" for p in self.aufteilung.get(r, ()))
-                zusatz = f"  -> Eltern [{el}]  Aufteilung {anteile}"
-            a(f"  Rang {r} ({self.bdfs[r]}): {self.rollen[r]}{zusatz}")
-        a(f"  Reduktionsdomaene: {list(self.domaene)}   Blaetter: {list(self.blaetter)}")
-        a(f"  Ringreihenfolge (nach gemessener Kapazitaet geordnet): "
+                zusatz = f"  -> parents [{el}]  split {anteile}"
+            a(f"  Rank {r} ({self.bdfs[r]}): {self.roles[r]}{zusatz}")
+        a(f"  Reduction domain: {list(self.domaene)}   Leaves: {list(self.blaetter)}")
+        a(f"  Ring order (sorted by measured capacity): "
           f"{list(self.ringfolge)}")
 
         a("")
-        a("-- Algorithmus je Groessenklasse --")
+        a("-- algorithm per size class --")
         for stufe in self.leiter:
-            grenze = (f"ab {_kib(stufe.von_bytes)}" if stufe.max_bytes < 0
+            grenze = (f"from {_kib(stufe.von_bytes)}" if stufe.max_bytes < 0
                       else f"{_kib(stufe.von_bytes)}..{_kib(stufe.max_bytes)}")
             vor = "  ".join(
                 f"{k}={v * 1e6:.1f}us" for k, v in sorted(stufe.vorhersage_s.items())
@@ -987,19 +996,19 @@ class Plan:
 
         if self.staffeln:
             a("")
-            a("-- Fan-in-Staffelplan (R3) --")
-            a("   Eine schnelle und eine langsame Quelle duerfen nicht "
-              "gleichzeitig ins selbe Ziel")
-            a("   schreiben: der Deckel wird gleichmaessig je Quelle "
-              "aufgeteilt, die schnelle wird")
-            a("   auf den Anteil der langsamen heruntergezogen. Mehr als eine "
-              "Welle heisst gestaffelt.")
+            a("-- fan-in staging plan (R3) --")
+            a("   A fast and a slow source may not write into the same "
+              "destination at the")
+            a("   same time: the cap is split evenly per source, the fast "
+              "one gets pulled")
+            a("   down to the slow one's share. More than one wave means "
+              "staggered.")
             for ziel, wellen in sorted(self.staffeln.items()):
                 w = " | ".join("+".join(str(q) for q in welle) for welle in wellen)
-                a(f"  Ziel {ziel} ({self.bdfs[ziel]}): {w}")
+                a(f"  Destination {ziel} ({self.bdfs[ziel]}): {w}")
 
         a("")
-        a("-- wirksame Konfiguration --")
+        a("-- effective configuration --")
         for k, v in sorted(self.konfig_zusammenfassung.items()):
             a(f"  {k}: {v}")
         a("=" * 78)
@@ -1013,38 +1022,38 @@ def _kib(n: int) -> str:
 
 
 # ===========================================================================
-# Das Kostenmodell -- hier stecken R1, R3 und R4
+# The cost model -- this is where R1, R3, and R4 live
 # ===========================================================================
 
 
-def _zeit_netz(m: Messung, gi: int, n_bytes: int, raenge: Sequence[int],
+def _time_mesh(m: Measurement, gi: int, n_bytes: int, raenge: Sequence[int],
                wellen: Mapping[int, tuple[tuple[int, ...], ...]],
-               schritt_s: float) -> float:
-    """Direktes Netz: Reduce-Scatter + Allgather, je genau ein Schritt.
+               step_s: float) -> float:
+    """Direct mesh: reduce-scatter + all-gather, exactly one step each.
 
-    ``raenge`` sind ECHTE Raenge, keine Indizes -- die Funktion wird auch
-    fuer eine Teilmenge (die Reduktionsdomaene) aufgerufen, und ein
-    Index-in-die-Teilmenge waere dort ein anderer Rang.
+    ``raenge`` are REAL ranks, not indices -- this function is also
+    called for a subset (the reduction domain), and an
+    index-into-the-subset would be a different rank there.
 
-    Byte-Last je Rang wie beim Ring: 2N(R-1)/R. Schritte aber nur **2**
-    statt 2(R-1) -- das ist der ganze Grund, warum das Netz bei kleinen
-    Nachrichten gewinnt.
+    Byte load per rank same as for the ring: 2N(R-1)/R. But only **2**
+    steps instead of 2(R-1) -- that is the entire reason the mesh wins at
+    small message sizes.
 
-    R3 steckt in der effektiven Rate: ``R-1`` Quellen beschreiben dasselbe
-    Ziel, und der Deckel wird **gleichmaessig je Quelle** aufgeteilt. Die
-    effektive Rate einer Quelle ist also
-    ``min(Kantenkapazitaet, Deckel / Zahl der gleichzeitigen Quellen)``.
-    Genau dieser Term bestraft das Netz bei Saettigung: die schnelle Kante
-    wird auf den Deckelanteil zusammengedrueckt und verschenkt.
+    R3 lives in the effective rate: ``R-1`` sources write into the same
+    destination, and the cap is split **evenly per source**. The
+    effective rate of one source is therefore
+    ``min(edge capacity, cap / number of simultaneous sources)``. This is
+    exactly the term that penalizes the mesh at saturation: the fast edge
+    gets squeezed down to its share of the cap, and the excess is wasted.
 
-    Der Staffelplan multipliziert die Schritte: wer in zwei Wellen
-    schreiben muss, zahlt die Schritte zweimal.
+    The staging plan multiplies the steps: whoever has to write in two
+    waves pays for the steps twice.
     """
     r = len(raenge)
     if r < 2:
         return 0.0
     menge = set(raenge)
-    anteil = n_bytes / r             # jeder schickt N/R an jeden Nachbarn
+    anteil = n_bytes / r             # everyone sends N/R to each neighbor
     schlimmste = 0.0
     schritte = 2
     for ziel in raenge:
@@ -1053,32 +1062,31 @@ def _zeit_netz(m: Messung, gi: int, n_bytes: int, raenge: Sequence[int],
             for welle in wellen.get(ziel, (tuple(x for x in raenge if x != ziel),))
         )
         w = tuple(welle for welle in w if welle)
-        deckel = m.deckel(ziel, gi)
-        # Wellen laufen NACHEINANDER -- das ist ihr ganzer Zweck. Also
-        # summieren, nicht das Maximum nehmen: gestaffelter Fan-in kostet
-        # Zeit, und genau dieser Preis muss im Vergleich gegen den Ring
-        # sichtbar sein.
+        cap = m.cap(ziel, gi)
+        # Waves run SEQUENTIALLY -- that's their whole purpose. So sum
+        # them, don't take the maximum: staggered fan-in costs time, and
+        # that cost must be visible in the comparison against the ring.
         summe = 0.0
         for welle in w:
             gleichzeitig = len(welle)
-            pro_quelle = deckel / gleichzeitig if gleichzeitig else deckel
+            pro_quelle = cap / gleichzeitig if gleichzeitig else cap
             dauer = 0.0
-            for quelle in welle:
-                rate = min(m.kap(quelle, ziel, gi), pro_quelle)
+            for source in welle:
+                rate = min(m.capacity(source, ziel, gi), pro_quelle)
                 dauer = max(dauer, anteil / (rate * 1e9) if rate > 0 else float("inf"))
             summe += dauer
         schlimmste = max(schlimmste, summe)
         schritte = max(schritte, 2 * len(w))
-    return schritte * schritt_s + 2 * schlimmste * m.netz_strafe(gi)
+    return schritte * step_s + 2 * schlimmste * m.mesh_penalty(gi)
 
 
-def _zeit_ring(m: Messung, gi: int, n_bytes: int, folge: Sequence[int],
-               schritt_s: float) -> float:
-    """Ring: 2(R-1) Schritte, aber jeder Rang empfaengt von genau EINEM Nachbarn.
+def _time_ring(m: Measurement, gi: int, n_bytes: int, folge: Sequence[int],
+               step_s: float) -> float:
+    """Ring: 2(R-1) steps, but every rank receives from exactly ONE neighbor.
 
-    Kein Fan-in, keine unfaire Aufteilung -- der Grund, warum der Ring an
-    der Saettigung gewinnt. Bezahlt wird das mit der Schrittzahl, die bei
-    R=8 vierzehn statt zwei betraegt.
+    No fan-in, no unfair split -- the reason the ring wins at saturation.
+    The price paid for that is the step count, which for R=8 is fourteen
+    instead of two.
     """
     welt = len(folge)
     if welt < 2:
@@ -1087,43 +1095,42 @@ def _zeit_ring(m: Messung, gi: int, n_bytes: int, folge: Sequence[int],
     langsamste = 0.0
     for k in range(welt):
         von, nach = folge[k], folge[(k + 1) % welt]
-        rate = m.kap(von, nach, gi)
+        rate = m.capacity(von, nach, gi)
         langsamste = max(langsamste, anteil / (rate * 1e9) if rate > 0 else float("inf"))
-    return 2 * (welt - 1) * (schritt_s + langsamste)
+    return 2 * (welt - 1) * (step_s + langsamste)
 
 
-def _zeit_stern(m: Messung, gi: int, n_bytes: int, nabe: int, welt: int,
-                schritt_s: float) -> float:
-    """Stern: alles auf die Nabe, dort reduzieren, zurueckverteilen.
+def _time_star(m: Measurement, gi: int, n_bytes: int, nabe: int, welt: int,
+                step_s: float) -> float:
+    """Star: everything to the hub, reduce there, distribute back.
 
-    Zwei streng getrennte Phasen mit (R-1)N je Richtung auf der Nabe. Steht
-    im Modell drin, weil er der heutige Zustand ist und weil
-    ``algorithmus: stern`` erzwingbar bleiben muss -- nicht weil er je
-    gewinnt.
+    Two strictly separate phases with (R-1)N per direction on the hub. It
+    is in the model because it is today's status quo and because
+    ``algorithmus: star`` must remain forceable -- not because it ever
+    wins.
     """
     if welt < 2:
         return 0.0
-    ein = m.deckel(nabe, gi)
-    aus_raten = [m.kap(nabe, j, gi) for j in range(welt) if j != nabe]
+    ein = m.cap(nabe, gi)
+    aus_raten = [m.capacity(nabe, j, gi) for j in range(welt) if j != nabe]
     aus = min(aus_raten) if aus_raten else 0.0
     if ein <= 0 or aus <= 0:
         return float("inf")
     hin = (welt - 1) * n_bytes / (ein * 1e9)
     rueck = (welt - 1) * n_bytes / (aus * 1e9)
-    return 2 * schritt_s + hin + rueck
+    return 2 * step_s + hin + rueck
 
 
-def _zeit_hierarchisch(m: Messung, gi: int, n_bytes: int,
+def _time_hierarchical(m: Measurement, gi: int, n_bytes: int,
                        domaene: Sequence[int], blaetter: Sequence[int],
                        eltern: Mapping[int, tuple[int, ...]],
                        aufteilung: Mapping[int, tuple[int, ...]],
-                       innen_s: float, schritt_s: float, welt: int) -> float:
-    """Blatt + Reduktionsdomaene, gechunkt und ueberlappt.
+                       innen_s: float, step_s: float, welt: int) -> float:
+    """Leaf + reduction domain, chunked and overlapped.
 
-    Das Blatt schickt N hinaus und holt N herein -- algorithmusunabhaengig
-    der Boden. Mit Chunking ueberlappen die beiden Richtungen, aber
-    **nicht gratis**: die Gutschrift ist der gemessene Duplexfaktor (R4),
-    nicht 2.
+    The leaf sends N out and pulls N in -- the floor, regardless of
+    algorithm. With chunking the two directions overlap, but **not for
+    free**: the credit is the measured duplex factor (R4), not 2.
     """
     if not blaetter:
         return innen_s
@@ -1136,65 +1143,65 @@ def _zeit_hierarchisch(m: Messung, gi: int, n_bytes: int,
         runter = 0.0
         for e, g in zip(el, gew):
             teil = n_bytes * (g / gesamt)
-            r_hoch = m.kap(b, e, gi)
-            r_runter = m.kap(e, b, gi)
+            r_hoch = m.capacity(b, e, gi)
+            r_runter = m.capacity(e, b, gi)
             hoch = max(hoch, teil / (r_hoch * 1e9) if r_hoch > 0 else float("inf"))
             runter = max(runter, teil / (r_runter * 1e9) if r_runter > 0 else float("inf"))
-        # Ueberlappung: der Duplexfaktor sagt, wieviel der Gegenrichtung
-        # tatsaechlich gratis ist. f=1 -> keine Ueberlappung (hoch+runter),
-        # f=2 -> volle Ueberlappung (max). Gemessen liegt er dazwischen.
-        f = max(1.0, min(2.0, m.duplex_faktor(b, gi)))
+        # Overlap: the duplex factor says how much of the reverse
+        # direction is actually free. f=1 -> no overlap (hoch+runter),
+        # f=2 -> full overlap (max). The measured value lies in between.
+        f = max(1.0, min(2.0, m.duplex_factor(b, gi)))
         seriell = hoch + runter
         parallel = max(hoch, runter)
         schlimmstes_blatt = max(schlimmstes_blatt, seriell - (f - 1.0) * (seriell - parallel))
-    return 2 * schritt_s + schlimmstes_blatt + innen_s
+    return 2 * step_s + schlimmstes_blatt + innen_s
 
 
 # ===========================================================================
-# Ableitungen: Rollen, Domaenen, Ring, Staffeln, Chunk
+# Derived quantities: roles, domains, ring, staggering, chunk
 # ===========================================================================
 
 
-def _knotenkapazitaet(m: Messung, r: int) -> float:
-    """Eine Zahl je Rang fuer den Rollenvergleich (R2).
+def _node_capacity(m: Measurement, r: int) -> float:
+    """One number per rank for the role comparison (R2).
 
-    Bewusst das **Minimum** von Aus- und Eingang ueber alle Groessen
-    gemittelt: eine Karte, die schnell sendet, aber langsam empfaengt, ist
-    fuer Transitverkehr genauso ungeeignet wie umgekehrt -- Transit heisst
-    beides. Fuer die Kantenwahl selbst bleiben die Richtungen getrennt;
-    zusammengefasst wird nur hier, wo eine Rangfolge gebraucht wird.
+    Deliberately the **minimum** of outbound and inbound, condensed
+    across sizes: a card that sends fast but receives slowly is just as
+    unsuited for transit traffic as the reverse -- transit means both. For
+    the edge choice itself the directions stay separate; they are
+    combined only here, where a single ranking is needed.
     """
-    gi = len(m.groessen) - 1        # groesste gemessene Groesse: dort trennt es sich
+    gi = len(m.groessen) - 1        # largest measured size: that's where it separates
     return min(m.aus[r][gi], m.ein[r][gi])
 
 
-def _rollen(m: Messung, k: KollektivKonfig) -> tuple[list[str], list[int], list[int]]:
+def _roles(m: Measurement, k: CollectiveConfig) -> tuple[list[str], list[int], list[int]]:
     welt = m.welt
-    kap = [_knotenkapazitaet(m, r) for r in range(welt)]
-    med = statistics.median(kap) if kap else 0.0
+    cap = [_node_capacity(m, r) for r in range(welt)]
+    med = statistics.median(cap) if cap else 0.0
     schwelle = k.blatt_schwelle * med
-    rollen = ["domaene"] * welt
+    roles = ["domaene"] * welt
     for r in range(welt):
-        if welt > 2 and kap[r] < schwelle:
-            rollen[r] = "blatt"
-    # Von Hand gesetzte Rollen ueberstimmen die Messung -- ausdruecklich.
+        if welt > 2 and cap[r] < schwelle:
+            roles[r] = "blatt"
+    # Manually set roles override the measurement -- deliberately.
     for r in range(welt):
-        fest = k.rollen.get(m.bdfs[r])
+        fest = k.roles.get(m.bdfs[r])
         if fest is not None:
-            rollen[r] = "domaene" if fest == "nabe" else fest
-    # Es muss mindestens zwei Domaenenknoten geben, sonst gibt es nichts,
-    # worin reduziert wird. Notfalls die staerksten zuruecknehmen.
-    dom = [r for r in range(welt) if rollen[r] != "blatt"]
+            roles[r] = "domaene" if fest == "nabe" else fest
+    # There must be at least two domain nodes, otherwise there is nothing
+    # to reduce into. If necessary, pull back the strongest ones.
+    dom = [r for r in range(welt) if roles[r] != "blatt"]
     if len(dom) < min(2, welt):
-        stark = sorted(range(welt), key=lambda r: (-kap[r], r))[: min(2, welt)]
+        stark = sorted(range(welt), key=lambda r: (-cap[r], r))[: min(2, welt)]
         for r in stark:
-            rollen[r] = "domaene"
-    dom = [r for r in range(welt) if rollen[r] != "blatt"]
-    blaetter = [r for r in range(welt) if rollen[r] == "blatt"]
-    return rollen, dom, blaetter
+            roles[r] = "domaene"
+    dom = [r for r in range(welt) if roles[r] != "blatt"]
+    blaetter = [r for r in range(welt) if roles[r] == "blatt"]
+    return roles, dom, blaetter
 
 
-def _domaenen_aus_konfig(m: Messung, k: KollektivKonfig) -> Optional[list[list[int]]]:
+def _domains_from_config(m: Measurement, k: CollectiveConfig) -> Optional[list[list[int]]]:
     if not k.domaenen:
         return None
     index = {bdf: r for r, bdf in enumerate(m.bdfs)}
@@ -1203,42 +1210,42 @@ def _domaenen_aus_konfig(m: Messung, k: KollektivKonfig) -> Optional[list[list[i
         raenge = []
         for bdf in gruppe:
             if bdf not in index:
-                raise KonfigFehler(
-                    f"kollektiv.domaenen nennt {bdf!r}, aber dieser Verbund hat "
-                    f"nur {sorted(index)}. Kein stiller Rueckfall -- entweder "
-                    f"die Adresse ist falsch oder die Karte fehlt."
+                raise ConfigError(
+                    f"kollektiv.domaenen names {bdf!r}, but this ensemble "
+                    f"only has {sorted(index)}. No silent fallback -- "
+                    f"either the address is wrong or the card is missing."
                 )
             raenge.append(index[bdf])
         aus.append(sorted(raenge))
     gesehen = [r for g in aus for r in g]
     if len(gesehen) != len(set(gesehen)):
-        raise KonfigFehler("kollektiv.domaenen: ein Rang steht in zwei Domaenen")
+        raise ConfigError("kollektiv.domaenen: one rank appears in two domains")
     return aus
 
 
-def _eltern_und_aufteilung(
-    m: Messung, domaene: Sequence[int], blaetter: Sequence[int], k: KollektivKonfig
+def _parent_and_split(
+    m: Measurement, domaene: Sequence[int], blaetter: Sequence[int], k: CollectiveConfig
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
-    """Wer haengt woran, und mit welchem Verhaeltnis.
+    """Who attaches to what, and in which ratio.
 
-    Das Aufteilungsverhaeltnis ist ein eigener Stellhebel: konzentriert das
-    Blatt seinen Verkehr auf einen Elternteil, bleibt den schnellen Karten
-    untereinander weniger uebrig (in Lane-Einheiten gerechnet: gleichmaessig
-    2+2 laesst B<->C sechs Lanes, konzentriert 4+0 nur vier). Fuer die
-    Gesamtdauer auf einem Drei-Karten-Rig aendert es nichts, bei mehr
-    Raengen sehr wohl -- deshalb steuerbar.
+    The split ratio is its own lever: if a leaf concentrates its traffic
+    on a single parent, less is left over for the fast cards among
+    themselves (in lane units: an even 2+2 leaves B<->C six lanes,
+    concentrated 4+0 only four). On a three-card rig this changes nothing
+    about the total duration, but with more ranks it very much does --
+    hence it's configurable.
 
-    ``auto`` = proportional zur gemessenen Kante, ABER durch R3 gedeckelt:
-    wo die Kapazitaeten der Eltern zu weit auseinanderliegen, bringt
-    Proportionalitaet nichts, weil der Fan-in-Deckel ohnehin gleichmaessig
-    teilt -- dort wird gleichmaessig aufgeteilt.
+    ``auto`` = proportional to the measured edge, BUT capped by R3: where
+    the parents' capacities are too far apart, proportionality buys
+    nothing, because the fan-in cap splits evenly regardless -- there, it
+    is split evenly.
     """
     gi = len(m.groessen) - 1
     eltern: dict[int, tuple[int, ...]] = {}
     aufteilung: dict[int, tuple[int, ...]] = {}
     modus = k.aufteilung
     for b in blaetter:
-        kand = sorted(domaene, key=lambda d: (-m.kap(b, d, gi), d))
+        kand = sorted(domaene, key=lambda d: (-m.capacity(b, d, gi), d))
         if not kand:
             continue
         eltern[b] = tuple(kand)
@@ -1246,9 +1253,9 @@ def _eltern_und_aufteilung(
             gew = modus.get(m.bdfs[b])
             if gew is not None:
                 if len(gew) != len(kand):
-                    raise KonfigFehler(
-                        f"kollektiv.aufteilung[{m.bdfs[b]!r}] nennt {len(gew)} "
-                        f"Gewichte, das Blatt hat aber {len(kand)} Eltern "
+                    raise ConfigError(
+                        f"kollektiv.aufteilung[{m.bdfs[b]!r}] names {len(gew)} "
+                        f"weights, but the leaf has {len(kand)} parents "
                         f"{[m.bdfs[d] for d in kand]}"
                     )
                 aufteilung[b] = _promille(gew)
@@ -1256,7 +1263,7 @@ def _eltern_und_aufteilung(
             modus_b = "auto"
         else:
             modus_b = modus
-        raten = [m.kap(b, d, gi) for d in kand]
+        raten = [m.capacity(b, d, gi) for d in kand]
         if modus_b == "gleich" or not any(raten):
             aufteilung[b] = _promille([1.0] * len(kand))
         elif modus_b == "proportional":
@@ -1277,28 +1284,28 @@ def _promille(gew: Sequence[float]) -> tuple[int, ...]:
     roh = [g / s * 1000.0 for g in gew]
     ganz = [int(x) for x in roh]
     rest = 1000 - sum(ganz)
-    # Groesste Nachkommareste bekommen den Rest -- deterministisch, damit
-    # jeder Rang dasselbe Ergebnis bekommt.
+    # Largest fractional remainders get the leftover -- deterministic, so
+    # every rank arrives at the same result.
     ordn = sorted(range(len(roh)), key=lambda i: (-(roh[i] - ganz[i]), i))
     for i in ordn[:rest]:
         ganz[i] += 1
     return tuple(ganz)
 
 
-def _ringfolge(m: Messung, welt: int) -> tuple[int, ...]:
-    """Nach gemessener Kapazitaet geordneter Ring.
+def _ring_order(m: Measurement, welt: int) -> tuple[int, ...]:
+    """Ring ordered by measured capacity.
 
-    Der Ring gewinnt unter anderem, weil er die Nachbarschaften so legen
-    kann, dass der Verkehr lokal bleibt und geteilte Engpaesse nur einmal
-    je Runde gequert werden. Die Ordnung entsteht hier **aus den
-    Messwerten** (gierige Rundreise ueber die staerksten Kanten); die
-    PCI-Naehe geht nur als Unentschieden-Brecher ein und nie als
-    Entscheidung -- ``lspci`` ist Startschaetzung, nicht Wahrheit.
+    The ring wins, among other reasons, because it can lay out
+    neighborhoods so that traffic stays local and shared bottlenecks are
+    crossed only once per round. The order here is built **from the
+    measurements** (a greedy tour over the strongest edges); PCI
+    proximity is used only as a tie-break and never as a decision --
+    ``lspci`` is a starting estimate, not truth.
     """
     if welt < 2:
         return tuple(range(welt))
     gi = len(m.groessen) - 1
-    start = min(range(welt), key=lambda r: (-_knotenkapazitaet(m, r), r))
+    start = min(range(welt), key=lambda r: (-_node_capacity(m, r), r))
     folge = [start]
     offen = set(range(welt)) - {start}
     while offen:
@@ -1306,8 +1313,8 @@ def _ringfolge(m: Messung, welt: int) -> tuple[int, ...]:
         naechster = min(
             offen,
             key=lambda j: (
-                -min(m.kap(letzter, j, gi), m.kap(j, letzter, gi)),
-                -_pci_naehe(m.bdfs[letzter], m.bdfs[j]),
+                -min(m.capacity(letzter, j, gi), m.capacity(j, letzter, gi)),
+                -_pci_proximity(m.bdfs[letzter], m.bdfs[j]),
                 j,
             ),
         )
@@ -1316,12 +1323,12 @@ def _ringfolge(m: Messung, welt: int) -> tuple[int, ...]:
     return tuple(folge)
 
 
-def _pci_naehe(a: str, b: str) -> int:
-    """Nur Unentschieden-Brecher: Laenge des gemeinsamen sysfs-Pfades.
+def _pci_proximity(a: str, b: str) -> int:
+    """Tie-break only: length of the shared sysfs path.
 
-    Zwei Karten unter demselben Switch teilen einen laengeren Pfad als
-    zwei an verschiedenen Root-Ports. Das ist eine Topologieaussage, keine
-    Kapazitaetsaussage -- deshalb steht sie hier und nirgends sonst.
+    Two cards under the same switch share a longer path than two on
+    different root ports. This is a statement about topology, not about
+    capacity -- which is why it lives here and nowhere else.
     """
     try:
         pa = os.path.realpath(f"/sys/bus/pci/devices/{a}")
@@ -1336,16 +1343,16 @@ def _pci_naehe(a: str, b: str) -> int:
     return n
 
 
-def _staffelplan(
-    m: Messung, welt: int, verhaeltnis: float
+def _tier_plan(
+    m: Measurement, welt: int, verhaeltnis: float
 ) -> dict[int, tuple[tuple[int, ...], ...]]:
-    """R3 als Fahrplan: wer darf gleichzeitig in dasselbe Ziel schreiben.
+    """R3 as a schedule: who may write into the same destination at the same time.
 
-    Regel aus der Fan-in-Messung: der Deckel wird gleichmaessig je Quelle
-    aufgeteilt, nicht nach Leistungsfaehigkeit. Eine x8-Quelle fiel neben
-    einer x4-Quelle von 12,81 auf 6,75 GB/s, waehrend die x4-Quelle ihre
-    6,46 behielt. Folge: Quellen, deren Kapazitaeten sich um mehr als
-    ``verhaeltnis`` unterscheiden, gehoeren in verschiedene Wellen.
+    Rule taken from the fan-in measurement: the cap is split evenly per
+    source, not by capability. An x8 source next to an x4 source dropped
+    from 12.81 to 6.75 GB/s, while the x4 source kept its 6.46. Hence:
+    sources whose capacities differ by more than ``verhaeltnis`` belong in
+    different waves.
     """
     gi = len(m.groessen) - 1
     plan: dict[int, tuple[tuple[int, ...], ...]] = {}
@@ -1354,13 +1361,13 @@ def _staffelplan(
         if len(quellen) < 2:
             plan[ziel] = (tuple(quellen),)
             continue
-        quellen.sort(key=lambda q: (-m.kap(q, ziel, gi), q))
+        quellen.sort(key=lambda q: (-m.capacity(q, ziel, gi), q))
         wellen: list[list[int]] = []
         for q in quellen:
-            rate = m.kap(q, ziel, gi)
+            rate = m.capacity(q, ziel, gi)
             gelegt = False
             for welle in wellen:
-                raten = [m.kap(x, ziel, gi) for x in welle] + [rate]
+                raten = [m.capacity(x, ziel, gi) for x in welle] + [rate]
                 lo, hi = min(raten), max(raten)
                 if lo > 0 and hi / lo <= verhaeltnis:
                     welle.append(q)
@@ -1372,23 +1379,23 @@ def _staffelplan(
     return plan
 
 
-def _chunk_bytes(m: Messung, k: KollektivKonfig, welt: int) -> int:
-    """Chunkgroesse aus gemessenen Schrittkosten und gemessener Rate.
+def _chunk_bytes(m: Measurement, k: CollectiveConfig, welt: int) -> int:
+    """Chunk size from measured step cost and measured rate.
 
-    Pipelining ist nach dem Kollektiv-Entwurf wahrscheinlich mehr wert als
-    die Topologiewahl (ohne Chunking laufen Hin- und Rueckweg des Blatts
-    nacheinander: 266 statt 133 us). Zu kleine Chunks ersaeufen im
-    Schrittaufwand, zu grosse ueberlappen nicht mehr.
+    Per the collective design, pipelining is probably worth more than the
+    topology choice (without chunking, the leaf's outbound and return
+    trips run sequentially: 266 instead of 133 us). Chunks too small drown
+    in per-step overhead, chunks too large stop overlapping.
 
-    Regel: ein Chunk soll rund viermal so lange uebertragen, wie ein
-    Schritt kostet. Beide Zahlen sind gemessen.
+    Rule: a chunk should take roughly four times as long to transfer as
+    one step costs. Both numbers are measured.
     """
     if k.chunk_kib is not None:
         return k.chunk_kib * 1024
     gi = len(m.groessen) - 1
-    raten = [m.kap(i, j, gi) for i in range(welt) for j in range(welt) if i != j]
+    raten = [m.capacity(i, j, gi) for i in range(welt) for j in range(welt) if i != j]
     rate = statistics.median(raten) if raten else 1.0
-    schritt = m.schritt_s()
+    schritt = m.step_s()
     if schritt <= 0 or rate <= 0:
         return 256 * 1024
     ziel = 4.0 * schritt * rate * 1e9
@@ -1397,143 +1404,141 @@ def _chunk_bytes(m: Messung, k: KollektivKonfig, welt: int) -> int:
 
 
 # ===========================================================================
-# plane(): Messung + Konfiguration -> Plan
+# plan_collective(): measurement + configuration -> plan
 # ===========================================================================
 
 
-def _fensterbedarf(algorithmus: str, nbytes: int, welt: int) -> int:
-    """Gleiche Rechnung wie ``htccl_bar1.fensterbedarf`` -- hier lokal, damit
-    der Planer ohne den BAR1-Transport benutzbar (und pruefbar) bleibt.
+def _window_requirement(algorithmus: str, nbytes: int, welt: int) -> int:
+    """Same calculation as ``htccl_bar1.window_requirement`` -- kept local here so
+    the planner stays usable (and testable) without the BAR1 transport.
 
-    **An den portierten Kernen nachgezaehlt**, nicht geschaetzt: Netz und
-    Ring brauchen BEIDE ``2(R-1)`` Schlitze zu ``ceil(N/R)``.
+    **Counted against the ported kernels**, not estimated: mesh and ring
+    BOTH need ``2(R-1)`` slots of ``ceil(N/R)``.
 
-    * Netz: ``R-1`` fuer den Reduce-Scatter und noch einmal ``R-1`` fuer den
-      Allgather. Getrennt, weil zwischen "ich lese meine RS-Schlitze" und
-      "der andere schreibt seinen AG-Chunk" keine Ordnung steht.
-    * Ring: einer je Schritt, und es gibt ``2(R-1)`` Schritte. Zwei Schlitze
-      abwechselnd zu benutzen ginge nur, wenn der Sender den Fortschritt
-      seines NACHFOLGERS beobachtete -- er beobachtet aber nur seinen
-      Vorgaenger.
-    * Stern: ``R-1`` volle Puffer auf der Nabe.
+    * Mesh: ``R-1`` for the reduce-scatter and another ``R-1`` for the
+      all-gather. Kept separate, because there is no ordering between "I
+      read my RS slots" and "the other side writes its AG chunk".
+    * Ring: one per step, and there are ``2(R-1)`` steps. Alternating
+      between two slots would only work if the sender observed its
+      SUCCESSOR's progress -- but it only observes its predecessor.
+    * Star: ``R-1`` full buffers on the hub.
 
-    KORREKTUR: hier stand fuer den Ring ``2*2*anteil``, also vier Schlitze
-    unabhaengig von R. Bei ``R=3`` ist das derselbe Wert (``2(R-1) = 4``)
-    und deshalb nie aufgefallen; ab ``R=4`` war er zu klein. Ein zu kleiner
-    Bedarf laesst einen Algorithmus zur Wahl zu, den die Abbildung nicht
-    traegt -- und der Fehler faellt dann erst im Transport auf.
+    CORRECTION: this used to say ``2*2*anteil`` for the ring, i.e. four
+    slots regardless of R. At ``R=3`` that is the same value
+    (``2(R-1) = 4``) and so it never stood out; from ``R=4`` on it was too
+    small. An undersized requirement lets an algorithm be selected that
+    the mapping cannot actually carry -- and the bug then only shows up
+    in the transport.
     """
     if welt < 2:
         return 0
     anteil = -(-nbytes // welt)
-    if algorithmus in ("netz", "ring", "hierarchisch"):
+    if algorithmus in ("mesh", "ring", "hierarchisch"):
         return 2 * (welt - 1) * anteil
-    if algorithmus == "stern":
+    if algorithmus == "star":
         return 2 * (welt - 1) * nbytes
     return 0
 
 
-def plane(m: Messung, k: HtcclKonfig, quelle: str = "gemessen",
+def plan_collective(m: Measurement, k: HtcclConfig, source: str = "gemessen",
           fenster_bytes: Optional[int] = None) -> Plan:
-    """Rein rechnend, ohne jede Ein-/Ausgabe -- damit pruefbar ohne Hardware.
+    """Purely computational, with no I/O at all -- so it's testable without hardware.
 
-    Ausschliesslich Funktion von ``(m, k, fenster_bytes)``. Zwei Raenge mit
-    denselben Eingaben bekommen zwingend denselben Plan; genau das prueft
-    ``HTCCLMatrixPlaner`` danach ueber die Pruefsumme.
+    Exclusively a function of ``(m, k, fenster_bytes)``. Two ranks with
+    the same inputs are guaranteed to get the same plan; that is exactly
+    what ``HTCCLMatrixPlanner`` checks afterwards via the checksum.
 
-    ``fenster_bytes`` ist, wieviel BAR1 je Ziel gleichzeitig abgebildet
-    werden kann -- also eine **Faehigkeit**, keine Politik. Ist sie bekannt,
-    faellt jeder Algorithmus heraus, dessen Fensterbedarf sie ueberschreitet.
-    Das ist der zweite Grund, aus dem der Ring gewinnen kann: er braucht
-    zwei Schlitze zu ``N/R``, das Netz ``R-1``. ``None`` heisst "unbekannt"
-    und schliesst nichts aus -- nicht "unbegrenzt".
+    ``fenster_bytes`` is how much BAR1 can be mapped simultaneously per
+    destination -- i.e. a **capability**, not a policy. If it is known,
+    any algorithm whose window requirement exceeds it drops out. This is
+    the second reason the ring can win: it needs two slots of ``N/R``,
+    the mesh needs ``R-1``. ``None`` means "unknown" and rules nothing
+    out -- not "unlimited".
     """
     c = k.kollektiv
     welt = m.welt
-    rollen, dom, blaetter = _rollen(m, c)
+    roles, dom, blaetter = _roles(m, c)
 
-    fest_dom = _domaenen_aus_konfig(m, c)
+    fest_dom = _domains_from_config(m, c)
     if fest_dom is not None:
-        # Von Hand gesetzte Domaenen: der erste Eintrag ist die
-        # Reduktionsdomaene, alles nicht Genannte wird Blatt.
+        # Manually set domains: the first entry is the reduction domain,
+        # everything not named becomes a leaf.
         genannt = {r for g in fest_dom for r in g}
         dom = sorted(fest_dom[0])
         blaetter = [r for r in range(welt) if r not in dom]
-        rollen = ["domaene" if r in dom else "blatt" for r in range(welt)]
+        roles = ["domaene" if r in dom else "blatt" for r in range(welt)]
         for r in range(welt):
-            if r not in genannt and c.rollen.get(m.bdfs[r]) is None:
-                rollen[r] = "blatt"
+            if r not in genannt and c.roles.get(m.bdfs[r]) is None:
+                roles[r] = "blatt"
 
-    eltern, aufteilung = _eltern_und_aufteilung(m, dom, blaetter, c)
-    folge = _ringfolge(m, welt)
-    staffeln = _staffelplan(m, welt, c.staffel_verhaeltnis)
+    eltern, aufteilung = _parent_and_split(m, dom, blaetter, c)
+    folge = _ring_order(m, welt)
+    staffeln = _tier_plan(m, welt, c.staffel_verhaeltnis)
     chunk = _chunk_bytes(m, c, welt)
-    schritt = m.schritt_s()
+    schritt = m.step_s()
     nabe = folge[0] if folge else 0
 
-    stufen: list[Stufe] = []
+    stufen: list[Stage] = []
     for gi, g in enumerate(m.groessen):
         vorhersage: dict[str, float] = {}
-        vorhersage["netz"] = _zeit_netz(m, gi, g, range(welt), staffeln, schritt)
-        vorhersage["ring"] = _zeit_ring(m, gi, g, folge, schritt)
-        vorhersage["stern"] = _zeit_stern(m, gi, g, nabe, welt, schritt)
+        vorhersage["mesh"] = _time_mesh(m, gi, g, range(welt), staffeln, schritt)
+        vorhersage["ring"] = _time_ring(m, gi, g, folge, schritt)
+        vorhersage["star"] = _time_star(m, gi, g, nabe, welt, schritt)
         if blaetter and len(dom) >= 2:
-            # Innerhalb der Domaene gewinnt, was dort gewinnt.
-            innen_netz = _zeit_netz(m, gi, g, dom, staffeln, schritt)
-            innen_ring = _zeit_ring(
+            # Within the domain, whatever wins there wins.
+            innen_netz = _time_mesh(m, gi, g, dom, staffeln, schritt)
+            innen_ring = _time_ring(
                 m, gi, g, [d for d in folge if d in dom] or dom, schritt
             )
-            vorhersage["hierarchisch"] = _zeit_hierarchisch(
+            vorhersage["hierarchisch"] = _time_hierarchical(
                 m, gi, g, dom, blaetter, eltern, aufteilung,
                 min(innen_netz, innen_ring), schritt, welt,
             )
 
-        # Faehigkeitsgrenze: was nicht ins Fenster passt, steht nicht zur
-        # Wahl. Ausdruecklich VOR der Politik -- eine Konfiguration darf
-        # keinen Algorithmus erzwingen, den die Hardware nicht abbilden kann.
+        # Capability limit: whatever doesn't fit the window isn't in the
+        # running. Deliberately BEFORE policy -- a configuration must not
+        # be able to force an algorithm the hardware cannot map.
         zu_gross = {
-            a: _fensterbedarf(a, g, welt) for a in list(vorhersage)
+            a: _window_requirement(a, g, welt) for a in list(vorhersage)
             if fenster_bytes is not None
-            and _fensterbedarf(a, g, welt) > fenster_bytes
+            and _window_requirement(a, g, welt) > fenster_bytes
         }
         moeglich = {a: v for a, v in vorhersage.items() if a not in zu_gross}
 
         if c.algorithmus != "auto":
             gewaehlt = c.algorithmus
             if gewaehlt in zu_gross:
-                raise KonfigFehler(
-                    f"kollektiv.algorithmus={gewaehlt} erzwungen, aber bei "
-                    f"{_kib(g)} und {welt} Raengen braucht er "
-                    f"{zu_gross[gewaehlt] // 1024} KiB Fenster; abbildbar sind "
-                    f"{fenster_bytes // 1024} KiB. Kein stiller Rueckfall -- "
-                    f"entweder kleiner chunken oder einen anderen Algorithmus "
-                    f"waehlen."
+                raise ConfigError(
+                    f"kollektiv.algorithmus={gewaehlt} forced, but at "
+                    f"{_kib(g)} and {welt} ranks it needs "
+                    f"{zu_gross[gewaehlt] // 1024} KiB of window; mappable "
+                    f"is {fenster_bytes // 1024} KiB. No silent fallback -- "
+                    f"either chunk smaller or choose a different algorithm."
                 )
-            grund = f"erzwungen ueber kollektiv.algorithmus={c.algorithmus}"
+            grund = f"forced via kollektiv.algorithmus={c.algorithmus}"
         else:
             if not moeglich:
-                raise KonfigFehler(
-                    f"Bei {_kib(g)} und {welt} Raengen passt KEIN Algorithmus "
-                    f"in das abbildbare Fenster von {fenster_bytes // 1024} "
-                    f"KiB (Bedarf: "
+                raise ConfigError(
+                    f"At {_kib(g)} and {welt} ranks NO algorithm fits into "
+                    f"the mappable window of {fenster_bytes // 1024} KiB "
+                    f"(requirement: "
                     f"{ {a: b // 1024 for a, b in zu_gross.items()} } KiB). "
-                    f"Das ist ein Startfehler und keine leise Umleitung: "
-                    f"kleiner chunken oder den Direktpfad fuer diese Groesse "
-                    f"ausschliessen."
+                    f"This is a startup error, not a quiet reroute: chunk "
+                    f"smaller, or exclude the direct path for this size."
                 )
             gewaehlt = min(moeglich, key=lambda a: (moeglich[a], a))
-            grund = _grund(m, gi, g, welt, gewaehlt, vorhersage, staffeln,
+            grund = _reason(m, gi, g, welt, gewaehlt, vorhersage, staffeln,
                            c.saettigung_anteil, blaetter)
             if zu_gross:
                 grund += (
-                    "  Ausgeschlossen, weil zu gross fuers Fenster: "
+                    "  Excluded for being too large for the window: "
                     + ", ".join(
                         f"{a} ({b // 1024} KiB > {fenster_bytes // 1024} KiB)"
                         for a, b in sorted(zu_gross.items())
                     ) + "."
                 )
         stufen.append(
-            Stufe(
+            Stage(
                 von_bytes=g,
                 max_bytes=g if gi + 1 < len(m.groessen) else -1,
                 algorithmus=gewaehlt,
@@ -1542,17 +1547,17 @@ def plane(m: Messung, k: HtcclKonfig, quelle: str = "gemessen",
             )
         )
 
-    stufen = _leiter_glaetten(stufen)
+    stufen = _smooth_ladder(stufen)
 
     zus = {
         "planer": c.planer,
         "algorithmus": c.algorithmus,
         "chunk_kib": "auto" if c.chunk_kib is None else c.chunk_kib,
         "blatt_schwelle": c.blatt_schwelle,
-        "aufteilung": c.aufteilung if isinstance(c.aufteilung, str) else "von Hand",
+        "aufteilung": c.aufteilung if isinstance(c.aufteilung, str) else "manual",
         "staffel_verhaeltnis": c.staffel_verhaeltnis,
-        "rollen (von Hand)": dict(c.rollen) or "-",
-        "domaenen (von Hand)": [list(g) for g in c.domaenen] or "-",
+        "roles (manual)": dict(c.roles) or "-",
+        "domaenen (manual)": [list(g) for g in c.domaenen] or "-",
         "nic": k.nic,
         "mess.groessen_kib": list(c.mess.groessen_kib),
         "mess.budget_ms": c.mess.budget_ms,
@@ -1560,7 +1565,7 @@ def plane(m: Messung, k: HtcclKonfig, quelle: str = "gemessen",
     return Plan(
         welt=welt,
         bdfs=m.bdfs,
-        rollen=tuple(rollen),
+        roles=tuple(roles),
         domaene=tuple(dom),
         blaetter=tuple(blaetter),
         eltern={k2: v for k2, v in sorted(eltern.items())},
@@ -1571,80 +1576,80 @@ def plane(m: Messung, k: HtcclKonfig, quelle: str = "gemessen",
         staffeln=staffeln,
         konfig_zusammenfassung=zus,
         messung=m,
-        quelle=quelle,
+        source=source,
     )
 
 
-def _grund(m: Messung, gi: int, g: int, welt: int, gewaehlt: str,
+def _reason(m: Measurement, gi: int, g: int, welt: int, gewaehlt: str,
            vorhersage: Mapping[str, float],
            staffeln: Mapping[int, tuple[tuple[int, ...], ...]],
            saettigung_anteil: float, blaetter: Sequence[int]) -> str:
-    """Ein Satz, warum. Ohne den ist die Wahl nicht nachvollziehbar."""
-    netz, ring = vorhersage.get("netz", 0.0), vorhersage.get("ring", 0.0)
+    """One sentence saying why. Without it the choice isn't traceable."""
+    mesh, ring = vorhersage.get("mesh", 0.0), vorhersage.get("ring", 0.0)
     anteil = g / welt
-    # Auslastung, die das Netz auf dem am staerksten beschriebenen Ziel
-    # erzeugen wuerde: was die R-1 Quellen zusammen anliefern wollen,
-    # gegen den gemessenen Deckel dieses Ziels.
+    # Load the mesh would create on the most heavily addressed
+    # destination: what the R-1 sources together want to deliver, against
+    # that destination's measured cap.
     last = 0.0
     for ziel in range(welt):
-        deckel = m.deckel(ziel, gi)
-        quellen = [m.kap(q, ziel, gi) for q in range(welt) if q != ziel]
-        if deckel > 0 and quellen:
-            last = max(last, sum(quellen) / deckel)
+        cap = m.cap(ziel, gi)
+        quellen = [m.capacity(q, ziel, gi) for q in range(welt) if q != ziel]
+        if cap > 0 and quellen:
+            last = max(last, sum(quellen) / cap)
     gesaettigt = last > 1.0 / max(saettigung_anteil, 1e-9)
     gestaffelt = sum(1 for w in staffeln.values() if len(w) > 1)
     t = []
-    if gewaehlt == "netz":
+    if gewaehlt == "mesh":
         if gesaettigt:
             t.append(
-                f"Netz trotz Saettigung (Nachfrage/Deckel {last:.2f}): die "
-                f"Schrittzahl ueberwiegt. 2 Schritte statt {2 * (welt - 1)}, "
-                f"und ein Schritt kostet hier {m.schritt_s() * 1e6:.1f} us."
+                f"Mesh despite saturation (demand/cap {last:.2f}): the step "
+                f"count outweighs it. 2 steps instead of {2 * (welt - 1)}, "
+                f"and one step costs {m.step_s() * 1e6:.1f} us here."
             )
         else:
             t.append(
-                f"Netz: 2 Schritte statt {2 * (welt - 1)}; Nachfrage/Deckel "
-                f"{last:.2f} liegt unter der Saettigung -- die Gleichzeitigkeit "
-                f"ist dort nahezu gratis (gemessen Quotient 0,99 bei 20 KiB)."
+                f"Mesh: 2 steps instead of {2 * (welt - 1)}; demand/cap "
+                f"{last:.2f} is below saturation -- concurrency is nearly "
+                f"free there (measured ratio 0.99 at 20 KiB)."
             )
         if gestaffelt:
-            t.append(f"{gestaffelt} Ziel(e) muessen dabei gestaffelt werden.")
+            t.append(f"{gestaffelt} destination(s) need to be staggered for this.")
     elif gewaehlt == "ring":
         t.append(
-            f"Ring: Nachfrage/Deckel {last:.2f} (Schwelle "
-            f"{1.0 / saettigung_anteil:.2f}) -- an der Saettigung bringt die "
-            f"Gleichzeitigkeit des Netzes nichts (gemessen 1,03x bei 1 MiB) "
-            f"und der Deckel wird gleichmaessig statt proportional geteilt, "
-            f"verschenkt also die schnellen Kanten. Im Ring empfaengt jeder "
-            f"Rang von genau einem Nachbarn."
+            f"Ring: demand/cap {last:.2f} (threshold "
+            f"{1.0 / saettigung_anteil:.2f}) -- at saturation, the mesh's "
+            f"concurrency buys nothing (measured 1.03x at 1 MiB) and the "
+            f"cap is split evenly instead of proportionally, wasting the "
+            f"fast edges. In the ring, every rank receives from exactly "
+            f"one neighbor."
         )
         if gestaffelt:
-            t.append(f"{gestaffelt} Ziel(e) muessten im Netz gestaffelt werden.")
+            t.append(f"{gestaffelt} destination(s) would have needed staggering in the mesh.")
     elif gewaehlt == "hierarchisch":
         t.append(
-            f"Hierarchisch: {len(blaetter)} Blatt/Blaetter tragen keinen "
-            f"Transit, sondern senden nur den eigenen Beitrag und empfangen "
-            f"nur das Ergebnis; die Domaene reduziert untereinander."
+            f"Hierarchical: {len(blaetter)} leaf/leaves carry no transit "
+            f"traffic, sending only their own contribution and receiving "
+            f"only the result; the domain reduces among itself."
         )
-    elif gewaehlt == "stern":
-        t.append("Stern: nur gewaehlt, weil alles andere schlechter vorhersagt "
-                 "oder weil er erzwungen wurde.")
-    t.append(f"(netz {netz * 1e6:.1f} us / ring {ring * 1e6:.1f} us, "
-             f"Anteil je Kante {anteil / 1024:.0f} KiB)")
+    elif gewaehlt == "star":
+        t.append("Star: chosen only because everything else predicts worse, "
+                 "or because it was forced.")
+    t.append(f"(mesh {mesh * 1e6:.1f} us / ring {ring * 1e6:.1f} us, "
+             f"share per edge {anteil / 1024:.0f} KiB)")
     return " ".join(t)
 
 
-def _leiter_glaetten(stufen: list[Stufe]) -> list[Stufe]:
-    """Aufeinanderfolgende Stufen mit gleichem Algorithmus zusammenfassen.
+def _smooth_ladder(stufen: list[Stage]) -> list[Stage]:
+    """Merge consecutive stages that use the same algorithm.
 
-    Eine Leiter mit drei Eintraegen desselben Algorithmus ist keine Leiter,
-    sondern eine Zeile -- und sie liest sich in der Erklaerung auch so.
+    A ladder with three entries of the same algorithm isn't a ladder, it's
+    a single line -- and it reads that way in the explanation too.
     """
-    aus: list[Stufe] = []
+    aus: list[Stage] = []
     for s in stufen:
         if aus and aus[-1].algorithmus == s.algorithmus:
-            # von_bytes bleibt stehen: die Stufe reicht dann von der
-            # kleinsten bis zur groessten Groesse, fuer die sie gilt.
+            # von_bytes stays as-is: the stage then spans from the
+            # smallest to the largest size it applies to.
             aus[-1] = replace(aus[-1], max_bytes=s.max_bytes,
                               vorhersage_s=s.vorhersage_s, grund=s.grund)
         else:
@@ -1655,30 +1660,30 @@ def _leiter_glaetten(stufen: list[Stufe]) -> list[Stufe]:
 
 
 # ===========================================================================
-# Zwischenspeicher
+# Cache
 # ===========================================================================
 
 
-def _vorgabe_cache() -> str:
+def _default_cache() -> str:
     basis = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return os.path.join(basis, "sglang", "htccl_matrix.json")
 
 
-def fingerabdruck(bdfs: Sequence[str], namen: Sequence[str],
-                  k: HtcclKonfig) -> str:
-    """Kartenliste, PCI-Adressen, Treiberversion, Patch-Stand, Messparameter.
+def fingerprint(bdfs: Sequence[str], namen: Sequence[str],
+                  k: HtcclConfig) -> str:
+    """Card list, PCI addresses, driver version, patch state, measurement parameters.
 
-    Aendert sich davon etwas, wird neu gemessen. Der Patch-Stand gehoert
-    ausdruecklich dazu: ohne den Regkey traegt der Direktpfad nicht, und
-    eine mit ihm gemessene Matrix ist danach falsch.
+    If any of these change, the matrix is measured again. The patch state
+    is deliberately part of it: without the regkey the direct path
+    doesn't carry, and a matrix measured with it becomes wrong afterwards.
     """
     m = k.kollektiv.mess
     teile = {
         "version": PLANER_VERSION,
         "bdfs": list(bdfs),
         "namen": list(namen),
-        "treiber": _treiberversion(),
-        "patch": _patchstand(),
+        "treiber": _driver_version(),
+        "patch": _patch_state(),
         "groessen_kib": list(m.groessen_kib),
         "wiederholungen": m.wiederholungen,
         "fanin": m.fanin,
@@ -1688,21 +1693,21 @@ def fingerabdruck(bdfs: Sequence[str], namen: Sequence[str],
     return hashlib.sha256(roh.encode()).hexdigest()[:24]
 
 
-def _treiberversion() -> str:
+def _driver_version() -> str:
     try:
         with open("/proc/driver/nvidia/version") as f:
             return f.read().strip().split("\n")[0]
     except OSError:
-        return "unbekannt"
+        return "unknown"
 
 
-def _patchstand() -> str:
-    """Regkeys des Treibers, soweit sichtbar.
+def _patch_state() -> str:
+    """Driver regkeys, as far as visible.
 
-    ``RegistryDwords`` ist die Stelle, an der ``RMSmallBarP2PPeerBar1`` und
-    ``RMPcieP2PType`` gesetzt werden. Steht dort nichts, ist der Direktpfad
-    nicht freigeschaltet -- eine damit gemessene Matrix darf nicht fuer
-    einen Lauf mit Patch wiederverwendet werden und umgekehrt.
+    ``RegistryDwords`` is where ``RMSmallBarP2PPeerBar1`` and
+    ``RMPcieP2PType`` get set. If nothing is there, the direct path isn't
+    unlocked -- a matrix measured with it must not be reused for a run
+    with the patch, and vice versa.
     """
     try:
         with open("/proc/driver/nvidia/params") as f:
@@ -1712,191 +1717,193 @@ def _patchstand() -> str:
             ]
         return "|".join(zeilen)
     except OSError:
-        return "unbekannt"
+        return "unknown"
 
 
-def lies_cache(pfad: str, fa: str) -> Optional[Messung]:
+def read_cache(pfad: str, fa: str) -> Optional[Measurement]:
     try:
         with open(pfad) as f:
             d = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if d.get("fingerabdruck") != fa:
+    if d.get("fingerprint") != fa:
         return None
     try:
-        return Messung.aus_dict(d["messung"])
+        return Measurement.from_dict(d["messung"])
     except (KeyError, TypeError, ValueError) as e:
-        logger.warning("HTCCL-Matrix: Zwischenspeicher %s unlesbar (%s); neu messen.",
+        logger.warning("HTCCL-Matrix: cache %s unreadable (%s); measuring again.",
                        pfad, e)
         return None
 
 
-def schreibe_cache(pfad: str, fa: str, m: Messung) -> None:
+def write_cache(pfad: str, fa: str, m: Measurement) -> None:
     try:
         p = pathlib.Path(pfad)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(p.suffix + f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(
-            {"fingerabdruck": fa, "messung": m.als_dict()},
+            {"fingerprint": fa, "messung": m.as_dict()},
             sort_keys=True, indent=1,
         ))
         tmp.replace(p)
     except OSError as e:
-        logger.warning("HTCCL-Matrix: Zwischenspeicher %s nicht schreibbar (%s).",
+        logger.warning("HTCCL-Matrix: cache %s not writable (%s).",
                        pfad, e)
 
 
 # ===========================================================================
-# Der Planer: Ablauf beim Start
+# The planner: what happens at startup
 # ===========================================================================
 
 
-class HTCCLMatrixPlaner:
-    """Misst, plant, prueft die Rangeinheitlichkeit, erklaert.
+class HTCCLMatrixPlanner:
+    """Measures, plans, checks rank uniformity, explains.
 
-    Aufruf::
+    Usage::
 
-        planer = HTCCLMatrixPlaner(cpu_group, device, konfig=lade_konfig())
-        plan = planer.plan()            # misst beim ersten Aufruf
-        logger.info("%s", plan.erklaerung())
+        planer = HTCCLMatrixPlanner(cpu_group, device, config=load_config())
+        plan = planer.plan()            # measures on the first call
+        logger.info("%s", plan.explanation())
 
-    Der Plan ist danach **eingefroren**. Das ist keine Bequemlichkeit,
-    sondern Auflage: Decode laeuft in aufgezeichneten CUDA-Graphen, und die
-    Wahl muss zum Aufzeichnungszeitpunkt feststehen. Eine Umschaltung je
-    Nachricht erzwaenge ein Re-Capture. Dynamik nach Last ist nur ausserhalb
-    aufgezeichneter Bereiche zulaessig und dann ueber mehrere
-    aufgezeichnete Varianten, nicht ueber eine Aenderung an diesem Plan.
+    The plan is **frozen** afterwards. This is not a convenience, it's a
+    requirement: decode runs inside captured CUDA graphs, and the choice
+    must be fixed at capture time. Switching per message would force a
+    re-capture. Load-dependent dynamism is only allowed outside captured
+    regions, and then via multiple captured variants, not via a change to
+    this plan.
     """
 
-    def __init__(self, cpu_group, device, konfig: Optional[HtcclKonfig] = None,
-                 fuehler: Optional[Fuehler] = None,
+    def __init__(self, cpu_group, device, config: Optional[HtcclConfig] = None,
+                 fuehler: Optional[Sensor] = None,
                  fenster_bytes: Optional[int] = None):
         import torch.distributed as dist
 
         self.cpu_group = cpu_group
         self.device = device
-        self.konfig = konfig if konfig is not None else lade_konfig()
+        self.config = config if config is not None else load_config()
         self.rank = dist.get_rank(cpu_group)
         self.welt = dist.get_world_size(cpu_group)
         self._fuehler = fuehler
-        # Faehigkeit, nicht Politik: wieviel BAR1 je Ziel gleichzeitig
-        # abbildbar ist. None = unbekannt (schliesst nichts aus).
+        # Capability, not policy: how much BAR1 can be mapped
+        # simultaneously per destination. None = unknown (rules nothing
+        # out).
         self.fenster_bytes = fenster_bytes
         self._plan: Optional[Plan] = None
 
-    # -- oeffentlich --------------------------------------------------------
+    # -- public -----------------------------------------------------------
 
     def plan(self) -> Plan:
         if self._plan is None:
-            self._plan = self._baue()
+            self._plan = self._build()
         return self._plan
 
-    # -- innen --------------------------------------------------------------
+    # -- internal -----------------------------------------------------------
 
-    def _baue(self) -> Plan:
+    def _build(self) -> Plan:
         import torch.distributed as dist
 
-        c = self.konfig.kollektiv
-        bdfs, namen = self._karten()
-        fa = fingerabdruck(bdfs, namen, self.konfig)
+        c = self.config.kollektiv
+        bdfs, namen = self._cards()
+        fa = fingerprint(bdfs, namen, self.config)
 
         if c.planer == "aus":
-            m = self._synthetische_messung(bdfs, namen)
-            p = plane(m, self.konfig, quelle="fest",
+            m = self._synthetic_measurement(bdfs, namen)
+            p = plan_collective(m, self.config, source="fest",
                       fenster_bytes=self.fenster_bytes)
-            self._pruefe_einheitlich(p)
+            self._check_uniform(p)
             return p
 
-        pfad = c.mess.cache or _vorgabe_cache()
+        pfad = c.mess.cache or _default_cache()
         m = None
         if not c.mess.cache_aus:
-            # Nur Rang 0 liest und verteilt -- sonst koennten zwei Raenge
-            # verschieden alte Dateien sehen und verschieden planen.
+            # Only rank 0 reads and distributes -- otherwise two ranks
+            # could see differently stale files and plan differently.
             traeger: list[Any] = [None]
             if self.rank == 0:
-                gefunden = lies_cache(pfad, fa)
-                traeger = [gefunden.als_dict() if gefunden is not None else None]
+                gefunden = read_cache(pfad, fa)
+                traeger = [gefunden.as_dict() if gefunden is not None else None]
             dist.broadcast_object_list(
                 traeger, src=dist.get_global_rank(self.cpu_group, 0),
                 group=self.cpu_group,
             )
             if traeger[0] is not None:
-                m = Messung.aus_dict(traeger[0])
+                m = Measurement.from_dict(traeger[0])
                 logger.info(
-                    "HTCCL-Matrix: Startmessung uebersprungen, "
-                    "Zwischenspeicher %s passt (Fingerabdruck %s). "
-                    "Neu messen mit SGLANG_HTCCL_MATRIX_CACHE_AUS=1.", pfad, fa,
+                    "HTCCL-Matrix: startup measurement skipped, cache %s "
+                    "matches (fingerprint %s). Force a re-measure with "
+                    "SGLANG_HTCCL_MATRIX_CACHE_OFF=1.", pfad, fa,
                 )
 
-        quelle = "zwischenspeicher"
+        source = "zwischenspeicher"
         if m is None:
             if c.planer == "fest":
-                # 'fest' heisst ausdruecklich: nicht messen, den abgelegten
-                # Befund verwenden. Fehlt er, ist das ein benannter Fehler --
-                # heimlich doch zu messen waere genau der stille Rueckfall,
-                # den dieser Entwurf verbietet.
-                raise KonfigFehler(
-                    f"kollektiv.planer=fest, aber unter {pfad!r} liegt kein "
-                    f"Befund mit dem Fingerabdruck {fa} (Kartenliste, "
-                    f"PCI-Adressen, Treiberversion, Patch-Stand, "
-                    f"Messparameter). Entweder einmal mit planer=auto messen "
-                    f"lassen oder den Pfad ueber SGLANG_HTCCL_MATRIX_CACHE "
-                    f"auf einen gueltigen Befund zeigen."
+                # 'fest' deliberately means: don't measure, use the stored
+                # result. If it's missing, that's a named error -- quietly
+                # measuring anyway would be exactly the silent fallback
+                # this design forbids.
+                raise ConfigError(
+                    f"kollektiv.planer=fest, but there is no result under "
+                    f"{pfad!r} with fingerprint {fa} (card list, PCI "
+                    f"addresses, driver version, patch state, measurement "
+                    f"parameters). Either measure once with planer=auto, or "
+                    f"point the path via SGLANG_HTCCL_MATRIX_CACHE at a "
+                    f"valid result."
                 )
-            quelle = "gemessen"
-            m = self._messe(bdfs, namen)
+            source = "gemessen"
+            m = self._measure(bdfs, namen)
             if not c.mess.cache_aus and self.rank == 0:
-                schreibe_cache(pfad, fa, m)
+                write_cache(pfad, fa, m)
 
-        p = plane(m, self.konfig, quelle=quelle,
+        p = plan_collective(m, self.config, source=source,
                   fenster_bytes=self.fenster_bytes)
-        self._pruefe_einheitlich(p)
+        self._check_uniform(p)
         return p
 
-    # -- Karten -------------------------------------------------------------
+    # -- cards --------------------------------------------------------------
 
-    def _karten(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def _cards(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         import torch
         import torch.distributed as dist
 
-        bdf = bdf_der_karte(self.device)
+        bdf = bdf_of_card(self.device)
         try:
             name = torch.cuda.get_device_name(self.device)
         except Exception:                       # pragma: no cover
-            name = "unbekannt"
+            name = "unknown"
         gesammelt: list[Any] = [None] * self.welt
         dist.all_gather_object(gesammelt, (bdf, name), group=self.cpu_group)
         bdfs = tuple(str(x[0]) for x in gesammelt)   # type: ignore[index]
         namen = tuple(str(x[1]) for x in gesammelt)  # type: ignore[index]
         if len(set(bdfs)) != len(bdfs):
             logger.warning(
-                "HTCCL-Matrix: doppelte PCI-Adressen %s. Rollen und Domaenen "
-                "werden ueber die Adresse angesprochen; mit Doppelungen "
-                "greift eine Konfiguration nicht eindeutig.", bdfs,
+                "HTCCL-Matrix: duplicate PCI addresses %s. Roles and "
+                "domains are addressed via the PCI address; with "
+                "duplicates a configuration cannot be applied "
+                "unambiguously.", bdfs,
             )
         return bdfs, namen
 
-    # -- Messung ------------------------------------------------------------
+    # -- measurement ------------------------------------------------------------
 
-    def _messe(self, bdfs, namen) -> Messung:
+    def _measure(self, bdfs, namen) -> Measurement:
         import torch.distributed as dist
 
-        c = self.konfig.kollektiv
-        mk = self._budget_anpassen(c.mess)
+        c = self.config.kollektiv
+        mk = self._adjust_budget(c.mess)
         groessen = tuple(g * 1024 for g in mk.groessen_kib)
-        f = self._fuehler if self._fuehler is not None else EigenlastFuehler(
+        f = self._fuehler if self._fuehler is not None else SelfLoadSensor(
             self.device, max_bytes=max(groessen),
             wiederholungen=mk.wiederholungen,
         )
         t_start = time.perf_counter()
-        m = Messung(
+        m = Measurement(
             welt=self.welt, groessen=groessen, bdfs=bdfs, namen=namen,
             fuehler=f.name(),
         )
 
-        # -- Phase 1: Eigenlast, gestaffelt. -------------------------------
-        # Nacheinander, nicht gleichzeitig: sonst konkurrieren R Karten um
-        # denselben Host-Speicher und die Zahlen messen die Gegenseite.
+        # -- Phase 1: self-load, staggered. --------------------------------
+        # Sequential, not simultaneous: otherwise R cards compete for the
+        # same host memory and the numbers end up measuring each other.
         eigen_aus: list[float] = []
         eigen_ein: list[float] = []
         eigen_dup: list[float] = []
@@ -1904,11 +1911,11 @@ class HTCCLMatrixPlaner:
             dist.barrier(group=self.cpu_group)
             if besitzer == self.rank:
                 for g in groessen:
-                    eigen_aus.append(_quant(f.eigenlast(g, "aus")))
-                    eigen_ein.append(_quant(f.eigenlast(g, "ein")))
+                    eigen_aus.append(_quant(f.self_load(g, "aus")))
+                    eigen_ein.append(_quant(f.self_load(g, "ein")))
                 if mk.duplex:
                     for g in groessen:
-                        d = f.eigenlast_duplex(g)
+                        d = f.self_load_duplex(g)
                         eigen_dup.append(_quant(d) if d is not None else 0.0)
             dist.barrier(group=self.cpu_group)
 
@@ -1921,10 +1928,10 @@ class HTCCLMatrixPlaner:
             m.ein[r] = list(e)
             if d and any(x > 0 for x in d):
                 m.duplex_summe[r] = list(d)
-            m.latenz_s[r] = _latenz_fit(groessen, list(a))
+            m.latenz_s[r] = _latency_fit(groessen, list(a))
 
-        # -- Phase 2: echte Kantenmessung, wenn ein Paar-Fuehler da ist. ----
-        hat_paar = self._hat_paarfuehler(f, groessen)
+        # -- Phase 2: real edge measurement, if a pair sensor is present. ----
+        hat_paar = self._has_pair_sensor(f, groessen)
         if hat_paar:
             for von in range(self.welt):
                 for nach in range(self.welt):
@@ -1934,11 +1941,11 @@ class HTCCLMatrixPlaner:
                     werte: list[float] = []
                     if self.rank == von:
                         for g in groessen:
-                            r = f.paar(nach, g)
+                            r = f.pair(nach, g)
                             werte.append(_quant(r) if r is not None else 0.0)
                     elif self.rank == nach:
                         for g in groessen:
-                            f.paar_empfang(von, g)
+                            f.pair_receive(von, g)
                     dist.barrier(group=self.cpu_group)
                     traeger: list[Any] = [werte if self.rank == von else None]
                     dist.broadcast_object_list(
@@ -1948,62 +1955,64 @@ class HTCCLMatrixPlaner:
                     if traeger[0]:
                         m.kante[(von, nach)] = list(traeger[0])
 
-            # -- Phase 3: Fan-in (R3). Alle Quellen gleichzeitig ins Ziel. --
+            # -- Phase 3: fan-in (R3). All sources into the destination at once. --
             if mk.fanin:
                 for ziel in range(self.welt):
                     dist.barrier(group=self.cpu_group)
                     werte = []
                     if self.rank != ziel:
                         for g in groessen:
-                            r = f.paar(ziel, g)
+                            r = f.pair(ziel, g)
                             werte.append(_quant(r) if r is not None else 0.0)
                     else:
                         for g in groessen:
-                            f.paar_empfang(-1, g)
+                            f.pair_receive(-1, g)
                     dist.barrier(group=self.cpu_group)
                     alle: list[Any] = [None] * self.welt
                     dist.all_gather_object(alle, werte, group=self.cpu_group)
-                    deckel = []
+                    cap = []
                     for gi in range(len(groessen)):
                         s = sum(v[gi] for r, v in enumerate(alle) if r != ziel and v)
-                        deckel.append(_quant(s))
-                    m.fanin_deckel[ziel] = deckel
+                        cap.append(_quant(s))
+                    m.fanin_deckel[ziel] = cap
                     for r, v in enumerate(alle):
                         if r != ziel and v:
                             m.fanin_anteile[(r, ziel)] = list(v)
                 m.hinweise.append(
-                    "Fan-in: die Quellen starten gemeinsam an einer Barriere, "
-                    "laufen die Groessenleiter danach aber unabhaengig ab. Bei "
-                    "stark ungleichen Karten ueberlappen die Groessen nicht "
-                    "vollstaendig; der gemessene Deckel ist damit eher eine "
-                    "UNTERgrenze der Gleichzeitigkeit. Eine verschraenkte "
-                    "Schleife hinter einem gemeinsamen Startgatter (wie in "
-                    "sonden/nebenlauf_probe.cu) waere genauer und braeuchte "
-                    "einen Fuehler, der beide Straenge selbst verschraenkt."
+                    "Fan-in: the sources start together at a barrier, but "
+                    "then run the size ladder independently afterwards. "
+                    "With strongly mismatched cards, the sizes don't fully "
+                    "overlap; the measured cap is therefore more of a "
+                    "LOWER bound on concurrency. An interleaved loop behind "
+                    "a shared start gate (as in "
+                    "sonden/nebenlauf_probe.cu) would be more accurate and "
+                    "would need a sensor that interleaves both strands itself."
                 )
-            # -- Phase 4: geteilte Engpaesse. ALLE Paare gleichzeitig. ------
-            # Der einzige Weg, den Unterschied zwischen "Netz" und "Ring" zu
-            # messen statt zu behaupten: im Netz reden alle Paare
-            # gleichzeitig, im Ring nur die Nachbarn. Was dabei ueber
-            # Switch-Uplinks und NUMA-Spruenge verlorengeht, steht in keiner
-            # Kantenkapazitaet -- die wurde je Kante EINZELN gemessen.
+            # -- Phase 4: shared bottlenecks. ALL pairs simultaneously. ------
+            # The only way to measure the difference between "mesh" and
+            # "ring" instead of just asserting it: in the mesh all pairs
+            # talk simultaneously, in the ring only the neighbors. Whatever
+            # is lost to switch uplinks and NUMA hops along the way shows
+            # up in no per-edge capacity -- those were each measured on
+            # their own edge, INDIVIDUALLY.
             #
-            # Methodik wie in sonden/nebenlauf_probe.cu: derselbe Strang
-            # zweimal, allein und gemeinsam, und verglichen werden RATEN,
-            # nicht Wanduhrzeiten. Ein Vergleich von Wanduhr gegen
-            # Einzeltransfer waere um die Wiederholungszahl daneben.
+            # Methodology as in sonden/nebenlauf_probe.cu: the same strand
+            # twice, alone and together, and what's compared is RATES, not
+            # wall-clock times. Comparing wall clock against a single
+            # transfer would be off by the repetition count.
             #
-            # Je Runde schreibt Rang i an Rang (i+versatz) mod R. Das ist
-            # eine perfekte Paarung: jeder sendet genau einmal und empfaengt
-            # genau einmal, also keine Fan-in-Konkurrenz -- gemessen wird
-            # hier ausschliesslich der geteilte Engpass, nicht der Deckel.
+            # Each round, rank i writes to rank (i+versatz) mod R. This is
+            # a perfect pairing: everyone sends exactly once and receives
+            # exactly once, so there is no fan-in contention -- what's
+            # measured here is exclusively the shared bottleneck, not the
+            # cap.
             gemeinsam: dict[tuple[int, int], list[float]] = {}
             for versatz in range(1, self.welt):
                 nach = (self.rank + versatz) % self.welt
                 dist.barrier(group=self.cpu_group)
                 meine: list[float] = []
                 for g in groessen:
-                    r = f.paar(nach, g)
+                    r = f.pair(nach, g)
                     meine.append(_quant(r) if r is not None else 0.0)
                 gesammelt2: list[Any] = [None] * self.welt
                 dist.all_gather_object(gesammelt2, meine, group=self.cpu_group)
@@ -2013,11 +2022,11 @@ class HTCCLMatrixPlaner:
 
             faktoren = []
             for gi in range(len(groessen)):
-                # Schlimmste Verschlechterung ueber alle Kanten: der Netz-
-                # Schritt ist so schnell wie seine langsamste Kante.
+                # Worst-case degradation across all edges: the mesh step
+                # is only as fast as its slowest edge.
                 schlimmster = 1.0
                 for (von, nach), raten in gemeinsam.items():
-                    allein = m.kap(von, nach, gi)
+                    allein = m.capacity(von, nach, gi)
                     zus = raten[gi]
                     if allein > 0 and zus > 0:
                         schlimmster = max(schlimmster, allein / zus)
@@ -2026,27 +2035,25 @@ class HTCCLMatrixPlaner:
             m.netz_faktor_gemessen = True
         else:
             m.hinweise.append(
-                "Kein Paar-Fuehler: die Kantenkapazitaeten sind aus der "
-                "Eigenlast geschaetzt (min(Ausgang, Eingang)) und damit eine "
-                "OBERGRENZE -- geteilte Engpaesse wie ein Switch-Uplink oder "
-                "ein zweiter Root-Complex sind darin nicht sichtbar. Der "
-                "Fan-in-Deckel ist die Eingangsrate, nicht der gemessene "
-                "BAR1-Deckel."
+                "No pair sensor: edge capacities are estimated from "
+                "self-load (min(outbound, inbound)) and are therefore an "
+                "UPPER BOUND -- shared bottlenecks such as a switch uplink "
+                "or a second root complex are not visible in them. The "
+                "fan-in cap is the inbound rate, not a measured BAR1 cap."
             )
             m.netz_faktor = [1.0] * len(groessen)
             m.netz_faktor_gemessen = False
             m.hinweise.append(
-                "GETEILTE ENGPAESSE UNGEMESSEN (netz_faktor = 1,0 gesetzt). "
-                "Ohne Paar-Fuehler laesst sich nicht messen, wieviel eine "
-                "Kante verliert, wenn ALLE Paare gleichzeitig reden statt nur "
-                "eines. Genau daran haengt die Erwartung, dass der Ring an "
-                "der Saettigung gewinnt: bei reinen Kantenkapazitaeten und "
-                "Fan-in-Deckeln bewegen Netz und Ring dieselben Bytes durch "
-                "denselben Deckel, und das Netz gewinnt dann IMMER ueber die "
-                "Schrittzahl. Solange dieser Faktor 1,0 ist, waehlt der "
-                "Planer folgerichtig nie den Ring -- das ist ein fehlender "
-                "Messwert, kein Ergebnis. Ueberstimmbar mit "
-                "SGLANG_HTCCL_NETZ_FAKTOR."
+                "SHARED BOTTLENECKS UNMEASURED (netz_faktor set to 1.0). "
+                "Without a pair sensor there is no way to measure how much "
+                "an edge loses when ALL pairs talk at once instead of just "
+                "one. This is exactly what the expectation that the ring "
+                "wins at saturation depends on: with plain edge capacities "
+                "and fan-in caps, mesh and ring move the same bytes through "
+                "the same cap, and the mesh then ALWAYS wins on step count. "
+                "As long as this factor is 1.0, the planner consistently "
+                "never picks the ring -- that is a missing measurement, not "
+                "a result. Overridable with SGLANG_HTCCL_MESH_FACTOR."
             )
 
         ueber = os.environ.get(_ENV_PRAEFIX + "NETZ_FAKTOR")
@@ -2055,176 +2062,178 @@ class HTCCLMatrixPlaner:
             if len(werte) == 1:
                 werte = werte * len(groessen)
             if len(werte) != len(groessen):
-                raise KonfigFehler(
-                    f"SGLANG_HTCCL_NETZ_FAKTOR={ueber!r}: erwartet ein Wert "
-                    f"oder {len(groessen)} Werte (je Groesse "
+                raise ConfigError(
+                    f"SGLANG_HTCCL_MESH_FACTOR={ueber!r}: expected one "
+                    f"value or {len(groessen)} values (per size "
                     f"{[g // 1024 for g in groessen]} KiB)."
                 )
             m.netz_faktor = [max(1.0, x) for x in werte]
             m.netz_faktor_gemessen = False
             m.hinweise.append(
-                f"netz_faktor von Hand auf {m.netz_faktor} gesetzt "
-                f"(SGLANG_HTCCL_NETZ_FAKTOR) -- nicht gemessen."
+                f"netz_faktor manually set to {m.netz_faktor} "
+                f"(SGLANG_HTCCL_MESH_FACTOR) -- not measured."
             )
 
         m.dauer_s = time.perf_counter() - t_start
-        self._plausibel(m)
+        self._plausible(m)
         return m
 
-    def _hat_paarfuehler(self, f: Fuehler, groessen) -> bool:
-        """Gruppenweit entscheiden, nicht je Rang.
+    def _has_pair_sensor(self, f: Sensor, groessen) -> bool:
+        """Decide group-wide, not per rank.
 
-        Ein Rang, der glaubt zu messen, waehrend die anderen an der Barriere
-        stehen, verklemmt den Start. Deshalb: alle fragen, und nur wenn
-        ALLE koennen, wird gemessen.
+        A rank that believes it's measuring while the others are waiting
+        at the barrier wedges the startup. Hence: ask everyone, and only
+        measure if ALL of them can.
         """
         import torch.distributed as dist
 
         try:
-            kann = f.paar(-1, groessen[0]) is not None
+            kann = f.pair(-1, groessen[0]) is not None
         except NotImplementedError:
             kann = False
         except Exception as e:
-            logger.warning("HTCCL-Matrix: Paar-Fuehler meldet Fehler (%s); "
-                           "Eigenlast-Schaetzung.", e)
+            logger.warning("HTCCL-Matrix: pair sensor reports an error (%s); "
+                           "using the self-load estimate.", e)
             kann = False
         alle: list[Any] = [None] * self.welt
         dist.all_gather_object(alle, bool(kann), group=self.cpu_group)
         return all(bool(x) for x in alle)
 
-    def _budget_anpassen(self, mk: MessKonfig) -> MessKonfig:
-        """Grobe Vorabschaetzung gegen ``budget_ms``.
+    def _adjust_budget(self, mk: MeasureConfig) -> MeasureConfig:
+        """Rough pre-estimate against ``budget_ms``.
 
-        Kosten wachsen mit R^2, sobald ein Paar-Fuehler da ist. Statt die
-        Startzeit explodieren zu lassen, wird zuerst die Groessenleiter
-        gekuerzt (die mittlere Groesse faellt zuerst -- sie trennt am
-        wenigsten) und dann die Wiederholungszahl. Was gekuerzt wurde, wird
-        protokolliert; heimlich duennere Belege gibt es nicht.
+        Cost grows with R^2 once a pair sensor is present. Rather than
+        letting startup time explode, the size ladder is thinned first
+        (the middle size goes first -- it discriminates the least), then
+        the repetition count. Whatever was thinned out is logged; there
+        is no such thing as quietly measuring on thinner evidence.
         """
         paare = self.welt * (self.welt - 1)
-        # Rundenzahl je Phase:
-        #   1 Eigenlast, gestaffelt          -> R
-        #   2 Kanten einzeln (Paar-Fuehler)  -> R(R-1)
-        #   3 Fan-in, ein Ziel je Runde      -> R
-        #   4 alle Paare gleichzeitig        -> R-1
-        # Ohne Paar-Fuehler entfallen 2 bis 4.
+        # Round count per phase:
+        #   1 self-load, staggered           -> R
+        #   2 edges individually (pair sensor) -> R(R-1)
+        #   3 fan-in, one destination per round -> R
+        #   4 all pairs simultaneously        -> R-1
+        # Without a pair sensor, 2 through 4 are skipped.
         mit_paar = self._fuehler is not None
         runden = self.welt + (paare + self.welt + self.welt - 1 if mit_paar else 0)
 
-        def schaetz(g_kib: Sequence[int], reps: int) -> float:
-            # ~6 GB/s als grobe Annahme fuer die Vorabschaetzung; sie
-            # entscheidet nur, wieviel gemessen wird, nie was herauskommt.
+        def estimate(g_kib: Sequence[int], reps: int) -> float:
+            # ~6 GB/s as a rough assumption for the pre-estimate; it only
+            # decides how much gets measured, never what comes out of it.
             uebertragung = sum((g * 1024) * reps / 6e9 * 1000 for g in g_kib)
-            # 2 Barrieren je Runde, gloo grob 0,3 ms.
+            # 2 barriers per round, gloo roughly 0.3 ms.
             return runden * (uebertragung + 0.6 * len(g_kib))
 
         g = list(mk.groessen_kib)
         reps = mk.wiederholungen
         gekuerzt = []
-        while schaetz(g, reps) > mk.budget_ms and len(g) > 2:
+        while estimate(g, reps) > mk.budget_ms and len(g) > 2:
             weg = g.pop(len(g) // 2)
             gekuerzt.append(f"{weg} KiB")
-        while schaetz(g, reps) > mk.budget_ms and reps > 4:
+        while estimate(g, reps) > mk.budget_ms and reps > 4:
             reps //= 2
         if gekuerzt or reps != mk.wiederholungen:
             logger.info(
-                "HTCCL-Matrix: Messbudget %.0f ms -- Groessen %s entfernt, "
-                "Wiederholungen %d -> %d. Voll messen mit "
-                "SGLANG_HTCCL_MESS_BUDGET_MS=<mehr>.",
-                mk.budget_ms, gekuerzt or "keine", mk.wiederholungen, reps,
+                "HTCCL-Matrix: measurement budget %.0f ms -- sizes %s "
+                "removed, repetitions %d -> %d. Measure fully with "
+                "SGLANG_HTCCL_MEASURE_BUDGET_MS=<more>.",
+                mk.budget_ms, gekuerzt or "none", mk.wiederholungen, reps,
             )
         return replace(mk, groessen_kib=tuple(g), wiederholungen=reps)
 
-    def _plausibel(self, m: Messung) -> None:
-        """Meldet Abweichungen von den Referenzwerten dieses Rigs.
+    def _plausible(self, m: Measurement) -> None:
+        """Reports deviations from this rig's reference values.
 
-        Kein Abbruch und keine Entscheidung -- nur ein Hinweis, damit ein
-        kaputter Messaufbau auffaellt, bevor er als Rig-Eigenheit
-        durchgeht. Vierzehn plausible Annahmen sind in diesem Vorhaben
-        bereits an der Hardware gescheitert; eine stille Messung waere die
-        fuenfzehnte.
+        No abort and no decision -- just a note, so that a broken
+        measurement setup stands out before it passes as a rig quirk.
+        Fourteen plausible assumptions have already failed against the
+        hardware in this project; a silent measurement would be the
+        fifteenth.
         """
         gi = len(m.groessen) - 1
         for r in range(m.welt):
             if m.aus[r][gi] <= 0.05 or m.ein[r][gi] <= 0.05:
                 m.hinweise.append(
-                    f"Rang {r} ({m.bdfs[r]}): gemessene Rate nahe null "
-                    f"(aus={m.aus[r][gi]:.2f}, ein={m.ein[r][gi]:.2f}) -- das "
-                    f"ist ein Messfehler, keine Karteneigenschaft."
+                    f"Rank {r} ({m.bdfs[r]}): measured rate near zero "
+                    f"(aus={m.aus[r][gi]:.2f}, ein={m.ein[r][gi]:.2f}) -- "
+                    f"this is a measurement error, not a property of the "
+                    f"card."
                 )
             if m.duplex_summe:
-                f = m.duplex_faktor(r, gi)
+                f = m.duplex_factor(r, gi)
                 if f > 1.9:
                     m.hinweise.append(
-                        f"Rang {r}: Duplexfaktor {f:.2f} bei der groessten "
-                        f"Groesse. Gemessen wurde auf diesem Rig "
-                        f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}; ein Wert nahe 2 "
-                        f"deutet auf nicht wirklich gleichzeitige Stroeme hin."
+                        f"Rank {r}: duplex factor {f:.2f} at the largest "
+                        f"size. Measured on this rig was "
+                        f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}; a value close to "
+                        f"2 suggests the streams weren't really running "
+                        f"simultaneously."
                     )
         if m.fanin_deckel:
             for j, d in m.fanin_deckel.items():
                 if d[gi] > 2.0 * m.ein[j][gi] and m.ein[j][gi] > 0:
                     m.hinweise.append(
-                        f"Ziel {j}: gemessener Fan-in-Deckel {d[gi]:.2f} GB/s "
-                        f"liegt weit ueber der Eingangsrate {m.ein[j][gi]:.2f} "
-                        f"GB/s -- pruefen, ob die Quellen wirklich gleichzeitig "
-                        f"gelaufen sind."
+                        f"Destination {j}: measured fan-in cap "
+                        f"{d[gi]:.2f} GB/s lies far above the inbound rate "
+                        f"{m.ein[j][gi]:.2f} GB/s -- check whether the "
+                        f"sources really ran simultaneously."
                     )
 
-    def _synthetische_messung(self, bdfs, namen) -> Messung:
-        """``planer: aus`` -- nichts messen, alles aus der Konfiguration.
+    def _synthetic_measurement(self, bdfs, namen) -> Measurement:
+        """``planer: aus`` -- measure nothing, take everything from the configuration.
 
-        Gleichverteilte Platzhalterraten, damit die Rollen ausschliesslich
-        aus ``rollen``/``domaenen`` kommen. Der Plan meldet ``quelle=fest``,
-        damit in der Erklaerung nicht der Eindruck entsteht, hier sei etwas
-        gemessen worden.
+        Evenly-distributed placeholder rates, so that roles come
+        exclusively from ``roles``/``domaenen``. The plan reports
+        ``source=fest``, so the explanation doesn't give the impression
+        that anything was actually measured here.
         """
-        groessen = tuple(g * 1024 for g in self.konfig.kollektiv.mess.groessen_kib)
-        m = Messung(welt=self.welt, groessen=groessen, bdfs=bdfs, namen=namen,
-                    fuehler="keiner (planer=aus)")
+        groessen = tuple(g * 1024 for g in self.config.kollektiv.mess.groessen_kib)
+        m = Measurement(welt=self.welt, groessen=groessen, bdfs=bdfs, namen=namen,
+                    fuehler="none (planer=aus)")
         for r in range(self.welt):
             m.aus[r] = [1.0] * len(groessen)
             m.ein[r] = [1.0] * len(groessen)
             m.latenz_s[r] = 0.0
         m.hinweise.append(
-            "planer=aus: nichts gemessen. Rollen, Domaenen und Algorithmus "
-            "stammen ausschliesslich aus der Konfiguration."
+            "planer=aus: nothing measured. Roles, domains, and algorithm "
+            "come exclusively from the configuration."
         )
         return m
 
-    def _pruefe_einheitlich(self, p: Plan) -> None:
-        """Der Plan MUSS auf allen Raengen gleich sein."""
+    def _check_uniform(self, p: Plan) -> None:
+        """The plan MUST be the same on every rank."""
         import torch.distributed as dist
 
         summen: list[Any] = [None] * self.welt
-        dist.all_gather_object(summen, p.pruefsumme(), group=self.cpu_group)
+        dist.all_gather_object(summen, p.checksum(), group=self.cpu_group)
         if len(set(summen)) != 1:
             abweichler = {r: s for r, s in enumerate(summen) if s != summen[0]}
             raise RuntimeError(
-                f"HTCCL-Matrix: die Raenge haben VERSCHIEDENE Plaene "
-                f"({summen}). Abweichler: {abweichler}. Das ist ein "
-                f"Startfehler und keine Warnung -- die Kollektive setzen "
-                f"voraus, dass alle Raenge dieselbe Zerlegung fahren. "
-                f"Haeufigste Ursachen: eine SGLANG_HTCCL_*-Variable oder eine "
-                f"Konfigurationsdatei ist nicht auf allen Raengen gleich, "
-                f"oder fenster_bytes wurde je Rang verschieden hereingereicht "
-                f"(es muss das Minimum ueber alle Ziele sein -- massgeblich "
-                f"ist, was sich UEBERALL abbilden laesst)."
+                f"HTCCL-Matrix: ranks ended up with DIFFERENT plans "
+                f"({summen}). Divergent ranks: {abweichler}. This is a "
+                f"startup error, not a warning -- the collectives assume "
+                f"that every rank runs the same decomposition. Most common "
+                f"causes: an SGLANG_HTCCL_* variable or a config file "
+                f"isn't the same on every rank, or fenster_bytes was "
+                f"passed in differently per rank (it must be the minimum "
+                f"across all destinations -- what matters is what can be "
+                f"mapped EVERYWHERE)."
             )
 
 
-def _latenz_fit(groessen: Sequence[int], raten: Sequence[float]) -> float:
-    """t(N) = latenz + N/rate, angepasst ueber die Groessenleiter.
+def _latency_fit(groessen: Sequence[int], raten: Sequence[float]) -> float:
+    """t(N) = latency + N/rate, fitted across the size ladder.
 
-    Aus den gemessenen Raten je Groesse ergeben sich Zeiten; die Gerade
-    darueber trennt Startkosten von Durchsatz. Die Startkosten sind das,
-    was ein Kollektivschritt mindestens kostet -- und bei 20 KiB war die
-    Quittungsschleife mit ~3 us von 13,47 us der groesste Einzelposten des
-    Kollektivs, also genau die Groesse, um die es geht.
+    The measured rates per size yield times; the line fitted through them
+    separates startup cost from throughput. The startup cost is what a
+    collective step costs at minimum -- and at 20 KiB the acknowledgment
+    round-trip, at ~3 us of 13.47 us, was the single largest line item of
+    the collective, which is exactly the size range this is about.
 
-    VORBEHALT: gemessen wird hier die Startkosten der Kopiermaschine, nicht
-    die der Quittungsschleife des Kollektivs. Das ist eine UNTERGRENZE.
-    Wer es besser weiss, setzt ``SGLANG_HTCCL_SCHRITT_US``.
+    CAVEAT: what's measured here is the copy engine's startup cost, not
+    that of the collective's acknowledgment loop. This is a LOWER BOUND.
+    Anyone who knows better sets ``SGLANG_HTCCL_STEP_US``.
     """
     ueber = os.environ.get(_ENV_PRAEFIX + "SCHRITT_US")
     if ueber:
@@ -2246,29 +2255,29 @@ def _latenz_fit(groessen: Sequence[int], raten: Sequence[float]) -> float:
 
 
 # ===========================================================================
-# Hilfsmittel
+# Utilities
 # ===========================================================================
 
 
-def bdf_der_karte(device) -> str:
-    """PCI-Adresse ``0000:05:00.0`` der Karte hinter ``device``.
+def bdf_of_card(device) -> str:
+    """PCI address ``0000:05:00.0`` of the card behind ``device``.
 
-    Ueber ``cudaDeviceGetPCIBusId``, weil das die einzige Zuordnung ist,
-    die auch bei gesetztem ``CUDA_VISIBLE_DEVICES`` stimmt -- das Ordinal
-    allein ist ueber Prozessgrenzen bedeutungslos, und die Konfiguration
-    spricht Karten ueber ihre Adresse an.
+    Via ``cudaDeviceGetPCIBusId``, because that's the only mapping that
+    stays correct even with ``CUDA_VISIBLE_DEVICES`` set -- the ordinal
+    alone is meaningless across process boundaries, and the configuration
+    addresses cards by their PCI address.
     """
     import torch
 
     ordinal = device.index if hasattr(device, "index") else int(device)
     if ordinal is None:
         ordinal = torch.cuda.current_device()
-    # Zuerst ohne ctypes, wenn torch die Felder anbietet. ACHTUNG:
-    # `props.pci_bus_id` ist die BUSNUMMER als int (aus cudaDeviceProp.pciBusID),
-    # NICHT die Adresszeichenkette -- str() darauf ergibt "10" und damit einen
-    # sysfs-Pfad, den es nicht gibt. Die Adresse entsteht erst aus Domaene,
-    # Bus und Slot; eine Funktionsnummer fuehrt cudaDeviceProp nicht, GPUs
-    # sitzen auf .0.
+    # First without ctypes, if torch offers the fields. WARNING:
+    # `props.pci_bus_id` is the BUS NUMBER as an int (from
+    # cudaDeviceProp.pciBusID), NOT the address string -- calling str() on
+    # it gives "10", i.e. a sysfs path that doesn't exist. The address is
+    # only formed from domain, bus, and slot; cudaDeviceProp carries no
+    # function number, GPUs always sit on .0.
     try:
         props = torch.cuda.get_device_properties(ordinal)
         dom = getattr(props, "pci_domain_id", None)
@@ -2293,18 +2302,18 @@ def bdf_der_karte(device) -> str:
         if fn(puffer, ctypes.c_int(32), ctypes.c_int(int(ordinal))) == 0:
             return _norm_bdf(puffer.value.decode())
     except Exception as e:                      # pragma: no cover
-        logger.warning("HTCCL-Matrix: PCI-Adresse nicht ermittelbar (%s).", e)
-    return f"unbekannt-{ordinal}"
+        logger.warning("HTCCL-Matrix: could not determine PCI address (%s).", e)
+    return f"unknown-{ordinal}"
 
 
-def linkbreite(bdf: str) -> Optional[tuple[int, str]]:
-    """``(Breite, Geschwindigkeit)`` aus sysfs -- NUR als Startschaetzung.
+def link_width(bdf: str) -> Optional[tuple[int, str]]:
+    """``(width, speed)`` from sysfs -- ONLY as a starting estimate.
 
-    Der Wert geht in KEINE Entscheidung ein. Er steht in der Erklaerung
-    neben der Messung, damit auffaellt, wenn beide auseinanderlaufen: sagt
-    sysfs x8 und die Messung 6 GB/s, ist entweder die Karte
-    heruntergetaktet oder der Messaufbau kaputt -- und genau diese Frage
-    hat in diesem Vorhaben mehrfach den Ausschlag gegeben.
+    This value feeds into NO decision. It's shown in the explanation next
+    to the measurement, so that it stands out if the two disagree: if
+    sysfs says x8 and the measurement says 6 GB/s, either the card is
+    downclocked or the measurement setup is broken -- and this exact
+    question has repeatedly been the deciding factor in this project.
     """
     try:
         basis = f"/sys/bus/pci/devices/{bdf}"

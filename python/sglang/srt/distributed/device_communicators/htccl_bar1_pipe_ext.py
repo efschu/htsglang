@@ -1,126 +1,123 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gepipelineter BAR1-Kollektivkern: ``netz_pipe``.
+"""Pipelined BAR1 collective kernel: ``netz_pipe``.
 
-Warum es diese Datei gibt
+Why this file exists
 -------------------------
-``htccl_bar1_ext.py`` traegt die aus der Messsonde ``bar1_kollektiv.cu``
-portierten Kerne ``netz`` (zwei gitterweite Sperren) und ``ring``
-(``2(R-1)`` Sperren). In der Sonde waren saubere Phasengrenzen
-**erwuenscht** -- eine Phasenuhr sollte Senden, Reduzieren und Verteilen
-getrennt ausweisen. Im Transport hat diese Entscheidung keinen Zweck mehr,
-sie kostet nur: zwischen dem Setzen einer Flagge und ihrem Eintreffen steht
-die Fabric still. Genau im Bereich 1-8 MiB ist das der Unterschied zwischen
-dauernd und schubweise belegter Leitung, und genau dort verliert der
-Direktpfad gegen NCCL (0,97x bei 1 MiB, 0,86x bei 4 MiB, zwei Karten).
+``htccl_bar1_ext.py`` carries the kernels ``mesh`` (two grid-wide barriers)
+and ``ring`` (``2(R-1)`` barriers) ported from the measurement probe
+``bar1_kollektiv.cu``. In the probe, clean phase boundaries were
+**desirable** -- a phase clock was meant to report sending, reducing, and
+distributing separately. In the transport this decision no longer serves a
+purpose, it only costs: between setting a flag and its arrival, the fabric
+sits idle. Right in the 1-8 MiB range that's the difference between a
+continuously versus a bursty-loaded link, and that's exactly where the
+direct path loses to NCCL (0.97x at 1 MiB, 0.86x at 4 MiB, two cards).
 
-Dieser Kern zerlegt die Nutzlast in ``K`` Chunks und laesst Senden,
-Reduzieren und Uebernehmen ueberlappen. Es gibt **keinen gitterweiten
-Gleichschritt je Phase** mehr.
+This kernel splits the payload into ``K`` chunks and lets sending, reducing,
+and adopting overlap. There is **no more grid-wide lockstep per phase**.
 
-Warum eine eigene Datei und nicht ein dritter Kern in ``htccl_bar1_ext.py``:
-an jener Datei arbeitet parallel ein anderer Vorgang. Die Primitiven
+Why a separate file instead of a third kernel in ``htccl_bar1_ext.py``:
+another effort is working on that file in parallel. The primitives
 (``leseV4``, ``schreibeV4``, ``flaggeLesen``, ``chunkGrenzen``, ``addV4``)
-sind deshalb hier **woertlich dupliziert** statt geteilt. Das ist bewusst
-und es ist eine Schuld: sobald beide Straenge zusammengefuehrt sind, gehoert
-der gemeinsame Teil in EINE Kopfdatei. Bis dahin gilt: wer eine Primitive
-hier aendert, muss sie dort mitaendern -- sie muessen bitgleich bleiben,
-weil beide Kerne in dieselben Schlitze schreiben koennen (nicht
-gleichzeitig, aber in aufeinanderfolgenden Runden).
+are therefore **duplicated verbatim** here instead of shared. That is
+deliberate, and it is a debt: once both efforts are merged, the shared part
+belongs in ONE header. Until then: whoever changes a primitive here must
+change it there too -- they must stay bit-identical, because both kernels
+can write into the same slots (not simultaneously, but in consecutive
+rounds).
 
-Das Schiebefenster (uebernommen von NCCL, Apache-2)
+The sliding window (adopted from NCCL, Apache-2.0)
 ---------------------------------------------------
-Die Flaggenmechanik ist **nicht** die der Sonde und auch nicht die naive
-"eine Flagge je (Chunk, Sender)". Sie ist NCCLs Schiebefenster aus
+The flag mechanism is **not** the probe's, and it isn't the naive "one flag
+per (chunk, sender)" scheme either. It is NCCL's sliding window from
 ``src/device/prims_simple.h`` (NCCL, Apache-2.0, NVIDIA):
 
-* ``NCCL_STEPS 8`` (``src/include/device.h:26``) -- feste Ringtiefe.
-* ``connStepPtr`` / ``connStepCache`` (``prims_simple.h:40-41``) -- EIN
-  monoton wachsender Zaehler je Verbindung, plus eine **lokale Kopie**.
-* ``waitPeer`` (``prims_simple.h:101-171``), Wartebedingung Zeile 107:
+* ``NCCL_STEPS 8`` (``src/include/device.h:26``) -- fixed ring depth.
+* ``connStepPtr`` / ``connStepCache`` (``prims_simple.h:40-41``) -- ONE
+  monotonically increasing counter per connection, plus a **local cache**.
+* ``waitPeer`` (``prims_simple.h:101-171``), wait condition on line 107:
   ``while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice)``
-* ``postPeer`` (``:165-171``) -- veroeffentlichen mit
+* ``postPeer`` (``:165-171``) -- publish with
   ``st_relaxed_sys_global``.
 
-Uebernommen ist das **Prinzip**, nicht der Quelltext: je gerichteter
-Verbindung und je Ring (RS, AG) gibt es zwei absolute Zaehler,
+What's adopted is the **principle**, not the source: per directed
+connection and per ring (RS, AG) there are two absolute counters,
 
-``tail``  vom Erzeuger geschrieben  = "soviele Chunks habe ich abgelegt",
-``head``  vom Verbraucher geschrieben = "soviele Chunks habe ich gelesen".
+``tail``  written by the producer  = "this many chunks I have deposited",
+``head``  written by the consumer  = "this many chunks I have read".
 
-Beide werden vom Erzeuger in den Speicher des **Lesers** geschrieben (ein
-gebuchter PCIe-Schreibvorgang, billig) und dort **lokal** gelesen. Ein
-Lesevorgang aus einer fremden BAR waere ein Umlauf; das ist die Stelle, an
-der NCCLs Annahme (NVLink, kohaerent) bei uns anders liegt und an der die
-Richtung deshalb nicht beliebig ist. ``connStepCache`` ist hier
-``sTailC``/``sHeadC`` im gemeinsamen Speicher: solange der zwischengespeicherte
-Wert reicht, wird gar nicht nachgelesen.
+Both are written by the producer into the **reader's** memory (a posted
+PCIe write, cheap) and read there **locally**. A read from a foreign BAR
+would be a round trip; that's the point where NCCL's assumption (NVLink,
+coherent) doesn't hold for us, and where the direction is therefore not
+arbitrary. ``connStepCache`` corresponds here to ``sTailC``/``sHeadC`` in
+shared memory: as long as the cached value suffices, no re-read happens at
+all.
 
-Die Zaehler sind **absolut ueber die Lebensdauer des Transports**, nicht je
-Runde zurueckgesetzt. Ein je Runde zurueckgesetzter Zaehler haette genau an
-der Rundengrenze eine Luecke: wenn Rang A seine Runde ``n`` beendet, kann
-Rang B noch in Runde ``n`` lesen, und ein Fenstervergleich gegen einen
-rundenlokalen Zaehler haette das nicht gesehen. Der Zaehler liegt deshalb in
-``schrittDev`` und waechst um ``K`` je Aufruf.
+The counters are **absolute over the transport's lifetime**, not reset per
+round. A counter reset per round would have a gap right at the round
+boundary: when rank A finishes its round ``n``, rank B may still be reading
+in round ``n``, and a window comparison against a round-local counter would
+have missed that. The counter therefore lives in ``schrittDev`` and grows
+by ``K`` per call.
 
-Was NICHT uebernommen ist und warum
+What is NOT adopted, and why
 -----------------------------------
-* **Direkt-Modus** (``prims_simple.h:39`` ``directBuff``, ``:135-148``).
-  NCCL schreibt bei verfuegbarem P2P am FIFO vorbei direkt in den
-  Zielpuffer. Bei uns scheitert das nicht am Kern, sondern am Bootstrap:
-  erreichbar ist nur, was beim Aufbau als dma-buf exportiert und per
-  ``mmap`` + ``cudaHostRegister`` gebunden wurde. Der Ergebnistensor
-  wechselt je Aufruf; ihn je Aufruf zu binden hiesse ioctl + mmap +
-  Registrierung im heissen Pfad. Die Bewertung steht im Bericht -- kurz:
-  gespart wuerde ein lokaler VRAM-Durchgang, und der ist gegen den
-  PCIe-Engpass zwei Groessenordnungen zu billig, um die 0,86x zu erklaeren.
-  Was dieser Kern dagegen sehr wohl spart: die Verteilung liest das
-  Ergebnis **nicht erneut aus dem VRAM**, sondern schreibt es aus dem
-  Register, in dem es gerade entstanden ist (``reduziereUndVerteile``).
-  ``bar1_netz_kernel`` macht daraus zwei Durchgaenge
-  (``reduziereNPhase`` + ``verteilePhase``).
-* **LL / LL128** (``prims_ll.h:111-119``, ``:154``). Die Flagge im
-  Datenwort setzt voraus, dass man nie "Flagge neu, Daten alt" sieht. Ueber
-  NVLink ist das gegeben, ueber PCIe in eine Write-Combining-Apertur ist es
-  **ungeprueft**, und auf diesem Rig ist belegt, dass der L2 mit
-  eingehenden PCIe-Schreibvorgaengen nicht kohaerent ist
-  (``BEFUND_L2_NICHT_KOHAERENT.md``). Ohne Beleg nicht gebaut.
+* **Direct mode** (``prims_simple.h:39`` ``directBuff``, ``:135-148``).
+  When P2P is available, NCCL bypasses the FIFO and writes directly into
+  the target buffer. For us that fails not at the kernel but at bootstrap:
+  only what was exported as a dma-buf and bound via ``mmap`` +
+  ``cudaHostRegister`` during setup is reachable. The result tensor changes
+  every call; binding it per call would mean ioctl + mmap + registration on
+  the hot path. The assessment is in the report -- in short: what would be
+  saved is one local VRAM pass, and against the PCIe bottleneck that's two
+  orders of magnitude too cheap to explain the 0.86x. What this kernel does
+  save, by contrast: the distribute step does **not read the result back
+  from VRAM**, but writes it straight from the register it was just formed
+  in (``reduziereUndVerteile``). ``bar1_netz_kernel`` turns that into two
+  passes (``reduziereNPhase`` + ``verteilePhase``).
+* **LL / LL128** (``prims_ll.h:111-119``, ``:154``). The flag embedded in
+  the data word assumes you never observe "flag new, data stale". Over
+  NVLink that holds, over PCIe into a write-combining aperture it is
+  **unverified**, and on this rig it is established that the L2 of the
+  receiving card is not coherent with incoming PCIe writes
+  (``BEFUND_L2_NICHT_KOHAERENT.md``). Not built without evidence.
 
-Der Direkt-Modus und die Graph-Wiedergabe
+Direct mode and graph replay
 -----------------------------------------
-Der Direkt-Modus (``SGLANG_HTCCL_BAR1_PIPE_DIREKT``) laesst den Rechenkern
-das Ergebnis nicht in einen Schlitz legen, aus dem der Empfaenger es
-umkopiert, sondern direkt in dessen ERGEBNISPUFFER schreiben. Dieser Puffer
-liegt in der exportierten Region -- er ist ein Ringplatz, und der
-Ergebnistensor, den ``all_reduce`` zurueckgibt, ist ein ``from_blob`` genau
-darueber. Wer den Platz waehlt, bestimmt also die Adresse eines Tensors, den
-der Aufrufer in die Hand bekommt; der Platz kann deshalb NICHT im Kern
-gewuerfelt werden, sondern muss hostseitig feststehen, bevor der Kern laeuft.
+Direct mode (``SGLANG_HTCCL_BAR1_PIPE_DIRECT``) makes the compute kernel not
+place the result into a slot that the receiver then copies out of, but
+write it directly into that receiver's RESULT BUFFER. This buffer lives in
+the exported region -- it is a ring slot, and the result tensor that
+``all_reduce`` returns is a ``from_blob`` right over it. Whoever picks the
+slot therefore determines the address of a tensor the caller ends up
+holding; the slot can therefore NOT be diced up inside the kernel, but must
+be fixed host-side before the kernel runs.
 
-Genau daran hing die Graph-Faehigkeit. Ein frei laufender Ringindex wird
-beim Aufzeichnen eingebrannt, und mehrere Aufzeichnungen laufen ueber
-dieselben Plaetze -- zwei Graphen teilen sich dann einen BAR1-Platz und
-liefern beim abwechselnden Wiedergeben die Zahlen des jeweils anderen.
+That is precisely what graph capturability hinged on. A freely running ring
+index gets baked in at capture time, and multiple captures then run over
+the same slots -- two graphs end up sharing one BAR1 slot and, on
+alternating replay, deliver each other's numbers.
 
-Die Loesung sind zwei Stuecke, und sie gehoeren zusammen:
+The fix is two pieces, and they belong together:
 
-1. **Besitz statt Rotation** (:func:`erg_aufteilung`). Der Ring wird
-   statisch geteilt: zwei Plaetze rotieren weiter fuer eager-Aufrufe, alles
-   darueber ist ein Vorrat, aus dem jede aufgezeichnete Aufrufstelle EINEN
-   Platz nimmt und nicht zurueckgibt. Damit kann keine zweite Aufzeichnung
-   denselben Platz bekommen.
-2. **Freigabe-Handschlag** (Flaggenfamilie 4, ``ergBereit``). Ein
-   reservierter Platz wird bei JEDER Wiedergabe neu beschrieben; der
-   Abstand, den der eager-Ring mit seinen zwei Plaetzen von selbst
-   herstellt, ist damit weg. Jeder Rang veroeffentlicht deshalb beim
-   Betreten eines Direkt-Aufrufs seine **Generation** -- "mein
-   Ergebnisplatz ist frei" -- und wer in einen fremden Ergebnisplatz
-   schreiben will, wartet darauf. Der Generationszaehler liegt im LOKALEN
-   VRAM und wird vom KERN fortgeschrieben, nicht vom Host: bei einer
-   Wiedergabe laeuft kein Hostcode, ein hostseitiger Zaehler stuende still.
+1. **Ownership instead of rotation** (:func:`result_slot_split`). The ring
+   is split statically: the first ``eager_plaetze`` slots keep rotating for
+   eager calls, everything above that is a pool from which each captured
+   call site takes ONE slot and never returns it. That way no second
+   capture can get the same slot.
+2. **Release handshake** (flag family 4, ``ergBereit``). A reserved slot is
+   overwritten on EVERY replay; the spacing that the eager ring's two slots
+   provide on their own is therefore gone. Every rank publishes its
+   **generation** on entering a direct call -- "my result slot is free" --
+   and anyone about to write into a foreign result slot waits for it. The
+   generation counter lives in LOCAL VRAM and is advanced by the KERNEL, not
+   the host: during a replay no host code runs, and a host-side counter
+   would sit frozen.
 
-Beides ist aus, solange ``SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH`` nicht
-gesetzt ist. Der Kern faehrt dann Byte fuer Byte den gemessenen Weg und
-fasst die Flaggenfamilie 4 nirgends an.
+Both are off as long as ``SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH`` is not set.
+The kernel then follows the measured path byte for byte and never touches
+flag family 4.
 """
 
 from __future__ import annotations
@@ -130,123 +127,126 @@ import os
 import time
 from typing import Optional
 
+from sglang.srt.distributed.device_communicators import (
+    htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+)
+
 logger = logging.getLogger(__name__)
 
 _ext = None
 
-#: Groesster Verbund, fuer den die Argumentfelder Platz haben. Gleich
-#: ``htccl_bar1_ext.MAX_RANGE`` -- die beiden Kerne teilen sich die
-#: Peer-Tabellen des Transports und muessen dieselbe Grenze haben.
+#: Largest rank group for which the argument arrays have room. Equal to
+#: ``htccl_bar1_ext.MAX_RANGE`` -- the two kernels share the transport's peer
+#: tables and must have the same limit.
 MAX_RANGE = 8
 
-#: Obergrenze fuer die Chunkzahl. Nur eine Schleifengrenze; die
-#: Schlitzgeometrie haengt an ``T``, nicht an ``K``.
+#: Upper bound on the chunk count. Just a loop bound; the slot geometry
+#: depends on ``T``, not on ``K``.
 MAX_CHUNKS = 1024
 
-#: Kleinste sinnvolle Tiefe. ``T = 1`` ist NICHT nur langsam, sondern
-#: verklemmt: bei ``T = 1`` faellt das Senden von Chunk ``c`` und sein
-#: Verbrauch in dieselbe Schleifenrunde, und die Wartebedingung stuende vor
-#: der Veroeffentlichung, auf die sie wartet. Siehe die Herleitung in
-#: :func:`pipe_plan`.
-MIN_TIEFE = 2
+#: Smallest useful depth. ``T = 1`` is NOT merely slow but deadlocked: at
+#: ``T = 1``, sending chunk ``c`` and consuming it fall into the same loop
+#: iteration, and the wait condition would stand before the publication it
+#: waits for. See the derivation in :func:`pipe_plan`.
+MIN_DEPTH = 2
 
-#: Groesste Tiefe. Aus NCCL: ``NCCL_STEPS 8``.
-MAX_TIEFE = 8
+#: Largest depth. From NCCL: ``NCCL_STEPS 8``.
+MAX_DEPTH = 8
 
 
 # ===========================================================================
-# Geometrie -- alles, was der Transport ueber diesen Kern wissen muss.
+# Geometry -- everything the transport needs to know about this kernel.
 #
-# Absichtlich HIER und nicht in htccl_bar1.py: der Kern und seine
-# Speicherordnung gehoeren zusammen, und htccl_bar1.py soll nur die
-# Ergebnisse einsetzen.
+# Deliberately HERE and not in htccl_bar1.py: the kernel and its memory
+# layout belong together, and htccl_bar1.py is meant only to plug in the
+# results.
 # ===========================================================================
 
 
-def pipe_flaggen_zusatz(welt: int) -> int:
-    """Zusaetzliche Flaggenbytes fuer ``netz_pipe``: ``5 * R * 256``.
+def pipe_flags_extra(welt: int) -> int:
+    """Extra flag bytes for ``netz_pipe``: ``5 * R * 256``.
 
-    Fuenf Familien zu je einer 256-Byte-Zeile je Rang:
+    Five families of one 256-byte line per rank each:
 
     ==== ================= ============================================
-    Fam. Name              geschrieben von / gelesen von
+    Fam. Name              written by / read by
     ==== ================= ============================================
-    0    ``tailRS``        Erzeuger des RS-Chunks / dessen Empfaenger
-    1    ``tailAG``        Erzeuger des AG-Chunks / dessen Empfaenger
-    2    ``headRS``        Verbraucher des RS-Chunks / dessen Erzeuger
-    3    ``headAG``        Verbraucher des AG-Chunks / dessen Erzeuger
-    4    ``ergBereit``     jeder Rang beim Betreten eines Direkt-Aufrufs /
-                           jeder, der in dessen Ergebnispuffer schreibt
+    0    ``tailRS``        producer of the RS chunk / its receiver
+    1    ``tailAG``        producer of the AG chunk / its receiver
+    2    ``headRS``        consumer of the RS chunk / its producer
+    3    ``headAG``        consumer of the AG chunk / its producer
+    4    ``ergBereit``     every rank on entering a direct call /
+                           anyone writing into its result buffer
     ==== ================= ============================================
 
-    Familie 4 ist der Freigabe-Handschlag des graphfesten Direkt-Modus
-    (:data:`ERG_EAGER_PLAETZE`). Sie liegt HINTER den vier alten Zeilen,
-    also bleibt jeder bestehende Zeilenversatz Byte fuer Byte, was er war;
-    ohne Direkt-Modus wird sie nie beschrieben und nie gelesen.
+    Family 4 is the release handshake of the graph-capturable direct mode
+    (:data:`ERG_EAGER_PLAETZE`). It sits BEHIND the four original lines, so
+    every existing line offset stays byte-for-byte what it was; without
+    direct mode it is never written and never read.
 
-    **Unabhaengig von K und T.** Das ist der eigentliche Gewinn des
-    Schiebefensters gegenueber "eine Flagge je (Chunk, Sender)": dort waere
-    der Bedarf ``2 * K * R`` Zeilen gewesen und haette bei jeder
-    Groessenaenderung die Flaggenregion mitbewegt.
+    **Independent of K and T.** That is the real payoff of the sliding
+    window versus "one flag per (chunk, sender)": there the requirement
+    would have been ``2 * K * R`` lines, and the flag region would have
+    shifted with every size change.
 
-    256 Byte je Zeile, wie ueberall in diesem Transport: kein False Sharing
-    zwischen Sendern, keins zwischen Familien.
+    256 bytes per line, as everywhere in this transport: no false sharing
+    between senders, none between families.
     """
     return 5 * welt * 256
 
 
-#: Familienindex von ``ergBereit`` in der Pipe-Flaggenregion. Als Konstante,
-#: weil Kern und Hostseite dieselbe Zahl brauchen und eine zweite Fassung
-#: genau die Stelle waere, an der Sender und Empfaenger auf verschiedene
-#: Zeilen zeigen.
+#: Family index of ``ergBereit`` in the pipe flag region. Kept as a
+#: constant because kernel and host side need the same number, and a second
+#: version would be exactly the place where sender and receiver end up
+#: pointing at different lines.
 ERG_BEREIT_FAMILIE = 4
 
 
 def pipe_fbasis(welt: int, mit_a2a: bool = True) -> int:
-    """Versatz der Pipe-Zeilen in der Flaggenregion.
+    """Offset of the pipe lines within the flag region.
 
-    **Hinter** Netz, Ring und a2a. Damit liegen alle gemessenen Topologien
-    Byte fuer Byte dort, wo sie lagen; die Pipe haengt sich nur hinten an.
-    Die Rechnung steht im Kern NICHT noch einmal -- sie wird als Argument
-    hereingereicht, weil eine zweite Fassung genau die Stelle waere, an der
-    Sender und Empfaenger auf verschiedene Zeilen zeigen.
+    **Behind** mesh, ring, and a2a. That way all the measured topologies
+    stay byte-for-byte where they were; the pipe only attaches at the end.
+    The computation does NOT appear a second time in the kernel -- it is
+    passed in as an argument, because a second version would be exactly the
+    place where sender and receiver end up pointing at different lines.
     """
     return (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
 
 
-def pipe_schlitz_vorgabe(welt: int, chunk_ziel_bytes: int) -> int:
-    """Die Schlitzgroesse, die der gepipelinete Weg wirklich braucht.
+def pipe_slot_default(welt: int, chunk_ziel_bytes: int) -> int:
+    """The slot size that the pipelined path actually needs.
 
-    Ein Schlitz traegt EIN Stueck EINES Chunks, also ``chunk / R``. Wie
-    gross ein Chunk wird, sagt ``pipe_chunk_bytes`` (die Zielgroesse, aus
-    der :func:`pipe_plan` sein ``K`` ableitet) -- nicht die groesste
-    Nutzlast des Transports. Der Bedarf haengt damit an der ZIELGROESSE und
-    ist von ``max_bytes`` unabhaengig, und genau diese Unabhaengigkeit
-    macht die Geometrie ausrechenbar: der Pipe-Bereich ist eine absolute
-    Bytezahl und kein Bruchteil des Fensters mehr.
+    A slot carries ONE piece of ONE chunk, i.e. ``chunk / R``. How big a
+    chunk gets is decided by ``pipe_chunk_bytes`` (the target size from
+    which :func:`pipe_plan` derives its ``K``) -- not the transport's
+    largest payload. The requirement therefore depends on the TARGET SIZE
+    and is independent of ``max_bytes``, and it is exactly this independence
+    that makes the geometry computable: the pipe region is an absolute byte
+    count and no longer a fraction of the window.
 
-    Auf 16 Byte aufgerundet, weil die Zugriffsbreite 128 Bit ist: ein
-    Schlitz, dessen Groesse kein Vielfaches von 16 waere, brauchte einen
-    schiefen Anfang fuer den naechsten.
+    Rounded up to 16 bytes, because the access width is 128 bits: a slot
+    whose size wasn't a multiple of 16 would force a misaligned start for
+    the next one.
 
-    **Was hier vorher stand und warum es weg ist.** Der Pipe-Bereich war ein
-    voller Schlitzsatz wie Netz, Ring und a2a, die Schlitzgroesse also
-    ``chunk_max / T`` -- aus der groessten Nutzlast abgeleitet statt aus der
-    Chunkgroesse, die ein Schlitz wirklich tragen muss. Bei R=3, T=4 und dem
-    96-MiB-Fenster dieses Rigs waren das 2047 KiB je Schlitz gegen 342 KiB
-    Bedarf: 32 MiB Bereich fuer 5,4 MiB, und die Differenz fehlte dem
-    all_reduce-Schlitz. Das war der gemessene Verlust von 7,5 % im Pipe-Arm
-    der Hebel-Messung zu #293 (Schlitz 8188 -> 6140 KiB, Kipp-Punkt
-    2456 -> 1842 Token, also unter den Arbeitspunkt von 2048).
+    **What used to be here, and why it's gone.** The pipe region used to be
+    a full slot set like mesh, ring, and a2a, i.e. slot size
+    ``chunk_max / T`` -- derived from the largest payload instead of from
+    the chunk size a slot actually has to carry. At R=3, T=4, and this
+    rig's 96 MiB window, that was 2047 KiB per slot against a 342 KiB
+    requirement: a 32 MiB region for 5.4 MiB, and the difference was missing
+    from the all_reduce slot. That was the measured 7.5% loss in the pipe
+    arm of the lever benchmark for #293 (slot 8188 -> 6140 KiB, tipping
+    point 2456 -> 1842 tokens, i.e. below the 2048 operating point).
 
-    **Warum ein zu kleiner Schlitz nicht gefaehrlich ist.**
-    :func:`pipe_plan` sucht sein ``K`` aufsteigend und prueft jedes mit
-    :func:`groesstes_stueck4` gegen den Schlitz; findet es keins, meldet
-    sich der Weg ueber ``handles()`` ab, und der Kern prueft dieselbe
-    Bedingung noch einmal mit ``TORCH_CHECK``. Ein knapper Schlitz kostet
-    Deckungsbereich, nie Richtigkeit. Nach oben deckt er
-    ``k_max * chunk_ziel_bytes`` ab -- bei 64 Chunks zu 1 MiB also 64 MiB
-    und damit weit mehr, als das Fenster dieses Rigs als Nutzlast traegt.
+    **Why a too-small slot isn't dangerous.**
+    :func:`pipe_plan` searches its ``K`` ascending and checks each one with
+    :func:`largest_chunk4` against the slot; if it finds none, the path
+    declines via ``handles()``, and the kernel checks the same condition
+    once more with ``TORCH_CHECK``. A tight slot costs coverage, never
+    correctness. At the top end it covers ``k_max * chunk_ziel_bytes`` --
+    at 64 chunks of 1 MiB that's 64 MiB, far more than this rig's window
+    ever carries as payload.
     """
     if welt < 2:
         return 0
@@ -254,84 +254,83 @@ def pipe_schlitz_vorgabe(welt: int, chunk_ziel_bytes: int) -> int:
     return ((stueck + 15) // 16) * 16
 
 
-def pipe_bereich_bytes(welt: int, tiefe: int, schlitz: int) -> int:
-    """Bytes, die der Pipe-Bereich in der Empfangsregion belegt.
+def pipe_range_bytes(welt: int, tiefe: int, slot: int) -> int:
+    """Bytes the pipe region occupies in the receive region.
 
-    ``2 * T * (R-1)`` Schlitze, auf eine Seite aufgerundet -- damit der
-    Bereich, der HINTER dem Pipe-Bereich beginnt (der Ergebnisring), wieder
-    auf einer Seitengrenze anfaengt. Der Anfang des Pipe-Bereichs liegt
-    ohnehin auf einer Seitengrenze, also ist jeder Schlitzanfang
-    16-Byte-ausgerichtet, solange ``schlitz`` es ist.
+    ``2 * T * (R-1)`` slots, rounded up to a page -- so that the region
+    starting BEHIND the pipe region (the result ring) again starts on a
+    page boundary. The start of the pipe region already sits on a page
+    boundary, so every slot start is 16-byte-aligned as long as ``slot``
+    is.
     """
-    roh = 2 * int(tiefe) * (int(welt) - 1) * int(schlitz)
-    return ((roh + SEITE - 1) // SEITE) * SEITE
+    roh = 2 * int(tiefe) * (int(welt) - 1) * int(slot)
+    return ((roh + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 
-#: Seitengroesse. Bewusst eine eigene Konstante und kein Import aus
-#: ``htccl_bar1`` -- jenes Modul importiert dieses, und ein Import in beide
-#: Richtungen auf Modulebene waere ein Zirkel.
-SEITE = 4096
+#: Page size. Deliberately its own constant and not an import from
+#: ``htccl_bar1`` -- that module imports this one, and an import in both
+#: directions at module level would be a cycle.
+PAGE_SIZE = 4096
 
-#: Wieviele Ergebnispuffer der Ring haelt. Zwei ist das Minimum, mit dem
-#: Runde ``n`` nicht in den Puffer schreibt, den der Aufrufer aus Runde
-#: ``n-1`` noch in der Hand haelt.
-ERG_RING_VORGABE = 2
+#: How many result buffers the ring holds. Two is the minimum with which
+#: round ``n`` doesn't write into the buffer the caller from round ``n-1``
+#: is still holding.
+ERG_RING_DEFAULT = 2
 
-#: Wieviele Ringplaetze der eager-Weg behaelt, wenn der graphfeste
-#: Direkt-Modus eingeschaltet ist -- die VORGABE, nicht mehr die Zahl.
+#: How many ring slots the eager path retains when the graph-capturable
+#: direct mode is turned on -- the DEFAULT, not the fixed number anymore.
 #:
-#: Zwei ist das Minimum, unter dem Runde ``n`` in den Puffer schriebe, den
-#: der Aufrufer aus Runde ``n-1`` noch haelt; dieselbe Herleitung, aus der
-#: :data:`ERG_RING_VORGABE` zwei ist. Zwei ist aber KEINE Aussage darueber,
-#: wieviele Ergebnisse ein bestimmter Aufrufer gleichzeitig am Leben haelt --
-#: und genau daran ist der graphfeste Direktmodus in der Hebel-Messung zu
-#: #293 gescheitert: das Aufzeichnungs-Warmup des Standardlaufs haelt mehr
-#: als zwei, ``SGLANG_HTCCL_BAR1_PIPE_ERG_RING`` half nicht, weil ein
-#: groesserer Ring ausschliesslich GRAPH-Plaetze vergab. Die Zahl ist
-#: deshalb ein Parameter (``SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER``) und keine
-#: Konstante mehr. Die Vorgabe bleibt zwei: wieviele der Standardlauf
-#: wirklich braucht, ist nicht gemessen, und eine geratene groessere Zahl
-#: waere kein besserer Wert, sondern nur ein teurerer.
+#: Two is the minimum below which round ``n`` would write into the buffer
+#: the caller from round ``n-1`` is still holding; the same derivation that
+#: makes :data:`ERG_RING_DEFAULT` two. But two is NOT a statement about how
+#: many results any particular caller holds alive simultaneously -- and
+#: that is exactly what tripped up the graph-capturable direct mode in the
+#: lever benchmark for #293: the standard run's capture warmup holds more
+#: than two, and ``SGLANG_HTCCL_BAR1_PIPE_RESULT_RING`` didn't help because
+#: a larger ring only ever handed out GRAPH slots. The number is therefore
+#: a parameter (``SGLANG_HTCCL_BAR1_PIPE_RESULT_EAGER``) and no longer a
+#: constant. The default stays two: how many the standard run really needs
+#: has not been measured, and a guessed larger number would not be a better
+#: value, only a more expensive one.
 ERG_EAGER_PLAETZE = 2
 
 
-def erg_aufteilung(ring: int, graphfest: bool,
+def result_slot_split(ring: int, graphfest: bool,
                    eager_plaetze: int = ERG_EAGER_PLAETZE) -> tuple[int, int]:
-    """``(eager_plaetze, graph_plaetze)`` fuer einen Ring der Groesse ``ring``.
+    """``(eager_plaetze, graph_plaetze)`` for a ring of size ``ring``.
 
-    Reine Arithmetik, damit sie ohne Karte pruefbar ist. Sie ist die
-    Besitzordnung des Ergebnisrings, und sie steht hier statt verstreut im
-    Transport, weil ein Platz, ueber dessen Eigentuemer zwei Stellen
-    verschieden denken, zu vertauschten Ergebnissen ohne Absturz fuehrt.
+    Pure arithmetic, so it can be checked without a card. It is the result
+    ring's ownership policy, and it lives here instead of scattered through
+    the transport, because a slot whose owner two places disagree about
+    leads to swapped results without a crash.
 
-    **Ohne** ``graphfest`` (Vorgabe) gehoert der GANZE Ring dem eager-Weg und
-    rotiert wie bisher -- Byte fuer Byte das gemessene Verhalten.
+    **Without** ``graphfest`` (the default), the WHOLE ring belongs to the
+    eager path and rotates as before -- byte for byte the measured
+    behavior.
 
-    **Mit** ``graphfest`` wird der Ring statisch geteilt:
+    **With** ``graphfest``, the ring is split statically:
 
-    * die ersten ``eager_plaetze`` Plaetze rotieren weiter fuer
-      eager-Aufrufe,
-    * alle darueber liegenden Plaetze sind ein Vorrat, aus dem eine
-      Graph-Aufzeichnung je Aufrufstelle EINEN Platz nimmt und ihn nicht
-      mehr zurueckgibt.
+    * the first ``eager_plaetze`` slots keep rotating for eager calls,
+    * every slot above that is a pool from which one graph capture per
+      call site takes ONE slot and never returns it.
 
-    ``eager_plaetze`` ist ein Parameter und keine Konstante, weil es eine
-    Eigenschaft des AUFRUFERS beschreibt -- wieviele Ergebnisse er
-    gleichzeitig am Leben haelt -- und nicht eine des Transports. Bei
-    :data:`ERG_EAGER_PLAETZE` festgenagelt vergab jeder groessere Ring
-    ausschliesslich Graph-Plaetze, waehrend das Aufzeichnungs-WARMUP, das
-    eager laeuft, an genau der eager-Zahl scheiterte.
+    ``eager_plaetze`` is a parameter and not a constant, because it
+    describes a property of the CALLER -- how many results it holds alive
+    simultaneously -- not one of the transport. Pinned at
+    :data:`ERG_EAGER_PLAETZE`, every larger ring handed out exclusively
+    graph slots, while the capture WARMUP, which runs eager, failed on
+    exactly the eager count.
 
-    **Statisch und nicht mitwachsend**, und das ist der Punkt: haette der
-    Vorrat sich aus dem oberen Ende des eager-Bereichs bedient, sobald eine
-    Aufzeichnung laeuft, koennte er einen Platz greifen, dessen eager-Tensor
-    der Aufrufer noch haelt. Die Grenze steht deshalb fest, bevor der erste
-    Aufruf laeuft.
+    **Static and not growing along with it**, and that is the point: had
+    the pool drawn from the upper end of the eager region while a capture
+    was running, it could have grabbed a slot whose eager tensor the caller
+    was still holding. The boundary is therefore fixed before the first
+    call runs.
 
-    Reicht der Ring nicht fuer beides, gibt es **null** Graph-Plaetze --
-    nicht etwa einen eager-Platz weniger. Der Aufrufer meldet das laut und
-    faehrt den ``direkt=0``-Weg; ein eager-Ring unter zwei Plaetzen waere
-    der Fehler, den :data:`ERG_RING_VORGABE` gerade verhindert.
+    If the ring isn't big enough for both, there are **zero** graph slots --
+    not, say, one eager slot fewer. The caller reports this loudly and runs
+    the ``direkt=0`` path; an eager ring below two slots would be exactly
+    the bug that :data:`ERG_RING_DEFAULT` prevents.
     """
     ring = max(0, int(ring))
     eager = max(0, int(eager_plaetze))
@@ -342,41 +341,41 @@ def erg_aufteilung(ring: int, graphfest: bool,
     return eager, ring - eager
 
 
-def erg_eager_platz(voriger: int, eager_plaetze: int) -> int:
-    """Der naechste eager-Ringplatz nach ``voriger``.
+def result_eager_slot(voriger: int, eager_plaetze: int) -> int:
+    """The next eager ring slot after ``voriger``.
 
-    Ausgelagert, damit die Monotonie- und Modulo-Zusage ohne Karte geprueft
-    werden kann. ``voriger = -1`` ist der Anfangszustand.
+    Factored out so the monotonicity and modulo guarantee can be checked
+    without a card. ``voriger = -1`` is the initial state.
     """
     if eager_plaetze <= 0:
-        raise ValueError("eager-Ring ohne Plaetze")
+        raise ValueError("eager ring has no slots")
     return (int(voriger) + 1) % int(eager_plaetze)
 
 
-def erg_eager_freier_platz(voriger: int, eager_plaetze: int,
+def result_eager_free_slot(voriger: int, eager_plaetze: int,
                            belegt) -> Optional[int]:
-    """Der naechste FREIE eager-Platz nach ``voriger``, oder ``None``.
+    """The next FREE eager slot after ``voriger``, or ``None``.
 
-    ``belegt[i]`` sagt, ob der Tensor, den Platz ``i`` zuletzt herausgegeben
-    hat, noch lebt. Reihum ab ``voriger + 1``, damit die Reihenfolge bei
-    freien Plaetzen Zug fuer Zug die alte bleibt -- der erste Kandidat ist
-    genau der, den :func:`erg_eager_platz` liefert.
+    ``belegt[i]`` says whether the tensor last handed out from slot ``i``
+    is still alive. Scanned round-robin starting at ``voriger + 1``, so
+    that the order among free slots stays the old one step for step -- the
+    first candidate is exactly the one :func:`result_eager_slot` returns.
 
-    **Warum ueberhaupt gesucht wird.** Vorher wurde nur der eine
-    Nachfolger geprueft und bei belegtem Platz hart abgebrochen. Der
-    Nachfolger ist aber der am laengsten unbenutzte, also der
-    wahrscheinlichste Kandidat -- nicht der einzige. Haelt der Aufrufer
-    gerade den einen und den anderen nicht, ist ein Abbruch schlicht falsch.
+    **Why this searches at all.** Previously only the one successor was
+    checked, and a hard abort followed if it was occupied. But the
+    successor is the longest-unused one, i.e. the most likely candidate --
+    not the only one. If the caller happens to be holding that one while
+    not holding the others, aborting is simply wrong.
 
-    ``None`` heisst "alle Plaetze werden noch gehalten". Dann faehrt der
-    Aufruf ``direkt=0``, gemeldet und mit derselben Begruendung wie beim
-    erschoepften Graph-Vorrat: ``direkt=0`` ist der gemessene Kontrollpfad,
-    er kostet den gesparten VRAM-Durchgang und nicht die Richtigkeit. Was
-    NICHT passieren darf, ist das Beschreiben eines gehaltenen Puffers --
-    und genau das passiert hier nicht.
+    ``None`` means "every slot is still being held". Then the call runs
+    ``direkt=0``, reported, with the same justification as an exhausted
+    graph pool: ``direkt=0`` is the measured control path, it costs the
+    saved VRAM pass, not correctness. What must NOT happen is writing into
+    a buffer that's still held -- and that is exactly what doesn't happen
+    here.
     """
     if eager_plaetze <= 0:
-        raise ValueError("eager-Ring ohne Plaetze")
+        raise ValueError("eager ring has no slots")
     L = int(eager_plaetze)
     for schritt in range(L):
         i = (int(voriger) + 1 + schritt) % L
@@ -386,23 +385,22 @@ def erg_eager_freier_platz(voriger: int, eager_plaetze: int,
 
 
 def erg_eager_slack(platz: int, zaehler: int, zuletzt, eager_plaetze: int) -> int:
-    """Wieviele Direkt-Aufrufe seit der letzten Benutzung von ``platz``.
+    """How many direct calls have happened since ``platz`` was last used.
 
-    Der Kern wartet mit ``ergSlack`` darauf, dass der Peer die Generation
-    ``ZIEL - ergSlack + 1`` betreten hat -- ein GROESSERER Slack ist die
-    SCHWAECHERE Bedingung. Er muss deshalb eine Untergrenze des
-    tatsaechlichen Wiederverwendungsabstands sein, nie eine Obergrenze.
+    The kernel waits, via ``ergSlack``, for the peer to have entered
+    generation ``ZIEL - ergSlack + 1`` -- a LARGER slack is the WEAKER
+    condition. It must therefore be a lower bound on the actual reuse
+    distance, never an upper bound.
 
-    Bei strenger Rotation ueber ``L`` Plaetze ist der Abstand genau ``L``,
-    und das ist der Wert, der hier herauskommt -- Zug fuer Zug der
-    gemessene. Sobald :func:`erg_eager_freier_platz` einen Platz
-    ueberspringt, ist er kleiner, und dann muss auch der Slack kleiner sein.
-    Gedeckelt auf ``L``, weil ein groesserer Wert die Bedingung nur
-    schwaecht und nichts gewinnt; mindestens ``1``, weil ``0`` den
-    Handschlag ganz abschaltet.
+    Under strict rotation over ``L`` slots the distance is exactly ``L``,
+    and that's the value this returns -- step for step the measured one.
+    As soon as :func:`result_eager_free_slot` skips a slot, the distance is
+    smaller, and then the slack must be smaller too. Capped at ``L``,
+    because a larger value only weakens the condition and gains nothing;
+    at least ``1``, because ``0`` would disable the handshake entirely.
 
-    ``zuletzt[i] is None`` heisst "noch nie benutzt" -- dann gibt es nichts
-    zu ueberschreiben und ``L`` ist zulaessig.
+    ``zuletzt[i] is None`` means "never used yet" -- then there is nothing
+    to overwrite and ``L`` is admissible.
     """
     L = max(1, int(eager_plaetze))
     vorher = zuletzt[int(platz)]
@@ -411,145 +409,140 @@ def erg_eager_slack(platz: int, zaehler: int, zuletzt, eager_plaetze: int) -> in
     return max(1, min(L, int(zaehler) - int(vorher)))
 
 
-def erg_graph_platz(vergeben: int, eager_plaetze: int,
+def result_graph_slot(vergeben: int, eager_plaetze: int,
                     graph_plaetze: int) -> Optional[int]:
-    """Der ``vergeben``-te Graph-Platz, oder ``None`` wenn der Vorrat leer ist.
+    """The ``vergeben``-th graph slot, or ``None`` if the pool is empty.
 
-    Die Graph-Plaetze liegen HINTER den eager-Plaetzen und werden
-    aufsteigend vergeben. Ein einmal vergebener Platz wird nie wieder
-    ausgegeben: welcher aufgezeichnete Graph noch lebt, ist von hier aus
-    nicht feststellbar, und ein zweimal vergebener Platz waere genau der
-    Fehler, den der graphfeste Modus beseitigen soll -- zwei Aufzeichnungen,
-    die sich einen BAR1-Platz teilen und beim abwechselnden Wiedergeben die
-    Zahlen des jeweils anderen liefern.
+    Graph slots sit BEHIND the eager slots and are handed out ascending.
+    A slot once handed out is never handed out again: which captured graph
+    is still alive cannot be determined from here, and a slot handed out
+    twice would be exactly the bug the graph-capturable mode is meant to
+    eliminate -- two captures sharing one BAR1 slot and, on alternating
+    replay, delivering each other's numbers.
 
-    ``None`` heisst: dieser Aufruf faehrt ``direkt=0``. Das ist kein stiller
-    Rueckfall -- der Aufrufer meldet ihn -- und es ist korrekt, weil
-    ``direkt=0`` derselbe gemessene Kontrollpfad ist.
+    ``None`` means: this call runs ``direkt=0``. That is not a silent
+    fallback -- the caller reports it -- and it is correct, because
+    ``direkt=0`` is the same measured control path.
     """
     if int(vergeben) >= int(graph_plaetze):
         return None
     return int(eager_plaetze) + int(vergeben)
 
 
-def erg_stride_bytes(max_bytes: int) -> int:
-    """Abstand zweier Ergebnispuffer im Ring.
+def result_stride_bytes(max_bytes: int) -> int:
+    """Distance between two result buffers in the ring.
 
-    Auf eine Seite aufgerundet. Damit beginnt jeder Puffer auf einer
-    Seitengrenze, ist also 16-Byte-ausgerichtet -- die Bedingung, an der
-    jeder Schreibvorgang in die WC-Apertur haengt -- und ein Puffer teilt
-    nie eine Seite mit seinem Nachbarn.
+    Rounded up to a page. That way every buffer starts on a page boundary,
+    i.e. is 16-byte-aligned -- the condition every write into the WC
+    aperture depends on -- and a buffer never shares a page with its
+    neighbor.
     """
-    return ((max_bytes + SEITE - 1) // SEITE) * SEITE
+    return ((max_bytes + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 
-def erg_ring_bytes(max_bytes: int, ring: int) -> int:
-    """Was der Ergebnisring im BAR-Fenster kostet: ``L * stride``.
+def result_ring_bytes(max_bytes: int, ring: int) -> int:
+    """What the result ring costs in the BAR window: ``L * stride``.
 
-    Das ist die Rechnung, die gegen die TATSAECHLICH abgebildete Laenge
-    geprueft werden muss, nicht gegen die Bruttogroesse aus sysfs. Sie ist
-    nicht klein: bei ``R = 2``, a2a und Pipe eingeschaltet, stehen
-    ``6 (R-1) = 6`` Schlitze zu je ``chunk_max`` gegen ``L * R * chunk_max``
-    Ergebnispuffer -- bei ``L = 2`` also 10 statt 6 Einheiten, und die
-    groesste Nutzlast sinkt entsprechend auf 6/10. Der Direkt-Modus ist
-    nicht umsonst; er tauscht BAR1-Fenster gegen einen gesparten
-    VRAM-Durchgang und gegen den Wegfall des Umkopierens.
+    This is the computation that must be checked against the ACTUALLY
+    mapped length, not against the raw size from sysfs. It isn't small: at
+    ``R = 2`` with a2a and pipe turned on, ``6 (R-1) = 6`` slots of
+    ``chunk_max`` each stand against ``L * R * chunk_max`` of result
+    buffers -- at ``L = 2`` that's 10 units instead of 6, and the largest
+    payload shrinks accordingly to 6/10. Direct mode isn't free; it trades
+    BAR1 window for a saved VRAM pass and for eliminating the copy-out.
     """
-    return max(0, int(ring)) * erg_stride_bytes(max_bytes)
+    return max(0, int(ring)) * result_stride_bytes(max_bytes)
 
 
-def pipe_fensterbedarf(welt: int, tiefe: int, schlitz: int) -> int:
-    """Der **gerechnete** Bedarf: ``2 * T * (R-1)`` Schlitze.
+def pipe_window_requirement(welt: int, tiefe: int, slot: int) -> int:
+    """The **computed** requirement: ``2 * T * (R-1)`` slots.
 
-    Nicht "ein Schlitzsatz, passt schon". Diese Zahl geht in ``handles()``
-    gegen die TATSAECHLICH abgebildete Laenge, und sie ist kleiner oder
-    gleich :func:`pipe_bereich_bytes` -- die Differenz ist der Verschnitt
-    aus dem Aufrunden auf eine Seite. Sie ist zugleich genau der Bereich,
-    den der Kern anfasst: der AG-Ring beginnt bei ``T(R-1)*schlitz``, und
-    die hoechste Adresse darin ist ``ringBytes + (T-1)*(R-1)*schlitz +
-    (R-1)*schlitz``.
+    Not "one slot set, that'll do". This number is checked in ``handles()``
+    against the ACTUALLY mapped length, and it is smaller than or equal to
+    :func:`pipe_range_bytes` -- the difference is the waste from rounding
+    up to a page. It is also exactly the region the kernel touches: the AG
+    ring starts at ``T(R-1)*slot``, and the highest address within it is
+    ``ringBytes + (T-1)*(R-1)*slot + (R-1)*slot``.
     """
-    return 2 * int(tiefe) * (int(welt) - 1) * int(schlitz)
+    return 2 * int(tiefe) * (int(welt) - 1) * int(slot)
 
 
-def _chunk_grenzen(n: int, j: int, teile: int) -> tuple[int, int]:
-    """Dieselbe Zerlegung wie ``chunkGrenzen`` im Kern: Rest nach vorn.
+def _chunk_bounds(n: int, j: int, teile: int) -> tuple[int, int]:
+    """The same split as ``chunkGrenzen`` in the kernel: remainder up front.
 
-    Sie steht hier NUR fuer die Planung und den Byte-Beleg. Die
-    Nahtstellenpruefung im Kern rechnet mit ``chunkGrenzen`` selbst -- eine
-    Naht, die auf beiden Seiten mit derselben falschen Formel geprueft
-    wuerde, faellt nicht auf.
+    This lives here ONLY for planning and the byte-level check. The seam
+    check in the kernel computes with ``chunkGrenzen`` itself -- a seam
+    checked on both sides with the same wrong formula would never surface.
     """
     basis = n // teile
     rest = n - basis * teile
-    laenge = basis + (1 if j < rest else 0)
+    length = basis + (1 if j < rest else 0)
     versatz = j * basis + (j if j < rest else rest)
-    return versatz, laenge
+    return versatz, length
 
 
-def groesstes_stueck4(n4: int, welt: int, k: int) -> int:
-    """Groesstes Stueck (in 128-Bit-Paketen), das je in einen Schlitz muss.
+def largest_chunk4(n4: int, welt: int, k: int) -> int:
+    """Largest piece (in 128-bit packets) that ever has to fit in a slot.
 
-    Ausgerechnet ueber ALLE (Chunk, Rang)-Paare, nicht ueber
-    ``ceil(ceil(n4/K)/R)``. Die geschlossene Form stimmt hier zwar, aber sie
-    ist eine zweite Fassung derselben Zerlegung, und genau das ist die
-    Fehlerklasse, die dieser Transport an mehreren Stellen ausdruecklich
-    vermeidet.
+    Computed over ALL (chunk, rank) pairs, not via
+    ``ceil(ceil(n4/K)/R)``. The closed form does happen to be correct here,
+    but it is a second version of the same split, and that is exactly the
+    error class this transport deliberately avoids in several places.
     """
     gr = 0
     for c in range(k):
-        _, clen = _chunk_grenzen(n4, c, k)
+        _, clen = _chunk_bounds(n4, c, k)
         for z in range(welt):
-            _, plen = _chunk_grenzen(clen, z, welt)
+            _, plen = _chunk_bounds(clen, z, welt)
             if plen > gr:
                 gr = plen
     return gr
 
 
-def pipe_plan(nbytes: int, welt: int, schlitz: int, tiefe: int,
+def pipe_plan(nbytes: int, welt: int, slot: int, tiefe: int,
               k_wunsch: int, chunk_ziel_bytes: int,
               k_max: int = 64) -> Optional[int]:
-    """Die Chunkzahl ``K`` fuer diese Nutzlast, oder ``None``.
+    """The chunk count ``K`` for this payload, or ``None``.
 
-    ``None`` heisst: diese Groesse traegt der gepipelinete Weg nicht -- der
-    Aufrufer meldet sich ueber ``handles()`` ab, statt still kleiner zu
-    rechnen.
+    ``None`` means: this size isn't carried by the pipelined path -- the
+    caller declines via ``handles()`` instead of silently computing
+    something smaller.
 
-    **Rangeinheitlich.** Jeder Eingang ist gruppenweit gleich (``nbytes``
-    und ``welt`` ohnehin, ``schlitz`` aus dem Aufbau, der Rest aus
-    rangeinheitlichen Umgebungsvariablen). Zwei Raenge duerfen hier nie
-    verschieden antworten.
+    **Rank-uniform.** Every input is the same group-wide (``nbytes`` and
+    ``welt`` inherently, ``slot`` from setup, the rest from rank-uniform
+    environment variables). Two ranks must never answer differently here.
 
-    Zwei Bedingungen, beide hart:
+    Two conditions, both hard:
 
-    1. ``K >= T``. Bei ``K < T`` gaebe es Schlitzklassen, die nie belegt
-       werden, und der Kern verlangt es ohnehin (``TORCH_CHECK(K >= TT)``).
-       Ausserdem ist ``T >= 2`` erzwungen (siehe :data:`MIN_TIEFE`).
-    2. Das groesste Stueck muss in einen Schlitz passen. Geprueft mit
-       :func:`groesstes_stueck4`, also mit der Zerlegung selbst.
+    1. ``K >= T``. At ``K < T`` there would be slot classes that are never
+       occupied, and the kernel enforces this anyway
+       (``TORCH_CHECK(K >= TT)``). Additionally ``T >= 2`` is enforced (see
+       :data:`MIN_DEPTH`).
+    2. The largest piece must fit in a slot. Checked with
+       :func:`largest_chunk4`, i.e. with the split itself.
 
-    Die Vorgabe fuer ``K`` (``k_wunsch <= 0``) leitet sich aus
-    ``chunk_ziel_bytes`` ab. Sie ist eine **Ausgangszahl fuer die
-    Messreihe**, keine Messaussage: begruendet ist sie damit, dass in
-    ``MESSUNG_ALLES_IM_SELBEN_LAUF.md`` (drei Raenge, Rig 1) ``netz`` bei
-    1 MiB 330,30 us braucht und die Leerrunde 25,74 us; ein 256-KiB-Chunk
-    kostet damit rund 82 us Uebertragung gegen rund 26 us Umlauf, der
-    Umlauf bleibt also hinter dem Verkehr verborgen. Auf zwei Karten und am
-    x8-Port ist das ungemessen.
+    The default for ``K`` (``k_wunsch <= 0``) is derived from
+    ``chunk_ziel_bytes``. It is a **starting point for the benchmark
+    series**, not a measurement result: the justification is that in
+    ``MESSUNG_ALLES_IM_SELBEN_LAUF.md`` (three ranks, rig 1), ``mesh`` takes
+    330.30 us at 1 MiB and the empty-round overhead is 25.74 us; a 256 KiB
+    chunk therefore costs about 82 us of transfer against about 26 us of
+    round trip, so the round trip stays hidden behind the traffic. On two
+    cards and on the x8 port this is unmeasured.
     """
     if nbytes % 16 != 0:
         return None
     n4 = nbytes // 16
-    if tiefe < MIN_TIEFE or tiefe > MAX_TIEFE:
+    if tiefe < MIN_DEPTH or tiefe > MAX_DEPTH:
         return None
-    schlitz = int(schlitz)
-    if schlitz <= 0 or schlitz % 16:
+    slot = int(slot)
+    if slot <= 0 or slot % 16:
         return None
     obergrenze = min(k_max, MAX_CHUNKS, max(1, n4 // welt))
     if obergrenze < tiefe:
-        # Weniger Chunks moeglich als die Tiefe verlangt: zu wenig Nutzlast
-        # je Rang. Kein Herunterregeln der Tiefe -- sie bestimmt die
-        # Schlitzgeometrie und die steht seit dem Aufbau fest.
+        # Fewer chunks possible than the depth requires: too little payload
+        # per rank. No lowering the depth -- it determines the slot
+        # geometry, and that has been fixed since setup.
         return None
 
     if k_wunsch > 0:
@@ -557,19 +550,19 @@ def pipe_plan(nbytes: int, welt: int, schlitz: int, tiefe: int,
     else:
         ziel = max(1, chunk_ziel_bytes)
         k0 = max(tiefe, min(obergrenze, max(1, nbytes // ziel)))
-        # Aufsteigend probieren: passt das groesste Stueck nicht in einen
-        # Schlitz, hilft MEHR Zerlegung, nie weniger.
+        # Try ascending: if the largest piece doesn't fit in a slot, MORE
+        # splitting helps, never less.
         kandidaten = list(range(k0, obergrenze + 1))
     for k in kandidaten:
         if k < tiefe or k > obergrenze:
             continue
-        if groesstes_stueck4(n4, welt, k) * 16 <= schlitz:
+        if largest_chunk4(n4, welt, k) * 16 <= slot:
             return int(k)
     return None
 
 
 # ===========================================================================
-# Kernelquelltext
+# Kernel source
 # ===========================================================================
 
 _CUDA_SRC = r"""
@@ -594,9 +587,9 @@ namespace cg = cooperative_groups;
 using u64 = unsigned long long;
 
 // ===========================================================================
-// Primitiven -- WOERTLICH aus htccl_bar1_ext.py dupliziert. Siehe Moduldoku:
-// die Duplikation ist bewusst (Dateikonflikt) und ist eine Schuld. Wer hier
-// etwas aendert, muss es dort mitaendern.
+// Primitives -- duplicated VERBATIM from htccl_bar1_ext.py. See the module
+// docstring: the duplication is deliberate (concurrent file ownership) and
+// is a debt. Whoever changes something here must change it there too.
 // ===========================================================================
 
 __device__ __forceinline__ uint4 leseV4(const void *p)
@@ -692,9 +685,9 @@ __device__ __forceinline__ uint4 addV4<__nv_bfloat16>(uint4 a, uint4 b)
     return r;
 }
 
-// Chunk j von n Einheiten ueber `teile`; Rest auf die VORDEREN Chunks.
-// Bitgleich zu htccl_bar1_ext.py::chunkGrenzen -- die Pipe zerlegt zweimal
-// mit derselben Regel (erst in K Chunks, dann in R Stuecke).
+// Chunk j out of n units over `teile`; remainder onto the LEADING chunks.
+// Bit-identical to htccl_bar1_ext.py::chunkGrenzen -- the pipe splits
+// twice with the same rule (first into K chunks, then into R pieces).
 __device__ __host__ __forceinline__ void chunkGrenzen(int n, int j, int teile,
                                                       int *off, int *len)
 {
@@ -712,18 +705,18 @@ __device__ __forceinline__ void barriere(void)
 }
 
 // ===========================================================================
-// Umkehrung von chunkGrenzen: zu einem flachen Index j in [0, n) das Stueck
-// z und den Versatz darin. Geschlossene Form, kein Scan.
+// Inverse of chunkGrenzen: for a flat index j in [0, n), the piece z and
+// the offset within it. Closed form, no scan.
 //
-// Sie erlaubt es, den Reduce-Scatter-Sendevorgang ueber ALLE Ziele in EINER
-// flachen Schleife zu fahren -- verschiedene Warps schreiben dann
-// gleichzeitig an verschiedene Karten, statt Ziel fuer Ziel. Dasselbe
-// Verfahren wie im a2a-Kern, dort ueber einen Praefixscan im gemeinsamen
-// Speicher; hier geht es geschlossen, weil die Zerlegung gleichmaessig ist.
+// It allows the reduce-scatter send to run over ALL targets in ONE flat
+// loop -- different warps then write to different cards at the same time,
+// instead of target by target. Same technique as in the a2a kernel, there
+// via a prefix scan in shared memory; here it works in closed form because
+// the split is uniform.
 //
-// basis == 0 (n < teile) ist NICHT der Sonderfall, der er zu sein scheint:
-// dann ist rest == n und grenz == n, der else-Zweig also unerreichbar. Eine
-// Division durch 0 kann nicht auftreten.
+// basis == 0 (n < teile) is NOT the special case it appears to be: then
+// rest == n and grenz == n, so the else branch is unreachable. A division
+// by 0 cannot occur.
 // ===========================================================================
 __device__ __forceinline__ void stueckAus(int n, int teile, int j,
                                           int *z, int *lok)
@@ -742,67 +735,66 @@ __device__ __forceinline__ void stueckAus(int n, int teile, int j,
 }
 
 // ===========================================================================
-// Argumente
+// Arguments
 // ===========================================================================
 struct PipeArgs {
     const uint4 *in;
     uint4       *out;
     u64         *rundeDev;
-    u64         *schrittDev;   // absoluter Chunkzaehler, ueberlebt den Aufruf
-    // Generationszaehler des Direkt-Modus. LOKALER VRAM, nicht im Fenster:
-    // ein lokaler Zaehler ist mit den eigenen Lesevorgaengen kohaerent, und
-    // nur die Peer-SICHT auf ihn braucht das Flaggenprotokoll. Er liegt auf
-    // dem GERAET, weil er bei jeder Graph-Wiedergabe weiterzaehlen muss --
-    // ein hostseitiger Zaehler wird beim Aufzeichnen eingebrannt und steht
-    // bei der Wiedergabe still.
+    u64         *schrittDev;   // absolute chunk counter, survives the call
+    // Generation counter of direct mode. LOCAL VRAM, not in the window: a
+    // local counter is coherent with the own reads, and only the peer's
+    // VIEW of it needs the flag protocol. It lives on the DEVICE because it
+    // must keep counting on every graph replay -- a host-side counter gets
+    // baked in at capture time and sits frozen during replay.
     u64         *ergGenDev;
     unsigned int *ctlStatus;
     unsigned int *abbruchDev;
     int          n4;
     int          R;
     int          rang;
-    int          K;            // Chunkzahl dieses Aufrufs
-    int          TT;           // Ringtiefe = Schlitzklassen je Phase
-    int          PP;           // Zeitplan-Vorlauf, 2 <= PP <= TT
-    int          quittung;     // 1 = head veroeffentlichen (Vorgabe)
-    long long    schlitz4;     // Schlitzgroesse in 128-Bit-Paketen
-    long long    klasse4;      // Abstand zweier Schlitzklassen = (R-1)*schlitz4
+    int          K;            // chunk count of this call
+    int          TT;           // ring depth = slot classes per phase
+    int          PP;           // schedule lead, 2 <= PP <= TT
+    int          quittung;     // 1 = publish head (default)
+    long long    schlitz4;     // slot size in 128-bit packets
+    long long    klasse4;      // distance between two slot classes = (R-1)*schlitz4
     u64          deckelZyklen;
 
-    int          direkt;       // 1 = Allgather schreibt in den Ergebnispuffer
-    // Freigabe-Handschlag des Direkt-Modus. 0 = aus (das gemessene
-    // Altverhalten, Flaggenfamilie 4 wird nie angefasst). > 0 = an, und die
-    // Zahl ist der ABSTAND IN GENERATIONEN, nach dem ein Ergebnisplatz
-    // wiederverwendet wird: 1 fuer einen fest reservierten Graph-Platz,
-    // sonst die Zahl der eager-Ringplaetze.
+    int          direkt;       // 1 = allgather writes into the result buffer
+    // Release handshake of direct mode. 0 = off (the measured legacy
+    // behavior, flag family 4 is never touched). > 0 = on, and the number
+    // is the DISTANCE IN GENERATIONS after which a result slot is reused:
+    // 1 for a permanently reserved graph slot, otherwise the number of
+    // eager ring slots.
     int          ergSlack;
 
-    // Nutzlastschlitze, Klasse 0. Klasse t liegt bei + t*klasse4.
+    // Payload slots, class 0. Class t sits at + t*klasse4.
     uint4       *sendRS[HTCCL_PIPE_MAX_RANKS];
     uint4       *sendAG[HTCCL_PIPE_MAX_RANKS];
     const uint4 *recvRS[HTCCL_PIPE_MAX_RANKS];
     const uint4 *recvAG[HTCCL_PIPE_MAX_RANKS];
-    // Direkt-Modus: der Ergebnispuffer des Peers z fuer DIESE Runde. Er
-    // liegt in derselben exportierten Region wie die Schlitze, also ist er
-    // ohne jede Registrierung im heissen Pfad erreichbar. Der Versatz
-    // innerhalb des Puffers ist derselbe wie im eigenen `out` -- der
-    // Allgather kopiert nichts um, er schreibt an die Endstelle.
+    // Direct mode: peer z's result buffer for THIS round. It lives in the
+    // same exported region as the slots, so it's reachable without any
+    // registration on the hot path. The offset within the buffer is the
+    // same as in the own `out` -- the allgather doesn't copy anything
+    // around, it writes straight to the final destination.
     uint4       *ergAn[HTCCL_PIPE_MAX_RANKS];
 
-    // Zaehler. [0] = RS-Ring, [1] = AG-Ring.
-    u64         *tailAn [2][HTCCL_PIPE_MAX_RANKS];  // ich -> Empfaenger z
-    const u64   *tailVon[2][HTCCL_PIPE_MAX_RANKS];  // lokal, von Sender s
-    u64         *headAn [2][HTCCL_PIPE_MAX_RANKS];  // ich -> Erzeuger s
-    const u64   *headVon[2][HTCCL_PIPE_MAX_RANKS];  // lokal, von Empfaenger z
+    // Counters. [0] = RS ring, [1] = AG ring.
+    u64         *tailAn [2][HTCCL_PIPE_MAX_RANKS];  // me -> receiver z
+    const u64   *tailVon[2][HTCCL_PIPE_MAX_RANKS];  // local, from sender s
+    u64         *headAn [2][HTCCL_PIPE_MAX_RANKS];  // me -> producer s
+    const u64   *headVon[2][HTCCL_PIPE_MAX_RANKS];  // local, from receiver z
 
-    // Freigabe des Ergebnisplatzes (Flaggenfamilie 4). Dieselbe Richtung wie
-    // tail/head: geschrieben wird beim Peer, gelesen wird lokal.
-    u64         *ergBereitAn [HTCCL_PIPE_MAX_RANKS]; // ich -> Peer z
-    const u64   *ergBereitVon[HTCCL_PIPE_MAX_RANKS]; // lokal, von Peer z
+    // Release of the result slot (flag family 4). Same direction as
+    // tail/head: written at the peer, read locally.
+    u64         *ergBereitAn [HTCCL_PIPE_MAX_RANKS]; // me -> peer z
+    const u64   *ergBereitVon[HTCCL_PIPE_MAX_RANKS]; // local, from peer z
 };
 
 // ===========================================================================
-// Der Kern
+// The kernel
 // ===========================================================================
 template<typename T, int LA, int GRID>
 __global__ void bar1_netz_pipe_kernel(PipeArgs A)
@@ -815,30 +807,29 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                         : (int)blockDim.x;
     const bool erster = (tid == 0);
     const int  n4 = A.n4, R = A.R, r = A.rang, K = A.K, TT = A.TT, PP = A.PP;
-    const u64  runde  = *(const volatile u64 *)A.rundeDev + 1ull;
+    const u64  round  = *(const volatile u64 *)A.rundeDev + 1ull;
     const u64  basis  = *(const volatile u64 *)A.schrittDev;
-    // Der Handschlag laeuft nur, wenn beides zusammenkommt: Direkt-Modus UND
-    // ein Slack-Wert. Beides ist gruppeneinheitlich, also treten entweder
-    // alle Raenge in den Handschlag ein oder keiner -- ein Rang, der ihn
-    // ausliesse, waehrend die anderen auf seine Flagge warten, waere ein
-    // Haenger und kein falsches Ergebnis.
+    // The handshake only runs when both come together: direct mode AND a
+    // slack value. Both are group-uniform, so either all ranks enter the
+    // handshake or none do -- a rank that skipped it while the others wait
+    // for its flag would be a hang, not a wrong result.
     const bool ergHand = (A.direkt != 0) && (A.ergSlack > 0);
     const u64  ergGen  = ergHand
                              ? (*(const volatile u64 *)A.ergGenDev + 1ull)
                              : 0ull;
 
-    // Alles, was mit LAUFENDEM Index indiziert wird, in den gemeinsamen
-    // Speicher. Ein dynamisch indiziertes Feld der Argumentstruktur zwingt
-    // nvcc, den ganzen Parameterblock je Thread in den local memory zu
-    // legen -- derselbe Grund wie im a2a-Kern.
+    // Everything indexed with a RUNNING index goes into shared memory. A
+    // dynamically indexed field of the argument struct forces nvcc to put
+    // the whole parameter block into local memory per thread -- the same
+    // reason as in the a2a kernel.
     __shared__ uint4       *sSendRS[HTCCL_PIPE_MAX_RANKS];
     __shared__ uint4       *sSendAG[HTCCL_PIPE_MAX_RANKS];
     __shared__ const uint4 *sRecvRS[HTCCL_PIPE_MAX_RANKS];
     __shared__ const uint4 *sRecvAG[HTCCL_PIPE_MAX_RANKS];
     __shared__ uint4       *sErgAn [HTCCL_PIPE_MAX_RANKS];
-    // Zaehlerzeiger und die lokalen Kopien (NCCL: connStepCache). Nur der
-    // erste Thread fasst sie an; sie liegen trotzdem im gemeinsamen
-    // Speicher, weil sonst 4*8 u64 als Register je Thread anfielen.
+    // Counter pointers and their local caches (NCCL: connStepCache). Only
+    // the first thread touches them; they still live in shared memory,
+    // because otherwise 4*8 u64 would pile up as registers per thread.
     __shared__ u64         *sTailAn [2][HTCCL_PIPE_MAX_RANKS];
     __shared__ const u64   *sTailVon[2][HTCCL_PIPE_MAX_RANKS];
     __shared__ u64         *sHeadAn [2][HTCCL_PIPE_MAX_RANKS];
@@ -860,21 +851,19 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                 sTailVon[ph][i] = A.tailVon[ph][i];
                 sHeadAn [ph][i] = A.headAn [ph][i];
                 sHeadVon[ph][i] = A.headVon[ph][i];
-                // Der Anfangswert des Zwischenspeichers ist BASIS, nicht 0:
-                // was vor diesem Aufruf geschehen ist, steht schon in
-                // schrittDev. Ein mit 0 anfangender Zwischenspeicher waere
-                // nicht falsch, aber er erzwaenge in der ersten
-                // Schleifenrunde ein Nachlesen je Verbindung.
+                // The cache's initial value is BASIS, not 0: what happened
+                // before this call is already reflected in schrittDev. A
+                // cache starting at 0 wouldn't be wrong, but it would force
+                // a re-read per connection in the first loop iteration.
                 sTailC[ph][i] = basis;
                 sHeadC[ph][i] = basis;
             }
             sBereitAn [i] = A.ergBereitAn [i];
             sBereitVon[i] = A.ergBereitVon[i];
-            // Anfangswert 0 und NICHT `ergGen - 1`: der optimistische
-            // Anfangswert waere genau die Annahme, die der Handschlag
-            // pruefen soll. Es kostet EINE lokale Leseoperation je Peer und
-            // je Aufruf -- die Zeile liegt im eigenen VRAM, nicht hinter
-            // PCIe.
+            // Initial value 0, and NOT `ergGen - 1`: the optimistic initial
+            // value would be exactly the assumption the handshake is
+            // supposed to verify. It costs ONE local read per peer and per
+            // call -- the line sits in the own VRAM, not behind PCIe.
             sBereitC  [i] = 0ull;
         }
         abbruchS = 0;
@@ -886,17 +875,17 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         __threadfence();
     }
 
-    // -- Freigabe veroeffentlichen, so frueh wie moeglich -------------------
+    // -- Publish the release, as early as possible --------------------------
     //
-    // "Ich bin in Generation g eingetreten." Weil dieser Kern auf demselben
-    // Strom liegt wie alles, was das Ergebnis der Generation g-1 gelesen
-    // hat, sagt das Eintreten zugleich: mein Ergebnisplatz ist frei. Der
-    // Peer darf ab jetzt hineinschreiben.
+    // "I have entered generation g." Because this kernel sits on the same
+    // stream as everything that read generation g-1's result, entering it
+    // simultaneously means: my result slot is free. The peer may write into
+    // it from now on.
     //
-    // Vor der Sperre und vor der Schleife, damit die PCIe-Laufzeit (rund
-    // 3 us, BEFUND_L2_UMGEHBAR.md) hinter der Reduce-Scatter-Phase
-    // verschwindet. Gewartet wird erst, wenn der erste Direktschreibvorgang
-    // ansteht -- also PP-1 Schleifenrunden spaeter.
+    // Before the barrier and before the loop, so the PCIe round-trip time
+    // (about 3 us, BEFUND_L2_UMGEHBAR.md) disappears behind the
+    // reduce-scatter phase. The wait only happens once the first direct
+    // write is due -- i.e. PP-1 loop iterations later.
     if (ergHand && erster) {
         for (int z = 0; z < R; ++z)
             if (z != r) schreibeU64(sBereitAn[z], ergGen);
@@ -904,14 +893,14 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     }
     barriere<GRID>();
 
-    // -- Wartebedingungen ---------------------------------------------------
+    // -- Wait conditions ------------------------------------------------------
     //
-    // Beide lesen ZUERST den Zwischenspeicher und fassen die Zeile nur an,
-    // wenn er nicht reicht. Ueber PCIe waere jedes Nachlesen ein Umlauf --
-    // ohne den Zwischenspeicher kostete das Fenster mehr als es bringt
-    // (NCCL prims_simple.h:40-41, 107).
+    // Both FIRST read the cache and only touch the line if it isn't
+    // sufficient. Over PCIe, every re-read would be a round trip -- without
+    // the cache, the window would cost more than it gains (NCCL
+    // prims_simple.h:40-41, 107).
     //
-    // `ziel` ist immer ein ABSOLUTER Schritt (basis + c + 1).
+    // `ziel` is always an ABSOLUTE step (basis + c + 1).
 
 #define PIPE_WARTE_DATEN(PH, ZIEL)                                             \
     do {                                                                       \
@@ -931,9 +920,9 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         }                                                                      \
     } while (0)
 
-    // Fenster: der Empfaenger z hat mindestens (ZIEL - TT) Chunks gelesen.
-    // Unsigned-Vergleich in der Form `cache + TT < ziel` -- genau wie NCCL,
-    // damit ziel < TT nicht unterlaeuft.
+    // Window: receiver z has read at least (ZIEL - TT) chunks. Unsigned
+    // comparison in the form `cache + TT < ziel` -- exactly like NCCL, so
+    // that ziel < TT does not underflow.
 #define PIPE_WARTE_FENSTER(PH, ZIEL)                                           \
     do {                                                                       \
         if (A.quittung) {                                                      \
@@ -954,22 +943,22 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         }                                                                      \
     } while (0)
 
-    // Der Peer z hat seinen Ergebnisplatz fuer Generation ZIEL freigegeben.
+    // Peer z has released its result slot for generation ZIEL.
     //
-    // Der Platz wird alle ``ergSlack`` Generationen wiederverwendet; wer in
-    // Generation ZIEL hineinschreibt, ueberschreibt also den Inhalt der
-    // Generation ``ZIEL - ergSlack``. Freigegeben ist der, sobald z in
-    // Generation ``ZIEL - ergSlack + 1`` eingetreten ist. Dieselbe
-    // unsigned-sichere Form wie bei PIPE_WARTE_FENSTER: der Slack steht auf
-    // der LINKEN Seite, damit ZIEL < ergSlack nicht unterlaeuft.
+    // The slot is reused every ``ergSlack`` generations; whoever writes
+    // into generation ZIEL therefore overwrites the contents of generation
+    // ``ZIEL - ergSlack``. It is released once z has entered generation
+    // ``ZIEL - ergSlack + 1``. The same unsigned-safe form as
+    // PIPE_WARTE_FENSTER: the slack sits on the LEFT side, so that
+    // ZIEL < ergSlack does not underflow.
     //
-    // Warum es diese Bedingung ueberhaupt braucht und die AG-Quittung nicht
-    // reicht: bei ``ergSlack >= 2`` folgt sie aus dem AG-Fenster (der
-    // Vorgaenger liegt zwei Aufrufe zurueck, und schon EIN Aufruf Abstand
-    // ist durch tail/head erzwungen). Bei einem fest reservierten
-    // Graph-Platz ist ``ergSlack == 1``: derselbe Platz wird bei JEDER
-    // Wiedergabe neu beschrieben, und dann gibt es keinen Abstand mehr, den
-    // das AG-Fenster erzwingen koennte.
+    // Why this condition is needed at all, and the AG acknowledgement isn't
+    // enough: at ``ergSlack >= 2`` it follows from the AG window (the
+    // predecessor is two calls back, and even ONE call of distance is
+    // already enforced by tail/head). For a permanently reserved graph
+    // slot, ``ergSlack == 1``: the same slot is overwritten on EVERY
+    // replay, and then there is no distance left that the AG window could
+    // enforce.
 #define PIPE_WARTE_ERGFREI(ZIEL)                                               \
     do {                                                                       \
         const u64 _z = (ZIEL);                                                 \
@@ -989,75 +978,73 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         }                                                                      \
     } while (0)
 
-    // Einmal je Aufruf, nicht je Schleifenrunde: die Bedingung haengt an der
-    // Generation, und die aendert sich innerhalb eines Aufrufs nicht. Nur
-    // Thread 0 wertet sie aus, also genuegt eine gewoehnliche lokale
-    // Variable.
+    // Once per call, not per loop iteration: the condition depends on the
+    // generation, and that doesn't change within a call. Only thread 0
+    // evaluates it, so an ordinary local variable is enough.
     bool ergFreiGesehen = !ergHand;
 
-    // -- Schleife -----------------------------------------------------------
+    // -- Loop -----------------------------------------------------------------
     //
-    // Drei Stufen, um PP-1 bzw. PP Schleifenrunden versetzt:
+    // Three stages, offset by PP-1 and PP loop iterations respectively:
     //
-    //   cs = i        Reduce-Scatter-Stueck von Chunk cs an alle Peers
-    //   cr = i-(PP-1) Chunk cr reduzieren UND das Ergebnis sofort verteilen
-    //   cg = i-PP     Allgather-Stuecke von Chunk cg uebernehmen
+    //   cs = i        reduce-scatter piece of chunk cs to all peers
+    //   cr = i-(PP-1) reduce chunk cr AND distribute the result immediately
+    //   cg = i-PP     adopt allgather pieces of chunk cg
     //
-    // Ein Rang schiebt also Chunk i hinaus, waehrend er Chunk i-PP+1
-    // reduziert und Chunk i-PP einsammelt. Zwischen den Stufen steht KEINE
-    // gitterweite Sperre je Phase mehr; die beiden Sperren je Schleifenrunde
-    // trennen nur "erster hat gewartet" von "alle arbeiten" und "alle sind
-    // fertig" von "erster veroeffentlicht".
+    // So a rank pushes out chunk i while reducing chunk i-PP+1 and
+    // collecting chunk i-PP. There is NO grid-wide lockstep per phase left
+    // between the stages anymore; the two barriers per loop iteration only
+    // separate "the first thread has waited" from "everyone works", and
+    // "everyone is done" from "the first thread publishes".
     //
-    // WARUM VORLAUF UND RINGTIEFE GETRENNT SIND
+    // WHY LEAD AND RING DEPTH ARE SEPARATE
     // -----------------------------------------
-    // Sie waren erst dasselbe (PP == TT), und das war ein Entwurfsfehler.
-    // Die Fensterbedingung fuer das Senden von Chunk i verlangt, dass der
-    // Empfaenger Chunk i-TT verbraucht hat; verbraucht wird er bei ihm in
-    // Schleifenrunde (i-TT)+(PP-1). Der Empfaenger darf also um
+    // They used to be the same (PP == TT), and that was a design mistake.
+    // The window condition for sending chunk i requires the receiver to
+    // have consumed chunk i-TT; for it, that consumption happens in loop
+    // iteration (i-TT)+(PP-1). So the receiver is allowed to lag by
     //
-    //     TT - PP + 1  Schleifenrunden
+    //     TT - PP + 1  loop iterations
     //
-    // zurueckliegen, bevor der Sender blockiert. Mit PP == TT ist das genau
-    // EINE Runde -- der Ring waere TT Schlitze tief, aber der Zeitplan
-    // verbraeuchte sie sofort wieder, und zwei ungleich schnelle Karten
-    // liefen faktisch im Gleichschritt. Genau die zeitliche Entkopplung, die
-    // dem Host-Weg seine einzige echte Staerke gibt (der Sender kippt ins
-    // RAM und ist fertig), waere damit verschenkt.
+    // before the sender blocks. With PP == TT that is exactly ONE
+    // iteration -- the ring would be TT slots deep, but the schedule would
+    // consume them again immediately, and two cards of unequal speed would
+    // effectively run in lockstep. Exactly the temporal decoupling that
+    // gives the host path its one genuine strength (the sender dumps into
+    // RAM and is done) would be thrown away by that.
     //
-    // Mit PP = 2 (dem Minimum, das ueberhaupt pipelinet) und TT = 4 sind es
-    // drei Runden Versatz. Das ist NCCLs Bauform: acht Schritte im Ring
-    // (NCCL_STEPS, src/include/device.h:26) gegen zwei Schritte je Scheibe
-    // (ALLREDUCE_SLICESTEPS, src/include/collectives.h:19) -- Ringtiefe und
-    // Vorlauf sind auch dort verschiedene Zahlen.
+    // With PP = 2 (the minimum that pipelines at all) and TT = 4, that's
+    // three iterations of offset. This is NCCL's design: eight steps in the
+    // ring (NCCL_STEPS, src/include/device.h:26) against two steps per
+    // slice (ALLREDUCE_SLICESTEPS, src/include/collectives.h:19) -- ring
+    // depth and lead are different numbers there too.
     for (int i = 0; i < K + PP; ++i) {
         const int cs = i;
         const int cr = i - (PP - 1);
         const int cg = i - PP;
-        // SCHLITZKLASSE AUS DEM ABSOLUTEN SCHRITT, nicht aus dem Chunkindex
-        // dieses Aufrufs. Mit `c % TT` verschoebe sich die Zuordnung
-        // Klasse <-> Schlitz an jeder Rundengrenze, an der K kein Vielfaches
-        // von TT ist -- die Fensterbedingung "head + TT >= schritt" spraeche
-        // dann ueber einen anderen Schlitz als den, in den geschrieben wird.
-        // Beispiel TT=2, K=3: Runde n legt die Schritte 1,2,3 in die Klassen
-        // 0,1,0; Runde n+1 legt Schritt 4 in Klasse 0, waehrend dort noch
-        // Schritt 3 liegt -- die Bedingung haette aber nur Schritt 2
-        // verlangt. Mit dem absoluten Schritt ist die Klasse
-        // `(schritt-1) mod TT` und die Bedingung trifft immer den richtigen
-        // Vorgaenger.
+        // SLOT CLASS FROM THE ABSOLUTE STEP, not from this call's chunk
+        // index. With `c % TT`, the class <-> slot mapping would shift at
+        // every round boundary where K isn't a multiple of TT -- the
+        // window condition "head + TT >= step" would then be talking about
+        // a different slot than the one being written to. Example TT=2,
+        // K=3: round n places steps 1,2,3 into classes 0,1,0; round n+1
+        // places step 4 into class 0, while step 3 still sits there -- but
+        // the condition would only have required step 2. With the absolute
+        // step, the class is `(step-1) mod TT` and the condition always
+        // hits the correct predecessor.
         const int ts = (int)((basis + (u64)cs) % (u64)TT);
         const int tr = (cr >= 0) ? (int)((basis + (u64)cr) % (u64)TT) : 0;
         const int tg = (cg >= 0) ? (int)((basis + (u64)cg) % (u64)TT) : 0;
 
-        // (a) nur der erste Thread: warten
+        // (a) first thread only: wait
         if (erster) {
             if (cs < K)             PIPE_WARTE_FENSTER(0, basis + (u64)cs + 1ull);
             if (!abbruchS && cr >= 0 && cr < K) {
                                     PIPE_WARTE_DATEN  (0, basis + (u64)cr + 1ull);
                 if (!abbruchS)      PIPE_WARTE_FENSTER(1, basis + (u64)cr + 1ull);
-                // Erst hier, unmittelbar vor dem ersten Direktschreibvorgang
-                // dieses Aufrufs -- die Reduce-Scatter-Runden davor haben die
-                // Flaggen der Peers bereits ueber die Leitung gebracht.
+                // Only here, right before this call's first direct write --
+                // the reduce-scatter iterations before it have already
+                // carried the peers' flags across the wire.
                 if (!abbruchS && !ergFreiGesehen) {
                     PIPE_WARTE_ERGFREI(ergGen);
                     ergFreiGesehen = true;
@@ -1075,54 +1062,53 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                                ? abbruchS
                                : (int)*(volatile unsigned int *)A.abbruchDev;
             if (ab) {
-                // ALLE Bloecke kehren gemeinsam zurueck -- ein einzelner
-                // Block, der eine grid.sync() nicht mehr erreicht, haengt
-                // den Rest auf.
+                // ALL blocks return together -- a single block that no
+                // longer reaches a grid.sync() hangs the rest.
                 if (erster) {
                     *A.ctlStatus = 1u;
-                    *(volatile u64 *)A.rundeDev   = runde;
+                    *(volatile u64 *)A.rundeDev   = round;
                     *(volatile u64 *)A.schrittDev = basis + (u64)K;
-                    // AUCH im Abbruchfall. Der Generationszaehler muss
-                    // gruppeneinheitlich bleiben; ein Rang, der ihn beim
-                    // Abbruch stehen liesse, waehrend ein anderer ihn
-                    // weiterzaehlt, wartete beim naechsten Aufruf auf eine
-                    // Generation, die nie kommt. Dieselbe Ueberlegung wie
-                    // bei rundeDev und schrittDev direkt darueber.
+                    // ALSO on the abort path. The generation counter must
+                    // stay group-uniform; a rank that left it standing on
+                    // abort while another kept advancing it would wait, on
+                    // the next call, for a generation that never comes.
+                    // Same reasoning as for rundeDev and schrittDev right
+                    // above.
                     if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
                     __threadfence_system();
                 }
                 return;
             }
         }
-        // OHNE DIESEN ZAUN LIEST DIE REDUKTION ALTE ZEILEN.
+        // WITHOUT THIS FENCE, THE REDUCTION READS STALE LINES.
         //
-        // `leseV4` ist `ld.global.cv`, und `ld.global.cv` allein sieht
-        // eingehende PCIe-Schreibvorgaenge auf diesem Rig NICHT: der L2 der
-        // Empfaengerkarte ist mit ihnen nicht kohaerent
-        // (BEFUND_L2_NICHT_KOHAERENT.md; BEFUND_L2_UMGEHBAR.md, Zeile (1):
-        // 46,5 Millionen Leseversuche, nie sichtbar). Sichtbar wird es erst
-        // mit `__threadfence_system()` DAVOR -- Zeile (6) derselben Messung,
-        // SASS `MEMBAR.SC.SYS` + `CCTL.IVALL`, sechs Leseversuche. Die
-        // Sperre allein genuegt nicht: `__syncthreads()` und
-        // `grid.sync()` sind geraeteweit, nicht systemweit.
+        // `leseV4` is `ld.global.cv`, and `ld.global.cv` alone does NOT see
+        // incoming PCIe writes on this rig: the receiving card's L2 is not
+        // coherent with them (BEFUND_L2_NICHT_KOHAERENT.md;
+        // BEFUND_L2_UMGEHBAR.md, line (1): 46.5 million read attempts,
+        // never visible). It only becomes visible with
+        // `__threadfence_system()` BEFORE it -- line (6) of the same
+        // benchmark, SASS `MEMBAR.SC.SYS` + `CCTL.IVALL`, six read
+        // attempts. The barrier alone is not enough: `__syncthreads()` and
+        // `grid.sync()` are device-wide, not system-wide.
         //
-        // Von ALLEN Threads, nicht nur vom ersten: der erste hat die Flagge
-        // gesehen, aber jeder Thread liest gleich seine eigenen Schlitze.
-        // `bar1_netz_kernel` hat denselben Zaun an derselben Stelle
-        // (htccl_bar1_ext.py, hinter jeder Abbruchpruefung).
+        // From ALL threads, not just the first: the first thread has seen
+        // the flag, but every thread reads its own slots right after.
+        // `bar1_netz_kernel` has the same fence at the same spot
+        // (htccl_bar1_ext.py, behind every abort check).
         __threadfence_system();
 
-        // (b) alle Threads: die Arbeit dieser Schleifenrunde.
+        // (b) all threads: this loop iteration's work.
         //
-        // Die drei Stufen stehen ohne Sperre nebeneinander. Sie kommen sich
-        // nicht ins Gehege:
-        //   - cs schreibt in FREMDE RS-Schlitze,
-        //   - cr liest EIGENE RS-Schlitze und schreibt out + FREMDE AG-Schlitze,
-        //   - cg liest EIGENE AG-Schlitze und schreibt out.
-        // cr und cg schreiben beide out, aber in verschiedene Chunks
-        // (cr = cg+1). cs und cg liegen in derselben Schlitzklasse
-        // ((i) mod TT == (i-TT) mod TT), aber in verschiedenen Ringen
-        // (RS gegen AG) und auf verschiedenen Karten (fremd gegen eigen).
+        // The three stages sit side by side without a barrier. They don't
+        // get in each other's way:
+        //   - cs writes into FOREIGN RS slots,
+        //   - cr reads OWN RS slots and writes out + FOREIGN AG slots,
+        //   - cg reads OWN AG slots and writes out.
+        // cr and cg both write out, but into different chunks (cr = cg+1).
+        // cs and cg sit in the same slot class ((i) mod TT == (i-TT) mod
+        // TT), but in different rings (RS versus AG) and on different
+        // cards (foreign versus own).
         if (cs < K) {
             int coff, clen;
             chunkGrenzen(n4, cs, K, &coff, &clen);
@@ -1130,7 +1116,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             for (int j = tid; j < clen; j += nth) {
                 int z, lok;
                 stueckAus(clen, R, j, &z, &lok);
-                if (z == r) continue;      // eigenes Stueck bleibt in `in`
+                if (z == r) continue;      // own piece stays in `in`
                 schreibeV4(sSendRS[z] + kv + lok, A.in[coff + j]);
             }
         }
@@ -1147,30 +1133,29 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                     if (p == r) continue;
                     s = addV4<T>(s, leseV4(sRecvRS[p] + kv + j));
                 }
-                // Ergebnis EINMAL bilden, dann aus dem Register sowohl in
-                // den eigenen Ausgabepuffer als auch an alle Peers. Der
-                // Sondenkern liest dafuer `out` ein zweites Mal
-                // (reduziereNPhase, dann verteilePhase).
-                // Im Direkt-Modus liegt `out` in der exportierten Region,
-                // und in DIESELBE Region schreiben die Peers per PCIe. Ein
-                // gewoehnlicher Store liesse eine schmutzige L2-Zeile
-                // zurueck; eine Zeile ist 128 Byte, eine Stueckgrenze aber
-                // nur 16-Byte-granular, also enthaelt die Zeile am Rand
-                // meines Stuecks auch Bytes, die der Nachbar per PCIe
-                // schreibt. Wird sie spaeter zurueckgeschrieben, ueberbuegelt
-                // sie dessen Bytes -- falsche Zahlen ohne Absturz. `st.wt`
-                // hinterlaesst keine schmutzige Zeile. Ausserhalb des
-                // Direkt-Modus ist `out` ein gewoehnlicher torch-Puffer, den
-                // kein Peer anfasst; dort bleibt der normale Store.
+                // Form the result ONCE, then write it from the register
+                // both into the own output buffer and to all peers. The
+                // probe kernel reads `out` a second time for this
+                // (reduziereNPhase, then verteilePhase).
+                // In direct mode, `out` lives in the exported region, and
+                // peers write into that SAME region via PCIe. An ordinary
+                // store would leave a dirty L2 line behind; a line is 128
+                // bytes, but a piece boundary is only 16-byte-granular, so
+                // the line at the edge of my piece also contains bytes the
+                // neighbor writes via PCIe. If it gets written back later,
+                // it overwrites their bytes -- wrong numbers without a
+                // crash. `st.wt` leaves no dirty line behind. Outside direct
+                // mode, `out` is an ordinary torch buffer that no peer
+                // touches; there the normal store remains.
                 if (A.direkt) schreibeV4(o + j, s);
                 else          o[j] = s;
                 if (A.direkt) {
-                    // DIREKT-MODUS: an die Endstelle im Ergebnispuffer des
-                    // Empfaengers, nicht in einen Schlitz. Damit entfaellt
-                    // beim Empfaenger der Auslese- und Umkopierdurchgang
-                    // ERSATZLOS -- nicht halb. Derselbe Versatz wie im
-                    // eigenen `out`, also 16-Byte-ausgerichtet, weil der
-                    // Puffer auf einer Seitengrenze beginnt.
+                    // DIRECT MODE: straight to the final destination in the
+                    // receiver's result buffer, not into a slot. That
+                    // eliminates the receiver's read-out-and-copy pass
+                    // ENTIRELY -- not halfway. Same offset as in the own
+                    // `out`, hence 16-byte-aligned, because the buffer
+                    // starts on a page boundary.
                     const int ziel = coff + poff + j;
                     for (int z = 0; z < R; ++z) {
                         if (z == r) continue;
@@ -1191,26 +1176,24 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             for (int j = tid; j < clen; j += nth) {
                 int s, lok;
                 stueckAus(clen, R, j, &s, &lok);
-                if (s == r) continue;      // eigenes Stueck steht schon in out
+                if (s == r) continue;      // own piece is already in out
                 A.out[coff + j] = leseV4(sRecvAG[s] + kv + lok);
             }
         }
-        // Im Direkt-Modus gibt es hier NICHTS zu tun: die Stuecke der Peers
-        // stehen bereits an ihrer Endstelle. Die Wartebedingung auf tailAG
-        // in Phase (a) bleibt trotzdem -- sie ist es, die sicherstellt, dass
-        // der Kern nicht endet, bevor die letzten Pakete der Peers
-        // angekommen sind. Ohne sie gaebe der Aufruf einen halb gefuellten
-        // Ergebnistensor zurueck.
+        // In direct mode there is NOTHING to do here: the peers' pieces are
+        // already at their final destination. The wait condition on tailAG
+        // in phase (a) still remains, though -- it's what ensures the
+        // kernel doesn't end before the peers' last packets have arrived.
+        // Without it the call would return a half-filled result tensor.
         __threadfence_system();
         barriere<GRID>();
 
-        // (c) nur der erste Thread: veroeffentlichen.
+        // (c) first thread only: publish.
         //
-        // Reihenfolge: erst die Nutzlast (oben, vor der Sperre und vor dem
-        // Zaun), dann der Zaehler. Nutzlast und Zaehler gehen an DIESELBE
-        // Zielkarte, also gilt die PCIe-Reihenfolge je
-        // Requester/Completer-Paar -- dieselbe Annahme, auf der schon
-        // netz/ring/a2a stehen.
+        // Order: payload first (above, before the barrier and the fence),
+        // then the counter. Payload and counter go to the SAME target
+        // card, so per-requester/completer-pair PCIe ordering holds --
+        // the same assumption mesh/ring/a2a already rely on.
         if (erster) {
             if (cs < K) {
                 const u64 m = basis + (u64)cs + 1ull;
@@ -1221,14 +1204,14 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                 const u64 m = basis + (u64)cr + 1ull;
                 for (int z = 0; z < R; ++z) {
                     if (z == r) continue;
-                    schreibeU64(sTailAn[1][z], m);          // AG-Daten liegen
-                    if (A.quittung) schreibeU64(sHeadAn[0][z], m);  // RS gelesen
+                    schreibeU64(sTailAn[1][z], m);          // AG data is in place
+                    if (A.quittung) schreibeU64(sHeadAn[0][z], m);  // RS read
                 }
             }
             if (cg >= 0 && A.quittung) {
                 const u64 m = basis + (u64)cg + 1ull;
                 for (int z = 0; z < R; ++z)
-                    if (z != r) schreibeU64(sHeadAn[1][z], m);      // AG gelesen
+                    if (z != r) schreibeU64(sHeadAn[1][z], m);      // AG read
             }
             __threadfence_system();
         }
@@ -1236,7 +1219,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
 
     barriere<GRID>();
     if (erster) {
-        *(volatile u64 *)A.rundeDev   = runde;
+        *(volatile u64 *)A.rundeDev   = round;
         *(volatile u64 *)A.schrittDev = basis + (u64)K;
         if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
         __threadfence_system();
@@ -1291,7 +1274,7 @@ static void startePipe(int kern, int la, PipeArgs &A, int threads,
         }                                                                      \
         bar1_netz_pipe_kernel<T, LA, K_1BLK><<<1, threads, 0, strom>>>(A);     \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
-                    "htccl-bar1 pipe: Kernelstart fehlgeschlagen");            \
+                    "htccl-bar1 pipe: kernel launch failed");                  \
         return;                                                                \
     } while (0)
 
@@ -1300,27 +1283,26 @@ static void startePipe(int kern, int la, PipeArgs &A, int threads,
 #undef HTCCL_PIPE_STARTE
 }
 
-// Ein Tensor UEBER die exportierte Empfangsregion, ohne Kopie.
+// A tensor OVER the exported receive region, without a copy.
 //
-// Das ist der Angelpunkt des Direkt-Modus: `all_reduce` arbeitet ausser
-// Platz und gibt einen frischen Tensor zurueck -- also bestimmen WIR, wo er
-// liegt. Statt torch einen Puffer aussuchen zu lassen, den die Nachbarn
-// nicht kennen, zeigt der Ergebnistensor in einen beim Aufbau exportierten
-// Ringpuffer. Der Aufrufer bekommt einen ganz gewoehnlichen Tensor; er liegt
-// nur in Speicher, in den die Nachbarkarten unmittelbar schreiben duerfen.
-// Keine Registrierung im heissen Pfad, kein Umkopieren.
+// This is the pivot point of direct mode: `all_reduce` operates
+// out-of-place and returns a fresh tensor -- so WE decide where it lives.
+// Instead of letting torch pick a buffer the neighbors don't know about,
+// the result tensor points into a ring buffer exported at setup time. The
+// caller gets a perfectly ordinary tensor; it just happens to live in
+// memory the neighboring cards may write into directly. No registration on
+// the hot path, no copying.
 //
-// `at::from_blob` OHNE Deleter: der Speicher gehoert dem Transport und wird
-// von `close()` freigegeben. Ein Deleter waere hier der Fehler -- torch
-// wuerde versuchen, eine cuMemMap-Adresse an den Caching-Allokator
-// zurueckzugeben.
+// `at::from_blob` WITHOUT a deleter: the memory belongs to the transport
+// and is freed by `close()`. A deleter would be the bug here -- torch
+// would try to hand a cuMemMap address back to the caching allocator.
 at::Tensor bar1_erg_tensor(int64_t ptr, at::Tensor muster)
 {
-    TORCH_CHECK(ptr != 0, "htccl-bar1 pipe: Ergebnispuffer ist ein Nullzeiger");
+    TORCH_CHECK(ptr != 0, "htccl-bar1 pipe: result buffer is a null pointer");
     TORCH_CHECK((ptr % 16) == 0,
-                "htccl-bar1 pipe: Ergebnispuffer ", ptr,
-                " ist nicht 16-Byte-ausgerichtet -- jeder Schreibvorgang in "
-                "die WC-Apertur ist 128 Bit breit");
+                "htccl-bar1 pipe: result buffer ", ptr,
+                " is not 16-byte-aligned -- every write into the WC "
+                "aperture is 128 bits wide");
     return at::from_blob((void *)(uintptr_t)ptr, muster.sizes(),
                          muster.options());
 }
@@ -1331,7 +1313,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     std::vector<int64_t> peer_flag,
                     std::vector<int64_t> peer_erg,
                     int64_t eigen_nutz, int64_t eigen_flag,
-                    int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
+                    int64_t slot, int64_t off_pipe, int64_t fbasis_pipe,
                     int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
                     int64_t quittung, int64_t direkt, int64_t erg_slack,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
@@ -1342,55 +1324,55 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     const int R = (int)world, r = (int)rank;
     const int K = (int)k_chunks, TT = (int)tiefe, PP = (int)vorlauf;
     TORCH_CHECK(R >= 2 && R <= HTCCL_PIPE_MAX_RANKS,
-                "htccl-bar1 pipe: world ", R, " ausserhalb 2..",
+                "htccl-bar1 pipe: world ", R, " outside 2..",
                 HTCCL_PIPE_MAX_RANKS);
-    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1 pipe: rank ausserhalb");
+    TORCH_CHECK(r >= 0 && r < R, "htccl-bar1 pipe: rank out of range");
     TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
-                "htccl-bar1 pipe: nur zusammenhaengende Tensoren");
+                "htccl-bar1 pipe: only contiguous tensors");
     TORCH_CHECK(inp.numel() == out.numel() &&
                 inp.scalar_type() == out.scalar_type(),
-                "htccl-bar1 pipe: in und out passen nicht zusammen");
+                "htccl-bar1 pipe: in and out do not match");
     TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
-                "htccl-bar1 pipe: in und out duerfen nicht dasselbe sein -- "
-                "die Reduktion liest 'in' noch, waehrend 'out' schon steht");
+                "htccl-bar1 pipe: in and out must not be the same -- the "
+                "reduction still reads 'in' while 'out' is already set");
     TORCH_CHECK((int64_t)peer_nutz.size() == world &&
                 (int64_t)peer_flag.size() == world &&
                 (int64_t)peer_erg.size() == world,
-                "htccl-bar1 pipe: Peer-Tabelle hat die falsche Laenge");
-    // PP >= 2: bei PP == 1 fielen das Senden von Chunk c und sein Verbrauch
-    // in dieselbe Schleifenrunde, und die Wartebedingung stuende VOR der
-    // Veroeffentlichung, auf die sie wartet -- ein Selbstblock, den kein
-    // Zeitdeckel zu einem Fehler macht, sondern nur zu einem langsamen.
-    // PP <= TT: der Ring muss mindestens so tief sein wie der Vorlauf, sonst
-    // ueberholt der Zeitplan die Schlitze.
+                "htccl-bar1 pipe: peer table has the wrong length");
+    // PP >= 2: at PP == 1, sending chunk c and consuming it would fall into
+    // the same loop iteration, and the wait condition would stand BEFORE
+    // the publication it waits for -- a self-deadlock that no timeout cap
+    // turns into an error, only into a slow one.
+    // PP <= TT: the ring must be at least as deep as the lead, otherwise
+    // the schedule overtakes the slots.
     TORCH_CHECK(TT >= 2 && TT <= HTCCL_PIPE_MAX_TIEFE,
-                "htccl-bar1 pipe: Ringtiefe ", TT, " ausserhalb 2..",
+                "htccl-bar1 pipe: ring depth ", TT, " outside 2..",
                 HTCCL_PIPE_MAX_TIEFE);
     TORCH_CHECK(PP >= 2 && PP <= TT,
-                "htccl-bar1 pipe: Vorlauf ", PP, " ausserhalb 2..", TT,
-                " -- er darf die Ringtiefe nicht ueberschreiten");
+                "htccl-bar1 pipe: lead ", PP, " outside 2..", TT,
+                " -- it must not exceed the ring depth");
     TORCH_CHECK(K >= TT, "htccl-bar1 pipe: K=", K, " < T=", TT,
-                " -- weniger Chunks als Ringtiefe");
-    TORCH_CHECK(schlitz > 0 && (schlitz % 16) == 0,
-                "htccl-bar1 pipe: Schlitzgroesse ", schlitz,
-                " ist kein positives Vielfaches von 16");
+                " -- fewer chunks than ring depth");
+    TORCH_CHECK(slot > 0 && (slot % 16) == 0,
+                "htccl-bar1 pipe: slot size ", slot,
+                " is not a positive multiple of 16");
     TORCH_CHECK((off_pipe % 16) == 0,
                 "htccl-bar1 pipe: off_pipe ", off_pipe,
-                " ist kein Vielfaches von 16 -- jeder Schreibvorgang in die "
-                "WC-Apertur ist 128 Bit breit und muss ausgerichtet sein");
+                " is not a multiple of 16 -- every write into the WC "
+                "aperture is 128 bits wide and must be aligned");
 
     const size_t nbytes = (size_t)inp.numel() * (size_t)inp.element_size();
     TORCH_CHECK(nbytes % 16 == 0,
-                "htccl-bar1 pipe: Nutzlast ", nbytes,
-                " ist kein Vielfaches von 16 Byte");
+                "htccl-bar1 pipe: payload ", nbytes,
+                " is not a multiple of 16 bytes");
     TORCH_CHECK(((uintptr_t)inp.data_ptr() % 16) == 0 &&
                 ((uintptr_t)out.data_ptr() % 16) == 0,
-                "htccl-bar1 pipe: Puffer nicht auf 16 Byte ausgerichtet");
+                "htccl-bar1 pipe: buffer not aligned to 16 bytes");
     const int n4 = (int)(nbytes / 16);
-    TORCH_CHECK(n4 >= R, "htccl-bar1 pipe: weniger als ein Paket je Rang");
+    TORCH_CHECK(n4 >= R, "htccl-bar1 pipe: fewer than one packet per rank");
 
-    // Nahtstellenpruefung. Gerechnet wird mit chunkGrenzen SELBST, ueber
-    // alle (Chunk, Rang)-Paare -- nicht mit einer geschlossenen Zweitfassung.
+    // Seam check. Computed with chunkGrenzen ITSELF, over all (chunk, rank)
+    // pairs -- not with a second, closed-form version.
     int maxStueck = 0, maxChunk = 0;
     for (int c = 0; c < K; ++c) {
         int coff, clen;
@@ -1402,11 +1384,11 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
             if (plen > maxStueck) maxStueck = plen;
         }
     }
-    TORCH_CHECK((int64_t)maxStueck * 16 <= schlitz,
-                "htccl-bar1 pipe: groesstes Stueck ", (int64_t)maxStueck * 16,
-                " Byte passt nicht in den Pipe-Schlitz von ", schlitz,
-                " Byte (K=", K, ", T=", TT, ", R=", R,
-                "). Der Aufrufer haette handles() fragen muessen.");
+    TORCH_CHECK((int64_t)maxStueck * 16 <= slot,
+                "htccl-bar1 pipe: largest piece ", (int64_t)maxStueck * 16,
+                " bytes does not fit in the pipe slot of ", slot,
+                " bytes (K=", K, ", T=", TT, ", R=", R,
+                "). The caller should have asked handles().");
 
     PipeArgs A;
     std::memset(&A, 0, sizeof(A));
@@ -1426,40 +1408,39 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     A.direkt       = (int)direkt;
     A.ergSlack     = (int)erg_slack;
     A.deckelZyklen = (u64)deckel_zyklen;
-    A.schlitz4     = (long long)(schlitz / 16);
+    A.schlitz4     = (long long)(slot / 16);
     A.klasse4      = (long long)(R - 1) * A.schlitz4;
 
-    // Der AG-Ring liegt hinter dem RS-Ring; jeder Ring haelt T*(R-1)
-    // Schlitze. Innerhalb eines Rings ist die Ordnung (Klasse, Position),
-    // damit die Klasse mit einem einzigen Vielfachen von klasse4 erreicht
-    // wird.
-    const long long ringBytes = (long long)TT * (R - 1) * schlitz;
+    // The AG ring sits behind the RS ring; each ring holds T*(R-1) slots.
+    // Within a ring the order is (class, position), so the class is
+    // reached with a single multiple of klasse4.
+    const long long ringBytes = (long long)TT * (R - 1) * slot;
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
-        // Meine Position in der aufsteigenden Peer-Liste des Empfaengers z.
-        // NICHT (r < z) -- dieselbe Herleitung wie bei netz und a2a.
+        // My position in receiver z's ascending peer list. NOT (r < z) --
+        // the same derivation as in mesh and a2a.
         const long long p = (long long)(r - (r > z ? 1 : 0));
         char *zb = (char *)(uintptr_t)peer_nutz[z] + off_pipe;
-        A.sendRS[z] = (uint4 *)(zb + p * schlitz);
-        A.sendAG[z] = (uint4 *)(zb + ringBytes + p * schlitz);
+        A.sendRS[z] = (uint4 *)(zb + p * slot);
+        A.sendAG[z] = (uint4 *)(zb + ringBytes + p * slot);
         if (direkt) {
             TORCH_CHECK(peer_erg[z] != 0,
-                        "htccl-bar1 pipe: Direkt-Modus ohne Ergebnispuffer "
-                        "von Rang ", z);
+                        "htccl-bar1 pipe: direct mode without a result "
+                        "buffer from rank ", z);
             TORCH_CHECK((peer_erg[z] % 16) == 0,
-                        "htccl-bar1 pipe: Ergebnispuffer von Rang ", z,
-                        " ist nicht 16-Byte-ausgerichtet");
+                        "htccl-bar1 pipe: result buffer of rank ", z,
+                        " is not 16-byte-aligned");
             A.ergAn[z] = (uint4 *)(uintptr_t)peer_erg[z];
         }
     }
     if (direkt) {
-        // Der eigene Ergebnispuffer MUSS `out` sein -- sonst schriebe der
-        // Peer an eine Stelle, die der Aufrufer nie zu sehen bekommt. Das
-        // ist die Naht zwischen Python und Kern, und sie wird geprueft, nicht
-        // vorausgesetzt.
+        // The own result buffer MUST be `out` -- otherwise the peer would
+        // write into a place the caller never gets to see. This is the
+        // seam between Python and the kernel, and it is checked, not
+        // assumed.
         TORCH_CHECK((uintptr_t)out.data_ptr() == (uintptr_t)peer_erg[r],
-                    "htccl-bar1 pipe: im Direkt-Modus muss `out` der eigene "
-                    "Ergebnispuffer sein (out=", (int64_t)(uintptr_t)out.data_ptr(),
+                    "htccl-bar1 pipe: in direct mode `out` must be the own "
+                    "result buffer (out=", (int64_t)(uintptr_t)out.data_ptr(),
                     ", erg=", peer_erg[r], ")");
     }
     {
@@ -1467,17 +1448,16 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
         for (int s = 0; s < R; ++s) {
             if (s == r) continue;
             const long long p = (long long)(s - (s > r ? 1 : 0));
-            A.recvRS[s] = (const uint4 *)(mb + p * schlitz);
-            A.recvAG[s] = (const uint4 *)(mb + ringBytes + p * schlitz);
+            A.recvRS[s] = (const uint4 *)(mb + p * slot);
+            A.recvAG[s] = (const uint4 *)(mb + ringBytes + p * slot);
         }
     }
 
-    // Zaehlerzeilen: vier Familien zu je R Zeilen a 256 Byte.
+    // Counter lines: four families of R lines at 256 bytes each.
     //   0 tailRS  1 tailAG  2 headRS  3 headAG
-    // tail schreibe ich beim EMPFAENGER in MEINE Zeile und lese bei mir
-    // DESSEN Zeile; head genau andersherum. Beides sind gebuchte
-    // Schreibvorgaenge und lokale Lesevorgaenge -- ein Lesevorgang aus einer
-    // fremden BAR waere ein Umlauf.
+    // I write tail into MY line at the RECEIVER and read THEIR line
+    // locally; head exactly the other way around. Both are posted writes
+    // and local reads -- a read from a foreign BAR would be a round trip.
     for (int ph = 0; ph < 2; ++ph) {
         for (int q = 0; q < R; ++q) {
             if (q == r) continue;
@@ -1490,16 +1470,16 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
         }
     }
 
-    // Familie 4: der Freigabe-Handschlag. Nur eingerichtet, wenn er auch
-    // laeuft -- ohne ihn bleiben die Zeiger null und der Kern fasst die
-    // Familie nirgends an, also ist der Weg Byte fuer Byte der gemessene.
+    // Family 4: the release handshake. Only set up if it actually runs --
+    // without it the pointers stay null and the kernel never touches the
+    // family, so the path is byte-for-byte the measured one.
     TORCH_CHECK(erg_slack >= 0,
-                "htccl-bar1 pipe: erg_slack ", erg_slack, " ist negativ");
+                "htccl-bar1 pipe: erg_slack ", erg_slack, " is negative");
     if (direkt && erg_slack > 0) {
         TORCH_CHECK(erg_gen_dev.scalar_type() == at::kLong &&
                     erg_gen_dev.numel() >= 1,
-                    "htccl-bar1 pipe: erg_gen_dev muss ein int64-Tensor mit "
-                    "mindestens einem Element sein");
+                    "htccl-bar1 pipe: erg_gen_dev must be an int64 tensor "
+                    "with at least one element");
         A.ergGenDev = (u64 *)erg_gen_dev.data_ptr();
         for (int q = 0; q < R; ++q) {
             if (q == r) continue;
@@ -1509,20 +1489,20 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
             A.ergBereitVon[q] = (const u64 *)(ef + (size_t)(4 * R + q) * 256u);
         }
     } else {
-        // Ohne Direkt-Modus ist ein Slack sinnlos, und ein sinnloser Wert,
-        // der stillschweigend ignoriert wird, ist die Stelle, an der jemand
-        // spaeter Wirkung vermutet, wo keine ist.
+        // Without direct mode, a slack value is meaningless, and a
+        // meaningless value that's silently ignored is exactly the spot
+        // where someone later assumes an effect that isn't there.
         TORCH_CHECK(erg_slack == 0 || direkt,
                     "htccl-bar1 pipe: erg_slack ", erg_slack,
-                    " ohne Direkt-Modus -- der Handschlag schuetzt einen "
-                    "Ergebnisplatz, den es in diesem Aufruf nicht gibt");
+                    " without direct mode -- the handshake protects a "
+                    "result slot that doesn't exist in this call");
         A.ergSlack = 0;
     }
 
     auto strom = at::cuda::getCurrentCUDAStream().stream();
-    // Das Gitter wird nach dem GROESSTEN CHUNK bemessen, nicht nach der
-    // ganzen Nutzlast: mehr Bloecke als ein Chunk Arbeit hat, warten nur an
-    // der grid.sync().
+    // The grid is sized after the LARGEST CHUNK, not the whole payload:
+    // more blocks than one chunk's worth of work only wait at
+    // grid.sync().
     switch (inp.scalar_type()) {
         case at::kFloat:
             startePipe<float>((int)kern, (int)ladeform, A, (int)threads,
@@ -1537,8 +1517,8 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                                       maxChunk, strom);
             break;
         default:
-            TORCH_CHECK(false, "htccl-bar1 pipe: Datentyp ", inp.scalar_type(),
-                        " wird nicht unterstuetzt (float32/float16/bfloat16)");
+            TORCH_CHECK(false, "htccl-bar1 pipe: data type ", inp.scalar_type(),
+                        " is not supported (float32/float16/bfloat16)");
     }
 }
 """
@@ -1552,7 +1532,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     std::vector<int64_t> peer_flag,
                     std::vector<int64_t> peer_erg,
                     int64_t eigen_nutz, int64_t eigen_flag,
-                    int64_t schlitz, int64_t off_pipe, int64_t fbasis_pipe,
+                    int64_t slot, int64_t off_pipe, int64_t fbasis_pipe,
                     int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
                     int64_t quittung, int64_t direkt, int64_t erg_slack,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
@@ -1563,18 +1543,17 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
 
 
 # ===========================================================================
-# Uebersetzen
+# Compiling
 # ===========================================================================
 
 
-def lade_pipe_ext(cpu_group, ptxas_verbose: bool = False):
-    """Die CUDA-Erweiterung mit ``bar1_netz_pipe``.
+def load_pipe_ext(cpu_group, ptxas_verbose: bool = False):
+    """The CUDA extension with ``bar1_netz_pipe``.
 
-    Eigener Name, eigenes Bauverzeichnis, eigener Cache-Schluessel: torch
-    schluesselt sein Bauverzeichnis nur nach dem Namen, und eine .so unter
-    fremdem Namen bekaeme ein Rang gereicht, dessen Karte sie nicht
-    ausfuehren kann. Mechanik und Cache-Hygiene kommen aus ``htccl_device``,
-    genau wie bei ``htccl_bar1_ext``.
+    Own name, own build directory, own cache key: torch keys its build
+    directory only by the name, and a .so under a foreign name could be
+    handed to a rank whose card cannot run it. The mechanism and cache
+    hygiene come from ``htccl_device``, just as for ``htccl_bar1_ext``.
     """
     global _ext
     if _ext is not None:
@@ -1592,9 +1571,9 @@ def lade_pipe_ext(cpu_group, ptxas_verbose: bool = False):
     vendor = _local_vendor()
     if vendor != "cuda":
         raise RuntimeError(
-            f"HTCCL-BAR1-PIPE: der Direktpfad ist NVIDIA-eigen (BAR1-Apertur, "
-            f"PTX-Einschuebe wie ld.mmio.relaxed.sys). Dieser Rang meldet "
-            f"{vendor!r}."
+            f"HTCCL-BAR1-PIPE: the direct path is NVIDIA-specific (BAR1 "
+            f"aperture, PTX inline asm such as ld.mmio.relaxed.sys). This "
+            f"rank reports {vendor!r}."
         )
     by_vendor = _resolve_build_arches(cpu_group)
     arches = by_vendor.get(vendor, [])
@@ -1616,47 +1595,47 @@ def lade_pipe_ext(cpu_group, ptxas_verbose: bool = False):
             build_directory=str(build_dir) if build_dir is not None else None,
         )
     logger.info(
-        "HTCCL-BAR1-PIPE: Erweiterung %r fuer Boegen %s in %.1f s gebaut.",
-        name, ",".join(arches) or "<torch-Vorgabe>", time.time() - t0,
+        "HTCCL-BAR1-PIPE: extension %r built for arches %s in %.1f s.",
+        name, ",".join(arches) or "<torch default>", time.time() - t0,
     )
     return _ext
 
 
 # ===========================================================================
-# Byte-Beleg
+# Byte-level proof
 # ===========================================================================
 
 
-def byte_beleg_pipe(transport, runden: int = 0) -> bool:
-    """Der Beleg fuer ``netz_pipe``: mehrere Runden, ungleiche Zerlegung.
+def byte_proof_pipe(transport, runden: int = 0) -> bool:
+    """The proof for ``netz_pipe``: multiple rounds, uneven splitting.
 
-    Ein Beleg, der nur EINE Runde prueft, findet genau den gefaehrlichsten
-    Fehler nicht -- die Schlitz-Wiederverwendung schlaegt erst zu, wenn eine
-    Schlitzklasse ein zweites Mal drankommt. Deshalb:
+    A proof that only checks ONE round misses exactly the most dangerous
+    bug -- slot reuse only strikes once a slot class comes around a second
+    time. Hence:
 
-    * **mehrere aufeinanderfolgende Runden** (Vorgabe ``2T + 3``, mindestens
-      so viele, dass jede Klasse mehrfach getroffen wird), jede mit ANDEREN
-      Zahlen -- ein liegengebliebener Schlitz faellt sonst nicht auf, weil
-      der alte Inhalt zufaellig richtig waere;
-    * **ungleiche Chunkzahlen**: Nutzlasten, deren Paketzahl weder durch
-      ``K`` noch durch ``R`` teilbar ist, sodass ``chunkGrenzen`` den Rest
-      auf die vorderen Chunks legt und die Stuecke verschieden lang sind;
-    * **Restchunks**: die kleinste erlaubte Nutzlast und Groessen kurz
-      ueber einer Zweierpotenz.
+    * **multiple consecutive rounds** (default ``2T + 3``, at least enough
+      that every class is hit more than once), each with DIFFERENT
+      numbers -- a stale slot would otherwise not surface, because the old
+      contents would happen to be correct;
+    * **uneven chunk counts**: payloads whose packet count is divisible by
+      neither ``K`` nor ``R``, so ``chunkGrenzen`` puts the remainder onto
+      the leading chunks and the pieces have different lengths;
+    * **remainder chunks**: the smallest permitted payload, and sizes just
+      above a power of two.
 
-    Zur Frage "Chunk kein Vielfaches von 16": bei ``all_reduce`` kann das
-    **nicht** auftreten und das ist nachgerechnet, nicht angenommen. Die
-    Einheit der Zerlegung ist das 128-Bit-Paket (``n4 = nbytes/16``,
-    ``nbytes % 16 == 0`` wird an der Naht erzwungen), also ist jede
-    Chunk- und Stueckgrenze ein Vielfaches von 16 Byte. Der Beleg prueft
-    diese Behauptung ausdruecklich, statt sie zu glauben.
+    On the question "chunk not a multiple of 16": for ``all_reduce`` that
+    **cannot** occur, and that is proven, not assumed. The unit of the
+    split is the 128-bit packet (``n4 = nbytes/16``, ``nbytes % 16 == 0``
+    is enforced at the seam), so every chunk and piece boundary is a
+    multiple of 16 bytes. The proof checks this claim explicitly instead
+    of trusting it.
 
-    Verglichen wird **bitgleich**. Die Eingaben sind kleine ganze Zahlen,
-    in float32/float16/bfloat16 exakt darstellbar, und der Kern summiert in
-    fester Reihenfolge (eigener Beitrag, dann Peers aufsteigend). Ein
-    Vergleich mit Toleranz wuerde genau die Fehlerklasse verdecken, um die
-    es hier geht: ein Schlitz, der einen Beitrag zu frueh oder zu spaet
-    traegt, verschiebt das Ergebnis um einen ganzen Summanden.
+    The comparison is **bit-exact**. The inputs are small integers, exactly
+    representable in float32/float16/bfloat16, and the kernel sums in a
+    fixed order (own contribution, then peers ascending). A tolerance-based
+    comparison would hide exactly the error class this is about: a slot
+    that carries a contribution too early or too late shifts the result by
+    a whole summand.
     """
     import torch
     import torch.distributed as dist
@@ -1670,16 +1649,16 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
     welt = transport.welt
     rang = transport.rank
     geraet = transport.device
-    schlitz = int(transport.pipe_schlitz)
+    slot = int(transport.pipe_schlitz)
     max_bytes = int(transport.max_bytes)
 
-    # Groessen: absichtlich krumm. 16*R*T ist die kleinste, bei der jeder
-    # Chunk jedes Rangs mindestens ein Paket bekommt; die uebrigen sind so
-    # gewaehlt, dass n4 weder durch K noch durch R aufgeht.
+    # Sizes: deliberately awkward. 16*R*T is the smallest at which every
+    # chunk of every rank gets at least one packet; the rest are chosen so
+    # that n4 divides evenly by neither K nor R.
     kandidaten = [
         16 * welt * tiefe,
         16 * (welt * tiefe + 1),
-        16 * 1021,                    # Primzahl an Paketen
+        16 * 1021,                    # a prime number of packets
         (1 << 20) + 16 * 3,
         (4 << 20) + 16 * 7,
     ]
@@ -1692,8 +1671,8 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
         groessen.append(n)
     if not groessen:
         logger.warning(
-            "HTCCL-BAR1-PIPE: keine Probengroesse passt zwischen %d und %d "
-            "Byte -- der Beleg kann nichts aussagen, also meldet er sich ab.",
+            "HTCCL-BAR1-PIPE: no sample size fits between %d and %d "
+            "bytes -- the proof cannot say anything, so it declines.",
             transport.min_bytes, max_bytes,
         )
         return False
@@ -1704,36 +1683,37 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
         k = transport._pipe_k(nbytes)
         if k is None:
             logger.info(
-                "HTCCL-BAR1-PIPE: %d Byte traegt der gepipelinete Weg nicht "
-                "(kein K passt) -- uebersprungen, nicht gefallen.", nbytes,
+                "HTCCL-BAR1-PIPE: %d bytes is not carried by the pipelined "
+                "path (no K fits) -- skipped, not failed.", nbytes,
             )
             continue
 
-        # Behauptung 1, nachgerechnet statt geglaubt: keine Chunk- oder
-        # Stueckgrenze faellt auf eine Adresse, die kein Vielfaches von 16
-        # ist, und kein Stueck sprengt den Schlitz.
+        # Claim 1, proven rather than trusted: no chunk or piece boundary
+        # falls on an address that isn't a multiple of 16, and no piece
+        # exceeds the slot.
         for c in range(k):
-            coff, clen = _chunk_grenzen(n4, c, k)
+            coff, clen = _chunk_bounds(n4, c, k)
             if (coff * 16) % 16 or (clen * 16) % 16:
-                raise AssertionError("Chunkgrenze nicht 16-Byte-ausgerichtet")
+                raise AssertionError("chunk boundary not 16-byte-aligned")
             for z in range(welt):
-                poff, plen = _chunk_grenzen(clen, z, welt)
+                poff, plen = _chunk_bounds(clen, z, welt)
                 if ((coff + poff) * 16) % 16:
-                    raise AssertionError("Stueckgrenze nicht ausgerichtet")
-                if plen * 16 > schlitz:
+                    raise AssertionError("piece boundary not aligned")
+                if plen * 16 > slot:
                     raise AssertionError(
-                        f"Stueck {plen * 16} > Schlitz {schlitz}"
+                        f"piece {plen * 16} > slot {slot}"
                     )
 
         n = nbytes // 4
-        for runde in range(runden):
-            # Jede Runde andere Zahlen, und je Rang verschieden -- ein
-            # Schlitz, der den Inhalt der Vorrunde traegt, faellt damit auf.
+        for round in range(runden):
+            # Different numbers every round, and different per rank -- a
+            # slot carrying the previous round's contents would thereby
+            # surface.
             welle = torch.arange(n, dtype=torch.float32, device=geraet)
-            eig = ((welle % 7.0) + 1.0) * float(rang + 1) + float(runde * 13)
+            eig = ((welle % 7.0) + 1.0) * float(rang + 1) + float(round * 13)
             erwartet = torch.zeros(n, dtype=torch.float32, device=geraet)
             for q in range(welt):
-                erwartet += ((welle % 7.0) + 1.0) * float(q + 1) + float(runde * 13)
+                erwartet += ((welle % 7.0) + 1.0) * float(q + 1) + float(round * 13)
             dist.barrier(group=transport.cpu_group)
             ist = transport._pipe_all_reduce(eig, k)
             torch.cuda.synchronize(geraet)
@@ -1741,24 +1721,24 @@ def byte_beleg_pipe(transport, runden: int = 0) -> bool:
             if schlecht:
                 erste = int((ist != erwartet).nonzero()[0].item())
                 logger.warning(
-                    "HTCCL-BAR1-PIPE: Byte-Beleg GEFALLEN bei %d Byte, K=%d, "
-                    "T=%d, Runde %d/%d: %d von %d Werten falsch, erster bei "
-                    "Index %d (ist %r, soll %r).",
-                    nbytes, k, tiefe, runde + 1, runden, schlecht, n, erste,
+                    "HTCCL-BAR1-PIPE: byte-level proof FAILED at %d bytes, "
+                    "K=%d, T=%d, round %d/%d: %d of %d values wrong, first "
+                    "at index %d (got %r, expected %r).",
+                    nbytes, k, tiefe, round + 1, runden, schlecht, n, erste,
                     float(ist[erste]), float(erwartet[erste]),
                 )
                 alles_gut = False
                 break
         else:
             logger.info(
-                "HTCCL-BAR1-PIPE: Byte-Beleg bestanden: %d Byte (n4=%d, K=%d, "
-                "T=%d), %d Runden, 0 von %d Werten falsch.",
+                "HTCCL-BAR1-PIPE: byte-level proof passed: %d bytes (n4=%d, "
+                "K=%d, T=%d), %d rounds, 0 of %d values wrong.",
                 nbytes, n4, k, tiefe, runden, n,
             )
-    # Gruppenweit EINE Antwort -- sonst antwortete `handles` rangabhaengig
-    # und der eine Rang liefe ins Kollektiv, waehrend der andere abbiegt.
-    # Ein Broadcast von Rang 0 taete das NICHT: gefallen ist der Beleg,
-    # sobald IRGENDEIN Rang ein falsches Wort gesehen hat.
+    # ONE answer group-wide -- otherwise `handles` would answer
+    # rank-dependently, and one rank would enter the collective while
+    # another bailed out. A broadcast from rank 0 would NOT do that: the
+    # proof has failed as soon as ANY rank has seen a wrong value.
     traeger: list = [None] * welt
     dist.all_gather_object(traeger, bool(alles_gut), group=transport.cpu_group)
     return all(bool(x) for x in traeger)
