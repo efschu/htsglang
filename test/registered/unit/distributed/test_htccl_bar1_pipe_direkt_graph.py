@@ -480,6 +480,10 @@ def _stub(**kw):
     t._erg_graph_vergeben = 0
     t._erg_i = -1
     t._erg_lebt = [None, None]
+    t._erg_zuletzt = [None, None]
+    t._erg_zaehler = 0
+    t._erg_eager_voll = 0
+    t._erg_eager_voll_gemeldet = False
     t._erg_eager_plaetze = 2
     t._erg_graph_plaetze = 0
     t._eigen = (1 << 30, 0, 0)

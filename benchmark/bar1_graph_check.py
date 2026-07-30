@@ -126,10 +126,15 @@ FAELLE = [
     },
     {
         "name": "vorbehalt",
-        "zweck": "Ueber der Schwelle, aber ohne SGLANG_HTCCL_BAR1_GRAPH_"
-                 "GITTER: _kern muss aufgezeichnet auf 1blk ausweichen "
+        "zweck": "Ueber der Schwelle, aber mit SGLANG_HTCCL_BAR1_GRAPH_"
+                 "GITTER=0: _kern muss aufgezeichnet auf 1blk ausweichen "
                  "statt zu scheitern.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": "0"},
+        # Die 0 steht AUSDRUECKLICH da, seit die Vorgabe aus
+        # SGLANG_HTCCL_GRAPH_FREIGABE kommt. Ohne sie haenge dieser Fall
+        # daran, ob die Freigabe in der Umgebung des Aufrufers steht -- und
+        # ein Fall, der je nach Umgebung etwas anderes prueft, prueft nichts.
+        "umgebung": {"SGLANG_HTCCL_BAR1_GITTER_AB": "0",
+                     "SGLANG_HTCCL_BAR1_GRAPH_GITTER": "0"},
         "groessen": [64 << 10, 8 << 20],
         "gate": True,
     },
@@ -675,10 +680,11 @@ def main() -> int:
         if n == "gitter" and ok:
             print()
             print("Und: der Fall 'gitter' ist bestanden -- der cooperative "
-                  "Start laesst sich auf diesem Rig aufzeichnen. Damit ist "
-                  "SGLANG_HTCCL_BAR1_GRAPH_GITTER=1 belegt und der "
-                  "Vorbehalt in HTCCLBar1Transport._kern kann als Vorgabe "
-                  "fallen.")
+                  "Start laesst sich auf diesem Rig aufzeichnen. Der "
+                  "Vorbehalt in HTCCLBar1Transport._kern faellt damit von "
+                  "selbst: seine Vorgabe haengt an SGLANG_HTCCL_GRAPH_"
+                  "FREIGABE. Wer ihn einzeln zurueckholen will, setzt "
+                  "SGLANG_HTCCL_BAR1_GRAPH_GITTER=0.")
     return 0
 
 
