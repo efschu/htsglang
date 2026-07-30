@@ -11727,3 +11727,294 @@ CT999-Locks entfernt, `gpu-arb`-Fenster geschlossen.
    bei bs=1 und kostet 53 % Kontext.
 6. Der **Kontextpreis** des Prefill-Extremums (-84 %) ist das staerkste
    Argument fuer die Delta-Duplikation statt eines statischen Vektorwechsels.
+
+## #294 Decode-Verifikation bar1_hi (probe/htccl-decode-verif, Basis 94d9636783) — 2026-07-30
+
+Zu pruefen war der Beifang-Befund aus dem Prefill-Fenster #293: **ms/Verify
+6,07 (bar1_hi) gegen 9,09 (NCCL), Faktor 1,50 bei bs=16**. Ein Prefill-Lauf
+hatte ihn nebenbei mitgenommen; dieses Fenster misst dieselbe Groesse mit
+Decode als Hauptpunkt und mit eigenem Rauschboden. Rohdaten in
+`/spinning/gpu-battery-results/2026-07-30_decode_verif/`.
+
+**Verdikt: NICHT bestaetigt. Der Faktor ist 1,135 bei bs=16, nicht 1,50.** Er
+ist echt — 4x ueber dem Boden, die zwoelf bar1-Punkte und die sechs
+NCCL-Punkte ueberlappen bei bs=16 nicht in einer einzigen Stichprobe —, aber
+er ist ein Drittel der behaupteten Groesse, und er ist **derselbe
+Transportgewinn wie im Prefill** (1,137 fuer `bar1` bei s=8), kein
+Decode-Sonderbonus.
+
+36 Punkte, 6 Boots plus 2 Boden-Boots, 1 Punkt ausgefallen.
+
+### Warum der alte Wert eine eigene Messung braucht
+
+Der 1,50 stammt aus je drei Tick-Zeilen pro Punkt, und in ihnen war die
+Batchgroesse nicht konstant. Bei `decode_log_interval` 40 liefert ein
+15-s-Fenster drei Zeilen; die NCCL-Arme haben davon je eine bei
+`#running-req 15` und zwei bei 16, weil im Fenster Anfragen fertig werden.
+`decode_tick_aggregat` sortiert nach exaktem `running_req` — der gute Tick
+eines Arms kann also im 15er-Eimer landen und seine zwei Rampen-Ticks im
+16er. Dazu kam: Prompt ~50 Token (kein Kontext), Arbeitspunkt im Fenster
+hineinwachsend statt vorgefuellt, und die zwei Seiten des Verhaeltnisses
+liefen mit **verschiedener Reserve** (`nccl` 3000,2700,2700 gegen `bar1_hi`
+4500,4200,4200), also mit verschieden grossem KV-Pool.
+
+### Der neue Messaufbau (`s14_decode_punkt.py`, `s14_decode_verif.sh`)
+
+* **Arbeitspunkt vorgefuellt, nicht hineingewachsen.** Ein gemeinsamer Prefix
+  von 2048 Token wird einmal gewaermt, dann starten `bs` Stroeme darauf; der
+  Radix-Cache bedient den Prefix, alle Stroeme sitzen auf derselben
+  KV-Laenge.
+* **Im Fenster wird nichts fertig.** `ignore_eos` plus ein aus der
+  Kontextlaenge abgeleitetes `max_new_tokens` halten `#running-req` fest auf
+  `bs`. Belegt: **fremde bs = 0 in allen sechs Punkten**.
+* **Das Fenster wird aus der Mitte geschnitten.** Rampe, dann t0, dann 15 s,
+  dann t1; die erste und letzte Tick-Zeile im Fenster fallen als angeschnittene
+  Log-Intervalle heraus. Ausbeute **18 von 20 Ticks** statt drei.
+* **`--decode-log-interval 10`** auf beiden Armen identisch — der Tick ist die
+  Stichprobe, und bei 40 gibt es zu wenige davon.
+* **Der NCCL-Anker traegt dieselbe Reserve** wie `bar1_hi`. Verglichen wird der
+  Transport, nicht der KV-Pool.
+* **bs=16 laeuft in jedem Boot zuerst und zuletzt** — das ist das A-gegen-A
+  innerhalb eines Boots, das jeder Boot gratis mitbringt.
+* `ms/Verify` behaelt die Definition aus s12 (`accept_len * 1000 / gen_tok_s`),
+  damit die Zahlen neben denen des Prefill-Fensters liegen koennen. Das ist die
+  Verify-Schrittzeit **je Anfrage**; die Wanduhr eines Schritts ist `bs` mal
+  groesser und steht als `ms/Schritt` daneben.
+
+### Tore vor der ersten Zahl
+
+* **Erweiterungs-Cache frisch.** Alle drei `.so` (bar1, dmabuf, pipe) sind vom
+  Kaltbau um 15:39-15:41 UTC, juenger als die neueste Quellaenderung
+  `af3c6e2385` (15:29:59 UTC). Kein htccl-Quelltext hat sich zwischen jenem
+  Bau und diesem HEAD bewegt. (`befunde/jit_cache_gate.txt`)
+* **ERREICHT je Gruppe**: 9 von 9 `ERREICHT=bar1` je Boot (world, tp, dcp x 3
+  Raenge), auf beiden Boden-Boots.
+* **Decode-Graphen aktiv** in jedem gewerteten Tick (`cuda graph: True`).
+
+### Rauschboden zuerst: 2,72 % auf ms/Verify
+
+A-gegen-A von `bar1_hi` bei bs=16, dreimal je Boot, zwei Boots, sechs
+Stichproben:
+
+| Metrik | Median | min | max | Spanne (max-min)/Median | rel. Stdev |
+|---|---:|---:|---:|---:|---:|
+| **ms/Verify** | **5,25** | 5,18 | 5,32 | **2,72 %** | 0,97 % |
+| ms/Schritt | 83,98 | 82,82 | 85,11 | 2,72 % | 0,97 % |
+| tok/s (Tick) | 615,0 | 590,9 | 637,2 | 7,53 % | 2,92 % |
+| tok/s (Klient) | 612,4 | 587,9 | 635,7 | 7,82 % | 2,85 % |
+| accept len | 3,24 | 3,09 | 3,34 | 7,88 % | 3,12 % |
+
+Der Boden sagt mehr als eine Schwelle. **Durchsatz und Accept-Laenge schwanken
+zusammen (beide ~7,5-7,9 %), die Verify-Schrittzeit tut es nicht (2,72 %).**
+Das Rauschen bei bs=16 ist also fast vollstaendig Accept-Rauschen: mehr
+akzeptierte Draft-Token je Schritt heissen mehr Token je Sekunde bei
+praktisch gleichbleibender Schrittzeit. Wer den Transport messen will, muss
+ihn deshalb an `ms/Verify` messen — an `tok/s` verschwindet ein
+Transportunterschied dieser Groessenordnung im Accept-Rauschen. Genau die
+Groesse, an der der 1,50 behauptet wurde, ist auch die belastbare.
+
+**Nichts unter 2,72 % wird aus diesem Fenster als Befund berichtet.**
+
+Zweite Meinung: der klientseitige Durchsatz (Token aus `meta_info` zwischen den
+beiden Marken) trifft den Tick-Durchsatz in allen sechs Punkten auf unter 1 %.
+Die beiden Ebenen widersprechen sich nicht.
+
+| Arm | bs | Wdh | ms/Verify | ms/Schritt | tok/s Tick | tok/s Klient | accept | Ticks gew./bs | fremde bs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| bar1_hi_r1 | 16 | 1 | 5,18 | 82,8 | 612,4 | 608,2 | 3,17 | 18/20 | 0 |
+| bar1_hi_r1 | 16 | 2 | 5,23 | 83,7 | 590,9 | 587,9 | 3,09 | 18/20 | 0 |
+| bar1_hi_r1 | 16 | 3 | 5,27 | 84,3 | 635,0 | 630,5 | 3,34 | 18/20 | 0 |
+| bar1_hi_r2 | 16 | 1 | 5,23 | 83,6 | 637,2 | 635,7 | 3,33 | 18/20 | 0 |
+| bar1_hi_r2 | 16 | 2 | 5,29 | 84,6 | 603,3 | 606,4 | 3,19 | 19/21 | 0 |
+| bar1_hi_r2 | 16 | 3 | 5,32 | 85,1 | 617,6 | 616,5 | 3,29 | 18/20 | 0 |
+
+Der Boot-zu-Boot-Anteil ist dabei klein: r1 liefert 5,18/5,23/5,27, r2
+5,23/5,29/5,32 — die beiden Boots liegen ineinander, die Streuung ist
+ueberwiegend die innerhalb eines Boots.
+
+Ueber den ganzen Lauf (Bodenphase plus drei Runden) bestaetigt sich das Bild
+fuer beide Arme und alle vier Batchgroessen. Spanne (max-min)/Median je Arm
+und Punkt:
+
+| bs | Wdh bar1 / nccl | ms/Verify bar1 | ms/Verify nccl | tok/s bar1 | tok/s nccl | accept bar1 | accept nccl |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | 3 / 3 | 0,48 % | 1,58 % | 2,96 % | 21,47 % | 2,50 % | 20,00 % |
+| 4 | 3 / 3 | 0,40 % | 1,15 % | 4,99 % | 13,38 % | 5,00 % | 13,76 % |
+| 8 | 2 / 3 | 0,21 % | 2,07 % | 2,49 % | 4,36 % | 2,28 % | 5,97 % |
+| 16 | 12 / 6 | 3,35 % | 2,80 % | 12,00 % | 10,21 % | 12,34 % | 11,89 % |
+
+Der Befund der Bodenphase gilt durchgehend: **die Verify-Schrittzeit ist
+ueberall die ruhige Groesse (0,2-3,4 %), Durchsatz und Accept sind ueberall
+die unruhigen (2,5-21,5 %), und sie schwanken paarweise mit praktisch
+identischer Spanne.** Das ist kein Zufall zweier Metriken, das ist dieselbe
+Groesse zweimal: mehr akzeptierte Draft-Token je Schritt heissen mehr Token je
+Sekunde bei gleichbleibender Schrittzeit. Ein Transportvergleich gehoert
+deshalb auf ms/Verify.
+
+### Die Hauptmatrix: bar1_hi gegen den NCCL-Anker
+
+Drei verschraenkte Runden, je Runde `nccl_hi` zuerst und `bar1_hi` danach, in
+jedem Boot die Folge `16 1 4 8 16`. Mediane ueber alle Wiederholungen eines
+Punktes; bei bs=16 sind das 12 Stichproben fuer `bar1_hi` (6 aus der
+Bodenphase, 6 aus den Runden) und 6 fuer `nccl_hi`.
+
+| bs | ms/Verify bar1_hi | ms/Verify nccl_hi | **Faktor** | ms/Schritt bar1 | ms/Schritt nccl | tok/s bar1_hi | tok/s nccl_hi | accept bar1 | accept nccl | Boden ms/Verify | ueber Boden |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 30,65 | 31,84 | **1,039** | 30,7 | 31,8 | 130,5 | 125,6 | 4,00 | 4,00 | 1,58 % | ja |
+| 4 | 10,24 | 11,84 | **1,157** | 41,0 | 47,4 | 353,0 | 278,7 | 3,60 | 3,27 | 1,15 % | ja |
+| 8 | 6,77 | 7,71 | **1,138** | 54,2 | 61,7 | 518,5 | 415,4 | 3,51 | 3,19 | 2,07 % | ja |
+| 16 | 5,24 | 5,95 | **1,135** | 83,9 | 95,2 | 597,1 | 532,4 | 3,16 | 3,16 | 3,35 % | ja |
+
+Die Trennung ist vollstaendig, nicht knapp. Bei bs=16 liegen die zwoelf
+`bar1_hi`-Stichproben zwischen 5,18 und 5,35 ms/Verify, die sechs
+`nccl_hi`-Stichproben zwischen 5,88 und 6,05 — **kein einziger Punkt der
+beiden Arme ueberlappt**. Dasselbe bei bs=8 (6,76-6,78 gegen 7,67-7,83),
+bs=4 (10,20-10,24 gegen 11,73-11,87) und bs=1 (30,65-30,80 gegen
+31,52-32,03). Umgerechnet auf die Wanduhr einer Verify-Runde bei bs=16: **83,9
+gegen 95,2 ms, also 11,3 ms je Runde.**
+
+Der Gewinn waechst von bs=1 auf bs=4 und **saettigt dann**: 1,039 / 1,157 /
+1,138 / 1,135. Bei bs=1 ist die Nutzlast des dominierenden Kollektivs 40 KiB
+und der Schritt mit 30,7 ms speicherbandbreiten-dominiert -- der
+Transportanteil ist klein, also ist es auch der Unterschied. Ab bs=4 traegt
+der Transport genug vom Schritt, und das Verhaeltnis bleibt flach, obwohl die
+Kollektivgroesse sich von bs=4 auf bs=16 vervierfacht.
+
+**tok/s taugt hier nicht als Messlatte, ms/Verify schon.** Bei bs=4 und bs=8
+weicht der tok/s-Faktor (1,267 / 1,248) deutlich vom ms/Verify-Faktor ab, weil
+die Accept-Laenge zwischen den Armen zufaellig auseinanderlag (3,60 gegen 3,27
+bei bs=4) — genau der Effekt, den der Boden vorhergesagt hat. Bei bs=16, wo
+die Accept-Laenge beider Arme auf 3,16 zusammenfaellt, stimmen beide Faktoren
+ueberein (1,135 gegen 1,122).
+
+### Woher die 1,50 kam
+
+Die Rekonstruktion ist pruefbar und faellt eindeutig aus. Der s13-Lauf hat
+fuer `nccl` zwei Eimer gefuellt:
+
+| s13-Arm | Tick-Eimer | ms/Verify |
+|---|---|---:|
+| nccl_r1 | bs=15 (1 Tick) | 6,01 |
+| nccl_r2 | bs=15 (1 Tick) | 6,07 |
+| nccl_r1 | bs=16 (2 Ticks) | 9,32 |
+| nccl_r2 | bs=16 (2 Ticks) | 8,87 |
+
+Der **saubere** Tick der NCCL-Arme steht im 15er-Eimer und sagt 6,04 im
+Mittel. Dieses Fenster misst `nccl_hi` bei bs=16 mit **5,95** — 1,5 % daneben,
+also dieselbe Zahl. Die 9,09 aus dem 16er-Eimer waren die zwei Ticks, in denen
+Anfragen fertig wurden; `bar1_hi` hatte in denselben Runden zufaellig drei
+saubere Ticks im 16er-Eimer. **Der Faktor 1,50 war ein Eimer-Artefakt eines
+Prefill-Laufs, keine Transporteigenschaft.** Was uebrig bleibt, ist 1,135 —
+und das ist genau die Groessenordnung, die der Transport im Prefill auch
+liefert.
+
+### Ein ausgefallener Punkt, ehrlich benannt
+
+`bar1_hi_r3` bei bs=8 hat kein Ergebnis: **35 von 36 Punkten**. Im Messfenster
+stand der Scheduler rund 20 Sekunden still — zwischen 20:30:40 und 20:30:59
+keine einzige `Decode batch`-Zeile, waehrend `/metrics` unveraendert 8
+laufende Anfragen und einen eingefrorenen `gen_throughput` meldete und der
+Klient in denselben 15 s keinen Chunk bekam. Beide Ebenen schweigen zugleich,
+das Log traegt keine andere Zeile aus dem Fenster als die zwei
+`/metrics`-Zugriffe. Der Punkt ist verworfen statt geschaetzt; `bar1_hi` bei
+bs=8 steht damit auf zwei statt drei Wiederholungen (6,76 und 6,78 — die
+beiden liegen 0,2 % auseinander, der Median traegt).
+
+Verdaechtig, aber hier nicht nachgewiesen: `/generate` streamt `text` und
+`output_ids` **kumulativ**, die Chunkgroesse waechst also linear mit der
+Generierung, und ein Klient, der nicht mehr mitliest, bremst ueber
+TCP-Gegendruck den Ausgabepfad. Ein `stream_interval` je Anfrage waere der
+naheliegende Hebel dagegen. Nicht gemessen, nicht behauptet.
+
+Zweiter, kleinerer Ausreisser derselben Familie: `bar1_hi_r5` bei bs=1 meldet
+klientseitig 33,9 tok/s, waehrend die Ticks 126,6 sagen und die Punkte davor
+und danach 125,9 / 128,3. Der Tick-Wert dieses Punktes ist unauffaellig und
+geht in die Tabelle ein; der Klientwert dieses einen Punktes ist es nicht und
+zieht die Klient-Spanne bei bar1_hi/bs=1 auf 75 %. Er steht in den Rohdaten.
+
+### Zur Kollektivklassen-Frage, soweit die Logs sie hergeben
+
+Die Frage war, ob ein etwaiger Gewinn aus dem Verify-Kollektiv oder aus dem
+Decode-`all_reduce` kommt. Zwei ehrliche Teilantworten:
+
+1. **Eine Zerlegung nach compute/wait gibt es auf dem Decode-Pfad nicht.** Die
+   `CollectiveClock`-Aufteilung aus #252 haengt an der Zeile `Prefill rank
+   batch`; der Decode-Pfad schreibt keine Zeile mit `gpu-ms (compute, wait)`
+   je Rang. Neue Instrumentierung war ausgeschlossen, also bleibt es dabei.
+2. **Die Groessenarithmetik ist eindeutig und braucht kein neues Log.** Bei
+   hidden 5120, 64 Schichten, bf16 und `num_draft_tokens` 4 gilt je
+   Verify-Runde:
+
+   | Klasse | Kollektive je Runde | Nutzlast je Kollektiv | Byte-Anteil |
+   |---|---:|---|---:|
+   | Ziel-/Verify-Vorwaertslauf | 128 (64 Schichten x 2) | bs x 40 KiB (bs=16: 640 KiB) | **98,8 %** |
+   | NEXTN-Draft (1 Schicht, 3 Schritte) | 6 | bs x 10 KiB (bs=16: 160 KiB) | 1,2 % |
+
+   Ein Transportunterschied auf dem Decode-Takt muss also praktisch
+   vollstaendig aus der Verify-Klasse kommen; die Draft-Klasse traegt 1,2 %
+   der Bytes und 4,5 % der Aufrufe. Das ist eine Aussage ueber die
+   Angriffsflaeche, keine Messung der Zeit — die waere ohne die fehlende
+   Decode-Zerlegung aus (1) nicht zu haben.
+3. **Die bs-Kurve stuetzt (1) und (2), ohne sie zu beweisen.** Die Nutzlast
+   der Verify-Klasse waechst mit bs (40 / 160 / 320 / 640 KiB), die der
+   Draft-Klasse ebenfalls (10 / 40 / 80 / 160 KiB). Waere der Gewinn eine
+   Schwelle — eine Groesse, ab der ein Weg guenstiger wird —, muesste das
+   Verhaeltnis mit bs wandern. Es tut es nicht: ab bs=4 steht es bei
+   1,157 / 1,138 / 1,135, waehrend die Nutzlast sich vervierfacht. Was mit bs
+   wandert, ist nur der ANTEIL des Transports am Schritt, und genau so sieht
+   die Kurve auch aus: bei bs=1, wo der 30,7-ms-Schritt von der
+   Speicherbandbreite bestimmt wird, bleiben 1,039 uebrig. Der Gewinn ist
+   also ueber die dominierende Klasse hinweg gleichmaessig, nicht an eine
+   Groessenklasse gebunden.
+
+### Zwei Messfallen, die dieses Fenster gekostet hat
+
+Beide sind in `befunde/` mit Ursache und Fix abgelegt, weil beide wiederkehren
+koennen.
+
+* **`fehlversuch1_leere_punkte.txt` — der stille 400er.** `max_new_tokens
+  100000` gegen `--context-length 32768` wird von `/generate` nicht abgelehnt,
+  sondern mit **HTTP 200** und einem einzigen `data: {"error": ...}`-Objekt
+  beantwortet. Ein Parser, der auf `meta_info` wartet, verwirft es wortlos:
+  sechzehn Stroeme, keine Chunks, keine Ausnahme, leere Messung. Fix: Kappung
+  aus der vom Server gelesenen Kontextlaenge **und** ein ausdruecklicher
+  Fehlerzweig im Chunk-Parser.
+* **`fehlversuch2_probe_deadlock.txt` — eine Anfrage mehr, als der Server
+  Plaetze hat.** Die Accept-Probe lief zunaechst neben dem Messbatch. Das
+  Rezept setzt `--max-running-requests 16`; bei bs=16 landet die Probe in der
+  Warteschlange, freigegeben wurden die Stroeme aber erst nach ihrer Antwort.
+  py-spy zeigte den Treiber genau in diesem `_post`
+  (`befunde/pyspy-driver-probe-hang.txt`). Derselbe Bau wie
+  „rank-lokaler Test vor Kollektiv": die Bedingung, die es unmoeglich machte
+  (`bs` gegen `max_running_requests`), war lokal bekannt, bevor irgendetwas
+  abgeschickt wurde. Die Probe laeuft jetzt hinter dem Batch und heisst
+  `probe_accept_bs1`, weil sie genau das ist.
+
+### Nebenbefund zum Arbeitspunkt
+
+Der vorgefuellte Arbeitspunkt liegt deutlich hoeher als der des
+Prefill-Fensters: **615 tok/s bei bs=16** gegen 474 dort, bei accept 3,24
+gegen 2,98 und ms/Verify 5,25 gegen 6,07. Ursache ist der Aufbau, nicht der
+Transport — konstante Batchgroesse, 2048 Token gemeinsamer Kontext, keine
+Rampe im Fenster. Die Fuellprosa ist repetitiv, was die Accept-Laenge nach
+oben zieht (3,24 von maximal 4, bei bs=1 sogar 4,00); sie ist auf beiden Armen
+byte-identisch, das Verhaeltnis bleibt davon unberuehrt, der Absolutwert ist
+optimistisch. Wer die Absolutzahlen dieses Abschnitts als Durchsatzaussage
+lesen will, muss diesen Vorbehalt mitlesen.
+
+### Was steht
+
+* **Der Faktor 1,50 ist widerlegt.** Er war ein Tick-Eimer-Artefakt; der
+  saubere Wert desselben s13-Laufs (6,04 im 15er-Eimer) stimmt auf 1,5 % mit
+  der hier gemessenen NCCL-Zahl ueberein.
+* **Ein echter Decode-Gewinn bleibt: 1,135 bei bs=16**, 1,138 bei bs=8, 1,157
+  bei bs=4, 1,039 bei bs=1. Vollstaendige Trennung der Stichproben bei allen
+  vier Batchgroessen, 4x ueber dem Boden bei bs=16.
+* **Es ist kein Decode-Sonderbonus.** 1,135 auf dem Decode-Takt gegen 1,137
+  fuer `bar1` und 1,170 fuer `bar1_hi` auf dem Prefill-Durchsatz: derselbe
+  Transport, dieselbe Groessenordnung. Die Erwartung „Decode profitiert
+  ueberproportional" wird von diesem Rig nicht getragen.
+* **Methodisch:** ms/Verify ist auf diesem Arbeitspunkt die einzige belastbare
+  Messlatte fuer den Transport. tok/s und Accept-Laenge sind dieselbe
+  schwankende Groesse in zwei Schreibweisen und verdecken einen 14-Prozent-
+  Unterschied bei bs=4/8.
