@@ -9,20 +9,27 @@ reporting:
   2. the graph gate. bar1_graph_check.py must have run and every GATE case must
      have passed. SGLANG_HTCCL_GRAPH_FREIGABE=1 without that evidence produces
      numbers from an operating point nobody can defend,
-  3. THE BOLT. htccl._select raises instead of quietly dropping to the
+  3. was a log harvested at ALL. An empty evidence list means one of two very
+     different things -- nobody looked, or nothing was there -- and only the
+     second is a measurement. `log_quellen` names the files that existed,
+  4. THE BOLT. htccl._select raises instead of quietly dropping to the
      host-staged gloo level during a graph capture. If it fired, that is the
      coverage gap of the current integration -- reported with op and size, in
      its own wording, so nobody has to open a log to tell it from a crash,
-  4. per-group attainment. EVERY communicator group must report ERREICHT=bar1.
+  5. a fatal in the log. This sits HERE and not at the end, deliberately: a
+     boot that died takes the smoke request, the setup lines and everything
+     else down with it, and reporting one of those instead means reporting the
+     consequence while the cause is two fields away. That is exactly how a run
+     whose capture aborted got reported as "no ERREICHT line in the log",
+  6. per-group attainment. EVERY communicator group must report ERREICHT=bar1.
      The requested transport name says bar1 either way; it is not evidence. One
      group on bar1 and one on gloo is a MIXED run: correct-looking, and its
      numbers may not be reported as bar1 numbers,
-  5. a BAR1 setup line per group. The ERREICHT line is written at group init;
+  7. a BAR1 setup line per group. The ERREICHT line is written at group init;
      the setup line is written when the aperture actually handed over the
      space,
-  6. the smoke request: coherent output (the numbers 1..20 in order, counted,
-     not judged) and spec_accept_length present as a number,
-  7. no OOM / NCCL / watchdog marker in the harvested log lines.
+  8. the smoke request: coherent output (the numbers 1..20 in order, counted,
+     not judged) and spec_accept_length present as a number.
 
 NOT judged: the HEIGHT of spec_accept_length, the setup duration, and any
 throughput. s11 answers "does the direct path carry a real run"; s12 answers
@@ -65,7 +72,7 @@ def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "bar1_e2e.json")
     classify_missing_result(step_dir, "bar1_e2e", path, "bar1_e2e.json")
     payload = load_json(path, "bar1_e2e.json")
-    require_envelope(payload, KIND, "bar1_e2e.json", 1)
+    require_envelope(payload, KIND, "bar1_e2e.json", 2)
 
     if not payload.get("reachable"):
         raise CheckStop(
@@ -94,6 +101,24 @@ def check(step_dir: str) -> None:
             "damit nicht freigegeben"
         )
 
+    # Erst die Frage, OB jemand geschaut hat. Eine leere Beweislage aus einer
+    # Schrittablage ohne Logauszug ist kein Befund ueber den Lauf, sondern
+    # einer ueber die Ernte -- und die beiden auseinanderzuhalten ist der
+    # Unterschied zwischen "der Lauf hat nichts gemeldet" und "wir haben
+    # nicht nachgesehen".
+    if "log_quellen" not in payload:
+        raise CheckStop(
+            "bar1_e2e.json nennt kein 'log_quellen' -- das Artefakt stammt von "
+            "einem aelteren Erzeuger, der die Beweislage nur aus htccl_lines.txt "
+            "gelesen hat und auf jedem Abbruchweg leer ausging"
+        )
+    if not payload["log_quellen"]:
+        raise CheckStop(
+            "kein Logauszug in der Schrittablage (weder htccl_lines.txt noch "
+            "server.log) -- niemand hat geschaut, also ist hier nichts zu "
+            "entscheiden"
+        )
+
     riegel = payload.get("riegel")
     if riegel:
         raise CheckFail(
@@ -104,12 +129,20 @@ def check(step_dir: str) -> None:
             "Szenario nimmt die BAR1-Integration ab."
         )
 
+    # Und danach sofort der Absturz. Ein toter Boot reisst Smoke-Request,
+    # Aufbauzeilen und ERREICHT-Zeilen mit -- wer eine von denen meldet,
+    # meldet die Folge und laesst die Ursache zwei Felder weiter stehen.
+    fatal = payload.get("fatal")
+    if fatal:
+        raise CheckFail(f"Fatal im Serverlog -- {fatal}")
+
     gruppen = payload.get("gruppen") or []
     if not gruppen:
         raise CheckFail(
-            "keine einzige 'ERREICHT='-Zeile im Log -- ohne sie ist der Arm des "
-            "Messwerts unbelegt (der angeforderte Transportname steht auch bei "
-            "Ausfall auf bar1)"
+            "keine einzige 'ERREICHT='-Zeile im Log (Quellen: "
+            f"{payload['log_quellen']}, {payload.get('log_zeilen')} Zeilen) -- "
+            "ohne sie ist der Arm des Messwerts unbelegt (der angeforderte "
+            "Transportname steht auch bei Ausfall auf bar1)"
         )
     for prefix in REQUIRED_GROUP_PREFIXES:
         found = _group_for(prefix, gruppen)
@@ -159,10 +192,6 @@ def check(step_dir: str) -> None:
             f"spec_accept_length ist {smoke.get('spec_accept_length')!r} -- der "
             "Spec-Pfad laeuft nicht oder die Antwort traegt kein meta_info"
         )
-
-    fatal = payload.get("fatal")
-    if fatal:
-        raise CheckFail(f"Fatal im Serverlog -- {fatal}")
 
 
 def main() -> int:

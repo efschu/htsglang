@@ -135,12 +135,21 @@ Zeitmessung** -- nur den Byte-Beleg (``byte_beleg_a2a``, gleichverteilt und
 schief, jedes Byte, jedes gerichtete Paar). Die Tabelle oben gilt fuer
 ``all_reduce`` und ausschliesslich dafuer.
 
+Auf demselben Kern, ohne eigene Zeitmessung
+-------------------------------------------
+``all_gather`` und ``broadcast``. Beide sind Sonderfaelle derselben
+a2a-Tabelle -- all_gather einer mit konstantem Sendeversatz, broadcast einer
+mit genau einem Sender -- und brauchen deshalb keinen zweiten Kern. Gemessen
+ist keiner von beiden; belegt ist jeder (``byte_beleg_a2a``,
+``byte_beleg_broadcast``). Die Zeittabelle oben gilt weiter ausschliesslich
+fuer ``all_reduce``.
+
 Was hier NICHT drin ist
 -----------------------
-``all_gather``, ``reduce_scatter`` und ``broadcast``. Sie waeren je eine
-Haelfte der all_reduce-Kernel, aber keine davon ist gemessen -- und in
-diesem Vorhaben zaehlt nur Gemessenes. ``handles`` gibt dafuer ``False``
-und die ``htccl_*``-Methoden erklaeren, was fehlt.
+``reduce_scatter``. Es braucht eine REDUKTION, und der a2a-Kern bewegt
+Bytes. Die RS-Phase der all_reduce-Kerne koennte es, aber nur als eigener
+Einsprung mit eigenem Schlitzsatz -- also nicht als Beifang. ``handles``
+gibt dafuer ``False`` und ``_kein_kollektiv`` erklaert, was fehlt.
 """
 
 from __future__ import annotations
@@ -889,6 +898,52 @@ def ag_plan(laengen, schlitz: int) -> list:
     return plan
 
 
+def bc_plan(nbytes: int, schlitz: int) -> list:
+    """Die Rundenzerlegung eines ``broadcast``. Reine Arithmetik.
+
+    Geliefert wird je Runde ein ``(versatz, laenge)`` in **Byte**. Anders
+    als bei :func:`ag_plan` gibt es keinen Vektor je Rang: bei einem
+    broadcast bewegt genau EIN Rang Bytes, und alle anderen bekommen
+    denselben Ausschnitt an denselben Versatz. Sende- und Empfangsversatz
+    fallen deshalb zusammen -- der Ausschnitt liegt in der Quelle wie im
+    Ergebnis an derselben Stelle.
+
+    **Warum ueberhaupt Runden.** Dieselbe Antwort wie bei all_gather: die
+    Nutzlast kann groesser sein als ein Schlitz, und eine Ablehnung waere
+    unter einer CUDA-Graph-Aufzeichnung kein langsamerer Weg, sondern der
+    Abbruch des Laufs. Also ``ceil(nbytes/schlitz)`` Runden statt einer
+    Absage.
+
+    **Rangeinheitlich, obwohl nur einer sendet.** Das ist die eine Stelle,
+    an der ein broadcast anders aussieht als ein all_gather und es doch
+    nicht sein darf. Die Rundenzahl haengt allein an ``nbytes`` und
+    ``schlitz``; beide sind gruppenweit gleich, also zaehlen alle Raenge
+    gleich viele Runden -- auch die, die in jeder davon null Byte senden.
+    Sie fahren die Sperre mit. Zaehlte ein Nicht-Quellen-Rang weniger
+    Runden (etwa "ich sende nichts, also ist nichts zu tun"), waere das
+    kein Fehler, sondern ein Haenger: die Quelle stuende in der Sperre
+    einer Runde, die niemand sonst mehr fuehrt.
+
+    **Warum das eine Aufzeichnung ueberlebt.** Dieselbe Begruendung wie bei
+    :func:`ag_plan`: die Zahl der Kernelstarts ist eingebrannt, und kein
+    Hostcode entscheidet je Runde etwas, was sich zwischen Aufzeichnung und
+    Wiedergabe aendern koennte. ``src`` steht zur Aufzeichnungszeit fest
+    und geht als Kernelargument mit.
+    """
+    nbytes = int(nbytes)
+    if schlitz <= 0:
+        raise ValueError(f"Schlitzgroesse {schlitz} ist nicht positiv")
+    if nbytes < 0:
+        raise ValueError(f"negative Nutzlast {nbytes}")
+    if nbytes == 0:
+        return []
+    runden = -(-nbytes // schlitz)
+    return [
+        (k * schlitz, min((k + 1) * schlitz, nbytes) - k * schlitz)
+        for k in range(runden)
+    ]
+
+
 def max_nutzlast(welt: int, region_bytes: int, mit_a2a: bool = True,
                  mit_pipe: bool = False, erg_ring: int = 0) -> int:
     """Groesste Nutzlast, deren Schlitze in eine Region dieser Groesse passen.
@@ -1084,27 +1139,28 @@ class HTCCLBar1Transport:
     ``False`` -- ohne Ausnahme, ohne Notpfad.
     """
 
-    #: all_reduce (gemessen), all_to_all (eigener Kern, ungemessen) und
+    #: all_reduce (gemessen), all_to_all (eigener Kern, ungemessen),
     #: all_gather (auf demselben Kern, ungemessen -- siehe
-    #: :meth:`htccl_all_gather`).
+    #: :meth:`htccl_all_gather`) und broadcast (derselbe Kern noch einmal,
+    #: siehe :meth:`htccl_broadcast`).
     #:
-    #: ``reduce_scatter`` und ``broadcast`` fehlen weiter, und zwar mit
-    #: Grund, nicht aus Versehen:
+    #: ``reduce_scatter`` fehlt weiter, und zwar mit Grund, nicht aus
+    #: Versehen: es braucht eine REDUKTION. Der a2a-Kern bewegt Bytes und
+    #: kennt keinen Datentyp; er traegt all_gather und broadcast deshalb
+    #: gratis und reduce_scatter gar nicht. Die RS-Phase der beiden
+    #: all_reduce-Kerne koennte es, aber nur als eigener Einsprung mit
+    #: eigenem Schlitzsatz -- also nicht als Beifang.
     #:
-    #: * ``reduce_scatter`` braucht eine REDUKTION. Der a2a-Kern bewegt
-    #:   Bytes und kennt keinen Datentyp; er traegt all_gather deshalb
-    #:   gratis und reduce_scatter gar nicht. Die RS-Phase der beiden
-    #:   all_reduce-Kerne koennte es, aber nur als eigener Einsprung mit
-    #:   eigenem Schlitzsatz -- also nicht als Beifang.
-    #: * ``broadcast`` ist in sglang AN ORT (``broadcast(tensor, src)``
-    #:   gibt denselben Tensor zurueck), und die Erweiterung lehnt
-    #:   ``in is out`` ab. Aus dem Beifang wuerde ein Zusatzpuffer plus
-    #:   Kopie -- billiger als ein neuer Kern, aber nicht gratis, und
-    #:   ausser Ort waere es eine andere Zusage als die der Naht.
+    #: ``broadcast`` stand aus einem zweiten Grund lange hier nicht: es ist
+    #: in sglang AN ORT (``broadcast(tensor, src)`` gibt denselben Tensor
+    #: zurueck), und die Erweiterung lehnt ``in is out`` ab. Der Preis dafuer
+    #: ist EIN Zwischenpuffer plus eine lokale Kopie -- kein neuer Kern. Bei
+    #: den Groessen dieses Pfades (128 Byte im Abnahmefall) ist das nichts,
+    #: und die Alternative war der Abbruch der Graph-Aufzeichnung.
     #:
-    #: Fuer beide bleibt der laute Riegel in ``htccl._select`` zustaendig.
-    #: Er nennt die Operation, und weil diese Menge hier die einzige
-    #: Wahrheit darueber ist, was gedeckt ist, kann die Meldung nicht
+    #: Fuer reduce_scatter bleibt der laute Riegel in ``htccl._select``
+    #: zustaendig. Er nennt die Operation, und weil diese Menge hier die
+    #: einzige Wahrheit darueber ist, was gedeckt ist, kann die Meldung nicht
     #: veralten.
     #:
     #: Beide Schreibweisen von all_to_all stehen hier, weil die Naht in
@@ -1113,7 +1169,8 @@ class HTCCLBar1Transport:
     #: ``all_to_all_single`` heisst. Zwei Namen, ein Weg -- besser als eine
     #: Umbenennung an der Nahtstelle, die man beim Lesen uebersieht.
     HTCCL_OPS: frozenset = frozenset(
-        {"all_reduce", "all_gather", "all_to_all", "all_to_all_single"}
+        {"all_reduce", "all_gather", "all_to_all", "all_to_all_single",
+         "broadcast"}
     )
 
     def __init__(self, cpu_group, device, fenster_bytes: int,
@@ -1373,6 +1430,33 @@ class HTCCLBar1Transport:
         self.ag_max_runden = int(
             os.environ.get("SGLANG_HTCCL_BAR1_AG_MAX_RUNDEN", "16")
         )
+        #: broadcast ueber denselben a2a-Kern. VORGABE AN, aus demselben
+        #: Grund wie bei all_gather: ohne sie bricht der Standardlauf beim
+        #: Aufzeichnen des Draft-Graphen ab (eagle_worker_v2.init_cuda_graphs
+        #: -> parallel_state broadcast -> der Riegel in htccl._select). Der
+        #: Schalter existiert, damit der Messende ihn gegen die gloo-Ebene
+        #: stellen kann.
+        self.bc_an = os.environ.get("SGLANG_HTCCL_BAR1_BC", "1") not in (
+            "0", "nein", "aus", "false"
+        )
+        #: Untergrenze wie bei a2a und all_gather: ein Paket. Sie ist hier
+        #: besonders niedrig anzusetzen -- der Fall, der diesen Weg noetig
+        #: gemacht hat, ist 128 Byte gross. Eine Untergrenze, die ihn
+        #: ausschliesst, ist unter Aufzeichnung kein langsamerer Weg,
+        #: sondern gar keiner.
+        self.bc_min_bytes = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_BC_MIN_BYTES", "16")
+        )
+        #: Rundengrenze wie bei all_gather, aus demselben Grund: je Runde
+        #: ein Kernelstart mit einer Sperre.
+        self.bc_max_runden = int(
+            os.environ.get("SGLANG_HTCCL_BAR1_BC_MAX_RUNDEN", "16")
+        )
+        #: Erst nach `byte_beleg_broadcast` gueltig. Eigener Merker, obwohl
+        #: derselbe Kern laeuft: faellt der broadcast-Beleg, ist das kein
+        #: Urteil ueber all_to_all -- die Tabelle ist eine andere (genau ein
+        #: Sender), und ein Fehlschlag dort traegt keine Aussage hierher.
+        self._bc_beleg = False
         try:
             self._baue_auf()
         except BaseException:
@@ -2075,6 +2159,8 @@ class HTCCLBar1Transport:
             return self._handles_a2a(nbytes)
         if op == "all_gather":
             return self._handles_all_gather(nbytes)
+        if op == "broadcast":
+            return self._handles_broadcast(nbytes)
         if nbytes < self.min_bytes or nbytes > self.max_bytes:
             return False
         if nbytes % 16 != 0:
@@ -2619,6 +2705,253 @@ class HTCCLBar1Transport:
         out = out.movedim(0, dim)
         return out.reshape(form[:dim] + (self.welt * form[dim],) + form[dim + 1:])
 
+    # -- broadcast ---------------------------------------------------------
+    #
+    # DER NAECHSTE STOPPER, und er sass eine Ebene tiefer als der von
+    # all_gather. Der Standardlauf brach beim Aufzeichnen des DRAFT-Graphen
+    # ab (eagle_worker_v2.init_cuda_graphs -> parallel_state broadcast ->
+    # htccl._select):
+    #
+    #     RuntimeError: HTCCL: 'broadcast' mit 128 Byte waehrend einer
+    #     CUDA-Graph-Aufzeichnung, aber bar1 meldet
+    #     handles('broadcast', 128) -> False.
+    #
+    # 128 Byte. Nicht die Bandbreite fehlte, sondern die Deckung -- und
+    # unter Aufzeichnung ist eine fehlende Deckung kein langsamerer Weg,
+    # sondern der Abbruch: der Ausweichweg (gloo, host-gestaffelt) liefe
+    # EINMAL beim Aufzeichnen und bei keiner Wiedergabe wieder.
+    #
+    # WIEDER KEIN NEUER KERN, und diesmal ist die Tabelle noch einfacher als
+    # beim all_gather. Ein broadcast ist ein all_to_all, in dem genau EIN
+    # Rang eine Zeile fuellt: die Quelle setzt fuer jedes Ziel denselben
+    # Ausschnitt (``sende_versatz[z] = const``, ``sende_bytes[z] = n``), und
+    # jeder andere Rang sendet ueberall 0 Byte. Empfangsseitig ist genau ein
+    # Block ungleich null, naemlich der von ``src``. Der Kern kennt das
+    # bereits: er bekommt Versaetze und Laengen je Rang getrennt, und eine
+    # Laenge 0 ist bei ihm kein Sonderfall, sondern eine leere Schleife.
+    #
+    # DIE EINE BEDINGUNG, DIE HIER SCHAERFER IST ALS BEIM ALL_GATHER: die
+    # Rundenzahl muss auf ALLEN Raengen gleich sein, obwohl nur einer sendet.
+    # Sie ist es, weil sie allein aus ``nbytes`` und dem Schlitz faellt (siehe
+    # bc_plan) -- nicht daraus, wieviel dieser Rang zu tun hat. Ein
+    # Nicht-Quellen-Rang, der "ich sende nichts" zu "also keine Runde"
+    # verkuerzte, liesse die Quelle in der Sperre stehen.
+    #
+    # WAS DAS KOSTET, ehrlich: EIN Zwischenpuffer und EINE lokale Kopie. Die
+    # Naht ist AN ORT (``broadcast(tensor, src)`` gibt denselben Tensor
+    # zurueck), die Erweiterung lehnt aber ``in is out`` ab -- und das zu
+    # Recht: Sende- und Empfangsphase des Kerns laufen um EINE Sperre herum,
+    # ein Puffer, der beides ist, waere in der zweiten Phase schon
+    # ueberschrieben. Der Zwischenpuffer kostet n Byte VRAM und eine
+    # geraeteinterne Kopie mit HBM-Bandbreite, waehrend das Kollektiv selbst
+    # ueber PCIe geht; bei den Groessen dieses Pfades (128 Byte) ist das
+    # nicht messbar. `torch.empty_like` unter Aufzeichnung kommt aus dem
+    # privaten Pool des Graphen und liegt bei jeder Wiedergabe an derselben
+    # Adresse -- dieselbe Begruendung, auf der htccl_device steht.
+
+    def _handles_broadcast(self, nbytes: int) -> bool:
+        """``nbytes`` ist die volle Nutzlast -- sie ist gruppenweit dieselbe.
+
+        Die Naht fragt mit ``tensor.numel() * element_size()``
+        (``htccl.HTCCLCommunicator.broadcast``). Anders als beim all_gather
+        gibt es hier keinen Unterschied zwischen Scherbe und Ergebnis: jeder
+        Rang haelt am Ende genau diese Bytes.
+
+        Jede Bedingung ist rangeinheitlich, aus demselben Grund wie in
+        :meth:`handles` -- und hier faellt das besonders auf, weil die
+        Operation selbst es nicht ist: nur ``src`` sendet. Genau deshalb
+        darf in dieser Antwort nichts stehen, was von ``self.rank``
+        abhaengt.
+
+        Ueber den Schlitz hinaus wird NICHT abgelehnt, sondern in Runden
+        zerlegt (:func:`bc_plan`). ``nbytes % 16 != 0`` wird ebenfalls nicht
+        abgelehnt -- der a2a-Kern hat den Restpfad. Beides aus demselben
+        Grund wie bei :meth:`_handles_all_gather`: unter Aufzeichnung ist
+        eine Absage ein Abbruch.
+        """
+        if not self.bc_an:
+            return False
+        # Derselbe Bereich, derselbe Kern -- aber ein EIGENER Byte-Beleg
+        # (`_bc_beleg`), weil die Tabelle eine andere ist. Ohne den
+        # a2a-Bereich gibt es auch keinen broadcast; gesagt, nicht still
+        # angenommen.
+        if not self.a2a_an or not self._a2a_beleg or not self._bc_beleg:
+            return False
+        geo = self._geo
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+            return False
+        if nbytes <= 0:
+            return False
+        if nbytes < self.bc_min_bytes:
+            return False
+        # Derselbe Fensterbegriff wie ueberall: gegen die gruppenweit
+        # KLEINSTE tatsaechlich abgebildete Laenge.
+        if geo["region_bytes"] > self._fenster_minimum:
+            return False
+        if -(-nbytes // int(geo["a2a_schlitz"])) > self.bc_max_runden:
+            return False
+        return True
+
+    def bc_runden(self, nbytes: int) -> int:
+        """Rundenzahl fuer ``nbytes`` -- fuer Protokoll/Test."""
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        if schlitz <= 0:
+            return 0
+        return max(1, -(-int(nbytes) // schlitz))
+
+    def htccl_broadcast(self, comm, tensor, src: int = 0):
+        """``broadcast`` ueber den Direktpfad, notfalls in mehreren Runden.
+
+        AN ORT und mit demselben Rueckgabewert wie jede andere Fassung
+        dieser Naht (``htccl.HTCCLCommunicator.broadcast``,
+        ``htccl_device.htccl_broadcast``): der uebergebene Tensor wird
+        gefuellt und zurueckgegeben. ``src`` ist ein GRUPPENLOKALER Rang --
+        so fragt die Naht, und so heisst auch ``self.rank``.
+        """
+        import torch
+
+        if not self._auf or self._ext is None or not self.a2a_an:
+            raise Bar1Unverfuegbar(
+                "htccl_broadcast ohne aufgebauten a2a-Bereich -- erreichbar "
+                "nur, wenn jemand handles() umgangen hat."
+            )
+        R = self.welt
+        if not 0 <= int(src) < R:
+            raise Bar1Unverfuegbar(
+                f"broadcast mit src={src} bei {R} Raengen -- der Rang ist "
+                f"gruppenlokal zu verstehen."
+            )
+        src = int(src)
+        # `reshape(-1)` statt `view(-1)`: ein nicht zusammenhaengender
+        # Tensor bekommt hier eine zusammenhaengende Kopie als QUELLE, und
+        # die Rueckgabe unten schreibt das Ergebnis mit `copy_` wieder in
+        # die urspruengliche Ablage. Beides ist noetig, weil die Naht an Ort
+        # zusagt, der Kern aber zusammenhaengende Puffer verlangt.
+        quelle = tensor.reshape(-1)
+        nbytes = quelle.numel() * quelle.element_size()
+        if nbytes == 0:
+            return tensor
+        ziel = torch.empty_like(quelle)
+        plan = bc_plan(nbytes, int(self._geo["a2a_schlitz"]))
+        # Gruppenweit gleich, weil `plan` es ist -- und deshalb faellt auch
+        # die Kernvariante (gitter/1blk) auf allen Raengen gleich aus, statt
+        # an der rangabhaengigen Frage "wieviel sende ICH" zu haengen.
+        for versatz, laenge in plan:
+            sendet = (self.rank == src)
+            s_len = [laenge if sendet else 0] * R
+            s_off = [versatz] * R
+            e_len = [laenge if i == src else 0 for i in range(R)]
+            e_off = [versatz if i == src else 0 for i in range(R)]
+            self.htccl_all_to_all_single(
+                comm, ziel, quelle, s_len, e_len, s_off, e_off,
+                kern_last=laenge * (R - 1),
+            )
+        tensor.copy_(ziel.view(tensor.shape))
+        return tensor
+
+    def byte_beleg_broadcast(self) -> bool:
+        """Byte-Beleg fuer ``broadcast``: jede Quelle einmal, ueber Runden.
+
+        Eigener Beleg, obwohl derselbe Kern laeuft. Was hier belegt werden
+        soll, ist nicht der Kern -- den deckt ``byte_beleg_a2a`` ab --,
+        sondern die TABELLE: genau ein Sender, alle anderen Laengen 0, und
+        ein Empfangsblock, dessen Versatz nicht die Praefixsumme der Laengen
+        ist. Eine vertauschte Zeile faellt in einem all_to_all mit lauter
+        gleich grossen Bloecken nicht auf, hier schon.
+
+        Gefahren wird
+        (a) je Rang EIN Durchgang mit diesem Rang als Quelle -- damit ist
+            jede gerichtete Kante ``src -> r`` einmal gelaufen, dieselbe
+            Deckung, die ``byte_beleg_a2a`` ueber die Paare hat --, und
+        (b) ein Durchgang ueber MEHRERE Runden (Nutzlast > Schlitz), weil
+            die Haelftenwahl nach Rundenparitaet in einer Einzelrunde gar
+            nicht drankommt.
+
+        **Zurueckgelesen wird auf einem anderen Weg als geschrieben.**
+        Geschrieben hat die BAR1-Apertur der Gegenkarte; geprueft wird auf
+        der CPU, nach einer gewoehnlichen Geraet-zu-Host-Kopie. Und der
+        SOLLWERT kommt nicht aus dem Transport: er wird lokal aus der
+        Quellrangnummer gerechnet (``_a2a_marke(src, src)``). Ein Rang
+        erfaehrt die erwarteten Bytes also nie ueber den Weg, der gerade
+        geprueft wird -- sonst belegte der Beleg sich selbst.
+
+        Faellt er, meldet sich **nur** ``broadcast`` ab.
+        """
+        import torch
+        import torch.distributed as dist
+
+        self._bc_beleg = False
+        if not self.bc_an:
+            logger.info(
+                "HTCCL-BAR1: broadcast ist per SGLANG_HTCCL_BAR1_BC=0 "
+                "abgeschaltet -- kein Byte-Beleg, handles() sagt False."
+            )
+            return False
+        if not self.a2a_an or not self._a2a_beleg:
+            return False
+        if not self._auf or self._ext is None:
+            return False
+
+        R, r = self.welt, self.rank
+        schlitz = int(self._geo.get("a2a_schlitz", 0))
+        if schlitz <= 0:
+            return False
+        klein = min(4096, schlitz)
+        # Ueber den Schlitz hinaus, aber nicht knapp: 16 Byte Rest in der
+        # zweiten Runde treffen zusaetzlich den Restpfad des Kerns.
+        gross = schlitz + 16
+
+        ok_lokal = True
+        for src, n in [(s, klein) for s in range(R)] + [(0, gross)]:
+            # Jeder Rang startet mit SEINER Marke. Fuer die Quelle ist das
+            # schon der Sollwert, fuer alle anderen ein davon
+            # unterscheidbares Byte -- ein broadcast, der gar nichts bewegt,
+            # faellt damit auf, statt zufaellig richtig auszusehen.
+            soll = self._a2a_marke(src, src)
+            puffer = torch.full((n,), self._a2a_marke(r, r), dtype=torch.uint8,
+                                device=self.device)
+            dist.barrier(group=self.cpu_group)
+            gelaufen = True
+            try:
+                self.htccl_broadcast(None, puffer, src)
+                torch.cuda.synchronize(self.device)
+            except Exception as ex:            # noqa: BLE001 -- Grund ins Protokoll
+                logger.warning(
+                    "HTCCL-BAR1: broadcast-Byte-Beleg (src=%d, %d Byte) nicht "
+                    "durchfuehrbar: %r", src, n, ex,
+                )
+                ok_lokal = False
+                gelaufen = False
+            if not gelaufen:
+                continue
+            rueck = puffer.cpu()
+            schlecht = int((rueck != soll).sum().item())
+            if schlecht:
+                ok_lokal = False
+                logger.warning(
+                    "HTCCL-BAR1: broadcast-Byte-Beleg %d->%d GEFALLEN: %d von "
+                    "%d Byte falsch (%d Runden). broadcast meldet sich ab.",
+                    src, r, schlecht, n, len(bc_plan(n, schlitz)),
+                )
+            else:
+                logger.info(
+                    "HTCCL-BAR1: broadcast-Byte-Beleg %d->%d bestanden: 0 von "
+                    "%d Byte falsch (%d Runden).",
+                    src, r, n, len(bc_plan(n, schlitz)),
+                )
+
+        traeger: list[object] = [None] * R
+        dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
+        self._bc_beleg = all(bool(x) for x in traeger)
+        if not self._bc_beleg:
+            logger.warning(
+                "HTCCL-BAR1: broadcast-Byte-Beleg gruppenweit gefallen "
+                "(Raenge %s). handles('broadcast') gibt False; all_reduce, "
+                "all_to_all und all_gather bleiben unberuehrt.",
+                [i for i, x in enumerate(traeger) if not x],
+            )
+        return self._bc_beleg
+
     # -- all_to_all --------------------------------------------------------
 
     def _handles_a2a(self, nbytes: int) -> bool:
@@ -2674,7 +3007,8 @@ class HTCCLBar1Transport:
 
     def htccl_all_to_all_single(self, comm, output, inp,
                                 sende_bytes, empfangs_bytes,
-                                sende_versatz=None, empfangs_versatz=None):
+                                sende_versatz=None, empfangs_versatz=None,
+                                kern_last=None):
         """``all_to_all_single`` ueber den Direktpfad. Ein Schritt, eine Sperre.
 
         ``sende_bytes[j]`` ist der Block, der an Rang ``j`` geht,
@@ -2695,6 +3029,17 @@ class HTCCLBar1Transport:
         kennt beide Faelle schon -- er bekommt Versaetze und Laengen getrennt
         herein und hat nie angenommen, dass sie zusammenhaengen; nur diese
         Naht hat die Versaetze bisher selbst gerechnet.
+
+        ``kern_last`` ist die Bytezahl, nach der die Kernvariante
+        (gitter/1blk) gewaehlt wird. ``None`` heisst: das, was dieser Rang
+        wirklich ueber die Apertur schickt -- richtig fuer jede Tabelle, in
+        der alle Raenge aehnlich viel bewegen. Ein broadcast ist genau das
+        nicht: dort sendet EIN Rang alles und alle anderen nichts, und eine
+        aus der eigenen Zeile gerechnete Wahl fiele je Rang anders aus.
+        Korrektheit haengt nicht daran (beide Varianten fahren dasselbe
+        Flaggenprotokoll), die Vergleichbarkeit von Messwerten und die
+        Rangeinheitlichkeit der Aufzeichnung schon. Der Aufrufer reicht
+        deshalb einen gruppenweit gleichen Wert herein.
 
         Der Aufrufer haftet dafuer, dass ``empfangs_bytes[i]`` auf diesem
         Rang gleich ``sende_bytes[rang]`` auf Rang ``i`` ist. Die Erweiterung
@@ -2747,7 +3092,12 @@ class HTCCLBar1Transport:
         # wie bei all_reduce -- gemessen ist sie DORT und nur dort; hier ist
         # sie uebernommen, nicht bestaetigt. Massgeblich ist, was wirklich
         # ueber PCIe geht, also ohne den eigenen Block.
-        bewegt = sum(int(n) for j, n in enumerate(sende_bytes) if j != self.rank)
+        if kern_last is None:
+            bewegt = sum(
+                int(n) for j, n in enumerate(sende_bytes) if j != self.rank
+            )
+        else:
+            bewegt = int(kern_last)
         kern = self._kern(bewegt, self.gitter_ab, "all_to_all_single")
 
         peer_nutz = [0] * R
@@ -2944,29 +3294,30 @@ class HTCCLBar1Transport:
 
         ``*args`` ist kein Bequemlichkeitszeichen: die Nahtstellen rufen mit
         verschiedenen Signaturen (``htccl_reduce_scatter(comm, inp, dim)``,
-        ``htccl_broadcast(comm, tensor, src)``). Mit dem frueheren festen
-        ``(self, comm, inp)`` kam bei beiden ein ``TypeError`` heraus, bevor
-        diese Meldung ueberhaupt zum Zug kam -- der Text war also unerreichbar
-        und die Ursache stand nirgends.
+        frueher auch ``htccl_broadcast(comm, tensor, src)``). Mit dem
+        frueheren festen ``(self, comm, inp)`` kam bei beiden ein
+        ``TypeError`` heraus, bevor diese Meldung ueberhaupt zum Zug kam --
+        der Text war also unerreichbar und die Ursache stand nirgends.
         """
         raise NotImplementedError(
             f"Der BAR1-Transport deckt {', '.join(sorted(self.HTCCL_OPS))} "
-            f"ab. reduce_scatter braucht eine Reduktion (der a2a-Kern bewegt "
-            f"Bytes und traegt deshalb all_gather gratis, reduce_scatter gar "
-            f"nicht), broadcast ist an dieser Naht an Ort und die Erweiterung "
-            f"lehnt in==out ab. Erreichbar ist diese Zeile nur, wenn jemand "
-            f"handles() umgangen hat."
+            f"ab. reduce_scatter braucht eine Reduktion, und der a2a-Kern "
+            f"bewegt Bytes: er traegt all_gather und broadcast gratis, "
+            f"reduce_scatter gar nicht. Erreichbar ist diese Zeile nur, wenn "
+            f"jemand handles() umgangen hat."
         )
 
-    # all_gather ist NICHT mehr hier. Die Zuweisung stand bis zur Einfuehrung
-    # von htccl_all_gather in dieser Liste und haette die neue Methode
-    # ueberschrieben -- eine Zuweisung im Klassenkoerper gewinnt gegen ein
-    # weiter oben stehendes `def` desselben Namens, lautlos. Ruff (F811) hat
-    # es gefunden; ohne den Lauf haette jedes all_gather ein
+    # all_gather und broadcast sind NICHT mehr hier. Beide Zuweisungen
+    # standen bis zur Einfuehrung von htccl_all_gather bzw. htccl_broadcast
+    # in dieser Liste und haetten die neue Methode ueberschrieben -- eine
+    # Zuweisung im Klassenkoerper gewinnt gegen ein weiter oben stehendes
+    # `def` desselben Namens, lautlos. Ruff (F811) hat es beim all_gather
+    # gefunden; ohne den Lauf haette jedes all_gather ein
     # NotImplementedError geworfen, obwohl handles() zugesagt hatte, und der
-    # Riegel haette wie ein Transportfehler ausgesehen.
+    # Riegel haette wie ein Transportfehler ausgesehen. Beim broadcast war
+    # dieselbe Falle vorbereitet und wird von test_htccl_bar1_broadcast.py
+    # jetzt zusaetzlich festgenagelt.
     htccl_reduce_scatter = _kein_kollektiv
-    htccl_broadcast = _kein_kollektiv
 
     # -- Abbau -------------------------------------------------------------
 
@@ -3124,6 +3475,20 @@ def baue_bar1(cpu_group, device, fenster_bytes: int,
                 "HTCCL-BAR1: a2a-Byte-Beleg nicht durchfuehrbar -- %r. "
                 "all_to_all meldet sich ab, all_reduce laeuft weiter.", e,
             )
+        # Und noch einmal fuer broadcast: derselbe Kern, aber eine andere
+        # Tabelle (genau ein Sender, Empfangsversatz ist nicht die
+        # Praefixsumme), also ein eigener Beleg. Er laeuft NUR, wenn der
+        # a2a-Beleg steht -- ohne den ist ohnehin alles zu. Faellt er,
+        # bleiben all_reduce, all_to_all und all_gather verfuegbar.
+        if t._a2a_beleg:
+            try:
+                t.byte_beleg_broadcast()
+            except Exception as e:
+                logger.info(
+                    "HTCCL-BAR1: broadcast-Byte-Beleg nicht durchfuehrbar "
+                    "-- %r. broadcast meldet sich ab, der Rest laeuft "
+                    "weiter.", e,
+                )
         # Und derselbe Grundsatz noch einmal fuer netz_pipe: eigener Kern,
         # eigene Schlitze, eigene Zaehlerzeilen, also eigener Beleg -- und
         # zwar einer ueber MEHRERE Runden, weil die Schlitz-Wiederverwendung
