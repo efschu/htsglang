@@ -90,7 +90,7 @@ Everything else, ordered by how much a rig of identical GPUs (1/2/4/8 cards) gai
 | [5](#f5) | Cross-algorithm drafter routing | WIP | no | no | no | no |
 | [6](#f6) | CUDA graph memory aliasing for spec branches | Boot-checked | partial | partial | no | no |
 | [7](#f7) | MoE expert offload + asymmetric TP/DCP | Boot-checked | partial | partial | partial | partial |
-| [28](#f28) | GPU-to-GPU collectives over small PCIe BARs | Exp, WIP* | no | no | no | no |
+| [28](#f28) | GPU-to-GPU collectives over small PCIe BARs | Exp, Boot-checked* | no | no | no | no |
 | [9](#f9) | Hibernate checkpoint/restore | Boot-checked | no | partial | partial | partial |
 | [20](#f20) | Session KV spill | Exp, Boot-checked | partial | partial | partial | partial |
 | [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
@@ -1239,23 +1239,25 @@ fork's delta on top of it. llama.cpp/ik_llama.cpp have no PD disaggregation.
 its neighbour's memory** across the PCIe BAR, with no bounce through system RAM and no
 RDMA NIC. Resizable-BAR machines can do this through CUDA P2P; the delta here is that it
 also works on cards whose BAR1 aperture is 256 MiB, which is every GeForce in this rig.
-**Exp / WIP** — the mechanism and the transport are measured, the serving-level effect is
-not, and it needs an out-of-tree driver patch to run at all. Branch
-`feat/bar1-integration`.
+**Exp, Boot-checked** — the transport now runs end to end on hardware with a real model
+(s00-s12 battery, `docs/dev/INTEGRATION_R3_VALIDATION.md`, "BAR1-Batterie 2026-07-30"),
+and still needs an out-of-tree driver patch to run at all. Branch `feat/bar1-integration`.
 
 | Item | Detail |
 |---|---|
 | Mechanism | dma-buf export (`NV_ESC_EXPORT_TO_DMABUF_FD`) plus a small GPL kernel module (`dmabuf_holder`) that holds the buffer so the BAR1 mapping exists. `cuMemGetHandleForAddressRange` fails on GeForce and a static BAR1 window is useless — allocations are physically scattered. 96 MiB maps contiguously out of 256 MiB gross |
 | Byte proof first, numbers second | all six directed pairs, `bad_bytes = 0` over 1.1 M verified rounds, read back through the **target card's own** pointer rather than the write path, so a broken path cannot hide its own error. A pair the driver reported as peer-capable delivered 4096 of 1 048 576 bytes; the byte proof struck the edge and `handles()` says no for it |
 | Transport measured | HTCCL, bf16, three cards, interleaved against NCCL in the same run: **1.13x / 1.34x / 1.15x / 1.04x / 1.30x** at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB. An independently built standalone probe (no sglang) agrees: 1.48 / 1.45 / 1.13 / 1.04 / 1.27. Two separately built paths, one answer |
-| End to end: **OPEN** | not a pending measurement, a blocked one. The standard run aborted in CUDA graph capture on an `all_gather` the transport did not cover; that gap is now closed (`HTCCL_OPS`, `ag_plan`, multi-round over the a2a kernel), but nothing has run on a card since. Every serving number for this row is therefore absent, not small |
-| What is only computed | Amdahl on the measured collective share: prefill 1190 → ~1400 tok/s, decode bs=16 454 → ~492, bs=1 88.2 → ~92. Stated as arithmetic, not as a result |
-| The question this row exists to answer | prefill is **64.6-67.7 %** collective-bound (minimum over ranks; the 5090's 90 % is mostly waiting for the 3080s), and its throughput is **flat** across 1/4/8/16 sessions: 1190/1097/1144/1105/1122 tok/s. The host detour saturates at one session. If the direct path keeps that curve flat the gain is a percentage; if the curve starts to rise, the ceiling itself was the detour. The second is what real NVIDIA P2P does, and it is the acceptance criterion — a change that raises the decode gain and lowers the prefill gain is wrong here even if the sum improves |
+| `all_gather` and `broadcast` | added over the s00-s12 window (`HTCCL_OPS`, `ag_plan`, multi-round over the a2a kernel; broadcast tiny-value floors `bc_min_bytes`/`ag_min_bytes` lowered 16 -> 1). This closed the CUDA-graph-capture gap that previously blocked every serving-level run; `reduce_scatter` remains behind the transport gate, unmeasured |
+| End to end: **transport accepted** | s11 of the battery: green across all process-group shapes exercised, CUDA-graph gate 7/7 (`benchmark/bar1_graph_check.py`, container and bare host). This is the gate that used to fail on `all_gather`; it is the reason serving-level numbers exist at all now |
+| Serving-level result (s12, single boot, verified A/B) | solo prefill **+14.3 %** (1469.0 vs 1285.6 tok/s at 1 session); decode **+3-4 %** (bs=1 ~32.6-33.2 vs ~31.5-31.9 tok/s; bs=16 ~166.5-168.9 vs ~161.7-162.6 tok/s). Real, not Amdahl arithmetic |
+| Multi-session ceiling: **answered, does not rise** | prefill ratio bar1/baseline across 1/4/8/16 sessions: 1.143 / 1.031 / 0.997 / 1.009. The size-profile hypothesis predicted recovery at 8/16 sessions and is refuted by the measurement; the gain is concentrated at 1 session and compresses toward noise as concurrency rises. This is the acceptance criterion from the previous row, and the answer is that the ceiling itself was not the detour — a contention hypothesis now leads, tracked as task #293 (open) |
 | Driver dependency, named | a patch to NVIDIA's **open** kernel modules (MIT/GPLv2), 2 files in the minimal form, activated by an own registry key `RMSmallBarP2PPeerBar1`. It lives in the private repository `efschu/nvidia-smallbar-p2p`, **not** in this fork; the fork only takes the header tree path via `SGLANG_HTCCL_BAR1_NV_QUELLE` for the JIT build. Without the patch the transport refuses at construction and the run falls back to its configured alternative. NCCL is unaffected by the patch — four configurations, all inside the measurement spread |
 | CUDA graphs | released by `SGLANG_HTCCL_GRAPH_FREIGABE=1`, gated on `benchmark/bar1_graph_check.py` (5/5 cases, container and bare host). Cooperative launches **are** capturable — the opposite assumption was wrong. The pipelined direct mode is **not**: its host-side ring index gets baked per graph, and with the default ring of 2 the first and third graph would share a BAR1 slot. It is off under capture, loudly |
 | Not pursued, with reasons | the fork's own **host** transport as an optimisation (NCCL wins 4 of 5 sizes; the earlier "5.1x" was a ping-pong artefact with an 8-byte return leg — it stays as a fallback for unpatched machines, not as a gain); **striping** direct and host traffic for the same transfer (measured, refuted: pure direct wins at every size); `all_to_all` at the HTCCL seam for MoE (the dispatchers bypass it entirely — that is what `bar1ep.py` is for, and it is unmeasured) |
 | Honest weak spot | on the fast x8 pair (2 cards) the transport **loses** between 1 and 8 MiB, down to 0.81x. On the x4 pair and at three cards it wins everywhere. Pattern: the faster the edge, the worse the standing. Three causes are identified; one of them (a local-memory spill in the net kernel, STACK 64 B against the ring kernel's 0) is fixed on this branch and verified offline with `nvcc -cubin` + `cuobjdump -res-usage` — STACK 0, one register fewer, no other kernel touched. Whether that is faster on the card is unmeasured |
 | Opt-in | nothing changes without `SGLANG_HTCCL*`. Pinned by `test_bar1_strand_is_opt_in.py`: the transport modules are not imported by the distributed stack or the MoE package, the new MoE backend member moves no existing predicate, `_select` without a transport is `None` for every op, and every new knob carries the `SGLANG_HTCCL` prefix so unsetting that prefix is the complete off switch |
+| Direct-mode GPU phase | CPU-side phase complete and validated (`benchmark/bar1_graph_check.py` 5/5 above), not yet merged onto this branch. Sits on `feat/bar1-direct-graph` (`24b9f5547a`), which needs a rebase before merge (task #292, open) |
 
 **Upstream:** neither sglang nor vLLM has a direct GPU-to-GPU collective plane for cards
 without Resizable-BAR P2P; both use NCCL, which on this topology falls back to host

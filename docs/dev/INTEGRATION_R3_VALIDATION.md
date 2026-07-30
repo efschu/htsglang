@@ -10078,3 +10078,95 @@ bestandener Smoke und kein unter-provisionierter.
 | `test_gpu_battery_checks_bar1.py` | 122 passed (+10) |
 | `test/registered/unit/distributed/` | 16 failed / 1186 passed / 8 skipped |
 | auf `3413e0306b` | 16 failed / 1154 passed / 8 skipped -- dieselben 16 |
+
+## BAR1-Batterie 2026-07-30 — Ergebnisse (s00-s12)
+
+Abschluss des gesamten Fensters s00-s12 in einem Lauf, ohne offene Schritte.
+Statustabelle, dann das s12-Kernergebnis, dann das Befunde-Register des
+Fensters, dann die verbliebenen offenen Posten.
+
+| Schritt | Status | Anmerkung |
+|---|---|---|
+| s00 | PASS#1 | — |
+| s01 | PASS#3 | Check-Schema-Drift `pairs`/`directed_pairs` gefixt |
+| s02 | PASS#1 | R7c-Lane-Frage beantwortet: Accept-Saettigung war vehikelgebunden, FP8 zeigt 1,07x/1,21x + gesunde Positionskurven |
+| s03 | FAIL#1 | echter Vehikel-Befund Task #289: AWQ-Marlin 9504 nicht durch 64 teilbar |
+| s04 | FAIL#4 | Anlauf 1-3 Rezept-/Fork-Bugs (`load_card_order`-Pipe, Draft-Pfad Datei-vs-Verzeichnis, dflash-draft-sibling-config); Anlauf 4 echter Befund Task #290: Q8-GGUF-DFLASH-Drafter Accept-Kollaps 1,00/0,00 beim Erstboot |
+| s05 | PASS#1 | Reseed-Daten, squares accept_len 1,59 ueber 120 Runden |
+| s06 | PASS#2 | Anlauf 1 Hang: beide Raenge sahen beide Karten, barrier baute einen 2-Karten-Kommunikator; NCCL-Referenz: 5090-3080b 184 us @ 1 MiB, 5,7 GB/s; x4-3080-Paare 330 us, 3,2 GB/s; SHM |
+| s07 | PASS#2 | Register-Raten: tensor-Route ~14,4 GB/s wave-in, park p50 33 ms @ 256 MiB; Sonden-Fix ueber explizite Policy |
+| s08 | PASS#1 | — |
+| s09 | PASS#1 | — |
+| s10 | PASS#1 | Treiber verify-only |
+| s11 | PASS#7 | — |
+| s12 | STOP#1 | Reproduktionstor, Daten vollstaendig |
+
+### Die Deckenfrage ist beantwortet
+
+| Sessions | bar1 (tok/s) | Grundlinie (tok/s) | Verhaeltnis |
+|---|---|---|---|
+| 1 | 1469,0 | 1285,6 | 1,143 |
+| 4 | 1193,6 | 1158,2 | 1,031 |
+| 8 | 1141,2 | 1144,7 | 0,997 |
+| 16 | 1141,7 | 1131,9 | 1,009 |
+
+Decode, gleicher Lauf: bar1 bs1 ~32,6-33,2 tok/s gegen Grundlinie
+~31,5-31,9 tok/s; bar1 bs16 ~166,5-168,9 tok/s gegen Grundlinie
+~161,7-162,6 tok/s, das sind +3-4 %.
+
+Die Decke steigt nicht. Der Gewinn ist bei einer Session konzentriert
+(+14,3 %) und faellt mit steigender Session-Zahl auf die Groessenordnung
+des Rauschens (0,997-1,031). Das ist keine Enttaeuschung, sondern die
+Antwort auf genau die Frage, fuer die dieser Schritt gebaut wurde: ein
+Direktpfad, der wirklich die Serving-Decke anhebt, muesste bei mehr
+gleichzeitigen Sessions eher staerker als schwaecher werden (mehr
+Kollektive im Flug, mehr Gelegenheit, den Host-Umweg zu sparen);
+gemessen ist das Gegenteil.
+
+Das Falsifikationsprotokoll war ehrlich in beide Richtungen: die
+Groessenprofil-Hypothese sagte eine Erholung des Verhaeltnisses bei 8 und
+16 Sessions voraus (groessere, batchierbare Kollektive sollten den
+Direktpfad wieder staerker machen) und ist an den gemessenen 0,997 / 1,009
+gefallen. Die Kontentions-Hypothese fuehrt jetzt: der Gewinn bei 1 Session
+verschwindet, sobald mehrere Raenge um denselben BAR1-Pfad konkurrieren.
+Task #293 nimmt das auf, erster Schritt ist eine Compute/Wait-Analyse aus
+den bereits vorliegenden s12-Logs, keine neue Messung.
+
+Reproduktions-Nebenbefund: die Grundlinie dieses Laufs liegt ca. 8 % ueber
+der Grundlinie der Uebergabe-Referenz. Das ist Umgebungsdrift, keine
+Messabweichung — der verschraenkte A/B-Vergleich innerhalb dieses Laufs
+bleibt gueltig, aber dieser Lauf ersetzt die alte Absolutreferenz, nicht
+umgekehrt.
+
+### Befunde-Register des Fensters
+
+- Temp-0-Trajektorien kippen unter bar1 anders als unter dem Host-Pfad;
+  bar1-Ergebnisse nur gegen bar1-Referenzen byte-vergleichen, nie gegen
+  Host-Referenzen.
+- broadcast + tiny-Floors: `bc_min_bytes`/`ag_min_bytes` 16 -> 1; die
+  F811-Falle beim Refactor war real, nicht nur ein Linter-Verdacht.
+- Der s11-Check las nur `htccl_lines.txt` und uebersah damit, was
+  daneben lag.
+- Zombie-Server entstand durch stdout-Salat in `bar1_boot_start` (Ursache
+  identisch zur s04-Wurzel, hier am Boot-Skript selbst statt am Verbraucher).
+- pgrep-Selbsttreffer: das Bracket-Idiom (`[b]ar1` statt `bar1`) ist noetig,
+  sonst findet der Check-Prozess sich selbst.
+- Stale `blocked.txt` konnte einen Lauf faelschlich als blockiert melden,
+  obwohl der vorherige Blocker laengst weg war.
+- Der Smoke-Check misst jetzt Intaktheit statt Gehorsam (siehe Anlauf-4-
+  Abschnitt oben) — gilt fensteruebergreifend, nicht nur fuer bar1.
+- `meta_info` ist opt-in auf dem Chat-Endpoint, nicht auf dem Completions-
+  Endpoint gesetzt; das ist Endpoint-Semantik, kein Fork-Bug.
+
+### Offene Posten
+
+- **#293** Nebenlaeufigkeits-Kompression des BAR1-Gewinns — PRIO, siehe
+  oben.
+- **#292** Direktmodus GPU-Phase + Merge: `feat/bar1-direct-graph`
+  (`24b9f5547a`) muss rebast werden.
+- **#289 / #290** Vehikel-Bugs aus s03/s04 (AWQ-Marlin-Padding,
+  Q8-GGUF-DFLASH-Erstboot-Kollaps) — eigene Tasks, unabhaengig von BAR1.
+- `reduce_scatter` bleibt weiter hinter der Sperre.
+- `htccl_matrix_transport.HTCCL_OPS`-Luecke: `all_gather` fehlt dort;
+  vorbestehend, nicht durch dieses Fenster eingefuehrt.
+- sm120-Gitter REG 40 -> 48 noch zu messen.
