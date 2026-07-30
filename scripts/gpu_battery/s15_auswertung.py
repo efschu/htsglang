@@ -52,7 +52,12 @@ ARM_LABEL = {
 }
 
 RE_MLP_UNITS = re.compile(r"materialized MLP units \[([0-9,\s]+)\]")
-RE_MAXTOK = re.compile(r"global max_total_num_tokens (\d+)")
+# Two spellings, and the authoritative one is the scheduler's own final
+# report `max_total_num_tokens=N`. The weighted-DCP sizing line spells it
+# `global max_total_num_tokens N` and is absent on a uniform KV vector
+# (arm 4), which is why matching only that form left arm 4 without a capacity.
+RE_MAXTOK = re.compile(r"max_total_num_tokens=(\d+)")
+RE_MAXTOK_DCP = re.compile(r"global max_total_num_tokens (\d+)")
 RE_PINNED = re.compile(r"MLP vector PINNED \(([^)]*)\)")
 
 
@@ -92,7 +97,7 @@ def load_proof(step_dir: str, arm: str) -> dict:
     m = RE_PINNED.search(text)
     if m:
         info["pinned"] = m.group(1)
-    tok = RE_MAXTOK.findall(text)
+    tok = RE_MAXTOK.findall(text) or RE_MAXTOK_DCP.findall(text)
     if tok:
         info["max_total_num_tokens"] = max(int(t) for t in tok)
     info["htccl_groups"] = text.count("HTCCL enabled for group")
