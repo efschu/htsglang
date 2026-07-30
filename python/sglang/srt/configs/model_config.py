@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
+    check_gguf_file,
     get_config,
     get_context_length,
     get_generation_config,
@@ -566,6 +567,24 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        if is_draft_model and quantization is None:
+            # A drafter shipped as a .gguf FILE must be BUILT quantized, or the
+            # GGUF loader (selected by the shared load_format) streams
+            # `*.qweight` / `*.qweight_type` names into a model whose skeleton
+            # only has dense `*.weight` parameters. Nothing raises: the names
+            # simply resolve to nothing and the drafter keeps its uninitialized
+            # weights, which reads as a total accept collapse rather than a
+            # load error (#290: 36 of 58 tensors dropped, accept 1.005).
+            #
+            # The target gets this exact rule from
+            # `arg_groups/overrides._gguf_quantization`; it keys on
+            # `model_path`, which is the TARGET's, so a GGUF drafter beside a
+            # non-GGUF target was never covered either. A drafter that is not a
+            # GGUF file is untouched, so the validated GGUF-target/dense-drafter
+            # combination keeps its exact behaviour.
+            draft_path = model_path or server_args.speculative_draft_model_path
+            if draft_path is not None and check_gguf_file(draft_path):
+                quantization = "gguf"
         override_config_file = (
             server_args.decrypted_draft_config_file
             if is_draft_model
