@@ -44,20 +44,21 @@ source ./common.sh
 MODEL="$MODEL_ROOT/Huihui-Qwen3.6-27B-abliterated-AWQ-MTP"
 PORT="${PORT:-30078}"
 TOKENS="${TOKENS:-192}"
-LOG=/tmp/r7c-boot-b.server.log
-OUT=/tmp/r7c-boot-b
+LOG="${LOG:-/tmp/r7c-boot-b.server.log}"
+OUT="${OUT:-/tmp/r7c-boot-b}"
 mkdir -p "$OUT"
 
 assert_cards_free || exit 1
-load_card_order | tee "$OUT/cards.txt"
+load_card_order "$OUT/cards.txt" || exit 1
 claim_cards "274-r7c-boot-b-dense-head"
 trap 'stop_vram_sampler; release_cards "boot B abgebrochen"; exit 1' INT TERM
 
 start_vram_sampler "$OUT/vram.csv"
 export SGLANG_ACCEPT_POSITION_PROBE=1
 
-cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+cd "$WT" || exit 1
+launch_server "$LOG" /tmp/r7c-boot-b.pid \
+  "$VENV/bin/python" -m sglang.launch_server \
   --model-path "$MODEL" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
   --rank-auto-reserve-mib 3000,2700,2700 \
@@ -66,9 +67,14 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --enable-metrics \
-  --host 127.0.0.1 --port "$PORT" \
-  > "$LOG" 2>&1 &
-echo $! > /tmp/r7c-boot-b.pid
+  --host 127.0.0.1 --port "$PORT"
+
+if dry_run; then
+  stop_vram_sampler
+  release_cards "boot B dry run"
+  echo "DRY RUN ok: boot B"
+  exit 0
+fi
 
 if ! wait_for_server "$PORT" 1800; then
   echo "--- letzte 40 Zeilen Serverlog (nur bei Abbruch) ---" >&2

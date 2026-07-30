@@ -63,15 +63,17 @@ TARGET="$TARGET_DIR/Qwen3.6-27B-Q3_K_M.gguf"
 DRAFT="$MODEL_ROOT/qwen3.6-27b-dflash-gguf"
 PORT="${PORT:-30079}"
 CTX="${CTX:-16384}"
-LOG=/tmp/r7c-boot-c.server.log
-OUT=/tmp/r7c-boot-c
+LOG="${LOG:-/tmp/r7c-boot-c.server.log}"
+OUT="${OUT:-/tmp/r7c-boot-c}"
 mkdir -p "$OUT"
 
-[ -f "$DRAFT/config.json" ] || { echo "ABBRUCH: $DRAFT/config.json fehlt" >&2; exit 1; }
-[ -f "$DRAFT/Qwen3.6-27B-DFlash-Q8_0.gguf" ] || { echo "ABBRUCH: Q8_0-GGUF fehlt" >&2; exit 1; }
+require_file "$DRAFT/config.json" "$DRAFT/config.json fehlt" || exit 1
+require_file "$DRAFT/Qwen3.6-27B-DFlash-Q8_0.gguf" "Q8_0-GGUF fehlt" || exit 1
 
 assert_cards_free || exit 1
-load_card_order | tee "$OUT/cards.txt"
+# Argument, not a pipe: `load_card_order | tee` would set CUDA_BIG/CUDA_SMALL
+# in a pipeline subshell and leave them unbound at line 77 below.
+load_card_order "$OUT/cards.txt" || exit 1
 
 # Host the drafter on the first 3080 unless told otherwise.
 DRAFT_GPU="${DRAFT_GPU:-${CUDA_SMALL%%,*}}"
@@ -94,8 +96,9 @@ trap 'stop_vram_sampler; release_cards "boot C abgebrochen"; exit 1' INT TERM
 start_vram_sampler "$OUT/vram.csv"
 export SGLANG_ACCEPT_POSITION_PROBE=1
 
-cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+cd "$WT" || exit 1
+launch_server "$LOG" /tmp/r7c-boot-c.pid \
+  "$VENV/bin/python" -m sglang.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
@@ -108,9 +111,14 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --speculative-draft-placement solo \
   --speculative-draft-gpu "$DRAFT_GPU" \
   --enable-metrics \
-  --host 127.0.0.1 --port "$PORT" \
-  > "$LOG" 2>&1 &
-echo $! > /tmp/r7c-boot-c.pid
+  --host 127.0.0.1 --port "$PORT"
+
+if dry_run; then
+  stop_vram_sampler
+  release_cards "boot C dry run"
+  echo "DRY RUN ok: boot C"
+  exit 0
+fi
 
 if ! wait_for_server "$PORT" 1800; then
   echo "--- letzte 60 Zeilen Serverlog (nur bei Abbruch) ---" >&2
