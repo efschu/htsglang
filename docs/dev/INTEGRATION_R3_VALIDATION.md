@@ -10824,3 +10824,283 @@ gezaehlt: keine neue.
 **Kein Spill-Beleg faellig** -- `htccl_bar1_ext.py` ist nicht angefasst
 (`git diff --quiet` darauf), es gibt keinen neuen Kernel und keine geaenderte
 Kernquelle. Die Aenderung liegt vollstaendig in der Naht.
+
+## #293 Schritt 2: Hebel-Messung gegen die Prefill-Decke (2026-07-30)
+
+Schritt 1 hat die Decke vermessen und die naheliegenden Ursachen
+ausgeschlossen: Kollektivgroesse konstant 20 MiB, Rundenzahl konstant 1, beide
+Transporte ab vier Sessions auf demselben absoluten Niveau, ueber 96 % des
+Zuwachses in `wait`. Was er nicht sagen konnte, war, WAS die Decke ist. Der
+Lauf, aus dem seine Zahlen stammen, fuhr ohne Pipe, ohne Direktmodus und ohne
+Prefill-Graphen -- drei Hebel, die nie gemessen wurden.
+
+Werkzeug: `scripts/gpu_battery/s13_hebel_messung.sh` (ein Boot je Arm, Arme
+unterscheiden sich in genau den Variablen und Argumenten, die den Hebel
+benennen), Auswertung `scripts/gpu_battery/s13_auswertung.py`, Artefakte unter
+`/spinning/gpu-battery-results/2026-07-30_hebel/`. Zwei Punkte je Boot
+(sessions=1 zuerst, sessions=8 zuletzt -- `s12_log_analyse` nimmt die letzten N
+Grossbatches als Fenster, also bekommt der Primaerpunkt es). Zwei Runden ueber
+die ganze Armliste in gleicher Reihenfolge; die Wiederholung IST der
+Rauschboden.
+
+### Phase A: der Direktmodus ist auf der Karte belegt
+
+Nach `scripts/probe/direktmodus_gpu_phase.md`, alles auf dem PVE-Host.
+
+* **Treiber**: `RegistryDwords: "RMSmallBarP2PPeerBar1=1"`, `/dev/dmabuf_holder`
+  vorhanden, `dmabuf_holder` geladen. Kein Serientreiber.
+* **Neun Gate-Faelle, alle bestanden**, einschliesslich der beiden neuen aus
+  #292: `pipe-direkt` (Ergebnistensor nachweislich im BAR1-Fenster, ueber den
+  Host zurueckgelesen statt ueber den nicht kohaerenten L2) und
+  `pipe-direkt-vorrat-leer` (Negativkontrolle mit `ERG_RING=2`). Der Info-Fall
+  `gitter` ist ebenfalls bestanden -- der cooperative Start laesst sich auf
+  diesem Rig aufzeichnen. `grep -c Zeitlimit` = 0.
+* **Eager-Byte-Beleg mit Handschlag** (`PIPE=1 DIREKT=1 DIREKT_GRAPH=1
+  ERG_RING=5`): 6 von 6 Rangpaaren, 0 von 65536 Byte falsch, `Zeitlimit` = 0.
+  Die Flaggenfamilie 4 ist damit zum ersten Mal auf echter Hardware
+  beschrieben.
+* **Registerzahl am GEBAUTEN JIT-Objekt** (das `.so` wurde waehrend des
+  Gate-Laufs neu uebersetzt, 15:20:04 gegen cuda.cu 15:19:08 -- die
+  Cache-Stale-Falle greift nicht). Werkzeug ist `cuobjdump` aus dem
+  Triton-Toolchain der venv; das System-CUDA 12.2 des Hosts kennt `sm_120`
+  nicht und bricht mit "Support for 'sm_4' has been removed" ab.
+
+  | arch | ohne gitter | mit gitter | STACK |
+  |---|---:|---:|---:|
+  | sm_86 | REG 40 | REG 42-44 | 0 |
+  | sm_120 | REG 40 | **REG 48** | 0 |
+
+  Die offline gemessenen 40 -> 48 bestaetigen sich am echten Objekt, kein Spill.
+
+**Verdikt Phase A: gruen.**
+
+### Rauschboden
+
+Punktabhaengig und punktweise angesetzt: **1,15 % bei acht Sessions, 4,20 %
+bei einer**. Der Primaerpunkt ist der engere, was zu erwarten ist -- acht
+Sessions messen eine gesaettigte Pipeline, eine Session eine Latenzkette mit
+einem einzigen Speiser. Enge Einzelwerte am Primaerpunkt: `bar1` 0,24 %,
+`bar1_hi` 0,30 %, `bar1pipe` 0,62 %, `bar1pg_hi` 0,79 %, `nccl` 0,83 %.
+
+### Die Haupttabelle
+
+| Arm | Hebel | tok/s (s=1) | vs. nccl | tok/s (s=8) | vs. nccl |
+|---|---|---:|---:|---:|---:|
+| `nccl` | Referenzanker | 1279,9 | 1,000 | 1140,1 | 1,000 |
+| `bar1` | Reproduktionsanker | 1493,9 | 1,167 | **1299,9** | **1,140** |
+| `bar1pipe` | `PIPE=1` (`DIREKT=0`) | 1399,0 | 1,093 | 1202,1 | 1,054 |
+| `bar1direkt` | `PIPE=1 DIREKT_GRAPH=1 ERG_RING=5` | bootet nicht | -- | bootet nicht | -- |
+| `bar1cp4096` | `--chunked-prefill-size 4096` | **1568,7** | **1,226** | OOM | -- |
+| `ncclpg` / `bar1pg` | Prefill-Graph, Reserve wie oben | bootet nicht | -- | bootet nicht | -- |
+
+Eigener Block mit eigener Reserve (`4500,4200,4200`) und eigenen Kontrollarmen,
+weil der Prefill-Graph aus der Reserve der uebrigen Arme nicht zu bezahlen ist:
+
+| Arm | Prefill-Graph | tok/s (s=1) | tok/s (s=8) | vs. nccl (s=8) |
+|---|---|---:|---:|---:|
+| `nccl_hi` | aus | 1301,5 | 1169,8 | 1,026 |
+| `ncclpg_hi` | **AN** | 1348,8 | 1144,2 | ~1,004 |
+| `bar1_hi` | aus | 1527,3 | 1334,5 | 1,171 |
+| `bar1pg_hi` | **AN** | 1321,6 | 1151,6 | ~1,010 |
+| `bar1pggitter_hi` | **AN** + gitter | **1576,0** | **1337,2** | **1,173** |
+
+### Befund 1 (Hauptbefund): der Reproduktionsanker reproduziert NICHT
+
+Schritt 1 mass bei acht Sessions ein Verhaeltnis bar1/Grundlinie von
+**0,997** -- beide Arme auf derselben Decke. Hier sind es **1,140**.
+
+Drift ist ausgeschlossen, und zwar am NCCL-Anker, der die Zahlen aus Schritt 1
+auf die dritte Stelle wiederholt:
+
+| | gpu-ms TP1 | wait TP1 | Durchsatz s=8 |
+|---|---:|---:|---:|
+| `nccl` Schritt 1 (s12) | 1781,7 | 1214,5 | ~1144 |
+| `nccl` hier (R1 / R2) | 1781,3 / 1787,8 | 1218,5 / 1218,2 | 1135,4 / 1144,8 |
+| `bar1` Schritt 1 (s12) | 1785,2 | 1220,1 | ~1141 |
+| `bar1` hier (R1 / R2) | **1548,6 / 1571,2** | **965,2 / 988,5** | 1301,4 / 1298,4 |
+
+Gleiche Kiste, gleiche Harness, gleicher Arbeitspunkt, gleicher Host-Pfad.
+Geaendert hat sich der BAR1-Arm, und der Gewinn sitzt vollstaendig in `wait`
+(1218 -> 977 ms, -20 %) bei unveraendertem `compute` auf allen drei Raengen --
+dieselbe Signatur, die Schritt 1 beim 1-Session-Punkt fand, jetzt auch unter
+Last.
+
+**Die gemeinsame Decke von 1147 tok/s ist keine gemeinsame mehr.** Sie gilt
+weiter fuer den Host-Pfad; der Direktpfad steht auf diesem Zweig bei
+1300 tok/s.
+
+Zwischen dem s12-Zweig und `f51d414959` liegt die Mehrrunden-Arbeit fuer
+`all_reduce`/`all_to_all` samt der generalisierten Ehrlichkeitsregel. Im
+BAR1-Arm dieses Laufs meldet `warum_nicht()` ueber alle Boots hinweg **keinen
+einzigen Rueckfall**, bei 9 von 9 `ERREICHT=bar1`. Auf dem s12-Zweig gab es
+diese Meldung noch nicht; ein stiller Rueckfall waere dort unsichtbar
+gewesen. Das ist ein Verdacht mit Beleg auf einer Seite und einer Luecke auf
+der anderen, **kein Beweis** -- ihn zu schliessen hiesse, den s12-Zweig mit der
+heutigen Ehrlichkeitsregel noch einmal zu fahren.
+
+### Befund 2: Chunk-Pipelining kostet 7,5 %, und zwar aus dem Fenster
+
+1202,1 gegen 1299,9 tok/s bei acht Sessions, **-7,5 %** gegen `bar1` (Boden
+1,15 %); `wait` auf TP1 steigt von 977 auf 1108 ms. Der Grund steht in der
+Aufbau-Zeile beider Arme:
+
+| Arm | Schlitz | groesste Nutzlast | Kipp-Punkt |
+|---|---:|---:|---:|
+| `bar1` | 8188 KiB | 24564 KiB | 2456 Token |
+| `bar1pipe` | **6140 KiB** | 18420 KiB | **1842 Token** |
+
+Der Ergebnisring der Pipe nimmt sich seinen Anteil am BAR1-Fenster, der
+Schlitz schrumpft um 25 %, der Kipp-Punkt faellt von 2456 auf 1842 Token --
+**unter den Arbeitspunkt von 2048**. Der 20-MiB-all_reduce, der ohne Pipe in
+einer Runde durchgeht, braucht mit Pipe zwei. Die Pipe bezahlt ihr Pipelining
+mit genau der Groesse, die sie pipelinen will. Auf DIESEM Arbeitspunkt ist das
+ein Verlustgeschaeft; ein groesseres BAR1-Fenster oder ein kleinerer
+Arbeitspunkt kann anders ausgehen -- das entscheidet diese Messung nicht.
+
+Der Decode zahlt mit: bs=16 faellt von 432,8 auf 381,1 tok/s (ms/Verify 6,47
+-> 7,99), bs=1 wird leicht besser (83,1 gegen 80,2).
+
+### Befund 3: der graphfeste Direktmodus bootet nicht, aus einem strukturellen Grund
+
+`bar1direkt` kommt in beiden Runden nicht hoch und stirbt reproduzierbar in
+der Decode-Graph-Aufzeichnung:
+
+    Bar1Unverfuegbar: Direkt-Modus: der Ergebnispuffer 1 von vor 2 Runden wird
+    noch gehalten. Ihn jetzt zu beschreiben, hiesse einen Tensor zu veraendern,
+    den der Aufrufer fuer fertig haelt.        htccl_bar1.py:2844, _erg_platz
+
+Dasselbe passiert mit dem blanken `SGLANG_HTCCL_BAR1_PIPE=1` (der Pipe-Arm
+faehrt deshalb `PIPE_DIREKT=0`). `ERG_RING` hilft nicht, und der Grund ist
+eine Konstante:
+
+    ERG_EAGER_PLAETZE = 2                      htccl_bar1_pipe_ext.py:259
+    erg_aufteilung(ring, graphfest) -> (ERG_EAGER_PLAETZE, ring - 2)
+
+Ein groesserer Ring vergibt ausschliesslich **Graph**-Plaetze; die eager-Zahl
+bleibt 2. Der Fehler faellt aber im Aufzeichnungs-WARMUP an, also eager.
+`ERG_RING=5` konnte nicht wirken, und `ERG_RING=50` wuerde es auch nicht.
+
+Der Widerspruch zu Phase A ist keiner: dort haelt der Direktmodus jeden
+Byte-Beleg. Was ihn im echten Modell bricht, ist das Aufrufmuster -- Qwen3.6
+haelt im MoE-`down_proj`-Pfad das Ergebnis eines all_reduce ueber mehr als
+zwei weitere all_reduce hinweg am Leben, und genau davor schuetzt der Ring. Er
+tut, was er soll; er ist zu klein fuer diesen Aufrufer. **Das ist der konkrete
+naechste Schritt fuer #292**: `ERG_EAGER_PLAETZE` beschreibt eine Eigenschaft
+des Aufrufers, nicht des Transports.
+
+### Befund 4: `chunked_prefill_size 4096` -- der Nebenbefund von Schritt 1 ist erledigt
+
+Schritt 1 warnte, `chunked_prefill_size > 2456` haette den BAR1-Pfad im
+Prefill **still** abgeschaltet. Auf diesem Zweig nicht mehr: der Arm faehrt
+Batches bis 4096 Token (41,9 MB Nutzlast gegen eine Einrunden-Decke von
+25,2 MB), also zwei Runden, bei 9 von 9 `ERREICHT=bar1` und **keiner einzigen
+Rueckfallmeldung**. Die laute Meldung bleibt aus, weil es nichts zu melden
+gibt.
+
+Bei einer Session ist es der schnellste Arm ausserhalb des pg-Blocks:
+**1568,7 tok/s, 1,226 gegen NCCL**, +5,0 % gegen `bar1` (Boden 4,20 % -- also
+knapp ueber der Grenze, nicht mehr).
+
+Bei acht Sessions gibt es keinen Punkt: beide Runden sterben im ersten echten
+Prefill an einem OOM (`GPU 0 ... 70,38 MiB is free`). Vorhergesagt hat das der
+Server selbst beim Booten -- die gepinnte Reserve `3000,2700,2700` stammt aus
+einem Rezept fuer `chunked_prefill_size=2048`, und der GDN-Prefill-Scratch
+skaliert mit dem Chunk (111 MiB je Layer bei 2048). Die Reserve wurde nicht
+angehoben, weil das den KV-Pool und damit den Vergleich aendert; der Punkt
+fehlt lieber, als dass er etwas anderes misst. **Unentschieden, nicht negativ.**
+
+### Befund 5: der Prefill-Graph -- aktivierbar, und er deckt den groessten Einzelposten auf
+
+**Aktivierbar ohne Codeaenderung.** Das Flag existiert
+(`--cuda-graph-backend-prefill {full,breakable,tc_piecewise,disabled}`,
+`server_args.py:2546`) und der CUDA-Vorgabewert ist bereits `breakable`
+(`cuda_graph_config.py:95`). Abgeschaltet wird er von einer Auto-Disable-Regel:
+
+    Breakable CUDA graph is incompatible with multimodal model;
+    disabling prefill CUDA graph.
+    ("multimodal model", lambda: self.get_model_config().is_multimodal)
+                                                   server_args.py:6613
+
+Qwen3.6-27B-FP8 zaehlt als multimodal, also faellt `prefill.backend` auf
+`disabled` -- in jedem Boot dieses Rezepts, auch in allen s12-Laeufen. Setzt
+man das Backend explizit, wird das Feld gesperrt und die ganze Kaskade
+uebersprungen (`server_args.py:6479`); `--cuda-graph-backend-prefill breakable`
+genuegt. Beleg, dass er dann laeuft: `Capture target prefill CUDA graph
+begin`/`end`, je dreimal, gegen 6x `Disable prefill CUDA graph` im
+Kontrollarm.
+
+**Aus der Reserve der uebrigen Arme nicht bezahlbar**: mit `3000,2700,2700`
+stirbt er in beiden Transporten und beiden Runden bei der Aufzeichnung selbst
+(`_create_prefill_wrappers`, OOM auf einer 20-GB-Karte). Daher der eigene
+Block mit `4500,4200,4200` und eigenen Kontrollarmen. Die Reserve selbst
+kostet wenig (`nccl_hi` 1169,8 gegen `nccl` 1140,1 bei acht Sessions).
+
+**Auf dem Host-Pfad**: -2,2 % bei acht Sessions, +3,6 % bei einer. Beides am
+Rand des jeweiligen Bodens, kein tragfaehiger Gewinn.
+
+**Auf dem Direktpfad sah er katastrophal aus**: 1334,5 -> 1151,6 tok/s,
+**-13,7 %**, exakt zurueck auf NCCL-Niveau. Der ganze BAR1-Vorsprung weg. Das
+Log nennt den Grund selbst:
+
+    ... wird aber waehrend einer CUDA-Graph-Aufzeichnung auf die 1blk-Variante
+    gelegt. Ob cudaLaunchCooperativeKernel sich aufzeichnen laesst, ist auf
+    diesem Rig NICHT gemessen
+
+Der Vorbehalt legt den gitter-Kern waehrend jeder Aufzeichnung auf die
+langsamere 1blk-Variante. Ohne Prefill-Graph trifft das nur den Decode; mit
+Prefill-Graph auch den Prefill -- und dort holt BAR1 seinen Vorsprung.
+
+Der Vorbehalt ist seit **Phase A dieses Laufs** gegenstandslos: der Gate-Fall
+`gitter` ist bestanden. Der Falsifikator dazu ist eindeutig:
+
+| | s=1 | s=8 |
+|---|---:|---:|
+| `bar1pg_hi` (Vorbehalt greift) | 1321,6 | 1151,6 |
+| `bar1pggitter_hi` (Vorbehalt aus) | 1576,0 | **1337,2** |
+| Gewinn | +19,3 % | **+16,1 %** |
+
+Der Vorsprung ist vollstaendig zurueck (1,173 gegen NCCL). Der Prefill-Graph
+selbst ist damit auf dem Direktpfad **neutral**, nicht positiv: 1337,2 gegen
+1334,5 ohne Graphen (+0,2 %, unter dem Boden von 1,15 %). Die 16,1 % sind der
+Preis des Vorbehalts, kein Gewinn des Graphen.
+
+**Damit ist die teuerste Einzelzeile dieses Laufs identifiziert und beziffert:
+16,1 % Prefill-Durchsatz, die ein nicht mehr zutreffender Vorbehalt liegen
+laesst, sobald irgendetwas den Prefill aufzeichnet.** Der Vorbehalt sitzt in
+`HTCCLBar1Transport._kern`. `bar1pggitter_hi` ist nur EIN Boot -- die
+16,1 % liegen weit ueber jedem Boden dieses Laufs, aber die Zahl selbst hat
+noch keine eigene A-gegen-A-Wiederholung.
+
+### Verdikt: welcher Hebel wie viel bringt
+
+Am Primaerpunkt (sessions=8), gemessen gegen `bar1`-Standard, Boden 1,15 %:
+
+| Hebel | Wirkung s=8 | Status |
+|---|---|---|
+| Chunk-Pipelining (`PIPE=1`) | **-7,5 %** | negativ, Ursache im Fenster-Budget benannt |
+| graphfester Direktmodus | -- | bootet nicht, Ursache `ERG_EAGER_PLAETZE=2` |
+| `chunked_prefill_size 4096` | -- | OOM am Punkt; bei s=1 +5,0 %; BAR1 bleibt tragend |
+| Prefill-Graph | ~0 (mit gitter) / -13,7 % (ohne) | neutral, deckt aber den gitter-Posten auf |
+| gitter-Vorbehalt fallen lassen | **+16,1 %** unter Prefill-Graph | groesster gemessener Posten |
+
+**Kein Hebel der urspruenglichen Liste zieht am Primaerpunkt ueber den
+Rauschboden nach oben.** Der Gewinn dieses Laufs liegt woanders und war nicht
+gesucht: der Direktpfad steht auf diesem Zweig ohnehin schon bei +14,0 % statt
+der +0 % aus Schritt 1, und der einzige Hebel mit einem positiven Preisschild
+ist das Fallenlassen eines Vorbehalts, den Phase A desselben Laufs entkraeftet
+hat.
+
+Offen und benannt: (a) der s12-Zweig mit heutiger Ehrlichkeitsregel, um Befund
+1 vom Verdacht zum Beleg zu machen; (b) `ERG_EAGER_PLAETZE` als
+Aufrufer-Eigenschaft statt Konstante; (c) `bar1cp4096` bei acht Sessions mit
+einer Reserve, die zum Chunk passt; (d) eine zweite Runde fuer
+`bar1pggitter_hi`.
+
+### Nebenbefund am Werkzeug
+
+`s12_log_analyse` beantwortete "traegt der Direktpfad diese Nutzlast" mit
+`nutzlast <= max_nutzlast`, der Einrunden-Decke. Seit `ar_plan` ist das die
+falsche Frage: beim cp4096-Arm sagte das Feld `nein`, waehrend das Log keinen
+Rueckfall kennt. Korrigiert auf die Rundenzahl; die alte Groesse bleibt als
+`einrundig`, weil der Kipp-Punkt aus ihr kommt und sie genau das ist, was sich
+unter der Pipe aendert.

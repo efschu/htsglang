@@ -163,9 +163,13 @@ def runden(nutzlast_bytes: int, schlitz_bytes: int, welt: int) -> int:
 
     BAR1 splits an all_reduce into ``welt`` equal shards (reduce-scatter, then
     all-gather); the shard has to fit a slot. ``max_nutzlast = welt *
-    schlitz`` is exactly the point where it stops fitting -- and above it
-    ``handles()`` says False and the payload leaves over the base transport,
-    so a value > 1 here is not "slower", it is "not on this path at all".
+    schlitz`` is where the shard stops fitting in ONE pass.
+
+    That used to be the end of the path: above it ``handles()`` said False and
+    the payload left over the base transport. Since ``ar_plan`` (the
+    all_reduce/all_to_all multi-round work merged as f51d414959) it is not --
+    the payload is cut into this many rounds and stays on the direct path. A
+    value > 1 therefore means "more rounds", not "not on this path at all".
     """
     if schlitz_bytes <= 0 or welt <= 0:
         return 0
@@ -370,7 +374,21 @@ def auswerten(quellen: list, punkte: dict, hidden: int, welt: int) -> dict:
     max_nutzlast = (geo or {}).get("max_nutzlast_kib", 0) * 1024
     for g in groessen:
         g["runden"] = runden(g["nutzlast_bytes"], schlitz_bytes, welt)
-        g["traegt_bar1"] = g["nutzlast_bytes"] <= max_nutzlast if max_nutzlast else None
+        # "Does the direct path carry this payload at all" -- and since
+        # ar_plan that question is answered by the ROUND PLAN, not by the
+        # single-pass ceiling. The old predicate (`nutzlast <= max_nutzlast`)
+        # was written when there was no second round, and it now reports the
+        # opposite of what the runtime does: the #293 lever measurement ran a
+        # 4096-token batch (41,9 MB against a 25,2 MB ceiling) whose log
+        # contains not one fallback line, while this field said "nein".
+        # The runtime's own honesty rule is the cross-check -- every fallback
+        # is reported by `warum_nicht()`, and there were none.
+        g["traegt_bar1"] = g["runden"] >= 1 if schlitz_bytes else None
+        # Kept because it is the number the tipping point is derived from,
+        # and it is what changes when the pipe takes its share of the window.
+        g["einrundig"] = (
+            g["nutzlast_bytes"] <= max_nutzlast if max_nutzlast else None
+        )
     return {
         "hidden": hidden,
         "welt": welt,

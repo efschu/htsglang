@@ -38,12 +38,30 @@ bar1_write_boot_script() {
     # than a spliced-in line: an empty line inside a backslash continuation
     # would end the command early and boot the baseline recipe with a truncated
     # argument list.
+    #
+    # `arm` decides the TRANSPORT and nothing else. Anything a caller wants on
+    # top of that -- further SGLANG_* variables, further server arguments --
+    # comes through the two optional variables below and lands in the same two
+    # array literals, for the same reason: an array that expands to nothing
+    # when empty leaves the recipe byte-identical for callers that do not set
+    # it (s11, s12), while a spliced-in line would have to be conditionally
+    # present and would eventually be spliced in wrong.
+    #
+    #   BAR1_EXTRA_ENV   space separated VAR=VAL, prepended to the server env
+    #   BAR1_EXTRA_ARGS  space separated server arguments, appended to the
+    #                    launch command
     local htccl_env="HTCCL_ENV=()"
     if [ "$arm" = "bar1" ]; then
         htccl_env="HTCCL_ENV=(SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=bar1"
         htccl_env="$htccl_env SGLANG_HTCCL_GRAPH_FREIGABE=1"
         htccl_env="$htccl_env SGLANG_HTCCL_BAR1_NV_QUELLE=$hn)"
     fi
+    if [ -n "${BAR1_EXTRA_ENV:-}" ]; then
+        htccl_env="${htccl_env%)} ${BAR1_EXTRA_ENV})"
+        # The baseline arm's literal is "HTCCL_ENV=()" -- stripping the ")"
+        # above leaves "HTCCL_ENV=(", so the extras become the whole array.
+    fi
+    local extra_args="EXTRA_ARGS=(${BAR1_EXTRA_ARGS:-})"
 
     cat > "$out" <<EOF
 #!/usr/bin/env bash
@@ -53,6 +71,7 @@ mkdir -p "$BAR1_HOST_LOGDIR"
 rm -f "$hostpid"
 cd $hw
 $htccl_env
+$extra_args
 PYTHONPATH=$hw/python:$hv/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=$hv/lib/python3.12/site-packages/nvidia/cu13/lib \\
 CUDA_HOME=$hv/lib/python3.12/site-packages/nvidia/cu13 \\
@@ -70,6 +89,7 @@ setsid env \${HTCCL_ENV[@]+"\${HTCCL_ENV[@]}"} \\
   --speculative-algorithm NEXTN --speculative-num-steps 3 \\
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \\
   --enable-metrics --host 127.0.0.1 --port $port \\
+  \${EXTRA_ARGS[@]+"\${EXTRA_ARGS[@]}"} \\
   > "$hostlog" 2>&1 &
 echo \$! > "$hostpid"
 echo "gestartet, pid \$(cat "$hostpid")"
