@@ -107,6 +107,9 @@ GRAPH_CHECK_FALLEN = GRAPH_CHECK_OK.replace(
 ).replace("Alle Gate-Faelle bestanden.", "Gefallene Gate-Faelle: zwei-graphen.")
 
 SMOKE_TEXT = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20."
+#: Die Fortsetzung, die /generate auf "1 2 3 4" liefern muss. Ab 5, weil die
+#: ersten vier im Prompt stehen und nichts belegen.
+SMOKE_FORTSETZUNG = " " + " ".join(str(i) for i in range(5, 26))
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +478,7 @@ class TestDriverCompose:
 def _e2e(**over) -> dict:
     payload = {
         "kind": "bar1_e2e",
-        "schema_version": 2,
+        "schema_version": 3,
         "host": "192.168.0.1",
         "reachable": True,
         "integration_present": True,
@@ -505,10 +508,15 @@ def _e2e(**over) -> dict:
         "log_zeilen": 42,
         "smoke": {
             "vorhanden": True,
-            "content_prefix": SMOKE_TEXT,
+            "endpunkt": "generate",
+            "content_prefix": SMOKE_FORTSETZUNG,
             "spec_accept_length": 2.9,
-            "zahlen_in_folge": 20,
+            "spec_verify_ct": 41,
+            "finish_reason": "length",
+            "zahlen_in_folge": 16,
+            "zahlen_erwartet": 16,
             "kohaerent": True,
+            "unterprovisioniert": False,
             "error": None,
         },
     }
@@ -724,6 +732,43 @@ class TestE2ECheck:
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "inkohaerent" in line
 
+    def test_under_provisioned_smoke_has_its_own_verdict(self, tmp_path):
+        """It must never read as a transport finding.
+
+        This is the 2026-07-30 outcome: 9x ERREICHT=bar1, no bolt, a full
+        boot -- and a smoke that spent its budget on a thinking preamble.
+        Reporting that as "incoherent" invites the reading that bar1
+        corrupted the output, which the byte proofs rule out.
+        """
+        payload = _e2e()
+        payload["smoke"].update(
+            {
+                "kohaerent": False,
+                "unterprovisioniert": True,
+                "zahlen_in_folge": 3,
+                "finish_reason": "length",
+                "content_prefix": "Here's a thinking process: 1. Analyze ...",
+            }
+        )
+        _write_e2e(tmp_path, payload)
+        line = assert_fail(self.CHECK, tmp_path, self.STEP)
+        assert "UNTER-PROVISIONIERT" in line
+        assert "NICHT ueber den Transport" in line
+        assert "inkohaerent" not in line
+
+    def test_a_chat_endpoint_artifact_is_a_stop(self, tmp_path):
+        """Not decidable, so not decided.
+
+        On the chat path the coherence number depends on the template and
+        meta_info is opt-in -- a verdict from that artifact would be an
+        opinion about the wrong thing.
+        """
+        payload = _e2e()
+        payload["smoke"]["endpunkt"] = "chat"
+        _write_e2e(tmp_path, payload)
+        line = assert_stop(self.CHECK, tmp_path, self.STEP)
+        assert "generate" in line
+
     def test_missing_accept_length_is_fail(self, tmp_path):
         payload = _e2e()
         payload["smoke"]["spec_accept_length"] = None
@@ -877,6 +922,79 @@ class TestAgainstTheRealS11Log:
         # And explicitly NOT the consequence it used to report.
         assert "ERREICHT" not in line
 
+
+class TestAgainstTheGreenTransportRun:
+    """Attempt 3, on the card: the transport side really carried the run.
+
+    The counterpart to the fixture above. Same day, same step, after the
+    broadcast coverage landed: nine ERREICHT=bar1 lines over world:0, tp:0
+    and dcp:0, no bolt, and all SEVEN gate cases passed -- including
+    `broadcast` and `broadcast-zwei-graphen`, which is the on-card proof
+    that a broadcast survives capture and replay.
+
+    What this class pins is the verdict SHAPE for that run: every transport
+    check has to pass, and the one thing that is wrong has to be reported as
+    a fault of the smoke. A run whose collectives are byte-proven must never
+    come out sounding like a transport fault.
+    """
+
+    CHECK, STEP = "check_s11_bar1_e2e.py", "s11_bar1_e2e"
+    FIXTURE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "fixtures", "gpu_battery", "s11_bar1_e2e_transport_gruen",
+    )
+
+    def _step_dir(self, tmp_path):
+        for name in ("server.log", "graph_check.txt", "graph_check_rc.txt",
+                     "smoke.json"):
+            shutil.copy(os.path.join(self.FIXTURE, name), str(tmp_path / name))
+        return tmp_path
+
+    def _compose(self, tmp_path):
+        step_dir = self._step_dir(tmp_path)
+        payload = compose(str(step_dir), 30030, "/root/battery-bar1/s11.server.log")
+        write_json(step_dir / "bar1_e2e.json", payload)
+        return step_dir, payload
+
+    def test_the_transport_side_is_clean(self, tmp_path):
+        _, payload = self._compose(tmp_path)
+        assert payload["riegel"] is None
+        assert payload["fatal"] is None
+        assert payload["gruppen_bar1"] == ["dcp:0", "tp:0", "world:0"]
+        assert payload["gruppen_ausgewichen"] == []
+        # Drei Raenge x drei Gruppen (world, tp, dcp) -- jeder Rang baut je
+        # Gruppe eine eigene Region auf.
+        assert payload["aufbau_lines"] == 9
+
+    def test_all_seven_gate_cases_passed_including_broadcast(self, tmp_path):
+        _, payload = self._compose(tmp_path)
+        gate = payload["graph_check"]
+        assert gate["gate_cases"] == 7
+        assert gate["gefallen"] == []
+        assert gate["alle_bestanden"] is True
+
+    def test_the_only_complaint_is_about_the_smoke(self, tmp_path):
+        step_dir, _ = self._compose(tmp_path)
+        line = assert_stop(self.CHECK, step_dir, self.STEP)
+        assert "/generate" in line
+        # Kein Wort, das nach Transportfehler klingt.
+        for verboten in ("RIEGEL", "ERREICHT", "Fatal", "gemischter Lauf"):
+            assert verboten not in line, verboten
+
+    def test_the_thinking_flip_is_visible_in_the_artifact(self, tmp_path):
+        """Diagnosable without opening a log: the state is a field.
+
+        The verdict says "repeat, do not judge"; the artifact still records
+        WHY, so the next reader does not have to rediscover it.
+        """
+        _, payload = self._compose(tmp_path)
+        smoke = payload["smoke"]
+        assert smoke["endpunkt"] == "chat"
+        assert smoke["finish_reason"] == "length"
+        assert smoke["unterprovisioniert"] is True
+        assert smoke["spec_accept_length"] is None
+        assert "thinking process" in smoke["content_prefix"]
+
     def test_graph_gate_summary_is_read_case_by_case(self, tmp_path):
         """The exit code alone would hide WHICH case fell, and a gate whose
         cases nobody counted is a gate that could have run zero of them."""
@@ -932,6 +1050,176 @@ class TestAgainstTheRealS11Log:
         write_json(tmp_path / "smoke.json", {"object": "error", "error": "no model"})
         out = parse_smoke(str(tmp_path))
         assert out["error"]
+
+
+class TestGenerateSmoke:
+    """The /generate form -- the one the step really asks for now.
+
+    Two things drove the switch, both from the run of 2026-07-30: the chat
+    template answered a temperature-0 request with a thinking preamble and
+    spent the whole token budget on it, and `meta_info` is opt-in on the
+    chat path (`return_meta_info`, default False) so the accept length was
+    structurally unreadable there.
+    """
+
+    def _schreibe(self, tmp_path, text, meta=None):
+        write_json(
+            tmp_path / "smoke.json",
+            {"text": text, "meta_info": meta if meta is not None else {}},
+        )
+        return parse_smoke(str(tmp_path))
+
+    def test_a_clean_continuation_is_coherent(self, tmp_path):
+        out = self._schreibe(
+            tmp_path,
+            SMOKE_FORTSETZUNG,
+            {"spec_accept_length": 2.87, "spec_verify_ct": 41,
+             "finish_reason": {"type": "length"}},
+        )
+        assert out["endpunkt"] == "generate"
+        assert out["zahlen_in_folge"] == 16
+        assert out["zahlen_erwartet"] == 16
+        assert out["kohaerent"] is True
+        assert out["unterprovisioniert"] is False
+        assert out["spec_accept_length"] == 2.87
+        assert out["spec_verify_ct"] == 41
+        assert out["finish_reason"] == "length"
+
+    def test_finish_reason_length_alone_is_not_a_failure(self, tmp_path):
+        """A continuation prompt has no reason to stop -- `length` is normal.
+
+        Making `length` a failure by itself would turn the expected outcome
+        of this smoke into a red verdict.
+        """
+        out = self._schreibe(
+            tmp_path, SMOKE_FORTSETZUNG, {"finish_reason": {"type": "length"}}
+        )
+        assert out["kohaerent"] is True
+        assert out["unterprovisioniert"] is False
+
+    def test_the_prompt_numbers_do_not_count(self, tmp_path):
+        """Echoing "1 2 3 4" proves nothing -- the count starts at 5."""
+        out = self._schreibe(tmp_path, "1 2 3 4")
+        assert out["zahlen_in_folge"] == 0
+        assert out["kohaerent"] is False
+
+    def test_a_numbered_list_no_longer_scores(self, tmp_path):
+        """The 2026-07-30 false positive, in miniature.
+
+        The old counter reported 3 for a thinking preamble, because it
+        matched the list markers "1.", "2.", "3.". Starting the range at 5
+        takes the small digits of ordinary prose out of the count.
+        """
+        praeambel = (
+            "Here's a thinking process:\n\n1.  **Analyze User Input:**\n"
+            "   - Language: German\n\n2.  **Identify Core Task:**\n"
+            "   - Generate a sequence.\n\n3.  **Determine Output Format:**\n"
+        )
+        out = self._schreibe(tmp_path, praeambel)
+        assert out["zahlen_in_folge"] == 0
+        assert out["kohaerent"] is False
+
+    def test_the_named_under_provisioned_state(self, tmp_path):
+        """Coherent text, budget spent, numbers never arrived."""
+        out = self._schreibe(
+            tmp_path,
+            "Let me think about this carefully. " * 20,
+            {"finish_reason": {"type": "length"}},
+        )
+        assert out["kohaerent"] is False
+        assert out["unterprovisioniert"] is True
+
+    def test_short_garbage_is_not_under_provisioned(self, tmp_path):
+        """Negative control: the named state must not swallow every failure.
+
+        An empty or tiny answer is a different fault, and calling it
+        "under-provisioned" would hide it behind a reassuring word.
+        """
+        for text in ("", "!!!", "5"):
+            out = self._schreibe(
+                tmp_path, text, {"finish_reason": {"type": "length"}}
+            )
+            assert out["unterprovisioniert"] is False, text
+
+    def test_long_coherent_text_that_stopped_is_not_under_provisioned(self, tmp_path):
+        """Negative control on the other axis: it needs finish=length.
+
+        A model that stopped on its own had the budget and did not use it
+        for the task -- that is incoherence, not under-provisioning.
+        """
+        out = self._schreibe(
+            tmp_path,
+            "Let me think about this carefully. " * 20,
+            {"finish_reason": {"type": "stop"}},
+        )
+        assert out["kohaerent"] is False
+        assert out["unterprovisioniert"] is False
+
+    def test_the_accept_length_comes_from_meta_info_only(self, tmp_path):
+        """NOT spec_ema_accept_len -- that is a smoothed curve, not this
+        request's acceptance length, and confusing the two is a known
+        measurement trap."""
+        out = self._schreibe(
+            tmp_path, SMOKE_FORTSETZUNG, {"spec_ema_accept_len": 3.4}
+        )
+        assert out["spec_accept_length"] is None
+
+    def test_a_response_that_is_neither_shape_is_an_error(self, tmp_path):
+        write_json(tmp_path / "smoke.json", {"unerwartet": True})
+        out = parse_smoke(str(tmp_path))
+        assert out["error"]
+        assert "generate" in out["error"]
+
+
+class TestSmokeContractWithTheStepScript:
+    """The parser's expected sequence must continue the prompt the shell sends.
+
+    Both live in different languages and different files; a test is the only
+    thing that can hold them together. Without it the parser could count a
+    continuation nobody asked for -- and it would look green for whatever
+    the model happened to say.
+    """
+
+    SHELL = os.path.join(BATTERY, "s11_bar1_e2e.sh")
+
+    def _befehle(self) -> str:
+        """Die Schrittdatei OHNE Kommentare.
+
+        Der Kommentar ueber dem Request nennt /v1/chat/completions -- als
+        Begruendung, warum es das nicht mehr ist. Ein Scan, der das nicht
+        auseinanderhalten kann, faellt ueber seine eigene Erklaerung.
+        """
+        zeilen = [
+            z for z in open(self.SHELL, encoding="utf-8").read().splitlines()
+            if not z.lstrip().startswith("#")
+        ]
+        return "\n".join(zeilen)
+
+    def test_the_shell_sends_the_prompt_the_parser_expects(self):
+        from s11_bar1_e2e import SMOKE_PROMPT, ZAHLEN_VON
+
+        text = self._befehle()
+        assert f'\\"text\\": \\"{SMOKE_PROMPT}\\"' in text, (
+            "der Fortsetzungs-Prompt in s11_bar1_e2e.sh und SMOKE_PROMPT "
+            "sind auseinandergelaufen"
+        )
+        # Und die Zaehlung setzt genau dahinter an.
+        letzte = int(SMOKE_PROMPT.split()[-1])
+        assert ZAHLEN_VON == letzte + 1
+
+    def test_the_shell_uses_generate_and_not_the_chat_endpoint(self):
+        text = self._befehle()
+        assert "/generate" in text
+        assert "/v1/chat/completions" not in text
+
+    def test_the_shell_gives_the_answer_room(self):
+        """128 Token waren der Grund, warum die Zahlen nie drankamen."""
+        import re
+
+        text = self._befehle()
+        treffer = re.search(r'max_new_tokens\\":\s*(\d+)', text)
+        assert treffer, "kein max_new_tokens im Smoke-Request"
+        assert int(treffer.group(1)) >= 512
 
 
 # ---------------------------------------------------------------------------

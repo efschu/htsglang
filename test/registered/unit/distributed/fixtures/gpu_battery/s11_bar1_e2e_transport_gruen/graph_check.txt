@@ -1,0 +1,11 @@
+Zusammenfassung
+  BESTANDEN  [Gate]  1blk-klein
+  BESTANDEN  [Gate]  1blk-gross
+  BESTANDEN  [Info]  gitter
+  BESTANDEN  [Gate]  vorbehalt
+  BESTANDEN  [Gate]  zwei-graphen
+  BESTANDEN  [Gate]  pipe
+  GEFALLEN   [Info]  pipe-direkt  -- process 1 terminated with exit code 1
+  BESTANDEN  [Gate]  broadcast
+  BESTANDEN  [Gate]  broadcast-zwei-graphen
+Alle Gate-Faelle bestanden.

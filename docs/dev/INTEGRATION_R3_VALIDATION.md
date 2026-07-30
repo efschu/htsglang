@@ -9852,3 +9852,104 @@ Zeugen, eine Zahl, kein Widerspruch. Neu:
 passed** / 8 skipped (auf `157dad9466`: 16 failed / 1126 passed / 8
 skipped, dieselben 16). `test_htccl_bar1_broadcast.py` 54 passed (+10),
 `test_htccl_bar1_all_gather.py` 31 passed.
+
+## Anlauf 3: Transport gruen, Smoke unter-provisioniert (2026-07-30)
+
+### Was auf der Karte belegt ist
+
+Der dritte s11-Lauf ist der Durchbruch auf der Transportseite: **9x
+ERREICHT=bar1** (world:0, tp:0, dcp:0 x 3 Raenge), kein Riegel, voller Boot
+in 181 s, und **alle sieben Gate-Faelle bestanden -- einschliesslich
+`broadcast` und `broadcast-zwei-graphen`**. Damit ist auf der Karte belegt,
+was die CPU-Tests nur behaupten konnten: ein broadcast ueberlebt
+Aufzeichnung und mehrfache Wiedergabe ueber den BAR1-Direktpfad. Die
+Artefakte liegen als Fixture
+`test/registered/unit/distributed/fixtures/gpu_battery/s11_bar1_e2e_transport_gruen/`.
+
+Der FAIL kam aus dem Smoke, und zwar aus zwei getrennten Luecken der
+Messvorrichtung.
+
+### Befund 1: Trajektorien-Kipp bei Temperatur 0 -- erwartete Klasse
+
+Derselbe Runbook-Request lieferte unter bar1 keine Zaehlung, sondern eine
+Denk-Praeambel in kohaerentem Englisch (sie analysiert sogar den
+Zaehle/Zaehle-Tippfehler). `finish_reason=length`: die 128 max_tokens waren
+vom Denktext verbraucht, die Zahlen kamen NIE dran. Der Kohaerenzzaehler
+meldete 3 -- und die drei Treffer waren die Aufzaehlungspunkte "1.", "2.",
+"3." DER PRAEAMBEL, nicht der Antwort. Ein Zaehler, der nicht sagt, woher
+seine Treffer kommen, ist bei Fliesstext leicht zu taeuschen.
+
+**Einordnung: erwartete Numerik-Klasse, keine Korruption.** Eine andere,
+ebenfalls korrekte Reduktionsordnung kippt einen Beinahe-Gleichstand am
+ersten Token, und ab da laeuft die Trajektorie woanders hin. Das ist die
+"topk=1 ist kein Losslessness-Orakel"-Lehre in ihrer reinsten Form: die
+Kollektive sind byte-belegt (`byte_beleg_alle`, `byte_beleg_a2a`,
+`byte_beleg_broadcast`), die Ausgabe ist trotzdem eine andere.
+
+**Konsequenz fuer jedes kuenftige Byte-Gate, und die ist die eigentliche
+Lehre dieses Abschnitts: bar1-Laeufe nur gegen bar1-REFERENZEN
+byte-vergleichen.** Ein Byte-Gate, das eine bar1-Ausgabe gegen eine
+gloo- oder NCCL-Referenz haelt, misst diese Klasse und nennt sie
+Regression. Wer greedy-Determinismus prueft, prueft ihn innerhalb EINES
+Transports.
+
+### Befund 2: meta_info auf dem Chat-Pfad -- kein Bug, sondern opt-in
+
+Die Vermutung war ein eigener kleiner Bug (meta_info strukturell leer auf
+`/v1/chat/completions`, obwohl der Boot NEXTN faehrt). Der Quelltext sagt
+etwas anderes:
+
+* `protocol.py:723` -- `return_meta_info: bool = False`
+* `serving_chat.py:1376` -- `ret_item["meta_info"] if request.return_meta_info else None`
+
+Das Feld ist auf dem Chat-Pfad **opt-in**, und der Smoke-Request hat es nie
+angefordert. `meta_info: None` in der Antwort ist also korrektes Verhalten,
+und der Mangel lag in der Messvorrichtung. Auf `/generate` kommt
+`meta_info` dagegen immer mit (`tokenizer_manager.py:2056/2062`), und
+`spec_accept_length` wird dort in `_calculate_spec_decode_metrics`
+(`:2421`) gefuellt. Kein Fork-Bug -- ein nicht gestellter Parameter.
+
+### Gebaut: der Smoke faehrt jetzt /generate
+
+Gewaehlt wurde Weg (a) in seiner bevorzugten Form, weil er beide Befunde
+mit EINEM Request erledigt:
+
+    curl .../generate -d '{"text": "1 2 3 4",
+      "sampling_params": {"temperature": 0, "max_new_tokens": 512}}'
+
+* **Kein Chat-Template, also keine Praeambel.** Das ist der Unterschied
+  zwischen "kann nicht entstehen" und "ist abgeschaltet": der Fork traegt
+  zwar `chat_template_kwargs` und `reasoning_effort: none`
+  (`protocol.py:763` bzw. `:724`), aber ob ein Schalter greift, haengt am
+  Template des Modells. Ein Fortsetzungs-Prompt haengt an nichts.
+* **Fortsetzung statt Anweisung.** "1 2 3 4" fortzusetzen ist keine
+  Aufgabe, ueber die sich nachdenken laesst.
+* **meta_info kommt ohne Bitte mit**, also ist `spec_accept_length` wieder
+  lesbar -- ausdruecklich NICHT `spec_ema_accept_len`, das ein geglaetteter
+  Verlauf ist und nicht die Akzeptanzlaenge dieser Anfrage.
+* **512 statt 128 Token.** Die Grenze soll nie die Antwort abschneiden.
+* **Gezaehlt wird ab 5**, also hinter dem Prompt: was im Prompt steht,
+  belegt nichts, und die kleinen Ziffern gewoehnlicher Prosa zaehlen nicht
+  mehr mit. Schwelle unveraendert 15, der Nenner ist 16 statt 20.
+
+### Drei Ausgaenge statt zwei
+
+`UNTER-PROVISIONIERT` ist ein eigener Zustand: zusammenhaengender Text,
+Token-Budget bis zum Anschlag verbraucht (`finish_reason=length`), Zahlen
+nie drangekommen. Er bekommt eine eigene Meldung, die ausdruecklich sagt,
+dass er nichts ueber den Transport aussagt. Ohne ihn haette derselbe Lauf
+"Smoke-Ausgabe inkohaerent" gemeldet -- und das laedt zu der einen Lesart
+ein, die die Byte-Belege ausschliessen.
+
+Ein Artefakt vom Chat-Pfad ergibt jetzt **STOP** statt eines Urteils: dort
+ist weder die Kohaerenzzahl noch `spec_accept_length` aussagekraeftig, also
+ist der Lauf zu wiederholen und nicht zu bewerten. Der Grund steht
+trotzdem im Artefakt (`endpunkt`, `finish_reason`, `unterprovisioniert`),
+damit ihn niemand neu herausfinden muss.
+
+`schema_version` 2 -> 3.
+
+**Testzahlen:** `test_gpu_battery_checks_bar1.py` 112 passed (+18), darunter
+zwei Klassen gegen ECHTE Artefakte: Anlauf 1 (Capture-Abbruch, Verdikt
+nennt den Riegel) und Anlauf 3 (Transport gruen, Verdikt haelt am Smoke und
+enthaelt kein Wort, das nach Transportfehler klingt).
