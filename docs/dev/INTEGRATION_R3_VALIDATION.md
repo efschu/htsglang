@@ -12923,3 +12923,239 @@ Folge fuer die Zusammenfuehrung: dieser Bericht haengt an der Fassung des
 Dokuments von `e1b17fe8ea` und enthaelt den #303-Abschnitt nicht. Beim Merge
 von `probe/fenster3` ist das ein reiner Anhang-Konflikt in
 `INTEGRATION_R3_VALIDATION.md`, beide Abschnitte bleiben.
+
+## #303-Beleg: drei Boots (Kartenfenster 2026-07-30, 21:03-21:18 UTC)
+
+Basis `56dcf57cea` (enthaelt den #303-Fix `531039140b` und den #290-Fix
+`3b688d53af`). Rezept unveraendert das `s03`/`s04`-Rezept aus
+`_bar1_host_boot.sh`, Arm `grundlinie`: `--tp-size 3 --rank-gpu-id 0,1,2
+--rank-tp-ratio auto-performance --rank-auto-reserve-mib 3000,2700,2700`,
+fp8-Checkpoint, NEXTN k=3, **kein gepinnter `--rank-mlp-ratio`** — die Sonde
+sollte laufen, sie ist der Gegenstand. Boots auf dem PVE-Host, Profil-Cache
+hostseitig unter `/root/.cache/sglang`, Treiber 595.58.03. Treiberskript und
+das je Boot erzeugte Bootskript liegen als Artefakte in
+`/spinning/gpu-battery-results/2026-07-30_303_beleg/`.
+
+Vorzustand: hostseitig lag genau eine Datei, das v2-Profil
+`hw_profile-124a7190f860.json` vom 27.07. (`probe_seconds` 13,5; drei paarweise
+`links` plus `__group__`; keine `gemm_lanes`). Eine v3-Datei
+`hw_profile-9a5e9b49b7dc.json` existierte nicht — Posten 1 fand seine
+Vorbedingung also bereits vor.
+
+### Die drei Boots
+
+| Boot | Cache vorher | Quellzeile `hardware profile:` | `probe_seconds` | bis „fired up" | Wanduhr bis `/health` |
+|---|---|---|---:|---:|---:|
+| A Migration | nur v2 | `migrated v2 cache + lanes top-up (132.2 s)` | 132,2 | **191 s** | 212 s |
+| B ohne Cache | leer | `fresh probe (15.3 s)` | 15,3 | **76 s** | 94 s |
+| C warmer Cache | v3 aus B | `cache (/root/.cache/sglang/hw_profile-9a5e9b49b7dc.json)` | — | **50 s** | 66 s |
+
+Die Bootdauer ist die Differenz der Zeitstempel des Servers selbst (erste
+gestempelte Zeile bis `fired up and ready to roll`, 1-s-Aufloesung). Die
+Wanduhrspalte enthaelt zusaetzlich ssh- und setsid-Overhead und pollt im
+5-s-Raster; sie steht daneben, weil nur sie den Aufwand des Aufrufers zeigt.
+
+### Posten 1 — Migration: der Mechanismus traegt, die 6-s-Erwartung nicht
+
+Die erwartete Logzeile steht wortgleich im Log:
+
+    auto-performance: migrating the cached v2 hardware profile to v3
+    (/root/.cache/sglang/hw_profile-124a7190f860.json) -- every measured value
+    is kept; only the added field(s) gemm_lane_notes, gemm_lanes are re-probed,
+    which runs the lanes probe group(s) and NOT the pairwise link matrix.
+
+Die Quelle lautet `migrated v2 cache + lanes top-up`, `notes` im geschriebenen
+Profil ist leer (der Top-up lief durch, kein Feld blieb ungemessen), und die
+**vier `links`-Eintraege der v2-Datei stehen unveraendert im neuen v3-Profil**:
+drei paarweise (5,10 / 9,06 / 5,77 GB/s) plus `__group__` (`ar_10kb_us` 33,7,
+`ar_1mb_us` 370,3). Die v2-Datei blieb unangetastet liegen. Damit ist belegt,
+was der Fix behauptet: ein additiver Versionsbump kostet seine Gruppe, nicht
+das ganze Profil, und die Netzphase wird dabei gar nicht erst angefasst.
+
+Nicht bestaetigt hat sich die Groessenordnung. Erwartet waren rund 6 s
+Nachprobe und unter 15 s Bootzuwachs; gemessen wurden **132,2 s Top-up und
+141 s Zuwachs gegenueber dem warmen Boot C**. Die Ursache ist nicht die
+Messung, sondern ein nvcc-Kaltbau: waehrend des Top-ups lief auf dem Host
+`ninja -v -j 4` in
+`~/.cache/tvm-ffi/sgl_kernel_jit_gptq_marlin_bf16_t_…__cuda_arch_12.0`, bei 0 %
+GPU-Auslastung und 15-20 W je Karte. Der Beleg, dass es der Bau war und nicht
+die Sonde: Boot B misst **dieselben** Lanes noch einmal, diesmal aus warmem
+Kernel-Cache, und braucht fuer die vollstaendige Stage 0 — Lanes, Bandbreite
+UND Link-Matrix — insgesamt 15,3 s. Die 6-s-Erwartung aus Posten 2a stammt aus
+einem Lauf mit warmem Cache und gilt nur dort. Auf einer Kiste, die die
+quantisierten Lane-Kernel zum ersten Mal fuer eine Arch baut, ist der erste
+`auto-performance`-Boot nach einem `PROFILE_VERSION`-Bump um die Baukosten
+teurer — einmalig, danach nie wieder.
+
+### Posten 2 — ohne Cache: die Link-Matrix laeuft DURCH
+
+Das ist der eigentliche Befund des Fensters. Beide Cache-Dateien wurden
+weggeraeumt (verschoben, nicht geloescht), Boot B lief die volle Stage 0 mit
+der angekuendigten 45-s-Deckelung. Von den beiden moeglichen Ausgaengen trat
+der erste ein:
+
+- Die Link-Matrix **kam durch**. Kein Deckel, kein Abbruch: `notes` ist leer,
+  und im Profil stehen drei frisch gemessene paarweise Eintraege
+  (5,12 / 9,03 / 5,89 GB/s) plus `__group__` (`ar_10kb_us` 31,0,
+  `ar_1mb_us` 361,8).
+- Die gesamte Stage 0 kostete **15,3 s** statt der 469 s, die dieselbe Phase im
+  Welle-2-Fenster verbrannt hat.
+
+Damit ist die Frage aus dem CPU-Teil beantwortet: **die Rendezvous-Haertung hat
+die Wurzel getroffen, die geerbte Umgebung war es.** Der Deckel hatte in diesem
+Lauf nichts zu tragen — er bleibt als Netz stehen, ist hier aber nicht der
+Grund fuer die 15,3 s. Nebenbefund zur Herkunft der geerbten Variablen: in
+einer nicht-interaktiven ssh-Sitzung auf dem Host ist `MASTER_ADDR` nicht
+gesetzt (geprueft), der Wert kann also nur aus dem Launcher-Prozess selbst
+stammen, nicht aus der Shell — konsistent damit, dass das Problem unter
+`sglang.launch_server` auftrat.
+
+Zweite, unabhaengige Bestaetigung der Migration: die von Boot A aus dem
+v2-Cache uebernommenen Linkwerte (5,10 / 9,06 / 5,77) und die von Boot B frisch
+gemessenen (5,12 / 9,03 / 5,89) liegen innerhalb von rund 2 % beieinander. Der
+migrierte Wert ist also nicht bloss formal vorhanden, er ist auch richtig.
+
+### Posten 3 — warmer Cache
+
+Boot C fand das von B geschriebene v3-Profil, meldete
+`cache (/root/.cache/sglang/hw_profile-9a5e9b49b7dc.json)`, startete keinen
+Subprozess und war nach **50 s** oben — der schnellste der drei. Das ist der
+Zustand, in dem ein Rig nach dem Fix dauerhaft laeuft: `auto-performance`
+kostet gegenueber einem gepinnten Vektor nichts mehr, weil gar keine Sonde
+mehr laeuft. Die 84 s des gepinnten Referenzboots aus dem Welle-2-Fenster
+liegen in derselben Groessenordnung, sind aber ein anderes Fenster und ein
+anderer Arm (Container statt Host) und taugen nur als grobe Einordnung, nicht
+als A/B.
+
+### Nebenbefund: auf den 3080ern gewinnt keine fp8-Lane
+
+Die Lane-Messung ist mit dem Fix erstmals im Profil dieses Hosts persistiert,
+und sie faellt eindeutig aus (TFLOPS):
+
+| Karte | fp8_native | fp8_marlin | fp8_w8a16 | im Plan verwendet |
+|---|---:|---:|---:|---|
+| RTX 5090 | **570,1** | 222,4 | 182,1 | fp8 native (`_scaled_mm`) |
+| RTX 3080 (×2) | — | — | — | dense bf16 (Fallback), 61,8 / 60,9 |
+
+Auf den 3080ern faellt **jede** der drei fp8-Lanes aus, mit je eigener,
+benannter Ursache: `_scaled_mm` verlangt Compute Capability >= 8,9,
+`fp8_marlin` und `fp8_w8a16` scheitern an `cudaErrorNoKernelImageForDevice` —
+der Kernel ist fuer sm_86 nicht im Image (#304; der ninja-Bau waehrend Boot A
+lief entsprechend nur fuer `cuda_arch_12.0`). Der Code substituiert hier keine
+Zahl, sondern schreibt die Luecke als `gemm_lane_notes` ins Profil und warnt
+beim Planen: „no fp8 GEMM lane measured on this card … scoring it on the DENSE
+BF16 probe instead". Folge fuer den Plan: der Compute-Vektor vergleicht
+570,1 TFLOPS fp8-nativ auf der 5090 gegen 61,8/60,9 TFLOPS dense-bf16 auf den
+3080ern. Das Verhaeltnis ~9,2 : 1 : 1 mischt zwei Formate und setzt die 3080er
+damit zu niedrig an — genau das, was die Warnung sagt. Solange #304 offen ist,
+ist jede `auto-performance`-Aufteilung auf diesem Rig in dieser Richtung
+verzerrt.
+
+### Posten 4 — #290: der gepackte Drafter rechnet richtig (bootfrei)
+
+`scripts/diag/q8_dflash_gpu_kernel_check.py` auf einer Karte, 17,5 s
+Kartenzeit, **exit 0**. Der Drafter liegt gepackt resident mit **1,71 GiB**
+(dense bf16 waeren 3,22 GiB) — das ist die Zahl aus dem #290-Fix, hier zum
+ersten Mal auf der GPU statt am Schreibtisch. Alle vier Modulklassen tragen
+durch `fused_mul_mat_gguf`, bei 1 und bei 16 Zeilen:
+
+| Modul | rows=1 | rows=16 |
+|---|---:|---:|
+| `fc` (ReplicatedLinear, der neue Pfad) | 0,00723 | 0,00562 |
+| `layers.0.self_attn.qkv_proj` | 0,00677 | 0,00568 |
+| `layers.0.mlp.gate_up_proj` | 0,00742 | 0,00555 |
+| `layers.0.mlp.down_proj` | 0,00732 | 0,00555 |
+
+Relativer mittlerer Fehler gegen die dense-BF16-Referenz, Toleranz 0,02. Alle
+acht Punkte liegen bei 0,0055-0,0074, also rund einen Faktor 3 unter der
+Grenze und in der Groessenordnung des am Schreibtisch gemessenen
+Dequant-Fehlers von 0,006. Eine mis-geslicete Merged-Shard oder ein falsch
+gelesenes Blocklayout laege bei >1,0; das ist hier ausgeschlossen.
+
+Eine Falle beim Nachfahren: mit dem im Auftrag genannten Interpreter
+`/spinning/shvllm/.venv/bin/python` bricht der Check mit
+`TypeError: 'NoneType' object is not callable` in `ggml_mul_mat_vec_a8` ab —
+in dieser venv fehlt die GGUF-Kernel-Bindung aus `sgl_kernel`. Der Drafter
+laedt dort korrekt (dieselben 1,71 GiB), nur der Kernel fehlt. Mit
+`/spinning/htsglang-gpu/.venv/bin/python` laeuft derselbe Check durch. Fuer
+diesen Check ist die htsglang-venv die richtige.
+
+### Posten 5 — s04 DFLASH-solo-Q8: der Accept-Kollaps ist weg
+
+`scripts/gpu_battery/s04_boot_c.sh` unveraendert, `RESERVE_HOST=5000` (steht
+so im Rezept), Drafter solo auf `cuda:1` (eine 3080), `rc=0`. Boot bis
+`fired up and ready to roll`: 259 s (mit CUDA-Graph-Kaltbau). Accept aus
+`meta_info.spec_accept_length`, 192 Completion-Tokens je Prompt, also je nach
+Accept 20-65 Verify-Runden — die geforderten mindestens 20 Ticks sind auf
+allen fuenf Prompts erreicht.
+
+| Prompt | Accept (DFLASH-Q8 solo) | Runden | NEXTN-fp8-Referenz | Verhaeltnis |
+|---|---:|---:|---:|---:|
+| alphabet | **6,19** | 31 | — | — |
+| squares | **6,86** | 28 | — | — |
+| repeat | **9,60** | 20 | — | — |
+| code | **4,27** | 45 | 3,279 | 1,30 |
+| prose | **2,95** | 65 | 2,688 | 1,10 |
+
+Gegen den Kollaps von 1,00 aus #290 ist das der erwartete Sprung: der Drafter
+rechnet, statt auf `torch.empty` zu raten. Die Inhaltsachse bleibt getrennt
+ausgewiesen und verhaelt sich wie erwartet — die stark strukturierten Prompts
+(`repeat` 9,60, `squares` 6,86) liegen weit ueber Code, Code ueber Prosa. Auf
+den beiden Prompts, fuer die eine NEXTN-Referenz existiert, liegt DFLASH-Q8
+solo darueber (Code +30 %, Prosa +10 %). Das ist ein Ein-Boot-Wert ohne
+A-vs-A-Rauschboden; als Aussage traegt er „der Kollaps ist behoben und der Arm
+ist konkurrenzfaehig", nicht „DFLASH schlaegt NEXTN um x %".
+
+Zwei Einschraenkungen, die zum Ergebnis gehoeren: die serving-seitige
+Positionskurve ist leer (`rounds: 0`, `curve: []` — der Probe-Lauf nutzt
+`--no-lane`), es gibt also keine p1/p2/p3-Aufloesung; und der Lauf persistiert
+keinen Text, die Kohaerenz ist hier nur ueber die Accept-Hoehe und die
+Loader-Zeilen belegt, nicht ueber eine Ausgabestichprobe.
+
+VRAM ueber den Lauf (174 Proben, NVML-Reihenfolge): 3080 Peak 17531 MiB
+(min frei 2949), 5090 Peak 21547 (min frei 11060), 3080 Peak 13781 (min frei
+6699). Der Korridor haelt auf allen drei Karten; die 6699 MiB Luft auf der
+zweiten 3080 sind die Asymmetrie der Solo-Platzierung (Reserve 5000 auf der
+Drafter-Karte gegen 2700 auf der anderen), kein Fehlschlag.
+
+### Kartenzeit und Leistung
+
+Fenster 21:03:30-21:18:33 UTC, **903 s = 15,1 min** von 30 min Budget.
+
+| Posten | Kartenzeit | Ergebnis |
+|---|---:|---|
+| Boot A Migration | ~240 s | davon 132 s nvcc-Kaltbau der sm_120-Lane-Kernel |
+| Boot B ohne Cache | ~116 s | volle Stage 0 in 15,3 s, Link-Matrix durch |
+| Boot C warmer Cache | ~86 s | schnellster Boot, keine Sonde |
+| Posten 4 (#290-Kernel) | 2× ~19 s | erster Anlauf falsche venv, zweiter exit 0 |
+| Posten 5 (s04) | ~295 s | Boot 259 s + Accept auf 5 Prompts |
+
+Leistung ueber das ganze Fenster, 5-s-Abtastung, 546 Proben
+(`power.csv`, NVML-Reihenfolge): 3080 66,5 W (Spitze 314,4), 5090 51,1 W
+(Spitze 241,8), 3080 63,1 W (Spitze 283,2), **Rig-Mittel 180,7 W**. Zum
+Vergleich die Zeile, die dieses Fenster ueberfluessig gemacht hat: im
+Welle-2-Fenster stand die haengende Sonde 469 s lang bei 69 W Rig-Mittel und
+19,8 W auf der 5090 — 469 s Kartenzeit, in denen nichts gerechnet wurde. In
+diesem Fenster gibt es kein solches Segment mehr.
+
+### Was dieses Fenster hinterlaesst
+
+1. **#303 ist am Rig belegt und kann geschlossen werden.** Die Link-Matrix
+   laeuft durch, die volle Stage 0 kostet 15,3 s statt 469 s, die Migration
+   traegt alle v2-Werte inklusive Link-Matrix, und der warme Cache bootet in
+   50 s ohne Subprozess. Der 45-s-Deckel wurde in keinem der drei Boots
+   gebraucht — er bleibt als Netz, ist aber nicht der Wirkmechanismus.
+2. **Die 6-s-Erwartung an den Lanes-Top-up gilt nur bei warmem Kernel-Cache.**
+   Der erste `auto-performance`-Boot nach einem `PROFILE_VERSION`-Bump zahlt
+   auf einer Kiste ohne gebaute Lane-Kernel einmalig die nvcc-Baukosten
+   (hier 132 s fuer `gptq_marlin_bf16_t` auf `cuda_arch_12.0`). Wer die Kosten
+   nicht im Bootfenster haben will, baut die Lane-Kernel vorher warm.
+3. **#304 kostet weiterhin Genauigkeit, nicht nur Geschwindigkeit.** Ohne
+   sm_86-Kernel misst keine der drei fp8-Lanes auf den 3080ern, der Planer
+   faellt dort auf dense bf16 zurueck und vergleicht damit zwei Formate
+   miteinander. Die Luecke ist benannt (`gemm_lane_notes` plus Warnung), aber
+   jede `auto-performance`-Aufteilung auf diesem Rig setzt die 3080er zu
+   niedrig an, solange sie offen ist.
+4. **#290 ist auf der GPU bestaetigt, zweifach.** Bootfrei durch den
+   Kernel-Check (1,71 GiB gepackt, alle vier Modulklassen innerhalb 0,0074
+   relativem Fehler) und im Serving durch s04 (Accept 2,95-9,60 statt 1,00).
