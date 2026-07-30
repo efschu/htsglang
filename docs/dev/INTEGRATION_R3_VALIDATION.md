@@ -9245,3 +9245,424 @@ Fallen, die dabei gelten:
   aus.** CUDA-Graphen abzuschalten, weil etwas unter Aufzeichnung klemmt,
   misst einen Betriebspunkt, den niemand faehrt. Solche Hindernisse gehoeren
   gemeldet, nicht geloest.
+
+## NVFP4 auf Nicht-Blackwell (sm86 / sm75 / sm70) — Machbarkeitsanalyse (2026-07-30)
+
+Frage: Lassen sich NVFP4-Checkpoints auf Ampere und aelteren Karten rechnen,
+indem auf fp16/bf16 dequantisiert wird — analog zum fp8-W8A16-Dequantpfad,
+den der Fork heute auf sm86 faehrt? Analyse ohne GPU (Karten in einer
+laufenden Testbatterie), rein aus dem Code, `gh` und HF-Metadaten.
+
+### Kurzurteil
+
+Ja, und fuer sm86 ist es **bereits gebaut** — nicht von uns, sondern upstream,
+und es liegt auf diesem Zweig. Die Analyse haette mit der Pflicht-Vorpruefung
+beginnen muessen und tut es hier: der eigentliche Befund ist, dass die
+vermutete Luecke fuer die 3080er nicht existiert.
+
+* **sm86 (3080):** NVFP4 laeuft ueber `gptq_marlin_gemm` als echtes W4A16 —
+  e2m1 wird im Kernel per Bitschieberei nach fp16/bf16 expandiert, die
+  FP8-E4M3-Blockskala als fp16-Multiplikation angewandt, die Tensorskala im
+  Epilog. Aktivierungen bleiben 16 bit. Auf `auto` waehlt sich jeder Rang
+  diesen Pfad selbst.
+* **sm75 (2080 Ti):** heute nicht lauffaehig. Drei unabhaengige Sperren bei
+  Capability 80. Upstream **vLLM** hat Turing nachgeruestet, sglang nicht.
+* **sm70 (V100):** Marlin gibt es dort auch upstream nicht (kein
+  `m16n8k8`-MMA), und bf16 fehlt der Karte ohnehin. Nur ueber einen
+  reinen Torch-/Triton-Dequantpfad in fp16 erreichbar.
+
+Empfehlung in einem Satz: nichts neu bauen, was schon da ist; die drei
+echten Fork-Deltas sind (1) compressed-tensors-NVFP4 auf sm8x freischalten,
+(2) der fehlende Determinismus-Gegenpart zu #192, weil NVFP4 auf sm80..88
+ausschliesslich auf dem als nichtdeterministisch vermessenen Marlin-Kernel
+sitzt und — anders als fp8 — keine Ausweichspur hat, (3) ein fused
+Dequant-GEMV nach Muster #189, das Decode beschleunigt und sm75/sm70/gfx900
+per Konstruktion mitnimmt.
+
+### 1. Format, exakt
+
+E2M1: 1 Vorzeichen, 2 Exponent, 1 Mantisse. Darstellbar sind
++/- {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}, Maximum 6.0, zwei Kodierungen der
+Null. Zwei Werte je uint8, gepackt entlang K.
+
+Zwei Skalenebenen:
+
+1. **Blockskala** je 16 Werte entlang K, gespeichert als `float8_e4m3fn`.
+2. **Tensorskala** je Tensor, fp32.
+
+Auf Platte (verifiziert an den safetensors-Headern von
+`nvidia/Qwen3-8B-NVFP4` und `RedHatAI/Llama-3.1-8B-Instruct-NVFP4`):
+
+| Rolle | ModelOpt (`nvidia/*`) | compressed-tensors (`RedHatAI/*`) | dtype | Form |
+|---|---|---|---|---|
+| Gewicht | `weight` | `weight_packed` | U8 | `[N, K/2]` |
+| Blockskala | `weight_scale` | `weight_scale` | F8_E4M3 | `[N, K/16]` |
+| Tensorskala | `weight_scale_2` | `weight_global_scale` | F32 | `[]` bzw. `[1]` |
+| Aktivierungsskala | `input_scale` | `input_global_scale` | F32 | `[]` bzw. `[1]` |
+
+Die Blockskala liegt auf Platte **linear**, nicht verschraenkt; das
+CUTLASS-128x4-Swizzle macht die Laufzeit (`swizzle_blockscale`), Marlin
+ignoriert es und permutiert selbst.
+
+**Falle, die man nur einmal uebersieht:** die beiden Erzeuger speichern die
+Tensorskala reziprok zueinander. ModelOpt legt `amax/2688` ab, genau was
+Marlin konsumiert; compressed-tensors legt `2688/amax` ab, also den Divisor.
+vLLM behandelt das explizit an zwei Stellen (`1.0 / weight_global_scale` im
+CT-Schema, keine Umkehrung im ModelOpt-Pfad). Jede eigene CT-Anbindung muss
+das mitmachen, sonst ist das Ergebnis um `(2688/amax)^2` falsch — ein
+stiller Zahlenfehler, kein Absturz.
+
+Abgrenzung MXFP4 (OCP): Blockgroesse 32 statt 16, Skala E8M0 (reine
+Zweierpotenz) statt E4M3, **keine** zweite Ebene. Praktisch: NVFP4 trifft
+Blockskalen zwischen den Zweierpotenzen, zum Preis der doppelten
+Skalenspeicherung. Im Code sind die beiden ueber die Skalen-dtype
+unterschieden, nicht ueber ein Flag (`w1_scale.dtype == float8_e8m0fnu` vs.
+Vorhandensein der globalen Skalen).
+
+### 2. Vorpruefung: was existiert schon
+
+#### (a) Im eigenen Fork — vollstaendiger Marlin-W4A16-Pfad fuer SM80..SM89
+
+Nicht Fork-Delta, sondern upstream-Bestand auf diesem Zweig. Historie
+upstream sglang: Issue #19491 -> PR #19652 ("NVFP4 Marlin fallback for
+non-Blackwell GPUs (SM75+)") -> **Revert** #22047 (`6aafe756b9`, Hygiene,
+nicht Korrektheit) -> wieder gelandet als Teil von #25655
+(`b8d7351a74`), aber **als SM80+, der SM75-Anspruch wurde dabei fallen
+gelassen** und der compressed-tensors-Pfad nicht mitrestauriert.
+
+Auswahl des Backends, `python/sglang/srt/layers/quantization/fp4_utils.py`
+in `initialize_fp4_gemm_config`:
+
+```python
+if backend == "auto":
+    if is_sm100_supported():
+        backend = "flashinfer_cutedsl"
+    elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
+        backend = "marlin"
+    else:
+        backend = "flashinfer_cutlass"
+```
+
+Aufgerufen in `python/sglang/srt/managers/scheduler.py:854`, also **je
+Scheduler-Prozess = je Rang**. Das ist der Grund, warum gemischte Pfade
+strukturell schon funktionieren (siehe Abschnitt 4).
+
+Beteiligte Stellen:
+
+* `python/sglang/srt/layers/quantization/modelopt_quant.py:1511` — die
+  Marlin-Abzweigung in `ModelOptFp4LinearMethod.process_weights_after_loading`,
+  **vor** dem Blackwell-Verbot bei `:1523`. Verlangt `group_size == 16`.
+* `modelopt_quant.py:1737` `ModelOptNvFp4A16LinearMethod` — der reine
+  W4A16-Pfad, ruft `prepare_nvfp4_layer_for_marlin` bedingungslos, `apply`
+  ist bedingungslos `apply_fp4_marlin_linear`. Kein Arch-Test darin; er erbt
+  Marlins SM80-Boden. Wird ueber `ModelOptMixedPrecisionConfig` bei
+  `quant_algo == "W4A16_NVFP4"` gewaehlt.
+* `modelopt_quant.py:1899-1907` — MoE-Gate; `use_marlin_fallback =
+  (8, 0) <= capability < (10, 0)`, und `:2447` setzt den MoE-Runner auf
+  MARLIN im selben Fenster.
+* `python/sglang/srt/layers/quantization/marlin_utils_fp4.py` —
+  `apply_fp4_marlin_linear`, `prepare_nvfp4_layer_for_marlin`,
+  `prepare_moe_nvfp4_layer_for_marlin`, `nvfp4_marlin_process_scales`.
+  Verweigert alles ausser fp16/bf16 als Aktivierung (`:89`).
+* `python/sglang/jit_kernel/csrc/gemm/marlin/dequant.h:358-425` — vier
+  `kFE2M1f`-Spezialisierungen (half2/bf162 x skip_flop). Keine
+  Nachschlagetabelle, sondern Bitmanipulation:
+
+  ```cpp
+  constexpr int MASK = 0x70007000;
+  int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  q <<= 4;
+  int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  ```
+
+  Das ist der Beweis der Machbarkeit auf Kernel-Ebene: E2M1 nach fp16 kostet
+  Maske, Schiebung, Oder — keine FP4-Hardware.
+* Die FP8-Blockskala wird ebenfalls per Schiebung expandiert: die Ladezeit
+  kodiert sie in ein eigenes S0E5M3-Byte um (`marlin_scales.view(int16) << 1`),
+  der Kernel schiebt einmal zurueck. Die Tensorskala wandert in den fp32-Epilog
+  und absorbiert dabei Exponentenbias und den 2^7-Faktor.
+
+Was auf dieser Karte **nicht** geht:
+
+* compressed-tensors-NVFP4 — `compressed_tensors_w4a4_nvfp4.py:37`
+  `get_min_capability() -> 100`, und
+  `compressed_tensors_w4a4_nvfp4_moe.py:42` wirft hart. Keine
+  Marlin-Abzweigung in beiden. Das ist die groesste konkrete Luecke: die
+  gesamte `RedHatAI/*-NVFP4`- und `*-NVFP4A16`-Familie faellt damit aus,
+  waehrend der numerisch gleichwertige `nvidia/*`-Checkpoint laeuft.
+* Alle `sglang.jit_kernel.nvfp4`-Einstiegspunkte — `nvfp4.py:34-41` verlangt
+  `major >= 10`. Betrifft den Marlin-Pfad nicht, er ruft sie nicht.
+* `sgl-kernel/csrc` enthaelt ueberhaupt keine FP4-Kernel; die FP4-Kernel
+  leben im JIT-Baum. Marlin liegt in beiden Baeumen. Der JIT uebersetzt
+  gegen die live gelesene Capability, auf einer 3080 also `sm_86` — der
+  `__CUDA_ARCH__ < 800`-Stub in `gptq_marlin.cuh:37` greift dort nicht.
+
+Doku im Fork ist an dieser Stelle **veraltet und widerspricht dem Code**:
+`docs/advanced_features/quantization.md:41` fuehrt `modelopt_fp4` als
+"Yes (Blackwell/SM100+)".
+
+#### (b) Upstream sglang
+
+Stand wie oben: SM80+, nur ModelOpt-Format, compressed-tensors weiterhin bei
+min capability 100. Kein Turing.
+
+#### (c) vLLM als Vorbild — deutlich weiter
+
+Verifiziert an `/spinning/shvllm` (HEAD `f05611dfe6`, 2026-07-08; die
+`vllm/`- und `csrc/`-Baeume sind unveraendert upstream).
+
+```python
+# vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py:34
+def is_fp4_marlin_supported():
+    return current_platform.is_cuda() and current_platform.has_device_capability(75)
+```
+
+Relevante PRs:
+
+| PR | Inhalt | Datum |
+|---|---|---|
+| #17687 | erster NVFP4-Marlin-Kernel, dense + MoE, sm80+ | 2025-05-11 |
+| #29901 | Marlin fuer Turing (sm75): kein `cp.async`, `m16n8k8` statt `m16n8k16`, 2 statt 4 Stages | 2025-12-16 |
+| #31008 | Einzeiler `80 -> 75` in `is_fp4_marlin_supported` | 2025-12-19 |
+| #33076 | CT-NVFP4 und ModelOpt-NVFP4 auf Turing; Testmatrix auf einer **2080 Ti** | 2026-01-27 |
+| #41769 | ModelOpt NVFP4 W4A16 (4-bit Gewichte, fp16/bf16 Aktivierungen) | 2026-05-09 |
+| #45306 / #45375 | `modelopt_mixed` auf Ampere (89->80) bzw. Turing (80->75) | 2026-06 |
+
+Zwei Punkte daraus sind fuer uns entscheidungsrelevant:
+
+* **#29901 nennt die Turing-Einschraenkung explizit**: unterstuetzte
+  Aktivierung fp16 und int8, *nicht* bf16 — die sm75-Kernel-Uebersetzungs-
+  einheiten werden nur fuer fp16 erzeugt. Ein 2080-Ti-Rang muesste also
+  `--dtype float16` fahren. Auf einem gemischten Rig heisst das: entweder
+  alle Raenge fp16, oder der 2080-Ti-Rang faellt raus.
+* **#33076 ist der empirische Beleg**, den wir nicht selbst erbringen
+  muessen: vier NVFP4-Checkpoints (u.a. `nv-community/Qwen3-30B-A3B-NVFP4`,
+  `RedHatAI/Qwen3-32B-NVFP4A16`) laufen dort auf einer 2080 Ti.
+
+vLLM hat ausserdem eine Emulationsspur
+(`nvfp4_emulation_utils.py`, `kE2M1ToFloat`-Tabelle) als letzten Ausweg —
+reines Torch, arch-frei, langsam. Das ist die direkte Entsprechung zu
+unserem `dequant_fp8_weight` und der Beleg, dass die triviale Variante
+tragfaehig ist.
+
+### 3. Machbarkeitsurteil je Ebene
+
+**(a) Weight-only W4A16, dequant nach bf16, GEMM in 16 bit.** Auf sm86
+erledigt. Auf sm75 fehlt nur der Kernel, das Verfahren ist unveraendert
+(vLLM belegt es). Auf sm70 und gfx900 ist der Marlin-Weg zu; dort bleibt der
+Torch-Weg: Nibbles entpacken, per Bit-Trick oder Tabelle nach fp16, mit der
+auf `[N, K]` aufgeblasenen E4M3-Blockskala multiplizieren, Tensorskala
+dazu, dann `F.linear`. Das ist exakt die Struktur von `dequant_fp8_weight`,
+nur mit einer zweiten Skalenebene und einem Entpackschritt — funktioniert
+ueberall, ist aber ein voller `[N, K]`-16-bit-Zwischentensor je Linear je
+Forward. Speicherbild wie beim fp8-Pfad, nur mit Faktor **4x** statt 2x:
+die Gewichte bleiben 4-bit-resident (der Kapazitaetsgewinn), die Spitze
+steigt um eine Schicht.
+
+**(b) Fused Dequant-GEMV fuer Decode (Muster #189).** Machbar und der
+interessanteste Posten, aber nicht durch Umbenennen zu haben. Drei harte
+Unterschiede zum fp8-Kernel in `fp8_dequant_gemv.py`:
+
+* `_as_uint8_nk` setzt "ein Element = ein Byte" voraus. Bei NVFP4 ist die
+  gespeicherte Achse bereits `K/2`; jede Stride- und Maskenrechnung braucht
+  eine Trennung von K und K_gepackt.
+* Der Bitdekoder ist auf 1|4|3 in einem Byte verdrahtet. E2M1 ist 1|2|1 in
+  einem Nibble, zwei je Byte, und die beiden Nibbles muessen in der richtigen
+  Reihenfolge auf die K-Achse gefaltet werden.
+* **Das Leistungsargument des Kanalkernels ueberlebt nicht.** Der fp8-Kanal-
+  kernel gewinnt, weil die Skala vollstaendig aus der k-Schleife faellt.
+  Eine Skala je 16 Elemente entlang K tut das nicht; der NVFP4-GEMV
+  entspricht strukturell dem *Block*-Kernel, also dem schwaecheren der
+  beiden, mitsamt dessen `N >= K`-Torbedingung.
+
+Der Nebeneffekt ist der eigentliche Wert: Triton, keine `fp8e4nv`- oder
+FP4-Typen, also laeuft der Kernel per Konstruktion auch auf sm75, sm70 und
+gfx900 — genau der Grund, aus dem der fp8-GEMV die Bytes von Hand dekodiert.
+Er ist ausserdem deterministisch (feste Reduktionsreihenfolge, kein
+atomicAdd) und beantwortet damit Ebene (c) und den Determinismusposten aus
+Abschnitt 4 in einem Zug.
+
+Nicht uebernehmen: `FUSED_GEMV_MAX_ROWS = 16` und die `N >= K`-Bedingung
+sind fp8-**Messungen**, keine Herleitungen. Halbierte Bytes verschieben den
+GEMV/GEMM-Knick nach oben. Neu messen, und dabei die #274-7c-Falle im Kopf
+behalten: eine zu niedrige Schwelle raeumt den DFLASH-Drafter (Blockgroesse
+16) still vom fused Pfad und man misst die Ausweichspur.
+
+**(c) Was auf sm70 zusaetzlich fehlt.** bf16 gibt es dort nicht — alles muss
+fp16 sein, inklusive der Tensorskala-Konstante, die fuer fp16 mit einem
+anderen Exponentenbias (14 statt 126) vorberechnet wird. vLLM setzt den
+fp16-Rueckskalierungsfaktor deshalb auf 1.0 (`_nvfp4_compute_scale_factor`),
+weil fp16s engerer Exponentenbereich den Umweg schaedlich macht; es gab dazu
+zwei Bugfix-PRs (#33972 NaN/Inf bei fp16, #34577 BF16-Dequant-Unterlauf).
+Wer eine fp16-Spur baut, faengt sich diese beiden Fehler sonst neu ein.
+
+### 4. Kreuzachsen
+
+**Uneven TP mit gemischten Pfaden.** Strukturell schon vorgesehen: die
+Backend-Wahl faellt in `scheduler.py:854` je Rang, mit `auto` nimmt sich der
+5090-Rang seinen nativen Pfad und die 3080-Raenge Marlin. Zu beachten:
+
+* `is_sm100_supported` deckt nur Major 10 ab, der 5090 (sm120) faellt
+  deshalb nicht auf `flashinfer_cutedsl`, sondern auf `flashinfer_cutlass`
+  (nativ fp4, `is_blackwell_supported` schliesst Major 12 ein). Kein Fehler,
+  aber der Pfad ist ein anderer als auf einem B200.
+* `--fp4-gemm-backend` ist **ein** globaler Serverschalter. Explizit
+  `marlin` zieht auch den 5090 auf W4A16. Es gibt keine Rang-Syntax; `auto`
+  ist die einzige Einstellung, die je Rang das Richtige tut.
+* **Der ernste Posten ist nicht die Determinismusfrage, sondern die
+  Numerik.** Bei einem W4A4-Checkpoint quantisiert der 5090-Rang die
+  *Aktivierungen* nach fp4, die 3080-Raenge rechnen sie in bf16. Das TP-
+  all-reduce summiert danach Teilprodukte, die mit unterschiedlicher
+  Aktivierungspraezision entstanden sind — die Abweichung liegt oberhalb der
+  Marlin-Offload-Schwelle von ~1e-2, die wir bei #77 akzeptiert haben, und
+  sie trifft jeden Rang, nicht nur die Stichprobe. Die Rang-0-
+  Broadcast-Regel (`capture_safe_tp_broadcast` in `spec_utils.py:102`,
+  Aufruf in `eagle_utils.py:1131`) rettet die *Uebereinstimmung* der Raenge,
+  weil sie Token-IDs und Accept-Indizes verteilt, nicht Tensoren — sie
+  rettet aber nicht die *Qualitaet* der Summe.
+
+  Zwei saubere Auswege, beide ohne Code:
+  1. Einen **NVFP4A16-Checkpoint** fahren. Dort gibt es gar keine
+     Aktivierungsquantisierung, `ModelOptNvFp4A16LinearMethod` faehrt auf
+     *allen* Raengen unbedingt Marlin, auch auf dem 5090. Alle Raenge rechnen
+     identisch. Das ist die Empfehlung fuer dieses Rig.
+  2. `--fp4-gemm-backend marlin` erzwingen: gleiche Uniformitaet, kostet den
+     nativen fp4-Durchsatz des 5090.
+
+* **Teilbarkeit unter uneven TP.** `tp_loaded_shard_start` rechnet den
+  Startversatz aus der Laenge der *geladenen* Achse neu und prueft ihn gegen
+  die tatsaechliche Parameterform, wirft also bei Unstimmigkeit. Beide
+  NVFP4-Tensoren sind `ModelWeightParameter(input_dim=1, output_dim=0)`, die
+  Eingangsachse ist einmal `K/2` und einmal `K/16`. `partition_sizes` ohne
+  `units` ist homogen ersten Grades, die Aufteilung ist also konsistent —
+  aber sie verlangt Teilbarkeit auf *jeder* Achse. Konkret muss fuer
+  zeilenparallele Schichten `16 * sum(gewichte)` das volle K teilen; fuer
+  `2,1,1` (Summe 4) und K = 4096 heisst das 64 | 4096, erfuellt. Ein
+  Verstoss endet in `uneven-TP shard mismatch`, also fail-fast, nicht still
+  falsch. Fuer die Unit-Plaene aus `uneven_perf.py` gilt dasselbe eine Stufe
+  strenger, weil `total // units` auf der `/16`-Achse 16-fach kleiner ist.
+  Das ist pruefbar ohne GPU und gehoert als Vorbedingung mit klarer
+  Fehlermeldung an den Planer, nicht in eine Kernel-Ausnahme.
+
+**Expert-Offload (#123-Familie).** Der Kopiermechanismus selbst ist
+formatblind: er kennt nur "Achse 0 ist die Expertenachse", `dtype` und
+`element_size()`, keine Byte-je-Gewicht-Annahme. Drei konkrete Arbeiten:
+
+* `EXPERT_TENSOR_ATTRS` in
+  `python/sglang/srt/layers/moe/expert_offload.py:713-742` ist eine
+  Namensliste. NVFP4 steht nicht darin — weder die Roh-Namen noch die
+  Nach-Repack-Marlin-Namen, die der GPTQ/AWQ-Zweig dort auffuehrt.
+* Der Presplit muss aus dem NVFP4-MoE-Pfad heraus aufgerufen werden, so wie
+  `fp8.py:2292`, `awq_moe.py:169` und `gptq_moe.py:136` es tun.
+* **Hoechstes Fehlerrisiko:** die Formpruefung `t.shape[0] != E` ueberspringt
+  Tensoren stillschweigend. Eine echt globale Tensorskala (`dim()==0`)
+  wird dadurch korrekt uebersprungen; eine **je-Experte** vorliegende Skala
+  der Form `(E,)` wuerde faelschlich mitgestaged bzw. bei falscher
+  Reihenfolge zum falschen Experten gepaart. `modelopt_quant.py:2134-2158`
+  zeigt, dass `w13_weight_scale_2` sehr wohl zweidimensional
+  `[E, 2]` sein kann und dort auf die Gate-Spalte kollabiert wird. Genau
+  diese Kante zuerst mit einem Falsifikator absichern.
+
+**Determinismus, der fehlende #192-Gegenpart.** `deterministic_fp8_marlin_disabled()`
+in `fp8_utils.py:266` schaltet auf sm80..88 den fp8-Marlin ab, *weil #190
+dort gemessen hat, dass `gptq_marlin_gemm` nicht lauftreu ist* (K-Slice-
+Reduktionsreihenfolge, bis zu 12/1200 abweichende Wiederholungen bei M=512,
+schlechtestes Element ~1e-1), und armiert im selben Helfer die
+Dequant-Ausweichspur. NVFP4 auf sm86 benutzt **denselben Kernel**. Der
+Schluss ist eine Herleitung, keine eigene Messung: derselbe Reduktionsbau,
+also dieselbe Erwartung. Der atomicAdd-Vektor ist es nicht — der ist im
+Fork per `if not True:` in `should_use_atomic_add_reduce` tot und
+`USE_FP32_REDUCE_DEFAULT = True`.
+
+Der Unterschied zu fp8 ist der, auf den es ankommt: **fuer NVFP4 gibt es
+keine Ausweichspur, die man armieren koennte.** Marlin abzuschalten
+hinterlaesst einen Checkpoint ohne GEMM. Genau die Situation, die die
+#192-Paarungsinvariante verhindern soll. Ein NVFP4-Determinismusschalter
+setzt deshalb zwingend eine Dequantspur voraus — was ihn an Scheibe M2
+bindet und die Reihenfolge festlegt.
+
+**GGUF ist nicht betroffen.** Eigenes Format, eigener Loader, eigene
+MMVQ/K-Quant-Kernel; die uneven-TP-Arbeiten dort (#82 16-Element-MLP-Einheiten,
+#109, #113) haben mit NVFP4 keine gemeinsame Codeflaeche. Der Expert-Offload
+lehnt GGUF-MoE ohnehin ausdruecklich ab (`_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES`).
+Die Beruehrung beschraenkt sich auf geteilte Marlin-Infrastruktur, die GGUF
+nicht benutzt.
+
+### 5. Aufwandsscheiben
+
+**S — vorhandene Kernel wiederverwenden, kein neuer CUDA-Code**
+
+| Posten | Inhalt |
+|---|---|
+| S1 | Bootbeleg auf einer 3080 mit einem `nvidia/*`-NVFP4-Checkpoint. Reine Bestaetigung des vorhandenen Pfades; danach `docs/advanced_features/quantization.md:41` korrigieren (steht heute falsch auf "Blackwell/SM100+"). |
+| S2 | uneven-TP-Vorbedingung `16 * sum(gewichte) \| K` als benannte Pruefung mit Fehlermeldung, statt als `uneven-TP shard mismatch` aus dem Ladepfad. |
+| S3 | **compressed-tensors-NVFP4 auf sm8x freischalten.** `get_min_capability` 100 -> 80 plus Marlin-Abzweigung in `CompressedTensorsW4A4Fp4`, analog zur ModelOpt-Abzweigung; `prepare_nvfp4_layer_for_marlin` ist wiederverwendbar. **Die Kehrwert-Konvention der Tensorskala nicht vergessen.** vLLM hat das Muster fertig. Bestes Verhaeltnis Nutzen zu Aufwand der ganzen Liste: schaltet die komplette `RedHatAI/*-NVFP4A16`-Familie frei. |
+| S4 | Expert-Offload: NVFP4-Tensornamen in `EXPERT_TENSOR_ATTRS`, Presplit-Aufruf im NVFP4-MoE-Pfad, Falsifikator gegen die `(E,)`-vs-skalare-Skalenkante. |
+
+**M — neuer Triton-Code, kein neues Kernelverfahren**
+
+| Posten | Inhalt |
+|---|---|
+| M1 | Reine Torch-Dequantspur `nvfp4 -> fp16/bf16` als Ausweichspur (Muster `dequant_fp8_weight`, Vorbild `nvfp4_emulation_utils`). Arch-frei. Voraussetzung fuer M3. |
+| M2 | Fused NVFP4-Dequant-GEMV fuer Decode nach Muster #189. Nibble-Entpacken, Blockskala je 16 in der k-Schleife, Tensorskala aussen. Nimmt sm75/sm70/gfx900 per Konstruktion mit und ist deterministisch. Schwellen neu messen, nicht erben. |
+| M3 | `SGLANG_DETERMINISTIC_NVFP4_GEMM` mit derselben Paarungsinvariante wie #192, gepinnt durch einen Test nach dem Muster von `test_deterministic_fp8_gemm.py::test_pairs_with_the_dequant_fallback`. Setzt M1 oder M2 voraus. |
+
+**L — neuer CUDA-Kernelcode**
+
+| Posten | Inhalt |
+|---|---|
+| L1 | sm75-Marlin: Portierung des Turing-Zweigs (kein `cp.async`, `m16n8k8`, 2 Stages, nur fp16). vLLM #29901 ist die Vorlage, das Ergebnis waere aber ein eigener Kernelzweig in beiden Marlin-Baeumen des Forks. Nur sinnvoll, wenn die 2080 Ti dauerhaft NVFP4 tragen soll — M2 deckt dieselbe Karte langsamer, aber ohne CUDA-Arbeit ab. |
+| L2 | Nativer FP4-GEMM auf Nicht-Blackwell. Gegenstandslos, die Hardware existiert nicht. Nicht verfolgen. |
+
+Reihenfolge: S1 -> S3 -> S2/S4 -> M2 (der Kernel, der drei Fragen zugleich
+beantwortet) -> M1/M3. L1 nur auf ausdruecklichen Bedarf.
+
+### 6. Was damit auf diesem Rig laufbar wird
+
+Groessen sind Plattenbytes. Kritisch ist die Spalte "Modus": ein
+W4A4-Checkpoint laedt auf Ampere zwar, faellt dort aber still auf
+gewichtsseitig 4 bit zurueck (die `input_global_scale` wird ignoriert) — das
+ist genau der Fall, der auf einem gemischten Rig die Numerik spreizt.
+
+Ganz auf den 5090 (W4A16-freundlich, alle Raenge identische Mathematik):
+
+| Repo | GB | Modus |
+|---|---|---|
+| `RedHatAI/Qwen3-32B-NVFP4A16` | 20,7 | gewichtsseitig |
+| `kaitchup/gemma-4-31B-it-NVFP4A16` | 20,4 | gewichtsseitig |
+| `Benasd/Qwen3-30B-A3B-Instruct-2507-NVFP4A16` | 18,1 | gewichtsseitig, MoE |
+| `cortecs/Qwen3-8B-NVFP4A16` | 6,4 | gewichtsseitig |
+
+Ueber das Rig verteilt (uneven TP):
+
+| Repo | GB | Modus |
+|---|---|---|
+| `RedHatAI/Llama-3.1-70B-Instruct-NVFP4A16` | 42,7 | gewichtsseitig |
+| `gesong2077/Qwen3-Next-80B-A3B-Thinking-NVFP4A16` | 48,0 | gewichtsseitig, MoE |
+| `nvidia/Qwen3.6-27B-NVFP4` | 21,9 | MIXED, W4A4 |
+| `nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4` | 50,8 | W4A4, MoE |
+
+Beachten: **die Namensendung ist nicht verlaesslich.**
+`prithivMLmods/Qwen3.6-27B-NVFP4` ist trotz fehlendem `A16` gewichtsseitig
+(`input_activations: null`). Entscheidend ist das Feld, nicht der Name.
+`mlx-community/*`-NVFP4 sind MLX-gepackt und nicht CUDA-ladbar (Erkennungs-
+merkmal: deutlich kleiner als dasselbe Modell in echtem NVFP4).
+
+Die S3-Scheibe ist hier direkt sichtbar: von den sieben oben genannten
+gewichtsseitigen Checkpoints sind vier `RedHatAI/*`, also
+compressed-tensors, also heute auf sm86 gesperrt.
+
+### 7. Offene Falsifikatoren (nichts davon ist gemessen)
+
+1. **Laeuft NVFP4 heute auf einer 3080?** Die gesamte Aussage in Abschnitt 2
+   ist Codepfadlesung, kein Boot. Erste und billigste Pruefung.
+2. **Ist `gptq_marlin_gemm` fuer `kFE2M1f` auf sm86 tatsaechlich
+   nichtdeterministisch?** Hergeleitet aus #190 (fp8, gleicher Kernel),
+   nicht nachgemessen. Der #190-Messaufbau ist wiederverwendbar.
+3. **Wie gross ist die Rangspreizung bei gemischt nativ/Marlin?** Nur eine
+   Zahl, aber sie entscheidet, ob W4A4-Checkpoints auf gemischten Rigs
+   ueberhaupt vertretbar sind, oder ob NVFP4A16 die einzige Empfehlung
+   bleibt.
+4. **Trifft die uneven-TP-Teilbarkeit fuer die real gefahrenen Vektoren?**
+   Ohne GPU pruefbar: `partition_sizes` gegen `K`, `K/2`, `K/16` fuer die
+   Zielmodelle durchrechnen.
