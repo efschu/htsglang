@@ -12018,3 +12018,283 @@ lesen will, muss diesen Vorbehalt mitlesen.
   Messlatte fuer den Transport. tok/s und Accept-Laenge sind dieselbe
   schwankende Groesse in zwei Schreibweisen und verdecken einen 14-Prozent-
   Unterschied bei bs=4/8.
+
+## Welle-2-Fenster: #289-Beleg, #298b-Lanes+3,2,2, #290-Evidenz (2026-07-30)
+
+Ein gebuendeltes Kartenfenster, 40 min ab Lock-Erwerb, drei unabhaengige
+Posten in Prioritaetsreihenfolge. Rohdaten in
+`/spinning/gpu-battery-results/2026-07-30_welle2/`. Leistungsaufzeichnung
+ueber das ganze Fenster mit 1-s-Takt (`power/rig_power_1s.csv`, eigener
+Prozess, am Ende beendet). JIT-Cache vor dem ersten Boot geprueft: alle drei
+htccl-`.so` (15:39:54-15:41:53) sind neuer als die neueste Quelle (15:31:16).
+
+### Der Befund, der das ganze Fenster gepraegt hat: die Stage-0-Sonde haengt
+
+`PROFILE_VERSION` ist mit #298a von 2 auf 3 gestiegen, und die Version steht im
+Cache-Schluessel. Damit ist auf diesem Rig **jedes** gecachte Profil ungueltig
+und **jeder** Boot mit `--rank-tp-ratio auto-performance` laeuft in eine
+frische Sonde. Deren zweiter Teil, die paarweise NCCL-Link-Matrix
+(`run_probe` -> `mp.spawn(_link_worker, ...)`), kommt hier nicht durch: alle
+drei Arbeiter stehen in `_create_c10d_store` (py-spy-Dumps in
+`posten1/pyspy-probe-*.txt`), Rang 0 haelt `*:29517`, die Karten liegen bei
+0 % Auslastung und 15-20 W. Nach 600 s gibt `get_hardware_profile` per
+Subprozess-Timeout auf und bootet ohne Profil weiter.
+
+Die Kosten sind nicht theoretisch: **600 s Kartenzeit pro Boot** in einem
+40-min-Fenster. Posten 1 hat 8 min davon bezahlt, bevor die Sonde erkannt und
+beendet wurde; die folgenden Posten sind daran vorbeigefahren.
+
+Der **per-GPU-Teil der Sonde ist nicht betroffen** — er laeuft vor der
+Link-Matrix und war in 6,1 s fertig. Genau das hat Posten 2a getragen.
+
+### Posten 1 — #289: AWQ-Marlin unter uneven TP bootet
+
+Kommando wie gebrieft (`run_step.sh s03 --force`, Rezept
+`boot_b_dense_head.sh` unveraendert), Vorlauf `s00_preflight` PASS.
+
+**Der Shape-Fehler ist weg.** Der Lauf vom 2026-07-29 starb im Laden an
+`ValueError: Weight output_size_per_partition = 9504 is not divisible by
+min_thread_n = 64` (zweimal im Log). Dieser Lauf: **null** Treffer fuer
+`not divisible by` / `is not a multiple of`, `awq_marlin` 22-mal aktiv,
+Gewichte in 2,38-2,46 s geladen, Server 19:17:28 oben ("fired up and ready to
+roll"), `max_total_num_tokens=655520`. Beide Laeufe fahren denselben
+Basisvektor `derived weights [29607, 17780, 17780]` — der Vergleich steht auf
+derselben Geometrie.
+
+Kurzgeneration kohaerent, Accept ueber fuenf Prompts (K=3, 192 Token):
+
+| Prompt | accept_len gemessen | meta_info spec_accept_length | Runden |
+|---|---:|---:|---:|
+| alphabet | 1,1988 | 1,1566 | 171 |
+| squares  | 1,3514 | 1,5484 | 296 |
+| repeat   | 1,4668 | 1,7455 | 407 |
+| code     | 1,4143 | 1,2632 | 560 |
+| prose    | 1,4820 | 1,8286 | 666 |
+
+VRAM (333 Proben): 3080 Peak 18025 / MIN frei 2455 MiB, 5090 Peak 27493 / MIN
+frei 5114 MiB, 3080 Peak 16931 / MIN frei 3549 MiB. Korridor gruen
+(>= 400 MiB); die knappste Karte liegt mit 2455 MiB unter der
+2700-MiB-Reservemarke der 3080-Pins — kein Abbruchgrund, aber der Posten, der
+bei einer Erhoehung des Arbeitspunkts zuerst zieht.
+
+**Das Check-Verdikt lautet FAIL, und das ist ein Artefakt dieses Fensters,
+kein #289-Befund.** Der Fatal-Grep findet in `server.log:17`
+`Traceback (most recent call last)` — den Abbruch der Stage-0-Sonde, die um
+19:16:37 bewusst beendet wurde, um die 600 s nicht zu bezahlen. Der Traceback
+nennt `uneven_perf.py:983 mp.spawn(_link_worker ...)`. Boot, Laden, Spec-Pfad
+und Accept-Sonde liefen danach vollstaendig durch.
+
+**Nebenbefund zur Boot-B-Frage selbst** (nicht Teil des Auftrags): der
+BF16-Kopf auf INT4-Koerper landet mit 1,20-1,48 im Band 1,15-1,53 der Runde
+7b. Die Kopf-Praezision ist damit von Q3 bis BF16 **nicht** der Hebel; die des
+Targets ist es.
+
+### Posten 2a — #298b: die drei FP8-Lanes, erstmals gemessen
+
+Weil die volle Sonde in der Link-Matrix haengt, wurde der per-GPU-Teil separat
+gefahren (`lane_probe_only.py` — dieselben Funktionen, dieselbe Reihenfolge,
+dieselben Shapes; das Ergebnis traegt `"partial": true` und wird **nicht** in
+den Profil-Cache geschrieben, weil ein Profil ohne Link-Matrix keins ist).
+6,1 s Kartenzeit.
+
+| Karte | bf16 | fp8_native | fp8_marlin | fp8_w8a16 | Dispatch-Lane |
+|---|---:|---:|---:|---:|---|
+| RTX 5090 (sm_120) | 233,3 | **566,2** | 216,6 | 178,4 | fp8_native |
+| RTX 3080 (sm_86) #1 | 63,2 | – | – (wirft) | **53,6** | fp8_w8a16 |
+| RTX 3080 (sm_86) #2 | 62,2 | – | – (wirft) | **53,5** | fp8_w8a16 |
+
+TFLOPS bei der Sonden-Shape.
+
+* **5090: `fp8_native` gewinnt mit 566,2** — die im Modulkommentar genannten
+  566,9 sind reproduziert. Native schlaegt Marlin um 2,61x, die Dequant-Lane
+  um 3,17x.
+* **3080: `fp8_native` faellt erwartungsgemaess aus** (`torch._scaled_mm`
+  verlangt sm >= 8.9).
+* **Die Marlin-Probe wirft, und der Grund ist festgehalten:**
+  `RuntimeError: Runtime check failed at .../gptq_marlin_repack.cuh:355: CUDA
+  error: no kernel image is available for execution on the device`. Das ist
+  **kein** Architekturbefund ueber sm_86 — fp8-Marlin ist dort laut
+  `fp8_utils.can_auto_enable_marlin_fp8` genau die Lane des Serving-Pfads. Es
+  ist ein **Build-Befund**: der Pfad im Fehlertext zeigt auf
+  `/spinning/wt-merge-probe/python/sglang/jit_kernel/...`, also einen
+  JIT-Kernel aus einem **anderen** Worktree, dessen Build kein
+  sm_86-Kernelimage enthaelt. Die AOT-/JIT-Cache-Arch-Falle, diesmal in der
+  Lane-Sonde. Solange sie steht, degradiert das Rig laut zur Dequant-Lane —
+  wie vorgesehen (Notiz statt Ersatzzahl) —, aber die 3080-Zahl ist damit ein
+  **unterer** Wert fuer das, was die Karte auf dieser Lane koennte.
+* **Die reale FP8-Spreizung ist 566,2 : 53,6 : 53,5 = 10,56 : 1 : 1.** Der
+  `fp8_objective_audit` von #296 hatte 8,64 : 1 : 1 angesetzt und ausdruecklich
+  als **untere** Schranke bezeichnet ("the real spread is therefore >= 8.64",
+  weil dort die bf16-Rate der 3080 als Obergrenze eingesetzt wurde). Gemessen:
+  10,56. Die Annahme haelt, und die Konzentration, die das Prefill-Objective
+  will, ist eher groesser als angenommen.
+* Bandbreite daneben: `membw_gemv` 1533,5 / 718,2 / 718,2 GB/s, Rohverhaeltnis
+  2,14 : 1 : 1.
+
+### Posten 2b — der planner-effektive Decode-Vektor 3,2,2 ist KEIN Extremum
+
+Der offene Kandidat aus #296: der vorhergesagte **effektive** Decode-Vektor
+1,46 : 1 : 1, im Unterschied zum rohen Bandbreitenvektor 7:3:3, den Arm 3
+bereits gefahren hat. Auf dem realen 136-Einheiten-MLP-Gitter liegen 1,46:1:1
+(57,4 Einheiten auf Rang 0) und die Ganzzahlfassung 3,2,2 (58,3) **eine
+Einheit** auseinander — 3,2,2 ist die getreue Realisierung, keine Naeherung,
+die das Verdikt drehen koennte. Fixposten vorab in `p2b_fixed_posts.md`.
+
+Rezept identisch zum #296-Anker bis auf den gepinnten Vektor: bar1, Reserve
+4500,4200,4200, `--rank-kv-ratio 7,3,3`, `--decode-log-interval 1`. Boot in
+84 s (ohne Sonde, siehe unten), `max_total_num_tokens=432172` gegen 433017 des
+Ankers — 0,2 % Unterschied, kein Kontextpreis.
+
+| Punkt | ms/Verify | vs Anker | Anker | accept | Ticks | tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| bs=1 | 30,401 | **~1,003** | 30,31 | 3,00 | 120 | 98,7 |
+| bs=8 | 6,667 | **~1,012** | 6,59 | 2,75 | 84 | 412,5 |
+
+Boden ms/Verify 2,72 % (#294). **Beide Verhaeltnisse liegen im Boden.**
+
+**Verdikt: nein.** 3,2,2 liegt im Decode nicht unter dem Anker, sondern ist von
+ihm nicht unterscheidbar. Zusammen mit Arm 3 aus #296 (7,3,3: 1,071 bei bs=1,
+~1,016 bei bs=8) ist die Decode-Achse damit geschlossen: **weder der rohe
+Bandbreitenvektor noch der effektive Vektor schlaegt den schlichten
+VRAM-auto-Anker.** Der Eintrag "offener Kandidat fuer ein Decode-Extremum
+unterhalb des Ankers" aus #296 ist damit erledigt — negativ.
+
+**Zwei Korrekturen am Briefing, beide erzwungen:**
+
+1. Die Achse ist `--rank-mlp-ratio`, nicht `--rank-tp-ratio`. Ein expliziter
+   `--rank-tp-ratio` wird zusammen mit `--rank-auto-reserve-mib` hart
+   abgelehnt (`--rank-auto-reserve-mib only applies with --rank-tp-ratio
+   auto`), und die Reserve traegt das ganze bar1_hi-Rezept. `--rank-mlp-ratio`
+   ist ausserdem die Achse, auf der 1,46:1:1 vorhergesagt wurde, und die, auf
+   der s15 die Arme 2-4 gegen genau diesen Anker variiert hat. Ein gepinnter
+   MLP-Vektor nimmt zusaetzlich den Pin-Pfad in `uneven_perf` und kehrt
+   **vor** `get_hardware_profile()` zurueck — derselbe Grund, aus dem s15s
+   Arme 2-6 schnell booteten, und in diesem Fenster der Weg an der haengenden
+   Sonde vorbei (84 s Boot statt 600 s Sonde + Boot).
+2. `--rank-kv-ratio speed` war nicht fahrbar: der Modus wird aus
+   `rank_kv_speed_weights` bedient, die nur ein Hardwareprofil fuellt. Der Arm
+   traegt 7,3,3 — zusaetzlich der Ankerwert, sodass gegen den #296-Anker genau
+   **ein** Delta bleibt.
+
+### Posten 3 — #290: der Q8-GGUF-DFLASH-Accept-Kollaps ist reproduziert
+
+Repro und Evidenz, kein Fix. Rezept `boot_c_dflash_solo_q8.sh` unveraendert
+ueber `run_step.sh s04 --force`; daneben lief `probe_killer.sh`, der die
+haengende Sonde nach 45 s statt nach 600 s beendet (erkannt 19:29:38, beendet
+19:30:23-30, protokolliert in `posten3/probe_killer.log`).
+
+**Verdikt identisch zum Erstboot:** `BATTERY-FAIL s04_boot_c: boot_c/alphabet:
+accept_len_mean ist None -- Spec-Pfad laeuft nicht oder die Sonde ist aus`.
+Wortgleich mit dem Lauf vom 2026-07-30_bar1. Der Kollaps ist stabil, kein
+Einmalereignis.
+
+Zahlen ueber alle fuenf Prompts (K=3, 192 Token), jeweils identisch:
+
+| Groesse | Wert |
+|---|---|
+| `accept_len_mean` (Positionssonde) | **None** |
+| `rounds` (Positionssonde) | **0** |
+| `meta_info spec_accept_length` | **1,00524** |
+| `completion_tokens` | 192 (alle fuenf Prompts vollstaendig erzeugt) |
+
+`spec_accept_length` 1,005 heisst: pro Verify-Runde wird praktisch nur das
+Token des Targets uebernommen, vom Entwurf im Mittel 0,005. Nicht "wenig
+Accept" — **kein** Accept.
+
+**Wohin die Evidenz zeigt — und wohin ausdruecklich nicht.** Die
+Wurzelrichtung "Drafter-Gewichte falsch geladen" ist von diesem Lauf
+**entlastet**:
+
+* null Treffer fuer `tensor name` / `KeyError` / `missing key` /
+  `unexpected key` im Serverlog (der Abbruchgrund, den das Rezept fuer den
+  Ladepfad ausdruecklich vorsieht),
+* der Solo-Entwurfspfad plant und belegt normal: `Draft-solo capacity curve:
+  P(g=4.267)=28938, P(g=17.000)=10696 -> alpha=1.481e-05 beta=4.629e-06
+  (budget 2.06 GB)`, `Draft-solo KV planning: rank 1 draft-KV cell term
+  10240 -> 43691 B/token (factor 4.267)`, `DFLASH solo draft pool: full
+  global-mirror pool`,
+* der Entwurfs-Verify-Graph wird sauber aufgezeichnet: `Capture draft verify
+  CUDA graph end. elapsed=1.66 s, mem usage=0.23 GB, avail mem=2.60 GB`,
+  bs=[1..8], num_tokens_per_bs=16.
+
+Der Drafter laedt also, plant, belegt Speicher und wird in den Graphen
+aufgenommen — und liefert trotzdem nichts Annehmbares. Damit bleiben die
+beiden anderen Richtungen aus dem Auftrag uebrig, **Logit-Mismatch** und
+**Verify-Pfad**, und zwischen diesen beiden trennt dieser Lauf noch nicht.
+
+VRAM (249 Proben): 3080 Peak 19053 / MIN frei **1427** MiB, 5090 Peak 20955 /
+MIN frei 11652 MiB, 3080 Peak 13381 / MIN frei 7099 MiB. Korridor gruen, aber
+die Drafter-Karte ist mit 1427 MiB die knappste Karte des ganzen Fensters.
+
+**Was NICHT gemessen wurde**, und warum: (b) eine Ausgabeprobe auf Kohaerenz
+und (d) der NEXTN-Kontrollarm. `accept.json` speichert keinen Ausgabetext, und
+das Rezept raeumt den Server unmittelbar nach der Sonde ab — als die
+Kohaerenzfrage gestellt werden konnte, war Port 30079 schon tot. Ein zweiter
+Boot fuer den NEXTN-Kontrollarm haette ~5 min gebraucht, das Fenster hatte
+noch ~10 min und davon waren ~4 fuer Freigabe und Abschluss gebunden; nach
+der Abbruchreihenfolge (Posten 3 zuerst) wurde er nicht mehr gestartet. Beides
+gehoert in den naechsten Anlauf und ist billig, sobald der Server einmal
+stehen bleibt: eine Generation gegen den laufenden Port beantwortet
+kohaerent-vs-Muell, und derselbe Boot mit `--speculative-algorithm NEXTN`
+beantwortet, ob der Verify-Pfad ueberhaupt akzeptiert.
+
+### Leistung ueber das Fenster
+
+1-s-Abtastung ueber die ganze Kartenzeit (`power/rig_power_1s.csv`, 5652
+Zeilen). Rig = Summe der drei Karten.
+
+| Abschnitt | Rig-Mittel | 5090 Mittel | 5090 Spitze | Dauer |
+|---|---:|---:|---:|---:|
+| P1a Sonde haengt (19:08:49-19:16:37) | 69,0 W | **19,8 W** | 279,9 W | 469 s |
+| P1b Boot + Accept (19:16:38-19:19:30) | 216,3 W | 59,2 W | 218,2 W | 173 s |
+| P2a Lane-Sonde | 129,2 W | 38,4 W | 274,6 W | 36 s |
+| P2b 3,2,2 (Containersicht) | 418,0 W | 108,7 W | 275,0 W | 180 s |
+| P3 s04 DFLASH | 122,8 W | 34,2 W | 221,8 W | 122 s |
+
+Die auffaelligste Zeile ist die erste: **469 s bei 69 W Rig und 19,8 W auf der
+5090** — die haengende Sonde haelt drei Karten belegt und rechnet nichts. Das
+ist der Fingerabdruck des Befunds oben, in Watt statt in Sekunden.
+
+Hostseitig hat der 2b-Arm eine eigene Aufzeichnung mit Power-State-Spalte
+(`p2_tp322/power/tp322.csv`, 69 Proben je Karte): 3080 285,8 W (Spitze 307,9),
+**5090 195,9 W** (Spitze 275,0), 3080 267,1 W (Spitze 302,9), Rig-Mittel
+**748,8 W**, Zustaende P2:138 / P1:69. Gegen die 635,0 W des #296-Ankers bei
+nahezu gleicher Probenzahl (207 vs. 210) und gleichem Rezept sind das
+**+17,9 %** — 3,2,2 kauft bei gleichem ms/Verify also mehr Leistungsaufnahme
+ein. Die Zahl ist eine Beobachtung, kein Verdikt: die beiden Fenster liegen
+Stunden auseinander und der #296-Wert deckt zwei Punkte plus Luecken ab.
+Bemerkenswert bleibt die Verteilung — die beiden 3080 ziehen mehr als die
+5090, der langsamste Rang gibt den Takt vor.
+
+### Kartenzeit
+
+| Posten | Kartenzeit | Ergebnis |
+|---|---:|---|
+| 1 (#289 s03) | ~660 s | Boot belegt, davon 469 s an der haengenden Sonde verloren |
+| 2a (Lane-Sonde) | 6 s | 3 Karten x 4 Lanes gemessen |
+| 2b (3,2,2) | ~305 s | Boot 84 s + zwei Decode-Punkte, 120/84 Ticks |
+| 2b (Fehlstart) | ~35 s | argparse-Ablehnung, vor jedem Kartenzugriff |
+| 3 (#290 s04) | ~590 s | Repro, inkl. JIT-Kaltbau des Prefill-Graphen |
+| **Summe** | **~1924 s = 32,1 min** | von 2400 s (40 min) |
+
+Karten nach dem Lauf freigegeben: alle drei 0 MiB, CT999- und Host-Locks
+entfernt, `gpu-arb`-Fenster geschlossen, Leistungs-Logger beendet.
+
+### Was dieses Fenster fuer die naechsten hinterlaesst
+
+1. **Die haengende Stage-0-Sonde ist der teuerste offene Posten am Rig.** Seit
+   #298a (`PROFILE_VERSION` 2 -> 3) laeuft sie bei jedem
+   `auto-performance`-Boot neu und kostet 600 s. Zwei Auswege sind belegt:
+   ein gepinnter `--rank-mlp-ratio` kehrt vor `get_hardware_profile()` zurueck
+   (84 s Boot statt 600 s + Boot), und `probe_killer.sh` kuerzt die Wartezeit
+   auf 45 s, wenn gepinnt nicht geht. Der eigentliche Fix — warum
+   `_create_c10d_store` auf `MASTER_PORT` 29517 nicht durchkommt — ist nicht
+   Teil dieses Fensters; die py-spy-Dumps aller vier Prozesse liegen bei.
+2. **Ohne Profil gibt es keinen `--rank-kv-ratio speed` und kein
+   `auto-performance`.** Solange die Sonde haengt, faellt jeder Boot auf den
+   VRAM-auto-Basisvektor zurueck. Das ist kein stiller Fehler (es steht im
+   Log), aber es entwertet jeden Vergleich, der `auto-performance` im Namen
+   traegt.
+3. **Der fp8-Marlin-Kernel fehlt fuer sm_86 im JIT-Cache** und der Fehlertext
+   zeigt auf einen fremden Worktree. Bis das gerichtet ist, ist jede
+   3080-fp8-Zahl dieses Rigs ein unterer Wert.
