@@ -66,7 +66,20 @@ DECODE_BATCHES="${S15_DECODE_BATCHES:-1,8}"
 
 # The pinned reserve of the bar1_hi recipe (#293's best arm). Kept on every
 # arm including the NCCL ones, so the reserve never becomes a hidden variable.
-RESERVE="--rank-auto-reserve-mib 4500,4200,4200"
+RESERVE="--rank-auto-reserve-mib 4500,4200,4200 --decode-log-interval 1"
+
+# WHY --decode-log-interval 1 IS PART OF THE SHARED RECIPE. The decode measure
+# is a per-TICK number, and a tick is one scheduler log line. At the default
+# interval of 40 steps this rig produces 2-3 ticks per decode point -- the
+# first attempt of this step measured exactly that (bs=1 n=1, bs=8 n=3), which
+# is not a sample. The point cannot simply run longer: it ends when the 256
+# requested tokens are generated (2.8 s at bs=1, 5.0 s at bs=8), not at the
+# time box, so the tick COUNT is set by the log interval and nothing else. At
+# interval 1 the same points yield ~42 and ~31 ticks, over the n>=10 the window
+# asks for. The cost is one formatted log line per decode step, ~0.7 % of a
+# 7 ms round, and it is carried IDENTICALLY by every arm including the NCCL
+# ones -- so it can shift the absolute level slightly against earlier runs, but
+# never the comparison between the arms of this table.
 
 # name | transport | extra env | extra server args | points (sessions:decode)
 ARM_TABLE=(
