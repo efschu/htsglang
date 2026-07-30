@@ -70,6 +70,21 @@ GRUNDLINIE_QUELLE = (
 ARME = ("bar1", "grundlinie")
 DECODE_BATCHES = (1, 16)
 
+
+def _decode_batches(args) -> tuple:
+    """Decode batch sizes for this point.
+
+    The default stays (1, 16) so every earlier step measures byte-identically;
+    --decode-batches lets a caller ask for the batch sizes ITS question is
+    about. s15 asks for 1 and 8, because its prefill points are 1 and 8
+    sessions and a phase comparison that reads prefill at 8 and decode at 16 is
+    comparing two different load points.
+    """
+    raw = getattr(args, "decode_batches", None)
+    if not raw:
+        return DECODE_BATCHES
+    return tuple(int(part.strip()) for part in str(raw).split(",") if part.strip())
+
 PROSA = (
     "Erklaere in ruhigem, sachlichem Ton, wie ein Rechner mehrere Aufgaben "
     "gleichzeitig bearbeitet, und woran man merkt, dass er dabei an eine "
@@ -363,7 +378,7 @@ def modus_messen(args) -> int:
 
     decode = []
     if args.with_decode:
-        for batch in DECODE_BATCHES:
+        for batch in _decode_batches(args):
             von = time.time()
             punkt_decode = messe_decode(args.port, batch, args.point_seconds)
             punkt_decode.update(ernte_ticks(args.server_log, von, time.time(), batch))
@@ -661,6 +676,11 @@ def main() -> int:
     ap.add_argument("--warmup-seconds", type=float, default=8.0)
     ap.add_argument("--prompt-tokens", type=int, default=2048)
     ap.add_argument("--with-decode", type=int, default=1)
+    ap.add_argument(
+        "--decode-batches",
+        default="",
+        help="Comma-separated decode batch sizes; empty keeps the default 1,16.",
+    )
     ap.add_argument(
         "--server-log",
         default="",
