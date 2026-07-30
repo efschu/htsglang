@@ -13929,32 +13929,119 @@ offload- vs. resident-Regel, Ledger, Co-Location, Fehler-Dekoration).
 unveraenderter Fehlermenge gegen die Basis (14, alle umgebungsbedingt: kein
 CUDA, kein `sgl_kernel`, kein `torch_memory_saver`).
 
-GPU-Beleg steht aus. Kommando fuer das naechste Kartenfenster — derselbe
-`voll`-Arm aus `/spinning/gpu-battery-results/2026-07-30_vllm_fair/`, exakt
-zwei Aenderungen an `run_arm.sh`:
 
-1. `--rank-auto-reserve-mib 5200,4200,4200` → `--rank-auto-reserve-mib auto`;
-2. Arbeitsbaum: `cd /spinning/wt-final` und `hw=$(host_path
-   /spinning/wt-final)` auf einen Checkout von `fix/ladder-reserve-derivation`
-   zeigen lassen (`/spinning/wt-final` selbst **nicht** umschalten).
+Der GPU-Beleg wurde im Kartenfenster 2026-07-30 23:37-23:46 UTC nachgeholt —
+siehe den folgenden Abschnitt.
 
-Also, nach dem Kopieren des Skripts:
+## #313-Beleg: die Leiter finanziert sich auf der Karte (Kartenfenster 2026-07-30, 23:37-23:46 UTC)
+
+Zwei Boots auf `/spinning/wt-final` @ `91d7d45f4e` (enthaelt #313 gemergt), TP=3
+auf 5090 + 2x 3080, derselbe `voll`-Arm des #707-Verfahrens
+(`2026-07-30_vllm_fair/run_arm.sh`), AEON-Ultimate-Uncensored-FP8-MTP, KV 7,3,3,
+fp8-KV, chunked-prefill 2048, Solo-Draft auf Rang 0, high-accept-Leiter [1..5].
+Gegenueber der Vorlage genau drei Aenderungen: die Reserve-Zeile (das
+Untersuchungsobjekt), `RUN=` auf ein eigenes Ergebnisverzeichnis und der
+Host-Logname — die beiden letzten nur, damit der Lauf die #707-Belege im
+`vllm_fair`-Verzeichnis nicht ueberschreibt. Das Boot-Kommando selbst ist bis
+auf die Reserve byte-gleich. Skripte: `run_arm_313.sh` und
+`run_arm_313_gegen.sh` in `/spinning/gpu-battery-results/2026-07-30_313_beleg/`.
+
+Kartenzeit gesamt 8 min 04 s von 20 min Budget.
+
+### Boot 1 — `--rank-auto-reserve-mib auto`: bootet ohne Handaufschlag
+
+Der Arm, der vorher nur mit dem von Hand aufgeschlagenen `5200,4200,4200`
+startete, startet jetzt mit `auto` — **ready after 103s**, Bench rc=0, keine
+Handzahl im Kommando. Die abgeleitete Reserve traf die Vorhersage des
+CPU-Fensters exakt:
 
 ```
-cd /spinning/gpu-battery-results/2026-07-30_vllm_fair
-sed -e 's#--rank-auto-reserve-mib 5200,4200,4200#--rank-auto-reserve-mib auto#' \
-    -e 's#/spinning/wt-final#/spinning/wt-ladder-reserve#g' \
-    run_arm.sh > run_arm_313.sh && chmod +x run_arm_313.sh
-bash run_arm_313.sh voll
+--rank-auto-reserve-mib auto: derived reserve per GPU {0: 5344, 1: 4160, 2: 4160} MiB
+  (runtime reserve + captured-token graph demand x co-located ranks; #68).
+--rank-auto-reserve-mib auto: GPU 0 hosts the solo draft rank 0 -- adaptive ladder:
+  +1184 MiB = peak built rung k5 = 672 MiB (flashinfer workspace 384 + graph capture 288);
+  other built rungs k1=480, k2=528, k4=624, k5=672 + serving margin 512 MiB
+  (SGLANG_ADAPTIVE_SERVING_MARGIN_MIB); boot rung k3 is already charged by the
+  captured-token term.
 ```
 
-Erwartung: Boot ohne Handaufschlag (die 54-MiB-Konstellation von heute), im
-Log `--rank-auto-reserve-mib auto: derived reserve per GPU {0: 5344, 1: 4160,
-2: 4160} MiB` gefolgt von `GPU 0 hosts the solo draft rank 0 -- adaptive
-ladder: +1184 MiB = peak built rung k5 = 672 MiB (flashinfer workspace 384 +
-graph capture 288) … + serving margin 512 MiB`, und
-`Adaptive graph memory offload: … free after pausing all states` deutlich
-ueber 1430 MiB. Gegenprobe im selben Fenster, falls Zeit bleibt: derselbe Arm
-mit `--rank-auto-reserve-mib 4500,4200,4200` muss weiterhin mit den 54 MiB
-scheitern — jetzt aber mit der Empfehlung `raise this entry to at least 4554
-MiB` in der Fehlermeldung.
+Also 4160 (Vor-#313-Ableitung) + 1184 (Leiter-Ledger) = 5344 MiB, und zwar nur
+auf GPU 0 — die beiden 3080 bleiben bei 4160, weil dort keine Leiter haengt.
+
+Die Leiter wurde vollstaendig gebaut (TP0: `adaptive_state_k1` 480 MiB,
+`k2` 512, `k4` 577, `k5` gebaut; Pausen-Fussabdruecke 588/732/866/918 MiB,
+Reserve-Regel `max(one state)=918.0 MiB` im offload-Modus). Danach meldet TP0
+`available_gpu_mem=2.14 GB` (2191 MiB) — gegen die geforderten 918 + 512 =
+1430 MiB, also **761 MiB Luft**. Die Zielmarke `> 1430 MiB` ist erfuellt; zum
+Vergleich: dieselbe Geometrie mass im #707-Fenster 1376 MiB und war damit
+knapp darunter.
+
+Der Preis der zusaetzlichen 144 MiB Reserve gegenueber dem Handwert 5200 ist
+sichtbar und klein: `max_total_num_tokens` 102323 → **93756** (KV 7,3,3).
+
+**Bench-Messpunkt (gratis, n=5 je Klasse, bs=1)** — derselbe Arm, dieselbe
+club-3090-eigene `bench.sh`, also direkt neben dem `5200`-Lauf lesbar:
+
+| Klasse | decode_TPS Mittel ± Std | CV | wall_TPS | TTFT | Accept (Gauge) | `5200`-Lauf decode_TPS |
+|---|---|---|---|---|---|---|
+| narrative | 85,25 ± 1,38 | 1,6 % | 84,13 | 156 ms | 3,05 | 84,26 |
+| code | 113,98 ± 3,80 | 3,3 % | 110,81 | 154 ms | 4,30 | 111,04 |
+
+Beide Klassen liegen minimal ueber dem `5200`-Lauf. Der Abstand ist kleiner
+als bzw. am Rand der Streuung beider Laeufe und wird hier **nicht** als Gewinn
+gebucht: die Aussage des Messpunkts ist, dass die abgeleitete Reserve den Arm
+nicht kostet, obwohl sie den KV-Pool um 8,4 % verkleinert. `spec_accept_length`
+ist ein Gauge (Momentanwert beim Abgriff), Groessenordnung statt Messpunkt.
+
+Output-Validierung: je Klasse ein vollstaendiges Sample gesichert
+(`raw/sample.voll.*.json`), beide kohaerent — narrative 1000 Tokens,
+unique-word-Ratio 0,536; code 800 Tokens, 0,501. Kein Lauf kontaminiert.
+
+Leistungsaufnahme ueber das Fenster (95 Abtastungen je Karte, beide Boots):
+GPU0 149,5 W Mittel / 290,6 W Spitze, GPU1 (5090) 139,7 W / 319,7 W,
+GPU2 131,2 W / 268,1 W.
+
+### Boot 2 — Gegenprobe `4500,4200,4200`: scheitert weiter, jetzt mit Zahl
+
+Derselbe Arm mit einer zu kleinen EXPLIZITEN Reserve muss weiterhin scheitern —
+und tut es, sauber und frueh (Server tot nach 104 s, kein NCCL-Haenger, kein
+spaeter OOM). Die Meldung, woertlich aus `logs/gegen_host_tail.txt`:
+
+```
+RuntimeError: Adaptive graph memory offload: free device memory with all candidate
+states paused (1376 MiB) is below the largest state's mapped footprint (918 MiB,
+adaptive_state_k5) plus the serving transient margin (512 MiB,
+SGLANG_ADAPTIVE_SERVING_MARGIN_MIB). Serving with that state mapped would leave
+458 MiB for eager-forward transients -> late runtime OOM instead of this early
+error. Increase the graph/KV reserve by at least 55 MiB, shrink the candidate
+set, or use --speculative-adaptive-graph-memory resident. Rank 0 runs on physical
+GPU 0 with a PINNED --rank-auto-reserve-mib entry of 4500 MiB; that value stands
+as passed. 'auto' would derive 5344 MiB for this GPU. Pass
+--rank-auto-reserve-mib auto, or raise this entry to at least 4555 MiB. Ladder
+posts: adaptive ladder: +1184 MiB = peak built rung k5 = 672 MiB (flashinfer
+workspace 384 + graph capture 288); other built rungs k1=480, k2=528, k4=624,
+k5=672 + serving margin 512 MiB (SGLANG_ADAPTIVE_SERVING_MARGIN_MIB); boot rung
+k3 is already charged by the captured-token term.
+```
+
+Damit ist beides belegt: die explizite Reserve wird **nicht** stillschweigend
+aufgeblasen (4500 steht, wie uebergeben, und der Boot bricht ab), und der
+Abbruch traegt jetzt die konkrete Abhilfe — `raise this entry to at least 4555
+MiB` plus die Alternative `auto` mit ihrer Zahl 5344 und dem vollstaendigen
+Leiter-Ledger.
+
+Die 1376 MiB "free with all states paused" sind exakt der Wert, aus dem #313
+abgeleitet wurde; die Konstellation ist also reproduziert, nicht bloss
+nachgestellt. Der Fehlbetrag misst hier **55** MiB, das CPU-Fenster hatte 54
+angesagt (und damit 4554 statt 4555 vorhergesagt) — eine MiB Rundungsdifferenz
+zwischen der gemockten und der echten Messung, ohne Bedeutung fuer die Klasse.
+
+### Rohdaten
+
+`/spinning/gpu-battery-results/2026-07-30_313_beleg/`:
+`run_arm_313.sh`, `run_arm_313_gegen.sh`, `posten_main.sh`, `posten_gegen.sh`
+(Skripte), `logs/main_driver.log`, `logs/gegen_driver.log`,
+`logs/gegen_host_tail.txt` (Fehlermeldung im Kontext),
+`proofs/ledger_lines.txt` (die beiden `auto`-Zeilen),
+`proofs/adaptive_lines.txt` (Leiterbau), `proofs/free_after_boot.txt`,
+`proofs/gegen_error_raw.txt`, `raw/` (Bench, Metriken, Samples), `power.csv`.
