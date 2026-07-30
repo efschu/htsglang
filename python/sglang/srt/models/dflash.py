@@ -529,6 +529,8 @@ class DFlashDraftModel(nn.Module):
                     return prefixed_name
             return None
 
+        loaded_params: set[str] = set()
+
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
@@ -540,6 +542,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -564,6 +567,28 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(resolved_name)
+
+        # A name that resolves to nothing is skipped above, by design (HF
+        # rotary caches). A PARAMETER that nothing ever wrote is a different
+        # thing entirely: the drafter then runs on `torch.empty`, proposes
+        # near-random tokens, and the only symptom is an accept rate that
+        # looks like a bad drafter instead of an unloaded one. #290 lost two
+        # GPU windows to exactly that -- a GGUF stream of `*.qweight` names
+        # against a dense skeleton dropped all 36 weight matrices and kept
+        # only the 22 F32 norms, and the load reported success.
+        missing = sorted(set(params_dict) - loaded_params)
+        if missing:
+            raise ValueError(
+                "DFLASH draft checkpoint left "
+                f"{len(missing)}/{len(params_dict)} parameters unloaded: "
+                f"{missing[:8]}{' ...' if len(missing) > 8 else ''}. "
+                "The checkpoint's tensor names do not reach this model's "
+                "parameters. A packed (GGUF) checkpoint loaded into a model "
+                "built WITHOUT a quantization config is the usual cause: the "
+                "stream carries `*.qweight` names and the skeleton only has "
+                "dense `*.weight` parameters."
+            )
 
 
 class DFlashLagunaAttention(DFlashAttention):

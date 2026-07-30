@@ -302,6 +302,22 @@ class ReplicatedLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        # Special case for GGUF. Every OTHER parallel linear (Column, Merged,
+        # QKV, Row) already carries this branch; ReplicatedLinear did not,
+        # which made a GGUF-packed replicated module unloadable: `qweight` is
+        # a GGUFUninitializedParameter whose `.size()` is `torch.Size([0])`
+        # until `materialize()` runs, so the shape assert below rejected the
+        # packed bytes, and `qweight_type` was copied into `.data` while the
+        # `.weight_type` ATTRIBUTE the kernels actually read stayed at its
+        # 0 (= F32) default. Replicated means no output sharding, so the
+        # materialized shape is the loaded shape as-is.
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
+
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
             if param.size() != loaded_weight.size() and param.size(0) == 1:
