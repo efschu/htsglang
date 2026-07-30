@@ -18,6 +18,11 @@ Verified:
     without it the #279 dispatcher's latency term is a guess that decides
     placements.
   * zero park/wave-in failures in the movement stats.
+  * the run's NEGATIVE CONTROL: an item left at the 'auto' policy with no
+    saturation sensor must still be REFUSED. The measurement asks for its
+    parks explicitly (class policy 'ram'); without this control a register
+    that started parking on demand-less 'auto' -- the exact regression the
+    gate exists to prevent -- would produce the same green rows.
 
 STOP rather than FAIL when the memory saver is unavailable: two of the three
 routes then were not tested at all, and a green verdict on one third of the
@@ -129,6 +134,18 @@ def check(step_dir: str) -> None:
             raise CheckFail(f"{field} = {value}")
     if not stats.get("parks"):
         raise CheckFail("die Bewegungs-Telemetrie zaehlt null parks")
+
+    control = payload.get("negative_control")
+    if not isinstance(control, dict) or "refused" not in control:
+        raise CheckStop(
+            "keine Negativkontrolle im Artefakt -- damit belegt der Lauf nicht, "
+            "dass die explizite Klassen-Policy den Park zugelassen hat"
+        )
+    if not control.get("refused"):
+        raise CheckFail(
+            "Negativkontrolle: 'auto' ohne Saettigungsdruck hat den Park NICHT "
+            f"verweigert ({control.get('error')})"
+        )
 
     terms = payload.get("latency_term_ms") or {}
     if not terms:
