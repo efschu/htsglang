@@ -151,7 +151,12 @@ bar1_altlast_pruefen() {
     roh="$(host_ssh_for 90 "
         echo \"PORT=\$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
                         | grep -c ':$port ' )\";
-        echo \"PROC=\$(pgrep -c -f 'sglang.launch_server' 2>/dev/null || echo 0)\";
+        echo \"PROC=\$(pgrep -c -f '[s]glang.launch_server' 2>/dev/null || echo 0)\";
+        # Bracket-Idiom [s]glang statt sglang: pgrep -f matcht gegen die volle
+        # Kommandozeile, und die eigene ssh-Session traegt das Suchmuster als
+        # Text (dieser hier eingebettete Heredoc). Ohne die Klammer zaehlt
+        # sich die Pruefung selbst mit und meldet Alt-Prozesse auf einem
+        # leeren Host.
         echo \"VRAM=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
                        2>/dev/null | tr '\n' ',')\";
     " 2>/dev/null)" || {

@@ -28,6 +28,7 @@ host, no card -- the leak is a shell property and is falsifiable as one.
 
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -49,6 +50,9 @@ set -uo pipefail
 : "${STUB_PIDFILE_INHALT=1962637}"     # OHNE Doppelpunkt: eine ausdruecklich
 : "${STUB_KILL0_RC:=1}"                 # LEERE Vorgabe soll leer bleiben --
 : "${STUB_ALTLAST=}"                    # ":=" haette sie ueberschrieben.
+: "${STUB_ALTLAST_REAL:=}"              # gesetzt: die PORT/PROC/VRAM-Zeile
+                                         # wirklich lokal ausfuehren statt die
+                                         # STUB_ALTLAST-Buchstaben zurueckzugeben.
 
 # --- Stubs fuer die Host-Ebene ---------------------------------------------
 host_path() { printf '%s\n' "$1"; }
@@ -62,7 +66,17 @@ host_ssh_for() {
     case "$cmd" in
         *"kill -0"*)  return "$STUB_KILL0_RC" ;;
         cat*)         printf '%s\n' "$STUB_PIDFILE_INHALT"; return 0 ;;
-        *PORT=*)      printf '%s\n' "$STUB_ALTLAST"; return 0 ;;
+        *PORT=*)
+            if [ -n "$STUB_ALTLAST_REAL" ]; then
+                # Kein ssh, kein Host, keine Karte -- aber die echte
+                # Kommandozeile laeuft, gegen die echte lokale Prozessliste.
+                # Das ist die einzige Art, den Selbsttreffer ueberhaupt zu
+                # sehen: die kanonische Buchstaben-Variante oben testet nur
+                # das Parsen eines fertigen PROC=-Werts, nie das pgrep selbst.
+                bash -c "$cmd"
+                return 0
+            fi
+            printf '%s\n' "$STUB_ALTLAST"; return 0 ;;
         *)            return 0 ;;
     esac
 }
@@ -263,6 +277,52 @@ class TestLeftoverDetection(CustomTestCase):
             "altlast", STUB_ALTLAST="PORT=1\nPROC=9\nVRAM=20000, 20000, 20000,\n"
         )
         self.assertEqual(protokoll.strip(), "")
+
+
+class TestPgrepSelfMatchTrap(CustomTestCase):
+    """The bracket idiom, proven against the real process table.
+
+    Every test above stubs ``host_ssh_for`` to hand back a canned ``PROC=``
+    value -- which only ever exercises the parsing, never the ``pgrep``
+    line itself. That is exactly the blind spot the real bug lived in: the
+    checking shell's own command line carries the search pattern as literal
+    text (it has to, to search for it), and unbracketed ``pgrep -f`` counts
+    that shell as a match. On the affected host this read "launch_server-
+    Prozesse=4" with zero real servers running.
+
+    These tests run the real ``pgrep`` line for real, with
+    ``STUB_ALTLAST_REAL`` swapping the ssh hop for a plain local
+    ``bash -c`` -- no ssh, no host, no card, same as the rest of this file.
+    """
+
+    def _lauf_real(self, **env):
+        return _lauf("altlast", STUB_ALTLAST_REAL="1", **env)
+
+    def test_the_checking_shell_does_not_count_itself(self):
+        """No decoy anywhere: the checking shell's own command line carries
+        the pattern as a string but is not launch_server. PROC must read 0.
+
+        Without the bracket this test is the falsifier -- it goes red on
+        its own, on a host running nothing at all.
+        """
+        fertig, _ = self._lauf_real()
+        self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+
+    def test_a_real_launch_server_named_process_is_still_counted(self):
+        """Positive control: an actual process whose command line carries
+        the un-bracketed name must still be found -- the fix must not trade
+        a false positive for a false negative."""
+        attrappe = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)",
+             "sglang.launch_server"],
+        )
+        try:
+            fertig, _ = self._lauf_real()
+            self.assertIn("ALTLAST", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+            self.assertIn("launch_server-Prozesse=", fertig.stderr)
+        finally:
+            attrappe.terminate()
+            attrappe.wait(timeout=5)
 
 
 class TestBothStepsUseIt(CustomTestCase):
