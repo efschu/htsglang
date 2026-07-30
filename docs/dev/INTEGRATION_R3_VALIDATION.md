@@ -13159,3 +13159,186 @@ diesem Fenster gibt es kein solches Segment mehr.
 4. **#290 ist auf der GPU bestaetigt, zweifach.** Bootfrei durch den
    Kernel-Check (1,71 GiB gepackt, alle vier Modulklassen innerhalb 0,0074
    relativem Fehler) und im Serving durch s04 (Accept 2,95-9,60 statt 1,00).
+
+## #304-Nachprobe: FP8-Lanes auf sm86 (Kartenfenster 2026-07-30, 21:45-21:56 UTC)
+
+Basis `09c7e6c3e0` (Merge von #304). Der Merge-Commit haelt ausdruecklich fest,
+was er nicht belegen konnte: „the sm_86 Marlin lane has never actually run,
+because the sm_120 cubin failed before the kernel started". Genau diese eine
+Zahl holt dieses Fenster nach. Rohdaten:
+`/spinning/gpu-battery-results/2026-07-30_lane_reprobe`.
+
+### Zum `CUDA_DEVICE_ORDER=PCI_BUS_ID` im beigelegten Kommando: weggelassen
+
+Das Kommando aus dem #304-Bau trug `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Auf diesem
+Rig ist die Variable verboten, weil die Reserve-Werte an der torch-Ordnung
+haengen. Sie wird hier auch nicht gebraucht: `lane_probe_only.py` spricht die
+Karten ausschliesslich ueber torch-Ordinale an
+(`torch.device(f"cuda:{g['cuda_index']}")`), und `_nvml_gpu_inventory` bruecken
+torch- auf NVML-Index bereits selbst ueber die PCI-Bus-ID
+(`server_args._torch_to_nvml_gpu_index_mapping`). Name, UUID und Total-VRAM je
+Karte stimmen damit unabhaengig davon, in welcher Reihenfolge CUDA
+enumeriert. Die Variable blieb weg; die Zuordnung im Ergebnis ist korrekt
+(cuda:0 = 5090, cuda:1/2 = 3080).
+
+### Erster Anlauf: falsche venv, und das faellt nicht als Fehler auf
+
+Das beigelegte Kommando nennt `/spinning/shvllm/.venv/bin/python` — die
+vLLM-venv. Dort ist `sgl_kernel` nicht installiert. Ergebnis:
+
+    fp8 Marlin GEMM did not run: AttributeError: 'str' object has no attribute 'id'
+
+und zwar auf **allen drei** Karten, auch der 5090, die die Lane vorher schon
+gemessen hatte. Die Ursache liegt nicht an der Karte:
+`quantization/utils.get_scalar_types()` faengt den fehlenden Import ab und
+liefert ein `MockScalarTypes`, dessen `__getattr__` fuer jeden Namen den String
+`f"mock_{name}"` zurueckgibt. `gptq_marlin_gemm` greift danach auf
+`b_q_type.id` zu — auf einem String. Die Lane-Sonde faengt die Exception als
+Lane-Notiz und schreibt „did not run" ins Profil.
+
+Das ist ein eigener Befund, unabhaengig von #304: eine unvollstaendige
+Umgebung wird hier nicht als Umgebungsfehler gemeldet, sondern als
+**Kartenbefund** protokolliert. Wer die Notiz liest, schliesst auf fehlende
+Hardware-Faehigkeit statt auf ein fehlendes Paket. Der Mock ist als
+Import-Weiche fuer CPU-Pfade gedacht und war schon vorher da (identisch in
+`wt-merge-probe`); neu ist nur, dass die Lane-Sonde ihn erreichen kann.
+Kandidat fuer eine eigene Aufgabe: bei fehlendem `sgl_kernel` in den
+Marlin-Pfaden hart und benannt scheitern statt still zu mocken.
+
+Richtig ist die venv, mit der auch gebootet wird — `sglang` aus dem Baum,
+`sgl_kernel` aus der GPU-venv:
+
+    PYTHONPATH=/spinning/wt-final/python \
+      /spinning/htsglang-gpu/.venv/bin/python \
+      /spinning/gpu-battery-results/2026-07-30_welle2/lane_probe_only.py --out <json>
+
+Kontrolle, dass die Umgebung stimmt: die 5090 misst `fp8_marlin` 215,9 TFLOPS
+und trifft damit die 216,61 aus Welle 2 auf 0,3 % — dieselbe Lane, dieselbe
+Groessenordnung, andere venv haette das nicht reproduziert.
+
+### #304 traegt: der sm_86-Kernel wird gebaut, geladen und laeuft
+
+Beide Pass-Kriterien erfuellt.
+
+`~/.cache/tvm-ffi` haelt nach dem Lauf je Kernel zwei Eintraege mit dem neuen
+Build-Hash, einen pro Architektur — vorher gab es nur den sm_120-Eintrag, der
+auf den 3080ern startete und mit `no kernel image` starb:
+
+    sgl_kernel_jit_gptq_marlin_bf16_t_ce32...__cuda_arch_8.6__tvmffi_0.1.11__b2b23f0175ca8
+    sgl_kernel_jit_gptq_marlin_bf16_t_ce32...__cuda_arch_12.0__tvmffi_0.1.11__bccf66001d43a
+    sgl_kernel_jit_gptq_marlin_repack_73da...__cuda_arch_8.6__tvmffi_0.1.11__bfbde568f3779
+    sgl_kernel_jit_gptq_marlin_repack_73da...__cuda_arch_12.0__tvmffi_0.1.11__b7d7dc6bdc694
+
+Das `sgl_jit_provenance.json` der sm_86-Eintraege nennt `target_archs: ["8.6"]`
+und `source_tree: /spinning/wt-final/python/sglang/jit_kernel`, also den
+bauenden Baum und nicht mehr `wt-merge-probe` (Kopien im Ergebnisverzeichnis).
+`gptq_marlin_repack` — der Aufruf, der in Welle 2 in
+`gptq_marlin_repack.cuh:355` starb — laeuft auf beiden 3080ern durch.
+
+### Die Zahlen
+
+Zwei unabhaengige Laeufe: A = `lane_probe_only.py` (nur der Per-Karten-Teil),
+B = der unterstuetzte Lanes-Top-up in den Profil-Cache
+(`python -m sglang.srt.uneven_perf --probe --groups lanes`). TFLOPS:
+
+| Karte | Lauf | dense bf16 | fp8_native | fp8_marlin | fp8_w8a16 |
+|---|---|---:|---:|---:|---:|
+| RTX 5090 | A | 232,5 | 564,86 | 215,90 | 177,49 |
+| RTX 5090 | B | 232,97\* | 568,48 | 216,34 | 181,43 |
+| RTX 3080 (cuda:1) | A | 62,6 | — | **60,27** | 53,46 |
+| RTX 3080 (cuda:1) | B | 62,72\* | — | **58,44** | 53,43 |
+| RTX 3080 (cuda:2) | A | 63,1 | — | **60,68** | 53,66 |
+| RTX 3080 (cuda:2) | B | 62,98\* | — | **59,15** | 53,78 |
+
+\* im Top-up nicht neu gemessen, aus dem Basisprofil uebernommen (`--groups
+lanes` misst genau die Lanes). `fp8_native` faellt auf sm86 weiter aus, mit
+unveraenderter, benannter Ursache: `torch._scaled_mm` verlangt Compute
+Capability >= 8,9. Das ist eine Hardware-Grenze, kein Bau-Problem.
+
+**marlin vs. w8a16 auf sm86 — die gesuchte Zahl:** 1,094 / 1,100 / 1,127 /
+1,131 ueber die vier Messpunkte, also **~1,11x zugunsten von Marlin**
+(Spanne 1,09-1,13). Marlin ist auf Ampere die richtige Lane fuer ein
+fp8-Checkpoint, aber nicht mit grossem Abstand — die Wahl ist ein
+Zehn-Prozent-Thema, keine Groessenordnung.
+
+**Marlin vs. dense bf16 auf derselben Karte:** 0,93-0,96. Weight-only fp8
+kostet auf der 3080 rund 4-7 % Rechenleistung gegenueber dense bf16 und zahlt
+dafuer den halben Gewichtsspeicher. Das erklaert nebenbei, warum der bisherige
+dense-bf16-Fallback numerisch fast richtig lag.
+
+### Neue reale FP8-Spreizung 5090:3080
+
+Der Planer bewertet jede Karte auf ihrer besten erreichbaren fp8-Lane. Das ist
+auf der 5090 `fp8_native`, auf den 3080ern ab jetzt `fp8_marlin`:
+
+    568,48 : 58,44 : 59,15   ->  9,73 : 1 : 1,01   (Lauf B)
+    564,86 : 60,27 : 60,68   ->  9,37 : 1 : 1,01   (Lauf A)
+
+**9,3-9,7 : 1 : 1**, und erstmals formatrein — fp8 gegen fp8 auf allen drei
+Karten. Zum Vergleich die beiden bisherigen Stellungen:
+
+| Stand | 5090 | 3080 | Verhaeltnis |
+|---|---:|---:|---:|
+| Profil 21:14 (nur w8a16 gemessen) | 569,89 fp8-nativ | 52,89 fp8-w8a16 | 10,8 : 1 |
+| #303-Notiz (gar keine Lane, dense-Fallback) | 570 fp8-nativ | 61,8 dense-bf16 | 9,2 : 1 |
+| **jetzt (marlin gemessen)** | **568,5 fp8-nativ** | **58,4-60,7 fp8-marlin** | **9,3-9,7 : 1** |
+
+Die Korrektur geht damit gegen die w8a16-Stellung, nicht gegen die
+dense-Stellung: der Cache-Stand von 21:14 hat die 3080er um rund 11-13 % zu
+niedrig angesetzt, der dense-Fallback der #303-Notiz lag zufaellig nahe an der
+Wahrheit. Die in #303 formulierte Sorge, jede `auto-performance`-Aufteilung
+sei „in dieser Richtung verzerrt", bestaetigt sich in der Richtung, aber der
+Betrag ist klein.
+
+Nebenbefund fuer die Aufteilungslogik: zwingt man alle drei Karten auf
+dieselbe Lane (Marlin), steht das Verhaeltnis bei **3,6-3,7 : 1**, nicht bei
+9,4 : 1. Die Spreizung des Planers stammt also ueberwiegend aus dem
+Format-Privileg der 5090 (`_scaled_mm`), nicht aus roher Rechenleistung — der
+dense-bf16-Abstand derselben Karten ist 3,7 : 1. Wer die Aufteilung
+interpretiert, sollte die beiden Anteile auseinanderhalten.
+
+### Profil-Cache
+
+`~/.cache/sglang/hw_profile-9a5e9b49b7dc.json` steht in gueltigem v3-Zustand:
+`version: 3`, `topup_groups: ["lanes"]`, alle drei Karten mit `gemm_lanes`
+inklusive `fp8_marlin`, Link-Matrix (4 Eintraege) unveraendert uebernommen,
+kein `partial`-Flag. Der Top-up brauchte 4,5 s bei warmem Kernel-Cache.
+Vorher-/Nachher-Kopien liegen als `hw_profile_before.json` /
+`hw_profile_after.json` im Ergebnisverzeichnis.
+
+### Kartenzeit und Leistung
+
+Fenster 21:45:19-21:56:08 UTC, **649 s = 10,8 min** von 35 min Budget.
+
+| Posten | Kartenzeit | Ergebnis |
+|---|---:|---|
+| Lauf A, erster Anlauf (falsche venv) | 326 s | davon ~319 s nvcc-Kaltbau, Lanes durch den Mock verloren |
+| Lauf A, Wiederholung (richtige venv) | 7,4 s | warmer Cache, alle Lanes gemessen |
+| Lauf B, Lanes-Top-up in den Cache | 4,5 s | Profil gueltig hinterlassen |
+
+Der Kaltbau war angekuendigt und einmalig: der neue Build-Hash aus #304
+verwaist die alten Eintraege. Er ist nicht verloren — die sm_86- und
+sm_120-Artefakte, die er erzeugt hat, sind genau die, die Lauf A und B danach
+in 7,4 s bzw. 4,5 s wiederverwendet haben.
+
+Leistung ueber das Fenster, 2-s-Abtastung, 915 Proben (`power.csv`,
+NVML-Reihenfolge): 3080 28,5 W (Spitze 266,2), 5090 23,7 W (Spitze 294,9),
+3080 22,1 W (Spitze 266,4), **Rig-Mittel 74,3 W**. Der niedrige Mittelwert ist
+korrekt und nicht das Welle-2-Muster: die 319 s Kaltbau sind CPU-Zeit auf
+nvcc, in der die Karten legitim leerlaufen. Gemessen wurde in den restlichen
+rund 12 s, und dort stehen die Spitzen.
+
+### Was dieses Fenster hinterlaesst
+
+1. **#304 ist am Rig belegt.** Der sm_86-Kernel baut, laedt und rechnet; die
+   Provenance-Datei nennt die richtige Architektur und den richtigen Baum. Die
+   im Merge-Commit offen gelassene Zahl ist gemessen.
+2. **Der Planer kann auf 9,3-9,7 : 1 : 1 umgestellt werden**, formatrein und
+   mit `fp8_marlin` als 3080-Lane. Gegenueber dem Cache-Stand von 21:14 werden
+   die 3080er dabei um 11-13 % angehoben.
+3. **marlin > w8a16 auf sm86, aber nur um ~1,11x.** Fuer die Lane-Wahl reicht
+   das; als Argument fuer groessere Umbauten reicht es nicht.
+4. **Offen, neu gefunden:** fehlendes `sgl_kernel` wird ueber `MockScalarTypes`
+   still zu einem Lane-Ausfall pro Karte statt zu einem Umgebungsfehler. Jede
+   Lane-Messung, die nicht in der GPU-venv laeuft, schreibt damit falsche
+   Kartenbefunde ins Profil.
