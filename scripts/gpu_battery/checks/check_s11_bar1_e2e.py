@@ -28,8 +28,11 @@ reporting:
   7. a BAR1 setup line per group. The ERREICHT line is written at group init;
      the setup line is written when the aperture actually handed over the
      space,
-  8. the smoke request: coherent output (the numbers 1..20 in order, counted,
-     not judged) and spec_accept_length present as a number.
+  8. the smoke request over /generate: coherent output (the continuation of
+     "1 2 3 4", counted, not judged) and spec_accept_length present as a
+     number. Three outcomes, not two -- "coherent text that never got to the
+     numbers because the token budget went elsewhere" is its own verdict
+     (UNTER-PROVISIONIERT) and says nothing about the transport.
 
 NOT judged: the HEIGHT of spec_accept_length, the setup duration, and any
 throughput. s11 answers "does the direct path carry a real run"; s12 answers
@@ -72,7 +75,7 @@ def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "bar1_e2e.json")
     classify_missing_result(step_dir, "bar1_e2e", path, "bar1_e2e.json")
     payload = load_json(path, "bar1_e2e.json")
-    require_envelope(payload, KIND, "bar1_e2e.json", 2)
+    require_envelope(payload, KIND, "bar1_e2e.json", 3)
 
     if not payload.get("reachable"):
         raise CheckStop(
@@ -181,10 +184,36 @@ def check(step_dir: str) -> None:
         raise CheckFail("kein Smoke-Request abgesetzt (smoke.json fehlt)")
     if smoke.get("error"):
         raise CheckFail(f"Smoke-Request meldet: {smoke['error']}")
+    if smoke.get("endpunkt") == "chat":
+        raise CheckStop(
+            "der Smoke kam ueber /v1/chat/completions -- dort haengt die "
+            "Ausgabe am Chat-Template (Denk-Praeambel) und meta_info ist "
+            "opt-in, also ist weder die Kohaerenz noch spec_accept_length "
+            "aussagekraeftig. Das Artefakt stammt aus einem Lauf vor der "
+            "Umstellung auf /generate; er ist zu wiederholen, nicht zu "
+            "bewerten"
+        )
+    # DER BENANNTE ZUSTAND. Zusammenhaengender Text, Token-Budget bis zum
+    # Anschlag verbraucht, Zahlen nie drangekommen. Am 2026-07-30 war das
+    # eine Denk-Praeambel bei Temperatur 0 -- ein unter-provisionierter
+    # Smoke, keine Transportstoerung und keine Korruption. Eigene Meldung,
+    # damit er nie als bar1-Befund gelesen wird.
+    if smoke.get("unterprovisioniert"):
+        raise CheckFail(
+            f"Smoke UNTER-PROVISIONIERT: die Antwort ist zusammenhaengend, hat "
+            f"aber das Token-Budget aufgebraucht (finish_reason="
+            f"{smoke.get('finish_reason')!r}), bevor die Zahlen drankamen -- "
+            f"{smoke.get('zahlen_in_folge')} von {smoke.get('zahlen_erwartet')}. "
+            f"Das ist ein Befund ueber den Smoke, NICHT ueber den Transport: "
+            f"die Kollektive sind byte-belegt, und ein Trajektorienwechsel bei "
+            f"Temperatur 0 liegt in der erwarteten Numerik-Klasse. Anfang: "
+            f"{str(smoke.get('content_prefix'))[:80]!r}"
+        )
     if not smoke.get("kohaerent"):
         raise CheckFail(
-            f"Smoke-Ausgabe inkohaerent: nur {smoke.get('zahlen_in_folge')} von 20 "
-            f"Zahlen in Folge (mindestens {MIN_ORDERED_NUMBERS}); Anfang: "
+            f"Smoke-Ausgabe inkohaerent: nur {smoke.get('zahlen_in_folge')} von "
+            f"{smoke.get('zahlen_erwartet')} Zahlen in Folge (mindestens "
+            f"{MIN_ORDERED_NUMBERS}); Anfang: "
             f"{str(smoke.get('content_prefix'))[:80]!r}"
         )
     if not is_number(smoke.get("spec_accept_length")):

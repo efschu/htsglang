@@ -20,6 +20,15 @@ Three extractions carry the step:
     host-staged gloo level during a graph capture. It is extracted as its own
     field, with op and size, because it is the expected failure of the current
     integration and needs to be distinguishable from any other crash.
+  * the smoke, over /generate. It used to go through /v1/chat/completions,
+    where two things went wrong at once on 2026-07-30: the chat template
+    answered a temperature-0 request with a thinking preamble and spent the
+    whole token budget on it, and `meta_info` is opt-in there
+    (`return_meta_info`, default False), so spec_accept_length could not be
+    read at all. A continuation prompt has no template and /generate always
+    carries meta_info. The full reasoning sits at the request in
+    s11_bar1_e2e.sh; what matters here is that the parser reads the shape the
+    step really asks for.
 
 WHICH FILE THE EVIDENCE IS READ FROM, and why that is not a detail. This used
 to read `htccl_lines.txt` alone -- the grep result the step script harvests
@@ -53,7 +62,25 @@ KIND = "bar1_e2e"
 #: mehr nur aus `htccl_lines.txt` gelesen. Ein aelteres Artefakt darf hier
 #: nicht durchrutschen -- es traegt die Felder nicht, an denen der Check
 #: "niemand hat geschaut" von "nichts gefunden" unterscheidet.
-SCHEMA_VERSION = 2
+#: 3: der Smoke laeuft ueber /generate statt /v1/chat/completions, und
+#: `smoke` traegt dafuer `endpunkt`, `finish_reason`, `zahlen_erwartet`,
+#: `spec_verify_ct` und `unterprovisioniert`. Aus demselben Grund: ohne
+#: `endpunkt` liest ein Check nicht, WORAUF die Kohaerenzzahl sich bezieht.
+SCHEMA_VERSION = 3
+
+#: Der Fortsetzungs-Prompt, den s11_bar1_e2e.sh an /generate schickt. Er
+#: steht hier UND dort; dass die beiden zusammenpassen, nagelt
+#: test_gpu_battery_checks_bar1.py am Quelltext der Schrittdatei fest --
+#: sonst zaehlte der Parser eine Folge, die der Request nie angestossen hat.
+SMOKE_PROMPT = "1 2 3 4"
+#: Die Zahlen, die die Fortsetzung liefern muss. Beginnt bei 5, also hinter
+#: dem Prompt: was im Prompt steht, ist kein Beleg fuer die Antwort.
+ZAHLEN_VON = 5
+ZAHLEN_BIS = 20
+#: Wieviele davon in Folge dastehen muessen. Unveraendert 15 -- geaendert hat
+#: sich der Nenner (16 statt 20), weil die ersten vier Zahlen jetzt im Prompt
+#: stehen und nicht mehr mitzaehlen duerfen.
+MIN_ZAHLEN_IN_FOLGE = 15
 
 #: Woraus die Beweislage gelesen wird, in dieser Reihenfolge. `htccl_lines.txt`
 #: ist der vollstaendige grep und steht deshalb vorn; `server.log` ist der
@@ -203,16 +230,54 @@ def parse_log_evidence(step_dir: str) -> dict:
     }
 
 
+def zaehle_in_folge(text: str, von: int, bis: int) -> int:
+    """Wieviele der Zahlen ``von..bis`` in DIESER Reihenfolge im Text stehen.
+
+    Eine Zahl, keine Meinung -- das war schon die Absicht und bleibt sie. Was
+    dazugelernt wurde: der Zaehler sagt nichts darueber, WOHER die Treffer
+    kommen. Im Lauf vom 2026-07-30 meldete er 3 fuer eine Antwort, die gar
+    nicht gezaehlt hat -- die Treffer waren die Aufzaehlungspunkte "1.",
+    "2.", "3." einer Denk-Praeambel. Deshalb faengt der Bereich jetzt bei 5
+    an (die Fortsetzung von "1 2 3 4"): die kleinen Ziffern, die in jedem
+    beliebigen Fliesstext vorkommen, zaehlen nicht mehr mit.
+    """
+    pos = 0
+    treffer = 0
+    for n in range(von, bis + 1):
+        stelle = text.find(str(n), pos)
+        if stelle < 0:
+            continue
+        treffer += 1
+        pos = stelle + len(str(n))
+    return treffer
+
+
 def parse_smoke(step_dir: str) -> dict:
-    """Coherence, mechanically. The prompt asks for 1..20; how many of those
-    numbers appear IN ORDER is a number, not an opinion."""
+    """Coherence, mechanically -- und aus der Antwort, die der Schritt wirklich holt.
+
+    Gelesen wird die /generate-Form (``{"text": ..., "meta_info": {...}}``).
+    Die Chat-Form wird weiter verstanden, damit ein Artefakt aus einem
+    aelteren Lauf nicht als "unlesbar" durchgeht, sondern als das, was es
+    ist -- aber sie ist nicht mehr das, was der Schritt anfordert. Warum,
+    steht in s11_bar1_e2e.sh am Request.
+
+    ``spec_accept_length`` kommt aus ``meta_info`` und AUSDRUECKLICH nicht
+    aus ``spec_ema_accept_len``: das ist ein geglaetteter Verlauf, nicht die
+    Akzeptanzlaenge dieser Anfrage, und die beiden zu verwechseln ist eine
+    bekannte Messfalle.
+    """
     path = os.path.join(step_dir, "smoke.json")
     out: dict = {
         "vorhanden": os.path.exists(path),
+        "endpunkt": None,
         "content_prefix": None,
         "spec_accept_length": None,
+        "spec_verify_ct": None,
+        "finish_reason": None,
         "zahlen_in_folge": 0,
+        "zahlen_erwartet": ZAHLEN_BIS - ZAHLEN_VON + 1,
         "kohaerent": False,
+        "unterprovisioniert": False,
         "error": None,
     }
     if not out["vorhanden"]:
@@ -229,29 +294,55 @@ def parse_smoke(step_dir: str) -> dict:
     if payload.get("error") or payload.get("object") == "error":
         out["error"] = " ".join(str(payload.get("error") or payload).split())[:200]
         return out
-    try:
-        choice = payload["choices"][0]
-        text = choice["message"]["content"] or ""
-        meta = choice.get("meta_info") or {}
-    except (KeyError, IndexError, TypeError) as exc:
-        out["error"] = f"Antwort ohne choices[0].message.content ({exc})"
-        return out
-    out["content_prefix"] = text[:300]
-    accept = meta.get("spec_accept_length")
-    if accept is None:
-        accept = (payload.get("usage") or {}).get("spec_accept_length")
-    out["spec_accept_length"] = accept
 
-    pos = 0
-    hits = 0
-    for n in range(1, 21):
-        found = text.find(str(n), pos)
-        if found < 0:
-            continue
-        hits += 1
-        pos = found + len(str(n))
-    out["zahlen_in_folge"] = hits
-    out["kohaerent"] = hits >= 15
+    meta: dict = {}
+    if isinstance(payload.get("text"), str):
+        # /generate: Text und meta_info liegen oben, ohne Wenn und Aber.
+        out["endpunkt"] = "generate"
+        text = payload["text"]
+        meta = payload.get("meta_info") or {}
+        von, bis = ZAHLEN_VON, ZAHLEN_BIS
+    else:
+        # Chat-Form. Sie zaehlt ab 1, weil dort kein Prompt fortgesetzt wird
+        # -- ein aelteres Artefakt soll dieselbe Zahl ergeben wie damals.
+        out["endpunkt"] = "chat"
+        try:
+            choice = payload["choices"][0]
+            text = choice["message"]["content"] or ""
+            meta = choice.get("meta_info") or {}
+        except (KeyError, IndexError, TypeError) as exc:
+            out["error"] = (
+                f"Antwort ist weder /generate (text) noch Chat "
+                f"(choices[0].message.content): {exc}"
+            )
+            return out
+        von, bis = 1, 20
+        out["zahlen_erwartet"] = bis - von + 1
+
+    out["content_prefix"] = text[:300]
+    out["spec_accept_length"] = meta.get("spec_accept_length")
+    out["spec_verify_ct"] = meta.get("spec_verify_ct")
+    ende = meta.get("finish_reason")
+    if isinstance(ende, dict):
+        ende = ende.get("type")
+    if ende is None and out["endpunkt"] == "chat":
+        try:
+            ende = payload["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError):
+            ende = None
+    out["finish_reason"] = ende
+
+    treffer = zaehle_in_folge(text, von, bis)
+    out["zahlen_in_folge"] = treffer
+    out["kohaerent"] = treffer >= MIN_ZAHLEN_IN_FOLGE
+    # Der benannte Zustand: zusammenhaengender Text, das Token-Budget bis
+    # zum Anschlag verbraucht, und die Zahlen kamen trotzdem nicht. Das ist
+    # kein Transportfehler und keine Korruption, sondern ein Smoke, dessen
+    # Budget woanders hingegangen ist -- der Fall vom 2026-07-30. Er
+    # bekommt einen eigenen Namen, damit ihn niemand als bar1-Befund liest.
+    out["unterprovisioniert"] = bool(
+        not out["kohaerent"] and ende == "length" and len(text.strip()) >= 200
+    )
     return out
 
 

@@ -111,14 +111,31 @@ if ! host_wait_for_server "$PORT" 900; then
 fi
 
 # --- smoke: coherence and a live spec path ---------------------------------
-# The prompt is the one from docs/wie_starte_ich: "count from 1 to 20" has a
-# MECHANICAL coherence criterion (are the numbers there, in order?), which is
-# the only kind a check can hold an opinion about.
-echo "== Smoke-Request =="
-host_ssh_for 180 "curl -s -m 120 http://127.0.0.1:$PORT/v1/chat/completions \
-  -H 'Content-Type: application/json' -d '{\"model\": \"default\", \
-  \"messages\": [{\"role\": \"user\", \"content\": \"Zaehle von 1 bis 20.\"}], \
-  \"max_tokens\": 128, \"temperature\": 0}' > $HOSTSMOKE; wc -c < $HOSTSMOKE" \
+# ZWEI Gruende, warum das /generate ist und nicht /v1/chat/completions.
+#
+# 1. DAS CHAT-TEMPLATE. Der Lauf vom 2026-07-30 hat denselben Request bei
+#    Temperatur 0 mit einer Denk-Praeambel beantwortet ("Here's a thinking
+#    process: 1. Analyze User Input ...") statt zu zaehlen. Die 128 Token
+#    waren davon verbraucht (finish_reason=length), die Zahlen kamen nie
+#    dran -- und der Kohaerenzzaehler meldete 3, weil er die
+#    Aufzaehlungspunkte DER PRAEAMBEL fuer die Antwort hielt. /generate
+#    schickt den Text ohne Template durch; eine Praeambel kann dort nicht
+#    entstehen, statt sie mit einem Schalter abzustellen, dessen
+#    Unterstuetzung am Template des Modells haengt.
+# 2. meta_info. Auf dem Chat-Pfad ist es opt-in (protocol.py:723
+#    return_meta_info=False, serving_chat.py:1376 gibt sonst None), auf
+#    /generate kommt es immer mit -- und nur dort steht
+#    spec_accept_length, das dieser Schritt braucht.
+#
+# Fortsetzungs-Prompt statt Anweisung: "1 2 3 4" fortzusetzen ist keine
+# Aufgabe, ueber die sich nachdenken laesst. Das Kriterium bleibt mechanisch
+# (wieviele der Zahlen 5..20 stehen in Folge da), und 512 Token sind
+# Luft genug, dass die Grenze nie die Antwort abschneidet.
+echo "== Smoke-Request (/generate, Fortsetzung) =="
+host_ssh_for 180 "curl -s -m 120 http://127.0.0.1:$PORT/generate \
+  -H 'Content-Type: application/json' -d '{\"text\": \"1 2 3 4\", \
+  \"sampling_params\": {\"temperature\": 0, \"max_new_tokens\": 512}}' \
+  > $HOSTSMOKE; wc -c < $HOSTSMOKE" \
   > "$DIR/smoke_bytes.txt" 2>&1
 host_ssh_for 60 "cat $HOSTSMOKE" > "$DIR/smoke.json" 2>/dev/null
 
