@@ -12516,3 +12516,141 @@ wieder geoeffnet, Leistungs-Logger beendet.
    Formattreue.
 4. **Ein A-vs-A-Boden aus zwei Boots reicht auf tick-tok/s nicht.** Drei Boots,
    oder die Achse als nicht belastbar markieren.
+
+## Task #303 — die haengende Stage-0-Sonde, CPU-seitig zerlegt (2026-07-30)
+
+Fortsetzung des Welle-2-Befunds oben. Vier Teile: Profil-Migration statt
+Invalidierung, harter Zeitdeckel auf der Netzphase, Wurzel des
+`_create_c10d_store`-Haengers, und der Fatal-Grep der Batterie. Alles hermetisch
+auf der CPU entwickelt (`CUDA_VISIBLE_DEVICES=99`), Branch
+`fix/stage0-probe-hang`.
+
+### Wurzel des c10d-Haengers: belegt (Mechanismus), nicht der Ausloeser
+
+Die py-spy-Dumps zeigen alle drei Arbeiter in `rendezvous.py:199`. Das ist
+nicht irgendeine Zeile in `_create_c10d_store`, sondern der `TCPStore(...)`-Aufruf
+im **`else`**-Zweig — dem Zweig, in dem Rang 0 den Store HOSTET. Damit sind zwei
+Hypothesen sofort tot:
+
+* `TORCHELASTIC_USE_AGENT_STORE=True` (alle Raenge waeren Clients) faellt aus:
+  das waere Zeile 190, nicht 199;
+* Port-Kollision faellt aus: nachgestellt auf der CPU wirft ein belegter Port
+  sofort `DistNetworkError ... EADDRINUSE`, er haengt nicht.
+
+Bleibt genau ein Bild, das zu „Rang 0 wartet UND die Clients warten" passt: der
+Store-Server bindet, die Clients erreichen ihn nicht. Torchs TCPStore-Server
+lauscht auf der **Wildcard**-Adresse und ignoriert den uebergebenen Hostnamen;
+die Clients waehlen den Hostnamen aus `MASTER_ADDR`. Zeigt der woanders hin,
+wartet Rang 0 in `waitForWorkers` und jeder Client im Connect-Retry — beide bis
+zum vollen Prozessgruppen-Timeout, und das ist bei NCCL genau 600 s.
+
+Nachgestellt (CPU, gloo, `MASTER_ADDR=192.0.2.7`, drei `mp.spawn`-Arbeiter):
+alle drei stehen in `rendezvous.py:199`, Signatur Zeile fuer Zeile identisch zu
+`posten1/pyspy-probe-children.txt` und `posten3/pyspy-probe-78315*.txt`.
+
+Der **Mechanismus** ist damit belegt. Welche Umgebungsvariable am Rig konkret
+gesetzt war, ist es nicht — kein Boot-Skript unter `/spinning` exportiert
+`MASTER_ADDR`, und die Prozessumgebung wurde im Fenster nicht mitgeschrieben.
+Der Code macht die Frage jetzt gegenstandslos:
+
+* `_link_worker` benutzte `os.environ.setdefault("MASTER_ADDR", ...)` auf einem
+  **fest verdrahteten** Port 29517. Beide Haelften sind der Fehler: `setdefault`
+  laesst eine geerbte Adresse gewinnen, und ein fester Port kollidiert mit jeder
+  parallelen oder verwaisten Sonde.
+* Jetzt diktiert der Elternprozess den Endpunkt: freier Port per `bind(0)`,
+  als Argument an die Arbeiter, und `_link_rendezvous_env` **loescht** vorher
+  jede steuernde Variable (`MASTER_ADDR/PORT`, `RANK`, `WORLD_SIZE`,
+  `LOCAL_RANK`, `TORCHELASTIC_*`) statt sie zu defaulten.
+* `init_process_group` bekommt ein explizites `timeout`; torchs 600-s-Default
+  ist genau die Kartenzeit, die hier verbrannt wurde.
+
+Falls trotzdem etwas haengt, faengt es der Zeitdeckel — deshalb ist Teil 2 kein
+Ersatz fuer die Wurzel, sondern das Netz darunter.
+
+### Profil-Migration statt Invalidierung
+
+`_PROFILE_VERSION_FIELDS` erklaert, welche **per-GPU-Felder** jede Version
+HINZUGEFUEGT hat (v2: die drei membw-Raten, v3: `gemm_lanes` /
+`gemm_lane_notes`). Beide Spruenge waren rein additiv, also wird ein aelteres
+Profil migriert statt weggeworfen:
+
+1. `legacy_profile_paths` sucht die Cache-Datei der Vorversionen (die Version
+   steht im Schluessel, die Datei liegt also woanders);
+2. `migrate_profile` uebernimmt **jeden** gemessenen Wert — inklusive der
+   Link-Matrix — und meldet nur die fehlenden Felder;
+3. `probe_groups_for_fields` bildet die fehlenden Felder auf **Sonden-Gruppen**
+   ab (`gemm` / `lanes` / `membw`), und `run_probe --groups lanes` misst nur
+   diese Gruppe. Die Netzphase laeuft im Top-up-Pfad **nie**.
+
+Gegen die echte Datei am Rig geprueft: `hw_profile-124a7190f860.json` (v2,
+2026-07-27) wird gefunden, fehlend sind ausschliesslich `gemm_lanes` und
+`gemm_lane_notes` auf allen drei Karten, aufgeloest zur Gruppe `lanes`, die
+vier Link-Eintraege bleiben erhalten. Zielpfad ist
+`hw_profile-9a5e9b49b7dc.json` — genau die Datei, die die haengenden Boots
+erzeugen wollten.
+
+Scheitert das Top-up, wird das migrierte Profil trotzdem behalten und je
+fehlendem Feld ein Grund unter `notes` abgelegt (dieselbe Mechanik wie
+`gemm_lane_notes`). Die Verbraucher melden dann eine benannte Luecke, statt
+eine Zahl zu erfinden — das war schon vorher so und bleibt es.
+
+Die Regel ist allgemein: ein kuenftiger additiver Versionssprung traegt seine
+Felder in `_PROFILE_VERSION_FIELDS` ein und kostet dann eine Sonden-Gruppe
+statt einer vollen Stage 0. Ein Sprung, der die BEDEUTUNG eines Feldes aendert,
+gehoert nicht in die Tabelle.
+
+### Zeitdeckel auf der Netzphase
+
+`SGLANG_PERF_PROBE_LINK_TIMEOUT_S` (Default **45 s**, vorher unbegrenzt bzw.
+600 s ueber den Subprozess-Deckel) begrenzt die gesamte Link-Phase.
+`probe_link_matrix` spawnt mit `join=False` und pollt gegen eine Deadline; bei
+Ablauf werden die Arbeiter beendet (SIGTERM, begrenzte Gnadenfrist, SIGKILL),
+die Karten-Messungen bleiben, und `notes["links"]` nennt den Grund samt der
+Raenge, die das Rendezvous erreicht haben. `SGLANG_PERF_PROBE_SKIP_LINKS=1`
+ueberspringt die Phase ganz, ebenfalls mit Grund.
+
+Rang-lokale Bedingung vor dem Kollektiv: jeder Arbeiter belegt zuerst seine
+eigene Karte (`torch.zeros(1, device=dev)`), meldet
+`reached_rendezvous:<rank>` in den Manager-Dict und geht **erst dann** in
+`init_process_group`. Dadurch nennt die Timeout-Meldung, welcher Rang nie
+angekommen ist, statt nur „haengt".
+
+### Fatal-Grep der Batterie
+
+Ein gekillte Sonde schreibt ihren Traceback in das Serverlog — der Server faengt
+den Fehler, benennt ihn und bootet weiter. `scan_log_for_fatals` wertete den
+zitierten Traceback als Bootfehler. Jetzt zweigleisig: der Emitter praefixt
+jede zitierte Zeile mit `[probe-subprocess] `, und der Scanner erkennt
+zusaetzlich strukturell einen Block zwischen einer „handled subprocess"-Zeile
+und der naechsten mit Server-Zeitstempel — damit sind auch die bereits
+geschriebenen Logs richtig bewertet. Die Ernte auf der Host-Seite
+(`host_grep_into`) filtert den Marker ebenfalls heraus, damit die Artefakte
+sauber bleiben.
+
+### Was das naechste Kartenfenster belegen muss
+
+Drei Boots, jeweils Dauer bis „fired up and ready to roll" messen. Rezept und
+Flags unveraendert gegenueber `s03_boot_b` / `s04_boot_c`, also mit
+`--rank-tp-ratio auto-performance` und OHNE gepinntes `--rank-mlp-ratio`.
+
+1. **Migration ohne Sonde.** Vorher: `rm -f
+   /root/.cache/sglang/hw_profile-9a5e9b49b7dc.json`, die v2-Datei
+   `hw_profile-124a7190f860.json` stehen lassen. Erwartung im Log:
+   `migrating the cached v2 hardware profile to v3 ... which runs the lanes
+   probe group(s) and NOT the pairwise link matrix`, Quelle
+   `migrated v2 cache + lanes top-up`, Top-up in der Groessenordnung der 6 s aus
+   Posten 2a. Erwarteter Bootzuwachs gegenueber einem gepinnten Boot: unter
+   15 s, nicht 600 s. Danach pruefen, dass die vier `links`-Eintraege der
+   v2-Datei im neuen Profil stehen.
+2. **Lanes-only-Nachprobe unter Deckel.** Beide Cache-Dateien wegraeumen
+   (`hw_profile-*.json` sichern und loeschen). Erwartung: volle Stage 0, und
+   falls die Link-Matrix wieder nicht durchkommt, Abbruch nach 45 s statt
+   600 s, mit `notes["links"]` im geschriebenen Profil und den Raengen in der
+   Warnung. Genau dieser Boot beantwortet auch, ob die Rendezvous-Haertung die
+   Wurzel getroffen hat: kommt die Link-Matrix jetzt durch, war es die geerbte
+   Umgebung.
+3. **Warmer Cache.** Direkt danach noch einmal booten. Erwartung: `cache (...)`,
+   kein Subprozess, Bootdauer wie mit gepinntem Vektor.
+
+Zu erheben: die drei Bootdauern, die Zeile `auto-performance (...)` mit der
+Quelle, `probe_seconds`, und bei Boot 2 der Inhalt von `notes`.

@@ -79,15 +79,67 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: 2: per-GPU membw_read_gbs / membw_copy_gbs / membw_gemv_gbs added. Cached
-#: v1 profiles carry no GEMV rate, so they re-probe rather than silently fall
-#: back to the streaming peak as the decode divisor.
+#: 2: per-GPU membw_read_gbs / membw_copy_gbs / membw_gemv_gbs added. A v1
+#: profile carries no GEMV rate, so the decode divisor falls back to the
+#: streaming peak with a named reason rather than silently.
 #: 3: per-GPU gemm_lanes / gemm_lane_notes added -- the GEMM probe measured in
 #: the QUANTIZED formats a checkpoint actually runs in, not only dense bf16.
 #: A v2 profile carries no lane, so an fp8 plan on one falls back to bf16 with
 #: a named warning rather than silently scoring the ranks in the wrong format.
+#:
+#: Both bumps only ADDED fields, so an older cached profile is migrated and
+#: topped up, never discarded -- see ``_PROFILE_VERSION_FIELDS``.
 PROFILE_VERSION = 3
 PROFILE_CACHE_DIR = os.path.expanduser("~/.cache/sglang")
+
+#: Probe GROUPS: the per-GPU keys one measurement pass produces. The stage-0
+#: probe can run any subset of them, which is what makes a version bump
+#: affordable -- see ``_PROFILE_VERSION_FIELDS``.
+PROBE_GROUP_GEMM = "gemm"
+PROBE_GROUP_LANES = "lanes"
+PROBE_GROUP_MEMBW = "membw"
+_PROBE_GROUP_FIELDS: Dict[str, Tuple[str, ...]] = {
+    PROBE_GROUP_GEMM: ("gemm_tflops",),
+    PROBE_GROUP_LANES: ("gemm_lanes", "gemm_lane_notes"),
+    PROBE_GROUP_MEMBW: (
+        "membw_gbs",
+        "membw_read_gbs",
+        "membw_copy_gbs",
+        "membw_gemv_gbs",
+    ),
+}
+_FIELD_PROBE_GROUP: Dict[str, str] = {
+    field: group for group, fields in _PROBE_GROUP_FIELDS.items() for field in fields
+}
+
+#: Per-GPU keys each PROFILE_VERSION ADDED. Both bumps so far were purely
+#: additive: every value the previous version measured still means the same
+#: thing. So a cached profile of an older version is MIGRATED, not discarded --
+#: its values are carried over and only the fields the newer versions added are
+#: marked missing and re-measured, in a lazy top-up that runs the probe GROUPS
+#: those fields belong to and nothing else.
+#:
+#: This is the general rule for future bumps, not a one-off for 2->3. Throwing
+#: a whole profile away over an added field costs a full stage-0 probe on the
+#: next boot -- including the pairwise link matrix, which is the slowest and by
+#: far the most failure-prone phase (task #303: an unreachable rendezvous there
+#: charged 600 s to every auto-performance boot). Declare the added fields
+#: here, register the probe group that measures them above, and the bump costs
+#: only that group.
+#:
+#: A bump that CHANGES the meaning of an existing field is not a migration and
+#: must not be listed here: drop the entry from the cache key instead, so the
+#: old value cannot be carried forward.
+_PROFILE_VERSION_FIELDS: Dict[int, Tuple[str, ...]] = {
+    2: ("membw_read_gbs", "membw_copy_gbs", "membw_gemv_gbs"),
+    3: ("gemm_lanes", "gemm_lane_notes"),
+}
+
+#: Top-level key holding the REASON for anything the profile does not carry --
+#: the same mechanic as the per-lane ``gemm_lane_notes`` (#298a): an absent
+#: measurement stores why it is absent, so a consumer reports a named gap
+#: instead of silently substituting a number.
+PROFILE_NOTES_KEY = "notes"
 
 #: Probe shapes (model-relevant): GEMM = one chunked-prefill MLP matmul
 #: (2048 tokens x 5120 x 17408 bf16), MEMBW = a decode-style weight-streaming
@@ -504,10 +556,80 @@ def _nvml_gpu_inventory() -> Tuple[List[dict], str]:
         pynvml.nvmlShutdown()
 
 
-def profile_cache_path(uuids: Sequence[str], driver: str) -> str:
-    key = json.dumps([sorted(uuids), driver, PROFILE_VERSION])
+def profile_cache_path(
+    uuids: Sequence[str], driver: str, version: Optional[int] = None
+) -> str:
+    """Cache path of the profile for this (GPU set, driver, schema version).
+
+    ``version`` defaults to the current ``PROFILE_VERSION``; passing an older
+    one addresses the file a previous release wrote, which is what the
+    migration reads."""
+    key = json.dumps(
+        [sorted(uuids), driver, PROFILE_VERSION if version is None else version]
+    )
     digest = hashlib.sha1(key.encode()).hexdigest()[:12]
     return os.path.join(PROFILE_CACHE_DIR, f"hw_profile-{digest}.json")
+
+
+def legacy_profile_paths(uuids: Sequence[str], driver: str) -> List[Tuple[int, str]]:
+    """``(version, path)`` of every OLDER schema version's cache file for this
+    rig, newest first. The schema version is part of the cache key, so an
+    older profile lives at a different path and has to be looked up
+    explicitly."""
+    return [
+        (v, profile_cache_path(uuids, driver, version=v))
+        for v in range(PROFILE_VERSION - 1, 0, -1)
+    ]
+
+
+def _profile_fields_through(version: int) -> List[str]:
+    """Every per-GPU field declared by ``_PROFILE_VERSION_FIELDS`` up to and
+    including ``version``."""
+    fields: List[str] = []
+    for v in sorted(_PROFILE_VERSION_FIELDS):
+        if v <= version:
+            fields.extend(_PROFILE_VERSION_FIELDS[v])
+    return fields
+
+
+def migrate_profile(profile: dict) -> Tuple[dict, Dict[str, List[str]]]:
+    """Lift a cached profile of an older ``PROFILE_VERSION`` to the current one.
+
+    Returns ``(migrated, {uuid: [missing field, ...]})``. Every value the old
+    profile carries -- per-card rates, the link matrix, the probe timestamp --
+    is carried over unchanged; only the fields the newer versions ADDED are
+    reported missing, for the caller to top up lazily. The returned profile is
+    a deep copy; the input is not modified."""
+    migrated = json.loads(json.dumps(profile))
+    old_version = int(migrated.get("version") or 0)
+    migrated["version"] = PROFILE_VERSION
+    migrated["migrated_from"] = old_version
+    wanted = _profile_fields_through(PROFILE_VERSION)
+    missing: Dict[str, List[str]] = {}
+    for uuid, entry in (migrated.get("gpus") or {}).items():
+        gaps = [f for f in wanted if f not in entry]
+        if gaps:
+            missing[uuid] = gaps
+    return migrated, missing
+
+
+def probe_groups_for_fields(fields: Sequence[str]) -> List[str]:
+    """The probe groups that have to run to measure ``fields`` -- in the fixed
+    order the full probe runs them, so a top-up and a full probe measure a
+    card in the same sequence (a GEMM pass leaves the card in a different
+    clock state than a bandwidth pass, and the order is part of the
+    measurement)."""
+    groups = {_FIELD_PROBE_GROUP[f] for f in fields if f in _FIELD_PROBE_GROUP}
+    return [
+        g
+        for g in (PROBE_GROUP_GEMM, PROBE_GROUP_LANES, PROBE_GROUP_MEMBW)
+        if g in groups
+    ]
+
+
+def _profile_note(profile: dict, key: str, reason: str) -> None:
+    """Record WHY ``key`` is absent from ``profile``."""
+    profile.setdefault(PROFILE_NOTES_KEY, {})[key] = reason
 
 
 # ---------------------------------------------------------------------------
@@ -885,17 +1007,95 @@ def _bench_membw_gbs(dev) -> float:
     return _bench_membw_rates(dev).streaming_peak_gbs
 
 
-def _link_worker(rank: int, world: int, results) -> None:
+#: Environment the link workers must NOT inherit. Every one of these steers
+#: torch's ``env://`` rendezvous, and the probe is a private, single-node,
+#: three-second process group that has nothing to do with whatever distributed
+#: job the launching shell was configured for. Inheriting any of them points
+#: the probe's rendezvous somewhere it will never complete -- see
+#: ``_link_rendezvous_env``.
+_LINK_ENV_TO_CLEAR = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "TORCHELASTIC_USE_AGENT_STORE",
+    "TORCHELASTIC_RUN_ID",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
+)
+
+
+def _free_tcp_port() -> int:
+    """A currently free localhost TCP port, for the probe's own rendezvous."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _link_rendezvous_env(port: int) -> None:
+    """Pin the link probe's rendezvous to a private localhost endpoint.
+
+    ROOT CAUSE, task #303. This used to be ``os.environ.setdefault``, on a
+    hardcoded port. Both halves are defects:
+
+      * ``setdefault`` means an inherited ``MASTER_ADDR`` wins. Rank 0 then
+        binds the store on the WILDCARD address (torch's TCPStore server
+        ignores the hostname when listening) and waits for its workers, while
+        the workers dial the inherited address and never reach it. Every rank
+        sits in the ``TCPStore`` constructor for the full process-group
+        timeout -- 600 s with the NCCL default -- and the probe subprocess is
+        then killed by its own outer timeout. Reproduced on CPU with
+        ``MASTER_ADDR=192.0.2.7``: all ranks block at
+        ``rendezvous.py:_create_c10d_store``, byte-for-byte the py-spy
+        signature captured on the rig.
+      * a hardcoded port collides with any concurrent or orphaned probe, and
+        the collision surfaces as a bind error on rank 0 that kills the whole
+        probe.
+      * ``TORCHELASTIC_USE_AGENT_STORE=True`` makes EVERY rank a store client,
+        so nobody hosts the store and all of them wait out the timeout.
+
+    So the endpoint is dictated, not defaulted: the parent picks a free port
+    and every steering variable is removed from the child environment first."""
+    for var in _LINK_ENV_TO_CLEAR:
+        os.environ.pop(var, None)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+
+
+def _link_worker(rank: int, world: int, results, port: int, timeout_s: float) -> None:
     """NCCL pairwise link probe (adapted from m20_nccl_bench): P2P 1 MiB
     bandwidth per GPU pair + small all-reduce latency over the full group."""
     import torch
     import torch.distributed as dist
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29517")
+    _link_rendezvous_env(port)
+    # Rank-local condition BEFORE the collective: prove this rank's own card
+    # answers, and publish that it got that far. A rank that cannot allocate
+    # on its device must fail here with its own error, not disappear into a
+    # group wait that reports nothing about which rank is broken; and when the
+    # group DOES hang, the parent can name the ranks that reached the
+    # rendezvous versus the ones that never arrived.
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world)
     dev = torch.device(f"cuda:{rank}")
+    torch.zeros(1, device=dev)
+    results[f"reached_rendezvous:{rank}"] = True
+
+    # Explicit, finite timeout: torch's default for NCCL is 600 s, which is
+    # the entire cost this probe is supposed to avoid. The group is local and
+    # tiny -- if it does not form within the phase budget it is not going to.
+    from datetime import timedelta
+
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world,
+        timeout=timedelta(seconds=max(5.0, timeout_s)),
+    )
     out = {}
 
     def bench(fn, iters=100, warmup=20):
@@ -936,87 +1136,382 @@ def _link_worker(rank: int, world: int, results) -> None:
     dist.destroy_process_group()
 
 
-def run_probe(out_path: str) -> dict:
-    """Execute the full stage-0 probe on every visible CUDA device and write
-    the JSON profile to `out_path`. Meant to run inside the dedicated probe
-    subprocess (see get_hardware_profile)."""
-    import torch
+def _link_timeout_s() -> float:
+    from sglang.srt.environ import envs
 
-    t0 = time.time()
-    gpus, driver = _nvml_gpu_inventory()
-    per_gpu: Dict[str, dict] = {}
-    for g in gpus:
-        dev = torch.device(f"cuda:{g['cuda_index']}")
-        torch.cuda.set_device(dev)
-        gemm = _bench_gemm_tflops(dev)
-        lane_tflops, lane_notes = _bench_gemm_lanes(dev)
-        rates = _bench_membw_rates(dev)
-        per_gpu[g["uuid"]] = {
-            "name": g["name"],
-            "cuda_index": g["cuda_index"],
-            "total_mib": g["total_mib"],
-            "gemm_tflops": round(gemm, 2),
-            # Quantized GEMM lanes, and the reason for each one that is
-            # absent. The prefill objective picks per card by the checkpoint's
-            # format (see rank_gemm_scores); a missing lane must read as a
-            # missing MEASUREMENT, which is why the note is stored next to it.
-            "gemm_lanes": lane_tflops,
-            "gemm_lane_notes": lane_notes,
-            # Unchanged meaning and unchanged consumers: the card's streaming
-            # bandwidth score.
-            "membw_gbs": round(rates.streaming_peak_gbs, 1),
-            # The three rates kept apart. membw_gemv_gbs is the decode
-            # roofline's divisor; the other two are what it is judged against
-            # (see _PROBE_GEMV_SATURATION_FLOOR / _PROBE_GEMV_CACHE_CEILING).
-            "membw_read_gbs": round(rates.read_gbs, 1),
-            "membw_copy_gbs": round(rates.copy_gbs, 1),
-            "membw_gemv_gbs": round(rates.gemv_gbs, 1),
-        }
+    return float(envs.SGLANG_PERF_PROBE_LINK_TIMEOUT_S.get())
+
+
+def probe_link_matrix(
+    gpus: Sequence[dict], timeout_s: Optional[float] = None
+) -> Tuple[Dict[str, dict], str]:
+    """Pairwise NCCL link matrix, under a HARD wall-clock cap.
+
+    Returns ``(links, reason)``; ``reason`` is empty when the phase completed
+    and names the failure otherwise, for the caller to store next to the empty
+    table (same mechanic as ``gemm_lane_notes``).
+
+    The cap exists because this is the only phase of the probe that waits on
+    something other than this rig's own hardware: it forms a process group, so
+    a rendezvous that cannot complete blocks for the process-group timeout
+    rather than failing. That is a boot-time cost paid on the critical path,
+    and no measurement is worth an unbounded wait -- the per-card numbers are
+    already in hand at this point, and the link matrix only refines the
+    communication term of the plan."""
+    import torch
+    import torch.multiprocessing as mp
 
     links: Dict[str, dict] = {}
-    world = torch.cuda.device_count()
-    if world > 1:
-        import torch.multiprocessing as mp
+    world = int(torch.cuda.device_count())
+    if world <= 1:
+        return links, ""
+    budget = _link_timeout_s() if timeout_s is None else float(timeout_s)
+    if budget <= 0:
+        return links, "link matrix disabled (link timeout <= 0)"
 
-        mgr = mp.Manager()
-        results = mgr.dict()
-        mp.spawn(_link_worker, args=(world, results), nprocs=world, join=True)
-        by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
-        r0 = dict(results[0]) if 0 in results else {}
-        for a in range(world):
-            ra = dict(results[a]) if a in results else {}
-            for b in range(a + 1, world):
-                key = "|".join(sorted([by_idx[a], by_idx[b]]))
-                gbs = ra.get(f"p2p_{a}_{b}_gbs")
-                if gbs is not None:
-                    links[key] = {"p2p_gbs": round(gbs, 2)}
-        if "ar_10kb_us" in r0:
-            links["__group__"] = {
-                "ar_10kb_us": round(r0["ar_10kb_us"], 1),
-                "ar_1mb_us": round(r0["ar_1mb_us"], 1),
-            }
+    port = _free_tcp_port()
+    mgr = mp.Manager()
+    results = mgr.dict()
+    ctx = mp.spawn(
+        _link_worker,
+        args=(world, results, port, budget),
+        nprocs=world,
+        join=False,
+    )
+    deadline = time.time() + budget
+    reason = ""
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                reached = sorted(
+                    int(k.split(":")[1])
+                    for k in list(results.keys())
+                    if isinstance(k, str) and k.startswith("reached_rendezvous:")
+                )
+                missing = [r for r in range(world) if r not in reached]
+                reason = (
+                    f"link matrix timed out after {budget:.0f} s "
+                    f"(rendezvous 127.0.0.1:{port}, world {world}; ranks that "
+                    f"reached the rendezvous: {reached or 'none'}"
+                    + (f", ranks that never arrived: {missing}" if missing else "")
+                    + "). Per-card measurements are kept; the plan falls back "
+                    "to its uniform link assumption. Raise "
+                    "SGLANG_PERF_PROBE_LINK_TIMEOUT_S to allow more, or set "
+                    "SGLANG_PERF_PROBE_SKIP_LINKS=1 to stop attempting it."
+                )
+                break
+            # join() returns True once every worker exited cleanly, raises if
+            # one died, and returns False on timeout -- so this loop is bounded
+            # by the deadline in every branch.
+            if ctx.join(timeout=min(1.0, remaining)):
+                break
+    except Exception as ex:
+        reason = f"link matrix failed: {type(ex).__name__}: {ex}"
+    finally:
+        _terminate_spawn_context(ctx)
+        # Snapshot before the manager goes away, then shut it down: the probe
+        # process exits right after this and must not leave a manager behind.
+        harvest = {k: dict(v) for k, v in results.items() if isinstance(v, dict)}
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
 
-    profile = {
-        "version": PROFILE_VERSION,
-        "driver": driver,
-        "uuids": sorted(per_gpu),
-        "gpus": per_gpu,
-        "links": links,
-        "probe_seconds": round(time.time() - t0, 1),
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    if reason:
+        return {}, reason
+
+    by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
+    r0 = harvest.get(0, {})
+    for a in range(world):
+        ra = harvest.get(a, {})
+        for b in range(a + 1, world):
+            if a not in by_idx or b not in by_idx:
+                continue
+            key = "|".join(sorted([by_idx[a], by_idx[b]]))
+            gbs = ra.get(f"p2p_{a}_{b}_gbs")
+            if gbs is not None:
+                links[key] = {"p2p_gbs": round(gbs, 2)}
+    if "ar_10kb_us" in r0:
+        links["__group__"] = {
+            "ar_10kb_us": round(r0["ar_10kb_us"], 1),
+            "ar_1mb_us": round(r0["ar_1mb_us"], 1),
+        }
+    return links, ""
+
+
+def _terminate_spawn_context(ctx, grace_s: float = 5.0) -> None:
+    """Tear down an ``mp.spawn`` context: SIGTERM, a bounded grace period, then
+    SIGKILL. Bounded at every step -- a probe that hung must not leave workers
+    behind holding CUDA contexts on the cards the server is about to load."""
+    procs = list(getattr(ctx, "processes", []) or [])
+    for p in procs:
+        if p.is_alive():
+            p.terminate()
+    deadline = time.time() + grace_s
+    for p in procs:
+        p.join(timeout=max(0.0, deadline - time.time()))
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=1.0)
+
+
+def _probe_one_gpu(g: dict, groups: Sequence[str]) -> dict:
+    """Run the requested probe groups on one card and return the fields they
+    measured. Groups run in the fixed order of the full probe."""
+    import torch
+
+    dev = torch.device(f"cuda:{g['cuda_index']}")
+    torch.cuda.set_device(dev)
+    fields: Dict[str, object] = {}
+    if PROBE_GROUP_GEMM in groups:
+        fields["gemm_tflops"] = round(_bench_gemm_tflops(dev), 2)
+    if PROBE_GROUP_LANES in groups:
+        lane_tflops, lane_notes = _bench_gemm_lanes(dev)
+        # Quantized GEMM lanes, and the reason for each one that is absent.
+        # The prefill objective picks per card by the checkpoint's format (see
+        # rank_gemm_scores); a missing lane must read as a missing
+        # MEASUREMENT, which is why the note is stored next to it.
+        fields["gemm_lanes"] = lane_tflops
+        fields["gemm_lane_notes"] = lane_notes
+    if PROBE_GROUP_MEMBW in groups:
+        rates = _bench_membw_rates(dev)
+        # Unchanged meaning and unchanged consumers: the card's streaming
+        # bandwidth score.
+        fields["membw_gbs"] = round(rates.streaming_peak_gbs, 1)
+        # The three rates kept apart. membw_gemv_gbs is the decode roofline's
+        # divisor; the other two are what it is judged against (see
+        # _PROBE_GEMV_SATURATION_FLOOR / _PROBE_GEMV_CACHE_CEILING).
+        fields["membw_read_gbs"] = round(rates.read_gbs, 1)
+        fields["membw_copy_gbs"] = round(rates.copy_gbs, 1)
+        fields["membw_gemv_gbs"] = round(rates.gemv_gbs, 1)
+    return fields
+
+
+def _write_profile(profile: dict, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     tmp = out_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(profile, f, indent=1)
     os.replace(tmp, out_path)
+
+
+def run_probe(
+    out_path: str,
+    groups: Optional[Sequence[str]] = None,
+    base: Optional[dict] = None,
+) -> dict:
+    """Execute the stage-0 probe on every visible CUDA device and write the
+    JSON profile to ``out_path``. Meant to run inside the dedicated probe
+    subprocess (see ``get_hardware_profile``).
+
+    ``groups`` selects which probe groups to measure; ``None`` is the full
+    probe (all groups plus the link matrix). Passing a subset together with
+    ``base`` is the LAZY TOP-UP path: only the named groups are measured, every
+    other field -- including the link matrix, the slowest phase by far -- is
+    carried over from ``base``. That is what makes an additive PROFILE_VERSION
+    bump cost one GEMM pass instead of a full stage 0."""
+    t0 = time.time()
+    gpus, driver = _nvml_gpu_inventory()
+    topup = groups is not None
+    groups = list(_PROBE_GROUP_FIELDS) if groups is None else list(groups)
+    base_gpus = dict((base or {}).get("gpus") or {})
+
+    per_gpu: Dict[str, dict] = {}
+    for g in gpus:
+        entry = dict(base_gpus.get(g["uuid"]) or {})
+        entry.update(
+            {
+                "name": g["name"],
+                "cuda_index": g["cuda_index"],
+                "total_mib": g["total_mib"],
+            }
+        )
+        entry.update(_probe_one_gpu(g, groups))
+        per_gpu[g["uuid"]] = entry
+
+    from sglang.srt.environ import envs
+
+    notes: Dict[str, str] = dict((base or {}).get(PROFILE_NOTES_KEY) or {})
+    if topup:
+        # The top-up never re-runs the network phase: its whole point is to
+        # add per-card fields to a profile whose link matrix already measured.
+        links = dict((base or {}).get("links") or {})
+    elif bool(envs.SGLANG_PERF_PROBE_SKIP_LINKS.get()):
+        links = {}
+        notes["links"] = "link matrix skipped (SGLANG_PERF_PROBE_SKIP_LINKS=1)"
+    else:
+        links, link_reason = probe_link_matrix(gpus)
+        if link_reason:
+            notes["links"] = link_reason
+            logger.warning("auto-performance probe: %s", link_reason)
+        else:
+            notes.pop("links", None)
+
+    profile = dict(base or {})
+    profile.update(
+        {
+            "version": PROFILE_VERSION,
+            "driver": driver,
+            "uuids": sorted(per_gpu),
+            "gpus": per_gpu,
+            "links": links,
+            "probe_seconds": round(time.time() - t0, 1),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    if topup:
+        profile["topup_groups"] = groups
+    if notes:
+        profile[PROFILE_NOTES_KEY] = notes
+    else:
+        profile.pop(PROFILE_NOTES_KEY, None)
+    _write_profile(profile, out_path)
     return profile
+
+
+#: Marker put in front of every line of a quoted SUBPROCESS log. The probe's
+#: own failure is caught, named and recovered from here; the traceback is
+#: quoted only as evidence. Without the marker the quoted traceback reads to a
+#: log scanner exactly like a crash of the server itself -- which is how a
+#: deliberately killed probe was scored as a boot failure (#303 part 4). The
+#: battery's scanner knows this token; see
+#: scripts/gpu_battery/checks/check_common.py.
+QUOTED_SUBLOG_PREFIX = "[probe-subprocess] "
+
+
+def _quote_sublog(text: str, limit: int = 2000) -> str:
+    """Prefix every line of a captured subprocess log with the marker above."""
+    tail = (text or "")[-limit:]
+    return "\n".join(QUOTED_SUBLOG_PREFIX + line for line in tail.splitlines())
+
+
+def _probe_timeout_s() -> float:
+    from sglang.srt.environ import envs
+
+    return float(envs.SGLANG_PERF_PROBE_TIMEOUT_S.get())
+
+
+def _run_probe_subprocess(path: str, groups: Optional[Sequence[str]]) -> Optional[str]:
+    """Run the probe in its own process (so the launcher stays free of CUDA
+    contexts). Returns None on success, or a one-line reason on failure."""
+    cmd = [sys.executable, "-m", "sglang.srt.uneven_perf", "--probe", "--out", path]
+    if groups:
+        cmd += ["--groups", ",".join(groups)]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_probe_timeout_s(),
+            check=False,
+        )
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    if proc.returncode != 0:
+        logger.warning(
+            "auto-performance: hardware probe failed (rc=%d); the quoted lines "
+            "below are the PROBE's log, not this server's:\n%s",
+            proc.returncode,
+            _quote_sublog(proc.stderr or proc.stdout or ""),
+        )
+        return f"probe subprocess exited with rc={proc.returncode}"
+    return None
+
+
+def _load_profile(path: str, driver: str, uuids: Sequence[str]) -> Optional[dict]:
+    """A cached profile from ``path`` whose rig key matches, else None. The
+    schema version is NOT checked here -- the caller decides between using and
+    migrating it."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            profile = json.load(f)
+    except Exception as e:
+        logger.warning(
+            "auto-performance: could not read cached profile %s (%s).", path, e
+        )
+        return None
+    if profile.get("driver") != driver or profile.get("uuids") != sorted(uuids):
+        return None
+    return profile
+
+
+def _migrated_profile(
+    driver: str, uuids: Sequence[str], path: str
+) -> Tuple[Optional[dict], str]:
+    """Migrate the newest older-version cache file for this rig, topping up
+    only the fields the newer versions added.
+
+    Returns ``(profile or None, source description)``. The top-up runs the
+    probe GROUPS those fields belong to and NOTHING else -- in particular not
+    the pairwise link matrix, which the old profile already measured and which
+    is the phase that can hang. If the top-up fails, the migrated profile is
+    still returned: every value the old version measured is valid, and the
+    consumers of the added fields already report a named gap rather than
+    substituting a number."""
+    for old_version, old_path in legacy_profile_paths(uuids, driver):
+        old = _load_profile(old_path, driver, uuids)
+        if old is None or int(old.get("version") or 0) != old_version:
+            continue
+        profile, missing = migrate_profile(old)
+        gaps = sorted({f for fields in missing.values() for f in fields})
+        if not gaps:
+            _write_profile(profile, path)
+            return profile, f"migrated v{old_version} cache ({old_path})"
+        groups = probe_groups_for_fields(gaps)
+        logger.info(
+            "auto-performance: migrating the cached v%d hardware profile to v%d "
+            "(%s) -- every measured value is kept; only the added field(s) %s "
+            "are re-probed, which runs the %s probe group(s) and NOT the "
+            "pairwise link matrix.",
+            old_version,
+            PROFILE_VERSION,
+            old_path,
+            ", ".join(gaps),
+            ", ".join(groups),
+        )
+        # Stage the migrated profile at the new path first: the top-up
+        # subprocess reads it as its base and merges into it, so a failed
+        # top-up still leaves the carried-over values cached.
+        _write_profile(profile, path)
+        failure = _run_probe_subprocess(path, groups)
+        if failure is None:
+            topped = _load_profile(path, driver, uuids)
+            if topped is not None:
+                return (
+                    topped,
+                    f"migrated v{old_version} cache + {'/'.join(groups)} top-up "
+                    f"({topped.get('probe_seconds', '?')} s)",
+                )
+            failure = "top-up wrote no readable profile"
+        for field in gaps:
+            _profile_note(
+                profile,
+                field,
+                f"added in profile version {PROFILE_VERSION}; the lazy top-up "
+                f"probe did not run ({failure}). Re-probe with "
+                f"SGLANG_PERF_REPROBE=1 to measure it.",
+            )
+        logger.warning(
+            "auto-performance: the lazy top-up probe failed (%s); keeping the "
+            "migrated v%d profile without %s.",
+            failure,
+            old_version,
+            ", ".join(gaps),
+        )
+        _write_profile(profile, path)
+        return profile, f"migrated v{old_version} cache (top-up failed)"
+    return None, ""
 
 
 def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
     """The rig's hardware profile: from the cache when the (sorted GPU UUIDs,
-    driver version) key matches, otherwise via a fresh probe subprocess
-    (isolated so the launcher process stays free of CUDA contexts).
+    driver version) key matches, otherwise migrated from an older schema
+    version's cache, otherwise via a fresh probe subprocess (isolated so the
+    launcher process stays free of CUDA contexts).
 
     Returns (profile or None, source description, per-CUDA-device inventory).
     SGLANG_PERF_REPROBE=1 forces a re-probe."""
@@ -1027,55 +1522,40 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
     from sglang.srt.environ import envs
 
     force = bool(envs.SGLANG_PERF_REPROBE.get())
-    if not force and os.path.exists(path):
-        try:
-            with open(path) as f:
-                profile = json.load(f)
-            if (
-                profile.get("version") == PROFILE_VERSION
-                and profile.get("driver") == driver
-                and profile.get("uuids") == sorted(uuids)
-            ):
-                return profile, f"cache ({path})", gpus
-            logger.warning(
-                "auto-performance: cached profile %s has a stale key; re-probing.",
-                path,
-            )
-        except Exception as e:
-            logger.warning(
-                "auto-performance: could not read cached profile %s (%s); "
-                "re-probing.",
-                path,
-                e,
-            )
-
     reason = "forced by SGLANG_PERF_REPROBE=1" if force else "no cached profile"
+    if not force:
+        profile = _load_profile(path, driver, uuids)
+        if profile is not None and profile.get("version") == PROFILE_VERSION:
+            return profile, f"cache ({path})", gpus
+        if profile is not None:
+            reason = f"cached profile {path} has a stale key"
+            logger.warning("auto-performance: %s; re-probing.", reason)
+        else:
+            migrated, source = _migrated_profile(driver, uuids, path)
+            if migrated is not None:
+                return migrated, source, gpus
+
     logger.info(
         "auto-performance: running the stage-0 hardware micro-probe (%s; "
         "GEMM per card in every reachable lane (bf16 + the quantized ones) "
-        "+ memory bandwidth, pairwise NCCL link matrix; "
+        "+ memory bandwidth, pairwise NCCL link matrix under a %.0f s cap; "
         "a few seconds, cached to %s afterwards)...",
         reason,
+        _link_timeout_s(),
         path,
     )
-    cmd = [sys.executable, "-m", "sglang.srt.uneven_perf", "--probe", "--out", path]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600, check=False
-        )
-        if proc.returncode != 0:
-            logger.warning(
-                "auto-performance: hardware probe failed (rc=%d):\n%s",
-                proc.returncode,
-                (proc.stderr or proc.stdout or "")[-2000:],
+    failure = _run_probe_subprocess(path, None)
+    if failure is None:
+        profile = _load_profile(path, driver, uuids)
+        if profile is not None:
+            return (
+                profile,
+                f"fresh probe ({profile.get('probe_seconds', '?')} s)",
+                gpus,
             )
-            return None, "probe failed", gpus
-        with open(path) as f:
-            profile = json.load(f)
-        return profile, f"fresh probe ({profile.get('probe_seconds', '?')} s)", gpus
-    except Exception as e:
-        logger.warning("auto-performance: hardware probe failed (%s).", e)
-        return None, "probe failed", gpus
+        failure = "probe wrote no readable profile"
+    logger.warning("auto-performance: hardware probe failed (%s).", failure)
+    return None, "probe failed", gpus
 
 
 def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
@@ -1083,22 +1563,23 @@ def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
     profile when its (sorted GPU UUIDs, driver, version) key matches, else
     (None, inventory). NEVER triggers a probe -- used by consumers that only
     want opportunistic access to the measured scores (--rank-vocab-ratio
-    auto), where a multi-second probe would be a surprising side effect."""
+    auto), where a multi-second probe would be a surprising side effect.
+
+    An older schema version's cache is MIGRATED in memory (values carried
+    over, added fields simply absent) rather than ignored: the migration
+    itself measures nothing, and dropping a rig's measured rates over a field
+    this caller does not read would be a loss for no gain. Nothing is written
+    back -- writing is the probing path's job."""
     gpus, driver = _nvml_gpu_inventory()
     uuids = [g["uuid"] for g in gpus]
-    path = profile_cache_path(uuids, driver)
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                profile = json.load(f)
-            if (
-                profile.get("version") == PROFILE_VERSION
-                and profile.get("driver") == driver
-                and profile.get("uuids") == sorted(uuids)
-            ):
-                return profile, gpus
-        except Exception:
-            pass
+    profile = _load_profile(profile_cache_path(uuids, driver), driver, uuids)
+    if profile is not None and profile.get("version") == PROFILE_VERSION:
+        return profile, gpus
+    for old_version, old_path in legacy_profile_paths(uuids, driver):
+        old = _load_profile(old_path, driver, uuids)
+        if old is not None and int(old.get("version") or 0) == old_version:
+            migrated, _ = migrate_profile(old)
+            return migrated, gpus
     return None, gpus
 
 
@@ -4122,13 +4603,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="sglang auto-performance probe")
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument(
+        "--groups",
+        type=str,
+        default=None,
+        help=(
+            "comma-separated probe groups to measure ("
+            + ", ".join(_PROBE_GROUP_FIELDS)
+            + "). Default: all of them plus the pairwise link matrix. A subset "
+            "is the LAZY TOP-UP mode -- the existing profile at --out is the "
+            "base, only the named groups are re-measured, and the link matrix "
+            "is carried over rather than re-run."
+        ),
+    )
     args = parser.parse_args()
     if args.probe:
         out = args.out
         if out is None:
             gpus, driver = _nvml_gpu_inventory()
             out = profile_cache_path([g["uuid"] for g in gpus], driver)
-        prof = run_probe(out)
+        groups = None
+        base = None
+        if args.groups:
+            groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+            unknown = [g for g in groups if g not in _PROBE_GROUP_FIELDS]
+            if unknown:
+                parser.error(
+                    f"unknown probe group(s) {unknown}; known: "
+                    f"{sorted(_PROBE_GROUP_FIELDS)}"
+                )
+            if not os.path.exists(out):
+                parser.error(f"--groups needs an existing base profile at {out}")
+            with open(out) as f:
+                base = json.load(f)
+        prof = run_probe(out, groups=groups, base=base)
         print(json.dumps(prof, indent=1))
     else:
         parser.error("nothing to do (pass --probe)")

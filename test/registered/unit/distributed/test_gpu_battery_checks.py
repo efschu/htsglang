@@ -2089,3 +2089,97 @@ class TestVerdictContract:
             raise CheckFail("erste Zeile\nzweite Zeile\n\ndritte")
 
         assert rc_helper("s99_probe", raiser) == 1
+
+
+class TestFatalScanSkipsQuotedSubprocessLogs:
+    """A boot is judged by its OWN lines (#303 part 4).
+
+    An sglang server QUOTES the log of helper subprocesses it ran and recovered
+    from -- above all the stage-0 hardware probe, whose failure is caught,
+    named and worked around. When that probe is killed (which the #289 evidence
+    run did on purpose, to stop it burning 600 s of card time), the server logs
+    a warning with the probe's full traceback and then serves normally. The
+    fatal scan used to see the quoted ``Traceback`` and score the boot as dead.
+
+    What must still be caught, unchanged: a traceback on the server's own
+    lines, and every other fatal marker.
+    """
+
+    KILLED_PROBE_LOG = (
+        "[2026-07-30 19:29:24] auto-performance: running the stage-0 hardware "
+        "micro-probe (no cached profile)...\n"
+        "[2026-07-30 19:30:25] auto-performance: hardware probe failed (rc=1); "
+        "the quoted lines below are the PROBE's log, not this server's:\n"
+        "[probe-subprocess] Traceback (most recent call last):\n"
+        '[probe-subprocess]   File "uneven_perf.py", line 983, in run_probe\n'
+        "[probe-subprocess]     mp.spawn(_link_worker, ...)\n"
+        "[probe-subprocess] ProcessExitedException: process 0 terminated with "
+        "signal SIGTERM\n"
+        "[2026-07-30 19:30:25] auto-performance: hardware profile unavailable "
+        "-- keeping the plain VRAM-auto split.\n"
+        "[2026-07-30 19:34:36] The server is fired up and ready to roll!\n"
+    )
+
+    # The same event as a log written BEFORE the marker existed: the quoted
+    # block is recognised structurally, by the server timestamp that ends it.
+    UNMARKED_KILLED_PROBE_LOG = (
+        "[2026-07-30 19:30:25] auto-performance: hardware probe failed (rc=1):\n"
+        "Traceback (most recent call last):\n"
+        '  File "uneven_perf.py", line 983, in run_probe\n'
+        "torch.multiprocessing.spawn.ProcessExitedException: process 0 "
+        "terminated with signal SIGTERM\n"
+        "[2026-07-30 19:30:25] Uneven DCP: auto-set dcp_size=3.\n"
+        "[2026-07-30 19:34:36] The server is fired up and ready to roll!\n"
+    )
+
+    def _scan(self, tmp_path, text):
+        sys.path.insert(0, CHECKS)
+        from check_common import scan_log_for_fatals  # noqa: E402
+
+        path = tmp_path / "server.log"
+        path.write_text(text)
+        return scan_log_for_fatals(str(path), "server.log")
+
+    def test_killed_probe_traceback_is_not_a_boot_failure(self, tmp_path):
+        assert self._scan(tmp_path, self.KILLED_PROBE_LOG) is None
+
+    def test_unmarked_killed_probe_traceback_is_not_a_boot_failure(self, tmp_path):
+        assert self._scan(tmp_path, self.UNMARKED_KILLED_PROBE_LOG) is None
+
+    def test_real_boot_traceback_is_still_a_failure(self, tmp_path):
+        log = (
+            "[2026-07-30 19:29:24] Load weight begin.\n"
+            "Traceback (most recent call last):\n"
+            '  File "model_runner.py", line 1, in load_model\n'
+            "RuntimeError: no kernel image is available\n"
+        )
+        found = self._scan(tmp_path, log)
+        assert found is not None
+        assert "Traceback" in found
+
+    def test_a_real_fatal_after_a_quoted_block_is_still_found(self, tmp_path):
+        log = self.KILLED_PROBE_LOG + (
+            "[2026-07-30 19:35:00] Scheduler hit an exception\n"
+            "torch.OutOfMemoryError: CUDA out of memory.\n"
+        )
+        found = self._scan(tmp_path, log)
+        assert found is not None
+        assert "out of memory" in found
+
+    def test_oom_inside_a_quoted_probe_log_is_not_a_boot_failure(self, tmp_path):
+        log = (
+            "[2026-07-30 19:30:25] auto-performance: hardware probe failed "
+            "(rc=1); the quoted lines below are the PROBE's log:\n"
+            "[probe-subprocess] torch.OutOfMemoryError: CUDA out of memory.\n"
+            "[2026-07-30 19:34:36] The server is fired up and ready to roll!\n"
+        )
+        assert self._scan(tmp_path, log) is None
+
+    def test_the_two_prefix_literals_agree(self):
+        """check_common and the emitter must name the same marker."""
+        sys.path.insert(0, CHECKS)
+        from check_common import QUOTED_SUBLOG_PREFIX  # noqa: E402
+
+        from sglang.srt.uneven_perf import QUOTED_SUBLOG_PREFIX as EMITTED
+
+        assert QUOTED_SUBLOG_PREFIX == EMITTED

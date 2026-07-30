@@ -148,6 +148,12 @@ FATAL_MARKERS = (
     "Traceback (most recent call last)",
 )
 
+# Lines the server QUOTED from a helper subprocess it ran and recovered from
+# (the stage-0 hardware probe). They carry the emitter's marker, and a fatal
+# marker inside one is evidence about the helper, not about this boot -- see
+# check_common.QUOTED_SUBLOG_PREFIX, keep the literals in step.
+QUOTED_SUBLOG_PREFIX = "[probe-subprocess] "
+
 
 def read_lines(path: str) -> list:
     if not os.path.exists(path):
@@ -248,7 +254,7 @@ def parse_log_evidence(step_dir: str) -> dict:
                 "bytes": int(m.group("bytes")),
                 "zeile": " ".join(line.split())[:300],
             }
-        if fatal is None:
+        if fatal is None and QUOTED_SUBLOG_PREFIX not in line:
             for marker in FATAL_MARKERS:
                 if marker in line:
                     fatal = " ".join(line.split())[:300]

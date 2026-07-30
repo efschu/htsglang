@@ -218,6 +218,14 @@ host_wait_for_server() {  # $1 = port, $2 = budget_s
 # The server log stays on the host. What comes into the run directory is the
 # GREP RESULT plus a bounded tail -- never the whole log, and never into an
 # agent's context.
+#
+# Lines the server QUOTED from a helper subprocess it ran, caught and recovered
+# from (the stage-0 hardware probe above all) are dropped from every harvest.
+# They carry the emitter's marker; a fatal pattern inside one describes the
+# helper, not this boot, and harvesting it is how a deliberately killed probe
+# scored as a BATTERY-FAIL. Keep the literal in step with
+# uneven_perf.QUOTED_SUBLOG_PREFIX / check_common.QUOTED_SUBLOG_PREFIX.
+HOST_QUOTED_SUBLOG_PREFIX='[probe-subprocess] '
 host_grep_into() {  # $1 = host log path, $2 = out file (container), $3.. = patterns
     local log="$1" out="$2"; shift 2
     local pat args=""
@@ -225,7 +233,8 @@ host_grep_into() {  # $1 = host log path, $2 = out file (container), $3.. = patt
         args="$args -e '$pat'"
     done
     : > "$out"
-    host_ssh_for 120 "grep -n -F $args $log 2>/dev/null | head -400" >> "$out" 2>/dev/null
+    host_ssh_for 120 "grep -n -F $args $log 2>/dev/null \
+        | grep -v -F -e '$HOST_QUOTED_SUBLOG_PREFIX' | head -400" >> "$out" 2>/dev/null
     return 0
 }
 
