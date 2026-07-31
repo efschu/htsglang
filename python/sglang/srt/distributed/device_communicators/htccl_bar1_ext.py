@@ -109,6 +109,14 @@ namespace cg = cooperative_groups;
 #define HTCCL_BAR1_MAX_RANKS 8
 #define HTCCL_BAR1_MAX_STEPS (2 * (HTCCL_BAR1_MAX_RANKS - 1))
 
+// Rate limit of the host abort probe inside the spin loops. The word lives in
+// pinned, device-mapped host memory, so reading it is a PCIe round trip -- one
+// per 1024 spin iterations keeps it far below the R volatile BAR1 flag loads
+// the same loop already issues per iteration, while still reacting within
+// microseconds of the host store. A collective that completes never reaches
+// the probe: the loop leaves through its "all peers arrived" break first.
+#define HTCCL_BAR1_WIRT_MASKE 1023u
+
 // Kernel variants, unchanged from the probe.
 #define K_1BLK   0
 #define K_GITTER 1
@@ -277,6 +285,11 @@ struct Bar1Args {
     u64         *rundeDev;    // one word, local: the running round number
     unsigned int *ctlStatus;  // 1 = time limit exceeded
     unsigned int *abbruchDev; // K_GITTER only: grid-wide abort bit
+    // Host-set abort word (pinned, device-mapped). nullptr = absent, and then
+    // the spin loops keep only their cycle deadline. Set to 1 by the peer
+    // watchdog when a peer process is provably gone, which is the one fact the
+    // rank-local deadline cannot see.
+    const unsigned int *abbruchWirt;
     int          n4;
     int          R;
     int          rang;
@@ -493,6 +506,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
 
         bool ab = false;
         long long t0 = clock64();
+        unsigned int sondeZaehler = 0u;
         for (;;) {
             bool alle = true;
             for (int s = 0; s < R; ++s) {
@@ -501,6 +515,8 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+            if (A.abbruchWirt != nullptr && ((++sondeZaehler & HTCCL_BAR1_WIRT_MASKE) == 0u)
+                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
         }
         if (ab) {
             if (GRID == K_1BLK) abbruchS = 1;
@@ -551,6 +567,7 @@ __global__ void bar1_netz_kernel(Bar1Args A)
 
         bool ab = false;
         long long t0 = clock64();
+        unsigned int sondeZaehler = 0u;
         for (;;) {
             bool alle = true;
             for (int s = 0; s < R; ++s) {
@@ -559,6 +576,8 @@ __global__ void bar1_netz_kernel(Bar1Args A)
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+            if (A.abbruchWirt != nullptr && ((++sondeZaehler & HTCCL_BAR1_WIRT_MASKE) == 0u)
+                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
         }
         if (ab) {
             if (GRID == K_1BLK) abbruchS = 1;
@@ -640,8 +659,11 @@ __global__ void bar1_ring_kernel(Bar1Args A)
 
             bool ab = false;
             long long t0 = clock64();
+            unsigned int sondeZaehler = 0u;
             while (flaggeLesen<LA>(A.rgFlagVon[s]) != round) {
                 if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+                if (A.abbruchWirt != nullptr && ((++sondeZaehler & HTCCL_BAR1_WIRT_MASKE) == 0u)
+                    && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
             }
             if (ab) {
                 if (GRID == K_1BLK) abbruchS = 1;
@@ -684,8 +706,11 @@ __global__ void bar1_ring_kernel(Bar1Args A)
 
             bool ab = false;
             long long t0 = clock64();
+            unsigned int sondeZaehler = 0u;
             while (flaggeLesen<LA>(A.rgFlagVon[sl]) != round) {
                 if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+                if (A.abbruchWirt != nullptr && ((++sondeZaehler & HTCCL_BAR1_WIRT_MASKE) == 0u)
+                    && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
             }
             if (ab) {
                 if (GRID == K_1BLK) abbruchS = 1;
@@ -769,6 +794,8 @@ struct A2aArgs {
     u64          *rundeDev;
     unsigned int *ctlStatus;
     unsigned int *abbruchDev;
+    // Host-set abort word (pinned, device-mapped). nullptr = absent.
+    const unsigned int *abbruchWirt;
     int           R;
     int           rang;
     u64           deckelZyklen;
@@ -909,6 +936,7 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
 
         bool ab = false;
         long long t0 = clock64();
+        unsigned int sondeZaehler = 0u;
         for (;;) {
             bool alle = true;
             for (int s = 0; s < R; ++s) {
@@ -917,6 +945,8 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
             }
             if (alle) break;
             if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
+            if (A.abbruchWirt != nullptr && ((++sondeZaehler & HTCCL_BAR1_WIRT_MASKE) == 0u)
+                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
         }
         if (ab) {
             if (GRID == K_1BLK) abbruchS = 1;
@@ -1048,7 +1078,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t chunk_max, int64_t off_netz, int64_t off_ring,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t fluss)
+                     int64_t ladeform, int64_t fluss, int64_t abbruch_wirt)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= HTCCL_BAR1_MAX_RANKS,
@@ -1099,6 +1129,9 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     A.rundeDev     = (u64 *)runde_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
     A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    // 0 means the host could not map the abort word; the kernels then see
+    // nullptr and skip the probe entirely.
+    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
     A.n4           = n4;
     A.R            = R;
     A.rang         = r;
@@ -1240,7 +1273,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform)
+                     int64_t ladeform, int64_t abbruch_wirt)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= HTCCL_BAR1_MAX_RANKS,
@@ -1308,6 +1341,9 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
     A.rundeDev     = (u64 *)runde_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
     A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    // 0 means the host could not map the abort word; nullptr disables the
+    // probe and leaves only the cycle deadline.
+    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
     A.R            = R;
     A.rang         = r;
     A.deckelZyklen = (u64)deckel_zyklen;
@@ -1355,7 +1391,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t chunk_max, int64_t off_netz, int64_t off_ring,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t fluss);
+                     int64_t ladeform, int64_t fluss, int64_t abbruch_wirt);
 
 void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world,
@@ -1369,7 +1405,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
                      at::Tensor runde_dev, at::Tensor ctl_dev,
                      int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform);
+                     int64_t ladeform, int64_t abbruch_wirt);
 """
 
 

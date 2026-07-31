@@ -91,6 +91,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators import htccl_liveness
+
 logger = logging.getLogger(__name__)
 
 _ONCE_SEEN: set = set()
@@ -840,6 +842,12 @@ class HTCCLHostTransport:
         self._p2p_base_off = _HEADER_BYTES + self.world_size * 2 * self.slot_bytes
         total = self._p2p_base_off + npairs * 2 * self.p2p_bytes
 
+        # Peer identities first, BEFORE the rendezvous: the exchange is
+        # itself a collective, so a rank that never arrives is caught by
+        # the exchange's own deadline instead of by the unbounded
+        # broadcast below.
+        self._peer_table = htccl_liveness.install(cpu_group)
+
         # Rendezvous over the (vendor-neutral) gloo group: rank 0 creates the
         # segment and broadcasts its name.
         if self.rank == 0:
@@ -847,6 +855,12 @@ class HTCCLHostTransport:
             name = [self._shm.name]
         else:
             name = [None]
+        # Inline in torch, so not pollable: refusing to enter it when a peer
+        # is already gone is the bound.
+        htccl_liveness.check_peers(
+            "htccl host rendezvous (broadcast_object_list)",
+            table=self._peer_table,
+        )
         dist.broadcast_object_list(
             name, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
         )
@@ -920,7 +934,11 @@ class HTCCLHostTransport:
         # Bound once: the hot path calls this per collective.
         self._resolve_timeout = resolve_timeout_cycles
         # Everyone attached, registered and zeroed before the first op.
-        dist.barrier(group=cpu_group)
+        htccl_liveness.bounded_barrier(
+            cpu_group,
+            "htccl host bring-up barrier",
+            table=self._peer_table,
+        )
         _info_once(
             "HTCCL host transport up: %d ranks, %d MiB slots (x2, "
             "double-buffered), %d MiB p2p pairs, pinned portable+mapped "

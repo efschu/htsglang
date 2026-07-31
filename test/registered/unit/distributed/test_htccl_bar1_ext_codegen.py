@@ -31,10 +31,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-_EXT = (
+_COMM = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/distributed/device_communicators/htccl_bar1_ext.py"
+    / "python/sglang/srt/distributed/device_communicators"
 )
+_EXT = _COMM / "htccl_bar1_ext.py"
+_PIPE = _COMM / "htccl_bar1_pipe_ext.py"
 
 #: The arrays inside ``Bar1Args`` that used to be indexed with a running
 #: index from every thread.
@@ -48,7 +50,7 @@ _PARAM_ARRAYS = (
 )
 
 
-def _cuda_src() -> str:
+def _cuda_src(path: Path = _EXT) -> str:
     """The ``_CUDA_SRC`` literal, read as source rather than imported.
 
     Importing the module is fine on CPU but pointless here: the question is
@@ -56,13 +58,13 @@ def _cuda_src() -> str:
     """
     import ast
 
-    tree = ast.parse(_EXT.read_text(encoding="utf-8"))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign):
             target = node.targets[0]
             if getattr(target, "id", "") == "_CUDA_SRC":
                 return node.value.value
-    raise AssertionError("_CUDA_SRC not found in htccl_bar1_ext.py")
+    raise AssertionError(f"_CUDA_SRC not found in {path.name}")
 
 
 def _without_comments(text: str) -> str:
@@ -152,6 +154,120 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
         ring = _kernel_body(self.src, "bar1_ring_kernel")
         self.assertNotIn("__shared__ uint4", ring)
         self.assertIn("A.rgSend[s]", ring)
+
+
+#: Every spin loop of the BAR1 family ends on the same cycle deadline, so the
+#: deadline check is the enumeration of the spin loops -- there is no second
+#: list to keep in sync.
+_DEADLINE = "> A.deckelZyklen"
+#: Expected number of spin loops per source. A change here is a change to the
+#: kernel's wait structure and should be a deliberate edit, not a surprise.
+_SPIN_LOOPS = {"htccl_bar1_ext.py": 5, "htccl_bar1_pipe_ext.py": 3}
+
+
+class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
+    """A spinning kernel must be reachable from the host.
+
+    The cycle deadline is rank-local: it cannot see that a peer PROCESS is
+    gone, it is multiplied by up to 40x inside the JIT cold-build window --
+    which is exactly the capture window where an OOM kill lands -- and its
+    expiry is silent. ``abbruchWirt`` is the one host-set word that closes
+    that gap, and it only closes it in the loops that actually read it. The
+    invariant is therefore per loop, not per file.
+    """
+
+    def _probe_follows_every_deadline(self, path: Path) -> None:
+        src = _without_comments(_cuda_src(path))
+        self.assertIn(
+            "#define HTCCL_BAR1_WIRT_MASKE",
+            _cuda_src(path),
+            msg=f"{path.name}: the probe's rate limit is gone",
+        )
+        self.assertIn(
+            "const unsigned int *abbruchWirt;",
+            src,
+            msg=f"{path.name}: no host abort word in the argument struct",
+        )
+        stellen = [
+            src.count("\n", 0, m.start()) + 1
+            for m in re.finditer(re.escape(_DEADLINE), src)
+        ]
+        self.assertEqual(
+            len(stellen),
+            _SPIN_LOOPS[path.name],
+            msg=(
+                f"{path.name} has {len(stellen)} spin loops, expected "
+                f"{_SPIN_LOOPS[path.name]}. Adding or removing a wait is "
+                f"fine -- update the count here and give the new loop its "
+                f"probe."
+            ),
+        )
+        zeilen = src.splitlines()
+        ohne = []
+        for lineno in stellen:
+            # The probe sits immediately after the deadline check, within the
+            # macro continuation or the next few statements of the loop body.
+            fenster = "\n".join(zeilen[lineno : lineno + 5])
+            if "A.abbruchWirt" not in fenster:
+                ohne.append(lineno)
+        self.assertFalse(
+            ohne,
+            msg=(
+                f"{path.name}: the spin loop(s) whose deadline check is on "
+                f"line(s) {ohne} do not probe the host abort word. Such a "
+                f"loop keeps spinning for the full "
+                f"SGLANG_HTCCL_BAR1_CAP_CYCLES budget after a peer has "
+                f"died, and the watchdog has no way to end it."
+            ),
+        )
+
+    def test_the_collective_kernels_probe(self):
+        self._probe_follows_every_deadline(_EXT)
+
+    def test_the_pipelined_kernel_probes(self):
+        self._probe_follows_every_deadline(_PIPE)
+
+    def test_the_probe_never_precedes_the_success_break(self):
+        """The completing collective must not pay for the probe.
+
+        In every loop the "all peers arrived" break comes first, then the
+        deadline check, then the probe. Pinning the probe to the lines right
+        after the deadline check keeps it there: moved up in front of the
+        break, it would put a host-memory read on the success path of every
+        spin iteration of every collective that completes.
+        """
+        for path in (_EXT, _PIPE):
+            zeilen = _without_comments(_cuda_src(path)).splitlines()
+            falsch = []
+            for i, zeile in enumerate(zeilen):
+                if "A.abbruchWirt != nullptr" not in zeile:
+                    continue
+                if not any(_DEADLINE in z for z in zeilen[max(0, i - 3) : i]):
+                    falsch.append(i + 1)
+            self.assertFalse(
+                falsch,
+                msg=(
+                    f"{path.name}: the probe(s) on line(s) {falsch} do not "
+                    f"sit directly after a deadline check. The order in the "
+                    f"loop is success break, deadline, probe -- anything "
+                    f"else costs the completing collective."
+                ),
+            )
+
+    def test_the_probe_is_rate_limited(self):
+        """Unmasked, it would be one PCIe read per spin iteration."""
+        for path in (_EXT, _PIPE):
+            src = _without_comments(_cuda_src(path))
+            lese = src.count("A.abbruchWirt != nullptr")
+            maske = src.count("& HTCCL_BAR1_WIRT_MASKE")
+            self.assertEqual(
+                lese,
+                maske,
+                msg=(
+                    f"{path.name}: {lese} null checks of the abort word but "
+                    f"{maske} rate limits. Every probe must be masked."
+                ),
+            )
 
 
 class TestExtensionSurface(CustomTestCase):

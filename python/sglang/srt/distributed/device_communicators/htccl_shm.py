@@ -23,13 +23,14 @@ Single node only — exactly the scope of a mixed NVIDIA+AMD box.
 import ctypes
 import ctypes.util
 import logging
-import time
 from multiprocessing import shared_memory
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+from sglang.srt.distributed.device_communicators import htccl_liveness
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,13 @@ class HTCCLShmTransport:
         self.slot_bytes = slot_bytes
         total = _HEADER_BYTES + self.world_size * slot_bytes
 
+        # Peer identities first, BEFORE the rendezvous: the exchange is
+        # itself a collective, so a rank that never shows up is caught by
+        # the exchange's own deadline rather than by the unbounded
+        # broadcast below. From here on every wait in this transport can
+        # name the process that went away.
+        self._peer_table = htccl_liveness.install(cpu_group)
+
         # Rendezvous: rank 0 creates the segment, broadcasts its name
         # over the (vendor-neutral) gloo cpu_group.
         if self.rank == 0:
@@ -102,6 +110,12 @@ class HTCCLShmTransport:
             name = [self._shm.name]
         else:
             name = [None]
+        # The object collectives run inline in torch and cannot be polled;
+        # refusing to enter one whose peer is already gone is the bound.
+        htccl_liveness.check_peers(
+            "htccl shm rendezvous (broadcast_object_list)",
+            table=self._peer_table,
+        )
         dist.broadcast_object_list(name, src=dist.get_global_rank(cpu_group, 0),
                                    group=cpu_group)
         if self.rank != 0:
@@ -129,7 +143,11 @@ class HTCCLShmTransport:
         self._slot_tensors = [torch.from_numpy(s) for s in self._slots]
 
         # Everyone attached & counters zeroed before first use.
-        dist.barrier(group=cpu_group)
+        htccl_liveness.bounded_barrier(
+            cpu_group,
+            "htccl shm bring-up barrier",
+            table=self._peer_table,
+        )
         _info_once(
             "HTCCL shm transport up: %d ranks x %d MiB slots, pinned=%s",
             self.world_size, slot_bytes // 2**20, self._pinned,
@@ -141,18 +159,35 @@ class HTCCLShmTransport:
         self._counters[self.rank, phase] = self._seq
 
     def _wait_all(self, phase: int, seq: int | None = None) -> None:
+        """Spin until every rank has published ``target`` for ``phase``.
+
+        The deadline used to be a hardcoded 120 s that no peer-liveness
+        information could shorten: a SIGKILLed rank was indistinguishable
+        from a slow one for two minutes, and inside the JIT cold-build
+        window 120 s is too SHORT for a healthy group. Both are now the
+        shared module policy (``SGLANG_HTCCL_PEER_TIMEOUT_S``, scaled while
+        the cold-build window is open), with the escape that a provably
+        dead peer ends the wait immediately instead of at the deadline.
+        """
         target = self._seq if seq is None else seq
-        deadline = time.monotonic() + 120.0
-        while True:
-            counters = self._counters[:, phase]
-            if bool((counters >= target).all()):
-                return
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"HTCCL shm barrier timeout (target={target}, "
-                    f"phase={phase}, counters={counters.tolist()})"
-                )
-            time.sleep(0)
+        counters = self._counters[:, phase]
+
+        def _ready() -> bool:
+            return bool((counters >= target).all())
+
+        try:
+            htccl_liveness.bounded_poll(
+                _ready,
+                "htccl shm barrier",
+                table=self._peer_table,
+            )
+        except htccl_liveness.PeerLivenessError as e:
+            # Same diagnostic the hardcoded deadline used to print, now on
+            # top of the reason the wait ended.
+            raise type(e)(
+                f"{e} HTCCL shm barrier state: target={target}, "
+                f"phase={phase}, counters={counters.tolist()}."
+            ) from None
 
     # -- pluggable-transport interface (see htccl.py "transport seam") --
     #

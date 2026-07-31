@@ -81,7 +81,14 @@ class TestCalibrationPayloadDtype(unittest.TestCase):
             mock.patch.object(
                 module.torch.cuda, "synchronize", lambda device=None: None
             ),
-            mock.patch.object(dist, "barrier", lambda group=None: None),
+            # `async_op` is part of the real signature, and the sweep's
+            # barriers are bounded (task #312) so they pass it. A stub
+            # narrower than the API it stands in for fails on the call
+            # rather than on the behaviour under test. Returning None is
+            # what a completed collective looks like to `bounded_barrier`.
+            mock.patch.object(
+                dist, "barrier", lambda group=None, async_op=False: None
+            ),
             mock.patch.object(
                 dist,
                 "all_gather_object",

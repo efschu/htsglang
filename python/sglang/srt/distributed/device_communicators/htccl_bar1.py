@@ -165,6 +165,13 @@ from typing import Optional
 
 from sglang.srt.distributed.device_communicators import (
     htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+    htccl_liveness,
+)
+from sglang.srt.distributed.device_communicators.htccl_liveness import (
+    PeerLivenessError,
+    bounded_barrier,
+    bounded_device_sync,
+    check_peers,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,6 +183,16 @@ class Bar1Unavailable(RuntimeError):
     Raised during setup and translated by the caller into
     ``handles() == False``. ALWAYS carries the reason, because in this
     project "doesn't work" is worthless without evidence.
+    """
+
+
+class Bar1KernelAborted(PeerLivenessError):
+    """A spin kernel took its abort path, and somebody finally asked.
+
+    Derived from ``PeerLivenessError`` because it is the device-side half of
+    the same fact the bounded host waits report: the collective did not
+    complete. The distinction matters to a caller that wants to treat "this
+    group is finished" uniformly, whichever side noticed first.
     """
 
 
@@ -1171,6 +1188,10 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
     traeger = [None]
     if rank == 0:
         traeger = [tempfile.mkdtemp(prefix="htccl-bar1-")]
+    # torch runs the object collectives inline and ignores async_op, so there
+    # is no Work to bound. A one-shot check before the call names a peer that
+    # is already gone instead of entering the 7200 s gloo wait for it.
+    check_peers("bar1 fd exchange: broadcast of the socket directory")
     dist.broadcast_object_list(
         traeger, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
     )
@@ -1186,7 +1207,7 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
             os.unlink(pfad)
         horcher.bind(pfad)
         horcher.listen(welt)
-        dist.barrier(group=cpu_group)
+        bounded_barrier(cpu_group, "bar1 fd exchange: sockets bound")
 
         for besitzer in range(welt):
             if besitzer == rank:
@@ -1207,6 +1228,10 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
                         letzter = e
                         time.sleep(0.01)
                 if letzter is not None:
+                    # The 2 s cap above already bounds this loop. What it
+                    # cannot do is say WHY: a peer that died before binding
+                    # its socket looks exactly like one that is merely slow.
+                    check_peers(f"bar1 fd exchange: connect to rank {besitzer}")
                     raise Bar1Unavailable(
                         f"fd exchange: {ziel} unreachable ({letzter})"
                     )
@@ -1220,7 +1245,9 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
                         f"fds instead of {anzahl}"
                     )
                 fds[besitzer] = list(empfangen)
-            dist.barrier(group=cpu_group)
+            bounded_barrier(
+                cpu_group, f"bar1 fd exchange: round {besitzer} complete"
+            )
     finally:
         horcher.close()
         try:
@@ -1370,6 +1397,11 @@ class HTCCLBar1Transport:
         self._belege_stehen = False
         self._runde_dev = None
         self._ctl_dev = None
+        # Peer liveness. Both stay None when SGLANG_HTCCL_PEER_LIVENESS=0 or
+        # when the identity exchange fails; every use site then falls back to
+        # the behaviour this transport had before task #312.
+        self._peer_table = None
+        self._abort_window = None
 
         if aktiviert is None:
             aktiviert = os.environ.get("SGLANG_HTCCL_MATRIX_DIRECT", "1") not in (
@@ -1781,6 +1813,14 @@ class HTCCLBar1Transport:
         if self.welt < 2:
             raise Bar1Unavailable("fewer than two ranks -- nothing to do")
 
+        # Peer liveness, before the first collective of the bring-up. From
+        # here on every host wait in this transport can decide whether a peer
+        # that has not arrived still exists, and the spin kernels get a host
+        # word they can be told to abort through. Returns None when the
+        # feature is off; every use site is guarded on that.
+        self._peer_table = htccl_liveness.install(self.cpu_group)
+        self._install_abort_window()
+
         t0 = time.perf_counter()
         self._cuda = _Cuda()
         self._halter = Holder()
@@ -1794,6 +1834,10 @@ class HTCCLBar1Transport:
         # per rank -- not an error, but writes landing at the wrong place.
         # Hence: a group-wide MINIMUM, and that decides.
         gesammelt: list[object] = [None] * self.welt
+        # torch runs the object collectives inline, so there is no Work to
+        # bound; the one-shot check names a peer that is already gone instead
+        # of letting gloo wait 7200 s for it.
+        check_peers("bar1 bring-up: BDF and window exchange", self._peer_table)
         dist.all_gather_object(
             gesammelt, (eigener_bdf, int(self.fenster_bytes)),
             group=self.cpu_group,
@@ -1990,6 +2034,7 @@ class HTCCLBar1Transport:
         lokal_min = min(z.nutz.length for z in self._peers.values())
         lokal_flag_min = min(z.flag.length for z in self._peers.values())
         traeger: list[object] = [None] * self.welt
+        check_peers("bar1 bring-up: window minimum exchange", self._peer_table)
         dist.all_gather_object(
             traeger, (lokal_min, lokal_flag_min), group=self.cpu_group
         )
@@ -2030,7 +2075,11 @@ class HTCCLBar1Transport:
         self._erg_gen_dev = torch.zeros(1, dtype=torch.int64,
                                         device=self.device)
 
-        dist.barrier(group=self.cpu_group)
+        bounded_barrier(
+            self.cpu_group,
+            "bar1 bring-up: peer targets bound",
+            table=self._peer_table,
+        )
         self._auf = True
         # Into the ledger. Only NOW, because only now is it established that
         # the aperture actually gave up the space -- booking before the
@@ -2312,20 +2361,37 @@ class HTCCLBar1Transport:
                 if source == ziel:
                     continue
                 marke = (source * 251 + ziel * 37 + 1) & 0xFF
-                dist.barrier(group=self.cpu_group)
+                paar = f"{source}->{ziel}"
+                bounded_barrier(
+                    self.cpu_group,
+                    f"bar1 byte proof {paar}: before clearing",
+                    table=self._peer_table,
+                )
                 if self.rank == ziel:
                     # Clear the destination first, so a buffer that was NOT
                     # written does not accidentally look like a hit.
                     leer = torch.full((n,), (marke ^ 0xFF) & 0xFF,
                                       dtype=torch.uint8, pin_memory=True)
                     self._cuda.memcpy(self._eigen[0], leer.data_ptr(), n)
-                dist.barrier(group=self.cpu_group)
+                bounded_barrier(
+                    self.cpu_group,
+                    f"bar1 byte proof {paar}: destination cleared",
+                    table=self._peer_table,
+                )
                 if self.rank == source:
                     muster = torch.full((n,), marke, dtype=torch.uint8,
                                         device=self.device)
                     self.put(ziel, muster.data_ptr(), n, 0)
-                    torch.cuda.synchronize(self.device)
-                dist.barrier(group=self.cpu_group)
+                    bounded_device_sync(
+                        f"bar1 byte proof {paar}: pattern written",
+                        device=self.device,
+                        table=self._peer_table,
+                    )
+                bounded_barrier(
+                    self.cpu_group,
+                    f"bar1 byte proof {paar}: pattern in place",
+                    table=self._peer_table,
+                )
                 ok = True
                 if self.rank == ziel:
                     self._cuda.memcpy(rueck.data_ptr(), self._eigen[0], n)
@@ -2347,6 +2413,10 @@ class HTCCLBar1Transport:
                             source, ziel, schlecht, n,
                         )
                 traeger: list[object] = [ok if self.rank == ziel else None]
+                check_peers(
+                    f"bar1 byte proof {paar}: verdict broadcast",
+                    self._peer_table,
+                )
                 dist.broadcast_object_list(
                     traeger, src=dist.get_global_rank(self.cpu_group, ziel),
                     group=self.cpu_group,
@@ -2439,11 +2509,31 @@ class HTCCLBar1Transport:
         source = torch.empty(n, dtype=torch.uint8, device=self.device)
         for _ in range(8):
             self.put(ziel, source.data_ptr(), n, 0)
-        torch.cuda.synchronize(self.device)
+        bounded_device_sync(
+            f"bar1 pair probe {self.rank}->{ziel}: warm-up",
+            device=self.device,
+            table=self._peer_table,
+        )
         runden = 64 if n <= 65536 else 16
         t0 = time.perf_counter()
         for _ in range(runden):
             self.put(ziel, source.data_ptr(), n, 0)
+        # Inside the timed section, so NOT bounded_device_sync: that one naps
+        # up to 50 ms between polls, and a 150 ms transfer would report a
+        # third less bandwidth than it delivers. Spinning on the bare event
+        # predicate keeps the number honest and still ends on a dead peer.
+        # With the feature off this is the plain synchronize it always was.
+        if htccl_liveness.liveness_enabled():
+            marke = f"bar1 pair probe {self.rank}->{ziel}: timed writes"
+            ereignis = torch.cuda.Event()
+            ereignis.record(torch.cuda.current_stream(self.device))
+            htccl_liveness.bounded_poll(
+                ereignis.query,
+                marke,
+                table=self._peer_table,
+                sleep=False,
+                on_abort=self._wait_abort(marke),
+            )
         torch.cuda.synchronize(self.device)
         dt = time.perf_counter() - t0
         return (runden * n) / dt / 1e9 if dt > 0 else 0.0
@@ -2768,6 +2858,7 @@ class HTCCLBar1Transport:
             self._runde_dev, self._ctl_dev,
             int(self.deckel_zyklen), int(self.threads), int(kern),
             int(self.ladeform), int(self.fluss),
+            int(self._abbruch_wirt),
         )
         return out
 
@@ -3109,6 +3200,7 @@ class HTCCLBar1Transport:
             self._ctl_dev,
             int(self.deckel_zyklen), int(self.threads), int(kern),
             int(self.ladeform),
+            int(self._abbruch_wirt),
         )
         return out
 
@@ -3516,11 +3608,23 @@ class HTCCLBar1Transport:
             soll = self._a2a_marker(src, src)
             puffer = torch.full((n,), self._a2a_marker(r, r), dtype=torch.uint8,
                                 device=self.device)
-            dist.barrier(group=self.cpu_group)
+            bounded_barrier(
+                self.cpu_group,
+                f"bar1 broadcast proof src={src} n={n}: before the round",
+                table=self._peer_table,
+            )
             gelaufen = True
             try:
                 self.htccl_broadcast(None, puffer, src)
-                torch.cuda.synchronize(self.device)
+                bounded_device_sync(
+                    f"bar1 broadcast proof src={src} n={n}",
+                    device=self.device,
+                    table=self._peer_table,
+                )
+                # A tripped kernel is otherwise silent: the stream carries on
+                # over a half-written buffer, and the byte comparison below
+                # would report a data bug where the cause was an abort.
+                self.raise_if_aborted(f"broadcast proof src={src} n={n}")
             except Exception as ex:            # noqa: BLE001 -- reason goes into the log
                 logger.warning(
                     "HTCCL-BAR1: broadcast byte-level proof (src=%d, %d "
@@ -3547,6 +3651,7 @@ class HTCCLBar1Transport:
                 )
 
         traeger: list[object] = [None] * R
+        check_peers("bar1 broadcast proof: verdict exchange", self._peer_table)
         dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
         self._bc_beleg = all(bool(x) for x in traeger)
         if not self._bc_beleg:
@@ -3805,6 +3910,7 @@ class HTCCLBar1Transport:
             self._runde_dev, self._ctl_dev,
             int(self.deckel_zyklen), int(self.threads), int(kern),
             int(self.ladeform),
+            int(self._abbruch_wirt),
         )
         return output
 
@@ -3884,6 +3990,7 @@ class HTCCLBar1Transport:
             logger.warning("HTCCL-BAR1: a2a byte-level proof aborted: %r", ex)
 
         traeger: list[object] = [None] * R
+        check_peers("bar1 a2a proof: verdict exchange", self._peer_table)
         dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
         self._a2a_beleg = all(bool(x) for x in traeger)
         if not self._a2a_beleg:
@@ -3899,13 +4006,13 @@ class HTCCLBar1Transport:
         """The two probe passes. Purely local, without group reconciliation.
 
         **Both passes always run**, even if the first one failed. Each
-        contains a ``dist.barrier``; a rank that cuts short after a
-        failure would leave the others waiting in the next barrier. A
-        failed proof would turn into a hang -- and a hang does not say
-        what is broken.
+        contains a barrier; a rank that cuts short after a failure would
+        leave the others waiting in the next barrier. A failed proof would
+        turn into a hang -- and a hang does not say what is broken. The
+        barrier is bounded, so that hang is now decidable rather than
+        merely documented as a risk.
         """
         import torch
-        import torch.distributed as dist
 
         R, r = self.welt, self.rank
         ok_lokal = True
@@ -3925,11 +4032,23 @@ class HTCCLBar1Transport:
                 o += sende[z]
             out = torch.full((sum(empf),), 0xFF, dtype=torch.uint8,
                              device=self.device)
-            dist.barrier(group=self.cpu_group)
+            lauf = "skewed" if schief else "uniform"
+            bounded_barrier(
+                self.cpu_group,
+                f"bar1 a2a proof ({lauf}): before the round",
+                table=self._peer_table,
+            )
             gelaufen = True
             try:
                 self.htccl_all_to_all_single(None, out, inp, sende, empf)
-                torch.cuda.synchronize(self.device)
+                bounded_device_sync(
+                    f"bar1 a2a proof ({lauf})",
+                    device=self.device,
+                    table=self._peer_table,
+                )
+                # Same reason as in the broadcast proof: without this, an
+                # aborted kernel is reported as a byte mismatch.
+                self.raise_if_aborted(f"a2a proof ({lauf})")
             except Exception as ex:            # noqa: BLE001 -- reason goes into the log
                 logger.warning(
                     "HTCCL-BAR1: a2a byte-level proof (%s) could not run: %r",
@@ -3966,6 +4085,93 @@ class HTCCLBar1Transport:
                     "skewed" if schief else "uniform", sum(empf), R,
                 )
         return ok_lokal
+
+    # -- Peer liveness -------------------------------------------------------
+
+    def _install_abort_window(self) -> None:
+        """One host word the spin kernels poll, so a dead peer can end them.
+
+        Only built when the feature is on. When the runtime refuses to map
+        the word, ``AbortWindow`` degrades to ``device_ptr == 0`` on its own
+        and the kernels see ``nullptr``; nothing here has to special-case
+        that.
+        """
+        if not htccl_liveness.liveness_enabled():
+            return
+        try:
+            window = htccl_liveness.AbortWindow()
+        except Exception as e:            # pragma: no cover - degrade, do not refuse to boot
+            logger.warning("HTCCL-BAR1: no abort window (%s).", e)
+            return
+        htccl_liveness.register_abort_window(window)
+        self._abort_window = window
+
+    def _release_abort_window(self) -> None:
+        window, self._abort_window = self._abort_window, None
+        if window is None:
+            return
+        htccl_liveness.unregister_abort_window(window)
+        window.close()
+
+    def _wait_abort(self, label: str):
+        """``on_abort`` hook for the bounded waits of this transport.
+
+        It trips the abort word and nothing else. Deliberately NOT
+        ``raise_if_aborted``: that reads ``ctlStatus`` off the device, the
+        read queues behind whatever is on the stream, and on the timeout
+        branch -- where the module does not trip the windows itself -- the
+        thing on the stream is exactly the spin kernel nobody can get past.
+        The abort handler would then hang in the same way the wait it is
+        handling did. Tripping first is what makes that read finish, so the
+        ordering is: hook trips, the wait raises with the peer named, and
+        whoever catches it can ask ``raise_if_aborted`` afterwards.
+        """
+
+        def _haken() -> None:
+            window = self._abort_window
+            if window is not None:
+                window.trip(f"host wait '{label}' gave up")
+
+        return _haken
+
+    @property
+    def _abbruch_wirt(self) -> int:
+        """Device address of the abort word, ``0`` when there is none.
+
+        Every extension call passes this. ``0`` is the pre-#312 behaviour
+        exactly: the kernels keep their cycle deadline and probe nothing.
+        """
+        window = self._abort_window
+        return window.device_ptr if window is not None else 0
+
+    def raise_if_aborted(self, label: str) -> None:
+        """Raise if a spin kernel took its abort path. NOT for the hot path.
+
+        ``status()`` has always held this answer and nothing in production
+        ever asked for it, which is why a tripped kernel was silent: the
+        stream simply continued over a partially written output buffer.
+        Reading the word synchronizes -- that cost is precisely what the
+        direct path exists to avoid -- so this belongs at bring-up and on
+        wait paths that have already failed, never inside a collective.
+
+        Not gated on ``SGLANG_HTCCL_PEER_LIVENESS``. The kill switch restores
+        the previous behaviour of the liveness machinery; it is not a request
+        to go back to accepting a half-written buffer as a result. The only
+        way to reach this raise is a run that was already broken.
+        """
+        if self.status() != 1:
+            return
+        window = self._abort_window
+        grund = window.reason if window is not None and window.tripped else None
+        raise Bar1KernelAborted(
+            f"HTCCL-BAR1 {label}: a spin kernel took its abort path. Either "
+            f"it exceeded SGLANG_HTCCL_BAR1_CAP_CYCLES "
+            f"({self.deckel_zyklen} cycles) waiting for a peer's flag, or "
+            f"the host abort word was set"
+            + (f" -- {grund}" if grund else "")
+            + ". The output buffer of that call is partially written and "
+            "must not be used."
+        )
 
     def status(self) -> int:
         """``1`` if a kernel ever hit the time limit.
@@ -4019,6 +4225,11 @@ class HTCCLBar1Transport:
         driver while a mapping is still live.
         """
         self._auf = False
+        # Before anything else: no kernel of this transport will run again,
+        # so the abort word has nobody left to talk to. Unregistering it here
+        # keeps the watchdog from holding a reference to a closed window.
+        self._release_abort_window()
+        self._peer_table = None
         # Deregister first: the space is on its way back from here on, and
         # a ledger that still reports it occupied after a `close` would
         # groundlessly shortchange a group built later.

@@ -40,6 +40,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed.device_communicators import (
     htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
+    htccl_liveness,
 )
 
 logger = logging.getLogger(__name__)
@@ -472,7 +473,7 @@ def _row_bytes(t: torch.Tensor) -> int:
     return n * t.element_size()
 
 
-def _group_max(wert: int, cpu_group) -> int:
+def _group_max(wert: int, cpu_group, table=None) -> int:
     """Maximum across the group, on the CPU.
 
     Only meant for the case where the caller brings BOTH split-size lists
@@ -482,7 +483,13 @@ def _group_max(wert: int, cpu_group) -> int:
     hang, and the evenly-split case doesn't need it at all.
     """
     t = torch.tensor([int(wert)], dtype=torch.int64)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=cpu_group)
+    htccl_liveness.bounded_collective(
+        lambda: dist.all_reduce(
+            t, op=dist.ReduceOp.MAX, group=cpu_group, async_op=True
+        ),
+        "htccl gloo group_max (all_reduce MAX)",
+        table=table,
+    )
     return int(t.item())
 
 
@@ -501,6 +508,13 @@ class HTCCLCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
+        #: Who the peer PROCESSES of this group are. Published once, here,
+        #: before any transport exists -- every gloo call below is bounded
+        #: against it, so a SIGKILLed rank ends the wait with a named error
+        #: instead of the 7200 s gloo process-group timeout. ``None`` when
+        #: the feature is switched off; the helpers then degrade to the
+        #: exact blocking calls they replaced.
+        self._peer_table = htccl_liveness.install(cpu_group)
         #: (Operation, size class) pairs for which the loud fallback
         #: notice has already gone out. Kept per group, because coverage
         #: can differ per group: tp and dcp get differently sized windows,
@@ -797,7 +811,13 @@ class HTCCLCommunicator:
                 _stage(ci + 1)  # D2H of next chunk overlaps gloo below
             start, end, host, ev = staged[ci]
             ev.synchronize()
-            dist.all_reduce(host, group=self.cpu_group)
+            htccl_liveness.bounded_collective(
+                lambda: dist.all_reduce(
+                    host, group=self.cpu_group, async_op=True
+                ),
+                f"htccl gloo all_reduce chunk {ci}/{n_chunks}",
+                table=self._peer_table,
+            )
             with torch.cuda.stream(self._stream):
                 dst = flat_out[start:end]
                 if host.dtype != dst.dtype:
@@ -830,7 +850,13 @@ class HTCCLCommunicator:
         )
         host_in.copy_(inp, non_blocking=False)
         host_out = [torch.empty_like(host_in) for _ in range(self.world_size)]
-        dist.all_gather(host_out, host_in, group=self.cpu_group)
+        htccl_liveness.bounded_collective(
+            lambda: dist.all_gather(
+                host_out, host_in, group=self.cpu_group, async_op=True
+            ),
+            "htccl gloo all_gather",
+            table=self._peer_table,
+        )
 
         output = torch.empty(
             (self.world_size,) + tuple(input_size),
@@ -918,6 +944,14 @@ class HTCCLCommunicator:
         capturable precisely because of that.
         """
         matrix: list = [None] * self.world_size
+        # ``all_gather_object`` has no ``async_op`` form -- torch runs it
+        # inline -- so it cannot be polled. The next best bound is to refuse
+        # to enter it when a peer is already provably gone; this sits on the
+        # MoE dispatch path, where entering it blind costs 7200 s.
+        htccl_liveness.check_peers(
+            "htccl gloo all_to_all counts (all_gather_object)",
+            table=self._peer_table,
+        )
         dist.all_gather_object(
             matrix, [int(x) for x in input_split_sizes], group=self.cpu_group
         )
@@ -1035,7 +1069,7 @@ class HTCCLCommunicator:
                 groesster = max(max(z) for z in matrix) * zeile_bytes
             else:
                 groesster = _group_max(
-                    max(sende + empf), self.cpu_group
+                    max(sende + empf), self.cpu_group, table=self._peer_table
                 )
             if t.supports_a2a(groesster):
                 # The round count follows from the GROUP-WIDE largest
@@ -1057,11 +1091,20 @@ class HTCCLCommunicator:
             dtype=output.dtype, pin_memory=True,
         )
         try:
-            dist.all_to_all_single(
-                host_out, host_in,
-                output_split_sizes=aus, input_split_sizes=ein,
-                group=self.cpu_group,
+            htccl_liveness.bounded_collective(
+                lambda: dist.all_to_all_single(
+                    host_out, host_in,
+                    output_split_sizes=aus, input_split_sizes=ein,
+                    group=self.cpu_group, async_op=True,
+                ),
+                "htccl gloo all_to_all_single",
+                table=self._peer_table,
             )
+        except htccl_liveness.PeerLivenessError:
+            # A dead peer or an expired deadline is not "this layer cannot
+            # run the call" -- it already names the cause. Rewrapping it as
+            # NotImplementedError below would bury that.
+            raise
         except (RuntimeError, NotImplementedError) as e:
             raise NotImplementedError(
                 f"all_to_all_single: neither the BAR1 direct path nor the "
@@ -1120,8 +1163,14 @@ class HTCCLCommunicator:
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         if self.rank == src:
             host.copy_(tensor, non_blocking=False)
-        dist.broadcast(host, src=dist.get_global_rank(self.cpu_group, src),
-                       group=self.cpu_group)
+        htccl_liveness.bounded_collective(
+            lambda: dist.broadcast(
+                host, src=dist.get_global_rank(self.cpu_group, src),
+                group=self.cpu_group, async_op=True,
+            ),
+            f"htccl gloo broadcast (src rank {src})",
+            table=self._peer_table,
+        )
         if self.rank != src:
             tensor.copy_(host, non_blocking=False)
         return tensor
