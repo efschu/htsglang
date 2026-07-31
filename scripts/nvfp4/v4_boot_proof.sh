@@ -174,6 +174,18 @@ RUN_SECONDS="${RUN_SECONDS:-20}"
 SOLO_RESERVE_MIB="${SOLO_RESERVE_MIB:-2048}"
 # #332 posten 2: ARM 1 with speculation, which the ignore-match fix unblocks.
 NEXTN="${NEXTN:-1}"
+# MEASURED 2026-07-31 (#336 card window, ARM A attempt 1): this used to be a
+# literal `--context-length -1` and NEITHER arm could boot with it. `-1` is the
+# vLLM idiom for "the model's own maximum"; sglang has no such sentinel.
+# ModelConfig._derive_context_length assigns the value verbatim whenever it is
+# not greater than the derived length, so context_len became -1 and tp_worker's
+#     max_req_len = min(context_len - 1, max_token_pool_size - 1)
+# was -2 -- "AssertionError: Memory pool size is too small", raised after a
+# fully successful load with 386,880 KV tokens sized and waiting. A sizing
+# message for a value that has nothing to do with sizing. 32768 is the
+# 332-family beleg's anchor context, which keeps this script's arms comparable
+# with that window; override for a different point.
+CONTEXT_LEN="${CONTEXT_LEN:-32768}"
 
 mkdir -p "$OUT"
 
@@ -219,7 +231,7 @@ COMMON=(
   --served-model-name Qwen3.6-27B-NVFP4
   --trust-remote-code
   --port "$PORT"
-  --context-length -1
+  --context-length "$CONTEXT_LEN"
   # Mandatory on every launch_server call on this rig (rig-runbook.md 3).
   --enable-metrics
 )
