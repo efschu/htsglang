@@ -257,3 +257,33 @@ Stated honestly, extending the design's own list:
 5. VapourSynth shim and CLI over the same executor.
 6. Audio-enhance stage (Demucs class) on the passthrough track inventory.
 7. Registry integration (M1): replace the static budget with a ledger slot.
+
+---
+
+## 8. Live watch + client liveness (user directive 2026-07-31)
+
+Two additions to the M2/#339 scope, recorded here as the persistent decision
+(tracked as task #344):
+
+1. **Live watch of running jobs.** While a video is being processed, the web
+   frontend must be able to watch BOTH the incoming stream and the outgoing
+   (enhanced) stream live. Implementation direction: low-bitrate preview taps
+   off the pipeline (NVENC side-encodes at preview resolution), served as
+   separate streams; the taps must never stall the main chain (drop-frame
+   preview, bounded queues — a slow preview viewer costs preview frames, not
+   pipeline throughput).
+
+2. **Universal client liveness with configurable timeouts.** For every kind
+   of session — LLM streams, video streams, training jobs, registry leases —
+   the server must detect that the other side is gone (bandwidth collapse,
+   network loss, silent client death) and clean up QUICKLY: KV, VRAM leases,
+   job slots, decoder/encoder pipelines. Reuse the mechanisms the APIs
+   already have (TCP/SSE disconnect, heartbeats, ledger lease TTL) rather
+   than inventing new ones, but make them interoperate; cleanup never runs
+   in the serving hot path and nothing blocks anything else unnecessarily.
+   The wait-until-declared-dead duration is user-configurable per endpoint
+   class. During a grace window the bound resources are NOT idly pinned:
+   they belong to the normal reclamation ladder (idle tenant #341, pressure
+   staircase #287, spill/offload) until the client either returns or is
+   declared dead. Related prior art in-tree: #312 bounded peer liveness in
+   collectives, #305-M1 ledger lease+heartbeat, M2 abort semantics (#338).
