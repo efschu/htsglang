@@ -4029,6 +4029,24 @@ class ServerArgs:
             "of them.",
         ),
     ] = 100.0
+    dual_group_lane_pairing_prefill_ms_per_row: A[
+        float,
+        Arg(
+            help="Duration estimate for a saturating serving PREFILL grain "
+            "in --dual-group-lane-pairing, in ms per GEMM row: the grain "
+            "stays current for rows * this value, because the signal is "
+            "published at batch LAUNCH and a big prefill forward then runs "
+            "for around a second -- a flat staleness that still detects "
+            "idleness for 17-35 ms decode iterations would age the signal "
+            "out during exactly the grains the policy exists to flag "
+            "(card-found in slice D boot 1: 1 of 11 picks saw the "
+            "saturating grain). Every later publish replaces the label "
+            "outright, so overshoot only matters when the serving group "
+            "drains right after a prefill. Default 1.0 is conservative "
+            "against the measured ~0.7 ms/row serving prefill on the C3 "
+            "vehicle.",
+        ),
+    ] = 1.0
     dual_group_lane_pairing_max_defer_ms: A[
         float,
         Arg(

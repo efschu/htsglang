@@ -115,15 +115,44 @@ class TestClassification(unittest.TestCase):
 class TestServingGrainSignal(unittest.TestCase):
     def test_fresh_read_and_staleness(self):
         sig = ServingGrainSignal(stale_ms=100.0)
-        label = classify_rows(PHASE_PREFILL, 2048)
+        label = classify_rows(PHASE_DECODE, 16)
         sig.publish(label, now=10.0)
         self.assertEqual(sig.read(now=10.05), label)
         # Aging out IS the idle signal: run_batch stops being called when
-        # the serving group drains, no idle hook needed.
+        # the serving group drains, no idle hook needed. (A saturating
+        # prefill grain ages by its own duration instead -- see below.)
         self.assertEqual(sig.read(now=10.2), IDLE_LABEL)
 
     def test_unpublished_reads_idle(self):
         self.assertEqual(ServingGrainSignal().read(now=1.0), IDLE_LABEL)
+
+    def test_saturating_prefill_stays_current_for_its_duration(self):
+        # Card-found (slice D boot 1): the label is published at batch
+        # LAUNCH, and a 1600-row prefill forward runs ~1.1 s -- a flat
+        # 100 ms staleness read IDLE during exactly the grains the policy
+        # exists to flag. A saturating prefill grain stays current for
+        # rows * ms_per_row.
+        sig = ServingGrainSignal(stale_ms=100.0, ms_per_row=1.0)
+        sat = classify_rows(PHASE_PREFILL, 1600)
+        sig.publish(sat, now=10.0)
+        self.assertEqual(sig.read(now=10.5), sat)  # mid-forward
+        self.assertEqual(sig.read(now=11.5), sat)  # still inside 1.6 s
+        self.assertEqual(sig.read(now=11.7), IDLE_LABEL)  # past it
+        # A later publish replaces the label outright: the estimate only
+        # governs the gap where nothing is published at all.
+        dec = classify_rows(PHASE_DECODE, 16)
+        sig.publish(dec, now=10.4)
+        self.assertEqual(sig.read(now=10.45), dec)
+
+    def test_non_saturating_grains_keep_flat_staleness(self):
+        sig = ServingGrainSignal(stale_ms=100.0, ms_per_row=1.0)
+        # A NON-saturating prefill (short prompt) must not inherit the
+        # duration extension: 40 rows * 1 ms is under the flat staleness
+        # anyway, and a 16-row decode ages out at 100 ms exactly as before.
+        dec = classify_rows(PHASE_DECODE, 16)
+        sig.publish(dec, now=10.0)
+        self.assertEqual(sig.read(now=10.05), dec)
+        self.assertEqual(sig.read(now=10.2), IDLE_LABEL)
 
 
 def _policy(**kw):

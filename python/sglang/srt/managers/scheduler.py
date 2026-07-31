@@ -671,7 +671,14 @@ class Scheduler(
                 self.lane_pairing_signal = ServingGrainSignal(
                     stale_ms=float(
                         getattr(sa, "dual_group_lane_pairing_stale_ms", 100.0)
-                    )
+                    ),
+                    ms_per_row=float(
+                        getattr(
+                            sa,
+                            "dual_group_lane_pairing_prefill_ms_per_row",
+                            1.0,
+                        )
+                    ),
                 )
                 # Rows per sequence of a non-extend serving forward: a
                 # target-verify runs num_draft_tokens rows per sequence, a

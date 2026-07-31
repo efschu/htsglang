@@ -88,6 +88,20 @@ DEFAULT_SAT_ROWS = 64
 # saturates nothing.
 DEFAULT_STALE_MS = 100.0
 
+# How long one GEMM row of a saturating prefill grain keeps that grain
+# current, in ms. CARD-FOUND (slice D boot 1): the signal is published when
+# the batch LAUNCHES, and a 1600-row prefill forward then runs for ~1.1 s --
+# under a flat 100 ms staleness the policy read IDLE during exactly the
+# grains it exists to flag (1 of 11 picks saw a saturating serving grain on
+# a serving load that was in prefill most of the wall clock). A saturating
+# prefill grain therefore stays current for rows * ms_per_row, a duration
+# estimate from its own size; the next publish replaces it anyway, so the
+# overshoot only exists when the serving group drains right after a prefill.
+# 1.0 ms/row is conservative against the measured ~0.7 ms/row (1400 tok/s
+# serving prefill on the C3 vehicle); calibratable via
+# --dual-group-lane-pairing-prefill-ms-per-row.
+DEFAULT_PREFILL_MS_PER_ROW = 1.0
+
 # Default starvation cap: a queue head skipped in favour of better-pairing
 # jobs for longer than this runs regardless of the pairing. The value bounds
 # added head latency at a handful of lane jobs, far below any lane job's own
@@ -161,20 +175,39 @@ class ServingGrainSignal:
     the idle signal: run_batch simply stops being called when the serving
     group drains, so a fresh "idle" publish would need a hook on the idle
     path -- aging out needs none.
+
+    EXCEPT for the grains the policy exists to flag (card-found, slice D
+    boot 1): the label is published when the batch LAUNCHES, and a big
+    prefill forward then runs for around a second -- far past any staleness
+    that still detects idleness for 17-35 ms decode iterations.  A
+    saturating prefill grain therefore stays current for its own estimated
+    duration, rows * ms_per_row; every later publish replaces it outright,
+    so the estimate only governs the gap where nothing is published at all.
     """
 
-    __slots__ = ("_current", "stale_s")
+    __slots__ = ("_current", "stale_s", "ms_per_row")
 
-    def __init__(self, stale_ms: float = DEFAULT_STALE_MS):
+    def __init__(
+        self,
+        stale_ms: float = DEFAULT_STALE_MS,
+        ms_per_row: float = DEFAULT_PREFILL_MS_PER_ROW,
+    ):
         self.stale_s = max(0.001, float(stale_ms) / 1000.0)
+        self.ms_per_row = max(0.0, float(ms_per_row))
         self._current: Tuple[float, GrainLabel] = (0.0, IDLE_LABEL)
 
     def publish(self, label: GrainLabel, now: Optional[float] = None) -> None:
         self._current = (time.monotonic() if now is None else now, label)
 
+    def _current_for_s(self, label: GrainLabel) -> float:
+        if label.saturating and label.phase == PHASE_PREFILL:
+            return max(self.stale_s, label.rows * self.ms_per_row / 1000.0)
+        return self.stale_s
+
     def read(self, now: Optional[float] = None) -> GrainLabel:
         t, label = self._current
-        if (time.monotonic() if now is None else now) - t > self.stale_s:
+        age = (time.monotonic() if now is None else now) - t
+        if age > self._current_for_s(label):
             return IDLE_LABEL
         return label
 
