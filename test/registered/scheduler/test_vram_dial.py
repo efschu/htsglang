@@ -613,6 +613,29 @@ class TestAllocatorGrow(CustomTestCase):
         with self.assertRaises(ValueError):
             alloc.grow_size(65)  # not page-aligned
 
+    def test_paged_allocator_natural_page_resize_updates_num_pages(self):
+        # The uneven-DCP lane runs the paged allocator at page_size=1; the
+        # old base.resize left num_pages stale there, so clear() rebuilt the
+        # free list at the OLD size (#330 finding).
+        alloc = PagedTokenToKVPoolAllocator(
+            32,
+            page_size=1,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+
+        class _Cfg:
+            max_total_num_tokens = 16
+
+        alloc.resize(_Cfg)
+        self.assertEqual(alloc.num_pages, 16)
+        self.assertEqual(alloc.available_size(), 16)
+        alloc.grow_size(48)
+        self.assertEqual(alloc.num_pages, 48)
+        self.assertEqual(alloc.available_size(), 48)
+
 
 if __name__ == "__main__":
     unittest.main()

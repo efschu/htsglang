@@ -222,6 +222,7 @@ class KvCapacityRuntime:
         page_size: int,
         current_c: int,
         user_cap: Optional[int] = None,
+        vector_caps: Optional[Dict[Tuple[int, ...], int]] = None,
         consensus_interval: int = 8,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         ready_fn: Callable[[], bool] = lambda: True,
@@ -253,6 +254,15 @@ class KvCapacityRuntime:
         self._page = int(page_size)
         self._c_cur = int(current_c)
         self._user_cap = None if user_cap is None else int(user_cap)
+        # Boot per-vector achievable ceilings (the #297 min-reduce, clamped
+        # by the user cap AND the hybrid mamba physical ceiling). Growth must
+        # never exceed the current vector's boot prognosis: the runtime's
+        # byte math knows budgets and VA, but only the boot sizing knows the
+        # mamba ceiling and the profiled physical capacity.
+        self._vector_caps = {
+            tuple(int(x) for x in k): int(v)
+            for k, v in (vector_caps or {}).items()
+        }
         self._interval = int(consensus_interval)
         self._collective_min = collective_min
         self._ready_fn = ready_fn
@@ -317,6 +327,13 @@ class KvCapacityRuntime:
         unit = min(self._unit_cap_for_rank(r, vec) for r in range(self._n))
         if self._user_cap is not None:
             unit = min(unit, self._user_cap // s)
+        cap = self._vector_caps.get(vec)
+        if cap is None and self._vector_caps:
+            # A vector outside the declared plan (should not happen: reshard
+            # only accepts declared vectors) is bounded by the plan maximum.
+            cap = max(self._vector_caps.values())
+        if cap is not None:
+            unit = min(unit, cap // s)
         # Keep C a multiple of page_size (unit granularity: page / gcd).
         step = self._page // math.gcd(s, self._page)
         unit = (unit // step) * step
@@ -825,11 +842,26 @@ def _measure_local_floor_bytes(participants: List[DialParticipant]) -> tuple:
     uuid = nvml.current_device_uuid()
     procs = nvml.process_bytes_on_uuid(uuid)
     used = procs.get(os.getpid())
+    if used is None and len(procs) == 1:
+        # LXC containers report HOST pids through NVML while os.getpid() is
+        # the container pid. On the one-rank-per-card lane a single compute
+        # process on the card is unambiguous -- adopt it, loudly.
+        (host_pid, used), = procs.items()
+        logger.warning(
+            "%s NVML pid namespace mismatch (container pid %d not in %s); "
+            "adopting the single compute process (host pid %d, %d MiB) as "
+            "this rank's usage.",
+            LOG_PREFIX,
+            os.getpid(),
+            sorted(procs),
+            host_pid,
+            used // MIB,
+        )
     if used is None:
         raise KvCapacityError(
             f"NVML reports no memory for pid {os.getpid()} on card {uuid} "
             f"(processes: {sorted(procs)}); cannot establish the pinned "
-            f"floor for --enable-vram-dial."
+            f"floor for --enable-vram-dial unambiguously."
         )
     backed = sum(int(p.pool.vmm_backed_bytes) for p in participants)
     floor = int(used) - backed
@@ -1063,6 +1095,7 @@ def build_kv_capacity_runtime(scheduler) -> KvCapacityRuntime:
         for g in gathered
     ]
 
+    plan = get_boot_capacity_plan()
     rt = KvCapacityRuntime(
         n_ranks=tp_size,
         my_rank=my_rank,
@@ -1070,6 +1103,7 @@ def build_kv_capacity_runtime(scheduler) -> KvCapacityRuntime:
         page_size=int(server_args.page_size or 1),
         current_c=int(scheduler.max_total_num_tokens),
         user_cap=getattr(server_args, "max_total_tokens", None),
+        vector_caps=plan.caps if plan is not None else None,
         consensus_interval=int(
             getattr(server_args, "vram_dial_consensus_interval", 8)
         ),

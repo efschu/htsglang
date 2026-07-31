@@ -262,11 +262,14 @@ curl -s -X POST http://127.0.0.1:<port>/vram_budget \
 - Dial-DOWN flushes the radix cache when the token ceiling must contract
   (slot ids above the new ceiling cannot be relocated in Stage 1); growth
   and re-raise keep the cache.
-- C re-raise: after `POST /kv_reshard` to a better vector, growth arms
-  AUTOMATICALLY and commits at the next idle boundary — no second call.
-  Resharding to a row-heavier vector after a trim self-provisions when the
-  budgets fund it; otherwise the reshard holds with a log line naming the
-  required dial.
+- C re-raise: the boot budget defaults to the NATURAL footprint, so grant
+  headroom once (`{"device":"all","budget_mib":999999}` clamps to each
+  rank's effective ceiling) — from then on growth arms AUTOMATICALLY after
+  every `POST /kv_reshard` to a better vector and commits at the next idle
+  boundary, clamped by the boot per-vector achievable ceiling (hybrid mamba
+  cap included). Resharding to a row-heavier vector after a trim
+  self-provisions when the budgets fund it; otherwise the reshard holds
+  with a log line naming the required dial.
 - `--vram-budget-mib r0,r1,r2` (optional) sets initial per-rank budgets;
   `--vram-dial-consensus-interval` (default 8) sets the commit cadence.
 - Every rank mirrors its budget into the #305-M1 VRAM ledger

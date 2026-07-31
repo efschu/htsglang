@@ -91,10 +91,22 @@ never by local state — every rank enters ONE bounded MIN-reduction
   mismatch raises the same `KvCapacityError` on every rank.
 
 Arming:
-* GROW (C_target > C_cur) arms AUTOMATICALLY — this is the C re-raise:
-  after a #297 cutover installs a better vector, every rank's next boundary
-  computes a higher C_target from the same replicated state and the group
-  grows in lock step. No operator action needed.
+* GROW (C_target > C_cur) arms AUTOMATICALLY within the budgets — this is
+  the C re-raise: after a #297 cutover installs a better vector, every
+  rank's next boundary computes a higher C_target from the same replicated
+  state and the group grows in lock step. `C_target` is additionally
+  clamped by the CURRENT vector's boot achievable ceiling (`_caps` from the
+  #297 min-reduce, which folds in the hybrid mamba physical ceiling and the
+  profiled physical capacity) — the runtime's byte math must never outgrow
+  what the boot sizing knows to be physically addressable.
+* Budget stance: the default boot budget is the NATURAL footprint
+  (floor + backed KV), so capacity never grows beyond the boot allocation
+  without an operator action — one dial-up (`budget_mib` is clamped to the
+  effective VA ceiling) or `--vram-budget-mib` authorizes the headroom, and
+  from then on the re-raise is automatic at every reshard. This is
+  deliberate: auto-claiming all free VRAM would silently swallow the
+  operator's activation reserve (the 2700-MiB GDN-prefill-scratch lesson)
+  and would squat on co-tenant memory.
 * SHRINK (C_target < C_cur) arms only from an explicit dial RPC (it flushes
   the radix cache; the runtime never destroys cache spontaneously).
 

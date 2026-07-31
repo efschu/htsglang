@@ -123,7 +123,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens
-        if self.page_size > 1:
+        # The paged allocator keeps num_pages even at page_size == 1 (the
+        # uneven-DCP natural-page lane); the old `page_size > 1` condition
+        # left it stale there and clear() would rebuild the free list at the
+        # OLD size (#330 finding).
+        if hasattr(self, "num_pages"):
             self.num_pages = config.max_total_num_tokens // self.page_size
         self.clear()
 
@@ -153,7 +157,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         )
         self.free_pages = torch.cat((self.free_pages, fresh))
         self.size = new_size
-        if self.page_size > 1:
+        if hasattr(self, "num_pages"):
             self.num_pages = new_pages
 
     @abc.abstractmethod
