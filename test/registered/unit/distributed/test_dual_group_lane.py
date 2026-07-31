@@ -12,6 +12,7 @@ Every test runs CPU-only (CUDA_VISIBLE_DEVICES=99 in the suite).  The claims:
   ColumnParallelLinear/RowParallelLinear toy tree.
 """
 
+import contextlib
 import os
 import types
 import unittest
@@ -514,6 +515,187 @@ class TestLanePartsAcrossCards(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             LaneFusedMoEShell([_MoEPartOnDevice("cpu"), _MoEPartOnDevice("meta")])
         self.assertIn("different cards", str(ctx.exception))
+
+
+class _ContextRecorder:
+    """Stands in for the CUDA context switch on a CPU-only host.
+
+    Replaces ``dgl._active_device``. ``active`` is what
+    ``torch.cuda.current_device()`` would report at any moment, so a part's
+    quant method can assert it is being launched into its OWN context rather
+    than the lane host's.
+    """
+
+    def __init__(self, ambient=None):
+        # The AMBIENT card: what the lane worker thread pinned with
+        # torch.cuda.set_device before any shell ran.
+        self.active = ambient
+        self.ambient = ambient
+        self.entered = []
+        self._stack = []
+
+    def __call__(self, device, home=None):
+        if device is None or device == home:
+            return contextlib.nullcontext()
+        return self._Scope(self, device)
+
+    class _Scope:
+        def __init__(self, rec, device):
+            self.rec = rec
+            self.device = device
+
+        def __enter__(self):
+            self.rec._stack.append(self.rec.active)
+            self.rec.active = self.device
+            self.rec.entered.append(None if self.device is None else self.device.type)
+            return self
+
+        def __exit__(self, *exc):
+            self.rec.active = self.rec._stack.pop()
+            return False
+
+
+class _ContextSensitiveQuant:
+    """A Triton-like quant method: refuses a pointer outside the active context.
+
+    This is the whole failure mode of the un-guarded shells reproduced without
+    a second card -- Triton raises ``ValueError: Pointer argument (at 0) cannot
+    be accessed`` when the tensor's card is not the current one.
+    """
+
+    def __init__(self, rec, log):
+        self.rec = rec
+        self.log = log
+
+    def _check(self, x, tag):
+        active = self.rec.active
+        if active is None or x.device != active:
+            raise ValueError(
+                f"Pointer argument (at 0) cannot be accessed from Triton "
+                f"(part {tag} on {x.device}, active context {active})"
+            )
+        self.log.append((tag, x.device.type))
+
+    def apply(self, layer, x, bias=None):
+        self._check(x, layer.tag)
+        return torch.zeros(x.shape[0], layer.out_width, dtype=x.dtype, device=x.device)
+
+    def embedding(self, layer, x):
+        self._check(x, layer.tag)
+        return torch.zeros(
+            x.shape[0], layer.out_width, dtype=torch.float32, device=x.device
+        )
+
+
+class _StrictPart(_FakePart):
+    def __init__(self, tag, out_width, rec, log, device):
+        super().__init__(tag, out_width, log, device)
+        self.quant_method = _ContextSensitiveQuant(rec, log)
+
+
+class TestLanePartsSwitchTheCudaContext(unittest.TestCase):
+    """A part's compute runs with the PART's card as the current device.
+
+    ``_on`` moves the tensor; it does not move the context. cuBLAS carries a
+    device guard out of its operands, Triton does not -- so the un-guarded
+    shells worked for dense bf16 and died on every FP8/INT4 lane that spanned
+    two cards. Observed here without CUDA: ``_active_device`` is replaced by a
+    recorder, and the parts' quant methods reject any activation whose device
+    is not the recorded active one, the same way Triton does.
+    """
+
+    def _parts(self, rec, log, cls=None):
+        cls = cls or _StrictPart
+        # "meta" plays the foreign card: a device that is never the ambient
+        # one on a cpu test host.
+        return [
+            cls("home", 8, rec, log, "cpu"),
+            cls("foreign", 8, rec, log, "meta"),
+        ]
+
+    def _run(self, rec, fn, guarded=True):
+        # ``_on`` cannot really move a tensor to the fake foreign device with
+        # a copy, so it is spied the same way the sibling suite does -- but
+        # unlike there it returns a tensor that ACTUALLY reports the
+        # destination device, which is what the context check compares
+        # against.
+        def spy(x, device):
+            if device is not None and x.device != device:
+                return torch.zeros(x.shape, dtype=x.dtype, device=device)
+            return x
+
+        guard = rec if guarded else (lambda dev, home=None: contextlib.nullcontext())
+        with unittest.mock.patch.object(dgl, "_active_device", guard):
+            with unittest.mock.patch.object(dgl, "_on", spy):
+                return fn()
+
+    def test_column_shell_guards_every_part(self):
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        shell = LaneColumnParallelShell(self._parts(rec, log))
+        self._run(rec, lambda: shell(torch.zeros(2, H)))
+        self.assertEqual(rec.entered, ["meta"])
+        self.assertEqual(log, [("home", "cpu"), ("foreign", "meta")])
+        self.assertEqual(rec.active, rec.ambient)  # restored after the shell
+
+    def test_row_shell_guards_every_part(self):
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        shell = LaneRowParallelShell(self._parts(rec, log))
+        self._run(rec, lambda: shell(torch.zeros(2, H)))
+        self.assertEqual(rec.entered, ["meta"])
+        self.assertEqual(log, [("home", "cpu"), ("foreign", "meta")])
+        self.assertEqual(rec.active, rec.ambient)
+
+    def test_lm_head_shell_guards_every_part(self):
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        shell = dgl.LaneLmHeadShell(self._parts(rec, log))
+        self._run(rec, lambda: shell.quant_method.apply(shell, torch.zeros(2, H)))
+        self.assertEqual(rec.entered, ["meta"])
+        self.assertEqual(log, [("home", "cpu"), ("foreign", "meta")])
+        self.assertEqual(rec.active, rec.ambient)
+
+    def test_vocab_embedding_shell_guards_every_part(self):
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        parts = self._parts(rec, log)
+        for p in parts:
+            p.shard_indices = types.SimpleNamespace(
+                org_vocab_start_index=0,
+                org_vocab_end_index=8,
+                num_org_vocab_padding=0,
+                added_vocab_start_index=8,
+                added_vocab_end_index=8,
+            )
+        shell = dgl.LaneVocabEmbeddingShell(parts)
+        self._run(rec, lambda: shell(torch.zeros(2, dtype=torch.long)))
+        self.assertEqual(rec.entered, ["meta"])
+        self.assertEqual([e[0] for e in log], ["home", "foreign"])
+        self.assertEqual(rec.active, rec.ambient)
+
+    def test_unguarded_shell_would_fail_the_way_triton_does(self):
+        """The falsifier: without the guard the foreign part raises.
+
+        Without this the four guards could be deleted and the four tests above
+        would still pass on their ``_on`` spy alone.
+        """
+        rec, log = _ContextRecorder(torch.device("cpu")), []
+        shell = LaneColumnParallelShell(self._parts(rec, log))
+        with self.assertRaises(ValueError) as ctx:
+            self._run(rec, lambda: shell(torch.zeros(2, H)), guarded=False)
+        self.assertIn("cannot be accessed", str(ctx.exception))
+
+    def test_active_device_switches_only_when_the_activation_travels(self):
+        cuda1 = torch.device("cuda:1")
+        # no part device, non-cuda parts, and the one-card lane: no switch,
+        # and no allocation either -- the shared no-op instance comes back.
+        for dev, home in [
+            (None, None),
+            (torch.device("cpu"), None),
+            (torch.device("meta"), None),
+            (cuda1, cuda1),
+        ]:
+            self.assertIs(dgl._active_device(dev, home), dgl._NO_DEVICE_SWITCH)
+        guard = dgl._active_device(cuda1, torch.device("cuda:0"))
+        self.assertIsInstance(guard, torch.cuda.device)
+        self.assertEqual(guard.idx, 1)
 
 
 class TestHostAndMaterializedRanks(unittest.TestCase):

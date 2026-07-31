@@ -249,6 +249,39 @@ def _on(x: torch.Tensor, device: Optional[torch.device]) -> torch.Tensor:
     return x.to(device, non_blocking=True)
 
 
+#: Stateless and reentrant, so one shared instance serves every no-op guard
+#: below instead of allocating one per shell per forward.
+_NO_DEVICE_SWITCH = contextlib.nullcontext()
+
+
+def _active_device(device: Optional[torch.device], home: Optional[torch.device] = None):
+    """Make a part's card the CURRENT cuda device for that part's compute.
+
+    The exact companion of ``_on``: wherever the activation has to TRAVEL, the
+    context has to travel with it. Moving the tensor alone is not the same
+    thing as switching the context the kernel is launched into, and the two are
+    only interchangeable for backends that derive their own guard from the
+    tensors they are handed. cuBLAS does -- which is why the dense bf16
+    two-card lane survived without this. Triton does not: it validates every
+    pointer argument against the ACTIVE context and rejects a correctly-placed
+    activation on a card that is not the current one:
+
+        ValueError: Pointer argument (at 0) cannot be accessed from Triton
+
+    Every FP8 and INT4 quant method in this tree launches Triton, so a lane
+    whose parts span cards has to switch the context per part, not just the
+    tensors.
+
+    ``home`` is the card the shell was called on. Passing it keeps the ONE-card
+    lane -- the common case, and the one that runs under CUDA graphs -- free of
+    any ``cudaSetDevice`` at all: same condition as ``_on``'s early return, so
+    a part that needs no hop needs no guard either.
+    """
+    if device is None or device == home or device.type != "cuda":
+        return _NO_DEVICE_SWITCH
+    return torch.cuda.device(device)
+
+
 class LaneColumnParallelShell(nn.Module):
     """Full-width column-parallel forward: per-sub-output concat of N parts.
 
@@ -295,11 +328,12 @@ class LaneColumnParallelShell(nn.Module):
         home = input_.device
         outs = []
         for p, dev in zip(parts, devices):
-            out = p.quant_method.apply(
-                p,
-                _on(input_, dev),
-                None if (p.bias is None or p.skip_bias_add) else p.bias,
-            )
+            with _active_device(dev, home):
+                out = p.quant_method.apply(
+                    p,
+                    _on(input_, dev),
+                    None if (p.bias is None or p.skip_bias_add) else p.bias,
+                )
             outs.append(_on(out, home))
         return local_column_gather(outs, self._lane_sub_sizes), None
 
@@ -329,10 +363,11 @@ class LaneRowParallelShell(nn.Module):
         parts = self._lane_parts
         home = input_.device
         pieces = local_row_split(input_, self._lane_in_sizes)
-        outs = [
-            _on(p.quant_method.apply(p, _on(piece, dev), None), home)
-            for p, piece, dev in zip(parts, pieces, self._lane_part_devices)
-        ]
+        outs = []
+        for p, piece, dev in zip(parts, pieces, self._lane_part_devices):
+            with _active_device(dev, home):
+                part_out = p.quant_method.apply(p, _on(piece, dev), None)
+            outs.append(_on(part_out, home))
         out = local_row_reduce(outs)
         bias = parts[0].bias
         if bias is not None and not self.skip_bias_add:
@@ -439,16 +474,17 @@ class LaneVocabEmbeddingShell(nn.Module):
         home = input_.device
         for p, dev in zip(self._lane_parts, self._lane_part_devices):
             idx = p.shard_indices
-            masked_input, input_mask = get_masked_input_and_mask(
-                _on(input_, dev),
-                idx.org_vocab_start_index,
-                idx.org_vocab_end_index,
-                idx.num_org_vocab_padding,
-                idx.added_vocab_start_index,
-                idx.added_vocab_end_index,
-            )
-            part_out = p.quant_method.embedding(p, masked_input.long())
-            part_out.masked_fill_(input_mask.unsqueeze(-1), 0)
+            with _active_device(dev, home):
+                masked_input, input_mask = get_masked_input_and_mask(
+                    _on(input_, dev),
+                    idx.org_vocab_start_index,
+                    idx.org_vocab_end_index,
+                    idx.num_org_vocab_padding,
+                    idx.added_vocab_start_index,
+                    idx.added_vocab_end_index,
+                )
+                part_out = p.quant_method.embedding(p, masked_input.long())
+                part_out.masked_fill_(input_mask.unsqueeze(-1), 0)
             part_out = _on(part_out, home)
             out = part_out if out is None else out + part_out
         return out
@@ -467,10 +503,11 @@ class _LaneLmHeadQuantMethod:
     def apply(self, layer, x, bias=None):
         shell = self._shell
         home = x.device
-        outs = [
-            _on(p.quant_method.apply(p, _on(x, dev), bias), home)
-            for p, dev in zip(shell._lane_parts, shell._lane_part_devices)
-        ]
+        outs = []
+        for p, dev in zip(shell._lane_parts, shell._lane_part_devices):
+            with _active_device(dev, home):
+                part_out = p.quant_method.apply(p, _on(x, dev), bias)
+            outs.append(_on(part_out, home))
         return torch.cat(outs, dim=-1)
 
 
