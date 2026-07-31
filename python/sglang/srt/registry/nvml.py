@@ -27,11 +27,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
+
+logger = logging.getLogger(__name__)
 
 MIB = 1024 * 1024
 
@@ -331,6 +334,290 @@ def _current_device_uuid_via_torch(devices: list[DeviceInfo]) -> str:
     )
 
 
+# ===========================================================================
+# Canonical card identity (AUDIT #331)
+#
+# Everything above answers "what does NVML see". This section answers the
+# question every *persisted* artifact has to answer instead: "which physical
+# card is this record about, given that the enumeration it was written under
+# is gone". The answer is the UUID; the indices are derived views of it,
+# recomputed live at process start and never stored as the key.
+#
+# Three enumerations coexist on one host and disagree routinely:
+#
+#   NVML index      PCI bus order, what nvidia-smi prints.
+#   CUDA ordinal    what torch.cuda sees, FASTEST_FIRST by default, and
+#                   further remapped by CUDA_VISIBLE_DEVICES.
+#   PCI BDF         the slot. Stable across boots, readable by a human,
+#                   but not usable as a key when a card is reseated.
+#
+# On the reference rig the 5090 is CUDA ordinal 0 and NVML index 1. Every
+# defect in this family (#305-M1, #336, #339, #340, #272) is one of those
+# three being written down and read back as another.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class CardIdentity:
+    """One physical GPU under all four names it answers to.
+
+    ``uuid`` is the key. ``nvml_index`` and ``cuda_ordinal`` are the views
+    valid for *this* process only, and ``cuda_ordinal`` is ``None`` when the
+    card is not visible to torch at all (masked by ``CUDA_VISIBLE_DEVICES``,
+    or torch absent).
+    """
+
+    uuid: str
+    nvml_index: int
+    pci_bus_id: str
+    name: str
+    total_bytes: int
+    cuda_ordinal: int | None = None
+
+    @property
+    def total_mib(self) -> int:
+        return self.total_bytes // MIB
+
+    def describe(self) -> str:
+        cuda = "-" if self.cuda_ordinal is None else str(self.cuda_ordinal)
+        return (
+            f"uuid={self.uuid}  nvml={self.nvml_index}  cuda={cuda}  "
+            f"bdf={self.pci_bus_id}  {self.name} {self.total_mib} MiB"
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "uuid": self.uuid,
+            "nvml_index": self.nvml_index,
+            "cuda_ordinal": self.cuda_ordinal,
+            "pci_bus_id": self.pci_bus_id,
+            "name": self.name,
+            "total_mib": self.total_mib,
+        }
+
+
+class IdentityMap:
+    """The live UUID <-> NVML index <-> CUDA ordinal <-> BDF resolver.
+
+    Built once per process from NVML (the source of truth) plus, when torch
+    is importable, the CUDA-ordinal side bridged over the PCI bus id. Every
+    persisted artifact that used to store an index resolves it through here
+    on read and rewrites itself UUID-keyed.
+
+    A resolver instance is a snapshot. It is deliberately not cached at
+    module level: hotplug (#329) will invalidate it, and a stale map that
+    silently answers is exactly the failure this audit removes.
+    """
+
+    def __init__(self, cards: Sequence[CardIdentity]):
+        self.cards: tuple[CardIdentity, ...] = tuple(cards)
+        self._by_uuid = {c.uuid: c for c in self.cards}
+        self._by_nvml = {c.nvml_index: c for c in self.cards}
+        self._by_cuda = {
+            c.cuda_ordinal: c for c in self.cards if c.cuda_ordinal is not None
+        }
+        self._by_bdf = {_normalize_bdf(c.pci_bus_id): c for c in self.cards}
+
+    # -- lookups ----------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.cards)
+
+    def __iter__(self) -> Iterator[CardIdentity]:
+        return iter(self.cards)
+
+    @property
+    def uuids(self) -> tuple[str, ...]:
+        return tuple(c.uuid for c in self.cards)
+
+    def get(self, uuid: str) -> CardIdentity | None:
+        return self._by_uuid.get(uuid)
+
+    def require(self, uuid: str) -> CardIdentity:
+        """The card, or a named error. Never a silent nearest match.
+
+        A UUID that is no longer present means a card was pulled, disabled or
+        moved to another host. The only correct answer is to say so: binding
+        the record to whatever now occupies that index is the bug.
+        """
+        card = self._by_uuid.get(uuid)
+        if card is None:
+            raise DeviceNotFoundError(
+                f"card {uuid} is not present on this host; visible now: "
+                + (
+                    ", ".join(f"{c.uuid} ({c.name}, nvml {c.nvml_index})" for c in self.cards)
+                    or "no NVML devices"
+                )
+            )
+        return card
+
+    def by_nvml_index(self, index: int) -> CardIdentity | None:
+        return self._by_nvml.get(int(index))
+
+    def by_cuda_ordinal(self, ordinal: int) -> CardIdentity | None:
+        return self._by_cuda.get(int(ordinal))
+
+    def by_pci_bus_id(self, bus_id: str) -> CardIdentity | None:
+        return self._by_bdf.get(_normalize_bdf(bus_id))
+
+    def nvml_index_of(self, uuid: str) -> int:
+        return self.require(uuid).nvml_index
+
+    def cuda_ordinal_of(self, uuid: str) -> int:
+        card = self.require(uuid)
+        if card.cuda_ordinal is None:
+            raise DeviceNotFoundError(
+                f"card {uuid} ({card.name}, nvml {card.nvml_index}) is not "
+                "visible to torch in this process; CUDA_VISIBLE_DEVICES masks it"
+            )
+        return card.cuda_ordinal
+
+    # -- legacy migration --------------------------------------------------
+
+    def adopt_legacy_indices(
+        self, indices: Sequence[int], *, order: str = "nvml"
+    ) -> list[str]:
+        """Index-keyed legacy record -> UUIDs, under a stated assumption.
+
+        This is the *migration* path, not a resolution path: an old artifact
+        recorded an index without recording which enumeration it meant, so
+        the best that can be done is to resolve it under the enumeration the
+        writer is known to have used and rewrite the artifact UUID-keyed at
+        once. ``order`` names that assumption explicitly rather than leaving
+        it in a comment -- ``"nvml"`` for anything derived from nvidia-smi or
+        NVML, ``"cuda"`` for anything derived from ``torch.cuda``.
+
+        An index with no card behind it raises rather than being dropped: a
+        legacy file naming card 3 on a two-card host is not a record whose
+        remaining entries can be trusted either.
+        """
+        if order not in ("nvml", "cuda"):
+            raise ValueError(f"order must be 'nvml' or 'cuda', not {order!r}")
+        out: list[str] = []
+        for raw in indices:
+            index = int(raw)
+            card = (
+                self.by_nvml_index(index)
+                if order == "nvml"
+                else self.by_cuda_ordinal(index)
+            )
+            if card is None:
+                raise DeviceNotFoundError(
+                    f"legacy record names {order} index {index}, which matches "
+                    f"no card on this host ({len(self.cards)} present: "
+                    + ", ".join(c.describe() for c in self.cards)
+                    + "). The record predates UUID keying and cannot be "
+                    "migrated; re-measure it."
+                )
+            out.append(card.uuid)
+        return out
+
+    def describe(self) -> str:
+        return "\n".join(c.describe() for c in self.cards)
+
+    def to_json(self) -> list[dict[str, Any]]:
+        return [c.to_json() for c in self.cards]
+
+
+def _normalize_bdf(bus_id: str) -> str:
+    """``00000000:2D:00.0`` and ``0000:2d:00.0`` are the same slot.
+
+    NVML pads the domain to eight hex digits and upper-cases; lspci and the
+    kernel use four and lower-case. Comparing the raw strings silently fails
+    to match, so every BDF entering a lookup passes through here.
+    """
+    text = (bus_id or "").strip().lower()
+    parts = text.split(":")
+    if len(parts) == 3:
+        domain, bus, rest = parts
+        try:
+            domain = f"{int(domain, 16):04x}"
+        except ValueError:
+            pass
+        return f"{domain}:{bus}:{rest}"
+    return text
+
+
+def _cuda_ordinals_by_bus(allow_cuda_init: bool = False) -> dict[str, int]:
+    """``{normalized BDF: CUDA ordinal}`` for the devices torch can see.
+
+    Bridged over the bus id, never over the index: that identity is the whole
+    point. Returns ``{}`` when torch is absent or reports no device, which is
+    the desk case and not an error -- the map is then UUID+NVML only.
+
+    ``allow_cuda_init`` guards a real side effect. ``get_device_properties``
+    goes through ``torch.cuda._lazy_init``, which creates a CUDA context and
+    costs a few hundred MiB of VRAM on every visible card. Most callers only
+    want to know *which card* a stored uuid is -- the boot-path presence
+    checks, the arbitration files -- and must not pay a context, least of all
+    in the launcher before it forks its workers. So by default the bridge is
+    built only when a context already exists; a caller that genuinely needs
+    the CUDA side (the planner, resolving ``--rank-gpu-id``) asks for it.
+    """
+    try:
+        import torch  # noqa: PLC0415 - optional; the map is useful without it
+    except ImportError:
+        return {}
+    try:
+        if not torch.cuda.is_available():
+            return {}
+        if not allow_cuda_init and not torch.cuda.is_initialized():
+            return {}
+        out: dict[str, int] = {}
+        for ordinal in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(ordinal)
+            bus = getattr(props, "pci_bus_id", None)
+            if bus is None:
+                continue
+            domain = getattr(props, "pci_domain_id", 0) or 0
+            device = getattr(props, "pci_device_id", 0) or 0
+            out[_normalize_bdf(f"{domain:04x}:{bus:02x}:{device:02x}.0")] = ordinal
+        return out
+    except Exception as exc:  # noqa: BLE001 - a broken torch must not break NVML
+        logger.debug("card identity: CUDA ordinal bridge unavailable: %s", exc)
+        return {}
+
+
+def identity_map(
+    devices: Sequence[DeviceInfo] | None = None,
+    cuda_ordinals_by_bus: dict[str, int] | None = None,
+    *,
+    allow_cuda_init: bool = False,
+) -> IdentityMap:
+    """Build the live resolver. NVML is the source of truth for the card set.
+
+    Both inputs are injectable so the hermetic tests can construct a rig
+    whose CUDA and NVML orders deliberately disagree (the real shape here:
+    5090 = CUDA 0 / NVML 1) without a driver.
+
+    ``allow_cuda_init`` is the licence to create a CUDA context in order to
+    fill in ``cuda_ordinal``; see :func:`_cuda_ordinals_by_bus`. Without it
+    the CUDA side is filled only when a context already exists, and is
+    ``None`` otherwise -- which is what every caller that keys on UUIDs
+    actually needs.
+    """
+    infos = list(devices) if devices is not None else list_devices()
+    bus_to_ordinal = (
+        cuda_ordinals_by_bus
+        if cuda_ordinals_by_bus is not None
+        else _cuda_ordinals_by_bus(allow_cuda_init)
+    )
+    normalized = {_normalize_bdf(k): v for k, v in bus_to_ordinal.items()}
+    return IdentityMap(
+        [
+            CardIdentity(
+                uuid=info.uuid,
+                nvml_index=info.index,
+                pci_bus_id=info.pci_bus_id,
+                name=info.name,
+                total_bytes=info.total_bytes,
+                cuda_ordinal=normalized.get(_normalize_bdf(info.pci_bus_id)),
+            )
+            for info in infos
+        ]
+    )
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m sglang.srt.registry.nvml",
@@ -345,11 +632,26 @@ def _main(argv: list[str] | None = None) -> int:
         "--name-fragment",
         help="print only the NVML index of the single device matching this fragment",
     )
+    parser.add_argument(
+        "--map",
+        action="store_true",
+        help=(
+            "print the full identity map (uuid <-> NVML index <-> CUDA ordinal "
+            "<-> PCI BDF) as every persisted artifact resolves it"
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
         if args.name_fragment:
             print(resolve_index_by_name_fragment(args.name_fragment))
+            return 0
+        if args.map:
+            imap = identity_map()
+            if args.json:
+                print(json.dumps(imap.to_json(), indent=2))
+            else:
+                print(imap.describe())
             return 0
         devices = list_devices()
     except (NvmlUnavailableError, DeviceNotFoundError) as exc:
