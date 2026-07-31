@@ -587,13 +587,17 @@ class RigRates:
     collective is free.
     """
 
-    #: Probed streaming bandwidth per rank's card, GB/s.
-    membw_gbs: List[float]
+    #: Probed streaming bandwidth per rank's card, GB/s. ``None`` for a card
+    #: the probe never scored -- never ``0.0`` (#359): a zero survives every
+    #: arithmetic it enters and reads downstream as an extremely slow but
+    #: valid card. Use :meth:`require_membw_gbs` to consume it.
+    membw_gbs: List[Optional[float]]
     #: Probed decode-shaped GEMV rate per rank's card, GB/s (None = absent).
     gemv_gbs: Optional[List[float]]
     #: Probed GEMM rate per rank's card, TFLOP/s, RESOLVED for the compute
-    #: dtype of the checkpoint being planned (see ``resolve_gemm_dtype``).
-    gemm_tflops: List[float]
+    #: format of the checkpoint being planned (see ``resolve_gemm_format``).
+    #: Same absence contract as ``membw_gbs``.
+    gemm_tflops: List[Optional[float]]
     #: The two raw rates, kept so the resolution can be redone once the
     #: checkpoint is known. A card without an fp8 tensor path has ``None``.
     gemm_bf16_tflops: List[Optional[float]] = dataclasses.field(default_factory=list)
@@ -610,10 +614,101 @@ class RigRates:
     basis: Dict[str, str] = dataclasses.field(default_factory=dict)
     #: Names of the inputs that are missing (each one costs a prediction).
     absent: List[str] = dataclasses.field(default_factory=list)
+    #: Where two artifacts measured the same fact and disagreed. Not an
+    #: absence -- both numbers exist -- and not something to average away, so
+    #: it travels as its own list for the caller to surface (#359).
+    divergences: List[str] = dataclasses.field(default_factory=list)
+    #: The rank's card entry from the probe, widened with whatever GEMM lanes
+    #: the hardware profile holds for the same UUID. This is what the #324
+    #: per-(rank, family) resolution reads; kept so the resolution can be
+    #: redone once the checkpoint is known.
+    rank_entries: Tuple[Dict, ...] = ()
+    #: Human-readable rank label per position, for absence messages.
+    rank_keys: Tuple[str, ...] = ()
+    #: The checkpoint format ``gemm_tflops`` was resolved for (#298a key).
+    gemm_format: str = "bf16"
+    #: GEMM lane label per rank, as #324 resolved it.
+    gemm_lanes: Tuple[str, ...] = ()
+    #: family -> per-rank rate, only for a #324 family whose format diverges
+    #: from the checkpoint-wide one. Empty on every single-scheme checkpoint.
+    gemm_family_tflops: Dict[str, List[float]] = dataclasses.field(default_factory=dict)
+    #: Loud wrong-lane fallbacks from the resolution, verbatim from #324.
+    gemm_warnings: Tuple[str, ...] = ()
 
     @property
     def ranks(self) -> int:
         return len(self.membw_gbs)
+
+    def require_membw_gbs(self) -> List[float]:
+        """The streaming rates, or :class:`cost_model.AbsentRate` naming the
+        first rank that has none."""
+        return self._require(self.membw_gbs, "streaming bandwidth")
+
+    def require_gemm_tflops(self) -> List[float]:
+        """The GEMM rates, or :class:`cost_model.AbsentRate` naming the first
+        rank that has none."""
+        return self._require(self.gemm_tflops, "GEMM rate")
+
+    def _require(self, values: Sequence[Optional[float]], what: str) -> List[float]:
+        out: List[float] = []
+        for r, value in enumerate(values):
+            if value is None:
+                key = self.rank_keys[r] if r < len(self.rank_keys) else f"rank {r}"
+                raise cost_model.AbsentRate(
+                    f"{what} for {key}",
+                    "the card probe never scored this card, so every term "
+                    "that divides by this rate is unpredictable. Re-run the "
+                    "card probe (POST /api/card_probe).",
+                )
+            out.append(float(value))
+        return out
+
+    def resolve_gemm_format(
+        self,
+        fmt: str,
+        family_formats: Optional[Dict[str, str]] = None,
+    ) -> RigRates:
+        """Re-score every rank on the lane the CHECKPOINT's format dispatches
+        to, through the #324 per-(rank, family) resolution (#359).
+
+        This replaces :meth:`resolve_gemm_dtype`, whose binary ``"fp8"`` /
+        ``"bf16"`` answer was right for exactly two formats. An int8 W8A8, an
+        NVFP4 or a W4A16 checkpoint answered ``"bf16"`` and was then priced at
+        the dense rate -- a measured number on the wrong lane, which is worse
+        than an absent one because it looks trustworthy. The reference rig's
+        int8 lane is 2.9x its own best fp8 lane on the 3080s and 1.2x on the
+        5090; scoring all three dense compresses a 3.68:1 rank ratio to
+        3.54:1 and the ladder solves a different vector for it.
+
+        The resolution is not re-derived here: ``rank_gemm_family_scores`` is
+        the resolver, wrapped for provenance by ``cost_model``. A format with
+        no lane table, or a lane the artifacts never measured, falls back to
+        the dense rate WITH the warning #324 already emits -- the same number
+        the binary classifier produced, now labelled.
+        """
+        if not self.rank_entries:
+            return self
+        rates = cost_model.compute_rates_from_entries(
+            self.rank_entries,
+            self.rank_keys or tuple(f"rank {r}" for r in range(self.ranks)),
+            fmt=fmt,
+            family_formats=family_formats,
+        )
+        picked = [rate.or_none() for rate in rates.rates]
+        families = {
+            family: [r.or_none() for r in vec] for family, vec in rates.families.items()
+        }
+        basis = dict(self.basis)
+        basis["gemm"] = f"rig artifacts, {fmt} GEMM lane resolution (#324)"
+        return dataclasses.replace(
+            self,
+            gemm_tflops=picked,
+            gemm_format=fmt,
+            gemm_lanes=tuple(rate.label for rate in rates.rates),
+            gemm_family_tflops={k: v for k, v in families.items() if all(v)},
+            gemm_warnings=tuple(rates.warnings),
+            basis=basis,
+        )
 
     def resolve_gemm_dtype(self, dtype: str) -> RigRates:
         """Re-pick the per-rank GEMM rate for the checkpoint's compute dtype.
@@ -629,12 +724,14 @@ class RigRates:
             raise ValueError(f"gemm dtype must be 'fp8' or 'bf16', got {dtype!r}")
         if not self.gemm_bf16_tflops:
             return self
-        picked: List[float] = []
+        picked: List[Optional[float]] = []
         for r in range(self.ranks):
             bf = self.gemm_bf16_tflops[r]
             fp = self.gemm_fp8_tflops[r] if self.gemm_fp8_tflops else None
             rate = fp if (dtype == "fp8" and fp) else bf
-            picked.append(float(rate or bf or 0.0))
+            # A card the probe never scored keeps its named absence (#359);
+            # it used to become a 0.0 that every divisor downstream accepted.
+            picked.append(float(rate) if rate else None)
         basis = dict(self.basis)
         basis["gemm"] = (
             f"card probe, {dtype} GEMM rate (bf16 where the card has no fp8 path)"
@@ -647,6 +744,7 @@ def rates_from_probe(
     rank_gpu_id: Sequence[int],
     *,
     cuda_order: bool = True,
+    hardware_profile: Optional[dict] = None,
 ) -> RigRates:
     """Assemble :class:`RigRates` from a ``card_probe`` artifact.
 
@@ -656,11 +754,20 @@ def rates_from_probe(
     that is the ``--rank-gpu-id`` space, and mixing it with the NVML order is
     the device-order trap the fork has walked into before.
 
+    ``hardware_profile`` is the rig profile (``profile["gpus"][uuid]``), whose
+    v3 ``gemm_lanes`` map holds the quantized GEMM lanes the card probe cannot
+    measure -- fp8 Marlin, fp8 W8A16, int8 native. Passing it is what lets the
+    #324 lane resolution price an int8 / nvfp4 / W4A16 checkpoint on the lane
+    it will actually dispatch to instead of on the dense bf16 probe (#359).
+    Without it the solver keeps exactly the two lanes the card probe measures
+    and any other format falls back to dense WITH a warning.
+
     Raises ``ValueError`` only for a structurally impossible mapping (a rank
     naming a card the probe does not know); everything merely missing becomes
     ``absent``.
     """
     absent: List[str] = []
+    divergences: List[str] = []
     basis: Dict[str, str] = {}
     if not probe or not probe.get("cards"):
         raise ValueError(
@@ -673,9 +780,9 @@ def rates_from_probe(
         idx = c.get("cuda_index") if cuda_order else c.get("index")
         by_index[int(idx if idx is not None else pos)] = c
 
-    membw: List[float] = []
+    membw: List[Optional[float]] = []
     gemv: List[float] = []
-    tflops: List[float] = []
+    tflops: List[Optional[float]] = []
     bf16: List[Optional[float]] = []
     fp8: List[Optional[float]] = []
     h2d: List[float] = []
@@ -693,21 +800,23 @@ def rates_from_probe(
             )
         rank_cards.append(c)
         rank_keys.append(f"rank {r} (GPU {gpu}, {c.get('name') or 'unnamed'})")
-        membw.append(float(c.get("membw_read_gbs") or c.get("membw_gbs") or 0.0))
+        streaming = c.get("membw_read_gbs") or c.get("membw_gbs")
+        membw.append(float(streaming) if streaming else None)
         g = c.get("membw_gemv_gbs")
         if g:
             gemv.append(float(g))
         else:
             gemv_ok = False
         # Both rates are kept; which one is used depends on the CHECKPOINT
-        # (resolve_gemm_dtype). The default here is bf16 — the path every
+        # (resolve_gemm_format). The default here is bf16 — the path every
         # card has — so a caller that forgets to resolve under-states a 5090
         # on an fp8 model rather than over-stating it on a GGUF one.
         b16 = c.get("gemm_bf16_tflops") or c.get("gemm_tflops")
         f8 = c.get("gemm_fp8_tflops")
         bf16.append(float(b16) if b16 else None)
         fp8.append(float(f8) if f8 else None)
-        tflops.append(float(b16 or f8 or 0.0))
+        dense = b16 or f8
+        tflops.append(float(dense) if dense else None)
         if c.get("h2d_gbs") and c.get("d2h_gbs"):
             h2d.append(float(c["h2d_gbs"]))
             d2h.append(float(c["d2h_gbs"]))
@@ -715,11 +824,12 @@ def rates_from_probe(
             h2d_ok = False
 
     # The class docstring promises nothing here is defaulted to a plausible
-    # number, but the two loops above fall back to 0.0 for a card the probe
-    # never scored -- a zero that survives as an almost-valid divisor instead
-    # of surfacing. The shared cost library resolves the same fields with
-    # provenance, so the absence gets a name (#348b). On a complete probe --
-    # every reference config -- both lists come back empty and nothing moves.
+    # number. #348b named the two holes the loops above left; #359 stops
+    # filling them: a card the probe never scored now carries ``None`` all the
+    # way to the consumer, which raises ``AbsentRate`` naming it, instead of a
+    # 0.0 that gets clamped to 1e-9 and read as an extremely slow valid card.
+    # On a complete probe -- every reference config -- both lists come back
+    # empty and nothing moves.
     membw_holes = [
         rate.source
         for rate in cost_model.memory_rates_from_entries(rank_cards, rank_keys, "membw")
@@ -728,13 +838,13 @@ def rates_from_probe(
     if membw_holes:
         absent.append(
             f"per-card streaming bandwidth on {len(membw_holes)} rank(s) — "
-            "the decode term reads 0 GB/s there: " + "; ".join(membw_holes[:3])
+            "the decode term cannot be predicted there: " + "; ".join(membw_holes[:3])
         )
-    gemm_holes = [key for key, rate in zip(rank_keys, tflops) if not rate]
+    gemm_holes = [key for key, rate in zip(rank_keys, tflops) if rate is None]
     if gemm_holes:
         absent.append(
             f"per-card GEMM rate on {len(gemm_holes)} rank(s) — every prefill "
-            "term there divides by 0 TFLOP/s: " + "; ".join(gemm_holes[:3])
+            "term there is unpredictable: " + "; ".join(gemm_holes[:3])
         )
 
     basis["membw"] = "card probe, streaming read rate"
@@ -763,11 +873,18 @@ def rates_from_probe(
             if c.get("uuid"):
                 uuid_of_index[int(idx if idx is not None else pos)] = str(c["uuid"])
         card_keys = [str(g) for g in sorted(used)]
-        matrix = cost_model.pair_matrix_from_card_probe(
-            probe,
+        # ONE boundary for both on-disk shapes (#359): the ordered card probe
+        # wins a contested pair, the unordered NCCL link map fills what it
+        # does not cover, and a disagreement is reported rather than silently
+        # decided by whichever reader ran.
+        matrix, link_divergences = cost_model.load_pair_matrix(
             card_keys,
+            card_probe=probe,
+            hardware_profile=hardware_profile,
             uuid_of_key={str(g): uuid_of_index.get(int(g), "") for g in sorted(used)},
+            read_disk=False,
         )
+        divergences.extend(link_divergences)
         bw_rate = matrix.narrowest_bandwidth_gbs()
         lat_rate = matrix.worst_latency_us()
         # Both or neither: the collective formula needs a payload term AND a
@@ -793,6 +910,14 @@ def rates_from_probe(
             "KV spill) is reported absent"
         )
 
+    # The lane-bearing entries the #324 resolution reads: the probe's own two
+    # lanes, widened with whatever the hardware profile measured for the same
+    # UUID. Assembled once here so ``resolve_gemm_format`` is a pure re-score.
+    lane_entries, lane_notes = cost_model.gemm_lane_entries(
+        rank_cards, hardware_profile=hardware_profile
+    )
+    divergences.extend(lane_notes)
+
     return RigRates(
         membw_gbs=membw,
         gemv_gbs=gemv or None,
@@ -805,6 +930,9 @@ def rates_from_probe(
         d2h_gbs=d2h or None,
         basis=basis,
         absent=absent,
+        divergences=divergences,
+        rank_entries=tuple(lane_entries),
+        rank_keys=tuple(rank_keys),
     )
 
 
@@ -992,16 +1120,19 @@ class KeyCostModel:
         ]
 
     def decode_weight_time(self, units: Sequence[int]) -> float:
-        bw = self.perf.effective_decode_bw(self.rates.membw_gbs, self.rates.gemv_gbs)
+        bw = self.perf.effective_decode_bw(
+            self.rates.require_membw_gbs(), self.rates.gemv_gbs
+        )
         w = self.weight_bytes(units)
         return max(w[r] / bw[r] for r in range(len(units)))
 
     def prefill_compute_time(self, units: Sequence[int]) -> float:
         eta = _gemm_efficiency()
+        gemm = self.rates.require_gemm_tflops()
         out = 0.0
         for r in range(len(units)):
             p = self.fixed_params[r] + self.unit_params * units[r]
-            out = max(out, 2.0 * p / (self.rates.gemm_tflops[r] * 1e12 * eta))
+            out = max(out, 2.0 * p / (gemm[r] * 1e12 * eta))
         return out
 
     # -- collective + host terms (pair matrix / host probe) ----------------
@@ -1063,10 +1194,11 @@ class KeyCostModel:
         if coll is None:
             return None
         eta = _gemm_efficiency()
+        gemm = self.rates.require_gemm_tflops()
         comp = 0.0
         for r in range(len(units)):
             p = self.fixed_params[r] + self.unit_params * units[r]
-            rate = self.rates.gemm_tflops[r]
+            rate = gemm[r]
             if rate <= 0:
                 return None
             comp = max(comp, 2.0 * p * max(int(tokens), 1) / (rate * 1e12 * eta))
@@ -1151,9 +1283,18 @@ def build_cost_model(
     Both are exact for the family model, which is why the optimizer's
     closed form is exact for it too.
     """
+    from sglang.srt import uneven_perf
     from sglang.srt.uneven_perf import PerfCostModel
 
-    rates = rates.resolve_gemm_dtype(gemm_dtype_for_checkpoint(plan_inputs.model_path))
+    # #359: the checkpoint's own compute format, resolved per (rank, family)
+    # through #324, replaces the binary fp8/bf16 classifier this module used to
+    # run. ``gemm_dtype_for_checkpoint`` stays exported for the callers that
+    # only want the dtype question answered; it is no longer what prices a
+    # plan, because it cannot name int8, nvfp4, W4A16 or a mixed checkpoint.
+    fmt, _desc, family_formats = uneven_perf.checkpoint_compute_format_families(
+        plan_inputs.model_path
+    )
+    rates = rates.resolve_gemm_format(fmt, family_formats)
     perf = PerfCostModel(
         plan_inputs,
         list(base_plan),
@@ -1223,20 +1364,17 @@ def _terms(
     """
     n = model.perf.tp_size
     if goal == "dec":
-        bw = model.perf.effective_decode_bw(model.rates.membw_gbs, model.rates.gemv_gbs)
+        bw = model.perf.effective_decode_bw(
+            model.rates.require_membw_gbs(), model.rates.gemv_gbs
+        )
         a = [model.fixed_bytes[r] / bw[r] for r in range(n)]
         b = [model.unit_bytes / bw[r] for r in range(n)]
         return a, b
     if goal == "enc":
         eta = _gemm_efficiency()
-        a = [
-            2.0 * model.fixed_params[r] / (model.rates.gemm_tflops[r] * 1e12 * eta)
-            for r in range(n)
-        ]
-        b = [
-            2.0 * model.unit_params / (model.rates.gemm_tflops[r] * 1e12 * eta)
-            for r in range(n)
-        ]
+        gemm = model.rates.require_gemm_tflops()
+        a = [2.0 * model.fixed_params[r] / (gemm[r] * 1e12 * eta) for r in range(n)]
+        b = [2.0 * model.unit_params / (gemm[r] * 1e12 * eta) for r in range(n)]
         return a, b
     if goal in ("maxkv", "sessions"):
         # free_r(u) = free_r(0) - unit_bytes * u_r  ->  maximize min_r free_r
@@ -1424,27 +1562,46 @@ def _predict_all(
         unit="tok/s",
     )
 
-    # Absent pair matrix: the RATIO below still has to be computable, so the
-    # shared placeholder stands in (#348b). Its contract is split-invariance --
-    # the collective term is n_layers * hidden * ranks, never the candidate
-    # vector, so it shifts both times by the same constant and cannot reorder
-    # candidates. The ABSOLUTE number is not reported from it: ``pre_val``
-    # below stays None without a measured baseline.
-    _link = model.rates.link_bw_gbs or cost_model.ABSENT_LINK_RANKING_PLACEHOLDER_GBS
-    tp = model.perf.prefill_time_model(list(units), model.rates.gemm_tflops, _link)
-    tp_base = model.perf.prefill_time_model(
-        list(base_units), model.rates.gemm_tflops, _link
-    )
+    # Absent pair matrix: the collective term is NOT PRICED and the ratio
+    # below is a COMPUTE-ONLY one (#359, replacing the 1e-3 GB/s placeholder
+    # that ``_prefill_sharded_time``'s own 0.1 floor silently swallowed before
+    # it ever reached the arithmetic). The omitted term is split-invariant --
+    # n_layers * hidden * ranks, never the candidate vector -- so it shifts
+    # both times by the same constant and the ORDER over candidates is the
+    # order at any link rate. What it is not is a magnitude a reader can act
+    # on, and the basis text says so instead of printing a bare number.
+    _link = model.rates.link_bw_gbs
+    _gemm = model.rates.require_gemm_tflops()
+    _families = model.rates.gemm_family_tflops or None
+    tp = model.perf.prefill_time_model(list(units), _gemm, _link, _families)
+    tp_base = model.perf.prefill_time_model(list(base_units), _gemm, _link, _families)
     pre_ratio = (tp_base / tp) if tp else 1.0
-    if anchors.prefill_tok_s:
+    compute_only = _link is None and model.rates.ranks > 1
+    lane_txt = (
+        f" on the {model.rates.gemm_format} GEMM lane of each card"
+        if model.rates.gemm_format
+        else ""
+    )
+    if compute_only:
+        # No absolute figure and no magnitude: the ratio orders candidates and
+        # that is all it is allowed to do here.
+        pre_val = None
+        pre_basis = (
+            "no pair matrix for these cards, so the per-layer all-reduce is "
+            f"not priced{lane_txt}. The candidates are still ORDERED by their "
+            "compute term (the collective is split-invariant), but no prefill "
+            "magnitude is reported from a comparison that omits it. Run the "
+            "card probe (POST /api/card_probe) to resolve it."
+        )
+    elif anchors.prefill_tok_s:
         pre_val: Optional[float] = anchors.prefill_tok_s * pre_ratio
         pre_basis = (
             f"measured baseline {anchors.prefill_tok_s:.0f} tok/s "
             f"({anchors.source}) scaled by the predicted prefill ratio "
-            f"{pre_ratio:.3f} (lockstep GEMM at the probed rates + the "
-            "per-layer all-reduce, with the split-invariant launch/non-GEMM "
-            f"remainder held at {model.perf.calibration.prefill_invariant:.0%} "
-            "of the base step)"
+            f"{pre_ratio:.3f} (lockstep GEMM{lane_txt} + the per-layer "
+            "all-reduce, with the split-invariant launch/non-GEMM remainder "
+            f"held at {model.perf.calibration.prefill_invariant:.0%} of the "
+            "base step)"
         )
     else:
         pre_val = None
@@ -4330,12 +4487,20 @@ def check_regressions(
         tw_cand = model.decode_weight_time(model.perf.mlp_unit_partition(cand_vec))
         step_ratio = f + (1.0 - f) * (tw_cand / tw_ref)
         dec_pred = (1.0 / step_ratio - 1.0) * 100.0
-        link = rates.link_bw_gbs or cost_model.ABSENT_LINK_RANKING_PLACEHOLDER_GBS
-        p_ref = model.perf.prefill_time_model(ref_vec, rates.gemm_tflops, link)
-        p_cand = model.perf.prefill_time_model(cand_vec, rates.gemm_tflops, link)
+        # A measured MAGNITUDE can only be checked against a prediction that
+        # prices the same terms. With no pair matrix the prefill prediction
+        # omits the collective, so "enc" is reported as not comparable rather
+        # than compared through a stand-in link rate (#359).
+        link = rates.link_bw_gbs
+        gemm = rates.require_gemm_tflops()
+        families = rates.gemm_family_tflops or None
+        p_ref = model.perf.prefill_time_model(ref_vec, gemm, link, families)
+        p_cand = model.perf.prefill_time_model(cand_vec, gemm, link, families)
         enc_pred = (p_ref / p_cand - 1.0) * 100.0
         predicted = {"enc": enc_pred, "dec": dec_pred}
-        deviations = {k: predicted[k] - anchor.measured[k] for k in anchor.measured}
+        not_priced = ["enc"] if (link is None and rates.ranks > 1) else []
+        comparable = [k for k in anchor.measured if k not in not_priced]
+        deviations = {k: predicted[k] - anchor.measured[k] for k in comparable}
         rows.append(
             {
                 "key": anchor.key,
@@ -4343,18 +4508,20 @@ def check_regressions(
                 "source": anchor.source,
                 "reference_vector": ref_vec,
                 "candidate_vector": cand_vec,
+                "gemm_format": rates.gemm_format,
+                "gemm_lanes": list(rates.gemm_lanes),
                 "measured_pct": dict(anchor.measured),
                 "predicted_pct": {k: round(v, 2) for k, v in predicted.items()},
                 "deviation_pct": {k: round(v, 2) for k, v in deviations.items()},
+                "not_comparable": not_priced,
                 "tolerance_pct": dict(anchor.tolerance_pct),
                 "tolerance_reason": anchor.tolerance_reason,
                 "within_tolerance": all(
-                    abs(deviations[k]) <= anchor.tolerance_pct[k]
-                    for k in anchor.measured
+                    abs(deviations[k]) <= anchor.tolerance_pct[k] for k in comparable
                 ),
                 "signs_match": all(
                     (predicted[k] > 0) == (anchor.measured[k] > 0)
-                    for k in anchor.measured
+                    for k in comparable
                     if abs(anchor.measured[k]) >= NOISE_FLOOR_PCT
                 ),
             }

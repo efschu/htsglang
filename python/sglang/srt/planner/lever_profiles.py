@@ -102,7 +102,7 @@ inventing a scale, and the expert view keeps every individual knob.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 __all__ = [
     "ProfileSpec",
@@ -295,12 +295,6 @@ METRICS: Tuple[MetricSpec, ...] = (
 # Selection
 # ---------------------------------------------------------------------------
 
-#: Link bandwidth assumed when no probe measured one. Mirrors the fallback
-#: ``uneven_perf.apply_auto_performance`` uses for the same term, so the
-#: offline ranking and the boot-time ranking do not diverge on a rig that was
-#: never probed.
-_FALLBACK_LINK_GBS = 8.0
-
 #: A predicted SPEED move smaller than this does not move the vector: the
 #: profile keeps the base split. 1 % is the boot-to-boot noise floor measured
 #: on this rig for the decode step (#210: 1.07 %), so below it the model is
@@ -346,40 +340,64 @@ def _rank_scores(roofline) -> Optional[Dict[str, Any]]:
     }
 
 
-def _min_link_gbs() -> Tuple[float, str]:
-    """The narrowest measured pair link, or the documented fallback.
+def _load_pair_matrix():
+    """The rig's hop costs, from the shared boundary. Split out so the tests
+    can present a rig with no measured wire without touching the disk.
 
-    The #213 card probe measures both directions of every pair, so when it is
-    cached the minimum is taken over the ORDERED matrix — an asymmetric route
-    (a card on a x4 slot) has a slow direction, and that direction is the one
-    a collective waits on.
+    The card set is the union of what the two artifacts know about, because
+    this surface prices a hypothetical placement rather than a running one:
+    the narrowest wire on the rig is the bound it reports.
     """
-    try:
-        from sglang.srt.rigmon.card_probe import load_card_probe
+    from sglang.srt import uneven_perf
+    from sglang.srt.planner import cost_model
 
-        cprobe = load_card_probe()
-        bws = [
-            p.bandwidth_gbs for p in (cprobe.pairs if cprobe else []) if p.bandwidth_gbs
-        ]
-        if bws:
-            transports = cprobe.transports
-            label = "measured ordered pair matrix"
-            if transports:
-                label += " via " + ", ".join(transports)
-            return float(min(bws)), label
-    except Exception:
-        pass
     try:
-        from sglang.srt.uneven_perf import get_cached_hardware_profile
-
-        profile, _ = get_cached_hardware_profile()
-        links = (profile or {}).get("links") or {}
-        bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
-        if bws:
-            return float(min(bws)), "measured pair matrix"
+        probe = cost_model._cached_card_probe()
     except Exception:
-        pass
-    return _FALLBACK_LINK_GBS, "assumed (no probed link matrix)"
+        probe = None
+    try:
+        profile, _inventory = uneven_perf.get_cached_hardware_profile()
+    except Exception:
+        profile = None
+    keys = {str(c["uuid"]) for c in (probe or {}).get("cards") or [] if c.get("uuid")}
+    keys |= {str(u) for u in ((profile or {}).get("gpus") or {})}
+    if not keys:
+        return None, []
+    try:
+        return cost_model.load_pair_matrix(
+            sorted(keys),
+            card_probe=probe,
+            hardware_profile=profile,
+            read_disk=False,
+        )
+    except Exception:
+        return None, []
+
+
+def _min_link_rate():
+    """The narrowest measured pair link, as a provenance-carrying rate.
+
+    Both on-disk pair-matrix shapes are read through the ONE library boundary
+    (``cost_model.load_pair_matrix``, #359) rather than through a precedence
+    order private to this module: the card probe's ORDERED matrix wins because
+    an asymmetric route (a card on a x4 slot) has a slow direction and that is
+    the direction a collective waits on, and a disagreement with the NCCL link
+    map is reported instead of being silently overridden.
+
+    Absent when no artifact measured a wire. There is no fallback rate: see
+    ``cost_model.ABSENT_LINK_COMPUTE_ONLY_REASON``.
+    """
+    from sglang.srt.planner import cost_model
+
+    matrix, divergences = _load_pair_matrix()
+    if matrix is None:
+        return (
+            cost_model.Rate.absent(
+                cost_model.ABSENT_LINK_COMPUTE_ONLY_REASON, unit="GB/s"
+            ),
+            [],
+        )
+    return matrix.narrowest_bandwidth_gbs(), list(divergences)
 
 
 def _card_probe_basis() -> Optional[Dict[str, Any]]:
@@ -536,6 +554,21 @@ def _choose(
             f"candidates ({_margin_txt(margin)} against the base split)"
         )
     if spec.objective == "prefill":
+        if min_link is None:
+            # The objective is not an argmax alone: ``_pick_best`` compares the
+            # winner's MARGIN against the 1 % boot-to-boot noise floor, and a
+            # compute-only margin overstates the move by exactly the collective
+            # term it does not charge. A threshold decision taken through an
+            # unmeasured quantity is the #216/#264 defect, so the objective
+            # reports itself unresolved instead (#359).
+            return None, (
+                "the prefill objective compares a modelled move against this "
+                "rig's 1 % noise floor, and no pair matrix was measured for "
+                "these cards: the per-layer all-reduce cannot be priced, a "
+                "compute-only margin overstates every move, and this surface "
+                "does not rank through a number nobody measured. Run the card "
+                "probe (POST /api/card_probe) to resolve it."
+            )
         gemm = list(scores["gemm_tflops"])
         vec, margin = _pick_best(
             cands,
@@ -570,21 +603,48 @@ def _session_point(result, target_context: int):
     return min(points, key=lambda p: abs(p.target_context_tokens - target_context))
 
 
-def _speed_ratios(model, vec: List[int], base: List[int], scores, min_link):
+class SpeedRatios(NamedTuple):
+    """The two tok/s multipliers of one profile against the base split.
+
+    ``prefill`` is ``None`` when it cannot be formed from measured inputs
+    alone; ``prefill_absent_reason`` then says why. Absence rather than a
+    number is the whole point: a ratio is not an argmax, and the constant a
+    quotient would have to divide by does not cancel out of it.
+    """
+
+    decode: float
+    prefill: Optional[float]
+    prefill_absent_reason: str = ""
+
+
+def _speed_ratios(
+    model, vec: List[int], base: List[int], scores, min_link
+) -> SpeedRatios:
     """(decode, prefill) tok/s multipliers of ``vec`` against the base split.
 
     Both come from the cost model that was fitted for split-to-split
     comparison, never from the roofline's peak-bandwidth arithmetic. Returns
-    ``(1.0, 1.0)`` for the base split itself and when no per-rank scores
-    exist -- in the latter case no profile leaves the base split anyway.
+    ``1.0`` for the base split itself and when no per-rank scores exist -- in
+    the latter case no profile leaves the base split anyway.
+
+    ``min_link is None`` means no pair matrix was measured. The prefill ratio
+    is then ABSENT, not computed compute-only and not computed through a
+    stand-in constant (#359): dividing two times that both omit the collective
+    term does not omit it from the quotient, it inflates the quotient, and
+    this figure is published as a throughput claim. The decode ratio does not
+    touch the link and stays available.
     """
     if scores is None or list(vec) == list(base):
-        return 1.0, 1.0
+        return SpeedRatios(1.0, 1.0)
     try:
         dec_pct = model.decode_cost_percent(list(vec), scores["membw_gbs"])
         dec = 1.0 / (1.0 + dec_pct / 100.0) if dec_pct > -100.0 else 1.0
     except Exception:
         dec = 1.0
+    if min_link is None:
+        from sglang.srt.planner import cost_model
+
+        return SpeedRatios(dec, None, cost_model.ABSENT_LINK_COMPUTE_ONLY_REASON)
     try:
         gemm = list(scores["gemm_tflops"])
         t_base = model.prefill_time_model(list(base), gemm, min_link)
@@ -592,7 +652,7 @@ def _speed_ratios(model, vec: List[int], base: List[int], scores, min_link):
         pre = (t_base / t_cand) if t_cand > 0 else 1.0
     except Exception:
         pre = 1.0
-    return dec, pre
+    return SpeedRatios(dec, pre)
 
 
 def _metric_values(
@@ -621,7 +681,7 @@ def _metric_values(
             ),
         }
 
-    dec_ratio, pre_ratio = ratios
+    dec_ratio, pre_ratio = ratios.decode, ratios.prefill
     if anchor is not None:
         out["decode_tok_s"] = {
             "available": True,
@@ -634,15 +694,24 @@ def _metric_values(
                 "provenance": anchor.provenance,
             },
         }
-        out["prefill_tok_s"] = {
-            "available": True,
-            "value": float(anchor.prefill_tok_s) * pre_ratio,
-            "detail": {
-                "anchor_tok_s": float(anchor.prefill_tok_s),
-                "cost_model_ratio": pre_ratio,
-                "provenance": anchor.provenance,
-            },
-        }
+        if pre_ratio is None:
+            # The level exists; the move off it does not. Reporting the
+            # anchor alone here would publish the BASE split's prefill figure
+            # under this profile's name (#359).
+            out["prefill_tok_s"] = {
+                "available": False,
+                "reason": ratios.prefill_absent_reason,
+            }
+        else:
+            out["prefill_tok_s"] = {
+                "available": True,
+                "value": float(anchor.prefill_tok_s) * pre_ratio,
+                "detail": {
+                    "anchor_tok_s": float(anchor.prefill_tok_s),
+                    "cost_model_ratio": pre_ratio,
+                    "provenance": anchor.provenance,
+                },
+            }
     else:
         miss = {
             "available": False,
@@ -793,7 +862,11 @@ def build_profiles(
     # four keeps the four numbers on one scale.
     anchor = getattr(base_result, "roofline", None)
     scores = _rank_scores(anchor)
-    min_link, link_source = _min_link_gbs()
+    link_rate, link_divergences = _min_link_rate()
+    min_link = link_rate.or_none()
+    link_source = ("absent — " if link_rate.is_absent else "") + link_rate.source
+    for line in link_divergences:
+        caveats.append("The two link artifacts disagree about a card pair: " + line)
     uniform = len(set(base_plan)) <= 1
     if uniform:
         caveats.append(

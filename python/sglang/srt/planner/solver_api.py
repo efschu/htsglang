@@ -67,6 +67,7 @@ __all__ = [
     "key_solver_model_payload",
     "key_solver_spread_payload",
     "cached_card_probe",
+    "cached_hardware_profile",
 ]
 
 
@@ -90,6 +91,23 @@ def cached_card_probe() -> Optional[dict]:
         if isinstance(data, dict) and data.get("cards"):
             return dict(data)
     return None
+
+
+def cached_hardware_profile() -> Optional[dict]:
+    """The cached rig profile, or ``None``. Never triggers a probe.
+
+    The solver needs it for one thing (#359): the v3 ``gemm_lanes`` map, which
+    holds the quantized GEMM lanes the card probe cannot measure. Without it an
+    int8 / nvfp4 / W4A16 checkpoint is scored on the dense bf16 probe -- a
+    measured number on a lane the serving path will not take.
+    """
+    try:
+        from sglang.srt import uneven_perf
+
+        profile, _inventory = uneven_perf.get_cached_hardware_profile()
+    except Exception:
+        return None
+    return profile or None
 
 
 def _card_probe_remedy() -> dict:
@@ -198,7 +216,9 @@ def key_solver_payload(payload: Optional[dict] = None) -> dict:
         }
 
     try:
-        rates = key_solver.rates_from_probe(probe, rank_gpu_id)
+        rates = key_solver.rates_from_probe(
+            probe, rank_gpu_id, hardware_profile=cached_hardware_profile()
+        )
     except ValueError as e:
         return {"ok": False, "reasons": [str(e)], "remeasure": _card_probe_remedy()}
 

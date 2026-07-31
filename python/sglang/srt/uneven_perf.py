@@ -4434,7 +4434,7 @@ class PerfCostModel:
         self,
         mlp_vector: List[int],
         gemm_tflops: List[float],
-        min_link_gbs: float,
+        min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
     ) -> float:
         """The shard-PROPORTIONAL part of the prefill step: lockstep compute
@@ -4483,26 +4483,45 @@ class PerfCostModel:
                 t_comp = max(t_comp, t)
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
+        #
+        # ``min_link_gbs=None`` means no pair matrix was measured: the term is
+        # NOT priced and the caller holds a compute-only time (#359). It used
+        # to be ``max(min_link_gbs, 0.1)``, a silent floor that rescued any
+        # value below it -- including the 1e-3 GB/s placeholder the key solver
+        # passed, which therefore never reached this arithmetic at all. A
+        # non-positive link is now a caller error, loudly.
         n = self.tp_size
+        if n <= 1 or min_link_gbs is None:
+            return t_comp
+        if min_link_gbs <= 0.0:
+            raise ValueError(
+                f"min_link_gbs must be a measured positive rate, got "
+                f"{min_link_gbs!r}. Pass None to price the compute term only "
+                "when no pair matrix exists; there is no stand-in constant."
+            )
         ar_bytes = self.n_layers * 2 * self.hidden * 2
-        t_comm = (
-            ar_bytes * 2 * (n - 1) / n / (max(min_link_gbs, 0.1) * 1e9)
-            if n > 1
-            else 0.0
-        )
+        t_comm = ar_bytes * 2 * (n - 1) / n / (min_link_gbs * 1e9)
         return t_comp + t_comm
 
     def prefill_time_model(
         self,
         mlp_vector: List[int],
         gemm_tflops: List[float],
-        min_link_gbs: float,
+        min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
     ) -> float:
         """Relative prefill step time. Only ratios between candidates are
         consumed. ``family_tflops`` switches the sharded term to the
         per-family ``sum(p/r)`` arithmetic (see ``_prefill_sharded_time``);
         ``None`` is the byte-identical scalar path.
+
+        ``min_link_gbs=None`` prices the compute term only, for a rig whose
+        pair matrix was never measured. The omitted collective term is
+        split-invariant, so the ORDER over candidates is the order at any link
+        rate -- an argmax stays answerable. A RATIO between two of these times
+        is not: it drops an additive constant from both sides and overstates
+        the move, so it must not be compared against a threshold. See
+        ``cost_model.ABSENT_LINK_COMPUTE_ONLY_REASON``.
 
         Two terms: the shard-proportional part (``_prefill_sharded_time``:
         GEMM compute at the probe rate + per-layer all-reduce) and a split-
@@ -4930,7 +4949,12 @@ def apply_auto_performance(server_args) -> None:
             )
     links = profile.get("links") or {}
     pair_bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
-    min_link = min(pair_bws) if pair_bws else 8.0
+    # No measured wire means the collective term is not priced and the
+    # objective ranks on compute alone (#359). The term is split-invariant, so
+    # the ordering is unchanged by omitting it; what used to happen instead was
+    # an assumed 8.0 GB/s that made the reported margins depend on a number
+    # nobody measured.
+    min_link = min(pair_bws) if pair_bws else None
     if pair_bws:
         lines.append(
             "link matrix: "
@@ -4940,6 +4964,11 @@ def apply_auto_performance(server_args) -> None:
                 for k, v in links.items()
                 if k != "__group__"
             )
+        )
+    else:
+        lines.append(
+            "link matrix: not measured — the prefill objective prices compute "
+            "only and its reported margin excludes the per-layer all-reduce"
         )
 
     # Measured KV-budget registry (previous boot of this exact config): when
