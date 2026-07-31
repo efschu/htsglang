@@ -1238,6 +1238,33 @@ global, so a dual-group lane carries its own; the #236 spill budget's session-co
 same value instead of keeping a second one. Registered as the cheapest relief rung of the KV
 pressure ladder (`admission_cap`) — the only rung that is an actuator rather than a data movement.
 
+On a hybrid (mamba/GDN) model the ceiling buys state that is not elastic: every running request
+owns a conv/temporal state slot on **every** rank for as long as it runs, so the pool costs
+`ceiling · mamba_ratio · safety` slots plus the speculative intermediate state, linearly in the
+ceiling. On a 20 GB card that turns a high ceiling from "a smaller KV pool" into "no budget left":
+measured 2026-07-30 on the TP=3 uneven rig, ceiling 64 came out 559 MiB over the per-rank budget
+and ceiling 32 407 MiB over it, both before the first KV token, while 16 booted — the target
+regime was exactly the unbootable one. The ceiling is therefore a **request**, not a promise: when
+the demand-driven pool cannot be afforded, it is fitted to the mamba side of the
+`--mamba-full-memory-ratio` split of the budget, the fitted size is min-reduced across ranks like
+every other pool count, `_resolve_max_num_reqs` caps `max_running_requests` at the pool's capacity,
+and the limiter floats below **that**. Both the rank that fitted and the scheduler say so at boot,
+naming requested and effective ceiling. The fit engages only when the pool would otherwise leave
+the token pool less than 256 MiB — a configuration that cannot serve a prefill chunk and does not
+boot today either — so every working boot keeps its pool slot for slot. The paths that pin the pool
+size or split by fixed fraction are not fitted and still refuse, but the refusal now names the
+ceiling the budget would carry instead of leaving it to be bisected.
+
+Two alternatives were rejected. Staging the slots (materialize beyond the start value only when
+admission rises, cold slots parked in the #104 RAM tier) does not address the target regime: at
+admission = ceiling every state set is hot, so the RAM tier is empty exactly when the ceiling is
+exercised — and the sets are `va_stable_required`, so moving them at all needs the #93 VMM route,
+whose GPU phase is unbuilt. Per-rank ceilings along the KV ratio are not expressible: the pool size
+is a request COUNT and a request's state lives on every rank, so per-rank counts min-reduce to the
+weakest card by construction; the proportionality that per-rank sizing would buy already exists in
+bytes, because the per-request state scales with each rank's head share (32.73 / 23.38 / 18.70 MiB
+at ratio 7,3,3).
+
 Default: unset = no ceiling, no float, unchanged behavior. **Built** — no hardware boot.
 
 **Upstream:** sglang's `max_running_requests` is a single static number that both sizes the pools

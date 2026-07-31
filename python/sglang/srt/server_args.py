@@ -856,6 +856,10 @@ class ServerArgs:
             "The decode CUDA-graph capture bound is widened to the ceiling "
             "so the whole declared range stays captured (graph memory grows "
             "with it; pin --cuda-graph-max-bs-decode to override). "
+            "On a hybrid (mamba/GDN) model the ceiling costs per-request "
+            "state that is not elastic, so a ceiling the cards cannot hold "
+            "is FITTED down to the largest one they can, min-reduced across "
+            "ranks and reported at boot, instead of failing the boot (#307). "
             "Default: unset = no ceiling, no float, today's behavior "
             "byte-identical (the limiter is a passive holder of "
             "max_running_requests and the admission arithmetic is unchanged).",

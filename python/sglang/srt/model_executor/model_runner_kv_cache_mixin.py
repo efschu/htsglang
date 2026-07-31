@@ -111,6 +111,18 @@ MAMBA_AUTO_SAFETY_MARGIN = 1.25
 # scratch, OOM'ing a large (~18k-token) prefill. Reserving this back lets the
 # default --rank-auto-reserve-mib stand (no need to raise it to buy headroom).
 MAMBA_AUTO_ACTIVATION_RESERVE_MIB = 1024
+# Trigger for the #307 ceiling fit, NOT a safety margin: when the pool the
+# concurrency target asks for would leave the token pool less than this, the
+# boot is lost either way (a KV pool below one prefill chunk cannot serve a
+# request), so the pool is fitted to the budget instead of the budget being
+# overspent. Above this the pool keeps the size it has today, byte for byte.
+MAMBA_CEILING_FIT_MIN_KV_MIB = 256
+
+#: Ledger label of the mamba post in the per-rank budget message. Named once
+#: so the message's ceiling hint can find the post it has to reason about.
+MAMBA_BUDGET_POST = (
+    "mamba state pool + speculative intermediate state + prefill activation reserve"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +399,7 @@ class ModelRunnerKVCacheMixin:
         rest_memory_gb: float,
         device_free_gb: float,
         occupancy: Tuple,
+        ceiling: Optional[int] = None,
     ) -> str:
         """The per-rank "no room for KV" message, itemized.
 
@@ -395,11 +408,38 @@ class ModelRunnerKVCacheMixin:
         The driver-free line is part of it on purpose: a shortfall on a
         shared card invites the theory that the neighbour was charged twice,
         and the numbers that refute (or confirm) it belong in the message.
+
+        ``ceiling`` is ``--max-running-requests-ceiling`` (#287). When it is
+        set, the mamba post scales linearly with it, so the message can name
+        the ceiling this budget WOULD carry instead of leaving the operator
+        to bisect it (#307). The demand-driven pool fits itself and never
+        reaches this message; the pinned-size and fixed-fraction paths can,
+        and there the number is the whole answer.
         """
         ledger = "; ".join(f"{name} {gb:.2f} GiB" for name, gb in posts if gb > 0.005)
         spent_gb = sum(gb for _name, gb in posts)
         short_mib = math.ceil(-rest_memory_gb * 1024)
         total_gb, outside_gb = occupancy
+        ceiling_note = ""
+        mamba_post_gb = sum(gb for name, gb in posts if name == MAMBA_BUDGET_POST)
+        if ceiling and mamba_post_gb > 0.005:
+            # The post is (slots + admitted*D) * per_req + a constant reserve,
+            # and both slot terms are proportional to the ceiling -- so the
+            # affordable ceiling scales with the affordable share of the post.
+            affordable_gb = max(mamba_post_gb + rest_memory_gb, 0.0)
+            fits = int(ceiling * affordable_gb / mamba_post_gb)
+            ceiling_note = (
+                f" --max-running-requests-ceiling={ceiling} is the value the "
+                f"state pools were dimensioned for and it is what the "
+                f"{mamba_post_gb:.2f} GiB post above is spent on; this budget "
+                f"carries a ceiling of about {max(fits, 1)}"
+                + (
+                    ". No ceiling fits this budget -- the shortfall survives "
+                    "even at one request."
+                    if fits < 1
+                    else "."
+                )
+            )
         return (
             f"The per-rank budget leaves no GPU memory for the KV cache "
             f"under --rank-gpu-memory-mib on rank {tp_rank}: the "
@@ -413,7 +453,7 @@ class ModelRunnerKVCacheMixin:
             f"was handed out in full: {device_free_gb:.2f} GiB of the device "
             f"is free at this point ({total_gb:.2f} GiB total, "
             f"{outside_gb:.2f} GiB held outside this process), and a "
-            f"co-resident process does not reduce the budget."
+            f"co-resident process does not reduce the budget." + ceiling_note
         )
 
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
@@ -524,13 +564,7 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-            budget_posts.append(
-                (
-                    "mamba state pool + speculative intermediate state + "
-                    "prefill activation reserve",
-                    before_mamba_gb - rest_memory,
-                )
-            )
+            budget_posts.append((MAMBA_BUDGET_POST, before_mamba_gb - rest_memory))
 
         # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
         # a scratch buffer before the large-M cuBLAS GEMM, and targets above
@@ -632,6 +666,7 @@ class ModelRunnerKVCacheMixin:
                         rest_memory_gb=rest_memory,
                         device_free_gb=device_free_gb,
                         occupancy=self._device_occupancy_gb(device_free_gb),
+                        ceiling=self.server_args.max_running_requests_ceiling,
                     )
                 )
             raise ValueError(
@@ -1480,6 +1515,97 @@ class ModelRunnerKVCacheMixin:
         slots = math.ceil(target * ratio * MAMBA_AUTO_SAFETY_MARGIN)
         return int(max(slots, ratio))
 
+    def _mamba_pool_budget_cost_gb(
+        self: ModelRunner, size: int, per_req: int, ratio: int, D: int
+    ) -> float:
+        """What a mamba pool of ``size`` state slots costs this rank's budget
+        on the demand path: the main state plus the speculative intermediate
+        state of the requests that pool can admit -- exactly the two posts
+        ``handle_max_mamba_cache`` subtracts from ``total_rest_memory``."""
+        sa = self.server_args
+        per_worker = sa.dp_size if sa.enable_dp_attention else 1
+        admitted = size // max(ratio, 1)
+        if sa.max_running_requests is not None:
+            admitted = min(sa.max_running_requests // per_worker, admitted)
+        return (size * per_req + admitted * D * per_req) / (1 << 30)
+
+    def _fit_mamba_pool_to_budget(
+        self: ModelRunner,
+        wanted: int,
+        total_rest_memory: float,
+        reserve_gb: float,
+        per_req: int,
+        ratio: int,
+        D: int,
+    ) -> int:
+        """Fit the mamba pool to the rank's budget when the concurrency
+        target cannot be afforded (#307).
+
+        ``--max-running-requests-ceiling`` (#287) is the DIMENSIONING value:
+        the pool is built for the ceiling and the admission limit floats
+        below it. The state a hybrid model needs per admitted request is not
+        elastic -- every running request owns a conv/temporal state slot on
+        every rank for as long as it runs -- so a ceiling costs
+        ``ceiling * ratio * safety`` slots plus the speculative intermediate
+        state, linearly. On a small card a high ceiling therefore does not
+        merely shrink the KV pool, it consumes the entire post-weights budget
+        and the boot dies in the ledger check before the first KV token
+        (measured: ceiling 64 -> 559 MiB short on a 20 GB card, ceiling 32 ->
+        407 MiB short, while 16 booted).
+
+        A ceiling that does not fit is a request for concurrency the card
+        cannot hold, so the honest answer is to serve the largest ceiling
+        that DOES fit rather than to refuse the boot: the pool is fitted to
+        the mamba side of the ``--mamba-full-memory-ratio`` split of the
+        budget, ``_resolve_max_num_reqs`` then caps ``max_running_requests``
+        at the pool's capacity, and the scheduler's ``AdmissionLimiter``
+        floats below THAT (it reads the resolved value, not the requested
+        ceiling). The result is rank-uniform by the same min-reduce that
+        already unifies the pool size across uneven-TP ranks, so the
+        throttle/retract controller keeps deciding on replicated inputs.
+
+        The fit engages ONLY when the size computed by the caller would
+        leave less than ``MAMBA_CEILING_FIT_MIN_KV_MIB`` for the KV pool, so
+        every configuration that boots today keeps its pool byte-identical.
+        That trigger is not a safety margin: below it the token pool cannot
+        hold a single prefill chunk and the boot is already lost."""
+        usable_gb = total_rest_memory - reserve_gb
+        cost_gb = self._mamba_pool_budget_cost_gb(wanted, per_req, ratio, D)
+        if usable_gb - cost_gb >= MAMBA_CEILING_FIT_MIN_KV_MIB / 1024.0:
+            return wanted
+        # Give the mamba side the share the fixed-fraction path would have
+        # given it; the rest of the budget stays with the KV pool. Per slot
+        # the pool costs the main state plus the spec intermediate of the
+        # request that slot group admits (D/ratio per slot).
+        r = self.server_args.mamba_full_memory_ratio
+        mamba_share_gb = max(usable_gb, 0.0) * r / (1.0 + r)
+        per_slot_bytes = per_req * (1.0 + D / max(ratio, 1))
+        fitted = int(mamba_share_gb * (1 << 30) // per_slot_bytes)
+        fitted = max(0, min(fitted, wanted))
+        if fitted >= wanted:
+            return wanted
+        logger.warning(
+            "[auto-mamba] the concurrency target does not fit this rank's "
+            "budget: %d state slots would cost %.2f GiB of the %.2f GiB left "
+            "after weights and the %.2f GiB activation reserve, leaving no KV "
+            "pool. Fitting the pool to the budget instead: %d slots "
+            "(%.2f GiB, admits ~%d requests per rank). "
+            "--max-running-requests-ceiling=%s is the requested ceiling; the "
+            "effective one is the min over ranks of the fitted capacity and "
+            "is reported by the scheduler. --mamba-full-memory-ratio=%.2f "
+            "decides the mamba/KV split of the fitted budget.",
+            wanted,
+            cost_gb,
+            total_rest_memory,
+            reserve_gb,
+            fitted,
+            self._mamba_pool_budget_cost_gb(fitted, per_req, ratio, D),
+            fitted // max(ratio, 1),
+            self.server_args.max_running_requests_ceiling,
+            r,
+        )
+        return fitted
+
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
@@ -1531,6 +1657,14 @@ class ModelRunnerKVCacheMixin:
             fit_cap = int(total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio)))
             size = min(demand_size, max(fit_cap, 0))
             reserve_gb = MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0
+            # #307: fit_cap above ignores the activation reserve and leaves
+            # the KV pool nothing, so a concurrency target the card cannot
+            # hold (a high --max-running-requests-ceiling on a small card)
+            # overspends the budget and kills the boot. Fit the pool instead;
+            # no-op unless the budget would actually be exhausted.
+            size = self._fit_mamba_pool_to_budget(
+                size, total_rest_memory, reserve_gb, per_req, ratio, D
+            )
             effective_target = self._auto_mamba_target_concurrency()
             # Show the EFFECTIVE (possibly capped) target actually used for
             # sizing, plus the raw --max-running-requests so a capped
