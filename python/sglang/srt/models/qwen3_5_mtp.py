@@ -42,6 +42,17 @@ logger = logging.getLogger(__name__)
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
+    # The draft block is a Qwen3_5ForCausalLM, so it fuses exactly the same
+    # projections and its quant config needs the same table to resolve a
+    # checkpoint's exclusion list. _get_quantization_config reads this off the
+    # MODEL CLASS, and the class it reads for a draft is this one, not the
+    # target's -- without it the draft's fused `qkv_proj` / `gate_up_proj`
+    # never match an `ignore` list that names q/k/v and gate/up separately,
+    # and the drafter is built quantised against dense bf16 tensors (#332,
+    # measured on ocicek/Qwen3.6-27B-NVFP4). Copied, not aliased: the loader
+    # mutates this dict in place for quark / NPU.
+    packed_modules_mapping = dict(Qwen3_5ForCausalLM.packed_modules_mapping)
+
     def __init__(
         self,
         config: PretrainedConfig,

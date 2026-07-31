@@ -16161,3 +16161,145 @@ Rohdaten: `/spinning/gpu-battery-results/2026-07-31_nvfp4_beleg/` —
 (VRAM vor/nach je Arm, `server_info`, `metrics`), `logs/` (Serverlogs, pyspy,
 Progress je Arm), dazu die gefahrenen Skripte `env.sh`, `arm.sh`,
 `falsifier.sh`, `coherence.py`.
+
+## #332: die drei Befunde des NVFP4-Belegs als Code (CPU-only, 2026-07-31)
+
+Der Beleg oben nennt drei Defekte und misst ihre Kosten. Dieser Abschnitt hält
+fest, was daraus Code geworden ist, wo die Diagnose des Belegs korrigiert
+werden musste, und mit welchen Erwartungen das Bootbeleg-Programm
+(`scripts/nvfp4/v4_boot_proof.sh`) gefahren wird. Alles hier ist hermetisch
+getestet, keine Karte beteiligt.
+
+### Posten 1 — Dequant-Fallback statt Verweigerung (TP=3-Blocker)
+
+Ein compressed-tensors-NVFP4-Layer, dessen **ungeshardete** Breite die
+Marlin-Kachel verfehlt, wird jetzt gepackt geladen und beim Load nach dicht
+materialisiert, statt den Boot abzubrechen. Neue Lane
+`CompressedTensorsW4A4Fp4Dequant`, geroutet von
+`CompressedTensorsConfig._maybe_dequantize_unpackable`.
+
+**Guard-Reihenfolge, absichtlich wie #316:** zuerst das Geometrie-Urteil auf
+der ungeshardeten Breite (`nvfp4_marlin_unpackable_reason`) — das entscheidet,
+WELCHE Layer betroffen sind —, erst danach ändert sich die Konsequenz. Ein
+Shard, der die Kachel verfehlt, während das Modul sie treffen könnte, bleibt
+ein lauter Fehler; das ist ein Shard-Plan-Problem und keine Eigenschaft des
+Checkpoints. Unterschied zu #316: dort lag der Tensor dicht auf der Platte und
+das Modul konnte leer-dicht gebaut werden, hier liegt er **gepackt** vor und
+muss geladen werden, bevor man ihn auflösen kann.
+
+**Kein Qualitätsverlust.** `dequantize_nvfp4` reproduziert exakt die Werte, die
+der Quantisierer kodiert hat — der Rundungsfehler steckt bereits in den
+Vier-Bit-Codes. Gegen eine unabhängig geschriebene Element-für-Element-Referenz
+byte-gleich getestet, inklusive der compressed-tensors-Skalenrichtung
+(dividieren durch `weight_global_scale`; die falsche Richtung crasht nicht,
+sie skaliert die Zeile mit `global_scale**2`). Zusätzlich sauberer als die
+Kernel-Lanes: pro logischem Shard mit dessen **eigenem** Global-Scale statt des
+`max()`-Kollapses, den ein gemeinsamer GEMM erzwingt.
+
+Kosten: die 48 GDN-b/a-Gates von Qwen3.6-27B sind zusammen ~11,8 M Parameter,
+also ~23 MiB dicht gegen ~7 MiB gepackt. Belastet werden nur Layer, die sonst
+gar nicht bedienbar wären.
+
+**Prior Art (vLLM, geprüft).** vLLM löst dieselbe Form zweimal:
+`EmulationNvFp4LinearKernel`
+(`vllm/model_executor/kernels/linear/nvfp4/emulation.py`) ist der terminale
+Eintrag seiner NVFP4-Kernel-Liste und meldet immer Unterstützung —
+dequantisiert aber in `apply_weights`, also bei **jedem** Forward; und
+`prepare_fp4_layer_for_marlin` polstert N per `marlin_padded_nk` auf die
+Kachel. Einmal beim Load zu materialisieren ist bei identischer Numerik
+billiger als das Erste, und braucht anders als das Zweite keine Einigung
+zwischen gepolstertem Puffer, Per-Rank-Shard-Breiten und dem
+column-parallel-Gather. Polstern bleibt die bessere Antwort, sobald diese
+Layer VRAM-relevant werden — im Docstring der Lane benannt.
+
+### Posten 2 — Fusions-bewusstes Ignore-Matching (NEXTN-Blocker)
+
+**Die Diagnose des Belegs stimmt zur Hälfte, und die andere Hälfte ist
+korrigiert.** Der Beleg nennt zwei Abweichungen, Präfix (`mtp.` gegen
+`model.`) und Fusion. Nachgemessen: `Qwen3_5ForCausalLMMTP` baut sein inneres
+Modell mit `prefix="mtp"`, der String, den `get_quant_method` sieht, ist also
+bereits `mtp.layers.0.…` — der Namensraum des Checkpoints, ohne Übersetzung.
+Die `model.layers.0.*`-Namen in der #318-Wächtermeldung stammen aus
+`named_parameters()`, dem Python-Attributbaum, den `load_weights` getrennt
+überbrückt. Hermetisch nachgewiesen: `mtp.layers.0.self_attn.o_proj` und
+`mtp.layers.0.mlp.down_proj` trafen die `ignore`-Liste schon vorher, nur die
+**fusionierten** Namen nicht. Ein Namensraum-Übersetzer wäre gebaut worden,
+ohne dass ihn etwas braucht.
+
+Die echte Wurzel liegt eine Ebene höher: `_get_quantization_config` liest
+`packed_modules_mapping` von der **Modellklasse**, und für einen Draft ist das
+die MTP-Klasse. **Keine der acht MTP-Klassen im Baum deklariert eine** — die
+Fusionstabelle, die die Quant-Config bekommt, war also leer. Zwei Fixes:
+
+* `Qwen3_5ForCausalLMMTP` deklariert die Tabelle der Zielarchitektur (kopiert,
+  nicht aliasiert — `_get_quantization_config` mutiert sie für quark/NPU
+  in-place).
+* `should_ignore_layer` (compressed-tensors) fällt auf dieselbe gemeinsame
+  Tabelle zurück, die `is_layer_skipped` (AWQ/FP8/ModelOpt) längst nutzt. Das
+  trägt die verbleibenden sieben MTP-Architekturen für q/k/v und gate/up.
+
+Die Tabelle `FALLBACK_FUSED_SHARDS` hat dabei die beiden GDN-Paare bekommen
+(`in_proj_ba`, `in_proj_qkvz`). Nebenbefund, ein echter latenter Bug: der
+AWQ-Auto-Round-Bruder listet die GDN-Gates **unfusioniert**, AWQ übergibt nie
+eine Tabelle — `in_proj_ba` wurde dort bisher quantisiert gebaut, obwohl der
+Produzent es ausgenommen hatte.
+
+Gegen alle drei realen Checkpoint-Formen dieser Kiste geprüft (Auszüge der
+echten Listen im Test): V4-`ignore`, AWQ-`modules_to_not_convert`,
+FP8-`modules_to_not_convert` — fusioniert wie unfusioniert, und die
+Zielmodell-Layer bleiben unverändert quantisiert.
+
+### Posten 3 — Reserve-Sizing auf dem Solo-Pfad
+
+Woher der Schlupf kommt: auf dem Default-Pfad (ohne `--rank-gpu-id`) hält
+`_profile_available_bytes`
+`pre_model_load_memory * (1 - mem_fraction_static)` zurück. Das ist ein
+blinder Prozentsatz der Karte; kein Posten darin ist benannt — weder
+Graph-Capture noch Activation-Working-Set noch CUDA-Kontext. Die itemisierte
+Alternative existierte längst (#68, `derived_rank_auto_reserve_mib`: Budget =
+NVML-TOTAL minus benannte Reserve), war aber ohne `--rank-gpu-id` nicht
+erreichbar — also gerade nicht auf einem Solo-Boot.
+
+`--rank-auto-reserve-mib <MiB>` wirkt jetzt auch ohne `--rank-gpu-id` und
+setzt `mem_fraction_static = (NVML-Total − Reserve) / NVML-Total`, **exakt**:
+kein Aufschlag, kein Cap, keine Rundung (`round(x, 3)` der Stock-Ableitung
+verschenkt auf dieser Karte bis zu 16 MiB). Ausschließend zu
+`--mem-fraction-static`, single-node, ein Rang pro GPU. `auto` bleibt dort
+wirkungslos — es ist der Default des Flags und kann sich nicht von „nicht
+gesetzt" unterscheiden, also bliebe der Default-Pfad sonst nicht unverändert.
+
+Rechnung gegen die Beleg-Zahlen (hermetisch gepinnt): 0,90 auf 32.607 MiB hält
+3.261 MiB zurück; die gemessenen 2,44 GiB Rest sind bei 31,9 KiB/Token 80.204
+Token, 153.007 + 80.204 = 233.211 — die „~233k" des Belegs, und der gemeldete
+Pool ist 66 % davon. Bei einer Reserve von 2.048 MiB liegt der Gewinn bei
+~39k Token (~192k gesamt). Kein Safety-Margin-Zwang: eine Reserve, die für
+Graphen und Aktivierungen der gewählten Rezeptur nicht reicht, ist das OOM des
+Nutzers — wie überall in diesem Fork.
+
+### Testzahlen
+
+| Suite | Ergebnis |
+|---|---|
+| `test_nvfp4_dequant_fallback.py` (neu) | 26 |
+| `test_fused_ignore_matching.py` (neu) | 22 |
+| `test_solo_reserve_sizing.py` (neu) | 18 |
+| `test_nvfp4_lane_defects.py` (#291-S3/#323) | 43, unverändert |
+| `test_draft_quantization_namespace.py` (#318) | 35, unverändert |
+| `unit/layers/quantization` + `unit/server_args` + `unit/model_loader` | 699 passed, 36 skipped, Failure-Set byte-identisch zur Basis (6, alle „No accelerator" in `test_modelopt_loader.py`) |
+| `unit/models`, `unit/configs` | 67 / 35 |
+
+`ruff --select F401,F821,UP037` und `codespell` identisch zur Basis (nur
+Vorbefunde), `black` sauber.
+
+### Bootbeleg-Programm
+
+`scripts/nvfp4/v4_boot_proof.sh` trägt die Erwartungen. ARM 1 (TP=3 uneven)
+läuft jetzt **mit** NEXTN und muss booten; erwartet werden 144
+`DEQUANTISED`-Zeilen (48 GDN-Schichten × 3 Ränge), null nicht-geladene
+Draft-Parameter und eine Accept-Länge deutlich über 1,0 — exakt 1,0052 bei 0
+akzeptierten Drafts ist die Signatur eines Drafters auf uninitialisierten
+Gewichten und damit der Falsifikator. ARM 2 (solo) fährt reserve-dimensioniert
+(`SOLO_RESERVE_MIB`, Default 2048) und muss die Gewichte bei 18,81 GiB lassen
+und den Pool von 153.007 auf ~192k heben. Damit wird auch die bisher offene
+Frage aus ANALYSE_321 §7(e) — mixed-arch-W4A4-Determinismus — in einem Fenster
+beantwortbar, weil zum ersten Mal beide Arme booten.
