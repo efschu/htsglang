@@ -17236,3 +17236,137 @@ server_info.json). duty-Defekt-Waechter in keinem Fenster gefeuert.
 - **Kalibrier-Evidenz**: die Fenster tragen jetzt Labels neben occ/cost-
   Ratios; eine Schwellen-Kalibrierung aus diesen Daten (statt der
   Roofline-Defaults) steht aus.
+
+## #297 Phasengrenzen-KV-Resharding: dcp_ratio wird echter Aktuator (`feat/kv-resharding`, Basis eda4f03b28; Kartenfenster 2026-07-31, 10:05-10:16 + 10:27-10:36 UTC)
+
+Der physische KV-Umzug zwischen Raengen im laufenden Betrieb: die erste
+planned-only-Sprosse der #287-Treppe (`dcp_ratio`) bewegt jetzt Bytes.
+Kernvereinfachung (DESIGN_297): unter der gewichteten Owner-Rule ist die
+physische Pool-Zeile eine PURE FUNKTION aus globaler Slot-ID und Vektor —
+`req_to_token`, Radix und Allokator halten nur globale IDs, also ist der
+Umzug ein reiner Byte-Move plus Refresh der wenigen Vektor-Snapshots
+(Backend-Owner-Bounds via WeakSet-Registry, `_CP_TOKEN_RATIOS`,
+hicache-Memo). Kein Metadaten-Umbau, keine Graph-Recapture.
+
+### Was gebaut wurde
+
+- `layers/dcp/reshard_plan.py`: pure Uebergangsarithmetik (Owner alt/neu,
+  retained/outgoing/incoming je Rang, deterministische Slot-Ordnung als
+  Payload-Konvention) + Fitted-Ceiling-Zeilenformel.
+- `managers/kv_reshard.py`: Konsens-Runtime nach #287-Muster — Kadenz am
+  replizierten Rundenzaehler, EINE bounded MIN-Reduktion mit
+  `(armed, ready, epoch, vektor)`; `armed`/`ready` MIN-semantisch (legale
+  Skew wartet uniform), `epoch`/Vektor gleichheitsgeprueft (Desync = lauter
+  `KvReshardError` auf allen Raengen). Executor: PACK (nur Reads) ->
+  NCCL-`batch_isend_irecv` ueber die Device-Gruppe (+ Checksummen-Trailer je
+  Paar) -> WRITE (je Layer gather-vor-scatter, aliasing-sicher) -> Cutover.
+  Pool bleibt bis nach Checksummen-Pruefung unberuehrt: Transportfehler
+  brechen sauber ab (Retry an spaeterer Grenze legal), nur die Write-Phase
+  ist fatal-laut.
+- Kapazitaets-Entscheid: **Fitted Ceiling statt #93-VMM** — Min-Regel in
+  `_apply_token_constraints` ueber die deklarierte Vektormenge erweitert,
+  Hybrid-Pool je Rang auf das Zeilen-Maximum dimensioniert. Preis: C
+  schrumpft auf das, was jeder Vektor auf jedem Rang traegt; Gewinn: stabile
+  Adressen/Groessen, Decode-Graphen bleiben ohne Recapture gueltig
+  (Replay-Metadaten werden host-seitig aus den refreshten Bounds gebaut,
+  Puffer sind vektorunabhaengig `max_num_tokens * max_context_len`).
+  #93-VMM-Wachstum bleibt benannter Folgeschritt fuer knappe Konfigs.
+- Verdrahtung: `--kv-reshard-vectors` (+ `--kv-reshard-consensus-interval`),
+  `POST /kv_reshard` (flush_cache-Muster, Broadcast = replizierte Arming);
+  #287-`dcp_ratio`-FLIP armt den Umzug, wenn die Ceiling-Menge das
+  Operating-Grid deckt (Boot-Inventar meldet WIRED, sonst benannt
+  planned-only). Stage-A-Guards verweigern PD-Disagg, hicache-Storage,
+  kv-session-offload, weightless, dual-group. Runbook 4.1.1 dokumentiert.
+
+### Hermetische Tore (CPU, Thread-Harness, 19/19 gruen)
+
+Owner-Rule gegen Brute-Force; Uebergangs-Deckung (jeder Slot genau einmal,
+Sender/Empfaenger-Symmetrie je Paar); **Byte-Identitaet** 7,3,3 -> 2,11,10
+und zurueck (globales Referenz-KV nach Umzug unter neuer Owner-Rule exakt
+gleich); Aliasing-Falsifikator (2,1 -> 1,2, schwere Alt/Neu-Ueberlappung im
+selben Puffer); **Desync-Falsifikator** (vergifteter Zielvektor -> alle
+Raenge derselbe laute Fehler, keiner haengt, NULL Pool-Bytes bewegt);
+Exchange-Abbruch-Falsifikator (Transportfehler -> Pool byte-identisch,
+Ziel bleibt gearmt); Ready-/Arming-Skew wartet uniform und committet
+danach; Ladder-Verdrahtung (FLIP ruft arm() mit Grid-Vektor, Inventar
+planned-only ohne Bindung). #287-Suite und dcp-layout-Tests bleiben gruen,
+mypy sauber, Flag aus = nichts konstruiert.
+
+### Boot 1 (A2, 10:05-10:16): zwei Karten-Funde, beide gefixt
+
+1. **Geparkter Loop erreicht nie eine Konsensgrenze**: `IdleSleeper` parkt
+   Rang 0 im zmq-Poll, der Request-Broadcast parkt die uebrigen Raenge
+   dahinter — gearmter Umzug wartete ewig. Fix: `maybe_sleep_on_idle`
+   ueberspringt den Schlaf, solange ein Ziel pending ist (replizierter
+   Zustand, alle Raenge derselbe Zweig; Spin durch Kadenz+Move begrenzt).
+2. **torch-gloo-P2P-Works sind unpollbar** (`SendWork`/`RecvWork` ohne
+   `is_completed`) — der bounded Poll kann Fertigstellung nie sehen. Die
+   #312-Familie fing exakt ihre Hang-Klasse: **CollectiveTimeoutError nach
+   120 s auf allen drei Raengen, laut, kein Haenger, kein Serving aus
+   Mischzustand.** Fix: Exchange device-nativ ueber die TP-NCCL-Gruppe per
+   `batch_isend_irecv` (Works pollen wahrheitsgemaess, Payloads bleiben auf
+   den GPUs) + Write-Phase strikt HINTER erfolgreichen Exchange gezogen.
+
+   Nebenbeleg Boot 1: Fitted-Ceiling-Sizing rechnet korrekt — Kandidaten
+   [522197, 251965] fuer {(7,3,3),(2,11,10)}, C = 251965 (bindend 2,11,10);
+   Rang-1/2-Zeilen 58146 -> 120516/109560, Rang 0 unveraendert.
+
+### Boot 2 (A3, gefixter Stand): Umzug gemessen
+
+| Posten | hin (7,3,3 -> 2,11,10) | zurueck (2,11,10 -> 7,3,3) |
+|---|---|---|
+| Dauer gesamt (Rang-max) | **63,5 ms** | **9,9 ms** |
+| Phasen (Rang 1) | read 2,4 / exchange 53,4 / write 5,7 ms | 2,4 / 0,4 / 5,5 ms |
+| Live-Slots / groesste Paarlast | 64 / 1,03 MiB | 64 / 1,03 MiB (gespiegelt) |
+| Checksummen (4 Legs x Paare) | alle gleich | alle gleich |
+
+Ziel "Delta < 1 s" um Faktor ~15-100 unterboten; der 53-ms-Exchange des
+ersten Legs ist NCCL-P2P-Warmup (zweiter Leg 0,4-1,1 ms). Zeilenzahlen
+exakt gespiegelt (33/8/9 hin = 33/8/9 zurueck, vertauschte Richtung).
+Kohaerenz: Multi-Turn nach dem Umzug korrekt (Frage nach Spanien ->
+"Madrid."), Session generiert sinnvoll weiter; Epoch 1 -> 2, Cutover-Zeile
+auf jedem Rang, 1 Owner-Bounds-Consumer je Rang refresht (Draft-Backend
+korrekt ausgenommen, dcp_size=1).
+
+### Boot 3 (B2) — Negativkontrolle und die ehrliche Text-Achse
+
+- **Negativkontrolle PASS, byte-identisch:** Frischboot-Erstlauf ohne Flag
+  == Frischboot-Erstlauf mit Flag vor dem Umzug (Text exakt gleich; zudem
+  A2-pre == A3-pre ueber zwei Boots -> Erstlauf reproduzierbar, der
+  Vergleich traegt). Ohne Flag null KV-RESHARD-Zeilen, Stock-Pfad.
+- **Text-Gleichheit ueber RERUNS ist auf diesem Stack kein Gate:** B-Rerun
+  != B-Erstlauf OHNE jeden Umzug (Radix-Hit-Batchform kippt
+  Beinahe-Gleichstaende, bekannter Befund). Die beobachtete pre/post-
+  Divergenz in A3 liegt in genau dieser Basisvarianz — der Umzug ist durch
+  die Kontrolle exoneriert; das Byte-Tor liegt in den hermetischen Tests
+  (exakt) plus den Laufzeit-Checksummen je Paar.
+- Rezept-Fussnote: `--rank-kv-ratio 7,3,3` OHNE Reshard-Flag laesst C auf
+  522197 und OOMt im Warmup bei Reserve 3000/2700/2700 (#320 fuhr dieselbe
+  Vektorklasse mit 4500/4200/4200); Kontrolle daher mit
+  `--max-total-tokens 251965` gefahren (= C des Flag-Boots, stockpfad-rein).
+
+### Auslastung, Kartenzeit, Disziplin
+
+| Posten | Wert |
+|---|---|
+| Fenster 1 | 10:05:19-10:16:27 UTC (11,1 min), Boots A/A2, Funde 1+2 |
+| Fenster 2 | 10:27:04-10:36:25 UTC (9,4 min), Boots A3/B/B2, alle Messungen |
+| Summe Kartenzeit | **20,5 min von 35** |
+| Zwischenzeit | Karten freigegeben, agent-340-Fenster lief dazwischen; Wiederaufnahme per begrenztem Polling (55-s-Schritte) |
+| Rohdaten | /tmp/t297_boot{A,A2,A3,B,B2}.log, /tmp/t297_*.json |
+| Locks/Arbitrierung | per-Karten-Locks + gpu-arb holder je Fenster gesetzt und geraeumt, fremder 9B-Boot unangetastet |
+
+### Offen
+
+- **Stufe B** (Umzug unter Last mit Delta-Nachzug) bewusst nicht gebaut —
+  erst wenn A im Betrieb Bestand hat; das Schatten-Pre-Staging der Treppe
+  (PRE_STAGE) haengt daran.
+- **C-Wiederanhebung nach Flip**: der Umzug verschiebt Bytes bei festem C;
+  den #320-Kapazitaetsgewinn (6,18x) zur Laufzeit zu heben braeuchte ein
+  wachsendes `max_total_num_tokens` (Scheduler/Allocator-Achse) oder
+  #93-VMM statt Fitted Ceiling.
+- `kv_spill`/`weightless_rank` bleiben planned-only (naechste Sprossen).
+- Erster-Leg-Exchange traegt ~50 ms NCCL-P2P-Warmup; ein Warmup-Ping beim
+  Armen wuerde ihn in die Arming-Latenz verschieben (kosmetisch bei <1 s).
+- Guards (hicache/spill/PD/weightless/dual-group) sind Verweigerungen, keine
+  Unvereinbarkeiten — je Feature ein benannter Migrationspfad offen.
