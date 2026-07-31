@@ -106,6 +106,7 @@ from sglang.srt.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    raise_on_unloaded_draft_parameters,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -853,14 +854,17 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config=model_config,
             )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, weights, target_device, model_config=None):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -882,12 +886,24 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                loaded_params = model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            loaded_params = model.load_weights(weights)
+
+        # A draft model that silently skipped parameters is the #290/#318
+        # failure mode: it loads "successfully" and then proposes noise. Checked
+        # BEFORE the quant post-processing loop, so the diagnostic names the
+        # unloaded parameters instead of a repack kernel tripping over the
+        # empty tensors they left behind.
+        if model_config is not None and getattr(model_config, "is_draft_model", False):
+            raise_on_unloaded_draft_parameters(
+                model,
+                loaded_params,
+                model_path=getattr(model_config, "model_path", ""),
+            )
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1064,7 +1080,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             return func
         return types.MethodType(func, obj)
 
-    def load_weights_and_postprocess(self, model, weights, target_device):
+    def load_weights_and_postprocess(
+        self, model, weights, target_device, model_config=None
+    ):
         """
         Initial load: Load BF16 → Record state → Apply FP8 quantization.
         Called ONCE during model initialization.
@@ -2946,7 +2964,10 @@ class IncModelLoader(DefaultModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, iter(quant_model.state_dict().items()), target_device
+                model,
+                iter(quant_model.state_dict().items()),
+                target_device,
+                model_config=model_config,
             )
         return model.eval()
 
@@ -3508,7 +3529,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config=model_config,
             )
 
         return model.eval()

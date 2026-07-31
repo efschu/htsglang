@@ -2902,7 +2902,15 @@ class ServerArgs:
     speculative_draft_model_quantization: A[
         Optional[str],
         Arg(
-            help="The quantization method for speculative model.",
+            help=(
+                "The quantization method for the speculative draft model. "
+                "Defaults to the target model's method. Pass 'unquant' to "
+                "build the drafter dense even when the checkpoint declares a "
+                "quantization method -- the escape hatch for a drafter whose "
+                "weights are stored unquantized inside a quantized checkpoint "
+                "(the draft namespace is probed automatically, so this is only "
+                "needed to override that verdict)."
+            ),
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
         ),
     ] = None
@@ -6409,6 +6417,14 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
+        #
+        # Record whether the value came from the user BEFORE the inheritance
+        # below overwrites it: the draft-side checkpoint probe (#318) only
+        # steps in where the draft inherited its method, never over an
+        # explicit choice.
+        self._speculative_draft_model_quantization_explicitly_set = (
+            self.speculative_draft_model_quantization is not None
+        )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
@@ -6420,6 +6436,15 @@ class ServerArgs:
             self._quantization_explicitly_unset = True
         else:
             self._quantization_explicitly_unset = False
+        # The draft path needs its own opt-out record. Without it "unquant" and
+        # "not given" both arrive as None -- the two cases the inheritance
+        # above has already merged -- and the flag documented as the escape
+        # hatch for a mis-quantized drafter did nothing at all: ModelConfig
+        # re-detected the method from the checkpoint's quantization_config and
+        # built the drafter quantized anyway (#318).
+        self._speculative_draft_model_quantization_explicitly_unset = (
+            self.speculative_draft_model_quantization == "unquant"
+        )
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 

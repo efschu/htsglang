@@ -1818,3 +1818,87 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
         return torch.cat(loaded_weight_pad, dim=output_dim)
     else:
         return loaded_weight
+
+
+#: Draft parameters the target hands over AFTER the load, so the draft
+#: checkpoint legitimately never carries them: `set_embed_and_head`,
+#: `set_embed_and_head_modules` and `set_lm_head_from_target` all replace these
+#: modules (or their `.weight`) with the target's once both models exist.
+_TARGET_PROVIDED_DRAFT_PARAM_FRAGMENTS = (
+    "embed_tokens.",
+    "lm_head.",
+    "embed_tokens_",
+)
+
+
+def raise_on_unloaded_draft_parameters(
+    model: torch.nn.Module,
+    loaded_params: Optional[Iterable[str]],
+    *,
+    model_path: str = "",
+) -> None:
+    """Turn silently skipped DRAFT parameters into a named error.
+
+    A checkpoint name that resolves to nothing is skipped by design (rotary
+    caches, foreign namespaces). A PARAMETER that nothing ever wrote is a
+    different thing: the drafter then runs on ``torch.empty``, proposes
+    near-random tokens, and the only symptom is an accept rate that looks like
+    a weak drafter rather than an unloaded one -- accept 1.005 both times this
+    happened.
+
+    #290 installed exactly this check, but inside ``DFlashDraftModel``, so it
+    covered one architecture. #318 hit the same wall from the other side: a
+    GPTQ-Marlin MTP skeleton fed a dense checkpoint dropped 7 projections per
+    layer behind a per-NAME ``logger.warning_once`` -- deduplicated, on the
+    checkpoint-name side, and never counted against the parameters that were
+    supposed to be filled. Hoisting the check to the loader makes it a property
+    of loading A DRAFT, not of one model class.
+
+    Only models whose ``load_weights`` REPORTS the parameters it filled are
+    checked; a model that returns ``None`` is left exactly as it was.
+    """
+    if loaded_params is None:
+        return
+    if not isinstance(loaded_params, (set, frozenset, list, tuple)):
+        return
+    loaded = {name for name in loaded_params if isinstance(name, str)}
+    if not loaded:
+        # Nothing reported at all: a load that filled everything through a
+        # different mechanism is indistinguishable from one that filled
+        # nothing, so this stays out of the raising business.
+        return
+
+    missing = sorted(
+        name
+        for name in dict(model.named_parameters())
+        if name not in loaded
+        and not any(
+            fragment in name for fragment in _TARGET_PROVIDED_DRAFT_PARAM_FRAGMENTS
+        )
+    )
+    if not missing:
+        return
+
+    shown = missing[:8]
+    message = (
+        f"Draft checkpoint {model_path or '(unknown path)'} left "
+        f"{len(missing)} parameter(s) of {type(model).__name__} unloaded: "
+        f"{shown}{' ...' if len(missing) > len(shown) else ''}. "
+        "The checkpoint's tensor names do not reach these parameters, so the "
+        "draft model would run on uninitialized weights and propose noise "
+        "(the symptom is an accept length of ~1.0, not a load error). The two "
+        "known causes are a quantization mismatch in either direction: a "
+        "packed checkpoint loaded into a model built WITHOUT a quantization "
+        "config (the stream carries `*.qweight`, the skeleton has dense "
+        "`*.weight`), or a model built WITH one over a checkpoint that stores "
+        "the draft block dense (the skeleton expects "
+        "`qweight`/`qzeros`/`scales`/`g_idx`, the file has plain `*.weight`). "
+        "Set --speculative-draft-model-quantization explicitly to pin the "
+        "side that is wrong."
+    )
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS.get():
+        logger.error("%s (SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS=1: continuing)", message)
+        return
+    raise ValueError(message)

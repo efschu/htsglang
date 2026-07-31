@@ -70,6 +70,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
     TypeVar,
     Union,
@@ -3685,6 +3686,108 @@ def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
         return False
     except Exception:
         return False
+
+
+#: Name fragments that only a quantizer writes. Generous on purpose: the
+#: consumer (:func:`checkpoint_namespace_is_dense`) turns "no marker found"
+#: into "build this namespace unquantized", so a MISSING marker is the
+#: dangerous direction and a spurious one merely costs a verdict.
+_PACKED_WEIGHT_MARKERS = (
+    "qweight",  # gptq / awq / gguf
+    "qzeros",  # gptq / awq
+    "g_idx",  # gptq with desc_act
+    "scales",  # gptq / awq / marlin (covers weight_scale* too)
+    "scale_inv",  # fp8 blockwise
+    "weight_packed",  # compressed-tensors
+    "weight_shape",  # compressed-tensors
+    "zero_point",  # compressed-tensors
+    "input_scale",  # fp8 / modelopt static activation scale
+    "absmax",  # bitsandbytes
+    "quant_map",  # bitsandbytes
+    "quant_state",  # bitsandbytes
+)
+
+
+def checkpoint_weight_names(model_path: str) -> Optional[Set[str]]:
+    """Tensor names in a safetensors checkpoint, read from headers only.
+
+    Returns ``None`` when no verdict is possible (no safetensors checkpoint at
+    that path, unreadable, a `.gguf` file, ...) so callers can distinguish
+    "nothing there" from "an empty checkpoint". Only the shard index (or, for a
+    single-file checkpoint, the few-KB header) is read; no weights are pulled.
+    Mirrors the local-dir / HF-repo handling of
+    :func:`has_fp8_weights_in_checkpoint`.
+    """
+    import json
+    import struct
+
+    try:
+        if os.path.isdir(model_path):
+
+            def _open(name):
+                return open(os.path.join(model_path, name), "rb")
+
+            def _exists(name):
+                return os.path.exists(os.path.join(model_path, name))
+
+        elif os.path.exists(model_path):
+            # A plain file (e.g. a .gguf drafter) is not a safetensors
+            # checkpoint; the caller must not read a verdict into that.
+            return None
+        else:
+            from huggingface_hub import HfFileSystem
+
+            fs = HfFileSystem()
+
+            def _open(name):
+                return fs.open(f"{model_path}/{name}", "rb")
+
+            def _exists(name):
+                return fs.exists(f"{model_path}/{name}")
+
+        if _exists("model.safetensors.index.json"):
+            with _open("model.safetensors.index.json") as f:
+                return set(json.loads(f.read()).get("weight_map", {}))
+        if _exists("model.safetensors"):
+            with _open("model.safetensors") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            return {key for key in header if key != "__metadata__"}
+        return None
+    except Exception:
+        return None
+
+
+def checkpoint_namespace_is_dense(
+    model_path: str, prefixes: Sequence[str] = ("",)
+) -> Optional[bool]:
+    """Whether the tensors under `prefixes` are stored unquantized.
+
+    ``True``  -- the namespace holds ``*.weight`` tensors and NOT ONE tensor
+                 name a quantizer would have written.
+    ``False`` -- at least one packed-weight marker is present.
+    ``None``  -- no verdict: the checkpoint is unreadable, is not safetensors,
+                 or carries no tensor under any of `prefixes`.
+
+    Task #318. GPTQModel leaves a Qwen3.5/3.6 MTP block in BF16 but does not
+    list it in ``modules_to_not_convert`` (it emits no ignore list at all), so
+    the checkpoint's own config is silent about the one namespace that differs
+    from the rest of the file. The AWQ sibling of the same base model puts
+    ``"mtp"`` in ``modules_to_not_convert`` and the FP8 one does the same; this
+    function recovers the identical fact from the index when the producer
+    omitted it.
+    """
+    names = checkpoint_weight_names(model_path)
+    if not names:
+        return None
+    scoped = [n for n in names if any(n.startswith(p) for p in prefixes)]
+    if not scoped:
+        return None
+    if any(marker in n for n in scoped for marker in _PACKED_WEIGHT_MARKERS):
+        return False
+    if not any(n.endswith(".weight") for n in scoped):
+        return None
+    return True
 
 
 def flatten_nested_list(nested_list):

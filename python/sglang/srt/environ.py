@@ -191,6 +191,11 @@ class Envs:
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
 
+    # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
+    # hard error to a log line. An unloaded drafter proposes noise, so this is
+    # a debugging escape hatch, not a supported configuration.
+    SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
