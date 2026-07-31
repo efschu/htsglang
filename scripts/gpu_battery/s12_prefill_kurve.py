@@ -263,10 +263,14 @@ def ernte_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
     Why this exists at all. The request level and the tick level answer two
     different questions and the 2026-07-30 run only ever recorded the first:
 
-    * ACCEPT was None in every one of the eight points. `meta_info` is opt-in on
-      the chat endpoint (`protocol.py` `return_meta_info: bool = False`), and
-      the accept request never asked for it. The scheduler logs `accept len` on
-      every tick no matter who asked.
+    * ACCEPT was None in every one of the eight 2026-07-30 points, because the
+      probe asked `/v1/chat/completions`, where `meta_info` is opt-in
+      (`protocol.py` `return_meta_info: bool = False`) and the request never
+      set it. Fixed in #326 by moving `_probe_accept_length` to `/generate`,
+      which carries meta_info on every response; a probe that still comes back
+      with no meta_info at all is now `accept_probe_fatal`, not a silent None.
+      The scheduler logs `accept len` on every tick no matter who asked, which
+      is why the tick source below exists independently of the probe.
     * THE RATE was the request level's: tokens of a stream over the wall clock
       of that stream, prefill and queue included. That reported 32 tok/s at
       bs=1 where the decode loop was turning over 77-83.
@@ -289,6 +293,105 @@ def ernte_ticks(server_log: str, start: float, end: float, batch: int) -> dict:
     agg = decode_tick_aggregat(im_fenster(ticks, start, end), batch)
     out.update({f"tick_{k}": v for k, v in agg.items()})
     return out
+
+
+# The accept probe hits the NATIVE /generate endpoint, not
+# /v1/chat/completions. `meta_info` is opt-in on the chat endpoint --
+# `return_meta_info: bool = False` in protocol.py -- and the 2026-07-30 run
+# never set it, so `spec_accept_length` came back None on all eight of that
+# run's arms, silently, and every ms_pro_verify derived from those arms was
+# void (task #326). `/generate` carries meta_info on every response with no
+# flag to opt into -- the same reason s14_decode_punkt.py's Stream and its
+# accept probe use it instead of the chat endpoint.
+ACCEPT_PROBE_PATH = "/generate"
+#: Named constants, not inline literals, so the marker-coupling test (#315
+#: lesson: couple assertions to the real source, never retype a literal by
+#: hand) imports these instead of guessing at the wording. A None
+#: `spec_accept_length` must always carry exactly one of these in
+#: `accept_probe_note` -- a bare None with no explanation is the silent shape
+#: that let eight void arms pass as measurements on 2026-07-30.
+ACCEPT_PROBE_NOTE_GENERATE_ERROR = "generate error: {message}"
+ACCEPT_PROBE_NOTE_NO_META_INFO = (
+    "no meta_info in /generate response -- structurally impossible on this "
+    "endpoint, treat as a probe bug, not a content result"
+)
+ACCEPT_PROBE_NOTE_NO_SPEC_ACCEPT_LENGTH = (
+    "meta_info carried no spec_accept_length (no speculative decoding on this boot)"
+)
+ACCEPT_PROBE_NOTE_EXCEPTION = "{exc_type}: {exc}"
+
+
+def _probe_accept_length(port: int, timeout: float = 180) -> dict:
+    """One bounded, non-streaming request on /generate, after the streamed
+    batch: `spec_accept_length` is the only honest accept number (never
+    `spec_ema_accept_len` from the log), and it rides on `meta_info`, which
+    `/generate` attaches to every response without an opt-in flag.
+
+    Returns a dict with:
+    * `spec_accept_length` -- the value, or None.
+    * `accept_probe_note` -- None when the value was read cleanly, otherwise
+      one of the ACCEPT_PROBE_NOTE_* constants above, naming WHY it is None.
+    * `accept_probe_fatal` -- True only for the class of bug #326 fixed: the
+      probe could not be answered at all (network/JSON failure, an `error`
+      object, or a response with no `meta_info` whatsoever -- structurally
+      impossible on this endpoint). A `meta_info` that legitimately carries
+      no spec block, because this boot runs without speculative decoding, is
+      noted but NOT fatal: that is a true absence, not a broken probe.
+    * `output_sample` -- the generated text, if any, for output_sample
+      fallback.
+    """
+    try:
+        answer = _post(
+            port,
+            ACCEPT_PROBE_PATH,
+            {
+                "text": PROSE,
+                "sampling_params": {"max_new_tokens": 64, "temperature": 0},
+            },
+            timeout=timeout,
+        )
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        return {
+            "spec_accept_length": None,
+            "accept_probe_note": ACCEPT_PROBE_NOTE_EXCEPTION.format(
+                exc_type=type(exc).__name__, exc=exc
+            ),
+            "accept_probe_fatal": True,
+            "output_sample": None,
+        }
+
+    if isinstance(answer, dict) and isinstance(answer.get("error"), dict):
+        return {
+            "spec_accept_length": None,
+            "accept_probe_note": ACCEPT_PROBE_NOTE_GENERATE_ERROR.format(
+                message=str(answer["error"].get("message"))[:200]
+            ),
+            "accept_probe_fatal": True,
+            "output_sample": None,
+        }
+
+    meta = (answer.get("meta_info") or {}) if isinstance(answer, dict) else {}
+    sample = (answer.get("text") or "")[:400] if isinstance(answer, dict) else None
+    if not meta:
+        return {
+            "spec_accept_length": None,
+            "accept_probe_note": ACCEPT_PROBE_NOTE_NO_META_INFO,
+            "accept_probe_fatal": True,
+            "output_sample": sample,
+        }
+    if "spec_accept_length" not in meta:
+        return {
+            "spec_accept_length": None,
+            "accept_probe_note": ACCEPT_PROBE_NOTE_NO_SPEC_ACCEPT_LENGTH,
+            "accept_probe_fatal": False,
+            "output_sample": sample,
+        }
+    return {
+        "spec_accept_length": meta.get("spec_accept_length"),
+        "accept_probe_note": None,
+        "accept_probe_fatal": False,
+        "output_sample": sample,
+    }
 
 
 def measure_decode(port: int, batch: int, seconds: float) -> dict:
@@ -332,30 +435,14 @@ def measure_decode(port: int, batch: int, seconds: float) -> dict:
     span = last - first
     rate = (tokens / span) if span > 0 and tokens > 0 else None
 
-    # One non-streaming request for the accept length: meta_info rides on the
-    # complete response, and spec_accept_length is the only honest accept
-    # number (never spec_ema_accept_len from the log).
-    accept = None
+    probe = _probe_accept_length(port)
+    accept = probe["spec_accept_length"]
     sample = good[0]["text"][:400]
-    try:
-        answer = _post(
-            port,
-            "/v1/chat/completions",
-            {
-                "model": "default",
-                "messages": [{"role": "user", "content": PROSE}],
-                "max_tokens": 64,
-                "temperature": 0,
-            },
-            timeout=180,
-        )
-        choice = (answer.get("choices") or [{}])[0]
-        accept = (choice.get("meta_info") or {}).get("spec_accept_length")
-        if not sample:
-            sample = ((choice.get("message") or {}).get("content") or "")[:400]
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, IndexError) as exc:
-        accept = None
-        sample = sample or f"(no answer: {type(exc).__name__}: {exc})"
+    if not sample:
+        if probe.get("output_sample"):
+            sample = probe["output_sample"]
+        elif probe.get("accept_probe_note"):
+            sample = f"(no answer: {probe['accept_probe_note']})"
 
     return {
         "batch": batch,
@@ -366,6 +453,9 @@ def measure_decode(port: int, batch: int, seconds: float) -> dict:
         "ms_pro_token": (1000.0 / rate) if rate else None,
         "ms_pro_verify": (1000.0 / rate * accept) if rate and accept else None,
         "spec_accept_length": accept,
+        # Never silently None: see ACCEPT_PROBE_NOTE_* above.
+        "accept_probe_note": probe.get("accept_probe_note"),
+        "accept_probe_fatal": probe.get("accept_probe_fatal", False),
         "output_sample": sample,
         "fehler": [r.get("fehler") for r in results if r.get("fehler")][:3],
     }
@@ -422,6 +512,21 @@ def mode_measure(args) -> int:
     if prefill.get("prefill_tok_s") is None:
         for err in prefill.get("fehler") or []:
             print(f"  error: {err}", file=sys.stderr)
+        return 1
+    # A decode point whose accept probe failed structurally (bug #326: the
+    # old probe hit /v1/chat/completions, which never attaches meta_info, so
+    # spec_accept_length was None on every arm and every ms_pro_verify derived
+    # from it was void, silently). Failing loudly here is the point of the
+    # fix: a None that could not possibly have been anything else must not
+    # pass through as a measurement.
+    fatal_decode = [d for d in decode if d.get("accept_probe_fatal")]
+    if fatal_decode:
+        for d in fatal_decode:
+            print(
+                f"  error: accept probe at bs={d.get('batch')} failed "
+                f"structurally: {d.get('accept_probe_note')}",
+                file=sys.stderr,
+            )
         return 1
     return 0
 
