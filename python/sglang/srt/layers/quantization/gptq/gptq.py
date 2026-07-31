@@ -17,11 +17,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_MIN_THREAD_K,
     check_marlin_supported,
+    check_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils.common import print_warning_once
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -96,6 +98,63 @@ def gptq_uneven_tp_block(
             groups.append(override)
     block = math.lcm(*groups, GPTQ_MARLIN_MIN_THREAD_K)
     return [block, block]
+
+
+def gptq_marlin_unpackable_reason(
+    layer: torch.nn.Module, group_size: int
+) -> Optional[str]:
+    """Why no GPTQ-Marlin weight can exist for `layer`, or None if one can.
+
+    Judged on the layer's UNSHARDED geometry (``input_size`` / ``output_size``,
+    the sizes a TP=1 load would see), which is available at
+    ``get_quant_method`` time because ``ColumnParallelLinear`` computes
+    ``output_size_per_partition`` only after ``LinearBase.__init__`` returns.
+    That is deliberate: a shard that misses Marlin's tile is a shard-plan
+    problem and must stay a loud error, while a module whose FULL output
+    dimension misses the tile could not have been packed by the producing
+    quantizer at any TP -- there is no Marlin layout for it to be in.
+
+    Task #316. Qwen3.5/3.6's gated-delta-net ships one such module in every
+    linear-attention layer: ``linear_attn.in_proj_ba``, the merged b/a
+    projection, is 5120 -> 2 x 48 = 96 outputs, and 96 is not a multiple of
+    ``GPTQ_MARLIN_MIN_THREAD_N`` (64). Every quantizer leaves it dense
+    accordingly -- the AWQ (auto-round) and FP8 siblings of the same base
+    model list ``linear_attn.in_proj_a`` / ``in_proj_b`` (FP8 also the fused
+    ``in_proj_ba``) in ``modules_to_not_convert``, and the fork's GGUF loader
+    carves it out as F32. GPTQModel emits no ignore list at all, so it just
+    writes BF16 ``in_proj_a.weight`` / ``in_proj_b.weight`` and says nothing;
+    without this check the module is built as a Marlin layer whose ``qweight``
+    no checkpoint tensor ever reaches, and ``gptq_marlin_repack`` aborts with
+    "size_n = 24 is not divisible by tile_n_size = 64" (the per-rank output
+    shards of 96 under a 3-rank uneven plan are 42/30/24).
+
+    ``block_aligned_units`` already defers this case explicitly ("Dimension is
+    not block-quantizable at all -- the quant method's own skip/validation
+    logic owns this case"); GPTQ-Marlin was the one config with no such logic.
+    ``AWQMarlinConfig.get_quant_method`` has had the shape guard since it was
+    written, but falls back to the plain AWQ kernel. GPTQ cannot do that: the
+    non-Marlin path would build a ``qweight`` for a module the checkpoint
+    stores dense, i.e. trade a hard abort for silent garbage weights.
+
+    Deliberately NOT applied to the exllama-only ``GPTQConfig``: there the
+    Marlin tile is not a constraint, so the same geometry proves nothing about
+    what the checkpoint contains.
+    """
+    from sglang.srt.layers.linear import LinearBase
+
+    if not isinstance(layer, LinearBase):
+        return None
+    supported, reason = check_marlin_supports_shape(
+        output_size_per_partition=layer.output_size,
+        input_size_per_partition=layer.input_size,
+        input_size=layer.input_size,
+        group_size=group_size,
+    )
+    if supported:
+        return None
+    # The shared message ends in TP advice that does not apply here: the whole
+    # point is that the UNSHARDED dimension is the one that misses the tile.
+    return reason.split("Consider reducing")[0].strip()
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -477,6 +536,20 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
+        # A module whose UNSHARDED geometry misses the Marlin tile has no
+        # packed representation in any GPTQ checkpoint, so it is dense on disk
+        # and must be built dense here (task #316; see
+        # gptq_marlin_unpackable_reason).
+        unpackable = gptq_marlin_unpackable_reason(layer, self.group_size)
+        if unpackable is not None:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            print_warning_once(
+                f"Layer '{prefix}' has no GPTQ-Marlin representation at any "
+                f"TP size ({unpackable} -- the UNSHARDED shape) and is kept "
+                "unquantized; the checkpoint stores it dense."
+            )
+            return UnquantizedLinearMethod()
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
         )
