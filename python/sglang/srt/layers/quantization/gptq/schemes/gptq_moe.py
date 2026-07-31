@@ -302,12 +302,33 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
+        # Task #283: the group scales must be allocated in params_dtype, not a
+        # hardcoded float16. `moe_wna16_marlin_gemm` is templated on a SINGLE
+        # scalar type taken from the activation dtype and reads `b_scales`
+        # through that same type -- a float16 scale tensor against bfloat16
+        # activations is not a slow path, it is a bit reinterpretation. Stock
+        # sglang pinned these two allocations to torch.half, so every bfloat16
+        # GPTQ MoE checkpoint (Qwen3.5-35B-A3B-GPTQ-Int4 among them) died at the
+        # first MoE forward on fused_marlin_moe's
+        # "hidden_states.dtype == w1_scale.dtype" guard, with --dtype float16 as
+        # the only workaround. The AWQ-Marlin MoE sibling that feeds the exact
+        # same kernel (awq_moe.py) has always used params_dtype here; this makes
+        # GPTQ agree with it.
+        #
+        # Numerics: for a float16 model params_dtype IS torch.half, so the
+        # allocation, the loader copy and the kernel input are unchanged
+        # bit-for-bit. For a bfloat16 model the checkpoint's float16 scales are
+        # downcast once at load (inside the weight loader's copy_), never per
+        # forward. Measured on INT4 group-128 weights: the downcast perturbs
+        # the dequantized weight by 0.167% while the INT4 grid it scales is
+        # already 11.15% off the original -- 67x smaller than the error it
+        # rides on.
         w13_scales = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
                 device=_moe_dev,
             ),
             requires_grad=False,
@@ -317,7 +338,10 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
 
         w2_scales = torch.nn.Parameter(
             torch.empty(
-                num_experts, scales_size2, hidden_size, dtype=torch.half,
+                num_experts,
+                scales_size2,
+                hidden_size,
+                dtype=params_dtype,
                 device=_moe_dev,
             ),
             requires_grad=False,

@@ -1734,11 +1734,23 @@ anderen, benannten Grund:
 |---|---|---|
 | Qwen3.6-35B-A3B-FP8 (gebrieft) | 34,89 GiB | passt nicht auf die 31,34-GiB-Lane-Karte — die Lane braucht die vollen Gewichte einmal, das ist arithmetisch aus |
 | gemma-4-26B-A4B-it-AWQ-4bit | 16,01 GiB | TP=3: 2 kv-Koepfe erzwingen REPLICATED-KV, womit Nesting nach §3.2 UNDEFINIERT ist (nicht verletzt). TP=2: der VERBAND stirbt in der Aktivierungs-Vektorbreite |
-| Qwen3.5-35B-A3B-GPTQ-Int4 | 20 GiB | der VERBAND stirbt in `moe_wna16_marlin_gemm`: `hidden_states` bf16 gegen `w1_scale` fp16 |
+| Qwen3.5-35B-A3B-GPTQ-Int4 | 20 GiB | ~~der VERBAND stirbt in `moe_wna16_marlin_gemm`: `hidden_states` bf16 gegen `w1_scale` fp16~~ — fixed by #283, see the note below |
 
 Keiner dieser drei Fehler beruehrt die Lane. Das ist die ehrliche Lesart:
 die Schalenklasse ist gebaut und in ihrer Kernbehauptung getestet, aber der
 data_ptr-Beleg an echten Expertentensoren und das Kohaerenz-Tor stehen aus.
+
+**Note (#283, 2026-07-31, English):** the third row is resolved.
+`GPTQMarlinMoEScheme.create_weights` allocated the group scales as a hardcoded
+`torch.half` instead of `params_dtype`, so a bfloat16 checkpoint's float16
+scales reached the bfloat16 kernel unconverted. The same TP=2 launch line now
+boots through with full CUDA graphs and answers two coherent completions;
+stashing the one-line fix reproduces the assertion on the same command. The
+vehicle is available for the lane bring-up again. With NEXTN it still fails,
+for an unrelated reason: #318 correctly builds the draft dense, and the dense
+draft MoE then dies in `silu_and_mul` with "hidden size must be divisible by
+vector size" under `--rank-tp-ratio 5,4` -- an uneven-TP alignment defect in
+the unquantized lane, its own ticket.
 
 **Naechster Schritt, konkret:** Qwen3.6-35B-A3B-AWQ-4bit (23,25 GiB, der
 moe_wna16-Pfad, den #83 fuer uneven TP repariert hat) bei TP=2 auf
