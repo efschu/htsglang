@@ -2693,3 +2693,21 @@ set_internal_state {"dual_group_lane_pairing": true/false} flippt die
 Policy im Boot: Policy-an- und Policy-aus-Arm teilen Boeden und Captures,
 statt Boot-zu-Boot-Varianz zu tragen. Regression: Flag aus = FIFO-Trace
 byte-identisch (hermetisch gepinnt, 19 Tests in test_lane_pairing.py).
+
+### 14.7 Karten-Funde des ersten Fensters (2026-07-31)
+
+1. **Signal-Staleness** (8bcfc94a15): Label wird beim Batch-START
+   publiziert; ein grosser Prefill-Forward laeuft ~1 s, die flache
+   100-ms-Staleness las waehrenddessen IDLE — das Signal alterte genau in
+   den Koernern aus, die es melden soll (1/11 satpicks). Fix: saettigende
+   Prefill-Koerner bleiben rows x ms_per_row aktuell (Flag, Default 1,0).
+2. **Job-Dominanz** (73d457dc97): ein 71-Token-Prompt vor 128
+   Decode-Schritten klassifizierte ueber sein NAECHSTES Korn (Prefill,
+   71 >= 64) den ganzen Job saettigend -> "queue all saturating" auf jedem
+   Pick. Fix: Pick-Label folgt der dominanten Phase, saettigend nur wenn
+   prefill_rows >= max_new_tokens x decode_step_rows (Flag, Default 12).
+
+Boot 3 (beide Fixe): Policy greift (10 Picks, 4 satpicks, 3 Umordnungen,
+1 Starvation-Override, occ_r 0,761 -> 0,864). E-Wirkung mit n=1 Fenster
+nicht von der Fenstervarianz trennbar — offener Posten. Voller Bericht in
+INTEGRATION_R3_VALIDATION (Kartenfenster 08:46-09:18 UTC).
