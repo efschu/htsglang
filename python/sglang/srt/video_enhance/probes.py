@@ -58,6 +58,15 @@ P1_STAGE_POINTS: tuple[tuple[str, Resolution, dict], ...] = (
     # a whole 4K frame pair fits at all on the smaller cards.
     ("rife", R4K, {"scale": 1.0}),
     ("rife", R4K, {"scale": 0.5}),
+    # Decode at the source sizes a request actually arrives at, and encode at
+    # the sizes the chain delivers. Both were missing from this grid, which is
+    # why the whole-chain rate table had a hole at each end and a Regime-B
+    # optimiser could not price an assignment that put decode or encode on a
+    # different card from the middle of the chain.
+    ("decode", R540P, {}),
+    ("decode", R1080P, {}),
+    ("encode", R1080P, {}),
+    ("encode", R4K, {}),
 )
 
 #: P2 boundary sizes, in MiB, from the §8.3 frame table.
@@ -293,6 +302,140 @@ def probe_resize(
     )
 
 
+def probe_encode(
+    card: str,
+    target: Resolution,
+    dtype: str,
+    iterations: int = 10,
+    backend: str = "ffmpeg",
+) -> Sample:
+    """P1 for the encode stage: ms per frame through a real encoder session.
+
+    Synthetic content, and that is a caveat rather than a detail: an encoder's
+    time per frame depends on how compressible the picture is, so a gradient
+    encodes faster than film grain. The number is therefore a floor for this
+    stage on this card, and it is comparable *between cards* -- which is what
+    a placement decision needs -- while not being a prediction for an
+    arbitrary clip.
+    """
+    import torch
+
+    from sglang.srt.video_enhance import codec
+    from sglang.srt.video_enhance.frame_math import PixelFormat
+    from sglang.srt.video_enhance.frames import Frame
+
+    torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
+    rgb = torch.rand(
+        1, 3, target.height, target.width, dtype=torch_dtype, device="cuda"
+    )
+    to_yuv = codec.ColorToYuvStage(dtype=dtype)
+    fmt = PixelFormat.RGB_FP16 if dtype == "fp16" else PixelFormat.RGB_FP32
+    (yuv_frame,) = to_yuv.process(
+        [Frame(data=rgb, resolution=target, format=fmt, index=0)]
+    )
+    encoder = codec.EncodeStage(
+        target, fps=30, codec="h264", device_id=0, backend=backend, segment_frames=1
+    )
+    counter = {"i": 0}
+
+    def once() -> None:
+        counter["i"] += 1
+        encoder.process(
+            [
+                Frame(
+                    data=yuv_frame.data,
+                    resolution=target,
+                    format=yuv_frame.format,
+                    index=counter["i"],
+                )
+            ]
+        )
+
+    try:
+        mean, stdev = _timeit(once, iterations=iterations)
+    finally:
+        closer = getattr(encoder, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - a probe must not mask its own result
+                pass
+        torch.cuda.empty_cache()
+    return Sample(
+        post="P1",
+        stage="encode",
+        card=card,
+        resolution=str(target),
+        dtype=dtype,
+        options={"backend": backend, "codec": "h264"},
+        ms_per_frame=mean,
+        ms_stdev=stdev,
+        iterations=iterations,
+        note="synthetic content; a floor for this stage, comparable across cards",
+    )
+
+
+def probe_decode(
+    card: str,
+    source: Resolution,
+    dtype: str,
+    clip: str,
+    iterations: int = 10,
+    backend: str = "ffmpeg",
+) -> Sample:
+    """P1 for the decode stage: ms per frame out of a real container.
+
+    Decode is the one stage whose cost is not a function of the card alone --
+    it is a function of the clip. The probe therefore reports which clip it
+    used, and a table built from two different clips is not internally
+    comparable on this row. The ffmpeg backend is the measured one because it
+    is the only one that can seek, which is what every multi-card shard needs.
+    """
+    import torch
+
+    from sglang.srt.video_enhance import codec
+
+    stage = codec.DecodeStage(
+        source=clip,
+        resolution=source,
+        device_id=0,
+        backend=backend,
+        frame_limit=iterations + 3,
+    )
+    frames = iter(stage)
+    # Warm the container open and the first packet out of the measurement:
+    # a probe that charged the stage for opening the file would price a
+    # 4-second clip and a 4-hour one differently for no physical reason.
+    for _ in range(3):
+        next(frames, None)
+
+    def once() -> None:
+        next(frames, None)
+
+    try:
+        mean, stdev = _timeit(once, iterations=iterations, warmup=0)
+    finally:
+        closer = getattr(stage, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - a probe must not mask its own result
+                pass
+        torch.cuda.empty_cache()
+    return Sample(
+        post="P1",
+        stage="decode",
+        card=card,
+        resolution=str(source),
+        dtype=dtype,
+        options={"backend": backend, "clip": str(clip)},
+        ms_per_frame=mean,
+        ms_stdev=stdev,
+        iterations=iterations,
+        note="clip-dependent; only comparable across cards for the same clip",
+    )
+
+
 def probe_sr(
     card: str,
     source: Resolution,
@@ -436,6 +579,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--rife-weight-dir", default=None)
     parser.add_argument("--skip-stages", default="", help="comma-separated stage names")
+    parser.add_argument(
+        "--clip",
+        default=None,
+        help="clip for the decode post; without it the decode rows are skipped",
+    )
     args = parser.parse_args(argv)
 
     # Pin before torch touches CUDA: one physical card per probe process, so a
@@ -501,6 +649,23 @@ def main(argv: list[str] | None = None) -> int:
                         args.dtype,
                         float(options["scale"]),
                         weights_dir=args.rife_weight_dir,
+                        iterations=args.iterations,
+                    )
+                elif stage == "encode":
+                    sample = probe_encode(
+                        card, resolution, args.dtype, iterations=args.iterations
+                    )
+                elif stage == "decode":
+                    if not args.clip:
+                        # No clip, no decode measurement. Skipping is right:
+                        # inventing one would put a number in the table that
+                        # no card produced.
+                        continue
+                    sample = probe_decode(
+                        card,
+                        resolution,
+                        args.dtype,
+                        args.clip,
                         iterations=args.iterations,
                     )
                 else:

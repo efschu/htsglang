@@ -99,7 +99,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "ABSENT_LINK_ASSUMED_GBS",
@@ -111,6 +111,7 @@ __all__ = [
     "PairMatrix",
     "Provenance",
     "Rate",
+    "StageRateTable",
     "allreduce_seconds",
     "apportion_cumulative",
     "apportion_largest_remainder",
@@ -123,6 +124,8 @@ __all__ = [
     "pair_matrix_from_hardware_profile",
     "reconcile_pair_matrices",
     "ring_factor",
+    "stage_rates_from_reports",
+    "stage_rates_from_samples",
 ]
 
 
@@ -969,6 +972,208 @@ def apportion_cumulative(total: int, weights: Sequence[float]) -> List[int]:
         out.append(stop - start)
         start = stop
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-stage rates: the axis a heterogeneous *pipeline* is priced on
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class StageRateTable:
+    """Measured cost of one pipeline stage on one card, at one resolution.
+
+    :class:`ComputeRates` prices a card with a single number because an LLM
+    rank runs the same kind of work throughout. A media pipeline does not: a
+    frame passes through decode, super-resolution, resize, interpolation and
+    encode, and the ratio between two cards is different for each of them.
+    That difference is the entire economic case for splitting a *stage* across
+    cards rather than splitting the frame stream -- comparative advantage
+    needs a per-stage table or it has nothing to compare.
+
+    Resolution is part of the key rather than an annotation because the same
+    stage runs at different sizes within one chain: super-resolution at the
+    source size, resize at four times it, interpolation at the target. A
+    table keyed only by (stage, card) would silently price the wrong work.
+
+    Every cell is a :class:`Rate`, so a combination nobody measured is a named
+    absence rather than a ``KeyError`` at plan time or, worse, an
+    extrapolation. The planner is allowed to know that it does not know.
+    """
+
+    #: ``(stage, card, resolution)`` -> ms per invocation.
+    cells: Mapping[Tuple[str, str, str], Rate]
+    #: Card keys, in the caller's order.
+    keys: Tuple[str, ...] = ()
+    source: str = ""
+    #: Run-to-run spread of the measurement session, if it established one.
+    #: A planner comparing two assignments whose predicted makespans differ by
+    #: less than this is choosing noise.
+    noise_floor_pct: Optional[float] = None
+
+    def rate(self, stage: str, card: str, resolution: str) -> Rate:
+        cell = self.cells.get((stage, card, str(resolution)))
+        if cell is not None:
+            return cell
+        measured = sorted(
+            res for st, cd, res in self.cells if st == stage and cd == card
+        )
+        return Rate.absent(
+            f"no measurement for stage {stage!r} on card {card!r} at "
+            f"{resolution}; measured resolutions for that pair: "
+            f"{measured or 'none'}",
+            unit="ms",
+            label=f"{stage}@{card}",
+        )
+
+    def ms(self, stage: str, card: str, resolution: str) -> float:
+        """The measured value, or :class:`AbsentRate` naming what is missing."""
+        return self.rate(stage, card, resolution).require(
+            f"{stage} on {card} at {resolution}"
+        )
+
+    @property
+    def stages(self) -> Tuple[str, ...]:
+        return tuple(sorted({stage for stage, _c, _r in self.cells}))
+
+    @property
+    def cards(self) -> Tuple[str, ...]:
+        return tuple(sorted({card for _s, card, _r in self.cells}))
+
+    def resolutions(self, stage: str) -> Tuple[str, ...]:
+        return tuple(sorted({r for s, _c, r in self.cells if s == stage}))
+
+    def absences(self) -> List[str]:
+        return [c.source for c in self.cells.values() if c.is_absent]
+
+    def coverage(self, stages: Sequence[str], cards: Sequence[str]) -> List[str]:
+        """Which (stage, card) pairs a plan would need and nobody measured.
+
+        The question a Regime-B optimiser has to ask before it starts, because
+        a stage assignment is only comparable against another if both are
+        priced from measurements. Answering it up front turns "the plan is
+        surprising" into "the plan could not have been made".
+        """
+        gaps: List[str] = []
+        for stage in stages:
+            for card in cards:
+                if not any(s == stage and c == card for s, c, _r in self.cells):
+                    gaps.append(f"{stage} on {card}")
+        return gaps
+
+    def advantage(self, stage: str, resolution: str) -> Dict[str, float]:
+        """Each card's rate for one stage, normalised to the fastest as 1.0.
+
+        Comparative advantage in the form the assignment question is actually
+        asked in: not "which card is fastest" -- that is usually the same card
+        for everything -- but "on which stage is a given card *least*
+        disadvantaged", which is what decides whether specialising beats
+        replicating.
+        """
+        measured = {
+            card: cell.value
+            for (s, card, r), cell in self.cells.items()
+            if s == stage and r == str(resolution) and not cell.is_absent
+        }
+        if not measured:
+            return {}
+        best = min(measured.values())
+        return {card: round(ms / best, 4) for card, ms in measured.items()}
+
+
+def stage_rates_from_samples(
+    samples: Iterable[Mapping],
+    *,
+    source: str = "probe_report",
+    noise_floor_pct: Optional[float] = None,
+    key_of: Optional[Mapping[str, str]] = None,
+) -> StageRateTable:
+    """Build a :class:`StageRateTable` from probe samples.
+
+    A sample is any mapping carrying ``stage``, ``card``, ``resolution`` and
+    ``ms_per_frame`` -- the shape
+    :class:`sglang.srt.video_enhance.probes.Sample` serialises to, so a
+    directory of P1 reports loads with no adapter in between.
+
+    ``key_of`` renames the card as recorded (a device name, which is not
+    unique on a rig with two identical cards) to the key the planner indexes
+    by (an NVML index or a UUID, which is). Without it the recorded string is
+    used as-is.
+
+    Repeated cells keep the **fastest** observation. A slow repeat is
+    contention or a cold cache; the floor is the closest thing a short probe
+    gets to the card's actual capability, and a planner that took the mean
+    would price every card by how busy the rig was when it was measured.
+    """
+    cells: Dict[Tuple[str, str, str], Rate] = {}
+    keys: List[str] = []
+    for sample in samples:
+        stage = sample.get("stage")
+        card = sample.get("card")
+        resolution = sample.get("resolution")
+        ms = sample.get("ms_per_frame")
+        if not stage or not card or not resolution:
+            continue
+        card = (key_of or {}).get(card, card)
+        if card not in keys:
+            keys.append(card)
+        key = (stage, card, str(resolution))
+        if ms is None or not (ms > 0.0):
+            # A non-positive or NaN cell is not a measurement. Recording it as
+            # an absence keeps it visible; recording it as a rate would hand
+            # that card an unbounded share of the work.
+            #
+            # It must not clobber a good value already recorded for this cell.
+            # A probe grid that measures a point twice and fails once has
+            # measured it -- letting the failure win would delete a real
+            # number because of a transient, and the deletion would show up
+            # later as a plan that refused to price a card it could price.
+            if key not in cells:
+                cells[key] = Rate.absent(
+                    f"probe recorded no usable time for {stage} on {card} at "
+                    f"{resolution} ({ms!r})",
+                    unit="ms",
+                    label=f"{stage}@{card}",
+                )
+            continue
+        existing = cells.get(key)
+        if existing is not None and not existing.is_absent and existing.value <= ms:
+            continue
+        cells[key] = Rate.measured(
+            float(ms), source, unit="ms", label=f"{stage}@{card}"
+        )
+    return StageRateTable(
+        cells=cells,
+        keys=tuple(keys),
+        source=source,
+        noise_floor_pct=noise_floor_pct,
+    )
+
+
+def stage_rates_from_reports(reports: Iterable[Mapping]) -> StageRateTable:
+    """Merge several probe reports -- typically one per card -- into one table.
+
+    The noise floor kept is the **largest** any contributing report declared.
+    Two cards measured in different sessions have different floors, and a
+    comparison across them is only as trustworthy as the worse one.
+    """
+    samples: List[Mapping] = []
+    floors: List[float] = []
+    sources: List[str] = []
+    for report in reports:
+        samples.extend(report.get("samples", ()))
+        floor = report.get("noise_floor_pct")
+        if floor is not None:
+            floors.append(float(floor))
+        host = report.get("host") or {}
+        name = host.get("card_name") or host.get("nvml_uuid") or "unknown"
+        sources.append(str(name))
+    table = stage_rates_from_samples(
+        samples,
+        source="probe_reports: " + ", ".join(sources) if sources else "probe_reports",
+        noise_floor_pct=max(floors) if floors else None,
+    )
+    return table
 
 
 # ---------------------------------------------------------------------------

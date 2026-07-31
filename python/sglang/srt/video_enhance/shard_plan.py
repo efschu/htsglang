@@ -109,6 +109,41 @@ class RateTable:
     ) -> "RateTable":
         return cls(StageRate(*row) for row in rows)
 
+    @classmethod
+    def from_stage_rates(
+        cls, table, *, cards: Sequence[str] | None = None
+    ) -> "RateTable":
+        """Build from the shared cost library's :class:`StageRateTable`.
+
+        This is the seam #348b left open. Until now this table was only ever
+        constructed by hand in tests -- there was no path from a measured
+        probe report into the planner at all, so every plan this module made
+        on a real rig was made from numbers a human had typed. Going through
+        ``cost_model`` means the video planner prices cards from the same
+        provenance-tagged library the LLM and diffusion planners do, and an
+        absent cell arrives as a named absence instead of as a hole that a
+        ``KeyError`` reports three frames later.
+
+        Absent cells are dropped rather than defaulted. The planner's own
+        :class:`MissingRateError` then names the miss at the point a chain
+        actually needs it, which is more useful than refusing to build a
+        table over a cell no chain in this request touches.
+        """
+        rows: list[StageRate] = []
+        by_value = {kind.value: kind for kind in StageKind}
+        for (stage, card, resolution), cell in table.cells.items():
+            if cell.is_absent:
+                continue
+            kind = by_value.get(stage)
+            if kind is None:
+                # A probe measured something this chain has no stage for.
+                # Not an error: the grid is allowed to be wider than a chain.
+                continue
+            if cards is not None and card not in cards:
+                continue
+            rows.append(StageRate(kind, card, Resolution.parse(resolution), cell.value))
+        return cls(rows)
+
     @property
     def cards(self) -> tuple[str, ...]:
         return tuple(sorted({card for _, card, _ in self._cells}))
