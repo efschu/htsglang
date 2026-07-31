@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Video-Enhance on the fly",
+  "version": "0.1.0",
+  "description": "Hand the video on this page to an htsglang video-enhance server and play the enhanced stream instead.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "video-enhance@htsglang",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "scripts": ["src/shared.js", "src/background.js"]
+  },
+  "action": {
+    "default_title": "Enhance video on the fly"
+  },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  }
+}

@@ -2,18 +2,29 @@
 # Licensed under the Apache License, Version 2.0
 """The chunked-HTTP surface of the Class-3 video-enhance tenant.
 
-Four endpoints, per DESIGN #333 §8.5:
+Per DESIGN #333 §8.5, extended by #338 for the browser-extension client:
 
-======================================  ====================================
-``POST   /v1/video/enhance``            enhance a stream, chunked response
-``GET    /v1/video/enhance/{id}``       progress, per-stage ms/frame, rings
-``DELETE /v1/video/enhance/{id}``       cancel, releasing rings and contexts
-``GET    /v1/video/engines``            what is cached, what needs a build
-======================================  ====================================
+==========================================  ================================
+``POST   /v1/video/enhance``                enhance a stream, chunked body
+``GET    /v1/video/enhance``                enhance-by-URL, same stream
+``GET    /v1/video/enhance/{id}``           progress, ms/frame, rings
+``DELETE /v1/video/enhance/{id}``           cancel, releasing rings/contexts
+``GET    /v1/video/capabilities``           what this deployment sustains
+``GET    /v1/video/tracks``                 what the muxer does per track
+``GET    /v1/video/engines``                what is cached, what needs a build
+``GET    /v1/video/liveness``               the dead-consumer timeouts
+==========================================  ================================
 
-The last one is operational, not cosmetic: an engine build is minutes long
-and exclusive on the card, so a request implying one has to say so before it
-starts rather than appearing to hang.
+``/v1/video/engines`` is operational, not cosmetic: an engine build is
+minutes long and exclusive on the card, so a request implying one has to say
+so before it starts rather than appearing to hang.
+
+Both enhance forms accept ``start_s`` and ``duration_s`` (#338): a client
+that only wants a stretch of a long source should not pay for the prefix.
+The range is resolved to frame indices once, at the HTTP surface, and reaches
+the decode stage as ``start_frame``/``frame_limit`` -- the same two knobs a
+multi-card shard already uses -- and the remuxer as an input seek on the
+source, so passthrough audio and subtitles start at the same point.
 
 Back-pressure is structural rather than configured. The response body is an
 async generator; Starlette awaits each yield until the transport has accepted
@@ -54,6 +65,7 @@ from sglang.srt.video_enhance.mux import (
     retimed_rate,
 )
 from sglang.srt.video_enhance.pipeline import PipelineExecutor
+from sglang.srt.video_enhance.probes import answer_capability, load_frontier
 from sglang.srt.video_enhance.ring import BoundedRing, OverloadPolicy, RingClosed
 from sglang.srt.video_enhance.tenant import (
     PlannedJob,
@@ -87,6 +99,180 @@ _ELEMENTARY_FORMAT: dict[str, str] = {
 }
 
 
+#: The chain configurations a client picks between by name. The browser
+#: extension (``clients/browser-extension``) offers exactly these two, and the
+#: capability endpoint reports both, so the name a user selects in a settings
+#: page and the name a measurement row is filed under are the same string.
+#:
+#: ``full_chain`` is super-resolution followed by interpolation;
+#: ``rife_only`` is interpolation alone, which is the cheap arm and the one
+#: that sustains 4K (see docs/dev/TASK_333_M2_MEASUREMENTS.md).
+CHAIN_PRESETS: dict[str, dict] = {
+    "rife_only": {
+        "enable_sr": False,
+        "enable_resize": False,
+        "fps_multiplier": 2,
+        "description": "interpolation only; source resolution preserved",
+    },
+    "full_chain": {
+        "enable_sr": True,
+        "sr_scale": 4,
+        "enable_resize": True,
+        "fps_multiplier": 2,
+        "description": "x4 super-resolution, resize to target, then interpolation",
+    },
+}
+
+
+class RangeError(ValueError):
+    """A time range that cannot be turned into a frame range."""
+
+
+class JobIdError(ValueError):
+    """A client-supplied job id that cannot be used."""
+
+
+#: Characters a client-supplied job id may contain. Deliberately narrow: the
+#: id appears in a URL path on ``DELETE`` and as a ring name in logs, and a
+#: value that has to be escaped in either place is not worth accepting.
+_JOB_ID_ALPHABET = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+JOB_ID_MAX_LENGTH = 64
+
+
+def normalize_job_id(job_id: str | None) -> str:
+    """Validate a client-supplied job id, or mint one.
+
+    A client that hands the enhance URL to something else -- a ``<video>``
+    element, a player, a download -- never sees the response headers, so it
+    cannot learn a server-minted id. Letting it name the job is what makes
+    ``DELETE /v1/video/enhance/{id}`` reachable from such a client at all;
+    without it the liveness watchdog is the *only* way a job ever ends, and
+    its ``video_stream`` timeout is 300 s.
+    """
+    if job_id is None:
+        return uuid.uuid4().hex[:16]
+    if not job_id or len(job_id) > JOB_ID_MAX_LENGTH:
+        raise JobIdError(
+            f"job_id must be 1 to {JOB_ID_MAX_LENGTH} characters (got {len(job_id)})"
+        )
+    bad = sorted(set(job_id) - _JOB_ID_ALPHABET)
+    if bad:
+        raise JobIdError(
+            f"job_id may contain only letters, digits, '-' and '_'; "
+            f"rejected {''.join(bad)!r}"
+        )
+    return job_id
+
+
+@dataclass(frozen=True)
+class TimeRange:
+    """A requested stretch of a source, resolved to decode-stage frame indices.
+
+    ``frame_limit`` is None for "to the end of the source", which is also what
+    an absent ``duration_s`` means. ``start_frame`` is an index into the
+    source timeline, not into the range, because every frame index in the
+    chain is absolute -- the same invariant the multi-card shards rely on.
+    """
+
+    start_s: float = 0.0
+    duration_s: float | None = None
+    start_frame: int = 0
+    frame_limit: int | None = None
+    frame_rate: str | None = None
+
+    @property
+    def is_whole_source(self) -> bool:
+        return self.start_frame == 0 and self.frame_limit is None
+
+    def describe(self) -> dict:
+        return {
+            "start_s": self.start_s,
+            "duration_s": self.duration_s,
+            "start_frame": self.start_frame,
+            "frame_limit": self.frame_limit,
+            "frame_rate": self.frame_rate,
+        }
+
+
+#: Whole-source range: what every request that names no range resolves to, and
+#: therefore the value that keeps the default path byte-for-byte what it was.
+WHOLE_SOURCE = TimeRange()
+
+
+def resolve_time_range(
+    *,
+    start_s: float,
+    duration_s: float | None,
+    rate: Fraction | None,
+    source_duration_s: float | None = None,
+) -> TimeRange:
+    """Turn a requested (start, duration) in seconds into a frame range.
+
+    Pure, so the validation is testable without a source, a card or a socket.
+
+    The conversion goes through :class:`~fractions.Fraction` rather than
+    float multiplication. At 24000/1001 fps a float product lands a hair
+    under or over an integer depending on the value, and the difference is a
+    whole frame at the seam -- which is the one place a viewer would see it.
+
+    A range past the end of the source is not an error: the source simply
+    ends, exactly as it does without a range. A range that *starts* past the
+    end is an error, because it can only produce an empty stream, and an
+    empty video body is indistinguishable from a broken server at the client.
+    """
+    if start_s < 0:
+        raise RangeError(f"start_s must not be negative (got {start_s})")
+    if duration_s is not None and duration_s <= 0:
+        raise RangeError(f"duration_s must be positive (got {duration_s})")
+    if not start_s and duration_s is None:
+        return WHOLE_SOURCE
+    if rate is None or rate <= 0:
+        raise RangeError(
+            "a time range needs the source frame rate: seconds cannot be "
+            "converted to frame indices without it. Pass source_frame_rate, "
+            "or use a source ffprobe can read a rate from."
+        )
+    if source_duration_s is not None and start_s >= source_duration_s:
+        raise RangeError(
+            f"start_s {start_s} is at or past the source duration "
+            f"{source_duration_s:.3f} s; the range would be empty"
+        )
+    start_frame = int(Fraction(start_s).limit_denominator(1000000) * rate)
+    frame_limit: int | None = None
+    if duration_s is not None:
+        frame_limit = int(Fraction(duration_s).limit_denominator(1000000) * rate)
+        if frame_limit < 1:
+            raise RangeError(
+                f"duration_s {duration_s} is shorter than one frame at "
+                f"{rate} fps; the range would be empty"
+            )
+    return TimeRange(
+        start_s=float(start_s),
+        duration_s=None if duration_s is None else float(duration_s),
+        start_frame=start_frame,
+        frame_limit=frame_limit,
+        frame_rate=str(rate),
+    )
+
+
+async def decode_frames(stage, source_url: str):
+    """Bind a source to the decode stage and drive it as the executor's source.
+
+    The executor wants an async iterator of frames; the decode stage is a
+    synchronous pull source. One frame per await and never running ahead, so
+    back-pressure still stops at the decoder -- the same bridge
+    ``chunk_worker._as_async`` uses inside a multi-card shard, kept here as
+    well because importing it would drag the multi-card module into the
+    single-card path.
+    """
+    stage.set_source(source_url)
+    for frame in stage:
+        yield frame
+        await asyncio.sleep(0)
+
+
 @dataclass
 class EnhanceRequestBody:
     """Parsed request body. Kept as a plain dataclass so the planning path is
@@ -117,6 +303,14 @@ class EnhanceRequestBody:
     passthrough_data: bool = True
     #: Source frame rate as "num/den". Probed when absent.
     source_frame_rate: str | None = None
+    #: #338 time range. ``start_s`` 0.0 with ``duration_s`` None is the whole
+    #: source and is the default, so a request that names no range takes
+    #: exactly the path it took before the range existed.
+    start_s: float = 0.0
+    duration_s: float | None = None
+
+    def has_time_range(self) -> bool:
+        return bool(self.start_s) or self.duration_s is not None
 
     def track_selection(self) -> TrackSelection:
         return TrackSelection(
@@ -158,6 +352,7 @@ class Job:
     created_at: float = 0.0
     source_rate: Fraction | None = None
     watchdog: ConsumerWatchdog | None = None
+    time_range: TimeRange = WHOLE_SOURCE
 
 
 class VideoEnhanceService:
@@ -192,6 +387,59 @@ class VideoEnhanceService:
         info = info if info is not None else probe(body.source_url)
         return describe_selection(info, body.track_selection())
 
+    def claim_job_id(self, job_id: str | None) -> str:
+        """Validate and reserve an id, refusing one that is already running.
+
+        Silently reusing a live id would make ``DELETE`` ambiguous -- two
+        streams, one name, and the cancel reaching whichever the registry
+        happens to hold. A finished job's id is free again; only a live one is
+        taken.
+        """
+        candidate = normalize_job_id(job_id)
+        existing = self.jobs.get(candidate)
+        if existing is not None and (existing.task is None or not existing.task.done()):
+            raise JobIdError(f"job {candidate} is already running")
+        return candidate
+
+    def resolve_range(
+        self, body: EnhanceRequestBody, info: MediaInfo | None = None
+    ) -> TimeRange:
+        """Resolve the requested time range against the source's real rate.
+
+        Called twice per ranged request on purpose: once by the endpoint, so a
+        bad range is a 422 with the arithmetic in it, and once by
+        :meth:`stream_response`. A validation failure discovered after the
+        response has begun cannot be a status code any more -- it can only be
+        a truncated video body, which at the client is indistinguishable from
+        a crashed server. The second probe is the price of that distinction.
+        """
+        if not body.has_time_range():
+            return WHOLE_SOURCE
+        rate: Fraction | None = None
+        duration_s: float | None = None
+        if body.source_frame_rate:
+            num, _, den = body.source_frame_rate.partition("/")
+            rate = Fraction(int(num), int(den or 1))
+        if info is None and rate is None:
+            try:
+                info = probe(body.source_url)
+            except MuxError as exc:
+                raise RangeError(
+                    f"a time range was requested but {body.source_url!r} could "
+                    f"not be probed for its frame rate: {exc}"
+                ) from exc
+        if info is not None:
+            duration_s = info.duration_s
+            if rate is None:
+                selection = body.track_selection()
+                rate = info.track(selection.resolve_video_index(info)).frame_rate()
+        return resolve_time_range(
+            start_s=body.start_s,
+            duration_s=body.duration_s,
+            rate=rate,
+            source_duration_s=duration_s,
+        )
+
     # -- execution --------------------------------------------------------
     async def stream_response(
         self,
@@ -201,6 +449,7 @@ class VideoEnhanceService:
         stage_factory=None,
         media_info: MediaInfo | None = None,
         remux: bool = True,
+        job_id: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Run one job and yield muxed chunks as they are produced.
 
@@ -211,13 +460,14 @@ class VideoEnhanceService:
         read when the bounded response bridge has room.
         """
         planned = self.plan(body)
-        job_id = uuid.uuid4().hex[:16]
+        time_range = self.resolve_range(body, media_info)
+        job_id = self.claim_job_id(job_id)
         bridge = BoundedRing(
             f"muxer->socket:{job_id}", RESPONSE_BRIDGE_DEPTH, body.policy()
         )
 
         remuxer, source_rate = (
-            self._make_remuxer(body, media_info) if remux else (None, None)
+            self._make_remuxer(body, media_info, time_range) if remux else (None, None)
         )
 
         if remuxer is None:
@@ -233,12 +483,20 @@ class VideoEnhanceService:
         stages = (
             stage_factory(planned.chain)
             if stage_factory is not None
-            else build_stages(self.config, planned.chain, device_id=self.device_id)
+            else build_stages(
+                self.config,
+                planned.chain,
+                device_id=self.device_id,
+                start_frame=time_range.start_frame,
+                frame_limit=time_range.frame_limit,
+            )
         )
         if source_factory is not None:
             source = source_factory(planned.chain)
         else:
-            source = stages[planned.chain.stages[0].kind].frames(body.source_url)  # type: ignore[index]
+            source = decode_frames(
+                stages[planned.chain.stages[0].kind], body.source_url
+            )
 
         executor = PipelineExecutor(
             job_id=job_id,
@@ -250,7 +508,11 @@ class VideoEnhanceService:
             policy=body.policy(),
         )
         job = Job(
-            job_id=job_id, executor=executor, planned=planned, created_at=time.time()
+            job_id=job_id,
+            executor=executor,
+            planned=planned,
+            created_at=time.time(),
+            time_range=time_range,
         )
         self.jobs[job_id] = job
 
@@ -342,6 +604,18 @@ class VideoEnhanceService:
             await watchdog.stop()
             if not job.task.done():
                 executor.cancel()
+                # Closing the chain's own rings, not just the response bridge.
+                # A client that disconnects mid-stream leaves the decode and
+                # middle stage tasks suspended in ``ring.put`` on rings nobody
+                # is draining any more, and the cancel flag is only read after
+                # that await returns -- which it never does. Without this the
+                # teardown falls through to the timeout below and holds the
+                # decoder, the encoder and the reservation for a further 30 s
+                # after the socket is already gone. The watchdog's release path
+                # and the DELETE endpoint both close the rings for exactly this
+                # reason; the disconnect path is the third way out and needs it
+                # just as much.
+                await executor.rings.close()
                 await bridge.close()
                 try:
                     await asyncio.wait_for(job.task, timeout=30)
@@ -378,7 +652,10 @@ class VideoEnhanceService:
         return tuple(claims)
 
     def _make_remuxer(
-        self, body: EnhanceRequestBody, media_info: MediaInfo | None
+        self,
+        body: EnhanceRequestBody,
+        media_info: MediaInfo | None,
+        time_range: TimeRange = WHOLE_SOURCE,
     ) -> tuple[StreamRemuxer | None, Fraction | None]:
         """Build the remuxer for this request, or None when muxing is skipped.
 
@@ -410,6 +687,8 @@ class VideoEnhanceService:
             enhanced_codec=_ELEMENTARY_FORMAT.get(body.video_codec, "h264"),
             output_rate=output_rate,
             container=body.container_format(),
+            source_seek_s=time_range.start_s,
+            source_duration_s=time_range.duration_s,
         )
         return StreamRemuxer(command), rate
 
@@ -419,9 +698,7 @@ class VideoEnhanceService:
             if callable(close):
                 try:
                     close()
-                except (
-                    Exception
-                ):  # noqa: BLE001 - one bad stage must not block the rest
+                except Exception:  # noqa: BLE001 - one bad stage must not block the rest
                     continue
 
     # -- introspection ----------------------------------------------------
@@ -435,6 +712,8 @@ class VideoEnhanceService:
         snapshot["rings"] = job.executor.rings.snapshot()
         snapshot["reserved_mib"] = job.planned.reservation.total_mib
         snapshot["max_in_flight"] = job.planned.max_in_flight
+        if not job.time_range.is_whole_source:
+            snapshot["time_range"] = job.time_range.describe()
         if job.watchdog is not None:
             snapshot["consumer"] = job.watchdog.state.snapshot()
         if job.source_rate is not None:
@@ -465,6 +744,102 @@ class VideoEnhanceService:
             except asyncio.TimeoutError:
                 job.task.cancel()
         return job.executor.stats.snapshot()
+
+    # -- capability -------------------------------------------------------
+    def capabilities(
+        self,
+        *,
+        source: Resolution | None = None,
+        target: Resolution | None = None,
+        target_fps: float | None = None,
+        configuration: str = "full_chain",
+    ) -> dict:
+        """What this deployment can actually do, separated by how it is known.
+
+        A client picking a chain preset needs two different kinds of answer
+        and they must not be confused with one another:
+
+        ``frontier``
+            measured. Rows come from probe reports on disk (P1, §8.6), so
+            "3840x2160 rife_only sustains 87.8 fps" is a number somebody
+            measured on this hardware. With no reports the frontier is empty
+            and says so; nothing is extrapolated into it.
+        ``budget``
+            arithmetic. :func:`~sglang.srt.video_enhance.tenant.plan_job` is
+            pure and needs no card, so whether a preset *fits* in the
+            configured MiB is always answerable even when no rate has ever
+            been measured. Fitting is not the same as being fast enough, and
+            the two live under different keys for exactly that reason.
+        """
+        frontier = load_frontier(self.config.measurement_dir)
+        payload: dict = {
+            "tenant_id": self.config.tenant_id,
+            "budget_mib": self.config.budget_mib,
+            "card_uuid": self.config.card_uuid,
+            "chain_presets": {
+                name: dict(preset) for name, preset in CHAIN_PRESETS.items()
+            },
+            "containers": sorted(_CONTAINER_BY_MEDIA_TYPE),
+            "video_codecs": sorted(_ELEMENTARY_FORMAT),
+            "supports_time_range": True,
+            "frontier": frontier,
+        }
+        if source is not None:
+            payload["budget"] = self._budget_answers(source, target)
+        if target_fps is not None:
+            resolution = target or source
+            if resolution is None:
+                raise ValueError(
+                    "target_fps needs a resolution to be answered against; "
+                    "pass source= or target="
+                )
+            payload["answer"] = answer_capability(
+                frontier=frontier["rows"],
+                resolution=resolution,
+                target_fps=target_fps,
+                configuration=configuration,
+            ).as_dict()
+        return payload
+
+    def _budget_answers(
+        self, source: Resolution, target: Resolution | None
+    ) -> list[dict]:
+        """Does each preset fit in the budget for this source? One row each."""
+        rows: list[dict] = []
+        for name, preset in CHAIN_PRESETS.items():
+            # A preset that neither upscales nor resizes keeps the source
+            # geometry by definition, so a requested target is not applicable
+            # to it. Feeding the target in anyway would make ``rife_only``
+            # refuse every request that also named a target -- a refusal about
+            # the caller's target, reported as if the preset did not fit.
+            upscales = preset.get("enable_sr") or preset.get("enable_resize")
+            request = ChainRequest(
+                source=source,
+                target=(target or source) if upscales else source,
+                fps_multiplier=int(preset.get("fps_multiplier", 1)),
+                enable_sr=bool(preset.get("enable_sr", False)),
+                sr_scale=int(preset.get("sr_scale", 4)),
+                enable_resize=bool(preset.get("enable_resize", False)),
+            )
+            row: dict = {"preset": name, "source": str(source)}
+            try:
+                planned = plan_job(self.config, request)
+            except (ChainError, TenantConfigError) as exc:
+                # The refusal carries the arithmetic that produced it, which is
+                # what a client needs to pick a preset that does fit.
+                rows.append({**row, "fits": False, "reason": str(exc)})
+                continue
+            rows.append(
+                {
+                    **row,
+                    "fits": True,
+                    "target": str(planned.chain.request.target),
+                    "reserved_mib": planned.reservation.total_mib,
+                    "max_in_flight": planned.max_in_flight,
+                    "stages": [s.kind.value for s in planned.chain.stages],
+                }
+            )
+        return rows
 
     def engines(self) -> dict:
         """What is cached for this card, and what a request would have to build."""
@@ -530,20 +905,41 @@ def create_app(
         passthrough_other_video: bool = True
         passthrough_data: bool = True
         source_frame_rate: str | None = None
+        start_s: float = 0.0
+        duration_s: float | None = None
+        job_id: str | None = None
+
+    def _headers(job_id: str) -> dict[str, str]:
+        """Response headers every enhance form carries.
+
+        ``X-Enhance-Job`` is the id ``DELETE`` takes. It is echoed even when
+        the client supplied it, so a client that reads headers and one that
+        cannot both end up holding the same string.
+        """
+        return {
+            "X-Enhance-Tenant": config.tenant_id,
+            "X-Enhance-Job": job_id,
+        }
 
     @app.post("/v1/video/enhance")
     async def enhance(body: Body):
-        parsed = EnhanceRequestBody(**body.model_dump())
+        payload = body.model_dump()
+        requested_id = payload.pop("job_id", None)
+        parsed = EnhanceRequestBody(**payload)
         try:
             service.plan(parsed)
-        except (ChainError, TenantConfigError) as exc:
+            service.resolve_range(parsed)
+            job_id = service.claim_job_id(requested_id)
+        except (ChainError, TenantConfigError, RangeError) as exc:
             # Refusal carries the arithmetic, so the caller can fix the request
             # rather than guess.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except JobIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StreamingResponse(
-            service.stream_response(parsed),
+            service.stream_response(parsed, job_id=job_id),
             media_type=parsed.container,
-            headers={"X-Enhance-Tenant": config.tenant_id},
+            headers=_headers(job_id),
         )
 
     @app.get("/v1/video/enhance")
@@ -560,14 +956,28 @@ def create_app(
         container: str = "video/mp4",
         overload_policy: str = "stall",
         enhance_video_index: int | None = None,
+        start_s: float = 0.0,
+        duration_s: float | None = None,
+        source_frame_rate: str | None = None,
+        job_id: str | None = None,
     ):
         """Enhance-by-URL: a GET that returns the enhanced stream.
 
         This is the primary consumption form. A player that can open an HTTP
         URL is already a client -- VLC and mpv open this endpoint directly, no
-        plugin, no filter graph, no local install. The player integrations on
-        the roadmap are convenience wrappers around this URL, not a separate
-        transport.
+        plugin, no filter graph, no local install; the browser extension in
+        ``clients/browser-extension`` puts this URL into a ``<video>`` element's
+        ``src``. The player integrations on the roadmap are convenience
+        wrappers around this URL, not a separate transport.
+
+        ``start_s`` and ``duration_s`` are the #338 time range. Both default to
+        the whole source, so an unranged request is the request this endpoint
+        has always served.
+
+        ``job_id`` lets the caller name the job it is about to start. A client
+        that puts this URL into a ``<video>`` element never sees the response
+        headers, so naming the job in the URL is the only way it can later
+        ``DELETE`` it.
         """
         parsed = EnhanceRequestBody(
             source_url=source_url,
@@ -582,15 +992,22 @@ def create_app(
             container=container,
             overload_policy=overload_policy,
             enhance_video_index=enhance_video_index,
+            start_s=start_s,
+            duration_s=duration_s,
+            source_frame_rate=source_frame_rate,
         )
         try:
             service.plan(parsed)
-        except (ChainError, TenantConfigError) as exc:
+            service.resolve_range(parsed)
+            claimed = service.claim_job_id(job_id)
+        except (ChainError, TenantConfigError, RangeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except JobIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StreamingResponse(
-            service.stream_response(parsed),
+            service.stream_response(parsed, job_id=claimed),
             media_type=parsed.container,
-            headers={"X-Enhance-Tenant": config.tenant_id},
+            headers=_headers(claimed),
         )
 
     @app.get("/v1/video/tracks")
@@ -616,10 +1033,50 @@ def create_app(
 
     @app.delete("/v1/video/enhance/{job_id}")
     async def cancel(job_id: str):
+        """Explicit abort. Returns only once the job has actually let go.
+
+        A client that can say "stop" should say it: the liveness watchdog
+        (#344b) is the backstop for clients that cannot, and its
+        ``video_stream`` timeout is a deliberately generous 300 s because a
+        paused player is a normal thing. A browser extension closing a tab
+        knows immediately, so it sends this and the card is free in
+        milliseconds rather than in five minutes.
+
+        The await before the return is the contract: rings closed, execution
+        contexts released, reservation given back. Returning earlier would let
+        the ledger admit a new job against bytes this one still holds.
+        """
         try:
             return JSONResponse(await service.cancel(job_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"no job {job_id}") from exc
+
+    @app.get("/v1/video/capabilities")
+    async def capabilities(
+        source: str | None = None,
+        target: str | None = None,
+        target_fps: float | None = None,
+        configuration: str = "full_chain",
+    ):
+        """What this deployment sustains, measured and arithmetic kept apart.
+
+        Called by a client before it offers the user a chain preset. With no
+        query parameters it is a static description: presets, containers,
+        codecs, and the measured frontier if one has been imported. With
+        ``source`` it adds the per-preset budget verdict for that source size,
+        and with ``target_fps`` the frontier answer for the requested rate.
+        """
+        try:
+            return JSONResponse(
+                service.capabilities(
+                    source=Resolution.parse(source) if source else None,
+                    target=Resolution.parse(target) if target else None,
+                    target_fps=target_fps,
+                    configuration=configuration,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/video/engines")
     async def engines():

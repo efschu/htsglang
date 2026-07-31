@@ -302,6 +302,8 @@ def build_remux_command(
     output_rate: Fraction,
     container: str = "mp4",
     enhanced_fd: str = "pipe:0",
+    source_seek_s: float = 0.0,
+    source_duration_s: float | None = None,
 ) -> list[str]:
     """ffmpeg command that muxes the enhanced elementary stream with the source.
 
@@ -310,6 +312,21 @@ def build_remux_command(
     original source, which ffmpeg opens by path or URL itself, so stdin stays
     free for the elementary stream and no extra descriptor has to be passed
     into the child.
+
+    ``source_seek_s`` and ``source_duration_s`` implement the #338 time range
+    on the passthrough side. They are *input* options on input 1 only: the
+    enhanced elementary stream arriving on stdin already contains nothing but
+    the requested range, because the decode stage was seeked to the same
+    point, so seeking input 0 as well would cut the range twice.
+
+    Timestamps are deliberately not preserved (no ``-copyts``). An input seek
+    rebases the kept tracks so the seek point becomes t=0, which is where the
+    enhanced elementary stream also starts -- that rebase is what keeps the
+    two inputs aligned. Residual skew is bounded by one packet of each copied
+    track: the kept tracks are ``-c copy`` and can only begin at a packet
+    boundary, which for 48 kHz AAC is at most 21.3 ms, while the video seek is
+    frame-accurate. A range request therefore aligns audio to within one audio
+    frame, not exactly.
     """
     enhanced_index = selection.resolve_video_index(info)
     kept = [t for t in info.tracks if selection.keeps(t, enhanced_index)]
@@ -328,6 +345,12 @@ def build_remux_command(
         enhanced_codec,
         "-i",
         enhanced_fd,
+    ]
+    if source_seek_s:
+        cmd += ["-ss", f"{float(source_seek_s):.6f}"]
+    if source_duration_s is not None:
+        cmd += ["-t", f"{float(source_duration_s):.6f}"]
+    cmd += [
         "-i",
         source_url,
         "-map",

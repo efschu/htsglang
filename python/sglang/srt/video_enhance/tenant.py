@@ -60,6 +60,12 @@ class TenantConfig:
     rife_measured_bytes_per_pair: int | None = None
     default_policy: OverloadPolicy = OverloadPolicy.STALL
     tenant_id: str = "k3-video-enhance"
+    #: Directory of probe reports (``probes.ProbeReport.to_json`` output) that
+    #: ``GET /v1/video/capabilities`` answers from. None means no measurement
+    #: has been imported, and the endpoint says so rather than inventing a
+    #: frontier: the only thing answerable without measured rates is whether a
+    #: configuration fits in the budget, not how fast it runs.
+    measurement_dir: Path | None = None
     extra: dict = field(default_factory=dict)
 
     @property
@@ -149,12 +155,19 @@ def build_stages(
     chain: Chain,
     *,
     device_id: int = 0,
+    start_frame: int = 0,
+    frame_limit: int | None = None,
 ) -> dict[StageKind, object]:
     """Instantiate the concrete stage objects for a chain.
 
     Imports are local because the codec and RIFE stages pull optional heavy
     dependencies; a host that only plans (the CPU-side feasibility check, the
     planner, the tests) must not need them.
+
+    ``start_frame`` and ``frame_limit`` are the #338 time range, resolved to
+    frame indices by the HTTP surface. They reach only the decode stage --
+    everything downstream is range-agnostic because frame indices stay
+    absolute in the source timeline.
     """
     from sglang.srt.video_enhance import codec, rife
     from sglang.srt.video_enhance.resize import ResizeStage
@@ -165,7 +178,10 @@ def build_stages(
     for spec in chain.stages:
         if spec.kind is StageKind.DECODE:
             stages[spec.kind] = codec.DecodeStage(
-                resolution=spec.in_res, device_id=device_id
+                resolution=spec.in_res,
+                device_id=device_id,
+                start_frame=start_frame,
+                frame_limit=frame_limit,
             )
         elif spec.kind is StageKind.COLOR_TO_RGB:
             stages[spec.kind] = codec.ColorToRgbStage(dtype=config.precision)

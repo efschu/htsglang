@@ -172,6 +172,46 @@ filter graph, no local install. The VapourSynth shim and the CLI named in the
 briefing are convenience wrappers around this URL and are follow-on posts, not
 M2.
 
+#### What #338 added to this endpoint
+
+The browser extension in `clients/browser-extension/` is the first client
+built on it, and it needed three things the endpoint did not have. All three
+are additive: a request that names none of them takes the path it always took.
+
+*   **`start_s` / `duration_s`** — a time range, resolved once at the HTTP
+    surface into the `start_frame` / `frame_limit` pair the decode stage
+    already had from the multi-card work, plus an input seek on the remuxer's
+    source input so the passthrough tracks start at the same point. Seconds
+    are converted to frame indices through `Fraction`: at 24000/1001 fps a
+    float product lands off by one, and one frame is exactly what is visible
+    at a seam. Audio alignment is bounded by one packet of each copied track
+    (21.3 ms for 48 kHz AAC), because the kept tracks are `-c copy` and can
+    only begin at a packet boundary while the video seek is frame-accurate.
+
+*   **`job_id`** — the caller may name the job. This is what makes
+    `DELETE /v1/video/enhance/{id}` reachable at all from the class of client
+    this endpoint exists for: a URL handed to a `<video>` element, to mpv or
+    to a download never surfaces a response header, so a server-minted id
+    cannot be learned. The id is echoed in `X-Enhance-Job` either way, and a
+    collision with a *live* job is a 409 rather than a silent reuse that would
+    make `DELETE` ambiguous.
+
+*   **`GET /v1/video/capabilities`** — what a client asks before it offers the
+    user a chain preset. It keeps two kinds of answer under two keys, because
+    conflating them is how a client comes to believe a measurement nobody
+    took. `frontier` is measured: rows come from `ProbeReport` JSON on disk
+    (§8.6 P1) through `probes.load_frontier`, carrying the card and noise
+    floor each row was measured with, and is explicitly `measured: false` with
+    a reason when no measurement directory is configured. `budget` is
+    arithmetic: `plan_job` is pure, so whether a preset *fits* in the
+    configured MiB is answerable with no card at all. Fitting is not the same
+    as being fast enough.
+
+The chain presets a client picks between (`rife_only`, `full_chain`) live in
+`server.CHAIN_PRESETS` and are mirrored in the extension's `shared.js`; a test
+compares the two field by field, so the name a user selects and the name a
+measurement row is filed under cannot drift apart.
+
 ---
 
 ## 4. Back-pressure, the gate that matters most
