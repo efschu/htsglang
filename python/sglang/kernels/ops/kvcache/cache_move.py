@@ -23,9 +23,20 @@ def set_kv_buffer_prefix_valid_tiled(
     dst_k_row_stride,
     dst_v_row_stride,
     block_size,
+    bound,
     ROW_BYTES: tl.constexpr,
     BYTES_PER_TILE: tl.constexpr,
 ):
+    """Commit-masked KV write: row ``row`` of block ``bid`` iff below its commit length.
+
+    ``bound`` (#355) is the number of destination rows this kernel may address,
+    supplied by ``kv_store_bound`` -- the same helper the raw ``store_cache``
+    path has used since #352, so the bounds of the two paths cannot drift. It
+    is a by-value scalar and therefore graph-frozen, which is why it must be
+    the buffer's VA row count rather than the pool's live ``size``. The
+    ``tl.device_assert`` is lowered only when the launch passes ``debug=True``
+    (``kv_bound_check_enabled``, default on).
+    """
     bid = tl.program_id(0)
     row = tl.program_id(1)
     tid = tl.program_id(2)
@@ -39,6 +50,9 @@ def set_kv_buffer_prefix_valid_tiled(
     tl.multiple_of(byte_off, 16)
 
     loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    tl.device_assert(
+        (loc >= 0) & (loc < bound), "set_kv_buffer_prefix_valid: loc out of range"
+    )
     src_row = bid * block_size + row
 
     src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))

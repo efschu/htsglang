@@ -171,6 +171,39 @@ def graph_safe_store_bound(live_limit: int, cache_rows: int) -> int:
     return max(int(live_limit), int(cache_rows))
 
 
+def kv_store_bound(live_limit: int, cache: torch.Tensor, row_dim: int) -> int:
+    """The single slot bound every KV writer in this module hands its kernel.
+
+    ``graph_safe_store_bound`` picks WHICH number is graph-stable; this wrapper
+    adds the one geometry conversion all the writers share, so that no writer
+    has to spell it out again. A KV buffer's addressable row count under a
+    writer that strides by ``row_dim`` is ``numel // row_dim`` -- true whether
+    the buffer is stored 3-D ``[rows, H, D]`` (per-layer pool) or already
+    flattened, and ``row_dim`` is deliberately the stride the CALLING KERNEL
+    uses, not ``self.row_dim``, so the bound describes the memory that kernel
+    can actually reach.
+
+    #352 gave the raw ``store_cache`` path a bound; #355 gave the masked Triton
+    writers the same one. They route through this function so the two cannot
+    drift: a writer growing its own bound expression is exactly the "one
+    consumer never got the treatment" defect that #345 and #352 both were.
+    ``test_kv_store_bound_unity.py`` fails if a writer stops using it.
+    """
+    return graph_safe_store_bound(live_limit, cache.numel() // row_dim)
+
+
+def kv_bound_check_enabled() -> bool:
+    """Whether the masked KV writers compile their in-kernel bound check (#355).
+
+    Passed to Triton as the per-launch ``debug`` option: on (the default) the
+    ``tl.device_assert`` lowers to a real device assert, off it lowers to
+    nothing at all, so the off-switch leaves no residual instruction to pay
+    for. Not cached in a module global -- the value is read once per launch and
+    an env lookup is orders of magnitude below the launch itself.
+    """
+    return not envs.SGLANG_DISABLE_KV_MASKED_BOUND_CHECK.get()
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -194,7 +227,7 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
-            size_limit=graph_safe_store_bound(size_limit, k_cache_rows.shape[0]),
+            size_limit=kv_store_bound(size_limit, k_cache, row_dim),
         )
 
     if _is_cpu and _cpu_has_amx_support:
@@ -230,6 +263,7 @@ def _set_kv_buffer_prefix_valid_impl(
     commit_lens: torch.Tensor,
     row_dim: int,
     store_dtype: torch.dtype,
+    size_limit: int,
 ) -> None:
     if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
         return
@@ -263,6 +297,14 @@ def _set_kv_buffer_prefix_valid_impl(
         triton.cdiv(row_bytes, bytes_per_tile),
     )
 
+    # #355: the kernel strides both destination buffers by their own row stride,
+    # so bound each by that stride and take the smaller -- one ``loc`` addresses
+    # both. Same helper as the raw store_cache path (#352), so no drift.
+    bound = min(
+        kv_store_bound(size_limit, k_cache, int(k_cache.stride(0))),
+        kv_store_bound(size_limit, v_cache, int(v_cache.stride(0))),
+    )
+
     set_kv_buffer_prefix_valid_tiled[grid](
         k,
         v,
@@ -275,10 +317,12 @@ def _set_kv_buffer_prefix_valid_impl(
         int(k_cache.stride(0) * k_cache.element_size()),
         int(v_cache.stride(0) * v_cache.element_size()),
         int(loc_2d.shape[1]),
+        bound,
         ROW_BYTES=row_bytes,
         BYTES_PER_TILE=bytes_per_tile,
         num_warps=num_warps,
         num_stages=2,
+        debug=kv_bound_check_enabled(),
     )
 
 
@@ -2250,13 +2294,20 @@ class MHATokenToKVPool(KVCache):
 
         if dcp_kv_mask is not None:
             N, H, D = cache_k.shape
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
+            # #355: the kernel addresses the buffer flat at ``loc * H * D``, so
+            # its bound is the row count under exactly that stride -- taken from
+            # the same helper the raw store_cache path uses so the two paths
+            # cannot drift apart.
             masked_set_kv_buffer_kernel[(N,)](
                 cache_k,
                 cache_v,
-                self.k_buffer[layer_id - self.start_layer],
-                self.v_buffer[layer_id - self.start_layer],
+                k_buf,
+                v_buf,
                 loc,
                 dcp_kv_mask,
+                kv_store_bound(self.size + self.page_size, k_buf, H * D),
                 N,
                 H,
                 D,
@@ -2265,6 +2316,7 @@ class MHATokenToKVPool(KVCache):
                 cache_k.stride(1),
                 cache_v.stride(0),
                 cache_v.stride(1),
+                debug=kv_bound_check_enabled(),
             )
             return
 
@@ -2412,6 +2464,9 @@ class MHATokenToKVPool(KVCache):
             commit_lens,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
+            # size + page_size = real slots + the reserved padding slot; the
+            # helper widens it to the buffer's VA row count where they differ.
+            size_limit=self.size + self.page_size,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -3927,6 +3982,7 @@ def masked_set_kv_buffer_kernel(
     v_buffer_ptr,
     loc_ptr,
     mask_ptr,
+    bound,
     N: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -3936,6 +3992,22 @@ def masked_set_kv_buffer_kernel(
     v_stride_B: tl.constexpr,
     v_stride_H: tl.constexpr,
 ):
+    """Owner-masked KV write: rank writes row ``pid`` iff ``mask[pid]``.
+
+    ``bound`` (#355) is the number of rows this kernel may address, i.e.
+    ``k_buffer.numel() // (H * D)``, supplied by ``kv_store_bound`` -- the same
+    helper the raw ``store_cache`` path uses, so the two bounds cannot drift.
+    It is a BY-VALUE scalar and therefore frozen into any CUDA graph that
+    captures this launch, which is why it has to be the buffer's VA row count
+    (stable for the graph's whole lifetime) and not the pool's live ``size``;
+    see ``graph_safe_store_bound`` for the full argument.
+
+    The check is a scalar compare against a register, guarding a write of
+    ``H * D`` elements -- but it is a ``tl.device_assert`` and therefore only
+    lowered when the launch passes ``debug=True`` (``kv_bound_check_enabled``,
+    default on). Without it an escaped compact row corrupts a live KV row
+    SILENTLY; with it the process dies naming this kernel.
+    """
     pid = tl.program_id(0)
     if pid >= N:
         return
@@ -3945,6 +4017,9 @@ def masked_set_kv_buffer_kernel(
         return
 
     loc = tl.load(loc_ptr + pid)
+    tl.device_assert(
+        (loc >= 0) & (loc < bound), "masked_set_kv_buffer: loc out of range"
+    )
     total = H * D
     num_chunks = tl.cdiv(total, CHUNK)
 

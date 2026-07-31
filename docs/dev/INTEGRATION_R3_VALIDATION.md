@@ -20060,3 +20060,103 @@ name on `APIRoute`, not a typo of ours). `mypy --ignore-missing-imports
 * **mpv and VLC plugins are a separate task.** They need nothing from this
   extension; they open the same URL. MSE re-encapsulation, the only route to
   YouTube-class sources, is explicitly out of scope and not planned here.
+
+# #355 — `masked_set_kv_buffer_kernel` hatte gar keine Index-Schranke
+
+Zweig `fix/masked-set-bound-355`, Basis `81981ff377`. Aufgabe aus dem
+#352-Audit, Posten 1 der dort registrierten offenen Punkte.
+
+## Der Defekt
+
+`masked_set_kv_buffer_kernel` (`mem_cache/memory_pool.py`) ist der Kernel,
+durch den JEDER target-seitige DCP-Schreibvorgang laeuft: auf der gewichteten
+Bahn traegt jeder Target-Write eine Owner-Maske und landet dort. Er schrieb
+nach `k_buffer_ptr + loc * H * D + idx` ohne jede Pruefung von `loc`.
+
+Geschuetzt war er nur MITTELBAR: #345 hat die kompakte Zeilenabbildung
+korrekt gemacht, also erreicht ihn heute keine Zeile ausserhalb des Bereichs.
+Eine entkommene kompakte Zeile — eine #345-Familienregression, ein falscher
+Reshard, ein Scheduler-Fehler — haette eine LEBENDE KV-Zeile still
+ueberschrieben statt am Verursacher zu scheitern. Host-seitig deckte das nur
+das per Default AUSGESCHALTETE `maybe_detect_oob` ab.
+
+## Bestandsaufnahme der Schreiber (die eigentliche Arbeit)
+
+Der #352-Befund war nicht "diesem Kernel fehlt eine Pruefung", sondern
+"niemand hat die Schreiber aufgezaehlt". Hier ist die Aufzaehlung; sie steht
+als `WRITER_AUDIT` auch im Test, damit ein NEUER Schreiber ohne Eintrag
+durchfaellt statt entdeckt zu werden.
+
+| Schreiber | Art | Schranke vorher | Schranke nachher |
+|---|---|---|---|
+| `store_cache` (`_set_kv_buffer_impl`) | roh | ja, `graph_safe_store_bound` (#352) | `kv_store_bound` |
+| `masked_set_kv_buffer_kernel` | MASKIERT (DCP-Owner) | **keine** | `kv_store_bound` + `tl.device_assert` |
+| `set_kv_buffer_prefix_valid_tiled` | MASKIERT (`commit_lens`) | **keine** | `kv_store_bound` + `tl.device_assert` |
+| `k_cache[indices] = k` (Fallback) | torch-Indexing | torchs eigener Device-Assert | unveraendert |
+| `use_hnd`-Pfad, MLA `kv_buffer[loc] =` | torch-Indexing | torchs eigener Device-Assert | unveraendert |
+| `store_cache_cpu` | CPU | — | unveraendert |
+| `copy_all_layer_kv_cache_tiled` / `_cpu` | roh (move) | nur env-gesteuertes `maybe_detect_oob` | unveraendert, registriert |
+| `move_kv_cache_native` | torch-Indexing | torchs eigener Device-Assert | unveraendert |
+| `store_cache_4d_kernel` (page-major) | roh | **keine** | unveraendert, registriert |
+| `launch_reshape_and_cache_shuffle_5d` | roh | **keine** | unveraendert, registriert |
+| `set_mla_kv_buffer_triton(_fp8_quant)` | roh (MLA) | **keine** | unveraendert, registriert |
+| `store_kv_index` / `set_index_kv_buffer` | roh (MiniMax) | **keine** | unveraendert, registriert |
+
+Umgesetzt sind die beiden MASKIERTEN Schreiber — der Auftragsumfang. Die
+restlichen vier unbeschraenkten Familien stehen unten unter "Offen"; sie
+liegen nicht auf der DCP-Decode-Bahn dieses Forks.
+
+## Mechanismus: eine Quelle, nicht zwei
+
+Zwei Pfade, die denselben Puffer mit zwei unabhaengig hingeschriebenen
+Schrankenausdruecken beschreiben, driften irgendwann auseinander, und eine
+gedriftete Schranke ist genau auf der Last falsch, die niemand getestet hat.
+Deshalb gibt es `kv_store_bound(live_limit, cache, row_dim)`:
+
+* es ruft `graph_safe_store_bound` — nach diesem Zweig der EINZIGE Aufrufer im
+  Produktivcode, ein CPU-Test prueft das repo-weit;
+* es fuegt die eine Geometrie-Umrechnung hinzu, die alle Schreiber teilen:
+  `numel // row_dim`, wobei `row_dim` bewusst die Schrittweite des AUFRUFENDEN
+  KERNELS ist (`H * D` beim maskierten Schreiber) und nicht `self.row_dim` —
+  die Schranke beschreibt damit den Speicher, den dieser Kernel wirklich
+  erreichen kann.
+
+Die Schranke ist ein By-Value-Skalar, wird also in einen CUDA-Graphen
+eingefroren — deshalb muss sie die VA-Zeilenzahl sein und nicht die lebende
+`size`. Das ist unveraendert die #352-Begruendung, jetzt an einer Stelle statt
+an dreien.
+
+Die Pruefung selbst ist `tl.device_assert((loc >= 0) & (loc < bound), "...")`,
+also die Triton-Entsprechung zu `SGL_DEVICE_ASSERT(index >= 0 && index <
+size_limit)` in `kvcache.cuh:112`. Triton senkt `device_assert` nur ab, wenn
+der Start `debug=True` mitgibt; das ist `kv_bound_check_enabled()`, DEFAULT AN.
+Mit `SGLANG_DISABLE_KV_MASKED_BOUND_CHECK=1` bleibt keine Restinstruktion
+uebrig — der Aus-Schalter ist damit auch der saubere A/B-Arm der Messung.
+
+Fehlermodus: CUDA-Device-Assert mit Datei, Zeile, Block/Thread und der
+Meldung `masked_set_kv_buffer: loc out of range`. Der Kontext ist danach tot.
+Das ist der Preis; die Alternative war eine still falsche Antwort.
+
+Nebenbefund, nicht behoben: `MHATokenToKVPoolNpu.set_kv_buffer` nimmt
+`dcp_kv_mask` entgegen und IGNORIERT es vollstaendig — auf NPU schreibt damit
+unter DCP jeder Rang jede Zeile. Eigener Posten, kein CUDA-Pfad.
+
+## Tests
+
+CPU, hermetisch, 20 Faelle
+(`test/registered/mem_cache/test_kv_store_bound_unity.py`):
+Schranken-Quelleneinheit (u.a. `graph_safe_store_bound` hat repo-weit genau
+einen Produktiv-Aufrufer, plus ein Falsifikator, der zeigt dass die
+AST-Sonde einen abweichenden Ausdruck auch wirklich meldet), Semantik von
+`kv_store_bound` (Off-Dial byte-identisch, Dial-Bahn auf die VA-Reserve,
+nie unter die lebende Schranke), Kernel-Vertrag (Parameter `bound` ist
+Laufzeitwert und kein constexpr, `tl.device_assert` vorhanden, Meldung
+benennt den Schreiber), Default-AN des Schalters, und die auf die maskierten
+Schreiber erweiterte #352-Verbraucher-Bestandsaufnahme.
+
+Regressionsfrei: `test_vram_dial.py` + `test_uneven_dcp_pool_geometry.py`
+53 Faelle gruen; `test/registered/mem_cache/` 26 passed / 10 skipped mit
+denselben 3 Setup-Errors wie auf der Basis (`TestPostCaptureKVSizing`
+braucht einen Serverstart). ruff + codespell sauber auf allen beruehrten
+Dateien.
+
