@@ -24,6 +24,17 @@ immediately with a reason, and the scheduler tries again on a later tick.
 The directory path is a flag, not a constant. Baking this rig's path into the
 tree is exactly the rig-only assumption ANALYSE #347 excludes: the protocol
 generalizes, the path does not.
+
+Card identity in these files is the NVML **UUID** (AUDIT #331). The files
+live on a persistent filesystem and are read by a process that did not write
+them, possibly after a reboot that re-enumerated the cards, so an index in
+``holder`` is not evidence about a physical card -- ``cards=0,1`` written
+before a driver reload can name two entirely different GPUs afterwards. Every
+line therefore carries ``card_uuids=`` beside ``cards=``: the UUIDs are what
+the protocol matches on, the indices stay for the operator reading the file
+with ``cat``. A legacy line with only ``cards=`` is resolved through the live
+NVML map under the stated assumption that its writer meant NVML order, and
+rewritten with UUIDs the next time this side touches the file.
 """
 
 from __future__ import annotations
@@ -63,30 +74,50 @@ def parse_free_until(text: str) -> tuple[Optional[float], set[int]]:
     An unparsable line yields ``(None, set())``, which means "no window", the
     safe direction: a window that cannot be read must not be treated as open.
     """
+    expiry, cards, _ = parse_free_until_identified(text)
+    return expiry, cards
+
+
+def parse_free_until_identified(
+    text: str,
+) -> tuple[Optional[float], set[int], list[str]]:
+    """As :func:`parse_free_until`, plus any ``card_uuids=`` the line carries.
+
+    The other side of the protocol is a shell script that may or may not have
+    been updated, so both shapes are accepted. When UUIDs are present they are
+    authoritative and the indices are decoration; when only indices are
+    present, the caller migrates them through the live map.
+    """
     line = (text or "").strip().splitlines()
     if not line:
-        return None, set()
+        return None, set(), []
     parts = line[0].split()
     if not parts:
-        return None, set()
+        return None, set(), []
     try:
         stamp = datetime.fromisoformat(parts[0].replace("Z", "+00:00"))
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         expiry = stamp.timestamp()
     except ValueError:
-        return None, set()
+        return None, set(), []
     cards: set[int] = set()
+    uuids: list[str] = []
+    all_cards = False
     for token in parts[1:]:
         key, _, value = token.partition("=")
-        if key != "cards":
-            continue
-        if value.strip().lower() in ("all", "*"):
-            return expiry, set()
-        for item in value.split(","):
-            with contextlib.suppress(ValueError):
-                cards.add(int(item.strip()))
-    return expiry, cards
+        if key == "card_uuids":
+            uuids = _split_uuids(value)
+        elif key == "cards":
+            if value.strip().lower() in ("all", "*"):
+                all_cards = True
+                continue
+            for item in value.split(","):
+                with contextlib.suppress(ValueError):
+                    cards.add(int(item.strip()))
+    if all_cards:
+        return expiry, set(), uuids
+    return expiry, cards, uuids
 
 
 def parse_holder(text: str) -> dict[str, str]:
@@ -99,6 +130,10 @@ def parse_holder(text: str) -> dict[str, str]:
     return out
 
 
+def _split_uuids(raw: str) -> list[str]:
+    return [tok for tok in (t.strip() for t in (raw or "").split(",")) if tok]
+
+
 class ArbRefused(RuntimeError):
     """The window could not be claimed. Carries the reason the operator needs."""
 
@@ -106,9 +141,18 @@ class ArbRefused(RuntimeError):
 class ArbClaim:
     """A held window. Heartbeat it, then release it."""
 
-    def __init__(self, directory: ArbDirectory, indices: Sequence[int], purpose: str):
+    def __init__(
+        self,
+        directory: ArbDirectory,
+        indices: Sequence[int],
+        purpose: str,
+        uuids: Sequence[str] = (),
+    ):
         self.directory = directory
         self.indices = tuple(sorted(indices))
+        #: The physical cards this claim is about, in the same order as
+        #: ``indices``. Empty only when NVML could not be reached at all.
+        self.uuids = tuple(uuids)
         self.purpose = purpose
         self.since = time.time()
         self._released = False
@@ -123,7 +167,9 @@ class ArbClaim:
         """
         if self._released:
             return
-        self.directory._write_holder(self.indices, self.purpose, self.since)
+        self.directory._write_holder(
+            self.indices, self.purpose, self.since, self.uuids
+        )
 
     def release(self) -> None:
         if self._released:
@@ -138,6 +184,7 @@ class ArbClaim:
     def to_json(self) -> dict[str, Any]:
         return {
             "cards": list(self.indices),
+            "card_uuids": list(self.uuids),
             "purpose": self.purpose,
             "since": _utc_now_iso(self.since),
             "released": self._released,
@@ -157,12 +204,17 @@ class ArbDirectory:
         occupancy: Optional[Callable[[Sequence[int]], dict[int, int]]] = None,
         accounted: Optional[Callable[[Sequence[int]], dict[int, int]]] = None,
         clock: Callable[[], float] = time.time,
+        identity: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.root = Path(root)
         self.session = session
         self.busy_bytes = int(busy_bytes)
         self.stale_after_s = float(stale_after_s)
         self.occupancy = occupancy or _nvml_occupancy
+        #: Live UUID <-> index resolver, rebuilt per call rather than cached:
+        #: the whole point is that the enumeration a file was written under
+        #: may no longer hold, and a cached map would reintroduce that.
+        self.identity = identity or _live_identity_map
         #: Bytes on each card that a *known* tenant legitimately holds, read
         #: from the VRAM ledger. Subtracted from the NVML reading before the
         #: busy test, because the workbench runs beside a resident serving
@@ -208,18 +260,30 @@ class ArbDirectory:
         holder_text = _read(self.holder_path)
         if holder_text:
             age = self._clock() - self.holder_path.stat().st_mtime
+            fields = parse_holder(holder_text)
+            uuids, indices, note = self._identify(
+                _split_uuids(fields.get("card_uuids", "")),
+                _indices_of(fields.get("cards", "")),
+            )
             body["holder"] = {
-                **parse_holder(holder_text),
+                **fields,
                 "age_s": round(age, 1),
                 "stale": age > self.stale_after_s,
-                "mine": parse_holder(holder_text).get("session") == self.session,
+                "mine": fields.get("session") == self.session,
+                "resolved_card_uuids": uuids,
+                "resolved_cards": indices,
+                "identity_note": note,
             }
-        expiry, cards = parse_free_until(_read(self.free_until_path))
+        expiry, cards, uuids = parse_free_until_identified(_read(self.free_until_path))
         if expiry:
+            resolved_uuids, resolved_cards, note = self._identify(uuids, sorted(cards))
             body["free_until"] = {
                 "until": _utc_now_iso(expiry),
                 "open": expiry > self._clock(),
                 "cards": sorted(cards) or "all",
+                "resolved_card_uuids": resolved_uuids,
+                "resolved_cards": resolved_cards if cards else "all",
+                "identity_note": note,
             }
         return body
 
@@ -237,14 +301,22 @@ class ArbDirectory:
             raise ArbRefused(f"arbitration directory unusable: {reason}")
         wanted = sorted(set(int(i) for i in indices))
         now = self._clock()
+        wanted_uuids, _, _ = self._identify([], wanted)
 
-        expiry, free_cards = parse_free_until(_read(self.free_until_path))
-        if expiry and expiry > now and (not free_cards or free_cards & set(wanted)):
-            raise ArbRefused(
-                f"a free window is published until {_utc_now_iso(expiry)} for "
-                f"cards {sorted(free_cards) or 'all'}; the other session may "
-                "take them without asking, so this side stays off them"
+        expiry, free_cards, free_uuids = parse_free_until_identified(
+            _read(self.free_until_path)
+        )
+        if expiry and expiry > now:
+            _, free_now, _ = self._identify(free_uuids, sorted(free_cards))
+            overlaps = (not free_cards and not free_uuids) or bool(
+                set(free_now) & set(wanted)
             )
+            if overlaps:
+                raise ArbRefused(
+                    f"a free window is published until {_utc_now_iso(expiry)} for "
+                    f"cards {sorted(free_now) or 'all'}; the other session may "
+                    "take them without asking, so this side stays off them"
+                )
 
         holder_text = _read(self.holder_path)
         if holder_text:
@@ -264,7 +336,17 @@ class ArbDirectory:
                 )
             # Stale. Orphan only if its cards are empty -- a stale holder on
             # busy cards is a working holder that forgot to touch.
-            held = _indices_of(fields.get("cards", ""))
+            #
+            # Which cards those are is resolved through the live map, not read
+            # off the line: a holder that survived a reboot names indices from
+            # the previous enumeration, and checking those would test the
+            # wrong cards for emptiness (AUDIT #331).
+            _, held, held_note = self._identify(
+                _split_uuids(fields.get("card_uuids", "")),
+                _indices_of(fields.get("cards", "")),
+            )
+            if held_note:
+                self._log(f"stale holder identity: {held_note}")
             busy = self._busy(held or wanted)
             if busy:
                 self._log(
@@ -289,10 +371,64 @@ class ArbDirectory:
                 f"holder claims them: {busy}"
             )
 
-        claim = ArbClaim(self, wanted, purpose)
-        self._write_holder(claim.indices, purpose, claim.since)
-        self._log(f"claimed cards {wanted} for {purpose}")
+        claim = ArbClaim(self, wanted, purpose, wanted_uuids)
+        self._write_holder(claim.indices, purpose, claim.since, claim.uuids)
+        self._log(
+            f"claimed cards {wanted} ({', '.join(claim.uuids) or 'uuids unresolved'}) "
+            f"for {purpose}"
+        )
         return claim
+
+    # -- identity -----------------------------------------------------------
+
+    def _identify(
+        self, uuids: Sequence[str], indices: Sequence[int]
+    ) -> tuple[list[str], list[int], str]:
+        """``(uuids, current indices, note)`` for a set of cards.
+
+        Three inputs, one answer. When ``uuids`` are given they win and the
+        indices are recomputed from the live map, which is the migration: a
+        record written under a different enumeration lands on the right cards.
+        When only ``indices`` are given the record is legacy, and they are
+        adopted under the NVML-order assumption the other side of this
+        protocol uses (its writers are ``nvidia-smi`` shell scripts). When
+        NVML cannot be reached the indices pass through unchanged and the note
+        says so -- an unreachable driver must not turn into a wrong answer.
+        """
+        wanted = [int(i) for i in indices]
+        try:
+            imap = self.identity()
+        except Exception as exc:  # noqa: BLE001 - a desk host has no NVML
+            return list(uuids), wanted, f"identity map unavailable ({exc})"
+        if imap is None:
+            return list(uuids), wanted, "identity map unavailable"
+        if uuids:
+            resolved: list[int] = []
+            missing: list[str] = []
+            for uuid in uuids:
+                card = imap.get(uuid)
+                if card is None:
+                    missing.append(uuid)
+                else:
+                    resolved.append(card.nvml_index)
+            note = (
+                f"card(s) {', '.join(missing)} named in the file are not present "
+                "on this host"
+                if missing
+                else ""
+            )
+            return list(uuids), sorted(resolved), note
+        try:
+            migrated = imap.adopt_legacy_indices(wanted, order="nvml")
+        except Exception as exc:  # noqa: BLE001 - report, never guess
+            return [], wanted, f"legacy index migration failed ({exc})"
+        note = (
+            "legacy index-only record adopted as NVML order: "
+            + ", ".join(f"{i} -> {u}" for i, u in zip(wanted, migrated))
+            if wanted
+            else ""
+        )
+        return migrated, wanted, note
 
     # -- internals ----------------------------------------------------------
 
@@ -323,11 +459,22 @@ class ArbDirectory:
                 )
         return "; ".join(offenders)
 
-    def _write_holder(self, indices: Sequence[int], purpose: str, since: float) -> None:
+    def _write_holder(
+        self,
+        indices: Sequence[int],
+        purpose: str,
+        since: float,
+        uuids: Sequence[str] = (),
+    ) -> None:
+        # Both keys, on purpose: ``card_uuids`` is what the protocol matches
+        # on and survives a re-enumeration, ``cards`` is what an operator
+        # reads at a glance. Never only the index (AUDIT #331).
         line = (
             f"session={self.session}  cards={','.join(str(i) for i in indices)}  "
-            f"purpose={purpose}  since={_utc_now_iso(since)}\n"
         )
+        if uuids:
+            line += f"card_uuids={','.join(uuids)}  "
+        line += f"purpose={purpose}  since={_utc_now_iso(since)}\n"
         with contextlib.suppress(OSError):
             self.holder_path.write_text(line, encoding="utf-8")
 
@@ -380,6 +527,15 @@ def _nvml_occupancy(indices: Sequence[int]) -> dict[int, int]:
     return out
 
 
+def _live_identity_map():
+    """The canonical resolver, built fresh. ``None`` when NVML is absent."""
+    from sglang.srt.registry import nvml
+
+    if not nvml.is_available():
+        return None
+    return nvml.identity_map()
+
+
 __all__ = [
     "ArbClaim",
     "ArbDirectory",
@@ -387,5 +543,6 @@ __all__ = [
     "DEFAULT_BUSY_BYTES",
     "DEFAULT_STALE_AFTER_S",
     "parse_free_until",
+    "parse_free_until_identified",
     "parse_holder",
 ]

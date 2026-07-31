@@ -2596,7 +2596,66 @@ def load_measured_registry(server_args) -> Optional[dict]:
     vec = data.get("mlp_vector")
     if not isinstance(vec, list) or len(vec) != server_args.tp_size:
         return None
+    if not measured_registry_cards_still_present(comps):
+        return None
     return data
+
+
+def measured_registry_cards_still_present(components: list) -> bool:
+    """Are the cards this balance was measured on the cards present now?
+
+    AUDIT #331. The registry is indexed by TP rank, and a rank is not a
+    physical card: between two boots the same rank can land on a different
+    GPU (a card pulled, ``--rank-gpu-id`` edited, CUDA re-enumerated), and the
+    stored ``device_total_bytes`` / residency balance then describes hardware
+    that is not there. Each component therefore carries the ``card_uuid`` it
+    was measured on, and a registry naming a card this host no longer has is
+    discarded rather than replayed -- a first boot re-measures in one run,
+    while a wrong total mis-sizes the KV pool silently.
+
+    Two deliberate non-failures. A component written before #331 has no
+    ``card_uuid``; it is accepted with a warning and re-stamped by the next
+    post-capture write, because rejecting every pre-existing registry would
+    throw away real measured convergence to guard against a card change that
+    probably did not happen. And an unreachable NVML accepts as well: the
+    check exists to catch a changed rig, not to make a driver hiccup lose the
+    registry.
+    """
+    stored = [
+        c.get("card_uuid") for c in components if isinstance(c, dict) and c.get("card_uuid")
+    ]
+    if not stored:
+        logger.warning(
+            "Measured KV-budget: the stored registry predates card-identity "
+            "stamping (#331), so which physical cards it was measured on "
+            "cannot be verified. Using it; the next post-capture write stamps it."
+        )
+        return True
+    try:
+        from sglang.srt.registry import nvml
+
+        if not nvml.is_available():
+            return True
+        # list_devices, not identity_map: this runs at parse time in the
+        # launcher, and the CUDA half of the map would create a context in
+        # the process that is about to fork its workers. Presence is a
+        # question about NVML alone.
+        present = {d.uuid for d in nvml.list_devices()}
+    except Exception as exc:  # noqa: BLE001 - never lose the registry to NVML
+        logger.debug("Measured KV-budget: card presence check skipped (%s)", exc)
+        return True
+    missing = sorted({u for u in stored if u not in present})
+    if missing:
+        logger.warning(
+            "Measured KV-budget: the stored registry was measured on card(s) "
+            "%s, which this host does not report any more (present: %s). "
+            "Discarding it and re-measuring rather than sizing the KV pool "
+            "against another card's total (#331).",
+            ", ".join(missing),
+            ", ".join(sorted(present)) or "none",
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

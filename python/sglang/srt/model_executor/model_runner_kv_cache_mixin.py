@@ -71,6 +71,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
+def _current_card_uuid() -> str:
+    """NVML UUID of the card this rank runs on, or ``""`` when unresolvable.
+
+    Stamped into the measured KV-budget registry so a later boot can tell
+    whether a stored per-rank balance belongs to the card that rank now sits
+    on. Never raises: an unresolvable identity degrades the registry to its
+    pre-#331 behaviour (accepted with a warning), it does not fail a boot.
+    """
+    try:
+        from sglang.srt.registry import nvml
+
+        return nvml.current_device_uuid()
+    except Exception as exc:  # noqa: BLE001 - identity is advisory here
+        logger.debug("Measured KV-budget: card identity unresolved (%s)", exc)
+        return ""
+
+
 def _should_enable_lazy_compaction() -> bool:
     """Lazy compaction default — ON unless
     `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
@@ -1227,6 +1244,14 @@ class ModelRunnerKVCacheMixin:
             - max(0, int(draft_solo_pool_bytes or 0)),
         )
         my_component = {
+            # Which physical card this rank's balance was measured on (AUDIT
+            # #331). ``device_total_bytes`` below is a property of THAT card;
+            # on a mixed rig, replaying a stored balance against a different
+            # card sizes the KV pool against the wrong total, which is the
+            # #336 defect in cached form. The rank position alone cannot say
+            # which card it was -- CUDA enumeration is not stable across
+            # boots -- so the uuid is written down and checked on read.
+            "card_uuid": _current_card_uuid(),
             "device_total_bytes": int(total_b),
             "ranks_on_gpu": int(ranks_on_gpu),
             "residual_residency_bytes": int(residual_residency_b),

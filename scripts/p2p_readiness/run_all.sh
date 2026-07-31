@@ -64,6 +64,14 @@ acquire_locks() {
             {
                 echo "holder=p2p_readiness"
                 echo "pid=$$"
+                echo "nvml_index=$i"
+                # The lock name carries an index, which stops being evidence
+                # about a physical card the moment the driver re-enumerates.
+                # The uuid is what a reader can trust (AUDIT #331).
+                echo "uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader \
+                    -i "$i" 2>/dev/null | tr -d ' ' | head -n1)"
+                echo "pci_bus_id=$(nvidia-smi --query-gpu=pci.bus_id \
+                    --format=csv,noheader -i "$i" 2>/dev/null | tr -d ' ' | head -n1)"
                 echo "acquired=$(date -Is)"
                 echo "heartbeat=$(date -Is)"
             } > "$info"

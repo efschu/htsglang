@@ -19734,3 +19734,89 @@ CUDA-Graph-Prewarm fuer registrierte kalte Engines, Cold-Tier-Kompression der
 Hibernate-Images (#306), Integrations-Boot-Matrix (#349) als stehendes
 Bug-Netz, sowie die uebrigen sieben Faktor-Kacheln (`power` und `prefix_cache`
 zuerst, `mlp_split` als teuerste).
+
+# #331 — Karten-Identitaets-Audit: UUID statt Index in allem, was den Prozess ueberlebt
+
+Branch `feat/card-identity-audit-331`, Basis b2c0fbc100. Vollstaendige
+Audit-Tabelle in `docs/dev/AUDIT_331_card_identity.md`.
+
+## Der Befund
+
+Drei Nummerierungen existieren nebeneinander und weichen auf diesem Rig
+routinemaessig voneinander ab: NVML-Index (PCI-Reihenfolge), CUDA-Ordinal
+(`FASTEST_FIRST`, danach durch `CUDA_VISIBLE_DEVICES` gefiltert) und PCI-BDF.
+Die 5090 ist hier CUDA-Ordinal 0 und NVML-Index 1 — live nachgewiesen:
+
+    uuid=GPU-5c648f96-...  nvml=0  bdf=00000000:05:00.0  RTX 3080  20480 MiB
+    uuid=GPU-31d7ef41-...  nvml=1  bdf=00000000:0A:00.0  RTX 5090  32607 MiB
+    uuid=GPU-62dbbae1-...  nvml=2  bdf=00000000:0B:00.0  RTX 3080  20480 MiB
+
+Sieben Artefakte schreiben eine Karten-Identitaet ueber eine Prozess- oder
+Boot-Grenze und lasen sie als rohen Index zurueck: der Holder und das
+`free-until` der Cross-Session-Arbitrierung, die Kartenschloesser
+`/tmp/gpu-card-N.lock`, die gemessene KV-Budget-Registry, die gespeicherten
+Planner-Profile, das Hibernate-Manifest und die `CUDA_VISIBLE_DEVICES` der
+Workbench-Tenant-Subprozesse. Alle sieben sind umgestellt.
+
+Neun weitere Artefakte waren bereits UUID-gekeyt (VRAM-Ledger, Registry-Specs
+und -Adapter, card-probe- und hw_profile-Caches, Power-Kalibrierung, die
+Hibernate-Rank-Shards) — geprueft, nicht angefasst. Fuenf bleiben
+index-gekeyt, jeweils mit benanntem Grund; der wichtigste ist der Lock-*Pfad*
+`/tmp/gpu-card-N.lock`, ueber den fuenf unabhaengige Werkzeuge arbitrieren:
+ein Name, den nur dieser Baum versteht, waere keine Arbitrierung. Der *Inhalt*
+traegt die Identitaet jetzt.
+
+## Der kanonische Helfer
+
+`registry/nvml.py` wurde erweitert, nicht dupliziert: `CardIdentity` (eine
+Karte unter allen vier Namen), `IdentityMap` (Live-Resolver in jede Richtung,
+`require()` nennt eine verschwundene Karte statt eine Nachbarkarte
+zurueckzugeben), `adopt_legacy_indices(order=...)` als Migrationspfad mit
+*explizit* benannter Annahme, und `identity_map(devices, cuda_ordinals_by_bus)`
+mit beiden Eingaben injizierbar. Die Map wird bewusst **nicht** modulweit
+gecacht — Hotplug (#329) invalidiert Snapshots, und eine gecachte Map, die
+trotzdem antwortet, waere derselbe Fehler noch einmal.
+
+Das CUDA-Ordinal zu fuellen ist **opt-in** (`allow_cuda_init=True`):
+`torch.cuda.get_device_properties` laeuft ueber `_lazy_init` und legt pro
+sichtbarer Karte einen CUDA-Kontext von einigen hundert MiB an. Die beiden
+Boot-Pfad-Pruefungen (KV-Budget-Registry, Hibernate-Manifest) umgehen die Map
+ganz und lesen `list_devices()` — sie laufen zur Parse-Zeit im Launcher, bevor
+der seine Worker forkt, und brauchen nur die UUID-Menge. Ohne diese Trennung
+haette das Audit einen CUDA-Kontext in den Elternprozess eingebaut, also genau
+die Sorte stiller Nebenwirkung, die es beseitigen soll.
+
+## Testergebnisse
+
+`test/registered/registry/test_card_identity_331.py`: 35 Tests, hermetisch,
+ohne Treiber. Jeder laeuft auf einem Rig, dessen CUDA- und NVML-Ordnung
+absichtlich auseinanderlaufen (5090 = CUDA 0 / NVML 1), plus einem
+`shuffled_map()` nach einer Re-Enumerierung und einem `map_without_5090()`.
+Eine Suite auf einem Rig, wo beide Ordnungen uebereinstimmen, waere mit dem
+Bug gruen — deshalb ist keiner dieser Tests so gebaut.
+
+Zwei Falsifikatoren belegen, dass die Tests greifen: der UUID-Zweig in
+`arb._identify` abgeschaltet -> 4 von 7 `Arb`-Tests rot; das Ordinal-Rewrite in
+`ProfileStore._resolve_card_uuids` abgeschaltet -> 2 von 6
+`ProfileStore`-Tests rot.
+
+Regression: `test/registered/{registry,workbench}`, `unit/planner`,
+`unit/distributed`, `unit/model_executor` gruen. `ruff` und `codespell` sauber
+auf allen geaenderten Dateien (die acht `ruff`-Funde in `uneven_perf.py` und
+`model_runner_kv_cache_mixin.py` sind gegen die Basis identisch vorhanden).
+Drei Ratchet-Tests (`module_state`, `legacy_global`,
+`server_args_mutation`) scheitern mit `retry() exceed maximum number of
+retries` — auf der unveraenderten Basis genauso, nicht von dieser Aenderung.
+
+## GPU-Fenster: nicht genommen
+
+Die drei Karten hielt waehrend der gesamten Arbeit `session=agent-354`
+(`#354 phase-optimal TPS`) laut `/spinning/gpu-arb/holder`. Der NVML-Teil des
+Beweises ist trotzdem echt: die Tabelle oben stammt aus
+`python -m sglang.srt.registry.nvml --map` auf dieser Maschine, mit leerem
+`CUDA_VISIBLE_DEVICES`, also reine NVML-Metadaten ohne CUDA-Kontext und ohne
+Eingriff in den fremden Lauf. Ungemessen bleibt damit genau eine Haelfte: die
+CUDA-Ordinal-Bruecke ueber die PCI-Bus-ID auf echter Hardware. Sie ist
+hermetisch getestet und spiegelt die vorhandene, im Feld benutzte Logik in
+`server_args._torch_to_nvml_gpu_index_mapping`, aber sie ist auf diesem Rig
+noch nicht gegen einen echten Treiber gelaufen.

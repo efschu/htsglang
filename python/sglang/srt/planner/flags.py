@@ -50,10 +50,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import typing
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FlagSpec",
@@ -2845,12 +2848,58 @@ DEFAULT_STORE_PATH = os.path.expanduser(
 )
 
 
+def _live_identity_map():
+    """The canonical UUID <-> ordinal resolver, or ``None`` without NVML.
+
+    ``allow_cuda_init`` because this is the one consumer that genuinely needs
+    the CUDA side: ``--rank-gpu-id`` is expressed in CUDA ordinals, so a saved
+    profile cannot be checked against the hardware without asking torch which
+    ordinal each card is now. The planner is a desk process that boots no
+    model; the cost is one CUDA context, and the alternative is relaunching a
+    server onto the wrong cards.
+    """
+    from sglang.srt.registry import nvml
+
+    if not nvml.is_available():
+        return None
+    return nvml.identity_map(allow_cuda_init=True)
+
+
+#: Where the physical identity of a profile's ``--rank-gpu-id`` cards is kept.
+#: Not a catalog flag and never passed to the server: it exists so a saved
+#: profile can be checked against the hardware it was written for.
+CARD_UUIDS_KEY = "_card_uuids"
+
+#: The settings that name physical cards as a per-rank list. Their entries are
+#: CUDA ordinals -- ``server_args`` hands ``--rank-gpu-id`` straight to
+#: ``torch.cuda`` -- so they migrate under ``order="cuda"``, not NVML order.
+#: Duplicates are meaningful (two ranks co-located on one card) and survive
+#: the round trip as duplicate UUIDs. The scalar ``base_gpu_id`` is not here:
+#: it is an offset into whatever the process can see, not a card reference.
+_CARD_INDEX_FLAGS = ("rank_gpu_id",)
+
+
 class ProfileStore:
     """A tiny JSON-backed store of user-saved :class:`Profile` objects, keyed
-    by name. No server, no locking beyond an atomic replace."""
+    by name. No server, no locking beyond an atomic replace.
 
-    def __init__(self, path: str = DEFAULT_STORE_PATH):
+    A saved profile can name physical cards (``--rank-gpu-id`` is one CUDA
+    ordinal per rank), and it is read back on a later boot -- so the ordinal
+    it stored is exactly the kind of reference AUDIT #331 removes: CUDA
+    enumeration is ``FASTEST_FIRST`` and shifts with driver state, so
+    ``0,1,1,2`` written in June can name a different card layout in August.
+    On save the store therefore resolves those ordinals to NVML UUIDs and
+    keeps them beside the settings; on load it resolves the UUIDs back to the
+    ordinals valid *now*, rewrites the profile when they moved, and raises a
+    named error when a card is simply gone. A profile saved before #331 has
+    no UUIDs, is loaded unchanged with a warning, and is stamped on its next
+    save.
+    """
+
+    def __init__(self, path: str = DEFAULT_STORE_PATH, identity=None):
         self.path = os.path.expanduser(path)
+        #: Injectable for tests; returns an ``IdentityMap`` or ``None``.
+        self.identity = identity or _live_identity_map
 
     def _read(self) -> Dict[str, dict]:
         if not os.path.exists(self.path):
@@ -2874,20 +2923,119 @@ class ProfileStore:
         by_name = self._read()
         if profile.name in by_name and not overwrite:
             raise KeyError(f"profile {profile.name!r} already exists")
-        by_name[profile.name] = profile.to_json()
+        record = profile.to_json()
+        uuids = self._stamp_card_uuids(record.get("settings") or {})
+        if uuids is not None:
+            record[CARD_UUIDS_KEY] = uuids
+        by_name[profile.name] = record
         self._write(by_name)
 
     def load(self, name: str) -> Profile:
         by_name = self._read()
         if name not in by_name:
             raise KeyError(f"unknown profile {name!r}")
-        return Profile.from_json(by_name[name])
+        record, migrated = self._resolve_card_uuids(by_name[name])
+        if migrated:
+            by_name[name] = record
+            self._write(by_name)
+        return Profile.from_json(record)
 
     def list(self) -> List[str]:
         return sorted(self._read().keys())
 
     def load_all(self) -> List[Profile]:
-        return [Profile.from_json(d) for d in self._read().values()]
+        by_name = self._read()
+        out: List[Profile] = []
+        migrated_any = False
+        for name, record in list(by_name.items()):
+            resolved, migrated = self._resolve_card_uuids(record)
+            by_name[name] = resolved
+            migrated_any = migrated_any or migrated
+            out.append(Profile.from_json(resolved))
+        if migrated_any:
+            self._write(by_name)
+        return out
+
+    # -- card identity (AUDIT #331) ----------------------------------------
+
+    def _stamp_card_uuids(self, settings: Dict[str, Any]) -> Optional[Dict[str, list]]:
+        """``{flag: [uuid, ...]}`` for every card-naming flag that is set."""
+        wanted = {
+            flag: settings[flag]
+            for flag in _CARD_INDEX_FLAGS
+            if isinstance(settings.get(flag), (list, tuple)) and settings[flag]
+        }
+        if not wanted:
+            return None
+        imap = self._identity_map()
+        if imap is None:
+            return None
+        out: Dict[str, list] = {}
+        for flag, ordinals in wanted.items():
+            try:
+                out[flag] = imap.adopt_legacy_indices(
+                    [int(v) for v in ordinals], order="cuda"
+                )
+            except Exception as exc:  # noqa: BLE001 - saving must not fail
+                logger.warning(
+                    "planner profiles: could not resolve %s=%s to card "
+                    "identities (%s); the profile is saved index-only and "
+                    "will not survive a re-enumeration (#331).",
+                    flag,
+                    ordinals,
+                    exc,
+                )
+        return out or None
+
+    def _resolve_card_uuids(self, record: dict) -> Tuple[dict, bool]:
+        """Rewrite a record's card ordinals from its stored UUIDs.
+
+        Returns ``(record, migrated)``; ``migrated`` is True when the ordinals
+        on disk no longer matched the live enumeration and the file needs
+        rewriting.
+        """
+        settings = record.get("settings") or {}
+        if not any(settings.get(flag) for flag in _CARD_INDEX_FLAGS):
+            return record, False
+        stored = record.get(CARD_UUIDS_KEY)
+        if not isinstance(stored, dict) or not stored:
+            logger.warning(
+                "planner profile %r names cards by index but predates card "
+                "identity stamping (#331); its indices are used as written "
+                "and cannot be checked against this host's cards.",
+                record.get("name"),
+            )
+            return record, False
+        imap = self._identity_map()
+        if imap is None:
+            return record, False
+        out = dict(record)
+        out["settings"] = dict(settings)
+        migrated = False
+        for flag, uuids in stored.items():
+            if not isinstance(uuids, list) or not uuids:
+                continue
+            ordinals = [imap.cuda_ordinal_of(u) for u in uuids]
+            if [int(v) for v in (settings.get(flag) or [])] != ordinals:
+                logger.warning(
+                    "planner profile %r: %s was saved as %s but those cards "
+                    "are CUDA ordinals %s now; rewriting the profile from the "
+                    "stored card identities (#331).",
+                    record.get("name"),
+                    flag,
+                    settings.get(flag),
+                    ordinals,
+                )
+                out["settings"][flag] = ordinals
+                migrated = True
+        return out, migrated
+
+    def _identity_map(self):
+        try:
+            return self.identity()
+        except Exception as exc:  # noqa: BLE001 - a desk host has no NVML
+            logger.debug("planner profiles: identity map unavailable (%s)", exc)
+            return None
 
     def delete(self, name: str) -> bool:
         by_name = self._read()

@@ -151,8 +151,15 @@ host_locks_acquire() {  # $1 = step id
     for i in $(seq 0 $((n - 1))); do
         lock="/tmp/gpu-card-$i.lock"
         if host_ssh_for 60 "mkdir $lock 2>/dev/null" >/dev/null 2>&1; then
-            host_ssh_for 60 "printf 'holder=gpu_battery_host\nstep=%s\nfrom=CT999\nacquired=%s\nheartbeat=%s\n' \
-                '$step' \"\$(date -Is)\" \"\$(date -Is)\" > $lock/info" >/dev/null 2>&1
+            # uuid/pci_bus_id are resolved on the HOST, in the host's NVML
+            # order -- the index in the lock name only means anything there
+            # (AUDIT #331; the container and the host are two namespaces with
+            # two enumerations that happen to share a lock name).
+            host_ssh_for 60 "printf 'holder=gpu_battery_host\nstep=%s\nfrom=CT999\nnvml_index=%s\nuuid=%s\npci_bus_id=%s\nacquired=%s\nheartbeat=%s\n' \
+                '$step' '$i' \
+                \"\$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i $i 2>/dev/null | tr -d ' ' | head -n1)\" \
+                \"\$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i $i 2>/dev/null | tr -d ' ' | head -n1)\" \
+                \"\$(date -Is)\" \"\$(date -Is)\" > $lock/info" >/dev/null 2>&1
             BATTERY_HOST_LOCKS+=("$lock")
         else
             info="$(host_ssh_for 60 "cat $lock/info 2>/dev/null" 2>/dev/null)"

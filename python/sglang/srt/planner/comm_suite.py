@@ -452,6 +452,15 @@ def rig_profile() -> dict:
 # ===========================================================================
 # Card window (runbook §7.1)
 # ===========================================================================
+def _live_identity_map():
+    """The canonical UUID <-> index resolver, or ``None`` without NVML."""
+    from sglang.srt.registry import nvml
+
+    if not nvml.is_available():
+        return None
+    return nvml.identity_map()
+
+
 class _CardWindow:
     """Per-card locks, taken in ascending NVML order, released together.
 
@@ -463,15 +472,28 @@ class _CardWindow:
     * the quiet flag is honored: while it exists (and is not stale), no new
       GPU-heavy phase starts. The suite's GPU arms go ``absent`` with the
       flag named rather than pushing into somebody's measurement window.
+
+    The lock *path* stays ``/tmp/gpu-card-<NVML index>.lock`` because five
+    independent tools -- this module, ``scripts/gpu_battery``,
+    ``scripts/p2p_readiness``, ``scripts/probe/*`` and the host-side battery
+    -- arbitrate through exactly that name, and a scheme only this file
+    understands would be no arbitration at all. What AUDIT #331 changes is the
+    *content*: every ``info`` file now records the ``uuid`` and ``pci_bus_id``
+    of the card the index meant when the lock was taken. A reader can then
+    tell which physical card is held, and a lock directory that outlived a
+    re-enumeration is visible as a uuid that no longer matches the card now
+    sitting at that index, instead of silently reading as "card 1 is busy".
     """
 
     OWNER = "comm-suite"
     FREE_MIB = 512
 
-    def __init__(self, indices: Sequence[int]):
+    def __init__(self, indices: Sequence[int], identity=None):
         self.indices = sorted(indices)
         self.held: List[int] = []
         self.reason: Optional[str] = None
+        self._identity = identity or _live_identity_map
+        self._map = None
 
     def _read_info(self, path: str) -> str:
         try:
@@ -480,11 +502,44 @@ class _CardWindow:
         except Exception:
             return ""
 
-    def _owner_of(self, path: str) -> str:
+    def _field_of(self, path: str, key: str) -> str:
+        prefix = f"{key}="
         for line in self._read_info(path).splitlines():
-            if line.startswith("owner="):
+            if line.startswith(prefix):
                 return line.split("=", 1)[1].strip()
-        return "unknown"
+        return ""
+
+    def _owner_of(self, path: str) -> str:
+        return self._field_of(path, "owner") or "unknown"
+
+    def _card_of(self, idx: int):
+        """The physical card behind ``idx`` right now, or ``None``."""
+        # ``None`` means not resolved yet, ``False`` means resolved to nothing
+        # (no NVML on this host). One attempt per window, not per card.
+        if self._map is None:
+            try:
+                self._map = self._identity()
+            except Exception:  # noqa: BLE001 - a desk host has no NVML
+                self._map = False
+        if not self._map:
+            return None
+        return self._map.by_nvml_index(idx)
+
+    def _held_card_note(self, path: str, idx: int) -> str:
+        """How a foreign lock's recorded card compares with the live one."""
+        recorded = self._field_of(path, "uuid")
+        card = self._card_of(idx)
+        if not recorded:
+            return (" (the lock records no card uuid, so which physical card "
+                    "it covers cannot be verified)")
+        if card is None:
+            return f" (lock names card {recorded})"
+        if card.uuid == recorded:
+            return f" (card {card.name}, {recorded})"
+        return (
+            f" (the lock names {recorded} but NVML index {idx} is now "
+            f"{card.uuid} / {card.name}: the lock outlived a re-enumeration)"
+        )
 
     def acquire(self) -> bool:
         if os.path.isdir(QUIET_LOCK_DIR):
@@ -507,7 +562,8 @@ class _CardWindow:
                 os.mkdir(path)
             except FileExistsError:
                 self.reason = (
-                    f"card {idx} is held by {self._owner_of(path)}; the GPU "
+                    f"card {idx} is held by {self._owner_of(path)}"
+                    f"{self._held_card_note(path, idx)}; the GPU "
                     f"arms need every local card at once")
                 self.release()
                 return False
@@ -515,11 +571,22 @@ class _CardWindow:
                 self.reason = f"could not take the lock for card {idx}: {e}"
                 self.release()
                 return False
+            card = self._card_of(idx)
             try:
                 with open(os.path.join(path, "info"), "w") as f:
                     f.write(
                         f"owner={self.OWNER}\n"
                         f"purpose=comm-benchmark suite (#271), GPU arms\n"
+                        f"nvml_index={idx}\n")
+                    # The durable half of the identity. The index is in the
+                    # path and in the line above; only these two survive a
+                    # re-enumeration (AUDIT #331).
+                    if card is not None:
+                        f.write(
+                            f"uuid={card.uuid}\n"
+                            f"pci_bus_id={card.pci_bus_id}\n"
+                            f"card_name={card.name}\n")
+                    f.write(
                         f"acquired={time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime())}\n")
             except Exception:
                 pass
