@@ -78,6 +78,11 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.errors import (
+    LaneUnavailable,
+    error_type_for_status,
+    openai_error_response,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -92,11 +97,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
+from sglang.srt.entrypoints.openai.registry_view import fetch_registry_view
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from sglang.srt.entrypoints.openai.serving_images import OpenAIServingImages
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_speech import OpenAIServingSpeech
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
@@ -323,6 +331,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
     )
+    # Adapters, not lanes: they forward to the diffusion / speech services when
+    # those are configured and reject with the registry's numbers when not.
+    fast_api_app.state.openai_serving_images = OpenAIServingImages()
+    fast_api_app.state.openai_serving_speech = OpenAIServingSpeech()
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
@@ -526,10 +538,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     error = ErrorResponse(
         object="error",
         message=exc.detail,
-        type=str(exc.status_code),
+        type=error_type_for_status(exc.status_code),
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    return ORJSONResponse(
+        content=error.to_openai_envelope(), status_code=exc.status_code
+    )
 
 
 # Custom exception handlers to change validation error status codes
@@ -569,13 +583,51 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     err = ErrorResponse(
         message=message,
-        type=HTTPStatus.BAD_REQUEST.phrase,
+        type=error_type_for_status(HTTPStatus.BAD_REQUEST.value),
         code=HTTPStatus.BAD_REQUEST.value,
     )
 
     return ORJSONResponse(
         status_code=400,
-        content=err.model_dump(),
+        content=err.to_openai_envelope(),
+    )
+
+
+@app.exception_handler(LaneUnavailable)
+async def lane_unavailable_handler(request: Request, exc: LaneUnavailable):
+    """A capability with no lane behind it, answered in the OpenAI error shape.
+
+    The status is the adapter's: 404 when the model genuinely is not served
+    here, 503 when a configured lane is down, 501 for an endpoint no lane
+    implements. Each maps to a distinct typed exception in the official SDKs,
+    which is the difference between a client that can retry and one that can
+    only fail.
+    """
+    return exc.to_response()
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Last resort: an OpenAI-shaped 500 instead of Starlette's plain text.
+
+    Without this, any exception raised outside a serving handler's own
+    try/except (a missing ``app.state.openai_serving_*`` attribute, for
+    instance) reaches the client as a text/plain body that no SDK can parse --
+    the client sees a decode failure rather than a server error. The detail is
+    deliberately not echoed: a 5xx message may carry a stack frame or a path.
+    """
+    logger.exception("Unhandled exception on %s", request.url.path)
+    if request.url.path.startswith("/v1/messages"):
+        return _anthropic_error_response(
+            status_code=500,
+            error_type="api_error",
+            message="Internal server error",
+        )
+    return openai_error_response(
+        "Internal server error",
+        status_code=500,
+        err_type="api_error",
+        code=500,
     )
 
 
@@ -1744,6 +1796,65 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     )
 
 
+@app.post("/v1/images/generations", dependencies=[Depends(validate_json_request)])
+async def openai_v1_images_generations(raw_request: Request):
+    """OpenAI-compatible image generation. Routed to the diffusion lane."""
+    body = await raw_request.json()
+    return await raw_request.app.state.openai_serving_images.generations(
+        body, raw_request
+    )
+
+
+@app.post("/v1/images/edits")
+async def openai_v1_images_edits(
+    raw_request: Request,
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    mask: Optional[UploadFile] = File(default=None),
+    model: Optional[str] = Form(default=None),
+    n: Optional[int] = Form(default=1),
+    size: Optional[str] = Form(default=None),
+    response_format: Optional[str] = Form(default=None),
+    user: Optional[str] = Form(default=None),
+):
+    """OpenAI-compatible image edit. Routed to the diffusion lane."""
+    files = {
+        "image": (image.filename or "image.png", await image.read(), image.content_type)
+    }
+    if mask is not None:
+        files["mask"] = (
+            mask.filename or "mask.png",
+            await mask.read(),
+            mask.content_type,
+        )
+    form = {
+        "prompt": prompt,
+        "model": model,
+        "n": n,
+        "size": size,
+        "response_format": response_format,
+        "user": user,
+    }
+    return await raw_request.app.state.openai_serving_images.edits(form, files, model)
+
+
+@app.post("/v1/images/variations")
+async def openai_v1_images_variations(
+    raw_request: Request,
+    image: UploadFile = File(...),
+    model: Optional[str] = Form(default=None),
+):
+    """OpenAI-compatible image variations. No lane implements this."""
+    return await raw_request.app.state.openai_serving_images.variations(model)
+
+
+@app.post("/v1/audio/speech", dependencies=[Depends(validate_json_request)])
+async def openai_v1_audio_speech(raw_request: Request):
+    """OpenAI-compatible text-to-speech. Routed to a speech lane when one exists."""
+    body = await raw_request.json()
+    return await raw_request.app.state.openai_serving_speech.create_speech(body)
+
+
 @app.post("/v1/audio/transcriptions")
 async def openai_v1_audio_transcriptions(
     raw_request: Request,
@@ -1759,13 +1870,14 @@ async def openai_v1_audio_transcriptions(
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
-        return ORJSONResponse(
-            content={
-                "error": {
-                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
-                }
-            },
+        return openai_error_response(
+            f"Unsupported response_format {response_format!r}: this endpoint "
+            "supports 'json', 'text' and 'verbose_json'. 'srt' and 'vtt' are "
+            "not implemented.",
             status_code=400,
+            err_type="invalid_request_error",
+            param="response_format",
+            code="unsupported_value",
         )
 
     audio_data = await file.read()
@@ -1795,60 +1907,103 @@ async def openai_v1_realtime_transcription(ws: WebSocket):
     await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
-@app.get("/v1/models", response_class=ORJSONResponse)
-async def available_models():
-    """Show available models. OpenAI-compatible endpoint."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
-    model_cards = []
-
-    # Add base model
-    for served_model_name in served_model_names:
-        model_cards.append(
-            ModelCard(
-                id=served_model_name,
-                root=served_model_name,
-                max_model_len=_global_state.tokenizer_manager.model_config.context_len,
-            )
+def _local_model_cards() -> List[ModelCard]:
+    """The models this process itself serves: the base model and its LoRAs."""
+    served_model_name = _global_state.tokenizer_manager.served_model_name
+    cards = [
+        ModelCard(
+            id=served_model_name,
+            root=served_model_name,
+            max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+            htsglang={
+                "served_by": "local",
+                "residency": "HOT",
+                "gpu_resident": True,
+            },
         )
+    ]
 
-    # Add loaded LoRA adapters
     if _global_state.tokenizer_manager.server_args.enable_lora:
         lora_registry = _global_state.tokenizer_manager.lora_registry
         for _, lora_ref in lora_registry.get_all_adapters().items():
-            model_cards.append(
+            cards.append(
                 ModelCard(
                     id=lora_ref.lora_name,
                     root=lora_ref.lora_path,
-                    parent=served_model_names[0],
+                    parent=served_model_name,
                     max_model_len=None,
+                    htsglang={
+                        "served_by": "local",
+                        "kind": "lora_adapter",
+                        "residency": "HOT",
+                        "gpu_resident": True,
+                    },
                 )
             )
+    return cards
 
-    return ModelList(data=model_cards)
+
+def _registry_model_cards(view) -> List[ModelCard]:
+    """One card per registered engine, residency reported as the registry has it.
+
+    Cold engines are listed. A registered engine is a model this deployment can
+    serve; that it currently holds no device memory is a fact about right now,
+    carried in ``x-htsglang.residency``, not a reason to pretend it does not
+    exist. Omitting it would make the listing disagree with the control plane,
+    and a client that then asks for it would get a "model not found" for a
+    model that is registered.
+    """
+    cards = []
+    for engine in view.engines:
+        extension = engine.to_extension()
+        extension["served_by"] = "registry"
+        cards.append(
+            ModelCard(id=engine.engine_id, root=engine.engine_id, htsglang=extension)
+        )
+    return cards
+
+
+@app.get("/v1/models", response_class=ORJSONResponse)
+async def available_models():
+    """Show available models. OpenAI-compatible endpoint.
+
+    Backed by the engine registry when one is configured (#305-M1): every
+    registered engine appears, each with its residency state in the namespaced
+    ``x-htsglang`` block. Without a registry this is the single served model
+    plus its LoRA adapters, exactly as before.
+    """
+    cards = _local_model_cards()
+    local_ids = {card.id for card in cards}
+
+    view = fetch_registry_view()
+    for card in _registry_model_cards(view):
+        # The locally served model is usually also a registered engine. The
+        # local card wins: this process knows its own context length and LoRAs.
+        if card.id not in local_ids:
+            cards.append(card)
+
+    return ModelList(data=cards)
 
 
 @app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
 async def retrieve_model(model: str):
     """Retrieves a model instance, providing basic information about the model."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+    for card in _local_model_cards():
+        if card.id == model:
+            return card
 
-    if model not in served_model_names:
-        return ORJSONResponse(
-            status_code=404,
-            content={
-                "error": {
-                    "message": f"The model '{model}' does not exist",
-                    "type": "invalid_request_error",
-                    "param": "model",
-                    "code": "model_not_found",
-                }
-            },
-        )
+    engine = fetch_registry_view().by_id(model)
+    if engine is not None:
+        extension = engine.to_extension()
+        extension["served_by"] = "registry"
+        return ModelCard(id=model, root=model, htsglang=extension)
 
-    return ModelCard(
-        id=model,
-        root=model,
-        max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+    return openai_error_response(
+        f"The model '{model}' does not exist",
+        status_code=404,
+        err_type="invalid_request_error",
+        param="model",
+        code="model_not_found",
     )
 
 
@@ -2022,8 +2177,14 @@ async def vertex_generate(
 
 
 def _create_error_response(e):
-    return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    # Native (non-/v1) endpoints share the OpenAI envelope: one error shape for
+    # the whole server means a client that already handles /v1 errors handles
+    # these too, and the four fields are always present rather than message-only.
+    return openai_error_response(
+        str(e),
+        status_code=HTTPStatus.BAD_REQUEST.value,
+        err_type=error_type_for_status(HTTPStatus.BAD_REQUEST.value),
+        code=HTTPStatus.BAD_REQUEST.value,
     )
 
 
@@ -2037,14 +2198,14 @@ def _create_error_response(e):
 def _admin_api_key_missing_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ) -> ORJSONResponse:
-    return ORJSONResponse(
-        content={
-            "error": (
-                "This endpoint requires admin API key, but this server was started "
-                "without one (admin-api-key). Restart with --admin-api-key to enable."
-            )
-        },
-        status_code=status_code,
+    # ``error`` is an object, never a bare string: a client that does
+    # ``body["error"]["message"]`` must not have to special-case this endpoint.
+    return openai_error_response(
+        "This endpoint requires admin API key, but this server was started "
+        "without one (admin-api-key). Restart with --admin-api-key to enable.",
+        status_code=status_code.value,
+        err_type=error_type_for_status(status_code.value),
+        code="admin_api_key_missing",
     )
 
 
@@ -2093,9 +2254,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # the manual escape hatch.
     # Read the decision the tokenizer manager already made, rather than
     # recomputing it, so the warmup and the admission check can never disagree.
-    mm_lane_refusal = getattr(
-        _global_state.tokenizer_manager, "mm_lane_refusal", None
-    )
+    mm_lane_refusal = getattr(_global_state.tokenizer_manager, "mm_lane_refusal", None)
     if is_vlm and mm_lane_refusal is not None:
         logger.warning(
             "Boot warmup: using a TEXT warmup instead of the image one, because "

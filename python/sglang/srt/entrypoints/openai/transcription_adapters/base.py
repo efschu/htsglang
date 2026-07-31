@@ -147,6 +147,22 @@ def register_transcription_adapter(
     return decorator
 
 
+def matched_adapter_key(architectures: List[str]) -> Optional[str]:
+    """The registry key an architecture matches, or ``None`` for no match.
+
+    ``resolve_adapter`` falls back to Whisper for anything unrecognised, which
+    is right for a model family it merely does not know by name and wrong for a
+    plain text LLM: the fallback makes ``/v1/audio/transcriptions`` answer with
+    fluent nonsense instead of refusing. Callers that need to know which of the
+    two happened ask here.
+    """
+    for arch in architectures or []:
+        for key in _ADAPTER_REGISTRY:
+            if key in arch:
+                return key
+    return None
+
+
 def resolve_adapter(architectures: List[str]) -> TranscriptionAdapter:
     """Pick the right adapter by matching architecture names against the registry."""
     for arch in architectures or []:

@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from sglang.srt.entrypoints.openai.errors import parse_error_body
+
 # Safety timeout for all HTTP requests to prevent CI from hanging forever.
 _REQUEST_TIMEOUT = 60
 
@@ -86,9 +88,10 @@ class WaitingTimeoutMixin:
             error_count = 0
             for future in as_completed(futures):
                 result = future.result()
-                if result.get("object") == "error":
+                error = parse_error_body(result) if "error" in result else {}
+                if error:
                     error_count += 1
-                    self.assertEqual(result["code"], 503)
+                    self.assertEqual(error["code"], 503)
 
             self.assertEqual(error_count, 1)
             self.assertIsNone(self.process.poll())
@@ -138,7 +141,8 @@ class RunningTimeoutTwoWaveMixin:
 
             for future in as_completed(futures1 + futures2):
                 result = future.result()
-                if result.get("object") == "error":
-                    self.assertEqual(result["code"], 503)
+                error = parse_error_body(result) if "error" in result else {}
+                if error:
+                    self.assertEqual(error["code"], 503)
 
         self.assertIsNone(self.process.poll())

@@ -396,11 +396,9 @@ def _verify_genereate_responses(
 
         # Check error message content or fields' existence based on status code
         if got_status != 200:
-            assert got_json["object"] == "error"
-            assert got_json["message"] == expected_err_msg
+            assert got_json["error"]["message"] == expected_err_msg
         else:
-            assert "object" not in got_json
-            assert "message" not in got_json
+            assert "error" not in got_json
 
         # Collect e2e latencies for scheduling validation
         e2e_latencies.append(

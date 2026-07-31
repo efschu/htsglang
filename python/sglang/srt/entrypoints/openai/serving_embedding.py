@@ -24,6 +24,32 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
 
+#: The two values OpenAI's ``encoding_format`` takes. Anything else is a
+#: client bug and is rejected rather than silently downgraded to floats.
+_SUPPORTED_ENCODING_FORMATS = frozenset({"float", "base64"})
+
+
+def encode_embedding(
+    embedding: List[float], encoding_format: str
+) -> Union[List[float], str]:
+    """Render one embedding in the requested wire format.
+
+    ``base64`` is little-endian float32, which is what OpenAI emits and
+    therefore what every client decoder assumes -- ``numpy.frombuffer(
+    base64.b64decode(s), dtype="float32")`` is the canonical read side, and it
+    is wrong for any other width or byte order. float32 also halves the body
+    against the float-list form, which is the reason clients ask for it.
+    """
+    if encoding_format != "base64":
+        return embedding
+    import base64  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    return base64.b64encode(np.asarray(embedding, dtype="<f4").tobytes()).decode(
+        "utf-8"
+    )
+
 
 class OpenAIServingEmbedding(OpenAIServingBase):
     """Handler for v1/embeddings requests"""
@@ -41,6 +67,15 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        if request.encoding_format not in _SUPPORTED_ENCODING_FORMATS:
+            # Rejecting beats silently returning floats for a caller that asked
+            # for base64: a client that decodes the answer would get garbage,
+            # and one that does not would never learn its request was ignored.
+            return (
+                f"Unsupported encoding_format {request.encoding_format!r}; "
+                f"expected one of {sorted(_SUPPORTED_ENCODING_FORMATS)}"
+            )
+
         if not (input := request.input):
             return "Input cannot be empty"
 
@@ -254,10 +289,16 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_embedding_response(ret)
+        response = self._build_embedding_response(
+            ret, encoding_format=request.encoding_format
+        )
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
+    def _build_embedding_response(
+        self,
+        ret: List[Dict[str, Any]],
+        encoding_format: str = "float",
+    ) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0
@@ -265,7 +306,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         for idx, ret_item in enumerate(ret):
             embedding_objects.append(
                 EmbeddingObject(
-                    embedding=ret_item["embedding"],
+                    embedding=encode_embedding(ret_item["embedding"], encoding_format),
                     index=idx,
                 )
             )

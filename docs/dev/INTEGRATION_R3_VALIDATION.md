@@ -18659,3 +18659,120 @@ korrekt ausgenommen, dcp_size=1).
   Armen wuerde ihn in die Arming-Latenz verschieben (kosmetisch bei <1 s).
 - Guards (hicache/spill/PD/weightless/dual-group) sind Verweigerungen, keine
   Unvereinbarkeiten — je Feature ein benannter Migrationspfad offen.
+
+## #335-M0: die OpenAI-Oberfläche als Adapterschicht, mit dem echten SDK gefahren (CPU-only, 2026-07-31)
+
+Basis `5406414926`, Zweig `feat/openai-surface-335`. Kein Kartenfenster: die
+Engine ist gemockt, alles davor ist echt. `CUDA_VISIBLE_DEVICES=99` für jeden
+Lauf.
+
+### Was die Bestandsaufnahme ergab
+
+Die Oberfläche war breiter als erwartet — Chat, Completions, Embeddings,
+Responses, Rerank, Score, Classify, Tokenize, Transcriptions, Realtime-ASR,
+dazu Ollama- und Anthropic-Emulation existieren bereits. Gefehlt haben nicht
+Endpunkte, sondern Protokolltreue an vier Stellen, und die vierte ist die
+teuerste:
+
+1. **Fehlerkörper flach statt eingebettet.** `OpenAIServingBase.
+   create_error_response` schrieb `{"object": "error", "message": ...,
+   "type": ..., "code": ...}` auf die Leitung — für jeden Endpunkt außer
+   `/v1/responses` und `/v1/messages`, die es schon richtig machten. Der
+   Streaming-Pfad derselben Endpunkte war dagegen korrekt eingebettet, das
+   heißt derselbe Endpunkt antwortete je nach `stream` in zwei Formen. Das ist
+   der eine Befund, der jeden Fremdclient trifft: `body["error"]["message"]`
+   ist das, was die SDKs lesen.
+2. **`encoding_format` war ein totes Feld.** Deklariert in
+   `EmbeddingRequest`, nirgends gelesen. Das ist schlimmer als es klingt: das
+   offizielle `openai`-Paket setzt `encoding_format="base64"` **von sich aus**,
+   wenn der Aufrufer nichts angibt (`openai/resources/embeddings.py`), und
+   dekodiert die Antwort mit `np.frombuffer(..., dtype="float32")`. Der
+   Standardpfad jedes Python-Clients hat also base64 angefordert und
+   Float-Listen bekommen.
+3. **`/v1/models` kannte die Registry nicht.** Die Kontrollebene aus #305-M1
+   läuft als eigener Dienst; die Serving-Oberfläche hat sie nie gelesen. Ein
+   registrierter, kalter Motor war über die API unsichtbar.
+4. **`/v1/audio/transcriptions` hat gelogen.** `resolve_adapter` fällt für
+   jede unbekannte Architektur auf Whisper zurück. Ein reines Text-LLM hat den
+   Endpunkt also bedient und flüssigen Text geliefert, der mit dem Audio
+   nichts zu tun hat — der schlimmstmögliche Fehlermodus, weil er wie ein
+   Ergebnis aussieht.
+
+Kein Stub für `/v1/files` und `/v1/fine_tuning/*`: die gehören zu #341 (D3),
+und ein 404 auf einen Endpunkt, den es nicht gibt, ist ehrlicher als eine
+Job-ID, die nie läuft.
+
+### Was gebaut wurde
+
+| Endpunkt | Status |
+|---|---|
+| `/v1/models`, `/v1/models/{id}` | Registry-gestützt, Residenz im `x-htsglang`-Block |
+| `/v1/embeddings` | `base64` implementiert, unbekanntes Format wird abgelehnt |
+| `/v1/images/generations`, `/edits` | neu: Weiterleitung an `multimodal_gen` |
+| `/v1/images/variations` | neu: 501, kein Lane implementiert das |
+| `/v1/audio/speech` | neu: 404 mit benannter fehlender Fähigkeit (TTS ist #333 M5) |
+| `/v1/audio/transcriptions` | Architektur-Prüfung statt stiller Whisper-Rückfall |
+| alle Fehlerpfade | OpenAI-Umschlag `{"error": {...}}`, Typ aus dem Statuscode |
+| `Exception`-Handler | neu: 5xx kommt als JSON statt als Klartext von Starlette |
+| `system_fingerprint`, `completion_tokens_details` | ergänzt (Spec-Felder, die fehlten) |
+
+Die Bild- und Sprachadapter leiten weiter oder lehnen strukturiert ab — sie
+implementieren nichts selbst. Drei Statuscodes, absichtlich unterschieden:
+`404` das Modell wird hier nicht bedient, `503` ein konfigurierter Lane
+antwortet nicht (wiederholbar), `501` kein Lane implementiert den Endpunkt.
+
+### Was die Umstellung des Fehlerkörpers sonst noch berührt hat
+
+Vier interne Leser der flachen Form mussten mit: `encode_receiver.py` (zwei
+Stellen, Fehlermeldungen vom Encoder-Server), `abort_timeout_kit.py`,
+`test_priority_scheduling.py`, `test_openai_server.py`. Für die Server-zu-
+Server-Richtung liegt jetzt `parse_error_body()` bereit, das beide Formen
+liest — bei einem rollenden Neustart reden die beiden Enden kurzzeitig
+verschiedene Fassungen, und das kostet eine Zeile statt eines leeren
+Fehlertexts. Die Anthropic-Emulation konnte schon beides (`payload.get("error",
+payload)`) und blieb unverändert.
+
+### Testergebnisse
+
+Alles CPU, alles gegen einen **echten uvicorn auf einem echten Port**, gefahren
+mit dem echten `openai`-Paket (2.6.1, war bereits im venv — `protocol.py`
+importiert ohnehin `openai.types.responses`). Gemockt ist ausschließlich
+`TokenizerManager.generate_request`; Routing, Exception-Handler, Serving-
+Klassen, Protokollmodelle, SSE-Rahmen und Alias-Serialisierung sind echt.
+`ServerArgs` im Harness ist eine echte Instanz, kein Mock — ein gemocktes
+`server_args` liefert für jedes unbekannte Flag ein wahrheitswertiges Mock und
+treibt damit still den falschen Zweig (genau das ist beim Bau zweimal
+passiert, sichtbar an falschen Streaming-Deltas).
+
+```
+test/registered/openai_server/basic/test_openai_sdk_surface.py   24 passed
+test/registered/unit/entrypoints/openai/test_surface_335.py      18 passed
+test/registered/unit/entrypoints/ (Regression, gesamt)          299 passed, 36 subtests
+ruff check (geänderte Dateien)     22 Befunde == Baseline, kein neuer
+codespell (geänderte Dateien)      sauber
+```
+
+Mit echtem SDK abgedeckt (live gegen den Server, nur Engine gemockt):
+`models.list`, `models.retrieve` (+ `NotFoundError`), `chat.completions`
+streamend und nicht-streamend inkl. Usage-Chunk mit leerem `choices`,
+`completions` beides, `embeddings` (Default-base64-Pfad und explizites
+`float`), `images.generate` (Ablehnung als `NotFoundError`, Weiterleitung an
+einen Fake-Lane, `RateLimitError` durchgereicht, 503 bei totem Lane),
+`audio.speech` (`NotFoundError`, `BadRequestError` bei falschem Format).
+Per `requests` geprüft, weil das SDK keine Methode dafür hat: `/v1/models`-
+Rohkörper, `/v1/images/variations`, `/v1/audio/transcriptions`, `/api/tags`,
+`/api/chat`, `/api/generate`.
+
+Nicht abgedeckt und bewusst so: echte Bildgenerierung (braucht einen
+`multimodal_gen`-Boot), echte Transkription (braucht Whisper auf einer Karte),
+echte Embeddings aus einem Pooling-Modell. Alle drei sind Lane-Verhalten, kein
+Protokollverhalten — die Adapter sind an der Naht getestet.
+
+### Der Befund, der beim Bau am meisten wert war
+
+Dass das offizielle SDK **defaultmäßig base64 anfordert**, war nicht bekannt
+und macht Befund 2 von "ein ignoriertes Feld" zu "der Standardpfad jedes
+Python-Clients war stillschweigend abweichend". Der Test dafür ist deshalb
+kein base64-Test, sondern der gewöhnliche `embeddings.create(...)`-Aufruf: er
+kommt nur dann mit exakt denselben Floats zurück, wenn unsere Kodierung
+bytegleich zu dem ist, was der offizielle Dekoder erwartet.

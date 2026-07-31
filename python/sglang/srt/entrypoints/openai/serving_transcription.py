@@ -52,7 +52,10 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     process_asr_chunk,
     split_audio_chunks,
 )
-from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
+from sglang.srt.entrypoints.openai.transcription_adapters import (
+    matched_adapter_key,
+    resolve_adapter,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -67,9 +70,15 @@ class OpenAIServingTranscription(OpenAIServingBase):
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
         model_config = tokenizer_manager.model_config
-        self._adapter = resolve_adapter(
-            getattr(model_config.hf_config, "architectures", [])
+        self._architectures = list(
+            getattr(model_config.hf_config, "architectures", []) or []
         )
+        # Whether the loaded model is actually an ASR model, or merely got the
+        # Whisper adapter because that is the fallback. A plain text LLM run
+        # through the transcription path produces confident, wrong text; the
+        # endpoint refuses instead (see ``_reject_if_not_asr``).
+        self._matched_adapter_key = matched_adapter_key(self._architectures)
+        self._adapter = resolve_adapter(self._architectures)
         # Cap concurrent /v1/realtime sessions. The Semaphore is bound to the
         # event loop on first acquire (uvicorn's loop in normal serving).
         self._session_semaphore = asyncio.Semaphore(
@@ -78,6 +87,31 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
+
+    def _reject_if_not_asr(self) -> Optional[ORJSONResponse]:
+        """Refuse transcription when the served model is not an ASR model.
+
+        The adapter registry falls back to Whisper for any unrecognised
+        architecture, so without this check a text LLM answers
+        ``/v1/audio/transcriptions`` with plausible text that has nothing to do
+        with the audio -- the worst possible failure, because it looks like a
+        result. Naming the loaded architecture makes the misconfiguration
+        obvious from the response alone.
+        """
+        if self._matched_adapter_key is not None:
+            return None
+        architectures = ", ".join(self._architectures) or "unknown"
+        return self.create_error_response(
+            message=(
+                f"The loaded model ({architectures}) is not a speech-recognition "
+                "model, so /v1/audio/transcriptions cannot serve it. Start this "
+                "server with an ASR model (Whisper, Qwen3-ASR or MiMo-V2-ASR) to "
+                "use this endpoint."
+            ),
+            err_type="invalid_request_error",
+            status_code=400,
+            param="model",
+        )
 
     def _validate_request(self, request: TranscriptionRequest) -> Optional[str]:
         """Validate transcription request."""
@@ -135,6 +169,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
         ORJSONResponse,
     ]:
         """Main entry point for transcription requests."""
+        rejection = self._reject_if_not_asr()
+        if rejection is not None:
+            return rejection
+
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
 

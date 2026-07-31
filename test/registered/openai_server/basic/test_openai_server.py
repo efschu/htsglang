@@ -1005,7 +1005,9 @@ class TestOpenAIV1Score(CustomTestCase):
 
         # Handle error responses
         if response.get("type") == "BadRequestError":
-            self.fail(f"Score request failed with error: {response['message']}")
+            self.fail(
+                f"Score request failed with error: {response['error']['message']}"
+            )
 
         # Verify response structure
         self.assertIn("scores", response, "Response should have a 'scores' field")
@@ -1067,7 +1069,9 @@ class TestOpenAIV1Score(CustomTestCase):
 
         # Handle error responses
         if response.get("type") == "BadRequestError":
-            self.fail(f"Score request failed with error: {response['message']}")
+            self.fail(
+                f"Score request failed with error: {response['error']['message']}"
+            )
 
         # Verify response structure
         self.assertIn("scores", response, "Response should have a 'scores' field")
@@ -1132,7 +1136,9 @@ class TestOpenAIV1Score(CustomTestCase):
         self.assertEqual(response.status_code, 400)
         error_response = response.json()
         self.assertEqual(error_response["type"], "BadRequestError")
-        self.assertIn("Token ID 999999 is out of vocabulary", error_response["message"])
+        self.assertIn(
+            "Token ID 999999 is out of vocabulary", error_response["error"]["message"]
+        )
 
 
 if __name__ == "__main__":
