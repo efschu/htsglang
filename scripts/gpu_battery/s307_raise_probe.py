@@ -20,7 +20,14 @@ import threading
 import time
 import urllib.request
 
-from s307_probe_sizing import default_concurrency, pool_from_info
+from s307_probe_sizing import (
+    admitted_from_info,
+    context_tokens_from_info,
+    default_concurrency,
+    default_prompt_repeat,
+    pool_from_info,
+    token_pool_from_info,
+)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 30047
 BASE = f"http://127.0.0.1:{PORT}"
@@ -48,23 +55,37 @@ def state():
     return st.get("admission_limiter") or info.get("admission_limiter") or {}
 
 
-def _live_pool():
-    """The fitted mamba pool this server reports right now, or None if the
-    query fails (e.g. the server is not up yet) -- see s307_probe_sizing."""
+def _live_info():
+    """This server's /get_server_info, or None when the query fails (e.g. it
+    is not up yet). Fetched ONCE: every sizing input below has to describe the
+    same server state, and three separate queries could straddle a change."""
     try:
-        return pool_from_info(get("/get_server_info"))
+        return get("/get_server_info")
     except Exception:
         return None
 
 
-# Sized as a FRACTION of the pool this server actually fitted, not a fixed
-# count calibrated against a predicted pool size -- see s307_probe_sizing for
-# why a fixed 24 stopped crossing --admission-throttle-high once the fitted
-# pool came out larger than predicted (#307-Beleg, 2026-07-31).
+_INFO = _live_info()
+
+# BOTH pressure dimensions are sized from what the server reports, never from
+# a predicted value -- see s307_probe_sizing for the two card runs that each
+# scored a quiet throttle_count 0 by getting one of them wrong.
+#
+#   CONCURRENCY    only has to keep the ADMITTED slots full; extra clients
+#                  queue and hold no tokens.
+#   PROMPT_REPEAT  is the one that actually moves occupancy, because the
+#                  controller samples HELD TOKENS over max_total_num_tokens.
 CONCURRENCY = (
-    int(sys.argv[2]) if len(sys.argv) > 2 else default_concurrency(_live_pool())
+    int(sys.argv[2]) if len(sys.argv) > 2 else default_concurrency(pool_from_info(_INFO))
 )
-PROMPT_REPEAT = int(sys.argv[3]) if len(sys.argv) > 3 else 900
+if len(sys.argv) > 3:
+    PROMPT_REPEAT, PROMPT_REPEAT_NOTE = int(sys.argv[3]), "pinned on the command line"
+else:
+    PROMPT_REPEAT, PROMPT_REPEAT_NOTE = default_prompt_repeat(
+        token_pool_from_info(_INFO),
+        admitted_from_info(_INFO),
+        context_tokens_from_info(_INFO),
+    )
 NEW_TOKENS = int(sys.argv[4]) if len(sys.argv) > 4 else 160
 
 
@@ -149,6 +170,18 @@ print(
         {
             "start_state": start_state,
             "end_state": end_state,
+            # How the pressure phase was sized, and why. Without this a run
+            # that could never reach the throttle mark looks exactly like a
+            # run whose mechanism is broken -- both report throttle_count 0.
+            "sizing": {
+                "concurrency": CONCURRENCY,
+                "prompt_repeat": PROMPT_REPEAT,
+                "prompt_repeat_note": PROMPT_REPEAT_NOTE,
+                "new_tokens": NEW_TOKENS,
+                "token_pool": token_pool_from_info(_INFO),
+                "admitted": admitted_from_info(_INFO),
+                "mamba_pool": pool_from_info(_INFO),
+            },
             "pressure_end_s": pressure_end,
             "peak_limit": max(limits) if limits else None,
             "min_limit": min(limits) if limits else None,
