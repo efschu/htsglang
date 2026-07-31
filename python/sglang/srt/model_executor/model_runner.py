@@ -939,6 +939,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self._attach_layer_fingerprint()
         self._prepare_moe_topk()
 
         # Must run before backend/graph init so no draft graph records a
@@ -3941,6 +3942,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Task #343 layer tap. Driven from here rather than from a forward
+        # pre-hook on the model, because the model is entered as
+        # ``model.forward(...)`` -- torch runs no hook on a direct .forward()
+        # call, only on __call__, so a root pre-hook would never fire and every
+        # submodule hook would record against an unstarted step.
+        if getattr(self, "_layer_fingerprint", None) is not None:
+            self._layer_fingerprint.begin_step(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
@@ -4155,6 +4163,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
+
+    def _attach_layer_fingerprint(self) -> None:
+        """Task #343: per-layer forward tap for the determinism harness.
+
+        Two gates, both off by default, so neither the serving path nor the
+        logits-only #124 harness changes: ``--determinism-logits-dump-dir``
+        must be set AND ``SGLANG_DETERMINISM_LAYER_FINGERPRINT=1`` must be in
+        the environment. See ``layer_fingerprint`` for what is recorded.
+        """
+        from sglang.srt.model_executor.layer_fingerprint import maybe_attach
+
+        self._layer_fingerprint = maybe_attach(
+            self.model, self.server_args.determinism_logits_dump_dir, self.tp_rank
+        )
 
     def _determinism_dump_logits(
         self,
