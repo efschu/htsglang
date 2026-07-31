@@ -4029,6 +4029,22 @@ class ServerArgs:
             "of them.",
         ),
     ] = 100.0
+    dual_group_lane_pairing_decode_step_rows: A[
+        int,
+        Arg(
+            help="Job-dominance rule for --dual-group-lane-pairing: how many "
+            "prefill GEMM rows one decode step is worth in lane device time. "
+            "A queued lane job counts as saturating only when its prefill "
+            "rows also clear max_new_tokens * this value -- a job whose "
+            "decode tail dwarfs its prefill is decode-dominated, and "
+            "deferring it defers almost no saturating work (card-found in "
+            "slice D boot 2: a 71-row/128-new-token job classified "
+            "saturating and left the policy with an all-saturating queue on "
+            "every pick). Default 12 derives from the measured lane costs "
+            "on the C3 vehicle (~17 ms decode step, ~1.5 ms per prefill "
+            "row).",
+        ),
+    ] = 12
     dual_group_lane_pairing_prefill_ms_per_row: A[
         float,
         Arg(

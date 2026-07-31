@@ -108,6 +108,24 @@ DEFAULT_PREFILL_MS_PER_ROW = 1.0
 # runtime budget.
 DEFAULT_MAX_DEFER_MS = 500.0
 
+# How many prefill ROWS one decode step is worth in lane device time, for the
+# job-dominance rule below. CARD-FOUND (slice D boot 2): a queued job's next
+# grain is always its prefill, so classifying the JOB by that one forward
+# called a 71-token-prompt, 128-new-token job "saturating" (71 rows >= 64) --
+# every queued job then classified saturating and the policy answered "queue
+# all saturating: FIFO" on all six picks that saw a saturating serving grain.
+# The 71-row prefill lasts ~35 ms; the 128 decode steps after it, ~2-5 s. A
+# job pick allocates the JOB's whole runtime next to the serving group, so
+# the label has to follow the job's DOMINANT phase: saturating only when the
+# prefill's device time outweighs the decode tail, i.e.
+#   prefill_rows >= max_new_tokens * decode_step_rows.
+# The default derives from the measured lane costs on the C3 vehicle: a lane
+# decode step is ~17 ms and a lane prefill row ~1.5 ms (mixed-floor cost
+# 1.4976 ms/token at 93 % prefill tokens, boot 1), giving ~11 rows per step;
+# 12 keeps it conservative. Calibratable via
+# --dual-group-lane-pairing-decode-step-rows.
+DEFAULT_DECODE_STEP_ROWS = 12
+
 
 @dataclass(frozen=True)
 class GrainLabel:
@@ -238,6 +256,7 @@ class PairingPolicy:
 
     sat_rows: int = DEFAULT_SAT_ROWS
     max_defer_ms: float = DEFAULT_MAX_DEFER_MS
+    decode_step_rows: int = DEFAULT_DECODE_STEP_ROWS
     spec_steps: int = 3
     enabled: bool = True
     signal: Optional[ServingGrainSignal] = None
@@ -250,8 +269,34 @@ class PairingPolicy:
     _deferred_since: Dict[int, float] = field(default_factory=dict)
 
     def label_job(self, job: Mapping[str, Any]) -> GrainLabel:
+        """Label a job for the PICK: its dominant phase, not its first forward.
+
+        A queued job's next grain is always its prefill, but picking a job
+        allocates the job's WHOLE runtime next to the serving group.  A job
+        whose prefill clears the row threshold while its decode tail dwarfs
+        that prefill in device time (card-found in boot 2: 71 rows / ~35 ms
+        of prefill in front of 128 steps / seconds of decode) is
+        decode-dominated: deferring it defers almost no saturating work and
+        starves the policy of exactly the non-saturating alternative it is
+        looking for.  Saturating therefore additionally requires
+        prefill_rows >= max_new_tokens * decode_step_rows.
+        """
         phase, rows = lane_job_grain_rows(job, self.spec_steps)
-        return classify_rows(phase, rows, self.sat_rows)
+        label = classify_rows(phase, rows, self.sat_rows)
+        if not label.saturating or phase != PHASE_PREFILL:
+            return label
+        decode_tail = int(job.get("max_new_tokens") or 0)
+        tail_rows = decode_tail * int(self.decode_step_rows)
+        if rows < tail_rows:
+            return GrainLabel(
+                phase,
+                rows,
+                False,
+                f"decode-dominated job: prefill {rows} rows < "
+                f"{decode_tail} new tokens x {int(self.decode_step_rows)} "
+                "rows/step",
+            )
+        return label
 
     def pick(
         self, jobs: Sequence[Mapping[str, Any]], now: Optional[float] = None
@@ -352,6 +397,7 @@ class PairingPolicy:
         out: Dict[str, Any] = {
             "enabled": self.enabled,
             "sat_rows": self.sat_rows,
+            "decode_step_rows": self.decode_step_rows,
             "max_defer_ms": self.max_defer_ms,
             "picks_total": self.picks_total,
             "reordered_total": self.reordered_total,

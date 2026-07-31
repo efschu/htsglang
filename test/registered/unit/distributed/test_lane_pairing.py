@@ -45,13 +45,20 @@ from sglang.srt.model_executor.lane_pairing import (
 )
 
 
-def _job(prompt_len: int, *, prefill_done: bool = False, spec: bool = False):
+def _job(
+    prompt_len: int,
+    *,
+    prefill_done: bool = False,
+    spec: bool = False,
+    max_new_tokens: int = 0,
+):
     """A lane job as DualGroupLane.enqueue builds it, reduced to the fields
     the pairing policy reads."""
     return {
         "input_ids": list(range(prompt_len)),
         "prefill_ms": 1.0 if prefill_done else None,
         "spec": spec or None,
+        "max_new_tokens": max_new_tokens,
     }
 
 
@@ -179,6 +186,34 @@ class TestPairingPolicy(unittest.TestCase):
         pol = _policy()
         jobs = [_job(2048), _job(8)]
         self.assertEqual(pol.pick(jobs, now=1.0), 0)
+
+    def test_job_dominance_rule(self):
+        # Card-found in boot 2: a 71-row prompt in front of 128 decode steps
+        # cleared the row threshold and classified the JOB saturating -- the
+        # queue was then "all saturating" on every pick. The pick label has
+        # to follow the job's dominant phase.
+        pol = _policy()
+        self.assertFalse(pol.label_job(_job(71, max_new_tokens=128)).saturating)
+        self.assertTrue(pol.label_job(_job(1600, max_new_tokens=8)).saturating)
+        # Boundary: prefill rows == tail rows stays saturating (>=).
+        self.assertTrue(pol.label_job(_job(96, max_new_tokens=8)).saturating)
+        self.assertFalse(pol.label_job(_job(95, max_new_tokens=8)).saturating)
+        # The rule never resurrects a sub-threshold prefill.
+        self.assertFalse(pol.label_job(_job(8, max_new_tokens=0)).saturating)
+
+    def test_boot2_scenario_reorders(self):
+        # The exact boot-2 queue: prefill-shaped head (1600 rows, 8 new
+        # tokens) and a decode-DOMINATED job (71 rows, 128 new tokens)
+        # behind it, serving saturating. Boot 2 answered FIFO six times;
+        # with the dominance rule the pick is the decode-dominated job.
+        pol = _policy()
+        _publish(pol, 1600, now=1.0)
+        jobs = [
+            _job(1600, max_new_tokens=8),
+            _job(71, max_new_tokens=128),
+        ]
+        self.assertEqual(pol.pick(jobs, now=1.01), 1)
+        self.assertEqual(pol.reordered_total, 1)
 
     def test_sat_sat_avoided_picks_first_non_saturating(self):
         pol = _policy()

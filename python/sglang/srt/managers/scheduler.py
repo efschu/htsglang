@@ -696,6 +696,13 @@ class Scheduler(
                     if lane.concurrent:
                         lane.pairing_policy = PairingPolicy(
                             sat_rows=self._lane_pairing_sat_rows,
+                            decode_step_rows=int(
+                                getattr(
+                                    sa,
+                                    "dual_group_lane_pairing_decode_step_rows",
+                                    12,
+                                )
+                            ),
                             max_defer_ms=float(
                                 getattr(
                                     sa,
