@@ -30,11 +30,18 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _R7C = _REPO_ROOT / "scripts" / "dual_group" / "r7c"
+_R8 = _REPO_ROOT / "scripts" / "dual_group" / "r8"
 _RECIPES = [
-    "boot_a_fp8_reference.sh",
-    "boot_b_dense_head.sh",
-    "boot_c_dflash_solo_q8.sh",
-    "boot_d_lane_reseed.sh",
+    _R7C / "boot_a_fp8_reference.sh",
+    _R7C / "boot_b_dense_head.sh",
+    _R7C / "boot_c_dflash_solo_q8.sh",
+    _R7C / "boot_d_lane_reseed.sh",
+    # Round 8 sources the same common.sh, so it inherits the same failure
+    # mode and belongs in the same sweep. Both of its modes are walked: the
+    # serial one assembles an EMPTY flag array, which is its own `set -u`
+    # trap under bash (`"${arr[@]}"` on an empty array is unbound in older
+    # bashes, and the expansion here is written to survive it).
+    _R8 / "boot_lane_spec.sh",
 ]
 
 # Verbatim shape of what resolve_cards() prints on the rig, including the two
@@ -59,7 +66,7 @@ _CARD_ORDERS = [
 ]
 
 
-def _dry_run(recipe: str, big: str, small: str, names) -> subprocess.CompletedProcess:
+def _dry_run(recipe, big: str, small: str, names, extra_env=None):
     """Run one recipe through its dry-run path in a throwaway directory."""
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = pathlib.Path(tmp)
@@ -84,8 +91,10 @@ def _dry_run(recipe: str, big: str, small: str, names) -> subprocess.CompletedPr
             "OUT": str(tmpdir / "out"),
             "LOG": str(tmpdir / "server.log"),
         }
+        env.update(extra_env or {})
+        path = recipe if isinstance(recipe, pathlib.Path) else _R7C / recipe
         return subprocess.run(
-            ["bash", "-u", str(_R7C / recipe)],
+            ["bash", "-u", str(path)],
             env=env,
             capture_output=True,
             text=True,
@@ -97,27 +106,28 @@ class TestR7cRecipeDryRun(CustomTestCase):
     def test_no_unbound_variable_in_any_recipe(self):
         for recipe in _RECIPES:
             for label, big, small, names in _CARD_ORDERS:
-                with self.subTest(recipe=recipe, cards=label):
+                with self.subTest(recipe=recipe.name, cards=label):
                     proc = _dry_run(recipe, big, small, names)
                     combined = proc.stdout + proc.stderr
                     self.assertNotIn(
                         "unbound variable",
                         combined.lower(),
                         msg=(
-                            f"{recipe} hit `set -u` in its dry run "
+                            f"{recipe.name} hit `set -u` in its dry run "
                             f"({label}). Output:\n{combined}"
                         ),
                     )
                     self.assertEqual(
                         proc.returncode,
                         0,
-                        msg=f"{recipe} dry run failed ({label}). Output:\n{combined}",
+                        msg=f"{recipe.name} dry run failed ({label}). "
+                        f"Output:\n{combined}",
                     )
                     self.assertIn(
                         "DRY RUN LAUNCH:",
                         proc.stdout,
                         msg=(
-                            f"{recipe} never reached the launch line, so the "
+                            f"{recipe.name} never reached the launch line, so "
                             f"flag assembly went unchecked. Output:\n{combined}"
                         ),
                     )
@@ -239,3 +249,42 @@ class TestR7cRecipeDryRun(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestR8ModeFlagAssembly(CustomTestCase):
+    """The round-8 recipe has a MODE, and an empty flag array is a `set -u` trap.
+
+    `CONCURRENT=0` leaves `MODE_FLAGS` empty, and a bare `"${MODE_FLAGS[@]}"`
+    is an unbound expansion under `set -u` on the bash versions this rig has
+    seen. Both modes are walked to the launch line, and each is checked for
+    the flag that distinguishes it -- an assembly that silently dropped the
+    mode would otherwise pass the unbound-variable check above.
+    """
+
+    def _launch_line(self, concurrent: str) -> str:
+        proc = _dry_run(
+            _R8 / "boot_lane_spec.sh",
+            "0",
+            "1,2",
+            ("5090", "3080", "3080"),
+            extra_env={"CONCURRENT": concurrent},
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        for line in proc.stdout.splitlines():
+            if line.startswith("DRY RUN LAUNCH:"):
+                return line
+        self.fail("no launch line: " + proc.stdout + proc.stderr)
+
+    def test_concurrent_mode_carries_its_two_flags(self):
+        line = self._launch_line("1")
+        self.assertIn("--dual-group-lane-concurrent", line)
+        self.assertIn("--dual-group-lane-admission-ms", line)
+
+    def test_serial_mode_carries_neither_and_still_reaches_the_launch(self):
+        line = self._launch_line("0")
+        self.assertNotIn("--dual-group-lane-concurrent", line)
+        self.assertNotIn("--dual-group-lane-admission-ms", line)
+        # Everything the two modes SHARE has to be there either way, or the
+        # empty-array expansion ate more than the mode flags.
+        self.assertIn("--dual-group-lane-spec", line)
+        self.assertIn("--dual-group-lane-budget-mib", line)

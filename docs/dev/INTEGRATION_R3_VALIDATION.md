@@ -14878,3 +14878,289 @@ Rohdaten unter `/spinning/gpu-battery-results/2026-07-31_318_beleg/`:
 GPU1, 16913 MiB auf GPU2 — drei Ladezyklen, kein Fremd-Spin im Fenster).
 Fenster geoeffnet 04:50:48 UTC, geschlossen 04:54:53 UTC; Locks beidseitig
 freigegeben, alle drei Karten danach auf 0 MiB.
+
+## Lane-Spec-Kette Runde 8 (feat/dual-group-lane-spec-r8, Basis 4403a98312) — 2026-07-31
+
+Auftrag: die vier offenen Kettenglieder schliessen (Kopf-Dispatch,
+rang-lokales Draft-KV-Sizing, Kohaerenz-Tor MIT Spec, Messung). Zuerst der
+Stand, weil zwei der vier bereits zu waren und das nachzuweisen billiger ist
+als es nachzubauen.
+
+### Posten 1 und 2: was tatsaechlich offen war
+
+**Kopf-Dispatch: bereits geschlossen, in R7a.** Der Auftrag verweist auf den
+offenen Rest aus `5ebf01805d` ("head dispatch open"), aber dieser Commit ist
+ein Vorfahr von HEAD und die Runden r2-r7c liegen dazwischen. Kontrakt 4 (der
+Kopf betritt `init_decode_cuda_graph` mit jeder Phase DISABLED und
+dereferenziert `graph_shared_output`) ist in `_finish_lane_draft_runner`
+geloest: der Kopf-Bringup laeuft unter der Args-View des KOPFES, nicht der des
+Lane-Ziels, und R7a gibt ihm die DECODE-Phase zurueck. Belegt in beiden Boots
+dieser Runde durch die Vertragszeile
+
+    dual-group lane: NEXTN head graph captured
+      (bs [1], 1 token, DECODE, hidden LAST, EagleDraftInput)
+
+und durch `head_graph_forwards == spec_rounds` in jedem gefahrenen Arm. Es ist
+nichts nachzuholen; das Kettenglied ist gefahren, nicht nur gebaut.
+
+**Draft-KV-Sizing: rang-lokal, aber am falschen Verhaeltnis.** Die
+`memory_pool_config`-Durchreichung ist seit `5ebf01805d` weg (der Kopf zaehlt
+seine KV-tragenden Layer am ASSEMBLIERTEN Baum, `_lane_kv_bearing_layer_count`).
+Der POSTEN davor war es nicht. `split_lane_budget` nahm das Verhaeltnis der
+`num_hidden_layers` — und ein echtes NEXTN-Draft-Config traegt die
+Layer-Zahl des ZIELS, weil es aus demselben Checkpoint abgeleitet wird. Das
+Verhaeltnis war auf jedem realen Boot 64/64 = 1,0, entschieden hat also die
+Klammer dahinter: ein pauschales Viertel des Budgets. Bei Budget 1600 sind das
+400 MiB, von denen der Kopf-Pool ~75 benutzt hat; die restlichen ~325 wurden
+weder allokiert noch an das Lane-Ziel zurueckgegeben. Der Unit-Test, der die
+Regel abdeckte, fuetterte ein Draft-Config mit EINEM Layer — was kein reales
+Draft-Config tut —, also wurde die Arithmetik nie auf ihrer Produktiv-Eingabe
+gefahren.
+
+Neue Regel, aus den rang-lokalen Verhaeltnissen: der Kopf folgt den Sequenzen
+des Ziels, also ist die einzige richtige Groesse seines Pools die TOKEN-ZAHL
+des Ziels. Beide Pools bauen auf derselben Zelle
+`kv_heads * (head_dim + v_head_dim) * elem` auf und unterscheiden sich nur
+darin, wie viele Layer sie bezahlen — "gleiche Tokens" ist damit exakt das
+Verhaeltnis der KV-TRAGENDEN Layer, und dtype, Kopfdimensionen und Page-Size
+kuerzen sich heraus:
+
+    draft_mib / budget = L_head / (L_head + L_target)
+
+`kv_bearing_layer_count` liest dafuer drei Faelle auseinander, die alle drei
+schon einmal falsch gelesen wurden: ein Hybrid-Ziel zaehlt nur seine
+`full_attention_layer_ids` (16 von 64 auf diesem Vehikel, die GDN-Layer halten
+Zustand, kein KV), ein Kopf zaehlt seine `num_nextn_predict_layers` (1 — die
+geerbten 64 Layer UND die geerbten 16 full-attention-Ids sind beide am Objekt
+vorhanden und beide falsch fuer ihn), und ein dichtes Config faellt auf seine
+Layer-Zahl durch. Der Split traegt ein `ledger()` nach dem #313-Muster, damit
+die Boot-Zeile sagt, warum jeder Posten seine Groesse hat.
+
+Auf der Karte, beide Boots identisch (Budget 700):
+
+    dual-group lane budget 700 MiB = target 658 MiB (16 KV-bearing layer(s))
+      + NEXTN head 42 MiB (1); the head's share is 1/17 ...
+    dual-group lane 0 HEAD pool sizing (rank-local): budget 42 MiB,
+      1 KV-bearing layer(s), 2048 B/token -> max_total_num_tokens=21056
+    dual-group lane 0 ready: max_total_num_tokens=21056
+
+Kopf-Pool und Ziel-Pool landen auf **derselben** Token-Zahl, 21056. Die alte
+Regel haette dem Kopf hier 175 MiB gegeben, von denen der Deckel ~134
+weggeworfen haette. Zwei Waechter halten das ehrlich: der bestehende
+Token-Deckel schneidet einen zu GROSSEN Pool (die Slots erreicht der Kopf nie),
+und eine neue benannte Warnung meldet einen zu KLEINEN mit beiden Zahlen und
+den MiB, die ihn schliessen wuerden — das ist die Richtung, in der der Kopf
+mitten in einer Sequenz ohne KV dasteht. Sie ist in beiden Boots nicht
+gefeuert.
+
+### Vehikel-Korrektur: FP8 traegt keine Lane
+
+Der Auftrag pinnt Qwen3.6-27B-FP8. Das ist das Vehikel des Accept-REFERENZ-
+Boots, und der faehrt `--no-lane`: 28,75 GiB Gewichte gegen 31,34 GiB nutzbar
+auf der Lane-Karte, und die Lane braucht die vollen Gewichte EINMAL zusaetzlich
+zu beiden Pools (rig-runbook 4.11, Familien-Slice Arm B). Ein auf FP8 gepinnter
+Lane-Boot haette null Messpunkte ergeben. Gefahren wurde deshalb das Vehikel,
+auf dem die C3-Kartenaequivalente selbst gemessen wurden:
+Qwen3.6-27B-MTP-Q3_K_M-GGUF, TP=3 uneven, Lane-Budget 700.
+
+### Posten 3: das Kohaerenz-Tor — und der Grund, warum es zuerst rot war
+
+Zwei Boots, `--dual-group-lane-concurrent` an und aus, sonst identisch. Beide
+zeigen dasselbe Bild, Ziffer fuer Ziffer bei Accept:
+
+| Prompt | A-vs-A-Boden (no-spec) | spec vs. no-spec | Accept |
+|---|---|---|---|
+| alphabet | byte-identisch | Inhalts-Divergenz bei Index 7 | 1,016 |
+| squares | byte-identisch | **identisch** | 1,400 |
+| repeat | byte-identisch | 64 gemeinsame Positionen gleich, EIN Token mehr | 1,255 |
+
+Zwei Befunde stecken darin, und der erste war ein Fehler des Instruments.
+
+**`repeat` ist keine Divergenz.** Eine spekulative Runde emittiert einen BLOCK
+von `accept + 1` Tokens, also kann der letzte Block ueber `max_new_tokens`
+hinauslaufen. Der Vergleich lief ueber die ganze Liste inklusive Laenge und
+machte daraus ein rotes Tor. `compare_trajectories` klassifiziert jetzt DREI
+Ausgaenge — `identical`, `length_end_only`, `content_divergence` — und nur der
+dritte laesst das Tor durchfallen.
+
+**`alphabet` ist eine Divergenz, aber nicht die der Kette.** Der Falsifikator
+(vier Arme gegen eine no-spec-Referenz, alle aus dem seriellen Boot):
+
+| Arm | Klassifikation | erster Unterschied | Accept | Runde |
+|---|---|---|---|---|
+| `plain` (unveraendert, Wiederholung) | **length_end_only** | — | 1,231 | 24,434 ms |
+| `tv_max_accept 0` | content_divergence | 7 | 1,000 | 24,063 ms |
+| `verify_eager` | content_divergence | 7 | 1,016 | 76,480 ms |
+| `head_eager` | content_divergence | 7 | 1,050 | 25,620 ms |
+
+Die erste Zeile ist die entscheidende: `plain` ist bytegleich derselbe Job wie
+der Tor-Arm — dieselbe Payload, derselbe Boot — und er divergiert NICHT. Zwei
+Laeufe desselben Arms widersprechen einander. Damit ist die Divergenz nicht
+reproduzierbar, und ein nicht reproduzierbarer Unterschied hat keinen Ort in
+der Kette.
+
+`tv_max_accept 0` sagt, wo er stattdessen sitzt: mit Deckel 0 wird NICHTS
+akzeptiert, jedes committete Token kommt aus Zeile 0 des Verify-Forwards, und
+die ganze Akzeptanz-Maschinerie (Rollback, KV-Commit, Rekurrenz-Vorschub) ist
+strukturell nicht beteiligt — und er divergiert trotzdem, bei genau Index 7.
+`verify_eager` divergiert ebenfalls bei 7, also ist es nicht der Capture. Was
+uebrig bleibt, ist der Verify-Forward selbst: derselbe Ziel-Forward als
+2-Zeilen-Batch statt als 1-Zeilen-Decode ist numerisch nicht bit-identisch,
+und an Position 7 liegt die Logit-Marge unter dieser Differenz. Index-stabil
+(immer 7, nie 6 oder 8) ist genau die Signatur EINER knappen Position und
+nicht die einer davonlaufenden Zustandskorruption.
+
+Und `alphabet` ist der einzige der drei Prompts, der dort ueberhaupt frei
+weiterschreibt: der Prompt endet bei `v`, 64 Tokens laufen weit ueber `z`
+hinaus, und ab da ist die Fortsetzung nicht mehr erzwungen. `squares` und
+`repeat` bleiben erzwungen und sind sauber.
+
+**Der Boden war zu schwach, und das ist die Methodik-Lehre der Runde.** Der
+no-spec-A-vs-A-Boden war auf `alphabet` byte-identisch — er muss es sein, beide
+Laeufe nehmen denselben Kernel-Pfad. Er zertifiziert einen Prompt fuer die
+Wiederholung DESSELBEN Pfades und sagt nichts ueber einen Vergleich QUER ueber
+zwei Pfade, und genau das ist dieses Tor. Das Tor holt sich jetzt einen zweiten
+Boden: der spekulative Arm laeuft zweimal, und ein Prompt traegt nur dann ein
+Verdikt, wenn BEIDE Boeden halten. Auf den Daten dieser Runde angewandt heisst
+das: `alphabet` VOID, `squares` identisch, `repeat` length_end_only —
+**Verdikt kohaerent auf zwei geurteilten Prompts**, mit dem dritten als
+benanntem Marge-Fall statt als stiller roter Zeile.
+
+### Posten 4: ms je Runde mit und ohne Spec (seriell, Lane solo, 64 Token)
+
+`ms/Token` ist die vergleichbare Groesse, und sie muss durch die EMITTIERTEN
+Tokens teilen. Der erste Anlauf teilte durch `decode_steps` — fuer einen
+spekulativen Job zaehlt das Feld RUNDEN (die Lane haengt einen `decode_ms`-
+Eintrag je Runde an), die Normalisierung tat also nichts und jeder spekulative
+Arm las sich als seine eigene Rundenzeit. Korrigiert und getestet.
+
+| Prompt | no-spec | spec: Runde = Verify + Kopf | Accept | Runden | emittiert | spec ms/Token |
+|---|---|---|---|---|---|---|
+| alphabet | 16,545 | 24,364 = 21,499 + 2,864 | 1,016 | 62 | 64 | 23,603 (+42,7 %) |
+| squares | 16,283 | 24,938 = 21,570 + 3,368 | 1,400 | 45 | 64 | 17,535 (+7,7 %) |
+| repeat | 16,201 | 24,596 = 21,486 + 3,110 | 1,255 | 51 | 65 | 19,298 (+19,1 %) |
+
+Break-even = 24,4 / 16,2 = **1,51**, und der Accept erreicht 1,40. Die
+Spekulation verliert auf der Lane SOLO auf allen drei Inhalten. Das bestaetigt
+die R7a-Zahlen (Break-even 1,48-1,53) auf einem zweiten Vehikelzustand und
+bestaetigt den R7a-Entscheid, `--dual-group-lane-spec` aus zu lassen — solo.
+
+`verify_eager` misst nebenbei, was der Capture in dieser Runde wert ist:
+76,48 ms gegen 24,43 ms Runde, also 21,4 ms gefangener Verify gegen 73,6 ms
+eager. Faktor 3,4 auf dem Verify, Faktor 3,1 auf der Runde.
+
+### Posten 4: Kartenaequivalente, nebenlaeufig, MIT und OHNE die Kette
+
+Ein Boot (`--dual-group-lane-concurrent`), drei 45-s-Fenster je Arm, Raten auf
+der WANDUHR, Auftraege die ueber das Fenster hinauslaufen fallen raus. Die Lane
+wird auf Warteschlangen-TIEFE 2 gehalten statt Job-fuer-Job gefuettert: ein
+Feeder, der auf seinen Job wartet, laesst die Lane je Job eine Poll-Periode
+leerlaufen, und dieser Leerlauf ist ein groesserer Anteil eines schnellen
+Solo-Fensters als eines langsamen geteilten — er verzerrt genau das Verhaeltnis,
+das die Phase rechnet.
+
+| Arm | Verband solo -> geteilt | Lane solo -> geteilt | share_V | share_L | **E** |
+|---|---|---|---|---|---|
+| Lane OHNE Kette | 54,044 -> 45,511 tok/s | 57,155 -> 11,000 tok/s | 0,842 | 0,193 | **1,035** |
+| Lane MIT Kette | 54,044 -> 45,511 tok/s | 52,822 -> 15,733 tok/s | 0,842 | 0,298 | **1,140** |
+
+    E 1,035 -> 1,140 = +10,2 % Aggregat durch die Kette
+
+**Der Befund kehrt das Solo-Ergebnis um.** Solo kostet die Kette 7,6 %
+(57,2 -> 52,8 tok/s), weil der Accept unter dem Break-even liegt. Unter
+Nebenlaeufigkeit bringt sie 43 % (11,0 -> 15,7 tok/s). Der Grund ist, dass sich
+der Engpass verschiebt: solo ist er die Rundenzeit der Lane, geteilt ist er ihr
+ZUGANG zur Karte. Wer nur jede n-te Gelegenheit bekommt, will aus jeder
+Gelegenheit mehr als ein Token holen, und genau das tut ein Accept von 1,2-1,4.
+Die Break-even-Rechnung von R7a gilt weiter — sie gilt fuer die Solo-Lane.
+
+Boeden und Aufloesung, ehrlich:
+* Der VERBANDS-Nenner hat sich in beiden Armen EXAKT reproduziert: 2432 Token /
+  19 Anfragen solo, 2048 / 16 geteilt, in zwei unabhaengigen Fenster-Paaren.
+  Das ist zugleich ein In-Boot-Boden von 0,00 % fuer diese Klasse und die
+  Erklaerung dafuer, dass `share_V` in beiden Zeilen identisch ist: die
+  Serving-Rate ist auf 128-Token-Anfragen quantisiert, eine Anfrage sind
+  2,84 tok/s, also ~5,3 % Aufloesung auf dem geteilten Arm. Der Unterschied
+  zwischen den beiden `share_V` ist NICHT null gemessen, er ist unter der
+  Aufloesung — so steht er hier und nicht als Gleichheit.
+* Fuer die Lane wird der C3-Boden weiterverwendet (0,25-0,69 % A-vs-A ueber
+  drei Laeufe, §11.5). Die gemessenen Lane-Effekte (43 % geteilt, 7,6 % solo)
+  liegen ein bis zwei Groessenordnungen darueber.
+* Gegen die aufgezeichneten seriellen Boeden (E 0,91-0,97 no-spec, 1,069 mit
+  eager-Kette) ist E 1,140 der erste Wert dieser Klasse mit VOLL gefangener
+  Kette. Er ist kleiner als die 1,897, die R4 mit eager `seqdecode` gemessen
+  hat — und das ist die in R7a schriftlich hingeschriebene Vorhersage: ein
+  grosser Teil dessen, was die Nebenlaeufigkeit damals einsammelte, waren die
+  CPU-seitigen Luecken der Lane selbst. Ein gefangener Verify hat sie nicht
+  mehr, also ist weniger einzusammeln. Die Vorhersage trifft zu.
+* Der serielle Modus wird nicht nachgemessen, sondern aus den aufgezeichneten
+  Laeufen getragen: der Modus ist ein LAUNCH-Flag, zwei Modi sind zwei Boots,
+  und seriell ist konstruktionsbedingt eine Nullsummen-Teilung EINER Wanduhr.
+
+### Auslastung und Leistung je Karte
+
+Sampler alle 5 s, jetzt inklusive `power.draw` (Belegung und Leistung sind
+verschiedene Fragen: 100 % bei 120 W und 100 % bei 440 W sind nicht dasselbe).
+
+| Boot | Karte | Peak MiB / Total | MIN frei | util avg/max | W avg/max |
+|---|---|---|---|---|---|
+| nebenlaeufig | 3080 (NVML 0) | 8213 / 20480 | 12267 | 34 / 100 | 139 / 291 |
+| nebenlaeufig | 5090 (NVML 1) | 29813 / 32607 | **2794** | 51 / 100 | 263 / 520 |
+| nebenlaeufig | 3080 (NVML 2) | 8163 / 20480 | 12317 | 34 / 100 | 128 / 263 |
+| seriell | 3080 (NVML 0) | 8187 / 20480 | 12293 | 10 / 100 | 74 / 227 |
+| seriell | 5090 (NVML 1) | 29101 / 32607 | 3506 | 17 / 100 | 110 / 568 |
+| seriell | 3080 (NVML 2) | 8139 / 20480 | 12341 | 9 / 100 | 72 / 218 |
+
+VRAM-Korridor eingehalten (frei >= 400 MiB auf jeder Karte). Die 12,3 GiB
+freier Platz auf beiden 3080ern sind der Posten, den jede Mehrkarten-
+Platzierung als Eingang braucht — die Lane sitzt vollstaendig auf der 5090,
+sichtbar auch daran, dass im Lane-Solo-Fenster nur die 5090 rechnet (87 % /
+440 W gegen 0 % auf beiden 3080ern).
+
+Die CUDA-Reihenfolge weicht wie erwartet von der NVML-Reihenfolge ab
+(`cuda:0` = 5090 = NVML 1); beide Rezepte loesen sie zur Laufzeit auf und
+schreiben sie in `cards.txt`.
+
+### Was diese Runde am Instrument geaendert hat
+
+Vier Defekte, jeder einer, den nur ein echter Lauf zeigt, jeder mit einem
+hermetischen Test dahinter:
+
+1. `lane_run` pollte die LAENGE von `results` — einem RING der letzten acht
+   Zeilen. Ab dem neunten Job eines Boots waere jeder weitere Job in sein
+   Budget gelaufen, obwohl er laengst fertig war. Der Fund steht seit dem
+   Familien-Slice in der Prosa ("hat 15 Minuten gekostet"), stand aber nicht
+   im Code. Jetzt `results_total`, der monotone Zaehler.
+2. Der Laengenende-Artefakt wurde als Divergenz gezaehlt.
+3. `ms/Token` teilte durch `decode_steps`, was fuer spekulative Jobs die
+   Rundenzahl ist — die Normalisierung tat nichts.
+4. Der A-vs-A-Boden deckte nur die no-spec-Seite ab.
+
+### Kartenzeit
+
+Zwei Boots, 05:06-05:17 und 05:21-05:26 UTC, zusammen **~16 Minuten** Belegung
+(Deckel 35). Beide ueber `gpu-arb` gehalten und freigegeben, keine fremde
+Session im Fenster, beide Karten-Reihenfolgen zur Laufzeit aufgeloest.
+
+### Offen fuer Runde 9
+
+- **Das korrigierte Tor ist nicht auf der Karte gefahren.** Der zweite Boden
+  ist aus den Daten dieser Runde REKONSTRUIERT (der Tor-Arm und der
+  `plain`-Falsifikator-Arm sind bytegleich derselbe Job aus einem Boot und
+  widersprechen einander), nicht von der neuen Gate-Schleife selbst erhoben.
+  Ein Boot mit `--phases gate` genuegt und kostet ~9 Minuten.
+- **`alphabet` bleibt als Gate-Prompt fragwuerdig.** Bei 64 Token laeuft er
+  weit ueber sein erzwungenes Ende hinaus. Entweder auf ~24 Token kuerzen
+  (dann bleibt die Fortsetzung erzwungen) oder durch einen erzwungenen Inhalt
+  ersetzen; die A-vs-A-Wahl der Prompts gehoert nach R4 ohnehin einmal
+  wiederholt, jetzt mit dem spekulativen Boden dabei.
+- **Der Verband gibt 15,8 % ab, die Lane 70 %.** In R4 hielt die Prioritaet
+  (share_Lane 1,002). Dieselbe Zahl kippt hier, und die Rezepte
+  unterscheiden sich in mehr als einer Achse (4 nebenlaeufige Serving-
+  Anfragen gegen die R4-Last, Spec auch auf der Serving-Seite). Welche der
+  Achsen es ist, ist ungemessen und eine eigene Frage — sie beruehrt den
+  PD-Prioritaetsanspruch direkt.
+- **E fuer eine PREFILL-foermige Lane mit Kette** fehlt weiter. §11.5 misst
+  +16 % (Prefill) gegen +57,5 % (Decode) OHNE Kette; die Lastform ist der
+  groesste bekannte Hebel auf E und die Kette ist nur auf der Decode-Form
+  vermessen.

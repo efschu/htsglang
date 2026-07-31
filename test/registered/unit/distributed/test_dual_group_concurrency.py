@@ -770,38 +770,160 @@ class TestLaneSpecBudget(unittest.TestCase):
 
         return _A()
 
-    def _cfg(self, layers):
+    def _cfg(self, layers, full_ids=None, nextn=None):
+        """A model config shaped like the real ones.
+
+        ``full_ids`` is what a hybrid text config exposes and what actually
+        pays per token; ``nextn`` is the NEXTN declaration. A REAL draft
+        config carries the target's ``num_hidden_layers`` AND the target's
+        ``full_attention_layer_ids`` -- only ``num_nextn_predict_layers``
+        distinguishes it -- so the head fixtures below reproduce that rather
+        than the friendlier "draft reports 1 layer" that the pre-r8 tests
+        assumed.
+        """
+
+        class _Text:
+            full_attention_layer_ids = list(full_ids or [])
+
+        class _Hf:
+            num_nextn_predict_layers = nextn
+
+            @staticmethod
+            def get_text_config():
+                return _Text()
+
         class _C:
             num_hidden_layers = layers
+            num_nextn_predict_layers = nextn
+            hf_config = _Hf()
 
         return _C()
+
+    def _qwen35(self):
+        """The rig vehicle: 64 layers, every fourth one full attention."""
+        return self._cfg(64, full_ids=list(range(3, 64, 4)))
+
+    def _qwen35_head(self):
+        """Its NEXTN head: same checkpoint-derived config, one predict layer."""
+        return self._cfg(64, full_ids=list(range(3, 64, 4)), nextn=1)
 
     def test_the_split_conserves_the_operators_budget(self):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
-        target, draft = split_lane_budget(self._args(1600), self._cfg(64), self._cfg(1))
+        target, draft = split_lane_budget(
+            self._args(1600), self._qwen35(), self._qwen35_head()
+        )
         self.assertEqual(target + draft, 1600)
 
-    def test_the_head_gets_its_layer_share_not_a_second_budget(self):
+    def test_the_head_gets_its_KV_LAYER_share_not_a_quarter(self):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
-        _, draft = split_lane_budget(self._args(1600), self._cfg(64), self._cfg(1))
-        # One layer of 64 -> 25 MiB by ratio, lifted to the 64 MiB floor.
-        self.assertEqual(draft, 64)
+        _, draft = split_lane_budget(
+            self._args(1600), self._qwen35(), self._qwen35_head()
+        )
+        # 16 full-attention layers against the head's one: 1/17 of 1600,
+        # rounded up. The pre-r8 rule returned 400 here -- the ratio of
+        # num_hidden_layers is 64/64 on a real draft config, so the clamp
+        # decided, and ~325 of those MiB were then thrown away by the token
+        # cap instead of going back to the lane target.
+        self.assertEqual(draft, 95)
 
-    def test_a_floor_keeps_the_head_pool_viable(self):
+    def test_a_head_that_declares_no_nextn_layer_is_not_guessed_to_be_one(self):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
-        _, draft = split_lane_budget(self._args(1600), self._cfg(4096), self._cfg(1))
-        self.assertGreaterEqual(draft, 64)
+        # Same config WITHOUT the NEXTN declaration: it is then indistinguishable
+        # from the target and must be charged like it, not silently shrunk.
+        _, draft = split_lane_budget(
+            self._args(1600),
+            self._qwen35(),
+            self._cfg(64, full_ids=list(range(3, 64, 4))),
+        )
+        self.assertEqual(draft, 800)
 
-    def test_the_head_can_never_take_more_than_a_quarter(self):
+    def test_a_dense_target_is_counted_by_its_plain_layers(self):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
-        # A pathological ratio (half the layers) must not starve the target.
-        target, draft = split_lane_budget(self._args(1600), self._cfg(2), self._cfg(1))
-        self.assertLessEqual(draft, 400)
-        self.assertGreater(target, draft)
+        # No hybrid split: every layer bears KV, so 1 of 64 + 1.
+        _, draft = split_lane_budget(
+            self._args(1600), self._cfg(64), self._cfg(64, nextn=1)
+        )
+        self.assertEqual(draft, 25)
+
+    def test_the_head_pool_stays_allocatable_on_a_tiny_budget(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        target, draft = split_lane_budget(
+            self._args(8), self._cfg(4096), self._cfg(4096, nextn=1)
+        )
+        self.assertGreaterEqual(draft, 1)
+        self.assertEqual(target + draft, 8)
+
+    def test_the_head_can_never_crowd_out_the_target(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        # A pathological ratio (the head deeper than the target) must not
+        # starve the lane target the head exists to serve.
+        target, draft = split_lane_budget(
+            self._args(1600), self._cfg(1), self._cfg(4, nextn=4)
+        )
+        self.assertLessEqual(draft, 800)
+        self.assertGreaterEqual(target, draft)
+
+    def test_the_ledger_names_both_posts_and_their_layer_counts(self):
+        from sglang.srt.model_executor.dual_group_lane import (
+            LaneBudgetSplit,
+            split_lane_budget,
+        )
+
+        target, draft = split_lane_budget(
+            self._args(1600), self._qwen35(), self._qwen35_head()
+        )
+        line = LaneBudgetSplit(1600, target, draft, 16, 1).ledger()
+        for token in ("1600", str(target), str(draft), "16", "1/17"):
+            self.assertIn(token, line)
+
+
+class TestLaneKvBearingLayerCount(unittest.TestCase):
+    """The layer count that decides the split is the KV-BEARING one.
+
+    Three ways to get it wrong, one test each, because each of them was a
+    real reading of a real config: the plain layer count (counts GDN layers
+    that hold no KV), the draft config's layer count (it is the target's),
+    and the draft config's full-attention ids (also the target's).
+    """
+
+    def _cfg(self, layers, full_ids=None, nextn=None):
+        return TestLaneSpecBudget._cfg(TestLaneSpecBudget(), layers, full_ids, nextn)
+
+    def test_a_hybrid_target_counts_only_its_full_attention_layers(self):
+        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+
+        cfg = self._cfg(64, full_ids=list(range(3, 64, 4)))
+        self.assertEqual(kv_bearing_layer_count(cfg), 16)
+
+    def test_a_head_is_counted_by_its_nextn_declaration(self):
+        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+
+        # The inherited 64 layers and the inherited 16 full-attention ids are
+        # both wrong for the head, and both are present on the object.
+        cfg = self._cfg(64, full_ids=list(range(3, 64, 4)), nextn=1)
+        self.assertEqual(kv_bearing_layer_count(cfg, is_head=True), 1)
+        self.assertEqual(kv_bearing_layer_count(cfg), 16)
+
+    def test_a_dense_config_falls_through_to_its_layer_count(self):
+        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+
+        self.assertEqual(kv_bearing_layer_count(self._cfg(32)), 32)
+
+    def test_an_empty_config_never_returns_zero(self):
+        from sglang.srt.model_executor.dual_group_lane import kv_bearing_layer_count
+
+        class _Bare:
+            pass
+
+        # A zero here divides by zero one frame later (that is how the head's
+        # first pool sizing died), so the floor is part of the contract.
+        self.assertGreaterEqual(kv_bearing_layer_count(_Bare()), 1)
 
 
 class TestLaneLending(unittest.TestCase):

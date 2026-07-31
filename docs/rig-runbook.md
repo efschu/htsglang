@@ -995,6 +995,23 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   graph capture or the breakable prefill capture OOMs (the full-width lane
   pays a larger per-tier footprint than a serving shard; its tier ladder is
   auto-thinned).
+- **With `--dual-group-lane-spec` the ONE budget is split, by KV-BEARING
+  layers** (#274 round 8). The head follows the target's sequences, so both
+  pools must hold the same token count; their per-token cells differ only in
+  how many layers pay, and everything else (dtype, head dims, page size)
+  cancels. On this vehicle that is 1/(1+16) -- 16 full-attention layers of 64,
+  the GDN layers hold state and no KV. Boot line to read back:
+
+      dual-group lane budget 700 MiB = target 658 MiB (16 KV-bearing layer(s))
+        + NEXTN head 42 MiB (1); the head's share is 1/17 ...
+
+  Both pools then come out at the SAME `max_total_num_tokens` (21056 here).
+  Before round 8 the rule took the ratio of `num_hidden_layers`, which is the
+  TARGET's count on a real draft config, so a flat quarter of the budget went
+  to the head and roughly four fifths of that was stranded -- neither
+  allocated nor returned. If you see `HEAD pool is SHORTER than the lane
+  target's` in the log, the head will run out of KV mid-sequence; the warning
+  names the MiB that close it.
 - **Driving jobs:** POST `/set_internal_state` with
   `{"server_args": {"dual_group_lane_prefill": {"lane_id": 0, "input_ids":
   [...], "max_new_tokens": N, "repeat": K}}}`; results (prefill ms, decode
@@ -1064,6 +1081,21 @@ grain, never mid-kernel.
   with a decode-shaped lane (+57.5 %). Two SM-saturating loads cannot both
   run at full speed on one card — concurrency only collects the gaps there.
   A latency-bound lane load overlaps for real.
+- **Speculation on the lane LOSES solo and WINS shared** (#274 round 8, one
+  boot, 45 s windows, decode-shaped lane, `scripts/dual_group/r8/`). Solo the
+  chain costs 7.6 % (57.2 -> 52.8 lane tok/s) because accept 1.2-1.4 sits under
+  the 1.51 break-even. Under concurrency it buys 43 % (11.0 -> 15.7 tok/s), so
+  `E` goes **1.035 -> 1.140**. The bottleneck moves: solo it is the lane's own
+  round time, shared it is the lane's ACCESS to the card, and a class that only
+  gets every n-th opening wants more than one token out of each opening. The
+  break-even arithmetic above still holds — it holds for the SOLO lane. The
+  concurrent number is also smaller than round 4's 1.897, which was measured
+  with an eager `seqdecode` verify: much of what concurrency collected then
+  were the lane's own CPU-side gaps, and a captured verify no longer has them.
+  Resolution note: the serving denominator is quantized to whole 128-token
+  requests (~2.84 tok/s, ~5.3 % on the shared arm) and reproduced EXACTLY
+  across four independent windows, so `share_serving` is identical in both arms
+  to within that resolution, not measured equal.
 - **The protected class pays MORE under real concurrency than under tick
   sharing**: lane prefill +9.7 % (concurrent) vs +0.4 % (serial). That is
   the priority promise in a different currency — serially the lane only
