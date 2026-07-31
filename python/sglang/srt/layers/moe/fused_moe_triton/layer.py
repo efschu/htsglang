@@ -134,17 +134,17 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         # die ein Objekt baut.
         if a2a_backend.is_bar1ep():
             from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
-                bar1ep_verfuegbar,
+                bar1ep_available,
             )
 
-            ok, grund = bar1ep_verfuegbar()
+            ok, reason = bar1ep_available()
             if not ok:
-                # Kein stiller Rueckfall: wer bar1ep gewaehlt hat, bekommt
-                # entweder BAR1 oder einen Grund. Ein Ausweichen auf DeepEP
-                # oder die gloo-Ebene saehe in der Messung aus wie BAR1.
+                # No silent fallback: whoever chose bar1ep gets either BAR1
+                # or a reason. Falling back to DeepEP or the gloo level
+                # would look like BAR1 in the measurement.
                 raise NotImplementedError(
-                    f"--moe-a2a-backend bar1ep ist auf diesem Rechner nicht "
-                    f"verfuegbar: {grund}"
+                    f"--moe-a2a-backend bar1ep is not available on this "
+                    f"machine: {reason}"
                 )
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
