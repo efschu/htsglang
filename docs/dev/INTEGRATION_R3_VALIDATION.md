@@ -15800,3 +15800,83 @@ boot2_r4cell}/` (`report.json`, `report.txt`, `contract_lines.txt`,
   Stream bei duty 1,0 ist GIL-verdaechtig, gemessen ist es nicht. Ein
   py-spy-Fenster auf den Lane-Thread waehrend eines geteilten Fensters wuerde
   es benennen — und erst dann ist entscheidbar, ob daran etwas zu holen ist.
+
+---
+
+## Task #324 — GEMM-Scores pro (Rang, Familie) (`feat/per-family-gemm-scores`)
+
+Voraussetzung fuer #287 aus `ANALYSE_321_nvfp4_asymmetry.md` §8.3: die
+Score-Ableitung in `uneven_perf.py` lieferte **einen Skalar je Rang**, und das
+Checkpoint-Format waehlte nur aus, *welche* gemessene Zahl das ist. Fuer fp8 —
+ein Schema fuer jedes Linear — ist das exakt richtig. Fuer einen
+MIXED_PRECISION-Checkpoint ist es falsch: auf **derselben** Karte laeuft die
+MLP-Familie ueber Marlin (216 TFLOPS auf der 5090) waehrend attn/GDN den
+nativen fp8-Pfad nimmt (566,88) — ein Faktor **2,62 innerhalb eines Rangs**,
+den ein Skalar nicht darstellen kann.
+
+**Datenmodell.** Neue Achse `(Rang, Familie)` mit den Familien
+`mlp` / `attn_gdn` / `vocab` / `moe`:
+
+* `checkpoint_compute_format_families(model_path) -> (key, desc, {familie: key})`
+  — das dritte Element ist **leer**, solange der Checkpoint ein einziges Schema
+  fuehrt. Gefuellt wird es nur aus zwei echten Per-Modul-Deklarationen:
+  ModelOpt `MIXED_PRECISION` (`quantized_layers`, je Modul ein `quant_algo`)
+  und compressed-tensors mit mehr als einer `config_groups`-Gruppe (`targets`).
+* `rank_gemm_family_scores(entries, fmt, family_formats) -> GemmScores` mit
+  `scalar`, `families`, `family_labels`, `family_formats`, `warnings`,
+  `mixed`, `for_family()`, `resolve()`. Eine Familie, deren Format dem
+  checkpoint-weiten gleicht, bekommt **keinen** eigenen Vektor — sonst waeren es
+  dieselben Zahlen unter einem zweiten Schluessel und `mixed` wuerde luegen.
+* Neue Lane-Schluessel `nvfp4_native` / `nvfp4_marlin` plus die Formatkeys
+  `nvfp4_a4` / `nvfp4_a16`. Sie tragen **noch keine Probe** (das ist §9.2
+  Schritt 1, GPU-Arbeit); die Eintraege sind die Dispatch-Reihenfolge, damit ein
+  Mixed-Checkpoint die richtige Lane je Familie aufloest, sobald die Proben
+  landen. Der Fallback sagt jetzt „no probe yet“ statt zu einem Reprobe zu
+  raten, der nichts erzeugen kann.
+* **Kein `PROFILE_VERSION`-Bump** (#303-Lehre): die Familienachse liegt
+  vollstaendig in der Ableitung, das Profil behaelt seine v3-Felder
+  `gemm_lanes` / `gemm_lane_notes` und bekommt nur neue **Keys** darin. Ein
+  Bump wuerde den Cache-Key aendern und jedes Rig zur 600-s-Neuvermessung der
+  Link-Matrix zwingen.
+* Zusaetzlich liest die Format-Erkennung jetzt `hf_quant_config.json`, wenn die
+  `config.json` keinen Quantisierungsblock fuehrt (ModelOpt-Exportform). Nur im
+  Compute-Format-Dispatch; das Byte-Modell liest unveraendert `_quant_config`.
+
+**Konsumenten-Inventar.** Produktiv gab es genau **einen** Aufrufer von
+`rank_gemm_scores` (`apply_auto_performance`, jetzt ueber
+`rank_gemm_family_scores`). Von dort:
+
+| Verbraucher | vorher | nachher |
+|---|---|---|
+| Plan-Log `rank r -> GPU …` | Skalar | Skalar (unveraendert), plus Familienzeilen nur bei `mixed` |
+| `enc_scores` (kapazitaets-gerichteter Zweig) | Skalar | `resolve(moe, mlp)` bzw. `resolve(mlp)` |
+| `enc_scores` (enc/both-Zweig) | Skalar | dieselbe Aufloesung |
+| `decode_bw_basis` / `decode_knee_detail` | membw/GEMV, nie GEMM | unberuehrt |
+| `planner/roofline.py:_fp8_lane_by_uuid` | liest `_FORMAT_LANES["fp8"]` direkt | unberuehrt (das fp8-Tupel ist unveraendert) |
+| `rigmon/card_probe.py`, `planner/card_library.py` | `gemm_tflops` roh | unberuehrt |
+
+Auf Nicht-MIXED-Checkpoints ist `families` leer, `resolve()` gibt den Skalar
+zurueck, und der enc-Vektor ist derselbe wie vorher — mit Regressions-Pins
+gegen die #298a-Lane-Fixtures.
+
+**Tests.** Neu `test/registered/unit/planner/test_gemm_family_scores.py`
+(28 Tests, 30 Subtests, hermetisch, CPU-only): Familien-Zuordnung von
+Modulpfaden (Experten vor Dense-MLP), MIXED_PRECISION-Mock mit zwei Lanes
+2,62x auseinander → familien-verschiedene Scores und eine **andere**
+Kandidaten-Leiter (`_mlp_candidates`) als der Skalar-Pfad, uniforme
+Checkpoints byte-identisch, fehlende Familiendaten → Skalar-Fallback mit
+benannter Quelle, v2→v3-Migration unberuehrt, plus Pins gegen die echten
+Checkpoints auf Platte (`Qwen3.6-27B-NVFP4` → `nvfp4_a4`, fp8/awq/gptq
+unveraendert).
+
+**Ergebnisse.** `test/registered/unit/planner/` + `unit/spec/` +
+`unit/distributed/test_gpu_battery_checks.py`: **1919 passed, 72 skipped, 0
+failed**. Derselbe `unit/planner/`-Lauf mit gesetztem
+`HTSGLANG_TEST_MODEL_DIR` (also mit den checkpoint-gebundenen Tests statt
+uebersprungen): **1793 passed, 3 skipped, 0 failed**.
+`test_gemm_lane_format.py` mit gesetztem `HTSGLANG_TEST_MODEL_DIR`
+(also inklusive der sechs sonst uebersprungenen End-zu-End-Tests durch
+`apply_auto_performance`): **25 passed**. ruff (F401/F821/UP037) und codespell
+sauber auf beiden Dateien; black auf der Testdatei angewandt, `uneven_perf.py`
+bringt genau die 33 black-Hunks mit, die es vorher schon hatte (keine neuen).
+Keine GPU angefasst (`CUDA_VISIBLE_DEVICES=99`).
