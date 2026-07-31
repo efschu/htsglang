@@ -521,19 +521,18 @@ def _seam_overlaps(
 
 
 def _weighted_boundaries(weights: Sequence[float], total_frames: int) -> list[int]:
-    """Cumulative rounding, so the chunks tile the timeline exactly."""
-    total_weight = sum(weights)
-    boundaries: list[int] = []
-    cumulative = 0.0
-    for weight in weights[:-1]:
-        cumulative += weight
-        boundaries.append(round(total_frames * cumulative / total_weight))
-    boundaries.append(total_frames)
-    # Cumulative rounding cannot invert, but it can repeat when a card's share
-    # rounds to nothing; clamp so the chunks stay ordered.
-    for i in range(1, len(boundaries)):
-        boundaries[i] = max(boundaries[i], boundaries[i - 1])
-    return boundaries
+    """Cumulative rounding, so the chunks tile the timeline exactly.
+
+    The rule itself lives in the shared cost library (#348b) next to the
+    largest-remainder rule the diffusion SP split uses, because the two do not
+    always agree and a reader comparing a video shard against an SP shard has
+    to be able to see which rounding produced which. Imported lazily: this
+    module is plan-time code in a runtime that should not pay the planner
+    package's import for a chunk boundary.
+    """
+    from sglang.srt.planner.cost_model import cumulative_boundaries
+
+    return cumulative_boundaries(total_frames, weights)
 
 
 def _overlap_per_seam(chain: Chain, requested: int) -> int:

@@ -287,6 +287,7 @@ import dataclasses
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.planner import cost_model
 from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED, Remeasure
 
 __all__ = [
@@ -388,9 +389,9 @@ FIXED_PROCESS_POST_MIB: float = 1536.0
 
 
 #: Ring efficiency for the pair-matrix collective term. A ring all-reduce
-#: moves 2(R-1)/R of the payload per rank.
-def _ring_factor(ranks: int) -> float:
-    return 0.0 if ranks < 2 else 2.0 * (ranks - 1) / ranks
+#: moves 2(R-1)/R of the payload per rank. One definition for every planner
+#: (#348b): the shard planners price the same schedule.
+_ring_factor = cost_model.ring_factor
 
 
 #: Achieved fraction of the probed GEMM peak in a real prefill step. Same
@@ -680,6 +681,8 @@ def rates_from_probe(
     h2d: List[float] = []
     d2h: List[float] = []
     gemv_ok, h2d_ok = True, True
+    rank_cards: List[dict] = []
+    rank_keys: List[str] = []
     for r, gpu in enumerate(rank_gpu_id):
         c = by_index.get(int(gpu))
         if c is None:
@@ -688,6 +691,8 @@ def rates_from_probe(
                 f"not know (it holds {sorted(by_index)}). Re-probe, or fix "
                 "--rank-gpu-id."
             )
+        rank_cards.append(c)
+        rank_keys.append(f"rank {r} (GPU {gpu}, {c.get('name') or 'unnamed'})")
         membw.append(float(c.get("membw_read_gbs") or c.get("membw_gbs") or 0.0))
         g = c.get("membw_gemv_gbs")
         if g:
@@ -709,6 +714,29 @@ def rates_from_probe(
         else:
             h2d_ok = False
 
+    # The class docstring promises nothing here is defaulted to a plausible
+    # number, but the two loops above fall back to 0.0 for a card the probe
+    # never scored -- a zero that survives as an almost-valid divisor instead
+    # of surfacing. The shared cost library resolves the same fields with
+    # provenance, so the absence gets a name (#348b). On a complete probe --
+    # every reference config -- both lists come back empty and nothing moves.
+    membw_holes = [
+        rate.source
+        for rate in cost_model.memory_rates_from_entries(rank_cards, rank_keys, "membw")
+        if rate.is_absent
+    ]
+    if membw_holes:
+        absent.append(
+            f"per-card streaming bandwidth on {len(membw_holes)} rank(s) — "
+            "the decode term reads 0 GB/s there: " + "; ".join(membw_holes[:3])
+        )
+    gemm_holes = [key for key, rate in zip(rank_keys, tflops) if not rate]
+    if gemm_holes:
+        absent.append(
+            f"per-card GEMM rate on {len(gemm_holes)} rank(s) — every prefill "
+            "term there divides by 0 TFLOP/s: " + "; ".join(gemm_holes[:3])
+        )
+
     basis["membw"] = "card probe, streaming read rate"
     if gemv_ok:
         basis["gemv"] = "card probe, decode-shaped GEMV rate"
@@ -720,34 +748,36 @@ def rates_from_probe(
         )
     basis["gemm"] = "card probe, bf16 GEMM rate (unresolved default)"
 
+    # Hop cost comes from the shared cost library (#348b), not from a reader
+    # private to this module: the video and diffusion planners price the same
+    # wires, and a second parser is a second set of assumptions. The library
+    # also rejects a same-card row, which the hand-rolled loop here trusted the
+    # probe never to emit.
     link_bw: Optional[float] = None
     link_lat: Optional[float] = None
     used = {int(g) for g in rank_gpu_id}
-    pairs = probe.get("pairs") or []
-    if pairs and len(used) > 1:
-        uuid_of: Dict[str, int] = {}
+    if len(used) > 1:
+        uuid_of_index: Dict[int, str] = {}
         for pos, c in enumerate(cards):
             idx = c.get("cuda_index") if cuda_order else c.get("index")
             if c.get("uuid"):
-                uuid_of[str(c["uuid"])] = int(idx if idx is not None else pos)
-        bws: List[float] = []
-        lats: List[float] = []
-        for p in pairs:
-            s = uuid_of.get(str(p.get("src_uuid")))
-            d = uuid_of.get(str(p.get("dst_uuid")))
-            if s is None or d is None or s not in used or d not in used:
-                continue
-            if p.get("bandwidth_gbs"):
-                bws.append(float(p["bandwidth_gbs"]))
-            if p.get("latency_us"):
-                lats.append(float(p["latency_us"]))
-        if bws and lats:
-            link_bw, link_lat = min(bws), max(lats)
-            transports = sorted({str(p.get("transport") or "") for p in pairs})
-            basis["link"] = (
-                f"pair matrix, narrowest of {len(bws)} ordered pairs "
-                f"({', '.join(t for t in transports if t)})"
-            )
+                uuid_of_index[int(idx if idx is not None else pos)] = str(c["uuid"])
+        card_keys = [str(g) for g in sorted(used)]
+        matrix = cost_model.pair_matrix_from_card_probe(
+            probe,
+            card_keys,
+            uuid_of_key={str(g): uuid_of_index.get(int(g), "") for g in sorted(used)},
+        )
+        bw_rate = matrix.narrowest_bandwidth_gbs()
+        lat_rate = matrix.worst_latency_us()
+        # Both or neither: the collective formula needs a payload term AND a
+        # latency term, and half of it is not a prediction.
+        if not bw_rate.is_absent and not lat_rate.is_absent:
+            link_bw = bw_rate.require("narrowest ordered pair")
+            link_lat = lat_rate.require("worst ordered-pair latency")
+            basis["link"] = bw_rate.source
+        for line in matrix.rejected:
+            absent.append(f"pair matrix row rejected — {line}")
     if link_bw is None and len(used) > 1:
         absent.append(
             "card-to-card pair matrix — the collective term of both phases "
@@ -986,10 +1016,12 @@ class KeyCostModel:
         r = self.rates.ranks
         if r < 2 or self.rates.link_bw_gbs is None:
             return None if r >= 2 else 0.0
-        lat = float(self.rates.link_latency_us or 0.0) * 1e-6
-        payload = float(self.perf.hidden) * 2.0  # bf16 activations
-        per_ar = (r - 1) * lat + _ring_factor(r) * payload / (
-            self.rates.link_bw_gbs * 1e9 * COLLECTIVE_EFFICIENCY
+        per_ar = cost_model.allreduce_seconds(
+            float(self.perf.hidden) * 2.0,  # bf16 activations
+            r,
+            self.rates.link_bw_gbs,
+            float(self.rates.link_latency_us or 0.0),
+            efficiency=COLLECTIVE_EFFICIENCY,
         )
         return 2.0 * self.perf.n_layers * per_ar
 
@@ -1001,10 +1033,12 @@ class KeyCostModel:
         r = self.rates.ranks
         if r < 2:
             return 0.0
-        lat = float(self.rates.link_latency_us or 0.0) * 1e-6
-        payload = float(self.perf.hidden) * 2.0 * max(int(tokens), 1)
-        per_ar = (r - 1) * lat + _ring_factor(r) * payload / (
-            float(self.rates.link_bw_gbs or 1.0) * 1e9 * COLLECTIVE_EFFICIENCY
+        per_ar = cost_model.allreduce_seconds(
+            float(self.perf.hidden) * 2.0 * max(int(tokens), 1),
+            r,
+            float(self.rates.link_bw_gbs or 1.0),
+            float(self.rates.link_latency_us or 0.0),
+            efficiency=COLLECTIVE_EFFICIENCY,
         )
         return 2.0 * self.perf.n_layers * per_ar
 
@@ -1390,11 +1424,16 @@ def _predict_all(
         unit="tok/s",
     )
 
-    tp = model.perf.prefill_time_model(
-        list(units), model.rates.gemm_tflops, model.rates.link_bw_gbs or 1e-3
-    )
+    # Absent pair matrix: the RATIO below still has to be computable, so the
+    # shared placeholder stands in (#348b). Its contract is split-invariance --
+    # the collective term is n_layers * hidden * ranks, never the candidate
+    # vector, so it shifts both times by the same constant and cannot reorder
+    # candidates. The ABSOLUTE number is not reported from it: ``pre_val``
+    # below stays None without a measured baseline.
+    _link = model.rates.link_bw_gbs or cost_model.ABSENT_LINK_RANKING_PLACEHOLDER_GBS
+    tp = model.perf.prefill_time_model(list(units), model.rates.gemm_tflops, _link)
     tp_base = model.perf.prefill_time_model(
-        list(base_units), model.rates.gemm_tflops, model.rates.link_bw_gbs or 1e-3
+        list(base_units), model.rates.gemm_tflops, _link
     )
     pre_ratio = (tp_base / tp) if tp else 1.0
     if anchors.prefill_tok_s:
@@ -4291,7 +4330,7 @@ def check_regressions(
         tw_cand = model.decode_weight_time(model.perf.mlp_unit_partition(cand_vec))
         step_ratio = f + (1.0 - f) * (tw_cand / tw_ref)
         dec_pred = (1.0 / step_ratio - 1.0) * 100.0
-        link = rates.link_bw_gbs or 1e-3
+        link = rates.link_bw_gbs or cost_model.ABSENT_LINK_RANKING_PLACEHOLDER_GBS
         p_ref = model.perf.prefill_time_model(ref_vec, rates.gemm_tflops, link)
         p_cand = model.perf.prefill_time_model(cand_vec, rates.gemm_tflops, link)
         enc_pred = (p_ref / p_cand - 1.0) * 100.0

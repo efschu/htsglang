@@ -20146,3 +20146,101 @@ CUDA-Ordinal-Bruecke ueber die PCI-Bus-ID auf echter Hardware. Sie ist
 hermetisch getestet und spiegelt die vorhandene, im Feld benutzte Logik in
 `server_args._torch_to_nvml_gpu_index_mapping`, aber sie ist auf diesem Rig
 noch nicht gegen einen echten Treiber gelaufen.
+
+---
+
+# #348b — eine Kostenbibliothek, drei Planer
+
+Vollstaendiges Design, Audit-Tabelle und Fundstellen:
+`docs/dev/DESIGN_348b_cost_model.md`. Hier nur die Validierung.
+
+Schreibtischarbeit, `CUDA_VISIBLE_DEVICES=99`, kein Kartenfenster genommen.
+Diese Aufgabe braucht keine Karte: alles laeuft gegen eingebettete
+Probe-Fixtures und zwei Checkpoints von der Platte.
+
+## Byte-identische Plaene
+
+Der Kern ist ein Refactor, also ist das Tor die Gleichheit der Plaene, nicht
+ihre Plausibilitaet. Harness: jede Referenz-Planflaeche als kanonisch
+sortiertes JSON, einmal gegen HEAD `5fa03e1664`, einmal gegen den Branch,
+`diff`.
+
+**158 Plan-Schluessel, null Unterschiede.** Abgedeckt:
+
+- `rates_from_probe` ueber 4 Rank-Mappings x 2 Probes (volle Paarmatrix und
+  gar keine) x 3 dtype-Aufloesungen — jeder Ratenvektor, beide Link-Zahlen;
+- `solve()` ueber 2 echte Checkpoints (`Qwen3.6-27B-FP8`,
+  `Qwen3.6-27B-Q3_K_M.gguf`) x 2 Probes x jedes Ziel aus `GOALS`: Units,
+  Launch-Flags, Feasibility, alle `raw`-Werte auf 12 Stellen, alle
+  `predictions` auf 9;
+- die 2-Ziel-**Pareto-Front inklusive Knie-Wahl** auf beiden Probes. Das ist
+  die eine Stelle, an der die Absent-Link-Konstante plausibel eine Auswahl
+  haette verschieben koennen — `_knee()` normiert min-max, und eine
+  nichtlineare Achsenstauchung ist im Gegensatz zu einem argmax nicht
+  invariant. Sie tut es nicht;
+- `check_regressions` auf beiden Checkpoints — die eingecheckten gemessenen
+  Anker, durchgehend ueber Raten -> Kostenmodell -> Vorhersage;
+- `compare_plans` + `capacity_weighted_plan` ueber 4 Kartensaetze x 2
+  fps-Multiplikatoren x 7 Frame-Zahlen: Strategie, jeder Chunk
+  `[card, start, stop, lead, tail]`, Rate-Scales, Makespan auf 9 Stellen;
+- `_weighted_boundaries` ueber 9 Gewichtsvektoren x 11 Totale, `_ring_factor`
+  ueber 0..8.
+
+Der Diffusions-Konsument `sp_shard_utils` laeuft in diesem venv nicht
+(`diffusers` und `addict` fehlen). Sein Beweis ist deshalb strukturell statt
+ausgefuehrt: das migrierte `_apportion` ist eine reine Ein-Zeilen-Delegation,
+und die Bibliotheksfunktion wird gegen eine eingefrorene woertliche Kopie des
+Vor-#348b-Algorithmus ueber 187 (Gewichte, Total)-Kombinationen geprueft.
+Gleiches Muster fuer `_weighted_boundaries` (198) und `_ring_factor` (33).
+
+Die in D4 ergaenzte Absenz-Benennung verschiebt die Referenzplaene nicht: die
+Referenz-Probe misst jede Karte, beide neuen `absent`-Listen kommen leer
+zurueck. Der Dump fuehrt `absent_n` pro Konfiguration mit und er ist
+unveraendert.
+
+## Testergebnisse
+
+`test/registered/{unit/planner,video_enhance,registry}`: Basis **2294
+passed / 72 skipped**, Branch **2329 passed / 72 skipped**. Delta = +35, exakt
+die neuen Tests (32 in `test_cost_model.py`, 3 in `test_adapters.py`). Keine
+Regression, kein neu uebersprungener Test.
+
+`test_cost_model.py` deckt drei Dinge ab, in dieser Reihenfolge: die
+Byte-Gleichheit jedes Primitivs gegen den Code, den es ersetzt; Provenance
+(eine fehlende Rate ist eine BENANNTE Absenz, nie eine Null und nie ein
+Roofline-Fill); und Divergenz — wo zwei Konsumenten dieselbe Sache aus zwei
+Quellen bepreisten, ist es jetzt eine Zahl und der Test behauptet, dass sie
+uebereinstimmen.
+
+`ruff check`, `black --check`, `isort`, `codespell` sauber auf allen
+geaenderten Dateien; `mypy --ignore-missing-imports` sauber auf
+`cost_model.py`. `sp_shard_utils.py` war auf der Basis nicht black-konform —
+der Lauf hat zwei unbeteiligte Signaturen umbrochen, verhaltensneutral.
+
+## Gefundene Divergenzen
+
+Vier, davon ein echter Bug:
+
+1. **`class2_diffusion._capacity_weights` las das falsche Artefakt** —
+   `load_measured_registry` ist die KV-Budget-Registry, nicht nach Karten-UUID
+   geschluesselt und hinter einem fremden Flag. Der gemessene Zweig warf bei
+   **jedem** Aufruf, waehrend beide Docstrings `rank_gemm_scores` behaupteten.
+   Kein Test deckte ihn ab. Gefixt, drei neue Faelle. Einzige beabsichtigte
+   Verhaltensaenderung von #348b — sie kann keinen Plan verschieben, weil der
+   reparierte Pfad keinen Plan erzeugte, sondern warf.
+2. **Drei verschiedene Link-Raten fuer dieselbe fehlende Messung**: `1e-3`,
+   `0.1` und `8.0` GB/s, also **80x auseinander**. Fuer argmax und
+   Pareto-Dominanz nachweislich harmlos (der Kollektivterm ist ein additiver
+   Konstante ueber alle Kandidaten — als Arithmetik geprueft, nicht behauptet).
+   Fuer ein **Verhaeltnis gegen eine Schwelle** — `lever_profiles._speed_ratios`
+   — nicht: ein additiver Term ueberlebt keine Division. Offener Punkt.
+3. **Zwei On-Disk-Formen der Paarmatrix**, geordnet vs. ungeordnet, sechs
+   unabhaengige Leser, nichts glich sie ab. `reconcile_pair_matrices` meldet
+   Abweichungen jetzt, statt sie zu mitteln.
+4. **Stilles `0.0`** fuer fehlende `membw`/`gemm_tflops` in `rates_from_probe`,
+   entgegen dem eigenen Klassen-Docstring. Jetzt benannte Absenz.
+
+Nicht vereinheitlicht, bewusst: die zwei Rundungsregeln (Hamilton vs.
+kumulativ, `(1,3)` ueber 10 gibt `[3,7]` gegen `[2,8]`). Beide sind fuer ihren
+Konsumenten richtig; eine Vereinheitlichung waere ein Re-Tune. Die Differenz
+ist jetzt ein festgenagelter Fakt statt eines stillen.

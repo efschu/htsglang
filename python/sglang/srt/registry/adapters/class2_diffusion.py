@@ -214,24 +214,23 @@ class Class2DiffusionAdapter:
     def _capacity_weights(self, cards: Sequence[str]) -> tuple[float, ...]:
         """Per-card capacity weights from the measured GEMM rates.
 
-        Reuses the K1 uneven-TP rate source: the boot-fingerprinted profile the
-        registry already writes, read for each placed card's ``gemm_tflops``.
-        The diffusion DiT is a dense bf16/fp16 transformer, so the dense GEMM
-        probe is the right rate -- the same score
-        ``sglang.srt.uneven_perf.rank_gemm_scores`` returns for a checkpoint with
-        no quantized lane table. A faster card earns a proportionally longer
-        slice of the sequence.
+        Reuses the K1 uneven-TP rate source through the shared cost library
+        (#348b): the boot-fingerprinted hardware profile, resolved per card by
+        ``uneven_perf.rank_gemm_scores``. The diffusion DiT is a dense bf16/fp16
+        transformer, so ``FORMAT_DENSE_BF16`` is the right format key -- it is a
+        real lane-table entry, so the dense GEMM probe is selected on purpose
+        and not as a fallback. A faster card earns a proportionally longer slice
+        of the sequence.
+
+        Until #348b this function read ``load_measured_registry`` instead. That
+        is the measured KV-BUDGET registry: gated behind
+        ``SGLANG_MEASURED_KV_BUDGET``, keyed by ``components``/``mlp_vector``
+        rather than by card UUID, and typed for a ``ServerArgs`` this caller
+        does not have. It could never return a per-card ``gemm_tflops``, so the
+        measured branch raised on every call and uneven SP was reachable only
+        by declaring ``launch.capacity_weights`` by hand -- while the docstring
+        claimed the K1 rates were in use. No test covered it.
         """
-        try:
-            from sglang.srt.uneven_perf import (  # noqa: PLC0415
-                load_measured_registry,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise EstimateError(
-                f"engine {self.spec.engine_id!r}: uneven SP needs the measured GEMM "
-                f"profile, which could not be loaded ({exc}). Run the rig probe, or "
-                "declare launch.capacity_weights explicitly."
-            ) from None
         declared = self.launch.get("capacity_weights")
         if declared:
             if len(declared) != len(cards):
@@ -241,23 +240,26 @@ class Class2DiffusionAdapter:
                 )
             return tuple(float(w) for w in declared)
         try:
-            registry = load_measured_registry(None)
-            weights = []
-            for card in cards:
-                entry = registry.get(card) if isinstance(registry, dict) else None
-                tflops = None
-                if isinstance(entry, dict):
-                    tflops = entry.get("gemm_tflops")
-                if tflops is None:
-                    raise KeyError(card)
-                weights.append(float(tflops))
-            return tuple(weights)
+            from sglang.srt.planner import cost_model  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             raise EstimateError(
-                f"engine {self.spec.engine_id!r}: no measured gemm_tflops for the "
-                f"placed cards ({exc}). Declare launch.capacity_weights explicitly, or "
-                "probe the rig first."
+                f"engine {self.spec.engine_id!r}: uneven SP needs the measured GEMM "
+                f"profile, which could not be loaded ({exc}). Run the rig probe, or "
+                "declare launch.capacity_weights explicitly."
             ) from None
+        rates = cost_model.compute_rates_for_cards(
+            cards, fmt=cost_model.FORMAT_DENSE_BF16
+        )
+        absences = rates.absences()
+        if absences:
+            raise EstimateError(
+                f"engine {self.spec.engine_id!r}: no measured GEMM rate for "
+                f"{len(absences)} of {len(cards)} placed cards. "
+                + " ".join(absences[:2])
+                + " Declare launch.capacity_weights explicitly, or probe the rig "
+                "first."
+            )
+        return tuple(rates.values())
 
     def bind(self, cards: tuple[str, ...]) -> None:
         self._cards = tuple(cards)
