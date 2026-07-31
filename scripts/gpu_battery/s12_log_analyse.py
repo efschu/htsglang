@@ -14,7 +14,7 @@ decide it without booting a card again:
   slower shows up in ``wait`` and nowhere else.
 * the same lines carry ``#new-token``, which IS the collective size: one
   all_reduce per layer collective over ``new_token x hidden x 2`` bytes.
-* the ``HTCCL-BAR1: setup`` line carries the slot geometry, so the round
+* the ``barlink-BAR1: setup`` line carries the slot geometry, so the round
   decomposition of a given payload is arithmetic, not a guess.
 
 Nothing here judges. It parses, aggregates and prints; the verdict is written
@@ -45,7 +45,7 @@ import sys
 # The lines the server really writes.
 #   scheduler.py           -- "Prefill rank batch, ..." (the #252 split)
 #   scheduler.py           -- "Decode batch, ..."
-#   htccl_bar1.py:2045     -- "HTCCL-BAR1: setup in ..."
+#   barlink_bar1.py:2045     -- "barlink-BAR1: setup in ..."
 RE_PREFILL_RANK = re.compile(
     r"\[(?P<zeit>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) TP(?P<rang>\d+)\] "
     r"Prefill rank batch, #new-token: (?P<new_token>\d+), "
@@ -62,10 +62,10 @@ RE_DECODE = re.compile(
 )
 # #315: this used to match "Aufbau in ... Peer-Ziele ... Region ... je Rang
 # (... Schlitze ...), Schlitz ... KiB, groesste Nutzlast ... KiB" -- the
-# German wording #295 moved htccl_bar1.py's setup line away from. Dead on
+# German wording #295 moved barlink_bar1.py's setup line away from. Dead on
 # every real run since; see test_bar1_marker_coupling.py.
 RE_BAR1_SETUP = re.compile(
-    r"HTCCL-BAR1: setup in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) peer "
+    r"barlink-BAR1: setup in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) peer "
     r"targets, region (?P<region_mib>[\d.]+) MiB per rank "
     r"\((?P<schlitze>\d+) slots"
     r".*?\), slot (?P<schlitz_kib>\d+) KiB, "

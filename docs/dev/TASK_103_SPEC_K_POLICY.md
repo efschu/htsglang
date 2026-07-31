@@ -332,7 +332,7 @@ term does not cancel out of the slope. Streaming sidesteps both prefill and
 the cache.
 
 The collective latency table is recorded in `FEATURES_VS_UPSTREAM.md` under
-row 21 (HTCCL); the end-to-end arms are condensed into the boot-check table
+row 21 (barlink); the end-to-end arms are condensed into the boot-check table
 there. Headline numbers:
 
 * **RDMA vs 1 GbE, end to end: 3.6-3.7x** (28.44/28.56/27.13 vs

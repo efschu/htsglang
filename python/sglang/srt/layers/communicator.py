@@ -55,7 +55,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    htccl_mlp_ar_overlap_comm,
+    barlink_mlp_ar_overlap_comm,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -569,12 +569,12 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                # HTCCL async overlap: if down_proj issued the AR already,
+                # barlink async overlap: if down_proj issued the AR already,
                 # the handle rides on the tensor -- complete it here. This
                 # check comes FIRST: with a handle in flight the kernel
                 # fusion below would re-reduce unreduced data and orphan the
                 # outstanding requests.
-                _ar_handle = getattr(hidden_states, "_htccl_ar_handle", None)
+                _ar_handle = getattr(hidden_states, "_barlink_ar_handle", None)
                 if _ar_handle is not None:
                     _comm, _th = _ar_handle
                     hidden_states = _comm.wait_async(_th)
@@ -817,14 +817,14 @@ class LayerCommunicator:
         if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             return False
 
-        # HTCCL async overlap (SGLANG_HTCCL_UCX_OVERLAP=1, default off):
+        # barlink async overlap (SGLANG_BARLINK_UCX_OVERLAP=1, default off):
         # route the MLP AR through the fuse seam so it can be issued at
         # down_proj and completed in the next layer's prepare_attn. The
         # condition is group-uniform by construction (env flag + transport
-        # class only -- see htccl_mlp_ar_overlap_comm); the structural
+        # class only -- see barlink_mlp_ar_overlap_comm); the structural
         # guards above still veto exactly as they do for the kernel fusions.
         if (
-            htccl_mlp_ar_overlap_comm() is not None
+            barlink_mlp_ar_overlap_comm() is not None
             and not self.is_last_layer
             and self._context.tp_size > 1
         ):

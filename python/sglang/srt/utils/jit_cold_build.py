@@ -10,9 +10,9 @@ builds its own artefacts, so the ranks arrive at that forward minutes apart:
 one rank sits in ``nvcc`` while another is already inside a collective.
 
 For a host-staged collective with a *cycle-counted* GPU-side deadline
-(``HTCCLDeviceTransport``, ``_TIMEOUT_CYCLES = 60e9``, i.e. ~23 s at 2.6 GHz)
+(``BarlinkDeviceTransport``, ``_TIMEOUT_CYCLES = 60e9``, i.e. ~23 s at 2.6 GHz)
 this is fatal and, worse, misattributed: the waiting kernel executes
-``HTCCL_TRAP()``, which poisons the CUDA context, and the resulting
+``BARLINK_TRAP()``, which poisons the CUDA context, and the resulting
 ``cudaErrorLaunchFailure`` surfaces at the NEXT launch -- some unrelated
 norm/attention kernel. Measured on the r3 merge tip: 6/6 boots RED on a cold
 JIT cache, 1/1 GREEN once the same tree found the cache warm, with a stall
@@ -54,9 +54,9 @@ exists. On a single-rank boot the original exception is re-raised unchanged
 cold-build collision sends the reader looking for a second rank that was
 never there.
 
-Default path: with no HTCCL device transport in the process, nothing reads
+Default path: with no barlink device transport in the process, nothing reads
 the window. ``resolve_timeout_cycles`` is the only consumer, and it is called
-only from the HTCCL device collectives.
+only from the barlink device collectives.
 """
 
 from __future__ import annotations

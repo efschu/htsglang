@@ -117,7 +117,7 @@ ARTIFACT_SUFFIXES = (".so", ".pyd")
 DEFAULT_QUIET_SECONDS = 120.0
 
 #: Hard bound on any wait. Chosen an order of magnitude above the slowest build
-#: that goes through this path on this tree (the HTCCL device extension, ~150 s
+#: that goes through this path on this tree (the barlink device extension, ~150 s
 #: of nvcc), so a genuine build is never interrupted, while an orphaned lock
 #: costs minutes instead of the rest of the run.
 DEFAULT_MAX_WAIT_SECONDS = 1800.0

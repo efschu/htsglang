@@ -9,7 +9,7 @@
 #     -> needs libssl-dev at runtime: the native page-hash C++ extension is
 #        JIT-compiled against <openssl/sha.h>; without it the server aborts
 #        with "Failed to load HiCache native hash extension".
-#   - HTCCL host-staged collectives for a second node over RoCE/UCX
+#   - barlink host-staged collectives for a second node over RoCE/UCX
 #     -> needs libucx0 at runtime (ctypes dlopen of libucp.so.0).
 #   - the planner / rigmon GUI (MODE=planner in the entrypoint). The planner's
 #     web UI is stdlib http.server — no fastapi/uvicorn/jinja needed — but its
@@ -71,7 +71,7 @@ ARG SGLANG_SCM_VERSION=0.0.0.dev15138
 
 # Feature toggles.
 #   INSTALL_SGL_KERNEL=0 -> Turing-only slim image (see the arch block above).
-#   INSTALL_UCX=0        -> drop HTCCL/UCX; single-node images do not need it.
+#   INSTALL_UCX=0        -> drop barlink/UCX; single-node images do not need it.
 #   INSTALL_PLANNER=0    -> no planner extra; MODE=planner still serves the UI,
 #                           only the quality-benchmark tab breaks.
 ARG INSTALL_SGL_KERNEL=1
@@ -110,14 +110,14 @@ RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
     && rm -rf /var/lib/apt/lists/*
 
-# UCX runtime for the HTCCL cross-rig transport. htccl_ucx_bindings.py dlopens
+# UCX runtime for the barlink cross-rig transport. barlink_ucx_bindings.py dlopens
 # libucp.so.0 by name via ctypes — no headers, no build step, so the runtime
 # package is enough. Ubuntu 24.04 ships UCX 1.16.0, which is the release the
 # binding's struct offsets were dumped from.
 #
 # UCX refuses to interoperate across releases with a different UCP wire address
 # format. Running the SAME image on both nodes is what guarantees parity; if
-# the second node runs UCX from the host instead, point SGLANG_HTCCL_UCX_LIB at
+# the second node runs UCX from the host instead, point SGLANG_BARLINK_UCX_LIB at
 # a matching build on both sides.
 ARG INSTALL_UCX
 RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
@@ -125,7 +125,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
       apt-get update && apt-get install -y --no-install-recommends \
         libucx0 ibverbs-providers libibverbs1 librdmacm1 \
       && rm -rf /var/lib/apt/lists/*; \
-    else echo "INSTALL_UCX=0 -> no UCX, HTCCL ucx transport unavailable"; fi
+    else echo "INSTALL_UCX=0 -> no UCX, barlink ucx transport unavailable"; fi
 
 WORKDIR /sgl-workspace
 

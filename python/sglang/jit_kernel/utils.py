@@ -472,7 +472,7 @@ def _jit_build_dir_name(module_name: str, build_hash: str = "") -> str:
     # Hopper part. Without the vendor, a shared cache volume would hand a
     # gfx900 .so to an sm_90 rank (or the reverse) under an identical key,
     # which is exactly the cross-arch reuse this name exists to prevent.
-    # Same defect and same fix shape as the HTCCL device-extension cache key.
+    # Same defect and same fix shape as the barlink device-extension cache key.
     #
     # ``build_hash`` closes the last gap in the name: flags, wrappers and the
     # toolchain choice also decide the binary, and two builds that differ only

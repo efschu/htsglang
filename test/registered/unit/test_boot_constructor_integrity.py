@@ -154,8 +154,8 @@ _LOAD_BEARING_INIT_ATTRS = (
         ),
     ),
     (
-        "distributed/device_communicators/htccl.py",
-        "HTCCLCommunicator",
+        "distributed/device_communicators/barlink.py",
+        "BarlinkCommunicator",
         (
             # `device_transport` / `shm_transport` were replaced by the single
             # pluggable seam `transport` (shm | device | ucx). The pin follows
@@ -174,8 +174,8 @@ _LOAD_BEARING_INIT_ATTRS = (
         ),
     ),
     (
-        "distributed/device_communicators/htccl_device.py",
-        "HTCCLDeviceTransport",
+        "distributed/device_communicators/barlink_device.py",
+        "BarlinkDeviceTransport",
         (
             "_slot_addrs",
             "_seq_dev",
@@ -186,8 +186,8 @@ _LOAD_BEARING_INIT_ATTRS = (
         ),
     ),
     (
-        "distributed/device_communicators/htccl_shm.py",
-        "HTCCLShmTransport",
+        "distributed/device_communicators/barlink_shm.py",
+        "BarlinkShmTransport",
         ("_counters", "_slots", "_pinned", "_seq", "_slot_tensors"),
     ),
 )

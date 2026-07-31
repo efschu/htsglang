@@ -85,7 +85,7 @@ def load_proof(step_dir: str, arm: str) -> dict:
         "mlp_units": None,
         "max_total_num_tokens": None,
         "pinned": None,
-        "htccl_groups": 0,
+        "barlink_groups": 0,
     }
     if not os.path.exists(path):
         return info
@@ -100,7 +100,7 @@ def load_proof(step_dir: str, arm: str) -> dict:
     tok = RE_MAXTOK.findall(text) or RE_MAXTOK_DCP.findall(text)
     if tok:
         info["max_total_num_tokens"] = max(int(t) for t in tok)
-    info["htccl_groups"] = text.count("HTCCL enabled for group")
+    info["barlink_groups"] = text.count("barlink enabled for group")
     return info
 
 
@@ -191,7 +191,7 @@ def main() -> int:
     w("### Plan actually booted, per arm")
     w("")
     w(
-        "| Arm | MLP pin | materialized MLP units | max_total_num_tokens | HTCCL groups |"
+        "| Arm | MLP pin | materialized MLP units | max_total_num_tokens | barlink groups |"
     )
     w("|---|---|---|---:|---:|")
     for a in arms:
@@ -199,7 +199,7 @@ def main() -> int:
         w(
             f"| {ARM_LABEL[a]} | {p['pinned'] or 'none (auto)'} | "
             f"{p['mlp_units'] or '-'} | {p['max_total_num_tokens'] or '-'} | "
-            f"{p['htccl_groups']} |"
+            f"{p['barlink_groups']} |"
         )
     w("")
 

@@ -3,7 +3,7 @@
 
 Task #315: scripts/gpu_battery/s11_bar1_e2e.py's regexes (and the BAR1 test
 fixtures next to them) had drifted onto dead German strings that the #295
-translation moved htccl_bar1.py / htccl.py / benchmark/bar1_graph_check.py
+translation moved barlink_bar1.py / barlink.py / benchmark/bar1_graph_check.py
 away from. Nothing matched on a real run any more; nothing noticed, because
 the fixtures were themselves still German and matched each other.
 
@@ -34,13 +34,13 @@ import os
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
 )
-HTCCL_BAR1_PY = os.path.join(
+BARLINK_BAR1_PY = os.path.join(
     REPO_ROOT, "python", "sglang", "srt", "distributed", "device_communicators",
-    "htccl_bar1.py",
+    "barlink_bar1.py",
 )
-HTCCL_PY = os.path.join(
+BARLINK_PY = os.path.join(
     REPO_ROOT, "python", "sglang", "srt", "distributed", "device_communicators",
-    "htccl.py",
+    "barlink.py",
 )
 PARALLEL_STATE_PY = os.path.join(
     REPO_ROOT, "python", "sglang", "srt", "distributed", "parallel_state.py"
@@ -50,17 +50,18 @@ GRAPH_CHECK_PY = os.path.join(REPO_ROOT, "benchmark", "bar1_graph_check.py")
 #: The exact source lines the renderers below are pinned to. Kept in one
 #: place so a source move shows up as one changed number, not a hunt through
 #: every render function.
-LINE_BAR1_SETUP = 2045
-LINE_BAR1_LEDGER = 2059
-LINE_BAR1_PIPE_POOL_EXHAUSTED = 2973
-LINE_HTCCL_RIEGEL = 655
-LINE_PARALLEL_STATE_GROUP_OK = 651
-LINE_PARALLEL_STATE_GROUP_FALLBACK = 659
+LINE_BAR1_SETUP = 2094
+LINE_BAR1_LEDGER = 2108
+LINE_BAR1_PIPE_POOL_EXHAUSTED = 3064
+LINE_BARLINK_RIEGEL = 669
+LINE_PARALLEL_STATE_GROUP_OK = 721
+LINE_PARALLEL_STATE_GROUP_FALLBACK = 729
 LINE_GRAPH_CHECK_HEADER = 619
 LINE_GRAPH_CHECK_SUMMARY_HEADING = 663
 LINE_GRAPH_CHECK_CASE_LINE = 667
 LINE_GRAPH_CHECK_FAILED_GATES = 677
 LINE_GRAPH_CHECK_ALL_PASSED = 680
+LINE_BAR1_UNAVAILABLE_CLASS = 180
 
 
 def _tree(path: str) -> ast.Module:
@@ -118,12 +119,12 @@ def _class_name_at(tree: ast.Module, lineno: int, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# htccl_bar1.py
+# barlink_bar1.py
 # ---------------------------------------------------------------------------
 
 
 def bar1_unavailable_class_name() -> str:
-    return _class_name_at(_tree(HTCCL_BAR1_PY), 173, HTCCL_BAR1_PY)
+    return _class_name_at(_tree(BARLINK_BAR1_PY), LINE_BAR1_UNAVAILABLE_CLASS, BARLINK_BAR1_PY)
 
 
 def render_setup_line(
@@ -136,8 +137,8 @@ def render_setup_line(
     flags_bytes: int = 5376,
     export: str = "NV_ESC_EXPORT_TO_DMABUF_FD",
 ) -> str:
-    """``HTCCL-BAR1: setup in ...`` -- one BAR1 region actually built."""
-    tmpl = _percent_template(_tree(HTCCL_BAR1_PY), LINE_BAR1_SETUP, HTCCL_BAR1_PY)
+    """``barlink-BAR1: setup in ...`` -- one BAR1 region actually built."""
+    tmpl = _percent_template(_tree(BARLINK_BAR1_PY), LINE_BAR1_SETUP, BARLINK_BAR1_PY)
     return tmpl % (
         dauer_ms, peer_targets, region_mib, slots_desc, slot_kib, payload_kib,
         flags_bytes, export,
@@ -145,23 +146,23 @@ def render_setup_line(
 
 
 def render_ledger_line(group: str = "tp:0", balance: str = "tp:0: 24.0 MiB") -> str:
-    """``HTCCL-BAR1: BAR1 ledger of this card after group ...``."""
-    tmpl = _percent_template(_tree(HTCCL_BAR1_PY), LINE_BAR1_LEDGER, HTCCL_BAR1_PY)
+    """``barlink-BAR1: BAR1 ledger of this card after group ...``."""
+    tmpl = _percent_template(_tree(BARLINK_BAR1_PY), LINE_BAR1_LEDGER, BARLINK_BAR1_PY)
     return tmpl % (group, balance)
 
 
 def render_pipe_pool_exhausted_line(
     assigned: int = 6, total: int = 6, ring_l: int = 4, stride_bytes: int = 2048,
 ) -> str:
-    """``HTCCL-BAR1-PIPE: the graph pool of the result ring is exhausted ...``."""
+    """``barlink-BAR1-PIPE: the graph pool of the result ring is exhausted ...``."""
     tmpl = _percent_template(
-        _tree(HTCCL_BAR1_PY), LINE_BAR1_PIPE_POOL_EXHAUSTED, HTCCL_BAR1_PY
+        _tree(BARLINK_BAR1_PY), LINE_BAR1_PIPE_POOL_EXHAUSTED, BARLINK_BAR1_PY
     )
     return tmpl % (assigned, total, ring_l, stride_bytes)
 
 
 # ---------------------------------------------------------------------------
-# htccl.py
+# barlink.py
 # ---------------------------------------------------------------------------
 
 
@@ -170,11 +171,11 @@ def render_riegel_message(
     nbytes: int = 10600448,
     grund: str = "bar1 reports handles('all_gather', 10600448) -> False",
 ) -> str:
-    """The RuntimeError htccl._select raises during an ungated CUDA graph
+    """The RuntimeError barlink._select raises during an ungated CUDA graph
     capture -- the coverage-gap "bolt" s11_bar1_e2e.py's RE_RIEGEL extracts.
     """
     return _render_fstring(
-        _tree(HTCCL_PY), LINE_HTCCL_RIEGEL, HTCCL_PY,
+        _tree(BARLINK_PY), LINE_BARLINK_RIEGEL, BARLINK_PY,
         op=op, nbytes=nbytes, grund=grund,
     )
 

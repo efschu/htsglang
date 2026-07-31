@@ -127,7 +127,7 @@ MESSAGE_CLASSES: Tuple[Dict[str, Any], ...] = (
     {
         "key": "tp_small",
         "label": "TP collectives, small (decode / verify all-reduce, gather)",
-        "carrier": "HTCCL UCX collective context",
+        "carrier": "barlink UCX collective context",
         "flag": "--collective-net-small",
         "env": "SGLANG_COLLECTIVE_NET_SMALL",
         "wants": "latency",
@@ -136,7 +136,7 @@ MESSAGE_CLASSES: Tuple[Dict[str, Any], ...] = (
     {
         "key": "tp_bulk",
         "label": "TP collectives, large (prefill chunks)",
-        "carrier": "HTCCL UCX collective context (the same one)",
+        "carrier": "barlink UCX collective context (the same one)",
         "flag": "--collective-net-small",
         "env": "SGLANG_COLLECTIVE_NET_SMALL",
         "wants": "bandwidth",
@@ -163,7 +163,7 @@ MESSAGE_CLASSES: Tuple[Dict[str, Any], ...] = (
 )
 
 #: The four preconditions the #214 desk evaluation asks for before a
-#: `dmabuf_rdma` HTCCL transport is even worth prototyping
+#: `dmabuf_rdma` barlink transport is even worth prototyping
 #: (``docs/EVAL_gdr_uebernahme.md`` §6.2, §9 P1). Each is read from
 #: :attr:`RigFacts.capabilities` -- never assumed -- because the host-side
 #: probe that answers most of these (``read_dmabuf_flag.sh`` needs `gdb` on
@@ -634,8 +634,8 @@ def _arch_rows(
                 verdict=WARN,
                 reason="An AMD card is in the pool ("
                 + ", ".join(c.name for c in amd)
-                + "). NCCL cannot span vendors; only the HTCCL data plane can.",
-                remedy="Set SGLANG_HTCCL=1 on every rank of a lane that mixes "
+                + "). NCCL cannot span vendors; only the barlink data plane can.",
+                remedy="Set SGLANG_BARLINK=1 on every rank of a lane that mixes "
                 "vendors, and keep the value identical on all of them.",
                 provenance=ESTIMATE,
                 evidence="runbook §2",
@@ -660,11 +660,11 @@ def _row_transport_available(local: RigFacts, remote: RigFacts) -> GateRow:
             verdict=OK,
             local=local.ucx or "",
             remote=remote.ucx or "",
-            reason="Both rigs report UCX, so HTCCL/ucx can carry the TP "
+            reason="Both rigs report UCX, so barlink/ucx can carry the TP "
             "collectives. NCCL's verbs path is broken on this RoCE fabric; "
             "NCCL over sockets on the same HCA works and is the fallback.",
             remedy="Both hosts must load the SAME UCX release "
-            "(SGLANG_HTCCL_UCX_LIB); mixed releases are refused at rendezvous.",
+            "(SGLANG_BARLINK_UCX_LIB); mixed releases are refused at rendezvous.",
             provenance=MEASURED,
             evidence="runbook §8.2 / FEATURES §21 fabric finding",
         )
@@ -677,11 +677,11 @@ def _row_transport_available(local: RigFacts, remote: RigFacts) -> GateRow:
         verdict=WARN,
         local=local.ucx or "not reported",
         remote=remote.ucx or "not reported",
-        reason=f"UCX is not reported on {missing}, so the HTCCL/ucx rung "
+        reason=f"UCX is not reported on {missing}, so the barlink/ucx rung "
         "cannot be confirmed. gloo over TCP always works and NCCL over "
         "sockets works on this fabric; NCCL over verbs does not.",
         remedy="Run the comm suite on the rig that reports nothing, or "
-        "install UCX there and set SGLANG_HTCCL_UCX_LIB to the same release "
+        "install UCX there and set SGLANG_BARLINK_UCX_LIB to the same release "
         "on both hosts.",
         provenance=ABSENT if not have_ucx else ESTIMATE,
         evidence="runbook §8.2 / FEATURES §21 fabric finding",
@@ -692,7 +692,7 @@ def _row_dmabuf_rdma(local: RigFacts, remote: RigFacts) -> GateRow:
     """The dmabuf GPU-RDMA precondition chain (#214, EVAL_gdr_uebernahme.md
     §6.2 / §9 P1) -- a CAPABILITY row, not a build recommendation.
 
-    Four checks decide whether a `dmabuf_rdma` HTCCL transport (the
+    Four checks decide whether a `dmabuf_rdma` barlink transport (the
     evaluation's P4, explicitly NOT built now) even has a floor to stand on:
     open kernel modules, rdma-core with `ibv_reg_dmabuf_mr`, the mlx5 dmabuf
     kernel path, and this fork's VMM export path. This row never blocks a
@@ -818,7 +818,7 @@ def _row_cuda_graph(transports: Sequence["TransportChoice"]) -> GateRow:
     everything and therefore says nothing.
     """
     data_plane = [t for t in transports if t.message_class in ("tp_small", "tp_bulk")]
-    staged = [t for t in data_plane if t.chosen in ("htccl-ucx", "gloo-tcp", "shm")]
+    staged = [t for t in data_plane if t.chosen in ("barlink-ucx", "gloo-tcp", "shm")]
     if not staged:
         return GateRow(
             key="cuda_graph",
@@ -835,7 +835,7 @@ def _row_cuda_graph(transports: Sequence["TransportChoice"]) -> GateRow:
         label="CUDA graphs vs the chosen transport",
         verdict=WARN,
         reason="The chosen carrier(s) " + ", ".join(names) + " host-stage "
-        "every collective. Only the `device` HTCCL transport may run inside a "
+        "every collective. Only the `device` barlink transport may run inside a "
         "capture; a graph-enabled boot with these is rejected at startup.",
         remedy="Add --disable-cuda-graph to the cross-rig lane, and never "
         "compare its numbers against a graph-enabled intra-rig run without "
@@ -991,8 +991,8 @@ class TransportChoice:
 #: appear here -- speed comes from measurements or not at all.
 _CARRIERS: Tuple[Dict[str, Any], ...] = (
     {
-        "key": "htccl-ucx",
-        "label": "HTCCL over UCX",
+        "key": "barlink-ucx",
+        "label": "barlink over UCX",
         "classes": ("tp_small", "tp_bulk"),
         "why": "Host-staged, vendor-neutral, and the transport the measured "
         "cross-rig TP=4 boot actually used.",
@@ -1117,7 +1117,7 @@ def transport_plan(
             if c.get("broken"):
                 entry["verdict"] = "unavailable"
                 entry["reason"] = c["needs"]
-            elif c["key"] == "htccl-ucx" and not ucx_both:
+            elif c["key"] == "barlink-ucx" and not ucx_both:
                 entry["verdict"] = "unknown"
                 entry["reason"] = "UCX is not reported on both rigs."
             else:

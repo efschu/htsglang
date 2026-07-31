@@ -119,8 +119,8 @@ TRANSPORTS: List[TransportSpec] = [
         "works wherever the pairing connection already works.",
     ),
     TransportSpec(
-        "htccl-ucx",
-        "HTCCL over UCX",
+        "barlink-ucx",
+        "barlink over UCX",
         scope="inter",
         tie_break=40,
         why="Host-staged, vendor-neutral. The second rung: it needs UCX built "
@@ -314,7 +314,7 @@ def choose_transport(
                         "does — moving work off this pair beats tuning it."
                     )
         else:
-            pick = "rdma" if "rdma" in {o.key for o in usable} else "htccl-ucx"
+            pick = "rdma" if "rdma" in {o.key for o in usable} else "barlink-ucx"
             note = (
                 "Cross-rig: the lowest rung of the ladder that this host can "
                 "actually run. "

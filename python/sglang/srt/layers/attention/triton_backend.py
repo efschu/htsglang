@@ -417,7 +417,7 @@ def reject_unsupported_dcp_geometry(
         head, DCP groups are consecutive tp slices) -- the geometry of the
         path's origin (Qwen3.5-397B, TP=8/DCP=2, kv=4) and its only CI case.
         Measured outside it: Qwen2.5-1.5B (q12/kv2) TP=2/DCP=2 -> mojibake on
-        NCCL and HTCCL alike; the same model at TP=4/DCP=2 (replicas 2 >= 2) is
+        NCCL and barlink alike; the same model at TP=4/DCP=2 (replicas 2 >= 2) is
         coherent; a 1-token prompt still garbles, so it is the head geometry
         and not the token-ownership layout.
 

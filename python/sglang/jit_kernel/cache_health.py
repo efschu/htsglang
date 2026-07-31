@@ -40,7 +40,7 @@ half-deleted entry under the real name.
 MORE THAN ONE WRITER (#181)
 ---------------------------
 The tvm-ffi cache is not the only place a killed build leaves poison. The
-HTCCL device extension is built by ``torch.utils.cpp_extension.load_inline``
+barlink device extension is built by ``torch.utils.cpp_extension.load_inline``
 into ``$TORCH_EXTENSIONS_DIR`` -- a different writer, a ~150 s build, and the
 same failure shape: residue (``main.cpp``, ``cuda.cu``, ``build.ninja``,
 ``*.o``) with no ``.so``, handed back to every later boot. So the two

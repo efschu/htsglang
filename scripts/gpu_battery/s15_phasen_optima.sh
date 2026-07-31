@@ -258,7 +258,7 @@ for ROW in "${ARM_TABLE[@]}"; do
         "Uneven-DCP token sizing" \
         "max_total_num_tokens" \
         "KV Cache is allocated" \
-        "HTCCL enabled for group" \
+        "barlink enabled for group" \
         "ACHIEVED=" \
         "Disable prefill CUDA graph"
 

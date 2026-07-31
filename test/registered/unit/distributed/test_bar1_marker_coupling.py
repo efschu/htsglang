@@ -3,7 +3,7 @@
 against the ACTUAL emitter source, so the next rename breaks HERE instead of
 silently on the next real run.
 
-Background: htccl.py / htccl_bar1.py / benchmark/bar1_graph_check.py were
+Background: barlink.py / barlink_bar1.py / benchmark/bar1_graph_check.py were
 translated from German to English in #295. Several scripts/gpu_battery/
 consumers (s11_bar1_e2e.py's RE_KASSE/RE_AUFBAU/RE_RIEGEL,
 s12_log_analyse.py's RE_BAR1_SETUP, the "Bar1Unverfuegbar" literal in the
@@ -139,27 +139,27 @@ class TestS12RegexAgainstTheRealEmitter:
 # actually occurring in a source-derived sample.
 # ---------------------------------------------------------------------------
 
-#: file -> literal `grep -F` patterns that are meant to catch BAR1/HTCCL
+#: file -> literal `grep -F` patterns that are meant to catch BAR1/barlink
 #: marker lines. Every one of these must (a) still be present verbatim in
 #: the shell script, and (b) actually occur in a synthetic emission built
 #: from the real format string.
 SHELL_HARVEST_MARKERS = {
     "s11_bar1_e2e.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "BAR1 ledger of this card after group",
         "during a CUDA graph capture",
     ],
     "s12_prefill_kurve.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
     ],
     "s13_hebel_messung.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
         "the graph pool of the result ring is exhausted",
     ],
     "s14_decode_verif.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
     ],
 }
@@ -179,7 +179,7 @@ _RIEGEL_SAMPLE = src.render_riegel_message()
 _POOL_EXHAUSTED_SAMPLE = src.render_pipe_pool_exhausted_line()
 
 _MARKER_SAMPLES = {
-    "HTCCL-BAR1: setup in": _SETUP_LINE_SAMPLE,
+    "barlink-BAR1: setup in": _SETUP_LINE_SAMPLE,
     "BAR1 ledger of this card after group": _LEDGER_LINE_SAMPLE,
     "during a CUDA graph capture": _RIEGEL_SAMPLE,
     "the graph pool of the result ring is exhausted": _POOL_EXHAUSTED_SAMPLE,

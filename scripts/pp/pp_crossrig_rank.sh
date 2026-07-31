@@ -5,10 +5,10 @@
 #   node 0  PVE HOST 10.10.10.1  RTX 3080   20 GB  sm86   pp_rank 0
 #   node 1  RIG2     10.10.10.2  RTX 2080Ti 11 GB  sm75   pp_rank 1
 #
-# Why this needs no HTCCL, unlike the cross-rig TP=4 recipe next to it: both
+# Why this needs no barlink, unlike the cross-rig TP=4 recipe next to it: both
 # cards are NVIDIA, and PP's transport is plain torch.distributed isend/irecv on
 # the NCCL device_group with gloo for the pickled metadata
-# (parallel_state.send_tensor_dict). HTCCL exists for cross-VENDOR groups. The
+# (parallel_state.send_tensor_dict). barlink exists for cross-VENDOR groups. The
 # consequence that matters for the numbers: nothing here is host-staged, so CUDA
 # graphs stay on -- section 6.3's eager requirement does not apply.
 #

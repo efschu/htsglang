@@ -48,25 +48,25 @@ POINTS="${S13_PUNKTE:-1:0 8:1}"
 # lever on top of it is an environment variable or a server argument, so that
 # an arm can never accidentally change the transport as a side effect.
 #
-# `bar1pipe` carries SGLANG_HTCCL_BAR1_PIPE_DIREKT=0 on purpose: it is the
+# `bar1pipe` carries SGLANG_BARLINK_BAR1_PIPE_DIRECT=0 on purpose: it is the
 # control arm for the pipe WITHOUT the result ring, so the pipe's own cost in
 # the BAR1 window can be read off against `bar1`.
 #
-# In the 2026-07-30 run the bare SGLANG_HTCCL_BAR1_PIPE=1 did not boot at all:
+# In the 2026-07-30 run the bare SGLANG_BARLINK_BAR1_PIPE=1 did not boot at all:
 # the decode graph capture warmup runs several all_reduce call sites back to
 # back, the two eager result slots were still held, and `_erg_platz` raised
 # Bar1Unverfuegbar rather than overwrite a buffer the caller still owns
 # (2026-07-30_hebel/befunde/bar1pipe_bootfehler.txt). Both halves of that are
 # fixed since: the eager path looks for a free slot instead of only checking
 # the next one, falls back to direkt=0 with a notice when every slot is held,
-# and the number of eager slots is SGLANG_HTCCL_BAR1_PIPE_ERG_EAGER instead of
+# and the number of eager slots is SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER instead of
 # a constant. How many the standard run needs is still UNMEASURED -- read
 # `erg_eager_voll` in the log before raising it.
 ARM_TABLE=(
     "nccl|grundlinie||"
     "bar1|bar1||"
-    "bar1pipe|bar1|SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT=0|"
-    "bar1direkt|bar1|SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH=1 SGLANG_HTCCL_BAR1_PIPE_ERG_RING=5|"
+    "bar1pipe|bar1|SGLANG_BARLINK_BAR1_PIPE=1 SGLANG_BARLINK_BAR1_PIPE_DIRECT=0|"
+    "bar1direkt|bar1|SGLANG_BARLINK_BAR1_PIPE=1 SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH=1 SGLANG_BARLINK_BAR1_PIPE_RESULT_RING=5|"
     "bar1cp4096|bar1||--chunked-prefill-size 4096"
     # --- 4096-token chunks with a reserve that funds them -------------------
     # `bar1cp4096` above measures at sessions=1 and dies at sessions=8, and the
@@ -101,7 +101,7 @@ ARM_TABLE=(
     "bar1_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200"
     "ncclpg_hi|grundlinie||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
     # The reservation is gone: since the lever fixes its default comes from
-    # SGLANG_HTCCL_GRAPH_FREIGABE, and that is set in every bar1 boot.
+    # SGLANG_BARLINK_GRAPH_ENABLE, and that is set in every bar1 boot.
     # `bar1pg_hi` is therefore the arm WITH the grid; the control arm next to
     # it explicitly puts the reservation back. The roles of the two rows are
     # thus swapped relative to the 2026-07-30 run, while the numbers stay
@@ -109,7 +109,7 @@ ARM_TABLE=(
     # (1576.0 / 1337.2), bar1pgvorbehalt_hi to the bar1pg_hi of back then
     # (1321.6 / 1151.6).
     "bar1pg_hi|bar1||--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
-    "bar1pgvorbehalt_hi|bar1|SGLANG_HTCCL_BAR1_GRAPH_GITTER=0|--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
+    "bar1pgvorbehalt_hi|bar1|SGLANG_BARLINK_BAR1_GRAPH_GRID=0|--rank-auto-reserve-mib 4500,4200,4200 --cuda-graph-backend-prefill breakable"
 )
 # A caller may narrow the list; the names must match column 1.
 S13_NUR="${S13_NUR:-}"
@@ -247,10 +247,10 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # the prefill graph and silently does not get it would otherwise be
         # reported as a prefill-graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
-            "HTCCL enabled for group" \
+            "barlink enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: setup in" \
-            "HTCCL-BAR1-PIPE:" \
+            "barlink-BAR1: setup in" \
+            "barlink-BAR1-PIPE:" \
             "Disable prefill CUDA graph" \
             "disabling prefill CUDA graph" \
             "prefill CUDA graph begin" \

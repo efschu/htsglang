@@ -76,12 +76,12 @@ already generated overrides it.
   NNODES                         total nodes (>1 enables multi-node)
   NODE_RANK                      0 on the head node
   DIST_INIT_ADDR                 <head-ip>:<port>, reachable from both nodes
-  SGLANG_HTCCL                   1 = host-staged cross-vendor collectives
-  SGLANG_HTCCL_TRANSPORT         ucx|shm|gloo
-  SGLANG_HTCCL_UCX_LIB           path to a matching libucp.so.0
+  SGLANG_BARLINK                   1 = host-staged cross-vendor collectives
+  SGLANG_BARLINK_TRANSPORT         ucx|shm|gloo
+  SGLANG_BARLINK_UCX_LIB           path to a matching libucp.so.0
   UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES
                                  passed through unchanged
-  Note: HTCCL synchronises with the host inside every collective, so it
+  Note: barlink synchronises with the host inside every collective, so it
   cannot be captured — ENFORCE_EAGER=1 is required with it.
 
 --- kv cache and speculative decoding --------------------------------------
@@ -266,10 +266,10 @@ fi
 : "${NNODES:=}"
 : "${NODE_RANK:=}"
 : "${DIST_INIT_ADDR:=}"
-# HTCCL and UCX are read from the environment by the fork / by libucp; export
+# barlink and UCX are read from the environment by the fork / by libucp; export
 # whatever the caller set so the values reach the worker processes unchanged.
-for v in SGLANG_HTCCL SGLANG_HTCCL_TRANSPORT SGLANG_HTCCL_UCX_LIB \
-         SGLANG_HTCCL_UCX_OVERLAP UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES; do
+for v in SGLANG_BARLINK SGLANG_BARLINK_TRANSPORT SGLANG_BARLINK_UCX_LIB \
+         SGLANG_BARLINK_UCX_OVERLAP UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES; do
     if [ -n "${!v:-}" ]; then export "${v?}"; fi
 done
 
@@ -356,7 +356,7 @@ add --speculative-draft-placement "$SPECULATIVE_DRAFT_PLACEMENT"
 add --speculative-cross-algorithm "$SPECULATIVE_CROSS_ALGORITHM"
 # sglang has no --enforce-eager (that is vLLM's spelling); the equivalent is
 # --disable-cuda-graph. ENFORCE_EAGER is kept as an alias because the fork's
-# own notes use that word for the HTCCL requirement. Either variable sets the
+# own notes use that word for the barlink requirement. Either variable sets the
 # same flag, and the flag is emitted at most once.
 case "${ENFORCE_EAGER}${DISABLE_CUDA_GRAPH}" in
     *1*|*true*|*TRUE*|*yes*|*on*) args+=(--disable-cuda-graph) ;;

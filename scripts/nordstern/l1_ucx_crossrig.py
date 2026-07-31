@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Nordstern L1: cross-rig correctness + throughput for the HTCCL UCX transport.
+"""Nordstern L1: cross-rig correctness + throughput for the barlink UCX transport.
 
 Runs one rank per host. CPU tensors only -- this validates the transport
 (rendezvous, version parity, tag matching, chunking, every collective) over the
@@ -25,7 +25,7 @@ import types
 
 
 def load_transport(comm_dir: str):
-    """Import htccl_ucx{,_bindings} from `comm_dir` without importing sglang."""
+    """Import barlink_ucx{,_bindings} from `comm_dir` without importing sglang."""
     for name in (
         "sglang",
         "sglang.srt",
@@ -45,12 +45,12 @@ def load_transport(comm_dir: str):
         return mod
 
     base = "sglang.srt.distributed.device_communicators."
-    _load(base + "htccl_ucx_bindings", os.path.join(comm_dir, "htccl_ucx_bindings.py"))
-    return _load(base + "htccl_ucx", os.path.join(comm_dir, "htccl_ucx.py"))
+    _load(base + "barlink_ucx_bindings", os.path.join(comm_dir, "barlink_ucx_bindings.py"))
+    return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
 
 
 class _Comm:
-    """Stand-in for HTCCLCommunicator: a FRESH output tensor per call."""
+    """Stand-in for BarlinkCommunicator: a FRESH output tensor per call."""
 
     def _get_out_buf(self, ref):
         import torch
@@ -85,14 +85,14 @@ def main() -> int:
     )
     mod = load_transport(args.comm_dir)
     bindings = sys.modules[
-        "sglang.srt.distributed.device_communicators.htccl_ucx_bindings"
+        "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"
     ]
     lib = bindings.UcpLibrary.instance()
     print(f"[rank {args.rank}] UCX {lib.version_string()} from {lib.path}", flush=True)
 
     if args.expect_version_mismatch:
         try:
-            mod.HTCCLUcxTransport(cpu_group=dist.group.WORLD,
+            mod.BarlinkUcxTransport(cpu_group=dist.group.WORLD,
                                   device=torch.device("cpu"))
         except bindings.UcxVersionMismatch as e:
             print(f"[rank {args.rank}] REJECTED as designed:\n{e}", flush=True)
@@ -101,7 +101,7 @@ def main() -> int:
         return 1
 
     t0 = time.monotonic()
-    t = mod.HTCCLUcxTransport(cpu_group=dist.group.WORLD, device=torch.device("cpu"))
+    t = mod.BarlinkUcxTransport(cpu_group=dist.group.WORLD, device=torch.device("cpu"))
     print(f"[rank {args.rank}] rendezvous+wireup {time.monotonic()-t0:.3f}s", flush=True)
 
     comm = _Comm()
@@ -119,37 +119,37 @@ def main() -> int:
     torch.manual_seed(20260726)
     parts = [torch.randn(97, 131) for _ in range(W)]
 
-    chk("all_reduce", t.htccl_all_reduce(comm, parts[R].clone()), sum(parts), 1e-4)
+    chk("all_reduce", t.barlink_all_reduce(comm, parts[R].clone()), sum(parts), 1e-4)
 
-    a = t.htccl_all_reduce(comm, parts[R].clone())
+    a = t.barlink_all_reduce(comm, parts[R].clone())
     a_snapshot = a.clone()
-    b = t.htccl_all_reduce(comm, (parts[R] * 3).clone())
+    b = t.barlink_all_reduce(comm, (parts[R] * 3).clone())
     if a.data_ptr() == b.data_ptr():
         fails.append("all_reduce returned an aliased buffer")
     chk("all_reduce/no-aliasing", a, a_snapshot, 0.0)
 
     t.ring_bytes = 1024  # force the ring branch (no-op at world=2 by design)
     big = [torch.randn(8, 512, 64) for _ in range(W)]
-    chk("all_reduce/large", t.htccl_all_reduce(comm, big[R].clone()), sum(big), 1e-3)
+    chk("all_reduce/large", t.barlink_all_reduce(comm, big[R].clone()), sum(big), 1e-3)
     t.ring_bytes = 1 << 30
 
     bf = [p.bfloat16() for p in parts]
-    chk("all_reduce/bf16", t.htccl_all_reduce(comm, bf[R].clone()).float(),
+    chk("all_reduce/bf16", t.barlink_all_reduce(comm, bf[R].clone()).float(),
         sum(p.float() for p in bf), 3e-1)
 
     for dim in (0, 1, -1):
         chk(f"all_gather/dim={dim}",
-            t.htccl_all_gather(comm, parts[R].clone(), dim),
+            t.barlink_all_gather(comm, parts[R].clone(), dim),
             torch.cat(parts, dim=dim))
 
     three = [torch.randn(2, 3, 5) for _ in range(W)]
-    chk("all_gather/3d dim=2", t.htccl_all_gather(comm, three[R].clone(), 2),
+    chk("all_gather/3d dim=2", t.barlink_all_gather(comm, three[R].clone(), 2),
         torch.cat(three, dim=2))
 
     for src in range(W):
         payload = torch.arange(257, dtype=torch.float32) + src * 1000
         tensor = payload.clone() if R == src else torch.zeros(257)
-        chk(f"broadcast/src={src}", t.htccl_broadcast(comm, tensor, src), payload)
+        chk(f"broadcast/src={src}", t.barlink_broadcast(comm, tensor, src), payload)
 
     rs = [torch.randn(2 * W, 3, 4 * W) for _ in range(W)]
     total = sum(rs)
@@ -158,10 +158,10 @@ def main() -> int:
         c = moved.shape[0] // W
         want = moved[R * c:(R + 1) * c].movedim(0, dim).contiguous()
         chk(f"reduce_scatter/dim={dim}",
-            t.htccl_reduce_scatter(comm, rs[R].clone(), dim), want, 1e-4)
+            t.barlink_reduce_scatter(comm, rs[R].clone(), dim), want, 1e-4)
 
     t.chunk_bytes = 8192  # force multi-chunk transfers
-    chk("all_reduce/chunked", t.htccl_all_reduce(comm, parts[R].clone()),
+    chk("all_reduce/chunked", t.barlink_all_reduce(comm, parts[R].clone()),
         sum(parts), 1e-4)
 
     # Pipelining (task #198) over the REAL link: ramps, not randn, so a chunk
@@ -170,17 +170,17 @@ def main() -> int:
                          ("one-past-boundary", 2049), ("sub-chunk", 5)):
         ramp = [torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
                 for r in range(W)]
-        chk(f"pipeline/{label}", t.htccl_all_reduce(comm, ramp[R].clone()),
+        chk(f"pipeline/{label}", t.barlink_all_reduce(comm, ramp[R].clone()),
             sum(ramp), 1e-2)
     ramp = [torch.arange(9000, dtype=torch.float32) * (r + 3) for r in range(W)]
-    piped = t.htccl_all_reduce(comm, ramp[R].clone())
+    piped = t.barlink_all_reduce(comm, ramp[R].clone())
     # Save and RESTORE, never assign True back: the bench below reports which
     # path it measured, and a hard-coded restore would silently re-enable
-    # pipelining in the SGLANG_HTCCL_UCX_PIPELINE=0 control run -- turning the
+    # pipelining in the SGLANG_BARLINK_UCX_PIPELINE=0 control run -- turning the
     # A/B into a measurement of the same code twice.
     was = t.pipeline
     t.pipeline = False
-    plain = t.htccl_all_reduce(comm, ramp[R].clone())
+    plain = t.barlink_all_reduce(comm, ramp[R].clone())
     t.pipeline = was
     chk("pipeline/matches-unpipelined", piped, plain, 0.0)
 
@@ -191,13 +191,13 @@ def main() -> int:
         ramp = [torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
                 for r in range(W)]
         chk(f"ag-pipeline/{label}",
-            t.htccl_all_gather(comm, ramp[R].clone(), 0),
+            t.barlink_all_gather(comm, ramp[R].clone(), 0),
             torch.cat(ramp, dim=0), 0.0)
     ramp = [torch.arange(9000, dtype=torch.float32) * (r + 3) for r in range(W)]
-    g_piped = t.htccl_all_gather(comm, ramp[R].clone(), 0)
+    g_piped = t.barlink_all_gather(comm, ramp[R].clone(), 0)
     was = t.pipeline  # save/restore, same reason as the all_reduce toggle
     t.pipeline = False
-    g_plain = t.htccl_all_gather(comm, ramp[R].clone(), 0)
+    g_plain = t.barlink_all_gather(comm, ramp[R].clone(), 0)
     t.pipeline = was
     chk("ag-pipeline/matches-unpipelined", g_piped, g_plain, 0.0)
     t.chunk_bytes = 4 << 20
@@ -217,7 +217,7 @@ def main() -> int:
     inp.fill_(-777.0)
     chk("async/input-free-after-issue", t.wait_async(h1), sum(ar_a), 1e-2)
     a_res = t.wait_async(t.all_reduce_async(comm, ar_a[R].clone()))
-    s_res = t.htccl_all_reduce(comm, ar_a[R].clone())
+    s_res = t.barlink_all_reduce(comm, ar_a[R].clone())
     chk("async/matches-sync", a_res, s_res, 0.0)
     h1 = t.all_gather_async(comm, ar_b[R].clone(), 0)
     chk("async/all_gather", t.wait_async(h1), torch.cat(ar_b, dim=0), 0.0)
@@ -238,8 +238,8 @@ def main() -> int:
         # the 8 KiB cell is the decode path and re-measuring it after every
         # transport change is the standing rule of this harness.
         ops = (
-            ("all_reduce", lambda x: t.htccl_all_reduce(comm, x)),
-            ("all_gather", lambda x: t.htccl_all_gather(comm, x, 0)),
+            ("all_reduce", lambda x: t.barlink_all_reduce(comm, x)),
+            ("all_gather", lambda x: t.barlink_all_gather(comm, x, 0)),
         )
         per_rep = {(name, mib): [] for name, _ in ops for mib in cells}
         bar_reps = []
@@ -296,7 +296,7 @@ def main() -> int:
             sync_s, async_s = [], []
             for _ in range(50):
                 t0 = time.perf_counter()
-                t.htccl_all_reduce(comm, x)
+                t.barlink_all_reduce(comm, x)
                 busy(busy_us)
                 sync_s.append(time.perf_counter() - t0)
             for _ in range(50):

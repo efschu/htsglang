@@ -36,7 +36,7 @@
 //
 // Ist zc deutlich schneller als die 37 us von NCCL, dann ist der Vorsprung
 // des NIC-Arms ueberwiegend ein Software-Vorsprung und mit einem besseren
-// eigenen Transport (HTCCL) einzuholen -- ohne NIC, ohne Treiber-Patch.
+// eigenen Transport (barlink) einzuholen -- ohne NIC, ohne Treiber-Patch.
 // Bleibt zc bei ~37 us, ist der RAM-Pfad tatsaechlich strukturell teuer und
 // der NIC-Umweg verdient seinen Namen nicht.
 //

@@ -3,7 +3,7 @@
 
 WARUM DIESE DATEI UEBERHAUPT EXISTIERT
 --------------------------------------
-``all_to_all`` in die HTCCL-Naht zu bauen war richtig und **wirkungslos**:
+``all_to_all`` in die barlink-Naht zu bauen war richtig und **wirkungslos**:
 die MoE-Dispatcher rufen dort nicht an. Nachgesehen, nicht angenommen --
 ``deepep.py:578`` ``buffer.dispatch(...)``, ``flashinfer.py:259``
 ``moe_a2a.dispatch(...)``, ``mooncake.py:236``, ``nixl.py:293``,
@@ -78,7 +78,7 @@ gezaehlt hat. Genau diese Reihenfolge steht hier: lokale Zerlegung, dann
 
 Der Zaehlwerte-Abgleich ist ein Host-Kollektiv und braucht die Zahlen auf der
 CPU. Das ist der Grund, warum dieser Pfad **nicht CUDA-Graph-faehig** ist --
-derselbe Grund, aus dem ``htccl.py:525`` den ungleich geteilten
+derselbe Grund, aus dem ``barlink.py:525`` den ungleich geteilten
 ``all_to_all_single`` dort ausnimmt. ``server_args`` schaltet deshalb fuer
 ``--moe-a2a-backend bar1ep`` die Graphen ab, wie es das fuer
 ``deepep_mode=normal`` schon tut.
@@ -105,7 +105,7 @@ verschieden, waere das ein Haenger und kein Fehler.
 
 FP8
 ---
-Der Kern bewegt **Bytes** (``htccl_bar1_ext.py:1136``, "Kein Datentyp, keine
+Der Kern bewegt **Bytes** (``barlink_bar1_ext.py:1136``, "Kein Datentyp, keine
 Reduktion"). ``torch.float8_e4m3fn`` braucht deshalb keinen Sonderweg -- die
 Nutzlast wird ohnehin als ``uint8`` angefasst, damit auch kein
 ``index_select`` auf einem fp8-Tensor noetig ist. Was **nicht** von selbst
@@ -188,7 +188,7 @@ def bar1ep_transport(gruppe_koordinator=None):
 
     Jede Bedingung ist rangeinheitlich: sie haengt an gruppenweit
     abgeglichenem Zustand (Umgebungsvariablen, ``_a2a_beleg`` aus einem
-    ``all_gather_object`` in ``htccl_bar1.byte_beleg_a2a``, Geometrie aus
+    ``all_gather_object`` in ``barlink_bar1.byte_beleg_a2a``, Geometrie aus
     rangeinheitlichen Groessen). Zwei Raenge duerfen hier nie verschieden
     antworten -- der eine liefe ins Kollektiv, der andere nicht, und daraus
     wuerde ein Haenger statt eines Fehlers.
@@ -198,24 +198,24 @@ def bar1ep_transport(gruppe_koordinator=None):
 
         gruppe_koordinator = get_tp_group()
 
-    comm = getattr(gruppe_koordinator, "htccl_comm", None)
+    comm = getattr(gruppe_koordinator, "barlink_comm", None)
     if comm is None:
         return None, (
-            "HTCCL ist nicht aktiv (SGLANG_HTCCL=0 oder world_size==1). Der "
-            "BAR1-Direktpfad haengt am HTCCLCommunicator; ohne ihn gibt es "
+            "barlink ist nicht aktiv (SGLANG_BARLINK=0 oder world_size==1). Der "
+            "BAR1-Direktpfad haengt am BarlinkCommunicator; ohne ihn gibt es "
             "weder Peer-Zeiger-Tabelle noch Schlitze."
         )
     if getattr(comm, "disabled", False):
-        return None, "HTCCLCommunicator ist abgeschaltet (world_size == 1)."
+        return None, "BarlinkCommunicator ist abgeschaltet (world_size == 1)."
     t = getattr(comm, "transport", None)
     if t is None:
         return None, (
-            "HTCCL laeuft auf der gloo-Ebene -- kein Transport. "
-            "SGLANG_HTCCL_TRANSPORT=bar1 oder =matrix waehlt den Direktpfad."
+            "barlink laeuft auf der gloo-Ebene -- kein Transport. "
+            "SGLANG_BARLINK_TRANSPORT=bar1 oder =matrix waehlt den Direktpfad."
         )
     fehlend = [
         n
-        for n in ("htccl_all_to_all_single", "traegt_a2a", "a2a_schlitz_bytes")
+        for n in ("barlink_all_to_all_single", "traegt_a2a", "a2a_schlitz_bytes")
         if not hasattr(t, n)
     ]
     if fehlend:
@@ -227,8 +227,8 @@ def bar1ep_transport(gruppe_koordinator=None):
     if schlitz <= 0:
         return None, (
             "Der BAR1-Transport steht, aber sein a2a-Byte-Beleg ist nicht "
-            "bestanden (oder SGLANG_HTCCL_BAR1_A2A=0). Ohne bestandenen Beleg "
-            "meldet sich all_to_all ab -- siehe htccl_bar1.byte_beleg_a2a."
+            "bestanden (oder SGLANG_BARLINK_BAR1_A2A=0). Ohne bestandenen Beleg "
+            "meldet sich all_to_all ab -- siehe barlink_bar1.byte_beleg_a2a."
         )
     return t, ""
 
@@ -306,7 +306,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         from sglang.srt.distributed.parallel_state import get_tp_group
 
         self.gruppe = get_tp_group()
-        self.comm = getattr(self.gruppe, "htccl_comm", None)
+        self.comm = getattr(self.gruppe, "barlink_comm", None)
         self.transport, grund = bar1ep_transport(self.gruppe)
         if self.transport is None:
             raise Bar1EPUnverfuegbar(
@@ -322,7 +322,7 @@ class Bar1EPDispatcher(BaseDispatcher):
             # Raengen als die Peer-Zeiger-Tabelle -- ein Haenger, kein Fehler.
             raise Bar1EPUnverfuegbar(
                 "bar1ep laeuft nur auf der TP-Gruppe: der BAR1-Transport "
-                "haengt an get_tp_group().htccl_comm, und eine zweite Gruppe "
+                "haengt an get_tp_group().barlink_comm, und eine zweite Gruppe "
                 "haette weder Peer-Zeiger noch Schlitze."
             )
 
@@ -441,7 +441,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         """Passt ueberhaupt EINE Zeile in einen Schlitz?
 
         Die Frage ist nicht akademisch: der Schlitz ist ``chunk_max`` aus
-        ``htccl_bar1.geometrie`` und faellt mit der Fenstergroesse. Eine
+        ``barlink_bar1.geometrie`` und faellt mit der Fenstergroesse. Eine
         Zeile, die nicht hineinpasst, laesst sich auch nicht in Runden
         zerlegen -- die Zerlegung teilt Zeilen, nicht Zeileninhalte. Dann
         meldet sich der Dispatcher ab, statt spaeter im heissen Pfad zu
@@ -456,7 +456,7 @@ class Bar1EPDispatcher(BaseDispatcher):
                 raise Bar1EPUnverfuegbar(
                     f"Eine {name}-Zeile ist {zb} Byte gross und passt nicht in "
                     f"den a2a-Schlitz von {self._schlitz} Byte. Groesseres "
-                    f"Fenster (SGLANG_HTCCL_BAR1_FENSTER_MIB) -- ein Rueckfall "
+                    f"Fenster (SGLANG_BARLINK_BAR1_WINDOW_MIB) -- ein Rueckfall "
                     f"waere hier keine Loesung, sondern eine andere Messung "
                     f"unter demselben Namen."
                 )
@@ -487,7 +487,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         Die Versaetze werden ausgerechnet und **uebergeben**, statt die Naht
         sie als Praefixsumme raten zu lassen: eine Runde bewegt aus jedem
         Block nur ein Stueck, und die Bloecke bleiben dabei stehen, wo sie
-        sind. Genau dafuer nimmt ``htccl_bar1.htccl_all_to_all_single`` seit
+        sind. Genau dafuer nimmt ``barlink_bar1.barlink_all_to_all_single`` seit
         dieser Aenderung ``sende_versatz``/``empfangs_versatz`` entgegen; der
         Kernel hat Versaetze und Laengen ohnehin immer getrennt bekommen.
         """
@@ -508,7 +508,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         aus_flach = aus.reshape(-1)
         # Ein leerer Tensor hat data_ptr() == 0. Sind BEIDE Seiten leer,
         # zeigen sie auf dieselbe Adresse, und die Erweiterung lehnt das ab
-        # ("in und out duerfen nicht dasselbe sein", htccl_bar1_ext.py:1209) --
+        # ("in und out duerfen nicht dasselbe sein", barlink_bar1_ext.py:1209) --
         # zu Recht, denn sie kann nicht wissen, dass hier nichts zu bewegen
         # ist. Aussteigen darf man trotzdem nicht: die anderen Raenge warten
         # in derselben Sperre auf meine Flagge, auch wenn ich null Byte
@@ -538,7 +538,7 @@ class Bar1EPDispatcher(BaseDispatcher):
                     f"Rundenzerlegung haette das verhindern muessen -- diese "
                     f"Zeile ist der Beweis, dass sie es nicht hat."
                 )
-            self.transport.htccl_all_to_all_single(
+            self.transport.barlink_all_to_all_single(
                 self.comm, aus_flach, ein_flach, s_len, e_len, s_off, e_off,
             )
         return aus
@@ -889,7 +889,7 @@ class Bar1EPDispatcher(BaseDispatcher):
            derselben Buchhaltung.
 
         Faellt irgendetwas davon, meldet sich **bar1ep** ab. ``all_reduce``
-        und der a2a der HTCCL-Naht bleiben unberuehrt: sie haben ihre eigenen
+        und der a2a der barlink-Naht bleiben unberuehrt: sie haben ihre eigenen
         Belege, und aus einem gefallenen Dispatcher folgt nichts ueber sie.
         """
         ok, grund = True, ""

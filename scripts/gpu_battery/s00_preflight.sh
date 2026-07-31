@@ -47,7 +47,7 @@ required = [
     f"{wt}/scripts/p2p_readiness/capability_matrix.py",
     f"{wt}/scripts/p2p_readiness/d2d_bench.py",
     f"{wt}/scripts/p2p_readiness/nccl_transport_check.py",
-    f"{wt}/python/sglang/srt/distributed/device_communicators/htccl_path_rates.py",
+    f"{wt}/python/sglang/srt/distributed/device_communicators/barlink_path_rates.py",
     f"{venv}/bin/python",
     f"{model_root}/Qwen3.6-27B-FP8",
     f"{model_root}/Huihui-Qwen3.6-27B-abliterated-AWQ-MTP",

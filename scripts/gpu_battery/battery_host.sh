@@ -46,7 +46,7 @@ BAR1_REGKEY="${BAR1_REGKEY:-RMSmallBarP2PPeerBar1=1}"
 
 # The JIT extension cache. Shared across boots on purpose: a cold build of the
 # BAR1 extension costs minutes and would be paid eight times in s12.
-BAR1_EXTCACHE="${BAR1_EXTCACHE:-/spinning/htccl_extcache_host}"
+BAR1_EXTCACHE="${BAR1_EXTCACHE:-/spinning/barlink_extcache_host}"
 
 BAR1_PORT="${BAR1_PORT:-30030}"
 

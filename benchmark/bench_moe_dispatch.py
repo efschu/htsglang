@@ -59,12 +59,12 @@ AUFRUF
 ------
 ::
 
-    SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=bar1 \\
+    SGLANG_BARLINK=1 SGLANG_BARLINK_TRANSPORT=bar1 \\
     torchrun --nproc_per_node=3 benchmark/bench_moe_dispatch.py \\
         --hidden 4096 --experts 24 --topk 8 \\
         --tokens 128,512,2048 --verteilung gleich,schief
 
-``SGLANG_HTCCL`` und ``SGLANG_HTCCL_TRANSPORT`` muessen **vor** dem Aufbau
+``SGLANG_BARLINK`` und ``SGLANG_BARLINK_TRANSPORT`` muessen **vor** dem Aufbau
 der Prozessgruppe stehen -- der ``GroupCoordinator`` liest sie dort. Das
 Programm prueft das und bricht mit Grund ab, statt eine gloo-Ebene zu messen
 und sie ``bar1ep`` zu nennen.
@@ -447,7 +447,7 @@ def messe(args, lebend, gruppe, welt, rank, geraet):
                     eine_runde(d, x, topk, ereignisse)
                     runden += 1
                 # Ueber die CPU-Gruppe, nicht ueber die Vorgabegruppe: bei
-                # aktivem HTCCL ist die Vorgabegruppe NCCL, und auf einer
+                # aktivem barlink ist die Vorgabegruppe NCCL, und auf einer
                 # Gruppe ueber zwei Hersteller ist das kein langsamerer Weg,
                 # sondern ein Haenger.
                 dist.barrier(group=gruppe.cpu_group)
@@ -598,19 +598,19 @@ def main() -> int:
     # Diese beiden liest der GroupCoordinator beim Aufbau. Sie hier zu setzen
     # waere zu spaet -- also wird nur geprueft und mit Grund abgebrochen.
     if "bar1ep" in args.varianten:
-        if os.environ.get("SGLANG_HTCCL", "0") in ("0", "false", ""):
+        if os.environ.get("SGLANG_BARLINK", "0") in ("0", "false", ""):
             print(
-                "SGLANG_HTCCL ist nicht gesetzt. Ohne HTCCL gibt es keinen "
+                "SGLANG_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen "
                 "BAR1-Transport, und was dann liefe, waere die gloo-Ebene "
                 "unter dem Namen bar1ep. Abbruch."
             )
             return 2
-        if os.environ.get("SGLANG_HTCCL_TRANSPORT", "device") not in (
+        if os.environ.get("SGLANG_BARLINK_TRANSPORT", "device") not in (
             "bar1", "matrix"
         ):
             print(
-                f"SGLANG_HTCCL_TRANSPORT="
-                f"{os.environ.get('SGLANG_HTCCL_TRANSPORT')!r} ist kein "
+                f"SGLANG_BARLINK_TRANSPORT="
+                f"{os.environ.get('SGLANG_BARLINK_TRANSPORT')!r} ist kein "
                 f"Direktpfad. bar1ep braucht 'bar1' oder 'matrix'. Abbruch."
             )
             return 2

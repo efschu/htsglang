@@ -46,7 +46,7 @@ import pathlib
 import sys
 
 p = (pathlib.Path(sys.argv[1])
-     / "python/sglang/srt/distributed/device_communicators/htccl_bar1_pipe_ext.py")
+     / "python/sglang/srt/distributed/device_communicators/barlink_bar1_pipe_ext.py")
 tree = ast.parse(p.read_text(encoding="utf-8"))
 for node in tree.body:
     if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "_CUDA_SRC":

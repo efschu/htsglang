@@ -11,7 +11,7 @@ Verified:
   * each point's boot ran the arm it claims. For bar1: every communicator group
     reports ACHIEVED=bar1 -- the requested name says bar1 even when the group
     fell back to gloo, and one mixed group makes the point a mixed point. For
-    the baseline: NO HTCCL group at all,
+    the baseline: NO barlink group at all,
   * a decode point at bs=1 and one at bs=16 per arm,
   * an output sample per arm is persisted. A fast garbage run looks good in a
     throughput table (measurement rule 5),
@@ -147,14 +147,14 @@ def check(step_dir: str) -> None:
             if groups:
                 raise CheckFail(
                     f"Grundlinie boot at {entry.get('sessions')} sessions reports "
-                    f"HTCCL groups {[g.get('group') for g in groups]} -- the "
-                    "baseline must not see a single SGLANG_HTCCL* variable"
+                    f"barlink groups {[g.get('group') for g in groups]} -- the "
+                    "baseline must not see a single SGLANG_BARLINK* variable"
                 )
             continue
         if not groups:
             raise CheckFail(
                 f"bar1 boot at {entry.get('sessions')} sessions reports not a "
-                "single ERREICHT line -- HTCCL was not on"
+                "single ERREICHT line -- barlink was not on"
             )
         for prefix in REQUIRED_GROUP_PREFIXES:
             hits = [g for g in groups if str(g.get("group", "")).startswith(prefix)]

@@ -425,14 +425,14 @@ def default_collective_min(tp_cpu_group) -> Callable[[List[int]], List[int]]:
     """The production consensus channel: one bounded MIN all-reduce of the
     packed proposal over the TP CPU (gloo) group.
 
-    Uses the #312 bounded primitive when the HTCCL liveness table is
+    Uses the #312 bounded primitive when the barlink liveness table is
     published (dead peer -> loud ``PeerLostError`` instead of a hang); the
     primitive itself degrades to the plain blocking call when liveness is
     off, which is the fork's pre-#312 behavior."""
     import torch
     import torch.distributed as dist
 
-    from sglang.srt.distributed.device_communicators.htccl_liveness import (
+    from sglang.srt.distributed.device_communicators.barlink_liveness import (
         bounded_collective,
     )
 

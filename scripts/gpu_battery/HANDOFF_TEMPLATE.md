@@ -82,7 +82,7 @@ In addition, depending on the step:
   `/root/battery-bar1/`; the run directory holds only the grep result and a
   tail. So:
   ```bash
-  cat $S/htccl_lines.txt | head -40        # s11: setup, ERREICHT, bolt
+  cat $S/barlink_lines.txt | head -40        # s11: setup, ERREICHT, bolt
   cat $S/belege/*.txt | grep ERREICHT      # s12: arm proof per point
   tail -40 $S/server.log                   # bounded tail, not the log
   ```

@@ -2,7 +2,7 @@
 # S6 -- NCCL / system-RAM reference measurement, #279 rate source 3.
 #
 # The measurement the dispatcher's third source has been waiting for. Its
-# FORMAT was defined in htccl_path_rates before the run existed, so this step
+# FORMAT was defined in barlink_path_rates before the run existed, so this step
 # writes directly loadable JSON and needs no glue.
 #
 # NCCL_DEBUG=INFO output goes to a FILE, never to stdout: a debug log in an

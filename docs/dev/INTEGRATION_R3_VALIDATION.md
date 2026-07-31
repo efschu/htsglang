@@ -1,5 +1,13 @@
 # integration/r3-probe — validation record
 
+> **Naming note (task #358).** Everything this record calls `HTCCL`,
+> `htccl_*.py` or `SGLANG_HTCCL*` is now called `barlink`, `barlink_*.py` and
+> `SGLANG_BARLINK*`. The old names are left standing throughout this file on
+> purpose: these are dated measurements, and every arm below was booted with
+> the variables spelled the way they appear here. Rewriting them would claim
+> a run that never happened. For the current spelling see
+> `docs/dev/DESIGN_358_barlink_rename.md`.
+
 Hardware: 1x RTX 5090 (sm_120) + 2x RTX 3080 (sm_86), uneven TP=3, uneven DCP.
 Model: Qwen3.6-27B-FP8. Every arm run with **CUDA graphs + speculative
 decoding** (not eager), `--rank-tp-ratio auto-performance`,

@@ -390,10 +390,10 @@ sufficient:
    is legal (`DESIGN_201:1691-1699`;
    `kv_pressure_ladder.py:47-52`; the three symmetry assertions at
    `model_runner.py:1194`, `base_runner.py:63-94`,
-   `decode_cuda_graph_runner.py:1298-1302`). HTCCL has **no `all_gatherv`**
+   `decode_cuda_graph_runner.py:1298-1302`). barlink has **no `all_gatherv`**
    (`parallel_state.py:1732`) and its uneven `all_to_all` is explicitly not
-   capturable (`htccl.py:936-944`); BAR1 round plans are baked per captured
-   shape (`htccl_bar1.py:2798-2801`). Cost unit = graph pool x rungs.
+   capturable (`barlink.py:936-944`); BAR1 round plans are baked per captured
+   shape (`barlink_bar1.py:2798-2801`). Cost unit = graph pool x rungs.
 6. **No sensor exists.** `CollectiveClock`
    (`python/sglang/srt/utils/collective_clock.py:69`) is armed for *plain
    prefill forwards only* and is blind under graph replay

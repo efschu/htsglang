@@ -54,8 +54,8 @@ MAXTOK_FLAG=""
 
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export TORCHDYNAMO_DISABLE=1
-export SGLANG_HTCCL=1
-export SGLANG_HTCCL_TRANSPORT=${TRANSPORT:-gloo}
+export SGLANG_BARLINK=1
+export SGLANG_BARLINK_TRANSPORT=${TRANSPORT:-gloo}
 export MAX_JOBS=4
 # The shm message-queue broadcaster is a NODE-LOCAL shared-memory optimisation.
 # Across two hosts its handle is broadcast with dist.broadcast_object_list and

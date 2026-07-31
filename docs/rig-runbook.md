@@ -67,7 +67,7 @@ accidental CUDA init sees no devices.
 ## 2. Environment variables
 
 Every entry states what breaks when the variable is missing. All
-`SGLANG_HTCCL*` variables must be **identical on every rank of a group** —
+`SGLANG_BARLINK*` variables must be **identical on every rank of a group** —
 divergence does not produce a wrong answer, it deadlocks (the transports spin
 on flags a differently-configured peer never publishes; documented at the
 definitions in `python/sglang/srt/environ.py`).
@@ -80,8 +80,8 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_UNEVEN_DCP_WEIGHTED` | `1` | selects the weighted (non-uniform) token-owner rule on top of the above; set both together for uneven-DCP runs. `0` (even-modulo owner rule under an uneven plan) is a valid comparison arm and boots since #345 — before that the first idle check killed the server with `pool memory leak detected! [full] total=N, available=dcp_size*N`, because the leak check compared this rank's physical pool against the allocator's GLOBAL slot space |
 | `SGLANG_MAMBA_SSM_DTYPE` | `bfloat16` | `environ.py` default is unset; resolution order is env > model config > `float32` (`configs/mamba_utils.py`). The Qwen3.6-27B configs pin `float32`, so without the env the GDN/SSM state pool is twice as large |
 | `CUDA_VISIBLE_DEVICES` | `99` (desk work only) | makes CUDA see no devices when the cards are occupied by other agents. Never set it for launches that use `--rank-gpu-id`: the mapping addresses the full device view |
-| `SGLANG_HTCCL` | `1` only for HTCCL runs | routes TP collectives over HTCCL instead of NCCL (default off = byte-identical stock dispatch). Required for cross-vendor (NVIDIA+AMD) groups; forceable on homogeneous groups for testing |
-| `SGLANG_HTCCL_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_HTCCL_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_HTCCL_UCX_CHUNK_MIB` (4), `SGLANG_HTCCL_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_HTCCL_UCX_AG_RING_KIB` (32; the all_gather ring, 0 disables it), `SGLANG_HTCCL_UCX_GRAIN_ELEMS` (32768; largest host-side pass kept on the calling thread, 0 restores the unchunked passes), `SGLANG_HTCCL_UCX_TIMEOUT_S` (300), `SGLANG_HTCCL_UCX_OVERLAP` (off) |
+| `SGLANG_BARLINK` | `1` only for barlink runs | routes TP collectives over barlink instead of NCCL (default off = byte-identical stock dispatch). Required for cross-vendor (NVIDIA+AMD) groups; forceable on homogeneous groups for testing |
+| `SGLANG_BARLINK_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_BARLINK_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_BARLINK_UCX_CHUNK_MIB` (4), `SGLANG_BARLINK_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_BARLINK_UCX_AG_RING_KIB` (32; the all_gather ring, 0 disables it), `SGLANG_BARLINK_UCX_GRAIN_ELEMS` (32768; largest host-side pass kept on the calling thread, 0 restores the unchunked passes), `SGLANG_BARLINK_UCX_TIMEOUT_S` (300), `SGLANG_BARLINK_UCX_OVERLAP` (off) |
 | `SGLANG_DEBUG_INPUT_BUFFER_POOL` | `1` for diagnosis only | logs one line per CUDA-graph input-buffer pool registration (scope, lane, name, numel, dtype, device, pointer, new/adopted). This is how you see two groups landing on one buffer; noisy, never for measurements |
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
@@ -312,14 +312,14 @@ without it.
 ### 4.3 Cross-rig (rig 1 + rig 2)
 
 Status: executed and measured. The cross-rig TP=4 GPU/model boot runs
-Qwen3.6-27B-FP8 with the HTCCL `ucx` data plane over the 40G RoCE link; the
+Qwen3.6-27B-FP8 with the barlink `ucx` data plane over the 40G RoCE link; the
 most recent point (task #263) reached READY in 80 s and decoded at 166.2 ms
 per verify round. (The "not yet executed" wording that stood here, and the
 matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
 #198/#204/#233.) What is settled:
 
 - **Both hosts must run the SAME sglang tree, not just the same
-  `htccl_ucx.py`.** Requests are `msgspec` structs broadcast rank-to-rank, so
+  `barlink_ucx.py`.** Requests are `msgspec` structs broadcast rank-to-rank, so
   a field the newer side adds kills the older side at deserialization —
   observed as `TypeError: Unexpected keyword argument 'spill_class'` in
   `broadcast_pyobj` on the stale rank, several minutes into a boot that
@@ -347,22 +347,22 @@ matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
   and the RoCE interface are visible. Rig-1 side: the Proxmox host
   (`<RDMA_R1>`). Rig-2 side: rig 2 itself (`<RDMA_R2>`). The development
   container can never be a cross-rig rank.
-- Flags/env on both sides: `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=ucx`,
+- Flags/env on both sides: `SGLANG_BARLINK=1 SGLANG_BARLINK_TRANSPORT=ucx`,
   `--enable-metrics` (mandatory, section 3), `--nnodes 4 --node-rank 0..3`,
   `--dist-init-addr <LAN ip>:<port>` (control plane stays on the 1 GbE LAN;
   only UCX rides the 40G link); per rank `UCX_TLS=rc,self,sm`,
   `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=<port>`.
-- Add `SGLANG_HTCCL_UCX_WORKERS=2` on **every** rank for a cross-rig group:
+- Add `SGLANG_BARLINK_UCX_WORKERS=2` on **every** rank for a cross-rig group:
   a second UCX context per rank, with the flat exchange's peers split over
   the two, is -7.6 % on the bs=1 decode all-reduce and -8.1 % on the decode
   all-gather, and neutral at ring sizes (task #266, table in FEATURES section
   21). It is rank-uniform and enforced as such — a rank left at the default 1
   is refused at rendezvous with a message naming the variable, not a hang.
-  Leave `SGLANG_HTCCL_UCX_RING_BIDIR` at 0: splitting the ring as well
+  Leave `SGLANG_BARLINK_UCX_RING_BIDIR` at 0: splitting the ring as well
   measured +17 % and exists only as the A/B control.
 - `ucx`/`gloo`/`shm` are host-staged: the boot must disable CUDA graphs
   (section 6.3), otherwise it is rejected at startup by design.
-- Both hosts must load the same UCX release (`SGLANG_HTCCL_UCX_LIB` points at
+- Both hosts must load the same UCX release (`SGLANG_BARLINK_UCX_LIB` points at
   a specific `libucp.so.0`); mixed releases are refused at rendezvous before
   any endpoint exists.
 - `ucx` is a transport choice, not a network requirement: it also runs
@@ -376,13 +376,13 @@ messages here, the bulk there". Two flags replace it where that matters:
 
 | Flag | Env | Reaches |
 | --- | --- | --- |
-| `--collective-net-small DEV` | `SGLANG_COLLECTIVE_NET_SMALL` | the HTCCL UCX collective context (pinned via `ucp_config_modify(NET_DEVICES)`, not via the process environment) |
+| `--collective-net-small DEV` | `SGLANG_COLLECTIVE_NET_SMALL` | the barlink UCX collective context (pinned via `ucp_config_modify(NET_DEVICES)`, not via the process environment) |
 | `--collective-net-bulk DEV` | `SGLANG_COLLECTIVE_NET_BULK` | PD-KV / HiCache — seeds `--disaggregation-ib-device` when that is unset, dropping the `:<port>` suffix |
 
 `DEV` is the `UCX_NET_DEVICES` spelling (`rocep4s0f1:1`, a comma-separated
 list, or `all`). Unset, nothing changes: the context is built from the
 unmodified environment config, exactly as before the flags existed. The value
-is deliberately **not** rank-uniform — unlike every `SGLANG_HTCCL*` knob — as
+is deliberately **not** rank-uniform — unlike every `SGLANG_BARLINK*` knob — as
 the two ends of one link have different local names (`rocep4s0f1` here,
 `rocep1s0f1` on rig 2). What has to match is the wire.
 
@@ -390,7 +390,7 @@ the two ends of one link have different local names (`rocep4s0f1` here,
 
 | Class | Carrier | Selected by |
 | --- | --- | --- |
-| (a) TP collectives, small (decode / verify all-reduce, gather) | HTCCL UCX context | `--collective-net-small` |
+| (a) TP collectives, small (decode / verify all-reduce, gather) | barlink UCX context | `--collective-net-small` |
 | (b) TP collectives, large (prefill chunks) | the **same** UCX context | `--collective-net-small` — no separate seam |
 | (c) PD-KV / HiCache bulk | mooncake / nixl transfer engine | `--collective-net-bulk` → `--disaggregation-ib-device` |
 | (d) Rendezvous / control | gloo process group | `--dist-init-addr`, `GLOO_SOCKET_IFNAME` (untouched on purpose) |
@@ -403,7 +403,7 @@ server logs that (b) stays on the `small` link rather than silently implying a
 split that is not there.
 
 The **second UCX context** this section used to describe as unbuilt now exists
-(`SGLANG_HTCCL_UCX_WORKERS`, task #266): a second `UcpWorker`, its address
+(`SGLANG_BARLINK_UCX_WORKERS`, task #266): a second `UcpWorker`, its address
 carried in the same rendezvous `all_gather_object`, and a worker selector that
 every rank evaluates identically — `(rank + peer) % ways` for the flat
 exchange, which is symmetric in the pair, so the two ends agree without
@@ -871,9 +871,9 @@ MODEL_NAME=Qwen3.5-4B RATIO=20,12 CTX=16384 MEMFRAC=0.85 \
 below. `scripts/pp/pp_link_pingpong.py` measures the boundary payload on the
 wire alone, and `scripts/pp/pp_measure.py` drives a running server.
 
-**No HTCCL, and that is the whole reason this slice was cheap.** PP's transport
+**No barlink, and that is the whole reason this slice was cheap.** PP's transport
 is `torch.distributed.isend/irecv` on the NCCL `device_group` plus gloo for the
-pickled metadata (`parallel_state.send_tensor_dict`). HTCCL exists for
+pickled metadata (`parallel_state.send_tensor_dict`). barlink exists for
 cross-VENDOR groups; both cards here are NVIDIA. Nothing is host-staged, so —
 unlike the cross-rig TP=4 recipe in 4.3 — **CUDA graphs stay on, on both
 stages, including the sm75 one** (`cuda graph: True` in the rig-2 decode lines).
@@ -911,9 +911,9 @@ on rig 2 with `AttributeError: 'str' object has no attribute
 `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0` for exactly this reason); with that
 set, rank 0's scheduler exits silently during `init_distributed` while rank 1
 sits in `all_reduce` forever (`py-spy`: `distributed_c10d.py:3075`). That is why
-4.3's cross-rig TP recipe runs on HTCCL/UCX rather than NCCL — and HTCCL is
+4.3's cross-rig TP recipe runs on barlink/UCX rather than NCCL — and barlink is
 host-staged, so it forces eager. **The pipeline needs neither the broadcaster
-workaround nor HTCCL, and keeps its CUDA graphs.** Under PP each node holds
+workaround nor barlink, and keeps its CUDA graphs.** Under PP each node holds
 `tp_size=1`, so no TP group ever spans the two hosts; that is the structural
 reason, not luck.
 
@@ -930,7 +930,7 @@ Things that decide whether this boots at all:
   are not.** With `NCCL_IB_HCA=rocep*s0f1 NCCL_IB_GID_INDEX=3` the first
   5120-byte proxy tensor comes back as `IBV_WC_REM_INV_REQ_ERR(9) ...
   req_type=Send ... hca rocep1s0f1` and the communicator dies, while UCX drives
-  the same two HCAs fine for HTCCL (4.3). `NCCL_IB_DISABLE=1` with
+  the same two HCAs fine for barlink (4.3). `NCCL_IB_DISABLE=1` with
   `NCCL_SOCKET_IFNAME` on the RoCE interface measures 2.07 GB/s — i.e. the
   40G line, not the 1 GbE (0.105 GB/s, 4.8). This is the default in the rank
   script; `NCCL_IB=1` re-arms verbs for whoever wants to chase it. For a
@@ -1523,10 +1523,10 @@ lane's in `DualGroupLane._finish`.
 > The driver-side part of this path (source patch, the dma-buf holder module,
 > and the standalone probes) is **not** part of this repository. It lives in
 > the separate `smallbar-p2p` repository and is pointed at from here only
-> through `SGLANG_HTCCL_BAR1_NV_QUELLE`. This fork carries the runtime
+> through `SGLANG_BARLINK_BAR1_NV_SOURCE`. This fork carries the runtime
 > transport, nothing else.
 
-`SGLANG_HTCCL_TRANSPORT=bar1` — TP collectives in which every card writes
+`SGLANG_BARLINK_TRANSPORT=bar1` — TP collectives in which every card writes
 straight into its neighbour's memory across the PCIe BAR. Works on 256 MiB
 BARs, i.e. on every GeForce in this rig. **Needs a patched driver and cannot
 run in the development container.** Status: transport measured (1.13-1.34x
@@ -1557,7 +1557,7 @@ apparmor=unconfined -v /sys:/sys`; without the AppArmor exception you get
 The patch itself is **not in this repo**; it lives in the private
 `efschu/nvidia-smallbar-p2p` (NVIDIA's open kernel modules are MIT/GPLv2, the
 holder module is the fork author's own GPL-2.0 code). This tree only takes the
-header tree PATH, through `SGLANG_HTCCL_BAR1_NV_QUELLE`.
+header tree PATH, through `SGLANG_BARLINK_BAR1_NV_SOURCE`.
 
 #### Loading the driver
 
@@ -1595,46 +1595,46 @@ Checks:
 
 #### The switches
 
-All rank-uniform, all under one prefix, so unsetting `SGLANG_HTCCL*` is the
+All rank-uniform, all under one prefix, so unsetting `SGLANG_BARLINK*` is the
 complete off switch. **Everything is opt-in: without an explicit choice
 nothing changes.**
 
 | Variable | Effect |
 |---|---|
-| `SGLANG_HTCCL=1` | HTCCL at all |
-| `SGLANG_HTCCL_TRANSPORT=bar1\|device\|host\|matrix` | transport choice |
-| `SGLANG_HTCCL_GRAPH_FREIGABE=1` | allows `bar1`/`matrix` under CUDA graphs. **Only after `bar1_graph_check.py` has passed** (section 6.3) |
-| `SGLANG_HTCCL_BAR1_NV_QUELLE=<tree>` | driver headers for the JIT build |
-| `SGLANG_HTCCL_BAR1_FENSTER_MIB[_<GROUP>]` | BAR1 window, settable per communicator group. 96 MiB maps contiguously out of 256 gross |
-| `SGLANG_HTCCL_BAR1_RING_AB` / `_GITTER_AB` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
-| `SGLANG_HTCCL_BAR1_GRAPH_GITTER=0\|1` | cooperative launch **under capture**. Unset it and the default follows `SGLANG_HTCCL_GRAPH_FREIGABE` — same gate, same question (`bar1_graph_check.py`, case `gitter`). Forcing it to `0` restores the old reservation and costs 16.1 % prefill throughput once anything captures the prefill (#293 lever run) |
-| `SGLANG_HTCCL_BAR1_PIPE=1` | pipelined kernel |
-| `SGLANG_HTCCL_BAR1_PIPE_DIREKT=0\|1` | direct mode. Off under capture regardless, loudly — its host-side ring index would be baked per graph |
-| `SGLANG_HTCCL_BAR1_A2A=0` | `all_to_all` off, which also turns `all_gather` off: they share the slot area and the byte proof |
-| `SGLANG_HTCCL_BAR1_AG=0` | `all_gather` off on its own. Default **on**; off means the standard run aborts in graph capture, which is the bug this covered |
-| `SGLANG_HTCCL_BAR1_AG_MAX_RUNDEN` | cap on kernel launches per all_gather (16). Not a window limit |
-| `SGLANG_HTCCL_PEER_LIVENESS=0` | **off switch for the #312 peer-liveness bound.** Default on: host waits get a deadline plus a `kill(pid, 0)` check on the peer processes, and a watchdog writes an abort word the BAR1 spin kernels poll. `0` restores the previous, unbounded blocking calls exactly — which means a killed rank leaves the survivors spinning again, so only set it to diagnose the mechanism itself |
-| `SGLANG_HTCCL_PEER_TIMEOUT_S` | seconds a host wait may make no progress (120). Scaled by `SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT` while the cold-build window is open, so a first boot on an empty kernel cache does not trip it. A DEAD peer is caught regardless of this value — death is a fact, the deadline only carries the wedged-but-alive case |
-| `SGLANG_HTCCL_PEER_PROBE_S` | how often a stalled wait, and the watchdog thread, may ask whether the peer processes still exist (1). One `kill(pid, 0)` per peer |
-| `SGLANG_HTCCL_PEER_WATCHDOG=0` | keeps the bounded host waits but stops the watchdog thread. The device-side spin then falls back to its cycle deadline alone, which is the pre-#312 behaviour for kernels under graph replay |
+| `SGLANG_BARLINK=1` | barlink at all |
+| `SGLANG_BARLINK_TRANSPORT=bar1\|device\|host\|matrix` | transport choice |
+| `SGLANG_BARLINK_GRAPH_ENABLE=1` | allows `bar1`/`matrix` under CUDA graphs. **Only after `bar1_graph_check.py` has passed** (section 6.3) |
+| `SGLANG_BARLINK_BAR1_NV_SOURCE=<tree>` | driver headers for the JIT build |
+| `SGLANG_BARLINK_BAR1_WINDOW_MIB[_<GROUP>]` | BAR1 window, settable per communicator group. 96 MiB maps contiguously out of 256 gross |
+| `SGLANG_BARLINK_BAR1_RING_THRESHOLD` / `_GITTER_AB` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
+| `SGLANG_BARLINK_BAR1_GRAPH_GRID=0\|1` | cooperative launch **under capture**. Unset it and the default follows `SGLANG_BARLINK_GRAPH_ENABLE` — same gate, same question (`bar1_graph_check.py`, case `gitter`). Forcing it to `0` restores the old reservation and costs 16.1 % prefill throughput once anything captures the prefill (#293 lever run) |
+| `SGLANG_BARLINK_BAR1_PIPE=1` | pipelined kernel |
+| `SGLANG_BARLINK_BAR1_PIPE_DIRECT=0\|1` | direct mode. Off under capture regardless, loudly — its host-side ring index would be baked per graph |
+| `SGLANG_BARLINK_BAR1_A2A=0` | `all_to_all` off, which also turns `all_gather` off: they share the slot area and the byte proof |
+| `SGLANG_BARLINK_BAR1_AG=0` | `all_gather` off on its own. Default **on**; off means the standard run aborts in graph capture, which is the bug this covered |
+| `SGLANG_BARLINK_BAR1_AG_MAX_ROUNDS` | cap on kernel launches per all_gather (16). Not a window limit |
+| `SGLANG_BARLINK_PEER_LIVENESS=0` | **off switch for the #312 peer-liveness bound.** Default on: host waits get a deadline plus a `kill(pid, 0)` check on the peer processes, and a watchdog writes an abort word the BAR1 spin kernels poll. `0` restores the previous, unbounded blocking calls exactly — which means a killed rank leaves the survivors spinning again, so only set it to diagnose the mechanism itself |
+| `SGLANG_BARLINK_PEER_TIMEOUT_S` | seconds a host wait may make no progress (120). Scaled by `SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT` while the cold-build window is open, so a first boot on an empty kernel cache does not trip it. A DEAD peer is caught regardless of this value — death is a fact, the deadline only carries the wedged-but-alive case |
+| `SGLANG_BARLINK_PEER_PROBE_S` | how often a stalled wait, and the watchdog thread, may ask whether the peer processes still exist (1). One `kill(pid, 0)` per peer |
+| `SGLANG_BARLINK_PEER_WATCHDOG=0` | keeps the bounded host waits but stops the watchdog thread. The device-side spin then falls back to its cycle deadline alone, which is the pre-#312 behaviour for kernels under graph replay |
 
 #### Booting the standard run over the direct path
 
-Section 4.1's recipe, unchanged, plus the HTCCL lines. Anything else stays
+Section 4.1's recipe, unchanged, plus the barlink lines. Anything else stays
 identical — that is what makes the baseline comparable.
 
 ```bash
 source /root/rig-env.sh 2>/dev/null || true
-export SGLANG_HTCCL=1
-export SGLANG_HTCCL_TRANSPORT=bar1
-export SGLANG_HTCCL_GRAPH_FREIGABE=1
-export SGLANG_HTCCL_BAR1_NV_QUELLE="${NV_SRC:-<NV_PATCHED_TREE>}"
+export SGLANG_BARLINK=1
+export SGLANG_BARLINK_TRANSPORT=bar1
+export SGLANG_BARLINK_GRAPH_ENABLE=1
+export SGLANG_BARLINK_BAR1_NV_SOURCE="${NV_SRC:-<NV_PATCHED_TREE>}"
 export CUDA_HOME="${VENV:-<VENV>}/lib/python3.12/site-packages/nvidia/cu13"
 export TORCH_CUDA_ARCH_LIST="8.6;12.0"
 export MAX_JOBS=4
 ```
 
-For the **baseline**, drop exactly the three `SGLANG_HTCCL*` lines and change
+For the **baseline**, drop exactly the three `SGLANG_BARLINK*` lines and change
 nothing else. Do not set `CUDA_DEVICE_ORDER=PCI_BUS_ID` — `cuda:0` is the 5090
 in the standard run, and the reserve values in 4.1 are written for that order
 (section 6.1).
@@ -1648,7 +1648,7 @@ in the standard run, and the reserve values in 4.1 are written for that order
 
 # Transport against NCCL, interleaved in one run
 "$VENV/bin/python" benchmark/bench_host_transport.py --devices 0,1,2 \
-  --op all_reduce --backends htccl:bar1,nccl --dtype bfloat16
+  --op all_reduce --backends barlink:bar1,nccl --dtype bfloat16
 
 # Diagnosis with a full traceback
 "$VENV/bin/python" benchmark/bar1_diag.py 0,1,2
@@ -1662,17 +1662,17 @@ failed on the holder with ENOMEM and fell back to gloo — and both lines said
 `transport=bar1`. Half of the resulting number was not a bar1 number.
 
 ```bash
-grep "HTCCL-BAR1: Aufbau in" "$LOG"   # one line per communicator group
+grep "barlink-BAR1: Aufbau in" "$LOG"   # one line per communicator group
 grep "ACHIEVED=" "$LOG"               # requested= vs ACHIEVED=
 ```
 
 With `SGLANG_UNEVEN_DCP=1` there are **two** groups (`tp:0`, `dcp:0`) and
 **both** must report `ACHIEVED=bar1`. Queryable at runtime as
-`htccl.gruppen_stand()` / `htccl.stand_zusammenfassung()`. A mixed run is not
+`barlink.gruppen_stand()` / `barlink.stand_zusammenfassung()`. A mixed run is not
 a bar1 measurement and must not be reported as one.
 
 Also: a blown deadline invalidates every number from the run. Check
-`htccl.status()` or grep the log for the timeout message before reporting
+`barlink.status()` or grep the log for the timeout message before reporting
 anything.
 
 #### Rank count is proof only from the output
@@ -1735,7 +1735,7 @@ against `nvidia-smi -L` before hardcoding indices anywhere.
 - No MPS daemon anywhere on rig 1 (check: `/tmp/nvidia-mps` exists only when
   a daemon runs).
 
-### 6.3 CUDA-graph capability follows the HTCCL transport
+### 6.3 CUDA-graph capability follows the barlink transport
 
 Enforced allowlist in `python/sglang/srt/distributed/parallel_state.py`. Ask
 `capturable_transports()`, never the constant — the release switch is added in
@@ -1745,15 +1745,15 @@ place and not the other.
 | Transport | Capturable | Why |
 |---|---|---|
 | `device`, `host` | yes, proven | GPU-driven. Both keep their per-op sequence number in **device** memory and never call a synchronize, so a replay advances it exactly as the first run did. `host` qualifies because of who drives it, not because of where its bytes sit |
-| `bar1`, `matrix` | only with `SGLANG_HTCCL_GRAPH_FREIGABE=1` | GPU-driven and believed capturable, but that was a statement about the code, not the hardware. Do **not** set the switch before `benchmark/bar1_graph_check.py` has passed on free cards (section 4.15) |
+| `bar1`, `matrix` | only with `SGLANG_BARLINK_GRAPH_ENABLE=1` | GPU-driven and believed capturable, but that was a statement about the code, not the hardware. Do **not** set the switch before `benchmark/bar1_graph_check.py` has passed on free cards (section 4.15) |
 | `shm`, `gloo`, `ucx`, any unknown name | no | host-staged: pinned allocation, `dist.*` on the CPU, `Event.synchronize()`. An unknown name silently becomes the inline gloo plane |
 
 A graph-enabled boot on a host-staged transport is rejected at startup with
-the reason. Consequence for measurements: an HTCCL run on a CPU-staged
+the reason. Consequence for measurements: an barlink run on a CPU-staged
 transport is always eager — never compare its numbers against a graph-enabled
 NCCL run without saying so.
 
-Under a capture there is **no fallback**. `htccl._select` refuses loudly
+Under a capture there is **no fallback**. `barlink._select` refuses loudly
 instead of dropping into the gloo plane, because that plane would run once at
 capture time and never again on replay — wrong numbers without a crash. The
 message names the op, the size, and the ops the transport does cover. If you
@@ -2412,7 +2412,7 @@ for a in d["arms"]:
     print("%-24s %-7s %ss" % (a["id"], a["status"], a["elapsed_s"]))'
 
 # One arm is stuck? Stop that one; the rest keeps its numbers.
-curl -s -X POST $UI/api/commsuite/cancel -d '{"arm":"collective_htccl_ucx"}'
+curl -s -X POST $UI/api/commsuite/cancel -d '{"arm":"collective_barlink_ucx"}'
 
 # The finished digest and the EXACT markdown that would be posted. Pure
 # render -- this sends nothing to GitHub.
@@ -2434,11 +2434,11 @@ curl -s -X POST $UI/api/share/rig_submit -d '{
 | `rig_profile` | inventory | nothing | 0.1 s |
 | `noise_floor` | cpu | nothing | 3.9 s |
 | `collective_gloo` | cpu | nothing | 1.9 s |
-| `collective_htccl_ucx` | cpu | nothing | 2.8 s |
+| `collective_barlink_ucx` | cpu | nothing | 2.8 s |
 | `byte_gate` | cpu | nothing | 1.6 s |
 | `card_probe` | gpu | a card window | absent under contention |
 | `collective_nccl` | gpu | a card window, >= 2 cards | absent under contention |
-| `collective_htccl_shm` | gpu | a card window | absent under contention |
+| `collective_barlink_shm` | gpu | a card window | absent under contention |
 | `cross_rig` | network | a reachable peer | absent in the container |
 
 **The CPU arms run first, and that is the point.** Measured on this rig with
@@ -2446,7 +2446,7 @@ all three cards held by another job: **10.3 s wall** for the whole run, five
 arms with numbers and four honestly absent. A suite that needed the cards
 would have returned nothing at all on a busy rig, which is most of the time.
 
-**HTCCL/shm is a GPU arm, not a CPU one.** `HTCCLShmTransport` pins its shared
+**barlink/shm is a GPU arm, not a CPU one.** `BarlinkShmTransport` pins its shared
 segment to a CUDA device for zero-copy H2D/D2H, so it cannot run device-free
 — constructing it with `torch.device("cpu")` fails in `_pin_host_memory`.
 There is no CPU-only shm cell and the suite does not invent one.

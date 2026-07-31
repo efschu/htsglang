@@ -1,24 +1,24 @@
-[2026-07-30 10:44:00 TP1] HTCCL enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP2] HTCCL enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP0] HTCCL enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP1] HTCCL-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP0] HTCCL-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP1] HTCCL-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
-[2026-07-30 10:44:00 TP2] HTCCL-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP0] HTCCL-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
-[2026-07-30 10:44:00 TP2] HTCCL-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
-[2026-07-30 10:44:00 TP0] HTCCL enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP1] HTCCL enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP2] HTCCL enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP1] HTCCL-BAR1: setup in 35 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP0] HTCCL-BAR1: setup in 36 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP2] HTCCL-BAR1: setup in 36 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
-[2026-07-30 10:44:00 TP1] HTCCL-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
-[2026-07-30 10:44:00 TP0] HTCCL-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
-[2026-07-30 10:44:00 TP2] HTCCL-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
-[2026-07-30 10:44:00 TP2] HTCCL enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP1] HTCCL enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
-[2026-07-30 10:44:00 TP0] HTCCL enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_HTCCL* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP1] barlink enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP2] barlink enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP0] barlink enabled for group 'world:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP1] barlink-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP0] barlink-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP1] barlink-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
+[2026-07-30 10:44:00 TP2] barlink-BAR1: setup in 46 ms, 2 peer targets, region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP0] barlink-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
+[2026-07-30 10:44:00 TP2] barlink-BAR1: BAR1 ledger of this card after group 'tp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB.
+[2026-07-30 10:44:00 TP0] barlink enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP1] barlink enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP2] barlink enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP1] barlink-BAR1: setup in 35 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP0] barlink-BAR1: setup in 36 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP2] barlink-BAR1: setup in 36 ms, 2 peer targets, region 24.8 MiB per rank (12 slots (of which 2(R-1) for all_to_all)), slot 2120 KiB, largest payload 6360 KiB, flags 5376 bytes, export via NV_ESC_EXPORT_TO_DMABUF_FD. From here on, nothing is mapped anymore on the hot path.
+[2026-07-30 10:44:00 TP1] barlink-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
+[2026-07-30 10:44:00 TP0] barlink-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
+[2026-07-30 10:44:00 TP2] barlink-BAR1: BAR1 ledger of this card after group 'dcp:0': world:0: 96.0 MiB, tp:0: 96.0 MiB, dcp:0: 24.9 MiB.
+[2026-07-30 10:44:00 TP2] barlink enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP1] barlink enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
+[2026-07-30 10:44:00 TP0] barlink enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1. Every SGLANG_BARLINK* env must be identical on all ranks; the host-staged transports (shm/gloo/ucx) additionally require --disable-cuda-graph.
 [2026-07-30 10:44:49 TP1] Scheduler hit an exception: Traceback (most recent call last):
   File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py", line 280, in __init__
     self.capture()
@@ -41,14 +41,14 @@
   File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/speculative/spec_utils.py", line 138, in capture_safe_tp_broadcast
     tp_group.broadcast(t, src=src)
   File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/distributed/parallel_state.py", line 1760, in broadcast
-    return self.htccl_comm.broadcast(input_, src)
+    return self.barlink_comm.broadcast(input_, src)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/distributed/device_communicators/htccl.py", line 1044, in broadcast
+  File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/distributed/device_communicators/barlink.py", line 1044, in broadcast
     t = self._select("broadcast", tensor.numel() * tensor.element_size())
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/distributed/device_communicators/htccl.py", line 587, in _select
+  File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/distributed/device_communicators/barlink.py", line 587, in _select
     raise RuntimeError(
-RuntimeError: HTCCL: 'broadcast' with 128 bytes during a CUDA graph capture, but bar1 reports handles('broadcast', 128) -> False. The fallback path is the host-staged gloo layer (pinned allocation, dist.* on the CPU, Event.synchronize()) -- which runs ONCE at capture time and not at all on replay. That would produce wrong numbers without a crash, so this aborts instead. Fix: --disable-cuda-graph, or choose a transport that can genuinely run this operation at this size (SGLANG_HTCCL_TRANSPORT=device covers all_reduce/all_gather/reduce_scatter/broadcast completely).
+RuntimeError: barlink: 'broadcast' with 128 bytes during a CUDA graph capture, but bar1 reports handles('broadcast', 128) -> False. The fallback path is the host-staged gloo layer (pinned allocation, dist.* on the CPU, Event.synchronize()) -- which runs ONCE at capture time and not at all on replay. That would produce wrong numbers without a crash, so this aborts instead. Fix: --disable-cuda-graph, or choose a transport that can genuinely run this operation at this size (SGLANG_BARLINK_TRANSPORT=device covers all_reduce/all_gather/reduce_scatter/broadcast completely).
 
 During handling of the above exception, another exception occurred:
 
@@ -71,4 +71,4 @@ Traceback (most recent call last):
                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/spinning/subvol-999-disk-0/spinning/wt-gpu-battery/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py", line 282, in __init__
     raise Exception(
-Exception: Capture cuda graph failed: HTCCL: 'broadcast' with 128 bytes during a CUDA graph capture, but bar1 reports handles('broadcast', 128) -> False. The fallback path is the host-staged gloo layer (pinned allocation, dist.* on the CPU, Event.synchronize()) -- which runs ONCE at capture time and not at all on replay. That would produce wrong numbers without a crash, so this aborts instead. Fix: --disable-cuda-graph, or choose a transport that can genuinely run this operation at this size (SGLANG_HTCCL_TRANSPORT=device covers all_reduce/all_gather/reduce_scatter/broadcast completely).
+Exception: Capture cuda graph failed: barlink: 'broadcast' with 128 bytes during a CUDA graph capture, but bar1 reports handles('broadcast', 128) -> False. The fallback path is the host-staged gloo layer (pinned allocation, dist.* on the CPU, Event.synchronize()) -- which runs ONCE at capture time and not at all on replay. That would produce wrong numbers without a crash, so this aborts instead. Fix: --disable-cuda-graph, or choose a transport that can genuinely run this operation at this size (SGLANG_BARLINK_TRANSPORT=device covers all_reduce/all_gather/reduce_scatter/broadcast completely).

@@ -10,13 +10,13 @@ Three extractions carry the step:
   * the graph gate. bar1_graph_check.py prints one PASSED/FAILED line per
     case with a [Gate]/[Info] marker and exits 0 only when every gate case
     passed. Both are recorded: the exit code alone would hide WHICH case fell.
-  * per-group attainment. parallel_state logs "HTCCL enabled for group '<x>':
+  * per-group attainment. parallel_state logs "barlink enabled for group '<x>':
     requested=<a>, ACHIEVED=<e>" on success and the same pair as a WARNING on
     fallback. The requested name is worthless -- it says bar1 either way. Only
     ACHIEVED counts, and it counts PER GROUP: with SGLANG_UNEVEN_DCP=1 there
     are two (tp:0, dcp:0), and a run where one of them fell back to gloo is a
     mixed measurement, not a bar1 measurement.
-  * the coverage bolt. htccl._select raises rather than falling back to the
+  * the coverage bolt. barlink._select raises rather than falling back to the
     host-staged gloo level during a graph capture. It is extracted as its own
     field, with op and size, because it is the expected failure of the current
     integration and needs to be distinguishable from any other crash.
@@ -31,7 +31,7 @@ Three extractions carry the step:
     step really asks for.
 
 WHICH FILE THE EVIDENCE IS READ FROM, and why that is not a detail. This used
-to read `htccl_lines.txt` alone -- the grep result the step script harvests
+to read `barlink_lines.txt` alone -- the grep result the step script harvests
 AFTER the server has answered. On every early exit (server never came up,
 capture aborted) the shell writes only `server.log` and jumps to compose, so
 that one file did not exist. `read_lines` returns [] for a missing file, so
@@ -59,7 +59,7 @@ import sys
 
 KIND = "bar1_e2e"
 #: 2: `log_quellen` / `log_zeilen` were added, and the evidence is no longer
-#: read from `htccl_lines.txt` alone. An older artifact must not slip through
+#: read from `barlink_lines.txt` alone. An older artifact must not slip through
 #: here -- it does not carry the fields the check uses to tell "nobody
 #: looked" from "nothing was found".
 #: 3: the smoke goes over /generate instead of /v1/chat/completions, and
@@ -72,7 +72,7 @@ KIND = "bar1_e2e"
 #: its `kohaerent` meant something other than the field of that name here.
 #: 5: the per-group entries under `gruppen` renamed their keys from German to
 #: English -- `gruppe`/`angefordert`/`erreicht` became `group`/`requested`/
-#: `achieved`, in step with htccl.py's report_state(). A schema-4 artifact
+#: `achieved`, in step with barlink.py's report_state(). A schema-4 artifact
 #: still spells them in German, so every group would read back as empty and
 #: the transport check would pass on nothing. Rejecting it by version is the
 #: point: re-run the step rather than read a stale artifact through the new
@@ -124,26 +124,26 @@ MUELL_EINHEIT_MAX = 32
 #: Shorter than this is not an answer anything can be said about.
 MUELL_MIN_ZEICHEN = 20
 
-#: Where the evidence is read from, in this order. `htccl_lines.txt` is the
+#: Where the evidence is read from, in this order. `barlink_lines.txt` is the
 #: complete grep result and therefore comes first; `server.log` is the bounded
 #: excerpt the step script writes on EVERY path -- including the ones that
 #: branch off before the grep.
-LOG_QUELLEN = ("htccl_lines.txt", "server.log")
+LOG_QUELLEN = ("barlink_lines.txt", "server.log")
 
 RE_GROUP = re.compile(
     r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
     r"ACHIEVED=(?P<achieved>[A-Za-z0-9_\-]+)"
 )
 #: #315: these three used to spell "Aufbau"/"Kasse"/"waehrend einer
-#: CUDA-Graph-Aufzeichnung" -- the German wording #295 moved htccl_bar1.py and
-#: htccl.py away from. Dead on every real run since, hidden by fixtures that
+#: CUDA-Graph-Aufzeichnung" -- the German wording #295 moved barlink_bar1.py and
+#: barlink.py away from. Dead on every real run since, hidden by fixtures that
 #: were never re-captured either; see test_bar1_marker_coupling.py, which
 #: checks these regexes against the actual emitter source so the next rename
 #: fails loudly instead of quietly.
 RE_KASSE = re.compile(r"BAR1 ledger of this card after group '(?P<group>[^']+)'")
-RE_AUFBAU = re.compile(r"HTCCL-BAR1: setup in\s+(?P<ms>[0-9.]+)\s*ms")
+RE_AUFBAU = re.compile(r"barlink-BAR1: setup in\s+(?P<ms>[0-9.]+)\s*ms")
 RE_RIEGEL = re.compile(
-    r"HTCCL: '(?P<op>[A-Za-z0-9_]+)' with (?P<bytes>\d+) bytes during a "
+    r"barlink: '(?P<op>[A-Za-z0-9_]+)' with (?P<bytes>\d+) bytes during a "
     r"CUDA graph capture"
 )
 RE_GATE_CASE = re.compile(

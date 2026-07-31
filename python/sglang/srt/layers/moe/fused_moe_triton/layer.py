@@ -99,7 +99,7 @@ def _get_deepep_comm_group(a2a_backend):
         group = get_tp_group()
 
     elif a2a_backend.is_bar1ep():
-        # Der BAR1-Direktpfad haengt an get_tp_group().htccl_comm -- Peer-
+        # Der BAR1-Direktpfad haengt an get_tp_group().barlink_comm -- Peer-
         # Zeiger-Tabelle und Schlitze gibt es nur fuer diese Gruppe. Eine
         # andere Gruppe waere ein Haenger, kein Fehler; deshalb steht dieser
         # Zweig hier und nicht als Sonderfall im Dispatcher.

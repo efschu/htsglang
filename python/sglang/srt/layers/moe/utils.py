@@ -64,7 +64,7 @@ class MoeA2ABackend(Enum):
         ``forward_deepep``, ep_moe/layer.py:275 ``get_moe_impl_class``,
         utils.py ``is_deepep_class_backend``). Gaebe ``bar1ep`` hier False,
         liefe die MoE-Schicht an ihrem eigenen Dispatcher vorbei -- genau der
-        Fehler, wegen dem das a2a in der HTCCL-Naht wirkungslos blieb.
+        Fehler, wegen dem das a2a in der barlink-Naht wirkungslos blieb.
 
         Wer wirklich die DeepEP-Bibliothek meint (also den Bau von
         ``DeepEPDispatcher``/``DeepEPBuffer``), fragt :meth:`is_deepep_native`.
@@ -455,42 +455,42 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
-# HTCCL async MLP-AR overlap (task #198). When enabled, the deferred MLP
+# barlink async MLP-AR overlap (task #198). When enabled, the deferred MLP
 # all-reduce of the fuse path is ISSUED at down_proj (all_reduce_async) and
 # WAITED in the next layer's prepare_attn, so the wire crossing runs under
 # the intervening host work instead of blocking at either end.
 #
 # RANK-UNIFORMITY: the answer below depends only on this env flag and on the
 # group's transport class -- both are required to be identical on every rank
-# (same rule as every SGLANG_HTCCL* variable). It deliberately does NOT
+# (same rule as every SGLANG_BARLINK* variable). It deliberately does NOT
 # depend on payloads, batch contents, or any other rank-local state.
-_HTCCL_UCX_OVERLAP = bool(int(os.environ.get("SGLANG_HTCCL_UCX_OVERLAP", "0")))
+_BARLINK_UCX_OVERLAP = bool(int(os.environ.get("SGLANG_BARLINK_UCX_OVERLAP", "0")))
 
 
-_htccl_overlap_announced = False
+_barlink_overlap_announced = False
 
 
-def htccl_mlp_ar_overlap_comm():
-    """The TP group's HTCCL communicator, iff async MLP-AR overlap is active.
+def barlink_mlp_ar_overlap_comm():
+    """The TP group's barlink communicator, iff async MLP-AR overlap is active.
 
-    None when the flag is off, HTCCL is not running, or the transport has no
+    None when the flag is off, barlink is not running, or the transport has no
     async support -- callers then keep the unmodified sync behavior.
     """
-    if not _HTCCL_UCX_OVERLAP:
+    if not _BARLINK_UCX_OVERLAP:
         return None
     from sglang.srt.distributed import get_tp_group
 
-    comm = getattr(get_tp_group(), "htccl_comm", None)
+    comm = getattr(get_tp_group(), "barlink_comm", None)
     if comm is not None and comm.supports_async():
         # Announce ONCE, so a measurement run can prove the overlap path is
         # live rather than silently dormant -- "no difference" is only a
         # result if the path demonstrably ran.
-        global _htccl_overlap_announced
-        if not _htccl_overlap_announced:
-            _htccl_overlap_announced = True
+        global _barlink_overlap_announced
+        if not _barlink_overlap_announced:
+            _barlink_overlap_announced = True
             logger.info(
-                "HTCCL: async MLP-AR overlap ACTIVE "
-                "(SGLANG_HTCCL_UCX_OVERLAP=1, issue at down_proj, "
+                "barlink: async MLP-AR overlap ACTIVE "
+                "(SGLANG_BARLINK_UCX_OVERLAP=1, issue at down_proj, "
                 "wait in next prepare_attn)."
             )
         return comm

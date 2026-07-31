@@ -14,7 +14,7 @@
 # Eight boots for four points per arm, and that is the price of not comparing
 # two different afternoons. Blockwise would be one boot per arm and worthless.
 #
-# The two arms differ in EXACTLY the three SGLANG_HTCCL* variables. The boot
+# The two arms differ in EXACTLY the three SGLANG_BARLINK* variables. The boot
 # script is generated from one template for both, so they cannot drift.
 #
 # Each boot also leaves its ERREICHT lines behind: a bar1 arm whose second
@@ -130,9 +130,9 @@ for N in $SESSIONS; do
         # The arm's own evidence, BEFORE the numbers: which transport each
         # communicator group really got.
         host_grep_into "$HOSTLOG" "$DIR/belege/${SEQ}_${ARM}_${N}.txt" \
-            "HTCCL enabled for group" \
+            "barlink enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: setup in" \
+            "barlink-BAR1: setup in" \
             "during a CUDA graph capture"
 
         # The server log goes along: accept len and the tick rate of the decode

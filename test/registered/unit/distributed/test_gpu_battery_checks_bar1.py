@@ -10,7 +10,7 @@ Two things get extra attention here, both because they are the ways a green
 verdict could be wrong rather than merely absent:
 
   * THE LOG STRINGS ARE THE REAL ONES. The fixtures carry the lines
-    parallel_state and htccl_bar1 actually emit, including the grep line-number
+    parallel_state and barlink_bar1 actually emit, including the grep line-number
     prefix. A regex that silently stops matching would turn "no group reported
     a fallback" into "every group is fine", which is exactly the failure mode
     the ERREICHT/angefordert split was introduced to end.
@@ -53,7 +53,7 @@ from s11_bar1_e2e import (  # noqa: E402
 from s12_prefill_kurve import tabelle, zusammenfassen  # noqa: E402
 
 # The lines the code really writes -- built from the ACTUAL format strings in
-# parallel_state.py / htccl.py / htccl_bar1.py / benchmark/bar1_graph_check.py
+# parallel_state.py / barlink.py / barlink_bar1.py / benchmark/bar1_graph_check.py
 # via _bar1_marker_source.py, not retyped. #315: this file's fixtures used to
 # be hand-typed and had drifted onto the German wording #295 moved the
 # emitters away from -- both sides matched each other and nothing noticed.
@@ -193,12 +193,12 @@ class TestBar1StepTable:
             step = STEPS_BY_ID[step_id]
             assert step.timeout_s > step.expected_min * 60, step_id
 
-    def test_the_two_arms_differ_in_the_htccl_variables_and_nothing_else(
+    def test_the_two_arms_differ_in_the_barlink_variables_and_nothing_else(
         self, tmp_path
     ):
         """The comparison IS the difference between the arms. Generating both
         from one template makes that testable: anything but the arm label and
-        the SGLANG_HTCCL* array showing up in the diff means the two boots
+        the SGLANG_BARLINK* array showing up in the diff means the two boots
         differ in something nobody intended."""
         script = tmp_path / "gen.sh"
         script.write_text(
@@ -220,14 +220,14 @@ class TestBar1StepTable:
         unterschiede = [(x, y) for x, y in zip(a, b) if x != y]
         assert len(unterschiede) == 2, unterschiede
         assert all(
-            "arm" in x or "HTCCL_ENV" in x for x, _ in unterschiede
+            "arm" in x or "BARLINK_ENV" in x for x, _ in unterschiede
         ), unterschiede
-        arm_a = next(x for x, _ in unterschiede if "HTCCL_ENV" in x)
-        arm_b = next(y for _, y in unterschiede if "HTCCL_ENV" in y)
+        arm_a = next(x for x, _ in unterschiede if "BARLINK_ENV" in x)
+        arm_b = next(y for _, y in unterschiede if "BARLINK_ENV" in y)
         for var in (
-            "SGLANG_HTCCL=1",
-            "SGLANG_HTCCL_TRANSPORT=bar1",
-            "SGLANG_HTCCL_GRAPH_FREIGABE=1",
+            "SGLANG_BARLINK=1",
+            "SGLANG_BARLINK_TRANSPORT=bar1",
+            "SGLANG_BARLINK_GRAPH_ENABLE=1",
         ):
             assert var in arm_a
             assert var not in arm_b
@@ -496,7 +496,7 @@ def _e2e(**over) -> dict:
         "aufbau_ms": [27.0, 31.0],
         "riegel": None,
         "fatal": None,
-        "log_quellen": ["htccl_lines.txt", "server.log"],
+        "log_quellen": ["barlink_lines.txt", "server.log"],
         "log_zeilen": 42,
         "smoke": {
             "vorhanden": True,
@@ -658,7 +658,7 @@ class TestE2ECheck:
         assert "niemand hat geschaut" in line
 
     def test_old_artifact_is_rejected_by_its_schema_version(self, tmp_path):
-        """The producer that only ever read htccl_lines.txt is not readable.
+        """The producer that only ever read barlink_lines.txt is not readable.
 
         Its artifacts are empty on exactly the runs worth diagnosing, and an
         empty artifact from that producer is indistinguishable from a clean
@@ -783,7 +783,7 @@ class TestE2EParsing:
     non-matching pattern would report a clean run for a mixed one."""
 
     def test_two_groups_on_bar1(self, tmp_path):
-        (tmp_path / "htccl_lines.txt").write_text(
+        (tmp_path / "barlink_lines.txt").write_text(
             "\n".join(
                 [
                     LOG_AUFBAU,
@@ -802,7 +802,7 @@ class TestE2EParsing:
         assert out["riegel"] is None
 
     def test_fallback_is_visible_per_group(self, tmp_path):
-        (tmp_path / "htccl_lines.txt").write_text(
+        (tmp_path / "barlink_lines.txt").write_text(
             "\n".join([LOG_GROUP_OK, LOG_GROUP_FALLBACK_DCP])
         )
         out = parse_log_evidence(str(tmp_path))
@@ -815,7 +815,7 @@ class TestE2EParsing:
         """A boot killed by a traceback -- no OOM, no NCCL error -- is just as
         dead. The shell harvests the marker; FATAL_MARKERS used to drop it, so
         exactly that death passed the fatal gate."""
-        (tmp_path / "htccl_lines.txt").write_text(
+        (tmp_path / "barlink_lines.txt").write_text(
             LOG_GROUP_OK
             + "\n910:Traceback (most recent call last):\n"
             + '911:  File "server.py", line 1, in <module>\n'
@@ -825,11 +825,11 @@ class TestE2EParsing:
         assert "Traceback" in out["fatal"]
 
     def test_clean_log_has_no_fatal(self, tmp_path):
-        (tmp_path / "htccl_lines.txt").write_text(LOG_GROUP_OK + "\n")
+        (tmp_path / "barlink_lines.txt").write_text(LOG_GROUP_OK + "\n")
         assert parse_log_evidence(str(tmp_path))["fatal"] is None
 
     def test_bolt_is_extracted_with_op_and_size(self, tmp_path):
-        (tmp_path / "htccl_lines.txt").write_text(LOG_RIEGEL + "\n")
+        (tmp_path / "barlink_lines.txt").write_text(LOG_RIEGEL + "\n")
         out = parse_log_evidence(str(tmp_path))
         assert out["riegel"]["op"] == "all_gather"
         assert out["riegel"]["bytes"] == 10600448
@@ -837,7 +837,7 @@ class TestE2EParsing:
     def test_server_log_alone_carries_the_evidence(self, tmp_path):
         """The file the shell writes on EVERY path, including the aborts.
 
-        htccl_lines.txt is the grep result, harvested only after the server
+        barlink_lines.txt is the grep result, harvested only after the server
         answered. On the run this test is built from it never existed, and
         the parser -- which read that file and nothing else -- reported an
         empty evidence list for a log that carried three ERREICHT lines, the
@@ -868,10 +868,10 @@ class TestE2EParsing:
 
     def test_the_two_sources_do_not_double_count(self, tmp_path):
         """grep prefixes the line number, tail does not -- same line, twice."""
-        (tmp_path / "htccl_lines.txt").write_text(LOG_AUFBAU + "\n")
+        (tmp_path / "barlink_lines.txt").write_text(LOG_AUFBAU + "\n")
         (tmp_path / "server.log").write_text(LOG_AUFBAU.split(":", 1)[1] + "\n")
         out = parse_log_evidence(str(tmp_path))
-        assert out["log_quellen"] == ["htccl_lines.txt", "server.log"]
+        assert out["log_quellen"] == ["barlink_lines.txt", "server.log"]
         assert out["aufbau_lines"] == 1
 
 
@@ -1490,9 +1490,9 @@ class TestPrefillKurveCheck:
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "mixed point" in line
 
-    def test_baseline_point_with_htccl_is_fail(self, tmp_path):
+    def test_baseline_point_with_barlink_is_fail(self, tmp_path):
         """The baseline arm differs in exactly three variables; if it sees
-        HTCCL at all, the two arms are not the two arms."""
+        barlink at all, the two arms are not the two arms."""
         payload = _kurve()
         payload["reihenfolge"][1]["gruppen"] = [
             {"group": "tp:0", "requested": "bar1", "achieved": "bar1"}

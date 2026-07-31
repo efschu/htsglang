@@ -3,7 +3,7 @@
 the consumer defines, plus the two coverage rules the #278 wrap-up bought
 with a wasted measurement.
 
-Schema (htccl_path_rates.NCCL_REFERENCE_*):
+Schema (barlink_path_rates.NCCL_REFERENCE_*):
   * kind == "nccl_reference", schema_version == 1,
   * every row carries ALL ten mandatory fields; a row missing one is dropped
     by the loader, so a file full of nine-field rows loads as an empty file,
@@ -155,11 +155,11 @@ def check(step_dir: str) -> None:
 def _check_loadable(payload: dict) -> None:
     add_repo_to_path()
     try:
-        from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
             load_nccl_reference,
         )
     except Exception as exc:
-        raise CheckStop(f"htccl_path_rates not importable: {exc}") from exc
+        raise CheckStop(f"barlink_path_rates not importable: {exc}") from exc
 
     res = load_nccl_reference(payload)
     if res.errors:

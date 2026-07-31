@@ -65,7 +65,7 @@ def main() -> int:
     )
     sys.path.insert(0, repo_python)
 
-    from sglang.srt.distributed.device_communicators.htccl_path_dispatcher import (
+    from sglang.srt.distributed.device_communicators.barlink_path_dispatcher import (
         PROVENANCE_MEASURED,
         PROVENANCE_PLACEHOLDER,
         STATUS_QUO,
@@ -73,7 +73,7 @@ def main() -> int:
         PathDispatcher,
         PathProfile,
     )
-    from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+    from sglang.srt.distributed.device_communicators.barlink_path_rates import (
         capability_matrix_rows,
         load_rate_tables,
     )

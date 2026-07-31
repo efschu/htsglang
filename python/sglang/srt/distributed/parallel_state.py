@@ -45,6 +45,17 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+
+# Imported for its import-time side effect: it raises if a retired
+# SGLANG_HTCCL* variable is set (task #358). It sits HERE rather than only in
+# the barlink modules because a stale launch script sets SGLANG_HTCCL=1 and
+# then nothing imports barlink at all -- the run would come up over NCCL and
+# quietly measure the wrong transport, which is exactly the failure the guard
+# exists to prevent. parallel_state is imported by every rank of every
+# distributed run, and the guard itself is stdlib-only.
+from sglang.srt.distributed.device_communicators import (  # noqa: F401
+    barlink_env_guard,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -88,15 +99,15 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 #: Fully qualified name of the peer-liveness module. Looked up in
-#: ``sys.modules`` rather than imported: a boot without an HTCCL transport
+#: ``sys.modules`` rather than imported: a boot without an barlink transport
 #: never loads it, and ``GroupCoordinator.barrier`` must not be the thing
 #: that changes that.
-_HTCCL_LIVENESS_MODULE = "sglang.srt.distributed.device_communicators.htccl_liveness"
+_BARLINK_LIVENESS_MODULE = "sglang.srt.distributed.device_communicators.barlink_liveness"
 
-#: Mirrors ``htccl_liveness.ENV_ENABLE``. Duplicated because reading the
+#: Mirrors ``barlink_liveness.ENV_ENABLE``. Duplicated because reading the
 #: switch must not require importing the module the switch controls; the
 #: module's own value is preferred whenever it is already loaded.
-_PEER_LIVENESS_ENV = "SGLANG_HTCCL_PEER_LIVENESS"
+_PEER_LIVENESS_ENV = "SGLANG_BARLINK_PEER_LIVENESS"
 _PEER_LIVENESS_OFF = ("", "0", "false", "no", "off")
 
 
@@ -104,7 +115,7 @@ def _peer_liveness_forced(module=None) -> bool:
     """Did the operator name the feature explicitly, rather than default it?
 
     The module defaults the feature ON, which is right for a process that
-    already runs HTCCL. It is not enough to make a process that does not
+    already runs barlink. It is not enough to make a process that does not
     import the module load it, so the barrier below asks for an explicit
     opt-in instead.
     """
@@ -119,16 +130,16 @@ def _peer_liveness_for_barrier():
     lookup and one ``os.environ`` read: no import, no collective, and the
     caller's original ``torch.distributed.barrier`` unchanged.
     """
-    module = sys.modules.get(_HTCCL_LIVENESS_MODULE)
+    module = sys.modules.get(_BARLINK_LIVENESS_MODULE)
     if module is None:
-        # Never imported => no HTCCL transport in this process. Only an
+        # Never imported => no barlink transport in this process. Only an
         # explicit opt-in justifies importing it just for the barrier.
         if not _peer_liveness_forced():
             return None
-        from sglang.srt.distributed.device_communicators import htccl_liveness
+        from sglang.srt.distributed.device_communicators import barlink_liveness
 
-        return htccl_liveness
-    # An HTCCL transport lives here. A registered table means the identity
+        return barlink_liveness
+    # An barlink transport lives here. A registered table means the identity
     # exchange succeeded and a dead peer can be named by rank, host and pid.
     if module.registered_tables():
         return module
@@ -273,82 +284,77 @@ def reg_all_to_all_single(
 # pinned host buffers for RDMA (FEATURES_VS_UPSTREAM.md, ucx transport table:
 # "`--enforce-eager` required ... Only `device` is capturable"), and any
 # unknown name silently maps to the inline gloo plane in
-# htccl._build_transport. The previous denylist ({"shm", "gloo"}) did not
+# barlink._build_transport. The previous denylist ({"shm", "gloo"}) did not
 # know "ucx", so a ucx boot with CUDA graphs enabled passed this guard and
 # then either crashed mid-capture or captured only rank-local regions --
 # silently, which left the graph regime of a cross-rig measurement unknown.
 #
 # "host" is on the list for the same reason "device" is, and NOT because its
 # bytes sit in host memory -- that is precisely what the other three do too.
-# What decides membership is who drives: htccl_host stages and reduces from
+# What decides membership is who drives: barlink_host stages and reduces from
 # two stream-ordered kernels that spin on flags in the pinned segment, never
 # calls a synchronize, and keeps its per-op sequence number in DEVICE memory
 # so a graph replay advances it exactly as the first run did.
-CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device", "host"})
+CAPTURABLE_BARLINK_TRANSPORTS = frozenset({"device", "host"})
 
-#: Die GPU-getriebenen Transporte, deren Graph-Erfassung geprueft, aber noch
-#: nicht belegt ist. Sie stehen NICHT in der Liste oben -- sie kommen ueber
-#: einen ausdruecklichen Schalter dazu, und nur ueber ihn.
-GRAPH_FREIGABE_TRANSPORTS = frozenset({"bar1", "matrix"})
+#: The GPU-driven transports whose graph capture has been checked but not
+#: yet proven. They are NOT in the list above -- they join it through an
+#: explicit switch, and only through it.
+GRAPH_ENABLE_TRANSPORTS = frozenset({"bar1", "matrix"})
 
-#: Der Schalter. **Nicht umlegen, bevor `benchmark/bar1_graph_check.py` auf
-#: freien Karten bestanden hat.**
+#: The switch. **Do not flip it before `benchmark/bar1_graph_check.py` has
+#: passed on free cards.**
 #:
-#: Warum ein Schalter und nicht einfach zwei weitere Namen in der Liste: was
-#: an bar1 einer Aufzeichnung im Weg stand, ist inzwischen behoben (der
-#: Ausweichriegel in `htccl._select`, die Kernauswahl in
-#: `HTCCLBar1Transport._kern`, der Direkt-Modus in `_erg_platz`) -- aber
-#: "behoben" ist eine Aussage ueber den Code, nicht ueber die Hardware. Der
-#: eine Punkt, der sich ohne Karten nicht klaeren liess, ist, ob der Treiber
-#: `cudaLaunchCooperativeKernel` aus einem Stream-Capture heraus annimmt.
-#: Solange das offen ist, faellt aufgezeichnet die 1blk-Variante, und diese
-#: Zeile bleibt aus.
-_GRAPH_FREIGABE_ENV = "SGLANG_HTCCL_GRAPH_ENABLE"
+#: Why a switch rather than two more names in the list: what stood between
+#: bar1 and a capture has been fixed by now (the fallback bolt in
+#: `barlink._select`, the kernel choice in `BarlinkBar1Transport._kern`, the
+#: direct mode in `_res_slot`) -- but "fixed" is a statement about the code,
+#: not about the hardware. The one point that could not be settled without
+#: cards is whether the driver accepts `cudaLaunchCooperativeKernel` from
+#: inside a stream capture. While that is open, a captured run falls back to
+#: the 1blk variant and this line stays off.
+_GRAPH_ENABLE_ENV = "SGLANG_BARLINK_GRAPH_ENABLE"
+
+#: Environment values that count as "off". Word for word the same tuple as
+#: ``barlink_bar1._OFF`` -- both decide the same thing and must never read
+#: differently.
+_OFF_VALUES = ("0", "no", "off", "false", "")
 
 
-def graph_freigabe_gesetzt() -> bool:
-    """Ob der Freigabeschalter fuer die GPU-getriebenen Transporte steht."""
+def graph_enable_set() -> bool:
+    """Whether the release switch for the GPU-driven transports is on."""
     import os
 
-    # NOTE (task #295, HTCCL env var rename): SGLANG_HTCCL_GRAPH_FREIGABE was
-    # renamed to SGLANG_HTCCL_GRAPH_ENABLE. This function re-reads
-    # os.environ live on every call (by design -- callers may set the env
-    # var at runtime, not just before import), so the alias must be
-    # re-resolved on every call too, not just once at import time -- an
-    # import-time-only resolution would miss an old name set AFTER this
-    # module was first imported. Calling resolve_env_aliases() here keeps
-    # this reader in agreement with htccl_bar1.graph_grid_default(),
-    # regardless of which htccl module happened to import first or when
-    # the caller sets the env var.
-    from sglang.srt.distributed.device_communicators import htccl_env_compat
+    # This function re-reads os.environ live on every call (by design --
+    # callers may set the env var at runtime, not just before import), so the
+    # retired-name check has to run on every call too. An import-time-only
+    # check would miss a retired name exported AFTER this module was first
+    # imported, and that name would then be silently ignored.
+    barlink_env_guard.check_retired_env_vars()
 
-    htccl_env_compat.resolve_env_aliases()
-
-    return os.environ.get(_GRAPH_FREIGABE_ENV, "0") not in (
-        "0", "nein", "aus", "false", ""
-    )
+    return os.environ.get(_GRAPH_ENABLE_ENV, "0") not in _OFF_VALUES
 
 
 def capturable_transports() -> frozenset:
-    """Die AKTUELL als capturable geltende Menge.
+    """The set that counts as capturable RIGHT NOW.
 
-    ``CAPTURABLE_HTCCL_TRANSPORTS`` ist die belegte Grundmenge und bleibt es;
-    diese Funktion ist die Stelle, die den Freigabeschalter dazurechnet. Wer
-    "ist das capturable?" fragt, fragt hier -- nicht die Konstante, sonst
-    wirkt der Schalter an einer Stelle und an der anderen nicht.
+    ``CAPTURABLE_BARLINK_TRANSPORTS`` is the proven base set and stays that
+    way; this function is the one place that adds the release switch on top.
+    Whoever asks "is this capturable?" asks here -- not the constant, or the
+    switch would take effect in one place and not in the other.
     """
-    if graph_freigabe_gesetzt():
-        return CAPTURABLE_HTCCL_TRANSPORTS | GRAPH_FREIGABE_TRANSPORTS
-    return CAPTURABLE_HTCCL_TRANSPORTS
+    if graph_enable_set():
+        return CAPTURABLE_BARLINK_TRANSPORTS | GRAPH_ENABLE_TRANSPORTS
+    return CAPTURABLE_BARLINK_TRANSPORTS
 
 
 def _enforce_cpu_transport_needs_eager(transport: str) -> None:
-    """Reject a host-staged HTCCL transport while CUDA graphs are enabled.
+    """Reject a host-staged barlink transport while CUDA graphs are enabled.
 
     Not a style check: a host-staged collective inside a capture raises
     `cudaErrorStreamCaptureUnsupported` from whichever kernel happens to be
     capturing, which reads as an unrelated CUDA fault. Checked here, where the
-    transport is known, and only when HTCCL is actually on -- flag off, this
+    transport is known, and only when barlink is actually on -- flag off, this
     function is never called.
     """
     if transport in capturable_transports():
@@ -361,27 +367,27 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         return  # no published ServerArgs yet -> nothing to validate against
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
-    if transport in GRAPH_FREIGABE_TRANSPORTS:
+    if transport in GRAPH_ENABLE_TRANSPORTS:
         # Different reason, so a different message. These two are NOT
         # host-staged: their payload never touches host memory, and their
         # round counter lives in device memory precisely so a graph replay
         # advances it instead of reusing a stale value. What is missing is a
         # MEASUREMENT -- nobody has captured their cooperative launch
         # (cudaLaunchCooperativeKernel, used above
-        # SGLANG_HTCCL_BAR1_GITTER_AB) into a graph and replayed it. Saying
+        # SGLANG_BARLINK_BAR1_GRID_THRESHOLD) into a graph and replayed it. Saying
         # "host-staged" here would be false, and letting them through on the
         # strength of an argument would be the assumption this project keeps
         # getting punished for.
         #
         # Was sich seither geaendert hat: die drei Stellen, an denen der
         # Transport eine Aufzeichnung wirklich nicht ueberlebt haette, sind
-        # behoben (htccl._select laesst nicht mehr still in die gloo-Ebene
-        # ausweichen; HTCCLBar1Transport._kern nimmt aufgezeichnet die
+        # behoben (barlink._select laesst nicht mehr still in die gloo-Ebene
+        # ausweichen; BarlinkBar1Transport._kern nimmt aufgezeichnet die
         # 1blk-Variante; _erg_platz schaltet den Direkt-Modus ab, dessen
         # Ringplatz sonst eingebrannt wuerde). Offen bleibt genau eine
         # Messfrage, und dafuer gibt es jetzt ein eigenes Pruefprogramm.
         raise ValueError(
-            f"SGLANG_HTCCL_TRANSPORT={transport!r} is a GPU-driven transport "
+            f"SGLANG_BARLINK_TRANSPORT={transport!r} is a GPU-driven transport "
             "whose CUDA-graph capture is UNMEASURED, not one that is known to "
             "be uncapturable: it never stages over the host and it keeps its "
             "round counter in device memory. The code paths that would have "
@@ -389,21 +395,21 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
             "PROOF on this hardware. Run "
             "`python benchmark/bar1_graph_check.py <dev,dev,...>` on free "
             "cards; if it passes, set "
-            f"{_GRAPH_FREIGABE_ENV}=1 to release this transport for capture. "
+            f"{_GRAPH_ENABLE_ENV}=1 to release this transport for capture. "
             "Until then pass --disable-cuda-graph to run it eagerly."
         )
     raise ValueError(
-        f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged transport "
+        f"SGLANG_BARLINK_TRANSPORT={transport!r} is a host-staged transport "
         "(shm/gloo stage over CPU memory, ucx stages over pinned host "
         "buffers for RDMA; an unknown name falls back to the gloo plane): "
         "every collective synchronizes with the host, which is illegal "
         "inside a CUDA-graph capture. Pass --disable-cuda-graph, or use "
-        "SGLANG_HTCCL_TRANSPORT=device (or =host), which run the collectives "
+        "SGLANG_BARLINK_TRANSPORT=device (or =host), which run the collectives "
         "on the GPU and ARE capturable."
     )
 
 
-def should_build_pynccl(use_pynccl: bool, world_size: int, htccl_active: bool) -> bool:
+def should_build_pynccl(use_pynccl: bool, world_size: int, barlink_active: bool) -> bool:
     """Whether GroupCoordinator should CONSTRUCT a PyNccl communicator.
 
     Module-level and importable ON PURPOSE: it is the single definition of this
@@ -413,10 +419,10 @@ def should_build_pynccl(use_pynccl: bool, world_size: int, htccl_active: bool) -
     same "checks something adjacent to the thing under test" failure this
     codebase keeps producing.
 
-    `htccl_active` -> do not build. NCCL cannot span vendors: on a mixed group
+    `barlink_active` -> do not build. NCCL cannot span vendors: on a mixed group
     ncclCommInitRank segfaults inside the C library trying to form a world with
-    a peer that has no NCCL. HTCCL reroutes the collectives but never prevented
-    the CONSTRUCTION, because `use_pynccl` is independent of SGLANG_HTCCL.
+    a peer that has no NCCL. barlink reroutes the collectives but never prevented
+    the CONSTRUCTION, because `use_pynccl` is independent of SGLANG_BARLINK.
 
     RANK-UNIFORM: every input is derived identically on every rank from the same
     CLI/env. A rank-divergent answer here would produce a hang rather than a
@@ -425,20 +431,20 @@ def should_build_pynccl(use_pynccl: bool, world_size: int, htccl_active: bool) -
     Flag OFF reduces exactly to the original `use_pynccl and world_size > 1`,
     so same-vendor rigs keep pynccl, which is their faster path.
     """
-    return use_pynccl and world_size > 1 and not htccl_active
+    return use_pynccl and world_size > 1 and not barlink_active
 
 
 def should_build_custom_allreduce(
-    use_custom_allreduce: bool, world_size: int, htccl_active: bool
+    use_custom_allreduce: bool, world_size: int, barlink_active: bool
 ) -> bool:
     """Whether GroupCoordinator should CONSTRUCT a CustomAllreduce.
 
     Same shape and same reason as `should_build_pynccl`, and module-level for
     the same reason: one definition, imported by the test rather than copied.
 
-    `htccl_active` -> do not build. CustomAllreduce is a CUDA-IPC intra-node
+    `barlink_active` -> do not build. CustomAllreduce is a CUDA-IPC intra-node
     fast path; it cannot serve a group that spans vendors or hosts, which is
-    precisely the group HTCCL exists for.
+    precisely the group barlink exists for.
 
     THE FAILURE IT PREVENTS IS A HANG, NOT A CRASH, AND IT WAS MEASURED.
     `CustomAllreduce.__init__` returns EARLY, before any collective, when
@@ -470,7 +476,7 @@ def should_build_custom_allreduce(
     Flag OFF reduces exactly to the original `use_custom_allreduce and
     world_size > 1`, so same-vendor rigs keep custom all-reduce.
     """
-    return use_custom_allreduce and world_size > 1 and not htccl_active
+    return use_custom_allreduce and world_size > 1 and not barlink_active
 
 
 class GroupCoordinator:
@@ -592,7 +598,7 @@ class GroupCoordinator:
                 # same as the device group above. It used to be pinned to
                 # the `gloo_timeout` default no matter what the operator
                 # configured, and that is the defect behind #312: every
-                # HTCCL handshake, `GroupCoordinator.barrier` and therefore
+                # barlink handshake, `GroupCoordinator.barrier` and therefore
                 # the CUDA-graph capture barrier run on THIS group, so a
                 # rank killed during capture left the survivors waiting out
                 # a hardcoded 7200 s that nothing could shorten. The same
@@ -658,23 +664,23 @@ class GroupCoordinator:
                 qr_rocm_arch_available,
             )
 
-        # HTCCL (task #117): vendor-neutral host-staged collectives, for TP
+        # barlink (task #117): vendor-neutral host-staged collectives, for TP
         # groups that span GPUs without a common device collective library
         # (NCCL and RCCL cannot form a joint communicator). Constructed
         # BEFORE pynccl and consulted FIRST in every dispatch, so that when
         # the flag is on no collective reaches NCCL.
         #
-        # Flag OFF (the default) leaves htccl_comm as None and every dispatch
+        # Flag OFF (the default) leaves barlink_comm as None and every dispatch
         # seam falls through a single `is not None` check -- behavior is
         # byte-identical to stock sglang.
         #
         # It attaches to self.cpu_group (gloo), which sglang already builds
         # for every group, so this adds no process group and no new
-        # collective beyond HTCCL's own startup calibration.
-        self.htccl_comm: Optional[Any] = None
-        if envs.SGLANG_HTCCL.get() and self.world_size > 1:
-            from sglang.srt.distributed.device_communicators.htccl import (
-                HTCCLCommunicator,
+        # collective beyond barlink's own startup calibration.
+        self.barlink_comm: Optional[Any] = None
+        if envs.SGLANG_BARLINK.get() and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.barlink import (
+                BarlinkCommunicator,
             )
 
             # The CPU transports host-stage every collective: shm calls
@@ -686,18 +692,18 @@ class GroupCoordinator:
             # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
             # the exact shape of the arm-E crash. Fail at startup, naming the
             # cause, instead.
-            _enforce_cpu_transport_needs_eager(envs.SGLANG_HTCCL_TRANSPORT.get())
+            _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
             # Ueber eine LOKALE Variable, und die Zustandsabfrage weiter
-            # unten auch: `self.htccl_comm` darf nur hinter einem
+            # unten auch: `self.barlink_comm` darf nur hinter einem
             # `is not None` beruehrt werden (test_dispatch_seams_are_all_
             # none_guarded pinnt das, und zu Recht -- daran haengt, dass
             # Flag-aus byteidentisch bleibt).
-            _comm = HTCCLCommunicator(
+            _comm = BarlinkCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
                 gruppe=self.unique_name,
             )
-            self.htccl_comm = _comm
+            self.barlink_comm = _comm
             # What was REQUESTED and what was ACHIEVED -- kept apart.
             #
             # Until now this line named the requested transport, whatever had
@@ -708,20 +714,20 @@ class GroupCoordinator:
             # that run was not a bar1 number at all. So the failure is now a
             # WARNING carrying the group name and the reason, and the success
             # says explicitly what is really running.
-            requested = envs.SGLANG_HTCCL_TRANSPORT.get()
+            requested = envs.SGLANG_BARLINK_TRANSPORT.get()
             stand = getattr(_comm, "stand", {}) or {}
             achieved = stand.get("achieved", requested)
             if stand.get("direct", True):
                 logger.info(
-                    "HTCCL enabled for group '%s': requested=%s, "
-                    "ACHIEVED=%s. Every SGLANG_HTCCL* env must be identical "
+                    "barlink enabled for group '%s': requested=%s, "
+                    "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
                     "on all ranks; the host-staged transports (shm/gloo/ucx) "
                     "additionally require --disable-cuda-graph.",
                     self.unique_name, requested, achieved,
                 )
             else:
                 logger.warning(
-                    "HTCCL group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
+                    "barlink group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
                     "This group does NOT run over %s. A measurement from "
                     "this run is mixed and must not be reported as a "
                     "%s value.",
@@ -730,49 +736,49 @@ class GroupCoordinator:
                     requested, requested,
                 )
 
-        # When HTCCL is active the pynccl communicator is NOT CONSTRUCTED --
+        # When barlink is active the pynccl communicator is NOT CONSTRUCTED --
         # not merely left unused.
         #
-        # `use_pynccl` is independent of SGLANG_HTCCL: enabling HTCCL reroutes
+        # `use_pynccl` is independent of SGLANG_BARLINK: enabling barlink reroutes
         # the COLLECTIVES but never stopped PyNcclCommunicator from being built
         # first. On a same-vendor rig that construction is harmless. On a
         # vendor-mixed group it is fatal: ncclCommInitRank tries to form an
         # NCCL world with a peer that has no NCCL at all, and SEGFAULTS inside
         # the C library. Measured on the cross-vendor host -- both ranks logged
-        # "HTCCL enabled ... (transport=gloo)" and rank 0 then died at
+        # "barlink enabled ... (transport=gloo)" and rank 0 then died at
         #   pynccl_wrapper.py:404 in ncclCommInitRank
         #   parallel_state.py:420 in __init__
         # before the model was even loaded.
         #
         # RANK-UNIFORM by construction: the condition reads only
-        # `envs.SGLANG_HTCCL` and `self.world_size`, both of which every rank
+        # `envs.SGLANG_BARLINK` and `self.world_size`, both of which every rank
         # derives identically from the same CLI/env. That matters more than the
         # crash it prevents -- if one rank built pynccl and another did not,
         # the result would not be a segfault but a HANG, which is quieter and
         # worse.
         #
-        # FLAG-OFF IS BYTE-IDENTICAL: with SGLANG_HTCCL unset, `_htccl_active`
+        # FLAG-OFF IS BYTE-IDENTICAL: with SGLANG_BARLINK unset, `_barlink_active`
         # is False and the condition reduces to the original
         # `use_pynccl and self.world_size > 1`. pynccl remains the faster path
         # on same-vendor rigs and is not given up -- the rule is
-        # "HTCCL active -> no pynccl", not "no pynccl".
+        # "barlink active -> no pynccl", not "no pynccl".
         #
         # Every consumer of self.pynccl_comm was checked to tolerate None:
         # the two sites that dereference it without a guard
         # (_all_reduce_out_place's assert, and the reduce_scatter path) are
-        # both preceded by an `if self.htccl_comm is not None:` early return,
+        # both preceded by an `if self.barlink_comm is not None:` early return,
         # so they are unreachable when this is None. Otherwise the fix would
         # only relocate the crash.
-        _htccl_active = self.htccl_comm is not None
+        _barlink_active = self.barlink_comm is not None
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if should_build_pynccl(use_pynccl, self.world_size, _htccl_active):
+        if should_build_pynccl(use_pynccl, self.world_size, _barlink_active):
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
         elif use_pynccl and self.world_size > 1:
             logger.info(
-                "HTCCL is active for group '%s': skipping PyNccl "
+                "barlink is active for group '%s': skipping PyNccl "
                 "communicator construction. NCCL cannot span vendors, and "
                 "constructing it would abort in ncclCommInitRank on a "
                 "vendor-mixed group.",
@@ -789,7 +795,7 @@ class GroupCoordinator:
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if should_build_custom_allreduce(
-            use_custom_allreduce, self.world_size, _htccl_active
+            use_custom_allreduce, self.world_size, _barlink_active
         ):
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -830,13 +836,13 @@ class GroupCoordinator:
             # balanced.
             self._harmonize_ca_comm_enablement()
         elif use_custom_allreduce and self.world_size > 1:
-            # HTCCL active. Skipping is the point: the constructor's
+            # barlink active. Skipping is the point: the constructor's
             # nvlink probe is a COLLECTIVE that only the ranks with
             # sgl_kernel's custom-AR ops would enter (measured: L0 TP=5
             # deadlocked with ranks 0-2 inside broadcast_object_list and
             # ranks 3-4 already past it).
             logger.info(
-                "HTCCL is active for group '%s': skipping CustomAllreduce "
+                "barlink is active for group '%s': skipping CustomAllreduce "
                 "construction. Its NVLink probe is a group-wide collective "
                 "that ranks without sgl_kernel's custom-AR ops never enter, "
                 "so a vendor-mixed or multi-host group deadlocks there.",
@@ -1080,13 +1086,13 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        # HTCCL must return BEFORE the Dynamo custom-op machinery below
+        # barlink must return BEFORE the Dynamo custom-op machinery below
         # (inplace_all_reduce / outplace_all_reduce). Those ops exist to keep
-        # the NCCL call opaque to torch.compile; letting HTCCL be decomposed
+        # the NCCL call opaque to torch.compile; letting barlink be decomposed
         # through them would split the host-staging schedule across graph
         # segments. Out-of-place, matching the outplace contract.
-        if self.htccl_comm is not None:
-            return self.htccl_comm.all_reduce(input_)
+        if self.barlink_comm is not None:
+            return self.barlink_comm.all_reduce(input_)
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
@@ -1281,11 +1287,11 @@ class GroupCoordinator:
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
-        # HTCCL handles the dim/movedim bookkeeping itself and must not go
+        # barlink handles the dim/movedim bookkeeping itself and must not go
         # through the symmetric-memory allocator below (which is a NCCL/
         # pynccl mechanism).
-        if self.htccl_comm is not None:
-            return self.htccl_comm.reduce_scatter(input_, dim)
+        if self.barlink_comm is not None:
+            return self.barlink_comm.reduce_scatter(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1333,8 +1339,8 @@ class GroupCoordinator:
             )
         return output
 
-    def _htccl_unsupported(self, op: str) -> None:
-        """Fail fast on a collective HTCCL does not implement.
+    def _barlink_unsupported(self, op: str) -> None:
+        """Fail fast on a collective barlink does not implement.
 
         On a mixed-vendor group there is no NCCL fallback to silently take:
         NCCL and RCCL cannot form a joint communicator, so letting the call
@@ -1346,7 +1352,7 @@ class GroupCoordinator:
         sequence (SPMD), so every rank raises on the same call.
         """
         raise NotImplementedError(
-            f"HTCCL does not implement {op!r}. SGLANG_HTCCL routes TP "
+            f"barlink does not implement {op!r}. SGLANG_BARLINK routes TP "
             f"collectives over the vendor-neutral host-staged path, which "
             f"currently covers all_reduce, all_gather(_into_tensor), "
             f"reduce_scatter(_tensor), all_to_all_single (equal split and "
@@ -1355,12 +1361,12 @@ class GroupCoordinator:
             f"to NCCL, which cannot span a mixed-vendor group -- that is a "
             f"deadlock, not a slowdown. Either avoid the feature that calls "
             f"{op!r} (uneven/variable-size collectives are the usual "
-            f"source) or extend HTCCLCommunicator."
+            f"source) or extend BarlinkCommunicator."
         )
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if self.htccl_comm is not None:
-            return self.htccl_comm.reduce_scatter_tensor(output, input)
+        if self.barlink_comm is not None:
+            return self.barlink_comm.reduce_scatter_tensor(output, input)
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1416,14 +1422,14 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        # HTCCL zuerst. Ohne diesen Zweig ging all_to_all_single bei aktivem
-        # SGLANG_HTCCL ungebremst auf self.device_group -- also auf genau das
-        # NCCL, das _htccl_unsupported oben als Deadlock-Ursache auf einer
+        # barlink zuerst. Ohne diesen Zweig ging all_to_all_single bei aktivem
+        # SGLANG_BARLINK ungebremst auf self.device_group -- also auf genau das
+        # NCCL, das _barlink_unsupported oben als Deadlock-Ursache auf einer
         # Gruppe ueber zwei Hersteller benennt. Es war bisher folgenlos, weil
         # die Methode keinen Aufrufer hat; folgenlos ist nicht dasselbe wie
         # richtig, und ein Haenger meldet sich nicht mit einer Fehlermeldung.
-        if self.htccl_comm is not None:
-            self.htccl_comm.all_to_all_single(output, input)
+        if self.barlink_comm is not None:
+            self.barlink_comm.all_to_all_single(output, input)
             return
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
@@ -1431,11 +1437,11 @@ class GroupCoordinator:
         if self.world_size == 1:
             output.copy_(input)
             return
-        # Wie bei all_reduce: HTCCL kehrt VOR der Dynamo-Custom-Op-Maschinerie
+        # Wie bei all_reduce: barlink kehrt VOR der Dynamo-Custom-Op-Maschinerie
         # zurueck. Der Zweig in _all_to_all_single bleibt trotzdem stehen --
         # er faengt den Weg ueber die registrierte Op ab.
-        if self.htccl_comm is not None:
-            self.htccl_comm.all_to_all_single(output, input)
+        if self.barlink_comm is not None:
+            self.barlink_comm.all_to_all_single(output, input)
             return
         reg_all_to_all_single(output, input, group_name=self.unique_name)
 
@@ -1463,8 +1469,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             output.copy_(input)
             return output
-        if self.htccl_comm is not None:
-            return self.htccl_comm.all_to_all_single(
+        if self.barlink_comm is not None:
+            return self.barlink_comm.all_to_all_single(
                 output, input, output_split_sizes, input_split_sizes
             )
         torch.distributed.all_to_all_single(
@@ -1481,8 +1487,8 @@ class GroupCoordinator:
         output: torch.Tensor,
         input_list: List[torch.Tensor],
     ) -> None:
-        if self.htccl_comm is not None:
-            self._htccl_unsupported("reduce_scatter(output, input_list)")
+        if self.barlink_comm is not None:
+            self._barlink_unsupported("reduce_scatter(output, input_list)")
         # TODO(ch-wan): support other backends
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
@@ -1497,8 +1503,8 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span():
                 return self.reduce_scatterv(input_, output=output, sizes=sizes)
-        if self.htccl_comm is not None:
-            self._htccl_unsupported("reduce_scatterv")
+        if self.barlink_comm is not None:
+            self._barlink_unsupported("reduce_scatterv")
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
@@ -1593,8 +1599,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if self.htccl_comm is not None:
-            return self.htccl_comm.all_gather_into_tensor(output, input)
+        if self.barlink_comm is not None:
+            return self.barlink_comm.all_gather_into_tensor(output, input)
         if _is_npu:
             self._all_gather_into_tensor(output, input)
         else:
@@ -1614,11 +1620,11 @@ class GroupCoordinator:
         The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
         """
         pynccl_comm = self.pynccl_comm
-        # Under HTCCL the pynccl fast path must not be taken even when a
-        # pynccl communicator happens to exist: route to the (HTCCL-aware)
+        # Under barlink the pynccl fast path must not be taken even when a
+        # pynccl communicator happens to exist: route to the (barlink-aware)
         # synchronous form instead. The async-stream optimization is a NCCL
         # feature and has no host-staged equivalent.
-        if self.htccl_comm is not None or pynccl_comm is None or pynccl_comm.disabled:
+        if self.barlink_comm is not None or pynccl_comm is None or pynccl_comm.disabled:
             self.all_gather_into_tensor(output, input)
         else:
             pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
@@ -1649,8 +1655,8 @@ class GroupCoordinator:
                 return input_
 
         if output_tensor_list is not None:
-            if self.htccl_comm is not None:
-                self._htccl_unsupported("all_gather(output_tensor_list=...)")
+            if self.barlink_comm is not None:
+                self._barlink_unsupported("all_gather(output_tensor_list=...)")
             # TODO(ch-wan): support other backends
             return torch.distributed.all_gather(
                 output_tensor_list, input_, group=self.device_group
@@ -1660,11 +1666,11 @@ class GroupCoordinator:
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
-        # HTCCL: vendor-neutral path, ahead of every device-specific
+        # barlink: vendor-neutral path, ahead of every device-specific
         # communicator. The output_tensor_list form above is left on NCCL in
-        # v1 (out-parameter variant, see PLAN_htccl_port.md section 5).
-        if self.htccl_comm is not None:
-            return self.htccl_comm.all_gather(input_, dim)
+        # v1 (out-parameter variant, see PLAN_barlink_port.md section 5).
+        if self.barlink_comm is not None:
+            return self.barlink_comm.all_gather(input_, dim)
 
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
@@ -1728,8 +1734,8 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span():
                 return self.all_gatherv(input_, sizes=sizes, output=output)
-        if self.htccl_comm is not None:
-            self._htccl_unsupported("all_gatherv")
+        if self.barlink_comm is not None:
+            self._barlink_unsupported("all_gatherv")
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
@@ -1832,10 +1838,10 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        # HTCCL: broadcast over the gloo cpu_group instead of the NCCL
+        # barlink: broadcast over the gloo cpu_group instead of the NCCL
         # device_group. In-place, like the stock path.
-        if self.htccl_comm is not None:
-            return self.htccl_comm.broadcast(input_, src)
+        if self.barlink_comm is not None:
+            return self.barlink_comm.broadcast(input_, src)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -2185,9 +2191,9 @@ class GroupCoordinator:
         what `enter_capture_group_barrier` and `run_capture_warmups` call
         (see model_executor/runner/base_runner.py), so a rank SIGKILLed
         during CUDA-graph capture parks every survivor here for the whole
-        gloo process-group timeout. When an HTCCL transport has published a
+        gloo process-group timeout. When an barlink transport has published a
         peer table, the wait goes through `bounded_barrier` and ends with
-        the dead rank named instead. A boot without HTCCL takes the plain
+        the dead rank named instead. A boot without barlink takes the plain
         call below, unchanged and without importing anything.
         """
         liveness = _peer_liveness_for_barrier()
@@ -2227,11 +2233,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
-        # Before the process groups go away: HTCCL owns a POSIX shm segment
+        # Before the process groups go away: barlink owns a POSIX shm segment
         # that must be unlinked, and its close() uses no collectives.
-        if getattr(self, "htccl_comm", None) is not None:
-            self.htccl_comm.close()
-            self.htccl_comm = None
+        if getattr(self, "barlink_comm", None) is not None:
+            self.barlink_comm.close()
+            self.barlink_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None

@@ -57,8 +57,8 @@ KIND = "bar1_prefill_kurve"
 #: 2: the per-point transport evidence under `gruppen` renamed its keys from
 #: German to English (`gruppe`/`angefordert`/`erreicht` ->
 #: `group`/`requested`/`achieved`), in step with s11_bar1_e2e.RE_GROUP and
-#: htccl.py's report_state(). A schema-1 artifact spells them in German, so
-#: every point would read back as having no HTCCL group at all -- which the
+#: barlink.py's report_state(). A schema-1 artifact spells them in German, so
+#: every point would read back as having no barlink group at all -- which the
 #: arm check would misread as "baseline". Rejecting it by version is the
 #: point: re-run the step rather than read a stale artifact.
 SCHEMA_VERSION = 2
@@ -560,7 +560,7 @@ def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
     The transport name in the log says bar1 either way -- that cost a whole
     measurement once already. So each boot leaves the ERREICHT lines behind and
     the point carries them: a bar1 point whose dcp group fell back to gloo is
-    not a bar1 point, and a baseline point with any HTCCL group is not a
+    not a bar1 point, and a baseline point with any barlink group is not a
     baseline point.
     """
     path = os.path.join(step_dir, "belege", f"{folge}_{arm}_{sessions}.txt")
