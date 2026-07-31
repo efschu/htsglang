@@ -18439,3 +18439,97 @@ korrekt ausgenommen, dcp_size=1).
   Armen wuerde ihn in die Arming-Latenz verschieben (kosmetisch bei <1 s).
 - Guards (hicache/spill/PD/weightless/dual-group) sind Verweigerungen, keine
   Unvereinbarkeiten — je Feature ein benannter Migrationspfad offen.
+
+## #339 — M2 video-enhance: Defekte, Multi-Card-Executor
+
+Zwei offene Posten aus M2 geschlossen, einen dritten Defekt dabei gefunden,
+und der Multi-Card-Executor gebaut und gemessen. Details in
+`TASK_333_M2_VIDEO_ENHANCE.md` §9-10, Rohdaten in
+`docs/dev/measurements/333-m2/`.
+
+### Was gefunden wurde
+
+**Byte-Stabilitaet war ein Cross-Stream-Hazard, kein Rundungsproblem.** Die
+ONNX-Runtime-CUDA-EP laeuft auf einem eigenen CUDA-Stream; die SR-Stage bindet
+einen torch-Tensor per Device-Pointer daran. Beide Richtungen waren
+ungeordnet — ORT konnte den Input lesen, bevor torch ihn fertig geschrieben
+hatte, und torch den Output, bevor ORT fertig war. Der Falsifikator brauchte
+weder Chunking noch eine zweite Karte: **derselbe Ganz-Clip-Lauf bei Ring-Tiefe
+1, 2 und 4 lieferte drei verschiedene Ergebnisse** (9 bzw. 178 von 191 Frames
+verschieden). Klonen des Outputs half nicht — der Klon liest dieselbe
+Speicherstelle im selben unsynchronisierten Moment. Nach dem Fix
+(`synchronize_inputs`/`synchronize_outputs` plus torch-Stream-Sync):
+Ring-Tiefe-invariant, 0 von 191.
+
+**Der mov_text-Hash-Mismatch war die sichtbare Haelfte eines 21,333-ms-A/V-Versatzes.**
+Fragmentiertes MP4 mit `+empty_moov` schreibt die moov, bevor ein Paket
+gesehen wurde, also kann libavformat fuer keine Spur eine `elst` schreiben.
+Die AAC-Priming-Kompensation (1024 Samples) der Quelle ging damit verloren
+und die kopierte Tonspur lief 21,333 ms hinter dem Bild her — die
+Dauer-Pruefung konnte das nicht sehen, weil alle Spuren gemeinsam
+verschoben wurden. `+delay_moov` behebt es; `alignment_report()` (1 ms
+Toleranz) ist jetzt die Pruefung, die so etwas ueberhaupt sehen kann.
+
+**Die Geraeteordnungs-Falle, wieder.** Ein Chunk-Worker bekam
+`CUDA_VISIBLE_DEVICES` mit einem NVML-Index und sonst nichts. CUDA
+enumeriert per Default `FASTEST_FIRST`, auf diesem Rig ist die 5090
+NVML-Index 1 und CUDA-Ordinal 0. Es faellt nicht auf: alle Karten laufen,
+die Naht bleibt exakt, das Ergebnis stimmt — nur werden die falschen Karten
+gemessen und beplant. Die Zahl war dadurch fast um Faktor zwei geschoent
+(2,91x gegen eine Baseline, die heimlich auf einer 3080 lief; 1,44x gegen
+die 5090). Jetzt `CUDA_DEVICE_ORDER=PCI_BUS_ID` im Kind-Environment.
+
+### Messungen (480 Frames, 960x540 -> 1920x1080, SR x4 + Lanczos-3 + RIFE x2)
+
+| Arm | Wall |
+|---|---|
+| Baseline, 5090 allein | 35,80 s |
+| drei Karten | 24,94 s |
+| Same-Card-Kontrolle (gleiches Chunking, alles 5090) | 54,22 s |
+
+- End-to-End **1,44x**, reine Rechenzeit **1,64x** (ohne ~8 s Worker-Start
+  je Chunk), Decke aus den gemessenen Raten **1,78x** — die
+  Kapazitaetsgewichtung faehrt bei ~92 % dieser Decke.
+- Eine 3080 ist auf dieser Kette **0,39 einer 5090**. Die projizierten
+  1,8-2,6x sind auf diesem Rig arithmetisch nicht erreichbar; zwei Karten a
+  0,39 addieren 0,78 Karten. Per "Rig ist Untergrenze" ist das eine Aussage
+  ueber dieses Rig, nicht ueber das Feature.
+- **Naht exakt: 959 von 959 Frames bit-identisch** zum Ganz-Clip-Lauf auf
+  einer Karte, verglichen per sha256 je Frame unmittelbar vor dem Encoder.
+
+### Messfalle, die dabei aufflog
+
+Der erste Naht-Test verglich die beiden Arme per PSNR der *encodierten*
+Ausgabe und kam auf 6-25 dB bei nachweislich identischen Eingangspixeln.
+Zwei unabhaengig encodierte H.264-Streams desselben Inhalts sind nicht
+derselbe Stream; die Zahl misst die Ratenregelung, nicht die Naht. Auch bei
+150 Mbit/s blieb es bei 31,7 dB im Mittel. Erst der Pre-Encode-Digest je
+Frame beantwortet die Frage. Gehoert in die Familie
+"Benchmark-Harness-Pflichten": das Instrument zuerst gegen sich selbst
+pruefen.
+
+### Kartenzeit und Disziplin
+
+| Posten | Wert |
+|---|---|
+| Fenster | 11:55-12:43 UTC, in einem Block, danach freigegeben |
+| Locks/Arbitrierung | `gpu-arb/holder` gesetzt, Log-Zeilen BELEGT/FREI, Herzschlag per `touch` bei Verlaengerung |
+| Fremdprozesse | keine beruehrt; agent-330 uebernahm die Karten direkt nach der Freigabe |
+| Rohdaten | `/tmp/mc480b/report.json`, `/tmp/mc3/report.json`, kopiert nach `docs/dev/measurements/333-m2/` |
+
+### Offen
+
+- **Live-Watch und Client-Liveness (§8, #344a) nicht gebaut.** Bewusst
+  zurueckgestellt: die Vorgabe war 1+2 vollstaendig statt vier Posten halb.
+  Ein Video-Job wird heute abgeraeumt, wenn der `finally`-Zweig des
+  Response-Generators laeuft — das deckt einen sauberen Disconnect ab und
+  nicht den Client, der einfach aufhoert zu lesen.
+- **fp16-TensorRT-Parity**: Export und Harness stehen
+  (`scripts/video_enhance/export_sr_fp16.py`, portiert aus
+  `efschu/vs-pipeline`), die benoteten Zahlen fehlen noch.
+- **P3, P5, P6, P7** weiterhin ungemessen; die PyNvVideoCodec-Encode-Strecke
+  laeuft weiterhin nicht ("incorrect usage of CPU input buffer"), alle
+  Messungen liefen ueber den ffmpeg-NVENC-Backend mit Host-Round-Trip.
+- **Regime B wieder offen**, aber nicht aus Argument, sondern aus Prior Art:
+  die produktive `vs-pipeline` legt ESRGAN auf die beiden 3080 und RIFE auf
+  die 5090, und P2 misst genau an deren Trennpunkt 1,7 ms Round-Trip.

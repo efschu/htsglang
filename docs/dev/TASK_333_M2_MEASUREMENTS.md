@@ -146,3 +146,119 @@ P5 (codec ceiling and concurrent session count), P6 (co-tenancy jitter against
 a HOT LLM), P7 (the 8-bit transport matrix), the 3080s, the TensorRT-EP fp16
 engine build and its parity gate, and the corrected P3. The window was spent
 on P1/P2/P4 and on getting the chain to run end to end.
+
+---
+
+# Task #339 window, 2026-07-31
+
+Raw JSON in `docs/dev/measurements/333-m2/multicard_480f.json` and
+`multicard_96f_seam.json`. Same rig, NVML 1 = RTX 5090, NVML 0 and 2 = RTX
+3080. Every number below was taken *after* the stream-ordering fix in
+`backends.py`; numbers taken before it are not comparable and are not kept.
+
+## The two defects that were open
+
+**Byte stability.** Met. The falsifier and the fix are in
+`TASK_333_M2_VIDEO_ENHANCE.md` §9.1. Evidence:
+
+| Check | Before | After |
+|---|---|---|
+| whole clip at ring depth 1 vs 2 | 9 of 191 frames differ | 0 |
+| whole clip at ring depth 2 vs 4 | 178 of 191 differ | 0 |
+| two whole-clip runs, elementary stream sha256 | recorded as differing | identical |
+| chunked vs whole clip, same card | 14 of 191 differ | 0 |
+
+**mov_text subtitle.** Closed, and it was the visible half of a 21.333 ms
+A/V lag. `TASK_333_M2_VIDEO_ENHANCE.md` §9.2. Measured on CPU:
+
+| Check | `+empty_moov` alone | with `+delay_moov` |
+|---|---|---|
+| audio first packet | 0.0, no `Skip Samples` | -0.021333, `Skip Samples 1024` |
+| subtitle cue timestamps | 0.021334 / 1.021334 | 0.0 / 1.0 |
+| second video packet | 0.042236 | 0.020833 |
+| inter-track drift vs source | 0.021334 s | 0.0 s |
+| audio tracks bit-identical | yes | yes |
+| subtitle content (gap samples stripped) | equal | equal |
+| remux of one fixed elementary stream, 3 runs | identical | identical |
+
+## Per-stage rates, both architectures
+
+480-frame run, 960x540 → 1920x1080, SR x4 + Lanczos-3 + RIFE 4.6 x2, fp16
+chain, SR on the CUDA provider, ffmpeg NVENC encode. ms per invocation.
+
+| Stage | RTX 5090 | RTX 3080 | ratio |
+|---|---|---|---|
+| decode | 0.01 | 0.02 | — |
+| colour to RGB | 0.22 | 0.48 | 2.18 |
+| SR (960x540, x4) | 35.58 | 90.9 | 2.55 |
+| resize (3840x2160 → 1920x1080) | 6.48 | 14.1 | 2.18 |
+| RIFE (1920x1080, scale 1.0) | 3.06 | 8.28 | 2.71 |
+| colour to YUV | 0.46 | 0.98 | 2.13 |
+| encode | 1.56 | 2.5 | 1.60 |
+
+The 5090 SR cell reproduces the earlier single-card P1 figure (35.19 ms) to
+within the 2.77 percent noise floor. **A 3080 is 0.39 of a 5090 on this
+chain.** SR is 71 percent of the 5090's per-frame time and 84 percent of a
+3080's.
+
+## Multi-card, 480 frames
+
+| Arm | wall | composition |
+|---|---|---|
+| baseline, 5090 alone | 35.80 s | one chunk, same executor |
+| three cards | 24.94 s | 5090 [0:243], 3080 [243:361], 3080 [361:480] |
+| same-card control | 54.22 s | identical chunking, all three chunks on the 5090 |
+
+*   end to end **1.44x**
+*   compute only **1.64x** (excluding the ~8 s per-worker torch/ORT import
+    from both arms)
+*   ceiling from the measured rates **1.78x**; the weighting is running at
+    about 92 percent of it
+
+The projection was 1.8-2.6x. It is not reachable on this rig with this
+chain — two cards at 0.39 add 0.78 of a card, and that is the arithmetic,
+not an implementation shortfall. The ceiling calculation is what carries to
+a rig with comparable cards; the 1.44 does not.
+
+The same-card control is slower than the baseline (54.2 s vs 35.8 s) because
+it pays three worker starts serially for work one worker did once. It exists
+to control the encoder for the correctness gate, not as a performance arm.
+
+## Multi-card correctness
+
+| Check | 96 frames | 480 frames |
+|---|---|---|
+| output frame count | 191, expected 191 | 959, expected 959 |
+| **seam exact** (pre-encode sha256 per frame, chunked vs whole, same card) | **191 of 191** | **959 of 959** |
+| multi-card vs same-card control, PSNR | — | 37.4 dB |
+| multi-card vs single-card baseline, PSNR | 35.5 dB | 36.5 dB |
+| frames bit-identical to the 5090 baseline | 95 of 191 | 486 of 959 |
+
+The seam row is exact, not approximate, and it is the gate. The two PSNR
+rows are measurements: 37.4 dB is cross-architecture convolution arithmetic
+with the encoder controlled for; 36.5 dB additionally carries the GOP
+difference, because a chunk boundary forces an IDR the baseline does not
+have.
+
+The count of frames bit-identical to the baseline is exactly the 5090's own
+chunk in both runs, which is the expected result and a useful cross-check
+that the chunk-to-card assignment is what the plan said.
+
+### The instrument had to be built
+
+The first attempt compared the two arms by PSNR of the encoded output and
+scored 6-25 dB on frames whose input pixels were provably identical. Two
+independently encoded H.264 streams of the same content are not the same
+stream, and at the ffmpeg `h264_nvenc` default rate the two are distorted
+differently enough that the number says nothing about the seam. Raising the
+rate to 150 Mbps moved the mean to 31.7 dB and did not fix it. Only the
+pre-encode per-frame digest answers the question.
+
+## Not measured in this window
+
+P3 (corrected SR allocator overhead), P5, P6, P7, the fp16 TensorRT engine
+and its parity numbers, and the PyNvVideoCodec encode path, which is still
+rejected with "incorrect usage of CPU input buffer" and was not diagnosed
+further. The 3080s were exercised for the first time here, but only as
+whole-chain chunk hosts — there is still no per-stage 3080 sweep across
+resolutions.
