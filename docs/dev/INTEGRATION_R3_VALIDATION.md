@@ -14721,3 +14721,160 @@ vor dem Boot gegen `--rank-gpu-id 0,1,2` gelesen: 0 = 3080, 1 = 5090,
 `power.csv` (78 Punkte je Karte; Spitzen 284 W / 17861 MiB auf GPU0,
 213 W / 27221 MiB auf GPU1, 273 W / 16767 MiB auf GPU2 — zwei
 Lade-und-Decode-Zyklen, kein Fremd-Spin im Fenster).
+
+## #318-Beleg: Draft-Namensraum auf der Karte (Kartenfenster 2026-07-31, 04:50-04:54 UTC)
+
+Drei Boots auf `/spinning/wt-final` @ `4403a98312` (enthaelt den #318-Fix
+`aa7fa57673` gemergt), TP=3 auf 5090 + 2x 3080, GPTQ-Int4-Ziel
+`Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4`,
+`--rank-tp-ratio auto-performance`, `--rank-auto-reserve-mib 3000,2700,2700`,
+fp8-KV, NEXTN k=3 — byte-genau das Kommando aus dem #316-Beleg. Die Arme
+unterscheiden sich in **genau einem Argument**:
+
+* Arm **main**: ohne jedes `--speculative-draft-model-quantization` (der
+  Hauptbeleg — die nackte Kommandozeile muss sich selbst helfen)
+* Arm **falsifier**: `--speculative-draft-model-quantization gptq`
+* Arm **falsifier_marlin**: `--speculative-draft-model-quantization gptq_marlin`
+
+Kartenzeit 4 min 05 s von 20 min Budget; knapp 16 min zurueckgegeben.
+Boot-Dauer 50 s (main, warmer JIT-Cache), 36 s bis zum Tod (beide
+Falsifikator-Arme).
+
+**Verdikt in einem Satz: #318 ist belegt gefixt — die nackte Kommandozeile
+baut den Draft von sich aus dense, null Namen fallen durch, und die
+Akzeptanzlaenge springt von 1.0052 (0 von 573) auf 2.667 (120 von 216) —, und
+der erzwungen gepackte Gegenarm stirbt beim Laden mit dem benannten
+unloaded-parameter-Fehler statt still hochzukommen.**
+
+### 1. Hauptbeleg: der Namensraum entscheidet, ohne Zusatzflag — erfuellt
+
+Die Verdikt-Zeile aus `model_config.py` steht **auf allen drei Raengen** im
+Log (`proofs/namespace.main.txt`, Zeilen 255/258/265):
+
+```
+[TP0] Draft checkpoint .../Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4
+declares quant_method 'gptq' but stores the draft namespace unquantized;
+building the draft model dense. Pass --speculative-draft-model-quantization to override.
+```
+
+Direkt darunter, ebenfalls 3x, die Folgezeile aus dem reparierten
+Opt-out-Zweig — der Beleg, dass das Urteil auch das Re-Ableiten aus
+`quantization_config` ueberlebt, was im #316-Beleg als No-Op aufgefallen war:
+
+```
+[TP0] Quantization explicitly disabled; ignoring the checkpoint's declared
+quant_method 'gptq' for the draft model.
+```
+
+`grep -c "not found in params_dict"` ueber das Volllog: **0**. Die sieben
+dense `mtp.*.weight`-Namen je Rang, die im #316-Beleg gegen ein
+Marlin-Skelett liefen und mit einer `warning_once` verschwanden, erreichen
+jetzt ihr Ziel.
+
+Der Server kommt in **50 s** hoch, allokiert KV
+(`307290 / 174131 / 174131` Tokens fp8_e4m3, Mamba-Cap 655520, globales
+`max_total_num_tokens` 844224 bei Vektor `[30, 17, 17]`) und generiert
+kohaerent. Erste Zeilen der 192-Token-Antwort auf „Explain in plain words why
+a rope bridge sways when you walk across it" (vollstaendig in
+`proofs/smoke.main.text.txt`):
+
+```
+<think>
+Here's a thinking process:
+1.  **Understand User Query**: The user wants a plain-language explanation of
+    why a rope bridge sways when you walk across it.
+2.  **Identify Key Concepts**:
+   - Rope bridges are flexible structures
+   - They lack rigid support
+   - Walking creates dynamic forces (not just static weight)
+   - Energy transfer and resonance
+```
+
+### 2. Der Drafter traegt jetzt — 72 Verify-Ticks, gemessen
+
+`meta_info` derselben Anfrage, gegen den #316-Falsifikator-Beleg auf byte-
+genau demselben Kommando gestellt:
+
+| Groesse | #316 (vor dem Fix) | #318 main (nach dem Fix) |
+|---|---|---|
+| `spec_accept_length` | 1.0052356020942408 | **2.6666666666666665** |
+| `spec_accept_rate` | 0.0 | **0.5555555555555556** |
+| `spec_verify_ct` | 191 | 72 |
+| `spec_num_proposed_drafts` | 573 | 216 |
+| `spec_accepted_drafts` | **0** | **120** |
+| `spec_accept_histogram` | `[191]` | `[19, 15, 9, 29]` |
+| `completion_tokens` | 192 | 192 |
+| `e2e_latency` | 5.365 s | **2.017 s** |
+| `decode_throughput` | 51.73 tok/s | **129.86 tok/s** |
+
+72 Verify-Ticks liegen ueber den geforderten 30. Dieselben 192 Tokens
+brauchen nur noch 72 statt 191 Verify-Runden, weil pro Runde im Schnitt 2.67
+statt 1.005 Tokens durchkommen; das Histogramm `[19, 15, 9, 29]` zeigt echte
+Verteilung ueber alle vier moeglichen Laengen statt der degenerierten
+Ein-Punkt-Masse `[191]`. **2.51x** Decode-Durchsatz, allein aus dem
+Draft-Namensraum.
+
+### 3. Falsifikator: erzwungen gepackt stirbt laut — erfuellt
+
+Der faithful-Arm ist `falsifier_marlin`: `gptq_marlin` ist genau die Methode,
+die der #318-Bug fuer den Draft gebaut hat. Er stirbt nach **36 s** waehrend
+des Ladens, auf allen drei Raengen, mit dem hochgezogenen #290-Guard
+(`proofs/errors.falsifier_marlin.txt`, `weight_utils.raise_on_unloaded_draft_parameters`):
+
+```
+ValueError: Draft checkpoint .../Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4
+left 16 parameter(s) of Qwen3_5ForCausalLMMTP unloaded:
+['model.layers.0.mlp.down_proj.g_idx', 'model.layers.0.mlp.down_proj.qweight',
+ 'model.layers.0.mlp.down_proj.qzeros', 'model.layers.0.mlp.down_proj.scales',
+ 'model.layers.0.mlp.gate_up_proj.g_idx', 'model.layers.0.mlp.gate_up_proj.qweight',
+ 'model.layers.0.mlp.gate_up_proj.qzeros', 'model.layers.0.mlp.gate_up_proj.scales'] ....
+The checkpoint's tensor names do not reach these parameters, so the draft model
+would run on uninitialized weights and propose noise (the symptom is an accept
+length of ~1.0, not a load error). The two known causes are a quantization
+mismatch in either direction: a packed checkpoint loaded into a model built
+WITHOUT a quantization config (the stream carries `*.qweight`, the skeleton has
+dense `*.weight`), or a model built WITH one over a checkpoint that stores the
+draft block dense (the skeleton expects `qweight`/`qzeros`/`scales`/`g_idx`,
+the file has plain `*.weight`). Set --speculative-draft-model-quantization
+explicitly to pin the side that is wrong.
+```
+
+**16 unloaded parameters** — exakt die Zahl, die der Unit-Test-Replay ueber
+die realen 15 mtp-Namen in `aa7fa57673` vorhergesagt hatte („packed leaves 16
+unloaded -> named raise"). Der Guard sieht die Karte zum ersten Mal und
+liefert dieselbe Zahl. Passend dazu stehen in diesem Arm **21**
+`not found in params_dict`-Warnungen, gegen **0** im Hauptarm — die
+Warnungsfamilie, die den Bug still gemacht hatte, ist genau da, wo sie
+hingehoert, und wird jetzt nicht mehr ueberlebt.
+
+### 4. Nebenbefund: `--speculative-draft-model-quantization gptq` stirbt frueher
+
+Der zuerst gefahrene Arm `falsifier` mit dem nackten `gptq` erreicht den
+Weight-Load gar nicht. Die exllama-`GPTQConfig` hat ein dtype-Tor, das vor dem
+ersten Tensor zuschlaegt:
+
+```
+ValueError: torch.bfloat16 is not supported for quantization method gptq.
+Supported dtypes: [torch.float16]
+```
+
+Auch das ist ein lauter Tod nach 36 s statt eines stillen Boots, aber es ist
+nicht der Guard, um den es hier geht — deshalb der dritte Arm. Fuer den
+Nutzer heisst das: auf diesem bf16-Ziel ist `gptq` als Draft-Override
+ohnehin unerreichbar, `gptq_marlin` ist der einzige Weg, das gepackte
+Skelett zu erzwingen, und genau der wird jetzt benannt abgelehnt.
+
+### 5. Fenster-Disziplin
+
+Rohdaten unter `/spinning/gpu-battery-results/2026-07-31_318_beleg/`:
+`drive_boot.sh` + die drei generierten `remote_boot_318_*.sh`,
+`proofs/namespace.*.txt`, `proofs/errors.*.txt`, `proofs/smoke.main.json`,
+`proofs/smoke.main.text.txt`, `proofs/server_info.main.json`,
+`logs/boot.*.tail.txt`, `logs/driver.log`,
+`proofs/card_order_{host,container}.txt` (vor dem Boot gegen
+`--rank-gpu-id 0,1,2` gelesen: 0 = 3080 20480 MiB, 1 = 5090 32607 MiB,
+2 = 3080 20480 MiB; kein `CUDA_DEVICE_ORDER` gesetzt),
+`power.csv` (48 Punkte je Karte; Spitzen 18007 MiB auf GPU0, 27479 MiB auf
+GPU1, 16913 MiB auf GPU2 — drei Ladezyklen, kein Fremd-Spin im Fenster).
+Fenster geoeffnet 04:50:48 UTC, geschlossen 04:54:53 UTC; Locks beidseitig
+freigegeben, alle drei Karten danach auf 0 MiB.
