@@ -14151,3 +14151,184 @@ Pfad (`run_step.sh`) taucht der Marker im argv ohnehin nicht auf.
 `lock_cross_shell.txt` (#314, Shell A und Shell B in einer Datei),
 `power.csv` (36 Punkte je Karte; Spitzen 179 W / 19493 MiB auf GPU0,
 115 W / 29345 MiB auf GPU1, 169 W / 18353 MiB auf GPU2).
+
+## #312-Beleg: Rang-Tod wird laut
+
+Kartenfenster 2026-07-31 00:25:44–00:42:54 UTC, **17 min** von 30 min Budget;
+13 min zurueckgegeben. Basis `wt-final` `0264eb03fe` (Merge
+`fix/collective-peer-liveness`), Rig 1, drei Karten frei vor dem Fenster
+(0/0/0 MiB auf beiden Seiten). Boot-Rezept `bar1_hi` unveraendert
+(`--tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance
+--rank-auto-reserve-mib 3000,2700,2700`, NEXTN k=3, fp8-KV, 32k Kontext),
+Transport `bar1`, Modell `Qwen3.6-27B-FP8`. Rohdaten in
+`/spinning/gpu-battery-results/2026-07-31_312_beleg/`.
+
+Kartenreihenfolge zur Fensterzeit per NVML, nicht angenommen: `0` = RTX 3080
+(`GPU-5c648f96`), `1` = RTX 5090 (`GPU-31d7ef41`), `2` = RTX 3080
+(`GPU-62dbbae1`). Kein `CUDA_DEVICE_ORDER` gesetzt; torch sortiert
+fastest-first, also liegt Rang 0 auf der 5090.
+
+### Abweichung vom beigelegten Skript, und warum
+
+`scripts/probe/peer_kill_proof.sh` beschreibt das Programm richtig und die
+Umgebung dieses Rigs in vier Punkten falsch — jeder einzelne haette dazu
+gefuehrt, dass der Lauf nichts misst:
+
+| Im Skript | Auf diesem Rig |
+|---|---|
+| `VENV=/spinning/shvllm/.venv` | torch 2.14.0a0, kein `nvidia/cu13`-Baum; GPU-venv ist `/spinning/htsglang-gpu/.venv` |
+| `SGLANG_HTCCL_GRAPH_ENABLE=1` | liest dieser Fork nicht; die Variable heisst `SGLANG_HTCCL_GRAPH_FREIGABE` |
+| kein `SGLANG_HTCCL_BAR1_NV_QUELLE`, kein `CUDA_HOME` | bar1 braucht die gepatchten Treiber-Header, und der JIT-Build scheitert ohne `CUDA_HOME` an ninja |
+| bootet lokal im Container | bar1 laeuft auf dem PVE-Host; der Container hat weder die Treiberquelle noch ein dafuer taugliches NCCL |
+
+Die **Arme** sind unveraendert gefahren. Das Rezept kommt aus dem kanonischen
+`scripts/gpu_battery/_bar1_host_boot.sh` statt aus dem Skript, damit dieses
+Fenster denselben Server bootet wie jedes andere bar1-Fenster. Treiber:
+`2026-07-31_312_beleg/run_312.sh`, `host_kill_watch.sh`, `ab_measure.py`.
+
+Zwei Korrekturen am Messgeraet waehrend des Fensters, beide protokolliert:
+
+1. **Opferauswahl.** Erster Anlauf suchte den Rang am `setproctitle`-Namen
+   (`sglang::scheduler_TP<n>`) und fand auf einem nachweislich laufenden
+   Server **nichts** (`raw/kill_arm.attempt1_no_victim.txt`). Der Rang ist auf
+   diesem Host nicht aus dem Prozesstitel lesbar. Seitdem waehlt das Skript
+   ueber NVML: welcher Prozess haelt Speicher auf welcher Karte. Rang 0 liegt
+   auf der 5090, also ist jeder Compute-Prozess auf einer 3080 per
+   Konstruktion ein Nicht-Null-Rang. Die 5090 wird zur Laufzeit am Namen
+   aufgeloest, nie an einem festen Index.
+2. **Trefferbegriff.** Der zweite Anlauf zaehlte `named_error 0` gegen das
+   Muster `PeerLostError|CollectiveTimeoutError`, waehrend im Log in derselben
+   Sekunde die benannte Diagnose stand. Die Log-Oberflaeche traegt den
+   Klassennamen nicht. Das urspruengliche Musterset des Probe-Skripts enthielt
+   `peer rank gone` und haette getroffen — die Verengung auf Klassennamen war
+   ein Fehler des Harness, nicht des Features.
+
+### Arm 1 — KILL: die Diagnose kommt in derselben Sekunde
+
+Server oben nach 77 s (JIT-Cache warm; der kalte Erstboot desselben Fensters
+brauchte 153 s). Zwei Aufwaermrunden plus die vollstaendige AB-Messung liefen
+vor dem Kill, das JIT-Fenster ist also geschlossen und die Graphen sind
+gefangen. Opfer: pid 3621947 auf `GPU-5c648f96` (3080) = **TP-Rang 1**.
+
+    kill_at   2026-07-31T00:31:44.105Z   (Host-Lokalzeit 02:31:44)
+
+Im Server-Log, `logs/kill_window_lines.txt`, Zeilen 605–610 — dieselbe
+Sekunde, je dreimal auf beiden Ueberlebenden:
+
+```
+[2026-07-31 02:31:44 TP2] HTCCL peer liveness: abort window tripped --
+    peer rank gone: rank 1 (proxmox, pid 3621947). Spinning collective
+    kernels on this rank will take their abort path.
+[2026-07-31 02:31:44 TP0] HTCCL peer liveness: abort window tripped --
+    peer rank gone: rank 1 (proxmox, pid 3621947). ...
+```
+
+Die Diagnose benennt Rang, Host und pid, wie der Modul-Docstring es zusagt.
+Unmittelbar danach faellt der Scheduler von Rang 0 aus dem `broadcast_pyobj`
+mit `RuntimeError: ... Connection closed by peer` — das ist der Host-Pfad
+derselben Zerlegung.
+
+| Kriterium | Messwert |
+|---|---|
+| benannter Fehler auf den Ueberlebenden | ja (`peer rank gone: rank 1`) |
+| Wanduhr Kill -> Diagnose | **< 1 s** (dieselbe Log-Sekunde) gegen Kriterium 60 s |
+| Rest-Auslastung t+10 s | GPU0 0 %, GPU1 0 %, GPU2 0 %, je 0 MiB |
+| Rest-Auslastung t+20 s | GPU0 0 %, GPU1 0 %, GPU2 0 %, je 0 MiB |
+| ueberlebende `sglang`-Prozesse | keine |
+
+**Arm 1 bestanden**, in beiden Haelften: laut *und* ohne Dauerbrenner.
+
+### Arm 1b — KILL0: der Falsifikator, und er sitzt
+
+Arm 1 allein zeigt nur, dass die Gruppe schnell und laut endet — nicht, dass
+das Peer-Zensus daran schuld ist, denn gleichzeitig steht ein
+gloo-Host-Kollektiv im Flug, und torchs gloo merkt einen geschlossenen
+TCP-Peer von selbst. Deshalb derselbe Kill, dasselbe aufgewaermte
+Arbeitspunkt, Feature **aus** (`SGLANG_HTCCL_PEER_LIVENESS=0`). Opfer pid
+3637485, wieder auf `GPU-5c648f96`, wieder Rang 1, `kill_at
+2026-07-31T00:38:07.653Z`.
+
+| | Feature AN (Arm 1) | Feature AUS (Arm 1b) |
+|---|---|---|
+| benannte Diagnose | in derselben Sekunde | **0 Treffer im ganzen Log**, ueber 100 s Beobachtung |
+| GPU1 (5090, Rang 0) t+10 s | 0 % | **100 %** |
+| GPU1 t+20 s | 0 % | **100 %** |
+| GPU1 bei 00:42:37 (>4 min nach dem Kill) | — | **100 % SM, 122 W, 2902 MHz, 0 MiB, null Compute-Prozesse** |
+
+Der Supervisor merkt den toten Rang in beiden Armen gleich schnell
+(`Subprocess scheduler_1 (pid=...) crashed with exit code -9. Triggering
+SIGQUIT`, 02:38:08) und meldet um 02:38:13 `No live scheduler processes
+found`. Die Prozesse sind also auch ohne das Feature weg — **der Kernel ist
+es nicht.** Die 5090 rechnete danach noch minutenlang leer weiter, ohne
+Besitzer und ohne belegtes VRAM: genau die Wedge-Signatur, gegen die #312
+gebaut ist, hier zum ersten Mal auf dieser Kiste als A/B isoliert.
+Beleg: `proofs/kill0_stuck_5090.txt`, `logs/kill0_window_lines.txt`.
+
+Damit traegt der Kernbeleg nicht nur „ein Fehler erscheint", sondern
+„**ohne das Feature erscheint er nicht, und die Karte brennt weiter**".
+
+### Arm 2 — AB: die Hot-Path-Kosten bleiben unter der Nachweisgrenze
+
+`ab1` lief auf dem Boot des Kill-Arms vor dem Kill (gesunder, aufgewaermter
+Server mit `PEER_LIVENESS=1`), `ab0` auf einem eigenen Boot mit `=0`; beide
+Boots identisch aufgewaermt. Je 5 Prefill-Punkte (`max_new_tokens=1`,
+fixer 8x-Prompt) und 5 Verify-Punkte (`max_new_tokens=256`), temperature 0,
+`ms/Verify = Wanduhr / spec_verify_ct` aus `meta_info`. Achsen sind
+ms/Runde, nicht tok/s. Rohdaten `raw/ab_ab1.json`, `raw/ab_ab0.json`.
+
+| Metrik | AN (=1) | AUS (=0) | Delta | Streuung innerhalb AN | innerhalb AUS |
+|---|---:|---:|---:|---:|---:|
+| **ms/Verify** | 31,788 | 31,519 | **+0,85 %** | 1,13 % | 0,50 % |
+| ms/Prefill | 161,613 | 153,948 | +4,98 % | 7,64 % | 27,01 % |
+
+Der dokumentierte A-gegen-A-Boden fuer ms/Verify ist **2,24 % (#285) bis
+2,72 % (#294)**. Die gemessenen +0,85 % liegen darunter und ausserdem unter
+der Streuung innerhalb jedes einzelnen Arms. **Die Behauptung „null Kosten auf
+dem abschliessenden Kollektiv" ist auf der Karte bestaetigt.**
+
+Fuer ms/Prefill gibt es aus den bekannten Fenstern keinen A-gegen-A-Boden;
+die dortigen 7,5–7,9 % gehoeren zu tok/s und Accept-Laenge, nicht zur
+Prefill-Zeit. Die +4,98 % sind hier trotzdem kein Befund, und zwar aus der
+Stichprobe selbst heraus: die Streuung innerhalb der beiden Arme (7,64 % bzw.
+27,01 %) ist groesser als der Unterschied zwischen ihnen. Ein
+Prefill-Einzelpunkt bei bs=1 ist auf diesem Rig zu laut, um 5 % aufzuloesen.
+So breit wie die Stichprobe formuliert: **dieses Fenster kann einen
+Prefill-Effekt dieser Groesse weder zeigen noch ausschliessen.**
+
+Zweite Meinung, und die ist scharf: die Accept-Laengen sind ueber beide Arme
+**punktweise identisch** (2,723 / 2,844 / 2,844 / 2,783 / 2,813), bei je 256
+erzeugten Token und `meta_info` auf allen Punkten getragen. Das Feature
+aendert nicht, was das Modell produziert — nur, was passiert, wenn ein Rang
+stirbt.
+
+### Verdikt
+
+**Beide Arme bestanden.** Der Kill-Arm ist der Kernbeleg und er ist mit dem
+`kill0`-Kontrollarm zu einer echten Falsifikation ausgebaut: mit Feature
+benennt die Gruppe den toten Rang in unter einer Sekunde und gibt alle drei
+Karten frei, ohne Feature schweigt sie 100 s lang und laesst die 5090
+brennen. Der AB-Arm zeigt die Kosten dafuer unter dem Rauschboden.
+
+### Offen
+
+* **GPU1 blieb nach dem `kill0`-Arm haengen** — 100 % SM, ~122 W, 2902 MHz,
+  ohne Compute-Prozess und ohne belegtes VRAM, noch >4 min nach dem Kill und
+  ueber das Fensterende hinaus. Der VRAM-Korridor ist eingehalten (0 MiB), die
+  Karte rechnet aber leer. Im `gpu-arb`-Log als HINWEIS veroeffentlicht. Kein
+  `--gpu-reset` durchgefuehrt: destruktive Eingriffe auf der geteilten Kiste
+  nur mit Nutzer-Freigabe. Das ist zugleich der Beleg dafuer, wie teuer der
+  Zustand ist, den #312 abschafft.
+* Der Kill traf beide Male einen Rang auf einer 3080. Ein Kill von Rang 0
+  (5090) und ein Kill waehrend eines reinen Device-Kollektivs ohne
+  gleichzeitiges gloo-Host-Kollektiv sind nicht gefahren — die Diagnose kaeme
+  dort aus derselben Quelle, aber gemessen ist sie nicht.
+* Am **Trefferbegriff** des beigelegten Probe-Skripts ist nichts zu tun: sein
+  Muster `PeerLostError|peer rank gone|no longer exists` haette getroffen. Der
+  False Negative gehoert allein diesem Harness, das die Klassennamen fuer die
+  ganze Wahrheit hielt. Festgehalten, weil die naheliegende Lehre („das Skript
+  war schuld") die falsche waere.
+* Offen bleibt dagegen die **Umgebung** des Probe-Skripts (venv,
+  `SGLANG_HTCCL_GRAPH_ENABLE`, fehlendes `BAR1_NV_QUELLE`/`CUDA_HOME`, lokaler
+  Boot). Es ist hier nur mit einem Kopfvermerk auf das kanonische Rezept
+  versehen, nicht umgeschrieben — ein Umbau auf Host-Boot ist mehr als eine
+  Beleg-Aufgabe und gehoert zum Skript, nicht zu diesem Fenster.
