@@ -127,6 +127,35 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self.num_pages = config.max_total_num_tokens // self.page_size
         self.clear()
 
+    def grow_size(self, new_size: int) -> None:
+        """#330 capacity re-raise: raise the slot-id ceiling at runtime while
+        KEEPING every live allocation — the new ids ``(size, new_size]`` join
+        the free list, nothing is cleared. Valid for the arange(1..N) free-id
+        convention shared by the token and paged allocators; subclasses with
+        extra size-derived state must override."""
+        new_size = int(new_size)
+        if new_size < self.size:
+            raise ValueError(
+                f"grow_size({new_size}) below current size {self.size}; "
+                f"shrinking requires the flush + resize path"
+            )
+        if new_size == self.size:
+            return
+        if new_size % self.page_size != 0:
+            raise ValueError(
+                f"grow_size({new_size}) not a multiple of page_size "
+                f"{self.page_size}"
+            )
+        old_pages = self.size // self.page_size
+        new_pages = new_size // self.page_size
+        fresh = torch.arange(
+            old_pages + 1, new_pages + 1, dtype=torch.int64, device=self.device
+        )
+        self.free_pages = torch.cat((self.free_pages, fresh))
+        self.size = new_size
+        if self.page_size > 1:
+            self.num_pages = new_pages
+
     @abc.abstractmethod
     def clear(self):
         raise NotImplementedError()

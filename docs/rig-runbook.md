@@ -225,6 +225,60 @@ Add to the 4.1 recipe to make the KV token vector re-shardable at runtime
 - Flag unset = nothing is constructed, no extra collective, byte-identical
   to a build without #297.
 
+### 4.1.2 Runtime VRAM budget dial + KV capacity re-raise (#330): `--enable-vram-dial`
+
+Add to the 4.1 recipe (composes with 4.1.1) to make each card's VRAM budget
+dialable at runtime and to let the token ceiling GROW after a reshard whose
+vector funds more KV (the C re-raise; #320 measured the stranded gain):
+
+```bash
+  --enable-vram-dial \
+```
+
+- Mechanism: the full-attention KV pools (target + NEXTN draft) live on a
+  CUDA-VMM arena — virtual addresses reserved once for the best declared
+  vector's ceiling, physical pages committed in 16 MiB chunks
+  (`SGLANG_VRAM_DIAL_CHUNK_MIB`) underneath. Dial-down decommits tail
+  chunks back to the DRIVER: the memory disappears from this process in
+  nvidia-smi and another process can cudaMalloc it. No tensor moves, no
+  CUDA-graph recapture, ever.
+- Dial by hand (device: `rank:N`, `cuda:N`, an NVML `GPU-...` UUID, or
+  `all`; exactly one of `budget_mib` / `release_mib` / `release_fraction`):
+
+```bash
+curl -s -X POST http://127.0.0.1:<port>/vram_budget \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"cuda:1","release_mib":4096}'
+# state only:
+curl -s -X POST http://127.0.0.1:<port>/vram_budget \
+  -H 'Content-Type: application/json' -d '{"query":true}'
+```
+
+  The response returns immediately with per-rank budget/floor/backing
+  numbers; the physical release/growth commits at the next group-idle
+  consensus boundary. Watch the log for `VRAM-DIAL DONE ... released`.
+- A dial below the pinned floor (weights + graphs + GDN state + one KV
+  owner block) is rejected in the HTTP response with the exact MiB numbers.
+- Dial-DOWN flushes the radix cache when the token ceiling must contract
+  (slot ids above the new ceiling cannot be relocated in Stage 1); growth
+  and re-raise keep the cache.
+- C re-raise: after `POST /kv_reshard` to a better vector, growth arms
+  AUTOMATICALLY and commits at the next idle boundary — no second call.
+  Resharding to a row-heavier vector after a trim self-provisions when the
+  budgets fund it; otherwise the reshard holds with a log line naming the
+  required dial.
+- `--vram-budget-mib r0,r1,r2` (optional) sets initial per-rank budgets;
+  `--vram-dial-consensus-interval` (default 8) sets the commit cadence.
+- Every rank mirrors its budget into the #305-M1 VRAM ledger
+  (`/run/htsglang/vram/<uuid>.json`, tenant `srt-<port>:rank<r>`), so
+  external tenants see dialed-away bytes as claimable immediately after the
+  commit.
+- Stage-1 limits (refused loudly at boot): requires weighted uneven DCP +
+  the hybrid-linear pool family; not combinable with memory saver, PD
+  disaggregation, hierarchical-cache storage, kv-session-offload,
+  weightless-KV ranks, dual-group lane, DP > 1, kv-canary, or the HND KV
+  layout. Flag unset = byte-identical behavior.
+
 ### 4.2 Co-location (several ranks on one physical GPU)
 
 Duplicates in `--rank-gpu-id` (e.g. `0,0,1,2`) require a **runtime NCCL >=

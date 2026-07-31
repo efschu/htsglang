@@ -3366,9 +3366,56 @@ class ModelRunnerKVCacheMixin:
                             _stage_S,
                             _stage_ratio,
                         )
+                # #330 --enable-vram-dial: reserve the VA upper bound for the
+                # best declared vector's ceiling; physically back only the
+                # boot fitted ceiling right after construction. Addresses are
+                # reserved once, so later runtime grow/shrink never moves a
+                # tensor and captured CUDA graphs keep replaying.
+                _dial_initial_rows = None
+                _dial_reserve = _hybrid_pool_size
+                _dial_chunk = None
+                if getattr(self.server_args, "enable_vram_dial", False):
+                    from sglang.srt.managers.vram_dial import (
+                        get_boot_capacity_plan,
+                    )
+
+                    if envs.SGLANG_USE_HND_KVCACHE.get():
+                        raise RuntimeError(
+                            "--enable-vram-dial does not support the HND KV "
+                            "layout (row-slice zeroing and span math assume "
+                            "slot-major rows)."
+                        )
+                    _plan = get_boot_capacity_plan()
+                    if _plan is None:
+                        raise RuntimeError(
+                            "--enable-vram-dial: no boot capacity plan was "
+                            "recorded; the uneven-DCP token sizing path did "
+                            "not run for this configuration. The dial "
+                            "requires weighted uneven DCP (see DESIGN_330 "
+                            "section 7)."
+                        )
+                    if _draft_non_dcp:
+                        _dial_reserve = max(_plan.max_cap, _hybrid_pool_size)
+                    else:
+                        _dial_reserve = max(
+                            _plan.reserve_rows_for_rank(
+                                get_parallel().attn_dcp_rank
+                            ),
+                            _hybrid_pool_size,
+                        )
+                    _dial_initial_rows = _hybrid_pool_size
+                    _dial_chunk = envs.SGLANG_VRAM_DIAL_CHUNK_MIB.get() << 20
+                    logger.info(
+                        "#330 vram-dial pool lane (%s): VA reserve %d rows, "
+                        "boot backing %d rows, commit chunk %d MiB",
+                        "draft" if _draft_non_dcp else "target",
+                        _dial_reserve,
+                        _dial_initial_rows,
+                        _dial_chunk >> 20,
+                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
-                    size=_hybrid_pool_size,
+                    size=_dial_reserve,
                     dtype=self.kv_cache_dtype,
                     head_num=_hybrid_kv_head_num,
                     head_dim=self.model_config.head_dim,
@@ -3395,9 +3442,24 @@ class ModelRunnerKVCacheMixin:
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
-                    post_capture_active=self.post_capture_kv_active,
+                    post_capture_active=(
+                        self.post_capture_kv_active or _dial_initial_rows is not None
+                    ),
+                    vmm_commit_chunk_bytes=_dial_chunk,
                     **extra_args,
                 )
+                if _dial_initial_rows is not None:
+                    from sglang.srt.managers.vram_dial import (
+                        register_dial_participant,
+                    )
+
+                    self.token_to_kv_pool.initial_backing_rows(_dial_initial_rows)
+                    register_dial_participant(
+                        self,
+                        self.token_to_kv_pool,
+                        is_target=not _draft_non_dcp,
+                        reserved_tokens=_dial_reserve,
+                    )
                 if getattr(self, "_wl_spill_phys_tokens", 0):
                     self._wl_attach_spill_host_pool()
                 if getattr(self, "_kv_sess_scratch_slot", None) is not None:
@@ -3911,6 +3973,24 @@ class ModelRunnerKVCacheMixin:
                     token_capacity,
                     _binding,
                 )
+                if getattr(self.server_args, "enable_vram_dial", False):
+                    # #330: record the PER-VECTOR achievable ceilings (each
+                    # clamped by the same external caps as C itself) -- the
+                    # VA reservation and the runtime C re-raise both derive
+                    # from them.
+                    from sglang.srt.managers.vram_dial import (
+                        set_boot_capacity_plan,
+                    )
+
+                    _dial_caps = {}
+                    for _u, _v in zip(_units.tolist(), _vecs):
+                        _cv = int(_u) * sum(_v)
+                        if user_limit is not None:
+                            _cv = min(_cv, user_limit)
+                        if hybrid_cap is not None:
+                            _cv = min(_cv, hybrid_cap)
+                        _dial_caps[tuple(_v)] = _cv
+                    set_boot_capacity_plan(_vecs, _dial_caps)
                 if user_limit is not None:
                     token_capacity = min(token_capacity, user_limit)
                 return self._apply_hybrid_kv_token_cap(
@@ -3944,6 +4024,15 @@ class ModelRunnerKVCacheMixin:
             token_capacity = self._apply_hybrid_kv_token_cap(
                 token_capacity, hybrid_cap, hybrid_cap_kind
             )
+            if getattr(self.server_args, "enable_vram_dial", False):
+                # #330 without --kv-reshard-vectors: the plan holds only the
+                # boot vector (the dial works; the cross-vector re-raise has
+                # nothing to raise to).
+                from sglang.srt.managers.vram_dial import set_boot_capacity_plan
+
+                set_boot_capacity_plan(
+                    [tuple(ratios)], {tuple(ratios): int(token_capacity)}
+                )
             return token_capacity
 
         # Sync across PP ranks (each may have different layer counts) and
@@ -4702,6 +4791,41 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        # #330 initial budgets: coarse profile-time clamp so the boot never
+        # vastly overshoots a declared budget; the capacity runtime reconciles
+        # exactly (against the measured floor) at the first consensus
+        # boundary. Uses device-level used bytes -- the closest honest proxy
+        # for this process's floor at profiling time.
+        if getattr(self.server_args, "enable_vram_dial", False) and getattr(
+            self.server_args, "vram_budget_mib", None
+        ):
+            budgets = self.server_args.parsed_vram_budget_mib()
+            if len(budgets) != self.tp_size:
+                raise ValueError(
+                    f"--vram-budget-mib has {len(budgets)} entries for "
+                    f"tp_size={self.tp_size}"
+                )
+            budget_bytes = int(budgets[self.tp_rank]) << 20
+            free_b, total_b = torch.cuda.mem_get_info(self.gpu_id)
+            used_b = int(total_b) - int(free_b)
+            kv_allow = budget_bytes - used_b
+            if kv_allow <= 0:
+                raise ValueError(
+                    f"--vram-budget-mib {budgets[self.tp_rank]} MiB for rank "
+                    f"{self.tp_rank} is below what is already resident at "
+                    f"profiling time ({used_b >> 20} MiB used on device "
+                    f"{self.gpu_id}); nothing is left for KV."
+                )
+            if kv_allow < available_bytes:
+                logger.info(
+                    "#330 initial budget clamp: profiled KV budget %d MiB -> "
+                    "%d MiB (budget %d MiB, %d MiB already used)",
+                    available_bytes >> 20,
+                    kv_allow >> 20,
+                    budgets[self.tp_rank],
+                    used_b >> 20,
+                )
+                available_bytes = kv_allow
         if not self.post_capture_kv_active:
             # Uneven-TP self-calibration on the final profiled budget;
             # with post-capture sizing the (more accurate) post-capture

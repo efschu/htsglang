@@ -313,6 +313,11 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # #330 --enable-vram-dial: physical commit chunk of the VMM-backed KV
+    # pool in MiB. Smaller chunks = finer dial-down release granularity but
+    # more driver handles (boot maps pool_bytes / chunk handles per rank).
+    SGLANG_VRAM_DIAL_CHUNK_MIB = EnvInt(16)
+
     # Measured KV-budget correction (two-boot convergence): after load +
     # capture each rank measures its ACTUAL leftover GPU memory and persists
     # `leftover - safety` per rank (config-fingerprinted cache); the next

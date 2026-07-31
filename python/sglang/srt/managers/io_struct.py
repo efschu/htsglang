@@ -1441,6 +1441,31 @@ class KvReshardReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class VramBudgetReqInput(BaseReq, kw_only=True):
+    """#330: dial one card's VRAM budget at runtime, or query the dial state.
+
+    ``device`` selects the target: ``rank:N``, ``cuda:N``, an NVML GPU-...
+    UUID, or ``all``. Exactly one of ``budget_mib`` (absolute new budget),
+    ``release_mib`` (delta down; negative = raise) or ``release_fraction``
+    (fraction of the dialable span budget-floor, in [-1, 1]) must be set --
+    unless ``query`` is true, which returns the state without changing it.
+    The physical commit happens at the next group-idle consensus boundary;
+    below-floor requests are rejected immediately with exact numbers.
+    """
+
+    device: str = "all"
+    budget_mib: Optional[int] = None
+    release_mib: Optional[int] = None
+    release_fraction: Optional[float] = None
+    query: bool = False
+
+
+class VramBudgetReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    state: Optional[dict] = None
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

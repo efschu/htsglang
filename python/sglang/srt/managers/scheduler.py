@@ -127,6 +127,8 @@ from sglang.srt.managers.io_struct import (
     KvReshardReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    VramBudgetReqInput,
+    VramBudgetReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -378,6 +380,10 @@ class Scheduler(
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
         self.kv_reshard_runtime = None
+        # #330 VRAM dial / KV capacity runtime: None on every default path;
+        # built lazily on the first scheduler iteration when
+        # --enable-vram-dial is set.
+        self.kv_capacity_runtime = None
         # colocated-congruent PD lane (#107): None on every default path.
         self.congruent_prefill_lane = None
         # Multi-group runtime (#274): in-process lanes over shared bytes.
@@ -1125,7 +1131,14 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
-        if model_runner.token_to_kv_pool.post_capture_active:
+        # post_capture_kv_active gate: the #330 vram-dial lane also sets the
+        # pool's post_capture_active (its buffers are VMM-backed), but its
+        # sizing is the boot fitted ceiling + runtime capacity commits, NOT
+        # the dcp=1 post-capture free-memory resize below.
+        if (
+            model_runner.token_to_kv_pool.post_capture_active
+            and model_runner.post_capture_kv_active
+        ):
             model_runner.post_capture_resize_kv_pool()
         # Measured KV-budget correction (two-boot convergence, env-gated):
         # everything permanent is resident here (weights, pools, graphs,
@@ -1726,6 +1739,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (KvReshardReqInput, self.handle_kv_reshard),
+                (VramBudgetReqInput, self.handle_vram_budget),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3228,6 +3242,18 @@ class Scheduler(
 
                 self.kv_reshard_runtime = build_kv_reshard_runtime(self)
             self.kv_reshard_runtime.on_round()
+
+        # #330 VRAM dial / KV capacity runtime: same lazy-build and cadence
+        # discipline. Runs AFTER the reshard block so a #297 cutover in this
+        # round is already visible to the capacity math (the C re-raise arms
+        # at the next boundary from the new vector). Flag unset = attribute
+        # stays None, no collective, byte-identical to today.
+        if self.server_args.enable_vram_dial:
+            if self.kv_capacity_runtime is None:
+                from sglang.srt.managers.vram_dial import build_kv_capacity_runtime
+
+                self.kv_capacity_runtime = build_kv_capacity_runtime(self)
+            self.kv_capacity_runtime.on_round()
 
         # #287 KV pressure ladder: one occupancy sample per iteration, ladder
         # transitions only at the rank-uniform consensus boundary inside
@@ -4777,6 +4803,46 @@ class Scheduler(
             return KvReshardReqOutput(success=False, message=str(e))
         return KvReshardReqOutput(success=ok, message=msg)
 
+    def handle_vram_budget(self, recv_req: VramBudgetReqInput) -> VramBudgetReqOutput:
+        """#330 control plane: dial a card's VRAM budget or query the state.
+
+        The request reaches every TP scheduler through the broadcast pipe;
+        budget mutation is a replicated, collective-free call (the physical
+        commit happens later, at a consensus boundary where every rank is
+        idle). Below-floor requests are rejected here with exact numbers.
+        """
+        if not self.server_args.enable_vram_dial:
+            return VramBudgetReqOutput(
+                success=False,
+                message=(
+                    "--enable-vram-dial is not set; the KV pools are not "
+                    "VMM-backed, so there is no releasable tail. Boot with "
+                    "the flag to use the dial."
+                ),
+            )
+        try:
+            if self.kv_capacity_runtime is None:
+                from sglang.srt.managers.vram_dial import build_kv_capacity_runtime
+
+                self.kv_capacity_runtime = build_kv_capacity_runtime(self)
+            rt = self.kv_capacity_runtime
+            if recv_req.query:
+                return VramBudgetReqOutput(
+                    success=True, message="", state=rt.status()
+                )
+            ok, msg = rt.apply_budget_request(
+                device=recv_req.device,
+                budget_mib=recv_req.budget_mib,
+                release_mib=recv_req.release_mib,
+                release_fraction=recv_req.release_fraction,
+            )
+        except Exception as e:
+            logger.warning("VRAM-DIAL request failed: %s", e)
+            return VramBudgetReqOutput(success=False, message=str(e))
+        return VramBudgetReqOutput(
+            success=ok, message=msg, state=self.kv_capacity_runtime.status()
+        )
+
     def _flush_zero_kv_buffers(self):
         """Zero the attention KV data buffers during an idle flush (default,
         SGLANG_FLUSH_ZERO_KV=0 opts out), so a flushed server matches a
@@ -5507,6 +5573,15 @@ class Scheduler(
         if (
             self.kv_reshard_runtime is not None
             and self.kv_reshard_runtime.pending is not None
+        ):
+            return
+        # #330: same rationale for a pending capacity change -- the commit
+        # needs consensus boundaries, and a parked loop never reaches one.
+        # pending_work() is a pure function of replicated state, so every
+        # rank skips the sleep in the same rounds.
+        if (
+            self.kv_capacity_runtime is not None
+            and self.kv_capacity_runtime.pending_work()
         ):
             return
         if self.idle_sleeper is not None:

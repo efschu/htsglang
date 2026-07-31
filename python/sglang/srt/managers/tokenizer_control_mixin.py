@@ -43,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     KvReshardReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    VramBudgetReqInput,
+    VramBudgetReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("kv_reshard", KvReshardReqOutput),
+    ("vram_budget", VramBudgetReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -276,6 +279,18 @@ class TokenizerControlMixin:
                 KvReshardReqInput(target_vector=list(target_vector))
             )
         )[0]
+
+    async def vram_budget(
+        self: TokenizerManager, obj: VramBudgetReqInput
+    ) -> VramBudgetReqOutput:
+        """#330: dial a card's VRAM budget or query the dial state.
+
+        Budget mutation is replicated across the TP schedulers via the
+        broadcast pipe and returns immediately with the arming verdict; the
+        physical release/growth commits at the next group-idle consensus
+        boundary (watch the VRAM-DIAL log lines for the DONE record)."""
+        self.auto_create_handle_loop()
+        return (await self.vram_budget_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
