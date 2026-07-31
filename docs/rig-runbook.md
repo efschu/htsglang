@@ -1427,6 +1427,10 @@ nothing changes.**
 | `SGLANG_HTCCL_BAR1_A2A=0` | `all_to_all` off, which also turns `all_gather` off: they share the slot area and the byte proof |
 | `SGLANG_HTCCL_BAR1_AG=0` | `all_gather` off on its own. Default **on**; off means the standard run aborts in graph capture, which is the bug this covered |
 | `SGLANG_HTCCL_BAR1_AG_MAX_RUNDEN` | cap on kernel launches per all_gather (16). Not a window limit |
+| `SGLANG_HTCCL_PEER_LIVENESS=0` | **off switch for the #312 peer-liveness bound.** Default on: host waits get a deadline plus a `kill(pid, 0)` check on the peer processes, and a watchdog writes an abort word the BAR1 spin kernels poll. `0` restores the previous, unbounded blocking calls exactly — which means a killed rank leaves the survivors spinning again, so only set it to diagnose the mechanism itself |
+| `SGLANG_HTCCL_PEER_TIMEOUT_S` | seconds a host wait may make no progress (120). Scaled by `SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT` while the cold-build window is open, so a first boot on an empty kernel cache does not trip it. A DEAD peer is caught regardless of this value — death is a fact, the deadline only carries the wedged-but-alive case |
+| `SGLANG_HTCCL_PEER_PROBE_S` | how often a stalled wait, and the watchdog thread, may ask whether the peer processes still exist (1). One `kill(pid, 0)` per peer |
+| `SGLANG_HTCCL_PEER_WATCHDOG=0` | keeps the bounded host waits but stops the watchdog thread. The device-side spin then falls back to its cycle deadline alone, which is the pre-#312 behaviour for kernels under graph replay |
 
 #### Booting the standard run over the direct path
 

@@ -706,6 +706,33 @@ confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline mode
 substituting for NCCL within one TP group, and is explicitly "proof-of-concept... fragile" per its
 own README (partial).
 
+**Peer liveness in the collective family (task #312).** A rank killed mid-collective — SIGKILL
+from the OOM killer during CUDA-graph capture is the observed case, twice in one window — used to
+leave every survivor spinning at 100 % SM and zero PCIe until somebody intervened by hand. Two
+mechanisms, neither able to see a dead process:
+
+| Layer | Old bound | Why it did not help |
+|---|---|---|
+| host, every `dist.*` on the gloo `cpu_group` | 7200 s, hardcoded in `GroupCoordinator.__init__` | `--dist-timeout` reached only the NCCL `device_group`; two hours is a hang as far as an operator is concerned |
+| host, `torch.cuda.synchronize()` after a spinning kernel | none | blocks the host thread in the driver, turning a wedged stream into a wedged process |
+| device, BAR1 spin kernels | `SGLANG_HTCCL_BAR1_CAP_CYCLES`, ~30 s at 2 GHz | rank-local, multiplied 40x inside the JIT cold-build window — which IS the capture window — and its expiry wrote a `ctlStatus` word no production path read, so the stream continued over a partially written buffer |
+
+The fix publishes one fact and consults it only while a wait is already making no progress:
+`(hostname, pid, /proc start time)` per rank at transport bring-up, so a same-host peer is
+decidable with `kill(pid, 0)` while a cross-host peer is reported UNKNOWN rather than guessed
+dead. Host waits go through bounded helpers that raise a named `PeerLostError` (rank, host, pid);
+the `cpu_group` now honours `--dist-timeout` like the device group does. For the device side a
+watchdog thread writes a 32-bit abort word in pinned, device-mapped host memory, which the spin
+kernels poll every 1024 iterations and answer with the abort path they already had — the only
+channel that can end a spin during graph replay, where no host code runs inside the collective.
+Knobs: `SGLANG_HTCCL_PEER_LIVENESS` (kill switch, `0` restores the previous unbounded calls
+exactly), `SGLANG_HTCCL_PEER_TIMEOUT_S` (120), `SGLANG_HTCCL_PEER_PROBE_S` (1),
+`SGLANG_HTCCL_PEER_WATCHDOG`. Nothing runs on a collective that completes.
+
+**Upstream:** torch's process-group timeout is the only bound stock SGLang/vLLM have, and it is a
+duration, not a liveness check — a wedged peer and a dead one are indistinguishable to it, and a
+dead one is exactly the case that is decidable (no).
+
 <a id="f23"></a>
 ### 23. Turing/gfx900 without sgl-kernel
 

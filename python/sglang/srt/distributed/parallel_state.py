@@ -29,6 +29,7 @@ import gc
 import logging
 import os
 import pickle
+import sys
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -85,6 +86,53 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+#: Fully qualified name of the peer-liveness module. Looked up in
+#: ``sys.modules`` rather than imported: a boot without an HTCCL transport
+#: never loads it, and ``GroupCoordinator.barrier`` must not be the thing
+#: that changes that.
+_HTCCL_LIVENESS_MODULE = "sglang.srt.distributed.device_communicators.htccl_liveness"
+
+#: Mirrors ``htccl_liveness.ENV_ENABLE``. Duplicated because reading the
+#: switch must not require importing the module the switch controls; the
+#: module's own value is preferred whenever it is already loaded.
+_PEER_LIVENESS_ENV = "SGLANG_HTCCL_PEER_LIVENESS"
+_PEER_LIVENESS_OFF = ("", "0", "false", "no", "off")
+
+
+def _peer_liveness_forced(module=None) -> bool:
+    """Did the operator name the feature explicitly, rather than default it?
+
+    The module defaults the feature ON, which is right for a process that
+    already runs HTCCL. It is not enough to make a process that does not
+    import the module load it, so the barrier below asks for an explicit
+    opt-in instead.
+    """
+    name = getattr(module, "ENV_ENABLE", _PEER_LIVENESS_ENV)
+    return os.environ.get(name, "").strip().lower() not in _PEER_LIVENESS_OFF
+
+
+def _peer_liveness_for_barrier():
+    """The liveness module if this process's barriers should be bounded.
+
+    ``None`` on a plain boot, and reaching that answer costs one dict
+    lookup and one ``os.environ`` read: no import, no collective, and the
+    caller's original ``torch.distributed.barrier`` unchanged.
+    """
+    module = sys.modules.get(_HTCCL_LIVENESS_MODULE)
+    if module is None:
+        # Never imported => no HTCCL transport in this process. Only an
+        # explicit opt-in justifies importing it just for the barrier.
+        if not _peer_liveness_forced():
+            return None
+        from sglang.srt.distributed.device_communicators import htccl_liveness
+
+        return htccl_liveness
+    # An HTCCL transport lives here. A registered table means the identity
+    # exchange succeeded and a dead peer can be named by rank, host and pid.
+    if module.registered_tables():
+        return module
+    return module if _peer_liveness_forced(module) else None
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -539,8 +587,24 @@ class GroupCoordinator:
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
+                #
+                # The timeout follows `--dist-timeout` when one is set, the
+                # same as the device group above. It used to be pinned to
+                # the `gloo_timeout` default no matter what the operator
+                # configured, and that is the defect behind #312: every
+                # HTCCL handshake, `GroupCoordinator.barrier` and therefore
+                # the CUDA-graph capture barrier run on THIS group, so a
+                # rank killed during capture left the survivors waiting out
+                # a hardcoded 7200 s that nothing could shorten. The same
+                # divergence produced the hicache stall fixed in #259.
+                # Unset keeps the previous 7200 s default exactly.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=(
+                        subgroup_timeout if subgroup_timeout is not None
+                        else gloo_timeout
+                    ),
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -2116,7 +2180,22 @@ class GroupCoordinator:
         terrible because it is internally a broadcast operation with
         secretly created GPU tensors. It is easy to mess up the current
         device. Use the CPU group instead.
+
+        This is the site of the 17-minute stall measured in #194: it is
+        what `enter_capture_group_barrier` and `run_capture_warmups` call
+        (see model_executor/runner/base_runner.py), so a rank SIGKILLed
+        during CUDA-graph capture parks every survivor here for the whole
+        gloo process-group timeout. When an HTCCL transport has published a
+        peer table, the wait goes through `bounded_barrier` and ends with
+        the dead rank named instead. A boot without HTCCL takes the plain
+        call below, unchanged and without importing anything.
         """
+        liveness = _peer_liveness_for_barrier()
+        if liveness is not None:
+            liveness.bounded_barrier(
+                self.cpu_group, f"group barrier ({self.unique_name})"
+            )
+            return
         torch.distributed.barrier(group=self.cpu_group)
 
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:

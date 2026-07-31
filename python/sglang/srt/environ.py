@@ -665,6 +665,29 @@ class Envs:
     # bytes were never the cost (task #244). +17 % on an 80 KiB all_reduce.
     # Kept as the A/B control and for links where the bytes DO dominate.
     SGLANG_HTCCL_UCX_RING_BIDIR = EnvBool(False)
+    # --- peer liveness for the collective family (task #312) ---------------
+    # A rank that dies leaves its peers spinning: the gloo cpu_group every
+    # HTCCL handshake runs on is built with a hardcoded 7200 s timeout, and
+    # the BAR1 spin kernels carry only a rank-local cycle deadline whose
+    # expiry writes a status word nothing reads. These four knobs bound both
+    # sides. 0 restores the previous, unbounded behaviour exactly.
+    #
+    # Rank-uniform like the rest of this block, and more strictly so than
+    # most: the deadline decides WHEN a rank gives up, and ranks that give up
+    # minutes apart turn one clean group failure into a cascade.
+    SGLANG_HTCCL_PEER_LIVENESS = EnvBool(True)
+    # Seconds a host-side wait may make no progress before it gives up. Scaled
+    # by SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT while the cold-build window is
+    # open, so a first boot on an empty kernel cache does not trip it.
+    SGLANG_HTCCL_PEER_TIMEOUT_S = EnvFloat(120.0)
+    # How often a stalled wait, and the watchdog thread, may ask whether the
+    # peer processes still exist. One kill(pid, 0) per peer, ~1 us.
+    SGLANG_HTCCL_PEER_PROBE_S = EnvFloat(1.0)
+    # Whether the watchdog thread runs. It is what ends a DEVICE-side spin:
+    # no host code runs inside a captured graph replay, so somebody outside
+    # the collective has to write the abort word the kernels poll.
+    SGLANG_HTCCL_PEER_WATCHDOG = EnvBool(True)
+
     # --- per-message-class link selection (task #240) ----------------------
     # Env spelling of --collective-net-small / --collective-net-bulk. Set
     # either directly or let server-args resolution export it; the flag and

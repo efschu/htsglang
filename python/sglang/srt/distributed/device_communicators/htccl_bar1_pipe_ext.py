@@ -130,6 +130,11 @@ from typing import Optional
 from sglang.srt.distributed.device_communicators import (
     htccl_env_compat,  # noqa: F401  (resolves deprecated env var aliases)
 )
+from sglang.srt.distributed.device_communicators.htccl_liveness import (
+    bounded_barrier,
+    bounded_device_sync,
+    check_peers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +584,13 @@ namespace cg = cooperative_groups;
 #define HTCCL_PIPE_MAX_RANKS 8
 #define HTCCL_PIPE_MAX_TIEFE 8
 
+// Rate limit of the host abort probe inside the wait macros. Same value and
+// same reasoning as HTCCL_BAR1_WIRT_MASKE in htccl_bar1_ext.py: the word sits
+// in pinned, device-mapped host memory, so one read per 1024 spin iterations
+// stays far below the flag loads the loop already issues, and a wait that is
+// satisfied leaves through its own break before the probe is ever evaluated.
+#define HTCCL_BAR1_WIRT_MASKE 1023u
+
 #define K_1BLK   0
 #define K_GITTER 1
 #define LA_CV    0
@@ -750,6 +762,10 @@ struct PipeArgs {
     u64         *ergGenDev;
     unsigned int *ctlStatus;
     unsigned int *abbruchDev;
+    // Host-set abort word (pinned, device-mapped). nullptr = absent, and then
+    // the wait macros keep only their cycle deadline. Set to 1 by the peer
+    // watchdog when a peer process is provably gone.
+    const unsigned int *abbruchWirt;
     int          n4;
     int          R;
     int          rang;
@@ -906,6 +922,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     do {                                                                       \
         const u64 _z = (ZIEL);                                                 \
         long long _t0 = clock64();                                             \
+        unsigned int _sonde = 0u;                                              \
         for (;;) {                                                             \
             bool _alle = true;                                                 \
             for (int _s = 0; _s < R; ++_s) {                                   \
@@ -917,6 +934,10 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             }                                                                  \
             if (_alle) break;                                                  \
             if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
+            if (A.abbruchWirt != nullptr &&                                    \
+                ((++_sonde & HTCCL_BAR1_WIRT_MASKE) == 0u) &&                  \
+                *(const volatile unsigned int *)A.abbruchWirt != 0u)           \
+                { abbruchS = 1; break; }                                       \
         }                                                                      \
     } while (0)
 
@@ -928,6 +949,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         if (A.quittung) {                                                      \
             const u64 _z = (ZIEL);                                             \
             long long _t0 = clock64();                                         \
+            unsigned int _sonde = 0u;                                          \
             for (;;) {                                                         \
                 bool _alle = true;                                             \
                 for (int _q = 0; _q < R; ++_q) {                               \
@@ -939,6 +961,10 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                 }                                                              \
                 if (_alle) break;                                              \
                 if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
+                if (A.abbruchWirt != nullptr &&                                \
+                    ((++_sonde & HTCCL_BAR1_WIRT_MASKE) == 0u) &&              \
+                    *(const volatile unsigned int *)A.abbruchWirt != 0u)       \
+                    { abbruchS = 1; break; }                                   \
             }                                                                  \
         }                                                                      \
     } while (0)
@@ -964,6 +990,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         const u64 _z = (ZIEL);                                                 \
         const u64 _sl = (u64)(A.ergSlack - 1);                                 \
         long long _t0 = clock64();                                             \
+        unsigned int _sonde = 0u;                                              \
         for (;;) {                                                             \
             bool _alle = true;                                                 \
             for (int _q = 0; _q < R; ++_q) {                                   \
@@ -975,6 +1002,10 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
             }                                                                  \
             if (_alle) break;                                                  \
             if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
+            if (A.abbruchWirt != nullptr &&                                    \
+                ((++_sonde & HTCCL_BAR1_WIRT_MASKE) == 0u) &&                  \
+                *(const volatile unsigned int *)A.abbruchWirt != 0u)           \
+                { abbruchS = 1; break; }                                       \
         }                                                                      \
     } while (0)
 
@@ -1319,7 +1350,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
                     at::Tensor erg_gen_dev, at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                    int64_t ladeform)
+                    int64_t ladeform, int64_t abbruch_wirt)
 {
     const int R = (int)world, r = (int)rank;
     const int K = (int)k_chunks, TT = (int)tiefe, PP = (int)vorlauf;
@@ -1398,6 +1429,9 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     A.schrittDev   = (u64 *)schritt_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
     A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    // 0 means the host could not map the abort word; the wait macros then see
+    // nullptr and skip the probe entirely.
+    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
     A.n4           = n4;
     A.R            = R;
     A.rang         = r;
@@ -1538,7 +1572,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
                     at::Tensor runde_dev, at::Tensor schritt_dev,
                     at::Tensor erg_gen_dev, at::Tensor ctl_dev,
                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                    int64_t ladeform);
+                    int64_t ladeform, int64_t abbruch_wirt);
 """
 
 
@@ -1714,9 +1748,21 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
             erwartet = torch.zeros(n, dtype=torch.float32, device=geraet)
             for q in range(welt):
                 erwartet += ((welle % 7.0) + 1.0) * float(q + 1) + float(round * 13)
-            dist.barrier(group=transport.cpu_group)
+            tisch = getattr(transport, "_peer_table", None)
+            bounded_barrier(
+                transport.cpu_group,
+                f"bar1 pipe proof: before round {round + 1}/{runden}",
+                table=tisch,
+            )
             ist = transport._pipe_all_reduce(eig, k)
-            torch.cuda.synchronize(geraet)
+            bounded_device_sync(
+                f"bar1 pipe proof: round {round + 1}/{runden}",
+                device=geraet,
+                table=tisch,
+            )
+            # A tripped kernel is otherwise silent -- the comparison below
+            # would report a data bug where the cause was an abort.
+            transport.raise_if_aborted(f"pipe proof round {round + 1}")
             schlecht = int((ist != erwartet).sum().item())
             if schlecht:
                 erste = int((ist != erwartet).nonzero()[0].item())
@@ -1740,5 +1786,12 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
     # another bailed out. A broadcast from rank 0 would NOT do that: the
     # proof has failed as soon as ANY rank has seen a wrong value.
     traeger: list = [None] * welt
+    # torch runs the object collectives inline; there is no Work to bound, so
+    # the one-shot check names an already dead peer instead of entering the
+    # 7200 s gloo wait for it.
+    check_peers(
+        "bar1 pipe proof: verdict exchange",
+        getattr(transport, "_peer_table", None),
+    )
     dist.all_gather_object(traeger, bool(alles_gut), group=transport.cpu_group)
     return all(bool(x) for x in traeger)

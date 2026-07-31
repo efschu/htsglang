@@ -38,6 +38,8 @@ from contextlib import contextmanager
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators import htccl_liveness
+
 # NOT a module-level `from sglang.srt.utils.jit_cold_build import ...`:
 # importing the `sglang.srt.utils` PACKAGE runs its __init__, which creates a
 # CUDA context, and this file must stay importable on the ROCm/CPU-only rank
@@ -889,6 +891,19 @@ def _load_ext(cpu_group):
     return _ext
 
 
+def _peer_table_of(obj) -> object:
+    """The peer table of a transport, tolerating a stand-in without one.
+
+    ``_resolve_owner_weights`` and ``_resolve_pipe_chunk`` are deliberately
+    callable on an object that is not a fully built transport -- that is how
+    the calibration tests drive the sweep without a card, a segment or a
+    process group. A missing table means "cannot name a dead peer", which is
+    already what ``None`` means to the bounded helpers, so this reads the
+    attribute instead of requiring it to exist.
+    """
+    return getattr(obj, "_peer_table", None)
+
+
 class HTCCLDeviceTransport:
     """GPU-driven all-reduce over the mapped shm segment.
 
@@ -925,6 +940,13 @@ class HTCCLDeviceTransport:
         self.world_size = self._shm.world_size
         self.slot_bytes = slot_bytes
         self._ext = _load_ext(cpu_group)
+        #: The shm transport constructed above already exchanged identities
+        #: on THIS cpu_group, so its table describes exactly the same peer
+        #: processes. Reuse it rather than paying a second collective;
+        #: install only if the shm side did not produce one.
+        self._peer_table = getattr(self._shm, "_peer_table", None)
+        if self._peer_table is None:
+            self._peer_table = htccl_liveness.install(cpu_group)
 
         import ctypes
 
@@ -966,9 +988,11 @@ class HTCCLDeviceTransport:
         self._pipe_chunk_bytes = (
             int(os.environ.get("SGLANG_HTCCL_PIPE_CHUNK_MIB", "4")) * 1024 * 1024
         )
-        import torch.distributed as dist
-
-        dist.barrier(group=cpu_group)
+        htccl_liveness.bounded_barrier(
+            cpu_group,
+            "htccl device bring-up barrier",
+            table=self._peer_table,
+        )
         # After the barrier the transport is fully usable — calibrate
         # the pipeline chunk size on the real all_reduce path (skipped
         # when SGLANG_HTCCL_PIPE_CHUNK_MIB or the tune bundle provides it).
@@ -1018,6 +1042,12 @@ class HTCCLDeviceTransport:
         torch.cuda.synchronize(self.device)
         gbps = 16 * nbytes / (time.perf_counter() - t0) / 1e9
         gathered = [None] * self.world_size
+        # Inline in torch, so not pollable: the bound is to refuse entry
+        # when a peer is already gone.
+        htccl_liveness.check_peers(
+            "htccl device RS+AG link calibration (all_gather_object)",
+            table=_peer_table_of(self),
+        )
         dist.all_gather_object(gathered, gbps, group=self.cpu_group)
         # Integerize to small weights (per-mille of total, gcd-reduced).
         import math
@@ -1069,17 +1099,29 @@ class HTCCLDeviceTransport:
         my_times = []
         for mib in candidates:
             self._pipe_chunk_bytes = mib * 1024 * 1024
-            dist.barrier(group=self.cpu_group)
+            htccl_liveness.bounded_barrier(
+                self.cpu_group,
+                f"htccl pipe-chunk sweep pre-warmup barrier ({mib} MiB)",
+                table=_peer_table_of(self),
+            )
             for _ in range(2):  # warmup
                 self.all_reduce(payload)
             torch.cuda.synchronize(self.device)
-            dist.barrier(group=self.cpu_group)
+            htccl_liveness.bounded_barrier(
+                self.cpu_group,
+                f"htccl pipe-chunk sweep pre-timing barrier ({mib} MiB)",
+                table=_peer_table_of(self),
+            )
             t0 = time.perf_counter()
             for _ in range(5):
                 self.all_reduce(payload)
             torch.cuda.synchronize(self.device)
             my_times.append(time.perf_counter() - t0)
         gathered: list[list[float] | None] = [None] * self.world_size
+        htccl_liveness.check_peers(
+            "htccl pipe-chunk sweep result exchange (all_gather_object)",
+            table=_peer_table_of(self),
+        )
         dist.all_gather_object(gathered, my_times, group=self.cpu_group)
         totals = [
             sum(times[i] for times in gathered)  # type: ignore[index]
