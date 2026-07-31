@@ -41,6 +41,16 @@ BUDGET_S=600
 MIN_FREE_MIB=400
 export PYTHONPATH="$WT/python"
 
+# CARD is an NVML index -- the index nvidia-smi, /spinning/gpu-arb and every
+# card window in the runbook are expressed in. CUDA's default enumeration is
+# FASTEST_FIRST, which on this rig is not NVML's: the 5090 is NVML 1 and CUDA
+# ordinal 0. Without this the preflight measures free memory on the NVML card
+# and the benchmark then runs on a different one -- the first run of this
+# script claimed NVML 0 (a 3080), and the benchmark's own
+# torch.cuda.get_device_name(0) printed "RTX 5090". Same trap as
+# TASK_333 §9.3; the fix is the same line.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
 
 # --- feasibility arith: the segment needs < 500 MiB; refuse a loaded card ---
@@ -80,9 +90,19 @@ log "claimed card $CARD, heartbeat pid $hb_pid"
 cd "$WT"
 rc=0
 
-log "=== 1/3 microbench: bound check off vs on (fp8) ==="
-CUDA_VISIBLE_DEVICES=$CARD timeout 200 "$PY" \
-  benchmark/kernels/bench_masked_kv_bound_check.py --dtype fp8 || rc=1
+# fp8 KV needs sm89+. Triton lowers the fp8e4nv load to nothing a 3080 can
+# execute and refuses at compile time, so on sm86 this arm has no result to
+# report -- which is not the same as a failed proof. Skipped by capability,
+# and the skip is printed so a reader can see the arm did not silently vanish.
+cc=$(CUDA_VISIBLE_DEVICES=$CARD nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)
+cc_num=$(echo "$cc" | tr -d '.')
+log "=== 1/3 microbench: bound check off vs on (fp8), card compute_cap $cc ==="
+if [ "$cc_num" -ge 89 ]; then
+  CUDA_VISIBLE_DEVICES=$CARD timeout 200 "$PY" \
+    benchmark/kernels/bench_masked_kv_bound_check.py --dtype fp8 || rc=1
+else
+  log "SKIP fp8 arm: compute_cap $cc < 8.9, fp8e4nv is not an instruction on this card"
+fi
 
 log "=== 1b/3 microbench (bf16) ==="
 CUDA_VISIBLE_DEVICES=$CARD timeout 200 "$PY" \
