@@ -20624,3 +20624,115 @@ Nicht vereinheitlicht, bewusst: die zwei Rundungsregeln (Hamilton vs.
 kumulativ, `(1,3)` ueber 10 gibt `[3,7]` gegen `[2,8]`). Beide sind fuer ihren
 Konsumenten richtig; eine Vereinheitlichung waere ein Re-Tune. Die Differenz
 ist jetzt ein festgenagelter Fakt statt eines stillen.
+
+## #357 Der Planner lehnte seinen eigenen phasenoptimalen Vektor ab (`fix/planner-phase-optimal-357`, Basis 398611ac04; Kartenfenster 2026-07-31, 19:33-19:58 UTC)
+
+Ausgangslage aus #354: der Planner loest den prefill-optimalen Vektor, gibt ihn
+in seiner ABSAGE-Zeile aus und lehnt ihn dann ab — obwohl genau dieser Vektor
+gebootet hat und 1540,3 tok/s Prefill lieferte. Damit kann das Phasenrezept
+nicht Standard werden, solange der eigene Planner nein sagt.
+
+### Die Absage, reproduziert, mit Zahlen
+
+Reproduziert auf dem Schreibtisch am #264/#265-Fixture, ergaenzt um die
+GEMM-Lanes des #354-Fensters (fp8_native 568,48 / fp8_marlin 58,44 / 59,15;
+int8_native 676,69 / 183,78 / 164,77). Das Fixture gibt `plan_fp8_auto.txt` und
+`plan_int8_auto.txt` zeilengleich wieder (`16,1,1` +22,2 % / `10,1,1` +9,1 %,
+Residuen `[3000, 5581, 7238]`, Zaehlung "unbootable 6, knee 2").
+
+**Es sind ZWEI verschiedene Absagen an zwei verschiedenen Arbeitspunkten, und
+nur eine davon ist falsch:**
+
+| Reserve | Gate | Term | Zahl |
+|---|---|---|---|
+| `3000,2700,2700` (Runbook) | Fundability (#265) | Rang-0-Residual gegen abgeleiteten Reserve-Bedarf | 3000 MiB < 4160 MiB |
+| `4500,2700,2700` (der Boot von #354) | Decode-Knee-Guard | Rang-0-Anteil gestreamter Gewichtsbytes gegen effektiven membw-Anteil | 60,3 % > 42,2 % (sichere Decke 41,6 %), prognostizierter Decode-Schritt +24,7 % |
+
+Die Fundability-Absage ist RICHTIG, und zwar zweiseitig belegt: #264 hat den
+OOM bei Reserve 3000 gemessen (6,1,1, GPU 0 auf 41,69 MiB frei), und #354
+belegt es von der anderen Seite — sein Prefill-Boot lief mit Reserve 4500 und
+endete mit 87 MiB frei auf der 5090, die Nicht-Budget-Posten haben also 4413
+MiB verbraucht. Der Bedarfswert 4160 MiB ist damit eher zu klein als zu gross;
+bei Reserve 3000 haette der Boot um rund 1400 MiB gefehlt.
+
+**Die falsche Absage ist die zweite.** An genau dem Arbeitspunkt, den #354
+gebootet hat, lehnt der Ladder `16,1,1` (FP8) bzw. `10,1,1` (INT8) mit einer
+DECODE-Zahl ab. Die Zahl selbst stimmt: prognostiziert +24,7 % Decode-Schritt,
+gemessen +20,2 % (bs=8) bis +25,0 % (bs=1). Falsch ist das Urteil, denn im
+Phasenrezept decodiert dieser Vektor gar nicht — die Decode-Phase faehrt den
+VRAM-auto-Split. Der Ladder verwirft einen Prefill-Vektor fuer einen Preis, den
+das Rezept nie zahlt, waehrend derselbe Boot +22,6 % Prefill bei s=1 gemessen
+hat (Prognose +22,9 %, Abweichung 0,3 Prozentpunkte).
+
+Nicht die Ursache, gegengeprueft: der offene #348b-Punkt (`key_solver` ruft die
+#324-Maschinerie nicht) traegt hier nicht. Der Ladder in `uneven_perf` hat die
+int8-Bahn korrekt benutzt — er loest fuer INT8 einen flacheren Vektor mit
+weniger als der halben Prognose, und beide Zahlen decken sich mit dem
+INT8-Plan-Log von #354.
+
+### Der Fix
+
+`--rank-perf-tune` bekommt zwei neue Arme, `phase-prefill` und `phase-decode`.
+Im Phasenarm ist der Decode-Knee-Guard BERATEND (Zahl steht weiter in jeder
+Kandidatenzeile, mit dem Zusatz "decode-knee ADVISORY"); Fundability und
+Kontext-Boden REJEKTIEREN unveraendert. `enc`, `both`, `dec` und `maxkv`
+bleiben byte-identisch — dort bedient ein Vektor beide Phasen, also ist der
+Decode-Preis ihrer. `phase-decode` haelt den VRAM-auto-Split, aendert im
+Gegensatz zu `dec` NICHT `--rank-kv-ratio`, und beide Arme protokollieren
+dasselbe Vektorpaar, damit ein Planlauf das ganze Rezept nennt. Dass ein
+Armwechsel heute einen Neustart kostet (Gewichte bewegt kein Aktuator; #297
+verschiebt KV-Token, #330 das VRAM-Budget), steht in der Logzeile selbst.
+
+### Tests
+
+`test/registered/unit/planner/test_phase_optimal_targets.py`, 14 Tests /
+17 Subtests, neu. Falsifikator gegen den ausgelieferten Planner gefahren:
+7 Faelle rot, darunter `'' != '16,1,1'` und `'' != '10,1,1'` — der Ladder
+installierte nichts. Negativkontrolle im selben File: bei Reserve 3000 bleibt
+der #354-Vektor UNBOOTABLE, der Phasenarm installiert ihn nicht, und der
+Kontext-Boden rejektiert weiterhin (erzwungen ueber 0,1 % Kontextabzug).
+Gesamtlauf `test/registered/unit/planner` + `test/registered/registry`:
+2036 passed, 1 skipped, 158 Subtests. Zwei Fremdtests mitgezogen
+(`test_webui`: Enum-Liste und Tooltip-Laenge), beide mechanisch.
+
+### Kartenteil (Bestaetigung, keine Neumessung)
+
+Je ein Boot pro Format, `--rank-perf-tune phase-prefill` OHNE gepinnten
+Vektor, Reserve `5000,2700,2700` (statt 4500, damit der VRAM-Korridor gruen
+bleibt: #354 endete bei 4500 mit 87 MiB frei auf der 5090).
+
+| Arm | Planner waehlt | Units | frei 5090 | Kohaerenz |
+|---|---|---|---|---|
+| FP8 | `16,1,1` | `[121, 8, 7]` | 2974 MiB | 2/2 Prompts sinnvoll |
+| INT8-W8A8 | `16,2,3` | `[104, 13, 19]` | 2236 MiB | 2/2 Prompts sinnvoll |
+
+Der abgeleitete Reserve-Bedarf im echten Boot ist `[4160, 4160, 4160]` MiB —
+derselbe Wert, den das Fixture setzt.
+
+**Der INT8-Vektor weicht von #354 ab, und zwar aus einem Messgrund, nicht aus
+einem Codegrund.** Die Lane-Neuprobe in diesem Fenster ergab 682,99 / 188,02 /
+187,61 TFLOPS gegen 676,69 / 183,78 / 164,77 in #354: die Asymmetrie zwischen
+den beiden 3080ern (0,90 gegen 1,00) ist verschwunden, und der Solver verteilt
+daraufhin `16,2,3` statt `10,1,1`. Die Konzentration ist vergleichbar
+(`[104, 13, 19]` gegen `[113, 12, 11]`). Wer die #354-Vektoren exakt
+reproduzieren will, braucht die #354-Lanes; der Test pinnt sie deshalb.
+
+sgl-kernel-Fork-Wheel und Hardware-Profil wurden fuer den INT8-Arm installiert
+und danach zurueckgerollt, in beide Richtungen geprueft (Fork-Marker 1->0,
+PyPI-Marker 0->1, Profil-md5 identisch zum Vorzustand, `int8_native` wieder
+weg). Karten ueber `/spinning/gpu-arb/` belegt und freigegeben, py-spy-Dump vor
+jedem Kill, nur die eigene Prozessgruppe signalisiert, am Ende alle drei Karten
+bei 3 MiB.
+
+### Empfehlung zum Default
+
+Den ausgelieferten Default NICHT umstellen, aus einem Grund, der in #354s
+eigenen Zahlen steht: der Prefill-Arm kostet 79 % (FP8) bzw. 70 % (INT8)
+Kontext und strandet 14,3 bzw. 12,3 GiB auf den 3080ern, und der Decode-Arm
+verliert 16,8-20,8 % Durchsatz, wenn man ihn mit dem Prefill-Vektor faehrt. Ein
+Default, der ohne Wissen ueber den Arbeitspunkt eine dieser beiden Seiten
+festlegt, ist fuer die andere falsch. Solange ein Armwechsel einen Neustart
+kostet, ist "ein Arm fuer alles" keine Standardeinstellung, sondern eine
+Annahme ueber die Last. Sinnvoll umstellbar wird der Default erst, wenn
+Gewichte zur Laufzeit umziehen koennen — dann ist die richtige Formulierung
+nicht "phasenoptimal als Default", sondern "Armwechsel am Phasenwechsel".

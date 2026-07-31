@@ -12745,7 +12745,8 @@ async function cardProbePoll(){
 // --rank-perf-tune, and the flag itself remains editable as its own row in
 // the flag surface. markTune therefore has to tolerate its old widgets being
 // absent -- it looks each one up and skips it.
-const TUNE_LABELS={both:'balanced', maxkv:'max KV', dec:'max decode', enc:'max prefill'};
+const TUNE_LABELS={both:'balanced', maxkv:'max KV', dec:'max decode', enc:'max prefill',
+  'phase-prefill':'phase recipe: prefill arm', 'phase-decode':'phase recipe: decode arm'};
 function applyTune(mode){
   window._flagSettings=window._flagSettings||{};
   if(mode==='both') delete window._flagSettings.rank_perf_tune;

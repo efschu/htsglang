@@ -572,6 +572,21 @@ def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
         pynvml.nvmlShutdown()
 
 
+#: Accepted ``--rank-perf-tune`` targets. The first four are the
+#: single-vector targets (one weight split serves the whole server); the two
+#: ``phase-*`` targets are the arms of the phase-optimal recipe (#354/#357),
+#: which plans one vector per phase. Kept as a module constant because the
+#: argument choices, the validation and the planner all have to agree.
+_RANK_PERF_TUNE_CHOICES: Tuple[str, ...] = (
+    "both",
+    "dec",
+    "enc",
+    "maxkv",
+    "phase-prefill",
+    "phase-decode",
+)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -2029,9 +2044,21 @@ class ServerArgs:
             "sets the pace. 'dec' therefore also selects --rank-kv-ratio "
             "speed when that flag is left at its default; measured worth "
             "-24.5 %% of the context-dependent part of the decode step at "
-            "120 k resident tokens (#210). Only valid with --rank-tp-ratio "
+            "120 k resident tokens (#210). 'phase-prefill' and 'phase-decode' "
+            "are the two arms of the PHASE-OPTIMAL recipe (#354/#357): one "
+            "weight vector per phase instead of one for the whole server. "
+            "phase-prefill installs the concentrated prefill vector and "
+            "treats the decode-knee guard as ADVISORY (that vector does not "
+            "decode; fundability and the context floor still reject); "
+            "phase-decode keeps the VRAM-auto split, the measured decode "
+            "optimum, and leaves --rank-kv-ratio alone. Both arms log the "
+            "same pair of vectors. Measured at the 27B-FP8 point: prefill "
+            "+22.6 %% at s=1 on the prefill arm, decode -20.0 %% at bs=1 if "
+            "that same vector is left in place for decode -- which is why "
+            "the arms are separate boots (switching needs a restart; weights "
+            "do not move at runtime). Only valid with --rank-tp-ratio "
             "auto-performance.",
-            choices=["both", "dec", "enc", "maxkv"],
+            choices=list(_RANK_PERF_TUNE_CHOICES),
         ),
     ] = "both"
     rank_mlp_ratio: A[
@@ -7851,9 +7878,10 @@ class ServerArgs:
                 "--rank-perf-loose-ctx-percent must be in [0, 100), got "
                 f"{self.rank_perf_loose_ctx_percent!r}."
             )
-        if self.rank_perf_tune not in ("both", "dec", "enc", "maxkv"):
+        if self.rank_perf_tune not in _RANK_PERF_TUNE_CHOICES:
             raise ValueError(
-                "--rank-perf-tune must be one of both|dec|enc|maxkv, got "
+                "--rank-perf-tune must be one of "
+                f"{'|'.join(_RANK_PERF_TUNE_CHOICES)}, got "
                 f"{self.rank_perf_tune!r}."
             )
         # The tuning target also picks the KV-TOKEN ownership mode, but only
@@ -7861,6 +7889,12 @@ class ServerArgs:
         # --rank-kv-ratio (any mode string or a pinned vector) always wins, so
         # the two flags never fight and the default path stays byte-identical
         # for tune='both'/'enc'.
+        #
+        # 'phase-decode' deliberately does NOT select --rank-kv-ratio speed
+        # the way 'dec' does: the phase recipe's decode arm is the boot #354
+        # measured (plain VRAM-auto split, coupled KV ownership), and the
+        # decode numbers quoted for it are that boot's. Pass --rank-kv-ratio
+        # speed explicitly to add the #210 lever on top.
         if self.rank_kv_ratio == "coupled":
             if self.rank_perf_tune == "dec":
                 self.rank_kv_ratio = "speed"

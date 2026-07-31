@@ -379,8 +379,9 @@ TRADEOFFS: Dict[str, Tradeoff] = {
     ),
     "rank_perf_tune": Tradeoff(
         gain="Says which axis auto-performance should optimise.",
-        cost="Each target gives up the others; there is no setting that wins "
-        "on all three.",
+        cost="Each target gives up the others. The phase-* arms split that "
+        "trade over two boots instead of one, and switching arms costs a "
+        "restart.",
     ),
     "rank_perf_loose_ctx_percent": Tradeoff(
         gain="Lets the optimiser trade this much predicted context away for "
