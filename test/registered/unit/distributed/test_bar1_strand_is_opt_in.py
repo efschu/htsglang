@@ -81,7 +81,7 @@ class TestNothingIsImported(CustomTestCase):
         What must NOT come with it is the transport side: ``barlink_bar1`` and
         its two extension modules. Those are the ones that read env vars,
         open ``/dev/dmabuf_holder`` and JIT-build. bar1ep reaches them only
-        from inside ``bar1ep_verfuegbar()`` / the dispatcher constructor,
+        from inside ``bar1ep_available()`` / the dispatcher constructor,
         i.e. only once someone has chosen ``--moe-a2a-backend bar1ep``.
         """
         code = (

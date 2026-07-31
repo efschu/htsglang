@@ -1,132 +1,127 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoE-Token-Dispatcher ueber den BAR1-Direktpfad.
+"""MoE token dispatcher over the BAR1 direct path.
 
-WARUM DIESE DATEI UEBERHAUPT EXISTIERT
---------------------------------------
-``all_to_all`` in die barlink-Naht zu bauen war richtig und **wirkungslos**:
-die MoE-Dispatcher rufen dort nicht an. Nachgesehen, nicht angenommen --
+WHY THIS FILE EXISTS AT ALL
+----------------------------
+Building ``all_to_all`` into the barlink seam was correct and **useless**:
+the MoE dispatchers never call in there. Checked, not assumed --
 ``deepep.py:578`` ``buffer.dispatch(...)``, ``flashinfer.py:259``
 ``moe_a2a.dispatch(...)``, ``mooncake.py:236``, ``nixl.py:293``,
-``moriep.py:724`` gehen alle an ``torch.distributed`` vorbei in ihre eigene
-Bibliothek. Wer an die MoE-Last will, muss **einen Dispatcher schreiben**,
-nicht ein Kollektiv.
+``moriep.py:724`` all bypass ``torch.distributed`` for their own library.
+Whoever wants the MoE load has to **write a dispatcher**, not a collective.
 
-DER VERTRAG, DEN DIESE KLASSE ERFUELLT -- mit Datei und Zeile belegt
---------------------------------------------------------------------
+THE CONTRACT THIS CLASS FULFILLS -- backed by file and line
+-------------------------------------------------------------
 ``token_dispatcher/base.py``:
 
 * ``:279`` ``dispatch(hidden_states, topk_output) -> DispatchOutput``
-  (abstrakt), ``:304`` ``combine(combine_input) -> torch.Tensor``
-  (abstrakt). Mehr verlangt ``BaseDispatcher`` nicht.
-* ``:187`` ``DispatchOutput`` ist ein ``Protocol`` mit dem Feld
-  ``hidden_states`` und der Eigenschaft ``format``; ``:242``
-  ``CombineInput`` nur mit ``format``.
-* ``:161`` ``DispatchOutputFormat`` und ``:235`` ``CombineInputFormat``
-  sind **geschlossene** Aufzaehlungen. Ein neuer Wert waere ein Format,
-  das kein Runner kennt -- der Dispatcher liefe, und niemand koennte sein
-  Ergebnis rechnen.
+  (abstract), ``:304`` ``combine(combine_input) -> torch.Tensor``
+  (abstract). ``BaseDispatcher`` demands nothing more.
+* ``:187`` ``DispatchOutput`` is a ``Protocol`` with the field
+  ``hidden_states`` and the property ``format``; ``:242``
+  ``CombineInput`` only with ``format``.
+* ``:161`` ``DispatchOutputFormat`` and ``:235`` ``CombineInputFormat``
+  are **closed** enumerations. A new value would be a format no runner
+  knows -- the dispatcher would run, and nobody could compute its result.
 * ``:361`` ``set_quant_config(dict)``, ``:364`` ``set_overlap_args``,
-  ``:370`` ``clear_overlap_args`` -- der Rahmen ruft sie.
-* ``:285``/``:308`` haengen Haken vor und hinter beide Richtungen; sie
-  arbeiten auf ``self.dispatch``/``self.combine`` und brauchen von einer
-  Unterklasse nichts weiter.
+  ``:370`` ``clear_overlap_args`` -- the framework calls them.
+* ``:285``/``:308`` hang hooks before and after both directions; they
+  operate on ``self.dispatch``/``self.combine`` and need nothing further
+  from a subclass.
 
-Deshalb liefert diese Klasse **kein eigenes Format**, sondern
-``DEEPEP_NORMAL``: dieselben ``NamedTuple``-Klassen aus ``deepep.py:95``
-(``DeepEPNormalDispatchOutput``) und ``deepep.py:128``
-(``DeepEPNormalCombineInput``). Wer sie auspackt, ist nachgesehen:
+That is why this class does **not** deliver its own format, but
+``DEEPEP_NORMAL``: the same ``NamedTuple`` classes from ``deepep.py:95``
+(``DeepEPNormalDispatchOutput``) and ``deepep.py:128``
+(``DeepEPNormalCombineInput``). Whoever unpacks them has been checked:
 
 * ``moe_runner/deep_gemm.py:779`` ``pre_permute_deepep_normal_to_deep_gemm``
-  entpackt das 5-Tupel ``(hidden_states, hidden_states_scale, topk_ids,
-  topk_weights, num_recv_tokens_per_expert)``, bildet
-  ``all_tokens = sum(num_recv_tokens_per_expert)`` -- also eine
-  **Python-Liste auf der CPU** -- und ruft ``ep_scatter``.
-* ``ep_moe/kernels.py:1108`` ``ep_scatter`` liest ``recv_topk`` als
-  **lokale** Expertennummer in ``[0, num_local_experts)`` und ``-1`` fuer
-  jeden Platz, der nicht hierher gehoert (``_fwd_kernel_ep_scatter_2``:
-  ``if expert_id >= 0``), und indiziert ``expert_start_loc`` damit.
-  ``m_indices.shape[0] % 128 == 0`` wird geprueft -- daher die Ausrichtung
-  der Zaehlwerte auf 128, genau wie ``deepep.py:589``
+  unpacks the 5-tuple ``(hidden_states, hidden_states_scale, topk_ids,
+  topk_weights, num_recv_tokens_per_expert)``, forms
+  ``all_tokens = sum(num_recv_tokens_per_expert)`` -- so a **Python list on
+  the CPU** -- and calls ``ep_scatter``.
+* ``ep_moe/kernels.py:1108`` ``ep_scatter`` reads ``recv_topk`` as a
+  **local** expert number in ``[0, num_local_experts)`` and ``-1`` for
+  every slot that does not belong here (``_fwd_kernel_ep_scatter_2``:
+  ``if expert_id >= 0``), and indexes ``expert_start_loc`` with it.
+  ``m_indices.shape[0] % 128 == 0`` is checked -- hence the alignment of
+  the counts to 128, exactly like ``deepep.py:589``
   ``expert_alignment=128 if ENABLE_JIT_DEEPGEMM``.
-* ``ep_moe/kernels.py:1234`` ``ep_gather`` gewichtet nur dort, wo
-  ``expert_id >= 0`` -- die Gewichte reisen also **unmaskiert**, wie bei
-  DeepEP.
+* ``ep_moe/kernels.py:1234`` ``ep_gather`` only weights where
+  ``expert_id >= 0`` -- so the weights travel **unmasked**, as with DeepEP.
 * ``moe_runner/deep_gemm.py:867`` ``post_permute_deep_gemm_to_deepep_normal``
-  baut daraus ``DeepEPNormalCombineInput(hidden_states, topk_ids,
-  topk_weights)`` mit ``hidden_states`` in **bf16** und in der Zeilenzahl
-  der empfangenen Token.
-* ``ep_moe/layer.py:207`` und ``quantization/unquant.py:837`` unterscheiden
-  die Faelle ueber ``DispatchOutputChecker.format_is_deepep_normal`` --
-  also ueber genau dieses Format.
+  builds ``DeepEPNormalCombineInput(hidden_states, topk_ids,
+  topk_weights)`` from it, with ``hidden_states`` in **bf16** and in the
+  row count of the received tokens.
+* ``ep_moe/layer.py:207`` and ``quantization/unquant.py:837`` distinguish
+  the cases via ``DispatchOutputChecker.format_is_deepep_normal`` -- so via
+  exactly this format.
 
-WAS DEEPEP VOR DEN DATEN AUSTAUSCHT, UND IN WELCHER REIHENFOLGE
----------------------------------------------------------------
+WHAT DEEPEP EXCHANGES BEFORE THE DATA, AND IN WHAT ORDER
+-----------------------------------------------------------
 ``deepep.py:559`` ``buffer.get_dispatch_layout(topk_ids, num_experts)``
-rechnet **rein lokal** aus ``topk_ids``:
+computes **purely locally** from ``topk_ids``:
 
-1. ``num_tokens_per_rank`` -- wieviele Token gehen an jeden Rang,
-2. ``num_tokens_per_rdma_rank`` -- dasselbe je RDMA-Knoten (hier
-   gegenstandslos, es gibt einen Knoten),
-3. ``num_tokens_per_expert`` -- wieviele Token je **globalem** Experten,
-4. ``is_token_in_rank`` -- die Bitmaske [T, R].
+1. ``num_tokens_per_rank`` -- how many tokens go to each rank,
+2. ``num_tokens_per_rdma_rank`` -- the same per RDMA node (moot here,
+   there is one node),
+3. ``num_tokens_per_expert`` -- how many tokens per **global** expert,
+4. ``is_token_in_rank`` -- the bitmask [T, R].
 
-Erst danach (``deepep.py:578``) laeuft ``buffer.dispatch(...)``, und **darin**
-steckt das eigentliche Kollektiv der Zaehlwerte (DeepEPs ``notify_dispatch``),
-denn der Empfaenger kann seine Puffergroesse nicht kennen, bevor der Sender
-gezaehlt hat. Genau diese Reihenfolge steht hier: lokale Zerlegung, dann
-**ein** ``all_gather`` der Zaehlwerte ueber die CPU-Gruppe, dann die Daten.
+Only after that (``deepep.py:578``) does ``buffer.dispatch(...)`` run, and
+**inside it** is the actual collective over the counts (DeepEP's
+``notify_dispatch``), because the receiver cannot know its buffer size
+before the sender has counted. Exactly this order is used here: local
+decomposition, then **one** ``all_gather`` of the counts over the CPU
+group, then the data.
 
-Der Zaehlwerte-Abgleich ist ein Host-Kollektiv und braucht die Zahlen auf der
-CPU. Das ist der Grund, warum dieser Pfad **nicht CUDA-Graph-faehig** ist --
-derselbe Grund, aus dem ``barlink.py:525`` den ungleich geteilten
-``all_to_all_single`` dort ausnimmt. ``server_args`` schaltet deshalb fuer
-``--moe-a2a-backend bar1ep`` die Graphen ab, wie es das fuer
-``deepep_mode=normal`` schon tut.
+The count exchange is a host collective and needs the numbers on the CPU.
+That is the reason this path is **not CUDA-graph-capable** -- the same
+reason ``barlink.py:525`` exempts the unevenly split ``all_to_all_single``
+there. ``server_args`` therefore turns the graphs off for
+``--moe-a2a-backend bar1ep``, the same way it already does for
+``deepep_mode=normal``.
 
-WAS AUF DER LEITUNG LIEGT
--------------------------
-Zwei Aufrufe je Richtung, nicht vier:
+WHAT IS ON THE WIRE
+--------------------
+Two calls per direction, not four:
 
-* **Nutzlast** -- ``[Token, hidden_size]``, als ``uint8`` angefasst. Sie
-  bleibt unangetastet und landet zeilenweise genau dort, wo der Runner sie
-  erwartet.
-* **Metadaten** -- ``[Token, topk*8 + topk*4 + Skalenzeile]``: lokale
-  Expertennummern (int64), Gewichte (float32) und, wenn fp8 laeuft, die
-  Skalenzeile. Drei kleine Felder in einem Block.
+* **Payload** -- ``[Token, hidden_size]``, handled as ``uint8``. It stays
+  untouched and lands row by row exactly where the runner expects it.
+* **Metadata** -- ``[Token, topk*8 + topk*4 + scale row]``: local expert
+  numbers (int64), weights (float32) and, when fp8 is running, the scale
+  row. Three small fields in one block.
 
-Vier Aufrufe waeren vier Sperren; einer waere ein Auspacken der ganzen
-Nutzlast. Zwei ist die Mitte, und die kleine Umkopie trifft nur die
-Metadaten.
+Four calls would be four locks; one would mean unpacking the whole payload.
+Two is the middle ground, and the small extra copy only hits the metadata.
 
-Ist ein Block groesser als ein a2a-Schlitz, laeuft er ueber mehrere Runden.
-Die Rundenzahl folgt aus dem **gruppenweiten** Maximum ueber alle R*R
-Bloecke; jeder Rang zaehlt damit gleich viele Runden. Zaehlten zwei Raenge
-verschieden, waere das ein Haenger und kein Fehler.
+If a block is larger than an a2a slot, it runs over several rounds. The
+round count follows from the **group-wide** maximum over all R*R blocks;
+every rank thereby counts the same number of rounds. If two ranks counted
+differently, that would be a hang, not an error.
 
 FP8
 ---
-Der Kern bewegt **Bytes** (``barlink_bar1_ext.py:1136``, "Kein Datentyp, keine
-Reduktion"). ``torch.float8_e4m3fn`` braucht deshalb keinen Sonderweg -- die
-Nutzlast wird ohnehin als ``uint8`` angefasst, damit auch kein
-``index_select`` auf einem fp8-Tensor noetig ist. Was **nicht** von selbst
-mitreist, sind die Skalierungsfaktoren: ``deepep.py:512`` quantisiert mit
-``sglang_per_token_group_quant_fp8(hidden_states, 128, ...)`` und laesst
-DeepEP das Paar ``(x_q, x_s)`` tragen; hier reist ``x_s`` je Token im
-Metadatenblock mit, Zeile fuer Zeile neben ``topk_ids`` und ``topk_weights``.
-Die Schalterstellung ist von ``deepep.py:512`` uebernommen, nicht
-nachempfunden.
+The kernel moves **bytes** (``barlink_bar1_ext.py:1136``, "no dtype, no
+reduction"). ``torch.float8_e4m3fn`` therefore needs no special case -- the
+payload is handled as ``uint8`` anyway, so no ``index_select`` on an fp8
+tensor is needed either. What does **not** travel along on its own is the
+scale factors: ``deepep.py:512`` quantizes with
+``sglang_per_token_group_quant_fp8(hidden_states, 128, ...)`` and lets
+DeepEP carry the pair ``(x_q, x_s)``; here ``x_s`` travels per token in the
+metadata block, row for row next to ``topk_ids`` and ``topk_weights``. The
+switch settings are taken from ``deepep.py:512``, not reimagined.
 
-WAS DIESER DISPATCHER NICHT KANN
+WHAT THIS DISPATCHER CANNOT DO
 --------------------------------
-* **Low-Latency-Form.** ``DEEPEP_LL`` hat ein anderes Layout (feste
-  Bucketgroesse je Experte, ``masked_m``, ``expected_m``) und einen anderen
-  Runner-Pfad. Hier ist nur die Normalform gebaut. ``--deepep-mode auto``
-  oder ``low_latency`` wird deshalb **abgelehnt**, nicht stillschweigend
-  umgebogen: sonst rechnete ``DeepEPMoE`` mit LL-Annahmen und bekaeme
-  Normalform-Tensoren.
-* **NVFP4.** Die Skalen liegen dort verschraenkt und je Token nicht
-  zusammenhaengend. Nicht gebaut, also nicht angeboten.
-* **Mehr als ein Knoten.** Der Direktpfad ist BAR1 zu BAR1 ueber PCIe.
+* **Low-latency form.** ``DEEPEP_LL`` has a different layout (fixed bucket
+  size per expert, ``masked_m``, ``expected_m``) and a different runner
+  path. Only the normal form is built here. ``--deepep-mode auto`` or
+  ``low_latency`` is therefore **rejected**, not silently bent into shape:
+  otherwise ``DeepEPMoE`` would compute with LL assumptions and get
+  normal-form tensors.
+* **NVFP4.** The scales are interleaved there and not contiguous per
+  token. Not built, so not offered.
+* **More than one node.** The direct path is BAR1 to BAR1 over PCIe.
 """
 
 from __future__ import annotations
@@ -163,23 +158,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class Bar1EPUnverfuegbar(RuntimeError):
-    """Der Direktpfad traegt diesen Dispatcher hier nicht.
+class Bar1EPUnavailable(RuntimeError):
+    """The direct path does not carry this dispatcher here.
 
-    Ausdruecklich **kein** stiller Rueckfall: wer ``bar1ep`` gewaehlt hat,
-    bekommt entweder BAR1 oder eine Fehlermeldung mit Grund. Ein Rueckfall,
-    der etwas anderes tut und wie BAR1 aussieht, waere die schlechteste aller
-    Antworten -- die Messung sagte dann etwas ueber einen Weg, den niemand
-    gewaehlt hat.
+    Explicitly **no** silent fallback: whoever chose ``bar1ep`` gets either
+    BAR1 or an error message with a reason. A fallback that does something
+    else and looks like BAR1 would be the worst of all answers -- the
+    measurement would then say something about a path nobody chose.
     """
 
 
-def _umgebungs_flagge(name: str, vorgabe: str = "1") -> bool:
-    return os.environ.get(name, vorgabe) not in ("0", "nein", "aus", "false")
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default) not in ("0", "no", "off", "false")
 
 
 # ---------------------------------------------------------------------------
-# Verfuegbarkeit
+# Availability
 # ---------------------------------------------------------------------------
 
 #: The transport methods this dispatcher calls, probed by name before the
@@ -214,108 +208,106 @@ def _declined(reason: str):
     return None, reason
 
 
-def bar1ep_transport(gruppe_koordinator=None):
-    """Der BAR1-Transport dieser Gruppe, oder ``(None, Grund)``.
+def bar1ep_transport(group_coordinator=None):
+    """This group's BAR1 transport, or ``(None, reason)``.
 
-    Jede Bedingung ist rangeinheitlich: sie haengt an gruppenweit
-    abgeglichenem Zustand (Umgebungsvariablen, ``_a2a_proof`` aus einem
-    ``all_gather_object`` in ``barlink_bar1.byte_proof_a2a``, Geometrie aus
-    rangeinheitlichen Groessen). Zwei Raenge duerfen hier nie verschieden
-    antworten -- der eine liefe ins Kollektiv, der andere nicht, und daraus
-    wuerde ein Haenger statt eines Fehlers.
+    Every condition is rank-uniform: it hangs off group-wide agreed state
+    (environment variables, ``_a2a_proof`` from an ``all_gather_object`` in
+    ``barlink_bar1.byte_proof_a2a``, geometry from rank-uniform sizes). Two
+    ranks must never answer differently here -- one would run into the
+    collective, the other would not, and the result would be a hang instead
+    of an error.
 
-    Jede Ablehnung geht durch ``_declined`` und steht damit im Protokoll.
+    Every decline goes through ``_declined`` and thereby ends up in the log.
     """
-    if gruppe_koordinator is None:
+    if group_coordinator is None:
         from sglang.srt.distributed.parallel_state import get_tp_group
 
-        gruppe_koordinator = get_tp_group()
+        group_coordinator = get_tp_group()
 
-    comm = getattr(gruppe_koordinator, "barlink_comm", None)
+    comm = getattr(group_coordinator, "barlink_comm", None)
     if comm is None:
         return _declined(
-            "barlink ist nicht aktiv (SGLANG_BARLINK=0 oder world_size==1). Der "
-            "BAR1-Direktpfad haengt am BarlinkCommunicator; ohne ihn gibt es "
-            "weder Peer-Zeiger-Tabelle noch Schlitze."
+            "barlink is not active (SGLANG_BARLINK=0 or world_size==1). The "
+            "BAR1 direct path hangs off the BarlinkCommunicator; without it "
+            "there is neither a peer pointer table nor slots."
         )
     if getattr(comm, "disabled", False):
-        return _declined(
-            "BarlinkCommunicator ist abgeschaltet (world_size == 1)."
-        )
+        return _declined("BarlinkCommunicator is disabled (world_size == 1).")
     t = getattr(comm, "transport", None)
     if t is None:
         return _declined(
-            "barlink laeuft auf der gloo-Ebene -- kein Transport. "
-            "SGLANG_BARLINK_TRANSPORT=bar1 oder =matrix waehlt den Direktpfad."
+            "barlink runs on the gloo level -- no transport. "
+            "SGLANG_BARLINK_TRANSPORT=bar1 or =matrix selects the direct path."
         )
-    fehlend = [n for n in TRANSPORT_A2A_ATTRS if not hasattr(t, n)]
-    if fehlend:
+    missing = [n for n in TRANSPORT_A2A_ATTRS if not hasattr(t, n)]
+    if missing:
         return _declined(
-            f"Transport {type(t).__name__} hat kein all_to_all "
-            f"({', '.join(fehlend)} fehlt). Das ist kein BAR1-Transport."
+            f"Transport {type(t).__name__} has no all_to_all "
+            f"({', '.join(missing)} missing). That is not a BAR1 transport."
         )
-    schlitz = int(t.a2a_slot_bytes())
-    if schlitz <= 0:
+    slot = int(t.a2a_slot_bytes())
+    if slot <= 0:
         return _declined(
-            "Der BAR1-Transport steht, aber sein a2a-Byte-Beleg ist nicht "
-            "bestanden (oder SGLANG_BARLINK_BAR1_A2A=0). Ohne bestandenen Beleg "
-            "meldet sich all_to_all ab -- siehe barlink_bar1.byte_proof_a2a."
+            "The BAR1 transport is up, but its a2a byte proof has not "
+            "passed (or SGLANG_BARLINK_BAR1_A2A=0). Without a passed proof, "
+            "all_to_all opts out -- see barlink_bar1.byte_proof_a2a."
         )
     return t, ""
 
 
-def bar1ep_verfuegbar(gruppe_koordinator=None) -> Tuple[bool, str]:
-    """``(True, "")`` genau dann, wenn die Auswahl ``bar1ep`` anbieten darf.
+def bar1ep_available(group_coordinator=None) -> Tuple[bool, str]:
+    """``(True, "")`` exactly when the ``bar1ep`` choice may be offered.
 
-    Prueft, was **ohne** die Modellgeometrie pruefbar ist. Die Fragen, die
-    erst mit ``hidden_size``/``topk`` beantwortbar sind (passt eine Zeile in
-    einen Schlitz?) und der Byte-Beleg stehen im Konstruktor des
-    Dispatchers, weil sie die Zahlen brauchen.
+    Checks what is checkable **without** the model geometry. The questions
+    that can only be answered once ``hidden_size``/``topk`` are known (does
+    a row fit into a slot?) and the byte proof live in the dispatcher's
+    constructor, because they need the numbers.
     """
-    t, grund = bar1ep_transport(gruppe_koordinator)
-    return (t is not None), grund
+    t, reason = bar1ep_transport(group_coordinator)
+    return (t is not None), reason
 
 
-#: Ein bestandener Selbsttest je (CPU-Gruppe, Geometrie). Der Test ist die
-#: Voraussetzung dafuer, dass sich der Dispatcher anbietet; er kostet aber
-#: Startzeit, und bei aktivem TBO werden zwei Dispatcher derselben Geometrie
-#: gebaut, bei jeder MoE-Schicht noch einmal. Der Schluessel enthaelt alles,
-#: was der Test wirklich prueft.
-_SELBSTTEST_STAND: dict = {}
+#: A passed self-test per (CPU group, geometry). The test is the
+#: prerequisite for the dispatcher offering itself; but it costs startup
+#: time, and with TBO active two dispatchers of the same geometry are built,
+#: once more per MoE layer. The key contains everything the test actually
+#: checks.
+_SELFTEST_STATE: dict = {}
 
 
-def _schneide(quelle: torch.Tensor, off: int, breite: int,
-              dtype: torch.dtype, spalten: int) -> torch.Tensor:
-    """Ein Spaltenstueck aus einem ``uint8``-Block, umgedeutet.
+def _slice(source: torch.Tensor, off: int, width: int,
+           dtype: torch.dtype, columns: int) -> torch.Tensor:
+    """A column slice out of a ``uint8`` block, reinterpreted.
 
-    Bewusst ueber einen **frischen** Puffer und ``copy_`` statt ueber
-    ``.contiguous().view(dtype)``: bei einer Zeile (oder null Zeilen) haelt
-    PyTorch den Spaltenschnitt schon fuer zusammenhaengend, ``contiguous()``
-    gibt dann die Sicht mit ihrem Speicherversatz zurueck, und ``view(dtype)``
-    haengt damit an einer Ausrichtungsbedingung, die von ``topk`` abhaengt.
-    Ein frischer Puffer beginnt bei Versatz 0 -- die Bedingung entfaellt,
-    statt fast immer zu gelten.
+    Deliberately via a **fresh** buffer and ``copy_`` instead of
+    ``.contiguous().view(dtype)``: with one row (or zero rows), PyTorch
+    already considers the column slice contiguous, ``contiguous()`` then
+    returns the view with its memory offset, and ``view(dtype)`` thereby
+    hangs off an alignment condition that depends on ``topk``. A fresh
+    buffer starts at offset 0 -- the condition drops out instead of holding
+    almost always.
     """
-    n = quelle.shape[0]
-    ziel = torch.empty((n, breite), dtype=torch.uint8, device=quelle.device)
-    ziel.copy_(quelle[:, off : off + breite])
-    return ziel.view(dtype).reshape(n, spalten)
+    n = source.shape[0]
+    dest = torch.empty((n, width), dtype=torch.uint8, device=source.device)
+    dest.copy_(source[:, off : off + width])
+    return dest.view(dtype).reshape(n, columns)
 
 
 # ---------------------------------------------------------------------------
-# Der Dispatcher
+# The dispatcher
 # ---------------------------------------------------------------------------
 
 
 class Bar1EPDispatcher(BaseDispatcher):
-    """Dispatch/Combine ueber ``bar1_all_to_all``, Normalform.
+    """Dispatch/combine over ``bar1_all_to_all``, normal form.
 
-    Der Zustand zwischen ``dispatch`` und ``combine`` (Sortierindex,
-    Zaehlwerte, Rundenzahl) haengt an der Instanz, nicht am
-    ``DispatchOutput`` -- dieselbe Loesung wie ``deepep.py:566`` ("`handle`
-    should be transmitted with tokens ... keeping `handle` as a member
-    variable works"), und aus demselben Grund: das Tupelformat ist
-    geschlossen, ein sechstes Feld waere ein neues Format.
+    The state between ``dispatch`` and ``combine`` (sort index, counts,
+    round count) hangs off the instance, not off the ``DispatchOutput`` --
+    the same solution as ``deepep.py:566`` ("`handle` should be transmitted
+    with tokens ... keeping `handle` as a member variable works"), and for
+    the same reason: the tuple format is closed, a sixth field would be a
+    new format.
     """
 
     def __init__(
@@ -330,35 +322,36 @@ class Bar1EPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.NORMAL,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        **_ungenutzt,
+        **_unused,
     ):
         super().__init__()
 
         from sglang.srt.distributed.parallel_state import get_tp_group
 
-        self.gruppe = get_tp_group()
-        self.comm = getattr(self.gruppe, "barlink_comm", None)
-        self.transport, grund = bar1ep_transport(self.gruppe)
+        self.group = get_tp_group()
+        self.comm = getattr(self.group, "barlink_comm", None)
+        self.transport, reason = bar1ep_transport(self.group)
         if self.transport is None:
-            raise Bar1EPUnverfuegbar(
-                f"--moe-a2a-backend bar1ep gewaehlt, aber: {grund}"
+            raise Bar1EPUnavailable(
+                f"--moe-a2a-backend bar1ep selected, but: {reason}"
             )
 
         if group is not None and group is not getattr(
-            self.gruppe, "device_group", None
+            self.group, "device_group", None
         ):
-            # create_moe_dispatcher reicht get_tp_group().device_group herein
-            # (fused_moe_triton/layer.py:96/125). Kaeme hier eine andere Gruppe
-            # an, liefe der Zaehlwerteabgleich ueber eine andere Menge von
-            # Raengen als die Peer-Zeiger-Tabelle -- ein Haenger, kein Fehler.
-            raise Bar1EPUnverfuegbar(
-                "bar1ep laeuft nur auf der TP-Gruppe: der BAR1-Transport "
-                "haengt an get_tp_group().barlink_comm, und eine zweite Gruppe "
-                "haette weder Peer-Zeiger noch Schlitze."
+            # create_moe_dispatcher passes get_tp_group().device_group in
+            # here (fused_moe_triton/layer.py:96/125). If a different group
+            # arrived here, the count exchange would run over a different
+            # set of ranks than the peer pointer table -- a hang, not an
+            # error.
+            raise Bar1EPUnavailable(
+                "bar1ep only runs on the TP group: the BAR1 transport hangs "
+                "off get_tp_group().barlink_comm, and a second group would "
+                "have neither peer pointers nor slots."
             )
 
         self.cpu_group = self.comm.cpu_group
-        self.welt = int(self.comm.world_size)
+        self.world = int(self.comm.world_size)
         self.rank = int(self.comm.rank)
 
         self.router_topk = int(router_topk)
@@ -368,89 +361,88 @@ class Bar1EPDispatcher(BaseDispatcher):
         self.params_dtype = params_dtype or torch.bfloat16
         self.device = torch.device("cuda", torch.cuda.current_device())
 
-        if self.num_experts != self.num_local_experts * self.welt:
-            raise Bar1EPUnverfuegbar(
-                f"num_experts {self.num_experts} ist nicht "
-                f"{self.num_local_experts} * {self.welt}. bar1ep bildet den "
-                f"Experten e auf Rang e // num_local_experts ab -- dieselbe "
-                f"Abbildung wie DeepEP; ohne gleiche Teilung gibt es sie nicht."
+        if self.num_experts != self.num_local_experts * self.world:
+            raise Bar1EPUnavailable(
+                f"num_experts {self.num_experts} is not "
+                f"{self.num_local_experts} * {self.world}. bar1ep maps "
+                f"expert e onto rank e // num_local_experts -- the same "
+                f"mapping as DeepEP; without an equal split, there is none."
             )
-        if self.hidden_size % 128 != 0 and self._skalen_moeglich():
-            raise Bar1EPUnverfuegbar(
-                f"hidden_size {self.hidden_size} ist kein Vielfaches von 128; "
-                f"die 128er-Blockquantisierung des fp8-Wegs (deepep.py:512) "
-                f"gibt es dafuer nicht."
+        if self.hidden_size % 128 != 0 and self._scales_possible():
+            raise Bar1EPUnavailable(
+                f"hidden_size {self.hidden_size} is not a multiple of 128; "
+                f"the fp8 path's 128-element block quantization "
+                f"(deepep.py:512) does not exist for it."
             )
 
         self.deepep_mode = deepep_mode
         if deepep_mode is not None and not deepep_mode.is_normal():
-            raise Bar1EPUnverfuegbar(
-                f"bar1ep baut nur die Normalform (DEEPEP_NORMAL), deepep_mode "
-                f"ist aber {deepep_mode}. Die Low-Latency-Form hat ein anderes "
-                f"Ausgabeformat (masked_m/expected_m) und einen anderen "
-                f"Runner-Pfad; sie hier stillschweigend durch die Normalform "
-                f"zu ersetzen hiesse, DeepEPMoE mit LL-Annahmen "
-                f"Normalform-Tensoren zu geben. Bitte --deepep-mode normal."
+            raise Bar1EPUnavailable(
+                f"bar1ep only builds the normal form (DEEPEP_NORMAL), but "
+                f"deepep_mode is {deepep_mode}. The low-latency form has a "
+                f"different output format (masked_m/expected_m) and a "
+                f"different runner path; silently replacing it with the "
+                f"normal form here would mean giving DeepEPMoE normal-form "
+                f"tensors under LL assumptions. Please use "
+                f"--deepep-mode normal."
             )
 
-        # DeepEP/Mooncake/Nixl markieren ungueltige topk-Plaetze mit -1; der
-        # AITER-pre_permute leitet sie auf einen Senkenplatz um. Ohne AITER
-        # gibt es hier nichts zu maskieren -- aber MaybeTboDeepEPDispatcher
-        # liest das Feld unbedingt (two_batch_overlap.py:1097).
+        # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
+        # pre_permute redirects them to a sink slot. Without AITER there is
+        # nothing to mask here -- but MaybeTboDeepEPDispatcher reads the
+        # field unconditionally (two_batch_overlap.py:1097).
         self.expert_mask_gpu = None
 
         self.quant_config: Optional[dict] = None
         self.use_fp8 = False
-        self._schlitz = int(self.transport.a2a_slot_bytes())
-        self._setze_ausgabetyp()
+        self._slot = int(self.transport.a2a_slot_bytes())
+        self._set_output_dtype()
 
-        # Zustand zwischen dispatch und combine.
-        self._sende_zeilen: List[int] = []
-        self._empf_zeilen: List[int] = []
-        self._sende_index: Optional[torch.Tensor] = None
-        self._token_zahl = 0
-        self._max_zeilen = 0
-        self._ausgabe_dtype = self.params_dtype
-        self._dispatch_zwischenstand = None
-        self._combine_zwischenstand = None
+        # State between dispatch and combine.
+        self._send_rows: List[int] = []
+        self._recv_rows: List[int] = []
+        self._send_index: Optional[torch.Tensor] = None
+        self._token_count = 0
+        self._max_rows = 0
+        self._output_dtype = self.params_dtype
+        self._dispatch_state = None
+        self._combine_state = None
 
         self._bar1_dispatch_hooks = DeepEPPDispatchHooks()
 
-        self._pruefe_fenster()
-        self._selbsttest_wenn_noetig()
+        self._check_window()
+        self._selftest_if_needed()
 
-    # -- Faehigkeit --------------------------------------------------------
+    # -- Capability ----------------------------------------------------
 
-    def _skalen_moeglich(self) -> bool:
+    def _scales_possible(self) -> bool:
         return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    def _setze_ausgabetyp(self) -> None:
-        typ = get_deepep_output_dtype(self)
-        if typ == DeepEPOutputDtype.NVFP4:
-            raise Bar1EPUnverfuegbar(
-                "bar1ep traegt nvfp4 nicht: dessen Skalen liegen verschraenkt "
-                "und je Token nicht zusammenhaengend. Nicht gebaut heisst "
-                "nicht angeboten."
+    def _set_output_dtype(self) -> None:
+        dtype = get_deepep_output_dtype(self)
+        if dtype == DeepEPOutputDtype.NVFP4:
+            raise Bar1EPUnavailable(
+                "bar1ep does not carry nvfp4: its scales are interleaved "
+                "and not contiguous per token. Not built means not offered."
             )
-        if typ == DeepEPOutputDtype.INT8:
-            raise Bar1EPUnverfuegbar("bar1ep traegt int8-Dispatch nicht (NPU-Weg).")
-        # Wie deepep.py:510: quantisiert wird nur, wenn DeepGEMM den fp8-Weg
-        # ueberhaupt rechnet. Ohne ihn faehrt auch DeepEP bf16.
+        if dtype == DeepEPOutputDtype.INT8:
+            raise Bar1EPUnavailable("bar1ep does not carry int8 dispatch (NPU path).")
+        # Like deepep.py:510: quantization only happens when DeepGEMM
+        # actually computes the fp8 path. Without it, DeepEP also runs bf16.
         self.use_fp8 = (
-            typ == DeepEPOutputDtype.FP8 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            dtype == DeepEPOutputDtype.FP8 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         )
 
-    def _skalen_dtype(self) -> torch.dtype:
+    def _scale_dtype(self) -> torch.dtype:
         return torch.int32 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 else torch.float32
 
-    def _skalen_spalten(self) -> int:
-        """Spalten des Skalentensors je Token -- 0, wenn ohne fp8.
+    def _scale_columns(self) -> int:
+        """Columns of the scale tensor per token -- 0 without fp8.
 
-        Die Zahlen sind aus ``fp8_kernel.py:488-511`` uebernommen: mit
-        ue8m0 packt der Quantisierer je vier Skalen in ein ``int32`` und
-        richtet auf vier aus, sonst ist es ein ``float32`` je 128er-Block.
-        ``ep_scatter`` prueft genau diese Spaltenzahl
-        (``kernels.py:1104``).
+        The numbers are taken from ``fp8_kernel.py:488-511``: with ue8m0 the
+        quantizer packs four scales into one ``int32`` and aligns to four,
+        otherwise it is one ``float32`` per 128-element block. ``ep_scatter``
+        checks exactly this column count (``kernels.py:1104``).
         """
         if not self.use_fp8:
             return 0
@@ -459,165 +451,163 @@ class Bar1EPDispatcher(BaseDispatcher):
             return -(-s // 4)
         return s
 
-    def _nutz_zeilenbytes(self) -> int:
+    def _payload_row_bytes(self) -> int:
         e = 1 if self.use_fp8 else (torch.finfo(self.params_dtype).bits // 8)
         return self.hidden_size * e
 
-    def _meta_zeilenbytes(self) -> int:
-        # topk_ids int64, topk_weights float32, dazu die Skalenzeile (int32
-        # oder float32 -- beide vier Byte).
-        return self.router_topk * 8 + self.router_topk * 4 + self._skalen_spalten() * 4
+    def _meta_row_bytes(self) -> int:
+        # topk_ids int64, topk_weights float32, plus the scale row (int32
+        # or float32 -- both four bytes).
+        return self.router_topk * 8 + self.router_topk * 4 + self._scale_columns() * 4
 
-    def _pruefe_fenster(self) -> None:
-        """Passt ueberhaupt EINE Zeile in einen Schlitz?
+    def _check_window(self) -> None:
+        """Does even ONE row fit into a slot?
 
-        Die Frage ist nicht akademisch: der Schlitz ist ``chunk_max`` aus
-        ``barlink_bar1.geometrie`` und faellt mit der Fenstergroesse. Eine
-        Zeile, die nicht hineinpasst, laesst sich auch nicht in Runden
-        zerlegen -- die Zerlegung teilt Zeilen, nicht Zeileninhalte. Dann
-        meldet sich der Dispatcher ab, statt spaeter im heissen Pfad zu
-        scheitern.
+        The question is not academic: the slot is ``chunk_max`` from
+        ``barlink_bar1.geometry`` and coincides with the window size. A row
+        that does not fit cannot be split into rounds either -- the split
+        divides rows, not row contents. Then the dispatcher declines instead
+        of failing later on the hot path.
         """
-        self._schlitz = int(self.transport.a2a_slot_bytes())
-        for name, zb in (
-            ("Nutzlast", self._nutz_zeilenbytes()),
-            ("Metadaten", self._meta_zeilenbytes()),
+        self._slot = int(self.transport.a2a_slot_bytes())
+        for name, rb in (
+            ("payload", self._payload_row_bytes()),
+            ("metadata", self._meta_row_bytes()),
         ):
-            if zb > self._schlitz:
-                raise Bar1EPUnverfuegbar(
-                    f"Eine {name}-Zeile ist {zb} Byte gross und passt nicht in "
-                    f"den a2a-Schlitz von {self._schlitz} Byte. Groesseres "
-                    f"Fenster (SGLANG_BARLINK_BAR1_WINDOW_MIB) -- ein Rueckfall "
-                    f"waere hier keine Loesung, sondern eine andere Messung "
-                    f"unter demselben Namen."
+            if rb > self._slot:
+                raise Bar1EPUnavailable(
+                    f"A {name} row is {rb} bytes and does not fit into the "
+                    f"a2a slot of {self._slot} bytes. A larger window "
+                    f"(SGLANG_BARLINK_BAR1_WINDOW_MIB) is needed -- a "
+                    f"fallback here would not be a solution, but a "
+                    f"different measurement under the same name."
                 )
 
-    def _zeilen_pro_runde(self, zeilenbytes: int) -> int:
-        return max(1, int(self._schlitz // max(1, zeilenbytes)))
+    def _rows_per_round(self, row_bytes: int) -> int:
+        return max(1, int(self._slot // max(1, row_bytes)))
 
-    # -- Der Datenweg ------------------------------------------------------
+    # -- The data path ---------------------------------------------------
 
-    def _a2a_zeilen(
+    def _a2a_rows(
         self,
-        aus: torch.Tensor,
-        ein: torch.Tensor,
-        sende_zeilen: List[int],
-        empf_zeilen: List[int],
-        zeilenbytes: int,
-        max_zeilen: int,
-        zeilen_pro_runde: Optional[int] = None,
+        out: torch.Tensor,
+        inp: torch.Tensor,
+        send_rows: List[int],
+        recv_rows: List[int],
+        row_bytes: int,
+        max_rows: int,
+        rows_per_round: Optional[int] = None,
     ) -> torch.Tensor:
-        """``all_to_all`` mit ungleichen Bloecken, notfalls ueber mehrere Runden.
+        """``all_to_all`` with uneven blocks, over several rounds if needed.
 
-        ``ein``/``aus`` sind zusammenhaengende ``uint8``-Tensoren der Form
-        ``[Zeilen, zeilenbytes]``. ``max_zeilen`` ist das **gruppenweite**
-        Maximum ueber alle R*R Bloecke; daraus folgt die Rundenzahl, und weil
-        die Zahl gruppenweit dieselbe ist, zaehlt jeder Rang gleich viele
-        Runden.
+        ``inp``/``out`` are contiguous ``uint8`` tensors of shape
+        ``[rows, row_bytes]``. ``max_rows`` is the **group-wide** maximum
+        over all R*R blocks; the round count follows from it, and because
+        that number is the same group-wide, every rank counts the same
+        number of rounds.
 
-        Die Versaetze werden ausgerechnet und **uebergeben**, statt die Naht
-        sie als Praefixsumme raten zu lassen: eine Runde bewegt aus jedem
-        Block nur ein Stueck, und die Bloecke bleiben dabei stehen, wo sie
-        sind. Genau dafuer nimmt ``barlink_bar1.barlink_all_to_all_single`` seit
-        dieser Aenderung ``send_offsets``/``recv_offsets`` entgegen; der
-        Kernel hat Versaetze und Laengen ohnehin immer getrennt bekommen.
+        The offsets are computed and **passed in**, instead of letting the
+        seam guess them as a prefix sum: one round moves only one piece out
+        of each block, and the blocks stay put where they are. This is
+        exactly why ``barlink_bar1.barlink_all_to_all_single`` has taken
+        ``send_offsets``/``recv_offsets`` since that change; the kernel has
+        always kept offsets and lengths separate anyway.
         """
-        R = self.welt
-        zpr = zeilen_pro_runde or self._zeilen_pro_runde(zeilenbytes)
-        runden = max(1, -(-int(max_zeilen) // zpr))
+        R = self.world
+        rpr = rows_per_round or self._rows_per_round(row_bytes)
+        rounds = max(1, -(-int(max_rows) // rpr))
 
-        s_basis, acc = [], 0
-        for n in sende_zeilen:
-            s_basis.append(acc)
+        s_base, acc = [], 0
+        for n in send_rows:
+            s_base.append(acc)
             acc += int(n)
-        e_basis, acc = [], 0
-        for n in empf_zeilen:
-            e_basis.append(acc)
+        e_base, acc = [], 0
+        for n in recv_rows:
+            e_base.append(acc)
             acc += int(n)
 
-        ein_flach = ein.reshape(-1)
-        aus_flach = aus.reshape(-1)
-        # Ein leerer Tensor hat data_ptr() == 0. Sind BEIDE Seiten leer,
-        # zeigen sie auf dieselbe Adresse, und die Erweiterung lehnt das ab
-        # ("in und out duerfen nicht dasselbe sein", barlink_bar1_ext.py:1209) --
-        # zu Recht, denn sie kann nicht wissen, dass hier nichts zu bewegen
-        # ist. Aussteigen darf man trotzdem nicht: die anderen Raenge warten
-        # in derselben Sperre auf meine Flagge, auch wenn ich null Byte
-        # schicke. Also zwei Platzhalter; alle Laengen sind 0, es wird nichts
-        # aus ihnen gelesen und nichts in sie geschrieben.
-        if ein_flach.numel() == 0:
-            ein_flach = torch.zeros(16, dtype=torch.uint8, device=ein.device)
-        if aus_flach.numel() == 0:
-            aus_flach = torch.zeros(16, dtype=torch.uint8, device=aus.device)
+        inp_flat = inp.reshape(-1)
+        out_flat = out.reshape(-1)
+        # An empty tensor has data_ptr() == 0. If BOTH sides are empty, they
+        # point at the same address, and the extension rejects that ("in and
+        # out must not be the same", barlink_bar1_ext.py:1209) -- rightly
+        # so, since it cannot know that there is nothing to move here.
+        # Bailing out is still not allowed: the other ranks wait on my flag
+        # in the same lock, even if I send zero bytes. So two placeholders;
+        # all lengths are 0, nothing is read from them and nothing is
+        # written into them.
+        if inp_flat.numel() == 0:
+            inp_flat = torch.zeros(16, dtype=torch.uint8, device=inp.device)
+        if out_flat.numel() == 0:
+            out_flat = torch.zeros(16, dtype=torch.uint8, device=out.device)
 
-        for k in range(runden):
+        for k in range(rounds):
             s_off, s_len, e_off, e_len = [], [], [], []
             for j in range(R):
-                a = min(k * zpr, int(sende_zeilen[j]))
-                b = min((k + 1) * zpr, int(sende_zeilen[j]))
-                s_off.append((s_basis[j] + a) * zeilenbytes)
-                s_len.append((b - a) * zeilenbytes)
-                a = min(k * zpr, int(empf_zeilen[j]))
-                b = min((k + 1) * zpr, int(empf_zeilen[j]))
-                e_off.append((e_basis[j] + a) * zeilenbytes)
-                e_len.append((b - a) * zeilenbytes)
-            groesster = max(s_len + e_len)
-            if not self.transport.supports_a2a(groesster):
-                raise Bar1EPUnverfuegbar(
-                    f"Runde {k}: groesster Block {groesster} Byte passt nicht "
-                    f"in den Schlitz von {self._schlitz} Byte. Die "
-                    f"Rundenzerlegung haette das verhindern muessen -- diese "
-                    f"Zeile ist der Beweis, dass sie es nicht hat."
+                a = min(k * rpr, int(send_rows[j]))
+                b = min((k + 1) * rpr, int(send_rows[j]))
+                s_off.append((s_base[j] + a) * row_bytes)
+                s_len.append((b - a) * row_bytes)
+                a = min(k * rpr, int(recv_rows[j]))
+                b = min((k + 1) * rpr, int(recv_rows[j]))
+                e_off.append((e_base[j] + a) * row_bytes)
+                e_len.append((b - a) * row_bytes)
+            largest = max(s_len + e_len)
+            if not self.transport.supports_a2a(largest):
+                raise Bar1EPUnavailable(
+                    f"Round {k}: largest block {largest} bytes does not fit "
+                    f"into the slot of {self._slot} bytes. The round split "
+                    f"should have prevented this -- this line is proof that "
+                    f"it did not."
                 )
             self.transport.barlink_all_to_all_single(
-                self.comm, aus_flach, ein_flach, s_len, e_len, s_off, e_off,
+                self.comm, out_flat, inp_flat, s_len, e_len, s_off, e_off,
             )
-        return aus
+        return out
 
-    def _zerlegung(self, topk_ids: torch.Tensor):
-        """Die lokale Zerlegung -- das Gegenstueck zu ``get_dispatch_layout``.
+    def _decompose(self, topk_ids: torch.Tensor):
+        """The local decomposition -- the counterpart to ``get_dispatch_layout``.
 
-        Liefert ``(is_token_in_rank, num_tokens_per_rank,
-        num_tokens_per_expert)``. ``topk_ids`` darf ``-1`` enthalten
-        (ungueltige Plaetze, so markiert sie die DeepEP-Familie); die zaehlen
-        nirgends mit.
+        Returns ``(is_token_in_rank, num_tokens_per_rank,
+        num_tokens_per_expert)``. ``topk_ids`` may contain ``-1`` (invalid
+        slots, the way the DeepEP family marks them); those do not count
+        anywhere.
         """
         T = topk_ids.shape[0]
-        R, nle = self.welt, self.num_local_experts
-        gueltig = topk_ids >= 0
-        ziel = torch.where(
-            gueltig,
+        R, nle = self.world, self.num_local_experts
+        valid = topk_ids >= 0
+        dest = torch.where(
+            valid,
             torch.div(topk_ids, nle, rounding_mode="floor"),
             torch.zeros_like(topk_ids),
         )
-        # scatter_add_ statt scatter_: liegen mehrere topk-Plaetze auf
-        # demselben Rang, ueberschriebe scatter_ in unbestimmter Reihenfolge,
-        # und ein ungueltiger Platz (Ziel 0) koennte einen echten Treffer
-        # loeschen.
-        zahl = torch.zeros((T, R), dtype=torch.int32, device=topk_ids.device)
-        zahl.scatter_add_(1, ziel, gueltig.to(torch.int32))
-        in_rang = zahl > 0
-        ntpr = in_rang.sum(dim=0).to(torch.int64)
+        # scatter_add_ instead of scatter_: if several topk slots land on
+        # the same rank, scatter_ would overwrite in an unspecified order,
+        # and an invalid slot (dest 0) could erase a real hit.
+        counts = torch.zeros((T, R), dtype=torch.int32, device=topk_ids.device)
+        counts.scatter_add_(1, dest, valid.to(torch.int32))
+        in_rank = counts > 0
+        ntpr = in_rank.sum(dim=0).to(torch.int64)
         ntpe = torch.bincount(
-            topk_ids[gueltig].reshape(-1), minlength=self.num_experts
+            topk_ids[valid].reshape(-1), minlength=self.num_experts
         ).to(torch.int64)[: self.num_experts]
-        return in_rang, ntpr, ntpe
+        return in_rank, ntpr, ntpe
 
-    def _zaehlwerte_tauschen(self, ntpr: torch.Tensor, ntpe: torch.Tensor):
-        """Ein ``all_gather`` ueber die CPU-Gruppe. Der einzige Host-Sync.
+    def _exchange_counts(self, ntpr: torch.Tensor, ntpe: torch.Tensor):
+        """An ``all_gather`` over the CPU group. The only host sync.
 
-        Genau der Schritt, den DeepEP in ``notify_dispatch`` faehrt, aus
-        demselben Grund: der Empfaenger kann seine Puffergroesse nicht kennen,
-        bevor der Sender gezaehlt hat. Er steht **vor** dem Datenpfad, nicht
-        darin. Zeile ``i`` ist ``[num_tokens_per_rank (R),
-        num_tokens_per_expert (num_experts)]`` des Rangs ``i``.
+        Exactly the step DeepEP runs in ``notify_dispatch``, for the same
+        reason: the receiver cannot know its buffer size before the sender
+        has counted. It happens **before** the data path, not inside it.
+        Row ``i`` is ``[num_tokens_per_rank (R), num_tokens_per_expert
+        (num_experts)]`` of rank ``i``.
         """
-        flach = torch.cat([ntpr, ntpe]).to("cpu")
-        eingang = [torch.empty_like(flach) for _ in range(self.welt)]
-        dist.all_gather(eingang, flach, group=self.cpu_group)
-        return [t.tolist() for t in eingang]
+        flat = torch.cat([ntpr, ntpe]).to("cpu")
+        gathered = [torch.empty_like(flat) for _ in range(self.world)]
+        dist.all_gather(gathered, flat, group=self.cpu_group)
+        return [t.tolist() for t in gathered]
 
-    # -- Hinweg ------------------------------------------------------------
+    # -- Outbound ----------------------------------------------------------
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: "TopKOutput"
@@ -628,162 +618,160 @@ class Bar1EPDispatcher(BaseDispatcher):
         return self.dispatch_b()
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: "TopKOutput"):
-        self._dispatch_zwischenstand = self._dispatch_vorbereiten(
-            hidden_states, topk_output
-        )
+        self._dispatch_state = self._dispatch_prepare(hidden_states, topk_output)
 
-    def dispatch_b(self, *zustand) -> DispatchOutput:
-        if not zustand:
-            zustand = self._dispatch_zwischenstand
-            self._dispatch_zwischenstand = None
-        return self._dispatch_kern(*zustand)
+    def dispatch_b(self, *state) -> DispatchOutput:
+        if not state:
+            state = self._dispatch_state
+            self._dispatch_state = None
+        return self._dispatch_core(*state)
 
-    def _dispatch_vorbereiten(
+    def _dispatch_prepare(
         self, hidden_states: torch.Tensor, topk_output: "TopKOutput"
     ):
-        """Alles bis zum Datenpfad: quantisieren, zerlegen, Zaehlwerte tauschen."""
+        """Everything up to the data path: quantize, decompose, exchange counts."""
         topk_weights = topk_output.topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
-        self._ausgabe_dtype = hidden_states.dtype
+        self._output_dtype = hidden_states.dtype
         hidden_states = hidden_states.contiguous()
 
-        skala = None
+        scale = None
         if self.use_fp8:
             from sglang.srt.layers.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
 
-            # Dieselben Schalter wie deepep.py:512 -- nicht aehnliche.
-            hidden_states, skala = sglang_per_token_group_quant_fp8(
+            # The same switches as deepep.py:512 -- not similar ones.
+            hidden_states, scale = sglang_per_token_group_quant_fp8(
                 hidden_states,
                 128,
                 column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-            # Bei ue8m0 legt der Quantisierer den Skalentensor spaltenweise an
-            # (fp8_kernel.py:499 `.transpose(-1,-2)`). Fuer den Transport
-            # braucht es die Zeile zusammenhaengend; ep_scatter liest ohnehin
-            # ueber Schrittweiten und nimmt beide Formen.
-            skala = skala.contiguous()
+            # With ue8m0, the quantizer lays out the scale tensor
+            # column-major (fp8_kernel.py:499 `.transpose(-1,-2)`). For the
+            # transport the row needs to be contiguous; ep_scatter reads
+            # over strides anyway and accepts both forms.
+            scale = scale.contiguous()
 
-        in_rang, ntpr, ntpe = self._zerlegung(topk_ids)
-        matrix = self._zaehlwerte_tauschen(ntpr, ntpe)
-        return (hidden_states, skala, topk_ids, topk_weights, in_rang, matrix)
+        in_rank, ntpr, ntpe = self._decompose(topk_ids)
+        matrix = self._exchange_counts(ntpr, ntpe)
+        return (hidden_states, scale, topk_ids, topk_weights, in_rank, matrix)
 
-    def _dispatch_kern(
-        self, hidden_states, skala, topk_ids, topk_weights, in_rang, matrix
+    def _dispatch_core(
+        self, hidden_states, scale, topk_ids, topk_weights, in_rank, matrix
     ) -> DispatchOutput:
-        R, nle, K = self.welt, self.num_local_experts, self.router_topk
+        R, nle, K = self.world, self.num_local_experts, self.router_topk
         T = hidden_states.shape[0]
-        geraet = hidden_states.device
+        device = hidden_states.device
 
-        sende_zeilen = [int(matrix[self.rank][j]) for j in range(R)]
-        empf_zeilen = [int(matrix[i][self.rank]) for i in range(R)]
-        max_zeilen = max(int(matrix[i][j]) for i in range(R) for j in range(R))
-        S, N = sum(sende_zeilen), sum(empf_zeilen)
+        send_rows = [int(matrix[self.rank][j]) for j in range(R)]
+        recv_rows = [int(matrix[i][self.rank]) for i in range(R)]
+        max_rows = max(int(matrix[i][j]) for i in range(R) for j in range(R))
+        S, N = sum(send_rows), sum(recv_rows)
 
-        # Sendereihenfolge: je Zielrang die eigenen Tokennummern aufsteigend,
-        # die Zielraenge aufsteigend hintereinander. Der Empfaenger kennt sie
-        # damit ohne ein einziges uebertragenes Indexbyte -- und der Rueckweg
-        # findet dieselbe Ordnung vor.
+        # Send order: per destination rank, own token numbers ascending, the
+        # destination ranks ascending one after another. The receiver
+        # thereby knows them without a single transmitted index byte -- and
+        # the return path finds the same order.
         if T:
-            lauf = torch.nonzero(
-                in_rang.t().reshape(-1), as_tuple=False
+            positions = torch.nonzero(
+                in_rank.t().reshape(-1), as_tuple=False
             ).reshape(-1)
-            sende_index = torch.remainder(lauf, T)
+            send_index = torch.remainder(positions, T)
         else:
-            sende_index = torch.zeros(0, dtype=torch.int64, device=geraet)
+            send_index = torch.zeros(0, dtype=torch.int64, device=device)
 
-        # -- Nutzlast: als Bytes angefasst, damit fp8 keinen Sonderweg und
-        #    kein index_select auf einem fp8-Tensor braucht.
-        nzb = self._nutz_zeilenbytes()
-        x_bytes = hidden_states.view(torch.uint8).reshape(T, nzb)
-        sende_x = x_bytes[sende_index]
-        empf_x = torch.empty((N, nzb), dtype=torch.uint8, device=geraet)
+        # -- Payload: handled as bytes, so fp8 needs no special case and no
+        #    index_select on an fp8 tensor.
+        prb = self._payload_row_bytes()
+        x_bytes = hidden_states.view(torch.uint8).reshape(T, prb)
+        send_x = x_bytes[send_index]
+        recv_x_bytes = torch.empty((N, prb), dtype=torch.uint8, device=device)
 
-        # -- Metadaten: lokale Expertennummern, Gewichte, Skalenzeile.
-        eigner = torch.repeat_interleave(
-            torch.arange(R, device=geraet, dtype=torch.int64),
-            torch.tensor(sende_zeilen, device=geraet, dtype=torch.int64),
+        # -- Metadata: local expert numbers, weights, scale row.
+        owner = torch.repeat_interleave(
+            torch.arange(R, device=device, dtype=torch.int64),
+            torch.tensor(send_rows, device=device, dtype=torch.int64),
         )
-        ids_roh = topk_ids[sende_index]
-        passt = (
-            torch.div(ids_roh, nle, rounding_mode="floor") == eigner.unsqueeze(1)
+        ids_raw = topk_ids[send_index]
+        matches = (
+            torch.div(ids_raw, nle, rounding_mode="floor") == owner.unsqueeze(1)
         )
-        ids_lokal = torch.where(
-            (ids_roh >= 0) & passt,
-            ids_roh - eigner.unsqueeze(1) * nle,
-            torch.full_like(ids_roh, -1),
+        ids_local = torch.where(
+            (ids_raw >= 0) & matches,
+            ids_raw - owner.unsqueeze(1) * nle,
+            torch.full_like(ids_raw, -1),
         ).contiguous()
-        gew = topk_weights[sende_index].contiguous()
+        weights = topk_weights[send_index].contiguous()
 
-        teile = [
-            ids_lokal.view(torch.uint8).reshape(S, K * 8),
-            gew.view(torch.uint8).reshape(S, K * 4),
+        parts = [
+            ids_local.view(torch.uint8).reshape(S, K * 8),
+            weights.view(torch.uint8).reshape(S, K * 4),
         ]
-        sb = self._skalen_spalten() * 4
-        if sb:
-            teile.append(
-                skala[sende_index].contiguous().view(torch.uint8).reshape(S, sb)
+        scale_bytes = self._scale_columns() * 4
+        if scale_bytes:
+            parts.append(
+                scale[send_index].contiguous().view(torch.uint8).reshape(S, scale_bytes)
             )
-        mzb = self._meta_zeilenbytes()
-        sende_meta = torch.cat(teile, dim=1)
-        empf_meta = torch.empty((N, mzb), dtype=torch.uint8, device=geraet)
+        mrb = self._meta_row_bytes()
+        send_meta = torch.cat(parts, dim=1)
+        recv_meta = torch.empty((N, mrb), dtype=torch.uint8, device=device)
 
-        self._a2a_zeilen(empf_x, sende_x, sende_zeilen, empf_zeilen, nzb, max_zeilen)
-        self._a2a_zeilen(
-            empf_meta, sende_meta, sende_zeilen, empf_zeilen, mzb, max_zeilen
+        self._a2a_rows(recv_x_bytes, send_x, send_rows, recv_rows, prb, max_rows)
+        self._a2a_rows(
+            recv_meta, send_meta, send_rows, recv_rows, mrb, max_rows
         )
 
-        # -- Auspacken.
-        recv_ids = _schneide(empf_meta, 0, K * 8, torch.int64, K)
-        recv_gew = _schneide(empf_meta, K * 8, K * 4, torch.float32, K)
-        recv_skala = (
-            _schneide(
-                empf_meta, K * 12, sb, self._skalen_dtype(), self._skalen_spalten()
+        # -- Unpacking.
+        recv_ids = _slice(recv_meta, 0, K * 8, torch.int64, K)
+        recv_weights = _slice(recv_meta, K * 8, K * 4, torch.float32, K)
+        recv_scale = (
+            _slice(
+                recv_meta, K * 12, scale_bytes, self._scale_dtype(), self._scale_columns()
             )
-            if sb
+            if scale_bytes
             else None
         )
-        recv_x = empf_x.view(
-            torch.float8_e4m3fn if self.use_fp8 else self._ausgabe_dtype
+        recv_x = recv_x_bytes.view(
+            torch.float8_e4m3fn if self.use_fp8 else self._output_dtype
         ).reshape(N, self.hidden_size)
 
-        # -- Zaehlwerte je lokalem Experten. Eine CPU-Liste, so wie der Runner
-        #    sie braucht (moe_runner/deep_gemm.py:797 `sum(...)`).
-        roh = [0] * nle
+        # -- Counts per local expert. A CPU list, the way the runner needs
+        #    it (moe_runner/deep_gemm.py:797 `sum(...)`).
+        raw_counts = [0] * nle
         for i in range(R):
-            zeile = matrix[i]
+            row = matrix[i]
             for e in range(nle):
-                roh[e] += int(zeile[R + self.rank * nle + e])
+                raw_counts[e] += int(row[R + self.rank * nle + e])
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            # ep_scatter prueft m_indices.shape[0] % 128 == 0 -- dieselbe
-            # Ausrichtung, die deepep.py:589 als expert_alignment uebergibt.
-            num_recv_tokens_per_expert = [(-(-c // 128)) * 128 for c in roh]
+            # ep_scatter checks m_indices.shape[0] % 128 == 0 -- the same
+            # alignment that deepep.py:589 passes as expert_alignment.
+            num_recv_tokens_per_expert = [(-(-c // 128)) * 128 for c in raw_counts]
         else:
-            num_recv_tokens_per_expert = roh
+            num_recv_tokens_per_expert = raw_counts
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
-            num_tokens_per_rank=torch.tensor(sende_zeilen, dtype=torch.int64),
+            num_tokens_per_rank=torch.tensor(send_rows, dtype=torch.int64),
             num_tokens_per_rdma_rank=None,
             num_tokens_per_expert=torch.tensor(
                 [int(x) for x in matrix[self.rank][R:]], dtype=torch.int64
             ),
         )
 
-        self._sende_zeilen = sende_zeilen
-        self._empf_zeilen = empf_zeilen
-        self._sende_index = sende_index
-        self._token_zahl = T
-        self._max_zeilen = max_zeilen
+        self._send_rows = send_rows
+        self._recv_rows = recv_rows
+        self._send_index = send_index
+        self._token_count = T
+        self._max_rows = max_rows
 
         return DeepEPNormalDispatchOutput(
-            recv_x, recv_skala, recv_ids, recv_gew, num_recv_tokens_per_expert
+            recv_x, recv_scale, recv_ids, recv_weights, num_recv_tokens_per_expert
         )
 
-    # -- Rueckweg ----------------------------------------------------------
+    # -- Return path ---------------------------------------------------------
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
         self.combine_a(combine_input)
@@ -791,85 +779,84 @@ class Bar1EPDispatcher(BaseDispatcher):
 
     def combine_a(self, combine_input: CombineInput):
         hidden_states, topk_ids, topk_weights = combine_input
-        self._combine_zwischenstand = (hidden_states,)
+        self._combine_state = (hidden_states,)
 
-    def combine_b(self, *zustand) -> torch.Tensor:
-        if not zustand:
-            zustand = self._combine_zwischenstand
-            self._combine_zwischenstand = None
-        return self._combine_kern(*zustand)
+    def combine_b(self, *state) -> torch.Tensor:
+        if not state:
+            state = self._combine_state
+            self._combine_state = None
+        return self._combine_core(*state)
 
-    def _combine_kern(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sende_index is None:
+    def _combine_core(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._send_index is None:
             raise RuntimeError(
-                "bar1ep: combine ohne vorangegangenes dispatch. Der "
-                "Sortierindex des Rueckwegs entsteht im Hinweg."
+                "bar1ep: combine without a preceding dispatch. The return "
+                "path's sort index is created in the outbound path."
             )
-        T = self._token_zahl
+        T = self._token_count
         H = hidden_states.shape[1]
-        geraet, dtype = hidden_states.device, hidden_states.dtype
-        zb = H * (torch.finfo(dtype).bits // 8)
+        device, dtype = hidden_states.device, hidden_states.dtype
+        row_bytes = H * (torch.finfo(dtype).bits // 8)
 
-        # Rueckweg: dieselbe Maschinerie in Gegenrichtung. Was im Hinweg
-        # empfangen wurde, wird jetzt gesendet -- Block fuer Block, in
-        # derselben Ordnung, also ohne ein einziges Indexbyte auf der Leitung.
-        sende_zeilen = list(self._empf_zeilen)
-        empf_zeilen = list(self._sende_zeilen)
-        S = sum(empf_zeilen)
+        # Return path: the same machinery in the opposite direction. What
+        # was received on the outbound path is now sent -- block by block,
+        # in the same order, so without a single index byte on the wire.
+        send_rows = list(self._recv_rows)
+        recv_rows = list(self._send_rows)
+        S = sum(recv_rows)
 
-        ein = hidden_states.contiguous().view(torch.uint8).reshape(-1, zb)
-        aus = torch.empty((S, zb), dtype=torch.uint8, device=geraet)
-        self._a2a_zeilen(aus, ein, sende_zeilen, empf_zeilen, zb, self._max_zeilen)
-        zurueck = aus.view(dtype).reshape(S, H)
+        inp = hidden_states.contiguous().view(torch.uint8).reshape(-1, row_bytes)
+        out = torch.empty((S, row_bytes), dtype=torch.uint8, device=device)
+        self._a2a_rows(out, inp, send_rows, recv_rows, row_bytes, self._max_rows)
+        returned = out.view(dtype).reshape(S, H)
 
-        # Die Reduktion: ein Token, das auf mehreren Raengen Experten hatte,
-        # bekommt je Rang einen Beitrag. index_add_ ueber den Sortierindex des
-        # Hinwegs summiert sie. In float32, weil DeepEPs Combine-Kern es auch
-        # tut -- in bf16 zu summieren waere billiger und eine andere Zahl.
-        if _umgebungs_flagge("SGLANG_BAR1EP_COMBINE_FP32", "1"):
-            acc = torch.zeros((T, H), dtype=torch.float32, device=geraet)
-            acc.index_add_(0, self._sende_index, zurueck.to(torch.float32))
-            ergebnis = acc.to(dtype)
+        # The reduction: a token that had experts on several ranks gets one
+        # contribution per rank. index_add_ over the outbound path's sort
+        # index sums them. In float32, because DeepEP's combine kernel also
+        # does so -- summing in bf16 would be cheaper and a different number.
+        if _env_flag("SGLANG_BAR1EP_COMBINE_FP32", "1"):
+            acc = torch.zeros((T, H), dtype=torch.float32, device=device)
+            acc.index_add_(0, self._send_index, returned.to(torch.float32))
+            result = acc.to(dtype)
         else:
-            ergebnis = torch.zeros((T, H), dtype=dtype, device=geraet)
-            ergebnis.index_add_(0, self._sende_index, zurueck)
+            result = torch.zeros((T, H), dtype=dtype, device=device)
+            result.index_add_(0, self._send_index, returned)
 
-        self._sende_index = None
-        return ergebnis
+        self._send_index = None
+        return result
 
-    # -- Rahmenwerk --------------------------------------------------------
+    # -- Framework -----------------------------------------------------------
 
     def set_quant_config(self, quant_config: dict) -> None:
         super().set_quant_config(quant_config)
         self.quant_config = quant_config
-        self._setze_ausgabetyp()
-        self._pruefe_fenster()
+        self._set_output_dtype()
+        self._check_window()
 
     def set_overlap_args(
         self, combine_overlap_args: "CombineOverlapArgs", meta_overlap_args: dict
     ) -> None:
-        # Der Direktpfad hat keine zweite Warteschlange und keinen
-        # Empfangshaken: dispatch/combine sind je ein Kernelstart mit einer
-        # Sperre. Die Ueberlappungsargumente werden angenommen (der Rahmen
-        # setzt sie unbedingt) und ausdruecklich nicht benutzt -- sie zu
-        # nehmen und zu ignorieren ist ehrlicher als eine Attrappe, die
-        # aussieht wie Ueberlappung.
+        # The direct path has no second queue and no receive hook:
+        # dispatch/combine are each one kernel launch with one lock. The
+        # overlap arguments are accepted (the framework sets them
+        # unconditionally) and deliberately unused -- taking them and
+        # ignoring them is more honest than a stub that looks like overlap.
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
 
     def register_deepep_dispatch_hook(self, hook):
         return self._bar1_dispatch_hooks.register_hook(hook)
 
-    # -- Byte-Beleg --------------------------------------------------------
+    # -- Byte proof ------------------------------------------------------
 
-    def _selbsttest_wenn_noetig(self) -> None:
-        if not _umgebungs_flagge("SGLANG_BAR1EP_SELFTEST", "1"):
+    def _selftest_if_needed(self) -> None:
+        if not _env_flag("SGLANG_BAR1EP_SELFTEST", "1"):
             logger.warning(
-                "bar1ep: Byte-Beleg per SGLANG_BAR1EP_SELFTEST=0 "
-                "uebersprungen. Damit steht hinter jeder Zahl dieses Laufs "
-                "keine Aussage darueber, ob die Bytes ankommen."
+                "bar1ep: byte proof skipped via SGLANG_BAR1EP_SELFTEST=0. "
+                "With that, no number from this run carries any statement "
+                "about whether the bytes actually arrive."
             )
             return
-        schluessel = (
+        key = (
             id(self.cpu_group),
             self.hidden_size,
             self.router_topk,
@@ -877,317 +864,316 @@ class Bar1EPDispatcher(BaseDispatcher):
             bool(self.use_fp8),
             str(self.params_dtype),
         )
-        stand = _SELBSTTEST_STAND.get(schluessel)
-        if stand is True:
+        state = _SELFTEST_STATE.get(key)
+        if state is True:
             return
-        if stand is False:
-            raise Bar1EPUnverfuegbar(
-                "bar1ep: der Byte-Beleg ist in diesem Prozess schon gefallen."
+        if state is False:
+            raise Bar1EPUnavailable(
+                "bar1ep: the byte proof already failed in this process."
             )
-        ok, grund = self.byte_beleg()
-        _SELBSTTEST_STAND[schluessel] = ok
+        ok, reason = self.byte_proof()
+        _SELFTEST_STATE[key] = ok
         if not ok:
-            raise Bar1EPUnverfuegbar(f"bar1ep: Byte-Beleg gefallen -- {grund}")
+            raise Bar1EPUnavailable(f"bar1ep: byte proof failed -- {reason}")
 
-    def byte_beleg(self) -> Tuple[bool, str]:
-        """Der Beleg, ohne den sich der Dispatcher nicht anbietet.
+    def byte_proof(self) -> Tuple[bool, str]:
+        """The proof without which the dispatcher does not offer itself.
 
-        Drei Durchgaenge, alle ueber den ECHTEN Weg:
+        Three passes, all over the REAL path:
 
-        1. **Rohe Bytes, ungleich und unausgerichtet, ueber mehrere Runden.**
-           Blocklaengen ``97*(1+((q+z)%3)) + ((q*5+z*3)%7)`` -- der Faktor
-           macht die Bloecke ungleich (der MoE-Normalfall), der Summand macht
-           sie zu Nicht-Vielfachen von 16 und schiebt damit jeden folgenden
-           Versatz aus der Ausrichtung. Die Rundenzahl wird auf mindestens
-           drei gedrueckt, damit die Doppelpufferung (``runde & 1``) und die
-           Versatzrechnung wirklich laufen und nicht nur existieren. Geprueft
-           wird je Sender einzeln, Byte fuer Byte, auf der EMPFANGENDEN Karte
-           -- auch der eigene Block, der gar nicht ueber die Apertur geht.
-        2. **Dispatch, strukturiert, je gerichtetem Paar.** Die Zuordnung
-           Token -> Experten folgt einer Regel, die jeder Rang fuer jeden
-           anderen nachrechnen kann. Damit weiss jeder Empfaenger vorher,
-           welche Zeile mit welchem Inhalt von wem kommen muss -- die Pruefung
-           haengt also nicht an derselben Buchhaltung, die sie pruefen soll.
-           Der Inhalt haengt an (Quellrang, Tokennummer, Spalte): eine
-           vertauschte Zeile und eine verschobene Spalte fallen beide auf.
-           Laeuft in der **konfigurierten** Form; mit fp8 wird gegen die
-           lokal quantisierte Sollform Byte fuer Byte verglichen, Skalen
-           eingeschlossen.
-        3. **Combine, strukturiert.** Der Rueckweg bekommt genau das zurueck,
-           was der Hinweg gebracht hat. Dann muss ``combine(dispatch(x))``
-           gleich ``x * (Zahl der Raenge, die fuer dieses Token zustaendig
-           sind)`` sein -- eine geschlossene Formel, kein zweiter Nachbau
-           derselben Buchhaltung.
+        1. **Raw bytes, uneven and unaligned, over several rounds.** Block
+           lengths ``97*(1+((q+z)%3)) + ((q*5+z*3)%7)`` -- the factor makes
+           the blocks uneven (the MoE normal case), the summand makes them
+           non-multiples of 16 and thereby pushes every following offset
+           out of alignment. The round count is forced to at least three,
+           so that double buffering (``round & 1``) and the offset
+           computation actually run and do not merely exist. Checked per
+           sender individually, byte by byte, on the RECEIVING card -- even
+           the sender's own block, which does not go over the aperture at
+           all.
+        2. **Dispatch, structured, per directed pair.** The token -> expert
+           mapping follows a rule that every rank can recompute for every
+           other rank. That way every receiver knows in advance which row
+           with what content must come from whom -- so the check does not
+           hang off the same bookkeeping it is supposed to check. The
+           content depends on (source rank, token number, column): a
+           swapped row and a shifted column both show up. Runs in the
+           **configured** form; with fp8 it is compared byte for byte
+           against the locally quantized expected form, scales included.
+        3. **Combine, structured.** The return path gets back exactly what
+           the outbound path brought. Then ``combine(dispatch(x))`` must
+           equal ``x * (number of ranks responsible for this token)`` -- a
+           closed formula, not a second rebuild of the same bookkeeping.
 
-        Faellt irgendetwas davon, meldet sich **bar1ep** ab. ``all_reduce``
-        und der a2a der barlink-Naht bleiben unberuehrt: sie haben ihre eigenen
-        Belege, und aus einem gefallenen Dispatcher folgt nichts ueber sie.
+        If any of this fails, **bar1ep** declines. ``all_reduce`` and the
+        barlink seam's a2a are unaffected: they have their own proofs, and a
+        failed dispatcher implies nothing about them.
         """
-        ok, grund = True, ""
+        ok, reason = True, ""
         try:
-            ok, grund = self._beleg_rohe_bytes()
+            ok, reason = self._proof_raw_bytes()
             if ok:
-                ok, grund = self._beleg_struktur()
-        except Exception as ex:  # noqa: BLE001 -- Grund ins Protokoll
-            ok, grund = False, repr(ex)
-            logger.warning("bar1ep: Byte-Beleg abgebrochen: %r", ex)
+                ok, reason = self._proof_structure()
+        except Exception as ex:  # noqa: BLE001 -- reason goes into the log
+            ok, reason = False, repr(ex)
+            logger.warning("bar1ep: byte proof aborted: %r", ex)
 
-        # Ab hier gruppenweit, IN JEDEM FALL. Ein Rang, der vor dem
-        # all_gather_object aussteigt, laesst die anderen darin stehen -- aus
-        # einem gefallenen Beleg wuerde ein Haenger, und ein Haenger sagt
-        # nicht, was kaputt ist.
-        traeger: list = [None] * self.welt
-        dist.all_gather_object(traeger, (bool(ok), str(grund)), group=self.cpu_group)
-        schlecht = [i for i, (o, _) in enumerate(traeger) if not o]
-        if schlecht:
-            gruende = "; ".join(f"Rang {i}: {traeger[i][1]}" for i in schlecht)
-            logger.warning("bar1ep: Byte-Beleg gruppenweit gefallen -- %s", gruende)
-            return False, gruende
+        # From here on group-wide, IN EVERY CASE. A rank that bails out
+        # before the all_gather_object leaves the others standing in it --
+        # a failed proof would turn into a hang, and a hang does not say
+        # what is broken.
+        carrier: list = [None] * self.world
+        dist.all_gather_object(carrier, (bool(ok), str(reason)), group=self.cpu_group)
+        bad = [i for i, (o, _) in enumerate(carrier) if not o]
+        if bad:
+            reasons = "; ".join(f"rank {i}: {carrier[i][1]}" for i in bad)
+            logger.warning("bar1ep: byte proof failed group-wide -- %s", reasons)
+            return False, reasons
         logger.info(
-            "bar1ep: Byte-Beleg bestanden (rohe Bytes ungleich/unausgerichtet "
-            "ueber mehrere Runden; Dispatch je gerichtetem Paar gegen die "
-            "Routenregel; Combine gegen die geschlossene Formel) -- %d Raenge, "
-            "hidden=%d, topk=%d, fp8=%s.",
-            self.welt, self.hidden_size, self.router_topk, self.use_fp8,
+            "bar1ep: byte proof passed (raw bytes uneven/unaligned over "
+            "several rounds; dispatch per directed pair against the "
+            "routing rule; combine against the closed formula) -- %d "
+            "ranks, hidden=%d, topk=%d, fp8=%s.",
+            self.world, self.hidden_size, self.router_topk, self.use_fp8,
         )
         return True, ""
 
     @staticmethod
-    def _marke(quelle: int, ziel: int) -> int:
-        """Ein je gerichtetem Paar verschiedenes Byte, nie 0x00 und nie 0xFF.
+    def _mark(source: int, dest: int) -> int:
+        """A byte that differs per directed pair, never 0x00 and never 0xFF.
 
-        0xFF ist die Vorbelegung des Ausgabepuffers, 0x00 die des
-        Empfangsschlitzes; beide sind damit vom Muster unterscheidbar, und ein
-        NICHT geschriebener Block faellt als solcher auf, statt zufaellig wie
-        ein Treffer auszusehen.
+        0xFF is the output buffer's preset, 0x00 the receive slot's; both
+        are thereby distinguishable from the pattern, and a block that was
+        NOT written shows up as such, instead of randomly looking like a
+        hit.
         """
-        return 0x40 | ((quelle * 8 + ziel) & 0x3F)
+        return 0x40 | ((source * 8 + dest) & 0x3F)
 
-    def _beleg_rohe_bytes(self) -> Tuple[bool, str]:
-        R, r = self.welt, self.rank
+    def _proof_raw_bytes(self) -> Tuple[bool, str]:
+        R, r = self.world, self.rank
 
-        def laenge(q: int, z: int) -> int:
+        def length(q: int, z: int) -> int:
             return 97 * (1 + ((q + z) % 3)) + ((q * 5 + z * 3) % 7)
 
-        sende = [laenge(r, z) for z in range(R)]
-        empf = [laenge(q, r) for q in range(R)]
-        max_zeilen = max(laenge(q, z) for q in range(R) for z in range(R))
-        # Zeilenbreite 1 Byte: dann sind Blocklaengen gleich Zeilenzahlen und
-        # die Versaetze durchweg unausgerichtet. Die Rundenzahl wird erzwungen,
-        # statt sich aus einem Schlitz zu ergeben, der auf diesem Rig fuer
-        # alles auf einmal reichen wuerde.
-        zpr = max(1, max_zeilen // 3)
+        send = [length(r, z) for z in range(R)]
+        recv = [length(q, r) for q in range(R)]
+        max_rows = max(length(q, z) for q in range(R) for z in range(R))
+        # Row width 1 byte: then block lengths equal row counts and the
+        # offsets are consistently unaligned. The round count is forced,
+        # instead of falling out of a slot that on this rig would be enough
+        # for everything at once.
+        rpr = max(1, max_rows // 3)
 
-        ein = torch.empty((sum(sende), 1), dtype=torch.uint8, device=self.device)
+        inp = torch.empty((sum(send), 1), dtype=torch.uint8, device=self.device)
         o = 0
         for z in range(R):
-            ein[o : o + sende[z]] = self._marke(r, z)
-            o += sende[z]
-        aus = torch.full((sum(empf), 1), 0xFF, dtype=torch.uint8, device=self.device)
+            inp[o : o + send[z]] = self._mark(r, z)
+            o += send[z]
+        out = torch.full((sum(recv), 1), 0xFF, dtype=torch.uint8, device=self.device)
 
         dist.barrier(group=self.cpu_group)
-        self._a2a_zeilen(aus, ein, sende, empf, 1, max_zeilen, zeilen_pro_runde=zpr)
+        self._a2a_rows(out, inp, send, recv, 1, max_rows, rows_per_round=rpr)
         torch.cuda.synchronize(self.device)
 
-        rueck = aus.reshape(-1).cpu()
+        back = out.reshape(-1).cpu()
         o = 0
         for q in range(R):
-            soll = self._marke(q, r)
-            stueck = rueck[o : o + empf[q]]
-            schlecht = int((stueck != soll).sum().item())
-            if schlecht:
+            expected = self._mark(q, r)
+            chunk = back[o : o + recv[q]]
+            bad = int((chunk != expected).sum().item())
+            if bad:
                 return False, (
-                    f"rohe Bytes {q}->{r}: {schlecht} von {empf[q]} Byte falsch"
+                    f"raw bytes {q}->{r}: {bad} of {recv[q]} bytes wrong"
                 )
-            o += empf[q]
+            o += recv[q]
         return True, ""
 
-    def _probe_routen(self, q: int) -> List[List[int]]:
-        """Die topk-Zeilen des Rangs ``q`` in der Probe. Rein rechnerisch.
+    def _probe_routes(self, q: int) -> List[List[int]]:
+        """Rank ``q``'s topk rows in the probe. Purely computed.
 
-        Zwei Bloecke:
+        Two blocks:
 
-        * Block 1 macht die **Paare** ungleich und keines leer: fuer jedes
-          Ziel ``z`` genau ``1 + ((q*3+z*5) % 5)`` Token, die NUR dorthin
-          gehen. Damit traegt jedes der R*R gerichteten Paare Bytes -- ein
-          Beleg ueber ein leeres Paar waere keiner.
-        * Block 2 macht die **Mehrfachzuordnung**: ``R`` Token, von denen
-          jedes ``min(topk, R)`` verschiedene Raenge trifft. Ohne diesen Block
-          bekaeme jedes Token genau einen Beitrag, und der Combine-Test waere
-          blind fuer die Summe.
+        * Block 1 makes the **pairs** uneven and none empty: for each
+          destination ``z`` exactly ``1 + ((q*3+z*5) % 5)`` tokens that go
+          ONLY there. That way every one of the R*R directed pairs carries
+          bytes -- a proof over an empty pair would be no proof.
+        * Block 2 makes the **multiple assignment**: ``R`` tokens, each of
+          which hits ``min(topk, R)`` different ranks. Without this block,
+          every token would get exactly one contribution, and the combine
+          test would be blind to the sum.
         """
-        R, nle, K = self.welt, self.num_local_experts, self.router_topk
-        zeilen: List[List[int]] = []
+        R, nle, K = self.world, self.num_local_experts, self.router_topk
+        rows: List[List[int]] = []
         for z in range(R):
             for _ in range(1 + ((q * 3 + z * 5) % 5)):
-                zeile = [-1] * K
+                row = [-1] * K
                 for k in range(min(K, nle)):
-                    zeile[k] = z * nle + k
-                zeilen.append(zeile)
+                    row[k] = z * nle + k
+                rows.append(row)
         for j in range(R):
-            zeile = [-1] * K
+            row = [-1] * K
             for k in range(min(K, R)):
                 z = (j + k) % R
-                zeile[k] = z * nle + ((j + k) % nle)
-            zeilen.append(zeile)
-        return zeilen
+                row[k] = z * nle + ((j + k) % nle)
+            rows.append(row)
+        return rows
 
     @staticmethod
-    def _probe_wert(q: int, t: int, spalten: int, geraet) -> torch.Tensor:
-        """Der Inhalt einer Probezeile -- verschieden je (Rang, Token, Spalte).
+    def _probe_value(q: int, t: int, columns: int, device) -> torch.Tensor:
+        """A probe row's content -- different per (rank, token, column).
 
-        Ganze Zahlen unter 128: in bf16 exakt, in float32 exakt, und nach der
-        128er-Blockquantisierung auf jedem Rang dieselbe Bitfolge, weil die
-        Quantisierung je Zeile und je Block unabhaengig ist.
+        Integers below 128: exact in bf16, exact in float32, and after the
+        128-element block quantization the same bit pattern on every rank,
+        because the quantization is independent per row and per block.
         """
-        s = torch.arange(spalten, device=geraet, dtype=torch.int32)
+        s = torch.arange(columns, device=device, dtype=torch.int32)
         return (q * 131 + t * 17 + s) % 113
 
-    def _beleg_struktur(self) -> Tuple[bool, str]:
-        R, r, nle, K = self.welt, self.rank, self.num_local_experts, self.router_topk
-        H, geraet = self.hidden_size, self.device
+    def _proof_structure(self) -> Tuple[bool, str]:
+        R, r, nle, K = self.world, self.rank, self.num_local_experts, self.router_topk
+        H, device = self.hidden_size, self.device
 
-        routen = {q: self._probe_routen(q) for q in range(R)}
-        meine = routen[r]
-        T = len(meine)
+        routes = {q: self._probe_routes(q) for q in range(R)}
+        mine = routes[r]
+        T = len(mine)
 
-        topk_ids = torch.tensor(meine, dtype=torch.int64, device=geraet)
-        topk_gew = (
-            torch.arange(T * K, device=geraet, dtype=torch.float32).reshape(T, K) % 7.0
+        topk_ids = torch.tensor(mine, dtype=torch.int64, device=device)
+        topk_weights = (
+            torch.arange(T * K, device=device, dtype=torch.float32).reshape(T, K) % 7.0
         ) + 1.0
-        muster = torch.stack(
-            [self._probe_wert(r, t, H, geraet) for t in range(T)], dim=0
+        pattern = torch.stack(
+            [self._probe_value(r, t, H, device) for t in range(T)], dim=0
         )
-        x = muster.to(torch.bfloat16 if self.use_fp8 else self.params_dtype)
+        x = pattern.to(torch.bfloat16 if self.use_fp8 else self.params_dtype)
 
         class _ProbeTopK:
             pass
 
         tk = _ProbeTopK()
         tk.topk_ids = topk_ids
-        tk.topk_weights = topk_gew
+        tk.topk_weights = topk_weights
 
         dist.barrier(group=self.cpu_group)
-        zustand = self._dispatch_vorbereiten(x, tk)
-        aus = self._dispatch_kern(*zustand)
+        state = self._dispatch_prepare(x, tk)
+        out = self._dispatch_core(*state)
         torch.cuda.synchronize(self.device)
 
-        # Was muss angekommen sein? Jeder Rang rechnet die Sendeordnung JEDES
-        # Rangs aus der Regel nach -- unabhaengig von der Buchhaltung, die
-        # gerade geprueft wird.
-        erwartet: List[Tuple[int, int]] = []  # (Quellrang, Tokennummer)
+        # What must have arrived? Every rank recomputes every rank's send
+        # order from the rule -- independent of the bookkeeping currently
+        # under test.
+        expected: List[Tuple[int, int]] = []  # (source rank, token number)
         for q in range(R):
-            for t, zeile in enumerate(routen[q]):
-                if any(e >= 0 and e // nle == r for e in zeile):
-                    erwartet.append((q, t))
-        N = aus.hidden_states.shape[0]
-        if N != len(erwartet):
-            return False, f"Dispatch: {N} Zeilen empfangen, erwartet {len(erwartet)}"
+            for t, row in enumerate(routes[q]):
+                if any(e >= 0 and e // nle == r for e in row):
+                    expected.append((q, t))
+        N = out.hidden_states.shape[0]
+        if N != len(expected):
+            return False, f"dispatch: {N} rows received, expected {len(expected)}"
 
-        recv_ids = aus.topk_ids.cpu()
-        for p, (q, t) in enumerate(erwartet):
-            soll = [
+        recv_ids = out.topk_ids.cpu()
+        for p, (q, t) in enumerate(expected):
+            expected_ids = [
                 (e - r * nle) if (e >= 0 and e // nle == r) else -1
-                for e in routen[q][t]
+                for e in routes[q][t]
             ]
-            if recv_ids[p].tolist() != soll:
+            if recv_ids[p].tolist() != expected_ids:
                 return False, (
-                    f"Dispatch: Zeile {p} (von Rang {q}, Token {t}) traegt "
-                    f"topk_ids {recv_ids[p].tolist()}, erwartet {soll}"
+                    f"dispatch: row {p} (from rank {q}, token {t}) carries "
+                    f"topk_ids {recv_ids[p].tolist()}, expected {expected_ids}"
                 )
 
-        # Nutzlast und Skalen byteweise gegen die lokal gebaute Sollform. Das
-        # ist kein zweiter Nachbau der Buchhaltung: gebaut wird nur die
-        # ERWARTETE Eingabe der fremden Raenge (aus der Regel), quantisiert
-        # mit demselben Kern, und verglichen werden die Bytes.
-        soll_x, soll_sk = self._probe_soll(erwartet)
-        ist_x = aus.hidden_states.view(torch.uint8).reshape(N, -1)
-        schlecht = int((ist_x != soll_x).sum().item())
-        if schlecht:
+        # Payload and scales, byte for byte, against the locally built
+        # expected form. This is not a second rebuild of the bookkeeping:
+        # only the EXPECTED input of the foreign ranks is built (from the
+        # rule), quantized with the same kernel, and the bytes are compared.
+        expected_x, expected_scale = self._probe_expected(expected)
+        actual_x = out.hidden_states.view(torch.uint8).reshape(N, -1)
+        bad = int((actual_x != expected_x).sum().item())
+        if bad:
             return False, (
-                f"Dispatch: {schlecht} von {ist_x.numel()} Nutzbyte falsch"
+                f"dispatch: {bad} of {actual_x.numel()} payload bytes wrong"
             )
-        if (soll_sk is None) != (aus.hidden_states_scale is None):
+        if (expected_scale is None) != (out.hidden_states_scale is None):
             return False, (
-                f"Dispatch: Skalen erwartet={soll_sk is not None}, "
-                f"angekommen={aus.hidden_states_scale is not None}"
+                f"dispatch: scale expected={expected_scale is not None}, "
+                f"arrived={out.hidden_states_scale is not None}"
             )
-        if soll_sk is not None:
-            ist_sk = aus.hidden_states_scale.contiguous().view(torch.uint8)
-            schlecht = int((ist_sk != soll_sk.view(torch.uint8)).sum().item())
-            if schlecht:
+        if expected_scale is not None:
+            actual_scale = out.hidden_states_scale.contiguous().view(torch.uint8)
+            bad = int((actual_scale != expected_scale.view(torch.uint8)).sum().item())
+            if bad:
                 return False, (
-                    f"Dispatch: {schlecht} von {ist_sk.numel()} Skalenbyte falsch"
+                    f"dispatch: {bad} of {actual_scale.numel()} scale bytes wrong"
                 )
 
-        # -- Combine: zurueck genau das, was gekommen ist.
-        rueck = (
+        # -- Combine: back exactly what came in.
+        returned = (
             torch.stack(
                 [
-                    self._probe_wert(q, t, H, geraet).to(torch.bfloat16)
-                    for (q, t) in erwartet
+                    self._probe_value(q, t, H, device).to(torch.bfloat16)
+                    for (q, t) in expected
                 ],
                 dim=0,
             )
             if N
-            else torch.zeros((0, H), dtype=torch.bfloat16, device=geraet)
+            else torch.zeros((0, H), dtype=torch.bfloat16, device=device)
         )
-        ergebnis = self.combine(
-            DeepEPNormalCombineInput(rueck, aus.topk_ids, aus.topk_weights)
+        result = self.combine(
+            DeepEPNormalCombineInput(returned, out.topk_ids, out.topk_weights)
         )
         torch.cuda.synchronize(self.device)
 
-        raenge_je_token = torch.tensor(
-            [len({e // nle for e in zeile if e >= 0}) for zeile in meine],
+        ranks_per_token = torch.tensor(
+            [len({e // nle for e in row if e >= 0}) for row in mine],
             dtype=torch.float32,
-            device=geraet,
+            device=device,
         ).unsqueeze(1)
-        soll = (muster.to(torch.float32) * raenge_je_token).to(ergebnis.dtype)
-        schlecht = int((ergebnis != soll).sum().item())
-        if schlecht:
+        expected_result = (pattern.to(torch.float32) * ranks_per_token).to(result.dtype)
+        bad = int((result != expected_result).sum().item())
+        if bad:
             return False, (
-                f"Combine: {schlecht} von {soll.numel()} Werten falsch "
-                f"(erwartet Eingabe * Zahl der zustaendigen Raenge)"
+                f"combine: {bad} of {expected_result.numel()} values wrong "
+                f"(expected input * number of responsible ranks)"
             )
         return True, ""
 
-    def _probe_soll(self, erwartet):
-        """Die Sollform der empfangenen Nutzlast, lokal gebaut.
+    def _probe_expected(self, expected):
+        """The expected form of the received payload, built locally.
 
-        Ohne fp8 ist das die Regel selbst. Mit fp8 wird die Regel durch
-        DENSELBEN Quantisierer geschickt, mit denselben Schaltern -- er
-        arbeitet je Zeile und je 128er-Block unabhaengig, also ist das Ergebnis
-        auf jedem Rang dieselbe Bitfolge wie beim Sender.
+        Without fp8, that is the rule itself. With fp8, the rule is run
+        through the SAME quantizer, with the same switches -- it operates
+        independently per row and per 128-element block, so the result is
+        the same bit pattern on every rank as on the sender's.
         """
-        H, geraet = self.hidden_size, self.device
-        if not erwartet:
-            leer_x = torch.empty(
-                (0, self._nutz_zeilenbytes()), dtype=torch.uint8, device=geraet
+        H, device = self.hidden_size, self.device
+        if not expected:
+            empty_x = torch.empty(
+                (0, self._payload_row_bytes()), dtype=torch.uint8, device=device
             )
             if not self.use_fp8:
-                return leer_x, None
-            return leer_x, torch.empty(
-                (0, self._skalen_spalten()), dtype=self._skalen_dtype(), device=geraet
+                return empty_x, None
+            return empty_x, torch.empty(
+                (0, self._scale_columns()), dtype=self._scale_dtype(), device=device
             )
-        roh = torch.stack(
-            [self._probe_wert(q, t, H, geraet) for (q, t) in erwartet], dim=0
+        raw = torch.stack(
+            [self._probe_value(q, t, H, device) for (q, t) in expected], dim=0
         )
         if not self.use_fp8:
-            w = roh.to(self.params_dtype).contiguous()
-            return w.view(torch.uint8).reshape(len(erwartet), -1), None
+            w = raw.to(self.params_dtype).contiguous()
+            return w.view(torch.uint8).reshape(len(expected), -1), None
 
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
         q8, s8 = sglang_per_token_group_quant_fp8(
-            roh.to(torch.bfloat16).contiguous(),
+            raw.to(torch.bfloat16).contiguous(),
             128,
             column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         return (
-            q8.contiguous().view(torch.uint8).reshape(len(erwartet), -1),
+            q8.contiguous().view(torch.uint8).reshape(len(expected), -1),
             s8.contiguous(),
         )

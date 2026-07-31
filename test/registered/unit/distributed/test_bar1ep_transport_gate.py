@@ -34,8 +34,8 @@ from sglang.srt.distributed.device_communicators.barlink_env_guard import (
 from sglang.srt.layers.moe.token_dispatcher import bar1ep as bar1ep_mod
 from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
     TRANSPORT_A2A_ATTRS,
+    bar1ep_available,
     bar1ep_transport,
-    bar1ep_verfuegbar,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -123,8 +123,8 @@ class TestGateAcceptsARealBar1Transport(CustomTestCase):
         self.assertIs(got, t, f"gate declined a real BAR1 transport: {reason}")
         self.assertEqual(reason, "")
 
-    def test_verfuegbar_says_yes_for_a_real_transport(self):
-        ok, reason = bar1ep_verfuegbar(_Group(_Comm(_RealNamedTransport())))
+    def test_available_says_yes_for_a_real_transport(self):
+        ok, reason = bar1ep_available(_Group(_Comm(_RealNamedTransport())))
         self.assertTrue(ok, reason)
 
     def test_a_zero_slot_transport_is_declined(self):

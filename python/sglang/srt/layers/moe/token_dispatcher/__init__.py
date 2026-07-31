@@ -10,8 +10,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
     Bar1EPDispatcher,
-    Bar1EPUnverfuegbar,
-    bar1ep_verfuegbar,
+    Bar1EPUnavailable,
+    bar1ep_available,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
@@ -50,8 +50,8 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 
 __all__ = [
     "Bar1EPDispatcher",
-    "Bar1EPUnverfuegbar",
-    "bar1ep_verfuegbar",
+    "Bar1EPUnavailable",
+    "bar1ep_available",
     "BaseDispatcher",
     "BaseDispatcherConfig",
     "CombineInput",
