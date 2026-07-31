@@ -57,7 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
-    nvfp4_marlin_unpackable_reason,
+    nvfp4_unpackable_reason,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -938,38 +938,45 @@ class CompressedTensorsConfig(QuantizationConfig):
         scheme: CompressedTensorsLinearScheme,
         layer: torch.nn.Module,
         layer_name: Optional[str],
+        output_size_per_partition: Optional[int] = None,
     ) -> CompressedTensorsLinearScheme:
         """Route a quantised layer with no kernel-legal form to the dense lane.
 
-        Task #332. The order is deliberate and mirrors #316: the GEOMETRY
-        verdict comes first and is taken on the UNSHARDED width
-        (``nvfp4_marlin_unpackable_reason``), because that is what decides
-        WHICH layers can never be served -- a per-shard verdict would blame the
-        shard plan for a property of the checkpoint. Only then does the
-        consequence change: #316 could build the layer dense-and-empty because
-        GPTQ leaves such a module dense on disk, while a compressed-tensors
-        NVFP4 checkpoint that targets ``Linear`` wholesale has really packed
-        it, so it must be loaded packed and materialised.
+        Task #332, extended to the native lane by #336. The order is deliberate
+        and mirrors #316: the GEOMETRY verdict comes first
+        (``nvfp4_unpackable_reason``), because that is what decides WHICH
+        layers can never be served; only then does the consequence change.
+        #316 could build the layer dense-and-empty because GPTQ leaves such a
+        module dense on disk, while a compressed-tensors NVFP4 checkpoint that
+        targets ``Linear`` wholesale has really packed it, so it must be loaded
+        packed and materialised.
+
+        Called twice per layer, because the two FP4 lanes are judged on
+        different widths (see ``nvfp4_unpackable_reason``): once from
+        ``get_quant_method`` without ``output_size_per_partition``, where only
+        the unsharded width exists, and once from
+        ``CompressedTensorsLinearMethod.create_weights`` with it, which is the
+        only place the native lane's ``n % 32`` can be answered. The second
+        call is a no-op for a layer the first already re-routed.
 
         Only the NVFP4 scheme has such a lane; every other scheme is returned
         untouched, so no other checkpoint class changes behaviour.
         """
         if not isinstance(scheme, CompressedTensorsW4A4Fp4):
             return scheme
-        if not scheme._use_marlin():
-            # The native FP4 lane has no thread tile; nothing to fall back from.
+        if isinstance(scheme, CompressedTensorsW4A4Fp4Dequant):
             return scheme
-        reason = nvfp4_marlin_unpackable_reason(layer)
+        reason = nvfp4_unpackable_reason(layer, output_size_per_partition)
         if reason is None:
             return scheme
         # Loud, once per layer, and named: a lane change that silently costs
         # VRAM must be readable off the boot log without a debugger.
         logger.warning(
-            "NVFP4: layer '%s' has no Marlin form at any TP size (%s), so the "
-            "checkpoint's packed weight is DEQUANTISED to dense %s at load "
-            "(#332). No precision is lost -- the quantisation error is already "
-            "in the stored codes -- but this layer costs bf16 VRAM instead of "
-            "4 bits.",
+            "NVFP4: layer '%s' has no form this rank's FP4 lane can serve "
+            "(%s), so the checkpoint's packed weight is DEQUANTISED to dense "
+            "%s at load (#332/#336). No precision is lost -- the quantisation "
+            "error is already in the stored codes -- but this layer costs "
+            "bf16 VRAM instead of 4 bits.",
             layer_name,
             reason,
             "bf16/fp16",
@@ -1115,6 +1122,20 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
+        # #336: the native FP4 lane's geometry condition is on the SHARDED
+        # width (cutlass_scaled_fp4_mm asserts n % 32), and this is the first
+        # moment that width exists -- ColumnParallelLinear computes it after
+        # LinearBase.__init__ returns, i.e. after get_quant_method already
+        # picked the scheme. Re-run the verdict with it and swap the lane
+        # before a single parameter is created; layer.scheme is also what
+        # process_weights_after_loading and apply read afterwards, so the swap
+        # carries through the whole layer lifetime.
+        layer.scheme = self.quantization_config._maybe_dequantize_unpackable(
+            layer.scheme,
+            layer,
+            getattr(layer, "prefix", None),
+            output_size_per_partition=sum(output_partition_sizes),
+        )
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,

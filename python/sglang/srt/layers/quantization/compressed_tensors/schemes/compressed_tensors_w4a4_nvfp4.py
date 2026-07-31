@@ -36,12 +36,22 @@ __all__ = [
     "CompressedTensorsW4A4Fp4",
     "CompressedTensorsW4A4Fp4Dequant",
     "NVFP4_BLOCK_SIZE",
+    "NVFP4_NATIVE_MIN_N",
     "dequantize_nvfp4",
     "nvfp4_marlin_unpackable_reason",
+    "nvfp4_native_unpackable_reason",
+    "nvfp4_unpackable_reason",
 ]
 
 #: Elements sharing one FP8-E4M3 block scale in ``nvfp4-pack-quantized``.
 NVFP4_BLOCK_SIZE = 16
+
+#: N granularity the NATIVE (CUTLASS / FlashInfer TRTLLM) block-scaled FP4 GEMM
+#: requires. ``nvfp4_scaled_mm_kernels.cuh:81`` asserts it outright -- measured
+#: 2026-07-31 as "Expected n to be divisible by 32, but got n: 42" on the TP0
+#: rank of an uneven TP=3 plan. Unlike the Marlin tile this is a condition on
+#: the width the kernel actually receives, i.e. the SHARDED one.
+NVFP4_NATIVE_MIN_N = 32
 
 #: The 16 E2M1 code points, indexed by nibble. Same table as
 #: ``kvfp4_tensor.E2M1_VALUES``, rebuilt locally because that one is pinned to
@@ -138,19 +148,105 @@ def nvfp4_marlin_unpackable_reason(layer: torch.nn.Module) -> Optional[str]:
     layer dense-and-empty would leave it unloaded. The caller therefore routes
     to ``CompressedTensorsW4A4Fp4Dequant`` instead of refusing.
     """
-    from sglang.srt.layers.linear import LinearBase
-
-    if not isinstance(layer, LinearBase):
-        return None
-    output_size = getattr(layer, "output_size", None)
-    if not isinstance(output_size, int):
-        return None
-    if output_size % GPTQ_MARLIN_MIN_THREAD_N == 0:
+    output_size = _linear_output_size(layer)
+    if output_size is None or output_size % GPTQ_MARLIN_MIN_THREAD_N == 0:
         return None
     return (
         f"the unsharded output width is {output_size}, not a multiple of the "
         f"NVFP4 Marlin thread tile {GPTQ_MARLIN_MIN_THREAD_N}"
     )
+
+
+def nvfp4_native_unpackable_reason(width: int, *, sharded: bool) -> Optional[str]:
+    """Why the NATIVE FP4 GEMM cannot serve a ``width``-row output, or None.
+
+    Task #336. The native lane has its own geometry condition, and it is not
+    the Marlin one: ``cutlass_scaled_fp4_mm`` asserts ``n % 32 == 0`` on the
+    width it is handed, which is the SHARDED width. That is the difference
+    that matters, because it inverts #316's rule about who is to blame.
+
+    For Marlin the verdict is taken on the unsharded width on purpose: the
+    fork's shard planner coarsens partitions to the quant block, so a shard
+    that misses the 64-tile while the module could hit it is a plan bug and
+    stays a loud error. The native lane has no such coarsening axis, and on
+    the geometry that produced this task no plan exists at all. Measured
+    2026-07-31 over three ratios on ``ocicek/Qwen3.6-27B-NVFP4``
+    (``auto`` -> 42, ``2,1,1`` -> 48, ``4,1,1`` -> 60): the gated-delta-net
+    splits in groups of three value heads (``linear_num_value_heads`` 48
+    against ``linear_num_key_heads`` 16), and the merged b/a gate carries two
+    rows per value head, so a rank holding ``g`` groups gets ``n = 6 * g``.
+    ``6g % 32 == 0`` needs ``3g % 16 == 0``, and 3 is coprime to 16, so it
+    needs ``g % 16 == 0`` -- every group on one rank. NO tensor-parallel split
+    of that layer satisfies the native lane, the even split included.
+
+    So a sharded miss here is not a plan to fix, it is a lane to leave: the
+    caller routes to ``CompressedTensorsW4A4Fp4Dequant``, exactly as the
+    Marlin verdict does, and says so per layer in the log.
+    """
+    if width % NVFP4_NATIVE_MIN_N == 0:
+        return None
+    which = "sharded" if sharded else "unsharded"
+    return (
+        f"the {which} output width is {width}, not a multiple of the native "
+        f"FP4 GEMM's N granularity {NVFP4_NATIVE_MIN_N}"
+    )
+
+
+def nvfp4_unpackable_reason(
+    layer: torch.nn.Module,
+    output_size_per_partition: Optional[int] = None,
+) -> Optional[str]:
+    """Why THIS rank's resolved FP4 lane can serve no form of ``layer``.
+
+    Task #336, generalising #332's Marlin-only verdict. A mixed-architecture
+    rig runs both lanes at once -- ``get_fp4_gemm_runner_backend()`` resolves
+    per rank against that rank's device -- and the two lanes have DIFFERENT
+    geometry conditions on DIFFERENT widths:
+
+    ==========  ======================  =================================
+    lane        condition               width it is judged on
+    ==========  ======================  =================================
+    Marlin      ``% 64`` (thread tile)  unsharded (``layer.output_size``)
+    native FP4  ``% 32`` (kernel N)     sharded (this rank's partition)
+    ==========  ======================  =================================
+
+    Hence the two moments. ``get_quant_method`` can only see the unsharded
+    width -- ``ColumnParallelLinear`` computes ``output_size_per_partition``
+    after ``LinearBase.__init__`` returns -- so it is called there without
+    ``output_size_per_partition`` and answers for Marlin, plus for the native
+    lane in the case no split can rescue either (unsharded width off the 32).
+    ``CompressedTensorsLinearMethod.create_weights`` calls it again WITH the
+    shard width, which is where the native verdict of #336 actually lands.
+
+    Both answers route to the same place, ``CompressedTensorsW4A4Fp4Dequant``:
+    load packed, materialise dense once at load, serve with ``F.linear``. The
+    numerics are exact either way (see ``dequantize_nvfp4``).
+    """
+    if get_fp4_gemm_runner_backend().is_marlin():
+        # Marlin keeps #332's unsharded-only verdict; its sharded misses stay
+        # a loud error in create_weights, because the plan can fix those.
+        return nvfp4_marlin_unpackable_reason(layer)
+    if output_size_per_partition is not None:
+        return nvfp4_native_unpackable_reason(output_size_per_partition, sharded=True)
+    output_size = _linear_output_size(layer)
+    if output_size is None:
+        return None
+    return nvfp4_native_unpackable_reason(output_size, sharded=False)
+
+
+def _linear_output_size(layer: torch.nn.Module) -> Optional[int]:
+    """The UNSHARDED output width of a linear layer, or None if it has none.
+
+    ``LinearBase.__init__`` records ``output_size`` before it asks the quant
+    config for a method, so this is readable at scheme-selection time; a
+    non-linear module (or a stub without the field) simply has no verdict.
+    """
+    from sglang.srt.layers.linear import LinearBase
+
+    if not isinstance(layer, LinearBase):
+        return None
+    output_size = getattr(layer, "output_size", None)
+    return output_size if isinstance(output_size, int) else None
 
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
@@ -195,8 +291,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     """
 
     #: Overridden by ``CompressedTensorsW4A4Fp4Dequant``: with no kernel in the
-    #: picture the Marlin tile stops being a constraint, so ``create_weights``
-    #: must not apply it.
+    #: picture neither the Marlin tile nor the native N granularity is a
+    #: constraint, so ``create_weights`` must not apply either.
     dequantize_on_load = False
 
     def __init__(self):
@@ -262,6 +358,26 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
                 "NVFP4 Marlin requires output_size_per_partition to be a "
                 f"multiple of {GPTQ_MARLIN_MIN_THREAD_N}, got "
                 f"{output_size_per_partition}. {cause}"
+            )
+
+        if (
+            not self.dequantize_on_load
+            and not self._use_marlin()
+            and output_size_per_partition % NVFP4_NATIVE_MIN_N
+        ):
+            # #336. Without this the width reaches cutlass_scaled_fp4_mm and
+            # the run dies mid-graph-capture on a kernel assert
+            # ("Expected n to be divisible by 32, but got n: 42") with no
+            # layer name attached. CompressedTensorsLinearMethod.create_weights
+            # routes such a shard to CompressedTensorsW4A4Fp4Dequant before it
+            # gets here, so reaching this raise means the routing was bypassed.
+            raise ValueError(
+                "The native NVFP4 GEMM requires output_size_per_partition to "
+                f"be a multiple of {NVFP4_NATIVE_MIN_N}, got "
+                f"{output_size_per_partition}. "
+                "CompressedTensorsLinearMethod.create_weights routes such a "
+                "shard to CompressedTensorsW4A4Fp4Dequant (#336); reaching "
+                "this raise means the routing was bypassed."
             )
 
         # Weight
@@ -487,14 +603,22 @@ class CompressedTensorsW4A4Fp4Dequant(CompressedTensorsW4A4Fp4):
     """Load NVFP4, serve dense: the fallback for a projection with no tile.
 
     Third lane of the compressed-tensors NVFP4 scheme, reached only through
-    ``nvfp4_marlin_unpackable_reason`` (task #332). The two kernel lanes need
-    an output width that is a multiple of ``GPTQ_MARLIN_MIN_THREAD_N`` (Marlin)
-    or a Blackwell card (native FP4). A checkpoint whose ``config_groups``
-    target ``Linear`` wholesale quantises narrow projections too -- on
-    Qwen3.5/3.6 the gated-delta-net's merged b/a gate, 96 rows against a
-    64-wide tile -- and no shard plan and no card can widen 96. Before this
-    lane the only outcomes were a load-time abort on every pre-Blackwell rank
-    or a checkpoint edit.
+    ``nvfp4_unpackable_reason`` (tasks #332 and #336). Both kernel lanes carry
+    a width condition and neither can be met by every checkpoint:
+
+    * Marlin needs a multiple of ``GPTQ_MARLIN_MIN_THREAD_N`` (64) UNSHARDED.
+      A checkpoint whose ``config_groups`` target ``Linear`` wholesale
+      quantises narrow projections too -- on Qwen3.5/3.6 the gated-delta-net's
+      merged b/a gate, 96 rows against a 64-wide tile -- and no shard plan and
+      no card can widen 96 (#332).
+    * The native FP4 GEMM needs a multiple of ``NVFP4_NATIVE_MIN_N`` (32) on
+      the SHARDED width, and on that same gate no tensor-parallel split
+      delivers one (#336; the arithmetic is in
+      ``nvfp4_native_unpackable_reason``).
+
+    Before this lane the outcomes were a load-time abort on every
+    pre-Blackwell rank, a mid-graph-capture kernel assert on every Blackwell
+    rank at TP > 1, or a checkpoint edit.
 
     So: keep the packed parameters (the loader must still find somewhere to put
     ``weight_packed`` / ``weight_scale`` -- unlike #316's GPTQ case, the tensor

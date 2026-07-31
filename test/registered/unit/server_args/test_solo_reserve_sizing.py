@@ -22,6 +22,17 @@ and the conversion the new path performs -- total minus reserve, exactly, with
 no margin, cap or rounding layered on top (the same rule
 ``--rank-gpu-memory-mib`` follows).
 
+Task #336 then fixed WHICH card that total comes from. The first cut read
+``get_device_memory_capacity``, i.e. ``nvidia-smi --query-gpu=memory.total``
+minimised over every card the DRIVER lists. Measured 2026-07-31 on the same
+arm: pinned by UUID to the 5090 and resident there (NVML index 1,
+30,423/32,607 MiB, both 3080s at 0 MiB), the reserve line still said "device
+total 20480 MiB" -- a 3080 -- and produced fraction 0.900000, by coincidence
+exactly the anchor's ``--mem-fraction-static``. The pool came out byte-
+identical (153,007 tokens) and the knob looked like a clean reproduction while
+doing nothing. ``TestItReadsTheCardTheProcessRunsOn`` reproduces that
+renumbering and pins the fix.
+
 CPU only, NVML mocked.
 """
 
@@ -32,6 +43,7 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import patch
 
+import sglang.srt.server_args as server_args_module
 import sglang.srt.utils as sglang_utils
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
@@ -52,6 +64,11 @@ KIB_PER_TOKEN = 31.9
 ARM_TOKENS = 153_007
 #: What §5 says a reserve-based boot should reach instead.
 ARM_REACHABLE_TOKENS = 233_000
+#: NVML total of the RTX 3080s in the same rig -- and the number the broken
+#: sizing line printed while pinned to the 5090.
+OTHER_CARD_TOTAL_MIB = 20480
+#: NVML index the 5090 sat at in that window; index 0 was a 3080.
+FIVE_NVML_INDEX = 1
 
 MIB = 1024
 GIB_IN_MIB = 1024
@@ -68,9 +85,18 @@ def make_args(**kwargs) -> ServerArgs:
 
 
 def run_handler(args, total_mib: int = CARD_TOTAL_MIB) -> ServerArgs:
-    with patch.object(
-        sglang_utils, "get_device_memory_capacity", return_value=total_mib
-    ):
+    """Run the handler with NVML answering ``total_mib`` for every visible id.
+
+    ``total_mib=None`` stands for "NVML could not resolve the device", which
+    the path must refuse loudly rather than paper over.
+    """
+
+    def fake_totals(gpu_ids, flag):
+        if total_mib is None:
+            raise ValueError(f"{flag} could not resolve the device total (#336).")
+        return {gpu_id: total_mib for gpu_id in sorted(set(gpu_ids))}
+
+    with patch.object(server_args_module, "_query_gpu_total_mib", fake_totals):
         args._handle_uneven_tp()
     return args
 
@@ -206,8 +232,175 @@ class TestTheRefusals(CustomTestCase):
             run_handler(make_args(rank_auto_reserve_mib=2000, nnodes=2))
 
     def test_an_unreadable_device_total_is_named(self):
-        with self.assertRaisesRegex(ValueError, "total memory"):
+        with self.assertRaisesRegex(ValueError, "could not resolve"):
             run_handler(make_args(rank_auto_reserve_mib=2000), total_mib=None)
+
+
+# ---------------------------------------------------------------------------
+# #336: the total must come from the card this process actually runs on
+# ---------------------------------------------------------------------------
+
+
+class TestItReadsTheCardTheProcessRunsOn(CustomTestCase):
+    """The measured no-op: right card, wrong total, plausible-looking result.
+
+    The rig is 2x RTX 3080 (20,480 MiB) + 1x RTX 5090 (32,607 MiB) and NVML
+    enumerates the 5090 at index 1. The arm pinned CUDA_VISIBLE_DEVICES to the
+    5090's UUID, so inside the process the card is CUDA device 0 -- while NVML
+    device 0 is a 3080 and ``nvidia-smi``'s driver-wide minimum is 20,480.
+    """
+
+    @staticmethod
+    def _nvml_rig(mapping, nvml_totals):
+        """Patch the CUDA -> NVML bridge and NVML's per-index totals.
+
+        Exercises the real ``_query_gpu_total_mib``, so the renumbering is
+        crossed by the code under test and not by the fixture.
+        """
+        import contextlib
+
+        class _FakePynvml:
+            NVMLError = Exception
+
+            @staticmethod
+            def nvmlInit():
+                return None
+
+            @staticmethod
+            def nvmlShutdown():
+                return None
+
+            @staticmethod
+            def nvmlDeviceGetCount():
+                return len(nvml_totals)
+
+            @staticmethod
+            def nvmlDeviceGetHandleByIndex(index):
+                return index
+
+            @staticmethod
+            def nvmlDeviceGetMemoryInfo(handle):
+                class _Mem:
+                    total = nvml_totals[handle] * 1024 * 1024
+
+                return _Mem()
+
+        @contextlib.contextmanager
+        def _ctx():
+            import sys
+
+            with patch.dict(sys.modules, {"pynvml": _FakePynvml}):
+                with patch.object(
+                    server_args_module,
+                    "_torch_to_nvml_gpu_index_mapping",
+                    lambda: dict(mapping),
+                ):
+                    yield
+
+        return _ctx()
+
+    #: The rig as NVML saw it: index 0 and 2 are 3080s, index 1 is the 5090.
+    RIG = [OTHER_CARD_TOTAL_MIB, CARD_TOTAL_MIB, OTHER_CARD_TOTAL_MIB]
+
+    def test_a_uuid_pin_sizes_against_the_pinned_card_not_nvml_zero(self):
+        """CUDA device 0 IS the 5090 here; NVML index 0 is not."""
+        args = make_args(rank_auto_reserve_mib=2048)
+        with self._nvml_rig({0: FIVE_NVML_INDEX}, self.RIG):
+            args._handle_uneven_tp()
+        self.assertEqual(
+            args.mem_fraction_static, (CARD_TOTAL_MIB - 2048) / CARD_TOTAL_MIB
+        )
+
+    def test_the_old_behaviour_would_have_produced_the_measured_no_op(self):
+        """Reading NVML index 0 gives 0.90 -- exactly the anchor's fraction.
+
+        This is the falsifier for the whole posten: the wrong card does not
+        produce an obviously wrong number, it produces the number the run was
+        being compared against.
+        """
+        wrong = (OTHER_CARD_TOTAL_MIB - 2048) / OTHER_CARD_TOTAL_MIB
+        self.assertEqual(wrong, ARM_FRACTION)
+        right = (CARD_TOTAL_MIB - 2048) / CARD_TOTAL_MIB
+        self.assertNotEqual(right, ARM_FRACTION)
+        # And the difference is the ~39k tokens the beleg said were owed.
+        gained = _tokens_for(CARD_TOTAL_MIB * (right - wrong))
+        self.assertAlmostEqual(gained, 39_000, delta=2_000)
+
+    def test_a_divergent_enumeration_order_without_a_pin_is_crossed(self):
+        """No CVD pin, three visible cards, torch order != NVML order.
+
+        torch's FASTEST_FIRST puts the 5090 at CUDA index 0 while NVML keeps
+        it at index 1. A solo boot lands on CUDA 0, so the total must be the
+        5090's.
+        """
+        args = make_args(rank_auto_reserve_mib=2048)
+        with self._nvml_rig({0: 1, 1: 0, 2: 2}, self.RIG):
+            args._handle_uneven_tp()
+        self.assertEqual(
+            args.mem_fraction_static, (CARD_TOTAL_MIB - 2048) / CARD_TOTAL_MIB
+        )
+
+    def test_base_gpu_id_moves_which_card_is_read(self):
+        """``--base-gpu-id 1`` places rank 0 on CUDA 1, i.e. NVML 0 here."""
+        args = make_args(rank_auto_reserve_mib=2048, base_gpu_id=1)
+        with self._nvml_rig({0: 1, 1: 0, 2: 2}, self.RIG):
+            args._handle_uneven_tp()
+        self.assertEqual(
+            args.mem_fraction_static,
+            (OTHER_CARD_TOTAL_MIB - 2048) / OTHER_CARD_TOTAL_MIB,
+        )
+
+    def test_an_unresolvable_mapping_is_loud_not_a_fallback(self):
+        """No bridge -> refuse. The silent fallback IS the defect."""
+        args = make_args(rank_auto_reserve_mib=2048)
+        with self._nvml_rig({}, self.RIG):
+            with self.assertRaisesRegex(ValueError, "Refusing to guess"):
+                args._handle_uneven_tp()
+        self.assertIsNone(args.mem_fraction_static)
+
+    def test_a_device_outside_nvmls_range_is_loud(self):
+        args = make_args(rank_auto_reserve_mib=2048)
+        with self._nvml_rig({0: 7}, self.RIG):
+            with self.assertRaisesRegex(ValueError, "Refusing to guess"):
+                args._handle_uneven_tp()
+
+    def test_mixed_cards_under_one_scalar_reserve_are_refused(self):
+        """One fraction cannot be exact on a 20 GiB and a 32 GiB card."""
+        args = make_args(rank_auto_reserve_mib=2048, tp_size=2)
+        with self._nvml_rig({0: 1, 1: 0}, self.RIG):
+            with self.assertRaisesRegex(ValueError, "different totals"):
+                args._handle_uneven_tp()
+
+    def test_identical_cards_across_ranks_are_fine(self):
+        args = make_args(rank_auto_reserve_mib=2048, tp_size=2)
+        with self._nvml_rig({0: 0, 1: 2}, self.RIG):
+            args._handle_uneven_tp()
+        self.assertEqual(
+            args.mem_fraction_static,
+            (OTHER_CARD_TOTAL_MIB - 2048) / OTHER_CARD_TOTAL_MIB,
+        )
+
+    def test_the_placement_enumerates_the_local_rank_grid(self):
+        self.assertEqual(make_args()._default_placement_gpu_ids(), [0])
+        self.assertEqual(
+            make_args(tp_size=4)._default_placement_gpu_ids(), [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            make_args(tp_size=2, gpu_id_step=2)._default_placement_gpu_ids(), [0, 2]
+        )
+        self.assertEqual(
+            make_args(tp_size=2, base_gpu_id=4)._default_placement_gpu_ids(), [4, 5]
+        )
+
+    def test_a_non_cuda_device_keeps_the_capacity_helper(self):
+        """NVML is CUDA-only; an XPU/HPU boot has no bridge to cross."""
+        args = make_args(rank_auto_reserve_mib=2048, device="xpu")
+        with patch.object(
+            sglang_utils, "get_device_memory_capacity", return_value=16384
+        ):
+            with self._nvml_rig({0: 0}, self.RIG):
+                args._handle_uneven_tp()
+        self.assertEqual(args.mem_fraction_static, (16384 - 2048) / 16384)
 
 
 class TestItStillDefersToTheRankPath(CustomTestCase):

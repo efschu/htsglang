@@ -504,6 +504,46 @@ def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
         return {}
 
 
+def _query_gpu_total_mib(gpu_ids, flag: str) -> Dict[int, int]:
+    """NVML TOTAL MiB per CUDA device index, refusing to guess the identity.
+
+    Task #336. The strict sibling of ``_query_rank_gpu_memory_mib``: where
+    that one falls back to identity when the CUDA -> NVML bridge cannot be
+    built (the ``--rank-gpu-id`` path names physical ids, so identity is the
+    documented meaning there), this one is used by callers who must read the
+    total of the card a PROCESS is actually running on. Guessing there is the
+    defect it exists to prevent, so an unresolvable device is an error.
+    """
+    import pynvml
+
+    mapping = _torch_to_nvml_gpu_index_mapping()
+    if not mapping:
+        raise ValueError(
+            f"{flag} needs the NVML identity of this process's CUDA "
+            "device(s), but the CUDA -> NVML index mapping could not be "
+            "resolved. Refusing to guess: reading the wrong card sizes the "
+            "KV pool against the wrong total (#336)."
+        )
+    pynvml.nvmlInit()
+    try:
+        device_count = pynvml.nvmlDeviceGetCount()
+        totals: Dict[int, int] = {}
+        for gpu_id in sorted(set(gpu_ids)):
+            nvml_idx = mapping.get(gpu_id)
+            if nvml_idx is None or not 0 <= nvml_idx < device_count:
+                raise ValueError(
+                    f"{flag} could not resolve CUDA device {gpu_id} to an "
+                    f"NVML device (NVML reports {device_count}). Refusing to "
+                    "guess: reading the wrong card sizes the KV pool against "
+                    "the wrong total (#336)."
+                )
+            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
+            totals[gpu_id] = pynvml.nvmlDeviceGetMemoryInfo(handle).total // 2**20
+        return totals
+    finally:
+        pynvml.nvmlShutdown()
+
+
 def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
     """NVML (total_mib, free_mib) for each CUDA device index in `gpu_ids`.
 
@@ -1946,7 +1986,12 @@ class ServerArgs:
             "mutually exclusive with --mem-fraction-static; 'auto' (the "
             "default) leaves the stock fraction heuristic in place there, "
             "because a default value cannot distinguish itself from an "
-            "unset flag.",
+            "unset flag. The NVML total there is read for the card this "
+            "process is actually placed on, resolved through the CUDA -> NVML "
+            "PCI-bus bridge so a CUDA_VISIBLE_DEVICES pin or a divergent "
+            "enumeration order cannot point it at a different card; an "
+            "unresolvable device, or a placement spanning cards of different "
+            "totals, is refused rather than guessed.",
             type_parser=str,
         ),
     ] = "auto"
@@ -7285,6 +7330,100 @@ class ServerArgs:
     #: 2048 MiB constant.
     AUTO_RANK_MEMORY_RESERVE_MIB = "auto"
 
+    def _default_placement_gpu_ids(self) -> List[int]:
+        """CUDA device indices this node's schedulers get on the DEFAULT path.
+
+        The ``base_gpu_id``/``gpu_id_step`` formula of ``gpu_id_for_rank``,
+        enumerated over the local rank grid. These are indices into the
+        process's CUDA_VISIBLE_DEVICES view, not physical NVML ids.
+        """
+        return sorted(
+            {
+                self.gpu_id_for_rank(pp_rank, tp_rank, self.pp_size, self.tp_size)
+                for pp_rank in range(self.pp_size)
+                for tp_rank in range(self.tp_size)
+            }
+        )
+
+    def _reserve_device_total_mib(self) -> int:
+        """NVML total of the card ``--rank-auto-reserve-mib`` sizes against.
+
+        Task #336, and the reason it is a method instead of one call to
+        ``get_device_memory_capacity``. That helper shells out to
+        ``nvidia-smi --query-gpu=memory.total`` and returns the MINIMUM over
+        every card the DRIVER lists: neither CUDA_VISIBLE_DEVICES nor the
+        placement enters into it. Measured 2026-07-31 -- a solo boot pinned by
+        UUID to the RTX 5090 (NVML index 1, 32,607 MiB), model resident there,
+        the two RTX 3080s idle -- the reserve line still read "device total
+        20480 MiB" and landed on fraction 0.900000. That happened to be
+        exactly the ``--mem-fraction-static`` the comparison run had been
+        launched with, so the KV pool came out byte-identical (153,007 tokens)
+        and the knob looked like a clean reproduction while doing nothing at
+        all. A sizing knob that silently no-ops is worse than one that fails.
+
+        So the total is resolved the way the ``--rank-gpu-id`` path already
+        resolves totals: through NVML, bridged from the CUDA index to the NVML
+        index by PCI bus id (``_torch_to_nvml_gpu_index_mapping``), indexed by
+        the devices this node's ranks are actually placed on -- never by a
+        naked index 0, and never by a minimum over cards this process cannot
+        even see.
+
+        Two refusals, both loud on purpose:
+
+        * an unresolvable device (no NVML, no CUDA, no bus match) is an error,
+          not a fall back to the driver-wide query that produced the defect;
+        * cards of DIFFERENT totals under one scalar reserve is an error, not
+          a silent pick. ``mem_fraction_static`` is one number applied to
+          every rank's own card, so "total minus reserve" can be exact on only
+          one of them. ``--rank-gpu-id`` with a per-rank reserve is the form
+          that stays exact on all of them.
+        """
+        device = self.device or "cuda"
+        if device != "cuda":
+            # Non-CUDA accelerators have no NVML; their capacity helper is the
+            # only source, and it is not subject to the defect above (there is
+            # no CUDA_VISIBLE_DEVICES renumbering to diverge from).
+            from sglang.srt.utils import get_device_memory_capacity
+
+            gpu_mem = get_device_memory_capacity(device)
+            if not gpu_mem:
+                raise ValueError(
+                    "--rank-auto-reserve-mib needs the device's total memory, "
+                    f"which could not be read for --device {device}."
+                )
+            return int(gpu_mem)
+
+        gpu_ids = self._default_placement_gpu_ids()
+        try:
+            totals = _query_gpu_total_mib(gpu_ids, "--rank-auto-reserve-mib")
+        except ValueError:
+            # Already a named refusal from the query itself; re-wrapping it
+            # would bury which of the two refusals fired.
+            raise
+        except Exception as e:
+            raise ValueError(
+                "--rank-auto-reserve-mib needs the NVML total of the card(s) "
+                f"this boot runs on (CUDA device(s) {gpu_ids}), which could "
+                f"not be read: {e}. Refusing to fall back to a driver-wide "
+                "query -- that is what made the knob a silent no-op (#336)."
+            ) from e
+
+        distinct = sorted(set(totals.values()))
+        if not distinct:
+            raise ValueError(
+                "--rank-auto-reserve-mib found no CUDA device to size against "
+                f"(placement {gpu_ids})."
+            )
+        if len(distinct) > 1:
+            raise ValueError(
+                "--rank-auto-reserve-mib is a single card-wide headroom, but "
+                f"this placement spans cards of different totals: {totals} "
+                "MiB. One --mem-fraction-static cannot be exact on all of "
+                "them; use --rank-gpu-id with a per-rank "
+                "--rank-auto-reserve-mib (or --rank-gpu-memory-mib) instead."
+            )
+        return distinct[0]
+
     def _apply_reserve_based_mem_fraction(self) -> None:
         """Size the DEFAULT placement path by a named reserve, not a fraction.
 
@@ -7314,8 +7453,6 @@ class ServerArgs:
         Requires one rank per GPU (the default placement) and a single node;
         with ``--rank-gpu-id`` the per-rank path owns the conversion instead.
         """
-        from sglang.srt.utils import get_device_memory_capacity
-
         if self.mem_fraction_static is not None:
             raise ValueError(
                 "--mem-fraction-static cannot be set together with "
@@ -7328,13 +7465,7 @@ class ServerArgs:
                 f"only (current: --nnodes {self.nnodes})."
             )
 
-        gpu_mem = get_device_memory_capacity(self.device)
-        if not gpu_mem:
-            raise ValueError(
-                "--rank-auto-reserve-mib needs the device's total memory, "
-                f"which could not be read for --device {self.device}."
-            )
-        gpu_mem = int(gpu_mem)
+        gpu_mem = self._reserve_device_total_mib()
 
         raw = str(self.rank_auto_reserve_mib)
         if "," in raw:
@@ -7372,10 +7503,11 @@ class ServerArgs:
         except Exception:  # pragma: no cover - advisory only
             derived_mib = None
         logger.info(
-            "Reserve-based sizing (#332): device total %d MiB, pinned reserve "
-            "%d MiB (the #68 demand model derives %s) -> "
+            "Reserve-based sizing (#332): CUDA device(s) %s, NVML total %d "
+            "MiB, pinned reserve %d MiB (the #68 demand model derives %s) -> "
             "--mem-fraction-static %.6f. The reserve is the ENTIRE headroom; "
             "no further margin, cap or rounding is applied on top.",
+            self._default_placement_gpu_ids(),
             gpu_mem,
             reserve_mib,
             f"{derived_mib} MiB" if derived_mib is not None else "no value here",
