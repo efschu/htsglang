@@ -46,6 +46,8 @@
 set -uo pipefail
 
 R10="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../dcp_report.sh
+source "$R10/../dcp_report.sh"
 WT="${WT:-/spinning/wt-340}"
 VENV="${VENV:-/spinning/htsglang-gpu/.venv}"
 PY="${PY:-$VENV/bin/python}"
@@ -294,6 +296,10 @@ run_arm() {  # $1 = label, $2 = config text, $3 = cvd, rest = extra flags
 
   local rc=1
   if wait_up "$label"; then
+    # HARNESS DUTY (#345): state the EFFECTIVE dcp geometry per arm. The env
+    # DCP flags only bite under --rank-tp-ratio, so an unprinted matrix
+    # compares two changes at once (that is what #340 did).
+    report_dcp "$label" "$RES/logs/${label}.server.log"
     timeout -k 10 "$(( PROBE_DEADLINE_S + 40 ))" \
       "$PY" "$R10/probe_arm.py" \
         --port "$PORT" --tokenizer "$MODEL" --tokens "$TOKENS" \

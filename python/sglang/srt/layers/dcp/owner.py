@@ -38,6 +38,7 @@ from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_t
 
 __all__ = [
     "build_dcp_weighted_kv_indices",
+    "dcp_accounting_total_slots",
     "dcp_compact_pool_rows",
     "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
@@ -113,6 +114,37 @@ def dcp_compact_pool_rows(global_tokens: int, cp_S: int, cp_ratio: int) -> int:
             "are only meaningful on the weighted lane."
         )
     return (int(global_tokens) // int(cp_S) + 1) * int(cp_ratio)
+
+
+def dcp_accounting_total_slots(
+    max_total_num_tokens: int,
+    allocator_size: Optional[int],
+    *,
+    token_sharded_dcp: bool,
+) -> int:
+    """The ``total`` a KV-slot leak check must compare ``available`` against.
+
+    ``available_size()`` counts the ALLOCATOR's index space, so the total it
+    is checked against has to be the same quantity. Off the token-sharded DCP
+    lane the two are the same number and this returns
+    ``max_total_num_tokens`` unchanged.
+
+    On the lane they can differ, and in exactly one direction. Under the
+    WEIGHTED owner rule ``max_total_num_tokens`` is already the GLOBAL context
+    budget C, which is also the allocator's index space -- nothing moves.
+    Under the EVEN-MODULO rule (``SGLANG_UNEVEN_DCP=1`` with
+    ``SGLANG_UNEVEN_DCP_WEIGHTED=0``) ``max_total_num_tokens`` is this rank's
+    PHYSICAL pool while the allocator hands out global slot ids over
+    ``max_total * cp_token_split_factor(dcp_size)`` of them. Comparing the two
+    made the first idle check report ``available`` at exactly ``dcp_size`` x
+    ``total`` and killed the server at boot -- "pool memory leak detected!
+    [full] total=28640, available=57280" (#345). The pool geometry was never
+    wrong there; one of the two scalars was simply not the quantity the other
+    one counts.
+    """
+    if not token_sharded_dcp or allocator_size is None:
+        return int(max_total_num_tokens)
+    return int(allocator_size)
 
 
 def swa_hybrid_dcp_lane(

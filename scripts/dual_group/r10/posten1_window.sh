@@ -22,6 +22,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/env.sh"
 source "$WT/scripts/dual_group/r7c/common.sh"
+# shellcheck source=../dcp_report.sh
+source "$HERE/../dcp_report.sh"
 
 STEP="${1:-all}"
 BUDGET_S="${BUDGET_S:-900}"
@@ -100,6 +102,9 @@ PY
     sleep 5
   done
   echo "  fp8 boot: up=$up after $(( $(date +%s) - t0 ))s"
+  # HARNESS DUTY (#345): this arm carries --rank-tp-ratio, so the env DCP
+  # flags DO bite here and not in a control without the ratio. Say so.
+  report_dcp "p1_fp8_lane" "$LOG" echo
 
   if [ "$up" = 1 ]; then
     # DRIVE A LANE JOB. Without this the forward under test never runs.

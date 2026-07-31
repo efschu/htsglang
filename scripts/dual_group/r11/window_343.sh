@@ -41,6 +41,8 @@
 set -uo pipefail
 
 R11="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../dcp_report.sh
+source "$R11/../dcp_report.sh"
 WT="${WT:-/spinning/wt-343-probe}"
 VENV="${VENV:-/spinning/htsglang-gpu/.venv}"
 PY="${PY:-$VENV/bin/python}"
@@ -220,6 +222,7 @@ COMMON_FLAGS=(
   --disable-radix-cache
   --cuda-graph-backend-decode disabled
   --cuda-graph-backend-prefill disabled
+  --enable-metrics
   --host 127.0.0.1 --port "$PORT"
 )
 
@@ -273,6 +276,11 @@ run_arm() {  # $1 = label, $2 = config text, $3 = cvd, rest = extra flags
 
   local rc=1
   if wait_up "$label"; then
+    # HARNESS DUTY (#345): every arm states its EFFECTIVE dcp geometry before
+    # it produces a number. The env DCP flags only bite under
+    # --rank-tp-ratio, so without this line a ratio arm and its control differ
+    # in two things at once and the matrix cannot say which one moved.
+    report_dcp "$label" "$RES/logs/${label}.server.log"
     # ARM the layer tap only now: boot warmup and memory profiling have run
     # their forwards, so astep 0 is the probe's first prefill in every arm.
     touch "$dump/ARM"
