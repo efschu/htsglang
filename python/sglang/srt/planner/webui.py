@@ -4925,6 +4925,220 @@ def share_rig_token_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "token_stored": rig_artifact.have_token()}
 
 
+# ===========================================================================
+# Task #342 -- Frontend IA v2: Models hub (registry M1 binding, read/write)
+# and a read-only Video & Media tab (M2 job list/progress).
+#
+# Both backends are their OWN, SEPARATE HTTP services -- the engine registry
+# (sglang.srt.registry.http_api, default port 8500) and the multimodal_gen
+# video-generation service (default port from its own launch flags) -- and
+# neither is mounted under this dashboard's port. The browser therefore never
+# calls them directly (a second origin is a CORS problem, and "which service
+# is this page allowed to talk to" should be one answer, not scattered
+# fetches); this module fetches BACKEND-SIDE instead, the same pattern
+# already used by _chat_completion() and quality_run_payload() above, and
+# mirrors the response back to the browser under this dashboard's own
+# /api/registry/* and /api/video/* paths.
+#
+# Rejections from the registry (PromotionRejected / RegistrationRejected /
+# UnknownEngineError / SpecError) are relayed WORD FOR WORD -- same status,
+# same JSON body. The registry composes these messages carefully (reason,
+# would-evict list, shortfall in MiB); rewording them here would just be a
+# second, drifting copy of the same sentence.
+# ===========================================================================
+
+DEFAULT_REGISTRY_URL = "http://127.0.0.1:8500"
+
+
+def _normalize_base(raw: Optional[str]) -> str:
+    raw = (raw or "").strip().rstrip("/")
+    if raw and not raw.startswith("http"):
+        raw = "http://" + raw
+    return raw
+
+
+def _registry_base(q: Optional[dict] = None) -> str:
+    """Resolution order: explicit ``?registry=`` override (mirrors the
+    landing tab's editable endpoint field) > ``SGLANG_REGISTRY_URL`` env >
+    the registry's own documented default port."""
+    q = q or {}
+    return _normalize_base(
+        q.get("registry")
+        or os.environ.get("SGLANG_REGISTRY_URL")
+        or DEFAULT_REGISTRY_URL
+    )
+
+
+def _video_base(q: Optional[dict] = None) -> str:
+    """No built-in default: the M2 video service is optional and
+    independently started, so an unset base is a real, honest 'not
+    configured' rather than a guessed port."""
+    q = q or {}
+    return _normalize_base(q.get("video") or os.environ.get("SGLANG_VIDEO_URL"))
+
+
+def _proxy_json(
+    url: str, method: str = "GET", body: Optional[dict] = None, timeout: float = 8.0
+):
+    """BACKEND-SIDE fetch of one JSON endpoint on another service (registry
+    or multimodal_gen), never called from the browser. Returns
+    ``(status, json_body)``. A genuine HTTP error response from the far side
+    is returned with ITS OWN status and JSON body, unchanged (see module
+    comment above); a connection failure (far service not running, wrong
+    port) has no far-side body to relay and instead synthesizes a
+    ``reachable: false`` payload."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, (json.loads(raw) if raw else {})
+        except Exception:  # pragma: no cover - defensive, non-JSON error body
+            return e.code, {
+                "error": "http_error",
+                "message": raw.decode(errors="replace"),
+            }
+    except Exception as e:
+        return 503, {
+            "ok": False,
+            "reachable": False,
+            "error": f"{url} unreachable: {e}",
+        }
+
+
+def registry_snapshot_payload(q: Optional[dict] = None) -> dict:
+    """GET /api/registry/snapshot -> the registry's own GET /registry,
+    unchanged: ``engines`` (one flat dict per EngineInstance -- engine_id,
+    klass, state, cards currently held, pinned, priority, ...), plus slots,
+    per-card ledger, default_hot and hot_capacity. The registry being
+    unreachable is an honest offline state for the Models hub to render,
+    not an exception page."""
+    base = _registry_base(q)
+    status, body = _proxy_json(base + "/registry", "GET")
+    ok = status == 200
+    return dict(
+        body, ok=ok, reachable=ok or bool(body.get("reachable")), registry_base=base
+    )
+
+
+def registry_cards_payload(q: Optional[dict] = None) -> dict:
+    """GET /api/registry/cards -> the registry's own GET /registry/cards
+    (per-card total/reserved/measured/corridor/waste), unchanged."""
+    base = _registry_base(q)
+    status, body = _proxy_json(base + "/registry/cards", "GET")
+    ok = status == 200
+    return dict(
+        body, ok=ok, reachable=ok or bool(body.get("reachable")), registry_base=base
+    )
+
+
+def registry_plan_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/registry/plan -> the registry's own POST /registry/plan: a
+    dry-run feasibility check for a spec that is NOT YET registered. Boots
+    and registers nothing. The registry's PlanResult (fits, cards,
+    feasible_without_eviction, shortfall_detail, would_evict, ...) is
+    relayed verbatim; a 4xx/5xx rejection keeps its original status and
+    message text -- see module comment."""
+    payload = dict(payload or {})
+    base = _registry_base({"registry": payload.pop("registry", None)})
+    with_planner = payload.pop("with_planner", None)
+    url = base + "/registry/plan"
+    if with_planner is not None:
+        url += f"?with_planner={'true' if with_planner else 'false'}"
+    status, body = _proxy_json(url, "POST", payload)
+    return dict(body, ok=status == 200, status=status, registry_base=base)
+
+
+def registry_register_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/registry/engines -> the registry's own POST
+    /registry/engines: validates feasibility and registers the spec WITHOUT
+    booting it -- an explicit Serve action (registry_state_payload with
+    target HOT) is the only thing that ever boots an engine. Rejections
+    (SpecError / RegistrationRejected) are relayed verbatim."""
+    payload = dict(payload or {})
+    base = _registry_base({"registry": payload.pop("registry", None)})
+    status, body = _proxy_json(base + "/registry/engines", "POST", payload)
+    return dict(body, ok=status == 200, status=status, registry_base=base)
+
+
+def registry_state_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/registry/state {engine_id, target, ...} -> the registry's
+    own POST /registry/engines/{id}/state. target=HOT is Serve; WARM_GPU or
+    COLD is Demote. A promotion the registry cannot currently afford comes
+    back as a 503 promotion_rejected with the reason, projected wait and the
+    would-evict list -- relayed unchanged, never reworded."""
+    payload = dict(payload or {})
+    engine_id = (payload.pop("engine_id", "") or "").strip()
+    base = _registry_base({"registry": payload.pop("registry", None)})
+    if not engine_id:
+        return {"ok": False, "error": "invalid_spec", "message": "engine_id required"}
+    status, body = _proxy_json(
+        base + f"/registry/engines/{engine_id}/state", "POST", payload
+    )
+    return dict(body, ok=status == 200, status=status, registry_base=base)
+
+
+def registry_delete_payload(payload: Optional[dict] = None) -> dict:
+    """DELETE /api/registry/engines {engine_id} -> the registry's own
+    DELETE /registry/engines/{id}: demotes to COLD, releases the ledger
+    hold, then deregisters the spec."""
+    payload = dict(payload or {})
+    engine_id = (payload.pop("engine_id", "") or "").strip()
+    base = _registry_base({"registry": payload.pop("registry", None)})
+    if not engine_id:
+        return {"ok": False, "error": "invalid_spec", "message": "engine_id required"}
+    status, body = _proxy_json(base + f"/registry/engines/{engine_id}", "DELETE")
+    return dict(body, ok=status == 200, status=status, registry_base=base)
+
+
+def video_jobs_payload(q: Optional[dict] = None) -> dict:
+    """GET /api/video/jobs -> the M2 video-generation service's own GET
+    /v1/videos (job list, each with a ``progress`` field). Read-only: this
+    tab creates nothing. No base URL configured, or the service unreachable,
+    is an honest OFFLINE state (``reachable: false``), not an error -- the
+    M2 service is optional and independently started."""
+    q = q or {}
+    base = _video_base(q)
+    if not base:
+        return {
+            "ok": True,
+            "reachable": False,
+            "jobs": [],
+            "note": "no video service configured "
+            "(set SGLANG_VIDEO_URL or pass ?video=host:port)",
+        }
+    url = base + "/v1/videos"
+    limit = q.get("limit")
+    if limit:
+        url += f"?limit={limit}"
+    status, body = _proxy_json(url, "GET")
+    if status == 200:
+        return {
+            "ok": True,
+            "reachable": True,
+            "video_base": base,
+            "jobs": body.get("data") or body.get("jobs") or [],
+        }
+    return {
+        "ok": False,
+        "reachable": False,
+        "video_base": base,
+        "error": body.get("error") or body.get("message") or f"http {status}",
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -5002,6 +5216,36 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/models"):
             try:
                 self._json(200, list_models_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        # Task #342 -- Models hub (registry M1) + Video & Media (M2), both
+        # read-only GETs. Longer, more specific prefixes first (flat
+        # startswith chain, same convention as /api/card_probe/status above).
+        if self.path.startswith("/api/registry/cards"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, registry_cards_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/registry/snapshot"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, registry_snapshot_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/video/jobs"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, video_jobs_payload(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -5383,6 +5627,19 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/version/cleanup"):
                 self._json(200, version_cleanup_payload(payload))
                 return
+            # Task #342 -- Models hub write actions (registry M1). Every one
+            # of these proxies to a real registry call; nothing here composes
+            # its own success/failure judgement (see module comment near
+            # registry_snapshot_payload above).
+            if self.path.startswith("/api/registry/plan"):
+                self._json(200, registry_plan_payload(payload))
+                return
+            if self.path.startswith("/api/registry/state"):
+                self._json(200, registry_state_payload(payload))
+                return
+            if self.path.startswith("/api/registry/engines"):
+                self._json(200, registry_register_payload(payload))
+                return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
             return
@@ -5407,6 +5664,14 @@ class _Handler(BaseHTTPRequestHandler):
                 q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                 q.update(payload or {})
                 self._json(200, bench_history_delete_payload(q))
+                return
+            # Task #342 -- Models hub Delete action (registry M1).
+            if self.path.startswith("/api/registry/engines"):
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                q.update(payload or {})
+                self._json(200, registry_delete_payload(q))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -6234,37 +6499,76 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <div id="loadbar" class="loadbar off">
   <span class="lb-name">reading the running server&hellip;</span></div>
 
-<!-- Navigation = the order of the work: watch the machine, configure it,
-     measure it, judge the answers, then the reference surfaces (what this
-     rig costs and what it can tell the project, a second rig) and finally
-     your own archive. One word per tab so the bar never scrolls; the long
-     form is the title attribute. Every entry is the same button in the same
-     strip -- no grown-in special cases.
-     The former "Rigs" tab (model x rig capacity matrix, and the per-rig
-     detail for one model that used to be its own "Landscape" tab) is gone;
-     both tools are questions the planner already answers, so they are now a
-     section of the Guide's expert step instead of a separate tab -- nothing
-     rendered there was lost, see the "capacity matrix" fieldset below.
-     Energy (per-card power calibration) and Rig data (comm benchmark + share
-     an anonymized profile) used to be two tabs answering the same underlying
-     question -- what this rig costs and what it can tell the project -- so
-     they are now one tab, Data, with both as sections. -->
-<div class="tabs">
-  <button id="tab_landing" class="tab active" onclick="showTab('landing')"
+<!-- Task #342 -- Frontend IA v2. Two-level navigation: a top-level, task-
+     oriented group bar (Models / Playground / Training / Video & Media /
+     Rig / Benchmarks / Settings, the same shape surveyed across
+     LLaMA-Factory WebUI, H2O LLM Studio, the OpenAI fine-tuning dashboard,
+     LM Studio and ComfyUI -- see docs/dev/IA_342_frontend_v2.md), and below
+     it the ORIGINAL per-tab bar, unchanged in id/onclick/content, now
+     filtered by JS (showGroup(), further down) to show only the active
+     group's own tabs. Nothing below was deleted or renamed at the DOM
+     level -- every existing tab_*/view_* pair, every poll/init hook keyed
+     to it in showTab(), is exactly where it was; only its home group and
+     its data-group attribute are new. This is why any script or link that
+     already knows a tab name (see NAV_GROUPS below) keeps resolving.
+
+     Group membership:
+       Models        -- NEW, Task #342: registry (M1) engine cards, Serve /
+                        Demote / Delete, add-by-HF-path dialog.
+       Playground    -- Guide (formerly the only top-level "Guide" tab):
+                        guided configuration, every deployment family with
+                        its numbers, and the full planner as the expert step.
+       Training      -- NEW, stub only (Task #341 builds the real thing).
+       Video & Media -- NEW, Task #342: read-only M2 video job list/progress.
+       Rig           -- Monitor (live monitor), Data (per-card power + comm
+                        benchmark + share), Pair rig (couple a second rig):
+                        three questions about the physical machine this
+                        dashboard runs on.
+       Benchmarks    -- Benchmark, Quality, History: run a suite, judge the
+                        answers, browse what was already run.
+       Settings      -- About / Update (dashboard version: install, update or
+                        roll back in place).
+
+     One word per group/tab button so neither bar ever scrolls; the long
+     form stays in the title attribute, same convention as before. -->
+<div class="tabs" id="nav_groups">
+  <button id="group_models" class="tab" onclick="showGroup('models')"
+    title="engine registry: serve, demote, delete, add a model">Models</button>
+  <button id="group_playground" class="tab" onclick="showGroup('playground')"
+    title="guided configuration and the full planner">Playground</button>
+  <button id="group_training" class="tab" onclick="showGroup('training')"
+    title="training jobs (stub -- coming: #341)">Training</button>
+  <button id="group_video" class="tab" onclick="showGroup('video')"
+    title="video / media generation jobs (read-only)">Video &amp; Media</button>
+  <button id="group_rig" class="tab active" onclick="showGroup('rig')"
+    title="live monitor, per-card power/energy data, pair a second rig">Rig</button>
+  <button id="group_bench" class="tab" onclick="showGroup('bench')"
+    title="behavioural benchmark suite, quality checks, recorded history">Benchmarks</button>
+  <button id="group_settings" class="tab" onclick="showGroup('settings')"
+    title="dashboard version: install, update or roll back in place">Settings</button>
+</div>
+<div class="tabs" id="sub_tabs">
+  <button id="tab_models" class="tab" data-group="models" onclick="showTab('models')"
+    title="engine registry: serve, demote, delete, add a model">Models</button>
+  <button id="tab_landing" class="tab active" data-group="rig" onclick="showTab('landing')"
     title="live monitor of any reachable sglang server">Monitor</button>
-  <button id="tab_wizard" class="tab" onclick="showTab('wizard')"
+  <button id="tab_wizard" class="tab" data-group="playground" onclick="showTab('wizard')"
     title="guided configuration: model, cards, every deployment family with its numbers, and the full planner as the expert step">Guide</button>
-  <button id="tab_bench" class="tab" onclick="showTab('bench')"
+  <button id="tab_bench" class="tab" data-group="bench" onclick="showTab('bench')"
     title="behavioural benchmark suite against a running server">Benchmark</button>
-  <button id="tab_quality" class="tab" onclick="showTab('quality')"
+  <button id="tab_quality" class="tab" data-group="bench" onclick="showTab('quality')"
     title="rendering / instruction-following checks">Quality</button>
-  <button id="tab_data" class="tab" onclick="showTab('data')"
+  <button id="tab_data" class="tab" data-group="rig" onclick="showTab('data')"
     title="per-card power calibration and energy per token; run the short comm benchmark and share an anonymized rig profile to improve the project">Data</button>
-  <button id="tab_pair" class="tab" onclick="showTab('pair')"
+  <button id="tab_pair" class="tab" data-group="rig" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
-  <button id="tab_history" class="tab" onclick="showTab('history')"
+  <button id="tab_history" class="tab" data-group="bench" onclick="showTab('history')"
     title="your own recorded benchmark runs: browse, filter, open, delete">History</button>
-  <button id="tab_about" class="tab" onclick="showTab('about')"
+  <button id="tab_training" class="tab" data-group="training" onclick="showTab('training')"
+    title="training jobs (stub -- coming: #341)">Training</button>
+  <button id="tab_video" class="tab" data-group="video" onclick="showTab('video')"
+    title="video / media generation jobs (read-only)">Video</button>
+  <button id="tab_about" class="tab" data-group="settings" onclick="showTab('about')"
     title="dashboard version: install, update or roll back in place">About / Update</button>
 </div>
 
@@ -7444,6 +7748,97 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       supervisor health-checks the new version and rolls back to the last good one
       automatically if it fails to come up. Plain --serve serves this launch
       checkout and can only install, not switch.</div>
+  </fieldset>
+</div>
+
+<!-- Task #342 -- Models hub: engine cards against the registry (M1) HTTP
+     API, proxied backend-side by registry_snapshot_payload() and friends
+     (see the Python module comment near those functions). Every action
+     button below is a real API call; there is nothing mocked here. An
+     unreachable registry is rendered as an honest offline state, not a
+     silent empty list. -->
+<div id="view_models" style="display:none">
+  <div class="sub">Engines known to the registry, with their residency state
+    (HOT = process up with weights/pools/graphs resident, WARM_GPU = process
+    up but kv-cache/graphs released, WARM_HOST = weights parked to host
+    memory, COLD = no process). Serve promotes to HOT; Demote drops to
+    WARM_GPU; Delete demotes to COLD and forgets the spec. A rejection
+    (does not fit, would need eviction beyond the caller's budget, ...) is
+    shown exactly as the registry worded it.</div>
+  <fieldset>
+    <legend>registry connection</legend>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+      <input id="mdl_registry" type="text" placeholder="127.0.0.1:8500"
+        style="min-width:14rem" oninput="modelsSaveBase()">
+      <button class="mini secondary" onclick="modelsPoll()">refresh</button>
+      <span id="mdl_conn" class="muted">loading&hellip;</span>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>engines</legend>
+    <div id="mdl_list" class="muted">loading&hellip;</div>
+  </fieldset>
+  <fieldset>
+    <legend>add an engine</legend>
+    <div class="sub">Validate composes an EngineSpec from the fields below and
+      asks the registry whether it would fit -- <b>nothing is booted or
+      registered</b>. Add does the same check and, if it passes, registers
+      the spec -- still without booting it; Serve is the only action that
+      ever starts a process.</div>
+    <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
+      <input id="mdl_new_id" type="text" placeholder="engine_id" style="width:12rem">
+      <select id="mdl_new_klass">
+        <option value="1">class 1 -- autoregressive (srt)</option>
+        <option value="2">class 2 -- diffusion (estimate-only in M1)</option>
+        <option value="3">class 3 -- utility</option>
+      </select>
+      <input id="mdl_new_model_path" type="text" placeholder="HF path or local model path"
+        style="min-width:18rem;flex:1 1 auto">
+    </div>
+    <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin-top:.4rem">
+      <input id="mdl_new_tp" type="number" min="1" value="1" style="width:5rem" title="tp_size">
+      <input id="mdl_new_placement" type="text" value="auto" style="width:10rem"
+        title="'auto' or a comma-separated list of card UUIDs">
+      <label class="muted"><input id="mdl_new_pinned" type="checkbox"> pinned</label>
+      <button class="mini secondary" onclick="modelsValidate()">Validate</button>
+      <button class="mini" onclick="modelsAdd()">Add</button>
+    </div>
+    <div id="mdl_new_result" style="margin-top:.4rem"></div>
+  </fieldset>
+</div>
+
+<!-- Task #342 -- Training tab. Stub only: the real training-job surface is
+     Task #341, not part of this IA-skeleton task. No API calls, no polling
+     -- there is nothing to bind to yet. -->
+<div id="view_training" style="display:none">
+  <div class="sub">Training is not part of this dashboard yet.</div>
+  <fieldset>
+    <legend>coming: #341</legend>
+    <div class="muted">This tab is a placeholder reserved by the navigation
+      skeleton (Task #342) for the training-job surface built in Task #341.
+      No training jobs can be started, listed or inspected from here.</div>
+  </fieldset>
+</div>
+
+<!-- Task #342 -- Video & Media tab: read-only binding to the M2 video-
+     generation service's job list (/v1/videos), proxied backend-side by
+     video_jobs_payload(). This service is optional and independently
+     started; "offline" here is an honest state, not an error. -->
+<div id="view_video" style="display:none">
+  <div class="sub">Job list and progress for the video-generation service, if
+    one is running. This tab creates nothing -- it only reads.</div>
+  <fieldset>
+    <legend>video service connection</legend>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+      <input id="vid_base" type="text" placeholder="host:port (leave empty if not running)"
+        style="min-width:16rem" oninput="videoSaveBase()">
+      <button class="mini secondary" onclick="videoPoll()">refresh</button>
+      <span id="vid_conn" class="muted">loading&hellip;</span>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>jobs</legend>
+    <div id="vid_list" class="muted">loading&hellip;</div>
   </fieldset>
 </div>
 
@@ -8705,10 +9100,16 @@ async function csForgetToken(){
 // likewise absent -- the capacity matrix is now the Guide's last expert
 // section (loadProfiles() below moved with it, guarded the same way).
 function showTab(t) {
-  const TABS = ['landing','wizard','bench','quality','data','pair','history','about'];
+  const TABS = ['landing','wizard','bench','quality','data','pair','history','about',
+                'models','training','video'];
   window._tab = t;
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
+  // Task #342 -- keep the group bar and the visible sub-tab row in sync with
+  // whatever tab just became active, however it was reached (a group-bar
+  // click, a direct showTab() call, or the hash router below).
+  const g = tabGroup(t);
+  if (g) { _groupLastTab[g] = t; syncGroupBar(g); }
   // The archive is re-read on every entry, not once: a run that finished
   // while another tab was open must be there when you come back to look.
   if (t==='history') historyLoad();
@@ -8755,6 +9156,242 @@ function showTab(t) {
   // The expert step opens on the RUNNING configuration when there is one: the
   // useful default is what is loaded, not an empty form.
   if (t==='wizard') prefillFromRunning();
+  // Task #342 -- Models hub and Video & Media poll only while their own tab
+  // is visible, same convention as the landing/data/pair polls above.
+  if (t==='models') startModels(); else stopModels();
+  if (t==='video') startVideo(); else stopVideo();
+  // Deep-linkable: #<group>/<tab>, so a reload or a shared link lands on the
+  // same tab instead of always back on 'landing' (see hash router below).
+  try { history.replaceState(null, '', '#'+g+'/'+t); } catch(e){}
+}
+
+// ===========================================================================
+// Task #342 -- top-level navigation groups. The bar above the original
+// per-tab row (#nav_groups) is purely a filter over which tab_* buttons in
+// #sub_tabs are visible; the tabs themselves, their ids and their onclick
+// targets are unchanged. A group with more than one tab remembers which of
+// its own tabs was last open (_groupLastTab) so switching away and back
+// does not reset to the group's first tab.
+// ===========================================================================
+const NAV_GROUPS = {
+  models:     {tabs: ['models']},
+  playground: {tabs: ['wizard']},
+  training:   {tabs: ['training']},
+  video:      {tabs: ['video']},
+  rig:        {tabs: ['landing','data','pair']},
+  bench:      {tabs: ['bench','quality','history']},
+  settings:   {tabs: ['about']},
+};
+const _groupLastTab = {};
+function tabGroup(t){
+  for (const g in NAV_GROUPS) if (NAV_GROUPS[g].tabs.includes(t)) return g;
+  return null;
+}
+// Only updates which buttons are ACTIVE/visible; never calls showTab (that
+// would recurse -- showTab calls this, not the other way round).
+function syncGroupBar(g){
+  for (const k in NAV_GROUPS) {
+    const b = $('group_'+k);
+    if (b) b.classList.toggle('active', k===g);
+  }
+  document.querySelectorAll('#sub_tabs .tab[data-group]').forEach(function(btn){
+    btn.style.display = (btn.getAttribute('data-group')===g) ? '' : 'none';
+  });
+}
+function showGroup(g){
+  const tabs = (NAV_GROUPS[g]||{}).tabs;
+  if (!tabs) return;
+  showTab(_groupLastTab[g] || tabs[0]);
+}
+// Deep links: '#rig/landing', '#models', ... A bare '#models' (no /tab)
+// opens that group's first/remembered tab. An unknown or missing hash is
+// the existing default (landing/'Monitor'), not an error.
+function routeFromHash(){
+  const h = (location.hash||'').replace(/^#/,'');
+  if (!h) return;
+  const parts = h.split('/');
+  const g = parts[0];
+  const t = parts[1];
+  if (t && tabGroup(t)===g) showTab(t);
+  else if (NAV_GROUPS[g]) showGroup(g);
+}
+window.addEventListener('hashchange', routeFromHash);
+
+// ===========================================================================
+// Task #342 -- Models hub. Every function below calls a real registry
+// endpoint through this dashboard's own /api/registry/* proxy (see the
+// Python module comment near registry_snapshot_payload for why the browser
+// never talks to the registry's port directly). A rejection body's
+// `message`/`error` text is rendered EXACTLY as received -- never rewritten,
+// never summarized -- because the registry already states the reason, the
+// projected wait and what would be evicted in one sentence.
+// ===========================================================================
+function mdlRegistryBase(){
+  try{ return (localStorage.getItem('mdl_registry')||'').trim(); }catch(e){ return ''; }
+}
+function modelsSaveBase(){
+  const v=($('mdl_registry').value||'').trim();
+  try{ if(v) localStorage.setItem('mdl_registry', v); else localStorage.removeItem('mdl_registry'); }catch(e){}
+}
+function startModels(){
+  if (window._mdlTimer) return;
+  if (!$('mdl_registry').value) $('mdl_registry').value = mdlRegistryBase();
+  modelsPoll();
+  window._mdlTimer = setInterval(modelsPoll, 4000);
+}
+function stopModels(){ if(window._mdlTimer){ clearInterval(window._mdlTimer); window._mdlTimer=null; } }
+const RESIDENCY_LABEL = {HOT:'HOT', WARM_GPU:'WARM_GPU', WARM_HOST:'WARM_HOST', COLD:'COLD'};
+async function modelsPoll(){
+  const q = mdlRegistryBase() ? ('?registry='+encodeURIComponent(mdlRegistryBase())) : '';
+  let d;
+  try{ d = await api('/api/registry/snapshot'+q, {key:'mdl_snapshot'}); }
+  catch(e){ if(apiAborted(e)) return; $('mdl_conn').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; return; }
+  if (!d.reachable) {
+    $('mdl_conn').innerHTML='<span class="reasons">registry unreachable at '
+      +esc(d.registry_base||'')+(d.error?(': '+esc(d.error)):'')+'</span>';
+    $('mdl_list').innerHTML='<span class="muted">no engines to show -- the registry '
+      +'is not reachable. Start it with <code>python -m sglang.srt.registry</code> '
+      +'or point this tab at the right host:port above.</span>';
+    return;
+  }
+  $('mdl_conn').innerHTML='<span class="pill">connected: '+esc(d.registry_base)+'</span>';
+  // Shape: registry's own GET /registry -> {"engines": [EngineInstance.to_json(), ...]}
+  // (registry/spec.py EngineInstance.to_json): engine_id, klass, state, cards
+  // (the physical cards CURRENTLY held -- empty while COLD/not yet promoted),
+  // pinned, priority. Relayed as-is; nothing here is renamed or reshaped.
+  const engines = d.engines || [];
+  if (!engines.length) { $('mdl_list').innerHTML='<span class="muted">no engines registered yet -- add one below.</span>'; return; }
+  let h='';
+  engines.slice().sort((a,b)=>(a.engine_id||'').localeCompare(b.engine_id||'')).forEach(function(e){
+    const id = e.engine_id;
+    const state = e.state || 'COLD';
+    h += '<div class="adv" data-engine="'+esc(id)+'">'
+      + '<b>'+esc(id)+'</b> <span class="pill">'+esc(RESIDENCY_LABEL[state]||state)+'</span>'
+      + (e.pinned?' <span class="pill">pinned</span>':'')
+      + ' <span class="muted">klass '+esc(e.klass)+'</span>'
+      + '<div class="muted">cards: '+esc((e.cards||[]).join(', ')||'none held yet')+'</div>'
+      + '<div class="actions">'
+      +   '<button class="mini" onclick="modelsServe(\''+esc(id)+'\')">Serve</button>'
+      +   '<button class="mini secondary" onclick="modelsDemote(\''+esc(id)+'\')">Demote</button>'
+      +   '<button class="mini secondary" onclick="modelsDelete(\''+esc(id)+'\')">Delete</button>'
+      + '</div>'
+      + '<div id="mdl_msg_'+esc(id)+'"></div>'
+      + '</div>';
+  });
+  $('mdl_list').innerHTML = h;
+}
+function mdlRejectionText(d){
+  // The registry's own wording, whichever shape it came back in -- relayed,
+  // never rephrased (see module comment above).
+  return d.message || d.shortfall_detail || d.error || ('http '+d.status);
+}
+async function modelsAction(id, target){
+  const msg = $('mdl_msg_'+id);
+  if (msg) msg.textContent = 'working…';
+  try{
+    const d = await api('/api/registry/state', {body:{engine_id:id, target:target,
+      registry: mdlRegistryBase()||undefined}});
+    if (msg) msg.innerHTML = d.ok ? '' : '<span class="reasons">'+esc(mdlRejectionText(d))+'</span>';
+  }catch(e){ if(!apiAborted(e) && msg) msg.innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; }
+  modelsPoll();
+}
+function modelsServe(id){ modelsAction(id, 'HOT'); }
+function modelsDemote(id){ modelsAction(id, 'WARM_GPU'); }
+async function modelsDelete(id){
+  if (!confirm('Delete engine '+id+'? This demotes it to COLD and forgets the spec.')) return;
+  const msg = $('mdl_msg_'+id);
+  try{
+    const d = await api('/api/registry/engines', {method:'DELETE',
+      body:{engine_id:id, registry: mdlRegistryBase()||undefined}});
+    if (!d.ok && msg) msg.innerHTML='<span class="reasons">'+esc(mdlRejectionText(d))+'</span>';
+  }catch(e){ if(!apiAborted(e) && msg) msg.innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; }
+  modelsPoll();
+}
+function mdlNewSpec(){
+  const placementRaw = ($('mdl_new_placement').value||'auto').trim();
+  const placement = placementRaw==='auto' ? ['auto'] : placementRaw.split(',').map(s=>s.trim()).filter(Boolean);
+  const klass = parseInt($('mdl_new_klass').value, 10);
+  const adapter = klass===2 ? 'class2_diffusion' : (klass===3 ? 'class3_utility' : 'class1_srt');
+  return {
+    engine_id: ($('mdl_new_id').value||'').trim(),
+    klass: klass,
+    adapter: adapter,
+    launch: {model_path: ($('mdl_new_model_path').value||'').trim(),
+             tp_size: parseInt($('mdl_new_tp').value,10)||1},
+    placement: placement,
+    pinned: !!$('mdl_new_pinned').checked,
+    registry: mdlRegistryBase()||undefined,
+  };
+}
+function mdlRenderPlan(d){
+  if (!d.ok) return '<span class="reasons">'+esc(mdlRejectionText(d))+'</span>';
+  let h = '<span class="pill">fits: '+(d.fits?'yes':'no')+'</span>';
+  if (d.feasible_without_eviction===false) h += ' <span class="pill">needs eviction</span>';
+  if (d.would_evict && d.would_evict.length) h += ' <span class="pill">would evict: '+esc(d.would_evict.join(', '))+'</span>';
+  if (d.shortfall_detail) h += '<div class="reasons">'+esc(d.shortfall_detail)+'</div>';
+  if (d.reason) h += '<div class="muted">'+esc(d.reason)+'</div>';
+  return h;
+}
+async function modelsValidate(){
+  $('mdl_new_result').innerHTML='validating…';
+  try{
+    const d = await api('/api/registry/plan', {body: mdlNewSpec()});
+    $('mdl_new_result').innerHTML = mdlRenderPlan(d);
+  }catch(e){ if(!apiAborted(e)) $('mdl_new_result').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; }
+}
+async function modelsAdd(){
+  $('mdl_new_result').innerHTML='adding…';
+  try{
+    const d = await api('/api/registry/engines', {body: mdlNewSpec()});
+    $('mdl_new_result').innerHTML = d.ok
+      ? '<span class="pill">registered: '+esc(d.plan? (d.plan.engine_id||''): '')+'</span>'
+      : '<span class="reasons">'+esc(mdlRejectionText(d))+'</span>';
+    if (d.ok) modelsPoll();
+  }catch(e){ if(!apiAborted(e)) $('mdl_new_result').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; }
+}
+
+// ===========================================================================
+// Task #342 -- Video & Media. Read-only: no action here creates, cancels or
+// deletes a job. An unset/unreachable video service renders as an honest
+// offline state (see video_jobs_payload's module comment), not an error.
+// ===========================================================================
+function vidBase(){
+  try{ return (localStorage.getItem('vid_base')||'').trim(); }catch(e){ return ''; }
+}
+function videoSaveBase(){
+  const v=($('vid_base').value||'').trim();
+  try{ if(v) localStorage.setItem('vid_base', v); else localStorage.removeItem('vid_base'); }catch(e){}
+}
+function startVideo(){
+  if (window._vidTimer) return;
+  if (!$('vid_base').value) $('vid_base').value = vidBase();
+  videoPoll();
+  window._vidTimer = setInterval(videoPoll, 4000);
+}
+function stopVideo(){ if(window._vidTimer){ clearInterval(window._vidTimer); window._vidTimer=null; } }
+async function videoPoll(){
+  const q = vidBase() ? ('?video='+encodeURIComponent(vidBase())) : '';
+  let d;
+  try{ d = await api('/api/video/jobs'+q, {key:'vid_jobs'}); }
+  catch(e){ if(apiAborted(e)) return; $('vid_conn').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; return; }
+  if (!d.reachable) {
+    $('vid_conn').innerHTML='<span class="muted">'+esc(d.note||d.error||'video service offline')+'</span>';
+    $('vid_list').innerHTML='<span class="muted">no jobs to show -- the video service is offline.</span>';
+    return;
+  }
+  $('vid_conn').innerHTML='<span class="pill">connected: '+esc(d.video_base)+'</span>';
+  const jobs = d.jobs || [];
+  if (!jobs.length) { $('vid_list').innerHTML='<span class="muted">no jobs.</span>'; return; }
+  let h='<div class="lp-wrap"><table class="lp"><thead><tr><th style="text-align:left">id</th>'
+    +'<th style="text-align:left">status</th><th>progress</th><th style="text-align:left">created</th></tr></thead><tbody>';
+  jobs.forEach(function(j){
+    h += '<tr><td style="text-align:left">'+esc(j.id||'')+'</td>'
+       + '<td style="text-align:left">'+esc(j.status||'')+'</td>'
+       + '<td>'+esc(j.progress!=null?j.progress:'')+'</td>'
+       + '<td style="text-align:left">'+esc(j.created_at||'')+'</td></tr>';
+  });
+  h += '</tbody></table></div>';
+  $('vid_list').innerHTML = h;
 }
 
 // ===========================================================================
@@ -14132,8 +14769,11 @@ async function shareSubmit(){
 
 // The page opens the way it was left: simple unless expert was chosen.
 applyViewMode();
-// Landing is the default view (live monitor of any reachable server).
+// Landing is the default view (live monitor of any reachable server); a
+// deep link (#rig/landing, #models, ...) overrides that default -- Task
+// #342, see routeFromHash() above.
 showTab('landing');
+routeFromHash();
 // The loaded-model bar is above the tabs, so it is filled before any tab
 // asks for anything, and then kept alive by a slow fallback poll for the
 // tabs that do not poll at all.

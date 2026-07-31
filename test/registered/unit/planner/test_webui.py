@@ -3776,12 +3776,35 @@ class TestConsolidatedNavigation(CustomTestCase):
     Data tab (same underlying question: what this rig costs, what it can
     tell the project). All of these are structural claims that a later edit
     could quietly undo, so they are pinned here.
+
+    Task #342 (Frontend IA v2) added a top-level nav-group bar over this
+    same tab strip and three new tabs -- Models (registry hub), Training
+    (stub, #341) and Video & Media (M2, read-only) -- without deleting,
+    renaming or reordering any pre-existing tab_*/view_* pair; see
+    NAV_GROUPS in the embedded script and TestFrontendIAv2NavMapping below
+    for the group-level assertions. ORDER below is the DOM order of the
+    #sub_tabs bar as it stands after that change.
     """
 
     # "about" sits last on purpose: it is not a workflow step but the
     # dashboard's own version management (install / update / roll back).
-    ORDER = ["landing", "wizard", "bench", "quality", "data",
-             "pair", "history", "about"]
+    # "models" leads (Task #342: the Models hub is the new primary landing
+    # concern for "what can this rig serve"); "training"/"video" are appended
+    # after the pre-existing workflow tabs, keeping every old tab's relative
+    # order unchanged.
+    ORDER = [
+        "models",
+        "landing",
+        "wizard",
+        "bench",
+        "quality",
+        "data",
+        "pair",
+        "history",
+        "training",
+        "video",
+        "about",
+    ]
 
     def test_tab_order_is_the_workflow_order(self):
         html = webui.INDEX_HTML
@@ -3853,6 +3876,357 @@ class TestConsolidatedNavigation(CustomTestCase):
         for gone in ('id="mx_models"', 'id="mx_rigs"', 'id="mx_cards"',
                      '<textarea id="mx'):
             self.assertNotIn(gone, guide, gone)
+
+
+# ===========================================================================
+# Task #342 -- Frontend IA v2: nav-group skeleton (Models / Playground /
+# Training / Video & Media / Rig / Benchmarks / Settings) over the
+# pre-existing tab strip, plus the Models hub's binding to the registry
+# (M1) API and the Video & Media tab's binding to the M2 job list.
+# ===========================================================================
+
+
+def _nav_groups_js() -> str:
+    """The body of the NAV_GROUPS object literal in the embedded script."""
+    html = webui.INDEX_HTML
+    m = re.search(r"const NAV_GROUPS = \{(.*?)\n\};", html, re.S)
+    assert m, "NAV_GROUPS object not found in INDEX_HTML"
+    return m.group(1)
+
+
+class TestFrontendIAv2NavMapping(CustomTestCase):
+    """Every pre-existing tab keeps its tab_*/view_* pair and its entry in
+    showTab()'s TABS array (TestConsolidatedNavigation covers that); this
+    class pins the NEW grouping layer added on top: every tab -- old and
+    new -- belongs to exactly one nav group, every group has a clickable
+    button, and the three brand-new tabs (models/training/video) are wired
+    the same way the pre-existing ones are.
+    """
+
+    # Every tab that must be reachable after the IA v2 change, old or new.
+    ALL_TABS = [
+        "landing",
+        "wizard",
+        "bench",
+        "quality",
+        "data",
+        "pair",
+        "history",
+        "about",
+        "models",
+        "training",
+        "video",
+    ]
+    GROUPS = ["models", "playground", "training", "video", "rig", "bench", "settings"]
+
+    def test_every_group_has_a_clickable_button(self):
+        html = webui.INDEX_HTML
+        for g in self.GROUPS:
+            self.assertIn(f'id="group_{g}"', html, g)
+            self.assertIn(f"showGroup('{g}')", html, g)
+
+    def test_nav_groups_js_partitions_every_tab_exactly_once(self):
+        js = _nav_groups_js()
+        seen = []
+        for m in re.finditer(r"tabs:\s*\[([^\]]*)\]", js):
+            names = re.findall(r"'([a-z]+)'", m.group(1))
+            seen.extend(names)
+        self.assertEqual(sorted(seen), sorted(self.ALL_TABS))
+        # exactly once each -- a tab claimed by two groups would be reachable
+        # from one but "active" in both, a state the group bar can't render.
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_new_tabs_have_view_and_data_group(self):
+        html = webui.INDEX_HTML
+        expect_group = {"models": "models", "training": "training", "video": "video"}
+        for tab, group in expect_group.items():
+            self.assertIn(f'id="tab_{tab}"', html, tab)
+            self.assertIn(f'id="view_{tab}"', html, tab)
+            m = re.search(r'id="tab_' + tab + r'"[^>]*data-group="([a-z]+)"', html)
+            self.assertIsNotNone(m, tab)
+            self.assertEqual(m.group(1), group, tab)
+
+    def test_old_tabs_each_carry_a_data_group_attribute(self):
+        # The pre-#342 tabs were not renamed or moved in the DOM -- only
+        # tagged with which group now shows/hides them.
+        html = webui.INDEX_HTML
+        old = [
+            "landing",
+            "wizard",
+            "bench",
+            "quality",
+            "data",
+            "pair",
+            "history",
+            "about",
+        ]
+        for tab in old:
+            m = re.search(r'id="tab_' + tab + r'"[^>]*data-group="([a-z]+)"', html)
+            self.assertIsNotNone(m, tab)
+            self.assertIn(m.group(1), self.GROUPS, tab)
+
+    def test_showgroup_and_hash_router_are_defined(self):
+        html = webui.INDEX_HTML
+        for needle in (
+            "function showGroup(",
+            "function routeFromHash(",
+            "function syncGroupBar(",
+            "function tabGroup(",
+        ):
+            self.assertIn(needle, html, needle)
+
+    def test_deep_link_hash_is_written_on_tab_switch(self):
+        html = webui.INDEX_HTML
+        self.assertIn("history.replaceState(null, '', '#'+g+'/'+t)", html)
+
+
+class TestFrontendIAv2RegistryHub(CustomTestCase):
+    """Models hub <-> registry (M1) binding. Every call is exercised through
+    ``webui._proxy_json`` mocked to hand back the exact (status, body) the
+    real registry would -- including its rejection shapes -- so these tests
+    pin that the dashboard relays them VERBATIM rather than composing its
+    own wording (Task #342 scope item 3)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("SGLANG_REGISTRY_URL", None)
+        os.environ.pop("SGLANG_VIDEO_URL", None)
+
+    def test_registry_base_resolution_order(self):
+        # query override > env > documented default (§ same convention as
+        # the landing tab's editable endpoint).
+        self.assertEqual(webui._registry_base({}), "http://127.0.0.1:8500")
+        os.environ["SGLANG_REGISTRY_URL"] = "10.0.0.5:9000"
+        try:
+            self.assertEqual(webui._registry_base({}), "http://10.0.0.5:9000")
+            self.assertEqual(
+                webui._registry_base({"registry": "other:1234"}), "http://other:1234"
+            )
+        finally:
+            os.environ.pop("SGLANG_REGISTRY_URL", None)
+
+    def test_snapshot_reachable_relays_body_verbatim(self):
+        # Real shape of GET /registry (arbiter.EngineRegistry.snapshot() /
+        # spec.EngineInstance.to_json()): a flat "engines" list, not a
+        # separate specs/instances mapping.
+        body = {
+            "engines": [
+                {
+                    "engine_id": "qwen",
+                    "klass": 1,
+                    "state": "HOT",
+                    "cards": ["GPU-1"],
+                    "pinned": False,
+                    "priority": 0,
+                }
+            ],
+            "slots": [],
+            "cards": [],
+            "default_hot": [],
+            "max_hot": None,
+        }
+        with mock.patch.object(webui, "_proxy_json", return_value=(200, dict(body))):
+            out = webui.registry_snapshot_payload({})
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["reachable"])
+        self.assertEqual(out["engines"], body["engines"])
+
+    def test_snapshot_unreachable_is_honest_offline_state(self):
+        with mock.patch.object(
+            webui,
+            "_proxy_json",
+            return_value=(
+                503,
+                {
+                    "ok": False,
+                    "reachable": False,
+                    "error": "http://127.0.0.1:8500/registry unreachable: "
+                    "[Errno 111] Connection refused",
+                },
+            ),
+        ):
+            out = webui.registry_snapshot_payload({})
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["reachable"])
+        self.assertIn("Connection refused", out["error"])
+
+    def test_plan_rejection_message_is_relayed_verbatim(self):
+        # Shape of RegistrationRejected / a plan that does not fit (see
+        # registry/arbiter.py PlanResult / RegistrationRejected.to_json()).
+        rejection_text = (
+            "engine 'qwen-27b' would take about 42000 ms to promote "
+            "(estimated), which exceeds the caller's budget of 5000 ms. "
+            "Getting there would evict ['other-engine']. Wait, raise the "
+            "budget, or use an engine that is already hot."
+        )
+        body = {
+            "engine_id": "qwen-27b",
+            "fits": False,
+            "feasible_without_eviction": False,
+            "shortfall_detail": "does not fit: card X short by 4096 MiB",
+            "would_evict": ["other-engine"],
+            "reason": rejection_text,
+        }
+        with mock.patch.object(webui, "_proxy_json", return_value=(200, dict(body))):
+            out = webui.registry_plan_payload({"engine_id": "qwen-27b", "klass": 1})
+        self.assertTrue(out["ok"])
+        # Not reworded, not truncated, not summarized -- byte for byte.
+        self.assertEqual(out["reason"], rejection_text)
+        self.assertEqual(out["shortfall_detail"], body["shortfall_detail"])
+        self.assertEqual(out["would_evict"], ["other-engine"])
+
+    def test_register_rejection_400_is_relayed_with_original_status(self):
+        message = (
+            "engine 'x' cannot fit on this rig even with every other "
+            "tenant evicted: does not fit: card Y short by 2048 MiB"
+        )
+        with mock.patch.object(
+            webui,
+            "_proxy_json",
+            return_value=(
+                400,
+                {
+                    "error": "registration_rejected",
+                    "message": message,
+                    "detail": "full report text",
+                },
+            ),
+        ):
+            out = webui.registry_register_payload({"engine_id": "x", "klass": 1})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], 400)
+        self.assertEqual(out["message"], message)
+        self.assertEqual(out["detail"], "full report text")
+
+    def test_promotion_rejected_503_shape_is_relayed_unchanged(self):
+        body = {
+            "error": "promotion_rejected",
+            "engine_id": "qwen-27b",
+            "message": "engine 'qwen-27b' would take about 42000 ms to promote",
+            "projected_wait_ms": 42000.0,
+            "projected_wait_is_estimated": True,
+            "would_evict": ["other-engine"],
+            "shortfalls": [
+                {
+                    "card_uuid": "GPU-1",
+                    "requested_bytes": 1,
+                    "held_bytes": 2,
+                    "corridor_bytes": 3,
+                    "total_bytes": 4,
+                    "shortfall_bytes": 5,
+                    "holders": ["other-engine"],
+                }
+            ],
+        }
+        with mock.patch.object(webui, "_proxy_json", return_value=(503, dict(body))):
+            out = webui.registry_state_payload(
+                {"engine_id": "qwen-27b", "target": "HOT"}
+            )
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], 503)
+        self.assertEqual(out["message"], body["message"])
+        self.assertEqual(out["shortfalls"], body["shortfalls"])
+        self.assertEqual(out["would_evict"], ["other-engine"])
+
+    def test_state_change_without_engine_id_never_calls_the_registry(self):
+        with mock.patch.object(webui, "_proxy_json") as proxy:
+            out = webui.registry_state_payload({"target": "HOT"})
+        proxy.assert_not_called()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "invalid_spec")
+
+    def test_delete_without_engine_id_never_calls_the_registry(self):
+        with mock.patch.object(webui, "_proxy_json") as proxy:
+            out = webui.registry_delete_payload({})
+        proxy.assert_not_called()
+        self.assertFalse(out["ok"])
+
+    def test_delete_success_relays_deregistered_id(self):
+        with mock.patch.object(
+            webui,
+            "_proxy_json",
+            return_value=(200, {"deregistered": "qwen-27b"}),
+        ) as proxy:
+            out = webui.registry_delete_payload({"engine_id": "qwen-27b"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["deregistered"], "qwen-27b")
+        # DELETE to the per-engine path, not the collection path.
+        args, kwargs = proxy.call_args
+        self.assertTrue(args[0].endswith("/registry/engines/qwen-27b"))
+        self.assertEqual(args[1], "DELETE")
+
+    def test_cards_payload_relays_per_card_ledger_unchanged(self):
+        cards = [
+            {
+                "card_uuid": "GPU-1",
+                "total_bytes": 100,
+                "reserved_bytes": 40,
+                "measured_bytes": 38,
+                "corridor_bytes": 5,
+                "waste_bytes": 2,
+            }
+        ]
+        with mock.patch.object(
+            webui, "_proxy_json", return_value=(200, {"cards": cards})
+        ):
+            out = webui.registry_cards_payload({})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["cards"], cards)
+
+
+class TestFrontendIAv2VideoTab(CustomTestCase):
+    """Video & Media tab <-> M2 job-list binding. Read-only: no test here
+    calls anything but the GET path. An unconfigured or unreachable service
+    is an honest offline state, not an error (module docstring on
+    video_jobs_payload)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("SGLANG_VIDEO_URL", None)
+
+    def test_no_base_configured_is_offline_without_a_network_attempt(self):
+        with mock.patch.object(webui, "_proxy_json") as proxy:
+            out = webui.video_jobs_payload({})
+        proxy.assert_not_called()
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["reachable"])
+        self.assertEqual(out["jobs"], [])
+
+    def test_reachable_service_relays_job_list(self):
+        jobs = [
+            {
+                "id": "vid_1",
+                "status": "completed",
+                "progress": 100,
+                "created_at": "2026-07-01T00:00:00Z",
+            }
+        ]
+        with mock.patch.object(
+            webui, "_proxy_json", return_value=(200, {"data": jobs})
+        ):
+            out = webui.video_jobs_payload({"video": "127.0.0.1:9100"})
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["reachable"])
+        self.assertEqual(out["jobs"], jobs)
+
+    def test_configured_but_unreachable_is_offline_not_an_error_page(self):
+        with mock.patch.object(
+            webui,
+            "_proxy_json",
+            return_value=(
+                503,
+                {
+                    "ok": False,
+                    "reachable": False,
+                    "error": "http://127.0.0.1:9100/v1/videos "
+                    "unreachable: [Errno 111] Connection refused",
+                },
+            ),
+        ):
+            out = webui.video_jobs_payload({"video": "127.0.0.1:9100"})
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["reachable"])
+        self.assertIn("Connection refused", out["error"])
 
 
 class TestCapacityMatrixIsChipDriven(CustomTestCase):
