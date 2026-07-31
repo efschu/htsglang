@@ -26,9 +26,13 @@ class FusedAGemmBackend(str, Enum):
     CUTEDSL = "cutedsl"
 
 
-_AUTO_BACKEND = (
-    FusedAGemmBackend.CUTEDSL if is_sm120_supported() else FusedAGemmBackend.JIT
-)
+def _auto_backend(device_id: int | None = None) -> "FusedAGemmBackend":
+    """Per device, not an import-time device-0 constant (#343)."""
+    return (
+        FusedAGemmBackend.CUTEDSL
+        if is_sm120_supported(device_id)
+        else FusedAGemmBackend.JIT
+    )
 
 
 def dsv3_fused_a_gemm(
@@ -39,7 +43,7 @@ def dsv3_fused_a_gemm(
 ) -> torch.Tensor:
     backend = FusedAGemmBackend(backend)
     if backend == FusedAGemmBackend.AUTO:
-        backend = _AUTO_BACKEND
+        backend = _auto_backend(mat_a.device.index)
 
     if backend == FusedAGemmBackend.AOT:
         from sgl_kernel import dsv3_fused_a_gemm as impl

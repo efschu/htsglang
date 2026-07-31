@@ -31,9 +31,26 @@ from sglang.srt.utils import common
 
 
 @contextlib.contextmanager
+def _mocked_capability():
+    """Per-device capability caches must not leak between mocked contexts.
+
+    The gates are cached per device id (#343); a mocked context changes what
+    the underlying probe answers for the SAME id, which no production caller
+    can do. Cleared on both edges so the order of the tests cannot matter.
+    """
+    common.clear_per_device_gate_caches()
+    try:
+        yield
+    finally:
+        common.clear_per_device_gate_caches()
+
+
+@contextlib.contextmanager
 def nvidia(capability=(9, 0)):
     """A mocked NVIDIA context reporting ``capability``."""
-    with mock.patch.object(common, "is_cuda", lambda: True), mock.patch.object(
+    with _mocked_capability(), mock.patch.object(
+        common, "is_cuda", lambda: True
+    ), mock.patch.object(
         common, "get_device_capability_no_init", lambda device=None: capability
     ), mock.patch.object(
         common.torch, "version", types.SimpleNamespace(hip=None, cuda="12.8")
@@ -46,7 +63,9 @@ def rocm(arch="gfx942", capability=(9, 4)):
     """A mocked ROCm context: torch.version.hip set, gfx arch reported, and the
     capability tuple torch derives from it -- the colliding number."""
     props = types.SimpleNamespace(gcnArchName=f"{arch}:sramecc+:xnack-")
-    with mock.patch.object(common, "is_cuda", lambda: False), mock.patch.object(
+    with _mocked_capability(), mock.patch.object(
+        common, "is_cuda", lambda: False
+    ), mock.patch.object(
         common, "get_device_capability_no_init", lambda device=None: capability
     ), mock.patch.object(
         common.torch, "version", types.SimpleNamespace(hip="6.3.0", cuda=None)

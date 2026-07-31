@@ -106,7 +106,10 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
 
     global STREAM_GROUPS, SM_COUNTS, SM_GROUP_NUM, CURRENT_STREAM_IDX, CURRENT_STREAM_GROUP
     # for pd_multiplexing, Init stream_groups
-    device = torch.cuda.current_device()
+    # The card whose SMs are being divided is ``gpu_id`` -- the same one
+    # ``get_sm_available`` is asked about. Reading torch's current device here
+    # instead was a latent mismatch whenever the two differ (#343).
+    device = gpu_id
     total_sm_count = spatial.get_sm_available(gpu_id)
     # (prefill_sm_count, decode_sm_count)
     if config.manual_divisions:

@@ -17773,6 +17773,271 @@ Decode-Schritt.
 
 ---
 
+## #343: the device-0 capability family, and what the uneven-TP decode divergence really was (2026-07-31)
+
+Two posts. Base `7f3e805c5c`, branch `fix/device0-family` in `/spinning/wt-343`;
+the card work ran from a second worktree, `probe/343-layer-delta` in
+`/spinning/wt-343-probe`, raw data in
+`/spinning/gpu-battery-results/2026-07-31_343_probe/`.
+
+### Post 1 -- one process, two architectures: the capability answers were shared
+
+#340 named the root: `initialize_fp8_gemm_config` plus three
+`lru_cache(maxsize=1)` capability gates are process-global and read device 0,
+so in the dual-group lane host the sm86 part was handed the sm120 part's
+Triton FP8 backend and died on `type fp8e4nv not supported in this
+architecture`. The fix went one level deeper than the three gates, because the
+three gates were not the root either.
+
+**The actual root is a default parameter value.** Every raw capability reader
+in `utils/common.py` was declared `device_id: int = 0` --
+`get_device_capability`, `get_cuda_capability`, `get_cuda_sm`,
+`cuda_sm_at_least`, `cuda_sm_below`, `cuda_sm_in_range`, `cuda_sm_major_in`,
+`get_hip_arch`, `hip_arch_in`. A bare `get_device_capability()` therefore asks
+about *card 0*, never about the card the caller is running on. That default is
+what the ~130 call sites inherit.
+
+The default is now `None`, resolved by a new
+`resolve_capability_device_id(device_id)`: the CURRENT device when CUDA is up,
+and 0 while it is not. The second half is what keeps everything else still:
+before initialization the current device IS 0 by definition, so GPU-passive
+processes (task #237) get the identical answer and still pay no CUDA context;
+and a single-card rank with a pinned `CUDA_VISIBLE_DEVICES` also has current
+device 0. The answer only moves where a process actually switched cards --
+which is exactly the bug. Changing this one default corrected every bare call
+site at once (`moe_wna16`, `vision.py`, `gemma4_vision`, `modelopt_quant`,
+`marlin_utils`, ...) without touching them.
+
+On top of that, three mechanisms replaced:
+
+| was | now |
+|---|---|
+| `lru_cache(maxsize=1)` over a no-argument probe -- one slot, so whichever card asked first froze the answer for the other | `per_device_gate`: the same cache keyed on the resolved device id, plus `clear_per_device_gate_caches()` for tests that mock capability |
+| `FP8_GEMM_RUNNER_BACKEND`, one module global set once by `initialize_fp8_gemm_config(server_args)` from `scheduler.py` -- before any part is placed | the launch REQUEST is recorded (`_Fp8GemmConfigRequest`); `get_fp8_gemm_runner_backend(device_id)` resolves it per card, lazily |
+| import-time constants (`_is_sm120_supported = ...`, `_ENABLE_PDL = ...`, `_AUTO_BACKEND = ...`, `= cutlass_fp8_supported()` as a function default) | asked at the point of use, with the device taken from the tensor in hand |
+
+No caller had to plumb an id through, and that is not luck: `ModelRunner` calls
+`set_device(self.gpu_id)` in `init_torch_distributed`, before `load_model`, and
+`_load_lane_part` wraps the whole lane-part load in
+`torch.cuda.device(part_gpu_id)`. The current device is already the right
+answer at every quant-method constructor and every kernel launch. That is why
+"default = current device" is the fix rather than a new parameter everywhere.
+
+**The floor, for what genuinely cannot be per device.** Two decisions are
+process-wide by construction and re-asking them per card is not available:
+`is_tf32_supported` is baked into a `tl.constexpr` at import (`fla/chunk_fwd`,
+`fla/chunk_intra`), and `ENABLE_JIT_DEEPGEMM` is read as a module constant in a
+dozen MoE call sites. For those, device 0 is wrong in the DANGEROUS direction
+-- if card 0 is the newer one, the older card is handed a kernel variant it
+cannot run. New `min_visible_cuda_capability_no_init()` answers the LOWEST
+capability among visible cards; both now use it. That is safe on every visible
+card and keeps ONE numeric path through the model, which a per-device tf32
+would not -- two precisions inside one forward is a determinism break just as
+surely as a missing kernel is a crash.
+
+**Family inventory.** Swept for: `get_device_capability` / `get_device_name` /
+`get_device_properties` / `torch.cuda.current_device`, every `lru_cache`/`cache`
+over them, import-time `_is_* = ...()` snapshots, globals set by
+`initialize_*_config`, `is_sm*_supported` / `is_hopper` / `is_blackwell` /
+`cutlass_*_supported` / `can_auto_enable_*`, and capability derived from
+`CUDA_VISIBLE_DEVICES`.
+
+FIXED:
+
+| site | what it was |
+|---|---|
+| `utils/common.py` -- 9 raw readers | `device_id: int = 0` default |
+| `utils/common.py` -- `is_sm80/90/100/120_supported`, `is_blackwell(_supported)`, `is_ampere_with_cuda_12_3`, `is_hopper_with_cuda_12_3` | `lru_cache(maxsize=1)` over a no-argument probe |
+| `fp8_utils` -- `cutlass_fp8_supported`, `can_auto_enable_marlin_fp8`, `fp8_native_gemm_available`, `deterministic_fp8_marlin_disabled`, `fp8_needs_dequant_fallback`, `use_rowwise_torch_scaled_mm` | same; `fp8_native_gemm_available` additionally probed on `device="cuda"` (the current one) while caching a single slot |
+| `fp8_utils` -- `FP8_GEMM_RUNNER_BACKEND`, `initialize_fp8_gemm_config`, `get_fp8_gemm_runner_backend`, `dispatch_w8a8_block_fp8_linear`, `dispatch_w8a8_mxfp8_linear`, `_dispatch_auto_backend`, `_check_cutlass_block_fp8_hardware_support` | one process-global backend for every card |
+| `fp8_utils` -- `apply_fp8_linear` / `apply_fp8_ptpc_linear` | `cutlass_fp8_supported: bool = cutlass_fp8_supported()` -- a default evaluated at IMPORT and baked into the function object |
+| `fp8_utils`, `fp8_kernel` -- `_is_sm100_supported`, `_is_sm120_supported` | import-time snapshots feeding per-forward `num_stages` and the MXFP8 hardware guard |
+| `fused_qk_rmsnorm_rope_gate` -- `_ENABLE_PDL` (**#267**) | import-time constant baked into a `tl.constexpr`; now `_enable_pdl(q_gate.device)` |
+| `deepseek_v4_backend` -- `_is_sm120` | import-time snapshot gating the sm120 FlashMLA path per forward |
+| `communicator` -- `_is_sm90_supported`, `_is_sm100_supported` | import-time snapshots; the module is imported before a rank calls `set_device`, so on a heterogeneous rig rank 2 got card 0's allreduce-fusion answer |
+| `fp4_utils` -- `_flashinfer_fp4_quantize_backend`; `mxfp4_flashinfer_trtllm_moe` -- `_MXFP8_QUANTIZE_BACKEND`; `jit_kernel/fused_a_gemm` -- `_AUTO_BACKEND` | import-time backend strings; now per device, from the tensor |
+| `model_runner._needs_float16_fallback` | `torch.cuda.get_device_properties(0)` hardcoded; the call site now passes `self.gpu_id`, as does the sm75 check below it |
+| `multiplex/pdmux_context.initialize_stream_groups` | divided the SMs of `torch.cuda.current_device()` while asking `get_sm_available(gpu_id)` -- two different cards in one expression |
+| `deep_gemm_wrapper/configurer.ENABLE_JIT_DEEPGEMM`, `fla/utils.is_tf32_supported` | device-0 answers for a process-wide constant; now the visible-card FLOOR |
+
+One hazard the fix itself would have introduced, closed in the same commit:
+the flashinfer fp8 helpers are defined inside an import-time
+`if is_blackwell_supported() and is_flashinfer_available():` block, and once
+`_dispatch_auto_backend` answers per device, a blackwell card 1 in a
+non-blackwell card 0 process would be routed at a symbol that was never
+created. `_FLASHINFER_FP8_HELPERS_DEFINED` records what the import actually
+did, so the dispatcher checks the fact instead of re-deriving the capability.
+
+ACQUITTED, with the reason:
+
+| site | why it is not this bug |
+|---|---|
+| `moe/utils.initialize_moe_config` SBO check | process-wide runtime flag by construction; reads the current device at scheduler init, which is the process's own card, and SBO is unreachable on the lane path (`_assert_lane_moe_is_pure_tp`) |
+| `fla/utils.is_nvidia_hopper` | only trims the autotune `NUM_WARPS` search space; every entry is launchable on either card, so a wrong answer costs autotune time, not correctness |
+| `arg_groups/overrides.py`, `server_args.py` capability reads | launch-argument derivation: one answer per launch, taken before any placement exists |
+| `compressed_tensors._check_scheme_supported`, `marlin_utils`, `flashmla_backend`, `mem_cache/memory_pool` | already correct -- uncached and current-device, or explicitly threaded from the tensor |
+| `dsa_backend`, `gdn_backend`, `kda_cutedsl`/`gdn_cutedsl`, `trtllm_mha_backend` | instance-scoped, constructed under their own runner's device; correct once the primitives above are |
+| `moriep`/`deepep`/`bar1ep` `current_device()` | EP token dispatchers need a real communicator, which a lane part does not have by the fork's own invariant |
+| `_is_gfx95_supported`, `is_intel_alchemist` snapshots | a ROCm/XPU process is single-vendor; the second, differently-architected card this post is about does not exist there |
+| `entrypoints/engine.py TRTLLM_ENABLE_PDL` | an environment variable handed to TRT-LLM, not a capability probe |
+
+**Hermetic tests**, `test/registered/unit/utils/test_per_device_capability.py`,
+21 cases, CPU only, `CUDA_VISIBLE_DEVICES=99`. A mocked rig where device 0 is
+sm120 and device 1 is sm86, and the same process must get different answers:
+the gate family, the raw readers, `per_device_gate` itself, the FP8 dispatch
+(including the bug verbatim -- the sm120 host keeps `triton`, the sm86 part
+does NOT inherit it), PDL, and the floor. Two are falsifiers by construction:
+`test_ask_order_does_not_change_the_answer` (with one cache slot, reversing the
+ask order flips the second answer) and
+`test_explicit_backend_still_applies_to_every_device` (a `--fp8-gemm-backend`
+is a user statement about the launch and must NOT become per-device).
+
+Measured falsifier against the base commit, same mocked rig, read-only from
+`/spinning/wt-final`:
+
+```
+BASE current_device=0 (sm120): is_sm120= False cutlass= False marlin= False
+BASE current_device=1 (sm86):  is_sm120= False cutlass= False marlin= False
+BASE is_sm120_supported(1)    -> TypeError: got multiple values for argument
+BASE cutlass_fp8_supported(1) -> TypeError: takes 0 positional arguments but 1 was given
+```
+
+Both cards get the same wrong answer, and neither gate can even be *asked*
+about a second card. On the branch the same rig answers correctly per index.
+
+### Post 2 -- the divergence is NOT the uneven split; it is uneven DCP
+
+#340 concluded "the deviation is uneven-TP-specific" from four arms. The
+layer-delta probe overturns that, and names the reason #340 could not see it:
+the shared harness environment carried `SGLANG_UNEVEN_DCP=1` /
+`SGLANG_UNEVEN_DCP_WEIGHTED=1`, and that pair only takes effect once a
+`--rank-tp-ratio` plan is installed. So every 3:1 arm silently ran
+`dcp_size=2` and every control ran `dcp_size=1`. The 3:1 flag was carrying a
+second change nobody declared -- the same two-ingredients-at-once trap #340
+was itself built to break.
+
+A new arm settles it. `uneven31_nodcp`, identical flags with
+`SGLANG_UNEVEN_DCP=0`, **reproduces all three reference token streams exactly
+over all 12 tokens**, all floors green, layer deltas on the even-TP=2 noise
+floor.
+
+The first diverging tensor at decode step 1 is `L00.o_proj`, the first
+row-parallel all-reduce. The name alone carries no verdict -- even TP=2
+differs at the same tensors, because bf16 reassociation differs. The MAGNITUDE
+carries it (`max|delta| / ref|absmax|`, rank 0 against TP=1):
+
+| tensor | even TP=2 | 3:1 + uneven DCP | 3:1, DCP off |
+|---|---|---|---|
+| L00.o_proj | 0.0061 | **0.567** | 0.0061 |
+| L00.mlp | 0.00376 | **0.537** | 0.00376 |
+| L01.mlp | 0.0133 | **59.1** | 0.00667 |
+| L02.out | 0.00641 | **14.0** | 0.00641 |
+| logits | 0.00679 | **0.589** | 0.00786 |
+
+even TP=2 is the noise floor -- its tokens are byte-identical to TP=1. The
+broken arm sits 90x to 4400x above it from the very first tensor, while its
+INPUT hidden state is byte-identical and prefill (step 0) is at the floor for
+both TP=2 arms. Two alternatives are ruled out in the same data: rank 0 and
+rank 1 are byte-exact on every post-all-reduce tensor (no all-reduce desync),
+and the lm_head vocab split stays even under `--rank-tp-ratio`, so the #100
+vocab-gather family is exonerated here.
+
+**Self-determinism, both directions.** ACROSS boots the 3:1 arm is
+byte-identical: 165/165 tensors match at decode step 1 between two boots, and
+all six token streams agree. WITHIN a boot it is not: on `alphabet` two
+identical greedy requests split at index 5. That split is itself reproducible
+across boots (boot A's first run equals boot B's first run, A's second equals
+B's second), so it is request-ORDER dependence, not randomness -- the second
+request lands on different KV slots. It disappears with DCP off. This is the
+failure mode `distributed/utils.py::uneven_dcp_owner_bounds` already documents
+in its own comment: indexing the compact pool with raw global indices captures
+rows belonging to other tokens.
+
+**Follow-up post, precisely named** (not fixed -- it spans the flashinfer DCP
+path, the pool sizing and HiCache's global/compact mapping, which is not a
+small fix):
+
+> *Uneven-DCP compact-pool slot mapping corrupts the first decode read.* With
+> `uneven_dcp_kv_replicated` true (`dcp_size>1` plus a `--rank-tp-ratio`
+> plan), decode attention at layer 0 is already 57% wrong relative to the
+> tensor's own scale while its input hidden state is byte-identical and
+> prefill is at the noise floor. Suspect the
+> `(L // S) * (hi - lo) + (L % S - lo)` compaction in
+> `uneven_dcp_owner_bounds` / `cp_token_prefix` against what the allocator
+> hands out. Falsifier in one boot: TP=1 against 3:1 with
+> `SGLANG_UNEVEN_DCP=1`, compare `L00.o_proj` at decode step 1.
+
+Second defect found in the same window, blocking the weighted-versus-even
+split: `SGLANG_UNEVEN_DCP=1` with `_WEIGHTED=0` does not boot --
+`ValueError: pool memory leak detected! [full] total=28640, available=57280`.
+`available` is exactly 2x `total`: the pool is sized with one split factor and
+accounted with another (`cp_token_split_factor` returns `dcp_size=2` in one
+place and `sum([3,1])=4` in another).
+
+The probe's instrument is a layer-fingerprint tap
+(`model_executor/layer_fingerprint.py`, plus 22 lines in `model_runner.py`)
+behind TWO gates that are both off by default:
+`--determinism-logits-dump-dir` AND
+`SGLANG_DETERMINISM_LAYER_FINGERPRINT=1`. It hooks the decoder layers
+directly rather than via `__call__`, because sglang enters the model through
+`model.forward(...)` and module hooks never fire -- one window was spent
+discovering that.
+
+### FP8 two-card boot: still not obtained
+
+Not attempted. The dispatch prerequisite (post 1) landed this window, but the
+second prerequisite from #340 is a memory budget that fits, and #340's
+`27000,9500` left `total_rest_memory=-0.08 GB` before any lane forward. The
+card time went to post 2, which had the higher information yield -- and which
+turned out to overturn a published verdict. Named open item, unchanged in
+shape: one uncontended window with budgets re-derived rather than reused.
+
+### Test numbers
+
+| suite | base `7f3e805c5c` | `fix/device0-family` |
+|---|---|---|
+| `unit/utils` + `unit/quantization` | 50 failed, 345 passed, 4 skipped | 50 failed, **366 passed**, 4 skipped |
+| `unit/distributed` + `unit/server_args` + `unit/model_loader` | 22 failed, 1908 passed, 17 skipped, 3 collection errors | identical |
+
+Failure sets compared line by line after stripping the worktree prefix: `diff`
+empty for both suites. The 21 additional passes are the new test file. The
+pre-existing failures are environment ones without bearing here (`No CUDA GPUs
+are available`, `retry() exceed maximum number of retries`) plus three files
+that already fail at collection on both sides.
+
+`ruff`: 17 findings on the touched files, and 17 on the same files at the base
+commit -- identical set, all pre-existing. `black`, `isort`, `codespell`:
+clean. `model_runner.py` and `fla/utils.py` were not black-clean at the base,
+so formatting them produced a handful of incidental hunks; that is what
+pre-commit would do to any change touching those files.
+
+Two test files needed an update, both because a cache was split or added, not
+because behaviour moved: `test_capability_vendor_gates.py` now clears the
+per-device caches on both edges of its mocked contexts, and
+`test_cuda_context_free_imports.py` clears `_nvml_all_devices` alongside
+`_nvml_cuda_device0` (the raw NVML enumeration is now shared with
+`min_visible_cuda_capability_no_init`).
+
+Card time: 643 s of the 1800 s cap, five windows between 11:00 and 11:13 UTC,
+every BELEGT matched by a FREI in `/spinning/gpu-arb/log`, cards released at
+0 MiB.
+
+### Open
+
+1. Uneven-DCP compact-pool slot mapping (the follow-up post above) -- this is
+   what #340's "uneven-TP divergence" actually was.
+2. `SGLANG_UNEVEN_DCP=1` with `_WEIGHTED=0` does not boot (pool accounting
+   mismatch), which is why weighted and even-modulo DCP could not be separated
+   by measurement.
+3. FP8 two-card boot with budgets that fit -- post 1 removed the dispatch
+   blocker, the memory dimensioning is still unproven.
+4. Harness hygiene: `/spinning/wt-340/scripts/dual_group/r10/env.sh` exports
+   DCP flags that only bite when `--rank-tp-ratio` is present. Any future arm
+   matrix built on it must print the effective `dcp_size` per arm, or it will
+   compare two changes at once again.
+
+---
+
 # #333-M1: engine registry and per-GPU ledger
 
 Branch `feat/registry-m1`, based on `eda4f03b28` (the #333-M2 merge). New code

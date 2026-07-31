@@ -18,6 +18,7 @@ from packaging import version
 from sglang.srt.utils.common import (
     get_device_capability_no_init,
     get_device_name_no_init,
+    min_visible_cuda_capability_no_init,
     torch_release,
 )
 
@@ -291,13 +292,26 @@ is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_n
 # while torch.cuda is uninitialized): this file is evaluated at import in
 # GPU-passive processes too, which must not pay a CUDA context (task #237).
 is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in get_device_name_no_init(0)
-    or get_device_capability_no_init()[0] >= 9
+    "NVIDIA H" in get_device_name_no_init(0) or get_device_capability_no_init(0)[0] >= 9
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
-is_tf32_supported = is_nvidia and get_device_capability_no_init(0)[0] >= 8
+#
+# Asked as the FLOOR over every visible card, not about device 0 (#343). This
+# value is baked into a ``tl.constexpr`` at import (chunk_fwd, chunk_intra),
+# so it CANNOT be re-asked per device the way a runtime gate can: one process
+# compiles one kernel variant. Device 0's answer is wrong in the dangerous
+# direction -- an sm86 card 0 next to an sm75 card 1 would compile tf32 dots
+# the sm75 card cannot run. The floor is safe on every visible card, and it
+# keeps a single numeric path through the model, which per-device tf32 would
+# not (two precisions inside one forward is a determinism break).
+_min_visible_capability = min_visible_cuda_capability_no_init()
+is_tf32_supported = (
+    is_nvidia
+    and _min_visible_capability is not None
+    and _min_visible_capability[0] >= 8
+)
 is_gather_supported = hasattr(triton.language, "gather")
 
 

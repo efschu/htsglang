@@ -88,8 +88,10 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm90_supported = _is_cuda and is_sm90_supported()
-_is_sm100_supported = _is_cuda and is_sm100_supported()
+# NOTE: not snapshotted at import. These modules are imported before a rank
+# calls torch.cuda.set_device(gpu_id), so an import-time answer is device 0's
+# -- on a heterogeneous rig that hands rank 2's sm86 card the sm120 card's
+# answer (#343). Asked lazily, per current device, below.
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
@@ -166,7 +168,8 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
+        _is_cuda
+        and (is_sm90_supported() or is_sm100_supported())
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE

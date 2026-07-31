@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -22,7 +22,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 
-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
+
+def _mxfp8_quantize_backend(device_id: Optional[int]) -> str:
+    """Per device rather than an import-time constant (#343)."""
+    return "cute-dsl" if is_sm100_supported(device_id) else "cuda"
+
 
 # flashinfer is imported lazily (first weight-processing / first apply), not
 # at module scope: importing flashinfer's fused_moe/fp4 machinery evaluates
@@ -390,7 +394,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 hidden_states,
                 False,
                 alignment=hidden_size,
-                backend=_MXFP8_QUANTIZE_BACKEND,
+                backend=_mxfp8_quantize_backend(hidden_states.device.index),
             )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1

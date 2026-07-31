@@ -51,7 +51,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
-from functools import lru_cache, partial
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
@@ -274,6 +274,100 @@ class _NvmlDeviceInfo(NamedTuple):
 
 
 @lru_cache(maxsize=1)
+def _nvml_all_devices() -> Tuple[Tuple[Tuple[int, int], str, str, str], ...]:
+    """Every NVML device on the box as ``(capability, name, uuid, bus_id)``,
+    in NVML order, without initializing CUDA. Empty when NVML cannot answer.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return ()
+    try:
+        devices = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode()
+            device_uuid = pynvml.nvmlDeviceGetUUID(handle)
+            if isinstance(device_uuid, bytes):
+                device_uuid = device_uuid.decode()
+            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
+            if isinstance(bus_id, bytes):
+                bus_id = bus_id.decode()
+            devices.append(((int(major), int(minor)), name, device_uuid, bus_id))
+    except Exception:
+        return ()
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return tuple(devices)
+
+
+@lru_cache(maxsize=1)
+def min_visible_cuda_capability_no_init() -> Optional[Tuple[int, int]]:
+    """The LOWEST compute capability among the CUDA devices this process can
+    see, or None off NVIDIA / when it cannot be determined.
+
+    For the decisions that genuinely have to be made ONCE PER PROCESS and
+    cannot be re-asked per device -- a ``tl.constexpr`` baked into a Triton
+    kernel at import, a JIT backend switched on for the whole process. For
+    those, "device 0's capability" is the wrong question in the DANGEROUS
+    direction: if card 0 is the newer one, the older card is handed a kernel
+    variant it cannot run. The floor is safe in both directions, and it keeps
+    ONE answer per process -- which those callers need, because two different
+    numeric paths inside one model would break the fork's byte-determinism
+    guarantees just as surely as a missing kernel would.
+
+    Answered without initializing CUDA while it is uninitialized (task #237);
+    once CUDA is up, torch is the authority on what is visible.
+    """
+    if not is_cuda():
+        return None
+    if torch.cuda.is_initialized():
+        try:
+            count = torch.cuda.device_count()
+            if count == 0:
+                return None
+            return min(torch.cuda.get_device_capability(i) for i in range(count))
+        except Exception:  # noqa: BLE001 - probe must never be fatal
+            return None
+
+    devices = _nvml_all_devices()
+    if not devices:
+        return None
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        visible = []
+        for entry in cvd.split(","):
+            entry = entry.strip()
+            if not entry:
+                break
+            if entry.startswith("GPU-"):
+                matches = [d for d in devices if d[2].startswith(entry)]
+                if len(matches) != 1:
+                    break  # includes MIG-...; CUDA stops at the first bad entry
+                visible.append(matches[0])
+            else:
+                try:
+                    index = int(entry)
+                except ValueError:
+                    break
+                if not 0 <= index < len(devices):
+                    break
+                visible.append(devices[index])
+        devices = visible
+    if not devices:
+        return None
+    return min(d[0] for d in devices)
+
+
+@lru_cache(maxsize=1)
 def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
     """Resolve CUDA device 0 (the 'current' device before any set_device)
     via NVML, honoring CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER.
@@ -293,44 +387,10 @@ def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
     cannot be answered from NVML; callers then fall back to torch (which
     initializes CUDA).
     """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
-        return None
-    try:
-        devices = []
-        for i in range(pynvml.nvmlDeviceGetCount()):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-            name = pynvml.nvmlDeviceGetName(handle)
-            if isinstance(name, bytes):
-                name = name.decode()
-            device_uuid = pynvml.nvmlDeviceGetUUID(handle)
-            if isinstance(device_uuid, bytes):
-                device_uuid = device_uuid.decode()
-            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
-            if isinstance(bus_id, bytes):
-                bus_id = bus_id.decode()
-            devices.append(
-                (
-                    (int(major), int(minor)),
-                    name,
-                    device_uuid,
-                    bus_id,
-                )
-            )
-    except Exception:
-        return None
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-
+    devices = _nvml_all_devices()
     if not devices:
         return None
+    devices = list(devices)
 
     pci_order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST") == "PCI_BUS_ID"
     if pci_order:
@@ -365,6 +425,43 @@ def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
     return _NvmlDeviceInfo(capability=first[0], name=first[1])
 
 
+_T = TypeVar("_T")
+
+#: Every gate built by ``per_device_gate`` / ``_device_version_gate``, so a
+#: test that mocks the underlying capability can drop all of them at once.
+_PER_DEVICE_GATES: List[Callable[..., Any]] = []
+
+
+def resolve_capability_device_id(device_id: Optional[int] = None) -> int:
+    """Which device a capability probe *without* an explicit index is about.
+
+    ``None`` means "the device this code will actually run on" -- the CURRENT
+    device, not device 0. The two answers only differ in a process that has
+    switched cards, and that difference is the whole point (#343):
+
+    * the dual-group lane host holds parts of one model on two cards of
+      different architecture in ONE process, and loads each part under
+      ``torch.cuda.device(part_gpu_id)``;
+    * a TP rank on a heterogeneous rig that was not given a per-rank
+      ``CUDA_VISIBLE_DEVICES`` calls ``torch.cuda.set_device(gpu_id)`` and
+      then asks capability questions about its own card, not about card 0.
+
+    A ``device_id=0`` default answers device 0 in both cases, so an sm86 part
+    is told it is sm120 and picks a kernel its architecture does not have.
+
+    While torch.cuda is uninitialized the current device is 0 by definition,
+    so GPU-passive processes get exactly the answer they got before and no
+    CUDA context is created (task #237). On a single-card rank
+    (``CUDA_VISIBLE_DEVICES`` pinned, the normal case) the current device is
+    0 as well, so nothing moves there either.
+    """
+    if device_id is not None:
+        return device_id
+    if hasattr(torch, "cuda") and torch.cuda.is_initialized():
+        return torch.cuda.current_device()
+    return 0
+
+
 def get_device_capability_no_init(
     device: Optional[int] = None,
 ) -> Tuple[int, int]:
@@ -374,8 +471,13 @@ def get_device_capability_no_init(
     Before initialization the current device is always 0, so the NVML path
     covers device in (None, 0). Falls back to torch -- which initializes
     CUDA -- when NVML cannot answer.
+
+    ``device=None`` is the current device (see
+    :func:`resolve_capability_device_id`), which is 0 exactly while CUDA is
+    uninitialized.
     """
-    if device in (0, None) and not torch.cuda.is_initialized():
+    device = resolve_capability_device_id(device)
+    if device == 0 and not torch.cuda.is_initialized():
         info = _nvml_cuda_device0()
         if info is not None:
             return info.capability
@@ -385,7 +487,8 @@ def get_device_capability_no_init(
 def get_device_name_no_init(device: Optional[int] = None) -> str:
     """torch.cuda.get_device_name() without initializing CUDA; see
     get_device_capability_no_init."""
-    if device in (0, None) and not torch.cuda.is_initialized():
+    device = resolve_capability_device_id(device)
+    if device == 0 and not torch.cuda.is_initialized():
         info = _nvml_cuda_device0()
         if info is not None:
             return info.name
@@ -393,52 +496,95 @@ def get_device_name_no_init(device: Optional[int] = None) -> str:
 
 
 def _check_cuda_device_version(
-    device_capability_majors: List[int], cuda_version: Tuple[int, int]
+    device_capability_majors: Sequence[int],
+    cuda_version: Tuple[int, int],
+    device_id: Optional[int] = None,
 ):
     if not is_cuda():
         return False
     if tuple(map(int, torch.version.cuda.split(".")[:2])) < cuda_version:
         return False
-    return get_device_capability_no_init()[0] in device_capability_majors
+    return get_device_capability_no_init(device_id)[0] in device_capability_majors
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
+def per_device_gate(fn: Callable[[int], _T]) -> Callable[..., _T]:
+    """Turn a device-scoped predicate ``fn(device_id: int)`` into a public
+    gate ``gate(device_id: Optional[int] = None)`` cached PER DEVICE.
+
+    The replacement for ``lru_cache(maxsize=1)`` on capability probes. One
+    slot is only correct while a process asks about a single card; a
+    dual-group lane host holds parts of one model on two cards of different
+    architecture and loads each of them under
+    ``torch.cuda.device(part_gpu_id)``, so whichever card asked first froze
+    the answer for the other (#343).
+
+    Still a cache: within a process a given card's answer cannot change, and
+    some of these probes run a kernel. ``gate.cache_clear()`` is forwarded, so
+    tests that mock the underlying capability can reset it.
+    """
+    cached = lru_cache(maxsize=None)(fn)
+
+    @functools.wraps(fn)
+    def gate(device_id: Optional[int] = None) -> _T:
+        return cached(resolve_capability_device_id(device_id))
+
+    gate.cache_clear = cached.cache_clear
+    _PER_DEVICE_GATES.append(gate)
+    return gate
+
+
+def clear_per_device_gate_caches() -> None:
+    """Drop every per-device capability cache built by :func:`per_device_gate`
+    or :func:`_device_version_gate`.
+
+    For tests that mock the underlying capability. Nothing in the serving path
+    calls it: within a process a card's architecture does not change.
+    """
+    for gate in _PER_DEVICE_GATES:
+        gate.cache_clear()
+
+
+def _device_version_gate(
+    name: str, device_capability_majors: Sequence[int], cuda_version: Tuple[int, int]
+):
+    """An architecture gate that answers PER DEVICE.
+
+    The cache is keyed on the resolved device id rather than being a single
+    slot (``lru_cache(maxsize=1)``), because one process can legitimately ask
+    the question about two cards -- see
+    :func:`resolve_capability_device_id`. It stays a cache: the answer for a
+    given card cannot change within a process, and the NVML/torch probe is
+    not free on a per-layer path.
+    """
+    majors = tuple(device_capability_majors)
+
+    @lru_cache(maxsize=None)
+    def _cached(device_id: int) -> bool:
+        return _check_cuda_device_version(majors, cuda_version, device_id)
+
+    def gate(device_id: Optional[int] = None) -> bool:
+        return _cached(resolve_capability_device_id(device_id))
+
+    gate.__name__ = name
+    gate.__qualname__ = name
+    gate.cache_clear = _cached.cache_clear
+    _PER_DEVICE_GATES.append(gate)
+    return gate
+
+
+is_ampere_with_cuda_12_3 = _device_version_gate(
+    "is_ampere_with_cuda_12_3", [8], (12, 3)
 )
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
+is_hopper_with_cuda_12_3 = _device_version_gate(
+    "is_hopper_with_cuda_12_3", [9], (12, 3)
 )
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
-    )
+is_blackwell_supported = is_blackwell = _device_version_gate(
+    "is_blackwell_supported", [10, 11, 12], (12, 8)
 )
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
-    )
-)
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-    )
-)
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
-    )
-)
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
+is_sm120_supported = _device_version_gate("is_sm120_supported", [12], (12, 8))
+is_sm100_supported = _device_version_gate("is_sm100_supported", [10], (12, 8))
+is_sm80_supported = _device_version_gate("is_sm80_supported", [8], (11, 0))
+is_sm90_supported = _device_version_gate("is_sm90_supported", [9], (12, 3))
 
 
 @lru_cache(maxsize=1)
@@ -1155,7 +1301,7 @@ def get_device_core_count(device_id: int = 0) -> int:
     return 0
 
 
-def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+def get_device_capability(device_id: Optional[int] = None) -> Tuple[int, int]:
     """The device capability AS THIS TORCH BUILD REPORTS IT -- vendor-namespaced.
 
     The number is only meaningful together with the vendor, and the namespaces
@@ -1172,6 +1318,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     :func:`get_cuda_sm`, all of which answer ``False``/``None`` off NVIDIA. To
     express an AMD statement use :func:`get_hip_arch` / :func:`hip_arch_in`.
     """
+    device_id = resolve_capability_device_id(device_id)
     major, minor = None, None
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         # No-init path: import-time callers (e.g. fp8_utils'
@@ -1215,7 +1362,9 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 # ------------------------------------------------------------------------------
 
 
-def get_cuda_capability(device_id: int = 0) -> Optional[Tuple[int, int]]:
+def get_cuda_capability(
+    device_id: Optional[int] = None,
+) -> Optional[Tuple[int, int]]:
     """Compute capability in the NVIDIA namespace, or None off NVIDIA.
 
     None means "this question does not apply here", not "old card": a ROCm,
@@ -1230,7 +1379,7 @@ def get_cuda_capability(device_id: int = 0) -> Optional[Tuple[int, int]]:
         return None
 
 
-def get_cuda_sm(device_id: int = 0) -> Optional[int]:
+def get_cuda_sm(device_id: Optional[int] = None) -> Optional[int]:
     """``major * 10 + minor`` in the NVIDIA namespace, or None off NVIDIA."""
     capability = get_cuda_capability(device_id)
     if capability is None:
@@ -1238,13 +1387,15 @@ def get_cuda_sm(device_id: int = 0) -> Optional[int]:
     return capability[0] * 10 + capability[1]
 
 
-def cuda_sm_at_least(major: int, minor: int = 0, device_id: int = 0) -> bool:
+def cuda_sm_at_least(
+    major: int, minor: int = 0, device_id: Optional[int] = None
+) -> bool:
     """Is this an NVIDIA device of at least sm{major}{minor}? False off NVIDIA."""
     capability = get_cuda_capability(device_id)
     return capability is not None and capability >= (major, minor)
 
 
-def cuda_sm_below(major: int, minor: int = 0, device_id: int = 0) -> bool:
+def cuda_sm_below(major: int, minor: int = 0, device_id: Optional[int] = None) -> bool:
     """Is this an NVIDIA device below sm{major}{minor}? False off NVIDIA.
 
     False off NVIDIA on purpose: "below sm80" is a statement about NVIDIA
@@ -1256,20 +1407,20 @@ def cuda_sm_below(major: int, minor: int = 0, device_id: int = 0) -> bool:
 
 
 def cuda_sm_in_range(
-    low: Tuple[int, int], high: Tuple[int, int], device_id: int = 0
+    low: Tuple[int, int], high: Tuple[int, int], device_id: Optional[int] = None
 ) -> bool:
     """Is this an NVIDIA device in ``[low, high)``? False off NVIDIA."""
     capability = get_cuda_capability(device_id)
     return capability is not None and low <= capability < high
 
 
-def cuda_sm_major_in(majors: Iterable[int], device_id: int = 0) -> bool:
+def cuda_sm_major_in(majors: Iterable[int], device_id: Optional[int] = None) -> bool:
     """Is this an NVIDIA device whose sm major is one of ``majors``?"""
     capability = get_cuda_capability(device_id)
     return capability is not None and capability[0] in tuple(majors)
 
 
-def get_hip_arch(device_id: int = 0) -> Optional[str]:
+def get_hip_arch(device_id: Optional[int] = None) -> Optional[str]:
     """The AMD arch name without its feature suffix (e.g. ``gfx942``), or None
     off ROCm.
 
@@ -1280,12 +1431,13 @@ def get_hip_arch(device_id: int = 0) -> Optional[str]:
     if torch.version.hip is None:
         return None
     try:
+        device_id = resolve_capability_device_id(device_id)
         return torch.cuda.get_device_properties(device_id).gcnArchName.split(":")[0]
     except Exception:  # noqa: BLE001 - probe must never be fatal
         return None
 
 
-def hip_arch_in(prefixes: Iterable[str], device_id: int = 0) -> bool:
+def hip_arch_in(prefixes: Iterable[str], device_id: Optional[int] = None) -> bool:
     """Does this AMD device's gfx family start with any of ``prefixes``?
 
     False off ROCm. Prefixes so a family can be named once (``gfx95`` covers
