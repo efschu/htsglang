@@ -24,15 +24,24 @@ the design record; the short form:
   byte-moving exchange is entered only from a group-agreed state
   ([[rank-lokaler-test-vor-kollektiv]]).
 * READS BEFORE WRITES. Old and new rows overlap inside the same physical
-  buffer, so per layer the executor first reads (pack outgoing, gather
-  retained into a temp) and only then writes (scatter). The aliasing
-  falsifier in test_kv_reshard.py pins this.
+  buffer, so the executor packs every outgoing row and (per layer) gathers
+  retained rows into a temp before the first scatter touches that layer's
+  buffer. The aliasing falsifier in test_kv_reshard.py pins this.
 * ATOMIC AT THE BOUNDARY. The move runs synchronously inside the scheduler
   round while the server is fully idle: nothing allocates, reads or writes
-  KV between the ready check and the cutover. Errors before the write phase
-  abort with the pool untouched (retry at a later boundary); errors after
-  writes began are FATAL and loud on every rank -- the server never serves
-  from a mixed layout because the failure raises before the round continues.
+  KV between the ready check and the cutover. The pool is UNTOUCHED through
+  pack, exchange and checksum verification -- a failure up to there aborts
+  the attempt cleanly (a later boundary may retry). Only the write phase is
+  the no-return region: an error there is FATAL and loud on every rank --
+  the server never serves from a mixed layout because the failure raises
+  before the round continues.
+* THE EXCHANGE IS DEVICE-NATIVE NCCL, deliberately. torch's gloo p2p works
+  (SendWork/RecvWork) do not implement ``is_completed``, so a bounded poll
+  over them can never observe completion -- measured on the first card run
+  as a clean 120 s ``CollectiveTimeoutError`` on every rank (the #312
+  family catching exactly the hang class it exists for). NCCL p2p works
+  poll truthfully, and ``batch_isend_irecv`` gives the group-uniform op
+  batch NCCL p2p requires.
 
 Capacity comes from the fitted-ceiling reservation
 (``reshard_ceiling_rows``): pools are sized at boot for every declared
@@ -77,9 +86,9 @@ class KvPoolView:
 
     One instance wraps the per-layer K and V buffers (row-major: dim 0 is
     the compact physical row). ``read_rows`` returns the rows of ONE layer
-    as a ``[n, row_nbytes]`` uint8 CPU tensor with the K bytes first and the
-    V bytes appended -- the packed wire format; ``write_rows`` is its exact
-    inverse. Pure adapter: no owner arithmetic in here.
+    as a ``[n, row_nbytes]`` uint8 tensor on the pool's device, K bytes
+    first and V bytes appended -- the packed wire format; ``write_rows`` is
+    its exact inverse. Pure adapter: no owner arithmetic in here.
     """
 
     def __init__(
@@ -112,10 +121,16 @@ class KvPoolView:
     @staticmethod
     def _as_bytes(rows_data: torch.Tensor) -> torch.Tensor:
         n = rows_data.shape[0]
-        return rows_data.contiguous().view(n, -1).view(torch.uint8).to("cpu")
+        return rows_data.contiguous().view(n, -1).view(torch.uint8)
+
+    @property
+    def device(self) -> torch.device:
+        return self._k[0].device
 
     def read_rows(self, layer: int, rows: torch.Tensor) -> torch.Tensor:
-        """``[n, row_nbytes]`` uint8 CPU tensor of layer ``layer``'s rows."""
+        """``[n, row_nbytes]`` uint8 tensor of layer ``layer``'s rows, on the
+        pool's device (the exchange stays device-native; only the injected
+        test channels ever see host tensors)."""
         k, v = self._k[layer], self._v[layer]
         idx = rows.to(k.device)
         return torch.cat([self._as_bytes(k[idx]), self._as_bytes(v[idx])], dim=1)
@@ -141,7 +156,7 @@ class KvPoolView:
 def _checksum(payload: torch.Tensor) -> torch.Tensor:
     """8-byte trailer: int64 sum of the uint8 payload (packing-order pin)."""
     total = int(payload.to(torch.int64).sum().item()) if payload.numel() else 0
-    return torch.tensor([total], dtype=torch.int64).view(torch.uint8)
+    return torch.tensor([total], dtype=torch.int64).view(torch.uint8).to(payload.device)
 
 
 class KvReshardRuntime:
@@ -411,30 +426,26 @@ class KvReshardRuntime:
         layers = range(self._pool.num_layers)
         row_bytes = self._pool.total_row_nbytes
 
-        # READ phase + local move, layer by layer: pack this layer's
-        # outgoing rows FIRST (reads), then gather retained rows into a temp
-        # and scatter them to their new rows (the gather materializes before
-        # the scatter touches the buffer -- aliasing-safe). Writes of layer
-        # L never precede reads of layer L; other layers live in other
-        # buffers.
-        out_parts: Dict[int, List[torch.Tensor]] = {p: [] for p in tr.outgoing_rows}
+        # PACK phase (reads only, pool untouched): stage every outgoing row
+        # into per-peer payloads -- [n, total_row_bytes] flattened plus an
+        # 8-byte checksum trailer pinning the packing-order convention (both
+        # ends derive the order from the same sorted slot set; the checksum
+        # keeps that contract falsifiable at runtime).
         t_read0 = self._clock()
+        out_parts: Dict[int, List[torch.Tensor]] = {p: [] for p in tr.outgoing_rows}
         for layer in layers:
             for peer, rows in tr.outgoing_rows.items():
                 out_parts[peer].append(self._pool.read_rows(layer, rows))
-            if tr.retained_old_rows.numel():
-                tmp = self._pool.read_rows(layer, tr.retained_old_rows)
-                self._pool.write_rows(layer, tr.retained_new_rows, tmp)
-        read_ms = (self._clock() - t_read0) * 1000.0
-
-        # EXCHANGE: one payload per peer -- [n, total_row_bytes] flattened,
-        # plus an 8-byte checksum trailer pinning the packing-order
-        # convention (both ends derive the order from the same sorted slot
-        # set; the checksum keeps that contract falsifiable at runtime).
         outgoing_payloads: Dict[int, torch.Tensor] = {}
         for peer, parts in out_parts.items():
             flat = torch.cat(parts, dim=1).reshape(-1)
             outgoing_payloads[peer] = torch.cat([flat, _checksum(flat)])
+        read_ms = (self._clock() - t_read0) * 1000.0
+
+        # EXCHANGE (pool still untouched): a failure up to and including this
+        # point aborts the attempt with the pool byte-identical -- a later
+        # boundary may retry. Only the WRITE phase below is the
+        # no-return-on-error region.
         incoming_nbytes = {
             peer: int(rows.numel()) * row_bytes + _CHECKSUM_BYTES
             for peer, rows in tr.incoming_rows.items()
@@ -442,9 +453,7 @@ class KvReshardRuntime:
         t_xfer0 = self._clock()
         received = self._exchange(outgoing_payloads, incoming_nbytes)
         xfer_ms = (self._clock() - t_xfer0) * 1000.0
-
-        # WRITE phase: verify each payload's checksum, then scatter it.
-        t_write0 = self._clock()
+        incoming_data: Dict[int, torch.Tensor] = {}
         for peer, rows in tr.incoming_rows.items():
             payload = received.get(peer)
             if payload is None or payload.numel() != incoming_nbytes[peer]:
@@ -464,13 +473,26 @@ class KvReshardRuntime:
                     f"{peer}: sender {want}, receiver {have} -- the packing "
                     f"order contract broke; refusing to scatter."
                 )
-            n = int(rows.numel())
-            data = data.view(n, row_bytes)
-            col = 0
-            for layer in layers:
-                nb = self._pool.row_nbytes(layer)
-                self._pool.write_rows(layer, rows, data[:, col : col + nb])
-                col += nb
+            incoming_data[peer] = data.view(int(rows.numel()), row_bytes)
+
+        # WRITE phase, layer by layer: gather this layer's retained rows
+        # into a temp FIRST (read), then scatter retained and received rows
+        # into their new rows. Reads of a layer strictly precede its writes,
+        # which makes the old/new row overlap inside one buffer harmless;
+        # retained and incoming target rows are disjoint (the row map is
+        # injective). Every read of OTHER layers happened in the pack phase
+        # or lands in other buffers.
+        t_write0 = self._clock()
+        for layer in layers:
+            if tr.retained_old_rows.numel():
+                tmp = self._pool.read_rows(layer, tr.retained_old_rows)
+                self._pool.write_rows(layer, tr.retained_new_rows, tmp)
+            col_lo = sum(self._pool.row_nbytes(lay) for lay in range(layer))
+            col_hi = col_lo + self._pool.row_nbytes(layer)
+            for peer, rows in tr.incoming_rows.items():
+                self._pool.write_rows(
+                    layer, rows, incoming_data[peer][:, col_lo:col_hi]
+                )
         write_ms = (self._clock() - t_write0) * 1000.0
 
         # CUTOVER: install the new vector into the global and every snapshot
@@ -527,14 +549,17 @@ class KvReshardRuntime:
 # ---------------------------------------------------------------------------
 
 
-def _dist_exchange(cpu_group):
-    """Pairwise byte channel over the TP CPU (gloo) group, bounded via #312.
+def _dist_exchange(device_group, device):
+    """Pairwise byte channel over the TP DEVICE (NCCL) group, bounded via
+    #312.
 
-    Post every irecv, then every isend, then poll all works through
-    ``bounded_collective`` -- a dead peer is a loud ``PeerLostError`` within
-    the probe interval, not a hang. Host-staged on purpose: byte-exact for
-    every KV dtype, no interplay with capture streams; the device-NCCL lane
-    is a named follow-up if the measured window ever needs it.
+    One ``batch_isend_irecv`` batch (recvs in ascending peer order, then
+    sends -- the same deterministic order on every rank), then every work is
+    polled through ``bounded_collective``: a dead peer is a loud
+    ``PeerLostError``/``CollectiveTimeoutError`` within the probe interval,
+    never a hang. Device-native on purpose: NCCL p2p works implement
+    ``is_completed`` truthfully (gloo's SendWork/RecvWork do not -- module
+    docstring), and the payloads never leave the GPUs.
     """
     import torch.distributed as dist
 
@@ -546,27 +571,38 @@ def _dist_exchange(cpu_group):
         outgoing: Dict[int, torch.Tensor], incoming_nbytes: Dict[int, int]
     ) -> Dict[int, torch.Tensor]:
         received: Dict[int, torch.Tensor] = {}
-        pending = []
+        ops = []
         for peer in sorted(incoming_nbytes):
-            buf = torch.empty(int(incoming_nbytes[peer]), dtype=torch.uint8)
+            buf = torch.empty(
+                int(incoming_nbytes[peer]), dtype=torch.uint8, device=device
+            )
             received[peer] = buf
-            src = dist.get_global_rank(cpu_group, peer)
-            pending.append(
-                (
-                    dist.irecv(buf, src=src, group=cpu_group),
-                    f"kv_reshard.recv[{peer}]",
+            ops.append(
+                dist.P2POp(
+                    dist.irecv,
+                    buf,
+                    peer=dist.get_global_rank(device_group, peer),
+                    group=device_group,
                 )
             )
         for peer in sorted(outgoing):
-            dst = dist.get_global_rank(cpu_group, peer)
-            pending.append(
-                (
-                    dist.isend(outgoing[peer].contiguous(), dst=dst, group=cpu_group),
-                    f"kv_reshard.send[{peer}]",
+            ops.append(
+                dist.P2POp(
+                    dist.isend,
+                    outgoing[peer].contiguous().to(device),
+                    peer=dist.get_global_rank(device_group, peer),
+                    group=device_group,
                 )
             )
-        for work, label in pending:
-            bounded_collective(lambda w=work: w, label)
+        if not ops:
+            return received
+        works = dist.batch_isend_irecv(ops)
+        for i, work in enumerate(works):
+            bounded_collective(lambda w=work: w, f"kv_reshard.p2p[{i}]")
+        # The works signal kernel completion on the p2p streams; the write
+        # phase consumes the buffers on the default stream, so order the two.
+        if torch.cuda.is_available() and received:
+            torch.cuda.synchronize(device)
         return received
 
     return _exchange
@@ -678,7 +714,7 @@ def build_kv_reshard_runtime(scheduler) -> KvReshardRuntime:
             getattr(server_args, "kv_reshard_consensus_interval", 8)
         ),
         collective_min=default_collective_min(scheduler.tp_cpu_group),
-        exchange=_dist_exchange(scheduler.tp_cpu_group),
+        exchange=_dist_exchange(scheduler.tp_group.device_group, view.device),
         pool_view=view,
         live_slots_fn=_live_slots,
         ready_fn=lambda: scheduler.is_fully_idle(),

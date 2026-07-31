@@ -5495,6 +5495,20 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        # #297: an armed reshard commits at an IDLE consensus boundary, so
+        # the loop must keep ticking rounds until the commit -- the sleeper
+        # parks rank 0 in a zmq poll and the request broadcast parks every
+        # other rank behind it, and a parked loop never reaches a boundary
+        # (observed on the first card run: armed on all ranks, zero
+        # boundaries). The pending target is replicated (broadcast RPC or
+        # consensus-committed ladder flip), so every rank skips the sleep in
+        # the same rounds; the busy spin is bounded by the consensus
+        # interval plus the move itself.
+        if (
+            self.kv_reshard_runtime is not None
+            and self.kv_reshard_runtime.pending is not None
+        ):
+            return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 

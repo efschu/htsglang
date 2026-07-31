@@ -264,12 +264,16 @@ def _run_ranks(
     ready_flags,
     rounds=8,
     interval=2,
+    exchange_factory=None,
 ):
     """One runtime per rank on a real thread. ``targets[r]`` is armed before
     the loop (None = not armed); ``ready_flags[r]`` is a mutable [bool] or a
-    zero-arg callable. Returns (runtimes, exceptions, cutovers)."""
+    zero-arg callable. ``exchange_factory(rank)`` overrides the mailbox
+    channel. Returns (runtimes, exceptions, cutovers)."""
     channel = _BarrierMinChannel(n_ranks)
     mailbox = _MailboxExchange(n_ranks)
+    if exchange_factory is None:
+        exchange_factory = mailbox.exchange_for
     cutovers = [[] for _ in range(n_ranks)]
     runtimes = []
     for r in range(n_ranks):
@@ -281,7 +285,7 @@ def _run_ranks(
                 current_vector=vectors[0],
                 consensus_interval=interval,
                 collective_min=channel.channel_for(r),
-                exchange=mailbox.exchange_for(r),
+                exchange=exchange_factory(r),
                 pool_view=views[r],
                 live_slots_fn=lambda: live,
                 ready_fn=lambda r=r: (
@@ -407,6 +411,47 @@ class TestConsensusDiscipline(CustomTestCase):
                 self.assertTrue(
                     torch.equal(b_old, b_new),
                     f"rank {r}: pool bytes moved before consensus",
+                )
+
+    def test_exchange_failure_aborts_with_pool_untouched(self):
+        # The pool is untouched through pack and exchange (DESIGN_297
+        # section 3): a failing byte channel must leave every buffer
+        # byte-identical, keep the target armed (a later boundary may
+        # retry), and raise on every rank -- never a half move.
+        vectors = [(7, 3, 3), (2, 11, 10)]
+        views, pools, ref, live = _make_pools(3, vectors, 600)
+        before = [
+            [b.clone() for b in pools[r][0]] + [b.clone() for b in pools[r][1]]
+            for r in range(3)
+        ]
+
+        def _broken_exchange_factory(rank):
+            def _exchange(outgoing, incoming_nbytes):
+                raise KvReshardError(f"injected exchange failure on rank {rank}")
+
+            return _exchange
+
+        ready = [[True] for _ in range(3)]
+        runtimes, excs, cutovers = _run_ranks(
+            3,
+            vectors=vectors,
+            views=views,
+            live=live,
+            targets=[vectors[1]] * 3,
+            ready_flags=ready,
+            exchange_factory=_broken_exchange_factory,
+        )
+        for r in range(3):
+            self.assertIsInstance(excs[r], KvReshardError)
+            self.assertIn("injected exchange failure", str(excs[r]))
+            self.assertEqual(cutovers[r], [])
+            self.assertEqual(runtimes[r].epoch, 0)
+            self.assertEqual(runtimes[r].pending, (2, 11, 10))
+            after = [b for b in pools[r][0]] + [b for b in pools[r][1]]
+            for b_old, b_new in zip(before[r], after):
+                self.assertTrue(
+                    torch.equal(b_old, b_new),
+                    f"rank {r}: pool bytes moved despite exchange failure",
                 )
 
     def test_readiness_skew_holds_uniformly_then_commits(self):

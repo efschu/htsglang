@@ -51,15 +51,32 @@ Hard guards (arming refuses loudly, reshard stays planned-only):
 At a consensus tick where every rank is armed AND ready (idle), the move runs
 SYNCHRONOUSLY inside the scheduler round, on every rank, in lock step:
 
-1. READ phase (no pool writes): pack outgoing rows per destination rank into
-   staging buffers; gather locally-retained rows into a temp buffer.
-2. EXCHANGE: pairwise isend/irecv of the packed payloads (+ checksums) over
-   the TP CPU (gloo) group, polled through the #312 bounded primitive.
-3. WRITE phase: scatter retained-temp and received payloads into the NEW
-   rows. Reads-strictly-before-writes per rank makes the old/new row overlap
-   in the same physical buffer harmless (the aliasing falsifier pins this).
+1. PACK phase (reads only, pool untouched): stage outgoing rows per
+   destination rank into device payloads (+ 8-byte checksum trailer).
+2. EXCHANGE (pool still untouched): one `batch_isend_irecv` batch over the
+   TP DEVICE (NCCL) group, every work polled through the #312 bounded
+   primitive; then checksum verification. A failure up to and including
+   this point aborts with the pool byte-identical -- a later boundary may
+   retry. Transport decision (card-run finding): torch's GLOO p2p works do
+   not implement `is_completed`, so a bounded poll can never observe
+   completion -- the first card run ended in a clean 120 s
+   `CollectiveTimeoutError` on all three ranks (the #312 family catching
+   exactly its hang class). NCCL p2p works poll truthfully and keep the
+   payloads on-device.
+3. WRITE phase (the only no-return region): per layer, gather retained rows
+   into a temp (read), then scatter retained and received rows into the NEW
+   rows. Reads of a layer strictly precede its writes, which makes the
+   old/new row overlap in the same physical buffer harmless (the aliasing
+   falsifier pins this); an error here is fatal and loud on every rank.
 4. CUTOVER: install the new vector, refresh every snapshot cache, bump the
    reshard epoch, log `KV-RESHARD` with duration and bytes.
+
+Scheduler interplay (card-run finding): an armed reshard must keep the
+scheduler loop TICKING -- `maybe_sleep_on_idle` parks rank 0 in a zmq poll
+and the request broadcast parks every other rank behind it, so a parked
+loop never reaches a consensus boundary. While a target is pending
+(replicated state), the sleep is skipped; the busy spin is bounded by the
+consensus interval plus the move itself.
 
 Because the server is fully idle, there is no serving to silence: the only
 "Stille" is that a request arriving mid-move waits in the input queue for the
