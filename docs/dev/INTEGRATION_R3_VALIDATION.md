@@ -17770,3 +17770,273 @@ Decode-Schritt.
 2. FP8-Zweikarten-Boot mit tragfähigen Budgets (`27000,9500` reicht auf diesem
    Rig nicht) — erst nach 1 aussagekräftig.
 3. Layer-Delta-Sonde für die uneven-TP=2-Divergenz.
+
+---
+
+# #333-M1: engine registry and per-GPU ledger
+
+Branch `feat/registry-m1`, based on `eda4f03b28` (the #333-M2 merge). New code
+under `python/sglang/srt/registry/`; the only pre-existing modules touched are
+the two the ledger unification moved.
+
+## What was built
+
+| Layer | File | What it owns |
+|---|---|---|
+| device identity | `registry/nvml.py` | NVML UUID -> card. Moved from `video_enhance/`. |
+| ledger (mechanism) | `registry/ledger.py` | per-card reservation files, flock, leases, reaping, the §3.3 invariant, the per-card exclusive window, and the new multi-card all-or-nothing layer |
+| entities | `registry/spec.py` | `EngineSpec` / `EngineInstance` / `Slot` / `ResourceProfile` |
+| lane contract | `registry/adapter.py` | §3.5 protocol plus the adapter table |
+| adapters | `registry/adapters/` | `class1_srt`, `class3_utility` (pooling + opaque process), `class2_diffusion` (estimate only) |
+| policy | `registry/arbiter.py` | admission, eviction, derived M, idle set, capture lock, thrash naming |
+| control plane | `registry/http_api.py`, `registry/launch.py` | §7.4 endpoints, `python -m sglang.srt.registry` |
+| second opinion | `registry/planner_bridge.py` | `GET /registry/plan?with_planner=1` calls `srt/planner/feasibility.plan` |
+
+Nothing in `srt`'s boot path imports the package. A launch without the
+registry is the launch it was before; the registry is a separate process that
+starts engines, not a hook inside one.
+
+## The ledger is unified with M2, not duplicated
+
+M2 wrote `python/sglang/srt/video_enhance/reservation.py` because the Class-3
+video tenant landed ahead of the registry and needed the §3.3 invariant before
+there was an arbiter to own it. M1 moves that file to
+`python/sglang/srt/registry/ledger.py` **unchanged in behaviour** and leaves
+`video_enhance/reservation.py` as a re-export of the same names; the same is
+done for `video_enhance/nvml.py`. There is exactly one implementation of the
+invariant, one lock discipline and one set of files under
+`/run/htsglang/vram/<uuid>.json` on this rig.
+
+The unification is tested from the M2 side, not asserted: M2's 251-test suite
+runs unmodified and green against the moved module, and
+`CoTenancyWithM2Test` writes a reservation through the *M2 import path* and
+then shows the registry refusing an engine because of it, quoting the video
+tenant by name.
+
+What M1 added on top of the moved code, all in the multi-card layer:
+
+- `CardDemand` / `FeasibilityReport` / `plan_reservation(...)` -- the read-only
+  projection the control plane answers `/registry/plan` with, including
+  `ignoring_tenants` (price an eviction before performing one) and
+  `on_empty_rig` (is this spec intrinsically feasible, independent of who
+  holds what).
+- `MultiCardReservation` -- a TP engine spans several cards and needs them all
+  or none. Cards are taken in sorted UUID order and a failure on the second
+  releases the first. A promotion that fails part-way rolls back to `COLD` on
+  the cards that already moved.
+- `adopt(...)` -- reattach to files that outlived the control plane, so a
+  restart does not race itself.
+
+## M is derived, not configured
+
+`hot_capacity()` answers §7.2 by simulating admission on an empty rig in the
+order the arbiter would really promote (pinned, then the idle default set,
+then priority, then id) and counting what fits. `--registry-max-hot` is
+applied *after* that, and the excluded engines carry the arithmetic that
+excluded them. On the mock rig of the test suite (2x 20 GiB + 1x 32 GiB):
+three 16 GiB engines on the 32 GiB card derive M=1, the same three at 15 GiB
+derive M=2, and one engine per card derives M=3 -- one number, three answers,
+none of them expressible as a count.
+
+## Rejections carry numbers
+
+`POST /registry/engines` for a spec that cannot fit an empty card is a 400 at
+registration, before anything boots. A promotion that would need too long is a
+503 whose body carries `projected_wait_ms`, whether that number is measured or
+still the class default, `would_evict`, and a per-card shortfall with held
+bytes, corridor, NVML total and the holders by name. Pinned engines are never
+evicted automatically and the rejection says so.
+
+## Hermetic test results
+
+`python -m pytest test/registered/registry -q` -> **108 passed**, in 8 s, no
+device touched.
+
+| File | Tests | Gate covered |
+|---|---|---|
+| `test_ledger_multicard.py` | 15 | all-or-nothing acquire and rollback, UUID keying across an enumeration swap, lease expiry vs live pid, orphan reaping on every card, read-only planning |
+| `test_registry.py` | 49 | spec validation, registration without boot, derived M on unlike cards, `default_hot` validated when declared, eviction order (pinned / default set / priority / LRU), informative rejection, corridor ownership, capture lock, M2 co-tenancy |
+| `test_adapters.py` | 27 | budget arithmetic incl. two ranks on one card, launch-argument construction, refused rungs (`WARM_HOST` for Class 1, `WARM_GPU` for Class 3, promotion for Class 2) |
+| `test_control_plane.py` | 17 | every §7.4 endpoint, status codes, the 503 body |
+
+Regression, same command before and after the change (`unit/server_args` +
+`unit/model_loader` + `video_enhance`, base measured by stashing the branch):
+
+| | failed | passed |
+|---|---|---|
+| base `eda4f03b28` | 6 | 722 |
+| `feat/registry-m1` | 6 | 827 |
+
+**Failure set byte-identical** -- the same six pre-existing
+`test_modelopt_loader.py` failures ("No accelerator", `retry() exceeded`). The
+105 additional passes are the new suite.
+
+`ruff`, `black`, `isort` and `codespell` clean on every touched path.
+
+## What the card found before it ran anything
+
+Two defects that no hermetic test on this rig could have produced, both fixed
+in-window, both now covered:
+
+**1. `--rank-gpu-id` is a CUDA index, and this rig disagrees with NVML.**
+The first attempt resolved the placement UUID to its NVML index and passed
+that. The 5090 is NVML 1 and CUDA 0 here (CUDA defaults to `FASTEST_FIRST`,
+NVML enumerates by PCI bus), so the engine booted on a 3080 with a 20000 MiB
+budget on a 20480 MiB card and was OOM-killed five minutes in. `avail mem=19.31
+GB` in the log was the only tell, and it reads like a memory problem.
+
+The fix is not "use the other index". There is no correct index for a UUID:
+the answer depends on an enumeration order the registry does not control. The
+adapter now pins the child with `CUDA_VISIBLE_DEVICES` to exactly its own
+cards, in placement order, and emits `--rank-gpu-id` as indices *into that
+list*. Index i is placement[i] by construction, in every enumeration order
+there is -- which is the isolation strategy the design already names, applied
+one level earlier than it was written down.
+
+**2. `--enable-memory-saver` cannot start on this rig without a loader path.**
+The `WARM_GPU` rung releases the `kv_cache` and `cuda_graph` tags and #89's
+park releases `weights`; without the memory saver all three are no-ops that
+free nothing, so the adapter enables it by default. It then failed at
+`exit code 127`: torch_memory_saver works by `LD_PRELOAD`-ing a shim, the
+loader resolves that shim before Python runs, and this host has
+`libcudart.so.12` installed while torch is built against 13. The matching
+runtime ships in the venv at `site-packages/nvidia/cu13/lib`, so
+`cuda_runtime_library_path()` puts those directories first on the child's
+`LD_LIBRARY_PATH`.
+
+The fix is verified without a GPU, directly against the loader:
+
+```
+$ ldd .../torch_memory_saver_hook_mode_preload_cu13.abi3.so | grep 'not found'
+        libcudart.so.13 => not found
+$ LD_LIBRARY_PATH=.../site-packages/nvidia/cu13/lib ldd ... | grep 'not found'
+        (nothing)
+```
+
+This is a pre-existing environment gap that any memory-saver user on this host
+would hit; the registry is simply the first caller that turns the flag on by
+default.
+
+## What M1 deliberately cannot do
+
+- **No Class-2 tenant.** The diffusion adapter estimates and refuses to
+  launch; promoting one is M3 (§10). Its estimate is not a placeholder -- a
+  diffusion footprint is exactly the one an operator cannot guess, and
+  declaring the §5.2 posts makes it plannable today.
+- **No `WARM_HOST` for Class 1.** Sharded, quantised, post-processed weights
+  are not a single `.to("cpu")` (§4.3). The rung raises rather than silently
+  mapping onto `COLD`.
+- **No mid-request preemption.** A promotion waits for in-flight work to
+  drain; the arbiter never interrupts a granted unit of work.
+- **No tick broker.** §3.7's deficit scheduler is declared in the lane
+  contract and not implemented: there is no second class to arbitrate against
+  until M3, and a stub that pretended to schedule would be worse than an
+  absent one.
+- **Placement is explicit or single-card `auto`.** Cross-card balancing of one
+  engine is the planner's job and a named non-goal (§7.7).
+- **`COLD` -> `HOT` is a full load unless the engine is GGUF.** #89 hibernate
+  is GGUF-scoped upstream, which is why the card-window pair is two GGUF
+  checkpoints rather than the safetensors Qwen3.5-2B / Llama-8B: for those two
+  the ladder still works, but its bottom rung costs a checkpoint load and the
+  hot-switch number would measure nothing about hibernate.
+
+## Live control plane, no GPU booked
+
+`python -m sglang.srt.registry --engines <file> --print-plan` on the real rig,
+with one Class-1 GGUF spec and one Class-2 estimate-only spec, both
+auto-placed:
+
+```
+engines:      [('qwen35-9b', 1, 'COLD', 20000 MiB), ('flux-stub', 2, 'COLD', 14500 MiB)]
+hot_capacity: derived_max_hot=1, would_be_hot=['flux-stub'],
+              excluded: qwen35-9b -- card GPU-31d7ef41... would hold 34500 MiB
+              + 400 MiB corridor against 32607 MiB total
+cards:        5090   total 32607  available 32207  corridor_ok True
+              3080-a total 20480  available 20080  corridor_ok True
+              3080-b total 20480  available 20080  corridor_ok True
+```
+
+Both specs registered, costed and excluded-with-arithmetic in under a second,
+nothing booted, no GPU window booked. That is the §7.4 property the whole
+control plane exists for.
+
+**One honest limitation this run exposes.** Auto-placement ranks cards by
+*ledger* availability, so both engines landed on the 5090 even though, at that
+moment, another session's undeclared process held 27 GiB of it and the 3080s
+were emptier by driver free memory. The ledger is a declaration layer: a
+tenant that never declared itself is invisible to placement, by construction.
+The corridor check does read the driver (`free_bytes_nvml`), so the arbiter
+still refuses to promote onto a card that is physically below corridor -- but
+plan-time card *choice* is only as good as what the tenants on the rig
+declared. On a rig where every tenant goes through the registry that is exact;
+on a shared rig it is not, and the harness now refuses to start rather than
+discovering it as an OOM five minutes into a load.
+
+## Card window: what ran, and what did not
+
+Raw data: `/spinning/gpu-battery-results/2026-07-31_333_m1_registry/`
+(`report.json`, `window.log`, per-engine server logs, the hibernate manifest).
+Harness: `scripts/registry/m1_card_window.py`. The card is resolved at runtime
+by NVML and never by index; the harness picks the largest card, which on this
+rig is the 5090 at NVML index 1 and CUDA index 0.
+
+Two Class-1 GGUF engines on the 5090, 20000 MiB budget each -- deliberately
+sized so that 2 x 20000 + 400 MiB corridor > 32607 MiB and only one can be
+hot. Engine A `Qwen3.5-9B-Q4_K_M`, engine B `Qwen3.6-27B-Q3_K_M`.
+
+### Reached, on the card (window 4, 235 s, `report.json`)
+
+| Step | Result |
+|---|---|
+| Register both | both `COLD`, 0 bytes reserved, nothing booted |
+| Derived M | **1**, with the arithmetic: "card GPU-31d7ef41... would hold 40000 MiB + 400 MiB corridor against 32607 MiB total" |
+| Promote A | `HOT` in **109.1 s**, on the correct card (`avail mem=30.66 GB` = the 5090) |
+| A serves | `"The capital of France is"` -> `" Paris."` |
+| Ledger line | reserved 20000 MiB, measured **18216 MiB**, waste 1784 MiB, `corridor_ok` true; the two 3080s at 0 reserved / 0 measured |
+| Registration rejection | `oversized` (33631 MiB): refused at registration, no boot, quoting request / held / corridor / NVML total |
+| Promotion rejection | `contender`: 503-shaped, "would take about 105000 ms to promote (estimated) ... would evict ['qwen35-9b']" |
+| Demote A to `COLD` | #89 park succeeded: `manifest.json` + `rank0_GPU-31d7ef41-....pt`, **7.18 GB**, NVML-UUID in the filename; the card returned to ~0 |
+| Independent NVML sampler | 235 samples, minimum free on the 5090 **13503 MiB**, on each 3080 20052 MiB -- the corridor held throughout, verified outside the ledger |
+
+The measured 18216 MiB against a declared 20000 MiB budget is the
+absolute-MiB path working end to end: the registry declared the budget, the
+ledger held exactly that, and the engine landed 1784 MiB under it without any
+implicit ceiling being applied on top.
+
+### Not reached: the hibernate restore time
+
+Engine B's boot was killed by the **host** OOM killer (exit -9; the host had
+21 GiB of 98 GiB available at that moment, held by a concurrent session), so
+the switch back to A -- the number that would have shown a hibernate restore
+against A's 109.1 s cold boot -- never ran.
+
+Three further attempts were made with a smaller engine B
+(`Qwen3.5-9B-Q8_0`, 9.5 GB instead of 13 GB) and they were lost to rig
+contention, not to the code: another session on this box was cycling
+TP=3 boots across all three cards throughout, and the 5090 went from
+32089 MiB free to under 1 GiB inside the seconds between the harness's
+pre-flight check and its first allocation. The last two attempts died with
+"Not enough GPU memory for hybrid state cache" and an OOM kill respectively,
+with the NVML sampler recording a minimum of 512 MiB free on a card the
+harness had measured as empty.
+
+**Open item, named and not worked around:** `promotion_cost_ms` for a
+`COLD -> HOT` transition that restores from a #89 manifest, against the
+109.1 s cold-boot baseline already measured. Everything it needs is in place
+-- A's manifest is parked on disk under the 5090's UUID, and the harness's
+step 3 is now a restore rather than a cold load -- so it is one uncontended
+window, not more work.
+
+Two things this contention did establish, both of them by accident:
+
+- The **pre-flight guard** added after the second failed attempt (refuse to
+  start when the target card has less than budget + corridor free) is the
+  right shape but not sufficient on a shared rig: it closes the "start into an
+  occupied card" case and cannot close the "occupied one second later" case.
+  Only a tenant that declares itself in the ledger can be seen coming, which
+  is the argument for the registry rather than a caveat about it.
+- `#89`'s park is **UUID-locked in the filename**
+  (`rank0_GPU-31d7ef41-....pt`), so a manifest parked on the 5090 cannot be
+  silently restored onto a 3080 after an enumeration shift. That is the same
+  discipline the ledger applies to reservations, and it held here without
+  anyone having to arrange it.
