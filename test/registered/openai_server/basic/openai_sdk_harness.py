@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import contextlib
 import socket
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterator, Optional
 from unittest.mock import MagicMock
 
@@ -159,12 +161,18 @@ def live_server(
     image_lane_url: str = "",
     speech_lane_url: str = "",
     architectures: Optional[list[str]] = None,
+    training_service=None,
 ) -> Iterator[str]:
     """Run the real app on a real port. Yields the base URL.
 
     ``registry_view`` / ``image_lane_url`` / ``speech_lane_url`` are injected
     into the adapters rather than set as process env, so a test can describe a
     rig state without a running registry or diffusion service.
+
+    ``training_service`` is the #341 service the fine-tuning routes talk to.
+    Injected for the same reason: a test describes a machine and an executor
+    without a card, a ledger or an installed training suite, and everything
+    between the socket and that service stays real.
     """
     import uvicorn
 
@@ -175,6 +183,10 @@ def live_server(
         OpenAIServingCompletion,
     )
     from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+    from sglang.srt.entrypoints.openai.serving_files import OpenAIServingFiles
+    from sglang.srt.entrypoints.openai.serving_finetune import (
+        OpenAIServingFineTuning,
+    )
     from sglang.srt.entrypoints.openai.serving_images import OpenAIServingImages
     from sglang.srt.entrypoints.openai.serving_speech import OpenAIServingSpeech
     from sglang.srt.entrypoints.openai.serving_transcription import (
@@ -210,6 +222,25 @@ def live_server(
     app.state.openai_serving_speech = OpenAIServingSpeech(
         lane_url_resolver=lambda: speech_lane_url, view_resolver=lambda: view
     )
+
+    if training_service is None:
+        from sglang.srt.training.service import (
+            TrainingService,
+            TrainingServiceConfig,
+        )
+
+        # Disabled by default: a test that does not ask for the tenant gets
+        # the production default, so the "switched off" rejection is covered
+        # by every other test in the file for free.
+        training_service = TrainingService(
+            TrainingServiceConfig(
+                enabled=False,
+                artifact_root=Path(tempfile.mkdtemp(prefix="htsglang-training-")),
+            )
+        )
+    app.state.training_service = training_service
+    app.state.openai_serving_files = OpenAIServingFiles(training_service)
+    app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(training_service)
     # The Ollama emulation rides the same lanes; it is served by the same app
     # and therefore covered by the same harness.
     from sglang.srt.entrypoints.ollama.serving import OllamaServing  # noqa: PLC0415
@@ -220,7 +251,14 @@ def live_server(
     # this harness has already provided both halves it would build.
     @contextlib.asynccontextmanager
     async def _noop_lifespan(_app):
-        yield
+        # The training tenant is the one piece the production lifespan starts
+        # that this harness still needs, because its scheduler is an asyncio
+        # task and must be created on the server's own loop, not the test's.
+        training_service.start()
+        try:
+            yield
+        finally:
+            await training_service.stop()
 
     previous_lifespan = app.router.lifespan_context
     app.router.lifespan_context = _noop_lifespan
