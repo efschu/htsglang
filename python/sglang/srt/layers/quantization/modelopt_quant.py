@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -43,6 +44,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils import GPTQ_MARLIN_MIN_THREAD_K
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_moe_nvfp4_layer_for_marlin,
@@ -174,6 +176,54 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
+
+
+def modelopt_fp4_uneven_tp_block(group_size: Optional[int]) -> List[int]:
+    """Uneven-TP shard block for a ModelOpt NVFP4 config (`--rank-tp-ratio`).
+
+    NVFP4 groups ``group_size`` (16) input channels under one E4M3 block
+    scale, so every per-rank shard boundary must end a whole group -- the same
+    constraint AWQ/GPTQ carry, and the same one the fork already solves by
+    exposing ``weight_block_size`` so ``_quant_block_aligned_units`` /
+    ``tp_partition_size`` coarsen the plan. ``ModelOptFp4Config`` exposed
+    nothing, so for exactly the NVFP4 checkpoint family that boots on
+    pre-Blackwell ranks the coarsening never fired and an uneven split failed
+    late, inside ``verify_marlin_supports_shape`` on the first forward. Fifth
+    member of the #37 / #86 / #289 / #300 alignment family.
+
+    The block is not the group size. Two different kernels can serve an NVFP4
+    layer and each adds its own tile:
+
+    * Marlin E2M1 (sm_80-sm_89, and any rank forced onto
+      ``--fp4-gemm-backend marlin``): ``GPTQ_MARLIN_MIN_THREAD_K`` = 128 on
+      the partitioned K dim; min_thread_n = 64 is dominated by it.
+    * native FP4 CUTLASS / FlashInfer (Blackwell): ``FP4_GEMM_ALIGNMENT`` = 32
+      on both N and K.
+
+    The lcm of the group size and BOTH tiles is taken, deliberately, rather
+    than the tile of whichever kernel this process happens to have resolved.
+    The shard plan is derived independently on every rank and the ranks must
+    agree to the element; on a mixed-architecture rig they resolve DIFFERENT
+    FP4 backends (native FP4 on the Blackwell rank, Marlin on the sm_86
+    ranks), so a per-rank block would hand rank 0 a 32-aligned split and ranks
+    1/2 a 128-aligned one and silently mis-shard the model. The block must be
+    a property of the checkpoint, not of the local device.
+
+    For the real case (group 16) this is ``lcm(16, 32, 128) = 128``, the same
+    value ``CompressedTensorsConfig._group_size_block`` already returns for an
+    NVFP4 scheme -- so the two NVFP4 config classes coarsen identically.
+
+    Both dims carry the same value so a column-parallel OUTPUT split (gate_up)
+    lands on the same boundary as its coupled row-parallel INPUT split (down):
+    they partition the same intermediate dimension.
+
+    Inert without an installed ratio plan -- the even-TP path never consults
+    the unit family.
+    """
+    block = math.lcm(FP4_GEMM_ALIGNMENT, GPTQ_MARLIN_MIN_THREAD_K)
+    if group_size and int(group_size) > 0:
+        block = math.lcm(block, int(group_size))
+    return [block, block]
 
 
 def round_up_to_multiple(x: int, m: int) -> int:
@@ -1223,6 +1273,19 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
+
+    @property
+    def weight_block_size(self) -> List[int]:
+        """Shard-alignment block for `--rank-tp-ratio` (see
+        :func:`modelopt_fp4_uneven_tp_block`).
+
+        Not a quantisation-semantic block: NVFP4's quantisation grain is the
+        group of 16 this folds in. The value additionally encodes the GEMM
+        thread-tile requirement of the kernels that can serve the layer, which
+        is what makes an uneven per-rank shard valid rather than merely
+        group-valid.
+        """
+        return modelopt_fp4_uneven_tp_block(self.group_size)
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:

@@ -687,8 +687,15 @@ class CompressedTensorsConfig(QuantizationConfig):
                 if is_fp4a4_nvfp4_supported:
                     return CompressedTensorsW4A4Fp4()
                 else:
+                    # The floor is Marlin's SM80, not Blackwell's SM100
+                    # (#291-S3): from SM80 up the scheme has a lane, either
+                    # native FP4 or in-kernel E2M1 dequant. Below it there is
+                    # no NVFP4 kernel at all.
                     raise NotImplementedError(
-                        "Current platform does not support w4a4 nvfp4 quantization."
+                        "Current platform does not support nvfp4 quantization: "
+                        "the compressed-tensors NVFP4 scheme needs compute "
+                        f"capability >= {CompressedTensorsW4A4Fp4.get_min_capability()} "
+                        "(SM80+ runs it through Marlin, SM100+ natively)."
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
