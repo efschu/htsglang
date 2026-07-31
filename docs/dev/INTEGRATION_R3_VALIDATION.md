@@ -14238,3 +14238,135 @@ arbeitet unter GPTQ genauso wie unter fp8.
 `logs/boot.tail.txt`, `logs/driver.log`, `power.csv` (27 Punkte je Karte;
 Spitzen 134 W / 5923 MiB auf GPU0, 72 W / 8597 MiB auf GPU1,
 116 W / 5661 MiB auf GPU2 — reiner Ladevorgang, nie ein Rechenpunkt).
+
+## #307-Beleg: fitted ceiling auf der Karte (Kartenfenster 2026-07-31, 00:49-00:53 UTC)
+
+Das im Merge-Commit `a35564e491` mitgelieferte Programm
+`scripts/gpu_battery/s307_ceiling_fit.sh`, unveraendert gefahren auf
+`/spinning/wt-final` @ `a35564e491`. TP=3 auf 5090 + 2x 3080,
+`Qwen3.6-27B-FP8`, Arm `bar1`, `--rank-tp-ratio auto-performance`,
+`--rank-mlp-ratio 63,37,36`, `--rank-kv-ratio 7,3,3`, fp8-KV, NEXTN k=3,
+`--admission-throttle-high 0.30 --admission-release-low 0.10`. Entscheidend
+ist der Reserve-Vektor: **4500,4200,4200 — exakt der, mit dem 8/64 am
+2026-07-30 gestorben ist** (Abschnitt "Fenster 3", 2.0: rank 2 lag
+**559 MiB ueber dem 16280-MiB-Budget**, vor dem ersten KV-Token). Kartenzeit
+**4 min 04 s** von 30 min Budget, drei Boots in zwei Servern.
+
+**Verdikt: der Fit traegt den Boot, der vorher starb — 14 von 16 Kriterien
+erfuellt. Die zwei roten sind Kalibrierungsfehler der PRUEFUNG, nicht des
+Mechanismus.** `s307 exit 1`.
+
+### Arm A — 8/64, die Konstellation, die starb (8 von 9)
+
+Der Server kommt hoch: **HEALTHY nach 78 s**, `/get_server_info` antwortet mit
+551 Keys. Damit ist die Kernaussage belegt: dieselbe Anforderung, die am
+2026-07-30 vor dem ersten KV-Token abbrach, bootet jetzt. Die Meldung
+`leaves no GPU memory for the KV cache` taucht nirgends auf, und das ist keine
+Formalie — es wird echter KV allokiert (`235564` Tokens auf Rang 0,
+`100956` auf den beiden 3080ern; K+V 3.59+3.59 GB bzw. 1.54+1.54 GB).
+
+Der Fit feuert auf **allen drei** Raengen, und der Scheduler sagt die Luecke
+laut, woertlich aus `a64_markers.txt`:
+
+```
+Dynamic admission limit: the requested ceiling 64 (per worker) does not fit
+the memory budget; the state pools and the float were fitted to 18. Raise the
+per-rank budget (--rank-gpu-memory-mib / --rank-auto-reserve-mib) or lower the
+ceiling to make the request honest.
+```
+
+Gruppenweit **ein** effektives Ceiling (`reported=[18]`), und der Float startet
+bei `--max-running-requests`, nicht am Ceiling:
+`{"current": 8, "start": 8, "ceiling": 18, "floor": 1}`.
+
+Die Rechnung im Merge-Commit sagte 14, gemessen sind **18**. Die Pruefung
+verlangt nur `0 < fitted < 64`; die Abweichung ist notiert, nicht bewertet.
+
+**Rot: "all ranks ended on one pool size" — `sizes=[90, 92, 94]`.** Die drei
+Pool-Zeilen nebeneinander:
+
+```
+max_mamba_cache_size=94 slots (3.43 GB @ per_req=37.41 MiB; fit_cap=214) -> admits ~18 reqs
+max_mamba_cache_size=92 slots (1.68 GB @ per_req=18.70 MiB; fit_cap=226) -> admits ~18 reqs
+max_mamba_cache_size=90 slots (1.64 GB @ per_req=18.70 MiB; fit_cap=221) -> admits ~18 reqs
+```
+
+Die Slot-Zahlen duerfen hier gar nicht gleich sein: `per_req` ist auf dem 5090
+**37.41 MiB** und auf den 3080ern **18.70 MiB**, die Budgets unterscheiden sich
+ebenso. Gleich ist, was das Feature zusagt — `admits ~18` auf allen drei
+Raengen und daraus das eine Gruppen-Ceiling 18. Das Kriterium prueft
+Rang-Uniformitaet an der rohen Slot-Zahl statt an der zugelassenen
+Request-Zahl und ist damit fuer uneven TP auf gemischten Karten falsch
+geschnitten. Nicht angefasst (Auftrag: sichern, nicht debuggen).
+
+### Arm B — der Anhebe-Pfad (5 von 6)
+
+Auf demselben Server. Der Float **steigt ueber seinen Start** und bleibt am
+gefitteten Ceiling stehen: `start_state.current=8` -> `peak_limit=18` =
+`end_state.current=18` bei `ceiling=18`, `release_count=9`,
+`last_reason="release"`. 32 Samples, **kein einziger Fehler**, `failed=0` —
+alle 24 Lastanfragen wurden bedient. **`Retract requests` = 0 Zeilen**: es
+wurde nichts zurueckgezogen.
+
+**Rot: "the pressure phase throttled" — `throttle_count=0`.** Die Drucklast
+der Sonde (24 parallele Anfragen, Default `CONCURRENCY=24`) war fuer diesen
+Boot zu klein: `--admission-throttle-high 0.30` gegen einen Pool von 90-94
+Slots verlangt mehr als ~27 belegte Slots, 24 Anfragen erreichen die Schwelle
+nie. Die Sonde ist auf den vorhergesagten Pool (~14 x 5 = 70 Slots) kalibriert,
+der tatsaechlich gefittete ist groesser. Der Drossel-Halbsatz wurde also nicht
+gepruefen — der Anhebe-Halbsatz, um den es in Arm B geht, sehr wohl. Auch das
+ist eine Sonden-Kalibrierung, keine Controller-Aussage.
+
+### Arm C — 4/16, der Lauf, der trug (5 von 5, gruen)
+
+Byte-identisches Verhalten zum 2026-07-30: **HEALTHY nach 79 s** (damals 70 s),
+**100 Slots auf allen drei Raengen**, `ceiling=16, start=4, floor=1` — das
+angeforderte Ceiling, kein gefittetes. Keine `[auto-mamba]`-Fit-Zeile und keine
+Scheduler-Luecken-Zeile irgendwo im Log.
+
+Der aufschlussreiche Vergleich zu Arm A steht in derselben Zeile: die
+`fit_cap`-Werte sind in beiden Armen **identisch** (214 / 226 / 221). Die
+Kapazitaet der Karten ist dieselbe; verschieden ist nur, was verlangt wurde.
+Bei 4/16 liefert der Pool `admits ~20` und damit mehr als die angeforderten 16
+— deshalb bleibt das Ceiling ungefittet. Genau die Fallunterscheidung, die
+#307 behauptet.
+
+### Fremd-Spin auf GPU1: waehrend des Fensters von selbst beendet
+
+Beim Fensterstart drehte die 5090 mit **100 % SM / 120.91 W bei 0 MiB** — der
+dokumentierte Rest-Spin aus dem #312-Falsifikator-Arm (Feature aus, Rang
+gekillt), kein neuer Bug. Aus `power.csv` (5-s-Takt, 48 Punkte je Karte,
+Zeitstempel CEST):
+
+```
+02:49:16  util=100 %  power=120.91 W  mem=0 MiB      <- Rest-Spin
+02:49:51  util=0 %    power=117.08 W  mem=905 MiB    <- Arm A nimmt die Karte
+```
+
+Der Spin endete also von selbst, sobald ein neuer CUDA-Kontext die Karte
+belegte — **ohne GPU-Reset**. Danach normales Lastprofil (Spitze 100 % /
+224.64 W / 32009 MiB waehrend Arm B). Verfaelschte Zahlen sind daraus keine
+entstanden: die drei Arme pruefen Boot-, Ceiling- und Admission-Verdikte, keine
+Perf-Werte. Die einzigen Zeitwerte im Bericht sind die drei Boot-Dauern
+(78 s / 79 s) — sie liegen hinter dem Spin-Ende und sind damit unbelastet.
+
+Eine Zwischenablesung um 02:51:13 zeigte 5 / 647 / 5 MiB und sah nach einem
+Einbruch aus; `power.csv` loest das auf: sie fiel in die ~45-s-Luecke zwischen
+dem Abraeumen von Arm A (02:51:12) und dem Boot von Arm C (ab 02:51:56). Kein
+Vorfall.
+
+### Rohdaten
+
+`/spinning/gpu-battery-results/2026-07-31_307_beleg/`:
+`window_open.sh` / `window_close.sh` / `run_307.sh` (Fenster und Treiber,
+1560-s-Wand um die Kartenzeit), `s307/verdict.txt` (alle 20 Pruefzeilen),
+`s307/a64_boot.sh` und `s307/c16_boot.sh` (die Kommandos, die liefen),
+`s307/a64_markers.txt` / `s307/c16_markers.txt` (Marker-Grep, nie ein
+Volllog), `s307/a64_server_info.json` / `s307/c16_server_info.json`,
+`s307/b_raise.json` (Trajektorie mit 32 Samples), `s307/*_tail.txt`,
+`s307/*_pyspy.txt`, `logs/s307_driver.log`,
+`proofs/card_order_host.txt` / `card_order_container.txt` (NVML-Reihenfolge
+vor dem Boot gegen `--rank-gpu-id 0,1,2` gelesen: 0 = 3080, 1 = 5090,
+2 = 3080; kein `CUDA_DEVICE_ORDER` gesetzt, `cuda:0` bleibt die 5090),
+`proofs/spin_pre.txt` (Fremd-Spin vor dem Fenster), `power.csv`.
+Die Serverlogs bleiben hostseitig unter `/root/battery-bar1/s307_*.server.log`.
