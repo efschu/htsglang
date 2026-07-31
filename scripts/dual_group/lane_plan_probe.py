@@ -35,13 +35,32 @@ from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS  # noqa: E402
 
 
 def read_cfg(path: str) -> dict:
+    """The TEXT config, plus the quantization block the checkpoint carries.
+
+    ``quantization_config`` lives at the TOP level of a multimodal config
+    while every geometry field lives under ``text_config``, so the two are
+    read separately and the quant block is carried along.
+    """
     with open(os.path.join(path, "config.json")) as f:
         cfg = json.load(f)
-    return cfg.get("text_config", cfg)
+    text = dict(cfg.get("text_config", cfg))
+    quant = cfg.get("quantization_config") or text.get("quantization_config") or {}
+    if not isinstance(quant, dict):
+        quant = getattr(quant, "__dict__", {}) or {}
+    text["_quantization_config"] = quant
+    return text
 
 
 def geometry(cfg: dict) -> dict:
+    """Exactly the probe inputs ``derive_lane_plan`` passes at boot.
+
+    The list must not drift from the boot check: a probe set that is a SUBSET
+    of the real one gives a green pre-boot verdict for a partition the layers
+    then refuse (or, worse, cut differently). ``moe_intermediate_size`` and
+    the block-quant axis were the two the script was missing.
+    """
     vocab = cfg.get("vocab_size")
+    quant = cfg.get("_quantization_config") or {}
     return {
         "num_attention_heads": cfg["num_attention_heads"],
         "num_kv_heads": cfg.get("num_key_value_heads", cfg["num_attention_heads"]),
@@ -49,6 +68,9 @@ def geometry(cfg: dict) -> dict:
         "num_experts": cfg.get("num_experts"),
         "linear_attn_units": cfg.get("gdn_tp_units") or cfg.get("linear_num_key_heads"),
         "vocab_units": (vocab + 63) // 64 if vocab else None,
+        "moe_intermediate_size": cfg.get("moe_intermediate_size"),
+        "weight_block_size": quant.get("weight_block_size"),
+        "quant_method": quant.get("quant_method"),
     }
 
 
@@ -108,9 +130,10 @@ def main() -> int:
         print("NESTING: OK")
         return 0
 
-    # Search: base vectors of length 3 with rank 0 first (shared rank), plus a
-    # matching mlp/vocab vector carrying the same shape.
-    n = 3
+    # Search: base vectors of the SAME length as --base (the serving group's
+    # rank count; a two-card serving group is a two-entry vector), rank 0
+    # first (shared rank), plus a matching mlp/vocab vector of that shape.
+    n = len(_parse_vec(args.base))
     hits = []
     rng = range(1, args.max_weight + 1)
     for base in itertools.product(rng, repeat=n):

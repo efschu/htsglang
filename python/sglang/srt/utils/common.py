@@ -1463,7 +1463,15 @@ def get_device_sm_nvidia_smi():
 
 
 @contextmanager
-def maybe_reindex_device_id(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int, extra_gpu_ids: Optional[Sequence[int]] = None):
+    """Isolate the child process onto ``gpu_id`` (which becomes ``cuda:0``).
+
+    ``extra_gpu_ids`` appends further cards AFTER the own one, for the single
+    case that needs more than its own card in one process: a dual-group lane
+    whose parts span two cards (#274 families slice, DESIGN_121 section
+    11.21). The own card stays first, so ``cuda:0`` keeps meaning "this
+    rank's card" everywhere else in the process.
+    """
 
     if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
         yield gpu_id
@@ -1475,10 +1483,17 @@ def maybe_reindex_device_id(gpu_id: int):
     else:
         cuda_visible_devices = []
 
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
+    def _phys(idx: int) -> str:
+        return cuda_visible_devices[idx] if cuda_visible_devices else str(idx)
 
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+    visible = [_phys(gpu_id)]
+    for extra in extra_gpu_ids or ():
+        token = _phys(int(extra))
+        if token not in visible:
+            visible.append(token)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {os.environ['CUDA_VISIBLE_DEVICES']}")
 
     yield 0
 

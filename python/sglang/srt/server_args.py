@@ -3905,6 +3905,30 @@ class ServerArgs:
             "pure TP only.",
         ),
     ] = False
+    dual_group_lane_part_gpu_id: A[
+        Optional[List[int]],
+        Arg(
+            help="Multi-group runtime (#274) families slice: place the lane's "
+            "parts on SEVERAL cards -- one PHYSICAL GPU id per LANE rank (the "
+            "lane group has 2 ranks), in the same id space as --rank-gpu-id. "
+            "Unset (the default) keeps every lane part on the host rank's "
+            "card, which is the one-card lane of slices A-C and is byte-for-"
+            "byte unchanged. The entry for the lane rank that IS the host "
+            "rank's resident shard must name the host card; the other entry "
+            "may name a different card, which is how a lane whose weights "
+            "exceed one card is hosted (e.g. block-quantized FP8 at 28.8 GiB "
+            "against a 31.3 GiB card). This costs no communicator: the lane's "
+            "collectives are local tensor ops either way, they merely move "
+            "one activation to the foreign card and the result back. It DOES "
+            "cost a full second copy of that part's weights on the foreign "
+            "card -- the resident shard over there belongs to another "
+            "process and cannot be aliased -- so that card's own "
+            "--rank-gpu-memory-mib budget has to leave room for it. Expert "
+            "(MoE) layers are not carried across cards and are refused. "
+            "Example: --dual-group-lane-part-gpu-id 1,0.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     dual_group_lane_budget_mib: A[
         Optional[int],
         Arg(
@@ -7012,6 +7036,58 @@ class ServerArgs:
         pipeline."""
         return pp_rank * self.tp_size + tp_rank
 
+    def _validate_dual_group_lane_part_gpu_id(self) -> None:
+        """--dual-group-lane-part-gpu-id: one physical GPU id per LANE rank.
+
+        Checked here, before a single card is touched, because the flag has
+        to be right BEFORE the host process starts: the foreign card is made
+        visible to that process through CUDA_VISIBLE_DEVICES at spawn time
+        and cannot be attached afterwards.
+
+        The lane group has two ranks by construction (DESIGN_121 section 3:
+        the FAST group is a two-segment split of the serving ranks), and the
+        rank that reuses serving rank 0's resident shard cannot move off
+        serving rank 0's card -- those are the same bytes.
+        """
+        part_gpus = self.dual_group_lane_part_gpu_id
+        if part_gpus is None:
+            return
+        if len(part_gpus) != 2:
+            raise ValueError(
+                "--dual-group-lane-part-gpu-id takes one physical GPU id per "
+                f"LANE rank, and the lane group has 2 ranks; got {part_gpus}. "
+                "It is NOT indexed by serving rank."
+            )
+        if any(g < 0 for g in part_gpus):
+            raise ValueError(
+                f"--dual-group-lane-part-gpu-id must be non-negative, got "
+                f"{part_gpus}."
+            )
+        if self.rank_gpu_id is None:
+            raise ValueError(
+                "--dual-group-lane-part-gpu-id names PHYSICAL GPU ids, which "
+                "only have a defined meaning together with --rank-gpu-id "
+                "(the flag that pins serving ranks to physical cards). Set "
+                "both, or neither."
+            )
+        host_gpu = self.rank_gpu_id[0]
+        if part_gpus[0] != host_gpu:
+            raise ValueError(
+                f"--dual-group-lane-part-gpu-id {part_gpus}: lane rank 0 is "
+                f"serving rank 0's resident shard and lives on physical GPU "
+                f"{host_gpu} (--rank-gpu-id {self.rank_gpu_id}). It cannot be "
+                "placed elsewhere -- those are the same bytes, not a copy."
+            )
+        if part_gpus[1] != host_gpu and part_gpus[1] not in self.rank_gpu_id:
+            raise ValueError(
+                f"--dual-group-lane-part-gpu-id {part_gpus}: physical GPU "
+                f"{part_gpus[1]} carries no serving rank "
+                f"(--rank-gpu-id {self.rank_gpu_id}). The two-card lane places "
+                "a part beside a serving rank whose budget the operator "
+                "already sized; an otherwise unused card is a different "
+                "configuration and is not what this flag expresses."
+            )
+
     def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
         """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.
 
@@ -7489,6 +7565,10 @@ class ServerArgs:
                 )
             if self.dual_group_lane_max_requests < 1:
                 raise ValueError("--dual-group-lane-max-requests must be >= 1.")
+<<<<<<< HEAD
+=======
+            self._validate_dual_group_lane_part_gpu_id()
+>>>>>>> feat/dual-group-families-2
             if self.dual_group_lane_spec:
                 if self.speculative_algorithm is None:
                     raise ValueError(
@@ -7542,6 +7622,13 @@ class ServerArgs:
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
                 "--dual-group-lane-budget-mib only applies with " "--dual-group-lane."
+<<<<<<< HEAD
+=======
+            )
+        elif self.dual_group_lane_part_gpu_id is not None:
+            raise ValueError(
+                "--dual-group-lane-part-gpu-id only applies with " "--dual-group-lane."
+>>>>>>> feat/dual-group-families-2
             )
 
         # ---------------------------------------------------------------
