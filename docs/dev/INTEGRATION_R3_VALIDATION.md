@@ -17608,3 +17608,165 @@ Ko-Belegung, nicht Budget, sondern ein fehlender Geräte-Guard vor jedem
 Triton-getragenen Quant-Method-Aufruf auf einer Fremdkarte — plus eine
 Kartengrenze dahinter, die auf diesem Rig auch den gefixten Pfad nicht
 durchlässt.
+
+## #340: der Geräte-Guard in den Lane-Shells, und wer bei zwei Karten wirklich abweicht (2026-07-31)
+
+Zwei Posten aus dem #336-GPU-Bündel, beide abgearbeitet. Basis
+`/spinning/wt-340` (Branch `fix/lane-device-guard`) @ `0d3230698f`, Rohdaten in
+`/spinning/gpu-battery-results/2026-07-31_340_gpu/`. Ein Kartenfenster,
+10:19:36–10:26:16 UTC, 6:40 min von 30 zulässigen; danach hat eine andere
+Sitzung (`operator`, #297) die Karten regulär übernommen.
+
+### Posten 1 — der fehlende Geräte-Guard, gefixt
+
+Arm C von #336 hatte die Wurzel benannt: die vier Lane-Shells verschieben die
+Aktivierung mit `_on()` auf die Karte des Teils, wechseln aber den AKTIVEN
+CUDA-Kontext nicht mit. Triton prüft jedes Pointer-Argument gegen den aktiven
+Kontext und lehnt eine korrekt platzierte Aktivierung auf einer Fremdkarte ab;
+cuBLAS zieht seinen DeviceGuard aus den Operanden und merkt nichts davon —
+genau deshalb überlebte die dichte bf16-Lane und starb die FP8-Lane.
+
+Gefixt in `python/sglang/srt/model_executor/dual_group_lane.py`: neues
+`_active_device(device, home)` und ein `with`-Guard um die vier
+Teil-Rechnungen — `LaneColumnParallelShell.forward`,
+`LaneRowParallelShell.forward`, `LaneVocabEmbeddingShell.forward` und
+`_LaneLmHeadQuantMethod.apply`.
+
+Der Guard ist das exakte Gegenstück zu `_on`: er greift unter derselben
+Bedingung, unter der die Aktivierung überhaupt reist (`device != home`). Damit
+bleibt die EINKARTEN-Lane — der Normalfall, und der, der unter CUDA-Graphs
+läuft — vollständig ohne `cudaSetDevice`; sie bekommt einen geteilten,
+zustandslosen `nullcontext` statt eines pro Shell und Forward neu erzeugten.
+
+**Audit der Geschwister-Stellen** (dieselbe Musterfrage: `_on()`-Verschiebung
+ohne Guard):
+
+| Stelle | Befund |
+|---|---|
+| `LaneFusedMoEShell.forward` | kein `_on()`; der Konstruktor verweigert kartenübergreifende Teile (`_spans_cards`) — nicht betroffen |
+| `_compose_column_weights_inplace` (Z. 670) | `_on()` auf Gewichtsscheiben, danach `torch.cat` — reine Tensor-Kopien mit eigenem Guard, kein Triton, einmalig beim Bring-up |
+| `_finalize_hull_params` (Z. 742) | dito, GDN-Vektoren |
+| `_prefill`/`tick` (Z. 2656, 3746, 3800, 3826) | `prefill_input_ids_cpu.to(batch.device)` — Host→eigene Karte, `batch.device` IST die ambiente Karte des Lane-Threads (`_worker_loop` pinnt sie einmalig mit `torch.cuda.set_device(self.runner.gpu_id)`) |
+
+Damit ist die Familie geschlossen: der Lane-Worker setzt sein Gerät genau
+einmal, und jede Stelle, an der danach eine Fremdkarte gerechnet hat, trägt
+jetzt den Guard.
+
+**Hermetischer Test** (`TestLanePartsSwitchTheCudaContext`, 6 Fälle, CPU-only):
+`_active_device` wird durch einen Rekorder ersetzt, und die Quant-Methoden der
+Teile weisen — wie Triton — jede Aktivierung ab, deren Gerät nicht das
+aktive ist. Dazu ein Falsifikator: ohne Guard MUSS derselbe Aufbau mit
+`cannot be accessed` scheitern, sonst prüften die vier Tests nur den
+`_on`-Spion und der Guard wäre löschbar, ohne dass etwas rot wird.
+
+**Kartenbeleg** (`scripts/dual_group/r10/guard_micro.py`, Host cuda:0 = 5090,
+Fremdkarte cuda:1 = 3080). Bewusst mit einem architekturneutralen
+bf16-Triton-Matmul statt mit dem Block-FP8-Kernel, weil der FP8-Kernel auf
+sm86 eine ZWEITE, unabhängige Wand hat (siehe unten) und beide Effekte in
+`c_micro.py` noch übereinanderlagen:
+
+| Fall | Ergebnis | max. Abweichung |
+|---|---|---|
+| A — Fremdstart, ohne Guard | **FAILURE** `ValueError: Pointer argument (at 0) cannot be accessed from Triton` | — |
+| B — Fremdstart, mit Guard | **SUCCESS** | 8,1e-4 (bf16-Rauschen) |
+| C — echte `LaneColumnParallelShell` über zwei Karten | **SUCCESS** | 8,5e-4 |
+
+Fall C ist der eigentliche Beleg: nicht ein nachgebauter Start, sondern die
+gefixte Shell selbst, mit Teilen auf zwei Karten, numerisch gegen ein
+Vollbreiten-Matmul geprüft.
+
+**Was der Guard NICHT löst, mit Code belegt.** Ein FP8-Zweikarten-Boot auf
+5090 + 3080 bleibt gesperrt, unabhängig vom Guard. Die Kernel-Wahl für
+Block-FP8 ist prozessglobal und liest GERÄT 0, nie das Gerät des Gewichts:
+`initialize_fp8_gemm_config` (`fp8_utils.py:907-925`) wird aus
+`scheduler.py:961` vor jedem Laden aufgerufen und setzt bei `is_sm120_supported()`
+den Backend-Global auf Triton; `is_sm120_supported`/`cutlass_fp8_supported`/
+`can_auto_enable_marlin_fp8` sind `lru_cache(maxsize=1)` über
+`get_device_capability_no_init()` (`common.py:394-437`), also Gerät 0. Im
+Lane-Host-Prozess ist Gerät 0 die 5090 — die 3080 bekommt damit den
+Triton-Pfad aufgezwungen, obwohl ihr sm86-Weg Marlin wäre
+(`fp8.py:483-487`, `can_auto_enable_marlin_fp8` = `80 <= sm < 89`). Der
+gefixte Guard startet den Kernel jetzt im richtigen Kontext, und dort
+scheitert er an `type fp8e4nv not supported in this architecture` — dieselbe
+Meldung wie in `micro_B.json` von #336. **Folgeposten, präzise benannt:**
+`FP8_GEMM_RUNNER_BACKEND` sowie die drei Capability-Gates brauchen ein
+`device_id` und einen darauf verschlüsselten Cache, damit ein Lane-Teil auf
+sm86 Marlin wählt, während der Host-Teil Triton behält. Das ist eine Änderung
+an der FP8-Dispatch-Schicht, nicht am Lane-Code.
+
+Der geplante FP8-Boot lief deshalb nur bis zur Speicherdimensionierung: mit
+den #336-Budgets `27000,9500` bleiben nach 25,45 GB Gewichten auf TP0 noch
+0,92 GiB, und `handle_max_mamba_cache` bricht mit `total_rest_memory=-0.08 GB`
+ab — vor jedem Lane-Forward, also ohne Aussage über den Guard in die eine oder
+andere Richtung. Nicht nachgeholt: das Fenster war zu Ende und die Karten
+waren regulär von einer anderen Sitzung übernommen.
+
+### Posten 2 — die Zweikarten-Divergenz ist uneven-TP, nicht die Lane
+
+#336 Arm B hatte zwei Zutaten auf einmal geändert: die abweichende Gruppe war
+BEIDES, 3:1-uneven UND mit Lane. Vier Arme auf demselben Fahrzeug (dichtes
+Llama-3.1-8B-Instruct, dieselben drei Prompts, greedy, 12 Token,
+`--disable-radix-cache`) trennen sie. Die Referenz wurde auf DIESEM Commit neu
+gemessen statt übernommen — und stimmt Token für Token mit der von #336
+überein, auf allen drei Prompts.
+
+| Prompt | Referenz TP=1 | 3:1 + Lane | 3:1 ohne Lane | even TP=2 |
+|---|---|---|---|---|
+| alphabet | `[86,198,87,198]` | `[86,326,326,320]` **ab 1** | `[86,326,326,320]` **ab 1** | `[86,198,87,198]` ✓ |
+| squares | `[717,220,8929,198]` | `[717,62,62,565]` **ab 1** | `[717,62,62,62]` **ab 1** | `[717,220,8929,198]` ✓ |
+| code | `[286,1853,284,659]` | `[286,311,279,220]` **ab 1** | `[286,311,279,220]` **ab 1** | `[286,1853,284,659]` ✓ |
+
+Alle Böden grün (A-vs-A je Prompt), Verdikt auf allen drei Prompts einstimmig:
+**nur 3:1 weicht ab — die Abweichung ist uneven-TP-spezifisch.** Die Lane ist
+entlastet, und zwar in einem Boot: 3:1 OHNE Lane weicht identisch ab. Der
+even-TP=2-Arm läuft über denselben Platzierungspfad (`--rank-gpu-id` plus
+skalares Budget, nur `--rank-tp-ratio` fehlt) und trifft die Referenz exakt —
+es ist also weder TP=2 als solches noch die Platzierung, sondern der ungleiche
+Split. Erster abweichender Index ist überall 1, das erste Token stimmt überall:
+der Prompt-Prefill trägt, die Divergenz entsteht beim ersten echten
+Decode-Schritt.
+
+Zwei Nebenbefunde, ehrlichkeitshalber:
+
+* `3:1 + Lane` und `3:1 ohne Lane` sind bei `squares` ab Index 3 nicht mehr
+  identisch (`565` vs `62`). Beide weichen ab Index 1 von der Referenz ab; ab
+  einer Divergenz laufen zwei Trajektorien erwartbar auseinander. Das ändert
+  das Verdikt nicht, verbietet aber die stärkere Aussage „Lane byte-identisch
+  zu ohne-Lane".
+* Der Kontrollarm `even_tp2_stock` (keine Fork-Platzierungsflags, Ränge nur
+  über `CUDA_VISIBLE_DEVICES`) BOOTET auf gemischten Karten gar nicht:
+  `RuntimeError: The memory capacity is unbalanced` (`model_runner.py:1734`,
+  19,2 GB vs 30,5 GB). Das ist kein Fehlschlag des Arms, sondern die Antwort
+  auf seine Frage — der Stock-Pfad lehnt heterogene Karten ab, und genau dafür
+  existieren die Platzierungsflags des Forks. Für das Verdikt wird er nicht
+  gebraucht: `even_tp2_nolane` trifft die Referenz bereits.
+
+**Folgeposten:** die Wurzel der uneven-TP=2-Divergenz ist mit diesem Fenster
+eingekreist, aber nicht gefunden — sie ist NICHT die Lane und NICHT der
+Platzierungspfad. Nächster Schritt ist die Layer-Delta-Sonde nach
+#124-Muster (`--determinism-logits-dump-dir`, `model_runner.py:4159`) gegen
+die TP=1-Referenz, die den ersten abweichenden Layer benennt; die
+Verdachtsfamilie ist die #100-Familie (Head-Gather / uneven Vocab) am ersten
+Decode-Schritt.
+
+### Testzahlen
+
+* `test/registered/unit/distributed/test_dual_group_lane.py`: **51 passed**
+  (45 vorher + 6 neue), CPU-only, `CUDA_VISIBLE_DEVICES=99`.
+* `test/registered/unit/distributed/` gesamt: **1426 passed, 334 subtests
+  passed, 8 skipped, 17 failed** — Fehlermenge Zeile für Zeile identisch mit
+  der Basis vor dem Eingriff (per `git stash` gemessen, `diff` leer). Die 17
+  sind Umgebungsfehler ohne Bezug (`KeyError: 'LOCAL_RANK'`, `retry() exceed
+  maximum number of retries`); dazu drei Dateien, die schon bei der Collection
+  scheitern und in beiden Läufen ausgeschlossen wurden.
+* `black`, `ruff`, `codespell`: sauber auf allen berührten Dateien.
+  `isort` meckert `dual_group_lane.py` an — unverändert auch auf der Basis,
+  es wurde kein Import hinzugefügt.
+
+### Offen
+
+1. FP8-Dispatch pro Gerät statt pro Prozess (Folgeposten oben) — ohne ihn
+   bleibt jede FP8-Lane über gemischte Architekturen gesperrt.
+2. FP8-Zweikarten-Boot mit tragfähigen Budgets (`27000,9500` reicht auf diesem
+   Rig nicht) — erst nach 1 aussagekräftig.
+3. Layer-Delta-Sonde für die uneven-TP=2-Divergenz.
