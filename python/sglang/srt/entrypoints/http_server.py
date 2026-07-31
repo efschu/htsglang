@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    KvReshardReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -879,6 +880,23 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
+
+
+@app.api_route("/kv_reshard", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def kv_reshard(obj: Annotated[KvReshardReqInput, Body()], request: Request):
+    """#297: arm a phase-boundary KV reshard to obj.target_vector (one entry
+    per DCP rank, from the set declared via --kv-reshard-vectors). The move
+    itself commits at the next consensus boundary where every rank is fully
+    idle; watch the KV-RESHARD log lines for the DONE record."""
+    try:
+        ret = await _global_state.tokenizer_manager.kv_reshard(obj.target_vector)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

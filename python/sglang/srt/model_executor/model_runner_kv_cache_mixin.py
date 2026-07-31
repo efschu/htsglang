@@ -3266,6 +3266,38 @@ class ModelRunnerKVCacheMixin:
                     _hybrid_pool_size = dcp_compact_pool_rows(
                         self.max_total_num_tokens, _S, _ratio_r
                     )
+                    # #297 fitted ceiling: with --kv-reshard-vectors set, the
+                    # pool must hold this rank's rows under EVERY declared
+                    # vector, so a later phase-boundary reshard never grows
+                    # the pool (stable addresses -> decode CUDA graphs stay
+                    # valid without recapture). The context budget C was
+                    # already min-ruled over the same set in
+                    # _apply_token_constraints, so this maximum is funded.
+                    if getattr(self.server_args, "kv_reshard_vectors", None):
+                        from sglang.srt.layers.dcp.reshard_plan import (
+                            reshard_ceiling_rows,
+                            reshard_vector_set,
+                        )
+
+                        _reshard_vecs = reshard_vector_set(
+                            self.server_args.kv_reshard_vectors,
+                            self.dcp_size,
+                            tuple(_ratios),
+                        )
+                        _ceiling = reshard_ceiling_rows(
+                            self.max_total_num_tokens,
+                            _reshard_vecs,
+                            get_parallel().attn_dcp_rank,
+                        )
+                        if _ceiling != _hybrid_pool_size:
+                            logger.info(
+                                "#297 fitted ceiling: full-attention pool "
+                                "rows %d -> %d (vector set %s)",
+                                _hybrid_pool_size,
+                                _ceiling,
+                                _reshard_vecs,
+                            )
+                            _hybrid_pool_size = _ceiling
                 elif getattr(self, "_wl_spill_phys_tokens", 0):
                     # Weightless-KV B1 host spill: the DEVICE tensors are sized
                     # to the PROFILED capacity D (device slots + staging), NOT
@@ -3844,6 +3876,46 @@ class ModelRunnerKVCacheMixin:
             split_factor = cp_token_split_factor(self.dcp_size)
             ratio_r = ratios[get_parallel().attn_dcp_rank]
             local_unit = int(token_capacity) // int(ratio_r)
+            if getattr(self.server_args, "kv_reshard_vectors", None):
+                # #297 fitted ceiling: C must fit EVERY declared reshard
+                # vector on EVERY rank, not only the boot vector. One
+                # min-reduction over the per-vector local units (the flag is
+                # group-uniform, so the payload shape is too), then the
+                # binding vector decides C. Flag unset keeps the original
+                # single-scalar reduce below, byte-identical.
+                from sglang.srt.layers.dcp.reshard_plan import reshard_vector_set
+
+                _vecs = reshard_vector_set(
+                    self.server_args.kv_reshard_vectors,
+                    self.dcp_size,
+                    tuple(ratios),
+                )
+                _rank = get_parallel().attn_dcp_rank
+                _units = torch.tensor(
+                    [int(token_capacity) // int(v[_rank]) for v in _vecs],
+                    dtype=torch.int64,
+                )
+                torch.distributed.all_reduce(
+                    _units,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=get_world_group().cpu_group,
+                )
+                _caps = [int(u) * sum(v) for u, v in zip(_units.tolist(), _vecs)]
+                token_capacity = min(_caps)
+                _binding = _vecs[_caps.index(token_capacity)]
+                logger.info(
+                    "#297 fitted-ceiling token sizing: candidate capacities "
+                    "%s for vectors %s -> C = %d (binding vector %s)",
+                    _caps,
+                    _vecs,
+                    token_capacity,
+                    _binding,
+                )
+                if user_limit is not None:
+                    token_capacity = min(token_capacity, user_limit)
+                return self._apply_hybrid_kv_token_cap(
+                    token_capacity, hybrid_cap, hybrid_cap_kind
+                )
             local_blocks = torch.tensor(local_unit, dtype=torch.int64)
             torch.distributed.all_reduce(
                 local_blocks,

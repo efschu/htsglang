@@ -188,6 +188,43 @@ Non-obvious points, each load-bearing:
 Validate with CUDA graphs and speculative decoding ON (the defaults above) —
 eager-only validation hides graph-replay bugs.
 
+### 4.1.1 Phase-boundary KV resharding (#297): `--kv-reshard-vectors`
+
+Add to the 4.1 recipe to make the KV token vector re-shardable at runtime
+(the physical actuator behind the #287 ladder's `dcp_ratio` rung):
+
+```bash
+  --rank-kv-ratio 7,3,3 \
+  --kv-reshard-vectors 2,11,10 \
+```
+
+- `--rank-kv-ratio <vector>` pins the BOOT vector (a non-`coupled` value
+  implies the weighted-DCP path; the two `SGLANG_UNEVEN_DCP*` env vars from
+  the recipe are still required). `--kv-reshard-vectors` declares the
+  vectors the server may reshard to; the boot vector is always implicitly
+  in the set (resharding back is always legal).
+- The declaration is paid at boot: each rank's full-attention KV pool is
+  sized to the FITTED CEILING over the whole set, and the global context
+  budget shrinks to what fits every declared vector on every rank. That is
+  the price of stable pool addresses — decode CUDA graphs stay valid across
+  a reshard without recapture.
+- Trigger by hand: `curl -s -X POST http://127.0.0.1:<port>/kv_reshard -H
+  'Content-Type: application/json' -d '{"target_vector":[2,11,10]}'`.
+  Arming returns immediately; the move commits at the next consensus
+  boundary where every rank is fully idle. Watch the log for
+  `KV-RESHARD DONE ... in <ms>` (duration, rows and MiB per direction).
+- With `--kv-pressure-ladder` also set, a `dcp_ratio` FLIP arms the reshard
+  automatically (the boot inventory then no longer lists `dcp_ratio` as
+  PLANNED-ONLY), provided the rung's operating-grid vectors are all in the
+  declared set — otherwise the boot log names the uncovered vectors and the
+  rung stays planned-only.
+- Stage A limits (arming refuses, loudly, with the reason): weighted uneven
+  DCP + hybrid-linear pool family only; not combinable with PD
+  disaggregation, hierarchical-cache storage, kv-session-offload,
+  weightless-KV ranks, or the dual-group lane.
+- Flag unset = nothing is constructed, no extra collective, byte-identical
+  to a build without #297.
+
 ### 4.2 Co-location (several ranks on one physical GPU)
 
 Duplicates in `--rank-gpu-id` (e.g. `0,0,1,2`) require a **runtime NCCL >=

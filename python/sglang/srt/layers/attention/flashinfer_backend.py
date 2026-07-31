@@ -683,6 +683,14 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cp_lo = _cp_prefix[self.dcp_rank]
             self.cp_hi = _cp_prefix[self.dcp_rank + 1]
             self.cp_ratio = self.cp_hi - self.cp_lo
+            # #297: these four fields are an init-time SNAPSHOT of the token
+            # vector. A phase-boundary KV reshard installs a new vector at
+            # runtime; registering makes this instance reachable for the
+            # cutover's refresh (weak ref -- swapped-out per-rung backends
+            # are not kept alive).
+            from sglang.srt.layers.dcp.owner import register_owner_bounds_consumer
+
+            register_owner_bounds_consumer(self)
         self.dcp_kv_replicated_heads = False
         # Generic fail-fast for TP > num_kv_heads (task #62): the
         # REPLICATED-KV geometry stays free of KV-cache duplication only
@@ -1276,6 +1284,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 dim=0,
             ),
         )
+
+    def refresh_dcp_owner_bounds(self) -> None:
+        """#297 cutover hook: re-derive the cached weighted owner bounds
+        (cp_S/cp_lo/cp_hi/cp_ratio) from the freshly installed token vector.
+        Called by ``refresh_all_owner_bounds`` after a phase-boundary KV
+        reshard, while the scheduler is idle -- never mid-forward. Everything
+        else this backend derives from the bounds is computed per batch, so
+        the next forward pass sees the new ownership consistently."""
+        if not self.uneven_dcp_weighted:
+            return
+        from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
+
+        (
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            self.cp_ratio,
+        ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         """IN-graph hook, recorded at the START of every captured decode body

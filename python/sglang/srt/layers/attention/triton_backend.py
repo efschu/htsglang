@@ -716,6 +716,11 @@ class TritonAttnBackend(AttentionBackend):
                 self.cp_hi,
                 self.cp_ratio,
             ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
+            # #297: the four fields are an init-time snapshot; register so a
+            # runtime KV reshard's cutover can refresh this instance.
+            from sglang.srt.layers.dcp.owner import register_owner_bounds_consumer
+
+            register_owner_bounds_consumer(self)
         # NOT _plan_aware_num_q_heads(...) * dcp_size: that helper is already
         # plan-aware, so multiplying double-counts and UNDER-sizes the decode
         # workspaces on the smaller ranks under an uneven plan. See
@@ -918,6 +923,19 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+    def refresh_dcp_owner_bounds(self) -> None:
+        """#297 cutover hook: re-derive the cached weighted owner bounds from
+        the freshly installed token vector (see the flashinfer twin for the
+        full rationale). Idle-boundary only, never mid-forward."""
+        if not self.uneven_dcp_weighted:
+            return
+        (
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            self.cp_ratio,
+        ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
 
     def get_num_kv_splits(
         self,

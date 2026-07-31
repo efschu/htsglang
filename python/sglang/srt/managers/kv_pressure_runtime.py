@@ -33,18 +33,19 @@ THE THREE RULES, IN CODE:
    ``KV-PRESSURE-LADDER`` prefix (the card proof greps for it); an
    actuator that is only PLANNED in Stage 1 says so in the same breath.
 
-STAGE 1 ACTUATION (honest inventory). ``admission_cap`` and
-``session_offload`` are REAL actuators (the floating admission limiter and
-the #236 spill manager exist and are driven here). ``dcp_ratio`` -- the
-KV-vector flip, first rung of the relief order -- is PLANNED-ONLY: the
-flip selects and logs the depth/format-aware target vector from the rung's
-operating grid, but no byte moves and no ownership changes, because the
-runtime ratio is baked into the boot pool geometry and the attention
-backends' cached owner ranges; the physical handover (including the
-new-allocations-only variant) is #297. ``kv_spill`` and
-``weightless_rank`` rungs are likewise planned-only. The wired/planned
-split is validated at construction and printed at boot, so a ladder never
-quietly promises relief it cannot deliver.
+ACTUATION (honest inventory). ``admission_cap`` and ``session_offload``
+are REAL actuators (the floating admission limiter and the #236 spill
+manager exist and are driven here). ``dcp_ratio`` -- the KV-vector flip,
+first rung of the relief order -- is REAL when ``--kv-reshard-vectors``
+declares a ceiling set covering the rung's operating grid: the flip then
+ARMS a #297 phase-boundary reshard (managers/kv_reshard.py) that
+physically moves the existing KV and refreshes every owner-bounds snapshot
+at the next group-wide idle consensus boundary. Without the flag (or with
+an uncovered grid) it stays PLANNED-ONLY exactly as in Stage 1: the flip
+selects and logs the target vector, no byte moves. ``kv_spill`` and
+``weightless_rank`` rungs remain planned-only. The wired/planned split is
+validated at construction and printed at boot, so a ladder never quietly
+promises relief it cannot deliver.
 """
 
 from __future__ import annotations
@@ -116,6 +117,7 @@ class KvPressureRuntime:
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         admission_limiter=None,
         spill_fn: Optional[Callable[[int], bool]] = None,
+        reshard_arm: Optional[Callable[[tuple], tuple]] = None,
     ):
         if consensus_interval < 1:
             raise ValueError(
@@ -135,6 +137,12 @@ class KvPressureRuntime:
         self._collective_min = collective_min
         self._limiter = admission_limiter
         self._spill_fn = spill_fn
+        # #297: when the phase-boundary reshard runtime is armed for this
+        # group AND its ceiling set covers the ladder's dcp_ratio grid, the
+        # builder passes its arm() here and the dcp_ratio rung becomes a
+        # REAL actuator (the flip arms a reshard that commits at the next
+        # group-wide idle boundary). None = Stage-1 behavior, planned-only.
+        self._reshard_arm = reshard_arm
         self._round = 0
         self._pending: List[OccupancySample] = []
         self._epoch = 0
@@ -167,6 +175,9 @@ class KvPressureRuntime:
                         "--enable-kv-session-offload. Refusing at boot "
                         "instead of at the first pressure episode."
                     )
+            elif feature == "dcp_ratio" and reshard_arm is not None:
+                # #297 wired: the flip arms a physical reshard.
+                pass
             else:
                 planned_only.append(feature)
         self.planned_only_reliefs = tuple(planned_only)
@@ -334,7 +345,19 @@ class KvPressureRuntime:
                 f"{list(point.layer_split)} [{point.provenance}]"
             )
         wired: str
-        if step.relief_feature == "admission_cap" and self._limiter is not None:
+        if (
+            step.relief_feature == "dcp_ratio"
+            and self._reshard_arm is not None
+            and grid is not None
+            and phase in grid.phases
+        ):
+            point = grid.select(phase, min(max(fill, 0.0), 1.0))
+            ok, msg = self._reshard_arm(tuple(point.kv_vector))
+            wired = (
+                f"actuator WIRED (#297): reshard to {list(point.kv_vector)} "
+                f"{'armed' if ok else 'REFUSED'} -- {msg}"
+            )
+        elif step.relief_feature == "admission_cap" and self._limiter is not None:
             changed = self._limiter.throttle(running_bs)
             wired = (
                 f"actuator WIRED: admission limit -> {self._limiter.current} "
@@ -449,6 +472,37 @@ def build_kv_pressure_runtime(scheduler) -> Optional[KvPressureRuntime]:
             return bool(scheduler.kv_session_offload.try_spill(batch))
 
     collective = default_collective_min(scheduler.tp_cpu_group) if tp_size > 1 else None
+
+    # #297: bind the dcp_ratio rung to the phase-boundary reshard runtime,
+    # but only when the declared ceiling set covers EVERY vector the rung's
+    # operating grid can select -- an actuator that would refuse its own
+    # targets at flip time must not be inventoried as wired.
+    reshard_arm = None
+    reshard_rt = getattr(scheduler, "kv_reshard_runtime", None)
+    if reshard_rt is not None:
+        grid_vectors = set()
+        for step in ladder.table.steps:
+            if step.relief_feature == "dcp_ratio" and step.operating_grid is not None:
+                for point in step.operating_grid.points:
+                    grid_vectors.add(tuple(point.kv_vector))
+        uncovered = sorted(
+            v for v in grid_vectors if v not in set(reshard_rt.allowed_vectors)
+        )
+        if uncovered:
+            logger.warning(
+                "%s dcp_ratio rung stays PLANNED-ONLY despite "
+                "--kv-reshard-vectors: operating-grid vectors %s are not in "
+                "the declared ceiling set %s (add them and reboot to wire "
+                "the rung).",
+                LOG_PREFIX,
+                uncovered,
+                list(reshard_rt.allowed_vectors),
+            )
+        else:
+
+            def reshard_arm(vec, _rt=reshard_rt):
+                return _rt.arm(vec, source="pressure_ladder")
+
     return KvPressureRuntime(
         ladder,
         consensus_interval=int(
@@ -458,4 +512,5 @@ def build_kv_pressure_runtime(scheduler) -> Optional[KvPressureRuntime]:
         collective_min=collective,
         admission_limiter=scheduler.admission_limiter,
         spill_fn=spill_fn,
+        reshard_arm=reshard_arm,
     )

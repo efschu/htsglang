@@ -1427,6 +1427,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class KvReshardReqInput(BaseReq, kw_only=True):
+    """#297: arm a phase-boundary KV reshard to the given weighted uneven-DCP
+    token vector (one entry per DCP rank; must be in the set declared via
+    --kv-reshard-vectors). Arming returns immediately; the move commits at
+    the next consensus boundary where every rank is fully idle."""
+
+    target_vector: List[int]
+
+
+class KvReshardReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
