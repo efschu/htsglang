@@ -712,6 +712,16 @@ LANE_NVFP4_NATIVE = "nvfp4_native"
 #: which card it lands on. That gap (measured band 2.6x on the reference rig's
 #: 5090) is what a single per-rank score cannot represent.
 LANE_NVFP4_MARLIN = "nvfp4_marlin"
+#: Native INT8 W8A8 through ``sgl_kernel.int8_scaled_mm``: int8 weights AND
+#: dynamically per-token-quantized int8 activations on the IMMA tensor path.
+#: The kernel's SM dispatch is closed-ended (sm75, sm80..89, sm90, sm120+ since
+#: #327a) and sm100/sm103 have no classic IMMA path at all, so whether a card
+#: has this lane is a fact to be discovered by calling it -- which is precisely
+#: what the probe does. Measured on the reference rig (#327): 678.00 TFLOPS on
+#: the 5090 (1.21x its own fp8_native lane) and 177.74 / 182.23 on the 3080s
+#: (2.96x / 3.05x their best fp8 lane, which is fp8_marlin -- sm_86 has no fp8
+#: tensor path).
+LANE_INT8_NATIVE = "int8_native"
 
 #: Checkpoint compute format -> the lanes a card may take for it, in the order
 #: the serving path tries them (fp8: native, then Marlin, then dequant --
@@ -731,11 +741,20 @@ LANE_NVFP4_MARLIN = "nvfp4_marlin"
 #: lane per family the moment the probes land. Until then a card takes the
 #: named bf16 fallback below, and the fallback says the lane is unprobed rather
 #: than telling the reader to re-run a probe that does not exist.
+#: ``int8`` carries ONE lane on purpose. The fp8 family has a three-lane ladder
+#: because a card without fp8 tensor cores still serves an fp8 checkpoint
+#: through Marlin or a dequant fallback; INT8 W8A8 has no such fallback in this
+#: tree (there is no ``dequant_int8_channel_weight``), so a card whose
+#: ``int8_scaled_mm`` dispatch has no arm cannot serve the checkpoint at all.
+#: Registering a second lane that the serving path could not take either would
+#: make the plan lie; the existing "no lane measured on this card" branch of
+#: ``rank_gemm_scores`` already produces the correct loud bf16 fallback.
 _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
     "bf16": (LANE_BF16,),
     "fp8": (LANE_FP8_NATIVE, LANE_FP8_MARLIN, LANE_FP8_W8A16),
     "nvfp4_a4": (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN),
     "nvfp4_a16": (LANE_NVFP4_MARLIN,),
+    "int8": (LANE_INT8_NATIVE,),
 }
 
 #: Human-readable lane names for the plan log.
@@ -746,6 +765,7 @@ _LANE_LABELS = {
     LANE_FP8_W8A16: "fp8 W8A16 dequant",
     LANE_NVFP4_NATIVE: "nvfp4 native (block-scaled FP4)",
     LANE_NVFP4_MARLIN: "nvfp4 Marlin (weight-only W4A16)",
+    LANE_INT8_NATIVE: "int8 W8A8 native (int8_scaled_mm)",
 }
 
 
@@ -937,6 +957,59 @@ def _bench_gemm_w8a16_tflops(dev) -> Tuple[Optional[float], str]:
         torch.cuda.empty_cache()
 
 
+def _bench_gemm_int8_native_tflops(dev) -> Tuple[Optional[float], str]:
+    """Native INT8 W8A8 GEMM via ``sgl_kernel.int8_scaled_mm``, or ``(None, why)``.
+
+    Per-token activation scales and per-channel weight scales -- the shape the
+    W8A8 serving path produces (``per_token_quant_int8`` then
+    ``int8_scaled_mm``), so the number prices the kernel that would actually
+    run. The lane is asked FUNCTIONALLY: the kernel's SM dispatch is
+    closed-ended and whether this card has a branch is a fact to be discovered
+    by calling it, not inferred from a capability integer -- the scheme's own
+    ``get_min_capability() == 80`` admits sm_100/sm_103, which have no classic
+    IMMA path at all and would abort inside CUTLASS at the first forward.
+
+    Landed unchanged from the standalone #320 script
+    (``p320_int8_lane_probe.py``), which has run twice on the reference rig."""
+    import torch
+
+    try:
+        from sgl_kernel import int8_scaled_mm
+    except Exception as ex:
+        return (
+            None,
+            f"sgl_kernel.int8_scaled_mm not importable: {type(ex).__name__}: {ex}",
+        )
+
+    a = b = sa = sb = None
+    try:
+        a = torch.randint(
+            -127, 127, (_PROBE_GEMM_M, _PROBE_GEMM_K), dtype=torch.int8, device=dev
+        )
+        # Column-major right operand: the kernel asserts mat_b.stride(0) == 1,
+        # so it is built as (N, K) and transposed, exactly like the fp8 native
+        # lane builds its own mat2.
+        b = torch.randint(
+            -127, 127, (_PROBE_GEMM_N, _PROBE_GEMM_K), dtype=torch.int8, device=dev
+        ).t()
+        sa = torch.ones(_PROBE_GEMM_M, dtype=torch.float32, device=dev)
+        sb = torch.ones(_PROBE_GEMM_N, dtype=torch.float32, device=dev)
+
+        def fn(a=a, b=b, sa=sa, sb=sb):
+            return int8_scaled_mm(a, b, sa, sb, out_dtype=torch.bfloat16, bias=None)
+
+        # One call outside the timing harness: a dispatch that has no branch
+        # for this card must surface as a note here, not as a crash inside the
+        # warmup loop.
+        fn()
+        return _time_gemm_tflops(dev, fn), ""
+    except Exception as ex:
+        return None, f"int8 GEMM did not run: {type(ex).__name__}: {ex}"
+    finally:
+        del a, b, sa, sb
+        torch.cuda.empty_cache()
+
+
 class ProbeEnvironmentError(RuntimeError):
     """The probe's OWN interpreter is missing something the ``lanes`` group
     needs to measure honestly -- as opposed to a genuine per-card GEMM
@@ -1002,6 +1075,7 @@ _LANE_PROBES = {
     LANE_FP8_NATIVE: _bench_gemm_fp8_native_tflops,
     LANE_FP8_MARLIN: _bench_gemm_fp8_marlin_tflops,
     LANE_FP8_W8A16: _bench_gemm_w8a16_tflops,
+    LANE_INT8_NATIVE: _bench_gemm_int8_native_tflops,
 }
 
 
@@ -1754,6 +1828,41 @@ def _is_fp8_like(method: str, fmt: str) -> bool:
     return method == "fp8" or "float8" in method or "float" in fmt or "fp8" in fmt
 
 
+def _is_int8_w8a8_like(method: str, fmt: str, qc: dict) -> bool:
+    """Whether a ``quantization_config`` denotes a genuine INT8 **W8A8** scheme
+    -- the one ``sgl_kernel.int8_scaled_mm`` serves.
+
+    False for weight-only INT8 (W8A16): compressed-tensors writes those as
+    ``format: "pack-quantized"`` with no ``input_activations`` block at all,
+    the weight is dequantized before a bf16 matmul, and none of the int8
+    tensor-core advantage this lane measures applies to them.
+
+    The ``input_activations`` block is trusted over the ``format`` string
+    because it is what actually decides which kernel runs, and 8-bit INT
+    activations are required so that a 4-bit or float variant cannot take this
+    lane by accident. The standalone ``w8a8_int8`` method carries no
+    ``config_groups`` -- its name in ``quant_method`` IS the declaration."""
+    if method not in ("compressed-tensors", "compressed_tensors", "w8a8_int8"):
+        return False
+    if method == "w8a8_int8":
+        return True
+    if "pack-quantized" in fmt:
+        return False
+    for group in (qc.get("config_groups") or {}).values():
+        weights = (group or {}).get("weights") or {}
+        acts = (group or {}).get("input_activations") or {}
+        try:
+            wbits = int(weights.get("num_bits") or 0)
+            abits = int(acts.get("num_bits") or 0)
+        except (TypeError, ValueError):
+            continue
+        wtype = str(weights.get("type") or "").lower()
+        atype = str(acts.get("type") or "").lower()
+        if wbits == 8 and abits == 8 and wtype == "int" and atype in ("int", ""):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Compute families: one score per rank is not enough.
 #
@@ -1885,8 +1994,18 @@ def _ct_group_format(group: dict) -> Optional[str]:
         except (TypeError, ValueError):
             act_bits = 0
         return "nvfp4_a4" if act_bits == 4 else "nvfp4_a16"
-    if bits in (4, 8):
-        return "int4" if bits == 4 else "int8"  # no lane table (loud fallback)
+    if bits == 4:
+        return "int4"  # no lane table (loud fallback)
+    if bits == 8:
+        # INT8: only a W8A8 group takes the int8_scaled_mm lane. A weight-only
+        # group (no 8-bit input_activations) runs through Marlin wNa16 and has
+        # no lane table, so it keeps a key that resolves to the loud bf16
+        # fallback rather than borrowing the wrong kernel's number.
+        try:
+            act_bits = int(acts.get("num_bits") or 0)
+        except (TypeError, ValueError):
+            act_bits = 0
+        return "int8" if act_bits == 8 else "int8_a16"
     return None
 
 
@@ -2034,6 +2153,12 @@ def checkpoint_compute_format(model_path: Optional[str]) -> Tuple[str, str]:
         block = qc.get("weight_block_size")
         shape = f", weight_block_size {block}" if block else ""
         return "fp8", f"fp8 (quant_method={method or '?'}, fmt={fmt or '?'}{shape})"
+    if _is_int8_w8a8_like(method, fmt, qc):
+        return (
+            "int8",
+            f"int8 W8A8 (quant_method={method or '?'}, fmt={fmt or '?'}, "
+            "dynamic per-token activations)",
+        )
     return (
         method or "unknown",
         f"quant_method={method or '?'}, format={fmt or '?'}",

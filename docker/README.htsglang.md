@@ -65,6 +65,27 @@ Two consequences:
 * sgl-kernel's floor is **sm_80**, and it is cubin-only, so an RTX 2080 Ti has
   no executable code in that wheel even though the module imports fine.
 
+### The image's sgl-kernel is upstream's, and the fork's tree is ahead of it
+
+`sgl-kernel` comes from PyPI at the pinned `SGL_KERNEL_VERSION`. The fork also
+carries CUDA changes in `sgl-kernel/csrc/` that no published wheel contains,
+so an image built from this Dockerfile does **not** have them. Current delta,
+one entry:
+
+| change | consequence in the image |
+|---|---|
+| INT8 `int8_scaled_mm` sm120/sm121 dispatch arm (#327a) | an INT8 W8A8 checkpoint aborts on a consumer-Blackwell rank at the first forward (`No implemented int8_scaled_mm for current compute capability`); FP8/NVFP4/AWQ/GGUF are unaffected |
+
+This is a decision, not a defect (#353). Compiling the tree in the image would
+pull in a full CUDA toolchain and roughly 45 minutes per build for a single
+branch, and the arch list that makes such a build cheap is a property of the
+target rig, not of the image. The supported route is a rig-local build
+installed over the wheel — see `sgl-kernel/README.md` and
+`docs/rig-runbook.md` section 6.6, including the `strings`-based discriminator
+that tells the two apart without a GPU. If a container ever needs the INT8
+lane, mount or `pip install` such a wheel at deploy time; nothing else in the
+image has to change, the op schema set is identical.
+
 ### sm75 without sgl-kernel
 
 This is already handled in the fork, and it does not require a separate image.

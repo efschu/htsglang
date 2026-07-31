@@ -19311,3 +19311,149 @@ die Karten durchgehend belegt sind. Rohdaten und Tabelle:
 `/spinning/gpu-battery-results/2026-07-31_327_int8_ab/`
 (`punkte.jsonl`, `decode_punkte.jsonl`, `roh_*.jsonl`,
 `int8_lane_probe_post327.json`, `tabelle_327.txt`, `coherence_*.txt`).
+
+## #353 INT8-Lane verdrahtet, Alignment-Luecke geschlossen, Wheel-Frage entschieden
+
+Fenster 2026-07-31 16:19:22-16:30:10 UTC, 648 s Kartenzeit von 1500 s Budget,
+keine Verlaengerung. Branch `feat/int8-lane-353`, Rohdaten
+`/spinning/gpu-battery-results/2026-07-31_353_int8_lane/`. Drei Posten aus den
+offenen Punkten von #327, in der Reihenfolge Korrektheit vor Performance.
+
+### 1. Alignment (§2d): Block plus Guard, weil ein Block allein nicht reicht
+
+`int8_scaled_mm` verlangt `K % 16 == 0` auf beiden Operanden und `N % 8 == 0`
+auf der Ausgabe, geprueft in CUDA beim ersten Forward. Channel-Strategy-INT8
+lieferte `weight_block_size = None`, also feuerte die Vergroeberung nie.
+
+Die Fix-Form aus ANALYSE_319 §2d (`[8, 16]`) ist in zwei Punkten korrigiert
+worden, beides durch Aufzaehlung der ECHTEN Unit-Familien von Qwen3.6-27B
+gegen einen Kandidatenblock, nicht durch Rechnen an der Kernel-Bedingung
+allein:
+
+1. **Ein geteilter Wert 16, kein Wert pro Dimension.** `gate_up`s Output-Units
+   und `down`s Input-Units zerteilen dieselbe Intermediate-Dimension; zwei
+   verschiedene Bloecke vergroebern die beiden Enden unterschiedlich und die
+   Rangschnitte laufen auseinander. Genau die Begruendung, die
+   `_group_size_block` und `modelopt_fp4_uneven_tp_block` schon fuer sich
+   aufgeschrieben haben.
+2. **Der Block hilft der dichten MLP nicht und kann die GDN gar nicht
+   bedienen.** Gemessen an der echten Geometrie:
+
+| Familie | Basis | Units ohne Block | Units mit `[16,16]` |
+|---|---|---:|---:|
+| dichte MLP | 17408 | 1088 | 1088 |
+| `gdn_tp_units` | 6144 / 16 k-Heads | 16 | 16 |
+| `in_proj_qkvz` | 2048 je Teil | 16 | 16 |
+| `in_proj_ba` | 48 je Teil | 16 | **1** |
+| MoE-Expert-Intermediate | 512 | 512 | **32** |
+
+Die dichte MLP-Familie ist schon von Haus aus 16-elementig
+(`intermediate // gcd(intermediate, 16)`) — der #327-Boot ist also nicht "durch
+Zufall" an der MLP vorbeigekommen, die MLP ist fuer diesen Kernel strukturell
+sicher. Was der Block wirklich kauft, ist der elementgranulare Fall: ein
+512-breites Expert-Intermediate teilt beim Verhaeltnis 29607:17780:17780 auf
+`[232, 140, 140]`, keiner davon ein Vielfaches von 16, `w2` bricht auf allen
+drei Raengen ab; mit Block `[224, 144, 144]`, auf jedem Rang gueltig.
+
+`in_proj_ba` zeigt die Grenze: 3-elementige Units kollabieren unter jedem Block,
+der 48 teilt, auf eine einzige Unit — und bei einem groeberen, noch teilbaren
+Wert wuerde die GDN gegen `in_proj_qkvz` fehlgeschnitten (Bug-Klasse #82/#109).
+`gdn_tp_units` ist EINE Zahl fuer fuenf Layer verschiedener Breite und laesst
+sich nicht pro Layer neu ableiten. Deshalb Block **plus** Guard, genau die
+Arbeitsteilung der Familie: #289/#323 legten einen Block offen, #300/#316
+liessen die Schnitte, die kein Block reparieren kann, laut und benannt.
+
+`verify_int8_scaled_mm_supports_shape` spiegelt die drei `TORCH_CHECK`s des
+Kernels zur Layer-Konstruktionszeit in beiden INT8-Schemata (CUDA-Pfad; der
+CPU-AMX/VNNI-Pfad faehrt einen anderen Kernel und ist ausgenommen).
+
+**Kartenbeleg** (RTX 5090, derselbe Aufruf gegen Guard und Kernel):
+
+| Fall | N | Guard | `int8_scaled_mm` direkt |
+|---|---:|---|---|
+| `in_proj_ba` Rang 0 | 42 | RAISE | `mat_b.size(1) must be multiple of 8 for memory alignment` |
+| `in_proj_ba` Rang 1 | 30 | RAISE | dieselbe Meldung |
+| `in_proj_ba` Rang 2 | 24 | passiert | laeuft |
+| `mlp.gate_up` #327 Rang 1 | 10432 | passiert | laeuft |
+
+Die Zahlen des Guards SIND die des Kernels. Der Avesed-Checkpoint listet
+`linear_attn.in_proj_a/b` auf jeder GDN-Schicht in `ignore`, baut also nie ein
+quantisiertes `in_proj_ba` — der zweite Grund, warum #327 an der Luecke
+vorbeilief. Ein W8A8-Checkpoint ohne diese Eintraege liefe hinein.
+
+Even TP bleibt unberuehrt: ohne installierten Ratio-Plan ignoriert
+`tp_partition_sizes` die Unit-Zahl vollstaendig.
+
+### 2. Planer-Lane: der Zufall von #327, beziffert
+
+Lane-Probe, ein Lauf, alle Lanes, Shape 2048x5120x17408, warmup/iters 10/60,
+mit dem sm120-Fork-Build:
+
+| Karte | sm | bf16 | beste fp8 | int8_native |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 120 | 231,90 | 568,77 (native) | **684,27** |
+| RTX 3080 | 86 | 62,81 | 59,50 (marlin) | **186,92** |
+| RTX 3080 | 86 | 63,78 | 57,91 (marlin) | **189,03** |
+
+Verhaeltnis, das die Prefill-Zielfunktion fuer DENSELBEN INT8-Checkpoint liest:
+
+| gewertet auf | Verhaeltnis |
+|---|---|
+| `int8_native` (jetzt) | **3,66 : 1,00 : 1,01** |
+| dichtes bf16 (vorher, gewarnter Rueckfall) | 3,69 : 1,00 : 1,02 |
+| `fp8`-Lanes | 9,82 : 1,03 : 1,00 |
+
+Der bf16-Rueckfall lag hier innerhalb von 1 % an der Wahrheit — deshalb war der
+#327-Split brauchbar. Die fp8-Spalte zeigt, wie derselbe Zufall aussieht, wenn
+er nicht haelt: fast die dreifache Konzentration.
+
+**Boot-Beleg**, TP=3, Reserve `3000,2700,2700`, Health nach 53 s: der Plan-Block
+nennt `checkpoint weight format: int8 W8A8 (quant_method=compressed-tensors,
+fmt=int-quantized, dynamic per-token activations)`, jeder Rang traegt
+`[int8 W8A8 native (int8_scaled_mm)]`, null Rueckfall-Warnungen. Gewaehlt wird
+weiterhin der reine VRAM-Auto-Split: alle 10 Konzentrationskandidaten fallen
+durch (8x UNBOOTABLE, 2x Knie), dasselbe Fundability-Urteil wie beim
+FP8-Referenzlauf (#265). Die Lane hat also den EINGANG der Zielfunktion
+korrigiert, nicht das Ergebnis an diesem Arbeitspunkt. Eine Generierung
+(160 Tokens, temp 0) laeuft kohaerent durch, kein Sprachbruch, keine
+Degeneration.
+
+Kein `PROFILE_VERSION`-Bump, wie in §3c entworfen: das Lazy-Top-up
+(`--probe --groups lanes`) hat `int8_native` in **3,2 s** in das bestehende
+v3-Profil geschrieben, die paarweise Link-Matrix unangetastet — gegen die
+600 s/Boot, die der Bump von #303 gekostet hat.
+
+### 3. Wheel-Frage: der Fix ist im Baum, gebaut wird rig-lokal
+
+Verifiziert gegen HEAD: `sgl-kernel/csrc/gemm/int8_gemm_kernel.cu` traegt
+`sm120_dispatch_shape`, den Zweig `else if (sm_version >= 120)` und den neuen
+Diskriminator-String. Der Port ist Fork-Quelltext, nicht nur Wheel.
+
+Die echte Luecke liegt woanders: **weder die venv noch
+`docker/htsglang.Dockerfile` bauen `sgl-kernel/` aus dem Baum** — beide
+installieren das PyPI-Wheel, in dem der Arm fehlt. Entscheidung: kein Wheel
+wird ausgeliefert, eingecheckt oder ins Image gebaut; der unterstuetzte Weg ist
+ein rig-lokaler Build ueber das veroeffentlichte Wheel. Begruendung und die
+drei Dokumentationsorte (Runbook 6.6, `sgl-kernel/README.md`,
+`docker/README.htsglang.md` plus Zeiger im Dockerfile selbst) stehen in
+ANALYSE_319 §5d.
+
+Offener Posten, dort notiert: ein zurueckgerolltes Rig, dessen Profil noch
+`int8_native` traegt, wuerde eine Lane werten, die der installierte Kernel nicht
+fahren kann. Das Runbook verlangt, das Vor-Fenster-Profil zusammen mit den
+Objekten zurueckzuspielen; eine Code-seitige Kopplung zwischen Profil-Lanes und
+installiertem Kernel-Build gibt es nicht.
+
+### Fensterdisziplin
+
+16:19:22-16:30:10 UTC, 648 s von 1500 s. Karten ueber `/spinning/gpu-arb/`
+belegt und freigegeben, `holder` mit Herzschlag geschrieben (Lehre aus #327),
+`/tmp/gpu-card-{0,1,2}` gesetzt und geraeumt, am Ende alle drei Karten bei
+0 MiB. Wheel installiert und **verifiziert zurueckgerollt**: alle vier `.so`
+byte-genau wie die Sicherung, Diskriminator in beide Richtungen geprueft
+(vorher sm-arm=0/stock=6, nachher sm-arm=1/stock=5, nach Rollback wieder
+0/6), `import sgl_kernel` laeuft. Das Profil wurde ebenfalls auf den
+Vor-Fenster-Stand zurueckgesetzt; die aufgestockte Fassung liegt als
+`hw_profile_with_int8_lane.json` bei den Rohdaten. Beim Beenden des eigenen
+Servers wurde die PGID gegen die eigene PID geprueft, bevor das Signal ging —
+auf der Kiste liefen fremde sglang-Prozesse.

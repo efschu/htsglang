@@ -21,6 +21,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    verify_int8_scaled_mm_supports_shape,
+)
 from sglang.srt.utils import is_cuda
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
@@ -74,6 +77,17 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
+
+        if _is_cuda:
+            # int8_scaled_mm's own 16 (K) / 8 (N) checks, mirrored here so an
+            # uneven --rank-tp-ratio shard that misses them is named at layer
+            # construction instead of aborting inside CUTLASS on the first
+            # forward, after the whole checkpoint has been loaded.
+            verify_int8_scaled_mm_supports_shape(
+                output_size_per_partition,
+                input_size_per_partition,
+                getattr(layer, "prefix", "") or type(layer).__name__,
+            )
 
         # WEIGHT
         weight = ModelWeightParameter(

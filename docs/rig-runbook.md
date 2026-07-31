@@ -1764,25 +1764,69 @@ OOMs in the GDN prefill scratch on the first long prompt; 2700 MiB holds.
 A successful warmup proves nothing about prefill headroom — test with a
 real long prompt before calling a reserve value good.
 
-### 6.6 INT8 W8A8 needs a locally built sgl-kernel wheel (#327)
+### 6.6 INT8 W8A8 needs an sgl-kernel built from THIS tree (#327, #353)
 
-The installed `sglang-kernel` 0.4.4 has no sm120 arm in `int8_scaled_mm`, so
-an INT8 W8A8 checkpoint crashes the 5090 rank at its first forward
-(`No implemented int8_scaled_mm for current compute capability`). The wheel
-built from `feat/int8-sm120-port` closes that gap; recipe, provenance and
-rollback live in `docs/dev/TASK_327_INT8_SM120_WHEEL.md`. That wheel is NOT
-installed by default — install it for an INT8 window and roll it back
-afterwards, the venv is shared.
+The sm120 dispatch arm is fork source, not a private wheel: it lives in
+`sgl-kernel/csrc/gemm/int8_gemm_kernel.cu` (commit `7da6f0cb2f`,
+`sm120_dispatch_shape` plus the `sm_version >= 120` branch). What is missing on
+this rig is only a BUILD of it — both the shared venv and
+`docker/htsglang.Dockerfile` install `sgl-kernel` from PyPI, and the published
+wheel has no sm120 INT8 arm, so an INT8 W8A8 checkpoint crashes the 5090 rank
+at its first forward (`No implemented int8_scaled_mm for current compute
+capability`).
 
-Discriminator to tell the two apart without a GPU:
+Decision (#353): no wheel is shipped or vendored. Whoever wants the INT8 lane
+builds the tree; the recipe below is the supported route, and the check
+afterwards is the branch's own error string. Reason: a rig-local build takes
+the arch list of that rig only (~45 min at `MAX_JOBS=4` here, against a ~1.7 GB
+all-arch wheel), and a binary in the repo would have no provenance a reader
+could re-derive.
+
+Build (CPU only, no GPU touched; provenance of the 2026-07-31 build:
+`docs/dev/TASK_327_INT8_SM120_WHEEL.md` section 3):
 
 ```bash
-SO=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/sgl_kernel/sm100/common_ops.abi3.so
-strings "$SO" | grep -c "No implemented int8_scaled_mm for compute capability sm"   # 1 = sm120 wheel
-strings "$SO" | grep -c "No implemented int8_scaled_mm for current compute capability"  # 1 = stock
+export CUDA_VISIBLE_DEVICES=99 MAX_JOBS=4 CMAKE_BUILD_PARALLEL_LEVEL=4
+GPU_SP=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages
+# System cmake 3.28 is too old for CMP0169/CMP0177 — use the venv's 4.x.
+export CMAKE_EXECUTABLE="$GPU_SP/cmake/data/bin/cmake" CMAKE_GENERATOR=Ninja
+export PYTHONPATH="$GPU_SP"            # torch/cmake/ninja, read-only
+cd <worktree>/sgl-kernel
+make build MAX_JOBS=4 CMAKE_ARGS="\
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+  -DCMAKE_PREFIX_PATH=$GPU_SP/torch/share/cmake \
+  -DSGL_KERNEL_LIMIT_CUDA_ARCHS=86;120 \
+  -DSGL_KERNEL_SKIP_SM90_VARIANT=ON \
+  -DSGL_KERNEL_ENABLE_FA3=OFF \
+  -DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
-With that wheel in place, the INT8 checkpoint boots on the standard TP=3
+`SGL_KERNEL_ENABLE_FA3=OFF` is load-bearing: `flash_ops.abi3.so` belongs to the
+other package (`sgl-kernel` 0.3.21) and must not be overwritten.
+
+Install / roll back. **The venv is shared — back up all four objects before
+installing and restore them at the end of the window**, and verify both
+directions:
+
+```bash
+V=/spinning/htsglang-gpu/.venv
+SP=$V/lib/python3.12/site-packages/sgl_kernel
+BK=/spinning/wt-327a-wheel/pre327-backup       # the 2026-07-31 backup, still valid
+$V/bin/pip install --force-reinstall --no-deps <built wheel>
+# ... window ...
+cp "$BK/sm100/common_ops.abi3.so" "$SP/sm100/"; cp "$BK"/{flashmla_ops.abi3.so,spatial_ops.abi3.so} "$SP/"
+cp "$BK/infllm_ops.cpython-312-x86_64-linux-gnu.so" "$SP/"
+```
+
+Discriminator, before and after, no GPU needed:
+
+```bash
+SO=$SP/sm100/common_ops.abi3.so
+strings "$SO" | grep -c "No implemented int8_scaled_mm for compute capability sm"      # >=1 = fork build
+strings "$SO" | grep -c "No implemented int8_scaled_mm for current compute capability" # >=1 = PyPI wheel
+```
+
+With the fork build in place, the INT8 checkpoint boots on the standard TP=3
 recipe (section 4) with only the model path swapped:
 
 ```bash
@@ -1797,13 +1841,34 @@ itself. Measured 2026-07-31 against the FP8 reference on the identical split
 floor at bs=1 and bs=8. Full table:
 `docs/dev/INTEGRATION_R3_VALIDATION.md`, section "#327 INT8-W8A8-Bringup".
 
-Two live limits, neither hit by that split but both still open: the
-channel-strategy INT8 scheme returns `weight_block_size = None`, so uneven-TP
-shard coarsening does not fire and a split that lands off a multiple of 16
-(K) / 8 (N) aborts inside CUTLASS mid-forward; and `checkpoint_compute_format`
-has no int8 lane entry, so `auto-performance` scores these checkpoints on the
-warned bf16 fallback. Both are described in
-`docs/dev/ANALYSE_319_int8_lane.md` sections 2d and 3a.
+`--rank-tp-ratio auto-performance` now scores these checkpoints on the int8
+lane (#353): the plan log names the format `int8 W8A8` and every rank carries
+`[int8 W8A8 native (int8_scaled_mm)]`. A profile cached before the lane existed
+does not have it and says so per card — top it up WITHOUT re-running the link
+matrix (the 600 s/boot #303 phase), 3.2 s measured:
+
+```bash
+python -m sglang.srt.uneven_perf --probe --groups lanes \
+  --out ~/.cache/sglang/hw_profile-<rig hash>.json
+```
+
+**A profile topped up while the fork build was installed becomes a lie the
+moment it is rolled back** — the 5090's `int8_native` entry then names a lane
+the installed kernel cannot run, and an `auto-performance` boot on an int8
+checkpoint would score it and then crash at the first forward. Restore the
+pre-window profile together with the objects, or re-run the top-up after
+rollback.
+
+**Anything the INT8 path can still refuse, by name.** An uneven split whose
+per-rank shard misses `N % 8` / `K % 16` is now rejected at layer construction
+with the layer name and both numbers, instead of aborting inside CUTLASS after
+a full model load. The reachable case on this model is a checkpoint that
+quantizes `linear_attn.in_proj_a/b`: 48 per part over 16 k-head units gives
+merged N = 42 / 30 / 24, and that family cannot be coarsened without
+mis-sharding the GDN against `in_proj_qkvz`. The Avesed checkpoint lists both
+in `ignore`, so it is unaffected; a different W8A8 checkpoint may not be. Fix
+it in the checkpoint's ignore list or with a shard plan whose per-rank output
+is a multiple of 8 — see `docs/dev/ANALYSE_319_int8_lane.md` section 2d.
 
 ### 6.7 Tree speculation (`--speculative-eagle-topk > 1`) loses on this rig
 

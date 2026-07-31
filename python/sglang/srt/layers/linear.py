@@ -215,6 +215,11 @@ class LinearBase(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
+        # The state-dict path of this layer, available to every quant method
+        # from create_weights onwards. Several subclasses already re-assign it
+        # after super().__init__(); doing it here as well makes a shard-shape
+        # error name the module instead of its class (#353).
+        self.prefix = prefix
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype

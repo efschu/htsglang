@@ -198,6 +198,52 @@ class CompressedTensorsConfig(QuantizationConfig):
         g = math.lcm(g, marlin_k_tile)
         return [g, g]
 
+    @staticmethod
+    def _int8_w8a8_block(target_scheme_map: Dict[str, Any]) -> Optional[List[int]]:
+        """Uneven-TP alignment block for a dynamic/static-activation INT8 W8A8
+        scheme (``CompressedTensorsW8A8Int8`` -> ``sgl_kernel.int8_scaled_mm``).
+
+        These schemes are per-CHANNEL or per-TENSOR: no ``block_structure``, no
+        ``group_size``, so both branches above return ``None`` and the uneven-TP
+        coarsening never fires -- the #353 gap. What still constrains the split
+        is the CUTLASS kernel's own 16 (K) / 8 (N) alignment; see
+        :func:`~sglang.srt.layers.quantization.w8a8_int8.int8_w8a8_uneven_tp_block`
+        for why that is expressed as one shared block and why it is not a
+        quantization block.
+
+        Detection requires an INT weight AND an 8-bit activation block, so that
+        weight-only INT8 (``pack-quantized`` W8A16, which runs through Marlin
+        wNa16 and is already served by ``_group_size_block``) does not pick up
+        the wrong kernel's alignment. Returns ``None`` when no scheme is INT8
+        W8A8, leaving every other format's path untouched."""
+        try:
+            from compressed_tensors.quantization import QuantizationType
+
+            int_type = QuantizationType.INT.value
+        except Exception:  # pragma: no cover - library shape guard
+            int_type = "int"
+        for scheme in (target_scheme_map or {}).values():
+            if not isinstance(scheme, dict):
+                continue
+            weights = scheme.get("weights")
+            acts = scheme.get("input_activations")
+            if weights is None or acts is None:
+                continue
+            wtype = getattr(weights, "type", None)
+            wtype = getattr(wtype, "value", wtype)
+            if str(wtype).lower() != str(int_type).lower():
+                continue
+            if getattr(weights, "num_bits", None) != 8:
+                continue
+            if getattr(acts, "num_bits", None) != 8:
+                continue
+            from sglang.srt.layers.quantization.w8a8_int8 import (
+                int8_w8a8_uneven_tp_block,
+            )
+
+            return int8_w8a8_uneven_tp_block()
+        return None
+
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
@@ -282,13 +328,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         Group-quantized schemes (AWQ/GPTQ INT4) instead carry a group_size,
         which serves the same uneven-TP alignment role — fall back to it so a
         `--rank-tp-ratio` split coarsens per-rank shards to group-multiples
-        (see _group_size_block)."""
+        (see _group_size_block). INT8 W8A8 (channel/tensor strategy) has
+        neither, but its GEMM still constrains the split — see
+        _int8_w8a8_block.
+
+        A checkpoint that mixes a group-quantized and an INT8 W8A8 scheme must
+        satisfy both, so the two blocks are folded with lcm rather than one
+        winning."""
         if "Linear" in self.target_scheme_map:
             weights_config = self.target_scheme_map["Linear"].get("weights")
             block_structure = getattr(weights_config, "block_structure", None)
             if block_structure:
                 return block_structure
-        return self._group_size_block(self.target_scheme_map)
+        group_block = self._group_size_block(self.target_scheme_map)
+        int8_block = self._int8_w8a8_block(self.target_scheme_map)
+        if group_block and int8_block:
+            return [math.lcm(g, i) for g, i in zip(group_block, int8_block)]
+        return group_block or int8_block
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:

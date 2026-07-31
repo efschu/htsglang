@@ -1,5 +1,12 @@
 # Task #327 pre-stage: INT8 on sm120 -- port, wheel, verification
 
+> **Status after #353.** The port is fork SOURCE and stays in the tree; the
+> wheel below is one build of it, kept for its provenance record, not a
+> deliverable. No wheel is shipped or vendored, and the container keeps
+> installing sgl-kernel from PyPI on purpose. Reasoning:
+> `ANALYSE_319_int8_lane.md` section 5d. Build/install/rollback recipe for a
+> rig: `docs/rig-runbook.md` section 6.6.
+
 Closes the gap recorded in `ANALYSE_319_int8_lane.md` section 2b: `int8_scaled_mm`
 had no dispatch arm for the 5090, so a W8A8 INT8 checkpoint crashed that rank on
 its first forward. Code change: commit `7da6f0cb2f`. Everything below was done

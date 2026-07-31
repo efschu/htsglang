@@ -147,6 +147,16 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
 # 2) Core inference kernels — exact host versions. sgl-kernel from PyPI
 #    (cp312 abi3 wheel), flashinfer JIT package (covers sm75+ at runtime).
 #    sgl-kernel is skippable: see the arch block at the top of this file.
+#
+#    DELIBERATE GAP, not an oversight (#353): the fork's own sgl-kernel tree
+#    carries CUDA changes this PyPI wheel does not — today exactly one, the
+#    INT8 `int8_scaled_mm` sm120 dispatch arm (#327a). An image built from this
+#    file therefore cannot serve an INT8 W8A8 checkpoint on a consumer
+#    Blackwell rank. Building the tree here would add a full CUDA toolchain and
+#    ~45 min per image for one branch, so the supported route stays a
+#    rig-local build installed over this wheel; recipe and the
+#    no-GPU discriminator in `sgl-kernel/README.md` ("This tree carries kernel
+#    changes the published wheel does not") and `docs/rig-runbook.md` 6.6.
 ARG INSTALL_SGL_KERNEL
 ARG SGL_KERNEL_VERSION
 ARG FLASHINFER_VERSION

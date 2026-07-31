@@ -44,6 +44,29 @@ make build MAX_JOBS=2
 make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
+### This tree carries kernel changes the published wheel does not (htsglang fork)
+
+The fork modifies CUDA sources here, so a `pip install sgl-kernel` (or the
+pinned `SGL_KERNEL_VERSION` in `docker/htsglang.Dockerfile`) resolves an
+upstream wheel that does NOT contain them. Whoever wants those kernels has to
+build this tree. Current delta:
+
+| change | source | what the published wheel does instead |
+| --- | --- | --- |
+| INT8 `int8_scaled_mm` dispatch arm for consumer Blackwell (sm120/sm121), task #327a | `csrc/gemm/int8_gemm_kernel.cu`, `sm120_dispatch_shape` + the `sm_version >= 120` branch | `TORCH_CHECK_NOT_IMPLEMENTED` at the first forward, so an INT8 W8A8 checkpoint cannot serve on an RTX 5090 rank at all |
+
+Discriminate the two without a GPU — the branch's own error string differs:
+
+```bash
+SO=<site-packages>/sgl_kernel/sm100/common_ops.abi3.so
+strings "$SO" | grep -c "No implemented int8_scaled_mm for compute capability sm"      # >=1 -> this tree
+strings "$SO" | grep -c "No implemented int8_scaled_mm for current compute capability" # >=1 -> upstream wheel
+```
+
+A rig-local build (only the archs that rig has, ~45 min on 4 jobs) is the
+supported route; `docs/rig-runbook.md` section 6.6 carries the exact recipe and
+provenance for the reference rig.
+
 ## Contribution
 
 ### Steps to add a new kernel:

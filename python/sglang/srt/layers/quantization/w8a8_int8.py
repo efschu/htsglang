@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
@@ -74,6 +75,104 @@ if _is_cuda and _has_sgl_int8_scaled_mm:
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Uneven-TP alignment for the INT8 W8A8 GEMM (task #353).
+#
+# ``sgl_kernel.int8_scaled_mm`` (sgl-kernel/csrc/gemm/int8_gemm_kernel.cu) makes
+# three unconditional TORCH_CHECKs on the shard it is handed:
+#
+#     mat_a.size(1) % 16 == 0    # K, the activation / input dim
+#     mat_b.size(0) % 16 == 0    # K, the weight's input dim
+#     mat_b.size(1) %  8 == 0    # N, output_size_per_partition
+#
+# They are checked at the first forward, i.e. AFTER weight load and after the
+# whole shard plan is already committed, so a split that misses them costs a
+# full model load before it fails.
+# ---------------------------------------------------------------------------
+
+#: ``int8_scaled_mm``'s N (output) alignment: ``mat_b.size(1) % 8 == 0``.
+INT8_SCALED_MM_ALIGN_N = 8
+#: ``int8_scaled_mm``'s K (input) alignment: ``mat_a.size(1) % 16 == 0``.
+INT8_SCALED_MM_ALIGN_K = 16
+
+
+def int8_w8a8_uneven_tp_block() -> List[int]:
+    """Uneven-TP shard block for a dynamic-activation INT8 W8A8 config.
+
+    Sixth member of the alignment family (#37 / #86 / #289 / #300 / #316 /
+    #318 / #323): a quantization config that never exposed
+    ``weight_block_size`` left ``_quant_block_aligned_units`` /
+    ``tp_partition_size`` / ``moe_uneven_tp_units`` with nothing to coarsen, so
+    an uneven ``--rank-tp-ratio`` split produced per-rank shards the kernel
+    refuses. Channel-strategy INT8 has neither a ``block_structure`` nor a
+    ``group_size``, so it returned ``None`` and no coarsening fired at all.
+
+    Unlike every earlier member, this block carries NO quantization meaning.
+    Channel-strategy scales are one scalar per output row and are therefore
+    insensitive to where the row dimension is cut; there is no scale grid to
+    stay inside. The block exists solely to keep the CUTLASS kernel's own
+    alignment check satisfied under an uneven split -- do not go looking for a
+    scale-grid reason, there is not one.
+
+    Both dims carry the SAME value, ``lcm(8, 16) = 16``, not the ``[8, 16]``
+    that ANALYSE_319 sec. 2d sketched. A single shared block is mandatory for
+    the coupled MLP pair: ``gate_up``'s OUTPUT units and ``down``'s INPUT units
+    partition the same intermediate dimension, so a per-dim block would
+    coarsen the two ends of that dimension differently and the per-rank shards
+    would diverge. ``CompressedTensorsConfig._group_size_block`` and
+    ``modelopt_fp4_uneven_tp_block`` set both dims for exactly this reason.
+    """
+    return [math.lcm(INT8_SCALED_MM_ALIGN_N, INT8_SCALED_MM_ALIGN_K)] * 2
+
+
+def verify_int8_scaled_mm_supports_shape(
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    layer_name: str = "",
+) -> None:
+    """Raise if this rank's shard cannot be fed to ``int8_scaled_mm``.
+
+    The kernel's checks live in CUDA and fire mid-forward. This mirrors them at
+    layer-construction time so the failure names the layer, the numbers and the
+    cause instead of surfacing as a bare ``TORCH_CHECK`` after a full model
+    load.
+
+    The block above cannot cover every family. A unit family that is COUPLED
+    across several layers of different widths -- Qwen3.5's GDN, where
+    ``gdn_tp_units`` is derived once from ``value_dim`` and handed unchanged to
+    ``in_proj_qkvz`` (1024-element units), ``in_proj_ba`` (3-element units) and
+    ``out_proj`` -- cannot be coarsened per layer without breaking the coupling
+    the model depends on. ``in_proj_ba`` is the concrete case: 48 per part over
+    16 k-head units, so an uneven split hands ranks N = 42 / 30 / 24 and the
+    first two are not multiples of 8. Coarsening it locally would collapse it
+    to a single unit and mis-shard the GDN against ``in_proj_qkvz``, so this is
+    #300 territory: the bad shard stays loud, by name.
+    """
+    where = f" ({layer_name})" if layer_name else ""
+    if output_size_per_partition % INT8_SCALED_MM_ALIGN_N:
+        raise ValueError(
+            f"INT8 W8A8 layer{where}: output_size_per_partition = "
+            f"{output_size_per_partition} is not a multiple of "
+            f"{INT8_SCALED_MM_ALIGN_N}, which sgl_kernel.int8_scaled_mm "
+            "requires of N (mat_b.size(1)). Under an uneven --rank-tp-ratio "
+            "this comes from a unit family too fine or too coupled to coarsen "
+            "to the kernel's block; pick a shard plan whose per-rank output is "
+            f"a multiple of {INT8_SCALED_MM_ALIGN_N}, or exclude this module "
+            "from quantization in the checkpoint."
+        )
+    if input_size_per_partition % INT8_SCALED_MM_ALIGN_K:
+        raise ValueError(
+            f"INT8 W8A8 layer{where}: input_size_per_partition = "
+            f"{input_size_per_partition} is not a multiple of "
+            f"{INT8_SCALED_MM_ALIGN_K}, which sgl_kernel.int8_scaled_mm "
+            "requires of K (mat_a.size(1) / mat_b.size(0)). Under an uneven "
+            "--rank-tp-ratio this comes from a unit family too fine or too "
+            "coupled to coarsen to the kernel's block; pick a shard plan whose "
+            f"per-rank input is a multiple of {INT8_SCALED_MM_ALIGN_K}, or "
+            "exclude this module from quantization in the checkpoint."
+        )
+
+
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Quantization.
 
@@ -103,6 +202,18 @@ class W8A8Int8Config(QuantizationConfig):
     @classmethod
     def get_name(self) -> str:
         return "w8a8_int8"
+
+    @property
+    def weight_block_size(self) -> List[int]:
+        """Shard-alignment block for `--rank-tp-ratio` (see
+        :func:`int8_w8a8_uneven_tp_block`).
+
+        Not a quantisation-semantic block -- this scheme's scales are
+        per-output-channel and carry no grid. The value encodes the GEMM
+        alignment ``sgl_kernel.int8_scaled_mm`` requires of an uneven per-rank
+        shard, which is what makes the shard valid rather than merely
+        loadable."""
+        return int8_w8a8_uneven_tp_block()
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -196,6 +307,16 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         weight_loader = extra_weight_attrs.get("weight_loader")
         self.logical_widths = output_partition_sizes
+
+        if not _is_cpu:
+            # The CPU path runs int8_scaled_mm_with_quant (AMX/VNNI), which has
+            # its own layout rules; only the CUDA CUTLASS kernel carries the
+            # 16/8 alignment this checks.
+            verify_int8_scaled_mm_supports_shape(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                getattr(layer, "prefix", "") or type(layer).__name__,
+            )
 
         weight = ModelWeightParameter(
             data=torch.empty(

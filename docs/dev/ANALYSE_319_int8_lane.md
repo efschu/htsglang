@@ -178,6 +178,10 @@ justified before Section 4's verdict.
 
 ### 2d. Alignment family: where uneven TP would break INT8, and why it currently would
 
+> **Closed in task #353**, with two corrections to the fix shape below. The
+> block is `[16, 16]`, not `[8, 16]`, and it is not the whole answer.
+> See `2d-fix` at the end of this section.
+
 `int8_scaled_mm`'s own `TORCH_CHECK`s (`int8_gemm_kernel.cu:677-679`) are:
 
 ```
@@ -238,6 +242,73 @@ mid-first-forward, the same failure class as 2b) on splits that do not --
 which on Qwen3.6-27B's dimensions is not guaranteed for an arbitrary
 MLP-unit vector.
 
+### 2d-fix. What #353 actually implemented, and where the sketch above was wrong
+
+Two corrections, both found by enumerating the real unit families of
+Qwen3.6-27B against a candidate block rather than reasoning from the kernel's
+constraint alone.
+
+**Correction 1: one shared block of 16, not `[8, 16]`.** A per-dim block
+coarsens the two ends of the SAME dimension differently. `gate_up`'s output
+units and `down`'s input units both partition the intermediate dimension; with
+`[8, 16]` the first would be re-expressed in 8-element and the second in
+16-element units, and the per-rank shards would diverge. That is exactly the
+argument `CompressedTensorsConfig._group_size_block` and
+`modelopt_fp4_uneven_tp_block` already write down for their own blocks, and it
+applies here unchanged. `lcm(8, 16) = 16` satisfies both halves of the kernel's
+rule on both dims.
+
+**Correction 2: the block does nothing for the dense MLP, and cannot serve the
+GDN at all.** Measured against this checkpoint's real geometry:
+
+| family | unit basis | units without a block | units with `[16, 16]` | why |
+|---|---|---:|---:|---|
+| dense MLP (`Qwen2MoeMLP`) | 17408 | 1088 | 1088 | the base family is ALREADY 16-element (`intermediate // gcd(intermediate, 16)`), so every shard is a multiple of 16 and `2*shard` a multiple of 32 |
+| GDN `gdn_tp_units` basis | 6144 / 16 k heads | 16 | 16 | 384-element units, already block-multiples |
+| GDN `in_proj_qkvz` | 2048 per part | 16 | 16 | 1024-element units |
+| GDN `in_proj_ba` | 48 per part | 16 | **1** | 3-element units; `lcm(3, 16) = 48` is the whole per-part dim |
+| MoE expert intermediate | 512 | 512 | **32** | element-granular, the family the block is actually for |
+
+So the #327 boot did NOT pass "by accident" in the MLP: the dense MLP is
+structurally safe for this kernel, with or without the block. What the block
+buys is the element-granular case — a 512-wide expert intermediate splits
+`[232, 140, 140]` at the `29607:17780:17780` ratio, and none of those is a
+multiple of 16, so `w2` aborts on all three ranks. With the block it splits
+`[224, 144, 144]`, valid on every rank.
+
+And `in_proj_ba` shows the limit of the mechanism. Its 3-element units collapse
+to a single unit under any block that divides 48, which would both fail the
+split outright (`Cannot give each of 3 ranks at least one of 1 units`) and, at
+a coarser-but-splittable value, mis-shard the GDN against `in_proj_qkvz`, whose
+units are NOT coarsened — the #82/#109 bug class. `gdn_tp_units` is one number
+shared by five layers of different widths; it cannot be re-derived per layer.
+
+**So the fix is the block PLUS a guard**, mirroring how the family's earlier
+members split the same problem: #289/#323 exposed a block, #300/#316 kept the
+shards a block cannot fix loud and named.
+`verify_int8_scaled_mm_supports_shape` mirrors the kernel's own three
+`TORCH_CHECK`s at layer-construction time in both int8 schemes
+(`CompressedTensorsW8A8Int8.create_weights`,
+`W8A8Int8LinearMethod.create_weights`, CUDA only — the CPU AMX/VNNI path runs a
+different kernel), so an unfixable shard is reported with the layer name and
+both numbers before the weights load, instead of as a bare `TORCH_CHECK` after
+a full model load.
+
+Card-proven on an RTX 5090, 2026-07-31: at the `in_proj_ba` geometry N = 42 and
+N = 30 the guard raises and `int8_scaled_mm`, called directly on the same
+shape, independently answers `mat_b.size(1) must be multiple of 8 for memory
+alignment`; at N = 24 and at the #327 boot's MLP shard N = 10432 the guard
+passes and the kernel runs. The guard's numbers ARE the kernel's.
+
+The Avesed checkpoint lists `linear_attn.in_proj_a/b` in `ignore` on every GDN
+layer, so it never builds a quantized `in_proj_ba` and never reaches the guard
+— which is the other reason the #327 window did not hit this. A W8A8
+checkpoint without those ignore entries would.
+
+Even TP is untouched in every case: `tp_partition_sizes` ignores the unit count
+entirely when no ratio plan is installed, so no default-path boot can observe
+the block at all.
+
 ### 2e. Summary table
 
 | concern | fp8 (today) | int8 w8a8 (proposed) |
@@ -249,6 +320,11 @@ MLP-unit vector.
 | uneven-TP shard alignment | handled (`weight_block_size=[128,128]`) | **not wired** -- `weight_block_size` returns `None` for channel-strategy int8, no coarsening fires |
 
 ## 3. Lane design: `int8_native` in `uneven_perf.py`
+
+> **Landed in task #353**, as designed, with one addition: `_ct_group_format`
+> now separates `int8` (W8A8) from `int8_a16` (weight-only), so a
+> pack-quantized checkpoint cannot pick up a kernel it never runs. Measured
+> effect at the end of this section (`3d`).
 
 ### 3a. Format-key detection
 
@@ -344,6 +420,46 @@ warning and falls back to bf16 for that rank, pointing at
 situation, not a new one. Given the choice between a known 600 s tax on every
 rig's next boot and a one-time `SGLANG_PERF_REPROBE=1` for whoever wants the
 new lane measured, the second is the correct default.
+
+### 3d. What the wired lane changed, measured
+
+Reference rig, 2026-07-31, one run, all lanes, probe shape 2048 x 5120 x 17408,
+warmup/iters 10/60, with the sm120 fork build installed:
+
+| card | sm | bf16 | best fp8 | int8_native |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 120 | 231.90 | 568.77 (native) | **684.27** |
+| RTX 3080 | 86 | 62.81 | 59.50 (marlin) | **186.92** |
+| RTX 3080 | 86 | 63.78 | 57.91 (marlin) | **189.03** |
+
+The per-rank ratio the prefill objective is made of, for the SAME INT8
+checkpoint:
+
+| scored on | ratio | verdict |
+|---|---|---|
+| `int8_native` (now) | **3.66 : 1.00 : 1.01** | the lane the serving path runs |
+| dense bf16 (before, warned fallback) | 3.69 : 1.00 : 1.02 | close HERE, by coincidence |
+| `fp8` lanes | 9.82 : 1.03 : 1.00 | the number a different lane table would have given |
+
+The bf16 fallback sat within 1 % of the truth on this rig, which is why the
+#327 split was usable. The fp8 column is what the same coincidence looks like
+when it does not hold: a rig whose weak ranks have an fp8 tensor path would
+have been planned at nearly 3x the wrong concentration.
+
+Boot proof, same window: `--rank-tp-ratio auto-performance` on
+`Qwen3.6-27B-INT8-W8A8`, TP=3, reserve `3000,2700,2700`. The plan log names
+`checkpoint weight format: int8 W8A8 (quant_method=compressed-tensors,
+fmt=int-quantized, dynamic per-token activations)` and every rank carries
+`[int8 W8A8 native (int8_scaled_mm)]`, zero fallback warnings. The chosen split
+is still the plain VRAM-auto one — at this reserve all 10 concentration
+candidates are rejected as UNBOOTABLE or past the decode knee, the same
+fundability verdict the FP8 reference gets (#265), so the lane changed the
+INPUT the objective reads, not the outcome at this operating point.
+
+No `PROFILE_VERSION` bump, as designed in 3c: the lazy top-up
+(`--probe --groups lanes`) added `int8_native` to the existing v3 profile in
+**3.2 s**, with the pairwise link matrix carried over untouched — against the
+600 s/boot the version bump of #303 cost.
 
 ## 4. Expectation calculation and verdict
 
@@ -514,6 +630,46 @@ window). Reuse the established noise floors verbatim rather than
 re-deriving them: **ms/Verify 2.72 %, tok/s (Tick) 7.53 %**
 (`docs/dev/INTEGRATION_R3_VALIDATION.md:11794-11816`, six-sample A-vs-A at
 bs=16, carried forward per the brief). Report nothing under those floors.
+
+## 5d. The wheel question, decided (#353)
+
+The sm120 dispatch arm is **fork source, present in the tree** — verified
+2026-07-31 against the current HEAD:
+`sgl-kernel/csrc/gemm/int8_gemm_kernel.cu` carries `sm120_dispatch_shape`, the
+`else if (sm_version >= 120)` branch, and the new discriminator string
+`"No implemented int8_scaled_mm for compute capability sm"`. It is not
+wheel-only.
+
+What is missing is a BUILD of it, in two places, and that turned out to be the
+real gap: the shared venv installs `sglang-kernel` from PyPI, and
+`docker/htsglang.Dockerfile` step 2 installs `sgl-kernel==${SGL_KERNEL_VERSION}`
+from PyPI as well. Neither compiles `sgl-kernel/` from the tree, so the arm is
+unreachable in both.
+
+**Decision: no wheel is shipped, vendored, or built into the image.** The
+supported route is a rig-local build installed over the published wheel.
+Reasons, in order:
+
+* the arch list that makes such a build cheap (~45 min at `MAX_JOBS=4` for
+  `86;120`) is a property of the target rig, not of the fork or the image; an
+  all-arch wheel is ~1.7 GB of mostly-unusable cubins;
+* building inside the container adds a full CUDA toolchain and that build time
+  to every image, for one dispatch branch;
+* a binary committed to the repo has no provenance a reader can re-derive,
+  which is the #304 lesson.
+
+What #353 shipped instead: the build recipe, the install/rollback procedure and
+the no-GPU `strings` discriminator in `docs/rig-runbook.md` 6.6; a
+"this tree is ahead of the published wheel" table in `sgl-kernel/README.md`
+(the natural discovery point for anyone touching these sources); the same table
+in `docker/README.htsglang.md` with the decision spelled out; and a pointer at
+the Dockerfile's own sgl-kernel step so it cannot be read as an oversight.
+
+Open item recorded there and not solved here: a rolled-back rig whose cached
+profile still carries `int8_native` would score a lane the installed kernel
+cannot run. The runbook says to restore the pre-window profile with the
+objects; a code-side coupling between the profile's lane entries and the
+installed kernel build does not exist.
 
 ## 6. Bottom line
 
