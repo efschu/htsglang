@@ -16053,3 +16053,60 @@ und der Retract-Fallback bleiben die Notbremsen dahinter.
   vorbestehender UP037-Aufraeumer in Skelett und uneven_perf, beide Dateien
   tragen `from __future__ import annotations`); codespell sauber; black
   auf den neuen Dateien und kv_ladder_table.py.
+
+### Kartenfenster-Kernbeleg (2026-07-31, 07:44-08:20 UTC, ~36 min Fenster inkl. zwei Boots)
+
+Aufbau (`scripts/probe287/run_proof.sh`, Artefakte
+`/root/.claude/jobs/1481bb40/tmp/p287b/`): erprobter FP8-TP=3-Boot
+(auto-performance, uneven DCP, NEXTN-Spec, CUDA-Graphs, fp8-KV) mit
+kuenstlich kleinem Pool (`--max-total-tokens 6000`, Kontext 8192). Arm A =
+Negativkontrolle ohne Ladder-Flags; Arm B = `--kv-pressure-ladder
+relief:dcp_ratio,relief:admission_cap --max-running-requests-ceiling 12`,
+erst ruhig, dann 10 nebenlaeufige 1200-Token-Generationen als Druckwelle.
+Ein erster Fensterversuch (07:39) kollidierte mit einem 1-s-Race der
+Nachbar-Session um die gpu-arb-Uebernahme (Fremd-OOM im Load, beide Boots
+tot) — Wiederholung im sauber uebernommenen Fenster lief durch.
+
+Ergebnis, gegen die Tore:
+
+- **Flip beobachtet, laut, rank-uniform**: `KV-PRESSURE-LADDER FLIP rung
+  0 -> 1 (dcp_ratio, epoch 1, occupancy 0.873)` und `FLIP rung 1 -> 2
+  (admission_cap, epoch 2, occupancy 0.892)` um 07:47:24 — je Transition
+  GENAU DREI Zeilen (TP0/TP1/TP2) mit identischer Epoche und identischer
+  Occupancy; die dcp_ratio-Zeile benennt ihren PLANNED-ONLY-Status
+  ausdruecklich. **0 DESYNC-Zeilen** im gesamten Log.
+- **Keine Retract-Schleife wo die Stufe greift**: EIN einziges
+  Retract-Ereignis (07:47:27, `#retracted_reqs: 1`, identisch auf allen
+  drei Raengen) drei Sekunden nach dem Admission-Flip — die bereits
+  laufende Welle brauchte die Tokens des naechsten Decode-Schritts, exakt
+  die dokumentierte Semantik (Retraction befreit, der Throttle verhindert
+  die SCHLEIFE danach). Danach im gesamten restlichen Episodenverlauf
+  (bis 08:19) kein weiteres Retract.
+- **Server gesund, bedient nach der Episode**: `/health` 200 unter Druck
+  und danach; ein Abschluss-Generate liefert Text.
+- **Abstieg mitbewiesen** (uebererfuellt): nach der Welle DESCEND
+  2 -> 1 -> 0 (Epochen 3/4, je drei Rang-Zeilen, "pressure gone for 64
+  rounds") mit `admission release on descend: limit -> 11 (start 12)` —
+  auch der traege Rueckweg ist rank-uniform durch denselben Kanal
+  gelaufen.
+- **Negativkontrolle**: im ruhigen Teil von Arm B KEIN Flip
+  (`armB-calm-no-flip PASS`); der GENERIERTE TEXT der ruhigen Anfrage ist
+  byte-identisch zu Arm A ohne Ladder-Flags (422/422 Zeichen; der
+  Skript-Erstbefund "calm-output-differs" war ein Proben-Kalibrierfehler
+  — verglichen wurde die volle JSON-Antwort inkl. per-Request-ids/
+  Timestamps/Throughput; der Vergleich ist im Skript auf das text-Feld
+  korrigiert, der Prompt bleibt bewusst unter der
+  GDN-Prefill-Nichtdeterminismus-Grenze).
+- **Boot-Inventar laut**: `KV-PRESSURE-LADDER armed: 3 rungs (base,
+  dcp_ratio, admission_cap), consensus every 8 rounds over 3 rank(s);
+  PLANNED-ONLY reliefs (Stage 1, no actuator wired): dcp_ratio`.
+- Randnotiz Harness: der aeussere 2040-s-Deckel schnitt das Skript im
+  Warten auf die 400-s-Burst-curls ab (rc=124), bevor dessen eigene
+  Abschluss-Checks liefen; Serve-nach-Episode und Retract-Zaehlung wurden
+  am noch gesunden Server direkt erhoben, danach py-spy-Dumps + sauberer
+  Abbau (alle Karten 0 MiB, Fenster im gpu-arb-Log geschlossen).
+
+**Fenster-Verdikt: PASS** — Druck erzeugt, Treppe flippt laut und
+rank-uniform durch den Konsens-Kanal, die Admission-Stufe stoppt die
+Retract-Schleife nach einem Einzel-Ereignis, ohne Druck kein Flip und
+Text-Byte-Gleichheit zur Ladder-freien Kontrolle.

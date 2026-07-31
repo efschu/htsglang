@@ -112,10 +112,17 @@ if grep -q "KV-PRESSURE-LADDER FLIP" "$ART/armB.log"; then
 else
   verdict "PASS armB-calm-no-flip"
 fi
-if cmp -s "$ART/armA_calm.json" "$ART/armB_calm.json"; then
-  verdict "PASS calm-output-byte-identical"
+# Compare the generated TEXT, not the raw response: meta_info carries
+# per-request ids/timestamps/throughput that differ between any two boots.
+if "$VENV" -c "
+import json, sys
+a = json.load(open('$ART/armA_calm.json'))['text']
+b = json.load(open('$ART/armB_calm.json'))['text']
+sys.exit(0 if a == b else 1)
+"; then
+  verdict "PASS calm-output-text-byte-identical"
 else
-  verdict "FAIL calm-output-differs (see armA_calm.json/armB_calm.json)"
+  verdict "FAIL calm-output-text-differs (see armA_calm.json/armB_calm.json)"
 fi
 
 # Phase 2: pressure -- 10 concurrent long generations against a 6000-token pool.
