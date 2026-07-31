@@ -20160,3 +20160,45 @@ denselben 3 Setup-Errors wie auf der Basis (`TestPostCaptureKVSizing`
 braucht einen Serverstart). ruff + codespell sauber auf allen beruehrten
 Dateien.
 
+
+## #355 GPU-Teil: schreibtisch-fertig, ein Kartenfenster offen
+
+Der Kartenteil ist NICHT gelaufen. Das gesamte Fenster hielt agent-354 alle
+drei Karten (0/1/2 bei 19787/30031/18685 MiB) fuer die langen
+phasenoptimalen #354-Messfenster; eine Anfrage lag in
+`/spinning/gpu-arb/requests/`, es oeffnete sich keine Luecke. Der Interpreter-
+Rauchtest (`TRITON_INTERPRET=1`, `CUDA_VISIBLE_DEVICES=99`) belegt, dass der
+Kernel mit der neuen Signatur (Parameter `bound`) laeuft und in-range korrekt
+schreibt; die Device-Assert-Semantik senkt der Interpreter nicht ab, daher
+braucht der Falsifikator eine echte Karte.
+
+Turnkey-Nachlauf, EIN Kommando, eine Karte, kein Modell, ~6 min:
+
+    CARD=0 bash scripts/dev/run_355_gpu.sh
+
+Er belegt die Karte ueber `/spinning/gpu-arb` mit Herzschlag, macht eine
+Fixposten-Preflight (Segment braucht < 500 MiB, lehnt eine belegte Karte ab),
+signalisiert nur eigene PIDs und gibt auf jedem Ausgang frei. Was er beweist:
+
+1. `bench_masked_kv_bound_check.py` — ns/Aufruf des maskierten KV-Schreibers
+   mit Schranke AUS (`SGLANG_DISABLE_KV_MASKED_BOUND_CHECK=1`, das
+   `tl.device_assert` wird zu nichts abgesenkt) vs AN (Default), verschraenkt
+   A/B, Rauschboden zuerst per A-vs-A, 100 Wdh. x 200 Starts je Punkt, auf der
+   Qwen3.6-27B-TP=3-Decode-Zeile (4 KV-Koepfe x head_dim 256). Erwartung: das
+   Delta liegt unter dem A-vs-A-Rauschboden — der Check ist ein
+   Register-Vergleich vor einem `H*D`-Element-Schreib. Das Skript druckt je
+   Form "below noise"/"MEASURABLE", die Behauptung ist damit falsifizierbar.
+   Wenn "MEASURABLE": der Off-Switch ist bereits eingebaut und dokumentiert.
+2. `test_masked_kv_bound_falsifier.py` — 4 Subprozess-Faelle (Device-Assert
+   vergiftet den Kontext, also je Fall ein eigener Prozess): in-range
+   byte-korrekt + genau eine Zeile beruehrt; out-of-range stirbt mit
+   `masked_set_kv_buffer: loc out of range`; DERSELBE Schreib mit
+   herauskompiliertem Check gibt exit 0 und eine still korrumpierte Zeile
+   zurueck (der geschlossene Defekt, als real assertiert); der Produktions-
+   Einstieg `MHATokenToKVPool.set_kv_buffer(dcp_kv_mask=...)` erreicht die
+   Wache.
+3. `test_kv_store_bound_after_growth.py` — die #352-Regression auf dem jetzt
+   geteilten Helfer, Beleg dass der Refactor den rohen Pfad nicht stoert.
+
+Status: **schreibtisch-fertig, GPU-Falsifikator/Microbench ausstehend, ein
+Kartenfenster via `scripts/dev/run_355_gpu.sh`.**
