@@ -235,6 +235,12 @@ class PipelineExecutor:
             async for frame in self.source:
                 if self.cancelled:
                     break
+                if frame.end_of_stream:
+                    # The sentinel is control, not content. Counting it made
+                    # frames_decoded one larger than the number of frames the
+                    # source actually produced, which is the number every
+                    # shard's arithmetic is checked against.
+                    break
                 timer.start()
                 frame.require_device(StageKind.DECODE.value)
                 timer.stop()

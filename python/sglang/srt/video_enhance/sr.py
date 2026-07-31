@@ -231,6 +231,26 @@ def sr_engine_key(
     )
 
 
+#: Torch dtype behind each RGB pixel format the chain declares. NV12 has no
+#: entry: it is the codec-side layout and never reaches an SR engine.
+_FORMAT_DTYPE_NAMES: dict[PixelFormat, str] = {
+    PixelFormat.RGB_FP16: "float16",
+    PixelFormat.RGB_FP32: "float32",
+    PixelFormat.RGB_UINT8: "uint8",
+}
+
+
+def _as_format(tensor, fmt: PixelFormat):
+    """Return ``tensor`` in the dtype the chain declared for this boundary."""
+    import torch
+
+    name = _FORMAT_DTYPE_NAMES.get(fmt)
+    if name is None:
+        raise ValueError(f"{fmt.value} is not an SR stage boundary format")
+    wanted = getattr(torch, name)
+    return tensor if tensor.dtype is wanted else tensor.to(wanted)
+
+
 class SuperResolutionStage(StageBase):
     """x4 SR over one device-resident frame at a time.
 
@@ -295,6 +315,13 @@ class SuperResolutionStage(StageBase):
                     f"SR stage configured for {self.source}, got {frame.resolution}"
                 )
             result = self.backend.run(frame.data)
+            # The chain declares one pixel format per boundary, and the
+            # backend returns whatever the graph's output type is. Those two
+            # are legitimately different -- the fp32 reference engine running
+            # inside an fp16 chain is exactly the parity setup -- so the stage
+            # restores the declared format rather than letting an fp32 tensor
+            # leak downstream and be reinterpreted by the next stage.
+            result = _as_format(result, self.format)
             out.append(
                 frame.with_data(result, resolution=self.out_resolution).require_device(
                     self.name

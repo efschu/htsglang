@@ -269,6 +269,9 @@ class ChunkResult:
     bytes_out: int
     wall_seconds: float
     stage_ms_per_frame: dict[str, float] = field(default_factory=dict)
+    #: Per-frame digests taken immediately before the encoder, when the run
+    #: asked for them. The encoder-independent way to compare two chunkings.
+    frame_digests: tuple[str, ...] = ()
     error: str | None = None
 
     @property
@@ -391,6 +394,7 @@ class SubprocessChunkRunner(ChunkRunner):
             bytes_out=report.get("bytes_out", 0),
             wall_seconds=elapsed,
             stage_ms_per_frame=report.get("stage_ms_per_frame", {}),
+            frame_digests=tuple(report.get("frame_digests", ())),
         )
 
 
@@ -403,6 +407,10 @@ class SubprocessChunkRunner(ChunkRunner):
 class MultiCardStats:
     job_id: str
     chunks: list[dict] = field(default_factory=list)
+    #: Every chunk's pre-encode frame digests, concatenated in timeline order.
+    #: Two chunkings of the same clip on the same card must produce the same
+    #: sequence; that equality is the exact statement of a correct stitch.
+    frame_digests: list[str] = field(default_factory=list)
     bytes_out: int = 0
     frames_encoded: int = 0
     started_at: float = field(default_factory=time.time)
@@ -433,6 +441,7 @@ class MultiCardStats:
             # capacity weighting actually balanced the cards.
             "busiest_card_seconds": round(max(per_card.values(), default=0.0), 3),
             "card_seconds": {k: round(v, 3) for k, v in per_card.items()},
+            "frame_digests": list(self.frame_digests),
             "error": self.error,
         }
 
@@ -529,6 +538,7 @@ class MultiCardExecutor:
                     )
                 await self._forward(result)
                 self.stats.chunks.append(result.as_dict())
+                self.stats.frame_digests.extend(result.frame_digests)
                 self.stats.frames_encoded += result.frames_encoded
                 forwarded[chunk.index].set()
                 self._slots.release()

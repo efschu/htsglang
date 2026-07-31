@@ -146,6 +146,8 @@ def request_payload(args, source_rate: Fraction) -> dict:
         # both arms so the baseline and the multi-card run differ in exactly
         # one thing.
         "decode_backend": "ffmpeg",
+        "bitrate": args.bitrate,
+        "frame_digests": args.frame_digests,
         "ring_depth": args.ring_depth,
     }
 
@@ -274,6 +276,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rife-scale", type=float, default=1.0)
     parser.add_argument("--video-codec", default="h264")
     parser.add_argument("--encode-backend", default="ffmpeg")
+    # Near-transparent by default, and that is a correctness requirement,
+    # not a quality preference. The PSNR gate below compares two independently
+    # encoded arms; at a rate where the encoder is lossy, the two are distorted
+    # differently and PSNR measures the rate controller rather than the stitch.
+    # Measured on the synthetic clip at the ffmpeg h264_nvenc default rate:
+    # baseline against a single un-concatenated chunk of the same frames scored
+    # 6-25 dB with the pixels provably identical going in.
+    parser.add_argument("--bitrate", type=int, default=150_000_000)
+    parser.add_argument(
+        "--frame-digests",
+        action="store_true",
+        default=True,
+        help="hash every frame before the encoder; the exact seam gate",
+    )
+    parser.add_argument(
+        "--no-frame-digests", dest="frame_digests", action="store_false"
+    )
+    parser.add_argument(
+        "--same-card-control",
+        action="store_true",
+        default=True,
+        help=(
+            "also run the multi-card chunking with every chunk on the baseline "
+            "card. Compared against the baseline it isolates the seam from the "
+            "cards: same chunk boundaries, same architecture, so any difference "
+            "is the stitch and nothing else."
+        ),
+    )
+    parser.add_argument(
+        "--no-same-card-control", dest="same_card_control", action="store_false"
+    )
     parser.add_argument("--ring-depth", type=int, default=2)
     parser.add_argument("--budget-mib", type=int, default=14000)
     parser.add_argument("--model-dir", default="/spinning/llm_stuff/k3-models")
@@ -407,6 +440,38 @@ def main(argv: list[str] | None = None) -> int:
     asyncio.run(remux(source, es, multicard_out, out_rate, args.video_codec))
     report["multicard"]["output_frames"] = count_frames(multicard_out)
 
+    # -- same-card control --------------------------------------------------
+    # The identical chunking, every chunk on the baseline card. Against the
+    # baseline this isolates the seam: same boundaries, same architecture, so
+    # a difference can only be the stitch. Against the multi-card run it
+    # isolates the cards: same boundaries, same GOP structure, so a difference
+    # can only be per-architecture arithmetic.
+    if args.same_card_control and not args.skip_baseline:
+        control_chunks = [
+            ChunkSpec(
+                index=c.index,
+                card=baseline_card,
+                start=c.start,
+                stop=c.stop,
+                pulls_successor=c.pulls_successor,
+                multiplier=c.multiplier,
+            )
+            for c in chunks
+        ]
+        es_ctl = workdir / "control.h264"
+        spool_ctl = workdir / "spool-control"
+        spool_ctl.mkdir(parents=True, exist_ok=True)
+        report["same_card_control"] = asyncio.run(
+            run_chunks(
+                control_chunks,
+                source=source,
+                request=request,
+                out_es=es_ctl,
+                job_id="control",
+                spool=spool_ctl,
+            )
+        )
+
     # -- verdict ------------------------------------------------------------
     checks: dict = {
         "multicard_frame_count": {
@@ -416,6 +481,43 @@ def main(argv: list[str] | None = None) -> int:
             == report["expected_output_frames"],
         }
     }
+
+    if args.frame_digests and not args.skip_baseline:
+        base_digests = report["baseline"].get("frame_digests", [])
+        control = report.get("same_card_control", {})
+        control_digests = control.get("frame_digests", [])
+        if control_digests:
+            first_diff = next(
+                (
+                    i
+                    for i, (a, b) in enumerate(zip(base_digests, control_digests))
+                    if a != b
+                ),
+                None,
+            )
+            checks["seam_is_exact"] = {
+                "compared": "pre-encode frame digests, chunked vs whole, same card",
+                "frames": len(base_digests),
+                "first_differing_frame": first_diff,
+                "pass": (
+                    len(base_digests) == len(control_digests) and first_diff is None
+                ),
+            }
+        multi_digests = report["multicard"].get("frame_digests", [])
+        if multi_digests and base_digests:
+            same = sum(1 for a, b in zip(base_digests, multi_digests) if a == b)
+            # Not a pass/fail. Frames produced on a different architecture are
+            # not expected to be bit-identical to the 5090's -- the convolution
+            # kernels differ -- so this is recorded as a measured fraction and
+            # the encoded-output PSNR below is what grades it.
+            checks["multicard_frames_bit_identical_to_baseline"] = {
+                "identical": same,
+                "of": len(multi_digests),
+                "note": (
+                    "cross-architecture convolution results are not bit-identical; "
+                    "this is a measurement, not a gate"
+                ),
+            }
     if not args.skip_baseline:
         value = psnr_between(baseline_out, multicard_out)
         checks["baseline_frame_count"] = {
@@ -444,6 +546,15 @@ def main(argv: list[str] | None = None) -> int:
             "predicted_speedup_x": None,
         }
     report["checks"] = checks
+    # The digest lists are long and their value is the comparison, which is
+    # already in "checks". Keep the counts, drop the lists.
+    for arm in ("baseline", "multicard", "same_card_control"):
+        if arm in report and isinstance(report[arm], dict):
+            digests = report[arm].pop("frame_digests", None)
+            if digests is not None:
+                report[arm]["frame_digest_count"] = len(digests)
+            for entry in report[arm].get("chunks", []):
+                entry.pop("frame_digests", None)
     (workdir / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
     print(json.dumps({"checks": checks, "speedup": report.get("speedup")}, indent=2))
 

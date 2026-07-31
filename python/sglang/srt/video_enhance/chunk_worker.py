@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -123,6 +124,7 @@ def build_chunk_stages(chunk: ChunkSpec, request: dict, source_url: str) -> tupl
                 codec=request.get("video_codec", "h264"),
                 device_id=0,
                 backend=request.get("encode_backend", "auto"),
+                bitrate=request.get("bitrate"),
             )
     return chain, stages, decode
 
@@ -141,6 +143,22 @@ async def run_chunk(payload: dict) -> dict:
         handle.write(chunk_bytes)
         written["bytes"] += len(chunk_bytes)
 
+    # Optional verification tap. Hashing the frame the instant before it
+    # reaches the encoder is the only comparison of two chunkings that the
+    # encoder cannot confound: two independently encoded H.264 streams of
+    # identical pixels are not identical streams, and their PSNR is a
+    # statement about rate control, not about the seam. Off by default -- it
+    # costs a device-to-host copy per frame.
+    digests: list[str] = []
+    want_digests = bool(request.get("frame_digests"))
+
+    def encode_filter(frame) -> bool:
+        keep = chunk.encodes(frame.index, frame.sub_index)
+        if keep and want_digests:
+            payload = frame.data.detach().to("cpu").contiguous().numpy().tobytes()
+            digests.append(hashlib.sha256(payload).hexdigest()[:16])
+        return keep
+
     executor = PipelineExecutor(
         job_id=f"chunk{chunk.index}",
         chain=chain,
@@ -149,7 +167,7 @@ async def run_chunk(payload: dict) -> dict:
         sink=sink,
         ring_depth=max(1, request.get("ring_depth", 2)),
         policy=OverloadPolicy.STALL,
-        encode_filter=lambda frame: chunk.encodes(frame.index, frame.sub_index),
+        encode_filter=encode_filter,
     )
 
     started = time.perf_counter()
@@ -176,6 +194,7 @@ async def run_chunk(payload: dict) -> dict:
         "wall_seconds": round(elapsed, 3),
         "stage_ms_per_frame": stats.stage_ms_per_frame,
         "expected_output_frames": chunk.output_frames,
+        "frame_digests": digests,
     }
 
 
