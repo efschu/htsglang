@@ -7565,10 +7565,7 @@ class ServerArgs:
                 )
             if self.dual_group_lane_max_requests < 1:
                 raise ValueError("--dual-group-lane-max-requests must be >= 1.")
-<<<<<<< HEAD
-=======
             self._validate_dual_group_lane_part_gpu_id()
->>>>>>> feat/dual-group-families-2
             if self.dual_group_lane_spec:
                 if self.speculative_algorithm is None:
                     raise ValueError(
@@ -7622,13 +7619,10 @@ class ServerArgs:
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
                 "--dual-group-lane-budget-mib only applies with " "--dual-group-lane."
-<<<<<<< HEAD
-=======
             )
         elif self.dual_group_lane_part_gpu_id is not None:
             raise ValueError(
                 "--dual-group-lane-part-gpu-id only applies with " "--dual-group-lane."
->>>>>>> feat/dual-group-families-2
             )
 
         # ---------------------------------------------------------------
