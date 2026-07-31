@@ -34,8 +34,8 @@ its own CUDA context, pinned to one physical GPU through
 | `nvml.py` | physical device identity by UUID | pynvml |
 | `reservation.py` | the Class-3 slice of the §3.3 cross-process ledger | no |
 | `shard_plan.py` | capacity-weighted chunk sharding, and the baselines it is measured against | no |
-| `multicard.py` | the multi-card executor: chunk specs, the seam convention, ordered stitching | no |
-| `chunk_worker.py` | one chunk, one process, one card | yes |
+| `multicard.py` | the multi-card executor: chunk specs, the seam convention, ordered stitching, and the two schedulers (pre-weighted, pull queue) | no |
+| `chunk_worker.py` | one chunk per process, or a serving worker taking items from a pipe | yes |
 | `probes.py` | measurement posts P1-P5 as a CLI, plus the playback arithmetic | torch |
 | `timing.py` | deferred-readout CUDA-event timing | torch optional |
 
@@ -295,6 +295,7 @@ Stated honestly, extending the design's own list:
    per-context workspace measurement and tiling.
 2. `lanczos3_kernel.cu` port, if P1 shows resize is a meaningful share.
 3. ~~Multi-card execution of `shard_plan`'s output.~~ Done, #339, §9.
+   Superseded as the default by pull scheduling, §12.
 4. RIFE TensorRT backend at the post-resize shape.
 5. VapourSynth shim and CLI over the same executor.
 6. Audio-enhance stage (Demucs class) on the passthrough track inventory.
@@ -304,6 +305,9 @@ Stated honestly, extending the design's own list:
    backend, which the stage knows and the backend does not — see §9.1.
 9. Live watch and client liveness (§8), untouched.
 10. Regime B, reopened by prior art rather than by argument — see §10.
+11. Cut the per-item fixed cost of a pull-queue item so the queue can be
+    finer than the balance it currently achieves — §12.7. The encoder
+    session is the expensive half.
 
 ---
 
@@ -650,3 +654,196 @@ configured timeout the executor is cancelled, every stage is closed, and the
 decoder, which was willing to produce 100000 frames, is stopped within one
 ring's worth of the frame it had reached. The control case, a consumer that
 keeps reading, runs to completion with `declared_dead` false.
+
+---
+
+## 12. Pull-queue scheduling (user directive 2026-07-31)
+
+§9.3's executor runs the plan `shard_plan` hands it: one chunk per card,
+sized by a measured rate table. The directive replaces the assignment step —
+the timeline is cut into more items than there are cards, the items name no
+card, and each card takes the next one from a shared list whenever it is
+free. Both modes now run through the same executor, selected by whether
+`cards=` is passed, and the pre-weighted mode is kept rather than deleted
+because it is the baseline the new one is measured against.
+
+### 12.1 Why the seam is not at risk, and how that is shown rather than said
+
+Nothing in the seam convention reads the card. `start`, `stop`,
+`pulls_successor`, `output_frames` and `encodes()` are functions of the
+timeline split alone, so binding a card late cannot move a frame — a chunk
+interpolates the pair that straddles its boundary and withholds the trailing
+original whichever card takes it, and whether or not its neighbour lands on
+the same card.
+
+That argument is one line and would be easy to believe wrongly, so it is a
+test rather than a paragraph: every item of an eight-item queue is placed on
+each of three cards in turn and the owned, pulled and encoded frame sets are
+required to be identical, including `encodes()` over every `(frame, sub)`
+pair in range. `verify_chunk_arithmetic` then runs on the queue before a card
+is touched, exactly as it does for a weighted plan, and the per-chunk output
+count is re-checked against every result.
+
+The card-side re-proof is the same instrument §9.4 used and is the one that
+grades this change: a sha256 per frame taken immediately before the encoder,
+comparing the pull-queue run against the un-chunked whole-clip run **on the
+same card**. A finer queue is more seams — one per item boundary rather than
+one per card — so the convention is under more load here than it ever was
+under the weighted plan.
+
+### 12.2 What pull scheduling actually buys
+
+Stated as properties, because the throughput number on this rig is bounded by
+the same 1.78x card ceiling §9.4 derived and pull scheduling does not move a
+ceiling:
+
+*   **No rate table.** `capacity_weighted_plan` refuses to run without a P1
+    measurement, and the bench spends a calibration pass per card producing
+    one. A pull queue needs none.
+*   **Correct under a rate the measurement could not have known.** A thermal
+    cap, an LLM co-tenant that arrives mid-job, a clip whose content is
+    harder than the calibration clip's. A weighted plan commits before the
+    first frame and cannot revise; a queue revises continuously. There is a
+    test for exactly this: a card that is fast for its first item and slow
+    afterwards ends up with fewer items than its neighbours.
+*   **Worst-case imbalance is one item, not the error in a rate estimate.**
+    That is what the item count buys, and it is the only reason to want more
+    items than cards.
+
+### 12.3 The persistent worker, which is what makes the queue affordable
+
+§9.3 recorded roughly 8 s of torch and ONNX Runtime import per chunk process,
+and named it as the reason the end-to-end speedup (1.44x) sat below the
+compute-only one (1.64x). A queue of four items per card through
+`SubprocessChunkRunner` would pay that eight seconds four times per card and
+hand back more than the scheduling could win.
+
+`PersistentChunkRunner` therefore keeps one worker process per card and feeds
+it items over a pipe (`chunk_worker --serve`). What is paid once per card
+instead of once per item: the import, the CUDA context, the ONNX Runtime
+session build and the RIFE weight load. What is necessarily rebuilt per item:
+the decoder, which seeks to a different frame, and the encoder, which must
+open its own session so each item's elementary stream begins with its own
+parameter sets and an IDR — the property §9.3's concatenation argument rests
+on. Reuse of the rest is safe because those stages hold no cross-frame state:
+the sliding pair RIFE consumes lives in `PipelineExecutor._ArityWindow`,
+constructed fresh per `run()`, so no frame of item *k* can reach item *k+1*.
+
+Two things the protocol had to get right, both of which would present as a
+hung card rather than as an error:
+
+*   **The report channel has to be a channel, not a convention.** The
+    one-shot worker got away with "the parent parses the last line" because
+    there was exactly one report and it came last. A serving worker
+    interleaves reports with whatever torch, ONNX Runtime and ffmpeg print,
+    so the worker dups fd 1 for reports and points fd 1 at fd 2 — the parent's
+    stdout pipe then carries reports and nothing else, without asking every
+    library in the process to be quiet. Reports also carry a prefix, so both
+    ends of the hazard are shut.
+*   **A worker's stderr must be drained.** A worker whose stderr pipe fills
+    stops writing and therefore stops working, which looks exactly like a
+    slow card. It is drained into a bounded tail that becomes the error
+    message when a worker dies, and a death mid-item is reported rather than
+    waited on.
+
+### 12.4 The spool bound under a queue, and why it cannot deadlock
+
+The bound is unchanged — at most `spool_chunks` completed-but-unforwarded
+items — but the argument for it is new, because under a queue a card is not
+tied to one item. A card acquires its spool slot *before* it takes an item,
+never after. Items therefore leave the queue in exactly the order slots were
+acquired, so a card blocked on a slot is always waiting behind items with a
+*lower* index than the one it is about to take, and those are precisely the
+ones the forwarding loop is working through and releasing. A card can never
+be blocked behind work that is itself blocked behind that card.
+
+Written as a test that would hang rather than fail if the order were wrong,
+so it runs under a timeout: twelve items, three cards, one spool slot.
+
+### 12.5 Measurements
+
+Raw records in `TASK_333_M2_MEASUREMENTS.md` and
+`/spinning/gpu-battery-results/2026-07-31_339_pull/`. The bench
+(`scripts/video_enhance/multicard_bench.py --schedule both`) runs the
+weighted arm and the pull arm against the same single-card baseline, so the
+two are comparable to each other and not only to themselves, and keeps
+`--persistent-worker` separable from `--schedule` so a number can be
+attributed to the scheduling or to the worker lifetime rather than to both.
+
+**The gate passed, at two queue lengths.** 96 source frames as 9 items with
+8 interior seams: 191 of 191 output frames bit-identical to the un-chunked
+whole-clip run on the same card. 240 source frames as 6 items with 5
+interior seams: 479 of 479. The weighted arm ran in the same two invocations
+and also passed, so making the card late-bound did not disturb the path that
+was already there. Eight interior seams on a 96-frame clip is four times the
+seam density §9.4 measured, which is why it was cut that finely — to load the
+convention, not to be fast.
+
+**The balance is real and needed no measurement.** Item counts came out
+5090-heaviest in both runs (4/3/2 and 3/1/2) from a scheduler given no P1
+rate table at all.
+
+**On throughput the pull queue lost to the weighted plan here — 1.10x
+against 1.29x on the 240-frame arm — and the reason is quantisation, not
+overhead.** The weighted plan had a calibration pass and can cut at any
+frame, so it split 115 / 62 / 63 and finished its three cards within 1.6 s of
+each other. Six whole items cannot express that 1.85 : 1 : 1 ratio; the queue
+landed on 3 : 1 : 2 and one 3080 carried 80 frames where the plan gave it 63,
+which set the makespan. Doubling the item count halves that rounding error;
+what stops the item count from rising is the fixed per-item cost, and
+reducing it is §12.7 rather than something claimed here.
+
+Two conclusions the numbers do **not** support. First, that pull scheduling
+is worse: it lost to a rate table measured minutes earlier on the same clip
+on the same idle cards, which is precisely the condition where a
+pre-weighted plan is at its best and adaptivity buys nothing — the cases
+§12.2 exists for were not what this rig was asked to produce. Second, that
+the ratio transfers: these cards differ by ~1.85x on this chain, which is
+what makes integer quantisation expensive, and on equal cards the ideal
+split is itself an integer one.
+
+### 12.6 A gate that was failing on a threshold the specification disowned
+
+`multicard_matches_same_card_control` was a pass/fail check at 40 dB. It
+scored 37.0 dB, so the harness returned non-zero on a run whose frame counts
+and seam digests were all green.
+
+40 dB is the floor `parity.py` derives for fp16 against fp32 **on one card**.
+The check applies it to a comparison that holds chunk boundaries and GOP
+structure fixed and varies the architecture, whose convolutions are not
+bit-identical — and §9.4 above had already recorded 37.4 dB for exactly this
+comparison and called it "cross-architecture arithmetic, measured, not
+passed". The code was failing runs against a number its own specification
+had rejected.
+
+It is now `multicard_vs_same_card_control` / `pull_vs_same_card_control`,
+recorded with the reasoning attached and not graded. The gate is the digest
+comparison, which is exact and which no cross-architecture argument can
+soften.
+
+### 12.7 What pull scheduling does not do
+
+*   **The per-item fixed cost is not reduced, only amortised across items on
+    one card.** A decode seek, an encoder session and one discarded seam
+    frame are still paid per item, and they are what caps the item count —
+    which is in turn what caps the balance. The 240-frame arm lost 0.19x to
+    integer quantisation for exactly this reason. Registered as the next
+    post: the encoder session is the expensive half and is rebuilt only
+    because each item's stream must start with its own IDR, which does not
+    obviously require a new session.
+*   **No work stealing.** An item is taken whole. A card that takes the last
+    item and turns out to be slow sets the makespan, and nothing splits that
+    item out from under it. The tail is therefore bounded by one item's
+    runtime, which is the bound §12.2 claims and no better.
+*   **No cross-job queue.** The queue is per job. Two concurrent jobs on the
+    same cards do not share one list, so they balance against each other only
+    through the reservation, not through the scheduler.
+*   **The item count is a configured constant, not derived.**
+    `DEFAULT_CHUNKS_PER_CARD = 4` with a `MIN_PULL_CHUNK_FRAMES = 8` floor.
+    Deriving it properly needs the per-item fixed cost as a measured number,
+    which is the same post as the first bullet.
+*   **A worker is not restarted if it dies.** The run fails with the worker's
+    stderr tail rather than re-queueing its item on another card. Re-queueing
+    is only safe once an item is known to have produced no output, and the
+    spool file makes that knowable — but it is not implemented, and a silent
+    retry of a half-written item would be worse than the refusal.

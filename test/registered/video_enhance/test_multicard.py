@@ -16,19 +16,27 @@ card, and none of them is decidable from a throughput number.
 """
 
 import asyncio
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
 from sglang.srt.video_enhance.chain import ChainRequest, build_chain
 from sglang.srt.video_enhance.frame_math import MIB, Resolution
 from sglang.srt.video_enhance.multicard import (
+    UNASSIGNED_CARD,
     ChunkResult,
     ChunkRunner,
     ChunkSpec,
     MultiCardError,
     MultiCardExecutor,
+    PersistentChunkRunner,
     SubprocessChunkRunner,
+    WorkQueue,
     chunk_specs_from_plan,
+    pinned_child_env,
+    pull_queue_chunks,
+    pull_queue_size,
     total_output_frames,
     verify_chunk_arithmetic,
 )
@@ -489,6 +497,613 @@ class BackPressureThroughSpoolTest(CustomTestCase):
         started_while_stalled = asyncio.run(scenario())
         self.assertLessEqual(started_while_stalled, 2)
         self.assertEqual(len(runner.finished), 6)
+
+
+# ---------------------------------------------------------------------------
+# Pull scheduling
+# ---------------------------------------------------------------------------
+
+
+class PullQueueConstructionTest(CustomTestCase):
+    """The queue is a tiling of the timeline, and the seam does not know it.
+
+    The claim pull scheduling has to survive is that deciding the card later
+    cannot move a frame. It holds because nothing in the seam convention reads
+    the card, and these tests are that statement made falsifiable rather than
+    asserted.
+    """
+
+    def test_items_tile_the_timeline_with_no_gap_and_no_overlap(self):
+        chunks = pull_queue_chunks(480, multiplier=2, has_rife=True, chunks=12)
+        self.assertEqual(chunks[0].start, 0)
+        self.assertEqual(chunks[-1].stop, 480)
+        for earlier, later in zip(chunks, chunks[1:]):
+            self.assertEqual(earlier.stop, later.start)
+
+    def test_the_arithmetic_holds_for_every_queue_length(self):
+        """Item count is a scheduling knob; it must not be a correctness one."""
+        for total in (97, 240, 480):
+            for count in (1, 2, 3, 7, 12):
+                for multiplier in (1, 2, 3):
+                    with self.subTest(total=total, count=count, m=multiplier):
+                        chunks = pull_queue_chunks(
+                            total, multiplier=multiplier, has_rife=True, chunks=count
+                        )
+                        verify_chunk_arithmetic(chunks, total, multiplier)
+                        self.assertEqual(
+                            total_output_frames(chunks),
+                            expected_frame_count(total, multiplier),
+                        )
+
+    def test_items_are_card_agnostic_until_a_card_takes_one(self):
+        chunks = pull_queue_chunks(100, multiplier=2, has_rife=True, chunks=4)
+        self.assertTrue(all(not c.is_assigned for c in chunks))
+        self.assertTrue(all(c.card == UNASSIGNED_CARD for c in chunks))
+
+    def test_assigning_a_card_changes_nothing_a_seam_depends_on(self):
+        """The falsifier for the whole design: place every item on every card
+        and require that the frames it owns, pulls and encodes are identical."""
+        chunks = pull_queue_chunks(200, multiplier=2, has_rife=True, chunks=8)
+        for chunk in chunks:
+            for card in ("0", "1", "2"):
+                placed = chunk.assigned_to(card)
+                self.assertEqual(placed.card, card)
+                self.assertEqual(placed.start, chunk.start)
+                self.assertEqual(placed.stop, chunk.stop)
+                self.assertEqual(placed.pulls_successor, chunk.pulls_successor)
+                self.assertEqual(placed.pulled_frames, chunk.pulled_frames)
+                self.assertEqual(placed.output_frames, chunk.output_frames)
+                for index in range(chunk.start, chunk.stop + 1):
+                    for sub in (0, 1):
+                        self.assertEqual(
+                            placed.encodes(index, sub), chunk.encodes(index, sub)
+                        )
+
+    def test_only_the_last_item_withholds_nothing(self):
+        chunks = pull_queue_chunks(100, multiplier=2, has_rife=True, chunks=5)
+        self.assertEqual([c.pulls_successor for c in chunks], [1, 1, 1, 1, 0])
+
+    def test_a_chain_without_rife_pulls_no_seam_frame(self):
+        chunks = pull_queue_chunks(100, multiplier=1, has_rife=False, chunks=5)
+        self.assertTrue(all(not c.pulls_successor for c in chunks))
+        verify_chunk_arithmetic(chunks, 100, 1)
+
+    def test_more_items_than_frames_is_refused(self):
+        with self.assertRaises(MultiCardError):
+            pull_queue_chunks(4, multiplier=2, has_rife=True, chunks=8)
+
+    def test_queue_size_scales_with_cards(self):
+        self.assertEqual(pull_queue_size(4800, cards=3, chunks_per_card=4), 12)
+        self.assertEqual(pull_queue_size(4800, cards=1, chunks_per_card=4), 4)
+
+    def test_a_short_clip_gets_fewer_items_rather_than_slivers(self):
+        """The floor is what stops the queue from being all overhead."""
+        size = pull_queue_size(20, cards=3, chunks_per_card=4, min_chunk_frames=8)
+        self.assertEqual(size, 2)
+        chunks = pull_queue_chunks(20, multiplier=2, has_rife=True, chunks=size)
+        self.assertTrue(all(c.owned_frames >= 8 for c in chunks))
+
+    def test_the_queue_hands_items_out_in_timeline_order_once_each(self):
+        queue = WorkQueue(pull_queue_chunks(90, multiplier=2, has_rife=True, chunks=6))
+        taken = []
+        while True:
+            item = queue.take("0" if len(taken) % 2 else "1")
+            if item is None:
+                break
+            taken.append(item.index)
+        self.assertEqual(taken, [0, 1, 2, 3, 4, 5])
+        self.assertIsNone(queue.take("0"))
+        self.assertEqual(sum(queue.items_per_card().values()), 6)
+
+
+class SpeedRunner(ChunkRunner):
+    """A fake worker whose per-item time depends on the card, not the item.
+
+    That is the shape pull scheduling exists for: the cards differ, the work
+    does not, and nothing told the scheduler the ratio in advance.
+    """
+
+    def __init__(self, seconds_per_item):
+        self.seconds_per_item = seconds_per_item
+        self.by_card: dict[str, list[int]] = {}
+        self.concurrent = 0
+        self.peak_concurrent = 0
+
+    async def run(self, chunk: ChunkSpec, spool: Path) -> ChunkResult:
+        self.by_card.setdefault(chunk.card, []).append(chunk.index)
+        self.concurrent += 1
+        self.peak_concurrent = max(self.peak_concurrent, self.concurrent)
+        try:
+            await asyncio.sleep(self.seconds_per_item[chunk.card])
+            payload = f"<chunk{chunk.index}>".encode()
+            spool.parent.mkdir(parents=True, exist_ok=True)
+            spool.write_bytes(payload)
+            return ChunkResult(
+                index=chunk.index,
+                card=chunk.card,
+                path=spool,
+                frames_encoded=chunk.output_frames,
+                frames_skipped=1 if chunk.pulls_successor else 0,
+                bytes_out=len(payload),
+                wall_seconds=self.seconds_per_item[chunk.card],
+            )
+        finally:
+            self.concurrent -= 1
+
+
+class PullSchedulingTest(CustomTestCase):
+    """The executor under a pull queue: balance, order, and the same gates."""
+
+    def _run(self, chunks, runner, cards, total_frames, **kwargs):
+        received = bytearray()
+
+        async def sink(payload: bytes) -> None:
+            received.extend(payload)
+
+        executor = MultiCardExecutor(
+            job_id="pull",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=cards,
+            total_frames=total_frames,
+            multiplier=2,
+            **kwargs,
+        )
+        stats = asyncio.run(executor.run())
+        return bytes(received), stats
+
+    def test_the_fast_card_takes_more_items_without_being_told_it_is_fast(self):
+        """The whole point, stated as a measurement rather than a design note.
+
+        No rate table, no calibration, no weight: the 5090-shaped card is
+        given no more information than the 3080-shaped ones and ends up with
+        the larger share purely by finishing sooner and asking again.
+        """
+        chunks = pull_queue_chunks(480, multiplier=2, has_rife=True, chunks=12)
+        runner = SpeedRunner({"1": 0.004, "0": 0.010, "2": 0.010})
+        _, stats = self._run(chunks, runner, ["1", "0", "2"], 480, spool_chunks=12)
+        counts = stats.items_per_card
+        self.assertEqual(sum(counts.values()), 12)
+        self.assertGreater(counts["1"], counts["0"])
+        self.assertGreater(counts["1"], counts["2"])
+
+    def test_a_card_that_stops_being_fast_stops_getting_work(self):
+        """A pre-weighted plan cannot revise itself; a queue does it for free.
+
+        The card is fast for its first item and slow afterwards -- a thermal
+        cap, or an LLM co-tenant arriving. A capacity-weighted split made
+        before the first frame would have handed it the largest chunk on the
+        strength of the calibration it no longer lives up to.
+        """
+        chunks = pull_queue_chunks(480, multiplier=2, has_rife=True, chunks=12)
+
+        class Derating(ChunkRunner):
+            def __init__(self):
+                self.by_card: dict[str, list[int]] = {}
+
+            async def run(self, chunk, spool):
+                seen = self.by_card.setdefault(chunk.card, [])
+                seen.append(chunk.index)
+                slow = chunk.card == "1" and len(seen) > 1
+                await asyncio.sleep(0.020 if slow else 0.002)
+                spool.parent.mkdir(parents=True, exist_ok=True)
+                spool.write_bytes(b"x")
+                return ChunkResult(
+                    index=chunk.index,
+                    card=chunk.card,
+                    path=spool,
+                    frames_encoded=chunk.output_frames,
+                    frames_skipped=1 if chunk.pulls_successor else 0,
+                    bytes_out=1,
+                    wall_seconds=0.0,
+                )
+
+        runner = Derating()
+        _, stats = self._run(chunks, runner, ["1", "0", "2"], 480, spool_chunks=12)
+        self.assertEqual(sum(stats.items_per_card.values()), 12)
+        # The derated card keeps its first item and is overtaken afterwards.
+        self.assertLess(stats.items_per_card["1"], stats.items_per_card["0"])
+
+    def test_output_is_in_timeline_order_whatever_order_the_cards_pulled(self):
+        chunks = pull_queue_chunks(120, multiplier=2, has_rife=True, chunks=6)
+        runner = SpeedRunner({"1": 0.001, "0": 0.008, "2": 0.004})
+        payload, stats = self._run(chunks, runner, ["1", "0", "2"], 120, spool_chunks=6)
+        positions = [payload.index(f"<chunk{i}>".encode()) for i in range(6)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(stats.state, "done")
+
+    def test_the_frame_total_is_the_single_card_answer(self):
+        chunks = pull_queue_chunks(480, multiplier=2, has_rife=True, chunks=12)
+        runner = SpeedRunner({"1": 0.001, "0": 0.002, "2": 0.002})
+        _, stats = self._run(chunks, runner, ["1", "0", "2"], 480, spool_chunks=12)
+        self.assertEqual(stats.frames_encoded, expected_frame_count(480, 2))
+
+    def test_the_wrong_frame_count_is_refused_under_pull_too(self):
+        """The per-chunk gate reads the item, not the plan, so it still fires."""
+        chunks = pull_queue_chunks(120, multiplier=2, has_rife=True, chunks=6)
+
+        class Short(ChunkRunner):
+            async def run(self, chunk, spool):
+                spool.parent.mkdir(parents=True, exist_ok=True)
+                spool.write_bytes(b"x")
+                return ChunkResult(
+                    index=chunk.index,
+                    card=chunk.card,
+                    path=spool,
+                    frames_encoded=chunk.output_frames - (1 if chunk.index == 3 else 0),
+                    frames_skipped=0,
+                    bytes_out=1,
+                    wall_seconds=0.0,
+                )
+
+        with self.assertRaises(MultiCardError) as ctx:
+            self._run(chunks, Short(), ["0", "1"], 120, spool_chunks=6)
+        self.assertIn("seam arithmetic", str(ctx.exception))
+
+    def test_the_error_names_the_card_that_actually_ran_the_item(self):
+        """Under pull the card is not knowable from the plan, so the message
+        has to come from the result or it names a card that never ran it."""
+        chunks = pull_queue_chunks(120, multiplier=2, has_rife=True, chunks=6)
+
+        class Failing(ChunkRunner):
+            async def run(self, chunk, spool):
+                return ChunkResult(
+                    index=chunk.index,
+                    card=chunk.card,
+                    path=spool,
+                    frames_encoded=0,
+                    frames_skipped=0,
+                    bytes_out=0,
+                    wall_seconds=0.0,
+                    error=f"CUDA out of memory on card {chunk.card}",
+                )
+
+        with self.assertRaises(MultiCardError) as ctx:
+            self._run(chunks, Failing(), ["2"], 120, spool_chunks=6)
+        self.assertIn("card 2", str(ctx.exception))
+
+    def test_the_spool_bound_still_holds_and_does_not_deadlock(self):
+        """One slot, many more items than cards: the run must finish anyway.
+
+        The hazard the slot-before-take order removes is a card blocked on a
+        slot while the forwarding loop waits for the very item that card is
+        about to take. If that were possible this test would hang rather than
+        fail, so it is run under a timeout.
+        """
+        chunks = pull_queue_chunks(240, multiplier=2, has_rife=True, chunks=12)
+        runner = SpeedRunner({"1": 0.001, "0": 0.002, "2": 0.003})
+
+        async def scenario():
+            received = bytearray()
+
+            async def sink(payload: bytes) -> None:
+                received.extend(payload)
+
+            executor = MultiCardExecutor(
+                job_id="bound",
+                chunks=chunks,
+                runner=runner,
+                sink=sink,
+                cards=["1", "0", "2"],
+                spool_chunks=1,
+                total_frames=240,
+                multiplier=2,
+            )
+            return await asyncio.wait_for(executor.run(), timeout=30)
+
+        stats = asyncio.run(scenario())
+        self.assertEqual(stats.state, "done")
+        self.assertEqual(runner.peak_concurrent, 1)
+        self.assertEqual(stats.frames_encoded, expected_frame_count(240, 2))
+
+    def test_a_stalled_sink_stops_the_cards_under_pull_as_well(self):
+        chunks = pull_queue_chunks(240, multiplier=2, has_rife=True, chunks=12)
+        runner = SpeedRunner({"1": 0.0, "0": 0.0, "2": 0.0})
+        gate = asyncio.Event()
+
+        async def scenario():
+            async def sink(payload: bytes) -> None:
+                await gate.wait()
+
+            executor = MultiCardExecutor(
+                job_id="stall",
+                chunks=chunks,
+                runner=runner,
+                sink=sink,
+                cards=["1", "0", "2"],
+                spool_chunks=2,
+                total_frames=240,
+                multiplier=2,
+            )
+            task = asyncio.create_task(executor.run())
+            for _ in range(80):
+                await asyncio.sleep(0)
+            taken = sum(len(v) for v in runner.by_card.values())
+            gate.set()
+            await task
+            return taken
+
+        taken_while_stalled = asyncio.run(scenario())
+        self.assertLessEqual(taken_while_stalled, 2)
+
+    def test_stats_record_which_schedule_ran_and_who_pulled_what(self):
+        chunks = pull_queue_chunks(120, multiplier=2, has_rife=True, chunks=6)
+        runner = SpeedRunner({"1": 0.001, "0": 0.003})
+        _, stats = self._run(chunks, runner, ["1", "0"], 120, spool_chunks=6)
+        snapshot = stats.snapshot()
+        self.assertEqual(snapshot["schedule"], "pull")
+        self.assertEqual(len(snapshot["pull_order"]), 6)
+        self.assertEqual([entry[0] for entry in snapshot["pull_order"]], list(range(6)))
+        self.assertEqual(sum(snapshot["items_per_card"].values()), 6)
+
+
+class ScheduleModeGuardTest(CustomTestCase):
+    """Two answers to the same question; mixing them silently is the bug."""
+
+    async def _sink(self, payload: bytes) -> None:
+        return None
+
+    def test_a_pre_weighted_plan_is_not_silently_re_scheduled(self):
+        chunks = [
+            ChunkSpec(0, "1", 0, 50, True, 2),
+            ChunkSpec(1, "0", 50, 100, False, 2),
+        ]
+        with self.assertRaises(MultiCardError) as ctx:
+            MultiCardExecutor(
+                job_id="x",
+                chunks=chunks,
+                runner=FakeRunner(),
+                sink=self._sink,
+                cards=["0", "1"],
+            )
+        self.assertIn("already name a card", str(ctx.exception))
+
+    def test_unassigned_items_without_a_card_list_are_refused(self):
+        chunks = pull_queue_chunks(100, multiplier=2, has_rife=True, chunks=4)
+        with self.assertRaises(MultiCardError) as ctx:
+            MultiCardExecutor(
+                job_id="x", chunks=chunks, runner=FakeRunner(), sink=self._sink
+            )
+        self.assertIn("no card", str(ctx.exception))
+
+    def test_the_same_card_offered_twice_is_refused(self):
+        chunks = pull_queue_chunks(100, multiplier=2, has_rife=True, chunks=4)
+        with self.assertRaises(MultiCardError) as ctx:
+            MultiCardExecutor(
+                job_id="x",
+                chunks=chunks,
+                runner=FakeRunner(),
+                sink=self._sink,
+                cards=["0", "0"],
+            )
+        self.assertIn("offered twice", str(ctx.exception))
+
+    def test_the_pinned_path_is_untouched(self):
+        """The default remains what it was: chunks carry cards, no queue."""
+        chunks = [
+            ChunkSpec(0, "1", 0, 50, True, 2),
+            ChunkSpec(1, "0", 50, 100, False, 2),
+        ]
+        executor = MultiCardExecutor(
+            job_id="x", chunks=chunks, runner=FakeRunner(), sink=self._sink
+        )
+        self.assertIsNone(executor.queue)
+        self.assertEqual(executor.stats.schedule, "pinned")
+
+
+# A worker stub that speaks the serving protocol and imports nothing but the
+# standard library. It stands in for the real chunk worker so the pipe
+# protocol -- one item in, one prefixed report out, process reused -- can be
+# proven without a card, a model, or eight seconds of torch import.
+STUB_WORKER = """
+import json, os, sys
+
+PREFIX = "@@CHUNK_REPORT@@ "
+args = sys.argv[1:]
+request = json.loads(args[args.index("--request") + 1])
+report_fd = os.dup(1)
+os.dup2(2, 1)
+reports = os.fdopen(report_fd, "w")
+pid = os.getpid()
+print("worker noise on stdout that must not be read as a report", flush=True)
+items = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    payload = json.loads(line)
+    chunk = payload["chunk"]
+    items += 1
+    if chunk["index"] == request.get("die_on_index"):
+        sys.stderr.write("stub worker is dying on purpose\\n")
+        sys.stderr.flush()
+        os._exit(9)
+    with open(payload["output_path"], "wb") as handle:
+        handle.write(("<chunk%d>" % chunk["index"]).encode())
+    owned = chunk["stop"] - chunk["start"]
+    m = chunk["multiplier"]
+    frames = owned * m if chunk["pulls_successor"] else owned + (owned - 1) * (m - 1)
+    reports.write(PREFIX + json.dumps({
+        "index": chunk["index"],
+        "frames_encoded": frames,
+        "frames_skipped": 1 if chunk["pulls_successor"] else 0,
+        "bytes_out": 8,
+        "worker_pid": pid,
+        "items_this_worker": items,
+        "card": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }) + "\\n")
+    reports.flush()
+"""
+
+
+class PersistentWorkerProtocolTest(CustomTestCase):
+    """One process per card, many items: the protocol, not the pixels.
+
+    The measured reason this class exists is the ~8 s of torch and ONNX
+    Runtime import #339 recorded per chunk process. A queue of four items per
+    card would pay it four times; a persistent worker pays it once. What is
+    checked here is that the reuse is real and that a dead worker is reported
+    rather than waited on.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="k3-stubworker-")
+        Path(self.tmp, "stub_chunk_worker.py").write_text(STUB_WORKER)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _runner(self, request=None):
+        return PersistentChunkRunner(
+            source_url="/tmp/does-not-exist.mp4",
+            request=request or {},
+            module="stub_chunk_worker",
+            env={"PYTHONPATH": self.tmp},
+        )
+
+    def test_one_worker_per_card_serves_every_item_that_card_takes(self):
+        chunks = pull_queue_chunks(240, multiplier=2, has_rife=True, chunks=8)
+        runner = self._runner()
+        received = bytearray()
+
+        async def sink(payload: bytes) -> None:
+            received.extend(payload)
+
+        executor = MultiCardExecutor(
+            job_id="persist",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=["0", "1"],
+            total_frames=240,
+            multiplier=2,
+            spool_chunks=8,
+        )
+        stats = asyncio.run(executor.run())
+        self.assertEqual(stats.state, "done")
+        self.assertEqual(stats.frames_encoded, expected_frame_count(240, 2))
+        # Two cards, eight items, two processes -- the reuse is the claim.
+        pids = {entry["card"]: entry for entry in stats.chunks}
+        self.assertLessEqual(len({c["card"] for c in stats.chunks}), 2)
+        self.assertEqual(len(pids), len({c["card"] for c in stats.chunks}))
+        positions = [received.index(f"<chunk{i}>".encode()) for i in range(8)]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_the_worker_is_started_once_and_kept(self):
+        chunks = pull_queue_chunks(120, multiplier=2, has_rife=True, chunks=6)
+        runner = self._runner()
+        seen: list[dict] = []
+
+        class Recording(PersistentChunkRunner):
+            async def run(self, chunk, spool):
+                result = await PersistentChunkRunner.run(self, chunk, spool)
+                seen.append({"index": chunk.index, "card": chunk.card})
+                return result
+
+        async def sink(payload: bytes) -> None:
+            return None
+
+        executor = MultiCardExecutor(
+            job_id="reuse",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=["0"],
+            total_frames=120,
+            multiplier=2,
+            spool_chunks=6,
+        )
+        asyncio.run(executor.run())
+        # One card took all six items, and exactly one startup was recorded.
+        self.assertEqual(list(runner.spawn_seconds), ["0"])
+
+    def test_stdout_noise_from_the_worker_is_not_read_as_a_report(self):
+        """The stub prints to stdout before its first report, as torch and
+        ONNX Runtime both do. A protocol that took "the next line" would
+        parse that and fail on the item that was actually fine."""
+        chunks = pull_queue_chunks(40, multiplier=2, has_rife=True, chunks=2)
+        runner = self._runner()
+
+        async def sink(payload: bytes) -> None:
+            return None
+
+        executor = MultiCardExecutor(
+            job_id="noise",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=["0"],
+            total_frames=40,
+            multiplier=2,
+        )
+        stats = asyncio.run(executor.run())
+        self.assertEqual(stats.state, "done")
+
+    def test_a_worker_that_dies_mid_item_is_reported_with_its_stderr(self):
+        """Not waited on. A parent blocked reading a pipe whose writer is gone
+        looks exactly like a slow card, and stays that way forever."""
+        chunks = pull_queue_chunks(60, multiplier=2, has_rife=True, chunks=3)
+        runner = self._runner(request={"die_on_index": 1})
+
+        async def sink(payload: bytes) -> None:
+            return None
+
+        executor = MultiCardExecutor(
+            job_id="dead",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=["0"],
+            total_frames=60,
+            multiplier=2,
+        )
+
+        async def scenario():
+            return await asyncio.wait_for(executor.run(), timeout=60)
+
+        with self.assertRaises(MultiCardError) as ctx:
+            asyncio.run(scenario())
+        message = str(ctx.exception)
+        self.assertIn("dying on purpose", message)
+        self.assertIn("card 0", message)
+
+    def test_workers_are_shut_down_when_the_run_ends(self):
+        chunks = pull_queue_chunks(40, multiplier=2, has_rife=True, chunks=2)
+        runner = self._runner()
+
+        async def sink(payload: bytes) -> None:
+            return None
+
+        executor = MultiCardExecutor(
+            job_id="shutdown",
+            chunks=chunks,
+            runner=runner,
+            sink=sink,
+            cards=["0"],
+            total_frames=40,
+            multiplier=2,
+        )
+        asyncio.run(executor.run())
+        self.assertEqual(runner._workers, {})
+
+
+class PinnedChildEnvTest(CustomTestCase):
+    """The device-order trap, now shared by both runners."""
+
+    def test_both_runners_pin_the_same_way(self):
+        chunk = ChunkSpec(0, "1", 0, 10, False, 2)
+        one_shot = SubprocessChunkRunner(source_url="/tmp/x.mp4", request={})
+        env = one_shot._child_env(chunk)
+        shared = pinned_child_env("1")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], shared["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], shared["CUDA_DEVICE_ORDER"])
+        self.assertEqual(shared["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+
+    def test_a_caller_cannot_override_the_device_order(self):
+        env = pinned_child_env("2", {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"})
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
 
 
 if __name__ == "__main__":

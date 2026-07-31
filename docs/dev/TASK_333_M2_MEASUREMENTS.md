@@ -262,3 +262,117 @@ rejected with "incorrect usage of CPU input buffer" and was not diagnosed
 further. The 3080s were exercised for the first time here, but only as
 whole-chain chunk hosts — there is still no per-stage 3080 sweep across
 resolutions.
+
+---
+
+# Task #339 pull-queue window, 2026-07-31
+
+Raw records in `/spinning/gpu-battery-results/2026-07-31_339_pull/`. Same
+rig, same chain, same clip generator as the #339 window above: 960x540 →
+1920x1080, SR x4 + Lanczos-3 + RIFE 4.6 x2, fp16, SR on the ONNX Runtime CUDA
+provider, ffmpeg NVENC encode, 150 Mbps. NVML 1 = RTX 5090, NVML 0 and 2 =
+RTX 3080. `CUDA_DEVICE_ORDER=PCI_BUS_ID` throughout.
+
+## The seam under a pull queue — the gate
+
+The comparison is a sha256 per frame taken immediately before the encoder,
+between the queue run and the un-chunked whole-clip run **on the same card**.
+Two runs, at two queue lengths:
+
+| Clip | Queue | Interior seams | Frames | Result |
+|---|---|---|---|---|
+| 96 source frames | 9 items | 8 | 191 | **191 of 191 bit-identical — pass** |
+| 240 source frames | 6 items | 5 | 479 | **479 of 479 bit-identical — pass** |
+
+The weighted arm's `seam_is_exact` ran in the same two invocations and also
+passed, 191 of 191 and 479 of 479, so the refactor that made the card
+late-bound left the pre-weighted path intact.
+
+Eight interior seams on a 96-frame clip is four times the seam density the
+#339 window measured (two interior seams on 480 frames). The convention
+holding at that density is the point of running it that way.
+
+## Self-balancing, with no rate table
+
+The pull arms were given no P1 measurement at all.
+
+| Card | 96 frames, 9 items | 240 frames, 6 items |
+|---|---|---|
+| 1 (RTX 5090) | 4 | 3 |
+| 0 (RTX 3080) | 3 | 1 |
+| 2 (RTX 3080) | 2 | 2 |
+
+The ordering is right in both — the 5090 takes the most — and it comes purely
+from finishing sooner and asking again.
+
+## Throughput: the pull queue loses to a well-calibrated plan here, and why
+
+240 source frames, the arm that is long enough to mean something:
+
+| Arm | wall | vs baseline |
+|---|---|---|
+| baseline, 5090 alone | 21.95 s | 1.00x |
+| three cards, capacity-weighted | 17.04 s | 1.29x |
+| three cards, pull queue (6 items) | 19.92 s | 1.10x |
+
+Per-card busy seconds say exactly where the difference went:
+
+| Card | weighted | pull |
+|---|---|---|
+| 1 (5090) | 15.40 | 15.98 |
+| 0 (3080) | 16.98 | 13.27 |
+| 2 (3080) | 16.93 | **18.78** |
+
+The weighted plan is balanced to within 1.6 s across three cards, because it
+had a calibration pass and could cut the timeline at any frame: it gave the
+5090 115 frames and the 3080s 62 and 63, a 1.85 : 1 : 1 split. The queue can
+only hand out whole items. Six equal items of 40 frames cannot express
+1.85 : 1 : 1 — the nearest integer splits are 3 : 2 : 1 and 4 : 1 : 1 — and it
+landed on 3 : 1 : 2, which gave one 3080 eighty frames where the weighted
+plan gave it sixty-three. That card is the makespan.
+
+So the gap is quantisation, not scheduling overhead, and it is a direct
+function of item count: doubling the items halves the worst-case rounding
+error. What stops the item count from rising is the fixed per-item cost — a
+decode seek, an encoder session, and one seam frame pulled through the
+pre-RIFE prefix and discarded. Reducing that is the lever, and it is
+registered as a follow-on rather than claimed.
+
+Two things this does **not** license concluding:
+
+* **That pull scheduling is worse.** It lost to a rate table that was
+  measured minutes earlier on the same clip on the same idle cards — the one
+  condition under which a pre-weighted plan is at its best and adaptivity is
+  worth nothing. The arms where it wins (no calibration available, a rate
+  that changes mid-job) are not in this table because this rig was not asked
+  to produce them.
+* **That the numbers transfer.** This rig's cards differ by ~1.85x on this
+  chain, which is what makes integer quantisation expensive. On cards of
+  equal speed the ideal split *is* an integer one and the quantisation term
+  vanishes.
+
+The 96-frame arm (baseline 13.79 s, weighted 12.62 s / 1.09x, pull 14.59 s /
+0.95x) is recorded only so it cannot later be mistaken for evidence. Four
+seconds of video is far below where the #339 window could resolve 1.44x, and
+nine items on it is deliberately past sensible granularity — that arm was cut
+that finely to load the seam, not to be fast.
+
+## The PSNR gate that was never met and should not have existed
+
+`multicard_matches_same_card_control` was declared a pass/fail gate at 40 dB
+and scored 37.0 dB (weighted) and 38.1 dB (pull), so the harness returned
+non-zero on a run whose actual gates were all green.
+
+The threshold was a category error rather than a near miss. 40 dB is the
+floor `parity.py` derives for **fp16 against fp32 on one card**. This
+comparison holds the chunk boundaries and the GOP structure fixed and varies
+the *architecture*, whose convolutions are not bit-identical — and §9.4 of
+the task document had already recorded 37.4 dB here and described it as
+"cross-architecture arithmetic, measured, not passed". The code was failing
+runs against a threshold its own specification had disowned.
+
+It is now recorded as a measurement with that reasoning attached, and the
+gate is the digest comparison, which is exact. Worth noting in passing that
+the pull arm scored *higher* than the weighted one (38.1 vs 37.0 dB), which
+is consistent with more of its frames having been produced on the baseline
+card.

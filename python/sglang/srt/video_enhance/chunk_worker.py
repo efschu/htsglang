@@ -9,9 +9,17 @@ process-level isolation Class 1 uses for ``--rank-gpu-id``: two chunks on one
 card are two processes with identical ``CUDA_VISIBLE_DEVICES``, never one
 process juggling a logical-to-physical map.
 
-The child writes the chunk's encoded elementary stream to the spool path it
-was given and prints one JSON line on stdout. Nothing else goes to stdout;
-the parent parses the last line.
+Two modes, one body of work:
+
+*   ``--spec`` runs exactly one item and exits. The child writes the chunk's
+    encoded elementary stream to the spool path it was given and prints one
+    JSON line on stdout; the parent parses the last line.
+*   ``--serve`` reads items from stdin until EOF and reports each on a
+    prefixed line, keeping the chain between them. This is the pull-scheduling
+    worker, and keeping the chain is the point: the ~8 s of torch and ONNX
+    Runtime import, the CUDA context, the SR session and the RIFE weights are
+    paid once per card instead of once per item, which is what makes a queue
+    finer than one item per card worth having.
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from pathlib import Path
 
 from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
 from sglang.srt.video_enhance.frame_math import Resolution
-from sglang.srt.video_enhance.multicard import ChunkSpec
+from sglang.srt.video_enhance.multicard import REPORT_PREFIX, ChunkSpec
 from sglang.srt.video_enhance.mux import retimed_rate
 from sglang.srt.video_enhance.pipeline import PipelineExecutor
 from sglang.srt.video_enhance.ring import OverloadPolicy
@@ -44,13 +52,38 @@ async def _as_async(decode):
         await asyncio.sleep(0)
 
 
-def build_chunk_stages(chunk: ChunkSpec, request: dict, source_url: str) -> tuple:
+#: Stages that depend on the chunk and must be rebuilt for every item.
+#:
+#: ``DECODE`` is seeked to the item's first frame and limited to its pulled
+#: range. ``ENCODE`` has to be a fresh session per item because each item's
+#: elementary stream is concatenated with its neighbours', which is only
+#: decodable if every item begins with its own parameter sets and an IDR --
+#: the property the executor's docstring relies on. Everything else in the
+#: chain is a pure function of the request, so a serving worker builds it once
+#: and keeps it.
+PER_CHUNK_STAGES = frozenset({StageKind.DECODE, StageKind.ENCODE})
+
+
+def build_chunk_stages(
+    chunk: ChunkSpec,
+    request: dict,
+    source_url: str,
+    shared: dict | None = None,
+) -> tuple:
     """Instantiate the chain for one chunk on ``cuda:0``.
 
     Kept separate from ``tenant.build_stages`` because a chunk's decode stage
     is the one thing that differs: it is seeked to the chunk's first frame and
     limited to the chunk's pulled range, and everything downstream is the same
     chain the single-card path builds.
+
+    ``shared`` is the serving worker's stage cache. When given, the stages
+    outside :data:`PER_CHUNK_STAGES` are built on the first item and reused on
+    every later one; that is where the ONNX Runtime session build and the RIFE
+    weight load stop being paid per item. It is safe because those stages hold
+    no cross-frame state: the sliding pair RIFE consumes lives in the
+    executor's ``_ArityWindow``, which is constructed fresh per ``run()``, so
+    no frame of item ``k`` can reach item ``k+1``.
     """
     from sglang.srt.video_enhance import codec
     from sglang.srt.video_enhance.resize import ResizeStage
@@ -84,6 +117,9 @@ def build_chunk_stages(chunk: ChunkSpec, request: dict, source_url: str) -> tupl
     )
     stages: dict = {}
     for spec in chain.stages:
+        if shared is not None and spec.kind in shared:
+            stages[spec.kind] = shared[spec.kind]
+            continue
         if spec.kind is StageKind.DECODE:
             stages[spec.kind] = decode
         elif spec.kind is StageKind.COLOR_TO_RGB:
@@ -126,14 +162,20 @@ def build_chunk_stages(chunk: ChunkSpec, request: dict, source_url: str) -> tupl
                 backend=request.get("encode_backend", "auto"),
                 bitrate=request.get("bitrate"),
             )
+    if shared is not None:
+        for kind, stage in stages.items():
+            if kind not in PER_CHUNK_STAGES:
+                shared[kind] = stage
     return chain, stages, decode
 
 
-async def run_chunk(payload: dict) -> dict:
+async def run_chunk(payload: dict, shared: dict | None = None) -> dict:
     chunk = ChunkSpec(**payload["chunk"])
     request = payload["request"]
     output_path = Path(payload["output_path"])
-    chain, stages, decode = build_chunk_stages(chunk, request, payload["source_url"])
+    chain, stages, decode = build_chunk_stages(
+        chunk, request, payload["source_url"], shared
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(output_path, "wb")
@@ -174,7 +216,12 @@ async def run_chunk(payload: dict) -> dict:
     try:
         stats = await executor.run()
     finally:
-        for stage in stages.values():
+        # Only the stages this item owns. Closing a shared stage would tear
+        # down the session the next item is about to reuse, and the failure
+        # would arrive one item later than its cause.
+        for kind, stage in stages.items():
+            if shared is not None and kind not in PER_CHUNK_STAGES:
+                continue
             close = getattr(stage, "close", None)
             if callable(close):
                 try:
@@ -198,10 +245,107 @@ async def run_chunk(payload: dict) -> dict:
     }
 
 
+async def serve(source_url: str, request: dict, reports) -> int:
+    """Take items from stdin until EOF, one report line each.
+
+    The pull-scheduling worker. The process, the CUDA context, the ONNX
+    Runtime session and the RIFE weights are built on the first item and kept
+    for every later one, which is the whole reason the queue can be finer than
+    one item per card.
+
+    Reads and runs strictly one item at a time. That is not a limitation being
+    accepted, it is the contract: a card is one device and a second concurrent
+    item on it would contend for exactly the memory the reservation sized for
+    one. The parent's :class:`~sglang.srt.video_enhance.multicard.PersistentChunkRunner`
+    holds a per-card lock that makes the same statement from its side.
+    """
+    loop = asyncio.get_running_loop()
+    shared: dict = {}
+    items = 0
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        payload = json.loads(line)
+        payload.setdefault("source_url", source_url)
+        payload.setdefault("request", request)
+        try:
+            report = await run_chunk(payload, shared)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised at the pipe
+            # A failed item must come back as a report. Dying here would leave
+            # the parent reading a pipe that will never produce a line, which
+            # is the same symptom as a very slow card and a much worse one to
+            # diagnose.
+            import traceback
+
+            report = {
+                "index": payload.get("chunk", {}).get("index"),
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-4000:],
+            }
+        items += 1
+        reports.write(REPORT_PREFIX + json.dumps(report) + "\n")
+        reports.flush()
+    # Shared stages outlive the items by design; they are closed here, at the
+    # one moment there is provably no next item.
+    for stage in shared.values():
+        close = getattr(stage, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - one bad stage must not mask
+                continue
+    print(f"worker finished after {items} item(s)", file=sys.stderr, flush=True)
+    return 0
+
+
+def _report_stream():
+    """Take the real stdout for reports and point everything else at stderr.
+
+    The one-shot protocol got away with "the parent parses the last line",
+    because there was exactly one report and it came last. A serving worker
+    emits a report per item interleaved with whatever torch, ONNX Runtime and
+    ffmpeg decide to print, so the report channel has to be a channel and not
+    a convention. Duplicating fd 1 and then pointing fd 1 at fd 2 gives the
+    parent a stdout pipe that carries reports and nothing else, without asking
+    every library in the process to be quiet.
+    """
+    import os
+
+    report_fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    return os.fdopen(report_fd, "w")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#333 M2 multi-card chunk worker")
-    parser.add_argument("--spec", required=True, help="JSON job description")
+    parser.add_argument("--spec", help="JSON job description for a single item")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="read items from stdin until EOF, reusing the chain between them",
+    )
+    parser.add_argument("--source-url", help="serving mode: the clip, once")
+    parser.add_argument("--request", help="serving mode: the request JSON, once")
     args = parser.parse_args(argv)
+
+    if args.serve:
+        if not args.source_url or not args.request:
+            parser.error("--serve needs --source-url and --request")
+        reports = _report_stream()
+        try:
+            return asyncio.run(
+                serve(args.source_url, json.loads(args.request), reports)
+            )
+        finally:
+            reports.close()
+
+    if not args.spec:
+        parser.error("one of --spec or --serve is required")
     payload = json.loads(args.spec)
     report = asyncio.run(run_chunk(payload))
     # One JSON line, last line of stdout. The parent reads exactly this.

@@ -44,8 +44,11 @@ from sglang.srt.video_enhance.frame_math import MIB, Resolution
 from sglang.srt.video_enhance.multicard import (
     ChunkSpec,
     MultiCardExecutor,
+    PersistentChunkRunner,
     SubprocessChunkRunner,
     chunk_specs_from_plan,
+    pull_queue_chunks,
+    pull_queue_size,
     resolve_cards,
     verify_chunk_arithmetic,
 )
@@ -125,6 +128,53 @@ def psnr_between(a: Path, b: Path) -> float | None:
     return None
 
 
+def cross_card_psnr(value: float | None, compared: str) -> dict:
+    """A cross-architecture PSNR: recorded, deliberately not graded.
+
+    It was a 40 dB gate, and that was a category error the numbers exposed
+    rather than an assertion anyone could defend. 40 dB is the floor
+    ``parity.py`` derives for **fp16 against fp32 on one card** -- the point
+    where mean squared error drops below the 8-bit output step. This
+    comparison is a different thing: identical chunk boundaries and identical
+    GOP structure, but the frames were produced on different architectures,
+    whose convolution kernels are not bit-identical. TASK_333 §9.4 already
+    recorded 37.4 dB here and described it, correctly, as "cross-architecture
+    arithmetic, measured, not passed" -- so the code was failing a run on a
+    threshold the document it implements had already disowned.
+
+    What grades the stitch is ``*_seam_is_exact``: a sha256 per frame taken
+    immediately before the encoder, against the un-chunked run on the same
+    card. That is exact, and it is a gate. This is context next to it.
+    """
+    return {
+        "psnr_db": value,
+        "compared": compared,
+        "note": (
+            "measurement, not a gate: the two arms ran on different "
+            "architectures, whose convolutions are not bit-identical. The "
+            "40 dB figure in parity.py is a same-card fp16-vs-fp32 floor and "
+            "does not apply here; the seam gate is the digest comparison"
+        ),
+    }
+
+
+def without_digests(arm: dict) -> dict:
+    """An arm's record with the per-frame hash lists replaced by their counts.
+
+    A 480-frame run carries 959 digests per arm and their value is entirely in
+    the comparison, which lives in ``checks``. Printing them makes the log
+    unreadable and hides the numbers a reader came for.
+    """
+    trimmed = {k: v for k, v in arm.items() if k != "frame_digests"}
+    if "frame_digests" in arm:
+        trimmed["frame_digest_count"] = len(arm["frame_digests"])
+    trimmed["chunks"] = [
+        {k: v for k, v in entry.items() if k != "frame_digests"}
+        for entry in arm.get("chunks", [])
+    ]
+    return trimmed
+
+
 def request_payload(args, source_rate: Fraction) -> dict:
     return {
         "source_resolution": args.source_resolution,
@@ -153,9 +203,27 @@ def request_payload(args, source_rate: Fraction) -> dict:
 
 
 async def run_chunks(
-    chunks, *, source: Path, request: dict, out_es: Path, job_id: str, spool: Path
+    chunks,
+    *,
+    source: Path,
+    request: dict,
+    out_es: Path,
+    job_id: str,
+    spool: Path,
+    cards: list[str] | None = None,
+    persistent: bool = False,
 ) -> dict:
-    runner = SubprocessChunkRunner(source_url=str(source), request=request)
+    """One arm. ``cards`` selects pull scheduling, ``persistent`` the runner.
+
+    The two are separable on purpose. Pull scheduling and the persistent
+    worker are one change in intent and two in mechanism, and a measurement
+    that could not separate them would not be able to say which of the two
+    produced whatever the numbers show.
+    """
+    if persistent:
+        runner: object = PersistentChunkRunner(source_url=str(source), request=request)
+    else:
+        runner = SubprocessChunkRunner(source_url=str(source), request=request)
     handle = open(out_es, "wb")
 
     async def sink(payload: bytes) -> None:
@@ -167,6 +235,7 @@ async def run_chunks(
         runner=runner,
         sink=sink,
         spool_dir=spool,
+        cards=cards,
     )
     started = time.perf_counter()
     try:
@@ -175,6 +244,8 @@ async def run_chunks(
         handle.close()
     snapshot = stats.snapshot()
     snapshot["wall_seconds"] = round(time.perf_counter() - started, 3)
+    if persistent:
+        snapshot["worker_spawn_seconds"] = dict(runner.spawn_seconds)
     return snapshot
 
 
@@ -307,6 +378,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-same-card-control", dest="same_card_control", action="store_false"
     )
+    parser.add_argument(
+        "--schedule",
+        choices=("weighted", "pull", "both"),
+        default="both",
+        help=(
+            "weighted: the capacity-weighted plan, one chunk per card. "
+            "pull: card-agnostic items taken from a shared queue. "
+            "both: run each as its own arm against the same baseline, which is "
+            "the only way the two are comparable"
+        ),
+    )
+    parser.add_argument(
+        "--chunks-per-card",
+        type=int,
+        default=4,
+        help="pull queue length, as a multiple of the card count",
+    )
+    parser.add_argument(
+        "--persistent-worker",
+        action="store_true",
+        default=True,
+        help=(
+            "keep one worker process per card and feed it items, instead of "
+            "launching a process per item. Only meaningful under pull "
+            "scheduling, where a process per item would pay the ~8 s torch and "
+            "ONNX Runtime import once per queue item"
+        ),
+    )
+    parser.add_argument(
+        "--no-persistent-worker", dest="persistent_worker", action="store_false"
+    )
     parser.add_argument("--ring-depth", type=int, default=2)
     parser.add_argument("--budget-mib", type=int, default=14000)
     parser.add_argument("--model-dir", default="/spinning/llm_stuff/k3-models")
@@ -420,25 +522,32 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(remux(source, es, baseline_out, out_rate, args.video_codec))
         report["baseline"]["output_frames"] = count_frames(baseline_out)
         report["baseline"]["card"] = baseline_card
-        print(json.dumps({"baseline": report["baseline"]}, indent=2), flush=True)
-
-    # -- multi-card ---------------------------------------------------------
-    es = workdir / "multicard.h264"
-    spool = workdir / "spool-multicard"
-    spool.mkdir(parents=True, exist_ok=True)
-    multicard_out = workdir / "multicard.mp4"
-    report["multicard"] = asyncio.run(
-        run_chunks(
-            chunks,
-            source=source,
-            request=request,
-            out_es=es,
-            job_id="multicard",
-            spool=spool,
+        print(
+            json.dumps({"baseline": without_digests(report["baseline"])}, indent=2),
+            flush=True,
         )
-    )
-    asyncio.run(remux(source, es, multicard_out, out_rate, args.video_codec))
-    report["multicard"]["output_frames"] = count_frames(multicard_out)
+
+    run_weighted = args.schedule in ("weighted", "both")
+    run_pull = args.schedule in ("pull", "both")
+
+    # -- multi-card, capacity-weighted --------------------------------------
+    multicard_out = workdir / "multicard.mp4"
+    if run_weighted:
+        es = workdir / "multicard.h264"
+        spool = workdir / "spool-multicard"
+        spool.mkdir(parents=True, exist_ok=True)
+        report["multicard"] = asyncio.run(
+            run_chunks(
+                chunks,
+                source=source,
+                request=request,
+                out_es=es,
+                job_id="multicard",
+                spool=spool,
+            )
+        )
+        asyncio.run(remux(source, es, multicard_out, out_rate, args.video_codec))
+        report["multicard"]["output_frames"] = count_frames(multicard_out)
 
     # -- same-card control --------------------------------------------------
     # The identical chunking, every chunk on the baseline card. Against the
@@ -446,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     # a difference can only be the stitch. Against the multi-card run it
     # isolates the cards: same boundaries, same GOP structure, so a difference
     # can only be per-architecture arithmetic.
-    if args.same_card_control and not args.skip_baseline:
+    if run_weighted and args.same_card_control and not args.skip_baseline:
         control_chunks = [
             ChunkSpec(
                 index=c.index,
@@ -475,99 +584,206 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(remux(source, es_ctl, control_out, out_rate, args.video_codec))
         report["same_card_control"]["output_frames"] = count_frames(control_out)
 
+    # -- pull scheduling ----------------------------------------------------
+    # The same clip, the same seam convention, and no plan: the timeline is cut
+    # into more items than there are cards and every card takes the next one
+    # when it is free. Two arms, because they answer two questions that a
+    # single arm would conflate -- the multi-card one is a throughput number
+    # against the same baseline, and the one-card one is the exact seam gate,
+    # where "exact" means a sha256 per frame taken immediately before the
+    # encoder and compared against the un-chunked run on that same card.
+    pull_out = workdir / "pull.mp4"
+    if run_pull:
+        queue_len = pull_queue_size(
+            total_frames, cards=len(args.cards), chunks_per_card=args.chunks_per_card
+        )
+        pull_items = pull_queue_chunks(
+            total_frames,
+            multiplier=args.fps_multiplier,
+            has_rife=any(s.kind.value == "rife" for s in chain.stages),
+            chunks=queue_len,
+        )
+        verify_chunk_arithmetic(pull_items, total_frames, args.fps_multiplier)
+        report["pull_plan"] = {
+            "items": len(pull_items),
+            "chunks_per_card": args.chunks_per_card,
+            "persistent_worker": args.persistent_worker,
+            "describe": [c.describe() for c in pull_items],
+        }
+
+        es_pull = workdir / "pull.h264"
+        spool_pull = workdir / "spool-pull"
+        spool_pull.mkdir(parents=True, exist_ok=True)
+        report["pull"] = asyncio.run(
+            run_chunks(
+                pull_items,
+                source=source,
+                request=request,
+                out_es=es_pull,
+                job_id="pull",
+                spool=spool_pull,
+                cards=args.cards,
+                persistent=args.persistent_worker,
+            )
+        )
+        asyncio.run(remux(source, es_pull, pull_out, out_rate, args.video_codec))
+        report["pull"]["output_frames"] = count_frames(pull_out)
+        print(
+            json.dumps({"pull": without_digests(report["pull"])}, indent=2), flush=True
+        )
+
+        if args.same_card_control and not args.skip_baseline:
+            es_pctl = workdir / "pull-control.h264"
+            spool_pctl = workdir / "spool-pull-control"
+            spool_pctl.mkdir(parents=True, exist_ok=True)
+            report["pull_same_card_control"] = asyncio.run(
+                run_chunks(
+                    pull_items,
+                    source=source,
+                    request=request,
+                    out_es=es_pctl,
+                    job_id="pullctl",
+                    spool=spool_pctl,
+                    cards=[baseline_card],
+                    persistent=args.persistent_worker,
+                )
+            )
+            pull_control_out = workdir / "pull-control.mp4"
+            asyncio.run(
+                remux(source, es_pctl, pull_control_out, out_rate, args.video_codec)
+            )
+            report["pull_same_card_control"]["output_frames"] = count_frames(
+                pull_control_out
+            )
+
     # -- verdict ------------------------------------------------------------
-    checks: dict = {
-        "multicard_frame_count": {
+    checks: dict = {}
+    if run_weighted:
+        checks["multicard_frame_count"] = {
             "expected": report["expected_output_frames"],
             "actual": report["multicard"]["output_frames"],
             "pass": report["multicard"]["output_frames"]
             == report["expected_output_frames"],
         }
-    }
+    if run_pull:
+        checks["pull_frame_count"] = {
+            "expected": report["expected_output_frames"],
+            "actual": report["pull"]["output_frames"],
+            "pass": report["pull"]["output_frames"] == report["expected_output_frames"],
+        }
+
+    def seam_check(base_digests, control_digests, label):
+        """The exact gate: chunked and un-chunked, same card, hashed pre-encode.
+
+        It is a gate rather than a tolerance because the comparison is taken
+        before the encoder. Two independently encoded H.264 streams of
+        identical pixels are not the same stream, so an encoded-output PSNR
+        here measures rate control; these digests measure the stitch.
+        """
+        first_diff = next(
+            (
+                i
+                for i, (a, b) in enumerate(zip(base_digests, control_digests))
+                if a != b
+            ),
+            None,
+        )
+        return {
+            "compared": f"pre-encode frame digests, {label} vs whole clip, same card",
+            "frames": len(base_digests),
+            "chunked_frames": len(control_digests),
+            "first_differing_frame": first_diff,
+            "pass": len(base_digests) == len(control_digests) and first_diff is None,
+        }
 
     if args.frame_digests and not args.skip_baseline:
         base_digests = report["baseline"].get("frame_digests", [])
-        control = report.get("same_card_control", {})
-        control_digests = control.get("frame_digests", [])
+        control_digests = report.get("same_card_control", {}).get("frame_digests", [])
         if control_digests:
-            first_diff = next(
-                (
-                    i
-                    for i, (a, b) in enumerate(zip(base_digests, control_digests))
-                    if a != b
-                ),
-                None,
+            checks["seam_is_exact"] = seam_check(
+                base_digests, control_digests, "capacity-weighted chunking"
             )
-            checks["seam_is_exact"] = {
-                "compared": "pre-encode frame digests, chunked vs whole, same card",
-                "frames": len(base_digests),
-                "first_differing_frame": first_diff,
-                "pass": (
-                    len(base_digests) == len(control_digests) and first_diff is None
-                ),
-            }
-        multi_digests = report["multicard"].get("frame_digests", [])
-        if multi_digests and base_digests:
-            same = sum(1 for a, b in zip(base_digests, multi_digests) if a == b)
-            # Not a pass/fail. Frames produced on a different architecture are
-            # not expected to be bit-identical to the 5090's -- the convolution
-            # kernels differ -- so this is recorded as a measured fraction and
-            # the encoded-output PSNR below is what grades it.
-            checks["multicard_frames_bit_identical_to_baseline"] = {
-                "identical": same,
-                "of": len(multi_digests),
-                "note": (
-                    "cross-architecture convolution results are not bit-identical; "
-                    "this is a measurement, not a gate"
-                ),
-            }
+        pull_control_digests = report.get("pull_same_card_control", {}).get(
+            "frame_digests", []
+        )
+        if pull_control_digests:
+            # The re-proof the pull-queue change owes. A finer queue means more
+            # seams -- one per item boundary instead of one per card -- so the
+            # convention is under more load here than it ever was under the
+            # weighted plan, and this is where that shows up if it is wrong.
+            checks["pull_seam_is_exact"] = seam_check(
+                base_digests, pull_control_digests, "pull queue"
+            )
+        for arm, key in (("multicard", "multicard"), ("pull", "pull")):
+            digests = report.get(arm, {}).get("frame_digests", [])
+            if digests and base_digests:
+                same = sum(1 for a, b in zip(base_digests, digests) if a == b)
+                # Not a pass/fail. Frames produced on a different architecture
+                # are not expected to be bit-identical to the 5090's -- the
+                # convolution kernels differ -- so this is recorded as a
+                # measured fraction and the encoded-output PSNR grades it.
+                checks[f"{key}_frames_bit_identical_to_baseline"] = {
+                    "identical": same,
+                    "of": len(digests),
+                    "note": (
+                        "cross-architecture convolution results are not "
+                        "bit-identical; this is a measurement, not a gate"
+                    ),
+                }
     if not args.skip_baseline:
-        value = psnr_between(baseline_out, multicard_out)
         checks["baseline_frame_count"] = {
             "expected": report["expected_output_frames"],
             "actual": report["baseline"]["output_frames"],
             "pass": report["baseline"]["output_frames"]
             == report["expected_output_frames"],
         }
-        # Informational, not a gate. It compares a three-card run against a
-        # one-card run, so it carries two differences at once: the cards, and
-        # the GOP structure -- chunk boundaries force an IDR, which the
-        # baseline does not have there, and two encodes of identical pixels
-        # with different GOP structure already differ. The gate below removes
-        # the second of those.
-        checks["multicard_vs_single_card_baseline"] = {
-            "psnr_db": value,
-            "note": (
-                "cards and GOP structure both differ; use "
-                "multicard_matches_same_card_control for the cards alone"
-            ),
-        }
-        if args.same_card_control:
-            control_value = psnr_between(workdir / "control.mp4", multicard_out)
-            # Same chunk boundaries, same GOP structure, so the encoder is
-            # controlled for and what remains is the per-architecture
-            # arithmetic of the SR and RIFE convolutions. 40 dB is the floor
-            # parity.py derives for fp16 against fp32: below the 8-bit output
-            # step on average.
-            checks["multicard_matches_same_card_control"] = {
-                "psnr_db": control_value,
-                "threshold_db": 40.0,
-                "compared": "same chunking, 3 cards vs 1 card",
-                "pass": control_value is not None and control_value >= 40.0,
+        if run_weighted:
+            # Informational, not a gate. It compares a three-card run against a
+            # one-card run, so it carries two differences at once: the cards,
+            # and the GOP structure -- chunk boundaries force an IDR, which the
+            # baseline does not have there, and two encodes of identical pixels
+            # with different GOP structure already differ. The gate below
+            # removes the second of those.
+            checks["multicard_vs_single_card_baseline"] = {
+                "psnr_db": psnr_between(baseline_out, multicard_out),
+                "note": (
+                    "cards and GOP structure both differ; use "
+                    "multicard_vs_same_card_control for the cards alone"
+                ),
             }
+            if args.same_card_control:
+                checks["multicard_vs_same_card_control"] = cross_card_psnr(
+                    psnr_between(workdir / "control.mp4", multicard_out),
+                    "same chunking, 3 cards vs 1 card",
+                )
+        if run_pull and args.same_card_control:
+            checks["pull_vs_same_card_control"] = cross_card_psnr(
+                psnr_between(workdir / "pull-control.mp4", pull_out),
+                "same queue, 3 cards vs 1 card",
+            )
+
         base_wall = report["baseline"]["wall_seconds"]
-        multi_wall = report["multicard"]["wall_seconds"]
+        # Every arm against the one baseline, so the arms are comparable to
+        # each other and not only to themselves.
         report["speedup"] = {
             "baseline_wall_s": base_wall,
-            "multicard_wall_s": multi_wall,
-            "speedup_x": round(base_wall / multi_wall, 3) if multi_wall else None,
             "cards": len(args.cards),
-            "predicted_speedup_x": None,
         }
+        for arm in ("multicard", "pull"):
+            wall = report.get(arm, {}).get("wall_seconds")
+            if wall:
+                report["speedup"][f"{arm}_wall_s"] = wall
+                report["speedup"][f"{arm}_speedup_x"] = round(base_wall / wall, 3)
     report["checks"] = checks
     # The digest lists are long and their value is the comparison, which is
     # already in "checks". Keep the counts, drop the lists.
-    for arm in ("baseline", "multicard", "same_card_control"):
+    for arm in (
+        "baseline",
+        "multicard",
+        "same_card_control",
+        "pull",
+        "pull_same_card_control",
+    ):
         if arm in report and isinstance(report[arm], dict):
             digests = report[arm].pop("frame_digests", None)
             if digests is not None:
