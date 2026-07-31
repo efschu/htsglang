@@ -18870,3 +18870,101 @@ pruefen.
 - **Regime B wieder offen**, aber nicht aus Argument, sondern aus Prior Art:
   die produktive `vs-pipeline` legt ESRGAN auf die beiden 3080 und RIFE auf
   die 5090, und P2 misst genau an deren Trennpunkt 1,7 ms Round-Trip.
+
+## #330 VRAM-Dial + C-Wiederanhebung (`feat/vram-dial-330`, Basis 5db315ae5c; Kartenfenster 2026-07-31, 12:40-13:21 UTC)
+
+Laufzeit-Budgetregler pro Karte + KV-Kapazitaets-Wiederanhebung auf der
+#93/#102-VMM-Maschinerie (kv_vmm_backing.py: gechunkte Commits 16 MiB,
+neues decommit_range; KEINE zweite VMM-Schicht). Konsens nach #287/#297-
+Muster: eine begrenzte MIN-Reduktion je Boundary mit (armed, ready, epoch,
+op_seq, C_target); Wachstum automatisch NACH erster Freigabe (op_seq>0),
+Schrumpfen NUR auf explizites Dial (flusht Radix). Hermetisch: 26 Tests
+(test_vram_dial.py, Mock-Kanaele, echte Threads: Desync-Falsifikator alle
+laut/keiner haengt, op_seq-Skew haelt-dann-committet, Fit-Guard +
+Pre-Provision, Allocator-Grow token+paged) + #297/#287-Suiten regressionsfrei.
+
+Boot-Rezept: erprobter TP=3-Boot (Qwen3.6-27B-FP8, Reserven 3000/2700/2700)
++ `--rank-kv-ratio 7,3,3 --kv-reshard-vectors 2,11,10 --enable-vram-dial`.
+Fitted C=251965; Boot-Plan-Caps {7,3,3: 522197; 2,11,10: 251965} (die
+431k/6,18x-Prognose aus #320 galt fuer ANDERE Reserven — auf diesem Boot
+ist 7,3,3 der Kapazitaetsgewinner, 2,11,10 der bindende Vektor; die
+Richtung ist konfigurationsabhaengig, der Mechanismus symmetrisch).
+Budgets/Floors (gemessen, kartenweise NVML minus VMM-Backing):
+[26349/21813, 19601/15701, 18151/14571] MiB.
+
+### Beweis (a): Dial runter/rauf auf einer 3080, live (Boot A3)
+
+| Punkt | Wert |
+|---|---|
+| Dial | release_mib=3584 auf GPU-5c648f96 (rank 1, 3080) |
+| Commit | SHRINK C 254761->41015, 122,9 ms auf rank 1, Radix geflusht |
+| Physisch frei | rank-1-Karte 19249->15957 MiB used = **3292 MiB an den Treiber** (nvidia-smi) |
+| Fremdprozess | claimant cudaMalloc **3,5 GiB** auf derselben Karte OK (free 3877->257 MiB), Server lief weiter |
+| Kohaerenz | Same-Prompt-Probe vor/nach byte-identisch (" Madrid.\nA. True..."); keine Graph-Recapture (einzige capture/graph-Zeile danach: regulaeres Prefill-Log) |
+| Rueckweg | budget_mib=19601 -> GROW C 41015->254761 in 2,5-8,8 ms, Kapazitaet exakt restauriert |
+| Ledger | /run/htsglang/vram/<uuid>.json: HOT-Eintrag srt-30030:rank1, reserved folgt dem Budget |
+
+### Beweis (b): Reshard-Interplay + C-Wiederanhebung
+
+- Reshard 7,3,3->2,11,10 bei C=250263: Fit-Guard hielt zuerst LAUT mit
+  exakten Zahlen ("needs 119702 rows on rank 1 but only 58794 are backed;
+  dial the capacity down to C<=122889 ... or raise that rank's budget"),
+  dann Pre-Provision AUTOMATISCH (ADJUST, rank 1 58794->119702 rows, 9,2 ms,
+  Budget deckte es), dann Reshard-Commit — alles in EINEM Boundary-Fenster.
+- **C-Wiederanhebung nach Cutover, automatisch:** GROW 250263->251965
+  (= Cap des neuen Vektors) in 0,5-2,5 ms, epoch 6, im selben Fenster.
+- **Grosses Wachstum** (Boot A4, sauberer Stand mit op_seq-Gate): Grant
+  rank0 budget_mib=27900 -> GROW **251965->341861 (1,357x) in 8,3 ms**,
+  rank0-Backing 135674->184086 rows, **+1560 MiB physisch gemappt**
+  (nvidia-smi 26647->28207), Adressen stabil, Graphen replayen
+  (Decode-Log "cuda graph: True"), Probe byte-identisch.
+- Last nach Wachstum: 12 Sessions x 20-30k Tokens = **260268 Prompt-Tokens
+  korrekt beantwortet** (jede Session erinnerte ihr Token S<i>X), kein OOM.
+- Erreicht: max_total_num_tokens **341861** vs 431k-Prognose — ehrlich:
+  die Prognosezahl gehoert zu einer anderen Reserven-Konfiguration; auf
+  diesem Boot war 522197 der Plan-Cap des Gewinner-Vektors, bewusst nur bis
+  341861 gewachsen (Aktivierungs-Headroom; Boot warnt selbst, dass die
+  gepinnten Reserven 3000/2700/2700 unter 'auto'-Bedarf 4160 liegen).
+
+### Beweis (c): Negativkontrolle
+
+budget_mib=15000 auf rank 1 (Floor 15701): HTTP 400, Meldung nennt exakt
+Floor 15701 MiB, Anfrage 15000 MiB, Min-viable 15701 MiB; op_seq und
+Zustand unveraendert, kein Commit.
+
+### Kartenfunde (3 gefixt, 1 offen)
+
+1. GEFIXT: Scheduler-Thread hat kein current_device, NVML-Pids sind im
+   LXC namespace-verschoben -> Floor-Messung jetzt kartenweise
+   (NVML-total minus free) ueber runner.gpu_id + torch-props-UUID.
+2. GEFIXT: eingefrorene Dataclass-Komponenten (pool_stats_observer u. a.)
+   -> object.__setattr__ im Snapshot-Refresh.
+3. GEFIXT: Chunk-Rundungs-Slack der Ceiling-Backing finanzierte ein
+   spontanes Boot-Wachstum ueber die Fitted Ceiling (254761>251965) und
+   blockierte damit deklariertes Resharding bis zum Dial-down ->
+   op_seq-Gate: KEIN Wachstum vor der ersten Budget-Freigabe (A4
+   verifiziert: haelt mit klarer Log-Zeile, C bleibt exakt 251965).
+   Dazu GEFIXT: effective-ceiling-Clamp konnte unter dem aktuellen Vektor
+   UNTER floor+backing klemmen (falsches Ledger, Pre-Provision-Escape
+   blockiert) -> Ceiling nie unter floor+backing/beste deklarierte Vector-
+   Finanzierung. Und: base-Allocator resize/grow_size liess num_pages bei
+   page_size=1 stale (latenter Stock-Bug der uneven-DCP-Spur, Test ergaenzt).
+4. OFFEN (Register-Posten): 10x30k-Sessions GLEICHZEITIG (Ziel: >252k
+   gleichzeitig gehaltene Tokens) crasht bei full token usage 0.88 mit
+   store_kvcache-Assert `index >= 0 && index < size_limit`
+   (kvcache.cuh:112, kElementBytes=256 = 2-KV-Head-Rang). size_limit ist
+   live (pool.size+page), Reihen-/Draft-Schranken rechnerisch gedeckt —
+   der entlaufende Index deutet auf einen Pfad, der erst bei Slot-Ids
+   OBERHALB des Boot-C angefasst wird (die 12-Session-Fuellung mit max 80k
+   gleichzeitig blieb unauffaellig, Allocator vergibt niedrige Ids
+   zuerst). Braucht ein eigenes Debug-Fenster (compute-sanitizer /
+   SGLANG_POISON, Kandidaten: Spec-Verify-/Overlap-Pfad ueber Boot-C).
+   Bis dahin gilt: Dial-down/-up innerhalb des Boot-C ist voll belastbar;
+   Wachstum ueber Boot-C traegt diese bekannte Grenze.
+
+### Fensterdisziplin
+
+12:40-13:21 UTC (~41 min Kartenzeit, 3 Boots A3/A4 + Crash-Analyse);
+Orphan-Reap des agent-339-holders nach Protokoll (Alter 1283 s, Karten
+leer, Log-Zeile); Locks + holder gesetzt/geraeumt, FREI-Zeile im Arb-Log;
+Rohdaten /tmp/t330/boot{A,A2,A3,A4}.log.

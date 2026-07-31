@@ -1697,6 +1697,7 @@ class MHATokenToKVPool(KVCache):
         enable_kv_cache_copy: bool = False,
         kv_cache_layout: Optional[str] = None,
         post_capture_active: bool = False,
+        vmm_commit_chunk_bytes: Optional[int] = None,
     ):
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
@@ -1714,6 +1715,9 @@ class MHATokenToKVPool(KVCache):
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
+        # #330 dial: chunked physical commits make the tail releasable at
+        # runtime; None keeps one handle per extension (stock post-capture).
+        self._vmm_commit_chunk_bytes = vmm_commit_chunk_bytes
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -1986,6 +1990,7 @@ class MHATokenToKVPool(KVCache):
             page_size=self.page_size,
             reserved_num_tokens=self.size,
             buffer_descs=self._build_kv_buffer_descs(),
+            commit_chunk_bytes=self._vmm_commit_chunk_bytes,
         )
         self._assign_post_capture_tensors(self._post_capture_owner.tensors)
 
@@ -2003,6 +2008,41 @@ class MHATokenToKVPool(KVCache):
     @property
     def post_capture_backed_bytes(self) -> int:
         return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
+
+    def runtime_set_backing_tokens(self, num_tokens: int) -> int:
+        """#330 dial: converge the VMM backing to ``num_tokens`` slots at
+        runtime (grow maps + zeroes new rows; shrink decommits the tail back
+        to the driver). Addresses never move, so captured CUDA graphs keep
+        replaying. Returns the bytes actually RELEASED (0 on grow/no-op).
+        Caller must hold an idle boundary and must have lowered the allocator
+        ceiling first on shrink (rows above ``num_tokens`` must be dead).
+        Newly grown rows are zeroed: a fresh boot's pools are torch.zeros and
+        the flush identity (zero_kv_data_buffers rationale) must keep holding.
+        """
+        owner = self._post_capture_owner
+        if owner is None:
+            raise RuntimeError(
+                "runtime_set_backing_tokens needs the VMM-backed pool "
+                "(post_capture_active); this pool was allocated via "
+                "torch.zeros and cannot release or grow physical backing."
+            )
+        prev = int(self.size)
+        n = int(num_tokens)
+        if n == prev:
+            return 0
+        if n > prev:
+            owner.finalize(n)
+            buffers = list(self.k_buffer) + list(self.v_buffer)
+            for desc, buf in zip(self._kv_buffer_descs, buffers):
+                lo = desc._rows(prev + self.page_size)
+                hi = desc._rows(n + self.page_size)
+                if hi > lo:
+                    buf[lo:hi].zero_()
+            self.size = n
+            return 0
+        released = owner.shrink(n)
+        self.size = n
+        return released
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -2821,6 +2861,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        vmm_commit_chunk_bytes: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2858,7 +2899,12 @@ class HybridLinearKVPool(KVCache):
                 TokenToKVPoolClass = full_kv_pool_class
 
             post_capture_kwargs = (
-                {"post_capture_active": True} if post_capture_active else {}
+                {
+                    "post_capture_active": True,
+                    "vmm_commit_chunk_bytes": vmm_commit_chunk_bytes,
+                }
+                if post_capture_active
+                else {}
             )
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2915,6 +2961,32 @@ class HybridLinearKVPool(KVCache):
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
         self.full_kv_pool._finalize_backing_tokens(config.max_total_num_tokens)
         self.size = int(config.max_total_num_tokens)
+
+    def initial_backing_rows(self, rows: int) -> None:
+        """#330 dial lane: back the full-attention sub-pool to its boot row
+        count right after construction (the ctor reserved the VA upper bound
+        only). Does NOT touch ``self.size`` — on this pool family the hybrid
+        ``size`` keeps the stock rows semantics of the non-VMM ctor path."""
+        self.full_kv_pool._finalize_backing_tokens(rows)
+        # Fresh VMM pages are relied on to read as zeros elsewhere in this
+        # lane; make it explicit for the whole boot span so the dial boot is
+        # byte-identical to the stock torch.zeros construction.
+        for buf in list(self.full_kv_pool.k_buffer) + list(self.full_kv_pool.v_buffer):
+            hi = rows + self.page_size
+            buf[:hi].zero_()
+
+    def runtime_set_backing_rows(self, rows: int) -> int:
+        """#330 dial: converge the full-attention sub-pool's physical backing
+        to ``rows`` at runtime; returns bytes released to the driver."""
+        return self.full_kv_pool.runtime_set_backing_tokens(rows)
+
+    @property
+    def vmm_backed_bytes(self) -> int:
+        return self.post_capture_backed_bytes
+
+    @property
+    def full_pool_backed_rows(self) -> int:
+        return int(self.full_kv_pool.size)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()

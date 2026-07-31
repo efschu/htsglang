@@ -131,6 +131,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
+    VramBudgetReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -947,6 +948,25 @@ async def kv_reshard(obj: Annotated[KvReshardReqInput, Body()], request: Request
         return _create_error_response(e)
     return ORJSONResponse(
         {"success": ret.success, "message": ret.message},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/vram_budget", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def vram_budget(obj: Annotated[VramBudgetReqInput, Body()], request: Request):
+    """#330: dial one card's VRAM budget at runtime (device: rank:N / cuda:N /
+    NVML UUID / all; exactly one of budget_mib, release_mib,
+    release_fraction), or query the dial state with {"query": true}. Released
+    memory is decommitted back to the driver at the next group-idle consensus
+    boundary; watch the VRAM-DIAL log lines for the DONE record. Requires
+    --enable-vram-dial."""
+    try:
+        ret = await _global_state.tokenizer_manager.vram_budget(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message, "state": ret.state},
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 

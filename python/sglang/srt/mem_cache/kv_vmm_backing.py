@@ -103,7 +103,12 @@ class KvVmmArena:
     # Per-instance suffix source -> isolated allocator symbols/state (see _stub_source).
     _instance_count = 0
 
-    def __init__(self, device_id: int, reserve_bytes: int = _DEFAULT_RESERVE_BYTES):
+    def __init__(
+        self,
+        device_id: int,
+        reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
+        commit_chunk_bytes: Optional[int] = None,
+    ):
         self.device_id = int(device_id)
         # Unique per (process, arena instance): the stub .so lives in a host-shared
         # tempdir, so co-located engine processes must not build the same-named .so
@@ -136,11 +141,21 @@ class KvVmmArena:
                     "cuMemAddressReserve",
                 )
             )
-            # commit_range bookkeeping: mapped VA -> (size, handle); committed bytes per offset.
-            self._ranges = {}
+            # commit_range bookkeeping, per bump-allocator offset: an ordered
+            # list of physically-mapped extents [(rel_start, size, handle)]
+            # plus the contiguous committed watermark. Extents are the unit of
+            # release: cuMemUnmap operates on whole mappings only, so
+            # decommit_range can only give back whole extents (#330).
+            self._extents_by_offset = {}
             self._committed_by_offset = {}
             self._range_backed = 0
             self._closed = False
+            # #330 dial: cap each physical handle at commit_chunk_bytes so a
+            # later decommit_range can release the tail at chunk granularity.
+            # None keeps the pre-#330 behavior: one handle per extension.
+            self._chunk = (
+                None if commit_chunk_bytes is None else self._align(commit_chunk_bytes)
+            )
 
         self._lib = self._build_stub()
         self._fn_set_base(ctypes.c_void_p(self.base))
@@ -222,25 +237,72 @@ class KvVmmArena:
                 f"{self.reserved}"
             )
         drv = _driver()
-        add = want - prev
-        addr = self.base + offset + prev
+        extents = self._extents_by_offset.setdefault(offset, [])
+        pos = prev
         with torch.cuda.device(self.device_id):
-            handle = _check(drv.cuMemCreate(add, self._prop, 0), "cuMemCreate")
-            try:
-                _check(drv.cuMemMap(addr, add, 0, handle, 0), "cuMemMap")
-                _check(
-                    drv.cuMemSetAccess(addr, add, [self._access], 1), "cuMemSetAccess"
-                )
-            except Exception:
-                # Roll back this failed extension; leave already-mapped ranges intact.
-                unmap = drv.cuMemUnmap(addr, add)
-                unmap = unmap[0] if isinstance(unmap, tuple) else unmap
-                rel = drv.cuMemRelease(handle)
-                rel = rel[0] if isinstance(rel, tuple) else rel
-                raise
-        self._ranges[addr] = (add, handle)
-        self._committed_by_offset[offset] = want
-        self._range_backed += add
+            while pos < want:
+                step = want - pos
+                if self._chunk is not None:
+                    step = min(step, self._chunk)
+                addr = self.base + offset + pos
+                handle = _check(drv.cuMemCreate(step, self._prop, 0), "cuMemCreate")
+                try:
+                    _check(drv.cuMemMap(addr, step, 0, handle, 0), "cuMemMap")
+                    _check(
+                        drv.cuMemSetAccess(addr, step, [self._access], 1),
+                        "cuMemSetAccess",
+                    )
+                except Exception:
+                    # Roll back this failed extent; keep the extents mapped so
+                    # far (the watermark below reflects them truthfully).
+                    unmap = drv.cuMemUnmap(addr, step)
+                    unmap = unmap[0] if isinstance(unmap, tuple) else unmap
+                    rel = drv.cuMemRelease(handle)
+                    rel = rel[0] if isinstance(rel, tuple) else rel
+                    raise
+                extents.append((pos, step, handle))
+                pos += step
+                self._range_backed += step
+                self._committed_by_offset[offset] = pos
+
+    def decommit_range(self, offset: int, keep_bytes: int) -> int:
+        """Release every whole extent of ``offset`` at or above ``keep_bytes``
+        back to the driver (#330 dial). The keep point is rounded UP to the
+        next extent boundary so bytes below it are never lost; with chunked
+        commits the rounding error is bounded by one chunk. Returns the bytes
+        actually released. Caller must ensure the released tail is quiescent
+        (idle boundary); a defensive synchronize still precedes the unmap.
+        """
+        if self._closed:
+            raise RuntimeError("KvVmmArena.decommit_range after close")
+        keep = align_up(max(int(keep_bytes), 0), self.granularity)
+        extents = self._extents_by_offset.get(offset, [])
+        if not extents or self._committed_by_offset.get(offset, 0) <= keep:
+            return 0
+        drv = _driver()
+        kept = []
+        released = 0
+        with torch.cuda.device(self.device_id):
+            torch.cuda.synchronize()
+            for rel, size, handle in extents:
+                if rel >= keep:
+                    _check(
+                        drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap"
+                    )
+                    _check(drv.cuMemRelease(handle), "cuMemRelease")
+                    released += size
+                    self._range_backed -= size
+                else:
+                    kept.append((rel, size, handle))
+        self._extents_by_offset[offset] = kept
+        self._committed_by_offset[offset] = max(
+            (rel + size for rel, size, _ in kept), default=0
+        )
+        return released
+
+    def committed_bytes(self, offset: int) -> int:
+        """The contiguous physically-committed watermark at ``offset``."""
+        return self._committed_by_offset.get(offset, 0)
 
     @property
     def backed_bytes(self) -> int:
@@ -260,16 +322,17 @@ class KvVmmArena:
             torch.cuda.synchronize()
         except Exception as e:  # pragma: no cover
             logger.warning("KvVmmArena.close synchronize failed: %s", e)
-        for addr, (size, handle) in self._ranges.items():
-            err = drv.cuMemUnmap(addr, size)
-            err = err[0] if isinstance(err, tuple) else err
-            if err != drv.CUresult.CUDA_SUCCESS:
-                logger.warning("cuMemUnmap range -> %s", err)
-            err = drv.cuMemRelease(handle)
-            err = err[0] if isinstance(err, tuple) else err
-            if err != drv.CUresult.CUDA_SUCCESS:
-                logger.warning("cuMemRelease range -> %s", err)
-        self._ranges.clear()
+        for offset, extents in self._extents_by_offset.items():
+            for rel, size, handle in extents:
+                err = drv.cuMemUnmap(self.base + offset + rel, size)
+                err = err[0] if isinstance(err, tuple) else err
+                if err != drv.CUresult.CUDA_SUCCESS:
+                    logger.warning("cuMemUnmap range -> %s", err)
+                err = drv.cuMemRelease(handle)
+                err = err[0] if isinstance(err, tuple) else err
+                if err != drv.CUresult.CUDA_SUCCESS:
+                    logger.warning("cuMemRelease range -> %s", err)
+        self._extents_by_offset.clear()
         err = drv.cuMemAddressFree(self.base, self.reserved)
         err = err[0] if isinstance(err, tuple) else err
         if err != drv.CUresult.CUDA_SUCCESS:
@@ -317,6 +380,7 @@ class KvVmmBufferOwner:
         page_size: int,
         reserved_num_tokens: int,
         buffer_descs: Sequence[KvBufferDesc],
+        commit_chunk_bytes: Optional[int] = None,
     ):
         self.device = device
         self.device_id = int(device_id)
@@ -334,7 +398,11 @@ class KvVmmBufferOwner:
             reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
             aligned = [align_up(s, gran) for s in reserved_spans]
             reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
-            self._arena = KvVmmArena(self.device_id, reserve_bytes=reserve_bytes)
+            self._arena = KvVmmArena(
+                self.device_id,
+                reserve_bytes=reserve_bytes,
+                commit_chunk_bytes=commit_chunk_bytes,
+            )
             assert self._arena.granularity == gran, (self._arena.granularity, gran)
 
             # NORMAL torch tensors through the arena MemPool; torch.empty never touches
@@ -424,6 +492,29 @@ class KvVmmBufferOwner:
             [s.desc.final_span_bytes(final, self.page_size) for s in self._specs]
         )
         self._final_num_tokens = final
+
+    def shrink(self, final_num_tokens: int) -> int:
+        """#330 dial: decommit every buffer's backing above the span of
+        ``final_num_tokens`` and return the bytes actually released to the
+        driver. Release is extent-granular (see ``decommit_range``), so the
+        remaining backing may exceed the exact span by < 1 commit chunk per
+        buffer — ``backed_bytes`` stays the truthful number. Caller must hold
+        an idle boundary: rows above the new span must be dead."""
+        if self._arena is None:
+            raise RuntimeError("shrink after close / before construction")
+        final = int(final_num_tokens)
+        if not (self.page_size <= final <= self._reserved_num_tokens):
+            raise ValueError(
+                f"shrink final_num_tokens={final} must satisfy page_size="
+                f"{self.page_size} <= final <= reserved={self._reserved_num_tokens}"
+            )
+        released = 0
+        for spec in self._specs:
+            keep = spec.desc.final_span_bytes(final, self.page_size)
+            released += self._arena.decommit_range(spec.offset, keep)
+            spec.backed_to = self._arena.committed_bytes(spec.offset)
+        self._final_num_tokens = final
+        return released
 
     # -- accessors / teardown -------------------------------------------------
 

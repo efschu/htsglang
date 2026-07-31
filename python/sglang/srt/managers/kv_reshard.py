@@ -92,7 +92,10 @@ class KvPoolView:
     """
 
     def __init__(
-        self, k_buffers: Sequence[torch.Tensor], v_buffers: Sequence[torch.Tensor]
+        self,
+        k_buffers: Sequence[torch.Tensor],
+        v_buffers: Sequence[torch.Tensor],
+        valid_rows_fn: Optional[Callable[[], int]] = None,
     ):
         if len(k_buffers) != len(v_buffers):
             raise KvReshardError(
@@ -105,8 +108,19 @@ class KvPoolView:
         rows = {int(t.shape[0]) for t in self._k} | {int(t.shape[0]) for t in self._v}
         if len(rows) != 1:
             raise KvReshardError(f"per-layer row counts differ: {sorted(rows)}")
-        self.num_rows = rows.pop()
+        self._tensor_rows = rows.pop()
+        # #330 dial lane: the tensors span the reserved VA upper bound while
+        # only a prefix is physically backed; the bounds check must hold
+        # against the BACKED prefix, not the tensor shape. None keeps the
+        # stock tensor-shape bound (fully-backed pools).
+        self._valid_rows_fn = valid_rows_fn
         self.num_layers = len(self._k)
+
+    @property
+    def num_rows(self) -> int:
+        if self._valid_rows_fn is not None:
+            return min(self._tensor_rows, int(self._valid_rows_fn()))
+        return self._tensor_rows
 
     def _row_nbytes(self, buf: torch.Tensor) -> int:
         return int(buf[0].numel()) * buf.element_size()
@@ -191,6 +205,9 @@ class KvReshardRuntime:
         cutover_fn: Optional[Callable[[Tuple[int, ...]], None]] = None,
         guards: Sequence[str] = (),
         clock: Callable[[], float] = time.perf_counter,
+        fit_check: Optional[
+            Callable[[Tuple[int, ...]], Tuple[bool, str]]
+        ] = None,
     ):
         if dcp_size < 2:
             raise KvReshardError(
@@ -248,6 +265,13 @@ class KvReshardRuntime:
         self._live_slots_fn = live_slots_fn
         self._ready_fn = ready_fn
         self._cutover_fn = cutover_fn
+        # #330: after a capacity grow, the boot fitted-ceiling invariant no
+        # longer covers every declared vector -- a reshard target that would
+        # need more rows than are physically backed must HOLD (uniformly,
+        # via ready=0) instead of failing the bounds check mid-move. The
+        # callback is a pure function of replicated capacity state, so every
+        # rank computes the same verdict. None = stock behavior.
+        self._fit_check = fit_check
         #: names of features that block Stage-A resharding for this process
         #: (evaluated once at construction; arming refuses while non-empty).
         self.blocking_guards = tuple(guards)
@@ -346,7 +370,10 @@ class KvReshardRuntime:
         if self._round % self._interval != 0:
             return None
         armed = 1 if self._pending is not None else 0
-        ready = 1 if (armed and self._ready_fn()) else 0
+        fit_ok, fit_msg = True, ""
+        if armed and self._fit_check is not None:
+            fit_ok, fit_msg = self._fit_check(self._pending)
+        ready = 1 if (armed and fit_ok and self._ready_fn()) else 0
         vec = self._pending if self._pending is not None else (0,) * self._size
         payload = _encode([armed, ready, self._epoch, *vec])
         self.desync_checks += 1
@@ -388,10 +415,16 @@ class KvReshardRuntime:
                 self._hold("waiting for every rank to arm (delivery skew)")
             return None
         if lo["ready"] == 0:
-            self._hold(
-                "armed, waiting for a group-wide idle boundary "
-                f"(this rank ready={ready})"
-            )
+            if not fit_ok:
+                self._hold(
+                    f"armed, but the target does not fit the backed pool: "
+                    f"{fit_msg}"
+                )
+            else:
+                self._hold(
+                    "armed, waiting for a group-wide idle boundary "
+                    f"(this rank ready={ready})"
+                )
             return None
         self._last_hold_reason = None
         return self._execute()
@@ -695,7 +728,14 @@ def build_kv_reshard_runtime(scheduler) -> KvReshardRuntime:
             f"named follow-ups."
         )
     full = pool.full_kv_pool
-    view = KvPoolView(full.k_buffer, full.v_buffer)
+    # #330 dial lane: the VMM-backed pool's tensors span the reserved VA
+    # upper bound; bound row checks by the physically-backed prefix instead.
+    valid_rows_fn = (
+        (lambda: int(full.size) + int(full.page_size))
+        if getattr(pool, "post_capture_active", False)
+        else None
+    )
+    view = KvPoolView(full.k_buffer, full.v_buffer, valid_rows_fn=valid_rows_fn)
     dcp_rank = int(get_parallel().attn_dcp_rank)
     tree_cache = scheduler.tree_cache
 
@@ -704,6 +744,15 @@ def build_kv_reshard_runtime(scheduler) -> KvReshardRuntime:
         if values is None or values.numel() == 0:
             return torch.empty(0, dtype=torch.int64)
         return values
+
+    def _fit_check(target_vec):
+        # #330: consult the capacity runtime (when armed) about whether the
+        # target vector's rows fit every rank's backed pool at the current
+        # ceiling. Pure function of replicated state -> uniform verdict.
+        cap_rt = getattr(scheduler, "kv_capacity_runtime", None)
+        if cap_rt is None:
+            return True, ""
+        return cap_rt.reshard_fit_check(target_vec)
 
     return KvReshardRuntime(
         dcp_size=dcp_size,
@@ -720,4 +769,5 @@ def build_kv_reshard_runtime(scheduler) -> KvReshardRuntime:
         ready_fn=lambda: scheduler.is_fully_idle(),
         cutover_fn=_cutover_fn_for(scheduler),
         guards=_stage_a_guards(scheduler),
+        fit_check=_fit_check,
     )

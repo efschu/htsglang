@@ -4584,6 +4584,44 @@ class ServerArgs:
             "read when --kv-reshard-vectors is set.",
         ),
     ] = 8
+    enable_vram_dial: A[
+        bool,
+        Arg(
+            help="Runtime per-card VRAM budget dial + KV capacity re-raise "
+            "(#330). Allocates the full-attention KV pools (target + draft) "
+            "on a CUDA-VMM arena: virtual addresses are reserved once for "
+            "the best declared vector's ceiling, physical pages are "
+            "committed in chunks underneath. A running server can then (a) "
+            "release part of one card's memory back to the DRIVER (visible "
+            "in nvidia-smi, claimable by other processes) and re-raise it "
+            "later via POST /vram_budget, and (b) GROW max_total_num_tokens "
+            "after a #297 reshard whose vector geometry funds more KV -- "
+            "automatically, at the rank-uniform consensus cadence. Requires "
+            "weighted uneven DCP and the hybrid-linear KV pool family; "
+            "refused loudly with memory saver, PD disaggregation, hicache "
+            "storage, kv-session-offload, dual-group lane or DP > 1 "
+            "(DESIGN_330 section 7). Default off = byte-identical behavior.",
+        ),
+    ] = False
+    vram_budget_mib: A[
+        Optional[str],
+        Arg(
+            help="#330 initial per-rank VRAM budgets in MiB (comma-separated, "
+            "one per TP rank, e.g. '12000,16000,16000'), applied as a coarse "
+            "clamp at profiling time and reconciled exactly (against the "
+            "measured pinned floor) at the first consensus boundary. "
+            "Requires --enable-vram-dial. Unset = the natural boot footprint "
+            "becomes the initial budget.",
+        ),
+    ] = None
+    vram_dial_consensus_interval: A[
+        int,
+        Arg(
+            help="Scheduler rounds between two consensus boundaries of the "
+            "#330 VRAM dial runtime (same discipline as the #287/#297 "
+            "runtimes). Only read when --enable-vram-dial is set.",
+        ),
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -6026,6 +6064,25 @@ class ServerArgs:
             from sglang.srt.layers.dcp.reshard_plan import parse_reshard_vectors
 
             parse_reshard_vectors(self.kv_reshard_vectors)
+        if self.vram_dial_consensus_interval < 1:
+            raise ValueError(
+                f"--vram-dial-consensus-interval must be >= 1, got "
+                f"{self.vram_dial_consensus_interval}."
+            )
+        if self.vram_budget_mib is not None and not self.enable_vram_dial:
+            raise ValueError(
+                "--vram-budget-mib requires --enable-vram-dial (the budgets "
+                "configure the dial's capacity model)."
+            )
+        if self.vram_budget_mib is not None:
+            # Syntactic fail-fast; the per-rank count check runs at boot
+            # where tp_size is final.
+            for tok in str(self.vram_budget_mib).split(","):
+                if not tok.strip().isdigit() or int(tok) <= 0:
+                    raise ValueError(
+                        f"--vram-budget-mib entries must be positive MiB "
+                        f"integers, got {tok!r} in {self.vram_budget_mib!r}."
+                    )
         # The sensor owns the mark/window contract; constructing one here is
         # the validation (it raises with the same messages the runtime would).
         KvPressureSensor(
@@ -9162,6 +9219,12 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def parsed_vram_budget_mib(self) -> Optional[List[int]]:
+        """#330: the initial per-rank VRAM budgets as a list, or None."""
+        if self.vram_budget_mib is None:
+            return None
+        return [int(t) for t in str(self.vram_budget_mib).split(",")]
 
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
