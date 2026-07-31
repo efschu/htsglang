@@ -17434,3 +17434,177 @@ gerechnet (frei >= 400 MiB, Verschwendung <= 1,5 GiB netto), und die
 Kartenreihenfolge wird zur Laufzeit per NVML/UUID aufgelöst — nach #336 gilt
 das jetzt auch für die Reserve-Zeile, die ihre CUDA-Device-Ids selbst
 mitprotokolliert.
+
+## #336-GPU-Bündel: die drei Kartenposten, gefahren (2026-07-31)
+
+Das Fahrprogramm direkt darüber, ausgeführt. Basis `/spinning/wt-final` @
+`b2f66cc361`, Rohdaten in `/spinning/gpu-battery-results/2026-07-31_336_gpu/`.
+Kartenzeit 09:41:58–09:48:32 UTC plus ein Nachläufer für Arm C, zusammen rund
+11 der veranschlagten 35 Minuten. Reihenfolge A → B → C eingehalten. Arm A
+brauchte zwei Anläufe, und der erste Anlauf ist selbst ein Befund.
+
+### Arm A — die #336-Abnahme: bestanden, nach einem Anlauf an einem Skriptfehler
+
+**Anlauf 1** (`scripts/nvfp4/v4_boot_proof.sh tp3`, `NEXTN=1`, unverändertes
+Rezept) lief durch Plan, Platzierung und Laden und starb in der
+Pool-Validierung: `AssertionError: Memory pool size is too small`
+(`tp_worker.py:347`). Das ist weder Knappheit noch ein #336-Defekt —
+`max_total_num_tokens` stand zu dem Zeitpunkt bereits bei 386.880. Die Ursache
+ist `--context-length -1` im `COMMON`-Block des Skripts. `-1` ist die
+vLLM-Schreibweise für „das Maximum des Modells"; sglang kennt kein solches
+Sentinel. `ModelConfig._derive_context_length` übernimmt den Wert wörtlich,
+sobald er nicht größer als die abgeleitete Länge ist, also wird `context_len`
+zu −1 und `max_req_len = min(context_len - 1, max_token_pool_size - 1)` ist −2,
+bevor eine Karte nach irgendetwas gefragt wird. Eine Sizing-Meldung für einen
+Wert, der mit Sizing nichts zu tun hat: die Meldung zeigt auf den Pool, der
+Fehler sitzt im Kontext. Das Skript ist gefixt (`CONTEXT_LEN`, Default 32768 =
+Ankerkontext des 332-Familien-Fensters), mit der Herleitung an der Variablen.
+
+**Anlauf 2** (identisches Rezept, `--context-length 32768 --kv-cache-dtype
+fp8_e4m3` wie im Ankerlauf) ist in allen drei Toren grün, in der
+vorgeschriebenen Reihenfolge gelesen:
+
+| Tor | Erwartung | Gemessen |
+|---|---|---|
+| (1) ARM 1 bootet | — | **ja**, ready nach 57 s |
+| (2) `grep -c DEQUANTISED` | 144, 48 je Rang | **144** — TP0 48, TP1 48, TP2 48 |
+| (2) kein MLP-Layer in der Lane | ~16 MiB | **~20 MiB**, ausschliesslich auf TP0 |
+| (3) `meta_info.spec_accept_length` | deutlich über 1,0 | **3,20 / 3,28 / 2,72**, Mittel **3,0685** |
+
+Tor (2) ist der eigentliche #336-Nachweis, und die Begründungstexte
+unterscheiden sich pro Rang genau wie vorhergesagt. TP1/TP2 nennen die
+ungeshardete 96 gegen die Marlin-Kachel 64. TP0 nennt „the sharded output width
+is 42, not a multiple of the native FP4 GEMM's N granularity 32" — **42** ist
+derselbe Wert, an dem der Lauf unter #332 allein im ersten Forward am
+Kernel-Assert `nvfp4_scaled_mm_kernels.cuh:81` starb. Die Breite, die vorher den
+Absturz erzeugte, erzeugt jetzt den Ausstieg aus der Lane: dieselbe Zahl,
+anderer Ausgang.
+
+Die Kostenprüfung ist die schärfste Kontrolle gegen einen Routingfehler, weil
+sie byte-genau gegen den Ankerlauf geht. Gewichtsspeicher pro Rang, 08:20 (96
+Dequants, TP0 keine) gegen 09:47 (144):
+
+| Rang | Anker 08:20 | #336 09:47 | Δ |
+|---|---:|---:|---:|
+| TP1 | 5,71 GB | 5,71 GB | 0 |
+| TP2 | 5,45 GB | 5,45 GB | 0 |
+| TP0 | 8,09 GB | 8,11 GB | **+0,02 GB** |
+
+Die Marlin-Ränge bewegen sich um null — ihre Lane war schon vorher dieselbe. TP0
+zahlt 20 MiB für seine 48 neu dequantisierten GDN-Gates, in der Größenordnung
+der vorhergesagten ~16 MiB. Ein MLP-Layer in der Lane stünde dort als
+Vielfaches.
+
+Tor (3): der Drafter ist echt. Die Falsifikator-Signatur — exakt 1,0052 bei 0
+akzeptierten Drafts, der Abdruck eines Drafters auf uninitialisierten Gewichten
+— ist **nicht** getroffen; gelesen wurde `meta_info.spec_accept_length`, nicht
+`spec_ema_accept_len`. Der Draft-Pfad wird zusätzlich graph-erfasst („Capture
+draft decode/extend CUDA graph"), was ein Drafter auf leeren Gewichten nicht
+überstünde. NEXTN auf V4 unter unebenem TP=3 ist damit belegt, offener Punkt 2
+geschlossen.
+
+Nebenbefunde: `max_total_num_tokens` = 773.824, identisch zum Ankerlauf bei
+gleichem Kontext und gleicher KV-dtype — die Dequant-Lane kostet keinen Pool.
+Budgets `[29607, 17780, 17780]` MiB aus NVML-Totalen. VRAM-Korridor im Betrieb
+629 / 2022 / 1755 MiB frei (NVML 0/1/2), alle über 400 MiB, NVML 0 ist der enge
+Rang. Kosmetisch, ohne Einfluss auf den Befund: TP0s 48 Meldungen nennen `layer
+'None'` — das Marlin-Urteil fällt in `get_quant_method`, das den Layernamen
+kennt, das native in `create_weights`, wo er noch nicht am Layer hängt. Die
+Meldung ist als per-Layer-greppbar gedacht und ist es auf dem nativen Rang
+nicht.
+
+### Arm B — die Richtung der Zweikarten-Divergenz: der VERBAND weicht ab
+
+Der Familien-Nachläufer war rot, aber richtungslos: beide Böden grün, alle drei
+Prompts ab `first_divergent_index = 1` auseinander, keine Aussage darüber,
+welche Seite die Wahrheit ist.
+
+Zwei Ein-Karten-Referenzen, TP=1, gleiches Vehikel (Llama-3.1-8B-Instruct),
+gleicher Prompt-Satz, gleiches Greedy-Sampling, `--disable-radix-cache`, 12
+Token — einmal auf der 5090, einmal auf einer 3080, damit die Referenz keine
+Architektur-Annahme trägt. Die Prompt-Ids stimmen mit denen des Belegs überein
+(57 / 58 / 173). Beide Referenzen haben auf allen drei Prompts einen grünen
+A-vs-A-Boden und sind untereinander identisch — der Vergleich ist belastbar,
+nicht VOID.
+
+| Prompt | Referenz (beide Karten) | Lane | Verband |
+|---|---|---|---|
+| alphabet | 86, **198**, 87, 198 | 86, **198**, 87, 198 | 86, **326**, 326, 320 |
+| squares | 717, **220**, 8929, 198 | 717, **220**, 8929, 198 | 717, **62**, 62, 565 |
+| code | 286, **1853**, 284, 659 | 286, **1853**, 284, 659 | 286, **311**, 279, 220 |
+
+Verdikt auf allen drei Prompts: **die Lane stimmt mit der Referenz überein, der
+VERBAND ist die abweichende Seite.** Das dreht die Vorannahme um, unter der der
+Nachläufer gelesen wurde; die Beobachtung des Belegs, die Lane-Ausgabe sehe
+wohlgeformter aus, war der richtige Hinweis. Die offene Frage ist damit nicht
+mehr „was macht die Lane falsch", sondern was der zweikartige Serving-Verband
+(TP=2, Ratio 3:1, 5090 + 3080) an dieser Stelle anders rechnet als dasselbe
+Modell auf einer Karte. Offener Punkt 4 hat eine Richtung; die Ursache im
+Verband ist noch offen.
+
+### Arm C — FP8-Ko-Belegung: es ist weder Ko-Belegung noch Budget
+
+**C1 ist so, wie der Beleg ihn formuliert hat, nicht startbar** — der erste
+Befund des Arms. Den Lane-Teil auf eine Karte ohne Verbandsrang zu legen, lehnt
+`server_args.py:_validate_dual_group_lane_part_gpu_id` ab, bevor eine Karte
+angefasst wird: „physical GPU N carries no serving rank … an otherwise unused
+card is a different configuration and is not what this flag expresses."
+
+Die Trennung kommt deshalb von einem Mikro-Falsifikator, der schärfer ist als C1
+gewesen wäre, weil auf der Fremdkarte **überhaupt kein zweiter Prozess** liegt:
+derselbe Triton-Block-FP8-Kernel, den der Absturz nennt, aus einem Prozess mit
+aktivem Gerät `cuda:0` auf Tensoren auf `cuda:1`, einmal ohne und einmal mit
+`torch.cuda.device`-Guard (je eigener Prozess, weil ein Fehlschlag den Kontext
+vergiftet).
+
+| Fall | Erwartung | Ergebnis |
+|---|---|---|
+| A: Fremdstart ohne Guard | Absturz | **`ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)`** — wörtlich die erste Ausnahme des Belegs |
+| B: Fremdstart mit Guard | grün | Pointer-Fehler **weg**; stattdessen `CompilationError: type fp8e4nv not supported in this architecture` |
+
+Daraus zwei Schichten, beide falsifizierbar erzeugt:
+
+1. **Die Ko-Belegungs-Hypothese ist tot.** Fall A stürzt auf einer leeren Karte
+   ab — kein zweiter Prozess, kein Verbandsrang, kein Budgetdruck. Der Defekt
+   ist der fehlende Geräte-Guard: `LaneColumnParallelShell.forward` und die drei
+   Schwester-Shells (`dual_group_lane.py` Zeilen 300, 333, 443, 471) schieben
+   die Aktivierung mit `_on()` auf die Fremdkarte, schalten aber das aktive
+   CUDA-Gerät des Prozesses nicht um. Torch-Ops tragen einen DeviceGuard aus
+   ihren Tensoren, ein Triton-Launch nicht — er prüft Pointer gegen den aktiven
+   Kontext. Deshalb überlebte der dichte bf16-Arm (cuBLAS, kein Triton) und
+   stirbt der FP8-Arm. Fall B beweist die Gegenrichtung: mit Guard verschwindet
+   genau diese Ausnahme.
+2. **Auch mit Guard trägt dieses Rig den Arm nicht.** Die Fremdkarte ist eine
+   sm86-3080, und Triton kennt dort kein `fp8e4nv` (nur `fp8e4b15`, `fp8e5`).
+   Das ist eine Kartengrenze, kein Defekt — auf einem Rig mit zwei
+   Ada-/Blackwell-Karten fiele sie weg. Nach „Rig ist Untergrenze" ist das kein
+   Urteil über das Feature, sondern über diese Karten.
+
+Der Nachläufer im echten Stack bestätigt die Reihenfolge. Ein erster Repro-Boot
+der `fp82_lowbudget`-Konfiguration auf `wt-final` erreichte „lane 0 ready" und
+protokollierte **keine** Ausnahme — kein Widerspruch zum Beleg, sondern eine
+Lücke im Repro: der Forward der Lane läuft nur auf einem LANE-Job, und
+Serving-Verkehr betritt `LaneColumnParallelShell.forward` nie. Der zweite
+Repro-Boot treibt das Family-Gate und schliesst sie. Im Log stehen beide
+Ausnahmen, in dieser Reihenfolge:
+
+* Zeile 232 — `dual_group_lane.py:298 forward` → `w8a8_block_fp8_matmul_triton`
+  → `ValueError: Pointer argument (at 0) cannot be accessed from Triton`
+* Zeile 255 — `torch.AcceleratorError: CUDA error: an illegal memory access`
+
+Die vom Beleg zitierte Meldung ist also die **zweite**: der nächste Stream-Op
+des Schedulers (`_apply_war_barrier` → `record_event`) auf einem bereits
+vergifteten Kontext. Wer die laute Meldung liest statt der ersten, sucht einen
+Speicherfehler, wo ein host-seitiger `ValueError` steht. **C2
+(compute-sanitizer) erübrigt sich damit** — eine device-seitige
+Speicherverletzung ist nicht die Wurzel. **C3 (Graph vs. Forward) ebenfalls**:
+die Kontraktzeile erzwingt für die Zweikarten-Lane ohnehin EAGER („forcing
+EAGER. The shells' cross-card activation hops are not capturable in one device's
+graph"), es gibt kein Capture, das man abtrennen müsste; der erste Forward war
+korrekt als Verdächtiger benannt.
+
+Offener Punkt 5 ist beantwortet, anders als die Hypothesenklasse vorsah: nicht
+Ko-Belegung, nicht Budget, sondern ein fehlender Geräte-Guard vor jedem
+Triton-getragenen Quant-Method-Aufruf auf einer Fremdkarte — plus eine
+Kartengrenze dahinter, die auf diesem Rig auch den gefixten Pfad nicht
+durchlässt.
