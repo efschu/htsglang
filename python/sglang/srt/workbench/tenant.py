@@ -164,10 +164,18 @@ class Feasibility:
 class WorkGrant:
     """What the scheduler hands a tenant for one segment.
 
-    Card *indices* are carried beside the UUIDs because every tenant here
-    launches a subprocess, and the fork's isolation rule is process-level:
-    ``CUDA_VISIBLE_DEVICES`` is set from these indices, and inside the child
+    Every tenant here launches a subprocess, and the fork's isolation rule is
+    process-level: ``CUDA_VISIBLE_DEVICES`` pins the child, and inside it
     ``cuda:0`` is unambiguous. No in-process logical-to-physical table exists.
+
+    That variable is set from the **UUIDs**, not the indices (AUDIT #331).
+    ``CUDA_VISIBLE_DEVICES`` accepts either form, and the UUID form is the one
+    that cannot be misread: an index in it is resolved in the driver's PCI
+    order, which is not the order the parent's ``torch.cuda`` reports, so an
+    index that travelled from a parent's CUDA view into a child's environment
+    is a wrong-card bind waiting for the two orders to diverge. The Class-1/2/3
+    registry adapters already pin by UUID; this is the same rule.
+    ``card_indices`` stays for logging and for the ledger's NVML lookups.
     """
 
     card_uuids: tuple[str, ...]
@@ -179,6 +187,8 @@ class WorkGrant:
 
     @property
     def visible_devices(self) -> str:
+        if self.card_uuids:
+            return ",".join(self.card_uuids)
         return ",".join(str(i) for i in self.card_indices)
 
     def to_json(self) -> dict[str, Any]:

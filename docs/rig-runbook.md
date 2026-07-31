@@ -1948,11 +1948,19 @@ only touch one card, and kept the rig blocked during pure orchestration
 phases (syncs, remote boots). Rules from now on:
 
 - **One lock per physical card**: `/tmp/gpu-card-<NVML-idx>.lock` (atomic
-  `mkdir`, then write `info` with owner/purpose/acquired, same format as
-  before). NVML index = `nvidia-smi` order. On this rig: **NVML 1 = RTX 5090
-  = cuda:0**; NVML 0 and 2 are the 3080s (cuda:1/2). Always confirm by name
+  `mkdir`, then write `info` with owner/purpose/acquired). NVML index =
+  `nvidia-smi` order. On this rig: **NVML 1 = RTX 5090 = cuda:0**; NVML 0 and
+  2 are the 3080s (cuda:1/2). Always confirm by name
   (`nvidia-smi --query-gpu=index,name --format=csv,noheader`) — the
   torch-vs-NVML order trap is on file.
+- **The `info` file carries the card's identity** (AUDIT #331): `nvml_index`,
+  `uuid` and `pci_bus_id`, written by all four producers (`comm_suite`,
+  `battery_common.sh`, `battery_host.sh`, `p2p_readiness/run_all.sh`). The
+  index in the lock *name* stops meaning anything the moment the driver
+  re-enumerates; the uuid does not. A lock whose recorded uuid no longer
+  matches the card now at that index outlived a re-enumeration and is
+  reported as such — it is still never broken. To see the current mapping:
+  `python -m sglang.srt.registry.nvml --map`.
 - **Take only the cards you need, only when occupancy is imminent** (a boot
   within ~2 min, or a server already resident). Long non-GPU phases (rsync,
   rig-2 setup, analysis) with no resident process on a card → that card's

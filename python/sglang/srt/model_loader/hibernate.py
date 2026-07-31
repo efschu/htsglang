@@ -164,6 +164,50 @@ def hibernate_manifest_matches(server_args) -> bool:
                 v,
             )
             return False
+    return _manifest_cards_present(manifest)
+
+
+def _manifest_cards_present(manifest: Dict[str, Any]) -> bool:
+    """Are all the cards this image was parked on still on this host?
+
+    AUDIT #331. ``identity.rank_gpu_id`` above is a list of CUDA ordinals,
+    which is not a statement about physical cards: the same ordinals can name
+    different GPUs after a driver reload, so the coarse gate can match while
+    the hardware has changed underneath it. The per-rank ``nvml_uuid``
+    re-check in :func:`restore_model_from_disk` is the authority and would
+    catch that -- but only after the skeleton is built and the boot is
+    committed to the hibernate path. Checking presence here turns that late
+    hard failure into an early, named fall back to a cold load.
+
+    NVML being unreachable is not a mismatch: the per-rank gate still runs.
+    """
+    parked = [
+        m.get("nvml_uuid")
+        for m in (manifest.get("ranks") or {}).values()
+        if isinstance(m, dict) and m.get("nvml_uuid")
+    ]
+    if not parked:
+        return True
+    try:
+        from sglang.srt.registry import nvml
+
+        if not nvml.is_available():
+            return True
+        # list_devices, not identity_map: this gate runs at parse time in the
+        # launcher, and the CUDA half of the map would create a context there.
+        present = {d.uuid for d in nvml.list_devices()}
+    except Exception as e:  # noqa: BLE001 - identity is a gate, not a boot dep
+        logger.debug("#89 hibernate: card presence check skipped (%s).", e)
+        return True
+    missing = sorted({u for u in parked if u not in present})
+    if missing:
+        logger.warning(
+            "#89 hibernate: the image was parked on card(s) %s, which this "
+            "host does not report any more (present: %s) -> cold load (#331).",
+            ", ".join(missing),
+            ", ".join(sorted(present)) or "none",
+        )
+        return False
     return True
 
 

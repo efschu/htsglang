@@ -256,6 +256,20 @@ battery_release_locks() {  # $1 = step tag, defaults to $BATTERY_STEP
     BATTERY_HELD_LOCKS=()
 }
 
+# The durable identity of the card behind an NVML index, for the lock's info
+# file. `nvidia-smi -i N` indexes in NVML order, the same order the lock name
+# uses. Empty output is not an error: the info file then simply carries no
+# uuid, exactly as it did before AUDIT #331.
+battery_card_uuid() {  # $1 = NVML index
+    nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$1" 2>/dev/null \
+        | tr -d ' ' | head -n1
+}
+
+battery_card_bdf() {  # $1 = NVML index
+    nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$1" 2>/dev/null \
+        | tr -d ' ' | head -n1
+}
+
 battery_acquire_locks() {  # $1 = step id (goes into the info file)
     local step="$1" n i lock
     n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')" || n=0
@@ -270,6 +284,12 @@ battery_acquire_locks() {  # $1 = step id (goes into the info file)
                 echo "holder=gpu_battery"
                 echo "step=$step"
                 echo "pid=$$"
+                echo "nvml_index=$i"
+                # Which physical card the index meant when the lock was
+                # taken. The index in the lock name is not evidence after a
+                # re-enumeration; this is (AUDIT #331).
+                echo "uuid=$(battery_card_uuid "$i")"
+                echo "pci_bus_id=$(battery_card_bdf "$i")"
                 echo "acquired=$(date -Is)"
                 echo "heartbeat=$(date -Is)"
                 echo "heartbeat_pid="
