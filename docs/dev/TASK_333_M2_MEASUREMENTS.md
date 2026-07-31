@@ -607,3 +607,94 @@ session itself, logs a warning naming both, and the parity rows carry
 the table above is stamped `CUDAExecutionProvider` with `fell_back: true`,
 which is why the caveat in this section is verifiable from the artifact rather
 than resting on this prose.
+
+---
+
+# Task #339 P4 continued — the real TensorRT engine, 2026-07-31 21:18-21:22Z
+
+TensorRT 11.2.1.2 was installed in the venv between windows. Raw records in
+`/spinning/gpu-battery-results/2026-07-31_339_p4trt/`.
+
+## The ONNX Runtime TensorRT EP still cannot be used, and the pair is the reason
+
+| component | version | soname |
+|---|---|---|
+| onnxruntime-gpu | 1.28.0 | its TRT EP links `libnvinfer.so.10`, `libnvonnxparser.so.10` |
+| tensorrt | 11.2.1.2 | provides `libnvinfer.so.11` |
+
+A major-version mismatch, and no `libnvinfer.so.10` exists anywhere on the
+box. The EP therefore cannot load and every session that requests it falls
+back to CUDA — which the new `provider_fell_back` stamping now makes visible
+rather than silent. No `LD_PRELOAD` was attempted: forcing a 10-linked EP
+against an 11 runtime would produce a number nobody could trust in a venv
+everyone shares.
+
+The engine was therefore built through the **TensorRT Python API directly**
+(`scripts/video_enhance/trt_engine_bench.py`) and benched standalone. In
+TensorRT 11 there is no `BuilderFlag.FP16`: networks are strongly typed and
+precision comes from the graph, so the fp16 ONNX yields a genuinely fp16
+engine with no builder-side permission involved. That removes the usual
+"was it *allowed* to run in half precision or did it actually" ambiguity.
+
+## Engine-build record
+
+| | RTX 3080 | RTX 5090 |
+|---|---|---|
+| compute capability | sm86 | sm120 |
+| build time | 9.4 s | 12.0 s |
+| I/O signature | `input` HALF `[1,3,-1,-1]` -> `output` HALF `[1,3,-1,-1]` | same |
+| profile min / opt / max | 960x540 / 960x540 / 1920x1080 | same |
+| consumer matrix | 960x540, 1280x720, 1920x1080 all servable | same |
+
+An engine is per-architecture, so both were built where they run and the
+manifest records the SM. An sm120 plan is not evidence about sm86.
+
+## Parity on the real engine
+
+fp32 ONNX on the CUDA provider as reference, three samples, gate 40 dB / 0.995:
+
+| card | PSNR | SSIM | verdict |
+|---|---|---|---|
+| RTX 5090 (sm120) | 48.09 - 48.12 dB | 0.999778 | pass |
+| RTX 3080 (sm86) | 45.50 dB | 0.99977 | pass |
+
+Both pass with 5-8 dB of margin. Lower than the 55.7 dB the same fp16 graph
+scored on the CUDA provider, which is expected — TensorRT picks its own
+tactics and fuses differently — and the per-card difference is the usual
+cross-architecture kernel divergence. The gate is met on the engine that
+would actually serve.
+
+## The answer: fp16 TensorRT moves the ratio, and it moves it the wrong way
+
+SR at 960x540, ms per frame:
+
+| path | RTX 3080 | RTX 5090 | 3080 : 5090 |
+|---|---|---|---|
+| fp32, ONNX Runtime CUDA provider | 88.82 | 35.15 | **2.53x** |
+| fp16, TensorRT engine | 22.26 | 5.85 | **3.81x** |
+| speedup from fp16 TRT | 3.99x | 6.01x | |
+
+A/B noise floors 0.76% (3080) and 1.04% (5090), so the change is two orders
+above the resolution of the measurement.
+
+**The gap widens from 2.53x to 3.81x.** Both cards gain a great deal — SR
+stops being a 35 ms stage and becomes a 6 ms one on the 5090 — but the 5090
+gains half as much again as the 3080 (6.0x against 4.0x), because Blackwell's
+fp16 tensor-core path is further ahead of its fp32 path than Ampere's is.
+
+Two consequences for the Regime-B question, in opposite directions, and the
+second one is the interesting one:
+
+*   **On SR specifically, the case for the 3080s gets worse, not better.** SR
+    was already their worst stage at 2.53x and becomes 3.81x. The historical
+    vs-pipeline mapping put ESRGAN on the two 3080s; the measured comparative
+    advantage argued against that at fp32 and argues against it harder on the
+    engine that would actually serve.
+*   **But the whole-chain balance shifts toward the 3080s.** SR was 71% of the
+    5090's frame time and 84% of a 3080's; at 5.85 ms it is no longer the
+    dominant term. What remains is resize (1.9-2.25x), RIFE (1.7-2.75x) and
+    encode (~parity), so the *chain* ratio should compress even as the SR
+    ratio widens. That is a prediction from this table, not a measurement:
+    recomputing it honestly needs the encode path fixed first, because encode
+    currently costs ~20 ms of ffmpeg host round trip (§9.5) and would dominate
+    any chain arithmetic done today.
