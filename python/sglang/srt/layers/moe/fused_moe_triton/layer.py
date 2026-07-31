@@ -1691,16 +1691,23 @@ class FusedMoE(torch.nn.Module):
         expert weights are fully loaded/processed. On any error the layer falls
         back to the resident (default) path and never retries.
 
-        #268: the quant-path check below runs BEFORE the try/except so it is a
-        hard boot abort for GGUF-MoE / MoeWNA16 (no load-time offload half),
-        never the silent per-layer fallback used for genuine install failures.
+        #268/#323b: the quant-path check below runs BEFORE the try/except so it
+        is a hard boot abort for GGUF-MoE / MoeWNA16 / NVFP4 MoE (no load-time
+        offload half), never the silent per-layer fallback used for genuine
+        install failures.
         """
         from sglang.srt.layers.moe.expert_offload import (
             MoEExpertOffloadCache,
             assert_expert_offload_quant_supported,
         )
 
-        assert_expert_offload_quant_supported(self.quant_method, self.layer_id)
+        assert_expert_offload_quant_supported(
+            self.quant_method,
+            self.layer_id,
+            # compressed-tensors hides the real layout behind a delegating
+            # wrapper; the scheme is the class that owns the tensor names.
+            scheme=getattr(self, "scheme", None),
+        )
 
         try:
             cache = MoEExpertOffloadCache(self, self._expert_offload_fraction)

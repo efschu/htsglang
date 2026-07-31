@@ -125,10 +125,13 @@ def apply_fp4_marlin_linear(
 
 
 def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if getattr(layer, "quant_config", None) is not None:
-        group_size = layer.quant_config.group_size
-        if group_size != 16:
-            raise ValueError(f"NVFP4 Marlin requires group_size=16, got {group_size}.")
+    # Probe, not requirement: ModelOpt binds its ModelOptFp4Config (which
+    # carries group_size) to layer.quant_config, while a compressed-tensors
+    # linear carries the CompressedTensorsConfig, whose group size lives per
+    # scheme and is validated by the caller. Read it when it is there.
+    group_size = getattr(getattr(layer, "quant_config", None), "group_size", None)
+    if group_size is not None and group_size != 16:
+        raise ValueError(f"NVFP4 Marlin requires group_size=16, got {group_size}.")
 
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition

@@ -495,41 +495,76 @@ def scratch_slot_count(resident_count: int) -> int:
 # unsupported (silently wrong per-expert weights, not a crash) -- undefined
 # behavior either way, so this must hard-abort before install(), not fall
 # back to the try/except's silent per-layer degrade.
+#
+# #323b: NVFP4 MoE was the named residual risk of #268 and it materialized.
+# The guard is an EXCLUSION list, so every quant method not named here passes
+# by default -- which is right for a family whose members share one tensor
+# layout, and wrong for a genuinely new one. NVFP4 MoE is a genuinely new one:
+# EXPERT_TENSOR_ATTRS below lists none of its per-expert tensors
+# (w13_weight_packed / w13_weight_scale_2 / w13_blockscale_swizzled /
+# w13_alphas / w13_input_scale_quant ...), and no NVFP4 MoE method calls
+# presplit_expert_offload_after_repack (fp8.py, gptq_moe.py and awq_moe.py do).
+# So the installer would stage a strict subset of the tensors the kernel reads
+# and run with per-expert weights paired against another expert's scales:
+# silently wrong output, not a crash. Named here until an NVFP4 offload half
+# actually exists.
 _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
     "GGUFMoEMethod",
     "GGUFMoEAscendMethod",
     "MoeWNA16Method",
+    # NVFP4 MoE (#323b) -- ModelOpt serialized, ModelOpt online-converted, and
+    # the compressed-tensors scheme.
+    "ModelOptNvFp4FusedMoEMethod",
+    "ModelOptNvFp4OnlineFusedMoEMethod",
+    "CompressedTensorsW4A4Nvfp4MoE",
 )
 
 
-def assert_expert_offload_quant_supported(quant_method, layer_id=None) -> None:
-    """Fail-fast guard (#268) for the MoE expert-offload installer.
+def assert_expert_offload_quant_supported(
+    quant_method, layer_id=None, scheme=None
+) -> None:
+    """Fail-fast guard (#268/#323b) for the MoE expert-offload installer.
 
     Call this BEFORE constructing a ``MoEExpertOffloadCache`` for a layer.
-    Raises ``RuntimeError`` if ``quant_method`` belongs to a quant path that
-    has no load-time offload half (GGUF-MoE, MoeWNA16). No-op for every
-    supported quant method (fp8, GPTQ-Marlin, AWQ-Marlin, unquantized) --
-    those are matched by NOT being in the unsupported set, so a new supported
-    quant method never needs to be added here.
+    Raises ``RuntimeError`` if the layer's quant path has no load-time offload
+    half (GGUF-MoE, MoeWNA16, NVFP4 MoE). No-op for every supported quant
+    method (fp8, GPTQ-Marlin, AWQ-Marlin, unquantized) -- those are matched by
+    NOT being in the unsupported set, so a new supported quant method never
+    needs to be added here.
+
+    ``scheme`` is the compressed-tensors MoE scheme when there is one
+    (``layer.scheme``). It has to be checked separately because a
+    compressed-tensors layer's ``quant_method`` is always the same delegating
+    ``CompressedTensorsFusedMoEMethod`` wrapper -- the class that decides the
+    tensor layout is the scheme behind it, so checking only the wrapper would
+    either miss NVFP4 or deny every compressed-tensors checkpoint.
 
     Matched by class name (not isinstance) to avoid importing
-    ``sglang.srt.layers.quantization.gguf`` / ``.moe_wna16`` from this module
-    at call sites that must stay import-light (this file is imported from the
-    hot FusedMoE construction path).
+    ``sglang.srt.layers.quantization.gguf`` / ``.moe_wna16`` /
+    ``.modelopt_quant`` from this module at call sites that must stay
+    import-light (this file is imported from the hot FusedMoE construction
+    path).
     """
-    name = type(quant_method).__name__
-    if name in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+    for candidate in (quant_method, scheme):
+        if candidate is None:
+            continue
+        name = type(candidate).__name__
+        if name not in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+            continue
         layer_tag = f" (layer_id={layer_id})" if layer_id is not None else ""
         raise RuntimeError(
             f"MoE expert-offload (SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0) "
             f"is not supported for quant method {name!r}{layer_tag}. "
-            "GGUF-MoE and MoeWNA16 have no load-time offload half: "
+            "GGUF-MoE, MoeWNA16 and NVFP4 MoE have no load-time offload half: "
             "GGUFUninitializedParameter only materializes a real tensor in "
-            "the loader postprocess step (#123), and MoeWNA16's per-expert "
+            "the loader postprocess step (#123), MoeWNA16's per-expert "
             "tensor layout was never validated against the offload cache's "
-            "slice/fetch path -- installing the cache here would either crash "
-            "on an uninitialized parameter or silently run with undefined "
-            "per-expert weight contents. Supported quant paths for "
+            "slice/fetch path, and the NVFP4 MoE layouts (#323b) are absent "
+            "from EXPERT_TENSOR_ATTRS and from "
+            "presplit_expert_offload_after_repack, so only part of each "
+            "expert would be staged -- installing the cache here would either "
+            "crash on an uninitialized parameter or silently run with "
+            "undefined per-expert weight contents. Supported quant paths for "
             "--moe-resident-expert-fraction < 1.0: fp8, GPTQ (Marlin), AWQ "
             "(Marlin). Leave --moe-resident-expert-fraction at 1.0 (or unset) "
             "for this checkpoint's quant type, or use a supported quant path."
