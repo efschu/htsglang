@@ -20,10 +20,9 @@ import threading
 import time
 import urllib.request
 
+from s307_probe_sizing import default_concurrency, pool_from_info
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 30047
-CONCURRENCY = int(sys.argv[2]) if len(sys.argv) > 2 else 24
-PROMPT_REPEAT = int(sys.argv[3]) if len(sys.argv) > 3 else 900
-NEW_TOKENS = int(sys.argv[4]) if len(sys.argv) > 4 else 160
 BASE = f"http://127.0.0.1:{PORT}"
 T0 = time.time()
 
@@ -47,6 +46,26 @@ def state():
     info = get("/get_server_info")
     st = (info.get("internal_states") or [{}])[0]
     return st.get("admission_limiter") or info.get("admission_limiter") or {}
+
+
+def _live_pool():
+    """The fitted mamba pool this server reports right now, or None if the
+    query fails (e.g. the server is not up yet) -- see s307_probe_sizing."""
+    try:
+        return pool_from_info(get("/get_server_info"))
+    except Exception:
+        return None
+
+
+# Sized as a FRACTION of the pool this server actually fitted, not a fixed
+# count calibrated against a predicted pool size -- see s307_probe_sizing for
+# why a fixed 24 stopped crossing --admission-throttle-high once the fitted
+# pool came out larger than predicted (#307-Beleg, 2026-07-31).
+CONCURRENCY = (
+    int(sys.argv[2]) if len(sys.argv) > 2 else default_concurrency(_live_pool())
+)
+PROMPT_REPEAT = int(sys.argv[3]) if len(sys.argv) > 3 else 900
+NEW_TOKENS = int(sys.argv[4]) if len(sys.argv) > 4 else 160
 
 
 samples = []
