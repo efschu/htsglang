@@ -19457,3 +19457,116 @@ Vor-Fenster-Stand zurueckgesetzt; die aufgestockte Fassung liegt als
 `hw_profile_with_int8_lane.json` bei den Rohdaten. Beim Beenden des eigenen
 Servers wurde die PGID gegen die eigene PID geprueft, bevor das Signal ging —
 auf der Kiste liefen fremde sglang-Prozesse.
+
+## #352 store_kvcache-Assert nach C-Wiederanhebung: die Schranke steckte im Graphen (`fix/kv-growth-consumers-352`, Basis e95969b945; Kartenfenster 2026-07-31, 17:09-17:45 UTC)
+
+Der in #330 §9b offen registrierte Defekt — `store_kvcache`
+`index >= 0 && index < size_limit` unter 10-facher 30k-Nebenlaeufigkeit
+NACH einem Wachstum — ist gefunden und behoben. Die Vermutung im
+#330-Befund ("die uebergebene Schranke ist live") stimmte fuer den
+Python-Quelltext und war fuer den ausgefuehrten Kernel falsch.
+
+**Ursache.** `store_cache` reicht `size_limit` als By-Value-Kernelparameter
+durch (`jit_kernel/kvcache.py:87-95` -> `csrc/elementwise/kvcache.cuh:27,100`,
+Assert in Zeile 112). Ein CUDA-Graph zeichnet Kernelparameter zum
+CAPTURE-ZEITPUNKT auf und spielt sie unveraendert wieder ab. #330 nimmt
+bewusst nie neu auf (VMM-Adressen sind stabil). Nach einem Grow hebt der
+Pool `size` an, der Allocator gibt Slot-Ids oberhalb der Boot-Decke aus
+(`allocator/base.py:grow_size` haengt sie ans ENDE der Freiliste), und ein
+vor dem Wachstum aufgenommener Graph weist genau diese LEGALEN Ids ab. Weil
+niedrige Ids zuerst vergeben werden, braucht es eine Last, die mehr als die
+Boot-Decke GLEICHZEITIG haelt — deshalb war ein 260k-Sequenzfuellen mit 80k
+Spitzen-Nebenlaeufigkeit sauber und 10x30k nicht.
+
+Dass ausgerechnet der Draft-Pool starb, ist strukturell: auf der
+gewichteten Bahn traegt jeder Target-Schreibvorgang eine Owner-Maske und
+laeuft dadurch in `masked_set_kv_buffer_kernel` (gar keine Schranke),
+waehrend der `_draft_non_dcp`-Pool rohe globale `out_cache_loc` durch
+`store_cache` schreibt. Er ist zugleich der einzige Teilnehmer, dessen
+Zeilenzahl mit C mitwaechst (die kompakten Target-Zeilen bleiben durch den
+Boot-Slack meist stehen). Signatur passt: `kElementBytes = 256` = 1 KV-Kopf
+x head_dim 256 x fp8 = die Draft-Zeile eines 3080-Rangs.
+
+**Fix.** `graph_safe_store_bound` (`mem_cache/memory_pool.py`) uebergibt die
+ZEILENZAHL des KV-Puffers, also die Boot-VA-Reservierung, die
+`KvVmmBufferOwner.finalize` nicht ueberschreiten laesst — gueltig fuer die
+gesamte Lebensdauer jedes darueber aufgenommenen Graphen. Bewusst NICHT an
+den Capture-Modus gekoppelt: `PrefillCudaGraphRunner.capture()` setzt das
+Flag nicht (heute nur durch den breakable-Prefill-Graph gedeckt), und eine
+Schranke, deren Richtigkeit daran haengt, dass jede Capture-Stelle ein Flag
+hebt, ist derselbe Defekt eine Ebene hoeher. Sicherheit kostet das nichts:
+das neu zugelassene Band liegt oberhalb der committeten Spanne und ist
+UNGEMAPPT, ein entkommener Index faellt weiterhin hart. Ausserhalb der
+Dial-Bahn sind die Puffer exakt `size + page_size` Zeilen gross — Schranke
+unveraendert, byte-identisch.
+
+Zusaetzlich verifiziert jeder Commit das Ergebnis
+(`verify_pool_reached_capacity`): jeder Teilnehmer-Pool muss die
+angeforderten Backed-Rows melden UND eine Store-Schranke, die `C_new + page`
+noch deckt. Wer das nicht kann, wird mit Zahlen abgelehnt statt spaeter auf
+einer legalen Slot-Id zu assertieren. Aus dem Audit neu hart abgelehnt:
+DFLASH (dessen Solo-Draft-Pool `num_draft_slots` und Index-Tabellen an der
+Boot-Decke einfriert), hisparse, weightless-KV, MLA-Pools — DESIGN_330 §7
+nannte sie, `validate_vram_dial_compat` prueft sie jetzt auch.
+
+**Beweis, vorher/nachher.** Mechanismus-Falsifikator (30 s, 1 Karte, ohne
+Modell): Graph mit Vor-Wachstums-Schranke 1025 aufnehmen, dann bei Slot 2048
+abspielen. Vor dem Fix bricht das mit
+`kvcache.cuh:112 ... kElementBytes = 256L; kSplit = 1; kUsePDL = false;
+T = signed long ... Assertion index >= 0 && index < size_limit failed` —
+byte-gleiche Signatur zum #330-Kartenlauf. Nach dem Fix:
+`REPLAY OK at slot 2048: written=True rows_touched=1`.
+
+Integrationslauf (TP=3, Qwen3.6-27B-FP8, `--rank-kv-ratio 7,3,3
+--kv-reshard-vectors 2,11,10 --enable-vram-dial`, Reserven 3000/2700/2700):
+Boot identisch zum #330-Fenster (C=251965, Draft-VA-Reserve 522197 Zeilen /
+Boot-Backing 251965, Budgets [26349, 19601, 18151] MiB gegen Boeden
+[21813, 15701, 14571] MiB).
+* Negativkontrolle OHNE Wachstum: 6 Sessions x 29022 Token = 174132 gehalten,
+  sauber, korrekte Wiedergabe.
+* Dial rank 0 auf 27900 MiB -> `DONE GROW: 251965 -> 341861` auf allen drei
+  Raengen (Backing 184086 / 120516 / 109560 Zeilen, 22-29 ms), die neue
+  Nachpruefung lief mit durch.
+* Die zuvor scheiternde Last: 10 ECHT nebenlaeufige Sessions x 29022 Token =
+  290220, Spitzenbelegung 0.85 (= 290582 lebende Slots, deutlich ueber der
+  Boot-Decke 251965), `#running-req` 10. Null Asserts, 10/10 korrekte
+  Wiedergabe des sessioneigenen Tokens, Kohaerenzprobe davor und danach
+  unveraendert.
+
+Messfalle nebenbei: der erste Anlauf mit dem #330-Lastskript blieb bei
+Spitzenbelegung 0.35 haengen — es fuhr `max_workers=3`, hielt also nie mehr
+als drei Sessions gleichzeitig und kreuzte die Boot-Decke gar nicht. Die
+Boot-Decke zu KREUZEN ist die ganze Bedingung; ein Lasttreiber, der nur die
+Gesamt-Tokenzahl summiert, kann gruen sein, ohne den Fehler auch nur zu
+beruehren.
+
+Tests: 40 hermetische CPU-Tests (`test/registered/scheduler/test_vram_dial.py`,
++14 neu: Schranken-Kontrakt, Wachstum-erreicht-jeden-Verbraucher inkl.
+Padding-Slot, die neuen Ablehnungen) plus 3 CUDA-Tests
+(`test/registered/mem_cache/test_kv_store_bound_after_growth.py`, der
+Graph-Regressionstest darunter) plus `test_kv_vmm_dial.py` regressionsfrei.
+ruff + codespell sauber; die Formatier-Abweichung der Dateien ist
+unveraendert gegenueber HEAD (keine Fremdumformatierung eingeschleppt).
+
+Karten ueber `/spinning/gpu-arb/` belegt (holder mit Herzschlag) und
+freigegeben, `/tmp/gpu-card-{0,1,2}` gesetzt und geraeumt, am Ende alle drei
+Karten bei 0 MiB; beim Beenden nur eigene PIDs signalisiert (fremde
+sglang-Prozesse laufen auf der Kiste), py-spy-Dump vor dem Kill.
+
+**Offen (aus dem Audit, nicht in diesem Fix).**
+1. `masked_set_kv_buffer_kernel` (`memory_pool.py`) hat GAR KEINE
+   Index-Schranke; jeder Target-DCP-Schreibvorgang laeuft dort durch. Eine
+   entkommene kompakte Zeile korrumpiert still statt am Verursacher zu
+   scheitern — Host-seitig deckt das nur das env-gesteuerte
+   `maybe_detect_oob` ab.
+2. `PrefillCudaGraphRunner.capture()` setzt `model_capture_mode()` nicht.
+   Fuer #352 jetzt egal (die Schranke haengt nicht mehr daran), aber alle
+   ANDEREN Capture-Zeit-Verzweigungen (alt-stream-Fusion,
+   dispose_tensor-Unterdrueckung, compile-in-capture) sehen dort False.
+3. `HybridLinearKVPool.size` wird nach einem Commit nie aufgefrischt (auf
+   der Dial-Bahn haelt es die VA-Reserve). Heute nur kosmetisch gelesen,
+   aber es ist die Zahl, nach der ein spaeterer Leser als "Poolgroesse"
+   greift.
+4. `pool_stats_observer`-Refresh laesst den `_pool_stats_dcp_factor()` weg —
+   auf der gewichteten Bahn Faktor 1, auf even-modulo-DCP um `dcp_size`
+   falsch. Nur Metrik.

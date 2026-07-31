@@ -37,9 +37,13 @@ from sglang.srt.managers.vram_dial import (
     KvCapacityError,
     KvCapacityRuntime,
     RankState,
+    validate_vram_dial_compat,
+    verify_pool_reached_capacity,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import graph_safe_store_bound
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -658,6 +662,153 @@ class TestAllocatorGrow(CustomTestCase):
         alloc.grow_size(48)
         self.assertEqual(alloc.num_pages, 48)
         self.assertEqual(alloc.available_size(), 48)
+
+
+class _FakePool:
+    """Minimal stand-in for a dial participant pool: the two capacity bounds
+    a store has to satisfy after a commit, and nothing else."""
+
+    def __init__(self, backed_rows, store_bound_rows, page_size=1):
+        self.full_pool_backed_rows = int(backed_rows)
+        self.store_bound_rows = int(store_bound_rows)
+        self.page_size = int(page_size)
+
+
+class _FakeParticipant:
+    def __init__(self, pool, is_target=False):
+        self.pool = pool
+        self.is_target = is_target
+
+
+class TestGraphSafeStoreBound(CustomTestCase):
+    """#352: the store_kvcache bound a CUDA graph bakes in at capture time
+    must stay valid for every capacity the pool can later reach."""
+
+    def test_off_dial_lane_is_byte_identical(self):
+        # Buffers allocated at exactly size + page_size: the live bound IS the
+        # row count, so the default path passes exactly what it passed before.
+        self.assertEqual(graph_safe_store_bound(4097, 4097), 4097)
+
+    def test_dial_lane_uses_the_lifetime_bound(self):
+        # Buffers span the VA reserve while the pool is backed well below it.
+        self.assertEqual(graph_safe_store_bound(251966, 522198), 522198)
+
+    def test_grown_ceiling_is_admitted_by_a_pre_growth_capture(self):
+        # The exact #330 card-run numbers: boot C = 251965, growth to 341861
+        # with a 522197-row VA reserve, page_size 1. Before the fix the graph
+        # carried 251966 and asserted on every legal id above the boot
+        # ceiling -- which is what >= 10 x 30k concurrent sessions are the
+        # first load to reach.
+        c_boot, c_new, reserve, page = 251965, 341861, 522197, 1
+        captured = graph_safe_store_bound(c_boot + page, reserve + page)
+        self.assertGreater(captured, c_new)
+        self.assertLess(c_boot + page, c_new)  # the pre-fix bound rejected ids
+
+    def test_never_narrows_below_the_live_bound(self):
+        self.assertEqual(graph_safe_store_bound(600, 400), 600)
+
+    def test_bound_does_not_depend_on_capture_mode(self):
+        # The correctness of the bound must NOT hinge on every capture site
+        # remembering to raise the capture flag: PrefillCudaGraphRunner does
+        # not raise it, and a gate there would re-create #352 for its graphs.
+        eager = graph_safe_store_bound(251966, 522198)
+        with model_capture_mode():
+            captured = graph_safe_store_bound(251966, 522198)
+        self.assertEqual(eager, captured)
+
+
+class TestCapacityReachesEveryConsumer(CustomTestCase):
+    """#345/#352 invariant: after a commit every participant pool either
+    carries the new capacity or the commit fails loudly naming the numbers.
+    A consumer that does neither must not pass silently."""
+
+    def test_pool_that_grew_passes(self):
+        p = _FakeParticipant(_FakePool(backed_rows=341861, store_bound_rows=522198))
+        verify_pool_reached_capacity(p, 341861)
+
+    def test_pool_frozen_at_the_boot_ceiling_is_caught(self):
+        p = _FakeParticipant(_FakePool(backed_rows=251965, store_bound_rows=522198))
+        with self.assertRaises(KvCapacityError) as cm:
+            verify_pool_reached_capacity(p, 341861)
+        msg = str(cm.exception)
+        self.assertIn("251965", msg)
+        self.assertIn("341861", msg)
+
+    def test_pool_that_cannot_host_the_capacity_vetoes_with_numbers(self):
+        # store_bound_rows is the lifetime ceiling captured graphs carry; a
+        # capacity above it is structurally unhostable and must be refused
+        # here rather than as a device assert on a legal slot id.
+        p = _FakeParticipant(_FakePool(backed_rows=341861, store_bound_rows=341861))
+        with self.assertRaises(KvCapacityError) as cm:
+            verify_pool_reached_capacity(p, 341861)
+        msg = str(cm.exception)
+        self.assertIn("341861", msg)
+        self.assertIn("341862", msg)
+
+    def test_padding_slot_is_counted_in_the_veto(self):
+        # Exactly enough rows for the slots but not for the reserved padding
+        # slot is still a refusal: padded/dummy tokens write at index `size`.
+        p = _FakeParticipant(
+            _FakePool(backed_rows=100, store_bound_rows=100, page_size=4)
+        )
+        with self.assertRaises(KvCapacityError):
+            verify_pool_reached_capacity(p, 100)
+        ok = _FakeParticipant(
+            _FakePool(backed_rows=100, store_bound_rows=104, page_size=4)
+        )
+        verify_pool_reached_capacity(ok, 100)
+
+    def test_pool_without_the_bounds_is_a_no_op_here(self):
+        # A pool family exposing neither bound cannot be verified at commit
+        # time; the guard against such a participant is the boot-time
+        # pool-family refusal in build_kv_capacity_runtime, not this function.
+        verify_pool_reached_capacity(_FakeParticipant(object()), 341861)
+
+
+class TestDialRefusals(CustomTestCase):
+    """DESIGN_330 section 7 refusals that guard capacity consumers with no
+    grow path (#352 audit)."""
+
+    class _Args:
+        device = "cuda"
+        enable_memory_saver = False
+        disaggregation_mode = "null"
+        hicache_storage_backend = None
+        enable_kv_session_offload = False
+        dual_group_lane = None
+        dp_size = 1
+        kv_canary = "none"
+        enable_hisparse = False
+        weightless_kv_fastlane = False
+        speculative_algorithm = "NEXTN"
+        speculative_drafter_policy = None
+
+    def _args(self, **over):
+        a = TestDialRefusals._Args()
+        for k, v in over.items():
+            setattr(a, k, v)
+        return a
+
+    def test_supported_lane_passes(self):
+        validate_vram_dial_compat(self._args())
+
+    def test_dflash_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            validate_vram_dial_compat(self._args(speculative_algorithm="DFLASH"))
+        self.assertIn("DFLASH", str(cm.exception))
+
+    def test_dflash_via_drafter_policy_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            validate_vram_dial_compat(
+                self._args(speculative_drafter_policy="0:dflash:16,4096:nextn:3")
+            )
+        self.assertIn("DFLASH", str(cm.exception))
+
+    def test_hisparse_and_weightless_are_refused(self):
+        with self.assertRaises(ValueError):
+            validate_vram_dial_compat(self._args(enable_hisparse=True))
+        with self.assertRaises(ValueError):
+            validate_vram_dial_compat(self._args(weightless_kv_fastlane=True))
 
 
 if __name__ == "__main__":
