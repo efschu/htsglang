@@ -2530,7 +2530,16 @@ class ModelRunnerKVCacheMixin:
         # Llama-3.1-8B (8 kv heads) at --rank-tp-ratio 3,1: pools of 6 and 2
         # heads against an 8-head write/read, first decode step 57% wrong at
         # L00.o_proj while prefill was at the noise floor.
-        if not self.is_draft_worker and uneven_dcp_kv_replicated(self.dcp_size):
+        #
+        # #108: with --draft-kv-layout dcp the DRAFT pool joins this exception
+        # -- it is token-sharded by the same owner rule, so it too stores the
+        # FULL replicated kv-heads. draft_pool_is_replicated() is the single
+        # predicate the attention backend reads as well.
+        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+
+        if not draft_pool_is_replicated(
+            self.is_draft_worker, self.server_args
+        ) and uneven_dcp_kv_replicated(self.dcp_size):
             return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
 
@@ -2557,7 +2566,14 @@ class ModelRunnerKVCacheMixin:
             get_cp_token_ratios,
         )
 
-        if self.is_draft_worker or not uneven_dcp_active(self.dcp_size):
+        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+
+        # #108: --draft-kv-layout dcp lets the draft pool through to the same
+        # ratio-proportional row count. Default 'replicated' keeps the early
+        # return, i.e. the full global context per rank, byte-identical.
+        if draft_pool_is_replicated(
+            self.is_draft_worker, self.server_args
+        ) or not uneven_dcp_active(self.dcp_size):
             return int(global_rows)
         if not uneven_dcp_kv_replicated(self.dcp_size):
             return int(global_rows)
@@ -3322,7 +3338,17 @@ class ModelRunnerKVCacheMixin:
                 # (LOCAL head-sharded kv, FULL token context) -- it is NOT
                 # DCP-token-sharded (see FlashInferAttnBackend.__init__ draft
                 # gate). Only the TARGET model replicates heads + token-shards.
-                _draft_non_dcp = self.is_draft_worker
+                #
+                # #108 --draft-kv-layout dcp opts the draft pool INTO the same
+                # treatment. The predicate lives in layers/dcp/owner.py because
+                # the attention backend reads the identical one -- pool and
+                # backend must never disagree about whether these rows are
+                # token-sharded (#345's right-token/wrong-slot class).
+                from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+
+                _draft_non_dcp = draft_pool_is_replicated(
+                    self.is_draft_worker, self.server_args
+                )
                 # Weightless-KV fast lane (Option-B): the head rank projects the
                 # FULL kv-heads (built under the weight-TP=1 override) and
                 # broadcasts them; every rank writes all total_num_kv_heads to

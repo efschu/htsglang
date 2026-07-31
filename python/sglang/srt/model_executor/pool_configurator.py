@@ -124,6 +124,15 @@ def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
     every rank.  It is left alone here on purpose -- fixing it would shrink the
     KV pool of every validated non-solo uneven-DCP arm, and the reference
     topology has enough slack to absorb it.  See the handoff note.
+
+    #108 RESOLVES THAT MISMATCH FROM THE OTHER SIDE, for split placement, when
+    ``--draft-kv-layout dcp`` is set: instead of correcting the CHARGE upward
+    to match a globally-sized draft pool, it shrinks the POOL to
+    ``C * ratio_r / S`` -- which is exactly what the ``1 + L_draft/L_target``
+    per-LOCAL-token term above already charges.  Nothing here changes, and
+    that is the point: the accounting was always written for the sharded
+    shape, and the draft pool now has it.  Under the default
+    ``--draft-kv-layout replicated`` the under-charge stands as described.
     """
     server_args = mr.server_args
     if not getattr(server_args, "speculative_draft_solo_active", None):

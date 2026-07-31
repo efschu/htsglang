@@ -34,7 +34,7 @@ class TestFlashInferDcpNoOpGuard(CustomTestCase):
         """THE falsifier: the measured config (dcp_size 2, no plan, no fast
         lane, target worker) used to boot and serve plain TP."""
         with self.assertRaises(ValueError) as ctx:
-            reject_silently_inert_dcp(2, uneven_dcp=False, is_draft_worker=False)
+            reject_silently_inert_dcp(2, uneven_dcp=False, draft_pool_replicated=False)
         msg = str(ctx.exception)
         self.assertIn("SILENTLY IGNORED", msg)
         # names all three ways out, so the message is actionable
@@ -44,17 +44,73 @@ class TestFlashInferDcpNoOpGuard(CustomTestCase):
 
     def test_the_validated_uneven_arm_is_untouched(self):
         for dcp in (2, 3, 8):
-            reject_silently_inert_dcp(dcp, uneven_dcp=True, is_draft_worker=False)
+            reject_silently_inert_dcp(dcp, uneven_dcp=True, draft_pool_replicated=False)
 
     def test_the_draft_worker_is_exempt_by_design(self):
         """M4: dcp_size lives in the parallel context, so an EAGLE/NEXTN draft
-        runner sees dcp_size > 1 as well, and deliberately does NOT token-shard
-        its 1-layer full-context KV pool -- its uneven_dcp is forced False for
+        runner sees dcp_size > 1 as well, and under the default
+        --draft-kv-layout replicated it deliberately does NOT token-shard its
+        1-layer full-context KV pool -- its uneven_dcp is forced False for
         that reason. Rejecting it would refuse the validated MTP + uneven-DCP
         arm, so this direction is asserted explicitly and not left to luck.
         """
         for dcp in (2, 3):
-            reject_silently_inert_dcp(dcp, uneven_dcp=False, is_draft_worker=True)
+            reject_silently_inert_dcp(dcp, uneven_dcp=False, draft_pool_replicated=True)
+
+    def test_a_dcp_sharded_draft_is_not_exempt(self):
+        """#108: the exemption is for a REPLICATED draft pool, not for "being
+        a draft worker".
+
+        With --draft-kv-layout dcp the draft runner is on the DCP machinery,
+        so a --dcp-size it would silently ignore is just as much a silent
+        no-op for it as for the target. Passing is_draft_worker here (rather
+        than draft_pool_is_replicated) would have punched a hole in the guard
+        exactly where the new code path runs.
+        """
+        for dcp in (2, 3):
+            with self.assertRaises(ValueError):
+                reject_silently_inert_dcp(
+                    dcp, uneven_dcp=False, draft_pool_replicated=False
+                )
+
+    def test_the_constructor_reads_the_shared_predicate(self):
+        """Pool geometry and backend geometry must come from ONE function.
+
+        A pool sized for a token split the backend does not perform is #345's
+        silent right-token/wrong-slot corruption -- an address that drifts
+        with the slot id, i.e. with request order. Both sites therefore call
+        draft_pool_is_replicated(); neither re-derives the condition, and this
+        test fails if the backend ever grows its own copy.
+        """
+        src = inspect.getsource(FlashInferAttnBackend.__init__)
+        self.assertIn("draft_pool_is_replicated(", src)
+        self.assertNotIn(
+            'and not getattr(model_runner, "is_draft_worker", False)\n'
+            "        # A --dcp-size",
+            src,
+            "the draft gate must go through the shared predicate",
+        )
+
+    def test_the_default_draft_gate_is_the_old_expression(self):
+        """BYTE-IDENTITY PIN for the unchanged path.
+
+        draft_pool_is_replicated(d, args) must equal the pre-#108 expression
+        `is_draft_worker` for every input with the flag at its default, so a
+        server that does not pass --draft-kv-layout cannot take a single
+        different branch.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+
+        for args in (
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(draft_kv_layout="replicated"),
+        ):
+            for is_draft in (False, True):
+                with self.subTest(args=args, is_draft=is_draft):
+                    self.assertEqual(draft_pool_is_replicated(is_draft, args), is_draft)
 
     def test_dcp_off_is_inert(self):
         """The default path: no DCP, nothing to reject, whatever else is set."""
@@ -63,7 +119,7 @@ class TestFlashInferDcpNoOpGuard(CustomTestCase):
                 for draft in (False, True):
                     with self.subTest(dcp=dcp, uneven=uneven, draft=draft):
                         reject_silently_inert_dcp(
-                            dcp, uneven_dcp=uneven, is_draft_worker=draft
+                            dcp, uneven_dcp=uneven, draft_pool_replicated=draft
                         )
 
     def test_the_constructor_calls_the_rule(self):

@@ -1021,6 +1021,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         ), "PP is not compatible with MTP models."
 
+        # BOOT GATE tier 2 (#108): --draft-kv-layout dcp is a one-layer
+        # contract, and this is the first point where the resolved draft
+        # checkpoint's KV layer count is actually known. ServerArgs bounded
+        # the algorithm, the topk and --enable-multi-layer-eagle from the CLI;
+        # a draft CHECKPOINT carrying several attention layers is only visible
+        # here. Fires before the KV pool is built, so the failure is a
+        # sentence rather than a shape mismatch in the draft capture.
+        if self.is_draft_worker:
+            from sglang.srt.layers.dcp.owner import (
+                draft_kv_layout_is_dcp,
+                reject_multi_layer_draft_kv_dcp,
+            )
+
+            if draft_kv_layout_is_dcp(self.server_args):
+                reject_multi_layer_draft_kv_dcp(
+                    self.num_effective_layers,
+                    self.model_config.hf_config.architectures[0],
+                )
+
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied

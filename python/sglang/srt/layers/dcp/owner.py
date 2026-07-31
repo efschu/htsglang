@@ -88,6 +88,69 @@ def refresh_all_owner_bounds() -> int:
     return len(consumers)
 
 
+def draft_kv_layout_is_dcp(server_args) -> bool:
+    """#108: has the user opted the DRAFT KV pool into DCP token-sharding?
+
+    Reads ``--draft-kv-layout`` defensively (``getattr``) because several test
+    doubles and the CUDA-graph runners construct model runners with partial
+    server-args stand-ins; an absent field means the unchanged default.
+    """
+    return getattr(server_args, "draft_kv_layout", "replicated") == "dcp"
+
+
+def draft_pool_is_replicated(is_draft_worker: bool, server_args) -> bool:
+    """THE single predicate for "this worker keeps the legacy replicated draft
+    KV pool" (#108).
+
+    Two independent sites decide the draft pool's geometry -- the KV pool
+    sizing (``model_runner_kv_cache_mixin``: replicated kv-heads +
+    ``dcp_compact_pool_rows``) and the attention backend
+    (``FlashInferAttnBackend.uneven_dcp``: owner-rule masked write, per-layer
+    kv-head all-gather, cross-rank LSE merge). If those two ever disagree the
+    pool is shaped for a token split the backend does not perform, which is
+    the right-token/wrong-slot corruption class #345 already cost a debugging
+    round on -- not a crash, a silently wrong address that drifts with the
+    slot id.
+
+    So both sites call THIS function and neither re-derives the condition.
+    The same coupling argument as ``_swa_hybrid_dcp_lane``.
+
+    True  -> the M4 default: the draft runner keeps its tiny full-context,
+             head-sharded 1-layer pool and every DCP branch stays off for it.
+    False -> either not a draft worker at all, or ``--draft-kv-layout dcp``:
+             the draft pool takes the identical target-model treatment.
+    """
+    return bool(is_draft_worker) and not draft_kv_layout_is_dcp(server_args)
+
+
+def reject_multi_layer_draft_kv_dcp(num_draft_kv_layers: int, arch: str) -> None:
+    """BOOT GATE tier 2 (#108): --draft-kv-layout dcp is a ONE-layer contract.
+
+    ``ServerArgs._reject_unsupported_draft_kv_dcp`` bounds the algorithm and
+    the topk from the CLI alone; it cannot see how many attention layers the
+    resolved draft checkpoint actually carries. NEXTN/MTP heads normalise to
+    ``num_nextn_predict_layers = 1`` (configs/model_config.py), but an EAGLE
+    checkpoint resolving through the same alias can carry several.
+
+    Why a second layer is not "the same thing twice": the owner rule shards a
+    single linear append chain, one KV row per accepted token per layer. With
+    L > 1 draft layers the draft's own decode reads positions written by an
+    earlier layer of the SAME forward, and the cross-rank LSE merge would have
+    to run per layer inside the draft step -- kernels that do not exist here
+    (#76-scale work). Refuse at pool construction rather than emit tokens from
+    rows nobody wrote.
+    """
+    if int(num_draft_kv_layers) <= 1:
+        return
+    raise ValueError(
+        "--draft-kv-layout dcp supports a single-layer draft chain "
+        f"(MTP/NEXTN) only, but the draft model {arch!r} has "
+        f"{int(num_draft_kv_layers)} KV layers. Multi-layer EAGLE drafts need "
+        "per-layer owner-rule kernels that are not implemented; run this "
+        "draft with --draft-kv-layout replicated."
+    )
+
+
 def dcp_compact_pool_rows(global_tokens: int, cp_S: int, cp_ratio: int) -> int:
     """Physical KV rows this rank must hold for a GLOBAL context of
     ``global_tokens`` slots under the weighted owner rule.
