@@ -569,16 +569,12 @@ offered per class — and §3.1 says today it would be offered for `control` onl
 
 ---
 
-## 7. Target 6 — licence and how to couple it in
+## 7. Target 6 — how to couple it in
 
-Facts: the handover's own code is **MIT** (`LICENSE`, `SPDX-License-Identifier:
-MIT` in every `.c`), copyright efschu. The fork is **Apache-2.0**. MIT into an
-Apache-2.0 project is unproblematic — keep the MIT headers and the file-level
-notice. The NVIDIA open-kernel-module headers (`nv-ioctl.h`, `nv_escape.h`,
-`ctrl0000unix.h`, …) are **deliberately not vendored**; they are Dual MIT/GPL and
-are meant to be cloned at the exact installed driver version, because the ioctl
-struct layouts must match the running driver (`BUILD.md:8-25`). `libcuda` is used
-unmodified under the NVIDIA EULA; `libibverbs` is Dual BSD/GPLv2.
+The NVIDIA open-kernel-module headers (`nv-ioctl.h`, `nv_escape.h`,
+`ctrl0000unix.h`, …) are **deliberately not vendored**; they are meant to be
+cloned at the exact installed driver version, because the ioctl struct layouts
+must match the running driver (`BUILD.md:8-25`).
 
 **Recommendation: optional module, headers fetched at build/run time, never
 vendored.** Concretely, and idiomatic for this fork:

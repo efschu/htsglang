@@ -1520,6 +1520,12 @@ lane's in `DualGroupLane._finish`.
 
 ### 4.15 BAR1 direct path: cards writing into each other, no host, no NIC (#288)
 
+> The driver-side part of this path (source patch, the dma-buf holder module,
+> and the standalone probes) is **not** part of this repository. It lives in
+> the separate `smallbar-p2p` repository and is pointed at from here only
+> through `SGLANG_HTCCL_BAR1_NV_QUELLE`. This fork carries the runtime
+> transport, nothing else.
+
 `SGLANG_HTCCL_TRANSPORT=bar1` — TP collectives in which every card writes
 straight into its neighbour's memory across the PCIe BAR. Works on 256 MiB
 BARs, i.e. on every GeForce in this rig. **Needs a patched driver and cannot
