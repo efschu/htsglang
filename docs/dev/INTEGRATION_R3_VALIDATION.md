@@ -14551,3 +14551,173 @@ vor dem Boot gegen `--rank-gpu-id 0,1,2` gelesen: 0 = 3080, 1 = 5090,
 2 = 3080; kein `CUDA_DEVICE_ORDER` gesetzt, `cuda:0` bleibt die 5090),
 `proofs/spin_pre.txt` (Fremd-Spin vor dem Fenster), `power.csv`.
 Die Serverlogs bleiben hostseitig unter `/root/battery-bar1/s307_*.server.log`.
+
+## #316-Beleg + #318-Falsifikator (Kartenfenster 2026-07-31, 01:01-01:08 UTC)
+
+Zwei Boots auf `/spinning/wt-final` @ `aae6176741` (enthaelt den #316-Fix
+`f9c21ec8c8` gemergt), TP=3 auf 5090 + 2x 3080, GPTQ-Int4-Ziel
+`Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4`,
+`--rank-tp-ratio auto-performance`, `--rank-auto-reserve-mib 3000,2700,2700`,
+fp8-KV, NEXTN k=3 — also byte-genau das Kommando aus dem #300-Beleg. Die
+beiden Arme unterscheiden sich in **genau einem Argument**:
+
+* Arm **mitigation**: zusaetzlich `--speculative-draft-model-quantization unquant`
+* Arm **falsifier**: ohne dieses Flag (#318-Falsifikator)
+
+Kartenzeit 6 min 35 s von 25 min Budget; 18 min zurueckgegeben. Boot-Dauer
+211 s (mitigation, zahlt den JIT-Build) und 65 s (falsifier, warmer Cache).
+
+**Verdikt in einem Satz: #316 ist belegt gefixt — der Boot kommt hoch und
+generiert kohaerent —, und #318 ist ein echter stiller Bug (Fall b), dessen
+vorgeschlagene Mitigation nachweislich wirkungslos ist.**
+
+### 1. #316: der Repack-Abbruch ist weg, der Guard greift — erfuellt
+
+`grep -c size_n` ueber beide Volllogs: **0**. Die im #300-Beleg
+festgehaltenen `size_n = 24 / 30 is not divisible by tile_n_size = 64` aus
+`gptq_marlin_repack.cuh:309` treten nicht mehr auf, auf keinem Rang.
+
+Stattdessen meldet der neue Shape-Guard sich **144-mal je Arm** (48
+GDN-Layer x 3 Raenge), woertlich:
+
+```
+Layer 'model.language_model.layers.0.linear_attn.in_proj_ba' has no GPTQ-Marlin
+representation at any TP size (Weight output_size_per_partition = 96 is not
+divisible by  min_thread_n = 64. -- the UNSHARDED shape) and is kept
+unquantized; the checkpoint stores it dense.
+```
+
+Das ist der Guard-Pfad aus `f9c21ec8c8`: Urteil auf der UNGESHARDETEN
+Geometrie (96), Aufloesung nach `UnquantizedLinearMethod`, `in_proj_ba` wird
+dense gebaut.
+
+Die BF16-`in_proj_a`/`in_proj_b`-Tensoren erreichen jetzt ihr Ziel:
+`grep -c "in_proj.*not found in params_dict"` ueber beide Volllogs = **0**.
+Im #300-Beleg stand an dieser Stelle noch
+`Parameter model.layers.62.linear_attn.in_proj_ba.weight not found in
+params_dict` (`proofs/repack_traceback.txt`) — genau diese Zeilenfamilie ist
+verschwunden.
+
+Die MLP-Shards sind unveraendert: `materialized MLP units [62, 37, 37]`,
+x 128 = **[7936, 4736, 4736]**, identisch zum #300-Beleg. Der #316-Fix hat
+die #300-Geometrie nicht angefasst.
+
+Der Server kommt hoch, allokiert KV (`307290 / 174131 / 174131` Tokens
+fp8_e4m3, plus die Mamba-Ebene mit 655520) und generiert kohaerent. Erste
+Zeilen der 192-Token-Antwort auf „Explain in plain words why a rope bridge
+sways when you walk across it":
+
+```
+<think>
+Here's a thinking process:
+1.  **Understand User Query**: The user wants a plain-language explanation of
+    why a rope bridge sways when you walk across it.
+2.  **Identify Key Concepts**:
+   - Rope bridges are flexible structures
+   - They lack rigid support
+   - Walking creates dynamic forces (not just static weight)
+```
+
+### 2. #318: Fall (b) — Server oben, Draft degeneriert
+
+Der Falsifikator-Arm ist **nicht** laut abgebrochen. Der #290-Guard
+„raise on unloaded parameters" greift hier nicht. Beide Arme liefern ueber
+**191 Verify-Ticks** (weit ueber die geforderten 20) folgende `meta_info`:
+
+| Groesse | mitigation | falsifier |
+|---|---|---|
+| `spec_accept_length` | 1.0052356020942408 | 1.0052356020942408 |
+| `spec_accept_rate` | 0.0 | 0.0 |
+| `spec_verify_ct` | 191 | 191 |
+| `spec_num_proposed_drafts` | 573 | 573 |
+| `spec_accepted_drafts` | **0** | **0** |
+| `completion_tokens` | 192 | 192 |
+| `decode_throughput` | 51.73 tok/s | 51.81 tok/s |
+
+573 vorgeschlagene Draft-Tokens, **null** angenommene. Der Ausgabetext ist
+zwischen den Armen zeichengleich. Das Ziel-Modell rechnet also korrekt — der
+Drafter traegt nichts bei und kostet nur.
+
+`1.005` ist nicht irgendeine Zahl: es ist die Signatur, die der Kommentar in
+`model_config.py:577` woertlich fuer #290 nennt („36 of 58 tensors dropped,
+accept 1.005"). #318 ist der Nicht-GGUF-Zwilling von #290.
+
+### 3. Warum die Mitigation nichts aendert
+
+Beide Arme protokollieren dasselbe: `speculative_draft_model_quantization=None`.
+Das Flag ist auf diesem Kommando ein **No-op**, aus zwei zusammenwirkenden
+Gruenden in `server_args.py:6409-6424`:
+
+* Ohne Flag setzt Zeile 6413 das Feld auf `self.quantization` — und
+  `--quantization` wurde nie uebergeben, ist also `None`.
+* Mit `unquant` setzt Zeile 6424 dasselbe Feld auf `None`.
+
+Beide Wege enden auf `None`, und `None` heisst hier **nicht** „dense", sondern
+„auto-detect". `ModelConfig.from_server_args` (Zeile 565-587) macht aus `None`
+nur dann etwas Explizites, wenn der Draft-Pfad eine GGUF-DATEI ist; sonst
+faellt der Drafter auf die Auto-Erkennung aus der `quantization_config` des
+Checkpoints zurueck — also auf `gptq`. Das Gegenstueck zum Ziel-Pfad fehlt:
+dort merkt sich Zeile 6420 den ausdruecklichen Verzicht in
+`_quantization_explicitly_unset`, auf dem Draft-Pfad gibt es dieses Feld nicht.
+
+### 4. Was dabei still verloren geht
+
+`grep -c "not found in params_dict"` = **21 je Arm**, 7 eindeutige Namen x 3
+Raenge, alle im MTP-Namensraum:
+
+```
+model.layers.0.q_proj.weight        model.layers.0.mlp.gate_proj.weight
+model.layers.0.k_proj.weight        model.layers.0.mlp.up_proj.weight
+model.layers.0.v_proj.weight        model.layers.0.mlp.down_proj.weight
+model.layers.0.o_proj.weight
+```
+
+Das sind saemtliche linearen Projektionen des MTP-Blocks. Der Checkpoint-Index
+belegt, warum sie nicht ankommen: GPTQModel hat den MTP-Block **dense
+gelassen** —
+
+```
+mtp.layers.0.self_attn.q_proj.weight     mtp.layers.0.mlp.gate_proj.weight
+mtp.layers.0.self_attn.k_proj.weight     mtp.layers.0.mlp.up_proj.weight
+mtp.layers.0.self_attn.v_proj.weight     mtp.layers.0.mlp.down_proj.weight
+mtp.layers.0.self_attn.o_proj.weight
+```
+
+— alles blanke `.weight`, waehrend das Ziel unter
+`model.language_model.layers.N.*` `qweight`/`qzeros`/`scales`/`g_idx` fuehrt.
+`quantization_config.modules_to_not_convert` ist `None`: GPTQModel schreibt
+den Block dense und sagt es nicht. sglang baut den Drafter darum quantisiert,
+die dense Namen finden kein Ziel, der Loader ueberspringt sie mit einer
+WARNUNG statt eines Fehlers, und der Drafter behaelt uninitialisierte
+Gewichte. Genau daher die Accept-Kollaps auf 1.005.
+
+Das ist strukturell dieselbe Familie wie #316 („der Checkpoint speichert es
+dense, sglang baut eine Marlin-Schicht, die kein Tensor je erreicht") — mit
+einem Unterschied, der erklaert, warum der #316-Guard hier nicht hilft: die
+sieben MTP-Projektionen haben **Marlin-legale Formen**. Ein Guard, der auf der
+Geometrie urteilt, sagt hier korrekt „Marlin ist moeglich". Das
+unterscheidende Signal ist nicht die Form, sondern was im Checkpoint liegt.
+Ein Fix fuer #318 muss darum am Namensraum ansetzen (dense `.weight` im
+MTP-Block erkannt = Block unquantisiert bauen), nicht an der Shape-Regel.
+
+Diagnose und Fix waren nicht Auftrag dieses Fensters; festgehalten ist der
+Befund samt Belegen, damit die naechste Runde dafuer nicht erneut booten muss.
+
+### Rohdaten
+
+`/spinning/gpu-battery-results/2026-07-31_316_beleg/`:
+`remote_boot_316_mitigation.sh` / `remote_boot_316_falsifier.sh` (die
+Kommandos, die liefen — sie unterscheiden sich in genau einer Zeile),
+`drive_boot.sh` / `window_open.sh` / `window_close.sh` (Treiber und Fenster),
+`proofs/smoke.mitigation.json` / `smoke.falsifier.json` (Volltext +
+`meta_info` beider Arme), `proofs/server_info.*.json`,
+`proofs/units.*.txt` (Einheiten-Zeile, Guard-Zeilen, KV-Allokation),
+`proofs/errors.*.txt` (`size_n`-Suche, `params_dict`-Suche, Tracebacks),
+`logs/host.316.mitigation.log` / `host.316.falsifier.log` (die Volllogs,
+501 / 503 Zeilen), `logs/boot.*.tail.txt`, `logs/driver.log`,
+`proofs/card_order_host.txt` / `card_order_container.txt` (NVML-Reihenfolge
+vor dem Boot gegen `--rank-gpu-id 0,1,2` gelesen: 0 = 3080, 1 = 5090,
+2 = 3080; kein `CUDA_DEVICE_ORDER` gesetzt, `cuda:0` bleibt die 5090),
+`power.csv` (78 Punkte je Karte; Spitzen 284 W / 17861 MiB auf GPU0,
+213 W / 27221 MiB auf GPU1, 273 W / 16767 MiB auf GPU2 — zwei
+Lade-und-Decode-Zyklen, kein Fremd-Spin im Fenster).
