@@ -59,14 +59,65 @@ FP16_SUFFIX = "_fp16.onnx"
 PROVENANCE_SUFFIX = ".provenance.json"
 
 
+def schema_pinned_float_inputs(model) -> set:
+    """Initializer names the ONNX spec pins to fp32, whatever the compute is.
+
+    Not every float input of every operator is part of its precision. Some are
+    fixed by the schema to ``tensor(float)`` rather than to a type variable
+    that follows the data: ``Resize`` declares ``roi`` and ``scales`` that way,
+    because they are geometry, not pixels. Casting them along with the weights
+    produces a model that ``onnx.checker.check_model`` accepts and ONNX Runtime
+    refuses to load:
+
+        Type 'tensor(float16)' of input parameter (onnx::Resize_275) of
+        operator (Resize) in node (Resize_68) is invalid.
+
+    That is what the first version of this converter did, and because the only
+    validation at export time was the checker, the broken artifact was written,
+    hashed and given a provenance sidecar. It sat on disk looking finished
+    until something tried to load it.
+
+    The fix is general rather than a list of op names: ask the operator's own
+    schema which of its inputs are type variables and which are pinned, and
+    leave the pinned ones alone. A future model that uses some other op with a
+    fixed float input is then covered without anyone remembering to add it.
+    """
+    from onnx import defs
+
+    opsets = {imp.domain: imp.version for imp in model.opset_import}
+    pinned: set = set()
+    for node in model.graph.node:
+        version = opsets.get(node.domain, opsets.get("", 0))
+        try:
+            schema = defs.get_schema(node.op_type, version, node.domain)
+        except Exception:  # noqa: BLE001 - an unknown op pins nothing
+            continue
+        variables = {tc.type_param_str for tc in schema.type_constraints}
+        declared = list(schema.inputs)
+        if not declared:
+            continue
+        for index, name in enumerate(node.input):
+            if not name:
+                continue
+            # A variadic tail repeats the last declared input's constraint.
+            spec = declared[index] if index < len(declared) else declared[-1]
+            if spec.type_str not in variables and "float16" not in spec.type_str:
+                pinned.add(name)
+    return pinned
+
+
 def convert_initializers_and_io(model):
     """Weights and graph I/O to fp16. The vs-pipeline conversion."""
     import numpy as np
     from onnx import TensorProto, helper, numpy_helper
 
+    pinned = schema_pinned_float_inputs(model)
     converted = 0
     for init in model.graph.initializer:
         if init.data_type != TensorProto.FLOAT:
+            continue
+        if init.name in pinned:
+            # Geometry, not pixels. See schema_pinned_float_inputs.
             continue
         array = numpy_helper.to_array(init).astype(np.float16)
         init.CopyFrom(
@@ -148,6 +199,33 @@ def insert_io_casts(model):
     return model, len(inserted)
 
 
+def _assert_loadable(onnx_path: Path) -> None:
+    """Open the artifact once on CPU. Raises if the runtime refuses it.
+
+    Deliberately the CPU provider: this asks whether the *graph* is valid, not
+    whether any accelerator is present, so it is the same check on a build box
+    with no card as on this rig.
+    """
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    try:
+        ort.InferenceSession(
+            str(onnx_path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised with what to do about it
+        onnx_path.unlink(missing_ok=True)
+        raise SystemExit(
+            f"the exported artifact {onnx_path.name} is not loadable and has been "
+            f"removed rather than left on disk looking finished: {exc}\n"
+            "If this is a type-constraint rejection, an initializer that the "
+            "operator's schema pins to fp32 was converted; see "
+            "schema_pinned_float_inputs. --io-cast-only is the fallback that "
+            "keeps every computation in fp32."
+        ) from exc
+
+
 def export(source_onnx: Path, out_path: Path, *, io_cast_only: bool) -> dict:
     try:
         import onnx
@@ -169,6 +247,15 @@ def export(source_onnx: Path, out_path: Path, *, io_cast_only: bool) -> dict:
     onnx.checker.check_model(model)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model, str(out_path))
+
+    # The checker is not the gate. It accepted the Resize/scales violation
+    # that made the first fp16 artifact unloadable, so the artifact was
+    # written, hashed and given a provenance sidecar that said it had been
+    # built -- and nothing found out until a grading run tried to open it
+    # weeks later. Loading it once, on CPU, costs a second and makes "built"
+    # mean "loadable". An artifact that cannot be loaded must not leave a
+    # sidecar behind claiming otherwise, so this runs before the manifest.
+    _assert_loadable(out_path)
 
     manifest = {
         "derived_from": str(source_onnx),
@@ -241,6 +328,19 @@ def grade(
                     {
                         "resolution": str(resolution),
                         "sample": sample,
+                        # What the numbers describe. A TensorRT session falls
+                        # back to CUDA when the libraries are missing, so a
+                        # record that only carried the *requested* provider
+                        # could claim a TensorRT result taken on a host where
+                        # libnvinfer was never installed.
+                        "candidate_provider": candidate_backend.info.effective_provider,
+                        "candidate_provider_requested": candidate_backend.info.provider,
+                        "candidate_provider_fell_back": (
+                            candidate_backend.info.provider_fell_back
+                        ),
+                        "reference_provider": (
+                            reference_backend.info.effective_provider
+                        ),
                         **verdict.as_manifest(),
                     }
                 )

@@ -516,3 +516,94 @@ gate is the digest comparison, which is exact. Worth noting in passing that
 the pull arm scored *higher* than the weighted one (38.1 vs 37.0 dB), which
 is consistent with more of its frames having been produced on the baseline
 card.
+
+---
+
+# Task #339 P4 — fp16 SR parity, 2026-07-31 20:47-20:55Z
+
+Raw records in `/spinning/gpu-battery-results/2026-07-31_339_p4/`. RTX 5090,
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, inputs sampled on the CPU and moved to the
+device (two architectures do not agree on `torch.rand`, so a device-sampled
+input would make these numbers card-specific).
+
+## The gate: both fp16 arms pass, comfortably
+
+fp32 ONNX on the CUDA provider is the reference. Three samples per
+resolution, `parity.py`'s fp16-vs-fp32 same-card floor: PSNR >= 40 dB,
+SSIM >= 0.995.
+
+| arm | resolution | PSNR dB | SSIM | verdict |
+|---|---|---|---|---|
+| full fp16 (weights + I/O) | 960x540 | 55.69 - 55.75 | 0.999961 | pass |
+| full fp16 (weights + I/O) | 1280x720 | 55.68 - 55.71 | 0.999961 | pass |
+| I/O cast only (fp32 compute) | 960x540 | 60.73 - 60.78 | 0.999988 | pass |
+| I/O cast only (fp32 compute) | 1280x720 | 60.73 - 60.75 | 0.999988 | pass |
+
+**The full conversion is numerically safe for this model**: ~15 dB of margin
+over the bar. The I/O-cast fallback scores ~5 dB better, which is what it
+should do — it leaves every computation in fp32 and only changes the
+interface — but it therefore buys interface bandwidth and no compute. On this
+evidence the full conversion is the one to use, and `--io-cast-only` stays
+what it was declared to be: the fallback for a model the full conversion
+cannot carry, which this model is not.
+
+## What is NOT measured here, and why
+
+**No TensorRT engine was built. TensorRT is not installed on this rig.**
+`libnvinfer.so.10: cannot open shared object file`, no `tensorrt` package in
+the venv, no `libnvinfer.so*` anywhere on the filesystem. Both arms above were
+therefore graded on the **CUDA execution provider**, which runs the fp16 graph
+in fp16 and so is a genuine fp16-vs-fp32 numerical comparison — but it is not
+a TensorRT result and is not labelled as one.
+
+Two consequences, stated rather than glossed:
+
+*   The parity table above settles the **conversion's numerics**. It does not
+    settle anything about the TensorRT engine.
+*   **The SR ratio question is still open.** The per-stage sweep measured SR
+    at fp32 on the CUDA provider and found the 3080 at 2.4-2.5x the 5090;
+    whether an fp16 TensorRT engine moves that ratio is exactly what an
+    engine would answer, and no engine exists. Installing TensorRT is a
+    ~2-3 GB change to a shared box and is a rig decision, not one to make
+    inside a borrowed card window.
+
+## Three defects, all found by running the gate rather than reading
+
+**1. The full-fp16 artifact had never been loadable.** It was built, hashed
+and given a provenance sidecar in an earlier window, and it does not load:
+
+    Type 'tensor(float16)' of input parameter (onnx::Resize_275) of
+    operator (Resize) in node (Resize_68) is invalid.
+
+The converter cast every float32 initializer. `Resize` pins `roi` and
+`scales` to `tensor(float)` in its schema — they are geometry, not pixels —
+so casting them produces a model the spec forbids. `onnx.checker.check_model`
+accepted it, which is why nothing caught it at export time.
+
+Fixed generally rather than with a list of op names: `schema_pinned_float_inputs`
+asks each operator's own ONNX schema which of its inputs are type variables
+and which are pinned, and leaves the pinned ones alone. The re-export converts
+101 initializers where the broken one converted 102 — the difference is
+exactly the `scales` tensor.
+
+**2. "Built and hashed" did not imply "loadable".** The checker was the only
+validation, so an unloadable artifact got a sidecar claiming success and sat
+on disk looking finished. `export` now opens the artifact once on the CPU
+provider before writing the manifest, and deletes the file rather than leaving
+one behind that lies about itself.
+
+**3. A parity record could claim a provider it never ran on.** The SR backend
+appends `CUDAExecutionProvider` after the TensorRT EP so a subgraph the EP
+cannot take still runs. On a host with no TensorRT that silently turns the
+whole session into a CUDA one — it works, it is fast, and every record it
+produces was labelled `tensorrt`. This is how a parity table comes to contain
+TensorRT numbers taken on a machine where libnvinfer was never installed;
+the first io-cast run in this window did exactly that and reported
+`PARITY GATE PASSED` under a TensorRT heading.
+
+`BackendInfo` now records `active_providers` and `provider_fell_back` from the
+session itself, logs a warning naming both, and the parity rows carry
+`candidate_provider` alongside `candidate_provider_requested`. Every row in
+the table above is stamped `CUDAExecutionProvider` with `fell_back: true`,
+which is why the caveat in this section is verifiable from the artifact rather
+than resting on this prose.

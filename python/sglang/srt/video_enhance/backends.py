@@ -54,11 +54,24 @@ class BackendInfo:
 
     runtime: str
     runtime_version: str
+    #: The provider that was *requested*.
     provider: str
     precision: str
     engine_path: str | None
     built_engine: bool
     build_seconds: float | None
+    #: The providers onnxruntime actually bound, in its own priority order.
+    #: Empty only for a backend that does not go through a session.
+    active_providers: tuple[str, ...] = ()
+    #: True when the requested provider is not among the active ones -- the
+    #: session fell back. A measurement taken through such a session does not
+    #: describe the provider its label claims.
+    provider_fell_back: bool = False
+
+    @property
+    def effective_provider(self) -> str:
+        """What to attribute a measurement to."""
+        return self.active_providers[0] if self.active_providers else self.provider
 
 
 class InferenceBackend(Protocol):
@@ -223,10 +236,33 @@ class OnnxRuntimeBackend:
             if cache is not None and self._key is not None and engine_path:
                 self._record_provenance(engine_path, elapsed, built)
 
+        # The provider that actually ran, not the one that was asked for.
+        # A TensorRT session lists CUDAExecutionProvider as a fallback so a
+        # subgraph the EP cannot take still runs -- which also means that on a
+        # host with no TensorRT libraries the whole session silently becomes a
+        # CUDA one. It works, it is fast, and every record it produces is
+        # labelled "tensorrt". That is how a parity table can come to contain
+        # TensorRT numbers taken on a machine where libnvinfer was never
+        # installed. Recording what ORT chose makes the fallback visible in
+        # the artifact rather than only in a log line nobody kept.
+        active = list(self.session.get_providers())
+        fell_back = provider_name not in active
+        if fell_back:
+            logger.warning(
+                "%s was requested but onnxruntime is running this session on %s; "
+                "any measurement taken through it describes %s, not %s",
+                provider_name,
+                active[0] if active else "no provider",
+                active[0] if active else "no provider",
+                provider_name,
+            )
+
         self.info = BackendInfo(
             runtime="onnxruntime",
             runtime_version=ort.__version__,
             provider=provider_name,
+            active_providers=tuple(active),
+            provider_fell_back=fell_back,
             precision=precision,
             engine_path=engine_path,
             built_engine=built,
