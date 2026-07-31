@@ -326,9 +326,7 @@ class VideoEnhanceService:
             if callable(close):
                 try:
                     close()
-                except (
-                    Exception
-                ):  # noqa: BLE001 - one bad stage must not block the rest
+                except Exception:  # noqa: BLE001 - one bad stage must not block the rest
                     continue
 
     # -- introspection ----------------------------------------------------
