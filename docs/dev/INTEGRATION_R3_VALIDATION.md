@@ -17071,3 +17071,201 @@ Kopf), `readout.py`, `punkte.jsonl`, `decode_punkte.jsonl`,
    Referenz, um die Richtung der Abweichung zu klären.
 5. **FP8-Zweikarten: Kandidat (a)** — Ko-Belegung der fremden Karte durch zwei
    Prozesse.
+
+## #336: die zwei CPU-Posten des 332-Familien-Belegs als Code (CPU-only, 2026-07-31)
+
+Der Beleg oben lässt fünf Punkte offen. Zwei davon sind reine CPU-Arbeit und
+hier erledigt: der dritte V4-TP3-Stopper (offener Punkt 1) und die
+Kartenauflösung der Solo-Reserve (offener Punkt 3). Die drei GPU-Punkte
+(NEXTN-Accept, Ein-Karten-Referenz, FP8-Ko-Belegung) sind unten als
+Fahrprogramm formuliert, aber NICHT gefahren. Alles hier ist hermetisch
+getestet, keine Karte beteiligt.
+
+### Posten 1 — die Dequant-Lane greift jetzt auch auf dem nativen Rang
+
+Der #332-Wächter kennt nur EINE Lane-Form. `nvfp4_marlin_unpackable_reason`
+fragt, ob die UNGESHARDETE Breite die Marlin-Kachel 64 trifft, und
+`_maybe_dequantize_unpackable` steigt vorher aus, wenn der Rang gar kein Marlin
+benutzt („die native FP4-Lane hat keine Thread-Kachel; nichts, wovon
+zurückzufallen wäre"). Genau dieser Satz war falsch: die native Lane hat sehr
+wohl eine Geometriebedingung, nur eine andere, auf einer anderen Breite.
+
+| Lane | Bedingung | geurteilt auf |
+|---|---|---|
+| Marlin | `% 64` (Thread-Kachel) | UNGESHARDET (`layer.output_size`) |
+| nativ FP4 | `% 32` (Kernel-N) | GESHARDET (Partition dieses Rangs) |
+
+Daraus folgen die zwei Urteilsmomente, und das ist die einzige strukturelle
+Neuerung. `get_quant_method` sieht nur die ungeshardete Breite —
+`ColumnParallelLinear` rechnet `output_size_per_partition` erst, nachdem
+`LinearBase.__init__` zurückgekehrt ist —, also beantwortet der Aufruf dort
+Marlin, plus den nativen Fall, den kein Split retten kann. Der zweite Aufruf
+sitzt in `CompressedTensorsLinearMethod.create_weights`, wo die Shard-Breite
+zum ersten Mal existiert; dort tauscht der Wächter `layer.scheme` aus, bevor
+ein einziger Parameter angelegt wird. Weil `process_weights_after_loading` und
+`apply` dasselbe `layer.scheme` lesen, trägt der Tausch über die ganze
+Layer-Lebensdauer.
+
+**Die Asymmetrie zu Marlin ist Absicht und keine Nachlässigkeit.** Bei Marlin
+bleibt ein Shard, der die Kachel verfehlt, obwohl das Modul sie treffen könnte,
+ein LAUTER Fehler: der Shard-Planer des Forks coarsent Partitionen auf den
+Quantblock, ein Fehlschlag dort ist ein Planfehler und soll als solcher
+auffallen. Die native Lane hat keine solche Coarsening-Achse, und auf der
+Geometrie, die diesen Task ausgelöst hat, existiert überhaupt kein Plan. Die
+Rechnung steht im Docstring von `nvfp4_native_unpackable_reason` und ist die
+des Belegs: `n = 6 · floor(16 · r₀/Σr)`, `n % 32 == 0` verlangt `g % 16 == 0`,
+also alle sechzehn Dreiergruppen auf einem Rang. Ein geshardeter Fehlschlag auf
+der nativen Lane ist damit kein Plan, den man reparieren kann, sondern eine
+Lane, die man verlassen muss.
+
+Die drei Kartenmesspunkte 42/48/60 liegen als Fixtures im Test, zusammen mit
+der falsifizierten Vorhersage (64) — nicht aus Nostalgie, sondern weil die
+Falsifikation das Modell erzeugt hat und ein späterer Leser sonst wieder die
+naive Proportion hinschreibt.
+
+Zusätzlich bekommt `CompressedTensorsW4A4Fp4.create_weights` einen nativen
+Bypass-Wächter, spiegelbildlich zum Marlin-Zweig: ohne ihn erreicht eine
+illegale Breite `cutlass_scaled_fp4_mm` und der Lauf stirbt mitten in der
+Graph-Aufzeichnung an einem Kernel-Assert ohne Layernamen.
+
+**Erwartung fürs nächste Kartenfenster:** `grep -c DEQUANTISED` liefert **144**
+statt 96 — 48 GDN-Schichten auf ALLEN drei Rängen. Der Begründungstext
+unterscheidet sich pro Rang: die beiden Marlin-Ränge nennen die ungeshardete 96
+gegen die 64er-Kachel, TP0 nennt seine Shard-Breite gegen die 32. 96 heisst,
+die #336-Hälfte fehlt und TP0 stirbt wieder im ersten Forward. Der 96er-Pin für
+die sm86-Seite ist unverändert und im Test festgenagelt: 96 % 32 == 0, aber
+96 % 64 ≠ 0, also dequantisiert der Marlin-Rang dort, wo ein nativer Rang bei
+TP=1 es nicht täte.
+
+### Posten 2 — die Solo-Reserve las die kleinste Karte des Treibers
+
+Der Beleg nennt „NVML-Index 0". Der Mechanismus ist ein anderer und ein
+schlimmerer. `_apply_reserve_based_mem_fraction` rief
+`get_device_memory_capacity`, das über `get_nvgpu_memory_capacity` auf
+`nvidia-smi --query-gpu=memory.total` geht und **`min(memory_values)` über alle
+Karten zurückgibt, die der TREIBER auflistet**. `nvidia-smi` filtert nicht nach
+`CUDA_VISIBLE_DEVICES`; der Prozess war per UUID auf die 5090 gepinnt, die
+Antwort war trotzdem 20.480 MiB, weil das die kleinste Karte im Rechner ist.
+Auf einem homogenen Rig fällt das nie auf. Der Rückfallpfad
+(`_cuda_mem_fallback` über `torch.cuda.mem_get_info`) hätte die CVD-Sicht
+respektiert — er wird nur nicht erreicht, solange `nvidia-smi` antwortet.
+
+`get_device_memory_capacity` ist damit nicht kaputt: es ist bewusst das
+konservative „kleinste sichtbare Karte"-Helferlein für Heuristiken. Es war das
+falsche Werkzeug für ein exaktes Per-Karten-Budget. Der Fix ist deshalb lokal
+und lässt den Default-Pfad unangetastet: neu ist `_reserve_device_total_mib`,
+das den Total über NVML für die Karten liest, auf denen die Ränge dieses Knotens
+tatsächlich platziert sind (`_default_placement_gpu_ids`, die
+`base_gpu_id`/`gpu_id_step`-Formel), gebrückt von CUDA-Index auf NVML-Index über
+die PCI-Bus-Id — derselbe `_torch_to_nvml_gpu_index_mapping`, den der
+`--rank-gpu-id`-Pfad seit #68 benutzt. Nie ein nackter Index 0, nie ein Minimum
+über Karten, die der Prozess nicht sieht.
+
+Zwei Verweigerungen, beide laut:
+
+* **Nicht auflösbares Gerät** (kein NVML, keine Bus-Übereinstimmung) ist ein
+  Fehler. Der stille Rückfall auf die treiberweite Abfrage IST der Defekt;
+  dafür gibt es `_query_gpu_total_mib` als strikten Zwilling von
+  `_query_rank_gpu_memory_mib` (der darf auf Identität zurückfallen, weil
+  `--rank-gpu-id` physische Ids benennt).
+* **Karten mit verschiedenen Totalen unter einer skalaren Reserve** ist ein
+  Fehler. `mem_fraction_static` ist EINE Zahl, die auf jedem Rang gegen dessen
+  eigene Karte wirkt; „Total minus Reserve" kann nur auf einer davon exakt
+  sein. Wer heterogen fahren will, nimmt `--rank-gpu-id` mit einer Per-Rang-
+  Reserve.
+
+Die Falsifikator-Eigenschaft des Defekts steht als eigener Test drin, weil sie
+die Lehre ist: `(20480 − 2048)/20480 = 0,900000` ist **exakt** der
+`--mem-fraction-static`-Wert des Ankers. Der falsche Kartenwert erzeugt keine
+offensichtlich falsche Zahl, er erzeugt genau die Zahl, gegen die verglichen
+wurde — Pool byte-identisch 153.007, Gewichte identisch, freier VRAM identisch.
+Ein Messwerkzeug, das bei Fehlfunktion „unverändert" meldet, ist schlimmer als
+eines, das abstürzt. Der richtige Wert ist `(32607 − 2048)/32607 = 0,937191`,
+und die Differenz sind die ~39k Token, die der Beleg eingefordert hat.
+
+Die Dimensionierungszeile nennt jetzt zusätzlich die CUDA-Device-Ids, damit
+derselbe Defekt beim nächsten Mal aus dem Log lesbar ist statt aus einem
+Vergleich mit einem Ankerlauf.
+
+### Testzahlen
+
+| Suite | Basis | Jetzt |
+|---|---:|---:|
+| `test_nvfp4_dequant_fallback.py` | 26 | **46** |
+| `test_solo_reserve_sizing.py` | 18 | **28** |
+| `unit/layers/quantization` + `unit/server_args` + `unit/model_loader` | 699 passed | **729 passed**, 36 skipped |
+
+Failure-Set byte-identisch zur Basis: dieselben 6 Fehlschläge, alle „No
+accelerator" bzw. Engine-Start in `test_modelopt_loader.py`.
+`ruff --select F401,F821,UP037` sauber, `codespell` identisch zur Basis (die
+zwei bekannten deutschen Vorbefunde in `server_args.py`), `black` sauber.
+
+### Beigelegt, nicht gefahren: das GPU-Bündel (Posten 3-5)
+
+Ein Fenster, drei Arme, in dieser Reihenfolge — Arm A ist die Voraussetzung
+dafür, dass Arm B überhaupt eine Referenz hat, und Arm C ist unabhängig.
+
+**Arm A — NEXTN-auf-V4-Accept nach den Fixes (offener Punkt 2).**
+`scripts/nvfp4/v4_boot_proof.sh tp3` mit `NEXTN=1`, unverändertes Rezept
+(`--rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib
+3000,2700,2700`). Torreihenfolge: (1) bootet ARM 1 überhaupt — das ist die
+eigentliche #336-Abnahme; (2) `grep -c DEQUANTISED` == 144, 48 je Rang, und
+kein MLP-Layer in der Lane (Kosten ~16 MiB dicht über das ganze Modell, alles
+darüber ist ein Routingfehler); (3) erst dann die Accept-Länge. Erwartung
+deutlich über 1,0; Falsifikator ist **exakt 1,0052 bei 0 akzeptierten Drafts**
+— die Signatur eines Drafters auf uninitialisierten Gewichten, nicht eine
+Enttäuschung. Gelesen wird `meta_info.spec_accept_length`, nie
+`spec_ema_accept_len` (Mess-Falle, Memory „Spec-Acceptance-Messfalle").
+Kartenzeit ~8 min. Vorbedingung: ohne (1) und (2) ist (3) nicht interpretierbar
+— ein Boot, der die Dequant-Lane verfehlt, misst eine andere Konfiguration.
+
+**Arm B — Ein-Karten-Referenz für die zweikartige Divergenz (offener Punkt 4).**
+Der Familien-Nachläufer (a) ist ROT: ohne Radix-Cache reproduzieren sich beide
+Böden, und alle drei Prompts weichen ab `first_divergent_index = 1` ab. Was
+FEHLT, ist die Richtung. Der Beleg hält ausdrücklich fest, dass die
+Lane-Ausgaben wohlgeformter aussehen als die des Verbands (`alphabet`: Lane
+`w\nx\ny\nz\na\nb`, Verband `86, 326, 326, 320`), also ist die Annahme „der
+Verband ist die Wahrheit" ungeprüft. Rezept: dasselbe Vehikel
+(Llama-3.1-8B-Instruct), derselbe Prompt-Satz, dieselben Sampling-Parameter,
+`--disable-radix-cache`, aber TP=1 auf EINER Karte — und zwar zweimal, einmal
+auf der 5090 und einmal auf einer 3080, weil die Referenz sonst selbst eine
+Architektur-Annahme trägt. Drei-Wege-Vergleich: Verband vs. Lane vs. Referenz.
+Wer von der Referenz abweicht, ist die abweichende Seite. Kartenzeit ~10 min
+(zwei kurze Boots, 12 Token je Prompt, greedy). Die Boden-Tore (A-vs-A) müssen
+auch auf der Referenz grün sein, sonst ist der Vergleich VOID statt rot.
+
+**Arm C — FP8-Zweikarten-Ko-Belegung (offener Punkt 5).** Kandidat (b),
+Budgetmangel, ist tot: derselbe `torch.AcceleratorError: CUDA error: an illegal
+memory access was encountered` bei Lane-Pool 600 MiB wie bei 1000, mit
+Lane-Teil 6002 statt 7036 MiB auf der fremden Karte. Übrig ist Kandidat (a),
+die Ko-Belegung von `cuda:1` durch den Lane-Teil aus Rang-0s Prozess NEBEN dem
+Prozess von Rang 1. Das ist eine Hypothesenklasse, keine Hypothese, und sie
+zerfällt in drei Arme, die einzeln billig sind:
+
+* **C1 Ko-Belegung als solche.** Lane-Teil auf eine Karte legen, auf der KEIN
+  Verbandsrang läuft (drei Karten sind da; Lane-Teil auf die freie 3080,
+  Verband 5090 + andere 3080). Bleibt der Absturz, ist es nicht die
+  Ko-Belegung, sondern der Fremdkarten-Zugriff an sich — das trennt C1 von C2
+  in einem Boot.
+* **C2 Fremdkarten-Allokation aus dem falschen Prozess.** Zeigt sich, wenn C1
+  grün wird: dann ist das Muster „Prozess A alloziert auf `cuda:1`, während
+  Prozess B dort seinen Kontext hat". Nächster Schritt wäre `compute-sanitizer`
+  auf genau diesem Boot, nicht weiteres Raten.
+* **C3 Stream-/Kontext-Reihenfolge.** Der Absturz kommt NACH `lane 0 ready:
+  max_total_num_tokens=8200`, also nach Plan, Platzierung, Laden, Assembly und
+  Byte-Tor — der erste Forward ist der Verdächtige, nicht das Setup. Ein
+  EAGER-Boot (die Zweikarten-Lane erzwingt ihn ohnehin laut Kontraktzeile)
+  gegen einen Boot mit `--disable-cuda-graph` explizit trennt Graph-Capture von
+  Forward.
+
+Reihenfolge C1 → (C2 oder C3, je nach C1). Kartenzeit ~12 min. Die exakte
+Meldung und die Boot-Kontraktzeilen liegen in
+`/spinning/gpu-battery-results/2026-07-31_332_fam_beleg/logs/fp82_lowbudget.server.log`;
+die Hypothesenarme sind daraus formuliert, nicht geraten.
+
+Gesamt ~30 min Kartenzeit, plus die Regel „nach ZEIT begrenzen, Arbeitspunkt
+prefillen statt hineinwachsen". Vor dem Fenster gehört der VRAM-Korridor
+gerechnet (frei >= 400 MiB, Verschwendung <= 1,5 GiB netto), und die
+Kartenreihenfolge wird zur Laufzeit per NVML/UUID aufgelöst — nach #336 gilt
+das jetzt auch für die Reserve-Zeile, die ihre CUDA-Device-Ids selbst
+mitprotokolliert.

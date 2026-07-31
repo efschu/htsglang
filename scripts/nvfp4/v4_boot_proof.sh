@@ -84,19 +84,30 @@
 # script is the acceptance program for them. Every expectation below is
 # derived from the numbers the first run measured, so a miss is readable.
 #
-#   POSTEN 1 -- ARM 1 must now BOOT. A compressed-tensors NVFP4 layer whose
-#     UNSHARDED width misses the Marlin tile is loaded packed and materialised
+#   POSTEN 1 -- ARM 1 must now BOOT. A compressed-tensors NVFP4 layer with no
+#     form its rank's FP4 lane can serve is loaded packed and materialised
 #     dense at load instead of aborting. Expect, on EVERY rank, one warning
 #     line per affected layer:
-#       "NVFP4: layer '...linear_attn.in_proj_ba' has no Marlin form at any TP
-#        size (the unsharded output width is 96, ...) ... DEQUANTISED ..."
-#     Count them: 48 GDN layers x the number of MARLIN ranks. On this rig that
-#     is 96, not 144 -- MEASURED 2026-07-31, 48 on TP1 and 48 on TP2 and ZERO
-#     on TP0. The zero is correct and not a miss: the guard asks whether the
-#     unsharded width has a MARLIN form, and the 5090 rank does not use Marlin
-#     at all, it uses the native FP4 lane. The old "144" assumed three sm_86
-#     ranks, i.e. a different rig. More than 48 per Marlin rank means an MLP
-#     layer fell into the fallback and the VRAM figures below will be wrong.
+#       "NVFP4: layer '...linear_attn.in_proj_ba' has no form this rank's FP4
+#        lane can serve (...) ... DEQUANTISED ..."
+#     Count them: 48 GDN layers x THREE ranks = 144.
+#
+#     The count moved twice, so read the history before calling a miss.
+#     MEASURED 2026-07-31 under #332 alone: 96, i.e. 48 on TP1 and 48 on TP2
+#     and ZERO on TP0. That zero was correct at the time -- #332's guard asks
+#     only whether the UNSHARDED width has a MARLIN form, and the 5090 rank
+#     does not use Marlin, it uses the native FP4 lane. TP0 then died in its
+#     first forward instead, on the native lane's own condition
+#     (nvfp4_scaled_mm_kernels.cuh:81, "Expected n to be divisible by 32, but
+#     got n: 42"). #336 extends the verdict to that lane: it is judged on the
+#     SHARDED width, and on this checkpoint's GDN geometry no TP > 1 split
+#     satisfies it (n = 6 * floor(16 * r0/sum r), measured over three ratios
+#     as 42/48/60; n % 32 == 0 forces all 16 head groups onto one rank). So
+#     TP0 now takes the dequant lane too, and the expectation is 48 per rank
+#     on ALL ranks. The reason string differs by rank: the Marlin ranks name
+#     the unsharded 96 against the 64-tile, TP0 names its shard against 32.
+#     More than 48 per rank means an MLP layer fell into the fallback and the
+#     VRAM figures below will be wrong.
 #     Cost check: the dense b/a gates add ~16 MiB across the whole model.
 #     Anything larger is a routing bug, not a rounding difference.
 #
@@ -122,6 +133,15 @@
 #     to check afterwards. Note one interaction: on the mamba post-capture
 #     path the slack is floored by the pre-capture reserve, so a reserve below
 #     that floor stops buying tokens; the boot log names both.
+#     MEASURED 2026-07-31 and FIXED in #336: the first attempt at this arm was
+#     a silent no-op. The sizing line read the total via nvidia-smi, which
+#     minimises over every card the DRIVER lists and ignores the
+#     CUDA_VISIBLE_DEVICES pin below -- so a run resident on the 5090 sized
+#     itself against a 3080's 20,480 MiB, landed on fraction 0.900000 (by
+#     coincidence the anchor's own value) and reproduced 153,007 tokens
+#     exactly. The total now comes from NVML for the card the process is
+#     actually placed on. Sanity-check the sizing line: it prints the CUDA
+#     device ids and the NVML total, and that total must be the 5090's.
 #
 # USAGE
 #   scripts/nvfp4/v4_boot_proof.sh <arm>   with arm in {tp3,solo,both}
@@ -313,12 +333,14 @@ echo
 echo "=== what to read out of ${OUT} (expectations from the 2026-07-31 beleg) ==="
 echo "  1. grep -E 'fp4|nvfp4|marlin|backend' *_server.log"
 echo "     ARM 1 must show TWO different FP4 lanes across the three ranks."
-echo "  2. #332 posten 1 -- grep -c 'DEQUANTISED' v4_tp3_uneven_server.log"
-echo "     expected 96 on this rig (48 GDN layers x the TWO Marlin ranks), each"
-echo "     naming in_proj_ba and the unsharded width 96; the 5090 rank"
-echo "     contributes ZERO because it takes the native FP4 lane. Zero overall"
-echo "     means ARM 1 died the old death; more than 48 per Marlin rank means"
-echo "     an MLP layer fell into the dense lane."
+echo "  2. #332/#336 posten 1 -- grep -c 'DEQUANTISED' v4_tp3_uneven_server.log"
+echo "     expected 144: 48 GDN layers on EACH of the three ranks, all naming"
+echo "     in_proj_ba. The two Marlin ranks name the unsharded width 96"
+echo "     against the 64-tile, the 5090 rank names its SHARDED width against"
+echo "     the native lane's 32 (#336). 96 means the #336 half is missing and"
+echo "     TP0 will die in its first forward on 'n to be divisible by 32';"
+echo "     zero means ARM 1 died the old #332 death; more than 48 per rank"
+echo "     means an MLP layer fell into the dense lane."
 echo "  3. #332 posten 2 -- grep -E 'unloaded|accept' v4_tp3_uneven_server.log"
 echo "     expected: no #318 raise, zero unloaded draft parameters, and"
 echo "     meta_info.spec_accept_length well above 1.0. Exactly 1.0052 with"
