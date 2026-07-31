@@ -3983,6 +3983,60 @@ class ServerArgs:
             "0 disables the yield and leaves priority entirely to the stream.",
         ),
     ] = 2.0
+    dual_group_lane_pairing: A[
+        bool,
+        Arg(
+            help="Pairing objective of the two-class scheduler (#274 slice "
+            "D): reorder the lane's OWN job queue so an SM-saturating lane "
+            "grain (a long prefill) is not started while the serving group "
+            "is itself running an SM-saturating grain, preferring "
+            "saturating+non-saturating pairings instead (C3: decode-shaped "
+            "pairing E 1.440 vs prefill-shaped 1.130, the +9.7 %% traced to "
+            "SM compute competition; D1: +24.3 %% aggregate for the better "
+            "pairing). Work-conserving by construction: the policy picks a "
+            "different job, it never idles the lane and never serializes "
+            "(saturating+saturating concurrency still beats taking turns, "
+            "E 1.130 vs 0.974) and never touches the serving group's batch "
+            "composition. Rank-local: lanes exist on the shared rank only "
+            "and carry no communicator, so pairing decisions need no "
+            "cross-rank consensus. Off (the default) keeps the lane's FIFO "
+            "order byte-identical. Also toggleable at runtime via "
+            'set_internal_state {"dual_group_lane_pairing": true/false} for '
+            "single-boot A/B measurement.",
+        ),
+    ] = False
+    dual_group_lane_pairing_sat_rows: A[
+        int,
+        Arg(
+            help="Calibratable GEMM-row threshold above which one forward "
+            "counts as SM-saturating for --dual-group-lane-pairing. A "
+            "forward over R rows reuses each weight byte R times and turns "
+            "compute-bound near R = (gemm_flops/mem_bw)/(2/bytes_per_weight)"
+            " -- ~117 for bf16 weights on a 5090-class card, ~26 for Q3_K "
+            "GGUF. The default 64 sits between the two; the anchors that "
+            "matter (2048-row prefill chunks, <=16-row speculative decode "
+            "batches) are each an order of magnitude away from it.",
+        ),
+    ] = 64
+    dual_group_lane_pairing_stale_ms: A[
+        float,
+        Arg(
+            help="Staleness of the serving grain signal for "
+            "--dual-group-lane-pairing: a signal older than this means the "
+            "serving group stopped launching batches (idle/draining), and "
+            "an idle class saturates nothing. Serving iterations are "
+            "17-35 ms on the measured vehicle, so the default covers a few "
+            "of them.",
+        ),
+    ] = 100.0
+    dual_group_lane_pairing_max_defer_ms: A[
+        float,
+        Arg(
+            help="Starvation cap for --dual-group-lane-pairing: a queue "
+            "head skipped in favour of better-pairing jobs for longer than "
+            "this runs regardless of the pairing.",
+        ),
+    ] = 500.0
     dual_group_lane_lend_mib: A[
         int,
         Arg(
@@ -7607,6 +7661,17 @@ class ServerArgs:
                 )
             if self.dual_group_lane_max_requests < 1:
                 raise ValueError("--dual-group-lane-max-requests must be >= 1.")
+            if self.dual_group_lane_pairing and not self.dual_group_lane_concurrent:
+                raise ValueError(
+                    "--dual-group-lane-pairing needs "
+                    "--dual-group-lane-concurrent: in the serial mode the "
+                    "two classes take turns on one wall clock, so there is "
+                    "no pairing to decide."
+                )
+            if self.dual_group_lane_pairing_sat_rows < 1:
+                raise ValueError(
+                    "--dual-group-lane-pairing-sat-rows must be >= 1."
+                )
             self._validate_dual_group_lane_part_gpu_id()
             if self.dual_group_lane_spec:
                 if self.speculative_algorithm is None:
@@ -7665,6 +7730,10 @@ class ServerArgs:
         elif self.dual_group_lane_part_gpu_id is not None:
             raise ValueError(
                 "--dual-group-lane-part-gpu-id only applies with " "--dual-group-lane."
+            )
+        elif self.dual_group_lane_pairing:
+            raise ValueError(
+                "--dual-group-lane-pairing only applies with --dual-group-lane."
             )
 
         # ---------------------------------------------------------------

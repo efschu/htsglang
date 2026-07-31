@@ -2616,3 +2616,80 @@ gebaut, nicht als Anhaengsel.
    Eintrag mit einem rohen Namensschluessel am Akzessor vorbei. Er liegt
    nicht im Lane-Pfad, ist damit heute harmlos, und ist der naechste Ort,
    an dem dieselbe Frage gestellt werden muss, sobald er es doch tut.
+
+## 14. Slice D: Paarungs-Zielfunktion des Zwei-Klassen-Schedulers (feat/dual-group-slice-d, Basis cc522801e2)
+
+### 14.1 Empirische Basis (gepinnt, nicht neu erhoben)
+
+- C3 (§11.5): Decode-foermige Lane neben dem Verband E 1,440; 2048er-
+  Prefill-Lane E 1,130. Die +9,7 % der geschuetzten Klasse sind URSAECHLICH
+  SM-Compute-Konkurrenz (prefill_wait_ms 0,01 — nicht Praeemption, nicht der
+  Einreichpfad).
+- D1 (§12.3): die bessere Paarung ist +24,3 % Aggregat auf einer
+  unabhaengigen Lane-Konfiguration.
+- #284: der Verlust unter Last zerfaellt haelftig in SM-Konkurrenz
+  (cost_ratio 2,04 auf demselben Graph-Replay) und GIL-gebundene
+  Submissions-Luecke (occ 0,378 bei duty 1,0). Chunking lohnt nicht
+  (admission_wait 1,087 ms gegen 2-ms-Budget); feinere Koernung
+  verschlimmert die GIL-Haelfte.
+
+### 14.2 Klassifikation: GEMM-Zeilen, nicht Occupancy
+
+Ein Korn ist EIN Forward. Die billige, deterministische Sättigungsgroesse
+ist seine GEMM-Zeilenzahl R (Wiederverwendungen jedes Gewichtsbytes):
+compute-gebunden ab etwa R_sat = (gemm_flops/mem_bw) / (2/bytes_per_weight),
+~117 (bf16, 5090-Klasse) bzw. ~26 (Q3_K). Default-Schwelle 64, kalibrierbar
+(`--dual-group-lane-pairing-sat-rows`); die relevanten Anker (2048er-
+Prefill-Chunk, <=16-Zeilen-Spec-Decode) liegen je eine Groessenordnung von
+der Schwelle entfernt. Verband: extend -> extend_num_tokens; sonst
+bs x rows_per_seq (Spec-Verify-Zeilen einmalig bei Init eingerechnet).
+Lane-Job in der Queue: naechstes Korn = Ganz-Prompt-Prefill (len(input_ids));
+aktive Jobs decodieren mit <= steps+1 Zeilen und sind nie saettigend.
+
+Occupancy aus dem ShareMeter ist BEWUSST kein automatischer Input:
+(a) Stream-Occupancy ist Duty, nicht SM-Breite — #284 misst occ 0,975 fuer
+eine bs=1-Decode-Lane, die exzellent paart (E 1,44); (b) die Meter-Fenster
+richten die Policy im A/B — eine Policy, die auf ihren Richter konditioniert,
+selbstkonditioniert die Messung (dasselbe Prinzip, das das LaneShareGate
+report-only haelt). Die occ/cost-Zerlegung ist stattdessen die
+KALIBRIER-Evidenz: Messfenster berichten Labels neben den gemessenen Ratios.
+
+### 14.3 Policy: arbeitserhaltende Umordnung, nie Leerlauf
+
+Am Job-Pick der Lane (einmal je Job, nicht je Forward):
+1. Policy aus / triviale Queue: FIFO (byte-identisch zum bisherigen pop(0)).
+2. Verbands-Korn nicht saettigend (inkl. idle/stale >100 ms): FIFO — eine
+   saettigende Lane fuellt die Luecke am besten.
+3. Verbands-Korn saettigend: erster NICHT-saettigender Job in Queue-Reihen-
+   folge; ein laenger als max_defer_ms (Default 500) uebergangener Kopf
+   laeuft trotzdem (Starvation-Deckel).
+4. Alles saettigend: FIFO — sät+sät nebenlaeufig schlaegt seriell
+   (E 1,130 vs 0,974), vermeiden heisst umordnen, NIE serialisieren.
+
+Der Verbands-Batch wird nicht angefasst; das Signal ist ein Tupel-Store je
+run_batch (ServingGrainSignal, Staleness = Idle-Signal, kein Idle-Hook).
+
+### 14.4 Kollektiv-Relevanz: NEIN, mit Beleg
+
+Lanes existieren nur auf dem Shared-Rank (build_dual_group_lanes liefert
+ueberall sonst []) und tragen per Vertrag keinen Kommunikator. Die Policy
+ordnet ausschliesslich Lane-Jobs auf diesem einen Rank um; die
+Batch-Komposition des Verbands (das kollektiv Relevante) wird nur GELESEN.
+Ein #287-Konsens ist nicht erforderlich. Die einzige rangsichtbare Wirkung
+ist dieselbe wie bisher: Rank 0 tritt einem Kollektiv frueher oder spaeter
+bei (Admission-Yield, unveraendert gedeckelt).
+
+### 14.5 GIL-Haelfte
+
+Entscheidungen nur an Job-Grenzen (~einmal je 50-130 Forwards), Labels aus
+bereits vorhandenen Job-Feldern, ein Tupel-Store je run_batch. ZWISCHEN
+zwei Lane-Forwards kommt keine Zeile Python dazu; der eigentliche Traeger
+der Submissions-Luecke (Python IN _decode_step) bleibt der offene
+py-spy-Posten aus #284 und wird hier nicht angefasst (Koernungs-Warnung).
+
+### 14.6 Laufzeit-A/B
+
+set_internal_state {"dual_group_lane_pairing": true/false} flippt die
+Policy im Boot: Policy-an- und Policy-aus-Arm teilen Boeden und Captures,
+statt Boot-zu-Boot-Varianz zu tragen. Regression: Flag aus = FIFO-Trace
+byte-identisch (hermetisch gepinnt, 19 Tests in test_lane_pairing.py).
