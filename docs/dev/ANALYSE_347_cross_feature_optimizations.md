@@ -2,8 +2,18 @@
 
 Survey of optimizations that exploit crossings between existing subsystems,
 checked against the discard register (nothing re-proposed from it). Ordered
-by expected gain. Items 1, 2+3, 4 are registered as tasks; 5 folds into
-#344/#333-M3/#341; 6 is a later planner objective.
+by expected gain. All six items accepted 2026-07-31. Tasks: 1 -> #347,
+2+3 -> #348, 4 -> #349, 6 -> #350 (behind the current performance line);
+5 folds into #344/#333-M3/#341 as a design rule.
+
+Boundary note (what "rig-only" means, and why it is excluded): anything
+that turns a property of the development rig into a build-time assumption —
+fixed topology rules instead of the measured pair matrix, recipe constants
+(reserve floors, CTA caps, power sweet spots) as code defaults, static
+phase assignments ("the big card does prefill"), or gating features down
+because a lever shows nothing HERE. Rig-local facts stay measurement
+inputs (short-probe, comm suite, runbook recipes); mechanisms re-derive
+them on every machine.
 
 ## 1. Idle workbench — generalize the #341 tenant (task #347)
 
