@@ -19847,3 +19847,161 @@ sglang-Prozesse laufen auf der Kiste), py-spy-Dump vor dem Kill.
 4. `pool_stats_observer`-Refresh laesst den `_pool_stats_dcp_factor()` weg —
    auf der gewichteten Bahn Faktor 1, auf even-modulo-DCP um `dcp_size`
    falsch. Nur Metrik.
+
+## #354 Phasen-optimale Verteilung: harte TPS-Zahlen fuer FP8 und INT8-W8A8 (`probe/354-phase-optimal`, Basis 4d7e3b5864; Kartenfenster 2026-07-31, 17:59-18:47 UTC)
+
+Gemessen wurde, was als Standardrezept vorgesehen ist: pro Checkpoint-Format
+ein PREFILL-optimaler und ein DECODE-optimaler Gewichts-Split, beide in
+reinem tok/s, `s=1..8` (Prefill) und `bs=1..8` (Decode). Vier Boots, je 16
+Punkte, TP=3 uneven auf 5090 + 2x 3080, NEXTN 3/1/4, CUDA-Graphs an
+(`tick_cuda_graph=True` an allen 64 Punkten), `--enable-metrics` an jedem
+Boot. Kein Punkt hat einen OOM, NCCL-Fehler oder Traceback erzeugt.
+
+**Ein Boot pro Phase, nicht ein Boot mit Reshard.** Die Frage, ob #297
+(`/kv_reshard`, `--kv-reshard-vectors`) beide Phasen aus EINEM Boot messbar
+macht, ist mit Nein beantwortet, und zwar strukturell: #297 verschiebt den
+KV-TOKEN-Vektor, #330 (`--enable-vram-dial`) verschiebt das VRAM-Budget —
+der phasenoptimale Hebel ist aber der MLP-GEWICHTS-Vektor
+(`--rank-mlp-ratio`), und Gewichte bewegt zur Laufzeit keiner der beiden
+Aktuatoren. Also zwei Boots je Format.
+
+### Die vom Planner geloesten Vektoren (der Lane-Befund, in Zahlen)
+
+Der Planner gibt seinen Prefill-Optimalvektor auch dann aus, wenn er ihn
+ablehnt: die Absage aus `_no_lever_lines` benennt den besten VERWIRKTEN
+Kandidaten samt vorhergesagtem Prefill-Gewinn. Das ist die Zeile, aus der
+die beiden Vektoren unten stammen (`--rank-tp-ratio auto-performance
+--rank-perf-tune enc`, Plan-Logs unter `plan_*.txt`).
+
+| Format | GEMM-Lanes (TFLOPS) | Verhaeltnis | Prefill-optimaler Vektor | MLP-Units | Planner-Prognose |
+|---|---|---|---|---|---|
+| FP8 | 568,5 / 58,4 / 59,1 (native / Marlin / Marlin) | 9,73 : 1,00 : 1,01 | `16,1,1` | 121 / 8 / 7 | +22,9 % Prefill |
+| INT8-W8A8 | 676,7 / 183,8 / 164,8 (alle native `int8_scaled_mm`) | 3,68 : 1,00 : 0,90 | `10,1,1` | 113 / 12 / 11 | +9,1 % Prefill |
+
+Die Lane-Regel ist damit nicht nur bestaetigt, sondern beziffert: weil die
+3080er auf der INT8-Bahn nativ rechnen statt ueber Marlin, faellt das
+Lane-Verhaeltnis von 9,73 auf 3,68 — und der Planner loest daraufhin einen
+FLACHEREN Spitzenkandidaten (10,1,1 statt 16,1,1) mit weniger als der
+HAELFTE des vorhergesagten Gewinns. Den FP8-Vektor auf INT8 zu uebernehmen
+waere kein konservativer Fehler, sondern eine Ueberkonzentration auf eine
+Karte, deren Vorsprung so gross gar nicht ist.
+
+Decode-optimal ist fuer BEIDE Formate weiterhin der reine VRAM-auto-Split
+ohne MLP-Vektor — der #265-Befund, hier unveraendert reproduziert.
+
+### Die Zahlen (tok/s, vollstaendige Tabelle in `tabelle_354.txt`)
+
+Prefill, tok/s:
+
+| s | FP8 auto | FP8 zitiert (#327) | FP8 `16,1,1` | Delta | INT8 auto | INT8 zitiert (#327) | INT8 `10,1,1` | Delta |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1256,7 | 1310,7 | **1540,3** | +22,6 % | 1685,2 | 1657,5 | **1787,5** | +6,1 % |
+| 2 | 1269,6 | – | **1562,8** | +23,1 % | 1616,7 | – | **1641,6** | im Rauschen |
+| 3 | 1153,4 | – | **1461,9** | +26,7 % | 1479,7 | – | **1589,0** | +7,4 % |
+| 4 | 1167,9 | – | **1344,0** | +15,1 % | 1477,1 | – | **1496,2** | im Rauschen |
+| 5 | 1143,6 | – | **1336,0** | +16,8 % | 1415,6 | – | **1456,5** | im Rauschen |
+| 6 | 1141,1 | – | **1309,2** | +14,7 % | 1397,6 | – | **1464,7** | +4,8 % |
+| 7 | 1146,1 | – | **1302,2** | +13,6 % | 1436,5 | – | **1490,6** | +3,8 % |
+| 8 | 1133,4 | 1134,5 | **1322,5** | +16,7 % | 1389,7 | 1396,1 | **1483,6** | +6,8 % |
+
+Decode, tok/s (Tick-Rate des Schedulers, Median im Fenster):
+
+| bs | FP8 auto | FP8 zitiert | FP8 `16,1,1` | Delta | INT8 auto | INT8 zitiert | INT8 `10,1,1` | Delta |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **122,2** | 94,7 | 97,8 | −20,0 % | **112,0** | 124,1 | 119,6 | +6,8 % |
+| 2 | **165,1** | – | 130,7 | −20,8 % | **205,5** | – | 185,9 | −9,5 % |
+| 3 | **250,8** | – | 214,8 | −14,3 % | **235,8** | – | 243,2 | +3,1 % |
+| 4 | **310,7** | – | 248,5 | −20,0 % | **257,9** | – | 267,8 | +3,8 % |
+| 5 | **295,1** | – | 274,5 | −7,0 % | **301,1** | – | 341,0 | +13,3 % |
+| 6 | **341,5** | – | 325,9 | −4,6 % | **384,4** | – | 352,3 | −8,4 % |
+| 7 | **427,6** | – | 347,9 | −18,6 % | **376,7** | – | 418,5 | +11,1 % |
+| 8 | **447,3** | 379,9 | 372,1 | −16,8 % | **426,1** | 431,1 | 413,5 | −3,0 % |
+
+Fett = die Spalte, die ins Phasenrezept eingeht (Prefill aus dem
+konzentrierten Boot, Decode aus dem auto-Boot).
+
+Rauschboeden wiederverwendet, nicht neu gemessen: Prefill s=1 2,71 %,
+Prefill s>=2 3,18 %, Decode 2,72 %.
+
+**Was davon traegt und was nicht.** Der FP8-Prefill-Gewinn traegt: alle acht
+Punkte liegen zwischen +13,6 % und +26,7 %, um ein Vielfaches ueber dem
+Boden, und der Punkt s=1 (+22,6 %) trifft die Planner-Prognose (+22,9 %) auf
+0,3 Prozentpunkte. Der INT8-Prefill-Gewinn traegt schwaecher, aber
+gleichgerichtet: fuenf von acht Punkten ueber dem Boden, drei im Rauschen,
+alle acht positiv — passend zur kleineren Prognose (+9,1 %). Der
+FP8-Decode-VERLUST traegt ebenfalls: acht von acht Punkten negativ, −4,6 bis
+−20,8 %, ein systematisches Vorzeichen. Der INT8-Decode-Effekt traegt NICHT:
+die Vorzeichen wechseln (+6,8 / −9,5 / +3,1 / +3,8 / +13,3 / −8,4 / +11,1 /
+−3,0), Mittel rund +2 %, kein systematischer Trend. Bei n=1 pro Punkt ist
+das die Signatur von Streuung oberhalb des uebernommenen FP8-Bodens, nicht
+die eines Effekts; wer die INT8-Decode-Frage entscheiden will, braucht
+verschraenkte Wiederholungen.
+
+### Der Preis des Prefill-Vektors: KV-Kapazitaet und gestrandetes VRAM
+
+Der konzentrierte Vektor kauft Prefill-Tempo mit Kontext, und zwar nicht
+knapp:
+
+| Arm | `max_total_num_tokens` | frei 5090 | frei 3080 #0 | frei 3080 #2 |
+|---|---|---|---|---|
+| FP8 auto | 453 632 | 1573 MiB | 399 MiB | 1061 MiB |
+| FP8 `16,1,1` | 96 256 (−79 %) | 87 MiB | 6663 MiB | 8019 MiB |
+| INT8 auto | 464 256 | 1199 MiB | 171 MiB | 917 MiB |
+| INT8 `10,1,1` | 137 664 (−70 %) | 123 MiB | 5671 MiB | 6921 MiB |
+
+Zwei Befunde daraus, beide relevant fuer "soll das der Default werden":
+
+1. **Der Prefill-Vektor strandet VRAM auf den 3080ern.** 14,3 GiB (FP8) bzw.
+   12,3 GiB (INT8) liegen auf den beiden kleinen Karten brach, weil der
+   KV-Pool am knappsten Rang haengt und dieser Rang durch die Konzentration
+   auf die 5090 gewandert ist. Das ist ein registrierter Verschwendungsposten
+   weit ueber 1,5 GiB — und zugleich genau der Posten, fuer den #330
+   (Dial) und #297 (Reshard) gebaut sind. Der Server sagt es selbst:
+   `restart with SGLANG_UNEVEN_MLP_VECTOR=84,22,30 to raise the KV pool from
+   43622 to ~185735 tokens`.
+2. **Der VRAM-Korridor ist auf drei von vier Armen rot.** Unter 400 MiB frei:
+   FP8 `16,1,1` (87 MiB auf der 5090), INT8 auto (171 MiB auf einer 3080),
+   INT8 `10,1,1` (123 MiB auf der 5090); FP8 auto liegt mit 399 MiB exakt
+   auf der Kante. Die Boots liefen sauber durch, aber als Dauerbetriebspunkt
+   ist keiner dieser drei Arme im gruenen Bereich.
+
+Das Rezept ist damit sauber phasenspezifisch, nicht global: `16,1,1` bzw.
+`10,1,1` sind richtig fuer einen prefill-dominierten Arbeitspunkt und falsch
+fuer alles, was Kontext oder Decode-Durchsatz braucht.
+
+### sgl-kernel-Fenster (6.6) und Rollback
+
+Der INT8-Arm braucht den rig-lokalen Fork-Build. Ablauf, mit dem
+Diskriminator in beide Richtungen geprueft:
+
+| Schritt | Fork-Marker | PyPI-Marker |
+|---|---|---|
+| vor dem Fenster | 0 | 1 |
+| nach `pip install --force-reinstall --no-deps` des Fork-Wheels | 1 | 0 |
+| nach Rollback aus `/spinning/wt-327a-wheel/pre327-backup` | 0 | 1 |
+
+Das Hardware-Profil wurde VOR dem Top-up gesichert und danach zurueck
+kopiert; `md5sum` bestaetigt byte-identisch zum Vorzustand, die
+`int8_native`-Eintraege sind wieder weg. Damit ist die in 6.6 beschriebene
+Falle (ein Profil, das eine Lane nennt, die der installierte Kernel nicht
+kann) geschlossen.
+
+Karten ueber `/spinning/gpu-arb/` belegt (holder mit 120-s-Herzschlag) und
+freigegeben, `/tmp/gpu-card-{0,1,2}` gesetzt und geraeumt, am Ende alle drei
+Karten bei 0 MiB; py-spy-Dump vor jedem Kill, nur die eigene Prozessgruppe
+signalisiert.
+
+**Offen.**
+1. INT8-Decode unter `10,1,1` ist bei n=1 nicht entscheidbar (siehe oben).
+2. Der Rauschboden stammt aus FP8-Messungen; ob er fuer die INT8-Decode-Bahn
+   gilt, ist ungeprueft — die Streuung dort sieht groesser aus.
+3. Das gestrandete 3080-VRAM des Prefill-Vektors ist nicht zurueckgeholt
+   worden. Der naheliegende naechste Schritt ist `--enable-vram-dial` plus
+   ein KV-Reshard auf den vom Server selbst vorgeschlagenen Token-Vektor,
+   gemessen auf demselben Gewichts-Split.
+4. Der Planner LEHNT beide Prefill-Vektoren ab (`infeasible` / `unbootable`),
+   obwohl beide booten und liefern. Die Kapazitaetsprognose ist an diesem
+   Betriebspunkt negativ fuer einen Rang — auch fuer den Basis-Split, der
+   nachweislich laeuft. Solange das so ist, kann `auto-performance` das
+   Phasenrezept nicht selbst waehlen; es kennt den Vektor, darf ihn aber
+   nicht nehmen.
