@@ -31,7 +31,7 @@ component's docstring:
    be closed.
 
 **Not this layer.** #312's bounded peer liveness inside collectives watches
-*ranks* on NCCL/HTCCL; its failure mode is a hung all-reduce. This watches
+*ranks* on NCCL/barlink; its failure mode is a hung all-reduce. This watches
 *clients* on a socket. They share no code and never interact.
 
 ## 2. Audit: every long-lived attachment in the tree

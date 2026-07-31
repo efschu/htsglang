@@ -4,7 +4,7 @@
 # The recipe is 04_BETRIEB.md of the P2P handover, unchanged. It is GENERATED
 # into the run directory rather than pasted into two step scripts, so that
 #
-#   * the two arms of s12 differ in EXACTLY the three SGLANG_HTCCL* lines and
+#   * the two arms of s12 differ in EXACTLY the three SGLANG_BARLINK* lines and
 #     in nothing else -- which is the whole point of the comparison, and the
 #     one thing a hand-copied second command would eventually get wrong,
 #   * the script that actually ran is an artifact next to its result.
@@ -23,7 +23,7 @@ set -uo pipefail
 
 # bar1_write_boot_script <container path> <arm> <host log> <host pidfile> <port>
 #
-# arm = "bar1"       the three SGLANG_HTCCL* lines plus the driver header source
+# arm = "bar1"       the three SGLANG_BARLINK* lines plus the driver header source
 #       "grundlinie" none of them, everything else byte-identical
 bar1_write_boot_script() {
     local out="$1" arm="$2" hostlog="$3" hostpid="$4" port="$5"
@@ -50,16 +50,16 @@ bar1_write_boot_script() {
     #   BAR1_EXTRA_ENV   space separated VAR=VAL, prepended to the server env
     #   BAR1_EXTRA_ARGS  space separated server arguments, appended to the
     #                    launch command
-    local htccl_env="HTCCL_ENV=()"
+    local barlink_env="BARLINK_ENV=()"
     if [ "$arm" = "bar1" ]; then
-        htccl_env="HTCCL_ENV=(SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=bar1"
-        htccl_env="$htccl_env SGLANG_HTCCL_GRAPH_FREIGABE=1"
-        htccl_env="$htccl_env SGLANG_HTCCL_BAR1_NV_QUELLE=$hn)"
+        barlink_env="BARLINK_ENV=(SGLANG_BARLINK=1 SGLANG_BARLINK_TRANSPORT=bar1"
+        barlink_env="$barlink_env SGLANG_BARLINK_GRAPH_ENABLE=1"
+        barlink_env="$barlink_env SGLANG_BARLINK_BAR1_NV_SOURCE=$hn)"
     fi
     if [ -n "${BAR1_EXTRA_ENV:-}" ]; then
-        htccl_env="${htccl_env%)} ${BAR1_EXTRA_ENV})"
-        # The baseline arm's literal is "HTCCL_ENV=()" -- stripping the ")"
-        # above leaves "HTCCL_ENV=(", so the extras become the whole array.
+        barlink_env="${barlink_env%)} ${BAR1_EXTRA_ENV})"
+        # The baseline arm's literal is "BARLINK_ENV=()" -- stripping the ")"
+        # above leaves "BARLINK_ENV=(", so the extras become the whole array.
     fi
     local extra_args="EXTRA_ARGS=(${BAR1_EXTRA_ARGS:-})"
 
@@ -70,7 +70,7 @@ set -uo pipefail
 mkdir -p "$BAR1_HOST_LOGDIR"
 rm -f "$hostpid"
 cd $hw
-$htccl_env
+$barlink_env
 $extra_args
 PYTHONPATH=$hw/python:$hv/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=$hv/lib/python3.12/site-packages/nvidia/cu13/lib \\
@@ -79,7 +79,7 @@ SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 \\
 SGLANG_MAMBA_SSM_DTYPE=bfloat16 FLASHINFER_DISABLE_VERSION_CHECK=1 \\
 TORCH_EXTENSIONS_DIR=$hcache \\
 TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
-setsid env \${HTCCL_ENV[@]+"\${HTCCL_ENV[@]}"} \\
+setsid env \${BARLINK_ENV[@]+"\${BARLINK_ENV[@]}"} \\
   /spinning/miniforge3_local_install/bin/python3.12 -m sglang.launch_server \\
   --model-path $hm \\
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \\
@@ -278,7 +278,7 @@ bar1_require_integration() {
     local wt="${BAR1_HOST_WT:-$WT}" missing=""
     local f
     for f in \
-        "python/sglang/srt/distributed/device_communicators/htccl_bar1.py" \
+        "python/sglang/srt/distributed/device_communicators/barlink_bar1.py" \
         "benchmark/bar1_graph_check.py"
     do
         [ -f "$wt/$f" ] || missing="$missing $f"

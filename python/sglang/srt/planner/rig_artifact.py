@@ -626,7 +626,7 @@ def _fold_errors(errors: Sequence[ErrorSignature]) -> List[ErrorSignature]:
 
 
 def _group_of(m: Measurement) -> str:
-    """``comm/htccl_ucx/all_reduce/20KiB`` -> ``comm/htccl_ucx``. The unit the
+    """``comm/barlink_ucx/all_reduce/20KiB`` -> ``comm/barlink_ucx``. The unit the
     ``group_measurements`` rung collapses to."""
     parts = m.id.split("/")
     return "/".join(parts[:2]) if len(parts) > 2 else m.id

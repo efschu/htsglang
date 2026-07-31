@@ -476,7 +476,7 @@ def launch_config(
     }
     if chosen == "rdma":
         env["NCCL_IB_DISABLE"] = "0"
-    elif chosen in ("gloo-tcp", "htccl-ucx"):
+    elif chosen in ("gloo-tcp", "barlink-ucx"):
         env["NCCL_IB_DISABLE"] = "1"
 
     notes = []

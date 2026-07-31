@@ -38,7 +38,7 @@ _BINDINGS = (
     / "srt"
     / "distributed"
     / "device_communicators"
-    / "htccl_ucx_bindings.py"
+    / "barlink_ucx_bindings.py"
 )
 
 
@@ -135,7 +135,7 @@ class TestUcxNetDeviceReachesUcx(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("_htccl_net_dev", _BINDINGS)
+        spec = importlib.util.spec_from_file_location("_barlink_net_dev", _BINDINGS)
         cls.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.mod)
         try:

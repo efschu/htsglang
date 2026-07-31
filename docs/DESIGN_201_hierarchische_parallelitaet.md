@@ -195,7 +195,7 @@ PP + volle Decode-CUDA-Graphen.
 - `managers/scheduler_pp_mixin.py`: **0 Aenderungen**, taucht im Diff nicht auf.
 - `distributed/utils.py`: +1102 Fork-Zeilen, aber `grep -E '^[+-].*(get_pp_indices|PP_LAYER|pp_rank|pp_size)'`
   liefert **nichts** — die Fork-Additionen sind uneven-TP / `--rank-kv-ratio` / DCP-Solver.
-- `distributed/parallel_state.py`: +348 Zeilen, alles HTCCL und kv-session-offload; der
+- `distributed/parallel_state.py`: +348 Zeilen, alles barlink und kv-session-offload; der
   `_PP`-Block (`:2636-2654`) und `send_tensor_dict`/`recv_tensor_dict` sind unveraendert.
 - `models/llama.py`, `utils/common.py`: PP-Pfad unberuehrt.
 
@@ -311,20 +311,20 @@ Die direkte Antwort auf die Nutzer-Frage *"Draft-Modell auf welcher Stage? Verif
   Entscheidung "Graph-Plan ist pro Stage frei, aber die P2P-Formen sind vertraglich fixiert".
   **Letzteres ist der eigentliche Gewinn (§3.4) und sollte die gewaehlte Richtung sein.**
 
-### F) HTCCL-Transport-Registry — HARD CONFLICT heute, auf UCX loesbar
+### F) barlink-Transport-Registry — HARD CONFLICT heute, auf UCX loesbar
 
 Die Nutzer-Intuition (*"Stage-Grenze = neue Kommunikations-Klasse: Punkt-zu-Punkt statt Kollektiv"*)
 trifft exakt den kritischen Punkt.
 
 | Ebene | Implementierte Ops |
 |---|---|
-| `HTCCLCommunicator` (`htccl.py`) | `all_reduce:210`, `all_gather:281`, `reduce_scatter:317`, `all_gather_into_tensor:358`, `reduce_scatter_tensor:371`, `broadcast:382` |
-| `device`-Transport (`htccl_device.py:1086`) | `{all_reduce, all_gather, reduce_scatter, broadcast}` |
-| `shm` (`htccl_shm.py:169`) | `{all_reduce}` |
-| `ucx` (`feat/htccl-ucx-l2`, `htccl_ucx.py:153`) | `{all_reduce, all_gather, broadcast, reduce_scatter}` + async `:1046,1078,1100` |
+| `BarlinkCommunicator` (`barlink.py`) | `all_reduce:210`, `all_gather:281`, `reduce_scatter:317`, `all_gather_into_tensor:358`, `reduce_scatter_tensor:371`, `broadcast:382` |
+| `device`-Transport (`barlink_device.py:1086`) | `{all_reduce, all_gather, reduce_scatter, broadcast}` |
+| `shm` (`barlink_shm.py:169`) | `{all_reduce}` |
+| `ucx` (`feat/barlink-ucx-l2`, `barlink_ucx.py:153`) | `{all_reduce, all_gather, broadcast, reduce_scatter}` + async `:1046,1078,1100` |
 
 **Es gibt nirgends `send`/`recv`.** Und der P2P-Pfad des GroupCoordinators hat **keinen
-HTCCL-Zweig** (`parallel_state.py:1843-1869`):
+barlink-Zweig** (`parallel_state.py:1843-1869`):
 
 ```python
 def send(self, tensor, dst=None):
@@ -333,21 +333,21 @@ def send(self, tensor, dst=None):
     else: torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 ```
 
-Das ist **entscheidend**, denn wenn HTCCL an ist, wird pynccl **absichtlich nicht gebaut**
+Das ist **entscheidend**, denn wenn barlink an ist, wird pynccl **absichtlich nicht gebaut**
 (`parallel_state.py:564-573`, `should_build_pynccl` `:248`, Docstring `:259`: *"NCCL cannot span
-vendors."*). Eine PP-Stage-Grenze unter HTCCL faellt also auf `torch.distributed.send` auf dem
+vendors."*). Eine PP-Stage-Grenze unter barlink faellt also auf `torch.distributed.send` auf dem
 `device_group` durch — genau den NCCL/RCCL-Kommunikator, der cross-vendor nicht existieren kann.
-Ergebnis: Haenger oder Crash, **ohne** `_htccl_unsupported`-Guard, der es benennen wuerde.
+Ergebnis: Haenger oder Crash, **ohne** `_barlink_unsupported`-Guard, der es benennen wuerde.
 
 **Der Weg ist aber kurz:** die UCX-Bindings tragen bereits getaggtes send/recv —
-`htccl_ucx_bindings.py:307-312` (`ucp_tag_send_nbx`/`ucp_tag_recv_nbx`), gewrappt als `post_send:519`
+`barlink_ucx_bindings.py:307-312` (`ucp_tag_send_nbx`/`ucp_tag_recv_nbx`), gewrappt als `post_send:519`
 / `post_recv:532` / `wait:562`, heute nur private Plumbing der Kollektive
-(`htccl_ucx.py:441,452,472`). Es fehlt: ein `send`/`recv`-Seam-Op, Aufnahme in `HTCCL_OPS` (`:153`)
+(`barlink_ucx.py:441,452,472`). Es fehlt: ein `send`/`recv`-Seam-Op, Aufnahme in `BARLINK_OPS` (`:153`)
 und ein Dispatch-Zweig in `parallel_state.py:1843/1855`. **Das ist die einzige echte
 Neubau-Komponente des ganzen Vorhabens** — und sie ist zugleich der fehlende L2-Baustein aus
 [[nordstern-rdma-tp5]] (hierarchischer Transport).
 
-Nebenbefund: HTCCL wird heute fuer **jeden** GroupCoordinator mit `world_size > 1` konstruiert,
+Nebenbefund: barlink wird heute fuer **jeden** GroupCoordinator mit `world_size > 1` konstruiert,
 auch fuer die `"pp"`-Gruppe (`parallel_state.py:502-528`), und unterdrueckt dort pynccl — d. h. der
 Fehlmodus ist bereits scharf, nur unerreichbar, weil alle Fork-Features PP ablehnen.
 
@@ -385,7 +385,7 @@ Fehlmodus ist bereits scharf, nur unerreichbar, weil alle Fork-Features PP ableh
 | KV-Kapazitaet (`max_total_num_tokens`) | NEEDS PARAM — Welt-MIN → Gruppen-MIN + Reconciliation |
 | CUDA-Graph-Plan | NEEDS PARAM — zweistufige Verhandlung / P2P-Formvertrag |
 | Hibernate | NEEDS PARAM — trivial |
-| **HTCCL-Transport** | **HARD CONFLICT** — kein P2P; UCX-Bindings tragen es aber schon |
+| **barlink-Transport** | **HARD CONFLICT** — kein P2P; UCX-Bindings tragen es aber schon |
 | **Spec / MTP / Solo-Draft** | **HARD CONFLICT** — Verify ist ein Ein-Rang-Voll-Forward |
 | **Weightless-KV-Lane** | **HARD CONFLICT** — Praemisse ist die Negation von PP |
 
@@ -401,7 +401,7 @@ Fehlmodus ist bereits scharf, nur unerreichbar, weil alle Fork-Features PP ableh
 `embed_tokens` und `lm_head` je 1,27 GB (fp8).
 `layer_types`: `full_attention_interval=4` → **16 Full-Attention-Layer, 48 Linear-Attention (GDN)**.
 
-**Link** (40G RoCE, HTCCL/UCX L2, cross-rig, beide Richtungen live —
+**Link** (40G RoCE, barlink/UCX L2, cross-rig, beide Richtungen live —
 `/spinning/wt-ucx-l2/FEATURES_VS_UPSTREAM.md:600-660`):
 8 KiB all_reduce **26,5 us**, Barrier **5,2-5,5 us**, roher Link-RTT **~1,5 us**,
 `ucx_perftest` unidirektional 3413 MB/s = **27,3 Gbit/s**, 4 MiB-Peak 21,19 Gbit/s.
@@ -623,14 +623,14 @@ minimiere  max_s (bytes_s / B_s)   u.d.N.  bytes_s <= vram_s
 | `--rank-tp-ratio` | pro Stage, als Liste von Vektoren oder `pp_rank`-gekeyt | heute prozess-globaler Singleton (`utils.py:86`) |
 | `--rank-kv-ratio` | dito, pro Stage | |
 | `--stage-map` | Rang→Rig/Host-Zuordnung fuer cross-rig | erst ab V3 noetig; intra-Rig reicht `--rank-gpu-id` nach Lockerung von `server_args.py:5784` |
-| `SGLANG_HTCCL_PP_TRANSPORT` | P2P-Lane fuer die Stage-Grenze | `ucx` / `torch` (Default `torch` = heutiges Verhalten) |
+| `SGLANG_BARLINK_PP_TRANSPORT` | P2P-Lane fuer die Stage-Grenze | `ucx` / `torch` (Default `torch` = heutiges Verhalten) |
 
 ### 4.3 Guards (fail fast, nach dem Muster der acht existierenden Rejects)
 
 - `sum(pp_layer_ratio) == num_hidden_layers` und `len(...) == pp_size` (upstream hat das schon,
   `utils.py:1214-1216`) — plus: **jede Stage >= 1 Layer** und `num_hidden_layers >= pp_size`
   (`utils/common.py:1509`).
-- **HTCCL + `pp_size > 1` ohne P2P-Lane → harter Fehler mit Namensnennung**, statt des heutigen
+- **barlink + `pp_size > 1` ohne P2P-Lane → harter Fehler mit Namensnennung**, statt des heutigen
   stillen Durchfalls auf `torch.distributed.send` (§2F). Das ist der wichtigste neue Guard.
 - Spec/MTP, Weightless-Lane, kv-session-offload, Solo-Draft: **Rejects bleiben** (§2D, §2G2).
 - Der offene Sofort-Fix: blankes `--rank-tp-ratio` ohne `--rank-gpu-id` braucht einen
@@ -645,7 +645,7 @@ minimiere  max_s (bytes_s / B_s)   u.d.N.  bytes_s <= vram_s
 | **S0 — MESSUNG** | `pp_size=2` **intra-Rig**, stock, `SGLANG_PP_LAYER_PARTITION`, ohne jedes Fork-Feature, `--disable-overlap-schedule`, kein Spec. Misst τ0/τ1 empirisch, prueft das Modell aus §3.5, deckt die Upstream-Bruchstellen auf. | **null Zeilen** |
 | **S1** | `--pp-layer-ratio` als CLI + Planner (Bytes/Layer, §3.6); Hibernate-Keying (§2G3) | klein |
 | **S2** | uneven TP + uneven DCP **pro Stage** (Singletons → `pp_rank`-gekeyt) + KV-Kapazitaets-MIN auf Gruppenebene (§2A/B/C) | mittel |
-| **S3** | HTCCL-P2P-Lane ueber UCX (`send`/`recv`-Seam-Op + Dispatch in `parallel_state.py:1843/1855`) — **die einzige echte Neubau-Komponente** (§2F) | mittel |
+| **S3** | barlink-P2P-Lane ueber UCX (`send`/`recv`-Seam-Op + Dispatch in `parallel_state.py:1843/1855`) — **die einzige echte Neubau-Komponente** (§2F) | mittel |
 | **S4** | cross-rig PP=2 ueber RoCE; Graph-Plan zweistufig + P2P-Formvertrag (§2E) | mittel |
 | **S5** | PP x Spec/MTP — Verify als Pipeline-Rundreise (§2D) | gross, **zurueckstellen** |
 
@@ -658,7 +658,7 @@ minimiere  max_s (bytes_s / B_s)   u.d.N.  bytes_s <= vram_s
 | S0 Messung | **~0,5 Tag, kein Code** | sehr niedrig | **SOFORT, sobald die Karten frei sind** |
 | S1 Layer-Ratio + Planner | ~1-2 Tage | niedrig (Mechanismus existiert) | bauen, nach S0 |
 | S2 Per-Stage-Ratios + KV-Kapazitaet | ~3-5 Tage | mittel (drei Singletons + drei MIN-Reduces, [[geteilter-puffer-familie]]-Muster) | bauen, wenn S0 traegt |
-| S3 HTCCL-P2P-Lane | ~2-4 Tage | mittel (Bindings da, Semantik neu) | **eigenstaendig wertvoll** — auch ohne PP der fehlende L2-Baustein aus [[nordstern-rdma-tp5]] |
+| S3 barlink-P2P-Lane | ~2-4 Tage | mittel (Bindings da, Semantik neu) | **eigenstaendig wertvoll** — auch ohne PP der fehlende L2-Baustein aus [[nordstern-rdma-tp5]] |
 | S4 cross-rig PP | ~3-5 Tage | hoch (Graph/P2P-Vertrag, zwei Hosts) | erst nach S3 + S0-Zahlen |
 | S5 PP x Spec | ~2 Wochen+ | sehr hoch | **zurueckstellen** |
 
@@ -676,7 +676,7 @@ minimiere  max_s (bytes_s / B_s)   u.d.N.  bytes_s <= vram_s
    verkauft, verkauft es falsch. Als **Kapazitaets**-Feature ist es dagegen mit 4-20 ms/Token/GB
    gegen 167 ms/Token/GB (naives Host-Streaming) klar im Recht — und gegen das heutige cross-rig
    TP=4 gewinnt es sofort um 2,7-3,2x.
-3. **S3 (HTCCL-P2P) vorziehen und eigenstaendig rechtfertigen.** Es ist die einzige echte
+3. **S3 (barlink-P2P) vorziehen und eigenstaendig rechtfertigen.** Es ist die einzige echte
    Neubau-Komponente, es ist der als fehlend benannte hierarchische Transport aus
    [[nordstern-rdma-tp5]] (Leitplanke 4), und es macht cross-rig **ohne RDMA** tragbar (§3.5,
    Faktor 154 auf 1 GbE). Dieser Wert ist unabhaengig davon, ob PP je in Produktion geht.
@@ -724,7 +724,7 @@ Nachgeprueft, keine Abweichung zur Analyse aus Teil 1:
 | Prozessschnitt: ein Scheduler-Prozess je (pp_rank, tp_rank) | `entrypoints/engine.py` Spawn-Schleife, Platzierung `server_args.gpu_id_for_rank` |
 
 Der Transport ist weiterhin `torch.distributed.isend/irecv` auf dem NCCL-`device_group`,
-Metadaten gepicklet ueber gloo. **Kein HTCCL-P2P** — der Befund aus Teil 1 §2F steht
+Metadaten gepicklet ueber gloo. **Kein barlink-P2P** — der Befund aus Teil 1 §2F steht
 unveraendert und bleibt der Blocker fuer Slice 2 (Cross-Rig).
 
 ### 6.2 GDN/Hybrid x PP — das Verdikt
@@ -903,21 +903,21 @@ je Weltrang, und `apply_rank_memory_budget(tp_rank, pp_rank)` liest ihn dort
   (Teil 1 §2C) — unter uneven Layer-Split pinnt sie weiterhin alle Stages auf die tiefste.
   Das ist der groesste offene Posten von Slice 3.
 - `mamba_cache_per_req` bleibt global gerechnet (§6.2 Defekt 1).
-- Kein HTCCL-P2P, also kein Cross-Rig (Slice 2).
+- Kein barlink-P2P, also kein Cross-Rig (Slice 2).
 
 ## 8. Aufwand Slice 2 und Slice 3 — mit einer Korrektur an Teil 1
 
 ### 8.1 Slice 2 (Cross-Rig-Grenze) — deutlich billiger als Teil 1 §5 annahm
 
-Teil 1 hat den Cross-Rig-Schritt an S3 (HTCCL-P2P-Lane, 2-4 Tage) und S4 (3-5 Tage) gehaengt,
-weil HTCCL kein `send`/`recv` kennt. **Diese Kopplung gilt fuer die geplante Konfiguration
+Teil 1 hat den Cross-Rig-Schritt an S3 (barlink-P2P-Lane, 2-4 Tage) und S4 (3-5 Tage) gehaengt,
+weil barlink kein `send`/`recv` kennt. **Diese Kopplung gilt fuer die geplante Konfiguration
 nicht.**
 
-- Stage 1 auf Rig 2 ist zunaechst die **2080 Ti — eine NVIDIA-Karte**. HTCCL existiert fuer
+- Stage 1 auf Rig 2 ist zunaechst die **2080 Ti — eine NVIDIA-Karte**. barlink existiert fuer
   Cross-**Vendor**-Gruppen. Eine NVIDIA↔NVIDIA-Pipeline ueber die 40G-Strecke braucht kein
-  HTCCL, sondern faellt auf genau den Pfad, den PP ohnehin benutzt:
+  barlink, sondern faellt auf genau den Pfad, den PP ohnehin benutzt:
   `torch.distributed.isend/irecv` auf dem NCCL-`device_group`, Metadaten ueber gloo
-  (`parallel_state.py:1757-1880`). HTCCL wird nur konstruiert, wenn `SGLANG_HTCCL=1` gesetzt
+  (`parallel_state.py:1757-1880`). barlink wird nur konstruiert, wenn `SGLANG_BARLINK=1` gesetzt
   ist — fuer diesen Lauf wird es das nicht.
 - **Mehr-Knoten-PP ist bereits verdrahtet, ohne eine Zeile Neucode.**
   `entrypoints/engine.py:1547-1580 _calculate_rank_ranges`: bei `pp_size=2, nnodes=2` faehrt
@@ -940,7 +940,7 @@ Posten sind Integration und Betrieb, nicht Mechanismus:
    **nicht** mehr in den eager-Modus. Das ist der erwartete Groessenordnungs-Gewinn gegenueber
    dem heutigen cross-rig TP=4 und muss dort gemessen werden.
 
-Der HTCCL-P2P-Baustein (Teil 1 §2F) bleibt noetig — aber erst, wenn die **Vega 64** eine Stage
+Der barlink-P2P-Baustein (Teil 1 §2F) bleibt noetig — aber erst, wenn die **Vega 64** eine Stage
 tragen soll. Er ist damit von Slice 2 entkoppelt und behaelt seine eigenstaendige Begruendung
 aus [[nordstern-rdma-tp5]].
 
@@ -1087,8 +1087,8 @@ Message-Queue-Broadcaster, den Runbook §4.3 fuer cross-rig per
 `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0` abschaltet), danach stirbt Rang 0s Scheduler
 still in `init_distributed`, waehrend Rang 1 dauerhaft in `all_reduce` steht
 (py-spy: `distributed_c10d.py:3075`). Genau deshalb faehrt das cross-rig-TP=4-Rezept
-aus §4.3 auf HTCCL/UCX — und HTCCL ist host-gestaged, also eager. **Die Pipeline
-braucht weder den Broadcaster-Workaround noch HTCCL und behaelt ihre CUDA-Graphen.**
+aus §4.3 auf barlink/UCX — und barlink ist host-gestaged, also eager. **Die Pipeline
+braucht weder den Broadcaster-Workaround noch barlink und behaelt ihre CUDA-Graphen.**
 Der Grund ist strukturell: unter PP haelt jeder Knoten `tp_size=1`, also spannt nie
 eine TP-Gruppe ueber beide Hosts. Damit ist Teil 1 §0.6 ("PP gewinnt gegen das heutige
 cross-rig TP") auf diesem Rig nicht nur quantitativ, sondern qualitativ bestaetigt —
@@ -1174,7 +1174,7 @@ sich intra-rig entwickeln und mit einem Boot ueber `scripts/pp/pp_crossrig_launc
 gegenpruefen.
 
 Weiterhin begruendet ausserhalb Slice 3: PP x Spec/MTP (Teil 1 §2D) und die
-Weightless-KV-Lane (Teil 1 §2G2). Der HTCCL-P2P-Baustein bleibt an die **Vega 64**
+Weightless-KV-Lane (Teil 1 §2G2). Der barlink-P2P-Baustein bleibt an die **Vega 64**
 gebunden und ist von PP entkoppelt — Slice 2 hat bestaetigt, dass eine NVIDIA-NVIDIA-
 Pipeline ihn nicht braucht.
 

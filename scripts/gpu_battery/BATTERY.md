@@ -380,30 +380,30 @@ One standard run over the direct path, end to end. The question is **not**
 whether it boots.
 
 * **Precondition** s10 PASS. The BAR1 integration must be present in the
-  working tree under test (`htccl_bar1.py`, `benchmark/bar1_graph_check.py`),
+  working tree under test (`barlink_bar1.py`, `benchmark/bar1_graph_check.py`),
   otherwise STOP with a pointer to `BAR1_HOST_WT`.
 * **Command** `bash run_step.sh s11`
-* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `GRAPH_FREIGABE=1`
+* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `SGLANG_BARLINK_GRAPH_ENABLE=1`
   without that proof yields numbers from an operating point nobody can defend.
 * **Success** `check_s11_bar1_e2e.py`: all gate cases of the gate passed;
   `ACHIEVED=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two
   (`tp:0`, `dcp:0`), and one of them on gloo makes the run a mixed one (which
   happened exactly once and cost a whole measurement); per group one
-  `HTCCL-BAR1: setup in` line; smoke answer coherent (the numbers 1..20 in
+  `barlink-BAR1: setup in` line; smoke answer coherent (the numbers 1..20 in
   sequence, **counted**, not judged) and `spec_accept_length` a number; no
   OOM/NCCL/watchdog in the grepped log.
-* **The bolt as a special case** `htccl._select` aborts **loudly** instead of
+* **The bolt as a special case** `barlink._select` aborts **loudly** instead of
   silently falling back to the host-staged gloo layer under a graph capture.
-  As long as `all_gather` is missing from `htccl_bar1`, the standard run ends
+  As long as `all_gather` is missing from `barlink_bar1`, the standard run ends
   with
-  `RuntimeError: HTCCL: 'all_gather' with <n> bytes during a CUDA graph
+  `RuntimeError: barlink: 'all_gather' with <n> bytes during a CUDA graph
   capture ...`. The check reports that as its **own FAIL message** carrying
   `RIEGEL`, the operation and the size — correct behaviour of the code and a
   FAIL of this step at the same time. This is exactly the scenario the
   parallel BAR1 integration signs off.
 * **Not judged** the HEIGHT of `spec_accept_length`, the setup duration, any
   throughput.
-* **Artifacts** `s11_bar1_e2e/{bar1_e2e.json,graph_check.txt,htccl_lines.txt,smoke.json,server_info.json,server.log,remote_*.sh}`
+* **Artifacts** `s11_bar1_e2e/{bar1_e2e.json,graph_check.txt,barlink_lines.txt,smoke.json,server_info.json,server.log,remote_*.sh}`
 
 ### S12 — `s12_prefill_kurve` · sonnet · ~70 min · NOT repeatable
 
@@ -419,8 +419,8 @@ it.
   to back (A,B,A,B), then the next session count. Eight boots for four points
   per arm — that is the price of not comparing two different afternoons
   (measurement rule 5). Blockwise would be one boot per arm, and worthless.
-* **The arms differ in exactly three variables** (`SGLANG_HTCCL`,
-  `SGLANG_HTCCL_TRANSPORT`, `SGLANG_HTCCL_GRAPH_FREIGABE`, plus the driver
+* **The arms differ in exactly three variables** (`SGLANG_BARLINK`,
+  `SGLANG_BARLINK_TRANSPORT`, `SGLANG_BARLINK_GRAPH_ENABLE`, plus the driver
   source). Both boot scripts come from **one** template so they cannot drift
   apart; a test diffs them and allows exactly two lines of difference.
 * **What is measured** per arm and session count 1/4/8/16 one prefill point
@@ -432,7 +432,7 @@ it.
 * **Success** `check_s12_prefill_kurve.py`: one number in **both** arms per
   planned session count; the arms really did alternate (otherwise FAIL
   "blockwise"); **the transport proof per point** — bar1 points with all groups
-  on `ACHIEVED=bar1`, baseline points without a single HTCCL group; one decode
+  on `ACHIEVED=bar1`, baseline points without a single barlink group; one decode
   point per arm at bs=1 and bs=16; one persisted output sample per arm (a fast
   garbage run looks good in a throughput table); and the **baseline
   reproduces** the known numbers within `±5%`.

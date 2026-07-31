@@ -552,8 +552,8 @@ class Envs:
     SGLANG_PERF_DECODE_NONWEIGHT_FRACTION = EnvFloat(None)
     SGLANG_PERF_PREFILL_INVARIANT_FRACTION = EnvFloat(None)
 
-    # --- HTCCL: vendor-neutral host-staged collectives (task #117) ---------
-    # Route this group's TP collectives over HTCCL instead of NCCL. Needed
+    # --- barlink: vendor-neutral host-staged collectives (task #117) ---------
+    # Route this group's TP collectives over barlink instead of NCCL. Needed
     # when a TP group spans GPUs with no common device collective library
     # (mixed NVIDIA + AMD); also forceable on a homogeneous group, where it
     # exercises the identical code path (on P2P-less consumer cards NCCL
@@ -561,12 +561,12 @@ class Envs:
     # OFF by default -- with this unset the dispatch is byte-identical to
     # stock sglang.
     #
-    # RANK-UNIFORMITY: every SGLANG_HTCCL* variable below MUST be set to the
+    # RANK-UNIFORMITY: every SGLANG_BARLINK* variable below MUST be set to the
     # same value on every rank of the group. Divergence does not produce a
     # wrong answer, it deadlocks -- the transports agree on a per-chunk flag
     # protocol, and a rank that took a different branch never publishes the
     # flag its peers spin on.
-    SGLANG_HTCCL = EnvBool(False)
+    SGLANG_BARLINK = EnvBool(False)
     # Data plane: "device" (GPU-driven DMA + spin kernels, CUDA-graph
     # capturable), "host" (GPU-driven zero-copy over ONE pinned, portable
     # host segment -- two kernels per op, no host sync, also capturable),
@@ -574,42 +574,42 @@ class Envs:
     # or "ucx" (RDMA, multi-node; same host-staged semantics as gloo). The
     # CPU transports synchronize with the host and therefore require
     # --disable-cuda-graph.
-    SGLANG_HTCCL_TRANSPORT = EnvStr("device")
+    SGLANG_BARLINK_TRANSPORT = EnvStr("device")
     # #279 path dispatcher (skeleton): size/load-aware path choice with
     # saturation overflow. Default off; even when on, decisions fall back to
     # the status-quo #240 class choice until measured rate tables are loaded
     # (placeholder neutrality), so enabling it is byte-identical today.
-    SGLANG_HTCCL_PATH_DISPATCHER = EnvBool(False)
+    SGLANG_BARLINK_PATH_DISPATCHER = EnvBool(False)
     # Per-rank shared-memory slot size (MiB) for payload staging.
-    SGLANG_HTCCL_SLOT_MIB = EnvInt(64)
+    SGLANG_BARLINK_SLOT_MIB = EnvInt(64)
     # Chunk size (MiB) of the gloo data-plane pipeline.
-    SGLANG_HTCCL_CHUNK_MIB = EnvInt(8)
+    SGLANG_BARLINK_CHUNK_MIB = EnvInt(8)
     # Chunk size (MiB) of the device transport's dual-stream pipeline.
     # Unset -> calibrated at startup (a collective sweep; see the
     # rank-uniformity note above -- set it on all ranks or on none).
-    SGLANG_HTCCL_PIPE_CHUNK_MIB = EnvStr(None)
+    SGLANG_BARLINK_PIPE_CHUNK_MIB = EnvStr(None)
     # Upcast half dtypes to fp32 for the gloo-plane reduction, to match
     # NCCL numerics.
-    SGLANG_HTCCL_FP32_REDUCE = EnvBool(True)
+    SGLANG_BARLINK_FP32_REDUCE = EnvBool(True)
     # RS+AG chunk-ownership weights for world >= 3 ("a,b,c", one positive
     # integer per rank). Unset -> measured from per-rank slot DMA bandwidth
     # at startup, so a slow PCIe link owns fewer reduce-scatter chunks.
-    SGLANG_HTCCL_RSAG_SHARES = EnvStr(None)
+    SGLANG_BARLINK_RSAG_SHARES = EnvStr(None)
     # --- host transport (pinned portable host memory, GPU-driven) ----------
-    # Per-rank staging slot (MiB). Unset -> inherit SGLANG_HTCCL_SLOT_MIB, so
+    # Per-rank staging slot (MiB). Unset -> inherit SGLANG_BARLINK_SLOT_MIB, so
     # there is one knob for the common case and a second only when the host
     # transport should differ. The segment holds TWO slots per rank (the
     # double buffering that removes a third kernel from every collective),
     # so it costs 2 x world x this.
-    SGLANG_HTCCL_HOST_SLOT_MIB = EnvStr(None)
+    SGLANG_BARLINK_HOST_SLOT_MIB = EnvStr(None)
     # Per-ordered-pair send/recv buffer (MiB), also double-buffered. 0
     # disables point-to-point, and the transport then DECLINES send/recv in
     # handles() rather than discovering the missing buffer later.
-    SGLANG_HTCCL_HOST_P2P_MIB = EnvInt(4)
+    SGLANG_BARLINK_HOST_P2P_MIB = EnvInt(4)
     # Grid width of the host transport's two data kernels. Its payloads are
     # latency-bound; more blocks buy nothing below ~1 MiB and cost tail
     # latency. Rank-uniform like every knob in this block.
-    SGLANG_HTCCL_HOST_BLOCKS = EnvInt(32)
+    SGLANG_BARLINK_HOST_BLOCKS = EnvInt(32)
     # --- ucx transport (RDMA data plane) -----------------------------------
     # Which libucp to load. Unset -> the system "libucp.so.0". Point this at a
     # side-by-side install to satisfy the transport's version-parity check
@@ -619,43 +619,43 @@ class Envs:
     # Mixed releases are REJECTED at rendezvous -- UCX's UCP wire address
     # format is not compatible across them and fails as "invalid bandwidth
     # 0.00".
-    SGLANG_HTCCL_UCX_LIB = EnvStr(None)
+    SGLANG_BARLINK_UCX_LIB = EnvStr(None)
     # Largest single UCX transfer (MiB). Chunks of one collective step are
     # posted and progressed together, so this caps per-request footprint
     # without costing extra round trips.
-    SGLANG_HTCCL_UCX_CHUNK_MIB = EnvInt(4)
+    SGLANG_BARLINK_UCX_CHUNK_MIB = EnvInt(4)
     # all_reduce payload (KiB) at or above which the one-step flat exchange
     # gives way to a ring. Below it latency beats bandwidth; above it the
     # flat exchange's (W-1) payloads per direction dominate. Measured
     # crossover on a cross-rig world-4 group is ~22 KiB (task #244), so a
     # speculative verify all-reduce sits on the ring side and a bs=1 decode
     # all-reduce on the flat side.
-    SGLANG_HTCCL_UCX_RING_KIB = EnvInt(24)
+    SGLANG_BARLINK_UCX_RING_KIB = EnvInt(24)
     # Deprecated MiB spelling of the same threshold; still honoured, and it
     # wins when both are set.
-    SGLANG_HTCCL_UCX_RING_MIB = EnvInt(None)
+    SGLANG_BARLINK_UCX_RING_MIB = EnvInt(None)
     # Same switch for all_gather (KiB); 0 disables the ring entirely. This
     # ring saves no bytes -- the flat exchange already moves the (W-1) * n
     # every rank must receive, in one round trip -- but it saves the single
     # UCX worker per rank from progressing 2(W-1) simultaneous requests.
     # Measured crossover cross-rig at world 4 is ~32 KiB (task #263), so a
     # bs=1 decode gather stays flat and a 4-token verify gather rings.
-    SGLANG_HTCCL_UCX_AG_RING_KIB = EnvInt(32)
+    SGLANG_BARLINK_UCX_AG_RING_KIB = EnvInt(32)
     # Largest host-side pass in elements that stays on the calling thread;
     # above it torch dispatches a CPU->CPU copy_/add_ through at::parallel_for.
     # Co-located TP ranks enter their host passes together, so the OpenMP
     # region's join lands on a descheduled thread and the 128 -> 256 KiB step
     # cost milliseconds (task #263). 0 restores the unchunked passes.
-    SGLANG_HTCCL_UCX_GRAIN_ELEMS = EnvInt(32768)
+    SGLANG_BARLINK_UCX_GRAIN_ELEMS = EnvInt(32768)
     # Seconds before a pending UCX request is declared stuck. Guards against
     # a silent hang when a peer dies or the ranks disagree about the
     # collective sequence.
-    SGLANG_HTCCL_UCX_TIMEOUT_S = EnvInt(300)
+    SGLANG_BARLINK_UCX_TIMEOUT_S = EnvInt(300)
     # Overlap the MLP all-reduce with the layer boundary: issue it
     # asynchronously at down_proj, complete it in the next layer's
     # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
     # transport; rank-uniform like every other flag in this block.
-    SGLANG_HTCCL_UCX_OVERLAP = EnvBool(False)
+    SGLANG_BARLINK_UCX_OVERLAP = EnvBool(False)
     # Number of independent UCX contexts/workers per rank for the collective
     # plane (task #266). 2 splits the flat exchange's peers over the two
     # workers by the symmetric (rank + peer) % ways rule, so no rank has all
@@ -667,17 +667,17 @@ class Envs:
     # strictly so than most: a rank that disagrees posts where nobody is
     # listening, which hangs rather than returning a wrong answer. Checked at
     # rendezvous before any endpoint exists.
-    SGLANG_HTCCL_UCX_WORKERS = EnvInt(1)
+    SGLANG_BARLINK_UCX_WORKERS = EnvInt(1)
     # Additionally run the RING half each way round, one direction per worker
     # (needs ..._WORKERS >= 2). Measured negative on this link -- a ring step
     # is two requests in lock step, so there is no concurrency for a second
     # worker to expose, and halving the bytes per hop buys nothing where the
     # bytes were never the cost (task #244). +17 % on an 80 KiB all_reduce.
     # Kept as the A/B control and for links where the bytes DO dominate.
-    SGLANG_HTCCL_UCX_RING_BIDIR = EnvBool(False)
+    SGLANG_BARLINK_UCX_RING_BIDIR = EnvBool(False)
     # --- peer liveness for the collective family (task #312) ---------------
     # A rank that dies leaves its peers spinning: the gloo cpu_group every
-    # HTCCL handshake runs on is built with a hardcoded 7200 s timeout, and
+    # barlink handshake runs on is built with a hardcoded 7200 s timeout, and
     # the BAR1 spin kernels carry only a rank-local cycle deadline whose
     # expiry writes a status word nothing reads. These four knobs bound both
     # sides. 0 restores the previous, unbounded behaviour exactly.
@@ -685,18 +685,18 @@ class Envs:
     # Rank-uniform like the rest of this block, and more strictly so than
     # most: the deadline decides WHEN a rank gives up, and ranks that give up
     # minutes apart turn one clean group failure into a cascade.
-    SGLANG_HTCCL_PEER_LIVENESS = EnvBool(True)
+    SGLANG_BARLINK_PEER_LIVENESS = EnvBool(True)
     # Seconds a host-side wait may make no progress before it gives up. Scaled
     # by SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT while the cold-build window is
     # open, so a first boot on an empty kernel cache does not trip it.
-    SGLANG_HTCCL_PEER_TIMEOUT_S = EnvFloat(120.0)
+    SGLANG_BARLINK_PEER_TIMEOUT_S = EnvFloat(120.0)
     # How often a stalled wait, and the watchdog thread, may ask whether the
     # peer processes still exist. One kill(pid, 0) per peer, ~1 us.
-    SGLANG_HTCCL_PEER_PROBE_S = EnvFloat(1.0)
+    SGLANG_BARLINK_PEER_PROBE_S = EnvFloat(1.0)
     # Whether the watchdog thread runs. It is what ends a DEVICE-side spin:
     # no host code runs inside a captured graph replay, so somebody outside
     # the collective has to write the abort word the kernels poll.
-    SGLANG_HTCCL_PEER_WATCHDOG = EnvBool(True)
+    SGLANG_BARLINK_PEER_WATCHDOG = EnvBool(True)
 
     # --- per-message-class link selection (task #240) ----------------------
     # Env spelling of --collective-net-small / --collective-net-bulk. Set
@@ -704,13 +704,13 @@ class Envs:
     # the variable carry the same value, and a value already present in the
     # environment is never overwritten.
     #
-    # NOT rank-uniform, unlike the SGLANG_HTCCL* block above: the value is a
+    # NOT rank-uniform, unlike the SGLANG_BARLINK* block above: the value is a
     # local device NAME, and the two ends of a link are normally called
     # different things (rocep4s0f1 on one host, rocep1s0f1 on the other).
     # What must match is the wire, not the string.
     #
-    # SMALL pins the HTCCL UCX collective context (small AND large TP
-    # collectives -- they share one context, see htccl_ucx.py), BULK reaches
+    # SMALL pins the barlink UCX collective context (small AND large TP
+    # collectives -- they share one context, see barlink_ucx.py), BULK reaches
     # the transfers that have a transport of their own: PD-KV / HiCache, by
     # seeding --disaggregation-ib-device when that is unset. On a host with
     # one line both are pointless; the payoff is a host with two, where a

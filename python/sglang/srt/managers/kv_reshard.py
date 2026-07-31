@@ -596,7 +596,7 @@ def _dist_exchange(device_group, device):
     """
     import torch.distributed as dist
 
-    from sglang.srt.distributed.device_communicators.htccl_liveness import (
+    from sglang.srt.distributed.device_communicators.barlink_liveness import (
         bounded_collective,
     )
 

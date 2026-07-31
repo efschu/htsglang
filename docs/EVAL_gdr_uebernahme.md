@@ -70,7 +70,7 @@ the handover correctly calls out as the fairness condition.
 Consequence that matters for adoption: **`stage` is the staging shape of *this
 benchmark*, not the staging shape of our engine.** It is one blocking
 `cuMemcpyDtoH` plus one blocking `cuMemcpyHtoD` per message, on a buffer that
-CUDA sees as pageable. Neither NCCL's SHM transport nor our HTCCL transports
+CUDA sees as pageable. Neither NCCL's SHM transport nor our barlink transports
 work that way.
 
 ### 1.2 Correction A — "intra-rig" means NIC loopback
@@ -213,7 +213,7 @@ by 2.4-2.6x as soon as a second flow shares the NIC.
 
 **Answer to the vehicle question: NCCL's own dmabuf path is dead on this
 hardware, and the intra-rig opportunity is structurally outside what NCCL would
-choose to do anyway.** If it is to be had, HTCCL is the only vehicle.
+choose to do anyway.** If it is to be had, barlink is the only vehicle.
 
 There is exactly one cheap way to falsify point 3 before writing any code, and it
 belongs in the GPU window (§9, item **W2**):
@@ -226,22 +226,22 @@ and read the transport line. If NCCL announces `[send] via NET/IB/0/GDRDMA`, the
 capability is reachable with zero lines of our code. Expected outcome given
 points 1-2: it announces a host-buffered NET path or fails to find a net device.
 
-### 2.2 Vehicle (b): HTCCL — the seam is ready, and it is not where the briefing assumed
+### 2.2 Vehicle (b): barlink — the seam is ready, and it is not where the briefing assumed
 
 The transport seam is real and documented as an extension point
-(`python/sglang/srt/distributed/device_communicators/htccl.py:67-80`,
+(`python/sglang/srt/distributed/device_communicators/barlink.py:67-80`,
 *"Adding a transport … is one registry entry plus its module; no dispatch site
 changes"*). Concretely a `dmabuf_rdma` transport is:
 
 | step | location |
 |---|---|
-| registry entry | `htccl.py:112-120` `TRANSPORT_REGISTRY` |
-| factory | beside `_make_ucx_transport`, `htccl.py:103-108` |
-| module | new file next to `htccl_ucx.py`, exposing `handles(op, nbytes)` + the four collectives |
-| size dispatch | `HTCCLCommunicator._select(op, nbytes)`, `htccl.py:173-183` — the *only* dispatch shape; per-transport predicate `handles()` |
-| graph capture | add to `CAPTURABLE_HTCCL_TRANSPORTS`, `parallel_state.py:232`, only if there is no host sync; otherwise `_enforce_cpu_transport_needs_eager` (`parallel_state.py:235-258`) correctly forces eager |
-| GPU-side reduce | template exists: `htccl_add_kernel` in `htccl_device.py` `_CUDA_SRC`, and `flat.add_(peer_dev)` at `htccl_shm.py:227` |
-| what disappears | `_slot`/`_staging` (`htccl_ucx.py:681-726`), `_staged_copy`/`_staged_add` (`:823-859`), `_h2d_async`/`_slot_guard` (`:764-810`) |
+| registry entry | `barlink.py:112-120` `TRANSPORT_REGISTRY` |
+| factory | beside `_make_ucx_transport`, `barlink.py:103-108` |
+| module | new file next to `barlink_ucx.py`, exposing `handles(op, nbytes)` + the four collectives |
+| size dispatch | `BarlinkCommunicator._select(op, nbytes)`, `barlink.py:173-183` — the *only* dispatch shape; per-transport predicate `handles()` |
+| graph capture | add to `CAPTURABLE_BARLINK_TRANSPORTS`, `parallel_state.py:232`, only if there is no host sync; otherwise `_enforce_cpu_transport_needs_eager` (`parallel_state.py:235-258`) correctly forces eager |
+| GPU-side reduce | template exists: `barlink_add_kernel` in `barlink_device.py` `_CUDA_SRC`, and `flat.add_(peer_dev)` at `barlink_shm.py:227` |
+| what disappears | `_slot`/`_staging` (`barlink_ucx.py:681-726`), `_staged_copy`/`_staged_add` (`:823-859`), `_h2d_async`/`_slot_guard` (`:764-810`) |
 
 **Correction to the briefing's premise:** #240's `--collective-net-small` /
 `--collective-net-bulk` are **not** a size switch. They are NIC pinning
@@ -253,17 +253,17 @@ carries both — and specifies what a genuine per-class split needs: a second
 worker, a second address exchange at rendezvous, a size-keyed selector, and a
 guarantee that all ranks pick the same worker for the same collective, ~200 LoC
 plus a cross-rig validation pass. The size hook for `dmabuf_rdma` is therefore
-`_select` + `handles`, and `htccl_shm.py:171-173` is the one existing
+`_select` + `handles`, and `barlink_shm.py:171-173` is the one existing
 size-conditioned `handles` to copy from.
 
-**Hazard to design around, stated in-tree** (`htccl_ucx.py:144-152`): a
+**Hazard to design around, stated in-tree** (`barlink_ucx.py:144-152`): a
 size-keyed `handles` is only safe when the payload size is rank-uniform, or ranks
 diverge and the group deadlocks instead of returning a wrong answer. `all_reduce`
 and `broadcast` are uniform; `all_gather`/`reduce_scatter` under uneven TP are
 padded to equal shapes first and are uniform only *after* the pad.
 
 Also to be overturned, not merely edited: the design rationale at
-`htccl_ucx.py:14-19` — *"There is deliberately no GPUDirect: this hardware has no
+`barlink_ucx.py:14-19` — *"There is deliberately no GPUDirect: this hardware has no
 P2P between the NIC and the GPUs … staging through the host is not a
 simplification, it is the only path that exists."* The handover falsifies the
 premise of that sentence. It is also the natural anchor for a future
@@ -444,7 +444,7 @@ Two independent blockers, one of them already codified in our own code.
 
 Small, bounded, no allocator-wide blast radius, no interaction with graph
 capture, and the 2 MiB granularity is irrelevant for a pool. The buffers it would
-replace are named and localised: `htccl_ucx.py:681-722` (`_slot`, pinned
+replace are named and localised: `barlink_ucx.py:681-722` (`_slot`, pinned
 `torch.empty(..., pin_memory=True)`), keyed per `(key, numel, dtype)` and cached
 for the transport's lifetime — i.e. **already a static pool**, which means MR
 registration cost is paid once at rendezvous and amortised to zero.
@@ -582,9 +582,9 @@ vendored.** Concretely, and idiomatic for this fork:
 1. Do **not** copy the NVIDIA headers into the tree. Version drift against the
    installed driver is a correctness hazard (wrong ioctl struct layout is a
    silent memory bug), not just a licence question.
-2. Follow the existing HTCCL pattern rather than inventing a build step: the
+2. Follow the existing barlink pattern rather than inventing a build step: the
    `device` transport already JIT-compiles its native code at runtime with
-   `torch.utils.cpp_extension.load_inline` (`htccl_device.py:822-875`) and needs
+   `torch.utils.cpp_extension.load_inline` (`barlink_device.py:822-875`) and needs
    no build system. A `dmabuf_rdma` helper can do the same, taking the header
    path from an env var (e.g. `SGLANG_DMABUF_RDMA_OGKM_INCLUDE`).
 3. Absent headers, absent `-open` driver, or absent `ibv_reg_dmabuf_mr` -> the
@@ -623,7 +623,7 @@ and portable *before* anyone builds on it, and the ReBAR asymmetry of this rig
 gets recorded rather than rediscovered. No GPU window.
 
 **P2 — a comm-suite arm that measures the crossover per rig.** Template is
-`_arm_collective_htccl_ucx` (`comm_suite.py:780-801`); it shells out to
+`_arm_collective_barlink_ucx` (`comm_suite.py:780-801`); it shells out to
 `link_collective_cost.py` with `--op` and `--sizes`. Add a `gdr_crossover` arm
 (kind `network`) that runs the handover's binary across the size ladder and
 reports the crossover point as a rig property. Value: turns "GDR is bad at 1 MiB"
@@ -635,7 +635,7 @@ differently. Small GPU window.
 whole large-message verdict; O3 closes the NCCL vehicle question with evidence
 instead of inference. **These two decide whether P4 is ever worth opening.**
 
-**P4 — build a `dmabuf_rdma` HTCCL transport. NOT NOW.** Only if O1 shows the
+**P4 — build a `dmabuf_rdma` barlink transport. NOT NOW.** Only if O1 shows the
 crossover moving past 64 KiB on a ReBAR target, *and* O3 confirms NCCL will not
 do it for us. Then: VMM staging pool per route (b) + registry entry + module +
 size-keyed `handles` respecting the rank-uniformity hazard. Estimated well north

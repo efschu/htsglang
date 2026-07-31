@@ -268,8 +268,8 @@ MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
     # Derselbe Dispatch-Vertrag wie deepep, Transport ueber den
-    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_HTCCL=1
-    # und SGLANG_HTCCL_TRANSPORT=bar1|matrix; ohne das meldet sich die
+    # BAR1-Direktpfad (token_dispatcher/bar1ep.py). Braucht SGLANG_BARLINK=1
+    # und SGLANG_BARLINK_TRANSPORT=bar1|matrix; ohne das meldet sich die
     # Auswahl mit Grund ab, statt still auf etwas anderes auszuweichen.
     "bar1ep",
     "mooncake",
@@ -2178,7 +2178,7 @@ class ServerArgs:
     collective_net_small: A[
         Optional[str],
         Arg(
-            help="Network device carrying the LATENCY class: the HTCCL UCX "
+            help="Network device carrying the LATENCY class: the barlink UCX "
             "collective plane (UCX_NET_DEVICES spelling, e.g. "
             "'rocep4s0f1:1', or a comma-separated list, or 'all'). Pins the "
             "UCX context of this instance to that link instead of leaving it "
@@ -2193,8 +2193,8 @@ class ServerArgs:
             "small AND large TP collectives share ONE UCX context, so this "
             "pins the whole collective plane, not only the small messages — "
             "see docs/rig-runbook.md for what a genuine per-class split "
-            "would require. Requires the HTCCL ucx transport "
-            "(SGLANG_HTCCL=1, SGLANG_HTCCL_TRANSPORT=ucx). Unset: behavior "
+            "would require. Requires the barlink ucx transport "
+            "(SGLANG_BARLINK=1, SGLANG_BARLINK_TRANSPORT=ucx). Unset: behavior "
             "is unchanged.",
         ),
     ] = None
@@ -6506,7 +6506,7 @@ class ServerArgs:
         # in eagle_worker_v2._solo_send_draft_tokens -- the ORDINARY TP group,
         # the same one that carries every collective of the model, and which a
         # TP=5 group spanning two hosts demonstrably serves (Nordstern L0 S1,
-        # HTCCL/gloo). `eagle_worker_v2.py` contains zero occurrences of
+        # barlink/gloo). `eagle_worker_v2.py` contains zero occurrences of
         # local_rank, nnodes, node_rank or torch.cuda.current_device.
         #
         # What IS node-bound is --speculative-draft-gpu: it is a CUDA DEVICE
@@ -12626,7 +12626,7 @@ class ServerArgs:
         The two flags are NOT symmetric, and that asymmetry is the honest
         state of the code rather than an oversight:
 
-        * SMALL reaches the HTCCL UCX collective plane, which is one context
+        * SMALL reaches the barlink UCX collective plane, which is one context
           with one endpoint per peer. Small and large TP collectives run
           through it together, so pinning it pins both.
         * BULK reaches the transfers that own a separate transport: PD-KV and
@@ -12648,13 +12648,13 @@ class ServerArgs:
             if "SGLANG_COLLECTIVE_NET_SMALL" not in os.environ:
                 os.environ["SGLANG_COLLECTIVE_NET_SMALL"] = self.collective_net_small
             if (
-                envs.SGLANG_HTCCL_TRANSPORT.get() != "ucx"
-                or not envs.SGLANG_HTCCL.get()
+                envs.SGLANG_BARLINK_TRANSPORT.get() != "ucx"
+                or not envs.SGLANG_BARLINK.get()
             ):
                 logger.warning(
                     "--collective-net-small=%s has no effect: it configures "
-                    "the HTCCL ucx collective plane, which is not active "
-                    "(needs SGLANG_HTCCL=1 and SGLANG_HTCCL_TRANSPORT=ucx).",
+                    "the barlink ucx collective plane, which is not active "
+                    "(needs SGLANG_BARLINK=1 and SGLANG_BARLINK_TRANSPORT=ucx).",
                     self.collective_net_small,
                 )
 

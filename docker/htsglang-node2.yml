@@ -93,7 +93,7 @@ services:
     devices:
       # /dev/infiniband must be present in the container namespace for the UCX
       # rc transport. If this rig has no RoCE NIC, comment this out and use
-      # SGLANG_HTCCL_TRANSPORT=shm or gloo (TCP) instead — slower, still
+      # SGLANG_BARLINK_TRANSPORT=shm or gloo (TCP) instead — slower, still
       # correct.
       # MISSING -> UCX endpoint creation fails at the first collective.
       - ${IB_DEVICE:-/dev/infiniband}:/dev/infiniband
@@ -140,18 +140,18 @@ services:
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
       - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
 
-      # --- HTCCL cross-vendor / cross-rig transport ---
+      # --- barlink cross-vendor / cross-rig transport ---
       # Both rigs must run the SAME UCX release: UCX refuses to interoperate
       # across releases whose UCP wire address format differs, and the failure
       # mode is an unhelpful "invalid bandwidth 0.00" at endpoint creation.
       # Running the same image on both sides is what guarantees that.
-      - SGLANG_HTCCL=${SGLANG_HTCCL:-}
-      - SGLANG_HTCCL_TRANSPORT=${SGLANG_HTCCL_TRANSPORT:-ucx}
-      - SGLANG_HTCCL_UCX_LIB=${SGLANG_HTCCL_UCX_LIB:-}
+      - SGLANG_BARLINK=${SGLANG_BARLINK:-}
+      - SGLANG_BARLINK_TRANSPORT=${SGLANG_BARLINK_TRANSPORT:-ucx}
+      - SGLANG_BARLINK_UCX_LIB=${SGLANG_BARLINK_UCX_LIB:-}
       - UCX_TLS=${UCX_TLS:-rc,self,sm}
       - UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-3}
       - UCX_NET_DEVICES=${UCX_NET_DEVICES:-}
-      # HTCCL synchronises with the host inside every collective, so it cannot
+      # barlink synchronises with the host inside every collective, so it cannot
       # live inside a CUDA-graph capture. Eager is mandatory with it.
       - ENFORCE_EAGER=${ENFORCE_EAGER:-1}
       - LOG_LEVEL=${LOG_LEVEL:-info}

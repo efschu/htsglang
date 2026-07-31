@@ -85,15 +85,15 @@ class RunTest(unittest.TestCase):
 
         store = _store({
             "collective_gloo": boom,
-            "collective_htccl_ucx": lambda c: ArmResult(
-                "collective_htccl_ucx", "ok", cells=dict(CELLS)),
+            "collective_barlink_ucx": lambda c: ArmResult(
+                "collective_barlink_ucx", "ok", cells=dict(CELLS)),
         })
         job = store.start()
         self.assertEqual(job.state, "ok")
         failed = job.results["collective_gloo"]
         self.assertEqual(failed.status, "error")
         self.assertIn("ncclInternalError", failed.error)
-        self.assertEqual(job.results["collective_htccl_ucx"].status, "ok")
+        self.assertEqual(job.results["collective_barlink_ucx"].status, "ok")
 
     def test_arms_run_cpu_before_gpu(self):
         order = []
@@ -242,7 +242,7 @@ class GpuArmShapeTest(unittest.TestCase):
                    "cells": dict(CELLS)}
         with mock.patch.object(comm_suite, "_worker_arm",
                                return_value=(payload, "")):
-            res = comm_suite._arm_collective_htccl_shm(
+            res = comm_suite._arm_collective_barlink_shm(
                 comm_suite._RunCtx(job=mock.MagicMock(), card_count=3))
         self.assertEqual(res.status, "ok")
         self.assertTrue(any("all_gather" in n for n in res.notes))
@@ -353,8 +353,8 @@ class SectionsTest(unittest.TestCase):
             "noise_floor": lambda c: ArmResult(
                 "noise_floor", "ok",
                 facts={"cell": "all_reduce/20KiB", "floor_pct": 3.8}),
-            "collective_htccl_ucx": lambda c: ArmResult(
-                "collective_htccl_ucx", "ok", cells=dict(CELLS),
+            "collective_barlink_ucx": lambda c: ArmResult(
+                "collective_barlink_ucx", "ok", cells=dict(CELLS),
                 facts={"world": 2}),
             "byte_gate": lambda c: ArmResult(
                 "byte_gate", "error",
@@ -365,7 +365,7 @@ class SectionsTest(unittest.TestCase):
     def test_cells_become_rows_with_unit_spread_and_context(self):
         sections = to_sections(self._job())
         rows = {m.id: m for m in sections.measurements}
-        key = "comm/collective_htccl_ucx/all_reduce/20KiB"
+        key = "comm/collective_barlink_ucx/all_reduce/20KiB"
         self.assertIn(key, rows)
         row = rows[key]
         self.assertEqual(row.value, 37.2)

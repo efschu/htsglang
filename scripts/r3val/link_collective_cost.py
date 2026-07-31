@@ -1,4 +1,4 @@
-"""Per-collective fixed cost of the HTCCL/UCX transport at decode payload sizes.
+"""Per-collective fixed cost of the barlink/UCX transport at decode payload sizes.
 
 Task #244.
 
@@ -48,7 +48,7 @@ class Phases:
     (first post_recv, then wait), so the timestamps come from the real call
     sites without editing the transport.
 
-    With more than one UCX worker (SGLANG_HTCCL_UCX_WORKERS, task #266) the
+    With more than one UCX worker (SGLANG_BARLINK_UCX_WORKERS, task #266) the
     ring and the flat fast paths do not call ``UcpWorker.wait`` at all -- they
     call the transport's ``_wait_split``, which progresses every worker in one
     loop. Both are wrapped: ``_wait_split`` delegates to ``UcpWorker.wait``
@@ -147,11 +147,11 @@ def main():
     dist.init_process_group(backend="gloo", rank=a.rank, world_size=a.world)
     mod = load_transport(a.comm_dir)
     bindings = sys.modules[
-        "sglang.srt.distributed.device_communicators.htccl_ucx_bindings"]
+        "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"]
     lib = bindings.UcpLibrary.instance()
     print(f"[rank {a.rank}] UCX {lib.version_string()} from {lib.path}",
           file=sys.stderr, flush=True)
-    t = mod.HTCCLUcxTransport(cpu_group=dist.group.WORLD,
+    t = mod.BarlinkUcxTransport(cpu_group=dist.group.WORLD,
                               device=torch.device("cpu"))
 
     class _Comm:
@@ -163,15 +163,15 @@ def main():
     res = {
         "rank": a.rank, "world": a.world, "iters": a.iters,
         "rndv_thresh": os.environ.get("UCX_RNDV_THRESH", "auto(unset)"),
-        "fp32_reduce": os.environ.get("SGLANG_HTCCL_FP32_REDUCE", "1(default)"),
+        "fp32_reduce": os.environ.get("SGLANG_BARLINK_FP32_REDUCE", "1(default)"),
         "cells": {},
     }
 
     def measure(label, nbytes, op):
         n = nbytes // 4
         x = torch.ones(n, dtype=torch.float32)
-        fn = (lambda y: t.htccl_all_reduce(comm, y)) if op == "all_reduce" \
-            else (lambda y: t.htccl_all_gather(comm, y, 0))
+        fn = (lambda y: t.barlink_all_reduce(comm, y)) if op == "all_reduce" \
+            else (lambda y: t.barlink_all_gather(comm, y, 0))
         for _ in range(a.warmup):
             fn(x.clone())
         samp, splits = [], []
@@ -202,14 +202,14 @@ def main():
             for extra in (0, 1, 3):
                 n = kib * 1024 // 4 + extra
                 x = torch.arange(n, dtype=torch.float32) * (a.rank + 1) + 1.0
-                got = t.htccl_all_reduce(comm, x.clone())
+                got = t.barlink_all_reduce(comm, x.clone())
                 want = torch.arange(n, dtype=torch.float32) * (
                     a.world * (a.world + 1) // 2) + float(a.world)
                 if not torch.equal(got, want):
                     bad += 1
                     print(f"  MISMATCH all_reduce n={n} ({kib}KiB+{extra})",
                           flush=True)
-                g = t.htccl_all_gather(comm, x.clone(), 0)
+                g = t.barlink_all_gather(comm, x.clone(), 0)
                 wg = torch.cat([
                     torch.arange(n, dtype=torch.float32) * (r + 1) + 1.0
                     for r in range(a.world)])
@@ -256,14 +256,14 @@ def main():
         n = nb // 4
         x = torch.ones(n, dtype=torch.float32)
         for _ in range(a.warmup):
-            t.htccl_all_reduce(comm, x.clone())
+            t.barlink_all_reduce(comm, x.clone())
         samp = []
         for _ in range(max(a.iters // 4, 10)):
             ys = [x.clone() for _ in range(count)]
             t.barrier()
             t0 = time.perf_counter()
             for y in ys:
-                t.htccl_all_reduce(comm, y)
+                t.barlink_all_reduce(comm, y)
             samp.append(time.perf_counter() - t0)
         st = stats(samp)
         st["per_collective_us"] = round(st["median_us"] / count, 2)

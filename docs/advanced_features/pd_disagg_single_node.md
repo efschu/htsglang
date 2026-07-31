@@ -49,7 +49,7 @@ hypothesis band at long context, above it at short lengths. **GO** for A3B;
 - GPUs (torch enumeration, fastest-first — `--rank-gpu-id` indexes THIS
   order, per the #102/T102 finding): 0 = RTX 5090 32.6 GB (PCIe Gen4 x8,
   ~13–14 GB/s), 1 = RTX 3080 20.5 GB (Gen4 **x4**, ~6.5 GB/s), 2 = RTX 3080
-  20.5 GB (Gen4 x8, ~13 GB/s). HTCCL-measured host-staged DMA:
+  20.5 GB (Gen4 x8, ~13 GB/s). barlink-measured host-staged DMA:
   14.3 / 6.5 / 13.2 GB/s. No NVLink, no CUDA P2P (GeForce, PHB topology):
   all cross-GPU traffic is host-staged.
 - **A3B (Qwen3.6-35B-A3B-AWQ-4bit, primary):** 40 layers, 10 full-attention

@@ -4,8 +4,13 @@
   "_fixture_provenance": "gekuerzte Kopie eines ECHTEN Laufs (gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e/server.log, 400-Zeilen-Auszug des Hostlogs). Behalten wurden die drei ERREICHT-Bloecke (world:0, tp:0, dcp:0), die Aufbau- und Kassenzeilen und der ERSTE Absturzblock; die beiden baugleichen Absturzbloecke der anderen Raenge und die dazwischenliegenden Ladezeilen sind gestrichen. Kein Wort ist umgeschrieben -- die Zeilenform stammt vom Erzeuger, nicht aus einer Vorstellung davon.",
   "quelle": "gpu-battery-results/2026-07-30_bar1/s11_bar1_e2e/server.log",
   "erzeuger": "scripts/gpu_battery/s11_bar1_e2e.sh (host_tail_into, 400 Zeilen)",
-  "warum": "Der Check meldete an diesem Lauf 'keine einzige ERREICHT-Zeile im Log', obwohl das Log sie traegt: der Erzeuger las ausschliesslich htccl_lines.txt, und die Datei entsteht erst NACH einem geglueckten Serverstart. Diese Datei ist die Gegenprobe -- an ihr muss der Check am Capture-Abbruch scheitern, nicht an der leeren Beweislage.",
-  "dateien": ["server.log", "graph_check.txt", "graph_check_rc.txt"],
+  "warum": "Der Check meldete an diesem Lauf 'keine einzige ERREICHT-Zeile im Log', obwohl das Log sie traegt: der Erzeuger las ausschliesslich barlink_lines.txt, und die Datei entsteht erst NACH einem geglueckten Serverstart. Diese Datei ist die Gegenprobe -- an ihr muss der Check am Capture-Abbruch scheitern, nicht an der leeren Beweislage.",
+  "dateien": [
+    "server.log",
+    "graph_check.txt",
+    "graph_check_rc.txt"
+  ],
   "dateien_hinweis": "graph_check.txt ist auf die Zusammenfassungszeilen desselben Laufs gekuerzt (64 KiB Ablauftext gestrichen); graph_check_rc.txt ist unveraendert.",
-  "task_315_note": "The capture predates the #295 German-to-English translation of htccl_bar1.py/htccl.py. The BAR1-specific lines (setup/ledger/RuntimeError) were mechanically retranslated in place to the current emitter wording via _bar1_marker_source.py, with every captured number (ms, MiB, KiB, byte counts, ranks, timestamps) kept unchanged -- the capture's shape and values are still the producer's, only the vocabulary was brought forward to match the code that would emit it today. Everything else in server.log is untouched."
+  "task_315_note": "The capture predates the #295 German-to-English translation of barlink_bar1.py/barlink.py. The BAR1-specific lines (setup/ledger/RuntimeError) were mechanically retranslated in place to the current emitter wording via _bar1_marker_source.py, with every captured number (ms, MiB, KiB, byte counts, ranks, timestamps) kept unchanged -- the capture's shape and values are still the producer's, only the vocabulary was brought forward to match the code that would emit it today. Everything else in server.log is untouched.",
+  "task_358_note": "Task #358 renamed the transport from HTCCL to barlink. The captured lines in server.log carry the new vocabulary (barlink-BAR1, SGLANG_BARLINK*) because the consumers under test parse the emitter's CURRENT format strings; every captured number (ms, MiB, KiB, byte counts, ranks, timestamps) is unchanged, exactly as for the #295 retranslation recorded above."
 }

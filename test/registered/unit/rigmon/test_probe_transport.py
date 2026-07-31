@@ -321,7 +321,7 @@ class TestTransportChoice(CustomTestCase):
         self.assertEqual(
             choose_transport(link, available_facilities=["rdma"]).chosen.key, "rdma"
         )
-        self.assertEqual(choose_transport(link).chosen.key, "htccl-ucx")
+        self.assertEqual(choose_transport(link).chosen.key, "barlink-ucx")
 
     def test_intra_and_inter_candidates_do_not_mix(self):
         from sglang.srt.rigmon.probe import LinkRate

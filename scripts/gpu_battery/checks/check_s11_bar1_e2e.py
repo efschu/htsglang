@@ -7,12 +7,12 @@ reporting:
   1. host reachable, BAR1 code in the worktree under test (STOP -- nothing was
      measured),
   2. the graph gate. bar1_graph_check.py must have run and every GATE case must
-     have passed. SGLANG_HTCCL_GRAPH_FREIGABE=1 without that evidence produces
+     have passed. SGLANG_BARLINK_GRAPH_ENABLE=1 without that evidence produces
      numbers from an operating point nobody can defend,
   3. was a log harvested at ALL. An empty evidence list means one of two very
      different things -- nobody looked, or nothing was there -- and only the
-     second is a measurement. `log_quellen` names the files that existed,
-  4. THE BOLT. htccl._select raises instead of quietly dropping to the
+     second is a measurement. `log_sources` names the files that existed,
+  4. THE BOLT. barlink._select raises instead of quietly dropping to the
      host-staged gloo level during a graph capture. If it fired, that is the
      coverage gap of the current integration -- reported with op and size, in
      its own wording, so nobody has to open a log to tell it from a crash,
@@ -75,7 +75,7 @@ def check(step_dir: str) -> None:
     path = os.path.join(step_dir, "bar1_e2e.json")
     classify_missing_result(step_dir, "bar1_e2e", path, "bar1_e2e.json")
     payload = load_json(path, "bar1_e2e.json")
-    require_envelope(payload, KIND, "bar1_e2e.json", 5)
+    require_envelope(payload, KIND, "bar1_e2e.json", 6)
 
     if not payload.get("reachable"):
         raise CheckStop(
@@ -85,7 +85,7 @@ def check(step_dir: str) -> None:
     if not payload.get("integration_present"):
         raise CheckStop(
             "the BAR1 integration is not in the worktree under test "
-            "(htccl_bar1.py / benchmark/bar1_graph_check.py) -- set BAR1_HOST_WT"
+            "(barlink_bar1.py / benchmark/bar1_graph_check.py) -- set BAR1_HOST_WT"
         )
     # "blockiert" stays: an out-of-scope unit test matches the verdict on it.
     if payload.get("blocked"):
@@ -96,7 +96,7 @@ def check(step_dir: str) -> None:
         raise CheckStop(
             "bar1_graph_check reported no gate case at all (rc="
             f"{gate.get('rc')!r}) -- the gate never ran, so "
-            "SGLANG_HTCCL_GRAPH_FREIGABE=1 is unsupported"
+            "SGLANG_BARLINK_GRAPH_ENABLE=1 is unsupported"
         )
     if not gate.get("alle_bestanden"):
         raise CheckFail(
@@ -109,23 +109,23 @@ def check(step_dir: str) -> None:
     # of a step directory with no log excerpt is not a finding about the run
     # but one about the harvest -- and telling those two apart is the
     # difference between "the run reported nothing" and "we did not look".
-    if "log_quellen" not in payload:
+    if "log_sources" not in payload:
         raise CheckStop(
-            "bar1_e2e.json names no 'log_quellen' -- the artifact comes from an "
-            "older producer that read the evidence out of htccl_lines.txt alone "
+            "bar1_e2e.json names no 'log_sources' -- the artifact comes from an "
+            "older producer that read the evidence out of barlink_lines.txt alone "
             "and came up empty on every abort path"
         )
-    if not payload["log_quellen"]:
+    if not payload["log_sources"]:
         raise CheckStop(
-            "no log excerpt in the step directory (neither htccl_lines.txt nor "
+            "no log excerpt in the step directory (neither barlink_lines.txt nor "
             "server.log) -- niemand hat geschaut, so there is nothing to decide "
             "here"
         )
 
-    bolt = payload.get("riegel")
+    bolt = payload.get("capture_bolt")
     if bolt:
         raise CheckFail(
-            f"RIEGEL: htccl._select aborted {bolt.get('op')!r} with "
+            f"CAPTURE-BOLT: barlink._select aborted {bolt.get('op')!r} with "
             f"{bolt.get('bytes')} bytes during a CUDA graph capture, because "
             "bar1 does not carry the operation at that size -- a coverage gap "
             "in the BAR1 transport, not a crash. This is exactly the scenario "
@@ -139,11 +139,11 @@ def check(step_dir: str) -> None:
     if fatal:
         raise CheckFail(f"Fatal im Serverlog -- {fatal}")
 
-    groups = payload.get("gruppen") or []
+    groups = payload.get("groups") or []
     if not groups:
         raise CheckFail(
             "not a single 'ACHIEVED=' line in the log (sources: "
-            f"{payload['log_quellen']}, {payload.get('log_zeilen')} lines) -- "
+            f"{payload['log_sources']}, {payload.get('log_lines')} lines) -- "
             "without it the arm of the measurement is unsupported (the "
             "requested transport name reads bar1 even on a fallback)"
         )
@@ -161,14 +161,14 @@ def check(step_dir: str) -> None:
             raise CheckFail(
                 f"group {g.get('group')!r} runs ACHIEVED={g.get('achieved')!r} "
                 f"(requested {g.get('requested')!r}) while "
-                f"{payload.get('gruppen_bar1')} run on bar1 -- ein gemischter "
-                "Lauf, whose numbers do not count as bar1 numbers"
+                f"{payload.get('groups_on_bar1')} run on bar1 -- a mixed "
+                "run, whose numbers do not count as bar1 numbers"
             )
 
-    ledger_groups = payload.get("aufbau_gruppen") or []
-    if not payload.get("aufbau_lines"):
+    ledger_groups = payload.get("setup_groups") or []
+    if not payload.get("setup_lines"):
         raise CheckFail(
-            "no 'HTCCL-BAR1: setup in' line -- no rank actually built a BAR1 "
+            "no 'barlink-BAR1: setup in' line -- no rank actually built a BAR1 "
             "region"
         )
     for prefix in REQUIRED_GROUP_PREFIXES:
@@ -180,7 +180,7 @@ def check(step_dir: str) -> None:
             )
 
     smoke = payload.get("smoke") or {}
-    if not smoke.get("vorhanden"):
+    if not smoke.get("present"):
         raise CheckFail("no smoke request was sent (smoke.json missing)")
     if smoke.get("error"):
         raise CheckFail(f"smoke request reports: {smoke['error']}")

@@ -5,18 +5,18 @@ multiple times -- and do the bytes check out after EVERY replay?
 
     python benchmark/bar1_graph_check.py 1,2,3 [port]
 
-No server, no model, no planner. ``HTCCLBar1Transport`` is built directly,
+No server, no model, no planner. ``BarlinkBar1Transport`` is built directly,
 as in ``bar1_diag.py``, so that an exception stays visible with its full
 traceback instead of being translated into a ``logger.info``.
 
 Why this program exists
 ------------------------
-``bar1`` is not in ``CAPTURABLE_HTCCL_TRANSPORTS``. The bar is set out of
+``bar1`` is not in ``CAPTURABLE_BARLINK_TRANSPORTS``. The bar is set out of
 caution: the data path never touches the host, the round number lives in a
-device word (``htccl_bar1_ext.py``, header comment), and the peer pointers
+device word (``barlink_bar1_ext.py``, header comment), and the peer pointers
 are fixed from bootstrap on -- capturable **by construction**. What was
 missing was the proof. This program supplies it, and only after it passes
-may ``SGLANG_HTCCL_GRAPH_ENABLE=1`` be set.
+may ``SGLANG_BARLINK_GRAPH_ENABLE=1`` be set.
 
 What exactly is checked
 -------------------------
@@ -91,13 +91,13 @@ WIEDERGABEN = 5
 # ===========================================================================
 #
 # `umgebung` ("environment") is set BEFORE building the transport -- the
-# knob values are read once by `HTCCLBar1Transport.__init__`.
+# knob values are read once by `BarlinkBar1Transport.__init__`.
 FAELLE = [
     {
         "name": "1blk-small",
         "zweck": "The ordinary launch, small payload. If this fails, "
                  "bar1 is fundamentally done with graphs.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [64 << 10],
         "gate": True,
     },
@@ -105,7 +105,7 @@ FAELLE = [
         "name": "1blk-large",
         "zweck": "The same launch above the grid threshold, so size, "
                  "not variant, is the variable.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [8 << 20],
         "gate": True,
     },
@@ -114,8 +114,8 @@ FAELLE = [
         "zweck": "cudaLaunchCooperativeKernel UNDER capture. The one "
                  "question that could not be settled without free cards.",
         "umgebung": {
-            "SGLANG_HTCCL_BAR1_GRID_THRESHOLD": "0",
-            "SGLANG_HTCCL_BAR1_GRAPH_GRID": "1",
+            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "0",
+            "SGLANG_BARLINK_BAR1_GRAPH_GRID": "1",
         },
         "groessen": [64 << 10, 8 << 20],
         # NOT a gate: if this fails, that is not a reason against bar1 --
@@ -126,15 +126,15 @@ FAELLE = [
     {
         "name": "reservation",
         "zweck": "Above the threshold, but with "
-                 "SGLANG_HTCCL_BAR1_GRAPH_GRID=0: _kernel must fall back "
+                 "SGLANG_BARLINK_BAR1_GRAPH_GRID=0: _kernel must fall back "
                  "to 1blk under capture instead of failing.",
         # The 0 is EXPLICITLY there, ever since the default started coming
-        # from SGLANG_HTCCL_GRAPH_ENABLE. Without it, this case would
+        # from SGLANG_BARLINK_GRAPH_ENABLE. Without it, this case would
         # depend on whether the release is set in the caller's environment
         # -- and a case that checks something different depending on the
         # environment checks nothing.
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": "0",
-                     "SGLANG_HTCCL_BAR1_GRAPH_GRID": "0"},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": "0",
+                     "SGLANG_BARLINK_BAR1_GRAPH_GRID": "0"},
         "groessen": [64 << 10, 8 << 20],
         "gate": True,
     },
@@ -142,23 +142,23 @@ FAELLE = [
         "name": "two-graphs",
         "zweck": "Two captures, replayed alternately. Exposes shared "
                  "flag or result slots.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [64 << 10, 256 << 10],
         "verschraenkt": True,
         "gate": True,
     },
     {
         "name": "pipe",
-        "zweck": "netz_pipe captured. Direct mode switches itself off "
+        "zweck": "mesh_pipe captured. Direct mode switches itself off "
                  "under capture; this checks that the direct=0 path "
                  "carries.",
         "umgebung": {
-            "SGLANG_HTCCL_BAR1_PIPE": "1",
-            "SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_HTCCL_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE": "1",
+            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
-        # Between pipe_ab (256 KiB) and ring_ab (1 MiB) -- only there does
-        # `algorithm_for` pick netz_pipe at all.
+        # Between pipe_from (256 KiB) and ring_from (1 MiB) -- only there does
+        # `algorithm_for` pick mesh_pipe at all.
         "groessen": [512 << 10],
         "gate": True,
     },
@@ -170,17 +170,17 @@ FAELLE = [
                  "device) and proves the result tensor really sits in "
                  "the BAR1 window.",
         "umgebung": {
-            "SGLANG_HTCCL_BAR1_PIPE": "1",
-            "SGLANG_HTCCL_BAR1_PIPE_DIRECT": "1",
-            "SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH": "1",
+            "SGLANG_BARLINK_BAR1_PIPE": "1",
+            "SGLANG_BARLINK_BAR1_PIPE_DIRECT": "1",
+            "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
             # 2 eager + 3 graph slots. Without the three above, the pool
             # would be empty and every captured call would fall back to
             # direct=0 -- the case would then pass without ever having
             # run direct mode. That is why `direkt` below verifies the
             # result tensor's location afterward.
-            "SGLANG_HTCCL_BAR1_PIPE_RESULT_RING": "5",
-            "SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_HTCCL_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING": "5",
+            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
         "groessen": [512 << 10, 640 << 10, 768 << 10],
         "verschraenkt": True,
@@ -195,12 +195,12 @@ FAELLE = [
                  "right bytes -- a fallback that delivers wrong numbers "
                  "would be worse than none at all.",
         "umgebung": {
-            "SGLANG_HTCCL_BAR1_PIPE": "1",
-            "SGLANG_HTCCL_BAR1_PIPE_DIRECT": "1",
-            "SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH": "1",
-            "SGLANG_HTCCL_BAR1_PIPE_RESULT_RING": "2",
-            "SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40),
-            "SGLANG_HTCCL_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE": "1",
+            "SGLANG_BARLINK_BAR1_PIPE_DIRECT": "1",
+            "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH": "1",
+            "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING": "2",
+            "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
+            "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
         "groessen": [512 << 10, 768 << 10],
         "verschraenkt": True,
@@ -213,7 +213,7 @@ FAELLE = [
         "zweck": "The cases from the standard run: 12- and 128-byte "
                  "broadcast in the draft graph. Every rank once as the "
                  "source, so no edge is left unchecked.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         # 12 comes first, and not out of tidiness: the first attempt
         # covered 128 and rejected 12 (floor of 16), and because the gate
         # only ran 128, it passed green while the standard run aborted. A
@@ -227,7 +227,7 @@ FAELLE = [
         "kollektiv": "broadcast",
         "zweck": "Two broadcast captures, replayed alternately. A "
                  "shared slot or a baked-in half only shows up here.",
-        "umgebung": {"SGLANG_HTCCL_BAR1_GRID_THRESHOLD": str(1 << 40)},
+        "umgebung": {"SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40)},
         "groessen": [12, 128, 64 << 10],
         "verschraenkt": True,
         "gate": True,
@@ -297,14 +297,14 @@ def _zeichne_auf(t, n: int, rang: int, geraet):
     strom.wait_stream(torch.cuda.current_stream(geraet))
     with torch.cuda.stream(strom):
         for _ in range(3):
-            t.htccl_all_reduce(None, eingabe)
+            t.barlink_all_reduce(None, eingabe)
     torch.cuda.current_stream(geraet).wait_stream(strom)
     torch.cuda.synchronize(geraet)
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ausgabe = t.htccl_all_reduce(None, eingabe)
+        ausgabe = t.barlink_all_reduce(None, eingabe)
     torch.cuda.synchronize(geraet)
     dist.barrier()
     return graph, eingabe, ausgabe
@@ -330,14 +330,14 @@ def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
     strom.wait_stream(torch.cuda.current_stream(geraet))
     with torch.cuda.stream(strom):
         for _ in range(3):
-            t.htccl_broadcast(None, puffer, src)
+            t.barlink_broadcast(None, puffer, src)
     torch.cuda.current_stream(geraet).wait_stream(strom)
     torch.cuda.synchronize(geraet)
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        t.htccl_broadcast(None, puffer, src)
+        t.barlink_broadcast(None, puffer, src)
     torch.cuda.synchronize(geraet)
     dist.barrier()
     return graph, puffer
@@ -443,8 +443,8 @@ def _pruefe_graphen(t, groessen, verschraenkt, rang, welt, geraet, protokoll,
                 f"have measured and passed the direct=0 control path "
                 f"without answering the question. Check the cause: the "
                 f"result ring's graph pool "
-                f"(SGLANG_HTCCL_BAR1_PIPE_RESULT_RING), "
-                f"SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH."
+                f"(SGLANG_BARLINK_BAR1_PIPE_RESULT_RING), "
+                f"SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH."
             )
         if direkt_erwartung == "none" and im_fenster:
             raise AssertionError(
@@ -535,10 +535,10 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
     torch.cuda.init()
     torch.zeros(1, device=geraet)
 
-    from sglang.srt.distributed.device_communicators.htccl_bar1 import (
-        HTCCLBar1Transport,
+    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        BarlinkBar1Transport,
     )
-    from sglang.srt.distributed.device_communicators.htccl_matrix_transport import (
+    from sglang.srt.distributed.device_communicators.barlink_matrix_transport import (
         _window_bytes,
     )
 
@@ -547,7 +547,7 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                 "grund": "", "protokoll": protokoll}
     t = None
     try:
-        t = HTCCLBar1Transport(dist.group.WORLD, geraet, _window_bytes())
+        t = BarlinkBar1Transport(dist.group.WORLD, geraet, _window_bytes())
         belege = t.byte_proof_all()
         if not all(belege.values()):
             raise RuntimeError(
@@ -555,10 +555,10 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                 f"handles() says False to everything, and a graph over a "
                 f"path that loses bytes proves nothing."
             )
-        if t.pipe_an and not t.byte_proof_pipe():
+        if t.pipe_on and not t.byte_proof_pipe():
             raise RuntimeError(
-                "netz_pipe byte proof failed -- this case needs it, "
-                "otherwise algorithm_for never picks netz_pipe at all"
+                "mesh_pipe byte proof failed -- this case needs it, "
+                "otherwise algorithm_for never picks mesh_pipe at all"
             )
         kollektiv = fall.get("kollektiv", "all_reduce")
         if kollektiv == "broadcast":
@@ -675,10 +675,10 @@ def main() -> int:
         return 2
     if fehlend:
         print(f"Failed gate cases: {', '.join(fehlend)}.")
-        print("SGLANG_HTCCL_GRAPH_ENABLE stays OFF.")
+        print("SGLANG_BARLINK_GRAPH_ENABLE stays OFF.")
         return 1
     print("All gate cases passed.")
-    print("Only now may SGLANG_HTCCL_GRAPH_ENABLE=1 be set;")
+    print("Only now may SGLANG_BARLINK_GRAPH_ENABLE=1 be set;")
     print("bar1/matrix then count as capturable in parallel_state.")
     info = [(n, ok) for n, gate, ok, _ in stand if not gate]
     for n, ok in info:
@@ -686,9 +686,9 @@ def main() -> int:
             print()
             print("Also: case 'grid' passed -- the cooperative launch can "
                   "be captured on this rig. That makes the reservation in "
-                  "HTCCLBar1Transport._kernel moot on its own: its default "
-                  "depends on SGLANG_HTCCL_GRAPH_ENABLE. To bring it back "
-                  "individually, set SGLANG_HTCCL_BAR1_GRAPH_GRID=0.")
+                  "BarlinkBar1Transport._kernel moot on its own: its default "
+                  "depends on SGLANG_BARLINK_GRAPH_ENABLE. To bring it back "
+                  "individually, set SGLANG_BARLINK_BAR1_GRAPH_GRID=0.")
     return 0
 
 

@@ -1,6 +1,6 @@
 """Cross-rig collective latency, one harness, three link configurations.
 
-Task #204 / FEATURES_VS_UPSTREAM HTCCL transport line.
+Task #204 / FEATURES_VS_UPSTREAM barlink transport line.
 
 WHY THIS EXISTS
 ---------------
@@ -13,7 +13,7 @@ Three configurations, which separate the software stack from the wire:
 
   gloo-1g    torch.distributed gloo over the 1 GbE LAN   (<RIG_LAN>.x)
   gloo-roce  torch.distributed gloo over the RoCE NIC's IP (<RDMA_NET>.x, TCP)
-  ucx        HTCCL/UCX native RDMA over the same RoCE NIC
+  ucx        barlink/UCX native RDMA over the same RoCE NIC
 
 gloo-1g vs ucx is the deployment question ("how much does RDMA buy").
 gloo-roce sits between them and shows how much of the gap is the wire and how
@@ -39,7 +39,7 @@ SIZES = [8 * 1024, 64 * 1024, 512 * 1024, 4 * 1024 * 1024]  # bytes
 
 
 def load_transport(comm_dir):
-    """Import htccl_ucx{,_bindings} from a checkout without importing sglang."""
+    """Import barlink_ucx{,_bindings} from a checkout without importing sglang."""
     for name in ("sglang", "sglang.srt", "sglang.srt.distributed",
                  "sglang.srt.distributed.device_communicators"):
         if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
@@ -55,9 +55,9 @@ def load_transport(comm_dir):
         return mod
 
     base = "sglang.srt.distributed.device_communicators."
-    _load(base + "htccl_ucx_bindings",
-          os.path.join(comm_dir, "htccl_ucx_bindings.py"))
-    return _load(base + "htccl_ucx", os.path.join(comm_dir, "htccl_ucx.py"))
+    _load(base + "barlink_ucx_bindings",
+          os.path.join(comm_dir, "barlink_ucx_bindings.py"))
+    return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
 
 
 def stats(samples):
@@ -113,15 +113,15 @@ def main():
                                 world_size=a.world)
         mod = load_transport(a.comm_dir)
         bindings = sys.modules[
-            "sglang.srt.distributed.device_communicators.htccl_ucx_bindings"]
+            "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"]
         lib = bindings.UcpLibrary.instance()
         print(f"[rank {a.rank}] UCX {lib.version_string()} from {lib.path}",
               file=sys.stderr, flush=True)
-        t = mod.HTCCLUcxTransport(cpu_group=dist.group.WORLD,
+        t = mod.BarlinkUcxTransport(cpu_group=dist.group.WORLD,
                                   device=torch.device("cpu"))
 
         class _Comm:
-            """Stand-in for HTCCLCommunicator: a fresh output tensor per call."""
+            """Stand-in for BarlinkCommunicator: a fresh output tensor per call."""
 
             def _get_out_buf(self, ref):
                 return torch.empty_like(ref)
@@ -132,10 +132,10 @@ def main():
             t.barrier()
 
         def do_all_reduce(x):
-            t.htccl_all_reduce(comm, x)
+            t.barlink_all_reduce(comm, x)
 
         def do_all_gather(x):
-            t.htccl_all_gather(comm, x, 0)
+            t.barlink_all_gather(comm, x, 0)
 
         fini = dist.destroy_process_group
 

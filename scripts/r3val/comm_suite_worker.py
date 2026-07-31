@@ -1,10 +1,10 @@
-"""Baseline collective cells for the comm suite: gloo, NCCL, HTCCL/shm.
+"""Baseline collective cells for the comm suite: gloo, NCCL, barlink/shm.
 
 Task #271.
 
 WHY THIS EXISTS
 ---------------
-``link_collective_cost.py`` measures the HTCCL/UCX transport and nothing else
+``link_collective_cost.py`` measures the barlink/UCX transport and nothing else
 -- it wraps that transport's own call sites to split a collective into
 stage/post/wait/finish. A transport figure with no reference point is not
 interpretable: "37 us at 20 KiB" only means something next to what the stock
@@ -23,8 +23,8 @@ Backends:
     ``torch.distributed`` on CUDA tensors, one rank per visible card. The
     intra-rig reference. Touches the GPU -- the suite runs it only inside a
     card window.
-``htccl_shm``
-    ``HTCCLShmTransport``: single-node shared memory, all_reduce only (the
+``barlink_shm``
+    ``BarlinkShmTransport``: single-node shared memory, all_reduce only (the
     transport implements no all_gather, and this worker does not add one --
     a cell that exists here but not in the transport would be measuring this
     file).
@@ -51,7 +51,7 @@ DEFAULT_SIZES_KIB = (20, 80, 256)
 
 
 def _load_shm_transport(comm_dir):
-    """Import ``htccl_shm`` from a checkout without importing sglang.
+    """Import ``barlink_shm`` from a checkout without importing sglang.
 
     Same trick as ``link_lat.load_transport``, kept separate because the shm
     module has no bindings sibling to load first.
@@ -65,9 +65,9 @@ def _load_shm_transport(comm_dir):
             stub = types.ModuleType(name)
             stub.__path__ = []
             sys.modules[name] = stub
-    mod_name = "sglang.srt.distributed.device_communicators.htccl_shm"
+    mod_name = "sglang.srt.distributed.device_communicators.barlink_shm"
     spec = importlib.util.spec_from_file_location(
-        mod_name, os.path.join(comm_dir, "htccl_shm.py"))
+        mod_name, os.path.join(comm_dir, "barlink_shm.py"))
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
@@ -75,7 +75,7 @@ def _load_shm_transport(comm_dir):
 
 
 class _Comm:
-    """The scrap of communicator surface the HTCCL transports call back into.
+    """The scrap of communicator surface the barlink transports call back into.
 
     Returns a FRESH buffer every time on purpose: a shared scratch buffer is
     the recurring shape behind the returned-buffer bug family, and a
@@ -91,7 +91,7 @@ class _Comm:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", required=True,
-                    choices=("gloo", "nccl", "htccl_shm"))
+                    choices=("gloo", "nccl", "barlink_shm"))
     ap.add_argument("--rank", type=int, required=True)
     ap.add_argument("--world", type=int, required=True)
     ap.add_argument("--sizes", default="",
@@ -99,7 +99,7 @@ def main():
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--comm-dir", default="",
-                    help="device_communicators dir, htccl_shm only")
+                    help="device_communicators dir, barlink_shm only")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -129,17 +129,17 @@ def main():
     }
 
     transport = None
-    if a.backend == "htccl_shm":
+    if a.backend == "barlink_shm":
         mod = _load_shm_transport(a.comm_dir)
         # The slot has to hold the largest payload this run moves, plus the
         # ragged element the correctness check appends. Sizing it from the
         # sweep rather than from a constant keeps the segment honest when the
         # caller passes a bigger ladder.
         slot_bytes = max(sizes) * 1024 + 4096
-        transport = mod.HTCCLShmTransport(cpu_group=dist.group.WORLD,
+        transport = mod.BarlinkShmTransport(cpu_group=dist.group.WORLD,
                                           device=device,
                                           slot_bytes=slot_bytes)
-        res["transport"] = "htccl_shm"
+        res["transport"] = "barlink_shm"
         res["slot_bytes"] = slot_bytes
 
     comm = _Comm()
@@ -147,11 +147,11 @@ def main():
     def _ops():
         """(label, callable) per collective this backend actually implements.
 
-        HTCCLShmTransport has no all_gather, so the shm arm reports all_reduce
+        BarlinkShmTransport has no all_gather, so the shm arm reports all_reduce
         only rather than a cell this file would have to synthesize.
         """
-        if a.backend == "htccl_shm":
-            return [("all_reduce", lambda y: transport.htccl_all_reduce(comm, y))]
+        if a.backend == "barlink_shm":
+            return [("all_reduce", lambda y: transport.barlink_all_reduce(comm, y))]
 
         def ar(y):
             dist.all_reduce(y)
@@ -204,8 +204,8 @@ def main():
              * (a.rank + 1) + 1.0)
         want = (torch.arange(n, dtype=torch.float32, device=device)
                 * (a.world * (a.world + 1) // 2) + float(a.world))
-        if a.backend == "htccl_shm":
-            got = transport.htccl_all_reduce(comm, x.clone())
+        if a.backend == "barlink_shm":
+            got = transport.barlink_all_reduce(comm, x.clone())
         else:
             got = x.clone()
             dist.all_reduce(got)

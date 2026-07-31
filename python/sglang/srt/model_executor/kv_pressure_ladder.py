@@ -45,7 +45,7 @@ ENFORCED INVARIANTS (in code, not by convention):
    rung raises ``KvLadderError`` (``force_target``), so the ordering holds
    for the runtime path too, not just for the table.
 3. CAPTURE GUARD: flips (and pre-stages) happen only at round boundaries and
-   never inside an active capture -- the same contract the HTCCL path
+   never inside an active capture -- the same contract the barlink path
    dispatcher and the K-ladder use. Refusal is a no-op plan with a reason,
    the status-quo direction.
 4. A step whose graphs are NOT captured in advance may not be the target of a
@@ -204,7 +204,7 @@ HANDOVER_STRATEGIES = (
 )
 
 #: Provenance labels of a step's expected figures -- same honesty discipline
-#: as the HTCCL path dispatcher's rate profiles: a number without a source is
+#: as the barlink path dispatcher's rate profiles: a number without a source is
 #: never silently treated as measured.
 PROVENANCE_MEASURED = "measured"
 PROVENANCE_SOLVER = "solver"
@@ -1398,7 +1398,7 @@ class KvPressureLadder:
     def protected_sessions(self) -> Tuple[str, ...]:
         return tuple(sorted(self._protected))
 
-    # -- capture guard (same contract as the HTCCL path dispatcher) ---------
+    # -- capture guard (same contract as the barlink path dispatcher) ---------
     def begin_capture(self) -> None:
         with self._lock:
             self._capture_active = True

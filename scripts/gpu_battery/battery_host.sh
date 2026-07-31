@@ -42,11 +42,18 @@ BAR1_HOST_LOGDIR="${BAR1_HOST_LOGDIR:-/root/battery-bar1}"
 # mapped). Both come straight from 04_BETRIEB.md of the P2P handover.
 BAR1_NV_SOURCE="${BAR1_NV_SOURCE:-/spinning/nvidia-open-595}"
 BAR1_HOLDER_KO="${BAR1_HOLDER_KO:-/spinning/nvidia-smallbar-p2p/dmabuf_holder/dmabuf_holder.ko}"
+# The default is deliberately the PRE-#358 spelling of the key, not the
+# current BarlinkPeerBar1. A driver built from the current patch reads
+# both (new first, old as fallback); a driver built before the rename
+# reads only the old one. The old name is therefore the spelling that
+# works against either module, and the rig may still be carrying the
+# older build. Override with BAR1_REGKEY=BarlinkPeerBar1=1 once the
+# loaded driver is known to come from the current patch.
 BAR1_REGKEY="${BAR1_REGKEY:-RMSmallBarP2PPeerBar1=1}"
 
 # The JIT extension cache. Shared across boots on purpose: a cold build of the
 # BAR1 extension costs minutes and would be paid eight times in s12.
-BAR1_EXTCACHE="${BAR1_EXTCACHE:-/spinning/htccl_extcache_host}"
+BAR1_EXTCACHE="${BAR1_EXTCACHE:-/spinning/barlink_extcache_host}"
 
 BAR1_PORT="${BAR1_PORT:-30030}"
 

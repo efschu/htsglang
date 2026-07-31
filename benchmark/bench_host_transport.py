@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""HTCCL against NCCL, all_reduce and all_to_all, interleaved in the same run.
+"""barlink against NCCL, all_reduce and all_to_all, interleaved in the same run.
 
 WHY
 ===
-The host transport (`SGLANG_HTCCL_TRANSPORT=host`, see
-python/sglang/srt/distributed/device_communicators/htccl_host.py) moves the
+The host transport (`SGLANG_BARLINK_TRANSPORT=host`, see
+python/sglang/srt/distributed/device_communicators/barlink_host.py) moves the
 payload over ONE pinned, portable host segment and is driven entirely by two
 kernels -- no host sync, no allocation in the hot path, completion signaled
 via flags in pinned memory. On this rig the plain pinned host path measured
@@ -54,16 +54,16 @@ MEASUREMENT DISCIPLINE (built in, not optional)
   from that round on, and is carried in the report with a reason.
 * **Dead variants with a reason, never a silent fallback.** If a transport
   fails to come up, or the active transport is not the one requested
-  (htccl.py silently falls back to the gloo inline layer for some names),
+  (barlink.py silently falls back to the gloo inline layer for some names),
   the backend is dropped on ALL ranks and the reason is printed. Something
   else is never measured as a substitute and reported as the one requested.
 
 COMPARABILITY, honestly
 =========================
-* HTCCL's `all_reduce` is OUT-OF-PLACE (returns a new tensor), NCCL's
+* barlink's `all_reduce` is OUT-OF-PLACE (returns a new tensor), NCCL's
   `dist.all_reduce` is IN-PLACE. The host transport therefore additionally
   writes a full result into a fresh buffer. If anything, the comparison is
-  skewed AGAINST HTCCL -- not in its favor.
+  skewed AGAINST barlink -- not in its favor.
 * The completion signal in the measurement path is the same for BOTH
   backends: `--completion sync` (default) calls `torch.cuda.synchronize`,
   `--completion event` polls a `cuda.Event`. The transport itself never
@@ -83,7 +83,7 @@ INVOCATION
 ==========
     python3 benchmark/bench_host_transport.py --devices 1,2
     python3 benchmark/bench_host_transport.py --devices 1,2,3 \
-        --op all_to_all --backends htccl:bar1,nccl
+        --op all_to_all --backends barlink:bar1,nccl
 
 The rank count follows from ``--devices``; it is no longer fixed at two.
 
@@ -111,18 +111,18 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 #: 20 KiB, 80 KiB, 1 MiB, 4 MiB, 16 MiB.
 DEFAULT_SIZES = "20480,81920,1048576,4194304,16777216"
 
-#: name -> (SGLANG_HTCCL_TRANSPORT value, expected transport class). The class
-#: name is the probe against the silent fallback: htccl.py lets an unknown or
+#: name -> (SGLANG_BARLINK_TRANSPORT value, expected transport class). The class
+#: name is the probe against the silent fallback: barlink.py lets an unknown or
 #: failed transport drop to the gloo inline layer, and then you measure gloo
 #: and call it "host".
-HTCCL_BACKENDS = {
-    "htccl:host": ("host", "HTCCLHostTransport"),
-    "htccl:device": ("device", "HTCCLDeviceTransport"),
-    "htccl:shm": ("shm", "HTCCLShmTransport"),
-    "htccl:bar1": ("bar1", "HTCCLBar1Transport"),
-    "htccl:matrix": ("matrix", "HTCCLMatrixTransport"),
+BARLINK_BACKENDS = {
+    "barlink:host": ("host", "BarlinkHostTransport"),
+    "barlink:device": ("device", "BarlinkDeviceTransport"),
+    "barlink:shm": ("shm", "BarlinkShmTransport"),
+    "barlink:bar1": ("bar1", "BarlinkBar1Transport"),
+    "barlink:matrix": ("matrix", "BarlinkMatrixTransport"),
 }
-DEFAULT_BACKENDS = "htccl:host,nccl"
+DEFAULT_BACKENDS = "barlink:host,nccl"
 
 #: Lower bound for the warmup per cell. See the header: without warmup, a
 #: factor of 7.6.
@@ -245,7 +245,7 @@ def run_rank(a: argparse.Namespace) -> int:
         backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world, timeout=to,
         device_id=dev,
     )
-    # Separate groups: HTCCL needs a pure gloo CPU group, NCCL gets its own,
+    # Separate groups: barlink needs a pure gloo CPU group, NCCL gets its own,
     # so that the two data planes do not serialize against each other over a
     # shared group.
     gloo_pg = dist.new_group(ranks=list(range(world)), backend="gloo", timeout=to)
@@ -262,28 +262,28 @@ def run_rank(a: argparse.Namespace) -> int:
     p = torch.cuda.get_device_properties(dev_ord)
     print(f"# rank{rank} -> cuda:{dev_ord} {p.name} sm_{p.major}{p.minor}", flush=True)
 
-    # ---------------- build the HTCCL communicators ----------------
+    # ---------------- build the barlink communicators ----------------
     sys.path.insert(0, a.sglang_python)
-    import sglang.srt.distributed.device_communicators.htccl as htccl_mod
+    import sglang.srt.distributed.device_communicators.barlink as barlink_mod
 
     comms: dict[str, object] = {}
     dead: dict[str, str] = {}
     for name in a.backends:
         if name == "nccl":
             continue
-        transport, want = HTCCL_BACKENDS[name]
+        transport, want = BARLINK_BACKENDS[name]
         err = ""
         obj = None
         t0 = time.time()
         try:
-            # In htccl.py the transport name comes from the module variable
+            # In barlink.py the transport name comes from the module variable
             # `_TRANSPORT`, filled once at import time from
-            # SGLANG_HTCCL_TRANSPORT; a single process therefore cannot see
+            # SGLANG_BARLINK_TRANSPORT; a single process therefore cannot see
             # the env var with two different values. Setting `_TRANSPORT` is
             # exactly the value the variable would have produced -- same code
             # path.
-            htccl_mod._TRANSPORT = transport
-            obj = htccl_mod.HTCCLCommunicator(cpu_group=gloo_pg, device=dev)
+            barlink_mod._TRANSPORT = transport
+            obj = barlink_mod.BarlinkCommunicator(cpu_group=gloo_pg, device=dev)
             got = type(obj.transport).__name__ if obj.transport is not None else None
             if got != want:
                 err = (
@@ -437,7 +437,7 @@ def run_rank(a: argparse.Namespace) -> int:
     # ---------------- ask the direct path up front, for all_to_all --------
     #
     # At large payloads a skewed block exceeds the slot limit. Then
-    # HTCCLCommunicator.all_to_all_single falls back to the CPU layer -- which
+    # BarlinkCommunicator.all_to_all_single falls back to the CPU layer -- which
     # is correct, but here it would be a measurement of the gloo layer under
     # the name of the direct path. So ask first, and otherwise drop the cell
     # with a reason.
@@ -501,7 +501,7 @@ def run_rank(a: argparse.Namespace) -> int:
         """Known-answer check. Empty string = fine."""
         op, nb, pattern, be = cell
         if op == "all_reduce":
-            # NCCL computes in place, HTCCL out of place -- the copy sits
+            # NCCL computes in place, barlink out of place -- the copy sits
             # outside any timing.
             x, out, want = check_in[nb].clone(), None, check_want[nb]
         else:
@@ -638,8 +638,8 @@ def run_rank(a: argparse.Namespace) -> int:
             "rounds": a.rounds,
             "warmup_s_per_cell": a.warmup,
             "measure_s_per_cell": a.secs,
-            "htccl_slot_mib": os.environ.get("SGLANG_HTCCL_SLOT_MIB", "64 (default)"),
-            "htccl_host_blocks": os.environ.get("SGLANG_HTCCL_HOST_BLOCKS",
+            "barlink_slot_mib": os.environ.get("SGLANG_BARLINK_SLOT_MIB", "64 (default)"),
+            "barlink_host_blocks": os.environ.get("SGLANG_BARLINK_HOST_BLOCKS",
                                                 "32 (default)"),
             "world": world,
             "op": a.op,
@@ -675,7 +675,7 @@ def run_rank(a: argparse.Namespace) -> int:
 def report(a, ops, sizes, backends, res, peer_res, meta, a2a_tot) -> None:
     print()
     print("=" * 78)
-    print("HTCCL against NCCL -- one run, interleaved, "
+    print("barlink against NCCL -- one run, interleaved, "
           + "/".join(ops))
     print("=" * 78)
     for k, v in meta.items():
@@ -699,8 +699,8 @@ def report(a, ops, sizes, backends, res, peer_res, meta, a2a_tot) -> None:
     print("  Neither all_reduce nor all_to_all has a half path --")
     print("  do not mix these with the point-to-point numbers.")
     print("  MB/s = payload per operation / p50, not bus bandwidth.")
-    print("  all_reduce: HTCCL computes OUT of place, NCCL IN place -- HTCCL")
-    print("  additionally writes a full result. The bias runs against HTCCL,")
+    print("  all_reduce: barlink computes OUT of place, NCCL IN place -- barlink")
+    print("  additionally writes a full result. The bias runs against barlink,")
     print("  not in its favor.")
     print("  all_to_all: BOTH out of place, same split sizes, same buffers.")
     print("  The comparison is unbiased there.")
@@ -827,7 +827,7 @@ def main() -> int:
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--backends", default=DEFAULT_BACKENDS,
-                    help="comma list of nccl," + ",".join(HTCCL_BACKENDS))
+                    help="comma list of nccl," + ",".join(BARLINK_BACKENDS))
     ap.add_argument("--secs", type=float, default=3.0,
                     help="measurement budget per cell in seconds (over all "
                          "rounds)")
@@ -844,10 +844,10 @@ def main() -> int:
                     help="completion signal in the measured path, the same "
                          "for every backend")
     ap.add_argument("--slot-mib", type=int, default=32,
-                    help="SGLANG_HTCCL_SLOT_MIB for the child processes; must "
+                    help="SGLANG_BARLINK_SLOT_MIB for the child processes; must "
                          "hold at least the largest payload")
     ap.add_argument("--bar1-window-mib", type=int, default=0,
-                    help="SGLANG_HTCCL_BAR1_WINDOW_MIB for the child "
+                    help="SGLANG_BARLINK_BAR1_WINDOW_MIB for the child "
                          "processes (0 = the module default, 96). The a2a "
                          "slot per directed pair is roughly window/(6(R-1)); "
                          "a skewed block above that makes the direct path "
@@ -862,7 +862,7 @@ def main() -> int:
     a = ap.parse_args()
     a.backends = [b for b in a.backends.split(",") if b]
     for b in a.backends:
-        if b != "nccl" and b not in HTCCL_BACKENDS:
+        if b != "nccl" and b not in BARLINK_BACKENDS:
             raise SystemExit(f"unknown backend {b!r}")
     if a.warmup < MIN_WARMUP_S:
         print(f"# Warmup raised from {a.warmup:.1f} s to {MIN_WARMUP_S:.1f} s: "
@@ -899,11 +899,11 @@ def main() -> int:
            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
            "MASTER_ADDR": "127.0.0.1",
            "MASTER_PORT": str(a.port),
-           "SGLANG_HTCCL_SLOT_MIB": str(a.slot_mib),
+           "SGLANG_BARLINK_SLOT_MIB": str(a.slot_mib),
            "PYTHONPATH": a.sglang_python + ":" + os.environ.get("PYTHONPATH", ""),
            "PYTHONUNBUFFERED": "1"}
     if a.bar1_window_mib:
-        env["SGLANG_HTCCL_BAR1_WINDOW_MIB"] = str(a.bar1_window_mib)
+        env["SGLANG_BARLINK_BAR1_WINDOW_MIB"] = str(a.bar1_window_mib)
     base = [sys.executable, os.path.abspath(__file__)]
     for k, v in vars(a).items():
         if k == "rank":

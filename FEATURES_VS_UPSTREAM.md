@@ -61,7 +61,7 @@ Without these, three genuinely different GPUs cannot be combined into one usable
 | [1](#f1) | Asymmetric tensor parallelism | Boot-checked | no | no | partial | partial |
 | [2](#f2) | Asymmetric decode context parallelism | Cross-checked | partial | partial | no | no |
 | [10](#f10) | Measured VRAM budget | Boot-checked | partial | partial | partial | partial |
-| [21](#f21) | HTCCL cross-vendor collectives | Cross-checked | no | no | partial | partial |
+| [21](#f21) | barlink cross-vendor collectives | Cross-checked | no | no | partial | partial |
 | [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
 | [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked | no | no | partial | unverified |
 | [11](#f11) | Cross-architecture speculative determinism | Boot-checked | partial | partial | no | no |
@@ -376,9 +376,9 @@ log emits a vector hint fed back on restart. **Boot-checked.**
 absolute budget.
 
 <a id="f21"></a>
-### 21. HTCCL cross-vendor collectives
+### 21. barlink cross-vendor collectives
 
-`SGLANG_HTCCL_TRANSPORT` = `gloo` / `shm` / `device` / `ucx` — vendor-neutral TP collectives that
+`SGLANG_BARLINK_TRANSPORT` = `gloo` / `shm` / `device` / `ucx` — vendor-neutral TP collectives that
 never call NCCL/RCCL, so one TP group can mix an NVIDIA and an AMD GPU. `device` reduces on-GPU over
 host-mapped memory and is CUDA-graph capturable; `ucx` is the cross-host data plane, with the same
 host-staged semantics as `gloo` but RDMA instead of TCP. **Cross-checked**, merged.
@@ -395,9 +395,9 @@ host-staged semantics as `gloo` but RDMA instead of TCP. **Cross-checked**, merg
 
 | Design point | Detail |
 |---|---|
-| ctypes over `libucp`, not ucx-py or Cython | version parity requires loading a *specific* library path; `ucx-py` bundles its own UCX and hard-codes one side of the mismatch, and is asyncio-shaped, the wrong control flow for a synchronous collective on a bs=1 decode path. Cython needs a compiler and UCX headers per host, and the second rig has the runtime libraries without the `-dev` package. A subprocess bridge adds an IPC hop to a ~1.5 us path. ctypes needs no build step and no headers, and takes the library from `SGLANG_HTCCL_UCX_LIB`. Struct layouts are mask-driven, over-allocated, and the transcribed offsets are asserted at import |
-| Version parity enforced, not hoped for | mixed UCX releases do not degrade; endpoint creation fails with `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over the existing `gloo` `cpu_group` and refuses **before any endpoint exists**, naming every rank's version, library path and the `SGLANG_HTCCL_UCX_LIB` remedy |
-| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below) and `all_gather` above `SGLANG_HTCCL_UCX_AG_RING_KIB` (32 KiB, measured; that ring saves no bytes, it saves the single UCX worker from progressing 2(W-1) requests at once). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
+| ctypes over `libucp`, not ucx-py or Cython | version parity requires loading a *specific* library path; `ucx-py` bundles its own UCX and hard-codes one side of the mismatch, and is asyncio-shaped, the wrong control flow for a synchronous collective on a bs=1 decode path. Cython needs a compiler and UCX headers per host, and the second rig has the runtime libraries without the `-dev` package. A subprocess bridge adds an IPC hop to a ~1.5 us path. ctypes needs no build step and no headers, and takes the library from `SGLANG_BARLINK_UCX_LIB`. Struct layouts are mask-driven, over-allocated, and the transcribed offsets are asserted at import |
+| Version parity enforced, not hoped for | mixed UCX releases do not degrade; endpoint creation fails with `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over the existing `gloo` `cpu_group` and refuses **before any endpoint exists**, naming every rank's version, library path and the `SGLANG_BARLINK_UCX_LIB` remedy |
+| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_BARLINK_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below) and `all_gather` above `SGLANG_BARLINK_UCX_AG_RING_KIB` (32 KiB, measured; that ring saves no bytes, it saves the single UCX worker from progressing 2(W-1) requests at once). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
 
 **Status (`ucx`):** implemented and validated on real RDMA, CPU-only, and since executed end-to-end with a GPU and a model on the cross-rig TP=4 boot below (tasks #198/#204/#244/#263; rig-runbook §4.3) — the "not yet exercised" wording below predates those tasks.
 
@@ -428,7 +428,7 @@ Three verdicts follow, all falsifiable from the same harness
 * **Rendezvous is not the cost.** `UCX_RNDV_THRESH=inf` at world 4 moves 80 KiB from 394 to 389 us
   — inside noise. The protocol-handshake hypothesis is refuted at decode sizes.
 * **The ring threshold was 25x too high.** flat and ring cross at ~22 KiB, and the ring wins 2x from
-  64 KiB up, so `SGLANG_HTCCL_UCX_RING_KIB` now defaults to 24 KiB (was `..._RING_MIB=1`, still
+  64 KiB up, so `SGLANG_BARLINK_UCX_RING_KIB` now defaults to 24 KiB (was `..._RING_MIB=1`, still
   accepted). A speculative verify all-reduce is the far side of that crossover, so on a cross-rig
   group the ring is the ordinary decode path. Exactness gated on the real link at world 4 across
   8/16/23/24/25/32/80/128 KiB and ragged tails: 0 mismatches, ring and flat alike.
@@ -443,7 +443,7 @@ threads land on one core count and the region's join waits on a descheduled thre
 rig-1 host, 3 concurrent processes, 320 KiB fp32: the whole-buffer copy is 7.91 us in the median
 with a **6000.80 us maximum**; split below the grain it is 22.41 us with a 46.23 us maximum. Under
 the real harness that tail *is* the median. The host passes that are not already chunked now split
-at the grain (`SGLANG_HTCCL_UCX_GRAIN_ELEMS`, 0 restores the old behaviour); the pipelined
+at the grain (`SGLANG_BARLINK_UCX_GRAIN_ELEMS`, 0 restores the old behaviour); the pipelined
 multi-chunk path is deliberately untouched, because its large-payload throughput does want the
 parallel copy. Byte-neutral by construction — copy and accumulate are elementwise, so no sub-range
 sees a different addend. Measured `all_reduce`, world 4, cross-rig, median of 100 after 20 warmup:
@@ -471,7 +471,7 @@ place:
 | flat | 54.0 | 97.2 | 195.8 | 397.6 | 642.3 | 1321.9 |
 | ring | 73.3 | 110.2 | 180.2 | **298.6** | **452.0** | **966.9** |
 
-They cross at ~32 KiB, which is the new default of `SGLANG_HTCCL_UCX_AG_RING_KIB` (0 disables the
+They cross at ~32 KiB, which is the new default of `SGLANG_BARLINK_UCX_AG_RING_KIB` (0 disables the
 ring and is the A/B control). A bs=1 decode gather (20 KiB) stays flat; a 4-token verify gather
 (80 KiB) rings and costs 25 % less. Exactness gated on the real link at world 4 with both rings
 active, across 8/16/23/24/25/32/80/128 KiB and ragged tails: **0 mismatches at atol 0**.
@@ -484,7 +484,7 @@ Decode-shaped cells at the resulting defaults (world 4, cross-rig, median of 100
 ended pointing at the same suspect: one rank's single-threaded UCX worker, not the link. #244 found
 the same world-4 group *with no wire at all* slower than across RDMA; #263 found an `all_gather`
 ring beating the flat exchange while moving identical bytes, purely by handing the worker two
-requests at a time instead of `2(W-1)`. `SGLANG_HTCCL_UCX_WORKERS=2` builds a second UCP context and
+requests at a time instead of `2(W-1)`. `SGLANG_BARLINK_UCX_WORKERS=2` builds a second UCP context and
 worker per rank, its address carried in the *same* rendezvous `all_gather_object` (no extra
 collective), and splits work across the two. Two structures were split, and they turned out to be
 independent mechanisms with **opposite signs**:
@@ -515,7 +515,7 @@ of ±3.5 % (±5 % at 20 KiB, tail-heavy above 128 KiB); the 20 KiB distributions
 reason it cannot win is structural. A ring step is exactly two requests in lock step, so there is no
 concurrency for a second worker to expose; halving the bytes per hop buys nothing on a link where
 #244 already established the bytes are not the cost; and every spin pass now progresses two engines
-instead of one. It ships as `SGLANG_HTCCL_UCX_RING_BIDIR`, default **off**, as the A/B control and
+instead of one. It ships as `SGLANG_BARLINK_UCX_RING_BIDIR`, default **off**, as the A/B control and
 for links where the bytes genuinely do dominate.
 
 Correctness and blast radius:
@@ -523,7 +523,7 @@ Correctness and blast radius:
 * Byte gate at atol 0 over the real RDMA link, world 4, `all_reduce` **and** `all_gather`, at
   8/16/23/24/25/32/80/128/256 KiB each with ragged tails (`+0/+1/+3` elements): **0 mismatches** in
   all three configurations (1 worker; 2 workers; 2 workers + bidirectional ring). Same gate green
-  locally at worlds 2, 3 and 4. 85 registered `htccl` unit tests green.
+  locally at worlds 2, 3 and 4. 85 registered `barlink` unit tests green.
 * The default path is unchanged and measured to be so: base commit against this change, both at
   1 worker, interleaved in one session — 80 KiB 202.8 vs 200.0 us, 128 KiB 272.3 vs 271.8 us,
   256 KiB 547.8 vs 557.9 us (medians of 5 runs at 256 KiB, the tail-heavy point). All inside noise.
@@ -584,12 +584,12 @@ sizes. An earlier measurement of the same cells on the same link, before the com
 
 Changes: a two-parity chunk pipeline for `all_reduce`, scheduled
 `stage-in(k+1) → wait(k) → post(k+1) → finish(k)`; progress interleaving every
-`SGLANG_HTCCL_UCX_PROGRESS_KIB` (default 256) inside the staged copies, without which the next
+`SGLANG_BARLINK_UCX_PROGRESS_KIB` (default 256) inside the staged copies, without which the next
 chunk's rendezvous handshake cannot start during a several-hundred-microsecond memcpy — removing it
 drops the 32 MiB figure from 17.4 to 13.8 Gbit/s; and a short small-message path with precomputed
 barrier slots, memoised staging records, error strings built only on failure, bound ctypes function
 objects, a single-request fast path in `wait`, and a dedicated single-chunk branch.
-`SGLANG_HTCCL_UCX_PIPELINE=0` restores the previous path as an A/B control.
+`SGLANG_BARLINK_UCX_PIPELINE=0` restores the previous path as an A/B control.
 
 `all_gather` received the same pipeline and a single-chunk fast path; the own rank's slice is copied
 device-locally inside `finish(k)` and never crosses the wire. Correctness: all references exact at
@@ -637,7 +637,7 @@ Transport-level overlap, CPU tensors over the real link: `sync(coll+busy)` again
 same CPU as the busy loop; only ~5 us of wire is hideable, and the handle/pool overhead of ~4 us
 consumes it.
 
-**Consumer-side overlap**, `SGLANG_HTCCL_UCX_OVERLAP=1`, default off. The MLP all-reduce rides the
+**Consumer-side overlap**, `SGLANG_BARLINK_UCX_OVERLAP=1`, default off. The MLP all-reduce rides the
 existing `fuse_mlp_allreduce` seam, the one legal deferral window in a dense decoder chain: layer
 N's `down_proj` all-reduce is mathematically movable into layer N+1's `prepare_attn`, where
 all-reduce, residual and layernorm happen together; everything else in the chain is a strict
@@ -665,7 +665,7 @@ waiting in lock step.
 | Step | Requirement |
 |---|---|
 | Preconditions | the same UCX release on both rigs; `/dev/infiniband` present in the ranks' namespace; RoCE port ACTIVE. The development container has neither `/dev/infiniband` nor a RoCE address, so GPU ranks must run where both the cards and the NIC are visible |
-| Flags | `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=ucx`, `--nnodes 2 --node-rank {0,1}`, `--dist-init-addr <LAN ip>:<port>` — the control plane stays on 1 GbE, only UCX rides RoCE; per rank `UCX_TLS=rc,self,sm`, `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=<port>` |
+| Flags | `SGLANG_BARLINK=1 SGLANG_BARLINK_TRANSPORT=ucx`, `--nnodes 2 --node-rank {0,1}`, `--dist-init-addr <LAN ip>:<port>` — the control plane stays on 1 GbE, only UCX rides RoCE; per rank `UCX_TLS=rc,self,sm`, `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=<port>` |
 | `--enforce-eager` required | like `gloo` and `shm`, this transport synchronises with the host inside every collective, so it cannot be inside a CUDA-graph capture. Only `device` is capturable |
 | Model geometry | `tp_size <= q/kv` units; Qwen3.5-4B cannot do TP=5. Any model fitting one card per rig works for a TP=2 smoke test |
 | Expected first failures, in likelihood order | pinned-buffer registration cost on the first collective, since staging buffers are `pin_memory=True` only when the rank's device is CUDA; a rank-uniformity break if any path issues a collective on one rig and not the other; the per-collective software floor showing up as poor decode tok/s |
@@ -674,7 +674,7 @@ waiting in lock step.
 **Cross-rig transport, measured (task #204, 2026-07-26).** Two hosts, one rank per host, CPU
 tensors, world=2, 10 iterations per cell, median. Three configurations, chosen so that the
 *wire* and the *transport stack* can be told apart: `gloo` over the 1 GbE LAN, `gloo` over the
-RoCE NIC's IP (TCP on the fast wire), and HTCCL/UCX native RDMA on that same NIC.
+RoCE NIC's IP (TCP on the fast wire), and barlink/UCX native RDMA on that same NIC.
 
 | cell | gloo 1 GbE | gloo RoCE (TCP) | **UCX RDMA** | RDMA vs 1 GbE | RDMA vs gloo-on-same-wire |
 |---|---|---|---|---|---|
@@ -715,7 +715,7 @@ mechanisms, neither able to see a dead process:
 |---|---|---|
 | host, every `dist.*` on the gloo `cpu_group` | 7200 s, hardcoded in `GroupCoordinator.__init__` | `--dist-timeout` reached only the NCCL `device_group`; two hours is a hang as far as an operator is concerned |
 | host, `torch.cuda.synchronize()` after a spinning kernel | none | blocks the host thread in the driver, turning a wedged stream into a wedged process |
-| device, BAR1 spin kernels | `SGLANG_HTCCL_BAR1_CAP_CYCLES`, ~30 s at 2 GHz | rank-local, multiplied 40x inside the JIT cold-build window — which IS the capture window — and its expiry wrote a `ctlStatus` word no production path read, so the stream continued over a partially written buffer |
+| device, BAR1 spin kernels | `SGLANG_BARLINK_BAR1_CAP_CYCLES`, ~30 s at 2 GHz | rank-local, multiplied 40x inside the JIT cold-build window — which IS the capture window — and its expiry wrote a `ctlStatus` word no production path read, so the stream continued over a partially written buffer |
 
 The fix publishes one fact and consults it only while a wait is already making no progress:
 `(hostname, pid, /proc start time)` per rank at transport bring-up, so a same-host peer is
@@ -725,9 +725,9 @@ the `cpu_group` now honours `--dist-timeout` like the device group does. For the
 watchdog thread writes a 32-bit abort word in pinned, device-mapped host memory, which the spin
 kernels poll every 1024 iterations and answer with the abort path they already had — the only
 channel that can end a spin during graph replay, where no host code runs inside the collective.
-Knobs: `SGLANG_HTCCL_PEER_LIVENESS` (kill switch, `0` restores the previous unbounded calls
-exactly), `SGLANG_HTCCL_PEER_TIMEOUT_S` (120), `SGLANG_HTCCL_PEER_PROBE_S` (1),
-`SGLANG_HTCCL_PEER_WATCHDOG`. Nothing runs on a collective that completes.
+Knobs: `SGLANG_BARLINK_PEER_LIVENESS` (kill switch, `0` restores the previous unbounded calls
+exactly), `SGLANG_BARLINK_PEER_TIMEOUT_S` (120), `SGLANG_BARLINK_PEER_PROBE_S` (1),
+`SGLANG_BARLINK_PEER_WATCHDOG`. Nothing runs on a collective that completes.
 
 **Upstream:** torch's process-group timeout is the only bound stock SGLang/vLLM have, and it is a
 duration, not a liveness check — a wedged peer and a dead one are indistinguishable to it, and a
@@ -745,7 +745,7 @@ platform checks, with real fallbacks (`forward_native`, torch-native sampler bac
 |---|---|
 | RTX 2080 Ti with `sgl_kernel` absent | all 11 core modules import, server starts, coherent generation, 608 unit tests pass |
 | `forward_native` sm75 against gfx900 | byte-identical; against the kernel path it differs by a ~4.8e-07-class reduction-order difference |
-| Mixed-vendor TP=2, Triton, HTCCL/`gloo` | reproduces the token ids of both solo runs, with solo as the independent oracle on each vendor |
+| Mixed-vendor TP=2, Triton, barlink/`gloo` | reproduces the token ids of both solo runs, with solo as the independent oracle on each vendor |
 | Fixes | Turing support; rope/`clamp_position` routing; a 4th platform-vs-availability defect on the NVIDIA rank, reproduced on hardware before the fix (red-then-green) |
 | Scope | gfx900 Triton support depends on an external `triton-gcn5` fork, not on fork code |
 
@@ -900,7 +900,7 @@ Design notes: `docs_new/weightless_kv_role_precision.md`, `docs_new/weightless_c
 `--pp-layer-ratio` extended across hosts (`scripts/pp/pp_crossrig_launch.sh`) — the two
 pipeline stages run on different machines over the 40G RoCE line, each stage sized by
 the ratio rather than an equal layer split, so a stage can go to whichever physical GPU
-a host actually has, fast or slow, without needing HTCCL: under PP each node holds
+a host actually has, fast or slow, without needing barlink: under PP each node holds
 `tp_size=1`, so no TP group ever spans the two hosts, and the transport is plain
 `torch.distributed.isend`/`irecv` (NCCL) plus gloo for the pickled shape metadata — CUDA
 graphs stay on on both stages, including the sm75 one. **Boot-checked** — merged
@@ -911,10 +911,10 @@ graphs stay on on both stages, including the sm75 one. **Boot-checked** — merg
 | Vehicle | Qwen3.5-4B fp16, `--pp-layer-ratio 20,12`, stage 0 on a rig-1 3080, stage 1 on rig 2's 2080 Ti, task #201 slice 2 |
 | Cost, honestly bounded | 55.1 tok/s / 18.16 ms per token against a 67.6 tok/s / 14.80 ms monolithic control on the same 3080 (8k-prompt TTFT 3.42 s against 1.35 s; A-vs-A noise floor 1.1-2.1%) — 18% of decode and 2.5x the prefill TTFT against the faster card alone. "PP does not beat a card the model already fits on — it buys the capacity to run one that does not" |
 | Where the cost lives | only ~0.4 ms of the 3.4 ms/token difference is the stage boundary itself (NCCL 1-way 142 us at bs=1, p90 173 us); the rest is the slower stage's own compute and the pipeline bubble, which `--disable-overlap-schedule` (forced under PP) cannot hide for a single request. At bs=1 the pickled shape metadata (`send_tensor_dict`) costs more than the payload — 249 us against 142 us, 64% of the crossing; caching it is queued, not built |
-| Why this needed no new collective code | `_calculate_rank_ranges` already placed `pp_rank` per node, and `check_server_args` already asserts `(tp_size * pp_size) % nnodes == 0`. A flat cross-rig TP=2 on the same two cards does not come up at all on plain NCCL (rank 0 dies silently in `init_distributed`, rank 1 hangs in `all_reduce` forever) — the no-number is itself part of the case for row 21's HTCCL/UCX on the TP axis, and for why PP sidesteps it entirely |
+| Why this needed no new collective code | `_calculate_rank_ranges` already placed `pp_rank` per node, and `check_server_args` already asserts `(tp_size * pp_size) % nnodes == 0`. A flat cross-rig TP=2 on the same two cards does not come up at all on plain NCCL (rank 0 dies silently in `init_distributed`, rank 1 hangs in `all_reduce` forever) — the no-number is itself part of the case for row 21's barlink/UCX on the TP axis, and for why PP sidesteps it entirely |
 | Hybrid-model correctness | a hybrid-GDN model splits its KV pool by full-attention layers, not by total layer count — a 14:10 layer split gave 3 full-attention layers per stage and an identical KV size on both; a split planner reading `num_hidden_layers` alone sizes every hybrid stage wrong |
 | Fabric finding | NCCL's ibverbs path is broken on this RoCE fabric (`IBV_WC_REM_INV_REQ_ERR` on the first proxy tensor); NCCL over sockets on the same HCA works and measures 2.07 GB/s, the 40G line rather than the 1 GbE fallback (0.105 GB/s) |
-| Open | `max_total_num_tokens` stays min-reduced across the world group, so the tighter stage still caps both, unchanged from the intra-rig slice; a genuinely cross-vendor pipeline (the Vega 64) is unexercised — slice 1 records it as needing HTCCL-p2p later, this slice only crossed two NVIDIA cards |
+| Open | `max_total_num_tokens` stays min-reduced across the world group, so the tighter stage still caps both, unchanged from the intra-rig slice; a genuinely cross-vendor pipeline (the Vega 64) is unexercised — slice 1 records it as needing barlink-p2p later, this slice only crossed two NVIDIA cards |
 
 Recipe: rig-runbook §4.9.
 
@@ -1285,10 +1285,10 @@ RoCE link with a negative control.
 | Mechanism | the UCX context is pinned with `ucp_config_modify(NET_DEVICES)` per instance. `UCX_NET_DEVICES` is one process-wide value and cannot address two instances or two classes; a modified config can. Unset → the call is skipped and the config is exactly the one the environment produced |
 | Reaches | (a) small and (b) large TP collectives via `small` — they share **one** UCX context, so this pins the whole collective plane; (c) PD-KV / HiCache via `bulk`, which seeds `--disaggregation-ib-device` when unset. (d) rendezvous/control is left on `--dist-init-addr` / `GLOO_SOCKET_IFNAME` on purpose |
 | Not separable | (a) from (b). One `UcpWorker`, one endpoint per peer. A genuine split needs a second UCX context, a second address exchange at rendezvous and a rank-uniform size-keyed selector (a disagreement deadlocks rather than returning a wrong answer) — ~200 lines plus cross-rig validation, not built. Setting `small` ≠ `bulk` is legal and logs that (b) stays on `small` |
-| Not rank-uniform | unlike every `SGLANG_HTCCL*` knob. The value is a local device name and the two ends of one link are called different things (`rocep4s0f1` / `rocep1s0f1`); the wire has to match, not the string |
+| Not rank-uniform | unlike every `SGLANG_BARLINK*` knob. The value is a local device name and the two ends of one link are called different things (`rocep4s0f1` / `rocep1s0f1`); the wire has to match, not the string |
 | Why the flags reject unknown devices | UCX does **not** fail on one. It warns `network device '...' is not available` and builds a context with no network transport, so the run completes and reports loopback numbers. Both flags validate against `/sys/class/infiniband` and `/sys/class/net` during server-args resolution and name what the host does have |
 | Evidence | cross-rig world-2 `all_reduce` over the 40G RoCE link with `UCX_TLS=rc,self,sm` and `UCX_NET_DEVICES` **unset**, driven only by `SGLANG_COLLECTIVE_NET_SMALL`: completes at 29.69 us / 184.54 us for 8 / 256 KiB. Negative control: repinned to the unwired second port `rocep4s0f0:1`, `ucp_ep_create` fails with `Destination is unreachable` — the pin is load-bearing, not decorative |
-| Default unchanged | 12 new CPU tests plus the 39 pre-existing HTCCL/UCX tests green. A/B control on the legacy `UCX_NET_DEVICES` route: 26.33 / 24.14 / 38.39 us at 8 KiB and 187.50 / 182.97 / 181.18 us at 256 KiB — the new route lands inside the old route's own repeat spread, and at 8 KiB that spread is far too wide for a 50-iteration harness to resolve a difference at all |
+| Default unchanged | 12 new CPU tests plus the 39 pre-existing barlink/UCX tests green. A/B control on the legacy `UCX_NET_DEVICES` route: 26.33 / 24.14 / 38.39 us at 8 KiB and 187.50 / 182.97 / 181.18 us at 256 KiB — the new route lands inside the old route's own repeat spread, and at 8 KiB that spread is far too wide for a 50-iteration harness to resolve a difference at all |
 | Worth it here? | no. This rig measures 1.47 us (FEC-free 40G) vs 1.58 us (100G, slot-limited to 3.43 GB/s) for an 8 B message, so there is no split worth making. The feature targets hosts whose latency-optimal and bandwidth-optimal cards differ |
 
 **Upstream:** sglang exposes `--disaggregation-ib-device` for the PD bulk side only; the collective
@@ -1323,7 +1323,7 @@ fork's delta on top of it. llama.cpp/ik_llama.cpp have no PD disaggregation.
 <a id="f28"></a>
 ### 28. GPU-to-GPU collectives over small PCIe BARs
 
-`SGLANG_HTCCL_TRANSPORT=bar1` — TP collectives in which each card writes **directly into
+`SGLANG_BARLINK_TRANSPORT=bar1` — TP collectives in which each card writes **directly into
 its neighbour's memory** across the PCIe BAR, with no bounce through system RAM and no
 RDMA NIC. Resizable-BAR machines can do this through CUDA P2P; the delta here is that it
 also works on cards whose BAR1 aperture is 256 MiB, which is every GeForce in this rig.
@@ -1335,16 +1335,16 @@ and still needs an out-of-tree driver patch to run at all. Branch `feat/bar1-int
 |---|---|
 | Mechanism | dma-buf export (`NV_ESC_EXPORT_TO_DMABUF_FD`) plus a small GPL kernel module (`dmabuf_holder`) that holds the buffer so the BAR1 mapping exists. `cuMemGetHandleForAddressRange` fails on GeForce and a static BAR1 window is useless — allocations are physically scattered. 96 MiB maps contiguously out of 256 MiB gross |
 | Byte proof first, numbers second | all six directed pairs, `bad_bytes = 0` over 1.1 M verified rounds, read back through the **target card's own** pointer rather than the write path, so a broken path cannot hide its own error. A pair the driver reported as peer-capable delivered 4096 of 1 048 576 bytes; the byte proof struck the edge and `handles()` says no for it |
-| Transport measured | HTCCL, bf16, three cards, interleaved against NCCL in the same run: **1.13x / 1.34x / 1.15x / 1.04x / 1.30x** at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB. An independently built standalone probe (no sglang) agrees: 1.48 / 1.45 / 1.13 / 1.04 / 1.27. Two separately built paths, one answer |
-| `all_gather` and `broadcast` | added over the s00-s12 window (`HTCCL_OPS`, `ag_plan`, multi-round over the a2a kernel; broadcast tiny-value floors `bc_min_bytes`/`ag_min_bytes` lowered 16 -> 1). This closed the CUDA-graph-capture gap that previously blocked every serving-level run; `reduce_scatter` remains behind the transport gate, unmeasured |
+| Transport measured | barlink, bf16, three cards, interleaved against NCCL in the same run: **1.13x / 1.34x / 1.15x / 1.04x / 1.30x** at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB. An independently built standalone probe (no sglang) agrees: 1.48 / 1.45 / 1.13 / 1.04 / 1.27. Two separately built paths, one answer |
+| `all_gather` and `broadcast` | added over the s00-s12 window (`BARLINK_OPS`, `ag_plan`, multi-round over the a2a kernel; broadcast tiny-value floors `bc_min_bytes`/`ag_min_bytes` lowered 16 -> 1). This closed the CUDA-graph-capture gap that previously blocked every serving-level run; `reduce_scatter` remains behind the transport gate, unmeasured |
 | End to end: **transport accepted** | s11 of the battery: green across all process-group shapes exercised, CUDA-graph gate 7/7 (`benchmark/bar1_graph_check.py`, container and bare host). This is the gate that used to fail on `all_gather`; it is the reason serving-level numbers exist at all now |
 | Serving-level result (s12, single boot, verified A/B) | solo prefill **+14.3 %** (1469.0 vs 1285.6 tok/s at 1 session); decode **+3-4 %** (bs=1 ~32.6-33.2 vs ~31.5-31.9 tok/s; bs=16 ~166.5-168.9 vs ~161.7-162.6 tok/s). Real, not Amdahl arithmetic |
 | Multi-session ceiling: **answered, does not rise** | prefill ratio bar1/baseline across 1/4/8/16 sessions: 1.143 / 1.031 / 0.997 / 1.009. The size-profile hypothesis predicted recovery at 8/16 sessions and is refuted by the measurement; the gain is concentrated at 1 session and compresses toward noise as concurrency rises. This is the acceptance criterion from the previous row, and the answer is that the ceiling itself was not the detour — a contention hypothesis now leads, tracked as task #293 (open) |
-| Driver dependency, named | a patch to NVIDIA's **open** kernel modules (MIT/GPLv2), 2 files in the minimal form, activated by an own registry key `RMSmallBarP2PPeerBar1`. It lives in the private repository `efschu/nvidia-smallbar-p2p`, **not** in this fork; the fork only takes the header tree path via `SGLANG_HTCCL_BAR1_NV_QUELLE` for the JIT build. Without the patch the transport refuses at construction and the run falls back to its configured alternative. NCCL is unaffected by the patch — four configurations, all inside the measurement spread |
-| CUDA graphs | released by `SGLANG_HTCCL_GRAPH_FREIGABE=1`, gated on `benchmark/bar1_graph_check.py` (5/5 cases, container and bare host). Cooperative launches **are** capturable — the opposite assumption was wrong, and since the #293 lever run the kernel choice says so: `SGLANG_HTCCL_BAR1_GRAPH_GITTER` defaults to the release switch instead of being a separate opt-in. Leaving the reservation in place cost 16.1 % prefill throughput as soon as the prefill was captured. The pipelined direct mode is a different case: its host-side ring index gets baked per graph, so it needs a reserved slot per captured call site (`SGLANG_HTCCL_BAR1_PIPE_DIREKT_GRAPH`) |
-| Not pursued, with reasons | the fork's own **host** transport as an optimisation (NCCL wins 4 of 5 sizes; the earlier "5.1x" was a ping-pong artefact with an 8-byte return leg — it stays as a fallback for unpatched machines, not as a gain); **striping** direct and host traffic for the same transfer (measured, refuted: pure direct wins at every size); `all_to_all` at the HTCCL seam for MoE (the dispatchers bypass it entirely — that is what `bar1ep.py` is for, and it is unmeasured) |
+| Driver dependency, named | a patch to NVIDIA's **open** kernel modules (MIT/GPLv2), 2 files in the minimal form, activated by an own registry key `RMSmallBarP2PPeerBar1`. It lives in the private repository `efschu/nvidia-smallbar-p2p`, **not** in this fork; the fork only takes the header tree path via `SGLANG_BARLINK_BAR1_NV_SOURCE` for the JIT build. Without the patch the transport refuses at construction and the run falls back to its configured alternative. NCCL is unaffected by the patch — four configurations, all inside the measurement spread |
+| CUDA graphs | released by `SGLANG_BARLINK_GRAPH_ENABLE=1`, gated on `benchmark/bar1_graph_check.py` (5/5 cases, container and bare host). Cooperative launches **are** capturable — the opposite assumption was wrong, and since the #293 lever run the kernel choice says so: `SGLANG_BARLINK_BAR1_GRAPH_GRID` defaults to the release switch instead of being a separate opt-in. Leaving the reservation in place cost 16.1 % prefill throughput as soon as the prefill was captured. The pipelined direct mode is a different case: its host-side ring index gets baked per graph, so it needs a reserved slot per captured call site (`SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH`) |
+| Not pursued, with reasons | the fork's own **host** transport as an optimisation (NCCL wins 4 of 5 sizes; the earlier "5.1x" was a ping-pong artefact with an 8-byte return leg — it stays as a fallback for unpatched machines, not as a gain); **striping** direct and host traffic for the same transfer (measured, refuted: pure direct wins at every size); `all_to_all` at the barlink seam for MoE (the dispatchers bypass it entirely — that is what `bar1ep.py` is for, and it is unmeasured) |
 | Honest weak spot | on the fast x8 pair (2 cards) the transport **loses** between 1 and 8 MiB, down to 0.81x. On the x4 pair and at three cards it wins everywhere. Pattern: the faster the edge, the worse the standing. Three causes are identified; one of them (a local-memory spill in the net kernel, STACK 64 B against the ring kernel's 0) is fixed on this branch and verified offline with `nvcc -cubin` + `cuobjdump -res-usage` — STACK 0, one register fewer, no other kernel touched. Whether that is faster on the card is unmeasured |
-| Opt-in | nothing changes without `SGLANG_HTCCL*`. Pinned by `test_bar1_strand_is_opt_in.py`: the transport modules are not imported by the distributed stack or the MoE package, the new MoE backend member moves no existing predicate, `_select` without a transport is `None` for every op, and every new knob carries the `SGLANG_HTCCL` prefix so unsetting that prefix is the complete off switch |
+| Opt-in | nothing changes without `SGLANG_BARLINK*`. Pinned by `test_bar1_strand_is_opt_in.py`: the transport modules are not imported by the distributed stack or the MoE package, the new MoE backend member moves no existing predicate, `_select` without a transport is `None` for every op, and every new knob carries the `SGLANG_BARLINK` prefix so unsetting that prefix is the complete off switch |
 | Direct-mode GPU phase | CPU-side phase complete and validated (`benchmark/bar1_graph_check.py` 5/5 above), not yet merged onto this branch. Sits on `feat/bar1-direct-graph` (`24b9f5547a`), which needs a rebase before merge (task #292, open) |
 
 **Upstream:** neither sglang nor vLLM has a direct GPU-to-GPU collective plane for cards

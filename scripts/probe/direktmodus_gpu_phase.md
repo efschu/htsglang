@@ -55,8 +55,8 @@ branch's worktree:
     PYTHONPATH=$W/python:$V/lib/python3.12/site-packages \
     LD_LIBRARY_PATH=$V/lib/python3.12/site-packages/nvidia/cu13/lib \
     CUDA_HOME=$V/lib/python3.12/site-packages/nvidia/cu13 \
-    SGLANG_HTCCL_BAR1_NV_SOURCE=$N \
-    TORCH_EXTENSIONS_DIR=/spinning/subvol-999-disk-0/spinning/htccl_extcache_host \
+    SGLANG_BARLINK_BAR1_NV_SOURCE=$N \
+    TORCH_EXTENSIONS_DIR=/spinning/subvol-999-disk-0/spinning/barlink_extcache_host \
     TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \
       $P <command>
 
@@ -110,7 +110,7 @@ Just the two new ones:
 * the result tensor must **really sit in the BAR1 window** (`result_window()`).
   If that is missing, the case measured and passed the `direct=0` control
   path without answering the question. The case then aborts with a pointer
-  to `SGLANG_HTCCL_BAR1_PIPE_RESULT_RING` instead of passing green;
+  to `SGLANG_BARLINK_BAR1_PIPE_RESULT_RING` instead of passing green;
 * it is also read back over the **host** instead of over the receiving
   card's L2. L2 is not coherent with incoming PCIe writes
   (`BEFUND_L2_NICHT_KOHAERENT.md`), so the second read path here is not a
@@ -129,13 +129,13 @@ Before the graph, because a failed eager proof invalidates every graph
 number.
 
     <environment> env \
-      SGLANG_HTCCL_BAR1_PIPE=1 \
-      SGLANG_HTCCL_BAR1_PIPE_DIRECT=1 \
-      SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH=1 \
-      SGLANG_HTCCL_BAR1_PIPE_RESULT_RING=5 \
+      SGLANG_BARLINK_BAR1_PIPE=1 \
+      SGLANG_BARLINK_BAR1_PIPE_DIRECT=1 \
+      SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH=1 \
+      SGLANG_BARLINK_BAR1_PIPE_RESULT_RING=5 \
       $P benchmark/bar1_diag.py 0,1,2
 
-This makes the release handshake run eager too (`ergSlack = 2`), and flag
+This makes the release handshake run eager too (`resultSlack = 2`), and flag
 family 4 gets exercised on real hardware for the first time. Up to this
 point it has only seen a Python simulation.
 
@@ -157,15 +157,15 @@ lowers occupancy is for the card to decide. Measured on the **built**
 object, not the one compiled offline:
 
     ssh -i /root/.ssh/id_root@proxmox root@192.168.0.1 \
-      'ls -l /spinning/htccl_extcache_host/htccl_bar1_pipe_ext_cuda_86_120/'
+      'ls -l /spinning/barlink_extcache_host/barlink_bar1_pipe_ext_cuda_86_120/'
 
     ssh ... '/usr/local/cuda/bin/cuobjdump -res-usage \
-      /spinning/htccl_extcache_host/htccl_bar1_pipe_ext_cuda_86_120/htccl_bar1_pipe_ext_cuda_86_120.so \
+      /spinning/barlink_extcache_host/barlink_bar1_pipe_ext_cuda_86_120/barlink_bar1_pipe_ext_cuda_86_120.so \
       | grep -E "Function|REG|STACK"'
 
 **Read the timestamps first.** The extension cache is shared across boots
 (a cold build costs minutes). If the `.so` is older than
-`python/sglang/srt/distributed/device_communicators/htccl_bar1_pipe_ext.py`,
+`python/sglang/srt/distributed/device_communicators/barlink_bar1_pipe_ext.py`,
 `cuobjdump` measures the **old** kernel -- the number is then worthless and
 the directory has to go before anything else runs.
 
@@ -185,12 +185,12 @@ Rules for this measurement, all three non-negotiable:
 * **Noise floor first**: an A-against-A pass before A is reported against
   B. Whatever lies below the noise floor is not reported.
 
-    <environment> env SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIRECT=0 \
+    <environment> env SGLANG_BARLINK_BAR1_PIPE=1 SGLANG_BARLINK_BAR1_PIPE_DIRECT=0 \
       $P benchmark/bar1_diag.py 0,1,2
-    <environment> env SGLANG_HTCCL_BAR1_PIPE=1 SGLANG_HTCCL_BAR1_PIPE_DIRECT=1 \
+    <environment> env SGLANG_BARLINK_BAR1_PIPE=1 SGLANG_BARLINK_BAR1_PIPE_DIRECT=1 \
       $P benchmark/bar1_diag.py 0,1,2
 
-And the same for `SGLANG_HTCCL_BAR1_PIPE_DIRECT_GRAPH=0/1` at
+And the same for `SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH=0/1` at
 `DIRECT=1` -- that is the question about the 8 registers from item 4.
 
 A saved VRAM pass at the receiver is expected. Against this rig's PCIe
@@ -201,7 +201,7 @@ outcome**, not a failure. Report in ms/round, not tok/s.
 
 ## 6. Standard e2e run
 
-With `SGLANG_HTCCL_GRAPH_ENABLE=1` and graph-safe direct mode, otherwise as
+With `SGLANG_BARLINK_GRAPH_ENABLE=1` and graph-safe direct mode, otherwise as
 in `scripts/gpu_battery/s11_bar1_e2e.sh`.
 
 Expect the graph pool to run low quickly on a real model (many call sites
@@ -223,12 +223,12 @@ around an obstacle swaps out the question.
    Report the holder from `info`, ask the operator.
 2. **`RegistryDwords` empty** or `/dev/dmabuf_holder` missing -- stock
    driver, direct mode does not run.
-3. **A gate case from item 2 fails.** `SGLANG_HTCCL_GRAPH_ENABLE` stays
+3. **A gate case from item 2 fails.** `SGLANG_BARLINK_GRAPH_ENABLE` stays
    off, items 5 and 6 do not run. The info case `grid` is allowed to fail.
 4. **`pipe-direct` reports "result tensor NOT in the BAR1 window".** Then
    the run measured the control path; the resulting number says nothing
    about direct mode.
-5. **Time cap tripped** (`Zeitlimit` in the log, `htccl.status()` nonzero).
+5. **Time cap tripped** (`Zeitlimit` in the log, `barlink.status()` nonzero).
    Every number from that run is invalidated.
 6. **JIT object older than the source** (item 4). Cache gone, rebuild,
    start over.

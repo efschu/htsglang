@@ -198,7 +198,7 @@ HOSTPID=""
 #
 # One template, and the speculative block is the only interpolated part. The
 # environment is the reference recipe of _bar1_host_boot.sh minus the three
-# SGLANG_HTCCL* lines: the transport is plain NCCL on every arm here, because
+# SGLANG_BARLINK* lines: the transport is plain NCCL on every arm here, because
 # the question is which DRAFTER is better on structured text and a second
 # moving part would have to be defended in every cell of the table.
 #

@@ -21,7 +21,7 @@ constructs no new cost model, it reuses the ones that exist
 (``key_solver.nesting_hull`` for the family question, the fork's parse-time
 capacity predictor for the token figures) and, where an input is simply
 missing, it says so with a PROVENANCE LABEL instead of inventing a number --
-the same honesty discipline as the HTCCL path dispatcher's rate profiles and
+the same honesty discipline as the barlink path dispatcher's rate profiles and
 the planner package's own "no estimated tok/s" rule.
 
 WHAT IT COMPUTES, AND FROM WHAT:

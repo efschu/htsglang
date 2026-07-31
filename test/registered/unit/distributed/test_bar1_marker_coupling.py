@@ -3,9 +3,9 @@
 against the ACTUAL emitter source, so the next rename breaks HERE instead of
 silently on the next real run.
 
-Background: htccl.py / htccl_bar1.py / benchmark/bar1_graph_check.py were
+Background: barlink.py / barlink_bar1.py / benchmark/bar1_graph_check.py were
 translated from German to English in #295. Several scripts/gpu_battery/
-consumers (s11_bar1_e2e.py's RE_KASSE/RE_AUFBAU/RE_RIEGEL,
+consumers (s11_bar1_e2e.py's RE_LEDGER/RE_SETUP/RE_CAPTURE_BOLT,
 s12_log_analyse.py's RE_BAR1_SETUP, the "Bar1Unverfuegbar" literal in the
 s13/s14/s15 booterror harvest lists, the "Zusammenfassung"/"Aufbau"
 substrings) kept matching the OLD German wording -- dead on every real run
@@ -48,22 +48,22 @@ import s12_log_analyse as s12  # noqa: E402
 
 
 class TestS11RegexesAgainstTheRealEmitters:
-    def test_re_aufbau_matches_the_real_setup_line(self):
+    def test_re_setup_matches_the_real_setup_line(self):
         line = src.render_setup_line()
-        m = s11.RE_AUFBAU.search(line)
-        assert m, f"RE_AUFBAU does not match the real setup line: {line!r}"
+        m = s11.RE_SETUP.search(line)
+        assert m, f"RE_SETUP does not match the real setup line: {line!r}"
         assert m.group("ms") == "46"
 
-    def test_re_kasse_matches_the_real_ledger_line(self):
+    def test_re_ledger_matches_the_real_ledger_line(self):
         line = src.render_ledger_line(group="dcp:0")
-        m = s11.RE_KASSE.search(line)
-        assert m, f"RE_KASSE does not match the real ledger line: {line!r}"
+        m = s11.RE_LEDGER.search(line)
+        assert m, f"RE_LEDGER does not match the real ledger line: {line!r}"
         assert m.group("group") == "dcp:0"
 
-    def test_re_riegel_matches_the_real_runtimeerror(self):
-        line = src.render_riegel_message(op="broadcast", nbytes=128)
-        m = s11.RE_RIEGEL.search(line)
-        assert m, f"RE_RIEGEL does not match the real RuntimeError: {line!r}"
+    def test_re_capture_bolt_matches_the_real_runtimeerror(self):
+        line = src.render_capture_bolt_message(op="broadcast", nbytes=128)
+        m = s11.RE_CAPTURE_BOLT.search(line)
+        assert m, f"RE_CAPTURE_BOLT does not match the real RuntimeError: {line!r}"
         assert m.group("op") == "broadcast"
         assert m.group("bytes") == "128"
 
@@ -117,7 +117,7 @@ class TestS12RegexAgainstTheRealEmitter:
         m = s12.RE_BAR1_SETUP.search(line)
         assert m, f"RE_BAR1_SETUP does not match the real setup line: {line!r}"
         d = m.groupdict()
-        assert d["aufbau_ms"] == "324"
+        assert d["setup_ms"] == "324"
         assert d["peers"] == "2"
         assert d["region_mib"] == "96.0"
         assert d["schlitze"] == "12"
@@ -139,27 +139,27 @@ class TestS12RegexAgainstTheRealEmitter:
 # actually occurring in a source-derived sample.
 # ---------------------------------------------------------------------------
 
-#: file -> literal `grep -F` patterns that are meant to catch BAR1/HTCCL
+#: file -> literal `grep -F` patterns that are meant to catch BAR1/barlink
 #: marker lines. Every one of these must (a) still be present verbatim in
 #: the shell script, and (b) actually occur in a synthetic emission built
 #: from the real format string.
 SHELL_HARVEST_MARKERS = {
     "s11_bar1_e2e.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "BAR1 ledger of this card after group",
         "during a CUDA graph capture",
     ],
     "s12_prefill_kurve.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
     ],
     "s13_hebel_messung.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
         "the graph pool of the result ring is exhausted",
     ],
     "s14_decode_verif.sh": [
-        "HTCCL-BAR1: setup in",
+        "barlink-BAR1: setup in",
         "during a CUDA graph capture",
     ],
 }
@@ -175,13 +175,13 @@ SHELL_BOOTERROR_CLASS_MARKER_FILES = (
 
 _SETUP_LINE_SAMPLE = src.render_setup_line()
 _LEDGER_LINE_SAMPLE = src.render_ledger_line()
-_RIEGEL_SAMPLE = src.render_riegel_message()
+_CAPTURE_BOLT_SAMPLE = src.render_capture_bolt_message()
 _POOL_EXHAUSTED_SAMPLE = src.render_pipe_pool_exhausted_line()
 
 _MARKER_SAMPLES = {
-    "HTCCL-BAR1: setup in": _SETUP_LINE_SAMPLE,
+    "barlink-BAR1: setup in": _SETUP_LINE_SAMPLE,
     "BAR1 ledger of this card after group": _LEDGER_LINE_SAMPLE,
-    "during a CUDA graph capture": _RIEGEL_SAMPLE,
+    "during a CUDA graph capture": _CAPTURE_BOLT_SAMPLE,
     "the graph pool of the result ring is exhausted": _POOL_EXHAUSTED_SAMPLE,
 }
 

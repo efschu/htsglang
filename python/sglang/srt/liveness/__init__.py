@@ -14,7 +14,7 @@ Placement note: this sits in ``srt/liveness`` rather than in the
 ``sglang.srt.video_enhance.liveness`` re-exports from here, unchanged.
 
 Not this module's layer: #312's bounded peer liveness inside collectives.
-That watches *ranks* on NCCL/HTCCL and its failure mode is a hung all-reduce.
+That watches *ranks* on NCCL/barlink and its failure mode is a hung all-reduce.
 This watches *clients* on a socket. The two never interact and share no code.
 """
 

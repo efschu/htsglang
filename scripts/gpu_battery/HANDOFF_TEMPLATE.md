@@ -82,12 +82,12 @@ In addition, depending on the step:
   `/root/battery-bar1/`; the run directory holds only the grep result and a
   tail. So:
   ```bash
-  cat $S/htccl_lines.txt | head -40        # s11: setup, ERREICHT, bolt
+  cat $S/barlink_lines.txt | head -40        # s11: setup, ERREICHT, bolt
   cat $S/belege/*.txt | grep ERREICHT      # s12: arm proof per point
   tail -40 $S/server.log                   # bounded tail, not the log
   ```
   Plus the one JSON per step: `driver_state.json` (`missing` names exactly
-  what is absent), `bar1_e2e.json` (`riegel`, `gruppen`, `graph_check`),
+  what is absent), `bar1_e2e.json` (`capture_bolt`, `gruppen`, `graph_check`),
   `prefill_kurve.json` (`abbruch`, `reihenfolge`,
   `grundlinie_abweichung_pct`). On a hang, the py-spy dumps run on the host
   and land as `$S/pyspy-host-*.txt`; the matching PIDs are in `$S/host_pids`.

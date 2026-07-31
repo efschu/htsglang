@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Diagnostic: build HTCCLBar1Transport directly, show the full traceback.
+"""Diagnostic: build BarlinkBar1Transport directly, show the full traceback.
 
-Two processes via mp.spawn, a gloo group, then HTCCLBar1Transport(...)
+Two processes via mp.spawn, a gloo group, then BarlinkBar1Transport(...)
 WITHOUT the build_bar1 factory -- so the exception is not translated into
 a logger.info, but stays visible with its full traceback.
 """
@@ -36,21 +36,21 @@ def worker(local_rank: int, devs: list, port: str) -> None:
     torch.cuda.init()
     torch.zeros(1, device=device)
 
-    from sglang.srt.distributed.device_communicators.htccl_bar1 import (
-        HTCCLBar1Transport,
+    from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+        BarlinkBar1Transport,
     )
-    from sglang.srt.distributed.device_communicators.htccl_matrix_transport import (
+    from sglang.srt.distributed.device_communicators.barlink_matrix_transport import (
         _window_bytes,
     )
 
     gruppe = dist.group.WORLD
     fb = _window_bytes()
     print(f"[r{rank}] dev={devs[rank]} window_bytes={fb}", flush=True)
-    print(f"[r{rank}] patch_state={HTCCLBar1Transport.patch_state()}", flush=True)
+    print(f"[r{rank}] patch_state={BarlinkBar1Transport.patch_state()}", flush=True)
 
     t = None
     try:
-        t = HTCCLBar1Transport(gruppe, device, fb)
+        t = BarlinkBar1Transport(gruppe, device, fb)
         print(f"[r{rank}] BUILD OK, window_minimum={t.window_minimum()}",
               flush=True)
     except BaseException:

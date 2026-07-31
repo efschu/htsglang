@@ -204,7 +204,7 @@ class TestGate(NoNetwork):
                    **VERSIONS)
         row = {r.key: r for r in rc.gate(local, far)}["vendor_mixed"]
         self.assertEqual(row.verdict, rc.WARN)
-        self.assertIn("SGLANG_HTCCL", row.remedy)
+        self.assertIn("SGLANG_BARLINK", row.remedy)
 
     def test_transport_row_names_the_broken_verbs_path(self):
         row = self._gate()["transport_available"]
@@ -337,11 +337,11 @@ class TestTransportPlan(NoNetwork):
         digest = {"measurements": [{
             "id": "comm/cross_rig/all_reduce/20KiB", "label": "wire",
             "unit": "us", "value": 166.2,
-            "context": {"op": "all_reduce", "backend": "htccl-ucx",
+            "context": {"op": "all_reduce", "backend": "barlink-ucx",
                         "size_kib": 20}}]}
         row = self._by_class(remote_digest=digest)["tp_small"]
         self.assertEqual(row.provenance, rc.MEASURED)
-        self.assertEqual(row.chosen, "htccl-ucx")
+        self.assertEqual(row.chosen, "barlink-ucx")
         self.assertEqual(row.evidence[0]["id"], "comm/cross_rig/all_reduce/20KiB")
         self.assertFalse(row.how_to_measure)
 
@@ -350,9 +350,9 @@ class TestTransportPlan(NoNetwork):
         # container. Counting it as a link measurement would put a number on
         # the wire that never crossed it.
         digest = {"measurements": [{
-            "id": "comm/collective_htccl_ucx/all_reduce/20KiB",
+            "id": "comm/collective_barlink_ucx/all_reduce/20KiB",
             "unit": "us", "value": 26.6,
-            "context": {"op": "all_reduce", "backend": "htccl_ucx"}}]}
+            "context": {"op": "all_reduce", "backend": "barlink_ucx"}}]}
         row = self._by_class(local_digest=digest)["tp_small"]
         self.assertEqual(row.provenance, rc.ABSENT)
         self.assertIsNone(row.chosen)
@@ -377,7 +377,7 @@ class TestTransportPlan(NoNetwork):
         far = _rig("rig-b", FAR_CARDS, nccl="2.28.9", commit="abcdef123456")
         rows = {t.message_class: t for t in rc.transport_plan(self.local, far)}
         opts = {c["key"]: c for c in rows["tp_small"].candidates}
-        self.assertEqual(opts["htccl-ucx"]["verdict"], "unknown")
+        self.assertEqual(opts["barlink-ucx"]["verdict"], "unknown")
 
     def test_a_single_available_carrier_is_an_estimate_not_a_measurement(self):
         rows = self._by_class()
@@ -478,7 +478,7 @@ class TestCouple(NoNetwork):
     def test_the_cuda_graph_row_follows_the_chosen_transport(self):
         digest = {"measurements": [{
             "id": "comm/cross_rig/all_reduce/20KiB", "unit": "us",
-            "value": 166.2, "context": {"backend": "htccl-ucx"}}]}
+            "value": 166.2, "context": {"backend": "barlink-ucx"}}]}
         rows = {r["key"]: r for r in
                 self._report(remote_digest=digest).to_json()["gate"]}
         self.assertEqual(rows["cuda_graph"]["verdict"], rc.WARN)

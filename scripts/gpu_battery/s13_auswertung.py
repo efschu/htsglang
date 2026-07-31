@@ -103,9 +103,9 @@ def load_evidence(step_dir: str) -> dict:
         elif "isabling prefill CUDA graph" in text or "Disable prefill CUDA" in text:
             pg = "off (auto-disable)"
         out[(arm, rnd)] = {
-            "bar1_gruppen": text.count("HTCCL-BAR1: setup in"),
+            "bar1_gruppen": text.count("barlink-BAR1: setup in"),
             "erreicht": len(re.findall(r"ACHIEVED=", text)),
-            "pipe_zeilen": text.count("HTCCL-BAR1-PIPE:"),
+            "pipe_zeilen": text.count("barlink-BAR1-PIPE:"),
             "vorrat_leer": (
                 "the graph pool of the result ring is exhausted" in text
             ),

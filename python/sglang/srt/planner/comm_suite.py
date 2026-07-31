@@ -209,8 +209,8 @@ ARMS: Tuple[ArmSpec, ...] = (
              "readable.",
     ),
     ArmSpec(
-        id="collective_htccl_ucx",
-        label="HTCCL / UCX",
+        id="collective_barlink_ucx",
+        label="barlink / UCX",
         kind="cpu",
         question="What does the UCX transport cost per collective?",
         budget_s=35.0,
@@ -251,8 +251,8 @@ ARMS: Tuple[ArmSpec, ...] = (
              "actually pays on this box.",
     ),
     ArmSpec(
-        id="collective_htccl_shm",
-        label="HTCCL / shm",
+        id="collective_barlink_shm",
+        label="barlink / shm",
         kind="gpu",
         question="What does the single-node shared-memory transport cost?",
         budget_s=60.0,
@@ -876,9 +876,9 @@ def _arm_collective_gloo(ctx: "_RunCtx") -> ArmResult:
     return res
 
 
-def _arm_collective_htccl_ucx(ctx: "_RunCtx") -> ArmResult:
-    res = ArmResult(arm_id="collective_htccl_ucx")
-    budget = ARM_BY_ID["collective_htccl_ucx"].budget_s / 2.0
+def _arm_collective_barlink_ucx(ctx: "_RunCtx") -> ArmResult:
+    res = ArmResult(arm_id="collective_barlink_ucx")
+    budget = ARM_BY_ID["collective_barlink_ucx"].budget_s / 2.0
     cells: Dict[str, dict] = {}
     facts: Dict[str, Any] = {}
     for op in ("all_reduce", "all_gather"):
@@ -1007,11 +1007,11 @@ def _arm_collective_nccl(ctx: "_RunCtx") -> ArmResult:
     return res
 
 
-def _arm_collective_htccl_shm(ctx: "_RunCtx") -> ArmResult:
-    res = ArmResult(arm_id="collective_htccl_shm")
+def _arm_collective_barlink_shm(ctx: "_RunCtx") -> ArmResult:
+    res = ArmResult(arm_id="collective_barlink_shm")
     world = min(max(ctx.card_count, 2), 2)
-    data, _ = _worker_arm("htccl_shm", world,
-                          ARM_BY_ID["collective_htccl_shm"].budget_s,
+    data, _ = _worker_arm("barlink_shm", world,
+                          ARM_BY_ID["collective_barlink_shm"].budget_s,
                           ITERS_CPU, ctx.register)
     res.cells = data.get("cells", {})
     res.facts = {"world": data.get("world"),
@@ -1023,7 +1023,7 @@ def _arm_collective_htccl_shm(ctx: "_RunCtx") -> ArmResult:
                      f"{data.get('exact_mismatches')} inexact all_reduce "
                      f"results")
     res.notes.append(
-        "all_reduce only: HTCCLShmTransport implements no all_gather, and "
+        "all_reduce only: BarlinkShmTransport implements no all_gather, and "
         "the suite does not synthesize a cell the transport does not have")
     res.notes.extend(_spread_note(res.cells, ctx.floor_pct))
     return res
@@ -1200,11 +1200,11 @@ ARM_RUNNERS: Dict[str, Callable[["_RunCtx"], ArmResult]] = {
     "rig_profile": _arm_rig_profile,
     "noise_floor": _arm_noise_floor,
     "collective_gloo": _arm_collective_gloo,
-    "collective_htccl_ucx": _arm_collective_htccl_ucx,
+    "collective_barlink_ucx": _arm_collective_barlink_ucx,
     "byte_gate": _arm_byte_gate,
     "card_probe": _arm_card_probe,
     "collective_nccl": _arm_collective_nccl,
-    "collective_htccl_shm": _arm_collective_htccl_shm,
+    "collective_barlink_shm": _arm_collective_barlink_shm,
     "gdr_crossover": _arm_gdr_crossover,
     "cross_rig": _arm_cross_rig,
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Nordstern L2: sglang-free self-test for the HTCCL UCX transport.
+"""Nordstern L2: sglang-free self-test for the barlink UCX transport.
 
-Same assertions as ``test/registered/unit/distributed/test_htccl_ucx_collectives.py``
+Same assertions as ``test/registered/unit/distributed/test_barlink_ucx_collectives.py``
 -- real multi-process ranks over a real UCX worker on loopback (self/sm/tcp) --
 but loaded the way ``l1_ucx_crossrig.py`` loads it: the two transport modules
 by path, with the ``sglang`` package tree stubbed out.
@@ -33,7 +33,7 @@ REPO_COMM = os.path.join(
 
 
 def load_transport(comm_dir):
-    """Import htccl_ucx{,_bindings} from `comm_dir` without importing sglang."""
+    """Import barlink_ucx{,_bindings} from `comm_dir` without importing sglang."""
     for name in (
         "sglang",
         "sglang.srt",
@@ -53,12 +53,12 @@ def load_transport(comm_dir):
         return mod
 
     base = "sglang.srt.distributed.device_communicators."
-    _load(base + "htccl_ucx_bindings", os.path.join(comm_dir, "htccl_ucx_bindings.py"))
-    return _load(base + "htccl_ucx", os.path.join(comm_dir, "htccl_ucx.py"))
+    _load(base + "barlink_ucx_bindings", os.path.join(comm_dir, "barlink_ucx_bindings.py"))
+    return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
 
 
 class _Comm:
-    """Stand-in for HTCCLCommunicator: a FRESH output tensor per call."""
+    """Stand-in for BarlinkCommunicator: a FRESH output tensor per call."""
 
     def _get_out_buf(self, ref):
         import torch
@@ -78,7 +78,7 @@ def _worker(rank, world, store, comm_dir, q):
         )
         mod = load_transport(comm_dir)
         comm = _Comm()
-        t = mod.HTCCLUcxTransport(
+        t = mod.BarlinkUcxTransport(
             cpu_group=dist.group.WORLD, device=torch.device("cpu")
         )
 
@@ -90,39 +90,39 @@ def _worker(rank, world, store, comm_dir, q):
         torch.manual_seed(4242)
         parts = [torch.randn(37, 53) for _ in range(world)]
 
-        chk("all_reduce", t.htccl_all_reduce(comm, parts[rank].clone()),
+        chk("all_reduce", t.barlink_all_reduce(comm, parts[rank].clone()),
             sum(parts), 1e-4)
 
-        a = t.htccl_all_reduce(comm, parts[rank].clone())
+        a = t.barlink_all_reduce(comm, parts[rank].clone())
         snapshot = a.clone()
-        b = t.htccl_all_reduce(comm, (parts[rank] * 5).clone())
+        b = t.barlink_all_reduce(comm, (parts[rank] * 5).clone())
         if a.data_ptr() == b.data_ptr():
             fails.append("all_reduce returned an aliased buffer")
         chk("all_reduce/first-result-intact", a, snapshot, 0.0)
 
         t.ring_bytes = 1024  # ring branch (world>2 only, by construction)
         big = [torch.randn(3, 128, 33) for _ in range(world)]
-        chk("all_reduce/ring", t.htccl_all_reduce(comm, big[rank].clone()),
+        chk("all_reduce/ring", t.barlink_all_reduce(comm, big[rank].clone()),
             sum(big), 1e-3)
         t.ring_bytes = 1 << 30
 
         bf = [p.bfloat16() for p in parts]
-        chk("all_reduce/bf16", t.htccl_all_reduce(comm, bf[rank].clone()).float(),
+        chk("all_reduce/bf16", t.barlink_all_reduce(comm, bf[rank].clone()).float(),
             sum(p.float() for p in bf), 3e-1)
 
         for dim in (0, 1, -1):
             chk(f"all_gather/dim={dim}",
-                t.htccl_all_gather(comm, parts[rank].clone(), dim),
+                t.barlink_all_gather(comm, parts[rank].clone(), dim),
                 torch.cat(parts, dim=dim))
 
         three = [torch.randn(2, 3, 5) for _ in range(world)]
-        chk("all_gather/3d-dim2", t.htccl_all_gather(comm, three[rank].clone(), 2),
+        chk("all_gather/3d-dim2", t.barlink_all_gather(comm, three[rank].clone(), 2),
             torch.cat(three, dim=2))
 
         for src in range(world):
             payload = torch.arange(129, dtype=torch.float32) + src * 977
             tensor = payload.clone() if rank == src else torch.zeros(129)
-            ret = t.htccl_broadcast(comm, tensor, src)
+            ret = t.barlink_broadcast(comm, tensor, src)
             chk(f"broadcast/src={src}", ret, payload)
             if ret.data_ptr() != tensor.data_ptr():
                 fails.append(f"broadcast/src={src} was not in-place")
@@ -134,13 +134,13 @@ def _worker(rank, world, store, comm_dir, q):
             c = moved.shape[0] // world
             want = moved[rank * c:(rank + 1) * c].movedim(0, dim).contiguous()
             chk(f"reduce_scatter/dim={dim}",
-                t.htccl_reduce_scatter(comm, rs[rank].clone(), dim), want, 1e-4)
+                t.barlink_reduce_scatter(comm, rs[rank].clone(), dim), want, 1e-4)
 
         t.chunk_bytes = 4096
-        chk("all_reduce/chunked", t.htccl_all_reduce(comm, parts[rank].clone()),
+        chk("all_reduce/chunked", t.barlink_all_reduce(comm, parts[rank].clone()),
             sum(parts), 1e-4)
         chk("all_gather/chunked",
-            t.htccl_all_gather(comm, parts[rank].clone(), 0),
+            t.barlink_all_gather(comm, parts[rank].clone(), 0),
             torch.cat(parts, dim=0))
         t.chunk_bytes = 4 << 20
 
@@ -166,7 +166,7 @@ def _worker(rank, world, store, comm_dir, q):
                 for r in range(world)
             ]
             chk(f"all_reduce/pipeline/{label}",
-                t.htccl_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
+                t.barlink_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
 
         t.progress_bytes = 512  # exercise every sub-block boundary
         ramp = [
@@ -174,7 +174,7 @@ def _worker(rank, world, store, comm_dir, q):
             for r in range(world)
         ]
         chk("all_reduce/pipeline/fine-progress",
-            t.htccl_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
+            t.barlink_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
         t.progress_bytes = 256 * 1024
 
         # ---- all_gather pipelining (task #198, block 2) ------------------
@@ -197,7 +197,7 @@ def _worker(rank, world, store, comm_dir, q):
                 for r in range(world)
             ]
             chk(f"all_gather/pipeline/{label}",
-                t.htccl_all_gather(comm, ramp[rank].clone(), 0),
+                t.barlink_all_gather(comm, ramp[rank].clone(), 0),
                 torch.cat(ramp, dim=0), 0.0)
 
         # Non-zero gather dim with multi-chunk payloads: the chunking is over
@@ -209,7 +209,7 @@ def _worker(rank, world, store, comm_dir, q):
         ]
         for dim in (0, 1, -1):
             chk(f"all_gather/pipeline/2d-dim={dim}",
-                t.htccl_all_gather(comm, ramp2[rank].clone(), dim),
+                t.barlink_all_gather(comm, ramp2[rank].clone(), dim),
                 torch.cat(ramp2, dim=dim), 0.0)
 
         # bf16: chunk length is counted in INPUT elements (2 bytes) -- an
@@ -219,14 +219,14 @@ def _worker(rank, world, store, comm_dir, q):
             for r in range(world)
         ]
         chk("all_gather/pipeline/bf16",
-            t.htccl_all_gather(comm, bramp2[rank].clone(), 0),
+            t.barlink_all_gather(comm, bramp2[rank].clone(), 0),
             torch.cat(bramp2, dim=0), 0.0)
 
         # Back-to-back: slot parities rotate across calls; a stale slot from
         # the first call corrupting the second, or an aliased output, fails.
-        g1 = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        g1 = t.barlink_all_gather(comm, ramp[rank].clone(), 0)
         g1_snapshot = g1.clone()
-        g2 = t.htccl_all_gather(comm, (ramp[rank] * 2).clone(), 0)
+        g2 = t.barlink_all_gather(comm, (ramp[rank] * 2).clone(), 0)
         chk("all_gather/pipeline/back-to-back-1", g1, g1_snapshot, 0.0)
         chk("all_gather/pipeline/back-to-back-2", g2,
             torch.cat([r * 2 for r in ramp], dim=0), 0.0)
@@ -236,16 +236,16 @@ def _worker(rank, world, store, comm_dir, q):
         # Fine progress granularity across every sub-block boundary.
         t.progress_bytes = 512
         chk("all_gather/pipeline/fine-progress",
-            t.htccl_all_gather(comm, ramp[rank].clone(), 0),
+            t.barlink_all_gather(comm, ramp[rank].clone(), 0),
             torch.cat(ramp, dim=0), 0.0)
         t.progress_bytes = 256 * 1024
 
         # Pipelined and unpipelined must agree bit for bit (both are pure
         # copies, so anything else is a routing bug).
-        gp = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        gp = t.barlink_all_gather(comm, ramp[rank].clone(), 0)
         was_ag = t.pipeline  # restore, never assign True back
         t.pipeline = False
-        gu = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        gu = t.barlink_all_gather(comm, ramp[rank].clone(), 0)
         t.pipeline = was_ag
         chk("all_gather/pipeline/matches-unpipelined", gp, gu, 0.0)
 
@@ -256,10 +256,10 @@ def _worker(rank, world, store, comm_dir, q):
             for r in range(world)
         ]
         for dim in (0, 1):
-            gf = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            gf = t.barlink_all_gather(comm, small[rank].clone(), dim)
             was_ag = t.pipeline
             t.pipeline = False
-            gg = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            gg = t.barlink_all_gather(comm, small[rank].clone(), dim)
             t.pipeline = was_ag
             chk(f"all_gather/fastpath/matches-generic-dim={dim}", gf, gg, 0.0)
             chk(f"all_gather/fastpath/reference-dim={dim}", gf,
@@ -267,9 +267,9 @@ def _worker(rank, world, store, comm_dir, q):
 
         # Back-to-back multi-chunk collectives: the slot parities rotate
         # across calls, so a stale slot would corrupt this one.
-        first = t.htccl_all_reduce(comm, ramp[rank].clone())
+        first = t.barlink_all_reduce(comm, ramp[rank].clone())
         first_snapshot = first.clone()
-        second = t.htccl_all_reduce(comm, (ramp[rank] * 2).clone())
+        second = t.barlink_all_reduce(comm, (ramp[rank] * 2).clone())
         chk("all_reduce/pipeline/back-to-back-1", first, first_snapshot, 0.0)
         chk("all_reduce/pipeline/back-to-back-2", second,
             sum(r * 2 for r in ramp), 1e-2)
@@ -284,16 +284,16 @@ def _worker(rank, world, store, comm_dir, q):
             for r in range(world)
         ]
         chk("all_reduce/pipeline/bf16",
-            t.htccl_all_reduce(comm, bramp[rank].clone()).float(),
+            t.barlink_all_reduce(comm, bramp[rank].clone()).float(),
             sum(b.float() for b in bramp), 3e-1)
 
         # Pipelined and unpipelined must agree bit for bit: same accumulation
         # order, same result.
         payload = torch.arange(4096 + 5, dtype=torch.float32) * (rank + 1)
-        piped = t.htccl_all_reduce(comm, payload.clone())
+        piped = t.barlink_all_reduce(comm, payload.clone())
         was = t.pipeline  # restore, never assign True back
         t.pipeline = False
-        plain = t.htccl_all_reduce(comm, payload.clone())
+        plain = t.barlink_all_reduce(comm, payload.clone())
         t.pipeline = was
         chk("all_reduce/pipeline/matches-unpipelined", piped, plain, 0.0)
         t.chunk_bytes = 4 << 20
@@ -339,7 +339,7 @@ def _worker(rank, world, store, comm_dir, q):
         # layer N's async all_reduce is outstanding while layer N+1 runs its
         # own sync collectives).
         h1 = t.all_reduce_async(comm, ramp_a[rank].clone())
-        sync_mid = t.htccl_all_reduce(comm, ramp_b[rank].clone())
+        sync_mid = t.barlink_all_reduce(comm, ramp_b[rank].clone())
         chk("async/ar/sync-in-between-sync", sync_mid, sum(ramp_b), 1e-2)
         chk("async/ar/sync-in-between-async", t.wait_async(h1),
             sum(ramp_a), 1e-2)
@@ -364,7 +364,7 @@ def _worker(rank, world, store, comm_dir, q):
         # Async == sync bit for bit (same accumulation order).
         h1 = t.all_reduce_async(comm, ramp_a[rank].clone())
         a_res = t.wait_async(h1)
-        s_res = t.htccl_all_reduce(comm, ramp_a[rank].clone())
+        s_res = t.barlink_all_reduce(comm, ramp_a[rank].clone())
         chk("async/ar/matches-sync", a_res, s_res, 0.0)
 
         # bf16 in, fp32 on the wire.

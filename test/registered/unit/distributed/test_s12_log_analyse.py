@@ -54,7 +54,7 @@ from s12_log_analyse import (  # noqa: E402
     wait_aggregat,
 )
 
-# The lines the scheduler and htccl_bar1 really write. Copied verbatim out of
+# The lines the scheduler and barlink_bar1 really write. Copied verbatim out of
 # /root/battery-bar1/s12.bar1.1.log and s12.grundlinie.8.log.
 ZEILE_PREFILL_BAR1 = (
     "[2026-07-30 13:34:52 TP0] Prefill rank batch, #new-token: 2048, "
@@ -76,7 +76,7 @@ ZEILE_DECODE_WARMUP = (
     "accept rate: 0.78, cuda graph: True, gen throughput (token/s): 3.37, "
     "#queue-req: 0"
 )
-# #315: built from the ACTUAL htccl_bar1.py format string via
+# #315: built from the ACTUAL barlink_bar1.py format string via
 # _bar1_marker_source.py, not retyped -- this used to be the German wording
 # #295 moved the emitter away from, matching only itself and RE_BAR1_SETUP's
 # equally-stale pattern.

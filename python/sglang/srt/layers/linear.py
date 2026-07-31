@@ -37,7 +37,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe.utils import (
-    htccl_mlp_ar_overlap_comm,
+    barlink_mlp_ar_overlap_comm,
     should_skip_mlp_all_reduce,
 )
 from sglang.srt.layers.parameter import (
@@ -2130,7 +2130,7 @@ class RowParallelLinear(LinearBase):
                 else:
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:
-            # HTCCL async overlap (SGLANG_HTCCL_UCX_OVERLAP=1): when this AR
+            # barlink async overlap (SGLANG_BARLINK_UCX_OVERLAP=1): when this AR
             # was skipped because the NEXT layer's prepare_attn absorbs it
             # (fuse_mlp_allreduce), issue it asynchronously HERE so the wire
             # crossing runs under the intervening host work. The handle
@@ -2147,11 +2147,11 @@ class RowParallelLinear(LinearBase):
                 and get_forward().fuse_mlp_allreduce
                 and output_parallel.numel() > 0
             ):
-                _comm = htccl_mlp_ar_overlap_comm()
+                _comm = barlink_mlp_ar_overlap_comm()
                 if _comm is not None:
                     _h = _comm.all_reduce_async(output_parallel)
                     if _h is not None:
-                        output_parallel._htccl_ar_handle = (_comm, _h)
+                        output_parallel._barlink_ar_handle = (_comm, _h)
             output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None

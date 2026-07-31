@@ -175,9 +175,9 @@ for ROUND in $(seq "$ROUND_START" $((ROUND_START + ROUNDS - 1))); do
         # decode graph that silently did not get captured would otherwise be
         # reported as a graph measurement.
         host_grep_into "$HOSTLOG" "$DIR/belege/${ARM}.txt" \
-            "HTCCL enabled for group" \
+            "barlink enabled for group" \
             "ACHIEVED=" \
-            "HTCCL-BAR1: setup in" \
+            "barlink-BAR1: setup in" \
             "CUDA graph begin" \
             "CUDA graph end" \
             "Disable cuda graph" \

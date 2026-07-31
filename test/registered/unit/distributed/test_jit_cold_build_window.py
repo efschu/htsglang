@@ -3,7 +3,7 @@ pre-capture warmup forwards -- and for nothing else.
 
 Falsifier for the r3 finding: on a cold kernel cache the merge tip went RED in
 6/6 boots and GREEN in 1/1 once the cache was warm. The stall was 23-30 s,
-which is HTCCLDeviceTransport._TIMEOUT_CYCLES = 60e9 at the 5090's ~2.6 GHz.
+which is BarlinkDeviceTransport._TIMEOUT_CYCLES = 60e9 at the 5090's ~2.6 GHz.
 Two 3080 ranks were inside a multi-minute nvcc build of gptq_marlin -- a
 kernel that builds on FIRST CALL, and whose first call is the warmup forward
 that precedes graph capture -- while rank 0 waited in a device collective.
@@ -20,7 +20,7 @@ What is pinned here:
  4. The window is opened RANK-UNIFORMLY and unconditionally: no rank-local
     predicate in front of the barrier. (pynccl and CustomAllreduce were both
     hangs of exactly that shape.)
- 5. The HTCCL device collectives actually route their deadline through the
+ 5. The barlink device collectives actually route their deadline through the
     resolver, rather than reading the constant directly.
  6. A failure inside the window is re-raised WITH the cold-build hypothesis,
     not silently forwarded as some unrelated kernel's launch failure.
@@ -52,7 +52,7 @@ from sglang.srt.utils.jit_cold_build import (  # noqa: E402
     run_capture_warmups,
 )
 
-_BASE = 60_000_000_000  # HTCCLDeviceTransport._TIMEOUT_CYCLES
+_BASE = 60_000_000_000  # BarlinkDeviceTransport._TIMEOUT_CYCLES
 
 
 class TestColdBuildWindow(CustomTestCase):
@@ -252,10 +252,10 @@ class TestCallSites(CustomTestCase):
     them wrong is a hang, not a wrong number.
     """
 
-    def test_htccl_device_collectives_resolve_their_deadline(self):
-        from sglang.srt.distributed.device_communicators import htccl_device
+    def test_barlink_device_collectives_resolve_their_deadline(self):
+        from sglang.srt.distributed.device_communicators import barlink_device
 
-        src = inspect.getsource(htccl_device)
+        src = inspect.getsource(barlink_device)
         self.assertIn("resolve_timeout_cycles", src)
         # No launch site may still pass the raw constant: that is the one
         # that trapped rank 0 while its peers were in nvcc.
@@ -263,7 +263,7 @@ class TestCallSites(CustomTestCase):
             stripped = line.strip()
             if stripped.startswith("self._TIMEOUT_CYCLES,"):
                 self.fail(
-                    "an HTCCL device collective still launches with the raw "
+                    "an barlink device collective still launches with the raw "
                     f"_TIMEOUT_CYCLES: {stripped!r}"
                 )
 

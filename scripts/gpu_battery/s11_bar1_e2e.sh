@@ -3,19 +3,19 @@
 #
 # The question is NOT "does it boot". It is: do BOTH communicator groups really
 # run over bar1, does the model answer coherently with a working spec path, and
-# does the coverage bolt in htccl._select hold or hit.
+# does the coverage bolt in barlink._select hold or hit.
 #
 # That bolt is the acceptance scenario of the parallel integration. Until
-# all_gather exists in htccl_bar1, the standard run aborts with
+# all_gather exists in barlink_bar1, the standard run aborts with
 #
-#   RuntimeError: HTCCL: 'all_gather' with <n> bytes during a CUDA graph
+#   RuntimeError: barlink: 'all_gather' with <n> bytes during a CUDA graph
 #   capture, but bar1 reports handles(...) -> False.
 #
 # loudly and with a reason, which is correct behaviour and a FAIL of this step
 # at the same time. The check gives it its own wording so nobody has to read a
 # log to tell it apart from a boot that simply died.
 #
-# Gate first: benchmark/bar1_graph_check.py. SGLANG_HTCCL_GRAPH_FREIGABE=1
+# Gate first: benchmark/bar1_graph_check.py. SGLANG_BARLINK_GRAPH_ENABLE=1
 # without that evidence is a run whose numbers nobody can defend.
 #
 # The server log stays on the HOST. What comes into the run directory is the
@@ -90,7 +90,7 @@ cd \$W
 PYTHONPATH=\$W/python:\$V/lib/python3.12/site-packages \\
 LD_LIBRARY_PATH=\$V/lib/python3.12/site-packages/nvidia/cu13/lib \\
 CUDA_HOME=\$V/lib/python3.12/site-packages/nvidia/cu13 \\
-SGLANG_HTCCL_BAR1_NV_QUELLE=\$N \\
+SGLANG_BARLINK_BAR1_NV_SOURCE=\$N \\
 TORCH_EXTENSIONS_DIR=$(host_path "$BAR1_EXTCACHE") \\
 TORCH_CUDA_ARCH_LIST="8.6;12.0" MAX_JOBS=4 \\
   /spinning/miniforge3_local_install/bin/python3.12 benchmark/bar1_graph_check.py 0,1,2
@@ -169,10 +169,10 @@ host_ssh_for 60 "curl -sf -m 20 http://127.0.0.1:$PORT/get_server_info" \
 
 # --- harvest the log evidence, then shut down ------------------------------
 echo "== Evidence out of the server log (stays on the host) =="
-host_grep_into "$HOSTLOG" "$DIR/htccl_lines.txt" \
-    "HTCCL-BAR1: setup in" \
+host_grep_into "$HOSTLOG" "$DIR/barlink_lines.txt" \
+    "barlink-BAR1: setup in" \
     "BAR1 ledger of this card after group" \
-    "HTCCL enabled for group" \
+    "barlink enabled for group" \
     "ACHIEVED=" \
     "during a CUDA graph capture" \
     "CUDA out of memory" \
@@ -180,7 +180,7 @@ host_grep_into "$HOSTLOG" "$DIR/htccl_lines.txt" \
     "NCCL error" \
     "Traceback (most recent call last)"
 host_tail_into "$HOSTLOG" "$DIR/server.log" 400
-wc -l "$DIR/htccl_lines.txt" "$DIR/server.log" 2>/dev/null
+wc -l "$DIR/barlink_lines.txt" "$DIR/server.log" 2>/dev/null
 
 cleanup
 trap - EXIT INT TERM

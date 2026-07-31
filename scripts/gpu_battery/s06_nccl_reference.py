@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NCCL / system-RAM reference measurement in the #279 format.
 
-The HTCCL path dispatcher's third rate source does not exist yet; its FORMAT
-does (htccl_path_rates.new_nccl_reference_envelope, schema_version 1). This
+The barlink path dispatcher's third rate source does not exist yet; its FORMAT
+does (barlink_path_rates.new_nccl_reference_envelope, schema_version 1). This
 script produces exactly that, so the result is loadable by load_nccl_reference
 without a single line of glue.
 
@@ -734,7 +734,7 @@ def main() -> int:
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python")
     )
     sys.path.insert(0, repo_python)
-    from sglang.srt.distributed.device_communicators.htccl_path_rates import (  # noqa: E402
+    from sglang.srt.distributed.device_communicators.barlink_path_rates import (  # noqa: E402
         new_nccl_reference_envelope,
     )
     from p2p_common import parse_nccl_transports, summarize_transport_classes  # noqa: E402

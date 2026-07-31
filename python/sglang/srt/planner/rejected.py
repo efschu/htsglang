@@ -424,12 +424,12 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         scope="general",
     ),
     RejectedEntry(
-        key="htccl_ring_bidir",
-        what="splitting the HTCCL ring bidirectionally (two workers per direction)",
+        key="barlink_ring_bidir",
+        what="splitting the barlink ring bidirectionally (two workers per direction)",
         verdict=(
             "REGRESSION: +17 % at 80 KiB. A ring step is two requests in "
             "lockstep; there is no concurrency to expose. "
-            "SGLANG_HTCCL_UCX_RING_BIDIR stays 0"
+            "SGLANG_BARLINK_UCX_RING_BIDIR stays 0"
         ),
         gain="both directions of the ring in flight at once",
         cost="+17 % time at 80 KiB -- a regression",
@@ -440,7 +440,7 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         ),
         level=BLOCKED,
         evidence="#266 A/B 2026-07-28, d6d4231e5a",
-        tags=("htccl-ring-bidir",),
+        tags=("barlink-ring-bidir",),
         scope="general",
     ),
     RejectedEntry(

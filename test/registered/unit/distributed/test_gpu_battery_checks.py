@@ -606,7 +606,7 @@ class TestP2PCheck:
         silence, indistinguishable from a rig without P2P."""
         results = _copy_real_run(tmp_path)
         sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
-        from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
             load_p2p_capability_matrix,
         )
 

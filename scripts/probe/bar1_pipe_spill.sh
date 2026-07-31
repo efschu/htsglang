@@ -8,7 +8,7 @@
 # echte Karte anfassen.
 #
 # Gefragt ist STACK: ein Local-Memory-Spill im Kern ist ein echter
-# Perf-Bug (Praezedenz: bar1_netz_kernel STACK 64 -> 0). REG und SHARED
+# Perf-Bug (Praezedenz: bar1_mesh_kernel STACK 64 -> 0). REG und SHARED
 # stehen daneben, weil sie die Belegung mitbestimmen.
 #
 #   scripts/probe/bar1_pipe_spill.sh [arch ...]      # Vorgabe: 86 120
@@ -46,7 +46,7 @@ import pathlib
 import sys
 
 p = (pathlib.Path(sys.argv[1])
-     / "python/sglang/srt/distributed/device_communicators/htccl_bar1_pipe_ext.py")
+     / "python/sglang/srt/distributed/device_communicators/barlink_bar1_pipe_ext.py")
 tree = ast.parse(p.read_text(encoding="utf-8"))
 for node in tree.body:
     if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "_CUDA_SRC":

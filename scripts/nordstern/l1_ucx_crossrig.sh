@@ -17,7 +17,7 @@
 # VERSION PARITY is mandatory: UCX peers must run the same release or endpoint
 # creation fails with the useless 'invalid bandwidth 0.00'. The main rig ships
 # 1.18.1 while the second rig ships 1.16.0, so rank 0 is pointed at the
-# side-by-side 1.16.0 build via SGLANG_HTCCL_UCX_LIB. The transport checks this
+# side-by-side 1.16.0 build via SGLANG_BARLINK_UCX_LIB. The transport checks this
 # itself at rendezvous and refuses with instructions; --mismatch exercises that.
 #
 # Hosts, keys and interpreter paths are read from the environment
@@ -30,7 +30,7 @@
 #   ./l1_ucx_crossrig.sh              # correctness + throughput over RDMA
 #   ./l1_ucx_crossrig.sh --mismatch   # prove the parity check rejects 1.18 vs 1.16
 #   ./l1_ucx_crossrig.sh --reps 5     # extra args go to both ranks
-#   EXTRA_ENV=SGLANG_HTCCL_UCX_PIPELINE=0 ./l1_ucx_crossrig.sh   # A/B control
+#   EXTRA_ENV=SGLANG_BARLINK_UCX_PIPELINE=0 ./l1_ucx_crossrig.sh   # A/B control
 set -uo pipefail
 
 # Site-specific values come from the environment, never from a default baked
@@ -64,7 +64,7 @@ R1_IB=rocep1s0f1:1
 
 MASTER_ADDR="${MASTER_ADDR:-<MASTER_ADDR>}"
 PORT="${PORT:-$((29700 + RANDOM % 200))}"
-STAGE="${L1_STAGE_DIR:-/root/htccl-ucx-l1}"
+STAGE="${L1_STAGE_DIR:-/root/barlink-ucx-l1}"
 MODE_FLAG="--bench"
 if [[ "${1:-}" == "--mismatch" ]]; then
   MODE_FLAG="--expect-version-mismatch"
@@ -74,7 +74,7 @@ fi
 # Anything left on the command line goes to BOTH ranks (e.g. --reps 5).
 EXTRA_ARGS=("$@")
 # EXTRA_ENV is applied to both ranks identically -- the A/B control for the
-# pipelining measurement is EXTRA_ENV="SGLANG_HTCCL_UCX_PIPELINE=0". Both
+# pipelining measurement is EXTRA_ENV="SGLANG_BARLINK_UCX_PIPELINE=0". Both
 # sides must agree: the two paths post the same tags in the same order, but
 # only a group that is uniformly configured is a meaningful measurement.
 EXTRA_ENV="${EXTRA_ENV:-}"
@@ -83,7 +83,7 @@ echo "== staging to both rigs (port $PORT) =="
 for spec in "R0" "R1"; do
   host_var="${spec}_HOST"; scp_var="${spec}_SCP[@]"; ssh_var="${spec}_SSH[@]"
   "${!ssh_var}" "mkdir -p $STAGE" || { echo "FATAL: cannot reach ${!host_var}"; exit 1; }
-  scp "${!scp_var}" "$COMM_SRC/htccl_ucx.py" "$COMM_SRC/htccl_ucx_bindings.py" \
+  scp "${!scp_var}" "$COMM_SRC/barlink_ucx.py" "$COMM_SRC/barlink_ucx_bindings.py" \
       "$DRIVER" "${!host_var}:$STAGE/" >/dev/null || { echo "FATAL: stage failed"; exit 1; }
 done
 
@@ -103,7 +103,7 @@ sleep 4
 
 echo "== rank 0 (main rig, <RDMA_NET>.1) =="
 R0_LIB_ENV=""
-[[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="SGLANG_HTCCL_UCX_LIB=$R0_UCX_LIB"
+[[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="SGLANG_BARLINK_UCX_LIB=$R0_UCX_LIB"
 "${R0_SSH[@]}" "cd $STAGE && env \
   GLOO_SOCKET_IFNAME=$R0_LAN_IF UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 UCX_NET_DEVICES=$R0_IB \
   $R0_LIB_ENV $EXTRA_ENV \

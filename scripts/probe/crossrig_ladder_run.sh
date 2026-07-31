@@ -623,7 +623,7 @@ run_pair() {
 }
 
 header() {
-  note "# pair	direction	modus	ro	depth	size_bytes	iters	p10_us	median_us	p90_us	MB_per_s"
+  note "# pair	direction	mode	ro	depth	size_bytes	iters	p10_us	median_us	p90_us	MB_per_s"
 }
 
 # ===========================================================================

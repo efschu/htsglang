@@ -38,7 +38,7 @@ them to write. A check that asserts an imagined schema fails on every healthy
 run and passes on none, which is worse than no check at all.
 
 And then the real gate: the artifacts are loaded with
-htccl_path_rates.load_p2p_capability_matrix / load_p2p_d2d_bench -- the SAME
+barlink_path_rates.load_p2p_capability_matrix / load_p2p_d2d_bench -- the SAME
 loaders #279 will use. A file that parses in a bespoke check but yields zero
 profiles in the consumer is a file that has not helped anyone.
 
@@ -334,12 +334,12 @@ def _nccl_cause(row: dict) -> str:
 def _check_loadable(cap: dict, d2d: dict, any_p2p: bool) -> None:
     add_repo_to_path()
     try:
-        from sglang.srt.distributed.device_communicators.htccl_path_rates import (
+        from sglang.srt.distributed.device_communicators.barlink_path_rates import (
             load_p2p_capability_matrix,
             load_p2p_d2d_bench,
         )
     except Exception as exc:  # an unimportable consumer is an env problem
-        raise CheckStop(f"htccl_path_rates not importable: {exc}") from exc
+        raise CheckStop(f"barlink_path_rates not importable: {exc}") from exc
 
     cap_res = load_p2p_capability_matrix(cap)
     if cap_res.errors:
