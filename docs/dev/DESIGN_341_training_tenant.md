@@ -1,8 +1,9 @@
 # DESIGN #341 — Training/finetune as idle tenant
 
-Status: design registered, implementation queued (entry step: LoRA-LLM, see
-multi-day plan). This file is the single persistent record of the #341
-analysis and decisions; the chat history is not authoritative.
+Status: **M1 implemented** (job store + OpenAI fine-tuning surface +
+LLaMA-Factory backend + idle tenant with preempt/resume), M2/M3 open. This
+file is the single persistent record of the #341 analysis and decisions; the
+chat history is not authoritative.
 
 ## Goal
 
@@ -95,10 +96,98 @@ remain compatible.
 2. M2: diffusion LoRA via kohya (K2), Unsloth fast path.
 3. M3: full-FT/pretrain path (offload-aware feasibility math, multi-card).
 
+## M1 as built (2026-07-31)
+
+Modules, all under `python/sglang/srt/training/`, none of them importing
+torch so the whole surface is testable on a card-less host:
+
+| Module | Carries |
+|---|---|
+| `store.py` | uploaded files, job records, event log with cursor pagination and SSE subscribers, checkpoints |
+| `feasibility.py` | D2: the formula, the machine probe, the model profiler, the method ladder |
+| `backends/` | D1: the executor interface, the LLaMA-Factory subprocess wrapper, a mock executor |
+| `tenant.py` | D4: idle detection, VRAM lease, checkpoint-and-release preemption, resume |
+| `service.py` | the assembly the HTTP surface talks to |
+| `activity.py` | this process's own serving-activity stamp |
+
+The HTTP surface is `entrypoints/openai/serving_files.py` and
+`serving_finetune.py`, wired into `http_server.py` as
+`app.state.openai_serving_files` / `openai_serving_fine_tuning` in the same
+place and the same style as the #335-M0 image and speech adapters.
+
+Server flags: `--enable-training-tenant`, `--training-artifact-root`,
+`--training-model-root`, `--training-idle-grace-seconds`,
+`--training-poll-seconds`, `--training-preempt-timeout-s`,
+`--training-save-steps`, `--training-default-backend`,
+`--training-default-method`, `--training-event-stream-timeout-s`. Documented
+in `docs/rig-runbook.md` section 10.
+
+### Resolved: LLaMA-Factory is driven by CLI subprocess, not by its API mode
+
+The open item asked whether LLaMA-Factory's own API mode could be the
+internal executor interface. It cannot, because its API mode is not a
+training API: `llamafactory-cli api` starts an OpenAI-compatible **chat**
+server for an already-trained model. The only programmatic training entry
+point is the in-process call `llamafactory.train.tuner.run_exp(args)`. So the
+real choice was subprocess CLI versus importing LLaMA-Factory into the
+serving process, and three properties decided it for the subprocess:
+
+1. **Preemption.** D4 requires releasing VRAM on serving demand. A subprocess
+   is signalled and the kernel returns its memory when it exits. An
+   in-process trainer holds a CUDA context and an allocator arena inside the
+   *serving* process; releasing that means unloading torch state the server
+   itself uses.
+2. **Dependency isolation.** LLaMA-Factory pins transformers, peft, trl,
+   accelerate and bitsandbytes. In-process, the serving stack and the
+   training stack become one constraint set.
+3. **Blast radius.** A CUDA OOM or a segfault in a training step kills a
+   subprocess; in-process it kills the server.
+
+The cost is stated rather than hidden: preemption granularity is
+`save_steps`, because the trainer's own checkpointing is the only place a
+subprocess can be stopped cleanly. The event log says so when a preempt
+happens.
+
+LLaMA-Factory is not installed in this rig's venv and was deliberately not
+installed: the backend probes for it and rejects by name with an install
+remedy, and the mock executor covers the whole lifecycle in tests. Nothing
+was pinned, nothing in the venv changed.
+
+### Resolved: idle detection is policy, the ledger is safety
+
+Two mechanisms, deliberately separate. `IdleMonitor` combines demand sources
+(this process's own request stamp, the registry's `last_used_ts` over
+class-1/2 engines) and a source that cannot answer contributes nothing rather
+than vetoing — a policy that refused to train without a reachable control
+plane would never train on most deployments. The VRAM lease is the actual
+guard: an `acquire` against the ledger fails closed with the holders named if
+the monitor was wrong.
+
+`registry_view.RegisteredEngine` gained `last_used_ts` (additive, parsed from
+the arbiter snapshot that already carried it).
+
+### Resolved: preemption is not a protocol state
+
+A preempted job stays `running` and reports `x-htsglang.tenant_state ==
+"preempted"` with `preemptions`, `last_step` and `resume_from`. Adding a
+state to OpenAI's vocabulary would break every client that switches on it.
+
 ## Open items
 
-- Idle-detection threshold and grace window defaults (measure, don't guess).
-- Checkpoint cost per method (LoRA cheap, full-FT expensive) feeds the
-  preemption policy.
-- Whether LLaMA-Factory's own API mode can be reused as internal executor
-  interface instead of raw subprocess CLI (check when M1 starts).
+- Idle-detection threshold and grace window defaults: shipped as flags with
+  120 s / 2 s defaults and no measurement behind them yet. Measure on a rig
+  with real serving traffic before calling the defaults right.
+- Checkpoint cost per method is now *estimated* by `checkpoint_bytes` and
+  used for the disk post. It is not measured; a measured cost should feed the
+  preemption policy (whether it is worth preempting at all for a short
+  serving burst).
+- Job records live in memory. A server restart loses them, which is honest
+  today because a restart also kills the executor subprocess. Surviving a
+  restart needs the executor to outlive the server — M3.
+- Multi-card training is priced (`world_size`, sharded for `full_offload`)
+  but only the single-process launch path is built. Multi-card execution is
+  M3.
+- The produced adapter is written to the artifact root and reported as
+  `fine_tuned_model`, but is not yet registered as a loadable serving
+  artifact. Closing that loop is the D4 sentence "produced adapters flow back
+  into serving" and is M2.

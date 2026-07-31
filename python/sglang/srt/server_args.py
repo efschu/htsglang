@@ -4929,6 +4929,88 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
     ] = None
 
+    # -------------------------------------------------------------------------
+    # Training / finetuning as an idle tenant (#341)
+    # -------------------------------------------------------------------------
+    enable_training_tenant: A[
+        bool,
+        Arg(
+            help="Serve the OpenAI fine-tuning API (/v1/files, "
+            "/v1/fine_tuning/jobs) and run submitted jobs while the rig is "
+            "idle. Training holds a VRAM lease from the same ledger as every "
+            "other tenant, is preempted with a checkpoint when serving demand "
+            "arrives, and resumes at the next idle window. The routes exist "
+            "either way; without this flag job creation is rejected by name "
+            "rather than queued forever.",
+        ),
+    ] = False
+    training_artifact_root: A[
+        Optional[str],
+        "Directory for training uploads, run configs, checkpoints and produced "
+        "adapters. Defaults to $HTSGLANG_TRAINING_ROOT, else "
+        "$XDG_CACHE_HOME/htsglang/training. Must have room for "
+        "--training-save-steps checkpoints of the trained parameters; the "
+        "feasibility gate checks its free space and refuses jobs that would "
+        "not fit.",
+    ] = None
+    training_model_root: A[
+        Optional[str],
+        "Directory that a fine-tuning job's 'model' field is resolved against "
+        "when it is not an absolute path. Unset means jobs must pass a path.",
+    ] = None
+    training_idle_grace_seconds: A[
+        float,
+        "Seconds of no serving activity before the rig counts as idle and a "
+        "queued training job may start. Activity is the maximum of this "
+        "process's own inbound requests and the registry's last engine "
+        "acquisition.",
+    ] = 120.0
+    training_poll_seconds: A[
+        float,
+        "How often the tenant re-checks serving demand while training. This is "
+        "the worst-case delay between a request arriving and preemption "
+        "starting, so lower it on a latency-sensitive rig and raise it to cut "
+        "registry traffic.",
+    ] = 2.0
+    training_preempt_timeout_s: A[
+        float,
+        "How long a preempted trainer may take to checkpoint and exit before "
+        "it is killed. Bounded on purpose: the serving tenant must never wait "
+        "indefinitely on a trainer that will not stop.",
+    ] = 120.0
+    training_save_steps: A[
+        int,
+        "Steps between checkpoints in the wrapped trainer. This is also the "
+        "preemption granularity: a preempted job redoes at most this many "
+        "steps on resume.",
+    ] = 50
+    training_default_backend: A[
+        str,
+        Arg(
+            help="Executor for jobs that do not name one. 'auto' picks the "
+            "first installed real backend; 'mock' simulates a run and trains "
+            "nothing, and is never chosen by 'auto'.",
+            choices=["auto", "llamafactory", "mock"],
+        ),
+    ] = "auto"
+    training_default_method: A[
+        str,
+        Arg(
+            help="Method for jobs that do not name one in the x-htsglang "
+            "block. The feasibility gate prices every rung regardless and "
+            "names the ones that fit.",
+            choices=["qlora", "lora", "freeze", "full_offload", "full"],
+        ),
+    ] = "lora"
+    training_event_stream_timeout_s: A[
+        float,
+        "Seconds an SSE consumer of /v1/fine_tuning/jobs/{id}/events may "
+        "accept no bytes before it is dropped (#344). The stream sends "
+        "keepalives, so silence is the consumer's. Dropping a listener never "
+        "touches the job: fine-tuning jobs are fire-and-forget by protocol. "
+        "Zero or negative disables the check.",
+    ] = 120.0
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -4982,6 +5064,8 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
+        # Validate the idle training tenant's knobs.
+        self._handle_training_tenant()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -7880,9 +7964,7 @@ class ServerArgs:
                     "no pairing to decide."
                 )
             if self.dual_group_lane_pairing_sat_rows < 1:
-                raise ValueError(
-                    "--dual-group-lane-pairing-sat-rows must be >= 1."
-                )
+                raise ValueError("--dual-group-lane-pairing-sat-rows must be >= 1.")
             self._validate_dual_group_lane_part_gpu_id()
             if self.dual_group_lane_spec:
                 if self.speculative_algorithm is None:
@@ -10904,11 +10986,10 @@ class ServerArgs:
             )
 
         if a2a_backend == "bar1ep":
-            # Der Zaehlwerteabgleich vor dem Datenpfad ist ein Host-Kollektiv
-            # (bar1ep.py._zaehlwerte_tauschen) -- derselbe Grund, aus dem
-            # deepep_mode=normal die Graphen abschaltet. Ohne diese Zeile
-            # scheiterte die Aufzeichnung mitten im Capture, weit weg von der
-            # Ursache.
+            # The token-count exchange ahead of the data path is a host
+            # collective (bar1ep.py) -- the same reason deepep_mode=normal
+            # turns graphs off. Without this line the recording failed in the
+            # middle of capture, a long way from the cause.
             logger.warning(
                 "Cuda graph is disabled because moe_a2a_backend=`bar1ep` "
                 "(the token-count exchange before the data path is a host "
@@ -12034,6 +12115,42 @@ class ServerArgs:
             raise ValueError(
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
+            )
+
+    def _handle_training_tenant(self):
+        """Validate the #341 idle-tenant knobs. Validates only; no mutation.
+
+        Every one of these is a duration or a count that the scheduler divides
+        by or waits on, so a zero is a hang and a negative is a busy loop.
+        Rejecting them here is the difference between an error at startup and
+        a server that boots and then never trains.
+        """
+        if self.training_idle_grace_seconds < 0:
+            raise ValueError(
+                f"--training-idle-grace-seconds must not be negative "
+                f"(got {self.training_idle_grace_seconds})."
+            )
+        if self.training_poll_seconds <= 0:
+            raise ValueError(
+                f"--training-poll-seconds must be positive "
+                f"(got {self.training_poll_seconds})."
+            )
+        if self.training_preempt_timeout_s <= 0:
+            raise ValueError(
+                f"--training-preempt-timeout-s must be positive "
+                f"(got {self.training_preempt_timeout_s}); it bounds how long "
+                "the serving tenant waits for a trainer to leave."
+            )
+        if self.training_save_steps <= 0:
+            raise ValueError(
+                f"--training-save-steps must be positive "
+                f"(got {self.training_save_steps}); it is the preemption "
+                "granularity, and a job that never checkpoints cannot resume."
+            )
+        if self.training_model_root and not os.path.isdir(self.training_model_root):
+            raise ValueError(
+                f"--training-model-root {self.training_model_root!r} is not a "
+                "directory."
             )
 
     def _handle_other_validations(self):

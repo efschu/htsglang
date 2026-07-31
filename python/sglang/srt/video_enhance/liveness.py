@@ -59,6 +59,10 @@ class EndpointClass(str, Enum):
     #: A progress poller. Not a stream; included so every endpoint class has
     #: a named policy rather than an implicit one.
     CONTROL = "control"
+    #: An SSE tap on a training job's event log (#341-M1). Legitimately quiet
+    #: -- a training step is seconds and a checkpoint is minutes apart -- so
+    #: the stream sends keepalives and silence really is the consumer's.
+    TRAINING_EVENTS = "training_events"
 
 
 #: Defaults per endpoint class. The video-stream figure is deliberately
@@ -69,6 +73,10 @@ DEFAULT_TIMEOUTS_S: dict[EndpointClass, float] = {
     EndpointClass.VIDEO_STREAM: 300.0,
     EndpointClass.PREVIEW_TAP: 15.0,
     EndpointClass.CONTROL: 60.0,
+    # A training tap costs one subscriber queue, not a decoder and a card, so
+    # it can afford to be patient with a reader that pauses. Bounded all the
+    # same: an abandoned tap must not accumulate.
+    EndpointClass.TRAINING_EVENTS: 120.0,
 }
 
 

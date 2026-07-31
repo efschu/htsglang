@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.training.activity import note_serving_activity
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -77,6 +78,12 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        # One float store, on the one path every OpenAI-shaped generation
+        # request goes through. The idle training tenant (#341) reads it to
+        # decide whether this process has been quiet long enough to train on;
+        # without it, a server that acquired its engine an hour ago and is
+        # answering right now looks idle from the registry's side.
+        note_serving_activity()
 
         try:
             # Validate request

@@ -27,6 +27,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -101,6 +102,8 @@ from sglang.srt.entrypoints.openai.registry_view import fetch_registry_view
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from sglang.srt.entrypoints.openai.serving_files import OpenAIServingFiles
+from sglang.srt.entrypoints.openai.serving_finetune import OpenAIServingFineTuning
 from sglang.srt.entrypoints.openai.serving_images import OpenAIServingImages
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -169,6 +172,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.training.activity import note_serving_activity
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -269,6 +273,63 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
+def training_liveness_config(server_args: ServerArgs):
+    """#344 policy for the fine-tuning event stream, from the server flag."""
+    from sglang.srt.video_enhance.liveness import EndpointClass, LivenessConfig
+
+    return LivenessConfig(
+        timeouts_s={
+            EndpointClass.TRAINING_EVENTS.value: float(
+                server_args.training_event_stream_timeout_s
+            )
+        }
+    )
+
+
+def build_training_service(server_args: ServerArgs):
+    """Assemble the #341 training service from the server arguments.
+
+    Built unconditionally. A disabled tenant still answers the routes -- with
+    a rejection that names ``--enable-training-tenant`` -- because a 404 on
+    ``/v1/fine_tuning/jobs`` is indistinguishable from an old server, and a
+    client cannot act on that.
+    """
+    from sglang.srt.training.feasibility import default_artifact_root
+    from sglang.srt.training.service import TrainingService, TrainingServiceConfig
+
+    root = (
+        Path(server_args.training_artifact_root)
+        if server_args.training_artifact_root
+        else default_artifact_root()
+    )
+    config = TrainingServiceConfig(
+        enabled=bool(server_args.enable_training_tenant),
+        artifact_root=root,
+        grace_seconds=float(server_args.training_idle_grace_seconds),
+        poll_seconds=float(server_args.training_poll_seconds),
+        preempt_timeout_s=float(server_args.training_preempt_timeout_s),
+        save_steps=int(server_args.training_save_steps),
+        default_backend=str(server_args.training_default_backend),
+        default_method=str(server_args.training_default_method),
+        model_root=str(server_args.training_model_root or ""),
+        event_stream_timeout_s=float(server_args.training_event_stream_timeout_s),
+    )
+    reservation_store = None
+    if config.enabled:
+        try:
+            from sglang.srt.registry.ledger import ReservationStore
+
+            reservation_store = ReservationStore()
+        except Exception as exc:  # noqa: BLE001 - the tenant runs without it
+            logger.warning(
+                "training tenant: no VRAM ledger (%s: %s); jobs will run "
+                "without a cross-process reservation",
+                type(exc).__name__,
+                exc,
+            )
+    return TrainingService(config, reservation_store=reservation_store)
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
@@ -335,6 +396,18 @@ async def lifespan(fast_api_app: FastAPI):
     # those are configured and reject with the registry's numbers when not.
     fast_api_app.state.openai_serving_images = OpenAIServingImages()
     fast_api_app.state.openai_serving_speech = OpenAIServingSpeech()
+
+    # The idle training tenant (#341). Built even when the tenant is disabled
+    # so /v1/files and /v1/fine_tuning/jobs answer with a named rejection
+    # rather than a 404 that looks like an old server.
+    training_service = build_training_service(server_args)
+    fast_api_app.state.training_service = training_service
+    training_service.start()
+    fast_api_app.state.openai_serving_files = OpenAIServingFiles(training_service)
+    fast_api_app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(
+        training_service,
+        liveness=training_liveness_config(server_args),
+    )
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
@@ -422,6 +495,12 @@ async def lifespan(fast_api_app: FastAPI):
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
+        training_service = getattr(fast_api_app.state, "training_service", None)
+        if training_service is not None:
+            # Stops the scheduler and releases any VRAM lease a training job
+            # is holding, so a shutdown does not leave the ledger claiming
+            # memory for a process that is gone.
+            await training_service.stop()
         if warmup_thread is not None:
             warmup_thread.join()
 
@@ -864,6 +943,9 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # Serving demand, for the idle training tenant (#341). The OpenAI routes
+    # stamp it in OpenAIServingBase; the native route has to do it here.
+    note_serving_activity()
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
@@ -1853,6 +1935,103 @@ async def openai_v1_audio_speech(raw_request: Request):
     """OpenAI-compatible text-to-speech. Routed to a speech lane when one exists."""
     body = await raw_request.json()
     return await raw_request.app.state.openai_serving_speech.create_speech(body)
+
+
+##### Files and fine-tuning (#341-M1) #####
+
+
+@app.post("/v1/files")
+async def openai_v1_files(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    purpose: str = Form(default="fine-tune"),
+):
+    """OpenAI-compatible file upload. Training data for the fine-tuning API."""
+    return await raw_request.app.state.openai_serving_files.create(
+        filename=file.filename or "upload.jsonl",
+        content=await file.read(),
+        purpose=purpose,
+    )
+
+
+@app.get("/v1/files", response_class=ORJSONResponse)
+async def openai_v1_files_list(raw_request: Request, purpose: Optional[str] = None):
+    return await raw_request.app.state.openai_serving_files.list(purpose=purpose)
+
+
+@app.get("/v1/files/{file_id}", response_class=ORJSONResponse)
+async def openai_v1_files_retrieve(file_id: str, raw_request: Request):
+    return await raw_request.app.state.openai_serving_files.retrieve(file_id)
+
+
+@app.delete("/v1/files/{file_id}", response_class=ORJSONResponse)
+async def openai_v1_files_delete(file_id: str, raw_request: Request):
+    return await raw_request.app.state.openai_serving_files.delete(file_id)
+
+
+@app.get("/v1/files/{file_id}/content")
+async def openai_v1_files_content(file_id: str, raw_request: Request):
+    return await raw_request.app.state.openai_serving_files.content(file_id)
+
+
+@app.post("/v1/fine_tuning/jobs", dependencies=[Depends(validate_json_request)])
+async def openai_v1_fine_tuning_jobs(raw_request: Request):
+    """OpenAI-compatible fine-tuning job submission. Run by the idle tenant."""
+    body = await raw_request.json()
+    return await raw_request.app.state.openai_serving_fine_tuning.create(body)
+
+
+@app.get("/v1/fine_tuning/jobs", response_class=ORJSONResponse)
+async def openai_v1_fine_tuning_jobs_list(
+    raw_request: Request, after: Optional[str] = None, limit: int = 20
+):
+    return await raw_request.app.state.openai_serving_fine_tuning.list(
+        after=after, limit=limit
+    )
+
+
+@app.get("/v1/fine_tuning/jobs/{job_id}", response_class=ORJSONResponse)
+async def openai_v1_fine_tuning_job(job_id: str, raw_request: Request):
+    return await raw_request.app.state.openai_serving_fine_tuning.retrieve(job_id)
+
+
+@app.post("/v1/fine_tuning/jobs/{job_id}/cancel", response_class=ORJSONResponse)
+async def openai_v1_fine_tuning_job_cancel(job_id: str, raw_request: Request):
+    return await raw_request.app.state.openai_serving_fine_tuning.cancel(job_id)
+
+
+@app.get("/v1/fine_tuning/jobs/{job_id}/events")
+async def openai_v1_fine_tuning_job_events(
+    job_id: str,
+    raw_request: Request,
+    after: Optional[str] = None,
+    limit: int = 20,
+    stream: bool = False,
+):
+    """The job's event log. ``stream=true`` turns it into a live SSE tap."""
+    return await raw_request.app.state.openai_serving_fine_tuning.events(
+        job_id, after=after, limit=limit, stream=stream
+    )
+
+
+@app.get("/v1/fine_tuning/jobs/{job_id}/checkpoints", response_class=ORJSONResponse)
+async def openai_v1_fine_tuning_job_checkpoints(
+    job_id: str, raw_request: Request, after: Optional[str] = None, limit: int = 10
+):
+    return await raw_request.app.state.openai_serving_fine_tuning.checkpoints(
+        job_id, after=after, limit=limit
+    )
+
+
+@app.get("/v1/fine_tuning/tenant", response_class=ORJSONResponse)
+async def training_tenant_state(raw_request: Request):
+    """The fork's own view: idle verdict, machine, backend probes.
+
+    Namespaced under the fine-tuning prefix but not part of the OpenAI
+    protocol -- it answers the questions the protocol has no field for, which
+    is what the frontend and an operator both need.
+    """
+    return ORJSONResponse(raw_request.app.state.training_service.snapshot())
 
 
 @app.post("/v1/audio/transcriptions")

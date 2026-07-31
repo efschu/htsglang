@@ -90,6 +90,10 @@ class RegisteredEngine:
     promotion_cost_ms: Optional[float] = None
     last_error: Optional[str] = None
     adapter: str = ""
+    #: Wall-clock of the last time the arbiter handed this engine to a
+    #: request. The idle tenant (#341) reads it to decide whether the rig has
+    #: been quiet long enough to train on.
+    last_used_ts: float = 0.0
 
     @property
     def is_gpu_resident(self) -> bool:
@@ -170,6 +174,7 @@ def _parse(payload: dict[str, Any], url: str) -> RegistryView:
                         else float(item["promotion_cost_ms"])
                     ),
                     last_error=item.get("last_error"),
+                    last_used_ts=float(item.get("last_used_ts") or 0.0),
                     adapter=str((item.get("spec") or {}).get("adapter", "")),
                 )
             )

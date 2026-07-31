@@ -2668,7 +2668,7 @@ PY
 | `/v1/responses`, `/v1/rerank`, `/v1/score`, `/v1/classify`, `/v1/tokenize` | this process |
 | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | the Ollama emulation, same lanes |
 | `/v1/messages` | the Anthropic emulation, same lanes |
-| `/v1/files`, `/v1/fine_tuning/*` | **not served.** The fine-tuning surface belongs to #341 and is deliberately not stubbed: a 404 from an endpoint that does not exist is a better answer than a job id that never runs |
+| `/v1/files`, `/v1/fine_tuning/*` | this process, the idle training tenant — see section 10. Without `--enable-training-tenant` the routes still answer, with a `503 training_tenant_disabled` naming the flag |
 
 **Additional environment variables.**
 
@@ -2706,3 +2706,153 @@ param, code}}`, with the status code that matches. This replaced a flat body
 their status distinct on purpose, because the three cases are three different
 client situations: `404` the model is not served here, `503` a configured lane
 is down (retryable), `501` no lane implements the endpoint.
+
+## 10. Training as an idle tenant (#341-M1)
+
+The rig trains while it is not inferencing. Jobs arrive over the **OpenAI
+fine-tuning protocol**, so any client that speaks it — the official SDKs,
+LangChain, a suite with a configurable base URL — can submit one without
+knowing anything about this fork. Execution is a wrapped training suite in a
+subprocess; the tenant gives it a VRAM lease from the same ledger every other
+tenant uses, takes the lease back when serving demand arrives, and hands it
+back at the next idle window.
+
+**Turning it on.**
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-AWQ-BF16-INT4 \
+  ... \
+  --enable-training-tenant \
+  --training-model-root /spinning/llm_stuff/club-3090/models-cache \
+  --training-artifact-root /spinning/training \
+  --training-idle-grace-seconds 120 \
+  --training-save-steps 50
+```
+
+| Flag | Default | What it decides |
+|---|---|---|
+| `--enable-training-tenant` | off | whether submitted jobs run. The routes exist either way; off means `503 training_tenant_disabled` naming this flag, never a 404 |
+| `--training-artifact-root` | `$HTSGLANG_TRAINING_ROOT`, else `$XDG_CACHE_HOME/htsglang/training` | where uploads, run configs, checkpoints and adapters go. Its free space is a post in the feasibility formula |
+| `--training-model-root` | unset | directory a job's `model` field is resolved against when it is not an absolute path |
+| `--training-idle-grace-seconds` | `120` | quiet time before the rig counts as idle |
+| `--training-poll-seconds` | `2` | worst-case delay between a request arriving and preemption starting |
+| `--training-preempt-timeout-s` | `120` | how long a preempted trainer may take to checkpoint and exit before it is killed. The serving tenant never waits longer than this |
+| `--training-save-steps` | `50` | checkpoint interval, and therefore the preemption granularity: a preempted job redoes at most this many steps |
+| `--training-default-backend` | `auto` | `auto` picks the first installed real backend; `mock` simulates a run and trains nothing, and `auto` never picks it |
+| `--training-default-method` | `lora` | rung used when a job does not name one |
+| `--training-event-stream-timeout-s` | `120` | #344 liveness bound on an SSE event consumer. The stream sends keepalives, so silence is the consumer's |
+
+**Submitting a job.** Vanilla client, no fork knowledge:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:30000/v1
+export OPENAI_API_KEY=unused
+
+python3 - <<'PY'
+import openai
+c = openai.OpenAI()
+f = c.files.create(file=open("train.jsonl", "rb"), purpose="fine-tune")
+job = c.fine_tuning.jobs.create(model="Qwen3.5-4B", training_file=f.id)
+print(job.id, job.status)
+PY
+```
+
+The fork's own knobs ride in a namespaced `x-htsglang` block (SDK
+`extra_body`) or, for clients that cannot send one, in `metadata` keys
+prefixed `x-htsglang.`:
+
+```python
+job = c.fine_tuning.jobs.create(
+    model="Qwen3.5-4B",
+    training_file=f.id,
+    extra_body={"x-htsglang": {
+        "method": "qlora",          # qlora | lora | freeze | full_offload | full
+        "backend": "llamafactory",  # or "auto" / "mock"
+        "sequence_length": 4096,
+        "save_steps": 50,
+        "base_model_path": "/abs/path/if/model/is/not/a/path",
+    }},
+)
+```
+
+**Endpoints.**
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/files` | multipart upload, `purpose=fine-tune`. JSONL is parsed and record-counted at upload; a bad line is a 400 naming the line number |
+| `GET /v1/files`, `GET /v1/files/{id}`, `DELETE /v1/files/{id}`, `GET /v1/files/{id}/content` | deleting a file a running job still needs is a `409` |
+| `POST /v1/fine_tuning/jobs` | infeasible requests are rejected here, not hours later — see below |
+| `GET /v1/fine_tuning/jobs`, `GET .../jobs/{id}` | cursor pagination via `after` / `limit` |
+| `GET .../jobs/{id}/events` | the event log. `?stream=true` turns it into an SSE tap terminated by `data: [DONE]` |
+| `GET .../jobs/{id}/checkpoints` | `fine_tuning.job.checkpoint` objects with step number and metrics |
+| `POST .../jobs/{id}/cancel` | a request, honoured at the next step boundary; cancelling a finished job is a `409` |
+| `GET /v1/fine_tuning/tenant` | **not OpenAI.** The fork's own view: idle verdict and its evidence, the measured machine, backend probes |
+
+**Job states are the protocol's, and preemption is not one of them.**
+`validating_files -> queued -> running -> succeeded | failed | cancelled`. A
+preempted job stays `running` — it has not stopped, its wall-clock is simply
+longer than its compute time. Where it actually is shows in the extension
+block:
+
+```bash
+curl -s "$OPENAI_BASE_URL/fine_tuning/jobs/$JOB" |
+  python3 -c 'import json,sys; j=json.load(sys.stdin); x=j["x-htsglang"]
+print(j["status"], x["tenant_state"], "step", x["last_step"],
+      "preemptions", x["preemptions"], x.get("resume_from",""))'
+# running preempted step 120 preemptions 1 /spinning/training/jobs/ftjob-.../checkpoint-120
+```
+
+`tenant_state` is `waiting_for_idle`, `training`, `preempted` or `done`.
+
+**Feasibility is a formula, and a rejection carries it.** Every request is
+priced against this machine — NVML card totals minus what the ledger says
+other tenants hold, `/proc/meminfo`, free space at the artifact root, and the
+model's own `config.json` and safetensors index. A rejection is a `400
+insufficient_resources` whose message is the whole ladder. Measured on this
+rig (2x RTX 3080 20 GiB + RTX 5090 32 GiB), a full finetune of Qwen3.5-4B at
+4096 tokens:
+
+```
+full on 4.66B parameters needs 58448 MiB per card (weights 8888 MiB,
+gradients 8888 MiB, optimizer 35552 MiB, activations 640 MiB, logits
+3880 MiB, cuda_context 600 MiB; per-card total 58448 MiB), but the largest
+claimable budget is 32607 MiB on NVIDIA GeForce RTX 5090 -- short by
+25841 MiB.
+
+Method ladder against this machine:
+  qlora             7632 MiB/card  FITS, 24975 MiB spare
+  full_offload     14008 MiB/card  FITS, 18599 MiB spare
+  lora             14141 MiB/card  FITS, 18466 MiB spare
+  freeze           19563 MiB/card  FITS, 13044 MiB spare
+  full             58448 MiB/card  does not fit, short 25841 MiB
+
+What would make this work:
+  - submit the job with method 'qlora': it needs 7632 MiB per card and fits
+    with 24975 MiB to spare
+```
+
+Nothing in that arithmetic is a rig constant: the same code on a node of
+H100s prices the same request as fitting. There is no safety factor either —
+`cuda_context` is a named post with a number, not a hidden margin.
+
+**Backends.** `llamafactory` is the LLM backend; it is *not* vendored and is
+*not* a dependency. If it is not installed in the server's interpreter the
+probe says so by name:
+
+```bash
+curl -s http://127.0.0.1:30000/v1/fine_tuning/tenant |
+  python3 -c 'import json,sys
+for p in json.load(sys.stdin)["backends"]:
+    print(p["backend"], p["available"], p["reason"])'
+```
+
+Install it into the *same* interpreter the server runs on, then restart:
+`pip install llamafactory`. Diffusion LoRA (kohya) and the Unsloth fast path
+are M2.
+
+**Preemption granularity.** The trainer is a subprocess, so the only clean
+place to stop it is its own checkpoint. `--training-save-steps` is therefore
+both the checkpoint interval and the amount of work a preemption can cost.
+The event log says so explicitly when it happens rather than leaving it to be
+inferred.

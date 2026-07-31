@@ -18870,3 +18870,119 @@ pruefen.
 - **Regime B wieder offen**, aber nicht aus Argument, sondern aus Prior Art:
   die produktive `vs-pipeline` legt ESRGAN auf die beiden 3080 und RIFE auf
   die 5090, und P2 misst genau an deren Trennpunkt 1,7 ms Round-Trip.
+
+---
+
+## #341-M1 — Training als Idle-Tenant: OpenAI-Fine-Tuning-Surface, LLaMA-Factory-Backend, Preempt/Resume
+
+Branch `feat/training-tenant-341`, Basis `0288df6266`. Alles auf
+`CUDA_VISIBLE_DEVICES=99` gelaufen; **keine Kartenzeit belegt, kein Eintrag
+in `gpu-arb`**. Der einzige Zugriff auf die Hardware war ein lesender
+NVML-Probe (`nvmlDeviceGetMemoryInfo`), der nichts allokiert und keinen
+CUDA-Kontext oeffnet.
+
+### Was echt lief und was gemockt war
+
+Das ist die entscheidende Trennung, weil "Surface getestet" sonst nichts
+heisst:
+
+| Schicht | Zustand im Test |
+|---|---|
+| Socket, uvicorn, FastAPI-App, Routen, Exception-Handler | **echt** (`openai_sdk_harness.live_server`, realer TCP-Port) |
+| Client | **echt**, das offizielle `openai`-SDK 2.6.1, inklusive dessen eigener Typvalidierung |
+| Job-Store, Event-Log, Cursor-Pagination, SSE-Framing, Fehler-Envelopes | **echt** |
+| Feasibility-Formel, Modell-Profiler, Idle-Monitor, Tenant-Scheduler, Preempt/Resume-Schleife | **echt** |
+| Maschine | **synthetisch** (80-GiB-Karte bzw. 6-GiB-Karte als `MachineResources`), weil CI keine hat |
+| Executor | **`MockBackend`** — durchlaeuft den vollen Lebenszyklus (Schritte, Checkpoints, Metrik-Events, Preempt am Schrittrand, Resume aus dem Checkpoint, Artefakt auf Platte), nur die Arithmetik ist ersetzt |
+| Inferenz-Engine | gemockt wie in jedem Harness-Test |
+| VRAM-Ledger | nicht konfiguriert; der Tenant sagt das im Event-Log ("no VRAM ledger is configured") statt es zu verschweigen |
+| LLaMA-Factory | **nicht installiert**, bewusst. Der Probe lehnt namentlich ab; die reinen Teile des Wrappers (Config-Bau, Log-Parsing, Checkpoint-Erkennung, Dataset-Format) sind einzeln getestet |
+
+Ein echter LoRA-Lauf auf Hardware ist damit **nicht** belegt. Das war der
+optionale Stretch und ist nicht eingeloest worden; Karten waren durch #330
+belegt, und die Machbarkeitsrechnung stand vor der Messung.
+
+### Testergebnisse
+
+```
+test/registered/training/test_training_unit.py                     36 passed
+test/registered/openai_server/basic/test_finetuning_sdk_surface.py 25 passed
+test/registered/openai_server/basic/test_openai_sdk_surface.py     25 passed  (Regression, #335-M0)
+test/registered/video_enhance/test_liveness.py                     22 passed  (Regression, #344a)
+```
+
+Beide neuen Dateien sind per `register_cpu_ci(..., suite="base-a-test-cpu")`
+registriert und laufen ohne Karte.
+
+`ruff check` auf allen beruehrten Dateien: 340 Befunde vor und 340 nach dem
+Patch, also **null neue** (der Rest ist der bestehende `F722`-Regen aus den
+`Annotated`-Hilfstypen in `server_args.py`). `codespell` sauber; dabei ist
+ein bestehender deutscher Kommentar in `server_args.py` (bar1ep-Zweig)
+uebersetzt worden, weil er den Commit sonst blockiert haette und die
+Englisch-Regel ihn ohnehin einsammelt.
+
+### Preempt/Resume, gemessen am Verhalten
+
+Der Beweis laeuft zweimal, einmal unter der HTTP-Oberflaeche und einmal
+darueber:
+
+- `TenantPreemptResumeTest.test_job_runs_preempts_and_resumes` (Service-Ebene)
+- `FineTuningSDKSurfaceTest.test_serving_demand_preempts_and_idle_resumes`
+  (durch das SDK)
+
+Ablauf im zweiten Fall: Job wird `running`, ein gefaelschtes
+Serving-Demand-Signal geht auf `busy`, der Tenant checkpointet und gibt frei.
+Der Job bleibt danach **`status == "running"`** — Preemption ist kein
+Protokollzustand — und meldet im Erweiterungsblock `tenant_state ==
+"preempted"`, `preemptions == 1`, `last_step > 0` und ein `resume_from`, das
+auf `checkpoint-N` zeigt. Nach `busy = False` laeuft er bis
+`last_step == 600` durch und wird `succeeded`. Das Event-Log enthaelt beide
+Saetze ("preempting: ...", "resuming from ...").
+
+### Client-Liveness (#344) auf dem Event-Stream
+
+`test_a_stream_consumer_that_leaves_does_not_touch_the_job`: ein
+SSE-Konsument liest eine Zeile und verschwindet. Der Subscriber wird
+abgeraeumt (`subscriber_count(job) == 0`), der **Job laeuft weiter** und
+wird `succeeded`. Das ist die Regel aus dem Briefing woertlich: Jobs sind
+per Protokoll fire-and-forget, nur der Zuhoerer wird aufgeraeumt. Der
+Watchdog ist derselbe `ConsumerWatchdog` aus #344a; neu ist nur die
+Endpunktklasse `TRAINING_EVENTS` (Default 120 s) und die Keepalive-Zeile,
+ohne die Stille des Jobs wie ein toter Client aussaehe.
+
+### Feasibility gegen die echte Kiste
+
+Einmal gegen die tatsaechlichen NVML-Werte gerechnet (2x RTX 3080 20480 MiB,
+RTX 5090 32607 MiB, 100920 MiB RAM, 788791 MiB frei auf `/spinning`),
+Qwen3.5-4B, `method=full`, `sequence_length=4096`:
+
+```
+full on 4.66B parameters needs 58448 MiB per card (weights 8888, gradients
+8888, optimizer 35552, activations 640, logits 3880, cuda_context 600),
+largest claimable budget 32607 MiB on the RTX 5090 -- short by 25841 MiB.
+
+  qlora             7632 MiB/card  FITS, 24975 MiB spare
+  full_offload     14008 MiB/card  FITS, 18599 MiB spare
+  lora             14141 MiB/card  FITS, 18466 MiB spare
+  freeze           19563 MiB/card  FITS, 13044 MiB spare
+  full             58448 MiB/card  does not fit, short 25841 MiB
+```
+
+Die Parameterzahl kommt aus `model.safetensors.index.json` (`total_size`),
+nicht aus dem Namen; die Kartenwerte aus NVML, die Belegung aus dem Ledger,
+RAM aus `/proc/meminfo`, Platte aus `statvfs`. Keine Rig-Konstante im Code —
+`test_same_request_fits_on_a_bigger_machine` faelscht genau das nach und
+zeigt dieselbe Anfrage auf einer 640-GiB-Karte als passend.
+
+### Offen (M2/M3)
+
+- Echter LoRA-Lauf auf Hardware. Der Wrapper ist gebaut und die reinen Teile
+  getestet, aber kein Byte wurde je von LLaMA-Factory trainiert.
+- Produzierte Adapter fliessen noch nicht als ladbares Serving-Artefakt
+  zurueck (D4-Satz, M2).
+- Job-Records leben im Speicher; ein Neustart verliert sie. Ehrlich, solange
+  der Neustart auch den Executor killt — Ueberleben braucht einen Executor,
+  der den Server ueberlebt (M3).
+- Multi-Card ist bepreist (`world_size`, sharded fuer `full_offload`), aber
+  nur der Einprozess-Start ist gebaut.
+- Idle-Grace 120 s und Poll 2 s sind gesetzt, nicht gemessen.
