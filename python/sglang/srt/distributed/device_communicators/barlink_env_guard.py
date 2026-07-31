@@ -140,11 +140,16 @@ RETIRED_ENV_VARS = {
     "SGLANG_HTCCL_UCX_RING_MIB": "SGLANG_BARLINK_UCX_RING_MIB",
     "SGLANG_HTCCL_UCX_TIMEOUT_S": "SGLANG_BARLINK_UCX_TIMEOUT_S",
     "SGLANG_HTCCL_UCX_WORKERS": "SGLANG_BARLINK_UCX_WORKERS",
+    # Task #361: the BAR1 EP dispatcher's own switch. It never carried the
+    # HTCCL prefix, so neither #295 nor #358 caught it, and it sat as the
+    # last German name in an environment surface declared English.
+    "SGLANG_BAR1EP_SELBSTTEST": "SGLANG_BAR1EP_SELFTEST",
 }
 
-#: Prefix shared by every retired name. Used to catch the per-group
+#: Prefix shared by most retired names. Used to catch the per-group
 #: variables that are built at runtime and any variable that a launch
-#: script grew after the table above was written.
+#: script grew after the table above was written. Names outside the prefix
+#: are caught by their table entry alone -- see ``check_retired_env_vars``.
 RETIRED_PREFIX = "SGLANG_HTCCL"
 
 
@@ -167,7 +172,12 @@ def check_retired_env_vars(environ=None) -> None:
     rather than one failure at a time.
     """
     env = os.environ if environ is None else environ
-    found = sorted(n for n in env if n.startswith(RETIRED_PREFIX))
+    # Two ways in: the prefix (catches names built at runtime and names a
+    # launch script grew after this table was written) and an exact table
+    # entry (catches retired names that never carried the prefix).
+    found = sorted(
+        n for n in env if n.startswith(RETIRED_PREFIX) or n in RETIRED_ENV_VARS
+    )
     if not found:
         return
     lines = "\n".join(f"  {n} -> {successor(n)}" for n in found)
