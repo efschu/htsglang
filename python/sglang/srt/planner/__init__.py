@@ -40,7 +40,22 @@ Single entry point::
 or the CLI: ``python -m sglang.planner --model <path> ...``.
 """
 
-from sglang.srt.uneven_perf import PlanInputs  # noqa: F401  (re-export)
+
+def __getattr__(name):
+    """Lazy re-export of ``PlanInputs`` (PEP 562).
+
+    Importing it eagerly pulled ``uneven_perf`` -- and through it torch -- into
+    every ``import sglang.srt.planner.<anything>``, ~7 s and a CUDA context's
+    worth of import for a caller that wanted a pure-math submodule. The
+    consumers of the #348b cost library live outside this package (the video
+    and diffusion shard planners) and must not pay that, so the heavy import
+    happens on first attribute access instead of at package import.
+    """
+    if name == "PlanInputs":
+        from sglang.srt.uneven_perf import PlanInputs
+
+        return PlanInputs
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def plan(*args, **kwargs):

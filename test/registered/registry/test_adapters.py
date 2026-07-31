@@ -292,6 +292,79 @@ class Class2Test(unittest.TestCase):
             Class2DiffusionAdapter(spec, context()).estimate(spec, (CARD_A, CARD_B))
         self.assertIn("M4", str(ctx.exception))
 
+    # -- capacity weights (#348b) ------------------------------------------
+    #
+    # Until #348b the measured branch of _capacity_weights called
+    # load_measured_registry -- the KV-BUDGET registry, gated behind
+    # SGLANG_MEASURED_KV_BUDGET, keyed by components/mlp_vector rather than by
+    # card UUID, and typed for a ServerArgs this caller does not have. It could
+    # not return a per-card gemm_tflops under any configuration, so uneven SP
+    # was reachable only by declaring the weights by hand while the docstring
+    # claimed the K1 rates were in use. Nothing covered it. These two cases do.
+
+    def _profile(self):
+        return {
+            "gpus": {
+                CARD_A: {"uuid": CARD_A, "name": "RTX 3080", "gemm_tflops": 65.57},
+                CARD_B: {"uuid": CARD_B, "name": "RTX 5090", "gemm_tflops": 231.97},
+            }
+        }
+
+    def test_capacity_weights_come_off_the_measured_gemm_rates(self):
+        from unittest import mock
+
+        from sglang.srt.planner import cost_model
+
+        spec = self.spec()
+        adapter = Class2DiffusionAdapter(spec, context())
+        with mock.patch.object(
+            cost_model,
+            "compute_rates_for_cards",
+            side_effect=lambda cards, **kw: cost_model.compute_rates_from_entries(
+                [self._profile()["gpus"].get(c) for c in cards], list(cards), **kw
+            ),
+        ):
+            weights = adapter._capacity_weights((CARD_A, CARD_B))
+        # The faster card earns the longer slice, in the ratio the probe
+        # measured -- not an equal split and not a hand-declared guess.
+        self.assertEqual(weights, (65.57, 231.97))
+
+    def test_a_card_without_a_measured_rate_is_named_not_guessed(self):
+        from unittest import mock
+
+        from sglang.srt.planner import cost_model
+
+        spec = self.spec()
+        adapter = Class2DiffusionAdapter(spec, context())
+        with mock.patch.object(
+            cost_model,
+            "compute_rates_for_cards",
+            side_effect=lambda cards, **kw: cost_model.compute_rates_from_entries(
+                [
+                    self._profile()["gpus"].get(c) if c == CARD_B else None
+                    for c in cards
+                ],
+                list(cards),
+                **kw,
+            ),
+        ):
+            with self.assertRaises(EstimateError) as ctx:
+                adapter._capacity_weights((CARD_A, CARD_B))
+        self.assertIn(CARD_A, str(ctx.exception))
+        self.assertIn("no measured GEMM rate", str(ctx.exception))
+
+    def test_declared_weights_still_win_over_the_measured_ones(self):
+        base = self.spec()
+        spec = EngineSpec(
+            engine_id=base.engine_id,
+            klass=base.klass,
+            adapter=base.adapter,
+            placement=(CARD_A, CARD_B),
+            launch={**base.launch, "capacity_weights": [1.0, 3.0]},
+        )
+        adapter = Class2DiffusionAdapter(spec, context())
+        self.assertEqual(adapter._capacity_weights((CARD_A, CARD_B)), (1.0, 3.0))
+
 
 class Class3Test(unittest.TestCase):
     def pooling_spec(self, **launch):

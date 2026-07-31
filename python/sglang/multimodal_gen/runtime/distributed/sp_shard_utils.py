@@ -9,7 +9,6 @@ global tail. `tail_attn_meta` then lets attention skip that block for free
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -34,9 +33,9 @@ _TEXT_SHARD_MIN = int(os.environ.get("SGLANG_SP_TEXT_SHARD_MIN", "0"))
 # Per-rank capacity weights for the heterogeneous (uneven) sequence-parallel
 # split. Comma-separated, one positive float per SP rank, e.g. "1.0,0.46,0.46"
 # for a 5090 + 2x3080 rig. The registry's Class-2 adapter fills this from the
-# same per-card GEMM rates the K1 uneven-TP planner uses
-# (``sglang.srt.uneven_perf.rank_gemm_scores`` -> ``gemm_tflops``), so the
-# faster card is handed a proportionally longer slice of the sequence. Absent
+# same per-card GEMM rates the K1 uneven-TP planner uses, through the shared
+# cost library (``sglang.srt.planner.cost_model.compute_rates_for_cards``,
+# #348b), so the faster card is handed a proportionally longer slice. Absent
 # or malformed, the split stays the classic equal-and-tail-padded one and every
 # existing call is byte-identical. This is the ONLY entry point for uneven SP:
 # nothing else in this module reaches into the registry, so the file stays
@@ -98,38 +97,18 @@ class SpShard:
 def _apportion(total: int, weights: Sequence[float]) -> list[int]:
     """Split ``total`` into per-rank integer counts proportional to ``weights``.
 
-    Largest-remainder (Hamilton) apportionment: floor every ideal share, then
-    hand the leftover units to the ranks with the largest fractional parts. The
-    result sums to ``total`` exactly, which is the coverage invariant the whole
-    uneven split rests on -- no unit is created or lost.
+    Largest-remainder (Hamilton) apportionment with a one-token floor per rank;
+    the rule and its rationale live in the shared cost library (#348b) so the
+    video chunk planner and this one round against the same documented pair of
+    rules rather than each carrying a private copy.
 
-    Every rank is guaranteed at least one token when ``total >= len(weights)``:
-    a rank with an empty sequence slice has no work and no attention rows, which
-    is a degenerate SP configuration, not a split. Below that floor the request
-    is too short to spread over this many ranks and the caller falls back to the
-    equal scheme.
+    Imported lazily and per call: this runs per request inside the forward
+    path, and the library is stdlib-only at module scope, so the first call
+    pays a module lookup and every later one pays a dict hit.
     """
-    n = len(weights)
-    if any(w <= 0 for w in weights):
-        raise ValueError(f"capacity weights must be positive; got {list(weights)}")
-    total_w = math.fsum(weights)
-    ideal = [total * w / total_w for w in weights]
-    counts = [int(math.floor(x)) for x in ideal]
-    remainder = total - sum(counts)
-    order = sorted(range(n), key=lambda i: ideal[i] - counts[i], reverse=True)
-    for k in range(remainder):
-        counts[order[k]] += 1
-    # Guarantee >= 1 per rank by moving units off the largest holders.
-    if total >= n:
-        donors = sorted(range(n), key=lambda i: counts[i], reverse=True)
-        d = 0
-        for i in range(n):
-            if counts[i] == 0:
-                while counts[donors[d]] <= 1:
-                    d += 1
-                counts[donors[d]] -= 1
-                counts[i] = 1
-    return counts
+    from sglang.srt.planner.cost_model import apportion_largest_remainder
+
+    return apportion_largest_remainder(total, weights, min_one=True)
 
 
 def capacity_weights_from_env(sp_size: int) -> tuple[float, ...] | None:
@@ -160,9 +139,7 @@ def capacity_weights_from_env(sp_size: int) -> tuple[float, ...] | None:
     return weights
 
 
-def build_shard_plan(
-    seq_len: int, weights: Sequence[float] | None = None
-) -> SpShard:
+def build_shard_plan(seq_len: int, weights: Sequence[float] | None = None) -> SpShard:
     """Shard math only; tensors are sliced separately via `shard_like`.
 
     ``weights`` selects the scheme. ``None`` (the default) reads the capacity
@@ -189,9 +166,7 @@ def build_shard_plan(
     )
 
 
-def _build_uneven_plan(
-    seq_len: int, sp_size: int, weights: Sequence[float]
-) -> SpShard:
+def _build_uneven_plan(seq_len: int, sp_size: int, weights: Sequence[float]) -> SpShard:
     if len(weights) != sp_size:
         raise ValueError(
             f"capacity weights has {len(weights)} entries but SP world size is "
