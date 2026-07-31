@@ -15164,3 +15164,296 @@ Session im Fenster, beide Karten-Reihenfolgen zur Laufzeit aufgeloest.
   +16 % (Prefill) gegen +57,5 % (Decode) OHNE Kette; die Lastform ist der
   groesste bekannte Hebel auf E und die Kette ist nur auf der Decode-Form
   vermessen.
+
+## #320 Messbündel (Kartenfenster 2026-07-31, 05:44-06:09 UTC)
+
+Vier gebündelte Posten auf `/spinning/wt-final` @ `a990bc6990` (Branch
+`integration/r3-probe-next2`, Arbeitsbaum sauber), Rezeptbasis
+`2026-07-30_phasen_optima`: TP=3 uneven auf 5090 + 2x 3080,
+Qwen3.6-27B-FP8, BAR1-Transport, `--rank-tp-ratio auto-performance`,
+`--rank-auto-reserve-mib 4500,4200,4200`, `--decode-log-interval 1`, fp8-KV,
+NEXTN k=3. Kein `CUDA_DEVICE_ORDER` gesetzt; NVML-Reihenfolge vorab erhoben
+(`nvml_order.csv`: nvidia-smi 0 = 3080, 1 = **5090**, 2 = 3080 — torch
+enumeriert `cuda:0` = 5090, die Reserve-Vektoren sind für diese Ordnung
+geschrieben).
+
+Kartenzeit **1153 s Hauptlauf + 112 s Korrekturarm = 1265 s (21,1 min) von
+40 min**; 18,9 min zurückgegeben. Alle vier Posten gemessen, keiner wegen
+Budget gekürzt. Böden unverändert übernommen: Prefill s=1 **2,71 %**, s=8
+**3,18 %**, ms/Verify **2,72 %**, Tick-tok/s **7,53 %**.
+
+**Verdikt in einem Satz: Posten 1 bestätigt #299 vollständig — der
+kapazitätsangepasste KV-Vektor `2,11,10` holt den Kontext von 69.784 auf
+431.457 Token (6,18x) zurück, ohne Prefill zu kosten und ohne dass die
+Tiefenachse ihn bestraft; Posten 2 misst die INT8-Lane auf sm86 zu 2,9-3,4x
+der besten dort verfügbaren fp8-Lane (über der erwarteten 1,5-2x-Bandbreite),
+bei hart bestätigter sm120-Lücke; Posten 3 liefert 487,25 tok/s Aggregat bei
+bs=8 = 4,93x gegen Spec-Solo desselben Boots; Posten 4 ist nach einer zweiten,
+benannten Kalibrierungskorrektur 6/6 grün.**
+
+### 1. Posten 1 — KV-Vektor-Matching (#299-Nachmessung)
+
+Arm `kvmatch`: `--rank-mlp-ratio 10,1,1 --rank-kv-ratio 2,11,10`, sonst
+identisch zum #296-Arm 2. Kontrollarm `anchor` (MLP auto, KV `7,3,3`) im
+**selben Fenster**, damit die Tiefenachse nicht gegen einen Fremdtag läuft.
+
+**Das Kapazitäts-Gate, aus dem Bootlog** (`proofs/kvmatch.txt:266`):
+
+```
+Uneven-DCP token sizing: rank 0 local capacity 37580 tokens / ratio 2 = unit 18790;
+min-reduced unit 18759 -> global max_total_num_tokens 431457 (vector [2, 11, 10])
+```
+
+| Größe | #296 Arm 2 (KV 7,3,3) | #320 kvmatch (KV 2,11,10) | Faktor |
+|---|---:|---:|---:|
+| `max_total_num_tokens` | 69.784 | **431.457** | **6,18x** |
+| profilierte Rangkapazität | 37576, 206358, 197718 | 37580, 206358, 197718 | identisch |
+| KV-Token je Rang | — | 37.520 / 206.360 / 187.600 | — |
+
+#299 hatte 431.475 vorhergesagt; gemessen 431.457, Abweichung 0,004 %. Die
+Summenerhaltung ist damit auf der Karte belegt, nicht mehr nur gerechnet. Die
+Hinweiszeile des Boots nennt als Restpotential nur noch `5,30,29` →
+436.288 (**+1,1 %**) — `2,11,10` ist praktisch das Optimum; zum Vergleich lässt
+der Anker mit `7,3,3` noch +4,0 % liegen (433.017 → 450.368).
+
+**Prefill (tok/s) — unverändert, wie vorhergesagt:**
+
+| Punkt | #296 Arm 2 | #320 kvmatch | Δ | Boden |
+|---|---:|---:|---:|---:|
+| 2k, s=1 | 1797,0 | 1856,8 | +3,3 % | 2,71 % |
+| 2k, s=8 | 1546,5 | 1561,7 | +1,0 % | 3,18 % |
+
+Beide Werte liegen an bzw. unter dem Boden — das Gate „Prefill unverändert
+~1797/1547" ist erfüllt, wenn überhaupt minimal positiv.
+
+**Die Tiefenachse (Nutzer-Direktive), gegen den Anker desselben Fensters:**
+
+| Maß | Tiefe | kvmatch | anchor | Δ | Boden | über Boden |
+|---|---|---:|---:|---:|---:|:---:|
+| Prefill s=1 | 20k | 1471,3 | 1310,3 | +12,3 % | 2,71 % | ja |
+| Prefill s=8 | 20k | 1449,7 | 1284,3 | +12,9 % | 3,18 % | ja |
+| ms/Verify bs=1 | 2k | 36,937 | 30,328 | +21,8 % | 2,72 % | ja |
+| ms/Verify bs=1 | 20k | 38,314 | 31,200 | +22,8 % | 2,72 % | ja |
+
+**Der entscheidende Vergleich ist nicht die Höhe, sondern die Steigung.** Der
+MLP-Vektor `10,1,1` kostet Decode — das ist der bekannte #296-Befund
+(Arm 2 gegen Anker: 36,66/30,31 = **+20,9 %** bei 2k). Heute misst dieselbe
+Relation mit dem extremen KV-Vektor **+21,8 %**. Der Aufpreis, den `2,11,10`
+gegenüber `7,3,3` auf die Decode-Runde legt, ist also **+0,9 Prozentpunkte —
+innerhalb des 2,72-%-Bodens**. Über die Tiefe:
+
+| Arm | ms/Verify bs=1 @2k | @20k | Steigung |
+|---|---:|---:|---:|
+| kvmatch (KV 2,11,10) | 36,937 | 38,314 | +3,7 % |
+| anchor (KV 7,3,3) | 30,328 | 31,200 | +2,9 % |
+
+Bei **zehnfachem Kontext** wächst der Abstand der beiden Arme von 1,218 auf
+1,228, also um 0,8 Prozentpunkte — ebenfalls unter dem Boden. Die Sorge aus
+#299 §7 („21 von 23 Token-Anteilen auf den 3080ern, deren Attention mit der
+Tiefe wächst") ist damit **falsifiziert, nicht nur unbestätigt**: bis 20k
+Kontext bezahlt der Vektor seinen 6,18x-Kontextgewinn nicht mit einer
+tiefenabhängigen Decode-Strafe. Der Arm-4-Prior (−3,0 % bei bs=1) zeigte in
+dieselbe Richtung und trägt.
+
+Nebenbeobachtung, nicht überinterpretieren: bei 20k steigt die Akzeptanzlänge
+in beiden Armen nicht gleich (kvmatch 4,00 gegen anchor 3,00 im Tick-Median),
+was den tok/s-Wert von kvmatch bei 20k über den des Ankers hebt (104,40 gegen
+96,2). ms/Verify ist gerade deshalb das Maß von Rang — es normiert das weg.
+
+### 2. Posten 2 — INT8-Lane-Microbench (#319 Stufe 1)
+
+Eigenes Skript `p320_int8_lane_probe.py` (neu, englisch), gebaut auf den
+unveränderten Sonden-Funktionen aus `uneven_perf` — gleiche Shape
+(M=2048, K=5120, N=17408), gleiche warmup/iters (10/60), alle Lanes im
+**selben Lauf**, Kartenidentität über NVML. Laufzeit 7,1 s, keine Kartenzeit
+von Belang.
+
+| Karte | sm | bf16 | fp8_native | fp8_w8a16 | fp8_marlin | **int8_native** | int8 / beste fp8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 5090 (`cuda:0`) | 120 | 230,6 | 559,11 | 176,38 | 219,25 | **—** | — |
+| RTX 3080 (`cuda:1`) | 86 | 62,7 | — | 52,42 | 58,87 | **178,75** | **3,04x** |
+| RTX 3080 (`cuda:2`) | 86 | 60,7 | — | 51,26 | 57,88 | **167,82** | **2,90x** |
+
+Gegen die `fp8_w8a16`-Referenz, auf die das #319-Entscheidungstor formuliert
+war (53,5-53,6): **3,41x / 3,27x**. Das Tor erwartete „deutlich über der
+fp8-Lane, interessant ist ob eher 1,5x oder 2x" — gemessen liegt es **über der
+gesamten erwarteten Bandbreite**. Die Zahlen decken sich im Übrigen mit der
+zwischengespeicherten #298b-Tabelle (bf16 62,2/63,2/233,3, fp8_w8a16
+53,5/53,6/178,4), was den Lauf als solchen validiert.
+
+**Die sm120-Lücke ist bestätigt, wörtlich** (`int8_lane_probe.json`,
+Lane-Notiz der 5090):
+
+```
+int8 GEMM did not run: NotImplementedError:
+No implemented int8_scaled_mm for current compute capability.
+```
+
+**Zur Trivialitätsfrage des Dispatch-Fixes: nein, nicht trivial — und der
+Grund liegt vor der Kernel-Frage.** `sgl_kernel` ist in dieser Umgebung ein
+**installiertes Wheel** (Version 0.3.21, `sm100/common_ops.abi3.so` vom
+17.07., kein `direct_url.json`, kein Editable-Install). Der Quelltext
+`sgl-kernel/csrc/gemm/int8_gemm_kernel.cu:699-744` im Repo ist also gar nicht
+das, was läuft; ein zusätzlicher Dispatch-Arm dort bleibt wirkungslos, bis das
+CUTLASS-Wheel neu gebaut wird — genau der Kernel-Neubau, den dieses Fenster
+ausschließt. Die Frage „läuft eine sm90-Config auf sm120?" wurde deshalb nicht
+empirisch beantwortet; sie ist erst nach einem Wheel-Bau stellbar. **Die
+5090-Seite bleibt offen und ist als solche dokumentiert.**
+
+Was die Zahlen für die Vektor-Arithmetik bedeuten, in zwei ehrlichen Lesarten:
+
+* **Balance.** Heute (FP8) stehen die Karten rechnerisch 559,11 : 58,87 : 57,88
+  = **9,5 : 1 : 0,98**. Mit einem INT8-Checkpoint und dem für die 5090 nötigen
+  bf16-Rückfall (#319 §2c, existiert noch nicht) wären es 230,6 : 178,75 :
+  167,82 = **1,29 : 1,00 : 0,94** — nahezu ausgeglichen. Für einen Stack, dessen
+  Prefill vom langsamsten Rang getaktet wird, ist das die eigentlich
+  interessante Zahl.
+* **Aggregat.** Dieselbe Umstellung senkt die Rohsumme von 675,9 auf
+  577,2 TFLOPS (**−14,6 %**), weil die 5090 ihre 559-TFLOPS-fp8-Lane aufgibt.
+
+Welche der beiden Größen gewinnt, entscheidet das Zeitanteilsmodell aus #299,
+nicht dieses Fenster. Der Microbench liefert nur die Eingangsgrößen — und die
+sind jetzt gemessen statt geschätzt.
+
+### 3. Posten 3 — Spec-Aggregat bei bs=8
+
+Anker-Boot, NEXTN an, 8 Sessions, `s14_decode_punkt.py` (vorgefülltes
+Fenster, `ignore_eos`, Mittelschnitt) — also die Methodik, die #294 zum
+Standard erklärt hat, nicht das s12-Nebenprodukt.
+
+| Maß | Wert |
+|---|---:|
+| Aggregat tok/s (Tick-Median, bs=8) | **487,25** |
+| ms/Verify bs=8 | **6,670** |
+| Akzeptanz (Tick-Median) | 3,25 |
+| gewertete Ticks | 261 von 263 |
+| Klient-Ebene | 482,1 tok/s über 8 Ströme |
+| Spec-Solo bs=1, **derselbe Boot** | 98,92 tok/s (ms/Verify 30,328) |
+| **ehrliche Skalierung bs=8 / Spec-Solo** | **4,93x** |
+
+Das ist die Zahl, die die alte „7,2x" ersetzt: jene war gegen einen
+**spec-losen** Solo von 37,8 tok/s gerechnet und mischte damit den
+Spekulations- in den Batching-Gewinn. Gegen den Spec-Solo desselben Boots
+bleiben **4,93x**. Der Solo-Wert liegt mit 98,92 tok/s leicht unter dem im
+Briefing genannten Korridor 108-130 — dieser Boot trägt `--decode-log-interval 1`
+und die Anker-Konfiguration, die Zahl ist als Nenner desselben Boots aber
+genau die richtige.
+
+Querprobe zur Methodik: #296 maß am Anker bs=8 ein ms/Verify von 6,59 (per
+s12-Nebenprodukt), heute 6,670 per s14 — **+1,2 %, innerhalb des
+2,72-%-Bodens**. Die beiden Messwege sind auf dem Verify-Maß also konsistent,
+was die Vergleichbarkeit der Tabellen über die Tage sichert.
+
+### 4. Posten 4 — s307-Drossel-Halbsatz (#317-Rest)
+
+Zwei Arme. **Arm B** fuhr die #317-Sonde unverändert und war grün in fünf von
+sechs Kriterien, aber `throttle_count` blieb **0**. **Arm B2** ändert genau
+eine Größe und ist **6/6 grün**.
+
+| Arm | Concurrency | Prompt-Repeats | peak | min | **throttle_count** | release | failed | Retract-Zeilen |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| B | 36 (`ceil(0,4 x 90)`) | 900 | 18 | 8 | **0** | 9 | 0 | 0 |
+| B2 | 12 | 1540 | 16 | 1 | **7** | 16 | 0 | 0 |
+
+Zuerst die gute Nachricht über #317: der Fix arbeitet wie gebaut. Der Pool
+wird live gelesen (`max_mamba_cache_size` = **90**, nicht die vorhergesagten
+~70), die Last daraus als `ceil(0,4 x 90)` = **36** dimensioniert statt der
+hartkodierten 24 — die numerische Falle aus dem #317-Commit ist auf der Karte
+reproduziert.
+
+**Warum das trotzdem nicht drosselte — ein zweiter Kalibrierungsfehler
+derselben Familie, eine Ebene tiefer.** Die Druckstichprobe des Controllers
+ist **Token**-Belegung, nicht Slot-Belegung
+(`scheduler.py:3668`: `replicated_pool_usage(sum(req.seqlen for req in
+batch.reqs), max_total_num_tokens)`). Daraus folgt zweierlei, das eine
+slot-basierte Dimensionierung strukturell nicht sehen kann:
+
+* Der Nenner ist `max_total_num_tokens` = **437.463**, nicht der 90er
+  Mamba-Pool. Für 0,30 braucht es ~**131.000 gehaltene Token**.
+* Der Zähler ist durch `current * prompt_tokens` gedeckelt, denn nur `current`
+  Anfragen werden **zugelassen** (Start 8) — der Rest wartet in der Queue und
+  hält gar nichts. Beim historischen 900er-Prompt (~11,7k Token) sind das
+  8 x 11.700 = 93.600 = **0,214** des Pools. Unter 0,30, und **keine
+  Client-Concurrency der Welt ändert diese Zahl**.
+
+Arm B bestätigt die Rechnung exakt: Druckphase nach 24,97 s vorbei,
+`throttle_count` 0, der Float stieg 8 → 18 ausschließlich über den
+**Release**-Pfad. Bindende Größe ist also die **Promptlänge**. Arm B2 setzt
+1540 Repeats (~20k Token): 8 x 20k = 160k = 0,37 des Pools — und die Drossel
+greift siebenmal, der Float fällt bis auf den Floor 1 und wird danach bis zur
+gefitteten Decke 18 zurückgegeben.
+
+Verdikt des unveränderten Prüfskripts (`s307_ceiling_fit.py arm_b`), rc=0:
+
+```
+PASS  the raise probe produced a trajectory
+PASS  the float rose above its start of 8 -- peak=16
+PASS  the float never exceeded the fitted ceiling -- peak=16 fitted=18
+PASS  the pressure phase throttled -- throttle_count=7
+PASS  throttling came before retraction, i.e. nothing was retracted -- 'Retract requests' lines=0
+PASS  every request was served -- failed=0
+```
+
+Damit ist der von #317 offen gelassene Drossel-Halbsatz **belegt**: die
+Drossel bewegt sich, und sie kommt vor jeder Retraktion.
+
+Der Befund ist als **Code** gelandet, nicht nur als Notiz, weil er sonst beim
+nächsten Rig mit anderem Pool erneut zuschlägt: `s307_probe_sizing.py` bekommt
+`token_pool_from_info` / `admitted_from_info` / `context_tokens_from_info` und
+`default_prompt_repeat`, das die Promptlänge aus genau diesen drei **vom
+Server gemeldeten** Größen ableitet und kontextdeckelt. Kann ein Boot die
+Drossel-Marke prinzipiell nicht erreichen, sagt die Sonde das jetzt in ihrer
+eigenen Ausgabe (`"... UNREACHABLE on this boot"`), statt still ein
+`throttle_count: 0` zu melden, das wie ein kaputter Mechanismus aussieht —
+dieselbe Fehler-zu-Tatsache-Wandlung, für die die Lane-Notizen existieren.
+5 neue Tests, Datei 36/36 grün.
+
+### 5. Ausgaben-Validierung, Nebenbefund, Budget
+
+**Ausgaben-Validierung**: kein Müll-Output in irgendeinem Arm
+(`output_check.jsonl`; mechanischer Test auf Replacement-Zeichen und auf
+einen Token, der >20x und >40 % des Textes ausmacht). Beide Arme antworten
+kohärent, 128 Token, `finish_reason` sauber.
+
+**Akzeptanz-Ordnung prose < code**: am Anker **3,282 < 3,556** — erfüllt. Der
+Code-Prompt liefert erwartungsgemäß die längere Akzeptanz.
+
+**Nebenbefund, harness-relevant und älter als dieses Fenster.** Die
+Akzeptanz-Sonde in `s12_prefill_kurve.py` fragt
+`/v1/chat/completions` und liest `choices[0].meta_info.spec_accept_length`.
+Dieser Endpunkt hängt auf diesem Server **kein `meta_info` an** — der Wert ist
+strukturell `None`. Gegenprobe über alle acht Arme von
+`2026-07-30_phasen_optima`: **8 von 8 mal `None`**, unbemerkt, und damit ist
+auch jedes `ms_pro_verify`, das s12 daraus ableitet, leer gewesen. Die
+Decode-Verdikte sind davon **nicht** betroffen: sie kommen aus der Tick-Zeile
+des Schedulers bzw. aus `s14_decode_punkt.py`, das `/generate` benutzt, wo
+`meta_info` oben liegt. Die Sonde dieses Fensters wurde nach dem ersten Arm
+auf `/generate` umgestellt (deshalb steht bei `kvmatch` keine Ordnung, bei
+`anchor` die oben genannte); die Korrektur an s12 selbst ist ein eigener,
+kleiner Posten und hier nur benannt, nicht mitgemacht.
+
+**Reproduktions-Nachweis**: der Anker-Boot dieses Fensters trifft
+`2026-07-30_phasen_optima` exakt — `max_total_num_tokens` 433.017,
+Rangkapazität [233163, 108054, 112596], materialisierte MLP-Units
+[63, 37, 36], 9 HTCCL-Gruppen. Das ist die Grundlage dafür, den
+#296-Arm-2-Vergleich über den Tagesrand hinweg überhaupt führen zu dürfen.
+
+**VRAM-Korridor** eingehalten: knappster Punkt 904 MiB frei auf der 5090
+(Anker-Arm), die 3080er 2349 / 2493 MiB — das ist die gepinnte Reserve des
+Rezepts, kein neuer Posten. Kein Fremd-Spin im Fenster, alle Karten nach
+Abschluss auf 0 MiB, Locks beidseitig (Container **und** Host) freigegeben,
+`gpu-arb/holder` gelöscht.
+
+**Kartenzeit-Buch**: Hauptlauf 1153 s (Boots: kvmatch 119 s, anchor 70 s,
+s307 70 s), Korrekturarm B2 112 s (Boot 67 s), zusammen **1265 s von 2400 s**.
+Der scheinbare Absturz des Anker-Boots im Log (`scheduler_0 ... exit code -15`)
+ist der **eigene Teardown-SIGTERM** nach dem letzten Punkt, nicht ein Vorfall:
+`logs/anchor.fatal.txt` ist leer, `dmesg` zeigt keinen OOM-Kill, und der
+betroffene Punkt (`anchor_p20k` s=8, 1284,3 tok/s) liegt vollständig vor.
+
+Rohdaten: `/spinning/gpu-battery-results/2026-07-31_320_messbuendel/` —
+`punkte.jsonl`, `decode_punkte.jsonl`, `int8_lane_probe.json`,
+`output_check.jsonl`, `s307_b_raise.json` / `s307b2_b_raise.json`,
+`tabellen.md`, `proofs/`, `power/`, `logs/`, `nvml_order.csv`, dazu die
+gefahrenen Skripte (`run.sh`, `run_b2.sh`, `p320_*.py`) und jedes generierte
+Boot-Skript.

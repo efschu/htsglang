@@ -641,5 +641,84 @@ class TestArmBPressureSizing(unittest.TestCase):
         self.assertEqual(mod.default_concurrency(0), 24)
 
 
+class TestArmBTokenPressureSizing(unittest.TestCase):
+    """#320 arm B: the SECOND calibration error, one layer under the first.
+
+    With the request-count fix in place the probe still scored throttle_count
+    0 on the card. The controller's pressure sample is TOKEN occupancy --
+    ``replicated_pool_usage(sum(req.seqlen), max_total_num_tokens)`` -- so the
+    quantity that has to clear --admission-throttle-high is
+    ``admitted * prompt_tokens / max_total_num_tokens``. Client concurrency
+    cannot raise it: only ``current`` requests are admitted, the rest queue and
+    hold nothing. The binding variable is PROMPT LENGTH.
+    """
+
+    # staticmethod() again on purpose: reading the attribute off the other
+    # class yields the plain function, and a plain function in a class body
+    # would be rebound as an instance method (self as the first argument).
+    _sizing_module = staticmethod(TestArmBPressureSizing._sizing_module)
+
+    #: The #320 arm B boot, read off /get_server_info.
+    POOL = 437463
+    ADMITTED = 8
+    CONTEXT = 32768
+
+    def test_the_real_arm_b_prompt_undershot_the_throttle_mark(self):
+        """The exact failure: 8 admitted requests at the historical 900-repeat
+        prompt hold 0.216 of the token pool, under the 0.30 mark -- and no
+        amount of client concurrency changes that number."""
+        held = self.ADMITTED * 900 * 13  # ~13 tokens per repeat, measured
+        self.assertLess(held / self.POOL, 0.30, "the bug this reproduces")
+
+    def test_default_prompt_repeat_clears_throttle_high(self):
+        mod = self._sizing_module()
+        repeats, note = mod.default_prompt_repeat(
+            self.POOL, self.ADMITTED, self.CONTEXT
+        )
+        self.assertEqual(note, "")
+        held = self.ADMITTED * repeats * mod.TOKENS_PER_REPEAT
+        self.assertGreater(held / self.POOL, 0.30)
+        # and it must still fit the context window
+        self.assertLess(repeats * mod.TOKENS_PER_REPEAT, self.CONTEXT)
+
+    def test_unreachable_throttle_mark_is_named_not_silently_undershot(self):
+        """A boot where the admitted count simply cannot hold enough tokens
+        must SAY so -- otherwise it reports throttle_count 0 and looks exactly
+        like a broken mechanism."""
+        mod = self._sizing_module()
+        repeats, note = mod.default_prompt_repeat(self.POOL, 1, 4096)
+        self.assertIn("UNREACHABLE", note)
+        self.assertGreaterEqual(repeats, 1)
+
+    def test_sizing_inputs_are_read_from_the_server_not_assumed(self):
+        mod = self._sizing_module()
+        info = {
+            "max_total_num_tokens": self.POOL,
+            "context_length": self.CONTEXT,
+            "internal_states": [
+                {
+                    "admission_limiter": {"current": 8, "start": 8},
+                    "context_length": self.CONTEXT,
+                }
+            ],
+        }
+        self.assertEqual(mod.token_pool_from_info(info), self.POOL)
+        self.assertEqual(mod.admitted_from_info(info), 8)
+        self.assertEqual(mod.context_tokens_from_info(info), self.CONTEXT)
+
+    def test_admitted_falls_back_to_the_start_value(self):
+        mod = self._sizing_module()
+        info = {"internal_states": [{"max_running_requests_start": 4}]}
+        self.assertEqual(mod.admitted_from_info(info), 4)
+
+    def test_missing_inputs_fall_back_without_crashing(self):
+        mod = self._sizing_module()
+        self.assertEqual(mod.default_prompt_repeat(None, 8, 32768)[0], 900)
+        self.assertEqual(mod.default_prompt_repeat(self.POOL, None, 32768)[0], 900)
+        self.assertIsNone(mod.token_pool_from_info({}))
+        self.assertIsNone(mod.admitted_from_info({}))
+        self.assertIsNone(mod.context_tokens_from_info({}))
+
+
 if __name__ == "__main__":
     unittest.main()
