@@ -4728,6 +4728,14 @@ class ModelRunnerKVCacheMixin:
         (``split_lane_budget``) and turns it into tokens the same way the
         lane target does -- bytes per token, page-aligned, no profiling, no
         collective.
+
+        The budget post is sized so that this pool comes out at the TARGET's
+        token count, because the head follows the target's sequences. Two
+        guards keep that promise honest against a mis-derived post: the cap
+        below trims a pool that came out LARGER (those bytes would buy slots
+        the head can never reach), and the shortfall warning names a pool
+        that came out SMALLER, which is the failure mode -- the head runs out
+        of KV mid-sequence while the target still has room.
         """
         from sglang.srt.model_executor.pool_configurator import (
             MemoryPoolConfig,
@@ -4750,6 +4758,23 @@ class ModelRunnerKVCacheMixin:
         cap = int(getattr(self, "dual_group_lane_token_cap", 0) or 0)
         if cap > 0 and tokens > cap:
             tokens = cap // self.page_size * self.page_size
+        elif cap > 0 and tokens < cap:
+            # Not fatal -- short jobs never reach the shortfall -- but it is
+            # never intended, so it is named with both numbers and the MiB it
+            # would take to close, rather than surfacing later as a pool
+            # exhaustion on the head alone.
+            logger.warning(
+                "dual-group lane %d HEAD pool is SHORTER than the lane "
+                "target's: %d tokens against %d. The head follows the "
+                "target's sequences, so a job longer than %d tokens will "
+                "exhaust the head's KV while the target still has room. "
+                "Closing it costs %d MiB of the lane budget.",
+                self.dual_group_lane_id,
+                tokens,
+                cap,
+                tokens,
+                (((cap - tokens) * cell) + (1 << 20) - 1) >> 20,
+            )
         if tokens <= 0:
             raise ValueError(
                 f"dual-group lane head: budget {budget_bytes >> 20} MiB is "

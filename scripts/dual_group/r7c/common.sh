@@ -24,7 +24,9 @@ export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 
 ARB=/spinning/gpu-arb
-OWNER=agent-lane-r7c
+# Overridable: several rounds share this file, and the arbitration log is only
+# useful if the line names the session that actually holds the cards.
+OWNER="${OWNER:-agent-lane-r7c}"
 
 # --- dry run ----------------------------------------------------------------
 # R7C_DRY_RUN=1 walks a recipe from the top to the launch line without touching
@@ -136,7 +138,8 @@ assert_cards_free() {
 
 claim_cards() {  # $1 = purpose
   dry_run && { echo "DRY RUN: keine Arbitrierung, purpose=$1"; return 0; }
-  printf 'session=operator  cards=0,1,2  purpose=%s  since=%s\n' \
+  printf "session=%s  cards=0,1,2  purpose=%s  since=%s\n" \
+    "$OWNER" \
     "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ARB/holder"
   printf '%s %s BELEGT cards=0,1,2 purpose=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$OWNER" "$1" >> "$ARB/log"
@@ -158,9 +161,15 @@ release_cards() {  # $1 = result line
 # Sampled DURING load, not just at the end: the peak is what decides whether a
 # drafter fits, and the steady state after warmup hides the prefill scratch
 # that the 2700 MiB reserve exists for.
+# Power is sampled alongside occupancy (#274 round 8): on a shared card, "how
+# busy" and "how much of the card each class actually got" are different
+# questions, and utilization alone answers neither -- a card at 100 % util and
+# 120 W is doing something very different from one at 100 % and 400 W. Both
+# columns are additive to the CSV; summarise_vram reads by NAME, so the older
+# recipes keep working unchanged.
 start_vram_sampler() {  # $1 = output csv
   local out="$1"
-  echo "ts_utc,gpu_index,name,mem_used_mib,mem_total_mib,util_pct" > "$out"
+  echo "ts_utc,gpu_index,name,mem_used_mib,mem_total_mib,util_pct,power_w" > "$out"
   if dry_run; then
     echo "DRY RUN: kein VRAM-Sampler"
     VRAM_SAMPLER_PID=""
@@ -169,8 +178,9 @@ start_vram_sampler() {  # $1 = output csv
   fi
   (
     while true; do
-      nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
-                 --format=csv,noheader,nounits \
+      nvidia-smi \
+        --query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw \
+        --format=csv,noheader,nounits \
         | sed "s/^/$(date -u +%Y-%m-%dT%H:%M:%SZ),/" >> "$out"
       sleep 5
     done
@@ -194,14 +204,44 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 peak = defaultdict(int)
 total = {}
 name = {}
+util = defaultdict(list)
+power = defaultdict(list)
+
+
+def _num(row, key):
+    v = (row.get(key) or "").strip()
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
 for r in rows:
     i = int(r["gpu_index"])
     peak[i] = max(peak[i], int(r["mem_used_mib"]))
     total[i] = int(r["mem_total_mib"])
     name[i] = r["name"]
-print(f"{'NVML':>4} {'Karte':28} {'Peak benutzt':>13} {'Total':>8} {'MIN frei':>9}")
+    for key, sink in (("util_pct", util), ("power_w", power)):
+        v = _num(r, key)
+        if v is not None:
+            sink[i].append(v)
+
+
+def _mm(xs):
+    return (f"{sum(xs) / len(xs):.0f}", f"{max(xs):.0f}") if xs else ("-", "-")
+
+
+print(
+    f"{'NVML':>4} {'Karte':28} {'Peak benutzt':>13} {'Total':>8} {'MIN frei':>9}"
+    f" {'util avg/max':>13} {'W avg/max':>12}"
+)
 for i in sorted(peak):
-    print(f"{i:>4} {name[i]:28} {peak[i]:>13} {total[i]:>8} {total[i]-peak[i]:>9}")
+    ua, um = _mm(util[i])
+    pa, pm = _mm(power[i])
+    print(
+        f"{i:>4} {name[i]:28} {peak[i]:>13} {total[i]:>8} {total[i]-peak[i]:>9}"
+        f" {ua + '/' + um:>13} {pa + '/' + pm:>12}"
+    )
 print(f"\n({len(rows)} Samples)")
 PY
 }

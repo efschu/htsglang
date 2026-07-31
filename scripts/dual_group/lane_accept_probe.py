@@ -28,7 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Forced-continuation prompts: the lane's trajectory is only reproducible where
 # the continuation is forced (round 4 measured that, and one of four candidates
@@ -141,27 +141,45 @@ def serving_run(base: str, input_ids: List[int], tokens: int) -> Dict[str, Any]:
 def lane_run(
     base: str, job: Dict[str, Any], poll_s: float = 1.0, budget_s: float = 900.0
 ):
-    before = len(lane_results(base))
+    """Post one lane job and return the result rows it produced.
+
+    Progress is read off ``results_total``, the MONOTONE counter, never off
+    the length of ``results``. That list is a RING of the last eight rows: a
+    poll on its length stops growing at the ninth job of a boot and the
+    caller then waits out its whole budget on a job that finished long ago.
+    Measured -- it cost 15 minutes of a card window in the families slice.
+    """
+    before, _ = lane_snapshot(base)
     _post(
         base, "/set_internal_state", {"server_args": {"dual_group_lane_prefill": job}}
     )
     t0 = time.time()
     while time.time() - t0 < budget_s:
-        res = lane_results(base)
-        if len(res) > before:
-            return res[before:]
+        total, res = lane_snapshot(base)
+        if total > before:
+            produced = min(total - before, len(res))
+            return res[-produced:] if produced else res[-1:]
         time.sleep(poll_s)
     raise TimeoutError("lane job did not finish inside the budget")
 
 
-def lane_results(base: str) -> List[Dict[str, Any]]:
+def lane_snapshot(base: str) -> Tuple[int, List[Dict[str, Any]]]:
+    """(results_total, the ring of recent result rows) over all lanes."""
     info = _get(base, "/get_server_info")
     states = info.get("internal_states") or []
+    total = 0
     out: List[Dict[str, Any]] = []
     for st in states:
         for lane in st.get("dual_group_lanes") or []:
+            total += int(lane.get("results_total") or 0)
             out.extend(lane.get("results") or [])
-    return out
+    return total, out
+
+
+def lane_results(base: str) -> List[Dict[str, Any]]:
+    """The result RING (last eight rows). Never poll its length -- see
+    :func:`lane_run`."""
+    return lane_snapshot(base)[1]
 
 
 def serving_curve(base: str) -> Optional[Dict[str, Any]]:

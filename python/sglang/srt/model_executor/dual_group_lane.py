@@ -45,6 +45,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -1091,9 +1092,75 @@ def resolve_speed_dial(server_args) -> Tuple[int, int]:
     return new_budget, new_requests
 
 
+def kv_bearing_layer_count(model_config, is_head: bool = False) -> int:
+    """How many layers of ``model_config`` actually hold a KV cache.
+
+    This is NOT ``num_hidden_layers``, and the difference is the whole point:
+
+    * On a hybrid model most layers are linear/GDN and hold recurrent state,
+      not KV. Only ``full_attention_layer_ids`` pays per token. On the Qwen3.5
+      family that is every fourth layer -- 16 of 64.
+    * A NEXTN head's config is built from the TARGET's checkpoint, so it
+      reports the target's layer count AND the target's full-attention layer
+      ids even though the head is ONE decoder layer. The head therefore has
+      to be read off ``num_nextn_predict_layers``, which the draft-config
+      derivation sets explicitly (``ModelConfig._maybe_patch_draft_arch``),
+      and never off either of the two layer lists it inherited.
+
+    Both branches are family-neutral -- a model without a hybrid split falls
+    through to its plain layer count -- and both are config-only, so this can
+    run before any pool, model or CUDA context exists.
+    """
+    if is_head:
+        nextn = getattr(model_config, "num_nextn_predict_layers", None)
+        if nextn is None:
+            hf = getattr(model_config, "hf_config", None)
+            nextn = getattr(hf, "num_nextn_predict_layers", None)
+        if isinstance(nextn, int) and nextn > 0:
+            return nextn
+        # No NEXTN declaration: fall through to the generic count rather than
+        # guessing 1. A head whose config says nothing is not known to be one
+        # layer deep, and over-reserving is the recoverable direction.
+
+    hf = getattr(model_config, "hf_config", None)
+    text = hf.get_text_config() if hasattr(hf, "get_text_config") else hf
+    for holder in (text, model_config):
+        ids = getattr(holder, "full_attention_layer_ids", None)
+        if ids:
+            return len(ids)
+    return max(1, int(getattr(model_config, "num_hidden_layers", 1) or 1))
+
+
+@dataclass(frozen=True)
+class LaneBudgetSplit:
+    """How the operator's ONE lane budget is divided, itemized (#313 idiom).
+
+    Carried as an object rather than a bare pair so the boot log can say WHY
+    each post has the size it has -- the same reason
+    :class:`LadderReserveDemand` carries its posts.
+    """
+
+    budget_mib: int
+    target_mib: int
+    draft_mib: int
+    target_kv_layers: int
+    draft_kv_layers: int
+
+    def ledger(self) -> str:
+        return (
+            f"lane budget {self.budget_mib} MiB = target {self.target_mib} MiB "
+            f"({self.target_kv_layers} KV-bearing layer(s)) + NEXTN head "
+            f"{self.draft_mib} MiB ({self.draft_kv_layers}); the head's share "
+            f"is {self.draft_kv_layers}/"
+            f"{self.draft_kv_layers + self.target_kv_layers} because both "
+            "pools hold the SAME token count at the same page size and their "
+            "per-token cells differ only in that layer count"
+        )
+
+
 def split_lane_budget(server_args, target_model_config, draft_model_config):
     """Split the operator's ONE lane budget between the lane's target and its
-    NEXTN head (#274 slice C).
+    NEXTN head (#274 slice C), from the RANK-LOCAL per-token KV cell.
 
     Resource principle 2: no VRAM is duplicated that does not have to be.
     Both lane runners read ``--dual-group-lane-budget-mib``, so without a
@@ -1101,16 +1168,51 @@ def split_lane_budget(server_args, target_model_config, draft_model_config):
     capacity post would double behind the operator's back. It is one budget
     and it is divided, not two budgets that happen to share a name.
 
-    The head is one decoder layer against the target's many, so its KV need
-    is that ratio of the target's. A floor keeps the pool above the
-    page/slot minimum on models with very many layers.
+    THE SPLIT RULE, and why it is this one. The head follows the target's
+    sequences token for token, so the only correct size for its pool is the
+    target's TOKEN COUNT -- not a fraction of the target's bytes. Both pools
+    are built from the same ``kv_heads * (head_dim + v_head_dim) * elem_size``
+    cell and differ only in how many layers pay it, so "same tokens" is
+    exactly the layer-count ratio::
+
+        draft_mib / budget = L_head / (L_head + L_target)
+
+    and the dtype, the head dimensions and the page size all cancel. On the
+    Qwen3.5 vehicle that is 1/(1+16) -- 94 MiB of a 1600 MiB budget.
+
+    WHAT THIS REPLACES, named because it was measured and not guessed: the
+    previous rule took the ratio of ``num_hidden_layers``, which on a real
+    NEXTN draft config is the TARGET's own layer count (the draft config is
+    derived from the target's checkpoint). The ratio therefore came out at 1.0
+    on every real boot and the result was decided by the clamp behind it --
+    a flat quarter of the budget, 400 MiB, of which the head's pool then used
+    ~75 and the token cap threw the remaining ~325 away: not allocated, and
+    not given back to the lane target either. The unit test that covered the
+    rule fed a draft config reporting ONE layer, which no real draft config
+    does, so the arithmetic was never exercised on its production input.
+
+    Config-only and rank-local: no profiling, no collective, and callable
+    before either runner has a pool -- which it must be, because the lane
+    target sizes its pool from what is left here.
     """
     budget = int(server_args.dual_group_lane_budget_mib or 0)
-    target_layers = max(1, int(getattr(target_model_config, "num_hidden_layers", 1)))
-    draft_layers = max(1, int(getattr(draft_model_config, "num_hidden_layers", 1)))
-    draft_mib = max(64, -(-budget * draft_layers // target_layers))
-    draft_mib = min(draft_mib, max(64, budget // 4))
-    return budget - draft_mib, draft_mib
+    target_layers = kv_bearing_layer_count(target_model_config)
+    draft_layers = kv_bearing_layer_count(draft_model_config, is_head=True)
+    # Rounded UP: the head running one page short of the target is a hard
+    # failure mode (it cannot follow the sequence), one page of slack is not.
+    draft_mib = -(-budget * draft_layers // (draft_layers + target_layers))
+    # The head must stay allocatable, and it must never crowd out the target
+    # it exists to serve. Both bounds only ever bind on a degenerate ratio.
+    draft_mib = max(1, min(draft_mib, max(1, budget // 2)))
+    split = LaneBudgetSplit(
+        budget_mib=budget,
+        target_mib=budget - draft_mib,
+        draft_mib=draft_mib,
+        target_kv_layers=target_layers,
+        draft_kv_layers=draft_layers,
+    )
+    logger.info("dual-group %s", split.ledger())
+    return split.target_mib, split.draft_mib
 
 
 def lane_chain_verify_mask(n_cached: int, draft_token_num: int, device=None):
