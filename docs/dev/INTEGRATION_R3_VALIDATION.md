@@ -10349,7 +10349,11 @@ Eigener Posten, groesser als der, um den es hier ging.
 Die s12-Zusammenfassung des Laufs meldete `accept: None` in allen acht
 Punkten und eine Decode-Rate auf Anfrageebene (32 tok/s bei bs=1), waehrend
 die Decode-Schleife 77-94 tok/s umschlug. Beides war Messvorrichtung, nicht
-Befund:
+Befund. Die Zahlen unten umgehen das ueber den Tick-Ertrag; die zugrunde
+liegende Sonde selbst (der `/v1/chat/completions`-Aufruf in
+`s12_prefill_kurve.py`) blieb bis Task #326 im Code unveraendert und riss
+am 2026-07-30-Lauf `2026-07-30_phasen_optima` erneut (siehe #320-Nebenbefund
+weiter unten in dieser Datei) — void-vermerkt und dort gefixt:
 
 * `meta_info` ist auf dem Chat-Endpunkt opt-in (`return_meta_info: bool =
   False`), und die Accept-Anfrage hat es nie angefordert. Der Scheduler loggt
@@ -15429,8 +15433,15 @@ Decode-Verdikte sind davon **nicht** betroffen: sie kommen aus der Tick-Zeile
 des Schedulers bzw. aus `s14_decode_punkt.py`, das `/generate` benutzt, wo
 `meta_info` oben liegt. Die Sonde dieses Fensters wurde nach dem ersten Arm
 auf `/generate` umgestellt (deshalb steht bei `kvmatch` keine Ordnung, bei
-`anchor` die oben genannte); die Korrektur an s12 selbst ist ein eigener,
-kleiner Posten und hier nur benannt, nicht mitgemacht.
+`anchor` die oben genannte); die Korrektur an s12 selbst war hier nur benannt,
+nicht mitgemacht — sie ist inzwischen unter Task #326 gelandet
+(`fix/s12-accept-probe`): die Sonde in `s12_prefill_kurve.py` fragt jetzt
+ebenfalls `/generate` statt `/v1/chat/completions`, und ein `None` ohne
+`meta_info` ueberhaupt ist jetzt `accept_probe_fatal` statt eines stillen
+Messwerts.
+
+**Void-Vermerk:** accept/ms_pro_verify aus s12 2026-07-30 void — Sonde las
+None; Decode-Verdikte via Tick-Zeile unberührt.
 
 **Reproduktions-Nachweis**: der Anker-Boot dieses Fensters trifft
 `2026-07-30_phasen_optima` exakt — `max_total_num_tokens` 433.017,
