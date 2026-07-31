@@ -28,6 +28,7 @@ import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from pathlib import Path
 
 from sglang.srt.video_enhance.frame_math import (
     MIB,
@@ -631,6 +632,98 @@ def aggregate_frontier(rows: list[FrontierPoint]) -> list[dict]:
             }
         )
     return out
+
+
+def load_probe_reports(directory: Path | str) -> tuple[list[Sample], list[dict]]:
+    """Read every ``ProbeReport`` JSON in a directory back into samples.
+
+    Returns the samples and one provenance record per file. Provenance is not
+    decoration: a frontier row is only meaningful together with the card it
+    was measured on and the noise floor of that run, and a caller comparing
+    two deployments needs to see that the numbers came from different
+    windows.
+
+    A file that is not a probe report -- the directory also holds e2e and
+    multi-card records -- has no ``samples`` key and is skipped rather than
+    treated as an empty measurement, which would look like a card that
+    sustains nothing.
+    """
+    root = Path(directory)
+    samples: list[Sample] = []
+    sources: list[dict] = []
+    if not root.is_dir():
+        return samples, sources
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or "samples" not in payload:
+            continue
+        rows = payload.get("samples") or []
+        loaded = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                samples.append(
+                    Sample(
+                        post=row.get("post", ""),
+                        stage=row.get("stage", ""),
+                        card=row.get("card", ""),
+                        resolution=row.get("resolution", ""),
+                        dtype=row.get("dtype", ""),
+                        options=row.get("options") or {},
+                        ms_per_frame=float(row["ms_per_frame"]),
+                        ms_stdev=float(row.get("ms_stdev", 0.0)),
+                        iterations=int(row.get("iterations", 0)),
+                        peak_device_bytes=row.get("peak_device_bytes"),
+                        note=row.get("note", ""),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            loaded += 1
+        sources.append(
+            {
+                "file": path.name,
+                "host": payload.get("host") or {},
+                "noise_floor_pct": payload.get("noise_floor_pct"),
+                "finished_at": payload.get("finished_at"),
+                "samples": loaded,
+            }
+        )
+    return samples, sources
+
+
+def load_frontier(directory: Path | str | None) -> dict:
+    """The measured capability frontier of a deployment, with its provenance.
+
+    The ``measured`` flag is the honest part. With no measurement directory,
+    or a directory with no probe reports in it, the frontier is empty and
+    every capability question about *rates* is unanswerable -- which the
+    caller is told, rather than being handed a plausible-looking table
+    extrapolated from nothing.
+    """
+    if directory is None:
+        return {
+            "measured": False,
+            "reason": "no measurement directory is configured for this tenant",
+            "sources": [],
+            "rows": [],
+        }
+    samples, sources = load_probe_reports(directory)
+    rows = aggregate_frontier(frontier_from_samples(samples))
+    return {
+        "measured": bool(rows),
+        "reason": (
+            ""
+            if rows
+            else f"no probe report with usable stage samples under {directory}"
+        ),
+        "sources": sources,
+        "rows": rows,
+    }
 
 
 @dataclass(frozen=True)

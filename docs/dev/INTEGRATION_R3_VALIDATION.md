@@ -19734,3 +19734,216 @@ CUDA-Graph-Prewarm fuer registrierte kalte Engines, Cold-Tier-Kompression der
 Hibernate-Images (#306), Integrations-Boot-Matrix (#349) als stehendes
 Bug-Netz, sowie die uebrigen sieben Faktor-Kacheln (`power` und `prefix_cache`
 zuerst, `mlp_split` als teuerste).
+
+# #338 — Video-Enhance on the fly: the browser extension and the API it needs
+
+Branch `feat/browser-extension-338`, base `b2c0fbc100` (post-#347-M1). Desk
+only, no card window taken: nothing in this task needs a GPU to be decided,
+and the one container question that does need real bytes was answered with
+ffmpeg on the CPU.
+
+## What was built
+
+The extension is a comfort shell, not a privileged path. It builds a URL and
+puts it in a `<video>` element's `src`. Everything it can do, `curl` can do
+with the same URL — which is why the work split roughly two-to-one in favour
+of the server-side API the URL needs.
+
+### Server: four additions to the enhance surface
+
+| Addition | Where | Shape |
+|---|---|---|
+| Time range | `GET`/`POST /v1/video/enhance` | `start_s: float = 0.0`, `duration_s: float \| None = None` |
+| Client-named job | both enhance forms | `job_id`, echoed as `X-Enhance-Job`, 409 on a live collision |
+| Capability probe | `GET /v1/video/capabilities` | `?source=`, `?target=`, `?target_fps=`, `?configuration=` |
+| Explicit abort | `DELETE /v1/video/enhance/{id}` | pre-existing; verified, documented, made reachable |
+
+The range resolves once, at the HTTP surface, into the two knobs the decode
+stage already had from #339's multi-card work — `start_frame` and
+`frame_limit` — and into an input seek on the remuxer's source input so the
+passthrough tracks start at the same point. Conversion goes through
+`Fraction`, not float: at 24000/1001 fps, `10 s` is frame 239 and a float
+product that lands on 240.0 starts the range one frame late, which is exactly
+where a seam is visible.
+
+`DELETE` already existed but was **unreachable from the class of client this
+task is about**. A URL handed to a `<video>` element never surfaces a response
+header, so a server-minted job id cannot be learned. `job_id` on the request
+is what closes that: the extension names the job, and can therefore cancel it.
+Without it the 300 s `video_stream` liveness timeout is the only way such a
+job ever ends.
+
+The capability endpoint keeps two kinds of answer apart under two keys,
+because conflating them is how a client ends up believing a measurement that
+was never taken:
+
+* `frontier` — **measured**. Rows are read from `ProbeReport` JSON via the new
+  `probes.load_frontier`, with per-file provenance (card, NVML UUID, noise
+  floor). With no `TenantConfig.measurement_dir` it is `{"measured": false,
+  "reason": "no measurement directory is configured for this tenant"}` and no
+  rows. Nothing is extrapolated into it.
+* `budget` — **arithmetic**. `plan_job` is pure, so "does this preset fit in
+  the configured MiB" is answerable with no card and no measurement. Against
+  the existing `docs/dev/measurements/333-m2/` reports the endpoint returns
+  seven frontier rows from two probe files, and `answer_capability(3840x2160,
+  48 fps, rife_only)` comes back achievable at 87.76 fps — the `scale=0.5`
+  arm, matching TASK_333_M2_MEASUREMENTS.md.
+
+### Two defects found on the way, both in the pre-existing path
+
+1. **`stream_response` could not build its own source.** Line 241 called
+   `stages[DECODE].frames(source_url)`; `DecodeStage` has no `frames` method
+   and never had one. Every test injected a `source_factory`, so nothing
+   caught it — the production path would have raised `AttributeError` on the
+   first request. Replaced with `decode_frames()`, the `set_source` + one
+   frame per await bridge that `chunk_worker._as_async` already uses inside a
+   shard.
+
+2. **A client disconnect held the card for 30 s.** The generator's `finally`
+   cancelled the executor and closed the response bridge but *not* the chain's
+   own rings. The decode and middle stage tasks sit suspended in `ring.put` on
+   rings nobody drains any more, and the cancel flag is only read after that
+   await returns — which it never does. Teardown therefore fell through to the
+   30 s guard timeout, holding the decoder, the encoder and the reservation
+   for half a minute after the socket was gone. The watchdog's release path
+   and the `DELETE` endpoint both close the rings and both say why in a
+   comment; the disconnect path is the third way out and was missing it.
+
+   Measured on the new regression test: **30.10 s → below 0.25 s** per
+   teardown (the test now falls off the `--durations=4` list entirely). This
+   is the exact path a closing browser tab takes.
+
+### Extension: `clients/browser-extension/`
+
+```
+manifest.json            MV3, Chrome/Chromium/Edge (background.service_worker)
+manifest.firefox.json    MV3, Firefox (background.scripts + gecko id)
+src/shared.js            pure logic: presets, classify, URL building (UMD)
+src/content.js           DOM read, src swap, restore; injected on click
+src/background.js        action click, DELETE on restore/tab close/navigation
+src/options.html/.js     settings + runtime permission request + server probe
+test/cases.js            29 cases, engine-agnostic
+test/run.js              node runner, zero dependencies
+README.md                install for both browsers, eligibility matrix, manual steps
+```
+
+Permissions are `activeTab`, `scripting`, `storage` and nothing else. No
+`content_scripts` block, no standing `host_permissions`: nothing runs on a
+page until the action is clicked, and access to the configured server origin
+is requested at runtime from the options page, because which server that is
+only becomes known when somebody types one in. A test asserts the set, so
+widening it fails CI rather than slipping through.
+
+No `webextension-polyfill` is vendored. `self.browser || self.chrome` gives a
+promise-returning namespace in both browsers for the five APIs used
+(`storage`, `tabs`, `scripting`, `action`, `runtime`), which is the whole of
+what the polyfill would have provided here.
+
+## Eligibility matrix, as tested
+
+| Case | Verdict | Code |
+|---|---|---|
+| Direct file URL | works | `direct` |
+| Relative `src` / `<source>` child | works, resolved against the page URL | `direct` |
+| HLS `.m3u8` / DASH `.mpd` | works **only if** the server's ffmpeg can reach the manifest and every segment | `manifest` |
+| DRM / EME (`mediaKeys` present) | refused | `drm` |
+| MSE / `blob:` (YouTube et al.) | refused | `mse` |
+| `MediaStream` (`srcObject`) | refused | `stream_object` |
+| `data:` URI | refused | `data_uri` |
+| `file:` URL | refused | `local_file` |
+| No source / no `<video>` | refused | `no_source` / `no_video` |
+| Any other scheme | refused | `unsupported_scheme` |
+
+Two caveats ride along with every eligible source and are surfaced rather than
+discovered: the server fetches the URL **without the browser's cookies**, and
+an element whose intrinsic size is not known yet sends its layout size, which
+the server rejects if it disagrees with the real source.
+
+The `mse` branch is the one that matters and it has its own test: a page whose
+`src` attribute still says `.mp4` while `currentSrc` is a `blob:` must be
+refused, not handed the stale attribute. That is the YouTube shape, and
+enhancing the attribute would enhance whatever it happened to point at.
+
+## Container check: does the output play in a `<video>` element?
+
+Answered with ffmpeg on the CPU rather than deferred to manual. A synthetic
+20 s 320x240 h264+aac clip was pushed through the real `build_remux_command`
+with its own video track standing in for the enhanced elementary stream.
+
+| Run | Bytes | First boxes | moov before mdat | `moof` fragments | Video pkts | Audio pkts |
+|---|---|---|---|---|---|---|
+| whole source | 326 061 | `ftyp, moov, moof, mdat, …` | yes | 19 | 480 | 863 |
+| `start_s=5, duration_s=4` | 71 474 | `ftyp, moov, moof, mdat, …` | yes | 19 | 98 | 177 |
+
+`ftyp` first and `moov` ahead of any media data is the property that makes a
+chunked response playable while it is still being produced; a non-fragmented
+MP4 writes `moov` last and a `<video>` element shows nothing until the final
+byte. `+delay_moov` survives the range — asserted in the test suite as well,
+because dropping it would silently cost the audio edit list.
+
+The ranged run is coherent end to end: 4.083 s of video against 4.110 s of
+audio. The 27 ms gap is the documented bound — the kept tracks are `-c copy`
+and can only start at a packet boundary, which for 48 kHz AAC is 21.3 ms,
+while the video seek is frame-accurate. A range aligns audio to within one
+audio frame, not exactly, and `build_remux_command`'s docstring says so.
+
+## Test results
+
+| Suite | Count | Runtime |
+|---|---|---|
+| `test/registered/video_enhance/` + `test/registered/liveness/` | **418 passed**, 104 subtests | 34.4 s |
+| of which new: `test_http_surface.py` | 45 tests | — |
+| of which new: `test_browser_extension.py` | 19 tests, 34 subtests | 8.4 s |
+| `clients/browser-extension/test/cases.js` | **29 cases, 113 assertions** | < 1 s |
+
+Baseline before the change was 314 passed in the video_enhance suite; nothing
+that passed then fails now.
+
+**The JS tests were not run under node — this host has no JS runtime at all**
+(no `node`, `deno`, `bun` or `qjs`). They were executed under a throwaway
+`quickjs` interpreter in a scratch venv outside the repo, with a ~30-line
+`URL` shim, purely to obtain the assertion counts above rather than assert
+them. `test/run.js` is written for node and has no dependency beyond
+`./cases.js`; a test asserts there is no `package.json` and no `node_modules`,
+so `node test/run.js` remains the whole invocation.
+
+The gap that leaves is covered from Python instead:
+`test_browser_extension.py` checks what can rot silently across the language
+boundary — both manifests parse and agree, the permission set has not
+widened, every file the manifests and `executeScript` reference exists, the
+`CHAIN_PRESETS` object literal in `shared.js` is field-for-field the server's
+`CHAIN_PRESETS`, every query parameter the URL builder sends is one the
+FastAPI route accepts, and the generated job ids pass `normalize_job_id`.
+
+## Tools
+
+`ruff check` and `ruff format` clean on all changed Python. `codespell`
+clean (`dependant` added to `.codespellrc` — it is FastAPI's own attribute
+name on `APIRoute`, not a typo of ours). `mypy --ignore-missing-imports
+--follow-imports=skip` clean on `server.py`, `probes.py`, `tenant.py`,
+`mux.py`.
+
+## Not measured, deliberately open
+
+* **No end-to-end browser proof.** The ten manual steps in
+  `clients/browser-extension/README.md` (happy path, restore, tab close,
+  navigation, DRM refusal, MSE refusal, no-video, wrong server, time range,
+  permission decline) have not been run. There is no browser in this
+  environment and no browser CI harness in this repo. They are labelled
+  manual in the README and are not claimed as passing.
+* **No GPU run.** The container evidence above is ffmpeg-level. A real
+  enhanced stream playing in a real `<video>` element has not been observed.
+* **`resolve_range` probes twice** on a ranged request whose source declares
+  no `source_frame_rate`: once at the endpoint so a bad range is a 422 with
+  arithmetic in it, once in `stream_response`. A validation failure discovered
+  after the response has begun cannot be a status code any more — only a
+  truncated body, which at the client is indistinguishable from a crashed
+  server. The second ffprobe is the price of that distinction, and it is not
+  cached.
+* **The job-id claim is not atomic.** Two requests naming the same id can both
+  pass the endpoint check before either registers. Single-threaded asyncio
+  makes the window small and the common case — a re-request while the first
+  is still streaming — is caught. It is not a lock.
+* **mpv and VLC plugins are a separate task.** They need nothing from this
+  extension; they open the same URL. MSE re-encapsulation, the only route to
+  YouTube-class sources, is explicitly out of scope and not planned here.

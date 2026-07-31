@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Video-Enhance on the fly - settings</title>
+    <style>
+      body {
+        font: 14px/1.5 system-ui, sans-serif;
+        margin: 2rem auto;
+        max-width: 46rem;
+        padding: 0 1rem;
+      }
+      h1 {
+        font-size: 1.3rem;
+      }
+      label {
+        display: block;
+        margin: 0.9rem 0 0.2rem;
+        font-weight: 600;
+      }
+      input,
+      select {
+        width: 100%;
+        padding: 0.35rem;
+        font: inherit;
+      }
+      .row {
+        display: flex;
+        gap: 1rem;
+      }
+      .row > div {
+        flex: 1;
+      }
+      .hint {
+        color: #666;
+        font-weight: 400;
+        font-size: 0.87rem;
+      }
+      button {
+        margin-top: 1.2rem;
+        margin-right: 0.5rem;
+        padding: 0.45rem 0.9rem;
+        font: inherit;
+      }
+      pre {
+        background: #f4f4f4;
+        padding: 0.8rem;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+      #status {
+        margin-top: 1rem;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Video-Enhance on the fly</h1>
+    <p class="hint">
+      This extension is one client of the server's public
+      <code>GET /v1/video/enhance</code> endpoint. Anything that opens an HTTP
+      URL &mdash; VLC, mpv, ffmpeg, curl &mdash; is an equally valid client of
+      the same endpoint; the extension only saves you from copying the URL by
+      hand.
+    </p>
+
+    <label for="serverUrl">Server URL</label>
+    <input id="serverUrl" type="url" placeholder="http://127.0.0.1:8100" />
+    <span class="hint"
+      >The host permission for this origin is requested on save, not held
+      permanently.</span
+    >
+
+    <label for="preset">Chain preset</label>
+    <select id="preset"></select>
+    <span class="hint" id="presetHint"></span>
+
+    <div class="row">
+      <div>
+        <label for="target">Target resolution</label>
+        <input id="target" type="text" placeholder="3840x2160" />
+        <span class="hint">Ignored by presets that keep the source size.</span>
+      </div>
+      <div>
+        <label for="rifeScale">Interpolation flow scale</label>
+        <input id="rifeScale" type="number" step="0.1" min="0.25" max="1" />
+        <span class="hint">0.5 is the 4K headroom arm; 1.0 is full quality.</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="startS">Start (seconds)</label>
+        <input id="startS" type="number" step="0.1" min="0" />
+      </div>
+      <div>
+        <label for="durationS">Duration (seconds)</label>
+        <input id="durationS" type="number" step="0.1" min="0" />
+        <span class="hint">Empty means to the end of the source.</span>
+      </div>
+    </div>
+
+    <button id="save">Save</button>
+    <button id="probe">Test server</button>
+    <div id="status"></div>
+    <pre id="report" hidden></pre>
+
+    <script src="shared.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

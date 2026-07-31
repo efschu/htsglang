@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Video-Enhance on the fly",
+  "version": "0.1.0",
+  "description": "Hand the video on this page to an htsglang video-enhance server and play the enhanced stream instead.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "Enhance video on the fly"
+  },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  }
+}
