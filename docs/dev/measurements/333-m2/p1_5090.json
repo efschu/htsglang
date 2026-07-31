@@ -1,0 +1,244 @@
+{
+  "finished_at": 1785488916.121218,
+  "host": {
+    "card_index": 1,
+    "card_name": "NVIDIA GeForce RTX 5090",
+    "nvml_uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+    "total_mib": 32607
+  },
+  "noise_floor_pct": 2.7745768378777074,
+  "samples": [
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 35.19435844421387,
+      "ms_stdev": 0.10986387413727351,
+      "note": "",
+      "options": {
+        "model": "realesr-general-wdn-x4v3",
+        "provider": "cuda"
+      },
+      "peak_device_bytes": 6220800,
+      "post": "P1",
+      "resolution": "960x540",
+      "stage": "sr"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 64.53438110351563,
+      "ms_stdev": 0.08375517743030045,
+      "note": "",
+      "options": {
+        "model": "realesr-general-wdn-x4v3",
+        "provider": "cuda"
+      },
+      "peak_device_bytes": 11059200,
+      "post": "P1",
+      "resolution": "1280x720",
+      "stage": "sr"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 146.29008941650392,
+      "ms_stdev": 0.06473735592858157,
+      "note": "",
+      "options": {
+        "model": "realesr-general-wdn-x4v3",
+        "provider": "cuda"
+      },
+      "peak_device_bytes": 25165824,
+      "post": "P1",
+      "resolution": "1920x1080",
+      "stage": "sr"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 6.271011209487915,
+      "ms_stdev": 0.1102080794722809,
+      "note": "",
+      "options": {
+        "filter": "lanczos3",
+        "target": "1920x1080"
+      },
+      "peak_device_bytes": 250804224,
+      "post": "P1",
+      "resolution": "3840x2160",
+      "stage": "resize"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 13.57274570465088,
+      "ms_stdev": 0.1795645055521128,
+      "note": "",
+      "options": {
+        "filter": "lanczos3",
+        "target": "3840x2160"
+      },
+      "peak_device_bytes": 608463360,
+      "post": "P1",
+      "resolution": "5120x2880",
+      "stage": "resize"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 10,
+      "ms_per_frame": 24.36723518371582,
+      "ms_stdev": 0.14065275275815722,
+      "note": "",
+      "options": {
+        "filter": "lanczos3",
+        "target": "3840x2160"
+      },
+      "peak_device_bytes": 996700160,
+      "post": "P1",
+      "resolution": "7680x4320",
+      "stage": "resize"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 0,
+      "ms_per_frame": NaN,
+      "ms_stdev": 0.0,
+      "note": "ValueError: RifeStage needs either weights_path or a pre-built modules= object; it will not run with random weights implicitly",
+      "options": {
+        "scale": "1.0"
+      },
+      "peak_device_bytes": null,
+      "post": "P1",
+      "resolution": "1920x1080",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 0,
+      "ms_per_frame": NaN,
+      "ms_stdev": 0.0,
+      "note": "ValueError: RifeStage needs either weights_path or a pre-built modules= object; it will not run with random weights implicitly",
+      "options": {
+        "scale": "0.5"
+      },
+      "peak_device_bytes": null,
+      "post": "P1",
+      "resolution": "1920x1080",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 0,
+      "ms_per_frame": NaN,
+      "ms_stdev": 0.0,
+      "note": "ValueError: RifeStage needs either weights_path or a pre-built modules= object; it will not run with random weights implicitly",
+      "options": {
+        "scale": "1.0"
+      },
+      "peak_device_bytes": null,
+      "post": "P1",
+      "resolution": "3840x2160",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp32",
+      "iterations": 0,
+      "ms_per_frame": NaN,
+      "ms_stdev": 0.0,
+      "note": "ValueError: RifeStage needs either weights_path or a pre-built modules= object; it will not run with random weights implicitly",
+      "options": {
+        "scale": "0.5"
+      },
+      "peak_device_bytes": null,
+      "post": "P1",
+      "resolution": "3840x2160",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "uint8",
+      "iterations": 10,
+      "ms_per_frame": 0.12121280133724213,
+      "ms_stdev": 0.0014506235681658202,
+      "note": "12.21 GiB/s round trip",
+      "options": {
+        "direction": "d2h+h2d"
+      },
+      "peak_device_bytes": null,
+      "post": "P2",
+      "resolution": "0.74MiB",
+      "stage": "transfer"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "uint8",
+      "iterations": 10,
+      "ms_per_frame": 0.44708160161972044,
+      "ms_stdev": 0.0029429151935401365,
+      "note": "13.29 GiB/s round trip",
+      "options": {
+        "direction": "d2h+h2d"
+      },
+      "peak_device_bytes": null,
+      "post": "P2",
+      "resolution": "2.97MiB",
+      "stage": "transfer"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "uint8",
+      "iterations": 10,
+      "ms_per_frame": 1.7415104150772094,
+      "ms_stdev": 0.003628238346360728,
+      "note": "13.63 GiB/s round trip",
+      "options": {
+        "direction": "d2h+h2d"
+      },
+      "peak_device_bytes": null,
+      "post": "P2",
+      "resolution": "11.87MiB",
+      "stage": "transfer"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "uint8",
+      "iterations": 10,
+      "ms_per_frame": 6.93570556640625,
+      "ms_stdev": 0.008428068406163574,
+      "note": "13.69 GiB/s round trip",
+      "options": {
+        "direction": "d2h+h2d"
+      },
+      "peak_device_bytes": null,
+      "post": "P2",
+      "resolution": "47.46MiB",
+      "stage": "transfer"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "uint8",
+      "iterations": 10,
+      "ms_per_frame": 27.722415924072266,
+      "ms_stdev": 0.004542115909519467,
+      "note": "13.70 GiB/s round trip",
+      "options": {
+        "direction": "d2h+h2d"
+      },
+      "peak_device_bytes": null,
+      "post": "P2",
+      "resolution": "189.84MiB",
+      "stage": "transfer"
+    }
+  ],
+  "started_at": 1785488910.261678
+}

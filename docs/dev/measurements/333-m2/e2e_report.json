@@ -1,0 +1,100 @@
+{
+  "args": {
+    "dtype": "fp32",
+    "enable_sr": true,
+    "encode_backend": "ffmpeg",
+    "fps": 24,
+    "fps_multiplier": 2,
+    "frames": 48,
+    "model_dir": "/spinning/llm_stuff/k3-models",
+    "out": "/tmp/e2e_ff",
+    "repeat": 2,
+    "rife_scale": 1.0,
+    "rife_version": "4.6",
+    "source_resolution": "960x540",
+    "sr_provider": "cuda",
+    "target": "1920x1080",
+    "video_codec": "h264"
+  },
+  "checks": {
+    "av_sync": {
+      "delta_s": 0.0417,
+      "output_duration_s": 2.041667,
+      "source_duration_s": 2.0
+    },
+    "byte_stable_across_runs": {
+      "digests": [
+        "5f4472af5842832c",
+        "82ce5679a4d2779a"
+      ],
+      "pass": false
+    },
+    "frame_count": {
+      "actual": 95,
+      "expected": 95,
+      "pass": true,
+      "source": 48
+    },
+    "passthrough_bit_identical": {
+      "0:a:0": {
+        "pass": true,
+        "sha256_output": "84e3c6cf926d499d",
+        "sha256_source": "84e3c6cf926d499d"
+      },
+      "0:a:1": {
+        "pass": true,
+        "sha256_output": "eef0418d994cdc05",
+        "sha256_source": "eef0418d994cdc05"
+      },
+      "0:s:0": {
+        "pass": false,
+        "sha256_output": "67976bfc1484714d",
+        "sha256_source": "fcde84e7476b6a1c"
+      }
+    },
+    "track_count": {
+      "output": 4,
+      "pass": true,
+      "source": 4
+    },
+    "video_geometry": {
+      "actual": "1920x1080",
+      "expected": "1920x1080",
+      "pass": true
+    }
+  },
+  "result": {
+    "bytes_out": 1390568,
+    "elapsed_s": 13.42,
+    "output_rate": "48",
+    "source_rate": "24",
+    "stats": {
+      "bytes_out": 1350592,
+      "dropped": 0,
+      "elapsed_s": 13.395,
+      "error": null,
+      "frames_decoded": 49,
+      "frames_encoded": 95,
+      "frames_enhanced": 47,
+      "id": "e2e",
+      "ring_occupancy": {
+        "color_to_rgb->sr": 0,
+        "color_to_yuv->encode": 0,
+        "decode->color_to_rgb": 1,
+        "resize->rife": 0,
+        "rife->color_to_yuv": 0,
+        "sr->resize": 0
+      },
+      "stage_ms_per_frame": {
+        "color_to_rgb": 0.8877,
+        "color_to_yuv": 1.0016,
+        "decode": 0.0031,
+        "encode": 2.3761,
+        "resize": 31.9718,
+        "rife": 69.5136,
+        "sr": 91.6775
+      },
+      "state": "done"
+    }
+  }
+}
