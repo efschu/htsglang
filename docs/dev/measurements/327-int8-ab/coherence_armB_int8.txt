@@ -1,0 +1,13 @@
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** Tensor parallelism in large language models (LLMs)
+   - **Question:** Why does it reduce per-GPU memory?
+   - **Format Requirement:** Exactly three short numbered points
+   - **Key Constraint:** "exactly three short numbered points"
+
+2.  **Understand Tensor Parallelism:**
+   - Tensor parallelism (TP) is a model parallelism technique where individual tensors (weights/activations) within a layer are partitioned across multiple GPUs.
+   - Common in LLMs for large linear/attention layers.
+   - How it reduces per-GPU memory:
+     - Weights are split: Each GPU stores only a shard

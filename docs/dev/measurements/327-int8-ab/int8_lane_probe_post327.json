@@ -1,0 +1,62 @@
+{
+  "posten": "320-2 int8 lane microbench",
+  "shape": {
+    "M": 2048,
+    "K": 5120,
+    "N": 17408
+  },
+  "warmup": 10,
+  "iters": 60,
+  "driver": "595.58.03",
+  "cards": [
+    {
+      "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+      "name": "NVIDIA GeForce RTX 5090",
+      "cuda_index": 0,
+      "sm": 120,
+      "total_mib": 32607,
+      "bf16_tflops": 232.05,
+      "lanes": {
+        "fp8_native": 562.07,
+        "fp8_marlin": 215.3,
+        "fp8_w8a16": 177.3,
+        "int8_native": 678.0
+      },
+      "lane_notes": {}
+    },
+    {
+      "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+      "name": "NVIDIA GeForce RTX 3080",
+      "cuda_index": 1,
+      "sm": 86,
+      "total_mib": 20480,
+      "bf16_tflops": 63.13,
+      "lanes": {
+        "fp8_marlin": 60.06,
+        "fp8_w8a16": 52.87,
+        "int8_native": 177.74
+      },
+      "lane_notes": {
+        "fp8_native": "native fp8 GEMM did not run: RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+"
+      }
+    },
+    {
+      "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+      "name": "NVIDIA GeForce RTX 3080",
+      "cuda_index": 2,
+      "sm": 86,
+      "total_mib": 20480,
+      "bf16_tflops": 61.03,
+      "lanes": {
+        "fp8_marlin": 59.67,
+        "fp8_w8a16": 52.91,
+        "int8_native": 182.23
+      },
+      "lane_notes": {
+        "fp8_native": "native fp8 GEMM did not run: RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+"
+      }
+    }
+  ],
+  "seconds": 7.0,
+  "created": "2026-07-31T13:33:11Z"
+}

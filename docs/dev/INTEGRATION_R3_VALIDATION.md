@@ -19084,3 +19084,230 @@ zeigt dieselbe Anfrage auf einer 640-GiB-Karte als passend.
 - Multi-Card ist bepreist (`world_size`, sharded fuer `full_offload`), aber
   nur der Einprozess-Start ist gebaut.
 - Idle-Grace 120 s und Poll 2 s sind gesetzt, nicht gemessen.
+
+## #327 INT8-W8A8-Bringup: sm120-Wheel, Korrektheit, INT8-vs-FP8-Boot-A/B
+
+Fenster 2026-07-31 13:30:59-13:52:50 UTC, 1299 s Kartenzeit von 1800 s
+Budget, keine Verlaengerung. Zweck: das in `TASK_327_INT8_SM120_WHEEL.md`
+vorbereitete Wheel installieren, die INT8-GEMM-Korrektheit auf echten Karten
+pruefen und den in `ANALYSE_319_int8_lane.md` §5b entworfenen
+Checkpoint-A/B fahren. Branch `probe/327-int8-ab`, Rohdaten
+`/spinning/gpu-battery-results/2026-07-31_327_int8_ab/`.
+
+### 0. Der Checkpoint war nicht lokal — heruntergeladen, nicht selbst quantisiert
+
+`Avesed/Qwen3.6-27B-INT8-W8A8` (ANALYSE_319 §1, Erstwahl) lag nicht im
+Modell-Cache. Heruntergeladen nach
+`/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8`,
+29,13 GiB, ~5 min, parallel zum Wheel-Teil und ohne Kartenzeit. Keine
+Selbstquantisierung.
+
+Der Checkpoint bestaetigt die Aktenlage exakt: `quant_method
+compressed-tensors`, `format int-quantized`, Gewichte `strategy channel`
+symmetrisch 8 bit, Aktivierungen `dynamic: true` / `strategy: token` /
+8 bit — die Form, die `CompressedTensorsW8A8Int8` erwartet und die
+`sgl_kernel.int8_scaled_mm` fuettert. `lm_head` und der komplette
+MTP-Namensraum (`re:.*mtp.*`) stehen in `ignore`, liegen also bf16 vor; der
+Fork erkennt das beim Boot selbst und baut das Draft-Modell dicht
+("declares quant_method 'compressed-tensors' but stores the draft namespace
+unquantized"). Architektur und Dimensionen sind identisch zum FP8-Referenz-
+Checkpoint (`Qwen3_5ForConditionalGeneration`, 64 Layer, hidden 5120,
+intermediate 17408) — der A/B ist damit like-for-like.
+
+### 1. Wheel-Installation und Rollback
+
+Wheel-sha256 vor der Installation gegen die Dokumentation geprueft
+(`e7b16e1d...f15b54`, Treffer). Installation nach Rezept
+(`pip install --force-reinstall --no-deps`). Vorzustand vorher vollstaendig
+gesichert — nicht nur `sm100/common_ops.abi3.so`, sondern alle vier Objekte,
+die `sglang-kernel` 0.4.4 besitzt, plus `dist-info` (das
+`direct_url.json` zeigt auf `/tmp/t66_wheel/...`, und dieses Verzeichnis
+existiert nicht mehr; eine Neuinstallation des Vorgaenger-Wheels waere also
+nicht moeglich gewesen).
+
+Diskriminator wie dokumentiert:
+
+| Zustand | "...for current compute capability" | "...for compute capability sm" |
+|---|---:|---:|
+| vor Installation | 1 | 0 |
+| nach Installation | 0 | 1 |
+| nach Rollback | 1 | 0 |
+
+Rollback am Fensterende ausgefuehrt und **verifiziert**: alle vier `.so`
+stimmen wieder byte-genau mit den sha256/Groessen aus dem `RECORD` der
+installierten 0.4.4 ueberein (`ROLLBACK CLEAN`), `import sgl_kernel` laeuft.
+`flash_ops.abi3.so` (FA3, gehoert `sgl-kernel` 0.3.21) wurde wie vorgesehen
+nie angefasst — Groesse und mtime vom 17.07. unveraendert. Die geteilte venv
+ist nach diesem Fenster im Ausgangszustand.
+
+### 2. Korrektheit: 3x1260 bestanden, beide Architekturen
+
+`sgl-kernel/tests/test_int8_gemm.py`, volle Parametrisierung
+(9 M x 7 N x 5 K x bias x {fp16, bf16} = 1260 Faelle), Karten ueber
+NVML-UUID gepinnt statt ueber einen Index angenommen:
+
+| Karte | sm | Faelle | Ergebnis | Laufzeit |
+|---|---:|---:|---|---:|
+| RTX 5090 (`GPU-31d7ef41`) | 120 | 1260 | **1260 passed** | 5,60 s |
+| RTX 3080 (`GPU-5c648f96`) | 86 | 1260 | **1260 passed** | 12,15 s |
+| RTX 3080 (`GPU-62dbbae1`) | 86 | 1260 | **1260 passed** | 11,84 s |
+
+`test_int8_gemm_dispatch.py` (hermetisch, ohne GPU): 5 passed. Keine
+numerische Abweichung, kein Abbruch, keine Sonderbehandlung — die sm120-Arm
+liefert gegen die float32-Referenz dasselbe wie die sm86-Arm. Damit ist die
+Bedingung "jede numerische Abweichung = Stopp" nicht eingetreten.
+
+### 3. Lane-Microbench neu gemessen — der 5090-Befund kehrt #320 um
+
+Das #320-Skript `p320_int8_lane_probe.py` unveraendert erneut gefahren
+(gleiche Shape 2048x5120x17408, gleiche warmup/iters 10/60, alle Lanes im
+selben Lauf, 7,0 s), diesmal mit dem neuen Wheel:
+
+| Karte | sm | bf16 | fp8_native | fp8_w8a16 | fp8_marlin | **int8_native** | int8 / beste fp8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 5090 (`cuda:0`) | 120 | 232,05 | 562,07 | 177,30 | 215,30 | **678,00** | **1,21x** |
+| RTX 3080 (`cuda:1`) | 86 | 63,13 | — | 52,87 | 60,06 | **177,74** | **2,96x** |
+| RTX 3080 (`cuda:2`) | 86 | 61,03 | — | 52,91 | 59,67 | **182,23** | **3,05x** |
+
+Die 3080-Zahlen reproduzieren #320 (3,04x / 2,90x) innerhalb der
+Lauf-zu-Lauf-Streuung — der Lauf validiert sich damit selbst. Neu und
+entscheidend ist die 5090-Zeile: wo #320 woertlich
+`NotImplementedError: No implemented int8_scaled_mm for current compute
+capability` protokollierte, steht jetzt eine Zahl, und sie ist **hoeher als
+die fp8_native-Lane derselben Karte**.
+
+Das dreht die #320-Aggregatrechnung um. Dort hiess es: eine INT8-Umstellung
+senkt die Rohsumme von 675,9 auf 577,2 TFLOPS (−14,6 %), weil die 5090 ihre
+fp8-Lane aufgibt. Mit einer echten sm120-INT8-Lane gilt stattdessen:
+
+* **Aggregat**: beste-fp8-Summe 562,07 + 60,06 + 59,67 = 681,80 gegen
+  int8-Summe 678,00 + 177,74 + 182,23 = **1037,97 TFLOPS**, also
+  **+52,2 %** statt −14,6 %.
+* **Balance**: FP8 steht 562,07 : 60,06 : 59,67 = 9,36 : 1,00 : 0,99;
+  INT8 steht 678,00 : 177,74 : 182,23 = **3,81 : 1,00 : 1,03**. Fuer einen
+  Prefill, den der langsamste Rang taktet, ist das die interessantere Zahl.
+
+### 4. Boot-A/B — beide Arme, identischer Split
+
+Rezept identisch bis auf den Checkpoint: TP=3, `--rank-gpu-id 0,1,2`,
+`--rank-tp-ratio auto-performance`, `--rank-auto-reserve-mib 3000,2700,2700`,
+`--kv-cache-dtype fp8_e4m3`, `--context-length 32768`,
+`--max-running-requests 16`, NEXTN 3/1/4, `--decode-log-interval 1`,
+CUDA-Graphs an (`tick_cuda_graph: true` in allen acht Decode-Punkten),
+Prompt 2048 Token — dieselbe Betriebsgroesse, aus der die
+wiederverwendeten Boeden stammen.
+
+**Arm B bootet.** Der INT8-W8A8-Checkpoint laed und generiert auf allen drei
+Raengen, Health nach ~80 s (Arm A: ~70 s). Kein `TORCH_CHECK_NOT_IMPLEMENTED`
+auf dem 5090-Rang — genau der Absturz beim ersten Forward, den ANALYSE_319
+§2b/§2e als harten Blocker fuer diese Rig-Konfiguration beschrieben hat.
+Damit ist die Kernaussage der #327-Vorstufe am laufenden Serving-Stack
+bestaetigt und nicht nur am Microbench.
+
+Auch der zweite Vorbehalt aus §2d hat sich in dieser Konfiguration nicht
+materialisiert: beide Arme landen auf **demselben** Split
+(`rank_tp_ratio=[29607, 17780, 17780]`, materialisierte MLP-Units
+`[62, 37, 37]`), weil die Referenz VRAM-getrieben konvergiert. 62/37/37
+erfuellt die 16/8-Alignment-Forderung des CUTLASS-Kernels zufaellig — die
+Luecke aus §2d ist damit **nicht geschlossen, nur nicht getroffen**. Ein
+Split, der sie trifft, wuerde weiterhin mitten im ersten Forward abbrechen.
+
+Nebenbefund zur Lane-Erkennung: `checkpoint_compute_format` liefert fuer
+diesen Checkpoint `"compressed-tensors"` — es gibt keinen `_FORMAT_LANES`-
+Eintrag fuer int8 (ANALYSE_319 §3a ist entworfen, nicht gelandet), also
+nimmt der Planer den gewarnten bf16-Rueckfall. Dass der Split trotzdem
+brauchbar ist, ist Glueck: die bf16-Verhaeltnisse 232,05 : 63,13 : 61,03 =
+3,68 : 1,00 : 0,97 liegen nahe an den echten int8-Verhaeltnissen
+3,81 : 1,00 : 1,03. Auf einem Rig mit anderem Karten-Mix waere das nicht so.
+
+#### Messpunkte
+
+Je Arm 4 Metriken x 2 warme Wiederholungen = 8 Punkte. Boeden
+wiederverwendet, nicht neu erhoben: Prefill s=1 2,71 %, s=8 3,18 %,
+ms/Verify 2,72 % (`2026-07-30_phasen_optima/STATUS.md`).
+
+**Prefill, tok/s (hoeher besser):**
+
+| Punkt | FP8 (A) | INT8 (B) | Delta | Boden | Urteil |
+|---|---|---|---:|---:|---|
+| s=1 | 1310,5 / 1310,8 → **1310,7** (Streuung 0,02 %) | 1650,8 / 1664,1 → **1657,5** (0,80 %) | **+26,46 %** | 2,71 % | **INT8 schneller, 9,8x ueber Boden** |
+| s=8 | 1142,7 / 1126,4 → **1134,5** (1,44 %) | 1385,1 / 1407,0 → **1396,1** (1,57 %) | **+23,05 %** | 3,18 % | **INT8 schneller, 7,2x ueber Boden** |
+
+**Decode, ms/Verify (niedriger besser, Mass von Rang):**
+
+| Punkt | FP8 (A) | INT8 (B) | Delta | Boden | Urteil |
+|---|---|---|---:|---:|---|
+| bs=1 | 31,691 / 32,214 → **31,952** (1,64 %) | 32,240 / 32,744 → **32,492** (1,55 %) | +1,69 % | 2,72 % | unter Boden, **kein Urteil** |
+| bs=8 | 7,897 / 7,840 → **7,869** (0,72 %) | 7,840 / 7,800 → **7,820** (0,52 %) | −0,62 % | 2,72 % | unter Boden, **kein Urteil** |
+
+Informationell, nie mit Urteil: Tick-tok/s bs=1 94,67/124,17 (A) gegen
+124,07/122,16 (B), bs=8 379,88/431,11 (A) gegen 431,10/433,35 (B);
+Akzeptanzlaengen 3,0-4,0 in beiden Armen. Die A-Werte bei bs=1 und bs=8
+streuen im tok/s deutlich staerker als im ms/Verify — genau der Grund,
+warum ms/Verify das Mass von Rang ist.
+
+**Kohaerenz:** identischer Prompt in beiden Armen, `max_tokens 160`,
+`temperature 0`. Beide Arme antworten sinnvoll und strukturell gleich
+(Denkspur, dann Aufzaehlung), 667 gegen 652 Zeichen. Texte abgelegt als
+`coherence_armA_fp8.txt` / `coherence_armB_int8.txt`. Keine Degeneration,
+kein abgeschnittener Satzbau, kein Sprachbruch.
+
+### 5. Lesart
+
+Die #319-Erwartung war "hoher einstelliger bis niedriger zweistelliger
+Prozentsatz der Prefill-Zeit, obere Schranke ~16 %". Gemessen sind
+**+26,5 % (s=1) und +23,1 % (s=8) am Serving-Stack**, also oberhalb der
+damals gerechneten oberen Schranke. Der Grund steht in §3: die Rechnung von
+damals unterstellte, die 5090 gebe ihre 562-TFLOPS-fp8-Lane fuer einen
+bf16-Rueckfall auf, und der Gewinn muesse allein von den 3080ern kommen. Mit
+der jetzt vorhandenen sm120-Lane gewinnen **alle drei Raenge** gleichzeitig,
+und der Aggregat-Verlust, gegen den der 3080-Gewinn aufzurechnen war,
+existiert nicht.
+
+Die Decode-Seite bestaetigt die #319-Prognose in der Sache: W8A8-INT8 ist
+ein reiner Prefill-/Grossbatch-Hebel, bei bs=1 bezahlt man die dynamische
+Per-Token-Quantisierung ohne kompensierenden GEMM-Gewinn. Die vermutete
+kleine Regression ist sichtbar (+1,69 % ms/Verify bei bs=1), bleibt aber
+**unter ihrem Boden** und traegt daher kein Urteil. Bei bs=8 ist der
+Unterschied mit −0,62 % erst recht nicht nachweisbar. Decode ist
+bandbreitengebunden, und ein Byte pro Gewicht ist ein Byte pro Gewicht,
+egal ob fp8 oder int8 — dass hier nichts passiert, ist die erwartete
+Antwort, nicht ein Nullbefund aus Messschwaeche.
+
+Was dieses Fenster **nicht** zeigt: Verhalten unter einem Split, der die
+§2d-Alignment-Luecke trifft; TP=4 mit zwei Raengen auf der 5090 (der
+Ko-Residenz-Arm aus §5b); Kontextlaengen jenseits 2048 Prompt-Token;
+Genauigkeit gegen eine Referenz jenseits der Kohaerenzprobe.
+
+### 6. Offene Posten
+
+1. **INT8-Lane verdrahten** (Folgeschritt fuer den Planer, jetzt begruendet):
+   `_FORMAT_LANES["int8"] = (LANE_INT8_NATIVE,)` plus
+   `_is_int8_w8a8_like` in `checkpoint_compute_format` und
+   `_bench_gemm_int8_native_tflops` in `uneven_perf.py` — der Entwurf steht
+   fertig in ANALYSE_319 §3a/§3b, das Probenskript existiert und ist
+   zweimal gelaufen. Ohne das laeuft `auto-performance` fuer
+   INT8-Checkpoints auf dem gewarnten bf16-Rueckfall.
+2. **§2d-Alignment schliessen**: `weight_block_size` fuer
+   channel-strategy-INT8 (`[8, 16]`, reine Kernel-Alignment-Bedeutung, keine
+   Quantisierungssemantik) in `CompressedTensorsConfig` und
+   `W8A8Int8Config`. Dieses Fenster ist an der Luecke vorbeigelaufen, nicht
+   durch sie hindurch.
+3. **Wheel dauerhaft machen**: die Messung lief auf einem lokal gebauten
+   Wheel, das am Fensterende zurueckgerollt wurde. Solange das so bleibt,
+   ist die INT8-Spur auf diesem Rig nicht bootbar.
+4. `get_min_capability() == 80` bleibt fuer sm100/sm103 die dokumentierte
+   Falle (ANALYSE_319 §2b) — dort gibt es weiterhin keinen IMMA-Pfad.
+
+### Fensterdisziplin
+
+13:30:59-13:52:50 UTC, 1299 s von 1800 s, keine Verlaengerung. Karten ueber
+`/spinning/gpu-arb/` belegt und freigegeben (BELEGT-/FREI-Zeile im Arb-Log),
+`/tmp/gpu-card-{0,1,2}` gesetzt und geraeumt, alle drei Karten am Ende bei
+0 MiB. Anmerkung fuer die naechste Runde: der Operator-Reaper hat den
+`holder` um 13:52:50 als Waise entfernt (1311 s ohne `touch`) — bei
+Fenstern ueber 20 min muss der Herzschlag mitgeschrieben werden, auch wenn
+die Karten durchgehend belegt sind. Rohdaten und Tabelle:
+`/spinning/gpu-battery-results/2026-07-31_327_int8_ab/`
+(`punkte.jsonl`, `decode_punkte.jsonl`, `roh_*.jsonl`,
+`int8_lane_probe_post327.json`, `tabelle_327.txt`, `coherence_*.txt`).

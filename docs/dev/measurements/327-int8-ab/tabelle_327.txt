@@ -1,0 +1,11 @@
+=== PREFILL tok/s (higher better) ===
+s=1: FP8 1310.5/1310.8 mean 1310.7 (spread 0.02%) | INT8 1650.8/1664.1 mean 1657.5 (spread 0.80%) | delta +26.46% | floor 2.71% -> VERDICT INT8 faster
+s=8: FP8 1142.7/1126.4 mean 1134.5 (spread 1.44%) | INT8 1385.1/1407.0 mean 1396.1 (spread 1.57%) | delta +23.05% | floor 3.18% -> VERDICT INT8 faster
+=== DECODE ms/Verify (lower better) ===
+bs=1: FP8 31.691/32.214 mean 31.952 (spread 1.64%) | INT8 32.240/32.744 mean 32.492 (spread 1.55%) | delta +1.69% | floor 2.72% -> below floor, no verdict
+bs=8: FP8 7.897/7.840 mean 7.869 (spread 0.72%) | INT8 7.840/7.800 mean 7.820 (spread 0.52%) | delta -0.62% | floor 2.72% -> below floor, no verdict
+=== decode side info (informational, never a verdict) ===
+bs=1 fp8_ref: tick tok/s [94.67, 124.17], accept [3.0, 4.0], graph [True, True]
+bs=1 int8_w8a8: tick tok/s [124.07, 122.16], accept [4.0, 4.0], graph [True, True]
+bs=8 fp8_ref: tick tok/s [379.88, 431.11], accept [3.0, 3.38], graph [True, True]
+bs=8 int8_w8a8: tick tok/s [431.1, 433.35], accept [3.38, 3.38], graph [True, True]
