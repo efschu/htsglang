@@ -1027,6 +1027,22 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   the gate. `SGLANG_LANE_SPEC_VERIFY` / `SGLANG_LANE_SPEC_TV_MAX_ACCEPT` are
   the process-wide equivalents; `SGLANG_LANE_SPEC_DEBUG=1` adds a per-round
   trace (and costs a second lm_head per round, so never measure with it on).
+- **Standing share gate** (#284): `--dual-group-lane-share-window-s 1.0`
+  switches the online estimator on, `--dual-group-lane-share-min 0.30` adds
+  the criterion "the lane keeps at least 30 % of its solo rate", and
+  `--dual-group-lane-share-load "..."` names the load the verdict is about (a
+  threshold without its load is not a criterion). The verdict, the median and
+  the CARRIER of any failure appear under `internal_states[...]["lane_share"]
+  ["gates"]`; nothing in the runtime reads them. **The floor is the trap.**
+  Floors are re-learned from every solo window, so a boot that changes the
+  LANE's own configuration between phases blends their solo rates into one
+  denominator — measured: a driver that ran a captured lane (56.8 tok/s), an
+  eager lane (16.5) and a depth-1 feeder (50.4) through one meter produced a
+  floor of 33.7 and a false **pass** at 0.310 for a lane keeping 0.185. The
+  gate now returns `insufficient` / `floor_moved` when its own denominator
+  spans more than 10 % across the windows it judged; call `freeze_floors()`
+  or `load_floors()` after a configuration-stable reference phase to get a
+  verdict back.
 - **Concurrent mode needs a SMALLER lane pool than the serial recipe.**
   `--dual-group-lane-concurrent` gives the lane its own graph memory pool on
   top of everything the serial mode allocates, and with
@@ -1096,6 +1112,33 @@ grain, never mid-kernel.
   requests (~2.84 tok/s, ~5.3 % on the shared arm) and reproduced EXACTLY
   across four independent windows, so `share_serving` is identical in both arms
   to within that resolution, not measured equal.
+- **`share_lane` is a function of the competing LOAD, not a priority
+  guarantee** (#284, two boots, five cells, one axis rotated at a time,
+  `scripts/dual_group/r9/`). Round 4's `share_lane` 1.002 does not reproduce
+  in any cell: an eager lane under heavy load keeps 0.172, a captured one
+  0.185, a job-by-job feeder 0.209, round 4's own recipe (eager lane + ONE
+  serving request) 0.293. The one axis that moves the number is how much load
+  it is measured against — four concurrent 128-token requests against one
+  lifts it from 0.185 to 0.448. Round 4's aggregate is the tell: `E` = 1.897
+  is almost two cards' work out of one card, while these five cells measure
+  `E` 1.18-1.38 and the device clock says why — **the lane alone already
+  occupies 97.5 % of the card**. Two SM-saturating loads cannot sum to 1.9;
+  round 4's own note that its concurrent-boot lane floor was depressed
+  (10.42 vs 12.80 tok/s) is the missing denominator.
+- **Read a lost share as a QUOTIENT, with `sglang:lane_occupancy` and
+  `sglang:lane_device_cost_ms` next to it.** `share = occupancy_ratio /
+  cost_ratio` is an identity, and the two factors call for opposite responses.
+  Measured on the captured lane under four requests: cost 17.15 -> 34.96 ms
+  per token (SM competition, the same graph replay simply runs slower) AND
+  occupancy 0.975 -> 0.378 at duty 1.0 (the lane holds work the whole window
+  but its stream is empty 63 % of it — Python between forwards, against the
+  GIL the scheduler thread holds). Roughly half each.
+- **Do not chunk the serving side to give the lane more openings.** Measured:
+  `admission_wait_ms` mean 1.087 ms against a 2.0 ms budget, i.e. ~3 % of a
+  35 ms round — the lane is not waiting for admission. Half the loss is SM
+  competition, which no allocation scheme can redistribute, and the other half
+  is GIL-bound, which finer grains make worse (more Python per unit of GPU
+  work, against the very thread that causes the gap).
 - **The protected class pays MORE under real concurrency than under tick
   sharing**: lane prefill +9.7 % (concurrent) vs +0.4 % (serial). That is
   the priority promise in a different currency — serially the lane only

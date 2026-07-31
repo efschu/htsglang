@@ -664,6 +664,35 @@ class Scheduler(
                         getattr(self.server_args, "dual_group_lane_share_ema_s", 1.0)
                     ),
                 )
+                # Standing gate (#284), one per lane, reporting only. Attached
+                # here rather than built into the meter so that a boot without
+                # a threshold carries no gate at all and the readout says so
+                # by being empty.
+                min_share = getattr(self.server_args, "dual_group_lane_share_min", None)
+                if min_share is not None:
+                    from sglang.srt.model_executor.lane_share import LaneShareGate
+
+                    for lane in self.dual_group_lanes:
+                        self.lane_share_meter.attach_gate(
+                            LaneShareGate(
+                                f"lane{lane.lane_id}",
+                                float(min_share),
+                                load=str(
+                                    getattr(
+                                        self.server_args,
+                                        "dual_group_lane_share_load",
+                                        "unspecified",
+                                    )
+                                ),
+                                min_windows=int(
+                                    getattr(
+                                        self.server_args,
+                                        "dual_group_lane_share_min_windows",
+                                        5,
+                                    )
+                                ),
+                            )
+                        )
 
         # kv-session-offload (S1): FCFS host-spill of the youngest session
         # under KV pressure. Must init before the batch-result processor
@@ -4692,7 +4721,18 @@ class Scheduler(
             )
         ]
         for lane in self.dual_group_lanes:
-            samples.append(ClassSample(f"lane{lane.lane_id}", dict(lane.work_total)))
+            # The device counters ride along with the work counters, from the
+            # same instant: reading them from two different calls would put a
+            # window boundary between the numerator and the denominator of the
+            # occupancy this window reports (#284).
+            clock = getattr(lane, "device_clock", None)
+            samples.append(
+                ClassSample(
+                    f"lane{lane.lane_id}",
+                    dict(lane.work_total),
+                    device=None if clock is None else clock.snapshot().to_counters(),
+                )
+            )
         try:
             win = meter.observe(now, samples, rung=self._lane_rung())
         except Exception:

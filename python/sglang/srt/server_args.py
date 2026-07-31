@@ -4114,6 +4114,41 @@ class ServerArgs:
             "(see --dual-group-lane-share-window-s). 0 disables smoothing.",
         ),
     ] = 1.0
+    dual_group_lane_share_min: A[
+        Optional[float],
+        Arg(
+            help="Standing GATE on the online estimator (#284): the fraction "
+            "of its SOLO rate a lane has to keep in a shared window, e.g. 0.3 "
+            'for "the lane keeps at least 30 %% under load". Judged on shared '
+            "windows only, on the median of at least "
+            "--dual-group-lane-share-min-windows of them, and REPORTED, never "
+            "enforced: the verdict appears under "
+            'internal_states[...]["lane_share"]["gates"] together with the '
+            "carrier of any failure (sm_competition = the lane's kernels ran "
+            "slower on the card it had; submission_gap = it held work and its "
+            "kernels were not on the card; starved = it did not hold work). "
+            "Nothing in the runtime reads the verdict, because a controller "
+            "reacting to it would make it self-conditioning. Requires "
+            "--dual-group-lane-share-window-s > 0.",
+        ),
+    ] = None
+    dual_group_lane_share_min_windows: A[
+        int,
+        Arg(
+            help="How many judged shared windows --dual-group-lane-share-min "
+            'needs before it reports anything but "insufficient".',
+        ),
+    ] = 5
+    dual_group_lane_share_load: A[
+        str,
+        Arg(
+            help="Free-text NAME of the load a --dual-group-lane-share-min "
+            'verdict is about, e.g. "4 concurrent 128-token serving '
+            'requests". A share threshold without the load it was measured '
+            "under is not a criterion, so the name is carried into the "
+            "readout.",
+        ),
+    ] = "unspecified"
     lane_offload_profile: A[
         str,
         Arg(
