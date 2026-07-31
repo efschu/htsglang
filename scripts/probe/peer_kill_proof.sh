@@ -20,6 +20,27 @@
 # NOT RUN BY THE AUTHOR OF THE FIX. This script is the program, written to be
 # executed by whoever holds the next GPU window. It needs all three cards.
 #
+# BEFORE YOU RUN THIS: the arms below are right, the environment is not.
+# The 2026-07-31 window ran both arms and found four environment facts wrong
+# for rig 1 -- each one enough to make the run measure nothing:
+#   * VENV here is /spinning/shvllm/.venv, which is torch 2.14.0a0 with no
+#     nvidia/cu13 tree. The GPU venv is /spinning/htsglang-gpu/.venv.
+#   * SGLANG_HTCCL_GRAPH_ENABLE is not a variable this fork reads. The name is
+#     SGLANG_HTCCL_GRAPH_FREIGABE.
+#   * SGLANG_HTCCL_BAR1_NV_QUELLE and CUDA_HOME are missing. bar1 needs the
+#     patched driver headers; the JIT build fails on ninja without CUDA_HOME.
+#   * it boots locally, but bar1 runs on the PVE host -- the container has
+#     neither the driver source nor a usable NCCL for it.
+# The canonical recipe is scripts/gpu_battery/_bar1_host_boot.sh. A driver
+# that runs these two arms against it, plus a liveness=0 kill control, is
+# /spinning/gpu-battery-results/2026-07-31_312_beleg/run_312.sh. See
+# docs/dev/INTEGRATION_R3_VALIDATION.md, "#312-Beleg: Rang-Tod wird laut".
+#
+# The match patterns below are CORRECT and were confirmed on hardware: the log
+# surface carries "peer rank gone: rank N (host, pid M)" and never the
+# exception class name. Do not narrow them to class names -- that is exactly
+# the false negative the 2026-07-31 window scored before it looked at the log.
+#
 #   scripts/probe/peer_kill_proof.sh kill
 #   scripts/probe/peer_kill_proof.sh ab
 #   scripts/probe/peer_kill_proof.sh cards      # NVML index -> name, only
