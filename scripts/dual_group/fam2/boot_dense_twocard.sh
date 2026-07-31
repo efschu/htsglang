@@ -45,6 +45,13 @@ RANK_MIB="${RANK_MIB:-16000,8000}"
 GATE_TOKENS="${GATE_TOKENS:-12}"
 BOOT_TIMEOUT_S="${BOOT_TIMEOUT_S:-900}"
 GATE_DEADLINE_S="${GATE_DEADLINE_S:-300}"
+# Extra launch flags, appended verbatim. The first user is the follow-up boot
+# this arm's own result asked for: the serving floor was red on all three
+# prompts while the lane floor was green, and the named suspect is the prefix
+# cache (a second identical request taking a different kernel path). Passing
+# --disable-radix-cache here answers that with one boot and no code change --
+# which is exactly why it is a flag and not an edit.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 mkdir -p "$OUT"
 
 load_card_order "$OUT/cards.txt" || exit 1
@@ -63,7 +70,8 @@ launch_server "$LOG" /tmp/fam2-dense2.pid \
   --max-running-requests 2 \
   --dual-group-lane --dual-group-lane-budget-mib "$LANE_BUDGET" \
   --dual-group-lane-part-gpu-id "$CUDA_BIG,$SMALL0" \
-  --host 127.0.0.1 --port "$PORT"
+  --host 127.0.0.1 --port "$PORT" \
+  ${EXTRA_ARGS}
 
 if dry_run; then
   echo "DRY RUN ok: fam2 dense two-card lane"

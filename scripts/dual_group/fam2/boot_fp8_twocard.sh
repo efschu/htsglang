@@ -50,6 +50,15 @@ LOG="${LOG:-/tmp/fam2-fp8.server.log}"
 OUT="${OUT:-/tmp/fam2-fp8}"
 LANE_BUDGET="${LANE_BUDGET:-1000}"
 RANK_MIB="${RANK_MIB:-27000,10500}"
+# Serving split, overridable. The first run reached the byte gate and then died
+# in the first forward with an illegal memory access, and the two candidates
+# were named but not measured: too little air on the cards, or a real defect in
+# allocating the lane part on a card another process is already serving from.
+# The budget candidate is the cheap one to rule out, and ruling it out needs
+# the ratio to move with the budgets: the foreign lane part is paid for out of
+# the SECOND card's headroom, so shifting weight onto the first card buys air
+# on the second. Hence a knob, not a new recipe.
+RATIO="${RATIO:-5,1}"
 GATE_TOKENS="${GATE_TOKENS:-12}"
 BOOT_TIMEOUT_S="${BOOT_TIMEOUT_S:-1200}"
 GATE_DEADLINE_S="${GATE_DEADLINE_S:-300}"
@@ -64,7 +73,7 @@ launch_server "$LOG" /tmp/fam2-fp8.pid \
   --model-path "$MODEL" \
   --tokenizer-path "$MODEL" \
   --tp-size 2 --rank-gpu-id "$CUDA_BIG,$SMALL0" \
-  --rank-tp-ratio 5,1 \
+  --rank-tp-ratio "$RATIO" \
   --rank-gpu-memory-mib "$RANK_MIB" \
   --attention-backend flashinfer \
   --kv-cache-dtype fp8_e4m3 --context-length 4096 --trust-remote-code \
