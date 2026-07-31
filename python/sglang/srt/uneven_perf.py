@@ -2239,6 +2239,92 @@ def rank_gemm_family_scores(
     )
 
 
+#: Cost-model weight family (``PerfCostModel.families`` keys) -> GEMM score
+#: family (#324 ``GemmScores`` axis). ``None`` = no family of its own, the
+#: scalar (checkpoint-wide) rate applies. The MLP entries are resolved at
+#: call time because the mlp mass IS the routed-expert mass on a MoE
+#: checkpoint (see ``_build_families``), where the ``moe`` score family
+#: carries it.
+_WEIGHT_TO_GEMM_FAMILY: Dict[str, Optional[str]] = {
+    "attn": GEMM_FAMILY_ATTN_GDN,
+    "gdn": GEMM_FAMILY_ATTN_GDN,
+    "draft_attn": GEMM_FAMILY_ATTN_GDN,
+    "vocab": GEMM_FAMILY_VOCAB,
+    # vision towers ship unquantized (bf16) in every checkpoint the byte
+    # model has seen; no measured family lane exists for them, so the
+    # honest rate is the scalar.
+    "vision": None,
+    "draft_repl": None,  # replicated: skipped by the sharded term anyway
+    "draft_solo_ckpt": None,  # external checkpoint bytes, format unknown
+}
+
+
+def gemm_family_for_weight_family(name: str, num_experts: int) -> Optional[str]:
+    """The #324 score family a cost-model weight family runs on, or ``None``
+    for 'no own family, use the scalar rate'."""
+    if name in ("mlp", "draft_mlp"):
+        return GEMM_FAMILY_MOE if num_experts > 0 else GEMM_FAMILY_MLP
+    return _WEIGHT_TO_GEMM_FAMILY.get(name)
+
+
+def family_prefill_tflops(
+    model: PerfCostModel, gemm: GemmScores
+) -> Optional[Dict[str, List[float]]]:
+    """Per-family compute rates for the ``sum(p/r)`` prefill arithmetic
+    (#287, deliberately deferred by #324 to keep that merge byte-identical).
+
+    ``None`` unless the checkpoint is genuinely MIXED: with an empty
+    ``gemm.families`` every family would map to the scalar vector and the
+    arithmetic, while mathematically equal, would differ from the scalar
+    path in the last float bits -- returning ``None`` keeps every
+    single-scheme plan bit-for-bit unchanged. On a mixed checkpoint each
+    weight family gets the per-rank vector of the lane its own format
+    resolves to (``GemmScores.for_family``: the family's own vector when one
+    diverges, the scalar otherwise).
+    """
+    if not gemm.mixed:
+        return None
+    out: Dict[str, List[float]] = {}
+    for name in model.families:
+        family = gemm_family_for_weight_family(name, model.num_experts)
+        out[name] = (
+            list(gemm.for_family(family)) if family else list(gemm.scalar)
+        )
+    return out
+
+
+def effective_prefill_tflops(
+    model: PerfCostModel, gemm: GemmScores
+) -> List[float]:
+    """Per-rank EFFECTIVE prefill compute rate, family-blended by the
+    ``sum(p/r)`` arithmetic at the base plan: ``sum_fam(p_fam) /
+    sum_fam(p_fam / r_fam)`` -- the harmonic, mass-weighted blend of the
+    lane rates each family actually runs on that rank.
+
+    On a single-scheme checkpoint this is exactly ``gemm.scalar`` (every
+    family divides by the same rate, the blend collapses algebraically and
+    the scalar is returned as the SAME list content, no arithmetic run).
+    Consumers: the #287 depth/format-aware operating grid, which needs one
+    per-card rate but must not lose the family axis."""
+    fam_map = family_prefill_tflops(model, gemm)
+    if fam_map is None:
+        return list(gemm.scalar)
+    out: List[float] = []
+    for r in range(model.tp_size):
+        params = 0.0
+        time = 0.0
+        for name, fam in model.families.items():
+            if fam.params <= 0 or fam.shard == "replicated":
+                continue
+            p_r = fam.params * model._shard_fractions(fam.shard, model.base_plan)[r]
+            rates = fam_map.get(name)
+            rate_r = rates[r] if rates else gemm.scalar[r]
+            params += p_r
+            time += p_r / rate_r
+        out.append(params / time if time > 0 else gemm.scalar[r])
+    return out
+
+
 def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[int]:
     """Integer weight vector proportional to the per-rank memory-bandwidth
     scores, for ratio-weighted vocab sharding (--rank-vocab-ratio auto).
@@ -2473,7 +2559,7 @@ class PlanInputs:
         return self.effective_vram_mib
 
     @classmethod
-    def from_server_args(cls, server_args) -> "PlanInputs":
+    def from_server_args(cls, server_args) -> PlanInputs:
         """Build the cost-model inputs from a (post-validation) ServerArgs.
 
         Called on the boot path right before ``PerfCostModel`` is
@@ -4161,23 +4247,56 @@ class PerfCostModel:
         return acc / total_streamed
 
     def _prefill_sharded_time(
-        self, mlp_vector: List[int], gemm_tflops: List[float], min_link_gbs: float
+        self,
+        mlp_vector: List[int],
+        gemm_tflops: List[float],
+        min_link_gbs: float,
+        family_tflops: Optional[Dict[str, List[float]]] = None,
     ) -> float:
         """The shard-PROPORTIONAL part of the prefill step: lockstep compute
         max over ranks (per-token flops ~ 2 x sharded params, the
         param-proxy) plus the ring-all-reduce term over the narrowest
-        link."""
+        link.
+
+        ``family_tflops`` (#287, delegated by #324) maps a WEIGHT family name
+        to its own per-rank compute rate. When given, the per-rank time is
+        ``sum_fam(2 * p_fam / r_fam)`` -- each family's params divided by the
+        rate of the lane THAT family runs on this rank. The pre-#287 scalar
+        arithmetic (``sum_fam(p_fam) / r``) is exact only while every family
+        runs one lane per rank; on a MIXED_PRECISION checkpoint the same card
+        runs e.g. MLP on Marlin (216 TFLOPS) and attn/GDN on native fp8
+        (566.88), a 2.62x band that a summed-params-over-one-rate model
+        mis-times. ``None`` (every single-scheme checkpoint) keeps the scalar
+        arithmetic byte-identical -- the two differ in the last bits even for
+        equal rates, because float addition of times is not float division of
+        a param sum.
+        """
         t_comp = 0.0
-        for r in range(self.tp_size):
-            params_r = 0.0
-            for fam in self.families.values():
-                if fam.params <= 0 or fam.shard == "replicated":
-                    continue
-                params_r += (
-                    fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
-                )
-            t = 2.0 * params_r / (gemm_tflops[r] * 1e12 * _PREDICT_GEMM_EFF)
-            t_comp = max(t_comp, t)
+        if family_tflops:
+            denom = 1e12 * _PREDICT_GEMM_EFF
+            for r in range(self.tp_size):
+                t = 0.0
+                for name, fam in self.families.items():
+                    if fam.params <= 0 or fam.shard == "replicated":
+                        continue
+                    params_fam_r = (
+                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                    )
+                    rates = family_tflops.get(name)
+                    rate_r = rates[r] if rates else gemm_tflops[r]
+                    t += 2.0 * params_fam_r / (rate_r * denom)
+                t_comp = max(t_comp, t)
+        else:
+            for r in range(self.tp_size):
+                params_r = 0.0
+                for fam in self.families.values():
+                    if fam.params <= 0 or fam.shard == "replicated":
+                        continue
+                    params_r += (
+                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                    )
+                t = 2.0 * params_r / (gemm_tflops[r] * 1e12 * _PREDICT_GEMM_EFF)
+                t_comp = max(t_comp, t)
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
         n = self.tp_size
@@ -4190,10 +4309,16 @@ class PerfCostModel:
         return t_comp + t_comm
 
     def prefill_time_model(
-        self, mlp_vector: List[int], gemm_tflops: List[float], min_link_gbs: float
+        self,
+        mlp_vector: List[int],
+        gemm_tflops: List[float],
+        min_link_gbs: float,
+        family_tflops: Optional[Dict[str, List[float]]] = None,
     ) -> float:
         """Relative prefill step time. Only ratios between candidates are
-        consumed.
+        consumed. ``family_tflops`` switches the sharded term to the
+        per-family ``sum(p/r)`` arithmetic (see ``_prefill_sharded_time``);
+        ``None`` is the byte-identical scalar path.
 
         Two terms: the shard-proportional part (``_prefill_sharded_time``:
         GEMM compute at the probe rate + per-layer all-reduce) and a split-
@@ -4208,11 +4333,13 @@ class PerfCostModel:
         over-predicted every measured concentration gain by x1.4-1.8
         (predicted +21.6 % for 6,1,1 where +13.0 % was measured)."""
         f = self.calibration.prefill_invariant
-        t_sharded = self._prefill_sharded_time(mlp_vector, gemm_tflops, min_link_gbs)
+        t_sharded = self._prefill_sharded_time(
+            mlp_vector, gemm_tflops, min_link_gbs, family_tflops
+        )
         if f <= 0.0:
             return t_sharded
         t_base = self._prefill_sharded_time(
-            self.base_plan, gemm_tflops, min_link_gbs
+            self.base_plan, gemm_tflops, min_link_gbs, family_tflops
         )
         return t_sharded + f / (1.0 - f) * t_base
 
@@ -4649,6 +4776,22 @@ def apply_auto_performance(server_args) -> None:
             )
             + f": {[round(x, 1) for x in base_enc_scores]} TFLOPS."
         )
+    # #287 per-family prefill arithmetic -- the piece #324 deliberately
+    # deferred to keep its own merge byte-identical. On a MIXED checkpoint
+    # the prefill time model divides each weight family's params by the rate
+    # of the lane THAT family runs per rank (sum(p/r)); the scalar path sums
+    # the params first and divides by one resolved rate (sum(p)/r), which
+    # mis-times every rank whose families straddle lanes. ``None`` on every
+    # single-scheme checkpoint: the time model then executes the pre-#287
+    # float operations bit-for-bit.
+    base_family_tflops = family_prefill_tflops(model, gemm)
+    if base_family_tflops is not None:
+        lines.append(
+            "prefill time model: per-family sum(p/r) arithmetic ACTIVE "
+            "(mixed checkpoint; diverging families: "
+            + ", ".join(sorted(gemm.families))
+            + ")"
+        )
     # Which bandwidth the decode roofline divides by, stated once. The GEMV
     # rate is the informative one; every fall back to the streaming peak is
     # reported with its reason, because the two carry different exponents and
@@ -4849,7 +4992,9 @@ def apply_auto_performance(server_args) -> None:
             pred = model.predict_capacity(list(cand))
             if not pred["feasible"]:
                 continue
-            t_cand = model.prefill_time_model(list(cand), enc_scores, min_link)
+            t_cand = model.prefill_time_model(
+                list(cand), enc_scores, min_link, base_family_tflops
+            )
             scored.append((cand, pred, t_cand))
         if scored:
             best_ctx = max(p["ctx"] for _, p, _ in scored)
@@ -4889,7 +5034,9 @@ def apply_auto_performance(server_args) -> None:
             knee_ok, knee_reason = model.decode_knee_detail(
                 list(cand), rank_scores_bw, rank_scores_gemv
             )
-            t_base = model.prefill_time_model(base_plan, enc_scores, min_link)
+            t_base = model.prefill_time_model(
+                base_plan, enc_scores, min_link, base_family_tflops
+            )
             for c2, p2, t2 in sorted(scored, key=lambda x: -x[1]["ctx"])[:6]:
                 lines.append(
                     f"capacity candidate {','.join(map(str, c2))}: predicted "
@@ -4954,6 +5101,7 @@ def apply_auto_performance(server_args) -> None:
             )
         # enc/both objective: minimize the lockstep prefill time model.
         enc_scores = list(base_enc_scores)
+        enc_family_tflops = base_family_tflops
         # Per-rank link penalty: a rank behind a narrow link attracts fewer
         # units (folded softly; the AR term already carries the group cost).
         if pair_bws and len(set(server_args.rank_gpu_id)) == server_args.tp_size:
@@ -4971,13 +5119,28 @@ def apply_auto_performance(server_args) -> None:
                 s * (l / best) ** _PREDICT_LINK_ALPHA
                 for s, l in zip(enc_scores, per_rank_link)
             ]
-        t_base = model.prefill_time_model(base_plan, enc_scores, min_link)
+            if enc_family_tflops is not None:
+                # The penalty is a per-RANK factor (the link is a property of
+                # the card, not of the format), so it scales every family's
+                # vector identically.
+                enc_family_tflops = {
+                    name: [
+                        r * (l / best) ** _PREDICT_LINK_ALPHA
+                        for r, l in zip(rates, per_rank_link)
+                    ]
+                    for name, rates in enc_family_tflops.items()
+                }
+        t_base = model.prefill_time_model(
+            base_plan, enc_scores, min_link, enc_family_tflops
+        )
         candidates = _mlp_candidates(model, enc_scores, base_plan)
         best_gain = 0.0
         results = []
         for cand in candidates:
             pred = model.predict_capacity(list(cand))
-            t_cand = model.prefill_time_model(list(cand), enc_scores, min_link)
+            t_cand = model.prefill_time_model(
+                list(cand), enc_scores, min_link, enc_family_tflops
+            )
             gain = t_base / t_cand - 1.0
             knee_ok, knee_reason = model.decode_knee_detail(
                 list(cand), rank_scores_bw, rank_scores_gemv

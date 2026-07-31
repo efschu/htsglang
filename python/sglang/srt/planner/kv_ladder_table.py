@@ -28,10 +28,12 @@ WHAT IT COMPUTES, AND FROM WHAT:
 
 * THE RUNGS. Base = the profile's first (coarsest, fastest) geometry. Then
   the enabled relief features in their canonical cheapness order
-  (``RELIEF_ORDER``): admission cap, DCP token ratio, KV spill, weightless
-  rank, session offload -- referenced by name, never implemented here. Then
-  the remaining geometries, coarse to fine. Then the out-of-family
-  (Nachtrag-14) steps.
+  (``RELIEF_ORDER``, a SERVICE-cost order per the #287 user directive): DCP
+  token-ratio flip (#320: sum-preserving KV-vector redistribution is
+  service-neutral), admission cap (costs served sessions), KV spill,
+  weightless rank, session offload -- referenced by name, never implemented
+  here. Then the remaining geometries, coarse to fine. Then the
+  out-of-family (Nachtrag-14) steps.
   The resulting order is exactly the one ``PressureLadder`` enforces, so the
   generator cannot produce a table the runtime would reject.
 
@@ -67,6 +69,9 @@ from sglang.srt.model_executor.kv_pressure_ladder import (
     DEFAULT_EXTERNAL_HYSTERESIS_ROUNDS,
     HANDOVER_BACKGROUND_MIGRATE,
     HANDOVER_SPILL_RELOAD,
+    OP_PHASE_DECODE,
+    OP_PHASE_PREFILL,
+    OP_PHASES,
     PROVENANCE_MEASURED,
     PROVENANCE_PLACEHOLDER,
     PROVENANCE_SOLVER,
@@ -77,19 +82,31 @@ from sglang.srt.model_executor.kv_pressure_ladder import (
     STEP_GEOMETRY,
     STEP_RELIEF,
     LadderStep,
+    OperatingPoint,
     PressureLadder,
+    StageOperatingGrid,
 )
 
 __all__ = [
     "CardSpec",
     "ExternalRungSpec",
     "GeometryRungSpec",
+    "RankScoreProfile",
     "RigModelProfile",
     "build_ladder_table",
     "capacity_from_report",
     "check_geometry_family",
+    "solve_operating_grid",
     "solver_capacity_tokens",
 ]
+
+#: Default depth/fill bins of the operating grid: the two poles plus three
+#: interior bins (user directive: "also in between, not only at the poles").
+#: The low pole sits at 0.05, not 0.0: at exactly zero context every KV
+#: vector has the same lockstep time (the depth term vanishes) and the
+#: "optimum" would be a tie-break artifact -- at 5% fill the time model is
+#: non-degenerate and the perf pole is genuinely solved.
+DEFAULT_DEPTH_BINS: Tuple[float, ...] = (0.05, 0.25, 0.5, 0.75, 1.0)
 
 MIB = 1 << 20
 
@@ -169,6 +186,50 @@ class ExternalRungSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class RankScoreProfile:
+    """Measured per-CARD rates the depth/format-aware operating grid
+    consumes (user directive, #287).
+
+    The FORMAT factors come out of the measured planner profile -- the
+    per-(rank, family) GEMM scores of #324 -- and are mapped card-by-card by
+    the caller; nothing here is a hardcoded arch table, and a missing rate
+    is a missing rate (the grid then stays unsolved with a note), never a
+    guess.
+
+    * ``card_prefill_tflops``: effective prefill compute rate per card,
+      already family-blended by the ``sum(p/r)`` arithmetic
+      (``uneven_perf.effective_prefill_tflops``) so the format axis of a
+      MIXED checkpoint survives the reduction to one number per card.
+    * ``card_attn_tflops``: the rate of the lane the attention/GDN family
+      runs on that card (``GemmScores.for_family("attn_gdn")``) -- the
+      depth-proportional prefill term divides by THIS, because
+      attention-over-context is that family's work.
+    * ``card_membw_gbs``: memory bandwidth per card; the decode phase and
+      its depth term are bandwidth-bound.
+    """
+
+    card_prefill_tflops: Dict[int, float]
+    card_attn_tflops: Dict[int, float]
+    card_membw_gbs: Dict[int, float]
+    provenance: str = PROVENANCE_MEASURED
+    source: str = ""
+
+    def __post_init__(self):
+        for label, table in (
+            ("card_prefill_tflops", self.card_prefill_tflops),
+            ("card_attn_tflops", self.card_attn_tflops),
+            ("card_membw_gbs", self.card_membw_gbs),
+        ):
+            for card, value in table.items():
+                if float(value) <= 0.0:
+                    raise ValueError(
+                        f"{label}[{card}] must be > 0, got {value}; a missing "
+                        f"rate is expressed by omitting the card, not by a "
+                        f"zero."
+                    )
+
+
+@dataclasses.dataclass(frozen=True)
 class RigModelProfile:
     """Everything the table generator is allowed to look at.
 
@@ -202,6 +263,15 @@ class RigModelProfile:
     #: it (``PerfCostModel.mlp_units``). None = family check skipped, and the
     #: table says so.
     mlp_units: Optional[int] = None
+    #: Measured per-card rates for the depth/format-aware operating grid
+    #: (#324 scores, mapped per card by the caller). None = no grid is
+    #: solved and every rung says so.
+    rank_scores: Optional[RankScoreProfile] = None
+    #: FLOPs of attention-over-context per (new token, context token) pair,
+    #: derived from the model dims by the caller (~4 * full_attn_layers *
+    #: q_heads * head_dim for the two context GEMMs). None = the prefill
+    #: depth term cannot be sized and the grid stays unsolved.
+    attn_context_flops_per_token_pair: Optional[float] = None
 
     def __post_init__(self):
         if not self.cards:
@@ -253,6 +323,11 @@ class RigModelProfile:
             raise ValueError("weight_bytes_total must be >= 0 when given")
         if self.mlp_units is not None and self.mlp_units <= 0:
             raise ValueError("mlp_units must be > 0 when given")
+        if (
+            self.attn_context_flops_per_token_pair is not None
+            and self.attn_context_flops_per_token_pair <= 0
+        ):
+            raise ValueError("attn_context_flops_per_token_pair must be > 0 when given")
 
     def card(self, index: int) -> CardSpec:
         for c in self.cards:
@@ -356,6 +431,214 @@ def solver_capacity_tokens(
         PROVENANCE_SOLVER,
         SOURCE_SOLVER,
     )
+
+
+def _free_kv_bytes_per_rank(
+    profile: RigModelProfile, geom: GeometryRungSpec
+) -> Optional[List[float]]:
+    """Per-rank bytes left for KV under ``geom`` (same arithmetic as
+    ``solver_capacity_tokens``, kept in one shape so the two cannot
+    drift), or ``None`` when the weight bytes are unknown."""
+    if profile.weight_bytes_total is None:
+        return None
+    ratio_sum = float(sum(int(u) for u in geom.ratio))
+    out: List[float] = []
+    for rank, gpu in enumerate(geom.gpus):
+        card = profile.card(int(gpu))
+        if card.budget_mib is not None:
+            budget_bytes = float(card.budget_mib) * MIB
+        else:
+            budget_bytes = float(card.total_mib) * MIB * profile.budget_fraction
+        weight_bytes = profile.weight_bytes_total * (int(geom.ratio[rank]) / ratio_sum)
+        out.append(
+            budget_bytes - weight_bytes - float(profile.overhead_mib_per_rank) * MIB
+        )
+    return out
+
+
+def _kv_vector_candidates(n: int, top: int) -> List[Tuple[int, ...]]:
+    """Deterministic small-integer KV-vector candidate set, gcd-reduced and
+    sorted. Exhaustive for the group sizes this fork serves (n <= 4); larger
+    groups fall back to the even vector so the solver never explodes -- the
+    fallback is named in the grid notes by the caller."""
+    import itertools
+    import math as _math
+
+    if top**n <= 1296 * 6:
+        seen = set()
+        for vec in itertools.product(range(1, top + 1), repeat=n):
+            g = _math.gcd(*vec)
+            seen.add(tuple(v // g for v in vec))
+        return sorted(seen)
+    return [tuple([1] * n)]
+
+
+def solve_operating_grid(
+    profile: RigModelProfile,
+    geom: GeometryRungSpec,
+    *,
+    depth_bins: Sequence[float] = DEFAULT_DEPTH_BINS,
+    kv_candidate_top: int = 6,
+) -> Tuple[Optional[StageOperatingGrid], List[str]]:
+    """The depth/format-aware (phase x depth) KV-vector optima of one rung
+    (user directive, #287).
+
+    Per phase (prefill compute-bound, decode bandwidth-bound) and per
+    depth/fill bin ``d`` the solver picks the KV token vector minimizing the
+    lockstep per-rank time
+
+    * prefill: ``t_r = Wbytes_r / rate_r + d*T * c_attn * share_r / attn_r``
+    * decode:  ``t_r = Wbytes_r / membw_r + d*T * kv_bytes * share_r / membw_r``
+
+    subject to the FIT constraint ``d*T * kv_bytes * share_r <= free_r``
+    (a vector that cannot hold the fill it is solved for is not an optimum
+    at that fill). ``T`` is the rung's solver capacity, ``share_r`` the
+    candidate's normalized ownership share. At ``d = 0`` the constraint is
+    void and the time-balance (perf) pole wins; as ``d`` grows the feasible
+    set shrinks towards the capacity pole -- the grid IS the trajectory
+    between the #296 extrema, with the #320 depth measurement as the
+    licence that the sum-preserving redistribution itself is service-neutral.
+    The layer split stays the rung's own ratio: Stage 1 never reshards
+    weights, so the split axis moves only by flipping rungs.
+
+    Format awareness enters exclusively through ``profile.rank_scores``
+    (#324 per-(rank, family) scores mapped per card); the weight-time proxy
+    ``Wbytes_r / rate`` treats bytes as the mass unit, a stated
+    simplification of the ``solver`` provenance. Returns ``(grid, notes)``;
+    an unsolvable grid is ``(None, notes)`` with the missing input named,
+    never a guessed table.
+    """
+    notes: List[str] = []
+    scores = profile.rank_scores
+    if scores is None:
+        return (None, ["no rank_scores in profile -- operating grid not solved"])
+    if profile.kv_bytes_per_token is None:
+        return (None, ["no kv_bytes_per_token -- operating grid not solved"])
+    free = _free_kv_bytes_per_rank(profile, geom)
+    if free is None:
+        return (None, ["no weight_bytes_total -- operating grid not solved"])
+    if min(free) <= 0.0:
+        return (
+            None,
+            [
+                f"rank {free.index(min(free))} has no free KV bytes under "
+                f"geometry {geom.key!r} -- operating grid not solved"
+            ],
+        )
+    if profile.attn_context_flops_per_token_pair is None:
+        return (
+            None,
+            [
+                "no attn_context_flops_per_token_pair -- the prefill depth "
+                "term cannot be sized, operating grid not solved"
+            ],
+        )
+    total_tokens, prov, _src = solver_capacity_tokens(profile, geom)
+    if not total_tokens:
+        return (
+            None,
+            [f"rung capacity unavailable ({prov}) -- operating grid not solved"],
+        )
+    n = len(geom.gpus)
+    rates: Dict[str, List[float]] = {}
+    for label, table in (
+        ("prefill", scores.card_prefill_tflops),
+        ("attn", scores.card_attn_tflops),
+        ("membw", scores.card_membw_gbs),
+    ):
+        vec = []
+        for gpu in geom.gpus:
+            if int(gpu) not in table:
+                return (
+                    None,
+                    [
+                        f"card {int(gpu)} has no {label} rate in rank_scores "
+                        f"-- operating grid not solved (a missing rate is "
+                        f"named, not guessed)"
+                    ],
+                )
+            vec.append(float(table[int(gpu)]))
+        rates[label] = vec
+    bins = sorted(set(float(b) for b in depth_bins))
+    if not bins or bins[0] < 0.0 or bins[-1] > 1.0:
+        raise ValueError(f"depth_bins must lie within [0, 1], got {depth_bins}")
+
+    ratio_sum = float(sum(int(u) for u in geom.ratio))
+    # Narrowing for the type checker: _free_kv_bytes_per_rank above already
+    # returned None (and this function with it) when the weight bytes are
+    # unknown.
+    assert profile.weight_bytes_total is not None
+    w_bytes = [
+        profile.weight_bytes_total * (int(geom.ratio[r]) / ratio_sum) for r in range(n)
+    ]
+    kv_bytes = float(profile.kv_bytes_per_token)
+    c_attn = float(profile.attn_context_flops_per_token_pair)
+    candidates = _kv_vector_candidates(n, kv_candidate_top)
+    if len(candidates) == 1:
+        notes.append(
+            f"kv candidate set degenerated to the even vector (group size "
+            f"{n} too large for the exhaustive grid)"
+        )
+
+    points: List[OperatingPoint] = []
+    for phase in OP_PHASES:
+        for d in bins:
+            ctx_tokens = d * float(total_tokens)
+            best: Optional[Tuple[float, Tuple[int, ...]]] = None
+            for cand in candidates:
+                share_sum = float(sum(cand))
+                shares = [c / share_sum for c in cand]
+                if any(ctx_tokens * kv_bytes * shares[r] > free[r] for r in range(n)):
+                    continue
+                t_max = 0.0
+                for r in range(n):
+                    if phase == OP_PHASE_PREFILL:
+                        t = w_bytes[r] / (rates["prefill"][r] * 1e12) + (
+                            ctx_tokens * c_attn * shares[r] / (rates["attn"][r] * 1e12)
+                        )
+                    else:
+                        t = (w_bytes[r] + ctx_tokens * kv_bytes * shares[r]) / (
+                            rates["membw"][r] * 1e9
+                        )
+                    t_max = max(t_max, t)
+                if best is None or (t_max, cand) < best:
+                    best = (t_max, cand)
+            if best is not None:
+                source = (
+                    f"solver: argmin lockstep {phase} time over "
+                    f"{len(candidates)} kv candidates at fill {d:g} "
+                    f"(fit-constrained; #324 card rates)"
+                )
+                vector = best[1]
+            else:
+                # No candidate holds this fill: name the capacity pole
+                # (argmax of the fit) rather than inventing a fit.
+                cap_best = max(
+                    candidates,
+                    key=lambda cand: (
+                        min(
+                            free[r] * sum(cand) / (kv_bytes * cand[r]) for r in range(n)
+                        ),
+                        tuple(-c for c in cand),
+                    ),
+                )
+                vector = cap_best
+                source = (
+                    f"solver: NO candidate holds fill {d:g} under geometry "
+                    f"{geom.key!r}; naming the capacity pole instead"
+                )
+                notes.append(source)
+            points.append(
+                OperatingPoint(
+                    phase=phase,
+                    depth_fraction=d,
+                    layer_split=tuple(int(u) for u in geom.ratio),
+                    kv_vector=tuple(int(v) for v in vector),
+                    provenance=PROVENANCE_SOLVER,
+                    source=source,
+                )
+            )
+    return (StageOperatingGrid(points), notes)
 
 
 def capacity_from_report(report) -> Tuple[Optional[int], str, str]:
@@ -475,6 +758,15 @@ def build_ladder_table(
     base_geom = profile.geometries[0]
     base_tokens, base_prov, base_src = capacity_fn(profile, base_geom)
     base_cost, base_cost_prov, base_cost_src = cost_fn(base_geom.key, STEP_BASE)
+    # Depth/format-aware operating grid (user directive): solved per rung
+    # from the #324 card rates when the profile carries them; an unsolved
+    # grid is None WITH its reason in the step source, never a guess.
+    base_grid, base_grid_notes = solve_operating_grid(profile, base_geom)
+    base_grid_note = (
+        "grid: " + "; ".join(base_grid_notes)
+        if base_grid_notes
+        else ("grid: solved" if base_grid is not None else "grid: none")
+    )
     if base_cost is None:
         # The base rung IS the reference of the cost axis; that is a
         # definition, not an estimate, so it is the one cost figure this
@@ -493,7 +785,8 @@ def build_ladder_table(
             expected_cost_factor=base_cost,
             graphs_precaptured=True,
             provenance=_merge_provenance(base_prov, base_cost_prov),
-            source=f"{base_src} | {base_cost_src} | {family_note}",
+            source=f"{base_src} | {base_cost_src} | {family_note} | {base_grid_note}",
+            operating_grid=base_grid,
         )
     )
 
@@ -507,6 +800,12 @@ def build_ladder_table(
             tokens = int(running_tokens) + int(gain)
             running_tokens = tokens
         cost, cost_prov, cost_src = cost_fn(feature, STEP_RELIEF)
+        # The dcp_ratio rung IS the KV-vector flip: its actuator picks a new
+        # ownership vector at the UNCHANGED base layer split, so the base
+        # geometry's grid is exactly its (phase x depth) target table. The
+        # other relief features move no vectors and carry no grid.
+        relief_grid = base_grid if feature == "dcp_ratio" else None
+        relief_grid_note = f" | {base_grid_note}" if feature == "dcp_ratio" else ""
         steps.append(
             LadderStep(
                 name=feature,
@@ -516,7 +815,8 @@ def build_ladder_table(
                 expected_cost_factor=cost,
                 graphs_precaptured=True,
                 provenance=_merge_provenance(gain_prov, cost_prov),
-                source=f"{gain_src} | {cost_src}",
+                source=f"{gain_src} | {cost_src}{relief_grid_note}",
+                operating_grid=relief_grid,
             )
         )
 
@@ -524,6 +824,12 @@ def build_ladder_table(
     for geom in profile.geometries[1:]:
         tokens, prov, src = capacity_fn(profile, geom)
         cost, cost_prov, cost_src = cost_fn(geom.key, STEP_GEOMETRY)
+        geom_grid, geom_grid_notes = solve_operating_grid(profile, geom)
+        geom_grid_note = (
+            "grid: " + "; ".join(geom_grid_notes)
+            if geom_grid_notes
+            else ("grid: solved" if geom_grid is not None else "grid: none")
+        )
         steps.append(
             LadderStep(
                 name=geom.key,
@@ -534,7 +840,8 @@ def build_ladder_table(
                 graphs_precaptured=bool(geom.graphs_precaptured),
                 handover=geom.handover,
                 provenance=_merge_provenance(prov, cost_prov),
-                source=f"{src} | {cost_src}",
+                source=f"{src} | {cost_src} | {geom_grid_note}",
+                operating_grid=geom_grid,
             )
         )
 

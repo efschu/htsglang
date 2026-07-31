@@ -413,14 +413,25 @@ class TestThrottleBeforeRetractOrdering(unittest.TestCase):
 
 
 class TestLadderRegistration(unittest.TestCase):
-    def test_admission_cap_is_the_cheapest_relief_rung(self):
+    def test_admission_cap_sits_between_kv_vector_flip_and_data_movers(self):
+        """#287 user directive: the relief order is a SERVICE-cost order --
+        KV-vector flip (service-neutral per #320) < admission lowering
+        (turns sessions away) < any data movement (spill/offload)."""
         from sglang.srt.model_executor.kv_pressure_ladder import (
             RELIEF_FEATURES,
             RELIEF_ORDER,
         )
 
         self.assertIn(ADMISSION_RELIEF_FEATURE, RELIEF_FEATURES)
-        self.assertEqual(RELIEF_ORDER[0], ADMISSION_RELIEF_FEATURE)
+        self.assertEqual(RELIEF_ORDER[0], "dcp_ratio")
+        self.assertEqual(RELIEF_ORDER[1], ADMISSION_RELIEF_FEATURE)
+        self.assertLess(
+            RELIEF_ORDER.index(ADMISSION_RELIEF_FEATURE),
+            min(
+                RELIEF_ORDER.index("kv_spill"),
+                RELIEF_ORDER.index("session_offload"),
+            ),
+        )
 
 
 if __name__ == "__main__":

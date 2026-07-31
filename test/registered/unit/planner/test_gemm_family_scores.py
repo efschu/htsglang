@@ -540,5 +540,152 @@ class TestRealCheckpointsOnDisk(CustomTestCase):
                 self.assertEqual(families, {})
 
 
+class _ArithModel(_StubModel):
+    """Enough of ``PerfCostModel`` for the prefill-time arithmetic: the
+    families, the shard fractions, the comm-term dims and the calibration."""
+
+    base_plan = [1, 1, 1]
+    num_experts = 0
+    n_layers = 4
+    hidden = 1024
+
+    class _Cal:
+        prefill_invariant = 0.0
+
+    calibration = _Cal()
+    # The two real methods under test, bound onto the stub.
+    _prefill_sharded_time = uneven_perf.PerfCostModel._prefill_sharded_time
+    prefill_time_model = uneven_perf.PerfCostModel.prefill_time_model
+
+
+class TestPerFamilyPrefillArithmetic(CustomTestCase):
+    """#287's delegated piece: ``sum(p/r)`` instead of ``sum(p)/r``.
+
+    #324 deliberately deferred this -- the two differ in the last float bits
+    even when they are mathematically equal -- so THIS is where the switch
+    happens, gated on ``gemm.mixed`` so every single-scheme plan stays
+    bit-for-bit."""
+
+    def _mixed(self):
+        return uneven_perf.rank_gemm_family_scores(
+            _entries(), "nvfp4_a16", {uneven_perf.GEMM_FAMILY_ATTN_GDN: "fp8"}
+        )
+
+    def _sharded_time(self, model, vec, rates, fam_map):
+        return uneven_perf.PerfCostModel._prefill_sharded_time(
+            model, vec, rates, 8.0, fam_map
+        )
+
+    def test_family_map_is_none_unless_genuinely_mixed(self):
+        model = _ArithModel()
+        uniform = uneven_perf.rank_gemm_family_scores(_entries(), "fp8", {})
+        self.assertIsNone(uneven_perf.family_prefill_tflops(model, uniform))
+        self.assertIsNotNone(uneven_perf.family_prefill_tflops(model, self._mixed()))
+
+    def test_sum_p_over_r_differs_from_every_single_rate_model(self):
+        """The point of the arithmetic: with attn on the fp8 lane and MLP on
+        Marlin, NO single per-rank vector reproduces the per-family time."""
+        model, gemm = _ArithModel(), self._mixed()
+        fam_map = uneven_perf.family_prefill_tflops(model, gemm)
+        vec = [1, 1, 1]
+        t_family = self._sharded_time(model, vec, gemm.scalar, fam_map)
+        t_scalar = self._sharded_time(model, vec, gemm.scalar, None)
+        t_attn = self._sharded_time(
+            model, vec, gemm.for_family(uneven_perf.GEMM_FAMILY_ATTN_GDN), None
+        )
+        self.assertNotAlmostEqual(t_family, t_scalar, places=12)
+        self.assertNotAlmostEqual(t_family, t_attn, places=12)
+        # And it is exactly the hand-computed sum(p/r) on the binding rank.
+        eff = 1e12 * uneven_perf._PREDICT_GEMM_EFF
+        expected_comp = max(
+            2.0
+            * (
+                model.families["mlp"].params
+                * model._shard_fractions("mlp", vec)[r]
+                / (gemm.scalar[r] * eff)
+            )
+            + 2.0
+            * (
+                model.families["attn"].params
+                * model._shard_fractions("attn", vec)[r]
+                / (gemm.for_family(uneven_perf.GEMM_FAMILY_ATTN_GDN)[r] * eff)
+            )
+            for r in range(3)
+        )
+        t_comm = t_scalar - max(
+            2.0
+            * sum(
+                fam.params * model._shard_fractions(fam.shard, vec)[r]
+                for fam in model.families.values()
+            )
+            / (gemm.scalar[r] * eff)
+            for r in range(3)
+        )
+        self.assertAlmostEqual(t_family, expected_comp + t_comm, places=18)
+
+    def test_none_map_is_the_byte_identical_scalar_path(self):
+        """``family_tflops=None`` runs the pre-#287 float operations: pin
+        the closed form so a refactor cannot drift the default path."""
+        model = _ArithModel()
+        rates = [216.0, 58.44, 59.15]
+        vec = [2, 1, 1]
+        eff = 1e12 * uneven_perf._PREDICT_GEMM_EFF
+        t_comp = max(
+            2.0
+            * sum(
+                fam.params * model._shard_fractions(fam.shard, vec)[r]
+                for fam in model.families.values()
+            )
+            / (rates[r] * eff)
+            for r in range(3)
+        )
+        ar_bytes = model.n_layers * 2 * model.hidden * 2
+        t_comm = ar_bytes * 2 * (3 - 1) / 3 / (8.0 * 1e9)
+        self.assertEqual(
+            self._sharded_time(model, vec, rates, None), t_comp + t_comm
+        )
+
+    def test_prefill_time_model_forwards_the_family_map(self):
+        model, gemm = _ArithModel(), self._mixed()
+        fam_map = uneven_perf.family_prefill_tflops(model, gemm)
+        with_map = uneven_perf.PerfCostModel.prefill_time_model(
+            model, [2, 1, 1], gemm.scalar, 8.0, fam_map
+        )
+        without = uneven_perf.PerfCostModel.prefill_time_model(
+            model, [2, 1, 1], gemm.scalar, 8.0
+        )
+        self.assertNotAlmostEqual(with_map, without, places=12)
+
+    def test_weight_family_mapping(self):
+        f = uneven_perf.gemm_family_for_weight_family
+        self.assertEqual(f("mlp", 0), uneven_perf.GEMM_FAMILY_MLP)
+        self.assertEqual(f("mlp", 64), uneven_perf.GEMM_FAMILY_MOE)
+        self.assertEqual(f("draft_mlp", 64), uneven_perf.GEMM_FAMILY_MOE)
+        self.assertEqual(f("attn", 0), uneven_perf.GEMM_FAMILY_ATTN_GDN)
+        self.assertEqual(f("gdn", 0), uneven_perf.GEMM_FAMILY_ATTN_GDN)
+        self.assertEqual(f("vocab", 0), uneven_perf.GEMM_FAMILY_VOCAB)
+        self.assertIsNone(f("vision", 0))
+        self.assertIsNone(f("draft_solo_ckpt", 0))
+
+    def test_effective_rate_is_the_harmonic_family_blend(self):
+        model, gemm = _ArithModel(), self._mixed()
+        eff = uneven_perf.effective_prefill_tflops(model, gemm)
+        attn = gemm.for_family(uneven_perf.GEMM_FAMILY_ATTN_GDN)
+        for r in range(3):
+            lo = min(gemm.scalar[r], attn[r])
+            hi = max(gemm.scalar[r], attn[r])
+            self.assertGreaterEqual(eff[r], lo)
+            self.assertLessEqual(eff[r], hi)
+        # Rank 0's blend must feel the 2.62x fp8-vs-Marlin band: strictly
+        # between, not clamped to either lane.
+        self.assertGreater(eff[0], gemm.scalar[0])
+        self.assertLess(eff[0], attn[0])
+        # Single scheme: the scalar comes back as-is.
+        uniform = uneven_perf.rank_gemm_family_scores(_entries(), "fp8", {})
+        self.assertEqual(
+            uneven_perf.effective_prefill_tflops(model, uniform), uniform.scalar
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

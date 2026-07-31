@@ -4369,6 +4369,23 @@ class ServerArgs:
             "rung, never the first.",
         ),
     ] = 512
+    kv_pressure_consensus_interval: A[
+        int,
+        Arg(
+            help="Scheduler rounds between two consensus boundaries of the "
+            "KV pressure ladder. Ladder transitions are COMMITTED only at "
+            "these boundaries, where every TP rank's local verdict passes "
+            "through one small MIN-reduction over the CPU group: equal "
+            "verdicts commit, unequal verdicts fail LOUDLY on every rank "
+            "(never a hang, never a silent majority). The cadence is gated "
+            "by the replicated round counter, so every rank enters the "
+            "collective in the same round unconditionally -- a rank-local "
+            "condition in front of a group collective is exactly the bug "
+            "class this channel exists to prevent. Occupancy is still "
+            "sampled every round; the interval only sets the commit "
+            "latency (and the collective cost) of the ladder.",
+        ),
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -5760,7 +5777,27 @@ class ServerArgs:
             parse_kv_pressure_ladder,
         )
 
-        parse_kv_pressure_ladder(self.kv_pressure_ladder)
+        spec = parse_kv_pressure_ladder(self.kv_pressure_ladder)
+        if isinstance(spec, tuple):
+            names = [name for _type, name in spec]
+            # Actuator dependencies fail at ARGUMENT time (#287 runtime,
+            # backward-compat rule: fail fast, not at the first pressure
+            # episode): a rung whose wired actuator cannot exist in this
+            # configuration is a configuration error.
+            if "admission_cap" in names and self.max_running_requests_ceiling is None:
+                raise ValueError(
+                    "--kv-pressure-ladder names the 'admission_cap' rung, "
+                    "but --max-running-requests-ceiling is unset: the rung "
+                    "actuates the floating admission limiter, which only "
+                    "arms under a ceiling. Set the ceiling or drop the rung."
+                )
+            if "session_offload" in names and not self.enable_kv_session_offload:
+                raise ValueError(
+                    "--kv-pressure-ladder names the 'session_offload' rung, "
+                    "but --enable-kv-session-offload is unset: the rung "
+                    "actuates the #236 session spill manager. Enable it or "
+                    "drop the rung."
+                )
         if self.kv_pressure_pre_stage and not self.kv_pressure_ladder:
             raise ValueError(
                 "--kv-pressure-pre-stage needs --kv-pressure-ladder: the "
@@ -5773,6 +5810,11 @@ class ServerArgs:
             raise ValueError(
                 f"--kv-pressure-external-hysteresis-rounds must be >= 1, got "
                 f"{self.kv_pressure_external_hysteresis_rounds}."
+            )
+        if self.kv_pressure_consensus_interval < 1:
+            raise ValueError(
+                f"--kv-pressure-consensus-interval must be >= 1, got "
+                f"{self.kv_pressure_consensus_interval}."
             )
         # The sensor owns the mark/window contract; constructing one here is
         # the validation (it raises with the same messages the runtime would).

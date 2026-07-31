@@ -15880,3 +15880,176 @@ uebersprungen): **1793 passed, 3 skipped, 0 failed**.
 sauber auf beiden Dateien; black auf der Testdatei angewandt, `uneven_perf.py`
 bringt genau die 33 black-Hunks mit, die es vorher schon hatte (keine neuen).
 Keine GPU angefasst (`CUDA_VISIBLE_DEVICES=99`).
+
+## Task #287 — KV-Druck-Treppe, Runde 2: rank-uniforme Runtime + Tiefen-/Format-Achse (`feat/kv-pressure-staircase`, Basis 6c37af91ca)
+
+Das Erg.-9/9b-CPU-Skelett (Tabelle, Sensor, Flip-Kontrakt) bekommt in dieser
+Runde die drei Stuecke, die es zur Treppe machen: die RANK-UNIFORME
+Laufzeit-Maschine im Scheduler, die TIEFEN- und FORMAT-bewussten Stufen-Optima
+und die per-Familie-Prefill-Arithmetik, die #324 ausdruecklich hierher
+delegiert hat.
+
+### Stufen-Modell (Achsen, Relief-Reihenfolge, Stufe-1-Grenzen)
+
+- **Relief-Reihenfolge umgestellt** (Nutzer-Direktive, SERVICE-Kostenordnung):
+  `RELIEF_ORDER` ist jetzt `dcp_ratio < admission_cap < kv_spill <
+  weightless_rank < session_offload`. Begruendung im Code: #320 hat
+  karten-bewiesen, dass die summen-erhaltende KV-Vektor-Umverteilung
+  service-NEUTRAL ist (69.784 → 431.457 Tokens = 6,18x bei Prefill am Boden
+  und Decode-Aufschlag +0,9pp unter dem 2,72%-Rauschboden) — die
+  Admission-Senkung dagegen KOSTET Service (jeder gesenkte Slot ist eine
+  abgewiesene Session), und die Daten-Beweger kommen zuletzt. Der alte Pin
+  `RELIEF_ORDER[0] == admission_cap` in `test_admission_limiter.py` wurde
+  durch den neuen Ordnungs-Pin ersetzt.
+- **Tiefen-Achse** (`OperatingPoint` / `StageOperatingGrid` in
+  `kv_pressure_ladder.py`, Solver in `planner/kv_ladder_table.py
+  .solve_operating_grid`): je Sprosse, je Phase (prefill compute-gebunden,
+  decode bandbreiten-gebunden) und je Fuellstands-Bin (Default 0.05, 0.25,
+  0.5, 0.75, 1.0 — "auch dazwischen") loest der Planner den KV-Vektor als
+  argmin der Lockstep-Zeit UNTER der Fit-Nebenbedingung (ein Vektor, der den
+  Fuellstand nicht halten kann, ist dort kein Optimum). Bei f→0 gewinnt der
+  Perf-Pol (Zeit-Balance), mit wachsendem f schrumpft die zulaessige Menge
+  auf den Kapazitaets-Pol — das Grid IST die #296-Extrema-Trajektorie, und
+  die Bin-Auswahl zur Laufzeit (`StageOperatingGrid.select`) ist reine
+  Floor-Bin-Selektion, deterministisch, ohne Vektor-Interpolation (ein
+  interpolierter Vektor waere eine Zahl, die niemand geloest hat). Der
+  unterste Default-Bin liegt bei 0,05 statt 0,0: bei exakt Null-Kontext
+  verschwindet der Tiefenterm und das "Optimum" waere ein
+  Tie-Break-Artefakt.
+- **Format-Achse**: der Solver konsumiert ausschliesslich
+  `RankScoreProfile` (per-Karte: effektive Prefill-Rate familien-geblendet,
+  attn_gdn-Lane-Rate, membw) — abgeleitet aus den #324-per-(Rang,Familie)-
+  Scores, nie aus einer Arch-Tabelle. Fehlende Rate = Grid ungeloest MIT
+  benannter Notiz im Step-Source (`grid: no rank_scores …`), nie geraten.
+  Testbeleg: dieselben Karten unter einem Format, dessen Lane auf Karte 0
+  ~3x langsamer ist (Marlin-vs-nativ-Band aus ANALYSE_321), ergeben ein
+  ANDERES Grid.
+- **Stufe-1-Grenzen, ehrlich**: `admission_cap` und `session_offload` sind
+  VERDRAHTETE Aktuatoren (Floating-Limiter-`throttle` mit Grund
+  `kv_pressure`; `try_spill` des #236-Managers). `dcp_ratio` ist in Stufe 1
+  PLANNED-ONLY: der Flip waehlt und loggt den tiefen-/format-bewussten
+  Ziel-Vektor aus dem Grid, bewegt aber kein Byte — die Laufzeit-Ratio ist
+  in Pool-Geometrie und Attention-Backend-Caches (`cp_lo/cp_hi`,
+  Konstruktionszeit) eingebacken; der physische Umzug (auch die
+  new-allocations-only-Variante) ist #297. `kv_spill`/`weightless_rank`
+  ebenso planned-only. Der wired/planned-Split wird bei Konstruktion
+  validiert (Sprosse ohne moeglichen Aktuator = harter Fehler zur
+  ARGUMENT-Zeit: `admission_cap` ohne `--max-running-requests-ceiling`,
+  `session_offload` ohne `--enable-kv-session-offload`) und beim Boot
+  inventarisiert — die Treppe verspricht nie still Entlastung, die sie
+  nicht liefern kann.
+
+### Rank-Uniformitaets-Mechanik + Desync-Falsifikator
+
+`managers/kv_pressure_runtime.py` (`KvPressureRuntime`), Aufruf im
+Scheduler direkt neben `update_dcp_admission_state` (der dokumentierte
+per-Iteration-Punkt, den jeder Rang unbedingt erreicht). Drei Regeln im
+Code:
+
+1. **Nur replizierte Eingaben**: die Occupancy-Probe ist dieselbe wie beim
+   Admission-Limiter (gehaltene Tokens der Live-Requests +
+   gruppen-vereinbartes `max_total_num_tokens`), Phase und Runden-Zaehler
+   ebenso repliziert — jeder Rang errechnet denselben lokalen Vorschlag ohne
+   Kollektiv.
+2. **Konsens-Grenze mit UNBEDINGTER Kadenz**: Uebergaenge werden nur an
+   jeder `--kv-pressure-consensus-interval`-ten Runde (Default 8)
+   festgeschrieben — Gate ist der REPLIZIERTE Zaehler, nie der lokale
+   Verdikt (exakt die Rank-lokaler-Test-vor-Kollektiv-Falle, die dieser
+   Kanal verhindert). An der Grenze MIN-reduziert EIN kleines
+   int64-Paket `[v, -v]`-Paare (Plan-Phase, Ziel-Sprosse, Ist-Sprosse,
+   Epoche) ueber die TP-CPU-Gruppe: min==max je Feld = Commit, sonst
+   erhebt JEDER Rang denselben lauten `KvLadderError` (alle sehen dieselben
+   reduzierten Werte — auch das Scheitern ist rank-uniform). Produktion
+   laeuft durch das #312-Primitiv `bounded_collective` (toter Peer =
+   benannter `PeerLostError`, kein Hang).
+3. **Laut, nie still**: Flips loggen auf WARNING mit Praefix
+   `KV-PRESSURE-LADDER` inkl. Epoche, Occupancy, Operating-Point und
+   wired/planned-Status des Aktuators.
+
+**Falsifikator-Ergebnis** (`test_kv_pressure_runtime.py`, echte Threads
+durch einen Barrier-MIN-Kanal, Join mit hartem Timeout — ein Hang faellt
+durch, statt die Suite einzufrieren): (a) drei Raenge mit identisch
+replizierten Serien flippen an derselben Grenze auf dieselbe Sprosse mit
+derselben Epoche, Kanal nachweislich benutzt; (b) ein Rang mit absichtlich
+rank-lokal verfaelschtem Bild (sein Pool "sieht voll aus", die Gruppe ist
+ruhig — die Gestalt, die ein lokaler `available_size`-Read unter uneven DCP
+produzieren wuerde) laesst ALLE DREI Raenge denselben `DESYNC…`-Fehler
+werfen; niemand haengt, niemand committet den strittigen Vorschlag
+(alle Sprossen bleiben 0).
+
+### Graph-Entscheid (dokumentiert)
+
+Alle Stufe-1-Uebergaenge (Relief-Sprossen) mutieren ausschliesslich
+CPU-seitigen Scheduler-Zustand (Admission-Zaehler, Spill-Anstoss, geplanter
+Vektor) — nichts davon liegt in einer Capture-Region, die Entscheidung
+laeuft im Scheduler-Loop ZWISCHEN den Forwards, und der Capture-Guard des
+Skeletts (Invariante 3: `begin_capture`/`end_capture` verweigert Plaene
+waehrend aktiver Capture) bleibt davor. **Stufenwechsel liegen fuer alle
+Stufe-1-Sprossen ausserhalb der Capture-Pfade; eigene Graph-Saetze braucht
+erst eine Geometrie-Sprosse** — deren Anforderung traegt die Tabelle
+bereits als Invariante 4 (`graphs_precaptured`, Register-Klasse
+`graph_rungs`, #93/#286-Muster), und in Stufe 1 ist keine Geometrie-Sprosse
+verdrahtet.
+
+### Per-Familie-Prefill-Arithmetik (die #324-Delegation)
+
+`uneven_perf.py`: `_prefill_sharded_time`/`prefill_time_model` nehmen
+optional `family_tflops` (Gewichts-Familie → per-Rang-Raten). Gesetzt wird
+es NUR bei `gemm.mixed` (`family_prefill_tflops`): die per-Rang-Zeit ist
+dann `sum_fam(2 p_fam / r_fam)` — sum(p/r) — statt Params zu summieren und
+durch EINE aufgeloeste Rate zu teilen (sum(p)/r). Mapping
+Gewichts-Familie → Score-Familie in `gemm_family_for_weight_family`
+(mlp/draft_mlp → moe bei Experten>0 sonst mlp; attn/gdn/draft_attn →
+attn_gdn; vocab → vocab; vision/draft_repl/draft_solo_ckpt → Skalar).
+`None` (jeder Ein-Schema-Checkpoint) laeuft die alten Float-Operationen
+bit-fuer-bit — genau die Byte-Identitaets-Grenze, wegen der #324 das
+Stueck verschoben hat; der Pin auf die geschlossene Form des Skalar-Pfads
+steht im Test. Der Link-Penalty des enc-Zweigs skaliert die Familienraten
+mit demselben per-Rang-Faktor (der Link ist Karten-, nicht
+Format-Eigenschaft). Zusaetzlich `effective_prefill_tflops` (harmonischer,
+massen-gewichteter Familien-Blend am Basis-Plan) als die EINE
+per-Karte-Zahl, die das Treppen-Grid konsumiert, ohne die Familienachse zu
+verlieren.
+
+### Flags
+
+Neu: `--kv-pressure-consensus-interval` (Default 8, >=1, validiert).
+Verschaerft: `--kv-pressure-ladder` mit `admission_cap`-Sprosse verlangt
+`--max-running-requests-ceiling`, mit `session_offload`-Sprosse
+`--enable-kv-session-offload` — beides zur Argument-Zeit. Flag aus =
+`kv_pressure_runtime is None`, kein Sample, kein Kollektiv, kein
+Konstruktor — der Default-Pfad bleibt byte-identisch (der Scheduler-Block
+ist zwei vorhersagbare Branches).
+
+### Sensor-Schwellen-Anker (#307-fit / #287)
+
+Als Test gepinnt (`TestThresholdAnchors`): `descend 0.55 < release_low
+0.70 <= pre_stage 0.70 < ascend 0.85 < throttle_high 0.90 < 1.0` — die
+Treppe ist die FRUEHE, geplante Reaktion; der 0.90-Throttle des Limiters
+und der Retract-Fallback bleiben die Notbremsen dahinter.
+
+### Testzahlen (CPU, hermetisch, `CUDA_VISIBLE_DEVICES=99`)
+
+- `test_kv_pressure_runtime.py` NEU **18** (Uniformitaet auf Threads,
+  Desync-Falsifikator, unbedingte Kadenz, Kanal-Kontrakt, Determinismus,
+  Phase-x-Tiefe-Selektion, Aktuatoren wired/planned inkl. Boot-Fehler,
+  Descend-Release, Pre-Stage ohne Wirkung auf den aktiven Pfad,
+  Warm-Shadow-delta_only, Ruhe-Regression, Schwellen-Anker, Laut-Log).
+- `test_kv_ladder_grid.py` NEU **10** (Solver-Provenienz, Pol-zu-Pol-
+  Trajektorie, eigene Zwischen-Bin-Optima, Determinismus, Format-Scores
+  bewegen das Optimum, fehlende Eingaben benannt, Bin-Validierung,
+  Tabellen-Anbindung base/dcp_ratio/Geometrie, admission ohne Grid).
+- `test_gemm_family_scores.py` **+6** (sum(p/r) ≠ jede Ein-Raten-Zeit +
+  Handrechnung, Skalar-Pfad-Pin, prefill_time_model-Durchreichung,
+  Familien-Mapping, harmonischer Blend, mixed-Gate).
+- `test_kv_pressure_ladder.py` **+4** (Argument-Zeit-Abhaengigkeiten,
+  Konsens-Intervall), `test_admission_limiter.py` Ordnungs-Pin ersetzt.
+- Bestand gruen: ladder+table+admission **166**, voller
+  `unit/planner/`-Lauf **1722 passed / 74 skipped** (uneven_perf-Aenderung
+  regressionsfrei), `unit/model_executor/` **443 passed** (4 Fails
+  vorbestehend, identisch auf sauberem HEAD: `test_coresidence_budget_
+  mapping.py`, umgebungsbedingt), Scheduler-CPU-Nachbarn 38 passed.
+- ruff (F401/F821/UP037) sauber auf allen beruehrten Dateien (inkl. 20
+  vorbestehender UP037-Aufraeumer in Skelett und uneven_perf, beide Dateien
+  tragen `from __future__ import annotations`); codespell sauber; black
+  auf den neuen Dateien und kv_ladder_table.py.
