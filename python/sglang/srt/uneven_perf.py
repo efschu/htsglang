@@ -698,6 +698,20 @@ LANE_FP8_MARLIN = "fp8_marlin"
 #: per forward, so at a prefill shape the expansion amortizes over the whole
 #: token block -- which is exactly the shape this probe measures.
 LANE_FP8_W8A16 = "fp8_w8a16"
+#: Native NVFP4: E2M1 weights AND E2M1 activations on the block-scaled FP4
+#: tensor path -- the fork's own sm_120a CUTLASS GEMM, or flashinfer's
+#: cutlass/cutedsl runners on Blackwell datacentre parts. Reachable only where
+#: ``fp4_utils.initialize_fp4_gemm_config`` resolves a non-Marlin backend, i.e.
+#: sm_100, or sm_120 with the fork's JIT kernel genuinely importable (#323c).
+LANE_NVFP4_NATIVE = "nvfp4_native"
+#: Weight-only NVFP4 through ``gptq_marlin_gemm``: E2M1 is unpacked in-kernel
+#: and multiplied on bf16 tensor cores. ``initialize_fp4_gemm_config`` resolves
+#: it on sm_80..sm_89, and ``ModelOptNvFp4A16LinearMethod`` plus the
+#: compressed-tensors W4A16-NVFP4 scheme take it on EVERY architecture,
+#: Blackwell included -- a W4A16 family never reaches the native lane no matter
+#: which card it lands on. That gap (measured band 2.6x on the reference rig's
+#: 5090) is what a single per-rank score cannot represent.
+LANE_NVFP4_MARLIN = "nvfp4_marlin"
 
 #: Checkpoint compute format -> the lanes a card may take for it, in the order
 #: the serving path tries them (fp8: native, then Marlin, then dequant --
@@ -711,9 +725,17 @@ LANE_FP8_W8A16 = "fp8_w8a16"
 #: own probe and its own evidence. A format with no entry falls back to the
 #: bf16 lane WITH A WARNING -- never silently, because a bf16 number wearing a
 #: quantized label is the defect this table exists to fix.
+#:
+#: The two ``nvfp4_*`` keys carry no probe yet -- their entries here are the
+#: DISPATCH ORDER only, so that a mixed-precision checkpoint resolves the right
+#: lane per family the moment the probes land. Until then a card takes the
+#: named bf16 fallback below, and the fallback says the lane is unprobed rather
+#: than telling the reader to re-run a probe that does not exist.
 _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
     "bf16": (LANE_BF16,),
     "fp8": (LANE_FP8_NATIVE, LANE_FP8_MARLIN, LANE_FP8_W8A16),
+    "nvfp4_a4": (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN),
+    "nvfp4_a16": (LANE_NVFP4_MARLIN,),
 }
 
 #: Human-readable lane names for the plan log.
@@ -722,6 +744,8 @@ _LANE_LABELS = {
     LANE_FP8_NATIVE: "fp8 native (_scaled_mm)",
     LANE_FP8_MARLIN: "fp8 Marlin (weight-only)",
     LANE_FP8_W8A16: "fp8 W8A16 dequant",
+    LANE_NVFP4_NATIVE: "nvfp4 native (block-scaled FP4)",
+    LANE_NVFP4_MARLIN: "nvfp4 Marlin (weight-only W4A16)",
 }
 
 
@@ -1730,6 +1754,249 @@ def _is_fp8_like(method: str, fmt: str) -> bool:
     return method == "fp8" or "float8" in method or "float" in fmt or "fp8" in fmt
 
 
+# ---------------------------------------------------------------------------
+# Compute families: one score per rank is not enough.
+#
+# For fp8 -- one scheme applied to every Linear -- a single per-rank number is
+# exactly right, and that is the only case the score derivation had to serve.
+# A MIXED_PRECISION checkpoint breaks it on the SAME card: nvidia's Qwen3.6-27B
+# NVFP4 (V1) keeps attention and the GDN in_proj at fp8 while the MLP is
+# W4A16-NVFP4, so a 5090 runs attention on the native fp8 path and the MLP on
+# Marlin -- a measured band of 2.6x INSIDE one rank, which a scalar cannot
+# express at all (ANALYSE_321 sec. 8.3).
+#
+# The dimension added here is (rank, family). It is derived, per family, from
+# the format that family's own modules declare in the checkpoint config, and
+# resolved against the SAME per-card lane table the scalar path uses -- so the
+# lane a family is scored on is the lane the serving path would resolve for
+# that card x that family (``fp4_utils.initialize_fp4_gemm_config`` /
+# ``get_fp4_gemm_runner_backend`` for the FP4 families, mirrored here by lane
+# ORDER rather than by calling the resolver: the planner runs pre-boot in one
+# process and must answer for every rank, while the resolver answers only for
+# the device it is called on).
+#
+# No PROFILE_VERSION bump. The family dimension lives entirely in the score
+# DERIVATION; the profile keeps its v3 ``gemm_lanes`` / ``gemm_lane_notes``
+# fields and only gains new KEYS inside them as lanes are added. Bumping the
+# version changes the cache key and forces every rig to re-probe the pairwise
+# link matrix -- the 600 s/boot phase of the #303 incident -- for a change the
+# cached measurements are already valid under.
+# ---------------------------------------------------------------------------
+
+#: Dense MLP (gate/up/down projections).
+GEMM_FAMILY_MLP = "mlp"
+#: Attention projections plus the GDN/linear-attention in_proj/out_proj. One
+#: family because every checkpoint seen so far quantizes them together, and
+#: because the planner never moves them independently.
+GEMM_FAMILY_ATTN_GDN = "attn_gdn"
+#: Embedding / lm_head.
+GEMM_FAMILY_VOCAB = "vocab"
+#: Routed and shared experts.
+GEMM_FAMILY_MOE = "moe"
+
+#: Every family the score derivation can resolve separately, in log order.
+GEMM_FAMILIES: Tuple[str, ...] = (
+    GEMM_FAMILY_MLP,
+    GEMM_FAMILY_ATTN_GDN,
+    GEMM_FAMILY_VOCAB,
+    GEMM_FAMILY_MOE,
+)
+
+#: Module-path markers per family, tested in THIS order. Order is load-bearing
+#: twice over: routed experts live UNDER ``mlp.experts`` so "moe" must be
+#: decided before "mlp", and a fused ``qkv_proj`` sits under ``self_attn`` so
+#: the attention marker must not be reached by an MLP path first.
+_GEMM_FAMILY_MARKERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        GEMM_FAMILY_VOCAB,
+        ("lm_head", "embed_tokens", "word_embeddings", "output_layer"),
+    ),
+    (
+        GEMM_FAMILY_MOE,
+        ("experts", "shared_expert", "block_sparse_moe", "moe_"),
+    ),
+    (
+        GEMM_FAMILY_ATTN_GDN,
+        (
+            "self_attn",
+            "self_attention",
+            "linear_attn",
+            "attention",
+            "qkv_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+        ),
+    ),
+    (GEMM_FAMILY_MLP, ("mlp", "feed_forward", "feedforward", "ffn")),
+)
+
+
+def gemm_family_of_module(name: str) -> Optional[str]:
+    """The compute family a module path belongs to, or ``None`` when no marker
+    matches (a norm, a router, a vision-tower module -- nothing the GEMM score
+    describes). Matching is on the LOWERCASED path so a ``re:``-prefixed
+    compressed-tensors target and a literal ModelOpt layer name both land."""
+    low = name.lower()
+    for family, markers in _GEMM_FAMILY_MARKERS:
+        if any(marker in low for marker in markers):
+            return family
+    return None
+
+
+def _modelopt_algo_format(algo: str) -> Optional[str]:
+    """A ModelOpt ``quant_algo`` string -> the ``_FORMAT_LANES`` key it runs
+    under, or ``None`` when the algo is one this table has no opinion about
+    (the caller then keeps the checkpoint-wide key, never invents a lane)."""
+    a = (algo or "").strip().upper()
+    if not a or a in ("NONE", "NULL", "BF16", "FP16", "NO_QUANT"):
+        return "bf16"
+    if a in ("W4A16_NVFP4", "NVFP4_A16", "W4A16_AWQ_NVFP4"):
+        return "nvfp4_a16"
+    if "NVFP4" in a or a in ("FP4", "W4A4"):
+        # NVFP4 / NVFP4_AWQ / W4A4_NVFP4: activations are 4-bit too, so the
+        # native block-scaled lane is reachable where the backend resolves to
+        # one. The W4A16 spellings above are already excluded.
+        return "nvfp4_a4"
+    if a.startswith("FP8") or a.startswith("W8A8_FP8"):
+        return "fp8"
+    if a.startswith("INT4") or a.startswith("W4A16"):
+        return "int4"  # no lane table: takes the loud bf16 fallback
+    return None
+
+
+def _ct_group_format(group: dict) -> Optional[str]:
+    """The ``_FORMAT_LANES`` key a compressed-tensors ``config_groups`` entry
+    runs under, read from its weight/activation bit widths and types."""
+    weights = (group or {}).get("weights") or {}
+    acts = (group or {}).get("input_activations") or {}
+    try:
+        bits = int(weights.get("num_bits") or 0)
+    except (TypeError, ValueError):
+        return None
+    wtype = str(weights.get("type") or "").lower()
+    if bits == 8 and wtype == "float":
+        return "fp8"
+    if bits == 4 and wtype == "float":
+        try:
+            act_bits = int(acts.get("num_bits") or 0)
+        except (TypeError, ValueError):
+            act_bits = 0
+        return "nvfp4_a4" if act_bits == 4 else "nvfp4_a16"
+    if bits in (4, 8):
+        return "int4" if bits == 4 else "int8"  # no lane table (loud fallback)
+    return None
+
+
+def _dominant(values: Sequence[str]) -> Optional[str]:
+    """The most frequent entry, ties broken by first appearance (so the result
+    does not depend on dict iteration luck)."""
+    best, best_count = None, 0
+    for value in values:
+        count = sum(1 for v in values if v == value)
+        if count > best_count:
+            best, best_count = value, count
+    return best
+
+
+def _per_family_formats(qc: dict) -> Dict[str, str]:
+    """``{family: format key}`` for the families the config declares a scheme
+    for, ``{}`` when it declares no per-module split at all.
+
+    Two config shapes carry a genuine per-module split:
+
+    * ModelOpt ``MIXED_PRECISION``, whose ``quantized_layers`` maps each module
+      path to its own ``quant_algo`` (``ModelOptMixedPrecisionConfig``,
+      modelopt_quant.py:666-770);
+    * compressed-tensors with more than one ``config_groups`` entry, each
+      naming the modules it covers in ``targets``.
+
+    A single-group / single-algo config returns ``{}`` -- there is nothing to
+    split, and the scalar key already describes it exactly."""
+    per_family: Dict[str, List[str]] = {}
+
+    layers = qc.get("quantized_layers")
+    if isinstance(layers, dict) and layers:
+        for module, info in layers.items():
+            family = gemm_family_of_module(str(module))
+            if family is None:
+                continue
+            algo = str((info or {}).get("quant_algo") or "")
+            key = _modelopt_algo_format(algo)
+            if key is not None:
+                per_family.setdefault(family, []).append(key)
+
+    groups = qc.get("config_groups")
+    if not per_family and isinstance(groups, dict) and len(groups) > 1:
+        for group in groups.values():
+            key = _ct_group_format(group or {})
+            if key is None:
+                continue
+            for target in (group or {}).get("targets") or []:
+                family = gemm_family_of_module(str(target))
+                if family is not None:
+                    per_family.setdefault(family, []).append(key)
+
+    resolved = {}
+    for family, keys in per_family.items():
+        key = _dominant(keys)
+        if key is not None:
+            resolved[family] = key
+    return resolved
+
+
+def _is_nvfp4_like(method: str, fmt: str, qc: dict) -> Optional[str]:
+    """``"nvfp4_a4"`` (activations 4-bit too, so the native FP4 lane is
+    reachable), ``"nvfp4_a16"`` (weight-only -> Marlin on EVERY architecture,
+    Blackwell included), or ``None``.
+
+    The distinction is not cosmetic and not inferable from the repo name: for
+    W4A16_NVFP4 the fork's ``ModelOptNvFp4A16LinearMethod`` is unconditionally
+    Marlin, so a 5090 scored on a native-FP4 number would be scored ~2.6x too
+    fast."""
+    if method in ("modelopt", "modelopt_fp4"):
+        algo = str(qc.get("quant_algo") or "").upper()
+        if algo == "MIXED_PRECISION":
+            # Stopgap for the checkpoint-WIDE key only: the FLOP-dominant
+            # family's format. The per-family vectors below are the actual
+            # answer; this keeps the scalar consumers on the format most of
+            # the model runs in rather than on a bf16 stand-in.
+            families = _per_family_formats(qc)
+            for family in (GEMM_FAMILY_MOE, GEMM_FAMILY_MLP):
+                if family in families:
+                    return families[family]
+            return _dominant(list(families.values()))
+        return _modelopt_algo_format(algo)
+    if "nvfp4" in fmt:  # nvfp4-pack-quantized (compressed-tensors)
+        for group in (qc.get("config_groups") or {}).values():
+            key = _ct_group_format(group or {})
+            if key in ("nvfp4_a4", "nvfp4_a16"):
+                return key
+    return None
+
+
+def _checkpoint_quant_config(model_path: Optional[str], cfg: dict) -> dict:
+    """The quantization block, from ``config.json`` or -- for a ModelOpt export
+    that keeps it out of the model config -- from ``hf_quant_config.json``,
+    whose payload sits under a ``quantization`` key (both shapes are what
+    ``ModelOptMixedPrecisionConfig.from_config`` accepts).
+
+    Read only by the compute-format dispatch. The byte model keeps reading
+    ``_quant_config`` alone so its sizing is unchanged."""
+    qc = _quant_config(cfg)
+    if qc or not model_path or _is_gguf_model(model_path):
+        return qc
+    try:
+        with open(os.path.join(model_path, "hf_quant_config.json")) as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    section = payload.get("quantization")
+    return section if isinstance(section, dict) else (payload or {})
+
+
 def checkpoint_compute_format(model_path: Optional[str]) -> Tuple[str, str]:
     """``(format key, one-line description)`` for the checkpoint's weight format.
 
@@ -1750,11 +2017,19 @@ def checkpoint_compute_format(model_path: Optional[str]) -> Tuple[str, str]:
             "unknown",
             f"unreadable checkpoint config ({type(ex).__name__}: {ex})",
         )
-    qc = _quant_config(cfg)
+    qc = _checkpoint_quant_config(model_path, cfg)
     if not qc:
         return "bf16", "unquantized (no quantization_config)"
     method = str(qc.get("quant_method") or "").lower()
     fmt = str(qc.get("format") or qc.get("fmt") or "").lower()
+    algo = str(qc.get("quant_algo") or "").upper()
+    if not method and algo:
+        # hf_quant_config.json shape: the algo IS the method declaration.
+        method = "modelopt"
+    nvfp4 = _is_nvfp4_like(method, fmt, qc)
+    if nvfp4 is not None:
+        detail = f"quant_algo={algo or '?'}" if algo else f"fmt={fmt or '?'}"
+        return nvfp4, f"{nvfp4} (quant_method={method or '?'}, {detail})"
     if _is_fp8_like(method, fmt):
         block = qc.get("weight_block_size")
         shape = f", weight_block_size {block}" if block else ""
@@ -1763,6 +2038,37 @@ def checkpoint_compute_format(model_path: Optional[str]) -> Tuple[str, str]:
         method or "unknown",
         f"quant_method={method or '?'}, format={fmt or '?'}",
     )
+
+
+def checkpoint_compute_format_families(
+    model_path: Optional[str],
+) -> Tuple[str, str, Dict[str, str]]:
+    """``(checkpoint-wide format key, description, per-family format keys)``.
+
+    The third element is EMPTY for every checkpoint that applies ONE scheme to
+    every family -- which is every checkpoint the scalar path was written for.
+    It is populated only when the config genuinely declares different schemes
+    for different families, so a caller that ignores it, or a family missing
+    from it, keeps reading exactly the number it read before. That is the whole
+    migration story: there is no new profile field and no new file format, only
+    a dict that is empty until a mixed-precision checkpoint fills it."""
+    fmt, desc = checkpoint_compute_format(model_path)
+    if _is_gguf_model(model_path):
+        return fmt, desc, {}
+    try:
+        cfg = _load_checkpoint_config(model_path)
+    except Exception:
+        return fmt, desc, {}
+    qc = _checkpoint_quant_config(model_path, cfg)
+    if not qc:
+        return fmt, desc, {}
+    families = _per_family_formats(qc)
+    if len(set(families.values())) <= 1:
+        # One scheme across the board (or none declared per module): the
+        # checkpoint-wide key already says everything the families would.
+        return fmt, desc, {}
+    detail = ", ".join(f"{fam}={families[fam]}" for fam in sorted(families))
+    return fmt, f"{desc}; per-family: {detail}", families
 
 
 def rank_gemm_scores(
@@ -1821,11 +2127,20 @@ def rank_gemm_scores(
             detail = "; ".join(
                 f"{lane}: {notes.get(lane, 'not probed')}" for lane in lanes
             )
+            # Do not tell the reader to re-probe a lane that has no probe: a
+            # format whose lanes are registered for DISPATCH ORDER only cannot
+            # be measured yet, however often the profile is rebuilt.
+            hint = (
+                "This format's lanes have no probe yet, so re-probing cannot "
+                "produce one."
+                if all(lane not in _LANE_PROBES for lane in lanes)
+                else "Re-run with SGLANG_PERF_REPROBE=1 if the profile "
+                "predates the lane probes."
+            )
             warnings.append(
                 f"{entry.get('name', 'GPU')}: no {fmt} GEMM lane measured on "
                 f"this card ({detail}) -- scoring it on the DENSE BF16 probe "
-                "instead. Re-run with SGLANG_PERF_REPROBE=1 if the profile "
-                "predates the lane probes; otherwise this rank's compute "
+                f"instead. {hint} Otherwise this rank's compute "
                 "score is in the wrong format and the ratio it forms with the "
                 "other ranks is understated."
             )
@@ -1833,6 +2148,95 @@ def rank_gemm_scores(
             scores.append(float(available[chosen]))
             labels.append(_LANE_LABELS.get(chosen, chosen))
     return scores, labels, warnings
+
+
+@dataclasses.dataclass
+class GemmScores:
+    """Per-rank compute scores widened by one axis: the compute family.
+
+    ``scalar`` is the pre-existing per-rank vector, unchanged and still the
+    answer for every consumer that has no family of its own. ``families`` holds
+    a vector ONLY for a family whose format differs from the checkpoint-wide
+    one, so on a uniform checkpoint it is empty and every lookup returns the
+    same floats the scalar path returned -- not an equal value, the same
+    object's contents.
+    """
+
+    #: Per-rank score in the checkpoint-wide format.
+    scalar: List[float]
+    #: Lane label per rank for ``scalar``.
+    scalar_labels: List[str]
+    #: family -> per-rank score, only for families that diverge.
+    families: Dict[str, List[float]]
+    #: family -> lane label per rank, same keys as ``families``.
+    family_labels: Dict[str, List[str]]
+    #: family -> format key, as read from the checkpoint config.
+    family_formats: Dict[str, str]
+    #: Loud fallbacks, family-tagged where they came from a family lookup.
+    warnings: List[str]
+
+    @property
+    def mixed(self) -> bool:
+        """Whether any family genuinely scores differently from the scalar."""
+        return bool(self.families)
+
+    def for_family(self, family: str) -> List[float]:
+        """This family's per-rank scores, or the scalar when it has none."""
+        return list(self.families.get(family) or self.scalar)
+
+    def resolve(self, *preferred: str) -> Tuple[List[float], str]:
+        """``(scores, source name)`` for the first preferred family that has
+        its own vector, else ``(scalar, "scalar")``.
+
+        The source name exists so the plan log can NAME the fallback instead of
+        printing a vector whose provenance the reader has to guess."""
+        for family in preferred:
+            if family in self.families:
+                return list(self.families[family]), family
+        return list(self.scalar), "scalar"
+
+
+def rank_gemm_family_scores(
+    entries: Sequence[dict],
+    fmt: str,
+    family_formats: Optional[Dict[str, str]] = None,
+) -> GemmScores:
+    """``rank_gemm_scores`` widened to (rank, family).
+
+    ``family_formats`` is what ``checkpoint_compute_format_families`` returned:
+    empty for every checkpoint with one scheme, in which case this is the
+    scalar call and nothing else. A family whose format equals the
+    checkpoint-wide one is deliberately NOT stored -- it would be the same
+    numbers under a second key, and an empty ``families`` is what makes
+    ``mixed`` mean what it says.
+
+    Each family resolves through the SAME per-card lane order as the scalar
+    path, so two families on one card can land on two different lanes exactly
+    when the serving path would put them there (a W4A16 family on Marlin while
+    an fp8 family takes the native tensor path on the very same 5090)."""
+    scalar, scalar_labels, warnings = rank_gemm_scores(entries, fmt)
+    families: Dict[str, List[float]] = {}
+    family_labels: Dict[str, List[str]] = {}
+    by_format: Dict[str, Tuple[List[float], List[str]]] = {}
+    for family in GEMM_FAMILIES:
+        family_fmt = (family_formats or {}).get(family)
+        if family_fmt is None or family_fmt == fmt:
+            continue
+        if family_fmt not in by_format:
+            scores, labels, warns = rank_gemm_scores(entries, family_fmt)
+            by_format[family_fmt] = (scores, labels)
+            warnings.extend(f"[{family_fmt}] {w}" for w in warns)
+        scores, labels = by_format[family_fmt]
+        families[family] = list(scores)
+        family_labels[family] = list(labels)
+    return GemmScores(
+        scalar=scalar,
+        scalar_labels=scalar_labels,
+        families=families,
+        family_labels=family_labels,
+        family_formats=dict(family_formats or {}),
+        warnings=warnings,
+    )
 
 
 def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[int]:
@@ -4149,12 +4553,18 @@ def apply_auto_performance(server_args) -> None:
     # dense bf16 probe reports is not the ratio a quantized checkpoint runs at
     # -- on the reference rig, 3.79 in bf16 against 8.64 for the same two
     # cards on the fp8 checkpoint they actually serve (#296).
-    quant_fmt, quant_desc = checkpoint_compute_format(server_args.model_path)
-    rank_scores_gemm, rank_gemm_lanes, gemm_warnings = rank_gemm_scores(
-        rank_entries, quant_fmt
+    # A MIXED_PRECISION checkpoint runs two formats on the same card, so the
+    # score carries a family axis as well (see the "Compute families" block).
+    # ``family_fmts`` is empty for every single-scheme checkpoint and the
+    # scalar below is then the only vector in play.
+    quant_fmt, quant_desc, family_fmts = checkpoint_compute_format_families(
+        server_args.model_path
     )
+    gemm = rank_gemm_family_scores(rank_entries, quant_fmt, family_fmts)
+    rank_scores_gemm = gemm.scalar
+    rank_gemm_lanes = gemm.scalar_labels
     lines.append(f"checkpoint weight format: {quant_desc}")
-    for w in gemm_warnings:
+    for w in gemm.warnings:
         logger.warning("auto-performance: %s", w)
         lines.append("WARNING: " + w)
     for r in range(server_args.tp_size):
@@ -4168,6 +4578,23 @@ def apply_auto_performance(server_args) -> None:
             f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS [{rank_gemm_lanes[r]}], "
             f"membw {rank_scores_bw[r]:.0f} GB/s{gemv_txt}"
         )
+    if gemm.mixed:
+        lines.append(
+            "MIXED-PRECISION checkpoint: the compute score is resolved per "
+            "family, because two families run different lanes on the SAME "
+            "card here."
+        )
+        for family in GEMM_FAMILIES:
+            if family not in gemm.families:
+                continue
+            per_rank = ", ".join(
+                f"r{r} {gemm.families[family][r]:.1f} "
+                f"[{gemm.family_labels[family][r]}]"
+                for r in range(server_args.tp_size)
+            )
+            lines.append(
+                f"  family {family} ({gemm.family_formats[family]}): {per_rank}"
+            )
     links = profile.get("links") or {}
     pair_bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
     min_link = min(pair_bws) if pair_bws else 8.0
@@ -4199,6 +4626,29 @@ def apply_auto_performance(server_args) -> None:
         measured=(registry or {}).get("components"),
         measured_mlp_vector=(registry or {}).get("mlp_vector"),
     )
+    # The enc/both objective's only lever is moving MLP units, so it is scored
+    # on the MLP family's own compute rate -- the routed-expert rate on a MoE
+    # checkpoint, where that family carries the mass the vector moves. On every
+    # single-scheme checkpoint neither family diverges, ``resolve`` returns the
+    # scalar, and the objective sees the identical vector it saw before.
+    enc_families = (
+        (GEMM_FAMILY_MOE, GEMM_FAMILY_MLP)
+        if model.num_experts > 0
+        else (GEMM_FAMILY_MLP,)
+    )
+    base_enc_scores, enc_score_source = gemm.resolve(*enc_families)
+    if gemm.mixed:
+        lines.append(
+            "enc/both objective scored on the "
+            + (
+                f"'{enc_score_source}' family lane"
+                if enc_score_source != "scalar"
+                else "checkpoint-wide scalar lane (no family datum for "
+                + "/".join(enc_families)
+                + ")"
+            )
+            + f": {[round(x, 1) for x in base_enc_scores]} TFLOPS."
+        )
     # Which bandwidth the decode roofline divides by, stated once. The GEMV
     # rate is the informative one; every fall back to the streaming peak is
     # reported with its reason, because the two carry different exponents and
@@ -4377,7 +4827,7 @@ def apply_auto_performance(server_args) -> None:
             "on the measured capacity model; prefill speed breaks ties "
             "within 1%; decode-knee guard is advisory (logged only)."
         )
-        enc_scores = list(rank_scores_gemm)
+        enc_scores = list(base_enc_scores)
         # Candidate space: exhaustive small-integer vectors (the capacity
         # optimum usually DRAINS the solo host, a direction the
         # score-proportional ladders never propose). 6^tp stays trivial for
@@ -4503,7 +4953,7 @@ def apply_auto_performance(server_args) -> None:
                 "here and the refusal is reported explicitly."
             )
         # enc/both objective: minimize the lockstep prefill time model.
-        enc_scores = list(rank_scores_gemm)
+        enc_scores = list(base_enc_scores)
         # Per-rank link penalty: a rank behind a narrow link attracts fewer
         # units (folded softly; the AR term already carries the group cost).
         if pair_bws and len(set(server_args.rank_gpu_id)) == server_args.tp_size:
