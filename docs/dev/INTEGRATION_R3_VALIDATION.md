@@ -14045,3 +14045,109 @@ zwischen der gemockten und der echten Messung, ohne Bedeutung fuer die Klasse.
 `proofs/ledger_lines.txt` (die beiden `auto`-Zeilen),
 `proofs/adaptive_lines.txt` (Leiterbau), `proofs/free_after_boot.txt`,
 `proofs/gegen_error_raw.txt`, `raw/` (Bench, Metriken, Samples), `power.csv`.
+
+## #315/#314-Beleg: Marker matchen live, Locks cross-shell
+
+Kartenfenster 2026-07-31 00:58:42–01:04:50 lokal (23:58:42–00:04:50 UTC),
+**6 min** von 25 min Budget; 19 min zurueckgegeben. Basis: `wt-final`
+`ace2586fe9` (Merge `fix/battery-regex-locks`), Rig 1, drei Karten frei
+(0/0/0 MiB vor und nach dem Fenster).
+
+### #315 — die Konsumenten-Regexe greifen auf einem echten Lauf
+
+Ein vollstaendiger s11-Durchlauf gegen den PVE-Host, nicht gegen eine Fixture:
+
+    BATTERY_RUN=/spinning/gpu-battery-results/2026-07-31_s11_beleg \
+      WT=/spinning/wt-final bash scripts/gpu_battery/run_step.sh s11 --force
+
+Vorlauf in derselben Ergebnisdatei (Kette `s00 -> s10 -> s11`): `s00_preflight`
+PASS in 2 s, `s10_bar1_driver` PASS in 2 s. `s11_bar1_e2e` **PASS in 238 s**
+(Budget 2700 s, Erwartung 1500 s — JIT-Cache war warm, Server oben nach 101 s).
+
+Das Verdikt allein ist hier nichts wert; genau das war die Kaschier-Falle. Die
+drei Marker sind deshalb im geernteten Evidence-Verzeichnis gegengezeigt
+(`proofs/marker_matches.txt`, Rohquelle `s11_bar1_e2e/htccl_lines.txt`):
+
+| Regex in `s11_bar1_e2e.py` | Marker | Treffer |
+|---|---|---|
+| `RE_AUFBAU` | `HTCCL-BAR1: setup in\s+([0-9.]+)\s*ms` | 9 |
+| `RE_KASSE` | `BAR1 ledger of this card after group '...'` | 9 |
+| `RE_GROUP` | `group '...': requested=..., ACHIEVED=...` | 9 |
+| `RE_RIEGEL` | `... during a CUDA graph capture` | 0 (Riegel hat nicht gefeuert) |
+| — | `Bar1Unavailable` | 0 in `htccl_lines.txt` **und** 0 in `server.log` |
+
+Je eine echte Zeile, ungekuerzt bis auf die Zeilenbreite:
+
+```
+106:[2026-07-31 02:01:35 TP1] HTCCL-BAR1: setup in 330 ms, 2 peer targets,
+    region 96.0 MiB per rank (12 slots (of which 2(R-1) for all_to_all)),
+    slot 8188 KiB, largest payload 24564 KiB, flags 5376 bytes, export via
+    NV_ESC_EXPORT_TO_DMABUF_FD. ...
+108:[2026-07-31 02:01:35 TP1] HTCCL-BAR1: BAR1 ledger of this card after
+    group 'world:0': world:0: 96.0 MiB.
+145:[2026-07-31 02:01:35 TP2] HTCCL enabled for group 'world:0':
+    requested=bar1, ACHIEVED=bar1. ...
+```
+
+Damit ist die Umstellung belegt, und zwar gegen den konkreten Vorbefund: der
+Lauf vom 2026-07-30 11:29 (`2026-07-30_bar1/s11_bar1_e2e/`) emittierte an
+denselben Stellen noch `HTCCL-BAR1: Aufbau in 323 ms`, `BAR1-Kasse dieser Karte
+nach Gruppe` und `angefordert=bar1, ERREICHT=bar1` — dort matchen die heutigen
+Regexe 0/0/0. Emitter (`htccl_bar1.py:2046`/`:2060`, `parallel_state.py:652`)
+und Konsumenten stehen jetzt auf derselben Sprache; die gemessenen 9/9/9 sind
+der Nachweis, dass keiner der beiden Seiten nachtraeglich wieder wegdriftet,
+ohne dass es auffaellt.
+
+Die daraus komponierte `bar1_e2e.json` (Schema 5, englische Gruppen-Keys):
+`graph_check` rc=0, 10 Faelle, **9 Gate-Faelle, alle bestanden**;
+`gruppen` = `dcp:0`, `tp:0`, `world:0`, alle drei `requested=bar1` /
+`achieved=bar1`; `gruppen_ausgewichen` leer; `aufbau_gruppen` = alle drei,
+`aufbau_lines` 9, `aufbau_ms` = 3x330/3x39/3x41; `riegel` null; `fatal` null.
+Smoke ueber `/generate`: kohaerent (10 Zahlen in Folge), `finish_reason=length`,
+nicht unterprovisioniert, `spec_accept_length` **3.10**.
+
+Die 14 `gloo`-Vorkommen in `server.log` sind kein Ausweichen, sondern der
+Hinweistext **innerhalb** der `ACHIEVED=bar1`-Zeile selbst
+(`the host-staged transports (shm/gloo/ucx) additionally require
+--disable-cuda-graph`). Nachgesehen, weil eine reine Zaehlung hier sonst wie
+ein Fallback aussieht.
+
+Kein Rest-#315-Fund: jeder Marker, den der Check auswertet, hat auf diesem Lauf
+getroffen.
+
+### #314 — Freigabe aus einer fremden Shell
+
+Der Fehlerfall von gestern Abend, nachgestellt und behoben nachgewiesen
+(`lock_cross_shell.txt`):
+
+* **Shell A** (pid 948489) nimmt via `battery_acquire_locks s11_bar1_e2e` alle
+  drei Locks. Info-Datei traegt `step=s11_bar1_e2e`, `pid=948489`,
+  `heartbeat_pid=948511`; der Heartbeat laeuft unter eigener Identitaet
+  (`pgrep -f '[b]attery_heartbeat'` -> 948511). Shell A endet.
+* **Shell B** (pid 948913, frische Instanz, hat nie `acquire` gesehen):
+  `BATTERY_HELD_LOCKS` und `BATTERY_HEARTBEAT_PID` sind nach dem `source` leer
+  — es gibt also nichts im Prozessgedaechtnis, worauf die Freigabe sich
+  stuetzen koennte. `battery_release_locks s11_bar1_e2e` rc=0.
+* Danach: **keine Lock-Verzeichnisse** mehr, Heartbeat 948511 **tot**, in einer
+  vierten, sauberen Shell ohne den Marker im eigenen argv **kein einziger
+  `battery_heartbeat`-Prozess** uebrig. Zweiter Aufruf derselben Freigabe
+  rc=0, idempotent.
+
+Eine Beobachtung zum Messinstrument, nicht zum Produkt: in Shell B lieferte
+`pgrep -f '[b]attery_heartbeat'` neben 948511 auch die Test-Shell selbst,
+weil das Pruefskript den Marker im eigenen Kommandozeilentext fuehrt. Die
+Freigabe faellt darauf nicht herein — sie schneidet das `pgrep`-Ergebnis mit
+`grep -qx "$hb_pid"` gegen genau die pid aus der Info-Datei. Auf dem echten
+Pfad (`run_step.sh`) taucht der Marker im argv ohnehin nicht auf.
+
+### Rohdaten
+
+`/spinning/gpu-battery-results/2026-07-31_s11_beleg/`:
+`state.json` (Verdikte s00/s10/s11), `s11_bar1_e2e/` (voller Schrittordner:
+`bar1_e2e.json`, `htccl_lines.txt`, `server.log`-Ausschnitt, `graph_check.txt`,
+`smoke.json`, `server_info.json`, `step.log`, generierte Remote-Skripte),
+`proofs/marker_matches.txt` (die gegengezeigten Marker mit ihrem Regex),
+`proofs/gate_cases.txt` (10 Gate-Zeilen), `proofs/bar1_e2e.json`,
+`lock_cross_shell.txt` (#314, Shell A und Shell B in einer Datei),
+`power.csv` (36 Punkte je Karte; Spitzen 179 W / 19493 MiB auf GPU0,
+115 W / 29345 MiB auf GPU1, 169 W / 18353 MiB auf GPU2).
