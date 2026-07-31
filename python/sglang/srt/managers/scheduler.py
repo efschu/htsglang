@@ -2151,6 +2151,25 @@ class Scheduler(
         )
         set_admission_limiter(self.admission_limiter)
         if self.admission_limiter.auto and self.ps.tp_rank == 0:
+            # #307: the ceiling is a REQUEST, and the pools it dimensions are
+            # fitted to the budget when the cards cannot hold it (a hybrid
+            # model's per-request state is not elastic). The limiter floats
+            # below the FITTED ceiling, so say when the two differ -- silently
+            # serving 18 where 64 was asked for is the kind of gap that gets
+            # read as a throttling bug. Uniform across ranks by construction:
+            # every input to `ceiling` is min-reduced before it gets here.
+            per_worker = sa.dp_size if sa.enable_dp_attention else 1
+            requested = max(1, int(sa.max_running_requests_ceiling) // per_worker)
+            if ceiling < requested:
+                logger.warning(
+                    "Dynamic admission limit: the requested ceiling %d (per "
+                    "worker) does not fit the memory budget; the state pools "
+                    "and the float were fitted to %d. Raise the per-rank "
+                    "budget (--rank-gpu-memory-mib / --rank-auto-reserve-mib) "
+                    "or lower the ceiling to make the request honest.",
+                    requested,
+                    ceiling,
+                )
             logger.info(
                 "Dynamic admission limit: ceiling=%d, start=%d, floor=%d "
                 "(throttle>=%.2f, release<=%.2f x%d). State pools are "
