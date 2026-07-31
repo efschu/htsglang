@@ -120,9 +120,12 @@ consumer, and the two cases differ:
   one case and not the other. Pinned by
   `test_a_ratio_is_not_invariant_and_that_is_the_open_risk`.
 
-The library names both values (`ABSENT_LINK_RANKING_PLACEHOLDER_GBS`,
+The library named both values (`ABSENT_LINK_RANKING_PLACEHOLDER_GBS`,
 `ABSENT_LINK_ASSUMED_GBS`) rather than picking a winner: unifying them would
-change plans on an unprobed rig, which is a re-tune. **Open item, §6.**
+have changed plans on an unprobed rig, which is a re-tune. **Closed by #359**
+— see §6.1: no stand-in rate exists any more, an absent link means the
+collective term is not priced, and a compute-only figure may order candidates
+but may not settle a threshold.
 
 ### D3 — two on-disk pair-matrix shapes, never reconciled
 
@@ -230,8 +233,7 @@ Composition  ring_factor(ranks)
              apportion_largest_remainder(total, weights, min_one=True)
              cumulative_boundaries(total, weights)
              apportion_cumulative(total, weights)
-             ABSENT_LINK_RANKING_PLACEHOLDER_GBS = 1e-3
-             ABSENT_LINK_ASSUMED_GBS            = 8.0
+             ABSENT_LINK_COMPUTE_ONLY_REASON    (#359: no stand-in rate exists)
 
 Bundle       CostSources{compute, links, keys, divergences}.absences()
              load_cost_sources(card_keys, fmt=, family_formats=,
@@ -280,8 +282,8 @@ one. Exercised by `test_the_302_entry_point_resolves_a_moe_family_and_a_hop`.
 | `key_solver._ring_factor` | own `2(R-1)/R` | `= cost_model.ring_factor` |
 | `key_solver.collective_decode_s` / `_prefill_s` | inlined `(R-1)·lat + ring·payload/BW` | `cost_model.allreduce_seconds(...)` |
 | `key_solver.rates_from_probe` pair block | own 25-line parser over `probe["pairs"]` | `pair_matrix_from_card_probe` + `narrowest/worst` |
-| `key_solver.rates_from_probe` membw/gemm | silent `0.0` | absence named via `memory_rates_from_entries` |
-| `key_solver` link fallback | bare `1e-3` ×3 | `ABSENT_LINK_RANKING_PLACEHOLDER_GBS` (same value, now documented) |
+| `key_solver.rates_from_probe` membw/gemm | silent `0.0` | absence named via `memory_rates_from_entries`; carried as `None` since #359 |
+| `key_solver` link fallback | bare `1e-3` ×3 | none — the collective term is not priced (#359) |
 | `shard_plan._weighted_boundaries` | own cumulative rounding | `cost_model.cumulative_boundaries` |
 | `sp_shard_utils._apportion` | own Hamilton apportionment | `cost_model.apportion_largest_remainder` |
 | `class2_diffusion._capacity_weights` | `load_measured_registry` (dead) | `compute_rates_for_cards` (D1 fix) |
@@ -344,25 +346,83 @@ clean, `codespell` clean, `mypy --ignore-missing-imports` clean on
 
 ## 6. Open items
 
-1. **D2 — the ratio consumer ranks through an unmeasured constant.**
-   `lever_profiles._speed_ratios` compares a ratio against a move threshold
-   with `_FALLBACK_LINK_GBS = 8.0` standing in for an unmeasured wire. The
-   guard-correct fix is to report the absence instead of ranking through it,
-   which changes lever output on an unprobed rig — a decision, not a refactor.
-   Both constants are now named in one module so the change is one edit.
-2. **`key_solver` does not use the #324 lane resolution.** It classifies a
-   checkpoint as `"fp8"` or `"bf16"` with its own reader
-   (`gemm_dtype_for_checkpoint`), so an int8 / nvfp4 / W4A16 / MIXED_PRECISION
-   checkpoint is ranked on a measured but wrong-lane bf16 rate. The library now
-   exposes the right resolver to it (`compute_rates_from_entries(..., fmt=)`);
-   switching would change plans on quantized checkpoints and needs its own
-   measured before/after.
-3. **D6 — the diffusion all-gather is still unpriced.** `allreduce_seconds`
-   plus a measured `PairMatrix` is what M4 needs; the split objective currently
-   optimises compute only.
-4. **`shard_plan` plans at full rate under a flagged co-tenant**
-   (`shard_plan.py:497-503` warns, then uses `rate_scale = 1.0`). The honest
-   shape is a named absence; it belongs with #348a's co-tenancy measurement.
+Items 1-4 were closed by **task #359**; item 5 is unchanged, and two new
+remainders are recorded honestly at the end.
+
+1. **D2 — the ratio consumer ranks through an unmeasured constant. RESOLVED
+   (#359).** There is no fallback link rate left in the tree. `1e-3`
+   (`ABSENT_LINK_RANKING_PLACEHOLDER_GBS`), the `0.1` floor inside
+   `PerfCostModel._prefill_sharded_time` and `8.0`
+   (`ABSENT_LINK_ASSUMED_GBS` / `lever_profiles._FALLBACK_LINK_GBS`,
+   `apply_auto_performance`) are all deleted. `prefill_time_model` now takes
+   `min_link_gbs: Optional[float]`, where `None` means the collective term is
+   not priced and the result is a compute-only time, and a non-positive rate
+   raises instead of being floored. A compute-only figure may settle an argmax
+   (the omitted term is split-invariant — proved as arithmetic in
+   `test_omitting_the_collective_term_cannot_reorder_candidates`) and may not
+   settle a ratio against a threshold: `lever_profiles._speed_ratios` returns
+   `prefill=None` with `cost_model.ABSENT_LINK_COMPUTE_ONLY_REASON`, the
+   `max prefill` objective reports itself unresolved, and `key_solver`'s
+   `enc` cell reports the absence rather than a magnitude. Sites:
+   `cost_model.py` (constant block), `uneven_perf.py:4433-4550, 4949-4966`,
+   `lever_profiles.py:355-410, 553-640, 810-820`,
+   `key_solver.py:1565-1615, 4494-4535`.
+2. **`key_solver` does not use the #324 lane resolution. RESOLVED (#359).**
+   `build_cost_model` calls `uneven_perf.checkpoint_compute_format_families`
+   and `RigRates.resolve_gemm_format`, which routes through
+   `cost_model.compute_rates_from_entries` and thus through
+   `rank_gemm_family_scores`. `rates_from_probe` gained an optional
+   `hardware_profile` argument: the card probe measures only dense bf16 and
+   native fp8, so the v3 `gemm_lanes` map is what lets an int8 / nvfp4 /
+   W4A16 checkpoint be priced on the lane it dispatches to.
+   `solver_api.cached_hardware_profile()` supplies it on the live path.
+   Measured before/after on the #264/#265 fixture: with the card probe alone,
+   every plan for bf16, fp8 and int8 is byte-identical (int8 takes the loud
+   dense fallback — same number, now labelled). With the profile's lanes,
+   bf16 is unchanged; fp8 keeps its key (`47,8,13` / `1,0,0`) and only its
+   reported prefill ratio moves (1.078439 → 1.087020, 1.234660 → 1.252042)
+   because both 3080s move from the dense fallback to their measured
+   `fp8_marlin` lane; int8 moves the prefill key `104,15,17` → `108,15,13`
+   because the `int8_native` lane separates the two 3080s by 10 % (183.78 vs
+   164.77) where dense bf16 had them 0.03 % apart. Pinned by
+   `test_cost_model_open_items.TestSolverUsesTheLaneResolution`.
+   `gemm_dtype_for_checkpoint` and `resolve_gemm_dtype` remain exported and
+   tested; they no longer price a plan.
+3. **D3 — the two pair-matrix shapes had a reconciler and no caller. RESOLVED
+   (#359).** `cost_model.load_pair_matrix` is the single boundary: it reads
+   both artifacts, prefers the ordered card probe, and returns every
+   disagreement beyond 10 % as a line the caller surfaces.
+   `key_solver.rates_from_probe`, `lever_profiles._min_link_rate` and
+   `load_cost_sources` all go through it; `RigRates.divergences` carries the
+   disagreements, which are not absences and are not averaged away. Both
+   readers now record a malformed row in `PairMatrix.rejected` instead of
+   dropping it with a bare `continue`.
+4. **D4 — silent `0.0` for a missing membw / GEMM rate. RESOLVED (#359).**
+   `RigRates.membw_gbs` and `RigRates.gemm_tflops` are
+   `List[Optional[float]]`; a card the probe never scored carries `None` all
+   the way to the consumer. Every consumer goes through
+   `require_membw_gbs()` / `require_gemm_tflops()`, which raise
+   `cost_model.AbsentRate` naming the rank. On a complete probe both lists are
+   full and nothing moves.
 5. **`sp_shard_utils` cannot be tested in the desk venv** (`diffusers`,
    `addict`). Its 34 existing cases were not run for this change; the
    equivalence proof is structural (§5).
+
+Still open, unchanged by #359:
+
+6. **D6 — the diffusion all-gather is still unpriced.** `allreduce_seconds`
+   plus a measured `PairMatrix` is what M4 needs; the split objective currently
+   optimises compute only.
+7. **`shard_plan` plans at full rate under a flagged co-tenant**
+   (`shard_plan.py:497-503` warns, then uses `rate_scale = 1.0`). The honest
+   shape is a named absence; it belongs with #348a's co-tenancy measurement.
+8. **The nvfp4 lanes have no probe.** `_FORMAT_LANES` registers
+   `nvfp4_native` / `nvfp4_marlin` for dispatch order only, so an NVFP4 or
+   W4A16 checkpoint still resolves to the loud dense fallback on every card.
+   Item 2 routes it correctly; there is nothing measured at the other end yet.
+9. **`gemm_lane_entries` merges two artifacts by UUID.** The card probe wins
+   the lanes it measures (its numbers are what the K1 regression anchors were
+   fitted against) and the hardware profile contributes the rest. A >10 %
+   disagreement on the shared `fp8_native` lane is reported in
+   `RigRates.divergences`, not resolved — the two probes ran in different
+   thermal windows and picking one silently would be a re-tune.

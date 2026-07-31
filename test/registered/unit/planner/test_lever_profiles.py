@@ -307,8 +307,14 @@ class TestProvenance(ProfileFixture):
             self.assertIn("nameplate", " ".join(d["caveats"]).lower())
 
     def test_the_link_term_says_whether_it_was_measured(self):
+        # UPDATED DELIBERATELY by #359: "assumed" is no longer one of the
+        # answers. An unprobed wire used to be filled with 8.0 GB/s and
+        # labelled; it is now a named absence, and the prefill figures that
+        # would have divided by it come back absent too.
         d = self._report()
-        self.assertIn(d["basis"]["min_link_source"].split()[0], ("measured", "assumed"))
+        self.assertIn(d["basis"]["min_link_source"].split()[0], ("measured", "absent"))
+        if d["basis"]["min_link_source"].startswith("absent"):
+            self.assertIsNone(d["basis"]["min_link_gbs"])
 
     def test_no_net_of_prefill_gain_and_decode_cost_is_reported(self):
         # crossover.MODELLED_NET_REFUSED: the two terms are each fitted on one

@@ -482,56 +482,61 @@ class TestDivergenceIsCaught(unittest.TestCase):
                 )
                 self.assertEqual(sum(cm.apportion_cumulative(total, weights)), total)
 
-    def test_the_absent_link_substitutions_are_named_in_one_place(self):
-        """Three code paths answered "no pair matrix" with numbers 80x apart.
+    def test_there_is_no_absent_link_substitution_left_to_name(self):
+        """UPDATED DELIBERATELY by #359 (was: the two constants are named in
+        one module so the divergence is one grep away).
 
-        The library does not pick a winner -- that would re-tune an unprobed
-        rig -- but it holds both, so the gap is one grep away instead of
-        spread over three modules.
+        #348b held ``1e-3`` and ``8.0`` GB/s side by side rather than picking
+        a winner, because unifying them would have re-tuned an unprobed rig.
+        #359 removed the question instead of answering it: an absent link
+        means the collective term is NOT PRICED, so there is no third number
+        to reconcile and no module left holding one.
         """
-        self.assertEqual(cm.ABSENT_LINK_RANKING_PLACEHOLDER_GBS, 1e-3)
-        self.assertEqual(cm.ABSENT_LINK_ASSUMED_GBS, 8.0)
+        self.assertFalse(hasattr(cm, "ABSENT_LINK_RANKING_PLACEHOLDER_GBS"))
+        self.assertFalse(hasattr(cm, "ABSENT_LINK_ASSUMED_GBS"))
+        self.assertIn("not priced", cm.ABSENT_LINK_COMPUTE_ONLY_REASON)
 
         from sglang.srt.planner import lever_profiles
 
-        self.assertEqual(lever_profiles._FALLBACK_LINK_GBS, cm.ABSENT_LINK_ASSUMED_GBS)
+        self.assertFalse(hasattr(lever_profiles, "_FALLBACK_LINK_GBS"))
 
-    def test_the_absent_link_placeholder_cannot_reorder_candidates(self):
+    def test_omitting_the_collective_term_cannot_reorder_candidates(self):
         """The #216/#264 guard, checked as arithmetic rather than asserted.
 
         The collective term depends on the layer count, the hidden size and
-        the rank count -- never on the candidate split -- so substituting any
-        link rate adds the SAME constant to every candidate and the ordering
-        of their compute terms survives.
+        the rank count -- never on the candidate split -- so it adds the SAME
+        constant to every candidate. That is what licenses the compute-only
+        argmax #359 uses in place of a substituted rate: the ordering with the
+        term at any bandwidth is the ordering without it.
         """
         compute = [0.9, 1.0, 1.1, 1.05, 0.95]  # five candidates' compute time
-        for bw in (
-            cm.ABSENT_LINK_RANKING_PLACEHOLDER_GBS,
-            cm.ABSENT_LINK_ASSUMED_GBS,
-            0.1,
-            4.32,
-        ):
+        by_compute = sorted(range(5), key=lambda i: compute[i])
+        for bw in (1e-3, 0.1, 4.32, 8.0, 1000.0):
             comm = cm.allreduce_seconds(5120.0 * 62 * 2, 3, bw, 22.4)
             ranked = sorted(range(5), key=lambda i: compute[i] + comm)
-            self.assertEqual(ranked, sorted(range(5), key=lambda i: compute[i]), bw)
+            self.assertEqual(ranked, by_compute, bw)
 
-    def test_a_ratio_is_not_invariant_and_that_is_the_open_risk(self):
-        """The other half of the same guard, stated as a failing property.
+    def test_a_ratio_is_not_invariant_which_is_why_it_is_now_refused(self):
+        """UPDATED DELIBERATELY by #359 (was: "and that is the open risk").
 
-        ``lever_profiles._speed_ratios`` divides two predicted times and
-        compares the result against a move threshold. An additive constant
-        does NOT survive a ratio: at 8.0 GB/s and at 0.1 GB/s the same two
-        candidates produce different ratios on identical measured inputs. The
-        fix is for the ratio consumer to report the absence rather than rank
-        through it; this test pins the size of what is at stake.
+        The arithmetic is unchanged and still the reason: an additive constant
+        does NOT survive a division, so at 8.0 GB/s and at 0.1 GB/s the same
+        two candidates produce different ratios on identical measured inputs,
+        and dropping the term entirely (the compute-only case, ``comm = 0``)
+        produces the largest claim of all. What changed is the consequence --
+        ``lever_profiles._speed_ratios`` now reports the absence instead of
+        ranking through any of them.
         """
         base, cand = 1.0, 0.8
         ratios = []
-        for bw in (cm.ABSENT_LINK_ASSUMED_GBS, 0.1):
+        for bw in (8.0, 0.1):
             comm = cm.allreduce_seconds(5120.0 * 62 * 2, 3, bw, 22.4)
             ratios.append((base + comm) / (cand + comm))
         self.assertNotAlmostEqual(ratios[0], ratios[1], places=3)
         self.assertGreater(ratios[0], ratios[1])  # a smaller comm term = bigger claim
+        # And compute-only, the honest lower bound on the term, overstates the
+        # move by more than either: exactly why it may not settle a threshold.
+        self.assertGreater(base / cand, ratios[0])
 
 
 # ---------------------------------------------------------------------------

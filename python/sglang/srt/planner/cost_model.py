@@ -38,11 +38,11 @@ with the absence's own text rather than handing a caller a plausible float.
 
 **The roofline never ranks a split** (the #216/#264 guard). An analytic peak
 may describe a card; it may not order two candidate placements against each
-other. Where an absent link rate would otherwise stop a ranking dead, the
-library offers exactly one documented, split-invariant placeholder
-(:data:`ABSENT_LINK_RANKING_PLACEHOLDER_GBS`) whose contract is that it adds
-the same constant to every candidate -- and it is a placeholder for the
-*ranking* only; the absolute prediction stays absent.
+other, and neither may a stand-in constant. An absent link rate is not filled
+in: the collective term is simply not priced, the resulting figure is labelled
+compute-only, and it may settle an argmax (the omitted term is split-invariant)
+but never a ratio against a threshold. See
+:data:`ABSENT_LINK_COMPUTE_ONLY_REASON`.
 
 **A hop is between two different cards.** Same-card ("loopback") entries are
 rejected at parse time, in both on-disk pair-matrix shapes, and counted in
@@ -102,8 +102,7 @@ import math
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
-    "ABSENT_LINK_ASSUMED_GBS",
-    "ABSENT_LINK_RANKING_PLACEHOLDER_GBS",
+    "ABSENT_LINK_COMPUTE_ONLY_REASON",
     "AbsentRate",
     "ComputeRates",
     "CostSources",
@@ -118,7 +117,9 @@ __all__ = [
     "compute_rates_for_cards",
     "compute_rates_from_entries",
     "cumulative_boundaries",
+    "gemm_lane_entries",
     "load_cost_sources",
+    "load_pair_matrix",
     "memory_rates_from_entries",
     "pair_matrix_from_card_probe",
     "pair_matrix_from_hardware_profile",
@@ -428,6 +429,75 @@ def compute_rates_for_cards(
     )
 
 
+#: ``uneven_perf.LANE_FP8_NATIVE``, inlined so this module stays stdlib-only at
+#: import time. Pinned against the real constant by the test suite.
+_LANE_FP8_NATIVE = "fp8_native"
+
+
+def gemm_lane_entries(
+    cards: Sequence[Mapping],
+    *,
+    hardware_profile: Optional[Mapping] = None,
+) -> Tuple[List[Dict], List[str]]:
+    """Card-probe cards, widened into the lane-bearing shape #324 resolves on.
+
+    The two artifacts measure different parts of the same question and neither
+    is complete on its own:
+
+    * the CARD PROBE measures dense bf16 (``gemm_bf16_tflops``) and the native
+      fp8 tensor path (``gemm_fp8_tflops``, absent where ``_scaled_mm`` does
+      not compile) -- and nothing else;
+    * the HARDWARE PROFILE carries the v3 ``gemm_lanes`` map: fp8 Marlin, fp8
+      W8A16, int8 native, and the nvfp4 entries as they land.
+
+    So a solver holding only a card probe can price a bf16 or an fp8-native
+    checkpoint and nothing beyond it. This merges the two by UUID and returns
+    entries ``rank_gemm_family_scores`` can resolve.
+
+    Precedence is deliberate: the card probe wins for the lanes it measures,
+    because those are the numbers the K1 solver was fitted and regression-
+    anchored against, and a profile written in a different thermal window must
+    not silently move a pinned prediction. The profile contributes only the
+    lanes the card probe cannot produce. A disagreement on a shared lane
+    beyond 10 % is returned as a note, not resolved.
+    """
+    gpus = (hardware_profile or {}).get("gpus") or {}
+    entries: List[Dict] = []
+    notes: List[str] = []
+    for card in cards:
+        card = dict(card or {})
+        dense = card.get("gemm_bf16_tflops") or card.get("gemm_tflops")
+        profile_entry = gpus.get(str(card.get("uuid") or "")) or {}
+        lanes: Dict[str, float] = {
+            str(k): float(v)
+            for k, v in (profile_entry.get("gemm_lanes") or {}).items()
+            if v
+        }
+        fp8 = card.get("gemm_fp8_tflops")
+        if fp8:
+            probed = float(fp8)
+            held = lanes.get(_LANE_FP8_NATIVE)
+            if held and abs(held - probed) > 0.10 * max(held, probed):
+                notes.append(
+                    f"{card.get('name') or card.get('uuid') or 'card'}: the "
+                    f"card probe measured the native fp8 lane at {probed:.2f} "
+                    f"TFLOP/s and the hardware profile at {held:.2f} "
+                    f"({abs(held - probed) / max(held, probed):.0%} apart). "
+                    "Keeping the card probe's number -- it is the artifact "
+                    "this solver's regression anchors were measured with."
+                )
+            lanes[_LANE_FP8_NATIVE] = probed
+        entry = {
+            "name": card.get("name"),
+            "uuid": card.get("uuid"),
+            "gemm_tflops": float(dense) if dense else None,
+            "gemm_lanes": lanes,
+            "gemm_lane_notes": dict(profile_entry.get("gemm_lane_notes") or {}),
+        }
+        entries.append(entry)
+    return entries, notes
+
+
 #: Memory-side rates the profile and the card probe both carry, with the
 #: field aliases each artifact uses. Order matters: the first field present
 #: wins, matching the pre-existing readers.
@@ -635,9 +705,24 @@ def pair_matrix_from_card_probe(
     hops: Dict[Tuple[str, str], Hop] = {}
     rejected: List[str] = []
     for row in (probe or {}).get("pairs") or []:
+        if (
+            not isinstance(row, Mapping)
+            or not row.get("src_uuid")
+            or not row.get("dst_uuid")
+        ):
+            # A row without both endpoints names no wire. Dropping it with a
+            # bare ``continue`` -- what this reader did before #359 -- turns a
+            # corrupt artifact into a quietly narrower matrix.
+            rejected.append(
+                f"malformed card-probe pair row {row!r}: a hop needs both "
+                "src_uuid and dst_uuid"
+            )
+            continue
         src = key_of_uuid.get(str(row.get("src_uuid")))
         dst = key_of_uuid.get(str(row.get("dst_uuid")))
         if src is None or dst is None:
+            # Not malformed: a measured pair between cards this caller is not
+            # placing on. Out of scope, not an error.
             continue
         if _reject_loopback(src, dst, rejected):
             continue
@@ -701,13 +786,21 @@ def pair_matrix_from_hardware_profile(
     rejected: List[str] = []
     widened = False
     for raw_key, row in links.items():
-        if raw_key == "__group__" or not isinstance(row, Mapping):
+        if raw_key == "__group__":
             continue
         parts = str(raw_key).split("|")
-        if len(parts) != 2:
+        if not isinstance(row, Mapping) or len(parts) != 2:
+            # ``"<uuidA>|<uuidB>"`` is the whole schema of this map. Anything
+            # else is a corrupt or foreign artifact and says so (#359); before
+            # this it was dropped without a word.
+            rejected.append(
+                f"malformed hardware-profile link key {raw_key!r}: expected "
+                "exactly two UUIDs separated by '|' and a mapping value"
+            )
             continue
         a, b = key_of_uuid.get(parts[0]), key_of_uuid.get(parts[1])
         if a is None or b is None:
+            # A measured pair outside this caller's card set. Out of scope.
             continue
         if _reject_loopback(a, b, rejected):
             continue
@@ -803,51 +896,116 @@ def reconcile_pair_matrices(
     )
 
 
+#: Cached card probe, or ``None``. Isolated so the disk read is one import
+#: away from every caller and never a probe as a side effect.
+def _cached_card_probe() -> Optional[Mapping]:
+    try:
+        from sglang.srt.rigmon.card_probe import (  # noqa: PLC0415  (heavy)
+            load_card_probe,
+        )
+
+        profile = load_card_probe()
+    except Exception:
+        return None
+    if profile is None:
+        return None
+    try:
+        return profile.to_json()
+    except Exception:
+        return None
+
+
+def load_pair_matrix(
+    card_keys: Sequence[str],
+    *,
+    card_probe: Optional[Mapping] = None,
+    hardware_profile: Optional[Mapping] = None,
+    uuid_of_key: Optional[Mapping[str, str]] = None,
+    tolerance: float = 0.10,
+    read_disk: bool = True,
+) -> Tuple[PairMatrix, List[str]]:
+    """THE hop-cost boundary: both on-disk shapes in, one matrix out (#359).
+
+    The rig writes its pair costs into two artifacts with two shapes and two
+    probe methods, and before this every consumer picked one, in its own
+    precedence order, and never learned that the other disagreed. This is the
+    single entry point: it reads whichever artifacts exist, prefers the
+    ORDERED card probe (it measures the direction a collective takes, and the
+    reference rig's 4.52 against 6.88 GB/s to the same card is a real
+    asymmetry the unordered shape cannot express), and returns every
+    disagreement beyond ``tolerance`` as a line the caller is expected to
+    surface rather than averaging it away.
+
+    ``read_disk=False`` keeps the call pure for a caller that passes its own
+    artifacts (tests, and any consumer that must not touch the cache).
+    """
+    keys = [str(k) for k in card_keys]
+    if card_probe is None and read_disk:
+        card_probe = _cached_card_probe()
+    if hardware_profile is None and read_disk:
+        from sglang.srt import uneven_perf  # noqa: PLC0415  (heavy: pulls torch)
+
+        try:
+            hardware_profile, _inventory = uneven_perf.get_cached_hardware_profile()
+        except Exception:
+            hardware_profile = None
+
+    matrices: List[PairMatrix] = []
+    if card_probe:
+        matrices.append(
+            pair_matrix_from_card_probe(card_probe, keys, uuid_of_key=uuid_of_key)
+        )
+    if hardware_profile:
+        matrices.append(
+            pair_matrix_from_hardware_profile(
+                hardware_profile, keys, uuid_of_key=uuid_of_key
+            )
+        )
+    if not matrices:
+        return (
+            PairMatrix(hops={}, keys=tuple(keys), source="no artifact on disk"),
+            [],
+        )
+    return reconcile_pair_matrices(*matrices, tolerance=tolerance)
+
+
 # ---------------------------------------------------------------------------
 # Composition primitives
 # ---------------------------------------------------------------------------
 
-#: Stand-in link bandwidth for a RANKING when the pair matrix is absent.
+#: What an absent pair matrix means for a prediction, in one sentence, for
+#: every consumer (#359).
 #:
-#: The #216/#264 guard says the roofline never ranks a split. This constant is
-#: what keeps that true while still letting a ranking run: the collective term
-#: it produces is IDENTICAL for every candidate in one solve -- it depends on
-#: the layer count, the hidden size and the rank count, none of which a
-#: candidate split varies -- so it shifts every candidate's predicted time by
-#: the same additive constant and cannot reorder them.
+#: #348b inherited three different stand-in link rates for the identical
+#: condition "no pair matrix was measured" -- ``1e-3`` GB/s in the key solver,
+#: a ``0.1`` GB/s floor inside ``PerfCostModel._prefill_sharded_time`` and
+#: ``8.0`` GB/s in ``lever_profiles`` and ``apply_auto_performance``. 80x
+#: apart, all three feeding candidate comparisons, and the middle one silently
+#: swallowing the first.
 #:
-#: What it must never do is reach an ABSOLUTE number a reader could take for a
-#: prediction. Callers that report a time (rather than a ratio) check the
-#: matrix for absence first and report absent; this value exists only so a
-#: ratio between two candidates stays computable.
-ABSENT_LINK_RANKING_PLACEHOLDER_GBS: float = 1e-3
-
-#: The OTHER value the fork substitutes for an absent link, and the reason
-#: this module names both instead of quietly picking one.
+#: Unifying them into one number would have hidden the same defect behind a
+#: consistent wrong value, so there is no number any more. The rule is:
 #:
-#: Two code paths answer the same question -- "no pair matrix was measured,
-#: what is the link worth?" -- with numbers 80x apart:
-#:
-#:   * ``0.1`` GB/s, the floor inside ``PerfCostModel._prefill_sharded_time``,
-#:     reached from the key solver's ``1e-3`` above;
-#:   * ``8.0`` GB/s, ``lever_profiles._FALLBACK_LINK_GBS`` and
-#:     ``uneven_perf.apply_auto_performance``, labelled "assumed".
-#:
-#: Both feed a candidate comparison, and they are NOT equally safe under the
-#: #216/#264 guard. The collective term they scale does not depend on the
-#: candidate split -- it is ``n_layers * hidden`` and the rank count -- so it
-#: is an additive constant and cannot reorder an argmax. But it is NOT
-#: invariant for a RATIO: ``lever_profiles._speed_ratios`` divides two
-#: predicted times and compares the result against a move threshold, and a
-#: collective term 80x larger pulls every ratio toward 1.0. At ``8.0`` GB/s a
-#: lever can clear that threshold and at ``0.1`` GB/s the same lever cannot,
-#: on identical measured inputs.
-#:
-#: Unifying the value would change outputs on an unprobed rig, which is a
-#: re-tune and not this refactor. The library therefore names the divergence
-#: rather than averaging it away; the fix is for the ratio consumer to report
-#: the absence instead of ranking through it. See DESIGN_348b §4.
-ABSENT_LINK_ASSUMED_GBS: float = 8.0
+#: * an absent link means the collective term is NOT PRICED. The predicted
+#:   time is then a COMPUTE-ONLY figure and must be labelled as one
+#:   (``PerfCostModel.prefill_time_model(..., min_link_gbs=None)``);
+#: * a compute-only figure MAY settle an argmax. The collective term does not
+#:   depend on the candidate split -- it is ``n_layers * hidden`` and the rank
+#:   count -- so omitting it shifts every candidate by the same constant and
+#:   the ordering is the ordering at any link rate;
+#: * a compute-only figure MAY NOT settle a RATIO compared against a
+#:   threshold. Dropping an additive constant from both sides of a quotient
+#:   changes the quotient, so a move that clears a 1 % noise floor
+#:   compute-only need not clear it once the wire is charged. There the answer
+#:   is the named absence below (the #216/#264 guard: an unmeasured number
+#:   never drives a threshold decision).
+ABSENT_LINK_COMPUTE_ONLY_REASON: str = (
+    "no pair matrix was measured for these cards, so the collective term of "
+    "the prefill step is not priced. A compute-only prediction can order two "
+    "candidates but cannot say whether the difference between them clears a "
+    "move threshold. Run the card probe (POST /api/card_probe) or the rig "
+    "probe to measure the wire."
+)
 
 
 def ring_factor(ranks: int) -> float:
@@ -1230,17 +1388,12 @@ def load_cost_sources(
     compute = compute_rates_for_cards(
         keys, fmt=fmt, family_formats=family_formats, profile=hardware_profile
     )
-    matrices = []
-    if card_probe:
-        matrices.append(
-            pair_matrix_from_card_probe(card_probe, keys, uuid_of_key=uuid_of_key)
-        )
-    matrices.append(
-        pair_matrix_from_hardware_profile(
-            hardware_profile, keys, uuid_of_key=uuid_of_key
-        )
+    links, divergences = load_pair_matrix(
+        keys,
+        card_probe=card_probe,
+        hardware_profile=hardware_profile,
+        uuid_of_key=uuid_of_key,
     )
-    links, divergences = reconcile_pair_matrices(*matrices)
     return CostSources(
         compute=compute,
         links=links,
