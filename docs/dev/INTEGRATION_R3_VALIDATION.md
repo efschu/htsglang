@@ -6804,6 +6804,15 @@ weitere Starts dieses Arms waren reine Argument-Rejects ohne GPU-Belegung
 (`--rank-tp-ratio 1,1` ist der gleichverteilte Split und wird abgelehnt;
 Budget 15500 lag unter den 15,92 GiB Gewichten des ersten Ratio-Versuchs).
 
+**Addendum #283 (2026-07-31, English):** what killed Start 8 is found and
+fixed. `GPTQMarlinMoEScheme.create_weights` allocated `w13_scales` /
+`w2_scales` as a hardcoded `torch.half` instead of `params_dtype`, so the
+checkpoint's float16 scales reached the bfloat16 kernel unconverted. The same
+launch line boots through on the fix (full CUDA graphs, two coherent
+completions, weights 10.97 / 10.69 GiB -- the numbers recorded above), and
+stashing the fix reproduces the same assertion on the same command. The
+vehicle is available for the lane bring-up again.
+
 Damit steht der Arm C so: Schalenklasse gebaut und CPU-gepinnt, Rig-Bringup
 offen, naechstes Vehikel und Vorab-Rechnung in DESIGN_121 §11.20 benannt.
 
