@@ -18249,7 +18249,7 @@ stammen aus `uneven31_b`, dem sauberen Neustart.
    `dcp_size`-mal so viele globale Slots vergibt. Der Leak-Check stimmt jetzt,
    aber die vom Scheduler gemeldete Kontextobergrenze ist damit um `dcp_size`
    zu klein. Kapazitaet, nicht Korrektheit -- und die gewichtete Regel, die
-   Produktionsspur, ist nicht betroffen.
+   Produktionsspur, ist nicht betroffen. (Closed by #346, see that section.)
 2. Die MHA-Pool-Familien ausserhalb CUDA (NPU-Ascend-SWA) bekommen die
    Kopfzahl-Korrektur ueber `_pool_kv_head_num`, aber ihr SWA-Full-Subpool
    kennt die `_swa_hybrid_dcp_lane`-Regel nicht. Auf dieser Kiste nicht
@@ -20736,3 +20736,88 @@ kostet, ist "ein Arm fuer alles" keine Standardeinstellung, sondern eine
 Annahme ueber die Last. Sinnvoll umstellbar wird der Default erst, wenn
 Gewichte zur Laufzeit umziehen koennen — dann ist die richtige Formulierung
 nicht "phasenoptimal als Default", sondern "Armwechsel am Phasenwechsel".
+
+---
+
+## #346 The even-modulo DCP owner rule reported a context ceiling dcp_size too small (`fix/even-modulo-ceiling-346`, base `ae67a2db87`; desk task, no card window)
+
+Open item 1 of the #345 section, closed here.
+
+The two owner rules of the token-sharded lane disagree about what
+`max_total_num_tokens` means, and only one of them was carried through to the
+consumers. Under the WEIGHTED rule it is the global context budget C, which is
+also the allocator's index space. Under the EVEN-MODULO rule
+(`SGLANG_UNEVEN_DCP=1` with `SGLANG_UNEVEN_DCP_WEIGHTED=0`) it is this rank's
+PHYSICAL pool P, while the allocator hands out `P * cp_token_split_factor(dcp_size)`
+global slot ids -- global slot L lives on rank `L % S` at compact row `L // S`.
+Every consumer that compares that field against a request LENGTH needs the
+global span, because a length is a global quantity on every rank.
+
+| site | decides | shipped (P=28640, S=2) | after |
+| --- | --- | --- | --- |
+| `ModelRunner.max_token_pool_size` | `max_req_len` / `max_req_input_len` -- the length at which a request is REFUSED | 28640 | 57280 |
+| `Scheduler.init_req_max_new_tokens` | the generation budget `cap - paged_input_len - page_size - 1` | 0 for a 1500-token input on a 1000-token per-rank pool | 498 |
+
+Both had been fixed for the weightless spill tier alone
+(`_wl_spill_global_capacity`); every other even-modulo deployment kept the
+small number. The second site is also the one whose comment promises to track
+the PrefillAdder budget -- and `rem_total_tokens` counts the ALLOCATOR's
+available slots, i.e. the global space, so the two were tracking different
+quantities rather than the same one.
+
+### Falsifier, against shipped code
+
+`dcp_size` 2/3/4 with `--rank-tp-ratio` `[3,1]` / `[4,2,1]` / `[5,3,2,1]`, no
+token vector:
+
+```
+ceiling  28640 != 57280 / 85920 / 114560     (per-rank pool reported as the span)
+budget       0 != 498 / 1498 / 2498          (1500-token input, 1000-token per-rank pool)
+```
+
+### Capacity, not correctness -- verified
+
+The reclaimed window is the global slot range `(P, P*S]`. Every id in it
+compacts to a row in `(P // S, P]`, all inside the pool's `size + page_size`
+rows and therefore inside `kv_store_bound(size + page_size, ...)`, the #352/#355
+bound every KV writer takes. The walk (all three geometries, real
+`kv_store_bound` on a CPU tensor) also confirms the window covers every owner
+rank. Nothing about the allocation moves: `_dcp_token_sharded_pool_rows`
+returns P unchanged under this rule and `max_total_num_tokens` is not touched,
+so the fix widens a REPORT onto an index space that already exists. Both
+statements are pinned by tests, so a later change cannot turn the widened
+report into a widened allocation.
+
+Reclaim at a given geometry is `(S-1) * P`. The only even-modulo boot on
+record is #345's TP=2 arm at P=28640, i.e. +28640 tokens; the same pool at
+dcp_size=3 reclaims +57280.
+
+### Fix
+
+`dcp_global_context_slots(per_rank_pool_tokens, dcp_size)` in
+`layers/dcp/owner.py` resolves the rule ONCE, next to `dcp_accounting_total_slots`
+(#345, the same defect in the leak check). Callers: `max_token_pool_size` and a
+`Scheduler._global_kv_capacity_tokens()` helper feeding
+`init_req_max_new_tokens`, the kv-pressure `capacity_tokens`, the admission
+limiter's `replicated_pool_usage` denominator (all three weigh GLOBAL held
+tokens or lengths) and the PD `DecodePreallocQueue` length check. Identity
+under the weighted rule, off DCP, and on stock even DCP.
+
+### Not fixed here
+
+* Stock even DCP (no `--rank-tp-ratio`) has the same shape -- its allocator is
+  `max_total * dcp_size` too -- and `Scheduler._pool_stats_dcp_factor` already
+  treats it that way for utilization stats. The ceiling is left alone there: a
+  utilization percentage that reads dcp_size too high is a wrong log line,
+  while a raised ceiling is a behaviour change on an upstream path this fork
+  does not exercise.
+* Unifying the two rules (making the even-modulo lane report C and size its
+  pool through `dcp_compact_pool_rows`, exactly as the weighted rule does)
+  would remove the class instead of the instances. It changes the ALLOCATION
+  shape at eight pool-construction sites and cannot be validated without a
+  card window.
+
+### Tests
+
+CPU, hermetic, `test/registered/unit/distributed/test_dcp_context_ceiling.py`,
+17 cases / 21 subtests, `CUDA_VISIBLE_DEVICES=""`.

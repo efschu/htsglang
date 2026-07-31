@@ -2995,11 +2995,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # _init_pools). Only set on the spill lane; None/absent everywhere else.
         _wl_global = getattr(self, "_wl_spill_global_capacity", 0)
         if _wl_global:
+            # Already the global span (per-rank pool x dcp_size), computed in
+            # _init_pools; do not apply the lane factor a second time.
             return _wl_global
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            pool_tokens = (
+                self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            )
         else:
-            return self.max_total_num_tokens
+            pool_tokens = self.max_total_num_tokens
+        # #346: this number becomes max_req_len, i.e. the length at which a
+        # request is REFUSED, and a request length is a GLOBAL token count.
+        # Under the even-modulo owner rule max_total_num_tokens is only this
+        # rank's shard of that span, so the ceiling came out dcp_size too
+        # small and the group turned away context its pool could hold. The
+        # weighted rule and every non-lane path are the identity here.
+        from sglang.srt.layers.dcp.owner import dcp_global_context_slots
+
+        return dcp_global_context_slots(pool_tokens, self.dcp_size)
 
     @property
     def kimi_linear_config(self):

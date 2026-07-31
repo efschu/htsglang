@@ -1483,7 +1483,10 @@ class Scheduler(
                 dp_size=self.server_args.dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                max_total_num_tokens=self.max_total_num_tokens,
+                # Used for _check_if_req_exceed_kv_capacity, which compares a
+                # request LENGTH against it -- the global span, same as the
+                # prefill queue reads off max_token_pool_size (#346).
+                max_total_num_tokens=self._global_kv_capacity_tokens(),
                 pp_rank=self.ps.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
@@ -2201,6 +2204,39 @@ class Scheduler(
             return 1
         return self.server_args.dcp_size
 
+    def _global_kv_capacity_tokens(self) -> int:
+        """This group's KV capacity as a GLOBAL token count (#346).
+
+        Every scheduler-side comparison against a request's length needs this
+        number, because a length is global on every rank while
+        ``max_total_num_tokens`` is only global under the WEIGHTED owner rule;
+        under the even-modulo rule it is this rank's physical shard and the
+        allocator carries ``x cp_token_split_factor(dcp_size)`` slot ids.
+        ``dcp_global_context_slots`` states that rule once for the runner-side
+        ceiling (``max_token_pool_size``) and for here.
+
+        The weightless spill lane pre-computes its own global span in
+        ``_init_pools`` (device + host tiers, already multiplied); it wins,
+        exactly as it does in ``max_token_pool_size``.
+
+        Rank-uniform: ``max_total_num_tokens`` is min-reduced and the split
+        factor is group-wide, so no collective and no divergent verdicts.
+        Read live rather than cached at init, because the #330 VRAM dial
+        raises ``max_total_num_tokens`` in place while the server runs.
+        """
+        wl_global = getattr(
+            getattr(getattr(self, "tp_worker", None), "model_runner", None),
+            "_wl_spill_global_capacity",
+            0,
+        )
+        if wl_global:
+            return int(wl_global)
+        from sglang.srt.layers.dcp.owner import dcp_global_context_slots
+
+        return dcp_global_context_slots(
+            self.max_total_num_tokens, getattr(self.server_args, "dcp_size", 1)
+        )
+
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
@@ -2386,21 +2422,20 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
-        # Weightless-KV host spill (B2): input_len is a GLOBAL token count, but
-        # a DCP-token-sharded sequence only consumes input_len // dcp_size slots
-        # PER RANK, and the allocator index space is the GLOBAL capacity
-        # (per-rank pool x dcp_size). Using the per-rank pool here would clamp
-        # the generation budget to 0 whenever the GLOBAL input exceeds the
-        # per-rank pool (e.g. an over-VRAM 259k sequence on a 104k per-rank
-        # pool) even though it fits globally. Compare against the GLOBAL
-        # capacity so the tiered pool's full span is usable. Spill lane only;
-        # None/absent -> the per-rank max_total, byte-identical elsewhere.
-        _wl_global = getattr(
-            getattr(self.tp_worker, "model_runner", None),
-            "_wl_spill_global_capacity",
-            0,
-        )
-        _pool_cap = _wl_global if _wl_global else self.max_total_num_tokens
+        # input_len is a GLOBAL token count, but a DCP-token-sharded sequence
+        # only consumes input_len // S slots PER RANK while the allocator
+        # index space is the GLOBAL capacity. Subtracting a global length from
+        # the per-rank pool clamps the generation budget to 0 for every input
+        # above that pool even though it fits the group (an over-VRAM 259k
+        # sequence on a 104k per-rank pool; #346 for the general even-modulo
+        # lane, previously handled for the weightless spill tier alone).
+        # It is also what keeps this bound consistent with the PrefillAdder
+        # budget it is documented to track: `rem_total_tokens` counts the
+        # ALLOCATOR's available slots, i.e. the global space, so the per-rank
+        # number was the tighter of two different quantities rather than the
+        # same one. Off the lane and under the weighted rule this is the same
+        # number as before, byte-identical.
+        _pool_cap = self._global_kv_capacity_tokens()
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -3282,7 +3317,10 @@ class Scheduler(
                     held_tokens=sum(
                         req.seqlen for req in running_batch.reqs
                     ),
-                    capacity_tokens=self.max_total_num_tokens,
+                    # held_tokens are GLOBAL sequence lengths, so the capacity
+                    # they are weighed against has to be the global span too
+                    # (#346). Identity off the token-sharded lane.
+                    capacity_tokens=self._global_kv_capacity_tokens(),
                     running_bs=running_batch.batch_size(),
                     phase="decode" if decode_active else "prefill",
                 )
@@ -3848,7 +3886,12 @@ class Scheduler(
             self.admission_limiter.observe(
                 replicated_pool_usage(
                     sum(req.seqlen for req in batch.reqs),
-                    self.max_total_num_tokens,
+                    # Both sides GLOBAL: seqlen is a global length, so the
+                    # denominator is the global span, not this rank's shard
+                    # of it (#346). Still replicated -- the span is the
+                    # min-reduced capacity times a group-wide factor -- so the
+                    # no-collective argument above is unaffected.
+                    self._global_kv_capacity_tokens(),
                 ),
                 batch.batch_size(),
             )

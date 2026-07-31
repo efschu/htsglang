@@ -40,6 +40,7 @@ __all__ = [
     "build_dcp_weighted_kv_indices",
     "dcp_accounting_total_slots",
     "dcp_compact_pool_rows",
+    "dcp_global_context_slots",
     "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
     "dcp_verify_paged_lens",
@@ -145,6 +146,66 @@ def dcp_accounting_total_slots(
     if not token_sharded_dcp or allocator_size is None:
         return int(max_total_num_tokens)
     return int(allocator_size)
+
+
+def dcp_global_context_slots(
+    per_rank_pool_tokens: int,
+    dcp_size: Optional[int],
+) -> int:
+    """The GLOBAL token span this DCP group can hold, from a rank's pool size.
+
+    This is the counterpart of :func:`dcp_accounting_total_slots` for the
+    consumers that decide how much CONTEXT a request may have -- the ceiling
+    behind ``max_req_len`` / ``max_req_input_len`` and the generation budget
+    ``Scheduler.init_req_max_new_tokens`` subtracts the input length from.
+    Both compare against GLOBAL token counts (a request's length is a global
+    quantity on every rank), so they need the global span, not this rank's
+    physical pool. The two rules of the token-sharded lane differ in whether
+    those are the same number:
+
+    * WEIGHTED (a token vector is installed): ``max_total_num_tokens`` is
+      ALREADY the global context budget C -- the allocator index space is C
+      and each rank stores its ``ratio_r / S`` share. Identity.
+    * EVEN-MODULO (``SGLANG_UNEVEN_DCP=1`` with ``SGLANG_UNEVEN_DCP_WEIGHTED=0``):
+      ``max_total_num_tokens`` is this rank's PHYSICAL pool P and the
+      allocator hands out ``P * cp_token_split_factor(dcp_size)`` global slot
+      ids -- global slot L lives on rank ``L % S`` at compact row ``L // S``,
+      so the span is P x S and a consumer reading P as a global count refuses
+      context the group can hold (#346). The reclaimed window ``(P, P*S]``
+      compacts to rows ``(P // S, P]``, all inside the pool's
+      ``size + page_size`` rows and therefore inside the #352/#355
+      ``kv_store_bound`` -- this widens a REPORT, never a bound.
+
+    Off the lane, and on stock even DCP (no ``--rank-tp-ratio`` head plan),
+    this is the identity: stock DCP's ceiling is upstream's to define and its
+    allocator geometry (inflated page size) is not this fork's. That is a
+    deliberate difference from ``Scheduler._pool_stats_dcp_factor``, which
+    scales stock even DCP as well -- a utilization PERCENTAGE that comes out
+    dcp_size too high is a wrong log line, while a raised ceiling is a
+    behaviour change on a path this fork does not exercise. The two agree
+    wherever this fork's lane is active.
+
+    Resolving the lane HERE rather than at each caller is deliberate. #345
+    (leak check), #352 (store bound) and this task are three instances of the
+    same defect -- one consumer reading a per-rank number as a global one --
+    and a second copy of the rule is how the fourth one happens.
+    """
+    from sglang.srt.distributed.utils import (
+        cp_token_split_factor,
+        uneven_dcp_active,
+        uneven_dcp_kv_replicated,
+        weightless_kv_active,
+    )
+
+    tokens = int(per_rank_pool_tokens)
+    size = int(dcp_size or 1)
+    if size <= 1:
+        return tokens
+    if not (uneven_dcp_kv_replicated(size) or weightless_kv_active()):
+        return tokens
+    if uneven_dcp_active(size):
+        return tokens
+    return tokens * cp_token_split_factor(size)
 
 
 def swa_hybrid_dcp_lane(
