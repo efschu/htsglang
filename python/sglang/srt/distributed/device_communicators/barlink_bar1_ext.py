@@ -70,6 +70,105 @@ from sglang.srt.distributed.device_communicators import (
 
 logger = logging.getLogger(__name__)
 
+#: Set to 0 to go back to "every rank calls load_inline at once and torch's
+#: FileBaton sorts them out". Kept as an escape hatch, not as a supported
+#: mode: see :func:`build_once_per_group` for what that costs.
+ENV_GROUPED_BUILD = "SGLANG_BARLINK_GROUPED_JIT_BUILD"
+
+
+def _grouped_build_enabled() -> bool:
+    return os.environ.get(ENV_GROUPED_BUILD, "1") not in ("0", "no", "off", "false")
+
+
+def build_once_per_group(cpu_group, name: str, build):
+    """Run ``build`` on ONE rank of ``cpu_group``, then let the rest load.
+
+    WHY THIS EXISTS -- the failure it removes
+    -----------------------------------------
+    Every rank used to call ``load_inline`` at the same moment, on the same
+    build directory. torch serialises that with a ``FileBaton``: one rank
+    creates ``lock`` and compiles, the others sit in ``FileBaton.wait()``.
+    A builder killed before ``release()`` leaves ``lock`` behind and every
+    later process waits on it.
+
+    ``baton_health`` already bounds that wait, but under CO-LOCATION its two
+    fast rules cannot fire, and that is exactly the case here:
+
+    * rule 2 wants the sources registered, and ``load_inline`` has none
+      outside the build directory to register;
+    * rule 3 wants the directory to stop changing, and it cannot -- every
+      waiting rank rewrites ``main.cpp`` into that same directory before
+      ``_jit_compile`` runs.
+
+    What is left is rule 4, the 30-minute backstop. Half an hour of silence
+    is a hang as far as anyone watching is concerned; task #366 killed such a
+    run after 3.5 minutes and reported it as one.
+
+    The fix is to stop racing. One rank builds; the others do not touch the
+    build directory until it is finished, so they meet a warm cache and
+    torch's baton never has two claimants. The wait is a bounded group
+    collective with a peer census behind it, so a builder that DIES ends the
+    others' wait with a named error instead of a 30-minute silence -- which
+    is the whole point of task #312's family, applied to the one blocking
+    site that still went through third-party code.
+
+    The verdict is exchanged before anyone acts on it. A builder that raises
+    must not leave the others waiting on a barrier it will never reach, and
+    a rank that skipped the build must not go on to load an artifact that was
+    never produced -- so both outcomes travel through the same
+    ``all_gather_object`` and every rank ends the same way.
+    """
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.device_communicators.barlink_liveness import (
+        bounded_barrier,
+    )
+
+    if cpu_group is None or not _grouped_build_enabled():
+        return build()
+
+    try:
+        rank = dist.get_rank(cpu_group)
+        world = dist.get_world_size(cpu_group)
+    except Exception:
+        # No usable group: the single-process path is the honest fallback.
+        return build()
+    if world <= 1:
+        return build()
+
+    builder = 0
+    result = None
+    failure = ""
+    if rank == builder:
+        try:
+            result = build()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised group-wide below
+            failure = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "barlink-BAR1: rank %d failed to build %r: %s. Telling the "
+                "group before anyone waits on an artifact that will not "
+                "appear.", rank, name, failure,
+            )
+    # Everyone arrives here, builder included, whether it succeeded or not.
+    bounded_barrier(cpu_group, f"barlink JIT build of {name!r}")
+    verdicts: list = [None] * world
+    dist.all_gather_object(verdicts, failure, group=cpu_group)
+    bad = [(i, v) for i, v in enumerate(verdicts) if v]
+    if bad:
+        raise RuntimeError(
+            f"barlink-BAR1: the JIT build of {name!r} failed on "
+            + "; ".join(f"rank {i}: {v}" for i, v in bad)
+            + f". Every rank of this group stops here, because a rank that "
+            f"went on would load an extension the others do not have. Set "
+            f"{ENV_GROUPED_BUILD}=0 to go back to one concurrent build per "
+            f"rank (which turns this named failure back into a wait)."
+        )
+    if rank == builder:
+        return result
+    # Warm cache: torch still runs its own no-op ninja pass here, but it is
+    # the only claimant of the baton by construction.
+    return build()
+
 _ext = None
 _dmabuf_ext = None
 _dmabuf_reason = ""
@@ -1670,16 +1769,23 @@ def load_collective_ext(cpu_group):
     if arches:
         name += "_" + "_".join(a.replace(".", "") for a in arches)
     t0 = time.time()
-    with _ext_cache_guarded(name) as build_dir:
-        _ext = load_inline(
-            name=name,
-            cpp_sources=_CPP_SRC,
-            cuda_sources=_CUDA_SRC,
-            functions=["bar1_all_reduce", "bar1_all_to_all"],
-            extra_cuda_cflags=flags or None,
-            verbose=False,
-            build_directory=str(build_dir) if build_dir is not None else None,
-        )
+
+    def _build():
+        with _ext_cache_guarded(name) as build_dir:
+            return load_inline(
+                name=name,
+                cpp_sources=_CPP_SRC,
+                cuda_sources=_CUDA_SRC,
+                functions=["bar1_all_reduce", "bar1_all_to_all"],
+                extra_cuda_cflags=flags or None,
+                verbose=False,
+                build_directory=str(build_dir) if build_dir is not None else None,
+            )
+
+    # One builder per group. Concurrent load_inline calls on one build
+    # directory are what turns a killed build into a 30-minute wait; see
+    # build_once_per_group.
+    _ext = build_once_per_group(cpu_group, name, _build)
     logger.info(
         "barlink-BAR1: collective extension %r built for arches %s in %.1f s.",
         name, ",".join(arches) or "<torch default>", time.time() - t0,

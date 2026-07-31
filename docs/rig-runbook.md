@@ -1606,6 +1606,42 @@ that is the user's decision. So this recipe runs on the **Proxmox host**
 apparmor=unconfined -v /sys:/sys`; without the AppArmor exception you get
 `EACCES` as root on a root-owned file.
 
+#### And why it does not run on the host either, today (#369)
+
+The transport needs a JIT CUDA extension (`barlink_bar1_ext`, plus
+`barlink_bar1_dmabuf_ext`). Measured on 2026-08-01, both halves of the split
+fail:
+
+* **The host cannot build it.** Host `g++` is 12.4 and the container's headers
+  are 13.3; compiling against the container tree with the host compiler dies in
+  `/usr/include/c++/12/ext/concurrence.h`. Running the container's own
+  `g++` 13.3 on the host (it executes natively, same trick as the venv shim)
+  gets past that and then dies in the container `pthread.h` reached through
+  `CPATH`. `nvcc` was never even reached.
+* **A container-built cache is not reusable there.** `ninja -d explain` in the
+  shared cache says `command line changed for main.o` and then lists every
+  container system header as dirty: the recorded dependency paths are
+  container-absolute (`/usr/include/c++/13/...`) and resolve on the host to the
+  host's gcc 12 tree. Deleting `.ninja_log`/`.ninja_deps` does not help —
+  ninja then reports `deps for 'main.o' are missing` and rebuilds anyway. torch
+  re-runs ninja on every fresh process regardless, because its version
+  bookkeeping is process-local.
+
+So `benchmark/bar1_graph_check.py` cannot currently pass anywhere on this rig:
+the container has the compiler but not the device node, the host has the device
+node but not a usable compiler. **`SGLANG_BARLINK_GRAPH_ENABLE` therefore stays
+unset** — see 6.3; the switch may only be set after that proof passes, and it
+has not.
+
+The unblock is one of:
+
+1. give CT999 the device node — `lxc.cgroup2.devices.allow: c 10:267 rwm` plus
+   a bind mount of `/dev/dmabuf_holder` in `/etc/pve/lxc/999.conf`, then a
+   container restart (kills every running agent, so it is the user's call), or
+2. install a matching toolchain on the host, or
+3. run the check in the Docker image on the host, which already carries both
+   the device node and a self-consistent toolchain (flags above).
+
 #### Preconditions
 
 1. Patched driver with the registry key `RMSmallBarP2PPeerBar1=1`
