@@ -182,6 +182,37 @@ def _umgebungs_flagge(name: str, vorgabe: str = "1") -> bool:
 # Verfuegbarkeit
 # ---------------------------------------------------------------------------
 
+#: The transport methods this dispatcher calls, probed by name before the
+#: first call. The names are the ones ``BarlinkBar1Transport`` publishes
+#: (``barlink_bar1.py``) -- and they are ONLY here as strings, which is what
+#: makes them dangerous: a ``hasattr`` probe survives every rename tool and
+#: every import check, so a stale spelling here closes the gate silently and
+#: forever. Task #295 renamed ``traegt_a2a``/``a2a_schlitz_bytes`` to
+#: ``supports_a2a``/``a2a_slot_bytes``, this probe was not renamed with them,
+#: and the BAR1 EP dispatch was unreachable until task #361.
+#: ``test_bar1ep_transport_gate.py`` pins every name against the real class.
+TRANSPORT_A2A_ATTRS = ("barlink_all_to_all_single", "supports_a2a", "a2a_slot_bytes")
+
+#: Decline reasons already announced in this process. The gate is asked once
+#: per MoE layer and once per dispatcher, so an unconditional log line would
+#: repeat dozens of times per boot; a set keeps it loud without being noise.
+_DECLINE_ANNOUNCED: set = set()
+
+
+def _declined(reason: str):
+    """Announce a closed gate exactly once, then return ``(None, reason)``.
+
+    A gate that declines without a word is how this path died: the condition
+    was false on every rank, and nothing in the log said so. The caller that
+    asked for ``bar1ep`` explicitly still gets an exception carrying the same
+    text (``create_moe_dispatcher``); this line is for the boot where the
+    reason would otherwise only exist as a return value nobody prints.
+    """
+    if reason not in _DECLINE_ANNOUNCED:
+        _DECLINE_ANNOUNCED.add(reason)
+        logger.warning("bar1ep: BAR1 dispatch path not available -- %s", reason)
+    return None, reason
+
 
 def bar1ep_transport(gruppe_koordinator=None):
     """Der BAR1-Transport dieser Gruppe, oder ``(None, Grund)``.
@@ -192,6 +223,8 @@ def bar1ep_transport(gruppe_koordinator=None):
     rangeinheitlichen Groessen). Zwei Raenge duerfen hier nie verschieden
     antworten -- der eine liefe ins Kollektiv, der andere nicht, und daraus
     wuerde ein Haenger statt eines Fehlers.
+
+    Jede Ablehnung geht durch ``_declined`` und steht damit im Protokoll.
     """
     if gruppe_koordinator is None:
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -200,32 +233,30 @@ def bar1ep_transport(gruppe_koordinator=None):
 
     comm = getattr(gruppe_koordinator, "barlink_comm", None)
     if comm is None:
-        return None, (
+        return _declined(
             "barlink ist nicht aktiv (SGLANG_BARLINK=0 oder world_size==1). Der "
             "BAR1-Direktpfad haengt am BarlinkCommunicator; ohne ihn gibt es "
             "weder Peer-Zeiger-Tabelle noch Schlitze."
         )
     if getattr(comm, "disabled", False):
-        return None, "BarlinkCommunicator ist abgeschaltet (world_size == 1)."
+        return _declined(
+            "BarlinkCommunicator ist abgeschaltet (world_size == 1)."
+        )
     t = getattr(comm, "transport", None)
     if t is None:
-        return None, (
+        return _declined(
             "barlink laeuft auf der gloo-Ebene -- kein Transport. "
             "SGLANG_BARLINK_TRANSPORT=bar1 oder =matrix waehlt den Direktpfad."
         )
-    fehlend = [
-        n
-        for n in ("barlink_all_to_all_single", "traegt_a2a", "a2a_schlitz_bytes")
-        if not hasattr(t, n)
-    ]
+    fehlend = [n for n in TRANSPORT_A2A_ATTRS if not hasattr(t, n)]
     if fehlend:
-        return None, (
+        return _declined(
             f"Transport {type(t).__name__} hat kein all_to_all "
             f"({', '.join(fehlend)} fehlt). Das ist kein BAR1-Transport."
         )
-    schlitz = int(t.a2a_schlitz_bytes())
+    schlitz = int(t.a2a_slot_bytes())
     if schlitz <= 0:
-        return None, (
+        return _declined(
             "Der BAR1-Transport steht, aber sein a2a-Byte-Beleg ist nicht "
             "bestanden (oder SGLANG_BARLINK_BAR1_A2A=0). Ohne bestandenen Beleg "
             "meldet sich all_to_all ab -- siehe barlink_bar1.byte_proof_a2a."
@@ -370,7 +401,7 @@ class Bar1EPDispatcher(BaseDispatcher):
 
         self.quant_config: Optional[dict] = None
         self.use_fp8 = False
-        self._schlitz = int(self.transport.a2a_schlitz_bytes())
+        self._schlitz = int(self.transport.a2a_slot_bytes())
         self._setze_ausgabetyp()
 
         # Zustand zwischen dispatch und combine.
@@ -447,7 +478,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         meldet sich der Dispatcher ab, statt spaeter im heissen Pfad zu
         scheitern.
         """
-        self._schlitz = int(self.transport.a2a_schlitz_bytes())
+        self._schlitz = int(self.transport.a2a_slot_bytes())
         for name, zb in (
             ("Nutzlast", self._nutz_zeilenbytes()),
             ("Metadaten", self._meta_zeilenbytes()),
@@ -531,7 +562,7 @@ class Bar1EPDispatcher(BaseDispatcher):
                 e_off.append((e_basis[j] + a) * zeilenbytes)
                 e_len.append((b - a) * zeilenbytes)
             groesster = max(s_len + e_len)
-            if not self.transport.traegt_a2a(groesster):
+            if not self.transport.supports_a2a(groesster):
                 raise Bar1EPUnverfuegbar(
                     f"Runde {k}: groesster Block {groesster} Byte passt nicht "
                     f"in den Schlitz von {self._schlitz} Byte. Die "
@@ -831,9 +862,9 @@ class Bar1EPDispatcher(BaseDispatcher):
     # -- Byte-Beleg --------------------------------------------------------
 
     def _selbsttest_wenn_noetig(self) -> None:
-        if not _umgebungs_flagge("SGLANG_BAR1EP_SELBSTTEST", "1"):
+        if not _umgebungs_flagge("SGLANG_BAR1EP_SELFTEST", "1"):
             logger.warning(
-                "bar1ep: Byte-Beleg per SGLANG_BAR1EP_SELBSTTEST=0 "
+                "bar1ep: Byte-Beleg per SGLANG_BAR1EP_SELFTEST=0 "
                 "uebersprungen. Damit steht hinter jeder Zahl dieses Laufs "
                 "keine Aussage darueber, ob die Bytes ankommen."
             )
