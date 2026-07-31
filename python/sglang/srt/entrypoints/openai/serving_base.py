@@ -213,7 +213,13 @@ class OpenAIServingBase(ABC):
         status_code: int = 400,
         param: Optional[str] = None,
     ) -> ORJSONResponse:
-        """Create an error response"""
+        """Create an error response in OpenAI's envelope shape.
+
+        ``{"error": {message, type, param, code}}`` -- see
+        :mod:`sglang.srt.entrypoints.openai.errors`. Handlers keep passing the
+        flat arguments; the envelope is applied in one place so no endpoint can
+        drift out of it.
+        """
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
@@ -222,7 +228,9 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        return ORJSONResponse(
+            content=error.to_openai_envelope(), status_code=status_code
+        )
 
     def create_streaming_error_response(
         self,
@@ -238,7 +246,7 @@ class OpenAIServingBase(ABC):
             param=None,
             code=status_code,
         )
-        return json.dumps({"error": error.model_dump()})
+        return json.dumps(error.to_openai_envelope())
 
     def extract_custom_labels(self, raw_request):
         if (

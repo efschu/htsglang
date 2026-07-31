@@ -2630,3 +2630,79 @@ of dead time). Both were observed; neither is acceptable latency.
 - **After any bounded poll: act or report.** Never loop inside a single call.
   The watchdog stays a janitor (stale locks, orphans); it is explicitly not the
   scheduler.
+
+## 9. The OpenAI-compatible surface as a client endpoint (#335-M0)
+
+Any tool that speaks the OpenAI protocol can point its base URL at a booted
+`sglang.launch_server` and work unchanged — that is the standing rule that
+every feature exposes its domain's de-facto standard protocol, applied to
+inference. The fork's own frontend is one client of this surface, not a
+privileged one.
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:30000/v1
+export OPENAI_API_KEY=unused          # any non-empty string unless --api-key is set
+
+python3 - <<'PY'
+import openai
+c = openai.OpenAI()
+print([m.id for m in c.models.list()])
+print(c.chat.completions.create(
+    model="Qwen3.6-27B",
+    messages=[{"role": "user", "content": "one word"}],
+).choices[0].message.content)
+PY
+```
+
+**Endpoints and where each one is served.**
+
+| Endpoint | Served by |
+|---|---|
+| `/v1/chat/completions`, `/v1/completions` | this process, the loaded model |
+| `/v1/embeddings` | this process (`--is-embedding` model); `encoding_format` `float` and `base64` both honored |
+| `/v1/models`, `/v1/models/{id}` | this process, plus every engine the registry knows (see below) |
+| `/v1/audio/transcriptions` | this process, only when an ASR model is loaded — a text LLM is refused with a 400 naming its architecture, instead of transcribing nonsense through the Whisper fallback |
+| `/v1/images/generations`, `/v1/images/edits` | forwarded to a `multimodal_gen` server, see `SGLANG_IMAGE_GEN_URL` |
+| `/v1/images/variations` | no lane implements it: 501 with `code: endpoint_not_implemented` |
+| `/v1/audio/speech` | forwarded to `SGLANG_SPEECH_URL`; nothing in this tree serves TTS yet (#333 M5), so unset means a 404 naming the missing capability |
+| `/v1/responses`, `/v1/rerank`, `/v1/score`, `/v1/classify`, `/v1/tokenize` | this process |
+| `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | the Ollama emulation, same lanes |
+| `/v1/messages` | the Anthropic emulation, same lanes |
+| `/v1/files`, `/v1/fine_tuning/*` | **not served.** The fine-tuning surface belongs to #341 and is deliberately not stubbed: a 404 from an endpoint that does not exist is a better answer than a job id that never runs |
+
+**Additional environment variables.**
+
+| Variable | Set to | Why, and what happens without it |
+|---|---|---|
+| `SGLANG_REGISTRY_URL` | `http://127.0.0.1:8500` (the default) | where `/v1/models` reads the engine registry (#305-M1). Set it to the empty string to disable the lookup outright on a single-model deployment; an unreachable registry is not an error either way, the listing just falls back to the locally served model. Same variable the planner dashboard uses |
+| `SGLANG_IMAGE_GEN_URL` | base URL of a running `multimodal_gen` server | without it `/v1/images/*` answers 404 `model_not_found` with an `x-htsglang` block naming the registered diffusion engines and the two steps that would make the request work. No port is guessed: the diffusion service is optional and started separately |
+| `SGLANG_SPEECH_URL` | base URL of a server exposing `POST /v1/audio/speech` | nothing in-tree serves it; unset is the normal state and produces the honest rejection above |
+
+**Extensions are namespaced.** Everything the fork adds beyond the spec rides
+in one `x-htsglang` object — on a model card, and inside the `error` object of
+a rejection. A vanilla client sees one unknown key and ignores it. On
+`/v1/models` that block carries the residency the registry reports
+(`HOT`/`WARM_GPU`/`WARM_HOST`/`COLD`), the cards, the reserved MiB and, once
+observed, the measured promotion cost in ms:
+
+```bash
+curl -s http://127.0.0.1:30000/v1/models |
+  python3 -c 'import json,sys
+for card in json.load(sys.stdin)["data"]:
+    x = card.get("x-htsglang") or {}
+    print(card["id"].ljust(28), x.get("residency","?").ljust(10),
+          str(x.get("reserved_mib","-")).rjust(7), "MiB", x.get("cards",""))'
+```
+
+A `COLD` engine is listed on purpose. It is a model this deployment can serve;
+that it holds no device memory right now is a fact the client should see, not
+a reason to hide the entry and then answer `model_not_found` for something
+that is registered.
+
+**Errors are the OpenAI envelope, everywhere.** `{"error": {message, type,
+param, code}}`, with the status code that matches. This replaced a flat body
+(`{"object": "error", "message": ...}`) that no SDK parses — see
+`docs/dev/INTEGRATION_R3_VALIDATION.md`, section #335-M0. Rejections keep
+their status distinct on purpose, because the three cases are three different
+client situations: `404` the model is not served here, `503` a configured lane
+is down (retryable), `501` no lane implements the endpoint.

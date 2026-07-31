@@ -2,6 +2,7 @@
 #   from ...transcription_adapters import TranscriptionAdapter, register_transcription_adapter
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa: F401
     TranscriptionAdapter,
+    matched_adapter_key,
     register_transcription_adapter,
     resolve_adapter,
 )
@@ -19,6 +20,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (  # no
 
 __all__ = [
     "TranscriptionAdapter",
+    "matched_adapter_key",
     "register_transcription_adapter",
     "resolve_adapter",
     "WhisperAdapter",

@@ -66,7 +66,21 @@ DEFAULT_MODEL_NAME = "default"
 
 
 class ModelCard(BaseModel):
-    """Model cards."""
+    """Model cards.
+
+    ``id``/``object``/``created``/``owned_by`` are the spec's four fields.
+    ``root``/``parent``/``max_model_len`` predate this model and are the
+    de-facto extras that vLLM emits too, so clients already tolerate them and
+    removing them would break readers for no gain.
+
+    Everything the fork adds beyond that rides in one namespaced ``x-htsglang``
+    object -- residency, cards, measured promotion cost. A vanilla client sees
+    an ordinary model card with one unknown key and ignores it; a fork-aware
+    client gets the honest answer to "is this model actually on a GPU right
+    now" without a second request.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     id: str
     object: str = "model"
@@ -75,6 +89,7 @@ class ModelCard(BaseModel):
     root: Optional[str] = None
     parent: Optional[str] = None
     max_model_len: Optional[int] = None
+    htsglang: Optional[Dict[str, Any]] = Field(default=None, alias="x-htsglang")
 
 
 class ModelList(BaseModel):
@@ -85,11 +100,35 @@ class ModelList(BaseModel):
 
 
 class ErrorResponse(BaseModel):
+    """The error payload, flat.
+
+    Kept flat because handlers construct it that way all over the tree; it is
+    serialized into OpenAI's ``{"error": {...}}`` envelope by
+    :meth:`to_openai_envelope`, which is what every wire path uses. Nothing
+    should emit ``model_dump()`` of this model directly onto the wire.
+    """
+
     object: str = "error"
     message: str
     type: str
     param: Optional[str] = None
     code: int
+
+    def to_openai_envelope(self) -> Dict[str, Any]:
+        """Wire shape: the four spec fields nested under ``error``.
+
+        ``object`` is dropped: OpenAI error bodies carry no ``object``
+        discriminator, and clients that look for one are looking at the
+        envelope key instead.
+        """
+        return {
+            "error": {
+                "message": self.message,
+                "type": self.type,
+                "param": self.param,
+                "code": self.code,
+            }
+        }
 
 
 @runtime_checkable
@@ -193,13 +232,52 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Spec-shaped breakdown of completion tokens.
+
+    OpenAI carries the reasoning-token count here, not at the top of ``usage``.
+    Clients that read reasoning cost -- cost dashboards, the SDK's own typed
+    model -- look in this object and find nothing when only the flat field is
+    present.
+    """
+
+    reasoning_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    accepted_prediction_tokens: Optional[int] = None
+    rejected_prediction_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    # Kept for the readers that already exist in this tree and in fork clients;
+    # the spec-shaped copy below is what OpenAI clients read.
     reasoning_tokens: Optional[int] = 0
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Mirror the flat reasoning count into the spec's nested object rather
+        # than making every construction site remember to fill both. Only when
+        # there is something to report: an empty details object on every plain
+        # completion would be noise.
+        if data.get("completion_tokens_details") is None:
+            if self.reasoning_tokens:
+                data["completion_tokens_details"] = {
+                    "reasoning_tokens": self.reasoning_tokens
+                }
+            else:
+                data.pop("completion_tokens_details", None)
+        return data
 
 
 class StreamOptions(BaseModel):
@@ -466,6 +544,7 @@ class CompletionResponse(BaseModel):
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
+    system_fingerprint: Optional[str] = None
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
@@ -500,6 +579,7 @@ class CompletionStreamResponse(BaseModel):
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
+    system_fingerprint: Optional[str] = None
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
@@ -1046,6 +1126,9 @@ class ChatCompletionResponse(BaseModel):
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
+    # Spec field. Null rather than absent: clients type it as an optional
+    # string and a missing key is a schema violation for the strict ones.
+    system_fingerprint: Optional[str] = None
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
@@ -1091,6 +1174,7 @@ class ChatCompletionStreamResponse(BaseModel):
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
+    system_fingerprint: Optional[str] = None
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
@@ -1137,7 +1221,9 @@ class EmbeddingRequest(BaseModel):
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    # ``str`` covers ``encoding_format="base64"``: a base64 little-endian
+    # float32 buffer, exactly as OpenAI returns it.
+    embedding: Union[List[float], str]
     index: int
     object: str = "embedding"
 

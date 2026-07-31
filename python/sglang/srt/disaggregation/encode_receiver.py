@@ -29,6 +29,7 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
 )
+from sglang.srt.entrypoints.openai.errors import error_message_of
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1100,7 +1101,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             elif resp.status != 200:
                 try:
                     err = await resp.json()
-                    msg = err.get("message", "Unknown error")
+                    msg = error_message_of(err)
                 except Exception:
                     msg = await resp.text()
                 logger.error(f"Encoder {endpoint} returned error {resp.status}: {msg}")
@@ -2063,7 +2064,7 @@ class MMReceiverHTTP(MMReceiverBase):
             if response.status != 200:
                 try:
                     err_data = await response.json()
-                    msg = err_data.get("message", "Unknown encoder error")
+                    msg = error_message_of(err_data, "Unknown encoder error")
                 except Exception:
                     msg = await response.text()
                 logger.error(f"Encoder returned error {response.status}: {msg}")
