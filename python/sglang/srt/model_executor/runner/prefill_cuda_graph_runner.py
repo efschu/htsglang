@@ -34,6 +34,7 @@ Backend selection comes from cuda_graph_config.prefill:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import inspect
 import logging
@@ -93,6 +94,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
@@ -800,15 +802,53 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
+    def _uses_raw_cuda_graph_capture(self) -> bool:
+        """True for the backends that record a raw CUDA graph (Full, Breakable).
+
+        These are mechanically identical to decode-side capture and must enter
+        model_capture_mode() exactly like DecodeCudaGraphRunner does (#356).
+        The tc_piecewise backend is intentionally excluded: it captures under
+        torch.compile, which owns dispose suppression via
+        is_in_tc_piecewise_cuda_graph(), and whose FX trace must NOT observe the
+        multi-stream / nested-compile capture branches that get_is_capture_mode()
+        gates (see deepseek_v2.DeepseekV2MoE.forward's explicit torch_compile
+        exclusion of the dual-stream path).
+        """
+        return isinstance(
+            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+        )
+
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
-        self.warmup()
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture() as graph_capture_context:
-                self.stream = graph_capture_context.stream
-                with self.backend.capture_session(self.stream):
-                    self._capture_one_stream()
+        #
+        # #356: the Full and Breakable backends record raw CUDA graphs, so they
+        # enter model_capture_mode() just like the decode runner. Two capture-
+        # time properties depend on it and were silently False on this path
+        # before (the prefill runner never entered the context):
+        #   * disable_dispose_tensor -- freeing a tensor mid-capture records
+        #     data_ptr()==0 into the graph; deep_gemm's MoE pre-permute disposes
+        #     hidden_states, so raw prefill capture MUST suppress it (a
+        #     correctness bug, not a perf one). Under tc_piecewise dispose is
+        #     already suppressed via is_in_tc_piecewise_cuda_graph().
+        #   * get_is_capture_mode() -- alt-stream fusion and the static-shape
+        #     model routing branches must be recorded so the replay runs them.
+        #     Breakable already read True via is_in_breakable_cuda_graph(); Full
+        #     set no flag at all and read False, silently losing both.
+        # #352's store bound stays correct regardless: it is graph-stable (KV VA
+        # row count) and deliberately NOT gated on capture mode.
+        capture_ctx = (
+            model_capture_mode()
+            if self._uses_raw_cuda_graph_capture()
+            else contextlib.nullcontext()
+        )
+        with capture_ctx:
+            self.warmup()
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                with graph_capture() as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with self.backend.capture_session(self.stream):
+                        self._capture_one_stream()
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(

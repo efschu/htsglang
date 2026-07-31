@@ -20288,3 +20288,83 @@ signalisiert nur eigene PIDs und gibt auf jedem Ausgang frei. Was er beweist:
 
 Status: **schreibtisch-fertig, GPU-Falsifikator/Microbench ausstehend, ein
 Kartenfenster via `scripts/dev/run_355_gpu.sh`.**
+
+---
+
+## #356 — PrefillCudaGraphRunner betritt model_capture_mode() nicht (Capture-Zeit-Frozen-State)
+
+### Befund (Schreibtisch-Audit, CPU-only)
+
+Praedikat: `get_is_capture_mode()`
+(`python/sglang/srt/model_executor/runner_utils/capture_mode.py:57-58`) =
+`_IS_CAPTURE_MODE.get() or is_in_breakable_cuda_graph()`.
+Der Context-Manager `model_capture_mode()` (ebd. `:84-96`) setzt ZWEI Dinge:
+`_IS_CAPTURE_MODE=True` UND `capture.disable_dispose_tensor=True`.
+
+Decode betritt ihn, Prefill nicht:
+- Decode: `runner/decode_cuda_graph_runner.py:640` `with model_capture_mode(): self.capture()`.
+- Prefill (vor #356): `runner/prefill_cuda_graph_runner.py` `capture()` hatte
+  keinerlei Wrapper. Genau so vom #352-Docstring beschrieben
+  (`mem_cache/memory_pool.py:152-159`).
+
+Die Luecke trifft nur die Backends, die einen ROHEN CUDA-Graph aufnehmen. Die
+drei Prefill-Backends verhalten sich beim Capture unterschiedlich:
+- Breakable (BCG): `capture_session` -> `replay_session` ->
+  `enable_breakable_cuda_graph()`, also `is_in_breakable_cuda_graph()=True` ->
+  `get_is_capture_mode()=True`. Aber `_IS_CAPTURE_MODE`/`disable_dispose_tensor`
+  BLIEBEN False.
+- tc_piecewise: `enable_tc_piecewise_cuda_graph()` (eigenes Flag, das
+  `get_is_capture_mode()` NICHT liest) -> `get_is_capture_mode()=False`.
+- Full: setzt gar kein Flag -> `get_is_capture_mode()=False`,
+  `disable_dispose_tensor=False`.
+
+### Reader-Klassifikation (pro Zweig, waehrend Prefill-Capture)
+
+| Reader | tc_piecewise | Breakable | Full |
+|---|---|---|---|
+| `get_is_capture_mode()`-Zweige (alt-stream-Fusion `models/utils.py:492`, `memory_pool.py:252/2789`, Modell-Routing `deepseek_v2:882`, `qwen3_5:549`, grok/qwen2_moe/…) | **LEGITIM-False**: FX-Trace darf Multi-Stream-/Static-Shape-Zweige nicht aufnehmen; `deepseek_v2.forward` schliesst den Dual-Stream-Pfad bei `enable_torch_compile` explizit aus | korrekt True (Breakable-Flag) | **WRONGLY-False = Bug (Perf)**: alt-stream-Overlap + Static-Shape-Routing fehlen im Replay |
+| `compile_in_capture_mode` (`deepseek_v4:1336,1468`, liest NUR `_IS_CAPTURE_MODE`) | LEGITIM-False (aeusseres `torch.compile` uebernimmt, kein Nesting) | **WRONGLY-False (Perf)**: hc-Prenorm-Fusion nicht kompiliert | **WRONGLY-False (Perf)** |
+| `dispose_tensor` (`utils/common.py:4082`, Aufrufer `moe/moe_runner/deep_gemm.py`) | LEGITIM-False: bereits via `is_in_tc_piecewise_cuda_graph()` (`common.py:4096`) unterdrueckt | **WRONGLY-False = Bug (Korrektheit)**: kein Guard -> `set_()` friert `data_ptr()==0` in den Graphen | **WRONGLY-False = Bug (Korrektheit)** |
+| Reine `is_in_breakable_cuda_graph()`-Reader (radix_attention, dsa, forward_mla …) | korrekt False | korrekt True | korrekt False (BCG-only, absichtlich) |
+
+Der genuine Korrektheits-(b) ist `dispose_tensor` unter Full/BCG (Rohgraph +
+deep_gemm-MoE-Prepermute). Die alt-stream-/compile-Faelle sind Perf-(b).
+
+### Fix (minimal, decode-konsistent)
+
+`PrefillCudaGraphRunner.capture()` betritt `model_capture_mode()` genau fuer die
+Rohgraph-Backends (Full, Breakable) — via `_uses_raw_cuda_graph_capture()` —
+und NICHT fuer tc_piecewise. Damit sieht jeder Reader unter jedem Backend den
+richtigen Wert (tc_piecewise=False by design, BCG/Full=True wie Decode).
+tc_piecewise (Default-Prefill-Backend, Referenz-Startbefehl) bleibt
+byte-identisch: es wird kein Kontext betreten. Geaenderte Datei:
+`python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py`.
+
+### #352-Bound weiterhin korrekt
+
+`graph_safe_store_bound` (`memory_pool.py:130-171`) ist absichtlich NICHT auf
+Capture-Mode gegatet: es nutzt die KV-VA-Zeilenzahl (graph-stabil ueber
+Capacity-Growth). Der Fix aendert diesen Bound nicht und haengt nicht von ihm
+ab; `test_kv_store_bound_unity.py` + `test_kv_store_bound_after_growth.py`
+bleiben gruen (22 passed, 3 skipped).
+
+### Tests
+
+`test/registered/unit/model_executor/test_prefill_capture_mode_356.py`,
+CPU-only, hermetisch (8 Tests + 3 Subtests, alle gruen):
+- WIRING: `capture()` betritt `model_capture_mode()` iff Rohgraph-Backend —
+  beobachtet an `disable_dispose_tensor`, das NUR dieser Kontext setzt (Full/BCG
+  True, tc_piecewise False); plus sauberes Verlassen (kein Leak).
+- READER-CONTRACT: im realen Per-Backend-Flag-Stack sieht jeder benannte Reader
+  seinen Sollwert; `dispose_tensor()` ist unter allen drei Prefill-Umgebungen
+  ein No-op und friert AUSSERHALB (Eager-Serving) korrekt frei.
+
+Zusaetzlich gruen gehalten: gesamtes `test/registered/unit/model_executor/`
+(445 passed; die 10 Fails in `test_bf16_fallback_vendor.py` /
+`test_coresidence_budget_mapping.py` sind pre-existing und NVML/Device-Props-
+abhaengig — identisch auf Base-HEAD), `TestCaptureModeIsolation`. ruff +
+codespell sauber.
+
+Status: **schreibtisch-fertig**. Kein Boot noetig — reine Capture-Mode-Verdrahtung;
+optionaler GPU-Beleg (Full-Backend-Prefill auf deep_gemm-MoE) offen, falls je
+ein Kartenfenster fuer diesen Nicht-Default-Pfad frei ist.
