@@ -65,6 +65,13 @@ from sglang.srt.video_enhance.mux import (
     retimed_rate,
 )
 from sglang.srt.video_enhance.pipeline import PipelineExecutor
+from sglang.srt.video_enhance.preview import (
+    DEFAULT_PREVIEW_BITRATE,
+    DEFAULT_PREVIEW_WIDTH,
+    PreviewConfig,
+    PreviewLanes,
+    build_preview_lanes,
+)
 from sglang.srt.video_enhance.probes import answer_capability, load_frontier
 from sglang.srt.video_enhance.ring import BoundedRing, OverloadPolicy, RingClosed
 from sglang.srt.video_enhance.tenant import (
@@ -98,6 +105,15 @@ _ELEMENTARY_FORMAT: dict[str, str] = {
     "av1": "obu",
 }
 
+#: Media type for a bare preview elementary stream. RFC 6184 for H.264;
+#: there is no registered type for a raw AV1 OBU stream, so it is served as
+#: the generic binary type rather than as a container it is not.
+_PREVIEW_MEDIA_TYPE: dict[str, str] = {
+    "h264": "video/H264",
+    "hevc": "video/H265",
+    "av1": "application/octet-stream",
+}
+
 
 #: The chain configurations a client picks between by name. The browser
 #: extension (``clients/browser-extension``) offers exactly these two, and the
@@ -126,6 +142,10 @@ CHAIN_PRESETS: dict[str, dict] = {
 
 class RangeError(ValueError):
     """A time range that cannot be turned into a frame range."""
+
+
+class PreviewUnavailable(LookupError):
+    """A preview was asked for on a job that has no lane to serve it."""
 
 
 class JobIdError(ValueError):
@@ -308,9 +328,27 @@ class EnhanceRequestBody:
     #: exactly the path it took before the range existed.
     start_s: float = 0.0
     duration_s: float | None = None
+    #: #344a live preview taps. Off by default, and that is the backward
+    #: compatibility statement: a request that does not ask for a preview
+    #: builds no tap, so the chain runs exactly the code it ran before.
+    preview: bool = False
+    preview_width: int = DEFAULT_PREVIEW_WIDTH
+    preview_bitrate: int = DEFAULT_PREVIEW_BITRATE
+    #: Encode every Nth frame into the preview. The honest lever on what a
+    #: tap costs the chain, exposed because the right value depends on how
+    #: much throughput the operator is willing to spend on being able to look.
+    preview_fps_divisor: int = 1
 
     def has_time_range(self) -> bool:
         return bool(self.start_s) or self.duration_s is not None
+
+    def preview_config(self) -> PreviewConfig:
+        return PreviewConfig(
+            width=self.preview_width,
+            bitrate=self.preview_bitrate,
+            fps_divisor=self.preview_fps_divisor,
+            codec=self.video_codec,
+        )
 
     def track_selection(self) -> TrackSelection:
         return TrackSelection(
@@ -353,6 +391,10 @@ class Job:
     source_rate: Fraction | None = None
     watchdog: ConsumerWatchdog | None = None
     time_range: TimeRange = WHOLE_SOURCE
+    #: Live preview taps (§8.1), or None when the request did not ask for
+    #: them. Built with the job so a viewer can attach at any point while it
+    #: runs; they cost nothing until they are started.
+    previews: PreviewLanes | None = None
 
 
 class VideoEnhanceService:
@@ -498,6 +540,26 @@ class VideoEnhanceService:
                 stages[planned.chain.stages[0].kind], body.source_url
             )
 
+        # Preview lanes are built before the executor because the executor
+        # needs the tap map. They are inert until started: a lane with no
+        # viewer holds an empty list and a closed encoder task.
+        previews: PreviewLanes | None = None
+        taps: dict = {}
+        if body.preview:
+            previews = build_preview_lanes(
+                planned.chain,
+                fps=retimed_rate(
+                    media_info.track(body.enhance_video_index).frame_rate()
+                    or Fraction(30),
+                    body.fps_multiplier,
+                ),
+                dtype=body.dtype,
+                device_id=self.device_id,
+                config=body.preview_config(),
+            )
+            taps = dict(previews.by_stage)
+            previews.start()
+
         executor = PipelineExecutor(
             job_id=job_id,
             chain=planned.chain,
@@ -506,6 +568,7 @@ class VideoEnhanceService:
             sink=sink,
             ring_depth=planned.ring_depth,
             policy=body.policy(),
+            taps=taps or None,
         )
         job = Job(
             job_id=job_id,
@@ -513,6 +576,7 @@ class VideoEnhanceService:
             planned=planned,
             created_at=time.time(),
             time_range=time_range,
+            previews=previews,
         )
         self.jobs[job_id] = job
 
@@ -574,6 +638,11 @@ class VideoEnhanceService:
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     job.task.cancel()
             self._close_stages(stages)
+            # The preview lanes hold an encoder session each. A job released
+            # for a dead consumer must not leave two NVENC sessions and a
+            # CUDA context behind for a viewer who is also gone.
+            if job.previews is not None:
+                await job.previews.close()
 
         watchdog = ConsumerWatchdog(
             job_id=job_id,
@@ -622,6 +691,8 @@ class VideoEnhanceService:
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     job.task.cancel()
             self._close_stages(stages)
+            if job.previews is not None:
+                await job.previews.close()
         # The trailer carries the drop count. A dropped frame is never silent.
         job.executor.stats.dropped = executor.rings.dropped + bridge.stats.dropped
 
@@ -692,6 +763,36 @@ class VideoEnhanceService:
         )
         return StreamRemuxer(command), rate
 
+    # -- previews ---------------------------------------------------------
+    def preview_lane(self, job_id: str, which: str):
+        """The lane a viewer wants, or a named refusal.
+
+        ``which`` is "input" or "output". A job that was not started with
+        ``preview: true`` has no lane, and saying so is better than handing
+        back an empty stream a client would read as a stalled encoder.
+        """
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job.previews is None:
+            raise PreviewUnavailable(
+                f"job {job_id} was started without preview taps; pass "
+                "preview=true on the enhance request to enable them. Taps "
+                "cannot be attached to a running job because the chain's tap "
+                "map is fixed when the executor is built."
+            )
+        lane = {
+            "input": job.previews.input_lane,
+            "output": job.previews.output_lane,
+        }.get(which)
+        if lane is None:
+            raise PreviewUnavailable(
+                f"job {job_id} has no {which!r} preview lane; this chain has "
+                f"no stage to tap for it. Available: "
+                f"{sorted(job.previews.snapshot())}"
+            )
+        return lane
+
     def _close_stages(self, stages: dict) -> None:
         for stage in stages.values():
             close = getattr(stage, "close", None)
@@ -716,6 +817,11 @@ class VideoEnhanceService:
             snapshot["time_range"] = job.time_range.describe()
         if job.watchdog is not None:
             snapshot["consumer"] = job.watchdog.state.snapshot()
+        if job.previews is not None:
+            # Reported next to the pipeline's own numbers on purpose: the
+            # claim that a tap costs the chain nothing is checkable from one
+            # response, by reading preview drops against frames_encoded.
+            snapshot["previews"] = job.previews.snapshot()
         if job.source_rate is not None:
             multiplier = job.planned.chain.request.fps_multiplier
             out_rate = retimed_rate(job.source_rate, multiplier)
@@ -1030,6 +1136,40 @@ def create_app(
             return JSONResponse(service.progress(job_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"no job {job_id}") from exc
+
+    @app.get("/v1/video/preview/{job_id}/{which}")
+    async def preview(job_id: str, which: str):
+        """Watch a running job's input or output live (§8.1).
+
+        ``which`` is "input" or "output". The body is a bare elementary
+        stream, which is what a preview wants: no container means no moov
+        atom to wait for and no duration to declare, so a player can start on
+        the first IDR and a stream with no defined end is not a special case.
+
+        A viewer who reads slowly loses preview frames -- the tap drops on
+        ingress -- and costs the enhance job nothing. That is the §8.1 rule
+        and it is enforced in ``preview.PreviewTap.offer``, not here.
+        """
+        if which not in ("input", "output"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"preview side must be 'input' or 'output', got {which!r}",
+            )
+        try:
+            lane = service.preview_lane(job_id, which)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"no job {job_id}") from exc
+        except PreviewUnavailable as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return StreamingResponse(
+            lane.stream(),
+            media_type=_PREVIEW_MEDIA_TYPE.get(lane.config.codec, "video/H264"),
+            headers={
+                "X-Preview-Resolution": str(lane.target),
+                "X-Preview-Frame-Rate": str(lane.fps),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.delete("/v1/video/enhance/{job_id}")
     async def cancel(job_id: str):

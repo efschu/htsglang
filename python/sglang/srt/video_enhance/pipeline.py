@@ -23,9 +23,10 @@ Two properties are enforced here rather than documented:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Awaitable, Callable, Sequence
+from typing import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 from sglang.srt.video_enhance.chain import Chain, StageKind
 from sglang.srt.video_enhance.frames import Frame
@@ -36,6 +37,8 @@ from sglang.srt.video_enhance.ring import (
     RingSet,
 )
 from sglang.srt.video_enhance.timing import ChainTimers
+
+logger = logging.getLogger(__name__)
 
 FrameSource = AsyncIterator[Frame]
 ByteSink = Callable[[bytes], Awaitable[None]]
@@ -140,6 +143,7 @@ class PipelineExecutor:
         policy: OverloadPolicy = OverloadPolicy.STALL,
         use_cuda_events: bool = True,
         encode_filter: Callable[[Frame], bool] | None = None,
+        taps: Mapping[StageKind, Sequence] | None = None,
     ) -> None:
         self.job_id = job_id
         self.chain = chain
@@ -147,6 +151,12 @@ class PipelineExecutor:
         self.source = source
         self.sink = sink
         self.policy = policy
+        # Preview taps (§8.1), keyed by the stage whose output feeds them.
+        # Every object in the sequence needs one method, ``offer(frame)``,
+        # which must be synchronous and must not raise -- see preview.py, where
+        # that contract is the whole design. The executor calls it and ignores
+        # the result, so a tap cannot influence the chain even by failing.
+        self.taps = dict(taps or {})
         # Multi-card shards only (``multicard.py``). A chunk pulls one frame
         # past its own range so RIFE has the second input for the seam pair,
         # and that trailing frame is encoded by the *next* chunk -- encoding it
@@ -187,6 +197,26 @@ class PipelineExecutor:
 
     def _ring(self, left: str, right: str) -> BoundedRing:
         return self.rings.rings[f"{left}->{right}"]
+
+    def _offer_to_taps(self, taps: Sequence, frame: Frame) -> None:
+        """Hand one frame to every tap on a stage. Cannot stall, cannot fail.
+
+        No ``await``: a tap that could suspend this coroutine would be
+        back-pressure from a preview viewer into the pipeline, which is the
+        one thing §8.1 forbids. No exception either: a preview is a
+        convenience and the job is the product, so a broken tap is logged
+        once and the frame moves on.
+        """
+        for tap in taps:
+            try:
+                tap.offer(frame)
+            except Exception as exc:  # noqa: BLE001 - a tap must not fail a job
+                logger.warning(
+                    "preview tap on job %s raised and is being ignored for this "
+                    "frame; the job continues: %s",
+                    self.job_id,
+                    exc,
+                )
 
     async def run(self) -> EnhanceStats:
         self.stats.state = "running"
@@ -299,8 +329,11 @@ class PipelineExecutor:
                     emitted.append(batch[-1])
                 else:
                     emitted.extend(produced)
+                taps = self.taps.get(kind)
                 for out_frame in emitted:
                     out_frame.require_device(kind.value)
+                    if taps:
+                        self._offer_to_taps(taps, out_frame)
                     await out_ring.put(out_frame)
                 if kind is StageKind.RIFE:
                     self.stats.frames_enhanced += len(produced)
