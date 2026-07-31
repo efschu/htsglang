@@ -4422,6 +4422,27 @@ class ServerArgs:
             "CPU phase plans only.",
         ),
     ] = None
+    gdn_resident_state_slots: A[
+        Optional[int],
+        Arg(
+            help="Cap on the number of RESIDENT GDN/Mamba state slots (#364) "
+            "-- a concurrent-decode ceiling for GDN sessions. The state pool "
+            "is boot-sized to this many session slots instead of to the "
+            "profiled target concurrency, so the bytes the surplus slots "
+            "would have held are never taken from the hybrid memory budget "
+            "and the KV pool gets them through the existing sizing route (no "
+            "second ledger). Sessions beyond the cap are NOT refused: an IDLE "
+            "session's state leaves VRAM as an opaque blob and is restored "
+            "into a free slot before that session's next decode tick; an "
+            "ACTIVE session never loses its state. A cap above what the "
+            "memory budget profiled is a ceiling, not a demand, and is "
+            "ignored. Default: unset = today's behaviour, every profiled slot "
+            "stays resident. Note this makes 'GDN stays resident' a default "
+            "policy rather than a hard rule; runtime GROWTH of the KV pool by "
+            "the freed bytes is not part of this flag (boot-time sizing "
+            "only).",
+        ),
+    ] = None
     gdn_state_set_ladder_hysteresis: A[
         int,
         Arg(
@@ -6157,6 +6178,20 @@ class ServerArgs:
         )
 
         parse_gdn_state_set_ladder(self.gdn_state_set_ladder)
+        # #364: the resident-slot cap. Validated here, next to the ladder it
+        # shares a pool with, so one place answers "is this state-slot
+        # configuration sane". A cap of 0 would mean no session can hold a
+        # recurrent state at all -- that is not a smaller pool, it is a
+        # broken one.
+        if (
+            self.gdn_resident_state_slots is not None
+            and self.gdn_resident_state_slots < 1
+        ):
+            raise ValueError(
+                f"--gdn-resident-state-slots must be >= 1 (at least one "
+                f"session must be able to hold GDN state), got "
+                f"{self.gdn_resident_state_slots}."
+            )
         if self.gdn_state_set_ladder_hysteresis < 1:
             raise ValueError(
                 f"--gdn-state-set-ladder-hysteresis must be >= 1 (admission "

@@ -1863,6 +1863,55 @@ class ModelRunnerKVCacheMixin:
                     max_mamba_cache_size=synced_size,
                 )
 
+        # #364 resident-slot cap. Applied AFTER every profiling branch and
+        # after the uneven-TP min-sync, so it is the last word on the pool
+        # geometry and cannot be undone by a branch that recomputes a size.
+        # Rank-uniform without a collective: it is a server arg, identical on
+        # every rank by construction, and it only ever lowers -- so the
+        # min-reduced agreement above still holds after it.
+        #
+        # This IS the accounting route: mamba_state_memory below is computed
+        # from max_mamba_cache_size and subtracted from the budget the KV
+        # sizing then spends, so the slots the cap keeps out become KV tokens
+        # with no transfer and no second ledger. What the cap does NOT do is
+        # grow the KV pool at RUNTIME when a session vacates -- the pool is
+        # fixed at boot; a vacated slot is reused by another session, not
+        # returned to the KV pool (see the #364 remainder).
+        _resident_cap = getattr(server_args, "gdn_resident_state_slots", None)
+        if _resident_cap is not None:
+            from sglang.srt.mem_cache.gdn_slot_ladder import (
+                cap_is_binding,
+                effective_state_slots,
+            )
+
+            _profiled = int(server_args.max_mamba_cache_size)
+            if cap_is_binding(_resident_cap, _profiled):
+                _capped = effective_state_slots(_profiled, _resident_cap)
+                logger.info(
+                    "GDN resident-slot cap: state slots %d -> %d "
+                    "(--gdn-resident-state-slots %d); %.2f GB stays out of "
+                    "the state pool and is spent on KV instead. Sessions "
+                    "beyond the cap run with a vacated (host-blob) state.",
+                    _profiled,
+                    _capped,
+                    int(_resident_cap),
+                    (_profiled - _capped)
+                    * config.mamba2_cache_params.mamba_cache_per_req
+                    / (1 << 30),
+                )
+                server_args.override(
+                    "mamba_pool.gdn_resident_state_slots",
+                    max_mamba_cache_size=_capped,
+                )
+            else:
+                logger.info(
+                    "GDN resident-slot cap: --gdn-resident-state-slots %d is "
+                    "at or above the profiled %d state slots; the cap is a "
+                    "ceiling, not a demand, and nothing changes.",
+                    int(_resident_cap),
+                    _profiled,
+                )
+
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
         # configuration. Fail fast with actionable advice instead of silently

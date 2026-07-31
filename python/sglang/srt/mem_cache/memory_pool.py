@@ -915,6 +915,116 @@ class MambaPool:
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
 
+    def export_state_blob(self, slot: int):
+        """One session's GDN/Mamba state as an OPAQUE blob (#364).
+
+        The blob is the unit the slot ladder vacates: every PERSISTENT
+        per-slot field of the pool, copied out of VRAM so the slot can be
+        handed back to the allocator and reused by another session. It is
+        opaque on purpose -- nothing between here and ``import_state_blob``
+        interprets it. In particular it does NOT travel the HiCache radix
+        route (#212): a recurrent state is positional, not prefix-shareable,
+        and a cache eviction of it would mean a silent full re-prefill.
+
+        Covered: every field of ``mamba_cache`` except the transient
+        speculative scratch, plus the ReplaySSM decode cursor. The exclusion
+        list is imported from the offload register (#286 Erg. 8) rather than
+        restated, so the blob and the register's per-set byte model cannot
+        disagree about what a "state set" is. ``intermediate_ssm`` /
+        ``intermediate_conv_window`` are verify scratch keyed to SPEC slots
+        and rebuilt inside every decode step -- carrying them would make the
+        blob bigger and no more correct.
+
+        Unlike ``get_cpu_copy`` (which covers conv + temporal only, enough
+        for its hibernate caller) this is complete, which is what makes the
+        round-trip bit-identical.
+        """
+        from sglang.srt.model_executor.offload_gdn_states import (
+            _TRANSIENT_SPEC_FIELDS,
+        )
+
+        idx = int(slot)
+        if idx < 1 or idx > self.size:
+            raise ValueError(
+                f"state slot {idx} out of range; slots 1..{self.size} are "
+                "session slots (slot 0 is the pool's dummy padding target "
+                "and never vacates)"
+            )
+        current_platform.synchronize()
+        blob = {}
+        for f in fields(self.mamba_cache):
+            if f.name in _TRANSIENT_SPEC_FIELDS:
+                continue
+            value = getattr(self.mamba_cache, f.name, None)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                blob[f.name] = [t[:, idx].to("cpu", copy=True) for t in value]
+            else:
+                blob[f.name] = value[:, idx].to("cpu", copy=True)
+        if self.replayssm_write_pos is not None:
+            blob["replayssm_write_pos"] = self.replayssm_write_pos[idx].to(
+                "cpu", copy=True
+            )
+        current_platform.synchronize()
+        return blob
+
+    def import_state_blob(self, slot: int, blob) -> None:
+        """Restore a blob produced by :meth:`export_state_blob` into ``slot``.
+
+        The slot need not be the one it was exported from -- that is the
+        point of vacating: a resumed session takes whichever resident slot is
+        free. Field-by-field by NAME, so a pool built with a different
+        optional-field set (ReplaySSM off) refuses the blob instead of
+        silently restoring a partial state.
+        """
+        idx = int(slot)
+        if idx < 1 or idx > self.size:
+            raise ValueError(
+                f"state slot {idx} out of range; slots 1..{self.size} are "
+                "session slots"
+            )
+        expected = set(self.state_blob_fields())
+        got = set(blob.keys())
+        if expected != got:
+            raise ValueError(
+                "GDN state blob does not match this pool's state layout: "
+                f"blob has {sorted(got)}, pool expects {sorted(expected)}. "
+                "A partially restored recurrent state is silently wrong "
+                "output, so this is a hard error."
+            )
+        current_platform.synchronize()
+        for name, value in blob.items():
+            if name == "replayssm_write_pos":
+                self.replayssm_write_pos[idx] = value.to(
+                    self.replayssm_write_pos.device
+                )
+                continue
+            target = getattr(self.mamba_cache, name)
+            if isinstance(target, (list, tuple)):
+                for i, t in enumerate(target):
+                    t[:, idx] = value[i].to(t.device)
+            else:
+                target[:, idx] = value.to(target.device)
+        current_platform.synchronize()
+
+    def state_blob_fields(self):
+        """Names a blob of this pool carries, in a stable order. Used by the
+        round-trip check and by callers sizing a blob tier."""
+        from sglang.srt.model_executor.offload_gdn_states import (
+            _TRANSIENT_SPEC_FIELDS,
+        )
+
+        names = [
+            f.name
+            for f in fields(self.mamba_cache)
+            if f.name not in _TRANSIENT_SPEC_FIELDS
+            and getattr(self.mamba_cache, f.name, None) is not None
+        ]
+        if self.replayssm_write_pos is not None:
+            names.append("replayssm_write_pos")
+        return names
+
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
         conv_cpu = [
