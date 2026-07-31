@@ -20,6 +20,7 @@ M_RETRACT = "Retract requests"
 _FITTED_RE = re.compile(r"were fitted to (\d+)")
 _REQUESTED_RE = re.compile(r"requested ceiling (\d+)")
 _SLOTS_RE = re.compile(r"max_mamba_cache_size=(\d+) slots")
+_ADMITS_RE = re.compile(r"admits ~(\d+) reqs")
 
 _results = []
 
@@ -90,14 +91,22 @@ def arm_a(markers_path, info_path, requested, *_extra):
         json.dumps({k: lim.get(k) for k in ("current", "start", "ceiling", "floor")}),
     )
 
-    # Rank uniformity: every rank that logged a pool size logged the SAME one,
-    # and the scheduler's fitted ceiling is that size // mamba_ratio.
+    # Rank uniformity: under uneven TP on mixed cards, the SLOT COUNT is not
+    # what has to match across ranks -- per-request state size is a property
+    # of each rank's shard (e.g. 37.41 MiB on a 5090-hosted rank vs 18.70 MiB
+    # on a 3080-hosted one, #307-Beleg 2026-07-31), so the fitted pools can
+    # and do land at different slot counts (90/92/94) while still being the
+    # correct fit for each rank's budget. What the feature actually promises
+    # is a uniform GROUP ceiling: every rank's pool line names the same
+    # admitted request count ("-> admits ~N reqs"), and that shared N is the
+    # scheduler's fitted ceiling.
     sizes = {int(m) for m in _SLOTS_RE.findall(markers)}
+    admits = {int(m) for m in _ADMITS_RE.findall(markers)}
     reported = {int(m) for m in _FITTED_RE.findall(markers)}
     check(
-        "all ranks ended on one pool size",
-        len(sizes) == 1,
-        f"sizes={sorted(sizes)}",
+        "pool sizes may differ across ranks, but every rank admits the same request count",
+        len(admits) == 1,
+        f"slot sizes={sorted(sizes)} (allowed to differ under uneven TP) admits={sorted(admits)}",
     )
     check(
         "one effective ceiling for the group",

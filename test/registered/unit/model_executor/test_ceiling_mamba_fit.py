@@ -17,7 +17,11 @@ amounts) and not to the MiB.
 """
 
 import importlib.util
+import io
+import json
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -444,6 +448,197 @@ class TestCardProofMarkerCoupling(unittest.TestCase):
             "@ per_req=18.70 MiB; fit_cap=204) -> admits ~20 reqs;"
         )
         self.assertEqual(mod._SLOTS_RE.findall(rendered), ["100"])
+
+    def test_the_admits_regex_matches_the_pool_line(self):
+        """#307-Beleg fix: arm A's rank-uniformity check reads this regex,
+        not the slot count -- see TestArmAUniformAdmissionUnderUnevenTP."""
+        mod = self._verdict_module()
+        rendered = (
+            "[auto-mamba] demand-driven mamba pool: target_concurrency=16 "
+            "ratio=5 safety=1.25 -> max_mamba_cache_size=100 slots (1.83 GB "
+            "@ per_req=18.70 MiB; fit_cap=204) -> admits ~20 reqs;"
+        )
+        self.assertEqual(mod._ADMITS_RE.findall(rendered), ["20"])
+
+
+# -----------------------------------------------------------------------
+# #307-Beleg (2026-07-31, docs/dev/INTEGRATION_R3_VALIDATION.md): the card
+# run that exposed the two probe-calibration errors below every criterion
+# they miscalibrated, fixtures built from the harvested markers/server_info
+# of that run (/spinning/gpu-battery-results/2026-07-31_307_beleg/s307/).
+# -----------------------------------------------------------------------
+
+#: (rank, slots, per_req_mib, fit_cap) for the three ranks of the #307-Beleg
+#: arm A boot (TP=3, 5090 + 2x 3080). Slot counts and per-request cost differ
+#: by rank because per_req is a property of each rank's shard; the group
+#: ceiling ("admits ~N reqs") is what has to agree.
+_BELEG_RANKS = (
+    (0, 94, "37.41", 214),  # 5090-hosted rank
+    (2, 92, "18.70", 226),  # 3080-hosted rank
+    (1, 90, "18.70", 221),  # 3080-hosted rank
+)
+
+
+def _beleg_fit_line(rank, slots, requested=64):
+    return (
+        f"[2026-07-31 02:50:19 TP{rank}] [auto-mamba] the concurrency target "
+        f"does not fit this rank's budget: leaving no KV pool. Fitting the "
+        f"pool to the budget instead: {slots} slots (x GiB, admits ~18 "
+        f"requests per rank). --max-running-requests-ceiling={requested} is "
+        f"the requested ceiling; the effective one is the min over ranks of "
+        f"the fitted capacity and is reported by the scheduler.\n"
+    )
+
+
+def _beleg_pool_line(rank, slots, per_req_mib, fit_cap, admits, requested=64):
+    return (
+        f"[2026-07-31 02:50:19 TP{rank}] [auto-mamba] demand-driven mamba "
+        f"pool: target_concurrency={requested} ratio=5 safety=1.25 -> "
+        f"max_mamba_cache_size={slots} slots (x GB @ per_req={per_req_mib} "
+        f"MiB; fit_cap={fit_cap}) -> admits ~{admits} reqs; "
+        f"activation_reserve=1.00 GB; remaining VRAM -> KV pool.\n"
+    )
+
+
+def _beleg_admit_lines(fitted, requested=64):
+    return (
+        f"[2026-07-31 02:50:32 TP0] Dynamic admission limit: the requested "
+        f"ceiling {requested} (per worker) does not fit the memory budget; "
+        f"the state pools and the float were fitted to {fitted}. Raise the "
+        f"per-rank budget (--rank-gpu-memory-mib / --rank-auto-reserve-mib) "
+        f"or lower the ceiling to make the request honest.\n"
+        f"[2026-07-31 02:50:32 TP0] Dynamic admission limit: ceiling="
+        f"{fitted}, start=8, floor=1 (throttle>=0.30, release<=0.10 x8). "
+        f"State pools are dimensioned for the ceiling; the limit floats "
+        f"below it.\n"
+    )
+
+
+def _beleg_markers(admits_by_rank, requested=64, fitted=18):
+    text = "".join(
+        _beleg_fit_line(r, slots, requested) for r, slots, _, _ in _BELEG_RANKS
+    )
+    text += "".join(
+        _beleg_pool_line(r, slots, per_req, fit_cap, admits_by_rank[r], requested)
+        for r, slots, per_req, fit_cap in _BELEG_RANKS
+    )
+    text += _beleg_admit_lines(fitted, requested)
+    return text
+
+
+_BELEG_INFO = {
+    "internal_states": [
+        {"admission_limiter": {"current": 8, "start": 8, "ceiling": 18, "floor": 1}}
+    ]
+}
+
+
+class TestArmAUniformAdmissionUnderUnevenTP(unittest.TestCase):
+    """Criterion 1 fix: "one pool size" is the wrong thing to demand under
+    uneven TP on mixed cards -- the #307-Beleg run fitted 90/92/94 slots on
+    its three ranks (per_req 37.41 MiB on the 5090-hosted rank vs 18.70 MiB
+    on each 3080-hosted rank) and scored FAIL on a healthy boot. What must be
+    uniform is the derived admission ceiling ("admits ~N reqs"), not the raw
+    slot count -- rewritten in s307_ceiling_fit.py arm_a."""
+
+    @staticmethod
+    def _run_arm_a(markers, info, requested=64):
+        mod = TestCardProofMarkerCoupling._verdict_module()
+        with tempfile.TemporaryDirectory() as td:
+            markers_path = Path(td) / "markers.txt"
+            info_path = Path(td) / "info.json"
+            markers_path.write_text(markers)
+            info_path.write_text(json.dumps(info))
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                rc = mod.arm_a(str(markers_path), str(info_path), requested)
+        return rc, captured.getvalue()
+
+    def test_the_real_uneven_tp_run_now_passes(self):
+        markers = _beleg_markers({0: 18, 2: 18, 1: 18})
+        rc, out = self._run_arm_a(markers, _BELEG_INFO)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(
+            "PASS  pool sizes may differ across ranks, but every rank admits "
+            "the same request count",
+            out,
+        )
+        # the raw slot counts are genuinely unequal in the fixture -- the fix
+        # stops requiring them to match, it does not hide the difference
+        self.assertIn("slot sizes=[90, 92, 94]", out)
+        self.assertIn("admits=[18]", out)
+
+    def test_a_divergent_admission_ceiling_still_fails(self):
+        """Uniform slot counts would no longer be required even if they held
+        -- but a genuinely divergent GROUP ceiling must still fail."""
+        markers = _beleg_markers({0: 18, 2: 18, 1: 17})
+        rc, out = self._run_arm_a(markers, _BELEG_INFO)
+        self.assertEqual(rc, 1, out)
+        self.assertIn(
+            "FAIL  pool sizes may differ across ranks, but every rank admits "
+            "the same request count",
+            out,
+        )
+        self.assertIn("admits=[17, 18]", out)
+
+
+class TestArmBPressureSizing(unittest.TestCase):
+    """Criterion 2 fix: the raise probe's pressure phase was sized as a fixed
+    24 requests, calibrated against the ~70-slot pool the fit's arithmetic
+    predicted. The #307-Beleg run fitted a 90-94 slot pool instead, so
+    0.30 * pool (~27 slots) was never reached and "the pressure phase
+    throttled" scored FAIL on a healthy raise. Fixed in
+    scripts/gpu_battery/s307_probe_sizing.py: size the load as a fraction of
+    the pool the server itself reports."""
+
+    @staticmethod
+    def _sizing_module():
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "scripts"
+            / "gpu_battery"
+            / "s307_probe_sizing.py"
+        )
+        spec = importlib.util.spec_from_file_location("s307_probe_sizing", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_pool_from_info_reads_the_beleg_shape(self):
+        mod = self._sizing_module()
+        info = {"internal_states": [{"max_mamba_cache_size": 90}]}
+        self.assertEqual(mod.pool_from_info(info), 90)
+
+    def test_pool_from_info_falls_back_to_the_top_level_key(self):
+        mod = self._sizing_module()
+        self.assertEqual(mod.pool_from_info({"max_mamba_cache_size": 100}), 100)
+
+    def test_pool_from_info_is_none_when_nothing_was_ever_fitted(self):
+        mod = self._sizing_module()
+        self.assertIsNone(mod.pool_from_info({"internal_states": [{}]}))
+        self.assertIsNone(mod.pool_from_info({}))
+
+    def test_the_real_beleg_pool_no_longer_undershoots_throttle_high(self):
+        """The exact failure: 24 requests against a 90-slot pool never
+        crosses 0.30 * 90 = 27 occupied slots; the fixed sizing does."""
+        mod = self._sizing_module()
+        pool = 90
+        old_fixed = 24
+        self.assertLessEqual(old_fixed, 0.30 * pool, "the bug this reproduces")
+        new_default = mod.default_concurrency(pool)
+        self.assertEqual(new_default, 36)
+        self.assertGreater(new_default, 0.30 * pool)
+
+    def test_default_concurrency_is_a_fraction_of_the_pool_not_a_constant(self):
+        mod = self._sizing_module()
+        self.assertEqual(mod.default_concurrency(20), 8)
+        self.assertEqual(mod.default_concurrency(50), 20)
+        self.assertEqual(mod.default_concurrency(94), 38)
+
+    def test_default_concurrency_falls_back_when_no_pool_was_reported(self):
+        mod = self._sizing_module()
+        self.assertEqual(mod.default_concurrency(None), 24)
+        self.assertEqual(mod.default_concurrency(0), 24)
 
 
 if __name__ == "__main__":
