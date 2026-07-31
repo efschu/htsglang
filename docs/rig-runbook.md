@@ -155,8 +155,15 @@ Non-obvious points, each load-bearing:
   survives the short warmup, reports "fired up" — and OOMs in the GDN
   prefill scratch on the first real prefill (observed: allocator down to
   8 MiB free on a 3080). Do not "optimize" this down because the boot looked
-  fine. Default is `auto` (derived); the explicit list is the known-good
-  operating point for this model class on these cards.
+  fine. Default is `auto` (derived); the explicit list was the known-good
+  operating point for short-prefill validation. **It is not enough for a real
+  long-context prompt**: #360's #151 stress suite OOMs this same auto split
+  (`3000,3200,3200`, an even more generous 3080 reserve than shown here) on
+  its first 10K-token needle probe — same crash site, same GDN prefill
+  scratch (§6.5). `5500,3800,3800` is the reserve #360 validated against
+  actual 10K+/25K+/30K+-token prompts across four full boots; use that for
+  anything that will see a real long prompt, and treat the numbers above as
+  sized for the warmup-only case they were validated against.
 - `--tp-size` is canonical (`--tensor-parallel-size` is the declared alias;
   `--tp` also works, but only via argparse prefix matching — do not rely on
   it in scripts).
@@ -499,10 +506,36 @@ naming what the host does have.
 
 ### 4.4 Which model for which purpose
 
-`<MODEL_ROOT>` holds the zoo. The default subjects: `Qwen3.6-27B-FP8`
-(standard TP=3 + NEXTN work, recipe above), `Qwen3.5-122B-A10B-GPTQ-Int4`
-(MoE expert-offload work), the `*-GGUF` trees (GGUF loader work). Smaller
-smoke-test subjects: `Qwen3.5-4B-GGUF`, `Llama-3.1-8B-Instruct`.
+`<MODEL_ROOT>` holds the zoo. The default subjects: `Qwen3.6-27B-INT8-W8A8`
+(standard TP=3 + NEXTN work, recipe above — see below for why this replaced
+FP8 as the default), `Qwen3.5-122B-A10B-GPTQ-Int4` (MoE expert-offload work),
+the `*-GGUF` trees (GGUF loader work). Smaller smoke-test subjects:
+`Qwen3.5-4B-GGUF`, `Llama-3.1-8B-Instruct`.
+
+**INT8-W8A8 is the default recommendation for Qwen3.6-27B on this rig**
+(both gates closed, 2026-07-31): prefill throughput is **+34%** at the auto
+(unconcentrated) split and **+16%** at each format's own concentrated
+optimum (both `s=1`, TP=3 uneven on 5090+2x3080; full table in #354 and
+§4.1.0). Decode does not consistently favor either format: at the
+auto-split working point, FP8 leads at some batch sizes (bs=1: +9%, bs=4:
++20%) and INT8-W8A8 at others (bs=2: +25%, bs=6: +13%) — call it a wash,
+not a decode regression. Quality parity holds (#360, 2026-07-31, 4-arm
+graded battery, `/spinning/gpu-battery-results/2026-07-31_360_int8_quality/`):
+INT8-W8A8 scores 41/42 graded (its one miss is an `instruction` item, not
+`code`/`factual`/`longctx`), matching a second FP8 boot's own 41/42 against
+the first FP8 boot's 42/42 — i.e. INT8-W8A8's quality gap from FP8 is no
+larger than FP8's gap from itself across two boots. `code` is 6/6 on every
+arm and the long-context needle recall is bit-identical at 30035 tokens on
+every arm. The one real, measured cost is speculative acceptance length:
+INT8-W8A8 runs **-6.5%** shorter average accept length than the FP8 arms
+(3.14 vs 3.34/3.39 tokens/verify) — a speed term, not a correctness one; see
+`docs/status-evidence-tiers` below for why text/answer identity between
+boots is not itself an instrument here. **FP8 remains the documented
+reference arm** for isolating quantization-format effects — every A-vs-A
+noise-band comparison in this repo is still anchored to it, and #354/#360
+both used it as the fixed point the INT8-W8A8 numbers are measured against.
+Building the INT8 lane requires a local `sgl-kernel` build (§6.6) — do that
+first, or fall back to the FP8 recipe unchanged.
 
 Community `qwen35` GGUFs brought up in task #154, both text-coherent and both
 carrying an `mmproj-*.gguf` (so they boot multimodal, see 4.5.1):
@@ -1842,6 +1875,28 @@ OOMs in the GDN prefill scratch on the first long prompt; 2700 MiB holds.
 A successful warmup proves nothing about prefill headroom — test with a
 real long prompt before calling a reserve value good.
 
+The #151 stress suite (the 14-item battery behind #360's quality runs) is a
+sharper version of the same trap: it survives the ~80-token warmup and six
+short probe items, then reaches item 8, "Needle small rungs (10K/30K)", and
+dies on the first (10K) rung. `--rank-auto-reserve-mib 3000,3200,3200`
+(TP=3, 5090+2x3080, Qwen3.6-27B-FP8, `--rank-tp-ratio auto`) OOMs in the GDN
+prefill scratch — `python/sglang/srt/layers/attention/fla/chunk_delta_h.py:324`,
+`h = k.new_empty(B, NT, H, V, K)` — with the 5090 (rank 0) at 10.38 MiB free
+of 31.34 GiB. 5500 MiB on rank 0 (the 5090) holds through all four #360
+arms; the small-card reserve that holds depends on the MLP vector — `3800`
+for the three arms on the flat/auto split (FP8 x2, INT8-W8A8) and `2700`
+for the MLP-concentrated phase-prefill arm (INT8-W8A8,
+`--rank-mlp-ratio 16,2,3`), which needs less
+small-card headroom because the concentration moves weight and activation
+work onto rank 0. Minimum free VRAM after load across all four arms and both
+reserve vectors is 1399-1887 MiB. Source:
+`/spinning/gpu-battery-results/2026-07-31_360_int8_quality/oom_run_reserve_3000/`
+(the dying boot) and the sibling `vram_after_*.txt` files one level up (the
+holding boots). The short warmup and the first six probe items (`math`,
+`fact`, `instr`, `code`) never touch a prompt long enough to grow the GDN
+scratch past a 3000/3200 reserve — the same shape of false pass as the
+2200-MiB case above, just a longer runway before it bites.
+
 ### 6.6 INT8 W8A8 needs an sgl-kernel built from THIS tree (#327, #353)
 
 The sm120 dispatch arm is fork source, not a private wheel: it lives in
@@ -2381,8 +2436,13 @@ curl -s "$UI/api/wizard/rejected?level=blocked" | python3 -m json.tool
 
 # Step 3: every family with its five figures, and every family that does not
 # fit with the concrete reason. Body = the ordinary plan payload plus the
-# wizard's own three inputs.
-BODY='{"model":"'$MODEL_ROOT'/Qwen3.6-27B-FP8",
+# wizard's own three inputs. Model here is the default recommendation for
+# this checkpoint family (#354/#360, see 4.4) -- point $MODEL_ROOT at the
+# FP8 tree instead to render the same families for the reference arm; the
+# wizard has no format-recommendation logic of its own, it renders whatever
+# checkpoint path this body names, so the recommendation itself lives in 4.4,
+# not in code.
+BODY='{"model":"'$MODEL_ROOT'/Qwen3.6-27B-INT8-W8A8",
        "hardware":{"source":"manual",
                    "gpus":["RTX 5090:32607","RTX 3080:20470","RTX 3080:20470"]},
        "tp_size":3,"kv_cache_dtype":"fp8_e4m3",
