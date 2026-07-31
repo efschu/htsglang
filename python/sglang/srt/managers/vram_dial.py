@@ -984,9 +984,58 @@ def _commit_on_scheduler(
     for p in get_dial_participants():
         target_backing = my_backing_rows if p.is_target else c_new
         released += int(p.pool.runtime_set_backing_rows(target_backing))
+        verify_pool_reached_capacity(p, target_backing)
     if mode in ("grow", "shrink"):
         _refresh_capacity_snapshots(scheduler, c_new)
     return released
+
+
+def verify_pool_reached_capacity(participant, target_backing: int) -> None:
+    """Post-commit check that a participant pool REALLY carries the new
+    capacity -- both bounds, not just the live one (#352).
+
+    #345 and #352 are the same defect twice: the pool grew and one consumer of
+    its capacity did not. The consumer is not always a Python attribute -- the
+    second time it was a number a CUDA graph had baked into a kernel launch,
+    which no amount of re-assigning ``pool.size`` reaches. So a commit checks
+    both quantities a store has to satisfy afterwards:
+
+    * ``full_pool_backed_rows`` -- the LIVE bound eager launches pass, which
+      must be exactly the rows this rank was told to back;
+    * ``store_bound_rows`` -- the LIFETIME bound a captured graph may be
+      replaying (see ``graph_safe_store_bound``), which must still cover the
+      new span, padding slot included.
+
+    A pool that cannot satisfy the second one structurally cannot host the
+    growth, and saying so here -- loudly, with the numbers -- is the point:
+    silent partial growth is the bug class itself.
+    """
+    pool = participant.pool
+    target_backing = int(target_backing)
+    kind = "target" if participant.is_target else "draft"
+    backed = getattr(pool, "full_pool_backed_rows", None)
+    if backed is not None and int(backed) != target_backing:
+        raise KvCapacityError(
+            f"{LOG_PREFIX} capacity commit did not reach "
+            f"{type(pool).__name__} ({kind} pool): backed rows {int(backed)} "
+            f"!= requested {target_backing}. The pool's live store bound "
+            f"would keep rejecting slot ids the allocator now hands out."
+        )
+    bound = getattr(pool, "store_bound_rows", None)
+    if bound is None:
+        return
+    page = int(getattr(pool, "page_size", 1))
+    needed = target_backing + page
+    if int(bound) < needed:
+        raise KvCapacityError(
+            f"{LOG_PREFIX} {type(pool).__name__} ({kind} pool) cannot host "
+            f"capacity {target_backing}: its KV buffers address {int(bound)} "
+            f"rows but {needed} are needed ({target_backing} slots + {page} "
+            f"padding). CUDA graphs captured over these buffers bake this "
+            f"bound into their store_kvcache launches, so growing past it "
+            f"would fail as a device assert on legal slot ids (#352) rather "
+            f"than here."
+        )
 
 
 def validate_vram_dial_compat(server_args) -> None:
@@ -1009,6 +1058,27 @@ def validate_vram_dial_compat(server_args) -> None:
         problems.append("data parallelism (DP controller caches the boot C)")
     if getattr(server_args, "kv_canary", "none") not in (None, "none"):
         problems.append("kv-canary (its launch capacities snapshot the boot C)")
+    if getattr(server_args, "enable_hisparse", False):
+        problems.append(
+            "hisparse (its allocator's size-derived state has no grow path)"
+        )
+    if getattr(server_args, "weightless_kv_fastlane", False):
+        problems.append("weightless-KV fast lane (rank-local KV sizing contract)")
+    # #352 audit: DFLASH's solo draft pool takes num_draft_slots from the BOOT
+    # max_total_num_tokens and builds its free list and index tables from it
+    # (speculative/dflash_solo_pool.py). Nothing refreshes those at a capacity
+    # commit, so a grown ceiling would hand the draft path slot ids its own
+    # tables cannot address. Refused loudly here rather than discovered as a
+    # device assert later -- which is exactly the failure #352 was.
+    _spec = " ".join(
+        str(getattr(server_args, name, "") or "").lower()
+        for name in ("speculative_algorithm", "speculative_drafter_policy")
+    )
+    if "dflash" in _spec:
+        problems.append(
+            "DFLASH speculative lane (its solo draft pool's num_draft_slots "
+            "and index tables are frozen at the boot ceiling)"
+        )
     if problems:
         raise ValueError(
             "--enable-vram-dial is refused with: "
@@ -1058,6 +1128,15 @@ def build_kv_capacity_runtime(scheduler) -> KvCapacityRuntime:
             raise KvCapacityError(
                 f"dial participant pool {type(p.pool).__name__} is not a "
                 f"VMM-backed HybridLinearKVPool"
+            )
+        if getattr(p.pool, "use_mla", False):
+            # DESIGN_330 section 7 names MLA as refused; until now it was only
+            # blocked indirectly. Its write path carries a different pool
+            # geometry than the one the capacity model measures.
+            raise KvCapacityError(
+                "--enable-vram-dial Stage 1 does not support MLA KV pools "
+                "(DESIGN_330 section 7); the capacity model measures the "
+                "MHA row geometry."
             )
     targets = [p for p in participants if p.is_target]
     drafts = [p for p in participants if not p.is_target]

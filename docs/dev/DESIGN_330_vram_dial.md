@@ -197,19 +197,42 @@ Ledger I/O failures log loudly but never take serving down.
   clamp + exact reconcile at the first boundary),
   `--vram-dial-consensus-interval N` (default 8).
 
-## 9b. Known limit (card-run finding, open)
+## 9b. Growth past the boot ceiling: the store bound (#352, resolved)
 
-Slot ids ABOVE the boot fitted ceiling carry an open defect: sustained
-10-way 30k-token concurrency after growth (held tokens ~0.88 of the grown
-ceiling) hits a `store_kvcache` `index < size_limit` device assert on a
-2-kv-head rank. The bound passed is live (`pool.size + page`), and the
-owner-rule row/draft bounds are arithmetically covered, so the escaping
-index implicates a path first exercised when allocation reaches the grown
-id region (low ids are handed out first; a 260k-token sequential fill with
-peak 80k concurrent was clean). Needs a dedicated debug window
-(compute-sanitizer, SGLANG_POISON_POOL_DATA). Until resolved: dial-down/up
-WITHIN the boot ceiling is fully validated; growth beyond it carries this
-known limit. Registered in INTEGRATION_R3_VALIDATION (#330 section).
+The first card run hit a `store_kvcache` `index < size_limit` device assert
+under sustained 10-way 30k-token concurrency after growth, on a rank whose
+draft pool has 256-byte rows. The bound was NOT stale in Python: it was
+stale IN THE GRAPH. `store_cache` passes `size_limit` as a by-value kernel
+parameter, so a CUDA graph records the number it saw at capture time and
+replays it forever — and this design never re-captures on purpose. After a
+grow, the allocator hands out ids above the boot ceiling and a pre-growth
+graph rejects them as out of range. It takes a load holding MORE than the
+boot ceiling at once to reach such an id (low ids are handed out first),
+which is why a 260k sequential fill with 80k peak concurrent was clean.
+
+Only the DRAFT pool blew up, and for a structural reason worth stating: on
+the weighted lane every target write carries an owner mask and therefore
+takes `masked_set_kv_buffer_kernel` (no bound at all), while the draft pool
+is `_draft_non_dcp` and writes raw global `out_cache_loc` through
+`store_cache`. The draft pool is also the only participant whose row count
+grows with C — the target's compact rows are min-ruled against boot slack
+and typically do not move.
+
+Fix (`mem_cache/memory_pool.py:graph_safe_store_bound`): the bound handed to
+the kernel is the KV buffer's ROW COUNT, i.e. the boot VA reservation, which
+`KvVmmBufferOwner.finalize` refuses to exceed. It is valid for the lifetime
+of any graph captured over those buffers. Deliberately NOT gated on capture
+mode — `PrefillCudaGraphRunner.capture()` does not set that flag, and a
+bound whose correctness depends on every capture site raising a flag is the
+same defect one level up. Widening costs no safety: the band it newly admits
+is above the committed span and therefore UNMAPPED, so an escaping id still
+faults hard. Off the dial lane the buffers are exactly `size + page_size`
+rows and the bound is unchanged.
+
+Commits additionally verify the result (`verify_pool_reached_capacity`):
+every participant pool must report the requested backed rows AND a store
+bound that still covers `C_new + page`. A pool that cannot is refused with
+the numbers instead of asserting on a legal slot id later.
 
 ## 10. Deliberately NOT built
 

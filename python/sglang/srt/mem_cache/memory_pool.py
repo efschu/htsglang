@@ -127,6 +127,50 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+def graph_safe_store_bound(live_limit: int, cache_rows: int) -> int:
+    """The slot bound to hand ``store_cache`` (#352).
+
+    ``store_kvcache`` takes ``size_limit`` as a by-value kernel parameter, so a
+    CUDA graph records the number it was given AT CAPTURE TIME and replays that
+    number forever. The pool's live bound (``size + page_size``) is therefore
+    only correct for an eager launch: after a #330 capacity growth the pool's
+    ``size`` rises, the allocator hands out the new slot ids, and a graph
+    captured before the growth rejects them with
+    ``index >= 0 && index < size_limit`` -- a device assert on a LEGAL id.
+    That is the whole of #352: >= 10 x 30k concurrent sessions are the first
+    load that holds more than the boot ceiling at once, so they are the first
+    to reach an id above it (low ids are handed out first).
+
+    A bound that may end up inside a graph has to hold for the graph's whole
+    lifetime, and exactly one number does: the KV buffer's ROW COUNT. The VMM
+    lane reserves the virtual address range once at boot and never moves or
+    reshapes it (that is what keeps captured graphs replayable at all), and
+    ``KvVmmBufferOwner.finalize`` refuses any capacity above that reservation
+    -- so ``cache_rows`` is an upper bound on every ``size + page_size`` the
+    pool can ever reach.
+
+    NOT gated on capture mode, deliberately. Gating would re-create the bug
+    class one level up: ``get_is_capture_mode()`` is set by each graph runner
+    individually and ``PrefillCudaGraphRunner.capture()`` does not set it at
+    all (it is covered today only because the CUDA prefill default backend is
+    the breakable graph, which ``get_is_capture_mode`` happens to detect). A
+    bound whose correctness depends on every present and future capture site
+    remembering to raise a flag is the same "one consumer never got the
+    treatment" defect that #345 and #352 both were.
+
+    Widening costs no safety. The band this newly admits is
+    ``(size + page_size, cache_rows]``, i.e. rows above the committed span,
+    which on the VMM lane are UNMAPPED: an id escaping into them still fails
+    hard (illegal access at a named address) instead of touching a live row.
+    Every MAPPED row was already inside the old bound. Off the dial lane the
+    buffers are allocated at exactly ``size + page_size`` rows, so
+    ``live_limit == cache_rows`` and the bound is unchanged -- byte-identical
+    behaviour on the default path, and the strict live check stays available
+    host-side via ``maybe_detect_oob``.
+    """
+    return max(int(live_limit), int(cache_rows))
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -142,14 +186,15 @@ def _set_kv_buffer_impl(
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+        k_cache_rows = k_cache.view(-1, row_dim)
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
-            k_cache.view(-1, row_dim),
+            k_cache_rows,
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
-            size_limit=size_limit,
+            size_limit=graph_safe_store_bound(size_limit, k_cache_rows.shape[0]),
         )
 
     if _is_cpu and _cpu_has_amx_support:
@@ -2009,6 +2054,23 @@ class MHATokenToKVPool(KVCache):
     def post_capture_backed_bytes(self) -> int:
         return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
 
+    @property
+    def store_bound_rows(self) -> int:
+        """Rows the K/V buffers physically address = the largest
+        ``size + page_size`` this pool can ever reach (#352).
+
+        Off the #330 dial lane the buffers are allocated at exactly
+        ``size + page_size``, so this IS the live bound. On the dial lane it is
+        the boot VA reservation, which ``KvVmmBufferOwner.finalize`` refuses to
+        exceed -- which is what makes it safe for a CUDA graph to bake it in.
+        """
+        buffers = getattr(self, "k_buffer", None)
+        if not buffers:
+            return int(self.size) + int(self.page_size)
+        buf = buffers[0]
+        row_dim = int(self.row_dim)
+        return int(buf.numel() // row_dim) if row_dim > 0 else int(buf.shape[0])
+
     def runtime_set_backing_tokens(self, num_tokens: int) -> int:
         """#330 dial: converge the VMM backing to ``num_tokens`` slots at
         runtime (grow maps + zeroes new rows; shrink decommits the tail back
@@ -2987,6 +3049,17 @@ class HybridLinearKVPool(KVCache):
     @property
     def full_pool_backed_rows(self) -> int:
         return int(self.full_kv_pool.size)
+
+    @property
+    def store_bound_rows(self) -> int:
+        """Rows the full-attention KV buffers physically address (#352).
+
+        The lifetime ceiling of every ``store_kvcache`` bound this pool can
+        ever pass -- including the ones a CUDA graph baked in at capture time.
+        The dial's growth must stay at or below it; see
+        ``graph_safe_store_bound``.
+        """
+        return int(self.full_kv_pool.store_bound_rows)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()

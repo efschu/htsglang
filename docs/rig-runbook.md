@@ -280,8 +280,18 @@ curl -s -X POST http://127.0.0.1:<port>/vram_budget \
 - Stage-1 limits (refused loudly at boot): requires weighted uneven DCP +
   the hybrid-linear pool family; not combinable with memory saver, PD
   disaggregation, hierarchical-cache storage, kv-session-offload,
-  weightless-KV ranks, dual-group lane, DP > 1, kv-canary, or the HND KV
-  layout. Flag unset = byte-identical behavior.
+  weightless-KV ranks, dual-group lane, DP > 1, kv-canary, hisparse, MLA
+  pools, the DFLASH speculative lane (its solo draft pool's slot tables are
+  frozen at the boot ceiling), or the HND KV layout. Flag unset =
+  byte-identical behavior.
+- Growth past the boot ceiling is validated (#352): the store bound a CUDA
+  graph bakes in at capture time is the KV buffer's row count (the boot VA
+  reservation), not the pool's momentary size, so graphs captured before a
+  grow keep accepting the ids the allocator hands out after it. Measured on
+  this rig: C 251965 -> 341861, 10 concurrent 29k-token sessions, peak
+  occupancy 0.85 (290582 live tokens), 10/10 correct recall, no device
+  assert. Every commit additionally verifies each pool reached the new
+  capacity and refuses loudly with the numbers if one did not.
 
 ### 4.2 Co-location (several ranks on one physical GPU)
 
