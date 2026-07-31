@@ -1763,7 +1763,48 @@ OOMs in the GDN prefill scratch on the first long prompt; 2700 MiB holds.
 A successful warmup proves nothing about prefill headroom — test with a
 real long prompt before calling a reserve value good.
 
-### 6.6 Tree speculation (`--speculative-eagle-topk > 1`) loses on this rig
+### 6.6 INT8 W8A8 needs a locally built sgl-kernel wheel (#327)
+
+The installed `sglang-kernel` 0.4.4 has no sm120 arm in `int8_scaled_mm`, so
+an INT8 W8A8 checkpoint crashes the 5090 rank at its first forward
+(`No implemented int8_scaled_mm for current compute capability`). The wheel
+built from `feat/int8-sm120-port` closes that gap; recipe, provenance and
+rollback live in `docs/dev/TASK_327_INT8_SM120_WHEEL.md`. That wheel is NOT
+installed by default — install it for an INT8 window and roll it back
+afterwards, the venv is shared.
+
+Discriminator to tell the two apart without a GPU:
+
+```bash
+SO=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/sgl_kernel/sm100/common_ops.abi3.so
+strings "$SO" | grep -c "No implemented int8_scaled_mm for compute capability sm"   # 1 = sm120 wheel
+strings "$SO" | grep -c "No implemented int8_scaled_mm for current compute capability"  # 1 = stock
+```
+
+With that wheel in place, the INT8 checkpoint boots on the standard TP=3
+recipe (section 4) with only the model path swapped:
+
+```bash
+--model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8
+```
+
+No `--quantization` flag: `compressed-tensors` is autodetected, `lm_head` and
+the MTP namespace ship unquantized and the fork builds the draft dense by
+itself. Measured 2026-07-31 against the FP8 reference on the identical split
+(`rank_tp_ratio=[29607, 17780, 17780]`, MLP units `[62, 37, 37]`): prefill
+**+26,5 % at s=1 and +23,1 % at s=8**, decode ms/Verify unchanged within its
+floor at bs=1 and bs=8. Full table:
+`docs/dev/INTEGRATION_R3_VALIDATION.md`, section "#327 INT8-W8A8-Bringup".
+
+Two live limits, neither hit by that split but both still open: the
+channel-strategy INT8 scheme returns `weight_block_size = None`, so uneven-TP
+shard coarsening does not fire and a split that lands off a multiple of 16
+(K) / 8 (N) aborts inside CUTLASS mid-forward; and `checkpoint_compute_format`
+has no int8 lane entry, so `auto-performance` scores these checkpoints on the
+warned bf16 fallback. Both are described in
+`docs/dev/ANALYSE_319_int8_lane.md` sections 2d and 3a.
+
+### 6.7 Tree speculation (`--speculative-eagle-topk > 1`) loses on this rig
 
 Measured 2026-07-28 (#139), section 4.5 recipe, Qwen3.6-27B-MTP-Q3_K_M-GGUF,
 TP=1 on the 5090, `--mem-fraction-static 0.90`, NEXTN, `--speculative-num-steps
