@@ -357,6 +357,146 @@ seconds of video is far below where the #339 window could resolve 1.44x, and
 nine items on it is deliberately past sensible granularity — that arm was cut
 that finely to load the seam, not to be fast.
 
+## Preview taps: what they cost the main chain (2026-07-31 19:57-20:00Z)
+
+`scripts/video_enhance/preview_tap_bench.py --card 1 --frames 96 --reps 4`,
+RTX 5090, both lanes on, `fps_divisor` 1, against a never-reading viewer.
+A-vs-A noise floor first, then interleaved off/on arms. Raw records in
+`/spinning/gpu-battery-results/2026-07-31_339b/taps_v3/`.
+
+| arm | fps mean | stdev |
+|---|---|---|
+| taps off | 33.615 | 0.125 |
+| taps on | 31.317 | 0.297 |
+
+**Taps cost 6.84 percent of main-chain throughput against a 3.44 percent
+noise floor — MEASURABLE, and reported as a finding rather than smoothed
+away.** The output is byte-identical with and without the taps (same sha256
+over the elementary stream), so the cost is contention for the device, not a
+change to the deliverable.
+
+Preview delivery in the same run, with a viewer that never reads a byte:
+
+| lane | offered | encoded | dropped | delivered |
+|---|---|---|---|---|
+| input | 96 | 96 | 0 | 100% |
+| output | 191 | 150 | 39 | 78.5% |
+
+The output lane carries the interpolated frames, so it sees twice the rate and
+is the one that drops — which is the §8.1 rule working: a viewer who does not
+read costs preview frames and the job still finished with a byte-identical
+output. `fps_divisor` is the lever that trades that 6.84 percent down.
+
+### Two defects the measurement found that the tests did not
+
+Both had the same shape, and it is worth naming: a preview that fails is
+deliberately swallowed so it cannot take a job down, so **a broken preview
+presents as a healthy job with a silent tap**. Only a measurement that reads
+the preview's own counters can see it.
+
+1.  **The first run measured nothing.** `offered: 0` on both lanes.
+    `build_preview_lanes` returns `by_stage` mapping a stage to *lanes*, the
+    executor calls `offer` on what it is handed, and `PreviewLane` had no
+    `offer` — so all 861 frames raised `AttributeError` into the swallow. The
+    unit tests all drove `PreviewTap` directly and could not see it. Fixed by
+    delegating, and pinned by a test that drives what the server builds.
+2.  **The second run had working taps and a dead encoder.** `offered: 96` but
+    `encoded: 0`, with `incorrect usage of CPU input buffer` — the open
+    PyNvVideoCodec defect from §9.5. The preview config defaulted its backend
+    to `auto`, which selects PyNvVideoCodec; the main chain has always pinned
+    ffmpeg for exactly this reason. The preview now pins it too.
+
+The +6.84 percent above is the third run, the first one in which both lanes
+actually encoded frames. The two earlier numbers (+1.05 percent with no
+frames offered, +5.83 percent with frames offered and no encoder) are void
+and are recorded here only so they cannot be mistaken for measurements.
+
+## Per-card, per-stage rates — the Regime-B table (2026-07-31 19:48-19:53Z)
+
+`scripts/video_enhance/stage_rate_sweep.py --cards 1,0,2`, one card at a time
+in its own process, two precision passes per card (the chain's fp16 for
+resize/RIFE/encode, fp32 for SR because the CUDA provider runs the pinned ONNX
+at its exported precision). Raw records in
+`/spinning/gpu-battery-results/2026-07-31_339b/stage_rates_v2/`.
+NVML 1 = RTX 5090, NVML 0 and 2 = RTX 3080.
+
+**RIFE on a 3080 is measured here for the first time.**
+
+ms per invocation:
+
+| stage @ resolution | 0 (3080) | 1 (5090) | 2 (3080) |
+|---|---|---|---|
+| sr @ 960x540 | 88.82 | 35.15 | 88.78 |
+| sr @ 1280x720 | 157.10 | 64.44 | 156.57 |
+| sr @ 1920x1080 | 352.54 | 146.12 | 351.75 |
+| resize @ 3840x2160 | 13.97 | 6.22 | 13.92 |
+| resize @ 5120x2880 | 25.55 | 13.96 | 25.27 |
+| resize @ 7680x4320 | 48.80 | 25.16 | 48.52 |
+| rife @ 1920x1080 | 8.97 | 5.16 | 8.76 |
+| rife @ 3840x2160 | 30.85 | 11.24 | 30.71 |
+| encode @ 1920x1080 | 19.59 | 20.79 | 22.30 |
+| encode @ 3840x2160 | 34.86 | 32.64 | 36.86 |
+
+Relative to the fastest card on each row — the comparative-advantage view,
+which is the form the assignment question is actually asked in:
+
+| stage @ resolution | 0 | 1 | 2 |
+|---|---|---|---|
+| sr @ 960x540 | 2.53x | 1.00x | 2.53x |
+| sr @ 1920x1080 | 2.41x | 1.00x | 2.41x |
+| resize @ 3840x2160 | 2.25x | 1.00x | 2.24x |
+| resize @ 7680x4320 | 1.94x | 1.00x | 1.93x |
+| rife @ 1920x1080 | 1.74x | 1.00x | 1.70x |
+| rife @ 3840x2160 | 2.75x | 1.00x | 2.73x |
+| encode @ 1920x1080 | 1.00x | 1.06x | 1.14x |
+| encode @ 3840x2160 | 1.07x | 1.00x | 1.13x |
+
+### What the table says
+
+**The 3080 column is not flat, so comparative advantage exists.** Its
+disadvantage ranges from ~1.0x (encode) through 1.7x (RIFE at 1080p) to 2.75x
+(RIFE at 4K) and 2.5x (SR). Regime B is therefore not ruled out by the data,
+which is the question this sweep was run to answer. A flat column would have
+closed the post.
+
+**The historical vs-pipeline mapping is contradicted by the numbers.** That
+mapping put ESRGAN on the two 3080s and RIFE on the 5090. SR is the 3080's
+*worst* stage (2.4-2.5x) and RIFE at 1080p is one of its *best* (1.74x), so
+comparative advantage points the other way. The user's framing correction
+that the mapping was a convenience of an early development state and not a
+template is supported by measurement, not just by argument.
+
+**Two nominally identical 3080s agree to within ~2% on every row**, which is
+the independent check that the harness measures the card rather than the
+session.
+
+**The 5090's SR figure reproduces prior work**: 35.15 ms at 960x540 against
+35.19 ms in the single-card P1 post and 35.58 ms in the §9.4 multi-card run.
+
+### What the table does not say
+
+*   **The encode row is below the measurement's resolution and must not be
+    read as "a 3080 encodes faster than a 5090".** The spread across the
+    three cards is 6-14%. Five of the six probe passes had noise floors of
+    0.28-2.25%, but one — card 2's chain pass — came in at 23.28%, and the
+    merged floor takes the worst contributor by design. The defensible
+    statement is that encode is at *parity* across all three cards, which is
+    still the finding that matters: encode does not scale with the card, so
+    the 3080's disadvantage is stage-dependent. NVENC is fixed-function, and
+    on this path the measurement is dominated by the ffmpeg host round trip
+    (§9.5) rather than by the encoder.
+*   **SR was measured on the ONNX Runtime CUDA provider at fp32**, not on the
+    TensorRT fp16 path. The ratio may move when that engine exists, which is
+    the open fp16-parity post.
+*   **RIFE's 5090 figure here (5.16 ms at 1080p) is higher than §9.4's
+    in-run 3.06 ms.** The probe times an isolated stage on synthetic tensors;
+    §9.4 timed the stage inside a warm chain. Recorded as a difference rather
+    than reconciled, because nothing yet says which is the number a planner
+    should use.
+*   **No optimiser consumes this yet.** The table is data; the assignment
+    search over the full space (Regime A replicas, Regime B stage
+    assignment, mixed forms) is not written.
+
 ## The PSNR gate that was never met and should not have existed
 
 `multicard_matches_same_card_control` was declared a pass/fail gate at 40 dB

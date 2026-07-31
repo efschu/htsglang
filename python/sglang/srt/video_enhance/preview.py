@@ -136,7 +136,14 @@ class PreviewConfig:
     ingress_depth: int = DEFAULT_INGRESS_DEPTH
     byte_depth: int = DEFAULT_BYTE_DEPTH
     codec: str = "h264"
-    encode_backend: str = "auto"
+    #: ffmpeg, not "auto". "auto" selects PyNvVideoCodec, which on this rig
+    #: rejects a device tensor with "incorrect usage of CPU input buffer" --
+    #: the defect TASK_333 §9.5 records as open and undiagnosed. The main
+    #: chain has always pinned ffmpeg for that reason; a preview built on
+    #: "auto" inherited the bug, and because a failing lane is deliberately
+    #: swallowed it presented as a preview that delivered zero bytes while
+    #: the job ran perfectly. Pin the backend that works until §9.5 closes.
+    encode_backend: str = "ffmpeg"
 
     def __post_init__(self) -> None:
         if self.width < 16:
@@ -273,6 +280,20 @@ class PreviewLane:
     @property
     def stats(self) -> PreviewStats:
         return self.tap.stats
+
+    def offer(self, frame: Frame) -> bool:
+        """Delegate to the tap, so a lane *is* a tap as far as the executor sees.
+
+        ``PreviewLanes.by_stage`` holds lanes, and the executor calls
+        ``offer`` on whatever it is given. Without this method the executor
+        raised ``AttributeError`` on every single frame -- and because a tap
+        that raises is deliberately swallowed so it cannot fail the job, the
+        result was a preview that silently delivered nothing while the job
+        looked perfectly healthy. It was found by a throughput measurement
+        that reported ``offered: 0``, not by the tests, which had exercised
+        ``PreviewTap`` directly and never the wiring around it.
+        """
+        return self.tap.offer(frame)
 
     def _build_stages(self) -> None:
         """Colour conversion and encoder for the preview, built on first use."""

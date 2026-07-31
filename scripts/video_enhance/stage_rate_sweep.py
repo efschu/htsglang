@@ -58,9 +58,35 @@ def nvml_card_names(cards: list[str]) -> dict[str, str]:
     return out
 
 
-def run_one_card(card: str, args, workdir: Path) -> Path:
+#: Stages whose probe runs at the chain's working dtype.
+CHAIN_DTYPE_STAGES = ("resize", "rife", "encode", "decode")
+
+#: Super-resolution is probed separately because it does not run at the
+#: chain's dtype. ONNX Runtime's CUDA provider executes the graph at the
+#: precision it was exported at -- fp32 for the pinned artifact -- and refuses
+#: an fp16 request rather than silently casting, which is the right refusal
+#: and the reason a single-dtype sweep produced no SR row at all on the first
+#: attempt. The production chain does exactly this split (see
+#: chunk_worker.build_chunk_stages, which passes precision="fp32" whenever the
+#: provider is "cuda"), so probing it this way measures what actually runs.
+SR_STAGE = "sr"
+
+
+def run_one_card(
+    card: str,
+    args,
+    workdir: Path,
+    *,
+    pass_name: str = "",
+    dtype: str | None = None,
+    skip: set[str] | None = None,
+) -> Path:
     """One probe process, pinned to one card. Returns the report path."""
-    report = workdir / f"p1_card{card}.json"
+    suffix = f"_{pass_name}" if pass_name else ""
+    report = workdir / f"p1_card{card}{suffix}.json"
+    dtype = dtype or args.dtype
+    skip = set(skip or ())
+    skip |= {s.strip() for s in args.skip_stages.split(",") if s.strip()}
     env = dict(os.environ)
     # Order first, and it is not optional -- see the module docstring.
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -79,7 +105,7 @@ def run_one_card(card: str, args, workdir: Path) -> Path:
         "--out",
         str(report),
         "--dtype",
-        args.dtype,
+        dtype,
         "--iterations",
         str(args.iterations),
         "--posts",
@@ -93,10 +119,10 @@ def run_one_card(card: str, args, workdir: Path) -> Path:
         cmd += ["--rife-weight-dir", args.rife_weight_dir]
     if args.clip:
         cmd += ["--clip", args.clip]
-    if args.skip_stages:
-        cmd += ["--skip-stages", args.skip_stages]
+    if skip:
+        cmd += ["--skip-stages", ",".join(sorted(skip))]
 
-    print(f"== card {card} ==", flush=True)
+    print(f"== card {card}{' ' + pass_name if pass_name else ''} ==", flush=True)
     completed = subprocess.run(cmd, env=env, timeout=args.timeout_s)
     if completed.returncode != 0:
         print(
@@ -140,12 +166,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="#333 per-card per-stage rate sweep")
     parser.add_argument("--cards", default="1,0,2", help="comma-separated NVML indices")
     parser.add_argument("--out", default="/tmp/stage_rates")
-    parser.add_argument("--dtype", default="fp16")
+    parser.add_argument("--dtype", default="fp16", help="the chain's working dtype")
+    parser.add_argument(
+        "--sr-dtype",
+        default="fp32",
+        help=(
+            "precision for the SR rows. Defaults to fp32 because the CUDA "
+            "provider runs the pinned ONNX at its exported precision and "
+            "refuses an fp16 request rather than casting silently"
+        ),
+    )
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--posts", default="P1")
     parser.add_argument("--sr-provider", default="cuda")
     parser.add_argument("--model-dir", default="/spinning/llm_stuff/k3-models")
-    parser.add_argument("--rife-weight-dir", default=None)
+    parser.add_argument(
+        "--rife-weight-dir",
+        default="/spinning/llm_stuff/k3-models/rife",
+        help="RIFE weights; without it the RIFE rows refuse to run on random weights",
+    )
     parser.add_argument("--clip", default=None, help="clip for the decode rows")
     parser.add_argument("--skip-stages", default="")
     parser.add_argument("--timeout-s", type=int, default=900)
@@ -157,23 +196,36 @@ def main(argv: list[str] | None = None) -> int:
     names = nvml_card_names(cards)
     print(json.dumps({"cards": names}, indent=2), flush=True)
 
+    # Two passes per card, because the chain itself runs two precisions: the
+    # SR graph at its exported fp32 under the CUDA provider, everything else
+    # at the chain's working dtype. One pass at one dtype cannot measure both,
+    # and a sweep that measured SR at the wrong precision would price the
+    # single most expensive stage in the chain against work no card does.
+    passes = [
+        ("chain", args.dtype, {SR_STAGE}),
+        ("sr", args.sr_dtype, set(CHAIN_DTYPE_STAGES)),
+    ]
+
     reports: list[dict] = []
     for card in cards:
-        path = run_one_card(card, args, workdir)
-        if not path.is_file():
-            print(f"card {card} produced no report at {path}", file=sys.stderr)
-            continue
-        payload = json.loads(path.read_text())
-        # The child saw one card as ordinal 0; re-label its rows with the NVML
-        # index the planner and the arbiter speak in. Doing it here rather
-        # than in the child keeps the child's own record honest about what it
-        # actually saw.
-        for sample in payload.get("samples", ()):
-            sample["card"] = card
-        payload.setdefault("host", {})["nvml_index"] = card
-        payload["host"]["card_name"] = names.get(card, "unknown")
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        reports.append(payload)
+        for pass_name, dtype, skip in passes:
+            path = run_one_card(
+                card, args, workdir, pass_name=pass_name, dtype=dtype, skip=skip
+            )
+            if not path.is_file():
+                print(f"card {card} produced no report at {path}", file=sys.stderr)
+                continue
+            payload = json.loads(path.read_text())
+            # The child saw one card as ordinal 0; re-label its rows with the NVML
+            # index the planner and the arbiter speak in. Doing it here rather
+            # than in the child keeps the child's own record honest about what it
+            # actually saw.
+            for sample in payload.get("samples", ()):
+                sample["card"] = card
+            payload.setdefault("host", {})["nvml_index"] = card
+            payload["host"]["card_name"] = names.get(card, "unknown")
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            reports.append(payload)
 
     if not reports:
         print("no card produced a report", file=sys.stderr)

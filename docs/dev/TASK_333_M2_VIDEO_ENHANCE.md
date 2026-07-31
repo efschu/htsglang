@@ -256,8 +256,8 @@ Stated honestly, extending the design's own list:
 *   ~~**Single card for the executor.**~~ Closed by #339: `multicard.py` runs
     the planner's chunks concurrently, one process per card, and stitches
     them in timeline order. See §9.
-*   **No live watch.** The preview taps of §8.1 are not built. Client
-    liveness (§8.2) is — see §11.
+*   ~~**No live watch.**~~ Built by #344a — see §13. Client liveness (§8.2)
+    is separate and is §11.
 *   **No Regime B.** No stage split across cards. P2 is measured so the
     decision has data behind it before any Regime-B code exists.
 *   **No int8 compute.** Deferred by §8.7 and by the standing rule that lossy
@@ -847,3 +847,72 @@ soften.
     is only safe once an item is known to have produced no output, and the
     spool file makes that knowable — but it is not implemented, and a silent
     retry of a half-written item would be worse than the refusal.
+
+---
+
+## 13. Live preview taps (§8.1), built in #344a
+
+`preview.py`, attached in `pipeline.py`, served from `server.py` at
+`GET /v1/video/preview/{job_id}/{input|output}`. Off unless the enhance
+request passes `preview: true`, so a request that does not ask for one builds
+no tap and takes the path it always took.
+
+**The rule is structural, not a tuning goal.** `PreviewTap.offer` is an
+ordinary synchronous method with no `await` anywhere in it, so the chain
+cannot be suspended by a tap even for one event-loop turn. That is why the
+ingress buffer is a plain list with a hand-written drop rule rather than
+`BoundedRing`, whose `put` is a coroutine by design — even its drop path takes
+an `asyncio.Condition`, which is an await, which is a place a stall can live.
+The buffer drops the *oldest* frame, because a preview frame whose moment has
+passed is worth less than the one arriving now. Back-pressure exists but is
+confined to the lane: a viewer who stops reading fills the byte ring, stalls
+the preview encoder, and the tap then drops on ingress.
+
+Frames are dropped, never bytes. An H.264 elementary stream cannot survive
+having byte ranges removed from its middle, so decimation happens before the
+encoder and a viewer always receives a well-formed stream.
+
+Taps attach by stage kind rather than by position, because the chain is
+request-level configuration and a tap pinned to "the third stage" would tap a
+different thing per request. Input is the output of `color_to_rgb`; output is
+the last RGB stage before `color_to_yuv`.
+
+### 13.1 What a tap costs, measured
+
+**6.84 percent of main-chain throughput against a 3.44 percent noise floor —
+measurable.** Both lanes, `fps_divisor` 1, on the 5090, with the output
+byte-identical either way. It is a finding, not something to smooth away: the
+downscale and the side encode do not *block* the chain, they *compete* with
+it for the device, and the structural argument was never going to settle
+that. `fps_divisor` is the lever, and the preview lane holds 100 percent
+delivery on the input side and 78.5 percent on the output side against a
+viewer that never reads a byte. Numbers and method in
+`TASK_333_M2_MEASUREMENTS.md`.
+
+### 13.2 The failure mode this feature has, named
+
+A preview that fails is deliberately swallowed so it cannot take a job down —
+the job is the product and the preview is a convenience. The cost of that
+choice is that **a broken preview presents as a perfectly healthy job with a
+silent tap**, and nothing in the pipeline's own statistics shows it. Two
+separate defects hid there during this build and both were found by the
+throughput measurement reading the preview's counters, not by the tests: a
+missing `offer` delegation that raised `AttributeError` on all 861 frames,
+and a default encoder backend that selected the PyNvVideoCodec path §9.5
+records as broken. Both are fixed, both are pinned by tests, and the general
+lesson is recorded here: the preview's own counters are the only place its
+health is visible, which is why `GET /v1/video/enhance/{id}` reports them
+next to the pipeline's.
+
+### 13.3 What is not built
+
+*   **No preview for a job that did not ask for one.** The tap map is fixed
+    when the executor is built, so a viewer cannot attach to a running job
+    that started without `preview: true`. The endpoint returns 409 saying so
+    rather than an empty stream a client would read as a stalled encoder.
+*   **No container, no HLS/DASH.** The body is a bare elementary stream,
+    which is what lets a player start on the first IDR with no duration to
+    declare. A browser `<video>` element wants a container; the extension
+    client would need one, and that is a follow-on.
+*   **No adaptive `fps_divisor`.** The cost is measured and the lever is
+    exposed, but nothing turns it automatically when the chain falls behind.

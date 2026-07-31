@@ -186,6 +186,81 @@ class StalledViewerCostsOnlyPreviewFramesTest(CustomTestCase):
         self.assertEqual(with_tap.frames_encoded, without.frames_encoded)
         self.assertEqual(with_tap.frames_decoded, without.frames_decoded)
 
+    def test_the_lanes_the_builder_produces_actually_receive_frames(self):
+        """The integration the unit tests missed, and a real bug lived in it.
+
+        ``build_preview_lanes`` returns ``by_stage`` mapping a stage to
+        *lanes*, and the executor calls ``offer`` on whatever it is handed.
+        ``PreviewLane`` had no ``offer``, so every frame raised
+        ``AttributeError`` -- which the executor swallows on purpose, because
+        a broken preview must not fail a job. The job therefore looked
+        healthy while the preview delivered nothing, and 861 swallowed
+        exceptions went unnoticed until a throughput measurement reported
+        ``offered: 0``.
+
+        Every earlier test in this file drove ``PreviewTap`` directly and so
+        could not see it. This one drives what the server actually builds.
+        """
+        from sglang.srt.video_enhance.pipeline import PipelineExecutor
+        from sglang.srt.video_enhance.ring import OverloadPolicy
+
+        request = ChainRequest(
+            source=Resolution(128, 128),
+            target=Resolution(64, 64),
+            fps_multiplier=1,
+            enable_sr=False,
+            enable_resize=True,
+            streams_in_flight=1,
+        )
+        chain = build_chain(request)
+        lanes = build_preview_lanes(chain, fps=24)
+        self.assertTrue(lanes.by_stage, "the builder produced no attachment points")
+
+        class Passthrough:
+            def process(self, frames):
+                return tuple(frames)
+
+        class Sink:
+            def process(self, frames):
+                return (b"x",)
+
+        stages = {
+            spec.kind: (Sink() if spec.kind is StageKind.ENCODE else Passthrough())
+            for spec in chain.stages
+        }
+        total = 20
+
+        async def source():
+            for i in range(total):
+                yield Frame(
+                    data=_FakeCuda(),
+                    resolution=Resolution(128, 128),
+                    format=PixelFormat.NV12,
+                    index=i,
+                )
+                await asyncio.sleep(0)
+
+        async def sink(payload: bytes) -> None:
+            return None
+
+        executor = PipelineExecutor(
+            job_id="wiring",
+            chain=chain,
+            stages=stages,
+            source=source(),
+            sink=sink,
+            ring_depth=2,
+            policy=OverloadPolicy.STALL,
+            use_cuda_events=False,
+            taps=dict(lanes.by_stage),
+        )
+        asyncio.run(executor.run())
+        # The lanes were never started, so nothing drains them -- but the
+        # frames must still have been *offered*, which is the thing that was
+        # broken. Zero offered is the exact signature of the bug.
+        self.assertEqual(lanes.input_lane.stats.offered, total)
+        self.assertGreater(lanes.input_lane.stats.dropped_full, 0)
+
     def test_a_tap_that_raises_does_not_fail_the_job(self):
         """A preview is a convenience; the job is the product."""
 
