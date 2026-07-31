@@ -76,11 +76,17 @@ def full_path(dump_dir: str, rank: int, astep: int, name: str) -> str:
     return os.path.join(dump_dir, f"full_rank{rank}_astep{astep:03d}_{safe}.pt")
 
 
-def exact_delta(
-    ref_dir: str, cmp_dir: str, ref_rank: int, cmp_rank: int, astep: int, name: str
+def exact_delta_pair(
+    ref_dir: str,
+    cmp_dir: str,
+    ref_rank: int,
+    cmp_rank: int,
+    ref_astep: int,
+    cmp_astep: int,
+    name: str,
 ) -> Optional[float]:
-    a = full_path(ref_dir, ref_rank, astep, name)
-    b = full_path(cmp_dir, cmp_rank, astep, name)
+    a = full_path(ref_dir, ref_rank, ref_astep, name)
+    b = full_path(cmp_dir, cmp_rank, cmp_astep, name)
     if not (os.path.exists(a) and os.path.exists(b)):
         return None
     import torch
@@ -99,6 +105,20 @@ def main() -> int:
     ap.add_argument("--ref-rank", type=int, default=0)
     ap.add_argument("--cmp-rank", type=int, default=0)
     ap.add_argument("--astep", type=int, default=1)
+    ap.add_argument(
+        "--cmp-astep",
+        type=int,
+        default=None,
+        help=(
+            "forward index on the COMPARISON side, when the two arms did not "
+            "see the same number of forwards after the arming point. Any "
+            "request that reaches the server between `touch ARM` and the "
+            "probe -- a stray /health, a readiness poll, a second agent -- "
+            "shifts one trace against the other, and joining on `astep` then "
+            "compares two different tokens (visible as `input_ids` itself "
+            "DIFFERing). Defaults to --astep, i.e. the aligned case."
+        ),
+    )
     ap.add_argument("--label", default="")
     ap.add_argument("--write", default="")
     ap.add_argument(
@@ -108,12 +128,15 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    cmp_astep = args.astep if args.cmp_astep is None else args.cmp_astep
     ref = load(os.path.join(args.ref, f"layers_rank{args.ref_rank}.jsonl"), args.astep)
-    cmp_ = load(os.path.join(args.cmp, f"layers_rank{args.cmp_rank}.jsonl"), args.astep)
+    cmp_ = load(os.path.join(args.cmp, f"layers_rank{args.cmp_rank}.jsonl"), cmp_astep)
 
     lines: List[str] = []
     label = args.label or f"{args.ref} vs {args.cmp}"
-    lines.append(f"# layer delta, astep={args.astep}: {label}")
+    lines.append(
+        f"# layer delta, ref astep={args.astep} vs cmp astep={cmp_astep}: {label}"
+    )
     lines.append(f"# ref rank{args.ref_rank}: {len(ref)} tensors")
     lines.append(f"# cmp rank{args.cmp_rank}: {len(cmp_)} tensors")
     if not ref or not cmp_:
@@ -146,8 +169,14 @@ def main() -> int:
         n_differ += 1
         if first_differ is None:
             first_differ = name
-        exact = exact_delta(
-            args.ref, args.cmp, args.ref_rank, args.cmp_rank, args.astep, name
+        exact = exact_delta_pair(
+            args.ref,
+            args.cmp,
+            args.ref_rank,
+            args.cmp_rank,
+            args.astep,
+            cmp_astep,
+            name,
         )
         head_delta = max(
             (abs(x - y) for x, y in zip(a["head"], b["head"])), default=float("nan")

@@ -21,6 +21,7 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_plan_active,
     uneven_dcp_active,
+    uneven_dcp_kv_replicated,
     weightless_kv_active,
 )
 from sglang.srt.environ import envs
@@ -2485,7 +2486,74 @@ class ModelRunnerKVCacheMixin:
         # with a weightless role -- so no draft pool reaches this line either.
         if not self.is_draft_worker and weightless_kv_active():
             return self.model_config.get_total_num_kv_heads()
+        # EXCEPTION -- uneven-DCP KV replication (#345). Under
+        # ``uneven_dcp_kv_replicated`` the full-attention KV cache is TOKEN-
+        # sharded and every rank stores the FULL, replicated kv-heads: the
+        # attention write gathers this rank's uneven projection shard up to
+        # ``get_total_num_kv_heads()`` (``_dcp_write_gather``) and the paged
+        # wrappers are planned with ``dcp_full_kv_heads``. The HYBRID
+        # (mamba/GDN) and SWA-hybrid pool sites state this inline and were
+        # therefore correct; the plain-MHA pool -- the family a DENSE model
+        # lands in -- read this function and got the per-rank SHARD instead.
+        #
+        # That is not an over/under-allocation, it is silent corruption:
+        # ``masked_set_kv_buffer_kernel`` writes at ``loc * H * D`` with H
+        # taken from the CACHE tensor (the full count), so a pool row stride
+        # of the smaller shard makes every owned slot land at the wrong
+        # address -- an offset that grows with the slot id, i.e. depends on
+        # what the allocator handed out, i.e. on request order. Measured on
+        # Llama-3.1-8B (8 kv heads) at --rank-tp-ratio 3,1: pools of 6 and 2
+        # heads against an 8-head write/read, first decode step 57% wrong at
+        # L00.o_proj while prefill was at the noise floor.
+        if not self.is_draft_worker and uneven_dcp_kv_replicated(self.dcp_size):
+            return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+
+    def _dcp_token_sharded_pool_rows(self: ModelRunner, global_rows: int) -> int:
+        """Physical rows a full-attention MHA pool needs for ``global_rows``
+        GLOBAL token slots on THIS rank (#345).
+
+        Under the WEIGHTED uneven-DCP owner rule ``max_total_num_tokens`` is
+        the shared GLOBAL context budget C, and this rank stores only its
+        ``ratio_r / S`` share of it -- exactly as the HybridLinearKVPool and
+        the SWA-hybrid full sub-pool already do, through the same
+        ``dcp_compact_pool_rows`` rule. Sizing the plain-MHA pool at C instead
+        allocated the whole global context per rank, which with the head-count
+        fix above (per-rank shard -> full replicated heads) is an OOM at boot
+        rather than merely waste.
+
+        Returns ``global_rows`` unchanged off the weighted lane -- including
+        the even-modulo owner rule, where ``max_total_num_tokens`` already IS
+        the per-rank pool and the allocator's index space is the inflated one
+        (``max_total * cp_token_split_factor``).
+        """
+        from sglang.srt.distributed.utils import (
+            cp_token_split_factor,
+            get_cp_token_ratios,
+        )
+
+        if self.is_draft_worker or not uneven_dcp_active(self.dcp_size):
+            return int(global_rows)
+        if not uneven_dcp_kv_replicated(self.dcp_size):
+            return int(global_rows)
+        from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+        ratios = get_cp_token_ratios()
+        rows = dcp_compact_pool_rows(
+            int(global_rows),
+            cp_token_split_factor(self.dcp_size),
+            int(ratios[get_parallel().attn_dcp_rank]),
+        )
+        logger.info(
+            "Uneven-DCP token-sharded MHA pool: %d global context slots -> %d "
+            "physical rows on dcp_rank %d (vector %s), %d replicated kv heads.",
+            int(global_rows),
+            rows,
+            get_parallel().attn_dcp_rank,
+            ratios,
+            self.model_config.get_total_num_kv_heads(),
+        )
+        return rows
 
     def _swa_hybrid_dcp_lane(self: ModelRunner) -> bool:
         """Is this rank serving SWA-hybrid uneven DCP? (#96, Stage B)
@@ -2952,7 +3020,7 @@ class ModelRunnerKVCacheMixin:
             else:
                 PoolCls = current_platform.get_mha_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
-                    self.max_total_num_tokens,
+                    self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self._pool_kv_head_num(),
@@ -3024,7 +3092,7 @@ class ModelRunnerKVCacheMixin:
                 )
 
                 self.token_to_kv_pool = NPUMHATokenToKVPool(
-                    self.max_total_num_tokens,
+                    self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self._pool_kv_head_num(),
@@ -3190,7 +3258,7 @@ class ModelRunnerKVCacheMixin:
                     get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
                 )
                 self.token_to_kv_pool = MiniMaxSparseKVPool(
-                    size=self.max_total_num_tokens,
+                    size=self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     index_dtype=self.dtype,
@@ -3408,7 +3476,7 @@ class ModelRunnerKVCacheMixin:
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
-                        self.max_total_num_tokens,
+                        self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self._pool_kv_head_num(),
@@ -3431,7 +3499,7 @@ class ModelRunnerKVCacheMixin:
                         else mha_pool_class
                     )
                     self.token_to_kv_pool = pool_cls(
-                        self.max_total_num_tokens,
+                        self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self._pool_kv_head_num(),

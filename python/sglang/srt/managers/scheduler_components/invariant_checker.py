@@ -40,6 +40,28 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
+def _dcp_global_slot_total(
+    server_args: ServerArgs,
+    allocator: BaseTokenToKVPoolAllocator,
+    max_total_num_tokens: int,
+) -> int:
+    """``total`` for the full-pool leak check, in the allocator's slot space.
+
+    Thin adapter: it only resolves whether this process is on the uneven-DCP
+    token-sharded lane and hands the two scalars to
+    ``dcp_accounting_total_slots``, which states the rule and the reason once.
+    """
+    from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+    from sglang.srt.layers.dcp.owner import dcp_accounting_total_slots
+
+    dcp_size = int(getattr(server_args, "dcp_size", 1) or 1)
+    return dcp_accounting_total_slots(
+        max_total_num_tokens,
+        getattr(allocator, "size", None),
+        token_sharded_dcp=uneven_dcp_kv_replicated(dcp_size),
+    )
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
     is_hybrid_swa: bool
@@ -103,7 +125,24 @@ class SchedulerInvariantChecker:
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.max_total_num_tokens
+            # `available_size` counts the ALLOCATOR's index space, so `total`
+            # has to be the same quantity. They coincide everywhere except on
+            # the uneven-DCP token-sharded lane under the EVEN-MODULO owner
+            # rule (SGLANG_UNEVEN_DCP=1, SGLANG_UNEVEN_DCP_WEIGHTED=0): there
+            # `max_total_num_tokens` is this rank's PHYSICAL pool while the
+            # allocator hands out GLOBAL slot ids over
+            # `max_total * cp_token_split_factor(dcp_size)` of them, so the
+            # very first idle check reported `available` at exactly dcp_size x
+            # `total` and the server died at boot with "pool memory leak
+            # detected! [full] total=28640, available=57280" (#345). Under the
+            # weighted rule `max_total_num_tokens` already IS the global
+            # context C == the allocator size, so nothing moves there, and off
+            # the lane the two are the same number by construction.
+            total = _dcp_global_slot_total(
+                self.server_args,
+                self.token_to_kv_pool_allocator,
+                self.max_total_num_tokens,
+            )
         full_evictable_size = ps.full_evictable_size
         allocator = self.token_to_kv_pool_allocator
         if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:

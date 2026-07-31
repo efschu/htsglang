@@ -18038,6 +18038,226 @@ every BELEGT matched by a FREI in `/spinning/gpu-arb/log`, cards released at
 
 ---
 
+## #345: die uneven-DCP-Dekodier-Korruptheit -- nicht die Slot-Abbildung, sondern der Pool, den sie adressiert (2026-07-31)
+
+Branch `fix/uneven-dcp-slot-mapping` in `/spinning/wt-345`, Basis `8fd8874725`
+(der #343-Merge). Rohdaten in
+`/spinning/gpu-battery-results/2026-07-31_345_fix/` (`VERDICT.txt`).
+
+### Der Falsifikator, zuerst -- und der benannte Verdaechtige stirbt
+
+#343 hat als Verdaechtigen die Kompaktierung `(L // S) * (hi - lo) + (L % S -
+lo)` in `uneven_dcp_owner_bounds` / `cp_token_prefix` benannt. Die Arithmetik
+ist korrekt: fuer jedes von diesem Rang besessene `L` liegt `L % S` in `[lo,
+hi)`, also `(L % S - lo)` in `[0, ratio)`, und die Abbildung ist injektiv --
+genau wie das gerade `L // dcp_size`, zu dem sie bei lauter Einsen degeneriert.
+
+Der Fehler steckt eine Ebene tiefer: **nicht in der Zeile, die adressiert wird,
+sondern im Pool, der adressiert wird.** Der Falsifikator kostete keine
+Kartensekunde, er steht im #343-Bootlog:
+
+```
+[TP0] KV Cache is allocated. #tokens: 61088, K size: 2.80 GB, V size: 2.80 GB
+[TP1] KV Cache is allocated. #tokens: 61088, K size: 0.93 GB, V size: 0.93 GB
+```
+
+61088 Tokens x 128 head_dim x 2 Byte x 32 Layer = 0.466 GiB pro kv-Head.
+2.80 / 0.466 = **6**, 0.93 / 0.466 = **2**. Llama-3.1-8B hat 8 kv-Heads, und
+`partition_sizes(8, [3,1], units=8) = [6, 2]`. Die beiden Pools waren also fuer
+den **Shard** dieses Rangs geformt, waehrend der uneven-DCP-Pfad die **volle
+replizierte** Kopfzahl schreibt und liest.
+
+Gegengeprueft am Code, ohne Karte, mit installiertem Plan `[3,1]` und Vektor
+`[17,15]`:
+
+```
+BASE  pool head_num: 6   (write/read benutzt 8)   pool rows: 61088 (= C)
+FIX   pool head_num: 8   (write/read benutzt 8)   pool rows: 32470
+```
+
+### Warum das Korruption ist und nicht bloss eine falsche Form
+
+`masked_set_kv_buffer_kernel` (`mem_cache/memory_pool.py:3814`) schreibt nach
+`k_buffer_ptr + loc * H * D`, und `H` kommt aus dem **Cache-Tensor**, also aus
+der vollen Kopfzahl -- waehrend die echte Zeilenschrittweite des Puffers
+`H_pool * D` ist. Jeder besessene Slot landet damit um
+`loc * (H_write - H_pool) * D` neben seiner eigenen Zeile: null fuer Slot 0,
+linear wachsend mit der Slot-Nummer.
+
+Das erklaert **beide** #343-Beobachtungen, und zwar mit demselben Term:
+
+* **Reihenfolgeabhaengigkeit innerhalb eines Boots.** Welche Slot-Nummern eine
+  Anfrage bekommt, entscheidet die Freiliste des Allokators, also wie viele
+  Anfragen vorher liefen. Die zweite von zwei identischen Greedy-Anfragen
+  startet hinter der ersten, bekommt groessere `loc`, driftet weiter ab und
+  liest Zeilen, die der Schwanz der ersten ueberschrieben hat -- der Split bei
+  Index 5.
+* **Byte-Identitaet ueber Boots hinweg.** Der Term ist eine reine Funktion von
+  `loc`; nichts daran ist zufaellig. Zwei Boots mit derselben Anfragefolge
+  bekommen dieselben `loc` und damit dieselbe Fehlabbildung.
+
+Warum es nicht knallt statt still falsch zu sein: die Byte-Summe stimmt
+zufaellig. Der Pool hielt `C` Zeilen zu `8 * ratio_r / S` Koepfen, gebraucht
+werden `C * ratio_r / S` Zeilen zu 8 Koepfen -- dasselbe Produkt. Die oberste
+Adresse liegt damit knapp innerhalb des Puffers, und es gibt keinen illegalen
+Zugriff, der die Sache verraten haette.
+
+**Wen es genau trifft.** Vier Bedingungen zusammen, und deshalb hat es dieser
+Fork zwei Jahre Feature-Arbeit lang nicht gesehen:
+
+1. token-geteiltes DCP an (`uneven_dcp_kv_replicated`, also `dcp_size > 1` plus
+   ein `--rank-tp-ratio`-Plan),
+2. das Modell landet im **schlichten MHA-Pool** -- nicht hybrid-mamba, nicht
+   SWA-hybrid, nicht MLA,
+3. `num_kv_heads >= tp_size`, sonst greift die REPLIZIERTE-KV-Geometrie
+   (`attn_kv_replicated`, Task #62) und `_uneven_tp_num_kv_heads` liefert
+   ohnehin schon `total_num_kv_heads` -- zufaellig richtig,
+4. der Plan teilt die kv-Koepfe wirklich ungleich, `[6,2]` statt `[4,4]`.
+
+Llama-3.1-8B mit `--rank-tp-ratio 3,1` auf TP=2 erfuellt alle vier. Qwen3.5/3.6
+und das 122B-MoE erfuellen (2) nicht, das A3B mit 2 kv-Koepfen auf TP=3
+erfuellt (3) nicht.
+
+Und warum es so lange unbemerkt blieb: die **hybriden** Pool-Familien machen es
+richtig. `HybridLinearKVPool` (mamba/GDN) und der SWA-Hybrid-Full-Subpool
+setzen beide `head_num = get_total_num_kv_heads()` und `rows =
+dcp_compact_pool_rows(...)` explizit inline. Uneven DCP wurde in diesem Fork an
+Qwen3.5/3.6 und dem 122B-MoE entwickelt -- alles Hybride. **Der schlichte
+MHA-Pool, in dem ein dichtes Modell landet, ist die eine Familie, die die
+Behandlung nie bekommen hat**, und #343 war der erste uneven-DCP-Lauf auf einem
+dichten Llama.
+
+### Der Fix
+
+| Ort | vorher | jetzt |
+|---|---|---|
+| `model_runner_kv_cache_mixin._pool_kv_head_num` | Ausnahmen nur fuer draft-solo und weightless-KV; uneven-DCP fiel auf `get_num_kv_heads(attn_tp_size)` | zusaetzlich `uneven_dcp_kv_replicated(dcp_size)` -> volle replizierte Kopfzahl. Eine Stelle, alle Pool-Familien, die sie lesen |
+| `model_runner_kv_cache_mixin._dcp_token_sharded_pool_rows` (neu) | -- | unter der gewichteten Owner-Regel `dcp_compact_pool_rows(C, S, ratio_r)`; dieselbe geteilte Regel, die die Hybride benutzen. Ausserhalb der Spur (auch unter der Modulo-Regel, wo `max_total_num_tokens` schon der Rang-Pool ist) unveraendert |
+| 5 MHA-Pool-Konstruktionen (plain, FP4, MiniMax-sparse, NPU-MHA, out-of-tree-MHA) | `size=self.max_total_num_tokens` | `size=self._dcp_token_sharded_pool_rows(self.max_total_num_tokens)` |
+| `layers/dcp/owner.dcp_accounting_total_slots` (neu) + `invariant_checker._check_full_pool` | `total = self.max_total_num_tokens` gegen ein `available`, das den Allokator-Indexraum zaehlt | auf der token-geteilten Spur die Allokatorgroesse -- dieselbe Groesse, die `available` zaehlt |
+
+Beide Groessen mussten zusammen wandern: mit der Kopfzahl allein waere der Pool
+`C` Zeilen zu 8 Koepfen geworden, also 8.0 GB gegen 5.16 GB profilierten
+Platz -- OOM beim Boot. Die Profilierung selbst war nie falsch
+(`pool_configurator` benutzt unter `uneven_dcp_kv_replicated` schon die volle
+Kopfzahl); nur die Allokation folgte ihr nicht.
+
+Der zweite Defekt ist derselbe Fehlertyp in Skalarform: `available_size()`
+zaehlt den Indexraum des Allokators, `max_total_num_tokens` unter der
+Modulo-Regel den physischen Pool dieses Rangs, und der Allokator vergibt
+`max_total * cp_token_split_factor(dcp_size)` globale Slots. Deshalb war
+`available` exakt `dcp_size`-mal `total`, und die erste Leerlaufpruefung hat
+den Server erschossen. Die Geometrie war dort nie falsch -- eine der beiden
+Zahlen war schlicht nicht die Groesse, die die andere zaehlt.
+
+### Karten-Beweis
+
+Zwei Fenster, 361 s Kartenzeit, Llama-3.1-8B-Instruct, greedy, 12 Token,
+`--disable-radix-cache`, `--enable-metrics`, CUDA-Graphen in jedem Arm aus.
+
+**Token-Streams.** Beide Laeufe (A und B) aller drei Prompts sind in JEDEM Arm
+byte-identisch zur TP=1-Referenz -- `uneven31_a`, `uneven31_b` (zweiter Boot),
+`uneven31_dcp_unweighted`, `even_tp2`, `uneven31_nodcp`. In #343 war der
+`alphabet`-A-gegen-A-Boden von `uneven31_a` ROT (Split bei Index 5); genau
+dieser Boden ist die Reihenfolgeprobe, und er ist jetzt in jedem Arm gruen.
+
+**Layer-Deltas**, Dekodierschritt 1, Rang 0 gegen TP=1, `max|d| / ref|absmax|`:
+
+| Tensor | even TP=2 | 3:1 wDCP #343 | 3:1 wDCP #345 | 3:1 evenDCP | 3:1 DCP aus |
+|---|---|---|---|---|---|
+| L00.o_proj | 0.0061 | **0.567** | 0.0137 | 0.0516 | 0.0061 |
+| L00.mlp | 0.00376 | **0.537** | 0.0188 | 0.0611 | 0.00376 |
+| L01.mlp | 0.0133 | **59.1** | 0.113 | 0.0700 | 0.00667 |
+| L02.out[1] | 0.00641 | **14.0** | 0.103 | 0.0513 | 0.00641 |
+| L31.mlp | 0.00538 | **2.45** | 0.0403 | 0.0753 | 0.00739 |
+| logits | 0.00679 | **0.589** | 0.0371 | 0.0500 | 0.00786 |
+| final_norm[0] | 0.00606 | **1.62** | 0.0970 | 0.115 | 0.0212 |
+
+Die #343-Spalte ist zitiert; die Spalten `even TP=2` und `DCP aus` wurden hier
+neu gemessen und kamen bit-fuer-bit auf #343s Zahlen heraus -- das pinnt
+Referenz und Rauschboden ueber zwei Fenster hinweg. Der gewichtete Arm faellt
+um Faktor 41 (L00.o_proj) bis 523 (L01.mlp). Er liegt 2x-9x ueber dem
+TP=2-Boden, und das ist kein Rest des Fehlers: der LSE-Merge ueber die
+Token-Shards ist eine Reduktion, die der gerade TP=2-Arm ueberhaupt nicht
+ausfuehrt.
+
+**Selbstdeterminismus.** Ueber Boots: `uneven31_a` gegen `uneven31_b`, Rang 0,
+165/165 Tensoren MATCH. Ueber Raenge: `uneven31_b` Rang 0 gegen Rang 1,
+133/133 vergleichbare Tensoren MATCH (32 SHAPE -- die per-Rang-Attention-Shards,
+nach Konstruktion unterschiedlich breit).
+
+**Zweiter Defekt.** `SGLANG_UNEVEN_DCP=1` mit `_WEIGHTED=0` bootet, bedient und
+trifft TP=1 auf allen drei Prompts. Pool 28640 Zeilen x 8 replizierte kv-Koepfe
+auf beiden Raengen.
+
+**Pool-Geometrie**, wie der Fix sie protokolliert:
+
+```
+[TP0] Uneven-DCP token-sharded MHA pool: 61088 global context slots ->
+      32470 physical rows on dcp_rank 0 (vector [17, 15]), 8 replicated kv heads.
+[TP1] ... 28650 physical rows on dcp_rank 1 ...
+```
+
+Profilierte Kapazitaeten (39389 / 28635 Token) und das daraus abgeleitete
+globale C=61088 sind unveraendert gegenueber #343. KV-Bytes pro Rang:
+5.60 -> 3.96 GB auf Rang 0, 1.86 -> 3.50 GB auf Rang 1.
+
+### Hermetische Tests
+
+`test/registered/unit/distributed/test_uneven_dcp_pool_geometry.py`, 13 Faelle,
+nur CPU, `CUDA_VISIBLE_DEVICES=99`. Der interessante Teil sind die drei, die
+den Fehler selbst modellieren statt den Fix zu wiederholen: eine Zeile ist
+`H_pool * D` Elemente, der Schreibkernel schreibt `H_write * D` ab
+`compact * H_write * D`, und die Frage ist, ob Slot `c` in Zeile `c` landet.
+`test_shard_shaped_pool_writes_outside_the_slots_own_row` haelt fest, dass die
+alte Geometrie das ab Slot 1 nicht tut;
+`test_request_order_decides_which_rows_are_clobbered` faehrt zwei Anfragen
+hintereinander durch dieselbe Belegung und zeigt, dass sich ihre Zeilenmengen
+unter der alten Geometrie ueberschneiden und unter der neuen nicht -- diese
+Ueberschneidung IST die Reihenfolgeabhaengigkeit.
+`test_every_reachable_compact_slot_is_inside_the_pool` laeuft den ganzen
+Allokator-Indexraum ab (C=61088, beide Raenge) und prueft die Zeilenzahl gegen
+den schlimmsten erreichbaren kompakten Slot.
+
+### Harness-Pflicht
+
+`scripts/dual_group/dcp_report.sh` -- `report_dcp <label> <server-log>` liest
+die aufgeloeste Geometrie aus dem Serverlog (nie aus den Startflags, denn genau
+diese Ableitung war falsch) und wird von `r11/window_343.sh` sowie
+`r10/posten1_window.sh` / `r10/posten2_window.sh` pro Arm aufgerufen. Im
+#345-Fenster liest sich die #340-Falle direkt ab:
+
+```
+tp1_ref                 dcp_size=1  ratio=None   (env SGLANG_UNEVEN_DCP=1)
+even_tp2                dcp_size=1  ratio=None   (env SGLANG_UNEVEN_DCP=1)
+uneven31_a/b            dcp_size=2  ratio=[3,1]  vector [17,15]
+uneven31_dcp_unweighted dcp_size=2  ratio=[3,1]  kein Token-Vektor
+uneven31_nodcp          dcp_size=1  ratio=[3,1]  (env SGLANG_UNEVEN_DCP=0)
+```
+
+Eine Lehre, hier bezahlt: ein einziges manuelles `curl /health` gegen
+`uneven31_a` NACH dem Scharfstellen des Taps hat zwei Forwards eingeschoben und
+die Spur um +2 verschoben, sodass der Join auf `astep` zwei verschiedene Token
+verglich (sichtbar daran, dass `input_ids` selbst DIFFER war).
+`compare_layers.py` nimmt dafuer jetzt `--cmp-astep`; die exakten Deltas oben
+stammen aus `uneven31_b`, dem sauberen Neustart.
+
+### Offen
+
+1. Unter der Modulo-Owner-Regel (`_WEIGHTED=0`) bleibt
+   `max_total_num_tokens` der Rang-Pool, waehrend der Allokator
+   `dcp_size`-mal so viele globale Slots vergibt. Der Leak-Check stimmt jetzt,
+   aber die vom Scheduler gemeldete Kontextobergrenze ist damit um `dcp_size`
+   zu klein. Kapazitaet, nicht Korrektheit -- und die gewichtete Regel, die
+   Produktionsspur, ist nicht betroffen.
+2. Die MHA-Pool-Familien ausserhalb CUDA (NPU-Ascend-SWA) bekommen die
+   Kopfzahl-Korrektur ueber `_pool_kv_head_num`, aber ihr SWA-Full-Subpool
+   kennt die `_swa_hybrid_dcp_lane`-Regel nicht. Auf dieser Kiste nicht
+   erreichbar, hier nicht angefasst.
+3. FP8-Zweikarten-Boot mit passenden Budgets -- unveraendert offen aus #343.
+
+---
+
 # #333-M1: engine registry and per-GPU ledger
 
 Branch `feat/registry-m1`, based on `eda4f03b28` (the #333-M2 merge). New code
