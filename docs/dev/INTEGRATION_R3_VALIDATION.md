@@ -14151,3 +14151,90 @@ Pfad (`run_step.sh`) taucht der Marker im argv ohnehin nicht auf.
 `lock_cross_shell.txt` (#314, Shell A und Shell B in einer Datei),
 `power.csv` (36 Punkte je Karte; Spitzen 179 W / 19493 MiB auf GPU0,
 115 W / 29345 MiB auf GPU1, 169 W / 18353 MiB auf GPU2).
+
+## #300-Beleg: der 136/1088-Abbruch ist weg, ein neuer Stopper steht dahinter (Kartenfenster 2026-07-31, 00:19-00:22 UTC)
+
+Ein Boot auf `/spinning/wt-final` @ `30ae870f2e` (enthaelt den #300-Fix
+gemergt), TP=3 auf 5090 + 2x 3080, GPTQ-Int4-Ziel
+`Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4`,
+`--rank-tp-ratio auto-performance`, `--rank-auto-reserve-mib 3000,2700,2700`,
+fp8-KV, NEXTN k=3. Hostseitig gefahren wie jeder andere Batterie-Boot auf
+diesem Rig (`remote_boot_300.sh` liegt als Artefakt neben seinem Ergebnis).
+Kartenzeit 2 min 16 s von 15 min Budget.
+
+**Verdikt: der #300-Abbruch ist belegt weg, der Boot kommt trotzdem nicht
+hoch.** Die drei Pass-Kriterien einzeln:
+
+### 1. Kein 136/1088-Abbruch — erfuellt
+
+`partition_sizes(136, units=1088)` taucht im gesamten Log nicht mehr auf. Der
+Lauf laeuft durch Planung, Uneven-DCP-Sizing und den vollstaendigen
+Gewichts-Load (`Multi-thread loading shards: 100% Completed | 6/6`) — also
+weit hinter den Punkt, an dem er vorher auf allen drei Raengen sofort starb.
+
+### 2. Per-Rang-MLP-Shards [7936, 4736, 4736] — erfuellt
+
+Aus `proofs/units.txt`, woertlich:
+
+```
+VRAM-auto reference: predicted per-rank capacity [331832, 118327, 161392] tokens,
+predicted max context ~611552 (converged weighted-DCP optimum; estimate),
+materialized MLP units [62, 37, 37]
+```
+
+Die Zeile zaehlt Einheiten, nicht Elemente, und genau das ist der Fix: die
+Einheit ist jetzt `gptq_uneven_tp_block = lcm(group=128, min_thread_k=64) =
+128` statt der alten 16. `[62, 37, 37] x 128 = [7936, 4736, 4736]`, Summe
+136 Einheiten x 128 = 17408 = das volle Intermediate. Dieselbe Geometrie, die
+vorher als `units=1088` (= 17408/16) in die Planung ging und dort an
+`partition_sizes` scheiterte, ist jetzt gruppenausgerichtet und traegt.
+
+### 3. Kohaerente Kurzgeneration + Accept — NICHT erreicht
+
+Es gibt keinen Server, an dem man haette generieren koennen. Der Boot stirbt
+nach 63 s, sauber und frueh, in `process_weights_after_loading` — also nach
+dem Load und vor jedem Kollektiv, kein NCCL-Haenger und kein spaeter OOM.
+Zwei von drei Raengen werfen, TP0 nicht (`grep -c 'Scheduler hit an
+exception'` = 2, beide Treffer TP1 und TP2):
+
+```
+RuntimeError: Runtime check failed at .../jit_kernel/csrc/gemm/marlin/gptq_marlin_repack.cuh:309:
+  size_n = 24 is not divisible by tile_n_size = 64      [TP2]
+  size_n = 30 is not divisible by tile_n_size = 64      [TP1]
+```
+
+Der Pfad dorthin, aus `proofs/repack_traceback.txt` gekuerzt:
+`loader.load_weights_and_postprocess` ->
+`gptq.py:641 process_weights_after_loading` ->
+`gptq_marlin.py:153` -> `gptq_kernels.py:226 _transform_param` ->
+`gptq_kernels.py:175 transform_w_q` -> `gptq_marlin_repack.py:44`.
+
+Das ist ein ANDERER Stopper als #300, an einer anderen Stelle und mit einer
+anderen Groesse: #300 sass in der Planung auf der K-Achse (Skalenzeilen,
+Einheiten von 17408), dieser hier sitzt im Repack-Kernel auf der N-Achse und
+nennt Werte von 24 und 30 — Groessen, die zu keiner MLP-Kachel dieses Modells
+gehoeren. Er wurde in diesem Fenster bewusst nicht weiterverfolgt; der Auftrag
+war der Beleg, nicht die Diagnose. Festgehalten ist die Meldung woertlich samt
+Traceback, damit die naechste Runde nicht erneut booten muss, um sie zu sehen.
+
+Der Vollstaendigkeit halber, weil es beim Lesen des Logs auffaellt und keine
+Fehlerbedingung ist: die Planung meldet fuer die aggressiveren
+MLP-Kandidaten (`10,1,1` bis `5,1,1`) korrekt `UNBOOTABLE` gegen die
+abgeleitete Reserve-Nachfrage und nimmt sie nicht an — die #313-Mechanik
+arbeitet unter GPTQ genauso wie unter fp8.
+
+### Rohdaten
+
+`/spinning/gpu-battery-results/2026-07-31_300_beleg/`:
+`remote_boot_300.sh` (das Kommando, das lief), `drive_boot.sh` /
+`window_open.sh` / `window_close.sh` (Fenster und Treiber),
+`proofs/units.txt` (die Einheiten-Zeile), `proofs/key_lines.txt`
+(Einheiten + Ratio + beide `size_n`-Meldungen in einer Datei),
+`proofs/repack_traceback.txt` (voller Traceback TP2, Anfang TP1),
+`proofs/errors.txt`, `proofs/card_order_host.txt` /
+`card_order_container.txt` (NVML-Reihenfolge vor dem Boot gegen
+`--rank-gpu-id 0,1,2` gelesen: 0 = 3080, 1 = 5090, 2 = 3080; kein
+`CUDA_DEVICE_ORDER` gesetzt, `cuda:0` bleibt die 5090),
+`logs/boot.tail.txt`, `logs/driver.log`, `power.csv` (27 Punkte je Karte;
+Spitzen 134 W / 5923 MiB auf GPU0, 72 W / 8597 MiB auf GPU1,
+116 W / 5661 MiB auf GPU2 — reiner Ladevorgang, nie ein Rechenpunkt).
