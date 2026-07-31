@@ -13,7 +13,7 @@ own parser here, and each parser consumes ONLY effective/measured values:
      median-latency ladder -> measured profiles ``d2d_direct:<src>-><dst>``
      and ``host_staged:<src>-><dst>``.
 2. #278 GDR matrix TSV rows (crossrig ladder, wire rows):
-   ``pair  direction  modus  ro  depth  size_bytes  iters  p10_us
+   ``pair  direction  mode  ro  depth  size_bytes  iters  p10_us
    median_us  p90_us  MB_per_s`` -> measured profiles
    ``gdr_direct@d<depth>:...`` / ``nic_staged@d<depth>:...`` (``+ro`` suffix
    when relaxed ordering was on). median_us is the half round-trip of one
@@ -233,7 +233,7 @@ def load_p2p_d2d_bench(payload: dict) -> LoadResult:
 GDR_TSV_COLUMNS = (
     "pair",
     "direction",
-    "modus",
+    "mode",
     "ro",
     "depth",
     "size_bytes",
@@ -277,8 +277,8 @@ def load_gdr_matrix_tsv(lines) -> LoadResult:
         if pair is None:
             res.errors.append(f"line {lineno}: unparsable pair {row['pair']!r}")
             continue
-        if row["modus"] not in ("gdr", "stage"):
-            res.errors.append(f"line {lineno}: unknown modus {row['modus']!r}")
+        if row["mode"] not in ("gdr", "stage"):
+            res.errors.append(f"line {lineno}: unknown mode {row['mode']!r}")
             continue
         try:
             depth = int(row["depth"])
@@ -288,7 +288,7 @@ def load_gdr_matrix_tsv(lines) -> LoadResult:
         except ValueError as e:
             res.errors.append(f"line {lineno}: {e}")
             continue
-        kind = KIND_GDR_DIRECT if row["modus"] == "gdr" else KIND_NIC_STAGED
+        kind = KIND_GDR_DIRECT if row["mode"] == "gdr" else KIND_NIC_STAGED
         if row["ro"] == "on":
             kind += "+ro"
         kind += f"@d{depth}"

@@ -383,7 +383,7 @@ whether it boots.
   working tree under test (`barlink_bar1.py`, `benchmark/bar1_graph_check.py`),
   otherwise STOP with a pointer to `BAR1_HOST_WT`.
 * **Command** `bash run_step.sh s11`
-* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `GRAPH_FREIGABE=1`
+* **Gate first** `benchmark/bar1_graph_check.py 0,1,2`. `SGLANG_BARLINK_GRAPH_ENABLE=1`
   without that proof yields numbers from an operating point nobody can defend.
 * **Success** `check_s11_bar1_e2e.py`: all gate cases of the gate passed;
   `ACHIEVED=bar1` **per group** — with `SGLANG_UNEVEN_DCP=1` there are two

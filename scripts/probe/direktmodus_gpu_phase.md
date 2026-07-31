@@ -135,7 +135,7 @@ number.
       SGLANG_BARLINK_BAR1_PIPE_RESULT_RING=5 \
       $P benchmark/bar1_diag.py 0,1,2
 
-This makes the release handshake run eager too (`ergSlack = 2`), and flag
+This makes the release handshake run eager too (`resultSlack = 2`), and flag
 family 4 gets exercised on real hardware for the first time. Up to this
 point it has only seen a Python simulation.
 

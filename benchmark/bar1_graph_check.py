@@ -149,7 +149,7 @@ FAELLE = [
     },
     {
         "name": "pipe",
-        "zweck": "netz_pipe captured. Direct mode switches itself off "
+        "zweck": "mesh_pipe captured. Direct mode switches itself off "
                  "under capture; this checks that the direct=0 path "
                  "carries.",
         "umgebung": {
@@ -157,8 +157,8 @@ FAELLE = [
             "SGLANG_BARLINK_BAR1_GRID_THRESHOLD": str(1 << 40),
             "SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD": str(1 << 40),
         },
-        # Between pipe_ab (256 KiB) and ring_ab (1 MiB) -- only there does
-        # `algorithm_for` pick netz_pipe at all.
+        # Between pipe_from (256 KiB) and ring_from (1 MiB) -- only there does
+        # `algorithm_for` pick mesh_pipe at all.
         "groessen": [512 << 10],
         "gate": True,
     },
@@ -555,10 +555,10 @@ def worker(local_rank: int, devs: list, port: str, fall: dict, ablage: str) -> N
                 f"handles() says False to everything, and a graph over a "
                 f"path that loses bytes proves nothing."
             )
-        if t.pipe_an and not t.byte_proof_pipe():
+        if t.pipe_on and not t.byte_proof_pipe():
             raise RuntimeError(
-                "netz_pipe byte proof failed -- this case needs it, "
-                "otherwise algorithm_for never picks netz_pipe at all"
+                "mesh_pipe byte proof failed -- this case needs it, "
+                "otherwise algorithm_for never picks mesh_pipe at all"
             )
         kollektiv = fall.get("kollektiv", "all_reduce")
         if kollektiv == "broadcast":

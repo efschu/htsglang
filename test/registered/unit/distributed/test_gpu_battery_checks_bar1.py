@@ -72,19 +72,19 @@ LOG_GROUP_FALLBACK_DCP = "418:[2026-07-30 03:11:02] " + _src.render_group_fallba
     group="dcp:0", achieved="gloo", stage="setup",
     reason="Bar1Unavailable: the holder reports ENOMEM",
 )
-LOG_AUFBAU = "400:[2026-07-30 03:11:01] " + _src.render_setup_line(
+LOG_SETUP = "400:[2026-07-30 03:11:01] " + _src.render_setup_line(
     dauer_ms=27, peer_targets=2, region_mib=24.0, slots_desc="8 slots",
     slot_kib=512, payload_kib=20480, flags_bytes=256, export="dma-buf",
 )
-LOG_KASSE_TP = "401:[2026-07-30 03:11:01] " + _src.render_ledger_line(
+LOG_LEDGER_TP = "401:[2026-07-30 03:11:01] " + _src.render_ledger_line(
     group="tp:0", balance="tp:0: 24.0 MiB",
 )
-LOG_KASSE_DCP = "409:[2026-07-30 03:11:01] " + _src.render_ledger_line(
+LOG_LEDGER_DCP = "409:[2026-07-30 03:11:01] " + _src.render_ledger_line(
     group="dcp:0", balance="tp:0: 24.0 MiB, dcp:0: 24.0 MiB",
 )
-LOG_RIEGEL = "902:RuntimeError: " + _src.render_riegel_message(
+LOG_CAPTURE_BOLT = "902:RuntimeError: " + _src.render_capture_bolt_message(
     op="all_gather", nbytes=10600448,
-    grund="bar1 reports handles('all_gather', 10600448) -> False",
+    reason="bar1 reports handles('all_gather', 10600448) -> False",
 )
 
 GRAPH_CHECK_OK = _src.render_graph_check_transcript()
@@ -470,14 +470,14 @@ class TestDriverCompose:
 def _e2e(**over) -> dict:
     payload = {
         "kind": "bar1_e2e",
-        "schema_version": 5,
+        "schema_version": 6,
         "host": "192.168.0.1",
         "reachable": True,
         "integration_present": True,
         "port": 30030,
         "server_log_remote": "/root/battery-bar1/s11.server.log",
-        "transport_angefordert": "bar1",
-        "graph_freigabe": True,
+        "transport_requested": "bar1",
+        "graph_enable": True,
         "graph_check": {
             "rc": 0,
             "cases": 5,
@@ -485,21 +485,21 @@ def _e2e(**over) -> dict:
             "gefallen": [],
             "alle_bestanden": True,
         },
-        "gruppen": [
+        "groups": [
             {"group": "dcp:0", "requested": "bar1", "achieved": "bar1"},
             {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
         ],
-        "gruppen_bar1": ["dcp:0", "tp:0"],
-        "gruppen_ausgewichen": [],
-        "aufbau_gruppen": ["tp:0", "dcp:0"],
-        "aufbau_lines": 6,
-        "aufbau_ms": [27.0, 31.0],
-        "riegel": None,
+        "groups_on_bar1": ["dcp:0", "tp:0"],
+        "groups_fell_back": [],
+        "setup_groups": ["tp:0", "dcp:0"],
+        "setup_lines": 6,
+        "setup_ms": [27.0, 31.0],
+        "capture_bolt": None,
         "fatal": None,
-        "log_quellen": ["barlink_lines.txt", "server.log"],
-        "log_zeilen": 42,
+        "log_sources": ["barlink_lines.txt", "server.log"],
+        "log_lines": 42,
         "smoke": {
-            "vorhanden": True,
+            "present": True,
             "endpunkt": "generate",
             "content_prefix": SMOKE_FORTSETZUNG,
             "spec_accept_length": 2.9,
@@ -521,7 +521,7 @@ def _e2e(**over) -> dict:
     return payload
 
 
-def _write_e2e(tmp_path, payload=None, log="alles gut\n"):
+def _write_e2e(tmp_path, payload=None, log="all good\n"):
     write_json(tmp_path / "bar1_e2e.json", payload if payload is not None else _e2e())
     if log is not None:
         (tmp_path / "server.log").write_text(log)
@@ -608,15 +608,15 @@ class TestE2ECheck:
         _write_e2e(
             tmp_path,
             _e2e(
-                riegel={
+                capture_bolt={
                     "op": "all_gather",
                     "bytes": 10600448,
-                    "zeile": LOG_RIEGEL,
+                    "line": LOG_CAPTURE_BOLT,
                 }
             ),
         )
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
-        assert "RIEGEL" in line
+        assert "CAPTURE-BOLT" in line
         assert "all_gather" in line
         assert "10600448" in line
 
@@ -626,20 +626,20 @@ class TestE2ECheck:
         _write_e2e(
             tmp_path,
             _e2e(
-                gruppen=[
+                groups=[
                     {"group": "dcp:0", "requested": "bar1", "achieved": "gloo"},
                     {"group": "tp:0", "requested": "bar1", "achieved": "bar1"},
                 ],
-                gruppen_bar1=["tp:0"],
-                gruppen_ausgewichen=["dcp:0"],
+                groups_on_bar1=["tp:0"],
+                groups_fell_back=["dcp:0"],
             ),
         )
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "dcp:0" in line
-        assert "gemischter Lauf" in line
+        assert "a mixed run" in line
 
     def test_no_erreicht_line_at_all_is_fail(self, tmp_path):
-        _write_e2e(tmp_path, _e2e(gruppen=[], gruppen_bar1=[]))
+        _write_e2e(tmp_path, _e2e(groups=[], groups_on_bar1=[]))
         assert_fail(self.CHECK, tmp_path, self.STEP)
 
     def test_no_harvested_log_is_a_stop_not_a_fail(self, tmp_path):
@@ -652,7 +652,7 @@ class TestE2ECheck:
         """
         _write_e2e(
             tmp_path,
-            _e2e(gruppen=[], gruppen_bar1=[], log_quellen=[], log_zeilen=0),
+            _e2e(groups=[], groups_on_bar1=[], log_sources=[], log_lines=0),
         )
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
         assert "niemand hat geschaut" in line
@@ -666,7 +666,7 @@ class TestE2ECheck:
         """
         payload = _e2e()
         payload["schema_version"] = 1
-        del payload["log_quellen"]
+        del payload["log_sources"]
         _write_e2e(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "schema_version" in line
@@ -674,10 +674,10 @@ class TestE2ECheck:
     def test_missing_log_quellen_at_the_right_schema_is_a_stop(self, tmp_path):
         """Belt and braces: the field is what the check reads, not the number."""
         payload = _e2e()
-        del payload["log_quellen"]
+        del payload["log_sources"]
         _write_e2e(tmp_path, payload)
         line = assert_stop(self.CHECK, tmp_path, self.STEP)
-        assert "log_quellen" in line
+        assert "log_sources" in line
 
     def test_a_dead_boot_is_reported_before_its_fallout(self, tmp_path):
         """Cause before consequence.
@@ -689,10 +689,10 @@ class TestE2ECheck:
         _write_e2e(
             tmp_path,
             _e2e(
-                gruppen=[],
-                gruppen_bar1=[],
-                aufbau_lines=0,
-                aufbau_gruppen=[],
+                groups=[],
+                groups_on_bar1=[],
+                setup_lines=0,
+                setup_groups=[],
                 fatal="Traceback (most recent call last):",
             ),
         )
@@ -703,20 +703,20 @@ class TestE2ECheck:
         _write_e2e(
             tmp_path,
             _e2e(
-                gruppen=[{"group": "tp:0", "requested": "bar1", "achieved": "bar1"}],
-                gruppen_bar1=["tp:0"],
-                aufbau_gruppen=["tp:0"],
+                groups=[{"group": "tp:0", "requested": "bar1", "achieved": "bar1"}],
+                groups_on_bar1=["tp:0"],
+                setup_groups=["tp:0"],
             ),
         )
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "dcp" in line
 
     def test_no_setup_line_is_fail(self, tmp_path):
-        _write_e2e(tmp_path, _e2e(aufbau_lines=0, aufbau_gruppen=[]))
+        _write_e2e(tmp_path, _e2e(setup_lines=0, setup_groups=[]))
         assert_fail(self.CHECK, tmp_path, self.STEP)
 
     def test_setup_only_for_one_group_is_fail(self, tmp_path):
-        _write_e2e(tmp_path, _e2e(aufbau_gruppen=["tp:0"]))
+        _write_e2e(tmp_path, _e2e(setup_groups=["tp:0"]))
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "setup" in line
 
@@ -786,27 +786,27 @@ class TestE2EParsing:
         (tmp_path / "barlink_lines.txt").write_text(
             "\n".join(
                 [
-                    LOG_AUFBAU,
-                    LOG_KASSE_TP,
+                    LOG_SETUP,
+                    LOG_LEDGER_TP,
                     LOG_GROUP_OK,
-                    LOG_KASSE_DCP,
+                    LOG_LEDGER_DCP,
                     LOG_GROUP_OK_DCP,
                 ]
             )
         )
         out = parse_log_evidence(str(tmp_path))
-        assert [g["group"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
-        assert all(g["achieved"] == "bar1" for g in out["gruppen"])
-        assert out["aufbau_gruppen"] == ["tp:0", "dcp:0"]
-        assert out["aufbau_lines"] == 1
-        assert out["riegel"] is None
+        assert [g["group"] for g in out["groups"]] == ["dcp:0", "tp:0"]
+        assert all(g["achieved"] == "bar1" for g in out["groups"])
+        assert out["setup_groups"] == ["tp:0", "dcp:0"]
+        assert out["setup_lines"] == 1
+        assert out["capture_bolt"] is None
 
     def test_fallback_is_visible_per_group(self, tmp_path):
         (tmp_path / "barlink_lines.txt").write_text(
             "\n".join([LOG_GROUP_OK, LOG_GROUP_FALLBACK_DCP])
         )
         out = parse_log_evidence(str(tmp_path))
-        by_name = {g["group"]: g for g in out["gruppen"]}
+        by_name = {g["group"]: g for g in out["groups"]}
         assert by_name["tp:0"]["achieved"] == "bar1"
         assert by_name["dcp:0"]["achieved"] == "gloo"
         assert by_name["dcp:0"]["requested"] == "bar1"
@@ -829,10 +829,10 @@ class TestE2EParsing:
         assert parse_log_evidence(str(tmp_path))["fatal"] is None
 
     def test_bolt_is_extracted_with_op_and_size(self, tmp_path):
-        (tmp_path / "barlink_lines.txt").write_text(LOG_RIEGEL + "\n")
+        (tmp_path / "barlink_lines.txt").write_text(LOG_CAPTURE_BOLT + "\n")
         out = parse_log_evidence(str(tmp_path))
-        assert out["riegel"]["op"] == "all_gather"
-        assert out["riegel"]["bytes"] == 10600448
+        assert out["capture_bolt"]["op"] == "all_gather"
+        assert out["capture_bolt"]["bytes"] == 10600448
 
     def test_server_log_alone_carries_the_evidence(self, tmp_path):
         """The file the shell writes on EVERY path, including the aborts.
@@ -847,32 +847,32 @@ class TestE2EParsing:
             "\n".join(
                 [
                     LOG_GROUP_OK.split(":", 1)[1],
-                    LOG_KASSE_TP.split(":", 1)[1],
-                    LOG_AUFBAU.split(":", 1)[1],
+                    LOG_LEDGER_TP.split(":", 1)[1],
+                    LOG_SETUP.split(":", 1)[1],
                     LOG_GROUP_OK_DCP.split(":", 1)[1],
-                    LOG_KASSE_DCP.split(":", 1)[1],
+                    LOG_LEDGER_DCP.split(":", 1)[1],
                 ]
             )
             + "\n"
         )
         out = parse_log_evidence(str(tmp_path))
-        assert out["log_quellen"] == ["server.log"]
-        assert [g["group"] for g in out["gruppen"]] == ["dcp:0", "tp:0"]
-        assert out["aufbau_lines"] == 1
+        assert out["log_sources"] == ["server.log"]
+        assert [g["group"] for g in out["groups"]] == ["dcp:0", "tp:0"]
+        assert out["setup_lines"] == 1
 
     def test_no_log_file_at_all_is_visible_as_such(self, tmp_path):
         out = parse_log_evidence(str(tmp_path))
-        assert out["log_quellen"] == []
-        assert out["log_zeilen"] == 0
-        assert out["gruppen"] == []
+        assert out["log_sources"] == []
+        assert out["log_lines"] == 0
+        assert out["groups"] == []
 
     def test_the_two_sources_do_not_double_count(self, tmp_path):
         """grep prefixes the line number, tail does not -- same line, twice."""
-        (tmp_path / "barlink_lines.txt").write_text(LOG_AUFBAU + "\n")
-        (tmp_path / "server.log").write_text(LOG_AUFBAU.split(":", 1)[1] + "\n")
+        (tmp_path / "barlink_lines.txt").write_text(LOG_SETUP + "\n")
+        (tmp_path / "server.log").write_text(LOG_SETUP.split(":", 1)[1] + "\n")
         out = parse_log_evidence(str(tmp_path))
-        assert out["log_quellen"] == ["barlink_lines.txt", "server.log"]
-        assert out["aufbau_lines"] == 1
+        assert out["log_sources"] == ["barlink_lines.txt", "server.log"]
+        assert out["setup_lines"] == 1
 
 
 class TestAgainstTheRealS11Log:
@@ -900,13 +900,13 @@ class TestAgainstTheRealS11Log:
 
     def test_the_evidence_is_found_in_the_real_log(self, tmp_path):
         out = parse_log_evidence(str(self._step_dir(tmp_path)))
-        assert out["log_quellen"] == ["server.log"]
-        assert [g["group"] for g in out["gruppen"]] == [
+        assert out["log_sources"] == ["server.log"]
+        assert [g["group"] for g in out["groups"]] == [
             "dcp:0", "tp:0", "world:0",
         ]
-        assert all(g["achieved"] == "bar1" for g in out["gruppen"])
-        assert out["riegel"]["op"] == "broadcast"
-        assert out["riegel"]["bytes"] == 128
+        assert all(g["achieved"] == "bar1" for g in out["groups"])
+        assert out["capture_bolt"]["op"] == "broadcast"
+        assert out["capture_bolt"]["bytes"] == 128
         assert "Traceback" in out["fatal"]
 
     def test_the_check_fails_on_the_cause(self, tmp_path):
@@ -914,7 +914,7 @@ class TestAgainstTheRealS11Log:
         payload = compose(str(step_dir), 30030, "/root/battery-bar1/s11.server.log")
         write_json(step_dir / "bar1_e2e.json", payload)
         line = assert_fail(self.CHECK, step_dir, self.STEP)
-        assert "RIEGEL" in line
+        assert "CAPTURE-BOLT" in line
         assert "broadcast" in line
         # And explicitly NOT the consequence it used to report.
         assert "ERREICHT" not in line
@@ -955,13 +955,13 @@ class TestAgainstTheGreenTransportRun:
 
     def test_the_transport_side_is_clean(self, tmp_path):
         _, payload = self._compose(tmp_path)
-        assert payload["riegel"] is None
+        assert payload["capture_bolt"] is None
         assert payload["fatal"] is None
-        assert payload["gruppen_bar1"] == ["dcp:0", "tp:0", "world:0"]
-        assert payload["gruppen_ausgewichen"] == []
+        assert payload["groups_on_bar1"] == ["dcp:0", "tp:0", "world:0"]
+        assert payload["groups_fell_back"] == []
         # Drei Raenge x drei Gruppen (world, tp, dcp) -- jeder Rang baut je
         # Gruppe eine eigene Region auf.
-        assert payload["aufbau_lines"] == 9
+        assert payload["setup_lines"] == 9
 
     def test_all_seven_gate_cases_passed_including_broadcast(self, tmp_path):
         _, payload = self._compose(tmp_path)
@@ -975,8 +975,8 @@ class TestAgainstTheGreenTransportRun:
         line = assert_stop(self.CHECK, step_dir, self.STEP)
         assert "/generate" in line
         # Kein Wort, das nach Transportfehler klingt.
-        for verboten in ("RIEGEL", "ERREICHT", "Fatal", "gemischter Lauf"):
-            assert verboten not in line, verboten
+        for forbidden in ("CAPTURE-BOLT", "ERREICHT", "Fatal", "a mixed run"):
+            assert forbidden not in line, forbidden
 
     def test_the_thinking_flip_is_visible_in_the_artifact(self, tmp_path):
         """Diagnosable without opening a log: the state is a field.
@@ -1292,11 +1292,11 @@ class TestSmokeContractWithTheStepScript:
         Begruendung, warum es das nicht mehr ist. Ein Scan, der das nicht
         auseinanderhalten kann, faellt ueber seine eigene Erklaerung.
         """
-        zeilen = [
+        lines = [
             z for z in open(self.SHELL, encoding="utf-8").read().splitlines()
             if not z.lstrip().startswith("#")
         ]
-        return "\n".join(zeilen)
+        return "\n".join(lines)
 
     def test_the_shell_sends_the_prompt_the_parser_expects(self):
         from s11_bar1_e2e import SMOKE_PROMPT, ZAHLEN_VON
@@ -1353,15 +1353,15 @@ def _kurve(**over) -> dict:
                     "arm": arm,
                     "sessions": sessions,
                     "zeit": "2026-07-30T04:00:00",
-                    "beleg_vorhanden": True,
-                    "gruppen": gruppen,
+                    "evidence_present": True,
+                    "groups": gruppen,
                     "fatal_erhoben": True,
                     "fatal": None,
                 }
             )
     payload = {
         "kind": "bar1_prefill_kurve",
-        "schema_version": 2,
+        "schema_version": 3,
         "arme": ["bar1", "grundlinie"],
         "sessions_geplant": plan,
         "abbruch": None,
@@ -1485,7 +1485,7 @@ class TestPrefillKurveCheck:
 
     def test_bar1_point_with_a_gloo_group_is_fail(self, tmp_path):
         payload = _kurve()
-        payload["reihenfolge"][0]["gruppen"][1]["achieved"] = "gloo"
+        payload["reihenfolge"][0]["groups"][1]["achieved"] = "gloo"
         _write_kurve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "mixed point" in line
@@ -1494,7 +1494,7 @@ class TestPrefillKurveCheck:
         """The baseline arm differs in exactly three variables; if it sees
         barlink at all, the two arms are not the two arms."""
         payload = _kurve()
-        payload["reihenfolge"][1]["gruppen"] = [
+        payload["reihenfolge"][1]["groups"] = [
             {"group": "tp:0", "requested": "bar1", "achieved": "bar1"}
         ]
         _write_kurve(tmp_path, payload)
@@ -1503,7 +1503,7 @@ class TestPrefillKurveCheck:
 
     def test_missing_transport_evidence_is_fail(self, tmp_path):
         payload = _kurve()
-        payload["reihenfolge"][0]["beleg_vorhanden"] = False
+        payload["reihenfolge"][0]["evidence_present"] = False
         _write_kurve(tmp_path, payload)
         line = assert_fail(self.CHECK, tmp_path, self.STEP)
         assert "Beleg" in line
@@ -1517,7 +1517,7 @@ class TestPrefillKurveCheck:
                 "folge": 3,
                 "arm": "bar1",
                 "sessions": 4,
-                "zeile": "logs/bar1_4.fatal.txt:1: torch.OutOfMemoryError: CUDA "
+                "line": "logs/bar1_4.fatal.txt:1: torch.OutOfMemoryError: CUDA "
                 "out of memory",
             }
         ]
@@ -1636,8 +1636,8 @@ class TestPrefillKurveSummary:
             1310.0 / 1190.0
         )
         assert abs(payload["grundlinie_abweichung_pct"]["1"]) < 0.1
-        assert payload["reihenfolge"][0]["gruppen"][0]["achieved"] == "bar1"
-        assert payload["reihenfolge"][1]["gruppen"] == []
+        assert payload["reihenfolge"][0]["groups"][0]["achieved"] == "bar1"
+        assert payload["reihenfolge"][1]["groups"] == []
         assert payload["fatal"] == []
         assert payload["fatal_ungeprueft"] == []
 
@@ -1654,7 +1654,7 @@ class TestPrefillKurveSummary:
         )
         payload = zusammenfassen(str(tmp_path), 5.0, [1])
         assert len(payload["fatal"]) == 2
-        assert "OutOfMemoryError" in payload["fatal"][0]["zeile"]
+        assert "OutOfMemoryError" in payload["fatal"][0]["line"]
         assert payload["fatal_ungeprueft"] == []
 
     def test_summary_marks_a_boot_without_a_harvest(self, tmp_path):

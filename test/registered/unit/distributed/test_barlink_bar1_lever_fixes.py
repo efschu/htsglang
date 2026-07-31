@@ -35,11 +35,11 @@ from sglang.srt.distributed.device_communicators.barlink_bar1 import (
     max_payload,
 )
 from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
-    ERG_EAGER_PLAETZE,
+    RESULT_EAGER_SLOTS,
     result_slot_split,
     result_eager_free_slot,
     result_eager_slot,
-    erg_eager_slack,
+    result_eager_slack,
     result_graph_slot,
     pipe_range_bytes,
     pipe_window_requirement,
@@ -56,21 +56,21 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 #: The geometry of the measurement run: 96 MiB window per rank, three
 #: ranks, a2a on, pipe depth T=4, chunk target 1 MiB. Every number in this
 #: test module falls out of these five.
-FENSTER = 96 << 20
-WELT = 3
-TIEFE = 4
-CHUNK_ZIEL = 1 << 20
+WINDOW = 96 << 20
+WORLD = 3
+DEPTH = 4
+CHUNK_TARGET = 1 << 20
 K_MAX = 64
 #: Hidden width x element size of the model -- so a tipping point can be
 #: read in TOKENS, the way the measurement report writes it.
-BYTE_JE_TOKEN = 5120 * 2
+BYTES_PER_TOKEN = 5120 * 2
 #: The working point of the run.
-ARBEITSPUNKT_TOKEN = 2048
+WORKING_POINT_TOKENS = 2048
 
 
-def _kipp_token(max_bytes: int) -> int:
+def _tipping_tokens(max_bytes: int) -> int:
     """Largest batch that ONE round still carries."""
-    return max_bytes // BYTE_JE_TOKEN
+    return max_bytes // BYTES_PER_TOKEN
 
 
 # ===========================================================================
@@ -129,19 +129,19 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
 
         ``parallel_state.graph_enable_set`` decides whether bar1 may
         be captured at all; the default here decides HOW. If the two read
-        an ``"aus"`` or an empty field differently, the difference only
+        an ``"off"`` or an empty field differently, the difference only
         shows up later, as a throughput loss.
         """
         import os
 
-        for wert in ("", "0", "1", "nein", "aus", "false", "ja", "wahr", "2"):
+        for value in ("", "0", "1", "no", "off", "false", "yes", "true", "2"):
             with mock.patch.dict(
-                os.environ, {"SGLANG_BARLINK_GRAPH_ENABLE": wert}, clear=False
+                os.environ, {"SGLANG_BARLINK_GRAPH_ENABLE": value}, clear=False
             ):
                 self.assertEqual(
                     graph_grid_default(),
                     graph_enable_set(),
-                    f"value {wert!r} is read differently",
+                    f"value {value!r} is read differently",
                 )
 
     def test_an_unset_variable_is_not_the_same_as_a_zero(self):
@@ -164,15 +164,15 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
 
 
 class TestKernelChoosesByTheDefault(CustomTestCase):
-    """Und die Vorgabe kommt auch wirklich bis in ``_kernel``."""
+    """And the default really does reach ``_kernel``."""
 
-    def _stub(self, graph_gitter: bool):
+    def _stub(self, graph_grid: bool):
         t = BarlinkBar1Transport.__new__(BarlinkBar1Transport)
-        t.graph_gitter = graph_gitter
-        t._graph_gitter_gemeldet = False
+        t.graph_grid = graph_grid
+        t._graph_grid_reported = False
         return t
 
-    def _mit_erfassung(self):
+    def _with_capture(self):
         return mock.patch(
             "sglang.srt.distributed.device_communicators.barlink."
             "graph_capture_running",
@@ -182,19 +182,19 @@ class TestKernelChoosesByTheDefault(CustomTestCase):
     def test_below_the_threshold_nothing_changes(self):
         for grid in (False, True):
             t = self._stub(grid)
-            with self._mit_erfassung():
+            with self._with_capture():
                 self.assertEqual(t._kernel(1024, 4 << 20, "all_reduce"), 0)
 
     def test_capture_with_the_release_keeps_the_cooperative_launch(self):
         t = self._stub(True)
-        with self._mit_erfassung():
+        with self._with_capture():
             self.assertEqual(t._kernel(8 << 20, 4 << 20, "all_reduce"), 1)
 
     def test_capture_without_it_still_falls_back_and_says_so(self):
         t = self._stub(False)
-        with self._mit_erfassung():
+        with self._with_capture():
             self.assertEqual(t._kernel(8 << 20, 4 << 20, "all_reduce"), 0)
-        self.assertTrue(t._graph_gitter_gemeldet)
+        self.assertTrue(t._graph_grid_reported)
 
 
 # ===========================================================================
@@ -207,25 +207,25 @@ class TestWhoStealsTheSlot(CustomTestCase):
 
     The report attributed the loss to the result ring. But the pipe arm
     ran with ``SGLANG_BARLINK_BAR1_PIPE_DIRECT=0``, which makes the ring
-    zero (``barlink_bar1.py``, "if not self.pipe_an or not self.pipe_direkt").
+    zero (``barlink_bar1.py``, "if not self.pipe_on or not self.pipe_direct").
     Exactly one cause remains, and it matches the report's numbers to the
     byte.
     """
 
     def test_the_measured_slot_without_the_pipe_is_reproduced(self):
-        n = max_payload(WELT, FENSTER, True, False, 0)
-        geo = geometry(WELT, n, True, False, 0)
+        n = max_payload(WORLD, WINDOW, True, False, 0)
+        geo = geometry(WORLD, n, True, False, 0)
         self.assertEqual(geo["chunk_max"] // 1024, 8188)
-        self.assertEqual(_kipp_token(n), 2456)
+        self.assertEqual(_tipping_tokens(n), 2456)
 
     def test_the_measured_loss_comes_from_the_pipe_set_not_from_the_ring(self):
-        """6140 KiB falls out at ``erg_ring = 0`` -- the ring was not involved."""
-        n = max_payload(WELT, FENSTER, True, True, 0)
-        geo = geometry(WELT, n, True, True, 0)
+        """6140 KiB falls out at ``result_ring = 0`` -- the ring was not involved."""
+        n = max_payload(WORLD, WINDOW, True, True, 0)
+        geo = geometry(WORLD, n, True, True, 0)
         self.assertEqual(geo["chunk_max"] // 1024, 6140)
-        self.assertEqual(_kipp_token(n), 1842)
+        self.assertEqual(_tipping_tokens(n), 1842)
         self.assertLess(
-            _kipp_token(n), ARBEITSPUNKT_TOKEN,
+            _tipping_tokens(n), WORKING_POINT_TOKENS,
             "the tipping point must lie BELOW the working point -- "
             "otherwise it does not explain the two rounds of the "
             "20 MiB all_reduce",
@@ -239,14 +239,14 @@ class TestWhoStealsTheSlot(CustomTestCase):
         because a ring reserved without being used would be exactly the
         bug the measurement report suspected.
         """
-        geo = geometry(WELT, 8 << 20, True, True, 0)
-        self.assertEqual(geo["erg_ring"], 0)
-        self.assertEqual(geo["off_erg"], -1)
-        self.assertEqual(geo["erg_stride"], 0)
+        geo = geometry(WORLD, 8 << 20, True, True, 0)
+        self.assertEqual(geo["result_ring"], 0)
+        self.assertEqual(geo["off_result"], -1)
+        self.assertEqual(geo["result_stride"], 0)
         # And with direct mode it costs what it costs -- that is not a
         # bug, it is the price of the mode.
-        mit = geometry(WELT, 8 << 20, True, True, 2)
-        self.assertGreater(mit["region_bytes"], geo["region_bytes"])
+        with_ring = geometry(WORLD, 8 << 20, True, True, 2)
+        self.assertGreater(with_ring["region_bytes"], geo["region_bytes"])
 
     def test_the_pipe_area_is_exactly_the_difference(self):
         """The difference between the two denominators, without a detour through the fixed points.
@@ -255,30 +255,30 @@ class TestWhoStealsTheSlot(CustomTestCase):
         Both of the measurement report's numbers fall out of the same
         division.
         """
-        seite = 4096
-        for nenner, erwartet in ((12, 8188), (16, 6140)):
+        page = 4096
+        for denominator, expected in ((12, 8188), (16, 6140)):
             self.assertEqual(
-                ((FENSTER - seite) // nenner // seite) * seite // 1024,
-                erwartet,
+                ((WINDOW - page) // denominator // page) * page // 1024,
+                expected,
             )
         self.assertEqual(
-            geometry(WELT, max_payload(WELT, FENSTER, True, False, 0),
+            geometry(WORLD, max_payload(WORLD, WINDOW, True, False, 0),
                       True, False, 0)["chunk_max"],
-            ((FENSTER - seite) // 12 // seite) * seite,
+            ((WINDOW - page) // 12 // page) * page,
         )
         self.assertEqual(
-            geometry(WELT, max_payload(WELT, FENSTER, True, True, 0),
+            geometry(WORLD, max_payload(WORLD, WINDOW, True, True, 0),
                       True, True, 0)["chunk_max"],
-            ((FENSTER - seite) // 16 // seite) * seite,
+            ((WINDOW - page) // 16 // page) * page,
         )
 
 
 class TestPipeRangeByNeed(CustomTestCase):
     """The range the pipe really needs -- and what it hands back."""
 
-    def _bereich(self) -> int:
+    def _range_bytes(self) -> int:
         return pipe_range_bytes(
-            WELT, TIEFE, pipe_slot_default(WELT, CHUNK_ZIEL)
+            WORLD, DEPTH, pipe_slot_default(WORLD, CHUNK_TARGET)
         )
 
     def test_the_need_is_a_property_of_the_chunk_target_not_of_the_window(self):
@@ -290,16 +290,16 @@ class TestPipeRangeByNeed(CustomTestCase):
         fixed-point computation.
         """
         for window in (64 << 20, 96 << 20, 256 << 20, 8 << 30):
-            n = max_payload(WELT, window, True, True, 0, self._bereich())
-            geo = geometry(WELT, n, True, True, 0, self._bereich())
-            self.assertEqual(geo["pipe_bereich"], self._bereich())
+            n = max_payload(WORLD, window, True, True, 0, self._range_bytes())
+            geo = geometry(WORLD, n, True, True, 0, self._range_bytes())
+            self.assertEqual(geo["pipe_range"], self._range_bytes())
 
     def test_the_right_sized_area_lifts_the_tipping_point_over_the_working_point(self):
-        n = max_payload(WELT, FENSTER, True, True, 0, self._bereich())
-        geo = geometry(WELT, n, True, True, 0, self._bereich())
+        n = max_payload(WORLD, WINDOW, True, True, 0, self._range_bytes())
+        geo = geometry(WORLD, n, True, True, 0, self._range_bytes())
         self.assertEqual(geo["chunk_max"] // 1024, 7736)
-        self.assertEqual(_kipp_token(n), 2320)
-        self.assertGreater(_kipp_token(n), ARBEITSPUNKT_TOKEN)
+        self.assertEqual(_tipping_tokens(n), 2320)
+        self.assertGreater(_tipping_tokens(n), WORKING_POINT_TOKENS)
 
     def test_pure_pipe_without_direct_keeps_almost_the_whole_slot(self):
         """"Pure pipe keeps the full slot", as far as that goes.
@@ -308,19 +308,19 @@ class TestPipeRangeByNeed(CustomTestCase):
         and that is missing from the slot. Of the 2048 KiB the full slot
         set cost, 1596 come back -- 78%.
         """
-        ohne = geometry(
-            WELT, max_payload(WELT, FENSTER, True, False, 0), True, False, 0
+        without = geometry(
+            WORLD, max_payload(WORLD, WINDOW, True, False, 0), True, False, 0
         )["chunk_max"]
-        alt = geometry(
-            WELT, max_payload(WELT, FENSTER, True, True, 0), True, True, 0
+        old = geometry(
+            WORLD, max_payload(WORLD, WINDOW, True, True, 0), True, True, 0
         )["chunk_max"]
-        neu = geometry(
-            WELT, max_payload(WELT, FENSTER, True, True, 0, self._bereich()),
-            True, True, 0, self._bereich(),
+        new_ = geometry(
+            WORLD, max_payload(WORLD, WINDOW, True, True, 0, self._range_bytes()),
+            True, True, 0, self._range_bytes(),
         )["chunk_max"]
-        self.assertLess(alt, neu)
-        self.assertLess(neu, ohne)
-        self.assertGreater((neu - alt) / (ohne - alt), 0.75)
+        self.assertLess(old, new_)
+        self.assertLess(new_, without)
+        self.assertGreater((new_ - old) / (without - old), 0.75)
 
     def test_the_eager_direct_slots_are_charged_to_the_direct_mode(self):
         """Two slots stay two slots -- they belong to direct mode.
@@ -329,10 +329,10 @@ class TestPipeRangeByNeed(CustomTestCase):
         them from the pipe range would mean showing direct mode as free.
         What it costs, it costs.
         """
-        ber = self._bereich()
-        ohne_ring = max_payload(WELT, FENSTER, True, True, 0, ber)
-        mit_ring = max_payload(WELT, FENSTER, True, True, 2, ber)
-        self.assertLess(mit_ring, ohne_ring)
+        range_bytes = self._range_bytes()
+        without_ring = max_payload(WORLD, WINDOW, True, True, 0, range_bytes)
+        with_ring = max_payload(WORLD, WINDOW, True, True, 2, range_bytes)
+        self.assertLess(with_ring, without_ring)
 
     def test_every_payload_the_window_carries_finds_a_chunk_count(self):
         """A tight slot is allowed to cost coverage -- here it costs none.
@@ -342,19 +342,19 @@ class TestPipeRangeByNeed(CustomTestCase):
         So this checks that, between the pipe's lower bound and the
         window's largest payload, it never actually comes to that.
         """
-        slot = pipe_slot_default(WELT, CHUNK_ZIEL)
-        maxb = max_payload(WELT, FENSTER, True, True, 0, self._bereich())
-        schritt = 16 * 997
+        slot = pipe_slot_default(WORLD, CHUNK_TARGET)
+        maxb = max_payload(WORLD, WINDOW, True, True, 0, self._range_bytes())
+        step = 16 * 997
         nb = 256 << 10
-        geprueft = 0
+        checked = 0
         while nb <= maxb:
             self.assertIsNotNone(
-                pipe_plan(nb, WELT, slot, TIEFE, 0, CHUNK_ZIEL, K_MAX),
+                pipe_plan(nb, WORLD, slot, DEPTH, 0, CHUNK_TARGET, K_MAX),
                 f"{nb} bytes are not carried by the {slot}-byte slot",
             )
-            geprueft += 1
-            nb += schritt
-        self.assertGreater(geprueft, 1000)
+            checked += 1
+            nb += step
+        self.assertGreater(checked, 1000)
 
     def test_what_the_kernel_touches_stays_inside_what_the_layout_reserves(self):
         """The one condition a too-small range would violate.
@@ -364,30 +364,30 @@ class TestPipeRangeByNeed(CustomTestCase):
         range is that same number, rounded up to a page -- and the result
         ring only starts beyond it.
         """
-        for welt in (2, 3, 4, 8):
-            for tiefe in (2, 4, 8):
-                for ziel in (256 << 10, 1 << 20, 4 << 20):
-                    slot = pipe_slot_default(welt, ziel)
-                    ber = pipe_range_bytes(welt, tiefe, slot)
+        for world in (2, 3, 4, 8):
+            for depth in (2, 4, 8):
+                for dst in (256 << 10, 1 << 20, 4 << 20):
+                    slot = pipe_slot_default(world, dst)
+                    range_bytes = pipe_range_bytes(world, depth, slot)
                     self.assertGreaterEqual(
-                        ber, pipe_window_requirement(welt, tiefe, slot)
+                        range_bytes, pipe_window_requirement(world, depth, slot)
                     )
-                    self.assertEqual(ber % 4096, 0)
+                    self.assertEqual(range_bytes % 4096, 0)
                     self.assertEqual(slot % 16, 0)
-                    n = max_payload(welt, FENSTER, True, True, 2, ber)
+                    n = max_payload(world, WINDOW, True, True, 2, range_bytes)
                     if n <= 0:
                         continue
-                    geo = geometry(welt, n, True, True, 2, ber)
-                    self.assertEqual(geo["pipe_bereich"], ber)
+                    geo = geometry(world, n, True, True, 2, range_bytes)
+                    self.assertEqual(geo["pipe_range"], range_bytes)
                     self.assertEqual(
-                        geo["off_erg"], geo["off_pipe"] + ber
+                        geo["off_result"], geo["off_pipe"] + range_bytes
                     )
                     self.assertLessEqual(
-                        geo["off_erg"] + 2 * geo["erg_stride"],
+                        geo["off_result"] + 2 * geo["result_stride"],
                         geo["region_bytes"],
                     )
                     self.assertEqual(geo["off_pipe"] % 4096, 0)
-                    self.assertEqual(geo["off_erg"] % 4096, 0)
+                    self.assertEqual(geo["off_result"] % 4096, 0)
 
     def test_a_layout_without_the_area_is_caught_by_the_same_check(self):
         """The falsifier: the check above must have teeth.
@@ -396,28 +396,28 @@ class TestPipeRangeByNeed(CustomTestCase):
         ``off_pipe`` because someone forgot the range. It would then land
         in the middle of the pipe slots.
         """
-        ber = self._bereich()
-        n = max_payload(WELT, FENSTER, True, True, 2, ber)
-        geo = geometry(WELT, n, True, True, 2, ber)
-        falsch = geo["off_pipe"]
+        range_bytes = self._range_bytes()
+        n = max_payload(WORLD, WINDOW, True, True, 2, range_bytes)
+        geo = geometry(WORLD, n, True, True, 2, range_bytes)
+        wrong = geo["off_pipe"]
         self.assertLess(
-            falsch,
+            wrong,
             geo["off_pipe"] + pipe_window_requirement(
-                WELT, TIEFE, pipe_slot_default(WELT, CHUNK_ZIEL)
+                WORLD, DEPTH, pipe_slot_default(WORLD, CHUNK_TARGET)
             ),
         )
-        self.assertNotEqual(falsch, geo["off_erg"])
+        self.assertNotEqual(wrong, geo["off_result"])
 
     def test_the_old_cut_is_still_available_and_byte_identical(self):
-        """``pipe_bereich = 0`` means "as before" -- exactly that."""
+        """``pipe_range = 0`` means "as before" -- exactly that."""
         for max_bytes in (64 << 10, 8 << 20):
-            alt = geometry(WELT, max_bytes, True, True, 2, 0)
+            old = geometry(WORLD, max_bytes, True, True, 2, 0)
             self.assertEqual(
-                alt["pipe_bereich"],
-                2 * (WELT - 1) * alt["chunk_max"],
+                old["pipe_range"],
+                2 * (WORLD - 1) * old["chunk_max"],
             )
             self.assertEqual(
-                alt["off_erg"], alt["off_pipe"] + alt["pipe_bereich"]
+                old["off_result"], old["off_pipe"] + old["pipe_range"]
             )
 
 
@@ -428,16 +428,16 @@ class TestPipeRangeByNeed(CustomTestCase):
 
 class TestResultSlotSplitIsConfigurable(CustomTestCase):
     def test_the_default_is_unchanged(self):
-        self.assertEqual(ERG_EAGER_PLAETZE, 2)
+        self.assertEqual(RESULT_EAGER_SLOTS, 2)
         self.assertEqual(result_slot_split(5, True), (2, 3))
         self.assertEqual(result_slot_split(5, False), (5, 0))
 
     def test_a_bigger_ring_used_to_hand_out_graph_slots_only(self):
         """The measurement run's finding, as a number.
 
-        ``ERG_RING=5`` gave three GRAPH slots and left the eager count at
+        ``RESULT_RING=5`` gave three GRAPH slots and left the eager count at
         two -- and the abort happened during capture WARMUP, which runs
-        eager. So the knob could not have worked, and ``ERG_RING=50``
+        eager. So the knob could not have worked, and ``RESULT_RING=50``
         would not have either.
         """
         for ring in (5, 8, 50):
@@ -461,14 +461,14 @@ class TestResultSlotSplitIsConfigurable(CustomTestCase):
 
 class TestFreeEagerSlot(CustomTestCase):
     def test_with_everything_free_the_rotation_is_the_old_one(self):
-        voriger = -1
-        folge = []
+        previous = -1
+        sequence = []
         for _ in range(6):
-            voriger = result_eager_free_slot(voriger, 3, [False] * 3)
-            folge.append(voriger)
-        self.assertEqual(folge, [0, 1, 2, 0, 1, 2])
+            previous = result_eager_free_slot(previous, 3, [False] * 3)
+            sequence.append(previous)
+        self.assertEqual(sequence, [0, 1, 2, 0, 1, 2])
         self.assertEqual(
-            folge[:3],
+            sequence[:3],
             [result_eager_slot(-1, 3), result_eager_slot(0, 3),
              result_eager_slot(1, 3)],
         )
@@ -498,67 +498,67 @@ class TestSlackIsALowerBound(CustomTestCase):
 
     def test_strict_rotation_gives_exactly_the_number_of_slots(self):
         L = 3
-        zuletzt = [None] * L
-        zaehler = 0
-        gesehen = []
+        last_used = [None] * L
+        counter = 0
+        seen = []
         for _ in range(3 * L):
             i = result_eager_free_slot(
-                (zaehler - 1) % L if zaehler else -1, L, [False] * L
+                (counter - 1) % L if counter else -1, L, [False] * L
             )
-            gesehen.append(erg_eager_slack(i, zaehler, zuletzt, L))
-            zuletzt[i] = zaehler
-            zaehler += 1
-        self.assertEqual(gesehen[:L], [L] * L)
-        self.assertEqual(gesehen[L:], [L] * (2 * L))
+            seen.append(result_eager_slack(i, counter, last_used, L))
+            last_used[i] = counter
+            counter += 1
+        self.assertEqual(seen[:L], [L] * L)
+        self.assertEqual(seen[L:], [L] * (2 * L))
 
     def test_a_skipped_slot_lowers_the_slack(self):
         L = 3
-        zuletzt = [None, None, None]
+        last_used = [None, None, None]
         # Slot 0 at call 0, then slot 0 again at call 1.
-        zuletzt[0] = 0
-        self.assertEqual(erg_eager_slack(0, 1, zuletzt, L), 1)
-        self.assertEqual(erg_eager_slack(0, 2, zuletzt, L), 2)
-        self.assertEqual(erg_eager_slack(0, 9, zuletzt, L), L)
+        last_used[0] = 0
+        self.assertEqual(result_eager_slack(0, 1, last_used, L), 1)
+        self.assertEqual(result_eager_slack(0, 2, last_used, L), 2)
+        self.assertEqual(result_eager_slack(0, 9, last_used, L), L)
 
     def test_an_unused_slot_may_take_the_full_distance(self):
-        self.assertEqual(erg_eager_slack(1, 7, [None, None], 2), 2)
+        self.assertEqual(result_eager_slack(1, 7, [None, None], 2), 2)
 
     def test_the_slack_is_never_zero(self):
         """``0`` would switch off the handshake in the kernel entirely."""
-        for zaehler in range(5):
+        for counter in range(5):
             self.assertGreaterEqual(
-                erg_eager_slack(0, zaehler, [zaehler], 4), 1
+                result_eager_slack(0, counter, [counter], 4), 1
             )
 
 
 def _stub(**kw):
     """A transport without ``__init__`` -- just the fields ``_result_slot`` needs."""
     t = BarlinkBar1Transport.__new__(BarlinkBar1Transport)
-    t.pipe_direkt = True
-    t.pipe_direkt_graph = False
-    t._direkt_graph_gemeldet = False
-    t._erg_graph_leer_gemeldet = False
-    t._erg_graph_vergeben = 0
-    t._erg_i = -1
-    t._erg_lebt = [None, None]
-    t._erg_zuletzt = [None, None]
-    t._erg_zaehler = 0
-    t._erg_eager_voll = 0
-    t._erg_eager_voll_gemeldet = False
-    t._erg_eager_plaetze = 2
-    t._erg_graph_plaetze = 0
-    t._eigen = (1 << 30, 0, 0)
-    t._geo = {"off_erg": 4096, "erg_stride": 1 << 20, "erg_ring": 2}
+    t.pipe_direct = True
+    t.pipe_direct_graph = False
+    t._direct_graph_reported = False
+    t._result_graph_empty_reported = False
+    t._result_graph_assigned = 0
+    t._result_i = -1
+    t._result_alive = [None, None]
+    t._result_last = [None, None]
+    t._result_counter = 0
+    t._result_eager_full = 0
+    t._result_eager_full_reported = False
+    t._result_eager_slots = 2
+    t._result_graph_slots = 0
+    t._own = (1 << 30, 0, 0)
+    t._geo = {"off_result": 4096, "result_stride": 1 << 20, "result_ring": 2}
     t._pipe_ext = mock.Mock()
-    t._pipe_ext.bar1_erg_tensor.side_effect = lambda ptr, muster: mock.Mock(
-        name=f"erg@{ptr}"
+    t._pipe_ext.bar1_result_tensor.side_effect = lambda ptr, like: mock.Mock(
+        name=f"result@{ptr}"
     )
     for k, v in kw.items():
         setattr(t, k, v)
     return t
 
 
-def _ohne_erfassung():
+def _without_capture():
     return mock.patch(
         "sglang.srt.distributed.device_communicators.barlink."
         "graph_capture_running",
@@ -572,68 +572,68 @@ class TestEagerFullFallsBackInsteadOfAborting(CustomTestCase):
     Previously ``_result_slot`` raised ``Bar1Unavailable`` here -- during
     capture WARMUP that meant a dead server. Aborting was the wrong answer
     to the right concern: what stays forbidden is writing into a held
-    buffer, and that is precisely what does not happen at ``direkt=0``.
+    buffer, and that is precisely what does not happen at ``direct=0``.
     It takes the same path the exhausted graph pool already takes a
     couple of lines above.
     """
 
     def test_a_held_slot_no_longer_kills_the_call(self):
         t = _stub()
-        with _ohne_erfassung():
-            behalten, _platz, _slack = t._result_slot(object())
-            zweiter = t._result_slot(object())
-        self.assertIsNotNone(behalten)
-        self.assertIsNotNone(zweiter)
-        self.assertNotEqual(zweiter[1], 0)
+        with _without_capture():
+            held, _slot, _slack = t._result_slot(object())
+            second = t._result_slot(object())
+        self.assertIsNotNone(held)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second[1], 0)
 
     def test_all_slots_held_falls_back_to_direct_zero_and_counts_it(self):
         t = _stub()
-        gehalten = []
-        with _ohne_erfassung():
+        held_list = []
+        with _without_capture():
             for _ in range(2):
-                gehalten.append(t._result_slot(object()))
+                held_list.append(t._result_slot(object()))
             self.assertIsNone(t._result_slot(object()))
             self.assertIsNone(t._result_slot(object()))
-        self.assertEqual(t._erg_eager_voll, 2)
-        self.assertTrue(t._erg_eager_voll_gemeldet)
+        self.assertEqual(t._result_eager_full, 2)
+        self.assertTrue(t._result_eager_full_reported)
         # And as soon as the caller lets go, direct mode runs again.
-        gehalten.clear()
-        with _ohne_erfassung():
+        held_list.clear()
+        with _without_capture():
             self.assertIsNotNone(t._result_slot(object()))
 
     def test_more_eager_slots_carry_more_live_results(self):
         """The knob missing from the measurement run, checked at the seam."""
         t = _stub(
-            _erg_lebt=[None] * 4,
-            _erg_zuletzt=[None] * 4,
-            _erg_eager_plaetze=4,
-            _geo={"off_erg": 4096, "erg_stride": 1 << 20, "erg_ring": 4},
+            _result_alive=[None] * 4,
+            _result_last=[None] * 4,
+            _result_eager_slots=4,
+            _geo={"off_result": 4096, "result_stride": 1 << 20, "result_ring": 4},
         )
-        gehalten = []
-        with _ohne_erfassung():
+        held_list = []
+        with _without_capture():
             for _ in range(4):
-                gehalten.append(t._result_slot(object()))
+                held_list.append(t._result_slot(object()))
             self.assertIsNone(t._result_slot(object()))
-        self.assertEqual([g[1] for g in gehalten], [0, 1, 2, 3])
-        self.assertEqual(t._erg_eager_voll, 1)
+        self.assertEqual([g[1] for g in held_list], [0, 1, 2, 3])
+        self.assertEqual(t._result_eager_full, 1)
 
     def test_the_handshake_slack_follows_the_real_reuse_distance(self):
-        t = _stub(pipe_direkt_graph=True)
-        with _ohne_erfassung():
-            erster = t._result_slot(object())      # slot 0, gets HELD
+        t = _stub(pipe_direct_graph=True)
+        with _without_capture():
+            isFirst = t._result_slot(object())      # slot 0, gets HELD
             t._result_slot(object())               # slot 1, discarded right away
-            dritter = t._result_slot(object())     # slot 1 again
-        self.assertEqual(erster[1], 0)
-        self.assertEqual(dritter[1], 1)
+            third = t._result_slot(object())     # slot 1 again
+        self.assertEqual(isFirst[1], 0)
+        self.assertEqual(third[1], 1)
         # Slot 1 was one call back, not two.
-        self.assertEqual(dritter[2], 1)
+        self.assertEqual(third[2], 1)
 
     def test_the_measured_rotation_keeps_its_old_slack(self):
-        t = _stub(pipe_direkt_graph=True)
-        with _ohne_erfassung():
+        t = _stub(pipe_direct_graph=True)
+        with _without_capture():
             for _ in range(5):
-                _out, _platz, slack = t._result_slot(object())
-                self.assertEqual(slack, t._erg_eager_plaetze)
+                _out, _slot, slack = t._result_slot(object())
+                self.assertEqual(slack, t._result_eager_slots)
 
 
 if __name__ == "__main__":

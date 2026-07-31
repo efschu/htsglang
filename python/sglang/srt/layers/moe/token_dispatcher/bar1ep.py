@@ -187,8 +187,8 @@ def bar1ep_transport(gruppe_koordinator=None):
     """Der BAR1-Transport dieser Gruppe, oder ``(None, Grund)``.
 
     Jede Bedingung ist rangeinheitlich: sie haengt an gruppenweit
-    abgeglichenem Zustand (Umgebungsvariablen, ``_a2a_beleg`` aus einem
-    ``all_gather_object`` in ``barlink_bar1.byte_beleg_a2a``, Geometrie aus
+    abgeglichenem Zustand (Umgebungsvariablen, ``_a2a_proof`` aus einem
+    ``all_gather_object`` in ``barlink_bar1.byte_proof_a2a``, Geometrie aus
     rangeinheitlichen Groessen). Zwei Raenge duerfen hier nie verschieden
     antworten -- der eine liefe ins Kollektiv, der andere nicht, und daraus
     wuerde ein Haenger statt eines Fehlers.
@@ -228,7 +228,7 @@ def bar1ep_transport(gruppe_koordinator=None):
         return None, (
             "Der BAR1-Transport steht, aber sein a2a-Byte-Beleg ist nicht "
             "bestanden (oder SGLANG_BARLINK_BAR1_A2A=0). Ohne bestandenen Beleg "
-            "meldet sich all_to_all ab -- siehe barlink_bar1.byte_beleg_a2a."
+            "meldet sich all_to_all ab -- siehe barlink_bar1.byte_proof_a2a."
         )
     return t, ""
 
@@ -488,7 +488,7 @@ class Bar1EPDispatcher(BaseDispatcher):
         sie als Praefixsumme raten zu lassen: eine Runde bewegt aus jedem
         Block nur ein Stueck, und die Bloecke bleiben dabei stehen, wo sie
         sind. Genau dafuer nimmt ``barlink_bar1.barlink_all_to_all_single`` seit
-        dieser Aenderung ``sende_versatz``/``empfangs_versatz`` entgegen; der
+        dieser Aenderung ``send_offsets``/``recv_offsets`` entgegen; der
         Kernel hat Versaetze und Laengen ohnehin immer getrennt bekommen.
         """
         R = self.welt

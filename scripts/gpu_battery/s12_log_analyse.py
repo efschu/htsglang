@@ -65,7 +65,7 @@ RE_DECODE = re.compile(
 # German wording #295 moved barlink_bar1.py's setup line away from. Dead on
 # every real run since; see test_bar1_marker_coupling.py.
 RE_BAR1_SETUP = re.compile(
-    r"barlink-BAR1: setup in (?P<aufbau_ms>[\d.]+) ms, (?P<peers>\d+) peer "
+    r"barlink-BAR1: setup in (?P<setup_ms>[\d.]+) ms, (?P<peers>\d+) peer "
     r"targets, region (?P<region_mib>[\d.]+) MiB per rank "
     r"\((?P<schlitze>\d+) slots"
     r".*?\), slot (?P<schlitz_kib>\d+) KiB, "
@@ -142,7 +142,7 @@ def parse_bar1_geometrie(lines) -> dict | None:
             return _numbers(
                 m,
                 ("peers", "schlitze", "schlitz_kib", "max_nutzlast_kib"),
-                ("aufbau_ms", "region_mib"),
+                ("setup_ms", "region_mib"),
             )
     return None
 

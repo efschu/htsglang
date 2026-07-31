@@ -75,7 +75,7 @@ class Bar1Failed(RuntimeError):
     The difference from a silent ``None`` is the whole point: a ``None``
     selects the gloo plane and afterwards looks like success. This
     exception carries the reason through to ``_build_transport``, which
-    writes it into a warning and into ``_STAND``.
+    writes it into a warning and into ``_STATE``.
     """
 
     def __init__(self, reason: str, stage: str = "setup"):
@@ -94,10 +94,10 @@ class Bar1Failed(RuntimeError):
 #: throughput number derived from that run (22.83 tok/s) was in part not a
 #: BAR1 number at all. A measurement whose arm can't be read off the log
 #: is not a measurement.
-_STAND: dict[str, dict] = {}
+_STATE: dict[str, dict] = {}
 
 
-def report_state(gruppe: str, requested: str, achieved: str,
+def report_state(group: str, requested: str, achieved: str,
                 reason: str = "", stage: str = "") -> dict:
     """Record what this group will actually run on.
 
@@ -106,16 +106,16 @@ def report_state(gruppe: str, requested: str, achieved: str,
     numbered placeholder name, so that two of them don't overwrite each
     other and one silently disappears.
     """
-    schluessel = gruppe
-    if not schluessel:
+    key = group
+    if not key:
         i = 0
-        while f"<ohne Namen #{i}>" in _STAND:
+        while f"<unnamed #{i}>" in _STATE:
             i += 1
-        schluessel = f"<ohne Namen #{i}>"
-    eintrag = {
+        key = f"<unnamed #{i}>"
+    entry = {
         # NOTE: these dict keys are a cross-file data contract.
         # python/sglang/srt/distributed/parallel_state.py reads them back
-        # via ``stand.get("achieved", ...)`` to build its own
+        # via ``state.get("achieved", ...)`` to build its own
         # "requested=%s, ACHIEVED=%s" log line, and
         # scripts/gpu_battery/s11_bar1_e2e.py rebuilds a lookalike dict with
         # the same spellings by regex-scanning that log line. Change a key
@@ -123,45 +123,45 @@ def report_state(gruppe: str, requested: str, achieved: str,
         # ``SCHEMA_VERSION`` of every gpu_battery artifact that persists it
         # (bar1_e2e.json, prefill_kurve.json), so a stale artifact is
         # rejected loudly instead of silently read as empty.
-        "group": schluessel,
+        "group": key,
         "requested": requested,
         "achieved": achieved,
         "reason": reason,
         "stage": stage,
         "direct": achieved == requested and achieved not in ("gloo", ""),
     }
-    _STAND[schluessel] = eintrag
-    return eintrag
+    _STATE[key] = entry
+    return entry
 
 
-def group_state() -> dict[str, dict]:
+def group_states() -> dict[str, dict]:
     """Which groups actually run over the requested transport.
 
     Made queryable, not just logged: a measurement program should be able
     to CHECK this, instead of parsing log lines.
     """
-    return dict(_STAND)
+    return dict(_STATE)
 
 
 def state_summary() -> str:
     """One line per group, for the log and for the measurement report."""
-    if not _STAND:
+    if not _STATE:
         return "barlink: no group reported."
-    zeilen = []
-    for name, e in sorted(_STAND.items()):
+    lines = []
+    for name, e in sorted(_STATE.items()):
         if e["direct"]:
-            zeilen.append(f"  {name}: {e['achieved']}")
+            lines.append(f"  {name}: {e['achieved']}")
         else:
-            zeilen.append(
+            lines.append(
                 f"  {name}: {e['achieved']} (REQUESTED WAS "
                 f"{e['requested']}; {e['stage']}: {e['reason']})"
             )
-    voll = all(e["direct"] for e in _STAND.values())
-    kopf = ("barlink: all groups are running the requested transport."
-            if voll else
-            "barlink: NOT all groups are running the requested transport -- "
-            "a measurement over this configuration is mixed.")
-    return kopf + "\n" + "\n".join(zeilen)
+    all_direct = all(e["direct"] for e in _STATE.values())
+    header = ("barlink: all groups are running the requested transport."
+              if all_direct else
+              "barlink: NOT all groups are running the requested transport -- "
+              "a measurement over this configuration is mixed.")
+    return header + "\n" + "\n".join(lines)
 
 
 # ----------------------------------------------------------------------
@@ -218,7 +218,7 @@ def _make_ucx_transport(cpu_group, device):
     return BarlinkUcxTransport(cpu_group=cpu_group, device=device)
 
 
-def _make_bar1_transport(cpu_group, device, gruppe: str = ""):
+def _make_bar1_transport(cpu_group, device, group: str = ""):
     """The BAR1 direct path on its own -- no planner, no measurement.
 
     The source card DMAs straight into the target card's BAR1 aperture: no
@@ -238,18 +238,21 @@ def _make_bar1_transport(cpu_group, device, gruppe: str = ""):
         window_for,
     )
 
-    bericht: dict = {}
-    t = build_bar1(cpu_group, device, window_for(gruppe, device), bericht,
-                  gruppe=gruppe)
-    if t is None or bericht.get("haelt_belegt"):
+    report: dict = {}
+    t = build_bar1(cpu_group, device, window_for(group, device), report,
+                  group=group)
+    # "holds_space" is written by barlink_bar1.build_bar1 and also read by
+    # barlink_matrix_transport; the key spelling is a cross-module contract,
+    # so all three sides moved to the English name in one step (#358).
+    if t is None or report.get("holds_space"):
         raise Bar1Failed(
-            bericht.get("reason", "no reason reported"),
-            stage=bericht.get("stage", "unknown"),
+            report.get("reason", "no reason reported"),
+            stage=report.get("stage", "unknown"),
         )
     return t
 
 
-def _make_matrix_transport(cpu_group, device, gruppe: str = ""):
+def _make_matrix_transport(cpu_group, device, group: str = ""):
     """Planner + BAR1 direct path.
 
     Builds the direct path, hands its ACTUALLY mapped window to the planner
@@ -262,7 +265,7 @@ def _make_matrix_transport(cpu_group, device, gruppe: str = ""):
         BarlinkMatrixTransport,
     )
 
-    t = BarlinkMatrixTransport(cpu_group=cpu_group, device=device, gruppe=gruppe)
+    t = BarlinkMatrixTransport(cpu_group=cpu_group, device=device, group=group)
     if t.bar1 is None:
         # The planner alone is not a transport: `handles` would return
         # False for everything, and every collective would run over the
@@ -292,7 +295,7 @@ TRANSPORT_REGISTRY = {
     "ucx": _make_ucx_transport,
     # GPU-to-GPU straight through the target's BAR1 aperture. Neither the
     # host nor a NIC touches the payload. Needs the relaxed driver guard
-    # (RMSmallBarP2PPeerBar1), the dmabuf_holder module and a passing byte
+    # (BarlinkPeerBar1), the dmabuf_holder module and a passing byte
     # proof; without any of them it opts out cleanly and the gloo plane
     # runs. Its knobs (SGLANG_BARLINK_BAR1_*) live in its own module because
     # they describe its kernels and its BAR1 geometry, not the communicator.
@@ -342,7 +345,7 @@ def _no_fallback(name: str) -> bool:
         return False
 
 
-def _invoke_factory(factory, cpu_group, device, gruppe: str):
+def _invoke_factory(factory, cpu_group, device, group: str):
     """Call the factory, passing the group name only if it accepts one.
 
     Two factories (bar1, matrix) need it -- for the per-group window size.
@@ -354,35 +357,35 @@ def _invoke_factory(factory, cpu_group, device, gruppe: str):
     import inspect
 
     try:
-        nimmt = "gruppe" in inspect.signature(factory).parameters
+        takes_group = "group" in inspect.signature(factory).parameters
     except (TypeError, ValueError):
-        nimmt = False
-    if nimmt:
-        return factory(cpu_group, device, gruppe=gruppe)
+        takes_group = False
+    if takes_group:
+        return factory(cpu_group, device, group=group)
     return factory(cpu_group, device)
 
 
 def _build_transport(name: str, cpu_group, device, disabled: bool,
-                     gruppe: str = ""):
+                     group: str = ""):
     if disabled:
-        report_state(gruppe, name, "none (world_size 1)")
+        report_state(group, name, "none (world_size 1)")
         return None
     factory = TRANSPORT_REGISTRY.get(name)
     if factory is None:
-        report_state(gruppe, name, "gloo",
+        report_state(group, name, "gloo",
                     reason="no such name in TRANSPORT_REGISTRY",
                     stage="selection")
         return None  # "gloo" or an unknown name -> inline data plane
     if _no_fallback(name):
-        t = _invoke_factory(factory, cpu_group, device, gruppe)
-        report_state(gruppe, name, name)
+        t = _invoke_factory(factory, cpu_group, device, group)
+        report_state(group, name, name)
         return t
     try:
-        t = _invoke_factory(factory, cpu_group, device, gruppe)
+        t = _invoke_factory(factory, cpu_group, device, group)
     except Exception as e:
         stage = getattr(e, "stage", "setup")
         reason = getattr(e, "reason", f"{type(e).__name__}: {e}")
-        report_state(gruppe, name, "gloo", reason=reason, stage=stage)
+        report_state(group, name, "gloo", reason=reason, stage=stage)
         # WARNING, not INFO, and with the group name. One group failing is
         # not an edge case: it turns any measurement over this run into a
         # mixed one, and that is exactly what happened here unnoticed.
@@ -391,19 +394,19 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
             "(%s: %s). This group runs over the host-staged gloo layer. "
             "Any measurement over this run is therefore mixed and must "
             "NOT be reported as a %r number.",
-            gruppe or "<ohne Namen>", name, stage, reason, name,
+            group or "<unnamed>", name, stage, reason, name,
         )
         return None
     if t is None:
-        report_state(gruppe, name, "gloo",
+        report_state(group, name, "gloo",
                     reason="factory returned None without a reason", stage="setup")
         logger.warning(
             "barlink: group %r does not get the requested transport %r "
             "(the factory returned None). gloo layer.",
-            gruppe or "<ohne Namen>", name,
+            group or "<unnamed>", name,
         )
         return None
-    report_state(gruppe, name, name)
+    report_state(group, name, name)
     return t
 
 
@@ -442,15 +445,15 @@ def _transport_name(t) -> str:
     last one that should be trusted with a call.
     """
     try:
-        holen = getattr(t, "name", None)
-        if callable(holen):
-            return str(holen())
+        name_fn = getattr(t, "name", None)
+        if callable(name_fn):
+            return str(name_fn())
     except Exception:  # noqa: BLE001 - a name must never itself be the cause
         pass
     return type(t).__name__
 
 
-def _gedeckte_ops(t) -> str:
+def _covered_ops(t) -> str:
     """The operations ``t`` actually offers -- straight from THE source.
 
     Reads ``BARLINK_OPS`` off the transport itself, never a list carried
@@ -473,7 +476,7 @@ def _row_bytes(t: torch.Tensor) -> int:
     return n * t.element_size()
 
 
-def _group_max(wert: int, cpu_group, table=None) -> int:
+def _group_max(value: int, cpu_group, table=None) -> int:
     """Maximum across the group, on the CPU.
 
     Only meant for the case where the caller brings BOTH split-size lists
@@ -482,7 +485,7 @@ def _group_max(wert: int, cpu_group, table=None) -> int:
     -- measurably expensive relative to a MoE dispatch, but cheaper than a
     hang, and the evenly-split case doesn't need it at all.
     """
-    t = torch.tensor([int(wert)], dtype=torch.int64)
+    t = torch.tensor([int(value)], dtype=torch.int64)
     barlink_liveness.bounded_collective(
         lambda: dist.all_reduce(
             t, op=dist.ReduceOp.MAX, group=cpu_group, async_op=True
@@ -500,11 +503,11 @@ class BarlinkCommunicator:
         self,
         cpu_group: ProcessGroup,
         device: torch.device,
-        gruppe: str = "",
+        group: str = "",
     ):
         self.cpu_group = cpu_group
         self.device = device
-        self.gruppe = gruppe
+        self.group = group
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
@@ -519,16 +522,16 @@ class BarlinkCommunicator:
         #: notice has already gone out. Kept per group, because coverage
         #: can differ per group: tp and dcp get differently sized windows,
         #: and what fits in one doesn't have to fit in the other.
-        self._rueckfall_gemeldet: set = set()
+        self._fallback_reported: set = set()
         self.transport = _build_transport(
-            _TRANSPORT, cpu_group, device, disabled=self.disabled, gruppe=gruppe,
+            _TRANSPORT, cpu_group, device, disabled=self.disabled, group=group,
         )
         #: What this group ACTUALLY runs on -- not what was requested.
         #: Nameless means: the entry `_build_transport` just created, i.e.
         #: the most recently inserted one.
-        self.stand = (
-            _STAND.get(gruppe, {}) if gruppe
-            else (list(_STAND.values())[-1] if _STAND else {})
+        self.state = (
+            _STATE.get(group, {}) if group
+            else (list(_STATE.values())[-1] if _STATE else {})
         )
         # #279 path dispatcher (skeleton, flag-gated, default None). With an
         # empty registry every decision is status quo, so building it does
@@ -617,35 +620,35 @@ class BarlinkCommunicator:
             # size class is the base-2 logarithm -- fine enough that a new
             # operating size stands out, coarse enough that noise doesn't
             # produce a new line every time.
-            klasse = int(nbytes).bit_length()
-            schluessel = (op, klasse)
+            size_class = int(nbytes).bit_length()
+            key = (op, size_class)
             # Created lazily, not assumed to exist: the communicator also
             # exists as a `__new__` stand-in (tests, and the path
             # dispatcher builds itself one), and a warning that dies on the
             # missing marker would be a new failure right at the point
             # where one is currently being closed off.
-            gemeldet = getattr(self, "_rueckfall_gemeldet", None)
-            if gemeldet is None:
-                gemeldet = set()
-                self._rueckfall_gemeldet = gemeldet
-            if schluessel not in gemeldet:
-                gemeldet.add(schluessel)
-                grund = ""
-                warum = getattr(t, "why_not", None)
-                if callable(warum):
+            reported = getattr(self, "_fallback_reported", None)
+            if reported is None:
+                reported = set()
+                self._fallback_reported = reported
+            if key not in reported:
+                reported.add(key)
+                reason = ""
+                why_not = getattr(t, "why_not", None)
+                if callable(why_not):
                     try:
-                        grund = warum(op, nbytes) or ""
+                        reason = why_not(op, nbytes) or ""
                     except Exception as e:      # noqa: BLE001
-                        grund = f"(reason could not be determined: {e!r})"
+                        reason = f"(reason could not be determined: {e!r})"
                 logger.warning(
                     "barlink[%s]: %s does NOT cover %r at %d bytes -- falling "
                     "back to the host-staged layer. Covered there: %s.%s "
                     "This message appears once per operation and size "
                     "class; this run's numbers for this size are NOT %s "
                     "numbers.",
-                    getattr(self, "gruppe", "?"), _transport_name(t), op,
-                    nbytes, _gedeckte_ops(t),
-                    f" Reason: {grund}." if grund else "",
+                    getattr(self, "group", "?"), _transport_name(t), op,
+                    nbytes, _covered_ops(t),
+                    f" Reason: {reason}." if reason else "",
                     _transport_name(t),
                 )
         if chosen is None and graph_capture_running():
@@ -655,20 +658,20 @@ class BarlinkCommunicator:
             # and this is exactly the one case that would otherwise fall
             # through ungated into the gloo layer during capture.
             if t is None:
-                grund = "no transport is built at all"
+                reason = "no transport is built at all"
             elif t.handles(op, nbytes):
-                grund = (
+                reason = (
                     f"{_transport_name(t)} can do it, but the path dispatcher "
                     f"decided on the gloo layer"
                 )
             else:
-                grund = (
+                reason = (
                     f"{_transport_name(t)} reports handles({op!r}, {nbytes}) "
-                    f"-> False; covered there: {_gedeckte_ops(t)}"
+                    f"-> False; covered there: {_covered_ops(t)}"
                 )
             raise RuntimeError(
                 f"barlink: {op!r} with {nbytes} bytes during a CUDA graph "
-                f"capture, but {grund}. The fallback path is the "
+                f"capture, but {reason}. The fallback path is the "
                 f"host-staged gloo layer (pinned allocation, dist.* on the "
                 f"CPU, Event.synchronize()) -- which runs ONCE at capture "
                 f"time and not at all on replay. That would produce wrong "
@@ -929,7 +932,7 @@ class BarlinkCommunicator:
     # special case (both lists None) and takes the same path.
     # ------------------------------------------------------------------
 
-    def all_to_all_zaehlwerte(self, input_split_sizes) -> list[list[int]]:
+    def all_to_all_counts(self, input_split_sizes) -> list[list[int]]:
         """The full R x R count matrix, from each rank's own send counts.
 
         ``matrix[i][j]`` = what rank i sends to rank j. An
@@ -973,7 +976,7 @@ class BarlinkCommunicator:
         ``*_split_sizes`` are **row counts**, not bytes -- same as in
         torch. ``None`` means evenly split. If only ``input_split_sizes``
         is given, the receive counts are obtained via
-        :meth:`all_to_all_zaehlwerte`; ``output`` must already be large
+        :meth:`all_to_all_counts`; ``output`` must already be large
         enough in that case.
         """
         if self.disabled:
@@ -983,14 +986,14 @@ class BarlinkCommunicator:
         if inp.dim() == 0 or output.dim() == 0:
             raise ValueError("all_to_all_single requires at least one axis")
 
-        zeile_elems = 1
+        row_elems = 1
         for d in inp.shape[1:]:
-            zeile_elems *= int(d)
-        zeile_bytes = zeile_elems * inp.element_size()
-        if zeile_bytes != _row_bytes(output):
+            row_elems *= int(d)
+        row_bytes = row_elems * inp.element_size()
+        if row_bytes != _row_bytes(output):
             raise ValueError(
                 f"all_to_all_single: row width mismatch -- input "
-                f"{zeile_bytes} bytes, output {_row_bytes(output)} bytes. "
+                f"{row_bytes} bytes, output {_row_bytes(output)} bytes. "
                 f"Only axis 0 is split."
             )
 
@@ -1006,12 +1009,12 @@ class BarlinkCommunicator:
                     f"all_to_all_single without input_split_sizes requires "
                     f"an axis 0 divisible by {w}, but got {inp.shape[0]}."
                 )
-            ein = [inp.shape[0] // w] * w
+            in_rows = [inp.shape[0] // w] * w
         else:
-            ein = [int(x) for x in input_split_sizes]
-            if len(ein) != w or sum(ein) != inp.shape[0]:
+            in_rows = [int(x) for x in input_split_sizes]
+            if len(in_rows) != w or sum(in_rows) != inp.shape[0]:
                 raise ValueError(
-                    f"input_split_sizes {ein} does not match axis 0 = "
+                    f"input_split_sizes {in_rows} does not match axis 0 = "
                     f"{inp.shape[0]} for {w} ranks."
                 )
         if output_split_sizes is None:
@@ -1022,23 +1025,25 @@ class BarlinkCommunicator:
                         f"requires an axis 0 of the output divisible by "
                         f"{w}, but got {output.shape[0]}."
                     )
-                aus = [output.shape[0] // w] * w
+                out_rows = [output.shape[0] // w] * w
             else:
-                matrix = self.all_to_all_zaehlwerte(ein)
-                aus = [matrix[i][self.rank] for i in range(w)]
+                matrix = self.all_to_all_counts(in_rows)
+                out_rows = [matrix[i][self.rank] for i in range(w)]
         else:
-            aus = [int(x) for x in output_split_sizes]
-            if len(aus) != w:
-                raise ValueError(f"output_split_sizes has length {len(aus)}")
-        if sum(aus) > output.shape[0]:
+            out_rows = [int(x) for x in output_split_sizes]
+            if len(out_rows) != w:
+                raise ValueError(
+                    f"output_split_sizes has length {len(out_rows)}"
+                )
+        if sum(out_rows) > output.shape[0]:
             raise ValueError(
-                f"output holds {output.shape[0]} rows, but {sum(aus)} "
+                f"output holds {output.shape[0]} rows, but {sum(out_rows)} "
                 f"are being received."
             )
 
-        sende = [n * zeile_bytes for n in ein]
-        empf = [n * zeile_bytes for n in aus]
-        nbytes = sum(sende)
+        send_bytes = [n * row_bytes for n in in_rows]
+        recv_bytes = [n * row_bytes for n in out_rows]
+        nbytes = sum(send_bytes)
 
         t = self._select("all_to_all", nbytes)
         if t is not None and not (
@@ -1064,22 +1069,25 @@ class BarlinkCommunicator:
             # otherwise it comes from the count matrix, or, if the caller
             # brought both lists itself, from a maximum across the group.
             if input_split_sizes is None and output_split_sizes is None:
-                groesster = max(sende + empf)
+                largest_block = max(send_bytes + recv_bytes)
             elif matrix is not None:
-                groesster = max(max(z) for z in matrix) * zeile_bytes
+                largest_block = max(max(row) for row in matrix) * row_bytes
             else:
-                groesster = _group_max(
-                    max(sende + empf), self.cpu_group, table=self._peer_table
+                largest_block = _group_max(
+                    max(send_bytes + recv_bytes), self.cpu_group,
+                    table=self._peer_table,
                 )
-            if t.supports_a2a(groesster):
+            if t.supports_a2a(largest_block):
                 # The round count follows from the GROUP-WIDE largest
                 # block we just computed -- not from this rank's own row,
                 # which differs per rank. A transport without this
                 # information runs a single round, as before.
-                holen = getattr(t, "a2a_rounds_for", None)
-                runden = holen(groesster) if callable(holen) else None
+                rounds_for = getattr(t, "a2a_rounds_for", None)
+                rounds = (
+                    rounds_for(largest_block) if callable(rounds_for) else None
+                )
                 return t.barlink_all_to_all_single(
-                    self, output, inp, sende, empf, runden=runden
+                    self, output, inp, send_bytes, recv_bytes, rounds=rounds
                 )
 
         # Fallback: the same decomposition over the CPU group. Pinned, so
@@ -1087,14 +1095,14 @@ class BarlinkCommunicator:
         host_in = torch.empty(inp.shape, dtype=inp.dtype, pin_memory=True)
         host_in.copy_(inp, non_blocking=False)
         host_out = torch.empty(
-            (sum(aus),) + tuple(output.shape[1:]),
+            (sum(out_rows),) + tuple(output.shape[1:]),
             dtype=output.dtype, pin_memory=True,
         )
         try:
             barlink_liveness.bounded_collective(
                 lambda: dist.all_to_all_single(
                     host_out, host_in,
-                    output_split_sizes=aus, input_split_sizes=ein,
+                    output_split_sizes=out_rows, input_split_sizes=in_rows,
                     group=self.cpu_group, async_op=True,
                 ),
                 "barlink gloo all_to_all_single",
@@ -1112,7 +1120,7 @@ class BarlinkCommunicator:
                 f"fallback to NCCL: on a group spanning two vendors, that "
                 f"is not a slower path, it is a hang."
             ) from e
-        output[: sum(aus)].copy_(host_out, non_blocking=False)
+        output[: sum(out_rows)].copy_(host_out, non_blocking=False)
         return output
 
     # ------------------------------------------------------------------

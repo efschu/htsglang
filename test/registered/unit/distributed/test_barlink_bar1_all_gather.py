@@ -36,7 +36,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 #: The size from the handover -- the exact payload that stopped the run.
-ABNAHME_BYTES = 10600448
+HANDOVER_BYTES = 10600448
 
 
 def _stub(**kw):
@@ -47,32 +47,32 @@ def _stub(**kw):
     then fails loudly here instead of being silently skipped.
     """
     t = BarlinkBar1Transport.__new__(BarlinkBar1Transport)
-    t.ag_an = True
-    t.a2a_an = True
-    t._a2a_beleg = True
+    t.ag_on = True
+    t.a2a_on = True
+    t._a2a_proof = True
     # The shipped default. This used to be 16, and the stub agreed with a
     # value its broadcast twin exposed as a bug: the standard run sends
     # collectives UNDER one 16-byte packet, and under capture a refusal is
     # an abort.
     t.ag_min_bytes = 1
-    t.ag_max_runden = 16
+    t.ag_max_rounds = 16
     # broadcast rides the same kernel but has its own switch and its own
     # byte proof. This is the all_gather stub: it says no to broadcast, so
     # that "the other ops are unaffected" really tests the other branch.
-    t.bc_an = False
-    t._fenster_minimum = 96 << 20
+    t.bc_on = False
+    t._window_minimum = 96 << 20
     t._geo = {
         "off_a2a": 4096,
-        "a2a_schlitz": 8 << 20,
+        "a2a_slot": 8 << 20,
         "region_bytes": 90 << 20,
     }
-    t._auf = True
+    t._up = True
     t._ext = object()
-    t._belege_stehen = True
-    t.welt = 3
+    t._proofs_hold = True
+    t.world = 3
     t.rank = 0
     for k, v in kw.items():
-        if k in ("off_a2a", "a2a_schlitz", "region_bytes"):
+        if k in ("off_a2a", "a2a_slot", "region_bytes"):
             t._geo[k] = v
         else:
             setattr(t, k, v)
@@ -187,15 +187,15 @@ class TestAgPlanArithmetic(CustomTestCase):
         yields for a 96 MiB window at R=3 with the a2a area on.
         """
         slot = 8384512
-        plan = self._check_coverage([ABNAHME_BYTES] * 3, slot)
+        plan = self._check_coverage([HANDOVER_BYTES] * 3, slot)
         self.assertEqual(len(plan), 2)
         self.assertEqual(plan[0][0][1], slot)
-        self.assertEqual(plan[1][0][1], ABNAHME_BYTES - slot)
+        self.assertEqual(plan[1][0][1], HANDOVER_BYTES - slot)
 
     def test_send_offsets_are_always_aligned(self):
         """``k*slot`` is 16-aligned whenever the slot is, and it always is.
 
-        The kernel's fast path (VEK=1) wants every offset 16-aligned. The
+        The kernel's fast path (VEC=1) wants every offset 16-aligned. The
         send side is free: the slot size comes from the window-geometry
         helper and is page-aligned, so ``k*slot`` is too.
         """
@@ -311,13 +311,13 @@ class TestHandlesGate(CustomTestCase):
     """When the transport says yes -- and when it says no, and why."""
 
     def test_yes_for_the_handover_payload(self):
-        t = _stub(a2a_schlitz=8384512)
-        self.assertTrue(t._handles_all_gather(ABNAHME_BYTES))
-        self.assertTrue(t.handles("all_gather", ABNAHME_BYTES))
+        t = _stub(a2a_slot=8384512)
+        self.assertTrue(t._handles_all_gather(HANDOVER_BYTES))
+        self.assertTrue(t.handles("all_gather", HANDOVER_BYTES))
 
     def test_a_shard_over_the_slot_is_not_rejected_but_split(self):
         """The whole point. Rejecting would abort a capture, not slow it."""
-        t = _stub(a2a_schlitz=4096)
+        t = _stub(a2a_slot=4096)
         self.assertTrue(t._handles_all_gather(4096 * 4))
         self.assertEqual(t.ag_rounds(4096 * 4), 4)
 
@@ -327,17 +327,17 @@ class TestHandlesGate(CustomTestCase):
         self.assertTrue(t._handles_all_gather(1023))
 
     def test_off_switch(self):
-        self.assertFalse(_stub(ag_an=False)._handles_all_gather(65536))
+        self.assertFalse(_stub(ag_on=False)._handles_all_gather(65536))
 
     def test_needs_the_a2a_area(self):
-        self.assertFalse(_stub(a2a_an=False)._handles_all_gather(65536))
-        self.assertFalse(_stub(_a2a_beleg=False)._handles_all_gather(65536))
+        self.assertFalse(_stub(a2a_on=False)._handles_all_gather(65536))
+        self.assertFalse(_stub(_a2a_proof=False)._handles_all_gather(65536))
         self.assertFalse(_stub(off_a2a=-1)._handles_all_gather(65536))
-        self.assertFalse(_stub(a2a_schlitz=0)._handles_all_gather(65536))
+        self.assertFalse(_stub(a2a_slot=0)._handles_all_gather(65536))
 
     def test_needs_the_window(self):
         """Against the smallest length actually mapped group-wide."""
-        self.assertFalse(_stub(_fenster_minimum=1 << 20)._handles_all_gather(65536))
+        self.assertFalse(_stub(_window_minimum=1 << 20)._handles_all_gather(65536))
 
     def test_only_the_empty_shard_is_below_the_floor(self):
         """No floor beyond "non-empty" -- the twin of the broadcast fix.
@@ -354,14 +354,14 @@ class TestHandlesGate(CustomTestCase):
 
     def test_round_cap(self):
         """Not a window limit -- a limit on kernel launches per collective."""
-        t = _stub(a2a_schlitz=1024, ag_max_runden=4)
+        t = _stub(a2a_slot=1024, ag_max_rounds=4)
         self.assertTrue(t._handles_all_gather(1024 * 4))
         self.assertFalse(t._handles_all_gather(1024 * 4 + 1))
 
     def test_the_other_ops_are_unaffected(self):
         """The new branch must not change what handles() said before.
 
-        broadcast is covered by now, but on its own gate (``_bc_beleg``),
+        broadcast is covered by now, but on its own gate (``_bc_proof``),
         which this stub deliberately does not set -- the all_gather branch
         must not answer for it.
         """
@@ -403,11 +403,11 @@ class TestLoudBarStillGuardsTheRest(CustomTestCase):
     def test_covered_op_under_capture_passes(self):
         from sglang.srt.distributed.device_communicators import barlink as mod
 
-        t = _stub(a2a_schlitz=8384512)
+        t = _stub(a2a_slot=8384512)
         c = self._comm(t)
         with mock.patch.object(mod, "graph_capture_running", lambda: True):
             self.assertIs(
-                mod.BarlinkCommunicator._select(c, "all_gather", ABNAHME_BYTES),
+                mod.BarlinkCommunicator._select(c, "all_gather", HANDOVER_BYTES),
                 t,
             )
 

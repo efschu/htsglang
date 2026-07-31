@@ -8,7 +8,7 @@
 # echte Karte anfassen.
 #
 # Gefragt ist STACK: ein Local-Memory-Spill im Kern ist ein echter
-# Perf-Bug (Praezedenz: bar1_netz_kernel STACK 64 -> 0). REG und SHARED
+# Perf-Bug (Praezedenz: bar1_mesh_kernel STACK 64 -> 0). REG und SHARED
 # stehen daneben, weil sie die Belegung mitbestimmen.
 #
 #   scripts/probe/bar1_pipe_spill.sh [arch ...]      # Vorgabe: 86 120

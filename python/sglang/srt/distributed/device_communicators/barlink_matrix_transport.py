@@ -7,7 +7,7 @@ The seam this module closes
 the piece that was missing until now is the one that
 
 1. builds the direct path (``build_bar1``),
-2. feeds its **actual** capacity into the planner as ``fenster_bytes`` --
+2. feeds its **actual** capacity into the planner as ``window_bytes`` --
    the minimum across all destinations and all ranks, not the raw size
    from sysfs and not the requested size,
 3. calls ``plan()`` and logs ``plan.explanation()`` on rank 0,
@@ -16,7 +16,7 @@ the piece that was missing until now is the one that
 
 The order here is not arbitrary. The planner excludes algorithms whose
 window requirement would overrun the mapping (``plan_collective(...,
-fenster_bytes=)``); that number is only known once the transport has been
+window_bytes=)``); that number is only known once the transport has been
 built. Conversely, the transport needs the plan to choose mesh or ring per
 size. Hence: build first, then plan, then feed the plan back in.
 
@@ -72,7 +72,7 @@ WINDOW_MIB_DEFAULT = 96
 #: real free size is already known.
 RESERVE_MIB_DEFAULT = 32
 
-#: Window ledger: per device ordinal, the list of ``(gruppe, bytes)``
+#: Window ledger: per device ordinal, the list of ``(group, bytes)``
 #: entries this PROCESS has already pinned in BAR1.
 #:
 #: It exists because the first group used to simply take whatever it
@@ -80,7 +80,7 @@ RESERVE_MIB_DEFAULT = 32
 #: ``tp`` grabbed 96 MiB, and ``dcp`` got a bare ``[Errno 12]`` from the
 #: holder. An ENOMEM from an ioctl doesn't say WHO holds the space. This
 #: table does.
-_KASSE: dict[int, list[tuple[str, int]]] = {}
+_LEDGER: dict[int, list[tuple[str, int]]] = {}
 
 
 def _ordinal(device) -> int:
@@ -92,12 +92,12 @@ def _ordinal(device) -> int:
     return int(torch.cuda.current_device())
 
 
-def _group_key(gruppe: str) -> str:
+def _group_key(group: str) -> str:
     """``dcp`` -> ``DCP``, ``tp:0`` -> ``TP_0``. For the variable name."""
-    return "".join(c if c.isalnum() else "_" for c in gruppe).upper()
+    return "".join(c if c.isalnum() else "_" for c in group).upper()
 
 
-def _requested(gruppe: str) -> tuple[int, str]:
+def _requested(group: str) -> tuple[int, str]:
     """The requested region size for this group, and where it came from.
 
     **Independently configurable per group, and that's the whole point.**
@@ -110,9 +110,9 @@ def _requested(gruppe: str) -> tuple[int, str]:
     ``SGLANG_BARLINK_BAR1_WINDOW_MIB_DCP=16`` turns the dcp group's window
     down without touching the tp group's.
     """
-    eigen = f"SGLANG_BARLINK_BAR1_WINDOW_MIB_{_group_key(gruppe)}"
-    if gruppe and eigen in os.environ:
-        return int(os.environ[eigen]) * 1024 * 1024, eigen
+    own = f"SGLANG_BARLINK_BAR1_WINDOW_MIB_{_group_key(group)}"
+    if group and own in os.environ:
+        return int(os.environ[own]) * 1024 * 1024, own
     return (
         int(os.environ.get("SGLANG_BARLINK_BAR1_WINDOW_MIB",
                            str(WINDOW_MIB_DEFAULT))) * 1024 * 1024,
@@ -121,10 +121,10 @@ def _requested(gruppe: str) -> tuple[int, str]:
 
 
 def bar1_free(device) -> tuple[Optional[int], int, str]:
-    """``(frei, brutto, source)`` for this card's BAR1 aperture.
+    """``(free, gross, source)`` for this card's BAR1 aperture.
 
-    ``frei`` is ``None`` when it could not be determined -- in that case
-    the caller must compute from ``brutto`` minus reserve, and say so.
+    ``free`` is ``None`` when it could not be determined -- in that case
+    the caller must compute from ``gross`` minus reserve, and say so.
     Nothing is guessed here.
 
     NVML (``nvmlDeviceGetBAR1MemoryInfo``) is the only source that truly
@@ -132,7 +132,7 @@ def bar1_free(device) -> tuple[Optional[int], int, str]:
     and how much of that RM itself occupies is recorded nowhere. That is
     exactly the gap the holder's ENOMEM falls into.
     """
-    brutto = 0
+    gross = 0
     try:
         from sglang.srt.distributed.device_communicators.barlink_bar1 import (
             bar1_window,
@@ -141,7 +141,7 @@ def bar1_free(device) -> tuple[Optional[int], int, str]:
             bdf_of_card,
         )
 
-        brutto = bar1_window(bdf_of_card(device)).groesse
+        gross = bar1_window(bdf_of_card(device)).size
     except Exception as e:
         logger.debug("barlink-BAR1: could not get BAR1 gross size from sysfs (%r)", e)
     try:
@@ -151,33 +151,33 @@ def bar1_free(device) -> tuple[Optional[int], int, str]:
         try:
             h = pynvml.nvmlDeviceGetHandleByIndex(_ordinal(device))
             info = pynvml.nvmlDeviceGetBAR1MemoryInfo(h)
-            return int(info.bar1Free), (brutto or int(info.bar1Total)), "nvml"
+            return int(info.bar1Free), (gross or int(info.bar1Total)), "nvml"
         finally:
             pynvml.nvmlShutdown()
     except Exception as e:
         logger.debug("barlink-BAR1: NVML did not provide BAR1 usage (%r)", e)
-    return None, brutto, "sysfs-gross"
+    return None, gross, "sysfs-gross"
 
 
-def ledger_credit(device, gruppe: str, bytes_: int) -> None:
-    _KASSE.setdefault(_ordinal(device), []).append((gruppe, int(bytes_)))
+def ledger_credit(device, group: str, bytes_: int) -> None:
+    _LEDGER.setdefault(_ordinal(device), []).append((group, int(bytes_)))
 
 
-def ledger_debit(device, gruppe: str) -> None:
-    posten = _KASSE.get(_ordinal(device))
-    if not posten:
+def ledger_debit(device, group: str) -> None:
+    items = _LEDGER.get(_ordinal(device))
+    if not items:
         return
-    for i, (g, _) in enumerate(posten):
-        if g == gruppe:
-            posten.pop(i)
+    for i, (g, _) in enumerate(items):
+        if g == group:
+            items.pop(i)
             return
 
 
 def ledger_balance(device) -> list[tuple[str, int]]:
-    return list(_KASSE.get(_ordinal(device), []))
+    return list(_LEDGER.get(_ordinal(device), []))
 
 
-def window_for(gruppe: str, device) -> int:
+def window_for(group: str, device) -> int:
     """The region size this group is allowed to request on THIS rank.
 
     A local PROPOSAL, not the final decision: the group's cards have
@@ -193,14 +193,14 @@ def window_for(gruppe: str, device) -> int:
     and messages about it fall back to the gloo layer without a single
     hint.
     """
-    requested, source = _requested(gruppe)
-    frei, brutto, woher = bar1_free(device)
+    requested, source = _requested(group)
+    free, gross, origin = bar1_free(device)
     reserve = int(os.environ.get("SGLANG_BARLINK_BAR1_RESERVE_MIB",
                                  str(RESERVE_MIB_DEFAULT))) * 1024 * 1024
-    schon = sum(b for _, b in ledger_balance(device))
+    already = sum(b for _, b in ledger_balance(device))
 
-    if frei is None:
-        if brutto <= 0:
+    if free is None:
+        if gross <= 0:
             logger.info(
                 "barlink-BAR1: BAR1 size of this card is unknown (neither "
                 "NVML nor sysfs). Requesting what %s says (%d MiB); if the "
@@ -212,22 +212,22 @@ def window_for(gruppe: str, device) -> int:
         # recorded there -- which is why our own ledger has to be
         # subtracted here, and why this estimate is optimistic. This is
         # exactly what tripped up the second group with ENOMEM.
-        cap = brutto - reserve - schon
-        rechnung = (
-            f"BAR1 gross per sysfs {brutto // 2**20} MiB - reserve "
+        cap = gross - reserve - already
+        arithmetic = (
+            f"BAR1 gross per sysfs {gross // 2**20} MiB - reserve "
             f"{reserve // 2**20} MiB - already pinned by this process "
-            f"{schon // 2**20} MiB = {max(cap, 0) // 2**20} "
+            f"{already // 2**20} MiB = {max(cap, 0) // 2**20} "
             f"MiB. NOTE: sysfs only knows the gross aperture size; what RM "
             f"itself occupies is NOT subtracted from it. Without NVML this "
             f"number is an upper bound, not a guarantee."
         )
     else:
         # NVML knows `used` -- that already includes what this process has
-        # pinned in other groups. So `schon` must NOT be subtracted again
+        # pinned in other groups. So `already` must NOT be subtracted again
         # here; it only appears below for attribution.
-        cap = frei - reserve
-        rechnung = (
-            f"free per NVML {frei // 2**20} MiB - reserve "
+        cap = free - reserve
+        arithmetic = (
+            f"free per NVML {free // 2**20} MiB - reserve "
             f"{reserve // 2**20} MiB = {max(cap, 0) // 2**20} MiB "
             f"(already includes what this process holds: "
             f"{', '.join(f'{g}: {b // 2**20} MiB' for g, b in ledger_balance(device)) or 'nothing'})"
@@ -244,9 +244,9 @@ def window_for(gruppe: str, device) -> int:
         "doesn't want that should set SGLANG_BARLINK_BAR1_WINDOW_MIB_%s "
         "explicitly, give the other group less, or deliberately let this "
         "group run over NCCL.",
-        gruppe or "<ohne Namen>", requested // 2**20, source,
-        max(cap, 0) // 2**20, rechnung, max(cap, 0) // 2**20,
-        _group_key(gruppe),
+        group or "<unnamed>", requested // 2**20, source,
+        max(cap, 0) // 2**20, arithmetic, max(cap, 0) // 2**20,
+        _group_key(group),
     )
     return max(cap, 0)
 
@@ -278,7 +278,7 @@ class BarlinkMatrixTransport:
         {"all_reduce", "all_to_all", "all_to_all_single"}
     )
 
-    def __init__(self, cpu_group, device, gruppe: str = ""):
+    def __init__(self, cpu_group, device, group: str = ""):
         import torch.distributed as dist
 
         from sglang.srt.distributed.device_communicators.barlink_bar1 import (
@@ -291,9 +291,9 @@ class BarlinkMatrixTransport:
 
         self.cpu_group = cpu_group
         self.device = device
-        self.gruppe = gruppe
+        self.group = group
         self.rank = dist.get_rank(cpu_group)
-        self.welt = dist.get_world_size(cpu_group)
+        self.world = dist.get_world_size(cpu_group)
 
         # 1. Direct path. `None` means: this machine can't have it, with a
         #    logged reason. No raising -- the planner is useful even
@@ -302,19 +302,22 @@ class BarlinkMatrixTransport:
         #    then every collective runs over the gloo layer while the log
         #    reports "transport=matrix". Exactly this mix-up once
         #    invalidated a measurement.
-        bericht: dict = {}
+        report: dict = {}
         self.bar1 = build_bar1(
-            cpu_group, device, window_for(gruppe, device), bericht,
-            gruppe=gruppe,
+            cpu_group, device, window_for(group, device), report,
+            group=group,
         )
-        if bericht.get("haelt_belegt") and self.bar1 is not None:
+        # ``holds_space`` is a key ``barlink_bar1.build_bar1`` writes; the
+        # spelling is a cross-module contract, renamed on all three sides
+        # together in #358.
+        if report.get("holds_space") and self.bar1 is not None:
             # It's up, but not carrying anything (byte proof failed). Tear
             # it down instead of leaving it lying around: otherwise it
             # keeps holding the BAR1 pages the next group needs.
             self.bar1.close()
             self.bar1 = None
-        self.bar1_reason = bericht.get("reason", "")
-        self.bar1_stage = bericht.get("stage", "")
+        self.bar1_reason = report.get("reason", "")
+        self.bar1_stage = report.get("stage", "")
 
         # 2. Capability, fed to the planner. Minimum over ALL destinations
         #    and all ranks; `None` means "unknown" and rules nothing out --
@@ -323,11 +326,11 @@ class BarlinkMatrixTransport:
 
         # 3. Plan. The direct path doubles as the pair sensor when it's
         #    up: then the planner measures real directed edges.
-        planer = BarlinkMatrixPlanner(
+        planner = BarlinkMatrixPlanner(
             cpu_group, device, config=load_config(),
-            fuehler=self.bar1, fenster_bytes=window,
+            sensor=self.bar1, window_bytes=window,
         )
-        self.plan = planer.plan()
+        self.plan = planner.plan()
 
         # 4. Explanation. Mandatory output, not gated behind a debug flag
         #    -- without it, nobody can debug this on unfamiliar hardware.
@@ -348,8 +351,8 @@ class BarlinkMatrixTransport:
                 (window or 0) // 1024, self.bar1.max_bytes // 1024,
                 ", ".join(
                     (f"up to {s.max_bytes // 1024} KiB" if s.max_bytes > 0
-                     else "above that") + f": {s.algorithmus}"
-                    for s in self.plan.leiter
+                     else "above that") + f": {s.algorithm}"
+                    for s in self.plan.ladder
                 ),
             )
         else:
@@ -386,31 +389,31 @@ class BarlinkMatrixTransport:
     # straight through here, without consulting the plan. A plan line for
     # a choice that doesn't exist would be a mock-up.
 
-    def supports_a2a(self, groesster_block: int) -> bool:
+    def supports_a2a(self, largest_block: int) -> bool:
         if self.bar1 is None:
             return False
-        return self.bar1.supports_a2a(groesster_block)
+        return self.bar1.supports_a2a(largest_block)
 
     def a2a_slot_bytes(self) -> int:
         return 0 if self.bar1 is None else self.bar1.a2a_slot_bytes()
 
-    def barlink_all_to_all_single(self, comm, output, inp, sende_bytes,
-                                empfangs_bytes, sende_versatz=None,
-                                empfangs_versatz=None, kern_last=None,
-                                runden=None):
+    def barlink_all_to_all_single(self, comm, output, inp, send_bytes,
+                                recv_bytes, send_offsets=None,
+                                recv_offsets=None, kernel_bytes=None,
+                                rounds=None):
         self._must_hold()
         return self.bar1.barlink_all_to_all_single(
-            comm, output, inp, sende_bytes, empfangs_bytes,
-            sende_versatz, empfangs_versatz, kern_last=kern_last,
-            runden=runden,
+            comm, output, inp, send_bytes, recv_bytes,
+            send_offsets, recv_offsets, kernel_bytes=kernel_bytes,
+            rounds=rounds,
         )
 
-    def a2a_rounds_for(self, groesster_block: int) -> int:
+    def a2a_rounds_for(self, largest_block: int) -> int:
         """Passed through the same way as supports_a2a -- a second copy
         would be exactly where the two could drift apart."""
         if self.bar1 is None:
             return 0
-        return self.bar1.a2a_rounds_for(groesster_block)
+        return self.bar1.a2a_rounds_for(largest_block)
 
     def _must_hold(self) -> None:
         if self.bar1 is None:

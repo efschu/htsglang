@@ -54,14 +54,18 @@ from s12_log_analyse import (  # noqa: E402  one parser, one place
 )
 
 KIND = "bar1_prefill_kurve"
-#: 2: the per-point transport evidence under `gruppen` renamed its keys from
+#: 2: the per-point transport evidence under `groups` renamed its keys from
 #: German to English (`gruppe`/`angefordert`/`erreicht` ->
 #: `group`/`requested`/`achieved`), in step with s11_bar1_e2e.RE_GROUP and
 #: barlink.py's report_state(). A schema-1 artifact spells them in German, so
 #: every point would read back as having no barlink group at all -- which the
 #: arm check would misread as "baseline". Rejecting it by version is the
 #: point: re-run the step rather than read a stale artifact.
-SCHEMA_VERSION = 2
+#: 3: task #358 put the remaining German keys of the per-point transport
+#: evidence into English -- `beleg_vorhanden` -> `evidence_present`,
+#: `gruppen` -> `groups`. A schema-2 artifact reads back as no evidence
+#: at all through the new names, so it is rejected by version instead.
+SCHEMA_VERSION = 3
 
 # The baseline over the host path, from MESSUNG_PREFILL_ANTEIL.md and
 # 02_WAS_ERREICHT_IST.md: "1190/1097/1144/1105/1122 tok/s" over 1, 2, 4, 8 and
@@ -564,14 +568,14 @@ def load_evidence(step_dir: str, folge, arm, sessions) -> dict:
     baseline point.
     """
     path = os.path.join(step_dir, "belege", f"{folge}_{arm}_{sessions}.txt")
-    out: dict = {"beleg_vorhanden": os.path.exists(path), "gruppen": []}
-    if not out["beleg_vorhanden"]:
+    out: dict = {"evidence_present": os.path.exists(path), "groups": []}
+    if not out["evidence_present"]:
         return out
     with open(path, errors="replace") as f:
         for line in f:
             m = RE_GROUP.search(line)
             if m:
-                out["gruppen"].append(
+                out["groups"].append(
                     {
                         "group": m.group("group"),
                         "requested": m.group("requested"),
@@ -680,7 +684,7 @@ def zusammenfassen(step_dir: str, tol_pct: float, plan: list) -> dict:
                 "folge": e.get("folge"),
                 "arm": e.get("arm"),
                 "sessions": e.get("sessions"),
-                "zeile": e["fatal"],
+                "line": e["fatal"],
             }
             for e in order
             if e.get("fatal")

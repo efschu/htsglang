@@ -80,7 +80,7 @@ def _check_fatal(payload: dict) -> None:
         first = fatal[0]
         raise CheckFail(
             f"{len(fatal)} boot(s) with a fatal, first {first.get('arm')}/"
-            f"{first.get('sessions')} sessions -- {first.get('zeile')}"
+            f"{first.get('sessions')} sessions -- {first.get('line')}"
         )
 
 
@@ -89,7 +89,7 @@ def check(step_dir: str) -> None:
     if not os.path.exists(path):
         raise CheckStop(f"prefill_kurve.json missing ({path}) -- the step never ran")
     payload = load_json(path, "prefill_kurve.json")
-    require_envelope(payload, KIND, "prefill_kurve.json", 2)
+    require_envelope(payload, KIND, "prefill_kurve.json", 3)
 
     if not payload.get("host_erreichbar"):
         raise CheckStop("host unreachable -- nothing was measured")
@@ -137,12 +137,12 @@ def check(step_dir: str) -> None:
     # --- did each boot run the arm it claims? -------------------------------
     for entry in order:
         arm = entry.get("arm")
-        if not entry.get("beleg_vorhanden"):
+        if not entry.get("evidence_present"):
             raise CheckFail(
                 f"no transport Beleg for {arm}/{entry.get('sessions')} -- without "
                 "it the measured value's arm is unsupported"
             )
-        groups = entry.get("gruppen") or []
+        groups = entry.get("groups") or []
         if arm == "grundlinie":
             if groups:
                 raise CheckFail(

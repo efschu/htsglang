@@ -1606,7 +1606,7 @@ nothing changes.**
 | `SGLANG_BARLINK_GRAPH_ENABLE=1` | allows `bar1`/`matrix` under CUDA graphs. **Only after `bar1_graph_check.py` has passed** (section 6.3) |
 | `SGLANG_BARLINK_BAR1_NV_SOURCE=<tree>` | driver headers for the JIT build |
 | `SGLANG_BARLINK_BAR1_WINDOW_MIB[_<GROUP>]` | BAR1 window, settable per communicator group. 96 MiB maps contiguously out of 256 gross |
-| `SGLANG_BARLINK_BAR1_RING_THRESHOLD` / `_GITTER_AB` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
+| `SGLANG_BARLINK_BAR1_RING_THRESHOLD` / `_GRID_THRESHOLD` | net→ring and 1blk→cooperative thresholds (1 / 4 MiB, measured on this rig) |
 | `SGLANG_BARLINK_BAR1_GRAPH_GRID=0\|1` | cooperative launch **under capture**. Unset it and the default follows `SGLANG_BARLINK_GRAPH_ENABLE` — same gate, same question (`bar1_graph_check.py`, case `gitter`). Forcing it to `0` restores the old reservation and costs 16.1 % prefill throughput once anything captures the prefill (#293 lever run) |
 | `SGLANG_BARLINK_BAR1_PIPE=1` | pipelined kernel |
 | `SGLANG_BARLINK_BAR1_PIPE_DIRECT=0\|1` | direct mode. Off under capture regardless, loudly — its host-side ring index would be baked per graph |
@@ -1642,7 +1642,8 @@ in the standard run, and the reserve values in 4.1 are written for that order
 #### Check programs
 
 ```bash
-# The gate for GRAPH_FREIGABE. Five cases, five replays each, byte proof
+# The gate for SGLANG_BARLINK_GRAPH_ENABLE. Five cases, five replays
+# each, byte proof
 # after every one. If one fails, do not set the release switch.
 "$VENV/bin/python" benchmark/bar1_graph_check.py 0,1,2
 
@@ -1662,13 +1663,13 @@ failed on the holder with ENOMEM and fell back to gloo — and both lines said
 `transport=bar1`. Half of the resulting number was not a bar1 number.
 
 ```bash
-grep "barlink-BAR1: Aufbau in" "$LOG"   # one line per communicator group
+grep "barlink-BAR1: setup in" "$LOG"    # one line per communicator group
 grep "ACHIEVED=" "$LOG"               # requested= vs ACHIEVED=
 ```
 
 With `SGLANG_UNEVEN_DCP=1` there are **two** groups (`tp:0`, `dcp:0`) and
 **both** must report `ACHIEVED=bar1`. Queryable at runtime as
-`barlink.gruppen_stand()` / `barlink.stand_zusammenfassung()`. A mixed run is not
+`barlink.group_states()` / `barlink.state_summary()`. A mixed run is not
 a bar1 measurement and must not be reported as one.
 
 Also: a blown deadline invalidates every number from the run. Check

@@ -379,13 +379,14 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
         # strength of an argument would be the assumption this project keeps
         # getting punished for.
         #
-        # Was sich seither geaendert hat: die drei Stellen, an denen der
-        # Transport eine Aufzeichnung wirklich nicht ueberlebt haette, sind
-        # behoben (barlink._select laesst nicht mehr still in die gloo-Ebene
-        # ausweichen; BarlinkBar1Transport._kern nimmt aufgezeichnet die
-        # 1blk-Variante; _erg_platz schaltet den Direkt-Modus ab, dessen
-        # Ringplatz sonst eingebrannt wuerde). Offen bleibt genau eine
-        # Messfrage, und dafuer gibt es jetzt ein eigenes Pruefprogramm.
+        # What has changed since: the three places where the transport
+        # genuinely would not have survived a capture are fixed
+        # (barlink._select no longer falls back to the gloo plane silently;
+        # BarlinkBar1Transport picks the 1blk kernel variant under capture;
+        # the result-slot path turns off direct mode, whose ring slot would
+        # otherwise be baked into the graph). Exactly one measurement
+        # question is left open, and there is a dedicated check program for
+        # it now.
         raise ValueError(
             f"SGLANG_BARLINK_TRANSPORT={transport!r} is a GPU-driven transport "
             "whose CUDA-graph capture is UNMEASURED, not one that is known to "
@@ -693,15 +694,15 @@ class GroupCoordinator:
             # the exact shape of the arm-E crash. Fail at startup, naming the
             # cause, instead.
             _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
-            # Ueber eine LOKALE Variable, und die Zustandsabfrage weiter
-            # unten auch: `self.barlink_comm` darf nur hinter einem
-            # `is not None` beruehrt werden (test_dispatch_seams_are_all_
-            # none_guarded pinnt das, und zu Recht -- daran haengt, dass
-            # Flag-aus byteidentisch bleibt).
+            # Through a LOCAL variable, and so is the state query further
+            # down: `self.barlink_comm` may only be touched behind an
+            # `is not None` (test_dispatch_seams_are_all_none_guarded pins
+            # that, and rightly so -- it is what keeps the flag-off path
+            # byte-identical).
             _comm = BarlinkCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
-                gruppe=self.unique_name,
+                group=self.unique_name,
             )
             self.barlink_comm = _comm
             # What was REQUESTED and what was ACHIEVED -- kept apart.
@@ -715,9 +716,9 @@ class GroupCoordinator:
             # WARNING carrying the group name and the reason, and the success
             # says explicitly what is really running.
             requested = envs.SGLANG_BARLINK_TRANSPORT.get()
-            stand = getattr(_comm, "stand", {}) or {}
-            achieved = stand.get("achieved", requested)
-            if stand.get("direct", True):
+            state = getattr(_comm, "state", {}) or {}
+            achieved = state.get("achieved", requested)
+            if state.get("direct", True):
                 logger.info(
                     "barlink enabled for group '%s': requested=%s, "
                     "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
@@ -732,7 +733,7 @@ class GroupCoordinator:
                     "this run is mixed and must not be reported as a "
                     "%s value.",
                     self.unique_name, requested, achieved,
-                    stand.get("stage", "?"), stand.get("reason", "?"),
+                    state.get("stage", "?"), state.get("reason", "?"),
                     requested, requested,
                 )
 
@@ -1422,12 +1423,13 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        # barlink zuerst. Ohne diesen Zweig ging all_to_all_single bei aktivem
-        # SGLANG_BARLINK ungebremst auf self.device_group -- also auf genau das
-        # NCCL, das _barlink_unsupported oben als Deadlock-Ursache auf einer
-        # Gruppe ueber zwei Hersteller benennt. Es war bisher folgenlos, weil
-        # die Methode keinen Aufrufer hat; folgenlos ist nicht dasselbe wie
-        # richtig, und ein Haenger meldet sich nicht mit einer Fehlermeldung.
+        # barlink first. Without this branch, all_to_all_single went
+        # straight to self.device_group while SGLANG_BARLINK was on -- that
+        # is, to exactly the NCCL that _barlink_unsupported above names as
+        # the deadlock cause on a group spanning two vendors. It had no
+        # consequence so far because the method has no caller; no
+        # consequence is not the same as correct, and a hang does not
+        # announce itself with an error message.
         if self.barlink_comm is not None:
             self.barlink_comm.all_to_all_single(output, input)
             return
@@ -1437,9 +1439,9 @@ class GroupCoordinator:
         if self.world_size == 1:
             output.copy_(input)
             return
-        # Wie bei all_reduce: barlink kehrt VOR der Dynamo-Custom-Op-Maschinerie
-        # zurueck. Der Zweig in _all_to_all_single bleibt trotzdem stehen --
-        # er faengt den Weg ueber die registrierte Op ab.
+        # As with all_reduce: barlink returns BEFORE the Dynamo custom-op
+        # machinery. The branch in _all_to_all_single stays anyway -- it
+        # catches the route through the registered op.
         if self.barlink_comm is not None:
             self.barlink_comm.all_to_all_single(output, input)
             return
@@ -1452,19 +1454,20 @@ class GroupCoordinator:
         output_split_sizes: Optional[List[int]] = None,
         input_split_sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """all_to_all_single mit ungleichen Teilgroessen (Zeilen, nicht Bytes).
+        """all_to_all_single with uneven split sizes (rows, not bytes).
 
-        Die Form, die MoE braucht: die Zahl der Token je Experte schwankt,
-        also schwankt die Blockgroesse je Zielrang. ``output_split_sizes=None``
-        laesst die Empfangszahlen aus den Sendezahlen ermitteln -- ein
-        all_gather der Zaehlwerte, wie DeepEP es vor dem Dispatch macht
+        The shape MoE needs: the token count per expert varies, so the block
+        size per destination rank varies with it. ``output_split_sizes=None``
+        derives the receive counts from the send counts -- an all_gather of
+        the counts, the way DeepEP does it before the dispatch
         (``get_dispatch_layout`` -> ``num_tokens_per_rank``).
 
-        BEWUSST NICHT ueber ``reg_all_to_all_single``: die registrierte
-        Custom-Op hat eine feste Signatur ohne Teilgroessen, und sie um
-        ``Optional[List[int]]`` zu erweitern haette den Schema-Vertrag der
-        bestehenden Op geaendert. Diese Form ist damit nicht opak fuer
-        Dynamo; wer sie unter torch.compile braucht, muss sie ausklammern.
+        DELIBERATELY NOT routed through ``reg_all_to_all_single``: the
+        registered custom op has a fixed signature without split sizes, and
+        extending it by ``Optional[List[int]]`` would have changed the
+        existing op's schema contract. This form is therefore not opaque to
+        Dynamo; whoever needs it under torch.compile has to graph-break
+        around it.
         """
         if self.world_size == 1:
             output.copy_(input)

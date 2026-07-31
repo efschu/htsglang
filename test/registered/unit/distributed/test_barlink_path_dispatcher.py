@@ -541,7 +541,7 @@ class TestGdrMatrixParser(CustomTestCase):
     """Source 2: the #278 crossrig-ladder TSV wire rows."""
 
     ROWS = [
-        "# pair\tdirection\tmodus\tro\tdepth\tsize_bytes\titers\tp10_us\tmedian_us\tp90_us\tMB_per_s",
+        "# pair\tdirection\tmode\tro\tdepth\tsize_bytes\titers\tp10_us\tmedian_us\tp90_us\tMB_per_s",
         "i_05:00.0_to_0a:00.0\tintra\tgdr\toff\t1\t20480\t234705\t9.428\t9.528\t9.688\t1074.7",
         "i_05:00.0_to_0a:00.0\tintra\tgdr\toff\t4\t20480\t100000\t9.428\t38.0\t40.0\t1074.7",
         "i_05:00.0_to_0a:00.0\tintra\tstage\toff\t1\t20480\t159185\t14.036\t14.272\t15.019\t717.5",

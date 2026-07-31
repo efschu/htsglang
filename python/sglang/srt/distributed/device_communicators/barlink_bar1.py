@@ -122,7 +122,7 @@ Three properties that set it apart from ``all_reduce``:
   int32, uint8 -- one path. That sm_86 cards lack fp8 conversion
   instructions (those start at sm_89) is irrelevant here.
 * **Unequal block sizes are the normal case.** The number of tokens per
-  expert varies; ``sende_bytes``/``empfangs_bytes`` arrive per rank. If a
+  expert varies; ``send_bytes``/``recv_bytes`` arrive per rank. If a
   block does not fit in a slot, the transport withdraws via
   ``supports_a2a`` instead of failing.
 * **Double slots instead of a second barrier.** ``2(R-1)`` slots, with the
@@ -202,12 +202,12 @@ class Bar1KernelAborted(PeerLivenessError):
 _OFF = ("0", "no", "off", "false", "")
 
 
-def _an(wert: Optional[str]) -> bool:
+def _is_on(value: Optional[str]) -> bool:
     """Whether an environment variable counts as set."""
-    return wert is not None and wert not in _OFF
+    return value is not None and value not in _OFF
 
 
-def graph_grid_default(umgebung=None) -> bool:
+def graph_grid_default(env=None) -> bool:
     """May the cooperative launch fire WHILE a graph is being captured?
 
     **Derived, not independent.** Whether ``cudaLaunchCooperativeKernel`` can
@@ -223,12 +223,12 @@ def graph_grid_default(umgebung=None) -> bool:
     ``SGLANG_BARLINK_BAR1_GRAPH_GRID`` remains an override in BOTH directions:
     set, it allows the cooperative launch even without the release (this is
     how the gate case ``grid`` itself runs); set to ``0``, it restores the
-    old restriction (this is how the gate case ``vorbehalt`` runs). Only
+    old restriction (this is how the gate case ``reservation`` runs). Only
     when it is NOT SET AT ALL does the release decide.
     """
     import os as _os
 
-    if umgebung is None:
+    if env is None:
         # Live os.environ, not a caller-supplied dict: re-run the retired-name
         # check on every call (not just once at import time), since a caller
         # may export a retired name at runtime, after this module was already
@@ -238,11 +238,11 @@ def graph_grid_default(umgebung=None) -> bool:
         )
 
         _barlink_env_guard.check_retired_env_vars()
-        umgebung = _os.environ
-    eigen = umgebung.get("SGLANG_BARLINK_BAR1_GRAPH_GRID")
-    if eigen is not None:
-        return eigen not in _OFF
-    return _an(umgebung.get("SGLANG_BARLINK_GRAPH_ENABLE"))
+        env = _os.environ
+    explicit = env.get("SGLANG_BARLINK_BAR1_GRAPH_GRID")
+    if explicit is not None:
+        return explicit not in _OFF
+    return _is_on(env.get("SGLANG_BARLINK_GRAPH_ENABLE"))
 
 
 # ===========================================================================
@@ -349,35 +349,35 @@ class _Cuda:
                 ctypes.byref(p), ctypes.c_int(CU_MEM_ALLOC_GRANULARITY_RECOMMENDED))
         return int(gran.value) or (2 << 20)
 
-    def vmm_alloc(self, ordinal: int, groesse: int) -> tuple[int, int, int]:
-        """``(dptr, handle, groesse)`` -- exportfaehige Geraeteallokation."""
+    def vmm_alloc(self, ordinal: int, size: int) -> tuple[int, int, int]:
+        """``(dptr, handle, size)`` -- exportfaehige Geraeteallokation."""
         gran = self.granularitaet(ordinal)
-        groesse = ((groesse + gran - 1) // gran) * gran
+        size = ((size + gran - 1) // gran) * gran
         handle = ctypes.c_ulonglong(0)
         p = self._prop(ordinal)
-        self._d("cuMemCreate", ctypes.byref(handle), ctypes.c_size_t(groesse),
+        self._d("cuMemCreate", ctypes.byref(handle), ctypes.c_size_t(size),
                 ctypes.byref(p), ctypes.c_ulonglong(0))
         dptr = ctypes.c_ulonglong(0)
         self._d("cuMemAddressReserve", ctypes.byref(dptr),
-                ctypes.c_size_t(groesse), ctypes.c_size_t(gran),
+                ctypes.c_size_t(size), ctypes.c_size_t(gran),
                 ctypes.c_ulonglong(0), ctypes.c_ulonglong(0))
         self._d("cuMemMap", ctypes.c_ulonglong(dptr.value),
-                ctypes.c_size_t(groesse), ctypes.c_size_t(0), handle,
+                ctypes.c_size_t(size), ctypes.c_size_t(0), handle,
                 ctypes.c_ulonglong(0))
         desc = _CUmemAccessDesc()
         desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
         desc.location.id = ordinal
         desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
         self._d("cuMemSetAccess", ctypes.c_ulonglong(dptr.value),
-                ctypes.c_size_t(groesse), ctypes.byref(desc), ctypes.c_size_t(1))
-        return int(dptr.value), int(handle.value), groesse
+                ctypes.c_size_t(size), ctypes.byref(desc), ctypes.c_size_t(1))
+        return int(dptr.value), int(handle.value), size
 
-    def vmm_free(self, dptr: int, handle: int, groesse: int) -> None:
+    def vmm_free(self, dptr: int, handle: int, size: int) -> None:
         for name, args in (
-            ("cuMemUnmap", (ctypes.c_ulonglong(dptr), ctypes.c_size_t(groesse))),
+            ("cuMemUnmap", (ctypes.c_ulonglong(dptr), ctypes.c_size_t(size))),
             ("cuMemRelease", (ctypes.c_ulonglong(handle),)),
             ("cuMemAddressFree", (ctypes.c_ulonglong(dptr),
-                                  ctypes.c_size_t(groesse))),
+                                  ctypes.c_size_t(size))),
         ):
             try:
                 getattr(self.drv, name)(*args)
@@ -389,10 +389,10 @@ class _Cuda:
         card by bus number, not by ordinal."""
         dev = ctypes.c_int(0)
         self._d("cuDeviceGet", ctypes.byref(dev), ctypes.c_int(ordinal))
-        wert = ctypes.c_int(0)
-        self._d("cuDeviceGetAttribute", ctypes.byref(wert),
+        value = ctypes.c_int(0)
+        self._d("cuDeviceGetAttribute", ctypes.byref(value),
                 ctypes.c_int(CU_DEVICE_ATTRIBUTE_PCI_BUS_ID), dev)
-        return int(wert.value)
+        return int(value.value)
 
     def export_shareable(self, handle: int) -> int:
         """``cuMemExportToShareableHandle`` -- the object fd for the ioctl path."""
@@ -403,7 +403,7 @@ class _Cuda:
                 ctypes.c_ulonglong(0))
         return int(fd.value)
 
-    def memset_d8(self, dptr: int, wert: int, n: int) -> None:
+    def memset_d8(self, dptr: int, value: int, n: int) -> None:
         # ``cuMemsetD8_v2``, NOT ``cuMemsetD8``. In cuda.h, the short name is
         # a macro for the _v2 form; going through dlsym/ctypes instead gets
         # you the old ABI entry point with a 32-bit CUdeviceptr, and that one
@@ -411,10 +411,10 @@ class _Cuda:
         # when a context is current (measured directly: cuCtxGetCurrent
         # returns a valid context, cuMemsetD8 -> 201, cuMemsetD8_v2 -> 0).
         # This applies to every _v2 function of the driver API.
-        self._d("cuMemsetD8_v2", ctypes.c_ulonglong(dptr), ctypes.c_ubyte(wert),
+        self._d("cuMemsetD8_v2", ctypes.c_ulonglong(dptr), ctypes.c_ubyte(value),
                 ctypes.c_size_t(n))
 
-    def dmabuf_fd(self, dptr: int, handle: int, groesse: int,
+    def dmabuf_fd(self, dptr: int, handle: int, size: int,
                   ordinal: int) -> tuple[int, list[int], str]:
         """``(dmabuf_fd, fds_to_hold, path)``.
 
@@ -438,7 +438,7 @@ class _Cuda:
         rc = -1
         if fn is not None:
             rc = fn(ctypes.byref(fd), ctypes.c_ulonglong(dptr),
-                    ctypes.c_size_t(groesse),
+                    ctypes.c_size_t(size),
                     ctypes.c_int(CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD),
                     ctypes.c_ulonglong(
                         CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE))
@@ -457,8 +457,8 @@ class _Cuda:
             )
         objfd = self.export_shareable(handle)
         try:
-            aus = ext.bar1_export_dmabuf(int(objfd), int(self.pci_bus(ordinal)),
-                                         int(groesse))
+            handed = ext.bar1_export_dmabuf(int(objfd), int(self.pci_bus(ordinal)),
+                                         int(size))
         except Exception as e:
             raise Bar1Unavailable(
                 f"NV_ESC_EXPORT_TO_DMABUF_FD failed: {e}"
@@ -470,34 +470,34 @@ class _Cuda:
                 os.close(objfd)
             except OSError:
                 pass
-        return int(aus[0]), [int(aus[1]), int(aus[2])], "NV_ESC_EXPORT_TO_DMABUF_FD"
+        return int(handed[0]), [int(handed[1]), int(handed[2])], "NV_ESC_EXPORT_TO_DMABUF_FD"
 
     # -- Runtime -----------------------------------------------------------
 
-    def register_io(self, adresse: int, length: int) -> None:
-        self._r("cudaHostRegister", ctypes.c_void_p(adresse),
+    def register_io(self, address: int, length: int) -> None:
+        self._r("cudaHostRegister", ctypes.c_void_p(address),
                 ctypes.c_size_t(length),
                 ctypes.c_uint(CUDA_HOST_REGISTER_IO_MEMORY))
 
-    def unregister(self, adresse: int) -> None:
+    def unregister(self, address: int) -> None:
         try:
-            self.rt.cudaHostUnregister(ctypes.c_void_p(adresse))
+            self.rt.cudaHostUnregister(ctypes.c_void_p(address))
         except Exception:
             pass
 
-    def dev_ptr(self, host_adresse: int) -> int:
+    def dev_ptr(self, host_address: int) -> int:
         p = ctypes.c_void_p(0)
         self._r("cudaHostGetDevicePointer", ctypes.byref(p),
-                ctypes.c_void_p(host_adresse), ctypes.c_uint(0))
+                ctypes.c_void_p(host_address), ctypes.c_uint(0))
         return int(p.value or 0)
 
-    def memcpy_async(self, ziel: int, source: int, n: int, stream: int) -> None:
-        self._r("cudaMemcpyAsync", ctypes.c_void_p(ziel), ctypes.c_void_p(source),
+    def memcpy_async(self, dst: int, source: int, n: int, stream: int) -> None:
+        self._r("cudaMemcpyAsync", ctypes.c_void_p(dst), ctypes.c_void_p(source),
                 ctypes.c_size_t(n), ctypes.c_int(CUDA_MEMCPY_DEFAULT),
                 ctypes.c_void_p(stream))
 
-    def memcpy(self, ziel: int, source: int, n: int) -> None:
-        self._r("cudaMemcpy", ctypes.c_void_p(ziel), ctypes.c_void_p(source),
+    def memcpy(self, dst: int, source: int, n: int) -> None:
+        self._r("cudaMemcpy", ctypes.c_void_p(dst), ctypes.c_void_p(source),
                 ctypes.c_size_t(n), ctypes.c_int(CUDA_MEMCPY_DEFAULT))
 
 
@@ -505,7 +505,15 @@ class _Cuda:
 # /dev/dmabuf_holder
 # ===========================================================================
 
-HALTER_PFAD = os.environ.get("SGLANG_BARLINK_BAR1_HOLDER", "/dev/dmabuf_holder")
+HOLDER_PATH = os.environ.get("SGLANG_BARLINK_BAR1_HOLDER", "/dev/dmabuf_holder")
+
+#: Driver registry keys that switch on the widened peer-BAR1 guard, in
+#: preference order. The second is the name the key carried before the
+#: transport was renamed from HTCCL to barlink (#358); the driver patch still
+#: reads it as a fallback, so a module loaded before the rename stays usable
+#: and this probe has to accept either spelling. Index 0 is the one to name
+#: in diagnostics.
+PEER_BAR1_REGKEYS = ("BarlinkPeerBar1", "RMSmallBarP2PPeerBar1")
 
 _HOLD_FMT = "=iIIBBBBIIQIIQQ"      # struct dmabuf_holder_hold
 _HOLD_SIZE = struct.calcsize(_HOLD_FMT)
@@ -515,8 +523,8 @@ _MAGIC = 0xDB
 _F_BDF_VALID = 1 << 0
 
 
-def _ioc(richtung: int, typ: int, nr: int, groesse: int) -> int:
-    return (richtung << 30) | (groesse << 16) | (typ << 8) | nr
+def _ioc(direction: int, magic: int, nr: int, size: int) -> int:
+    return (direction << 30) | (size << 16) | (magic << 8) | nr
 
 
 _IOC_WRITE, _IOC_READ = 1, 2
@@ -536,7 +544,7 @@ def _ioc_arg(op: int) -> int:
 
 @dataclass
 class SgEntry:
-    dma_adresse: int
+    dma_address: int
     length: int
 
 
@@ -550,10 +558,10 @@ class Holder:
     returns the sg-table, which makes the pattern scan unnecessary.
     """
 
-    def __init__(self, pfad: str = HALTER_PFAD):
-        if not os.path.exists(pfad):
+    def __init__(self, path: str = HOLDER_PATH):
+        if not os.path.exists(path):
             raise Bar1Unavailable(
-                f"{pfad} is missing. Without an importer, the driver does "
+                f"{path} is missing. Without an importer, the driver does "
                 f"not map the BAR1 pages of the exported buffer (proven: "
                 f"the pattern scan found nothing across 65,536 probes, but "
                 f"the hit appeared immediately once the attach happened). "
@@ -562,13 +570,13 @@ class Holder:
                 f"different mode of operation, not the same one."
             )
         try:
-            self.fd = os.open(pfad, os.O_RDWR)
+            self.fd = os.open(path, os.O_RDWR)
         except OSError as e:
-            raise Bar1Unavailable(f"{pfad} could not be opened: {e}") from e
+            raise Bar1Unavailable(f"{path} could not be opened: {e}") from e
         self._handles: list[int] = []
 
     def hold(self, dmabuf_fd: int, bdf: str,
-              max_eintraege: int = 1024) -> tuple[int, list[SgEntry], int]:
+              max_entries: int = 1024) -> tuple[int, list[SgEntry], int]:
         """``dma_buf_attach`` + ``dma_buf_map_attachment`` as ``bdf``.
 
         ``bdf`` is the **source card** -- the device that will later write.
@@ -587,17 +595,17 @@ class Holder:
         first is kept alive in the meantime so the BAR1 mapping never drops
         in between.
         """
-        handle_, eintraege, total_len, nents = self._hold_once(
-            dmabuf_fd, bdf, max_eintraege
+        handle_, entries, total_len, nents = self._hold_once(
+            dmabuf_fd, bdf, max_entries
         )
-        if nents > max_eintraege:
-            alt = handle_
+        if nents > max_entries:
+            old = handle_
             try:
-                handle_, eintraege, total_len, nents2 = self._hold_once(
+                handle_, entries, total_len, nents2 = self._hold_once(
                     dmabuf_fd, bdf, nents
                 )
             finally:
-                self.release(alt)
+                self.release(old)
             if nents2 > nents:
                 self.release(handle_)
                 raise Bar1Unavailable(
@@ -606,23 +614,23 @@ class Holder:
                     f"Without a complete table, the contiguous length "
                     f"cannot be determined."
                 )
-        if not eintraege:
+        if not entries:
             raise Bar1Unavailable(
                 "The holder reports 0 sg-entries -- the mapping is empty. "
                 "Without an sg-address, the BAR1 offset cannot be "
                 "determined; the pattern scan would be the fallback, but it "
                 "does not belong in a transport."
             )
-        return handle_, eintraege, total_len
+        return handle_, entries, total_len
 
     def _hold_once(self, dmabuf_fd: int, bdf: str,
-                      max_eintraege: int) -> tuple[int, list[SgEntry], int, int]:
+                      max_entries: int) -> tuple[int, list[SgEntry], int, int]:
         dom, bus, slot, func = _split_bdf(bdf)
-        puffer = ctypes.create_string_buffer(16 * max_eintraege)
+        buffer = ctypes.create_string_buffer(16 * max_entries)
         arg = bytearray(struct.pack(
             _HOLD_FMT,
             dmabuf_fd, _F_BDF_VALID, dom, bus, slot, func, 0,
-            max_eintraege, 0, ctypes.addressof(puffer),
+            max_entries, 0, ctypes.addressof(buffer),
             0, 0, 0, 0,
         ))
         try:
@@ -633,16 +641,16 @@ class Holder:
                 f"attachment there is no BAR1 mapping and thus no direct "
                 f"path."
             ) from e
-        werte = struct.unpack(_HOLD_FMT, bytes(arg))
-        handle_, nents, _dmabuf_size, total_len = werte[10], werte[11], werte[12], werte[13]
+        values = struct.unpack(_HOLD_FMT, bytes(arg))
+        handle_, nents, _dmabuf_size, total_len = values[10], values[11], values[12], values[13]
         self._handles.append(handle_)
-        eintraege = []
-        gueltig = min(nents, max_eintraege)
-        roh = bytes(puffer.raw[: 16 * gueltig])
-        for i in range(gueltig):
-            a, l = struct.unpack_from("=QQ", roh, 16 * i)
-            eintraege.append(SgEntry(a, l))
-        return handle_, eintraege, int(total_len), int(nents)
+        entries = []
+        valid = min(nents, max_entries)
+        raw = bytes(buffer.raw[: 16 * valid])
+        for i in range(valid):
+            a, l = struct.unpack_from("=QQ", raw, 16 * i)
+            entries.append(SgEntry(a, l))
+        return handle_, entries, int(total_len), int(nents)
 
     def release(self, handle_: int) -> None:
         # Remove from the list BEFORE running the ioctl: otherwise `close()`
@@ -684,12 +692,12 @@ def _split_bdf(bdf: str) -> tuple[int, int, int, int]:
 @dataclass(frozen=True)
 class Bar1Window:
     bdf: str
-    basis: int
-    groesse: int          # gross, per sysfs
+    base: int
+    size: int          # gross, per sysfs
 
     @property
     def end(self) -> int:
-        return self.basis + self.groesse
+        return self.base + self.size
 
 
 def bar1_window(bdf: str) -> Bar1Window:
@@ -700,28 +708,28 @@ def bar1_window(bdf: str) -> Bar1Window:
     of it for itself. ``check_window_requirement`` therefore checks against
     what could actually be exported, not against this number.
     """
-    pfad = f"/sys/bus/pci/devices/{bdf}/resource"
+    path = f"/sys/bus/pci/devices/{bdf}/resource"
     try:
-        with open(pfad) as f:
-            zeilen = f.read().strip().split("\n")
+        with open(path) as f:
+            lines = f.read().strip().split("\n")
     except OSError as e:
-        raise Bar1Unavailable(f"{pfad} could not be read: {e}") from e
-    if len(zeilen) < 2:
-        raise Bar1Unavailable(f"{pfad}: no BAR1 line")
-    start_s, ende_s, _flags = zeilen[1].split()
-    start, end = int(start_s, 16), int(ende_s, 16)
+        raise Bar1Unavailable(f"{path} could not be read: {e}") from e
+    if len(lines) < 2:
+        raise Bar1Unavailable(f"{path}: no BAR1 line")
+    start_s, end_s, _flags = lines[1].split()
+    start, end = int(start_s, 16), int(end_s, 16)
     if end <= start:
-        raise Bar1Unavailable(f"{bdf}: BAR1 is empty ({start_s}..{ende_s})")
-    return Bar1Window(bdf=bdf, basis=start, groesse=end - start + 1)
+        raise Bar1Unavailable(f"{bdf}: BAR1 is empty ({start_s}..{end_s})")
+    return Bar1Window(bdf=bdf, base=start, size=end - start + 1)
 
 
-SEITE = 4096
+PAGE_SIZE = 4096
 
 #: Largest group for which the kernel arguments have room.
 MAX_RANGE = 8
 
 
-def window_requirement(algorithmus: str, nbytes: int, welt: int) -> int:
+def window_requirement(algorithm: str, nbytes: int, world: int) -> int:
     """How much BAR1 the decomposition needs mapped at the same time.
 
     **Counted against the ported kernels, not estimated.** Both need
@@ -748,26 +756,26 @@ def window_requirement(algorithmus: str, nbytes: int, welt: int) -> int:
       docstring; the branch stays here so the planner computes the same
       value.
     """
-    if welt < 2:
+    if world < 2:
         return 0
-    anteil = -(-nbytes // welt)          # round up
-    # ``netz_pipe`` is grouped with mesh and ring here because this function
+    share = -(-nbytes // world)          # round up
+    # ``mesh_pipe`` is grouped with mesh and ring here because this function
     # asks about the requirement of ONE payload, and the pipe moves the same
     # 2(R-1)*ceil(N/R) bytes for that. What it actually OCCUPIES in the
     # window is something different: ``2 T (R-1)`` slots of one chunk-piece
     # size each, computed in ``barlink_bar1_pipe_ext.pipe_window_requirement``
     # and additionally checked in ``handles``. That number depends on
     # ``pipe_chunk_bytes``, not on the payload.
-    if algorithmus in ("mesh", "netz_pipe", "ring", "hierarchisch"):
-        return 2 * (welt - 1) * anteil
-    if algorithmus == "star":
-        return 2 * (welt - 1) * nbytes
-    raise ValueError(f"unknown algorithm {algorithmus!r}")
+    if algorithm in ("mesh", "mesh_pipe", "ring", "hierarchical"):
+        return 2 * (world - 1) * share
+    if algorithm == "star":
+        return 2 * (world - 1) * nbytes
+    raise ValueError(f"unknown algorithm {algorithm!r}")
 
 
-def geometry(welt: int, max_bytes: int, mit_a2a: bool = True,
-              mit_pipe: bool = False, erg_ring: int = 0,
-              pipe_bereich: int = 0) -> dict:
+def geometry(world: int, max_bytes: int, with_a2a: bool = True,
+              with_pipe: bool = False, result_ring: int = 0,
+              pipe_range: int = 0) -> dict:
     """The memory layout of ONE receive region, for arbitrary R.
 
     It carries all schemes **simultaneously**, so a plan can switch per size
@@ -780,7 +788,7 @@ def geometry(welt: int, max_bytes: int, mit_a2a: bool = True,
     ...          mesh AG slots      ``(R-1) * chunk_max``
     ``off_ring`` ring slots         ``2(R-1) * chunk_max``
     ``off_a2a``  a2a slots          ``2(R-1) * chunk_max``
-    ``off_pipe`` netz_pipe slots    ``pipe_bereich`` (absolute)
+    ``off_pipe`` mesh_pipe slots    ``pipe_range`` (absolute)
     ===========  =================  ========================================
 
     ``chunk_max`` is rounded up to a page -- a slot that begins on a page
@@ -798,20 +806,20 @@ def geometry(welt: int, max_bytes: int, mit_a2a: bool = True,
     ``4(R-1)`` to ``6(R-1)`` slots, so the largest all_reduce payload for a
     given window drops to two-thirds. No measured number changes because of
     this -- only the ceiling above which ``handles`` says False. Anyone who
-    wants it back sets ``SGLANG_BARLINK_BAR1_A2A=0``; then ``mit_a2a`` is
+    wants it back sets ``SGLANG_BARLINK_BAR1_A2A=0``; then ``with_a2a`` is
     False and the layout is byte-for-byte the old one.
 
-    **Why netz_pipe gets its OWN region and not mesh's.** The regions of
+    **Why mesh_pipe gets its OWN region and not mesh's.** The regions of
     the different schemes must be pairwise disjoint, and not only within a
     single call. When rank A finishes its round ``n``, rank B may still be
     reading that round's all-gather slot -- before A finishes, it only
     waits on B's flag, not on B's read. This does not show up with
     ``mesh``, because A's next write goes into the RS half while B reads
-    from the AG half. A ``netz_pipe`` that used the whole mesh region would
+    from the AG half. A ``mesh_pipe`` that used the whole mesh region would
     immediately hit the AG half. A dedicated region makes the question
     moot.
 
-    The region is only created when ``mit_pipe`` is set
+    The region is only created when ``with_pipe`` is set
     (``SGLANG_BARLINK_BAR1_PIPE=1``); without it, the layout is byte-for-byte
     the measured one.
 
@@ -824,64 +832,64 @@ def geometry(welt: int, max_bytes: int, mit_a2a: bool = True,
     it, the tipping point from 2456 to 1842 tokens -- below the working
     point of 2048; that is the 7.5% loss the lever measurement for #293
     attributed to the pipe arm (there still attributed to the result ring,
-    which was wrong: that arm ran ``PIPE_DIREKT=0`` and thus
-    ``erg_ring = 0``).
+    which was wrong: that arm ran ``PIPE_DIRECT=0`` and thus
+    ``result_ring = 0``).
 
     The region's requirement depends on ``pipe_chunk_bytes``, ``T``, and
     ``R`` -- on nothing that follows from ``max_bytes``. That makes it a
     constant in the fixed-point computation of :func:`max_payload` rather
-    than another denominator term. ``pipe_bereich = 0`` keeps the old
+    than another denominator term. ``pipe_range = 0`` keeps the old
     sizing, so a geometry without this argument stays byte-for-byte the
     old one.
     """
-    if welt < 2:
-        raise ValueError("welt < 2")
+    if world < 2:
+        raise ValueError("world < 2")
     n4_max = max_bytes // 16
-    chunk4 = -(-n4_max // welt)
-    chunk_max = ((chunk4 * 16 + SEITE - 1) // SEITE) * SEITE
-    schlitze = 2 * (welt - 1)
-    off_netz = 0
-    off_ring = schlitze * chunk_max
-    off_a2a = 2 * schlitze * chunk_max
+    chunk4 = -(-n4_max // world)
+    chunk_max = ((chunk4 * 16 + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    slots = 2 * (world - 1)
+    off_mesh = 0
+    off_ring = slots * chunk_max
+    off_a2a = 2 * slots * chunk_max
     from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
         result_stride_bytes,
     )
 
-    saetze = 2 + (1 if mit_a2a else 0)
-    off_pipe = saetze * schlitze * chunk_max
+    sets = 2 + (1 if with_a2a else 0)
+    off_pipe = sets * slots * chunk_max
     # The pipe region: the absolute number passed in, otherwise the old full
     # slot set. Rounded up to a page, so the result ring behind it again
     # begins on a page boundary.
-    pipe_bereich = int(pipe_bereich) if mit_pipe else 0
-    if mit_pipe and pipe_bereich <= 0:
-        pipe_bereich = schlitze * chunk_max
-    pipe_bereich = ((pipe_bereich + SEITE - 1) // SEITE) * SEITE if pipe_bereich else 0
-    off_erg = off_pipe + pipe_bereich
-    ring = int(erg_ring) if mit_pipe else 0
-    erg_stride = result_stride_bytes(max_bytes) if ring > 0 else 0
-    region = off_erg + ring * erg_stride + SEITE
+    pipe_range = int(pipe_range) if with_pipe else 0
+    if with_pipe and pipe_range <= 0:
+        pipe_range = slots * chunk_max
+    pipe_range = ((pipe_range + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE if pipe_range else 0
+    off_result = off_pipe + pipe_range
+    ring = int(result_ring) if with_pipe else 0
+    result_stride = result_stride_bytes(max_bytes) if ring > 0 else 0
+    region = off_result + ring * result_stride + PAGE_SIZE
     return {
         "chunk_max": chunk_max,
-        "off_netz": off_netz,
+        "off_mesh": off_mesh,
         "off_ring": off_ring,
         # -1 explicitly means "does not exist", not "is at 0" -- an offset
         # of 0 would be the mesh region.
-        "off_a2a": off_a2a if mit_a2a else -1,
-        "a2a_schlitz": chunk_max if mit_a2a else 0,
-        "off_pipe": off_pipe if mit_pipe else -1,
-        "pipe_bereich": pipe_bereich,
-        "off_erg": off_erg if ring > 0 else -1,
-        "erg_stride": erg_stride,
-        "erg_ring": ring,
+        "off_a2a": off_a2a if with_a2a else -1,
+        "a2a_slot": chunk_max if with_a2a else 0,
+        "off_pipe": off_pipe if with_pipe else -1,
+        "pipe_range": pipe_range,
+        "off_result": off_result if ring > 0 else -1,
+        "result_stride": result_stride,
+        "result_ring": ring,
         "region_bytes": region,
         "max_bytes": max_bytes,
-        "mit_a2a": bool(mit_a2a),
-        "mit_pipe": bool(mit_pipe),
+        "with_a2a": bool(with_a2a),
+        "with_pipe": bool(with_pipe),
     }
 
 
-def flags_requirement(welt: int, mit_a2a: bool = True,
-                   mit_pipe: bool = False) -> int:
+def flags_requirement(world: int, with_a2a: bool = True,
+                   with_pipe: bool = False) -> int:
     """``(2 + 2(R-1) [+ 1]) * R * 256`` bytes, plus ``5 R * 256`` for the pipe.
 
     One 256-byte line per (topology, step, sender): no false sharing between
@@ -889,8 +897,8 @@ def flags_requirement(welt: int, mit_a2a: bool = True,
     ring ``2(R-1)``, a2a exactly **one**. At R=8 that is 34 KiB, well below
     an allocation granularity.
 
-    ``netz_pipe`` appends five lines per rank at the end (``tailRS``,
-    ``tailAG``, ``headRS``, ``headAG``, ``ergBereit``) -- **independent of
+    ``mesh_pipe`` appends five lines per rank at the end (``tailRS``,
+    ``tailAG``, ``headRS``, ``headAG``, ``resultReady``) -- **independent of
     K and T**, because it is a sliding window with one counter per
     connection, not a flag per chunk. Appended at the end so every existing
     line offset stays byte-for-byte the same.
@@ -899,11 +907,11 @@ def flags_requirement(welt: int, mit_a2a: bool = True,
         pipe_flags_extra,
     )
 
-    grund = (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
-    return grund + (pipe_flags_extra(welt) if mit_pipe else 0)
+    base = (2 + 2 * (world - 1) + (1 if with_a2a else 0)) * world * 256
+    return base + (pipe_flags_extra(world) if with_pipe else 0)
 
 
-def fbasis_a2a(welt: int) -> int:
+def fbase_a2a(world: int) -> int:
     """Offset of the a2a flag lines within the flag region.
 
     Behind mesh and ring, so the two measured topologies stay byte-for-byte
@@ -912,15 +920,15 @@ def fbasis_a2a(welt: int) -> int:
     would be exactly the place where sender and receiver end up pointing at
     different lines.
     """
-    return (2 + 2 * (welt - 1)) * welt * 256
+    return (2 + 2 * (world - 1)) * world * 256
 
 
-def ag_plan(laengen, slot: int) -> list:
+def ag_plan(lengths, slot: int) -> list:
     """The round decomposition of an ``all_gather``. Pure arithmetic.
 
-    ``laengen[i]`` is rank ``i``'s shard in **bytes**; the result is their
-    concatenation, i.e. ``sum(laengen)`` bytes, with rank ``i`` at offset
-    ``sum(laengen[:i])``.
+    ``lengths[i]`` is rank ``i``'s shard in **bytes**; the result is their
+    concatenation, i.e. ``sum(lengths)`` bytes, with rank ``i`` at offset
+    ``sum(lengths[:i])``.
 
     Delivered is, per round, a list of ``(send_offset, length,
     receive_offset)`` per rank -- all in bytes, all absolute, nothing left
@@ -929,17 +937,17 @@ def ag_plan(laengen, slot: int) -> list:
     * ``send_offset`` points into the CALLER'S OWN shard (the same slice for
       every destination -- that is exactly what distinguishes all_gather
       from all_to_all),
-    * ``receive_offset`` points into the result, i.e. ``basis[i] + k*slot``.
+    * ``receive_offset`` points into the result, i.e. ``base[i] + k*slot``.
 
     **Why rounds at all.** A shard can be larger than a slot. The failure
     case from the handoff is exactly that: 10,600,448 bytes of all_gather
     against an a2a slot of just under 8 MiB with a 96-MiB window. Instead of
     withdrawing via ``handles`` -- which aborts the run during a CUDA graph
     capture, because there is no fallback path -- the shard runs in
-    ``ceil(max(laengen)/slot)`` rounds.
+    ``ceil(max(lengths)/slot)`` rounds.
 
     **Why this survives a capture.** The round count depends only on
-    ``laengen`` and ``slot``. Both are group-wide identical and constant
+    ``lengths`` and ``slot``. Both are group-wide identical and constant
     for a captured shape, so the number of kernel launches is baked in and
     the same on every replay -- the same argument that lets
     ``barlink_device.all_reduce`` capture its slot loop. No host code here
@@ -948,14 +956,14 @@ def ag_plan(laengen, slot: int) -> list:
     host-side ring index fails on exactly this point (see
     ``_result_slot``).
 
-    **Rank-uniform.** Every rank computes from the SAME ``laengen`` vector,
+    **Rank-uniform.** Every rank computes from the SAME ``lengths`` vector,
     so all of them end up with the same number of rounds. If a rank counted
     differently, that would not be an error but a hang: the others would
     wait in the barrier of a round it no longer runs.
 
     **Unequal shards** are arithmetic here, not a rewrite. Today's seam
     (``BarlinkCommunicator.all_gather``) is uniform -- its result is
-    ``(R,) + form``, which CANNOT be uneven, and the uneven form is called
+    ``(R,) + shape``, which CANNOT be uneven, and the uneven form is called
     ``all_gatherv`` in sglang and explicitly not covered under barlink. This
     function nonetheless takes a vector: under uneven TP, unequal shards are
     the normal case, and the place where a uniform distribution is ASSUMED
@@ -963,38 +971,38 @@ def ag_plan(laengen, slot: int) -> list:
     A rank whose shard ends earlier gets length 0 in the remaining rounds --
     it rides along in the barrier without moving any bytes.
     """
-    laengen = [int(x) for x in laengen]
-    if not laengen:
+    lengths = [int(x) for x in lengths]
+    if not lengths:
         return []
     if slot <= 0:
         raise ValueError(f"slot size {slot} is not positive")
-    if any(n < 0 for n in laengen):
-        raise ValueError(f"negative shard length in {laengen}")
-    basis, acc = [], 0
-    for n in laengen:
-        basis.append(acc)
+    if any(n < 0 for n in lengths):
+        raise ValueError(f"negative shard length in {lengths}")
+    base, acc = [], 0
+    for n in lengths:
+        base.append(acc)
         acc += n
-    runden = max(1, -(-max(laengen) // slot))
+    rounds = max(1, -(-max(lengths) // slot))
     plan = []
-    for k in range(runden):
-        eine = []
-        for i, n in enumerate(laengen):
+    for k in range(rounds):
+        row = []
+        for i, n in enumerate(lengths):
             a = min(k * slot, n)
             b = min((k + 1) * slot, n)
-            eine.append((a, b - a, basis[i] + a))
-        plan.append(eine)
+            row.append((a, b - a, base[i] + a))
+        plan.append(row)
     return plan
 
 
-def ar_plan(nbytes: int, chunk_max: int, welt: int) -> list:
+def ar_plan(nbytes: int, chunk_max: int, world: int) -> list:
     """The round decomposition of an ``all_reduce``. Pure arithmetic.
 
     Delivered is, per round, an ``(offset, length)`` in **bytes**. Each
     round is a complete all_reduce over a slice of the buffer -- the same
-    kernel, the same decomposition into ``welt`` shards, just on fewer
+    kernel, the same decomposition into ``world`` shards, just on fewer
     bytes.
 
-    **Why this exists.** The kernel decomposes a payload into ``welt``
+    **Why this exists.** The kernel decomposes a payload into ``world``
     equally sized shards (reduce-scatter, then all-gather), and the shard
     has to fit into a slot. Up to now, "does not fit" simply meant
     ``handles() == False``, and the payload fell back to the base
@@ -1006,7 +1014,7 @@ def ar_plan(nbytes: int, chunk_max: int, welt: int) -> list:
     of declining.
 
     **Evenly distributed, not filled to the brim.** The obvious approach
-    would be to fill every round up to ``chunk_max*welt`` and put the
+    would be to fill every round up to ``chunk_max*world`` and put the
     remainder in the last one. That produces a tail that can become
     arbitrarily small -- and the extension insists on ``n4 >= R`` (one
     128-bit packet per rank, ``TORCH_CHECK`` in the host). A leftover round
@@ -1015,14 +1023,14 @@ def ar_plan(nbytes: int, chunk_max: int, welt: int) -> list:
     the largest.
 
     **Rank-uniform and capture-safe.** The round count depends solely on
-    ``nbytes``, ``chunk_max``, and ``welt``. All three are group-wide
+    ``nbytes``, ``chunk_max``, and ``world``. All three are group-wide
     identical and constant for a captured shape, so the number of kernel
     launches is baked in -- the same argument as for :func:`ag_plan` and
     :func:`bc_plan`.
     """
     nbytes = int(nbytes)
-    if welt < 2:
-        raise ValueError(f"welt {welt} is smaller than 2")
+    if world < 2:
+        raise ValueError(f"world {world} is smaller than 2")
     if chunk_max < 16:
         raise ValueError(f"chunk_max {chunk_max} cannot carry a packet")
     if nbytes < 0:
@@ -1031,26 +1039,26 @@ def ar_plan(nbytes: int, chunk_max: int, welt: int) -> list:
         raise ValueError(f"payload {nbytes} is not a multiple of 16")
     if nbytes == 0:
         return []
-    pakete = nbytes // 16
+    packets = nbytes // 16
     # Packets per rank and round -- the size the slot depends on.
-    je_rang_max = chunk_max // 16
-    max_pakete = je_rang_max * welt
-    runden = -(-pakete // max_pakete)
-    basis, rest = divmod(pakete, runden)
+    per_rank_max = chunk_max // 16
+    max_packets = per_rank_max * world
+    rounds = -(-packets // max_packets)
+    base, rest = divmod(packets, rounds)
     plan = []
-    versatz = 0
-    for k in range(runden):
-        p = basis + (1 if k < rest else 0)
+    offset = 0
+    for k in range(rounds):
+        p = base + (1 if k < rest else 0)
         length = p * 16
-        plan.append((versatz, length))
-        versatz += length
+        plan.append((offset, length))
+        offset += length
     return plan
 
 
-def a2a_rounds(groesster_block: int, slot: int) -> int:
+def a2a_rounds(largest_block: int, slot: int) -> int:
     """Round count for an ``all_to_all``, from the LARGEST block.
 
-    ``groesster_block`` is the maximum over all ``R*R`` blocks, not over the
+    ``largest_block`` is the maximum over all ``R*R`` blocks, not over the
     caller's own row -- the seam computes it group-wide before asking
     (``BarlinkCommunicator.all_to_all_single``). That is exactly why the round
     count can be derived from it and still be the same on every rank:
@@ -1064,9 +1072,9 @@ def a2a_rounds(groesster_block: int, slot: int) -> int:
     """
     if slot <= 0:
         raise ValueError(f"slot size {slot} is not positive")
-    if groesster_block < 0:
-        raise ValueError(f"negative block {groesster_block}")
-    return max(1, -(-int(groesster_block) // int(slot)))
+    if largest_block < 0:
+        raise ValueError(f"negative block {largest_block}")
+    return max(1, -(-int(largest_block) // int(slot)))
 
 
 def bc_plan(nbytes: int, slot: int) -> list:
@@ -1106,16 +1114,16 @@ def bc_plan(nbytes: int, slot: int) -> list:
         raise ValueError(f"negative payload {nbytes}")
     if nbytes == 0:
         return []
-    runden = -(-nbytes // slot)
+    rounds = -(-nbytes // slot)
     return [
         (k * slot, min((k + 1) * slot, nbytes) - k * slot)
-        for k in range(runden)
+        for k in range(rounds)
     ]
 
 
-def max_payload(welt: int, region_bytes: int, mit_a2a: bool = True,
-                 mit_pipe: bool = False, erg_ring: int = 0,
-                 pipe_bereich: int = 0) -> int:
+def max_payload(world: int, region_bytes: int, with_a2a: bool = True,
+                 with_pipe: bool = False, result_ring: int = 0,
+                 pipe_range: int = 0) -> int:
     """Largest payload whose slots fit into a region of this size.
 
     Inverse of :func:`geometry`. Deliberately rounded conservatively and
@@ -1124,39 +1132,39 @@ def max_payload(welt: int, region_bytes: int, mit_a2a: bool = True,
     is exactly why there does not need to be a second version of the
     factor computation here: ``geometry`` itself has the final say.
     """
-    if welt < 2 or region_bytes <= SEITE:
+    if world < 2 or region_bytes <= PAGE_SIZE:
         return 0
     # The pipe region is an ABSOLUTE number as soon as it is passed in -- it
     # depends on `pipe_chunk_bytes`, T, and R, not on `chunk_max`. It is
     # therefore subtracted and does not appear in the denominator. Without
     # it, the old sizing remains (a full slot set, i.e. 2(R-1) in the
     # denominator).
-    absolut = int(pipe_bereich) if (mit_pipe and pipe_bereich > 0) else 0
-    if absolut:
-        absolut = ((absolut + SEITE - 1) // SEITE) * SEITE
+    absolute = int(pipe_range) if (with_pipe and pipe_range > 0) else 0
+    if absolute:
+        absolute = ((absolute + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
     # 2 sets for mesh, 2 for ring, 2 each for a2a and the pipe -- so 4 as
     # the base, not 2. Spelled out instead of "(6 if a2a else 4)", so the
     # fourth term does not disappear back into a single number.
-    schlitze = (4 + (2 if mit_a2a else 0)
-                + (2 if (mit_pipe and not absolut) else 0)) * (welt - 1)
-    ring = int(erg_ring) if mit_pipe else 0
-    # The result ring costs ``L * roundup(N, SEITE)``, and ``N`` is
+    slots = (4 + (2 if with_a2a else 0)
+                + (2 if (with_pipe and not absolute) else 0)) * (world - 1)
+    ring = int(result_ring) if with_pipe else 0
+    # The result ring costs ``L * roundup(N, PAGE_SIZE)``, and ``N`` is
     # ``chunk_max * R``. In units of chunk_max that is ``L * R`` additional
-    # units on top of ``schlitze`` -- which is why the ring appears here IN
+    # units on top of ``slots`` -- which is why the ring appears here IN
     # THE DENOMINATOR and not as a subtraction. A subtraction would have
     # placed the initial value far enough off that the forward check below
     # would have had to search downward in 32-byte steps.
-    nenner = schlitze + ring * welt
-    rest = region_bytes - SEITE - absolut
+    denominator = slots + ring * world
+    rest = region_bytes - PAGE_SIZE - absolute
     if rest <= 0:
         return 0
-    chunk_max = (rest // nenner // SEITE) * SEITE
+    chunk_max = (rest // denominator // PAGE_SIZE) * PAGE_SIZE
     if chunk_max <= 0:
         return 0
-    n = (chunk_max // 16) * welt * 16
-    while n > 0 and geometry(welt, n, mit_a2a, mit_pipe, ring,
-                              absolut)["region_bytes"] > region_bytes:
-        n -= welt * 16
+    n = (chunk_max // 16) * world * 16
+    while n > 0 and geometry(world, n, with_a2a, with_pipe, ring,
+                              absolute)["region_bytes"] > region_bytes:
+        n -= world * 16
     return n
 
 
@@ -1165,8 +1173,8 @@ def max_payload(welt: int, region_bytes: int, mit_a2a: bool = True,
 # ===========================================================================
 
 
-def _exchange_fds(cpu_group, rank: int, welt: int,
-                 eigene_fds: list[int]) -> list[list[int]]:
+def _exchange_fds(cpu_group, rank: int, world: int,
+                 own_fds: list[int]) -> list[list[int]]:
     """Every rank hands its dma-buf fds to all the others.
 
     There are TWO per rank: the payload region and the flag region. They
@@ -1185,73 +1193,73 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
 
     import torch.distributed as dist
 
-    traeger = [None]
+    carrier = [None]
     if rank == 0:
-        traeger = [tempfile.mkdtemp(prefix="barlink-bar1-")]
+        carrier = [tempfile.mkdtemp(prefix="barlink-bar1-")]
     # torch runs the object collectives inline and ignores async_op, so there
     # is no Work to bound. A one-shot check before the call names a peer that
     # is already gone instead of entering the 7200 s gloo wait for it.
     check_peers("bar1 fd exchange: broadcast of the socket directory")
     dist.broadcast_object_list(
-        traeger, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
+        carrier, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
     )
-    verz = str(traeger[0])
-    pfad = os.path.join(verz, f"r{rank}.sock")
+    directory = str(carrier[0])
+    path = os.path.join(directory, f"r{rank}.sock")
 
-    anzahl = len(eigene_fds)
-    fds: list[list[int]] = [[] for _ in range(welt)]
-    fds[rank] = list(eigene_fds)
-    horcher = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    count = len(own_fds)
+    fds: list[list[int]] = [[] for _ in range(world)]
+    fds[rank] = list(own_fds)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        if os.path.exists(pfad):
-            os.unlink(pfad)
-        horcher.bind(pfad)
-        horcher.listen(welt)
+        if os.path.exists(path):
+            os.unlink(path)
+        listener.bind(path)
+        listener.listen(world)
         bounded_barrier(cpu_group, "bar1 fd exchange: sockets bound")
 
-        for besitzer in range(welt):
-            if besitzer == rank:
-                for _ in range(welt - 1):
-                    verb, _ = horcher.accept()
-                    with verb:
-                        socket.send_fds(verb, [b"x"], list(eigene_fds))
+        for owner in range(world):
+            if owner == rank:
+                for _ in range(world - 1):
+                    conn, _ = listener.accept()
+                    with conn:
+                        socket.send_fds(conn, [b"x"], list(own_fds))
             else:
-                ziel = os.path.join(verz, f"r{besitzer}.sock")
-                verb = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                letzter: Optional[Exception] = None
+                dst = os.path.join(directory, f"r{owner}.sock")
+                conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                last_error: Optional[Exception] = None
                 for _ in range(200):        # the peer may still be binding
                     try:
-                        verb.connect(ziel)
-                        letzter = None
+                        conn.connect(dst)
+                        last_error = None
                         break
                     except OSError as e:
-                        letzter = e
+                        last_error = e
                         time.sleep(0.01)
-                if letzter is not None:
+                if last_error is not None:
                     # The 2 s cap above already bounds this loop. What it
                     # cannot do is say WHY: a peer that died before binding
                     # its socket looks exactly like one that is merely slow.
-                    check_peers(f"bar1 fd exchange: connect to rank {besitzer}")
+                    check_peers(f"bar1 fd exchange: connect to rank {owner}")
                     raise Bar1Unavailable(
-                        f"fd exchange: {ziel} unreachable ({letzter})"
+                        f"fd exchange: {dst} unreachable ({last_error})"
                     )
-                with verb:
-                    _daten, empfangen, _fl, _adr = socket.recv_fds(
-                        verb, 1, anzahl
+                with conn:
+                    _data, received, _fl, _addr = socket.recv_fds(
+                        conn, 1, count
                     )
-                if len(empfangen) != anzahl:
+                if len(received) != count:
                     raise Bar1Unavailable(
-                        f"fd exchange: rank {besitzer} sent {len(empfangen)} "
-                        f"fds instead of {anzahl}"
+                        f"fd exchange: rank {owner} sent {len(received)} "
+                        f"fds instead of {count}"
                     )
-                fds[besitzer] = list(empfangen)
+                fds[owner] = list(received)
             bounded_barrier(
-                cpu_group, f"bar1 fd exchange: round {besitzer} complete"
+                cpu_group, f"bar1 fd exchange: round {owner} complete"
             )
     finally:
-        horcher.close()
+        listener.close()
         try:
-            os.unlink(pfad)
+            os.unlink(path)
         except OSError:
             pass
     return fds
@@ -1266,14 +1274,14 @@ def _exchange_fds(cpu_group, rank: int, welt: int,
 class Mapping:
     """A mapped and registered foreign BAR1 region."""
 
-    bar1_basis: int
-    bar1_versatz: int          # region's offset within BAR1
+    bar1_base: int
+    bar1_offset: int          # region's offset within BAR1
     length: int                # ACTUALLY mapped, contiguous length
     mmap_obj: object           # held so the mapping stays alive
-    reg_adresse: int           # address under which REGISTRATION happened
-    host_adresse: int          # user-space address of the region (reg + lead-in)
+    reg_address: int           # address under which REGISTRATION happened
+    host_address: int          # user-space address of the region (reg + lead-in)
     dev_ptr: int               # THIS card's device pointer to the foreign BAR
-    halter_handle: int
+    holder_handle: int
 
 
 @dataclass
@@ -1285,9 +1293,9 @@ class PeerTarget:
     arrangement the probe measured.
     """
 
-    rang: int
+    rank: int
     bdf: str
-    nutz: Mapping
+    payload: Mapping
     flag: Mapping
     byte_proof: bool = False
 
@@ -1295,11 +1303,11 @@ class PeerTarget:
     # the payload region. Kept so the measurement probe stays unchanged.
     @property
     def dev_ptr(self) -> int:
-        return self.nutz.dev_ptr
+        return self.payload.dev_ptr
 
     @property
     def length(self) -> int:
-        return self.nutz.length
+        return self.payload.length
 
 
 class BarlinkBar1Transport:
@@ -1314,7 +1322,7 @@ class BarlinkBar1Transport:
     * ``barlink_all_reduce`` over the ported kernels ``mesh`` and ``ring``.
       Fully measured in the probe (float32, three ranks, rig 1); the table
       is in the module docstring.
-    * ``put(ziel, quell_ptr, nbytes, versatz)`` -- a single write into the
+    * ``put(dst, source_ptr, nbytes, offset)`` -- a single write into the
       destination card's BAR.
     * ``pair``/``pair_receive`` -- the measurement probe that
       ``barlink_matrix.BarlinkMatrixPlanner`` needs for real edge capacities
@@ -1363,8 +1371,8 @@ class BarlinkBar1Transport:
          "broadcast"}
     )
 
-    def __init__(self, cpu_group, device, fenster_bytes: int,
-                 aktiviert: Optional[bool] = None, gruppe: str = ""):
+    def __init__(self, cpu_group, device, window_bytes: int,
+                 enabled: Optional[bool] = None, group: str = ""):
         import torch
         import torch.distributed as dist
 
@@ -1375,27 +1383,27 @@ class BarlinkBar1Transport:
         #: pins down is unavailable to the next one. Without the name,
         #: there would be no way to either book it or say who holds the
         #: space.
-        self.gruppe = gruppe
+        self.group = group
         self.rank = dist.get_rank(cpu_group)
-        self.welt = dist.get_world_size(cpu_group)
-        self.fenster_bytes = int(fenster_bytes)
-        self._auf = False
+        self.world = dist.get_world_size(cpu_group)
+        self.window_bytes = int(window_bytes)
+        self._up = False
         self._peers: dict[int, PeerTarget] = {}
-        self._halter: Optional[Holder] = None
+        self._holder: Optional[Holder] = None
         self._cuda: Optional[_Cuda] = None
-        self._eigen = (0, 0, 0)          # payload: dptr, handle, size
-        self._eigen_flag = (0, 0, 0)     # flags:  dptr, handle, size
-        self._eigen_fuehler = None
+        self._own = (0, 0, 0)          # payload: dptr, handle, size
+        self._own_flag = (0, 0, 0)     # flags:  dptr, handle, size
+        self._own_sensor = None
         self._dmabuf_fds: list[int] = []       # own, exported
-        self._halte_fds: list[int] = []        # /dev/nvidiactl, /dev/nvidiaN
-        self._fremde_fds: list[list[int]] = []
+        self._hold_fds: list[int] = []        # /dev/nvidiactl, /dev/nvidiaN
+        self._foreign_fds: list[list[int]] = []
         self._ext = None
         self._geo: dict = {}
         self._plan = None                      # optional plan from barlink_matrix
         # Capability, group-wide uniform. Only valid after _build_up.
-        self._fenster_minimum = 0
-        self._belege_stehen = False
-        self._runde_dev = None
+        self._window_minimum = 0
+        self._proofs_hold = False
+        self._round_dev = None
         self._ctl_dev = None
         # Peer liveness. Both stay None when SGLANG_BARLINK_PEER_LIVENESS=0 or
         # when the identity exchange fails; every use site then falls back to
@@ -1403,17 +1411,17 @@ class BarlinkBar1Transport:
         self._peer_table = None
         self._abort_window = None
 
-        if aktiviert is None:
-            aktiviert = os.environ.get("SGLANG_BARLINK_MATRIX_DIRECT", "1") not in (
+        if enabled is None:
+            enabled = os.environ.get("SGLANG_BARLINK_MATRIX_DIRECT", "1") not in (
                 "0", "no", "off", "false"
             )
-        if not aktiviert:
+        if not enabled:
             raise Bar1Unavailable(
                 "disabled via SGLANG_BARLINK_MATRIX_DIRECT=0"
             )
-        if self.welt > MAX_RANGE:
+        if self.world > MAX_RANGE:
             raise Bar1Unavailable(
-                f"{self.welt} ranks, but the kernel arguments hold at most "
+                f"{self.world} ranks, but the kernel arguments hold at most "
                 f"{MAX_RANGE}. The limit lives in barlink_bar1_ext.py "
                 f"(BARLINK_BAR1_MAX_RANKS) and should be raised there in a "
                 f"traceable way -- not worked around here."
@@ -1427,19 +1435,19 @@ class BarlinkBar1Transport:
         # kernel instead of occupying the card indefinitely. Same order of
         # magnitude as BarlinkDeviceTransport._TIMEOUT_CYCLES, for the same
         # reason.
-        self.deckel_zyklen = int(
+        self.cap_cycles = int(
             os.environ.get("SGLANG_BARLINK_BAR1_CAP_CYCLES", "60000000000")
         )
         # Flag load shape: 2 = ld.mmio.relaxed.sys (the only genuine
         # cache-bypass, the probe's default), 0 = ld.global.cv.
-        self.ladeform = int(os.environ.get("SGLANG_BARLINK_BAR1_LOAD_SHAPE", "2"))
+        self.load_shape = int(os.environ.get("SGLANG_BARLINK_BAR1_LOAD_SHAPE", "2"))
         # Read fence: only needed when payload and flag sit on different
         # PCIe targets. Here they do not; default off.
-        self.fluss = int(os.environ.get("SGLANG_BARLINK_BAR1_FLOW", "0"))
+        self.read_flush = int(os.environ.get("SGLANG_BARLINK_BAR1_FLOW", "0"))
         # Payload size from which the cooperative multi-block launch kicks
         # in. 4 MiB, because in MESSUNG_ALLES_IM_SELBEN_LAUF.md the 'grid'
         # variant wins from 4 MiB up and '1blk' wins below it.
-        self.gitter_ab = int(
+        self.grid_from = int(
             os.environ.get("SGLANG_BARLINK_BAR1_GRID_THRESHOLD", str(4 << 20))
         )
         # May the cooperative variant be launched WHILE a CUDA graph is being
@@ -1454,10 +1462,10 @@ class BarlinkBar1Transport:
         # driver also accepts it out of a stream capture is proven twice on
         # this rig: the gate case `grid` passed, and the lever measurement
         # for #293 (phase A) with the same result.
-        self.graph_gitter = graph_grid_default()
-        self._graph_gitter_gemeldet = False
+        self.graph_grid = graph_grid_default()
+        self._graph_grid_reported = False
         # Emergency mesh->ring threshold, if no plan is passed in.
-        self.ring_ab = int(
+        self.ring_from = int(
             os.environ.get("SGLANG_BARLINK_BAR1_RING_THRESHOLD", str(1 << 20))
         )
         self.min_bytes = int(os.environ.get("SGLANG_BARLINK_BAR1_MIN_BYTES", "4096"))
@@ -1466,18 +1474,18 @@ class BarlinkBar1Transport:
         # costs a third of the largest all_reduce payload (see `geometry`).
         # Rank-uniform like every other SGLANG_BARLINK* variable; 0 restores
         # the old memory layout byte-for-byte.
-        self.a2a_an = os.environ.get("SGLANG_BARLINK_BAR1_A2A", "1") not in (
+        self.a2a_on = os.environ.get("SGLANG_BARLINK_BAR1_A2A", "1") not in (
             "0", "no", "off", "false"
         )
         #: Only valid after `byte_proof_a2a`. Without a passed proof,
         #: all_to_all withdraws -- all_reduce is unaffected by this.
-        self._a2a_beleg = False
+        self._a2a_proof = False
 
-        # -- netz_pipe (pipelined mesh, barlink_bar1_pipe_ext) ----------------
+        # -- mesh_pipe (pipelined mesh, barlink_bar1_pipe_ext) ----------------
         # OFF by default. Enabled, it occupies another slot set and four
         # flag lines per rank; disabled, every number and every offset in
         # this module is byte-for-byte the measured one.
-        self.pipe_an = os.environ.get("SGLANG_BARLINK_BAR1_PIPE", "0") not in (
+        self.pipe_on = os.environ.get("SGLANG_BARLINK_BAR1_PIPE", "0") not in (
             "0", "no", "off", "false"
         )
         # RING DEPTH T -- slots per phase and connection. 4, from NCCL:
@@ -1493,7 +1501,7 @@ class BarlinkBar1Transport:
         # the skew between unevenly fast ranks is exactly what the window
         # is meant to absorb. P = 2 is the minimum that pipelines at all;
         # with T = 4 that is three rounds of skew.
-        self.pipe_vorlauf = int(
+        self.pipe_lead = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_LEAD", "2")
         )
         # Chunk count K. 0 = automatic, from `pipe_chunk_bytes`.
@@ -1531,14 +1539,14 @@ class BarlinkBar1Transport:
         # missing from the all_reduce slot (8188 -> 6140 KiB). Anyone who
         # explicitly wants a larger slot thereby covers larger payloads at
         # small K and pays for it out of the same window.
-        self.pipe_schlitz_kib = int(
+        self.pipe_slot_kib = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_SLOT_KIB", "0")
         )
-        #: Only fixed during setup (from `pipe_schlitz_kib` or computed).
-        self.pipe_schlitz = 0
+        #: Only fixed during setup (from `pipe_slot_kib` or computed).
+        self.pipe_slot = 0
         # SEPARATE 1blk/grid threshold for the pipe.
         #
-        # Separate from `gitter_ab`, because the calculation for the pipe
+        # Separate from `grid_from`, because the calculation for the pipe
         # comes out differently: `mesh` pays two `grid.sync()` per
         # collective, the pipe pays two per LOOP ROUND, i.e. 2(K+P) instead
         # of 2. And the reason the cooperative variant wins for `mesh` from
@@ -1553,20 +1561,20 @@ class BarlinkBar1Transport:
         # own lever: per the calculation above, the pipe should do better
         # with 1blk, and that is the first question of the measurement
         # series.
-        self.pipe_gitter_ab = int(
+        self.pipe_grid_from = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_GRID_THRESHOLD",
-                           str(self.gitter_ab))
+                           str(self.grid_from))
         )
         # Receiver acknowledgment (head). 1 = on. Turned off, it shows what
         # the sliding window costs; turned ON, it may only be used by
         # someone who has read the schedule proof in barlink_bar1_pipe_ext.
-        self.pipe_quittung = int(
+        self.pipe_ack = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_ACK", "1")
         )
-        # Payload size from which netz_pipe runs instead of mesh. 256 KiB,
+        # Payload size from which mesh_pipe runs instead of mesh. 256 KiB,
         # because below that a single chunk would remain and the pipe would
         # then just be the mesh's bookkeeping.
-        self.pipe_ab = int(
+        self.pipe_from = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_THRESHOLD", str(256 << 10))
         )
         # Direct mode: the all-gather writes into the receiver's result
@@ -1574,7 +1582,7 @@ class BarlinkBar1Transport:
         # out and copy over. Default ON as soon as the pipe is on -- that is
         # the whole point of the pipe. 0 is the control run with the same
         # memory layout.
-        self.pipe_direkt = os.environ.get(
+        self.pipe_direct = os.environ.get(
             "SGLANG_BARLINK_BAR1_PIPE_DIRECT", "1"
         ) not in ("0", "no", "off", "false")
         # Direct mode WHILE a graph is being captured. Default OFF -- not
@@ -1584,14 +1592,14 @@ class BarlinkBar1Transport:
         # pool above the eager slots, plus the release handshake in the
         # kernel. The derivation lives in `_result_slot` and in
         # `barlink_bar1_pipe_ext.result_slot_split`.
-        self.pipe_direkt_graph = os.environ.get(
+        self.pipe_direct_graph = os.environ.get(
             "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH", "0"
         ) not in ("0", "no", "off", "false")
-        self._direkt_graph_gemeldet = False
+        self._direct_graph_reported = False
         # How many result buffers the ring holds. Costs L*max_bytes in the
         # BAR window; 2 is the minimum with which round n does not write
         # into the buffer the caller still holds from round n-1.
-        self.pipe_erg_ring = int(
+        self.pipe_result_ring = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_RESULT_RING", "2")
         )
         # How many ring slots the EAGER path retains. Default 2, i.e.
@@ -1602,51 +1610,51 @@ class BarlinkBar1Transport:
         # eager -- a larger SGLANG_BARLINK_BAR1_PIPE_RESULT_RING there
         # allocates exclusively graph slots and does not help.
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (  # noqa: E501
-            ERG_EAGER_PLAETZE,
+            RESULT_EAGER_SLOTS,
         )
 
-        self.pipe_erg_eager = int(
+        self.pipe_result_eager = int(
             os.environ.get("SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER",
-                           str(ERG_EAGER_PLAETZE))
+                           str(RESULT_EAGER_SLOTS))
         )
         #: Only valid after `byte_proof_pipe`.
-        self._pipe_beleg = False
+        self._pipe_proof = False
         self._pipe_ext = None
-        self._schritt_dev = None
-        self._erg_gen_dev = None
+        self._step_dev = None
+        self._result_gen_dev = None
         #: Running index into the result ring. HOST-SIDE and rank-uniform,
         #: because every rank sees the same sequence of collectives (SPMD)
         #: -- the same assumption `algorithm_for` already relies on. The
         #: kernel CANNOT choose it itself: the host must build the result
         #: tensor before the kernel runs.
-        self._erg_i = -1
+        self._result_i = -1
         #: Weak references to the most recently handed-out result tensors,
         #: per ring slot. They are the liveness check.
-        self._erg_lebt: list = []
+        self._result_alive: list = []
         #: Running number of eager direct calls, and the number at which a
         #: slot was last assigned. From that falls out the reuse distance
-        #: the release handshake needs as ``ergSlack`` -- under strict
+        #: the release handshake needs as ``resultSlack`` -- under strict
         #: rotation it is the number of eager slots, fewer after skipping
         #: an occupied slot.
-        self._erg_zaehler = 0
-        self._erg_zuletzt: list = []
+        self._result_counter = 0
+        self._result_last: list = []
         #: How often an eager call found no free slot and therefore ran
-        #: ``direkt=0``. Reported once per rank; the counter itself keeps
+        #: ``direct=0``. Reported once per rank; the counter itself keeps
         #: going, so "once at warmup" and "on every call" can be told
         #: apart.
-        self._erg_eager_voll = 0
-        self._erg_eager_voll_gemeldet = False
+        self._result_eager_full = 0
+        self._result_eager_full_reported = False
         #: Split of the result ring into eager slots and graph slots. Fixed
         #: before the first call runs (`result_slot_split`), so the graph
         #: pool can never grab a slot whose eager tensor the caller still
         #: holds.
-        self._erg_eager_plaetze = 0
-        self._erg_graph_plaetze = 0
+        self._result_eager_slots = 0
+        self._result_graph_slots = 0
         #: How many graph slots have already been assigned. Only grows; a
         #: slot once assigned never comes back, because from here there is
         #: no way to tell whether the graph it belongs to is still alive.
-        self._erg_graph_vergeben = 0
-        self._erg_graph_leer_gemeldet = False
+        self._result_graph_assigned = 0
+        self._result_graph_empty_reported = False
         #: Lower bound for all_to_all. Deliberately NOT `min_bytes` (4096):
         #: the whole appeal of a2a over BAR1 lies precisely in the small
         #: MoE dispatch blocks. 16 bytes = one packet.
@@ -1661,7 +1669,7 @@ class BarlinkBar1Transport:
         #: does not require a recompile. It only takes effect within
         #: SGLANG_BARLINK_TRANSPORT=bar1|matrix; without barlink it changes
         #: nothing.
-        self.ag_an = os.environ.get("SGLANG_BARLINK_BAR1_AG", "1") not in (
+        self.ag_on = os.environ.get("SGLANG_BARLINK_BAR1_AG", "1") not in (
             "0", "no", "off", "false"
         )
         #: Lower bound: **1 byte**. This used to be 16 ("one packet",
@@ -1687,7 +1695,7 @@ class BarlinkBar1Transport:
         #: (96-MiB window, R=3), and thus every size that occurs in this
         #: model -- the largest measured is 10.6 MB. Above that, the path
         #: withdraws instead of presenting a loop as a transport.
-        self.ag_max_runden = int(
+        self.ag_max_rounds = int(
             os.environ.get("SGLANG_BARLINK_BAR1_AG_MAX_ROUNDS", "16")
         )
         #: broadcast over the same a2a kernel. DEFAULT ON, for the same
@@ -1695,7 +1703,7 @@ class BarlinkBar1Transport:
         #: capturing the draft graph (eagle_worker_v2.init_cuda_graphs ->
         #: parallel_state broadcast -> the guard in barlink._select). The
         #: switch exists so a benchmarker can pit it against the gloo tier.
-        self.bc_an = os.environ.get("SGLANG_BARLINK_BAR1_BC", "1") not in (
+        self.bc_on = os.environ.get("SGLANG_BARLINK_BAR1_BC", "1") not in (
             "0", "no", "off", "false"
         )
         #: Lower bound: **1 byte**, i.e. none at all. This used to be 16
@@ -1705,7 +1713,7 @@ class BarlinkBar1Transport:
         #:
         #: The 16 had no technical reason. The kernel does write in 16-byte
         #: packets, but assembles the last, incomplete one from the
-        #: available bytes in a register (``packeBytes``) -- a 12-byte
+        #: available bytes in a register (``packBytes``) -- a 12-byte
         #: block is ONE such packet, not a special case. The slot begins on
         #: a page boundary and is a multiple of 16, so the four padding
         #: bytes land inside its own slot; the receive phase writes exactly
@@ -1721,14 +1729,14 @@ class BarlinkBar1Transport:
         #: number sitting right next to it.
         #:
         #: Covered is thus everything from 1 byte to
-        #: ``a2a_schlitz * bc_max_runden``. Whoever turns the knob up is
+        #: ``a2a_slot * bc_max_rounds``. Whoever turns the knob up is
         #: declining on purpose; it no longer happens silently.
         self.bc_min_bytes = int(
             os.environ.get("SGLANG_BARLINK_BAR1_BC_MIN_BYTES", "1")
         )
         #: Round limit as with all_gather, for the same reason: each round
         #: is one kernel launch with one barrier.
-        self.bc_max_runden = int(
+        self.bc_max_rounds = int(
             os.environ.get("SGLANG_BARLINK_BAR1_BC_MAX_ROUNDS", "16")
         )
         #: Round limit for all_reduce and all_to_all -- the same kind of
@@ -1738,10 +1746,10 @@ class BarlinkBar1Transport:
         #: all_reduce payload of ~384 MiB at an 8188-KiB slot and R=3, and
         #: thus every size that occurs in this model -- the standard run's
         #: working point is 20 MiB.
-        self.ar_max_runden = int(
+        self.ar_max_rounds = int(
             os.environ.get("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS", "16")
         )
-        self.a2a_max_runden = int(
+        self.a2a_max_rounds = int(
             os.environ.get("SGLANG_BARLINK_BAR1_A2A_MAX_ROUNDS", "16")
         )
         #: Only valid after `byte_proof_broadcast`. Its own flag even
@@ -1749,7 +1757,7 @@ class BarlinkBar1Transport:
         #: is not a verdict on all_to_all -- the table is a different one
         #: (exactly one sender), and a failure there carries no conclusion
         #: over here.
-        self._bc_beleg = False
+        self._bc_proof = False
         try:
             self._build_up()
         except BaseException:
@@ -1769,36 +1777,43 @@ class BarlinkBar1Transport:
     def patch_state() -> dict:
         """What the driver reveals about itself -- without any interpretation.
 
-        ``RMSmallBarP2PPeerBar1`` widens the guard from "within the static
+        ``BarlinkPeerBar1`` widens the guard from "within the static
         window of another GPU" to "within the BAR1 aperture of another
         GPU". The default is **0**; without the reg key, the guard behaves
         exactly as before, and ``cudaHostRegister(..., IoMemory)`` on a
         foreign BAR fails.
+
+        Either spelling in ``PEER_BAR1_REGKEYS`` counts as set:
+        ``RMSmallBarP2PPeerBar1`` is the name the key carried before #358,
+        and the driver patch still reads it, so a module loaded before the
+        rename is just as usable as one loaded after it.
 
         Only what is in ``/proc/driver/nvidia/params`` is reported. An
         empty ``RegistryDwords`` entry means: the reg key is not set. That
         is not proof that "the path is dead" -- the proof is the failed
         ``cudaHostRegister``, and that is exactly what setup waits for.
         """
-        aus = {"regkeys": "", "treiber": "", "halter": os.path.exists(HALTER_PFAD)}
+        info = {"regkeys": "", "driver": "", "holder": os.path.exists(HOLDER_PATH)}
         try:
             with open("/proc/driver/nvidia/params") as f:
-                for z in f:
+                for line in f:
                     # Exactly "RegistryDwords:" -- not
                     # "RegistryDwordsPerDevice:", which would otherwise
                     # overwrite the real one as a later line and report a
                     # reg key that is actually set as empty.
-                    if z.startswith("RegistryDwords:"):
-                        aus["regkeys"] = z.strip()
+                    if line.startswith("RegistryDwords:"):
+                        info["regkeys"] = line.strip()
         except OSError:
             pass
         try:
             with open("/proc/driver/nvidia/version") as f:
-                aus["treiber"] = f.readline().strip()
+                info["driver"] = f.readline().strip()
         except OSError:
             pass
-        aus["smallbar_p2p_peerbar1"] = "RMSmallBarP2PPeerBar1" in aus["regkeys"]
-        return aus
+        info["peer_bar1_regkey"] = any(
+            k in info["regkeys"] for k in PEER_BAR1_REGKEYS
+        )
+        return info
 
     # -- Setup -----------------------------------------------------------
 
@@ -1810,7 +1825,7 @@ class BarlinkBar1Transport:
             bdf_of_card,
         )
 
-        if self.welt < 2:
+        if self.world < 2:
             raise Bar1Unavailable("fewer than two ranks -- nothing to do")
 
         # Peer liveness, before the first collective of the bring-up. From
@@ -1823,9 +1838,9 @@ class BarlinkBar1Transport:
 
         t0 = time.perf_counter()
         self._cuda = _Cuda()
-        self._halter = Holder()
+        self._holder = Holder()
 
-        eigener_bdf = bdf_of_card(self.device)
+        own_bdf = bdf_of_card(self.device)
         # BDF and window proposal in ONE all_gather. The proposal has to
         # travel along because the cards in the group have differently
         # sized apertures (3080: 256 MiB gross) and, in a process with two
@@ -1833,28 +1848,28 @@ class BarlinkBar1Transport:
         # region that differs per rank would mean a different slot layout
         # per rank -- not an error, but writes landing at the wrong place.
         # Hence: a group-wide MINIMUM, and that decides.
-        gesammelt: list[object] = [None] * self.welt
+        gathered: list[object] = [None] * self.world
         # torch runs the object collectives inline, so there is no Work to
         # bound; the one-shot check names a peer that is already gone instead
         # of letting gloo wait 7200 s for it.
         check_peers("bar1 bring-up: BDF and window exchange", self._peer_table)
         dist.all_gather_object(
-            gesammelt, (eigener_bdf, int(self.fenster_bytes)),
+            gathered, (own_bdf, int(self.window_bytes)),
             group=self.cpu_group,
         )
-        self.bdfs = [str(x[0]) for x in gesammelt]      # type: ignore[index]
-        vorschlaege = [int(x[1]) for x in gesammelt]    # type: ignore[index]
-        gemeinsam = min(vorschlaege)
-        if gemeinsam != self.fenster_bytes:
+        self.bdfs = [str(x[0]) for x in gathered]      # type: ignore[index]
+        proposals = [int(x[1]) for x in gathered]    # type: ignore[index]
+        common = min(proposals)
+        if common != self.window_bytes:
             logger.warning(
                 "barlink-BAR1: per-rank window proposals %s MiB -- the "
                 "group-wide minimum of %d MiB governs. This rank could "
                 "have done %d MiB. The region is rank-uniform because the "
                 "slot offsets in both kernels are computed from it.",
-                [v // 2**20 for v in vorschlaege], gemeinsam // 2**20,
-                self.fenster_bytes // 2**20,
+                [v // 2**20 for v in proposals], common // 2**20,
+                self.window_bytes // 2**20,
             )
-        if gemeinsam <= 0:
+        if common <= 0:
             raise Bar1Unavailable(
                 "0 bytes of BAR1 window remain group-wide. Another "
                 "communicator in this process has claimed the aperture; "
@@ -1863,7 +1878,7 @@ class BarlinkBar1Transport:
                 "group less (SGLANG_BARLINK_BAR1_WINDOW_MIB_<NAME>) or run "
                 "this group explicitly over NCCL."
             )
-        self.fenster_bytes = gemeinsam
+        self.window_bytes = common
 
         # 0. The kernels. First, because a failed build is cheaper to abort
         # than a half-built peer table.
@@ -1879,7 +1894,7 @@ class BarlinkBar1Transport:
         # 0b. The pipelined kernel, if enabled. A failed build disables it
         # instead of losing the whole transport -- mesh and ring are
         # unaffected by this.
-        if self.pipe_an:
+        if self.pipe_on:
             from sglang.srt.distributed.device_communicators import (
                 barlink_bar1_pipe_ext,
             )
@@ -1889,63 +1904,63 @@ class BarlinkBar1Transport:
             except Exception as e:
                 logger.warning(
                     "barlink-BAR1: the pipelined extension could not be "
-                    "compiled (%s). netz_pipe drops out; mesh and ring "
+                    "compiled (%s). mesh_pipe drops out; mesh and ring "
                     "continue unchanged.", e,
                 )
-                self.pipe_an = False
+                self.pipe_on = False
                 self._pipe_ext = None
 
         # 1. Memory layout. The largest payload follows from the window the
         # caller grants -- not the other way around.
-        if self.pipe_an and not (2 <= self.pipe_vorlauf <= self.pipe_t):
+        if self.pipe_on and not (2 <= self.pipe_lead <= self.pipe_t):
             raise Bar1Unavailable(
-                f"SGLANG_BARLINK_BAR1_PIPE_LEAD={self.pipe_vorlauf} does not "
+                f"SGLANG_BARLINK_BAR1_PIPE_LEAD={self.pipe_lead} does not "
                 f"fit T={self.pipe_t}: 2 <= P <= T is required. P=1 "
                 f"deadlocks (sending and consuming a chunk would fall into "
                 f"the same loop round), P>T would let the schedule overtake "
                 f"the slots."
             )
-        pipe_bereich = 0
-        if self.pipe_an:
+        pipe_range = 0
+        if self.pipe_on:
             from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (  # noqa: E501
                 pipe_range_bytes,
                 pipe_slot_default,
             )
 
-            if self.pipe_schlitz_kib > 0:
-                self.pipe_schlitz = (self.pipe_schlitz_kib * 1024 // 16) * 16
+            if self.pipe_slot_kib > 0:
+                self.pipe_slot = (self.pipe_slot_kib * 1024 // 16) * 16
             else:
-                self.pipe_schlitz = pipe_slot_default(
-                    self.welt, self.pipe_chunk_bytes
+                self.pipe_slot = pipe_slot_default(
+                    self.world, self.pipe_chunk_bytes
                 )
-            if self.pipe_schlitz <= 0:
+            if self.pipe_slot <= 0:
                 raise Bar1Unavailable(
-                    f"Pipe slot size of {self.pipe_schlitz} bytes is not "
+                    f"Pipe slot size of {self.pipe_slot} bytes is not "
                     f"usable (from SGLANG_BARLINK_BAR1_PIPE_SLOT_KIB="
-                    f"{self.pipe_schlitz_kib} resp. PIPE_CHUNK_BYTES="
-                    f"{self.pipe_chunk_bytes} at {self.welt} ranks)."
+                    f"{self.pipe_slot_kib} resp. PIPE_CHUNK_BYTES="
+                    f"{self.pipe_chunk_bytes} at {self.world} ranks)."
                 )
-            pipe_bereich = pipe_range_bytes(
-                self.welt, self.pipe_t, self.pipe_schlitz
+            pipe_range = pipe_range_bytes(
+                self.world, self.pipe_t, self.pipe_slot
             )
             logger.info(
                 "barlink-BAR1-PIPE: ring depth T=%d, lead P=%d -- a peer may "
                 "lag behind by %d loop rounds before the sender blocks. "
                 "Direct mode %s, result ring L=%d, pipe slot %d KiB (%s), "
                 "pipe region %.1f MiB.",
-                self.pipe_t, self.pipe_vorlauf,
-                self.pipe_t - self.pipe_vorlauf + 1,
-                "on" if self.pipe_direkt else "off", self.pipe_erg_ring,
-                self.pipe_schlitz // 1024,
-                "set" if self.pipe_schlitz_kib > 0
+                self.pipe_t, self.pipe_lead,
+                self.pipe_t - self.pipe_lead + 1,
+                "on" if self.pipe_direct else "off", self.pipe_result_ring,
+                self.pipe_slot // 1024,
+                "set" if self.pipe_slot_kib > 0
                 else f"from chunk target {self.pipe_chunk_bytes // 1024} KiB",
-                pipe_bereich / 2**20,
+                pipe_range / 2**20,
             )
-        if not self.pipe_an or not self.pipe_direkt:
-            self.pipe_erg_ring = 0
-        elif self.pipe_erg_eager < 2:
+        if not self.pipe_on or not self.pipe_direct:
+            self.pipe_result_ring = 0
+        elif self.pipe_result_eager < 2:
             raise Bar1Unavailable(
-                f"SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER={self.pipe_erg_eager}: "
+                f"SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER={self.pipe_result_eager}: "
                 f"direct mode needs at least two eager result buffers. With "
                 f"only one, round n would write into exactly the buffer the "
                 f"caller still holds from round n-1 -- a silently "
@@ -1953,36 +1968,36 @@ class BarlinkBar1Transport:
                 f"crash. Whoever doesn't want the ring can disable direct "
                 f"mode with SGLANG_BARLINK_BAR1_PIPE_DIRECT=0."
             )
-        elif self.pipe_erg_ring < self.pipe_erg_eager:
+        elif self.pipe_result_ring < self.pipe_result_eager:
             raise Bar1Unavailable(
-                f"SGLANG_BARLINK_BAR1_PIPE_RESULT_RING={self.pipe_erg_ring} is "
+                f"SGLANG_BARLINK_BAR1_PIPE_RESULT_RING={self.pipe_result_ring} is "
                 f"smaller than SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER="
-                f"{self.pipe_erg_eager}. The ring holds the eager slots and "
+                f"{self.pipe_result_eager}. The ring holds the eager slots and "
                 f"the graph pool together; it cannot be smaller than its "
                 f"eager part."
             )
-        max_bytes = max_payload(self.welt, self.fenster_bytes, self.a2a_an,
-                                 self.pipe_an, self.pipe_erg_ring,
-                                 pipe_bereich)
+        max_bytes = max_payload(self.world, self.window_bytes, self.a2a_on,
+                                 self.pipe_on, self.pipe_result_ring,
+                                 pipe_range)
         if max_bytes < self.min_bytes:
             raise Bar1Unavailable(
-                f"Window of {self.fenster_bytes // 1024} KiB carries only "
-                f"{max_bytes} bytes of payload at {self.welt} ranks, "
+                f"Window of {self.window_bytes // 1024} KiB carries only "
+                f"{max_bytes} bytes of payload at {self.world} ranks, "
                 f"minimum size is {self.min_bytes}. 4(R-1) slots of "
                 f"ceil(N/R) each must fit."
             )
-        self._geo = geometry(self.welt, max_bytes, self.a2a_an, self.pipe_an,
-                              self.pipe_erg_ring, pipe_bereich)
+        self._geo = geometry(self.world, max_bytes, self.a2a_on, self.pipe_on,
+                              self.pipe_result_ring, pipe_range)
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (  # noqa: E501
             result_slot_split,
         )
 
-        self._erg_eager_plaetze, self._erg_graph_plaetze = result_slot_split(
-            self.pipe_erg_ring, self.pipe_direkt_graph, self.pipe_erg_eager
+        self._result_eager_slots, self._result_graph_slots = result_slot_split(
+            self.pipe_result_ring, self.pipe_direct_graph, self.pipe_result_eager
         )
-        self._erg_lebt = [None] * max(0, self._erg_eager_plaetze)
-        self._erg_zuletzt = [None] * max(0, self._erg_eager_plaetze)
-        if self.pipe_direkt_graph:
+        self._result_alive = [None] * max(0, self._result_eager_slots)
+        self._result_last = [None] * max(0, self._result_eager_slots)
+        if self.pipe_direct_graph:
             logger.info(
                 "barlink-BAR1-PIPE: graph-safe direct mode, result ring L=%d "
                 "split into %d eager slots and %d graph slots. Each "
@@ -1990,40 +2005,40 @@ class BarlinkBar1Transport:
                 "it back; if the pool is empty, the capture runs the "
                 "direct=0 path. More graphs need a larger "
                 "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING.",
-                self.pipe_erg_ring, self._erg_eager_plaetze,
-                self._erg_graph_plaetze,
+                self.pipe_result_ring, self._result_eager_slots,
+                self._result_graph_slots,
             )
         self.max_bytes = max_bytes
         region = self._geo["region_bytes"]
-        flaggen = flags_requirement(self.welt, self.a2a_an, self.pipe_an)
+        flag_bytes = flags_requirement(self.world, self.a2a_on, self.pipe_on)
 
         # 2. Two receive regions, two exports. Separate, because the probe
         # measured them separately.
-        dptr, handle, groesse = self._cuda.vmm_alloc(self.ordinal, region)
-        self._eigen = (dptr, handle, groesse)
-        fptr, fhandle, fgroesse = self._cuda.vmm_alloc(self.ordinal, flaggen)
-        self._eigen_flag = (fptr, fhandle, fgroesse)
+        dptr, handle, size = self._cuda.vmm_alloc(self.ordinal, region)
+        self._own = (dptr, handle, size)
+        fptr, fhandle, fsize = self._cuda.vmm_alloc(self.ordinal, flag_bytes)
+        self._own_flag = (fptr, fhandle, fsize)
         # Flags to 0. Rounds start at 1, so no old marker can pass as a
         # valid acknowledgment.
-        self._cuda.memset_d8(fptr, 0, fgroesse)
+        self._cuda.memset_d8(fptr, 0, fsize)
 
-        weg = ""
-        for adr, hnd, gr in ((dptr, handle, groesse), (fptr, fhandle, fgroesse)):
-            fd, hold, weg = self._cuda.dmabuf_fd(adr, hnd, gr, self.ordinal)
+        route = ""
+        for addr, hnd, nbytes in ((dptr, handle, size), (fptr, fhandle, fsize)):
+            fd, hold, route = self._cuda.dmabuf_fd(addr, hnd, nbytes, self.ordinal)
             self._dmabuf_fds.append(fd)
-            self._halte_fds.extend(hold)
+            self._hold_fds.extend(hold)
 
         # 3. Exchange fds -- both in one message.
-        self._fremde_fds = _exchange_fds(
-            self.cpu_group, self.rank, self.welt, self._dmabuf_fds
+        self._foreign_fds = _exchange_fds(
+            self.cpu_group, self.rank, self.world, self._dmabuf_fds
         )
 
         # 4.-6. attach each peer, offset from the sg-table, map, register.
         # This happens EXACTLY HERE and never again.
-        for peer in range(self.welt):
+        for peer in range(self.world):
             if peer == self.rank:
                 continue
-            self._peers[peer] = self._bind_peer(peer, self._fremde_fds[peer])
+            self._peers[peer] = self._bind_peer(peer, self._foreign_fds[peer])
 
         # 7. What is ACTUALLY mapped -- the group-wide minimum. Not the
         # gross size from sysfs and not the requested one: what governs is
@@ -2031,40 +2046,40 @@ class BarlinkBar1Transport:
         # rank whose smallest window is smaller decides for everyone --
         # otherwise `handles` would answer differently per rank and the
         # SPMD assumption would be violated.
-        lokal_min = min(z.nutz.length for z in self._peers.values())
-        lokal_flag_min = min(z.flag.length for z in self._peers.values())
-        traeger: list[object] = [None] * self.welt
+        local_min = min(z.payload.length for z in self._peers.values())
+        local_flag_min = min(z.flag.length for z in self._peers.values())
+        carrier: list[object] = [None] * self.world
         check_peers("bar1 bring-up: window minimum exchange", self._peer_table)
         dist.all_gather_object(
-            traeger, (lokal_min, lokal_flag_min), group=self.cpu_group
+            carrier, (local_min, local_flag_min), group=self.cpu_group
         )
-        self._fenster_minimum = min(int(x[0]) for x in traeger)   # type: ignore[index]
-        flag_minimum = min(int(x[1]) for x in traeger)            # type: ignore[index]
-        if self._fenster_minimum < region:
+        self._window_minimum = min(int(x[0]) for x in carrier)   # type: ignore[index]
+        flag_minimum = min(int(x[1]) for x in carrier)            # type: ignore[index]
+        if self._window_minimum < region:
             raise Bar1Unavailable(
                 f"{region} bytes of payload region were requested, at most "
-                f"{self._fenster_minimum} bytes are mapped contiguously "
+                f"{self._window_minimum} bytes are mapped contiguously "
                 f"group-wide. No silent shrinking of the payload: the slot "
                 f"offsets are fixed in both kernels, and a rank with a "
                 f"different layout would write to the wrong place."
             )
-        if flag_minimum < flaggen:
+        if flag_minimum < flag_bytes:
             raise Bar1Unavailable(
-                f"Flag region: {flaggen} bytes needed, at most "
+                f"Flag region: {flag_bytes} bytes needed, at most "
                 f"{flag_minimum} mapped group-wide."
             )
 
         # 8. Round counter and status word. Both LOCAL in VRAM -- they are
         # never touched by a peer.
-        self._runde_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._round_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
         # Absolute chunk counter of the sliding window. Separate from the
         # round counter, because it grows by K per call and is only
-        # advanced by netz_pipe -- it is the reference against which the
+        # advanced by mesh_pipe -- it is the reference against which the
         # peers' head/tail lines are compared, and must therefore remain
         # absolute across calls. Rank-uniform, because every rank sees the
         # same sequence of calls with the same K.
-        self._schritt_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._step_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
         # Generation counter of the graph-safe direct mode. Also LOCAL in
         # VRAM: local accesses are coherent with one's own reads, and only
         # the PEER's view of the counter value needs the flag protocol --
@@ -2072,7 +2087,7 @@ class BarlinkBar1Transport:
         # not on the host, because it must keep counting on every graph
         # replay; a host counter gets baked in at capture time and then
         # sits still.
-        self._erg_gen_dev = torch.zeros(1, dtype=torch.int64,
+        self._result_gen_dev = torch.zeros(1, dtype=torch.int64,
                                         device=self.device)
 
         bounded_barrier(
@@ -2080,117 +2095,117 @@ class BarlinkBar1Transport:
             "bar1 bring-up: peer targets bound",
             table=self._peer_table,
         )
-        self._auf = True
+        self._up = True
         # Into the ledger. Only NOW, because only now is it established that
         # the aperture actually gave up the space -- booking before the
         # holder would be a promise on spec, and the second group's ENOMEM
         # would then come from a reservation that does not actually exist.
         from sglang.srt.distributed.device_communicators import (
-            barlink_matrix_transport as _kasse,
+            barlink_matrix_transport as _ledger,
         )
 
-        _kasse.ledger_credit(self.device, self.gruppe, region + flaggen)
-        dauer = time.perf_counter() - t0
+        _ledger.ledger_credit(self.device, self.group, region + flag_bytes)
+        duration = time.perf_counter() - t0
         logger.info(
             "barlink-BAR1: setup in %.0f ms, %d peer targets, region %.1f MiB "
             "per rank (%s), slot %d KiB, largest payload %d KiB, flags %d "
             "bytes, export via %s. From here on, nothing is mapped anymore "
             "on the hot path.",
-            dauer * 1000, len(self._peers), region / 2**20,
-            f"{(6 if self.a2a_an else 4) * (self.welt - 1)} slots"
-            + (" (of which 2(R-1) for all_to_all)" if self.a2a_an
+            duration * 1000, len(self._peers), region / 2**20,
+            f"{(6 if self.a2a_on else 4) * (self.world - 1)} slots"
+            + (" (of which 2(R-1) for all_to_all)" if self.a2a_on
                else ", all_to_all disabled"),
             self._geo["chunk_max"] // 1024,
-            max_bytes // 1024, flaggen, weg,
+            max_bytes // 1024, flag_bytes, route,
         )
         # And log the ledger too. Without it, the next group that fails
         # with ENOMEM is again reduced to guessing.
         logger.info(
             "barlink-BAR1: BAR1 ledger of this card after group %r: %s.",
-            self.gruppe or "<unnamed>",
+            self.group or "<unnamed>",
             ", ".join(f"{g or '<unnamed>'}: {b / 2**20:.1f} MiB"
-                      for g, b in _kasse.ledger_balance(self.device)),
+                      for g, b in _ledger.ledger_balance(self.device)),
         )
 
-    def _bind_peer(self, peer: int, fremde_fds: list) -> PeerTarget:
+    def _bind_peer(self, peer: int, foreign_fds: list) -> PeerTarget:
         """Attach, map, and register both regions of a peer."""
-        ziel_bdf = self.bdfs[peer]
-        nutz = self._bind_region(peer, ziel_bdf, fremde_fds[0], "payload",
+        dst_bdf = self.bdfs[peer]
+        payload = self._bind_region(peer, dst_bdf, foreign_fds[0], "payload",
                                   self._geo["region_bytes"])
         try:
-            flag = self._bind_region(peer, ziel_bdf, fremde_fds[1], "flag",
-                                      flags_requirement(self.welt, self.a2a_an,
-                                                     self.pipe_an))
+            flag = self._bind_region(peer, dst_bdf, foreign_fds[1], "flag",
+                                      flags_requirement(self.world, self.a2a_on,
+                                                     self.pipe_on))
         except BaseException:
             # Release the already-bound payload region again: it is not yet
             # recorded in any PeerTarget and would not be found by close().
-            self._resolve_region(nutz)
+            self._resolve_region(payload)
             raise
-        return PeerTarget(rang=peer, bdf=ziel_bdf, nutz=nutz, flag=flag)
+        return PeerTarget(rank=peer, bdf=dst_bdf, payload=payload, flag=flag)
 
     def _resolve_region(self, a: Mapping) -> None:
         if self._cuda is not None:
-            self._cuda.unregister(a.reg_adresse)
+            self._cuda.unregister(a.reg_address)
         try:
             a.mmap_obj.close()              # type: ignore[attr-defined]
         except Exception:
             pass
-        if self._halter is not None:
-            self._halter.release(a.halter_handle)
+        if self._holder is not None:
+            self._holder.release(a.holder_handle)
 
-    def _bind_region(self, peer: int, ziel_bdf: str, fremder_fd: int,
-                      kind: str, mindestens: int) -> Mapping:
-        assert self._cuda is not None and self._halter is not None
-        window = bar1_window(ziel_bdf)
+    def _bind_region(self, peer: int, dst_bdf: str, foreign_fd: int,
+                      kind: str, minimum: int) -> Mapping:
+        assert self._cuda is not None and self._holder is not None
+        window = bar1_window(dst_bdf)
 
         # Attach happens as THIS card -- it will write later.
-        handle_, sg, total = self._halter.hold(fremder_fd, self.bdfs[self.rank])
+        handle_, sg, total = self._holder.hold(foreign_fd, self.bdfs[self.rank])
 
-        treffer = [e for e in sg if window.basis <= e.dma_adresse < window.end]
-        if not treffer:
-            self._halter.release(handle_)
+        hits = [e for e in sg if window.base <= e.dma_address < window.end]
+        if not hits:
+            self._holder.release(handle_)
             raise Bar1Unavailable(
                 f"None of the {len(sg)} sg-addresses of rank {peer} lie "
-                f"within its BAR1 [{window.basis:#x}, {window.end:#x}). "
-                f"First address {sg[0].dma_adresse:#x}. This means either "
+                f"within its BAR1 [{window.base:#x}, {window.end:#x}). "
+                f"First address {sg[0].dma_address:#x}. This means either "
                 f"that the IOMMU does not map identically (in which case "
                 f"the offset derived from the sg-table does not hold and "
                 f"the pattern scan would be needed), or that the driver did "
                 f"not map into BAR1 at all. No guessing -- this edge is "
                 f"dropped."
             )
-        treffer.sort(key=lambda e: e.dma_adresse)
-        start = treffer[0].dma_adresse
+        hits.sort(key=lambda e: e.dma_address)
+        start = hits[0].dma_address
         # Contiguous? Only the contiguous beginning can be mapped as one
         # piece; the rest would be a second window.
         length = 0
-        erwartet = start
-        for e in treffer:
-            if e.dma_adresse != erwartet:
+        expected = start
+        for e in hits:
+            if e.dma_address != expected:
                 break
             length += e.length
-            erwartet += e.length
-        versatz = start - window.basis
-        if length < mindestens:
-            self._halter.release(handle_)
+            expected += e.length
+        offset = start - window.base
+        if length < minimum:
+            self._holder.release(handle_)
             raise Bar1Unavailable(
-                f"{kind} region of rank {peer} ({ziel_bdf}): "
-                f"{mindestens} bytes needed, but only {length} bytes are "
-                f"mapped CONTIGUOUSLY in BAR1 (from {len(treffer)} "
+                f"{kind} region of rank {peer} ({dst_bdf}): "
+                f"{minimum} bytes needed, but only {length} bytes are "
+                f"mapped CONTIGUOUSLY in BAR1 (from {len(hits)} "
                 f"sg-entries starting at {start:#x}). This is the length "
                 f"that is checked against -- not the gross size from sysfs "
-                f"({window.groesse} bytes), of which RM helps itself first."
+                f"({window.size} bytes), of which RM helps itself first."
             )
 
-        seite = mmap.PAGESIZE
-        m_versatz = (versatz // seite) * seite
-        vorlauf = versatz - m_versatz
-        m_laenge = length + vorlauf
-        res = f"/sys/bus/pci/devices/{ziel_bdf}/resource1_wc"
+        page = mmap.PAGESIZE
+        m_offset = (offset // page) * page
+        lead_in = offset - m_offset
+        m_length = length + lead_in
+        res = f"/sys/bus/pci/devices/{dst_bdf}/resource1_wc"
         try:
             res_fd = os.open(res, os.O_RDWR | os.O_SYNC)
         except OSError as e:
-            self._halter.release(handle_)
+            self._holder.release(handle_)
             raise Bar1Unavailable(
                 f"{res} could not be opened ({e}). Without a "
                 f"write-combining aperture there is no direct path."
@@ -2198,28 +2213,28 @@ class BarlinkBar1Transport:
         try:
             # ONLY the needed slice: an mmap over a 32-GiB window fails with
             # EINVAL (measured on the 5090).
-            abb = mmap.mmap(res_fd, m_laenge, mmap.MAP_SHARED,
-                            mmap.PROT_READ | mmap.PROT_WRITE, offset=m_versatz)
+            mapped = mmap.mmap(res_fd, m_length, mmap.MAP_SHARED,
+                            mmap.PROT_READ | mmap.PROT_WRITE, offset=m_offset)
         except (OSError, ValueError) as e:
-            self._halter.release(handle_)
+            self._holder.release(handle_)
             raise Bar1Unavailable(
-                f"mmap({res}, length={m_laenge}, offset={m_versatz:#x}) "
+                f"mmap({res}, length={m_length}, offset={m_offset:#x}) "
                 f"failed: {e}"
             ) from e
         finally:
             os.close(res_fd)
 
-        host = ctypes.addressof(ctypes.c_char.from_buffer(abb)) + vorlauf
+        host = ctypes.addressof(ctypes.c_char.from_buffer(mapped)) + lead_in
         try:
-            self._cuda.register_io(host - vorlauf, m_laenge)
+            self._cuda.register_io(host - lead_in, m_length)
         except Bar1Unavailable as e:
-            abb.close()
-            self._halter.release(handle_)
+            mapped.close()
+            self._holder.release(handle_)
             ps = self.patch_state()
-            if not ps["smallbar_p2p_peerbar1"]:
-                grund = (
+            if not ps["peer_bar1_regkey"]:
+                reason = (
                     f"This is the expected outcome WITHOUT the widened "
-                    f"guard: the reg key RMSmallBarP2PPeerBar1 defaults to "
+                    f"guard: the reg key {PEER_BAR1_REGKEYS[0]} defaults to "
                     f"0 and must be set via NVreg_RegistryDwords. "
                     f"Found: {ps['regkeys'] or '<empty>'}."
                 )
@@ -2235,7 +2250,7 @@ class BarlinkBar1Transport:
                 # NOT have CAP_SYS_ADMIN in the default set -- the call then
                 # fails as NV_ERR_INSUFFICIENT_PERMISSIONS, which arrives
                 # here as cudaError 800 (cudaErrorNotPermitted).
-                grund = (
+                reason = (
                     f"The reg key is set ({ps['regkeys']}), so it is not the "
                     f"range guard. Next suspect, in this order: (1) "
                     f"CAP_SYS_ADMIN is missing from the process -- "
@@ -2252,19 +2267,19 @@ class BarlinkBar1Transport:
                 )
             raise Bar1Unavailable(
                 f"cudaHostRegister(IoMemory) on the {kind} region of rank "
-                f"{peer} ({ziel_bdf}) failed: {e}. {grund} "
+                f"{peer} ({dst_bdf}) failed: {e}. {reason} "
                 f"The transport withdraws, it does not force anything."
             ) from e
-        dev = self._cuda.dev_ptr(host - vorlauf)
+        dev = self._cuda.dev_ptr(host - lead_in)
         return Mapping(
-            bar1_basis=window.basis, bar1_versatz=versatz, length=length,
-            mmap_obj=abb, reg_adresse=host - vorlauf, host_adresse=host,
-            dev_ptr=dev + vorlauf, halter_handle=handle_,
+            bar1_base=window.base, bar1_offset=offset, length=length,
+            mmap_obj=mapped, reg_address=host - lead_in, host_address=host,
+            dev_ptr=dev + lead_in, holder_handle=handle_,
         )
 
     # -- Window computation --------------------------------------------------
 
-    def check_window_requirement(self, algorithmus: str, nbytes: int) -> None:
+    def check_window_requirement(self, algorithm: str, nbytes: int) -> None:
         """Requirement against what could ACTUALLY be exported.
 
         Not against the gross size from sysfs: the 3080s report 256 MiB
@@ -2272,16 +2287,16 @@ class BarlinkBar1Transport:
         is unmeasured -- RM reserves part of it for itself. What governs is
         the length the holder actually mapped contiguously per peer.
         """
-        noetig = window_requirement(algorithmus, nbytes, self.welt)
+        needed = window_requirement(algorithm, nbytes, self.world)
         for peer, z in sorted(self._peers.items()):
-            brutto = bar1_window(z.bdf).groesse
-            if noetig > z.nutz.length:
+            gross = bar1_window(z.bdf).size
+            if needed > z.payload.length:
                 raise Bar1Unavailable(
-                    f"Window too small for '{algorithmus}' at "
-                    f"{nbytes // 1024} KiB and {self.welt} ranks: needed "
-                    f"{noetig // 1024} KiB, but only {z.nutz.length // 1024} "
+                    f"Window too small for '{algorithm}' at "
+                    f"{nbytes // 1024} KiB and {self.world} ranks: needed "
+                    f"{needed // 1024} KiB, but only {z.payload.length // 1024} "
                     f"KiB mapped at rank {peer} ({z.bdf}) (BAR1 gross "
-                    f"{brutto // 2**20} MiB). Either chunk smaller or "
+                    f"{gross // 2**20} MiB). Either chunk smaller or "
                     f"exclude this edge. Mesh and ring BOTH need 2(R-1) "
                     f"slots -- the ring is no way out here."
                 )
@@ -2290,16 +2305,16 @@ class BarlinkBar1Transport:
         """Smallest actually mapped payload region in the GROUP.
 
         This is the number that belongs in the planner as
-        ``fenster_bytes``: a **capability**, determined from what the
+        ``window_bytes``: a **capability**, determined from what the
         holder actually mapped contiguously per peer, minimized across all
         ranks. A value that differs per rank would yield a different plan
         per rank, and the collectives' SPMD assumption depends on that not
         happening.
         """
-        return self._fenster_minimum
+        return self._window_minimum
 
     def algorithm_for(self, nbytes: int) -> str:
-        """``mesh``, ``netz_pipe``, or ``ring`` for this size.
+        """``mesh``, ``mesh_pipe``, or ``ring`` for this size.
 
         The plan from ``barlink_matrix.py`` takes precedence if one was
         passed in (``set_plan``). It is group-wide identical -- checked via
@@ -2313,21 +2328,21 @@ class BarlinkBar1Transport:
         clean threshold -- the planner should measure this, not hard-code
         it".
 
-        **THE ONE PLACE where netz_pipe is chosen.** The planner does not
-        know ``netz_pipe`` and should not, for now: its cost models are
+        **THE ONE PLACE where mesh_pipe is chosen.** The planner does not
+        know ``mesh_pipe`` and should not, for now: its cost models are
         calibrated against the two measured topologies. As long as
         ``SGLANG_BARLINK_BAR1_PIPE`` is off -- and that is the default --
         this method gives byte-for-byte the same answer as before.
         """
         if self._plan is not None:
             a = self._plan.algorithm_for(nbytes)
-            # 'star' and 'hierarchisch' are not ported here; they never
+            # 'star' and 'hierarchical' are not ported here; they never
             # reach this point via handles() in the first place.
         else:
-            a = "ring" if nbytes >= self.ring_ab else "mesh"
-        if (self.pipe_an and a == "mesh" and nbytes >= self.pipe_ab
+            a = "ring" if nbytes >= self.ring_from else "mesh"
+        if (self.pipe_on and a == "mesh" and nbytes >= self.pipe_from
                 and self._pipe_k(nbytes) is not None):
-            return "netz_pipe"
+            return "mesh_pipe"
         return a
 
     def set_plan(self, plan) -> None:
@@ -2353,95 +2368,95 @@ class BarlinkBar1Transport:
         import torch.distributed as dist
 
         assert self._cuda is not None
-        n = min(probe_bytes, self._eigen[2])
-        ergebnis: dict[tuple[int, int], bool] = {}
-        rueck = torch.empty(n, dtype=torch.uint8, pin_memory=True)
-        for source in range(self.welt):
-            for ziel in range(self.welt):
-                if source == ziel:
+        n = min(probe_bytes, self._own[2])
+        result: dict[tuple[int, int], bool] = {}
+        back = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+        for source in range(self.world):
+            for dst in range(self.world):
+                if source == dst:
                     continue
-                marke = (source * 251 + ziel * 37 + 1) & 0xFF
-                paar = f"{source}->{ziel}"
+                marker = (source * 251 + dst * 37 + 1) & 0xFF
+                pair_name = f"{source}->{dst}"
                 bounded_barrier(
                     self.cpu_group,
-                    f"bar1 byte proof {paar}: before clearing",
+                    f"bar1 byte proof {pair_name}: before clearing",
                     table=self._peer_table,
                 )
-                if self.rank == ziel:
+                if self.rank == dst:
                     # Clear the destination first, so a buffer that was NOT
                     # written does not accidentally look like a hit.
-                    leer = torch.full((n,), (marke ^ 0xFF) & 0xFF,
+                    blank = torch.full((n,), (marker ^ 0xFF) & 0xFF,
                                       dtype=torch.uint8, pin_memory=True)
-                    self._cuda.memcpy(self._eigen[0], leer.data_ptr(), n)
+                    self._cuda.memcpy(self._own[0], blank.data_ptr(), n)
                 bounded_barrier(
                     self.cpu_group,
-                    f"bar1 byte proof {paar}: destination cleared",
+                    f"bar1 byte proof {pair_name}: destination cleared",
                     table=self._peer_table,
                 )
                 if self.rank == source:
-                    muster = torch.full((n,), marke, dtype=torch.uint8,
+                    pattern = torch.full((n,), marker, dtype=torch.uint8,
                                         device=self.device)
-                    self.put(ziel, muster.data_ptr(), n, 0)
+                    self.put(dst, pattern.data_ptr(), n, 0)
                     bounded_device_sync(
-                        f"bar1 byte proof {paar}: pattern written",
+                        f"bar1 byte proof {pair_name}: pattern written",
                         device=self.device,
                         table=self._peer_table,
                     )
                 bounded_barrier(
                     self.cpu_group,
-                    f"bar1 byte proof {paar}: pattern in place",
+                    f"bar1 byte proof {pair_name}: pattern in place",
                     table=self._peer_table,
                 )
                 ok = True
-                if self.rank == ziel:
-                    self._cuda.memcpy(rueck.data_ptr(), self._eigen[0], n)
-                    schlecht = int((rueck != marke).sum().item())
-                    ok = schlecht == 0
+                if self.rank == dst:
+                    self._cuda.memcpy(back.data_ptr(), self._own[0], n)
+                    bad = int((back != marker).sum().item())
+                    ok = bad == 0
                     if ok:
                         # The passed proof belongs in the log too: "0 of N
                         # bytes wrong" is the statement every later timing
                         # measurement rests on.
                         logger.info(
                             "barlink-BAR1: byte-level proof %d->%d passed: 0 "
-                            "of %d bytes wrong.", source, ziel, n,
+                            "of %d bytes wrong.", source, dst, n,
                         )
                     else:
                         logger.warning(
                             "barlink-BAR1: byte-level proof %d->%d FAILED: %d "
                             "of %d bytes wrong. This edge is struck, "
                             "regardless of what the driver reports.",
-                            source, ziel, schlecht, n,
+                            source, dst, bad, n,
                         )
-                traeger: list[object] = [ok if self.rank == ziel else None]
+                carrier: list[object] = [ok if self.rank == dst else None]
                 check_peers(
-                    f"bar1 byte proof {paar}: verdict broadcast",
+                    f"bar1 byte proof {pair_name}: verdict broadcast",
                     self._peer_table,
                 )
                 dist.broadcast_object_list(
-                    traeger, src=dist.get_global_rank(self.cpu_group, ziel),
+                    carrier, src=dist.get_global_rank(self.cpu_group, dst),
                     group=self.cpu_group,
                 )
-                ergebnis[(source, ziel)] = bool(traeger[0])
-        for (q, z), ok in ergebnis.items():
+                result[(source, dst)] = bool(carrier[0])
+        for (q, z), ok in result.items():
             if q == self.rank and z in self._peers:
                 self._peers[z].byte_proof = ok
-        # ONE answer, group-wide. `ergebnis` is identical on every rank
+        # ONE answer, group-wide. `result` is identical on every rank
         # (every entry was distributed from the destination), so this is
         # also rank-uniform -- exactly what `handles` needs.
-        self._belege_stehen = all(ergebnis.values())
-        if not self._belege_stehen:
-            gefallen = sorted(k for k, v in ergebnis.items() if not v)
+        self._proofs_hold = all(result.values())
+        if not self._proofs_hold:
+            failed = sorted(k for k, v in result.items() if not v)
             logger.warning(
                 "barlink-BAR1: byte-level proof failed for %s. The "
                 "collectives withdraw (handles -> False); a collective over "
                 "an edge that loses bytes would not be a collective.",
-                gefallen,
+                failed,
             )
-        return ergebnis
+        return result
 
     # -- Data path -------------------------------------------------------
 
-    def put(self, ziel: int, quell_ptr: int, nbytes: int, versatz: int = 0,
+    def put(self, dst: int, source_ptr: int, nbytes: int, offset: int = 0,
             stream: Optional[int] = None) -> None:
         """A write into the destination card's BAR. Posted, hence fast.
 
@@ -2450,14 +2465,14 @@ class BarlinkBar1Transport:
         versus 3254 MB/s in). Hence the rule "everyone pushes for
         themselves".
         """
-        if not self._auf:
+        if not self._up:
             raise Bar1Unavailable("transport not set up")
-        z = self._peers.get(ziel)
+        z = self._peers.get(dst)
         if z is None:
-            raise Bar1Unavailable(f"no peer target for rank {ziel}")
-        if versatz + nbytes > z.length:
+            raise Bar1Unavailable(f"no peer target for rank {dst}")
+        if offset + nbytes > z.length:
             raise Bar1Unavailable(
-                f"put({ziel}): {versatz}+{nbytes} exceeds the mapped "
+                f"put({dst}): {offset}+{nbytes} exceeds the mapped "
                 f"window of {z.length} bytes. The caller must chunk; "
                 f"automatic re-mapping on the hot path is excluded -- it is "
                 f"exactly the expensive part."
@@ -2467,21 +2482,21 @@ class BarlinkBar1Transport:
             import torch
 
             stream = torch.cuda.current_stream(self.device).cuda_stream
-        self._cuda.memcpy_async(z.dev_ptr + versatz, quell_ptr, nbytes, stream)
+        self._cuda.memcpy_async(z.dev_ptr + offset, source_ptr, nbytes, stream)
 
     # -- Measurement probe for barlink_matrix -------------------------------
 
     def name(self) -> str:
         return "bar1"
 
-    def self_load(self, nbytes: int, richtung: str) -> float:
+    def self_load(self, nbytes: int, direction: str) -> float:
         from sglang.srt.distributed.device_communicators.barlink_matrix import (
             SelfLoadSensor,
         )
 
-        if getattr(self, "_eigen_fuehler", None) is None:
-            self._eigen_fuehler = SelfLoadSensor(self.device, max_bytes=4 << 20)
-        return self._eigen_fuehler.self_load(nbytes, richtung)
+        if getattr(self, "_own_sensor", None) is None:
+            self._own_sensor = SelfLoadSensor(self.device, max_bytes=4 << 20)
+        return self._own_sensor.self_load(nbytes, direction)
 
     def self_load_duplex(self, nbytes: int) -> Optional[float]:
         """Deliberately ``None``.
@@ -2494,49 +2509,49 @@ class BarlinkBar1Transport:
         """
         return None
 
-    def pair(self, ziel: int, nbytes: int) -> Optional[float]:
+    def pair(self, dst: int, nbytes: int) -> Optional[float]:
         """Directed edge GB/s -- only if the byte-level proof holds."""
         import torch
 
-        if not self._auf:
+        if not self._up:
             return None
-        if ziel < 0:                       # planner's capability query
+        if dst < 0:                       # planner's capability query
             return 0.0 if self._peers else None
-        z = self._peers.get(ziel)
+        z = self._peers.get(dst)
         if z is None or not z.byte_proof:
             return None
         n = min(nbytes, z.length)
         source = torch.empty(n, dtype=torch.uint8, device=self.device)
         for _ in range(8):
-            self.put(ziel, source.data_ptr(), n, 0)
+            self.put(dst, source.data_ptr(), n, 0)
         bounded_device_sync(
-            f"bar1 pair probe {self.rank}->{ziel}: warm-up",
+            f"bar1 pair probe {self.rank}->{dst}: warm-up",
             device=self.device,
             table=self._peer_table,
         )
-        runden = 64 if n <= 65536 else 16
+        rounds = 64 if n <= 65536 else 16
         t0 = time.perf_counter()
-        for _ in range(runden):
-            self.put(ziel, source.data_ptr(), n, 0)
+        for _ in range(rounds):
+            self.put(dst, source.data_ptr(), n, 0)
         # Inside the timed section, so NOT bounded_device_sync: that one naps
         # up to 50 ms between polls, and a 150 ms transfer would report a
         # third less bandwidth than it delivers. Spinning on the bare event
         # predicate keeps the number honest and still ends on a dead peer.
         # With the feature off this is the plain synchronize it always was.
         if barlink_liveness.liveness_enabled():
-            marke = f"bar1 pair probe {self.rank}->{ziel}: timed writes"
-            ereignis = torch.cuda.Event()
-            ereignis.record(torch.cuda.current_stream(self.device))
+            marker = f"bar1 pair probe {self.rank}->{dst}: timed writes"
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
             barlink_liveness.bounded_poll(
-                ereignis.query,
-                marke,
+                event.query,
+                marker,
                 table=self._peer_table,
                 sleep=False,
-                on_abort=self._wait_abort(marke),
+                on_abort=self._wait_abort(marker),
             )
         torch.cuda.synchronize(self.device)
         dt = time.perf_counter() - t0
-        return (runden * n) / dt / 1e9 if dt > 0 else 0.0
+        return (rounds * n) / dt / 1e9 if dt > 0 else 0.0
 
     def pair_receive(self, source: int, nbytes: int) -> None:
         """Nothing to do -- the writes are one-sided.
@@ -2553,8 +2568,8 @@ class BarlinkBar1Transport:
         """``True`` only if the path can really carry this operation.
 
         Every condition is **rank-uniform**: it depends only on group-wide
-        reconciled sizes (``_belege_stehen`` comes from a distribution per
-        directed pair, ``_fenster_minimum`` and ``max_bytes`` from an
+        reconciled sizes (``_proofs_hold`` comes from a distribution per
+        directed pair, ``_window_minimum`` and ``max_bytes`` from an
         ``all_gather``, the thresholds from rank-uniform environment
         variables). Two ranks must never answer differently here -- one
         would run into the collective and the other would not, and the
@@ -2566,9 +2581,9 @@ class BarlinkBar1Transport:
         """
         if op not in self.BARLINK_OPS:
             return False
-        if not self._auf or self._ext is None:
+        if not self._up or self._ext is None:
             return False
-        if not self._belege_stehen:
+        if not self._proofs_hold:
             return False
         if op in ("all_to_all", "all_to_all_single"):
             return self._handles_a2a(nbytes)
@@ -2582,7 +2597,7 @@ class BarlinkBar1Transport:
         """``all_reduce``, now decomposed into rounds instead of using a cap.
 
         What changed and why: up to here, this answer ended in False at
-        ``groesster_chunk > chunk_max``, and the payload fell back to the
+        ``largest_chunk > chunk_max``, and the payload fell back to the
         base transport. The tipping point in the standard run is 2456
         tokens per batch -- ``chunked_prefill_size`` 4096 or 8192, both
         common in sglang, would have turned off the direct path during
@@ -2600,7 +2615,7 @@ class BarlinkBar1Transport:
             # unmeasured path in the kernel. The extension insists on this
             # (TORCH_CHECK in the host), this is not a caution rule here.
             return False
-        if nbytes // 16 < self.welt:
+        if nbytes // 16 < self.world:
             # Fewer than one packet per rank -- the chunk decomposition
             # would leave ranks empty-handed, and the host rejects it.
             return False
@@ -2609,13 +2624,13 @@ class BarlinkBar1Transport:
             return False
         # The round limit replaces the old size cap. It is not a window
         # limit but a limit on kernel launches.
-        runden = ar_plan(nbytes, chunk_max, self.welt)
-        if len(runden) > self.ar_max_runden:
+        rounds = ar_plan(nbytes, chunk_max, self.world)
+        if len(rounds) > self.ar_max_rounds:
             return False
         # The LARGEST round is checked. It is the only one that could
         # fail -- and it is the same group-wide.
-        groesste = max(length for _, length in runden)
-        if groesste > self.max_bytes:
+        largest_round = max(length for _, length in rounds)
+        if largest_round > self.max_bytes:
             return False
         # Does the LARGEST chunk of ONE ROUND fit into a slot? This is the
         # condition the mapping actually depends on -- checked, not
@@ -2623,18 +2638,18 @@ class BarlinkBar1Transport:
         # second time, there with its own chunk bounds rather than this
         # formula: a seam checked on both sides with the same wrong formula
         # would not stand out.
-        groesster_chunk = -(-(groesste // 16) // self.welt) * 16
-        if groesster_chunk > chunk_max:
+        largest_chunk = -(-(largest_round // 16) // self.world) * 16
+        if largest_chunk > chunk_max:
             return False
         # The algorithm is decided PER ROUND, so it is checked per round.
         # For a single round, this is byte-for-byte the old question.
-        for _, length in runden:
+        for _, length in rounds:
             algo = self.algorithm_for(length)
-            if algo not in ("mesh", "netz_pipe", "ring"):
-                # 'star' and 'hierarchisch' are not ported here. No silent
+            if algo not in ("mesh", "mesh_pipe", "ring"):
+                # 'star' and 'hierarchical' are not ported here. No silent
                 # fallback to 'mesh'.
                 return False
-            if algo == "netz_pipe" and not self._pipe_supports(length):
+            if algo == "mesh_pipe" and not self._pipe_supports(length):
                 return False
             # And the same requirement again, in the planner's currency,
             # against the group-wide SMALLEST actually mapped length.
@@ -2642,7 +2657,7 @@ class BarlinkBar1Transport:
             # exactly for that reason cheap: this line catches anyone who
             # touches the region size without carrying the window concept
             # along.
-            if window_requirement(algo, length, self.welt) > self._fenster_minimum:
+            if window_requirement(algo, length, self.world) > self._window_minimum:
                 return False
         return True
 
@@ -2651,7 +2666,7 @@ class BarlinkBar1Transport:
         chunk_max = int(self._geo.get("chunk_max", 0))
         if chunk_max < 16 or nbytes <= 0 or nbytes % 16:
             return 0
-        return len(ar_plan(nbytes, chunk_max, self.welt))
+        return len(ar_plan(nbytes, chunk_max, self.world))
 
     def why_not(self, op: str, nbytes: int) -> str:
         """Why ``handles`` says False for this size -- in words.
@@ -2668,69 +2683,69 @@ class BarlinkBar1Transport:
         """
         if op not in self.BARLINK_OPS:
             return f"{op} is not in BARLINK_OPS"
-        if not self._auf or self._ext is None:
+        if not self._up or self._ext is None:
             return "the direct path is not set up"
-        if not self._belege_stehen:
+        if not self._proofs_hold:
             return "the byte-level proof per pair does not hold"
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        slot = int(self._geo.get("a2a_slot", 0))
         chunk_max = int(self._geo.get("chunk_max", 0))
         if op in ("all_to_all", "all_to_all_single"):
-            if not self.a2a_an:
+            if not self.a2a_on:
                 return "all_to_all is disabled via SGLANG_BARLINK_BAR1_A2A=0"
-            if not self._a2a_beleg:
+            if not self._a2a_proof:
                 return "the a2a byte-level proof does not hold"
             if nbytes < self.a2a_min_bytes:
                 return f"{nbytes} bytes are below a2a_min_bytes ({self.a2a_min_bytes})"
-            n = a2a_rounds(-(-nbytes // self.welt), slot) if slot else 0
-            if n > self.a2a_max_runden:
+            n = a2a_rounds(-(-nbytes // self.world), slot) if slot else 0
+            if n > self.a2a_max_rounds:
                 return (f"would need {n} rounds at a {slot}-byte slot, "
-                        f"{self.a2a_max_runden} are allowed")
+                        f"{self.a2a_max_rounds} are allowed")
         elif op == "all_gather":
-            if not self.ag_an:
+            if not self.ag_on:
                 return "all_gather is disabled via SGLANG_BARLINK_BAR1_AG=0"
-            if not self._a2a_beleg:
+            if not self._a2a_proof:
                 return "the a2a byte-level proof does not hold (all_gather rides on it)"
             if nbytes < self.ag_min_bytes:
                 return f"{nbytes} bytes are below ag_min_bytes ({self.ag_min_bytes})"
-            if slot and -(-nbytes // slot) > self.ag_max_runden:
+            if slot and -(-nbytes // slot) > self.ag_max_rounds:
                 return (f"would need {-(-nbytes // slot)} rounds at a "
-                        f"{slot}-byte slot, {self.ag_max_runden} are allowed")
+                        f"{slot}-byte slot, {self.ag_max_rounds} are allowed")
         elif op == "broadcast":
-            if not self.bc_an:
+            if not self.bc_on:
                 return "broadcast is disabled via SGLANG_BARLINK_BAR1_BC=0"
-            if not self._bc_beleg:
+            if not self._bc_proof:
                 return "the broadcast byte-level proof does not hold"
             if nbytes < self.bc_min_bytes:
                 return f"{nbytes} bytes are below bc_min_bytes ({self.bc_min_bytes})"
-            if slot and -(-nbytes // slot) > self.bc_max_runden:
+            if slot and -(-nbytes // slot) > self.bc_max_rounds:
                 return (f"would need {-(-nbytes // slot)} rounds at a "
-                        f"{slot}-byte slot, {self.bc_max_runden} are allowed")
+                        f"{slot}-byte slot, {self.bc_max_rounds} are allowed")
         else:
             if nbytes < self.min_bytes:
                 return f"{nbytes} bytes are below min_bytes ({self.min_bytes})"
             if nbytes % 16:
                 return (f"{nbytes} bytes are not a multiple of 16 -- the "
                         f"kernel's access width is 128 bits")
-            if nbytes // 16 < self.welt:
+            if nbytes // 16 < self.world:
                 return (f"{nbytes} bytes are fewer than one 128-bit packet "
-                        f"per rank ({self.welt})")
+                        f"per rank ({self.world})")
             if chunk_max >= 16:
-                n = len(ar_plan(nbytes, chunk_max, self.welt))
-                if n > self.ar_max_runden:
+                n = len(ar_plan(nbytes, chunk_max, self.world))
+                if n > self.ar_max_rounds:
                     return (f"would need {n} rounds at a chunk bound of "
-                            f"{chunk_max} bytes, {self.ar_max_runden} are "
+                            f"{chunk_max} bytes, {self.ar_max_rounds} are "
                             f"allowed")
-        if self._geo.get("region_bytes", 0) > self._fenster_minimum:
+        if self._geo.get("region_bytes", 0) > self._window_minimum:
             return (f"the region ({self._geo.get('region_bytes')} bytes) does "
                     f"not fit into the group-wide smallest mapped window "
-                    f"({self._fenster_minimum} bytes)")
+                    f"({self._window_minimum} bytes)")
         return ""
 
-    def _kernel(self, bewegt: int, schwelle: int, wo: str) -> int:
+    def _kernel(self, moved: int, threshold: int, where: str) -> int:
         """``1`` = cooperative multi-block launch (``grid``), ``0`` = ``1blk``.
 
         **The one place where this choice is made** -- previously, each of
-        the three collectives computed `bewegt >= schwelle` for itself, and
+        the three collectives computed `moved >= threshold` for itself, and
         a capture rule could have been added at three places and forgotten
         at one of them.
 
@@ -2745,9 +2760,9 @@ class BarlinkBar1Transport:
         kernel variant -- one rank in the collective, the other not, i.e. a
         hang.
         """
-        if bewegt < schwelle:
+        if moved < threshold:
             return 0
-        if self.graph_gitter:
+        if self.graph_grid:
             return 1
         from sglang.srt.distributed.device_communicators.barlink import (
             graph_capture_running,
@@ -2755,8 +2770,8 @@ class BarlinkBar1Transport:
 
         if not graph_capture_running():
             return 1
-        if not self._graph_gitter_gemeldet:
-            self._graph_gitter_gemeldet = True
+        if not self._graph_grid_reported:
+            self._graph_grid_reported = True
             logger.warning(
                 "barlink-BAR1: %s with %d bytes would be above the grid "
                 "threshold (%d bytes), but is placed on the 1blk variant "
@@ -2769,7 +2784,7 @@ class BarlinkBar1Transport:
                 "rig (benchmark/bar1_graph_check.py, case 'grid'); with the "
                 "release set, the restriction drops away on its own. This "
                 "notice appears once per rank.",
-                wo, bewegt, schwelle,
+                where, moved, threshold,
             )
         return 0
 
@@ -2783,7 +2798,7 @@ class BarlinkBar1Transport:
         """
         import torch
 
-        if not self._auf or self._ext is None:
+        if not self._up or self._ext is None:
             raise Bar1Unavailable(
                 "barlink_all_reduce without a transport set up -- reachable "
                 "only if someone bypassed handles()."
@@ -2791,7 +2806,7 @@ class BarlinkBar1Transport:
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
         chunk_max = int(self._geo.get("chunk_max", 0))
-        plan = ar_plan(nbytes, chunk_max, self.welt) if chunk_max >= 16 else []
+        plan = ar_plan(nbytes, chunk_max, self.world) if chunk_max >= 16 else []
         if len(plan) > 1:
             # MULTIPLE ROUNDS. Each is a complete all_reduce over a slice --
             # no new kernel, no different decomposition, just fewer bytes
@@ -2800,18 +2815,18 @@ class BarlinkBar1Transport:
             # a captured shape.
             #
             # The slices are views into the flat buffer, not copies:
-            # `versatz` and `length` are multiples of 16, so every view
+            # `offset` and `length` are multiples of 16, so every view
             # stays 16-byte-aligned, which the host insists on.
-            ergebnis = torch.empty_like(inp)
-            flach_ein = inp.view(-1)
-            flach_aus = ergebnis.view(-1)
+            result = torch.empty_like(inp)
+            flat_in = inp.view(-1)
+            flat_out = result.view(-1)
             eg = inp.element_size()
-            for versatz, length in plan:
-                teil = self._all_reduce_one_round(
-                    flach_ein[versatz // eg:(versatz + length) // eg]
+            for offset, length in plan:
+                part = self._all_reduce_one_round(
+                    flat_in[offset // eg:(offset + length) // eg]
                 )
-                flach_aus[versatz // eg:(versatz + length) // eg].copy_(teil)
-            return ergebnis
+                flat_out[offset // eg:(offset + length) // eg].copy_(part)
+            return result
         return self._all_reduce_one_round(inp)
 
     def _all_reduce_one_round(self, inp):
@@ -2827,11 +2842,11 @@ class BarlinkBar1Transport:
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
         algo = self.algorithm_for(nbytes)
-        if algo == "netz_pipe":
+        if algo == "mesh_pipe":
             k = self._pipe_k(nbytes)
             if k is None:
                 raise Bar1Unavailable(
-                    "netz_pipe without a matching chunk count -- reachable "
+                    "mesh_pipe without a matching chunk count -- reachable "
                     "only if someone bypassed handles()."
                 )
             return self._pipe_all_reduce(inp, k)
@@ -2840,29 +2855,29 @@ class BarlinkBar1Transport:
         # measured (it wins from 4 MiB up), but it is a number from ONE
         # rig -- hence it lives in an environment variable. Under graph
         # capture, `_kernel` additionally decides.
-        kern = self._kernel(nbytes, self.gitter_ab, "all_reduce")
-        peer_nutz = [0] * self.welt
-        peer_flag = [0] * self.welt
+        kernel_variant = self._kernel(nbytes, self.grid_from, "all_reduce")
+        peer_payload = [0] * self.world
+        peer_flag = [0] * self.world
         for r, z in self._peers.items():
-            peer_nutz[r] = z.nutz.dev_ptr
+            peer_payload[r] = z.payload.dev_ptr
             peer_flag[r] = z.flag.dev_ptr
-        peer_nutz[self.rank] = self._eigen[0]
-        peer_flag[self.rank] = self._eigen_flag[0]
+        peer_payload[self.rank] = self._own[0]
+        peer_flag[self.rank] = self._own_flag[0]
         self._ext.bar1_all_reduce(
-            inp, out, int(self.rank), int(self.welt),
+            inp, out, int(self.rank), int(self.world),
             0 if algo == "mesh" else 1,
-            peer_nutz, peer_flag,
-            int(self._eigen[0]), int(self._eigen_flag[0]),
-            int(self._geo["chunk_max"]), int(self._geo["off_netz"]),
+            peer_payload, peer_flag,
+            int(self._own[0]), int(self._own_flag[0]),
+            int(self._geo["chunk_max"]), int(self._geo["off_mesh"]),
             int(self._geo["off_ring"]),
-            self._runde_dev, self._ctl_dev,
-            int(self.deckel_zyklen), int(self.threads), int(kern),
-            int(self.ladeform), int(self.fluss),
-            int(self._abbruch_wirt),
+            self._round_dev, self._ctl_dev,
+            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            int(self.load_shape), int(self.read_flush),
+            int(self._abort_host),
         )
         return out
 
-    # -- netz_pipe ---------------------------------------------------------
+    # -- mesh_pipe ---------------------------------------------------------
     #
     # Everything beyond the choice itself lives in barlink_bar1_pipe_ext: the
     # kernel, the slot and counter geometry, the chunk planning, and the
@@ -2882,40 +2897,40 @@ class BarlinkBar1Transport:
         path. ``handles`` and ``barlink_all_reduce`` ask per collective; the
         sizes repeat.
         """
-        if not self.pipe_an or self._pipe_ext is None:
+        if not self.pipe_on or self._pipe_ext is None:
             return None
         if self._geo.get("off_pipe", -1) < 0:
             return None
-        merk = getattr(self, "_pipe_k_merk", None)
-        if merk is None:
-            merk = {}
-            self._pipe_k_merk = merk
-        if nbytes in merk:
-            return merk[nbytes]
+        memo = getattr(self, "_pipe_k_memo", None)
+        if memo is None:
+            memo = {}
+            self._pipe_k_memo = memo
+        if nbytes in memo:
+            return memo[nbytes]
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
             pipe_plan,
         )
 
         k = pipe_plan(
-            int(nbytes), int(self.welt), int(self.pipe_schlitz),
+            int(nbytes), int(self.world), int(self.pipe_slot),
             int(self.pipe_t), int(self.pipe_k), int(self.pipe_chunk_bytes),
             int(self.pipe_k_max),
         )
-        merk[nbytes] = k
+        memo[nbytes] = k
         return k
 
     def _pipe_supports(self, nbytes: int) -> bool:
-        """Window limit for ``netz_pipe`` -- computed, not assumed.
+        """Window limit for ``mesh_pipe`` -- computed, not assumed.
 
         The requirement is ``2 T (R-1)`` slots of ``chunk_max/T`` each,
         computed in ``pipe_window_requirement``. Checked against the
-        group-wide SMALLEST **actually mapped** length (``_fenster_minimum``),
+        group-wide SMALLEST **actually mapped** length (``_window_minimum``),
         not against the gross size from sysfs and not against the requested
         region: what governs is what the holder actually found mapped
         contiguously in BAR1 per peer. If it does not fit, this path
         withdraws via ``handles``.
         """
-        if not self._pipe_beleg:
+        if not self._pipe_proof:
             return False
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
             result_ring_bytes,
@@ -2925,17 +2940,17 @@ class BarlinkBar1Transport:
         off = int(self._geo.get("off_pipe", -1))
         if off < 0:
             return False
-        noetig = off + pipe_window_requirement(
-            self.welt, int(self.pipe_t), int(self.pipe_schlitz)
+        needed = off + pipe_window_requirement(
+            self.world, int(self.pipe_t), int(self.pipe_slot)
         )
-        # And the result ring on top: L * roundup(max_bytes, SEITE). It sits
+        # And the result ring on top: L * roundup(max_bytes, PAGE_SIZE). It sits
         # BEHIND the slots, so the requirement is the ring's offset plus its
         # length -- not the maximum of the two.
-        if int(self._geo.get("off_erg", -1)) >= 0:
-            noetig = max(noetig, int(self._geo["off_erg"]) + result_ring_bytes(
-                int(self.max_bytes), int(self._geo["erg_ring"])
+        if int(self._geo.get("off_result", -1)) >= 0:
+            needed = max(needed, int(self._geo["off_result"]) + result_ring_bytes(
+                int(self.max_bytes), int(self._geo["result_ring"])
             ))
-        return noetig <= self._fenster_minimum
+        return needed <= self._window_minimum
 
     def result_window(self) -> Optional[tuple[int, int]]:
         """``(start, length)`` of the result ring within the caller's own window.
@@ -2949,25 +2964,25 @@ class BarlinkBar1Transport:
         ``None`` means: there is no result ring, so no call could have run
         in direct mode.
         """
-        off = int(self._geo.get("off_erg", -1)) if self._geo else -1
-        if off < 0 or not self._eigen[0]:
+        off = int(self._geo.get("off_result", -1)) if self._geo else -1
+        if off < 0 or not self._own[0]:
             return None
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (  # noqa: E501
             result_ring_bytes,
         )
 
         length = result_ring_bytes(int(self.max_bytes),
-                                int(self._geo["erg_ring"]))
-        return int(self._eigen[0]) + off, int(length)
+                                int(self._geo["result_ring"]))
+        return int(self._own[0]) + off, int(length)
 
     def _result_slot(self, inp):
         """Result buffer and ownership info -- or ``None``.
 
-        Returns ``(tensor, platz, slack)``:
+        Returns ``(tensor, slot, slack)``:
 
         ``tensor``  the result buffer, a tensor OVER the window,
-        ``platz``   its ring slot -- the caller needs it to build the
-                    ``peer_erg`` table,
+        ``slot``   its ring slot -- the caller needs it to build the
+                    ``peer_result`` table,
         ``slack``   after how many generations this slot is overwritten
                     again; ``0`` means "handshake off".
 
@@ -2999,13 +3014,13 @@ class BarlinkBar1Transport:
         """
         import weakref
 
-        if not self.pipe_direkt or self._geo.get("off_erg", -1) < 0:
+        if not self.pipe_direct or self._geo.get("off_result", -1) < 0:
             return None
         # -- Capture -------------------------------------------------------
         #
         # This method is HOST CODE. It runs exactly once during capture and
         # never again on replay. The chosen ring slot, the pointer computed
-        # from it, and the kernel's `peer_erg` table get baked into the
+        # from it, and the kernel's `peer_result` table get baked into the
         # graph. This has three consequences, and they are the reason for
         # splitting the ring:
         #
@@ -3018,7 +3033,7 @@ class BarlinkBar1Transport:
         #    no other. What it does NOT replace is the distance between
         #    two replays of the SAME slot -- that is carried by the
         #    release handshake in the kernel (flag family 4,
-        #    `ergSlack = 1`).
+        #    `resultSlack = 1`).
         # 3. The silent bug was this: with a freely running ring index,
         #    multiple captures (sglang captures one per batch size) run
         #    over the same slots. Two graphs then share one BAR1 slot, and
@@ -3026,8 +3041,8 @@ class BarlinkBar1Transport:
         #    No crash. That is exactly what the pool eliminates: a graph
         #    slot is assigned ONCE and never again.
         #
-        # If the pool is empty, the call falls back to `direkt=0` --
-        # reported, not silent, and correct: `direkt=0` is the same
+        # If the pool is empty, the call falls back to `direct=0` --
+        # reported, not silent, and correct: `direct=0` is the same
         # measured control path, its `torch.empty_like` during capture
         # comes from the graph's private memory pool and thus already has
         # a fixed address regardless. It costs the saved VRAM pass, not
@@ -3037,17 +3052,17 @@ class BarlinkBar1Transport:
         )
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (  # noqa: E501
             result_eager_free_slot,
-            erg_eager_slack,
+            result_eager_slack,
             result_graph_slot,
         )
 
         if graph_capture_running():
-            if not self.pipe_direkt_graph:
-                if not self._direkt_graph_gemeldet:
-                    self._direkt_graph_gemeldet = True
+            if not self.pipe_direct_graph:
+                if not self._direct_graph_reported:
+                    self._direct_graph_reported = True
                     logger.warning(
                         "barlink-BAR1-PIPE: direct mode disabled while a CUDA "
-                        "graph is being captured (default). netz_pipe runs "
+                        "graph is being captured (default). mesh_pipe runs "
                         "the captured direct=0 path. "
                         "SGLANG_BARLINK_BAR1_PIPE_DIRECT_GRAPH=1 enables the "
                         "graph-safe path: a reserved ring slot per call "
@@ -3055,12 +3070,12 @@ class BarlinkBar1Transport:
                         "notice appears once per rank."
                     )
                 return None
-            i = result_graph_slot(self._erg_graph_vergeben,
-                                self._erg_eager_plaetze,
-                                self._erg_graph_plaetze)
+            i = result_graph_slot(self._result_graph_assigned,
+                                self._result_eager_slots,
+                                self._result_graph_slots)
             if i is None:
-                if not self._erg_graph_leer_gemeldet:
-                    self._erg_graph_leer_gemeldet = True
+                if not self._result_graph_empty_reported:
+                    self._result_graph_empty_reported = True
                     logger.warning(
                         "barlink-BAR1-PIPE: the graph pool of the result ring "
                         "is exhausted (%d of %d slots assigned, L=%d). This "
@@ -3069,18 +3084,18 @@ class BarlinkBar1Transport:
                         "VRAM pass. More slots are available with a larger "
                         "SGLANG_BARLINK_BAR1_PIPE_RESULT_RING, and each slot "
                         "costs %d bytes in the BAR1 window.",
-                        self._erg_graph_vergeben, self._erg_graph_plaetze,
-                        int(self._geo["erg_ring"]),
-                        int(self._geo["erg_stride"]),
+                        self._result_graph_assigned, self._result_graph_slots,
+                        int(self._geo["result_ring"]),
+                        int(self._geo["result_stride"]),
                     )
                 return None
             # NO weak reference: from now on, this slot belongs to exactly
             # this call site. Assigning it again later would be the bug --
             # and that is exactly why the counter only grows.
-            self._erg_graph_vergeben += 1
-            ptr = (self._eigen[0] + int(self._geo["off_erg"])
-                   + i * int(self._geo["erg_stride"]))
-            out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
+            self._result_graph_assigned += 1
+            ptr = (self._own[0] + int(self._geo["off_result"])
+                   + i * int(self._geo["result_stride"]))
+            out = self._pipe_ext.bar1_result_tensor(int(ptr), inp)
             return out, i, 1
 
         # -- eager -----------------------------------------------------------
@@ -3096,22 +3111,22 @@ class BarlinkBar1Transport:
         # The abort was the wrong answer to the right concern. What must
         # not happen is overwriting a buffer that is still held. If ALL
         # eager slots are held, the correct answer is the same as for the
-        # exhausted graph pool a couple of lines up: `direkt=0`, reported
+        # exhausted graph pool a couple of lines up: `direct=0`, reported
         # and counted. That is the measured control path and costs the
         # saved VRAM pass, not correctness. How many slots a given caller
         # needs is set by `SGLANG_BARLINK_BAR1_PIPE_RESULT_EAGER`.
-        if self._erg_eager_plaetze < 2:
+        if self._result_eager_slots < 2:
             return None
-        belegt = [
-            v is not None and v() is not None for v in self._erg_lebt
+        busy = [
+            v is not None and v() is not None for v in self._result_alive
         ]
         i = result_eager_free_slot(
-            self._erg_i, self._erg_eager_plaetze, belegt
+            self._result_i, self._result_eager_slots, busy
         )
         if i is None:
-            self._erg_eager_voll += 1
-            if not self._erg_eager_voll_gemeldet:
-                self._erg_eager_voll_gemeldet = True
+            self._result_eager_full += 1
+            if not self._result_eager_full_reported:
+                self._result_eager_full_reported = True
                 logger.warning(
                     "barlink-BAR1-PIPE: all %d eager result slots are still "
                     "being held by the caller. This call runs the "
@@ -3122,14 +3137,14 @@ class BarlinkBar1Transport:
                     "(and a SGLANG_BARLINK_BAR1_PIPE_RESULT_RING of at least "
                     "that size). Each slot costs %d bytes in the BAR1 "
                     "window. This notice appears once per rank; how often "
-                    "it actually happens is recorded in erg_eager_voll.",
-                    self._erg_eager_plaetze,
-                    int(self._geo["erg_stride"]),
+                    "it actually happens is recorded in _result_eager_full.",
+                    self._result_eager_slots,
+                    int(self._geo["result_stride"]),
                 )
             return None
-        ptr = (self._eigen[0] + int(self._geo["off_erg"])
-               + i * int(self._geo["erg_stride"]))
-        out = self._pipe_ext.bar1_erg_tensor(int(ptr), inp)
+        ptr = (self._own[0] + int(self._geo["off_result"])
+               + i * int(self._geo["result_stride"]))
+        out = self._pipe_ext.bar1_result_tensor(int(ptr), inp)
         # The handshake only runs along in eager mode if graph-safe mode is
         # on. Without it, the kernel stays byte-for-byte the measured one --
         # flag family 4 is then never touched. With it, the slack is the
@@ -3138,18 +3153,18 @@ class BarlinkBar1Transport:
         # slack that is too large would be the weaker wait condition, i.e.
         # the dangerous direction.
         slack = (
-            erg_eager_slack(i, self._erg_zaehler, self._erg_zuletzt,
-                            self._erg_eager_plaetze)
-            if self.pipe_direkt_graph else 0
+            result_eager_slack(i, self._result_counter, self._result_last,
+                            self._result_eager_slots)
+            if self.pipe_direct_graph else 0
         )
-        self._erg_lebt[i] = weakref.ref(out)
+        self._result_alive[i] = weakref.ref(out)
         # The number recorded is that of THIS call, not the next one: the
         # distance to the next use of the same slot is the difference of
         # two call numbers, and under strict rotation over L slots that is
         # thus exactly L.
-        self._erg_zuletzt[i] = self._erg_zaehler
-        self._erg_zaehler += 1
-        self._erg_i = i
+        self._result_last[i] = self._result_counter
+        self._result_counter += 1
+        self._result_i = i
         return out, i, slack
 
     def _pipe_all_reduce(self, inp, k: int):
@@ -3158,54 +3173,54 @@ class BarlinkBar1Transport:
 
         inp = inp.contiguous()
         nbytes = inp.numel() * inp.element_size()
-        platz = self._result_slot(inp)
-        direkt = platz is not None
-        if direkt:
-            out, erg_slot, erg_slack = platz
+        reserved = self._result_slot(inp)
+        direct = reserved is not None
+        if direct:
+            out, result_slot, result_slack = reserved
         else:
-            out, erg_slot, erg_slack = torch.empty_like(inp), -1, 0
-        kern = self._kernel(nbytes, self.pipe_gitter_ab, "netz_pipe")
-        peer_nutz = [0] * self.welt
-        peer_flag = [0] * self.welt
-        peer_erg = [0] * self.welt
+            out, result_slot, result_slack = torch.empty_like(inp), -1, 0
+        kernel_variant = self._kernel(nbytes, self.pipe_grid_from, "mesh_pipe")
+        peer_payload = [0] * self.world
+        peer_flag = [0] * self.world
+        peer_result = [0] * self.world
         for r, z in self._peers.items():
-            peer_nutz[r] = z.nutz.dev_ptr
+            peer_payload[r] = z.payload.dev_ptr
             peer_flag[r] = z.flag.dev_ptr
-        peer_nutz[self.rank] = self._eigen[0]
-        peer_flag[self.rank] = self._eigen_flag[0]
-        if direkt:
+        peer_payload[self.rank] = self._own[0]
+        peer_flag[self.rank] = self._own_flag[0]
+        if direct:
             # THE SAME ring slot on every rank. This is not an assumption
             # about the neighbor but the same SPMD precondition every
             # collective in this module rests on: all ranks see the same
             # sequence of calls. The kernel additionally checks that its
             # own entry really is `out`.
-            versatz = (int(self._geo["off_erg"])
-                       + erg_slot * int(self._geo["erg_stride"]))
-            for r in range(self.welt):
-                peer_erg[r] = peer_nutz[r] + versatz
+            offset = (int(self._geo["off_result"])
+                       + result_slot * int(self._geo["result_stride"]))
+            for r in range(self.world):
+                peer_result[r] = peer_payload[r] + offset
         from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
-            pipe_fbasis,
+            pipe_fbase,
         )
 
-        self._pipe_ext.bar1_netz_pipe(
-            inp, out, int(self.rank), int(self.welt),
-            peer_nutz, peer_flag, peer_erg,
-            int(self._eigen[0]), int(self._eigen_flag[0]),
-            int(self.pipe_schlitz),
+        self._pipe_ext.bar1_mesh_pipe(
+            inp, out, int(self.rank), int(self.world),
+            peer_payload, peer_flag, peer_result,
+            int(self._own[0]), int(self._own_flag[0]),
+            int(self.pipe_slot),
             int(self._geo["off_pipe"]),
-            int(pipe_fbasis(self.welt, self.a2a_an)),
-            int(k), int(self.pipe_t), int(self.pipe_vorlauf),
-            int(self.pipe_quittung), 1 if direkt else 0, int(erg_slack),
-            self._runde_dev, self._schritt_dev, self._erg_gen_dev,
+            int(pipe_fbase(self.world, self.a2a_on)),
+            int(k), int(self.pipe_t), int(self.pipe_lead),
+            int(self.pipe_ack), 1 if direct else 0, int(result_slack),
+            self._round_dev, self._step_dev, self._result_gen_dev,
             self._ctl_dev,
-            int(self.deckel_zyklen), int(self.threads), int(kern),
-            int(self.ladeform),
-            int(self._abbruch_wirt),
+            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            int(self.load_shape),
+            int(self._abort_host),
         )
         return out
 
-    def byte_proof_pipe(self, runden: int = 0) -> bool:
-        """Byte-level proof for ``netz_pipe``. Without it, the path withdraws.
+    def byte_proof_pipe(self, rounds: int = 0) -> bool:
+        """Byte-level proof for ``mesh_pipe``. Without it, the path withdraws.
 
         Separate from ``byte_proof_all``, because it checks something
         different: the pair proof shows that bytes arrive; this one shows
@@ -3217,29 +3232,29 @@ class BarlinkBar1Transport:
             barlink_bar1_pipe_ext,
         )
 
-        if not self.pipe_an or self._pipe_ext is None:
-            self._pipe_beleg = False
+        if not self.pipe_on or self._pipe_ext is None:
+            self._pipe_proof = False
             return False
         # Provisionally let it through so the proof itself can run; the
         # final answer is below. Nobody asks `handles` in the meantime --
         # the proof runs during setup, before the first collective.
-        self._pipe_beleg = True
+        self._pipe_proof = True
         try:
-            ok = barlink_bar1_pipe_ext.byte_proof_pipe(self, runden)
+            ok = barlink_bar1_pipe_ext.byte_proof_pipe(self, rounds)
         except Exception as e:
             logger.warning(
                 "barlink-BAR1-PIPE: the byte-level proof aborted with %r. "
-                "netz_pipe withdraws; mesh and ring are unaffected.",
+                "mesh_pipe withdraws; mesh and ring are unaffected.",
                 e,
             )
             ok = False
-        self._pipe_beleg = bool(ok)
+        self._pipe_proof = bool(ok)
         if not ok:
             logger.warning(
-                "barlink-BAR1-PIPE: byte-level proof not passed -- netz_pipe "
+                "barlink-BAR1-PIPE: byte-level proof not passed -- mesh_pipe "
                 "withdraws via handles()."
             )
-        return self._pipe_beleg
+        return self._pipe_proof
 
     # -- all_gather --------------------------------------------------------
     #
@@ -3258,7 +3273,7 @@ class BarlinkBar1Transport:
     # it moves bytes, knows no data type, and receives offsets and lengths
     # SEPARATELY PER RANK. An all_gather is an all_to_all in which every
     # destination gets the same slice -- i.e. the same table with
-    # ``sende_versatz[z] = const``. This is not a trick but the promise
+    # ``send_offsets[z] = const``. This is not a trick but the promise
     # already spelled out in barlink_bar1_ext.py ("it never assumed they were
     # contiguous").
     #
@@ -3298,7 +3313,7 @@ class BarlinkBar1Transport:
         on. Only what does not work even in rounds is rejected.
 
         ``nbytes % 16 != 0`` is explicitly NOT rejected, unlike with
-        all_reduce. The a2a kernel has the tail path for that (``VEK=0``,
+        all_reduce. The a2a kernel has the tail path for that (``VEC=0``,
         packet assembled byte by byte): correct, slower, unmeasured. That
         is the right choice, because under capture the alternative is not
         a slower path but no path at all.
@@ -3307,20 +3322,20 @@ class BarlinkBar1Transport:
         bytes, but everything. Rank ``i``'s result offset is ``i *
         shard``; if ``shard`` is not a multiple of 16, every offset except
         rank 0's is off-alignment, and the extension switches to
-        ``VEK=0`` for the WHOLE call (it checks all offsets jointly,
+        ``VEC=0`` for the WHOLE call (it checks all offsets jointly,
         barlink_bar1_ext.py: "there is no such thing as 'mostly aligned'").
         Whoever sees a slow number should check this first before
         attributing it to the transport.
         """
-        if not self.ag_an:
+        if not self.ag_on:
             return False
         # Same region, same kernel, same byte-level proof. Without the a2a
         # region (SGLANG_BARLINK_BAR1_A2A=0), there is also no all_gather --
         # stated, not silently assumed.
-        if not self.a2a_an or not self._a2a_beleg:
+        if not self.a2a_on or not self._a2a_proof:
             return False
         geo = self._geo
-        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_slot", 0) <= 0:
             return False
         if nbytes <= 0:
             return False
@@ -3328,19 +3343,19 @@ class BarlinkBar1Transport:
             return False
         # The same window concept as with all_reduce and a2a: against the
         # group-wide SMALLEST actually mapped length.
-        if geo["region_bytes"] > self._fenster_minimum:
+        if geo["region_bytes"] > self._window_minimum:
             return False
         # There is still a ceiling, though, and it is not a window limit
         # but a round limit: every round is one kernel launch with one
         # barrier, and arbitrarily many of those per collective would not
         # be a transport but a loop. Rank-uniform, because nbytes is.
-        if -(-nbytes // int(geo["a2a_schlitz"])) > self.ag_max_runden:
+        if -(-nbytes // int(geo["a2a_slot"])) > self.ag_max_rounds:
             return False
         return True
 
     def ag_rounds(self, nbytes: int) -> int:
         """Round count for a shard of ``nbytes`` -- for logging/tests."""
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        slot = int(self._geo.get("a2a_slot", 0))
         if slot <= 0:
             return 0
         return max(1, -(-int(nbytes) // slot))
@@ -3350,14 +3365,14 @@ class BarlinkBar1Transport:
 
         Result shape and axis handling are byte-for-byte those of the seam
         (``barlink.BarlinkCommunicator.all_gather``) and of
-        ``barlink_device.all_gather``: first ``(R,) + form``, then
+        ``barlink_device.all_gather``: first ``(R,) + shape``, then
         ``movedim(0, dim)``, then merge. Not reinvented -- the same
         expression, so a transport switch changes nothing about the
         numbers.
         """
         import torch
 
-        if not self._auf or self._ext is None or not self.a2a_an:
+        if not self._up or self._ext is None or not self.a2a_on:
             raise Bar1Unavailable(
                 "barlink_all_gather without an a2a region set up -- reachable "
                 "only if someone bypassed handles()."
@@ -3365,25 +3380,25 @@ class BarlinkBar1Transport:
         if dim < 0:
             dim += inp.dim()
         inp = inp.contiguous()
-        form = tuple(inp.size())
-        scherbe = inp.numel() * inp.element_size()
-        out = torch.empty((self.welt,) + form, dtype=inp.dtype,
+        shape = tuple(inp.size())
+        shard = inp.numel() * inp.element_size()
+        out = torch.empty((self.world,) + shape, dtype=inp.dtype,
                           device=inp.device)
         # Uniform, because the seam is -- but passed as a VECTOR to
         # ag_plan, not as an assumption in the arithmetic. The rationale is
         # in ag_plan.
-        plan = ag_plan([scherbe] * self.welt, int(self._geo["a2a_schlitz"]))
-        flach = out.view(-1)
+        plan = ag_plan([shard] * self.world, int(self._geo["a2a_slot"]))
+        flat = out.view(-1)
         for round in plan:
-            s_off = [round[self.rank][0]] * self.welt
-            s_len = [round[self.rank][1]] * self.welt
+            s_off = [round[self.rank][0]] * self.world
+            s_len = [round[self.rank][1]] * self.world
             e_off = [x[2] for x in round]
             e_len = [x[1] for x in round]
             self.barlink_all_to_all_single(
-                comm, flach, inp, s_len, e_len, s_off, e_off,
+                comm, flat, inp, s_len, e_len, s_off, e_off,
             )
         out = out.movedim(0, dim)
-        return out.reshape(form[:dim] + (self.welt * form[dim],) + form[dim + 1:])
+        return out.reshape(shape[:dim] + (self.world * shape[dim],) + shape[dim + 1:])
 
     # -- broadcast ---------------------------------------------------------
     #
@@ -3404,7 +3419,7 @@ class BarlinkBar1Transport:
     # AGAIN NO NEW KERNEL, and this time the table is even simpler than for
     # all_gather. A broadcast is an all_to_all in which exactly ONE rank
     # fills a row: the source sets the same slice for every destination
-    # (``sende_versatz[z] = const``, ``sende_bytes[z] = n``), and every
+    # (``send_offsets[z] = const``, ``send_bytes[z] = n``), and every
     # other rank sends 0 bytes everywhere. On the receive side, exactly one
     # block is non-zero, namely the one from ``src``. The kernel already
     # knows this: it receives offsets and lengths separately per rank, and a
@@ -3448,7 +3463,7 @@ class BarlinkBar1Transport:
         reason as in :meth:`_handles_all_gather`: under capture, a decline
         is an abort.
 
-        **The covered range is ``1 .. a2a_schlitz * bc_max_runden``**, with
+        **The covered range is ``1 .. a2a_slot * bc_max_rounds``**, with
         no gaps. This is not a rewrite but the lesson from the second
         attempt: the first covered broadcast but rejected 12 bytes (lower
         bound 16, copied from a2a), and the standard run sends exactly
@@ -3457,16 +3472,16 @@ class BarlinkBar1Transport:
         ever reintroduced here, it needs the same rationale
         ``_no_collective`` also states for reduce_scatter.
         """
-        if not self.bc_an:
+        if not self.bc_on:
             return False
         # Same region, same kernel -- but an OWN byte-level proof
-        # (`_bc_beleg`), because the table is a different one. Without the
+        # (`_bc_proof`), because the table is a different one. Without the
         # a2a region there is also no broadcast; stated, not silently
         # assumed.
-        if not self.a2a_an or not self._a2a_beleg or not self._bc_beleg:
+        if not self.a2a_on or not self._a2a_proof or not self._bc_proof:
             return False
         geo = self._geo
-        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_slot", 0) <= 0:
             return False
         if nbytes <= 0:
             return False
@@ -3474,15 +3489,15 @@ class BarlinkBar1Transport:
             return False
         # The same window concept as everywhere: against the group-wide
         # SMALLEST actually mapped length.
-        if geo["region_bytes"] > self._fenster_minimum:
+        if geo["region_bytes"] > self._window_minimum:
             return False
-        if -(-nbytes // int(geo["a2a_schlitz"])) > self.bc_max_runden:
+        if -(-nbytes // int(geo["a2a_slot"])) > self.bc_max_rounds:
             return False
         return True
 
     def bc_rounds(self, nbytes: int) -> int:
         """Round count for ``nbytes`` -- for logging/tests."""
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        slot = int(self._geo.get("a2a_slot", 0))
         if slot <= 0:
             return 0
         return max(1, -(-int(nbytes) // slot))
@@ -3498,12 +3513,12 @@ class BarlinkBar1Transport:
         """
         import torch
 
-        if not self._auf or self._ext is None or not self.a2a_an:
+        if not self._up or self._ext is None or not self.a2a_on:
             raise Bar1Unavailable(
                 "barlink_broadcast without an a2a region set up -- reachable "
                 "only if someone bypassed handles()."
             )
-        R = self.welt
+        R = self.world
         if not 0 <= int(src) < R:
             raise Bar1Unavailable(
                 f"broadcast with src={src} at {R} ranks -- the rank is to "
@@ -3519,23 +3534,23 @@ class BarlinkBar1Transport:
         nbytes = source.numel() * source.element_size()
         if nbytes == 0:
             return tensor
-        ziel = torch.empty_like(source)
-        plan = bc_plan(nbytes, int(self._geo["a2a_schlitz"]))
+        dst = torch.empty_like(source)
+        plan = bc_plan(nbytes, int(self._geo["a2a_slot"]))
         # Group-wide identical, because `plan` is -- and that is why the
         # kernel variant (grid/1blk) also comes out the same on every rank,
         # instead of depending on the rank-dependent question "how much do
         # I send".
-        for versatz, length in plan:
-            sendet = (self.rank == src)
-            s_len = [length if sendet else 0] * R
-            s_off = [versatz] * R
+        for offset, length in plan:
+            sends = (self.rank == src)
+            s_len = [length if sends else 0] * R
+            s_off = [offset] * R
             e_len = [length if i == src else 0 for i in range(R)]
-            e_off = [versatz if i == src else 0 for i in range(R)]
+            e_off = [offset if i == src else 0 for i in range(R)]
             self.barlink_all_to_all_single(
-                comm, ziel, source, s_len, e_len, s_off, e_off,
-                kern_last=length * (R - 1),
+                comm, dst, source, s_len, e_len, s_off, e_off,
+                kernel_bytes=length * (R - 1),
             )
-        tensor.copy_(ziel.view(tensor.shape))
+        tensor.copy_(dst.view(tensor.shape))
         return tensor
 
     def byte_proof_broadcast(self) -> bool:
@@ -3569,53 +3584,53 @@ class BarlinkBar1Transport:
         import torch
         import torch.distributed as dist
 
-        self._bc_beleg = False
-        if not self.bc_an:
+        self._bc_proof = False
+        if not self.bc_on:
             logger.info(
                 "barlink-BAR1: broadcast is disabled via SGLANG_BARLINK_BAR1_BC=0 "
                 "-- no byte-level proof, handles() says False."
             )
             return False
-        if not self.a2a_an or not self._a2a_beleg:
+        if not self.a2a_on or not self._a2a_proof:
             return False
-        if not self._auf or self._ext is None:
+        if not self._up or self._ext is None:
             return False
 
-        R, r = self.welt, self.rank
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        R, r = self.world, self.rank
+        slot = int(self._geo.get("a2a_slot", 0))
         if slot <= 0:
             return False
-        klein = min(4096, slot)
+        small = min(4096, slot)
         # Beyond the slot size, but not by a hair: 16 leftover bytes in the
         # second round additionally hit the kernel's tail path.
-        gross = slot + 16
+        large = slot + 16
         # BELOW one packet. This is the case the first attempt walked right
         # past: the lower bound stood at 16, the standard run sends 12, and
         # the proof only ran sizes the bound accepted anyway -- so it could
         # never have seen the bug. 12 bytes exercise the one path no other
         # size here does: a single, incomplete packet, assembled in a
         # register and read back out byte by byte.
-        winzig = 12
+        tiny = 12
 
-        ok_lokal = True
-        for src, n in ([(s, klein) for s in range(R)]
-                       + [(s, winzig) for s in range(R)]
-                       + [(0, gross)]):
+        ok_local = True
+        for src, n in ([(s, small) for s in range(R)]
+                       + [(s, tiny) for s in range(R)]
+                       + [(0, large)]):
             # Every rank starts with ITS OWN marker. For the source, that is
             # already the expected value; for everyone else, a byte
             # distinguishable from it -- a broadcast that moves nothing at
             # all thus stands out instead of accidentally looking correct.
-            soll = self._a2a_marker(src, src)
-            puffer = torch.full((n,), self._a2a_marker(r, r), dtype=torch.uint8,
+            expected = self._a2a_marker(src, src)
+            buffer = torch.full((n,), self._a2a_marker(r, r), dtype=torch.uint8,
                                 device=self.device)
             bounded_barrier(
                 self.cpu_group,
                 f"bar1 broadcast proof src={src} n={n}: before the round",
                 table=self._peer_table,
             )
-            gelaufen = True
+            ran = True
             try:
-                self.barlink_broadcast(None, puffer, src)
+                self.barlink_broadcast(None, buffer, src)
                 bounded_device_sync(
                     f"bar1 broadcast proof src={src} n={n}",
                     device=self.device,
@@ -3630,18 +3645,18 @@ class BarlinkBar1Transport:
                     "barlink-BAR1: broadcast byte-level proof (src=%d, %d "
                     "bytes) could not run: %r", src, n, ex,
                 )
-                ok_lokal = False
-                gelaufen = False
-            if not gelaufen:
+                ok_local = False
+                ran = False
+            if not ran:
                 continue
-            rueck = puffer.cpu()
-            schlecht = int((rueck != soll).sum().item())
-            if schlecht:
-                ok_lokal = False
+            back = buffer.cpu()
+            bad = int((back != expected).sum().item())
+            if bad:
+                ok_local = False
                 logger.warning(
                     "barlink-BAR1: broadcast byte-level proof %d->%d FAILED: "
                     "%d of %d bytes wrong (%d rounds). broadcast withdraws.",
-                    src, r, schlecht, n, len(bc_plan(n, slot)),
+                    src, r, bad, n, len(bc_plan(n, slot)),
                 )
             else:
                 logger.info(
@@ -3650,18 +3665,18 @@ class BarlinkBar1Transport:
                     src, r, n, len(bc_plan(n, slot)),
                 )
 
-        traeger: list[object] = [None] * R
+        carrier: list[object] = [None] * R
         check_peers("bar1 broadcast proof: verdict exchange", self._peer_table)
-        dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
-        self._bc_beleg = all(bool(x) for x in traeger)
-        if not self._bc_beleg:
+        dist.all_gather_object(carrier, bool(ok_local), group=self.cpu_group)
+        self._bc_proof = all(bool(x) for x in carrier)
+        if not self._bc_proof:
             logger.warning(
                 "barlink-BAR1: broadcast byte-level proof failed group-wide "
                 "(ranks %s). handles('broadcast') returns False; "
                 "all_reduce, all_to_all, and all_gather are unaffected.",
-                [i for i, x in enumerate(traeger) if not x],
+                [i for i, x in enumerate(carrier) if not x],
             )
-        return self._bc_beleg
+        return self._bc_proof
 
     # -- all_to_all --------------------------------------------------------
 
@@ -3675,10 +3690,10 @@ class BarlinkBar1Transport:
         group-wide reconciled sizes, that one on a value the caller passes
         in after maximizing it group-wide.
         """
-        if not self.a2a_an or not self._a2a_beleg:
+        if not self.a2a_on or not self._a2a_proof:
             return False
         geo = self._geo
-        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_schlitz", 0) <= 0:
+        if geo.get("off_a2a", -1) < 0 or geo.get("a2a_slot", 0) <= 0:
             return False
         if nbytes < self.a2a_min_bytes:
             return False
@@ -3687,27 +3702,27 @@ class BarlinkBar1Transport:
         # broadcast. The coarse number here is the uniform case; the exact
         # round count falls out in `supports_a2a`, once the group-wide
         # largest block is known.
-        if a2a_rounds(-(-nbytes // self.welt),
-                      int(geo["a2a_schlitz"])) > self.a2a_max_runden:
+        if a2a_rounds(-(-nbytes // self.world),
+                      int(geo["a2a_slot"])) > self.a2a_max_rounds:
             return False
         # The same window concept as with all_reduce: against the
         # group-wide SMALLEST actually mapped length, not against the
         # requested one. Redundant as long as setup completed
         # successfully -- and exactly for that reason cheap.
-        if geo["region_bytes"] > self._fenster_minimum:
+        if geo["region_bytes"] > self._window_minimum:
             return False
         return True
 
     def a2a_slot_bytes(self) -> int:
         """Largest block ONE directed pair can carry. 0 = no a2a."""
-        if not self.a2a_an or not self._a2a_beleg:
+        if not self.a2a_on or not self._a2a_proof:
             return 0
-        return int(self._geo.get("a2a_schlitz", 0))
+        return int(self._geo.get("a2a_slot", 0))
 
-    def supports_a2a(self, groesster_block: int) -> bool:
+    def supports_a2a(self, largest_block: int) -> bool:
         """Does the largest block over ALL pairs fit into a slot?
 
-        ``groesster_block`` must be a **group-wide identical** value -- the
+        ``largest_block`` must be a **group-wide identical** value -- the
         maximum over all R*R blocks, not over the caller's own row. If
         every rank computed it only from its own block sizes, one rank
         could run into the collective and another into the fallback, and
@@ -3716,18 +3731,18 @@ class BarlinkBar1Transport:
         beforehand; that is exactly why this check does not live in
         ``handles``.
         """
-        if not self.a2a_an or not self._a2a_beleg or not self._auf:
+        if not self.a2a_on or not self._a2a_proof or not self._up:
             return False
-        if groesster_block < 0:
+        if largest_block < 0:
             return False
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        slot = int(self._geo.get("a2a_slot", 0))
         if slot <= 0:
             return False
         # If it does not fit into ONE slot, it runs in several rounds --
         # only what does not work even in rounds is rejected.
-        return a2a_rounds(groesster_block, slot) <= self.a2a_max_runden
+        return a2a_rounds(largest_block, slot) <= self.a2a_max_rounds
 
-    def a2a_rounds_for(self, groesster_block: int) -> int:
+    def a2a_rounds_for(self, largest_block: int) -> int:
         """Round count the caller passes to ``barlink_all_to_all_single``.
 
         It falls out of the GROUP-WIDE largest block, which the seam has
@@ -3735,18 +3750,18 @@ class BarlinkBar1Transport:
         its own row it would be rank-dependent, and a rank running one
         round fewer would leave the others waiting in the barrier.
         """
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        slot = int(self._geo.get("a2a_slot", 0))
         if slot <= 0:
             return 0
-        return a2a_rounds(groesster_block, slot)
+        return a2a_rounds(largest_block, slot)
 
     def barlink_all_to_all_single(self, comm, output, inp,
-                                sende_bytes, empfangs_bytes,
-                                sende_versatz=None, empfangs_versatz=None,
-                                kern_last=None, runden=None):
+                                send_bytes, recv_bytes,
+                                send_offsets=None, recv_offsets=None,
+                                kernel_bytes=None, rounds=None):
         """Wrapper with a round loop. One step or several, depending on the block.
 
-        ``runden`` comes from the caller and is GROUP-WIDE identical -- the
+        ``rounds`` comes from the caller and is GROUP-WIDE identical -- the
         seam computes it from the largest block over all pairs
         (:meth:`a2a_rounds_for`). ``None`` means one round and is thus
         byte-for-byte the previous path; that is exactly how
@@ -3760,56 +3775,56 @@ class BarlinkBar1Transport:
         reason: the round count must not depend on how much THIS rank has
         to do.
         """
-        n = 1 if runden is None else max(1, int(runden))
+        n = 1 if rounds is None else max(1, int(rounds))
         if n == 1:
             return self._a2a_one_round(
-                comm, output, inp, sende_bytes, empfangs_bytes,
-                sende_versatz, empfangs_versatz, kern_last,
+                comm, output, inp, send_bytes, recv_bytes,
+                send_offsets, recv_offsets, kernel_bytes,
             )
-        slot = int(self._geo["a2a_schlitz"])
-        s_basis = list(sende_versatz) if sende_versatz is not None else None
-        e_basis = list(empfangs_versatz) if empfangs_versatz is not None else None
-        if s_basis is None:
-            s_basis, acc = [], 0
-            for length in sende_bytes:
-                s_basis.append(acc)
+        slot = int(self._geo["a2a_slot"])
+        s_base = list(send_offsets) if send_offsets is not None else None
+        e_base = list(recv_offsets) if recv_offsets is not None else None
+        if s_base is None:
+            s_base, acc = [], 0
+            for length in send_bytes:
+                s_base.append(acc)
                 acc += int(length)
-        if e_basis is None:
-            e_basis, acc = [], 0
-            for length in empfangs_bytes:
-                e_basis.append(acc)
+        if e_base is None:
+            e_base, acc = [], 0
+            for length in recv_bytes:
+                e_base.append(acc)
                 acc += int(length)
         for k in range(n):
             s_len = [
                 min(slot, max(0, int(length) - k * slot))
-                for length in sende_bytes
+                for length in send_bytes
             ]
             e_len = [
                 min(slot, max(0, int(length) - k * slot))
-                for length in empfangs_bytes
+                for length in recv_bytes
             ]
             self._a2a_one_round(
                 comm, output, inp, s_len, e_len,
-                [b + k * slot for b in s_basis],
-                [b + k * slot for b in e_basis],
-                kern_last,
+                [b + k * slot for b in s_base],
+                [b + k * slot for b in e_base],
+                kernel_bytes,
             )
         return output
 
     def _a2a_one_round(self, comm, output, inp,
-                        sende_bytes, empfangs_bytes,
-                        sende_versatz=None, empfangs_versatz=None,
-                        kern_last=None):
+                        send_bytes, recv_bytes,
+                        send_offsets=None, recv_offsets=None,
+                        kernel_bytes=None):
         """``all_to_all_single`` over the direct path. One step, one barrier.
 
-        ``sende_bytes[j]`` is the block going to rank ``j``,
-        ``empfangs_bytes[i]`` the one coming from rank ``i`` -- both in
+        ``send_bytes[j]`` is the block going to rank ``j``,
+        ``recv_bytes[i]`` the one coming from rank ``i`` -- both in
         **bytes**, not in rows and not in elements. The kernel moves bytes:
         there is no reduction, hence no data type. fp8, bf16, int32, uint8
         take the same path, and the sm_86 cards' missing fp8 conversion
         instructions are irrelevant here.
 
-        ``sende_versatz`` / ``empfangs_versatz`` are **optional** and in
+        ``send_offsets`` / ``recv_offsets`` are **optional** and in
         bytes. ``None`` means: the prefix sum of the lengths, i.e. the
         gap-free concatenation that ``torch.distributed.
         all_to_all_single`` means -- byte-for-byte the previous path. They
@@ -3821,7 +3836,7 @@ class BarlinkBar1Transport:
         separately and has never assumed they were contiguous; only this
         seam used to compute the offsets itself.
 
-        ``kern_last`` is the byte count that decides the kernel variant
+        ``kernel_bytes`` is the byte count that decides the kernel variant
         (grid/1blk). ``None`` means: what this rank actually sends over the
         aperture -- correct for any table in which all ranks move similar
         amounts. A broadcast is precisely not that: there, ONE rank sends
@@ -3832,99 +3847,99 @@ class BarlinkBar1Transport:
         rank-uniformity of the capture do. The caller therefore passes in a
         group-wide identical value.
 
-        The caller is responsible for ensuring that ``empfangs_bytes[i]``
-        on this rank equals ``sende_bytes[rang]`` on rank ``i``. The
+        The caller is responsible for ensuring that ``recv_bytes[i]``
+        on this rank equals ``send_bytes[rank]`` on rank ``i``. The
         extension checks what it can check locally (buffer bounds, slot
         bound, its own block), but not agreement across the group -- that
         would require running a collective, and that would be exactly the
         host sync this path avoids.
         """
-        if not self._auf or self._ext is None or not self.a2a_an:
+        if not self._up or self._ext is None or not self.a2a_on:
             raise Bar1Unavailable(
                 "barlink_all_to_all_single without an a2a region set up -- "
                 "reachable only if someone bypassed handles()."
             )
-        R = self.welt
-        if len(sende_bytes) != R or len(empfangs_bytes) != R:
+        R = self.world
+        if len(send_bytes) != R or len(recv_bytes) != R:
             raise Bar1Unavailable(
-                f"block sizes have length {len(sende_bytes)}/"
-                f"{len(empfangs_bytes)}, {R} expected."
+                f"block sizes have length {len(send_bytes)}/"
+                f"{len(recv_bytes)}, {R} expected."
             )
         inp = inp.contiguous()
         if not output.is_contiguous():
             raise Bar1Unavailable("output buffer is not contiguous")
 
-        if sende_versatz is None:
-            sende_off, s = [], 0
-            for n in sende_bytes:
-                sende_off.append(s)
+        if send_offsets is None:
+            send_off, s = [], 0
+            for n in send_bytes:
+                send_off.append(s)
                 s += int(n)
         else:
-            if len(sende_versatz) != R:
+            if len(send_offsets) != R:
                 raise Bar1Unavailable(
-                    f"sende_versatz has length {len(sende_versatz)}, "
+                    f"send_offsets has length {len(send_offsets)}, "
                     f"{R} expected."
                 )
-            sende_off = [int(x) for x in sende_versatz]
-        if empfangs_versatz is None:
-            empf_off, e = [], 0
-            for n in empfangs_bytes:
-                empf_off.append(e)
+            send_off = [int(x) for x in send_offsets]
+        if recv_offsets is None:
+            recv_off, e = [], 0
+            for n in recv_bytes:
+                recv_off.append(e)
                 e += int(n)
         else:
-            if len(empfangs_versatz) != R:
+            if len(recv_offsets) != R:
                 raise Bar1Unavailable(
-                    f"empfangs_versatz has length {len(empfangs_versatz)}, "
+                    f"recv_offsets has length {len(recv_offsets)}, "
                     f"{R} expected."
                 )
-            empf_off = [int(x) for x in empfangs_versatz]
+            recv_off = [int(x) for x in recv_offsets]
 
         # The cooperative multi-block launch pays off at the same threshold
         # as with all_reduce -- it is measured THERE and only there; here it
         # is carried over, not confirmed. What governs is what actually
         # goes over PCIe, i.e. excluding one's own block.
-        if kern_last is None:
-            bewegt = sum(
-                int(n) for j, n in enumerate(sende_bytes) if j != self.rank
+        if kernel_bytes is None:
+            moved = sum(
+                int(n) for j, n in enumerate(send_bytes) if j != self.rank
             )
         else:
-            bewegt = int(kern_last)
-        kern = self._kernel(bewegt, self.gitter_ab, "all_to_all_single")
+            moved = int(kernel_bytes)
+        kernel_variant = self._kernel(moved, self.grid_from, "all_to_all_single")
 
-        peer_nutz = [0] * R
+        peer_payload = [0] * R
         peer_flag = [0] * R
         for rr, z in self._peers.items():
-            peer_nutz[rr] = z.nutz.dev_ptr
+            peer_payload[rr] = z.payload.dev_ptr
             peer_flag[rr] = z.flag.dev_ptr
-        peer_nutz[self.rank] = self._eigen[0]
-        peer_flag[self.rank] = self._eigen_flag[0]
+        peer_payload[self.rank] = self._own[0]
+        peer_flag[self.rank] = self._own_flag[0]
 
         self._ext.bar1_all_to_all(
             inp, output, int(self.rank), int(R),
-            [int(x) for x in sende_off], [int(x) for x in sende_bytes],
-            [int(x) for x in empf_off], [int(x) for x in empfangs_bytes],
-            peer_nutz, peer_flag,
-            int(self._eigen[0]), int(self._eigen_flag[0]),
-            int(self._geo["a2a_schlitz"]), int(self._geo["off_a2a"]),
-            int(fbasis_a2a(R)),
-            self._runde_dev, self._ctl_dev,
-            int(self.deckel_zyklen), int(self.threads), int(kern),
-            int(self.ladeform),
-            int(self._abbruch_wirt),
+            [int(x) for x in send_off], [int(x) for x in send_bytes],
+            [int(x) for x in recv_off], [int(x) for x in recv_bytes],
+            peer_payload, peer_flag,
+            int(self._own[0]), int(self._own_flag[0]),
+            int(self._geo["a2a_slot"]), int(self._geo["off_a2a"]),
+            int(fbase_a2a(R)),
+            self._round_dev, self._ctl_dev,
+            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            int(self.load_shape),
+            int(self._abort_host),
         )
         return output
 
     @staticmethod
-    def _a2a_marker(source: int, ziel: int) -> int:
+    def _a2a_marker(source: int, dst: int) -> int:
         """A byte that differs per directed pair, never 0x00 and never 0xFF.
 
-        ``0x40 | (source*8 + ziel)`` -- for R <= 8, ``source*8+ziel`` is
+        ``0x40 | (source*8 + dst)`` -- for R <= 8, ``source*8+dst`` is
         injective and fits in 6 bits. 0xFF is the output buffer's
         pre-fill value, 0x00 the receive slot's; both are thus
         distinguishable from the pattern, and a block that was NOT written
         stands out as such instead of accidentally looking like a hit.
         """
-        return 0x40 | ((source * 8 + ziel) & 0x3F)
+        return 0x40 | ((source * 8 + dst) & 0x3F)
 
     def byte_proof_a2a(self) -> bool:
         """Byte-level proof for ``all_to_all``: every byte, every directed pair.
@@ -3955,19 +3970,19 @@ class BarlinkBar1Transport:
         """
         import torch.distributed as dist
 
-        self._a2a_beleg = False
-        if not self.a2a_an:
+        self._a2a_proof = False
+        if not self.a2a_on:
             logger.info(
                 "barlink-BAR1: all_to_all is disabled via "
                 "SGLANG_BARLINK_BAR1_A2A=0 -- no byte-level proof, handles() "
                 "says False."
             )
             return False
-        if not self._auf or self._ext is None:
+        if not self._up or self._ext is None:
             return False
 
-        R, r = self.welt, self.rank
-        slot = int(self._geo.get("a2a_schlitz", 0))
+        R, r = self.world, self.rank
+        slot = int(self._geo.get("a2a_slot", 0))
         # The largest block of the skewed pass is 3*block+6.
         block = min(8192, (slot - 6) // 3)
         block = (block // 16) * 16
@@ -3982,25 +3997,25 @@ class BarlinkBar1Transport:
         # rank that bails out before the all_gather_object because of a
         # local exception would leave the others waiting in it -- a failed
         # proof would turn into a hang.
-        ok_lokal = True
+        ok_local = True
         try:
-            ok_lokal = self._a2a_proof_passes(block)
+            ok_local = self._a2a_proof_passes(block)
         except Exception as ex:                # noqa: BLE001
-            ok_lokal = False
+            ok_local = False
             logger.warning("barlink-BAR1: a2a byte-level proof aborted: %r", ex)
 
-        traeger: list[object] = [None] * R
+        carrier: list[object] = [None] * R
         check_peers("bar1 a2a proof: verdict exchange", self._peer_table)
-        dist.all_gather_object(traeger, bool(ok_lokal), group=self.cpu_group)
-        self._a2a_beleg = all(bool(x) for x in traeger)
-        if not self._a2a_beleg:
+        dist.all_gather_object(carrier, bool(ok_local), group=self.cpu_group)
+        self._a2a_proof = all(bool(x) for x in carrier)
+        if not self._a2a_proof:
             logger.warning(
                 "barlink-BAR1: a2a byte-level proof failed group-wide (ranks "
                 "%s). handles('all_to_all') returns False; all_reduce is "
                 "unaffected.",
-                [i for i, x in enumerate(traeger) if not x],
+                [i for i, x in enumerate(carrier) if not x],
             )
-        return self._a2a_beleg
+        return self._a2a_proof
 
     def _a2a_proof_passes(self, block: int) -> bool:
         """The two probe passes. Purely local, without group reconciliation.
@@ -4014,77 +4029,77 @@ class BarlinkBar1Transport:
         """
         import torch
 
-        R, r = self.welt, self.rank
-        ok_lokal = True
-        for schief in (False, True):
+        R, r = self.world, self.rank
+        ok_local = True
+        for skewed in (False, True):
 
             def length(q: int, z: int) -> int:
-                if not schief:
+                if not skewed:
                     return block
                 return block * (1 + ((q + z) % 3)) + ((q * 5 + z * 3) % 7)
 
-            sende = [length(r, z) for z in range(R)]
-            empf = [length(q, r) for q in range(R)]
-            inp = torch.empty(sum(sende), dtype=torch.uint8, device=self.device)
+            send = [length(r, z) for z in range(R)]
+            recv = [length(q, r) for q in range(R)]
+            inp = torch.empty(sum(send), dtype=torch.uint8, device=self.device)
             o = 0
             for z in range(R):
-                inp[o:o + sende[z]] = self._a2a_marker(r, z)
-                o += sende[z]
-            out = torch.full((sum(empf),), 0xFF, dtype=torch.uint8,
+                inp[o:o + send[z]] = self._a2a_marker(r, z)
+                o += send[z]
+            out = torch.full((sum(recv),), 0xFF, dtype=torch.uint8,
                              device=self.device)
-            lauf = "skewed" if schief else "uniform"
+            run_name = "skewed" if skewed else "uniform"
             bounded_barrier(
                 self.cpu_group,
-                f"bar1 a2a proof ({lauf}): before the round",
+                f"bar1 a2a proof ({run_name}): before the round",
                 table=self._peer_table,
             )
-            gelaufen = True
+            ran = True
             try:
-                self.barlink_all_to_all_single(None, out, inp, sende, empf)
+                self.barlink_all_to_all_single(None, out, inp, send, recv)
                 bounded_device_sync(
-                    f"bar1 a2a proof ({lauf})",
+                    f"bar1 a2a proof ({run_name})",
                     device=self.device,
                     table=self._peer_table,
                 )
                 # Same reason as in the broadcast proof: without this, an
                 # aborted kernel is reported as a byte mismatch.
-                self.raise_if_aborted(f"a2a proof ({lauf})")
+                self.raise_if_aborted(f"a2a proof ({run_name})")
             except Exception as ex:            # noqa: BLE001 -- reason goes into the log
                 logger.warning(
                     "barlink-BAR1: a2a byte-level proof (%s) could not run: %r",
-                    "skewed" if schief else "uniform", ex,
+                    "skewed" if skewed else "uniform", ex,
                 )
-                ok_lokal = False
-                gelaufen = False
-            if not gelaufen:
+                ok_local = False
+                ran = False
+            if not ran:
                 continue
-            rueck = out.cpu()
+            back = out.cpu()
             o = 0
-            schlecht_ges = 0
+            bad_total = 0
             for q in range(R):
-                soll = self._a2a_marker(q, r)
-                stueck = rueck[o:o + empf[q]]
-                schlecht = int((stueck != soll).sum().item())
-                if schlecht:
-                    ok_lokal = False
-                    schlecht_ges += schlecht
+                expected = self._a2a_marker(q, r)
+                piece = back[o:o + recv[q]]
+                bad = int((piece != expected).sum().item())
+                if bad:
+                    ok_local = False
+                    bad_total += bad
                     logger.warning(
                         "barlink-BAR1: a2a byte-level proof %d->%d (%s) "
                         "FAILED: %d of %d bytes wrong. all_to_all "
                         "withdraws.",
-                        q, r, "skewed" if schief else "uniform", schlecht,
-                        empf[q],
+                        q, r, "skewed" if skewed else "uniform", bad,
+                        recv[q],
                     )
-                o += empf[q]
-            if not schlecht_ges:
+                o += recv[q]
+            if not bad_total:
                 # The passed proof belongs in the log too -- it is the
                 # statement every later timing measurement rests on.
                 logger.info(
                     "barlink-BAR1: a2a byte-level proof (%s) passed: 0 of %d "
                     "bytes wrong across %d senders.",
-                    "skewed" if schief else "uniform", sum(empf), R,
+                    "skewed" if skewed else "uniform", sum(recv), R,
                 )
-        return ok_lokal
+        return ok_local
 
     # -- Peer liveness -------------------------------------------------------
 
@@ -4127,15 +4142,15 @@ class BarlinkBar1Transport:
         whoever catches it can ask ``raise_if_aborted`` afterwards.
         """
 
-        def _haken() -> None:
+        def _hook() -> None:
             window = self._abort_window
             if window is not None:
                 window.trip(f"host wait '{label}' gave up")
 
-        return _haken
+        return _hook
 
     @property
-    def _abbruch_wirt(self) -> int:
+    def _abort_host(self) -> int:
         """Device address of the abort word, ``0`` when there is none.
 
         Every extension call passes this. ``0`` is the pre-#312 behaviour
@@ -4162,13 +4177,13 @@ class BarlinkBar1Transport:
         if self.status() != 1:
             return
         window = self._abort_window
-        grund = window.reason if window is not None and window.tripped else None
+        reason = window.reason if window is not None and window.tripped else None
         raise Bar1KernelAborted(
             f"barlink-BAR1 {label}: a spin kernel took its abort path. Either "
             f"it exceeded SGLANG_BARLINK_BAR1_CAP_CYCLES "
-            f"({self.deckel_zyklen} cycles) waiting for a peer's flag, or "
+            f"({self.cap_cycles} cycles) waiting for a peer's flag, or "
             f"the host abort word was set"
-            + (f" -- {grund}" if grund else "")
+            + (f" -- {reason}" if reason else "")
             + ". The output buffer of that call is partially written and "
             "must not be used."
         )
@@ -4224,7 +4239,7 @@ class BarlinkBar1Transport:
         allocation. Reversed, this would pull pages out from under the
         driver while a mapping is still live.
         """
-        self._auf = False
+        self._up = False
         # Before anything else: no kernel of this transport will run again,
         # so the abort word has nobody left to talk to. Unregistering it here
         # keeps the watchdog from holding a reference to a closed window.
@@ -4235,41 +4250,41 @@ class BarlinkBar1Transport:
         # groundlessly shortchange a group built later.
         try:
             from sglang.srt.distributed.device_communicators import (
-                barlink_matrix_transport as _kasse,
+                barlink_matrix_transport as _ledger,
             )
 
-            _kasse.ledger_debit(self.device, self.gruppe)
+            _ledger.ledger_debit(self.device, self.group)
         except Exception:
             pass
         for z in self._peers.values():
-            for a in (z.nutz, z.flag):
+            for a in (z.payload, z.flag):
                 if self._cuda is not None:
                     # UNREGISTER AT THE SAME ADDRESS UNDER WHICH IT WAS
                     # REGISTERED. cudaHostUnregister on a pointer INSIDE the
                     # registration fails, and the unregister would silently
                     # not happen -- the aperture would remain registered on
                     # the next run.
-                    self._cuda.unregister(a.reg_adresse)
+                    self._cuda.unregister(a.reg_address)
                 try:
                     a.mmap_obj.close()      # type: ignore[attr-defined]
                 except Exception:
                     pass
-        if self._halter is not None:
+        if self._holder is not None:
             for z in self._peers.values():
-                for a in (z.nutz, z.flag):
-                    self._halter.release(a.halter_handle)
-            self._halter.close()
-            self._halter = None
+                for a in (z.payload, z.flag):
+                    self._holder.release(a.holder_handle)
+            self._holder.close()
+            self._holder = None
         self._peers.clear()
-        eigene = set(self._dmabuf_fds)
-        for liste in self._fremde_fds:
-            for fd in liste or ():
-                if fd is not None and fd >= 0 and fd not in eigene:
+        own_set = set(self._dmabuf_fds)
+        for items in self._foreign_fds:
+            for fd in items or ():
+                if fd is not None and fd >= 0 and fd not in own_set:
                     try:
                         os.close(fd)
                     except OSError:
                         pass
-        self._fremde_fds = []
+        self._foreign_fds = []
         for fd in self._dmabuf_fds:
             try:
                 os.close(fd)
@@ -4280,57 +4295,57 @@ class BarlinkBar1Transport:
         # exported memory object is attached. Had it been closed earlier,
         # RM would have released the object out from under the peers'
         # still-live mappings.
-        for fd in self._halte_fds:
+        for fd in self._hold_fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        self._halte_fds = []
+        self._hold_fds = []
         if self._cuda is not None:
-            for eig in ("_eigen", "_eigen_flag"):
-                w = getattr(self, eig)
+            for attr in ("_own", "_own_flag"):
+                w = getattr(self, attr)
                 if w[2]:
                     self._cuda.vmm_free(*w)
-                    setattr(self, eig, (0, 0, 0))
-        self._runde_dev = None
+                    setattr(self, attr, (0, 0, 0))
+        self._round_dev = None
         self._ctl_dev = None
-        self._schritt_dev = None
-        self._erg_gen_dev = None
+        self._step_dev = None
+        self._result_gen_dev = None
 
 
-def build_bar1(cpu_group, device, fenster_bytes: int,
-              bericht: Optional[dict] = None,
-              gruppe: str = "") -> Optional[BarlinkBar1Transport]:
+def build_bar1(cpu_group, device, window_bytes: int,
+              report: Optional[dict] = None,
+              group: str = "") -> Optional[BarlinkBar1Transport]:
     """Factory with a clean fallback.
 
     ``None`` means: this machine cannot do the direct path, with a logged
     reason. No raising, no silent fallback to another path -- the choice
     of a replacement path is made by the caller, not by this module.
 
-    ``fenster_bytes`` is the **requested** size of the receive region per
+    ``window_bytes`` is the **requested** size of the receive region per
     rank. What actually comes of it is reported afterward by
     ``transport.window_minimum()`` -- and only that belongs in the
     planner.
 
-    ``bericht`` is the REASON, and it is not an afterthought. Previously,
+    ``report`` is the REASON, and it is not an afterthought. Previously,
     every failure ended in a ``logger.info`` and a ``None``, and the
     caller then went on to log "transport=bar1" regardless. That is
     exactly how a measurement was devalued once: the tp group ran over
     BAR1, the dcp group over gloo, and the log looked the same in both
-    cases. Whoever passes ``bericht`` gets ``reason`` and ``stage``
+    cases. Whoever passes ``report`` gets ``reason`` and ``stage``
     ("setup", "byte_proof") written into it here and can turn that into a
     loud message.
     """
-    if bericht is None:
-        bericht = {}
+    if report is None:
+        report = {}
 
     def _aus(stage: str, text: str):
-        bericht["stage"] = stage
-        bericht["reason"] = text
+        report["stage"] = stage
+        report["reason"] = text
         return None
 
     try:
-        t = BarlinkBar1Transport(cpu_group, device, fenster_bytes, gruppe=gruppe)
+        t = BarlinkBar1Transport(cpu_group, device, window_bytes, group=group)
     except Bar1Unavailable as e:
         logger.info("barlink-BAR1: direct path not available -- %s", e)
         return _aus("setup", str(e))
@@ -4344,31 +4359,31 @@ def build_bar1(cpu_group, device, fenster_bytes: int,
     # it, `handles` is locked. On this rig, the driver reported peer
     # access for one pair and delivered 4096 of 1,048,576 bytes.
     try:
-        belege = t.byte_proof_all()
+        proofs = t.byte_proof_all()
     except Exception as e:
         logger.info("barlink-BAR1: byte-level proof could not run -- %r", e)
         t.close()
         return _aus("byte_proof", f"could not run: {type(e).__name__}: {e}")
-    if not t._belege_stehen:
+    if not t._proofs_hold:
         # Previously, the transport came out of here UNSCATHED and only
         # withdrew later via `handles` -- so every collective silently ran
         # over the gloo tier while the log said "transport=bar1". The
         # reason belongs reported to the caller, not withheld.
-        gefallen = sorted(k for k, v in belege.items() if not v)
-        bericht["stage"] = "byte_proof"
-        bericht["reason"] = (
-            f"Byte-level proof failed for the directed pairs {gefallen}. "
+        failed = sorted(k for k, v in proofs.items() if not v)
+        report["stage"] = "byte_proof"
+        report["reason"] = (
+            f"Byte-level proof failed for the directed pairs {failed}. "
             f"handles() says False for everything; every collective in "
             f"this group runs over the gloo tier."
         )
-        bericht["haelt_belegt"] = True
+        report["holds_space"] = True
     # And the same principle for all_to_all -- its own kernel, its own
     # slots, its own flag lines, hence its own proof. It is ONLY attempted
     # if the all_reduce proof holds: a collective over an edge that has
     # already lost bytes there needs no second probe. If it fails,
     # all_reduce remains available regardless; that is why the transport
     # is not torn down here either.
-    if t._belege_stehen:
+    if t._proofs_hold:
         try:
             t.byte_proof_a2a()
         except Exception as e:
@@ -4381,7 +4396,7 @@ def build_bar1(cpu_group, device, fenster_bytes: int,
         # sum), hence its own proof. It runs ONLY if the a2a proof holds --
         # without that, everything is closed anyway. If it fails,
         # all_reduce, all_to_all, and all_gather remain available.
-        if t._a2a_beleg:
+        if t._a2a_proof:
             try:
                 t.byte_proof_broadcast()
             except Exception as e:
@@ -4389,17 +4404,17 @@ def build_bar1(cpu_group, device, fenster_bytes: int,
                     "barlink-BAR1: broadcast byte-level proof could not run "
                     "-- %r. broadcast withdraws, the rest continues.", e,
                 )
-        # And the same principle once more for netz_pipe: its own kernel,
+        # And the same principle once more for mesh_pipe: its own kernel,
         # its own slots, its own counter lines, hence its own proof -- and
         # one over MULTIPLE rounds at that, because slot reuse never even
         # gets exercised in a single round. If it fails, mesh and ring
         # remain available.
-        if t.pipe_an:
+        if t.pipe_on:
             try:
                 t.byte_proof_pipe()
             except Exception as e:
                 logger.info(
                     "barlink-BAR1: pipe byte-level proof could not run -- "
-                    "%r. netz_pipe withdraws, mesh and ring continue.", e,
+                    "%r. mesh_pipe withdraws, mesh and ring continue.", e,
                 )
     return t

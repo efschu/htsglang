@@ -5,8 +5,8 @@ One ``A.nzSendRS[z]`` with a running ``z`` therefore makes nvcc copy the
 WHOLE parameter block into local memory, per thread. Measured on this
 kernel with ``nvcc -cubin -arch=sm_86`` plus ``cuobjdump -res-usage``:
 
-    before   bar1_netz_kernel   REG:39-40  STACK:64  SHARED:0-4
-    after    bar1_netz_kernel   REG:37-40  STACK:0    SHARED:512-520
+    before   bar1_mesh_kernel   REG:39-40  STACK:64  SHARED:0-4
+    after    bar1_mesh_kernel   REG:37-40  STACK:0    SHARED:512-520
 
 ``bar1_ring_kernel`` (fixed indices) had STACK:0 all along, which is what
 made the mesh number stand out. The a2a and pipelined kernels avoid it the
@@ -15,7 +15,7 @@ shared memory, then everyone indexes there.
 
 That measurement needs nvcc, takes minutes, and belongs in the validation
 notes -- not in a unit test. What belongs here is the INVARIANT, so the
-next edit cannot quietly put the spill back: inside ``bar1_netz_kernel``,
+next edit cannot quietly put the spill back: inside ``bar1_mesh_kernel``,
 the parameter arrays are read only in the staging loop.
 
 Pure source analysis. No nvcc, no card.
@@ -45,8 +45,8 @@ _PARAM_ARRAYS = (
     "nzSendAG",
     "nzRecvRS",
     "nzRecvAG",
-    "nzFlagAn",
-    "nzFlagVon",
+    "nzFlagTo",
+    "nzFlagFrom",
 )
 
 
@@ -99,7 +99,7 @@ def _kernel_body(src: str, name: str) -> str:
 class TestMeshKernelHasNoParamSpill(CustomTestCase):
     def setUp(self):
         self.src = _cuda_src()
-        self.body = _kernel_body(self.src, "bar1_netz_kernel")
+        self.body = _kernel_body(self.src, "bar1_mesh_kernel")
 
     def test_the_staging_block_exists(self):
         """Otherwise the test below would pass on an empty kernel."""
@@ -109,7 +109,7 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
     def test_staging_uses_syncthreads_not_the_grid_barrier(self):
         """Shared memory is block-local, so the barrier has to be too.
 
-        ``barriere<GRID>()`` is a grid sync in the cooperative variant. Using
+        ``barrier<GRID>()`` is a grid sync in the cooperative variant. Using
         it here would leave every block except block 0 reading a shared array
         nobody in that block filled -- null pointers, not slow code.
         """
@@ -117,7 +117,7 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
         after = self.body[pos : pos + 1400]
         self.assertIn("__syncthreads();", after)
         before_sync = after[: after.index("__syncthreads();")]
-        self.assertNotIn("barriere<GRID>", before_sync)
+        self.assertNotIn("barrier<GRID>", before_sync)
 
     def test_param_arrays_are_read_only_while_staging(self):
         """Every ``A.<array>`` sits inside the thread-0 staging loop."""
@@ -139,7 +139,7 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
         self.assertFalse(
             offenders,
             msg=(
-                "bar1_netz_kernel reads a Bar1Args pointer array outside the "
+                "bar1_mesh_kernel reads a Bar1Args pointer array outside the "
                 "staging loop. Kernel parameters live in constant bank 0, "
                 "which cannot be indexed dynamically -- nvcc answers by "
                 "copying the whole parameter block into local memory per "
@@ -159,7 +159,7 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
 #: Every spin loop of the BAR1 family ends on the same cycle deadline, so the
 #: deadline check is the enumeration of the spin loops -- there is no second
 #: list to keep in sync.
-_DEADLINE = "> A.deckelZyklen"
+_DEADLINE = "> A.capCycles"
 #: Expected number of spin loops per source. A change here is a change to the
 #: kernel's wait structure and should be a deliberate edit, not a surprise.
 _SPIN_LOOPS = {"barlink_bar1_ext.py": 5, "barlink_bar1_pipe_ext.py": 3}
@@ -171,7 +171,7 @@ class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
     The cycle deadline is rank-local: it cannot see that a peer PROCESS is
     gone, it is multiplied by up to 40x inside the JIT cold-build window --
     which is exactly the capture window where an OOM kill lands -- and its
-    expiry is silent. ``abbruchWirt`` is the one host-set word that closes
+    expiry is silent. ``abortHost`` is the one host-set word that closes
     that gap, and it only closes it in the loops that actually read it. The
     invariant is therefore per loop, not per file.
     """
@@ -179,42 +179,42 @@ class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
     def _probe_follows_every_deadline(self, path: Path) -> None:
         src = _without_comments(_cuda_src(path))
         self.assertIn(
-            "#define BARLINK_BAR1_WIRT_MASKE",
+            "#define BARLINK_BAR1_HOST_MASK",
             _cuda_src(path),
             msg=f"{path.name}: the probe's rate limit is gone",
         )
         self.assertIn(
-            "const unsigned int *abbruchWirt;",
+            "const unsigned int *abortHost;",
             src,
             msg=f"{path.name}: no host abort word in the argument struct",
         )
-        stellen = [
+        positions = [
             src.count("\n", 0, m.start()) + 1
             for m in re.finditer(re.escape(_DEADLINE), src)
         ]
         self.assertEqual(
-            len(stellen),
+            len(positions),
             _SPIN_LOOPS[path.name],
             msg=(
-                f"{path.name} has {len(stellen)} spin loops, expected "
+                f"{path.name} has {len(positions)} spin loops, expected "
                 f"{_SPIN_LOOPS[path.name]}. Adding or removing a wait is "
                 f"fine -- update the count here and give the new loop its "
                 f"probe."
             ),
         )
-        zeilen = src.splitlines()
-        ohne = []
-        for lineno in stellen:
+        lines = src.splitlines()
+        without = []
+        for lineno in positions:
             # The probe sits immediately after the deadline check, within the
             # macro continuation or the next few statements of the loop body.
-            fenster = "\n".join(zeilen[lineno : lineno + 5])
-            if "A.abbruchWirt" not in fenster:
-                ohne.append(lineno)
+            window = "\n".join(lines[lineno : lineno + 5])
+            if "A.abortHost" not in window:
+                without.append(lineno)
         self.assertFalse(
-            ohne,
+            without,
             msg=(
                 f"{path.name}: the spin loop(s) whose deadline check is on "
-                f"line(s) {ohne} do not probe the host abort word. Such a "
+                f"line(s) {without} do not probe the host abort word. Such a "
                 f"loop keeps spinning for the full "
                 f"SGLANG_BARLINK_BAR1_CAP_CYCLES budget after a peer has "
                 f"died, and the watchdog has no way to end it."
@@ -237,17 +237,17 @@ class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
         spin iteration of every collective that completes.
         """
         for path in (_EXT, _PIPE):
-            zeilen = _without_comments(_cuda_src(path)).splitlines()
-            falsch = []
-            for i, zeile in enumerate(zeilen):
-                if "A.abbruchWirt != nullptr" not in zeile:
+            lines = _without_comments(_cuda_src(path)).splitlines()
+            wrong = []
+            for i, line in enumerate(lines):
+                if "A.abortHost != nullptr" not in line:
                     continue
-                if not any(_DEADLINE in z for z in zeilen[max(0, i - 3) : i]):
-                    falsch.append(i + 1)
+                if not any(_DEADLINE in z for z in lines[max(0, i - 3) : i]):
+                    wrong.append(i + 1)
             self.assertFalse(
-                falsch,
+                wrong,
                 msg=(
-                    f"{path.name}: the probe(s) on line(s) {falsch} do not "
+                    f"{path.name}: the probe(s) on line(s) {wrong} do not "
                     f"sit directly after a deadline check. The order in the "
                     f"loop is success break, deadline, probe -- anything "
                     f"else costs the completing collective."
@@ -258,14 +258,14 @@ class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
         """Unmasked, it would be one PCIe read per spin iteration."""
         for path in (_EXT, _PIPE):
             src = _without_comments(_cuda_src(path))
-            lese = src.count("A.abbruchWirt != nullptr")
-            maske = src.count("& BARLINK_BAR1_WIRT_MASKE")
+            reads = src.count("A.abortHost != nullptr")
+            masks = src.count("& BARLINK_BAR1_HOST_MASK")
             self.assertEqual(
-                lese,
-                maske,
+                reads,
+                masks,
                 msg=(
-                    f"{path.name}: {lese} null checks of the abort word but "
-                    f"{maske} rate limits. Every probe must be masked."
+                    f"{path.name}: {reads} null checks of the abort word but "
+                    f"{masks} rate limits. Every probe must be masked."
                 ),
             )
 

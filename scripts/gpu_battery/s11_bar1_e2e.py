@@ -41,11 +41,11 @@ line) instead of the CAUSE (the capture aborted). Exactly the s01 pattern:
 a loader that reads a shape the producer does not write, and is silently
 empty rather than loud.
 
-Both files are read now, and which ones existed is recorded (`log_quellen`).
+Both files are read now, and which ones existed is recorded (`log_sources`).
 "nobody harvested a log" and "the log holds nothing" are then two different
 answers rather than one empty list. The two files overlap -- the grep result
 carries grep's "<lineno>:" prefix, the tail does not -- so lines are
-deduplicated on their content, without which `aufbau_lines` would count the
+deduplicated on their content, without which `setup_lines` would count the
 same setup line twice.
 """
 
@@ -58,7 +58,7 @@ import re
 import sys
 
 KIND = "bar1_e2e"
-#: 2: `log_quellen` / `log_zeilen` were added, and the evidence is no longer
+#: 2: `log_sources` / `log_lines` were added, and the evidence is no longer
 #: read from `barlink_lines.txt` alone. An older artifact must not slip through
 #: here -- it does not carry the fields the check uses to tell "nobody
 #: looked" from "nothing was found".
@@ -70,14 +70,23 @@ KIND = "bar1_e2e"
 #: model is intact -- `anker_zahlen`, `muell_befunde`, `lm_intakt` and the
 #: metrics behind them. A schema-3 artifact does not carry those fields, and
 #: its `kohaerent` meant something other than the field of that name here.
-#: 5: the per-group entries under `gruppen` renamed their keys from German to
+#: 5: the per-group entries under `groups` renamed their keys from German to
 #: English -- `gruppe`/`angefordert`/`erreicht` became `group`/`requested`/
 #: `achieved`, in step with barlink.py's report_state(). A schema-4 artifact
 #: still spells them in German, so every group would read back as empty and
 #: the transport check would pass on nothing. Rejecting it by version is the
 #: point: re-run the step rather than read a stale artifact through the new
 #: names.
-SCHEMA_VERSION = 5
+#: 6: task #358 renamed the transport from HTCCL to barlink and put the
+#: payload's remaining German keys into English -- `gruppen` ->
+#: `groups`, `aufbau_gruppen`/`aufbau_lines`/`aufbau_ms` ->
+#: `setup_groups`/`setup_lines`/`setup_ms`, `riegel` -> `capture_bolt`,
+#: `transport_angefordert` -> `transport_requested`, `graph_freigabe` ->
+#: `graph_enable`, `log_quellen`/`log_zeilen` -> `log_sources`/
+#: `log_lines`, `smoke.vorhanden` -> `smoke.present`. Same reasoning as
+#: 5: read through the new names, a schema-5 artifact looks empty
+#: everywhere instead of looking wrong.
+SCHEMA_VERSION = 6
 
 #: The continuation prompt s11_bar1_e2e.sh sends to /generate. It lives here
 #: AND there; test_gpu_battery_checks_bar1.py pins the two together against
@@ -134,15 +143,15 @@ RE_GROUP = re.compile(
     r"group '(?P<group>[^']+)': requested=(?P<requested>[^,\s]+),\s*"
     r"ACHIEVED=(?P<achieved>[A-Za-z0-9_\-]+)"
 )
-#: #315: these three used to spell "Aufbau"/"Kasse"/"waehrend einer
-#: CUDA-Graph-Aufzeichnung" -- the German wording #295 moved barlink_bar1.py and
-#: barlink.py away from. Dead on every real run since, hidden by fixtures that
-#: were never re-captured either; see test_bar1_marker_coupling.py, which
+#: #315: these three used to match the German wording ("Aufbau", "Kasse",
+#: "waehrend einer CUDA-Graph-Aufzeichnung") that #295 moved barlink_bar1.py
+#: and barlink.py away from. Dead on every real run since, hidden by fixtures
+#: that were never re-captured either; see test_bar1_marker_coupling.py, which
 #: checks these regexes against the actual emitter source so the next rename
-#: fails loudly instead of quietly.
-RE_KASSE = re.compile(r"BAR1 ledger of this card after group '(?P<group>[^']+)'")
-RE_AUFBAU = re.compile(r"barlink-BAR1: setup in\s+(?P<ms>[0-9.]+)\s*ms")
-RE_RIEGEL = re.compile(
+#: fails loudly instead of quietly. Their own names went English in #358.
+RE_LEDGER = re.compile(r"BAR1 ledger of this card after group '(?P<group>[^']+)'")
+RE_SETUP = re.compile(r"barlink-BAR1: setup in\s+(?P<ms>[0-9.]+)\s*ms")
+RE_CAPTURE_BOLT = re.compile(
     r"barlink: '(?P<op>[A-Za-z0-9_]+)' with (?P<bytes>\d+) bytes during a "
     r"CUDA graph capture"
 )
@@ -212,7 +221,7 @@ def _without_grep_prefix(line: str) -> str:
 
     ``grep -n`` puts "<lineno>:" in front, ``tail`` does not. The same log
     line therefore looks different in the two sources even though it is the
-    same one -- without this normalisation `aufbau_lines` counted it twice.
+    same one -- without this normalisation `setup_lines` counted it twice.
     """
     return " ".join(re.sub(r"^\d+:", "", line).split())
 
@@ -256,18 +265,18 @@ def parse_log_evidence(step_dir: str) -> dict:
                 "requested": m.group("requested"),
                 "achieved": m.group("achieved"),
             }
-        m = RE_KASSE.search(line)
+        m = RE_LEDGER.search(line)
         if m and m.group("group") not in ledger_groups:
             ledger_groups.append(m.group("group"))
-        m = RE_AUFBAU.search(line)
+        m = RE_SETUP.search(line)
         if m:
             setup_ms.append(float(m.group("ms")))
-        m = RE_RIEGEL.search(line)
+        m = RE_CAPTURE_BOLT.search(line)
         if m and bolt is None:
             bolt = {
                 "op": m.group("op"),
                 "bytes": int(m.group("bytes")),
-                "zeile": " ".join(line.split())[:300],
+                "line": " ".join(line.split())[:300],
             }
         if fatal is None and QUOTED_SUBLOG_PREFIX not in line:
             for marker in FATAL_MARKERS:
@@ -275,14 +284,14 @@ def parse_log_evidence(step_dir: str) -> dict:
                     fatal = " ".join(line.split())[:300]
                     break
     return {
-        "gruppen": sorted(groups.values(), key=lambda g: g["group"]),
-        "aufbau_gruppen": ledger_groups,
-        "aufbau_lines": len(setup_ms),
-        "aufbau_ms": setup_ms,
-        "riegel": bolt,
+        "groups": sorted(groups.values(), key=lambda g: g["group"]),
+        "setup_groups": ledger_groups,
+        "setup_lines": len(setup_ms),
+        "setup_ms": setup_ms,
+        "capture_bolt": bolt,
         "fatal": fatal,
-        "log_quellen": sources,
-        "log_zeilen": len(lines),
+        "log_sources": sources,
+        "log_lines": len(lines),
     }
 
 
@@ -414,7 +423,7 @@ def garbage_check(text: str) -> tuple:
     metrics["max_wiederholung"] = repeats
     if repeats >= MUELL_WDH_MAX:
         findings.append(
-            f"eine kurze Einheit wiederholt sich {repeats}x unmittelbar "
+            f"a short unit repeats {repeats}x back to back "
             f"(>= {MUELL_WDH_MAX}) -- Tokenschleife"
         )
     return findings, metrics
@@ -435,7 +444,7 @@ def parse_smoke(step_dir: str) -> dict:
     """
     path = os.path.join(step_dir, "smoke.json")
     out: dict = {
-        "vorhanden": os.path.exists(path),
+        "present": os.path.exists(path),
         "endpunkt": None,
         "content_prefix": None,
         "spec_accept_length": None,
@@ -452,7 +461,7 @@ def parse_smoke(step_dir: str) -> dict:
         "unterprovisioniert": False,
         "error": None,
     }
-    if not out["vorhanden"]:
+    if not out["present"]:
         return out
     try:
         with open(path, errors="replace") as f:
@@ -562,18 +571,18 @@ def compose(step_dir: str, port: int, host_log: str) -> dict:
         "blocked": " ".join(" ".join(blocked_lines).split())[:200] or None,
         "port": port,
         "server_log_remote": host_log,
-        "transport_angefordert": "bar1",
-        "graph_freigabe": True,
+        "transport_requested": "bar1",
+        "graph_enable": True,
         "uneven_dcp": True,
         "graph_check": parse_graph_check(step_dir),
         "smoke": parse_smoke(step_dir),
     }
     payload.update(parse_log_evidence(step_dir))
-    payload["gruppen_bar1"] = sorted(
-        g["group"] for g in payload["gruppen"] if g["achieved"] == "bar1"
+    payload["groups_on_bar1"] = sorted(
+        g["group"] for g in payload["groups"] if g["achieved"] == "bar1"
     )
-    payload["gruppen_ausgewichen"] = sorted(
-        g["group"] for g in payload["gruppen"] if g["achieved"] != g["requested"]
+    payload["groups_fell_back"] = sorted(
+        g["group"] for g in payload["groups"] if g["achieved"] != g["requested"]
     )
     return payload
 
@@ -591,10 +600,10 @@ def main() -> int:
         json.dump(payload, f, indent=2)
         f.write("\n")
     print(
-        f"bar1_e2e.json written: groups on bar1={payload['gruppen_bar1']}, "
-        f"fell back={payload['gruppen_ausgewichen']}, "
-        f"setup lines={payload['aufbau_lines']}, "
-        f"bolt={'yes' if payload['riegel'] else 'no'}"
+        f"bar1_e2e.json written: groups on bar1={payload['groups_on_bar1']}, "
+        f"fell back={payload['groups_fell_back']}, "
+        f"setup lines={payload['setup_lines']}, "
+        f"bolt={'yes' if payload['capture_bolt'] else 'no'}"
     )
     return 0
 

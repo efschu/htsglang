@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipelined BAR1 collective kernel: ``netz_pipe``.
+"""Pipelined BAR1 collective kernel: ``mesh_pipe``.
 
 Why this file exists
 -------------------------
@@ -18,7 +18,7 @@ and adopting overlap. There is **no more grid-wide lockstep per phase**.
 
 Why a separate file instead of a third kernel in ``barlink_bar1_ext.py``:
 another effort is working on that file in parallel. The primitives
-(``leseV4``, ``schreibeV4``, ``flaggeLesen``, ``chunkGrenzen``, ``addV4``)
+(``readV4``, ``writeV4``, ``readFlag``, ``chunkBounds``, ``addV4``)
 are therefore **duplicated verbatim** here instead of shared. That is
 deliberate, and it is a debt: once both efforts are merged, the shared part
 belongs in ONE header. Until then: whoever changes a primitive here must
@@ -58,7 +58,7 @@ The counters are **absolute over the transport's lifetime**, not reset per
 round. A counter reset per round would have a gap right at the round
 boundary: when rank A finishes its round ``n``, rank B may still be reading
 in round ``n``, and a window comparison against a round-local counter would
-have missed that. The counter therefore lives in ``schrittDev`` and grows
+have missed that. The counter therefore lives in ``stepDev`` and grows
 by ``K`` per call.
 
 What is NOT adopted, and why
@@ -74,8 +74,8 @@ What is NOT adopted, and why
   orders of magnitude too cheap to explain the 0.86x. What this kernel does
   save, by contrast: the distribute step does **not read the result back
   from VRAM**, but writes it straight from the register it was just formed
-  in (``reduziereUndVerteile``). ``bar1_netz_kernel`` turns that into two
-  passes (``reduziereNPhase`` + ``verteilePhase``).
+  in (``reduceAndScatter``). ``bar1_mesh_kernel`` turns that into two
+  passes (``reduceNPhase`` + ``scatterPhase``).
 * **LL / LL128** (``prims_ll.h:111-119``, ``:154``). The flag embedded in
   the data word assumes you never observe "flag new, data stale". Over
   NVLink that holds, over PCIe into a write-combining aperture it is
@@ -102,11 +102,11 @@ alternating replay, deliver each other's numbers.
 The fix is two pieces, and they belong together:
 
 1. **Ownership instead of rotation** (:func:`result_slot_split`). The ring
-   is split statically: the first ``eager_plaetze`` slots keep rotating for
+   is split statically: the first ``eager_slots`` slots keep rotating for
    eager calls, everything above that is a pool from which each captured
    call site takes ONE slot and never returns it. That way no second
    capture can get the same slot.
-2. **Release handshake** (flag family 4, ``ergBereit``). A reserved slot is
+2. **Release handshake** (flag family 4, ``resultReady``). A reserved slot is
    overwritten on EVERY replay; the spacing that the eager ring's two slots
    provide on their own is therefore gone. Every rank publishes its
    **generation** on entering a direct call -- "my result slot is free" --
@@ -168,8 +168,8 @@ MAX_DEPTH = 8
 # ===========================================================================
 
 
-def pipe_flags_extra(welt: int) -> int:
-    """Extra flag bytes for ``netz_pipe``: ``5 * R * 256``.
+def pipe_flags_extra(world: int) -> int:
+    """Extra flag bytes for ``mesh_pipe``: ``5 * R * 256``.
 
     Five families of one 256-byte line per rank each:
 
@@ -180,12 +180,12 @@ def pipe_flags_extra(welt: int) -> int:
     1    ``tailAG``        producer of the AG chunk / its receiver
     2    ``headRS``        consumer of the RS chunk / its producer
     3    ``headAG``        consumer of the AG chunk / its producer
-    4    ``ergBereit``     every rank on entering a direct call /
+    4    ``resultReady``   every rank on entering a direct call /
                            anyone writing into its result buffer
     ==== ================= ============================================
 
     Family 4 is the release handshake of the graph-capturable direct mode
-    (:data:`ERG_EAGER_PLAETZE`). It sits BEHIND the four original lines, so
+    (:data:`RESULT_EAGER_SLOTS`). It sits BEHIND the four original lines, so
     every existing line offset stays byte-for-byte what it was; without
     direct mode it is never written and never read.
 
@@ -197,17 +197,17 @@ def pipe_flags_extra(welt: int) -> int:
     256 bytes per line, as everywhere in this transport: no false sharing
     between senders, none between families.
     """
-    return 5 * welt * 256
+    return 5 * world * 256
 
 
-#: Family index of ``ergBereit`` in the pipe flag region. Kept as a
+#: Family index of ``resultReady`` in the pipe flag region. Kept as a
 #: constant because kernel and host side need the same number, and a second
 #: version would be exactly the place where sender and receiver end up
 #: pointing at different lines.
-ERG_BEREIT_FAMILIE = 4
+RESULT_READY_FAMILY = 4
 
 
-def pipe_fbasis(welt: int, mit_a2a: bool = True) -> int:
+def pipe_fbase(world: int, with_a2a: bool = True) -> int:
     """Offset of the pipe lines within the flag region.
 
     **Behind** mesh, ring, and a2a. That way all the measured topologies
@@ -216,10 +216,10 @@ def pipe_fbasis(welt: int, mit_a2a: bool = True) -> int:
     passed in as an argument, because a second version would be exactly the
     place where sender and receiver end up pointing at different lines.
     """
-    return (2 + 2 * (welt - 1) + (1 if mit_a2a else 0)) * welt * 256
+    return (2 + 2 * (world - 1) + (1 if with_a2a else 0)) * world * 256
 
 
-def pipe_slot_default(welt: int, chunk_ziel_bytes: int) -> int:
+def pipe_slot_default(world: int, chunk_target_bytes: int) -> int:
     """The slot size that the pipelined path actually needs.
 
     A slot carries ONE piece of ONE chunk, i.e. ``chunk / R``. How big a
@@ -249,17 +249,17 @@ def pipe_slot_default(welt: int, chunk_ziel_bytes: int) -> int:
     :func:`largest_chunk4` against the slot; if it finds none, the path
     declines via ``handles()``, and the kernel checks the same condition
     once more with ``TORCH_CHECK``. A tight slot costs coverage, never
-    correctness. At the top end it covers ``k_max * chunk_ziel_bytes`` --
+    correctness. At the top end it covers ``k_max * chunk_target_bytes`` --
     at 64 chunks of 1 MiB that's 64 MiB, far more than this rig's window
     ever carries as payload.
     """
-    if welt < 2:
+    if world < 2:
         return 0
-    stueck = -(-int(chunk_ziel_bytes) // int(welt))
-    return ((stueck + 15) // 16) * 16
+    piece = -(-int(chunk_target_bytes) // int(world))
+    return ((piece + 15) // 16) * 16
 
 
-def pipe_range_bytes(welt: int, tiefe: int, slot: int) -> int:
+def pipe_range_bytes(world: int, depth: int, slot: int) -> int:
     """Bytes the pipe region occupies in the receive region.
 
     ``2 * T * (R-1)`` slots, rounded up to a page -- so that the region
@@ -268,8 +268,8 @@ def pipe_range_bytes(welt: int, tiefe: int, slot: int) -> int:
     boundary, so every slot start is 16-byte-aligned as long as ``slot``
     is.
     """
-    roh = 2 * int(tiefe) * (int(welt) - 1) * int(slot)
-    return ((roh + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    raw = 2 * int(depth) * (int(world) - 1) * int(slot)
+    return ((raw + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 
 #: Page size. Deliberately its own constant and not an import from
@@ -280,14 +280,14 @@ PAGE_SIZE = 4096
 #: How many result buffers the ring holds. Two is the minimum with which
 #: round ``n`` doesn't write into the buffer the caller from round ``n-1``
 #: is still holding.
-ERG_RING_DEFAULT = 2
+RESULT_RING_DEFAULT = 2
 
 #: How many ring slots the eager path retains when the graph-capturable
 #: direct mode is turned on -- the DEFAULT, not the fixed number anymore.
 #:
 #: Two is the minimum below which round ``n`` would write into the buffer
 #: the caller from round ``n-1`` is still holding; the same derivation that
-#: makes :data:`ERG_RING_DEFAULT` two. But two is NOT a statement about how
+#: makes :data:`RESULT_RING_DEFAULT` two. But two is NOT a statement about how
 #: many results any particular caller holds alive simultaneously -- and
 #: that is exactly what tripped up the graph-capturable direct mode in the
 #: lever benchmark for #293: the standard run's capture warmup holds more
@@ -297,32 +297,32 @@ ERG_RING_DEFAULT = 2
 #: constant. The default stays two: how many the standard run really needs
 #: has not been measured, and a guessed larger number would not be a better
 #: value, only a more expensive one.
-ERG_EAGER_PLAETZE = 2
+RESULT_EAGER_SLOTS = 2
 
 
-def result_slot_split(ring: int, graphfest: bool,
-                   eager_plaetze: int = ERG_EAGER_PLAETZE) -> tuple[int, int]:
-    """``(eager_plaetze, graph_plaetze)`` for a ring of size ``ring``.
+def result_slot_split(ring: int, graph_safe: bool,
+                   eager_slots: int = RESULT_EAGER_SLOTS) -> tuple[int, int]:
+    """``(eager_slots, graph_slots)`` for a ring of size ``ring``.
 
     Pure arithmetic, so it can be checked without a card. It is the result
     ring's ownership policy, and it lives here instead of scattered through
     the transport, because a slot whose owner two places disagree about
     leads to swapped results without a crash.
 
-    **Without** ``graphfest`` (the default), the WHOLE ring belongs to the
+    **Without** ``graph_safe`` (the default), the WHOLE ring belongs to the
     eager path and rotates as before -- byte for byte the measured
     behavior.
 
-    **With** ``graphfest``, the ring is split statically:
+    **With** ``graph_safe``, the ring is split statically:
 
-    * the first ``eager_plaetze`` slots keep rotating for eager calls,
+    * the first ``eager_slots`` slots keep rotating for eager calls,
     * every slot above that is a pool from which one graph capture per
       call site takes ONE slot and never returns it.
 
-    ``eager_plaetze`` is a parameter and not a constant, because it
+    ``eager_slots`` is a parameter and not a constant, because it
     describes a property of the CALLER -- how many results it holds alive
     simultaneously -- not one of the transport. Pinned at
-    :data:`ERG_EAGER_PLAETZE`, every larger ring handed out exclusively
+    :data:`RESULT_EAGER_SLOTS`, every larger ring handed out exclusively
     graph slots, while the capture WARMUP, which runs eager, failed on
     exactly the eager count.
 
@@ -334,35 +334,35 @@ def result_slot_split(ring: int, graphfest: bool,
 
     If the ring isn't big enough for both, there are **zero** graph slots --
     not, say, one eager slot fewer. The caller reports this loudly and runs
-    the ``direkt=0`` path; an eager ring below two slots would be exactly
-    the bug that :data:`ERG_RING_DEFAULT` prevents.
+    the ``direct=0`` path; an eager ring below two slots would be exactly
+    the bug that :data:`RESULT_RING_DEFAULT` prevents.
     """
     ring = max(0, int(ring))
-    eager = max(0, int(eager_plaetze))
-    if not graphfest:
+    eager = max(0, int(eager_slots))
+    if not graph_safe:
         return ring, 0
     if ring <= eager:
         return ring, 0
     return eager, ring - eager
 
 
-def result_eager_slot(voriger: int, eager_plaetze: int) -> int:
-    """The next eager ring slot after ``voriger``.
+def result_eager_slot(previous: int, eager_slots: int) -> int:
+    """The next eager ring slot after ``previous``.
 
     Factored out so the monotonicity and modulo guarantee can be checked
-    without a card. ``voriger = -1`` is the initial state.
+    without a card. ``previous = -1`` is the initial state.
     """
-    if eager_plaetze <= 0:
+    if eager_slots <= 0:
         raise ValueError("eager ring has no slots")
-    return (int(voriger) + 1) % int(eager_plaetze)
+    return (int(previous) + 1) % int(eager_slots)
 
 
-def result_eager_free_slot(voriger: int, eager_plaetze: int,
-                           belegt) -> Optional[int]:
-    """The next FREE eager slot after ``voriger``, or ``None``.
+def result_eager_free_slot(previous: int, eager_slots: int,
+                           busy) -> Optional[int]:
+    """The next FREE eager slot after ``previous``, or ``None``.
 
-    ``belegt[i]`` says whether the tensor last handed out from slot ``i``
-    is still alive. Scanned round-robin starting at ``voriger + 1``, so
+    ``busy[i]`` says whether the tensor last handed out from slot ``i``
+    is still alive. Scanned round-robin starting at ``previous + 1``, so
     that the order among free slots stays the old one step for step -- the
     first candidate is exactly the one :func:`result_eager_slot` returns.
 
@@ -373,27 +373,27 @@ def result_eager_free_slot(voriger: int, eager_plaetze: int,
     not holding the others, aborting is simply wrong.
 
     ``None`` means "every slot is still being held". Then the call runs
-    ``direkt=0``, reported, with the same justification as an exhausted
-    graph pool: ``direkt=0`` is the measured control path, it costs the
+    ``direct=0``, reported, with the same justification as an exhausted
+    graph pool: ``direct=0`` is the measured control path, it costs the
     saved VRAM pass, not correctness. What must NOT happen is writing into
     a buffer that's still held -- and that is exactly what doesn't happen
     here.
     """
-    if eager_plaetze <= 0:
+    if eager_slots <= 0:
         raise ValueError("eager ring has no slots")
-    L = int(eager_plaetze)
-    for schritt in range(L):
-        i = (int(voriger) + 1 + schritt) % L
-        if not belegt[i]:
+    L = int(eager_slots)
+    for step in range(L):
+        i = (int(previous) + 1 + step) % L
+        if not busy[i]:
             return i
     return None
 
 
-def erg_eager_slack(platz: int, zaehler: int, zuletzt, eager_plaetze: int) -> int:
-    """How many direct calls have happened since ``platz`` was last used.
+def result_eager_slack(slot: int, counter: int, last_used, eager_slots: int) -> int:
+    """How many direct calls have happened since ``slot`` was last used.
 
-    The kernel waits, via ``ergSlack``, for the peer to have entered
-    generation ``ZIEL - ergSlack + 1`` -- a LARGER slack is the WEAKER
+    The kernel waits, via ``resultSlack``, for the peer to have entered
+    generation ``TARGET - resultSlack + 1`` -- a LARGER slack is the WEAKER
     condition. It must therefore be a lower bound on the actual reuse
     distance, never an upper bound.
 
@@ -404,19 +404,19 @@ def erg_eager_slack(platz: int, zaehler: int, zuletzt, eager_plaetze: int) -> in
     because a larger value only weakens the condition and gains nothing;
     at least ``1``, because ``0`` would disable the handshake entirely.
 
-    ``zuletzt[i] is None`` means "never used yet" -- then there is nothing
+    ``last_used[i] is None`` means "never used yet" -- then there is nothing
     to overwrite and ``L`` is admissible.
     """
-    L = max(1, int(eager_plaetze))
-    vorher = zuletzt[int(platz)]
-    if vorher is None:
+    L = max(1, int(eager_slots))
+    previous = last_used[int(slot)]
+    if previous is None:
         return L
-    return max(1, min(L, int(zaehler) - int(vorher)))
+    return max(1, min(L, int(counter) - int(previous)))
 
 
-def result_graph_slot(vergeben: int, eager_plaetze: int,
-                    graph_plaetze: int) -> Optional[int]:
-    """The ``vergeben``-th graph slot, or ``None`` if the pool is empty.
+def result_graph_slot(assigned: int, eager_slots: int,
+                    graph_slots: int) -> Optional[int]:
+    """The ``assigned``-th graph slot, or ``None`` if the pool is empty.
 
     Graph slots sit BEHIND the eager slots and are handed out ascending.
     A slot once handed out is never handed out again: which captured graph
@@ -425,13 +425,13 @@ def result_graph_slot(vergeben: int, eager_plaetze: int,
     eliminate -- two captures sharing one BAR1 slot and, on alternating
     replay, delivering each other's numbers.
 
-    ``None`` means: this call runs ``direkt=0``. That is not a silent
+    ``None`` means: this call runs ``direct=0``. That is not a silent
     fallback -- the caller reports it -- and it is correct, because
-    ``direkt=0`` is the same measured control path.
+    ``direct=0`` is the same measured control path.
     """
-    if int(vergeben) >= int(graph_plaetze):
+    if int(assigned) >= int(graph_slots):
         return None
-    return int(eager_plaetze) + int(vergeben)
+    return int(eager_slots) + int(assigned)
 
 
 def result_stride_bytes(max_bytes: int) -> int:
@@ -459,7 +459,7 @@ def result_ring_bytes(max_bytes: int, ring: int) -> int:
     return max(0, int(ring)) * result_stride_bytes(max_bytes)
 
 
-def pipe_window_requirement(welt: int, tiefe: int, slot: int) -> int:
+def pipe_window_requirement(world: int, depth: int, slot: int) -> int:
     """The **computed** requirement: ``2 * T * (R-1)`` slots.
 
     Not "one slot set, that'll do". This number is checked in ``handles()``
@@ -469,24 +469,24 @@ def pipe_window_requirement(welt: int, tiefe: int, slot: int) -> int:
     ring starts at ``T(R-1)*slot``, and the highest address within it is
     ``ringBytes + (T-1)*(R-1)*slot + (R-1)*slot``.
     """
-    return 2 * int(tiefe) * (int(welt) - 1) * int(slot)
+    return 2 * int(depth) * (int(world) - 1) * int(slot)
 
 
-def _chunk_bounds(n: int, j: int, teile: int) -> tuple[int, int]:
-    """The same split as ``chunkGrenzen`` in the kernel: remainder up front.
+def _chunk_bounds(n: int, j: int, parts: int) -> tuple[int, int]:
+    """The same split as ``chunkBounds`` in the kernel: remainder up front.
 
     This lives here ONLY for planning and the byte-level check. The seam
-    check in the kernel computes with ``chunkGrenzen`` itself -- a seam
+    check in the kernel computes with ``chunkBounds`` itself -- a seam
     checked on both sides with the same wrong formula would never surface.
     """
-    basis = n // teile
-    rest = n - basis * teile
-    length = basis + (1 if j < rest else 0)
-    versatz = j * basis + (j if j < rest else rest)
-    return versatz, length
+    base = n // parts
+    rest = n - base * parts
+    length = base + (1 if j < rest else 0)
+    offset = j * base + (j if j < rest else rest)
+    return offset, length
 
 
-def largest_chunk4(n4: int, welt: int, k: int) -> int:
+def largest_chunk4(n4: int, world: int, k: int) -> int:
     """Largest piece (in 128-bit packets) that ever has to fit in a slot.
 
     Computed over ALL (chunk, rank) pairs, not via
@@ -494,18 +494,18 @@ def largest_chunk4(n4: int, welt: int, k: int) -> int:
     but it is a second version of the same split, and that is exactly the
     error class this transport deliberately avoids in several places.
     """
-    gr = 0
+    largest = 0
     for c in range(k):
         _, clen = _chunk_bounds(n4, c, k)
-        for z in range(welt):
-            _, plen = _chunk_bounds(clen, z, welt)
-            if plen > gr:
-                gr = plen
-    return gr
+        for z in range(world):
+            _, plen = _chunk_bounds(clen, z, world)
+            if plen > largest:
+                largest = plen
+    return largest
 
 
-def pipe_plan(nbytes: int, welt: int, slot: int, tiefe: int,
-              k_wunsch: int, chunk_ziel_bytes: int,
+def pipe_plan(nbytes: int, world: int, slot: int, depth: int,
+              k_wanted: int, chunk_target_bytes: int,
               k_max: int = 64) -> Optional[int]:
     """The chunk count ``K`` for this payload, or ``None``.
 
@@ -514,7 +514,7 @@ def pipe_plan(nbytes: int, welt: int, slot: int, tiefe: int,
     something smaller.
 
     **Rank-uniform.** Every input is the same group-wide (``nbytes`` and
-    ``welt`` inherently, ``slot`` from setup, the rest from rank-uniform
+    ``world`` inherently, ``slot`` from setup, the rest from rank-uniform
     environment variables). Two ranks must never answer differently here.
 
     Two conditions, both hard:
@@ -526,8 +526,8 @@ def pipe_plan(nbytes: int, welt: int, slot: int, tiefe: int,
     2. The largest piece must fit in a slot. Checked with
        :func:`largest_chunk4`, i.e. with the split itself.
 
-    The default for ``K`` (``k_wunsch <= 0``) is derived from
-    ``chunk_ziel_bytes``. It is a **starting point for the benchmark
+    The default for ``K`` (``k_wanted <= 0``) is derived from
+    ``chunk_target_bytes``. It is a **starting point for the benchmark
     series**, not a measurement result: the justification is that in
     ``MESSUNG_ALLES_IM_SELBEN_LAUF.md`` (three ranks, rig 1), ``mesh`` takes
     330.30 us at 1 MiB and the empty-round overhead is 25.74 us; a 256 KiB
@@ -538,30 +538,30 @@ def pipe_plan(nbytes: int, welt: int, slot: int, tiefe: int,
     if nbytes % 16 != 0:
         return None
     n4 = nbytes // 16
-    if tiefe < MIN_DEPTH or tiefe > MAX_DEPTH:
+    if depth < MIN_DEPTH or depth > MAX_DEPTH:
         return None
     slot = int(slot)
     if slot <= 0 or slot % 16:
         return None
-    obergrenze = min(k_max, MAX_CHUNKS, max(1, n4 // welt))
-    if obergrenze < tiefe:
+    upper_limit = min(k_max, MAX_CHUNKS, max(1, n4 // world))
+    if upper_limit < depth:
         # Fewer chunks possible than the depth requires: too little payload
         # per rank. No lowering the depth -- it determines the slot
         # geometry, and that has been fixed since setup.
         return None
 
-    if k_wunsch > 0:
-        kandidaten = [k_wunsch]
+    if k_wanted > 0:
+        candidates = [k_wanted]
     else:
-        ziel = max(1, chunk_ziel_bytes)
-        k0 = max(tiefe, min(obergrenze, max(1, nbytes // ziel)))
+        dst = max(1, chunk_target_bytes)
+        k0 = max(depth, min(upper_limit, max(1, nbytes // dst)))
         # Try ascending: if the largest piece doesn't fit in a slot, MORE
         # splitting helps, never less.
-        kandidaten = list(range(k0, obergrenze + 1))
-    for k in kandidaten:
-        if k < tiefe or k > obergrenze:
+        candidates = list(range(k0, upper_limit + 1))
+    for k in candidates:
+        if k < depth or k > upper_limit:
             continue
-        if largest_chunk4(n4, welt, k) * 16 <= slot:
+        if largest_chunk4(n4, world, k) * 16 <= slot:
             return int(k)
     return None
 
@@ -582,17 +582,17 @@ _CUDA_SRC = r"""
 namespace cg = cooperative_groups;
 
 #define BARLINK_PIPE_MAX_RANKS 8
-#define BARLINK_PIPE_MAX_TIEFE 8
+#define BARLINK_PIPE_MAX_DEPTH 8
 
 // Rate limit of the host abort probe inside the wait macros. Same value and
-// same reasoning as BARLINK_BAR1_WIRT_MASKE in barlink_bar1_ext.py: the word sits
+// same reasoning as BARLINK_BAR1_HOST_MASK in barlink_bar1_ext.py: the word sits
 // in pinned, device-mapped host memory, so one read per 1024 spin iterations
 // stays far below the flag loads the loop already issues, and a wait that is
 // satisfied leaves through its own break before the probe is ever evaluated.
-#define BARLINK_BAR1_WIRT_MASKE 1023u
+#define BARLINK_BAR1_HOST_MASK 1023u
 
 #define K_1BLK   0
-#define K_GITTER 1
+#define K_GRID 1
 #define LA_CV    0
 #define LA_MMIO  2
 
@@ -604,7 +604,7 @@ using u64 = unsigned long long;
 // is a debt. Whoever changes something here must change it there too.
 // ===========================================================================
 
-__device__ __forceinline__ uint4 leseV4(const void *p)
+__device__ __forceinline__ uint4 readV4(const void *p)
 {
     uint4 v;
     asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -613,14 +613,14 @@ __device__ __forceinline__ uint4 leseV4(const void *p)
     return v;
 }
 
-__device__ __forceinline__ void schreibeV4(void *p, uint4 v)
+__device__ __forceinline__ void writeV4(void *p, uint4 v)
 {
     asm volatile("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
                  :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
 
 template<int LA>
-__device__ __forceinline__ u64 flaggeLesen(const u64 *p)
+__device__ __forceinline__ u64 readFlag(const u64 *p)
 {
     u64 v;
     if (LA == LA_MMIO) {
@@ -632,7 +632,7 @@ __device__ __forceinline__ u64 flaggeLesen(const u64 *p)
     return v;
 }
 
-__device__ __forceinline__ void schreibeU64(void *p, u64 v)
+__device__ __forceinline__ void writeU64(void *p, u64 v)
 {
     asm volatile("st.global.wt.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
@@ -697,27 +697,27 @@ __device__ __forceinline__ uint4 addV4<__nv_bfloat16>(uint4 a, uint4 b)
     return r;
 }
 
-// Chunk j out of n units over `teile`; remainder onto the LEADING chunks.
-// Bit-identical to barlink_bar1_ext.py::chunkGrenzen -- the pipe splits
+// Chunk j out of n units over `parts`; remainder onto the LEADING chunks.
+// Bit-identical to barlink_bar1_ext.py::chunkBounds -- the pipe splits
 // twice with the same rule (first into K chunks, then into R pieces).
-__device__ __host__ __forceinline__ void chunkGrenzen(int n, int j, int teile,
+__device__ __host__ __forceinline__ void chunkBounds(int n, int j, int parts,
                                                       int *off, int *len)
 {
-    const int basis = n / teile;
-    const int rest  = n - basis * teile;
-    *len = basis + (j < rest ? 1 : 0);
-    *off = j * basis + (j < rest ? j : rest);
+    const int base = n / parts;
+    const int rest  = n - base * parts;
+    *len = base + (j < rest ? 1 : 0);
+    *off = j * base + (j < rest ? j : rest);
 }
 
 template<int GRID>
-__device__ __forceinline__ void barriere(void)
+__device__ __forceinline__ void barrier(void)
 {
-    if (GRID == K_GITTER) cg::this_grid().sync();
+    if (GRID == K_GRID) cg::this_grid().sync();
     else                  __syncthreads();
 }
 
 // ===========================================================================
-// Inverse of chunkGrenzen: for a flat index j in [0, n), the piece z and
+// Inverse of chunkBounds: for a flat index j in [0, n), the piece z and
 // the offset within it. Closed form, no scan.
 //
 // It allows the reduce-scatter send to run over ALL targets in ONE flat
@@ -726,23 +726,23 @@ __device__ __forceinline__ void barriere(void)
 // via a prefix scan in shared memory; here it works in closed form because
 // the split is uniform.
 //
-// basis == 0 (n < teile) is NOT the special case it appears to be: then
-// rest == n and grenz == n, so the else branch is unreachable. A division
+// base == 0 (n < parts) is NOT the special case it appears to be: then
+// rest == n and bound == n, so the else branch is unreachable. A division
 // by 0 cannot occur.
 // ===========================================================================
-__device__ __forceinline__ void stueckAus(int n, int teile, int j,
-                                          int *z, int *lok)
+__device__ __forceinline__ void pieceOf(int n, int parts, int j,
+                                          int *z, int *loc)
 {
-    const int basis = n / teile;
-    const int rest  = n - basis * teile;
-    const int grenz = rest * (basis + 1);
-    if (j < grenz) {
-        const int q = j / (basis + 1);
-        *z = q; *lok = j - q * (basis + 1);
+    const int base = n / parts;
+    const int rest  = n - base * parts;
+    const int bound = rest * (base + 1);
+    if (j < bound) {
+        const int q = j / (base + 1);
+        *z = q; *loc = j - q * (base + 1);
     } else {
-        const int d = j - grenz;
-        const int q = d / basis;               // basis > 0, s.o.
-        *z = rest + q; *lok = d - q * basis;
+        const int d = j - bound;
+        const int q = d / base;               // base > 0, s.o.
+        *z = rest + q; *loc = d - q * base;
     }
 }
 
@@ -752,40 +752,40 @@ __device__ __forceinline__ void stueckAus(int n, int teile, int j,
 struct PipeArgs {
     const uint4 *in;
     uint4       *out;
-    u64         *rundeDev;
-    u64         *schrittDev;   // absolute chunk counter, survives the call
+    u64         *roundDev;
+    u64         *stepDev;   // absolute chunk counter, survives the call
     // Generation counter of direct mode. LOCAL VRAM, not in the window: a
     // local counter is coherent with the own reads, and only the peer's
     // VIEW of it needs the flag protocol. It lives on the DEVICE because it
     // must keep counting on every graph replay -- a host-side counter gets
     // baked in at capture time and sits frozen during replay.
-    u64         *ergGenDev;
+    u64         *resultGenDev;
     unsigned int *ctlStatus;
-    unsigned int *abbruchDev;
+    unsigned int *abortDev;
     // Host-set abort word (pinned, device-mapped). nullptr = absent, and then
     // the wait macros keep only their cycle deadline. Set to 1 by the peer
     // watchdog when a peer process is provably gone.
-    const unsigned int *abbruchWirt;
+    const unsigned int *abortHost;
     int          n4;
     int          R;
-    int          rang;
+    int          rank;
     int          K;            // chunk count of this call
     int          TT;           // ring depth = slot classes per phase
     int          PP;           // schedule lead, 2 <= PP <= TT
-    int          quittung;     // 1 = publish head (default)
-    long long    schlitz4;     // slot size in 128-bit packets
-    long long    klasse4;      // distance between two slot classes = (R-1)*schlitz4
-    u64          deckelZyklen;
+    int          ack;     // 1 = publish head (default)
+    long long    slot4;     // slot size in 128-bit packets
+    long long    class4;      // distance between two slot classes = (R-1)*slot4
+    u64          capCycles;
 
-    int          direkt;       // 1 = allgather writes into the result buffer
+    int          direct;       // 1 = allgather writes into the result buffer
     // Release handshake of direct mode. 0 = off (the measured legacy
     // behavior, flag family 4 is never touched). > 0 = on, and the number
     // is the DISTANCE IN GENERATIONS after which a result slot is reused:
     // 1 for a permanently reserved graph slot, otherwise the number of
     // eager ring slots.
-    int          ergSlack;
+    int          resultSlack;
 
-    // Payload slots, class 0. Class t sits at + t*klasse4.
+    // Payload slots, class 0. Class t sits at + t*class4.
     uint4       *sendRS[BARLINK_PIPE_MAX_RANKS];
     uint4       *sendAG[BARLINK_PIPE_MAX_RANKS];
     const uint4 *recvRS[BARLINK_PIPE_MAX_RANKS];
@@ -795,43 +795,43 @@ struct PipeArgs {
     // registration on the hot path. The offset within the buffer is the
     // same as in the own `out` -- the allgather doesn't copy anything
     // around, it writes straight to the final destination.
-    uint4       *ergAn[BARLINK_PIPE_MAX_RANKS];
+    uint4       *resultTo[BARLINK_PIPE_MAX_RANKS];
 
     // Counters. [0] = RS ring, [1] = AG ring.
-    u64         *tailAn [2][BARLINK_PIPE_MAX_RANKS];  // me -> receiver z
-    const u64   *tailVon[2][BARLINK_PIPE_MAX_RANKS];  // local, from sender s
-    u64         *headAn [2][BARLINK_PIPE_MAX_RANKS];  // me -> producer s
-    const u64   *headVon[2][BARLINK_PIPE_MAX_RANKS];  // local, from receiver z
+    u64         *tailTo [2][BARLINK_PIPE_MAX_RANKS];  // me -> receiver z
+    const u64   *tailFrom[2][BARLINK_PIPE_MAX_RANKS];  // local, from sender s
+    u64         *headTo [2][BARLINK_PIPE_MAX_RANKS];  // me -> producer s
+    const u64   *headFrom[2][BARLINK_PIPE_MAX_RANKS];  // local, from receiver z
 
     // Release of the result slot (flag family 4). Same direction as
     // tail/head: written at the peer, read locally.
-    u64         *ergBereitAn [BARLINK_PIPE_MAX_RANKS]; // me -> peer z
-    const u64   *ergBereitVon[BARLINK_PIPE_MAX_RANKS]; // local, from peer z
+    u64         *resultReadyTo [BARLINK_PIPE_MAX_RANKS]; // me -> peer z
+    const u64   *resultReadyFrom[BARLINK_PIPE_MAX_RANKS]; // local, from peer z
 };
 
 // ===========================================================================
 // The kernel
 // ===========================================================================
 template<typename T, int LA, int GRID>
-__global__ void bar1_netz_pipe_kernel(PipeArgs A)
+__global__ void bar1_mesh_pipe_kernel(PipeArgs A)
 {
-    const int tid = (GRID == K_GITTER)
+    const int tid = (GRID == K_GRID)
                         ? (int)(blockIdx.x * blockDim.x + threadIdx.x)
                         : (int)threadIdx.x;
-    const int nth = (GRID == K_GITTER)
+    const int nth = (GRID == K_GRID)
                         ? (int)(gridDim.x * blockDim.x)
                         : (int)blockDim.x;
-    const bool erster = (tid == 0);
-    const int  n4 = A.n4, R = A.R, r = A.rang, K = A.K, TT = A.TT, PP = A.PP;
-    const u64  round  = *(const volatile u64 *)A.rundeDev + 1ull;
-    const u64  basis  = *(const volatile u64 *)A.schrittDev;
+    const bool isFirst = (tid == 0);
+    const int  n4 = A.n4, R = A.R, r = A.rank, K = A.K, TT = A.TT, PP = A.PP;
+    const u64  round  = *(const volatile u64 *)A.roundDev + 1ull;
+    const u64  base  = *(const volatile u64 *)A.stepDev;
     // The handshake only runs when both come together: direct mode AND a
     // slack value. Both are group-uniform, so either all ranks enter the
     // handshake or none do -- a rank that skipped it while the others wait
     // for its flag would be a hang, not a wrong result.
-    const bool ergHand = (A.direkt != 0) && (A.ergSlack > 0);
-    const u64  ergGen  = ergHand
-                             ? (*(const volatile u64 *)A.ergGenDev + 1ull)
+    const bool resultHandshake = (A.direct != 0) && (A.resultSlack > 0);
+    const u64  resultGen  = resultHandshake
+                             ? (*(const volatile u64 *)A.resultGenDev + 1ull)
                              : 0ull;
 
     // Everything indexed with a RUNNING index goes into shared memory. A
@@ -842,52 +842,52 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     __shared__ uint4       *sSendAG[BARLINK_PIPE_MAX_RANKS];
     __shared__ const uint4 *sRecvRS[BARLINK_PIPE_MAX_RANKS];
     __shared__ const uint4 *sRecvAG[BARLINK_PIPE_MAX_RANKS];
-    __shared__ uint4       *sErgAn [BARLINK_PIPE_MAX_RANKS];
+    __shared__ uint4       *sResultTo [BARLINK_PIPE_MAX_RANKS];
     // Counter pointers and their local caches (NCCL: connStepCache). Only
     // the first thread touches them; they still live in shared memory,
     // because otherwise 4*8 u64 would pile up as registers per thread.
-    __shared__ u64         *sTailAn [2][BARLINK_PIPE_MAX_RANKS];
-    __shared__ const u64   *sTailVon[2][BARLINK_PIPE_MAX_RANKS];
-    __shared__ u64         *sHeadAn [2][BARLINK_PIPE_MAX_RANKS];
-    __shared__ const u64   *sHeadVon[2][BARLINK_PIPE_MAX_RANKS];
+    __shared__ u64         *sTailTo [2][BARLINK_PIPE_MAX_RANKS];
+    __shared__ const u64   *sTailFrom[2][BARLINK_PIPE_MAX_RANKS];
+    __shared__ u64         *sHeadTo [2][BARLINK_PIPE_MAX_RANKS];
+    __shared__ const u64   *sHeadFrom[2][BARLINK_PIPE_MAX_RANKS];
     __shared__ u64          sTailC[2][BARLINK_PIPE_MAX_RANKS];
     __shared__ u64          sHeadC[2][BARLINK_PIPE_MAX_RANKS];
-    __shared__ u64         *sBereitAn [BARLINK_PIPE_MAX_RANKS];
-    __shared__ const u64   *sBereitVon[BARLINK_PIPE_MAX_RANKS];
-    __shared__ u64          sBereitC  [BARLINK_PIPE_MAX_RANKS];
-    __shared__ int          abbruchS;
+    __shared__ u64         *sReadyTo [BARLINK_PIPE_MAX_RANKS];
+    __shared__ const u64   *sReadyFrom[BARLINK_PIPE_MAX_RANKS];
+    __shared__ u64          sReadyC  [BARLINK_PIPE_MAX_RANKS];
+    __shared__ int          abortS;
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < R; ++i) {
             sSendRS[i] = A.sendRS[i]; sSendAG[i] = A.sendAG[i];
             sRecvRS[i] = A.recvRS[i]; sRecvAG[i] = A.recvAG[i];
-            sErgAn[i]  = A.ergAn[i];
+            sResultTo[i]  = A.resultTo[i];
             for (int ph = 0; ph < 2; ++ph) {
-                sTailAn [ph][i] = A.tailAn [ph][i];
-                sTailVon[ph][i] = A.tailVon[ph][i];
-                sHeadAn [ph][i] = A.headAn [ph][i];
-                sHeadVon[ph][i] = A.headVon[ph][i];
-                // The cache's initial value is BASIS, not 0: what happened
-                // before this call is already reflected in schrittDev. A
+                sTailTo [ph][i] = A.tailTo [ph][i];
+                sTailFrom[ph][i] = A.tailFrom[ph][i];
+                sHeadTo [ph][i] = A.headTo [ph][i];
+                sHeadFrom[ph][i] = A.headFrom[ph][i];
+                // The cache's initial value is BASE, not 0: what happened
+                // before this call is already reflected in stepDev. A
                 // cache starting at 0 wouldn't be wrong, but it would force
                 // a re-read per connection in the first loop iteration.
-                sTailC[ph][i] = basis;
-                sHeadC[ph][i] = basis;
+                sTailC[ph][i] = base;
+                sHeadC[ph][i] = base;
             }
-            sBereitAn [i] = A.ergBereitAn [i];
-            sBereitVon[i] = A.ergBereitVon[i];
-            // Initial value 0, and NOT `ergGen - 1`: the optimistic initial
+            sReadyTo [i] = A.resultReadyTo [i];
+            sReadyFrom[i] = A.resultReadyFrom[i];
+            // Initial value 0, and NOT `resultGen - 1`: the optimistic initial
             // value would be exactly the assumption the handshake is
             // supposed to verify. It costs ONE local read per peer and per
             // call -- the line sits in the own VRAM, not behind PCIe.
-            sBereitC  [i] = 0ull;
+            sReadyC  [i] = 0ull;
         }
-        abbruchS = 0;
+        abortS = 0;
     }
     __syncthreads();
 
-    if (GRID == K_GITTER && erster) {
-        *(volatile unsigned int *)A.abbruchDev = 0u;
+    if (GRID == K_GRID && isFirst) {
+        *(volatile unsigned int *)A.abortDev = 0u;
         __threadfence();
     }
 
@@ -902,12 +902,12 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     // (about 3 us, BEFUND_L2_UMGEHBAR.md) disappears behind the
     // reduce-scatter phase. The wait only happens once the first direct
     // write is due -- i.e. PP-1 loop iterations later.
-    if (ergHand && erster) {
+    if (resultHandshake && isFirst) {
         for (int z = 0; z < R; ++z)
-            if (z != r) schreibeU64(sBereitAn[z], ergGen);
+            if (z != r) writeU64(sReadyTo[z], resultGen);
         __threadfence_system();
     }
-    barriere<GRID>();
+    barrier<GRID>();
 
     // -- Wait conditions ------------------------------------------------------
     //
@@ -916,103 +916,103 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
     // the cache, the window would cost more than it gains (NCCL
     // prims_simple.h:40-41, 107).
     //
-    // `ziel` is always an ABSOLUTE step (basis + c + 1).
+    // `dst` is always an ABSOLUTE step (base + c + 1).
 
-#define PIPE_WARTE_DATEN(PH, ZIEL)                                             \
+#define PIPE_WAIT_DATA(PH, TARGET)                                             \
     do {                                                                       \
-        const u64 _z = (ZIEL);                                                 \
+        const u64 _z = (TARGET);                                                 \
         long long _t0 = clock64();                                             \
-        unsigned int _sonde = 0u;                                              \
+        unsigned int _probe = 0u;                                              \
         for (;;) {                                                             \
-            bool _alle = true;                                                 \
+            bool _all = true;                                                 \
             for (int _s = 0; _s < R; ++_s) {                                   \
                 if (_s == r) continue;                                         \
                 if (sTailC[PH][_s] < _z) {                                     \
-                    sTailC[PH][_s] = flaggeLesen<LA>(sTailVon[PH][_s]);        \
-                    if (sTailC[PH][_s] < _z) { _alle = false; break; }         \
+                    sTailC[PH][_s] = readFlag<LA>(sTailFrom[PH][_s]);        \
+                    if (sTailC[PH][_s] < _z) { _all = false; break; }         \
                 }                                                              \
             }                                                                  \
-            if (_alle) break;                                                  \
-            if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
-            if (A.abbruchWirt != nullptr &&                                    \
-                ((++_sonde & BARLINK_BAR1_WIRT_MASKE) == 0u) &&                  \
-                *(const volatile unsigned int *)A.abbruchWirt != 0u)           \
-                { abbruchS = 1; break; }                                       \
+            if (_all) break;                                                  \
+            if ((u64)(clock64() - _t0) > A.capCycles) { abortS = 1; break; } \
+            if (A.abortHost != nullptr &&                                    \
+                ((++_probe & BARLINK_BAR1_HOST_MASK) == 0u) &&                  \
+                *(const volatile unsigned int *)A.abortHost != 0u)           \
+                { abortS = 1; break; }                                       \
         }                                                                      \
     } while (0)
 
-    // Window: receiver z has read at least (ZIEL - TT) chunks. Unsigned
-    // comparison in the form `cache + TT < ziel` -- exactly like NCCL, so
-    // that ziel < TT does not underflow.
-#define PIPE_WARTE_FENSTER(PH, ZIEL)                                           \
+    // Window: receiver z has read at least (TARGET - TT) chunks. Unsigned
+    // comparison in the form `cache + TT < dst` -- exactly like NCCL, so
+    // that dst < TT does not underflow.
+#define PIPE_WAIT_WINDOW(PH, TARGET)                                           \
     do {                                                                       \
-        if (A.quittung) {                                                      \
-            const u64 _z = (ZIEL);                                             \
+        if (A.ack) {                                                      \
+            const u64 _z = (TARGET);                                             \
             long long _t0 = clock64();                                         \
-            unsigned int _sonde = 0u;                                          \
+            unsigned int _probe = 0u;                                          \
             for (;;) {                                                         \
-                bool _alle = true;                                             \
+                bool _all = true;                                             \
                 for (int _q = 0; _q < R; ++_q) {                               \
                     if (_q == r) continue;                                     \
                     if (sHeadC[PH][_q] + (u64)TT < _z) {                       \
-                        sHeadC[PH][_q] = flaggeLesen<LA>(sHeadVon[PH][_q]);    \
-                        if (sHeadC[PH][_q] + (u64)TT < _z) { _alle = false; break; } \
+                        sHeadC[PH][_q] = readFlag<LA>(sHeadFrom[PH][_q]);    \
+                        if (sHeadC[PH][_q] + (u64)TT < _z) { _all = false; break; } \
                     }                                                          \
                 }                                                              \
-                if (_alle) break;                                              \
-                if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
-                if (A.abbruchWirt != nullptr &&                                \
-                    ((++_sonde & BARLINK_BAR1_WIRT_MASKE) == 0u) &&              \
-                    *(const volatile unsigned int *)A.abbruchWirt != 0u)       \
-                    { abbruchS = 1; break; }                                   \
+                if (_all) break;                                              \
+                if ((u64)(clock64() - _t0) > A.capCycles) { abortS = 1; break; } \
+                if (A.abortHost != nullptr &&                                \
+                    ((++_probe & BARLINK_BAR1_HOST_MASK) == 0u) &&              \
+                    *(const volatile unsigned int *)A.abortHost != 0u)       \
+                    { abortS = 1; break; }                                   \
             }                                                                  \
         }                                                                      \
     } while (0)
 
-    // Peer z has released its result slot for generation ZIEL.
+    // Peer z has released its result slot for generation TARGET.
     //
-    // The slot is reused every ``ergSlack`` generations; whoever writes
-    // into generation ZIEL therefore overwrites the contents of generation
-    // ``ZIEL - ergSlack``. It is released once z has entered generation
-    // ``ZIEL - ergSlack + 1``. The same unsigned-safe form as
-    // PIPE_WARTE_FENSTER: the slack sits on the LEFT side, so that
-    // ZIEL < ergSlack does not underflow.
+    // The slot is reused every ``resultSlack`` generations; whoever writes
+    // into generation TARGET therefore overwrites the contents of generation
+    // ``TARGET - resultSlack``. It is released once z has entered generation
+    // ``TARGET - resultSlack + 1``. The same unsigned-safe form as
+    // PIPE_WAIT_WINDOW: the slack sits on the LEFT side, so that
+    // TARGET < resultSlack does not underflow.
     //
     // Why this condition is needed at all, and the AG acknowledgement isn't
-    // enough: at ``ergSlack >= 2`` it follows from the AG window (the
+    // enough: at ``resultSlack >= 2`` it follows from the AG window (the
     // predecessor is two calls back, and even ONE call of distance is
     // already enforced by tail/head). For a permanently reserved graph
-    // slot, ``ergSlack == 1``: the same slot is overwritten on EVERY
+    // slot, ``resultSlack == 1``: the same slot is overwritten on EVERY
     // replay, and then there is no distance left that the AG window could
     // enforce.
-#define PIPE_WARTE_ERGFREI(ZIEL)                                               \
+#define PIPE_WAIT_RESULT_FREE(TARGET)                                               \
     do {                                                                       \
-        const u64 _z = (ZIEL);                                                 \
-        const u64 _sl = (u64)(A.ergSlack - 1);                                 \
+        const u64 _z = (TARGET);                                                 \
+        const u64 _sl = (u64)(A.resultSlack - 1);                                 \
         long long _t0 = clock64();                                             \
-        unsigned int _sonde = 0u;                                              \
+        unsigned int _probe = 0u;                                              \
         for (;;) {                                                             \
-            bool _alle = true;                                                 \
+            bool _all = true;                                                 \
             for (int _q = 0; _q < R; ++_q) {                                   \
                 if (_q == r) continue;                                         \
-                if (sBereitC[_q] + _sl < _z) {                                 \
-                    sBereitC[_q] = flaggeLesen<LA>(sBereitVon[_q]);            \
-                    if (sBereitC[_q] + _sl < _z) { _alle = false; break; }     \
+                if (sReadyC[_q] + _sl < _z) {                                 \
+                    sReadyC[_q] = readFlag<LA>(sReadyFrom[_q]);            \
+                    if (sReadyC[_q] + _sl < _z) { _all = false; break; }     \
                 }                                                              \
             }                                                                  \
-            if (_alle) break;                                                  \
-            if ((u64)(clock64() - _t0) > A.deckelZyklen) { abbruchS = 1; break; } \
-            if (A.abbruchWirt != nullptr &&                                    \
-                ((++_sonde & BARLINK_BAR1_WIRT_MASKE) == 0u) &&                  \
-                *(const volatile unsigned int *)A.abbruchWirt != 0u)           \
-                { abbruchS = 1; break; }                                       \
+            if (_all) break;                                                  \
+            if ((u64)(clock64() - _t0) > A.capCycles) { abortS = 1; break; } \
+            if (A.abortHost != nullptr &&                                    \
+                ((++_probe & BARLINK_BAR1_HOST_MASK) == 0u) &&                  \
+                *(const volatile unsigned int *)A.abortHost != 0u)           \
+                { abortS = 1; break; }                                       \
         }                                                                      \
     } while (0)
 
     // Once per call, not per loop iteration: the condition depends on the
     // generation, and that doesn't change within a call. Only thread 0
     // evaluates it, so an ordinary local variable is enough.
-    bool ergFreiGesehen = !ergHand;
+    bool resultFreeSeen = !resultHandshake;
 
     // -- Loop -----------------------------------------------------------------
     //
@@ -1063,49 +1063,49 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         // the condition would only have required step 2. With the absolute
         // step, the class is `(step-1) mod TT` and the condition always
         // hits the correct predecessor.
-        const int ts = (int)((basis + (u64)cs) % (u64)TT);
-        const int tr = (cr >= 0) ? (int)((basis + (u64)cr) % (u64)TT) : 0;
-        const int tg = (cg >= 0) ? (int)((basis + (u64)cg) % (u64)TT) : 0;
+        const int ts = (int)((base + (u64)cs) % (u64)TT);
+        const int tr = (cr >= 0) ? (int)((base + (u64)cr) % (u64)TT) : 0;
+        const int tg = (cg >= 0) ? (int)((base + (u64)cg) % (u64)TT) : 0;
 
         // (a) first thread only: wait
-        if (erster) {
-            if (cs < K)             PIPE_WARTE_FENSTER(0, basis + (u64)cs + 1ull);
-            if (!abbruchS && cr >= 0 && cr < K) {
-                                    PIPE_WARTE_DATEN  (0, basis + (u64)cr + 1ull);
-                if (!abbruchS)      PIPE_WARTE_FENSTER(1, basis + (u64)cr + 1ull);
+        if (isFirst) {
+            if (cs < K)             PIPE_WAIT_WINDOW(0, base + (u64)cs + 1ull);
+            if (!abortS && cr >= 0 && cr < K) {
+                                    PIPE_WAIT_DATA  (0, base + (u64)cr + 1ull);
+                if (!abortS)      PIPE_WAIT_WINDOW(1, base + (u64)cr + 1ull);
                 // Only here, right before this call's first direct write --
                 // the reduce-scatter iterations before it have already
                 // carried the peers' flags across the wire.
-                if (!abbruchS && !ergFreiGesehen) {
-                    PIPE_WARTE_ERGFREI(ergGen);
-                    ergFreiGesehen = true;
+                if (!abortS && !resultFreeSeen) {
+                    PIPE_WAIT_RESULT_FREE(resultGen);
+                    resultFreeSeen = true;
                 }
             }
-            if (!abbruchS && cg >= 0) PIPE_WARTE_DATEN(1, basis + (u64)cg + 1ull);
-            if (abbruchS && GRID == K_GITTER) {
-                *(volatile unsigned int *)A.abbruchDev = 1u;
+            if (!abortS && cg >= 0) PIPE_WAIT_DATA(1, base + (u64)cg + 1ull);
+            if (abortS && GRID == K_GRID) {
+                *(volatile unsigned int *)A.abortDev = 1u;
                 __threadfence();
             }
         }
-        barriere<GRID>();
+        barrier<GRID>();
         {
             const int ab = (GRID == K_1BLK)
-                               ? abbruchS
-                               : (int)*(volatile unsigned int *)A.abbruchDev;
+                               ? abortS
+                               : (int)*(volatile unsigned int *)A.abortDev;
             if (ab) {
                 // ALL blocks return together -- a single block that no
                 // longer reaches a grid.sync() hangs the rest.
-                if (erster) {
+                if (isFirst) {
                     *A.ctlStatus = 1u;
-                    *(volatile u64 *)A.rundeDev   = round;
-                    *(volatile u64 *)A.schrittDev = basis + (u64)K;
+                    *(volatile u64 *)A.roundDev   = round;
+                    *(volatile u64 *)A.stepDev = base + (u64)K;
                     // ALSO on the abort path. The generation counter must
                     // stay group-uniform; a rank that left it standing on
                     // abort while another kept advancing it would wait, on
                     // the next call, for a generation that never comes.
-                    // Same reasoning as for rundeDev and schrittDev right
+                    // Same reasoning as for roundDev and stepDev right
                     // above.
-                    if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
+                    if (resultHandshake) *(volatile u64 *)A.resultGenDev = resultGen;
                     __threadfence_system();
                 }
                 return;
@@ -1113,7 +1113,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         }
         // WITHOUT THIS FENCE, THE REDUCTION READS STALE LINES.
         //
-        // `leseV4` is `ld.global.cv`, and `ld.global.cv` alone does NOT see
+        // `readV4` is `ld.global.cv`, and `ld.global.cv` alone does NOT see
         // incoming PCIe writes on this rig: the receiving card's L2 is not
         // coherent with them (BEFUND_L2_NICHT_KOHAERENT.md;
         // BEFUND_L2_UMGEHBAR.md, line (1): 46.5 million read attempts,
@@ -1125,7 +1125,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         //
         // From ALL threads, not just the first: the first thread has seen
         // the flag, but every thread reads its own slots right after.
-        // `bar1_netz_kernel` has the same fence at the same spot
+        // `bar1_mesh_kernel` has the same fence at the same spot
         // (barlink_bar1_ext.py, behind every abort check).
         __threadfence_system();
 
@@ -1142,32 +1142,32 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         // cards (foreign versus own).
         if (cs < K) {
             int coff, clen;
-            chunkGrenzen(n4, cs, K, &coff, &clen);
-            const long long kv = (long long)ts * A.klasse4;
+            chunkBounds(n4, cs, K, &coff, &clen);
+            const long long kv = (long long)ts * A.class4;
             for (int j = tid; j < clen; j += nth) {
-                int z, lok;
-                stueckAus(clen, R, j, &z, &lok);
+                int z, loc;
+                pieceOf(clen, R, j, &z, &loc);
                 if (z == r) continue;      // own piece stays in `in`
-                schreibeV4(sSendRS[z] + kv + lok, A.in[coff + j]);
+                writeV4(sSendRS[z] + kv + loc, A.in[coff + j]);
             }
         }
         if (cr >= 0 && cr < K) {
             int coff, clen, poff, plen;
-            chunkGrenzen(n4, cr, K, &coff, &clen);
-            chunkGrenzen(clen, r, R, &poff, &plen);
-            const long long kv = (long long)tr * A.klasse4;
+            chunkBounds(n4, cr, K, &coff, &clen);
+            chunkBounds(clen, r, R, &poff, &plen);
+            const long long kv = (long long)tr * A.class4;
             const uint4 *q = A.in  + coff + poff;
             uint4       *o = A.out + coff + poff;
             for (int j = tid; j < plen; j += nth) {
                 uint4 s = q[j];
                 for (int p = 0; p < R; ++p) {
                     if (p == r) continue;
-                    s = addV4<T>(s, leseV4(sRecvRS[p] + kv + j));
+                    s = addV4<T>(s, readV4(sRecvRS[p] + kv + j));
                 }
                 // Form the result ONCE, then write it from the register
                 // both into the own output buffer and to all peers. The
                 // probe kernel reads `out` a second time for this
-                // (reduziereNPhase, then verteilePhase).
+                // (reduceNPhase, then scatterPhase).
                 // In direct mode, `out` lives in the exported region, and
                 // peers write into that SAME region via PCIe. An ordinary
                 // store would leave a dirty L2 line behind; a line is 128
@@ -1178,37 +1178,37 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
                 // crash. `st.wt` leaves no dirty line behind. Outside direct
                 // mode, `out` is an ordinary torch buffer that no peer
                 // touches; there the normal store remains.
-                if (A.direkt) schreibeV4(o + j, s);
+                if (A.direct) writeV4(o + j, s);
                 else          o[j] = s;
-                if (A.direkt) {
+                if (A.direct) {
                     // DIRECT MODE: straight to the final destination in the
                     // receiver's result buffer, not into a slot. That
                     // eliminates the receiver's read-out-and-copy pass
                     // ENTIRELY -- not halfway. Same offset as in the own
                     // `out`, hence 16-byte-aligned, because the buffer
                     // starts on a page boundary.
-                    const int ziel = coff + poff + j;
+                    const int dst = coff + poff + j;
                     for (int z = 0; z < R; ++z) {
                         if (z == r) continue;
-                        schreibeV4(sErgAn[z] + ziel, s);
+                        writeV4(sResultTo[z] + dst, s);
                     }
                 } else {
                     for (int z = 0; z < R; ++z) {
                         if (z == r) continue;
-                        schreibeV4(sSendAG[z] + kv + j, s);
+                        writeV4(sSendAG[z] + kv + j, s);
                     }
                 }
             }
         }
-        if (cg >= 0 && !A.direkt) {
+        if (cg >= 0 && !A.direct) {
             int coff, clen;
-            chunkGrenzen(n4, cg, K, &coff, &clen);
-            const long long kv = (long long)tg * A.klasse4;
+            chunkBounds(n4, cg, K, &coff, &clen);
+            const long long kv = (long long)tg * A.class4;
             for (int j = tid; j < clen; j += nth) {
-                int s, lok;
-                stueckAus(clen, R, j, &s, &lok);
+                int s, loc;
+                pieceOf(clen, R, j, &s, &loc);
                 if (s == r) continue;      // own piece is already in out
-                A.out[coff + j] = leseV4(sRecvAG[s] + kv + lok);
+                A.out[coff + j] = readV4(sRecvAG[s] + kv + loc);
             }
         }
         // In direct mode there is NOTHING to do here: the peers' pieces are
@@ -1217,7 +1217,7 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         // kernel doesn't end before the peers' last packets have arrived.
         // Without it the call would return a half-filled result tensor.
         __threadfence_system();
-        barriere<GRID>();
+        barrier<GRID>();
 
         // (c) first thread only: publish.
         //
@@ -1225,50 +1225,50 @@ __global__ void bar1_netz_pipe_kernel(PipeArgs A)
         // then the counter. Payload and counter go to the SAME target
         // card, so per-requester/completer-pair PCIe ordering holds --
         // the same assumption mesh/ring/a2a already rely on.
-        if (erster) {
+        if (isFirst) {
             if (cs < K) {
-                const u64 m = basis + (u64)cs + 1ull;
+                const u64 m = base + (u64)cs + 1ull;
                 for (int z = 0; z < R; ++z)
-                    if (z != r) schreibeU64(sTailAn[0][z], m);
+                    if (z != r) writeU64(sTailTo[0][z], m);
             }
             if (cr >= 0 && cr < K) {
-                const u64 m = basis + (u64)cr + 1ull;
+                const u64 m = base + (u64)cr + 1ull;
                 for (int z = 0; z < R; ++z) {
                     if (z == r) continue;
-                    schreibeU64(sTailAn[1][z], m);          // AG data is in place
-                    if (A.quittung) schreibeU64(sHeadAn[0][z], m);  // RS read
+                    writeU64(sTailTo[1][z], m);          // AG data is in place
+                    if (A.ack) writeU64(sHeadTo[0][z], m);  // RS read
                 }
             }
-            if (cg >= 0 && A.quittung) {
-                const u64 m = basis + (u64)cg + 1ull;
+            if (cg >= 0 && A.ack) {
+                const u64 m = base + (u64)cg + 1ull;
                 for (int z = 0; z < R; ++z)
-                    if (z != r) schreibeU64(sHeadAn[1][z], m);      // AG read
+                    if (z != r) writeU64(sHeadTo[1][z], m);      // AG read
             }
             __threadfence_system();
         }
     }
 
-    barriere<GRID>();
-    if (erster) {
-        *(volatile u64 *)A.rundeDev   = round;
-        *(volatile u64 *)A.schrittDev = basis + (u64)K;
-        if (ergHand) *(volatile u64 *)A.ergGenDev = ergGen;
+    barrier<GRID>();
+    if (isFirst) {
+        *(volatile u64 *)A.roundDev   = round;
+        *(volatile u64 *)A.stepDev = base + (u64)K;
+        if (resultHandshake) *(volatile u64 *)A.resultGenDev = resultGen;
         __threadfence_system();
     }
-#undef PIPE_WARTE_DATEN
-#undef PIPE_WARTE_FENSTER
-#undef PIPE_WARTE_ERGFREI
+#undef PIPE_WAIT_DATA
+#undef PIPE_WAIT_WINDOW
+#undef PIPE_WAIT_RESULT_FREE
 }
 
 // ===========================================================================
-// Hostseite
+// Host side
 // ===========================================================================
 
-static int gitterGroesse(const void *fn, int threads, int n4)
+static int gridSize(const void *fn, int threads, int n4)
 {
-    int proSM = 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&proSM, fn, threads, 0)
-            != cudaSuccess || proSM < 1)
+    int perSM = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSM, fn, threads, 0)
+            != cudaSuccess || perSM < 1)
         return 1;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return 1;
@@ -1276,42 +1276,42 @@ static int gitterGroesse(const void *fn, int threads, int n4)
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)
             != cudaSuccess || sms < 1)
         return 1;
-    int g = proSM * sms;
-    int noetig = (n4 + threads - 1) / threads;
-    if (noetig < 1) noetig = 1;
-    if (noetig < g) g = noetig;
+    int g = perSM * sms;
+    int needed = (n4 + threads - 1) / threads;
+    if (needed < 1) needed = 1;
+    if (needed < g) g = needed;
     if (g < 1) g = 1;
     return g;
 }
 
 template<typename T>
-static void startePipe(int kern, int la, PipeArgs &A, int threads,
-                       int grid_n4, cudaStream_t strom)
+static void startPipe(int kernel_variant, int la, PipeArgs &A, int threads,
+                       int grid_n4, cudaStream_t stream)
 {
-#define BARLINK_PIPE_STARTE(LA)                                                  \
+#define BARLINK_PIPE_LAUNCH(LA)                                                  \
     do {                                                                       \
-        if (kern == K_GITTER) {                                                \
+        if (kernel_variant == K_GRID) {                                                \
             const void *fn =                                                   \
-                (const void *)bar1_netz_pipe_kernel<T, LA, K_GITTER>;          \
-            int g = gitterGroesse(fn, threads, grid_n4);                       \
+                (const void *)bar1_mesh_pipe_kernel<T, LA, K_GRID>;          \
+            int g = gridSize(fn, threads, grid_n4);                       \
             dim3 gd((unsigned)g), bd((unsigned)threads);                       \
             void *args[1] = { &A };                                            \
             cudaError_t e = cudaLaunchCooperativeKernel(fn, gd, bd, args, 0,   \
-                                                        strom);                \
+                                                        stream);                \
             TORCH_CHECK(e == cudaSuccess,                                      \
                         "barlink-bar1 pipe: cudaLaunchCooperativeKernel -> ",    \
                         cudaGetErrorString(e));                                \
             return;                                                            \
         }                                                                      \
-        bar1_netz_pipe_kernel<T, LA, K_1BLK><<<1, threads, 0, strom>>>(A);     \
+        bar1_mesh_pipe_kernel<T, LA, K_1BLK><<<1, threads, 0, stream>>>(A);     \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
                     "barlink-bar1 pipe: kernel launch failed");                  \
         return;                                                                \
     } while (0)
 
-    if (la == LA_MMIO) BARLINK_PIPE_STARTE(LA_MMIO);
-    else               BARLINK_PIPE_STARTE(LA_CV);
-#undef BARLINK_PIPE_STARTE
+    if (la == LA_MMIO) BARLINK_PIPE_LAUNCH(LA_MMIO);
+    else               BARLINK_PIPE_LAUNCH(LA_CV);
+#undef BARLINK_PIPE_LAUNCH
 }
 
 // A tensor OVER the exported receive region, without a copy.
@@ -1327,33 +1327,33 @@ static void startePipe(int kern, int la, PipeArgs &A, int threads,
 // `at::from_blob` WITHOUT a deleter: the memory belongs to the transport
 // and is freed by `close()`. A deleter would be the bug here -- torch
 // would try to hand a cuMemMap address back to the caching allocator.
-at::Tensor bar1_erg_tensor(int64_t ptr, at::Tensor muster)
+at::Tensor bar1_result_tensor(int64_t ptr, at::Tensor like)
 {
     TORCH_CHECK(ptr != 0, "barlink-bar1 pipe: result buffer is a null pointer");
     TORCH_CHECK((ptr % 16) == 0,
                 "barlink-bar1 pipe: result buffer ", ptr,
                 " is not 16-byte-aligned -- every write into the WC "
                 "aperture is 128 bits wide");
-    return at::from_blob((void *)(uintptr_t)ptr, muster.sizes(),
-                         muster.options());
+    return at::from_blob((void *)(uintptr_t)ptr, like.sizes(),
+                         like.options());
 }
 
-void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
+void bar1_mesh_pipe(at::Tensor inp, at::Tensor out,
                     int64_t rank, int64_t world,
-                    std::vector<int64_t> peer_nutz,
+                    std::vector<int64_t> peer_payload,
                     std::vector<int64_t> peer_flag,
-                    std::vector<int64_t> peer_erg,
-                    int64_t eigen_nutz, int64_t eigen_flag,
-                    int64_t slot, int64_t off_pipe, int64_t fbasis_pipe,
-                    int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
-                    int64_t quittung, int64_t direkt, int64_t erg_slack,
-                    at::Tensor runde_dev, at::Tensor schritt_dev,
-                    at::Tensor erg_gen_dev, at::Tensor ctl_dev,
-                    int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                    int64_t ladeform, int64_t abbruch_wirt)
+                    std::vector<int64_t> peer_result,
+                    int64_t own_payload, int64_t own_flag,
+                    int64_t slot, int64_t off_pipe, int64_t fbase_pipe,
+                    int64_t k_chunks, int64_t depth, int64_t lead,
+                    int64_t ack, int64_t direct, int64_t result_slack,
+                    at::Tensor round_dev, at::Tensor step_dev,
+                    at::Tensor result_gen_dev, at::Tensor ctl_dev,
+                    int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                    int64_t load_shape, int64_t abort_host)
 {
     const int R = (int)world, r = (int)rank;
-    const int K = (int)k_chunks, TT = (int)tiefe, PP = (int)vorlauf;
+    const int K = (int)k_chunks, TT = (int)depth, PP = (int)lead;
     TORCH_CHECK(R >= 2 && R <= BARLINK_PIPE_MAX_RANKS,
                 "barlink-bar1 pipe: world ", R, " outside 2..",
                 BARLINK_PIPE_MAX_RANKS);
@@ -1366,9 +1366,9 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
                 "barlink-bar1 pipe: in and out must not be the same -- the "
                 "reduction still reads 'in' while 'out' is already set");
-    TORCH_CHECK((int64_t)peer_nutz.size() == world &&
+    TORCH_CHECK((int64_t)peer_payload.size() == world &&
                 (int64_t)peer_flag.size() == world &&
-                (int64_t)peer_erg.size() == world,
+                (int64_t)peer_result.size() == world,
                 "barlink-bar1 pipe: peer table has the wrong length");
     // PP >= 2: at PP == 1, sending chunk c and consuming it would fall into
     // the same loop iteration, and the wait condition would stand BEFORE
@@ -1376,9 +1376,9 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     // turns into an error, only into a slow one.
     // PP <= TT: the ring must be at least as deep as the lead, otherwise
     // the schedule overtakes the slots.
-    TORCH_CHECK(TT >= 2 && TT <= BARLINK_PIPE_MAX_TIEFE,
+    TORCH_CHECK(TT >= 2 && TT <= BARLINK_PIPE_MAX_DEPTH,
                 "barlink-bar1 pipe: ring depth ", TT, " outside 2..",
-                BARLINK_PIPE_MAX_TIEFE);
+                BARLINK_PIPE_MAX_DEPTH);
     TORCH_CHECK(PP >= 2 && PP <= TT,
                 "barlink-bar1 pipe: lead ", PP, " outside 2..", TT,
                 " -- it must not exceed the ring depth");
@@ -1402,21 +1402,21 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     const int n4 = (int)(nbytes / 16);
     TORCH_CHECK(n4 >= R, "barlink-bar1 pipe: fewer than one packet per rank");
 
-    // Seam check. Computed with chunkGrenzen ITSELF, over all (chunk, rank)
+    // Seam check. Computed with chunkBounds ITSELF, over all (chunk, rank)
     // pairs -- not with a second, closed-form version.
-    int maxStueck = 0, maxChunk = 0;
+    int maxPiece = 0, maxChunk = 0;
     for (int c = 0; c < K; ++c) {
         int coff, clen;
-        chunkGrenzen(n4, c, K, &coff, &clen);
+        chunkBounds(n4, c, K, &coff, &clen);
         if (clen > maxChunk) maxChunk = clen;
         for (int z = 0; z < R; ++z) {
             int poff, plen;
-            chunkGrenzen(clen, z, R, &poff, &plen);
-            if (plen > maxStueck) maxStueck = plen;
+            chunkBounds(clen, z, R, &poff, &plen);
+            if (plen > maxPiece) maxPiece = plen;
         }
     }
-    TORCH_CHECK((int64_t)maxStueck * 16 <= slot,
-                "barlink-bar1 pipe: largest piece ", (int64_t)maxStueck * 16,
+    TORCH_CHECK((int64_t)maxPiece * 16 <= slot,
+                "barlink-bar1 pipe: largest piece ", (int64_t)maxPiece * 16,
                 " bytes does not fit in the pipe slot of ", slot,
                 " bytes (K=", K, ", T=", TT, ", R=", R,
                 "). The caller should have asked handles().");
@@ -1425,60 +1425,60 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     std::memset(&A, 0, sizeof(A));
     A.in           = (const uint4 *)inp.data_ptr();
     A.out          = (uint4 *)out.data_ptr();
-    A.rundeDev     = (u64 *)runde_dev.data_ptr();
-    A.schrittDev   = (u64 *)schritt_dev.data_ptr();
+    A.roundDev     = (u64 *)round_dev.data_ptr();
+    A.stepDev   = (u64 *)step_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
-    A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    A.abortDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
     // 0 means the host could not map the abort word; the wait macros then see
     // nullptr and skip the probe entirely.
-    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
+    A.abortHost  = (const unsigned int *)(uintptr_t)abort_host;
     A.n4           = n4;
     A.R            = R;
-    A.rang         = r;
+    A.rank         = r;
     A.K            = K;
     A.TT           = TT;
     A.PP           = PP;
-    A.quittung     = (int)quittung;
-    A.direkt       = (int)direkt;
-    A.ergSlack     = (int)erg_slack;
-    A.deckelZyklen = (u64)deckel_zyklen;
-    A.schlitz4     = (long long)(slot / 16);
-    A.klasse4      = (long long)(R - 1) * A.schlitz4;
+    A.ack     = (int)ack;
+    A.direct       = (int)direct;
+    A.resultSlack     = (int)result_slack;
+    A.capCycles = (u64)cap_cycles;
+    A.slot4     = (long long)(slot / 16);
+    A.class4      = (long long)(R - 1) * A.slot4;
 
     // The AG ring sits behind the RS ring; each ring holds T*(R-1) slots.
     // Within a ring the order is (class, position), so the class is
-    // reached with a single multiple of klasse4.
+    // reached with a single multiple of class4.
     const long long ringBytes = (long long)TT * (R - 1) * slot;
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
         // My position in receiver z's ascending peer list. NOT (r < z) --
         // the same derivation as in mesh and a2a.
         const long long p = (long long)(r - (r > z ? 1 : 0));
-        char *zb = (char *)(uintptr_t)peer_nutz[z] + off_pipe;
+        char *zb = (char *)(uintptr_t)peer_payload[z] + off_pipe;
         A.sendRS[z] = (uint4 *)(zb + p * slot);
         A.sendAG[z] = (uint4 *)(zb + ringBytes + p * slot);
-        if (direkt) {
-            TORCH_CHECK(peer_erg[z] != 0,
+        if (direct) {
+            TORCH_CHECK(peer_result[z] != 0,
                         "barlink-bar1 pipe: direct mode without a result "
                         "buffer from rank ", z);
-            TORCH_CHECK((peer_erg[z] % 16) == 0,
+            TORCH_CHECK((peer_result[z] % 16) == 0,
                         "barlink-bar1 pipe: result buffer of rank ", z,
                         " is not 16-byte-aligned");
-            A.ergAn[z] = (uint4 *)(uintptr_t)peer_erg[z];
+            A.resultTo[z] = (uint4 *)(uintptr_t)peer_result[z];
         }
     }
-    if (direkt) {
+    if (direct) {
         // The own result buffer MUST be `out` -- otherwise the peer would
         // write into a place the caller never gets to see. This is the
         // seam between Python and the kernel, and it is checked, not
         // assumed.
-        TORCH_CHECK((uintptr_t)out.data_ptr() == (uintptr_t)peer_erg[r],
+        TORCH_CHECK((uintptr_t)out.data_ptr() == (uintptr_t)peer_result[r],
                     "barlink-bar1 pipe: in direct mode `out` must be the own "
                     "result buffer (out=", (int64_t)(uintptr_t)out.data_ptr(),
-                    ", erg=", peer_erg[r], ")");
+                    ", result=", peer_result[r], ")");
     }
     {
-        char *mb = (char *)(uintptr_t)eigen_nutz + off_pipe;
+        char *mb = (char *)(uintptr_t)own_payload + off_pipe;
         for (int s = 0; s < R; ++s) {
             if (s == r) continue;
             const long long p = (long long)(s - (s > r ? 1 : 0));
@@ -1495,60 +1495,60 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
     for (int ph = 0; ph < 2; ++ph) {
         for (int q = 0; q < R; ++q) {
             if (q == r) continue;
-            char *pf = (char *)(uintptr_t)peer_flag[q] + fbasis_pipe;
-            char *ef = (char *)(uintptr_t)eigen_flag   + fbasis_pipe;
-            A.tailAn [ph][q] = (u64 *)(pf + (size_t)(ph * R + r) * 256u);
-            A.tailVon[ph][q] = (const u64 *)(ef + (size_t)(ph * R + q) * 256u);
-            A.headAn [ph][q] = (u64 *)(pf + (size_t)((2 + ph) * R + r) * 256u);
-            A.headVon[ph][q] = (const u64 *)(ef + (size_t)((2 + ph) * R + q) * 256u);
+            char *pf = (char *)(uintptr_t)peer_flag[q] + fbase_pipe;
+            char *ef = (char *)(uintptr_t)own_flag   + fbase_pipe;
+            A.tailTo [ph][q] = (u64 *)(pf + (size_t)(ph * R + r) * 256u);
+            A.tailFrom[ph][q] = (const u64 *)(ef + (size_t)(ph * R + q) * 256u);
+            A.headTo [ph][q] = (u64 *)(pf + (size_t)((2 + ph) * R + r) * 256u);
+            A.headFrom[ph][q] = (const u64 *)(ef + (size_t)((2 + ph) * R + q) * 256u);
         }
     }
 
     // Family 4: the release handshake. Only set up if it actually runs --
     // without it the pointers stay null and the kernel never touches the
     // family, so the path is byte-for-byte the measured one.
-    TORCH_CHECK(erg_slack >= 0,
-                "barlink-bar1 pipe: erg_slack ", erg_slack, " is negative");
-    if (direkt && erg_slack > 0) {
-        TORCH_CHECK(erg_gen_dev.scalar_type() == at::kLong &&
-                    erg_gen_dev.numel() >= 1,
-                    "barlink-bar1 pipe: erg_gen_dev must be an int64 tensor "
+    TORCH_CHECK(result_slack >= 0,
+                "barlink-bar1 pipe: result_slack ", result_slack, " is negative");
+    if (direct && result_slack > 0) {
+        TORCH_CHECK(result_gen_dev.scalar_type() == at::kLong &&
+                    result_gen_dev.numel() >= 1,
+                    "barlink-bar1 pipe: result_gen_dev must be an int64 tensor "
                     "with at least one element");
-        A.ergGenDev = (u64 *)erg_gen_dev.data_ptr();
+        A.resultGenDev = (u64 *)result_gen_dev.data_ptr();
         for (int q = 0; q < R; ++q) {
             if (q == r) continue;
-            char *pf = (char *)(uintptr_t)peer_flag[q] + fbasis_pipe;
-            char *ef = (char *)(uintptr_t)eigen_flag   + fbasis_pipe;
-            A.ergBereitAn [q] = (u64 *)(pf + (size_t)(4 * R + r) * 256u);
-            A.ergBereitVon[q] = (const u64 *)(ef + (size_t)(4 * R + q) * 256u);
+            char *pf = (char *)(uintptr_t)peer_flag[q] + fbase_pipe;
+            char *ef = (char *)(uintptr_t)own_flag   + fbase_pipe;
+            A.resultReadyTo [q] = (u64 *)(pf + (size_t)(4 * R + r) * 256u);
+            A.resultReadyFrom[q] = (const u64 *)(ef + (size_t)(4 * R + q) * 256u);
         }
     } else {
         // Without direct mode, a slack value is meaningless, and a
         // meaningless value that's silently ignored is exactly the spot
         // where someone later assumes an effect that isn't there.
-        TORCH_CHECK(erg_slack == 0 || direkt,
-                    "barlink-bar1 pipe: erg_slack ", erg_slack,
+        TORCH_CHECK(result_slack == 0 || direct,
+                    "barlink-bar1 pipe: result_slack ", result_slack,
                     " without direct mode -- the handshake protects a "
                     "result slot that doesn't exist in this call");
-        A.ergSlack = 0;
+        A.resultSlack = 0;
     }
 
-    auto strom = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     // The grid is sized after the LARGEST CHUNK, not the whole payload:
     // more blocks than one chunk's worth of work only wait at
     // grid.sync().
     switch (inp.scalar_type()) {
         case at::kFloat:
-            startePipe<float>((int)kern, (int)ladeform, A, (int)threads,
-                              maxChunk, strom);
+            startPipe<float>((int)kernel_variant, (int)load_shape, A, (int)threads,
+                              maxChunk, stream);
             break;
         case at::kHalf:
-            startePipe<__half>((int)kern, (int)ladeform, A, (int)threads,
-                               maxChunk, strom);
+            startPipe<__half>((int)kernel_variant, (int)load_shape, A, (int)threads,
+                               maxChunk, stream);
             break;
         case at::kBFloat16:
-            startePipe<__nv_bfloat16>((int)kern, (int)ladeform, A, (int)threads,
-                                      maxChunk, strom);
+            startPipe<__nv_bfloat16>((int)kernel_variant, (int)load_shape, A, (int)threads,
+                                      maxChunk, stream);
             break;
         default:
             TORCH_CHECK(false, "barlink-bar1 pipe: data type ", inp.scalar_type(),
@@ -1558,21 +1558,21 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
 """
 
 _CPP_SRC = """
-at::Tensor bar1_erg_tensor(int64_t ptr, at::Tensor muster);
+at::Tensor bar1_result_tensor(int64_t ptr, at::Tensor like);
 
-void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
+void bar1_mesh_pipe(at::Tensor inp, at::Tensor out,
                     int64_t rank, int64_t world,
-                    std::vector<int64_t> peer_nutz,
+                    std::vector<int64_t> peer_payload,
                     std::vector<int64_t> peer_flag,
-                    std::vector<int64_t> peer_erg,
-                    int64_t eigen_nutz, int64_t eigen_flag,
-                    int64_t slot, int64_t off_pipe, int64_t fbasis_pipe,
-                    int64_t k_chunks, int64_t tiefe, int64_t vorlauf,
-                    int64_t quittung, int64_t direkt, int64_t erg_slack,
-                    at::Tensor runde_dev, at::Tensor schritt_dev,
-                    at::Tensor erg_gen_dev, at::Tensor ctl_dev,
-                    int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                    int64_t ladeform, int64_t abbruch_wirt);
+                    std::vector<int64_t> peer_result,
+                    int64_t own_payload, int64_t own_flag,
+                    int64_t slot, int64_t off_pipe, int64_t fbase_pipe,
+                    int64_t k_chunks, int64_t depth, int64_t lead,
+                    int64_t ack, int64_t direct, int64_t result_slack,
+                    at::Tensor round_dev, at::Tensor step_dev,
+                    at::Tensor result_gen_dev, at::Tensor ctl_dev,
+                    int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                    int64_t load_shape, int64_t abort_host);
 """
 
 
@@ -1582,7 +1582,7 @@ void bar1_netz_pipe(at::Tensor inp, at::Tensor out,
 
 
 def load_pipe_ext(cpu_group, ptxas_verbose: bool = False):
-    """The CUDA extension with ``bar1_netz_pipe``.
+    """The CUDA extension with ``bar1_mesh_pipe``.
 
     Own name, own build directory, own cache key: torch keys its build
     directory only by the name, and a .so under a foreign name could be
@@ -1623,7 +1623,7 @@ def load_pipe_ext(cpu_group, ptxas_verbose: bool = False):
             name=name,
             cpp_sources=_CPP_SRC,
             cuda_sources=_CUDA_SRC,
-            functions=["bar1_netz_pipe", "bar1_erg_tensor"],
+            functions=["bar1_mesh_pipe", "bar1_result_tensor"],
             extra_cuda_cflags=flags or None,
             verbose=bool(ptxas_verbose),
             build_directory=str(build_dir) if build_dir is not None else None,
@@ -1640,8 +1640,8 @@ def load_pipe_ext(cpu_group, ptxas_verbose: bool = False):
 # ===========================================================================
 
 
-def byte_proof_pipe(transport, runden: int = 0) -> bool:
-    """The proof for ``netz_pipe``: multiple rounds, uneven splitting.
+def byte_proof_pipe(transport, rounds: int = 0) -> bool:
+    """The proof for ``mesh_pipe``: multiple rounds, uneven splitting.
 
     A proof that only checks ONE round misses exactly the most dangerous
     bug -- slot reuse only strikes once a slot class comes around a second
@@ -1652,7 +1652,7 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
       numbers -- a stale slot would otherwise not surface, because the old
       contents would happen to be correct;
     * **uneven chunk counts**: payloads whose packet count is divisible by
-      neither ``K`` nor ``R``, so ``chunkGrenzen`` puts the remainder onto
+      neither ``K`` nor ``R``, so ``chunkBounds`` puts the remainder onto
       the leading chunks and the pieces have different lengths;
     * **remainder chunks**: the smallest permitted payload, and sizes just
       above a power of two.
@@ -1674,36 +1674,36 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
     import torch
     import torch.distributed as dist
 
-    if not transport.pipe_an:
+    if not transport.pipe_on:
         return False
-    tiefe = int(transport.pipe_t)
-    if runden <= 0:
-        runden = 2 * tiefe + 3
+    depth = int(transport.pipe_t)
+    if rounds <= 0:
+        rounds = 2 * depth + 3
 
-    welt = transport.welt
-    rang = transport.rank
-    geraet = transport.device
-    slot = int(transport.pipe_schlitz)
+    world = transport.world
+    rank = transport.rank
+    device = transport.device
+    slot = int(transport.pipe_slot)
     max_bytes = int(transport.max_bytes)
 
     # Sizes: deliberately awkward. 16*R*T is the smallest at which every
     # chunk of every rank gets at least one packet; the rest are chosen so
     # that n4 divides evenly by neither K nor R.
-    kandidaten = [
-        16 * welt * tiefe,
-        16 * (welt * tiefe + 1),
+    candidates = [
+        16 * world * depth,
+        16 * (world * depth + 1),
         16 * 1021,                    # a prime number of packets
         (1 << 20) + 16 * 3,
         (4 << 20) + 16 * 7,
     ]
-    groessen = []
-    for n in kandidaten:
+    sizes = []
+    for n in candidates:
         if n < transport.min_bytes or n > max_bytes:
             continue
-        if n % 16 or n // 16 < welt:
+        if n % 16 or n // 16 < world:
             continue
-        groessen.append(n)
-    if not groessen:
+        sizes.append(n)
+    if not sizes:
         logger.warning(
             "barlink-BAR1-PIPE: no sample size fits between %d and %d "
             "bytes -- the proof cannot say anything, so it declines.",
@@ -1711,8 +1711,8 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
         )
         return False
 
-    alles_gut = True
-    for nbytes in groessen:
+    all_good = True
+    for nbytes in sizes:
         n4 = nbytes // 16
         k = transport._pipe_k(nbytes)
         if k is None:
@@ -1729,8 +1729,8 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
             coff, clen = _chunk_bounds(n4, c, k)
             if (coff * 16) % 16 or (clen * 16) % 16:
                 raise AssertionError("chunk boundary not 16-byte-aligned")
-            for z in range(welt):
-                poff, plen = _chunk_bounds(clen, z, welt)
+            for z in range(world):
+                poff, plen = _chunk_bounds(clen, z, world)
                 if ((coff + poff) * 16) % 16:
                     raise AssertionError("piece boundary not aligned")
                 if plen * 16 > slot:
@@ -1739,53 +1739,53 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
                     )
 
         n = nbytes // 4
-        for round in range(runden):
+        for round in range(rounds):
             # Different numbers every round, and different per rank -- a
             # slot carrying the previous round's contents would thereby
             # surface.
-            welle = torch.arange(n, dtype=torch.float32, device=geraet)
-            eig = ((welle % 7.0) + 1.0) * float(rang + 1) + float(round * 13)
-            erwartet = torch.zeros(n, dtype=torch.float32, device=geraet)
-            for q in range(welt):
-                erwartet += ((welle % 7.0) + 1.0) * float(q + 1) + float(round * 13)
-            tisch = getattr(transport, "_peer_table", None)
+            wave = torch.arange(n, dtype=torch.float32, device=device)
+            own = ((wave % 7.0) + 1.0) * float(rank + 1) + float(round * 13)
+            expected = torch.zeros(n, dtype=torch.float32, device=device)
+            for q in range(world):
+                expected += ((wave % 7.0) + 1.0) * float(q + 1) + float(round * 13)
+            table = getattr(transport, "_peer_table", None)
             bounded_barrier(
                 transport.cpu_group,
-                f"bar1 pipe proof: before round {round + 1}/{runden}",
-                table=tisch,
+                f"bar1 pipe proof: before round {round + 1}/{rounds}",
+                table=table,
             )
-            ist = transport._pipe_all_reduce(eig, k)
+            actual = transport._pipe_all_reduce(own, k)
             bounded_device_sync(
-                f"bar1 pipe proof: round {round + 1}/{runden}",
-                device=geraet,
-                table=tisch,
+                f"bar1 pipe proof: round {round + 1}/{rounds}",
+                device=device,
+                table=table,
             )
             # A tripped kernel is otherwise silent -- the comparison below
             # would report a data bug where the cause was an abort.
             transport.raise_if_aborted(f"pipe proof round {round + 1}")
-            schlecht = int((ist != erwartet).sum().item())
-            if schlecht:
-                erste = int((ist != erwartet).nonzero()[0].item())
+            bad = int((actual != expected).sum().item())
+            if bad:
+                first_bad = int((actual != expected).nonzero()[0].item())
                 logger.warning(
                     "barlink-BAR1-PIPE: byte-level proof FAILED at %d bytes, "
                     "K=%d, T=%d, round %d/%d: %d of %d values wrong, first "
                     "at index %d (got %r, expected %r).",
-                    nbytes, k, tiefe, round + 1, runden, schlecht, n, erste,
-                    float(ist[erste]), float(erwartet[erste]),
+                    nbytes, k, depth, round + 1, rounds, bad, n, first_bad,
+                    float(actual[first_bad]), float(expected[first_bad]),
                 )
-                alles_gut = False
+                all_good = False
                 break
         else:
             logger.info(
                 "barlink-BAR1-PIPE: byte-level proof passed: %d bytes (n4=%d, "
                 "K=%d, T=%d), %d rounds, 0 of %d values wrong.",
-                nbytes, n4, k, tiefe, runden, n,
+                nbytes, n4, k, depth, rounds, n,
             )
     # ONE answer group-wide -- otherwise `handles` would answer
     # rank-dependently, and one rank would enter the collective while
     # another bailed out. A broadcast from rank 0 would NOT do that: the
     # proof has failed as soon as ANY rank has seen a wrong value.
-    traeger: list = [None] * welt
+    carrier: list = [None] * world
     # torch runs the object collectives inline; there is no Work to bound, so
     # the one-shot check names an already dead peer instead of entering the
     # 7200 s gloo wait for it.
@@ -1793,5 +1793,5 @@ def byte_proof_pipe(transport, runden: int = 0) -> bool:
         "bar1 pipe proof: verdict exchange",
         getattr(transport, "_peer_table", None),
     )
-    dist.all_gather_object(traeger, bool(alles_gut), group=transport.cpu_group)
-    return all(bool(x) for x in traeger)
+    dist.all_gather_object(carrier, bool(all_good), group=transport.cpu_group)
+    return all(bool(x) for x in carrier)

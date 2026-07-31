@@ -23,9 +23,9 @@ for f in "$WIRE" "$TI" "$GPU" "$INTRA" "$PRESS"; do [ -n "$f" ] && echo "  $f"; 
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktion: median_us fuer eine Zeile herausziehen
-# Spalten: pair dir modus ro depth size iters p10 median p90 MB/s
+# Spalten: pair dir mode ro depth size iters p10 median p90 MB/s
 # ---------------------------------------------------------------------------
-med() {  # med <file> <pair-regex> <dir> <modus> <ro> <depth> <size>
+med() {  # med <file> <pair-regex> <dir> <mode> <ro> <depth> <size>
   awk -F'\t' -v p="$2" -v d="$3" -v m="$4" -v r="$5" -v dp="$6" -v s="$7" \
     '$1 ~ p && $2==d && $3==m && $4==r && $5==dp && $6==s {print $9; exit}' "$1"
 }

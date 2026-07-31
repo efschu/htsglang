@@ -50,12 +50,12 @@ GRAPH_CHECK_PY = os.path.join(REPO_ROOT, "benchmark", "bar1_graph_check.py")
 #: The exact source lines the renderers below are pinned to. Kept in one
 #: place so a source move shows up as one changed number, not a hunt through
 #: every render function.
-LINE_BAR1_SETUP = 2094
-LINE_BAR1_LEDGER = 2108
-LINE_BAR1_PIPE_POOL_EXHAUSTED = 3064
-LINE_BARLINK_RIEGEL = 669
-LINE_PARALLEL_STATE_GROUP_OK = 721
-LINE_PARALLEL_STATE_GROUP_FALLBACK = 729
+LINE_BAR1_SETUP = 2109
+LINE_BAR1_LEDGER = 2123
+LINE_BAR1_PIPE_POOL_EXHAUSTED = 3079
+LINE_BARLINK_CAPTURE_BOLT = 672
+LINE_PARALLEL_STATE_GROUP_OK = 722
+LINE_PARALLEL_STATE_GROUP_FALLBACK = 730
 LINE_GRAPH_CHECK_HEADER = 619
 LINE_GRAPH_CHECK_SUMMARY_HEADING = 663
 LINE_GRAPH_CHECK_CASE_LINE = 667
@@ -166,17 +166,17 @@ def render_pipe_pool_exhausted_line(
 # ---------------------------------------------------------------------------
 
 
-def render_riegel_message(
+def render_capture_bolt_message(
     op: str = "all_gather",
     nbytes: int = 10600448,
-    grund: str = "bar1 reports handles('all_gather', 10600448) -> False",
+    reason: str = "bar1 reports handles('all_gather', 10600448) -> False",
 ) -> str:
     """The RuntimeError barlink._select raises during an ungated CUDA graph
-    capture -- the coverage-gap "bolt" s11_bar1_e2e.py's RE_RIEGEL extracts.
+    capture -- the coverage-gap "bolt" s11_bar1_e2e.py's RE_CAPTURE_BOLT extracts.
     """
     return _render_fstring(
-        _tree(BARLINK_PY), LINE_BARLINK_RIEGEL, BARLINK_PY,
-        op=op, nbytes=nbytes, grund=grund,
+        _tree(BARLINK_PY), LINE_BARLINK_CAPTURE_BOLT, BARLINK_PY,
+        op=op, nbytes=nbytes, reason=reason,
     )
 
 

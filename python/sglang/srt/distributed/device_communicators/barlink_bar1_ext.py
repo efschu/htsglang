@@ -22,9 +22,9 @@ Two separate extensions, because they have different requirements:
 
 What was taken from the probe, and what changed
 ------------------------------------------------------------
-TAKEN OVER, as literally as possible: ``schreibeV4`` (``st.global.wt``),
-``leseV4`` (``ld.global.cv``), ``flaggeLesen`` (``ld.mmio.relaxed.sys`` or
-``ld.global.cv``), ``leseFluss``, ``barriere<GRID>``, the step sequence and
+TAKEN OVER, as literally as possible: ``writeV4`` (``st.global.wt``),
+``readV4`` (``ld.global.cv``), ``readFlag`` (``ld.mmio.relaxed.sys`` or
+``ld.global.cv``), ``readFlush``, ``barrier<GRID>``, the step sequence and
 the barrier count of both kernels, the chunk geometry (remainder onto the
 leading chunks), the 256-byte-per-rank flag lines (topology, step, sender),
 and the grid-size computation.
@@ -115,11 +115,11 @@ namespace cg = cooperative_groups;
 // the same loop already issues per iteration, while still reacting within
 // microseconds of the host store. A collective that completes never reaches
 // the probe: the loop leaves through its "all peers arrived" break first.
-#define BARLINK_BAR1_WIRT_MASKE 1023u
+#define BARLINK_BAR1_HOST_MASK 1023u
 
 // Kernel variants, unchanged from the probe.
 #define K_1BLK   0
-#define K_GITTER 1
+#define K_GRID 1
 // Flag load mode. LA_MMIO is the only genuine cache bypass and the probe's
 // default (run field uncachedLeseart = LA_MMIO).
 #define LA_CV    0
@@ -132,7 +132,7 @@ using u64 = unsigned long long;
 // from bar1_kollektiv.cu: the bytes arrive via DMA from a FOREIGN card into
 // the framebuffer, and a reused cache line would show the stale state.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ uint4 leseV4(const void *p)
+__device__ __forceinline__ uint4 readV4(const void *p)
 {
     uint4 v;
     asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -141,14 +141,14 @@ __device__ __forceinline__ uint4 leseV4(const void *p)
     return v;
 }
 
-__device__ __forceinline__ void schreibeV4(void *p, uint4 v)
+__device__ __forceinline__ void writeV4(void *p, uint4 v)
 {
     asm volatile("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
                  :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
 
 template<int LA>
-__device__ __forceinline__ u64 flaggeLesen(const u64 *p)
+__device__ __forceinline__ u64 readFlag(const u64 *p)
 {
     u64 v;
     if (LA == LA_MMIO) {
@@ -160,7 +160,7 @@ __device__ __forceinline__ u64 flaggeLesen(const u64 *p)
     return v;
 }
 
-__device__ __forceinline__ void schreibeU64(void *p, u64 v)
+__device__ __forceinline__ void writeU64(void *p, u64 v)
 {
     asm volatile("st.global.wt.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
@@ -169,7 +169,7 @@ __device__ __forceinline__ void schreibeU64(void *p, u64 v)
 // all_to_all: there a block can end at a boundary that isn't a multiple of
 // 16, and the last bytes come -- like the rest -- via DMA from a foreign
 // card. Without .cv, a reused cache line would sit in front of them.
-__device__ __forceinline__ unsigned char leseB(const void *p)
+__device__ __forceinline__ unsigned char readB(const void *p)
 {
     unsigned int v;
     asm volatile("ld.global.cv.u8 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -181,7 +181,7 @@ __device__ __forceinline__ unsigned char leseB(const void *p)
 // the same target card, and per-requester/completer-pair ordering holds);
 // the switch exists so the acknowledgement style can be tested later
 // without a code change.
-__device__ __forceinline__ void leseFluss(const uint4 *peerRecv, int n4)
+__device__ __forceinline__ void readFlush(const uint4 *peerRecv, int n4)
 {
     if (n4 <= 0) return;
     unsigned int d = 0;
@@ -266,13 +266,13 @@ __device__ __forceinline__ uint4 addV4<__nv_bfloat16>(uint4 a, uint4 b)
 // the seam check (bar1_all_reduce): a seam checked on both sides with THE
 // SAME wrong formula would never surface.
 // ---------------------------------------------------------------------------
-__device__ __host__ __forceinline__ void chunkGrenzen(int n4, int j, int R,
+__device__ __host__ __forceinline__ void chunkBounds(int n4, int j, int R,
                                                       int *off, int *len)
 {
-    const int basis = n4 / R;
-    const int rest  = n4 - basis * R;
-    *len = basis + (j < rest ? 1 : 0);
-    *off = j * basis + (j < rest ? j : rest);
+    const int base = n4 / R;
+    const int rest  = n4 - base * R;
+    *len = base + (j < rest ? 1 : 0);
+    *off = j * base + (j < rest ? j : rest);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,41 +282,41 @@ __device__ __host__ __forceinline__ void chunkGrenzen(int n4, int j, int R,
 struct Bar1Args {
     const uint4 *in;          // local, VRAM
     uint4       *out;         // local, VRAM
-    u64         *rundeDev;    // one word, local: the running round number
+    u64         *roundDev;    // one word, local: the running round number
     unsigned int *ctlStatus;  // 1 = time limit exceeded
-    unsigned int *abbruchDev; // K_GITTER only: grid-wide abort bit
+    unsigned int *abortDev; // K_GRID only: grid-wide abort bit
     // Host-set abort word (pinned, device-mapped). nullptr = absent, and then
     // the spin loops keep only their cycle deadline. Set to 1 by the peer
     // watchdog when a peer process is provably gone, which is the one fact the
     // rank-local deadline cannot see.
-    const unsigned int *abbruchWirt;
+    const unsigned int *abortHost;
     int          n4;
     int          R;
-    int          rang;
-    u64          deckelZyklen;
+    int          rank;
+    u64          capCycles;
 
     // mesh: indexed by RANK NUMBER, own entry stays empty.
     uint4       *nzSendRS[BARLINK_BAR1_MAX_RANKS];
     uint4       *nzSendAG[BARLINK_BAR1_MAX_RANKS];
     const uint4 *nzRecvRS[BARLINK_BAR1_MAX_RANKS];
     const uint4 *nzRecvAG[BARLINK_BAR1_MAX_RANKS];
-    u64         *nzFlagAn [2][BARLINK_BAR1_MAX_RANKS];
-    const u64   *nzFlagVon[2][BARLINK_BAR1_MAX_RANKS];
+    u64         *nzFlagTo [2][BARLINK_BAR1_MAX_RANKS];
+    const u64   *nzFlagFrom[2][BARLINK_BAR1_MAX_RANKS];
 
     // ring: indexed by STEP, 0 .. 2*(R-1)-1.
     uint4       *rgSend   [BARLINK_BAR1_MAX_STEPS];
     const uint4 *rgRecv   [BARLINK_BAR1_MAX_STEPS];
-    u64         *rgFlagAn [BARLINK_BAR1_MAX_STEPS];
-    const u64   *rgFlagVon[BARLINK_BAR1_MAX_STEPS];
+    u64         *rgFlagTo [BARLINK_BAR1_MAX_STEPS];
+    const u64   *rgFlagFrom[BARLINK_BAR1_MAX_STEPS];
 };
 
 // ---------------------------------------------------------------------------
 // Barrier -- the only difference between the kernel variants.
 // ---------------------------------------------------------------------------
 template<int GRID>
-__device__ __forceinline__ void barriere(void)
+__device__ __forceinline__ void barrier(void)
 {
-    if (GRID == K_GITTER) cg::this_grid().sync();
+    if (GRID == K_GRID) cg::this_grid().sync();
     else                  __syncthreads();
 }
 
@@ -325,26 +325,26 @@ __device__ __forceinline__ void barriere(void)
 // ---------------------------------------------------------------------------
 
 // Write own contribution via DMA into the target card's receive slot.
-__device__ __forceinline__ void sendePhase(const uint4 *__restrict__ in,
+__device__ __forceinline__ void sendPhase(const uint4 *__restrict__ in,
                                            uint4 *peerRecv,
                                            int n4, int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) schreibeV4(peerRecv + j, in[j]);
+    for (int j = tid; j < n4; j += nth) writeV4(peerRecv + j, in[j]);
 }
 
 // One piece to ALL peers, in ONE loop -- so the result is read from local
 // VRAM only once (the probe's distribute phase, generalized from two
 // targets to R-1).
-__device__ __forceinline__ void verteilePhase(const uint4 *__restrict__ erg,
-                                              uint4 *const *ziel,
-                                              int R, int rang,
+__device__ __forceinline__ void scatterPhase(const uint4 *__restrict__ res,
+                                              uint4 *const *dst,
+                                              int R, int rank,
                                               int n4, int tid, int nth)
 {
     for (int j = tid; j < n4; j += nth) {
-        const uint4 v = erg[j];
+        const uint4 v = res[j];
         for (int z = 0; z < R; ++z) {
-            if (z == rang) continue;
-            schreibeV4(ziel[z] + j, v);
+            if (z == rank) continue;
+            writeV4(dst[z] + j, v);
         }
     }
 }
@@ -352,36 +352,36 @@ __device__ __forceinline__ void verteilePhase(const uint4 *__restrict__ erg,
 // Reduce locally over the own contribution and ALL R-1 received ones.
 // (the probe's reduce3 phase, generalized.)
 template<typename T>
-__device__ __forceinline__ void reduziereNPhase(const uint4 *__restrict__ in,
+__device__ __forceinline__ void reduceNPhase(const uint4 *__restrict__ in,
                                                 uint4 *out,
                                                 const uint4 *const *recv,
-                                                int R, int rang,
+                                                int R, int rank,
                                                 int n4, int tid, int nth)
 {
     for (int j = tid; j < n4; j += nth) {
         uint4 s = in[j];
         for (int q = 0; q < R; ++q) {
-            if (q == rang) continue;
-            s = addV4<T>(s, leseV4(recv[q] + j));
+            if (q == rank) continue;
+            s = addV4<T>(s, readV4(recv[q] + j));
         }
         out[j] = s;
     }
 }
 
 // Adopt what was received (the probe's adopt phase, without the check).
-__device__ __forceinline__ void uebernehmePhase(uint4 *out, const uint4 *recv,
+__device__ __forceinline__ void takeOverPhase(uint4 *out, const uint4 *recv,
                                                 int n4, int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) out[j] = leseV4(recv + j);
+    for (int j = tid; j < n4; j += nth) out[j] = readV4(recv + j);
 }
 
 // Ring reduce-scatter, receive step: own contribution plus partial sum.
 template<typename T>
-__device__ __forceinline__ void ringAddiere(const uint4 *__restrict__ in,
+__device__ __forceinline__ void ringAdd(const uint4 *__restrict__ in,
                                             uint4 *out, const uint4 *recv,
                                             int n4, int tid, int nth)
 {
-    for (int j = tid; j < n4; j += nth) out[j] = addV4<T>(in[j], leseV4(recv + j));
+    for (int j = tid; j < n4; j += nth) out[j] = addV4<T>(in[j], readV4(recv + j));
 }
 
 // ---------------------------------------------------------------------------
@@ -397,9 +397,9 @@ __device__ __forceinline__ void ringAddiere(const uint4 *__restrict__ in,
 // round advance must be identical in EVERY kernel -- a second version would
 // be exactly the place where the ranks drift apart.
 template<typename ARGS>
-__device__ __forceinline__ void rundeSchreiben(const ARGS &A, u64 round)
+__device__ __forceinline__ void writeRound(const ARGS &A, u64 round)
 {
-    *(volatile u64 *)A.rundeDev = round;
+    *(volatile u64 *)A.roundDev = round;
     __threadfence_system();
 }
 
@@ -412,25 +412,25 @@ __device__ __forceinline__ void rundeSchreiben(const ARGS &A, u64 round)
 // slots" and "the other side writes its AG chunk". With a shared slot set
 // this would need a third barrier.
 // ---------------------------------------------------------------------------
-template<typename T, int LA, int FLUSS, int GRID>
-__global__ void bar1_netz_kernel(Bar1Args A)
+template<typename T, int LA, int FLUSH, int GRID>
+__global__ void bar1_mesh_kernel(Bar1Args A)
 {
-    const int tid = (GRID == K_GITTER)
+    const int tid = (GRID == K_GRID)
                         ? (int)(blockIdx.x * blockDim.x + threadIdx.x)
                         : (int)threadIdx.x;
-    const int nth = (GRID == K_GITTER)
+    const int nth = (GRID == K_GRID)
                         ? (int)(gridDim.x * blockDim.x)
                         : (int)blockDim.x;
-    const bool erster = (tid == 0);
-    const int  n4 = A.n4, R = A.R, r = A.rang;
-    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
+    const bool isFirst = (tid == 0);
+    const int  n4 = A.n4, R = A.R, r = A.rank;
+    const u64  round = *(const volatile u64 *)A.roundDev + 1ull;
 
-    __shared__ int abbruchS;
+    __shared__ int abortS;
     if (GRID == K_1BLK) {
-        if (threadIdx.x == 0) abbruchS = 0;
+        if (threadIdx.x == 0) abortS = 0;
         __syncthreads();
-    } else if (erster) {
-        *(volatile unsigned int *)A.abbruchDev = 0u;
+    } else if (isFirst) {
+        *(volatile unsigned int *)A.abortDev = 0u;
         __threadfence();
     }
 
@@ -448,10 +448,10 @@ __global__ void bar1_netz_kernel(Bar1Args A)
     // block writes the tables into __shared__ once, after which everyone
     // indexes dynamically from there. Per block, not per grid --
     // `__syncthreads()` suffices and holds in BOTH kernel variants;
-    // `barriere<GRID>()` would be the wrong barrier here, because shared
+    // `barrier<GRID>()` would be the wrong barrier here, because shared
     // memory is block-local.
     //
-    // The flag pointers are included here even though only `erster` touches
+    // The flag pointers are included here even though only `isFirst` touches
     // them: what determines whether the parameter block must go to local
     // memory is THAT something is indexed dynamically anywhere, not by how
     // many threads.
@@ -463,75 +463,75 @@ __global__ void bar1_netz_kernel(Bar1Args A)
     __shared__ uint4       *sSendAG[BARLINK_BAR1_MAX_RANKS];
     __shared__ const uint4 *sRecvRS[BARLINK_BAR1_MAX_RANKS];
     __shared__ const uint4 *sRecvAG[BARLINK_BAR1_MAX_RANKS];
-    __shared__ u64         *sFlagAn [2][BARLINK_BAR1_MAX_RANKS];
-    __shared__ const u64   *sFlagVon[2][BARLINK_BAR1_MAX_RANKS];
+    __shared__ u64         *sFlagTo [2][BARLINK_BAR1_MAX_RANKS];
+    __shared__ const u64   *sFlagFrom[2][BARLINK_BAR1_MAX_RANKS];
     if (threadIdx.x == 0) {
         for (int z = 0; z < R; ++z) {
             sSendRS[z] = A.nzSendRS[z];
             sSendAG[z] = A.nzSendAG[z];
             sRecvRS[z] = A.nzRecvRS[z];
             sRecvAG[z] = A.nzRecvAG[z];
-            sFlagAn [0][z] = A.nzFlagAn [0][z];
-            sFlagAn [1][z] = A.nzFlagAn [1][z];
-            sFlagVon[0][z] = A.nzFlagVon[0][z];
-            sFlagVon[1][z] = A.nzFlagVon[1][z];
+            sFlagTo [0][z] = A.nzFlagTo [0][z];
+            sFlagTo [1][z] = A.nzFlagTo [1][z];
+            sFlagFrom[0][z] = A.nzFlagFrom[0][z];
+            sFlagFrom[1][z] = A.nzFlagFrom[1][z];
         }
     }
     __syncthreads();
 
     int offR, lenR;
-    chunkGrenzen(n4, r, R, &offR, &lenR);
+    chunkBounds(n4, r, R, &offR, &lenR);
 
     // --- 1. Reduce-scatter: chunk z to rank z ------------------------------
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
         int off, len;
-        chunkGrenzen(n4, z, R, &off, &len);
-        sendePhase(A.in + off, sSendRS[z], len, tid, nth);
+        chunkBounds(n4, z, R, &off, &len);
+        sendPhase(A.in + off, sSendRS[z], len, tid, nth);
     }
     __threadfence_system();
-    barriere<GRID>();
+    barrier<GRID>();
 
-    if (erster) {
+    if (isFirst) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            if (FLUSS) {
+            if (FLUSH) {
                 int off, len;
-                chunkGrenzen(n4, z, R, &off, &len);
-                leseFluss(sSendRS[z], len);
+                chunkBounds(n4, z, R, &off, &len);
+                readFlush(sSendRS[z], len);
             }
-            schreibeU64(sFlagAn[0][z], round);
+            writeU64(sFlagTo[0][z], round);
         }
         __threadfence_system();
 
         bool ab = false;
         long long t0 = clock64();
-        unsigned int sondeZaehler = 0u;
+        unsigned int probeCounter = 0u;
         for (;;) {
-            bool alle = true;
+            bool allArrived = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(sFlagVon[0][s]) != round) { alle = false; break; }
+                if (readFlag<LA>(sFlagFrom[0][s]) != round) { allArrived = false; break; }
             }
-            if (alle) break;
-            if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
-            if (A.abbruchWirt != nullptr && ((++sondeZaehler & BARLINK_BAR1_WIRT_MASKE) == 0u)
-                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
+            if (allArrived) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
         }
         if (ab) {
-            if (GRID == K_1BLK) abbruchS = 1;
-            else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
         }
     }
-    barriere<GRID>();
+    barrier<GRID>();
     {
-        const int abbruch = (GRID == K_1BLK)
-                                ? abbruchS
-                                : (int)*(volatile unsigned int *)A.abbruchDev;
-        if (abbruch) {
-            if (erster) {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, round);
+                writeRound(A, round);
             }
             return;
         }
@@ -547,52 +547,52 @@ __global__ void bar1_netz_kernel(Bar1Args A)
         // `sRecvRS` instead of a local copy: the copy was a per-THREAD array
         // in local memory, and it was also the reason the whole parameter
         // block had to go there.
-        reduziereNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
+        reduceNPhase<T>(A.in + offR, A.out + offR, sRecvRS, R, r, lenR,
                            tid, nth);
     }
-    barriere<GRID>();
+    barrier<GRID>();
 
     // --- 3. Allgather: the finished own chunk to everyone else --------------
-    verteilePhase(A.out + offR, sSendAG, R, r, lenR, tid, nth);
+    scatterPhase(A.out + offR, sSendAG, R, r, lenR, tid, nth);
     __threadfence_system();
-    barriere<GRID>();
+    barrier<GRID>();
 
-    if (erster) {
+    if (isFirst) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            if (FLUSS) leseFluss(sSendAG[z], lenR);
-            schreibeU64(sFlagAn[1][z], round);
+            if (FLUSH) readFlush(sSendAG[z], lenR);
+            writeU64(sFlagTo[1][z], round);
         }
         __threadfence_system();
 
         bool ab = false;
         long long t0 = clock64();
-        unsigned int sondeZaehler = 0u;
+        unsigned int probeCounter = 0u;
         for (;;) {
-            bool alle = true;
+            bool allArrived = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(sFlagVon[1][s]) != round) { alle = false; break; }
+                if (readFlag<LA>(sFlagFrom[1][s]) != round) { allArrived = false; break; }
             }
-            if (alle) break;
-            if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
-            if (A.abbruchWirt != nullptr && ((++sondeZaehler & BARLINK_BAR1_WIRT_MASKE) == 0u)
-                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
+            if (allArrived) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
         }
         if (ab) {
-            if (GRID == K_1BLK) abbruchS = 1;
-            else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
         }
     }
-    barriere<GRID>();
+    barrier<GRID>();
     {
-        const int abbruch = (GRID == K_1BLK)
-                                ? abbruchS
-                                : (int)*(volatile unsigned int *)A.abbruchDev;
-        if (abbruch) {
-            if (erster) {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, round);
+                writeRound(A, round);
             }
             return;
         }
@@ -602,11 +602,11 @@ __global__ void bar1_netz_kernel(Bar1Args A)
     for (int s = 0; s < R; ++s) {
         if (s == r) continue;
         int off, len;
-        chunkGrenzen(n4, s, R, &off, &len);
-        uebernehmePhase(A.out + off, sRecvAG[s], len, tid, nth);
+        chunkBounds(n4, s, R, &off, &len);
+        takeOverPhase(A.out + off, sRecvAG[s], len, tid, nth);
     }
-    barriere<GRID>();
-    if (erster) rundeSchreiben(A, round);
+    barrier<GRID>();
+    if (isFirst) writeRound(A, round);
 }
 
 // ---------------------------------------------------------------------------
@@ -614,25 +614,25 @@ __global__ void bar1_netz_kernel(Bar1Args A)
 // Always sends to (r+1)%R, always receives from (r-1+R)%R.
 // Unchanged from ar3_ring_kernel, only RANGE_N -> A.R and without the check.
 // ---------------------------------------------------------------------------
-template<typename T, int LA, int FLUSS, int GRID>
+template<typename T, int LA, int FLUSH, int GRID>
 __global__ void bar1_ring_kernel(Bar1Args A)
 {
-    const int tid = (GRID == K_GITTER)
+    const int tid = (GRID == K_GRID)
                         ? (int)(blockIdx.x * blockDim.x + threadIdx.x)
                         : (int)threadIdx.x;
-    const int nth = (GRID == K_GITTER)
+    const int nth = (GRID == K_GRID)
                         ? (int)(gridDim.x * blockDim.x)
                         : (int)blockDim.x;
-    const bool erster = (tid == 0);
-    const int  n4 = A.n4, R = A.R, r = A.rang;
-    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
+    const bool isFirst = (tid == 0);
+    const int  n4 = A.n4, R = A.R, r = A.rank;
+    const u64  round = *(const volatile u64 *)A.roundDev + 1ull;
 
-    __shared__ int abbruchS;
+    __shared__ int abortS;
     if (GRID == K_1BLK) {
-        if (threadIdx.x == 0) abbruchS = 0;
+        if (threadIdx.x == 0) abortS = 0;
         __syncthreads();
-    } else if (erster) {
-        *(volatile unsigned int *)A.abbruchDev = 0u;
+    } else if (isFirst) {
+        *(volatile unsigned int *)A.abortDev = 0u;
         __threadfence();
     }
 
@@ -641,49 +641,49 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         const int cs = (r - s + 2 * R) % R;         // chunk sent
         const int cr = (r - s - 1 + 2 * R) % R;     // chunk received
         int offS, lenS, offE, lenE;
-        chunkGrenzen(n4, cs, R, &offS, &lenS);
-        chunkGrenzen(n4, cr, R, &offE, &lenE);
+        chunkBounds(n4, cs, R, &offS, &lenS);
+        chunkBounds(n4, cr, R, &offE, &lenE);
 
         // Step 0 sends the own contribution, every further step the partial
         // sum formed in the previous step.
         const uint4 *source = (s == 0) ? (A.in + offS)
                                        : (const uint4 *)(A.out + offS);
-        sendePhase(source, A.rgSend[s], lenS, tid, nth);
+        sendPhase(source, A.rgSend[s], lenS, tid, nth);
         __threadfence_system();
-        barriere<GRID>();
+        barrier<GRID>();
 
-        if (erster) {
-            if (FLUSS) leseFluss(A.rgSend[s], lenS);
-            schreibeU64(A.rgFlagAn[s], round);
+        if (isFirst) {
+            if (FLUSH) readFlush(A.rgSend[s], lenS);
+            writeU64(A.rgFlagTo[s], round);
             __threadfence_system();
 
             bool ab = false;
             long long t0 = clock64();
-            unsigned int sondeZaehler = 0u;
-            while (flaggeLesen<LA>(A.rgFlagVon[s]) != round) {
-                if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
-                if (A.abbruchWirt != nullptr && ((++sondeZaehler & BARLINK_BAR1_WIRT_MASKE) == 0u)
-                    && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
+            unsigned int probeCounter = 0u;
+            while (readFlag<LA>(A.rgFlagFrom[s]) != round) {
+                if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+                if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                    && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
             }
             if (ab) {
-                if (GRID == K_1BLK) abbruchS = 1;
-                else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+                if (GRID == K_1BLK) abortS = 1;
+                else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
             }
         }
-        barriere<GRID>();
+        barrier<GRID>();
         {
-            const int abbruch = (GRID == K_1BLK)
-                                    ? abbruchS
-                                    : (int)*(volatile unsigned int *)A.abbruchDev;
-            if (abbruch) {
-                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, round); }
+            const int aborted = (GRID == K_1BLK)
+                                    ? abortS
+                                    : (int)*(volatile unsigned int *)A.abortDev;
+            if (aborted) {
+                if (isFirst) { *A.ctlStatus = 1u; writeRound(A, round); }
                 return;
             }
         }
         __threadfence_system();
 
-        ringAddiere<T>(A.in + offE, A.out + offE, A.rgRecv[s], lenE, tid, nth);
-        barriere<GRID>();
+        ringAdd<T>(A.in + offE, A.out + offE, A.rgRecv[s], lenE, tid, nth);
+        barrier<GRID>();
     }
 
     // --------------------------- Allgather -----------------------------------
@@ -692,48 +692,48 @@ __global__ void bar1_ring_kernel(Bar1Args A)
         const int cs = (r + 1 - s + 2 * R) % R;     // chunk sent
         const int cr = (r - s + 2 * R) % R;         // chunk adopted
         int offS, lenS, offE, lenE;
-        chunkGrenzen(n4, cs, R, &offS, &lenS);
-        chunkGrenzen(n4, cr, R, &offE, &lenE);
+        chunkBounds(n4, cs, R, &offS, &lenS);
+        chunkBounds(n4, cr, R, &offE, &lenE);
 
-        sendePhase((const uint4 *)(A.out + offS), A.rgSend[sl], lenS, tid, nth);
+        sendPhase((const uint4 *)(A.out + offS), A.rgSend[sl], lenS, tid, nth);
         __threadfence_system();
-        barriere<GRID>();
+        barrier<GRID>();
 
-        if (erster) {
-            if (FLUSS) leseFluss(A.rgSend[sl], lenS);
-            schreibeU64(A.rgFlagAn[sl], round);
+        if (isFirst) {
+            if (FLUSH) readFlush(A.rgSend[sl], lenS);
+            writeU64(A.rgFlagTo[sl], round);
             __threadfence_system();
 
             bool ab = false;
             long long t0 = clock64();
-            unsigned int sondeZaehler = 0u;
-            while (flaggeLesen<LA>(A.rgFlagVon[sl]) != round) {
-                if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
-                if (A.abbruchWirt != nullptr && ((++sondeZaehler & BARLINK_BAR1_WIRT_MASKE) == 0u)
-                    && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
+            unsigned int probeCounter = 0u;
+            while (readFlag<LA>(A.rgFlagFrom[sl]) != round) {
+                if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+                if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                    && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
             }
             if (ab) {
-                if (GRID == K_1BLK) abbruchS = 1;
-                else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+                if (GRID == K_1BLK) abortS = 1;
+                else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
             }
         }
-        barriere<GRID>();
+        barrier<GRID>();
         {
-            const int abbruch = (GRID == K_1BLK)
-                                    ? abbruchS
-                                    : (int)*(volatile unsigned int *)A.abbruchDev;
-            if (abbruch) {
-                if (erster) { *A.ctlStatus = 1u; rundeSchreiben(A, round); }
+            const int aborted = (GRID == K_1BLK)
+                                    ? abortS
+                                    : (int)*(volatile unsigned int *)A.abortDev;
+            if (aborted) {
+                if (isFirst) { *A.ctlStatus = 1u; writeRound(A, round); }
                 return;
             }
         }
         __threadfence_system();
 
-        uebernehmePhase(A.out + offE, A.rgRecv[sl], lenE, tid, nth);
-        barriere<GRID>();
+        takeOverPhase(A.out + offE, A.rgRecv[sl], lenE, tid, nth);
+        barrier<GRID>();
     }
 
-    if (erster) rundeSchreiben(A, round);
+    if (isFirst) writeRound(A, round);
 }
 
 // ---------------------------------------------------------------------------
@@ -782,37 +782,37 @@ __global__ void bar1_ring_kernel(Bar1Args A)
 // The slot begins on a page boundary and is a multiple of 16, so the
 // rounded-up packet never hits the neighbor.
 //
-// VEK=1 means: all block offsets AND both buffer base addresses are
+// VEC=1 means: all block offsets AND both buffer base addresses are
 // 16-byte-aligned, so the bulk of the traffic runs with 128-bit accesses.
-// VEK=0 is the remainder path (row width not a multiple of 16): then every
+// VEC=0 is the remainder path (row width not a multiple of 16): then every
 // packet is assembled byte by byte. Correct, slow, and honestly named --
 // it has not been measured.
 // ---------------------------------------------------------------------------
 struct A2aArgs {
     const unsigned char *in;
     unsigned char       *out;
-    u64          *rundeDev;
+    u64          *roundDev;
     unsigned int *ctlStatus;
-    unsigned int *abbruchDev;
+    unsigned int *abortDev;
     // Host-set abort word (pinned, device-mapped). nullptr = absent.
-    const unsigned int *abbruchWirt;
+    const unsigned int *abortHost;
     int           R;
-    int           rang;
-    u64           deckelZyklen;
+    int           rank;
+    u64           capCycles;
     long long     slot;                 // slot size in bytes
     long long     sendOff[BARLINK_BAR1_MAX_RANKS];   // offset in `in`
     long long     sendLen[BARLINK_BAR1_MAX_RANKS];
     long long     recvOff[BARLINK_BAR1_MAX_RANKS];   // offset in `out`
     long long     recvLen[BARLINK_BAR1_MAX_RANKS];
-    unsigned char *zielBasis[BARLINK_BAR1_MAX_RANKS];  // peer's a2a region
-    const unsigned char *eigenBasis;                 // own a2a region
-    u64          *flagAn [BARLINK_BAR1_MAX_RANKS];
-    const u64    *flagVon[BARLINK_BAR1_MAX_RANKS];
+    unsigned char *dstBase[BARLINK_BAR1_MAX_RANKS];  // peer's a2a region
+    const unsigned char *ownBase;                 // own a2a region
+    u64          *flagTo [BARLINK_BAR1_MAX_RANKS];
+    const u64    *flagFrom[BARLINK_BAR1_MAX_RANKS];
 };
 
 // Assemble a 16-byte packet from at most 16 bytes. The remainder stays 0;
 // it lands in the slot's overhang and is never read by the receiver.
-__device__ __forceinline__ uint4 packeBytes(const unsigned char *q, int n)
+__device__ __forceinline__ uint4 packBytes(const unsigned char *q, int n)
 {
     uint4 v = make_uint4(0u, 0u, 0u, 0u);
     unsigned char *b = (unsigned char *)&v;
@@ -824,41 +824,41 @@ __device__ __forceinline__ uint4 packeBytes(const unsigned char *q, int n)
 // Where I (rank r) write for rank z: my position in that rank's ascending
 // peer list, within half `par`. The same position formula as in mesh --
 // NOT (r < z).
-__device__ __forceinline__ unsigned char *a2aZiel(const A2aArgs &A, int z, int par)
+__device__ __forceinline__ unsigned char *a2aDst(const A2aArgs &A, int z, int par)
 {
-    const int p = A.rang - (A.rang > z ? 1 : 0);
-    return A.zielBasis[z] + (long long)(par * (A.R - 1) + p) * A.slot;
+    const int p = A.rank - (A.rank > z ? 1 : 0);
+    return A.dstBase[z] + (long long)(par * (A.R - 1) + p) * A.slot;
 }
 
 // Where rank s's block for me sits: its position in MY ascending peer
 // list.
-__device__ __forceinline__ const unsigned char *a2aQuelle(const A2aArgs &A,
+__device__ __forceinline__ const unsigned char *a2aSource(const A2aArgs &A,
                                                           int s, int par)
 {
-    const int p = s - (s > A.rang ? 1 : 0);
-    return A.eigenBasis + (long long)(par * (A.R - 1) + p) * A.slot;
+    const int p = s - (s > A.rank ? 1 : 0);
+    return A.ownBase + (long long)(par * (A.R - 1) + p) * A.slot;
 }
 
-template<int VEK, int LA, int GRID>
+template<int VEC, int LA, int GRID>
 __global__ void bar1_a2a_kernel(A2aArgs A)
 {
-    const long long tid = (GRID == K_GITTER)
+    const long long tid = (GRID == K_GRID)
                               ? (long long)blockIdx.x * blockDim.x + threadIdx.x
                               : (long long)threadIdx.x;
-    const long long nth = (GRID == K_GITTER)
+    const long long nth = (GRID == K_GRID)
                               ? (long long)gridDim.x * blockDim.x
                               : (long long)blockDim.x;
-    const bool erster = (tid == 0);
-    const int  R = A.R, r = A.rang;
-    const u64  round = *(const volatile u64 *)A.rundeDev + 1ull;
+    const bool isFirst = (tid == 0);
+    const int  R = A.R, r = A.rank;
+    const u64  round = *(const volatile u64 *)A.roundDev + 1ull;
     const int  par = (int)(round & 1ull);
 
-    __shared__ int abbruchS;
+    __shared__ int abortS;
     if (GRID == K_1BLK) {
-        if (threadIdx.x == 0) abbruchS = 0;
+        if (threadIdx.x == 0) abortS = 0;
         __syncthreads();
-    } else if (erster) {
-        *(volatile unsigned int *)A.abbruchDev = 0u;
+    } else if (isFirst) {
+        *(volatile unsigned int *)A.abortDev = 0u;
         __threadfence();
     }
 
@@ -872,19 +872,19 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
     __shared__ long long ePre[BARLINK_BAR1_MAX_RANKS + 1];
     __shared__ long long sLenS[BARLINK_BAR1_MAX_RANKS];
     __shared__ long long eLenS[BARLINK_BAR1_MAX_RANKS];
-    __shared__ const unsigned char *sQuelle[BARLINK_BAR1_MAX_RANKS];
-    __shared__ unsigned char       *sZiel  [BARLINK_BAR1_MAX_RANKS];
-    __shared__ const unsigned char *eQuelle[BARLINK_BAR1_MAX_RANKS];
-    __shared__ unsigned char       *eZiel  [BARLINK_BAR1_MAX_RANKS];
+    __shared__ const unsigned char *sSource[BARLINK_BAR1_MAX_RANKS];
+    __shared__ unsigned char       *sDst  [BARLINK_BAR1_MAX_RANKS];
+    __shared__ const unsigned char *eSource[BARLINK_BAR1_MAX_RANKS];
+    __shared__ unsigned char       *eDst  [BARLINK_BAR1_MAX_RANKS];
     if (threadIdx.x == 0) {
         sPre[0] = 0; ePre[0] = 0;
         for (int z = 0; z < R; ++z) {
             sLenS[z] = A.sendLen[z];
             eLenS[z] = A.recvLen[z];
-            sQuelle[z] = A.in + A.sendOff[z];
-            eZiel[z]   = A.out + A.recvOff[z];
-            sZiel[z]   = (z == r) ? nullptr : a2aZiel(A, z, par);
-            eQuelle[z] = (z == r) ? nullptr : a2aQuelle(A, z, par);
+            sSource[z] = A.in + A.sendOff[z];
+            eDst[z]   = A.out + A.recvOff[z];
+            sDst[z]   = (z == r) ? nullptr : a2aDst(A, z, par);
+            eSource[z] = (z == r) ? nullptr : a2aSource(A, z, par);
             sPre[z + 1] = sPre[z] + ((z == r) ? 0LL : (sLenS[z] + 15LL) / 16LL);
             ePre[z + 1] = ePre[z] + ((z == r) ? 0LL : (eLenS[z] + 15LL) / 16LL);
         }
@@ -893,27 +893,27 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
 
     // --- 1. Send phase: all targets in the same flat index space -----------
     {
-        const long long ges = sPre[R];
-        for (long long j = tid; j < ges; j += nth) {
+        const long long total = sPre[R];
+        for (long long j = tid; j < total; j += nth) {
             int z = 0;
             while (sPre[z + 1] <= j) ++z;          // R <= 8, so a short scan
             const long long b = (j - sPre[z]) * 16LL;
             const int rest = (int)((sLenS[z] - b) < 16LL
                                        ? (sLenS[z] - b) : 16LL);
-            const unsigned char *q = sQuelle[z] + b;
+            const unsigned char *q = sSource[z] + b;
             uint4 v;
-            if (VEK && rest == 16) v = *(const uint4 *)q;
-            else                   v = packeBytes(q, rest);
-            schreibeV4(sZiel[z] + b, v);
+            if (VEC && rest == 16) v = *(const uint4 *)q;
+            else                   v = packBytes(q, rest);
+            writeV4(sDst[z] + b, v);
         }
     }
 
     // --- 1b. own block: purely local, no detour through the aperture -------
     {
         const long long n = sLenS[r];
-        const unsigned char *q = sQuelle[r];
-        unsigned char *z = eZiel[r];
-        if (VEK) {
+        const unsigned char *q = sSource[r];
+        unsigned char *z = eDst[r];
+        if (VEC) {
             const long long p = n / 16LL;
             for (long long k = tid; k < p; k += nth)
                 *(uint4 *)(z + k * 16LL) = *(const uint4 *)(q + k * 16LL);
@@ -924,44 +924,44 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
     }
 
     __threadfence_system();
-    barriere<GRID>();
+    barrier<GRID>();
 
     // --- 2. The one barrier --------------------------------------------------
-    if (erster) {
+    if (isFirst) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
-            schreibeU64(A.flagAn[z], round);
+            writeU64(A.flagTo[z], round);
         }
         __threadfence_system();
 
         bool ab = false;
         long long t0 = clock64();
-        unsigned int sondeZaehler = 0u;
+        unsigned int probeCounter = 0u;
         for (;;) {
-            bool alle = true;
+            bool allArrived = true;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                if (flaggeLesen<LA>(A.flagVon[s]) != round) { alle = false; break; }
+                if (readFlag<LA>(A.flagFrom[s]) != round) { allArrived = false; break; }
             }
-            if (alle) break;
-            if ((u64)(clock64() - t0) > A.deckelZyklen) { ab = true; break; }
-            if (A.abbruchWirt != nullptr && ((++sondeZaehler & BARLINK_BAR1_WIRT_MASKE) == 0u)
-                && *(const volatile unsigned int *)A.abbruchWirt != 0u) { ab = true; break; }
+            if (allArrived) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
         }
         if (ab) {
-            if (GRID == K_1BLK) abbruchS = 1;
-            else { *(volatile unsigned int *)A.abbruchDev = 1u; __threadfence(); }
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
         }
     }
-    barriere<GRID>();
+    barrier<GRID>();
     {
-        const int abbruch = (GRID == K_1BLK)
-                                ? abbruchS
-                                : (int)*(volatile unsigned int *)A.abbruchDev;
-        if (abbruch) {
-            if (erster) {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
                 *A.ctlStatus = 1u;
-                rundeSchreiben(A, round);
+                writeRound(A, round);
             }
             return;
         }
@@ -970,24 +970,24 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
 
     // --- 3. Receive phase: own slots into the output buffer -----------------
     {
-        const long long ges = ePre[R];
-        for (long long j = tid; j < ges; j += nth) {
+        const long long total = ePre[R];
+        for (long long j = tid; j < total; j += nth) {
             int s = 0;
             while (ePre[s + 1] <= j) ++s;
             const long long b = (j - ePre[s]) * 16LL;
             const int rest = (int)((eLenS[s] - b) < 16LL
                                        ? (eLenS[s] - b) : 16LL);
-            const unsigned char *q = eQuelle[s] + b;
-            unsigned char *z = eZiel[s] + b;
-            if (VEK && rest == 16) {
-                *(uint4 *)z = leseV4(q);
+            const unsigned char *q = eSource[s] + b;
+            unsigned char *z = eDst[s] + b;
+            if (VEC && rest == 16) {
+                *(uint4 *)z = readV4(q);
             } else {
-                for (int i = 0; i < rest; ++i) z[i] = leseB(q + i);
+                for (int i = 0; i < rest; ++i) z[i] = readB(q + i);
             }
         }
     }
-    barriere<GRID>();
-    if (erster) rundeSchreiben(A, round);
+    barrier<GRID>();
+    if (isFirst) writeRound(A, round);
 }
 
 // ===========================================================================
@@ -999,11 +999,11 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
 //   1. Never more blocks than can be resident SIMULTANEOUSLY -- otherwise
 //      grid.sync() waits on a block that isn't even running.
 //   2. More blocks than there is work is pointless: ceil(n4/threads).
-static int gitterGroesse(const void *fn, int threads, int n4)
+static int gridSize(const void *fn, int threads, int n4)
 {
-    int proSM = 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&proSM, fn, threads, 0)
-            != cudaSuccess || proSM < 1)
+    int perSM = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSM, fn, threads, 0)
+            != cudaSuccess || perSM < 1)
         return 1;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return 1;
@@ -1011,10 +1011,10 @@ static int gitterGroesse(const void *fn, int threads, int n4)
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)
             != cudaSuccess || sms < 1)
         return 1;
-    int g = proSM * sms;
-    int noetig = (n4 + threads - 1) / threads;
-    if (noetig < 1) noetig = 1;
-    if (noetig < g) g = noetig;
+    int g = perSM * sms;
+    int needed = (n4 + threads - 1) / threads;
+    if (needed < 1) needed = 1;
+    if (needed < g) g = needed;
     if (g < 1) g = 1;
     return g;
 }
@@ -1022,63 +1022,63 @@ static int gitterGroesse(const void *fn, int threads, int n4)
 // Launches the chosen kernel. Flag load mode, read flush, and barrier kind
 // are template arguments -- no branch is left over in the wait loops.
 template<typename T>
-static void starte(int algo, int kern, int la, int fluss, Bar1Args &A,
-                   int threads, cudaStream_t strom)
+static void start(int algo, int kernel_variant, int la, int read_flush, Bar1Args &A,
+                   int threads, cudaStream_t stream)
 {
-#define BARLINK_BAR1_STARTE(KERNFN, LA, FL)                                      \
+#define BARLINK_BAR1_LAUNCH(KERNELFN, LA, FL)                                      \
     do {                                                                       \
-        if (kern == K_GITTER) {                                                \
-            const void *fn = (const void *)KERNFN<T, LA, FL, K_GITTER>;        \
-            int g = gitterGroesse(fn, threads, A.n4);                          \
+        if (kernel_variant == K_GRID) {                                                \
+            const void *fn = (const void *)KERNELFN<T, LA, FL, K_GRID>;        \
+            int g = gridSize(fn, threads, A.n4);                          \
             dim3 gd((unsigned)g), bd((unsigned)threads);                       \
             void *args[1] = { &A };                                            \
             cudaError_t e = cudaLaunchCooperativeKernel(fn, gd, bd, args, 0,   \
-                                                        strom);                \
+                                                        stream);                \
             TORCH_CHECK(e == cudaSuccess,                                      \
                         "barlink-bar1: cudaLaunchCooperativeKernel -> ",         \
                         cudaGetErrorString(e));                                \
             return;                                                            \
         }                                                                      \
-        KERNFN<T, LA, FL, K_1BLK><<<1, threads, 0, strom>>>(A);                \
+        KERNELFN<T, LA, FL, K_1BLK><<<1, threads, 0, stream>>>(A);                \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
                     "barlink-bar1: kernel launch failed");                       \
         return;                                                                \
     } while (0)
 
-#define BARLINK_BAR1_WAEHLE(KERNFN)                                              \
+#define BARLINK_BAR1_SELECT(KERNELFN)                                              \
     do {                                                                       \
         if (la == LA_MMIO) {                                                   \
-            if (fluss) BARLINK_BAR1_STARTE(KERNFN, LA_MMIO, 1);                  \
-            else       BARLINK_BAR1_STARTE(KERNFN, LA_MMIO, 0);                  \
+            if (read_flush) BARLINK_BAR1_LAUNCH(KERNELFN, LA_MMIO, 1);                  \
+            else       BARLINK_BAR1_LAUNCH(KERNELFN, LA_MMIO, 0);                  \
         } else {                                                               \
-            if (fluss) BARLINK_BAR1_STARTE(KERNFN, LA_CV, 1);                    \
-            else       BARLINK_BAR1_STARTE(KERNFN, LA_CV, 0);                    \
+            if (read_flush) BARLINK_BAR1_LAUNCH(KERNELFN, LA_CV, 1);                    \
+            else       BARLINK_BAR1_LAUNCH(KERNELFN, LA_CV, 0);                    \
         }                                                                      \
     } while (0)
 
-    if (algo == 0) BARLINK_BAR1_WAEHLE(bar1_netz_kernel);
-    else           BARLINK_BAR1_WAEHLE(bar1_ring_kernel);
-#undef BARLINK_BAR1_WAEHLE
-#undef BARLINK_BAR1_STARTE
+    if (algo == 0) BARLINK_BAR1_SELECT(bar1_mesh_kernel);
+    else           BARLINK_BAR1_SELECT(bar1_ring_kernel);
+#undef BARLINK_BAR1_SELECT
+#undef BARLINK_BAR1_LAUNCH
 }
 
 // ---------------------------------------------------------------------------
 // bar1_all_reduce
 //
-// `peer_nutz` / `peer_flag` carry, per rank, THIS card's device pointer into
+// `peer_payload` / `peer_flag` carry, per rank, THIS card's device pointer into
 // the target's BAR1 region; the own entry is the local pointer to the own
 // region. The slot offsets are computed here, not in Python: the same code
 // that writes them into the kernel arguments also checks them.
 // ---------------------------------------------------------------------------
 void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world, int64_t algo,
-                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_payload,
                      std::vector<int64_t> peer_flag,
-                     int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t chunk_max, int64_t off_netz, int64_t off_ring,
-                     at::Tensor runde_dev, at::Tensor ctl_dev,
-                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t fluss, int64_t abbruch_wirt)
+                     int64_t own_payload, int64_t own_flag,
+                     int64_t chunk_max, int64_t off_mesh, int64_t off_ring,
+                     at::Tensor round_dev, at::Tensor ctl_dev,
+                     int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                     int64_t load_shape, int64_t read_flush, int64_t abort_host)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1092,7 +1092,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
                 "barlink-bar1: in and out must not be the same -- the ring "
                 "still reads 'in' while it writes 'out'");
-    TORCH_CHECK((int64_t)peer_nutz.size() == world &&
+    TORCH_CHECK((int64_t)peer_payload.size() == world &&
                 (int64_t)peer_flag.size() == world,
                 "barlink-bar1: peer table has the wrong length");
 
@@ -1107,13 +1107,13 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(n4 >= R, "barlink-bar1: fewer than one 128-bit packet per rank");
 
     // Seam check: the LARGEST chunk must fit in a slot. Deliberately here
-    // and not only in Python -- computed with chunkGrenzen itself, not with
+    // and not only in Python -- computed with chunkBounds itself, not with
     // a second version of the formula.
     {
         int maxLen = 0;
         for (int j = 0; j < R; ++j) {
             int off, len;
-            chunkGrenzen(n4, j, R, &off, &len);
+            chunkBounds(n4, j, R, &off, &len);
             if (len > maxLen) maxLen = len;
         }
         TORCH_CHECK((int64_t)maxLen * 16 <= chunk_max,
@@ -1126,26 +1126,26 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     std::memset(&A, 0, sizeof(A));
     A.in           = (const uint4 *)inp.data_ptr();
     A.out          = (uint4 *)out.data_ptr();
-    A.rundeDev     = (u64 *)runde_dev.data_ptr();
+    A.roundDev     = (u64 *)round_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
-    A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    A.abortDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
     // 0 means the host could not map the abort word; the kernels then see
     // nullptr and skip the probe entirely.
-    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
+    A.abortHost  = (const unsigned int *)(uintptr_t)abort_host;
     A.n4           = n4;
     A.R            = R;
-    A.rang         = r;
-    A.deckelZyklen = (u64)deckel_zyklen;
+    A.rank         = r;
+    A.capCycles = (u64)cap_cycles;
 
-    const int schritte_netz = 2;
-    const int schritte_ring = 2 * (R - 1);
-    // FSLOT(topo, step, sender) = FBASIS[topo] + (step*R + sender)*256,
-    // FBASIS = { 0, 2*R*256 }. Unchanged from the probe, just without the
+    const int steps_mesh = 2;
+    const int steps_ring = 2 * (R - 1);
+    // FSLOT(topo, step, sender) = FBASE[topo] + (step*R + sender)*256,
+    // FBASE = { 0, 2*R*256 }. Unchanged from the probe, just without the
     // two additional topologies it also measured.
-    const size_t fbasis_netz = 0;
-    const size_t fbasis_ring = (size_t)schritte_netz * (size_t)R * 256u;
-#define FSLOT(BASIS, SCHRITT, SENDER) \
-    ((BASIS) + (size_t)((SCHRITT) * R + (SENDER)) * 256u)
+    const size_t fbase_mesh = 0;
+    const size_t fbase_ring = (size_t)steps_mesh * (size_t)R * 256u;
+#define FSLOT(BASE, STEP, SENDER) \
+    ((BASE) + (size_t)((STEP) * R + (SENDER)) * 256u)
 
     if (algo == 0) {
         for (int z = 0; z < R; ++z) {
@@ -1153,60 +1153,60 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
             // My position in the ascending peer list of receiver z.
             // NOT (r < z) -- see the derivation in the probe.
             const size_t p = (size_t)(r - (r > z ? 1 : 0));
-            char *zb = (char *)(uintptr_t)peer_nutz[z];
-            A.nzSendRS[z] = (uint4 *)(zb + off_netz +
+            char *zb = (char *)(uintptr_t)peer_payload[z];
+            A.nzSendRS[z] = (uint4 *)(zb + off_mesh +
                                       (size_t)(0 * (R - 1) + (int)p) * chunk_max);
-            A.nzSendAG[z] = (uint4 *)(zb + off_netz +
+            A.nzSendAG[z] = (uint4 *)(zb + off_mesh +
                                       (size_t)(1 * (R - 1) + (int)p) * chunk_max);
         }
         {
-            char *mb = (char *)(uintptr_t)eigen_nutz;
+            char *mb = (char *)(uintptr_t)own_payload;
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
                 const size_t p = (size_t)(s - (s > r ? 1 : 0));
-                A.nzRecvRS[s] = (const uint4 *)(mb + off_netz +
+                A.nzRecvRS[s] = (const uint4 *)(mb + off_mesh +
                                   (size_t)(0 * (R - 1) + (int)p) * chunk_max);
-                A.nzRecvAG[s] = (const uint4 *)(mb + off_netz +
+                A.nzRecvAG[s] = (const uint4 *)(mb + off_mesh +
                                   (size_t)(1 * (R - 1) + (int)p) * chunk_max);
             }
         }
         for (int ph = 0; ph < 2; ++ph) {
             for (int s = 0; s < R; ++s) {
                 if (s == r) continue;
-                A.nzFlagAn[ph][s] = (u64 *)((char *)(uintptr_t)peer_flag[s] +
-                                            FSLOT(fbasis_netz, ph, r));
-                A.nzFlagVon[ph][s] = (const u64 *)((char *)(uintptr_t)eigen_flag +
-                                                   FSLOT(fbasis_netz, ph, s));
+                A.nzFlagTo[ph][s] = (u64 *)((char *)(uintptr_t)peer_flag[s] +
+                                            FSLOT(fbase_mesh, ph, r));
+                A.nzFlagFrom[ph][s] = (const u64 *)((char *)(uintptr_t)own_flag +
+                                                   FSLOT(fbase_mesh, ph, s));
             }
         }
     } else {
-        const int nach = (r + 1) % R;
-        const int vor  = (r + R - 1) % R;
-        char *zb = (char *)(uintptr_t)peer_nutz[nach];
-        char *mb = (char *)(uintptr_t)eigen_nutz;
-        for (int s = 0; s < schritte_ring; ++s) {
+        const int next_rank = (r + 1) % R;
+        const int prev_rank  = (r + R - 1) % R;
+        char *zb = (char *)(uintptr_t)peer_payload[next_rank];
+        char *mb = (char *)(uintptr_t)own_payload;
+        for (int s = 0; s < steps_ring; ++s) {
             A.rgSend[s]    = (uint4 *)(zb + off_ring + (size_t)s * chunk_max);
             A.rgRecv[s]    = (const uint4 *)(mb + off_ring + (size_t)s * chunk_max);
-            A.rgFlagAn[s]  = (u64 *)((char *)(uintptr_t)peer_flag[nach] +
-                                     FSLOT(fbasis_ring, s, r));
-            A.rgFlagVon[s] = (const u64 *)((char *)(uintptr_t)eigen_flag +
-                                           FSLOT(fbasis_ring, s, vor));
+            A.rgFlagTo[s]  = (u64 *)((char *)(uintptr_t)peer_flag[next_rank] +
+                                     FSLOT(fbase_ring, s, r));
+            A.rgFlagFrom[s] = (const u64 *)((char *)(uintptr_t)own_flag +
+                                           FSLOT(fbase_ring, s, prev_rank));
         }
     }
 #undef FSLOT
 
-    auto strom = at::cuda::getCurrentCUDAStream().stream();
-    const int kernI = (int)kern, laI = (int)ladeform, flI = (int)fluss;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int kernelI = (int)kernel_variant, laI = (int)load_shape, flushI = (int)read_flush;
     switch (inp.scalar_type()) {
         case at::kFloat:
-            starte<float>((int)algo, kernI, laI, flI, A, (int)threads, strom);
+            start<float>((int)algo, kernelI, laI, flushI, A, (int)threads, stream);
             break;
         case at::kHalf:
-            starte<__half>((int)algo, kernI, laI, flI, A, (int)threads, strom);
+            start<__half>((int)algo, kernelI, laI, flushI, A, (int)threads, stream);
             break;
         case at::kBFloat16:
-            starte<__nv_bfloat16>((int)algo, kernI, laI, flI, A, (int)threads,
-                                  strom);
+            start<__nv_bfloat16>((int)algo, kernelI, laI, flushI, A, (int)threads,
+                                  stream);
             break;
         default:
             TORCH_CHECK(false, "barlink-bar1: data type ", inp.scalar_type(),
@@ -1222,43 +1222,43 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
 // so the same function carries both the evenly-split and the unevenly-split
 // form (input_split_sizes/output_split_sizes), and fp8 is simply a byte.
 //
-// `peer_nutz` is the SAME peer pointer table as in bar1_all_reduce; the a2a
+// `peer_payload` is the SAME peer pointer table as in bar1_all_reduce; the a2a
 // region sits as a third section in the same receive region (offset
 // `off_a2a`). Nothing is mapped here -- that happened during setup, and
 // only there.
 // ---------------------------------------------------------------------------
-static void starteA2a(int vek, int kern, int la, A2aArgs &A, int threads,
-                      long long pakete, cudaStream_t strom)
+static void startA2a(int vec, int kernel_variant, int la, A2aArgs &A, int threads,
+                      long long packets, cudaStream_t stream)
 {
-#define BARLINK_A2A_STARTE(VEK, LA)                                              \
+#define BARLINK_A2A_LAUNCH(VEC, LA)                                              \
     do {                                                                       \
-        if (kern == K_GITTER) {                                                \
-            const void *fn = (const void *)bar1_a2a_kernel<VEK, LA, K_GITTER>; \
-            int n4 = (int)(pakete > 2147483647LL ? 2147483647LL : pakete);     \
-            int g = gitterGroesse(fn, threads, n4);                            \
+        if (kernel_variant == K_GRID) {                                                \
+            const void *fn = (const void *)bar1_a2a_kernel<VEC, LA, K_GRID>; \
+            int n4 = (int)(packets > 2147483647LL ? 2147483647LL : packets);     \
+            int g = gridSize(fn, threads, n4);                            \
             dim3 gd((unsigned)g), bd((unsigned)threads);                       \
             void *args[1] = { &A };                                            \
             cudaError_t e = cudaLaunchCooperativeKernel(fn, gd, bd, args, 0,   \
-                                                        strom);                \
+                                                        stream);                \
             TORCH_CHECK(e == cudaSuccess,                                      \
                         "barlink-bar1 a2a: cudaLaunchCooperativeKernel -> ",     \
                         cudaGetErrorString(e));                                \
             return;                                                            \
         }                                                                      \
-        bar1_a2a_kernel<VEK, LA, K_1BLK><<<1, threads, 0, strom>>>(A);         \
+        bar1_a2a_kernel<VEC, LA, K_1BLK><<<1, threads, 0, stream>>>(A);         \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess,                         \
                     "barlink-bar1 a2a: kernel launch failed");                   \
         return;                                                                \
     } while (0)
 
-    if (vek) {
-        if (la == LA_MMIO) BARLINK_A2A_STARTE(1, LA_MMIO);
-        else               BARLINK_A2A_STARTE(1, LA_CV);
+    if (vec) {
+        if (la == LA_MMIO) BARLINK_A2A_LAUNCH(1, LA_MMIO);
+        else               BARLINK_A2A_LAUNCH(1, LA_CV);
     } else {
-        if (la == LA_MMIO) BARLINK_A2A_STARTE(0, LA_MMIO);
-        else               BARLINK_A2A_STARTE(0, LA_CV);
+        if (la == LA_MMIO) BARLINK_A2A_LAUNCH(0, LA_MMIO);
+        else               BARLINK_A2A_LAUNCH(0, LA_CV);
     }
-#undef BARLINK_A2A_STARTE
+#undef BARLINK_A2A_LAUNCH
 }
 
 void bar1_all_to_all(at::Tensor inp, at::Tensor out,
@@ -1267,13 +1267,13 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      std::vector<int64_t> send_len,
                      std::vector<int64_t> recv_off,
                      std::vector<int64_t> recv_len,
-                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_payload,
                      std::vector<int64_t> peer_flag,
-                     int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
-                     at::Tensor runde_dev, at::Tensor ctl_dev,
-                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t abbruch_wirt)
+                     int64_t own_payload, int64_t own_flag,
+                     int64_t slot, int64_t off_a2a, int64_t fbase_a2a,
+                     at::Tensor round_dev, at::Tensor ctl_dev,
+                     int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                     int64_t load_shape, int64_t abort_host)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1291,7 +1291,7 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                 (int64_t)send_len.size() == world &&
                 (int64_t)recv_off.size() == world &&
                 (int64_t)recv_len.size() == world &&
-                (int64_t)peer_nutz.size() == world &&
+                (int64_t)peer_payload.size() == world &&
                 (int64_t)peer_flag.size() == world,
                 "barlink-bar1 a2a: one of the tables has the wrong length");
     TORCH_CHECK(slot > 0 && (slot % 16) == 0,
@@ -1338,60 +1338,60 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
     std::memset(&A, 0, sizeof(A));
     A.in           = (const unsigned char *)inp.data_ptr();
     A.out          = (unsigned char *)out.data_ptr();
-    A.rundeDev     = (u64 *)runde_dev.data_ptr();
+    A.roundDev     = (u64 *)round_dev.data_ptr();
     A.ctlStatus    = (unsigned int *)ctl_dev.data_ptr();
-    A.abbruchDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
+    A.abortDev   = ((unsigned int *)ctl_dev.data_ptr()) + 1;
     // 0 means the host could not map the abort word; nullptr disables the
     // probe and leaves only the cycle deadline.
-    A.abbruchWirt  = (const unsigned int *)(uintptr_t)abbruch_wirt;
+    A.abortHost  = (const unsigned int *)(uintptr_t)abort_host;
     A.R            = R;
-    A.rang         = r;
-    A.deckelZyklen = (u64)deckel_zyklen;
+    A.rank         = r;
+    A.capCycles = (u64)cap_cycles;
     A.slot      = (long long)slot;
-    A.eigenBasis   = (const unsigned char *)((char *)(uintptr_t)eigen_nutz
+    A.ownBase   = (const unsigned char *)((char *)(uintptr_t)own_payload
                                              + off_a2a);
 
-    // VEK only when EVERYTHING is aligned: both base addresses and every
+    // VEC only when EVERYTHING is aligned: both base addresses and every
     // block offset. A single misaligned offset makes the 128-bit load
     // instruction invalid, and there is no such thing as "mostly aligned".
-    int vek = (((uintptr_t)inp.data_ptr() % 16) == 0 &&
+    int vec = (((uintptr_t)inp.data_ptr() % 16) == 0 &&
                ((uintptr_t)out.data_ptr() % 16) == 0) ? 1 : 0;
-    long long pakete = 0;
+    long long packets = 0;
     for (int z = 0; z < R; ++z) {
         A.sendOff[z] = (long long)send_off[z];
         A.sendLen[z] = (long long)send_len[z];
         A.recvOff[z] = (long long)recv_off[z];
         A.recvLen[z] = (long long)recv_len[z];
-        if ((send_off[z] % 16) || (recv_off[z] % 16)) vek = 0;
-        if (z != r) pakete += (A.sendLen[z] + 15LL) / 16LL;
+        if ((send_off[z] % 16) || (recv_off[z] % 16)) vec = 0;
+        if (z != r) packets += (A.sendLen[z] + 15LL) / 16LL;
     }
     for (int z = 0; z < R; ++z) {
         if (z == r) continue;
-        A.zielBasis[z] = (unsigned char *)((char *)(uintptr_t)peer_nutz[z]
+        A.dstBase[z] = (unsigned char *)((char *)(uintptr_t)peer_payload[z]
                                            + off_a2a);
         // One flag line per (step=0, sender). I write into MY line at the
         // receiver and read THEIR line locally.
-        A.flagAn[z]  = (u64 *)((char *)(uintptr_t)peer_flag[z] +
-                               fbasis_a2a + (size_t)r * 256u);
-        A.flagVon[z] = (const u64 *)((char *)(uintptr_t)eigen_flag +
-                                     fbasis_a2a + (size_t)z * 256u);
+        A.flagTo[z]  = (u64 *)((char *)(uintptr_t)peer_flag[z] +
+                               fbase_a2a + (size_t)r * 256u);
+        A.flagFrom[z] = (const u64 *)((char *)(uintptr_t)own_flag +
+                                     fbase_a2a + (size_t)z * 256u);
     }
 
-    auto strom = at::cuda::getCurrentCUDAStream().stream();
-    starteA2a(vek, (int)kern, (int)ladeform, A, (int)threads, pakete, strom);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    startA2a(vec, (int)kernel_variant, (int)load_shape, A, (int)threads, packets, stream);
 }
 """
 
 _CPP_SRC = """
 void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world, int64_t algo,
-                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_payload,
                      std::vector<int64_t> peer_flag,
-                     int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t chunk_max, int64_t off_netz, int64_t off_ring,
-                     at::Tensor runde_dev, at::Tensor ctl_dev,
-                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t fluss, int64_t abbruch_wirt);
+                     int64_t own_payload, int64_t own_flag,
+                     int64_t chunk_max, int64_t off_mesh, int64_t off_ring,
+                     at::Tensor round_dev, at::Tensor ctl_dev,
+                     int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                     int64_t load_shape, int64_t read_flush, int64_t abort_host);
 
 void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world,
@@ -1399,13 +1399,13 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      std::vector<int64_t> send_len,
                      std::vector<int64_t> recv_off,
                      std::vector<int64_t> recv_len,
-                     std::vector<int64_t> peer_nutz,
+                     std::vector<int64_t> peer_payload,
                      std::vector<int64_t> peer_flag,
-                     int64_t eigen_nutz, int64_t eigen_flag,
-                     int64_t slot, int64_t off_a2a, int64_t fbasis_a2a,
-                     at::Tensor runde_dev, at::Tensor ctl_dev,
-                     int64_t deckel_zyklen, int64_t threads, int64_t kern,
-                     int64_t ladeform, int64_t abbruch_wirt);
+                     int64_t own_payload, int64_t own_flag,
+                     int64_t slot, int64_t off_a2a, int64_t fbase_a2a,
+                     at::Tensor round_dev, at::Tensor ctl_dev,
+                     int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
+                     int64_t load_shape, int64_t abort_host);
 """
 
 
@@ -1462,14 +1462,14 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
     const NvHandle hMemory = 0xbee00010;
     NvHandle hClient = 0;
     int ctlFd = -1, devFd = -1;
-    char fehler[256] = {0};
+    char errmsg[256] = {0};
 
 #define NVX_FAIL(...)                                                          \
     do {                                                                       \
-        std::snprintf(fehler, sizeof(fehler), __VA_ARGS__);                    \
+        std::snprintf(errmsg, sizeof(errmsg), __VA_ARGS__);                    \
         if (devFd >= 0) close(devFd);                                          \
         if (ctlFd >= 0) close(ctlFd);                                          \
-        TORCH_CHECK(false, "barlink-bar1 dma-buf export: ", fehler);             \
+        TORCH_CHECK(false, "barlink-bar1 dma-buf export: ", errmsg);             \
     } while (0)
 
     ctlFd = open("/dev/nvidiactl", O_RDWR);
@@ -1590,11 +1590,11 @@ std::vector<int64_t> bar1_export_dmabuf(int64_t objfd, int64_t pci_bus,
     }
 #undef NVX_FAIL
 
-    std::vector<int64_t> aus;
-    aus.push_back((int64_t)dmabufFd);
-    aus.push_back((int64_t)ctlFd);
-    aus.push_back((int64_t)devFd);
-    return aus;
+    std::vector<int64_t> out;
+    out.push_back((int64_t)dmabufFd);
+    out.push_back((int64_t)ctlFd);
+    out.push_back((int64_t)devFd);
+    return out;
 }
 """
 
@@ -1616,17 +1616,17 @@ def nv_include_paths() -> Optional[list]:
     copy of the UAPI structures -- their field offsets are version-bound,
     and a wrongly guessed struct sends garbage into a kernel ioctl.
     """
-    wurzel = os.environ.get("SGLANG_BARLINK_BAR1_NV_SOURCE", NV_SOURCE_DEFAULT)
-    p = pathlib.Path(wurzel)
-    pfade = [p / t for t in NV_INCLUDES]
-    fehlend = [str(x) for x in pfade if not x.is_dir()]
-    if fehlend:
+    root = os.environ.get("SGLANG_BARLINK_BAR1_NV_SOURCE", NV_SOURCE_DEFAULT)
+    p = pathlib.Path(root)
+    paths = [p / t for t in NV_INCLUDES]
+    missing = [str(x) for x in paths if not x.is_dir()]
+    if missing:
         return None
     # A header spot-check: the directory can exist and still be the wrong
     # tree.
-    if not (pfade[1] / "nvos.h").is_file():
+    if not (paths[1] / "nvos.h").is_file():
         return None
-    return [str(x) for x in pfade]
+    return [str(x) for x in paths]
 
 
 def load_collective_ext(cpu_group):
@@ -1701,8 +1701,8 @@ def load_dmabuf_ext():
     if _dmabuf_reason:
         return None
 
-    pfade = nv_include_paths()
-    if pfade is None:
+    paths = nv_include_paths()
+    if paths is None:
         _dmabuf_reason = (
             f"The headers of the open-source NVIDIA kernel modules are not "
             f"under "
@@ -1728,7 +1728,7 @@ def load_dmabuf_ext():
                 name=name,
                 cpp_sources=_DMABUF_SRC,
                 functions=["bar1_export_dmabuf"],
-                extra_include_paths=pfade,
+                extra_include_paths=paths,
                 verbose=False,
                 build_directory=str(build_dir) if build_dir is not None else None,
             )
@@ -1738,7 +1738,7 @@ def load_dmabuf_ext():
         return None
     logger.info(
         "barlink-BAR1: dma-buf extension built in %.1f s (driver tree %s).",
-        time.time() - t0, pfade[0],
+        time.time() - t0, paths[0],
     )
     return _dmabuf_ext
 

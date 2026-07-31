@@ -47,14 +47,14 @@ R1  **Mesh vs. ring.** Below saturation, the mesh's concurrency is free
 R2  **Leaves.** Whoever's measured capacity sits clearly below the
     median carries no transit traffic. If everyone is roughly level,
     there are no leaves and the flat scheme is kept. Threshold
-    ``blatt_schwelle`` (default 0.6 x median).
+    ``leaf_threshold`` (default 0.6 x median).
 
 R3  **Fan-in cap.** No card receives more than its measured cap,
     regardless of the number of sources (this rig: ~13 GB/s). The cap is
     split **evenly per source**, not proportionally -- the x8 source
     dropped from 12.81 to 6.75 GB/s, the x4 source kept its 6.46. Hence:
     never let a fast and a slow card write into the same destination at
-    the same time; stagger them instead (``Plan.staffeln``).
+    the same time; stagger them instead (``Plan.tiers``).
 
 R4  **Full duplex does not double.** At saturation each direction drops
     to ~65%, sum 1.32x. Below saturation it is nearly free (0.99 at
@@ -103,17 +103,17 @@ logger = logging.getLogger(__name__)
 
 # Fingerprint component: if the planning logic changes, an old cache
 # entry becomes invalid even when the hardware is the same.
-PLANER_VERSION = 1
+PLANNER_VERSION = 1
 
 # Default size ladder for the measurement, in KiB. The three points are
 # the operating regimes that matter: decode (20), transition (80),
 # prefill (1024).
-VORGABE_GROESSEN_KIB = (20, 80, 1024)
+DEFAULT_SIZES_KIB = (20, 80, 1024)
 
-ALGORITHMEN = ("mesh", "ring", "star", "hierarchisch")
-PLANER_MODI = ("auto", "fest", "aus")
-NIC_MODI = ("nie", "bei_bedarf", "immer")
-ROLLEN = ("blatt", "domaene", "nabe")
+ALGORITHMS = ("mesh", "ring", "star", "hierarchical")
+PLANNER_MODES = ("auto", "fixed", "off")
+NIC_MODES = ("never", "on_demand", "always")
+ROLES = ("leaf", "domain", "hub")
 
 # ---------------------------------------------------------------------------
 # Reference values for this rig -- ONLY for the plausibility report.
@@ -122,9 +122,9 @@ ROLLEN = ("blatt", "domaene", "nabe")
 # that is logged, so a broken measurement setup stands out instead of
 # passing as a rig quirk. Evidence: MESSUNG_NEBENLAEUFIGKEIT.md.
 # ---------------------------------------------------------------------------
-_BELEG_FANIN_GBPS = 13.16          # cap at 1 MiB, two sources
-_BELEG_DUPLEX_SUMME_1MIB = 1.32    # sum of both directions / one direction
-_BELEG_DUPLEX_SUMME_20KIB = 1.47
+_REFERENCE_FANIN_GBPS = 13.16          # cap at 1 MiB, two sources
+_REFERENCE_DUPLEX_TOTAL_1MIB = 1.32    # sum of both directions / one direction
+_REFERENCE_DUPLEX_TOTAL_20KIB = 1.47
 
 
 # ===========================================================================
@@ -140,9 +140,9 @@ class ConfigError(ValueError):
 class MeasureConfig:
     """What the planner measures at startup, and how long it's allowed to take."""
 
-    groessen_kib: tuple[int, ...] = VORGABE_GROESSEN_KIB
-    wiederholungen: int = 32
-    vorlauf: int = 8
+    sizes_kib: tuple[int, ...] = DEFAULT_SIZES_KIB
+    repeats: int = 32
+    warmup: int = 8
     # Ceiling for the entire startup measurement. If it's exceeded, the
     # planner thins out the size ladder and then the repetition count,
     # and logs it -- it does NOT abort, and it does not quietly keep going
@@ -154,65 +154,65 @@ class MeasureConfig:
     duplex: bool = True
     # Cache of the matrix plus its fingerprint. None = default path.
     cache: Optional[str] = None
-    cache_aus: bool = False
+    cache_off: bool = False
 
 
 @dataclass(frozen=True)
 class CollectiveConfig:
-    planer: str = "auto"                 # auto | fest | aus  (auto | fixed | off)
-    algorithmus: str = "auto"            # auto | mesh | ring | star | hierarchisch (hierarchical)
+    planner: str = "auto"                # auto | fixed | off
+    algorithm: str = "auto"              # auto | mesh | ring | star | hierarchical
     chunk_kib: Optional[int] = None      # None == "auto"
-    blatt_schwelle: float = 0.6          # capacity < 0.6 x median -> leaf
-    aufteilung: Any = "auto"             # auto | gleich | proportional | {bdf: [...]}  (auto | even | proportional)
+    leaf_threshold: float = 0.6          # capacity < 0.6 x median -> leaf
+    split: Any = "auto"                  # auto | even | proportional | {bdf: [...]}
     roles: Mapping[str, str] = field(default_factory=dict)      # bdf -> role
-    domaenen: tuple[tuple[str, ...], ...] = ()                   # lists of BDFs
+    domains: tuple[tuple[str, ...], ...] = ()                   # lists of BDFs
     # R3: within one fan-in wave, source capacities may differ by at most
     # this factor. Beyond it, they get staggered.
-    staffel_verhaeltnis: float = 1.5
+    tier_ratio: float = 1.5
     # Fraction of the measured capacity above which an edge counts as
     # saturated. Only used for the explanation/report -- the actual
     # decision is made via the cost comparison, not via this threshold.
-    saettigung_anteil: float = 0.75
-    mess: MeasureConfig = field(default_factory=MeasureConfig)
+    saturation_share: float = 0.75
+    measure: MeasureConfig = field(default_factory=MeasureConfig)
 
 
 @dataclass(frozen=True)
 class BarlinkConfig:
-    kollektiv: CollectiveConfig = field(default_factory=CollectiveConfig)
-    nic: str = "nie"                     # nie | bei_bedarf | immer  (never | on_demand | always)
+    collective: CollectiveConfig = field(default_factory=CollectiveConfig)
+    nic: str = "never"                   # never | on_demand | always
 
 
 # -- File --------------------------------------------------------------
 
-_MESS_SCHLUESSEL = {
-    "groessen_kib", "wiederholungen", "vorlauf", "budget_ms",
-    "fanin", "duplex", "cache", "cache_aus",
+_MEASURE_KEYS = {
+    "sizes_kib", "repeats", "warmup", "budget_ms",
+    "fanin", "duplex", "cache", "cache_off",
 }
-_KOLLEKTIV_SCHLUESSEL = {
-    "planer", "algorithmus", "chunk_kib", "blatt_schwelle", "aufteilung",
-    "roles", "domaenen", "staffel_verhaeltnis", "saettigung_anteil", "mess",
+_COLLECTIVE_KEYS = {
+    "planner", "algorithm", "chunk_kib", "leaf_threshold", "split",
+    "roles", "domains", "tier_ratio", "saturation_share", "measure",
 }
-_WURZEL_SCHLUESSEL = {"kollektiv", "nic"}
+_ROOT_KEYS = {"collective", "nic"}
 
 
-def _bool(wert: Any, wo: str) -> bool:
-    if isinstance(wert, bool):
-        return wert
-    if isinstance(wert, str):
-        s = wert.strip().lower()
-        if s in ("1", "ja", "true", "an", "yes"):
+def _bool(value: Any, where: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "on"):
             return True
-        if s in ("0", "nein", "false", "aus", "no"):
+        if s in ("0", "false", "no", "off"):
             return False
-    raise ConfigError(f"{wo}: {wert!r} is not a boolean value")
+    raise ConfigError(f"{where}: {value!r} is not a boolean value")
 
 
-def _check_key(gegeben: Iterable[str], erlaubt: set[str], wo: str) -> None:
-    unbekannt = sorted(set(gegeben) - erlaubt)
-    if unbekannt:
+def _check_key(given: Iterable[str], allowed: set[str], where: str) -> None:
+    unknown = sorted(set(given) - allowed)
+    if unknown:
         raise ConfigError(
-            f"{wo}: unknown keys {unbekannt}; allowed are "
-            f"{sorted(erlaubt)}. (A silently ignored typo in the "
+            f"{where}: unknown keys {unknown}; allowed are "
+            f"{sorted(allowed)}. (A silently ignored typo in the "
             f"configuration is exactly the kind of bug that later sends "
             f"someone hunting for performance that was switched off by "
             f"configuration.)"
@@ -221,7 +221,7 @@ def _check_key(gegeben: Iterable[str], erlaubt: set[str], wo: str) -> None:
 
 #: A PCI address, with or without a domain. Serves as a probe against
 #: anything that merely looks like one (e.g. a bare bus number).
-_IST_BDF = re.compile(r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
+_IS_BDF = re.compile(r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
 
 
 def _norm_bdf(s: str) -> str:
@@ -232,119 +232,119 @@ def _norm_bdf(s: str) -> str:
     return s
 
 
-def _read_file(pfad: str) -> dict:
-    p = pathlib.Path(pfad).expanduser()
+def _read_file(path: str) -> dict:
+    p = pathlib.Path(path).expanduser()
     if not p.is_file():
-        raise ConfigError(f"config file {pfad!r} does not exist")
+        raise ConfigError(f"config file {path!r} does not exist")
     text = p.read_text()
-    daten: Any
+    data: Any
     if p.suffix.lower() in (".yaml", ".yml"):
         try:
             import yaml
         except ImportError as e:  # pragma: no cover - PyYAML is a project dependency
             raise ConfigError(
-                f"{pfad}: YAML requested, but PyYAML is missing ({e}). "
+                f"{path}: YAML requested, but PyYAML is missing ({e}). "
                 f"JSON (.json) works without an extra package."
             ) from e
-        daten = yaml.safe_load(text)
+        data = yaml.safe_load(text)
     else:
-        daten = json.loads(text)
-    if daten is None:
+        data = json.loads(text)
+    if data is None:
         return {}
-    if not isinstance(daten, dict):
-        raise ConfigError(f"{pfad}: expected a mapping, not {type(daten)}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: expected a mapping, not {type(data)}")
     # Both `barlink: {...}` and the bare subtree are accepted.
-    if set(daten) == {"barlink"}:
-        daten = daten["barlink"] or {}
-    elif "barlink" in daten:
-        daten = daten["barlink"] or {}
-    if not isinstance(daten, dict):
-        raise ConfigError(f"{pfad}: `barlink` must be a mapping")
-    return daten
+    if set(data) == {"barlink"}:
+        data = data["barlink"] or {}
+    elif "barlink" in data:
+        data = data["barlink"] or {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: `barlink` must be a mapping")
+    return data
 
 
-def _from_mapping(basis: BarlinkConfig, d: Mapping[str, Any], wo: str) -> BarlinkConfig:
-    _check_key(d, _WURZEL_SCHLUESSEL, wo)
-    koll = basis.kollektiv
-    nic = basis.nic
+def _from_mapping(base: BarlinkConfig, d: Mapping[str, Any], where: str) -> BarlinkConfig:
+    _check_key(d, _ROOT_KEYS, where)
+    coll = base.collective
+    nic = base.nic
     if "nic" in d:
         nic = str(d["nic"]).strip().lower().replace("-", "_")
-    kd = d.get("kollektiv") or {}
+    kd = d.get("collective") or {}
     if not isinstance(kd, Mapping):
-        raise ConfigError(f"{wo}.kollektiv must be a mapping")
-    _check_key(kd, _KOLLEKTIV_SCHLUESSEL, f"{wo}.kollektiv")
-    aend: dict[str, Any] = {}
-    if "planer" in kd:
-        aend["planer"] = str(kd["planer"]).strip().lower()
-    if "algorithmus" in kd:
-        aend["algorithmus"] = str(kd["algorithmus"]).strip().lower()
+        raise ConfigError(f"{where}.collective must be a mapping")
+    _check_key(kd, _COLLECTIVE_KEYS, f"{where}.collective")
+    changes: dict[str, Any] = {}
+    if "planner" in kd:
+        changes["planner"] = str(kd["planner"]).strip().lower()
+    if "algorithm" in kd:
+        changes["algorithm"] = str(kd["algorithm"]).strip().lower()
     if "chunk_kib" in kd:
         v = kd["chunk_kib"]
-        aend["chunk_kib"] = None if str(v).strip().lower() == "auto" else int(v)
-    if "blatt_schwelle" in kd:
-        aend["blatt_schwelle"] = float(kd["blatt_schwelle"])
-    if "staffel_verhaeltnis" in kd:
-        aend["staffel_verhaeltnis"] = float(kd["staffel_verhaeltnis"])
-    if "saettigung_anteil" in kd:
-        aend["saettigung_anteil"] = float(kd["saettigung_anteil"])
-    if "aufteilung" in kd:
-        aend["aufteilung"] = _read_split(kd["aufteilung"], f"{wo}.kollektiv")
+        changes["chunk_kib"] = None if str(v).strip().lower() == "auto" else int(v)
+    if "leaf_threshold" in kd:
+        changes["leaf_threshold"] = float(kd["leaf_threshold"])
+    if "tier_ratio" in kd:
+        changes["tier_ratio"] = float(kd["tier_ratio"])
+    if "saturation_share" in kd:
+        changes["saturation_share"] = float(kd["saturation_share"])
+    if "split" in kd:
+        changes["split"] = _read_split(kd["split"], f"{where}.collective")
     if "roles" in kd:
         r = kd["roles"] or {}
         if not isinstance(r, Mapping):
-            raise ConfigError(f"{wo}.kollektiv.roles must be a mapping")
-        aend["roles"] = {
+            raise ConfigError(f"{where}.collective.roles must be a mapping")
+        changes["roles"] = {
             _norm_bdf(k): str(v).strip().lower() for k, v in r.items()
         }
-    if "domaenen" in kd:
-        dom = kd["domaenen"] or []
+    if "domains" in kd:
+        dom = kd["domains"] or []
         if not isinstance(dom, Sequence) or isinstance(dom, (str, bytes)):
-            raise ConfigError(f"{wo}.kollektiv.domaenen must be a list of lists")
-        aend["domaenen"] = tuple(
-            tuple(_norm_bdf(x) for x in gruppe) for gruppe in dom
+            raise ConfigError(f"{where}.collective.domains must be a list of lists")
+        changes["domains"] = tuple(
+            tuple(_norm_bdf(x) for x in group) for group in dom
         )
-    if "mess" in kd:
-        md = kd["mess"] or {}
+    if "measure" in kd:
+        md = kd["measure"] or {}
         if not isinstance(md, Mapping):
-            raise ConfigError(f"{wo}.kollektiv.mess must be a mapping")
-        _check_key(md, _MESS_SCHLUESSEL, f"{wo}.kollektiv.mess")
-        maend: dict[str, Any] = {}
-        if "groessen_kib" in md:
-            maend["groessen_kib"] = tuple(int(x) for x in md["groessen_kib"])
-        for schl in ("wiederholungen", "vorlauf"):
-            if schl in md:
-                maend[schl] = int(md[schl])
+            raise ConfigError(f"{where}.collective.measure must be a mapping")
+        _check_key(md, _MEASURE_KEYS, f"{where}.collective.measure")
+        mchanges: dict[str, Any] = {}
+        if "sizes_kib" in md:
+            mchanges["sizes_kib"] = tuple(int(x) for x in md["sizes_kib"])
+        for key in ("repeats", "warmup"):
+            if key in md:
+                mchanges[key] = int(md[key])
         if "budget_ms" in md:
-            maend["budget_ms"] = float(md["budget_ms"])
-        for schl in ("fanin", "duplex", "cache_aus"):
-            if schl in md:
-                maend[schl] = _bool(md[schl], f"{wo}.kollektiv.mess.{schl}")
+            mchanges["budget_ms"] = float(md["budget_ms"])
+        for key in ("fanin", "duplex", "cache_off"):
+            if key in md:
+                mchanges[key] = _bool(md[key], f"{where}.collective.measure.{key}")
         if "cache" in md:
-            maend["cache"] = None if md["cache"] is None else str(md["cache"])
-        aend["mess"] = replace(koll.mess, **maend)
-    return BarlinkConfig(kollektiv=replace(koll, **aend), nic=nic)
+            mchanges["cache"] = None if md["cache"] is None else str(md["cache"])
+        changes["measure"] = replace(coll.measure, **mchanges)
+    return BarlinkConfig(collective=replace(coll, **changes), nic=nic)
 
 
-def _read_split(v: Any, wo: str) -> Any:
+def _read_split(v: Any, where: str) -> Any:
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in ("auto", "gleich", "proportional"):
+        if s in ("auto", "even", "proportional"):
             return s
         raise ConfigError(
-            f"{wo}.aufteilung: {v!r} unknown "
-            f"(auto | gleich | proportional | mapping BDF -> weights)"
+            f"{where}.split: {v!r} unknown "
+            f"(auto | even | proportional | mapping BDF -> weights)"
         )
     if isinstance(v, Mapping):
-        aus: dict[str, tuple[float, ...]] = {}
-        for k, gew in v.items():
-            if not isinstance(gew, Sequence) or isinstance(gew, (str, bytes)):
-                raise ConfigError(f"{wo}.aufteilung[{k!r}]: expected a list of weights")
-            g = tuple(float(x) for x in gew)
+        out: dict[str, tuple[float, ...]] = {}
+        for k, weights in v.items():
+            if not isinstance(weights, Sequence) or isinstance(weights, (str, bytes)):
+                raise ConfigError(f"{where}.split[{k!r}]: expected a list of weights")
+            g = tuple(float(x) for x in weights)
             if not g or any(x < 0 for x in g) or sum(g) <= 0:
-                raise ConfigError(f"{wo}.aufteilung[{k!r}]: weights must be >= 0, sum > 0")
-            aus[_norm_bdf(k)] = g
-        return aus
-    raise ConfigError(f"{wo}.aufteilung: {v!r} not parseable")
+                raise ConfigError(f"{where}.split[{k!r}]: weights must be >= 0, sum > 0")
+            out[_norm_bdf(k)] = g
+        return out
+    raise ConfigError(f"{where}.split: {v!r} not parseable")
 
 
 # -- Environment -------------------------------------------------------------
@@ -353,7 +353,7 @@ def _read_split(v: Any, wo: str) -> Any:
 # wins, because it is the way to measure a run against itself without
 # changing any file.
 
-_ENV_PRAEFIX = "SGLANG_BARLINK_"
+_ENV_PREFIX = "SGLANG_BARLINK_"
 
 
 def load_config(env: Optional[Mapping[str, str]] = None) -> BarlinkConfig:
@@ -366,136 +366,136 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> BarlinkConfig:
     """
     env = os.environ if env is None else env
     k = BarlinkConfig()
-    pfad = env.get(_ENV_PRAEFIX + "KONFIG")
-    if pfad:
-        k = _from_mapping(k, _read_file(pfad), wo=pfad)
+    path = env.get(_ENV_PREFIX + "CONFIG")
+    if path:
+        k = _from_mapping(k, _read_file(path), where=path)
 
-    ueber: dict[str, Any] = {}
-    kueber: dict[str, Any] = {}
-    mueber: dict[str, Any] = {}
+    over: dict[str, Any] = {}
+    coll_over: dict[str, Any] = {}
+    measure_over: dict[str, Any] = {}
 
     def _e(name: str) -> Optional[str]:
-        return env.get(_ENV_PRAEFIX + name)
+        return env.get(_ENV_PREFIX + name)
 
     if (v := _e("NIC")) is not None or (v := _e("MATRIX_NIC")) is not None:
         # `MATRIX_NIC` is the name used in ENTWURF_BARLINK_TRANSPORT.md;
-        # `bei-bedarf` there, `bei_bedarf` here -- both are accepted.
-        ueber["nic"] = v.strip().lower().replace("-", "_")
-    if (v := _e("PLANER")) is not None:
-        kueber["planer"] = v.strip().lower()
-    if (v := _e("ALGORITHMUS")) is not None:
-        kueber["algorithmus"] = v.strip().lower()
+        # it spells the value `on-demand`; both spellings are accepted.
+        over["nic"] = v.strip().lower().replace("-", "_")
+    if (v := _e("PLANNER")) is not None:
+        coll_over["planner"] = v.strip().lower()
+    if (v := _e("ALGORITHM")) is not None:
+        coll_over["algorithm"] = v.strip().lower()
     if (v := _e("CHUNK_KIB")) is not None:
-        kueber["chunk_kib"] = None if v.strip().lower() == "auto" else int(v)
-    if (v := _e("BLATT_SCHWELLE")) is not None:
-        kueber["blatt_schwelle"] = float(v)
-    if (v := _e("STAFFEL_VERHAELTNIS")) is not None:
-        kueber["staffel_verhaeltnis"] = float(v)
-    if (v := _e("SAETTIGUNG_ANTEIL")) is not None:
-        kueber["saettigung_anteil"] = float(v)
-    if (v := _e("AUFTEILUNG")) is not None:
+        coll_over["chunk_kib"] = None if v.strip().lower() == "auto" else int(v)
+    if (v := _e("LEAF_THRESHOLD")) is not None:
+        coll_over["leaf_threshold"] = float(v)
+    if (v := _e("TIER_RATIO")) is not None:
+        coll_over["tier_ratio"] = float(v)
+    if (v := _e("SATURATION_SHARE")) is not None:
+        coll_over["saturation_share"] = float(v)
+    if (v := _e("SPLIT")) is not None:
         s = v.strip()
-        kueber["aufteilung"] = _read_split(
+        coll_over["split"] = _read_split(
             json.loads(s) if s.startswith("{") else s, "SGLANG_BARLINK_SPLIT"
         )
-    if (v := _e("ROLLEN")) is not None:
-        # "0000:05:00.0=blatt,0000:0a:00.0=domaene" or JSON
+    if (v := _e("ROLES")) is not None:
+        # "0000:05:00.0=leaf,0000:0a:00.0=domain" or JSON
         s = v.strip()
         if s.startswith("{"):
-            roh = json.loads(s)
+            raw = json.loads(s)
         else:
-            roh = {}
-            for teil in s.split(","):
-                if not teil.strip():
+            raw = {}
+            for part in s.split(","):
+                if not part.strip():
                     continue
-                if "=" not in teil:
+                if "=" not in part:
                     raise ConfigError(
-                        f"SGLANG_BARLINK_ROLES: {teil!r} has no '='; expected "
+                        f"SGLANG_BARLINK_ROLES: {part!r} has no '='; expected "
                         f"'<bdf>=<role>[,<bdf>=<role>]' or JSON"
                     )
-                bdf, rolle = teil.split("=", 1)
-                roh[bdf] = rolle
-        kueber["roles"] = {_norm_bdf(a): str(b).strip().lower() for a, b in roh.items()}
-    if (v := _e("DOMAENEN")) is not None:
+                bdf, role = part.split("=", 1)
+                raw[bdf] = role
+        coll_over["roles"] = {_norm_bdf(a): str(b).strip().lower() for a, b in raw.items()}
+    if (v := _e("DOMAINS")) is not None:
         # "05:00.0+0b:00.0;0a:00.0" or a JSON list of lists
         s = v.strip()
         if s.startswith("["):
-            roh = json.loads(s)
+            raw = json.loads(s)
         else:
-            roh = [g.split("+") for g in s.split(";") if g.strip()]
-        kueber["domaenen"] = tuple(tuple(_norm_bdf(x) for x in g) for g in roh)
-    if (v := _e("MESS_GROESSEN_KIB")) is not None:
-        mueber["groessen_kib"] = tuple(int(x) for x in v.replace(";", ",").split(","))
-    if (v := _e("MESS_WIEDERHOLUNGEN")) is not None:
-        mueber["wiederholungen"] = int(v)
-    if (v := _e("MESS_VORLAUF")) is not None:
-        mueber["vorlauf"] = int(v)
-    if (v := _e("MESS_BUDGET_MS")) is not None:
-        mueber["budget_ms"] = float(v)
-    if (v := _e("MESS_FANIN")) is not None:
-        mueber["fanin"] = _bool(v, "SGLANG_BARLINK_MEASURE_FANIN")
-    if (v := _e("MESS_DUPLEX")) is not None:
-        mueber["duplex"] = _bool(v, "SGLANG_BARLINK_MEASURE_DUPLEX")
+            raw = [g.split("+") for g in s.split(";") if g.strip()]
+        coll_over["domains"] = tuple(tuple(_norm_bdf(x) for x in g) for g in raw)
+    if (v := _e("MEASURE_SIZES_KIB")) is not None:
+        measure_over["sizes_kib"] = tuple(int(x) for x in v.replace(";", ",").split(","))
+    if (v := _e("MEASURE_REPEATS")) is not None:
+        measure_over["repeats"] = int(v)
+    if (v := _e("MEASURE_WARMUP")) is not None:
+        measure_over["warmup"] = int(v)
+    if (v := _e("MEASURE_BUDGET_MS")) is not None:
+        measure_over["budget_ms"] = float(v)
+    if (v := _e("MEASURE_FANIN")) is not None:
+        measure_over["fanin"] = _bool(v, "SGLANG_BARLINK_MEASURE_FANIN")
+    if (v := _e("MEASURE_DUPLEX")) is not None:
+        measure_over["duplex"] = _bool(v, "SGLANG_BARLINK_MEASURE_DUPLEX")
     if (v := _e("MATRIX_CACHE")) is not None:
-        mueber["cache"] = v
-    if (v := _e("MATRIX_CACHE_AUS")) is not None:
-        mueber["cache_aus"] = _bool(v, "SGLANG_BARLINK_MATRIX_CACHE_OFF")
+        measure_over["cache"] = v
+    if (v := _e("MATRIX_CACHE_OFF")) is not None:
+        measure_over["cache_off"] = _bool(v, "SGLANG_BARLINK_MATRIX_CACHE_OFF")
 
-    koll = k.kollektiv
-    if mueber:
-        kueber["mess"] = replace(koll.mess, **mueber)
-    if kueber:
-        koll = replace(koll, **kueber)
-    k = replace(k, kollektiv=koll, **ueber)
+    coll = k.collective
+    if measure_over:
+        coll_over["measure"] = replace(coll.measure, **measure_over)
+    if coll_over:
+        coll = replace(coll, **coll_over)
+    k = replace(k, collective=coll, **over)
     _validate(k)
     return k
 
 
 def _validate(k: BarlinkConfig) -> None:
-    if k.nic not in NIC_MODI:
-        raise ConfigError(f"nic={k.nic!r} unknown; allowed {list(NIC_MODI)}")
-    c = k.kollektiv
-    if c.planer not in PLANER_MODI:
-        raise ConfigError(f"kollektiv.planer={c.planer!r}; allowed {list(PLANER_MODI)}")
-    if c.algorithmus != "auto" and c.algorithmus not in ALGORITHMEN:
+    if k.nic not in NIC_MODES:
+        raise ConfigError(f"nic={k.nic!r} unknown; allowed {list(NIC_MODES)}")
+    c = k.collective
+    if c.planner not in PLANNER_MODES:
+        raise ConfigError(f"collective.planner={c.planner!r}; allowed {list(PLANNER_MODES)}")
+    if c.algorithm != "auto" and c.algorithm not in ALGORITHMS:
         raise ConfigError(
-            f"kollektiv.algorithmus={c.algorithmus!r}; allowed "
-            f"{['auto', *ALGORITHMEN]}"
+            f"collective.algorithm={c.algorithm!r}; allowed "
+            f"{['auto', *ALGORITHMS]}"
         )
-    if not 0.0 < c.blatt_schwelle <= 1.0:
+    if not 0.0 < c.leaf_threshold <= 1.0:
         raise ConfigError(
-            f"kollektiv.blatt_schwelle={c.blatt_schwelle} must lie in (0, 1] "
+            f"collective.leaf_threshold={c.leaf_threshold} must lie in (0, 1] "
             f"(fraction of the median; 1.0 means 'everything below the "
             f"median is a leaf')"
         )
-    if c.staffel_verhaeltnis < 1.0:
-        raise ConfigError("kollektiv.staffel_verhaeltnis must be >= 1")
-    if not 0.0 < c.saettigung_anteil <= 1.0:
-        raise ConfigError("kollektiv.saettigung_anteil must lie in (0, 1]")
+    if c.tier_ratio < 1.0:
+        raise ConfigError("collective.tier_ratio must be >= 1")
+    if not 0.0 < c.saturation_share <= 1.0:
+        raise ConfigError("collective.saturation_share must lie in (0, 1]")
     if c.chunk_kib is not None and c.chunk_kib <= 0:
-        raise ConfigError("kollektiv.chunk_kib must be > 0 or 'auto'")
-    for bdf, rolle in c.roles.items():
-        if rolle not in ROLLEN:
+        raise ConfigError("collective.chunk_kib must be > 0 or 'auto'")
+    for bdf, role in c.roles.items():
+        if role not in ROLES:
             raise ConfigError(
-                f"kollektiv.roles[{bdf!r}]={rolle!r}; allowed {list(ROLLEN)}"
+                f"collective.roles[{bdf!r}]={role!r}; allowed {list(ROLES)}"
             )
-    m = c.mess
-    if not m.groessen_kib or any(g <= 0 for g in m.groessen_kib):
-        raise ConfigError("kollektiv.mess.groessen_kib: expected positive values")
-    if m.wiederholungen <= 0 or m.vorlauf < 0:
-        raise ConfigError("kollektiv.mess.wiederholungen > 0, vorlauf >= 0")
+    m = c.measure
+    if not m.sizes_kib or any(g <= 0 for g in m.sizes_kib):
+        raise ConfigError("collective.measure.sizes_kib: expected positive values")
+    if m.repeats <= 0 or m.warmup < 0:
+        raise ConfigError("collective.measure.repeats > 0, warmup >= 0")
     if m.budget_ms <= 0:
-        raise ConfigError("kollektiv.mess.budget_ms must be > 0")
-    if c.planer == "aus" and c.algorithmus == "auto":
+        raise ConfigError("collective.measure.budget_ms must be > 0")
+    if c.planner == "off" and c.algorithm == "auto":
         raise ConfigError(
-            "kollektiv.planer=aus requires a fixed kollektiv.algorithmus -- "
-            "'aus' + 'auto' would mean 'don't measure, but still choose', "
+            "collective.planner=off requires a fixed collective.algorithm -- "
+            "'off' + 'auto' would mean 'don't measure, but still choose', "
             "and that doesn't exist. No silent fallback."
         )
-    if c.planer == "fest" and c.mess.cache_aus:
+    if c.planner == "fixed" and c.measure.cache_off:
         raise ConfigError(
-            "kollektiv.planer=fest needs the cache; mess.cache_aus=1 takes "
-            "away its only source. You probably mean planer=auto."
+            "collective.planner=fixed needs the cache; measure.cache_off=1 takes "
+            "away its only source. You probably mean planner=auto."
         )
 
 
@@ -525,16 +525,16 @@ class Sensor(Protocol):
 
     def name(self) -> str: ...
 
-    def self_load(self, nbytes: int, richtung: str) -> float:
-        """GB/s. ``richtung`` is ``"aus"`` (D2H) or ``"ein"`` (H2D)."""
+    def self_load(self, nbytes: int, direction: str) -> float:
+        """GB/s. ``direction`` is ``"d2h"`` (outbound) or ``"h2d"`` (inbound)."""
         ...
 
     def self_load_duplex(self, nbytes: int) -> Optional[float]:
         """Sum of both directions running simultaneously, GB/s. ``None`` if not measurable."""
         ...
 
-    def pair(self, ziel: int, nbytes: int) -> Optional[float]:
-        """GB/s from *this* rank to rank ``ziel``. ``None`` = no pair path."""
+    def pair(self, dst: int, nbytes: int) -> Optional[float]:
+        """GB/s from *this* rank to rank ``dst``. ``None`` = no pair path."""
         ...
 
     def pair_receive(self, source: int, nbytes: int) -> None:
@@ -554,7 +554,7 @@ class SelfLoadSensor:
     """
 
     def __init__(self, device, max_bytes: int = 4 << 20,
-                 wiederholungen: Optional[int] = None):
+                 repeats: Optional[int] = None):
         import torch
 
         self.device = device
@@ -563,7 +563,7 @@ class SelfLoadSensor:
         # None = the size-dependent default (small messages need more
         # rounds, otherwise you end up measuring the clock instead of the
         # link).
-        self._reps = wiederholungen
+        self._reps = repeats
         self._dev = torch.empty(max_bytes, dtype=torch.uint8, device=device)
         self._host = torch.empty(max_bytes, dtype=torch.uint8, pin_memory=True)
         self._host2 = torch.empty(max_bytes, dtype=torch.uint8, pin_memory=True)
@@ -573,23 +573,23 @@ class SelfLoadSensor:
     def name(self) -> str:
         return "self_load"
 
-    def _lauf(self, nbytes: int, richtung: str, n: int) -> None:
+    def _run(self, nbytes: int, direction: str, n: int) -> None:
         d = self._dev[:nbytes]
         h = self._host[:nbytes]
         for _ in range(n):
-            if richtung == "aus":
+            if direction == "d2h":
                 h.copy_(d, non_blocking=True)   # D2H == card's outbound direction
             else:
                 d.copy_(h, non_blocking=True)   # H2D == card's inbound direction
 
-    def self_load(self, nbytes: int, richtung: str) -> float:
+    def self_load(self, nbytes: int, direction: str) -> float:
         torch = self._torch
         nbytes = min(nbytes, self._max_bytes)
-        self._lauf(nbytes, richtung, 8)
+        self._run(nbytes, direction, 8)
         torch.cuda.synchronize(self.device)
         n = self._reps or _repeats_for(nbytes)
         t0 = time.perf_counter()
-        self._lauf(nbytes, richtung, n)
+        self._run(nbytes, direction, n)
         torch.cuda.synchronize(self.device)
         dt = time.perf_counter() - t0
         return (n * nbytes) / dt / 1e9 if dt > 0 else 0.0
@@ -625,7 +625,7 @@ class SelfLoadSensor:
         dt = time.perf_counter() - t0
         return (2 * n * nbytes) / dt / 1e9 if dt > 0 else None
 
-    def pair(self, ziel: int, nbytes: int) -> Optional[float]:
+    def pair(self, dst: int, nbytes: int) -> Optional[float]:
         return None   # no point-to-point path -- honest rather than estimated
 
     def pair_receive(self, source: int, nbytes: int) -> None:
@@ -659,95 +659,95 @@ class Measurement:
     All rates in GB/s (10^9 bytes/s, as elsewhere in the repo).
     """
 
-    welt: int
-    groessen: tuple[int, ...]                      # bytes
-    bdfs: tuple[str, ...]                          # per rank
-    namen: tuple[str, ...]                         # per rank (card name)
-    fuehler: str                                   # which sensor measured
+    world: int
+    sizes: tuple[int, ...]      # bytes
+    bdfs: tuple[str, ...]       # per rank
+    names: tuple[str, ...]      # per rank (card name)
+    sensor: str                 # which sensor measured
     # Node rates per rank and size.
-    aus: dict[int, list[float]] = field(default_factory=dict)     # rank -> per size
-    ein: dict[int, list[float]] = field(default_factory=dict)
-    duplex_summe: dict[int, list[float]] = field(default_factory=dict)
+    outbound: dict[int, list[float]] = field(default_factory=dict)   # per rank
+    inbound: dict[int, list[float]] = field(default_factory=dict)
+    duplex_total: dict[int, list[float]] = field(default_factory=dict)
     # Edge rates, if a pair sensor was present: (from, to) -> per size
-    kante: dict[tuple[int, int], list[float]] = field(default_factory=dict)
+    edge: dict[tuple[int, int], list[float]] = field(default_factory=dict)
     # R3: fan-in cap per destination and size, plus shares per source.
-    fanin_deckel: dict[int, list[float]] = field(default_factory=dict)
-    fanin_anteile: dict[tuple[int, int], list[float]] = field(default_factory=dict)
+    fanin_cap: dict[int, list[float]] = field(default_factory=dict)
+    fanin_shares: dict[tuple[int, int], list[float]] = field(default_factory=dict)
     # Line t(N) = latency + N/rate fitted from the size ladder, per rank:
     # the startup cost of one step, in seconds.
-    latenz_s: dict[int, float] = field(default_factory=dict)
+    latency_s: dict[int, float] = field(default_factory=dict)
     # Shared bottlenecks: by how much an edge slows down when ALL pairs
     # talk at once (mesh) instead of just one (ring). 1.0 means "no
     # interference" AND is also the value for "not measured" -- which of
-    # the two applies is told by `netz_faktor_gemessen`.
+    # the two applies is told by `mesh_factor_measured`.
     #
     # This is the term the ring-wins hypothesis hinges on: a mesh forces
     # EVERY pair to talk, including across switch uplinks and NUMA hops,
     # while a topology-ordered ring crosses shared bottlenecks only once
     # per round. Per-edge capacities alone cannot capture this -- they are
     # each measured on their own edge.
-    netz_faktor: list[float] = field(default_factory=list)
-    netz_faktor_gemessen: bool = False
-    dauer_s: float = 0.0
-    hinweise: list[str] = field(default_factory=list)
+    mesh_factor: list[float] = field(default_factory=list)
+    mesh_factor_measured: bool = False
+    duration_s: float = 0.0
+    hints: list[str] = field(default_factory=list)
 
     # -- derived views (no state) --------------------------------------
 
-    def capacity(self, von: int, nach: int, gi: int) -> float:
-        """Directed rank->rank capacity at size ``groessen[gi]``.
+    def capacity(self, src: int, dst: int, gi: int) -> float:
+        """Directed rank->rank capacity at size ``sizes[gi]``.
 
         A measured edge wins. Otherwise the self-load estimate
         ``min(source's outbound, destination's inbound)`` -- explicitly an
         **upper bound**, because it cannot see shared bottlenecks (switch
         uplink, a second root complex).
         """
-        e = self.kante.get((von, nach))
+        e = self.edge.get((src, dst))
         if e is not None:
             return e[gi]
-        return min(self.aus[von][gi], self.ein[nach][gi])
+        return min(self.outbound[src][gi], self.inbound[dst][gi])
 
-    def edge_measured(self, von: int, nach: int) -> bool:
-        return (von, nach) in self.kante
+    def edge_measured(self, src: int, dst: int) -> bool:
+        return (src, dst) in self.edge
 
-    def cap(self, nach: int, gi: int) -> float:
-        d = self.fanin_deckel.get(nach)
+    def cap(self, dst: int, gi: int) -> float:
+        d = self.fanin_cap.get(dst)
         if d is not None:
             return d[gi]
-        return self.ein[nach][gi]
+        return self.inbound[dst][gi]
 
-    def cap_measured(self, nach: int) -> bool:
-        return nach in self.fanin_deckel
+    def cap_measured(self, dst: int) -> bool:
+        return dst in self.fanin_cap
 
     def mesh_penalty(self, gi: int) -> float:
         """Factor applied to the mesh transfer term. >= 1."""
-        if not self.netz_faktor or gi >= len(self.netz_faktor):
+        if not self.mesh_factor or gi >= len(self.mesh_factor):
             return 1.0
-        return max(1.0, self.netz_faktor[gi])
+        return max(1.0, self.mesh_factor[gi])
 
-    def duplex_factor(self, rang: int, gi: int) -> float:
+    def duplex_factor(self, rank: int, gi: int) -> float:
         """Sum of both directions / larger single direction. 1.0 = no gain."""
-        d = self.duplex_summe.get(rang)
+        d = self.duplex_total.get(rank)
         if d is None:
             return 1.0
-        einzeln = max(self.aus[rang][gi], self.ein[rang][gi])
-        return d[gi] / einzeln if einzeln > 0 else 1.0
+        single = max(self.outbound[rank][gi], self.inbound[rank][gi])
+        return d[gi] / single if single > 0 else 1.0
 
     def step_s(self) -> float:
         """Startup cost of one collective step, in seconds (median across ranks)."""
-        if not self.latenz_s:
+        if not self.latency_s:
             return 0.0
-        return statistics.median(self.latenz_s.values())
+        return statistics.median(self.latency_s.values())
 
     def as_dict(self) -> dict:
         d = asdict(self)
         # Tuple keys aren't JSON-safe.
-        d["kante"] = {f"{a}->{b}": v for (a, b), v in self.kante.items()}
-        d["fanin_anteile"] = {f"{a}->{b}": v for (a, b), v in self.fanin_anteile.items()}
-        d["aus"] = {str(k): v for k, v in self.aus.items()}
-        d["ein"] = {str(k): v for k, v in self.ein.items()}
-        d["duplex_summe"] = {str(k): v for k, v in self.duplex_summe.items()}
-        d["fanin_deckel"] = {str(k): v for k, v in self.fanin_deckel.items()}
-        d["latenz_s"] = {str(k): v for k, v in self.latenz_s.items()}
+        d["edge"] = {f"{a}->{b}": v for (a, b), v in self.edge.items()}
+        d["fanin_shares"] = {f"{a}->{b}": v for (a, b), v in self.fanin_shares.items()}
+        d["outbound"] = {str(k): v for k, v in self.outbound.items()}
+        d["inbound"] = {str(k): v for k, v in self.inbound.items()}
+        d["duplex_total"] = {str(k): v for k, v in self.duplex_total.items()}
+        d["fanin_cap"] = {str(k): v for k, v in self.fanin_cap.items()}
+        d["latency_s"] = {str(k): v for k, v in self.latency_s.items()}
         return d
 
     @staticmethod
@@ -757,25 +757,25 @@ class Measurement:
             return int(a), int(b)
 
         m = Measurement(
-            welt=int(d["welt"]),
-            groessen=tuple(int(x) for x in d["groessen"]),
+            world=int(d["world"]),
+            sizes=tuple(int(x) for x in d["sizes"]),
             bdfs=tuple(d["bdfs"]),
-            namen=tuple(d["namen"]),
-            fuehler=str(d["fuehler"]),
-            dauer_s=float(d.get("dauer_s", 0.0)),
-            hinweise=list(d.get("hinweise", [])),
+            names=tuple(d["names"]),
+            sensor=str(d["sensor"]),
+            duration_s=float(d.get("duration_s", 0.0)),
+            hints=list(d.get("hints", [])),
         )
-        m.aus = {int(k): list(v) for k, v in d["aus"].items()}
-        m.ein = {int(k): list(v) for k, v in d["ein"].items()}
-        m.duplex_summe = {int(k): list(v) for k, v in d.get("duplex_summe", {}).items()}
-        m.kante = {pair(k): list(v) for k, v in d.get("kante", {}).items()}
-        m.fanin_deckel = {int(k): list(v) for k, v in d.get("fanin_deckel", {}).items()}
-        m.fanin_anteile = {
-            pair(k): list(v) for k, v in d.get("fanin_anteile", {}).items()
+        m.outbound = {int(k): list(v) for k, v in d["outbound"].items()}
+        m.inbound = {int(k): list(v) for k, v in d["inbound"].items()}
+        m.duplex_total = {int(k): list(v) for k, v in d.get("duplex_total", {}).items()}
+        m.edge = {pair(k): list(v) for k, v in d.get("edge", {}).items()}
+        m.fanin_cap = {int(k): list(v) for k, v in d.get("fanin_cap", {}).items()}
+        m.fanin_shares = {
+            pair(k): list(v) for k, v in d.get("fanin_shares", {}).items()
         }
-        m.latenz_s = {int(k): float(v) for k, v in d.get("latenz_s", {}).items()}
-        m.netz_faktor = [float(x) for x in d.get("netz_faktor", [])]
-        m.netz_faktor_gemessen = bool(d.get("netz_faktor_gemessen", False))
+        m.latency_s = {int(k): float(v) for k, v in d.get("latency_s", {}).items()}
+        m.mesh_factor = [float(x) for x in d.get("mesh_factor", [])]
+        m.mesh_factor_measured = bool(d.get("mesh_factor_measured", False))
         return m
 
 
@@ -800,68 +800,68 @@ def _quant(x: float) -> float:
 
 @dataclass(frozen=True)
 class Stage:
-    """One stage of the size ladder: up to ``max_bytes``, ``algorithmus`` applies."""
+    """One stage of the size ladder: up to ``max_bytes``, ``algorithm`` applies."""
 
-    von_bytes: int                       # smallest size this was measured for
+    min_bytes: int                       # smallest size this was measured for
     max_bytes: int                       # inclusive; -1 == "and everything above"
-    algorithmus: str
-    vorhersage_s: Mapping[str, float]    # algorithm -> predicted time
-    grund: str
+    algorithm: str
+    prediction_s: Mapping[str, float]    # algorithm -> predicted time
+    reason: str
 
 
 @dataclass(frozen=True)
 class Plan:
-    welt: int
+    world: int
     bdfs: tuple[str, ...]
     roles: tuple[str, ...]                     # per rank
-    domaene: tuple[int, ...]                    # ranks of the reduction domain
-    blaetter: tuple[int, ...]
-    eltern: Mapping[int, tuple[int, ...]]       # leaf -> domain nodes
-    aufteilung: Mapping[int, tuple[int, ...]]   # leaf -> per-mille share per parent
-    ringfolge: tuple[int, ...]
-    leiter: tuple[Stage, ...]
+    domain: tuple[int, ...]                    # ranks of the reduction domain
+    leaves: tuple[int, ...]
+    parents: Mapping[int, tuple[int, ...]]     # leaf -> domain nodes
+    split: Mapping[int, tuple[int, ...]]       # leaf -> per-mille share per parent
+    ring_order: tuple[int, ...]
+    ladder: tuple[Stage, ...]
     chunk_bytes: int
-    staffeln: Mapping[int, tuple[tuple[int, ...], ...]]   # destination -> waves of sources
-    konfig_zusammenfassung: Mapping[str, Any]
-    messung: Optional[Measurement] = None
-    source: str = "gemessen"                    # gemessen | zwischenspeicher | fest  (measured | cached | fixed)
+    tiers: Mapping[int, tuple[tuple[int, ...], ...]]  # destination -> waves of sources
+    config_summary: Mapping[str, Any]
+    measurement: Optional[Measurement] = None
+    source: str = "measured"                   # measured | cached | fixed
 
     # -- queries a transport needs ---------------------------------------
 
     def algorithm_for(self, nbytes: int) -> str:
-        for stufe in self.leiter:
-            if stufe.max_bytes < 0 or nbytes <= stufe.max_bytes:
-                return stufe.algorithmus
-        return self.leiter[-1].algorithmus
+        for stage in self.ladder:
+            if stage.max_bytes < 0 or nbytes <= stage.max_bytes:
+                return stage.algorithm
+        return self.ladder[-1].algorithm
 
-    def is_leaf(self, rang: int) -> bool:
-        return self.roles[rang] == "blatt"
+    def is_leaf(self, rank: int) -> bool:
+        return self.roles[rank] == "leaf"
 
     def checksum(self) -> str:
         """Fingerprint of the *decisions*, not of the raw measurement.
 
-        Deliberately without ``messung``: the raw values differ between
+        Deliberately without ``measurement``: the raw values differ between
         ranks by measurement noise once every rank contributes its own
         numbers. What MUST agree is the plan.
         """
-        kern = {
-            "welt": self.welt,
+        core = {
+            "world": self.world,
             "roles": list(self.roles),
-            "domaene": list(self.domaene),
-            "blaetter": list(self.blaetter),
-            "eltern": {str(k): list(v) for k, v in sorted(self.eltern.items())},
-            "aufteilung": {str(k): list(v) for k, v in sorted(self.aufteilung.items())},
-            "ringfolge": list(self.ringfolge),
-            "leiter": [(s.von_bytes, s.max_bytes, s.algorithmus) for s in self.leiter],
+            "domain": list(self.domain),
+            "leaves": list(self.leaves),
+            "parents": {str(k): list(v) for k, v in sorted(self.parents.items())},
+            "split": {str(k): list(v) for k, v in sorted(self.split.items())},
+            "ring_order": list(self.ring_order),
+            "ladder": [(s.min_bytes, s.max_bytes, s.algorithm) for s in self.ladder],
             "chunk_bytes": self.chunk_bytes,
-            "staffeln": {
-                str(k): [list(w) for w in v] for k, v in sorted(self.staffeln.items())
+            "tiers": {
+                str(k): [list(w) for w in v] for k, v in sorted(self.tiers.items())
             },
         }
-        roh = json.dumps(kern, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(roh.encode()).hexdigest()[:16]
+        raw = json.dumps(core, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    # -- Erklaerung ---------------------------------------------------------
+    # -- Explanation --------------------------------------------------------
 
     def explanation(self) -> str:
         """Human-readable: what was measured, what was inferred, what was chosen.
@@ -874,11 +874,11 @@ class Plan:
         a = z.append
         a("=" * 78)
         a(f"barlink path matrix: plan {self.checksum()} ({self.source}), "
-          f"{self.welt} ranks")
+          f"{self.world} ranks")
         a("=" * 78)
-        m = self.messung
+        m = self.measurement
         if m is not None:
-            a(f"Sensor: {m.fuehler}   Measurement duration: {m.dauer_s * 1000:.0f} ms")
+            a(f"Sensor: {m.sensor}   Measurement duration: {m.duration_s * 1000:.0f} ms")
             a("")
             a("-- measured node rates (GB/s, outbound/inbound per size) --")
             a("   The sysfs column is shown ONLY for comparison and feeds "
@@ -887,67 +887,67 @@ class Plan:
               "card is downclocked")
             a("   or the measurement setup is broken -- lspci is a starting "
               "estimate, not truth.")
-            kopf = "  Rank  Card                   sysfs   " + "".join(
-                f"{_kib(g):>18}" for g in m.groessen
+            header = "  Rank  Card                   sysfs   " + "".join(
+                f"{_kib(g):>18}" for g in m.sizes
             )
-            a(kopf)
-            for r in range(self.welt):
+            a(header)
+            for r in range(self.world):
                 lb = link_width(self.bdfs[r])
                 lbs = f"x{lb[0]}" if lb else "?"
-                zeile = (f"  {r:>4}  {self.bdfs[r]:<14}{m.namen[r][:8]:<8}"
-                         f"{lbs:<8}")
-                for gi in range(len(m.groessen)):
-                    zeile += f"{m.aus[r][gi]:>8.2f}/{m.ein[r][gi]:<9.2f}"
-                a(zeile)
-            if m.duplex_summe:
+                line = (f"  {r:>4}  {self.bdfs[r]:<14}{m.names[r][:8]:<8}"
+                        f"{lbs:<8}")
+                for gi in range(len(m.sizes)):
+                    line += f"{m.outbound[r][gi]:>8.2f}/{m.inbound[r][gi]:<9.2f}"
+                a(line)
+            if m.duplex_total:
                 a("")
                 a("-- full duplex (sum of both directions / stronger single direction) --")
                 a("   R4: measured, not assumed. 1.00 = the reverse direction "
                   "isn't free at all;")
                 a("   2.00 would be the naive expectation. Reference for this rig: "
-                  f"{_BELEG_DUPLEX_SUMME_20KIB:.2f}x at 20 KiB, "
-                  f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}x at 1 MiB.")
-                for r in range(self.welt):
-                    if r not in m.duplex_summe:
+                  f"{_REFERENCE_DUPLEX_TOTAL_20KIB:.2f}x at 20 KiB, "
+                  f"{_REFERENCE_DUPLEX_TOTAL_1MIB:.2f}x at 1 MiB.")
+                for r in range(self.world):
+                    if r not in m.duplex_total:
                         continue
-                    werte = "  ".join(
+                    values = "  ".join(
                         f"{_kib(g)}: {m.duplex_factor(r, gi):.2f}x"
-                        for gi, g in enumerate(m.groessen)
+                        for gi, g in enumerate(m.sizes)
                     )
-                    a(f"  Rank {r}: {werte}")
+                    a(f"  Rank {r}: {values}")
             a("")
             a("-- directed edge capacities (GB/s) --")
             a("   'M' = measured on the pair, 'S' = estimate min(outbound, "
               "inbound) from self-load")
-            for gi, g in enumerate(m.groessen):
+            for gi, g in enumerate(m.sizes):
                 a(f"  at {_kib(g)}:")
-                a("        " + "".join(f"{'->' + str(j):>12}" for j in range(self.welt)))
-                for i in range(self.welt):
-                    zeile = f"    {i:>2}  "
-                    for j in range(self.welt):
+                a("        " + "".join(f"{'->' + str(j):>12}" for j in range(self.world)))
+                for i in range(self.world):
+                    line = f"    {i:>2}  "
+                    for j in range(self.world):
                         if i == j:
-                            zeile += f"{'-':>12}"
+                            line += f"{'-':>12}"
                         else:
                             mark = "M" if m.edge_measured(i, j) else "S"
-                            zeile += f"{m.capacity(i, j, gi):>10.2f}{mark}"
-                    a(zeile)
+                            line += f"{m.capacity(i, j, gi):>10.2f}{mark}"
+                    a(line)
             a("")
             a("-- fan-in cap per destination (GB/s) --")
             a("   R3: no card receives more than the cap, regardless of how "
               "many sources.")
-            a(f"   Reference for this rig: {_BELEG_FANIN_GBPS:.2f} GB/s at 1 MiB "
+            a(f"   Reference for this rig: {_REFERENCE_FANIN_GBPS:.2f} GB/s at 1 MiB "
               "with two sources.")
-            for j in range(self.welt):
+            for j in range(self.world):
                 mark = "measured" if m.cap_measured(j) else "estimated from inbound rate"
-                werte = "  ".join(
-                    f"{_kib(g)}: {m.cap(j, gi):.2f}" for gi, g in enumerate(m.groessen)
+                values = "  ".join(
+                    f"{_kib(g)}: {m.cap(j, gi):.2f}" for gi, g in enumerate(m.sizes)
                 )
-                a(f"  Destination {j} ({self.bdfs[j]}): {werte}   [{mark}]")
+                a(f"  Destination {j} ({self.bdfs[j]}): {values}   [{mark}]")
             a(f"  Step cost (startup cost per collective step): "
               f"{m.step_s() * 1e6:.2f} us")
             a("")
             a("-- shared bottlenecks: mesh penalty vs. the ring --")
-            if m.netz_faktor_gemessen:
+            if m.mesh_factor_measured:
                 a("   Measured: all pairs simultaneously vs. one pair alone. "
                   ">1 means the mesh")
                 a("   loses to uplinks/NUMA hops that a per-edge capacity "
@@ -959,42 +959,42 @@ class Plan:
                   "wins on step")
                 a("   count. Here the ring can only be chosen via the "
                   "window limit.")
-            werte = "  ".join(
+            values = "  ".join(
                 f"{_kib(g)}: {m.mesh_penalty(gi):.2f}x"
-                for gi, g in enumerate(m.groessen)
+                for gi, g in enumerate(m.sizes)
             )
-            a(f"  {werte}")
-            for h in m.hinweise:
+            a(f"  {values}")
+            for h in m.hints:
                 a(f"  ! {h}")
         else:
             a("No measurement (planner off or fixed configuration).")
 
         a("")
-        a("-- roles (R2: capacity < blatt_schwelle x median -> leaf) --")
-        for r in range(self.welt):
-            zusatz = ""
-            if r in self.eltern:
-                el = ", ".join(str(x) for x in self.eltern[r])
-                anteile = "/".join(f"{p / 10:.0f}%" for p in self.aufteilung.get(r, ()))
-                zusatz = f"  -> parents [{el}]  split {anteile}"
-            a(f"  Rank {r} ({self.bdfs[r]}): {self.roles[r]}{zusatz}")
-        a(f"  Reduction domain: {list(self.domaene)}   Leaves: {list(self.blaetter)}")
+        a("-- roles (R2: capacity < leaf_threshold x median -> leaf) --")
+        for r in range(self.world):
+            extra = ""
+            if r in self.parents:
+                parent_list = ", ".join(str(x) for x in self.parents[r])
+                shares = "/".join(f"{p / 10:.0f}%" for p in self.split.get(r, ()))
+                extra = f"  -> parents [{parent_list}]  split {shares}"
+            a(f"  Rank {r} ({self.bdfs[r]}): {self.roles[r]}{extra}")
+        a(f"  Reduction domain: {list(self.domain)}   Leaves: {list(self.leaves)}")
         a(f"  Ring order (sorted by measured capacity): "
-          f"{list(self.ringfolge)}")
+          f"{list(self.ring_order)}")
 
         a("")
         a("-- algorithm per size class --")
-        for stufe in self.leiter:
-            grenze = (f"from {_kib(stufe.von_bytes)}" if stufe.max_bytes < 0
-                      else f"{_kib(stufe.von_bytes)}..{_kib(stufe.max_bytes)}")
-            vor = "  ".join(
-                f"{k}={v * 1e6:.1f}us" for k, v in sorted(stufe.vorhersage_s.items())
+        for stage in self.ladder:
+            bounds = (f"from {_kib(stage.min_bytes)}" if stage.max_bytes < 0
+                      else f"{_kib(stage.min_bytes)}..{_kib(stage.max_bytes)}")
+            predicted = "  ".join(
+                f"{k}={v * 1e6:.1f}us" for k, v in sorted(stage.prediction_s.items())
             )
-            a(f"  {grenze:>16}: {stufe.algorithmus:<14} [{vor}]")
-            a(f"                    {stufe.grund}")
+            a(f"  {bounds:>16}: {stage.algorithm:<14} [{predicted}]")
+            a(f"                    {stage.reason}")
         a(f"  Chunk: {self.chunk_bytes // 1024} KiB")
 
-        if self.staffeln:
+        if self.tiers:
             a("")
             a("-- fan-in staging plan (R3) --")
             a("   A fast and a slow source may not write into the same "
@@ -1003,13 +1003,13 @@ class Plan:
               "one gets pulled")
             a("   down to the slow one's share. More than one wave means "
               "staggered.")
-            for ziel, wellen in sorted(self.staffeln.items()):
-                w = " | ".join("+".join(str(q) for q in welle) for welle in wellen)
-                a(f"  Destination {ziel} ({self.bdfs[ziel]}): {w}")
+            for dst, waves in sorted(self.tiers.items()):
+                w = " | ".join("+".join(str(q) for q in wave) for wave in waves)
+                a(f"  Destination {dst} ({self.bdfs[dst]}): {w}")
 
         a("")
         a("-- effective configuration --")
-        for k, v in sorted(self.konfig_zusammenfassung.items()):
+        for k, v in sorted(self.config_summary.items()):
             a(f"  {k}: {v}")
         a("=" * 78)
         return "\n".join(z)
@@ -1026,12 +1026,12 @@ def _kib(n: int) -> str:
 # ===========================================================================
 
 
-def _time_mesh(m: Measurement, gi: int, n_bytes: int, raenge: Sequence[int],
-               wellen: Mapping[int, tuple[tuple[int, ...], ...]],
+def _time_mesh(m: Measurement, gi: int, n_bytes: int, ranks: Sequence[int],
+               waves: Mapping[int, tuple[tuple[int, ...], ...]],
                step_s: float) -> float:
     """Direct mesh: reduce-scatter + all-gather, exactly one step each.
 
-    ``raenge`` are REAL ranks, not indices -- this function is also
+    ``ranks`` are REAL ranks, not indices -- this function is also
     called for a subset (the reduction domain), and an
     index-into-the-subset would be a different rank there.
 
@@ -1049,38 +1049,38 @@ def _time_mesh(m: Measurement, gi: int, n_bytes: int, raenge: Sequence[int],
     The staging plan multiplies the steps: whoever has to write in two
     waves pays for the steps twice.
     """
-    r = len(raenge)
+    r = len(ranks)
     if r < 2:
         return 0.0
-    menge = set(raenge)
-    anteil = n_bytes / r             # everyone sends N/R to each neighbor
-    schlimmste = 0.0
-    schritte = 2
-    for ziel in raenge:
+    members = set(ranks)
+    share = n_bytes / r             # everyone sends N/R to each neighbor
+    worst = 0.0
+    steps = 2
+    for dst in ranks:
         w = tuple(
-            tuple(q for q in welle if q in menge)
-            for welle in wellen.get(ziel, (tuple(x for x in raenge if x != ziel),))
+            tuple(q for q in wave if q in members)
+            for wave in waves.get(dst, (tuple(x for x in ranks if x != dst),))
         )
-        w = tuple(welle for welle in w if welle)
-        cap = m.cap(ziel, gi)
+        w = tuple(wave for wave in w if wave)
+        cap = m.cap(dst, gi)
         # Waves run SEQUENTIALLY -- that's their whole purpose. So sum
         # them, don't take the maximum: staggered fan-in costs time, and
         # that cost must be visible in the comparison against the ring.
-        summe = 0.0
-        for welle in w:
-            gleichzeitig = len(welle)
-            pro_quelle = cap / gleichzeitig if gleichzeitig else cap
-            dauer = 0.0
-            for source in welle:
-                rate = min(m.capacity(source, ziel, gi), pro_quelle)
-                dauer = max(dauer, anteil / (rate * 1e9) if rate > 0 else float("inf"))
-            summe += dauer
-        schlimmste = max(schlimmste, summe)
-        schritte = max(schritte, 2 * len(w))
-    return schritte * step_s + 2 * schlimmste * m.mesh_penalty(gi)
+        total = 0.0
+        for wave in w:
+            concurrent = len(wave)
+            per_source = cap / concurrent if concurrent else cap
+            duration = 0.0
+            for source in wave:
+                rate = min(m.capacity(source, dst, gi), per_source)
+                duration = max(duration, share / (rate * 1e9) if rate > 0 else float("inf"))
+            total += duration
+        worst = max(worst, total)
+        steps = max(steps, 2 * len(w))
+    return steps * step_s + 2 * worst * m.mesh_penalty(gi)
 
 
-def _time_ring(m: Measurement, gi: int, n_bytes: int, folge: Sequence[int],
+def _time_ring(m: Measurement, gi: int, n_bytes: int, order: Sequence[int],
                step_s: float) -> float:
     """Ring: 2(R-1) steps, but every rank receives from exactly ONE neighbor.
 
@@ -1088,73 +1088,75 @@ def _time_ring(m: Measurement, gi: int, n_bytes: int, folge: Sequence[int],
     The price paid for that is the step count, which for R=8 is fourteen
     instead of two.
     """
-    welt = len(folge)
-    if welt < 2:
+    world = len(order)
+    if world < 2:
         return 0.0
-    anteil = n_bytes / welt
-    langsamste = 0.0
-    for k in range(welt):
-        von, nach = folge[k], folge[(k + 1) % welt]
-        rate = m.capacity(von, nach, gi)
-        langsamste = max(langsamste, anteil / (rate * 1e9) if rate > 0 else float("inf"))
-    return 2 * (welt - 1) * (step_s + langsamste)
+    share = n_bytes / world
+    slowest = 0.0
+    for k in range(world):
+        src, dst = order[k], order[(k + 1) % world]
+        rate = m.capacity(src, dst, gi)
+        slowest = max(slowest, share / (rate * 1e9) if rate > 0 else float("inf"))
+    return 2 * (world - 1) * (step_s + slowest)
 
 
-def _time_star(m: Measurement, gi: int, n_bytes: int, nabe: int, welt: int,
+def _time_star(m: Measurement, gi: int, n_bytes: int, hub: int, world: int,
                 step_s: float) -> float:
     """Star: everything to the hub, reduce there, distribute back.
 
     Two strictly separate phases with (R-1)N per direction on the hub. It
     is in the model because it is today's status quo and because
-    ``algorithmus: star`` must remain forceable -- not because it ever
+    ``algorithm: star`` must remain forceable -- not because it ever
     wins.
     """
-    if welt < 2:
+    if world < 2:
         return 0.0
-    ein = m.cap(nabe, gi)
-    aus_raten = [m.capacity(nabe, j, gi) for j in range(welt) if j != nabe]
-    aus = min(aus_raten) if aus_raten else 0.0
-    if ein <= 0 or aus <= 0:
+    inbound = m.cap(hub, gi)
+    out_rates = [m.capacity(hub, j, gi) for j in range(world) if j != hub]
+    outbound = min(out_rates) if out_rates else 0.0
+    if inbound <= 0 or outbound <= 0:
         return float("inf")
-    hin = (welt - 1) * n_bytes / (ein * 1e9)
-    rueck = (welt - 1) * n_bytes / (aus * 1e9)
-    return 2 * step_s + hin + rueck
+    forward = (world - 1) * n_bytes / (inbound * 1e9)
+    back = (world - 1) * n_bytes / (outbound * 1e9)
+    return 2 * step_s + forward + back
 
 
 def _time_hierarchical(m: Measurement, gi: int, n_bytes: int,
-                       domaene: Sequence[int], blaetter: Sequence[int],
-                       eltern: Mapping[int, tuple[int, ...]],
-                       aufteilung: Mapping[int, tuple[int, ...]],
-                       innen_s: float, step_s: float, welt: int) -> float:
+                       domain: Sequence[int], leaves: Sequence[int],
+                       parents: Mapping[int, tuple[int, ...]],
+                       split: Mapping[int, tuple[int, ...]],
+                       inner_s: float, step_s: float, world: int) -> float:
     """Leaf + reduction domain, chunked and overlapped.
 
     The leaf sends N out and pulls N in -- the floor, regardless of
     algorithm. With chunking the two directions overlap, but **not for
     free**: the credit is the measured duplex factor (R4), not 2.
     """
-    if not blaetter:
-        return innen_s
-    schlimmstes_blatt = 0.0
-    for b in blaetter:
-        el = eltern.get(b, tuple(domaene))
-        gew = aufteilung.get(b, tuple(1000 // max(len(el), 1) for _ in el))
-        gesamt = sum(gew) or 1
-        hoch = 0.0
-        runter = 0.0
-        for e, g in zip(el, gew):
-            teil = n_bytes * (g / gesamt)
-            r_hoch = m.capacity(b, e, gi)
-            r_runter = m.capacity(e, b, gi)
-            hoch = max(hoch, teil / (r_hoch * 1e9) if r_hoch > 0 else float("inf"))
-            runter = max(runter, teil / (r_runter * 1e9) if r_runter > 0 else float("inf"))
+    if not leaves:
+        return inner_s
+    worst_leaf = 0.0
+    for b in leaves:
+        leaf_parents = parents.get(b, tuple(domain))
+        weights = split.get(
+            b, tuple(1000 // max(len(leaf_parents), 1) for _ in leaf_parents)
+        )
+        total_weight = sum(weights) or 1
+        up = 0.0
+        down = 0.0
+        for e, g in zip(leaf_parents, weights):
+            part = n_bytes * (g / total_weight)
+            r_up = m.capacity(b, e, gi)
+            r_down = m.capacity(e, b, gi)
+            up = max(up, part / (r_up * 1e9) if r_up > 0 else float("inf"))
+            down = max(down, part / (r_down * 1e9) if r_down > 0 else float("inf"))
         # Overlap: the duplex factor says how much of the reverse
-        # direction is actually free. f=1 -> no overlap (hoch+runter),
+        # direction is actually free. f=1 -> no overlap (up+down),
         # f=2 -> full overlap (max). The measured value lies in between.
         f = max(1.0, min(2.0, m.duplex_factor(b, gi)))
-        seriell = hoch + runter
-        parallel = max(hoch, runter)
-        schlimmstes_blatt = max(schlimmstes_blatt, seriell - (f - 1.0) * (seriell - parallel))
-    return 2 * step_s + schlimmstes_blatt + innen_s
+        serial = up + down
+        parallel = max(up, down)
+        worst_leaf = max(worst_leaf, serial - (f - 1.0) * (serial - parallel))
+    return 2 * step_s + worst_leaf + inner_s
 
 
 # ===========================================================================
@@ -1171,60 +1173,60 @@ def _node_capacity(m: Measurement, r: int) -> float:
     the edge choice itself the directions stay separate; they are
     combined only here, where a single ranking is needed.
     """
-    gi = len(m.groessen) - 1        # largest measured size: that's where it separates
-    return min(m.aus[r][gi], m.ein[r][gi])
+    gi = len(m.sizes) - 1        # largest measured size: that's where it separates
+    return min(m.outbound[r][gi], m.inbound[r][gi])
 
 
 def _roles(m: Measurement, k: CollectiveConfig) -> tuple[list[str], list[int], list[int]]:
-    welt = m.welt
-    cap = [_node_capacity(m, r) for r in range(welt)]
-    med = statistics.median(cap) if cap else 0.0
-    schwelle = k.blatt_schwelle * med
-    roles = ["domaene"] * welt
-    for r in range(welt):
-        if welt > 2 and cap[r] < schwelle:
-            roles[r] = "blatt"
+    world = m.world
+    cap = [_node_capacity(m, r) for r in range(world)]
+    median_cap = statistics.median(cap) if cap else 0.0
+    threshold = k.leaf_threshold * median_cap
+    roles = ["domain"] * world
+    for r in range(world):
+        if world > 2 and cap[r] < threshold:
+            roles[r] = "leaf"
     # Manually set roles override the measurement -- deliberately.
-    for r in range(welt):
-        fest = k.roles.get(m.bdfs[r])
-        if fest is not None:
-            roles[r] = "domaene" if fest == "nabe" else fest
+    for r in range(world):
+        fixed = k.roles.get(m.bdfs[r])
+        if fixed is not None:
+            roles[r] = "domain" if fixed == "hub" else fixed
     # There must be at least two domain nodes, otherwise there is nothing
     # to reduce into. If necessary, pull back the strongest ones.
-    dom = [r for r in range(welt) if roles[r] != "blatt"]
-    if len(dom) < min(2, welt):
-        stark = sorted(range(welt), key=lambda r: (-cap[r], r))[: min(2, welt)]
-        for r in stark:
-            roles[r] = "domaene"
-    dom = [r for r in range(welt) if roles[r] != "blatt"]
-    blaetter = [r for r in range(welt) if roles[r] == "blatt"]
-    return roles, dom, blaetter
+    dom = [r for r in range(world) if roles[r] != "leaf"]
+    if len(dom) < min(2, world):
+        strongest = sorted(range(world), key=lambda r: (-cap[r], r))[: min(2, world)]
+        for r in strongest:
+            roles[r] = "domain"
+    dom = [r for r in range(world) if roles[r] != "leaf"]
+    leaves = [r for r in range(world) if roles[r] == "leaf"]
+    return roles, dom, leaves
 
 
 def _domains_from_config(m: Measurement, k: CollectiveConfig) -> Optional[list[list[int]]]:
-    if not k.domaenen:
+    if not k.domains:
         return None
     index = {bdf: r for r, bdf in enumerate(m.bdfs)}
-    aus: list[list[int]] = []
-    for gruppe in k.domaenen:
-        raenge = []
-        for bdf in gruppe:
+    out: list[list[int]] = []
+    for group in k.domains:
+        ranks = []
+        for bdf in group:
             if bdf not in index:
                 raise ConfigError(
-                    f"kollektiv.domaenen names {bdf!r}, but this ensemble "
+                    f"collective.domains names {bdf!r}, but this ensemble "
                     f"only has {sorted(index)}. No silent fallback -- "
                     f"either the address is wrong or the card is missing."
                 )
-            raenge.append(index[bdf])
-        aus.append(sorted(raenge))
-    gesehen = [r for g in aus for r in g]
-    if len(gesehen) != len(set(gesehen)):
-        raise ConfigError("kollektiv.domaenen: one rank appears in two domains")
-    return aus
+            ranks.append(index[bdf])
+        out.append(sorted(ranks))
+    seen = [r for g in out for r in g]
+    if len(seen) != len(set(seen)):
+        raise ConfigError("collective.domains: one rank appears in two domains")
+    return out
 
 
 def _parent_and_split(
-    m: Measurement, domaene: Sequence[int], blaetter: Sequence[int], k: CollectiveConfig
+    m: Measurement, domain: Sequence[int], leaves: Sequence[int], k: CollectiveConfig
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
     """Who attaches to what, and in which ratio.
 
@@ -1240,59 +1242,59 @@ def _parent_and_split(
     nothing, because the fan-in cap splits evenly regardless -- there, it
     is split evenly.
     """
-    gi = len(m.groessen) - 1
-    eltern: dict[int, tuple[int, ...]] = {}
-    aufteilung: dict[int, tuple[int, ...]] = {}
-    modus = k.aufteilung
-    for b in blaetter:
-        kand = sorted(domaene, key=lambda d: (-m.capacity(b, d, gi), d))
-        if not kand:
+    gi = len(m.sizes) - 1
+    parents: dict[int, tuple[int, ...]] = {}
+    split: dict[int, tuple[int, ...]] = {}
+    mode = k.split
+    for b in leaves:
+        candidates = sorted(domain, key=lambda d: (-m.capacity(b, d, gi), d))
+        if not candidates:
             continue
-        eltern[b] = tuple(kand)
-        if isinstance(modus, Mapping):
-            gew = modus.get(m.bdfs[b])
-            if gew is not None:
-                if len(gew) != len(kand):
+        parents[b] = tuple(candidates)
+        if isinstance(mode, Mapping):
+            weights = mode.get(m.bdfs[b])
+            if weights is not None:
+                if len(weights) != len(candidates):
                     raise ConfigError(
-                        f"kollektiv.aufteilung[{m.bdfs[b]!r}] names {len(gew)} "
-                        f"weights, but the leaf has {len(kand)} parents "
-                        f"{[m.bdfs[d] for d in kand]}"
+                        f"collective.split[{m.bdfs[b]!r}] names {len(weights)} "
+                        f"weights, but the leaf has {len(candidates)} parents "
+                        f"{[m.bdfs[d] for d in candidates]}"
                     )
-                aufteilung[b] = _promille(gew)
+                split[b] = _per_mille(weights)
                 continue
-            modus_b = "auto"
+            mode_b = "auto"
         else:
-            modus_b = modus
-        raten = [m.capacity(b, d, gi) for d in kand]
-        if modus_b == "gleich" or not any(raten):
-            aufteilung[b] = _promille([1.0] * len(kand))
-        elif modus_b == "proportional":
-            aufteilung[b] = _promille(raten)
+            mode_b = mode
+        rates = [m.capacity(b, d, gi) for d in candidates]
+        if mode_b == "even" or not any(rates):
+            split[b] = _per_mille([1.0] * len(candidates))
+        elif mode_b == "proportional":
+            split[b] = _per_mille(rates)
         else:  # auto
-            spanne = (max(raten) / min(raten)) if min(raten) > 0 else float("inf")
-            aufteilung[b] = _promille(
-                [1.0] * len(kand) if spanne > k.staffel_verhaeltnis else raten
+            spread = (max(rates) / min(rates)) if min(rates) > 0 else float("inf")
+            split[b] = _per_mille(
+                [1.0] * len(candidates) if spread > k.tier_ratio else rates
             )
-    return eltern, aufteilung
+    return parents, split
 
 
-def _promille(gew: Sequence[float]) -> tuple[int, ...]:
-    s = sum(gew)
+def _per_mille(weights: Sequence[float]) -> tuple[int, ...]:
+    s = sum(weights)
     if s <= 0:
-        n = len(gew)
+        n = len(weights)
         return tuple([1000 // n] * (n - 1) + [1000 - (1000 // n) * (n - 1)])
-    roh = [g / s * 1000.0 for g in gew]
-    ganz = [int(x) for x in roh]
-    rest = 1000 - sum(ganz)
+    raw = [g / s * 1000.0 for g in weights]
+    whole = [int(x) for x in raw]
+    remainder = 1000 - sum(whole)
     # Largest fractional remainders get the leftover -- deterministic, so
     # every rank arrives at the same result.
-    ordn = sorted(range(len(roh)), key=lambda i: (-(roh[i] - ganz[i]), i))
-    for i in ordn[:rest]:
-        ganz[i] += 1
-    return tuple(ganz)
+    order_by_remainder = sorted(range(len(raw)), key=lambda i: (-(raw[i] - whole[i]), i))
+    for i in order_by_remainder[:remainder]:
+        whole[i] += 1
+    return tuple(whole)
 
 
-def _ring_order(m: Measurement, welt: int) -> tuple[int, ...]:
+def _ring_order(m: Measurement, world: int) -> tuple[int, ...]:
     """Ring ordered by measured capacity.
 
     The ring wins, among other reasons, because it can lay out
@@ -1302,25 +1304,25 @@ def _ring_order(m: Measurement, welt: int) -> tuple[int, ...]:
     proximity is used only as a tie-break and never as a decision --
     ``lspci`` is a starting estimate, not truth.
     """
-    if welt < 2:
-        return tuple(range(welt))
-    gi = len(m.groessen) - 1
-    start = min(range(welt), key=lambda r: (-_node_capacity(m, r), r))
-    folge = [start]
-    offen = set(range(welt)) - {start}
-    while offen:
-        letzter = folge[-1]
-        naechster = min(
-            offen,
+    if world < 2:
+        return tuple(range(world))
+    gi = len(m.sizes) - 1
+    start = min(range(world), key=lambda r: (-_node_capacity(m, r), r))
+    order = [start]
+    open_set = set(range(world)) - {start}
+    while open_set:
+        last = order[-1]
+        next_rank = min(
+            open_set,
             key=lambda j: (
-                -min(m.capacity(letzter, j, gi), m.capacity(j, letzter, gi)),
-                -_pci_proximity(m.bdfs[letzter], m.bdfs[j]),
+                -min(m.capacity(last, j, gi), m.capacity(j, last, gi)),
+                -_pci_proximity(m.bdfs[last], m.bdfs[j]),
                 j,
             ),
         )
-        folge.append(naechster)
-        offen.discard(naechster)
-    return tuple(folge)
+        order.append(next_rank)
+        open_set.discard(next_rank)
+    return tuple(order)
 
 
 def _pci_proximity(a: str, b: str) -> int:
@@ -1344,42 +1346,42 @@ def _pci_proximity(a: str, b: str) -> int:
 
 
 def _tier_plan(
-    m: Measurement, welt: int, verhaeltnis: float
+    m: Measurement, world: int, ratio: float
 ) -> dict[int, tuple[tuple[int, ...], ...]]:
     """R3 as a schedule: who may write into the same destination at the same time.
 
     Rule taken from the fan-in measurement: the cap is split evenly per
     source, not by capability. An x8 source next to an x4 source dropped
     from 12.81 to 6.75 GB/s, while the x4 source kept its 6.46. Hence:
-    sources whose capacities differ by more than ``verhaeltnis`` belong in
+    sources whose capacities differ by more than ``ratio`` belong in
     different waves.
     """
-    gi = len(m.groessen) - 1
+    gi = len(m.sizes) - 1
     plan: dict[int, tuple[tuple[int, ...], ...]] = {}
-    for ziel in range(welt):
-        quellen = [q for q in range(welt) if q != ziel]
-        if len(quellen) < 2:
-            plan[ziel] = (tuple(quellen),)
+    for dst in range(world):
+        sources = [q for q in range(world) if q != dst]
+        if len(sources) < 2:
+            plan[dst] = (tuple(sources),)
             continue
-        quellen.sort(key=lambda q: (-m.capacity(q, ziel, gi), q))
-        wellen: list[list[int]] = []
-        for q in quellen:
-            rate = m.capacity(q, ziel, gi)
-            gelegt = False
-            for welle in wellen:
-                raten = [m.capacity(x, ziel, gi) for x in welle] + [rate]
-                lo, hi = min(raten), max(raten)
-                if lo > 0 and hi / lo <= verhaeltnis:
-                    welle.append(q)
-                    gelegt = True
+        sources.sort(key=lambda q: (-m.capacity(q, dst, gi), q))
+        waves: list[list[int]] = []
+        for q in sources:
+            rate = m.capacity(q, dst, gi)
+            placed = False
+            for wave in waves:
+                rates = [m.capacity(x, dst, gi) for x in wave] + [rate]
+                lo, hi = min(rates), max(rates)
+                if lo > 0 and hi / lo <= ratio:
+                    wave.append(q)
+                    placed = True
                     break
-            if not gelegt:
-                wellen.append([q])
-        plan[ziel] = tuple(tuple(w) for w in wellen)
+            if not placed:
+                waves.append([q])
+        plan[dst] = tuple(tuple(w) for w in waves)
     return plan
 
 
-def _chunk_bytes(m: Measurement, k: CollectiveConfig, welt: int) -> int:
+def _chunk_bytes(m: Measurement, k: CollectiveConfig, world: int) -> int:
     """Chunk size from measured step cost and measured rate.
 
     Per the collective design, pipelining is probably worth more than the
@@ -1392,14 +1394,14 @@ def _chunk_bytes(m: Measurement, k: CollectiveConfig, welt: int) -> int:
     """
     if k.chunk_kib is not None:
         return k.chunk_kib * 1024
-    gi = len(m.groessen) - 1
-    raten = [m.capacity(i, j, gi) for i in range(welt) for j in range(welt) if i != j]
-    rate = statistics.median(raten) if raten else 1.0
-    schritt = m.step_s()
-    if schritt <= 0 or rate <= 0:
+    gi = len(m.sizes) - 1
+    rates = [m.capacity(i, j, gi) for i in range(world) for j in range(world) if i != j]
+    rate = statistics.median(rates) if rates else 1.0
+    step = m.step_s()
+    if step <= 0 or rate <= 0:
         return 256 * 1024
-    ziel = 4.0 * schritt * rate * 1e9
-    kib = max(16, min(4096, 2 ** int(round(math.log2(max(ziel, 1.0) / 1024)))))
+    target = 4.0 * step * rate * 1e9
+    kib = max(16, min(4096, 2 ** int(round(math.log2(max(target, 1.0) / 1024)))))
     return int(kib) * 1024
 
 
@@ -1408,7 +1410,7 @@ def _chunk_bytes(m: Measurement, k: CollectiveConfig, welt: int) -> int:
 # ===========================================================================
 
 
-def _window_requirement(algorithmus: str, nbytes: int, welt: int) -> int:
+def _window_requirement(algorithm: str, nbytes: int, world: int) -> int:
     """Same calculation as ``barlink_bar1.window_requirement`` -- kept local here so
     the planner stays usable (and testable) without the BAR1 transport.
 
@@ -1423,240 +1425,240 @@ def _window_requirement(algorithmus: str, nbytes: int, welt: int) -> int:
       SUCCESSOR's progress -- but it only observes its predecessor.
     * Star: ``R-1`` full buffers on the hub.
 
-    CORRECTION: this used to say ``2*2*anteil`` for the ring, i.e. four
+    CORRECTION: this used to say ``2*2*share`` for the ring, i.e. four
     slots regardless of R. At ``R=3`` that is the same value
     (``2(R-1) = 4``) and so it never stood out; from ``R=4`` on it was too
     small. An undersized requirement lets an algorithm be selected that
     the mapping cannot actually carry -- and the bug then only shows up
     in the transport.
     """
-    if welt < 2:
+    if world < 2:
         return 0
-    anteil = -(-nbytes // welt)
-    if algorithmus in ("mesh", "ring", "hierarchisch"):
-        return 2 * (welt - 1) * anteil
-    if algorithmus == "star":
-        return 2 * (welt - 1) * nbytes
+    share = -(-nbytes // world)
+    if algorithm in ("mesh", "ring", "hierarchical"):
+        return 2 * (world - 1) * share
+    if algorithm == "star":
+        return 2 * (world - 1) * nbytes
     return 0
 
 
-def plan_collective(m: Measurement, k: BarlinkConfig, source: str = "gemessen",
-          fenster_bytes: Optional[int] = None) -> Plan:
+def plan_collective(m: Measurement, k: BarlinkConfig, source: str = "measured",
+          window_bytes: Optional[int] = None) -> Plan:
     """Purely computational, with no I/O at all -- so it's testable without hardware.
 
-    Exclusively a function of ``(m, k, fenster_bytes)``. Two ranks with
+    Exclusively a function of ``(m, k, window_bytes)``. Two ranks with
     the same inputs are guaranteed to get the same plan; that is exactly
     what ``BarlinkMatrixPlanner`` checks afterwards via the checksum.
 
-    ``fenster_bytes`` is how much BAR1 can be mapped simultaneously per
+    ``window_bytes`` is how much BAR1 can be mapped simultaneously per
     destination -- i.e. a **capability**, not a policy. If it is known,
     any algorithm whose window requirement exceeds it drops out. This is
     the second reason the ring can win: it needs two slots of ``N/R``,
     the mesh needs ``R-1``. ``None`` means "unknown" and rules nothing
     out -- not "unlimited".
     """
-    c = k.kollektiv
-    welt = m.welt
-    roles, dom, blaetter = _roles(m, c)
+    c = k.collective
+    world = m.world
+    roles, dom, leaves = _roles(m, c)
 
-    fest_dom = _domains_from_config(m, c)
-    if fest_dom is not None:
+    fixed_domains = _domains_from_config(m, c)
+    if fixed_domains is not None:
         # Manually set domains: the first entry is the reduction domain,
         # everything not named becomes a leaf.
-        genannt = {r for g in fest_dom for r in g}
-        dom = sorted(fest_dom[0])
-        blaetter = [r for r in range(welt) if r not in dom]
-        roles = ["domaene" if r in dom else "blatt" for r in range(welt)]
-        for r in range(welt):
-            if r not in genannt and c.roles.get(m.bdfs[r]) is None:
-                roles[r] = "blatt"
+        named = {r for g in fixed_domains for r in g}
+        dom = sorted(fixed_domains[0])
+        leaves = [r for r in range(world) if r not in dom]
+        roles = ["domain" if r in dom else "leaf" for r in range(world)]
+        for r in range(world):
+            if r not in named and c.roles.get(m.bdfs[r]) is None:
+                roles[r] = "leaf"
 
-    eltern, aufteilung = _parent_and_split(m, dom, blaetter, c)
-    folge = _ring_order(m, welt)
-    staffeln = _tier_plan(m, welt, c.staffel_verhaeltnis)
-    chunk = _chunk_bytes(m, c, welt)
-    schritt = m.step_s()
-    nabe = folge[0] if folge else 0
+    parents, split = _parent_and_split(m, dom, leaves, c)
+    order = _ring_order(m, world)
+    tiers = _tier_plan(m, world, c.tier_ratio)
+    chunk = _chunk_bytes(m, c, world)
+    step = m.step_s()
+    hub = order[0] if order else 0
 
-    stufen: list[Stage] = []
-    for gi, g in enumerate(m.groessen):
-        vorhersage: dict[str, float] = {}
-        vorhersage["mesh"] = _time_mesh(m, gi, g, range(welt), staffeln, schritt)
-        vorhersage["ring"] = _time_ring(m, gi, g, folge, schritt)
-        vorhersage["star"] = _time_star(m, gi, g, nabe, welt, schritt)
-        if blaetter and len(dom) >= 2:
+    stages: list[Stage] = []
+    for gi, g in enumerate(m.sizes):
+        prediction: dict[str, float] = {}
+        prediction["mesh"] = _time_mesh(m, gi, g, range(world), tiers, step)
+        prediction["ring"] = _time_ring(m, gi, g, order, step)
+        prediction["star"] = _time_star(m, gi, g, hub, world, step)
+        if leaves and len(dom) >= 2:
             # Within the domain, whatever wins there wins.
-            innen_netz = _time_mesh(m, gi, g, dom, staffeln, schritt)
-            innen_ring = _time_ring(
-                m, gi, g, [d for d in folge if d in dom] or dom, schritt
+            inner_mesh = _time_mesh(m, gi, g, dom, tiers, step)
+            inner_ring = _time_ring(
+                m, gi, g, [d for d in order if d in dom] or dom, step
             )
-            vorhersage["hierarchisch"] = _time_hierarchical(
-                m, gi, g, dom, blaetter, eltern, aufteilung,
-                min(innen_netz, innen_ring), schritt, welt,
+            prediction["hierarchical"] = _time_hierarchical(
+                m, gi, g, dom, leaves, parents, split,
+                min(inner_mesh, inner_ring), step, world,
             )
 
         # Capability limit: whatever doesn't fit the window isn't in the
         # running. Deliberately BEFORE policy -- a configuration must not
         # be able to force an algorithm the hardware cannot map.
-        zu_gross = {
-            a: _window_requirement(a, g, welt) for a in list(vorhersage)
-            if fenster_bytes is not None
-            and _window_requirement(a, g, welt) > fenster_bytes
+        too_large = {
+            a: _window_requirement(a, g, world) for a in list(prediction)
+            if window_bytes is not None
+            and _window_requirement(a, g, world) > window_bytes
         }
-        moeglich = {a: v for a, v in vorhersage.items() if a not in zu_gross}
+        feasible = {a: v for a, v in prediction.items() if a not in too_large}
 
-        if c.algorithmus != "auto":
-            gewaehlt = c.algorithmus
-            if gewaehlt in zu_gross:
+        if c.algorithm != "auto":
+            chosen = c.algorithm
+            if chosen in too_large:
                 raise ConfigError(
-                    f"kollektiv.algorithmus={gewaehlt} forced, but at "
-                    f"{_kib(g)} and {welt} ranks it needs "
-                    f"{zu_gross[gewaehlt] // 1024} KiB of window; mappable "
-                    f"is {fenster_bytes // 1024} KiB. No silent fallback -- "
+                    f"collective.algorithm={chosen} forced, but at "
+                    f"{_kib(g)} and {world} ranks it needs "
+                    f"{too_large[chosen] // 1024} KiB of window; mappable "
+                    f"is {window_bytes // 1024} KiB. No silent fallback -- "
                     f"either chunk smaller or choose a different algorithm."
                 )
-            grund = f"forced via kollektiv.algorithmus={c.algorithmus}"
+            reason = f"forced via collective.algorithm={c.algorithm}"
         else:
-            if not moeglich:
+            if not feasible:
                 raise ConfigError(
-                    f"At {_kib(g)} and {welt} ranks NO algorithm fits into "
-                    f"the mappable window of {fenster_bytes // 1024} KiB "
+                    f"At {_kib(g)} and {world} ranks NO algorithm fits into "
+                    f"the mappable window of {window_bytes // 1024} KiB "
                     f"(requirement: "
-                    f"{ {a: b // 1024 for a, b in zu_gross.items()} } KiB). "
+                    f"{ {a: b // 1024 for a, b in too_large.items()} } KiB). "
                     f"This is a startup error, not a quiet reroute: chunk "
                     f"smaller, or exclude the direct path for this size."
                 )
-            gewaehlt = min(moeglich, key=lambda a: (moeglich[a], a))
-            grund = _reason(m, gi, g, welt, gewaehlt, vorhersage, staffeln,
-                           c.saettigung_anteil, blaetter)
-            if zu_gross:
-                grund += (
+            chosen = min(feasible, key=lambda a: (feasible[a], a))
+            reason = _reason(m, gi, g, world, chosen, prediction, tiers,
+                             c.saturation_share, leaves)
+            if too_large:
+                reason += (
                     "  Excluded for being too large for the window: "
                     + ", ".join(
-                        f"{a} ({b // 1024} KiB > {fenster_bytes // 1024} KiB)"
-                        for a, b in sorted(zu_gross.items())
+                        f"{a} ({b // 1024} KiB > {window_bytes // 1024} KiB)"
+                        for a, b in sorted(too_large.items())
                     ) + "."
                 )
-        stufen.append(
+        stages.append(
             Stage(
-                von_bytes=g,
-                max_bytes=g if gi + 1 < len(m.groessen) else -1,
-                algorithmus=gewaehlt,
-                vorhersage_s={a: round(v, 9) for a, v in vorhersage.items()},
-                grund=grund,
+                min_bytes=g,
+                max_bytes=g if gi + 1 < len(m.sizes) else -1,
+                algorithm=chosen,
+                prediction_s={a: round(v, 9) for a, v in prediction.items()},
+                reason=reason,
             )
         )
 
-    stufen = _smooth_ladder(stufen)
+    stages = _smooth_ladder(stages)
 
-    zus = {
-        "planer": c.planer,
-        "algorithmus": c.algorithmus,
+    summary = {
+        "planner": c.planner,
+        "algorithm": c.algorithm,
         "chunk_kib": "auto" if c.chunk_kib is None else c.chunk_kib,
-        "blatt_schwelle": c.blatt_schwelle,
-        "aufteilung": c.aufteilung if isinstance(c.aufteilung, str) else "manual",
-        "staffel_verhaeltnis": c.staffel_verhaeltnis,
+        "leaf_threshold": c.leaf_threshold,
+        "split": c.split if isinstance(c.split, str) else "manual",
+        "tier_ratio": c.tier_ratio,
         "roles (manual)": dict(c.roles) or "-",
-        "domaenen (manual)": [list(g) for g in c.domaenen] or "-",
+        "domains (manual)": [list(g) for g in c.domains] or "-",
         "nic": k.nic,
-        "mess.groessen_kib": list(c.mess.groessen_kib),
-        "mess.budget_ms": c.mess.budget_ms,
+        "measure.sizes_kib": list(c.measure.sizes_kib),
+        "measure.budget_ms": c.measure.budget_ms,
     }
     return Plan(
-        welt=welt,
+        world=world,
         bdfs=m.bdfs,
         roles=tuple(roles),
-        domaene=tuple(dom),
-        blaetter=tuple(blaetter),
-        eltern={k2: v for k2, v in sorted(eltern.items())},
-        aufteilung={k2: v for k2, v in sorted(aufteilung.items())},
-        ringfolge=folge,
-        leiter=tuple(stufen),
+        domain=tuple(dom),
+        leaves=tuple(leaves),
+        parents={k2: v for k2, v in sorted(parents.items())},
+        split={k2: v for k2, v in sorted(split.items())},
+        ring_order=order,
+        ladder=tuple(stages),
         chunk_bytes=chunk,
-        staffeln=staffeln,
-        konfig_zusammenfassung=zus,
-        messung=m,
+        tiers=tiers,
+        config_summary=summary,
+        measurement=m,
         source=source,
     )
 
 
-def _reason(m: Measurement, gi: int, g: int, welt: int, gewaehlt: str,
-           vorhersage: Mapping[str, float],
-           staffeln: Mapping[int, tuple[tuple[int, ...], ...]],
-           saettigung_anteil: float, blaetter: Sequence[int]) -> str:
+def _reason(m: Measurement, gi: int, g: int, world: int, chosen: str,
+           prediction: Mapping[str, float],
+           tiers: Mapping[int, tuple[tuple[int, ...], ...]],
+           saturation_share: float, leaves: Sequence[int]) -> str:
     """One sentence saying why. Without it the choice isn't traceable."""
-    mesh, ring = vorhersage.get("mesh", 0.0), vorhersage.get("ring", 0.0)
-    anteil = g / welt
+    mesh, ring = prediction.get("mesh", 0.0), prediction.get("ring", 0.0)
+    share = g / world
     # Load the mesh would create on the most heavily addressed
     # destination: what the R-1 sources together want to deliver, against
     # that destination's measured cap.
-    last = 0.0
-    for ziel in range(welt):
-        cap = m.cap(ziel, gi)
-        quellen = [m.capacity(q, ziel, gi) for q in range(welt) if q != ziel]
-        if cap > 0 and quellen:
-            last = max(last, sum(quellen) / cap)
-    gesaettigt = last > 1.0 / max(saettigung_anteil, 1e-9)
-    gestaffelt = sum(1 for w in staffeln.values() if len(w) > 1)
+    load = 0.0
+    for dst in range(world):
+        cap = m.cap(dst, gi)
+        sources = [m.capacity(q, dst, gi) for q in range(world) if q != dst]
+        if cap > 0 and sources:
+            load = max(load, sum(sources) / cap)
+    saturated = load > 1.0 / max(saturation_share, 1e-9)
+    staggered = sum(1 for w in tiers.values() if len(w) > 1)
     t = []
-    if gewaehlt == "mesh":
-        if gesaettigt:
+    if chosen == "mesh":
+        if saturated:
             t.append(
-                f"Mesh despite saturation (demand/cap {last:.2f}): the step "
-                f"count outweighs it. 2 steps instead of {2 * (welt - 1)}, "
+                f"Mesh despite saturation (demand/cap {load:.2f}): the step "
+                f"count outweighs it. 2 steps instead of {2 * (world - 1)}, "
                 f"and one step costs {m.step_s() * 1e6:.1f} us here."
             )
         else:
             t.append(
-                f"Mesh: 2 steps instead of {2 * (welt - 1)}; demand/cap "
-                f"{last:.2f} is below saturation -- concurrency is nearly "
+                f"Mesh: 2 steps instead of {2 * (world - 1)}; demand/cap "
+                f"{load:.2f} is below saturation -- concurrency is nearly "
                 f"free there (measured ratio 0.99 at 20 KiB)."
             )
-        if gestaffelt:
-            t.append(f"{gestaffelt} destination(s) need to be staggered for this.")
-    elif gewaehlt == "ring":
+        if staggered:
+            t.append(f"{staggered} destination(s) need to be staggered for this.")
+    elif chosen == "ring":
         t.append(
-            f"Ring: demand/cap {last:.2f} (threshold "
-            f"{1.0 / saettigung_anteil:.2f}) -- at saturation, the mesh's "
+            f"Ring: demand/cap {load:.2f} (threshold "
+            f"{1.0 / saturation_share:.2f}) -- at saturation, the mesh's "
             f"concurrency buys nothing (measured 1.03x at 1 MiB) and the "
             f"cap is split evenly instead of proportionally, wasting the "
             f"fast edges. In the ring, every rank receives from exactly "
             f"one neighbor."
         )
-        if gestaffelt:
-            t.append(f"{gestaffelt} destination(s) would have needed staggering in the mesh.")
-    elif gewaehlt == "hierarchisch":
+        if staggered:
+            t.append(f"{staggered} destination(s) would have needed staggering in the mesh.")
+    elif chosen == "hierarchical":
         t.append(
-            f"Hierarchical: {len(blaetter)} leaf/leaves carry no transit "
+            f"Hierarchical: {len(leaves)} leaf/leaves carry no transit "
             f"traffic, sending only their own contribution and receiving "
             f"only the result; the domain reduces among itself."
         )
-    elif gewaehlt == "star":
+    elif chosen == "star":
         t.append("Star: chosen only because everything else predicts worse, "
                  "or because it was forced.")
     t.append(f"(mesh {mesh * 1e6:.1f} us / ring {ring * 1e6:.1f} us, "
-             f"share per edge {anteil / 1024:.0f} KiB)")
+             f"share per edge {share / 1024:.0f} KiB)")
     return " ".join(t)
 
 
-def _smooth_ladder(stufen: list[Stage]) -> list[Stage]:
+def _smooth_ladder(stages: list[Stage]) -> list[Stage]:
     """Merge consecutive stages that use the same algorithm.
 
     A ladder with three entries of the same algorithm isn't a ladder, it's
     a single line -- and it reads that way in the explanation too.
     """
-    aus: list[Stage] = []
-    for s in stufen:
-        if aus and aus[-1].algorithmus == s.algorithmus:
-            # von_bytes stays as-is: the stage then spans from the
+    out: list[Stage] = []
+    for s in stages:
+        if out and out[-1].algorithm == s.algorithm:
+            # min_bytes stays as-is: the stage then spans from the
             # smallest to the largest size it applies to.
-            aus[-1] = replace(aus[-1], max_bytes=s.max_bytes,
-                              vorhersage_s=s.vorhersage_s, grund=s.grund)
+            out[-1] = replace(out[-1], max_bytes=s.max_bytes,
+                              prediction_s=s.prediction_s, reason=s.reason)
         else:
-            aus.append(s)
-    if aus:
-        aus[-1] = replace(aus[-1], max_bytes=-1)
-    return aus
+            out.append(s)
+    if out:
+        out[-1] = replace(out[-1], max_bytes=-1)
+    return out
 
 
 # ===========================================================================
@@ -1665,11 +1667,11 @@ def _smooth_ladder(stufen: list[Stage]) -> list[Stage]:
 
 
 def _default_cache() -> str:
-    basis = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(basis, "sglang", "barlink_matrix.json")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "sglang", "barlink_matrix.json")
 
 
-def fingerprint(bdfs: Sequence[str], namen: Sequence[str],
+def fingerprint(bdfs: Sequence[str], names: Sequence[str],
                   k: BarlinkConfig) -> str:
     """Card list, PCI addresses, driver version, patch state, measurement parameters.
 
@@ -1677,20 +1679,20 @@ def fingerprint(bdfs: Sequence[str], namen: Sequence[str],
     is deliberately part of it: without the regkey the direct path
     doesn't carry, and a matrix measured with it becomes wrong afterwards.
     """
-    m = k.kollektiv.mess
-    teile = {
-        "version": PLANER_VERSION,
+    m = k.collective.measure
+    parts = {
+        "version": PLANNER_VERSION,
         "bdfs": list(bdfs),
-        "namen": list(namen),
-        "treiber": _driver_version(),
+        "names": list(names),
+        "driver": _driver_version(),
         "patch": _patch_state(),
-        "groessen_kib": list(m.groessen_kib),
-        "wiederholungen": m.wiederholungen,
+        "sizes_kib": list(m.sizes_kib),
+        "repeats": m.repeats,
         "fanin": m.fanin,
         "duplex": m.duplex,
     }
-    roh = json.dumps(teile, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(roh.encode()).hexdigest()[:24]
+    raw = json.dumps(parts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
 def _driver_version() -> str:
@@ -1704,51 +1706,51 @@ def _driver_version() -> str:
 def _patch_state() -> str:
     """Driver regkeys, as far as visible.
 
-    ``RegistryDwords`` is where ``RMSmallBarP2PPeerBar1`` and
+    ``RegistryDwords`` is where ``BarlinkPeerBar1`` and
     ``RMPcieP2PType`` get set. If nothing is there, the direct path isn't
     unlocked -- a matrix measured with it must not be reused for a run
     with the patch, and vice versa.
     """
     try:
         with open("/proc/driver/nvidia/params") as f:
-            zeilen = [
+            lines = [
                 z.strip() for z in f
                 if z.startswith(("RegistryDwords", "EnableResizableBar"))
             ]
-        return "|".join(zeilen)
+        return "|".join(lines)
     except OSError:
         return "unknown"
 
 
-def read_cache(pfad: str, fa: str) -> Optional[Measurement]:
+def read_cache(path: str, fp: str) -> Optional[Measurement]:
     try:
-        with open(pfad) as f:
+        with open(path) as f:
             d = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if d.get("fingerprint") != fa:
+    if d.get("fingerprint") != fp:
         return None
     try:
-        return Measurement.from_dict(d["messung"])
+        return Measurement.from_dict(d["measurement"])
     except (KeyError, TypeError, ValueError) as e:
         logger.warning("barlink-Matrix: cache %s unreadable (%s); measuring again.",
-                       pfad, e)
+                       path, e)
         return None
 
 
-def write_cache(pfad: str, fa: str, m: Measurement) -> None:
+def write_cache(path: str, fp: str, m: Measurement) -> None:
     try:
-        p = pathlib.Path(pfad)
+        p = pathlib.Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(p.suffix + f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(
-            {"fingerprint": fa, "messung": m.as_dict()},
+            {"fingerprint": fp, "measurement": m.as_dict()},
             sort_keys=True, indent=1,
         ))
         tmp.replace(p)
     except OSError as e:
         logger.warning("barlink-Matrix: cache %s not writable (%s).",
-                       pfad, e)
+                       path, e)
 
 
 # ===========================================================================
@@ -1761,8 +1763,8 @@ class BarlinkMatrixPlanner:
 
     Usage::
 
-        planer = BarlinkMatrixPlanner(cpu_group, device, config=load_config())
-        plan = planer.plan()            # measures on the first call
+        planner = BarlinkMatrixPlanner(cpu_group, device, config=load_config())
+        plan = planner.plan()            # measures on the first call
         logger.info("%s", plan.explanation())
 
     The plan is **frozen** afterwards. This is not a convenience, it's a
@@ -1774,20 +1776,20 @@ class BarlinkMatrixPlanner:
     """
 
     def __init__(self, cpu_group, device, config: Optional[BarlinkConfig] = None,
-                 fuehler: Optional[Sensor] = None,
-                 fenster_bytes: Optional[int] = None):
+                 sensor: Optional[Sensor] = None,
+                 window_bytes: Optional[int] = None):
         import torch.distributed as dist
 
         self.cpu_group = cpu_group
         self.device = device
         self.config = config if config is not None else load_config()
         self.rank = dist.get_rank(cpu_group)
-        self.welt = dist.get_world_size(cpu_group)
-        self._fuehler = fuehler
+        self.world = dist.get_world_size(cpu_group)
+        self._sensor = sensor
         # Capability, not policy: how much BAR1 can be mapped
         # simultaneously per destination. None = unknown (rules nothing
         # out).
-        self.fenster_bytes = fenster_bytes
+        self.window_bytes = window_bytes
         self._plan: Optional[Plan] = None
 
     # -- public -----------------------------------------------------------
@@ -1802,60 +1804,60 @@ class BarlinkMatrixPlanner:
     def _build(self) -> Plan:
         import torch.distributed as dist
 
-        c = self.config.kollektiv
-        bdfs, namen = self._cards()
-        fa = fingerprint(bdfs, namen, self.config)
+        c = self.config.collective
+        bdfs, names = self._cards()
+        fp = fingerprint(bdfs, names, self.config)
 
-        if c.planer == "aus":
-            m = self._synthetic_measurement(bdfs, namen)
-            p = plan_collective(m, self.config, source="fest",
-                      fenster_bytes=self.fenster_bytes)
+        if c.planner == "off":
+            m = self._synthetic_measurement(bdfs, names)
+            p = plan_collective(m, self.config, source="fixed",
+                      window_bytes=self.window_bytes)
             self._check_uniform(p)
             return p
 
-        pfad = c.mess.cache or _default_cache()
+        path = c.measure.cache or _default_cache()
         m = None
-        if not c.mess.cache_aus:
+        if not c.measure.cache_off:
             # Only rank 0 reads and distributes -- otherwise two ranks
             # could see differently stale files and plan differently.
-            traeger: list[Any] = [None]
+            carrier: list[Any] = [None]
             if self.rank == 0:
-                gefunden = read_cache(pfad, fa)
-                traeger = [gefunden.as_dict() if gefunden is not None else None]
+                found = read_cache(path, fp)
+                carrier = [found.as_dict() if found is not None else None]
             dist.broadcast_object_list(
-                traeger, src=dist.get_global_rank(self.cpu_group, 0),
+                carrier, src=dist.get_global_rank(self.cpu_group, 0),
                 group=self.cpu_group,
             )
-            if traeger[0] is not None:
-                m = Measurement.from_dict(traeger[0])
+            if carrier[0] is not None:
+                m = Measurement.from_dict(carrier[0])
                 logger.info(
                     "barlink-Matrix: startup measurement skipped, cache %s "
                     "matches (fingerprint %s). Force a re-measure with "
-                    "SGLANG_BARLINK_MATRIX_CACHE_OFF=1.", pfad, fa,
+                    "SGLANG_BARLINK_MATRIX_CACHE_OFF=1.", path, fp,
                 )
 
-        source = "zwischenspeicher"
+        source = "cached"
         if m is None:
-            if c.planer == "fest":
-                # 'fest' deliberately means: don't measure, use the stored
+            if c.planner == "fixed":
+                # 'fixed' deliberately means: don't measure, use the stored
                 # result. If it's missing, that's a named error -- quietly
                 # measuring anyway would be exactly the silent fallback
                 # this design forbids.
                 raise ConfigError(
-                    f"kollektiv.planer=fest, but there is no result under "
-                    f"{pfad!r} with fingerprint {fa} (card list, PCI "
+                    f"collective.planner=fixed, but there is no result under "
+                    f"{path!r} with fingerprint {fp} (card list, PCI "
                     f"addresses, driver version, patch state, measurement "
-                    f"parameters). Either measure once with planer=auto, or "
+                    f"parameters). Either measure once with planner=auto, or "
                     f"point the path via SGLANG_BARLINK_MATRIX_CACHE at a "
                     f"valid result."
                 )
-            source = "gemessen"
-            m = self._measure(bdfs, namen)
-            if not c.mess.cache_aus and self.rank == 0:
-                write_cache(pfad, fa, m)
+            source = "measured"
+            m = self._measure(bdfs, names)
+            if not c.measure.cache_off and self.rank == 0:
+                write_cache(path, fp, m)
 
         p = plan_collective(m, self.config, source=source,
-                  fenster_bytes=self.fenster_bytes)
+                  window_bytes=self.window_bytes)
         self._check_uniform(p)
         return p
 
@@ -1870,10 +1872,10 @@ class BarlinkMatrixPlanner:
             name = torch.cuda.get_device_name(self.device)
         except Exception:                       # pragma: no cover
             name = "unknown"
-        gesammelt: list[Any] = [None] * self.welt
-        dist.all_gather_object(gesammelt, (bdf, name), group=self.cpu_group)
-        bdfs = tuple(str(x[0]) for x in gesammelt)   # type: ignore[index]
-        namen = tuple(str(x[1]) for x in gesammelt)  # type: ignore[index]
+        gathered: list[Any] = [None] * self.world
+        dist.all_gather_object(gathered, (bdf, name), group=self.cpu_group)
+        bdfs = tuple(str(x[0]) for x in gathered)   # type: ignore[index]
+        names = tuple(str(x[1]) for x in gathered)  # type: ignore[index]
         if len(set(bdfs)) != len(bdfs):
             logger.warning(
                 "barlink-Matrix: duplicate PCI addresses %s. Roles and "
@@ -1881,104 +1883,104 @@ class BarlinkMatrixPlanner:
                 "duplicates a configuration cannot be applied "
                 "unambiguously.", bdfs,
             )
-        return bdfs, namen
+        return bdfs, names
 
     # -- measurement ------------------------------------------------------------
 
-    def _measure(self, bdfs, namen) -> Measurement:
+    def _measure(self, bdfs, names) -> Measurement:
         import torch.distributed as dist
 
-        c = self.config.kollektiv
-        mk = self._adjust_budget(c.mess)
-        groessen = tuple(g * 1024 for g in mk.groessen_kib)
-        f = self._fuehler if self._fuehler is not None else SelfLoadSensor(
-            self.device, max_bytes=max(groessen),
-            wiederholungen=mk.wiederholungen,
+        c = self.config.collective
+        mk = self._adjust_budget(c.measure)
+        sizes = tuple(g * 1024 for g in mk.sizes_kib)
+        f = self._sensor if self._sensor is not None else SelfLoadSensor(
+            self.device, max_bytes=max(sizes),
+            repeats=mk.repeats,
         )
         t_start = time.perf_counter()
         m = Measurement(
-            welt=self.welt, groessen=groessen, bdfs=bdfs, namen=namen,
-            fuehler=f.name(),
+            world=self.world, sizes=sizes, bdfs=bdfs, names=names,
+            sensor=f.name(),
         )
 
         # -- Phase 1: self-load, staggered. --------------------------------
         # Sequential, not simultaneous: otherwise R cards compete for the
         # same host memory and the numbers end up measuring each other.
-        eigen_aus: list[float] = []
-        eigen_ein: list[float] = []
-        eigen_dup: list[float] = []
-        for besitzer in range(self.welt):
+        own_out: list[float] = []
+        own_in: list[float] = []
+        own_duplex: list[float] = []
+        for owner in range(self.world):
             dist.barrier(group=self.cpu_group)
-            if besitzer == self.rank:
-                for g in groessen:
-                    eigen_aus.append(_quant(f.self_load(g, "aus")))
-                    eigen_ein.append(_quant(f.self_load(g, "ein")))
+            if owner == self.rank:
+                for g in sizes:
+                    own_out.append(_quant(f.self_load(g, "d2h")))
+                    own_in.append(_quant(f.self_load(g, "h2d")))
                 if mk.duplex:
-                    for g in groessen:
+                    for g in sizes:
                         d = f.self_load_duplex(g)
-                        eigen_dup.append(_quant(d) if d is not None else 0.0)
+                        own_duplex.append(_quant(d) if d is not None else 0.0)
             dist.barrier(group=self.cpu_group)
 
-        gesammelt: list[Any] = [None] * self.welt
+        gathered: list[Any] = [None] * self.world
         dist.all_gather_object(
-            gesammelt, (eigen_aus, eigen_ein, eigen_dup), group=self.cpu_group
+            gathered, (own_out, own_in, own_duplex), group=self.cpu_group
         )
-        for r, (a, e, d) in enumerate(gesammelt):    # type: ignore[misc]
-            m.aus[r] = list(a)
-            m.ein[r] = list(e)
+        for r, (a, e, d) in enumerate(gathered):    # type: ignore[misc]
+            m.outbound[r] = list(a)
+            m.inbound[r] = list(e)
             if d and any(x > 0 for x in d):
-                m.duplex_summe[r] = list(d)
-            m.latenz_s[r] = _latency_fit(groessen, list(a))
+                m.duplex_total[r] = list(d)
+            m.latency_s[r] = _latency_fit(sizes, list(a))
 
         # -- Phase 2: real edge measurement, if a pair sensor is present. ----
-        hat_paar = self._has_pair_sensor(f, groessen)
-        if hat_paar:
-            for von in range(self.welt):
-                for nach in range(self.welt):
-                    if von == nach:
+        has_pair = self._has_pair_sensor(f, sizes)
+        if has_pair:
+            for src in range(self.world):
+                for dst in range(self.world):
+                    if src == dst:
                         continue
                     dist.barrier(group=self.cpu_group)
-                    werte: list[float] = []
-                    if self.rank == von:
-                        for g in groessen:
-                            r = f.pair(nach, g)
-                            werte.append(_quant(r) if r is not None else 0.0)
-                    elif self.rank == nach:
-                        for g in groessen:
-                            f.pair_receive(von, g)
+                    values: list[float] = []
+                    if self.rank == src:
+                        for g in sizes:
+                            r = f.pair(dst, g)
+                            values.append(_quant(r) if r is not None else 0.0)
+                    elif self.rank == dst:
+                        for g in sizes:
+                            f.pair_receive(src, g)
                     dist.barrier(group=self.cpu_group)
-                    traeger: list[Any] = [werte if self.rank == von else None]
+                    carrier: list[Any] = [values if self.rank == src else None]
                     dist.broadcast_object_list(
-                        traeger, src=dist.get_global_rank(self.cpu_group, von),
+                        carrier, src=dist.get_global_rank(self.cpu_group, src),
                         group=self.cpu_group,
                     )
-                    if traeger[0]:
-                        m.kante[(von, nach)] = list(traeger[0])
+                    if carrier[0]:
+                        m.edge[(src, dst)] = list(carrier[0])
 
             # -- Phase 3: fan-in (R3). All sources into the destination at once. --
             if mk.fanin:
-                for ziel in range(self.welt):
+                for dst in range(self.world):
                     dist.barrier(group=self.cpu_group)
-                    werte = []
-                    if self.rank != ziel:
-                        for g in groessen:
-                            r = f.pair(ziel, g)
-                            werte.append(_quant(r) if r is not None else 0.0)
+                    values = []
+                    if self.rank != dst:
+                        for g in sizes:
+                            r = f.pair(dst, g)
+                            values.append(_quant(r) if r is not None else 0.0)
                     else:
-                        for g in groessen:
+                        for g in sizes:
                             f.pair_receive(-1, g)
                     dist.barrier(group=self.cpu_group)
-                    alle: list[Any] = [None] * self.welt
-                    dist.all_gather_object(alle, werte, group=self.cpu_group)
+                    rows: list[Any] = [None] * self.world
+                    dist.all_gather_object(rows, values, group=self.cpu_group)
                     cap = []
-                    for gi in range(len(groessen)):
-                        s = sum(v[gi] for r, v in enumerate(alle) if r != ziel and v)
+                    for gi in range(len(sizes)):
+                        s = sum(v[gi] for r, v in enumerate(rows) if r != dst and v)
                         cap.append(_quant(s))
-                    m.fanin_deckel[ziel] = cap
-                    for r, v in enumerate(alle):
-                        if r != ziel and v:
-                            m.fanin_anteile[(r, ziel)] = list(v)
-                m.hinweise.append(
+                    m.fanin_cap[dst] = cap
+                    for r, v in enumerate(rows):
+                        if r != dst and v:
+                            m.fanin_shares[(r, dst)] = list(v)
+                m.hints.append(
                     "Fan-in: the sources start together at a barrier, but "
                     "then run the size ladder independently afterwards. "
                     "With strongly mismatched cards, the sizes don't fully "
@@ -2001,50 +2003,50 @@ class BarlinkMatrixPlanner:
             # wall-clock times. Comparing wall clock against a single
             # transfer would be off by the repetition count.
             #
-            # Each round, rank i writes to rank (i+versatz) mod R. This is
+            # Each round, rank i writes to rank (i+offset) mod R. This is
             # a perfect pairing: everyone sends exactly once and receives
             # exactly once, so there is no fan-in contention -- what's
             # measured here is exclusively the shared bottleneck, not the
             # cap.
-            gemeinsam: dict[tuple[int, int], list[float]] = {}
-            for versatz in range(1, self.welt):
-                nach = (self.rank + versatz) % self.welt
+            concurrent_rates: dict[tuple[int, int], list[float]] = {}
+            for offset in range(1, self.world):
+                dst = (self.rank + offset) % self.world
                 dist.barrier(group=self.cpu_group)
-                meine: list[float] = []
-                for g in groessen:
-                    r = f.pair(nach, g)
-                    meine.append(_quant(r) if r is not None else 0.0)
-                gesammelt2: list[Any] = [None] * self.welt
-                dist.all_gather_object(gesammelt2, meine, group=self.cpu_group)
-                for von, werte2 in enumerate(gesammelt2):
-                    if werte2:
-                        gemeinsam[(von, (von + versatz) % self.welt)] = list(werte2)
+                mine: list[float] = []
+                for g in sizes:
+                    r = f.pair(dst, g)
+                    mine.append(_quant(r) if r is not None else 0.0)
+                gathered2: list[Any] = [None] * self.world
+                dist.all_gather_object(gathered2, mine, group=self.cpu_group)
+                for src, values2 in enumerate(gathered2):
+                    if values2:
+                        concurrent_rates[(src, (src + offset) % self.world)] = list(values2)
 
-            faktoren = []
-            for gi in range(len(groessen)):
+            factors = []
+            for gi in range(len(sizes)):
                 # Worst-case degradation across all edges: the mesh step
                 # is only as fast as its slowest edge.
-                schlimmster = 1.0
-                for (von, nach), raten in gemeinsam.items():
-                    allein = m.capacity(von, nach, gi)
-                    zus = raten[gi]
-                    if allein > 0 and zus > 0:
-                        schlimmster = max(schlimmster, allein / zus)
-                faktoren.append(_quant(schlimmster))
-            m.netz_faktor = [max(1.0, x) for x in faktoren]
-            m.netz_faktor_gemessen = True
+                worst = 1.0
+                for (src, dst), rates in concurrent_rates.items():
+                    alone = m.capacity(src, dst, gi)
+                    together = rates[gi]
+                    if alone > 0 and together > 0:
+                        worst = max(worst, alone / together)
+                factors.append(_quant(worst))
+            m.mesh_factor = [max(1.0, x) for x in factors]
+            m.mesh_factor_measured = True
         else:
-            m.hinweise.append(
+            m.hints.append(
                 "No pair sensor: edge capacities are estimated from "
                 "self-load (min(outbound, inbound)) and are therefore an "
                 "UPPER BOUND -- shared bottlenecks such as a switch uplink "
                 "or a second root complex are not visible in them. The "
                 "fan-in cap is the inbound rate, not a measured BAR1 cap."
             )
-            m.netz_faktor = [1.0] * len(groessen)
-            m.netz_faktor_gemessen = False
-            m.hinweise.append(
-                "SHARED BOTTLENECKS UNMEASURED (netz_faktor set to 1.0). "
+            m.mesh_factor = [1.0] * len(sizes)
+            m.mesh_factor_measured = False
+            m.hints.append(
+                "SHARED BOTTLENECKS UNMEASURED (mesh_factor set to 1.0). "
                 "Without a pair sensor there is no way to measure how much "
                 "an edge loses when ALL pairs talk at once instead of just "
                 "one. This is exactly what the expectation that the ring "
@@ -2056,29 +2058,29 @@ class BarlinkMatrixPlanner:
                 "a result. Overridable with SGLANG_BARLINK_MESH_FACTOR."
             )
 
-        ueber = os.environ.get(_ENV_PRAEFIX + "NETZ_FAKTOR")
-        if ueber:
-            werte = [float(x) for x in ueber.replace(";", ",").split(",")]
-            if len(werte) == 1:
-                werte = werte * len(groessen)
-            if len(werte) != len(groessen):
+        over = os.environ.get(_ENV_PREFIX + "MESH_FACTOR")
+        if over:
+            values = [float(x) for x in over.replace(";", ",").split(",")]
+            if len(values) == 1:
+                values = values * len(sizes)
+            if len(values) != len(sizes):
                 raise ConfigError(
-                    f"SGLANG_BARLINK_MESH_FACTOR={ueber!r}: expected one "
-                    f"value or {len(groessen)} values (per size "
-                    f"{[g // 1024 for g in groessen]} KiB)."
+                    f"SGLANG_BARLINK_MESH_FACTOR={over!r}: expected one "
+                    f"value or {len(sizes)} values (per size "
+                    f"{[g // 1024 for g in sizes]} KiB)."
                 )
-            m.netz_faktor = [max(1.0, x) for x in werte]
-            m.netz_faktor_gemessen = False
-            m.hinweise.append(
-                f"netz_faktor manually set to {m.netz_faktor} "
+            m.mesh_factor = [max(1.0, x) for x in values]
+            m.mesh_factor_measured = False
+            m.hints.append(
+                f"mesh_factor manually set to {m.mesh_factor} "
                 f"(SGLANG_BARLINK_MESH_FACTOR) -- not measured."
             )
 
-        m.dauer_s = time.perf_counter() - t_start
+        m.duration_s = time.perf_counter() - t_start
         self._plausible(m)
         return m
 
-    def _has_pair_sensor(self, f: Sensor, groessen) -> bool:
+    def _has_pair_sensor(self, f: Sensor, sizes) -> bool:
         """Decide group-wide, not per rank.
 
         A rank that believes it's measuring while the others are waiting
@@ -2088,16 +2090,16 @@ class BarlinkMatrixPlanner:
         import torch.distributed as dist
 
         try:
-            kann = f.pair(-1, groessen[0]) is not None
+            can = f.pair(-1, sizes[0]) is not None
         except NotImplementedError:
-            kann = False
+            can = False
         except Exception as e:
             logger.warning("barlink-Matrix: pair sensor reports an error (%s); "
                            "using the self-load estimate.", e)
-            kann = False
-        alle: list[Any] = [None] * self.welt
-        dist.all_gather_object(alle, bool(kann), group=self.cpu_group)
-        return all(bool(x) for x in alle)
+            can = False
+        rows: list[Any] = [None] * self.world
+        dist.all_gather_object(rows, bool(can), group=self.cpu_group)
+        return all(bool(x) for x in rows)
 
     def _adjust_budget(self, mk: MeasureConfig) -> MeasureConfig:
         """Rough pre-estimate against ``budget_ms``.
@@ -2108,39 +2110,39 @@ class BarlinkMatrixPlanner:
         the repetition count. Whatever was thinned out is logged; there
         is no such thing as quietly measuring on thinner evidence.
         """
-        paare = self.welt * (self.welt - 1)
+        pairs = self.world * (self.world - 1)
         # Round count per phase:
         #   1 self-load, staggered           -> R
         #   2 edges individually (pair sensor) -> R(R-1)
         #   3 fan-in, one destination per round -> R
         #   4 all pairs simultaneously        -> R-1
         # Without a pair sensor, 2 through 4 are skipped.
-        mit_paar = self._fuehler is not None
-        runden = self.welt + (paare + self.welt + self.welt - 1 if mit_paar else 0)
+        with_pair = self._sensor is not None
+        rounds = self.world + (pairs + self.world + self.world - 1 if with_pair else 0)
 
         def estimate(g_kib: Sequence[int], reps: int) -> float:
             # ~6 GB/s as a rough assumption for the pre-estimate; it only
             # decides how much gets measured, never what comes out of it.
-            uebertragung = sum((g * 1024) * reps / 6e9 * 1000 for g in g_kib)
+            transfer = sum((g * 1024) * reps / 6e9 * 1000 for g in g_kib)
             # 2 barriers per round, gloo roughly 0.3 ms.
-            return runden * (uebertragung + 0.6 * len(g_kib))
+            return rounds * (transfer + 0.6 * len(g_kib))
 
-        g = list(mk.groessen_kib)
-        reps = mk.wiederholungen
-        gekuerzt = []
+        g = list(mk.sizes_kib)
+        reps = mk.repeats
+        dropped = []
         while estimate(g, reps) > mk.budget_ms and len(g) > 2:
-            weg = g.pop(len(g) // 2)
-            gekuerzt.append(f"{weg} KiB")
+            removed = g.pop(len(g) // 2)
+            dropped.append(f"{removed} KiB")
         while estimate(g, reps) > mk.budget_ms and reps > 4:
             reps //= 2
-        if gekuerzt or reps != mk.wiederholungen:
+        if dropped or reps != mk.repeats:
             logger.info(
                 "barlink-Matrix: measurement budget %.0f ms -- sizes %s "
                 "removed, repetitions %d -> %d. Measure fully with "
                 "SGLANG_BARLINK_MEASURE_BUDGET_MS=<more>.",
-                mk.budget_ms, gekuerzt or "none", mk.wiederholungen, reps,
+                mk.budget_ms, dropped or "none", mk.repeats, reps,
             )
-        return replace(mk, groessen_kib=tuple(g), wiederholungen=reps)
+        return replace(mk, sizes_kib=tuple(g), repeats=reps)
 
     def _plausible(self, m: Measurement) -> None:
         """Reports deviations from this rig's reference values.
@@ -2151,52 +2153,53 @@ class BarlinkMatrixPlanner:
         hardware in this project; a silent measurement would be the
         fifteenth.
         """
-        gi = len(m.groessen) - 1
-        for r in range(m.welt):
-            if m.aus[r][gi] <= 0.05 or m.ein[r][gi] <= 0.05:
-                m.hinweise.append(
+        gi = len(m.sizes) - 1
+        for r in range(m.world):
+            if m.outbound[r][gi] <= 0.05 or m.inbound[r][gi] <= 0.05:
+                m.hints.append(
                     f"Rank {r} ({m.bdfs[r]}): measured rate near zero "
-                    f"(aus={m.aus[r][gi]:.2f}, ein={m.ein[r][gi]:.2f}) -- "
+                    f"(outbound={m.outbound[r][gi]:.2f}, "
+                    f"inbound={m.inbound[r][gi]:.2f}) -- "
                     f"this is a measurement error, not a property of the "
                     f"card."
                 )
-            if m.duplex_summe:
+            if m.duplex_total:
                 f = m.duplex_factor(r, gi)
                 if f > 1.9:
-                    m.hinweise.append(
+                    m.hints.append(
                         f"Rank {r}: duplex factor {f:.2f} at the largest "
                         f"size. Measured on this rig was "
-                        f"{_BELEG_DUPLEX_SUMME_1MIB:.2f}; a value close to "
+                        f"{_REFERENCE_DUPLEX_TOTAL_1MIB:.2f}; a value close to "
                         f"2 suggests the streams weren't really running "
                         f"simultaneously."
                     )
-        if m.fanin_deckel:
-            for j, d in m.fanin_deckel.items():
-                if d[gi] > 2.0 * m.ein[j][gi] and m.ein[j][gi] > 0:
-                    m.hinweise.append(
+        if m.fanin_cap:
+            for j, d in m.fanin_cap.items():
+                if d[gi] > 2.0 * m.inbound[j][gi] and m.inbound[j][gi] > 0:
+                    m.hints.append(
                         f"Destination {j}: measured fan-in cap "
                         f"{d[gi]:.2f} GB/s lies far above the inbound rate "
-                        f"{m.ein[j][gi]:.2f} GB/s -- check whether the "
+                        f"{m.inbound[j][gi]:.2f} GB/s -- check whether the "
                         f"sources really ran simultaneously."
                     )
 
-    def _synthetic_measurement(self, bdfs, namen) -> Measurement:
-        """``planer: aus`` -- measure nothing, take everything from the configuration.
+    def _synthetic_measurement(self, bdfs, names) -> Measurement:
+        """``planner: off`` -- measure nothing, take everything from the configuration.
 
         Evenly-distributed placeholder rates, so that roles come
-        exclusively from ``roles``/``domaenen``. The plan reports
-        ``source=fest``, so the explanation doesn't give the impression
+        exclusively from ``roles``/``domains``. The plan reports
+        ``source=fixed``, so the explanation doesn't give the impression
         that anything was actually measured here.
         """
-        groessen = tuple(g * 1024 for g in self.config.kollektiv.mess.groessen_kib)
-        m = Measurement(welt=self.welt, groessen=groessen, bdfs=bdfs, namen=namen,
-                    fuehler="none (planer=aus)")
-        for r in range(self.welt):
-            m.aus[r] = [1.0] * len(groessen)
-            m.ein[r] = [1.0] * len(groessen)
-            m.latenz_s[r] = 0.0
-        m.hinweise.append(
-            "planer=aus: nothing measured. Roles, domains, and algorithm "
+        sizes = tuple(g * 1024 for g in self.config.collective.measure.sizes_kib)
+        m = Measurement(world=self.world, sizes=sizes, bdfs=bdfs, names=names,
+                    sensor="none (planner=off)")
+        for r in range(self.world):
+            m.outbound[r] = [1.0] * len(sizes)
+            m.inbound[r] = [1.0] * len(sizes)
+            m.latency_s[r] = 0.0
+        m.hints.append(
+            "planner=off: nothing measured. Roles, domains, and algorithm "
             "come exclusively from the configuration."
         )
         return m
@@ -2205,24 +2208,24 @@ class BarlinkMatrixPlanner:
         """The plan MUST be the same on every rank."""
         import torch.distributed as dist
 
-        summen: list[Any] = [None] * self.welt
-        dist.all_gather_object(summen, p.checksum(), group=self.cpu_group)
-        if len(set(summen)) != 1:
-            abweichler = {r: s for r, s in enumerate(summen) if s != summen[0]}
+        sums: list[Any] = [None] * self.world
+        dist.all_gather_object(sums, p.checksum(), group=self.cpu_group)
+        if len(set(sums)) != 1:
+            divergent = {r: s for r, s in enumerate(sums) if s != sums[0]}
             raise RuntimeError(
                 f"barlink-Matrix: ranks ended up with DIFFERENT plans "
-                f"({summen}). Divergent ranks: {abweichler}. This is a "
+                f"({sums}). Divergent ranks: {divergent}. This is a "
                 f"startup error, not a warning -- the collectives assume "
                 f"that every rank runs the same decomposition. Most common "
                 f"causes: an SGLANG_BARLINK_* variable or a config file "
-                f"isn't the same on every rank, or fenster_bytes was "
+                f"isn't the same on every rank, or window_bytes was "
                 f"passed in differently per rank (it must be the minimum "
                 f"across all destinations -- what matters is what can be "
                 f"mapped EVERYWHERE)."
             )
 
 
-def _latency_fit(groessen: Sequence[int], raten: Sequence[float]) -> float:
+def _latency_fit(sizes: Sequence[int], rates: Sequence[float]) -> float:
     """t(N) = latency + N/rate, fitted across the size ladder.
 
     The measured rates per size yield times; the line fitted through them
@@ -2235,23 +2238,23 @@ def _latency_fit(groessen: Sequence[int], raten: Sequence[float]) -> float:
     that of the collective's acknowledgment loop. This is a LOWER BOUND.
     Anyone who knows better sets ``SGLANG_BARLINK_STEP_US``.
     """
-    ueber = os.environ.get(_ENV_PRAEFIX + "SCHRITT_US")
-    if ueber:
-        return float(ueber) / 1e6
-    punkte = [
-        (float(n), n / (r * 1e9)) for n, r in zip(groessen, raten) if r > 0
+    over = os.environ.get(_ENV_PREFIX + "STEP_US")
+    if over:
+        return float(over) / 1e6
+    points = [
+        (float(n), n / (r * 1e9)) for n, r in zip(sizes, rates) if r > 0
     ]
-    if len(punkte) < 2:
+    if len(points) < 2:
         return 0.0
-    n_mittel = sum(x for x, _ in punkte) / len(punkte)
-    t_mittel = sum(y for _, y in punkte) / len(punkte)
-    zaehler = sum((x - n_mittel) * (y - t_mittel) for x, y in punkte)
-    nenner = sum((x - n_mittel) ** 2 for x, _ in punkte)
-    if nenner <= 0:
+    n_mean = sum(x for x, _ in points) / len(points)
+    t_mean = sum(y for _, y in points) / len(points)
+    numerator = sum((x - n_mean) * (y - t_mean) for x, y in points)
+    denominator = sum((x - n_mean) ** 2 for x, _ in points)
+    if denominator <= 0:
         return 0.0
-    steigung = zaehler / nenner
-    achsenabschnitt = t_mittel - steigung * n_mittel
-    return max(0.0, achsenabschnitt)
+    slope = numerator / denominator
+    intercept = t_mean - slope * n_mean
+    return max(0.0, intercept)
 
 
 # ===========================================================================
@@ -2283,7 +2286,7 @@ def bdf_of_card(device) -> str:
         dom = getattr(props, "pci_domain_id", None)
         bus = getattr(props, "pci_bus_id", None)
         slot = getattr(props, "pci_device_id", None)
-        if isinstance(bus, str) and _IST_BDF.match(bus.strip()):
+        if isinstance(bus, str) and _IS_BDF.match(bus.strip()):
             return _norm_bdf(bus)
         if None not in (dom, bus, slot):
             return _norm_bdf(f"{int(dom):04x}:{int(bus):02x}:{int(slot):02x}.0")
@@ -2297,10 +2300,10 @@ def bdf_of_card(device) -> str:
         )
         fn = (lib.hipDeviceGetPCIBusId if torch.version.hip is not None
               else lib.cudaDeviceGetPCIBusId)
-        puffer = ctypes.create_string_buffer(32)
+        buffer = ctypes.create_string_buffer(32)
         fn.restype = ctypes.c_int
-        if fn(puffer, ctypes.c_int(32), ctypes.c_int(int(ordinal))) == 0:
-            return _norm_bdf(puffer.value.decode())
+        if fn(buffer, ctypes.c_int(32), ctypes.c_int(int(ordinal))) == 0:
+            return _norm_bdf(buffer.value.decode())
     except Exception as e:                      # pragma: no cover
         logger.warning("barlink-Matrix: could not determine PCI address (%s).", e)
     return f"unknown-{ordinal}"
@@ -2316,11 +2319,11 @@ def link_width(bdf: str) -> Optional[tuple[int, str]]:
     question has repeatedly been the deciding factor in this project.
     """
     try:
-        basis = f"/sys/bus/pci/devices/{bdf}"
-        with open(f"{basis}/current_link_width") as f:
-            breite = int(f.read().strip())
-        with open(f"{basis}/current_link_speed") as f:
-            tempo = f.read().strip()
-        return breite, tempo
+        base = f"/sys/bus/pci/devices/{bdf}"
+        with open(f"{base}/current_link_width") as f:
+            width = int(f.read().strip())
+        with open(f"{base}/current_link_speed") as f:
+            speed = f.read().strip()
+        return width, speed
     except (OSError, ValueError):
         return None
