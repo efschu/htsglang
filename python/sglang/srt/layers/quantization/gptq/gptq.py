@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -13,7 +14,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.marlin_utils import check_marlin_supported
+from sglang.srt.layers.quantization.marlin_utils import (
+    GPTQ_MARLIN_MIN_THREAD_K,
+    check_marlin_supported,
+)
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
@@ -38,6 +42,60 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _, scalar_types = get_scalar_types()
+
+
+def gptq_uneven_tp_block(
+    group_size: int, dynamic: Optional[Dict[str, Dict[str, Any]]] = None
+) -> List[int]:
+    """Uneven-TP shard block for a GPTQ config (`--rank-tp-ratio`).
+
+    GPTQ groups `group_size` input channels under one scale and (on this
+    hardware) executes through the Marlin wNa16 GEMM, so a per-rank shard
+    boundary is only valid where BOTH constraints hold: a whole group ends,
+    and the shard is a multiple of Marlin's thread tile. Coarsening to
+    ``lcm(group_size, GPTQ_MARLIN_MIN_THREAD_K)`` satisfies both at once --
+    min_thread_k=128 dominates min_thread_n=64, so the same value keeps the
+    column-parallel OUTPUT dim tile-valid too.
+
+    Exposing it as ``weight_block_size`` is what makes the existing uneven-TP
+    machinery (`_quant_block_aligned_units` / `tp_partition_size`) fire. A
+    GPTQ config that stays silent gets an element-granular split: for
+    Qwen3.6-27B (intermediate 17408, group 128) the 16-element activation
+    units survive into the plan and hand the ranks K = [7904, 4752, 4752].
+    None of those is a multiple of 128, so ``GPTQMarlinLinearScheme`` sizes
+    down_proj's ``scales`` at ``K // group_size`` rows (61 / 37 / 37) while
+    the checkpoint dimension has 17408 // 128 = 136 -- the row-parallel
+    loader then tries to partition 136 in the weight's 1088 units and raises
+    "Dimension of size 136 is not a multiple of its unit count 1088".
+
+    Both dims carry the same value so a column-parallel OUTPUT split
+    (gate_up) lands on the same boundary as its coupled row-parallel INPUT
+    split (down) -- they partition the same intermediate dimension and must
+    coarsen identically. Mirrors ``awq_uneven_tp_block`` (#289),
+    ``AutoRoundConfig`` (#86) and ``CompressedTensorsConfig._group_size_block``
+    (#37).
+
+    ``dynamic`` is GPTQModel's per-module override map; a positive rule may
+    raise a layer's ``group_size`` above the base one. The block folds those
+    in so the plan is valid for every layer -- the partition is computed from
+    the BASE config (``linear._quant_block_aligned_units`` never sees the
+    per-layer clone ``get_linear_quant_method`` builds), so a base-only block
+    would be too fine for such a layer. Configs without a ``group_size``
+    override (the common case, including every checkpoint in the fork's test
+    set) are unaffected.
+
+    Inert without an installed ratio plan: the even-TP path never consults
+    the unit family.
+    """
+    groups = [int(group_size)] if group_size and int(group_size) > 0 else []
+    for pattern, overrides in (dynamic or {}).items():
+        if pattern.startswith("-:") or not isinstance(overrides, dict):
+            continue
+        override = overrides.get("group_size")
+        if isinstance(override, int) and override > 0:
+            groups.append(override)
+    block = math.lcm(*groups, GPTQ_MARLIN_MIN_THREAD_K)
+    return [block, block]
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -96,6 +154,8 @@ class GPTQConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.pack_factor = Fraction(32, self.weight_bits)
+        # Uneven-TP group + Marlin-tile alignment; see gptq_uneven_tp_block.
+        self.weight_block_size = gptq_uneven_tp_block(group_size, dynamic)
         # GPTQ v1 and v2 format deals with zero points differently.
         # Currently GPTQModel stores v1 format checkpoints by default,
         # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
@@ -319,10 +379,12 @@ class GPTQMarlinConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.full_config = full_config
+        # Uneven-TP group + Marlin-tile alignment; see gptq_uneven_tp_block.
+        self.weight_block_size = gptq_uneven_tp_block(group_size, dynamic)
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
-                "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
+                f"Unsupported quantization config: bits={weight_bits}, sym={is_sym}"
             )
 
         # (num_bits, is_sym) -> quant_type
@@ -497,7 +559,6 @@ class GPTQLinearMethod(LinearMethodBase):
 
 
 class GPTQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
         self.quant_config = quant_config
