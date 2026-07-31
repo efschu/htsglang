@@ -15800,3 +15800,229 @@ boot2_r4cell}/` (`report.json`, `report.txt`, `contract_lines.txt`,
   Stream bei duty 1,0 ist GIL-verdaechtig, gemessen ist es nicht. Ein
   py-spy-Fenster auf den Lane-Thread waehrend eines geteilten Fensters wuerde
   es benennen — und erst dann ist entscheidbar, ob daran etwas zu holen ist.
+
+## #274 Familien-Slice Runde 2: MoE-Lane, zweikartige Lane, FP8-Konstellation (Kartenfenster 2026-07-31, 07:21-07:42 UTC)
+
+Zweig `feat/dual-group-families-2`, Basis b20688181d. Der Auftrag nannte drei
+offene Familien-Arme aus DESIGN_121 §11.12. Der Stand der Basis ist aber
+schon §11.18-11.20: der aeltere Zweig `feat/dual-group-families` ist
+vollstaendig eingemergt (`git merge-base --is-ancestor` gruen), die dense
+Spalte und die Blockachse sind erledigt, die Expertenschale ist GEBAUT. Offen
+waren genau die drei Zeilen, die dort als NICHT erreicht stehen — und die
+sind hier bearbeitet.
+
+### Der Befund vor dem ersten Edit: bei TP=2 gab es gar keine Lane
+
+`derive_nested_plan` macht aus einem Verband zwei Segmente. Bei `tp_size = 2`
+sind beide Singletons, also beide nach der bisherigen Lesart „shared", und
+`build_lane_model` hat das hart abgelehnt („shared segment 1 covers serving
+rank 1 but this process is serving rank 0"). Die Ablehnung war richtig, die
+Lesart falsch: byte-teilbar ist ein Singleton nur fuer den Prozess, dem der
+Shard gehoert. Der Plan trennt jetzt `host_fast_rank` (der eine aliasierte
+Rang) von `materialized_fast_ranks` (alle anderen, egal ob Komplement oder
+fremder Singleton). Fuer die Slice-B-Form aendert das nichts; neu ist, dass
+TP=2 ueberhaupt eine Lane bekommt.
+
+Das war kein Nebenprodukt, sondern Voraussetzung fuer beide neuen Arme: das
+MoE-Vehikel hat 2 kv-Koepfe (bei TP=3 ist Nesting nach §3.2 UNDEFINIERT — die
+Wand, an der der gemma-Kandidat in §11.20 stand), und die zweikartige
+Konstellation will ohnehin genau zwei Verbandsraenge. Bei TP=2 ist die
+FAST-Ratio ausserdem gleich der BIG-Ratio, also nestet jede Probe per
+Konstruktion.
+
+### Arm EXPERTEN: die erste MoE-Lane auf einer Karte — GRUEN
+
+Vehikel Qwen3.6-35B-A3B-AWQ-4bit (23,29 GiB, moe_wna16/AWQ, 256 Experten,
+`moe_intermediate` 512, 2 kv-Koepfe), TP=2 auf 5090 (Rang 0) + 3080,
+`--rank-tp-ratio 3,1`, Lane einkartig auf der 5090.
+
+Kontraktzeile aus dem Boot:
+
+    dual-group lane target model assembled (hull on meta, parts on cuda:0,0):
+    shells column=165 row=135 embed=2 lm_head=1 moe=40 composed=30;
+    params aliased=323 composed_vec=60 buffers=101 captured=90;
+    shared-byte gate PASSED (1056 data_ptr identities).
+
+**40 Expertenschalen, 1056 data_ptr-Identitaeten.** Das ist der Beleg, den
+§11.20 als ausstehend gebucht hat: die fuenfte Schalenklasse steht an echten
+`w13_weight`/`w2_weight`-Tensoren und deren Skalen, und das Byte-Tor greift
+ueber sie, weil sie registrierte Parameter sind.
+
+VRAM-Posten (Lane-Karte): geteilter Shard 0 MiB (1056 Identitaeten),
+Lane-Teil 6586 MiB, Huellen-Rest 0 MiB — die Lane kostet auf ihrer Karte
+genau den Shard, den die andere Karte haelt, und sonst nichts.
+
+| Tor | Ergebnis |
+|---|---|
+| Boden Verband (A-vs-A, greedy, 12 Token) | gruen auf `squares` und `code`, `alphabet` nicht reproduzierbar |
+| Boden Lane (A-vs-A) | gruen auf allen drei |
+| Kohaerenz Lane vs. Verband | **byte-identisch** auf beiden geurteilten Prompts |
+
+`alphabet` ist VOID, nicht rot: der Verband reproduziert sich dort selbst
+nicht, also traegt der Prompt in keine Richtung ein Urteil. Lane-Zahlen
+informativ (Regel 4, kein Share-Anspruch): Prefill 450-1152 ms/1k, Decode
+5,33-5,34 ms/Schritt, Graphen aufgezeichnet.
+
+### Arm ZWEIKARTEN: die Lane ueber zwei Karten, ohne Kommunikator
+
+§11.10/§11.11 hatten den zweikartigen Lauf als „braucht ECHTE
+Lane-Kollektive" gebucht. Er braucht keine. Die Lane hat ihre Kollektive
+bereits durch lokale Tensoroperationen ersetzt (§4); liegt ein Summand auf
+einer anderen Karte, wird daraus eine Kopie des AKTIVIERUNGSVEKTORS, nicht
+ein Kollektiv. Neu ist `--dual-group-lane-part-gpu-id` (eine physische GPU-Id
+je LANE-Rang), die fremde Karte kommt vor dem Prozessstart in
+CUDA_VISIBLE_DEVICES, und die Schalen schicken pro Schale einen Tensor
+hinueber und das Ergebnis zurueck.
+
+Vehikel Llama-3.1-8B-Instruct, TP=2 auf 5090 + 3080, Lane-Rang 1 auf der
+3080. Kontraktzeilen:
+
+    dual-group lane spans cards: rank 0 also sees physical GPU(s) [1]
+    dual-group lane spans cards (--dual-group-lane-part-gpu-id [0, 1]):
+      forcing EAGER
+    dual-group lane: part rank 1 (of ratio [3, 1]) loaded on cuda:1 in 1.7 s
+    dual-group lane target model assembled (hull on meta, parts on cuda:0,1):
+      shells column=64 row=64 embed=1 lm_head=1 moe=0 composed=0;
+      params aliased=65 ...; shared-byte gate PASSED (195 data_ptr identities).
+
+195 Identitaeten — exakt die dense-Zielzahl aus §11.18. Der Postenblock ist
+die eigentliche Aussage des Arms:
+
+| Posten | MiB | Status |
+|---|---|---|
+| geteilter Verbands-Shard (Lane-Rang 0) | 0 | shared, 195 Identitaeten |
+| Lane-Teile auf DIESER Karte | 0 | nested |
+| Huellen-Rest | 0 | duplicated |
+| Lane-Teil auf fremder Karte cuda:1 | 4382 | duplicated |
+
+**Auf der Lane-Karte kostet die Lane null Byte Gewicht.** Das ist genau das,
+was die einkartige Lane nicht kann und wofuer der Arm existiert. Der Preis
+steht daneben und wird nicht weggerechnet: auf der fremden Karte liegt der
+Shard VOLL, weil der residente dort einem anderen Prozess gehoert.
+
+Lane-Zahlen informativ, eager ueber PCIe (dieses Rig hat kein GPUDirect-P2P,
+alles PHB): Prefill 679-878 ms/1k, Decode ~30 ms/Schritt. Das ist die
+Kapazitaets-gegen-Tempo-Seite des Tauschs und keine Share-Zusage.
+
+| Tor | Ergebnis |
+|---|---|
+| Boot + Assembly + Byte-Tor | **gruen** (195 Identitaeten, Teile auf cuda:0,1) |
+| Boden Lane (A-vs-A, 12 Token) | **gruen auf allen drei Prompts** |
+| Boden Verband (A-vs-A) | ROT auf allen drei |
+| Kohaerenz Lane vs. Verband | **VOID** |
+
+Die Kohaerenz dieses Arms ist also NICHT belegt, und zwar nicht, weil die
+Lane abweicht, sondern weil der Verband sich auf diesem Vehikel selbst nicht
+reproduziert. Nach der Regel des Tors (und nach #284) ist das ein drittes
+Ergebnis und kein Bestehen: das Instrument sagt, dass es nichts sehen kann.
+Der Kontrast ist scharf und gehoert dazu — auf demselben Boot ist die LANE
+auf allen drei Prompts reproduzierbar, der Verband auf keinem. Der Verdacht
+ist der Prefix-Cache (die zweite identische Anfrage nimmt einen anderen
+Kernel-Weg), gemessen ist er nicht. Naechster Schritt fuer diesen Arm ist
+eine Boden-Messung mit `--disable-radix-cache`, ein Boot, kein Umbau.
+
+### Arm FP8: die Rechnung war noch zu freundlich
+
+§11.19 hat die einkartige FP8-Lane mit „28,75 gegen 31,34 GiB" fuer
+arithmetisch tot erklaert. Sie war weiter daneben als das. Die
+Slice-A-Regel `hull_needs_real_storage` fragte nach der FAMILIE — Linear
+Attention ja/nein — mit der Begruendung, quantisierte Gewichte seien lazy
+allokiert. Das gilt fuer GGUF (`GGUFUninitializedParameter`) und fuer sonst
+nichts: `fp8.py create_weights` legt mit `torch.empty` an. Ein FP8-GDN-Boot
+haette also das GANZE Modell ein zweites Mal auf der Lane-Karte angelegt, nur
+um es Sekunden spaeter wegzuwerfen.
+
+Die Regel fragt jetzt nach Familie UND Lazy-Heit. Wer auf meta baut, bekommt
+die zwei per WERT zusammengesetzten Tensorklassen einzeln real
+(GDN-Conv-Kern, `dt_bias`/`A_log`) — Kilobytes statt Modellgroesse — und die
+von `RadixLinearAttention` bei der Konstruktion GEFANGENEN Referenzen werden
+danach neu gesetzt. Ohne diesen zweiten Schritt zeigte das MoE-Vehikel genau
+das erwartete Bild: `ValueError: All inputs must be on the same device` aus
+dem GDN-Decode-Kernel.
+
+Damit ist die zweikartige FP8-Lane BOOTBAR, und das ist der Beleg, den §11.19
+offen gelassen hat. Qwen3.6-27B-FP8 (28,77 GiB), TP=2 auf 5090 + 3080,
+`--rank-tp-ratio 5,1`, Lane-Rang 1 auf der 3080:
+
+    dual-group lane target model assembled (hull on meta, parts on cuda:0,1):
+      shells column=231 row=183 embed=2 lm_head=1 moe=0 composed=48;
+      params aliased=321 composed_vec=96 buffers=161 captured=144;
+      shared-byte gate PASSED (1104 data_ptr identities).
+
+    lane part shard on foreign card cuda:1   7036 MiB  duplicated
+    -> added by the lane                     7036 MiB
+
+Null Byte Gewicht auf der Lane-Karte, 7036 MiB auf der fremden. Die Huelle
+liegt auf meta — bei der alten Regel waeren hier 28,77 GiB zusaetzlich
+angefordert worden, und der Boot haette die Karte nie ueberlebt.
+
+**Der Arm ist trotzdem NICHT gruen.** Die erste echte Verbandsanfrage nach
+dem Lane-Bau stirbt in `event_loop_overlap` mit `CUDA error: an illegal
+memory access was encountered` (TP0; TP1 sieht nur den abgerissenen
+gloo-Peer). Belegt ist damit genau so viel: Plan, Platzierung, Laden,
+Assembly und das Byte-Tor tragen fuer die zweikartige FP8-Konstellation; ab
+dem ersten Forward ist ein Defekt offen, der noch keinen Namen hat. Zwei
+Kandidaten, beide ungemessen: (a) die Lane-Allokation auf cuda:1 aus dem
+Prozess von Rang 0 neben dem Prozess von Rang 1 auf derselben Karte,
+(b) 27000 MiB Verbandsbudget auf einer 32607-MiB-Karte plus Lane, also
+schlicht zu wenig Luft. (b) ist mit einem Boot pruefbar (Ratio 6:1, Budget
+runter) und deshalb der erste Schritt, nicht (a).
+
+### Was das Fenster gekostet hat, und was es gelehrt hat
+
+Drei Defekte, alle im Fenster gefunden, alle gefixt:
+
+1. **Meta-Huelle × Linear Attention** (oben): gefangene Referenzen zeigen nach
+   der Materialisierung ins Leere. Laut, nicht still — das ist die gute
+   Version.
+2. **Eager wurde zu spaet entschieden.** Die kartenuebergreifende Lane
+   erzwingt eager, aber die Erzwingung stand NACH `_lane_server_args_view`,
+   und die View loest die Disable-Flags bereits in die Phasenkonfiguration
+   auf. Der Lane-PREFILL-Graph hat deshalb weiter aufgezeichnet und ist beim
+   ersten Karten-Hop in `cudaErrorStreamCaptureIsolation` gestorben. Der Fix
+   ist die Reihenfolge, und die Lehre ist die bekannte: eine „View" die
+   AUFLOEST, ist ein Zeitpunkt, kein Sichtfenster.
+3. **Das Messinstrument selbst.** Das erste Kohaerenz-Tor las die Verbands-Ids
+   aus `meta_info`; `/generate` liefert sie eine Ebene hoeher. Ergebnis: JEDER
+   Verbands-Boden „nicht reproduzierbar", also jeder Prompt VOID — ein
+   Instrumentendefekt, der aussieht wie ein Befund. Genau der Fall, gegen den
+   #284 die Positivkontrolle eingefuehrt hat.
+
+
+### Kartenzeit, Rohdaten, Verdikte
+
+Fuenf Boots in 21 Minuten Belegung (07:21:10-07:42:00 UTC), ueber `gpu-arb`
+gehalten und freigegeben, Kartenreihenfolge in jedem Boot zur Laufzeit
+aufgeloest (CUDA_BIG=0 = 5090, NVML-Index 1 — die bekannte Falle). Drei der
+fuenf Boots gingen auf die drei oben benannten Defekte drauf, einer auf einen
+Aufraeum-Wettlauf (der Vorgaenger-Prozess hielt beim naechsten Start noch
+11,96 GiB). Rohdaten unter
+`/spinning/gpu-battery-results/2026-07-31_274_families2/{moe,dense2_twocard,
+fp8_twocard}/` (`contract_lines.txt`, `gate.json`, `gate.txt`, `cards.txt`,
+`server.log`, `server_info.json`) plus die Fenster-Logs.
+
+| Arm | gebaut | bootbar | kohaerent |
+|---|---|---|---|
+| EXPERTEN (MoE, einkartig) | ja | **ja** | **ja** (byte-identisch, 2 geurteilte Prompts) |
+| ZWEIKARTEN (dense) | ja | **ja** | VOID (Verbands-Boden rot, Lane-Boden gruen) |
+| FP8 ZWEIKARTEN | ja | **ja, bis zum Byte-Tor** | nein (illegal memory access im ersten Forward) |
+
+Keine Share-Zahl in diesem Slice: er baut FAEHIGKEIT. Die Lane-Zahlen oben
+sind informativ und stehen unter Regel 4 (#328 bewegt gerade den Nenner).
+
+### Offen
+
+1. **FP8-Zweikarten, erster Forward.** Der einzige rote Punkt. Erst Budget
+   ausschliessen (ein Boot), dann die Ko-Belegung der fremden Karte.
+2. **Dense-Zweikarten-Kohaerenz.** Braucht einen Boden ohne Prefix-Cache.
+   Der Lane-Boden ist bereits gruen, es fehlt nur die Vergleichsseite.
+3. **Expertenschale ueber Karten.** Bewusst abgelehnt (Routing + Dispatcher
+   reisen nicht mit), damit ein MoE-Modell, das nicht auf eine Karte passt,
+   heute keine Lane bekommt. Eigener Bau.
+4. **Expert-Offload x Lane** und **EP x Lane** sind jetzt benannte
+   Ablehnungen statt stiller Fehlkonfigurationen — beide sind Kandidaten fuer
+   „kombinierbar machen", keine physikalischen Grenzen.
+5. **Zwei Karten in EINEM Prozess heisst eager.** Solange die Karten-Hops
+   nicht in einem Graphen stehen koennen, kostet der zweikartige Arm die
+   Graphen. Ob ein Graph je Karte plus ein Event-Paar das aufloest, ist
+   ungeprueft.

@@ -59,6 +59,8 @@ __all__ = [
     "check_nesting",
     "derive_nested_plan",
     "format_vram_posts",
+    "lane_part_device_indices",
+    "lane_visible_physical_gpus",
     "lane_vram_posts",
     "local_column_gather",
     "local_row_reduce",
@@ -180,6 +182,39 @@ class NestedGroupPlan:
         or None when that FAST rank is a complement."""
         seg = self.segments[fast_rank]
         return seg[0] if len(seg) == 1 else None
+
+    # -- host view (#274 families slice 2) --------------------------------
+    #
+    # A segment of length 1 is byte-shareable IN PRINCIPLE, but only the
+    # process that owns that BIG rank can share the bytes: a resident shard
+    # of another rank lives in another process and is not addressable here.
+    # The two helpers below split the segments the way the BUILD needs them,
+    # from the point of view of the process that hosts the lane:
+    #
+    #   * exactly one fast rank is ALIASED   -- its segment is {host},
+    #   * every other fast rank is MATERIALIZED -- the lane loads that shard
+    #     itself, whether it is a complement (segment longer than 1) or
+    #     another rank's byte-identical singleton (BIG tp_size == 2).
+    #
+    # For the slice-B shape (host = BIG rank 0, segments ({0}, {1..n-1}))
+    # this reproduces the old shared/complement split exactly.
+
+    def host_fast_rank(self, host_big_rank: int) -> int:
+        """The fast rank whose shard is the host process's resident shard."""
+        for f, seg in enumerate(self.segments):
+            if seg == (host_big_rank,):
+                return f
+        raise ValueError(
+            f"dual-group plan {self.describe()} has no singleton segment for "
+            f"serving rank {host_big_rank}: the lane must be built in a "
+            "process whose resident shard is one whole lane shard, otherwise "
+            "there is nothing to share and the lane is just a second model."
+        )
+
+    def materialized_fast_ranks(self, host_big_rank: int) -> Tuple[int, ...]:
+        """The fast ranks the lane has to load itself, in lane-rank order."""
+        host = self.host_fast_rank(host_big_rank)
+        return tuple(f for f in range(self.fast_size) if f != host)
 
     def describe(self) -> str:
         parts = []
@@ -681,3 +716,68 @@ def format_vram_posts(posts: Sequence[VramPost], card: str) -> str:
         "(shared items cost nothing)"
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Lane part placement across cards (#274 families slice 2, arm C)
+# ---------------------------------------------------------------------------
+#
+# By default every lane part lives on the host rank's card: the lane is the
+# slice-A "second group on ONE card". A lane whose weights do not fit on one
+# card can place its MATERIALIZED parts on other cards instead. That does not
+# need a communicator -- the lane's collectives are already local tensor ops
+# (section 4) -- it turns them into cross-device copies of the ACTIVATION,
+# which is the smaller object by orders of magnitude.
+#
+# The one thing it does need is visibility: with --rank-gpu-id each scheduler
+# process sees exactly one card (CUDA_VISIBLE_DEVICES isolation), so the host
+# process has to be given the foreign cards too. Both sides -- the parent that
+# composes CUDA_VISIBLE_DEVICES and the lane that has to name a device inside
+# the process -- derive their answer from the two functions below, so the
+# order cannot drift between them.
+
+
+def lane_visible_physical_gpus(
+    host_physical_gpu: int, part_physical_gpus: Sequence[int]
+) -> List[int]:
+    """The physical GPU ids the lane HOST process must see, in order.
+
+    The host card is always first, so ``cuda:0`` keeps meaning "this rank's
+    card" inside the process exactly as it does without a lane.
+    """
+    order = [int(host_physical_gpu)]
+    for gid in part_physical_gpus:
+        gid = int(gid)
+        if gid not in order:
+            order.append(gid)
+    return order
+
+
+def lane_part_device_indices(
+    host_physical_gpu: int,
+    part_physical_gpus: Sequence[int],
+    visible_physical_gpus: Optional[Sequence[int]] = None,
+) -> List[int]:
+    """Per-fast-rank IN-PROCESS device index for the given physical placement.
+
+    ``visible_physical_gpus`` is what CUDA_VISIBLE_DEVICES says (None: every
+    card is visible under its own physical index). A physical id that the
+    process cannot see is a hard error naming the flag -- the alternative is
+    an out-of-range cuda index deep inside the loader.
+    """
+    if visible_physical_gpus is None:
+        return [int(g) for g in part_physical_gpus]
+    visible = [int(g) for g in visible_physical_gpus]
+    out = []
+    for f, gid in enumerate(part_physical_gpus):
+        gid = int(gid)
+        if gid not in visible:
+            raise ValueError(
+                f"--dual-group-lane-part-gpu-id places lane rank {f} on "
+                f"physical GPU {gid}, but the lane host process only sees "
+                f"{visible} (CUDA_VISIBLE_DEVICES). The host card is "
+                f"{host_physical_gpu}; a foreign card has to be listed in the "
+                "flag BEFORE the process starts, it cannot be attached later."
+            )
+        out.append(visible.index(gid))
+    return out

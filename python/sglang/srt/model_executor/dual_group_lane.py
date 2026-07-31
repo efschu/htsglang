@@ -56,6 +56,7 @@ from sglang.srt.distributed.dual_group import (
     check_nesting,
     derive_nested_plan,
     format_vram_posts,
+    lane_part_device_indices,
     local_column_gather,
     local_row_reduce,
     local_row_split,
@@ -102,12 +103,25 @@ def lane_geometry_override(fast_size: int, fast_rank: int):
     later forward.  The dcp fields are forced OFF: the lane's KV pool is its
     own, un-token-sharded pool; a live ``dcp_enabled`` read during a lane
     forward must never see the serving group's DCP geometry.
+
+    ``moe_ep`` moves with them and is forced to the SINGLE-GROUP view.
+    ``FusedMoE.__init__`` reads ``get_parallel().moe_ep_size / moe_ep_rank``
+    directly, and the lane's expert algebra is the moe-TP one (each part is a
+    partial sum of the same full-width output).  Leaving the ambient EP
+    geometry in place would make a freshly loaded lane part claim the SAME
+    local expert range as the resident one, and would let the part build an
+    EP dispatcher bound to the production all-to-all group.  Expert
+    parallelism in the serving group is refused outright at build time
+    (``_assert_lane_moe_is_pure_tp``); this override keeps the construction
+    honest for every other case.
     """
     return get_parallel().override(
         tp_size=fast_size,
         tp_rank=fast_rank,
         moe_tp_size=fast_size,
         moe_tp_rank=fast_rank,
+        moe_ep_size=1,
+        moe_ep_rank=0,
         attn_tp_size=fast_size,
         attn_tp_rank=fast_rank,
         dcp_enabled=False,
@@ -201,6 +215,40 @@ def derive_lane_plan(server_args, model_config) -> NestedGroupPlan:
 # ---------------------------------------------------------------------------
 
 
+def _part_device(part: nn.Module) -> Optional[torch.device]:
+    """The device a lane part's weights live on (None: no tensors at all)."""
+    for t in part.parameters():
+        return t.device
+    for t in part.buffers():
+        return t.device
+    return None
+
+
+def _part_devices(parts: Sequence[nn.Module]) -> Tuple[Optional[torch.device], ...]:
+    return tuple(_part_device(p) for p in parts)
+
+
+def _spans_cards(parts: Sequence[nn.Module]) -> bool:
+    """Whether these parts sit on more than one device (#274 families 2, arm C).
+
+    A lane that does not fit on one card places its materialized parts on
+    other cards. The shells stay the same substitution -- gather is still a
+    ``cat``, reduce is still an ``add`` -- but the ACTIVATION now travels to
+    the part and the result travels back. That is the whole cost of the
+    two-card lane, and it is the small object: one ``[tokens, hidden]``
+    tensor per shell instead of a weight shard.
+    """
+    seen = {d for d in _part_devices(parts) if d is not None}
+    return len(seen) > 1
+
+
+def _on(x: torch.Tensor, device: Optional[torch.device]) -> torch.Tensor:
+    """Move an activation to a part's device; a no-op on the one-card lane."""
+    if device is None or x.device == device:
+        return x
+    return x.to(device, non_blocking=True)
+
+
 class LaneColumnParallelShell(nn.Module):
     """Full-width column-parallel forward: per-sub-output concat of N parts.
 
@@ -239,15 +287,20 @@ class LaneColumnParallelShell(nn.Module):
                     "LaneColumnParallelShell: skip_bias_add with a bias is not "
                     "composed yet (no vehicle model needs it)."
                 )
+        self._lane_part_devices = _part_devices(parts)
 
     def forward(self, input_):
         parts = self._lane_parts
-        outs = [
-            p.quant_method.apply(
-                p, input_, None if (p.bias is None or p.skip_bias_add) else p.bias
+        devices = self._lane_part_devices
+        home = input_.device
+        outs = []
+        for p, dev in zip(parts, devices):
+            out = p.quant_method.apply(
+                p,
+                _on(input_, dev),
+                None if (p.bias is None or p.skip_bias_add) else p.bias,
             )
-            for p in parts
-        ]
+            outs.append(_on(out, home))
         return local_column_gather(outs, self._lane_sub_sizes), None
 
 
@@ -265,6 +318,7 @@ class LaneRowParallelShell(nn.Module):
             raise ValueError("LaneRowParallelShell: no parts.")
         self._lane_parts = tuple(parts)
         self._lane_in_sizes = tuple(int(p.input_size_per_partition) for p in parts)
+        self._lane_part_devices = _part_devices(parts)
         p0 = parts[0]
         self.skip_bias_add = p0.skip_bias_add
 
@@ -273,12 +327,16 @@ class LaneRowParallelShell(nn.Module):
         # RowParallelLinear; the lane's "all-reduce" is the local sum below and
         # is never optional (without it the output is a partial product).
         parts = self._lane_parts
+        home = input_.device
         pieces = local_row_split(input_, self._lane_in_sizes)
-        outs = [p.quant_method.apply(p, piece, None) for p, piece in zip(parts, pieces)]
+        outs = [
+            _on(p.quant_method.apply(p, _on(piece, dev), None), home)
+            for p, piece, dev in zip(parts, pieces, self._lane_part_devices)
+        ]
         out = local_row_reduce(outs)
         bias = parts[0].bias
         if bias is not None and not self.skip_bias_add:
-            out = out + bias
+            out = out + _on(bias, out.device)
             bias = None
         return out, (bias if self.skip_bias_add else None)
 
@@ -326,6 +384,15 @@ class LaneFusedMoEShell(nn.Module):
                 "lane cannot split its group all-reduce off and would sum "
                 "already-reduced outputs."
             )
+        if _spans_cards(parts):
+            raise ValueError(
+                "LaneFusedMoEShell: this lane places its parts on different "
+                "cards, and the expert path is not carried across cards. The "
+                "linear shells move one activation per shell; a FusedMoE part "
+                "consumes the ROUTING as well (topk ids/weights, and on some "
+                "paths a dispatcher), so a cross-card expert shell is its own "
+                "build and is refused rather than half-done."
+            )
         self._lane_parts = tuple(parts)
         p0 = parts[0]
         # Read-only geometry the surrounding block asks the experts about.
@@ -353,6 +420,7 @@ class LaneVocabEmbeddingShell(nn.Module):
         if not parts:
             raise ValueError("LaneVocabEmbeddingShell: no parts.")
         self._lane_parts = tuple(parts)
+        self._lane_part_devices = _part_devices(parts)
 
     @property
     def embedding_dim(self):
@@ -368,10 +436,11 @@ class LaneVocabEmbeddingShell(nn.Module):
         )
 
         out = None
-        for p in self._lane_parts:
+        home = input_.device
+        for p, dev in zip(self._lane_parts, self._lane_part_devices):
             idx = p.shard_indices
             masked_input, input_mask = get_masked_input_and_mask(
-                input_,
+                _on(input_, dev),
                 idx.org_vocab_start_index,
                 idx.org_vocab_end_index,
                 idx.num_org_vocab_padding,
@@ -380,6 +449,7 @@ class LaneVocabEmbeddingShell(nn.Module):
             )
             part_out = p.quant_method.embedding(p, masked_input.long())
             part_out.masked_fill_(input_mask.unsqueeze(-1), 0)
+            part_out = _on(part_out, home)
             out = part_out if out is None else out + part_out
         return out
 
@@ -395,8 +465,12 @@ class _LaneLmHeadQuantMethod:
         self._shell = shell
 
     def apply(self, layer, x, bias=None):
-        parts = self._shell._lane_parts
-        outs = [p.quant_method.apply(p, x, bias) for p in parts]
+        shell = self._shell
+        home = x.device
+        outs = [
+            _on(p.quant_method.apply(p, _on(x, dev), bias), home)
+            for p, dev in zip(shell._lane_parts, shell._lane_part_devices)
+        ]
         return torch.cat(outs, dim=-1)
 
 
@@ -412,6 +486,7 @@ class LaneLmHeadShell(nn.Module):
         if not parts:
             raise ValueError("LaneLmHeadShell: no parts.")
         self._lane_parts = tuple(parts)
+        self._lane_part_devices = _part_devices(parts)
         self.quant_method = _LaneLmHeadQuantMethod(self)
         self.bias = None
         p0 = parts[0]
@@ -545,6 +620,24 @@ def _gdn_conv_sub_sizes(gdn_parts: Sequence[nn.Module]) -> List[List[int]]:
     return sizes
 
 
+def _compose_home_device(
+    target: torch.Tensor, parts: Sequence[nn.Module]
+) -> Optional[torch.device]:
+    """Where a composed-by-value tensor is assembled.
+
+    The hull's own device when it has one; a meta hull has none, and then the
+    first part's device is the answer -- lane rank order puts the host's own
+    resident shard first, so that IS the lane's card.
+    """
+    if target is not None and target.device.type != "meta":
+        return target.device
+    for p in parts:
+        dev = _part_device(p)
+        if dev is not None and dev.type != "meta":
+            return dev
+    return None
+
+
 def _compose_column_weights_inplace(
     hull_linear: nn.Module,
     parts: Sequence[nn.Module],
@@ -558,6 +651,12 @@ def _compose_column_weights_inplace(
     this storage at construction; reassigning ``.data`` would strand it.
     """
     n_sub = len(per_part_sub_sizes[0])
+    # The composed tensors are built from EVERY part, and a card-spanning lane
+    # has parts on more than one device. The pieces are gathered on the HULL's
+    # card -- the hull is what they are written into, and it is the lane's own
+    # card by construction. These are conv kernels and per-head vectors, so
+    # the gather is kilobytes and happens once at bring-up.
+    home = _compose_home_device(hull_linear.weight, parts)
     pieces = []
     for s in range(n_sub):
         for f, p in enumerate(parts):
@@ -568,12 +667,20 @@ def _compose_column_weights_inplace(
                     f"{p.weight.data.shape[0]} != declared groups {sizes}."
                 )
             off = sum(sizes[:s])
-            pieces.append(p.weight.data[off : off + sizes[s]])
+            pieces.append(_on(p.weight.data[off : off + sizes[s]], home))
     full = torch.cat(pieces, dim=0)
     if full.shape != hull_linear.weight.shape:
         raise ValueError(
             f"composed weight shape {tuple(full.shape)} != hull "
             f"{tuple(hull_linear.weight.shape)} for a composed column linear."
+        )
+    if hull_linear.weight.device.type == "meta":
+        # Meta hull (every family whose full-width weights are not lazily
+        # allocated): this ONE tensor has to become real, because it is
+        # composed by value rather than shelled. It is a conv kernel, i.e.
+        # kilobytes -- which is the whole point of not making the rest real.
+        hull_linear.weight = nn.Parameter(
+            torch.empty_like(full, device=full.device), requires_grad=False
         )
     hull_linear.weight.data.copy_(full)
     if getattr(hull_linear, "bias", None) is not None:
@@ -623,16 +730,25 @@ def _finalize_hull_params(
                 param.data = sp.data
             counts["aliased"] += 1
             continue
-        if param.device.type == "meta":
+        base = name.rsplit(".", 1)[-1]
+        if param.device.type == "meta" and base not in ("dt_bias", "A_log"):
             raise ValueError(
                 f"dual-group lane: hull parameter {name!r} is still on meta "
                 "and has no counterpart in the shared tree -- it would run "
                 "with no storage at all."
             )
-        base = name.rsplit(".", 1)[-1]
         if base in ("dt_bias", "A_log"):
-            pieces = [pp[name].data for pp in part_params]
+            home = _compose_home_device(param, part_models)
+            pieces = [_on(pp[name].data, home) for pp in part_params]
             full = torch.cat(pieces, dim=0)
+            if param.device.type == "meta":
+                # Same reason as the composed conv weight: a per-head GDN
+                # vector is composed BY VALUE, so it needs storage even on a
+                # meta hull. Per head, not per weight matrix -- kilobytes.
+                parent_name, _, attr = name.rpartition(".")
+                parent = hull.get_submodule(parent_name) if parent_name else hull
+                param = nn.Parameter(torch.empty_like(full), requires_grad=False)
+                setattr(parent, attr, param)
             if full.shape != param.shape:
                 raise ValueError(
                     f"dual-group lane: composed {name} shape "
@@ -706,23 +822,37 @@ def verify_shared_bytes(
 # ---------------------------------------------------------------------------
 
 
-def _load_complement_model(
-    lane_runner, plan: NestedGroupPlan, fast_rank: int
+def _load_lane_part(
+    lane_runner, plan: NestedGroupPlan, fast_rank: int, gpu_id: Optional[int] = None
 ) -> nn.Module:
-    """Load one complement part: the lane group's rank ``fast_rank`` shard.
+    """Load one MATERIALIZED part: the lane group's rank ``fast_rank`` shard.
 
     Runs the STOCK loader under (a) the lane's own partition vectors --
     without the scope the resident group's vector does not apply to a group
     of another size and the loader silently falls back to the even split --
     and (b) the ParallelContext override for (fast_size, fast_rank).  The v2
     parameter loaders read tp geometry from exactly these two sources.
+
+    ``gpu_id`` is the IN-PROCESS cuda index the part is loaded onto; it
+    differs from the lane's own card only for a lane that spans two cards
+    (arm C).  The device is set for the whole load, not just handed to the
+    ``DeviceConfig``: the loaders allocate through ``torch.empty`` and
+    ``torch.cuda.current_device()`` in several places, and one of them
+    landing on the wrong card is a silent half-placed part.
     """
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.model_loader import get_model_loader
 
+    if gpu_id is None:
+        gpu_id = lane_runner.gpu_id
     fams = {name: list(vec) for name, vec in plan.fast_family_ratios}
     t0 = time.perf_counter()
     with (
+        (
+            torch.cuda.device(gpu_id)
+            if torch.cuda.is_available()
+            else contextlib.nullcontext()
+        ),
         scoped_tp_partition_ratios(list(plan.fast_ratio), fams or None),
         lane_geometry_override(plan.fast_size, fast_rank),
     ):
@@ -732,12 +862,13 @@ def _load_complement_model(
         )
         model = loader.load_model(
             model_config=lane_runner.model_config,
-            device_config=DeviceConfig(lane_runner.device, lane_runner.gpu_id),
+            device_config=DeviceConfig(lane_runner.device, gpu_id),
         )
     logger.info(
-        "dual-group lane: complement rank %d (of ratio %s) loaded in %.1f s",
+        "dual-group lane: part rank %d (of ratio %s) loaded on cuda:%d in %.1f s",
         fast_rank,
         list(plan.fast_ratio),
+        gpu_id,
         time.perf_counter() - t0,
     )
     return model.eval()
@@ -754,27 +885,38 @@ def hull_needs_real_storage(model_config) -> bool:
     families have such tensors.
 
     For every other family the choice is not cosmetic, it decides whether the
-    lane can exist at all.  A quantized family's big weights are
-    lazily-initialized parameters, so a real hull costs a few MiB either way
-    -- which is why the GGUF vehicle never noticed.  An UNQUANTIZED family
-    (dense bf16 Llama class) allocates the entire full-width model with
-    ``torch.empty`` in ``create_weights``, and that allocation lands on the
-    lane card ON TOP of the serving shard and the complement, only to be
-    dropped again by ``assemble_lane_shells`` moments later.  On this rig
-    that transient peak is the difference between a lane that boots and a
-    CUDA OOM in the hull's first attention layer (#274 families slice A).
+    lane can exist at all: the full-width hull is allocated ON TOP of the
+    serving shard and the lane parts, only to be dropped again by
+    ``assemble_lane_shells`` moments later.  On this rig that transient peak
+    is the difference between a lane that boots and a CUDA OOM in the hull's
+    first attention layer (#274 families slice A).
+
+    Whether the peak exists at all depends on the QUANTIZATION, not on the
+    family.  GGUF registers ``GGUFUninitializedParameter``, so a real hull
+    costs kilobytes -- which is why the GGUF-GDN vehicle never noticed the
+    real build.  Every other path (unquantized ``unquant.py``, and fp8's
+    ``create_weights``) allocates the full-width weight with ``torch.empty``.
+    The FP8-GDN vehicle sits in the intersection the slice-A predicate got
+    wrong: linear attention AND eagerly allocated weights, i.e. a real hull
+    of the entire model (28.75 GiB at 27B) that no card here can absorb
+    (#274 families slice 2).  Such families build on meta as well; the two
+    composed-by-value tensor classes (the conv kernel and the per-head GDN
+    vectors) are materialized individually where they are filled, which is
+    kilobytes rather than the whole model.
     """
     cfg = getattr(model_config, "hf_text_config", None) or getattr(
         model_config, "hf_config", None
     )
     if cfg is None:
         return True
-    return bool(
+    linear_attention = bool(
         getattr(cfg, "gdn_tp_units", None)
         or getattr(cfg, "linear_num_key_heads", None)
         or getattr(cfg, "linear_attn_config", None)
         or getattr(cfg, "mamba_d_ssm", None)
     )
+    hull_weights_are_lazy = getattr(model_config, "quantization", None) == "gguf"
+    return linear_attention and hull_weights_are_lazy
 
 
 def _fill_hull_buffers(hull: nn.Module, shared_model: nn.Module) -> int:
@@ -806,6 +948,44 @@ def _fill_hull_buffers(hull: nn.Module, shared_model: nn.Module) -> int:
         setattr(parent, attr, sb)
         filled += 1
     return filled
+
+
+def _refresh_captured_linear_attention_tensors(hull: nn.Module) -> int:
+    """Re-point the linear-attention layer's CAPTURED tensor references.
+
+    ``RadixLinearAttention.__init__`` stores plain references to its mixer's
+    ``conv1d.weight`` view, ``A_log`` and ``dt_bias``. On a meta hull those
+    references are meta, and the two composed-by-value tensors are given real
+    storage by REPLACING the Parameter object on the owning mixer -- which
+    leaves the captured reference behind, pointing at nothing. The kernel then
+    fails with "All inputs must be on the same device", which is the good
+    outcome; the bad one would be a silent read.
+
+    This is why the slice-A predicate built such families with a real hull at
+    all. Refreshing the three references afterwards is the cheaper half of
+    that trade: it costs one walk, and it lets the hull stay on meta for a
+    family whose real hull is the whole model (#274 families slice 2).
+
+    Returns the number of references refreshed. Nothing to refresh is a valid
+    answer -- a dense family has no such layer.
+    """
+    refreshed = 0
+    for _, mixer in hull.named_modules():
+        attn = getattr(mixer, "attn", None)
+        if attn is None or not hasattr(attn, "conv_weights"):
+            continue
+        conv1d = getattr(mixer, "conv1d", None)
+        if conv1d is not None and getattr(conv1d, "weight", None) is not None:
+            w = conv1d.weight
+            attn.conv_weights = w.view(w.size(0), w.size(2))
+            attn.bias = conv1d.bias
+            refreshed += 1
+        for name in ("A_log", "dt_bias"):
+            owned = getattr(mixer, name, None)
+            if owned is not None:
+                setattr(attn, name, owned)
+                refreshed += 1
+    return refreshed
 
 
 def _build_hull(lane_runner, device=None) -> nn.Module:
@@ -937,9 +1117,100 @@ def _find_lane_vocab_shells(lane_target: nn.Module, hidden_size: int):
     return _pick(embeds, "embedding"), _pick(heads, "lm_head")
 
 
+def resolve_lane_part_gpu_ids(server_args, plan, host_gpu_id: int) -> Tuple[int, ...]:
+    """IN-PROCESS cuda index for every lane part, in lane-rank order.
+
+    Unset ``--dual-group-lane-part-gpu-id`` keeps every part on the host
+    rank's card -- the one-card lane of slices A-C, byte-for-byte the same
+    build.  When it IS set it names PHYSICAL GPU ids (the same space as
+    ``--rank-gpu-id``), which this process can only address because the
+    parent listed them in ``CUDA_VISIBLE_DEVICES`` before the process
+    started; the translation to in-process indices uses that list.
+    """
+    spec = getattr(server_args, "dual_group_lane_part_gpu_id", None)
+    if not spec:
+        return tuple(host_gpu_id for _ in range(plan.fast_size))
+    if len(spec) != plan.fast_size:
+        raise ValueError(
+            f"--dual-group-lane-part-gpu-id has {len(spec)} entries but the "
+            f"lane group has {plan.fast_size} ranks ({plan.describe()}). One "
+            "physical GPU id per LANE rank, not per serving rank."
+        )
+    visible_env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = (
+        [int(x) for x in visible_env.split(",") if x != ""] if visible_env else None
+    )
+    host_phys = visible[0] if visible else host_gpu_id
+    indices = lane_part_device_indices(host_phys, spec, visible)
+    host_fast = plan.host_fast_rank(0)
+    if indices[host_fast] != host_gpu_id:
+        raise ValueError(
+            f"--dual-group-lane-part-gpu-id puts lane rank {host_fast} on "
+            f"physical GPU {spec[host_fast]}, but that rank IS the host "
+            f"rank's resident shard and cannot move off its card "
+            f"(physical {host_phys}). Name the host card there."
+        )
+    return tuple(int(i) for i in indices)
+
+
+def _lane_spans_cards(server_args) -> bool:
+    """Whether the configured lane places a part on a foreign card."""
+    spec = getattr(server_args, "dual_group_lane_part_gpu_id", None)
+    return bool(spec) and len(set(spec)) > 1
+
+
+def _assert_lane_moe_is_pure_tp(model: nn.Module) -> None:
+    """Refuse a lane over an EXPERT-PARALLEL MoE serving group.
+
+    The lane's expert algebra (``LaneFusedMoEShell``) is the moe-TP one: N
+    parts, each a partial sum of the same full-width output, combined by an
+    addition that stands in for one all-reduce. Expert parallelism is a
+    different decomposition -- it routes tokens between ranks with a live
+    all-to-all dispatcher -- and a lane part built under it would (a) claim
+    the same local expert range as the resident part rather than a
+    complementary one, and (b) carry a dispatcher bound to the production
+    communicator into a lane forward, which is exactly the wire operation
+    this runtime is built not to have. Refused at build time, named.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    for name, module in model.named_modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        ep_size = int(getattr(module, "moe_ep_size", 1) or 1)
+        if ep_size > 1:
+            raise ValueError(
+                f"dual-group lane: the serving group runs expert parallelism "
+                f"(moe_ep_size={ep_size} on {name!r}). The lane's expert "
+                "shell substitutes ONE all-reduce with an addition, which is "
+                "the moe-TP decomposition; EP routes tokens between ranks and "
+                "has no local substitute. Run the serving group with "
+                "moe-TP-only expert sharding, or run without --dual-group-lane."
+            )
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is not None and type(dispatcher).__name__ not in (
+            "StandardDispatcher",
+        ):
+            raise ValueError(
+                f"dual-group lane: expert module {name!r} dispatches through "
+                f"{type(dispatcher).__name__}, which is a cross-rank all-to-all "
+                "path. The lane has no communicator; only the standard "
+                "(pure-TP) dispatcher can run inside it."
+            )
+        if getattr(module, "_moe_offload_enabled", False):
+            raise ValueError(
+                f"dual-group lane: expert module {name!r} has expert offload "
+                "enabled (#77, SGLANG_MOE_RESIDENT_EXPERT_FRACTION). Every "
+                "materialized lane part would install its OWN pinned host "
+                "cache beside the serving group's -- host memory nobody "
+                "budgeted. The combination is refused until the lane parts "
+                "register with the resident offloader instead."
+            )
+
+
 def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
-    """The lane ModelRunner's load_model body: complement parts + hull +
-    shells + the shared-byte gate.  Rank-local by contract."""
+    """The lane ModelRunner's load_model body: lane parts + hull + shells +
+    the shared-byte gate.  Rank-local by contract."""
     host_runner = lane_runner.dual_group_host_runner
     plan: NestedGroupPlan = lane_runner.dual_group_plan
     if host_runner is None or plan is None:
@@ -947,25 +1218,30 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
             "dual-group lane runner needs dual_group_host_runner and dual_group_plan."
         )
 
-    free_before = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
+    _assert_lane_moe_is_pure_tp(host_runner.model)
 
-    # Part models in lane-rank order: shared segments reuse the resident
-    # model; complement segments load their shard.
+    host_fast_rank = plan.host_fast_rank(host_runner.tp_rank)
+    part_gpu_ids = resolve_lane_part_gpu_ids(
+        lane_runner.server_args, plan, lane_runner.gpu_id
+    )
+    cards = sorted(set(part_gpu_ids))
+    free_before = {c: torch.cuda.mem_get_info(c)[0] for c in cards}
+
+    # Part models in lane-rank order: the host's own segment reuses the
+    # resident model (shared bytes); every other segment is materialized on
+    # its assigned card -- a complement (several BIG ranks) or, at BIG
+    # tp_size 2, another rank's byte-identical singleton that this process
+    # simply cannot reach.
     part_models: List[nn.Module] = []
-    for f, seg in enumerate(plan.segments):
-        if len(seg) == 1:
-            if plan.shared_big_rank(f) != host_runner.tp_rank:
-                raise ValueError(
-                    f"dual-group lane: shared segment {f} covers serving rank "
-                    f"{plan.shared_big_rank(f)} but this process is serving "
-                    f"rank {host_runner.tp_rank} -- the lane must be built in "
-                    "the shared rank's process."
-                )
+    for f in range(plan.fast_size):
+        if f == host_fast_rank:
             part_models.append(host_runner.model)
         else:
-            part_models.append(_load_complement_model(lane_runner, plan, f))
+            part_models.append(
+                _load_lane_part(lane_runner, plan, f, gpu_id=part_gpu_ids[f])
+            )
 
-    free_after_complement = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
+    free_after_complement = {c: torch.cuda.mem_get_info(c)[0] for c in cards}
     # The NEXTN head's hull goes on META: unlike the target it has no GDN
     # mixer whose conv views are captured at construction (its single layer
     # is full attention), and its own vocab tables are 2.37 GiB that the
@@ -977,27 +1253,31 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
     counts = assemble_lane_shells(hull, part_models)
     fill = _finalize_hull_params(hull, host_runner.model, part_models)
     fill["buffers"] = _fill_hull_buffers(hull, host_runner.model) if on_meta else 0
+    # After the composed tensors got their storage, and before any forward.
+    fill["captured"] = (
+        _refresh_captured_linear_attention_tensors(hull) if on_meta else 0
+    )
 
-    shared_ranks = plan.shared_fast_ranks
-    checked = 0
-    for f in shared_ranks:
-        checked += verify_shared_bytes(hull, part_models[f], f)
+    checked = verify_shared_bytes(hull, part_models[host_fast_rank], host_fast_rank)
     if checked == 0:
-        # The gate is the whole point of the shared segment: if a segment is
-        # declared shared, its bytes MUST be the resident ones. Zero
-        # identities means the assembly silently produced a private copy.
+        # The gate is the whole point of the host segment: its bytes MUST be
+        # the resident ones. Zero identities means the assembly silently
+        # produced a private copy.
         raise ValueError(
             f"dual-group lane ({kind}): shared-byte gate found 0 data_ptr "
-            f"identities across shared segments {list(shared_ranks)} -- the "
-            "lane would compute on copies, not on the serving rank's bytes."
+            f"identities for host lane rank {host_fast_rank} -- the lane "
+            "would compute on copies, not on the serving rank's bytes."
         )
     logger.info(
-        "dual-group lane %s model assembled (hull on %s): shells column=%d "
+        "dual-group lane %s model assembled (hull on %s, parts on cuda:%s): "
+        "shells column=%d "
         "row=%d embed=%d lm_head=%d moe=%d composed=%d; params aliased=%d "
-        "composed_vec=%d buffers=%d; shared-byte gate PASSED (%d data_ptr "
+        "composed_vec=%d buffers=%d captured=%d; shared-byte gate PASSED (%d "
+        "data_ptr "
         "identities).",
         kind,
         "meta" if on_meta else "device",
+        ",".join(str(g) for g in part_gpu_ids),
         counts["column"],
         counts["row"],
         counts["embedding"],
@@ -1007,40 +1287,57 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
         fill["aliased"],
         fill["composed_vec"],
         fill["buffers"],
+        fill["captured"],
         checked,
     )
 
-    free_after = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
-    added_mib = max(0, (free_before - free_after)) >> 20
-    complement_mib = max(0, (free_before - free_after_complement)) >> 20
+    free_after = {c: torch.cuda.mem_get_info(c)[0] for c in cards}
+    home = lane_runner.gpu_id
+    added_mib = max(0, free_before[home] - free_after[home]) >> 20
+    part_mib = max(0, free_before[home] - free_after_complement[home]) >> 20
     lane_runner.dual_group_lane_weight_added_mib = int(added_mib)
     # The §5 posts block, with MEASURED numbers (the shared post is exact by
     # the gate above; the nested/duplicated posts are what mem_get_info saw).
     from sglang.srt.distributed.dual_group import DUPLICATED, NESTED, SHARED, VramPost
 
-    posts = (
+    posts = [
         VramPost(
-            name=f"shared serving-rank shard (segments {list(plan.shared_fast_ranks)})",
+            name=f"shared serving-rank shard (lane rank {host_fast_rank})",
             status=SHARED,
             mib=0,
             why=f"data_ptr-verified, {checked} identities",
         ),
         VramPost(
-            name="lane complement shard(s)",
+            name="lane part shard(s) on this card",
             status=NESTED,
-            mib=int(complement_mib),
-            why="bytes the other cards hold; this card now holds the full "
-            "weights exactly once",
+            mib=int(part_mib),
+            why="bytes the other cards hold; this card now holds its share of "
+            "the full weights exactly once",
         ),
         VramPost(
             name="hull tree residue (composed conv/state vectors, buffers)",
             status=DUPLICATED,
-            mib=int(added_mib - complement_mib),
+            mib=int(added_mib - part_mib),
             why="small real tensors of the full-width hull; big weights are "
             "lazy/shelled",
         ),
-    )
-    logger.info("%s", format_vram_posts(posts, f"cuda:{lane_runner.gpu_id} ({kind})"))
+    ]
+    for c in cards:
+        if c == home:
+            continue
+        # A foreign card carries the part in FULL: the resident shard over
+        # there belongs to another process and cannot be aliased from here.
+        # That is the price of the two-card lane, and it is stated as such.
+        posts.append(
+            VramPost(
+                name=f"lane part shard on foreign card cuda:{c}",
+                status=DUPLICATED,
+                mib=int(max(0, free_before[c] - free_after[c]) >> 20),
+                why="another process owns the resident copy of these bytes; "
+                "the lane cannot alias across process boundaries",
+            )
+        )
+    logger.info("%s", format_vram_posts(posts, f"cuda:{home} ({kind})"))
     # Keep references so the parts stay alive (shells hold them too, via
     # plain tuples that named_parameters() does not walk).
     lane_runner.dual_group_part_models = part_models
@@ -4199,6 +4496,24 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
         )
 
     plan = derive_lane_plan(server_args, host_runner.model_config)
+
+    # A lane whose parts sit on two cards runs EAGER, and this has to be
+    # decided BEFORE the args view is taken: the view RESOLVES the disable
+    # flags into the phase config, so a later flip reaches nothing and the
+    # lane's own prefill graph still captures (measured -- the capture died
+    # in cudaErrorStreamCaptureIsolation on the shells' first cross-card hop).
+    # A CUDA graph is recorded on one stream of one device; a device-to-device
+    # copy whose peer work is not on the capture stream is not a graphable
+    # operation. Named in the log, because eager is a state the reader has to
+    # know about.
+    if _lane_spans_cards(server_args) and not server_args.dual_group_lane_eager:
+        server_args.dual_group_lane_eager = True
+        logger.warning(
+            "dual-group lane spans cards (--dual-group-lane-part-gpu-id %s): "
+            "forcing EAGER. The shells' cross-card activation hops are not "
+            "capturable in one device's graph.",
+            list(server_args.dual_group_lane_part_gpu_id or ()),
+        )
 
     lane_args = _lane_server_args_view(server_args)
     lane_id = 0

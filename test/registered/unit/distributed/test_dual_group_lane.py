@@ -12,12 +12,20 @@ Every test runs CPU-only (CUDA_VISIBLE_DEVICES=99 in the suite).  The claims:
   ColumnParallelLinear/RowParallelLinear toy tree.
 """
 
+import os
+import types
 import unittest
+import unittest.mock
 
 import torch
 from torch import nn
 
-from sglang.srt.distributed.dual_group import derive_nested_plan
+import sglang.srt.model_executor.dual_group_lane as dgl
+from sglang.srt.distributed.dual_group import (
+    derive_nested_plan,
+    lane_part_device_indices,
+    lane_visible_physical_gpus,
+)
 from sglang.srt.distributed.utils import (
     partition_sizes,
     scoped_tp_partition_ratios,
@@ -32,7 +40,10 @@ from sglang.srt.model_executor.dual_group_lane import (
     LaneColumnParallelShell,
     LaneFusedMoEShell,
     LaneRowParallelShell,
+    _assert_lane_moe_is_pure_tp,
+    _finalize_hull_params,
     assemble_lane_shells,
+    resolve_lane_part_gpu_ids,
     verify_shared_bytes,
 )
 
@@ -397,6 +408,382 @@ class TestFamilyNoOp(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._lane(_PoolWithMamba())._verify_state_buffers(4)
         self.assertIn("SpeculativeState", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# #274 families slice 2: lane parts that are NOT the host's shard, and lane
+# parts that are not on the host's card.
+# ---------------------------------------------------------------------------
+
+
+class _FakeQuant:
+    """Records which device each part was asked to compute on."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def apply(self, layer, x, bias=None):
+        self.log.append(("apply", layer.tag, x.device.type))
+        return torch.zeros(x.shape[0], layer.out_width, dtype=x.dtype)
+
+
+class _FakePart(nn.Module):
+    def __init__(self, tag, out_width, log, device):
+        super().__init__()
+        self.tag = tag
+        self.out_width = out_width
+        self.output_partition_sizes = [out_width]
+        self.input_size_per_partition = H // 2
+        self.bias = None
+        self.skip_bias_add = False
+        self.gather_output = False
+        self.quant_method = _FakeQuant(log)
+        self.register_parameter(
+            "weight", nn.Parameter(torch.zeros(1, device=device), requires_grad=False)
+        )
+
+
+class TestLanePartsAcrossCards(unittest.TestCase):
+    """The shells move the ACTIVATION to the part and the result back.
+
+    No CUDA here: the plumbing is observed by replacing the module-level
+    ``_on`` helper with a recorder, which is exactly the function the shells
+    route every cross-card hop through. What is asserted is the CALL PATTERN
+    -- every part sees a tensor on its own device, every result comes home to
+    the input's device -- not a copy engine.
+    """
+
+    def _record(self):
+        hops = []
+        real_on = dgl._on
+
+        def spy(x, device):
+            if device is not None and x.device != device:
+                hops.append((x.device.type, device.type))
+                return x  # cannot really move to a fake device on CPU
+            return real_on(x, device)
+
+        return hops, spy
+
+    def test_one_card_lane_makes_no_hops_at_all(self):
+        log = []
+        parts = [_FakePart("a", 8, log, "cpu"), _FakePart("b", 8, log, "cpu")]
+        shell = LaneColumnParallelShell(parts)
+        hops, spy = self._record()
+        with unittest.mock.patch.object(dgl, "_on", spy):
+            out, _ = shell(torch.zeros(2, H))
+        self.assertEqual(hops, [])
+        self.assertEqual(out.shape, (2, 16))
+
+    def test_column_shell_sends_the_activation_and_brings_the_result_home(self):
+        log = []
+        parts = [_FakePart("a", 8, log, "cpu"), _FakePart("b", 8, log, "meta")]
+        shell = LaneColumnParallelShell(parts)
+        self.assertEqual([d.type for d in shell._lane_part_devices], ["cpu", "meta"])
+        hops, spy = self._record()
+        with unittest.mock.patch.object(dgl, "_on", spy):
+            shell(torch.zeros(2, H))
+        # one hop out to the foreign part, one hop back with its result;
+        # the resident part is untouched.
+        self.assertEqual(hops, [("cpu", "meta")])
+
+    def test_row_shell_splits_first_then_travels(self):
+        log = []
+        parts = [_FakePart("a", 8, log, "cpu"), _FakePart("b", 8, log, "meta")]
+        shell = LaneRowParallelShell(parts)
+        hops, spy = self._record()
+        with unittest.mock.patch.object(dgl, "_on", spy):
+            shell(torch.zeros(2, H))
+        # the SLICE travels, not the whole activation -- the split happens
+        # before the hop.
+        self.assertEqual(hops, [("cpu", "meta")])
+        self.assertEqual([e[2] for e in log], ["cpu", "cpu"])
+
+    def test_expert_shell_refuses_to_span_cards(self):
+        class _MoEPartOnDevice(nn.Module):
+            def __init__(self, device):
+                super().__init__()
+                self.register_parameter(
+                    "w13_weight",
+                    nn.Parameter(torch.zeros(1, device=device), requires_grad=False),
+                )
+
+            def forward_local(self, hidden_states, topk_output):
+                return hidden_states
+
+        with self.assertRaises(ValueError) as ctx:
+            LaneFusedMoEShell([_MoEPartOnDevice("cpu"), _MoEPartOnDevice("meta")])
+        self.assertIn("different cards", str(ctx.exception))
+
+
+class TestHostAndMaterializedRanks(unittest.TestCase):
+    """Which lane rank is aliased, and which one the lane has to load itself.
+
+    At BIG tp_size 2 BOTH segments are singletons, so the old
+    shared/complement split called them both shared -- and the build refused,
+    because the second one's bytes live in another process. The host view
+    names the one rank this process can actually alias.
+    """
+
+    def test_three_rank_group_reproduces_the_slice_b_split(self):
+        plan = derive_nested_plan([2, 1, 1])
+        self.assertEqual(plan.host_fast_rank(0), 0)
+        self.assertEqual(plan.materialized_fast_ranks(0), (1,))
+
+    def test_two_rank_group_has_a_materialized_singleton(self):
+        plan = derive_nested_plan([3, 1])
+        self.assertEqual(plan.segments, ((0,), (1,)))
+        # Both segments are byte-shareable in principle ...
+        self.assertEqual(plan.shared_fast_ranks, (0, 1))
+        # ... but only rank 0's bytes are in THIS process.
+        self.assertEqual(plan.host_fast_rank(0), 0)
+        self.assertEqual(plan.materialized_fast_ranks(0), (1,))
+
+    def test_a_host_rank_with_no_singleton_segment_is_named(self):
+        plan = derive_nested_plan([2, 1, 1])
+        with self.assertRaises(ValueError) as ctx:
+            plan.host_fast_rank(1)
+        self.assertIn("no singleton segment for serving rank 1", str(ctx.exception))
+
+
+class TestLanePartPlacement(unittest.TestCase):
+    """Physical GPU ids -> in-process cuda indices, one rule for both sides."""
+
+    def test_host_card_is_always_first(self):
+        self.assertEqual(lane_visible_physical_gpus(1, [1, 0]), [1, 0])
+        self.assertEqual(lane_visible_physical_gpus(1, [1, 1]), [1])
+
+    def test_indices_follow_the_visible_list(self):
+        self.assertEqual(lane_part_device_indices(1, [1, 0], [1, 0]), [0, 1])
+        self.assertEqual(lane_part_device_indices(1, [1, 1], [1]), [0, 0])
+
+    def test_all_cards_visible_means_physical_is_the_index(self):
+        self.assertEqual(lane_part_device_indices(1, [1, 2], None), [1, 2])
+
+    def test_a_card_the_process_cannot_see_is_refused_by_name(self):
+        with self.assertRaises(ValueError) as ctx:
+            lane_part_device_indices(1, [1, 2], [1, 0])
+        self.assertIn("only sees [1, 0]", str(ctx.exception))
+
+    def test_default_keeps_every_part_on_the_host_card(self):
+        plan = derive_nested_plan([2, 1, 1])
+        args = types.SimpleNamespace(dual_group_lane_part_gpu_id=None)
+        self.assertEqual(resolve_lane_part_gpu_ids(args, plan, 0), (0, 0))
+
+    def test_flag_resolves_against_cuda_visible_devices(self):
+        plan = derive_nested_plan([2, 1, 1])
+        args = types.SimpleNamespace(dual_group_lane_part_gpu_id=[1, 0])
+        with unittest.mock.patch.dict(
+            os.environ, {"CUDA_VISIBLE_DEVICES": "1,0"}, clear=False
+        ):
+            self.assertEqual(resolve_lane_part_gpu_ids(args, plan, 0), (0, 1))
+
+    def test_the_host_rank_cannot_be_moved_off_its_card(self):
+        plan = derive_nested_plan([2, 1, 1])
+        args = types.SimpleNamespace(dual_group_lane_part_gpu_id=[0, 1])
+        with unittest.mock.patch.dict(
+            os.environ, {"CUDA_VISIBLE_DEVICES": "1,0"}, clear=False
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                resolve_lane_part_gpu_ids(args, plan, 0)
+        self.assertIn("cannot move off its card", str(ctx.exception))
+
+    def test_length_is_checked_against_the_lane_group(self):
+        plan = derive_nested_plan([2, 1, 1])
+        args = types.SimpleNamespace(dual_group_lane_part_gpu_id=[1, 0, 2])
+        with self.assertRaises(ValueError) as ctx:
+            resolve_lane_part_gpu_ids(args, plan, 0)
+        self.assertIn("per LANE rank", str(ctx.exception))
+
+
+class TestExpertShellEndToEnd(unittest.TestCase):
+    """The MoE shell through assembly + finalize + the data_ptr gate.
+
+    Slice-C pinned the shell's reduce algebra with a stand-in that had no
+    parameters at all, so the expert TENSORS never met the byte gate. This
+    walks a hull whose expert module is a real ``FusedMoE`` instance carrying
+    real ``w13_weight``/``w2_weight`` parameters, which is the path a MoE lane
+    boot takes.
+    """
+
+    @staticmethod
+    def _expert_module(seed):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        mod = FusedMoE.__new__(FusedMoE)
+        nn.Module.__init__(mod)
+        g = torch.Generator().manual_seed(seed)
+        mod.register_parameter(
+            "w13_weight",
+            nn.Parameter(torch.rand(2, 4, generator=g), requires_grad=False),
+        )
+        mod.register_parameter(
+            "w2_weight",
+            nn.Parameter(torch.rand(4, 2, generator=g), requires_grad=False),
+        )
+        mod.num_experts, mod.top_k, mod.hidden_size, mod.layer_id = 8, 2, H, 0
+        mod.moe_ep_size = 1
+        mod.forward_local = lambda hidden_states, topk_output: hidden_states
+        return mod
+
+    @staticmethod
+    def _tree(expert):
+        tree = nn.Module()
+        tree.experts = expert
+        return tree
+
+    def test_expert_tensors_pass_the_shared_byte_gate(self):
+        shared = self._tree(self._expert_module(1))
+        other = self._tree(self._expert_module(2))
+        hull = self._tree(self._expert_module(3))
+
+        counts = assemble_lane_shells(hull, [shared, other])
+        self.assertEqual(counts["moe"], 1)
+        self.assertIsInstance(hull.experts, LaneFusedMoEShell)
+
+        fill = _finalize_hull_params(hull, shared, [shared, other])
+        # The shell holds its parts in a plain tuple, so the hull tree has no
+        # expert parameters left to fill -- and none to leave unfilled.
+        self.assertEqual(fill["aliased"], 0)
+
+        checked = verify_shared_bytes(hull, shared, 0)
+        # w13_weight and w2_weight of the shared part, by data_ptr identity.
+        self.assertEqual(checked, 2)
+
+    def test_a_copied_expert_tensor_fails_the_gate(self):
+        shared = self._tree(self._expert_module(1))
+        other = self._tree(self._expert_module(2))
+        hull = self._tree(self._expert_module(3))
+        # Assemble against a COPY of the resident expert module -- same
+        # names, same shapes, different storage. That is exactly the failure
+        # the gate exists for: a lane that computes on a copy of the serving
+        # rank's experts instead of on its bytes.
+        copy_of_shared = self._tree(self._expert_module(1))
+        assemble_lane_shells(hull, [copy_of_shared, other])
+        with self.assertRaises(AssertionError) as ctx:
+            verify_shared_bytes(hull, shared, 0)
+        self.assertIn("shared-byte gate FAILED", str(ctx.exception))
+
+
+class TestPartGpuFlagValidation(unittest.TestCase):
+    """The flag is checked BEFORE any card is touched, because the foreign
+    card has to be in CUDA_VISIBLE_DEVICES at spawn time."""
+
+    @staticmethod
+    def _args(part_gpus, rank_gpu_id=(1, 0)):
+        return types.SimpleNamespace(
+            dual_group_lane_part_gpu_id=list(part_gpus),
+            rank_gpu_id=list(rank_gpu_id) if rank_gpu_id is not None else None,
+        )
+
+    def _check(self, args):
+        from sglang.srt.server_args import ServerArgs
+
+        ServerArgs._validate_dual_group_lane_part_gpu_id(args)
+
+    def test_two_entries_on_known_cards_are_accepted(self):
+        self._check(self._args([1, 0]))
+
+    def test_one_entry_per_lane_rank_not_per_serving_rank(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(self._args([1, 1, 0]))
+        self.assertIn("per LANE rank", str(ctx.exception))
+
+    def test_the_host_lane_rank_must_name_the_host_card(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(self._args([0, 1]))
+        self.assertIn("same bytes, not a copy", str(ctx.exception))
+
+    def test_a_card_with_no_serving_rank_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(self._args([1, 5]))
+        self.assertIn("carries no serving rank", str(ctx.exception))
+
+    def test_physical_ids_need_rank_gpu_id(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(self._args([1, 0], rank_gpu_id=None))
+        self.assertIn("--rank-gpu-id", str(ctx.exception))
+
+
+class TestHullStorage(unittest.TestCase):
+    """Which families may build a REAL full-width hull.
+
+    The slice-A predicate asked "is this linear attention?", on the reasoning
+    that a quantized checkpoint allocates its big weights lazily. That holds
+    for GGUF (``GGUFUninitializedParameter``) and for nothing else: fp8's
+    ``create_weights`` calls ``torch.empty``, so an FP8-GDN hull is the whole
+    model a second time.
+    """
+
+    @staticmethod
+    def _cfg(quantization=None, **attrs):
+        text = types.SimpleNamespace(**attrs)
+        return types.SimpleNamespace(
+            hf_text_config=text, hf_config=text, quantization=quantization
+        )
+
+    def test_gguf_linear_attention_keeps_the_real_hull(self):
+        self.assertTrue(
+            dgl.hull_needs_real_storage(
+                self._cfg(quantization="gguf", linear_num_key_heads=16)
+            )
+        )
+
+    def test_fp8_linear_attention_goes_to_meta(self):
+        self.assertFalse(
+            dgl.hull_needs_real_storage(
+                self._cfg(quantization="fp8", linear_num_key_heads=16)
+            )
+        )
+
+    def test_dense_family_goes_to_meta(self):
+        self.assertFalse(dgl.hull_needs_real_storage(self._cfg()))
+
+    def test_unquantized_linear_attention_goes_to_meta_too(self):
+        self.assertFalse(
+            dgl.hull_needs_real_storage(self._cfg(linear_num_key_heads=16))
+        )
+
+
+class TestExpertParallelIsRefused(unittest.TestCase):
+    """EP is a different decomposition, and the lane says so at build time."""
+
+    @staticmethod
+    def _moe(**attrs):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        mod = FusedMoE.__new__(FusedMoE)
+        nn.Module.__init__(mod)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        tree = nn.Module()
+        tree.experts = mod
+        return tree
+
+    def test_pure_tp_experts_pass(self):
+        _assert_lane_moe_is_pure_tp(self._moe(moe_ep_size=1))
+
+    def test_expert_parallel_group_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            _assert_lane_moe_is_pure_tp(self._moe(moe_ep_size=2))
+        self.assertIn("expert parallelism", str(ctx.exception))
+
+    def test_an_all_to_all_dispatcher_is_refused(self):
+        class _DeepEPish:
+            pass
+
+        with self.assertRaises(ValueError) as ctx:
+            _assert_lane_moe_is_pure_tp(
+                self._moe(moe_ep_size=1, dispatcher=_DeepEPish())
+            )
+        self.assertIn("all-to-all", str(ctx.exception))
+
+    def test_expert_offload_is_refused_as_an_unbudgeted_post(self):
+        with self.assertRaises(ValueError) as ctx:
+            _assert_lane_moe_is_pure_tp(
+                self._moe(moe_ep_size=1, _moe_offload_enabled=True)
+            )
+        self.assertIn("expert offload", str(ctx.exception))
 
 
 if __name__ == "__main__":

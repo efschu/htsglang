@@ -1749,6 +1749,163 @@ aus, ist der naechste ehrliche Schritt ein MoE-Vehikel, das der VERBAND
 zuerst allein tragen muss (§ "Einzelteil vor Verbund"), nicht ein weiterer
 Lane-Versuch.
 
+### 11.21 Familien-Slice Runde 2 (feat/dual-group-families-2, Basis b20688181d)
+
+**Herkunft zuerst.** Der aeltere Zweig `feat/dual-group-families` (42af3df1d6)
+ist VOLLSTAENDIG in der Basis dieses Slices enthalten (`git merge-base
+--is-ancestor` gruen); der Zweig selbst ist gegen b20688181d nur noch veraltet.
+Aus ihm uebernommen ist damit alles, was 11.18-11.20 beschreiben —
+`hull_needs_real_storage`, `_fill_hull_buffers`, die Blockachse im
+Vor-Boot-Check, `LaneFusedMoEShell` — und zwar als Basis, nicht als Cherry-Pick.
+Diese Runde arbeitet an genau den drei Zeilen, die dort als NICHT erreicht
+stehen: der MoE-Rig-Bringup, der zweikartige Lauf, und die dense-Spalte
+jenseits des einkartigen Falls.
+
+#### Der Befund vor dem ersten Edit: TP=2 hatte gar keine Lane
+
+`derive_nested_plan` zerlegt die BIG-Raenge in zwei zusammenhaengende
+Segmente. Bei `tp_size = 2` sind BEIDE Segmente Singletons — also nach der
+bisherigen Lesart beide „shared" —, und `build_lane_model` lehnte genau das
+ab: „shared segment 1 covers serving rank 1 but this process is serving rank
+0". Die Ablehnung war richtig und die Lesart falsch. Ein Singleton ist
+byte-teilbar IM PRINZIP; teilen kann die Bytes aber nur der Prozess, dem der
+Shard gehoert. Ein fremder Rang liegt in einem anderen Prozess und ist von
+hier aus nicht adressierbar, egal wie gut er nestet.
+
+Die Trennung heisst jetzt so, wie der Bau sie braucht, und sitzt im Plan:
+
+* `plan.host_fast_rank(host_big_rank)` — der EINE Lane-Rang, dessen Segment
+  genau der eigene Verbandsrang ist. Nur er wird aliasiert, nur er geht durch
+  das data_ptr-Tor.
+* `plan.materialized_fast_ranks(host_big_rank)` — jeder andere. Ob das ein
+  Komplement (mehrere BIG-Raenge) oder ein fremder Singleton ist, aendert am
+  Bau nichts: die Lane laedt ihn selbst.
+
+Fuer die Slice-B-Form (Host = Rang 0, Segmente `({0}, {1..n-1})`) ist das
+dieselbe Aufteilung wie vorher, Zeile fuer Zeile. Neu ist nur, dass `tp_size
+= 2` ueberhaupt eine Lane bekommt — und das ist keine Randnotiz, sondern die
+Voraussetzung fuer beide neuen Arme: das MoE-Vehikel hat 2 kv-Koepfe (TP=3
+erzwingt REPLICATED-KV fuer den Verband und nicht fuer die Lane, womit
+Nesting nach §3.2 UNDEFINIERT ist), und die zweikartige FP8-Konstellation
+will ohnehin genau zwei Verbandsraenge.
+
+Nebenbei faellt bei `tp_size = 2` das Nesting-Risiko komplett weg: die
+FAST-Ratio IST die BIG-Ratio, jede Probe nestet per Konstruktion.
+
+#### Die zweikartige Lane braucht keinen Kommunikator
+
+11.10 und 11.11 haben den zweikartigen Lauf als „braucht ECHTE
+Lane-Kollektive" gebucht. Das ist bei genauem Hinsehen nicht der Fall, und der
+Grund steht in §4: die Lane hat ihre Kollektive bereits durch LOKALE
+Tensoroperationen ersetzt. Ein all-gather ist ein `cat`, ein all-reduce ein
+`add`. Liegt einer der Summanden auf einer anderen Karte, wird daraus kein
+Kollektiv, sondern eine Kopie — und zwar die des AKTIVIERUNGSVEKTORS, nicht
+die des Gewichts.
+
+Also: `--dual-group-lane-part-gpu-id <phys>,<phys>` (eine physische GPU-Id je
+LANE-Rang, gleicher Id-Raum wie `--rank-gpu-id`). Ohne die Flag bleibt alles
+auf der Host-Karte und der Bau ist Byte fuer Byte der bisherige. Mit ihr:
+
+1. **Sichtbarkeit.** Mit `--rank-gpu-id` sieht jeder Scheduler-Prozess genau
+   eine Karte (CUDA_VISIBLE_DEVICES-Isolation). Die Host-Karte bleibt die
+   erste — `cuda:0` heisst weiterhin ueberall „die eigene Karte" —, die
+   fremden werden angehaengt. Das passiert VOR dem Prozessstart; nachtraeglich
+   ist es nicht nachruestbar, weshalb die Flag im `ServerArgs`-Check und nicht
+   erst im Lane-Bau geprueft wird.
+2. **Ein Ort fuer die Regel.** `lane_visible_physical_gpus` (Elternprozess,
+   baut die Liste) und `lane_part_device_indices` (Lane, uebersetzt physisch
+   -> prozessintern) stehen nebeneinander in `distributed/dual_group.py`,
+   damit die Reihenfolge zwischen beiden Seiten nicht auseinanderlaufen kann.
+3. **Die Schalen springen.** Column/Row/Vocab/LmHead schicken die Aktivierung
+   auf die Karte ihres Teils und holen das Ergebnis auf die Karte des
+   EINGANGS zurueck. Kein Teil davon ist neuer Code im Rechenweg: `_on(x,
+   dev)` ist ein No-Op, wenn das Teil auf der eigenen Karte liegt, also ist
+   der einkartige Pfad unveraendert.
+4. **Der Preis, benannt.** Auf der fremden Karte liegt der Shard VOLL —
+   der residente dort drueben gehoert einem anderen Prozess und ist nicht
+   aliasierbar. Das Postenblock im Boot-Log fuehrt ihn als eigene Zeile
+   (`lane part shard on foreign card cuda:N`, Status DUPLICATED). Wer die
+   zweikartige Lane fahren will, muss das Budget dieser Karte entsprechend
+   klein setzen; das Werkzeug rechnet es nicht heimlich weg.
+5. **Graphen aus.** Ein CUDA-Graph wird auf EINEM Stream EINER Karte
+   aufgezeichnet; die Karten-Hops der Schalen sind darin nicht aufzeichenbar.
+   Eine kartenuebergreifende Lane erzwingt daher `--dual-group-lane-eager` und
+   sagt es im Log. Das ist der Kapazitaets-gegen-Tempo-Tausch dieses Arms und
+   keine Uebergangsloesung, solange die Hops im Graphen nicht stehen koennen.
+
+Der Expertenpfad macht diesen Sprung NICHT mit: `LaneFusedMoEShell` lehnt
+Teile auf verschiedenen Karten laut ab. Eine lineare Schale schickt einen
+Tensor; ein Expertenteil konsumiert zusaetzlich die Routing-Entscheidung (und
+auf manchen Pfaden einen Dispatcher). Das ist ein eigener Bau, und ein halb
+gebauter waere hier ein stiller.
+
+#### Die Korrektur an 11.18: „quantisiert heisst lazy" gilt nur fuer GGUF
+
+`hull_needs_real_storage` hat bisher nach der FAMILIE gefragt — Linear
+Attention ja/nein — mit der Begruendung, eine quantisierte Familie lege ihre
+grossen Gewichte lazy an, also koste eine echte Huelle nur ein paar MiB. Das
+stimmt fuer GGUF (`GGUFUninitializedParameter`, null Bytes) und fuer sonst
+nichts. `fp8.py create_weights` legt mit `torch.empty` an, genau wie
+`unquant.py`.
+
+Damit lag das FP8-27B-Vehikel in der Schnittmenge, die die Slice-A-Regel
+falsch beantwortet: Linear Attention UND eager allokierte Gewichte, also eine
+echte Huelle des GANZEN Modells (28,77 GiB) zusaetzlich zu Shard und Teilen.
+Die 11.19-Rechnung („28,75 gegen 31,34 GiB") war also noch zu freundlich —
+das Vehikel war nicht knapp, es war um eine ganze Modellkopie daneben.
+
+Die Regel fragt jetzt nach beidem: echte Huelle nur, wenn die Familie sie
+braucht UND die Gewichte lazy sind. Alle anderen bauen auf meta, und die zwei
+Tensorklassen, die per WERT zusammengesetzt werden statt geschalt (der
+GDN-Conv-Kern und die Per-Kopf-Vektoren `dt_bias`/`A_log`), bekommen ihren
+Speicher dort, wo sie gefuellt werden — Kilobytes statt Modellgroesse.
+
+#### Zwei Ablehnungen, die der MoE-Arm mitbringt
+
+Beide stammen aus der Vor-Bau-Sichtung und sind gebaut, bevor ein Vehikel sie
+ausloesen konnte:
+
+* **Expertenparallelismus.** `lane_geometry_override` hat `moe_ep_size` /
+  `moe_ep_rank` nie ueberschrieben, `FusedMoE.__init__` liest sie aber direkt
+  aus dem ParallelContext. Unter EP haette ein frisch geladenes Lane-Teil
+  denselben lokalen Expertenbereich beansprucht wie das residente (statt des
+  komplementaeren), und `create_moe_dispatcher` haette ihm einen Dispatcher
+  auf der PRODUKTIONS-All-to-all-Gruppe gebaut — eine Wire-Operation mitten
+  in einer Lane, die per Konstruktion keinen Kommunikator hat. Jetzt: der
+  Override zieht `moe_ep` mit, und `_assert_lane_moe_is_pure_tp` lehnt einen
+  EP-Verband beim Bau laut ab. Die Lane-Algebra IST die moe-TP-Zerlegung
+  (jedes Teil ein Partialsummand derselben vollbreiten Ausgabe); EP ist eine
+  andere Zerlegung und hat keinen lokalen Ersatz.
+* **Expert-Offload (#77).** Jedes materialisierte Lane-Teil wuerde beim ersten
+  `forward_local` seinen EIGENEN gepinnten Host-Cache installieren, neben dem
+  des Verbands — Hostspeicher, den niemand budgetiert hat. Abgelehnt und
+  benannt, bis sich die Lane-Teile am residenten Offloader registrieren statt
+  einen zweiten aufzumachen. Die Quant-Deny-Listen aus #268/#323 sind davon
+  unberuehrt: sie greifen ueber den Klassennamen der Quant-Methode und kennen
+  die Lane nicht, was hier richtig ist.
+
+#### Was das Vor-Boot-Praedikat vorher nicht geprueft hat
+
+`scripts/dual_group/lane_plan_probe.py` hat eine ECHTE Teilmenge der
+Boot-Proben gerechnet: `moe_intermediate_size`, `weight_block_size` und
+`quant_method` fehlten, obwohl `derive_lane_plan` sie seit 11.19 durchreicht.
+Eine gruene Vorhersage aus einer Teilmenge ist genau die Sorte Aussage, gegen
+die 11.19 den Blockachsen-Kontrakt gebaut hat. Behoben; ausserdem sucht
+`--search` jetzt in der Laenge, die `--base` vorgibt, statt fest in 3.
+
+#### Stand am Ende der Runde (Belege: INTEGRATION_R3_VALIDATION.md)
+
+| Arm | gebaut | bootbar | kohaerent |
+|---|---|---|---|
+| Experten (MoE, einkartig) | ja | ja | **byte-identisch** (2 geurteilte Prompts, 40 Schalen, 1056 Identitaeten) |
+| Zweikarten (dense) | ja | ja (195 Identitaeten, 0 MiB auf der Lane-Karte) | VOID — der VERBAND reproduziert sich auf dem Vehikel nicht, die Lane schon |
+| FP8 zweikartig | ja | ja bis zum Byte-Tor (1104 Identitaeten, Huelle auf meta) | nein — illegal memory access im ersten Verbands-Forward, offen |
+
+Die Feature-x-Lane-x-FAMILIE-Tabelle in §11.12 ist damit in der MoE-Spalte
+nicht mehr „s. 11.20": Komplement-Loader, Huellbaum, Schalen, Pools und
+Graphen sind fuer eine moe-TP-gesharde MoE-Familie GEMESSEN. Was dort offen
+bleibt, ist MoE-GGUF (unveraendert LUECKE) und der NEXTN-Kopf mit Experten.
+
 ## 12. Slice D Runde 1 (feat/dual-group-slice-d1, Basis 2d48ea0608)
 
 Slice D ist die Intelligenz-Schicht: WO laufen welche Lasten, und ab wann

@@ -664,7 +664,32 @@ class Engine(EngineScoreMixin, EngineBase):
                         server_args, tp_rank
                     )
 
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    # The dual-group lane host (serving rank 0) is the one
+                    # process that may need a second card visible: a lane
+                    # whose parts span two cards addresses the foreign one
+                    # from here, and CUDA_VISIBLE_DEVICES cannot be widened
+                    # after the process exists (#274 families slice).
+                    lane_extra_gpus = None
+                    if (
+                        tp_rank == 0
+                        and pp_rank == 0
+                        and getattr(server_args, "dual_group_lane", False)
+                        and server_args.dual_group_lane_part_gpu_id
+                    ):
+                        lane_extra_gpus = [
+                            g
+                            for g in server_args.dual_group_lane_part_gpu_id
+                            if g != gpu_id
+                        ]
+                        if lane_extra_gpus:
+                            logger.info(
+                                "dual-group lane spans cards: rank 0 also "
+                                "sees physical GPU(s) %s for its lane "
+                                "part(s).",
+                                lane_extra_gpus,
+                            )
+
+                    with maybe_reindex_device_id(gpu_id, lane_extra_gpus) as gpu_id:
                         proc = mp.Process(
                             target=run_scheduler_process_func,
                             args=(
