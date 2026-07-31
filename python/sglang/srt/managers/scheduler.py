@@ -379,6 +379,9 @@ class Scheduler(
         self.dual_group_lanes = []
         self.lane_share_meter = None
         self._lane_share_next_t = 0.0
+        # Pairing objective (#274 slice D): None on every default path; the
+        # serving grain publish in run_batch gates on it with one check.
+        self.lane_pairing_signal = None
         self._kv_arrival_ct = 0
         self.init_soft_watchdog(server_args)
 
@@ -648,6 +651,71 @@ class Scheduler(
             )
 
             self.dual_group_lanes = build_dual_group_lanes(self)
+
+            # Pairing objective of the two-class scheduler (#274 slice D).
+            # Built whenever concurrent lanes exist so the runtime A/B toggle
+            # (set_internal_state) has an object to flip; ACTIVE only when
+            # --dual-group-lane-pairing is set. Inactive, the lane's job pick
+            # stays the FIFO pop(0) -- pick() returns 0 unconditionally --
+            # and the only cost on the serving path is one None-check per
+            # run_batch.
+            if self.dual_group_lanes and any(
+                lane.concurrent for lane in self.dual_group_lanes
+            ):
+                from sglang.srt.model_executor.lane_pairing import (
+                    PairingPolicy,
+                    ServingGrainSignal,
+                )
+
+                sa = self.server_args
+                self.lane_pairing_signal = ServingGrainSignal(
+                    stale_ms=float(
+                        getattr(sa, "dual_group_lane_pairing_stale_ms", 100.0)
+                    ),
+                    ms_per_row=float(
+                        getattr(
+                            sa,
+                            "dual_group_lane_pairing_prefill_ms_per_row",
+                            1.0,
+                        )
+                    ),
+                )
+                # Rows per sequence of a non-extend serving forward: a
+                # target-verify runs num_draft_tokens rows per sequence, a
+                # plain decode runs 1. Folded in here once so the launch-path
+                # publish stays integer arithmetic.
+                self._lane_pairing_rows_per_seq = (
+                    int(getattr(sa, "speculative_num_draft_tokens", None) or 1)
+                    if sa.speculative_algorithm is not None
+                    else 1
+                )
+                self._lane_pairing_sat_rows = int(
+                    getattr(sa, "dual_group_lane_pairing_sat_rows", 64)
+                )
+                for lane in self.dual_group_lanes:
+                    if lane.concurrent:
+                        lane.pairing_policy = PairingPolicy(
+                            sat_rows=self._lane_pairing_sat_rows,
+                            decode_step_rows=int(
+                                getattr(
+                                    sa,
+                                    "dual_group_lane_pairing_decode_step_rows",
+                                    12,
+                                )
+                            ),
+                            max_defer_ms=float(
+                                getattr(
+                                    sa,
+                                    "dual_group_lane_pairing_max_defer_ms",
+                                    500.0,
+                                )
+                            ),
+                            spec_steps=lane.spec_steps,
+                            enabled=bool(
+                                getattr(sa, "dual_group_lane_pairing", False)
+                            ),
+                            signal=self.lane_pairing_signal,
+                        )
 
             # Online card-equivalent estimator (#274 slice D, S1). Built only
             # where lanes exist, so the default path never allocates it and
@@ -3936,6 +4004,30 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
+        # Pairing objective (#274 slice D): publish this batch's grain shape
+        # for the lane's pairing policy. Read-only for the policy, one tuple
+        # store here; None on every default path. Publishing must not alter
+        # the batch or its timing beyond this constant cost -- the policy's
+        # regression gate is that scheduling with the policy off is
+        # byte-identical.
+        if self.lane_pairing_signal is not None:
+            from sglang.srt.model_executor.lane_pairing import serving_batch_grain
+
+            # is_plain_prefill: EXTEND/MIXED, the scheduler-level prefill
+            # batches whose extend_num_tokens is the row count. Everything
+            # else at this level is decode-shaped and gets bs * rows_per_seq
+            # (the spec worker's verify runs num_draft_tokens rows per
+            # sequence below this grain).
+            self.lane_pairing_signal.publish(
+                serving_batch_grain(
+                    batch.forward_mode.is_plain_prefill(),
+                    batch.extend_num_tokens,
+                    batch.batch_size(),
+                    self._lane_pairing_rows_per_seq,
+                    self._lane_pairing_sat_rows,
+                )
+            )
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -4876,6 +4968,12 @@ class Scheduler(
                 # "repeat": K}). A command, not a server arg; ranks without
                 # the addressed lane treat it as a no-op success.
                 "dual_group_lane_prefill",
+                # Pairing objective (#274 slice D): flip the lane's pairing
+                # policy at runtime, so a policy-on and a policy-off arm come
+                # from ONE boot (same floors, same captures) instead of
+                # carrying boot-to-boot variance. A command on the lane-local
+                # policy object; ranks without lanes no-op successfully.
+                "dual_group_lane_pairing",
                 # #287: move THIS group's floating admission limit. A command
                 # on the lane-local limiter, not a server arg -- the ceiling
                 # the pools were built for stays where it is.
@@ -4965,6 +5063,23 @@ class Scheduler(
             # arg. Only the rank carrying the addressed lane enqueues; every
             # other rank no-ops successfully (the control message is
             # broadcast to all TP schedulers).
+            # Pairing objective (#274 slice D): runtime A/B flip of the
+            # pairing policy. Popped before the generic override so it never
+            # lands in get_server_args() as a fake server arg.
+            if "dual_group_lane_pairing" in remaining:
+                pairing_on = bool(remaining.pop("dual_group_lane_pairing"))
+                flipped = 0
+                for lane in self.dual_group_lanes:
+                    if lane.pairing_policy is not None:
+                        lane.pairing_policy.enabled = pairing_on
+                        flipped += 1
+                if flipped:
+                    logger.info(
+                        "dual-group lane pairing policy set to %s on %d "
+                        "lane(s).",
+                        pairing_on,
+                        flipped,
+                    )
             lane_job = remaining.pop("dual_group_lane_prefill", None)
             if lane_job:
                 lane_id = int(lane_job.get("lane_id", 0))

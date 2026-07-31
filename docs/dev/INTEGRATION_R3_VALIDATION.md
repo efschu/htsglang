@@ -17071,3 +17071,168 @@ Kopf), `readout.py`, `punkte.jsonl`, `decode_punkte.jsonl`,
    Referenz, um die Richtung der Abweichung zu klären.
 5. **FP8-Zweikarten: Kandidat (a)** — Ko-Belegung der fremden Karte durch zwei
    Prozesse.
+
+## #274 Slice D: Paarungs-Zielfunktion — Bau, zwei Karten-Funde, A/B + #328-1 (Kartenfenster 2026-07-31, 08:46-09:18 UTC)
+
+Auftrag: die Paarungs-Zielfunktion des Zwei-Klassen-Schedulers — SM-saettigende
+und nicht-saettigende Arbeit richtig paaren. CPU-first, ein Kartenfenster,
+huckepack #328 Posten 1 (r8-E-Werte mit korrigiertem Fenster neu). Design in
+DESIGN_121 §14, Basis cc522801e2, Branch feat/dual-group-slice-d.
+
+### Was gebaut wurde
+
+- **Klassifikation** (`lane_pairing.py`): ein Korn ist EIN Forward, die
+  Saettigungsgroesse seine GEMM-Zeilenzahl R gegen eine kalibrierbare
+  Schwelle (`--dual-group-lane-pairing-sat-rows`, Default 64; Roofline-
+  Herleitung ~117 bf16 / ~26 Q3_K auf 5090-Klasse — die Anker 2048er-Chunk
+  und 16-Zeilen-Spec-Decode liegen je eine Groessenordnung entfernt).
+  Occupancy aus dem ShareMeter ist BEWUSST kein automatischer Input: occ ist
+  Duty, nicht SM-Breite (#284: occ 0,975 fuer eine bs=1-Lane, die mit E 1,44
+  exzellent paart), und der Meter richtet die Policy im A/B — eine Policy,
+  die auf ihren Richter konditioniert, selbstkonditioniert die Messung
+  (dasselbe Prinzip, das das LaneShareGate report-only haelt).
+- **Policy**: arbeitserhaltende UMORDNUNG der Lane-Job-Queue am Job-Pick.
+  Verband saettigend -> erster nicht-saettigender Job (Starvation-Deckel
+  500 ms); sonst FIFO; alles saettigend -> FIFO, NIE serialisieren (C3:
+  saet+saet nebenlaeufig E 1,130 schlaegt seriell 0,974). Signal = ein
+  Tupel-Store je run_batch; Policy aus = byte-identisches FIFO (gepinnt).
+  Laufzeit-A/B via set_internal_state, beide Arme aus EINEM Boot.
+- **Kollektiv-Relevanz: NEIN, mit Beleg.** Lanes existieren nur auf dem
+  Shared-Rank (build_dual_group_lanes liefert sonst []), tragen keinen
+  Kommunikator, und die Policy liest die Verbands-Batch-Komposition nur.
+  Kein #287-Konsens noetig; die einzige rangsichtbare Wirkung bleibt der
+  unveraenderte, gedeckelte Admission-Yield.
+- **GIL-Haelfte**: Entscheidungen nur an Job-Grenzen (~einmal je 50-130
+  Forwards), null zusaetzliches Python zwischen zwei Lane-Forwards
+  (#284-Warnung vor feinerer Koernung beachtet; der eigentliche Traeger —
+  Python IN _decode_step — bleibt der offene py-spy-Posten).
+- 28 CPU-Tests in zwei Suiten (Label-Tabelle, jede Pick-Regel, disabled ==
+  FIFO auf 200 Zufallsqueues, Flip-Roundtrip, Treiber: Identitaet der
+  Zerlegung, Lese-vor-Stopp-Reihenfolge, verschraenkte Flip-Sequenz);
+  angrenzende Lane-Suiten 249 gruen; ruff/black/codespell sauber.
+
+### Boot 1: die Policy war aktiv und tat NICHTS — Karten-Fund 1 (Signal)
+
+4 Arme verschraenkt (off/on/off/off... korrekt: off,on,off,on) auf gemischter
+Lane-Queue (Tiefe 4, alternierend 1600-Token-Prefill-Jobs und 71-Token/128-
+Decode-Jobs) gegen Langprompt-Serving (4x ~1600 Token + 32 neue):
+
+| Arm | E | share_serving | share_lane_total | occ_r | cost_r | reordered |
+|---|---|---|---|---|---|---|
+| off_1 | 1,2727 | 0,818 | 0,4547 | 0,785 | 1,727 | 0 |
+| on_1 | 1,2633 | 0,8108 | 0,4525 | 0,816 | 1,803 | **0** |
+| off_2 | 1,2710 | 0,8173 | 0,4537 | 0,814 | 1,795 | 0 |
+| on_2 | 1,2512 | 0,8044 | 0,4468 | 0,804 | 1,800 | **0** |
+
+In-Boot-Boden off-vs-off 0,13 %; die on/off-Differenz liegt unter der
+1-Anfrage-Quantisierung der Serving-Seite (~1,07 tok/s) UND die Policy hat
+nachweislich nicht gehandelt: **1 von 11 Picks** sah ein saettigendes
+Verbands-Korn. Ursache (live vom Server gelesen, `serving_signal` age 1,3 s
+mit saettigendem 2048-Zeilen-Label): das Label wird beim BATCH-START
+publiziert, ein 1600-Zeilen-Prefill-Forward laeuft danach ~1,1 s, und die
+flache 100-ms-Staleness — richtig fuer Idle-Erkennung zwischen 17-35-ms-
+Decode-Iterationen — liess die Policy WAEHREND des Prefills IDLE lesen:
+das Signal alterte genau in den Koernern aus, die es melden soll. Fix
+(8bcfc94a15): ein saettigendes Prefill-Korn bleibt rows x ms_per_row aktuell
+(`--dual-group-lane-pairing-prefill-ms-per-row`, Default 1,0 gegen gemessene
+~0,7 ms/Zeile); jedes spaetere Publish ersetzt das Label ohnehin.
+
+### Boot 2 (Signal-Fix): 6/9 Picks sahen das Korn — Karten-Fund 2 (Dominanz)
+
+| Arm | E | share_serving | share_lane_total | satpicks | reordered |
+|---|---|---|---|---|---|
+| off_1 | 1,3736 | 0,8808 | 0,4928 | 0 | 0 |
+| on_1 | 1,4354 | 0,9407 | 0,4947 | **6/9** | **0** |
+| off_2 | 1,3766 | 0,8808 | 0,4958 | 0 | 0 |
+| on_2 | 1,3638 | 0,8743 | 0,4895 | **5/9** | **0** |
+
+(on_1s Serving-Ausschlag ist exakt ein 1-Anfrage-Quantum.) Der Signal-Fix
+wirkt — und jeder dieser Picks antwortete "queue all saturating: FIFO". Der
+Grund steht im last_decision-Label: der "decode-foermige" Job traegt einen
+71-Token-Prompt, 71 Zeilen >= 64, also klassifizierte sein NAECHSTES Korn
+(der ~35-ms-Prefill) den ganzen Job als saettigend — obwohl seine 128
+Decode-Schritte (Sekunden) genau die nicht-saettigende Arbeit sind, die die
+Policy sucht. Ein Job-Pick allokiert die GANZE Job-Laufzeit neben dem
+Verband, also muss das Pick-Label der DOMINANTEN Phase folgen. Fix
+(73d457dc97): saettigend nur, wenn zusaetzlich prefill_rows >=
+max_new_tokens x decode_step_rows (`--dual-group-lane-pairing-decode-step-
+rows`, Default 12 aus ~17 ms/Decode-Schritt gegen ~1,5 ms/Prefill-Zeile).
+Boden-Reproduktion nebenbei: lane_mixed solo 601,515 (Boot 2) gegen 601,505
+(Boot 3) — 0,002 %.
+
+### Boot 3 (beide Fixe): die Policy GREIFT; der E-Effekt braucht mehr Fenster
+
+| Arm | E | share_serving | share_lane_total | occ_r | picks | satpicks | reordered | starv |
+|---|---|---|---|---|---|---|---|---|
+| off_1 | 1,1917 | 0,6144 | 0,5773 | 0,761 | 0 | 0 | 0 | 0 |
+| on_1 | **1,4411** | 0,853 | 0,5881 | **0,864** | 10 | 4 | **3** | 1 |
+
+Das Engagement ist der belastbare Beleg dieser Runde: 3 Umordnungen + 1
+Starvation-Override in 10 Picks, Occupancy-Ratio 0,761 -> 0,864, BEIDE
+Seiten-Raten im on-Fenster hoeher (Serving 11,5 -> 16,0 tok/s bei 11 vs 15
+fertigen Anfragen, Lane 347,3 -> 353,8 tok/s). Der E-Sprung +20,9 %
+in-boot wird NICHT als Effekt berichtet: n=1 Fenster je Arm, und die
+Spannweite aller off/inerten Fenster ueber die drei Boots ist E 1,19-1,44 —
+der Effekt ist von der Fenstervarianz mit einem Fenster nicht trennbar
+(off_1 dieses Boots ist das serving-schwaechste Fenster der ganzen Reihe).
+Mehr Fenster je Arm sind der erste Posten des naechsten Kartenfensters;
+die Instrumentierung dafuer (Policy-Zaehler je Fenster differenziert,
+Komposition-Drift-Waechter 0,6-1,2 %) ist gebaut und gelaufen.
+
+### #328 Posten 1: r8-E-Werte mit korrigiertem Fenster — und ein Befund
+
+Gleiche Lastformen wie r8 Posten 4 (4x 128-Token-Serving, decode-foermige
+Lane Tiefe 2, Kette an/aus je Job), korrigierter Fenster-Leser (Zaehler VOR
+dem Stoppen), 45-s-Fenster, Policy aus:
+
+| Groesse | r8 (4403a98312) | JETZT (cc522801e2) | Abstand |
+|---|---|---|---|
+| Lane-Solo no-chain (nur Decode-Tokens) | 57,155 tok/s | **56,189** | 1,7 % |
+| Lane-Solo mit Kette | 52,822 | **52,766** | **0,1 %** |
+| Serving solo c4 | 54,044 | 48,269 | 2 Anfragen Quantisierung |
+| Lane geteilt no-chain | 11,000 (Schwanz-inflationiert) | **28,04** | 2,5x |
+| Lane geteilt mit Kette | 15,733 (dito) | **31,33** | 2,0x |
+| share_lane (Decode-Def.) | 0,193 / 0,298 | **0,499 / 0,593** | — |
+| E (r8-Definition) | 1,035 / 1,140 | **1,441 / 1,534** | — |
+
+Die Zerlegung benennt, was passiert ist: occ_r **1,002 / 1,038** (r8/#284:
+0,39) bei cost_r 2,009 / 1,710 und identity_error <= 4e-5. **Die
+GIL-gebundene Submissions-Luecke — in #284 die HAELFTE des Lane-Verlusts —
+ist auf diesem HEAD verschwunden**; der verbleibende Verlust ist reine
+SM-Konkurrenz (Traeger sm_competition in allen Armen). Das korrigierte
+Fenster erklaert den Sprung NICHT (der Schwanz hat r8s geteilte Raten
+UEBER-schaetzt, die wahren r8-Werte lagen noch tiefer): zwischen
+4403a98312 und cc522801e2 liegen die Merges #287/#320/#324/families-2, und
+die Solo-Boeden reproduzieren auf 0,1-1,7 % — es ist ein echter
+Laufzeit-Gewinn der geteilten Fenster, dessen tragender Merge ungemessen
+ist (eigener Posten). Der Ketten-Gewinn unter Nebenlaeufigkeit
+reproduziert in der Richtung: +6,5 % Aggregat (r8: +10,2 %).
+
+### Auslastung, Kartenzeit, Disziplin
+
+| Boot | Fenster (UTC) | Dauer | 5090 MIN frei | Korridor |
+|---|---|---|---|---|
+| 1 (A/B inert + r8redo) | 08:46:22-08:58:53 | 12:31 | 2716 MiB | ok |
+| 2 (Signal-Fix) | 08:59:20-09:07:34 | 8:14 | 2730 MiB | ok |
+| 3 (beide Fixe) | 09:10:23-09:17:35 | 7:12 | 2730 MiB | ok |
+
+Zusammen **27:57 gegen den 30-min-Deckel**; alle drei ueber gpu-arb belegt
+und freigegeben, Kartenreihenfolge je Boot zur Laufzeit aufgeloest
+(cuda:0 = 5090 = NVML 1), keine fremde Session (das 332-fam-Fenster schloss
+08:31). Rohdaten unter `/spinning/gpu-battery-results/
+2026-07-31_274_slice_d_pairing/{boot1,boot2,boot3}/` (report.json,
+report.txt, contract_lines.txt, cards.txt, vram.csv, vram_summary.txt,
+server_info.json). duty-Defekt-Waechter in keinem Fenster gefeuert.
+
+### Offen
+
+- **Der E-Effekt der greifenden Policy** braucht mehrere Fenster je Arm
+  (verschraenkt, ein Boot) — das Engagement ist belegt, die Wirkung auf E
+  ist es mit n=1 nicht.
+- **Welcher Merge die Submissions-Luecke geschlossen hat** (occ_r 0,39 ->
+  1,00 zwischen r8 und diesem HEAD) ist ein eigener, bisect-foermiger
+  Posten — er beruehrt #284s Verdikt, dass die GIL-Haelfte einen eigenen
+  Hebel braucht: auf diesem Stand braucht sie offenbar keinen mehr.
+- **Kalibrier-Evidenz**: die Fenster tragen jetzt Labels neben occ/cost-
+  Ratios; eine Schwellen-Kalibrierung aus diesen Daten (statt der
+  Roofline-Defaults) steht aus.

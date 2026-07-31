@@ -1704,6 +1704,10 @@ class DualGroupLane:
         self._busy = False
         self._admission_waits: List[float] = []
         self.lending = None  # set by the scheduler when stage-2 lending is on
+        # Pairing objective of the two-class scheduler (#274 slice D): set by
+        # the scheduler when --dual-group-lane-pairing is on. None keeps the
+        # job pick byte-identical to the FIFO pop(0) below.
+        self.pairing_policy = None
         self.results_total = 0
         self.prefill_tokens_total = 0
         self.decode_steps_total = 0
@@ -2005,6 +2009,8 @@ class DualGroupLane:
                 }
             ),
         }
+        if self.pairing_policy is not None:
+            stats["pairing"] = self.pairing_policy.snapshot()
         if self._admission_waits:
             waits = self._admission_waits[-64:]
             stats["admission_wait_ms"] = {
@@ -2119,7 +2125,16 @@ class DualGroupLane:
         (entered once for the thread) -- do NOT re-enter it per step."""
         with self._lock:
             if self.active is None:
-                self.active = self.jobs.pop(0)
+                # Pairing objective (#274 slice D): a work-conserving reorder
+                # of THIS queue is the policy's whole actuation surface. With
+                # the policy off or absent this is the FIFO pop(0) it always
+                # was, byte for byte. The pick runs once per JOB (not per
+                # forward), so it adds nothing to the Python between two lane
+                # forwards -- the submission-gap half of #284's loss.
+                idx = 0
+                if self.pairing_policy is not None and len(self.jobs) > 1:
+                    idx = self.pairing_policy.pick(self.jobs)
+                self.active = self.jobs.pop(idx)
             job = self.active
         self._submitted.clear()
         with torch.no_grad():
