@@ -216,11 +216,8 @@ Stated honestly, extending the design's own list:
 *   ~~**Single card for the executor.**~~ Closed by #339: `multicard.py` runs
     the planner's chunks concurrently, one process per card, and stitches
     them in timeline order. See §9.
-*   **No live watch and no client-liveness handling.** Section 8 below is a
-    user directive and is *not built*. The preview taps and the
-    configurable dead-client timeout are open; a video job today is torn
-    down when the response generator's `finally` runs, which covers a clean
-    disconnect and does not cover a client that simply stops reading.
+*   **No live watch.** The preview taps of §8.1 are not built. Client
+    liveness (§8.2) is — see §11.
 *   **No Regime B.** No stage split across cards. P2 is measured so the
     decision has data behind it before any Regime-B code exists.
 *   **No int8 compute.** Deferred by §8.7 and by the standing rule that lossy
@@ -549,3 +546,67 @@ a better reason to reopen the post than the one that closed it.
 job model with `PipelineManager`, `GpuResourceManager` and
 `BackgroundJobService` over this chain. It is prior art for the M2 job API
 and for the §8 liveness work rather than for anything in this task.
+
+---
+
+## 11. Client liveness (§8.2), built in #339
+
+`liveness.py`, wired into `server.py`'s streaming path. The preview taps of
+§8.1 are still open; this is the other half of the directive.
+
+**What it is for.** A client that closes the connection was already handled:
+Starlette throws into the response generator and its `finally` tears the job
+down. The case that was not handled is the client that neither closes nor
+reads. The socket stays open, the TCP window stays full, the sink coroutine
+never returns, and back-pressure — working exactly as designed — stalls the
+chain and holds a decoder, an encoder, the engines and the reservation for a
+viewer who left. From the server's side that is indistinguishable from a
+very slow viewer, and the only thing separating them is how long. So the
+duration is the policy and it is configured, not constant.
+
+**Progress means bytes the transport accepted**, not bytes the chain
+produced. A stalled client makes the chain stop producing, so "the pipeline
+is idle" is a consequence of the stall and cannot be its evidence. The
+watchdog is stamped after the `yield` returns, which is the one moment in
+the process that proves the peer is still there.
+
+**Per endpoint class**, because the right number differs by an order of
+magnitude: a paused player is normal and reclaiming its job would be worse
+than holding it, while a preview tap that has accepted nothing for ten
+seconds has no viewer. Defaults: `video_stream` 300 s, `preview_tap` 15 s,
+`control` 60 s. `LivenessConfig.parse("video_stream=120,preview_tap=5")` is
+the server-argument form, a non-positive value disables detection for that
+class (a batch export nobody watches by design is a real case), and
+`GET /v1/video/liveness` reports the resolved policy.
+
+Two things the implementation had to get right that are easy to miss, both
+found by the end-to-end test rather than by reading:
+
+*   **A suspended generator never reaches its own `finally`.** The stage
+    teardown that runs there on a normal or a cancelled stream does not run
+    for a client that simply stopped calling `__anext__`, so the release
+    path closes the stages itself. Without that the decoder and encoder
+    sessions survive the job.
+*   **`executor.cancel()` does not unblock a stalled pipeline.** A stage
+    blocked in `ring.put` on a full ring only sees the cancel flag after that
+    await returns, and on a stalled pipeline nothing is draining, so it never
+    does. The release closes the rings, which is what wakes every blocked
+    producer — the same thing `DELETE /v1/video/enhance/{id}` already did,
+    now done in both places.
+
+Teardown is itself bounded (`teardown_timeout_s`, default 30 s) and escalates
+to a cancel: a release that will not finish must not leave the reservation
+held by a job nobody is watching.
+
+**What is not built.** During the grace window the job's resources stay
+where they are. The directive asks for them to join the normal reclamation
+ladder (idle tenant #341, pressure staircase #287, spill) rather than being
+idly pinned, and that ladder is not wired to this tenant. Registered as a
+follow-on.
+
+Demonstrated in `test/registered/video_enhance/test_liveness.py`: a consumer
+takes one chunk and then stops — no close, no further read — and within the
+configured timeout the executor is cancelled, every stage is closed, and the
+decoder, which was willing to produce 100000 frames, is stopped within one
+ring's worth of the frame it had reached. The control case, a consumer that
+keeps reading, runs to completion with `declared_dead` false.
