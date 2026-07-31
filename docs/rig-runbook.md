@@ -3104,3 +3104,151 @@ Grace never shortens a lease. A tenant in grace is still running and still
 holds its device memory; expiring its lease early would let the reaper hand
 the same bytes to a second tenant while they are in use. The flag is advisory
 and the reclamation decision stays with the ladder that owns the policy.
+
+## 12. The idle workbench: a queue of useful idle work (#347-M1)
+
+Training (§10) was the first thing the rig did with an idle window. It is not
+the only useful one. The workbench generalizes that machinery into one
+scheduler over a **priority-ordered queue of tenants**, every entry preempted
+by serving demand inside the grace window:
+
+| Priority | Tenant | One work item | How it stops | Where results go |
+|---|---|---|---|---|
+| 10 | `training` | one training attempt | the #341 checkpoint-and-release path; the job stays `running` with `tenant_state: preempted` | the job's `output_dir` |
+| 50 | `fp8_tuner` | one block-quantized GEMM combination `(N, K, M)` | SIGTERM to the tuning subprocess; the combination stays queued and nothing partial is written | `<artifact-root>/fp8_tuner/configs/` |
+| 70 | `card_probe` | one short probe over every card | SIGTERM to the probe subprocess; the planner's factor tiles stay absent | `~/.cache/sglang/card_probe-<digest>.json` |
+
+A user's submitted job outranks work the rig invented for itself, and a
+measurement that only refreshes a dashboard tile outranks nothing. Exactly one
+tenant runs at a time: two opportunistic tenants sharing a card would tune and
+measure each other.
+
+**Turning it on.**
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-AWQ-BF16-INT4 \
+  ... \
+  --enable-training-tenant \
+  --enable-idle-workbench \
+  --workbench-artifact-root /spinning/workbench \
+  --workbench-idle-grace-seconds 120 \
+  --workbench-arb-dir /spinning/gpu-arb \
+  --workbench-tuner-queue /spinning/workbench/tuner-queue.txt
+```
+
+With `--enable-idle-workbench`, `--enable-training-tenant` decides whether
+fine-tuning jobs are *accepted* and the workbench decides when they *run*: the
+training service comes up surface-only and the workbench owns its loop. Two
+schedulers deciding when training runs would be one too many.
+
+| Flag | Default | What it decides |
+|---|---|---|
+| `--enable-idle-workbench` | off | whether queued idle work runs. `GET /x-htsglang/workbench` answers either way, with `enabled: false` — never a 404 |
+| `--workbench-artifact-root` | `$HTSGLANG_WORKBENCH_ROOT`, else `$XDG_CACHE_HOME/htsglang/workbench` | where segment output lands. Nothing is written into the source tree |
+| `--workbench-tenants` | all three | which tenants to register. An unknown name is a startup error |
+| `--workbench-idle-grace-seconds` | 120 | quiet time before idle work may start. Separate from the training flag so a submitted job can start sooner than self-maintenance |
+| `--workbench-poll-seconds` | 2.0 | worst-case delay between a request arriving and preemption starting |
+| `--workbench-preempt-timeout-s` | 60 | how long a segment may take to stop before it is killed |
+| `--workbench-segment-timeout-s` | 1800 | hard bound on one segment |
+| `--workbench-arb-dir` | `$HTSGLANG_GPU_ARB_DIR`, else off | the cross-session arbitration directory (§7.1). Off is right when nothing else competes for the cards |
+| `--workbench-arb-heartbeat-s` | 300 | how often the `holder` file is touched. Well inside the protocol's 20-minute staleness window, because an idle-work window can be much longer |
+| `--workbench-tuner-queue` | none | file of GEMM shapes for the tuner |
+| `--workbench-tuner-card` | `largest` | which card the tuner uses: `largest`, an NVML index, or a name fragment. Resolved through NVML on every decision |
+| `--workbench-probe-max-age-s` | 604800 (7 d) | how stale the cached card probe may get before it is re-measured |
+
+### 12.1 Reading the queue
+
+```bash
+curl -s localhost:30000/x-htsglang/workbench | python3 -m json.tool
+```
+
+```
+enabled           true
+paused            false
+running           fp8_tuner            # or null
+idle              {"idle": true, "idle_for_s": 340.0, "reason": "..."}
+tenants[]         name, priority, pending, paused, available, blocked_reason,
+                  segments_run / _preempted / _failed, last_outcome
+arb               root, holder, free_until, claim
+```
+
+`blocked_reason` is the one to read when nothing is happening. It carries the
+arithmetic of whatever refused: a shortfall in MiB with the card named, a
+cross-session window held by the other session, an unavailable tenant with the
+missing piece named.
+
+The event log is cursor-paginated by sequence number:
+
+```bash
+curl -s 'localhost:30000/x-htsglang/workbench/events?after=0&limit=200'
+```
+
+Pause the whole bench, or one tenant, and add work:
+
+```bash
+curl -sX POST localhost:30000/x-htsglang/workbench/pause \
+     -H 'content-type: application/json' -d '{"paused": true}'
+curl -sX POST localhost:30000/x-htsglang/workbench/pause \
+     -H 'content-type: application/json' \
+     -d '{"paused": true, "tenant": "fp8_tuner"}'
+curl -sX POST localhost:30000/x-htsglang/workbench/enqueue \
+     -H 'content-type: application/json' \
+     -d '{"tenant": "fp8_tuner", "item": {"n": 7168, "k": 5120, "batch_size": 4}}'
+```
+
+Pausing the bench preempts whatever is running; pausing a tenant only stops it
+from being picked up next time, unless it is the one running.
+
+### 12.2 The tuner queue file
+
+One `<N> <K> [M,M,...]` per line, `#` comments, blank lines ignored —
+deliberately the format the shell tuner used, so an existing `queue.txt` works
+unchanged. A line without batch sizes expands to `4,2048`: one decode-shaped
+and one prefill-chunk-shaped operating point.
+
+```text
+# the three shapes #255 left queued for sm120
+7168 5120 4,2048
+5120 2688 4,2048
+5120 3072 4,2048
+```
+
+There is no built-in shape list. Which shapes matter is a fact about the
+deployed model and its TP split, so they are input.
+
+A combination whose batch size already appears in the config file for the
+running device name is skipped, which makes the queue idempotent: re-running
+after a driver change is a delete-and-requeue, not an edit. One combination
+took 35–70 s in the #255 runs.
+
+**The tuner commits nothing.** Results land in
+`<artifact-root>/fp8_tuner/configs/` with the exact filename the tuning script
+writes. Promoting one is a human step, after reading the A/B:
+
+```bash
+ls /spinning/workbench/fp8_tuner/configs/
+# N=7168,K=5120,device_name=NVIDIA_GeForce_RTX_5090,dtype=fp8_w8a8,block_shape=[128, 128].json
+cp '/spinning/workbench/fp8_tuner/configs/N=7168,...json' \
+   python/sglang/srt/layers/quantization/configs/
+```
+
+### 12.3 Cross-session cards
+
+With `--workbench-arb-dir` set, the workbench takes a window through the
+protocol in §7.1 before every segment and releases it afterwards. It:
+
+* refuses to claim while `free-until` publishes an open window for any of the
+  cards it wants — that window is a promise to the other session;
+* refuses while a live `holder` names the cards;
+* reaps a `holder` only when it is stale **and** its cards are empty, with a
+  line in `log`; a stale holder on busy cards is a working holder that forgot
+  to touch, and is left alone;
+* checks NVML before every claim regardless of what the files say, and treats
+  memory that no VRAM-ledger tenant accounts for as a foreign process. A
+  resident serving engine is accounted for and does not block a claim; an
+  unregistered process does.
+
+It never performs a destructive action and never waits: a refused claim is
+logged with the reason and retried on a later tick.
+

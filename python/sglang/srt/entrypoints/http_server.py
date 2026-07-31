@@ -374,6 +374,19 @@ def build_training_service(server_args: ServerArgs):
     return TrainingService(config, reservation_store=reservation_store)
 
 
+def build_workbench_service(server_args: ServerArgs, training_service):
+    """Assemble the #347 idle workbench from the server arguments.
+
+    Built unconditionally, like the training service and for the same reason:
+    a disabled workbench answers ``GET /x-htsglang/workbench`` with
+    ``enabled: false`` and the tenant list, which is what an operator asking
+    "why is nothing being tuned" needs. A 404 answers nothing.
+    """
+    from sglang.srt.workbench.service import build_service
+
+    return build_service(server_args, training_service=training_service)
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
@@ -451,12 +464,23 @@ async def lifespan(fast_api_app: FastAPI):
     # rather than a 404 that looks like an old server.
     training_service = build_training_service(server_args)
     fast_api_app.state.training_service = training_service
-    training_service.start()
+    # With the #347 workbench, training is one tenant in a priority order and
+    # the workbench owns its loop; the service comes up surface-only so two
+    # schedulers are never deciding when training runs.
+    workbench_enabled = bool(getattr(server_args, "enable_idle_workbench", False))
+    training_service.start(start_tenant=not workbench_enabled)
     fast_api_app.state.openai_serving_files = OpenAIServingFiles(training_service)
     fast_api_app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(
         training_service,
         liveness=liveness_config,
     )
+
+    # The idle workbench (#347): the queue of useful idle work, of which the
+    # training tenant above is entry #1. Built even when disabled so
+    # /x-htsglang/workbench reports "enabled: false" instead of a 404.
+    workbench_service = build_workbench_service(server_args, training_service)
+    fast_api_app.state.workbench_service = workbench_service
+    workbench_service.start()
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
@@ -544,6 +568,13 @@ async def lifespan(fast_api_app: FastAPI):
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
+        workbench_service = getattr(fast_api_app.state, "workbench_service", None)
+        if workbench_service is not None:
+            # Stopped before the training service, because the workbench owns
+            # the training loop when it is enabled: stopping it in the other
+            # order would restart nothing but would log a confusing pair of
+            # shutdowns.
+            await workbench_service.stop()
         training_service = getattr(fast_api_app.state, "training_service", None)
         if training_service is not None:
             # Stops the scheduler and releases any VRAM lease a training job
@@ -2112,6 +2143,70 @@ async def training_tenant_state(raw_request: Request):
     is what the frontend and an operator both need.
     """
     return ORJSONResponse(raw_request.app.state.training_service.snapshot())
+
+
+# ---------------------------------------------------------------------------
+# The idle workbench (#347). Namespaced under x-htsglang because none of it is
+# in anybody's standard protocol; the routes exist whether or not the feature
+# is enabled, and a disabled bench says so rather than 404ing.
+# ---------------------------------------------------------------------------
+
+
+def _workbench_response(fn, *args, **kwargs) -> ORJSONResponse:
+    from sglang.srt.workbench.http_api import error_payload
+    from sglang.srt.workbench.service import WorkbenchError
+
+    try:
+        return ORJSONResponse(fn(*args, **kwargs))
+    except WorkbenchError as exc:
+        status, body = error_payload(exc)
+        return ORJSONResponse(body, status_code=status)
+
+
+@app.get("/x-htsglang/workbench", response_class=ORJSONResponse)
+async def workbench_state(raw_request: Request):
+    """Queue state, tenant table, idle verdict and cross-session claim."""
+    from sglang.srt.workbench.http_api import snapshot_payload
+
+    return _workbench_response(
+        snapshot_payload, raw_request.app.state.workbench_service
+    )
+
+
+@app.get("/x-htsglang/workbench/events", response_class=ORJSONResponse)
+async def workbench_events(raw_request: Request, after: int = 0, limit: int = 200):
+    """The idle-work event log, cursor-paginated by sequence number."""
+    from sglang.srt.workbench.http_api import events_payload
+
+    return _workbench_response(
+        events_payload,
+        raw_request.app.state.workbench_service,
+        {"after": after, "limit": limit},
+    )
+
+
+@app.post("/x-htsglang/workbench/pause", dependencies=[Depends(validate_json_request)])
+async def workbench_pause(raw_request: Request):
+    """Pause or resume the whole bench, or one tenant by name."""
+    from sglang.srt.workbench.http_api import pause_payload
+
+    body = await raw_request.json()
+    return _workbench_response(
+        pause_payload, raw_request.app.state.workbench_service, body
+    )
+
+
+@app.post(
+    "/x-htsglang/workbench/enqueue", dependencies=[Depends(validate_json_request)]
+)
+async def workbench_enqueue(raw_request: Request):
+    """Add one work item to one tenant's queue."""
+    from sglang.srt.workbench.http_api import enqueue_payload
+
+    body = await raw_request.json()
+    return _workbench_response(
+        enqueue_payload, raw_request.app.state.workbench_service, body
+    )
 
 
 @app.post("/v1/audio/transcriptions")

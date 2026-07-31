@@ -162,6 +162,7 @@ def live_server(
     speech_lane_url: str = "",
     architectures: Optional[list[str]] = None,
     training_service=None,
+    workbench_service=None,
 ) -> Iterator[str]:
     """Run the real app on a real port. Yields the base URL.
 
@@ -172,7 +173,8 @@ def live_server(
     ``training_service`` is the #341 service the fine-tuning routes talk to.
     Injected for the same reason: a test describes a machine and an executor
     without a card, a ledger or an installed training suite, and everything
-    between the socket and that service stays real.
+    between the socket and that service stays real. ``workbench_service`` is
+    the #347 idle workbench, injected on the same terms.
     """
     import uvicorn
 
@@ -241,6 +243,19 @@ def live_server(
     app.state.training_service = training_service
     app.state.openai_serving_files = OpenAIServingFiles(training_service)
     app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(training_service)
+
+    if workbench_service is None:
+        from sglang.srt.workbench.scheduler import WorkbenchConfig
+        from sglang.srt.workbench.service import WorkbenchService
+
+        # Disabled by default, same reasoning as the training service above.
+        workbench_service = WorkbenchService(
+            WorkbenchConfig(
+                enabled=False,
+                artifact_root=Path(tempfile.mkdtemp(prefix="htsglang-workbench-")),
+            )
+        )
+    app.state.workbench_service = workbench_service
     # The Ollama emulation rides the same lanes; it is served by the same app
     # and therefore covered by the same harness.
     from sglang.srt.entrypoints.ollama.serving import OllamaServing  # noqa: PLC0415
@@ -254,10 +269,12 @@ def live_server(
         # The training tenant is the one piece the production lifespan starts
         # that this harness still needs, because its scheduler is an asyncio
         # task and must be created on the server's own loop, not the test's.
-        training_service.start()
+        training_service.start(start_tenant=not workbench_service.config.enabled)
+        workbench_service.start()
         try:
             yield
         finally:
+            await workbench_service.stop()
             await training_service.stop()
 
     previous_lifespan = app.router.lifespan_context

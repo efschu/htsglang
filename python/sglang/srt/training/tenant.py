@@ -302,6 +302,13 @@ class TrainingTenant:
         #: Set by tests and by the preempt demo to force a decision without
         #: waiting for the poll interval.
         self.force_preempt = asyncio.Event()
+        #: When true the loop finishes what it is doing and picks up nothing
+        #: new. Distinct from stopping: the loop stays alive and starts
+        #: accepting again when it is cleared. The #347 workbench sets it
+        #: while it ends a training segment, so a job cannot be relaunched
+        #: into the gap between "the trainer checkpointed" and "the loop was
+        #: stopped".
+        self.hold_new_work = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -323,6 +330,16 @@ class TrainingTenant:
     def wake(self) -> None:
         """Nudge the loop: a job was submitted or cancelled."""
         self._wake.set()
+
+    @property
+    def running_job_id(self) -> Optional[str]:
+        """The job currently executing, or ``None``.
+
+        A read-only view of the loop's state for callers outside this package
+        -- the #347 workbench adapter, which arbitrates when this loop runs
+        without reaching into it.
+        """
+        return self._current[0].id if self._current else None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -351,7 +368,7 @@ class TrainingTenant:
         for job in cancelled_early:
             self._finish_cancelled(job)
         pending = [j for j in pending if not j.cancel_requested]
-        if not pending:
+        if not pending or self.hold_new_work:
             await self._sleep(self.config.poll_seconds)
             return
 

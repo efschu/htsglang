@@ -5052,6 +5052,97 @@ class ServerArgs:
     ] = 120.0
 
     # -------------------------------------------------------------------------
+    # The idle workbench (#347)
+    # -------------------------------------------------------------------------
+    enable_idle_workbench: A[
+        bool,
+        Arg(
+            help="Run a queue of useful work while the rig is idle. One "
+            "scheduler, one priority order, every entry preempted by serving "
+            "demand inside the grace window: submitted fine-tuning jobs "
+            "first, then rig self-maintenance (kernel-shape tuning, "
+            "re-measuring the planner's stale factors). With this flag the "
+            "workbench owns the training loop, so --enable-training-tenant "
+            "controls whether training is accepted and this controls when it "
+            "runs. State is at GET /x-htsglang/workbench.",
+        ),
+    ] = False
+    workbench_artifact_root: A[
+        Optional[str],
+        "Directory for idle-work artifacts (tuned kernel configs, segment "
+        "output). Defaults to $HTSGLANG_WORKBENCH_ROOT, else "
+        "$XDG_CACHE_HOME/htsglang/workbench. Nothing here is written into the "
+        "source tree; promoting a result is a human step.",
+    ] = None
+    workbench_tenants: A[
+        Optional[str],
+        "Comma-separated tenants to register, in any order (priority is a "
+        "property of the tenant, not of this list): training, fp8_tuner, "
+        "card_probe. Unset registers all three. An unknown name is a startup "
+        "error, because a typo that silently disables a tenant produces a rig "
+        "that looks idle-managed and is not.",
+    ] = None
+    workbench_idle_grace_seconds: A[
+        float,
+        "Seconds of no serving activity before idle work may start. Separate "
+        "from --training-idle-grace-seconds so a deployment can let a "
+        "submitted job start sooner than the rig's self-maintenance.",
+    ] = 120.0
+    workbench_poll_seconds: A[
+        float,
+        "How often the workbench re-checks serving demand while a segment "
+        "runs. The worst-case delay between a request arriving and preemption "
+        "starting.",
+    ] = 2.0
+    workbench_preempt_timeout_s: A[
+        float,
+        "How long a segment may take to stop cleanly before it is killed. "
+        "Bounded on purpose: the serving tenant must never wait indefinitely "
+        "on idle work.",
+    ] = 60.0
+    workbench_segment_timeout_s: A[
+        float,
+        "Hard bound on one segment. A tenant whose work does not fit inside "
+        "this must cut it into smaller items; that is what a segment is.",
+    ] = 1800.0
+    workbench_arb_dir: A[
+        Optional[str],
+        "Directory shared with another session that competes for these cards "
+        "(holder file with heartbeat, free-until windows, orphan reaping). "
+        "Defaults to $HTSGLANG_GPU_ARB_DIR; unset disables the claim, which "
+        "is right when nothing else uses the rig. The workbench never "
+        "performs a destructive action through it and never waits on it.",
+    ] = None
+    workbench_arb_heartbeat_s: A[
+        float,
+        "How often the cross-session holder file is touched while a segment "
+        "runs. Must stay well inside the arbitration protocol's 20-minute "
+        "staleness window, because an idle-work window can be much longer "
+        "than that and a claim that stops heartbeating may be reaped.",
+    ] = 300.0
+    workbench_tuner_queue: A[
+        Optional[str],
+        "File of GEMM shapes for the kernel-tuning tenant, one '<N> <K> "
+        "[M,M,...]' per line with '#' comments. Which shapes matter is a fact "
+        "about the deployed model and TP split, so there is no built-in list. "
+        "Shapes can also be posted to /x-htsglang/workbench/enqueue.",
+    ] = None
+    workbench_tuner_card: A[
+        str,
+        "Which card the tuning tenant uses: 'largest' (most total VRAM), an "
+        "NVML index, or a device-name fragment. Resolved through NVML on every "
+        "decision, never cached, because enumeration order can shift between "
+        "boots.",
+    ] = "largest"
+    workbench_probe_max_age_s: A[
+        float,
+        "How old the cached card probe may get before the workbench "
+        "re-measures it, filling the planner's card-rate and pair-link "
+        "factors. One week by default: those numbers move with a driver or a "
+        "power-limit change, not with the hour.",
+    ] = 604800.0
+
+    # -------------------------------------------------------------------------
     # Universal client liveness (#344)
     # -------------------------------------------------------------------------
     client_liveness_timeouts: A[
@@ -5144,6 +5235,8 @@ class ServerArgs:
         self._handle_asr_validation()
         # Validate the idle training tenant's knobs.
         self._handle_training_tenant()
+        # Validate the idle workbench's knobs.
+        self._handle_idle_workbench()
         # Validate the per-endpoint-class client-liveness policy.
         self._handle_client_liveness()
 
@@ -12256,6 +12349,74 @@ class ServerArgs:
             raise ValueError(
                 f"--training-model-root {self.training_model_root!r} is not a "
                 "directory."
+            )
+
+    def _handle_idle_workbench(self):
+        """Validate the #347 workbench knobs. Validates only; no mutation.
+
+        Same rule as the training tenant's: every one of these is a duration
+        the scheduler waits on, so a zero is a hang and a negative is a busy
+        loop. The tenant list is checked here too, because a typo'd tenant
+        name produces a rig that looks idle-managed and is not -- a failure
+        that is invisible until somebody wonders why nothing was tuned.
+        """
+        if self.workbench_idle_grace_seconds < 0:
+            raise ValueError(
+                f"--workbench-idle-grace-seconds must not be negative "
+                f"(got {self.workbench_idle_grace_seconds})."
+            )
+        if self.workbench_poll_seconds <= 0:
+            raise ValueError(
+                f"--workbench-poll-seconds must be positive "
+                f"(got {self.workbench_poll_seconds})."
+            )
+        if self.workbench_preempt_timeout_s <= 0:
+            raise ValueError(
+                f"--workbench-preempt-timeout-s must be positive "
+                f"(got {self.workbench_preempt_timeout_s}); it bounds how long "
+                "the serving tenant waits for idle work to leave."
+            )
+        if self.workbench_segment_timeout_s <= 0:
+            raise ValueError(
+                f"--workbench-segment-timeout-s must be positive "
+                f"(got {self.workbench_segment_timeout_s})."
+            )
+        if self.workbench_arb_heartbeat_s <= 0:
+            raise ValueError(
+                f"--workbench-arb-heartbeat-s must be positive "
+                f"(got {self.workbench_arb_heartbeat_s})."
+            )
+        if self.workbench_probe_max_age_s <= 0:
+            raise ValueError(
+                f"--workbench-probe-max-age-s must be positive "
+                f"(got {self.workbench_probe_max_age_s})."
+            )
+        if self.workbench_tenants:
+            from sglang.srt.workbench.service import DEFAULT_TENANTS
+
+            unknown = [
+                name.strip()
+                for name in self.workbench_tenants.split(",")
+                if name.strip() and name.strip() not in DEFAULT_TENANTS
+            ]
+            if unknown:
+                raise ValueError(
+                    f"--workbench-tenants names unknown tenant(s) "
+                    f"{', '.join(unknown)}; known tenants are "
+                    f"{', '.join(DEFAULT_TENANTS)}."
+                )
+        if self.workbench_tuner_queue and not os.path.isfile(
+            self.workbench_tuner_queue
+        ):
+            raise ValueError(
+                f"--workbench-tuner-queue {self.workbench_tuner_queue!r} is not "
+                "a file."
+            )
+        if self.workbench_arb_dir and not os.path.isdir(self.workbench_arb_dir):
+            raise ValueError(
+                f"--workbench-arb-dir {self.workbench_arb_dir!r} is not a "
+                "directory. It must be a path both competing sessions can read "
+                "and write."
             )
 
     def _handle_client_liveness(self):

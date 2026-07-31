@@ -224,9 +224,16 @@ class TrainingService:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, *, start_tenant: bool = True) -> None:
+        """Create the artifact root and, by default, start the scheduler loop.
+
+        ``start_tenant=False`` brings the surface up without the loop, for the
+        one caller that owns the loop itself: the #347 idle workbench, where
+        training is one tenant in a priority order and two schedulers deciding
+        when it runs would be one too many.
+        """
         Path(self.config.artifact_root).mkdir(parents=True, exist_ok=True)
-        if self.config.enabled:
+        if self.config.enabled and start_tenant:
             self.tenant.start()
 
     async def stop(self) -> None:

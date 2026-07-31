@@ -19601,3 +19601,136 @@ haelt beide zusammen). Der Rest — `llm_stream=90`, `video_stream=300`,
 Code (`DEFAULT_TIMEOUT_RATIONALE`), keines mit einer Messung dahinter. Die
 Grace-Fraction 0,25 ebenso. Ein Messfenster dafuer ist offen und nicht
 Bestandteil dieses Stands.
+
+# #347-M1 — der Idle-Workbench: Arbeitswarteschlange statt Einzeltenant
+
+Stand 2026-07-31, Branch `feat/idle-workbench-347`, Basis `979955f03e`.
+Design: `docs/dev/DESIGN_347_idle_workbench.md`, Runbook §12.
+
+## Was gebaut wurde
+
+ANALYSE #347 Punkt 1: die #341-Maschinerie (Idle-Erkennung, VRAM-Lease,
+Preemption per Checkpoint-and-Release, Event-Kanal) traegt eine *Warteschlange*
+nuetzlicher Idle-Arbeit statt genau eines Tenants. Neu ist
+`python/sglang/srt/workbench/` mit einem Interface, einem Scheduler, einer
+Prioritaetsordnung und drei registrierten Tenants. Nichts davon importiert
+torch, die gesamte Oberflaeche ist auf einer kartenlosen Kiste testbar.
+
+| Tenant | Prio | Ein Arbeitspaket | Preemption | Artefakt |
+|---|---|---|---|---|
+| `training` (#341-Adapter) | 10 | ein Trainingsversuch | `force_preempt` -> Trainer checkpointet, danach Loop-Stop und Lease-Rueckgabe | `output_dir` des Jobs |
+| `fp8_tuner` (#255-Rest) | 50 | eine Kombination `(N, K, M)` | SIGTERM an die Prozessgruppe; Kombination bleibt in der Queue, nichts Halbes wird geschrieben | `<artifact-root>/fp8_tuner/configs/` |
+| `card_probe` (Self-Benchmark) | 70 | ein Short-Probe ueber alle Karten | SIGTERM; die Planner-Kacheln bleiben `absent` | `~/.cache/sglang/card_probe-<digest>.json` |
+
+## Der Eingriff in #341: genau zwei additive Zeilenbloecke
+
+Der Adapter ersetzt kein Verhalten, er verschiebt eine Entscheidung: **wer
+startet und stoppt den Trainings-Loop.** Mit `--enable-idle-workbench` kommt
+der Trainingsdienst nur als Oberflaeche hoch (`start(start_tenant=False)`) und
+der Workbench besitzt den Loop. Zwei Scheduler, die ueber denselben Loop
+entscheiden, waeren einer zu viel.
+
+Additiv an `training/`:
+
+1. `TrainingService.start(*, start_tenant: bool = True)` — Default erhalten.
+2. `TrainingTenant.running_job_id` (read-only Property) und
+   `TrainingTenant.hold_new_work` (Default `False`).
+
+`hold_new_work` schliesst ein echtes Rennen, das im ersten Durchlauf
+zugeschlagen hat: nach dem Preempt kann der #341-Loop den naechsten Job im
+Fenster zwischen "Trainer hat gecheckpointet" und "Loop gestoppt" wieder
+starten, und der laeuft dann auf Karten, die der Workbench gerade zurueckgibt.
+Der Test `test_the_bench_runs_and_preempts_a_real_training_job` ist genau
+dieser Falsifikator und war rot, bevor das Flag existierte.
+
+## Testergebnisse
+
+Alle CPU-only, `CUDA_VISIBLE_DEVICES=99`, venv `/spinning/htsglang-gpu/.venv`.
+
+| Suite | Tests | Ergebnis |
+|---|---|---|
+| `test/registered/workbench/test_workbench_unit.py` (neu) | 67 | gruen, 9,5 s |
+| `test/registered/openai_server/basic/test_workbench_http_surface.py` (neu) | 11 | gruen, 16,0 s |
+| `test/registered/training/test_training_unit.py` (**unveraendert**) | 36 | gruen, 9,8 s |
+| `test/registered/openai_server/basic/test_finetuning_sdk_surface.py` (**unveraendert**) | 25 | gruen, 22,5 s |
+
+Die beiden #341-Suiten sind byte-identisch zu HEAD (`git diff` auf
+`test/registered/training/` leer) — das war die Abnahmebedingung fuer "Adapter
+statt Umbau". Gesamt 139 Tests, davon 78 neu.
+
+Was die 67 Unit-Tests belegen, in den Worten des Designs:
+
+* **W3 Pricing.** Emptiest-Card-Wahl, Pinning, `cards_wanted=0` (alle Karten),
+  Disk- und RAM-Posten, und dass eine Ablehnung die Arithmetik traegt
+  (`40960 MiB wanted ... 24576 MiB total`, Shortfall 16 GiB). `self_leased`
+  passiert die Preisstufe absichtlich unberuehrt.
+* **W4 Scheduler.** idle -> Start; Serving-Demand -> Preempt (< 2 s inkl.
+  CI-Schlupf, gemessen ueber `poll_seconds=0.02`); Wiederaufnahme im naechsten
+  Fenster mit unveraenderter Queue-Tiefe (ein praeemptiertes Paket wird
+  requeued, nicht verbraucht); Prioritaetsordnung; genau ein Tenant zur Zeit;
+  Segment-Timeout cancelt; `stop()` beendet das laufende Segment, **bevor** der
+  Loop-Task gecancelt wird (sonst ueberlebt das Kind den Server).
+* **W5 Arbitrierung.** Free-until als Versprechen, lebender Fremd-Holder,
+  Waisen-Reap nur bei leeren Karten, Stale-Holder auf belegten Karten bleibt
+  stehen, Hardware schlaegt Dateien, fehlgeschlagene NVML-Abfrage verweigert
+  (statt durchzuwinken), Heartbeat, unbenutzbares Verzeichnis.
+* **W6 Tuner.** Queue-Parsing im Format des Shell-Tuners, NVML-aufgeloeste
+  Kartenwahl (kein fixer Index), Skip bei bereits vorhandener Batch-Size,
+  benannte Posten die mit der Shape skalieren, fehlendes Skript = benannter
+  Skip, Fehler-Kombination wird nicht ewig wiederholt. Zwei Subprozess-Tests
+  mit echtem Kindprozess: Erfolgspfad meldet sein Artefakt, Preempt beendet das
+  Kind und laesst das Paket in der Queue.
+* **W7 Self-Benchmark.** `absent` und `stale` sind die Queue, kein
+  Enqueue-Pfad, Posten sind die tatsaechlichen Allokationen des Probes.
+* **W8 API.** Snapshot antwortet auch abgeschaltet, Tenant-Tabelle
+  prioritaetssortiert, benannte 503/404/400 statt 404-Rauschen.
+
+Die 11 HTTP-Tests fahren dieselbe Oberflaeche ueber einen echten Socket mit
+echtem uvicorn und echten Routen: Snapshot, Cursor-Pagination, Pause der Bank
+(praeemptiert das laufende Segment), Pause eines Tenants, Enqueue einer
+Tuner-Shape, und die drei Fehlerhuellen.
+
+## GPU-Fenster: nicht genommen
+
+Die Kiste war ueber den gesamten Slice hinweg von der #352-Sitzung belegt
+(`holder` frisch, alle drei Karten 18–27 GiB belegt). Kein Warten, kein
+Wegdruecken — das Fenster wurde nicht angefragt und der Stretch entfaellt
+ehrlich.
+
+Was **ohne** Kartenzugriff gegen das echte `/spinning/gpu-arb` geprueft wurde
+(nur Lesen, kein Byte geschrieben, `holder` und `log` danach unveraendert):
+
+```
+SNAPSHOT  holder{session=operator, purpose=#352, age_s=44.4, stale=false, mine=false}
+          free_until{until=2026-07-31T10:36:25Z, open=false}
+REFUSED   held by operator for #352 since 2026-07-31T17:09:37Z (44s ago)
+BUSY      card 0 holds 19984 MiB, of which 19984 MiB is not in the VRAM ledger;
+          card 1 holds 27605 MiB, ...; card 2 holds 18556 MiB, ...
+```
+
+Beide Sperren greifen unabhaengig voneinander: die Datei-Ebene lehnt wegen des
+lebenden Holders ab, die Hardware-Ebene wegen nicht im Ledger verbuchter
+Belegung. Genau die Redundanz, die das README des Verzeichnisses fordert.
+
+## Werkzeuge
+
+`ruff --select=F401,F821,UP037`, `codespell`, `isort`, `black` sauber auf allen
+neuen und geaenderten Dateien. Die neuen CLI-Flags parsen gegen `ServerArgs`;
+ein unbekannter Tenant-Name, eine nicht-positive Dauer, eine fehlende
+Queue-Datei und ein nicht existierendes Arbitrierungsverzeichnis werden beim
+**Start** abgelehnt, nicht still ignoriert.
+
+## Nicht gemessen, bewusst offen
+
+Die Segmentkosten (`expected_seconds`) sind Schaetzungen der Tenants, keine
+Messungen; nur die Tuner-Zahl (35–70 s) stammt aus den #255-Laeufen. Der
+`triton_sweep`-Posten (256 MiB) ist eine benannte Schaetzung, kein
+Sicherheitsaufschlag. Die Grace-Defaults erben die Kritik aus #341: 120 s ohne
+Messung dahinter. Das Event-Log lebt im Speicher, ein Neustart verliert es —
+ehrlich, weil ein Neustart auch jedes Segment beendet.
+
+M2 (nicht gebaut, passt ohne Interface-Aenderung): TRT-Staircase-Rungs (#337),
+CUDA-Graph-Prewarm fuer registrierte kalte Engines, Cold-Tier-Kompression der
+Hibernate-Images (#306), Integrations-Boot-Matrix (#349) als stehendes
+Bug-Netz, sowie die uebrigen sieben Faktor-Kacheln (`power` und `prefix_cache`
+zuerst, `mlp_split` als teuerste).
