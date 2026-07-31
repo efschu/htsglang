@@ -27,6 +27,7 @@ from sglang.srt.video_enhance.multicard import (
     ChunkSpec,
     MultiCardError,
     MultiCardExecutor,
+    SubprocessChunkRunner,
     chunk_specs_from_plan,
     total_output_frames,
     verify_chunk_arithmetic,
@@ -414,6 +415,38 @@ class ExecutorOrderingTest(CustomTestCase):
         self.assertEqual(sorted(snapshot["cards"]), ["0", "1", "2"])
         self.assertIn("busiest_card_seconds", snapshot)
         self.assertEqual(len(snapshot["chunks"]), 3)
+
+
+class WorkerEnvironmentTest(CustomTestCase):
+    """A worker's card identity, which is not the same as its CUDA ordinal.
+
+    CUDA enumerates by FASTEST_FIRST unless told otherwise; NVML enumerates by
+    PCI bus. On a mixed rig those two orders disagree, and a plan built from
+    NVML indices then runs its chunks on the wrong cards -- silently, because
+    every card still works and the output is still correct.
+    """
+
+    def setUp(self):
+        self.runner = SubprocessChunkRunner(source_url="/tmp/x.mp4", request={})
+        self.chunk = ChunkSpec(0, "1", 0, 10, False, 2)
+
+    def test_the_card_is_pinned_by_visible_devices(self):
+        env = self.runner._child_env(self.chunk)
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
+
+    def test_device_order_is_forced_to_nvml_order(self):
+        env = self.runner._child_env(self.chunk)
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+
+    def test_an_inherited_device_order_does_not_win(self):
+        """A stray CUDA_DEVICE_ORDER in the parent must not change the mapping."""
+        runner = SubprocessChunkRunner(
+            source_url="/tmp/x.mp4",
+            request={},
+            env={"CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+        )
+        env = runner._child_env(self.chunk)
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
 
 
 class BackPressureThroughSpoolTest(CustomTestCase):

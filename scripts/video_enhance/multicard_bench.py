@@ -471,6 +471,9 @@ def main(argv: list[str] | None = None) -> int:
                 spool=spool_ctl,
             )
         )
+        control_out = workdir / "control.mp4"
+        asyncio.run(remux(source, es_ctl, control_out, out_rate, args.video_codec))
+        report["same_card_control"]["output_frames"] = count_frames(control_out)
 
     # -- verdict ------------------------------------------------------------
     checks: dict = {
@@ -526,16 +529,32 @@ def main(argv: list[str] | None = None) -> int:
             "pass": report["baseline"]["output_frames"]
             == report["expected_output_frames"],
         }
-        # 40 dB is the same floor parity.py derives for fp16 against fp32: at
-        # that level the mean squared error is below the 8-bit output step.
-        # Two independently encoded H.264 streams of the same pixels will not
-        # be identical, so exact equality is the wrong gate; a shifted or
-        # duplicated frame lands far below 40 dB and is caught.
-        checks["multicard_matches_baseline"] = {
+        # Informational, not a gate. It compares a three-card run against a
+        # one-card run, so it carries two differences at once: the cards, and
+        # the GOP structure -- chunk boundaries force an IDR, which the
+        # baseline does not have there, and two encodes of identical pixels
+        # with different GOP structure already differ. The gate below removes
+        # the second of those.
+        checks["multicard_vs_single_card_baseline"] = {
             "psnr_db": value,
-            "threshold_db": 40.0,
-            "pass": value is not None and value >= 40.0,
+            "note": (
+                "cards and GOP structure both differ; use "
+                "multicard_matches_same_card_control for the cards alone"
+            ),
         }
+        if args.same_card_control:
+            control_value = psnr_between(workdir / "control.mp4", multicard_out)
+            # Same chunk boundaries, same GOP structure, so the encoder is
+            # controlled for and what remains is the per-architecture
+            # arithmetic of the SR and RIFE convolutions. 40 dB is the floor
+            # parity.py derives for fp16 against fp32: below the 8-bit output
+            # step on average.
+            checks["multicard_matches_same_card_control"] = {
+                "psnr_db": control_value,
+                "threshold_db": 40.0,
+                "compared": "same chunking, 3 cards vs 1 card",
+                "pass": control_value is not None and control_value >= 40.0,
+            }
         base_wall = report["baseline"]["wall_seconds"]
         multi_wall = report["multicard"]["wall_seconds"]
         report["speedup"] = {

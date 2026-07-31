@@ -334,6 +334,20 @@ class SubprocessChunkRunner(ChunkRunner):
     def _child_env(self, chunk: ChunkSpec) -> dict[str, str]:
         env = dict(os.environ)
         env.update(self.env)
+        # CUDA_DEVICE_ORDER first, and it is not optional. CUDA's default
+        # ordering is FASTEST_FIRST, which is not NVML's -- and NVML's is what
+        # the planner, the reservation, nvidia-smi and every card window in
+        # the runbook are expressed in. On this rig the 5090 is NVML index 1
+        # and CUDA ordinal 0, so a plan that hands "card 1" the largest chunk
+        # because it measured that card as the fastest would put that chunk on
+        # a 3080 and put the 5090's chunk on a 3080 as well.
+        #
+        # It does not fail: every card runs, every frame is produced, the seam
+        # is exact and the output is correct. It just measures and schedules
+        # the wrong cards. Caught here by a per-stage rate table in which the
+        # "3080" at NVML index 0 ran super-resolution at 36 ms/frame and the
+        # "5090" at NVML index 1 ran it at 93.
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = str(chunk.card)
         return env
 
