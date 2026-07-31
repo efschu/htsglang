@@ -376,6 +376,10 @@ class Scheduler(
         # #287 KV pressure ladder runtime: None on every default path; built
         # lazily on the first scheduler iteration when the flag is set.
         self.kv_pressure_runtime = None
+        # #364 GDN resident-slot ladder executor: None on every default path;
+        # built lazily on the first scheduler iteration when
+        # --gdn-resident-state-slots is set.
+        self.gdn_slot_executor = None
         # #297 phase-boundary KV reshard runtime: None on every default path;
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
@@ -3324,6 +3328,24 @@ class Scheduler(
                     running_bs=running_batch.batch_size(),
                     phase="decode" if decode_active else "prefill",
                 )
+
+        # #364 GDN resident-slot ladder. Same between-tick boundary and the
+        # same lazy-build discipline as the #287 block above, for the same
+        # reason: the previous batch is retired here and the next one is not
+        # selected yet, so no captured graph can replay while the executor
+        # rewrites a state slot (#52/#53). The executor REFUSES to run outside
+        # the window it is given here, so this placement is enforced, not just
+        # documented. Flag unset = the attribute stays None and this is one
+        # predictable branch, byte-identical to today.
+        if self.server_args.gdn_resident_state_slots is not None:
+            if self.gdn_slot_executor is None:
+                from sglang.srt.managers.gdn_slot_runtime import (
+                    build_gdn_slot_executor,
+                )
+
+                self.gdn_slot_executor = build_gdn_slot_executor(self)
+            if self.gdn_slot_executor is not None:
+                self.gdn_slot_executor.on_round(running_batch, self.waiting_queue)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
