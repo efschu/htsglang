@@ -39,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KvReshardReqInput,
+    KvReshardReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -104,6 +106,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("kv_reshard", KvReshardReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -257,6 +260,21 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
+
+    async def kv_reshard(
+        self: TokenizerManager, target_vector: List[int]
+    ) -> KvReshardReqOutput:
+        """#297: arm a phase-boundary KV reshard to ``target_vector``.
+
+        Returns the scheduler's arming verdict; the physical move commits
+        asynchronously at the next group-wide idle consensus boundary (watch
+        the KV-RESHARD log lines for the DONE record)."""
+        self.auto_create_handle_loop()
+        return (
+            await self.kv_reshard_communicator(
+                KvReshardReqInput(target_vector=list(target_vector))
+            )
         )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:

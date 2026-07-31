@@ -123,6 +123,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KvReshardReqInput,
+    KvReshardReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -372,6 +374,10 @@ class Scheduler(
         # #287 KV pressure ladder runtime: None on every default path; built
         # lazily on the first scheduler iteration when the flag is set.
         self.kv_pressure_runtime = None
+        # #297 phase-boundary KV reshard runtime: None on every default path;
+        # built lazily on the first scheduler iteration when
+        # --kv-reshard-vectors is set.
+        self.kv_reshard_runtime = None
         # colocated-congruent PD lane (#107): None on every default path.
         self.congruent_prefill_lane = None
         # Multi-group runtime (#274): in-process lanes over shared bytes.
@@ -1719,6 +1725,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (KvReshardReqInput, self.handle_kv_reshard),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3206,6 +3213,21 @@ class Scheduler(
             # split the ranks across branches with mismatched collective counts.
             # See update_dcp_admission_state for the full rationale.
             self.kv_session_offload.update_dcp_admission_state()
+
+        # #297 phase-boundary KV resharding: same lazy-build and cadence
+        # discipline as the #287 block below. Built FIRST so the pressure
+        # runtime's dcp_ratio actuator can bind to it in the same iteration.
+        # on_round enters its bounded consensus reduction only every
+        # consensus_interval-th round, gated by the replicated round counter;
+        # the byte move itself runs only from a group-agreed armed+idle
+        # state. Flag unset = attribute stays None, no collective,
+        # byte-identical to today.
+        if self.server_args.kv_reshard_vectors is not None:
+            if self.kv_reshard_runtime is None:
+                from sglang.srt.managers.kv_reshard import build_kv_reshard_runtime
+
+                self.kv_reshard_runtime = build_kv_reshard_runtime(self)
+            self.kv_reshard_runtime.on_round()
 
         # #287 KV pressure ladder: one occupancy sample per iteration, ladder
         # transitions only at the rank-uniform consensus boundary inside
@@ -4721,6 +4743,40 @@ class Scheduler(
             success = False
         return success
 
+    def handle_kv_reshard(self, recv_req: KvReshardReqInput) -> KvReshardReqOutput:
+        """#297 control plane: arm a phase-boundary KV reshard.
+
+        Arming is a replicated call (the request reaches every TP scheduler
+        through the broadcast pipe) and does no collective work itself -- the
+        move commits later, at a consensus boundary where every rank is armed
+        and fully idle. Delivery skew across ranks is legal and absorbed by
+        the runtime's MIN-semantics on the armed flag.
+        """
+        if self.server_args.kv_reshard_vectors is None:
+            return KvReshardReqOutput(
+                success=False,
+                message=(
+                    "--kv-reshard-vectors is not set; the pool has no fitted "
+                    "ceiling to reshard within. Declare the vector set at "
+                    "boot."
+                ),
+            )
+        try:
+            if self.kv_reshard_runtime is None:
+                from sglang.srt.managers.kv_reshard import build_kv_reshard_runtime
+
+                self.kv_reshard_runtime = build_kv_reshard_runtime(self)
+            ok, msg = self.kv_reshard_runtime.arm(
+                tuple(recv_req.target_vector), source="rpc"
+            )
+        except Exception as e:
+            # Arming performs no collective and moves no byte, so reporting
+            # the failure instead of crashing is safe -- and every rank
+            # computes the same verdict from the same replicated input.
+            logger.warning("KV-RESHARD arm failed: %s", e)
+            return KvReshardReqOutput(success=False, message=str(e))
+        return KvReshardReqOutput(success=ok, message=msg)
+
     def _flush_zero_kv_buffers(self):
         """Zero the attention KV data buffers during an idle flush (default,
         SGLANG_FLUSH_ZERO_KV=0 opts out), so a flushed server matches a
@@ -5439,6 +5495,20 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        # #297: an armed reshard commits at an IDLE consensus boundary, so
+        # the loop must keep ticking rounds until the commit -- the sleeper
+        # parks rank 0 in a zmq poll and the request broadcast parks every
+        # other rank behind it, and a parked loop never reaches a boundary
+        # (observed on the first card run: armed on all ranks, zero
+        # boundaries). The pending target is replicated (broadcast RPC or
+        # consensus-committed ladder flip), so every rank skips the sleep in
+        # the same rounds; the busy spin is bounded by the consensus
+        # interval plus the move itself.
+        if (
+            self.kv_reshard_runtime is not None
+            and self.kv_reshard_runtime.pending is not None
+        ):
+            return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 

@@ -29,6 +29,7 @@ position, which keeps the compact slot an injective, collision-free function
 of ``L`` across concurrent requests — exactly like the even ``L // dcp_size``.
 """
 
+import weakref
 from typing import Optional
 
 import torch
@@ -46,8 +47,43 @@ __all__ = [
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",
     "dcp_weighted_write_slots",
+    "refresh_all_owner_bounds",
+    "register_owner_bounds_consumer",
     "swa_hybrid_dcp_lane",
 ]
+
+#: #297 cutover registry: every object that SNAPSHOTS the weighted owner
+#: bounds at construction (the attention backends' cached
+#: cp_S/cp_lo/cp_hi/cp_ratio) registers itself here, so a live vector flip
+#: can refresh EVERY instance -- including per-rung backends the adaptive
+#: draft ladder swaps in later -- without any caller having to enumerate
+#: them. Weak references: a swapped-out backend must not be kept alive by
+#: the registry.
+_OWNER_BOUNDS_CONSUMERS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def register_owner_bounds_consumer(consumer) -> None:
+    """Register an object exposing ``refresh_dcp_owner_bounds()`` for #297.
+
+    Called by every attention backend that caches the weighted owner bounds
+    at ``__init__`` time. Idempotent (WeakSet).
+    """
+    if not hasattr(consumer, "refresh_dcp_owner_bounds"):
+        raise TypeError(
+            f"{type(consumer).__name__} registers as an owner-bounds "
+            "consumer but has no refresh_dcp_owner_bounds() method"
+        )
+    _OWNER_BOUNDS_CONSUMERS.add(consumer)
+
+
+def refresh_all_owner_bounds() -> int:
+    """#297 cutover: re-derive every registered consumer's cached bounds
+    from the freshly installed token vector. Returns the consumer count
+    (logged by the reshard runtime as cutover evidence)."""
+    consumers = list(_OWNER_BOUNDS_CONSUMERS)
+    for consumer in consumers:
+        consumer.refresh_dcp_owner_bounds()
+    return len(consumers)
 
 
 def dcp_compact_pool_rows(global_tokens: int, cp_S: int, cp_ratio: int) -> int:

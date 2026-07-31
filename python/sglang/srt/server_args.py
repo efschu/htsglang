@@ -4551,6 +4551,39 @@ class ServerArgs:
             "latency (and the collective cost) of the ladder.",
         ),
     ] = 8
+    kv_reshard_vectors: A[
+        Optional[str],
+        Arg(
+            help="Phase-boundary KV resharding (#297): semicolon-separated "
+            "list of weighted uneven-DCP token vectors (one entry per DCP "
+            "rank, e.g. '2,11,10') that the server may PHYSICALLY reshard "
+            "the existing KV cache to at runtime, at a fully-idle phase "
+            "boundary, via the rank-uniform consensus cadence. Setting this "
+            "flag (a) reserves each rank's KV pool rows at the FITTED "
+            "CEILING over the boot vector plus every listed vector (the "
+            "global context budget shrinks to what fits every vector on "
+            "every rank -- the price of stable pool addresses, which is "
+            "what keeps the decode CUDA graphs valid across a reshard "
+            "without recapture), and (b) makes the #287 ladder's dcp_ratio "
+            "rung a REAL actuator: its flip arms a reshard to the operating "
+            "point's vector instead of only logging it. A reshard can also "
+            "be armed explicitly via POST /kv_reshard. Requires weighted "
+            "uneven DCP and the hybrid-linear KV pool family (Stage A). "
+            "Default: unset = no reservation, no consensus round, no "
+            "reshard -- byte-identical to today.",
+        ),
+    ] = None
+    kv_reshard_consensus_interval: A[
+        int,
+        Arg(
+            help="Scheduler rounds between two consensus boundaries of the "
+            "#297 KV reshard runtime (same discipline as "
+            "--kv-pressure-consensus-interval: cadence gated by the "
+            "replicated round counter, one bounded MIN-reduction per "
+            "boundary, equality-checked epoch/target, loud desync). Only "
+            "read when --kv-reshard-vectors is set.",
+        ),
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -5981,6 +6014,18 @@ class ServerArgs:
                 f"--kv-pressure-consensus-interval must be >= 1, got "
                 f"{self.kv_pressure_consensus_interval}."
             )
+        if self.kv_reshard_consensus_interval < 1:
+            raise ValueError(
+                f"--kv-reshard-consensus-interval must be >= 1, got "
+                f"{self.kv_reshard_consensus_interval}."
+            )
+        if self.kv_reshard_vectors is not None:
+            # Syntactic fail-fast at argument time; the semantic checks
+            # (vector length == dcp_size, weighted uneven DCP active, hybrid
+            # pool family) run at boot where those facts exist.
+            from sglang.srt.layers.dcp.reshard_plan import parse_reshard_vectors
+
+            parse_reshard_vectors(self.kv_reshard_vectors)
         # The sensor owns the mark/window contract; constructing one here is
         # the validation (it raises with the same messages the runtime would).
         KvPressureSensor(
