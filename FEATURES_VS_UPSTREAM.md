@@ -19,12 +19,15 @@ Modifiers: `WIP` — present but not complete. `Exp` — experimental, not produ
 trailing `*` — the capability lives only on an unmerged branch. `red-then-green` marks a row whose
 own test fails before its fix and passes after.
 
-Two identities do **not** qualify as a cross-check:
+Three identities do **not** qualify as a cross-check:
 
 | Claim | Why it does not hold |
 |---|---|
 | Byte-/token-identity above ~109 prompt tokens on an RTX 3080 under fp8 | `gptq_marlin_gemm`, the only fp8 GEMM sm86 has, is measured run-to-run nondeterministic above that length: 0 of 1200 mismatches through M=109, first mismatch at M=128. The fix is not merged. The RTX 5090 (sm120, a different fp8 GEMM path) is unaffected at any length. |
 | Token identity between speculative and non-speculative decoding | The verify round computes k+1 tokens in one forward instead of one per token, so the reduction order differs. With repetition, presence or frequency penalties set, n-1 of n accepted tokens never reach the penalty function. The acceptance decision itself is exact integer equality against the target's argmax and cannot diverge. A valid reference for a speculative arm carries the same speculative configuration. |
+| Text identity between two boots of the SAME checkpoint at temperature 0 | #360 (2026-07-31, Qwen3.6-27B-FP8, identical flags, identical split): two independent boots diverge on 12 of 42 graded answers. Near-tie argmax flips are reachable at temp 0 through ordinary run-to-run variance (GEMM tiling, batch-shape-dependent reduction order) without either boot being wrong. Text identity is therefore not an instrument for correctness on this rig — it is not even self-consistent within one checkpoint and one config. |
+
+The methodological consequence: a quality comparison between two arms (two formats, two splits, two anything) needs a graded score — a probe with a checked-answer rubric, not a text diff — and a same-arm A-vs-A pair run alongside it to fix the noise band those 12/42 represent. A cross-arm delta that sits inside the A-vs-A band is noise; only a delta that clears it is evidence. #360 is the worked example: two FP8-vs-FP8 boots (the A-vs-A pair) disagree on 12/42 texts but grade 42/42 and 41/42 — inside the band — while every arm's `code`/`factual`/`longctx` categories and the 30035-token needle-recall depth are bit-for-bit identical across all four arms, which is the part of #360 that *is* evidence.
 
 ## Reference hardware
 
