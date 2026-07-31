@@ -51,8 +51,10 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
-_is_sm100_supported = is_sm100_supported()
-_is_sm120_supported = is_sm120_supported()
+# NOTE: deliberately no ``_is_sm100_supported = is_sm100_supported()`` here.
+# An import-time capability snapshot freezes device 0's answer for the whole
+# process, which is wrong wherever one process holds parts of the same model
+# on two architectures (#343); the gates are called at the point of use.
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
@@ -1607,7 +1609,13 @@ def mxfp8_block_scaled_matmul_triton(
             SM120: 1, SM100: 4.
     """
     if num_stages is None:
-        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
+        # Asked about the card the operands live on, not device 0 (#343).
+        device_id = a.device.index
+        num_stages = (
+            1
+            if is_sm120_supported(device_id)
+            else (4 if is_sm100_supported(device_id) else 1)
+        )
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b

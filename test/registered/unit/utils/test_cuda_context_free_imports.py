@@ -151,10 +151,20 @@ class TestNvmlDevice0(unittest.TestCase):
         import sglang.srt.utils.common as common
 
         self.common = common
-        common._nvml_cuda_device0.cache_clear()
+        self._clear()
 
     def tearDown(self):
+        self._clear()
+
+    def _clear(self):
+        """Both caches: the NVML enumeration and the device-0 resolution.
+
+        They are separate since #343 (the raw enumeration is now shared with
+        ``min_visible_cuda_capability_no_init``), so clearing only the second
+        leaves a previous test's fake rig in the first.
+        """
         self.common._nvml_cuda_device0.cache_clear()
+        self.common._nvml_all_devices.cache_clear()
 
     def _resolve(self, devices, env):
         fake = make_fake_pynvml(devices)
@@ -166,9 +176,9 @@ class TestNvmlDevice0(unittest.TestCase):
         clean_env.update(env)
         with mock.patch.dict(sys.modules, {"pynvml": fake}):
             with mock.patch.dict(os.environ, clean_env, clear=True):
-                self.common._nvml_cuda_device0.cache_clear()
+                self._clear()
                 result = self.common._nvml_cuda_device0()
-        self.common._nvml_cuda_device0.cache_clear()
+        self._clear()
         return result
 
     def test_fastest_first_picks_max_capability(self):
@@ -200,7 +210,7 @@ class TestNvmlDevice0(unittest.TestCase):
     def test_nvml_failure_is_refused(self):
         broken = SimpleNamespace(nvmlInit=mock.Mock(side_effect=RuntimeError))
         with mock.patch.dict(sys.modules, {"pynvml": broken}):
-            self.common._nvml_cuda_device0.cache_clear()
+            self._clear()
             self.assertIsNone(self.common._nvml_cuda_device0())
 
 
@@ -236,7 +246,9 @@ class TestPredicatesContextFree(unittest.TestCase):
     def _run(self, fn):
         common, patches = self._context()
         common._nvml_cuda_device0.cache_clear()
+        common._nvml_all_devices.cache_clear()
         common.is_cuda.cache_clear()
+        common.clear_per_device_gate_caches()
         try:
             for p in patches:
                 p.start()
@@ -245,7 +257,9 @@ class TestPredicatesContextFree(unittest.TestCase):
             for p in reversed(patches):
                 p.stop()
             common._nvml_cuda_device0.cache_clear()
+            common._nvml_all_devices.cache_clear()
             common.is_cuda.cache_clear()
+            common.clear_per_device_gate_caches()
 
     def test_check_cuda_device_version_uses_nvml(self):
         # fake rig's device 0 (FASTEST_FIRST) is the 5090 -> major 12
@@ -268,9 +282,7 @@ class TestPredicatesContextFree(unittest.TestCase):
         self.assertEqual(self._run(lambda c: c.get_device_sm()), 120)
 
     def test_get_device_capability_util_uses_nvml(self):
-        self.assertEqual(
-            self._run(lambda c: c.get_device_capability(0)), (12, 0)
-        )
+        self.assertEqual(self._run(lambda c: c.get_device_capability(0)), (12, 0))
 
 
 class TestSglKernelLoaderContextFree(unittest.TestCase):
@@ -306,9 +318,7 @@ class TestSglKernelLoaderContextFree(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"pynvml": fake}):
             with mock.patch.dict(os.environ, clean_env, clear=True):
                 with mock.patch.object(torch.cuda, "is_available", lambda: True):
-                    with mock.patch.object(
-                        torch.cuda, "is_initialized", lambda: False
-                    ):
+                    with mock.patch.object(torch.cuda, "is_initialized", lambda: False):
                         with mock.patch.object(
                             torch.cuda, "get_device_properties", forbidden
                         ):
@@ -383,8 +393,8 @@ class TestCudaInitTracer(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ)
-            env["PYTHONPATH"] = REPO_PYTHON_ROOT + os.pathsep + env.get(
-                "PYTHONPATH", ""
+            env["PYTHONPATH"] = (
+                REPO_PYTHON_ROOT + os.pathsep + env.get("PYTHONPATH", "")
             )
             code = (
                 "import importlib.util, os, sys\n"

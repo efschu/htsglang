@@ -13,22 +13,31 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import cuda_sm_at_least
+from sglang.srt.utils import cuda_sm_at_least, per_device_gate
 
 
-def _pdl_supported() -> bool:
-    """Is Programmatic Dependent Launch available here? (NVIDIA sm90+.)
+@per_device_gate
+def _pdl_supported(device_id: int) -> bool:
+    """Is Programmatic Dependent Launch available ON THIS CARD? (NVIDIA sm90+.)
 
     PDL is a CUDA feature with no ROCm counterpart, so the question is asked
     in the NVIDIA namespace (#171). The bare ``major >= 9`` this replaces was
     vendor-blind, and the namespaces collide: gfx942 reports ``(9, 4)`` and
     gfx950 ``(9, 5)``, so every CDNA3/CDNA4 card enabled PDL on a build that
     has none.
+
+    Asked PER CARD and at launch time rather than once at import (#267, same
+    family as #343): the module-level ``_ENABLE_PDL = _pdl_supported()`` this
+    replaces probed device 0, so in a process holding parts of one model on
+    two cards the second card was handed the first card's answer -- and PDL is
+    a ``tl.constexpr`` baked into the compiled kernel, so a wrong True is a
+    kernel the card cannot launch rather than a slow one.
     """
-    return cuda_sm_at_least(9)
+    return cuda_sm_at_least(9, device_id=device_id)
 
 
-_ENABLE_PDL = _pdl_supported()
+def _enable_pdl(device: torch.device) -> bool:
+    return _pdl_supported(device.index)
 
 
 @triton.jit
@@ -198,7 +207,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         FP16=q_gate.dtype == torch.float16,
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
-        ENABLE_PDL=_ENABLE_PDL,
+        ENABLE_PDL=_enable_pdl(q_gate.device),
     )
 
     return q_out, k_out, gate_out if has_gate else None

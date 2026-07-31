@@ -5,7 +5,15 @@ import os
 from collections import OrderedDict
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -55,6 +63,8 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     offloader,
+    per_device_gate,
+    resolve_capability_device_id,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -63,8 +73,12 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
-_is_sm100_supported = is_sm100_supported()
-_is_sm120_supported = is_sm120_supported()
+# NOTE: no ``_is_sm100_supported = is_sm100_supported()`` here any more. An
+# import-time capability snapshot is a device-0 answer frozen for the whole
+# process, which is wrong in a process that spans two architectures (#343);
+# the NVIDIA gates are called at the point of use with the device in hand.
+# The ROCm one stays a snapshot: a ROCm process is single-vendor and the gfx95
+# question is not asked about a second, differently-architected card here.
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
@@ -197,24 +211,26 @@ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 TORCH_DEVICE_IDENTITY = None
 
 
-def use_rowwise_torch_scaled_mm():
+@per_device_gate
+def use_rowwise_torch_scaled_mm(device_id: int) -> bool:
+    """Whether ``torch._scaled_mm``'s rowwise path exists ON THIS DEVICE.
+
+    Cached per device instead of being snapshotted into a module constant at
+    import: the probe is expensive (which is why it is cached at all), but the
+    answer is a property of the card, not of the process (#343).
+    """
     if _is_hip:
         # The condition to determine if it is on a platform that supports
         # torch._scaled_mm rowwise feature.
-        # The condition is determined once as the operations
-        # are time consuming.
-        return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+        return get_device_capability(device_id) >= (9, 4) and torch_release >= (2, 7)
     return False
 
 
-USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
-
-
-@lru_cache(maxsize=1)
-def cutlass_fp8_supported():
+@per_device_gate
+def cutlass_fp8_supported(device_id: int) -> bool:
     if not _is_cuda:
         return False
-    major, minor = get_device_capability()
+    major, minor = get_device_capability(device_id)
     cuda_version = get_cuda_version()
     if major >= 9:
         return cuda_version >= (12, 0)
@@ -223,8 +239,8 @@ def cutlass_fp8_supported():
     return False
 
 
-@lru_cache(maxsize=1)
-def fp8_native_gemm_available() -> bool:
+@per_device_gate
+def fp8_native_gemm_available(device_id: int) -> bool:
     """Whether this device has a working native fp8 GEMM.
 
     Asked FUNCTIONALLY -- by attempting the operation once -- and not by
@@ -246,11 +262,14 @@ def fp8_native_gemm_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
+    # Probed on the device the question is about, not on the current one: in a
+    # process that spans two cards the answer differs between them (#343).
+    device = torch.device("cuda", device_id)
     try:
-        a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device="cuda")
+        a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device)
         # _scaled_mm wants the second operand column-major
-        b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device="cuda").t()
-        scale = torch.ones((), dtype=torch.float32, device="cuda")
+        b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device).t()
+        scale = torch.ones((), dtype=torch.float32, device=device)
         torch._scaled_mm(a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
         return True
     except Exception as e:  # noqa: BLE001 - any failure means "not available"
@@ -262,8 +281,8 @@ def fp8_native_gemm_available() -> bool:
         return False
 
 
-@lru_cache(maxsize=1)
-def deterministic_fp8_marlin_disabled() -> bool:
+@per_device_gate
+def deterministic_fp8_marlin_disabled(device_id: int) -> bool:
     """True when SGLANG_DETERMINISTIC_FP8_GEMM must switch the fp8 Marlin path off.
 
     Narrow on purpose, in BOTH directions:
@@ -284,8 +303,10 @@ def deterministic_fp8_marlin_disabled() -> bool:
     the gfx900-reports-(9,0) trap. Restricting to 80..88 dodges it anyway, but
     the guard keeps the intent legible.
 
-    lru_cached, so the warning below is emitted exactly once per process (i.e.
-    once per rank, which is the right granularity: the decision is rank-local).
+    Cached per device, so the warning below is emitted exactly once per card
+    the process actually asks about -- which is the right granularity: the
+    decision is per card, and a lane host spanning an sm86 and an sm120 part
+    gets the answer (and the warning) for the sm86 part only.
     """
     from sglang.srt import environ as _environ
 
@@ -294,7 +315,7 @@ def deterministic_fp8_marlin_disabled() -> bool:
     if not is_cuda():
         return False
     try:
-        major, minor = get_device_capability()
+        major, minor = get_device_capability(device_id)
     except Exception:  # noqa: BLE001 - unknown device means "leave it alone"
         return False
     sm = major * 10 + minor
@@ -314,8 +335,8 @@ def deterministic_fp8_marlin_disabled() -> bool:
     return True
 
 
-@lru_cache(maxsize=1)
-def fp8_needs_dequant_fallback() -> bool:
+@per_device_gate
+def fp8_needs_dequant_fallback(device_id: int) -> bool:
     """True when NO fp8 GEMM of any kind is reachable on this device.
 
     Checked in the order the fast paths would be tried: a native fp8 GEMM
@@ -337,12 +358,12 @@ def fp8_needs_dequant_fallback() -> bool:
     """
     if get_bool_env_var("SGLANG_FORCE_FP8_DEQUANT"):
         return True
-    if deterministic_fp8_marlin_disabled():
+    if deterministic_fp8_marlin_disabled(device_id):
         return True
     return not (
-        fp8_native_gemm_available()
-        or cutlass_fp8_supported()
-        or can_auto_enable_marlin_fp8()
+        fp8_native_gemm_available(device_id)
+        or cutlass_fp8_supported(device_id)
+        or can_auto_enable_marlin_fp8(device_id)
     )
 
 
@@ -580,15 +601,37 @@ class Fp8GemmRunnerBackend(Enum):
         return self == Fp8GemmRunnerBackend.AITER
 
 
-FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+class _Fp8GemmConfigRequest(NamedTuple):
+    """What the launch ASKED for, before any card was consulted.
+
+    Hashable so the per-device resolution can be an ``lru_cache`` keyed on
+    (request, device_id) rather than a global that one card wins.
+    """
+
+    backend: str
+    quantization: Optional[str]
 
 
-def _check_cutlass_block_fp8_hardware_support() -> bool:
+#: The recorded request, or None before ``initialize_fp8_gemm_config`` ran
+#: (benchmarks and unit tests import these dispatchers without a launch).
+_FP8_GEMM_CONFIG_REQUEST: Optional[_Fp8GemmConfigRequest] = None
+
+
+def _check_cutlass_block_fp8_hardware_support(device_id: Optional[int] = None) -> bool:
     """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm90_supported() or is_blackwell_supported()
+    return is_sm90_supported(device_id) or is_blackwell_supported(device_id)
 
+
+#: Whether the flashinfer fp8 helpers below were actually DEFINED in this
+#: process. The block is an import-time decision (it imports flashinfer), so
+#: it can only ask about device 0 -- but the dispatchers below now answer per
+#: device (#343), and a device that says "blackwell" cannot be routed at a
+#: symbol import never created. Checked explicitly rather than re-derived
+#: from the capability, so the two can never drift apart.
+_FLASHINFER_FP8_HELPERS_DEFINED = False
 
 if is_blackwell_supported() and is_flashinfer_available():
+    _FLASHINFER_FP8_HELPERS_DEFINED = True
     from flashinfer import SfLayout
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -739,26 +782,30 @@ if is_sm90_supported() and is_flashinfer_available():
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
 
-def dispatch_w8a8_block_fp8_linear() -> Callable:
+def dispatch_w8a8_block_fp8_linear(device_id: Optional[int] = None) -> Callable:
     """
     Dispatch to the appropriate FP8 block linear implementation.
 
     This function selects the backend based on:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
+
+    Both are answered for ONE device -- the current one unless told otherwise
+    (#343). Callers construct quant methods under the device of the weight
+    they are about to load, so the default is the right answer for them.
     """
-    backend = get_fp8_gemm_runner_backend()
+    backend = get_fp8_gemm_runner_backend(device_id)
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
         return _dispatch_explicit_backend(backend)
 
     # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+    return _dispatch_auto_backend(device_id)
 
 
-def dispatch_w8a8_mxfp8_linear() -> Callable:
-    backend = get_fp8_gemm_runner_backend()
+def dispatch_w8a8_mxfp8_linear(device_id: Optional[int] = None) -> Callable:
+    backend = get_fp8_gemm_runner_backend(device_id)
     if backend.is_deep_gemm():
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
     elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
@@ -883,8 +930,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
-def _dispatch_auto_backend() -> Callable:
-    """Auto-select the best backend based on hardware capabilities."""
+def _dispatch_auto_backend(device_id: Optional[int] = None) -> Callable:
+    """Auto-select the best backend based on THIS DEVICE's capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
@@ -894,9 +941,13 @@ def _dispatch_auto_backend() -> Callable:
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
+    elif (
+        is_blackwell_supported(device_id)
+        and is_flashinfer_available()
+        and _FLASHINFER_FP8_HELPERS_DEFINED
+    ):
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-    elif _check_cutlass_block_fp8_hardware_support():
+    elif _check_cutlass_block_fp8_hardware_support(device_id):
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
@@ -905,11 +956,35 @@ def _dispatch_auto_backend() -> Callable:
 
 
 def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
-    """Initialize FP8 GEMM configuration."""
-    global FP8_GEMM_RUNNER_BACKEND
+    """Record the FP8 GEMM configuration REQUEST.
 
-    backend = server_args.fp8_gemm_runner_backend
-    if backend == "auto" and is_sm120_supported():
+    The resolution itself is deferred to
+    :func:`get_fp8_gemm_runner_backend`, because it depends on the
+    architecture of the card the GEMM will run on and this function is called
+    once per process (``scheduler.py``), before any model part is placed.
+    Resolving here and storing one global answered device 0 for every card in
+    the process: in a dual-group lane host that put the sm120 host card's
+    ``triton`` choice on the sm86 part as well, which then died on
+    ``type fp8e4nv not supported in this architecture`` instead of taking its
+    own Marlin route (#343).
+    """
+    global _FP8_GEMM_CONFIG_REQUEST
+    _FP8_GEMM_CONFIG_REQUEST = _Fp8GemmConfigRequest(
+        backend=server_args.fp8_gemm_runner_backend,
+        quantization=server_args.quantization,
+    )
+    _resolve_fp8_gemm_runner_backend.cache_clear()
+
+
+@lru_cache(maxsize=None)
+def _resolve_fp8_gemm_runner_backend(
+    request: Optional["_Fp8GemmConfigRequest"], device_id: int
+) -> Fp8GemmRunnerBackend:
+    if request is None:
+        return Fp8GemmRunnerBackend.AUTO
+
+    backend = request.backend
+    if backend == "auto" and is_sm120_supported(device_id):
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
 
@@ -917,21 +992,29 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     if (
         backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
+        and request.quantization == "mxfp8"
+        and is_sm100_supported(device_id)
         and is_flashinfer_available()
     ):
         backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
-    FP8_GEMM_RUNNER_BACKEND = backend
+    return backend
 
 
-def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
-    """Get the current FP8 GEMM runner backend."""
-    global FP8_GEMM_RUNNER_BACKEND
-    if FP8_GEMM_RUNNER_BACKEND is None:
-        FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
-    return FP8_GEMM_RUNNER_BACKEND
+def get_fp8_gemm_runner_backend(
+    device_id: Optional[int] = None,
+) -> Fp8GemmRunnerBackend:
+    """The FP8 GEMM runner backend FOR ONE DEVICE.
+
+    ``device_id=None`` is the current device (see
+    ``resolve_capability_device_id``), which is the card a quant method is
+    being constructed on -- the lane part loader runs the whole load under
+    ``torch.cuda.device(part_gpu_id)``, and a rank sets its own device before
+    loading, so no caller has to plumb an id through.
+    """
+    return _resolve_fp8_gemm_runner_backend(
+        _FP8_GEMM_CONFIG_REQUEST, resolve_capability_device_id(device_id)
+    )
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
@@ -1409,8 +1492,11 @@ def _raw_triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    # Asked about the card the activation lives on, not about device 0: one
+    # process can hold parts of the same model on two architectures (#343).
+    device_id = input.device.index
     if not (
-        (_is_cuda and (_is_sm100_supported or _is_sm120_supported))
+        (_is_cuda and (is_sm100_supported(device_id) or is_sm120_supported(device_id)))
         or (_is_hip and _is_gfx95_supported)
     ):
         raise RuntimeError(
@@ -1477,7 +1563,11 @@ def _raw_triton_mxfp8_blockscaled_linear(
         else _pack_mxfp8_scales(weight_scale)
     )
 
-    num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
+    num_stages = (
+        1
+        if is_sm120_supported(device_id)
+        else (4 if is_sm100_supported(device_id) else 1)
+    )
     output = triton_mxfp8_block_scaled_matmul(
         q_input,
         a_scale_packed,
@@ -2037,6 +2127,11 @@ def apply_fp8_linear_bmm_flashinfer(
     return output.view(*output_shape)
 
 
+#: Alias so the two ``apply_*_linear`` functions can keep a parameter named
+#: ``cutlass_fp8_supported`` (public signature) and still reach the gate.
+_cutlass_fp8_supported_on = cutlass_fp8_supported
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2044,7 +2139,10 @@ def apply_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     input_scale_ub: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+    # ``None`` = ask this activation's own card. A ``= cutlass_fp8_supported()``
+    # default is evaluated at IMPORT, i.e. frozen to device 0 for the whole
+    # process -- wrong wherever one process spans two architectures (#343).
+    cutlass_fp8_supported: Optional[bool] = None,
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
@@ -2054,6 +2152,8 @@ def apply_fp8_linear(
     # This could change in the future.
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
+    if cutlass_fp8_supported is None:
+        cutlass_fp8_supported = _cutlass_fp8_supported_on(input.device.index)
     if pad_output is None:
         pad_output = not cutlass_fp8_supported and not get_bool_env_var(
             "SGLANG_ENABLE_TORCH_COMPILE"
@@ -2153,7 +2253,7 @@ def apply_fp8_linear(
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (use_rowwise_torch_scaled_mm(input.device.index) or _use_aiter)
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
@@ -2233,7 +2333,8 @@ def apply_fp8_linear(
     )
 
 
-def can_auto_enable_marlin_fp8() -> bool:
+@per_device_gate
+def can_auto_enable_marlin_fp8(device_id: int) -> bool:
     """Whether sm80..88 would auto-route fp8 through Marlin. HARDWARE ONLY.
 
     Deliberately NOT gated by SGLANG_DETERMINISTIC_FP8_GEMM. That flag is
@@ -2249,7 +2350,7 @@ def can_auto_enable_marlin_fp8() -> bool:
     caller's vendor namespace -- gfx803 reports (8, 0), landing inside the
     range on a card Marlin was never built for.
     """
-    sm = get_cuda_sm()
+    sm = get_cuda_sm(device_id)
     return sm is not None and 80 <= sm < 89
 
 
@@ -2260,12 +2361,18 @@ def apply_fp8_ptpc_linear(
     input_scale: Optional[torch.Tensor] = None,
     input_scale_ub: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+    # ``None`` = ask this activation's own card. A ``= cutlass_fp8_supported()``
+    # default is evaluated at IMPORT, i.e. frozen to device 0 for the whole
+    # process -- wrong wherever one process spans two architectures (#343).
+    cutlass_fp8_supported: Optional[bool] = None,
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
     """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
+    if cutlass_fp8_supported is None:
+        probe = input[0] if isinstance(input, tuple) else input
+        cutlass_fp8_supported = _cutlass_fp8_supported_on(probe.device.index)
     # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
     if isinstance(input, tuple):
         q_input, x_scale = input

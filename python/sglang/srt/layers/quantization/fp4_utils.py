@@ -24,7 +24,11 @@ fp4_quantize = None
 try:
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
-    _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
+    def _flashinfer_fp4_quantize_backend(device_id: Optional[int]) -> str:
+        # Per device rather than an import-time constant: an import-time
+        # answer is device 0's, frozen for a process that can hold parts of
+        # the same model on two architectures (#343).
+        return "cute-dsl" if is_sm100_supported(device_id) else "cuda"
 
     def _round_up(x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
@@ -46,7 +50,7 @@ try:
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             is_sf_8x4_layout=is_sf_8x4_layout,
             enable_pdl=enable_pdl,
-            backend=_flashinfer_fp4_quantize_backend,
+            backend=_flashinfer_fp4_quantize_backend(input.device.index),
         )
 
     def _flashinfer_fp4_quantize_fake(

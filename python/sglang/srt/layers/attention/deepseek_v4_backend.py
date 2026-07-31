@@ -78,7 +78,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
-_is_sm120 = is_sm120_supported()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
@@ -131,7 +130,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    # Per device, not device 0 (#343): the backend is built once per
+    # ModelRunner, under that runner's own card.
+    if is_sm120_supported() or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1670,7 +1671,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if is_sm120_supported(q.device.index):
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

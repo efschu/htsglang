@@ -213,6 +213,8 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_device_capability,
+    get_hip_arch,
     init_custom_process_group,
     is_hip,
     is_host_cpu_arm64,
@@ -309,8 +311,13 @@ _ROCM_ARCHS_WITHOUT_BF16 = frozenset(
 )
 
 
-def _needs_float16_fallback() -> bool:
+def _needs_float16_fallback(device_id: Optional[int] = None) -> bool:
     """Does this device lack bfloat16, so the model must fall back to fp16?
+
+    ``device_id`` is the card this rank was placed on. ``None`` means the
+    current device, which is 0 only while nothing has been placed elsewhere
+    -- the previous ``get_device_properties(0)`` asked about card 0 no matter
+    where the rank actually ran (#343).
 
     Asked vendor-first, because the old test -- ``get_device_capability()[0] <
     8`` -- reads a number whose namespace depends on the torch build, while the
@@ -340,13 +347,11 @@ def _needs_float16_fallback() -> bool:
         # So the question is asked in the AMD namespace instead, by gfx family.
         # Only families MEASURED to lack bf16 are listed; anything unknown or
         # newer is left alone, so no working card can regress on a guess.
-        try:
-            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        except Exception as e:  # noqa: BLE001 - probe must never be fatal
+        arch = get_hip_arch(device_id)
+        if arch is None:
             logger.warning(
-                "Could not read gcnArchName (%s); leaving the model dtype "
-                "unchanged. If this card has no bf16, pass --dtype float16.",
-                e,
+                "Could not read gcnArchName; leaving the model dtype "
+                "unchanged. If this card has no bf16, pass --dtype float16."
             )
             return False
         if arch in _ROCM_ARCHS_WITHOUT_BF16:
@@ -357,7 +362,7 @@ def _needs_float16_fallback() -> bool:
             )
             return True
         return False
-    return torch.cuda.get_device_capability()[0] < 8
+    return get_device_capability(device_id)[0] < 8
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -1526,8 +1531,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 return
 
             from sglang.srt.distributed.utils import (
-                partition_sizes,
                 get_tp_partition_ratios,
+                partition_sizes,
                 tp_plan_active,
             )
 
@@ -1551,9 +1556,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if (
                 not envs.SGLANG_SHARED_EXPERT_TP1.get()
                 and not (
-                    tp_plan_active(moe_tp_size)
-                    and _plan
-                    and len(_plan) == moe_tp_size
+                    tp_plan_active(moe_tp_size) and _plan and len(_plan) == moe_tp_size
                 )
                 and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
                 and not _use_aiter
@@ -1881,7 +1884,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
-            if _needs_float16_fallback():
+            if _needs_float16_fallback(self.gpu_id):
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
                 )
@@ -1904,7 +1907,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # minor number may only be read in the NVIDIA namespace.
                 if (
                     torch.version.hip is None
-                    and torch.cuda.get_device_capability()[1] < 5
+                    and get_device_capability(self.gpu_id)[1] < 5
                 ):
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
@@ -3833,9 +3836,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return cached
         from sglang.srt.layers.radix_attention import RadixAttention
 
-        layers = [
-            m for m in self.model.modules() if isinstance(m, RadixAttention)
-        ]
+        layers = [m for m in self.model.modules() if isinstance(m, RadixAttention)]
         layers.sort(key=lambda a: a.layer_id)
         self._wl_verify_role_kv_scales(layers)
         self._wl_attn_layers_cache = layers
@@ -4006,9 +4007,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch,
                         pp_proxy_tensors=pp_proxy_tensors,
                     )
-                    return ModelRunnerOutput(
-                        logits_output=None, can_run_graph=True
-                    )
+                    return ModelRunnerOutput(logits_output=None, can_run_graph=True)
                 return self._forward_weightless_worker(forward_batch)
 
             mode_check = (
