@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 from sgl_kernel import int8_scaled_mm
-from utils import is_sm10x
+from utils import is_datacenter_blackwell
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -34,8 +34,10 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
 
 @pytest.mark.skipif(
-    is_sm10x(),
-    reason="int8_scaled_mm is only supported on sm90 and lower",
+    is_datacenter_blackwell(),
+    reason="int8_scaled_mm has no kernel for sm100/sm103: datacenter Blackwell "
+    "dropped the classic IMMA path. sm120 (consumer Blackwell) keeps it and is "
+    "covered.",
 )
 @pytest.mark.parametrize("M", [1, 16, 32, 64, 128, 512, 1024, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096, 8192, 16384])
