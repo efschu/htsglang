@@ -244,6 +244,9 @@ class TestGrowReRaise(CustomTestCase):
         ch = _BarrierMinChannel(1)
         rt = self._grow_setup(collective=ch.channel_for(0))
         self.assertIsNone(rt.on_round())  # boot state: stable
+        # Growth requires one prior dial (op_seq > 0, the headroom grant);
+        # simulate it -- replicated state, identical on every rank.
+        rt._op_seq = 1
         rt._test_vec["vec"] = (1, 3)  # the #297 cutover installed a new vector
         self.assertTrue(rt.pending_work())
         stats = rt.on_round()
@@ -261,6 +264,7 @@ class TestGrowReRaise(CustomTestCase):
 
     def test_growth_waits_for_idle(self):
         rt = self._grow_setup(ready=False)
+        rt._op_seq = 1
         rt._test_vec["vec"] = (1, 3)
         self.assertIsNone(rt.on_round())
         self.assertEqual(rt.epoch, 0)
@@ -268,10 +272,27 @@ class TestGrowReRaise(CustomTestCase):
 
     def test_cadence_gate(self):
         rt = self._grow_setup(interval=4)
+        rt._op_seq = 1
         rt._test_vec["vec"] = (1, 3)
         for _ in range(3):
             self.assertIsNone(rt.on_round())
         self.assertIsNotNone(rt.on_round())  # 4th round is the boundary
+
+    def test_no_growth_before_first_dial(self):
+        """Card-run finding: chunk-rounding slack in the natural budgets
+        funded a spontaneous boot grow past the fitted ceiling, breaking
+        declared-vector resharding. Growth stays held until op_seq > 0."""
+        # Boot backing already covers both vectors (the fitted-ceiling
+        # situation), so the vector flip alone needs no backing adjust.
+        rt = self._grow_setup(boot_rows=[200, 200])
+        rt._test_vec["vec"] = (1, 3)  # growth funded...
+        self.assertIsNone(rt.on_round())  # ...but never armed without a dial
+        self.assertEqual(rt.epoch, 0)
+        self.assertFalse(rt.pending_work())
+        rt._op_seq = 1  # the headroom grant
+        self.assertTrue(rt.pending_work())
+        stats = rt.on_round()
+        self.assertEqual(stats["kind"], "grow")
 
 
 class TestShrinkDiscipline(CustomTestCase):
@@ -492,6 +513,7 @@ class TestConsensusDiscipline(CustomTestCase):
             for q in range(n):
                 rt._ranks[q].budget_bytes = 40_000
             rt._shrink_authorized = False
+            rt._op_seq = 1  # growth is armed only after a dial
         rts[1]._ranks[0].budget_bytes = 30_000  # the poison
         results, errors = self._run_ranks(n, lambda r: rts[r].on_round())
         for r in range(n):
@@ -533,6 +555,7 @@ class TestConsensusDiscipline(CustomTestCase):
         for rt in rts:
             for q in range(n):
                 rt._ranks[q].budget_bytes = 40_000  # uniform raise
+            rt._op_seq = 1  # growth is armed only after a dial
         results, errors = self._run_ranks(n, lambda r: rts[r].on_round())
         self.assertEqual(errors, [None] * n)
         for r in range(n):

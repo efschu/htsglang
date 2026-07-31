@@ -366,18 +366,29 @@ class KvCapacityRuntime:
         )
 
     def effective_budget_ceiling_bytes(self, r: int) -> int:
-        """Budget beyond which the VA reservation binds (raising further has
-        no effect); used to clamp stored budgets for honest ledger entries."""
-        vec = tuple(self._vector_fn())
+        """Budget beyond which raising further has no effect; used to clamp
+        stored budgets for honest ledger entries. Card-run finding: the
+        VA-derived bound under the CURRENT vector can lie BELOW the rank's
+        actual backing (e.g. after resharding to a vector with a small ratio
+        on that rank), and clamping there both falsified the ledger and
+        blocked the pre-provision escape -- so the ceiling is never below
+        floor + the rank's backed bytes, and never below the best declared
+        vector's funding needs (pre-provisioning a pending reshard must stay
+        fundable)."""
         st = self._ranks[r]
-        v_r, s = int(vec[r]), sum(vec)
-        unit_va = st.target_reserve_rows // v_r - 1
-        if st.draft_token_bytes > 0:
-            unit_va = min(unit_va, st.draft_reserve_tokens // s)
-        kv = (unit_va + 1) * v_r * st.target_row_bytes + (
-            unit_va * s + self._page
+        best = st.floor_bytes + st.backed_rows * st.target_row_bytes + (
+            self._c_cur + self._page
         ) * st.draft_token_bytes
-        return st.floor_bytes + kv
+        for vec in self._vector_caps or {tuple(self._vector_fn()): None}:
+            v_r, s = int(vec[r]), sum(vec)
+            unit_va = st.target_reserve_rows // v_r - 1
+            if st.draft_token_bytes > 0:
+                unit_va = min(unit_va, st.draft_reserve_tokens // s)
+            kv = (unit_va + 1) * v_r * st.target_row_bytes + (
+                unit_va * s + self._page
+            ) * st.draft_token_bytes
+            best = max(best, st.floor_bytes + kv)
+        return best
 
     # -- state accessors -------------------------------------------------------
 
@@ -603,6 +614,25 @@ class KvCapacityRuntime:
         replicated state (budgets, floors, vector, pending reshard target,
         the backing model, the authorization flag)."""
         c_target = self.compute_target_c(vec)
+        # Grow deadband: the byte->unit inversion carries ceil/page rounding
+        # slack of a few owner blocks, so a natural boot can look like a
+        # tiny grow (card run finding: +epsilon at the first boundary). A
+        # growth below two owner blocks is noise, not capacity.
+        if self._c_cur < c_target < self._c_cur + 2 * sum(vec):
+            c_target = self._c_cur
+        # No growth before the first dial (card run finding): the natural
+        # boot budgets include the chunk-rounding slack of the ceiling
+        # backing, which funded a spontaneous grow past the fitted ceiling
+        # and broke declared-vector resharding until a dial-down. Growth is
+        # armed only once an operator has touched the budgets (op_seq > 0);
+        # from then on it is automatic (including the post-reshard re-raise).
+        if c_target > self._c_cur and self._op_seq == 0:
+            self._hold(
+                f"growth to {c_target} tokens is funded but no dial has "
+                f"authorized headroom yet (POST /vram_budget); holding the "
+                f"boot ceiling {self._c_cur}"
+            )
+            c_target = self._c_cur
         if c_target >= self._c_cur or self._shrink_authorized:
             c_new = c_target
         else:
@@ -830,41 +860,36 @@ class KvCapacityRuntime:
 
 
 def _measure_local_floor_bytes(participants: List[DialParticipant]) -> tuple:
-    """(floor_bytes, card_uuid, device_index): NVML per-process used bytes on
-    this rank's card minus the VMM-backed KV bytes. NVML is the honest
-    source: it sees the CUDA context, NCCL buffers and every non-torch
-    allocation the caching allocator cannot account for."""
+    """(floor_bytes, card_uuid, device_index): CARD-level NVML used bytes on
+    this rank's card minus the VMM-backed KV bytes.
+
+    Card-level on purpose (first card run findings): per-process NVML pids
+    are namespace-shifted inside the LXC container, and sibling rank
+    processes leave small CUDA contexts on foreign cards -- pid matching is
+    ambiguous, the card total is not. The arb window guarantees exclusivity
+    at boot, so everything used on the card minus our KV backing IS this
+    rank's pinned floor (plus sibling context slivers, which honestly do
+    reduce what a dial can release on this card). The device index comes
+    from the runner's own gpu_id, never from the scheduler thread's
+    current-device (which is unset there -- also a card-run finding)."""
     import torch
 
     from sglang.srt.registry import nvml
 
-    device_index = torch.cuda.current_device()
-    uuid = nvml.current_device_uuid()
-    procs = nvml.process_bytes_on_uuid(uuid)
-    used = procs.get(os.getpid())
-    if used is None and len(procs) == 1:
-        # LXC containers report HOST pids through NVML while os.getpid() is
-        # the container pid. On the one-rank-per-card lane a single compute
-        # process on the card is unambiguous -- adopt it, loudly.
-        (host_pid, used), = procs.items()
-        logger.warning(
-            "%s NVML pid namespace mismatch (container pid %d not in %s); "
-            "adopting the single compute process (host pid %d, %d MiB) as "
-            "this rank's usage.",
-            LOG_PREFIX,
-            os.getpid(),
-            sorted(procs),
-            host_pid,
-            used // MIB,
-        )
-    if used is None:
+    device_index = int(getattr(participants[0].runner, "gpu_id", 0))
+    props = torch.cuda.get_device_properties(device_index)
+    uuid = f"GPU-{props.uuid}"
+    try:
+        info = nvml.memory_info_for_uuid(uuid)
+    except Exception as e:
         raise KvCapacityError(
-            f"NVML reports no memory for pid {os.getpid()} on card {uuid} "
-            f"(processes: {sorted(procs)}); cannot establish the pinned "
-            f"floor for --enable-vram-dial unambiguously."
-        )
+            f"cannot resolve NVML memory info for card {uuid} (cuda:"
+            f"{device_index}): {e}; --enable-vram-dial needs the card-level "
+            f"usage to establish the pinned floor."
+        ) from e
+    used = int(info.total_bytes - info.free_bytes)
     backed = sum(int(p.pool.vmm_backed_bytes) for p in participants)
-    floor = int(used) - backed
+    floor = used - backed
     if floor <= 0:
         raise KvCapacityError(
             f"floor measurement came out non-positive ({floor} bytes = "
@@ -921,7 +946,12 @@ def _refresh_capacity_snapshots(scheduler, c_new: int) -> None:
     ):
         comp = getattr(scheduler, attr, None)
         if comp is not None and hasattr(comp, "max_total_num_tokens"):
-            comp.max_total_num_tokens = c_new
+            try:
+                comp.max_total_num_tokens = c_new
+            except Exception:
+                # Several scheduler components are frozen dataclasses (card
+                # run finding); the refresh is still the right semantics.
+                object.__setattr__(comp, "max_total_num_tokens", c_new)
 
 
 def _commit_on_scheduler(

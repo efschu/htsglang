@@ -197,6 +197,20 @@ Ledger I/O failures log loudly but never take serving down.
   clamp + exact reconcile at the first boundary),
   `--vram-dial-consensus-interval N` (default 8).
 
+## 9b. Known limit (card-run finding, open)
+
+Slot ids ABOVE the boot fitted ceiling carry an open defect: sustained
+10-way 30k-token concurrency after growth (held tokens ~0.88 of the grown
+ceiling) hits a `store_kvcache` `index < size_limit` device assert on a
+2-kv-head rank. The bound passed is live (`pool.size + page`), and the
+owner-rule row/draft bounds are arithmetically covered, so the escaping
+index implicates a path first exercised when allocation reaches the grown
+id region (low ids are handed out first; a 260k-token sequential fill with
+peak 80k concurrent was clean). Needs a dedicated debug window
+(compute-sanitizer, SGLANG_POISON_POOL_DATA). Until resolved: dial-down/up
+WITHIN the boot ceiling is fully validated; growth beyond it carries this
+known limit. Registered in INTEGRATION_R3_VALIDATION (#330 section).
+
 ## 10. Deliberately NOT built
 
 * The #305 pause rung (suspend a tenant wholesale) — separate task; this
