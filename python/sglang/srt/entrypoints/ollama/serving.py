@@ -25,6 +25,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowResponse,
     OllamaTagsResponse,
 )
+from sglang.srt.liveness import guard_generate_stream
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -165,9 +166,16 @@ class OllamaServing:
 
                 yield orjson.dumps(response.model_dump()) + b"\n"
 
-        return StreamingResponse(
-            generate_stream(),
-            media_type="application/x-ndjson",
+        # #344: the Ollama routes never had any abort path -- no background
+        # task, no disconnect check -- so a client that walked away held KV
+        # blocks until the generation finished on its own.
+        return guard_generate_stream(
+            StreamingResponse(
+                generate_stream(),
+                media_type="application/x-ndjson",
+            ),
+            tokenizer_manager=self.tokenizer_manager,
+            obj=gen_request,
         )
 
     async def handle_generate(
@@ -281,9 +289,16 @@ class OllamaServing:
 
                 yield orjson.dumps(response.model_dump()) + b"\n"
 
-        return StreamingResponse(
-            generate_stream(),
-            media_type="application/x-ndjson",
+        # #344: the Ollama routes never had any abort path -- no background
+        # task, no disconnect check -- so a client that walked away held KV
+        # blocks until the generation finished on its own.
+        return guard_generate_stream(
+            StreamingResponse(
+                generate_stream(),
+                media_type="application/x-ndjson",
+            ),
+            tokenizer_manager=self.tokenizer_manager,
+            obj=gen_request,
         )
 
     def get_tags(self) -> OllamaTagsResponse:

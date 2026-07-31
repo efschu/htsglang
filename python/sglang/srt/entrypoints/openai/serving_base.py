@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.liveness import EndpointClass, guard_generate_stream
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -107,8 +108,19 @@ class OpenAIServingBase(ABC):
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
+                )
+                # #344: one place for every OpenAI-shaped streaming endpoint.
+                # Each of them already schedules a background abort, but that
+                # runs after the response body ends -- which is exactly what
+                # does not happen when a client stops reading without closing.
+                # A non-streaming or error response passes through untouched.
+                return guard_generate_stream(
+                    response,
+                    tokenizer_manager=self.tokenizer_manager,
+                    obj=adapted_request,
+                    endpoint_class=self._liveness_endpoint_class(),
                 )
             else:
                 return await self._handle_non_streaming_request(
@@ -138,6 +150,16 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+
+    def _liveness_endpoint_class(self) -> EndpointClass:
+        """Which #344 timeout applies to this endpoint's streams.
+
+        Token streams by default, which is what chat, completions and the
+        Anthropic and Ollama shapes all are. A subclass whose stream is a
+        different kind of thing -- transcription writes per audio chunk, not
+        per token -- overrides this to get its own budget.
+        """
+        return EndpointClass.LLM_STREAM
 
     @abstractmethod
     def _request_id_prefix(self) -> str:

@@ -170,10 +170,12 @@ class OpenAIServingFineTuning:
         self, job_id: str, *, after: Optional[str]
     ) -> AsyncIterator[str]:
         """Backlog then live tail, bounded by a #344 consumer watchdog."""
-        from sglang.srt.video_enhance.liveness import (  # noqa: PLC0415
+        from sglang.srt.liveness import (  # noqa: PLC0415
+            ClaimKind,
             ConsumerWatchdog,
             EndpointClass,
             LivenessConfig,
+            ResourceClaim,
         )
 
         store = self._service.jobs
@@ -192,7 +194,14 @@ class OpenAIServingFineTuning:
             store.unsubscribe(job_id, queue)
 
         watchdog = ConsumerWatchdog(
-            job_id=f"ftevents-{job_id}", policy=policy, release=release
+            job_id=f"ftevents-{job_id}",
+            policy=policy,
+            release=release,
+            # A subscriber queue and nothing else. Declared anyway so a stuck
+            # tap shows up in the attachment registry next to the streams that
+            # do hold a card -- an operator asking "what is attached and
+            # quiet" wants the complete answer, not the expensive half of it.
+            claims=(ResourceClaim(kind=ClaimKind.SUBSCRIBER, key=job_id),),
         )
         watchdog.start()
         # Keepalives are what make silence attributable. Without them a job

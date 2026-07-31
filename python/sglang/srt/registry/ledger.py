@@ -136,6 +136,15 @@ class ReservationEntry:
     pid: int = 0
     heartbeat_ts: float = 0.0
     lease_expiry_ts: float = 0.0
+    #: #344: the client this tenant is serving has gone quiet and is a dead
+    #: suspect, but has not been declared dead yet. The bytes are still
+    #: reserved and the tenant is still alive -- what changed is that nobody
+    #: is currently reading the work they are paying for, so a reclaimer may
+    #: prefer these bytes over an actively used tenant's. Advisory only:
+    #: nothing in this module acts on the flag.
+    in_grace: bool = False
+    #: When the flag was last set. Zero while ``in_grace`` is false.
+    grace_since_ts: float = 0.0
 
     @property
     def is_gpu_resident(self) -> bool:
@@ -161,12 +170,17 @@ class ReservationEntry:
             pid=int(data.get("pid", 0)),
             heartbeat_ts=float(data.get("heartbeat_ts", 0.0)),
             lease_expiry_ts=float(data.get("lease_expiry_ts", 0.0)),
+            # Defaulted, so a ledger file written by a server from before
+            # #344 reads back as an ordinary active entry.
+            in_grace=bool(data.get("in_grace", False)),
+            grace_since_ts=float(data.get("grace_since_ts", 0.0)),
         )
 
     def describe(self) -> str:
+        grace = " [in grace, reclaimable]" if self.in_grace else ""
         return (
             f"{self.tenant_id} (class {self.klass}, {self.state.value}, pid {self.pid}) "
-            f"reserved {self.reserved_bytes / MIB:.0f} MiB"
+            f"reserved {self.reserved_bytes / MIB:.0f} MiB{grace}"
         )
 
 
@@ -201,16 +215,35 @@ class CardLedger:
         its declaration, which is a ledger finding, not something to clamp."""
         return self.reserved_bytes - self.measured_bytes
 
+    @property
+    def in_grace(self) -> tuple[ReservationEntry, ...]:
+        return tuple(e for e in self.gpu_resident if e.in_grace)
+
+    @property
+    def grace_bytes(self) -> int:
+        """Reserved bytes held by tenants whose client is a dead suspect (#344).
+
+        Distinct from ``waste_bytes``: waste is memory a tenant declared and
+        has not touched, which it may still need. This is memory a tenant is
+        genuinely using on behalf of a consumer that appears to have left, so
+        it is the more honest first target when a card is under pressure.
+        Reporting only -- reclaiming is #287's staircase to decide.
+        """
+        return sum(e.reserved_bytes for e in self.in_grace)
+
     def render(self) -> str:
         if not self.entries:
             return f"{self.card_uuid}: no reservations"
         lines = [f"{self.card_uuid}:"]
         lines += [f"  {e.describe()}" for e in self.entries]
-        lines.append(
+        summary = (
             f"  reserved {self.reserved_bytes / MIB:.0f} MiB, "
             f"measured {self.measured_bytes / MIB:.0f} MiB, "
             f"waste {self.waste_bytes / MIB:.0f} MiB"
         )
+        if self.grace_bytes:
+            summary += f", in grace {self.grace_bytes / MIB:.0f} MiB"
+        lines.append(summary)
         return "\n".join(lines)
 
 
@@ -578,6 +611,29 @@ class ReservationStore:
             "heartbeat",
             lambda entry, now: replace(
                 entry, heartbeat_ts=now, lease_expiry_ts=now + float(lease_seconds)
+            ),
+        )
+
+    def set_grace(
+        self, card_uuid: str, tenant_id: str, in_grace: bool
+    ) -> ReservationEntry:
+        """Mark the tenant's client as a dead suspect, or clear the mark (#344).
+
+        The lease is untouched on purpose. A tenant in grace is still running
+        and still holds its device memory -- shortening its lease would let
+        the reaper hand the same bytes to somebody else while they are in
+        use, which is exactly the failure ``_reap_unlocked`` refuses to make.
+        What this changes is only what a reclaimer *sees*: bytes booked
+        against a consumer that appears to have left.
+        """
+        return self._mutate(
+            card_uuid,
+            tenant_id,
+            "set_grace",
+            lambda entry, now: replace(
+                entry,
+                in_grace=bool(in_grace),
+                grace_since_ts=(now if in_grace else 0.0),
             ),
         )
 

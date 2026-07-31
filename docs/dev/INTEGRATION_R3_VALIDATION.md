@@ -19457,3 +19457,147 @@ Vor-Fenster-Stand zurueckgesetzt; die aufgestockte Fassung liegt als
 `hw_profile_with_int8_lane.json` bei den Rohdaten. Beim Beenden des eigenen
 Servers wurde die PGID gegen die eigene PID geprueft, bevor das Signal ging —
 auf der Kiste liefen fremde sglang-Prozesse.
+
+## #344b — Universelle Client-Liveness: ein Kern, zwoelf Endpunktklassen, Grace statt Pinning
+
+Basis `eaaa4efb2f` (`integration/r3-probe-next2`), Branch
+`feat/universal-liveness-344`. Reine Schreibtischarbeit, `CUDA_VISIBLE_DEVICES=99`,
+keine Karte angefasst. Entwurfsnotiz: `docs/dev/DESIGN_344_liveness.md`,
+Runbook-Abschnitt 11.
+
+### Was der Audit gefunden hat
+
+Neunzehn langlebige Client-Bindungen im Baum. Drei Befunde, die vorher
+niemand benannt hatte:
+
+1. **`/v1/responses` hatte gar keinen Abort-Pfad** — nicht einmal den
+   2-Sekunden-Hintergrundtask, den alle anderen OpenAI-Streams tragen. Im
+   Generator stand woertlich `# TODO: 1. Handle disconnect`. Ein Client, der
+   mitten im Stream auflegte, hielt KV-Bloecke und einen Running-Batch-Slot
+   bis EOS.
+2. **Die Ollama-Routen (`/api/chat`, `/api/generate`) genauso** — kein
+   Hintergrundtask, kein `is_disconnected()`, kein `finally` in der ganzen
+   Datei.
+3. **Bild- und Speech-Lane** (`/v1/images/*`, `/v1/audio/speech`): schlichte
+   FastAPI-Handler ohne `is_disconnected()`-Poll. Starlette bricht einen
+   normalen Handler bei Disconnect nicht ab, also lief der Diffusions- bzw.
+   Speech-Job auf der Gegenseite bis zum vollen `aiohttp`-Timeout weiter (900 s
+   bzw. 300 s) fuer einen Client, der laengst weg war.
+
+Der 2-Sekunden-Hintergrundtask, den die uebrigen Streams tragen, ist **kein**
+Schutz gegen den hier interessanten Fall: er laeuft erst, wenn der Response-Body
+endet — und genau das passiert bei einem Client, der nicht liest und nicht
+schliesst, nie.
+
+Ehrlich negativ geblieben (in der Entwurfsnotiz §7 gelistet, nicht gefaked):
+gRPC-Bridge bei sofort geschlossenem Kanal, Planner-Dashboard-SSE (synchroner
+`ThreadingHTTPServer`, der asyncio-Watchdog passt dort nicht), Realtime-WS.
+
+### Was gebaut wurde
+
+`python/sglang/srt/liveness/` als Paket — nicht im `video_enhance`-Tenant,
+weil `srt/entrypoints` und `srt/registry` die Konsumenten sind und keiner von
+beiden aus einem Tenant-Paket importieren darf. `video_enhance/liveness.py`
+ist jetzt ein Re-Export mit identischer oeffentlicher Flaeche; `EndpointClass`
+hat Mitglieder dazubekommen, kein bestehendes Mitglied und kein Default hat
+sich geaendert.
+
+Verdrahtet: `/generate`, `/v1/responses`, Ollama x2, alle OpenAI-Streams ueber
+den einen Punkt `OpenAIServingBase.handle_request` (Chat, Completions,
+Transcription, Anthropic erben), Bild- und Speech-Lane ueber
+`await_with_liveness`, Video-Enhance und Training-Events wie gehabt.
+
+Flags: `--client-liveness-timeouts` (`<klasse>=<sekunden>,...`),
+`--client-liveness-poll-interval-s` (1.0),
+`--client-liveness-teardown-timeout-s` (30.0),
+`--client-liveness-grace-fraction` (0.25).
+`--training-event-stream-timeout-s` bleibt als Kurzform fuer eine Klasse
+gueltig und verliert gegen die allgemeine Flag.
+
+### Grace: gehalten, in Grace, reclaimable — versus aktiv benutzt
+
+Zwischen "still" und "fuer tot erklaert" liegt das Grace-Fenster. Die
+Bindung wird nicht abgeraeumt, aber ihre Claims werden im
+prozessweiten `AttachmentRegistry` als **reclaimable** veroeffentlicht.
+`DEAD` ist bewusst *nicht* reclaimable: dort laeuft der eigene Release des
+Watchdogs, und ein zweiter Reclaimer wuerde dieselben Objekte von zwei Seiten
+abbauen.
+
+Der eine verdrahtete Konsument ist das **VRAM-Ledger**, weil es die
+prozessuebergreifende Sicht ist: Arbiter, ein zweiter Serving-Prozess auf
+derselben Karte und die `registry`-Ausgabe lesen die Datei, und keiner von
+ihnen sieht Python-Objekte dieses Prozesses. `ReservationEntry` hat
+`in_grace`/`grace_since_ts`, `CardLedger.grace_bytes` summiert, `render()`
+zeigt `[in grace, reclaimable]`. Beispielausgabe (hermetisch erzeugt):
+
+```
+GPU-x:
+  t1 (class 3, HOT, pid ...) reserved 6000 MiB [in grace, reclaimable]
+  reserved 6000 MiB, measured 0 MiB, waste 6000 MiB, in grace 6000 MiB
+```
+
+Die Lease wird dabei **nicht** verkuerzt. Ein Tenant in Grace laeuft noch und
+haelt sein Device-Memory; eine vorgezogene Lease-Expiry wuerde dem Reaper
+erlauben, dieselben Bytes an einen zweiten Tenant zu vergeben, waehrend sie
+benutzt werden — genau der Fehler, den `_reap_unlocked` seit #305-M1 verweigert.
+`grace_bytes` ist auch nicht dasselbe wie `waste_bytes`: Waste ist deklariertes,
+nie angefasstes Memory, das der Tenant noch brauchen koennte; Grace ist Memory,
+das er wirklich benutzt — fuer einen Konsumenten, der offenbar weg ist.
+
+### Testergebnisse
+
+`test/registered/liveness/test_universal_liveness.py`: **40 Tests, alle gruen,
+12 s**, hermetisch, CPU-only. Dazu die 22 bestehenden aus
+`test/registered/video_enhance/test_liveness.py`.
+
+Gesamtlauf der beruehrten Suiten:
+`liveness + video_enhance + registry + training` = **499 passed, 51 subtests**,
+36 s. Breiterer Lauf `test/registered/unit` + `lora/test_lora_openai_api.py`
++ `prefill_only/test_serving_rerank.py`: keine Regression gegenueber dem
+Basisstand (verbleibende Fehler sind GPU- bzw. `sglang`-Binary-abhaengig und
+bestehen auf der Basis genauso).
+
+Die drei Formen eines toten Clients, jede auf einem echten Stream, jede **mit
+einem zweiten gesunden Stream auf derselben Event-Loop**, der waehrend des
+ganzen Abbaus weiter Frames bekommen muss — das ist das Tor "nichts blockiert
+unnoetig":
+
+| Fall | Erwartung | Ergebnis |
+|---|---|---|
+| liest nicht mehr, schliesst nicht | Release innerhalb des konfigurierten Timeouts | gruen, gemessen 0,25-2,0 s bei `timeout_s=0.25` |
+| schliesst hart | **kein** Release-Pfad, das `finally` des Generators raeumt auf | gruen; doppelter Abbau waere die Regression |
+| verschwindet mitten im Stream | Release, obwohl niemand den Generator je schliesst | gruen |
+| gesunder Nachbar | bekommt waehrenddessen weiter Frames, wird nie gedroppt | gruen in allen drei Faellen |
+
+Zeitmessende Tests laufen mit echten kurzen Dauern (400 ms), nicht mit einer
+Fake-Clock: die zu pruefende Eigenschaft ist *Nebenlaeufigkeit*, und eine Uhr,
+die der Test von Hand vorstellt, kann nicht zeigen, dass zwei Streams
+unabhaengig vorangekommen sind. Policy-Arithmetik nutzt die Fake-Clock — dort
+kauft Wanduhr-Zeit nichts, inklusive eines Durchlaufs, der alle zwoelf Klassen
+mit ihrem jeweiligen Default startet und freigibt.
+
+Zwei bestehende Tests mussten angepasst werden, beide aus demselben Grund
+(die Klassen- bzw. Schema-Tabelle ist gewachsen), keiner wegen geaenderten
+Verhaltens: `test_an_unknown_class_is_refused_by_name` benutzte `llm_stream`
+als Platzhalter fuer eine unbekannte Klasse, und
+`test_acquire_writes_the_documented_schema` listet das Ledger-Schema
+vollstaendig auf.
+
+Werkzeuge: `ruff --select=F401,F821,UP037` sauber auf allen geaenderten und
+neuen Dateien, `codespell` sauber, `isort` und `black` angewandt. Die
+CLI-Flags parsen gegen `ServerArgs.add_cli_args`; eine unbekannte Klasse und
+eine Grace-Fraction ausserhalb `[0,1]` werden beim **Start** abgelehnt, nicht
+still ignoriert.
+
+### Nicht gemessen
+
+Keiner der Klassen-Defaults ist gemessen. `image_generation=900` und
+`audio_speech=300` sind aus den Forward-Timeouts der jeweiligen Lane
+abgeleitet, `registry_lease=120` aus `ledger.DEFAULT_LEASE_SECONDS` (ein Test
+haelt beide zusammen). Der Rest — `llm_stream=90`, `video_stream=300`,
+`preview_tap=15`, `control=60`, `training_events=120`,
+`audio_transcription=120`, `realtime_session=60`, `dashboard_sse=60`,
+`embedding=60` — sind begruendete Urteile, jedes mit seiner Begruendung im
+Code (`DEFAULT_TIMEOUT_RATIONALE`), keines mit einer Messung dahinter. Die
+Grace-Fraction 0,25 ebenso. Ein Messfenster dafuer ist offen und nicht
+Bestandteil dieses Stands.

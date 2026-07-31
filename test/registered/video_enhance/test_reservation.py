@@ -126,6 +126,11 @@ class TestEntrySchemaAndRoundTrip(LedgerTestCase):
                 "pid",
                 "heartbeat_ts",
                 "lease_expiry_ts",
+                # #344: whether this tenant's consumer is a dead suspect. Part
+                # of the written schema because the reclamation ladder reading
+                # the file runs in another process.
+                "in_grace",
+                "grace_since_ts",
             },
         )
         self.assertEqual(entry["state"], "HOT")

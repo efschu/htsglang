@@ -127,13 +127,64 @@ class OpenAIServingImages:
 
     async def generations(self, body: dict, raw_request: Request) -> ORJSONResponse:
         lane = self._resolve_lane(body.get("model"))
-        return await self._forward_json(lane + "/v1/images/generations", body)
+        return await self._guard(
+            self._forward_json(lane + "/v1/images/generations", body),
+            raw_request,
+            "generations",
+        )
 
     async def edits(
-        self, form: dict, files: dict, model: Optional[str]
+        self,
+        form: dict,
+        files: dict,
+        model: Optional[str],
+        raw_request: Optional[Request] = None,
     ) -> ORJSONResponse:
         lane = self._resolve_lane(model)
-        return await self._forward_multipart(lane + "/v1/images/edits", form, files)
+        return await self._guard(
+            self._forward_multipart(lane + "/v1/images/edits", form, files),
+            raw_request,
+            "edits",
+        )
+
+    async def _guard(self, coro, raw_request, label: str) -> ORJSONResponse:
+        """#344: stop waiting on the lane once the client has hung up.
+
+        A plain FastAPI handler is not cancelled when the client disconnects,
+        so before this a caller that pressed Ctrl-C in the first second left
+        the lane rendering for up to the full 900 s forward timeout, on a GPU
+        it was the only claimant for. Polling ``is_disconnected`` is the only
+        signal available here: an image generation writes once, at the end,
+        so there are no frames for a progress-based watchdog to count.
+        """
+        from sglang.srt.liveness import (  # noqa: PLC0415 - import cost off the path
+            ConsumerGone,
+            EndpointClass,
+            await_with_liveness,
+        )
+
+        job_id = f"images-{label}-{id(coro):x}"
+        try:
+            return await await_with_liveness(
+                coro,
+                raw_request=raw_request,
+                endpoint_class=EndpointClass.IMAGE_GENERATION,
+                job_id=job_id,
+            )
+        except ConsumerGone as exc:
+            # Nobody is reading this. It exists so the log and any middleware
+            # see a terminated request rather than a swallowed one.
+            return ORJSONResponse(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "client_closed_request",
+                        "param": None,
+                        "code": 499,
+                    }
+                },
+                status_code=499,
+            )
 
     async def variations(self, model: Optional[str]) -> ORJSONResponse:
         # Resolve the lane first: with no lane at all, "no image lane" is the

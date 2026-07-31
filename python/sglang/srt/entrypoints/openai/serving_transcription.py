@@ -88,6 +88,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "trsc-"
 
+    def _liveness_endpoint_class(self):
+        """#344: a transcription stream writes per audio chunk, not per token."""
+        from sglang.srt.liveness import EndpointClass
+
+        return EndpointClass.AUDIO_TRANSCRIPTION
+
     def _reject_if_not_asr(self) -> Optional[ORJSONResponse]:
         """Refuse transcription when the served model is not an ASR model.
 

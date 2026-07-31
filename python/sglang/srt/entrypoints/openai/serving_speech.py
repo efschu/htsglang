@@ -108,7 +108,7 @@ class OpenAIServingSpeech:
             detail=detail,
         )
 
-    async def create_speech(self, body: dict) -> Response:
+    async def create_speech(self, body: dict, raw_request=None) -> Response:
         invalid = self._validate(body)
         if invalid is not None:
             raise invalid
@@ -117,7 +117,35 @@ class OpenAIServingSpeech:
         if not lane:
             raise self._reject_no_lane(self._view_resolver(), body.get("model"))
 
-        return await self._forward(lane + "/v1/audio/speech", body)
+        # #344: same shape as the image lane and the same failure -- one long
+        # await with no intermediate writes, and a GPU job on the far side of
+        # it that keeps running for a client that already left.
+        from sglang.srt.liveness import (  # noqa: PLC0415
+            ConsumerGone,
+            EndpointClass,
+            await_with_liveness,
+        )
+
+        coro = self._forward(lane + "/v1/audio/speech", body)
+        try:
+            return await await_with_liveness(
+                coro,
+                raw_request=raw_request,
+                endpoint_class=EndpointClass.AUDIO_SPEECH,
+                job_id=f"speech-{id(coro):x}",
+            )
+        except ConsumerGone as exc:
+            return ORJSONResponse(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "client_closed_request",
+                        "param": None,
+                        "code": 499,
+                    }
+                },
+                status_code=499,
+            )
 
     async def _forward(self, url: str, body: dict) -> Response:
         import aiohttp  # noqa: PLC0415
