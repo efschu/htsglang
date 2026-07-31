@@ -157,6 +157,23 @@ def main() -> int:
     print(f"\ntarget card: {target_card.describe()}\n", flush=True)
     report["target_card"] = target_card.uuid
 
+    # Pre-flight, before a GPU minute is spent: the ledger only knows about
+    # tenants that declared themselves, and this rig is shared with sessions
+    # that do not. A card already occupied by someone else's process turns a
+    # 20-minute window into a five-minute load followed by an OOM kill, and
+    # the log makes that look like a budget mistake.
+    free_mib = memory_info_for_uuid(target_card.uuid).free_bytes // MIB
+    needed_mib = args.budget_mib + 400
+    if free_mib < needed_mib:
+        print(
+            f"refusing to start: {target_card.name} has {free_mib} MiB free but this "
+            f"window needs {needed_mib} MiB (budget {args.budget_mib} + 400 MiB "
+            "corridor). Another process holds the card; wait for it or lower "
+            "--budget-mib.",
+            file=sys.stderr,
+        )
+        return 2
+
     totals = card_totals_from_nvml()
     store = ReservationStore(out / "ledger")
     registry = EngineRegistry(
@@ -183,14 +200,14 @@ def main() -> int:
             args.budget_mib,
             out / "hibernate-qwen35-9b",
         ),
-        "qwen36-27b": engine_spec(
-            "qwen36-27b",
-            MODEL_ROOT / "Qwen3.6-27B-MTP-Q3_K_M-GGUF" / "Qwen3.6-27B-Q3_K_M.gguf",
-            MODEL_ROOT / "Qwen3.6-27B-MTP-Q3_K_M-GGUF",
+        "qwen35-9b-q8": engine_spec(
+            "qwen35-9b-q8",
+            MODEL_ROOT / "Qwen3.5-9B-GGUF" / "Qwen3.5-9B-Q8_0.gguf",
+            MODEL_ROOT / "Qwen3.5-9B-GGUF",
             target_card.uuid,
             args.port_b,
             args.budget_mib,
-            out / "hibernate-qwen36-27b",
+            out / "hibernate-qwen35-9b-q8",
         ),
     }
 
@@ -233,7 +250,7 @@ def main() -> int:
             adapter="class1_srt",
             placement=(target_card.uuid,),
             launch={
-                "model_path": str(specs["qwen36-27b"].launch["model_path"]),
+                "model_path": str(specs["qwen35-9b-q8"].launch["model_path"]),
                 "port": 31_599,
                 "rank_gpu_memory_mib": target_card.total_mib + 1024,
             },
@@ -252,7 +269,7 @@ def main() -> int:
             adapter="class1_srt",
             placement=(target_card.uuid,),
             launch={
-                "model_path": str(specs["qwen36-27b"].launch["model_path"]),
+                "model_path": str(specs["qwen35-9b-q8"].launch["model_path"]),
                 "port": 31_598,
                 "rank_gpu_memory_mib": args.budget_mib,
             },
@@ -271,9 +288,9 @@ def main() -> int:
         print(
             "\n== 5. hot switch: engine B in, engine A out (hibernated) ==", flush=True
         )
-        transition(registry, "qwen36-27b", ResidencyState.HOT, report["transitions"])
+        transition(registry, "qwen35-9b-q8", ResidencyState.HOT, report["transitions"])
         assert registry.instance("qwen35-9b").state is ResidencyState.COLD
-        text_b = registry.adapter("qwen36-27b").generate_probe(
+        text_b = registry.adapter("qwen35-9b-q8").generate_probe(
             "The capital of France is"
         )
         print(f"  engine B says: {text_b!r}", flush=True)

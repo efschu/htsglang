@@ -17405,3 +17405,104 @@ default.
   checkpoints rather than the safetensors Qwen3.5-2B / Llama-8B: for those two
   the ladder still works, but its bottom rung costs a checkpoint load and the
   hot-switch number would measure nothing about hibernate.
+
+## Live control plane, no GPU booked
+
+`python -m sglang.srt.registry --engines <file> --print-plan` on the real rig,
+with one Class-1 GGUF spec and one Class-2 estimate-only spec, both
+auto-placed:
+
+```
+engines:      [('qwen35-9b', 1, 'COLD', 20000 MiB), ('flux-stub', 2, 'COLD', 14500 MiB)]
+hot_capacity: derived_max_hot=1, would_be_hot=['flux-stub'],
+              excluded: qwen35-9b -- card GPU-31d7ef41... would hold 34500 MiB
+              + 400 MiB corridor against 32607 MiB total
+cards:        5090   total 32607  available 32207  corridor_ok True
+              3080-a total 20480  available 20080  corridor_ok True
+              3080-b total 20480  available 20080  corridor_ok True
+```
+
+Both specs registered, costed and excluded-with-arithmetic in under a second,
+nothing booted, no GPU window booked. That is the §7.4 property the whole
+control plane exists for.
+
+**One honest limitation this run exposes.** Auto-placement ranks cards by
+*ledger* availability, so both engines landed on the 5090 even though, at that
+moment, another session's undeclared process held 27 GiB of it and the 3080s
+were emptier by driver free memory. The ledger is a declaration layer: a
+tenant that never declared itself is invisible to placement, by construction.
+The corridor check does read the driver (`free_bytes_nvml`), so the arbiter
+still refuses to promote onto a card that is physically below corridor -- but
+plan-time card *choice* is only as good as what the tenants on the rig
+declared. On a rig where every tenant goes through the registry that is exact;
+on a shared rig it is not, and the harness now refuses to start rather than
+discovering it as an OOM five minutes into a load.
+
+## Card window: what ran, and what did not
+
+Raw data: `/spinning/gpu-battery-results/2026-07-31_333_m1_registry/`
+(`report.json`, `window.log`, per-engine server logs, the hibernate manifest).
+Harness: `scripts/registry/m1_card_window.py`. The card is resolved at runtime
+by NVML and never by index; the harness picks the largest card, which on this
+rig is the 5090 at NVML index 1 and CUDA index 0.
+
+Two Class-1 GGUF engines on the 5090, 20000 MiB budget each -- deliberately
+sized so that 2 x 20000 + 400 MiB corridor > 32607 MiB and only one can be
+hot. Engine A `Qwen3.5-9B-Q4_K_M`, engine B `Qwen3.6-27B-Q3_K_M`.
+
+### Reached, on the card (window 4, 235 s, `report.json`)
+
+| Step | Result |
+|---|---|
+| Register both | both `COLD`, 0 bytes reserved, nothing booted |
+| Derived M | **1**, with the arithmetic: "card GPU-31d7ef41... would hold 40000 MiB + 400 MiB corridor against 32607 MiB total" |
+| Promote A | `HOT` in **109.1 s**, on the correct card (`avail mem=30.66 GB` = the 5090) |
+| A serves | `"The capital of France is"` -> `" Paris."` |
+| Ledger line | reserved 20000 MiB, measured **18216 MiB**, waste 1784 MiB, `corridor_ok` true; the two 3080s at 0 reserved / 0 measured |
+| Registration rejection | `oversized` (33631 MiB): refused at registration, no boot, quoting request / held / corridor / NVML total |
+| Promotion rejection | `contender`: 503-shaped, "would take about 105000 ms to promote (estimated) ... would evict ['qwen35-9b']" |
+| Demote A to `COLD` | #89 park succeeded: `manifest.json` + `rank0_GPU-31d7ef41-....pt`, **7.18 GB**, NVML-UUID in the filename; the card returned to ~0 |
+| Independent NVML sampler | 235 samples, minimum free on the 5090 **13503 MiB**, on each 3080 20052 MiB -- the corridor held throughout, verified outside the ledger |
+
+The measured 18216 MiB against a declared 20000 MiB budget is the
+absolute-MiB path working end to end: the registry declared the budget, the
+ledger held exactly that, and the engine landed 1784 MiB under it without any
+implicit ceiling being applied on top.
+
+### Not reached: the hibernate restore time
+
+Engine B's boot was killed by the **host** OOM killer (exit -9; the host had
+21 GiB of 98 GiB available at that moment, held by a concurrent session), so
+the switch back to A -- the number that would have shown a hibernate restore
+against A's 109.1 s cold boot -- never ran.
+
+Three further attempts were made with a smaller engine B
+(`Qwen3.5-9B-Q8_0`, 9.5 GB instead of 13 GB) and they were lost to rig
+contention, not to the code: another session on this box was cycling
+TP=3 boots across all three cards throughout, and the 5090 went from
+32089 MiB free to under 1 GiB inside the seconds between the harness's
+pre-flight check and its first allocation. The last two attempts died with
+"Not enough GPU memory for hybrid state cache" and an OOM kill respectively,
+with the NVML sampler recording a minimum of 512 MiB free on a card the
+harness had measured as empty.
+
+**Open item, named and not worked around:** `promotion_cost_ms` for a
+`COLD -> HOT` transition that restores from a #89 manifest, against the
+109.1 s cold-boot baseline already measured. Everything it needs is in place
+-- A's manifest is parked on disk under the 5090's UUID, and the harness's
+step 3 is now a restore rather than a cold load -- so it is one uncontended
+window, not more work.
+
+Two things this contention did establish, both of them by accident:
+
+- The **pre-flight guard** added after the second failed attempt (refuse to
+  start when the target card has less than budget + corridor free) is the
+  right shape but not sufficient on a shared rig: it closes the "start into an
+  occupied card" case and cannot close the "occupied one second later" case.
+  Only a tenant that declares itself in the ledger can be seen coming, which
+  is the argument for the registry rather than a caveat about it.
+- `#89`'s park is **UUID-locked in the filename**
+  (`rank0_GPU-31d7ef41-....pt`), so a manifest parked on the 5090 cannot be
+  silently restored onto a 3080 after an enumeration shift. That is the same
+  discipline the ledger applies to reservations, and it held here without
+  anyone having to arrange it.
