@@ -172,7 +172,10 @@ Non-obvious points, each load-bearing:
   (#265) no longer reports the small concentration steps as decode gains.
   The plan log names which gate bound — floor, decode-knee, or fundability —
   and only recommends `--rank-perf-loose-ctx-percent` when the floor is the
-  one that did.
+  one that did. If the gate that bound is the decode-knee and you want the
+  concentrated vector for a PREFILL-dominated operating point anyway, that is
+  what `--rank-perf-tune phase-prefill` is for (section 4.1.0) — not a looser
+  gate.
 - A candidate marked `UNBOOTABLE` in that log is not a context trade: it
   leaves a rank below its derived reserve demand, so raising
   `--rank-perf-loose-ctx-percent` buys an OOM in the first real prefill
@@ -188,6 +191,64 @@ Non-obvious points, each load-bearing:
 
 Validate with CUDA graphs and speculative decoding ON (the defaults above) —
 eager-only validation hides graph-replay bugs.
+
+### 4.1.0 Asking for the phase-optimal split by name (#354/#357): `--rank-perf-tune phase-prefill|phase-decode`
+
+The bullet above says `auto-performance` proposes no MLP vector at this
+operating point. That is still true for the single-vector targets, and it is
+the right answer for them: one weight split has to serve both phases, and
+#264/#354 measured the concentrated vector as net negative that way.
+
+The phase-optimal recipe is the other reading of the same measurement — one
+vector per phase, two boots:
+
+```bash
+# PREFILL arm: concentrated MLP vector, solved by the planner
+  --rank-tp-ratio auto-performance --rank-perf-tune phase-prefill \
+  --rank-auto-reserve-mib 4500,2700,2700 \
+
+# DECODE arm: the plain VRAM-auto split (the measured decode optimum)
+  --rank-tp-ratio auto-performance --rank-perf-tune phase-decode \
+  --rank-auto-reserve-mib 3000,2700,2700 \
+```
+
+Measured at the 27B point (#354, four boots, 16 points each):
+
+| Arm | Vector | Prefill s=1 | Decode bs=1 | `max_total_num_tokens` |
+|---|---|---|---|---|
+| FP8 decode arm (auto) | none | 1256,7 tok/s | **122,2 tok/s** | 453 632 |
+| FP8 prefill arm | `16,1,1` | **1540,3 tok/s** (+22,6 %) | 97,8 tok/s (−20,0 %) | 96 256 (−79 %) |
+| INT8 decode arm (auto) | none | 1685,2 tok/s | **112,0 tok/s** | 464 256 |
+| INT8 prefill arm | `10,1,1` | **1787,5 tok/s** (+6,1 %) | 119,6 tok/s (n=1, undecided) | 137 664 (−70 %) |
+
+Non-obvious points:
+
+- **The two arms solve different vectors per checkpoint format.** FP8
+  concentrates to `16,1,1`, INT8-W8A8 only to `10,1,1`, because the 3080s run
+  INT8 natively instead of through Marlin: the lane ratio drops from 9,73:1
+  to 3,68:1. Do not carry the FP8 vector over to an INT8 boot — that is
+  over-concentration onto a card whose lead is not that large.
+- **The decode-knee guard is ADVISORY on the prefill arm and prints its
+  number anyway.** It predicted +24,7 % decode step for `16,1,1` and the boot
+  measured +20,2 % (bs=8) to +25,0 % (bs=1): the guard is right, but that
+  price belongs to the decode arm, which runs the other vector. Fundability
+  and the context floor still REJECT in both arms.
+- **Switching arms costs a restart.** The MLP vector is a WEIGHT split and no
+  runtime actuator moves weights: #297 (`/kv_reshard`) moves KV tokens, #330
+  (`--enable-vram-dial`) moves the VRAM budget. Both were checked against
+  this in #354.
+- **The prefill arm needs the larger reserve.** `16,1,1` at
+  `--rank-auto-reserve-mib 3000` is refused as `UNBOOTABLE` (rank 0 residual
+  3000 MiB against a derived demand of 4160 MiB) and the refusal is correct:
+  the #354 boot ran at 4500 and ended with 87 MiB free on the 5090, i.e. the
+  non-budget posts really took 4413 MiB. At the runbook reserve the arm falls
+  back to a flatter, fundable vector instead.
+- **The prefill arm strands VRAM on the small cards.** 14,3 GiB (FP8) /
+  12,3 GiB (INT8) idle on the two 3080s, because the KV pool follows the
+  tightest rank and the concentration moved it onto the 5090. `--enable-vram-dial`
+  (#330) is the knob for that; nothing reclaims it automatically.
+- Whichever arm you launch, the plan log names BOTH vectors, so one boot
+  tells you the whole recipe.
 
 ### 4.1.1 Phase-boundary KV resharding (#297): `--kv-reshard-vectors`
 

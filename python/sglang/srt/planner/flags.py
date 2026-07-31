@@ -631,13 +631,23 @@ _CURATED: Dict[str, dict] = {
         group="uneven-tp",
         type="enum",
         default="both",
-        allowed=("both", "dec", "enc", "maxkv"),
+        allowed=(
+            "both",
+            "dec",
+            "enc",
+            "maxkv",
+            "phase-prefill",
+            "phase-decode",
+        ),
         requires=("rank_tp_ratio",),
         hover="auto-performance tuning target: 'enc' maximizes prefill, 'both' "
         "(default) prefill+concurrent throughput, 'maxkv' maximum context "
         "(selects --rank-kv-ratio capacity), 'dec' decode -- a near-no-op on "
         "the WEIGHT split (decode is flat across splits) but it selects "
         "--rank-kv-ratio speed, which is where the decode lever actually sits. "
+        "'phase-prefill'/'phase-decode' are the two arms of the phase-optimal "
+        "recipe (#354/#357): one weight vector per phase, decode-knee guard "
+        "advisory on the prefill arm, fundability still binding. "
         "Only valid with auto-performance.",
     ),
     "rank_mlp_ratio": dict(

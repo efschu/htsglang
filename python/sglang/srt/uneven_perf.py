@@ -4591,9 +4591,24 @@ def _mlp_candidates(
 #: Gate names in the order the per-candidate verdict applies them.
 _GATE_ORDER = ("infeasible", "unbootable", "floor", "knee", "no gain")
 
+#: ``--rank-perf-tune`` targets that plan the PHASE-OPTIMAL recipe (#357):
+#: one weight vector per phase instead of one vector for the whole server.
+#: ``phase-prefill`` installs the concentrated prefill vector,
+#: ``phase-decode`` installs the VRAM-auto split (the measured decode
+#: optimum); both arms report the same pair, so one plan run states the whole
+#: recipe.
+_PHASE_PREFILL = "phase-prefill"
+_PHASE_DECODE = "phase-decode"
+_PHASE_TUNES = (_PHASE_PREFILL, _PHASE_DECODE)
 
-def _binding_gate(entry) -> str:
-    """Which gate rejected this candidate, in verdict precedence order."""
+
+def _binding_gate(entry, knee_binding: bool = True) -> str:
+    """Which gate rejected this candidate, in verdict precedence order.
+
+    ``knee_binding`` is False in the phase-optimal modes (#357), where the
+    decode-knee verdict is reported but does not reject: that vector serves
+    the PREFILL phase and the decode phase runs the companion split, so a
+    decode cost it never pays cannot be the gate that refuses it."""
     _cand, pred, gain, floor_ok, knee_ok, _reason, _res, unfundable = entry
     if not pred["feasible"]:
         return "infeasible"
@@ -4601,12 +4616,14 @@ def _binding_gate(entry) -> str:
         return "unbootable"
     if not floor_ok:
         return "floor"
-    if not knee_ok:
+    if not knee_ok and knee_binding:
         return "knee"
     return "no gain" if gain <= 0 else "accepted"
 
 
-def _no_lever_lines(tune: str, loose: float, results) -> List[str]:
+def _no_lever_lines(
+    tune: str, loose: float, results, knee_binding: bool = True
+) -> List[str]:
     """The refusal, when no candidate survives the gates (#265).
 
     Before this, the optimizer printed one generic sentence that named the
@@ -4628,16 +4645,21 @@ def _no_lever_lines(tune: str, loose: float, results) -> List[str]:
             f"tune={tune}: no representable concentration candidate on this "
             "MLP grid -- keeping the plain VRAM-auto split."
         ]
-    gates = [_binding_gate(e) for e in results]
+    gates = [_binding_gate(e, knee_binding) for e in results]
     tally = ", ".join(
         f"{g} {gates.count(g)}" for g in _GATE_ORDER if gates.count(g)
     )
     best = max(results, key=lambda e: e[2])
-    best_gate = _binding_gate(best)
+    best_gate = _binding_gate(best, knee_binding)
     lever = (
         "enc has no effective lever at this operating point"
         if tune == "enc"
-        else "no candidate survives the gates"
+        else (
+            "the phase-optimal prefill arm has no lever at this operating "
+            "point"
+            if tune in _PHASE_TUNES
+            else "no candidate survives the gates"
+        )
     )
     head = (
         f"tune={tune}: {lever}. {len(results)} concentration candidates "
@@ -5260,12 +5282,34 @@ def apply_auto_performance(server_args) -> None:
             "lever."
         )
     else:
+        # The decode-knee guard REJECTS in the single-vector modes and only
+        # REPORTS in the phase-optimal modes (#357). It is not being softened:
+        # its number was right. At the #354 operating point it predicted a
+        # +24.7% decode step for 16,1,1 and the boot measured +20.2% (bs=8) to
+        # +25.0% (bs=1) -- but that cost belongs to the DECODE phase, which in
+        # this recipe runs the companion VRAM-auto vector. Vetoing the prefill
+        # vector on it rejected a vector for a price the recipe never pays:
+        # the same boot measured +22.6% prefill at s=1 against a +22.9%
+        # prediction. Fundability and the context floor stay binding in every
+        # mode -- those are about whether the boot happens at all.
+        knee_binding = tune not in _PHASE_TUNES
         if tune == "both":
             lines.append(
                 "tune=both: prefill and concurrent throughput ride the same "
                 "MLP-concentration lever (M22: +10% prefill / +7% conc-8 "
                 "for the C6-class vector), so 'both' optimizes the same "
                 "objective as 'enc'."
+            )
+        elif tune in _PHASE_TUNES:
+            lines.append(
+                f"tune={tune}: PHASE-OPTIMAL recipe (#354/#357). One weight "
+                "vector per phase instead of one for the whole server: the "
+                "prefill arm is the concentrated MLP vector solved below, the "
+                "decode arm is the plain VRAM-auto split (measured decode "
+                "optimum, #265/#354). The decode-knee guard is ADVISORY here "
+                "and its number is printed for every candidate -- the vector "
+                "it warns about is not the vector that decodes. Fundability "
+                "and the context floor still REJECT."
             )
         else:
             # tune=enc used to fall into the 'both' branch without a word of
@@ -5349,7 +5393,7 @@ def apply_auto_performance(server_args) -> None:
             )
             if (
                 floor_ok
-                and knee_ok
+                and (knee_ok or not knee_binding)
                 and unfundable is None
                 and gain > best_gain + 1e-9
             ):
@@ -5375,8 +5419,13 @@ def apply_auto_performance(server_args) -> None:
                 verdict = unfundable
             elif not floor_ok:
                 verdict = "REJECTED by floor"
-            elif not knee_ok:
+            elif not knee_ok and knee_binding:
                 verdict = f"REJECTED by decode-knee guard -- {knee_reason}"
+            elif not knee_ok:
+                verdict = (
+                    "floor OK, fundable; decode-knee ADVISORY (not binding in "
+                    f"a phase-optimal arm) -- {knee_reason}"
+                )
             else:
                 verdict = "floor OK, knee OK, fundable"
             # The decode cost is stated for EVERY candidate, including the
@@ -5401,8 +5450,22 @@ def apply_auto_performance(server_args) -> None:
             )
         if chosen is None:
             lines.extend(
-                _no_lever_lines(tune, loose, results)
+                _no_lever_lines(tune, loose, results, knee_binding)
             )
+        elif tune == _PHASE_DECODE:
+            # The decode arm of the recipe IS the VRAM-auto split. The
+            # concentrated vector is still solved and named, so one plan run
+            # states both arms and the operator can drive the switch; it is
+            # not installed here.
+            lines.append(
+                "phase-optimal DECODE arm: keeping the plain VRAM-auto split "
+                "(the measured decode optimum). The companion PREFILL vector "
+                f"for this rig and checkpoint is {','.join(map(str, chosen))} "
+                f"(predicted prefill gain {best_gain * 100:+.1f}%); launch "
+                "with --rank-perf-tune phase-prefill to serve the prefill "
+                "arm."
+            )
+            chosen = None
 
     if chosen is not None:
         pred = model.predict_capacity(list(chosen))
@@ -5426,6 +5489,19 @@ def apply_auto_performance(server_args) -> None:
             f"--rank-tp-ratio auto --rank-mlp-ratio "
             f"{','.join(map(str, chosen))}"
         )
+        if tune == _PHASE_PREFILL:
+            # State the other arm of the recipe, and what switching costs
+            # today: the MLP vector is a WEIGHT split, and no runtime actuator
+            # moves weights -- #297 (/kv_reshard) moves KV tokens, #330
+            # (--enable-vram-dial) moves the VRAM budget (#354, measured).
+            lines.append(
+                "phase-optimal PREFILL arm installed. The companion DECODE "
+                "arm is the plain VRAM-auto split (launch the same command "
+                "with --rank-perf-tune phase-decode). Switching arms needs a "
+                "RESTART: the MLP vector is a weight split and no runtime "
+                "actuator moves weights (#297 moves KV tokens, #330 moves the "
+                "VRAM budget)."
+            )
         # Solo placement: seed the DCP token vector from the PREDICTED per-rank
         # capacity instead of letting resolve_cp_token_ratios fall back to its
         # budget estimate. That estimate splits tokens proportionally to raw

@@ -2921,13 +2921,23 @@ class TestTemplatesAreStartingPoints(CustomTestCase):
         for key in ("tune_both", "tune_maxkv", "tune_dec", "tune_enc"):
             self.assertNotIn('id="%s"' % key, html, key)
         self.assertIn("function applyTune(", html)
-        # the four still map onto the fork's own --rank-perf-tune enum
+        # the objective labels still map onto the fork's own --rank-perf-tune
+        # enum -- including the phase-optimal arms (#357), so a value the
+        # server accepts never renders as a bare identifier in the objective
+        # note.
         from sglang.srt.planner import flags as flagsmod
         allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
-        self.assertEqual(allowed, {"both", "dec", "enc", "maxkv"})
-        self.assertEqual(set(_index_script().split("const TUNE_LABELS={")[1]
-                             .split("}")[0].replace("'", "").split(","))
-                         .__len__(), 4)
+        self.assertEqual(
+            allowed,
+            {"both", "dec", "enc", "maxkv", "phase-prefill", "phase-decode"},
+        )
+        labels = _index_script().split("const TUNE_LABELS={")[1].split("};")[0]
+        keys = {
+            part.split(":")[0].strip().strip("'")
+            for part in labels.split(",")
+            if ":" in part
+        }
+        self.assertEqual(keys, allowed)
 
     def test_concurrency_slider_is_not_capped_at_a_constant(self):
         js = _index_script()

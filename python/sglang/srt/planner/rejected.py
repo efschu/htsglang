@@ -206,14 +206,18 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         cost="-13.7 % decode and -47.9 % KV",
         why=(
             "decode is gated by the slowest rank, so loading the strong card "
-            "makes the weak ranks the clock; and the units they gave up were "
-            "holding KV. The collective floor -- 69-75 % of the window -- does "
-            "not move at all, which is the real finding: the floor is the "
-            "lever, not the split."
+            "makes the weak ranks the clock, and the units they gave up were "
+            "holding KV. The verdict is about ONE vector serving BOTH phases; "
+            "per phase the prefill half carries (#354: FP8 16,1,1 is +22.6 % "
+            "prefill, -20.0 % decode, -79 % context), which is what "
+            "--rank-perf-tune phase-prefill asks for (#357)."
         ),
         unlock="--rank-mlp-ratio 6,1,1",
         level=NOT_DEFAULT,
-        evidence="#264 A/B 2026-07-28, INTEGRATION_R3_VALIDATION (539154288d)",
+        evidence=(
+            "#264 A/B 2026-07-28, INTEGRATION_R3_VALIDATION (539154288d); "
+            "per-phase re-measurement #354 2026-07-31 (4 boots x 16 points)"
+        ),
         tags=("mlp-concentration",),
         scope="rig",
     ),
