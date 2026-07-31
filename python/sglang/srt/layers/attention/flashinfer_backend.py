@@ -534,7 +534,7 @@ def reject_silently_inert_dcp(
     dcp_size: int,
     *,
     uneven_dcp: bool,
-    is_draft_worker: bool,
+    draft_pool_replicated: bool,
 ) -> None:
     """Refuse a --dcp-size that this backend would silently ignore.
 
@@ -554,16 +554,23 @@ def reject_silently_inert_dcp(
     reason the token-vector-without-a-plan case was already made a hard reject
     in resolve_cp_token_ratios.
 
-    THE DRAFT WORKER IS EXEMPT, BY DESIGN, NOT BY OVERSIGHT (M4): dcp_size is a
-    property of the parallel context, so an EAGLE/NEXTN draft runner sees
-    dcp_size > 1 too, and it deliberately does not token-shard its tiny 1-layer
-    full-context KV pool (it runs as a plain uneven-TP model). Its uneven_dcp
-    is forced False for that reason a few lines below, and rejecting it here
-    would refuse the validated MTP + uneven-DCP arm.
+    A REPLICATED-POOL DRAFT WORKER IS EXEMPT, BY DESIGN, NOT BY OVERSIGHT (M4):
+    dcp_size is a property of the parallel context, so an EAGLE/NEXTN draft
+    runner sees dcp_size > 1 too, and under the default
+    ``--draft-kv-layout replicated`` it deliberately does not token-shard its
+    tiny 1-layer full-context KV pool (it runs as a plain uneven-TP model). Its
+    uneven_dcp is forced False for that reason a few lines below, and rejecting
+    it here would refuse the validated MTP + uneven-DCP arm.
+
+    The parameter is ``draft_pool_replicated``, not "is a draft worker": under
+    ``--draft-kv-layout dcp`` (#108) the draft runner IS on the DCP machinery,
+    so the silent-no-op argument applies to it exactly as to the target and it
+    must NOT be exempt. Callers pass
+    ``layers.dcp.owner.draft_pool_is_replicated(...)``.
 
     Pure function of the decision inputs so the rule is testable on CPU.
     """
-    if dcp_size <= 1 or uneven_dcp or is_draft_worker:
+    if dcp_size <= 1 or uneven_dcp or draft_pool_replicated:
         return
     raise ValueError(
         f"--dcp-size {dcp_size} with --attention-backend flashinfer would be "
@@ -648,23 +655,44 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner, "is_draft_worker", False
         )
         # M4 (MTP+DCP): the DRAFT worker (EAGLE/NEXTN) does NOT token-shard its
-        # tiny 1-layer KV pool. It runs as a plain uneven-TP model -- head-sharded
-        # kv (whole GQA groups per rank, [2,1,1]) with the FULL token context
-        # resident on every rank -- so its draft/verify KV indices never need the
-        # weighted DCP owner rule. Only the TARGET model uses DCP token-sharding.
-        # This is the coordinator's "keep the draft heads local, not DCP-split"
+        # tiny 1-layer KV pool BY DEFAULT (--draft-kv-layout replicated). It runs
+        # as a plain uneven-TP model -- head-sharded kv (whole GQA groups per
+        # rank, [2,1,1]) with the FULL token context resident on every rank -- so
+        # its draft/verify KV indices never need the weighted DCP owner rule.
+        # Only the TARGET model uses DCP token-sharding. This is the
+        # coordinator's "keep the draft heads local, not DCP-split"
         # simplification (minimal variant: head-sharded across ranks, reusing the
         # existing uneven-TP weight loading, rather than whole-on-one-card).
+        #
+        # #108 (--draft-kv-layout dcp): opt the DRAFT pool into token-sharding
+        # with the SAME weighted owner rule + replicated-kv-heads + LSE merge as
+        # the target. The draft worker then takes the identical uneven_dcp path
+        # below -- no draft-specific branch anywhere past this line, which is
+        # the whole point: the machinery is reused, not re-derived. Gated OFF by
+        # default so the replicated path stays bit-identical.
+        #
+        # draft_pool_is_replicated() is shared with
+        # model_runner_kv_cache_mixin's pool sizing; the two must never disagree
+        # (pool shaped for a split the backend does not perform is #345's
+        # silent right-token/wrong-slot corruption, not a crash).
+        from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
+
+        _is_draft = bool(getattr(model_runner, "is_draft_worker", False))
+        _draft_replicated = draft_pool_is_replicated(
+            _is_draft, getattr(model_runner, "server_args", None)
+        )
         self.uneven_dcp = (
             uneven_dcp_kv_replicated(self.dcp_size) or self.weightless_kv
-        ) and not getattr(model_runner, "is_draft_worker", False)
+        ) and not _draft_replicated
         # A --dcp-size this backend would silently ignore is refused here
         # rather than served as plain TP under a DCP-looking config. See
-        # reject_silently_inert_dcp (draft workers exempt by design).
+        # reject_silently_inert_dcp. A DCP-sharded draft worker (#108) is NOT
+        # exempt: it is on the machinery, so the silent-no-op argument applies
+        # to it exactly as to the target.
         reject_silently_inert_dcp(
             self.dcp_size,
             uneven_dcp=self.uneven_dcp,
-            is_draft_worker=bool(getattr(model_runner, "is_draft_worker", False)),
+            draft_pool_replicated=_draft_replicated,
         )
         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
         # vector is installed, so this rank owns the contiguous virtual-block

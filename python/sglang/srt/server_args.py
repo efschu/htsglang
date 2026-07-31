@@ -1290,6 +1290,26 @@ class ServerArgs:
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    draft_kv_layout: A[
+        str,
+        Arg(
+            help=(
+                "Memory layout of the speculative DRAFT KV pool across TP "
+                "ranks. 'replicated' (default) keeps the full token context on "
+                "every rank (today's behavior, unchanged). 'dcp' token-shards "
+                "the draft KV pool across ranks using the SAME weighted DCP "
+                "owner rule + replicated-kv-heads + LSE-merge as the target "
+                "model, making the draft KV token-addressable (granular "
+                "draft-VRAM control; foundation for speculation in "
+                "PD-disaggregation). 'dcp' is only valid on the "
+                "uneven-weighted-DCP path with a linear draft chain "
+                "(MTP/NEXTN, --speculative-eagle-topk 1); it is a lossless "
+                "memory optimization: at temperature 0 the verified output is "
+                "byte-identical to 'replicated'."
+            ),
+            choices=("replicated", "dcp"),
+        ),
+    ] = "replicated"
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5437,6 +5457,23 @@ class ServerArgs:
         if self.weightless_kv_fastlane and self.speculative_algorithm is not None:
             self._reject_unsupported_weightless_spec()
 
+        # --draft-kv-layout dcp (#108). Runs HERE for the same reason as the
+        # weightless gate directly above, and the list of things that must
+        # already be resolved is exactly why it cannot sit in
+        # _handle_dcp_validation:
+        #   * the algorithm alias  (NEXTN -> EAGLE, handle_speculative_decoding)
+        #   * the speculative defaults (topk, num_steps)
+        #   * --rank-tp-ratio      ('auto-performance' -> a concrete vector,
+        #                           _handle_uneven_tp)
+        #   * dcp_size             (auto-set to tp_size by SGLANG_UNEVEN_DCP,
+        #                           _handle_uneven_tp)
+        # Reading any of them earlier compares against the UNRESOLVED value and
+        # refuses a configuration that is in fact admitted -- measured: a
+        # correct `--speculative-algorithm NEXTN --rank-tp-ratio
+        # auto-performance` TP=3 boot was rejected with
+        # "rank_tp_ratio=auto-performance, dcp_size=1".
+        self._reject_unsupported_draft_kv_dcp()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -6739,10 +6776,197 @@ class ServerArgs:
                 "bitwise-deterministic under uneven-DCP."
             )
 
+    def _reject_unsupported_draft_kv_dcp(self):
+        """BOOT GATE (#108): --draft-kv-layout dcp only on the covered path.
+
+        'dcp' token-shards the DRAFT KV pool with the SAME weighted owner rule
+        + replicated-kv-heads + LSE-merge the TARGET pool uses. That machinery
+        exists for exactly one shape: the uneven-weighted-DCP path carrying a
+        LINEAR draft chain (MTP/NEXTN, topk == 1, one draft KV layer).
+
+        Everything outside that shape is refused HERE, at parse time, from
+        (speculative_algorithm, topk, rank_tp_ratio, dcp_size, env) alone --
+        the alternative is a late NCCL hang or silently wrong tokens after a
+        full weight load. The draft LAYER COUNT is not knowable from
+        ServerArgs; it is checked in the draft ModelRunner (tier 2, see
+        reject_multi_layer_draft_kv_dcp).
+        """
+        if self.draft_kv_layout != "dcp":
+            return
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # The owner rule the draft pool would reuse is installed only by the
+        # uneven-hybrid WEIGHTED DCP path. Without it there is no weight
+        # vector to shard the draft tokens by, so 'dcp' has nothing to mean.
+        _uneven_weighted_dcp = (
+            self.speculative_algorithm is not None
+            and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+            and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+            and self.rank_tp_ratio is not None
+            and len(set(self.rank_tp_ratio)) > 1
+            and self.dcp_size > 1
+            and self.dcp_size == self.tp_size
+        )
+        if not _uneven_weighted_dcp:
+            raise ValueError(
+                "--draft-kv-layout dcp requires the uneven-hybrid weighted "
+                "DCP + speculative path: a speculative algorithm, "
+                "SGLANG_UNEVEN_DCP=1, SGLANG_UNEVEN_DCP_WEIGHTED=1, a "
+                "non-uniform --rank-tp-ratio, and dcp_size == tp_size > 1. "
+                "Got speculative_algorithm="
+                f"{self.speculative_algorithm}, SGLANG_UNEVEN_DCP="
+                f"{os.environ.get('SGLANG_UNEVEN_DCP', '0')}, "
+                "SGLANG_UNEVEN_DCP_WEIGHTED="
+                f"{os.environ.get('SGLANG_UNEVEN_DCP_WEIGHTED', '0')}, "
+                f"rank_tp_ratio={self.rank_tp_ratio}, "
+                f"dcp_size={self.dcp_size}, tp_size={self.tp_size}. "
+                "Leave --draft-kv-layout at its default 'replicated' for "
+                "every other configuration."
+            )
+
+        if self.speculative_eagle_topk is not None and self.speculative_eagle_topk > 1:
+            raise ValueError(
+                "--draft-kv-layout dcp is only supported for a linear draft "
+                "chain (MTP/NEXTN, --speculative-eagle-topk 1), got "
+                f"--speculative-eagle-topk {self.speculative_eagle_topk}. A "
+                "tree/branching draft writes a branching KV chain the owner "
+                "rule does not cover, and topk > 1 under uneven DCP is "
+                "refused outright by the #76 tree-verify guard. Use "
+                "--speculative-eagle-topk 1 or --draft-kv-layout replicated."
+            )
+
+        # Per-algorithm coverage. EAGLE here is the resolved alias that NEXTN
+        # also lands on (arg_groups/speculative_hook.py
+        # _resolve_speculative_algorithm_alias): the MTP-chain shape this
+        # feature covers. EAGLE3 (extra aux-hidden-state draft layers),
+        # STANDALONE (a full draft model with its own multi-layer KV),
+        # DFLASH/DSPARK (block draft: the draft reads KV positions it did not
+        # write in chain order) and NGRAM (no draft KV at all) each have a
+        # draft KV access pattern the owner rule does not cover.
+        _spec_algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+        if not (_spec_algo == SpeculativeAlgorithm.EAGLE):
+            raise ValueError(
+                "--draft-kv-layout dcp covers the MTP/NEXTN chain draft only "
+                "(--speculative-algorithm NEXTN, or EAGLE resolving to the "
+                "same one-layer chain). Got "
+                f"--speculative-algorithm {self.speculative_algorithm}. "
+                "EAGLE3, STANDALONE, DFLASH, DSPARK, NGRAM and FROZEN_KV_MTP "
+                "have draft KV access patterns the DCP owner rule does not "
+                "cover yet; run them with --draft-kv-layout replicated."
+            )
+
+        # MULTI-LAYER EAGLE (--enable-multi-layer-eagle) is the other multi-
+        # layer axis, and the one that is decidable from the CLI: it loads ONE
+        # DRAFT MODEL RUNNER PER CHAIN POSITION (tp_worker
+        # _init_multi_layer_eagle_model_runners), each with its own KV rows,
+        # instead of rolling one draft model out k times. Sharding N such
+        # pools by one owner rule needs the per-layer owner-rule kernels this
+        # pass does not build (#76-scale). Refused by name so the failure is a
+        # sentence and not a shape mismatch deep in the draft capture.
+        if getattr(self, "enable_multi_layer_eagle", False):
+            raise ValueError(
+                "--draft-kv-layout dcp is not supported with "
+                "--enable-multi-layer-eagle: multi-layer EAGLE holds one draft "
+                "model runner per chain position, and token-sharding that "
+                "family needs per-layer owner-rule kernels that are not "
+                "implemented. Use --draft-kv-layout replicated, or drop "
+                "--enable-multi-layer-eagle to run the single-model MTP chain."
+            )
+
+        # Cross-algorithm serving swaps the active draft rung at runtime, so
+        # the boot-time algorithm check above cannot bound what the draft KV
+        # pool will be asked to do.
+        if getattr(self, "speculative_cross_algorithm", False):
+            raise ValueError(
+                "--draft-kv-layout dcp is not supported together with "
+                "cross-algorithm speculative serving: the active draft rung "
+                "changes at runtime, so the boot-time chain guarantee the "
+                "DCP-sharded draft pool relies on does not hold. Use "
+                "--draft-kv-layout replicated."
+            )
+
+        # DRAFT-SOLO placement puts the whole draft on ONE rank; the other
+        # ranks hold a meta-device stub and no draft pool at all. Token-
+        # sharding needs a DCP group of real peers to shard ACROSS, and here
+        # there is exactly one participant -- the owner rule would hand the
+        # host rank ratio_r/S of the rows it is the sole owner of, i.e. drop
+        # the rest of the context on the floor.
+        _solo = getattr(self, "speculative_draft_solo_active", None)
+        if callable(_solo) and _solo():
+            raise ValueError(
+                "--draft-kv-layout dcp is incompatible with draft-solo "
+                "placement: the draft lives on a single rank there, so there "
+                "is no DCP peer group to token-shard its KV pool across. Use "
+                "split placement, or --draft-kv-layout replicated."
+            )
+
+        # kv-session-offload's spec-in-tick DRAFT SURGERY
+        # (managers/kv_session_offload.py spec_in_tick_draft_pre) writes
+        # RAW ALLOCATOR SLOT IDS straight into draft_full_pool.k_buffer /
+        # v_buffer and into req_to_token, bypassing set_kv_buffer and
+        # therefore the owner rule. Against a token-sharded draft pool those
+        # global ids address rows belonging to other tokens -- the #60 L3
+        # zero-page corruption class, silent rather than loud. Refuse the
+        # pair until that path compacts its indices.
+        if getattr(self, "enable_kv_session_offload", False):
+            raise ValueError(
+                "--draft-kv-layout dcp is not supported together with "
+                "--enable-kv-session-offload: the spec-in-tick draft surgery "
+                "writes raw global allocator slot ids directly into the draft "
+                "KV buffers, which a token-sharded draft pool would read as "
+                "other tokens' rows. Use --draft-kv-layout replicated."
+            )
+
+        # NOT YET IMPLEMENTED, measured (#108 v1): the DRAFT-EXTEND forward has
+        # no uneven-DCP metadata split.
+        #
+        # Everything else on the draft side already works when the pool is
+        # token-sharded -- boot-proven on the reference rig (TP=3, vector
+        # [30,17,17], NEXTN k=3 topk=1): the pool is sized to this rank's
+        # owned share, the draft DECODE cuda graphs capture, and the owner-rule
+        # masked write / kv-head all-gather / LSE merge all run for the draft.
+        # Draft EXTEND does not. flashinfer's DCP split admits only
+        # _DCP_VERIFY_SPEC_INPUT_TYPES ({EAGLE_VERIFY, DFLASH_VERIFY}); an
+        # EAGLE_DRAFT_EXTEND falls into the generic spec branch, which leaves
+        # use_ragged False, so the ragged wrapper is never planned while
+        # _forward_extend_dcp runs the current-chunk ragged stage
+        # unconditionally -> AttributeError '_cached_q_data_type' during
+        # "Capture draft extend CUDA graph". Exactly the failure the DFLASH
+        # verify hit before it joined that set.
+        #
+        # Adding EAGLE_DRAFT_EXTEND to that SET is the wrong door -- the verify
+        # split assumes a uniform draft_token_num query block, while
+        # draft-extend's block is the per-request accept length. The likely
+        # fix is the OTHER branch, the non-spec extend DCP split, which already
+        # builds owned-prefix indices from prefix_lens and derives qo_indptr
+        # from cumsum(seq_lens - prefix_lens), i.e. handles ragged per-request
+        # query lengths natively. Full argument in
+        # docs/dev/TASK_108_DRAFT_KV_DCP.md.
+        #
+        # Refuse by name at boot. A flag that reaches graph capture and dies on
+        # an AttributeError is worse than one that says what is missing.
+        raise ValueError(
+            "--draft-kv-layout dcp is not usable yet: the draft-EXTEND "
+            "forward has no uneven-DCP metadata split, so the run dies during "
+            "draft-extend CUDA graph capture with AttributeError "
+            "'_cached_q_data_type' (the ragged wrapper is never planned). The "
+            "pool sizing, the draft decode path and the owner-rule write are "
+            "implemented and boot-proven; only the draft-extend split is "
+            "missing. See docs/dev/TASK_108_DRAFT_KV_DCP.md. Use "
+            "--draft-kv-layout replicated."
+        )
+
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
         # only on AMD HIP/ROCm. Reject invalid or unverified configurations
         # early instead of letting them fail deeper in model initialization.
+        #
+        # NOTE (#108): --draft-kv-layout dcp is NOT gated here. Its inputs
+        # (resolved algorithm alias, resolved topk, concrete --rank-tp-ratio,
+        # auto-set dcp_size) are all still unresolved at this point in
+        # __post_init__; the gate runs after _handle_speculative_draft_placement
+        # instead. See _reject_unsupported_draft_kv_dcp.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "

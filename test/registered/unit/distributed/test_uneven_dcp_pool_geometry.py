@@ -72,12 +72,25 @@ class _FakeModelConfig:
 
 
 class _StubRunner(ModelRunnerKVCacheMixin):
-    """The smallest object the two pool-geometry methods read."""
+    """The smallest object the two pool-geometry methods read.
 
-    def __init__(self, *, dcp_size, model_config, is_draft_worker=False):
+    ``server_args`` is part of that minimum since #108: --draft-kv-layout is
+    a third input to the draft pool's geometry, alongside dcp_size and
+    is_draft_worker.
+    """
+
+    def __init__(
+        self,
+        *,
+        dcp_size,
+        model_config,
+        is_draft_worker=False,
+        draft_kv_layout="replicated",
+    ):
         self.dcp_size = dcp_size
         self.model_config = model_config
         self.is_draft_worker = is_draft_worker
+        self.server_args = SimpleNamespace(draft_kv_layout=draft_kv_layout)
 
 
 class _DcpPlanFixture(CustomTestCase):
@@ -139,12 +152,20 @@ class TestUnevenDcpPoolHeadNum(_DcpPlanFixture):
         self.assertNotEqual(self.per_rank_kv_heads, self.total_kv_heads)
 
     def test_draft_worker_keeps_its_per_rank_shard(self):
-        # The NEXTN/EAGLE draft pool is NOT token-sharded (the flashinfer
-        # backend gates the whole uneven_dcp path on `not is_draft_worker`),
-        # so it must keep the local head shard or the two disagree the other
-        # way round.
+        # The NEXTN/EAGLE draft pool is NOT token-sharded by default (the
+        # flashinfer backend gates the whole uneven_dcp path on
+        # `draft_pool_is_replicated`), so it must keep the local head shard or
+        # the two disagree the other way round.
         runner = self.runner(is_draft_worker=True)
         self.assertEqual(runner._pool_kv_head_num(), self.per_rank_kv_heads)
+
+    def test_draft_kv_layout_dcp_takes_the_replicated_head_count(self):
+        # #108: opted in, the draft pool is the target pool's twin -- full
+        # replicated kv-heads, because the same _dcp_write_gather runs for it.
+        # Storing the per-rank shard here would be the #345 corruption again,
+        # this time in the draft pool.
+        runner = self.runner(is_draft_worker=True, draft_kv_layout="dcp")
+        self.assertEqual(runner._pool_kv_head_num(), self.total_kv_heads)
 
     def test_no_plan_is_untouched(self):
         set_tp_partition_ratios(None)
@@ -207,6 +228,29 @@ class TestUnevenDcpPoolRows(_DcpPlanFixture):
             self.runner()._dcp_token_sharded_pool_rows(self.global_context),
             self.global_context,
         )
+
+    def test_draft_kv_layout_dcp_shards_the_draft_rows(self):
+        """#108's whole point, as a number: the opted-in draft pool holds this
+        rank's owned share, not the global context.
+
+        This is the sizing falsifier -- with the flag on and nothing else
+        changed, per-rank draft KV rows must drop by the shard factor
+        ratio_r / S. If it ever returns global_context again the flag is
+        inert and the feature buys nothing.
+        """
+        S = cp_token_split_factor(self.dcp_size())
+        for rank, ratio in enumerate(self.token_vector):
+            self._parallel.attn_dcp_rank = rank
+            rows = self.runner(
+                is_draft_worker=True, draft_kv_layout="dcp"
+            )._dcp_token_sharded_pool_rows(self.global_context)
+            self.assertEqual(rows, dcp_compact_pool_rows(self.global_context, S, ratio))
+            self.assertLess(rows, self.global_context)
+            # and it is the SAME row count the target pool gets on this rank
+            self.assertEqual(
+                rows,
+                self.runner()._dcp_token_sharded_pool_rows(self.global_context),
+            )
 
 
 class TestUnevenDcpWriteAddressing(_DcpPlanFixture):
