@@ -211,5 +211,183 @@ def test_gather_seq_trims(monkeypatch):
     assert out.shape[1] == 15
 
 
+# --- uneven (capacity-weighted) split: apportionment ------------------------
+
+
+def test_apportion_covers_total_exactly():
+    # Coverage invariant: the per-rank counts sum to the whole, always.
+    for total in (1, 7, 20, 4096, 4097):
+        for weights in ([1, 1, 1], [1.0, 0.46, 0.46], [3, 1], [5, 4, 3, 2, 1]):
+            if total < len(weights):
+                continue
+            counts = sps._apportion(total, weights)
+            assert sum(counts) == total
+            assert all(c >= 1 for c in counts)
+
+
+def test_apportion_honours_weights():
+    # 5090 (1.0) + 2x3080 (0.46) on a 4096-token image latent.
+    counts = sps._apportion(4096, [1.0, 0.46, 0.46])
+    # Faster card takes the largest slice; the two equal cards match.
+    assert counts[0] > counts[1] == counts[2]
+    total_w = 1.0 + 0.46 + 0.46
+    for c, w in zip(counts, [1.0, 0.46, 0.46]):
+        ideal = 4096 * w / total_w
+        assert abs(c - ideal) < 1.0  # within one unit of the ideal share
+
+
+def test_apportion_equal_weights_is_balanced():
+    counts = sps._apportion(4096, [1.0, 1.0])
+    assert counts == [2048, 2048]
+    counts = sps._apportion(4097, [1.0, 1.0])
+    assert sorted(counts) == [2048, 2049] and sum(counts) == 4097
+
+
+def test_apportion_guarantees_one_per_rank():
+    # A weak rank whose ideal share rounds to zero must still get a token.
+    counts = sps._apportion(3, [100.0, 0.1, 0.1])
+    assert sum(counts) == 3 and all(c >= 1 for c in counts)
+
+
+def test_apportion_rejects_nonpositive_weight():
+    with pytest.raises(ValueError):
+        sps._apportion(10, [1.0, 0.0])
+
+
+# --- capacity_weights_from_env ----------------------------------------------
+
+
+def test_capacity_env_unset_is_none(monkeypatch):
+    monkeypatch.delenv(sps._CAPACITY_WEIGHTS_ENV, raising=False)
+    assert sps.capacity_weights_from_env(2) is None
+
+
+def test_capacity_env_parses(monkeypatch):
+    monkeypatch.setenv(sps._CAPACITY_WEIGHTS_ENV, "1.0,0.46,0.46")
+    assert sps.capacity_weights_from_env(3) == (1.0, 0.46, 0.46)
+
+
+def test_capacity_env_wrong_length_raises(monkeypatch):
+    monkeypatch.setenv(sps._CAPACITY_WEIGHTS_ENV, "1.0,0.46")
+    with pytest.raises(ValueError):
+        sps.capacity_weights_from_env(3)
+
+
+def test_capacity_env_malformed_raises(monkeypatch):
+    monkeypatch.setenv(sps._CAPACITY_WEIGHTS_ENV, "1.0,fast,0.5")
+    with pytest.raises(ValueError):
+        sps.capacity_weights_from_env(3)
+
+
+# --- build_shard_plan, uneven ------------------------------------------------
+
+
+def test_uneven_plan_covers_sequence_no_gap_no_overlap(monkeypatch):
+    # The #345-style geometry proof: concatenating every rank's real slice
+    # reproduces the original sequence exactly -- no gap, no overlap.
+    _fake_sp(monkeypatch, 3, 0)
+    seq = torch.arange(4096)
+    reconstructed = []
+    for rank in range(3):
+        _fake_sp(monkeypatch, 3, rank)
+        s = sps.build_shard_plan(4096, weights=[1.0, 0.46, 0.46])
+        assert s.uneven and s.num_pad == 0
+        # offsets are the running prefix sums of lens.
+        assert s.offsets[0] == 0
+        assert s.offsets[rank] + s.lens[rank] == (
+            s.offsets[rank + 1] if rank + 1 < 3 else s.orig_len
+        )
+        reconstructed.append(seq[s.local_offset : s.local_offset + s.local_len])
+    assert torch.equal(torch.cat(reconstructed), seq)
+    assert sum(sps.build_shard_plan(4096, weights=[1.0, 0.46, 0.46]).lens) == 4096
+
+
+def test_uneven_plan_weights_honoured(monkeypatch):
+    _fake_sp(monkeypatch, 3, 0)
+    s = sps.build_shard_plan(4096, weights=[1.0, 0.46, 0.46])
+    assert s.lens[0] > s.lens[1] == s.lens[2]
+
+
+def test_uneven_plan_from_env(monkeypatch):
+    _fake_sp(monkeypatch, 2, 1)
+    monkeypatch.setenv(sps._CAPACITY_WEIGHTS_ENV, "3.0,1.0")
+    s = sps.build_shard_plan(4096)
+    assert s.uneven and s.lens == (3072, 1024)
+    assert s.sp_rank == 1 and s.local_len == 1024 and s.local_offset == 3072
+
+
+def test_uneven_sp1_is_identity(monkeypatch):
+    # The correctness reference: at SP=1 the uneven and equal schemes are the
+    # same no-op plan. Uneven splits must change who does the work, never the
+    # result, and SP=1 is where that is checkable without a collective.
+    _fake_sp(monkeypatch, 1)
+    even = sps.build_shard_plan(4096)
+    uneven = sps.build_shard_plan(4096, weights=[1.0])
+    assert even == uneven
+    assert (even.local_len, even.num_pad, even.uneven) == (4096, 0, False)
+
+
+def test_short_sequence_falls_back_to_equal(monkeypatch):
+    # Fewer tokens than ranks cannot give every rank one, so the plan stays the
+    # equal ceil-division scheme rather than emitting an empty-slice rank.
+    _fake_sp(monkeypatch, 4, 0)
+    s = sps.build_shard_plan(2, weights=[1.0, 1.0, 1.0, 1.0])
+    assert not s.uneven and s.local_len == 1  # ceil(2/4)
+
+
+def test_no_weights_is_byte_identical_equal(monkeypatch):
+    # The default path must be exactly the pre-uneven plan.
+    _fake_sp(monkeypatch, 4, 3)
+    monkeypatch.delenv(sps._CAPACITY_WEIGHTS_ENV, raising=False)
+    s = sps.build_shard_plan(14)
+    assert (s.local_len, s.num_pad, s.uneven) == (4, 2, False)
+    assert s.offsets == () and s.lens == ()
+
+
+# --- shard_like / gather_seq, uneven ----------------------------------------
+
+
+def test_shard_like_uneven_slices_own_range():
+    shard = SpShard(
+        orig_len=20, local_len=5, num_pad=0, sp_size=3, sp_rank=1,
+        offsets=(0, 10, 15), lens=(10, 5, 5), uneven=True,
+    )
+    x = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+    local = shard_like(x, shard, dim=1)
+    assert local.shape[1] == 5
+    assert local[0, 0, 0].item() == 10.0  # rank1 starts at global offset 10
+    assert local[0, -1, 0].item() == 14.0  # no padding at the tail
+
+
+def test_uneven_shard_then_gather_roundtrip(monkeypatch):
+    # Shard the sequence unevenly, then all-gather it back: the padding used to
+    # carry unequal chunks over a fixed-size collective must never survive into
+    # the output. Coverage proven end to end on CPU.
+    _fake_sp(monkeypatch, 3, 0)
+    seq = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+    plan = sps.build_shard_plan(20, weights=[2.0, 1.0, 1.0])
+    lens = plan.lens
+    max_len = max(lens)
+    # Simulate the collective: every rank pads its real chunk to max_len and
+    # the gather concatenates them in rank order.
+    stacked = []
+    off = 0
+    for length in lens:
+        chunk = seq.narrow(1, off, length)
+        pad = max_len - length
+        if pad:
+            chunk = torch.nn.functional.pad(chunk, [0, 0, 0, pad])
+        stacked.append(chunk)
+        off += length
+    gathered = torch.cat(stacked, dim=1)
+    monkeypatch.setattr(
+        sps, "sequence_model_parallel_all_gather", lambda t, dim: gathered
+    )
+    rank0_local = seq.narrow(1, 0, lens[0])
+    out = sps.gather_seq(rank0_local, 20, dim=1, shard=plan)
+    assert out.shape[1] == 20
+    assert torch.equal(out, seq)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

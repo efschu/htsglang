@@ -85,6 +85,7 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_DEBUG_INPUT_BUFFER_POOL` | `1` for diagnosis only | logs one line per CUDA-graph input-buffer pool registration (scope, lane, name, numel, dtype, device, pointer, new/adopted). This is how you see two groups landing on one buffer; noisy, never for measurements |
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
+| `SGLANG_SP_CAPACITY_WEIGHTS` | comma-separated positive floats, one per SP rank (e.g. `1.0,0.46,0.46`) | diffusion lane (#333-M3) only. Switches `multimodal_gen`'s sequence-parallel `build_shard_plan` from the equal split to a capacity-weighted one: a faster card is handed a proportionally longer slice of the sequence. Unset (the default) keeps the equal-and-tail-padded split byte-for-byte. A wrong-length or malformed vector is a hard error, not a silent fallback. The registry's Class-2 adapter sets this from measured `gemm_tflops` when `launch.enable_uneven_sp` is on; see `docs/dev/DESIGN_333_M3_diffusion_lane.md` |
 
 ## 3. Mandatory boot flags
 

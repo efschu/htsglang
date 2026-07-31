@@ -268,14 +268,25 @@ class Class2Test(unittest.TestCase):
             Class2DiffusionAdapter(spec, context())
         self.assertIn("activation_peak_bytes", str(ctx.exception))
 
-    def test_promotion_is_refused_and_says_which_milestone_owns_it(self):
-        spec = self.spec()
-        adapter = Class2DiffusionAdapter(spec, context())
+    def test_warm_gpu_rung_is_refused_with_the_ladder(self):
+        # M3 launches, but Class 2 exposes no WARM_GPU endpoint; the ladder is
+        # HOT / WARM_HOST / COLD and the refusal says so.
+        adapter = Class2DiffusionAdapter(self.spec(), context())
+        with self.assertRaises(AdapterError) as ctx:
+            adapter.promote(ResidencyState.WARM_GPU)
+        self.assertIn("WARM_HOST", str(ctx.exception))
+
+    def test_promotion_needs_a_model_path_to_boot(self):
+        # Estimate-only registration works from posts alone (§7.4); booting does
+        # not -- it needs a model to load.
+        adapter = Class2DiffusionAdapter(self.spec(), context())
         with self.assertRaises(AdapterError) as ctx:
             adapter.promote(ResidencyState.HOT)
-        self.assertIn("M3", str(ctx.exception))
+        self.assertIn("model_path", str(ctx.exception))
 
-    def test_multi_card_diffusion_is_out_of_scope_and_says_so(self):
+    def test_multi_card_diffusion_needs_opt_in_and_says_so(self):
+        # Without enable_uneven_sp a multi-card tenant is out of scope; the
+        # message names M4, where the uneven-SP collective wiring lands.
         spec = self.spec()
         with self.assertRaises(EstimateError) as ctx:
             Class2DiffusionAdapter(spec, context()).estimate(spec, (CARD_A, CARD_B))
