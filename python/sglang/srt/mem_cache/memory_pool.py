@@ -198,8 +198,15 @@ def kv_bound_check_enabled() -> bool:
     Passed to Triton as the per-launch ``debug`` option: on (the default) the
     ``tl.device_assert`` lowers to a real device assert, off it lowers to
     nothing at all, so the off-switch leaves no residual instruction to pay
-    for. Not cached in a module global -- the value is read once per launch and
-    an env lookup is orders of magnitude below the launch itself.
+    for.
+
+    Deliberately NOT cached in a module global, and the price is measured
+    rather than assumed: 683 ns/call (200k reps, CPU). The masked writer runs
+    once per full-attention layer per step -- 16 of the 64 layers on
+    Qwen3.6-27B -- so this is ~11 us of host time per decode step against a
+    step of 15-25 ms on this rig, i.e. below 0.1%. Caching it would buy that
+    back and cost the ability to flip the switch after import, which is what
+    the falsifier test and any live A/B need.
     """
     return not envs.SGLANG_DISABLE_KV_MASKED_BOUND_CHECK.get()
 
@@ -4007,6 +4014,12 @@ def masked_set_kv_buffer_kernel(
     lowered when the launch passes ``debug=True`` (``kv_bound_check_enabled``,
     default on). Without it an escaped compact row corrupts a live KV row
     SILENTLY; with it the process dies naming this kernel.
+
+    Placement note: the assert sits after two early returns, and both are
+    BLOCK-UNIFORM (``pid >= N`` and a scalar mask load, identical for every
+    thread in the program). That matters because Triton's assert lowering may
+    emit a barrier, and a barrier reached by only some threads of a block
+    hangs. Any future early return above this line has to stay uniform.
     """
     pid = tl.program_id(0)
     if pid >= N:

@@ -36,6 +36,11 @@ def set_kv_buffer_prefix_valid_tiled(
     the buffer's VA row count rather than the pool's live ``size``. The
     ``tl.device_assert`` is lowered only when the launch passes ``debug=True``
     (``kv_bound_check_enabled``, default on).
+
+    The assert sits after a BLOCK-UNIFORM early return (``row >= commit_len``,
+    a scalar load identical for every thread in the program). Triton's assert
+    lowering may emit a barrier, and a barrier reached by only some threads of
+    a block hangs -- any future early return above this line must stay uniform.
     """
     bid = tl.program_id(0)
     row = tl.program_id(1)

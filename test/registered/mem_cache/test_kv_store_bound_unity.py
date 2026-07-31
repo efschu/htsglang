@@ -233,6 +233,19 @@ class TestKvStoreBoundSemantics(CustomTestCase):
         buf = torch.zeros(97, 3)
         self.assertEqual(kv_store_bound(11, buf, 3), graph_safe_store_bound(11, 97))
 
+    def test_store_cache_arm_is_byte_identical_to_the_pre_355_expression(self):
+        # #352 wrote `graph_safe_store_bound(size_limit, k_cache.view(-1,
+        # row_dim).shape[0])` inline. Routing it through kv_store_bound must
+        # not change the number for any geometry the pool can hand over --
+        # otherwise "no behaviour change on the raw path" is a claim, not a
+        # fact. Qwen3.6-27B row: 4 replicated KV heads x head_dim 256.
+        for rows, h, d in ((4097, 4, 256), (251966, 1, 256), (64, 8, 128)):
+            with self.subTest(rows=rows, h=h, d=d):
+                buf = torch.zeros(rows, h, d, dtype=torch.bfloat16)
+                row_dim = h * d
+                old = graph_safe_store_bound(rows, buf.view(-1, row_dim).shape[0])
+                self.assertEqual(kv_store_bound(rows, buf, row_dim), old)
+
 
 class TestMaskedWriterCarriesTheCheck(CustomTestCase):
     """The kernels themselves: a bound parameter and an assert on it."""
