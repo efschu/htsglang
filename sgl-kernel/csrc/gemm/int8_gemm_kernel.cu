@@ -416,6 +416,38 @@ void sm89_dispatch_shape(
   }
 }
 
+// Dispatch shape for sm120/sm121 (consumer Blackwell, e.g. RTX 5090).
+//
+// Provenance: vLLM has NO CUTLASS INT8 path for Blackwell. Its SM100 and SM120
+// dispatchers pass a null int8 functor
+// (csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c3x_sm120.cu:
+// `nullptr, // int8 not supported on SM120`) and the shared helper then raises
+// "Int8 not supported on SM<n>. Use FP8 quantization instead". There is
+// therefore no upstream sm120 INT8 config to port; what is portable is the
+// CUTLASS 2.x INT8 path that vLLM (and this file, see sm89_dispatch_shape) uses
+// for Ada, retargeted at sm120.
+//
+// That retarget is sound rather than a lucky fallback:
+//   * sm120 keeps the classic warp-level IMMA instruction
+//     (mma.sync.aligned.m16n8k32.s8) that the CUTLASS 2.x kernels emit under
+//     the Sm80 arch tag; only the sm100 tcgen05 datacenter path dropped it,
+//     which is why vLLM's Blackwell c3x dispatchers carry no INT8 functor.
+//   * sm120's per-block shared memory ceiling (100 KB) matches sm86/sm89, not
+//     sm80's 160 KB, so the sm89 tile/stage table is the correct budget fit.
+// Consequently this forwards to sm89_dispatch_shape instead of duplicating the
+// table. It exists as a separate symbol so a future sm120-specific retune has
+// one obvious place to land.
+template <typename ElementOutput, typename ArchTag, typename InstructionShape>
+void sm120_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
+  sm89_dispatch_shape<ElementOutput, ArchTag, InstructionShape>(out, mat_a, mat_b, scales_a, scales_b, bias);
+}
+
 template <
     typename ElementOutput,
     typename TileShape,
@@ -739,8 +771,21 @@ torch::Tensor int8_scaled_mm(
           out, mat_a, mat_b, scales_a, scales_b, bias);
     }
 #endif
+  } else if (sm_version >= 120) {
+    // Consumer Blackwell (sm120/sm121). Uses the CUTLASS 2.x IMMA kernels with
+    // the Ada tile table; see sm120_dispatch_shape for why the Sm80 arch tag is
+    // the right one here. sm100/sm103 (datacenter Blackwell) deliberately stay
+    // out of this branch: those parts have no classic IMMA path, which is also
+    // why vLLM reports INT8 as unsupported there.
+    if (out_dtype == torch::kBFloat16) {
+      sm120_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm120_dispatch_shape<cutlass::half_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
   } else {
-    TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for compute capability sm", sm_version, ".");
   }
 
   return out;

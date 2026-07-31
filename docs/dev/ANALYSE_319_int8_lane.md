@@ -102,6 +102,10 @@ after a Triton dynamic per-token activation quant
 (`per_token_quant_int8`, `sglang/srt/layers/quantization/int8_kernel.py` --
 arch-general, no gap here).
 
+> **Resolved (task #327 pre-stage, commit `7da6f0cb2f`).** The sm120 arm now
+> exists; see `TASK_327_INT8_SM120_WHEEL.md`. The section below describes the
+> state before that commit and stays as the record of how the gap was found.
+
 **`int8_scaled_mm`'s own SM dispatch (`int8_gemm_kernel.cu:699-744`) is
 explicit and closed-ended:**
 
@@ -139,6 +143,14 @@ probe's "ask functionally, don't infer from a capability integer" principle
 built to convert into a loud, pre-boot fact instead of a late crash.
 
 ### 2c. No dequant fallback lane exists for INT8 (unlike FP8's three-lane ladder)
+
+> **Superseded for the 5090 (task #327 pre-stage).** This section's cost estimate
+> was wrong in one direction: the native branch was not "a materially bigger and
+> higher-risk undertaking" but one forwarding template plus an `else if`, because
+> the INT8 SASS for sm_120 was already being emitted from the sm86 arm. The
+> dequant fallback lane is still the answer for cards with no IMMA path at all
+> (sm100/sm103); it is no longer needed to make this rig bootable on INT8.
+> See `TASK_327_INT8_SM120_WHEEL.md`.
 
 FP8 has `LANE_FP8_W8A16`
 (`_bench_gemm_w8a16_tflops`, `uneven_perf.py:874-913`, using
