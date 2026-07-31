@@ -227,6 +227,84 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+#: Namespaces a speculative draft block occupies INSIDE a target checkpoint.
+#: An MTP/NEXTN block shipped with its target is the only case where the draft
+#: and the rest of the file can disagree about quantization, so it is probed
+#: before the checkpoint as a whole.
+_IN_CHECKPOINT_DRAFT_PREFIXES = (
+    "mtp.",
+    "model.mtp.",
+    "nextn.",
+    "model.nextn.",
+    "draft_model.",
+)
+
+#: Every key a quantizer uses to say "leave these modules alone".
+_QUANT_CFG_IGNORE_KEYS = (
+    "modules_to_not_convert",
+    "ignore",
+    "ignored_layers",
+    "exclude_layers",
+    "exclude_modules",
+    "skip_modules",
+)
+
+
+def _draft_checkpoint_is_dense(draft_path: str) -> bool:
+    """Whether the draft's OWN tensors are stored unquantized (task #318).
+
+    Two shapes, probed in that order:
+
+    1. A draft block living inside the target checkpoint (MTP / NEXTN). Its
+       namespace is the only part of the file that may differ from the rest,
+       and it is the case GPTQModel gets wrong.
+    2. A standalone draft directory, where every tensor is the draft's.
+
+    A namespace that yields no verdict (absent, unreadable, not safetensors)
+    falls through to the next shape and finally to False -- "keep whatever was
+    resolved", never "guess dense".
+    """
+    from sglang.srt.utils.common import checkpoint_namespace_is_dense
+
+    verdict = checkpoint_namespace_is_dense(
+        draft_path, prefixes=_IN_CHECKPOINT_DRAFT_PREFIXES
+    )
+    if verdict is None:
+        verdict = checkpoint_namespace_is_dense(draft_path, prefixes=("",))
+    return verdict is True
+
+
+def _quant_cfg_excludes_draft_namespace(quant_cfg: dict) -> bool:
+    """Whether the checkpoint itself already exempts the draft block.
+
+    A producer that wrote the exemption down needs no help: the AWQ sibling of
+    Qwen3.6-27B carries ``modules_to_not_convert: ["mtp", ...]`` and the FP8
+    and Quark ones do the same, so their draft block is already built dense by
+    the per-layer skip logic. Recognising that keeps those checkpoints on
+    exactly the path they load on today and confines the #318 probe to the
+    producers that stayed silent.
+    """
+    if not isinstance(quant_cfg, dict):
+        return False
+    stems = tuple(
+        prefix.rstrip(".").rsplit(".", 1)[-1]
+        for prefix in _IN_CHECKPOINT_DRAFT_PREFIXES
+    )
+    for key in _QUANT_CFG_IGNORE_KEYS:
+        entries = quant_cfg.get(key)
+        if isinstance(entries, str):
+            entries = [entries]
+        if not isinstance(entries, (list, tuple, set)):
+            continue
+        for entry in entries:
+            if not isinstance(entry, str):
+                continue
+            head = entry.strip().lstrip("^").split(".", 1)[0]
+            if head in stems:
+                return True
+    return False
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -239,6 +317,8 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        quantization_explicitly_unset: bool = False,
+        quantization_inherited: bool = False,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
@@ -255,6 +335,15 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        # `quantization is None` means "nothing resolved yet, detect it from
+        # the checkpoint". This flag means "resolved to nothing, on purpose" --
+        # the checkpoint's own quantization_config must not undo it.
+        self.quantization_explicitly_unset = quantization_explicitly_unset
+        # True when a DRAFT model took its method from the target instead of
+        # from --speculative-draft-model-quantization. Only an inherited method
+        # may be overturned by the checkpoint-namespace probe (#318); an
+        # explicit one is the user's last word.
+        self.quantization_inherited = quantization_inherited
         self.is_draft_model = is_draft_model
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
@@ -567,7 +656,25 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
-        if is_draft_model and quantization is None:
+        # "the user asked for no quantization" is not the same fact as "the
+        # user asked for nothing"; both arrive here as None. Only the former
+        # may survive `_verify_quantization`'s checkpoint auto-detection.
+        quantization_explicitly_unset = bool(
+            getattr(
+                server_args,
+                (
+                    "_speculative_draft_model_quantization_explicitly_unset"
+                    if is_draft_model
+                    else "_quantization_explicitly_unset"
+                ),
+                False,
+            )
+        )
+        if (
+            is_draft_model
+            and quantization is None
+            and not quantization_explicitly_unset
+        ):
             # A drafter shipped as a .gguf FILE must be BUILT quantized, or the
             # GGUF loader (selected by the shared load_format) streams
             # `*.qweight` / `*.qweight_type` names into a model whose skeleton
@@ -582,6 +689,12 @@ class ModelConfig:
             # non-GGUF target was never covered either. A drafter that is not a
             # GGUF file is untouched, so the validated GGUF-target/dense-drafter
             # combination keeps its exact behaviour.
+            #
+            # An EXPLICIT `--speculative-draft-model-quantization unquant` is
+            # not overridden here (that is what the guard above excludes): the
+            # flag is the user's last word, and a dense skeleton fed a packed
+            # stream is now a named load error rather than a silent accept
+            # collapse.
             draft_path = model_path or server_args.speculative_draft_model_path
             if draft_path is not None and check_gguf_file(draft_path):
                 quantization = "gguf"
@@ -604,6 +717,15 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=quantization,
+            quantization_explicitly_unset=quantization_explicitly_unset,
+            quantization_inherited=(
+                is_draft_model
+                and not getattr(
+                    server_args,
+                    "_speculative_draft_model_quantization_explicitly_set",
+                    False,
+                )
+            ),
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
@@ -1573,6 +1695,56 @@ class ModelConfig:
                 "Config list contains configs from 2 methods, must be only 1"
             )
         quant_cfg = cfg_list[0] if cfg_list else None
+
+        if (
+            quant_cfg is not None
+            and self.is_draft_model
+            and self.quantization_inherited
+            and not self.quantization_explicitly_unset
+            and not _quant_cfg_excludes_draft_namespace(quant_cfg)
+            and _draft_checkpoint_is_dense(self.model_path)
+        ):
+            # #318, the mirror image of #290: here the SKELETON is packed and
+            # the CHECKPOINT is dense. GPTQModel leaves a Qwen3.5/3.6 MTP block
+            # in BF16 but emits no ignore list at all, so the drafter inherits
+            # the target's gptq method, is built as a Marlin skeleton expecting
+            # qweight/qzeros/scales/g_idx, and the 7 dense `mtp.*.weight` names
+            # per rank reach nothing: accept 1.0052, 0 of 573 drafts accepted
+            # over 191 verify ticks, bit-identical in both arms of the probe.
+            #
+            # The decision keys on the CHECKPOINT NAMESPACE, not on geometry:
+            # MTP shapes are Marlin-legal, so #316's shape guard correctly does
+            # not fire here. It also does not fire when the producer said so
+            # itself -- the AWQ and FP8 siblings of the same base model list
+            # `mtp` in `modules_to_not_convert` and keep their exact current
+            # behaviour through `_quant_cfg_excludes_draft_namespace`. This
+            # branch only recovers the fact a quantizer forgot to write down.
+            logger.info(
+                "Draft checkpoint %s declares quant_method %r but stores the "
+                "draft namespace unquantized; building the draft model dense. "
+                "Pass --speculative-draft-model-quantization to override.",
+                self.model_path,
+                quant_cfg.get("quant_method"),
+            )
+            self.quantization = None
+            self.quantization_explicitly_unset = True
+
+        if quant_cfg is not None and self.quantization_explicitly_unset:
+            # An explicit opt-out (`--quantization unquant`,
+            # `--speculative-draft-model-quantization unquant`, or the #318
+            # dense-draft-namespace verdict) ends here. Everything below this
+            # point RE-DERIVES a method from the checkpoint's own
+            # quantization_config, which is precisely what an opt-out has to
+            # survive -- without this branch the flag resolved to None in
+            # ServerArgs and was handed straight back as "gptq" one call later,
+            # which is why it read as a no-op on the command line.
+            logger.info(
+                "Quantization explicitly disabled; ignoring the checkpoint's "
+                "declared quant_method %r%s.",
+                quant_cfg.get("quant_method"),
+                " for the draft model" if self.is_draft_model else "",
+            )
+            quant_cfg = None
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
