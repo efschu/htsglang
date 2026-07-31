@@ -31,7 +31,12 @@ full fp16 conversion; it buys the interface bandwidth without the accuracy
 risk. Which one this model needs is a measurement, and ``--grade`` is how it
 is taken.
 
-    PYTHONPATH=python python scripts/video_enhance/export_sr_fp16.py --grade
+Needs ``onnx`` at the graph-surgery step, which the serving path does not.
+It is a build-time tool, so ``onnx`` is deliberately not added to the
+runtime requirements; install it wherever this is run, e.g.
+
+    pip install --target /tmp/onnxtools onnx   # then drop its bundled numpy
+    PYTHONPATH=python:/tmp/onnxtools python scripts/video_enhance/export_sr_fp16.py --grade
 """
 
 from __future__ import annotations
@@ -144,7 +149,15 @@ def insert_io_casts(model):
 
 
 def export(source_onnx: Path, out_path: Path, *, io_cast_only: bool) -> dict:
-    import onnx
+    try:
+        import onnx
+    except ImportError as exc:  # pragma: no cover - build-time tool only
+        raise SystemExit(
+            "the fp16 export needs the 'onnx' package for the graph surgery. It "
+            "is a build-time dependency and is deliberately not in the serving "
+            "requirements; install it into a scratch target and put that on "
+            "PYTHONPATH."
+        ) from exc
 
     model = onnx.load(str(source_onnx))
     if io_cast_only:
