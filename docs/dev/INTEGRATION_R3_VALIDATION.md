@@ -15880,3 +15880,284 @@ uebersprungen): **1793 passed, 3 skipped, 0 failed**.
 sauber auf beiden Dateien; black auf der Testdatei angewandt, `uneven_perf.py`
 bringt genau die 33 black-Hunks mit, die es vorher schon hatte (keine neuen).
 Keine GPU angefasst (`CUDA_VISIBLE_DEVICES=99`).
+
+## NVFP4-Beleg: V4 auf sm86 + solo-5090 (Kartenfenster 2026-07-31, 06:40-06:59 UTC)
+
+Belegprogramm zu #291-S3/#323 (gemergt @ `27878251e8`) und zu
+`docs/dev/ANALYSE_321_nvfp4_asymmetry.md`. Checkpoint: **`ocicek/Qwen3.6-27B-NVFP4`**
+(V4-Klasse, compressed-tensors `nvfp4-pack-quantized`, all-Linear W4A4,
+group_size 16, `strategy: tensor_group`), heruntergeladen in diesem Fenster
+(174 s, 18 GiB) nach `/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-NVFP4`.
+Stock-Variante wie in ANALYSE_321 §7(d) gerankt, nicht die AEON-Variante.
+
+### Verdikte zuerst
+
+1. **phi0 ist gemessen: 2,298** an der Probe-Form, 2,06-2,66 an den echten
+   Shard-Formen. Weit über der Stoppregel 1,3333 — die MLP-Ecke bindet. Ändert
+   die V4-Posten nicht, und zwar in beide Richtungen: der Deckel der
+   Platzierungsthese bleibt 3,6 % gegen einen 3,18-%-Boden, und die Ecke ist auf
+   diesem Rig ohnehin unerreichbar (Verdikt 2).
+2. **V4 bootet NICHT auf sm86 — aber nicht mehr aus dem #291-S3-Grund.** Der
+   Blackwell-Boden ist weg; dahinter steht ein zweiter, unabhängiger Stopper,
+   und er sitzt im Checkpoint, nicht im Shard-Plan: die GDN-b/a-Projektion ist
+   96 Zeilen breit und mitquantisiert, das NVFP4-Marlin-Tile ist 64. **Falsifiziert
+   auf der Karte**: ein TP=1-Boot auf einer einzelnen 3080, ohne jeden Shard-Plan,
+   scheitert mit derselben Meldung.
+3. **V4 solo-5090 bootet, bedient und ist kohärent** — und löscht den
+   Kollektivboden: **7,70x** Prefill-Durchsatz gegen den fp8-TP=3-Anker desselben
+   Fensters, ms/Decode-Schritt −20,6 % (bs=1) und −41,5 % (bs=8). Alles weit über
+   den Böden.
+4. **NEXTN ist auf diesem Checkpoint nicht verfügbar** — Draft-Namensraum-Defekt
+   (Verdikt 6 unten). Beide gemessenen Arme laufen deshalb **ohne Spekulation**,
+   auf beiden Seiten gleich; ms/Verify gibt es in diesem Fenster nicht, nur
+   ms/Decode-Schritt.
+5. Die §6.2-Prognose stimmt in der Richtung und in der Prefill-Größenordnung
+   (7,5x prognostiziert, 7,70x gemessen), **nicht** im KV-Posten: 153.007 statt
+   326.192 Token (Verdikt 7).
+
+### 1. phi0-Mikrobench (`scripts/nvfp4/phi0_lane_microbench.py`)
+
+TFLOPS, `M=2048`, ITERS=20 nach 5 Warmups. `--` = Lane läuft auf der Karte
+nicht und protokolliert ihren Grund, nie einen Ersatzwert.
+
+**RTX 5090 (cc 12.0, `auto` -> cutlass):**
+
+| Form | K,N | bf16 | fp8_native | fp8_marlin | nvfp4_native | nvfp4_marlin | phi0 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| probe | 5120,17408 | 233,86 | 567,65 | 215,30 | **1304,47** | 233,18 | **2,298** |
+| uneven-r0-gate_up | 5120,15872 | 230,34 | 565,77 | 214,66 | 1258,23 | 229,40 | 2,224 |
+| uneven-r0-down | 7936,5120 | 217,59 | 563,85 | 216,42 | 1371,07 | 228,50 | 2,432 |
+| uneven-r1-gate_up | 5120,9472 | 227,39 | 557,32 | 213,74 | 1146,99 | 227,56 | 2,058 |
+| uneven-r1-down | 4736,5120 | 214,27 | 528,86 | 209,92 | 1312,08 | 222,79 | 2,481 |
+| corner-r0-gate_up | 5120,34816 | 229,02 | 473,79 | 204,38 | 1260,12 | 228,47 | 2,660 |
+| corner-r0-down | 17408,5120 | 211,70 | 534,54 | 206,12 | 1386,20 | 230,53 | 2,593 |
+
+**RTX 3080 (cc 8.6, beide Karten):** `fp8_native` und `nvfp4_native` laufen
+nicht (`torch._scaled_mm` braucht >= 8.9; NVFP4-JIT braucht >= 10.0) — beide mit
+protokolliertem Grund. `nvfp4_marlin` liegt an jeder Form **über** `fp8_marlin`
+(Probe 62,80/63,28 gegen 59,91/61,09; über alle sieben Formen 58,43-63,38 gegen
+53,84-61,09). Die 4-Bit-Lane ist auf sm86 also nicht der Kompatibilitätsboden,
+sondern die schnellere der beiden quantisierten Lanes — genau die Aussage, auf
+der #291-S3 aufsetzt. Sie ist auf diesem Checkpoint nur nicht erreichbar.
+
+Der 5x-Abstand aus ANALYSE_321 §4.2 ist bestätigt: auf der 5090 liefert
+`nvfp4_native` 1304 TFLOPS, `nvfp4_marlin` 233 — **5,59x**. Welche Lane `auto`
+je Rang auflöst, entscheidet auf diesem Rig also mehr als das Gewichtsformat.
+
+**Stoppregel dokumentiert:** phi0 = 2,298 >= 1,3333, also `a_0/phi0 + n_0 =
+148,1 ms <= max(n_1,n_2) = 208,9 ms`. Die Ecke `[136,0,0]` bindet, das innere
+Optimum verschwindet, und der Taktgeber wird der gewichtsfreie GDN-/Attention-Rest
+der 3080er, den kein Gewichtsformat anfasst. Deckel der These: 3,6 % des
+Prefill-Fensters gegen 3,18 % Boden. **Das bleibt kein Grund, NVFP4 zu fahren** —
+der Grund ist §6, und der hängt nicht an phi0.
+
+### 2. ARM 1 (TP=3 uneven): blockiert, und der Grund ist neu
+
+Rezept identisch zum Standard-TP=3 aus `docs/rig-runbook.md` 4.1, nur der
+Modellpfad getauscht (`--tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio
+auto-performance --rank-auto-reserve-mib 3000,2700,2700 --kv-cache-dtype
+fp8_e4m3 --context-length 32768`). Der Plan wird sauber abgeleitet
+(Budgets `[29607, 17780, 17780]` MiB, uneven DCP `dcp_size=3`), dann stirbt der
+Ladevorgang in Schicht 0:
+
+```
+ValueError: NVFP4 Marlin requires output_size_per_partition to be a multiple
+of 64, got 30.   (davor derselbe Abbruch mit got 24)
+  ... qwen3_5.py:501 create_ba_proj -> Qwen3_5GatedDeltaNet
+```
+
+**Ursache, aus dem Checkpoint gelesen** (safetensors-Header, kein Boot nötig):
+
+```
+model.language_model.layers.0.linear_attn.in_proj_a.weight_packed  U8 [48, 2560]
+model.language_model.layers.0.linear_attn.in_proj_b.weight_packed  U8 [48, 2560]
+```
+
+Die b- und a-Gates des Gated-DeltaNet sind je 48 Zeilen breit und in dieser
+Checkpoint-Klasse **mitquantisiert** (`config_groups.group_0.targets: ["Linear"]`,
+und die `ignore`-Liste enthält von den Sprachschichten nur `lm_head`). Zusammengelegt
+sind es 96 Zeilen. 96 ist kein Vielfaches von 64.
+
+**Falsifikator, auf der Karte gefahren:** TP=1 auf einer einzelnen 3080, kein
+`--rank-gpu-id`, kein `--rank-tp-ratio`, kein Kollektiv:
+
+```
+ValueError: NVFP4 Marlin requires output_size_per_partition to be a multiple
+of 64, got 96.
+```
+
+Damit ist ausgeschlossen, dass #323a (die Coarsening-Regel) hier etwas hätte
+retten können: es gibt keinen Shard-Plan, der 96 auf ein Vielfaches von 64
+bringt. Der Kontrollarm „even TP=3" (`--tp-size 3` ohne Rang-Flags) kommt gar
+nicht so weit — er wird vorher vom Balance-Wächter abgewiesen
+(`memory capacity is unbalanced`, 3080 20 GiB gegen 5090 30,5 GiB) und ist
+deshalb nicht aussagekräftig; der TP=1-Arm ist der tragende Falsifikator.
+
+**Konsequenz für ANALYSE_321 §2.1.** Die Zeile „V4 boots on sm_86: NO … one code
+change away (§9)" ist nach S3 nur zur Hälfte erledigt. Der `get_min_capability()
+== 100`-Boden ist weg, aber V4-Checkpoints quantisieren per Definition *alle*
+Linear-Layer, also auch die schmalen GDN-Gates, und die Marlin-Lane kann sie auf
+keiner pre-Blackwell-Karte bedienen. Für einen Rig mit einem sm86-Rang bleibt
+damit **V2 (MLP-only W4A4) die einzige benutzbare NVFP4-Klasse**; V4 ist auf
+diesem Rig eine reine 5090-Solo-Option. Das ist keine Fork-Lücke, die ein
+Coarsening schließt — es braucht ein Ausschließen der schmalen Projektion von
+der Quantisierung (`in_proj_a`/`in_proj_b` sind zusammen ~11,8 M Parameter über
+48 GDN-Schichten, also VRAM-irrelevant), entweder im Checkpoint oder als
+Lade-Regel.
+
+**Mitgenommen (Code, in diesem Commit):** die Fehlermeldung behauptete beide
+Male, der Shard-Plan sei schuld („Under an uneven `--rank-tp-ratio` this means
+the shard plan was not coarsened"). Im TP=1-Fall ist das nachweislich falsch.
+Sie unterscheidet jetzt die beiden Ursachen anhand der ungeshardeten Breite
+(`output_size` liegt in `create_weights` bereits vor) und nennt im
+Checkpoint-Fall die richtige Abhilfe. 43/43 Tests in
+`test/registered/unit/layers/quantization/test_nvfp4_lane_defects.py` bleiben grün.
+
+### 3. Draft-Namensraum (#318-Lehre), Verdikt: bf16 im Checkpoint, trotzdem unbenutzbar
+
+Aus `config.json` gelesen, vor jedem Boot: die `ignore`-Liste nennt den
+kompletten Drafter — `mtp.fc`, `mtp.layers.0.mlp.{gate,up,down}_proj`,
+`mtp.layers.0.self_attn.{q,k,v,o}_proj` — und alle 15 `mtp.*`-Tensoren liegen als
+schlichte `.weight` in einem eigenen Shard `model-mtp-bf16.safetensors` (keine
+`weight_packed`/`weight_scale`). **Der Drafter ist dense bf16**, also das
+sichere Muster, das ANALYSE_321 §2 für diesen Publisher erwartet hat.
+
+Der Boot mit `--speculative-algorithm NEXTN` scheitert trotzdem, und der eigene
+Wächter aus #318 fängt es sauber ab:
+
+```
+ValueError: Draft checkpoint ... left 8 parameter(s) of Qwen3_5ForCausalLMMTP
+unloaded: ['model.layers.0.mlp.gate_up_proj.input_global_scale',
+ ... .weight_packed, ... 'model.layers.0.qkv_proj.weight_packed', ...]
+```
+
+Zwei Abweichungen übereinander, beide nötig für einen Treffer:
+
+* **Präfix.** Der Checkpoint ignoriert `mtp.layers.0.*`, das Draft-Modul wird als
+  `model.layers.0.*` gebaut. Der `ignore`-Abgleich greift nicht, also baut der
+  Fork den Drafter quantisiert.
+* **Fusion.** Der Checkpoint nennt `gate_proj`/`up_proj` und `q/k/v_proj`
+  einzeln, das Modul hat `gate_up_proj` und `qkv_proj`. Ein reines
+  Präfix-Remapping reicht also nicht; der Abgleich muss fusionsbewusst sein.
+
+Verdikt: **NEXTN auf V4 gesperrt, bis der `ignore`-Abgleich Präfix und Fusion
+beherrscht.** Der Wächter tut genau das Richtige — er verhindert einen Drafter
+auf uninitialisierten Gewichten, dessen Symptom eine Accept-Länge ~1,0 wäre und
+kein Ladefehler. Beide Messarme dieses Fensters laufen deshalb ohne Spekulation.
+
+### 4. ARM 2 (solo 5090) gegen den fp8-TP=3-Anker
+
+Beide Arme im selben Fenster, dieselben Skripte
+(`scripts/gpu_battery/s12_prefill_kurve.py`, `s14_decode_punkt.py`), dieselben
+Prompts, **beide ohne Spekulation** — die Spec-Achse ist damit neutralisiert
+statt einseitig bevorteilt.
+
+| | V4 solo-5090 (TP=1) | fp8 TP=3 uneven (Anker) |
+|---|---:|---:|
+| Gewichte auf der Karte | 18,81 GiB | 12,63 / 8,73 / 8,39 GiB |
+| KV-Pool | 153.007 Token | 659.648 Token (3 Karten, Token-Sharding) |
+| `max_running_requests` | 11 | 16 |
+| Kohärenz (#289, 5 Prompts) | **5/5** | **5/5** |
+| Prefill s=1, 2048 Tok | **10.113,06 tok/s** | 1.314,15 tok/s |
+| Prefill-Latenz p50 | **210,09 ms** | 1.609,61 ms |
+| Decode bs=1 | **60,66 tok/s** = 16,49 ms/Schritt | 48,12 tok/s = 20,78 ms/Schritt |
+| Decode bs=8 | **456,95 tok/s** = 17,51 ms/Schritt | 267,43 tok/s = 29,91 ms/Schritt |
+
+Verhältnisse gegen den Anker, jeweils gegen den zuständigen Boden:
+
+| Maß | Δ | Boden | über Boden |
+|---|---:|---:|---|
+| Prefill-Durchsatz s=1 | **+669,6 %** (7,70x) | 2,71 % | ja, ~247x |
+| Prefill-Latenz p50 | **−86,9 %** (7,66x) | 2,71 % | ja |
+| ms/Decode-Schritt bs=1 | **−20,6 %** | 2,72 % | ja, ~7,6x |
+| ms/Decode-Schritt bs=8 | **−41,5 %** | 3,18 % | ja, ~13x |
+
+Der Decode-Punkt ist der server-seitige `sglang:gen_throughput` aus
+`/metrics`, vor und nach dem 12-s-Fenster gelesen (bs=1: 60,84/60,48; bs=8:
+458,11/455,79 — Spanne < 1 %, das Fenster steht). Die Tick-Ebene von `s14` liefert
+in diesem Lauf `ticks 0/0`: ihr Parser braucht das `accept len`-Feld, das ohne
+Spekulation nicht in der `Decode batch`-Zeile steht. Die Tick-Zeilen selbst sind
+da (3.585 Stück im Solo-Log) — das ist eine Grenze des Skripts im No-Spec-Fall,
+kein fehlender Messwert, und die berichtete Zahl ist entsprechend als
+Metrik-Ebene ausgewiesen.
+
+**Der Kollektivboden ist damit auf der Karte belegt.** §6.2 prognostizierte
+7,5x Prefill (161 ms solo gegen 1206 ms TP=3) und begründete es vollständig mit
+Transport, nicht mit Rechenleistung; gemessen sind 7,66x (210 ms gegen 1610 ms).
+Prognose und Messung sind sich über einen Faktor 7,5 einig — bei um 27 % bzw.
+33 % danebenliegenden Absolutwerten. Für den Decode war die Prognose „roughly a
+wash"; gemessen gewinnt Solo klar (−20,6 % bei bs=1, −41,5 % bei bs=8), weil das
+Decode-All-Reduce im Anker teurer ist als das Modell annahm.
+
+**Und der qualitative Kernsatz stimmt:** V4 ist das erste Gewichtsformat, unter
+dem Qwen3.6-27B mit echtem KV-Pool auf eine 5090 passt. `Qwen3.6-27B-FP8` bootet
+dort nicht (Verdikt vom 2026-07-28, `rig-runbook.md` §8), V4 bedient mit 153k
+Token Kontext-Kapazität.
+
+### 5. Wo die Prognose danebenliegt: der KV-Posten
+
+Gemessen 153.007 Token gegen prognostizierte 326.192 — **47 %**. Zwei benannte
+Ursachen, beide auf unserer Seite, keine davon ein Fehler im Modell der Analyse:
+
+* **Gewichte 18,81 GiB statt 17,49 GiB (+1,32 GiB).** Die §6.2-Rechnung zählt
+  die 24,35e9 quantisierten Parameter; auf der Karte liegen zusätzlich der
+  bf16-Vision-Tower und bf16-`embed`/`lm_head`, die dieser Checkpoint
+  mitbringt (`ignore` enthält alle 110 `model.visual.*`-Einträge).
+* **`--mem-fraction-static 0.90` lässt 10 % Schlupf stehen.** Nach dem Boot
+  waren 2,44 GiB frei; bei 31,9 KiB/Token (fp8-KV, K und V je 2,33 GiB für
+  153.007 Token) sind das ~80.000 Token, die nicht im Pool sind. Ein reserve-basiert
+  dimensionierter Boot (`--rank-auto-reserve-mib` statt Fraktion) sollte ~233k
+  Token erreichen. Die 326k der Analyse unterstellen zusätzlich die 17,49 GiB
+  Gewichte und bleiben damit auch dann unerreicht.
+
+Als registrierter Posten benannt, nicht als Rauschen weggeschrieben: die 2,44 GiB
+sind der Preis der gewählten Fraktion, und 153.007 Token sind **nicht** die
+Obergrenze dieses Arms.
+
+### 6. Semantik zwischen den Armen
+
+Kein Byte-Vergleich möglich und keiner behauptet: die beiden Arme fahren
+verschiedene Gewichtsformate auf verschiedenen Karten in verschiedenen
+TP-Graden. Geprüft wurde, was prüfbar ist — beide Arme 5/5 kohärent nach
+mechanischen Kriterien (>= 12 Wörter, kein Token-Anteil über 0,30, >= 95 %
+druckbar; schlechtester Wert über beide Arme: 90 Wörter, `top_word_share` 0,084),
+und beide beantworten die Faktenfrage korrekt (`Canberra` in beiden). Die
+mixed-arch-W4A4-Determinismusfrage aus ANALYSE_321 §7(e) bleibt **offen** —
+sie braucht zwei bootende Arme, und ARM 1 bootet auf diesem Checkpoint nicht.
+
+### 7. Was das für die #291/#323-Bilanz heißt
+
+* #291-S3 ist **korrekt und wirksam**: der Blackwell-Boden fällt, die Lane wird
+  aufgelöst, `nvfp4_marlin` ist auf sm86 gemessen die schnellste quantisierte
+  Lane (über `fp8_marlin` an jeder der sieben Formen). Was S3 nicht leisten kann
+  und nie versprochen hat: einen Checkpoint bedienen, der Projektionen unterhalb
+  der Tile-Breite quantisiert.
+* #323a (Coarsening) ist an diesem Checkpoint **nicht widerlegt und nicht
+  bestätigt** — der Lauf kommt nicht bis dahin. Für einen Test braucht es einen
+  V2-Checkpoint (MLP-only), dessen GDN in bf16 bleibt.
+* Der V4-Nutzen dieses Rigs ist **solo-5090**, gemessen, und er ist groß. Er ist
+  damit auch die Einstiegsbedingung für die weightless-KV-Lane (#131/#133):
+  bei 18,81 GiB Gewichten trägt eine Karte das ganze Modell, und die 40 GiB der
+  beiden 3080er sind reine KV-Kapazität.
+
+### Hygiene
+
+**VRAM-Korridor** eingehalten: knappster Punkt 2.184 MiB frei auf der 5090 im
+Solo-Arm (30.423 von 32.607 MiB belegt), im Anker-Arm 17.967/28.253/17.163 MiB
+belegt. Die 2,44 GiB Schlupf des Solo-Arms sind oben als Posten registriert.
+Nach jedem Arm alle drei Karten auf **0 MiB**, `--query-compute-apps` leer, keine
+verwaisten `sglang::scheduler_TP*`. Locks (`/tmp/gpu-card-{0,1,2}.lock`) und
+`gpu-arb/holder` freigegeben, Fenster in `gpu-arb/log` geöffnet und geschlossen.
+
+**Kartenzeit-Buch**: **1.141 s von 2.100 s**. phi0-Mikrobench ~160 s;
+Boots: `v4_tp3_uneven` 31 s (Abbruch), `v4_solo_5090`+NEXTN 60 s (Abbruch),
+`v4_solo_5090` 201 s (voll gemessen), `fp8_tp3_anchor` 195 s (voll gemessen),
+`v4_tp3_even` 30 s (Abbruch), `v4_solo_3080` 30 s (Falsifikator). Der
+Checkpoint-Download (174 s) lief vor dem Fenster, ohne Karten.
+
+Rohdaten: `/spinning/gpu-battery-results/2026-07-31_nvfp4_beleg/` —
+`phi0_lanes.json`, `punkte.jsonl`, `decode_punkte.jsonl`,
+`coherence_{v4_solo_5090,fp8_tp3_anchor}.jsonl`, `nvml_order.csv`, `proofs/`
+(VRAM vor/nach je Arm, `server_info`, `metrics`), `logs/` (Serverlogs, pyspy,
+Progress je Arm), dazu die gefahrenen Skripte `env.sh`, `arm.sh`,
+`falsifier.sh`, `coherence.py`.

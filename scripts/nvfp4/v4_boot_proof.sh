@@ -62,11 +62,38 @@
 #     drafter: the MTP layer runs at shapes where a 4-bit GEMM has no
 #     arithmetic advantage and accept length is directly quality-sensitive.
 #
+# RESULT OF THE FIRST RUN (2026-07-31, ocicek/Qwen3.6-27B-NVFP4)
+# ---------------------------------------------------------------
+#   * ARM 1 does NOT boot, and not for a reason #291-S3 or #323a can fix.
+#     The checkpoint quantises the GDN b/a gate (`create_ba_proj`), whose full
+#     width is 96 rows -- below the Marlin 64-tile at TP=1 already. Confirmed
+#     by falsifier: a TP=1 boot on one 3080, with no shard plan at all, fails
+#     with the same message. sm_86 + all-Linear NVFP4 is blocked at the
+#     checkpoint, not at the split.
+#   * ARM 2 boots, serves and is coherent. 18.81 GiB of weights, 153,007 KV
+#     tokens, 7.70x the TP=3 fp8 prefill throughput.
+#   * NEXTN is not available on this checkpoint: its compressed-tensors
+#     `ignore` list names `mtp.*` unfused, the draft module is built as
+#     `model.layers.0.*` fused, so the drafter comes out quantised against a
+#     bf16 shard. Run ARM 2 without `--speculative-algorithm`.
+# Details: docs/dev/INTEGRATION_R3_VALIDATION.md, section "NVFP4-Beleg".
+#
 # USAGE
 #   scripts/nvfp4/v4_boot_proof.sh <arm>   with arm in {tp3,solo,both}
 #   MODEL=/path/to/v4-checkpoint scripts/nvfp4/v4_boot_proof.sh both
 
 set -euo pipefail
+
+# Rig environment (docs/rig-runbook.md sections 1.1 and 2). Without the venv
+# interpreter, PYTHONPATH and the cu13 library path this script silently runs
+# a different checkout, or dies in the first deep_gemm JIT compile.
+source /root/rig-env.sh 2>/dev/null || true
+VENV="${VENV:-/spinning/htsglang-gpu/.venv}"
+PY="${PY:-$VENV/bin/python}"
+WT="${WT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="$WT/python"
+export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 
 ARM="${1:-both}"
 MODEL="${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-NVFP4}"
@@ -77,9 +104,15 @@ RUN_SECONDS="${RUN_SECONDS:-20}"
 
 mkdir -p "$OUT"
 
-# --- NVML-resolved card indices --------------------------------------------
+# --- NVML-resolved card identity --------------------------------------------
 # Never assume physical index 0 is the 5090; NVML/nvidia-smi order can shift
 # between boots and driver states.
+#
+# Resolve to UUIDs, not to indices. `CUDA_VISIBLE_DEVICES` is interpreted in
+# CUDA enumeration order (FASTEST_FIRST on this rig), which is NOT NVML order:
+# NVML index 1 is the 5090 but CUDA index 0 is (docs/rig-runbook.md 6.1).
+# Feeding an NVML index into CUDA_VISIBLE_DEVICES silently pins the wrong card.
+# A UUID means the same card in both order systems.
 resolve_cards() {
   python3 - <<'PY'
 import pynvml
@@ -90,15 +123,18 @@ for i in range(pynvml.nvmlDeviceGetCount()):
     name = pynvml.nvmlDeviceGetName(handle)
     if isinstance(name, bytes):
         name = name.decode()
+    uuid = pynvml.nvmlDeviceGetUUID(handle)
+    if isinstance(uuid, bytes):
+        uuid = uuid.decode()
     if "5090" in name:
-        five = i
+        five = uuid
     elif "3080" in name:
-        threes.append(i)
-    print(f"# nvml[{i}] {name}", flush=True)
+        threes.append(uuid)
+    print(f"# nvml[{i}] {name} {uuid}", flush=True)
 pynvml.nvmlShutdown()
 assert five is not None, "no RTX 5090 found via NVML"
 print(f"FIVE={five}")
-print(f"THREES={','.join(str(i) for i in threes)}")
+print(f"THREES={','.join(threes)}")
 PY
 }
 
@@ -112,6 +148,8 @@ COMMON=(
   --port "$PORT"
   --mem-fraction-static 0.9
   --context-length -1
+  # Mandatory on every launch_server call on this rig (rig-runbook.md 3).
+  --enable-metrics
 )
 
 wait_ready() {
@@ -163,7 +201,7 @@ boot() {
   echo "--- ${tag}: booting, log -> ${log}"
   # setsid so the server survives this script's own process group and a stray
   # Ctrl-C never leaves a half-killed rank holding VRAM.
-  setsid python3 -m sglang.launch_server "${COMMON[@]}" "$@" >"$log" 2>&1 &
+  setsid "$PY" -m sglang.launch_server "${COMMON[@]}" "$@" >"$log" 2>&1 &
   local pid=$!
   echo "$pid" > "$OUT/${tag}.pid"
   if wait_ready "$pid"; then

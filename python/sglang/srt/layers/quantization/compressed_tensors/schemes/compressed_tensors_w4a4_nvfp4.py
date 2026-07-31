@@ -109,12 +109,31 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.params_dtype = params_dtype
 
         if self._use_marlin() and output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N:
+            # Two different causes end up here and they need different fixes,
+            # so name which one this is. Measured 2026-07-31: the all-Linear
+            # NVFP4 checkpoint ocicek/Qwen3.6-27B-NVFP4 quantises the GDN b/a
+            # gate, whose FULL width is 96 rows -- it fails this check at TP=1
+            # on a single card, where there is no shard plan to blame.
+            full_size = kwargs.get("output_size")
+            if isinstance(full_size, int) and full_size % GPTQ_MARLIN_MIN_THREAD_N:
+                cause = (
+                    f"The UNSHARDED width is {full_size}, which is itself not a "
+                    f"multiple of {GPTQ_MARLIN_MIN_THREAD_N}, so no shard plan "
+                    "can satisfy this check -- the checkpoint quantises a "
+                    "projection narrower than the Marlin tile. Serving it on a "
+                    "pre-Blackwell rank requires the projection to be excluded "
+                    "from quantisation, not a different --rank-tp-ratio."
+                )
+            else:
+                cause = (
+                    f"The unsharded width is {full_size}, so the tile is "
+                    "reachable: under an uneven --rank-tp-ratio this means the "
+                    "shard plan was not coarsened to the Marlin tile."
+                )
             raise ValueError(
                 "NVFP4 Marlin requires output_size_per_partition to be a "
                 f"multiple of {GPTQ_MARLIN_MIN_THREAD_N}, got "
-                f"{output_size_per_partition}. Under an uneven --rank-tp-ratio "
-                "this means the shard plan was not coarsened to the Marlin "
-                "tile."
+                f"{output_size_per_partition}. {cause}"
             )
 
         # Weight
