@@ -1226,6 +1226,13 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # In-kernel slot-id bound check for the masked KV writers (#355). Unlike
+    # SGLANG_ENABLE_ASYNC_ASSERT above this is DEFAULT ON and costs no extra
+    # kernel launch: the compare runs in-register against a by-value bound the
+    # writer already knows, the same mechanism store_cache uses since #352. Set
+    # to 1 only to prove the check is what a slowdown is caused by -- with it
+    # off, an out-of-range slot id corrupts KV silently again.
+    SGLANG_DISABLE_KV_MASKED_BOUND_CHECK = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
