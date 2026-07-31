@@ -451,6 +451,30 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=[*labels.keys(), "lane_class", "arm"],
             multiprocess_mode="mostrecent",
         )
+        # The two factors sglang:lane_share is the quotient of (#284).  A share
+        # alone cannot distinguish a class that was denied the card from one
+        # that had it and ran slower on it, and those two call for opposite
+        # fixes.
+        self.lane_occupancy = Gauge(
+            name="sglang:lane_occupancy",
+            documentation=(
+                "Fraction of the window a class's own kernels were executing "
+                "on the card, from CUDA events on its own stream. Published "
+                "for every window in which the class was busy."
+            ),
+            labelnames=[*labels.keys(), "lane_class"],
+            multiprocess_mode="mostrecent",
+        )
+        self.lane_device_cost_ms = Gauge(
+            name="sglang:lane_device_cost_ms",
+            documentation=(
+                "Device ms a class spent per unit of work in the window. "
+                "Rises under SM competition; flat when the class is merely "
+                "getting less of the card."
+            ),
+            labelnames=[*labels.keys(), "lane_class"],
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # Speculative decoding
@@ -1294,6 +1318,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         reader needs to judge whether a share is meaningful at all.
         """
         for row in window.classes:
+            if row.occupancy is not None:
+                self.lane_occupancy.labels(**self.labels, lane_class=row.key).set(
+                    row.occupancy
+                )
+            if row.cost_ms is not None:
+                self.lane_device_cost_ms.labels(**self.labels, lane_class=row.key).set(
+                    row.cost_ms
+                )
             if row.floor is None or row.arm is None:
                 continue
             self.lane_share_floor.labels(

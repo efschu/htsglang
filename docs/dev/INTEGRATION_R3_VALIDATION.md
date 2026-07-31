@@ -15468,3 +15468,335 @@ Rohdaten: `/spinning/gpu-battery-results/2026-07-31_320_messbuendel/` —
 `tabellen.md`, `proofs/`, `power/`, `logs/`, `nvml_order.csv`, dazu die
 gefahrenen Skripte (`run.sh`, `run_b2.sh`, `p320_*.py`) und jedes generierte
 Boot-Skript.
+
+## #284: der Traeger der 70 %, das nachgefahrene Tor und der LaneShareMeter (Kartenfenster 2026-07-31, 06:09-06:27 UTC)
+
+Auftrag: die zwei offenen Caveats aus Runde 8 schliessen — WELCHE Achse die
+70 % traegt, die die Lane unter Last abgibt, und das korrigierte Kohaerenz-Tor
+einmal wirklich auf der Karte fahren — und danach den dauerhaften
+Karten-Anteils-Messer bauen.
+
+**Verdikt in drei Saetzen: Das Tor faellt durch, sobald es selbst faehrt —
+zwei von drei Prompts divergieren im Inhalt, bei diesmal DREI gruenen Boeden,
+also ohne den VOID, mit dem Runde 8 das Urteil gerettet hatte. Die 70 % traegt
+KEINE der Rezept-Achsen: weder der eager-Verify (0,172 gegen 0,185), noch die
+Feeder-Tiefe (0,209), noch die Kombination beider mit leichter Last (0,293) —
+nur die LASTHOEHE bewegt die Zahl ueberhaupt (0,185 -> 0,448 bei einer statt
+vier Anfragen), und keine der fuenf gemessenen Zellen kommt in die Naehe der
+1,002 aus Runde 4. Der Anteil zerfaellt stattdessen exakt in zwei Faktoren,
+die beide etwa gleich viel tragen: die Kernels der Lane laufen rund doppelt so
+lange (SM-Konkurrenz) UND ihr Stream ist zu ~63 % leer, obwohl sie
+durchgehend Arbeit haelt (Submissions-Luecke).**
+
+### Das Instrument, das die Frage ueberhaupt beantwortbar macht
+
+`share_lane` ist ein QUOTIENT, und Runde 8 hat ihn als Zahl berichtet statt
+als Quotient. Zwei entgegengesetzte Situationen erzeugen dieselbe Zahl: eine
+Klasse, der die Karte entzogen wird, und eine Klasse, die die Karte hat und
+langsamer auf ihr rechnet. Mit `occ = device_ms / wall_ms` (Anteil des
+Fensters, in dem die eigenen Kernels liefen) und `cost = device_ms / Token`
+ist die Definition einer Rate eine Identitaet, keine Naeherung:
+
+    rate = Arbeit / Wand = occ / cost
+    share = rate_geteilt / rate_solo = (occ_g/occ_0) / (cost_g/cost_0)
+
+Damit hat jedes Fenster genau zwei Kandidaten fuer seinen Verlust, und der
+groessere IST der groessere Teil — das ist keine Heuristik, das sind die
+beiden Faktoren einer Identitaet. `identity_error` prueft es in jedem Arm
+gegen die Rate, die es zerlegt: gemessen 4e-06 bis 1,5e-04.
+
+Geliefert wird `device_ms` von `LaneDeviceClock`: ein CUDA-Event-Paar je
+Forward auf dem Lane-Stream, **versetzt gelesen** — `elapsed_time` erst, wenn
+`query()` sagt, dass das Paar zurueck ist. Ein blockierender Read im Round der
+Lane wuerde die Lane gegen ihre eigenen Kernels serialisieren und dann das
+Ergebnis messen. Kosten: zwei Event-Records, ein Deque-Append, kein
+`synchronize`. Am Ring-Deckel wird der aelteste Eintrag benannt und gezaehlt
+abgewartet (`forced_reads`) statt verworfen — im ganzen Fenster 0 mal noetig.
+
+### Posten 2 zuerst: das Tor faellt durch, wenn es selbst faehrt
+
+Ein Boot, `--phases gate`, sonst byte-genau das r8-Rezept
+(Qwen3.6-27B-MTP-Q3_K_M-GGUF, TP=3 uneven, Lane-Budget 700, nebenlaeufig,
+NEXTN k=3, `--dual-group-lane-spec-steps 1`). Die Vertragszeilen sind
+Ziffer fuer Ziffer die aus Runde 8 — `lane budget 700 MiB = target 658 MiB
+(16 KV-bearing layer(s)) + NEXTN head 42 MiB (1)`, Head-Pool 21056 Tokens,
+Verify-Graph und NEXTN-Head-Graph gefangen, Worker auf Stream-Prioritaet -3.
+
+| Prompt | A-vs-A no-spec | A-vs-A spec | Klassifikation | erster Unterschied | Accept | ms/Token no-spec -> spec |
+|---|---|---|---|---|---|---|
+| alphabet | byte-identisch | **byte-identisch** | content_divergence | 7 | 1,016 | 16,277 -> 23,988 |
+| squares | byte-identisch | **byte-identisch** | **content_divergence** | **18** | 1,340 | 16,188 -> 18,688 |
+| repeat | byte-identisch | byte-identisch | length_end_only | — | 1,185 | 16,186 -> 20,839 |
+
+**Verdikt: divergent, drei geurteilte Prompts, null VOID.**
+
+Beide Befunde der Runde 8 kippen, und zwar in entgegengesetzte Richtungen:
+
+* `alphabet` war in r8 VOID, weil der spekulative A-vs-A-Boden dort nicht
+  hielt. Er haelt hier. Der Prompt traegt also ein Urteil, und das Urteil ist
+  Divergenz bei Index 7 — genau dem Index, den r8s Falsifikator schon
+  gefunden und dann als nicht reproduzierbar abgelegt hatte.
+* `squares` war in r8 **identisch** und ist hier bei Index 18 divergent.
+
+Der Unterschied zwischen den beiden Runden ist nicht das Rezept, sondern wer
+misst: r8 hat das Verdikt aus den Daten REKONSTRUIERT, die selbst der
+Gegenstand der Pruefung waren (der Tor-Arm und der `plain`-Falsifikator-Arm
+sind bytegleich derselbe Job und widersprachen einander). Diese Runde hat die
+korrigierte Schleife gefahren. Das ist der Grund, warum ein rekonstruiertes
+Verdikt keins ist.
+
+Die Divergenz ist damit weiterhin die #139-Familie — ein 2-Zeilen-Verify-Batch
+ist nicht bit-identisch zu einem 1-Zeilen-Decode, und an Positionen mit enger
+Logit-Marge entscheidet diese Differenz —, aber sie ist jetzt REPRODUZIERT
+statt weggevoidet: beide spekulativen Laeufe je Prompt sind untereinander
+byte-identisch, sie weichen gemeinsam von der no-spec-Bahn ab. Ein Prompt mit
+gruenem spekulativem Boden und Inhaltsdivergenz ist die eine Konstellation,
+die das Tor nicht wegerklaeren kann.
+
+### Posten 1: fuenf Zellen, eine Achse nach der anderen
+
+Ein Boot fuer vier Zellen (Achsen einzeln gedreht), ein zweiter, kurzer Boot
+fuer die fuenfte (die R4-Zelle, beide Achsen zugleich). Alle Fenster 30 s,
+Lane-Prompt `squares`, 128 Token je Auftrag, Serving-Anfragen 128 Token.
+Die Solo-Boeden sind der Falsifikator gegen das eigene Instrument: wenn der
+Device-Clock oder der online-Schaetzer den Arbeitspunkt verschoben haetten,
+muessten sie hier abweichen.
+
+| Boden | r9 | r8 | Abstand |
+|---|---|---|---|
+| Lane solo, gefangen, ohne Kette | **56,833 tok/s** | 57,155 | **0,56 %** |
+| Serving solo, 4 Anfragen | 51,2 tok/s | 54,044 | 5,3 % (= 1 Anfrage Aufloesung) |
+
+Die Lane reproduziert INNERHALB des C3-A-vs-A-Bodens (0,25-0,69 %). Die
+Instrumente haben den Arbeitspunkt nicht bewegt. Die Serving-Seite ist bei
+30-s-Fenstern auf ganze 128-Token-Anfragen quantisiert (12 Anfragen, also
+8,3 % Aufloesung), und die Differenz liegt darunter — sie steht hier deshalb
+als "unter der Aufloesung", nicht als Abweichung.
+
+Die Arme, `share_lane` roh und schwanz-korrigiert (siehe Instrumenten-Befund
+unten), dazu die Zerlegung auf den GEFANGENEN Armen, die die sauberen sind:
+
+| Arm | Lane | Last | Feeder | share_lane roh | **korrigiert** | occ_r | cost_r | share_serving |
+|---|---|---|---|---|---|---|---|---|
+| A_baseline | gefangen | 4 | Tiefe 2 | 0,2311 | **0,185** | 0,378 | 2,039 | 1,000 |
+| B_eager_lane | **eager** | 4 | Tiefe 2 | 0,2121 | **0,172** | — | — | 1,000 |
+| C_light_load | gefangen | **1** | Tiefe 2 | 0,4868 | **0,448** | 0,700 | 1,562 | 0,889 |
+| D_depth1 | gefangen | 4 | **Tiefe 1** | 0,2520 | **0,209** | 0,423 | 2,027 | 1,000 |
+| E_r4_cell | **eager** | **1** | Tiefe 2 | 0,2928 | **0,293** | 0,991 | 3,386 | 0,889 |
+
+Achse fuer Achse, gegen A gelesen:
+
+* **Graph-Capture (A -> B): NICHT der Traeger.** Die eager Lane — Runde 4s
+  Lane, ~78 ms je Runde statt 17 — behaelt 0,172 gegen 0,185. Sie verliert
+  sogar minimal MEHR. Die naheliegendste Hypothese der Runde 8 ("ein grosser
+  Teil dessen, was die Nebenlaeufigkeit damals einsammelte, waren die
+  CPU-seitigen Luecken der Lane selbst") erklaert die 1,002 nicht: eine Lane
+  mit lauter CPU-Luecken haelt ihren Anteil hier genauso wenig.
+* **Lasthoehe (A -> C): der einzige Traeger, Faktor 2,4.** Eine statt vier
+  gleichzeitiger Serving-Anfragen hebt den Anteil von 0,185 auf 0,448. Das
+  ist die einzige Achse, die die Zahl ueberhaupt gross bewegt — und sie sagt
+  zugleich, was `share_lane` ist: eine Funktion der konkurrierenden Last, kein
+  Prioritaets-Versprechen.
+* **Feeder-Tiefe (A -> D): klein, und in der vorhergesagten Richtung.** 0,209
+  gegen 0,185, also +13 %. Der Tiefe-1-Boden bestaetigt die Begruendung, mit
+  der r8 auf Tiefe 2 gegangen ist, direkt: er misst duty **0,877** — der
+  job-fuer-job-Feeder laesst die Lane 12 % der Zeit leerlaufen, drueckt damit
+  den SOLO-Boden (50,4 statt 56,8 tok/s) und blaeht den Anteil auf. Methodik,
+  nicht Laufzeit.
+* **Die R4-Zelle selbst (E): 0,293, nicht 1,002.** Beide Achsen zugleich,
+  gemessen statt aus den Einzelachsen multipliziert. Selbst das exakte
+  Rezept-Analogon der Runde 4 reproduziert deren Zahl nicht.
+
+**Damit ist die Frage anders beantwortet, als sie gestellt war.** Es gibt
+keine Rezept-Achse, die die 70 % traegt. Die 1,002 der Runde 4 ist der
+Ausreisser, und das Aggregat sagt, warum: R4 berichtet `E` = 0,895 + 1,002 =
+**1,897** — fast zwei Karten Arbeit aus einer Karte. Diese Runde misst ueber
+fuenf Zellen `E` zwischen **1,18 und 1,38**, und der Device-Clock nennt die
+physikalische Schranke direkt: die Lane solo belegt die Karte zu **97,5 %**
+(occ 0,97454), die Serving-Gruppe solo saettigt sie ebenfalls. Zwei
+SM-saettigende Lasten auf einer Karte koennen nicht 1,9 ergeben. Runde 4 hat
+seinen Lane-Boden im nebenlaeufigen Boot selbst als gedrueckt notiert
+(10,42 gegen 12,80 tok/s seriell) — ein zu kleiner Nenner ist genau der Weg,
+auf dem `share_lane` ueber 1 und `E` in die Naehe von 2 kommt. Der
+PD-Prioritaets-Anspruch, den die 1,002 gestuetzt hat, traegt nicht.
+
+### Wovon der Verlust getragen wird, wenn nicht vom Rezept
+
+Auf den gefangenen Armen ist die Zerlegung eindeutig lesbar, weil ein
+Graph-Replay EIN Launch ist: zwischen den beiden Events liegt dort echte
+GPU-Ausfuehrung und keine Launch-Luecke.
+
+* **cost_r 2,04 (A):** derselbe gefangene Decode-Graph braucht unter Last
+  34,96 statt 17,15 ms Device-Zeit je Token. Das ist SM-Konkurrenz, direkt
+  gemessen.
+* **occ_r 0,378 (A):** die Lane haelt durchgehend Arbeit (duty 1,0), aber ihr
+  Stream ist 63 % des Fensters leer. Diese Zeit liegt ZWISCHEN den Forwards —
+  `prepare_for_decode`, das `.item()`, die Job-Buchhaltung: Python, und damit
+  die GIL, die der Scheduler-Thread haelt, waehrend er die Serving-Gruppe
+  fuehrt.
+
+Beide Terme sind etwa gleich gross (2,04 gegen 2,65), und unter leichter Last
+schrumpfen beide gemeinsam (C: 1,56 und 1,43). Der Verlust ist also zur
+Haelfte SM-Konkurrenz und zur Haelfte eine Submissions-Luecke — nicht
+entweder-oder.
+
+Fuer die EAGER-Arme ist `occupancy` bewusst NICHT als SM-Zeit zu lesen: die
+Event-Spanne umschliesst dort einen launch-gebundenen Forward, also auch die
+Luecken INNERHALB des Forwards. Bei E steht deshalb occ_r 0,991 und cost_r
+3,386 — die Spanne selbst wird 3,4x laenger. Der Ratenpfad ist davon nicht
+beruehrt und traegt die Aussage dieser Arme.
+
+### Posten 4: Chunking wird NICHT gebaut
+
+Der Auftrag baut die feinere Verleih-Quantisierung nur, wenn Posten 1 sie als
+Traeger ausweist. Er tut es nicht, und zwei Messungen dieses Fensters sagen es
+mit Zahlen:
+
+1. **Die Zulassung ist nicht der Engpass.** `admission_wait_ms` ueber den Boot:
+   Mittel **1,087 ms**, Max 2,395 ms gegen ein 2,0-ms-Budget. Die Lane bekommt
+   ihre Gelegenheit, und sie kostet ~3 % einer 35-ms-Runde. Feinere Grains
+   koennten hoechstens diese 3 % umverteilen.
+2. **Die Haelfte des Verlusts ist SM-Konkurrenz, und SMs kann man nicht
+   verleihen.** cost_r 2,04 entsteht, waehrend die Lane auf der Karte IST.
+   Kein Zuteilungs-Schema aendert daran etwas; die Karte ist von beiden
+   Klassen gesaettigt.
+3. **Die andere Haelfte wuerde durch Chunking schlechter.** Die
+   Submissions-Luecke ist GIL-/Python-gebunden. Die Serving-Seite in kleinere
+   Grains zu schneiden heisst mehr Python je GPU-Arbeit, also mehr
+   GIL-Konkurrenz gegen genau den Thread, der die Luecke schon verursacht.
+
+Das dokumentierte Design bleibt damit stehen und unausgefuehrt. Wenn die
+Submissions-Luecke angegangen wird, ist der Hebel nicht die Grain-Groesse,
+sondern die Menge Python zwischen zwei Lane-Forwards.
+
+### Posten 3: LaneShareMeter — die zweite Achse und das Gate
+
+Der Messer selbst gab es seit Slice D1 (Arbeit je Wandsekunde, Boeden nur aus
+Solo-Fenstern, ein Arm je Fenster, jedes Fenster traegt seine Sprosse). Diese
+Runde ergaenzt ihn um die Achse, ohne die er die Frage dieses Auftrags nicht
+beantworten kann, und um ein formuliertes Kriterium:
+
+* `ClassSample` traegt optional `device` (`device_ms`, `busy_wall_ms`), beide
+  monoton, beide je Fenster differenziert. Eine Klasse ohne Uhr bekommt
+  weiterhin ihren Anteil und einfach keine Zuschreibung — `None` und `0.0`
+  werden strikt getrennt, sonst haette jedes Fenster einen erfundenen Traeger.
+* `ClassWindow` rechnet `occupancy`, `duty`, `cost_ms` und daraus
+  `occupancy_ratio` / `cost_ratio` / `duty_ratio` und den `carrier` — einen
+  von drei benannten: `sm_competition`, `submission_gap`, `starved`.
+* `FloorEstimate` fuehrt Occupancy, Cost und Duty des Bodens mit, weil eine
+  Zerlegung, deren Nenner aus einem anderen Fenster stammt als ihr Zaehler,
+  den falschen Lauf erklaert.
+* `LaneShareGate(key, min_share, load=..., min_windows=...)`: "Lane haelt
+  >= X unter Last Y". Nur GETEILTE Fenster werden geurteilt (sonst besteht
+  eine Lane den Lasttest, indem sie nicht belastet wird), der MEDIAN
+  entscheidet (ein Fenster zwischen zwei Jobs ist ein langer linker Schwanz
+  auf einer beschraenkten Groesse), und ein Fehlschlag nennt den Traeger.
+  Flags: `--dual-group-lane-share-min`, `--dual-group-lane-share-min-windows`,
+  `--dual-group-lane-share-load`. Das Gate BEWERTET nur; nichts in der
+  Laufzeit liest sein Verdikt, weil ein darauf reagierender Regler die
+  Messung selbstkonditionieren wuerde.
+* Zwei neue Gauges: `sglang:lane_occupancy` und `sglang:lane_device_cost_ms`
+  — die beiden Faktoren neben dem Quotienten `sglang:lane_share`.
+
+**Der Messer wurde auf der Karte gegen den Offline-Treiber geeicht, und die
+Eichung hat sofort einen Fehler im Gate gefunden.** Im ersten Boot meldete das
+Gate ein bequemes **pass** bei Median 0,3096 fuer eine Lane, die in Wahrheit
+0,185 hielt. Die Zahl war nicht falsch, der Nenner war es: der Treiber faehrt
+absichtlich drei Lane-Konfigurationen durch einen Messer, und dessen Boden
+lernt nach Regel 3 aus jedem Solo-Fenster weiter — 56,83 (gefangen), 16,50
+(eager) und 50,40 (Tiefe 1) verschmolzen zu **33,655 tok/s**. Gegen den
+richtigen Boden gerechnet: 33,655/56,833 x 0,3096 = **0,1833** gegen 0,1852
+offline, also **1,0 % auseinander**. Die beiden Instrumente stimmen ueberein,
+sobald der Nenner stimmt.
+
+Daraus die vierte Gate-Regel, und sie ist card-run: **ein Nenner, der sich
+waehrend des Urteilens bewegt, macht das Verdikt ungueltig.** Das Gate fuehrt
+den Boden jedes geurteilten Fensters mit und meldet `insufficient` /
+`floor_moved`, wenn die Spanne `floor_tolerance` (10 %) uebersteigt. Positive
+Kontrolle im zweiten Boot, dessen Lane-Konfiguration sich nie aendert:
+`floor_span` **0,0**, Verdikt **fail**, Median 0,2509, `carrier`
+`sm_competition` in 17 von 17 gescheiterten Fenstern. Gegen den offline
+gemessenen Anteil derselben Zelle (0,2928) bleibt der Abstand genau die
+Differenz der Boeden (18,50 online gegen 16,26 offline).
+
+### Was diese Runde am Instrument geaendert hat
+
+Zwei Defekte, beide nur auf einem echten Lauf sichtbar, beide mit
+hermetischem Test:
+
+5. **Fenster-Grenze: die Zaehler wurden NACH dem Stoppen der Lasten gelesen.**
+   `serving.stop()` joint Worker, die je in einem `/generate` stehen und
+   Sekunden brauchen koennen; die Lane arbeitet durch diesen Join hindurch.
+   Sichtbar als Unmoeglichkeit: duty **1,208-1,377** — mehr belegte Wandzeit
+   im Fenster, als das Fenster hatte. Es trifft nur die GETEILTEN Fenster
+   (ein Solo-Lane-Fenster hat keinen Serving-Join davor), also genau den
+   Zaehler von `share_lane`. **Das betrifft auch die r8-Zahlen: deren geteilte
+   Lane-Raten (11,000 und 15,733 tok/s) tragen denselben Schwanz und sind
+   Ueber-Schaetzungen, der Verlust war groesser als berichtet.** Korrigiert
+   (Lesen vor dem Stoppen), und ein duty > 1 wird benannt statt geklemmt — ein
+   geklemmter Widerspruch sieht aus wie eine Messung. Die Zahlen der
+   A-D-Tabelle oben sind mit `busy_wall_ms` als effektivem Fenster
+   nachkorrigiert; Boot 2 (Zelle E) fuhr bereits die reparierte Fassung, was
+   die Spalten "roh" und "korrigiert" dort zusammenfallen laesst.
+6. **Der Device-Clock hing nur am nicht-spekulativen Pfad.** Der Verify laeuft
+   ueber `_timed_forward_raw` (das Wandzeit ZURUECKGIBT, weil jeder Aufrufer
+   sie als Rundenzeit nutzt), der Plain-Decode ueber `_timed_forward` — nur
+   der zweite fuetterte die Uhr. Ein spekulatives Fenster berichtete damit die
+   Kopf-Forwards, als waeren sie die ganze Lane: Boot 1 las fuer die eager
+   Lane occ 0,064, Boot 2 mit eigenem Event-Paar auf dem Raw-Pfad occ 0,975
+   und cost 59,99 ms/Token — was r8s eager Runde von 76,5 ms bestaetigt. Die
+   Rueckgabe blieb Wandzeit, die Uhr bekommt ihr eigenes Paar.
+
+Ein dritter, ohne Karte gefunden, aber aus derselben Familie: der neue
+Treiber-Test lief allein gruen und in der Suite rot. Diese Skripte werden per
+Dateipfad unter festen Modulnamen geladen, also ueberschreiben zwei Testdateien
+gegenseitig ihren `sys.modules`-Eintrag; ein Re-Import INNERHALB einer Methode
+loest dann auf ein anderes Modulobjekt auf als das, welches der Test gepatcht
+hat, und der Job geht an den echten Transport. Behoben, indem die
+Modul-Ebenen-Namen benutzt werden statt eines Imports im Aufruf. "Allein gruen,
+in der Suite rot" ist die Signatur genau dieses Fehlers.
+
+### Auslastung und Leistung je Karte
+
+| Boot | Karte | Peak MiB / Total | MIN frei | util avg/max | W avg/max |
+|---|---|---|---|---|---|
+| 1 (Tor + A-D) | 3080 (NVML 0) | 8331 / 20480 | 12149 | 38 / 100 | 142 / 287 |
+| 1 | 5090 (NVML 1) | 29633 / 32607 | **2974** | 55 / 100 | 267 / 572 |
+| 1 | 3080 (NVML 2) | 8279 / 20480 | 12201 | 37 / 100 | 130 / 275 |
+| 2 (Zelle E) | 3080 (NVML 0) | 8079 / 20480 | 12401 | 24 / 100 | 109 / 288 |
+| 2 | 5090 (NVML 1) | 29347 / 32607 | 3260 | 28 / 100 | 143 / 370 |
+| 2 | 3080 (NVML 2) | 8031 / 20480 | 12449 | 23 / 100 | 105 / 269 |
+
+VRAM-Korridor eingehalten (frei >= 400 MiB auf jeder Karte). Boot 2 zieht
+deutlich weniger Leistung, weil die eager Lane und eine einzelne
+Serving-Anfrage die Karte nicht auslasten — dieselbe Aussage wie occ/cost, nur
+in Watt. CUDA-Reihenfolge zur Laufzeit aufgeloest, `cuda:0` = 5090 = NVML 1,
+wie erwartet abweichend.
+
+### Kartenzeit
+
+Zwei Boots, 06:09:15-06:19:50 und 06:20:49-06:27:22 UTC, zusammen **~17
+Minuten** Belegung gegen einen Deckel von 30. Beide ueber `gpu-arb` gehalten
+und freigegeben, keine fremde Sitzung im Fenster (das #320-Fenster war um
+06:09 bereits geschlossen), beide Karten-Reihenfolgen zur Laufzeit aufgeloest.
+Boot-Dauer 4 min 25 s bzw. 4 min 30 s bei warmem JIT-Cache. Rohdaten unter
+`/spinning/gpu-battery-results/2026-07-31_284_lane_share/{boot1_axes,
+boot2_r4cell}/` (`report.json`, `report.txt`, `contract_lines.txt`,
+`cards.txt`, `vram.csv`, `vram_summary.txt`, `server_info.json`).
+
+### Offen
+
+- **Das Tor ist rot und braucht eine Entscheidung, keine weitere Messung.**
+  Die Divergenz ist die #139-Familie (2-Zeilen-Verify gegen 1-Zeilen-Decode).
+  Entweder das Tor akzeptiert diese Klasse explizit als bekannte
+  Numerik-Differenz und prueft nur noch gegen einen spekulativen Referenzlauf
+  — dann ist es ein Reproduzierbarkeits-Tor und kein Kohaerenz-Tor —, oder
+  `--dual-group-lane-spec` bleibt aus. Es bleibt ohnehin aus (Default), aber
+  die Runde-8-Zeile "Verdikt kohaerent auf zwei geurteilten Prompts" ist
+  zurueckzunehmen.
+- **`E` fuer eine PREFILL-foermige Lane** fehlt weiter (aus r8 uebernommen);
+  die Lastform ist der groesste bekannte Hebel auf `E`.
+- **Die Submissions-Luecke ist beziffert, aber nicht zerlegt.** 63 % leerer
+  Stream bei duty 1,0 ist GIL-verdaechtig, gemessen ist es nicht. Ein
+  py-spy-Fenster auf den Lane-Thread waehrend eines geteilten Fensters wuerde
+  es benennen — und erst dann ist entscheidbar, ob daran etwas zu holen ist.

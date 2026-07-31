@@ -69,6 +69,7 @@ from sglang.srt.managers.admission_limiter import (
     AdmissionLimiter,
     admission_limiter_scope,
 )
+from sglang.srt.model_executor.lane_device_clock import LaneDeviceClock
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -1418,6 +1419,14 @@ class DualGroupLane:
         # decode-shaped step have different solo floors and may not be
         # averaged into one rate.
         self.work_total = {"prefill_tokens": 0, "decode_tokens": 0}
+        # Monotone TIME counters next to the monotone WORK counters (#284).
+        # work_total answers "how much did the lane get done"; this answers
+        # "how much of the card did it have while doing it", and the r8 caveat
+        # is that the first question alone cannot tell a lane that lost the
+        # card from a lane whose kernels ran slower on it.
+        self.device_clock = LaneDeviceClock(
+            lambda: torch.cuda.Event(enable_timing=True), None
+        )
         self._register_offload_items()
 
     def _rung_size_source(self, rung: int):
@@ -1648,6 +1657,11 @@ class DualGroupLane:
         if self.lending is not None:
             self.lending.on_lane_work_arrived()
         self._idle_since = None
+        # The busy interval opens when work ARRIVES, not when the worker picks
+        # it up: the time between the two is time the lane held work and did
+        # not run, which is exactly the quantity the duty cycle is meant to
+        # expose (a feeder gap would otherwise hide inside it).
+        self.device_clock.mark_busy()
         self._wake.set()
 
     @property
@@ -1670,6 +1684,10 @@ class DualGroupLane:
             # Per-arm work completed, bumped at completion rather than at job
             # finish -- the numerator of share_lane (see lane_share.py).
             "work_total": dict(self.work_total),
+            # The TIME counters that turn share_lane from a number into a
+            # diagnosis (#284): device ms on the lane's own stream and wall ms
+            # spent holding work, both monotone, both differenced per window.
+            "device_clock": self.device_clock.snapshot().to_json(),
             "results": self.results[-8:],
             "weight_added_mib": getattr(
                 self.runner, "dual_group_lane_weight_added_mib", None
@@ -1739,6 +1757,11 @@ class DualGroupLane:
         # makes both classes equal-priority and isolates that question.
         high = int(os.environ.get("SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY", high))
         self.stream = torch.cuda.Stream(device=self.runner.gpu_id, priority=high)
+        # The clock records on the lane's stream from here on. Before this
+        # point (and on the serial path) it records on the current stream,
+        # which is the lane's for the duration of a serial tick -- the same
+        # measurement, taken where the lane is the only writer.
+        self.device_clock.bind_stream(self.stream)
         self._thread = threading.Thread(
             target=self._worker_loop,
             name=f"dual-group-lane-{self.lane_id}",
@@ -1777,8 +1800,13 @@ class DualGroupLane:
                             self._busy = False
                             if self._idle_since is None:
                                 self._idle_since = time.monotonic()
-                            break
-                        self._busy = True
+                            idle = True
+                        else:
+                            self._busy = True
+                            idle = False
+                    if idle:
+                        self.device_clock.mark_idle()
+                        break
                     try:
                         with torch.cuda.stream(self.stream):
                             self._step_locked_scope()
@@ -1832,6 +1860,7 @@ class DualGroupLane:
         with self._lock:
             if self.active is None:
                 if not self.jobs:
+                    self.device_clock.mark_idle()
                     return False
                 self.active = self.jobs.pop(0)
             job = self.active
@@ -1963,7 +1992,12 @@ class DualGroupLane:
         self._head_graph_last = bool(
             graph_runner is not None and graph_runner.lane_draft_can_replay(fb)
         )
-        out = self.draft_runner.forward(fb).logits_output
+        # The one forward on the lane's paths with no event pair of its own,
+        # and the one whose cost the round's ms/token has to carry: a K-chain
+        # runs K of these per verify. The span defers its read (#284), so
+        # adding it costs two event records and no synchronize.
+        with self.device_clock.span():
+            out = self.draft_runner.forward(fb).logits_output
         return out
 
     def _propose(self, job):
@@ -2079,8 +2113,20 @@ class DualGroupLane:
         if capture_mode is not None:
             batch.capture_hidden_mode = capture_mode
         t0 = time.perf_counter()
+        # This path RETURNS wall time -- every caller uses it as the round's
+        # own timing and the recorded tables are wall -- so the device clock
+        # gets its own event pair rather than the returned number. Missing
+        # this cost the r9 boot the occupancy of every SPECULATIVE arm: the
+        # verify runs here, the plain decode runs in _timed_forward, and only
+        # the second one was feeding the clock, so a speculative window
+        # reported the head's forwards as if they were the whole lane.
+        start_ev = end_ev = None
         if self.stream is None:
             torch.cuda.synchronize(runner.gpu_id)
+        else:
+            start_ev = torch.cuda.Event(enable_timing=True)
+            end_ev = torch.cuda.Event(enable_timing=True)
+            start_ev.record(self.stream)
         fb = ForwardBatch.init_new(batch, runner)
         if capture_mode is not None:
             fb.capture_hidden_mode = capture_mode
@@ -2088,9 +2134,13 @@ class DualGroupLane:
         out = runner.forward(fb).logits_output
         if self.stream is None:
             torch.cuda.synchronize(runner.gpu_id)
-        else:
-            self._submitted.set()
-            self.stream.synchronize()
+            wall_ms = (time.perf_counter() - t0) * 1000.0
+            self.device_clock.add_device_ms(wall_ms)
+            return out, wall_ms
+        end_ev.record(self.stream)
+        self._submitted.set()
+        self.stream.synchronize()
+        self.device_clock.add_device_ms(start_ev.elapsed_time(end_ev))
         return out, (time.perf_counter() - t0) * 1000.0
 
     def _timed_forward(self, batch):
@@ -2114,7 +2164,9 @@ class DualGroupLane:
             logits_output = runner.forward(forward_batch).logits_output
             next_token_ids = runner.sample(logits_output, forward_batch)
             torch.cuda.synchronize(runner.gpu_id)
-            return next_token_ids, (time.perf_counter() - t0) * 1000.0
+            ms = (time.perf_counter() - t0) * 1000.0
+            self.device_clock.add_device_ms(ms)
+            return next_token_ids, ms
 
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
@@ -2131,7 +2183,9 @@ class DualGroupLane:
         # Device time on the lane's stream: what the lane's own kernels took,
         # including the SM share it lost to the serving group but excluding
         # any time spent waiting for the GIL between launches.
-        return next_token_ids, start_ev.elapsed_time(end_ev)
+        device_ms = start_ev.elapsed_time(end_ev)
+        self.device_clock.add_device_ms(device_ms)
+        return next_token_ids, device_ms
 
     # -- one-shot row/position diagnosis (env-gated, off by default) -------
 

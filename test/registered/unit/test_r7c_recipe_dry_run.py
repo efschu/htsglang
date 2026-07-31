@@ -31,6 +31,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _R7C = _REPO_ROOT / "scripts" / "dual_group" / "r7c"
 _R8 = _REPO_ROOT / "scripts" / "dual_group" / "r8"
+_R9 = _REPO_ROOT / "scripts" / "dual_group" / "r9"
 _RECIPES = [
     _R7C / "boot_a_fp8_reference.sh",
     _R7C / "boot_b_dense_head.sh",
@@ -42,6 +43,9 @@ _RECIPES = [
     # trap under bash (`"${arr[@]}"` on an empty array is unbound in older
     # bashes, and the expansion here is written to survive it).
     _R8 / "boot_lane_spec.sh",
+    # Round 9 (#284) sources the same common.sh and additionally overrides WT
+    # before sourcing it, which is its own way to break the resolution.
+    _R9 / "boot_lane_share_axes.sh",
 ]
 
 # Verbatim shape of what resolve_cards() prints on the rig, including the two
