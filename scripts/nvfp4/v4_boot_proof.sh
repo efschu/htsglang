@@ -90,10 +90,13 @@
 #     line per affected layer:
 #       "NVFP4: layer '...linear_attn.in_proj_ba' has no Marlin form at any TP
 #        size (the unsharded output width is 96, ...) ... DEQUANTISED ..."
-#     Count them: 48 GDN layers x 3 ranks = 144 lines, the same count the #316
-#     guard produced in its own card proof. Fewer means some layers took a
-#     kernel lane they cannot serve; more means an MLP layer fell into the
-#     fallback and the VRAM figures below will be wrong.
+#     Count them: 48 GDN layers x the number of MARLIN ranks. On this rig that
+#     is 96, not 144 -- MEASURED 2026-07-31, 48 on TP1 and 48 on TP2 and ZERO
+#     on TP0. The zero is correct and not a miss: the guard asks whether the
+#     unsharded width has a MARLIN form, and the 5090 rank does not use Marlin
+#     at all, it uses the native FP4 lane. The old "144" assumed three sm_86
+#     ranks, i.e. a different rig. More than 48 per Marlin rank means an MLP
+#     layer fell into the fallback and the VRAM figures below will be wrong.
 #     Cost check: the dense b/a gates add ~16 MiB across the whole model.
 #     Anything larger is a routing bug, not a rounding difference.
 #
@@ -281,9 +284,16 @@ if [[ "$ARM" == "tp3" || "$ARM" == "both" ]]; then
     SPEC=(--speculative-algorithm NEXTN --speculative-num-steps 3
           --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
   fi
-  CUDA_VISIBLE_DEVICES="${FIVE},${T0},${T1}" \
+  # Placement is --rank-gpu-id, not CUDA_VISIBLE_DEVICES. `--rank-tp-ratio auto`
+  # derives its per-rank budgets from NVML totals and therefore REQUIRES
+  # --rank-gpu-id; pinning by UUID and passing `auto` alone aborts at argument
+  # validation ("--rank-tp-ratio auto requires --rank-gpu-id") without ever
+  # reaching a card. All three cards are in play here, so there is nothing to
+  # hide, and index 0 resolves to the 5090 (budgets [29607, 17780, 17780] MiB),
+  # which is what the 3000/2700/2700 reserve list assumes.
   boot v4_tp3_uneven \
     --tensor-parallel-size 3 \
+    --rank-gpu-id 0,1,2 \
     --rank-tp-ratio auto \
     --rank-auto-reserve-mib 3000,2700,2700 \
     "${SPEC[@]}"
@@ -304,9 +314,11 @@ echo "=== what to read out of ${OUT} (expectations from the 2026-07-31 beleg) ==
 echo "  1. grep -E 'fp4|nvfp4|marlin|backend' *_server.log"
 echo "     ARM 1 must show TWO different FP4 lanes across the three ranks."
 echo "  2. #332 posten 1 -- grep -c 'DEQUANTISED' v4_tp3_uneven_server.log"
-echo "     expected 144 (48 GDN layers x 3 ranks), each naming in_proj_ba and"
-echo "     the unsharded width 96. Zero means ARM 1 died the old death;"
-echo "     a count above 144 means an MLP layer fell into the dense lane."
+echo "     expected 96 on this rig (48 GDN layers x the TWO Marlin ranks), each"
+echo "     naming in_proj_ba and the unsharded width 96; the 5090 rank"
+echo "     contributes ZERO because it takes the native FP4 lane. Zero overall"
+echo "     means ARM 1 died the old death; more than 48 per Marlin rank means"
+echo "     an MLP layer fell into the dense lane."
 echo "  3. #332 posten 2 -- grep -E 'unloaded|accept' v4_tp3_uneven_server.log"
 echo "     expected: no #318 raise, zero unloaded draft parameters, and"
 echo "     meta_info.spec_accept_length well above 1.0. Exactly 1.0052 with"

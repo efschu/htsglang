@@ -16759,3 +16759,315 @@ Ergebnis, gegen die Tore:
 rank-uniform durch den Konsens-Kanal, die Admission-Stufe stoppt die
 Retract-Schleife nach einem Einzel-Ereignis, ohne Druck kein Flip und
 Text-Byte-Gleichheit zur Ladder-freien Kontrolle.
+
+## #332+Familien-Beleg: Bootbelege zu #332 und den zwei Familien-Nachläufern (Kartenfenster 2026-07-31, 08:20-08:3x UTC)
+
+Belegprogramm zu den Merges #332 (`68e02ea398`) und Familien-Slice 2
+(`df08e51baa`). Basis ist **`8cc836bb40`**, nicht der ursprünglich beauftragte
+Merge `9ef5570345` — warum, sagt Verdikt 0. Checkpoint für alle NVFP4-Arme:
+`ocicek/Qwen3.6-27B-NVFP4`, derselbe wie im NVFP4-Beleg des 06:40-Fensters,
+dessen Zahlen hier durchgängig als Anker dienen.
+
+### Verdikte zuerst
+
+0. **Der beauftragte Merge-HEAD war unbootbar.** `9ef5570345` trug
+   einbetonierte Konfliktmarker in `server_args.py`; das Modul parste nicht.
+   Gefunden vor der ersten Kartensekunde durch eine CPU-Argumentprobe.
+   Wurzelfix `8cc836bb40`.
+1. **Posten 1 trägt — aber die Erwartung „144" war falsch. Richtig sind 96.**
+   Der Dequant-Fallback feuert auf beiden Marlin-Rängen und korrekterweise auf
+   keinem nativen.
+2. **ARM 1 bootet trotzdem nicht.** Dahinter steht ein **dritter, bisher
+   unbenannter Stopper**: die native FP4-Lane verlangt eine geshardete Breite,
+   die durch 32 teilbar ist, und die GDN-b/a-Projektion dieses Checkpoints kann
+   das bei **keinem** TP > 1 liefern — auch nicht beim ebenen Split. Über drei
+   Ratios auf der Karte vermessen, eine vorab registrierte Vorhersage
+   eingetroffen, eine falsifiziert; die Falsifikation hat das Modell erst
+   scharf gemacht.
+3. **Posten 2 (NEXTN) bleibt OFFEN** — ARM 1 erreicht nie den Servierzustand,
+   also gibt es keine Accept-Länge, weder bestätigend noch falsifizierend.
+4. **Posten 3 ist defekt: falsche Karte.** `--rank-auto-reserve-mib` liest den
+   NVML-Index 0 statt der sichtbaren Karte. Der Knopf hat in diesem Fenster
+   **nichts** bewirkt — und sah dabei aus wie ein sauberes „unverändert".
+5. **Familien-Nachläufer (a) ist beantwortet und kippt das Urteil:** ohne
+   Radix-Cache sind beide Böden grün, und der Arm ist damit nicht mehr VOID,
+   sondern **ROT** — die zweikartige Lane weicht wirklich ab.
+6. **Familien-Nachläufer (b) ist beantwortet: die Budget-Hypothese ist tot.**
+   Mehr Luft auf beiden Karten ändert nichts, der Illegal-Memory-Access bleibt.
+
+### 0. Der Merge-HEAD parste nicht
+
+`git grep` über `9ef5570345` findet genau eine Datei mit echten Konfliktblöcken:
+`python/sglang/srt/server_args.py`, zwei Hunks, sechs Markerzeilen. Beide Hunks
+haben eine LEERE HEAD-Seite; die Feature-Seite trägt den Aufruf
+`_validate_dual_group_lane_part_gpu_id()` und den Gating-Zweig für
+`--dual-group-lane-part-gpu-id`. Keiner der beiden Merge-Eltern trägt die
+Marker (`68e02ea398`: 0, `df08e51baa`: 0) — sie sind bei der Auflösung des
+Merges selbst entstanden und mit `git add -A` mitcommittet worden.
+
+Betroffen war ausschliesslich `/spinning/wt-final`; `/spinning/htsglang`,
+`/spinning/htsglang-gpu` und `/spinning/wt-lane-fam2` sind sauber, weshalb das
+parallel laufende #287-Fenster nichts davon merkte.
+
+Der Wurzelfix `8cc836bb40` löst zur Feature-Seite auf. Geprüft wurde nicht nur,
+dass das Modul parst, sondern dass **beide** wiederhergestellten Hunks scharf
+sind — ein reiner Parse-Test hätte einen toten Zweig nicht von einem lebenden
+unterschieden:
+
+| Probe | Ergebnis |
+|---|---|
+| Flag ohne `--dual-group-lane` | `ValueError: --dual-group-lane-part-gpu-id only applies with --dual-group-lane.` |
+| Falsche Listenlänge mit Lane | `ValueError: ... takes one physical GPU id per LANE rank, and the lane group has 2 ranks; got [0,1,2]` |
+
+Eine Nebenbeobachtung, die in die Testabdeckung gehört: die Kette hängt in
+`_handle_uneven_tp` und wird nur erreicht, wenn `--rank-gpu-id` oder
+`--rank-tp-ratio` gesetzt ist. Bei `tp_size=1` nimmt der Parser
+`--dual-group-lane-part-gpu-id` bis heute wortlos an.
+
+### 1. Posten 1: der Dequant-Fallback trägt, die Erwartung war falsch
+
+`v4_boot_proof.sh` erwartet **144** DEQUANTISED-Zeilen (48 GDN-Layer × 3 Ränge)
+und nennt jede Abweichung nach unten einen Fehlschlag. Gemessen:
+
+| Rang | Karte | Lane | DEQUANTISED-Zeilen |
+|---|---|---|---:|
+| TP0 | RTX 5090 (sm120) | nativ FP4 | **0** |
+| TP1 | RTX 3080 (sm86) | Marlin | 48 |
+| TP2 | RTX 3080 (sm86) | Marlin | 48 |
+| | | | **96** |
+
+Die Null auf TP0 ist **kein Miss, sondern richtig**. Der Wächter fragt, ob die
+UNGESHARDETE Breite eine MARLIN-Form hat; der native Rang benutzt Marlin gar
+nicht und stellt die Frage nie. Die 144 unterstellen drei Marlin-Ränge — sie
+beschreiben ein Rig aus drei sm86-Karten, nicht dieses. **Die Erwartung im
+Skript gehört auf 48 × (Zahl der Marlin-Ränge) korrigiert.**
+
+Jede der 96 Zeilen nennt `linear_attn.in_proj_ba` und die ungeshardete Breite
+96, wie vorgesehen. Posten 1 tut also genau das, wofür er gebaut wurde.
+
+### 2. Der dritte Stopper: uneven-Shard-Breite × native FP4-Lane
+
+ARM 1 lädt durch, dimensioniert den KV-Pool (`max_total_num_tokens=773824`,
+profilierte Kapazität `[447152, 205561, 240622]`) und stirbt auf **TP0** im
+ersten Forward, während der CUDA-Graph aufgezeichnet wird:
+
+    nvfp4_scaled_mm_kernels.cuh:81:
+      Expected n to be divisible by 32, but got n: 42
+
+Der Pfad ist eindeutig und führt nicht durch den Dequant-Fallback:
+`compressed_tensors_w4a4_nvfp4.py:472 apply_weights` -> `fp4_gemm` ->
+`cutlass_scaled_fp4_mm`, im Layer `in_proj_ba`.
+
+Die Arithmetik dahinter: `linear_num_value_heads = 48`, das GDN-b/a-Gate trägt
+zwei Skalare je Value-Head, also ist die Projektion ungeshardet 96 Zeilen breit.
+Der `auto`-Plan gibt Rang 0 einundzwanzig der 48 Heads — 42 Zeilen. 42 % 32 ≠ 0.
+
+**Das ist eine Lücke im #332-Wächter, keine Eigenschaft des Checkpoints.** #332
+deckt die Marlin-Ränge ab (Kachel 64, ungeshardete Breite). Die native Lane hat
+eine EIGENE Geometriebedingung — geshardete Breite % 32 — und die prüft niemand.
+Bei TP=1 fällt das nicht auf, weil 96 % 32 = 0; erst der uneven Split erzeugt
+Breiten, die die native Bedingung verfehlen.
+
+**Falsifikation auf der Karte, Zahlen vorab registriert.** Der Kontrollarm
+variiert nur das Ratio. Der ebene Split taugt auf diesem Rig nicht als
+Kontrolle: `--rank-tp-ratio 1,1,1` wird abgelehnt („identical entries is the
+even split") und ohne das Flag greift der Balance-Wächter von stock sglang auf
+ungleichen Karten (`pre_model_load_memory=19.23` gegen
+`local_gpu_memory=30.55 GB`). Also zwei UNEVEN Ratios, eines mit vorhergesagtem
+Tod bei einer bestimmten Zahl, eines mit vorhergesagtem Durchkommen:
+
+| Ratio | Vorhersage (vorab) | Gemessen | |
+|---|---|---|---|
+| `auto` | (Ausgangsbefund) | `got n: 42` | |
+| `2,1,1` | stirbt mit **n = 48** | **`got n: 48`** | eingetroffen |
+| `4,1,1` | kommt durch (n = 64) | **`got n: 60`** | **falsifiziert** |
+
+**Die zweite Vorhersage ist falsch gewesen, und das ist der wertvollere Teil
+dieses Arms.** Mein Modell war die einfache Proportion
+n = 2 · (48 · r₀/Σr); die hätte für 4,1,1 zweiunddreissig Heads und n = 64
+ergeben. Gemessen wurden dreissig Heads und n = 60. Die 30 statt 32 verrät die
+fehlende Randbedingung: der Checkpoint hat `linear_num_key_heads = 16` bei
+`linear_num_value_heads = 48`, also **drei Value-Heads je Key-Head**, und
+geteilt wird in diesen Dreiergruppen, nicht in einzelnen Heads. Damit gilt
+
+    n = 6 · floor(16 · r₀/Σr)
+
+und dieses Modell trifft **alle drei** Messpunkte exakt:
+
+| Ratio | Gruppen Rang 0 | Heads | n (Modell) | n (gemessen) |
+|---|---:|---:|---:|---:|
+| `auto` | 7 | 21 | 42 | 42 |
+| `2,1,1` | 8 | 24 | 48 | 48 |
+| `4,1,1` | 10 | 30 | 60 | 60 |
+
+Und daraus folgt eine deutlich schärfere Aussage als die, mit der dieser Arm
+gestartet ist. `n % 32 == 0` verlangt `6g % 32 == 0`, also `3g % 16 == 0`, also
+— weil 3 und 16 teilerfremd sind — `g % 16 == 0`. Die einzige Lösung mit
+höchstens 16 Gruppen ist g = 16, und das heisst: alle Gruppen auf einem Rang.
+
+**Auf diesem Checkpoint kann folglich KEIN Tensor-Parallel-Split von
+`in_proj_ba` die Bedingung der nativen FP4-Lane erfüllen — auch der ebene
+nicht.** Es ist also kein Pech des uneven-Plans und keine Sache eines besseren
+Ratios; die native Lane ist mit jedem TP > 1 auf dieser GDN-Geometrie
+unvereinbar. Der ebene TP=3-Kontrollarm, den der Balance-Wächter verhindert
+hat, wäre nach derselben Rechnung ebenfalls gescheitert (16 Heads sind kein
+Vielfaches von 3; der Plan hätte 15 Heads = 30 Zeilen vergeben).
+
+Damit verschiebt sich auch die Konsequenz: ein „klügerer Shard-Plan" löst das
+nicht. Was es braucht, ist der Dequant-Fallback von Posten 1 **auch auf dem
+nativen Rang** — die Lane dafür existiert bereits, es fehlt nur das
+Geometrie-Urteil, das sie dort auslöst.
+
+Eine Ehrlichkeitsnotiz zur Methode: das Dreiergruppen-Modell ist aus drei
+Messpunkten rückgeschlossen und nicht am Aufteilungscode gelesen. Es erklärt
+alle drei exakt und macht eine scharfe, billig prüfbare Vorhersage (jedes
+weitere Ratio muss ein n aus {6, 12, ..., 90} liefern, nie eines dazwischen) —
+aber bestätigt ist es an drei Punkten, nicht am Quelltext.
+
+### 3. Posten 2 (NEXTN): offen, nicht widerlegt
+
+ARM 1 erreicht den Servierzustand nie, also gibt es **keine** Accept-Länge. Was
+sich sagen lässt, ist eine Aussage über die Ladephase und sonst nichts: kein
+#318-Raise, null „unloaded"-Zeilen bis zum Absturz. Die Falsifikator-Signatur
+des Briefings (1,0052 bei 0 akzeptierten Drafts) ist damit **weder bestätigt
+noch ausgeschlossen**. Posten 2 braucht einen Boot, der über den Stopper aus
+Verdikt 2 hinauskommt.
+
+### 4. Posten 3: die Reserve rechnet gegen die falsche Karte
+
+Der Arm lief mit `CUDA_VISIBLE_DEVICES` auf die UUID der 5090 gepinnt, und das
+Modell lag auch dort — NVML-Index 1, 30.423 von 32.607 MiB belegt, die beiden
+3080 bei 0 MiB. Die Dimensionierungszeile sagt trotzdem:
+
+    Reserve-based sizing (#332): device total 20480 MiB, pinned reserve 2048 MiB
+    -> --mem-fraction-static 0.900000
+
+**20480 MiB ist eine 3080.** Die Reserve-Rechnung liest den NVML-Index 0 statt
+der sichtbaren Karte — die bekannte Device-Order-Falle, diesmal im #332-Code
+selbst. Folge: Bruch 0,90, also **exakt** der `--mem-fraction-static`-Wert des
+Ankers, und damit ein Pool von 153.007 Token — Zeichen für Zeichen die
+Ankerzahl. Erwartet waren ~192k (32607 − 2048 = 30559 -> 0,9372).
+
+Die Messseite bestätigt die Nullwirkung unabhängig von der Logzeile:
+
+| Posten | Anker (06:40) | Dieses Fenster | Delta |
+|---|---:|---:|---|
+| Gewichte | 18,81 GiB | 18,81 GiB | 0 (Erwartung gehalten) |
+| KV-Pool | 153.007 Tok | 153.007 Tok | **0** (erwartet: +25 %) |
+| frei nach Boot | 2,44 GB | 2,44 GB | 0 |
+| Prefill | 10.113,1 tok/s | 10.399,9 tok/s | +2,8 % (Rauschen) |
+| Decode bs=1 | 16,48 ms/Schritt | 16,51 ms/Schritt | +0,2 % |
+| Decode bs=8 | 17,57 ms/Schritt | 17,57 ms/Schritt | 0 |
+| Kohärenz | — | 5/5 | grün |
+
+VRAM-Korridor grün: 32.607 − 30.423 = 2.184 MiB frei, weit über den 400 MiB.
+
+Das ist der unangenehme Fehlermodus: der Knopf tut nichts, und weil er
+zufällig auf denselben Bruch fällt wie der Anker, sieht das Ergebnis nicht nach
+Defekt aus, sondern nach sauberer Reproduktion. Nur die Logzeile mit der
+falschen Kartengrösse verrät es.
+
+### 5. Familien-Nachläufer (a): Radix war der Boden — und darunter liegt Rot
+
+Ein Boot, Llama-3.1-8B, TP=2 auf 5090 + 3080, Ratio 3,1, Lane-Teil auf der
+fremden Karte (4382 MiB), zusätzlich `--disable-radix-cache`.
+
+| Prompt | Boden Verband | Boden Lane | Urteil |
+|---|---|---|---|
+| alphabet | **grün** | grün | content_divergence |
+| squares | **grün** | grün | content_divergence |
+| code | **grün** | grün | content_divergence |
+
+Gegen die Vorrunde (alle drei VOID, Verbands-Boden auf allen dreien rot) ist das
+eine doppelte Auskunft:
+
+1. **Der Radix-Verdacht war richtig.** Der Verbands-Boden war rot, weil die
+   zweite identische Anfrage über den Prefix-Cache einen anderen Kernel-Weg
+   nahm. Ohne Radix reproduziert sich der Verband auf allen drei Prompts.
+2. **Und deshalb sieht man jetzt erst, dass der Arm ROT ist.** Mit zwei grünen
+   Böden trägt jeder Prompt ein Urteil, und alle drei sagen Abweichung, jeweils
+   ab `first_divergent_index = 1` — also unmittelbar nach dem ersten Token.
+
+Der Arm ist damit von „nicht messbar" auf „gemessen und rot" gewechselt. Das
+ist ein Fortschritt und kein Rückschritt: VOID war nie ein Bestehen.
+
+Eine Beobachtung, die ausdrücklich NICHT als Verdikt zu lesen ist, aber
+festgehalten gehört, weil sie die Richtung der Abweichung offenlässt: auf allen
+drei Prompts sieht die LANE-Ausgabe wohlgeformter aus als die des Verbands
+(alphabet — Lane `w\nx\ny\nz\na\nb`, Verband `86, 326, 326, 320`; squares —
+Lane eine geordnete Zahlenliste, Verband `717, 62, 62, 565`). Das Tor sagt nur
+„die beiden Seiten sind verschieden", nicht welche recht hat. Wer den Arm
+weiterverfolgt, braucht als nächstes eine einkartige Referenz für DENSELBEN
+Prompt-Satz — sonst wird stillschweigend angenommen, der Verband sei die
+Wahrheit, und genau das ist hier ungeprüft.
+
+### 6. Familien-Nachläufer (b): die Budget-Hypothese ist tot
+
+Ein Boot, Qwen3.6-27B-FP8, TP=2, mit deutlich mehr Luft auf BEIDEN Karten als
+in der Vorrunde: Ratio von 5,1 auf 6,1 (schiebt Gewicht auf die 5090, entlastet
+die 3080, auf der der fremde Lane-Teil bezahlt wird), Verbandsbudget der 3080
+von 10500 auf 9500 MiB, Lane-Pool der 5090 von 1000 auf 600 MiB. Der Lane-Teil
+auf der fremden Karte schrumpft entsprechend von 7036 auf **6002 MiB**.
+
+Der Boot kommt genauso weit wie vorher — Plan, Platzierung, Laden, Assembly,
+Byte-Tor, `lane 0 ready: max_total_num_tokens=8200` — und stirbt an derselben
+Stelle mit derselben Meldung:
+
+    torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+
+**Damit ist Kandidat (b) erledigt.** Es ist nicht zu wenig Luft. Übrig bleibt
+Kandidat (a): die Lane-Allokation auf `cuda:1` aus dem Prozess von Rang 0
+heraus, neben dem Prozess von Rang 1 auf derselben Karte. Wie beauftragt wurde
+hier nicht weiterdebuggt, nur die exakte Meldung gesichert.
+
+### Kartenzeit, Rohdaten, Instrumentenfehler
+
+Das Fenster lief in drei Belegungen (08:20:35-08:24:22, 08:26:24-08:29:51,
+08:30:10-08:3x), jeweils über `gpu-arb` gehalten und freigegeben,
+Kartenreihenfolge zur Laufzeit per NVML/UUID aufgelöst.
+
+Vier Defekte im Werkzeug statt im Prüfling, alle vor oder während des Fensters
+gefunden:
+
+1. **`v4_boot_proof.sh` ARM 1 kann nicht starten.** Es pinnt die Karten per
+   UUID und übergibt `--rank-tp-ratio auto` allein; `auto` leitet seine Budgets
+   aus NVML-Totalen ab und verlangt deshalb `--rank-gpu-id`
+   („--rank-tp-ratio auto requires --rank-gpu-id"). Vor dem Fenster auf der CPU
+   gefunden, im Rezept auf `--rank-gpu-id 0,1,2` korrigiert.
+2. **Nicht exportierte UUIDs im eigenen Treiber.** Die Arme laufen in
+   `bash -c`-Subshells; ein nicht exportiertes `FIVE` wäre als leeres
+   `CUDA_VISIBLE_DEVICES` angekommen und hätte den Solo-Arm still auf allen drei
+   Karten laufen lassen.
+3. **`LOG` aus bereits neu gesetztem `OUT`.** Bash expandiert
+   Zuweisungen im Kommando-Präfix von links nach rechts, spätere sehen die
+   früheren: `OUT=$OUT/dense2 LOG=$OUT/logs/...` legte das Log in ein nicht
+   existierendes Verzeichnis, die Umleitung schlug fehl, der Server starb
+   sofort. Runde 1 hat beide Familien-Arme genau daran verloren (rc=1 nach 9
+   bzw. 8 Sekunden).
+4. **Zählmuster in falscher Reihenfolge.** `DEQUANTISED.*in_proj_ba` trifft
+   nicht, weil die Meldung den Layernamen VOR das Wort DEQUANTISED stellt; die
+   Gesamtzahl 96 ist davon unberührt und per Rang gegengezählt.
+
+Rohdaten unter `/spinning/gpu-battery-results/2026-07-31_332_fam_beleg/`:
+`window.sh`, `arm.sh`, `falsifier_v2.sh` (mit den registrierten Vorhersagen im
+Kopf), `readout.py`, `punkte.jsonl`, `decode_punkte.jsonl`,
+`coherence_*.jsonl`, `logs/*.server.log`, `proofs/*.readout.txt`,
+`dense2_noradix/`, `fp82_lowbudget/`, `base_commit.txt`.
+
+### Offen
+
+1. **Native-Lane-Geometriewächter.** Die Konsequenz aus Verdikt 2: ein Wächter,
+   der für die native FP4-Lane die GESHARDETE Breite gegen 32 prüft, analog zu
+   #332 für Marlin gegen 64, und bei Verfehlung dieselbe Dequant-Lane auslöst.
+   Nach der Rechnung in Verdikt 2 ist das kein Randfall, sondern der Normalfall:
+   auf dieser GDN-Geometrie trifft **kein** TP > 1 die 32. Ohne diesen Wächter
+   ist V4 auf diesem Checkpoint auf TP=1 beschränkt — was den solo-5090-Arm
+   erklärt, der als einziger NVFP4-Arm je gebootet hat.
+2. **Posten 2 (NEXTN) ungemessen** — hängt an 1.
+3. **Posten 3: Kartenauflösung.** `--rank-auto-reserve-mib` muss die Grösse der
+   tatsächlich benutzten Karte lesen, nicht NVML-Index 0. Erst danach ist die
+   ~192k-Erwartung überhaupt prüfbar.
+4. **Zweikartige dense Lane ist rot** und braucht als nächstes eine einkartige
+   Referenz, um die Richtung der Abweichung zu klären.
+5. **FP8-Zweikarten: Kandidat (a)** — Ko-Belegung der fremden Karte durch zwei
+   Prozesse.
