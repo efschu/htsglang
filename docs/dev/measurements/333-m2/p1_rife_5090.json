@@ -1,0 +1,77 @@
+{
+  "finished_at": 1785489029.7841449,
+  "host": {
+    "card_index": 1,
+    "card_name": "NVIDIA GeForce RTX 5090",
+    "nvml_uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+    "total_mib": 32607
+  },
+  "noise_floor_pct": 1.3951468054907221,
+  "samples": [
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp16",
+      "iterations": 10,
+      "ms_per_frame": 5.983283233642578,
+      "ms_stdev": 0.31608464835519245,
+      "note": "peak_device_bytes is the P4 per-frame-pair figure",
+      "options": {
+        "scale": 1.0,
+        "version": "4.6"
+      },
+      "peak_device_bytes": 1242930688,
+      "post": "P1",
+      "resolution": "1920x1080",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp16",
+      "iterations": 10,
+      "ms_per_frame": 5.48403844833374,
+      "ms_stdev": 0.21007897448211502,
+      "note": "peak_device_bytes is the P4 per-frame-pair figure",
+      "options": {
+        "scale": 0.5,
+        "version": "4.6"
+      },
+      "peak_device_bytes": 824126464,
+      "post": "P1",
+      "resolution": "1920x1080",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp16",
+      "iterations": 10,
+      "ms_per_frame": 20.682765007019043,
+      "ms_stdev": 0.1171963408091625,
+      "note": "peak_device_bytes is the P4 per-frame-pair figure",
+      "options": {
+        "scale": 1.0,
+        "version": "4.6"
+      },
+      "peak_device_bytes": 4970958848,
+      "post": "P1",
+      "resolution": "3840x2160",
+      "stage": "rife"
+    },
+    {
+      "card": "NVIDIA GeForce RTX 5090",
+      "dtype": "fp16",
+      "iterations": 10,
+      "ms_per_frame": 11.395280075073241,
+      "ms_stdev": 0.10156524008499321,
+      "note": "peak_device_bytes is the P4 per-frame-pair figure",
+      "options": {
+        "scale": 0.5,
+        "version": "4.6"
+      },
+      "peak_device_bytes": 3292716544,
+      "post": "P1",
+      "resolution": "3840x2160",
+      "stage": "rife"
+    }
+  ],
+  "started_at": 1785489028.4133468
+}
