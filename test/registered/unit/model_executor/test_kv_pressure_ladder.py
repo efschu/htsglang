@@ -1028,6 +1028,41 @@ class TestServerArgsValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stage and discard forever"):
             args._handle_kv_pressure_ladder()
 
+    def test_admission_rung_needs_the_ceiling_at_argument_time(self):
+        """#287 runtime: a rung whose wired actuator cannot exist in this
+        configuration fails at parse time, not at the first episode."""
+        args = self._args(kv_pressure_ladder="relief:admission_cap")
+        with self.assertRaisesRegex(
+            ValueError, "max-running-requests-ceiling"
+        ):
+            args._handle_kv_pressure_ladder()
+
+    def test_admission_rung_with_ceiling_accepted(self):
+        args = self._args(
+            kv_pressure_ladder="relief:dcp_ratio,relief:admission_cap",
+            max_running_requests_ceiling=64,
+        )
+        args._handle_kv_pressure_ladder()  # must not raise
+
+    def test_session_offload_rung_needs_the_manager_flag(self):
+        args = self._args(kv_pressure_ladder="relief:session_offload")
+        with self.assertRaisesRegex(ValueError, "enable-kv-session-offload"):
+            args._handle_kv_pressure_ladder()
+        ok = self._args(
+            kv_pressure_ladder="relief:session_offload",
+            enable_kv_session_offload=True,
+        )
+        ok._handle_kv_pressure_ladder()  # must not raise
+
+    def test_consensus_interval_validated(self):
+        args = self._args(
+            kv_pressure_ladder="geometry:tp2",
+            kv_pressure_consensus_interval=0,
+        )
+        with self.assertRaisesRegex(ValueError, "consensus-interval"):
+            args._handle_kv_pressure_ladder()
+        self.assertEqual(self._args().kv_pressure_consensus_interval, 8)
+
     def test_mark_order_rejected(self):
         args = self._args(
             kv_pressure_ladder="geometry:tp2",

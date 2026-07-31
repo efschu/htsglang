@@ -369,6 +369,9 @@ class Scheduler(
         # kv-session-offload defaults BEFORE any watchdog thread can touch
         # is_fully_idle(); the manager itself is created late in __init__.
         self.kv_session_offload = None
+        # #287 KV pressure ladder runtime: None on every default path; built
+        # lazily on the first scheduler iteration when the flag is set.
+        self.kv_pressure_runtime = None
         # colocated-congruent PD lane (#107): None on every default path.
         self.congruent_prefill_lane = None
         # Multi-group runtime (#274): in-process lanes over shared bytes.
@@ -3135,6 +3138,38 @@ class Scheduler(
             # split the ranks across branches with mismatched collective counts.
             # See update_dcp_admission_state for the full rationale.
             self.kv_session_offload.update_dcp_admission_state()
+
+        # #287 KV pressure ladder: one occupancy sample per iteration, ladder
+        # transitions only at the rank-uniform consensus boundary inside
+        # on_round. Constructed lazily on the first iteration (every
+        # dependency -- limiter, offload manager, tp_cpu_group -- exists by
+        # then, still before any request is admitted). Flag unset = the
+        # attribute stays None and this block is two predictable branches:
+        # no sample, no collective, byte-identical to today.
+        if self.server_args.kv_pressure_ladder is not None:
+            if self.kv_pressure_runtime is None:
+                from sglang.srt.managers.kv_pressure_runtime import (
+                    build_kv_pressure_runtime,
+                )
+
+                self.kv_pressure_runtime = build_kv_pressure_runtime(self)
+            if self.kv_pressure_runtime is not None:
+                # Every input is REPLICATED (held tokens of live requests,
+                # the group-agreed capacity, batch size, the derived phase)
+                # -- the same uniformity argument as the admission limiter's
+                # sample below at update_running_batch.
+                decode_active = (
+                    not running_batch.is_empty()
+                    and not running_batch.is_prefill_only
+                )
+                self.kv_pressure_runtime.on_round(
+                    held_tokens=sum(
+                        req.seqlen for req in running_batch.reqs
+                    ),
+                    capacity_tokens=self.max_total_num_tokens,
+                    running_bs=running_batch.batch_size(),
+                    phase="decode" if decode_active else "prefill",
+                )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)

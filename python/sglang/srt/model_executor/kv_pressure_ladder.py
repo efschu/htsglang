@@ -160,13 +160,26 @@ RELIEF_FEATURES: Dict[str, str] = {
 
 #: Canonical cheapness order of the relief features (cheapest first). A table
 #: generator uses it so the same rig always produces the same ladder.
+#:
+#: The order is a SERVICE-cost order, not an implementation-effort order
+#: (user directive, #287: KV-vector flip < admission lowering < session
+#: spill):
+#:
+#: * ``dcp_ratio`` is first because #320 card-proved that a sum-preserving
+#:   KV-vector redistribution is service-NEUTRAL: 69,784 -> 431,457 tokens
+#:   (6.18x) with prefill at/under the noise floor and a decode surcharge of
+#:   +0.9pp, below the 2.72% floor. Re-aiming where NEW tokens land costs no
+#:   served session anything.
+#: * ``admission_cap`` is second: a counter update that copies nothing, but
+#:   it DOES cost service -- every lowered slot is a session the server now
+#:   turns away.
+#: * The data movers come last: page spill (#134/#236), the weightless rank
+#:   role (#115) and finally whole-session offload, which freezes a live
+#:   session's tokens out of VRAM -- the most service-expensive relief and
+#:   the last one before a geometry flip.
 RELIEF_ORDER: Tuple[str, ...] = (
-    # Cheapest rung of the whole ladder and the only one that is an actuator
-    # rather than a data movement: lowering the admission limit is a counter
-    # update, it copies nothing and it discards nothing. It is therefore the
-    # first thing tried under pressure and the last thing given back.
-    "admission_cap",
     "dcp_ratio",
+    "admission_cap",
     "kv_spill",
     "weightless_rank",
     "session_offload",
@@ -284,13 +297,13 @@ class KvHandover:
     #: Whether ``prepare`` may run ahead of the boundary (9b pre-staging).
     supports_pre_stage: bool = False
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         raise NotImplementedError
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         raise NotImplementedError
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         raise NotImplementedError
 
 
@@ -307,13 +320,13 @@ class NoHandover(KvHandover):
     strategy = HANDOVER_NONE
     supports_pre_stage = False
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         return None
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         return None
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         return None
 
 
@@ -339,19 +352,19 @@ class NewTokensOnlyHandover(KvHandover):
     strategy = HANDOVER_NEW_TOKENS_ONLY
     supports_pre_stage = False
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "new_tokens_only handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "new_tokens_only handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "new_tokens_only handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
@@ -381,19 +394,19 @@ class BackgroundMigrateHandover(KvHandover):
     strategy = HANDOVER_BACKGROUND_MIGRATE
     supports_pre_stage = False
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "background_migrate handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "background_migrate handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "background_migrate handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
@@ -420,19 +433,19 @@ class SpillReloadHandover(KvHandover):
     strategy = HANDOVER_SPILL_RELOAD
     supports_pre_stage = False
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "spill_reload handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "spill_reload handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "spill_reload handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
@@ -471,19 +484,19 @@ class AnticipatoryShadowHandover(KvHandover):
     strategy = HANDOVER_ANTICIPATORY_SHADOW
     supports_pre_stage = True
 
-    def prepare(self, plan: "LadderPlan") -> None:
+    def prepare(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "anticipatory_shadow handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def execute(self, plan: "LadderPlan") -> None:
+    def execute(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "anticipatory_shadow handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
         )
 
-    def abort(self, plan: "LadderPlan") -> None:
+    def abort(self, plan: LadderPlan) -> None:
         raise NotImplementedError(
             "anticipatory_shadow handover is a named design option, not an "
             "implementation: it is decided by measurement (see docstring)."
@@ -517,6 +530,156 @@ def handover_supports_pre_stage(strategy: str) -> bool:
             f"{', '.join(HANDOVER_STRATEGIES)}."
         )
     return bool(_HANDOVERS[strategy].supports_pre_stage)
+
+
+# --------------------------------------------------------------------------
+# 1b. Depth- and format-aware operating points (user directive, #287)
+# --------------------------------------------------------------------------
+
+#: Execution phases an operating point is keyed on. Distinct namespace from
+#: the PLAN phases above (``PHASE_FLIP`` etc.): these are the model's
+#: prefill/decode phases, not ladder transitions.
+OP_PHASE_PREFILL = "prefill"
+OP_PHASE_DECODE = "decode"
+OP_PHASES = (OP_PHASE_PREFILL, OP_PHASE_DECODE)
+
+
+@dataclass(frozen=True)
+class OperatingPoint:
+    """One (phase x depth/fill) optimum of a rung.
+
+    The staircase is DEPTH- and FORMAT-aware (user directive): per execution
+    phase AND per context depth / fill level each rung carries its own
+    optimum for the layer split and the KV token vector -- "also in
+    between", not only at the poles. Data basis: the #296 extrema and the
+    #320 depth measurement (sum-preserving KV-vector redistribution,
+    2,11,10 = 6.18x at the prefill pole); the format factors enter through
+    the per-(rank, family) scores of #324, read from the planner profile
+    and never from a hardcoded arch table.
+
+    ``depth_fraction`` is the normalized context depth / pool fill in
+    [0, 1] this point was solved at. ``layer_split`` is the rung's weight
+    geometry (Stage 1 never reshards, so within one rung it is constant and
+    recorded for honesty); ``kv_vector`` is the KV token-ownership optimum
+    at this operating condition.
+    """
+
+    phase: str
+    depth_fraction: float
+    layer_split: Tuple[int, ...]
+    kv_vector: Tuple[int, ...]
+    provenance: str = PROVENANCE_PLACEHOLDER
+    source: str = ""
+
+    def __post_init__(self):
+        if self.phase not in OP_PHASES:
+            raise ValueError(
+                f"unknown operating phase {self.phase!r}; known: "
+                f"{', '.join(OP_PHASES)}."
+            )
+        if not 0.0 <= self.depth_fraction <= 1.0:
+            raise ValueError(
+                f"depth_fraction must be within [0, 1], got {self.depth_fraction}"
+            )
+        if not self.kv_vector or any(int(v) <= 0 for v in self.kv_vector):
+            raise ValueError(
+                f"kv_vector must be non-empty positive integers, got "
+                f"{self.kv_vector}"
+            )
+        if not self.layer_split or any(int(v) <= 0 for v in self.layer_split):
+            raise ValueError(
+                f"layer_split must be non-empty positive integers, got "
+                f"{self.layer_split}"
+            )
+        if len(self.layer_split) != len(self.kv_vector):
+            raise ValueError(
+                f"layer_split has {len(self.layer_split)} ranks but kv_vector "
+                f"{len(self.kv_vector)}; one entry per rank."
+            )
+        if self.provenance not in PROVENANCES:
+            raise ValueError(
+                f"unknown provenance {self.provenance!r}; known: "
+                f"{', '.join(PROVENANCES)}."
+            )
+
+
+class StageOperatingGrid:
+    """The (phase x depth) grid of one rung, with a DETERMINISTIC lookup.
+
+    Selection is pure floor-bin selection over the sorted depth bins of a
+    phase: the point with the largest ``depth_fraction <= requested`` wins,
+    below the lowest bin the lowest bin wins. No interpolation of the
+    integer vectors -- an interpolated vector would be a number nobody
+    solved for; "in between" is expressed by SOLVING intermediate bins into
+    the grid, not by inventing vectors at lookup time.
+    """
+
+    def __init__(self, points: Sequence[OperatingPoint]):
+        points = tuple(points)
+        if not points:
+            raise ValueError(
+                "an operating grid needs at least one point; 'no grid' is "
+                "expressed by operating_grid=None on the step."
+            )
+        by_phase: Dict[str, List[OperatingPoint]] = {}
+        for point in points:
+            by_phase.setdefault(point.phase, []).append(point)
+        for phase, phase_points in by_phase.items():
+            fractions = [p.depth_fraction for p in phase_points]
+            if len(set(fractions)) != len(fractions):
+                raise ValueError(
+                    f"operating grid declares duplicate depth bins for phase "
+                    f"{phase!r}: {sorted(fractions)}"
+                )
+            phase_points.sort(key=lambda p: p.depth_fraction)
+        self._by_phase = {k: tuple(v) for k, v in by_phase.items()}
+        self._points = points
+
+    @property
+    def points(self) -> Tuple[OperatingPoint, ...]:
+        return self._points
+
+    @property
+    def phases(self) -> Tuple[str, ...]:
+        return tuple(sorted(self._by_phase))
+
+    def select(self, phase: str, depth_fraction: float) -> OperatingPoint:
+        """The operating point for ``(phase, depth_fraction)``.
+
+        Deterministic by construction: same inputs, same point, on every
+        rank -- the selection is part of the rank-uniform contract, so it
+        may consume only replicated inputs (the caller's obligation) and
+        must itself be a pure function (this method's obligation).
+        """
+        if phase not in self._by_phase:
+            raise KeyError(
+                f"operating grid has no phase {phase!r}; known: "
+                f"{', '.join(sorted(self._by_phase))}."
+            )
+        if not 0.0 <= depth_fraction <= 1.0:
+            raise ValueError(
+                f"depth_fraction must be within [0, 1], got {depth_fraction}"
+            )
+        chosen = self._by_phase[phase][0]
+        for point in self._by_phase[phase]:
+            if point.depth_fraction <= depth_fraction:
+                chosen = point
+            else:
+                break
+        return chosen
+
+    def describe(self) -> List[Dict[str, object]]:
+        return [
+            {
+                "phase": p.phase,
+                "depth_fraction": p.depth_fraction,
+                "layer_split": list(p.layer_split),
+                "kv_vector": list(p.kv_vector),
+                "provenance": p.provenance,
+                "source": p.source,
+            }
+            for p in self._points
+        ]
 
 
 # --------------------------------------------------------------------------
@@ -566,6 +729,11 @@ class LadderStep:
     source: str = ""
     graph_rung_items: Tuple[str, ...] = ()
     shadow_items: Tuple[str, ...] = ()
+    #: Depth/format-aware (phase x depth) optima of this rung (user
+    #: directive; solved by the planner from the #324 per-(rank, family)
+    #: scores). ``None`` = no grid solved -- the rung still works, it just
+    #: cannot name a depth-specific KV vector.
+    operating_grid: Optional[StageOperatingGrid] = None
 
     def __post_init__(self):
         if not self.name or not self.name.strip():
@@ -667,6 +835,11 @@ class LadderStep:
             "min_hysteresis_rounds": self.min_hysteresis_rounds,
             "provenance": self.provenance,
             "source": self.source,
+            "operating_grid": (
+                self.operating_grid.describe()
+                if self.operating_grid is not None
+                else None
+            ),
         }
 
 
@@ -1186,6 +1359,22 @@ class KvPressureLadder:
     def staged_target(self) -> Optional[int]:
         """The rung a shadow copy is currently staged for (9b), or None."""
         return self._staged_target
+
+    def operating_point(
+        self, phase: str, depth_fraction: float
+    ) -> Optional[OperatingPoint]:
+        """The CURRENT rung's depth/format-aware optimum at ``(phase,
+        depth_fraction)``, or ``None`` when the rung carries no grid.
+
+        Deterministic stage-detail selection (user directive): the answer is
+        a pure function of (current rung, phase, depth) -- the caller feeds
+        replicated inputs, so every rank names the same vector.
+        """
+        with self._lock:
+            grid = self._table[self._current].operating_grid
+        if grid is None:
+            return None
+        return grid.select(phase, depth_fraction)
 
     @property
     def pre_stage_enabled(self) -> bool:
