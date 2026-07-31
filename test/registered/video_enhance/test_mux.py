@@ -16,6 +16,8 @@ from fractions import Fraction
 
 from sglang.srt.video_enhance.mux import (
     FRAGMENTED_MP4_FLAGS,
+    MOV_TEXT_EMPTY_SAMPLE,
+    AlignmentReport,
     MuxError,
     TrackSelection,
     build_remux_command,
@@ -24,6 +26,7 @@ from sglang.srt.video_enhance.mux import (
     expected_frame_count,
     parse_ffprobe,
     retimed_rate,
+    strip_empty_mov_text,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -242,6 +245,21 @@ class TestRemuxCommand(CustomTestCase):
         for flag in FRAGMENTED_MP4_FLAGS:
             self.assertIn(flag, self.cmd)
 
+    def test_fragmented_mp4_delays_the_moov_so_edit_lists_survive(self):
+        """The regression guard for the 21.333 ms A/V lag.
+
+        With ``+empty_moov`` alone the moov is written before any packet is
+        seen and no ``elst`` can be emitted, so an AAC source's priming
+        compensation is dropped and every copied track lands one AAC frame
+        late against the enhanced video. ``+delay_moov`` is what makes the
+        edit list writable, and dropping it reintroduces a defect that is
+        inaudible on a short clip and obvious on a long one.
+        """
+        movflags = self.cmd[self.cmd.index("-movflags") + 1]
+        self.assertIn("delay_moov", movflags)
+        self.assertIn("empty_moov", movflags)
+        self.assertIn("frag_keyframe", movflags)
+
     def test_matroska_does_not_get_mp4_flags(self):
         cmd = build_remux_command(
             source_url="/tmp/in.mkv",
@@ -295,6 +313,99 @@ class TestRemuxCommand(CustomTestCase):
                 enhanced_codec="h264",
                 output_rate=Fraction(25),
             )
+
+
+class MovTextGapSamplesTest(CustomTestCase):
+    """mov_text encodes screen time with no cue as an explicit empty sample.
+
+    A remux whose output runs longer than the source is therefore *obliged* to
+    append one, and a raw byte comparison of the demuxed subtitle track will
+    always report a mismatch. Separating the two is what makes the passthrough
+    gate meaningful for subtitles instead of permanently red.
+    """
+
+    def setUp(self):
+        self.one = b"\x00\x0amarker one"
+        self.two = b"\x00\x0amarker two"
+
+    def test_empty_sample_is_two_zero_bytes(self):
+        self.assertEqual(MOV_TEXT_EMPTY_SAMPLE, b"\x00\x00")
+
+    def test_content_survives_a_trailing_gap_sample(self):
+        source = self.one + self.two
+        output = self.one + self.two + MOV_TEXT_EMPTY_SAMPLE
+        self.assertNotEqual(source, output)
+        self.assertEqual(strip_empty_mov_text(output), source)
+
+    def test_content_survives_leading_and_interior_gap_samples(self):
+        output = (
+            MOV_TEXT_EMPTY_SAMPLE
+            + self.one
+            + MOV_TEXT_EMPTY_SAMPLE
+            + self.two
+            + MOV_TEXT_EMPTY_SAMPLE
+        )
+        self.assertEqual(strip_empty_mov_text(output), self.one + self.two)
+
+    def test_a_changed_cue_still_fails_the_comparison(self):
+        """The filter must not be able to hide a real content change."""
+        altered = b"\x00\x0amarker ONE" + self.two + MOV_TEXT_EMPTY_SAMPLE
+        self.assertNotEqual(
+            strip_empty_mov_text(altered), strip_empty_mov_text(self.one + self.two)
+        )
+
+    def test_a_payload_that_is_not_mov_text_is_returned_untouched(self):
+        """Applying the filter to another subtitle codec must be a no-op."""
+        srt = b"1\n00:00:00,000 --> 00:00:01,000\nmarker one\n"
+        self.assertEqual(strip_empty_mov_text(srt), srt)
+
+    def test_a_truncated_sample_is_returned_untouched(self):
+        truncated = self.one + b"\x00\xff\x41"
+        self.assertEqual(strip_empty_mov_text(truncated), truncated)
+
+
+class AlignmentReportTest(CustomTestCase):
+    """Inter-track start offsets are the A/V-sync observable, not durations.
+
+    A container that shifts every copied track by the same amount against the
+    enhanced video produces identical durations and a broken result, which is
+    exactly how the ``+delay_moov`` defect stayed hidden.
+    """
+
+    def test_no_drift_when_offsets_are_preserved(self):
+        report = AlignmentReport(
+            reference_track=0,
+            source_relative={0: 0.0, 1: -0.021333, 3: 0.0},
+            output_relative={0: 0.0, 1: -0.021333, 3: 0.0},
+        )
+        self.assertEqual(report.max_drift_s, 0.0)
+
+    def test_a_uniform_lag_of_every_copied_track_is_caught(self):
+        report = AlignmentReport(
+            reference_track=0,
+            source_relative={0: 0.0, 1: -0.021333, 3: 0.0},
+            output_relative={0: 0.0, 1: 0.0, 3: 0.021334},
+        )
+        self.assertAlmostEqual(report.max_drift_s, 0.021334, places=6)
+        self.assertAlmostEqual(report.drift[1], 0.021333, places=6)
+        self.assertAlmostEqual(report.drift[3], 0.021334, places=6)
+
+    def test_a_track_missing_from_the_output_is_not_counted_as_drift(self):
+        report = AlignmentReport(
+            reference_track=0,
+            source_relative={0: 0.0, 1: -0.021333, 3: 0.0},
+            output_relative={0: 0.0, 1: -0.021333},
+        )
+        self.assertNotIn(3, report.drift)
+        self.assertEqual(report.max_drift_s, 0.0)
+
+    def test_report_is_serialisable_for_the_progress_endpoint(self):
+        report = AlignmentReport(
+            reference_track=0, source_relative={0: 0.0}, output_relative={0: 0.0}
+        )
+        payload = report.as_dict()
+        self.assertEqual(payload["reference_track"], 0)
+        self.assertIn("max_drift_s", payload)
 
 
 if __name__ == "__main__":

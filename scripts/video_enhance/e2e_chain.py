@@ -36,10 +36,12 @@ from sglang.srt.video_enhance.frame_math import Resolution
 from sglang.srt.video_enhance.mux import (
     StreamRemuxer,
     TrackSelection,
+    alignment_report,
     build_remux_command,
     expected_frame_count,
     probe,
     retimed_rate,
+    strip_empty_mov_text,
 )
 from sglang.srt.video_enhance.pipeline import PipelineExecutor
 from sglang.srt.video_enhance.ring import OverloadPolicy
@@ -121,8 +123,8 @@ async def _as_async(decode):
         await asyncio.sleep(0)
 
 
-def stream_hash(path: Path, selector: str) -> str:
-    """SHA-256 of one demuxed stream's packets: the bit-identity check."""
+def stream_bytes(path: Path, selector: str) -> bytes:
+    """The demuxed packet payload of one stream, concatenated."""
     out = subprocess.run(
         [
             "ffmpeg",
@@ -142,7 +144,27 @@ def stream_hash(path: Path, selector: str) -> str:
         check=True,
         capture_output=True,
     )
-    return hashlib.sha256(out.stdout).hexdigest()
+    return out.stdout
+
+
+def stream_hash(path: Path, selector: str) -> str:
+    """SHA-256 of one demuxed stream's packets: the bit-identity check."""
+    return hashlib.sha256(stream_bytes(path, selector)).hexdigest()
+
+
+def subtitle_content_hash(path: Path, selector: str) -> str:
+    """SHA-256 of a subtitle track with mov_text gap samples removed.
+
+    The raw-byte comparison used for audio is the wrong instrument for
+    mov_text: the codec has no gap representation, so the muxer is obliged to
+    emit an empty sample wherever no cue is on screen, and an output that runs
+    longer than the source necessarily gains one at the tail. Filtering the
+    empty samples is what separates "the text survived" from "the container
+    added padding it had to add".
+    """
+    return hashlib.sha256(
+        strip_empty_mov_text(stream_bytes(path, selector))
+    ).hexdigest()
 
 
 async def run_chain(source: Path, out_path: Path, args) -> dict:
@@ -220,7 +242,16 @@ async def run_chain(source: Path, out_path: Path, args) -> dict:
     )
     await remuxer.start()
 
+    # Tee the encoded elementary stream before it reaches the muxer. Two runs
+    # that differ only after this point implicate the muxer; two runs that
+    # already differ here implicate the encoder or a stage above it. Without
+    # the tee "the output is not byte-stable" names no layer.
+    es_digest = hashlib.sha256()
+    es_bytes = {"n": 0}
+
     async def sink(payload: bytes) -> None:
+        es_digest.update(payload)
+        es_bytes["n"] += len(payload)
         await remuxer.feed(payload)
 
     executor = PipelineExecutor(
@@ -257,6 +288,8 @@ async def run_chain(source: Path, out_path: Path, args) -> dict:
     return {
         "elapsed_s": round(elapsed, 3),
         "bytes_out": written["bytes"],
+        "elementary_sha256": es_digest.hexdigest(),
+        "elementary_bytes": es_bytes["n"],
         "stats": stats.snapshot(),
         "source_rate": str(source_rate),
         "output_rate": str(out_rate),
@@ -330,14 +363,20 @@ def validate(source: Path, out: Path, args, result: dict) -> dict:
         },
     }
 
-    # Bit-identity of every passthrough track.
+    # Bit-identity of every passthrough track. Audio must be byte-for-byte
+    # equal; a subtitle track is compared on content, because mov_text's gap
+    # samples are muxer output rather than source content -- see
+    # ``subtitle_content_hash``.
     passthrough = {}
     for kind, count in (("a", 2), ("s", 1)):
         for i in range(count):
             selector = f"0:{kind}:{i}"
+            digest = subtitle_content_hash if kind == "s" else stream_hash
             try:
-                before = stream_hash(source, selector)
-                after = stream_hash(out, selector)
+                before = digest(source, selector)
+                after = digest(out, selector)
+                raw_before = stream_hash(source, selector)
+                raw_after = stream_hash(out, selector)
             except subprocess.CalledProcessError as exc:
                 passthrough[selector] = {
                     "pass": False,
@@ -347,9 +386,33 @@ def validate(source: Path, out: Path, args, result: dict) -> dict:
             passthrough[selector] = {
                 "sha256_source": before[:16],
                 "sha256_output": after[:16],
+                "compared": "content" if kind == "s" else "raw_bytes",
+                "raw_bytes_identical": raw_before == raw_after,
                 "pass": before == after,
             }
     checks["passthrough_bit_identical"] = passthrough
+
+    # Inter-track start offsets. The duration delta alone cannot see a
+    # constant lag of every copied track against the enhanced video, which is
+    # exactly what a fragmented container that drops edit lists produces.
+    try:
+        report = alignment_report(str(source), str(out))
+        # 1 ms, not one frame. Container timescales quantise a start offset by
+        # tens of microseconds, so exact zero is not reachable; a frame-sized
+        # tolerance would have accepted the 21.333 ms edit-list loss this check
+        # exists to catch.
+        tolerance_s = 0.001
+        checks["av_alignment"] = {
+            **report.as_dict(),
+            "tolerance_s": tolerance_s,
+            "pass": report.max_drift_s <= tolerance_s,
+        }
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        checks["av_alignment"] = {
+            "pass": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
     checks["av_sync"] = {
         "source_duration_s": src.duration_s,
         "output_duration_s": dst.duration_s,
@@ -393,16 +456,33 @@ def main(argv: list[str] | None = None) -> int:
     print(f"source: {source} ({source.stat().st_size} bytes)", flush=True)
 
     digests = []
+    elementary = []
     result = {}
     for run in range(args.repeat):
         out = workdir / f"out{run}.mp4"
         result = asyncio.run(run_chain(source, out, args))
         digests.append(hashlib.sha256(out.read_bytes()).hexdigest())
+        elementary.append(result["elementary_sha256"])
         print(f"run {run}: {json.dumps(result)}", flush=True)
 
     checks = validate(source, workdir / "out0.mp4", args, result)
+    # Two layers, reported separately. The muxer is byte-stable given an
+    # identical elementary stream (proved on CPU in test_mux.py), so a
+    # container digest that moves while the elementary digest holds is a muxer
+    # bug, and one where both move is upstream of the muxer.
+    checks["byte_stable_elementary"] = {
+        "digests": [d[:16] for d in elementary],
+        "pass": len(set(elementary)) == 1,
+    }
     checks["byte_stable_across_runs"] = {
         "digests": [d[:16] for d in digests],
+        "layer": (
+            "muxer"
+            if len(set(elementary)) == 1 and len(set(digests)) > 1
+            else "chain"
+            if len(set(digests)) > 1
+            else "stable"
+        ),
         "pass": len(set(digests)) == 1,
     }
     report = {"args": vars(args), "result": result, "checks": checks}

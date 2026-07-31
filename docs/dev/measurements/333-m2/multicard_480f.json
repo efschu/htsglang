@@ -1,0 +1,178 @@
+{
+  "arms": {
+    "baseline": {
+      "chunks": [
+        {
+          "card": "1",
+          "frames": 959,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.22,
+            "color_to_yuv": 0.46,
+            "decode": 0.01,
+            "encode": 1.56,
+            "resize": 6.48,
+            "rife": 3.06,
+            "sr": 35.58
+          },
+          "wall": 35.521
+        }
+      ],
+      "wall_seconds": 35.802
+    },
+    "multicard": {
+      "chunks": [
+        {
+          "card": "1",
+          "frames": 486,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.43,
+            "color_to_yuv": 0.51,
+            "decode": 0.02,
+            "encode": 1.83,
+            "resize": 6.94,
+            "rife": 3.41,
+            "sr": 36.05
+          },
+          "wall": 23.65
+        },
+        {
+          "card": "0",
+          "frames": 236,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.49,
+            "color_to_yuv": 1.0,
+            "decode": 0.02,
+            "encode": 2.57,
+            "resize": 14.04,
+            "rife": 8.29,
+            "sr": 91.08
+          },
+          "wall": 24.78
+        },
+        {
+          "card": "2",
+          "frames": 237,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.47,
+            "color_to_yuv": 0.96,
+            "decode": 0.02,
+            "encode": 2.38,
+            "resize": 14.11,
+            "rife": 8.26,
+            "sr": 90.74
+          },
+          "wall": 24.721
+        }
+      ],
+      "wall_seconds": 24.935
+    },
+    "same_card_control": {
+      "chunks": [
+        {
+          "card": "1",
+          "frames": 486,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.44,
+            "color_to_yuv": 0.51,
+            "decode": 0.02,
+            "encode": 1.83,
+            "resize": 6.85,
+            "rife": 3.37,
+            "sr": 36.28
+          },
+          "wall": 23.392
+        },
+        {
+          "card": "1",
+          "frames": 236,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.57,
+            "color_to_yuv": 0.51,
+            "decode": 0.01,
+            "encode": 2.09,
+            "resize": 6.89,
+            "rife": 3.48,
+            "sr": 36.99
+          },
+          "wall": 16.504
+        },
+        {
+          "card": "1",
+          "frames": 237,
+          "stage_ms_per_frame": {
+            "color_to_rgb": 0.55,
+            "color_to_yuv": 0.5,
+            "decode": 0.01,
+            "encode": 1.87,
+            "resize": 6.79,
+            "rife": 3.49,
+            "sr": 36.84
+          },
+          "wall": 14.024
+        }
+      ],
+      "wall_seconds": 54.224
+    }
+  },
+  "cards": {
+    "0": "NVIDIA GeForce RTX 3080",
+    "1": "NVIDIA GeForce RTX 5090",
+    "2": "NVIDIA GeForce RTX 3080"
+  },
+  "chain": [
+    "decode        960x540/nv12 -> 960x540/nv12",
+    "color_to_rgb  960x540/nv12 -> 960x540/rgb_fp16",
+    "sr            960x540/rgb_fp16 -> 3840x2160/rgb_fp16",
+    "resize        3840x2160/rgb_fp16 -> 1920x1080/rgb_fp16",
+    "rife          1920x1080/rgb_fp16 -> 1920x1080/rgb_fp16",
+    "color_to_yuv  1920x1080/rgb_fp16 -> 1920x1080/nv12",
+    "encode        1920x1080/nv12 -> 1920x1080/nv12"
+  ],
+  "checks": {
+    "baseline_frame_count": {
+      "actual": 959,
+      "expected": 959,
+      "pass": true
+    },
+    "multicard_frame_count": {
+      "actual": 959,
+      "expected": 959,
+      "pass": true
+    },
+    "multicard_frames_bit_identical_to_baseline": {
+      "identical": 486,
+      "note": "cross-architecture convolution results are not bit-identical; this is a measurement, not a gate",
+      "of": 959
+    },
+    "multicard_matches_same_card_control": {
+      "compared": "same chunking, 3 cards vs 1 card",
+      "pass": false,
+      "psnr_db": 37.421674,
+      "threshold_db": 40.0
+    },
+    "multicard_vs_single_card_baseline": {
+      "note": "cards and GOP structure both differ; use multicard_matches_same_card_control for the cards alone",
+      "psnr_db": 36.456249
+    },
+    "seam_is_exact": {
+      "compared": "pre-encode frame digests, chunked vs whole, same card",
+      "first_differing_frame": null,
+      "frames": 959,
+      "pass": true
+    }
+  },
+  "plan": "capacity_weighted: 480 frames over 3 card(s), predicted makespan 14995.2 ms\n  1            [0:243]              243 frames (+1 overlap)\n  0            [243:361]            118 frames (+2 overlap)\n  2            [361:480]            119 frames (+1 overlap)\n  contiguous chunks weighted by measured chain rate; contiguous because RIFE reads adjacent pairs and an interleave would split every pair across cards",
+  "source": {
+    "frames": 480,
+    "path": "/tmp/mc480b/source.mp4",
+    "rate": "24",
+    "resolution": "960x540"
+  },
+  "speedup": {
+    "baseline_wall_s": 35.802,
+    "cards": 3,
+    "multicard_wall_s": 24.935,
+    "predicted_speedup_x": null,
+    "speedup_x": 1.436
+  }
+}

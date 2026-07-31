@@ -50,6 +50,11 @@ class EnhanceStats:
     frames_decoded: int = 0
     frames_enhanced: int = 0
     frames_encoded: int = 0
+    #: Frames that reached the encode task and were withheld by an
+    #: ``encode_filter``. Only a multi-card shard sets one; the count is
+    #: reported so a seam frame withheld here can be matched against the frame
+    #: the neighbouring chunk emitted in its place.
+    frames_skipped: int = 0
     bytes_out: int = 0
     dropped: int = 0
     started_at: float = field(default_factory=time.time)
@@ -66,6 +71,7 @@ class EnhanceStats:
             "frames_decoded": self.frames_decoded,
             "frames_enhanced": self.frames_enhanced,
             "frames_encoded": self.frames_encoded,
+            "frames_skipped": self.frames_skipped,
             "bytes_out": self.bytes_out,
             "dropped": self.dropped,
             "elapsed_s": round(elapsed, 3),
@@ -133,6 +139,7 @@ class PipelineExecutor:
         ring_depth: int,
         policy: OverloadPolicy = OverloadPolicy.STALL,
         use_cuda_events: bool = True,
+        encode_filter: Callable[[Frame], bool] | None = None,
     ) -> None:
         self.job_id = job_id
         self.chain = chain
@@ -140,6 +147,12 @@ class PipelineExecutor:
         self.source = source
         self.sink = sink
         self.policy = policy
+        # Multi-card shards only (``multicard.py``). A chunk pulls one frame
+        # past its own range so RIFE has the second input for the seam pair,
+        # and that trailing frame is encoded by the *next* chunk -- encoding it
+        # here too would duplicate one frame per seam. None, the default, is
+        # the single-card path and encodes every frame it is handed.
+        self.encode_filter = encode_filter
         self.stats = EnhanceStats(job_id=job_id)
         self._cancelled = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -222,6 +235,12 @@ class PipelineExecutor:
             async for frame in self.source:
                 if self.cancelled:
                     break
+                if frame.end_of_stream:
+                    # The sentinel is control, not content. Counting it made
+                    # frames_decoded one larger than the number of frames the
+                    # source actually produced, which is the number every
+                    # shard's arithmetic is checked against.
+                    break
                 timer.start()
                 frame.require_device(StageKind.DECODE.value)
                 timer.stop()
@@ -299,6 +318,9 @@ class PipelineExecutor:
                     break
                 if self.cancelled:
                     break
+                if self.encode_filter is not None and not self.encode_filter(frame):
+                    self.stats.frames_skipped += 1
+                    continue
                 timer.start()
                 chunks = stage.process([frame])
                 timer.stop()

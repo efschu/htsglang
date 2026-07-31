@@ -35,6 +35,11 @@ from typing import AsyncIterator
 from sglang.srt.video_enhance.chain import ChainError, ChainRequest
 from sglang.srt.video_enhance.engine_cache import EngineCache
 from sglang.srt.video_enhance.frame_math import Resolution
+from sglang.srt.video_enhance.liveness import (
+    ConsumerWatchdog,
+    EndpointClass,
+    LivenessConfig,
+)
 from sglang.srt.video_enhance.mux import (
     MediaInfo,
     MuxError,
@@ -150,6 +155,7 @@ class Job:
     task: asyncio.Task | None = None
     created_at: float = 0.0
     source_rate: Fraction | None = None
+    watchdog: ConsumerWatchdog | None = None
 
 
 class VideoEnhanceService:
@@ -160,11 +166,18 @@ class VideoEnhanceService:
     and asserts on ring occupancy, with no socket involved.
     """
 
-    def __init__(self, config: TenantConfig, *, device_id: int = 0) -> None:
+    def __init__(
+        self,
+        config: TenantConfig,
+        *,
+        device_id: int = 0,
+        liveness: LivenessConfig | None = None,
+    ) -> None:
         self.config = config
         self.device_id = device_id
         self.jobs: dict[str, Job] = {}
         self.cache = EngineCache(config.engine_cache_dir)
+        self.liveness = liveness or LivenessConfig()
 
     # -- planning ---------------------------------------------------------
     def plan(self, body: EnhanceRequestBody) -> PlannedJob:
@@ -265,6 +278,46 @@ class VideoEnhanceService:
 
         job.task = asyncio.create_task(drive())
         job.source_rate = source_rate
+
+        async def release() -> None:
+            """What a dead consumer's job costs to give back.
+
+            All three steps are needed, and the third is the one that is easy
+            to miss. A client that stopped reading leaves this generator
+            suspended at its ``yield``, and a suspended generator never
+            reaches its own ``finally`` -- so the stage teardown that runs
+            there on a normal or a cancelled stream does not run here.
+            Cancelling the executor stops the decoder and closing the bridge
+            lets the driver finish, but the decoder session and the encoder
+            session are only released by closing the stages, which this has
+            to do itself.
+            """
+            executor.cancel()
+            # Setting the cancel flag is not enough on its own. A stage
+            # blocked in ``ring.put`` on a full ring only sees the flag after
+            # that await returns, and on a stalled pipeline it never does --
+            # nothing is draining. Closing the rings is what wakes every
+            # blocked producer and consumer, which is the same thing the
+            # DELETE endpoint does and for the same reason.
+            await executor.rings.close()
+            await bridge.close()
+            if job.task is not None and not job.task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(job.task),
+                        timeout=self.liveness.teardown_timeout_s,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    job.task.cancel()
+            self._close_stages(stages)
+
+        watchdog = ConsumerWatchdog(
+            job_id=job_id,
+            policy=self.liveness.policy_for(EndpointClass.VIDEO_STREAM),
+            release=release,
+        )
+        job.watchdog = watchdog
+        watchdog.start()
         try:
             while True:
                 try:
@@ -272,7 +325,12 @@ class VideoEnhanceService:
                 except RingClosed:
                     break
                 yield chunk
+                # After the yield, not before. Control returns here only once
+                # the transport has taken the chunk, so this is the one place
+                # in the process that knows the peer is still there.
+                watchdog.note_progress(len(chunk))
         finally:
+            await watchdog.stop()
             if not job.task.done():
                 executor.cancel()
                 await bridge.close()
@@ -326,9 +384,7 @@ class VideoEnhanceService:
             if callable(close):
                 try:
                     close()
-                except (
-                    Exception
-                ):  # noqa: BLE001 - one bad stage must not block the rest
+                except Exception:  # noqa: BLE001 - one bad stage must not block the rest
                     continue
 
     # -- introspection ----------------------------------------------------
@@ -342,6 +398,8 @@ class VideoEnhanceService:
         snapshot["rings"] = job.executor.rings.snapshot()
         snapshot["reserved_mib"] = job.planned.reservation.total_mib
         snapshot["max_in_flight"] = job.planned.max_in_flight
+        if job.watchdog is not None:
+            snapshot["consumer"] = job.watchdog.state.snapshot()
         if job.source_rate is not None:
             multiplier = job.planned.chain.request.fps_multiplier
             out_rate = retimed_rate(job.source_rate, multiplier)
@@ -399,13 +457,18 @@ class VideoEnhanceService:
         }
 
 
-def create_app(config: TenantConfig, *, device_id: int = 0):
+def create_app(
+    config: TenantConfig,
+    *,
+    device_id: int = 0,
+    liveness: LivenessConfig | None = None,
+):
     """Build the FastAPI application. Imported lazily by the entry point."""
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
 
-    service = VideoEnhanceService(config, device_id=device_id)
+    service = VideoEnhanceService(config, device_id=device_id, liveness=liveness)
     app = FastAPI(title="htsglang video-enhance (Class 3)")
 
     class Body(BaseModel):
@@ -524,6 +587,22 @@ def create_app(config: TenantConfig, *, device_id: int = 0):
     @app.get("/v1/video/engines")
     async def engines():
         return JSONResponse(service.engines())
+
+    @app.get("/v1/video/liveness")
+    async def liveness_policy():
+        """The configured dead-consumer timeout for every endpoint class.
+
+        Operational rather than cosmetic: a job that vanished and a job that
+        is being held for a paused viewer look the same from outside, and the
+        difference is this number.
+        """
+        return JSONResponse(
+            {
+                "timeouts_s": service.liveness.describe(),
+                "poll_interval_s": service.liveness.poll_interval_s,
+                "teardown_timeout_s": service.liveness.teardown_timeout_s,
+            }
+        )
 
     @app.get("/v1/video/plan")
     async def plan(body: Body):

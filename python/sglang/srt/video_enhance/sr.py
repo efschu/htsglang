@@ -205,6 +205,59 @@ def fetch_model(
     return path
 
 
+#: Suffix of the locally derived fp16 artifact and of its provenance sidecar.
+#: See ``scripts/video_enhance/export_sr_fp16.py``.
+FP16_SUFFIX = "_fp16.onnx"
+PROVENANCE_SUFFIX = ".provenance.json"
+
+
+def derived_fp16_model(
+    model_dir: Path = DEFAULT_MODEL_DIR,
+    base: SrModel = REALESR_GENERAL_WDN_X4V3,
+) -> SrModel:
+    """The locally derived fp16 sibling of a pinned artifact.
+
+    The upstream distribution has no fp16 file, so this one is produced
+    locally and cannot carry a hash pinned in source. Its identity comes from
+    the sidecar the export wrote: the hash of the file it was derived from,
+    the hash of the file itself, and the conversion method. Reading the hash
+    from the sidecar rather than recomputing it silently is the point -- a
+    file whose bytes no longer match what the export recorded fails
+    ``fetch_model``'s check exactly as a corrupted download would.
+    """
+    path = Path(model_dir) / (Path(base.filename).stem + FP16_SUFFIX)
+    sidecar = path.with_suffix(path.suffix + PROVENANCE_SUFFIX)
+    if not sidecar.is_file():
+        raise ArtifactError(
+            f"no fp16 artifact derived yet: {sidecar} is absent. Run "
+            "scripts/video_enhance/export_sr_fp16.py, which writes both the "
+            "ONNX and the provenance it is verified against."
+        )
+    manifest = json.loads(sidecar.read_text())
+    if manifest.get("derived_from_sha256") != base.sha256:
+        raise ArtifactError(
+            f"{path.name} was derived from an artifact hashing to "
+            f"{manifest.get('derived_from_sha256')}, but the pinned source now "
+            f"hashes to {base.sha256}. Re-export rather than use a derivative "
+            "of a different model."
+        )
+    return SrModel(
+        model_id=f"{base.model_id}-fp16",
+        url="",
+        filename=path.name,
+        sha256=manifest["sha256"],
+        size_bytes=int(manifest["bytes"]),
+        scale=base.scale,
+        exported_precision="fp16",
+        opset=base.opset,
+        architecture=base.architecture,
+        note=(
+            f"derived locally from {base.filename} by {manifest.get('method')}; "
+            "graded by the parity gate before use"
+        ),
+    )
+
+
 def sr_engine_key(
     model: SrModel,
     onnx_path: Path,
@@ -229,6 +282,26 @@ def sr_engine_key(
         shapes=shapes,
         builder_flags=("builder_optimization_level=5", "timing_cache"),
     )
+
+
+#: Torch dtype behind each RGB pixel format the chain declares. NV12 has no
+#: entry: it is the codec-side layout and never reaches an SR engine.
+_FORMAT_DTYPE_NAMES: dict[PixelFormat, str] = {
+    PixelFormat.RGB_FP16: "float16",
+    PixelFormat.RGB_FP32: "float32",
+    PixelFormat.RGB_UINT8: "uint8",
+}
+
+
+def _as_format(tensor, fmt: PixelFormat):
+    """Return ``tensor`` in the dtype the chain declared for this boundary."""
+    import torch
+
+    name = _FORMAT_DTYPE_NAMES.get(fmt)
+    if name is None:
+        raise ValueError(f"{fmt.value} is not an SR stage boundary format")
+    wanted = getattr(torch, name)
+    return tensor if tensor.dtype is wanted else tensor.to(wanted)
 
 
 class SuperResolutionStage(StageBase):
@@ -295,6 +368,13 @@ class SuperResolutionStage(StageBase):
                     f"SR stage configured for {self.source}, got {frame.resolution}"
                 )
             result = self.backend.run(frame.data)
+            # The chain declares one pixel format per boundary, and the
+            # backend returns whatever the graph's output type is. Those two
+            # are legitimately different -- the fp32 reference engine running
+            # inside an fp16 chain is exactly the parity setup -- so the stage
+            # restores the declared format rather than letting an fp32 tensor
+            # leak downstream and be reinterpreted by the next stage.
+            result = _as_format(result, self.format)
             out.append(
                 frame.with_data(result, resolution=self.out_resolution).require_device(
                     self.name
@@ -342,6 +422,7 @@ __all__ = [
     "SR_MODELS",
     "SrModel",
     "SuperResolutionStage",
+    "derived_fp16_model",
     "fetch_model",
     "run_parity_gate",
     "sr_engine_key",

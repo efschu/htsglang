@@ -266,7 +266,24 @@ def duration_drift_s(
 #: Fragmented MP4. Without these flags the moov atom is written at the end, so
 #: a chunked response is unusable until the last byte arrives -- which defeats
 #: the point of streaming.
-FRAGMENTED_MP4_FLAGS = ("-movflags", "+frag_keyframe+empty_moov+default_base_moof")
+#:
+#: ``+delay_moov`` is not cosmetic and must not be dropped. With
+#: ``+empty_moov`` alone the moov is written before any packet has been seen,
+#: so no ``elst`` edit-list box can be written for any track. Every MP4 source
+#: whose audio carries encoder-priming compensation expresses it as exactly
+#: such an edit list -- an AAC track at 48 kHz carries a 1024-sample skip,
+#: 21.333 ms -- and losing it makes the copied audio play that much late
+#: against the enhanced video, with the subtitle track dragged along. Measured
+#: on the reference clip: without ``+delay_moov`` the audio's first packet
+#: moves from -0.021333 s to 0.0 and the ``Skip Samples`` side data is gone;
+#: with it, both survive and the mov_text samples keep their source
+#: timestamps. ``+delay_moov`` holds the initial moov back until the first
+#: fragment is cut, which is late enough to know the edit lists and still
+#: early enough to stream.
+FRAGMENTED_MP4_FLAGS = (
+    "-movflags",
+    "+frag_keyframe+empty_moov+delay_moov+default_base_moof",
+)
 
 _CONTAINER_FLAGS: dict[str, tuple[str, ...]] = {
     "mp4": FRAGMENTED_MP4_FLAGS,
@@ -407,6 +424,150 @@ class StreamRemuxer:
                 await asyncio.wait_for(self.process.wait(), timeout=10)
             except asyncio.TimeoutError:
                 self.process.kill()
+
+
+# --------------------------------------------------------------------------
+# A/V alignment: what the container does to inter-track start offsets
+# --------------------------------------------------------------------------
+
+#: A mov_text sample of length zero: the two-byte big-endian text length and
+#: no text. The MP4 text codec has no notion of a gap, so a stretch of screen
+#: time with no cue on it is encoded as an explicit empty sample. A remux into
+#: a longer output therefore *must* append one to stop the last cue from
+#: staying on screen for the added duration, and a byte-for-byte comparison of
+#: the demuxed track will always see it. It is required output, not drift.
+MOV_TEXT_EMPTY_SAMPLE = b"\x00\x00"
+
+
+def track_start_offsets(source_url: str, *, timeout: int = 60) -> dict[int, float]:
+    """First *presented* PTS of every track, in seconds, edit lists applied.
+
+    This is the number that decides A/V sync across a remux. A source rarely
+    starts every track at zero: an MP4 whose audio was encoded by an AAC
+    encoder carries a negative first PTS (or an equivalent edit list) covering
+    the encoder's priming samples, and it is the *difference* between tracks
+    that a player turns into lip sync. Preserving the absolute values is not
+    required; preserving the differences is.
+    """
+    offsets: dict[int, float] = {}
+    for track in probe(source_url, timeout=timeout).tracks:
+        cmd = [
+            FFPROBE,
+            "-v",
+            "error",
+            "-select_streams",
+            str(track.index),
+            "-show_packets",
+            "-read_intervals",
+            "%+0.5",
+            "-print_format",
+            "json",
+            source_url,
+        ]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=timeout, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            raise MuxError(f"could not read packets of track {track.index}") from exc
+        packets = json.loads(out.stdout).get("packets", [])
+        for packet in packets:
+            value = packet.get("pts_time")
+            if value not in (None, "N/A"):
+                offsets[track.index] = float(value)
+                break
+    return offsets
+
+
+@dataclass(frozen=True)
+class AlignmentReport:
+    """Per-track start offsets before and after a remux, relative to video.
+
+    ``max_drift_s`` is the gate. Zero means every copied track sits exactly
+    where it sat relative to the enhanced video; anything else is a sync error
+    of that size, in seconds, and is reported rather than tolerated silently.
+    """
+
+    reference_track: int
+    source_relative: dict[int, float]
+    output_relative: dict[int, float]
+
+    @property
+    def drift(self) -> dict[int, float]:
+        return {
+            index: round(self.output_relative[index] - offset, 6)
+            for index, offset in self.source_relative.items()
+            if index in self.output_relative
+        }
+
+    @property
+    def max_drift_s(self) -> float:
+        values = self.drift.values()
+        return max((abs(v) for v in values), default=0.0)
+
+    def as_dict(self) -> dict:
+        return {
+            "reference_track": self.reference_track,
+            "source_relative_s": self.source_relative,
+            "output_relative_s": self.output_relative,
+            "drift_s": self.drift,
+            "max_drift_s": self.max_drift_s,
+        }
+
+
+def alignment_report(source_url: str, output_url: str) -> AlignmentReport:
+    """Compare inter-track start offsets across a remux.
+
+    Both sides are normalised against their own first video track, because a
+    container is free to move the whole programme in time -- only the spacing
+    between the tracks is a correctness property.
+    """
+    source_info = probe(source_url)
+    output_info = probe(output_url)
+    src = track_start_offsets(source_url)
+    dst = track_start_offsets(output_url)
+
+    def normalise(info: MediaInfo, offsets: dict[int, float]) -> tuple[int, dict]:
+        video = info.video_tracks
+        if not video:
+            raise MuxError("cannot report alignment without a video track")
+        base_index = video[0].index
+        base = offsets.get(base_index, 0.0)
+        return base_index, {k: round(v - base, 6) for k, v in offsets.items()}
+
+    reference, source_relative = normalise(source_info, src)
+    _, output_relative = normalise(output_info, dst)
+    return AlignmentReport(
+        reference_track=reference,
+        source_relative=source_relative,
+        output_relative=output_relative,
+    )
+
+
+def strip_empty_mov_text(payload: bytes) -> bytes:
+    """Drop mov_text gap samples from a concatenated subtitle track.
+
+    A mov_text sample is a two-byte big-endian length followed by that many
+    UTF-8 bytes and optional style boxes. Length zero is a gap marker with no
+    content, emitted by the muxer wherever no cue is on screen; a remux whose
+    output runs longer than the source necessarily gains one at the tail. This
+    filter is what makes "did the subtitle content survive" answerable
+    separately from "did the container add the padding it is obliged to add".
+
+    A payload that does not parse as a mov_text sample sequence is returned
+    unchanged, so this is safe to apply to any subtitle codec.
+    """
+    out = bytearray()
+    cursor = 0
+    end = len(payload)
+    while cursor + 2 <= end:
+        length = int.from_bytes(payload[cursor : cursor + 2], "big")
+        if cursor + 2 + length > end:
+            return payload  # not mov_text, or truncated: do not pretend
+        if length:
+            out += payload[cursor : cursor + 2 + length]
+        cursor += 2 + length
+    if cursor != end:
+        return payload
+    return bytes(out)
 
 
 def describe_selection(info: MediaInfo, selection: TrackSelection) -> dict:

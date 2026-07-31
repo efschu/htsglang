@@ -1,0 +1,43 @@
+{
+  "cards": {
+    "0": "NVIDIA GeForce RTX 3080",
+    "1": "NVIDIA GeForce RTX 5090",
+    "2": "NVIDIA GeForce RTX 3080"
+  },
+  "checks": {
+    "baseline_frame_count": {
+      "actual": 191,
+      "expected": 191,
+      "pass": true
+    },
+    "multicard_frame_count": {
+      "actual": 191,
+      "expected": 191,
+      "pass": true
+    },
+    "multicard_frames_bit_identical_to_baseline": {
+      "identical": 95,
+      "note": "cross-architecture convolution results are not bit-identical; this is a measurement, not a gate",
+      "of": 191
+    },
+    "multicard_matches_baseline": {
+      "pass": false,
+      "psnr_db": 35.490726,
+      "threshold_db": 40.0
+    },
+    "seam_is_exact": {
+      "compared": "pre-encode frame digests, chunked vs whole, same card",
+      "first_differing_frame": null,
+      "frames": 191,
+      "pass": true
+    }
+  },
+  "plan": "capacity_weighted: 96 frames over 3 card(s), predicted makespan 3208.4 ms\n  1            [0:24]                24 frames (+1 overlap)\n  0            [24:72]               48 frames (+2 overlap)\n  2            [72:96]               24 frames (+1 overlap)\n  contiguous chunks weighted by measured chain rate; contiguous because RIFE reads adjacent pairs and an interleave would split every pair across cards",
+  "speedup": {
+    "baseline_wall_s": 20.675,
+    "cards": 3,
+    "multicard_wall_s": 12.491,
+    "predicted_speedup_x": null,
+    "speedup_x": 1.655
+  }
+}

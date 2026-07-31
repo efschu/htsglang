@@ -41,6 +41,7 @@ arithmetic do -- costs nothing and fails nowhere.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import threading
@@ -56,6 +57,8 @@ from sglang.srt.video_enhance.frame_math import (
     frame_bytes,
 )
 from sglang.srt.video_enhance.frames import Frame, StageBase
+
+logger = logging.getLogger(__name__)
 
 BackendName = Literal["auto", "pynvvideocodec", "ffmpeg"]
 
@@ -691,6 +694,8 @@ def build_ffmpeg_decode_command(
     ffmpeg_path: str = "ffmpeg",
     device_id: int = 0,
     start_frame: int = 0,
+    frame_rate: Fraction | None = None,
+    frame_limit: int | None = None,
 ) -> list[str]:
     """The fallback decode command: CUVID decode, host-staged NV12 out.
 
@@ -698,6 +703,19 @@ def build_ffmpeg_decode_command(
     NVDEC, but ffmpeg has no way to hand a CUDA frame to another process, so
     ``hwdownload`` is unavoidable and the frames cross PCIe twice on their way
     into the chain.
+
+    ``start_frame`` is what makes a multi-card shard possible: each card needs
+    only its own stretch of the timeline. It is expressed as an *input* seek
+    (``-ss`` before ``-i``), which decodes forward from the preceding keyframe
+    and discards, rather than as a ``select`` filter, which would decode the
+    entire prefix on every card and give the last card in the plan the whole
+    clip to chew through before it starts working.
+
+    The seek target is placed half a frame interval early, so the frame that
+    should be first is unambiguously the first one at or after the seek point
+    rather than a coin flip on floating-point rounding. ``frame_rate`` is
+    required whenever ``start_frame`` is non-zero, because a frame index
+    cannot be converted to a seek time without it.
     """
     cmd = [
         ffmpeg_path,
@@ -713,12 +731,24 @@ def build_ffmpeg_decode_command(
         "cuda",
     ]
     if start_frame:
-        cmd += ["-vf", f"select=gte(n\\,{start_frame})"]
+        if frame_rate is None or frame_rate <= 0:
+            raise ValueError(
+                "start_frame needs frame_rate: a frame index cannot be turned "
+                "into a seek time without the rate it was counted at"
+            )
+        seek = (Fraction(start_frame) - Fraction(1, 2)) / frame_rate
+        cmd += ["-ss", f"{float(seek):.6f}"]
     cmd += [
         "-i",
         str(source),
         "-vf",
         f"hwdownload,format=nv12,scale={resolution.width}:{resolution.height}",
+    ]
+    if frame_limit is not None:
+        if frame_limit < 1:
+            raise ValueError("frame_limit must be positive")
+        cmd += ["-frames:v", str(frame_limit)]
+    cmd += [
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -910,6 +940,8 @@ class _FfmpegDecodeBackend:
         device_id: int = 0,
         device: str | None = None,
         ffmpeg_path: str = "ffmpeg",
+        start_frame: int = 0,
+        frame_limit: int | None = None,
     ) -> None:
         if shutil.which(ffmpeg_path) is None:
             raise CodecBackendUnavailable(f"{ffmpeg_path} not found on PATH")
@@ -923,6 +955,9 @@ class _FfmpegDecodeBackend:
                 info.resolution,
                 ffmpeg_path=ffmpeg_path,
                 device_id=device_id,
+                start_frame=start_frame,
+                frame_rate=info.fps,
+                frame_limit=frame_limit,
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -994,6 +1029,8 @@ class DecodeStage(StageBase):
         emit_eos: bool = True,
         ffmpeg_path: str = "ffmpeg",
         ffprobe_path: str = "ffprobe",
+        start_frame: int = 0,
+        frame_limit: int | None = None,
     ) -> None:
         self.source = source
         self.resolution = resolution
@@ -1005,10 +1042,25 @@ class DecodeStage(StageBase):
         self.emit_eos = emit_eos
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
+        # Multi-card sharding (``multicard.py``): a chunk decodes only its own
+        # stretch of the timeline. ``start_frame`` is a real seek on the
+        # ffmpeg backend and a decode-and-discard on the NVDEC backend, which
+        # has no seek of its own -- the cost is named in ``_open``.
+        if start_frame < 0:
+            raise ValueError("start_frame cannot be negative")
+        if frame_limit is not None and frame_limit < 1:
+            raise ValueError("frame_limit must be positive")
+        self.start_frame = start_frame
+        self.frame_limit = frame_limit
 
         self._info = info
         self._backend: object | None = None
-        self._index = 0
+        # Frame indices are absolute in the source timeline, not relative to
+        # the shard. A shard's ``encode_filter`` is written against the index
+        # of the seam frame in the source, and interpolated frames inherit the
+        # index of the earlier frame of their pair, so a shard-relative
+        # numbering would make the two disagree.
+        self._index = start_frame
         self._cancelled = False
         self._eos_emitted = False
         self.frames_decoded = 0
@@ -1056,6 +1108,30 @@ class DecodeStage(StageBase):
                 device_id=self.device_id,
                 copy_surfaces=self.copy_surfaces,
             )
+            if self.start_frame:
+                # NVDEC through PyNvVideoCodec is driven packet by packet and
+                # exposes no seek, so the only way to reach frame N is to
+                # decode and throw away the N before it. That is correct but
+                # it is not free: the last chunk of a multi-card plan pays for
+                # the whole prefix. The ffmpeg backend, which seeks, is the
+                # one to use for sharded work -- said here rather than
+                # discovered from a flat speedup curve.
+                logger.warning(
+                    "decode backend %s cannot seek; reaching frame %d costs a "
+                    "decode-and-discard of every frame before it",
+                    chosen,
+                    self.start_frame,
+                )
+                remaining = self.start_frame
+                while remaining > 0:
+                    got = self._backend.read(min(remaining, 32))
+                    if not got:
+                        raise CodecError(
+                            f"source ended before frame {self.start_frame}; a "
+                            "shard was planned against a frame count the source "
+                            "does not have"
+                        )
+                    remaining -= len(got)
         else:
             self._backend = _FfmpegDecodeBackend(
                 self.source,
@@ -1063,6 +1139,8 @@ class DecodeStage(StageBase):
                 device_id=self.device_id,
                 device=self.device,
                 ffmpeg_path=self.ffmpeg_path,
+                start_frame=self.start_frame,
+                frame_limit=self.frame_limit,
             )
         self._info = self._info.with_backend(chosen)
         return self._backend
@@ -1132,6 +1210,16 @@ class DecodeStage(StageBase):
             return []
         backend = self._open()
         assert self._info is not None
+
+        if self.frame_limit is not None:
+            n = min(n, self.frame_limit - self.frames_decoded)
+            if n <= 0:
+                # The shard's range is complete. The sentinel still has to go
+                # out once, or the downstream stages never see end of stream.
+                if self._eos_emitted or not self.emit_eos:
+                    return []
+                self._eos_emitted = True
+                return [Frame.eos(self._index)]
 
         tensors = backend.read(n)
         frames = [

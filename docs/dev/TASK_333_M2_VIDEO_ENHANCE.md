@@ -34,6 +34,8 @@ its own CUDA context, pinned to one physical GPU through
 | `nvml.py` | physical device identity by UUID | pynvml |
 | `reservation.py` | the Class-3 slice of the §3.3 cross-process ledger | no |
 | `shard_plan.py` | capacity-weighted chunk sharding, and the baselines it is measured against | no |
+| `multicard.py` | the multi-card executor: chunk specs, the seam convention, ordered stitching | no |
+| `chunk_worker.py` | one chunk, one process, one card | yes |
 | `probes.py` | measurement posts P1-P5 as a CLI, plus the playback arithmetic | torch |
 | `timing.py` | deferred-readout CUDA-event timing | torch optional |
 
@@ -211,10 +213,11 @@ See `docs/dev/TASK_333_M2_MEASUREMENTS.md` for the raw records.
 
 Stated honestly, extending the design's own list:
 
-*   **Single card for the executor.** The shard planner computes multi-card
-    plans and predicts their makespan, and the P1 table it consumes is
-    measured per card — but the executor runs one chain in one process on one
-    card. Distributing a job across cards is the next post, not this one.
+*   ~~**Single card for the executor.**~~ Closed by #339: `multicard.py` runs
+    the planner's chunks concurrently, one process per card, and stitches
+    them in timeline order. See §9.
+*   **No live watch.** The preview taps of §8.1 are not built. Client
+    liveness (§8.2) is — see §11.
 *   **No Regime B.** No stage split across cards. P2 is measured so the
     decision has data behind it before any Regime-B code exists.
 *   **No int8 compute.** Deferred by §8.7 and by the standing rule that lossy
@@ -251,12 +254,16 @@ Stated honestly, extending the design's own list:
 1. Native TensorRT driver extracted from `efschu/vs-mlrt` (§9.3), unlocking
    per-context workspace measurement and tiling.
 2. `lanczos3_kernel.cu` port, if P1 shows resize is a meaningful share.
-3. Multi-card execution of `shard_plan`'s output (the planner exists; the
-   executor is single-card).
+3. ~~Multi-card execution of `shard_plan`'s output.~~ Done, #339, §9.
 4. RIFE TensorRT backend at the post-resize shape.
 5. VapourSynth shim and CLI over the same executor.
 6. Audio-enhance stage (Demucs class) on the passthrough track inventory.
 7. Registry integration (M1): replace the static budget with a ledger slot.
+8. Bind a torch-owned output buffer to the SR session instead of cloning
+   ONNX Runtime's. Needs the output shape threaded from the chain into the
+   backend, which the stage knows and the backend does not — see §9.1.
+9. Live watch and client liveness (§8), untouched.
+10. Regime B, reopened by prior art rather than by argument — see §10.
 
 ---
 
@@ -287,3 +294,319 @@ Two additions to the M2/#339 scope, recorded here as the persistent decision
    staircase #287, spill/offload) until the client either returns or is
    declared dead. Related prior art in-tree: #312 bounded peer liveness in
    collectives, #305-M1 ledger lease+heartbeat, M2 abort semantics (#338).
+
+---
+
+## 9. Task #339 — the defects, and multi-card execution
+
+Recorded 2026-07-31. Raw records in `TASK_333_M2_MEASUREMENTS.md` and
+`docs/dev/measurements/333-m2/`.
+
+### 9.1 The byte-stability defect was a cross-stream hazard
+
+§ "End-to-end functional proof" recorded "output is not byte-stable across
+two runs — not diagnosed". It is diagnosed, and it was not a tolerance
+problem: it was corrupting whole frames.
+
+ONNX Runtime's CUDA execution provider runs on its own CUDA stream. The SR
+backend binds a torch tensor to it by device pointer, so every inference
+crosses a stream boundary twice, and neither crossing was ordered. ORT could
+begin reading the input before torch had finished producing it, and torch
+could begin reading the output before ORT had finished writing it. Nothing
+in the API suggests this; `run_with_iobinding` returns and the output tensor
+is there.
+
+The falsifier that settled it needed no chunking and no second card: the
+**same whole-clip run at ring depth 1, 2 and 4 produced three different
+outputs**, differing in 9 and then 178 of 191 frames. A deeper pipeline
+means more frames in flight and a wider window for ORT's stream to write
+over a frame another stage is still reading. Cloning the output does not
+help — the clone reads the same memory at the same unsynchronised moment.
+
+Fixed with `torch.cuda.current_stream().synchronize()` and
+`binding.synchronize_inputs()` before the run, `binding.synchronize_outputs()`
+after. Afterwards the chain is ring-depth invariant (0 of 191 frames differ
+across depths 1, 2 and 4) and two whole-clip runs produce byte-identical
+elementary streams.
+
+**Byte-stability gate: met.** The remaining known nondeterminism source is
+named rather than open: convolution results are not bit-identical *across
+architectures*, so a frame produced on a 3080 is not the frame the 5090
+produces. That is a property of the hardware, it is measured (§9.4), and it
+is why the multi-card correctness gate is the same-card control rather than
+a cross-card hash.
+
+Two smaller defects found in the same area, both by running rather than by
+reading:
+
+*   An fp16 frame was bound to the fp32 SR graph with the element type
+    declared as float32, so ONNX Runtime read twice the allocation and
+    faulted with `CUDA failure 700: an illegal memory access` from inside the
+    session, with nothing in the message pointing at the dtype. The backend
+    now casts to the graph's input type and warns once naming both; the SR
+    stage restores the chain's declared pixel format on the way out.
+*   `cudnn_conv_algo_search` is no longer left at ONNX Runtime's `EXHAUSTIVE`
+    default, which picks a convolution algorithm by stopwatch and can
+    therefore choose differently in two processes. `HEURISTIC` picks by shape
+    and reproduces.
+
+### 9.2 The mov_text subtitle mismatch was an edit-list loss
+
+Also recorded as an open defect, and the smaller half of a larger one.
+Bisected entirely on CPU, no card involved.
+
+The muxer is byte-stable: three remuxes of one fixed elementary stream
+produce identical bytes, so the container writer was never the instability.
+What the bisection found instead is that fragmented MP4 with `+empty_moov`
+writes the moov before any packet has been seen, so libavformat cannot emit
+an `elst` box for any track. An MP4 whose audio came out of an AAC encoder
+carries its 1024-sample priming compensation as exactly such an edit list.
+
+Losing it moved the audio's first packet from -0.021333 s to 0.0 and
+dropped its `Skip Samples` side data, so **the copied audio played 21.333 ms
+late against the enhanced video**, with the subtitle track dragged along.
+The duration check could not see it: all tracks shifted together, so the
+durations still matched. Only an inter-track offset comparison sees it, and
+`alignment_report()` is now that comparison, gated at 1 ms.
+
+`+delay_moov` holds the initial moov back until the first fragment is cut —
+late enough to know the edit lists, early enough to still stream. With it the
+`Skip Samples` survives, the cues sit at their source timestamps, and the
+second video packet lands at 0.020833 s rather than the 0.042236 s the
+flag-less variant produced.
+
+What remains of the subtitle mismatch is one trailing two-byte empty sample.
+mov_text has no gap representation, so screen time with no cue on it must be
+an explicit empty sample, and an output that runs longer than the source is
+obliged to append one or leave the last cue on screen for the extra
+duration. That is required muxer output, not source content.
+`strip_empty_mov_text()` separates the two so the passthrough gate compares
+text rather than padding; a changed cue still fails it.
+
+**Subtitle post: closed.** Audio and subtitle content are bit-identical
+across the remux, and inter-track drift is 0.0 s where it was 0.021334 s.
+
+### 9.3 The multi-card executor
+
+`multicard.py` plus `chunk_worker.py`. The planner already decided what each
+card should do; this is what carries it out.
+
+The seam convention is the tail: chunk *k* pulls frame `stop` as RIFE's
+second input, emits the interpolated frames for the pair that straddles the
+boundary, and withholds the trailing original, which chunk *k+1* encodes.
+`shard_plan` prices both a lead and a tail overlap because its cost model is
+symmetric and cannot know which side will do the work, so the executor's
+real seam cost is half what the planner charged — pessimistic, which is the
+safe direction for an admission check.
+
+The arithmetic is the gate, not a comment. A chunk with a successor encodes
+`n*m` frames, one without encodes `n + (n-1)(m-1)`, and any chunking of `N`
+frames at multiplier `m` sums to `N + (N-1)(m-1)` — the same
+`expected_frame_count` the muxer retimes against. `verify_chunk_arithmetic()`
+refuses a chunking that does not, before a card is touched, and the executor
+refuses a chunk whose worker reported a count the arithmetic did not predict.
+
+Two things multi-card gives up, both stated rather than glossed:
+
+*   **Back-pressure is bounded, not immediate.** The single-card chain stalls
+    the decoder within one ring depth. Here a finished chunk waiting for an
+    earlier one has to be spooled, so a stalled client stops the run after at
+    most `spool_chunks` completed chunks — one per card by default, which is
+    the smallest bound that still lets every card work at once.
+*   **A process launch per chunk.** Roughly 8 s of torch and ONNX Runtime
+    import before the first frame moves, which is the whole reason the
+    end-to-end speedup below is lower than the compute-only one.
+
+**The device-order trap.** A worker was launched with `CUDA_VISIBLE_DEVICES`
+set to an NVML index and nothing else. CUDA enumerates `FASTEST_FIRST` by
+default, which on this rig is not NVML's PCI-bus order — the 5090 is NVML
+index 1 and CUDA ordinal 0. It does not fail: every card runs, the seam
+stays exact, the output is correct. It just measures and schedules the wrong
+cards, and it flattered the headline number by nearly a factor of two (2.91x
+against a baseline silently on a 3080, 1.44x against the 5090 it was meant
+to be compared with). `CUDA_DEVICE_ORDER=PCI_BUS_ID` is now set in the child
+environment ahead of anything the caller passes in.
+
+### 9.4 Multi-card measurements
+
+480 source frames, 960x540 → 1920x1080, SR x4 + Lanczos-3 + RIFE 4.6 x2,
+fp16 chain, SR on the ONNX Runtime CUDA provider, ffmpeg NVENC encode.
+NVML 1 = RTX 5090, NVML 0 and 2 = RTX 3080.
+
+Per-stage ms per invocation, from the run itself:
+
+| Stage | 5090 | 3080 | ratio |
+|---|---|---|---|
+| SR (960x540, x4) | 35.58 | 90.9 | 2.55 |
+| resize (3840x2160 → 1920x1080) | 6.48 | 14.1 | 2.18 |
+| RIFE (1920x1080, scale 1.0) | 3.06 | 8.28 | 2.71 |
+| encode | 1.56 | 2.5 | 1.60 |
+
+The 5090's SR figure reproduces the single-card P1 table (35.19 ms) to
+within the 2.77 percent noise floor, which is the check that the multi-card
+harness measures the same thing the earlier post did.
+
+| Arm | wall | notes |
+|---|---|---|
+| baseline, 5090 alone | 35.80 s | one chunk, same executor |
+| three cards | 24.94 s | plan: 5090 [0:243], 3080s [243:361] and [361:480] |
+| same-card control | 54.22 s | the identical chunking, all on the 5090 |
+
+*   **End to end: 1.44x.**
+*   **Compute only: 1.64x**, excluding the ~8 s worker start from both arms.
+*   **Ceiling from the measured rates: 1.78x.** A 3080 is 0.39 of a 5090 on
+    this chain, so two of them add 0.78 of a card. The capacity weighting is
+    therefore running at about 92 percent of what the rates allow.
+
+The honest framing of the 1.8-2.6x projection: it is not reachable *on this
+rig* with this chain, because the cards are that unequal and the job is that
+short. Nothing here says it is unreachable on a rig with comparable cards,
+and the ceiling calculation is the thing to carry forward, not the 1.44.
+
+Correctness, 480-frame run:
+
+| Check | Result |
+|---|---|
+| output frame count | 959, matching `expected_frame_count(480, 2)` — pass |
+| **seam exact** | **959 of 959 frames bit-identical to the whole-clip run on one card** — pass |
+| multi-card vs same-card control | 37.4 dB PSNR — cross-architecture arithmetic, measured, not passed |
+| multi-card frames bit-identical to the 5090 baseline | 486 of 959 (exactly the 5090's chunk) |
+
+The seam row is the one that matters, and it is exact rather than
+approximate: the comparison is a sha256 per frame taken immediately before
+the encoder, so the encoder cannot confound it. That instrument had to be
+built — the first attempt compared the two arms by PSNR of the encoded
+output and scored 6-25 dB on pixels that were provably identical going in,
+because two independently encoded H.264 streams of the same frames are not
+the same stream and their PSNR is a statement about rate control.
+
+### 9.5 What is still open from the P-series
+
+*   **P3 (SR allocator overhead)** — still not answered. The corrected probe
+    reads the device-wide free-memory delta rather than torch's allocator;
+    it did not fit in these windows. `SR_ALLOCATOR_OVERHEAD_FRACTION = 0.45`
+    remains unvalidated.
+*   **P5 (codec ceiling, concurrent session count)** — not measured.
+*   **P6 (co-tenancy jitter against a HOT LLM)** — not measured. The shard
+    planner warns when a card declares an LLM co-tenant without a P6 derate,
+    so a plan built without it says so.
+*   **P7 (8-bit transport matrix)** — not measured.
+*   **PyNvVideoCodec encode** — still not working. The `__dlpack__` signature
+    problem is worked around, and the wrapped tensor then reaches NVENC and
+    is rejected with "incorrect usage of CPU input buffer". Every measurement
+    here used the ffmpeg NVENC backend, which is a host round trip per frame
+    and is visible in the encode column above. Not diagnosed further.
+*   **fp16 TensorRT engine and its parity numbers** — the export and the
+    parity harness exist (`scripts/video_enhance/export_sr_fp16.py`); the
+    graded numbers are not in yet.
+
+---
+
+## 10. Prior art: `efschu/vs-pipeline`
+
+The reference VapourSynth pipeline M2 was built from became public during
+#339. Two things in it bear directly on open posts.
+
+**fp16 export.** `build/build_esrgan_rtx.py` solves the fp16 problem for
+*this exact model*: convert the initializers with `numpy.astype`, set the
+graph I/O to fp16, build `STRONGLY_TYPED`.
+`scripts/video_enhance/export_sr_fp16.py` is that conversion, ported, with
+provenance recorded in the file header and in the artifact's sidecar.
+`build_rife_rtx_fp16.py`'s alternative — Cast nodes at the I/O so the
+compute stays fp32 while the interface is fp16 — is ported alongside it as
+`--io-cast-only`, because it is the right answer for a network the parity
+gate rejects at full fp16 and having both means the choice is a measurement.
+
+What is deliberately *not* taken is the builder: `vs-pipeline` builds with
+`tensorrt_rtx` and ships `.engine` files. This fork's SR path goes through
+ONNX Runtime's TensorRT EP (§2.1), which builds its own engine from the
+ONNX, so the port produces an ONNX and the engine stays the EP's business.
+Adding a second TensorRT distribution to produce an artifact the existing
+one can produce would be a dependency for no capability. The prebuilt
+`engines/*.engine` are for that toolchain and this rig and are not vendored.
+
+**Regime B, reopened.** The README records the working production mapping:
+ESRGAN on the two 3080s (`cycle=4`, two streams per GPU), interleave at 4K
+RGBH, RIFE on the 5090, one Bicubic RGB→YUV at the end. That is a *stage*
+split across cards — Regime B, which §6 excluded for M2 and which
+`shard_plan`'s cost model prices but does not run.
+
+It is excluded on an argument the measurements now partly contradict. P2
+measured the host-staged round trip at 1.7 ms for an 11.87 MiB post-resize
+boundary, and the reference pipeline's split point is exactly there. And the
+per-card table in §9.4 says why the shape is attractive on *this* rig: the
+3080s are 0.39 of the 5090 on the whole chain, but SR is 71 percent of the
+5090's frame time and 84 percent of a 3080's, so moving SR wholesale onto
+two 3080s and leaving RIFE alone on the 5090 balances differently than
+chunking does. That is a hypothesis with an arithmetic case, not a result —
+but it is now a hypothesis with a working implementation behind it, which is
+a better reason to reopen the post than the one that closed it.
+
+`efschu/jellyfin-vapoursynth-plugin` is the other half of the same system: a
+job model with `PipelineManager`, `GpuResourceManager` and
+`BackgroundJobService` over this chain. It is prior art for the M2 job API
+and for the §8 liveness work rather than for anything in this task.
+
+---
+
+## 11. Client liveness (§8.2), built in #339
+
+`liveness.py`, wired into `server.py`'s streaming path. The preview taps of
+§8.1 are still open; this is the other half of the directive.
+
+**What it is for.** A client that closes the connection was already handled:
+Starlette throws into the response generator and its `finally` tears the job
+down. The case that was not handled is the client that neither closes nor
+reads. The socket stays open, the TCP window stays full, the sink coroutine
+never returns, and back-pressure — working exactly as designed — stalls the
+chain and holds a decoder, an encoder, the engines and the reservation for a
+viewer who left. From the server's side that is indistinguishable from a
+very slow viewer, and the only thing separating them is how long. So the
+duration is the policy and it is configured, not constant.
+
+**Progress means bytes the transport accepted**, not bytes the chain
+produced. A stalled client makes the chain stop producing, so "the pipeline
+is idle" is a consequence of the stall and cannot be its evidence. The
+watchdog is stamped after the `yield` returns, which is the one moment in
+the process that proves the peer is still there.
+
+**Per endpoint class**, because the right number differs by an order of
+magnitude: a paused player is normal and reclaiming its job would be worse
+than holding it, while a preview tap that has accepted nothing for ten
+seconds has no viewer. Defaults: `video_stream` 300 s, `preview_tap` 15 s,
+`control` 60 s. `LivenessConfig.parse("video_stream=120,preview_tap=5")` is
+the server-argument form, a non-positive value disables detection for that
+class (a batch export nobody watches by design is a real case), and
+`GET /v1/video/liveness` reports the resolved policy.
+
+Two things the implementation had to get right that are easy to miss, both
+found by the end-to-end test rather than by reading:
+
+*   **A suspended generator never reaches its own `finally`.** The stage
+    teardown that runs there on a normal or a cancelled stream does not run
+    for a client that simply stopped calling `__anext__`, so the release
+    path closes the stages itself. Without that the decoder and encoder
+    sessions survive the job.
+*   **`executor.cancel()` does not unblock a stalled pipeline.** A stage
+    blocked in `ring.put` on a full ring only sees the cancel flag after that
+    await returns, and on a stalled pipeline nothing is draining, so it never
+    does. The release closes the rings, which is what wakes every blocked
+    producer — the same thing `DELETE /v1/video/enhance/{id}` already did,
+    now done in both places.
+
+Teardown is itself bounded (`teardown_timeout_s`, default 30 s) and escalates
+to a cancel: a release that will not finish must not leave the reservation
+held by a job nobody is watching.
+
+**What is not built.** During the grace window the job's resources stay
+where they are. The directive asks for them to join the normal reclamation
+ladder (idle tenant #341, pressure staircase #287, spill) rather than being
+idly pinned, and that ladder is not wired to this tenant. Registered as a
+follow-on.
+
+Demonstrated in `test/registered/video_enhance/test_liveness.py`: a consumer
+takes one chunk and then stops — no close, no further read — and within the
+configured timeout the executor is cancelled, every stage is closed, and the
+decoder, which was willing to produce 100000 frames, is stopped within one
+ring's worth of the frame it had reached. The control case, a consumer that
+keeps reading, runs to completion with `declared_dead` false.
