@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Fp4Dequant,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -56,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    nvfp4_marlin_unpackable_reason,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -131,9 +133,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.linear_fp8_config = linear_fp8_config
 
     @staticmethod
-    def _group_size_block(
-        target_scheme_map: Dict[str, Any]
-    ) -> Optional[List[int]]:
+    def _group_size_block(target_scheme_map: Dict[str, Any]) -> Optional[List[int]]:
         """Uneven-TP group alignment for group-quantized schemes (AWQ/GPTQ INT4,
         group_size G).
 
@@ -921,6 +921,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_quant=weight_quant,
                 input_quant=input_quant,
             )
+            scheme = self._maybe_dequantize_unpackable(scheme, layer, layer_name)
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
@@ -931,6 +932,49 @@ class CompressedTensorsConfig(QuantizationConfig):
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
+
+    @staticmethod
+    def _maybe_dequantize_unpackable(
+        scheme: CompressedTensorsLinearScheme,
+        layer: torch.nn.Module,
+        layer_name: Optional[str],
+    ) -> CompressedTensorsLinearScheme:
+        """Route a quantised layer with no kernel-legal form to the dense lane.
+
+        Task #332. The order is deliberate and mirrors #316: the GEOMETRY
+        verdict comes first and is taken on the UNSHARDED width
+        (``nvfp4_marlin_unpackable_reason``), because that is what decides
+        WHICH layers can never be served -- a per-shard verdict would blame the
+        shard plan for a property of the checkpoint. Only then does the
+        consequence change: #316 could build the layer dense-and-empty because
+        GPTQ leaves such a module dense on disk, while a compressed-tensors
+        NVFP4 checkpoint that targets ``Linear`` wholesale has really packed
+        it, so it must be loaded packed and materialised.
+
+        Only the NVFP4 scheme has such a lane; every other scheme is returned
+        untouched, so no other checkpoint class changes behaviour.
+        """
+        if not isinstance(scheme, CompressedTensorsW4A4Fp4):
+            return scheme
+        if not scheme._use_marlin():
+            # The native FP4 lane has no thread tile; nothing to fall back from.
+            return scheme
+        reason = nvfp4_marlin_unpackable_reason(layer)
+        if reason is None:
+            return scheme
+        # Loud, once per layer, and named: a lane change that silently costs
+        # VRAM must be readable off the boot log without a debugger.
+        logger.warning(
+            "NVFP4: layer '%s' has no Marlin form at any TP size (%s), so the "
+            "checkpoint's packed weight is DEQUANTISED to dense %s at load "
+            "(#332). No precision is lost -- the quantisation error is already "
+            "in the stored codes -- but this layer costs bf16 VRAM instead of "
+            "4 bits.",
+            layer_name,
+            reason,
+            "bf16/fp16",
+        )
+        return CompressedTensorsW4A4Fp4Dequant()
 
     def get_scheme_dict(
         self, layer: torch.nn.Module, layer_name: str | None = None

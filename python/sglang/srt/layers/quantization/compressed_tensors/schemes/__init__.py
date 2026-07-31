@@ -5,7 +5,11 @@ from .compressed_tensors_scheme import (
     CompressedTensorsMoEScheme,
 )
 from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
-from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
+from .compressed_tensors_w4a4_nvfp4 import (
+    CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Fp4Dequant,
+    nvfp4_marlin_unpackable_reason,
+)
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from .compressed_tensors_w4a8_int8_moe import NPUCompressedTensorsW4A8Int8DynamicMoE
 from .compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
@@ -38,6 +42,8 @@ __all__ = [
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A4Fp4",
+    "CompressedTensorsW4A4Fp4Dequant",
+    "nvfp4_marlin_unpackable_reason",
     "CompressedTensorsW4A4Nvfp4MoE",
     "NPUCompressedTensorsW4A8Int8DynamicMoE",
     "CompressedTensorsMxInt4MoE",

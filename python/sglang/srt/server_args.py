@@ -1938,7 +1938,15 @@ class ServerArgs:
             "to be free at launch: a co-resident process does not shrink it "
             "(it is the reserve's job to account for one), it only limits "
             "what can physically be allocated — which is reported "
-            "separately. Only valid with --rank-tp-ratio auto.",
+            "separately. WITHOUT --rank-gpu-id (default placement, one rank "
+            "per GPU) the same flag sizes the plain path by reserve instead "
+            "of by fraction: it must then be a single MiB integer, and it "
+            "sets mem_fraction_static = (NVML total - reserve) / NVML total "
+            "exactly, with no further margin, cap or rounding. That mode is "
+            "mutually exclusive with --mem-fraction-static; 'auto' (the "
+            "default) leaves the stock fraction heuristic in place there, "
+            "because a default value cannot distinguish itself from an "
+            "unset flag.",
             type_parser=str,
         ),
     ] = "auto"
@@ -7071,6 +7079,103 @@ class ServerArgs:
     #: 2048 MiB constant.
     AUTO_RANK_MEMORY_RESERVE_MIB = "auto"
 
+    def _apply_reserve_based_mem_fraction(self) -> None:
+        """Size the DEFAULT placement path by a named reserve, not a fraction.
+
+        Task #332, third posten. Without ``--rank-gpu-id`` the KV budget is
+        ``available_gpu_memory - pre_model_load_memory * (1 - fraction)``
+        (``_profile_available_bytes``): the withheld slack is a blind
+        percentage of the card, and nothing in it is itemized. Measured
+        2026-07-31 on the solo-5090 NVFP4 arm, ``--mem-fraction-static 0.90``
+        left 2.44 GiB unused after the boot -- ~80k KV tokens at that run's
+        31.9 KiB/token, against 153,007 actually allocated.
+
+        The reserve-based sizing that answers this already exists (#68,
+        ``derived_rank_auto_reserve_mib``), it was just unreachable without
+        ``--rank-gpu-id``: budget = NVML TOTAL minus a reserve that names its
+        components (stock runtime activation/metadata heuristic + captured
+        tokens x 2 MiB + the #313 ladder demand). This makes it reachable on
+        the plain path, converting once to the fraction the rest of the
+        pipeline consumes:
+
+            mem_fraction_static = (nvml_total_mib - reserve_mib) / nvml_total_mib
+
+        No safety margin, no cap, no rounding down on top -- the same rule as
+        ``--rank-gpu-memory-mib``. A reserve too small for the graphs and
+        activations of the chosen recipe is the user's OOM, and ``auto``
+        derives one that covers them from the recipe itself.
+
+        Requires one rank per GPU (the default placement) and a single node;
+        with ``--rank-gpu-id`` the per-rank path owns the conversion instead.
+        """
+        from sglang.srt.utils import get_device_memory_capacity
+
+        if self.mem_fraction_static is not None:
+            raise ValueError(
+                "--mem-fraction-static cannot be set together with "
+                "--rank-auto-reserve-mib: the reserve REPLACES the fraction "
+                "(budget = NVML total - reserve). Pass one or the other."
+            )
+        if self.nnodes > 1:
+            raise ValueError(
+                "--rank-auto-reserve-mib without --rank-gpu-id is single-node "
+                f"only (current: --nnodes {self.nnodes})."
+            )
+
+        gpu_mem = get_device_memory_capacity(self.device)
+        if not gpu_mem:
+            raise ValueError(
+                "--rank-auto-reserve-mib needs the device's total memory, "
+                f"which could not be read for --device {self.device}."
+            )
+        gpu_mem = int(gpu_mem)
+
+        raw = str(self.rank_auto_reserve_mib)
+        if "," in raw:
+            raise ValueError(
+                "--rank-auto-reserve-mib takes a per-rank LIST only together "
+                f"with --rank-gpu-id (got {self.rank_auto_reserve_mib!r}). On "
+                "the default placement every rank owns a whole GPU, so the "
+                "reserve is a single value."
+            )
+        # 'auto' is the flag's DEFAULT, i.e. indistinguishable from "not
+        # passed", so it cannot mean "size by reserve here" without changing
+        # the default path for every boot. On this path the reserve is
+        # therefore an explicit MiB number; the derived value is logged
+        # alongside it as the starting point.
+        try:
+            reserve_mib = int(raw)
+        except ValueError:
+            raise ValueError(
+                "--rank-auto-reserve-mib without --rank-gpu-id must be a MiB "
+                f"integer, got {self.rank_auto_reserve_mib!r}. ('auto' derives "
+                "a PER-GPU placement reserve and needs --rank-gpu-id with "
+                "--rank-tp-ratio auto.)"
+            ) from None
+        if reserve_mib <= 0 or reserve_mib >= gpu_mem:
+            raise ValueError(
+                f"--rank-auto-reserve-mib {reserve_mib} MiB does not leave a "
+                f"usable budget on a {gpu_mem} MiB device."
+            )
+
+        # Deliberately NOT rounded: round(x, 3) on a 32 GiB card discards up
+        # to 16 MiB of budget, and this path exists to stop giving budget away.
+        self.mem_fraction_static = (gpu_mem - reserve_mib) / gpu_mem
+        try:
+            derived_mib = self.derived_rank_auto_reserve_mib(gpu_mem)
+        except Exception:  # pragma: no cover - advisory only
+            derived_mib = None
+        logger.info(
+            "Reserve-based sizing (#332): device total %d MiB, pinned reserve "
+            "%d MiB (the #68 demand model derives %s) -> "
+            "--mem-fraction-static %.6f. The reserve is the ENTIRE headroom; "
+            "no further margin, cap or rounding is applied on top.",
+            gpu_mem,
+            reserve_mib,
+            f"{derived_mib} MiB" if derived_mib is not None else "no value here",
+            self.mem_fraction_static,
+        )
+
     def _check_perf_flags(self, ratio_was_perf: bool) -> None:
         """Fail fast on --rank-perf-* flags outside the auto-performance
         mode, and on out-of-range values inside it."""
@@ -7314,9 +7419,11 @@ class ServerArgs:
             if str(self.rank_auto_reserve_mib) != str(
                 ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB
             ):
-                raise ValueError(
-                    "--rank-auto-reserve-mib only applies with " "--rank-tp-ratio auto."
-                )
+                # #332: without --rank-gpu-id the reserve is not a per-rank
+                # placement budget, it is the whole card's headroom -- which
+                # is exactly the honest form of the sizing knob on a
+                # one-rank-per-GPU boot. Take it instead of rejecting it.
+                self._apply_reserve_based_mem_fraction()
             if self.uneven_kv_flag_active():
                 raise ValueError(
                     "--rank-kv-ratio (other than 'coupled') requires "
@@ -7381,9 +7488,7 @@ class ServerArgs:
                     "parallelism only (no PP, no DP attention)."
                 )
             if self.dual_group_lane_max_requests < 1:
-                raise ValueError(
-                    "--dual-group-lane-max-requests must be >= 1."
-                )
+                raise ValueError("--dual-group-lane-max-requests must be >= 1.")
             if self.dual_group_lane_spec:
                 if self.speculative_algorithm is None:
                     raise ValueError(
@@ -7401,9 +7506,7 @@ class ServerArgs:
                         "on this class of rig and is not offered on the lane."
                     )
                 if self.dual_group_lane_spec_steps < 1:
-                    raise ValueError(
-                        "--dual-group-lane-spec-steps must be >= 1."
-                    )
+                    raise ValueError("--dual-group-lane-spec-steps must be >= 1.")
                 # Round 7a: the ladder is parsed once, here, so a malformed
                 # rung list fails at argument time rather than at capture time
                 # (a capture failure costs a model load to find out about).
@@ -7438,8 +7541,7 @@ class ServerArgs:
             )
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
-                "--dual-group-lane-budget-mib only applies with "
-                "--dual-group-lane."
+                "--dual-group-lane-budget-mib only applies with " "--dual-group-lane."
             )
 
         # ---------------------------------------------------------------

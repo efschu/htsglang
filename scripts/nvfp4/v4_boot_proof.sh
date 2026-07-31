@@ -78,9 +78,53 @@
 #     bf16 shard. Run ARM 2 without `--speculative-algorithm`.
 # Details: docs/dev/INTEGRATION_R3_VALIDATION.md, section "NVFP4-Beleg".
 #
+# WHAT #332 CHANGED, AND WHAT TO EXPECT THIS TIME
+# -----------------------------------------------
+# All three findings above were code defects, and all three are fixed. This
+# script is the acceptance program for them. Every expectation below is
+# derived from the numbers the first run measured, so a miss is readable.
+#
+#   POSTEN 1 -- ARM 1 must now BOOT. A compressed-tensors NVFP4 layer whose
+#     UNSHARDED width misses the Marlin tile is loaded packed and materialised
+#     dense at load instead of aborting. Expect, on EVERY rank, one warning
+#     line per affected layer:
+#       "NVFP4: layer '...linear_attn.in_proj_ba' has no Marlin form at any TP
+#        size (the unsharded output width is 96, ...) ... DEQUANTISED ..."
+#     Count them: 48 GDN layers x 3 ranks = 144 lines, the same count the #316
+#     guard produced in its own card proof. Fewer means some layers took a
+#     kernel lane they cannot serve; more means an MLP layer fell into the
+#     fallback and the VRAM figures below will be wrong.
+#     Cost check: the dense b/a gates add ~16 MiB across the whole model.
+#     Anything larger is a routing bug, not a rounding difference.
+#
+#   POSTEN 2 -- ARM 1 runs WITH `--speculative-algorithm NEXTN`. The
+#     checkpoint's `ignore` list names the drafter's projections unfused; the
+#     fused-name match now resolves them, so the drafter is built dense.
+#     Expect: no #318 raise, ZERO unloaded draft parameters, and an accept
+#     length WELL above 1.0 -- 1.0052 with 0/573 accepted drafts is the exact
+#     signature of a drafter on uninitialised weights (#316's card proof), so
+#     it is the falsifier, not a disappointment. Read
+#     `meta_info.spec_accept_length`, never `spec_ema_accept_len`.
+#
+#   POSTEN 3 -- ARM 2 is sized by RESERVE, not by fraction. The first run left
+#     2.44 GiB unused at `--mem-fraction-static 0.90` (~80k KV tokens at that
+#     run's 31.9 KiB/token), so 153,007 was not the arm's ceiling; §5 puts the
+#     ceiling near 233k. `--rank-auto-reserve-mib <MiB>` now works without
+#     `--rank-gpu-id` and sets the budget to NVML total minus exactly that
+#     reserve. At the default 2048 MiB below, expect roughly
+#       153,007 + (3261 - 2048) MiB / 31.9 KiB ~= 192k tokens,
+#     i.e. +25 %, with weights unchanged at 18.81 GiB. Push the reserve lower
+#     to approach 233k -- that is deliberately the user's risk, no margin is
+#     added on top, and the VRAM corridor rule (>= 400 MiB free) is the floor
+#     to check afterwards. Note one interaction: on the mamba post-capture
+#     path the slack is floored by the pre-capture reserve, so a reserve below
+#     that floor stops buying tokens; the boot log names both.
+#
 # USAGE
 #   scripts/nvfp4/v4_boot_proof.sh <arm>   with arm in {tp3,solo,both}
 #   MODEL=/path/to/v4-checkpoint scripts/nvfp4/v4_boot_proof.sh both
+#   SOLO_RESERVE_MIB=1500 scripts/nvfp4/v4_boot_proof.sh solo
+#   NEXTN=0 scripts/nvfp4/v4_boot_proof.sh tp3      # posten-1-only control
 
 set -euo pipefail
 
@@ -101,6 +145,12 @@ PORT="${PORT:-30000}"
 OUT="${OUT:-/spinning/gpu-battery-results/nvfp4_v4_boot}"
 # Time-boxed, per the standing rule: bound the run by TIME, not by token count.
 RUN_SECONDS="${RUN_SECONDS:-20}"
+# #332 posten 3: the solo arm's ENTIRE headroom, in MiB. 0.90 of this card
+# withheld 3261 MiB; 2048 is the first honest step down from that. Lower it to
+# walk towards the ~233k ceiling -- nothing is added on top of what you name.
+SOLO_RESERVE_MIB="${SOLO_RESERVE_MIB:-2048}"
+# #332 posten 2: ARM 1 with speculation, which the ignore-match fix unblocks.
+NEXTN="${NEXTN:-1}"
 
 mkdir -p "$OUT"
 
@@ -146,11 +196,13 @@ COMMON=(
   --served-model-name Qwen3.6-27B-NVFP4
   --trust-remote-code
   --port "$PORT"
-  --mem-fraction-static 0.9
   --context-length -1
   # Mandatory on every launch_server call on this rig (rig-runbook.md 3).
   --enable-metrics
 )
+# Sizing is per arm now, not shared: ARM 1 keeps the per-GPU placement
+# reserves it always had, ARM 2 takes the #332 card-wide one. The two are
+# mutually exclusive with --mem-fraction-static by design.
 
 wait_ready() {
   local deadline=$((SECONDS + 900))
@@ -220,32 +272,55 @@ boot() {
 
 if [[ "$ARM" == "tp3" || "$ARM" == "both" ]]; then
   IFS=, read -r T0 T1 <<< "$THREES"
-  # ARM 1: the #291-S3 proof. Two Marlin ranks + one native-FP4 rank in one
-  # model, with the uneven plan that #323a makes tile-valid.
+  # ARM 1: the #291-S3 proof, now reachable. Two Marlin ranks + one native-FP4
+  # rank in one model, with the uneven plan that #323a makes tile-valid, the
+  # #332 dequant lane carrying the 96-row GDN gates that used to abort the
+  # load, and NEXTN on top now that the ignore match sees fused names.
+  SPEC=()
+  if [[ "$NEXTN" == "1" ]]; then
+    SPEC=(--speculative-algorithm NEXTN --speculative-num-steps 3
+          --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
+  fi
   CUDA_VISIBLE_DEVICES="${FIVE},${T0},${T1}" \
   boot v4_tp3_uneven \
     --tensor-parallel-size 3 \
     --rank-tp-ratio auto \
-    --rank-auto-reserve-mib 3000,2700,2700
+    --rank-auto-reserve-mib 3000,2700,2700 \
+    "${SPEC[@]}"
 fi
 
 if [[ "$ARM" == "solo" || "$ARM" == "both" ]]; then
-  # ARM 2: the collective-floor eraser. §6.2 expects ~17.9 GiB of weights and
-  # ~326k KV tokens on the 5090 alone. Grep the log for max_total_num_tokens
-  # and the weight footprint and put both against those two numbers.
+  # ARM 2: the collective-floor eraser, sized honestly. The first run got
+  # 18.81 GiB of weights and 153,007 KV tokens at --mem-fraction-static 0.90
+  # and left 2.44 GiB on the card; this arm names the headroom instead.
   CUDA_VISIBLE_DEVICES="${FIVE}" \
   boot v4_solo_5090 \
-    --tensor-parallel-size 1
+    --tensor-parallel-size 1 \
+    --rank-auto-reserve-mib "$SOLO_RESERVE_MIB"
 fi
 
 echo
-echo "=== what to read out of ${OUT} ==="
+echo "=== what to read out of ${OUT} (expectations from the 2026-07-31 beleg) ==="
 echo "  1. grep -E 'fp4|nvfp4|marlin|backend' *_server.log"
 echo "     ARM 1 must show TWO different FP4 lanes across the three ranks."
-echo "  2. grep -E 'max_total_num_tokens|KV Cache is allocated|weight' v4_solo_5090_server.log"
-echo "     expected ~17.9 GiB weights and ~326k tokens (FP8 leaves 78k)."
-echo "  3. diff the five coherence answers between the two arms."
+echo "  2. #332 posten 1 -- grep -c 'DEQUANTISED' v4_tp3_uneven_server.log"
+echo "     expected 144 (48 GDN layers x 3 ranks), each naming in_proj_ba and"
+echo "     the unsharded width 96. Zero means ARM 1 died the old death;"
+echo "     a count above 144 means an MLP layer fell into the dense lane."
+echo "  3. #332 posten 2 -- grep -E 'unloaded|accept' v4_tp3_uneven_server.log"
+echo "     expected: no #318 raise, zero unloaded draft parameters, and"
+echo "     meta_info.spec_accept_length well above 1.0. Exactly 1.0052 with"
+echo "     0 accepted drafts is the drafter-on-uninitialised-weights"
+echo "     signature -- that is the falsifier."
+echo "  4. #332 posten 3 -- grep -E 'max_total_num_tokens|Reserve-based sizing|weight' \\"
+echo "       v4_solo_5090_server.log"
+echo "     expected 18.81 GiB weights (unchanged) and, at the default"
+echo "     2048 MiB reserve, ~192k tokens against the first run's 153,007."
+echo "     The sizing line must report total - reserve with no extra margin."
+echo "     Then check the VRAM corridor: >= 400 MiB free after the boot."
+echo "  5. diff the five coherence answers between the two arms."
 echo "     Divergence is the mixed-arch W4A4 determinism risk (ANALYSE_321"
 echo "     §7 e), not a boot bug -- it needs the #50 battery, not a retry."
-echo "  4. ARM 1 prefill vs the FP8 baseline window: predicted -3.1 %."
+echo "     ARM 1 now boots, so §7(e) is finally answerable in one window."
+echo "  6. ARM 1 prefill vs the FP8 baseline window: predicted -3.1 %."
 echo "     A large POSITIVE delta falsifies the §5 cost model."

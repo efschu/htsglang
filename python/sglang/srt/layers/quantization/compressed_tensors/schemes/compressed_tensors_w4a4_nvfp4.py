@@ -32,7 +32,125 @@ from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CompressedTensorsW4A4Fp4"]
+__all__ = [
+    "CompressedTensorsW4A4Fp4",
+    "CompressedTensorsW4A4Fp4Dequant",
+    "NVFP4_BLOCK_SIZE",
+    "dequantize_nvfp4",
+    "nvfp4_marlin_unpackable_reason",
+]
+
+#: Elements sharing one FP8-E4M3 block scale in ``nvfp4-pack-quantized``.
+NVFP4_BLOCK_SIZE = 16
+
+#: The 16 E2M1 code points, indexed by nibble. Same table as
+#: ``kvfp4_tensor.E2M1_VALUES``, rebuilt locally because that one is pinned to
+#: a device at import time and this helper follows its input's device.
+_E2M1_CODE_POINTS = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def dequantize_nvfp4(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialise a compressed-tensors NVFP4 weight as a dense tensor.
+
+    ``weight_packed`` is ``[N, K // 2]`` uint8 with two E2M1 nibbles per byte,
+    LOW nibble first (element ``2*j`` in the low half of byte ``j``), which is
+    the layout ``fp4_quantize`` / ``break_fp4_bytes`` produce and consume.
+    ``weight_scale`` is ``[N, K // 16]`` FP8-E4M3, one scale per group of
+    ``NVFP4_BLOCK_SIZE`` input channels.
+
+    Scale direction: compressed-tensors stores ``weight_global_scale`` in the
+    QUANTISE direction (``FP8_E4M3_MAX * FP4_E2M1_MAX / amax``), so recovering
+    the original value DIVIDES by it -- the same convention the Marlin lane
+    handles by inverting the scale before handing it to the ModelOpt-shaped
+    helpers (see ``_process_weights_for_marlin``). Getting the direction wrong
+    does not crash, it scales the whole row block by ``global_scale**2``.
+
+    This reproduces exactly what the producer's quantiser encoded; it adds no
+    error of its own. The rounding loss is already baked into the four-bit
+    codes on disk.
+    """
+    if weight_packed.dtype != torch.uint8:
+        raise ValueError(
+            f"NVFP4 dequantisation expects uint8 packed weights, got "
+            f"{weight_packed.dtype}."
+        )
+    n, k_half = weight_packed.shape
+    k = k_half * 2
+    if weight_scale.shape != (n, k // NVFP4_BLOCK_SIZE):
+        raise ValueError(
+            f"NVFP4 dequantisation expects block scales of shape "
+            f"{(n, k // NVFP4_BLOCK_SIZE)} for a {(n, k)} weight, got "
+            f"{tuple(weight_scale.shape)}."
+        )
+
+    codes = torch.empty(n, k, dtype=torch.uint8, device=weight_packed.device)
+    codes[:, 0::2] = weight_packed & 0x0F
+    codes[:, 1::2] = (weight_packed >> 4) & 0x0F
+    lut = torch.tensor(
+        _E2M1_CODE_POINTS, dtype=torch.float32, device=weight_packed.device
+    )
+    values = lut[codes.long()].view(n, k // NVFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE)
+    values = values * weight_scale.to(torch.float32).unsqueeze(-1)
+    dense = values.view(n, k) / weight_global_scale.to(torch.float32)
+    return dense.to(out_dtype)
+
+
+def nvfp4_marlin_unpackable_reason(layer: torch.nn.Module) -> Optional[str]:
+    """Why NVFP4 Marlin can serve no shard of ``layer``, or None if it can.
+
+    Judged on the UNSHARDED geometry (``layer.output_size``), the width a TP=1
+    load would see -- available at ``get_quant_method`` time because
+    ``ColumnParallelLinear`` computes ``output_size_per_partition`` only after
+    ``LinearBase.__init__`` returns. Same verdict, same reasoning and the same
+    deliberate split as ``gptq_marlin_unpackable_reason`` (#316): a SHARD that
+    misses Marlin's tile is a shard-plan problem and stays a loud error, while
+    a module whose FULL output dimension misses the tile can never be served
+    by Marlin at any TP -- including TP=1, where there is no plan to blame.
+
+    Task #332, measured 2026-07-31 on ``ocicek/Qwen3.6-27B-NVFP4``: that
+    checkpoint's ``config_groups`` targets ``Linear`` wholesale, so the
+    gated-delta-net's merged b/a gate is quantised too. Its full width is
+    2 x 48 = 96 rows and ``GPTQ_MARLIN_MIN_THREAD_N`` is 64.
+
+    Unlike #316's GPTQ case, the tensor IS packed on disk here, so building the
+    layer dense-and-empty would leave it unloaded. The caller therefore routes
+    to ``CompressedTensorsW4A4Fp4Dequant`` instead of refusing.
+    """
+    from sglang.srt.layers.linear import LinearBase
+
+    if not isinstance(layer, LinearBase):
+        return None
+    output_size = getattr(layer, "output_size", None)
+    if not isinstance(output_size, int):
+        return None
+    if output_size % GPTQ_MARLIN_MIN_THREAD_N == 0:
+        return None
+    return (
+        f"the unsharded output width is {output_size}, not a multiple of the "
+        f"NVFP4 Marlin thread tile {GPTQ_MARLIN_MIN_THREAD_N}"
+    )
 
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
@@ -76,8 +194,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     ``_process_weights_for_marlin``).
     """
 
+    #: Overridden by ``CompressedTensorsW4A4Fp4Dequant``: with no kernel in the
+    #: picture the Marlin tile stops being a constraint, so ``create_weights``
+    #: must not apply it.
+    dequantize_on_load = False
+
     def __init__(self):
-        self.group_size = 16
+        self.group_size = NVFP4_BLOCK_SIZE
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -108,7 +231,11 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         # activation dtype off the layer and reject anything but fp16/bf16.
         layer.params_dtype = params_dtype
 
-        if self._use_marlin() and output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N:
+        if (
+            not self.dequantize_on_load
+            and self._use_marlin()
+            and output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N
+        ):
             # Two different causes end up here and they need different fixes,
             # so name which one this is. Measured 2026-07-31: the all-Linear
             # NVFP4 checkpoint ocicek/Qwen3.6-27B-NVFP4 quantises the GDN b/a
@@ -120,9 +247,10 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
                     f"The UNSHARDED width is {full_size}, which is itself not a "
                     f"multiple of {GPTQ_MARLIN_MIN_THREAD_N}, so no shard plan "
                     "can satisfy this check -- the checkpoint quantises a "
-                    "projection narrower than the Marlin tile. Serving it on a "
-                    "pre-Blackwell rank requires the projection to be excluded "
-                    "from quantisation, not a different --rank-tp-ratio."
+                    "projection narrower than the Marlin tile. "
+                    "CompressedTensorsConfig.get_linear_scheme routes such a "
+                    "layer to CompressedTensorsW4A4Fp4Dequant (#332); reaching "
+                    "this raise means the routing was bypassed."
                 )
             else:
                 cause = (
@@ -353,3 +481,100 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+class CompressedTensorsW4A4Fp4Dequant(CompressedTensorsW4A4Fp4):
+    """Load NVFP4, serve dense: the fallback for a projection with no tile.
+
+    Third lane of the compressed-tensors NVFP4 scheme, reached only through
+    ``nvfp4_marlin_unpackable_reason`` (task #332). The two kernel lanes need
+    an output width that is a multiple of ``GPTQ_MARLIN_MIN_THREAD_N`` (Marlin)
+    or a Blackwell card (native FP4). A checkpoint whose ``config_groups``
+    target ``Linear`` wholesale quantises narrow projections too -- on
+    Qwen3.5/3.6 the gated-delta-net's merged b/a gate, 96 rows against a
+    64-wide tile -- and no shard plan and no card can widen 96. Before this
+    lane the only outcomes were a load-time abort on every pre-Blackwell rank
+    or a checkpoint edit.
+
+    So: keep the packed parameters (the loader must still find somewhere to put
+    ``weight_packed`` / ``weight_scale`` -- unlike #316's GPTQ case, the tensor
+    IS on disk here), then materialise them once, at load, into a dense
+    ``weight`` in ``params_dtype`` and run ``F.linear``.
+
+    **This is not a lossy step.** ``dequantize_nvfp4`` reproduces exactly the
+    values the producer's quantiser encoded; the rounding error is already in
+    the four-bit codes on disk and dequantisation adds none of its own. What it
+    costs is VRAM: bf16 instead of ~4.5 bits per weight, for the layers that
+    take this lane. On Qwen3.6-27B those are the 48 GDN b/a gates, together
+    ~11.8 M parameters -- 23 MiB dense against 7 MiB packed. It is charged
+    against the layers that cannot be served otherwise, never against layers
+    a kernel can take.
+
+    Prior art. vLLM solves the same shape two ways, and this is a third:
+    ``EmulationNvFp4LinearKernel``
+    (``vllm/model_executor/kernels/linear/nvfp4/emulation.py``) is the terminal
+    entry of its NVFP4 kernel list and always reports support, but it
+    dequantises inside ``apply_weights``, i.e. on EVERY forward;
+    ``prepare_fp4_layer_for_marlin`` instead zero-pads N up to the tile
+    (``marlin_padded_nk``). Materialising once at load is strictly cheaper than
+    the first at the same numerics, and unlike the second it needs no
+    agreement between the padded buffer, the per-rank shard widths and the
+    column-parallel gather. Padding stays the better answer if these layers
+    ever stop being negligible in VRAM.
+    """
+
+    dequantize_on_load = True
+
+    def needs_device_kernel(self) -> bool:
+        # Dequantisation plus F.linear: no kernel, hence no capability floor.
+        return False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Per LOGICAL shard, with that shard's own global scale. The kernel
+        # lanes have to collapse the fused shards' scales with max() because
+        # one GEMM serves them all (and warn that it costs accuracy); this lane
+        # has no such constraint, so a fused qkv/gate_up/b+a layer is
+        # reconstructed exactly as the producer quantised it.
+        packed = layer.weight_packed
+        scales = layer.weight_scale
+        global_scales = layer.weight_global_scale.data.flatten()
+        widths = list(layer.logical_widths)
+        if len(global_scales) not in (1, len(widths)):
+            raise ValueError(
+                "NVFP4 dequantisation expected one weight_global_scale per "
+                f"logical shard ({len(widths)}) or a single shared one, got "
+                f"{len(global_scales)}."
+            )
+
+        pieces = []
+        row = 0
+        for index, width in enumerate(widths):
+            gs = global_scales[index if len(global_scales) > 1 else 0]
+            pieces.append(
+                dequantize_nvfp4(
+                    packed.data[row : row + width],
+                    scales.data[row : row + width],
+                    gs,
+                    layer.params_dtype,
+                )
+            )
+            row += width
+        dense = torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+
+        for name in (
+            "weight_packed",
+            "weight_scale",
+            "weight_global_scale",
+            "input_global_scale",
+        ):
+            if hasattr(layer, name):
+                delattr(layer, name)
+        layer.register_parameter("weight", Parameter(dense, requires_grad=False))
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return torch.nn.functional.linear(x, layer.weight, bias)

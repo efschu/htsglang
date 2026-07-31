@@ -60,11 +60,28 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
 
 
 # Known fused-linear -> shard names. Used as a fallback when the quant
-# config doesn't ship packed_modules_mapping (typical for HF FP8 configs).
-_FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
-    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-    "gate_up_proj": ["gate_proj", "up_proj"],
-}
+# config doesn't ship packed_modules_mapping (typical for HF FP8 configs, and
+# for every MTP/NEXTN draft architecture -- those classes carry no
+# packed_modules_mapping of their own, so _get_quantization_config hands their
+# quant config an empty table).
+#
+# A producer is free to write an exclusion list either way round: the AWQ
+# (auto-round) sibling of Qwen3.6-27B lists the GDN gates UNFUSED
+# (`linear_attn.in_proj_a` / `in_proj_b`) while the FP8 sibling lists the fused
+# `in_proj_ba` as well, and the NVFP4 sibling names the draft's attention and
+# MLP projections unfused (`mtp.layers.0.self_attn.q_proj`, ...). The runtime
+# builds all of them fused, so an entry that is not fusion-aware silently
+# misses and the layer is built quantised against a dense (or absent)
+# checkpoint tensor. Task #332.
+FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = MappingProxyType(
+    {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        # Qwen3.5/3.6 gated-delta-net (see Qwen3_5ForCausalLM.packed_modules_mapping)
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+)
 
 
 def is_layer_skipped(
@@ -81,7 +98,7 @@ def is_layer_skipped(
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
     effective_fused = (
-        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
+        fused_mapping if proj_name in fused_mapping else FALLBACK_FUSED_SHARDS
     )
     if proj_name in effective_fused:
         shard_prefixes = [

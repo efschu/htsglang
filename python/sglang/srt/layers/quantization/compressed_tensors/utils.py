@@ -9,6 +9,8 @@ from typing import Iterable, List, Mapping, Optional
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
+from sglang.srt.layers.quantization.utils import FALLBACK_FUSED_SHARDS
+
 
 def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
@@ -36,6 +38,18 @@ def should_ignore_layer(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
+    #
+    # `fused_mapping` is the MODEL CLASS's packed_modules_mapping, injected by
+    # _get_quantization_config. It is empty for any architecture that declares
+    # none -- every MTP/NEXTN draft class does exactly that, which is how a
+    # `ignore: [mtp.layers.0.self_attn.q_proj, ...]` list came to miss the
+    # draft's fused `mtp.layers.0.self_attn.qkv_proj` and build a quantised
+    # drafter against dense bf16 tensors (#332). Fall back to the same shared
+    # table `is_layer_skipped` (AWQ / FP8 / ModelOpt) already uses, so all
+    # three exclusion-list dialects resolve fused and unfused names alike.
+    if proj_name not in fused_mapping and proj_name in FALLBACK_FUSED_SHARDS:
+        fused_mapping = FALLBACK_FUSED_SHARDS
+
     if proj_name in fused_mapping and layer_name not in ignore:
         shard_proj_names = fused_mapping[proj_name]
 
