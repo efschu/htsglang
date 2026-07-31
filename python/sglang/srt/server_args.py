@@ -5046,8 +5046,48 @@ class ServerArgs:
         "accept no bytes before it is dropped (#344). The stream sends "
         "keepalives, so silence is the consumer's. Dropping a listener never "
         "touches the job: fine-tuning jobs are fire-and-forget by protocol. "
-        "Zero or negative disables the check.",
+        "Zero or negative disables the check. Shorthand for "
+        "--client-liveness-timeouts training_events=<seconds>, which wins if "
+        "both are given.",
     ] = 120.0
+
+    # -------------------------------------------------------------------------
+    # Universal client liveness (#344)
+    # -------------------------------------------------------------------------
+    client_liveness_timeouts: A[
+        Optional[str],
+        "Per-endpoint-class timeouts as '<class>=<seconds>,<class>=<seconds>'. "
+        "A class's timeout is how long a consumer may accept no bytes before "
+        "it is declared dead and what it holds -- KV blocks, a decoder, a VRAM "
+        "lease, a job slot -- is released. Classes: llm_stream, embedding, "
+        "video_stream, preview_tap, control, training_events, image_generation, "
+        "audio_speech, audio_transcription, realtime_session, registry_lease, "
+        "dashboard_sse. Zero or negative disables detection for that class. "
+        "Unset classes use their documented default; none of the defaults is "
+        "measured, see docs/dev/DESIGN_344_liveness.md.",
+    ] = None
+    client_liveness_poll_interval_s: A[
+        float,
+        "How often a liveness watchdog checks its stream. Never needs to be "
+        "finer than the shortest timeout in use; the streaming path itself "
+        "only stamps a float, so this costs one wakeup per attached client "
+        "per interval and nothing on the serving hot path.",
+    ] = 1.0
+    client_liveness_teardown_timeout_s: A[
+        float,
+        "How long releasing a dead consumer's resources may take before it is "
+        "escalated to a hard cancel. Bounded on purpose: a release that hangs "
+        "would leave exactly the held-forever state the check exists to end.",
+    ] = 30.0
+    client_liveness_grace_fraction: A[
+        float,
+        "Fraction of a class's timeout after which a quiet consumer enters the "
+        "grace window. During grace the client is not dropped, but what it "
+        "holds is published as reclaimable so the pressure staircase and the "
+        "idle tenant may take it rather than leaving it pinned. 0 puts a "
+        "consumer in grace as soon as it goes quiet; 1 disables the grace "
+        "window and keeps only the declare-dead step.",
+    ] = 0.25
 
     def __post_init__(self):
         """
@@ -5104,6 +5144,8 @@ class ServerArgs:
         self._handle_asr_validation()
         # Validate the idle training tenant's knobs.
         self._handle_training_tenant()
+        # Validate the per-endpoint-class client-liveness policy.
+        self._handle_client_liveness()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -12215,6 +12257,39 @@ class ServerArgs:
                 f"--training-model-root {self.training_model_root!r} is not a "
                 "directory."
             )
+
+    def _handle_client_liveness(self):
+        """Validate the #344 per-endpoint-class liveness policy. No mutation.
+
+        The spec string is parsed here rather than at first use so an unknown
+        class name or a typo'd number is a startup error. The alternative is a
+        server that boots, silently applies no timeout to the class the
+        operator meant to bound, and is discovered the next time a client dies
+        badly -- which is the failure this whole feature exists to end.
+        """
+        from sglang.srt.liveness import LivenessConfig
+
+        if self.client_liveness_poll_interval_s <= 0:
+            raise ValueError(
+                f"--client-liveness-poll-interval-s must be positive "
+                f"(got {self.client_liveness_poll_interval_s})."
+            )
+        if self.client_liveness_teardown_timeout_s <= 0:
+            raise ValueError(
+                f"--client-liveness-teardown-timeout-s must be positive "
+                f"(got {self.client_liveness_teardown_timeout_s}); it bounds "
+                "how long a release may take before it is hard-cancelled."
+            )
+        if not 0.0 <= self.client_liveness_grace_fraction <= 1.0:
+            raise ValueError(
+                f"--client-liveness-grace-fraction must be between 0.0 and 1.0 "
+                f"(got {self.client_liveness_grace_fraction}); it is a fraction "
+                "of each class's own timeout."
+            )
+        try:
+            LivenessConfig.parse(self.client_liveness_timeouts)
+        except ValueError as exc:
+            raise ValueError(f"--client-liveness-timeouts: {exc}") from None
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view

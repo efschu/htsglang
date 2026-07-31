@@ -2955,3 +2955,87 @@ place to stop it is its own checkpoint. `--training-save-steps` is therefore
 both the checkpoint interval and the amount of work a preemption can cost.
 The event log says so explicitly when it happens rather than leaving it to be
 inferred.
+
+## 11. Client liveness: dropping consumers that are gone (#344)
+
+Every long-lived attachment — token streams, video streams, training event
+taps, image and speech lane calls — is watched by one component with a
+per-endpoint-class timeout. A consumer that accepts no bytes for longer than
+its class allows is declared dead and what it held (KV blocks and a
+running-batch slot, a decoder pipeline, a job slot, a VRAM lease) is released.
+
+This is not about clients that disconnect: those were always handled, because
+Starlette throws into the response generator. It is about the client that
+neither closes nor reads — the socket stays open, back-pressure stalls the
+whole chain, and without a timeout the resources are held forever.
+
+Design note: `docs/dev/DESIGN_344_liveness.md`.
+
+### 11.1 Flags
+
+| Flag | Default | What it decides |
+|---|---|---|
+| `--client-liveness-timeouts` | unset | per-class table, `<class>=<seconds>,<class>=<seconds>`. Zero or negative disables detection for that class |
+| `--client-liveness-poll-interval-s` | `1.0` | how often a watchdog looks. One wakeup per attached client per interval; the streaming path itself only stamps a float |
+| `--client-liveness-teardown-timeout-s` | `30.0` | how long releasing a dead consumer's resources may take before it is hard-cancelled |
+| `--client-liveness-grace-fraction` | `0.25` | when a quiet consumer enters the grace window, as a fraction of its class timeout. `1` disables the grace window |
+| `--training-event-stream-timeout-s` | `120` | pre-existing #341-M1 flag; shorthand for `training_events=`. The general flag wins if both name the class |
+
+An unknown class name or a malformed number is a **startup** error, not a
+silently ignored line: a server that boots with no timeout on the class the
+operator meant to bound is the failure this feature exists to end.
+
+### 11.2 Classes and defaults
+
+```
+llm_stream=90  embedding=60  video_stream=300  preview_tap=15  control=60
+training_events=120  image_generation=900  audio_speech=300
+audio_transcription=120  realtime_session=60  registry_lease=120
+dashboard_sse=60
+```
+
+None of these is measured. `image_generation` and `audio_speech` are derived
+from the lanes' own forward timeouts and `registry_lease` from the ledger's
+`DEFAULT_LEASE_SECONDS` (a test asserts the last one cannot drift); the rest
+are judgements about what silence means for that consumer, each with its
+reasoning recorded in `DEFAULT_TIMEOUT_RATIONALE` in
+`python/sglang/srt/liveness/classes.py`.
+
+Example — a rig serving interactive chat and long batch exports:
+
+```bash
+--client-liveness-timeouts llm_stream=45,video_stream=0,preview_tap=10
+```
+
+`video_stream=0` turns detection off for that class entirely, which is a real
+choice for an export nobody is watching by design.
+
+### 11.3 Grace: what a quiet client's memory counts as
+
+Between "quiet" and "declared dead" an attachment is in **grace**. It is not
+dropped, but what it holds is published as reclaimable so the pressure
+staircase (#287) and the idle tenant (#341) can prefer those bytes over an
+actively used tenant's. If the consumer comes back, it goes straight back to
+active.
+
+The visible effect on this rig is in the ledger. A tenant whose consumer is a
+dead suspect is rendered with `[in grace, reclaimable]` and its bytes are
+summed separately:
+
+```bash
+python3 - <<'PY'
+import json
+from sglang.srt.registry.ledger import MIB, ReservationStore
+store = ReservationStore()
+for path in sorted(store.root.glob("*.json")):
+    uuid = json.loads(path.read_text())["card_uuid"]
+    card = store.read(uuid)
+    print(card.render())
+    print("  reclaimable now:", card.grace_bytes // MIB, "MiB")
+PY
+```
+
+Grace never shortens a lease. A tenant in grace is still running and still
+holds its device memory; expiring its lease early would let the reaper hand
+the same bytes to a second tenant while they are in use. The flag is advisory
+and the reclamation decision stays with the ladder that owns the policy.

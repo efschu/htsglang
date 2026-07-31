@@ -15,8 +15,8 @@ here is about a configured duration rather than about a state.
 import asyncio
 import unittest
 
-from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
 from sglang.srt.video_enhance.chain import StageKind
+from sglang.srt.video_enhance.frame_math import PixelFormat, Resolution
 from sglang.srt.video_enhance.frames import Frame, StageBase
 from sglang.srt.video_enhance.liveness import (
     DEFAULT_TIMEOUTS_S,
@@ -94,9 +94,12 @@ class ConfigParsingTest(CustomTestCase):
         )
 
     def test_an_unknown_class_is_refused_by_name(self):
+        # ``llm_stream`` stood here until #344b made it a real class. Any name
+        # that is not in the table has to fail the same way, so the test now
+        # uses one that is not going to be adopted later.
         with self.assertRaises(ValueError) as ctx:
-            LivenessConfig.parse("llm_stream=5")
-        self.assertIn("llm_stream", str(ctx.exception))
+            LivenessConfig.parse("telepathy_stream=5")
+        self.assertIn("telepathy_stream", str(ctx.exception))
 
     def test_a_non_numeric_timeout_is_refused(self):
         with self.assertRaises(ValueError):

@@ -32,14 +32,16 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import AsyncIterator
 
-from sglang.srt.video_enhance.chain import ChainError, ChainRequest
-from sglang.srt.video_enhance.engine_cache import EngineCache
-from sglang.srt.video_enhance.frame_math import Resolution
-from sglang.srt.video_enhance.liveness import (
+from sglang.srt.liveness import (
+    ClaimKind,
     ConsumerWatchdog,
     EndpointClass,
     LivenessConfig,
+    ResourceClaim,
 )
+from sglang.srt.video_enhance.chain import ChainError, ChainRequest
+from sglang.srt.video_enhance.engine_cache import EngineCache
+from sglang.srt.video_enhance.frame_math import Resolution
 from sglang.srt.video_enhance.mux import (
     MediaInfo,
     MuxError,
@@ -315,6 +317,13 @@ class VideoEnhanceService:
             job_id=job_id,
             policy=self.liveness.policy_for(EndpointClass.VIDEO_STREAM),
             release=release,
+            # #344: what this stream holds, in the terms the reclamation
+            # ladder thinks in. Declaring it is what puts the job's bytes on
+            # the ladder while the consumer is a dead suspect instead of
+            # leaving them pinned for the full 300 s window. Without a card
+            # UUID there is no ledger entry to point at, so the claim carries
+            # only the local pipeline and the ledger bridge skips it.
+            claims=self._stream_claims(job),
         )
         job.watchdog = watchdog
         watchdog.start()
@@ -341,6 +350,32 @@ class VideoEnhanceService:
             self._close_stages(stages)
         # The trailer carries the drop count. A dropped frame is never silent.
         job.executor.stats.dropped = executor.rings.dropped + bridge.stats.dropped
+
+    def _stream_claims(self, job) -> tuple[ResourceClaim, ...]:
+        """What one enhance stream holds, for the #344 grace registry.
+
+        The pipeline claim is always there. The VRAM claim only when the
+        tenant is configured against a specific card, because the ledger
+        addresses an entry by (card UUID, tenant id) and a claim missing
+        either coordinate cannot be published.
+        """
+        claims = [
+            ResourceClaim(kind=ClaimKind.PIPELINE, key=job.job_id),
+            ResourceClaim(kind=ClaimKind.JOB_SLOT, key=job.job_id),
+        ]
+        reserved_mib = getattr(
+            getattr(job.planned, "reservation", None), "total_mib", 0
+        )
+        if self.config.card_uuid and reserved_mib:
+            claims.append(
+                ResourceClaim(
+                    kind=ClaimKind.VRAM_LEASE,
+                    key=str(self.config.card_uuid),
+                    nbytes=int(reserved_mib) * 1024 * 1024,
+                    tenant_id=str(self.config.tenant_id),
+                )
+            )
+        return tuple(claims)
 
     def _make_remuxer(
         self, body: EnhanceRequestBody, media_info: MediaInfo | None
@@ -384,7 +419,9 @@ class VideoEnhanceService:
             if callable(close):
                 try:
                     close()
-                except Exception:  # noqa: BLE001 - one bad stage must not block the rest
+                except (
+                    Exception
+                ):  # noqa: BLE001 - one bad stage must not block the rest
                     continue
 
     # -- introspection ----------------------------------------------------

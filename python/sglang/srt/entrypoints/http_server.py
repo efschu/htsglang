@@ -119,6 +119,7 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.liveness import guard_generate_stream
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -134,7 +135,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
-    VramBudgetReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -154,6 +154,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+    VramBudgetReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -274,17 +275,59 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
-def training_liveness_config(server_args: ServerArgs):
-    """#344 policy for the fine-tuning event stream, from the server flag."""
-    from sglang.srt.video_enhance.liveness import EndpointClass, LivenessConfig
+def client_liveness_config(server_args: ServerArgs):
+    """The #344 per-endpoint-class policy, assembled from the server flags.
 
-    return LivenessConfig(
-        timeouts_s={
-            EndpointClass.TRAINING_EVENTS.value: float(
-                server_args.training_event_stream_timeout_s
-            )
-        }
+    ``--training-event-stream-timeout-s`` predates the general flag and stays
+    supported as shorthand for one class. The general flag wins where both
+    name the same class, because an operator who wrote out an explicit
+    per-class table meant it.
+    """
+    from sglang.srt.liveness import EndpointClass, LivenessConfig
+
+    config = LivenessConfig.parse(
+        server_args.client_liveness_timeouts,
+        poll_interval_s=float(server_args.client_liveness_poll_interval_s),
+        teardown_timeout_s=float(server_args.client_liveness_teardown_timeout_s),
+        grace_fraction=float(server_args.client_liveness_grace_fraction),
     )
+    config.timeouts_s.setdefault(
+        EndpointClass.TRAINING_EVENTS.value,
+        float(server_args.training_event_stream_timeout_s),
+    )
+    return config
+
+
+def install_client_liveness(server_args: ServerArgs):
+    """Install the process-wide liveness policy and its ledger bridge (#344).
+
+    Two globals, both write-once at startup: the policy, which the streaming
+    guards three layers down read instead of being handed a config through
+    every constructor, and the grace bridge, which mirrors "this tenant's
+    consumer went quiet" onto the ledger so out-of-process reclaimers can see
+    it. A rig without a writable ledger keeps the policy and loses only the
+    cross-process view.
+    """
+    from sglang.srt.liveness import (
+        global_attachment_registry,
+        set_global_liveness_config,
+    )
+
+    config = client_liveness_config(server_args)
+    set_global_liveness_config(config)
+    try:
+        from sglang.srt.liveness import attach_ledger_grace_bridge
+        from sglang.srt.registry.ledger import ReservationStore
+
+        attach_ledger_grace_bridge(global_attachment_registry(), ReservationStore())
+    except Exception as exc:  # noqa: BLE001 - reporting, not correctness
+        logger.info(
+            "client liveness: no VRAM ledger to publish grace into (%s: %s); "
+            "detection and release are unaffected",
+            type(exc).__name__,
+            exc,
+        )
+    return config
 
 
 def build_training_service(server_args: ServerArgs):
@@ -363,6 +406,11 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    # Universal client liveness (#344). Installed before the handlers, because
+    # every streaming handler below reads the process-wide policy when it puts
+    # a watchdog on its response.
+    liveness_config = install_client_liveness(server_args)
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -407,7 +455,7 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_files = OpenAIServingFiles(training_service)
     fast_api_app.state.openai_serving_fine_tuning = OpenAIServingFineTuning(
         training_service,
-        liveness=training_liveness_config(server_args),
+        liveness=liveness_config,
     )
 
     # Initialize Ollama-compatible serving handler
@@ -977,10 +1025,18 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+        # #344: the background abort task only runs once the response body
+        # ends, which for a client that stopped reading without closing is
+        # never. The watchdog is what bounds that case; the background task
+        # stays for the ordinary end-of-stream path.
+        return guard_generate_stream(
+            StreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+                background=_global_state.tokenizer_manager.create_abort_task(obj),
+            ),
+            tokenizer_manager=_global_state.tokenizer_manager,
+            obj=obj,
         )
     else:
         try:
@@ -1937,7 +1993,9 @@ async def openai_v1_images_edits(
         "response_format": response_format,
         "user": user,
     }
-    return await raw_request.app.state.openai_serving_images.edits(form, files, model)
+    return await raw_request.app.state.openai_serving_images.edits(
+        form, files, model, raw_request
+    )
 
 
 @app.post("/v1/images/variations")
@@ -1954,7 +2012,9 @@ async def openai_v1_images_variations(
 async def openai_v1_audio_speech(raw_request: Request):
     """OpenAI-compatible text-to-speech. Routed to a speech lane when one exists."""
     body = await raw_request.json()
-    return await raw_request.app.state.openai_serving_speech.create_speech(body)
+    return await raw_request.app.state.openai_serving_speech.create_speech(
+        body, raw_request
+    )
 
 
 ##### Files and fine-tuning (#341-M1) #####
@@ -2224,10 +2284,18 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
 
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):
-        return StreamingResponse(
-            result,
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        # #344: this route never had an abort path at all -- not even the
+        # two-second background task the other OpenAI-shaped streams carry --
+        # so until now a client that hung up mid-stream held its KV blocks
+        # until the generation reached EOS on its own.
+        return guard_generate_stream(
+            StreamingResponse(
+                result,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            ),
+            tokenizer_manager=_global_state.tokenizer_manager,
+            rids=[request.request_id] if getattr(request, "request_id", None) else None,
         )
 
     return result
