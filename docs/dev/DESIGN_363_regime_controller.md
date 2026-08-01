@@ -1090,3 +1090,53 @@ boots, and gates 1+2 will need re-recording when it lands.
 
 `spread_veto_pct = 25` gets the same verdict for an ordinary reason: the
 measured spread peaked at 12.5 %, so the veto never fires.
+
+---
+
+## 16. Gate 3 run (2026-08-01): NOT PASSED, four verdicts, three predicted
+
+Two identical FP8 boots, identical workload flags. Preceded by the #384
+permanent fork-wheel reinstall (runbook §2.1), verified in both directions
+including the can-fail proof: `require_int8_arm(..., available=False)` refuses
+and names the wheel. The shadowing pypi `sgl-kernel 0.3.21` dist is gone from
+CT999; only `sglang-kernel 0.4.4` remains, provenance sha256 matching the pin.
+
+### 16.1 The result
+
+`decode_share` band **0** over 29 paired samples, so `enter_decode = 0.90`
+CLEARS. `enter_prefill`, `kv_ascend_mark` and `spread_veto_pct` all UNREACHED
+— the three §6 predicted in advance, confirmed on two real boots and recorded
+as found. Nothing was chased into existence and no constant was re-tuned.
+
+The arms were reproducible to a degree worth stating: **both produced exactly
+29 active boundaries**, peak occupancy 0.1648 against 0.1649, and all three
+ranks of arm A recorded zero desyncs.
+
+### 16.2 The two ARMS_DISSIMILAR results are a method finding
+
+`occupancy` and `queued_prompt_tokens` are present on EVERY boundary — an idle
+window reports occupancy `0.0`, a real value and not an absence. So §15.1's
+"drop the absent samples" does not drop idle windows for these two, and the
+arms' different idle lengths (19 402 vs 15 504 boundaries) pair a quiet
+stretch of one against a busy stretch of the other.
+
+The guard worked exactly as designed: it refused to publish a `0.1649`
+"occupancy noise floor" that is really the entire signal range. Without it the
+report would have shipped a number that looks like a measurement and is an
+alignment artifact.
+
+The fix is one line of method — restrict these two signals to ACTIVE
+boundaries, as the shares already are. **Deliberately not applied in the same
+breath as reading the result**: it is a method change motivated by looking at
+the data, and changing the instrument to improve the answer it just gave is
+the failure this project keeps naming. It should be made as its own decision,
+stated, and the same two traces re-analysed — no cards needed.
+
+### 16.3 A signal that is not stable across boots
+
+`rank_ms_spread_pct` peaked at **0.61 %** here against **12.5 %** in the
+re-run of §14 — same recipe, same workload, different boot. Its within-pair
+band is 0.449 on a max of 0.614, i.e. large relative to the signal itself.
+Whatever `spread_veto_pct` eventually becomes has to respect that, and the
+current 25 is not merely unreached but an order of magnitude off the observed
+range.
