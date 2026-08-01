@@ -158,6 +158,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        sliding_window_size: int = -1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -238,6 +239,12 @@ class LlamaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            # #378: -1 (the RadixAttention default) means NO window, so every
+            # existing Llama-derived caller is byte-identical. A derived model
+            # whose config declares a sliding window passes it here, which is
+            # the same plumbing Gemma4 uses -- the window has to reach
+            # RadixAttention or nothing applies it.
+            sliding_window_size=sliding_window_size,
         )
 
     def forward_prepare_native(self, positions, hidden_states):
