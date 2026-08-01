@@ -40,6 +40,8 @@ Known two-segment assumptions are named in the slice report, not hidden.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import sys
@@ -1991,6 +1993,13 @@ class DualGroupLane:
                     # so "re-seeded against the target" and "not re-seeded" are
                     # two arms of ONE boot on the same token ids.
                     "draft_reseed": job.get("draft_reseed"),
+                    # #404: a label the caller puts on the job so the pool
+                    # checksum records say WHICH arm produced them. The lane
+                    # never reads it; it only travels, which is the point -- a
+                    # jsonl whose lines cannot be attributed to an arm has to
+                    # be joined by arrival order, and arrival order is exactly
+                    # what a concurrent lane does not guarantee.
+                    "probe_tag": job.get("probe_tag"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -2516,6 +2525,320 @@ class DualGroupLane:
         for i in range(min(int(n_emitted), rows)):
             self._record_margin(job, self._top2_margin(logits[i : i + 1]))
 
+    # -- per-round pool checksum probe (env-gated, off by default) ---------
+    #
+    # #404. The bracket window falsified the VOLUME story for the pool-axis
+    # rollback -- 18 arms, 738 rejected candidate rows, a flat dose response --
+    # and left the instrument where it started: "the tokens diverged somewhere
+    # downstream" is a detection, not a localisation. This turns it into one.
+    # After every COMMITTED round the lane hashes the three surfaces a rejected
+    # candidate can leave residue in, and a no-spec job standing at the SAME
+    # committed position must produce the same hashes. A mismatch names the
+    # surface and the round instead of the token index of a downstream flip.
+    #
+    # The surfaces, and why each boundary is where it is:
+    #
+    #   ``map``   ``req_to_token[idx, :committed_len]`` -- the slot mapping the
+    #             round committed. The FREED TAIL is excluded deliberately: the
+    #             verify writes ``d`` candidate pointers into the row and frees
+    #             only the rejected candidates' SLOTS, leaving their pointers
+    #             behind (`_verify_by_target_verify`). Those stale pointers
+    #             differ between a speculative and a non-speculative job by
+    #             construction, so hashing them would make every arm red and
+    #             carry no information at all. ``SGLANG_LANE_POOL_CHECKSUM_TAIL``
+    #             points the probe at the tail instead, which is the probe's own
+    #             can-fail arm: an instrument that cannot be pointed at the
+    #             wrong place and shown to miss has not been calibrated.
+    #   ``kv``    the KV pool rows those committed slots point to -- key and
+    #             value, every full-attention layer. This is the surface the
+    #             rollback is accused of leaking into.
+    #   ``conv`` / ``ssm``   the request's PERSISTENT recurrent state, hashed
+    #             apart so a GDN-carrier and a KV-carrier separate on sight.
+    #             ``MambaPool.SpeculativeState``'s per-draft-step
+    #             ``intermediate_*`` scratch is NOT hashed: it is the state
+    #             axis' equivalent of the freed tail, holding the last
+    #             candidate's state whatever was accepted, and
+    #             ``update_mamba_state_after_mtp_verify`` is what moves the
+    #             accepted step out of it into the two buffers above.
+    #
+    # TWO READINGS come out of one record set, and the cheaper one needs no
+    # reference job at all:
+    #
+    #   APPEND-ONLY (within a job). Every record also carries the digest of the
+    #   prefix that was already committed BEFORE the round -- ``map_stable`` and
+    #   ``kv_stable``. Those must equal the PREVIOUS record's ``map`` / ``kv``.
+    #   A rejected candidate leaking into a row the lane had already committed
+    #   breaks that equality at the round it happened, in one job, with no
+    #   second run to align against. It is free: a second pass over the host
+    #   copies the full-prefix digest already paid for, not a second D2H.
+    #
+    #   CROSS-JOB (spec against no-spec). ``kv`` / ``conv`` / ``ssm`` join on
+    #   ``committed_len``, which both paths maintain identically. ``map`` does
+    #   NOT join across jobs and is not meant to: it hashes physical slot ids,
+    #   which the allocator hands out differently to two jobs even when both are
+    #   correct.
+    #
+    # COST, stated rather than implied. One D2H of the committed prefix per
+    # round, per full-attention layer: at 24 layers x 8 kv heads x 128 dims of
+    # fp8 that is ~48 KiB per committed token, so a 700-token position costs
+    # ~33 MiB of device-to-host traffic in that one round and the traffic grows
+    # linearly with the position. It is off by default and it must never be on
+    # while a timing table is being produced. What it does NOT do is enter
+    # ``round_ms``: every call site sits after the round's wall clock has been
+    # taken, so the per-round timings a checksum run reports stay comparable to
+    # a clean run's even though the job's total duration does not.
+    #
+    # ORDERING. The hash reads device memory the verify forward wrote, so on
+    # the captured path it must land after the REPLAY, never inside a capture.
+    # Both are enforced rather than argued: an event recorded on the lane's own
+    # stream is synchronized before the first read, and a stream that is
+    # capturing is refused outright. Capture happens once inside
+    # ``init_cuda_graphs`` with no job in flight, so the second guard is a
+    # belt-and-braces assertion of a structural property.
+    def _pool_checksum_on(self) -> bool:
+        return bool(os.environ.get("SGLANG_LANE_POOL_CHECKSUM"))
+
+    @staticmethod
+    def _pool_checksum_tail() -> int:
+        """Width of the FREED TAIL the can-fail arm hashes instead (0 = off)."""
+        try:
+            return int(os.environ.get("SGLANG_LANE_POOL_CHECKSUM_TAIL") or 0)
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _pool_cpu(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().contiguous().cpu()
+
+    @staticmethod
+    def _pool_feed(h, t: torch.Tensor) -> None:
+        """Feed a CPU tensor to ``h`` as its RAW bytes, shape and dtype first.
+
+        Bytes, not a float reduction: the question is whether two runs wrote
+        the same values, and a sum over a differently-ordered set of the same
+        magnitudes can collide. Shape and dtype go in as well so a surface that
+        changed size cannot hash equal to one that did not.
+        """
+        h.update(f"|{tuple(t.shape)}|{t.dtype}|".encode())
+        flat = t.reshape(-1)
+        try:
+            raw = flat.view(torch.uint8)
+        except RuntimeError:
+            # A dtype torch declines to reinterpret (rare, and never on the
+            # kv/state dtypes this lane uses). Widening is injective on
+            # everything but NaN payloads, which no pool row carries.
+            raw = flat.to(torch.float32).view(torch.uint8)
+        h.update(raw.numpy().tobytes())
+
+    @classmethod
+    def _pool_digest(cls, *tensors) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        for t in tensors:
+            if t is None:
+                h.update(b"|none|")
+            else:
+                cls._pool_feed(h, cls._pool_cpu(t))
+        return h.hexdigest()
+
+    def _pool_checksum_kv_pool(self):
+        """The lane target's KV cache, via the allocator that owns it."""
+        alloc = getattr(self.runner, "token_to_kv_pool_allocator", None)
+        getter = getattr(alloc, "get_kvcache", None)
+        return getter() if getter is not None else None
+
+    @staticmethod
+    def _pool_checksum_kv_layers(kv_pool) -> List[int]:
+        """The layer ids ``get_key_buffer`` accepts on this pool.
+
+        A hybrid GDN pool holds KV for the FULL-ATTENTION layers only and
+        refuses any other id by name; a dense pool numbers its layers from
+        ``start_layer``. Asking the pool rather than the model is what keeps
+        this correct for both without a family switch.
+        """
+        mapping = getattr(kv_pool, "full_attention_layer_id_mapping", None)
+        if mapping:
+            return sorted(int(k) for k in mapping)
+        start = int(getattr(kv_pool, "start_layer", 0) or 0)
+        num = int(getattr(kv_pool, "layer_num", 0) or 0)
+        return list(range(start, start + num))
+
+    def _pool_checksum_kv(self, kv_pool, index, stable: int, per_pos: bool):
+        """Digests of the KV rows ``index`` points at.
+
+        Returns ``(digest, stable_digest, per_position)``. ``stable_digest``
+        covers only the first ``stable`` rows -- the positions that were
+        ALREADY committed before this round -- and it costs nothing extra: it
+        is a second pass over the same host copies, not a second D2H. That
+        second digest is what makes the probe self-sufficient. Comparing it
+        against the PREVIOUS round's full digest asks the append-only question
+        directly -- did anything this round wrote or freed change a row the
+        lane had already committed? -- and answers it without a reference job,
+        at the round it happened.
+        """
+        layers = self._pool_checksum_kv_layers(kv_pool)
+        rows: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        h = hashlib.blake2b(digest_size=16)
+        hs = hashlib.blake2b(digest_size=16)
+        for layer_id in layers:
+            k = self._pool_cpu(kv_pool.get_key_buffer(layer_id)[index])
+            v = self._pool_cpu(kv_pool.get_value_buffer(layer_id)[index])
+            self._pool_feed(h, k)
+            self._pool_feed(h, v)
+            if stable > 0:
+                self._pool_feed(hs, k[:stable])
+                self._pool_feed(hs, v[:stable])
+            if per_pos:
+                rows.append((k, v))
+        digest = h.hexdigest()
+        stable_digest = hs.hexdigest() if stable > 0 and layers else None
+        if not rows:
+            return digest, stable_digest, None
+        per: List[str] = []
+        for p in range(int(index.shape[0])):
+            hp = hashlib.blake2b(digest_size=8)
+            for k, v in rows:
+                self._pool_feed(hp, k[p])
+                self._pool_feed(hp, v[p])
+            per.append(hp.hexdigest())
+        return digest, stable_digest, per
+
+    def _pool_checksum_state(self, job):
+        """(conv digest, ssm digest) for THIS request's persistent state."""
+        req = job.get("_req")
+        pool = getattr(self.runner, "req_to_token_pool", None)
+        mamba_pool = getattr(pool, "mamba_pool", None)
+        cache = getattr(mamba_pool, "mamba_cache", None)
+        slot = getattr(req, "mamba_pool_idx", None)
+        if cache is None or slot is None:
+            # A family without recurrence has no such surface, and saying so
+            # with None is not the same as saying it hashed empty.
+            return None, None
+        slot = int(slot)
+        conv = self._pool_digest(*[c[:, slot] for c in cache.conv])
+        ssm = self._pool_digest(cache.temporal[:, slot])
+        return conv, ssm
+
+    @staticmethod
+    def _pool_committed_len(job) -> int:
+        """How many positions this job has COMMITTED, on either path.
+
+        ``_kv_len`` is the speculative path's own counter; a non-speculative
+        job never sets it, and for that side the count is the prompt plus one
+        per decode step (the last sampled token was never written to the pool
+        -- the same arithmetic ``_finish`` frees by). The two agree at every
+        position on a speculative job, which is what makes the field usable as
+        the JOIN KEY between a spec and a no-spec run.
+        """
+        n = job.get("_kv_len")
+        if n is not None:
+            return int(n)
+        return len(job["input_ids"]) + max(0, len(job["output_ids"]) - 1)
+
+    def _pool_checksum_path(self) -> Optional[str]:
+        """Where this lane/rank writes its jsonl, or None.
+
+        The env value is a PREFIX, not a filename: under TP every rank runs
+        this code with the same environment, and one shared file would
+        interleave lines from processes that are not even at the same round.
+        """
+        prefix = os.environ.get("SGLANG_LANE_POOL_CHECKSUM_PATH")
+        if not prefix:
+            return None
+        rank = int(getattr(self.runner, "tp_rank", 0) or 0)
+        return f"{prefix}.lane{self.lane_id}.rank{rank}.jsonl"
+
+    def _record_pool_checksum(self, job, *, path: str, n_accept=None) -> None:
+        """One record per committed round. Never raises into the lane."""
+        if not self._pool_checksum_on():
+            return
+        capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+        try:
+            if capturing is not None and capturing():
+                return
+        except Exception:
+            pass
+        t0 = time.perf_counter()
+        try:
+            if self.stream is not None:
+                # AFTER the replay: an event on the lane's own stream, waited
+                # on before the first device read. The forward helpers already
+                # synchronize this stream, so in practice this returns at once
+                # -- it is here so the ordering is a property of the probe and
+                # not of what happens to call it.
+                event = torch.cuda.Event()
+                event.record(self.stream)
+                event.synchronize()
+            n_committed = self._pool_committed_len(job)
+            batch = job.get("_batch")
+            idx = job.get("_req_pool_idx")
+            if batch is None or idx is None or n_committed <= 0:
+                return
+            row = batch.req_to_token_pool.req_to_token[int(idx)]
+            tail = self._pool_checksum_tail()
+            if tail > 0:
+                lo = n_committed
+                hi = min(int(row.shape[0]), n_committed + tail)
+            else:
+                lo, hi = 0, n_committed
+            slots = row[lo:hi]
+            # The prefix this round INHERITED. Under the freed-tail can-fail
+            # arm there is no such prefix, so the append-only digests are
+            # withheld rather than computed over a region they do not describe.
+            prev_len = int(job.get("_pool_prev_len") or 0)
+            stable = 0 if tail > 0 else max(0, min(prev_len, hi - lo))
+            per_pos = bool(os.environ.get("SGLANG_LANE_POOL_CHECKSUM_PER_POS"))
+            kv_pool = self._pool_checksum_kv_pool()
+            kv_digest = kv_stable = kv_positions = None
+            if kv_pool is not None and hi > lo:
+                kv_digest, kv_stable, kv_positions = self._pool_checksum_kv(
+                    kv_pool, slots.to(torch.int64), stable, per_pos
+                )
+            conv, ssm = self._pool_checksum_state(job)
+            records = job.setdefault("_pool_checksums", [])
+            rec: Dict[str, Any] = {
+                "tag": job.get("probe_tag"),
+                "lane": self.lane_id,
+                "rank": int(getattr(self.runner, "tp_rank", 0) or 0),
+                "round": len(records),
+                "path": path,
+                "n_accept": n_accept,
+                "rung": int(job.get("_rung") or 0) if path == "spec" else 0,
+                "committed_len": n_committed,
+                "prev_committed_len": prev_len,
+                "kv_len": job.get("_kv_len"),
+                "emitted": len(job.get("output_ids") or []),
+                "region": "freed_tail" if tail > 0 else "committed_prefix",
+                "map": self._pool_digest(slots),
+                "map_stable": (
+                    self._pool_digest(slots[:stable]) if stable > 0 else None
+                ),
+                "kv": kv_digest,
+                "kv_stable": kv_stable,
+                "conv": conv,
+                "ssm": ssm,
+            }
+            if kv_positions is not None:
+                rec["kv_pos"] = kv_positions
+            rec["probe_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+            job["_pool_prev_len"] = n_committed
+            records.append(rec)
+            out_path = self._pool_checksum_path()
+            if out_path:
+                with open(out_path, "a") as handle:
+                    handle.write(json.dumps(rec) + "\n")
+        except Exception:
+            # A diagnostic that can kill the job it is diagnosing is worse than
+            # no diagnostic; the failure is loud in the log and the round goes
+            # on. Once, so a per-round fault cannot flood the boot.
+            if not getattr(self, "_pool_checksum_failed", False):
+                self._pool_checksum_failed = True
+                logger.exception(
+                    "dual-group lane %d: the pool checksum probe failed; it is "
+                    "disabled for the rest of this process.",
+                    self.lane_id,
+                )
+            os.environ.pop("SGLANG_LANE_POOL_CHECKSUM", None)
+
     def _timed_forward_raw(self, batch, capture_mode=None):
         """A lane forward that returns the LOGITS OUTPUT instead of sampled
         ids -- the verify path needs the per-candidate argmax and the hidden
@@ -2616,8 +2939,6 @@ class DualGroupLane:
         return bool(os.environ.get("SGLANG_LANE_SPEC_DEBUG"))
 
     def _dbg(self, tag: str, payload: dict) -> None:
-        import json
-
         logger.info("[lane-spec-dbg] %s %s", tag, json.dumps(payload, default=str))
 
     def _dbg_prefill_rows(self, out, input_ids):
@@ -4000,6 +4321,11 @@ class DualGroupLane:
         # across the decode preparations.
         job["_req"] = batch.reqs[0]
         job["_req_pool_idx"] = int(batch.reqs[0].req_pool_idx)
+        # #404 anchor record. Two jobs are only comparable from a position they
+        # both reached identically; if the PROMPT already hashes differently
+        # every downstream record is noise, and without this record that would
+        # be read as a round-1 divergence.
+        self._record_pool_checksum(job, path="prefill")
 
     def _choose_rung(self, job) -> int:
         """The chain length for the NEXT round of this job.
@@ -4016,8 +4342,21 @@ class DualGroupLane:
             self.spec_policy.adaptive = (
                 bool(adaptive) and len(self.spec_policy.rungs) > 1
             )
-        if job.get("spec_steps") is not None:
-            ctx["rung"] = int(job["spec_steps"])
+        pin = job.get("spec_steps")
+        if isinstance(pin, (list, tuple)):
+            # #404: a per-round SCHEDULE, cycled. A scalar pin is constant for
+            # the whole job, so a pinned job can never be MIXED-RUNG -- and the
+            # mixed shape is the only one that reaches the READ side of the
+            # ``_kv_len`` advance (a verify round taking ``n_cached`` right
+            # after a K = 0 round, ``727bff334a``). Reaching it through the
+            # adaptive policy instead would make the measurement depend on what
+            # the policy happened to decide; ``[0, 1]`` reaches it on every
+            # second round, in a fixed order, on any boot.
+            if pin:
+                index = len(job.get("_rungs") or [])
+                ctx["rung"] = int(pin[index % len(pin)])
+        elif pin is not None:
+            ctx["rung"] = int(pin)
         return int(self.spec_policy.choose(ctx))
 
     def _spec_round(self, job):
@@ -4065,6 +4404,10 @@ class DualGroupLane:
         job.setdefault("_propose_ms", []).append(round_ms - ms)
         job["output_ids"].extend(emitted)
         job.setdefault("_accept", []).append(n_accept + 1)
+        # #404: the committed surfaces of THIS round, after the rollback has
+        # given the rejected candidates' slots back and after ``round_ms`` was
+        # taken -- so the probe's D2H stays out of every reported timing.
+        self._record_pool_checksum(job, path="spec", n_accept=n_accept)
         # RAW per-position counters, next to the policy's EMA'd ones. The
         # policy EMAs because it decides from the number and old content must
         # stop voting; a falsifier wants the whole job weighted equally, and
@@ -4239,6 +4582,11 @@ class DualGroupLane:
         # the pinned single-rung recipe does not exercise it.
         if job.get("_kv_len") is not None:
             job["_kv_len"] = int(job["_kv_len"]) + 1
+        # #404: the same record the speculative round emits. This is the path a
+        # NO-SPEC job travels end to end, so it is where the comparison target
+        # comes from -- and it is also the K = 0 rung of a speculative job, so
+        # a mixed-rung job's records interleave the two on one committed axis.
+        self._record_pool_checksum(job, path="decode")
         self.work_total["decode_tokens"] += 1
 
     def drop_active(self) -> None:
@@ -4435,6 +4783,14 @@ class DualGroupLane:
                 "nonzero_rounds": sum(1 for x in lags if x != 0),
                 "rounds": len(lags),
             }
+        # #404: present only under SGLANG_LANE_POOL_CHECKSUM=1. Carried on the
+        # result row as well as written to the jsonl so a harness that already
+        # polls /get_server_info needs no file access on the server's host --
+        # the two are the same records, not two instruments.
+        checksums = job.get("_pool_checksums")
+        if checksums:
+            result["pool_checksums"] = checksums
+            result["pool_checksum_rounds"] = len(checksums)
         if job.get("_argmax_rounds"):
             result["argmax_check"] = {
                 "rounds": job["_argmax_rounds"],

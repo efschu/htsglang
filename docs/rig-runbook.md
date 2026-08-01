@@ -84,6 +84,10 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_BARLINK_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_BARLINK_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_BARLINK_UCX_CHUNK_MIB` (4), `SGLANG_BARLINK_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_BARLINK_UCX_AG_RING_KIB` (32; the all_gather ring, 0 disables it), `SGLANG_BARLINK_UCX_GRAIN_ELEMS` (32768; largest host-side pass kept on the calling thread, 0 restores the unchunked passes), `SGLANG_BARLINK_UCX_TIMEOUT_S` (300), `SGLANG_BARLINK_UCX_OVERLAP` (off) |
 | `SGLANG_DEBUG_INPUT_BUFFER_POOL` | `1` for diagnosis only | logs one line per CUDA-graph input-buffer pool registration (scope, lane, name, numel, dtype, device, pointer, new/adopted). This is how you see two groups landing on one buffer; noisy, never for measurements |
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
+| `SGLANG_LANE_POOL_CHECKSUM` | `1` for a correctness window only | dual-group lane (#404). After every committed round the lane hashes the surfaces a rejected speculative candidate could leave residue in — `req_to_token[idx, :committed_len]`, the KV rows those committed slots point at (every full-attention layer, key and value), and the request's persistent conv/ssm state — and carries the records on the result row (`pool_checksums`). Read them with `scripts/dual_group/r404/pool_checksum_diff.py`, two ways: **append-only** inside one job (round R's `kv_stable`/`map_stable` must equal round R-1's `kv`/`map`; a break names the round a leak reached back into an already-committed position) and **cross-job** against a no-spec reference joined on `committed_len` (`kv`/`conv`/`ssm` only — `map` hashes physical slot ids, which two correct jobs draw differently). Costs one D2H of the committed prefix per round per full-attention layer (~48 KiB per committed token on the 27B GGUF recipe, growing with the position). It stays out of `round_ms` — the probe runs after the round's wall clock is taken — but not out of the job's total duration. **Never on while a timing table is being produced** |
+| `SGLANG_LANE_POOL_CHECKSUM_PATH` | a path PREFIX, with the above | each lane/rank appends `.lane<L>.rank<R>.jsonl`. It is a prefix and not a filename on purpose: under TP every rank runs this code with the same environment, and one shared file interleaves lines from processes that are not at the same round. Unset, the records still travel on the result row |
+| `SGLANG_LANE_POOL_CHECKSUM_PER_POS` | `1` with the above | adds one digest per committed POSITION, so a KV difference localises to a token instead of to the prefix. Costs jsonl size, not device traffic — the host copies are already made |
+| `SGLANG_LANE_POOL_CHECKSUM_TAIL` | `N` only to disarm the probe on purpose | the probe's own **can-fail** arm: hash `N` slots of the FREED TAIL instead of the committed prefix. The rejected candidates' pointers are still in the row past `committed_len`, so this reads a region a real leak never touches and the probe misses by construction. Use it to prove an instrument was calibrated, never in a window that is asked a question |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 | `SGLANG_GGUF_MXFP4_REPACK` | leave unset (default on); `0` only to refuse MXFP4 | repacks GGUF MXFP4 (ggml type 39) tensors to Q5_0 while the weight stream is read (`model_loader/gguf_mxfp4_repack.py`). Value-exact — every element dequantizes to the same fp32 number — and it is the only reason a checkpoint carrying MXFP4 boots at all: no GGUF kernel dispatches on type 39. It costs 22/17 = 1.294x the bytes of the repacked tensors, in host RAM and in VRAM; the boot log states the exact inflation. Set to `0` and the load is refused by name instead — there is no silent middle ground. See section 4.5.3 |
 | `SGLANG_MOE_GGUF_STREAM_STAGING` | leave unset (default on); `0` only to reproduce the pre-#391c load | GGUF MoE expert offload only. On, each expert is copied into its resident slot or its pinned host row **as it leaves the weight stream** and dropped, so the load's host peak is the pinned tier plus one layer's incomplete expert set. Off, the loader accumulates the complete owned expert set in host RAM first and the residency plan only acts on it at `process_weights_after_loading` — which is what OOM-killed the DeepSeek-V4-Flash boot at 90.7 GiB of anon on this 98.5 GiB swapless box. Consulted only when the offload already covers the layer, so a default GGUF boot is byte-identical either way. See section 4.6 |
@@ -1608,6 +1612,27 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   the gate. `SGLANG_LANE_SPEC_VERIFY` / `SGLANG_LANE_SPEC_TV_MAX_ACCEPT` are
   the process-wide equivalents; `SGLANG_LANE_SPEC_DEBUG=1` adds a per-round
   trace (and costs a second lm_head per round, so never measure with it on).
+- **`"spec_steps"` is a pin OR a schedule** (#404). An integer pins the rung
+  for the whole job, which is what every per-rung measurement uses. A **list**
+  is a per-round schedule, cycled: `"spec_steps": [0, 1]` alternates the plain
+  decode step and a K=1 verify, so every verify round takes `n_cached` right
+  after a K=0 round. That is the only shape that reaches the READ side of the
+  `_kv_len` advance (`727bff334a`), and before the schedule existed no recipe
+  could produce it — a scalar pin is constant, and reaching it through
+  `"adaptive": true` would make the measurement depend on what the policy
+  decided. An off-ladder value in a schedule is honoured exactly as an
+  off-ladder scalar pin is: the verify falls back to eager and the result row
+  says so in `verify_graph_rounds`. `"probe_tag": "..."` labels the job so the
+  `SGLANG_LANE_POOL_CHECKSUM` records can be attributed to an arm.
+- **The verify graph ladder is what the boot CAPTURED, not what a job asks
+  for.** `--dual-group-lane-spec-rungs 0,1,3` records verify shapes 2 and 4
+  (`verify_rungs = tuple(k + 1 for k in rungs if k >= 1)`); an unset flag
+  resolves to the single `--dual-group-lane-spec-steps` value and records one
+  shape. A job pinned to a rung outside that set runs **eager** — silently
+  correct, silently 2.5x slower, and (measured, #404 bracket window) easy to
+  read as captured if only the pin is checked. Grep the boot log for
+  `verify graph captured (bs 1, N tokens` once per rung you intend to measure,
+  and assert `verify_graph_rounds` on the result row.
 - **Standing share gate** (#284): `--dual-group-lane-share-window-s 1.0`
   switches the online estimator on, `--dual-group-lane-share-min 0.30` adds
   the criterion "the lane keeps at least 30 % of its solo rate", and
