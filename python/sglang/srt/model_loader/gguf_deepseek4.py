@@ -132,11 +132,15 @@ def _supported_ggml_types() -> set:
     ``gguf.GGMLQuantizationType``.
 
     Single source of truth is the quantization layer's own type sets, so this
-    check cannot drift away from what the kernels dispatch on.
+    check cannot drift away from what the kernels dispatch on, plus the types
+    the load-time repack (gguf_mxfp4_repack) converts into that set before any
+    consumer sees them. The repack contributes nothing when it is switched off,
+    so the gate then refuses exactly what it refused before it existed.
     """
     import gguf
 
     from sglang.srt.layers.quantization.gguf import DEQUANT_TYPES
+    from sglang.srt.model_loader.gguf_mxfp4_repack import repack_source_types
 
     unquantized = {
         gguf.GGMLQuantizationType.F32,
@@ -144,7 +148,7 @@ def _supported_ggml_types() -> set:
         gguf.GGMLQuantizationType.BF16,
         gguf.GGMLQuantizationType.I32,
     }
-    return set(DEQUANT_TYPES) | unquantized
+    return set(DEQUANT_TYPES) | unquantized | repack_source_types()
 
 
 class Deepseek4GGUFAdapter(GGUFAdapterBase):
@@ -224,11 +228,18 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
         stack has no path for.
 
         The published UD-* quantizations store the routed ``down`` projection
-        as MXFP4 (the model's native expert dtype), and MXFP4 is in none of the
-        GGUF type sets and in no dequantize/MMQ/MMVQ kernel case. Without this
-        check the failure surfaces as a bare ``NotImplementedError`` from
-        ``fused_mul_mat_gguf`` after the whole 119 GiB file has been read.
+        (and, on layer 26, ``gate``/``up`` as well) as MXFP4, the model's native
+        expert dtype. MXFP4 is in none of the GGUF type sets and in no
+        dequantize/MMQ/MMVQ kernel case, so without a repair the failure
+        surfaces as a bare ``NotImplementedError`` from ``fused_mul_mat_gguf``
+        after the whole 119 GiB file has been read.
+
+        The repair is a value-exact load-time repack to Q5_0 in the weight
+        stream (``gguf_mxfp4_repack``), so MXFP4 is no longer an offender here
+        unless ``SGLANG_GGUF_MXFP4_REPACK=0`` switched the repack off. This gate
+        keeps its job for every type the repack does not cover.
         """
+        from sglang.srt.model_loader.gguf_mxfp4_repack import repack_enabled
         from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
 
         supported = _supported_ggml_types()
@@ -243,18 +254,22 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
             f"{tname}: {len(names)} tensors (e.g. {sorted(names)[0]})"
             for tname, names in sorted(offenders.items())
         )
+        hint = (
+            " MXFP4 is among them only because SGLANG_GGUF_MXFP4_REPACK=0 "
+            "disabled the value-exact load-time repack to Q5_0; unset that "
+            "variable to load this checkpoint."
+            if "MXFP4" in offenders and not repack_enabled()
+            else ""
+        )
         raise RuntimeError(
             f"{self.FAMILY} GGUF {self.gguf_file} uses GGML type(s) this build "
             f"cannot execute -- {detail}. sglang's GGUF path dispatches only on "
             "the types in layers/quantization/gguf.py (standard, K-quant, "
-            "I-matrix) plus F32/F16/BF16/I32; there is no dequantize or "
-            "matmul kernel for the others. Use a quantization whose tensors "
-            "are all within that set, or add the missing type to the GGUF "
-            "kernels first. For MXFP4 specifically, see "
-            "test/registered/unit/model_loader/test_gguf_mxfp4_bridge.py: the "
-            "block is value-exactly convertible both to the safetensors mxfp4 "
-            "parameter pair and to GGUF Q5_0, so neither repair needs a new "
-            "quantizer -- only wiring."
+            "I-matrix) plus F32/F16/BF16/I32, plus whatever the load-time "
+            "repack in model_loader/gguf_mxfp4_repack.py converts into that "
+            "set; there is no dequantize or matmul kernel for the others. Use "
+            "a quantization whose tensors are all within that set, or add the "
+            f"missing type to the GGUF kernels first.{hint}"
         )
 
     # ------------------------------------------------------------------

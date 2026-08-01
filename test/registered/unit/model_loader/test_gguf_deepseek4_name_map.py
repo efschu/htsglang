@@ -338,12 +338,22 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
             )
         self.assertIn("vocab_size", str(ctx.exception))
 
-    def test_unexecutable_quant_type_is_refused(self):
-        # UD-Q3_K_XL stores the routed down projection as MXFP4, for which
-        # this build has no dequantize or matmul kernel.
-        with self.assertRaises(RuntimeError) as ctx:
-            self.adapter.assert_quant_types_executable()
-        self.assertIn("MXFP4", str(ctx.exception))
+    def test_mxfp4_passes_the_gate_only_while_the_repack_is_on(self):
+        """UD-Q3_K_XL stores 45 expert tensors as MXFP4, for which this build
+        has no dequantize or matmul kernel. The load-time repack to Q5_0
+        (#391 blocker 1) makes them executable, so the gate must let the file
+        through -- and must go back to refusing it, by name, the moment the
+        repack is switched off. Both directions on the real shard set."""
+        from sglang.srt.environ import envs
+
+        self.adapter.assert_quant_types_executable()
+
+        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.adapter.assert_quant_types_executable()
+        message = str(ctx.exception)
+        self.assertIn("MXFP4", message)
+        self.assertIn("SGLANG_GGUF_MXFP4_REPACK", message)
 
 
 if __name__ == "__main__":
