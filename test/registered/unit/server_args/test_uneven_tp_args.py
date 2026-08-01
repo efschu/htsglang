@@ -3,7 +3,10 @@
 --rank-auto-reserve-mib) — CPU only, NVML mocked."""
 
 import argparse
+import json
 import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -1675,3 +1678,93 @@ class TestBudgetIsTotalMinusReserve(CustomTestCase):
     def test_note_flags_a_tight_context_margin(self):
         note = ServerArgs.budget_free_shortfall_note(1, [0], 19500, 20480, 20100, 1024)
         self.assertIn("less than 1024 MiB per rank", note)
+
+
+class TestDerivedPlanVectorLog(CustomTestCase):
+    """#391 harness item C: plain ``--rank-tp-ratio auto`` must name the
+    per-rank vectors its weights partition into.
+
+    Boots 8 and 9 resolved ``[28639,16512,16512]`` and the runbook claims
+    that lands on ``[32,16,16]`` of V4's 64 heads, but nothing in the log
+    said so -- and both boots died mid-load, before any rank could be asked
+    for its own tensor shapes. The weight vector is a ratio; the plan is
+    what the ratio partitions into, and only the second one is checkable.
+    """
+
+    # DeepSeek-V4-Flash geometry, trimmed to the keys the unit grid reads.
+    CONFIG = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "model_type": "deepseek_v4",
+        "hidden_size": 4096,
+        "head_dim": 512,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "num_hidden_layers": 43,
+        "o_groups": 8,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "moe_intermediate_size": 2048,
+        "vocab_size": 129280,
+    }
+
+    def _model_dir(self, **overrides):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        config = dict(self.CONFIG)
+        config.update(overrides)
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(config, handle)
+        return directory
+
+    def _resolve(self, model_path):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048",
+        )
+        args.model_path = model_path
+        with self.assertLogs(server_args_module.logger, level="INFO") as captured:
+            run_handler(args)
+        return args, captured.output
+
+    def _plan_lines(self, output):
+        return [line for line in output if "partition into per-rank" in line]
+
+    def test_auto_names_the_head_and_expert_vectors(self):
+        args, output = self._resolve(self._model_dir())
+        # (32768/20480/20480) - 2048 reserve, gcd-reduced.
+        self.assertEqual(args.rank_tp_ratio, [5, 3, 3])
+        lines = self._plan_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        # 8 o_groups, largest-remainder: [4,2,2] groups x 8 heads each.
+        self.assertIn("[32, 16, 16] of 64 q-heads", lines[0])
+        self.assertIn("[4, 2, 2] of 8", lines[0])
+        # 256 routed experts under the same weights.
+        self.assertIn("[116, 70, 70] of 256 routed experts", lines[0])
+
+    def test_the_head_vector_follows_the_unit_grid_and_can_disagree(self):
+        """Falsifier: drop ``o_groups`` and the attention unit becomes the
+        kv-head count, which for V4 is 1 -- unsplittable across 3 ranks, so
+        the attention term must DISAPPEAR rather than report a made-up
+        vector. A test that cannot distinguish the two says nothing."""
+        _args, output = self._resolve(self._model_dir(o_groups=None))
+        lines = self._plan_lines(output)
+        self.assertEqual(len(lines), 1, output)
+        self.assertNotIn("q-heads", lines[0])
+        self.assertIn("[116, 70, 70] of 256 routed experts", lines[0])
+
+    def test_an_unreadable_config_costs_one_debug_line_and_no_boot(self):
+        """The line is diagnostic: a checkpoint the cost model cannot read
+        must not turn a working boot into a failing one."""
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048",
+        )
+        args.model_path = os.path.join(tempfile.mkdtemp(), "absent")
+        with self.assertLogs(server_args_module.logger, level="INFO") as captured:
+            run_handler(args)
+        self.assertEqual(self._plan_lines(captured.output), [])
+        self.assertEqual(args.rank_tp_ratio, [5, 3, 3])

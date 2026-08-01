@@ -8926,6 +8926,102 @@ class ServerArgs:
             budgets,
         )
 
+    def _log_derived_plan_vectors(self):
+        """One INFO line naming the per-rank vectors the resolved weights
+        actually partition into.
+
+        The weight vector is a ratio, not a plan: ``[28639,16512,16512]``
+        does not tell an operator whether attention landed on ``[32,16,16]``
+        heads or somewhere else, because every dimension snaps to its own
+        indivisible unit (V4's ``o_groups``, an MoE model's whole experts)
+        by largest-remainder rounding. ``--rank-tp-ratio auto-performance``
+        prints its family vectors; plain ``auto`` printed only the ratio, so
+        boots 8 and 9 (#391) could not confirm the ``[32,16,16]`` the runbook
+        claims without reading a rank's own tensor shapes after the load --
+        which is exactly the evidence a load that dies mid-stream never
+        produces.
+
+        Diagnostic only: the numbers are recomputed with the same
+        ``partition_units`` the model shards with, nothing is stored, and any
+        failure to derive them leaves one debug line and the boot unchanged.
+        """
+        if not isinstance(self.rank_tp_ratio, list):
+            return
+        weights = list(self.rank_tp_ratio)
+        parts: List[str] = []
+        try:
+            from sglang.srt.distributed.utils import partition_units
+            from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+            budgets = self.rank_gpu_memory_mib
+            if isinstance(budgets, int):
+                budgets = [budgets] * self.tp_size
+            inputs = PlanInputs.from_server_args(self)
+            # For a GGUF checkpoint the parse-time config is synthesized from
+            # the GGUF KV block, which does not carry every geometry key the
+            # model reads -- V4's ``o_groups`` among them, so the attention
+            # unit grid would collapse to the kv-head count (1) and describe
+            # nothing. When the export ships the sibling ``config.json`` the
+            # loader reconciles against (gguf_registry.
+            # reconcile_sibling_config), address that directory instead: the
+            # cost model then reads the same geometry the model will shard on.
+            sibling_dir = os.path.dirname(inputs.model_path or "")
+            if inputs.model_path.endswith(".gguf") and os.path.exists(
+                os.path.join(sibling_dir, "config.json")
+            ):
+                inputs = dataclasses.replace(inputs, model_path=sibling_dir)
+            model = PerfCostModel(
+                inputs, weights, list(budgets or [1024] * self.tp_size)
+            )
+        except Exception as e:
+            logger.debug("Could not derive the per-rank plan vectors: %s", e)
+            return
+
+        def split(units):
+            """``partition_units`` or None. A dimension whose unit count
+            cannot be spread over the ranks at all (V4's kv-head count of 1
+            when ``o_groups`` is missing) is not this line's business to
+            report or to fail on -- the partitioner itself refuses that plan
+            later, by name. Dropping only the term keeps every other vector
+            in the log."""
+            try:
+                return partition_units(int(units), weights)
+            except Exception:
+                return None
+
+        groups = split(model.attn_units) if model.q_heads > 0 else None
+        if groups is not None:
+            scale = model.q_heads // model.attn_units
+            parts.append(
+                f"attention {[u * scale for u in groups]} of {model.q_heads} "
+                f"q-heads (whole units of {scale} head(s): {groups} of "
+                f"{model.attn_units})"
+            )
+        gdn = split(model.gdn_units) if model.gdn_units > 1 else None
+        if gdn is not None:
+            parts.append(
+                f"GDN {gdn} of {model.gdn_units} linear-attention head(s)"
+            )
+        experts = split(model.num_experts) if model.num_experts > 0 else None
+        if experts is not None:
+            parts.append(f"MoE {experts} of {model.num_experts} routed experts")
+        elif model.num_experts <= 0 and model.intermediate > 0:
+            columns = split(model.mlp_units)
+            if columns is not None:
+                scale = model.intermediate // model.mlp_units
+                parts.append(
+                    f"MLP {[u * scale for u in columns]} of "
+                    f"{model.intermediate} intermediate columns "
+                    f"(whole units of {scale})"
+                )
+        if not parts:
+            return
+        logger.info(
+            "--rank-tp-ratio auto: weights %s partition into per-rank %s.",
+            weights,
+            "; ".join(parts),
+        )
+
     def _handle_uneven_tp(self):
         """Validate --rank-gpu-id / --rank-gpu-memory-mib / --rank-tp-ratio
         (heterogeneous rank placement and uneven tensor parallelism).
@@ -8984,6 +9080,11 @@ class ServerArgs:
             from sglang.srt.uneven_perf import apply_auto_performance
 
             apply_auto_performance(self)
+        elif ratio_was_auto:
+            # Plain auto only: auto-performance emits its own family-vector
+            # block a few lines later, and printing the base vectors first
+            # would name numbers it is about to replace.
+            self._log_derived_plan_vectors()
         if not ratio_was_auto and isinstance(self.rank_tp_ratio, str):
             raise ValueError(
                 f"Invalid --rank-tp-ratio value {self.rank_tp_ratio!r}: "
