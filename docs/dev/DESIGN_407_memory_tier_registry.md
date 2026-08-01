@@ -873,3 +873,58 @@ somebody has to remember.
 5. **`safetensors._drop_file_cache_after_load` is fadvise-only** — the same ZFS
    no-op class as `a8a2f7bc22`, flagged in the merge commit, own ticket. Any
    `fs:` tier that manages its own page cache on `/spinning` inherits it.
+
+---
+
+## 8. Cut 1 as built
+
+`python/sglang/srt/memtier/` — `tiers.py` (identity, record, volatility law),
+`profile.py` (measured numbers as data), `registry.py` (enumerate / filter /
+refuse), `reservations.py` (named ledger posts), `probe.py` (measurement
+catalogue), `profiles/rig1.json` (this rig, and only this rig). 82 hermetic
+tests in `test/registered/unit/memtier/`, `base-a-test-cpu`. No consumer reads
+any of it; nothing writes outside a test's temp directory.
+
+**Followed as designed:** the module name `memtier` and its reasons; the
+`TierId` grammar; `TierKind{DEVICE, HOST, FILESYSTEM, BLOB}` with locality as
+a host field rather than a kind; `Volatility` with `DEVICE_BOUND_ONLY`;
+`TierCapacity`'s total/floor/reserved/corridor split; `cost_model.Rate` and
+`Provenance` reused verbatim; `TierHealth` in `GateRow`'s vocabulary, with
+unreachable tiers enumerated and blocked rather than omitted; `admits` checked
+against `offload_register.OFFLOAD_CLASSES`; the candidate-list-plus-named-
+refusals shape of `_select_target`; the three honesty corrections shipped as
+ESTIMATE (host DRAM) and ABSENT (peer-VRAM latency class, NVMe latency).
+
+**Deviations, each with its reason:**
+
+1. **`aperture_bytes` is a `Rate`, not `Optional[int]`.** An int cannot say why
+   it is missing, and this field's absence (M2, never run) is the thing worth
+   saying. Same rule as every other number in the record.
+2. **`Volatility` (tier) and `PayloadClass` (content) are two enums.** §3.1
+   carries one; admission needs both sides, and a single enum would have made
+   the falsifier — a `persistence_required` payload offered a tmpfs tier —
+   inexpressible. `ADMITTED_PAYLOADS` maps one onto the other in one table.
+3. **`vram:unenumerated@<host>` added to the grammar.** X3 asks for rig-2's
+   cards to be *declared* with a blocking verdict, and §3.1's grammar has no
+   spelling for a card no local NVML has ever resolved. Inventing a UUID for
+   it would have been worse. `is_bound` is false for these and
+   `admission_refusal` refuses them whatever their volatility says.
+4. **No staging graph, so no C1 resolution yet.** §3.5's shortest path is cut
+   3's, together with the `destinations_error` it fixes. The ordering key is
+   `(provenance_rank, -bandwidth, tier_id)` and is public on every candidate
+   so the substitution is visible when it happens. `transport.stages_through`
+   is recorded from cut 1 so the graph's edges are already data.
+5. **No `GET /registry/tiers` route.** The brief for this cut is the registry
+   plus records; an endpoint is a consumer. `TierRegistry.to_json()` and
+   `gate_rows()` are the payload, ready to mount.
+6. **Device tiers come from card-MODEL templates, not from the profile's tier
+   list.** A membw figure is a property of a 5090, not of one particular 5090,
+   and a profile that named UUIDs would be wrong on the next machine. Binding
+   happens when a live card is enumerated; an unprofiled model gets live
+   capacity and ABSENT caps, never a roofline.
+7. **`_host_memory_bytes` reads `/proc/meminfo` rather than `psutil`.** §2.9
+   counts eight unowned `psutil.virtual_memory()` sites; this module is meant
+   to become their owner, not the ninth.
+
+**Still open after cut 1:** M1–M8 unchanged; the E1/E2/E3 reconciliation
+(deferred to cut 4 as designed); `expert_stats.py` still wired and empty.

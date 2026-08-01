@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "profile_id": "htsglang-rig-1",
+  "host": "rig-1",
+  "hostnames": ["CT999"],
+  "title": "The htsglang development rig, as measured on it",
+  "caveat": "Every number in this file was measured on ONE machine (5090 + 2x 3080, DDR4 host, ZFS on NVMe, 40G RoCE to rig-2). It is a rig profile, not a hardware truth: ANALYSE_389's own words about the 1.8 GB/s NVMe figure -- 'this verdict must not be recorded as a verdict on the approach' -- apply to every row here. A different rig loads a different profile; nothing in the registry hardcodes these values.",
+  "sources": "DESIGN_407_memory_tier_registry.md section 1.1, which cites each figure to the runbook / EVAL / ANALYSE line it came from.",
+  "device_models": {
+    "NVIDIA GeForce RTX 5090": {
+      "capacity": {
+        "total": {"value": 34190917632, "provenance": "measured", "source": "NVML total 32607 MiB; rig-runbook.md:2977, DESIGN_407 section 1.1 T0. Live NVML overrides this at enumeration.", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "the #330 pinned floor (weights, graphs, GDN pool, activation workspaces, allocator metadata) is measured once per boot as nvml_process_used_bytes - vmm_backed_bytes; it does not exist before a boot", "unit": "bytes"},
+        "corridor": 419430400
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "no device-memory point-latency probe exists in this tree; card_probe measures bandwidth only (DESIGN_407 section 4, M1)", "unit": "us"},
+        "bandwidth_gbs": {"value": 1558.0, "provenance": "measured", "source": "rigmon/card_probe.py membw read probe; rig-runbook.md:3468", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "the EFFECTIVE per-directed-pair BAR1 aperture is what #286's window policy needs; scripts/p2p_readiness/capability_matrix.py has never been run and no results/ directory exists (DESIGN_407 section 4, M2). The nominal ReBAR window is in properties and is NOT this number.", "unit": "bytes"},
+        "ledger_key": "vram"
+      },
+      "properties": {
+        "membw_gemv_gbs": "1533.5 (measured, card_probe gemv lane)",
+        "bar1_nominal_bytes": "34359738368 (32 GiB, ReBAR; FEATURES_VS_UPSTREAM.md:1339)",
+        "peer_path_evidence": "barlink vs NCCL, interleaved, bf16, three cards: 1.13 / 1.34 / 1.15 / 1.04 / 1.30x at 20 KiB / 80 KiB / 1 MiB / 4 MiB / 16 MiB (measured, commit 137e3a6c25). The smallest datapoint is a 20 KiB three-rank all_reduce at 45.59 us -- a COLLECTIVE, not a point latency.",
+        "peer_latency_claim": "the '1-3 us posted write' class quoted for peer VRAM is an ASSUMPTION (EVAL_p2p_prefill_decode_split.md:140, under 'Tragende Annahmen'), which is why caps.latency_us is absent rather than estimated",
+        "medium": "vram"
+      }
+    },
+    "NVIDIA GeForce RTX 3080": {
+      "capacity": {
+        "total": {"value": 21474836480, "provenance": "measured", "source": "NVML total 20480 MiB; rig-runbook.md:2977, DESIGN_407 section 1.1 T0. Live NVML overrides this at enumeration.", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "the #330 pinned floor is measured once per boot as nvml_process_used_bytes - vmm_backed_bytes; it does not exist before a boot", "unit": "bytes"},
+        "corridor": 419430400
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "no device-memory point-latency probe exists in this tree; card_probe measures bandwidth only (DESIGN_407 section 4, M1)", "unit": "us"},
+        "bandwidth_gbs": {"value": 723.0, "provenance": "measured", "source": "rigmon/card_probe.py membw read probe; rig-runbook.md:3468", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "the EFFECTIVE per-directed-pair BAR1 aperture is unmeasured (DESIGN_407 section 4, M2); the nominal 256 MiB window and the 96 MiB that maps contiguously are in properties and must not be read as the effective aperture", "unit": "bytes"},
+        "ledger_key": "vram"
+      },
+      "properties": {
+        "membw_gemv_gbs": "718.2 (measured, card_probe gemv lane)",
+        "bar1_nominal_bytes": "268435456 (256 MiB nominal)",
+        "bar1_contiguous_bytes": "100663296 (96 MiB maps contiguously; measured, EVAL_gdr_uebernahme.md:141)",
+        "bar_size_irrelevant": "#278 W1: BAR size moved nothing at any measured step, and the direct-vs-staged story is a BAND at 64-80 KiB rather than a crossover point",
+        "medium": "vram"
+      }
+    }
+  },
+  "tiers": [
+    {
+      "id": "host:rig-1",
+      "kind": "host",
+      "host": "rig-1",
+      "volatility": "expensive_ok",
+      "admits": ["graph_rungs", "drafter_heads", "lane_workspaces", "cold_lane", "experts", "kv_shadow"],
+      "capacity": {
+        "total": {"value": 105763569664, "provenance": "measured", "source": "cgroup memory limit 98.5 GiB (MemTotal 103.3 GB, no swap); DESIGN_407 section 1.1 T2. Live /proc/meminfo + cgroup override this at enumeration.", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "the non-ledger resident set at this tier (page cache, ARC, the TokenizerManager frontend process) is accounted nowhere -- #400's known blind spot, inherited unchanged. apply_local_facts() fills it from a live MemAvailable reading.", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "no host-DRAM access-latency probe exists in this tree", "unit": "us"},
+        "bandwidth_gbs": {"value": 38.0, "provenance": "estimate", "source": "central value of the measured 32-45 GB/s sustained band, ANALYSE_393_ik_llama.md:299-300. ESTIMATE and not MEASURED because the 51.2 GB/s peak it is read against is ASSUMED from dual-channel DDR4-3200 -- dmidecode -t 17 is empty under this VM. ANALYSE_393:554 names the measured read bandwidth as an open item (DESIGN_407 section 4, M4).", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "host RAM is not an aperture-gated tier", "unit": "bytes"},
+        "ledger_key": "host_ram"
+      },
+      "health": {"reachable": true, "verdict": "ok", "reason": ""},
+      "transport": {"name": "pcie", "handle": "torch pinned H2D/D2H; probe at rigmon/card_probe.py:561-586", "stages_through": null},
+      "properties": {
+        "medium": "dram",
+        "h2d_pinned_gbs": "6.4 / 13 / 13 per card (gen4 x4 / x8 / x8), aggregate 32.4 (measured, ANALYSE_393_ik_llama.md:301-304); barlink host-staged retake 14.3 / 6.5 / 13.2",
+        "swap": "none -- a swapless box, so an over-reservation here is an OOM kill and not a slowdown",
+        "contention": "all three rank processes contend for one memory controller; the per-card H2D figures were taken one direction at a time, alone",
+        "pointer_io": "no",
+        "flock": "n/a",
+        "rig_is_lower_bound": "measured on this rig only; a machine with more channels moves this number and nothing in the registry assumes otherwise"
+      }
+    },
+    {
+      "id": "fs:rig-1:/spinning",
+      "kind": "filesystem",
+      "host": "rig-1",
+      "volatility": "persistent",
+      "admits": ["experts", "cold_lane", "drafter_heads"],
+      "capacity": {
+        "total": {"value": 729000000000, "provenance": "measured", "source": "free space at the time of the #389 measurement, ANALYSE_389_nvme_expert_tier.md:99. Live statvfs overrides this at enumeration.", "unit": "bytes"},
+        "floor": {"value": 0, "provenance": "measured", "source": "a filesystem tier holds no per-boot pinned floor; what is on it is on it", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "no fio, no iodepth, no per-read microsecond figure exists anywhere in this tree; all of #389's arithmetic is bandwidth-only (DESIGN_407 section 4, M5)", "unit": "us"},
+        "bandwidth_gbs": {"value": 1.8, "provenance": "measured", "source": "cold read, iflag=direct, reproduced three times; ANALYSE_389_nvme_expert_tier.md:77-89, commit 71fc6356be", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "a filesystem is not an aperture-gated tier", "unit": "bytes"},
+        "ledger_key": "nvme_spinning"
+      },
+      "health": {"reachable": true, "verdict": "ok", "reason": ""},
+      "transport": {"name": "posix", "handle": "open/pread/pwrite on a ZFS dataset", "stages_through": "host:rig-1"},
+      "properties": {
+        "medium": "nvme",
+        "fs_type": "zfs",
+        "flock": "yes",
+        "rewritable": "yes -- #306 may rewrite a blob here in place, in a transformed representation, without the producer hearing about it",
+        "persistent_across_reboot": "yes",
+        "arc_warm_excluded": "the warm 3.8 / 9.5 GB/s readings are ARC hits and are deliberately NOT credited to this tier",
+        "writeback_durability": "unmeasured (DESIGN_407 section 4, M6): whether a write is durable when the call returns, and whether the page cache it leaves is reclaimable IN TIME, are open. Boot 8 died with memory.current at 98.3/98.5 GiB for seven minutes -- reclaimable is not reclaimable in time.",
+        "page_cache_reclaim": "posix_fadvise(DONTNEED) is a no-op for mapped pages and on this pool even post-unmap (16384/16384 pages resident by mincore, commit a8a2f7bc22); madvise(MADV_PAGEOUT) reclaims to 0",
+        "hosts_hibernate_images": "yes (#89). Hibernate images have no OFFLOAD_CLASSES member, so it is the persistent volatility class -- not the admits set -- that lets them rest here.",
+        "rig_is_lower_bound": "1.8 GB/s is THIS box's ZFS-on-NVMe cold read; ANALYSE_389 is explicit that its K3 verdict must not be recorded as a verdict on the approach"
+      }
+    },
+    {
+      "id": "fs:rig-1:/dev/shm",
+      "kind": "filesystem",
+      "host": "rig-1",
+      "volatility": "expensive_ok",
+      "admits": ["lane_workspaces", "kv_shadow"],
+      "capacity": {
+        "total": {"value": null, "provenance": "absent", "source": "a tmpfs has no measured constant size; it is a live statvfs fact, filled by apply_local_facts()", "unit": "bytes"},
+        "floor": {"value": 0, "provenance": "measured", "source": "a filesystem tier holds no per-boot pinned floor", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "unmeasured", "unit": "us"},
+        "bandwidth_gbs": {"value": null, "provenance": "absent", "source": "no tmpfs bandwidth probe exists. This tier IS host RAM behind a filesystem API, but the host tier's DRAM figure is deliberately not copied here: a number measured on one path must not be reprinted under another path's name.", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "a filesystem is not an aperture-gated tier", "unit": "bytes"},
+        "ledger_key": "shm"
+      },
+      "health": {"reachable": true, "verdict": "ok", "reason": ""},
+      "transport": {"name": "posix", "handle": "open/pread/pwrite on tmpfs", "stages_through": "host:rig-1"},
+      "properties": {
+        "medium": "tmpfs",
+        "fs_type": "tmpfs",
+        "flock": "yes",
+        "persistent_across_reboot": "no -- this tier is the reason persistence is a DECLARED class and not an assumed property of a path. A --hibernate-dir pointed here yields a hibernate that does not survive a reboot, and nothing in the tree would notice (DESIGN_407 section 2.4b).",
+        "backed_by": "host:rig-1 -- bytes written here are charged to the host RAM budget, on a swapless box"
+      }
+    },
+    {
+      "id": "host:rig-2",
+      "kind": "host",
+      "host": "rig-2",
+      "volatility": "expensive_ok",
+      "admits": ["cold_lane", "experts", "kv_shadow"],
+      "capacity": {
+        "total": {"value": null, "provenance": "absent", "source": "rig-2's RAM has never been enumerated from this host; the registry does not guess a remote machine's size", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "unknown for the same reason as total", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": 1.47, "provenance": "measured", "source": "8 B message on the 40G line; rig-runbook.md:1264. The 100G line measures 1.58 us and is slot-limited to 3.43 GB/s (PCIe-3.0-x4-bound).", "unit": "us"},
+        "bandwidth_gbs": {"value": 2.83, "provenance": "measured", "source": "staged RDMA at 1 MiB, EVAL_gdr_uebernahme.md:125. Same line: NCCL-over-sockets 2.07 GB/s, iperf3 single stream 1.93 GB/s.", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "not an aperture-gated tier", "unit": "bytes"},
+        "ledger_key": "rig2_host_ram"
+      },
+      "health": {"reachable": false, "verdict": "warn", "reason": "reachability is not probed at enumeration time in cut 1 -- the registry opens no socket to build a record. The last measured contact is the #266 cross-rig run; treat the tier as unreachable until a probe says otherwise."},
+      "transport": {"name": "roce-40g", "handle": "barlink / UCX; scripts/r3val/link_collective_cost.py", "stages_through": "host:rig-1"},
+      "properties": {
+        "medium": "dram",
+        "nic_relay_serialises": "three pairs in parallel cost 2.34x latency for only 1.28x aggregate -- the single Gen3-x4 NIC is the wall (#278 V5). A remote tier is not width-scalable on this rig.",
+        "collective_cost": "at serving level, decode all_reduce ~89 us and verify all_reduce ~202 us, of which host staging carries ~86% (#266)",
+        "ucx_barrier_us": "8.30 (world 2); all_reduce 8 KiB 44.92 us, 64 KiB 55.79 us, 512 KiB 237.70 us",
+        "producer_fingerprint": "a remote entry is a hit only if producer == consumer on model, quantization, KV dtype, TP size / rank-tp-ratio, DCP geometry, head geometry and layer count (#224). A mismatch is a hard request error, never silent corruption.",
+        "line_pairing_warning": "the 3.43 GB/s and 1.47 us figures quoted together in kv_session_spill_destination.destinations_error come from DIFFERENT lines (100G and 40G). DESIGN_407 open item 4: fix the string when cut 3 touches the function.",
+        "rig_is_lower_bound": "one 40G RoCE line through a Gen3-x4 slot; this is the wire this rig has, not the wire the approach needs"
+      }
+    },
+    {
+      "id": "vram:unenumerated@rig-2",
+      "kind": "device",
+      "host": "rig-2",
+      "card_model": "NVIDIA GeForce RTX 2080 Ti",
+      "volatility": "device_bound_only",
+      "admits": [],
+      "capacity": {
+        "total": {"value": null, "provenance": "absent", "source": "rig-2's cards have never been enumerated from this host", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "rig-2's cards have never been enumerated from this host", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": 4.99, "provenance": "measured", "source": "8 B GDR direct into a 3080 BAR (staged: 3.77 us); EVAL_gdr_uebernahme.md:124. This is the INBOUND direction from rig-2's NIC, not a GPU-to-GPU path.", "unit": "us"},
+        "bandwidth_gbs": {"value": 0.83, "provenance": "measured", "source": "direct GDR into a 3080 BAR at 1 MiB vs 2.83 GB/s staged; #278's retake found no crossover point but a BAND at 64-80 KiB where direct loses, and direct winning outside it (20 KiB 1.26x, 1 MiB 1.19x, 4 MiB 1.24x)", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "unmeasured; #278 W1 also showed BAR size irrelevant at every measured step", "unit": "bytes"},
+        "ledger_key": "rig2_vram"
+      },
+      "health": {"reachable": false, "verdict": "block", "reason": "GPU-to-GPU across the rig boundary was never demonstrated on this hardware, and #280's userspace workaround is closed as impossible (cudaHostRegisterIoMemory -> CUDA_ERROR_INVALID_VALUE, driver guard osCheckGpuBarsOverlapAddrRange). Declared with a blocking verdict rather than omitted, so a rig where it works needs a data change and not a code change (DESIGN_407 X3)."},
+      "transport": {"name": "roce-40g", "handle": "GDR bench; scripts/p2p_readiness/", "stages_through": "host:rig-2"},
+      "properties": {
+        "medium": "vram",
+        "nordstern": "this is the NORDSTERN shape (TP=5 across two rigs). Enumerating it with a blocking verdict makes the gap a dashboard row instead of an invisible absence.",
+        "mr_registration_cost": "untimed (DESIGN_407 section 4, M8): amortised to zero for a static pool, the whole design for anything dynamic"
+      }
+    },
+    {
+      "id": "fs:rig-2:/",
+      "kind": "filesystem",
+      "host": "rig-2",
+      "volatility": "persistent",
+      "admits": [],
+      "capacity": {
+        "total": {"value": null, "provenance": "absent", "source": "never probed", "unit": "bytes"},
+        "floor": {"value": null, "provenance": "absent", "source": "never probed", "unit": "bytes"},
+        "corridor": 0
+      },
+      "caps": {
+        "latency_us": {"value": null, "provenance": "absent", "source": "never probed", "unit": "us"},
+        "bandwidth_gbs": {"value": null, "provenance": "absent", "source": "never probed", "unit": "GB/s"},
+        "aperture_bytes": {"value": null, "provenance": "absent", "source": "not an aperture-gated tier", "unit": "bytes"},
+        "ledger_key": "rig2_disk"
+      },
+      "health": {"reachable": false, "verdict": "block", "reason": "never probed, in any unit. Reachable only through the rig-2 wire (DESIGN_407 section 4, M7), and declared here so the gap is visible rather than absent."},
+      "transport": {"name": "roce-40g", "handle": "none yet", "stages_through": "host:rig-2"},
+      "properties": {
+        "medium": "disk",
+        "flock": "no -- flock does not cross the wire, which is why #89 needs a capability filter and not a filesystem-kind check"
+      }
+    }
+  ]
+}
