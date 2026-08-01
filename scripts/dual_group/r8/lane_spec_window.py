@@ -51,9 +51,16 @@ from lane_accept_probe import (  # noqa: E402
     PROMPTS,
     _get,
     _post,
+    detokenize,
     lane_run,
     tokenize,
 )
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "r12")
+)
+
+from graded import score as graded_score  # noqa: E402
 
 # Serving-side filler for the concurrency phases. Each request gets a unique
 # prefix appended, because an identical prompt is served from the radix cache
@@ -177,6 +184,7 @@ def run_gate(
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"prompts": {}, "verdict": None}
     coherent = True
+    identical_rate_fail = 0
     for name in prompt_names:
         if time.time() > deadline:
             out["truncated_at"] = name
@@ -232,10 +240,29 @@ def run_gate(
         spec_floor_ok = spec["output_ids"] == spec_b["output_ids"]
         cmp = compare_trajectories(ref_a["output_ids"], spec["output_ids"])
 
+        # The graded score of all four arms. Two per side, because the band
+        # a cross-arm delta has to clear is the one the arms measure on
+        # THEMSELVES (#360): a score difference is only evidence when the
+        # same arm scores the same twice.
+        scored = {
+            k: graded_score(name, detokenize(v["output_ids"], tokenizer))["score"]
+            for k, v in arms.items()
+        }
+        band = max(
+            abs(scored["no_spec"] - scored["no_spec_repeat"]),
+            abs(scored["spec"] - scored["spec_repeat"]),
+        )
+        score_delta = scored["spec"] - scored["no_spec"]
+        score_ok = abs(score_delta) <= band
+
         out["prompts"][name] = {
             "prompt_tokens": len(ids),
             "floor_byte_identical": floor_ok,
             "spec_floor_byte_identical": spec_floor_ok,
+            "graded_scores": scored,
+            "graded_a_vs_a_band": band,
+            "graded_delta": score_delta,
+            "graded_within_band": score_ok,
             **cmp,
             "ms_per_token": {
                 "no_spec": _ms_per_token(ref_a),
@@ -258,11 +285,41 @@ def run_gate(
                 "comparison on it measures the margin, not the chain"
             )
         elif cmp["classification"] == "content_divergence":
-            coherent = False
+            # #284 -> r12: a content divergence is NO LONGER an automatic
+            # fail, because the criterion it fails is not an instrument.
+            #
+            # The control that settled this ran on 2026-07-31 with NO LANE at
+            # all (scripts/dual_group/r12, docs/dev/ANALYSE_284_lane_spec_
+            # divergence.md): stock NEXTN speculation leaves the stock greedy
+            # trajectory on this very vehicle, at the position with the
+            # SMALLEST top-2 margin of the whole run (0.25 nats against a
+            # median of 10.5), inside the measured batch-shape perturbation
+            # band, and with an identical graded score. The runbook says the
+            # same in its own words for stock speculation (section 6.7,
+            # #139): topk 1 is not a losslessness oracle on this
+            # configuration. A gate that fails on such a flip measures the
+            # margin at one position, not the lane.
+            #
+            # So the verdict moves to the #360 standard: a graded score that
+            # a flip can move, judged against the A-vs-A band the same arms
+            # measure on themselves, with the token-identity rate reported
+            # beside it as the framing number rather than as the criterion.
+            if not score_ok:
+                coherent = False
+        # `identical` and `length_end_only` stay coherent without consulting
+        # the score. Identical tokens cannot score differently, and a
+        # length-end difference is the arms disagreeing about where the last
+        # speculative block fell -- the extra token can legitimately add a
+        # correct item, and failing on that would re-introduce exactly the
+        # kind of non-instrument the graded gate replaced.
+        if cmp["classification"] != "identical":
+            identical_rate_fail += 1
         print(
             f"  gate {name:9s} floors={'ok' if floor_ok else 'VOID'}"
             f"/{'ok' if spec_floor_ok else 'VOID'} "
             f"{cmp['classification']:20s} "
+            f"score {scored['no_spec']}->{scored['spec']} "
+            f"(band {band}, {'in' if score_ok else 'OUT'}) "
             f"round {spec['round_ms_mean']} ms accept {spec['accept_len_mean']} "
             f"vgraph {spec['verify_graph_rounds']}/{spec['spec_rounds']}",
             flush=True,
@@ -273,6 +330,21 @@ def run_gate(
         "coherent" if judged and coherent else ("void" if not judged else "divergent")
     )
     out["judged_prompts"] = len(judged)
+    # The framing number, per #360: how often the two arms produced literally
+    # the same tokens. It does NOT decide the verdict -- it says how much
+    # weight a reader should put on the fact that they sometimes did not.
+    out["token_identity_rate"] = (
+        round(1.0 - identical_rate_fail / len(out["prompts"]), 3)
+        if out["prompts"]
+        else None
+    )
+    out["verdict_criterion"] = (
+        "graded score within the arms' own A-vs-A band (#360). Token identity "
+        "is reported, not required: the r12 control showed stock NEXTN "
+        "leaving the stock greedy trajectory on this vehicle with no lane "
+        "present, at the smallest top-2 margin of the run and at an identical "
+        "score (docs/dev/ANALYSE_284_lane_spec_divergence.md)."
+    )
     return out
 
 

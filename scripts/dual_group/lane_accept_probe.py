@@ -123,6 +123,22 @@ def tokenize(base: str, text: str, tokenizer_path: str) -> List[int]:
     return list(ids)
 
 
+def detokenize(ids, tokenizer_path: str) -> str:
+    """Text for a list of token ids, from the SERVER's tokenizer path.
+
+    The counterpart of :func:`tokenize`, and it exists for the same reason:
+    the lane reports ``output_ids`` and nothing else, so anything that grades
+    a lane trajectory has to turn ids back into text with the tokenizer the
+    server was booted with, not with a guess.
+    """
+    from transformers import AutoTokenizer
+
+    global _TOK
+    if _TOK is None:
+        _TOK = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    return _TOK.decode(list(ids), skip_special_tokens=True)
+
+
 def serving_run(base: str, input_ids: List[int], tokens: int) -> Dict[str, Any]:
     return _post(
         base,
