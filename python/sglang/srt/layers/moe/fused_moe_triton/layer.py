@@ -14,6 +14,7 @@ from torch.nn.parameter import UninitializedParameter
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed.utils import (
+    assert_activation_aligned_shards,
     tp_partition_offset,
     tp_partition_size,
     tp_plan_active,
@@ -183,16 +184,53 @@ class FusedMoeWeightScaleSupported(Enum):
 MOE_MARLIN_TILE = 64
 
 
+def _activation_vec_units(intermediate_size: int) -> int:
+    """Coarsen an otherwise unconstrained intermediate dimension to whole
+    activation vectors (#367). Falls back to element granularity when the
+    dimension is not a multiple of the vector -- the construction-time guard
+    then names the constraint instead of the kernel raising mid-forward."""
+    from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS
+
+    if intermediate_size % ACTIVATION_VEC_ELEMS == 0:
+        return intermediate_size // ACTIVATION_VEC_ELEMS
+    return intermediate_size
+
+
 def moe_uneven_tp_units(intermediate_size: int, quant_config) -> int:
     """Unit count for the expert intermediate dimension under an uneven shard
     plan (`--rank-tp-ratio`).
 
     The units are the indivisible packets the plan distributes, so they have
     to be as fine as the weight format allows while still landing every cut
-    on a boundary the kernels accept. Returns the element-granular count when
-    no quantization constrains the dimension; that is also the value the even
-    split and the no-plan path effectively use, since units are only consulted
-    under an installed plan.
+    on a boundary the kernels accept.
+
+    When no quantization constrains the dimension the finest LEGAL grain is
+    not one element (task #367). The expert intermediate feeds
+    ``silu_and_mul`` / ``gelu_and_mul``, whose jit kernel is instantiated on a
+    vector width and hard-checks ``hidden_size % kVecSize == 0``
+    (elementwise/activation.cuh:168). Element-granular units let the plan cut
+    anywhere: the dense MTP draft of Qwen3.5-35B-A3B at ``--rank-tp-ratio
+    5,4`` gets 512 -> [284, 228], neither a multiple of the 16-element
+    Blackwell vector nor of the 8-element Ampere one, and the boot dies in
+    the draft's FIRST MoE forward with "hidden size must be divisible by
+    vector size" -- after the weights are loaded and the graphs are captured.
+
+    So the unconstrained lane coarsens to ``ACTIVATION_VEC_ELEMS``, the same
+    16-element MLP unit #82 established for the dense side and #353 for the
+    INT8 lane. The quantized branches below already return a coarser unit
+    (group 32 / block 128 are multiples of 16), so this is the one lane that
+    was missing its boundary. Only ONE grain is used for every rank because
+    the plan is built before anyone knows which rank lands on which arch, and
+    a multiple of 16 is a multiple of 8: one plan, valid on a mixed rig.
+
+    An intermediate size that is not itself a multiple of the vector cannot be
+    coarsened at all; the element-granular count is returned and
+    ``assert_activation_aligned_shards`` in ``FusedMoE.__init__`` rejects the
+    geometry at construction with the constraint named, rather than letting
+    the kernel raise at the first forward.
+
+    Units are only consulted under an installed plan, so the even split and
+    the no-plan path are unaffected by the coarsening.
     """
     block = getattr(quant_config, "weight_block_size", None) if quant_config else None
     group = getattr(quant_config, "group_size", None) if quant_config else None
@@ -231,7 +269,9 @@ def moe_uneven_tp_units(intermediate_size: int, quant_config) -> int:
             g //= 2
         if g >= 32:
             return intermediate_size // g
-        return intermediate_size
+        # No usable group grain left: the dimension is unconstrained by the
+        # weight format, so the activation vector is the binding boundary.
+        return _activation_vec_units(intermediate_size)
 
     ct_map = getattr(quant_config, "target_scheme_map", None)
     if ct_map:
@@ -252,7 +292,7 @@ def moe_uneven_tp_units(intermediate_size: int, quant_config) -> int:
             if intermediate_size % g == 0:
                 return intermediate_size // g
 
-    return intermediate_size
+    return _activation_vec_units(intermediate_size)
 
 
 class FusedMoE(torch.nn.Module):
@@ -399,6 +439,22 @@ class FusedMoE(torch.nn.Module):
                 intermediate_size,
             )
         elif tp_plan_active(self.moe_tp_size, self.moe_tp_family):
+            # #367: every rank's expert intermediate feeds silu_and_mul /
+            # gelu_and_mul, whose kernel hard-checks its vector alignment at
+            # the FIRST FORWARD -- after weight load and graph capture. The
+            # units above coarsen the splits this planner makes; a split that
+            # still lands unaligned (a foreign SGLANG_UNEVEN_MOE_VECTOR, or an
+            # intermediate size no unit grain can fix) is rejected HERE, at
+            # construction, with the constraint named. The dense MLP side has
+            # had this guard since #82; the expert side was the gap this
+            # closes.
+            assert_activation_aligned_shards(
+                intermediate_size,
+                self.moe_tp_size,
+                self.moe_tp_units,
+                self.moe_tp_family,
+                what="MoE expert intermediate",
+            )
             self.intermediate_size_per_partition = tp_partition_size(
                 intermediate_size,
                 self.moe_tp_size,

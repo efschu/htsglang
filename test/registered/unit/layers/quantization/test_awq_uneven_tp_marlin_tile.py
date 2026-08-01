@@ -329,8 +329,19 @@ class TestMoEGrainUnchanged(CustomTestCase):
         self.assertEqual(moe_uneven_tp_units(512, cfg), 512 // 128)
         self.assertEqual(moe_uneven_tp_units(704, cfg), 704 // 64)
 
-    def test_unquantized_experts_stay_element_granular(self):
-        self.assertEqual(moe_uneven_tp_units(512, None), 512)
+    def test_unquantized_experts_use_the_activation_vector_grain(self):
+        # Was element-granular until #367, which gave the unconstrained lane
+        # its own boundary: the activation kernel's widest vector. The point
+        # this test guards is unchanged -- the AWQ/dense block must not hijack
+        # the unquantized lane -- and 32 is still far finer than the 128-tile
+        # grain above.
+        from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS
+
+        self.assertEqual(moe_uneven_tp_units(512, None), 512 // ACTIVATION_VEC_ELEMS)
+        self.assertNotEqual(
+            moe_uneven_tp_units(512, None),
+            moe_uneven_tp_units(512, _FakeCompressedTensorsConfig(32)),
+        )
 
 
 if __name__ == "__main__":
