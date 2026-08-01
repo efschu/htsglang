@@ -14902,6 +14902,26 @@ freigegeben, alle drei Karten danach auf 0 MiB.
 
 ## Lane-Spec-Kette Runde 8 (feat/dual-group-lane-spec-r8, Basis 4403a98312) — 2026-07-31
 
+> **RETREAT NOTICE (#328, added 2026-08-01).** The SHARED-window numbers in
+> this round are withdrawn. Round 8 read the lane's wall-clock counters AFTER
+> stopping the serving load, so the serving stop's worker join was counted
+> inside the shared window; #284 measured the consequence as an impossibility
+> (duty 1.208-1.377 -- more occupied wall time in a window than the window
+> had) and named the boundary as the cause. Only SHARED windows are affected
+> (a solo-lane window has no serving join in front of it), i.e. exactly the
+> numerator of `share_lane` -- so r8's shared lane rates (11.000 and 15.733
+> tok/s) are OVER-estimates and the reported loss was larger than stated, not
+> smaller. The solo figures and the qualitative chain findings stand.
+>
+> The corrected method reads the counters BEFORE stopping and names a
+> duty > 1 instead of clamping it (a clamped contradiction looks like a
+> measurement). The re-measure under that method is "#328 Posten 1: r8-E-Werte
+> mit korrigiertem Fenster" further down in this file; read those numbers
+> instead of the ones in this section. The content gate that accompanies the
+> re-measure is `scripts/dual_group/chain_quality_gate.py` -- graded scores
+> against a same-boot A-vs-A band, never text identity (#360/#365) and never a
+> pre-registered constant (#274).
+
 Auftrag: die vier offenen Kettenglieder schliessen (Kopf-Dispatch,
 rang-lokales Draft-KV-Sizing, Kohaerenz-Tor MIT Spec, Messung). Zuerst der
 Stand, weil zwei der vier bereits zu waren und das nachzuweisen billiger ist

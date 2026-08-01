@@ -1343,6 +1343,21 @@ mitgefuehrten A-gegen-A-Boden ist kein Urteil.
 
 ### 11.17 Lane-Spec-Kette Runde 4 (feat/dual-group-lane-spec-r4, Basis 640e4d7085)
 
+> **RETREAT NOTICE (#328, added 2026-08-01).** Where this round and the r8
+> round that follows it quote SHARED-window lane rates, those figures are
+> withdrawn: the window read its counters after the serving load was stopped,
+> so the stop's worker join fell inside the measured window. #284 caught it as
+> a duty > 1 (more occupied wall time than the window had) and corrected the
+> reader to count before stopping. Shared windows only -- the solo figures and
+> the structural findings of this section (the TARGET_VERIFY rebuild and why
+> it was not adopted) are unaffected, because that decision rests on a
+> measured boundary, not on the shared rates.
+>
+> Corrected numbers: "#328 Posten 1: r8-E-Werte mit korrigiertem Fenster" in
+> `docs/dev/INTEGRATION_R3_VALIDATION.md`. Content quality alongside them is
+> judged by `scripts/dual_group/chain_quality_gate.py`, graded against a
+> same-boot A-vs-A band rather than by text identity.
+
 Auftrag war der Umbau des Lane-Verifys von der seqdecode-Bruecke auf einen
 echten `ForwardMode.TARGET_VERIFY`. Der Umbau ist gebaut, und er ist NICHT
 uebernommen worden — die Grenze ist gemessen, nicht geschaetzt.
