@@ -82,8 +82,21 @@ if dry_run; then
   kill $HB_PID 2>/dev/null
   stop_vram_sampler
   release_cards "#274 chunking dry run"
+  echo "DRY RUN ok: #274 chunking window"
   exit 0
 fi
+
+if ! wait_for_server "$PORT" 1200; then
+  echo "--- letzte 40 Zeilen Serverlog (nur bei Abbruch) ---" >&2
+  tail -40 "$LOG" >&2
+  kill $HB_PID 2>/dev/null
+  stop_vram_sampler
+  release_cards "#274 chunking: server nicht oben, verbraucht"
+  exit 1
+fi
+
+grep -E "lane budget [0-9]+ MiB =|NEXTN head graph captured|lane 0 ready|prefill tier" \
+  "$LOG" | tee "$OUT/contract_lines.txt"
 
 "$VENV/bin/python" "$DRIVER" \
   --base "http://127.0.0.1:$PORT" \
@@ -95,9 +108,13 @@ fi
   --out "$OUT/chunking_results.json"
 DRIVER_RC=$?
 
+curl -sf -m 30 "http://127.0.0.1:$PORT/get_server_info" > "$OUT/server_info.json"
+"$VENV/bin/py-spy" dump --pid "$(cat $PIDFILE 2>/dev/null)" > "$OUT/pyspy_before_kill.txt" 2>&1
 kill "$(cat $PIDFILE 2>/dev/null)" 2>/dev/null
+sleep 20
 kill $HB_PID 2>/dev/null
 stop_vram_sampler
-summarise_vram "$OUT/vram.csv" || true
-release_cards "#274 chunking window done rc=$DRIVER_RC"
+summarise_vram "$OUT/vram.csv" | tee "$OUT/vram_summary.txt"
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tee "$OUT/final_vram.txt"
+release_cards "#274 chunking window done rc=$DRIVER_RC, Rohdaten in $OUT"
 exit $DRIVER_RC
