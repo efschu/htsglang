@@ -328,7 +328,7 @@ def ctx_gate_eligible(
       (ctx > near_frac * threshold) and its remaining new-token budget can
       carry it past -- then DFLASH is not selected from the start instead of
       switching away mid-stream shortly after. Requests far below the
-      threshold are NOT pre-empted on budget alone (no answer-length
+      threshold are NOT preempted on budget alone (no answer-length
       estimator: a 2k-ctx request with a 16k budget usually stops early).
       A genuine mid-stream crossing is handled by the per-round-boundary
       eligibility check (switch cost ~1 round; no special path).
@@ -690,7 +690,7 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         )
     if server_args.speculative_draft_model_path is None:
         _fail(
-            "requires --speculative-draft-model pointing at the DFLASH draft "
+            "requires --speculative-draft-model-path pointing at the DFLASH draft "
             "checkpoint (the MTP rung drafts from the target checkpoint and "
             "needs no path)."
         )

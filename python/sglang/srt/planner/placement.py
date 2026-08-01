@@ -118,7 +118,7 @@ class PlacementFlags:
     #: high-accept ladder: one draft-graph pair PER RUNG, itemized).
     speculative_num_steps: Optional[int] = None
     speculative_adaptive: bool = False
-    #: Config dict of an EXTERNAL --speculative-draft-model (checkpoints
+    #: Config dict of an EXTERNAL --speculative-draft-model-path (checkpoints
     #: without their own MTP head): sized into the draft-weights segment.
     #: The webui resolves the path to this config; placement stays pure.
     speculative_draft_model_cfg: Optional[dict] = None
@@ -411,7 +411,7 @@ class RankBreakdown:
     mlp_dense_mib: float = 0.0
     experts_mib: float = 0.0
     #: Draft/speculative weights: the checkpoint's own MTP layers
-    #: (== mtp_mib) OR an external --speculative-draft-model's shard.
+    #: (== mtp_mib) OR an external --speculative-draft-model-path shard.
     draft_w_mib: float = 0.0
     draft_w_source: Optional[str] = None
     #: KV cache split: target layers vs draft/MTP layers (the cost model's
@@ -1130,7 +1130,7 @@ def _kv_replication_info(model, flags, base_plan, attn_heads):
 def _draft_weights(model, flags, mtp, base_plan, tp, notes):
     """Draft-weight segment source + per-rank MiB: the checkpoint's own MTP
     layers (already in the family model), or an EXTERNAL
-    --speculative-draft-model config sized through the same cost model
+    --speculative-draft-model-path config sized through the same cost model
     (tp=1 total, sharded by the base plan -- an estimate, noted)."""
     if mtp.present:
         return "mtp", list(mtp.per_rank_mib), (
@@ -1155,11 +1155,11 @@ def _draft_weights(model, flags, mtp, base_plan, tp, notes):
         sw = sum(base_plan) or tp
         per_rank = [total * w / sw / _MIB for w in base_plan]
         notes.append(
-            "draft weights are an EXTERNAL --speculative-draft-model sized "
+            "draft weights are an EXTERNAL --speculative-draft-model-path sized "
             "from its config and sharded by the base plan (estimate)."
         )
         return "external", per_rank, (
-            "draft = external --speculative-draft-model "
+            "draft = external --speculative-draft-model-path "
             f"({total / _GIB:.2f} GiB total), sharded by the base TP plan "
             "(estimate)."
         )
@@ -1503,7 +1503,7 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
                     f"{m.mtp_layers} MTP/nextn layer(s) appended after "
                     f"layer {m.n_layers}"
                     if draft_src == "mtp"
-                    else "external --speculative-draft-model (estimate)"
+                    else "external --speculative-draft-model-path (estimate)"
                 )
             )
             if draft_src
