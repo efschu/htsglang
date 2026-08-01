@@ -96,13 +96,31 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
     total_verdicts = 0
     all_regimes: List[str] = []
     for t in traces:
-        if t["summary"] is None:
+        # FACTS FIRST, judgement second. This loop used to `continue` past a
+        # missing summary, so a trace holding 93 603 verdicts was reported as
+        # "0 verdicts, regimes []" next to the real refusal -- the verdict was
+        # right and the diagnostics were misleading, which is the failure mode
+        # this whole tool exists to avoid (2026-08-01 window).
+        all_regimes.extend(regime_transitions(t["verdicts"]))
+        if t["summary"] is not None:
+            total_desyncs += int(t["summary"].get("desyncs", 0))
+            total_verdicts += int(t["summary"].get("verdicts", 0))
+            if t["summary"].get("uncoordinated"):
+                problems.append(
+                    f"{t['path']}: the run was UNCOORDINATED (multi-rank "
+                    f"group with no consensus channel), so rank agreement was "
+                    f"never checked and a zero desync count means nothing."
+                )
+        else:
+            # Count what the verdicts themselves show, so the reader sees the
+            # run's size even when its ending is missing.
+            total_verdicts += len(t["verdicts"])
+            total_desyncs += sum(1 for v in t["verdicts"] if v.get("agreed") is False)
             problems.append(
                 f"{t['path']}: no summary line. It is written on close, so "
                 f"its absence means the server was killed -- 'zero desyncs' "
                 f"would only mean 'zero so far'."
             )
-            continue
         if not t["verdicts"]:
             problems.append(
                 f"{t['path']}: no verdicts. The observer never reached a "
@@ -116,15 +134,6 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
         mode = (t["header"] or {}).get("mode")
         if mode not in ("observe", "act"):
             problems.append(f"{t['path']}: header mode is {mode!r}, expected observe")
-        total_desyncs += int(t["summary"].get("desyncs", 0))
-        total_verdicts += int(t["summary"].get("verdicts", 0))
-        if t["summary"].get("uncoordinated"):
-            problems.append(
-                f"{t['path']}: the run was UNCOORDINATED (multi-rank group "
-                f"with no consensus channel), so rank agreement was never "
-                f"checked and a zero desync count means nothing."
-            )
-        all_regimes.extend(regime_transitions(t["verdicts"]))
 
     distinct = sorted(set(r for r in all_regimes if r))
     if len(distinct) < 2:

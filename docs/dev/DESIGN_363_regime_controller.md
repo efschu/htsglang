@@ -883,3 +883,85 @@ needs a card:
 
 Until all four are recorded in an evidence file, `--regime-controller act`
 does not start a server.
+
+---
+
+## 13. First card window (2026-08-01) — neither gate passed, four findings
+
+10 minutes on cards 0,1,2. Recorded here because two of the four are defects
+in this design's own wiring, and one of those is the kind only a rig can find.
+
+### 13.1 What held
+
+FP8 TP=3 uneven, 26 requests, 0 errors. **93 603 verdicts across three ranks,
+0 unparsable lines, `agreed=True` on every one — zero desyncs.** The tier-L
+spread came back on 92 028 of them. The rank-uniformity property §3.1 could
+only assert hermetically holds on three real ranks, and the consensus routing
+of the rank-local tier works end to end. That is the substantive positive
+result, and it is most of gate 1's content — it just cannot be *recorded* as
+gate 1 for the reason in §13.3.
+
+### 13.2 The headline defect: an idle round read as prefill
+
+The regime histogram was `prefill_heavy` 93 600, `mixed` 3, on a rig that was
+idle most of the window.
+
+Cause: the scheduler hook computed a BOOLEAN by negating #287's "is this a
+decode round", so an EMPTY batch landed on the prefill side. §3.2 says an idle
+window must read `MIXED` — an idle window is no measurement, not 0 % prefill —
+and `RegimeSample` already encodes that correctly by returning `None` shares
+on an empty window. The bug was entirely in the mapping that produced the
+input, and the hermetic tests never touched it because **they passed
+`prefill_active` directly**. A test that supplies the value under test cannot
+falsify the code that computes it.
+
+Fixed: the hook passes a three-way `phase` (`prefill` / `decode` / `idle`),
+idle counts in the round index and in neither share, and an unknown phase is
+refused by name. The prefill/decode split for a round that *has* work is still
+#287's, so the two controllers do not disagree about a working round. Four new
+cases pin it, one of which drives the scheduler's own mapping rather than the
+observer's parameter.
+
+### 13.3 Gate 1 refused, correctly, on its own checks
+
+No summary line: **nothing calls `observer.close_trace()` at shutdown**. The
+writer landed in the phase-2 slice; the shutdown hook did not. `readout.py`
+refuses a trace without a summary because "zero desyncs" and "zero desyncs so
+far" are different claims — so the tooling was right and the wiring was
+incomplete. Gate 2 was not run: it needs the same summary.
+
+Also found in the reader itself: `judge()` `continue`d past a missing summary
+and therefore reported "0 verdicts, regimes []" for a trace holding 93 603 of
+them. The verdict was right and the diagnostics were misleading, which is the
+failure mode the tool exists to prevent. Fixed: collect facts first, judge
+second.
+
+### 13.4 The vehicle, and three boots spent on it
+
+* **INT8-W8A8 does not boot on this build**: `NotImplementedError: No
+  implemented int8_scaled_mm for current compute capability` (sgl_kernel
+  0.3.21), surfacing inside the cuda-graph cold-build window so the visible
+  error is a `ColdBuildWindowError`. The runsheet's vehicle is now the FP8
+  reference arm.
+* `deep_gemm` hard-requires `libnvrtc.so.13`, which the venv ships under
+  `nvidia/cu13/lib` and does not put on the loader path.
+* The runsheet carried vLLM flag spellings, and `--speculative-algorithm
+  NEXTN` auto-chooses all three spec params and asserts the others are unset.
+
+All corrected in `RUNSHEET_363_card_gates.md` §0a.
+
+### 13.5 Ready-wait discipline, three ways to get it wrong
+
+Every one of these cost a boot: `Failed to` matches the benign `Ignore import
+error when loading ...` lines; `sigquit` matches `custom_sigquit_handler=None`
+inside the `server_args=ServerArgs(...)` dump; and any `pgrep -f` / `pkill -f`
+pattern naming the server also matches the checking shell (exit 144,
+self-kill). Terminal-state patterns need an exclusion list and an anchor, and
+process cleanup needs PIDs captured at launch rather than a pattern.
+
+### 13.6 Still outstanding for gates 1+2
+
+The observe path is now believed correct, but the run must be repeated: the
+idle mapping changed what the classifier reports, so the 93 603 verdicts
+describe the OLD behaviour. The next window needs `close_trace()` wired to
+shutdown first — that is a desk task, not a card one.
