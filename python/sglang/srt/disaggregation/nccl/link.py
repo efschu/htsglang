@@ -35,6 +35,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -114,8 +115,21 @@ class KvLink(abc.ABC):
     name: str = "abstract"
 
     @abc.abstractmethod
-    def setup(self, *, session_id: str, is_sender: bool, peer: str) -> None:
-        """Establish the connection. Bounded; raises rather than blocking."""
+    def setup(
+        self,
+        *,
+        session_id: str,
+        is_sender: bool,
+        peer: str,
+        expected_world_size: Optional[int] = None,
+    ) -> None:
+        """Establish the connection. Bounded; raises rather than blocking.
+
+        ``expected_world_size`` is the member count bootstrap agreed on. A
+        member that forms a group MUST check what it was handed against it
+        (#259's fixed universe): a short world rendezvouses successfully and
+        then silently moves a subset of the rows.
+        """
 
     @abc.abstractmethod
     def register(self, regions: Sequence[MemoryRegion]) -> None:
@@ -145,6 +159,106 @@ class KvLink(abc.ABC):
         """Release. Idempotent; never raises on a already-closed link."""
 
 
+def bounded_formation(
+    factory: Callable[[], Any],
+    *,
+    peer: str,
+    timeout_s: float = DEFAULT_LINK_TIMEOUT_S,
+) -> Any:
+    """Run a group-formation call under a wall-clock bound.
+
+    FORMATION IS A WAIT -- the first one, and the one most likely to hang. A
+    rendezvous blocks until every declared peer arrives, and torch's TCPStore
+    carries its own default measured in tens of minutes, which silently wins
+    over any bound this module declares elsewhere. Calling the factory bare
+    made "every wait is bounded" false for exactly the wait that matters:
+    #259's defect, one layer above where #259 found it.
+
+    Why a thread and not ``bounded_collective``: the #312 helpers bound a
+    collective ON an existing group, and here the group is what does not exist
+    yet. There is nothing to poll, so the bound has to be wall-clock around
+    the call. The worker thread is left daemon on timeout -- a rendezvous
+    stuck in the store cannot be interrupted from outside, so the honest
+    behaviour is to stop WAITING on it and say so, not to pretend it was
+    cancelled.
+    """
+    import threading
+
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = factory()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            box["error"] = exc
+
+    t = threading.Thread(target=_run, daemon=True, name=f"kvlink-formation-{peer}")
+    started = time.monotonic()
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise LinkTimeoutError(
+            f"group formation with peer {peer} did not complete within "
+            f"{timeout_s:.0f}s (waited {time.monotonic() - started:.1f}s). The "
+            "rendezvous is still blocked in the store; this bound exists "
+            "because the store's own default is tens of minutes and would "
+            "otherwise decide the timeout (#259)."
+        )
+    if "error" in box:
+        raise LinkError(
+            f"group formation with peer {peer} failed: "
+            f"{type(box['error']).__name__}: {box['error']}"
+        ) from box["error"]
+    return box.get("value")
+
+
+def verify_world(
+    group: Any,
+    *,
+    expected_world_size: Optional[int],
+    peer: str,
+    world_size_fn: Optional[Callable[[Any], int]] = None,
+) -> None:
+    """Check the world we were HANDED against the one bootstrap agreed on.
+
+    The fixed-universe rule (#259) is stated in this module and was, until
+    now, only stated: a factory that quietly discovers its members, or builds
+    a smaller world because one peer was slow to arrive, produced a link that
+    looked correct. A short world is not a formation error -- every present
+    rank rendezvouses successfully -- so nothing raises, and the transfer
+    later moves a subset of the rows with no indication that it did.
+
+    ``expected_world_size=None`` means the caller did not carry a
+    bootstrap-agreed count; the check is then skipped and says so, rather than
+    inventing an expectation.
+    """
+    if expected_world_size is None:
+        return
+    if world_size_fn is None:
+
+        def world_size_fn(g: Any) -> int:
+            import torch.distributed as dist
+
+            return int(dist.get_world_size(g))
+
+    try:
+        actual = int(world_size_fn(group))
+    except Exception as exc:  # noqa: BLE001 - an unreadable world is a failure
+        raise LinkError(
+            f"cannot read the world size of the group formed with {peer}, so "
+            f"the fixed-universe rule cannot be checked: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if actual != int(expected_world_size):
+        raise LinkError(
+            f"group formed with {peer} has world size {actual}, but bootstrap "
+            f"agreed on {int(expected_world_size)}. A short world is not a "
+            "formation error -- every present rank rendezvouses fine -- so "
+            "this is checked rather than trusted: transferring into it would "
+            "move a subset of the rows with nothing to indicate it."
+        )
+
+
 class LoopbackLink(KvLink):
     """An in-process link that copies between two local buffer sets.
 
@@ -165,7 +279,22 @@ class LoopbackLink(KvLink):
         #: Every transfer, for tests that assert on the block plan itself.
         self.transfers: List[Dict[str, Any]] = []
 
-    def setup(self, *, session_id: str, is_sender: bool, peer: str) -> None:
+    def setup(
+        self,
+        *,
+        session_id: str,
+        is_sender: bool,
+        peer: str,
+        expected_world_size: Optional[int] = None,
+    ) -> None:
+        # Loopback's universe is one local pair by construction, so an
+        # expectation other than 1 is a caller error rather than a short world.
+        if expected_world_size is not None and int(expected_world_size) != 1:
+            raise LinkError(
+                f"loopback link is a single local pair (world size 1) but the "
+                f"caller expects {expected_world_size}; the fixed-universe "
+                "check would silently pass on a link that has no peers"
+            )
         self._open = True
         self.session_id = session_id
         self.peer = peer
@@ -257,15 +386,26 @@ class NcclLink(KvLink):
         *,
         group_factory: Optional[Callable[..., Any]] = None,
         timeout_s: float = DEFAULT_LINK_TIMEOUT_S,
+        world_size_fn: Optional[Callable[[Any], int]] = None,
     ) -> None:
         self._group = None
         self._group_factory = group_factory
         self._timeout_s = timeout_s
+        #: Injectable so the fixed-universe check is exercisable without a
+        #: real process group; production leaves it None -> torch.distributed.
+        self._world_size_fn = world_size_fn
         self._regions: List[MemoryRegion] = []
         self.peer: Optional[str] = None
         self.session_id: Optional[str] = None
 
-    def setup(self, *, session_id: str, is_sender: bool, peer: str) -> None:
+    def setup(
+        self,
+        *,
+        session_id: str,
+        is_sender: bool,
+        peer: str,
+        expected_world_size: Optional[int] = None,
+    ) -> None:
         self.session_id = session_id
         self.peer = peer
         self.is_sender = is_sender
@@ -276,8 +416,22 @@ class NcclLink(KvLink):
                 "universe, #259), never discovered by asking the group who is "
                 "present. Pass group_factory=... from the KV manager."
             )
-        self._group = self._group_factory(
-            session_id=session_id, is_sender=is_sender, peer=peer
+        # BOUNDED: formation is a wait, and the store's own default would
+        # otherwise decide the timeout. See bounded_formation.
+        self._group = bounded_formation(
+            lambda: self._group_factory(
+                session_id=session_id, is_sender=is_sender, peer=peer
+            ),
+            peer=peer,
+            timeout_s=self._timeout_s,
+        )
+        # CHECKED, not trusted: the world we were handed must be the world
+        # bootstrap agreed on. See verify_world.
+        verify_world(
+            self._group,
+            expected_world_size=expected_world_size,
+            peer=peer,
+            world_size_fn=self._world_size_fn,
         )
 
     def register(self, regions: Sequence[MemoryRegion]) -> None:

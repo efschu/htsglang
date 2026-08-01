@@ -46,8 +46,10 @@ from sglang.srt.disaggregation.nccl.link import (
     NcclLink,
     TransferBlock,
     available_links,
+    bounded_formation,
     get_link,
     register_link,
+    verify_world,
 )
 
 __all__ = [
@@ -66,10 +68,12 @@ __all__ = [
     "TransferBlock",
     "TransportIdentity",
     "available_links",
+    "bounded_formation",
     "get_link",
     "identity_from_args",
     "net_for_class",
     "plan_blocks",
     "register_link",
     "resolve_route",
+    "verify_world",
 ]

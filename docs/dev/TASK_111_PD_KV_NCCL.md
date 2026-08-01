@@ -147,15 +147,35 @@ One prefill instance + one decode instance, hybrid GDN model (Qwen3.6-27B class
 4. **Partial registration fails loudly.** Inject a failing region and confirm
    the boot dies naming the region, rather than serving with one component
    unregistered (#221's failure mode).
-5. **Peer death ends the wait.** Kill the prefill instance mid-transfer; the
-   decode side must surface a named error within the bound, never spin (#312).
-   Run it in both directions.
+5. **Peer death ends the wait — in BOTH windows, and they are different
+   failures.** Run two arms, because the two deaths mean different things to a
+   caller and must not share an error type:
+   * **mid-FORMATION** (kill the peer *before* the group forms): the pairing
+     never happened, no bytes moved, the session is safe to retry from
+     scratch. Must surface as `LinkTimeoutError` from `bounded_formation`
+     within the declared bound — NOT after the store's own multi-minute
+     default.
+   * **mid-TRANSFER** (kill the peer *during* `transfer()`): the session is
+     half-moved and the KV state is ambiguous; a retry is not obviously safe.
+   Run each in both directions (prefill dies / decode dies).
 6. **Handshake refusal on a real mismatch.** Boot the two sides with different
    `--kv-cache-dtype` and confirm the refusal fires before the first transfer.
 7. **Per-class net pinning takes.** With `--collective-net-small` and
    `--collective-net-bulk` on different interfaces, confirm the bulk KV rides
    the fast wire — the #212 measurement (105 MB/s LAN vs ~1930 MB/s RoCE) is
    the reason this is worth checking rather than assuming.
+
+**Front-loaded residuals (the review's R6 and R8).** These two produce WRONG
+BYTES rather than NO BYTES, so they are checked before anything optional:
+
+* **R6 — byte identity over the WIRE, not in-process.** The loopback gate
+  proves the block plan is right; it does not prove NCCL moved the bytes
+  unchanged. Endianness, padding and stride assumptions all live past the
+  seam. Compare decode-side KV bytes against the source for the same payload.
+* **R8 — DCP row ownership.** Loopback has one owner by construction, so
+  nothing so far has exercised a transfer where sender and receiver disagree
+  about which rank holds which row. Run at least one token-sharded arm and
+  confirm rows land where the owner rule says, not merely that bytes arrived.
 
 Not in scope for the first window: a throughput claim against mooncake. Correct
 and loud first; the comparison is its own ticket once the path is proven.
@@ -169,3 +189,47 @@ and loud first; the comparison is its own ticket once the path is proven.
    between two instances is unwritten — it belongs with (1).
 4. No `--disaggregation-kv-link` server flag yet; adding one before the backend
    works would be a knob that selects a `NotImplementedError`.
+
+
+---
+
+## Review preconditions (#111 review, merged as REVIEW_111_nccl_link.md)
+
+All three were "an invariant this module states but does not check", and all
+three are now checked. Cheapest to fix at the desk, most expensive to discover
+on hardware.
+
+**Axis 5, DEFECT — the identity handshake excluded `dcp_size`.** The exclusion
+reasoned from PD's support for differing prefill/decode TP, which is a fact
+about the STATE/HEAD axis (`state_dim_per_tensor` / `state_dim_offsets` let the
+sender re-slice). DCP shards the TOKEN axis — slot `L` on rank `L % S` at row
+`L // S` — and no offset table re-derives row ownership. A `dcp_size=1` prefill
+against a `dcp_size=3` decode waved through the handshake and would have become
+wrong-bytes the moment `transfer()` worked. Fixed by comparing `dcp_size` AND a
+derived `row_ownership` descriptor `(S, lo, hi)` taken from
+`dcp_weighted_owner_bounds` — the same owner rule the pools use, never
+re-derived. Keeping the descriptor (rather than `dcp_size` alone) means a
+future differing-DCP PD is legal exactly when the row mappings genuinely agree.
+
+**Axis 2, DEFECT — formation was the one unbounded wait.** `setup()` called the
+injected factory bare, so torch's TCPStore default (tens of minutes) decided
+the timeout and the module's declared 120 s was false for the wait most likely
+to hang: #259's shape, one layer above where #259 found it. Fixed with
+`bounded_formation`, a wall-clock bound around the call — deliberately not the
+#312 helpers, which bound a collective ON an existing group, and here the group
+is what does not exist yet. On timeout the worker thread is left daemon and
+said to be still blocked, rather than pretending it was cancelled.
+
+**Axis 1, RISK — the fixed universe was asserted, not checked.** A factory that
+discovers members, or builds a smaller world because a peer was slow, produces
+a link that looks correct: a short world rendezvouses fine, nothing raises, and
+the transfer later moves a subset of the rows. Fixed with `verify_world`,
+called from `setup()` against the bootstrap-agreed count. `None` skips the
+check and says so rather than inventing an expectation; an unreadable world is
+a failure, not a pass.
+
+Tests: +16 hermetic cases. Falsifier-checked — reverting the identity fix reds
+5, unbinding formation reds 1 (and the run takes 40 s instead of 9, which is
+the hang), skipping the world check reds 3. One previously-passing test,
+`test_differing_dcp_is_allowed`, encoded the defect and is now inverted to
+`test_differing_dcp_is_REFUSED`.

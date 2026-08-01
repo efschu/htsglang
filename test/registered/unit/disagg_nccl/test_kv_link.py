@@ -355,3 +355,103 @@ class TestLinkRegistry(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBoundedFormation(CustomTestCase):
+    """#111 review, Axis 2 (DEFECT): formation is a wait, and it was the one
+    unbounded one. The store's own default is tens of minutes and would
+    otherwise decide the timeout -- #259's shape, one layer up."""
+
+    def test_a_prompt_factory_returns_its_value(self):
+        from sglang.srt.disaggregation.nccl import bounded_formation
+
+        sentinel = object()
+        self.assertIs(
+            bounded_formation(lambda: sentinel, peer="p", timeout_s=5.0), sentinel
+        )
+
+    def test_a_hanging_factory_is_bounded_and_names_the_peer(self):
+        import time as _t
+
+        from sglang.srt.disaggregation.nccl import LinkTimeoutError, bounded_formation
+
+        started = _t.monotonic()
+        with self.assertRaises(LinkTimeoutError) as cm:
+            bounded_formation(lambda: _t.sleep(30), peer="decode-7:8998", timeout_s=0.3)
+        self.assertLess(_t.monotonic() - started, 5.0, "the bound did not bind")
+        msg = str(cm.exception)
+        self.assertIn("decode-7:8998", msg)
+        self.assertIn("#259", msg)
+
+    def test_a_raising_factory_surfaces_as_a_link_error(self):
+        from sglang.srt.disaggregation.nccl import LinkError, bounded_formation
+
+        with self.assertRaises(LinkError) as cm:
+            bounded_formation(
+                lambda: (_ for _ in ()).throw(RuntimeError("store refused")),
+                peer="p",
+                timeout_s=5.0,
+            )
+        self.assertIn("store refused", str(cm.exception))
+
+    def test_nccl_setup_goes_through_the_bound(self):
+        """The seam-level check: a hanging factory must not hang setup()."""
+        import time as _t
+
+        from sglang.srt.disaggregation.nccl import LinkTimeoutError
+
+        link = NcclLink(group_factory=lambda **kw: _t.sleep(30), timeout_s=0.3)
+        with self.assertRaises(LinkTimeoutError):
+            link.setup(session_id="s", is_sender=True, peer="p")
+
+
+class TestFixedUniverseIsChecked(CustomTestCase):
+    """#111 review, Axis 1 (RISK): the fixed-universe rule was asserted in
+    prose and never checked. A factory that builds a SHORT world rendezvouses
+    successfully -- nothing raises -- and the transfer then moves a subset of
+    the rows with no indication that it did."""
+
+    def _link(self, world):
+        return NcclLink(
+            group_factory=lambda **kw: object(), world_size_fn=lambda g: world
+        )
+
+    def test_a_matching_world_passes(self):
+        self._link(3).setup(
+            session_id="s", is_sender=True, peer="p", expected_world_size=3
+        )
+
+    def test_a_short_world_is_refused_with_both_numbers(self):
+        with self.assertRaises(LinkError) as cm:
+            self._link(2).setup(
+                session_id="s", is_sender=True, peer="p", expected_world_size=3
+            )
+        msg = str(cm.exception)
+        self.assertIn("world size 2", msg)
+        self.assertIn("agreed on 3", msg)
+
+    def test_a_larger_world_is_also_refused(self):
+        with self.assertRaises(LinkError):
+            self._link(4).setup(
+                session_id="s", is_sender=True, peer="p", expected_world_size=3
+            )
+
+    def test_no_expectation_skips_the_check_rather_than_inventing_one(self):
+        self._link(99).setup(session_id="s", is_sender=True, peer="p")
+
+    def test_an_unreadable_world_is_a_failure_not_a_pass(self):
+        link = NcclLink(
+            group_factory=lambda **kw: object(),
+            world_size_fn=lambda g: (_ for _ in ()).throw(RuntimeError("no group")),
+        )
+        with self.assertRaises(LinkError) as cm:
+            link.setup(session_id="s", is_sender=True, peer="p", expected_world_size=3)
+        self.assertIn("cannot read the world size", str(cm.exception))
+
+    def test_loopback_refuses_a_multi_member_expectation(self):
+        """Loopback is one local pair; passing an expectation it cannot honour
+        must not silently satisfy the fixed-universe check."""
+        with self.assertRaises(LinkError):
+            LoopbackLink().setup(
+                session_id="s", is_sender=True, peer="p", expected_world_size=3
+            )
