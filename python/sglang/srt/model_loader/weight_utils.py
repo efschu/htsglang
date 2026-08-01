@@ -1270,6 +1270,7 @@ def gguf_quant_weights_iterator(
     )
     from sglang.srt.model_loader.gguf_shards import (
         declared_tensor_count,
+        make_stream_page_dropper,
         resolve_gguf_shard_paths,
     )
 
@@ -1279,7 +1280,14 @@ def gguf_quant_weights_iterator(
     # a merged file would present, rather than per-shard pass1+pass2.
     shard_paths = resolve_gguf_shard_paths(gguf_file)
     readers = [gguf.GGUFReader(path, "r") for path in shard_paths]
-    all_tensors = [tensor for reader in readers for tensor in reader.tensors]
+    all_tensors = []
+    # (shard index, index within that shard) per tensor, so the page-cache
+    # dropper below can name the region a tensor occupies in its own file.
+    tensor_origin: List[Tuple[int, int]] = []
+    for shard_index, reader in enumerate(readers):
+        for tensor_index, tensor in enumerate(reader.tensors):
+            all_tensors.append(tensor)
+            tensor_origin.append((shard_index, tensor_index))
 
     expected_tensors = declared_tensor_count(gguf_file)
     if expected_tensors is not None and len(all_tensors) != expected_tensors:
@@ -1342,55 +1350,82 @@ def gguf_quant_weights_iterator(
                 weight_type_name = gguf_quantized_name(name, "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
 
-    # Second pass: yield actual weights
-    for tensor in all_tensors:
-        weight = tensor.data
-        tensor_name = tensor.name
-        source_type = tensor.tensor_type
-        weight_type = repacked_gguf_type(source_type, tensor_name)
+    # Second pass: yield actual weights.
+    #
+    # #391: this is the only place in the loader that faults GGUF payload pages
+    # in, so it is also the only place that can give them back. `dropper` marks
+    # each tensor's byte range droppable ONE ITERATION AFTER the loop has passed
+    # it -- i.e. only once the consumer has come back for the next item, which
+    # means the copy out of the mapping (torch.tensor / repacked_gguf_bytes)
+    # has certainly completed. Skipped tensors are marked too: the stream has
+    # passed them and nothing downstream will read their payload.
+    #
+    # Under TP each rank runs its own dropper over the same files. That is not a
+    # cross-rank hazard: madvise only unmaps the calling process's PTEs, and the
+    # following fadvise can only free pages no process still maps -- a rank that
+    # is behind keeps its own pages until it passes them itself.
+    dropper = make_stream_page_dropper(shard_paths, readers)
+    previous_origin: Optional[Tuple[int, int]] = None
+    try:
+        for tensor, origin in zip(all_tensors, tensor_origin):
+            if previous_origin is not None:
+                dropper.consume(*previous_origin)
+            previous_origin = origin
 
-        # Check if this is a MoE expert weight (packed format)
-        is_moe_weight = any(
-            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
-        )
+            weight = tensor.data
+            tensor_name = tensor.name
+            source_type = tensor.tensor_type
+            weight_type = repacked_gguf_type(source_type, tensor_name)
 
-        if is_moe_weight:
-            # MoE weights: split packed format into individual expert weights
-            import re
+            # Check if this is a MoE expert weight (packed format)
+            is_moe_weight = any(
+                pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+            )
 
-            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
-            if match:
-                layer_id = int(match.group(1))
-                weight_pattern = match.group(2)
-                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+            if is_moe_weight:
+                # MoE weights: split packed format into individual expert weights
+                import re
 
-                if hf_weight_name:
-                    # Packed format: [num_experts, ...]
-                    num_experts = weight.shape[0]
-                    for expert_id in range(num_experts):
-                        # Repack per expert, not per stacked tensor: a Q5_0
-                        # block is self-contained and the split runs on whole
-                        # blocks, so one expert's slice repacks to a valid
-                        # payload on its own -- and the transient buffer stays
-                        # one expert wide instead of one layer wide.
-                        expert_weight = repacked_gguf_bytes(
-                            source_type, weight[expert_id], tensor_name
-                        )
+                match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+                if match:
+                    layer_id = int(match.group(1))
+                    weight_pattern = match.group(2)
+                    hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
 
-                        if weight_type.name != "F32":
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
-                        else:
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
+                    if hf_weight_name:
+                        # Packed format: [num_experts, ...]
+                        num_experts = weight.shape[0]
+                        for expert_id in range(num_experts):
+                            # Repack per expert, not per stacked tensor: a Q5_0
+                            # block is self-contained and the split runs on whole
+                            # blocks, so one expert's slice repacks to a valid
+                            # payload on its own -- and the transient buffer stays
+                            # one expert wide instead of one layer wide.
+                            expert_weight = repacked_gguf_bytes(
+                                source_type, weight[expert_id], tensor_name
+                            )
 
-                        yield hf_name, torch.tensor(expert_weight)
-        elif tensor_name in gguf_to_hf_name_map:
-            # Normal weight handling
-            name = gguf_to_hf_name_map[tensor_name]
+                            if weight_type.name != "F32":
+                                hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
+                            else:
+                                hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
 
-            if weight_type.name != "F32":
-                name = gguf_quantized_name(name, "qweight")
-            param = torch.tensor(repacked_gguf_bytes(source_type, weight, tensor_name))
-            yield name, param
+                            yield hf_name, torch.tensor(expert_weight)
+            elif tensor_name in gguf_to_hf_name_map:
+                # Normal weight handling
+                name = gguf_to_hf_name_map[tensor_name]
+
+                if weight_type.name != "F32":
+                    name = gguf_quantized_name(name, "qweight")
+                param = torch.tensor(
+                    repacked_gguf_bytes(source_type, weight, tensor_name)
+                )
+                yield name, param
+
+        if previous_origin is not None:
+            dropper.consume(*previous_origin)
+    finally:
+        dropper.close()
 
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
@@ -1518,7 +1553,6 @@ def runai_safetensors_weights_iterator(
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-
         streamer.stream_files(
             hf_weights_files,
             device=device,
@@ -1717,9 +1751,9 @@ class KVCacheQuantSchema(BaseModel):
                     f"{len(layer_maps)}."
                 )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                assert i in self.scaling_factor, (
+                    f"KV cache scales map for TP rank {i} not found."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1867,9 +1901,9 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             int(output_size / total_output_size * raw_output_size)
             for output_size in output_sizes
         ]
-        assert (
-            sum(weight_split_size) == raw_output_size
-        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        assert sum(weight_split_size) == raw_output_size, (
+            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        )
 
         split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
         for i, output_size in enumerate(output_sizes):

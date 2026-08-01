@@ -1577,6 +1577,19 @@ class Envs:
     # before the repack existed. There is no silent middle ground.
     SGLANG_GGUF_MXFP4_REPACK = EnvBool(True)
 
+    # #391: release the page cache behind the GGUF weight stream. gguf-py's
+    # reader maps every part with np.memmap, so reading the stream faults the
+    # whole checkpoint into the page cache and never gives it back -- ~48+ GiB
+    # of clean file pages competing with the loader's own anonymous memory on a
+    # swapless box (boot attempt 8 died exactly there: memory.current pinned at
+    # 98.3 of 98.5 GiB while the kernel traded file pages for anon one for one).
+    # With this on, each consumed region is madvise(MADV_DONTNEED)'d and then
+    # posix_fadvise(POSIX_FADV_DONTNEED)'d as the stream advances. Read-only
+    # shared mapping of an unmodified file: an advised range re-faults the same
+    # bytes, so the streamed bytes are identical either way. Set to False to
+    # restore the pre-#391 accumulation.
+    SGLANG_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================

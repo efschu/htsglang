@@ -90,6 +90,7 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_LANE_POOL_CHECKSUM_TAIL` | `N` only to disarm the probe on purpose | the probe's own **can-fail** arm: hash `N` slots of the FREED TAIL instead of the committed prefix. The rejected candidates' pointers are still in the row past `committed_len`, so this reads a region a real leak never touches and the probe misses by construction. Use it to prove an instrument was calibrated, never in a window that is asked a question |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 | `SGLANG_GGUF_MXFP4_REPACK` | leave unset (default on); `0` only to refuse MXFP4 | repacks GGUF MXFP4 (ggml type 39) tensors to Q5_0 while the weight stream is read (`model_loader/gguf_mxfp4_repack.py`). Value-exact — every element dequantizes to the same fp32 number — and it is the only reason a checkpoint carrying MXFP4 boots at all: no GGUF kernel dispatches on type 39. It costs 22/17 = 1.294x the bytes of the repacked tensors, in host RAM and in VRAM; the boot log states the exact inflation. Set to `0` and the load is refused by name instead — there is no silent middle ground. See section 4.5.3 |
+| `SGLANG_GGUF_STREAM_DROP_CACHE` | leave unset (default on); `0` only to reproduce the boot-8 host wall | releases the checkpoint's page cache BEHIND the weight stream (`model_loader/gguf_shards.py`). gguf-py maps every part with `np.memmap`, so reading a 119 GiB export faults all of it into the page cache and nothing ever asks for it back — on the swapless box that cache competes with the loader's own anonymous memory and wins the race to the limit (section 4.5.5). On, each region is advised away once the stream has passed it; the load log ends with `released N GiB of checkpoint page cache behind the consumer`. Off, the pages accumulate for the whole load. The streamed bytes are identical either way — a read-only shared mapping of an unmodified file re-faults the same bytes — and this is pinned by `test/registered/unit/model_loader/test_gguf_stream_page_cache.py` |
 | `SGLANG_MOE_GGUF_STREAM_STAGING` | leave unset (default on); `0` only to reproduce the pre-#391c load | GGUF MoE expert offload only. On, each expert is copied into its resident slot or its pinned host row **as it leaves the weight stream** and dropped, so the load's host peak is the pinned tier plus one layer's incomplete expert set. Off, the loader accumulates the complete owned expert set in host RAM first and the residency plan only acts on it at `process_weights_after_loading` — which is what OOM-killed the DeepSeek-V4-Flash boot at 90.7 GiB of anon on this 98.5 GiB swapless box. Consulted only when the offload already covers the layer, so a default GGUF boot is byte-identical either way. See section 4.6 |
 | `SGLANG_MOE_STAGING_TRACE` | `1` for diagnosis only | one INFO line per MoE layer, emitted **during** the load at the layer's staging boundary, carrying the stager's own cumulative byte accounting (streamed / resident / pinned-host / delegated, in-flight now and peak, and peak host held). Line prefix `[moe-staging-trace]`. This is what an external RAM monitor's anon curve is cross-checked against — the cumulative `pinned(host)` figure should track it, and `in-flight peak` is the bulge it is allowed |
 | `SGLANG_MM_FRONTEND_GPU_PREPROCESS` | leave unset (default off) | `1` lets the GPU-passive tokenizer process preprocess multimodal data on `base_gpu_id` again (nvJPEG decode, fast-image-processor resize/normalize, pinned video frames) — the pre-#403 behavior. The context it opens is invisible to every per-rank budget and to `--rank-auto-reserve-mib`; if you set this, subtract it from rank 0 by hand. See section 6.8 |
@@ -881,11 +882,67 @@ handled in the code — none of them belongs in a boot script any more:
 Attention TP on this model is capped at `o_groups` = 8 ranks, refused by name
 above that.
 
-The open blocker is unchanged and unrelated to the above: the routed `down`
-projections are MXFP4 (section 4.5.3 repacks them to Q5_0, which costs
-+14 GiB) and host RAM is the binding constraint — boot attempt 5 was killed by
-the OOM killer during weight load with `SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.36`
-and `SGLANG_MOE_SCRATCH_SLOTS=4` (~81 GiB pinned of ~88 GiB usable).
+Host RAM is the binding constraint on this route, and every code wall in the
+load path is cleared as of boot attempt 8 — 26 of 43 layers streamed with zero
+weight-loading warnings and zero unmatched tensors before the host box killed
+it. What is left is a memory-budget question, and it has two halves: the page
+cache (section 4.5.5) and the watchdog that is supposed to catch the rest.
+
+**Watch host RAM with `scripts/dsv4/rammon.sh`, not with a per-boot copy.**
+
+```bash
+setsid bash "$WT/scripts/dsv4/rammon.sh" \
+  --pidfile "$RUN/boot.pid" --out "$RUN/ram.log" \
+  --margin-gib 6 --interval 15 &
+```
+
+It guards on **`memory.current`**, the number the OOM killer itself compares
+against the limit, and stops only the launched process group. The per-boot
+`rammonN.sh` scripts guarded on `anon` and that guard is structurally blind:
+boot 8 died with anon at 32.9 GiB against a 93 GiB anon guard, because the
+other 63.8 GiB was page cache. `anon + file`, `file - inactive_file` and
+`MemAvailable` are all the same trap in different clothing — reclaimable is not
+reclaimable IN TIME, which is exactly what boot 8 demonstrated. Replayed
+against `ram8.log`, the `memory.current` guard fires at 16:58:28, seven minutes
+before the kill at 17:05:19.
+
+### 4.5.5 The GGUF page cache is released behind the stream (#391)
+
+`gguf.GGUFReader` maps each part with `np.memmap` and hands out views into it,
+so streaming a 119 GiB export pulls the whole thing into the page cache and
+nothing gives it back. On the 98.5 GiB swapless box that is not a cosmetic
+cost. Boot attempt 8 (`/spinning/gpu-battery-results/2026-08-01_391_dsv4flash8`)
+sat at `memory.current` 98.3–98.4 GiB for seven minutes while the kernel traded
+file pages for anon almost byte for byte — `file` 81.6 → 63.8 GiB as `anon`
+15.1 → 32.9 GiB — until a 2.4 GiB anon burst inside one 15 s window outran
+reclaim and `oom_kill` fired at `memory.peak` 98.55 GiB. Steady-state anon
+extrapolates to ~55–57 GiB: the load fits, the cache was the only thing in the
+way. Tuning `SGLANG_MOE_RESIDENT_EXPERT_FRACTION` cannot reach this — down
+means more host anon, up means the VRAM wall.
+
+The loader now advises each region away as the stream passes it
+(`SGLANG_GGUF_STREAM_DROP_CACHE`, default on). Two details worth knowing before
+touching that code:
+
+- **`posix_fadvise(POSIX_FADV_DONTNEED)` on the fd is the wrong syscall here.**
+  `invalidate_mapping_pages()` skips pages that are still mapped, and on the ZFS
+  pool the checkpoints live on it does not free them after the unmap either.
+  Measured on a 64 MiB file: read through a memmap, then madvise(DONTNEED) +
+  fadvise + unmap + fadvise again → 16384 of 16384 pages still resident by
+  `mincore(2)`. `madvise(MADV_PAGEOUT)` — ordinary reclaim, not invalidate —
+  takes the same file to 0.
+- **Advice never runs ahead of the consumer.** A region is released only once
+  every tensor holding a byte in it has been passed, and the range is cut at the
+  page boundary below the first unconsumed tensor, so a page shared by two
+  neighbouring tensors is held until both are done.
+
+Expect `memory.current` to hold near **~66 GiB** for the whole load (≈57 GiB
+anon plus the working set), instead of pinning at the limit. A page cache left
+over from an earlier attempt of the same checkpoint needs no separate reset:
+those are the same pages the stream re-maps, and the loader pages them out as it
+consumes them. The load log ends with `GGUF stream: released N GiB of checkpoint
+page cache behind the consumer in M advice call(s)`; if that line is missing the
+feature did not run and the run says nothing about the host budget.
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 

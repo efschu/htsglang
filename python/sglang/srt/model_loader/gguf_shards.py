@@ -21,7 +21,8 @@ loader agrees on the same answer:
 
 * :func:`resolve_gguf_shard_paths` -- the ordered set, validated;
 * :func:`gguf_metadata_path` -- the part whose KV block is authoritative;
-* :func:`iter_gguf_tensors` -- one tensor stream over the whole set.
+* :func:`iter_gguf_tensors` -- one tensor stream over the whole set;
+* :class:`ConsumedPageDropper` -- release the page cache behind the stream.
 
 A file that is not part of a split set resolves to a one-element list, and every
 call site then does exactly what it did before this module existed.
@@ -30,9 +31,20 @@ call site then does exactly what it did before this module existed.
 from __future__ import annotations
 
 import logging
+import mmap as _mmap
 import os
 import re
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+import sys
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,3 +213,395 @@ def gguf_tensor_names(gguf_file: str) -> set:
         str(tensor.name)
         for tensor in iter_gguf_tensors(resolve_gguf_shard_paths(gguf_file))
     }
+
+
+# ---------------------------------------------------------------------------
+# Releasing the page cache behind the weight stream (#391 boot-9 blocker)
+# ---------------------------------------------------------------------------
+#
+# ``gguf.GGUFReader`` (gguf-py 0.19) maps the whole part with
+# ``np.memmap(path, mode="r")`` and hands every ``ReaderTensor.data`` out as a
+# view into that map. Reading the stream therefore faults the entire checkpoint
+# into the page cache and NOTHING ever asks for it back: a 119 GiB export leaves
+# ~48+ GiB of clean file pages behind while the loader's own anonymous memory
+# (repacked payloads, the pinned host pool) is still growing.
+#
+# Boot attempt 8 (2026-08-01, /spinning/gpu-battery-results/2026-08-01_391_
+# dsv4flash8) is the shape this exists to remove: ``memory.current`` pinned at
+# 98.3 of 98.5 GiB swapless for seven minutes while the kernel traded file pages
+# for anon one for one (file 81.6 -> 63.8 GiB, anon 15.1 -> 32.9 GiB), until a
+# 2.4 GiB anon burst inside one 15 s window outran reclaim and the OOM killer
+# fired. Steady-state anon extrapolated to ~55-57 GiB -- the load fits, the
+# cache was the only thing in the way.
+#
+# WHICH SYSCALL -- measured on this rig, not assumed. The obvious candidate
+# (``posix_fadvise(POSIX_FADV_DONTNEED)`` on the fd) is the wrong one, twice
+# over:
+#
+# * ``invalidate_mapping_pages()`` skips a page that is still mapped into a live
+#   page table, so fadvise over a range a live mmap covers frees close to
+#   nothing. ``test_a2_fadvise_alone_does_not_free_a_mapped_range`` pins that.
+# * On ZFS -- which is what ``/spinning`` is, and where the checkpoints live --
+#   fadvise does not free the pages even after the mapping is gone. Measured:
+#   64 MiB file, read through a memmap, then ``madvise(MADV_DONTNEED)`` +
+#   ``posix_fadvise(DONTNEED)`` + unmap + ``posix_fadvise(DONTNEED)`` again ->
+#   16384 of 16384 pages still resident by ``mincore(2)``. The same fadvise on
+#   the same file BEFORE it was ever mapped drops it to zero, so the call works
+#   and the mmap'd state is what defeats it.
+#
+# ``madvise(MADV_PAGEOUT)`` (Linux 5.4+) does work: it does not invalidate, it
+# runs the range through the ordinary reclaim path -- the same path that WAS
+# visibly working during boot 8, just far too late and only under pressure.
+# Same measurement, same file: 16384 -> 0 resident pages. So the ladder is
+#
+#   1. ``madvise(MADV_PAGEOUT)`` -- the one that works here;
+#   2. ``madvise(MADV_DONTNEED)`` + ``posix_fadvise(POSIX_FADV_DONTNEED)`` --
+#      the classic recipe, kept for kernels older than 5.4 and filesystems
+#      where the invalidate path does the job.
+#
+# The mapping stays valid throughout: it is a read-only ``MAP_SHARED`` mapping
+# of an unmodified file, so a later access to an advised range simply re-faults
+# the same bytes from disk. Nothing the stream produces can change.
+#
+# ``MADV_PAGEOUT`` reclaims through the rmap, so a page another TP rank still
+# maps can be taken from under it. That costs the slower rank a re-read; it
+# cannot cost it correctness, and the ranks walk the same tensor order within
+# seconds of each other.
+
+#: How many newly droppable bytes to accumulate before issuing the syscalls.
+#: Per-tensor syscalls would be affordable (the repack runs at ~0.7 GiB/s), but
+#: the advice is over a coalesced range, so batching costs nothing in coverage
+#: and keeps the syscall count in the low thousands rather than the low
+#: hundreds of thousands.
+_DEFAULT_DROP_BATCH_BYTES = 64 << 20
+
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+#: ``asm-generic/mman-common.h``. Identical on every Linux architecture sglang
+#: builds for. CPython only exposes the ``MADV_*`` constants its own build host
+#: had headers for, and ``MADV_PAGEOUT`` is missing from common builds, so the
+#: numbers are spelled out rather than depended on.
+_MADV_DONTNEED = getattr(_mmap, "MADV_DONTNEED", 4)
+_MADV_PAGEOUT = getattr(_mmap, "MADV_PAGEOUT", 21)
+
+_LIBC: Any = None
+_LIBC_LOADED = False
+
+
+def _libc() -> Any:
+    """``libc`` with ``madvise`` bound, or None where it is not reachable."""
+    global _LIBC, _LIBC_LOADED
+    if _LIBC_LOADED:
+        return _LIBC
+    _LIBC_LOADED = True
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        name = ctypes.util.find_library("c")
+        if name is None:
+            return None
+        libc = ctypes.CDLL(name, use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        libc.madvise.restype = ctypes.c_int
+        _LIBC = libc
+    except Exception as err:  # pragma: no cover - platform dependent
+        logger.debug("GGUF stream: libc madvise unavailable: %s", err)
+        _LIBC = None
+    return _LIBC
+
+
+def stream_drop_cache_enabled() -> bool:
+    """Whether the streaming loader releases the page cache behind itself.
+
+    ``SGLANG_GGUF_STREAM_DROP_CACHE=0`` restores the pre-#391 behaviour: the
+    whole checkpoint accumulates in the page cache for the life of the load.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_GGUF_STREAM_DROP_CACHE.get())
+
+
+def _page_cache_advice_available() -> bool:
+    return _libc() is not None
+
+
+class ConsumedPageDropper:
+    """Release the page cache of GGUF shard regions the stream has passed.
+
+    Bookkeeping contract -- the whole point of the class, and what
+    ``test_gguf_stream_page_cache.py`` pins:
+
+    * a region is advised only once EVERY tensor that owns a byte in it has
+      been marked consumed;
+    * the advised range is cut at the page boundary BELOW the first
+      not-yet-consumed tensor's start, so a page shared between a consumed and
+      an unconsumed tensor is left alone until the second one is consumed too;
+    * consumption order does not have to match file order. Registered extents
+      are sorted by offset and a watermark walks them; an out-of-order or
+      never-consumed tensor stalls the watermark, which loses cache release and
+      cannot lose correctness.
+    """
+
+    def __init__(
+        self,
+        shard_paths: Sequence[str],
+        mappings: Sequence[Optional[Any]],
+        *,
+        batch_bytes: Optional[int] = None,
+    ) -> None:
+        if batch_bytes is None:
+            # Read at call time, not bound at def time, so the module global
+            # stays the single knob (and the tests can turn it down).
+            batch_bytes = _DEFAULT_DROP_BATCH_BYTES
+        if len(shard_paths) != len(mappings):
+            raise ValueError("shard_paths and mappings must have the same length")
+        self._paths = list(shard_paths)
+        # Base address + byte length of each part's mapping. ``madvise`` needs an
+        # address, not a file offset, and only the numpy view knows it: numpy
+        # closes the fd right after mapping and maps from offset 0, so the
+        # array's data pointer IS the mapping base.
+        self._addrs: List[Optional[int]] = []
+        self._map_len: List[int] = []
+        for mapping in mappings:
+            pointer = getattr(getattr(mapping, "ctypes", None), "data", None)
+            self._addrs.append(int(pointer) if pointer else None)
+            self._map_len.append(int(getattr(mapping, "nbytes", 0) or 0))
+        self._batch_bytes = int(batch_bytes)
+        self._fds: List[Optional[int]] = [None] * len(self._paths)
+        # Per shard: extents in registration order, the registration indices
+        # sorted by start offset, a consumed flag per extent, the watermark into
+        # the sorted order, and how far the file has already been advised.
+        self._extents: List[List[Tuple[int, int]]] = [[] for _ in self._paths]
+        self._order: List[List[int]] = [[] for _ in self._paths]
+        self._consumed: List[List[bool]] = [[] for _ in self._paths]
+        self._cursor: List[int] = [0] * len(self._paths)
+        self._advised_to: List[int] = [0] * len(self._paths)
+        self._pending: List[int] = [0] * len(self._paths)
+        self._sizes: List[int] = []
+        for path in self._paths:
+            try:
+                self._sizes.append(os.path.getsize(path))
+            except OSError:
+                self._sizes.append(0)
+        self.bytes_advised = 0
+        self.calls = 0
+
+    @classmethod
+    def for_readers(
+        cls,
+        shard_paths: Sequence[str],
+        readers: Sequence[Any],
+        **kwargs: Any,
+    ) -> "ConsumedPageDropper":
+        """Build a dropper for ``gguf.GGUFReader`` objects, extents included.
+
+        ``reader.data`` is the ``np.memmap`` of the whole part. A reader that
+        does not expose one (a future gguf-py that reads instead of maps) still
+        gets the ``fadvise`` half, which is the correct advice for a
+        read()-based reader.
+        """
+        mappings = [getattr(r, "data", None) for r in readers]
+        dropper = cls(shard_paths, mappings, **kwargs)
+        for shard_index, reader in enumerate(readers):
+            dropper.register(
+                shard_index,
+                [
+                    (int(tensor.data_offset), int(tensor.n_bytes))
+                    for tensor in reader.tensors
+                ],
+            )
+        return dropper
+
+    def register(self, shard_index: int, extents: Iterable[Tuple[int, int]]) -> None:
+        """Declare ``(offset, nbytes)`` for every tensor of one shard."""
+        stored = [(int(offset), int(nbytes)) for offset, nbytes in extents]
+        self._extents[shard_index] = stored
+        self._consumed[shard_index] = [False] * len(stored)
+        self._order[shard_index] = sorted(
+            range(len(stored)), key=lambda i: stored[i][0]
+        )
+        self._cursor[shard_index] = 0
+
+    def consume(self, shard_index: int, tensor_index: int) -> None:
+        """Mark one registered tensor as fully read by the consumer."""
+        consumed = self._consumed[shard_index]
+        if tensor_index < 0 or tensor_index >= len(consumed):
+            raise IndexError(
+                f"tensor index {tensor_index} is outside shard {shard_index}'s "
+                f"{len(consumed)} registered extents"
+            )
+        if consumed[tensor_index]:
+            return
+        consumed[tensor_index] = True
+        self._pending[shard_index] += self._extents[shard_index][tensor_index][1]
+        if self._pending[shard_index] >= self._batch_bytes:
+            self._flush_shard(shard_index)
+
+    def flush(self) -> None:
+        """Advise every region that is droppable right now, batch or not."""
+        for shard_index in range(len(self._paths)):
+            self._flush_shard(shard_index, force=True)
+
+    def close(self) -> None:
+        """Final flush, then release the file descriptors."""
+        try:
+            self.flush()
+        finally:
+            for index, fd in enumerate(self._fds):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self._fds[index] = None
+            if self.bytes_advised:
+                logger.info(
+                    "GGUF stream: released %.2f GiB of checkpoint page cache "
+                    "behind the consumer in %d advice call(s). Set "
+                    "SGLANG_GGUF_STREAM_DROP_CACHE=0 to keep it instead.",
+                    self.bytes_advised / float(1 << 30),
+                    self.calls,
+                )
+
+    def __enter__(self) -> "ConsumedPageDropper":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    # -- internals ---------------------------------------------------------
+
+    def _first_unconsumed_start(self, shard_index: int) -> int:
+        """Start offset of the lowest-offset tensor still unconsumed.
+
+        The whole remaining file when every tensor is consumed. This is the
+        ceiling the advised range is never allowed to cross.
+        """
+        order = self._order[shard_index]
+        consumed = self._consumed[shard_index]
+        cursor = self._cursor[shard_index]
+        while cursor < len(order) and consumed[order[cursor]]:
+            cursor += 1
+        self._cursor[shard_index] = cursor
+        if cursor >= len(order):
+            return self._sizes[shard_index]
+        return self._extents[shard_index][order[cursor]][0]
+
+    def _flush_shard(self, shard_index: int, force: bool = False) -> None:
+        ceiling = self._first_unconsumed_start(shard_index)
+        # Cut at the page boundary BELOW the first unconsumed byte: GGUF packs
+        # tensors to a 32-byte alignment, so consecutive tensors routinely share
+        # a page and advising the partial page would drop bytes the consumer has
+        # not read yet.
+        end = (ceiling // _PAGE_SIZE) * _PAGE_SIZE
+        start = self._advised_to[shard_index]
+        if end <= start:
+            self._pending[shard_index] = 0
+            return
+        if not force and (end - start) < self._batch_bytes:
+            return
+        self._advise(shard_index, start, end)
+        self._advised_to[shard_index] = end
+        self._pending[shard_index] = 0
+
+    def _madvise(self, shard_index: int, start: int, length: int, advice: int) -> bool:
+        libc = _libc()
+        address = self._addrs[shard_index]
+        if libc is None or address is None:
+            return False
+        limit = self._map_len[shard_index]
+        if limit and start + length > limit:
+            length = max(0, limit - start)
+        if length <= 0:
+            return False
+        import ctypes
+
+        rc = libc.madvise(
+            ctypes.c_void_p(address + start), ctypes.c_size_t(length), advice
+        )
+        if rc != 0:
+            logger.debug(
+                "GGUF stream: madvise(%d) on %s [%d,+%d) failed: errno %d",
+                advice,
+                self._paths[shard_index],
+                start,
+                length,
+                ctypes.get_errno(),
+            )
+            return False
+        return True
+
+    def _advise(self, shard_index: int, start: int, end: int) -> None:
+        """Drop ``[start, end)`` of one shard. Overridden by the contract test."""
+        length = end - start
+        self.calls += 1
+        self.bytes_advised += length
+        if self._madvise(shard_index, start, length, _MADV_PAGEOUT):
+            return
+        # Fallback ladder (see the module comment): unmap first, because
+        # fadvise cannot free a page that is still mapped, then invalidate.
+        self._madvise(shard_index, start, length, _MADV_DONTNEED)
+        if not hasattr(os, "posix_fadvise"):
+            return
+        fd = self._fds[shard_index]
+        if fd is None:
+            try:
+                fd = os.open(self._paths[shard_index], os.O_RDONLY)
+            except OSError as err:  # pragma: no cover - path validated earlier
+                logger.debug(
+                    "GGUF stream: cannot open %s for fadvise: %s",
+                    self._paths[shard_index],
+                    err,
+                )
+                return
+            self._fds[shard_index] = fd
+        try:
+            os.posix_fadvise(fd, start, length, os.POSIX_FADV_DONTNEED)
+        except OSError as err:  # pragma: no cover - kernel dependent
+            logger.debug(
+                "GGUF stream: posix_fadvise(DONTNEED) on %s [%d,%d) failed: %s",
+                self._paths[shard_index],
+                start,
+                end,
+                err,
+            )
+
+
+class _NullPageDropper:
+    """No-op stand-in so the call sites stay branch-free."""
+
+    bytes_advised = 0
+    calls = 0
+
+    def consume(self, shard_index: int, tensor_index: int) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def make_stream_page_dropper(
+    shard_paths: Sequence[str],
+    readers: Sequence[Any],
+) -> Any:
+    """A dropper for this stream, or a no-op when the feature is switched off."""
+    if not stream_drop_cache_enabled():
+        logger.info(
+            "GGUF stream: SGLANG_GGUF_STREAM_DROP_CACHE=0 -- the checkpoint's "
+            "pages stay in the page cache for the whole load (pre-#391 "
+            "behaviour)."
+        )
+        return _NullPageDropper()
+    if not _page_cache_advice_available():
+        logger.info(
+            "GGUF stream: madvise is not reachable on this platform, the page "
+            "cache is left to the kernel."
+        )
+        return _NullPageDropper()
+    return ConsumedPageDropper.for_readers(shard_paths, readers)
