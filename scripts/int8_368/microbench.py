@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Task #368 -- per-GEMM microbenchmark of the INT8 W8A8 decode path.
+
+WHAT THIS ANSWERS
+=================
+The designated standard model (Qwen3.6-27B-INT8-W8A8) loses 4-10 % decode
+throughput against the FP8 checkpoint at small batch (#354). Roughly a third
+of that is explained by the -6.5 % accept length. The open question is the
+rest: is the INT8 linear path itself slow in the decode regime?
+
+#370 established that there is nothing to tune by config generation --
+``CompressedTensorsW8A8Int8.apply_weights`` dispatches to the CUTLASS
+``sgl_kernel.int8_scaled_mm`` and never consults the Triton config directory,
+so there is no #255 analog. What is left is to price the two kernels that DO
+run, separately, at the shapes and batch sizes the serving path uses:
+
+    python/sglang/srt/layers/quantization/compressed_tensors/schemes/
+        compressed_tensors_w8a8_int8.py:213   x_q, x_scale = per_token_quant_int8(x)
+        compressed_tensors_w8a8_int8.py:215   int8_scaled_mm(x_q, layer.weight,
+                                                x_scale, layer.weight_scale,
+                                                out_dtype=x.dtype, bias=bias)
+
+Two kernel launches per linear layer, no fusion, no epilogue reuse. The
+activation quant is a Triton row kernel (``int8_kernel.py:79``,
+``_per_token_quant_int8``, one program per token row, ``num_stages=1``); at
+M=1 it is a one-row launch whose cost is essentially launch overhead. The
+GEMM is CUTLASS. Which of the two dominates at M<=8 decides the remedy:
+
+    quant dominant           -> fusion candidate (quant into the previous
+                                layer's epilogue, or a fused quant+GEMM)
+    gemm slow at M<=8        -> kernel/dispatch candidate (a GEMV-shaped
+                                path, or a dispatch threshold)
+    neither above the floor  -> the deficit is accept-length physics; close
+                                #368 with the evidence
+
+The runsheet (RUNSHEET.md next to this file) spells the decision tree out
+with the arbitration protocol and the card budget.
+
+WHAT IS MEASURED
+================
+Per (shape, M), eight lanes, each timed SEPARATELY so the split is visible
+rather than inferred:
+
+    bf16_linear         F.linear(x, w_bf16)              -- the unquantized floor
+    int8_quant          per_token_quant_int8(x)          -- activation quant only
+    int8_gemm           int8_scaled_mm(pre-quantized)    -- GEMM only
+    int8_fused          quant + GEMM                     -- the serving path verbatim
+    fp8_quant           sglang_per_token_quant_fp8(x)    -- FP8 act quant only
+    fp8_gemm            fp8_scaled_mm(pre-quantized)     -- FP8 GEMM only
+    fp8_ct_fused        apply_fp8_linear, compressed-tensors branch
+    fp8_deployed_fused  apply_fp8_linear, the branch Fp8LinearMethod takes for
+                        the deployed Qwen3.6-27B-FP8 checkpoint
+
+``int8_fused`` is not assumed to equal ``int8_quant + int8_gemm``: the
+difference between the two is the launch-gap and allocator cost that only a
+fused measurement shows, and that difference is exactly what a fusion would
+recover. It is reported.
+
+Two FP8 references, because the two FP8 checkpoints on this rig reach the
+kernels through different branches. The compressed-tensors FP8 scheme is the
+structural twin of the INT8 scheme. The deployed Qwen3.6-27B-FP8 checkpoint
+is ``quant_method: fp8``, ``activation_scheme: dynamic``, whose per-tensor
+weight scale is widened to channelwise at load time whenever cutlass fp8 is
+supported -- it ends at the same two kernels through a different code path,
+and that path is what #354 measured end to end. Neither FP8 lane re-measures
+#354; they are the per-GEMM context for it.
+
+SHAPES
+======
+Derived from the checkpoint's own config.json and the shard plan, not
+hardcoded. Under uneven TP the per-rank N differs per rank, so the shape set
+is a function of (tp_size, --rank-tp-ratio, --rank-mlp-ratio, rank). The
+partition arithmetic is the largest-remainder split the serving path uses;
+when sglang is importable the derivation is cross-checked against
+``sglang.srt.distributed.utils.partition_units`` and disagreement is fatal.
+
+Only layers that are actually INT8 are included. The checkpoint's ignore
+list keeps ``in_proj_b`` / ``in_proj_a`` (the GDN ba projection), ``lm_head``
+and everything matching ``re:.*mtp.*`` in bf16 -- so the whole MTP draft
+model is unquantized and contributes no INT8 GEMM at all.
+
+TIMING
+======
+CUDA events around a burst of N iterations, burst size auto-calibrated to a
+target wall time so short and long shapes get comparable statistical weight.
+Lanes are INTERLEAVED: one burst per lane per round, same rotation every
+round, so clock drift and thermal drift hit every lane equally instead of
+accumulating in whichever lane ran last.
+
+Every lane is instantiated TWICE, on independent tensors (``lane`` and
+``lane#A2``), and both copies sit in the same rotation. The A-vs-A spread
+between the two copies IS the noise floor at that operating point and is
+reported next to every comparison. Distributions are reported as
+median / p5 / p95 over rounds, never as means -- a mean over a burst
+distribution with a launch-stall tail is not a number anyone can act on.
+
+No percent-threshold stop rule is built in. The script reports the numbers;
+the runsheet reports gain AND effort as a pair.
+
+DRY RUN
+=======
+``--dry-run`` executes every code path on CPU with pure-torch stand-ins for
+the two CUDA kernels, so the harness is proven to run end to end before a
+card window is claimed. The full, real shape table is still derived and
+emitted; only the tensors that are actually multiplied are capped
+(``--max-dim``) so a CPU can carry them. Dry-run output is stamped
+``"dry_run": true`` and every timing carries ``"stub": true`` -- it is path
+coverage, never a measurement.
+
+USAGE
+=====
+    # desk, no card:
+    python3 scripts/int8_368/microbench.py --dry-run
+
+    # card, inside a claimed arbitration window:
+    CUDA_VISIBLE_DEVICES=<idx> python3 scripts/int8_368/microbench.py \
+        --out /tmp/int8_368.<card>.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import platform
+import socket
+import statistics
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Optional, Sequence
+
+import torch
+
+# --------------------------------------------------------------------------
+# Shard arithmetic
+# --------------------------------------------------------------------------
+
+
+def partition_units_local(units: int, weights: Sequence[int]) -> list:
+    """Largest-remainder split of `units` over ranks proportional to
+    `weights`, every rank >= 1 unit, ties toward the lower rank index.
+
+    A deliberate second implementation of
+    ``sglang.srt.distributed.utils._partition_units_raw`` so this script
+    derives shapes without importing the serving stack (a desk machine
+    without sgl_kernel can still print the table). When sglang IS
+    importable, ``cross_check_partition`` compares the two and refuses to
+    continue on disagreement -- a shape table that silently drifts from the
+    serving split would be worse than no table.
+    """
+    n = len(weights)
+    if units < n:
+        raise ValueError(
+            f"Cannot give each of {n} ranks at least one of {units} units."
+        )
+    total_w = sum(weights)
+    quotas = [units * w / total_w for w in weights]
+    sizes = [max(int(q), 1) for q in quotas]
+    remaining = units - sum(sizes)
+    if remaining < 0:
+        for _ in range(-remaining):
+            i = max(range(n), key=lambda r: (sizes[r], -r))
+            sizes[i] -= 1
+        remaining = 0
+    order = sorted(
+        range(n), key=lambda r: (quotas[r] - int(quotas[r]), -r), reverse=True
+    )
+    for k in range(remaining):
+        order_i = order[k % n]
+        sizes[order_i] += 1
+    assert sum(sizes) == units and all(s >= 1 for s in sizes)
+    return sizes
+
+
+def cross_check_partition(cases: Sequence[tuple]) -> str:
+    """Compare the local split against sglang's for every (units, weights)
+    the shape derivation used. Returns a provenance string for the JSON."""
+    try:
+        from sglang.srt.distributed.utils import _partition_units_raw  # noqa: PLC0415
+    except Exception as ex:  # sglang not importable on a bare desk machine
+        return f"local-only ({type(ex).__name__}: {ex})"
+    for units, weights in cases:
+        mine = partition_units_local(units, weights)
+        theirs = list(_partition_units_raw(units, list(weights)))
+        if mine != theirs:
+            raise SystemExit(
+                f"Shard arithmetic disagrees with the serving stack for "
+                f"units={units} weights={list(weights)}: local {mine} vs "
+                f"sglang {theirs}. Refusing to emit a shape table that does "
+                f"not match what the ranks would actually build."
+            )
+    return "cross-checked against sglang.srt.distributed.utils._partition_units_raw"
+
+
+@dataclass
+class Shape:
+    """One linear layer's per-rank GEMM, in serving orientation.
+
+    ``n`` is the output width (weight rows before the transpose), ``k`` the
+    reduction dim. The INT8 scheme stores ``layer.weight`` transposed, so the
+    kernel sees ``(k, n)`` column-major -- built that way below.
+    """
+
+    name: str
+    n: int
+    k: int
+    module: str
+    layers: int  # how many layers of the model carry this GEMM
+    note: str = ""
+    exec_n: Optional[int] = None  # capped size actually multiplied (dry run)
+    exec_k: Optional[int] = None
+
+    @property
+    def run_n(self) -> int:
+        return self.exec_n if self.exec_n is not None else self.n
+
+    @property
+    def run_k(self) -> int:
+        return self.exec_k if self.exec_k is not None else self.k
+
+    @property
+    def capped(self) -> bool:
+        return self.exec_n is not None or self.exec_k is not None
+
+
+#: The three shapes #255 queued for the sm120 FP8 Triton tuner
+#: (docs/rig-runbook.md, "the three shapes #255 left queued for sm120").
+#: Carried along so the INT8 numbers land on the same operating points the
+#: FP8 tuner was measured at, even when the current shard plan moves the
+#: derived shapes. They correspond to a rank with 12 q heads / 2 kv heads
+#: (qkv 7168x5120, o_proj 5120x3072) and a GDN rank with 21 value heads
+#: (out_proj 5120x2688) -- a plan close to, but not identical with, the
+#: [30,17,17] default below.
+LEGACY_255_SHAPES = [
+    ("legacy255_qkv", 7168, 5120),
+    ("legacy255_gdn_out", 5120, 2688),
+    ("legacy255_o_proj", 5120, 3072),
+]
+
+
+def derive_shapes(
+    cfg: dict,
+    tp_size: int,
+    ratio: Sequence[int],
+    mlp_ratio: Sequence[int],
+    rank: int,
+) -> tuple[list, list, dict]:
+    """Per-rank INT8 GEMM shapes for a Qwen3.5/3.6 dense text model.
+
+    Mirrors, module by module:
+      * ``Qwen3_5Attention``  (models/qwen3_5.py:928 qkv_proj, :947 o_proj)
+      * ``Qwen3_5GatedDeltaNet`` (:252 in_proj_qkvz, :347 out_proj)
+      * ``Qwen2MoeMLP`` (models/qwen2_moe.py:226 gate_up_proj, :~250 down_proj)
+
+    Returns (shapes, partition_cases, facts).
+    """
+    t = cfg.get("text_config", cfg)
+    hidden = int(t["hidden_size"])
+    n_layers = int(t["num_hidden_layers"])
+    inter = int(t["intermediate_size"])
+    n_heads = int(t["num_attention_heads"])
+    n_kv = int(t["num_key_value_heads"])
+    head_dim = int(t.get("head_dim") or hidden // n_heads)
+    gate = 2 if t.get("attn_output_gate", False) else 1
+
+    k_heads = int(t["linear_num_key_heads"])
+    v_heads = int(t["linear_num_value_heads"])
+    head_k = int(t["linear_key_head_dim"])
+    head_v = int(t["linear_value_head_dim"])
+
+    layer_types = t.get("layer_types") or []
+    if layer_types:
+        n_full = sum(1 for x in layer_types if x == "full_attention")
+        n_linear = sum(1 for x in layer_types if x == "linear_attention")
+    else:
+        interval = int(t.get("full_attention_interval", 1))
+        n_full = n_layers // interval
+        n_linear = n_layers - n_full
+
+    uniform = len(set(ratio)) == 1
+    cases: list = []
+
+    def split(units: int, weights: Sequence[int]) -> int:
+        if tp_size == 1:
+            return units
+        cases.append((units, tuple(weights)))
+        return partition_units_local(units, weights)[rank]
+
+    if tp_size > 1 and not uniform:
+        # kv >= tp: kv heads are the indivisible unit for the q dimension too
+        # (attn_q_partition_units), and groups is None (no REPLICATED-KV).
+        if n_kv < tp_size:
+            raise SystemExit(
+                f"num_key_value_heads ({n_kv}) < tp_size ({tp_size}): that is "
+                "the REPLICATED-KV geometry, whose q split carries a "
+                "kv-boundary alignment constraint this script does not "
+                "reimplement. Derive the shapes from a live rank instead."
+            )
+        loc_kv = split(n_kv, ratio)
+        loc_q = split(n_kv, ratio) * (n_heads // n_kv)
+        loc_kh = split(k_heads, ratio)
+        loc_vh = split(k_heads, ratio) * (v_heads // k_heads)
+        mlp_units = inter // math.gcd(inter, 16)
+        loc_inter = partition_units_local(mlp_units, mlp_ratio)[rank] * (
+            inter // mlp_units
+        )
+        if tp_size != len(mlp_ratio):
+            raise SystemExit("--rank-mlp-ratio length must equal --tp-size")
+        cases.append((mlp_units, tuple(mlp_ratio)))
+    else:
+        for total, name in (
+            (n_heads, "q"),
+            (n_kv, "kv"),
+            (k_heads, "gdn-k"),
+            (inter, "mlp"),
+        ):
+            if total % tp_size:
+                raise SystemExit(
+                    f"Even TP={tp_size} does not divide the {name} dimension "
+                    f"({total}). Pass a --ratio for the uneven plan."
+                )
+        loc_kv = n_kv // tp_size
+        loc_q = n_heads // tp_size
+        loc_kh = k_heads // tp_size
+        loc_vh = v_heads // tp_size
+        loc_inter = inter // tp_size
+
+    shapes = [
+        Shape(
+            "attn_qkv",
+            gate * loc_q * head_dim + 2 * loc_kv * head_dim,
+            hidden,
+            "Qwen3_5Attention.qkv_proj",
+            n_full,
+            f"{loc_q} q heads x{gate} (output gate) + 2x{loc_kv} kv heads, head_dim {head_dim}",
+        ),
+        Shape(
+            "attn_o",
+            hidden,
+            loc_q * head_dim,
+            "Qwen3_5Attention.o_proj",
+            n_full,
+            "row-parallel, input = local q width",
+        ),
+        Shape(
+            "gdn_in_qkvz",
+            2 * loc_kh * head_k + 2 * loc_vh * head_v,
+            hidden,
+            "Qwen3_5GatedDeltaNet.in_proj_qkvz",
+            n_linear,
+            f"[q,k,z,v] merged: 2x{loc_kh}x{head_k} + 2x{loc_vh}x{head_v}",
+        ),
+        Shape(
+            "gdn_out",
+            hidden,
+            loc_vh * head_v,
+            "Qwen3_5GatedDeltaNet.out_proj",
+            n_linear,
+            "row-parallel, input = local value width",
+        ),
+        Shape(
+            "mlp_gate_up",
+            2 * loc_inter,
+            hidden,
+            "Qwen2MoeMLP.gate_up_proj",
+            n_layers,
+            f"gate+up merged, local intermediate {loc_inter}",
+        ),
+        Shape(
+            "mlp_down",
+            hidden,
+            loc_inter,
+            "Qwen2MoeMLP.down_proj",
+            n_layers,
+            "row-parallel",
+        ),
+    ]
+
+    facts = {
+        "hidden_size": hidden,
+        "num_hidden_layers": n_layers,
+        "intermediate_size": inter,
+        "num_attention_heads": n_heads,
+        "num_key_value_heads": n_kv,
+        "head_dim": head_dim,
+        "attn_output_gate": bool(t.get("attn_output_gate", False)),
+        "linear_num_key_heads": k_heads,
+        "linear_num_value_heads": v_heads,
+        "full_attention_layers": n_full,
+        "linear_attention_layers": n_linear,
+        "local_q_heads": loc_q,
+        "local_kv_heads": loc_kv,
+        "local_gdn_k_heads": loc_kh,
+        "local_gdn_v_heads": loc_vh,
+        "local_intermediate": loc_inter,
+        "not_quantized_by_ignore_list": [
+            "linear_attn.in_proj_b / in_proj_a (the merged in_proj_ba stays bf16)",
+            "lm_head",
+            "re:.*mtp.* -- the whole MTP draft model runs unquantized",
+        ],
+    }
+    return shapes, cases, facts
+
+
+# --------------------------------------------------------------------------
+# Kernels: real ones on a card, pure-torch stand-ins for the dry run
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Kernels:
+    per_token_quant_int8: Callable
+    int8_scaled_mm: Callable
+    per_token_quant_fp8: Optional[Callable]
+    fp8_scaled_mm: Optional[Callable]
+    apply_fp8_linear: Optional[Callable]
+    fp8_dtype: torch.dtype
+    stub: bool
+    missing: list = field(default_factory=list)
+
+
+def _stub_per_token_quant_int8(x: torch.Tensor):
+    x32 = x.to(torch.float32)
+    absmax = x32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    scale = absmax / 127.0
+    return torch.round(x32 * (127.0 / absmax)).to(torch.int8), scale
+
+
+def _stub_int8_scaled_mm(a, b, sa, sb, out_dtype, bias=None):
+    acc = a.to(torch.float32) @ b.to(torch.float32)
+    acc = acc * sa.view(-1, 1).to(torch.float32) * sb.view(1, -1).to(torch.float32)
+    if bias is not None:
+        acc = acc + bias.to(torch.float32)
+    return acc.to(out_dtype)
+
+
+def _stub_per_token_quant_fp8(x: torch.Tensor, fp8_dtype: torch.dtype):
+    x32 = x.to(torch.float32)
+    finfo_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
+    absmax = x32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    scale = absmax / finfo_max
+    return (x32 / scale).clamp(-finfo_max, finfo_max).to(fp8_dtype), scale
+
+
+def _stub_fp8_scaled_mm(a, b, sa, sb, out_dtype, bias=None):
+    return _stub_int8_scaled_mm(a, b, sa, sb, out_dtype, bias)
+
+
+def load_kernels(dry_run: bool) -> Kernels:
+    fp8_dtype = torch.float8_e4m3fn
+    if dry_run:
+        try:
+            torch.zeros(2, dtype=torch.bfloat16).to(fp8_dtype)
+        except Exception:
+            # A CPU build without float8 conversion: the stub lane still has
+            # to execute, so it runs on bf16 storage. Stamped in the JSON.
+            fp8_dtype = torch.bfloat16
+        return Kernels(
+            per_token_quant_int8=_stub_per_token_quant_int8,
+            int8_scaled_mm=_stub_int8_scaled_mm,
+            per_token_quant_fp8=lambda x: _stub_per_token_quant_fp8(x, fp8_dtype),
+            fp8_scaled_mm=_stub_fp8_scaled_mm,
+            apply_fp8_linear=None,  # replaced by a stub closure in build_lanes
+            fp8_dtype=fp8_dtype,
+            stub=True,
+        )
+
+    missing = []
+    from sglang.srt.layers.quantization.int8_kernel import (  # noqa: PLC0415
+        per_token_quant_int8,
+    )
+    from sgl_kernel import int8_scaled_mm  # noqa: PLC0415
+
+    try:
+        from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: PLC0415
+            sglang_per_token_quant_fp8,
+        )
+    except Exception as ex:
+        sglang_per_token_quant_fp8 = None
+        missing.append(f"sglang_per_token_quant_fp8: {type(ex).__name__}: {ex}")
+    try:
+        from sgl_kernel import fp8_scaled_mm  # noqa: PLC0415
+    except Exception as ex:
+        fp8_scaled_mm = None
+        missing.append(f"fp8_scaled_mm: {type(ex).__name__}: {ex}")
+    try:
+        from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
+            apply_fp8_linear,
+        )
+    except Exception as ex:
+        apply_fp8_linear = None
+        missing.append(f"apply_fp8_linear: {type(ex).__name__}: {ex}")
+
+    return Kernels(
+        per_token_quant_int8=per_token_quant_int8,
+        int8_scaled_mm=int8_scaled_mm,
+        per_token_quant_fp8=sglang_per_token_quant_fp8,
+        fp8_scaled_mm=fp8_scaled_mm,
+        apply_fp8_linear=apply_fp8_linear,
+        fp8_dtype=fp8_dtype,
+        stub=False,
+        missing=missing,
+    )
+
+
+# --------------------------------------------------------------------------
+# Lane construction
+# --------------------------------------------------------------------------
+
+ALL_LANES = [
+    "bf16_linear",
+    "int8_quant",
+    "int8_gemm",
+    "int8_fused",
+    "fp8_quant",
+    "fp8_gemm",
+    "fp8_ct_fused",
+    "fp8_deployed_fused",
+]
+OPTIONAL_LANES: list = []
+
+
+@dataclass
+class Weights:
+    """One independent weight set for a shape. Two of these give the A-vs-A
+    pair; they are built separately so the pair also carries the
+    allocator/address component of the noise, not only the clock's. Built
+    ONCE per shape and reused across every M -- rebuilding a 16320x5120
+    weight per M would put more wall time into torch.randn than into the
+    kernels being measured."""
+
+    w_bf16: torch.Tensor
+    w_i8_t: torch.Tensor
+    ws_i8: torch.Tensor
+    w_f8_t: Optional[torch.Tensor]
+    ws_f8_chan: Optional[torch.Tensor]
+
+
+@dataclass
+class Operand:
+    """A weight set plus the activations for one M."""
+
+    w: Weights
+    x: torch.Tensor
+    xq_i8: torch.Tensor
+    xs_i8: torch.Tensor
+    xq_f8: Optional[torch.Tensor]
+    xs_f8: Optional[torch.Tensor]
+
+
+def build_weights(shape: Shape, dev: torch.device, kn: Kernels, seed: int) -> Weights:
+    n, k = shape.run_n, shape.run_k
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    # Sampled on CPU and moved: on-GPU randn is not architecture-identical
+    # across sm86/sm120, and the two cards must see the same input bytes.
+    w_bf16 = (
+        torch.randn(n, k, generator=g, dtype=torch.float32).to(dev).to(torch.bfloat16)
+    )
+    # INT8 weight in serving layout: the scheme stores weight.t(), so the
+    # kernel's mat_b is (k, n) with stride(0) == 1.
+    w_i8 = torch.randint(-127, 127, (n, k), generator=g, dtype=torch.int8).to(dev)
+    ws_i8 = torch.rand(n, 1, generator=g, dtype=torch.float32).to(dev).add_(0.01)
+
+    w_f8_t = ws_f8_chan = None
+    if kn.per_token_quant_fp8 is not None:
+        w_f8_t = w_bf16.to(kn.fp8_dtype).t()
+        ws_f8_chan = (
+            torch.rand(n, 1, generator=g, dtype=torch.float32).to(dev).add_(0.01)
+        )
+    return Weights(w_bf16, w_i8.t(), ws_i8, w_f8_t, ws_f8_chan)
+
+
+def build_operand(
+    w: Weights, shape: Shape, m: int, dev: torch.device, kn: Kernels, seed: int
+) -> Operand:
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    x = (
+        torch.randn(m, shape.run_k, generator=g, dtype=torch.float32)
+        .to(dev)
+        .to(torch.bfloat16)
+    )
+    xq_i8, xs_i8 = kn.per_token_quant_int8(x)
+    xq_f8 = xs_f8 = None
+    if kn.per_token_quant_fp8 is not None:
+        xq_f8, xs_f8 = kn.per_token_quant_fp8(x)
+    return Operand(w, x, xq_i8, xs_i8, xq_f8, xs_f8)
+
+
+def build_lanes(op: Operand, kn: Kernels, want: Sequence[str]) -> dict:
+    """name -> zero-arg callable. Only lanes whose kernels exist are built."""
+    out: dict = {}
+    dt = op.x.dtype
+
+    if "bf16_linear" in want:
+        out["bf16_linear"] = lambda: torch.nn.functional.linear(op.x, op.w.w_bf16)
+    if "int8_quant" in want:
+        out["int8_quant"] = lambda: kn.per_token_quant_int8(op.x)
+    if "int8_gemm" in want:
+        out["int8_gemm"] = lambda: kn.int8_scaled_mm(
+            op.xq_i8, op.w.w_i8_t, op.xs_i8, op.w.ws_i8, out_dtype=dt, bias=None
+        )
+
+    if "int8_fused" in want:
+
+        def _int8_fused():
+            # Verbatim CompressedTensorsW8A8Int8.apply_weights body
+            # (compressed_tensors_w8a8_int8.py:213-217); bias is None because
+            # every quantized linear in this checkpoint is bias-free.
+            x_q, x_scale = kn.per_token_quant_int8(op.x)
+            return kn.int8_scaled_mm(
+                x_q, op.w.w_i8_t, x_scale, op.w.ws_i8, out_dtype=dt, bias=None
+            )
+
+        out["int8_fused"] = _int8_fused
+
+    if kn.per_token_quant_fp8 is not None:
+        if "fp8_quant" in want:
+            out["fp8_quant"] = lambda: kn.per_token_quant_fp8(op.x)
+        if "fp8_gemm" in want and kn.fp8_scaled_mm is not None:
+            out["fp8_gemm"] = lambda: kn.fp8_scaled_mm(
+                op.xq_f8,
+                op.w.w_f8_t,
+                op.xs_f8,
+                op.w.ws_f8_chan,
+                out_dtype=dt,
+                bias=None,
+            )
+        if "fp8_ct_fused" in want:
+            if kn.apply_fp8_linear is not None:
+                out["fp8_ct_fused"] = lambda: kn.apply_fp8_linear(
+                    input=op.x,
+                    weight=op.w.w_f8_t,
+                    weight_scale=op.w.ws_f8_chan,
+                    input_scale=None,
+                    bias=None,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+            elif kn.fp8_scaled_mm is not None:
+
+                def _fp8_stub_fused():
+                    q, s = kn.per_token_quant_fp8(op.x)
+                    return kn.fp8_scaled_mm(
+                        q, op.w.w_f8_t, s, op.w.ws_f8_chan, out_dtype=dt, bias=None
+                    )
+
+                out["fp8_ct_fused"] = _fp8_stub_fused
+        if "fp8_deployed_fused" in want:
+            # The lane the deployed Qwen3.6-27B-FP8 checkpoint actually runs.
+            # Fp8LinearMethod (fp8.py:1163) calls apply_fp8_linear with
+            # compressed_tensor_quant left at False, use_per_token_if_dynamic
+            # False and input_scale None (activation_scheme "dynamic"); the
+            # per-tensor checkpoint scale was widened to CHANNELWISE at load
+            # (fp8.py:~935 convert_to_channelwise) whenever cutlass fp8 is
+            # supported. So the quant step is sglang_per_token_quant_fp8 and
+            # the GEMM is fp8_scaled_mm -- the same two kernels as the
+            # compressed-tensors twin, reached through a different branch.
+            if kn.apply_fp8_linear is not None:
+                out["fp8_deployed_fused"] = lambda: kn.apply_fp8_linear(
+                    input=op.x,
+                    weight=op.w.w_f8_t,
+                    weight_scale=op.w.ws_f8_chan,
+                    input_scale=None,
+                    bias=None,
+                    use_per_token_if_dynamic=False,
+                    compressed_tensor_quant=False,
+                )
+            elif kn.fp8_scaled_mm is not None:
+
+                def _fp8_dep_stub():
+                    q, s = kn.per_token_quant_fp8(op.x)
+                    return kn.fp8_scaled_mm(
+                        q, op.w.w_f8_t, s, op.w.ws_f8_chan, out_dtype=dt, bias=None
+                    )
+
+                out["fp8_deployed_fused"] = _fp8_dep_stub
+    return out
+
+
+# --------------------------------------------------------------------------
+# Timing
+# --------------------------------------------------------------------------
+
+
+def time_burst(fn: Callable, iters: int, cuda: bool) -> float:
+    """Mean ms per iteration over one uninterrupted burst.
+
+    A burst is the atom; the DISTRIBUTION is taken over bursts (rounds), not
+    over single iterations -- single-iteration CUDA-event pairs measure the
+    event overhead as much as the kernel at these sizes.
+    """
+    if cuda:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - t0) * 1e3 / iters
+
+
+def calibrate(fn: Callable, target_ms: float, cuda: bool, max_iters: int) -> int:
+    for _ in range(3):
+        fn()
+    if cuda:
+        torch.cuda.synchronize()
+    probe = max(time_burst(fn, 3, cuda), 1e-4)
+    return max(1, min(max_iters, int(target_ms / probe)))
+
+
+def summarize(samples: Sequence[float]) -> dict:
+    s = sorted(samples)
+    return {
+        "n": len(s),
+        "median_ms": statistics.median(s),
+        "p5_ms": s[max(0, int(0.05 * (len(s) - 1)))],
+        "p95_ms": s[min(len(s) - 1, int(math.ceil(0.95 * (len(s) - 1))))],
+        "min_ms": s[0],
+        "max_ms": s[-1],
+    }
+
+
+def run_point(
+    shape: Shape,
+    m: int,
+    w_a: Weights,
+    w_b: Weights,
+    dev: torch.device,
+    kn: Kernels,
+    want: Sequence[str],
+    rounds: int,
+    target_ms: float,
+    max_iters: int,
+    cuda: bool,
+    seed: int,
+) -> dict:
+    op_a = build_operand(w_a, shape, m, dev, kn, seed)
+    op_b = build_operand(w_b, shape, m, dev, kn, seed + 977)
+    lanes_a = build_lanes(op_a, kn, want)
+    lanes_b = build_lanes(op_b, kn, want)
+
+    rotation = []
+    for name in want:
+        if name in lanes_a:
+            rotation.append((name, lanes_a[name]))
+            rotation.append((name + "#A2", lanes_b[name]))
+    if not rotation:
+        return {"skipped": "no lane could be built at this point"}
+
+    iters = {name: calibrate(fn, target_ms, cuda, max_iters) for name, fn in rotation}
+    samples: dict = {name: [] for name, _ in rotation}
+    for _ in range(rounds):
+        for name, fn in rotation:
+            samples[name].append(time_burst(fn, iters[name], cuda))
+
+    lanes: dict = {}
+    for name, _ in rotation:
+        lanes[name] = summarize(samples[name])
+        lanes[name]["iters_per_burst"] = iters[name]
+        if kn.stub:
+            lanes[name]["stub"] = True
+
+    noise: dict = {}
+    for name in want:
+        if name in lanes and name + "#A2" in lanes:
+            a = lanes[name]["median_ms"]
+            b = lanes[name + "#A2"]["median_ms"]
+            base = min(a, b)
+            noise[name] = {
+                "a_vs_a_abs_ms": abs(a - b),
+                "a_vs_a_rel": (abs(a - b) / base) if base else None,
+            }
+
+    derived = {}
+    if "int8_quant" in lanes and "int8_gemm" in lanes and "int8_fused" in lanes:
+        parts = lanes["int8_quant"]["median_ms"] + lanes["int8_gemm"]["median_ms"]
+        fused = lanes["int8_fused"]["median_ms"]
+        derived["int8_quant_share_of_fused"] = (
+            lanes["int8_quant"]["median_ms"] / fused if fused else None
+        )
+        derived["int8_gemm_share_of_fused"] = (
+            lanes["int8_gemm"]["median_ms"] / fused if fused else None
+        )
+        # Positive = the fused path costs more than its two parts measured
+        # in isolation, i.e. launch-gap/allocator cost a fusion could recover.
+        derived["int8_fused_minus_parts_ms"] = fused - parts
+    for fp8_lane, key in (
+        ("fp8_ct_fused", "int8_over_fp8_ct"),
+        ("fp8_deployed_fused", "int8_over_fp8_deployed"),
+    ):
+        if "int8_fused" in lanes and fp8_lane in lanes:
+            f8 = lanes[fp8_lane]["median_ms"]
+            derived[key] = lanes["int8_fused"]["median_ms"] / f8 if f8 else None
+    if "int8_fused" in lanes and "bf16_linear" in lanes:
+        bf = lanes["bf16_linear"]["median_ms"]
+        derived["int8_over_bf16"] = (
+            lanes["int8_fused"]["median_ms"] / bf if bf else None
+        )
+
+    del op_a, op_b, lanes_a, lanes_b
+    return {"lanes": lanes, "noise_floor": noise, "derived": derived}
+
+
+# --------------------------------------------------------------------------
+# Environment
+# --------------------------------------------------------------------------
+
+
+def environment(dev: torch.device, cuda: bool, kn: Kernels) -> dict:
+    env = {
+        "host": socket.gethostname(),
+        "python": platform.python_version(),
+        "executable": sys.executable,
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        "kernels_stubbed": kn.stub,
+        "kernels_missing": kn.missing,
+        "fp8_dtype": str(kn.fp8_dtype),
+    }
+    if cuda:
+        props = torch.cuda.get_device_properties(dev)
+        env["device_name"] = props.name
+        env["capability"] = f"sm{props.major}{props.minor}"
+        env["total_memory_mib"] = props.total_memory // (1024 * 1024)
+        env["torch_cuda"] = torch.version.cuda
+        try:
+            env["driver"] = (
+                subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=driver_version",
+                        "--format=csv,noheader",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                .stdout.strip()
+                .splitlines()[0]
+            )
+        except Exception as ex:
+            env["driver"] = f"unavailable: {type(ex).__name__}"
+    try:
+        env["git_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        ).stdout.strip()
+    except Exception:
+        env["git_commit"] = ""
+    try:
+        import sgl_kernel  # noqa: PLC0415
+
+        env["sgl_kernel"] = getattr(sgl_kernel, "__version__", "unknown")
+    except Exception as ex:
+        env["sgl_kernel"] = f"unavailable: {type(ex).__name__}"
+    return env
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+DEFAULT_CONFIG = (
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8/config.json"
+)
+
+
+def int_list(text: str) -> list:
+    return [int(p) for p in text.replace(" ", "").split(",") if p]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--config", default=DEFAULT_CONFIG, help="checkpoint config.json")
+    ap.add_argument("--tp-size", type=int, default=3)
+    ap.add_argument("--ratio", default="30,17,17", help="--rank-tp-ratio vector")
+    ap.add_argument(
+        "--mlp-ratio", default="", help="--rank-mlp-ratio vector (default: --ratio)"
+    )
+    ap.add_argument(
+        "--rank", type=int, default=0, help="which rank's shard shapes to bench"
+    )
+    ap.add_argument("--m", default="1,2,4,8,16,2048", help="token counts")
+    ap.add_argument(
+        "--lanes",
+        default="",
+        help="comma list; prefix a name with + to add an optional lane",
+    )
+    ap.add_argument("--rounds", type=int, default=9)
+    ap.add_argument("--target-ms", type=float, default=20.0, help="wall time per burst")
+    ap.add_argument("--max-iters", type=int, default=4000)
+    ap.add_argument(
+        "--max-dim",
+        type=int,
+        default=0,
+        help="cap N and K of the tensors actually multiplied (0 = no cap)",
+    )
+    ap.add_argument(
+        "--no-legacy255",
+        action="store_true",
+        help="omit the three #255 FP8-tuner shapes",
+    )
+    ap.add_argument("--seed", type=int, default=368)
+    ap.add_argument("--out", default="", help="JSON output path")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="CPU stubs, path coverage only"
+    )
+    ap.add_argument(
+        "--shapes-only", action="store_true", help="print the shape table and exit"
+    )
+    ap.add_argument(
+        "--check-imports",
+        action="store_true",
+        help="resolve the real kernels and exit; needs no card, so it is the "
+        "pre-flight to run BEFORE claiming an arbitration window",
+    )
+    args = ap.parse_args(argv)
+
+    if args.check_imports:
+        kn = load_kernels(dry_run=False)
+        for label, obj in (
+            ("per_token_quant_int8", kn.per_token_quant_int8),
+            ("int8_scaled_mm", kn.int8_scaled_mm),
+            ("sglang_per_token_quant_fp8", kn.per_token_quant_fp8),
+            ("fp8_scaled_mm", kn.fp8_scaled_mm),
+            ("apply_fp8_linear", kn.apply_fp8_linear),
+        ):
+            print(f"{'OK  ' if obj is not None else 'MISS'} {label}")
+        for line in kn.missing:
+            print(f"     {line}")
+        print(f"cuda_available={torch.cuda.is_available()}")
+        return 0 if not kn.missing else 1
+
+    ratio = int_list(args.ratio)
+    mlp_ratio = int_list(args.mlp_ratio) if args.mlp_ratio else list(ratio)
+    if args.tp_size > 1 and len(ratio) != args.tp_size:
+        ap.error(f"--ratio has {len(ratio)} entries but --tp-size is {args.tp_size}")
+    if not 0 <= args.rank < max(1, args.tp_size):
+        ap.error("--rank out of range")
+
+    with open(args.config) as fh:
+        cfg = json.load(fh)
+    shapes, cases, facts = derive_shapes(cfg, args.tp_size, ratio, mlp_ratio, args.rank)
+    provenance = cross_check_partition(cases)
+
+    if not args.no_legacy255:
+        seen = {(s.n, s.k) for s in shapes}
+        for name, n, k in LEGACY_255_SHAPES:
+            if (n, k) in seen:
+                continue  # the current plan already produces this exact GEMM
+            shapes.append(
+                Shape(
+                    name, n, k, "#255 FP8 tuner queue", 0, "reference operating point"
+                )
+            )
+            seen.add((n, k))
+
+    # Dry run defaults: real shape table, small tensors, few rounds.
+    if args.dry_run:
+        if args.max_dim == 0:
+            args.max_dim = 256
+        if args.rounds == ap.get_default("rounds"):
+            args.rounds = 3
+        args.target_ms = min(args.target_ms, 1.0)
+        args.max_iters = min(args.max_iters, 20)
+
+    if args.max_dim:
+        cap = args.max_dim
+        for s in shapes:
+            # Keep the kernel's own divisibility rules (K % 16, N % 8) intact
+            # so the capped run still exercises a legal shape.
+            s.exec_n = min(s.n, cap - cap % 8)
+            s.exec_k = min(s.k, cap - cap % 16)
+
+    m_list = int_list(args.m)
+    if args.dry_run and args.m == ap.get_default("m"):
+        m_list = [1, 2, 8]
+
+    want = list(ALL_LANES)
+    if args.lanes:
+        explicit = [p for p in args.lanes.replace(" ", "").split(",") if p]
+        added = [p[1:] for p in explicit if p.startswith("+")]
+        named = [p for p in explicit if not p.startswith("+")]
+        if named:
+            want = named
+        want = want + [a for a in added if a not in want]
+    unknown = [w for w in want if w not in ALL_LANES + OPTIONAL_LANES]
+    if unknown:
+        ap.error(f"unknown lane(s): {unknown}; known: {ALL_LANES + OPTIONAL_LANES}")
+
+    # ---- shape table -----------------------------------------------------
+    print("=" * 78)
+    print(
+        f"Task #368 INT8 decode microbench -- shapes for rank {args.rank} of TP={args.tp_size}"
+    )
+    print(f"config      {args.config}")
+    print(f"ratio       {ratio}   mlp-ratio {mlp_ratio}")
+    print(f"partition   {provenance}")
+    print("=" * 78)
+    print(f"{'shape':<20}{'N(out)':>9}{'K(in)':>9}{'layers':>8}  module")
+    illegal = []
+    for s in shapes:
+        # int8_scaled_mm's own N % 8 / K % 16 rules
+        # (w8a8_int8.verify_int8_scaled_mm_supports_shape). A shape that
+        # violates them would abort inside CUTLASS, so name it here.
+        if s.n % 8 or s.k % 16:
+            illegal.append(f"{s.name} N={s.n} K={s.k}")
+        print(f"{s.name:<20}{s.n:>9}{s.k:>9}{s.layers:>8}  {s.module}")
+        if s.note:
+            print(f"{'':<20}{s.note}")
+        if s.capped:
+            print(f"{'':<20}[dry run] tensors multiplied at N={s.run_n} K={s.run_k}")
+    print("-" * 78)
+    n_gemms = sum(s.layers for s in shapes)
+    print(
+        f"INT8 linear layers traversed per decoded token on this rank: "
+        f"{n_gemms}  ({2 * n_gemms} kernel launches -- quant + GEMM each)"
+    )
+    for line in facts["not_quantized_by_ignore_list"]:
+        print(f"  not INT8: {line}")
+    if illegal:
+        print(
+            "  !! int8_scaled_mm requires N % 8 == 0 and K % 16 == 0; "
+            f"these shards do not satisfy it: {illegal}"
+        )
+    print("=" * 78)
+    if args.shapes_only:
+        return 0
+
+    kn = load_kernels(args.dry_run)
+    cuda = (not args.dry_run) and torch.cuda.is_available()
+    if not args.dry_run and not cuda:
+        print(
+            "No CUDA device visible. Use --dry-run for the desk path.", file=sys.stderr
+        )
+        return 2
+    dev = torch.device("cuda") if cuda else torch.device("cpu")
+
+    env = environment(dev, cuda, kn)
+    print(f"device      {env.get('device_name', 'cpu')} {env.get('capability', '')}")
+    print(f"lanes       {want}")
+    print(f"M           {m_list}")
+    print(f"rounds      {args.rounds}   target {args.target_ms} ms/burst")
+    if kn.stub:
+        print("!! DRY RUN: pure-torch stand-ins, NOT a measurement !!")
+    print("=" * 78)
+
+    results = []
+    t_start = time.time()
+    for s in shapes:
+        # Weights are M-independent and expensive to sample; build the
+        # A-vs-A pair once per shape and hold it across the whole M sweep.
+        w_a = build_weights(s, dev, kn, args.seed)
+        w_b = build_weights(s, dev, kn, args.seed + 977)
+        for m in m_list:
+            t0 = time.time()
+            point = run_point(
+                s,
+                m,
+                w_a,
+                w_b,
+                dev,
+                kn,
+                want,
+                args.rounds,
+                args.target_ms,
+                args.max_iters,
+                cuda,
+                args.seed + m,
+            )
+            row = {"shape": asdict(s), "m": m, "wall_s": round(time.time() - t0, 3)}
+            row.update(point)
+            results.append(row)
+            if "lanes" in point:
+                med = {
+                    k: round(v["median_ms"], 5)
+                    for k, v in point["lanes"].items()
+                    if "#A2" not in k
+                }
+                print(f"{s.name:<20} M={m:<6} {row['wall_s']:>6.2f}s  {med}")
+            else:
+                print(f"{s.name:<20} M={m:<6} {point}")
+        del w_a, w_b
+        if cuda:
+            torch.cuda.empty_cache()
+    total_s = round(time.time() - t_start, 2)
+    print("=" * 78)
+    print(f"total measurement wall time: {total_s} s")
+
+    payload = {
+        "task": "368",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "dry_run": bool(args.dry_run),
+        "environment": env,
+        "model_config": args.config,
+        "model_facts": facts,
+        "plan": {
+            "tp_size": args.tp_size,
+            "ratio": ratio,
+            "mlp_ratio": mlp_ratio,
+            "rank": args.rank,
+            "partition_provenance": provenance,
+        },
+        "settings": {
+            "m": m_list,
+            "lanes": want,
+            "rounds": args.rounds,
+            "target_ms": args.target_ms,
+            "max_iters": args.max_iters,
+            "max_dim": args.max_dim,
+            "seed": args.seed,
+        },
+        "shapes": [asdict(s) for s in shapes],
+        "results": results,
+        "total_wall_s": total_s,
+    }
+    out = args.out
+    if not out:
+        slug = env.get("device_name", "cpu").replace(" ", "_")
+        suffix = "dryrun" if args.dry_run else time.strftime("%Y%m%d-%H%M%S")
+        out = f"/tmp/int8_368_microbench.{slug}.{suffix}.json"
+    with open(out, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"wrote {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
