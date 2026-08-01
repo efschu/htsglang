@@ -31,17 +31,6 @@ docker run -d --name htsglang \
 `--gpus` takes NVML GPU UUIDs (`nvidia-smi -L`), not indices, to avoid
 enumeration-order drift across driver/toolkit versions.
 
-Fork-specific flags (see `--help` for full descriptions):
-
-| Flag | Purpose |
-|---|---|
-| `--tp-size N` / `--rank-gpu-id` | one physical GPU id per rank; duplicates co-locate ranks on one GPU |
-| `--rank-tp-ratio auto` | uneven TP shard split across mismatched GPUs (requires `--rank-gpu-id`) |
-| `--rank-auto-reserve-mib` | per-GPU VRAM headroom reserved before `--rank-tp-ratio auto` sizes shards |
-| `--kv-cache-dtype fp8_e4m3` | fp8 KV cache |
-| `--speculative-algorithm NEXTN --speculative-num-steps N --speculative-num-draft-tokens N` | NEXTN speculative decoding |
-| `--enable-metrics` | Prometheus metrics endpoint |
-
 ## Chat template
 
 The checkpoint's own `chat_template.jinja` is used by default. For
@@ -59,27 +48,50 @@ command (as in the example above) instead of relying on env vars.
 NCCL: the image pins NCCL 2.30.7, required for multi-rank-per-GPU
 co-location.
 
-## Not yet in the Docker image
+## Fork flags
 
-The published image was built from the 2026-07-14 tree. The features below
-exist in this repository but are not in that image yet — run from source or
-wait for the next image build.
+- `--rank-gpu-id <id,id,...>` — one CUDA device index per tensor-parallel rank; duplicates co-locate ranks on one GPU, length must equal `--tp-size`.
+- `--rank-gpu-memory-mib <MiB>|<MiB,MiB,...>` — absolute memory budget per rank; a scalar applies to every rank, a per-rank list is allowed with `--rank-tp-ratio`; no further utilization ceiling is applied.
+- `--rank-tp-ratio auto|auto-performance|<w,w,...>` — uneven TP: integer shard weights per rank, derived from the memory budgets or NVML totals (`auto`) or additionally from a measured hardware profile (`auto-performance`).
+- `--rank-auto-reserve-mib auto|<MiB>|<MiB,MiB,...>` — headroom subtracted from the NVML total when `--rank-tp-ratio auto` derives the budgets itself.
+- `--rank-mlp-ratio <w,w,...>` — per-rank weights for the dense-MLP family only, rebalancing weight bytes so the min-synced KV pool grows.
+- `--rank-moe-ratio <w,w,...>` — the same lever for the fused expert (MoE) weight family.
+- `--mamba-checkpoint-interval <tokens>` — pin all radix-cached mamba/GDN checkpoints to absolute multiples of this token count.
 
-- GGUF loading (Qwen3.5/3.6, Gemma-4), K-quant kernels, multimodal and
-  dynamic-quant GGUF variants
-- Asymmetric decode-context-parallelism (`--rank-kv-ratio`) and
-  ratio-weighted vocab sharding (`--rank-vocab-ratio`)
-- TP degree greater than the model's KV-head count (replicated-KV + token
-  sharding)
-- MoE expert offload to host RAM under asymmetric TP/DCP
-- Hibernate checkpoint/restore (suspend-to-disk, fast reload)
-- SWA-DCP (sliding-window hybrid decode-context-parallelism, Gemma-4)
-- Weightless-KV lane (meta-device worker, separate weight/KV roles)
-- Fast-lane priority scheduling
-- Single-node PD disaggregation
-- Cross-algorithm drafter routing, NEXTN/DFLASH bandit (in progress)
-- Session KV spill to host RAM (in progress)
-- Rig dashboard / capacity-planner UI
+**Not in the published Docker image — run from source or wait for the next image build:**
+
+- `--rank-vocab-ratio auto|<w,w,...>` — ratio-weighted vocab sharding of the tied vocab layers, balancing lm_head read time instead of shard width.
+- `--rank-kv-ratio coupled|capacity|auto|<t,t,...>` — uneven-DCP KV token ownership, decoupled from the weight split; `capacity` installs the measured per-rank optimum.
+- `--rank-perf-tune both|dec|enc` — tuning target of `--rank-tp-ratio auto-performance`.
+- `--rank-perf-loose-ctx-percent <percent>` — context floor for auto-performance candidates: predicted max context must stay at or above (100 - X)% of the VRAM-auto split.
+- `--swa-pool-sizing ratio|cap` — SWA pool sizing on hybrid sliding-window models; `cap` pins the SWA pool at its window-bounded worst case and gives the rest to full attention.
+- `--speculative-draft-placement split|solo` — draft model TP-sharded (default) or unsharded on one rank that broadcasts its draft token ids.
+- `--speculative-draft-gpu <id>` — CUDA device index whose TP rank hosts the solo draft.
+- `--speculative-adaptive-graph-memory auto|resident|offload|offload-scratch` — VRAM policy for the pre-built adaptive runtime states.
+- `--speculative-cross-algorithm` — load the NEXTN/MTP and DFLASH drafts co-resident on one server.
+- `--speculative-cross-algorithm-force nextn|dflash|schedule:N|auto|policy` — which rung serves batches: static pin, debug schedule, acceptance-driven bandit, or policy table.
+- `--speculative-cross-algorithm-ctx-gate auto|off|<tokens>` — context threshold at or above which the DFLASH rung is ineligible.
+- `--speculative-drafter-policy auto|<start_ctx:family:value,...>` — ordered context-threshold stage table used by `--speculative-cross-algorithm-force policy`.
+- `--enable-fast-lane` — latency-priority scheduling class: requests tagged `lane='fast'` outrank batched heavy requests.
+- `--fast-lane-priority <int>` — priority value seeded for fast-lane requests.
+- `--fast-lane-reserved-heavy-slots <int>` — minimum number of running heavy requests that fast-lane preemption never drops below.
+- `--fast-lane-heavy-aging-ms <ms>` — a heavy request queued longer than this is promoted ahead of the fast tier once; 0 disables aging.
+- `--weightless-kv-fastlane` — experimental: one head rank holds all weights and runs as TP=1, the other ranks hold only a KV token shard.
+- `--weightless-kv-head-rank <rank>` — the weight-bearing rank of the weightless-KV lane.
+- `--weightless-kv-chunked-block-size <tokens>` — block-decode staging size for that lane; 0 keeps the single monolithic attention call.
+- `--weightless-kv-host-spill-tokens <tokens>` — per-rank pinned-host KV overflow slots, so one sequence's KV can exceed the rank's VRAM.
+- `--weightless-kv-spill-device-cap <tokens>` — debug cap on device-resident KV slots per rank, forcing the host-streaming path.
+- `--enable-kv-session-offload` — experimental: spill the youngest running session's KV to host RAM and keep decoding it from host.
+- `--kv-session-offload-block-size <tokens>` — per-rank streamed block size of the spill tick.
+- `--kv-session-offload-tick-interval <iterations>` — minimum scheduler iterations between two spill ticks.
+- `--kv-session-offload-tick-adaptive` — derive the tick cadence from measured device slack and tick cost instead of the static interval.
+- `--kv-session-offload-tick-floor <iterations>` — anti-starvation bound on the adaptive interval, i.e. the guaranteed minimum progress rate of a spilled session.
+- `--kv-session-offload-restore-margin-tokens <tokens>` — free-slot headroom required before a spilled session is restored.
+- `--kv-session-offload-restore-hysteresis-steps <iterations>` — consecutive iterations the restore condition must hold.
+- `--kv-session-offload-max-spills <n>` — maximum number of concurrently spilled sessions; sizes the pinned host pool linearly.
+- `--determinism-logits-dump-dir <path>` — debug: every rank dumps its per-step next-token logits row into this directory.
+- `--enable-weights-disk-backup` — hibernate (suspend-to-disk): the `/hibernate` endpoint parks each rank's post-load GPU weights for a fast restore.
+- `--hibernate-dir <path>` — directory for the hibernate weight shards and manifest; required with `--enable-weights-disk-backup`.
 
 *Upstream sglang README below.*
 
