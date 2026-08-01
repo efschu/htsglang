@@ -2098,13 +2098,20 @@ class ServerArgs:
             "measured-first (the #146 harness / results store) and fall back "
             "to the #148 roofline estimate, each carrying its provenance -- "
             "a config with neither is reported unscorable for energy, never "
-            "silently substituted. SCOPE TODAY (#350 phase 3): the objective "
-            "is honoured by the PLANNER (the /api/key_solver path and "
-            "key_solver.solve, which return the energy-optimal key with "
-            "mode='energy'); the boot's own --rank-tp-ratio auto-performance "
-            "sizing does not consult it yet, so setting this flag alone does "
-            "not change the vector a server boots with -- plan with it, then "
-            "boot the key it returns.",
+            "silently substituted. Honoured by BOTH the planner (the "
+            "/api/key_solver path and key_solver.solve, which return the "
+            "energy-optimal key with mode='energy') and the BOOT's own "
+            "--rank-tp-ratio auto-performance sizing, which selects the "
+            "admissible MLP vector with the lowest predicted J/token -- so "
+            "launching with --objective energy boots the energy-optimal "
+            "vector directly. Boot-time power anchors come from the NVML "
+            "power calibration when present and from the card library's TDP "
+            "otherwise; a rig where some card has neither is REFUSED at "
+            "parse time with a named reason rather than booted on the "
+            "throughput vector under an energy flag. The context floor, the "
+            "decode-knee guard and fundability stay binding either way -- "
+            "the objective picks among admissible vectors, it does not buy "
+            "past a correctness gate.",
             choices=["throughput", "energy"],
         ),
     ] = "throughput"

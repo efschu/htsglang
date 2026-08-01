@@ -16,35 +16,32 @@ On the desk fixture the two optima genuinely differ — `(10,1,1)` vs `(12,0,0)`
 i.e. **9.8 % fewer J/token at 18.2 % slower**. The GPU run asks whether that
 divergence survives contact with the real rig.
 
-## How each arm's plan is selected (updated for phase 3)
+## How each arm's plan is selected (updated for phase 4)
 
-`--objective` is honoured by the **planner**, not yet by the boot's own
-`--rank-tp-ratio auto-performance` sizing. So the two arms are not "the same
-boot with a different flag" — each arm's key is PLANNED first and then booted
-explicitly:
+`--objective` is now honoured by the BOOT itself: `--rank-tp-ratio
+auto-performance` selects the admissible MLP vector with the lowest predicted
+J/token. The two arms are therefore the same boot with one flag changed --
+the plan-then-boot curl the phase-3 runsheet needed is gone.
 
 ```bash
-# energy arm: ask the solver for the energy-optimal key (needs power anchors)
-curl -s localhost:<planner-port>/api/key_solver -H 'content-type: application/json' -d '{
-  "model_path": "'"$MODEL"'", "tp_size": 3, "rank_gpu_id": [0,1,2],
-  "goal": "dec", "objective": "energy",
-  "power_anchors": [{"idle_w": 30, "active_w": 300, "source": "measured"},
-                    {"idle_w": 90, "active_w": 320, "source": "measured"},
-                    {"idle_w": 90, "active_w": 320, "source": "measured"}]
-}' | jq -r '.candidates[0].launch_flags | @sh'
-# -> --rank-mlp-ratio a,b,c   ... boot with exactly that
+# energy arm  -- boots the energy-optimal vector directly
+... --rank-tp-ratio auto-performance --objective energy
+# throughput arm -- omit the flag (or pass --objective throughput)
+... --rank-tp-ratio auto-performance
 ```
 
-Drop `"objective"` and `"power_anchors"` for the throughput arm. The answer
-carries `mode: "energy"` and a caveat naming the J/work figure and whether the
-anchors were measured or estimated; an unpriceable request comes back
-`ok: false` with a named reason (never a throughput plan under an energy
-label), and the script must treat that as INCONCLUSIVE, not as an arm.
+Read the chosen vector and the pricing tier off the boot log's
+`auto-performance` block: it now prints `objective=energy: planning for
+J/token, <measured|estimate> power anchors (...)` and a `predicted N J/token`
+figure next to every candidate. Quote the tier in the verdict -- an
+estimate-anchored run is estimate-grade.
 
-Power anchors: use the NVML calibration from #149 (`power_calibration`) when
-present — those are the `"measured"` tier. TDP-derived anchors from the card
-library are the `"estimate-tdp"` tier and still plan, but the verdict must
-then quote the run as estimate-grade.
+If the rig cannot be priced (a card with neither an NVML calibration row nor a
+TDP in the card library) the boot FAILS at parse time with a named reason. That
+is the intended behaviour, not a bug in the script: run the #149 power
+calibration first, or add the card's TDP. Never "fix" it by dropping the flag
+and reporting the arm anyway -- that is the silent substitution the whole
+design refuses.
 
 ## Before you start
 
