@@ -1024,6 +1024,16 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
+        # #273: lifetime count of "sole survivor of retract_decode and still
+        # does not fit" events for THIS request. Distinct from
+        # retraction_count (a client-visible total covering every kind of
+        # retraction): this one gates a bounded retry-vs-fail decision for
+        # the specific solo-OOM corner (see retract_decode) and is never
+        # reset, so a request that keeps losing this exact race -- even
+        # with ordinary retractions in between -- eventually fails cleanly
+        # instead of retrying forever.
+        self.solo_oom_count = 0
+
         # For observability
         self.metrics_collector = metrics_collector
         if time_stats is not None:
@@ -2793,20 +2803,63 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
-            # Even the last remaining request cannot fit in memory.
-            # Instead of crashing the scheduler, gracefully abort it.
+            # Even the last remaining request cannot fit in memory. Every
+            # less-preferred request has already been retracted above, so by
+            # construction this survivor is the OLDEST / most-progressed
+            # request in the batch -- the one FCFS says must not be
+            # sacrificed for someone else's pressure (#273). This is
+            # reachable under ordinary extreme concurrent load once the
+            # kv-session-offload spill budget is exhausted (try_spill
+            # returns False when no host region is free -> stock retraction
+            # runs, see scheduler.py's decode-OOM branch): transient, not a
+            # sign this request is unfittable.
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
-            last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
-                "in the decode batch. Aborting the last request.",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
-            logger.warning(
-                "retract_decode: aborted last request %s due to OOM", last_req.rid
-            )
+            last_req.solo_oom_count += 1
+            max_retries = envs.SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES.get()
+            if last_req.solo_oom_count <= max_retries:
+                # Retract it too, exactly like every other victim in this
+                # function: release memory and send it back to the waiting
+                # queue instead of killing the client. It gets another
+                # scheduling turn once pressure eases (a spill region frees
+                # up, another request finishes, ...).
+                retracted_reqs.append(last_req)
+                self.release_req(last_idx, 0, server_args)
+                logger.warning(
+                    "retract_decode: retracted the last remaining request "
+                    "%s (solo-OOM #%d/%d) instead of aborting it -- the "
+                    "pool could not fit even one request's next decode "
+                    "step",
+                    last_req.rid,
+                    last_req.solo_oom_count,
+                    max_retries,
+                )
+            else:
+                # This exact request has now lost the solo-OOM race too many
+                # times to be ordinary contention, which resolves within a
+                # couple of scheduler iterations. Retracting it again would
+                # silently turn a structurally oversized request into an
+                # infinite retry loop with zero progress -- worse than a
+                # clean failure. SERVICE_UNAVAILABLE, not
+                # INTERNAL_SERVER_ERROR: nothing crashed, the pool is
+                # (persistently) unable to seat this request's own
+                # footprint, which is a capacity fact about the request, not
+                # a server fault.
+                last_req.to_finish = FINISH_ABORT(
+                    f"Out of memory {last_req.solo_oom_count} times in a "
+                    f"row as the sole remaining request in the decode "
+                    f"batch. The pool cannot currently fit this request "
+                    f"even alone.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                reqs_to_abort.append(last_req)
+                self.release_req(last_idx, 0, server_args)
+                logger.warning(
+                    "retract_decode: aborted request %s after %d "
+                    "consecutive solo-OOM retractions (SERVICE_UNAVAILABLE)",
+                    last_req.rid,
+                    last_req.solo_oom_count,
+                )
 
         self.filter_batch(keep_indices=sorted_indices)
 

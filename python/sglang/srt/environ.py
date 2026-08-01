@@ -431,6 +431,13 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    # #273: how many times in a row a request may be the sole survivor of
+    # retract_decode and still not fit before it is failed instead of
+    # re-queued again. Ordinary extreme pressure (e.g. the #236/#242
+    # kv-session-offload spill budget running out) resolves within a couple
+    # of scheduler iterations; a request still solo-OOMing past this many
+    # retries is structurally too large for the pool, not merely contended.
+    SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES = EnvInt(8)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
