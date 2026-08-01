@@ -2789,6 +2789,115 @@ class PlanInputs:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class LayerFamilyCensus:
+    """How many layers actually CARRY each weight family, and how wide (#371).
+
+    The uneven-TP family table used to assume every layer carries every
+    family: attention params were ``full_layers * attn_layer`` and MLP params
+    ``n_layers * mlp_layer``, with one uniform per-layer size each. A
+    hybrid checkpoint corrects the attention count through ``layer_types``,
+    but a HETEROGENEOUS-LAYER checkpoint (Nemotron-NAS / Puzzle) declares
+    ``block_configs`` instead: per layer, ``attention.no_op`` / ``ffn.no_op``
+    say the block is ABSENT, and ``ffn.ffn_mult`` gives that layer its own
+    FFN width. Such a config has no ``layer_types``, so it fell through to
+    "every layer is a full-attention MLP layer" and the table counted weights
+    that do not exist.
+
+    Two consequences, both silent: the weight-byte model over-counts, and the
+    unit partition derived from it hands ranks a share of a family that is not
+    there. The #324 per-(rank, family) scores and the #348b cost library read
+    the same table, so the error propagates into the plan rather than showing
+    up as a load error.
+
+    ``ffn_width_factor`` is the SUM over layers of that layer's FFN width
+    relative to the config's nominal ``intermediate_size`` -- so a uniform
+    stack of N layers gives exactly ``N`` and the arithmetic is unchanged,
+    while a variable-width stack is summed instead of multiplied.
+    """
+
+    n_layers: int
+    attn_layers: int
+    ffn_layers: int
+    ffn_width_factor: float
+    heterogeneous: bool
+
+    @property
+    def uniform(self) -> bool:
+        return not self.heterogeneous
+
+
+def layer_family_census(text: dict, n_layers: int) -> LayerFamilyCensus:
+    """Read the per-layer family census off a text config (#371).
+
+    Returns the UNIFORM census (every layer carries every family, width
+    factor == ``n_layers``) for every checkpoint that does not declare
+    ``block_configs`` -- which is every model this fork serves today, so the
+    family table below stays byte-identical for them.
+
+    Tolerant by construction: ``block_configs`` entries may be dicts (raw
+    JSON) or objects (a parsed HF config), and a malformed or partial entry
+    is treated as a PRESENT block. Over-counting a block that is absent is
+    the error this function exists to remove, but under-counting one that is
+    present would size a pool too small and fail a boot -- so when the shape
+    is unreadable the census degrades toward today's behaviour rather than
+    toward the smaller number.
+    """
+    blocks = text.get("block_configs")
+    if not blocks:
+        return LayerFamilyCensus(
+            n_layers=n_layers,
+            attn_layers=n_layers,
+            ffn_layers=n_layers,
+            ffn_width_factor=float(n_layers),
+            heterogeneous=False,
+        )
+
+    def _sub(block, name):
+        if isinstance(block, dict):
+            return block.get(name)
+        return getattr(block, name, None)
+
+    def _field(sub, name, default=None):
+        if sub is None:
+            return default
+        if isinstance(sub, dict):
+            return sub.get(name, default)
+        return getattr(sub, name, default)
+
+    nominal_mult = None
+    attn_layers = 0
+    ffn_layers = 0
+    width = 0.0
+    for block in blocks:
+        attn = _sub(block, "attention")
+        ffn = _sub(block, "ffn")
+        if not _field(attn, "no_op", False):
+            attn_layers += 1
+        if not _field(ffn, "no_op", False):
+            ffn_layers += 1
+            mult = _field(ffn, "ffn_mult", None)
+            if mult is None:
+                width += 1.0
+            else:
+                # Widths are relative: the first real FFN sets the reference,
+                # so a stack that is uniform in ffn_mult still yields exactly
+                # its layer count and the byte model does not move.
+                if nominal_mult is None:
+                    nominal_mult = float(mult)
+                width += (
+                    float(mult) / nominal_mult if nominal_mult else 1.0
+                )
+    n = len(blocks)
+    return LayerFamilyCensus(
+        n_layers=n,
+        attn_layers=attn_layers,
+        ffn_layers=ffn_layers,
+        ffn_width_factor=width,
+        heterogeneous=(attn_layers != n or ffn_layers != n or width != float(n)),
+    )
+
+
 @dataclasses.dataclass
 class _Family:
     """One weight family: total parameter count, bytes per parameter, and
@@ -3510,6 +3619,17 @@ class PerfCostModel:
         else:
             self.full_layers, self.gdn_layers = n_layers, 0
         self.n_layers = n_layers
+        # #371: per-layer family census. `layer_types` covers the hybrid
+        # (Qwen-style) shape; a HETEROGENEOUS-LAYER checkpoint declares its
+        # per-layer blocks in `block_configs` instead (Nemotron-NAS / Puzzle:
+        # each entry carries attention.no_op / ffn.no_op and its own
+        # ffn_mult), and that shape reaches the `else` branch above, where
+        # every layer is counted as a full-attention MLP layer. The census
+        # corrects both family counts and returns the FFN width factor, so a
+        # variable-width FFN stack is summed rather than multiplied.
+        self.layer_census = layer_family_census(text, n_layers)
+        if self.layer_census.heterogeneous:
+            self.full_layers = self.layer_census.attn_layers
         self.kv_heads = int(text.get("num_key_value_heads", 1))
         self.q_heads = int(text.get("num_attention_heads", 1))
         self.head_dim = int(text.get("head_dim", self.hidden // self.q_heads))
@@ -3673,6 +3793,18 @@ class PerfCostModel:
         gs = quant_cfg.get("group_size")
         return int(gs) if gs else None
 
+    def _mlp_layer_factor(self) -> float:
+        """Layer-equivalents of MLP mass in this checkpoint (#371).
+
+        ``n_layers`` for every uniform stack -- so the family table is
+        byte-identical for everything this fork serves today -- and the
+        census's summed width factor for a heterogeneous one.
+        """
+        census = getattr(self, "layer_census", None)
+        if census is None or census.uniform:
+            return float(self.n_layers)
+        return census.ffn_width_factor
+
     def _build_families(self, cfg: dict) -> Dict[str, _Family]:
         H, I = self.hidden, self.intermediate
         q_size = self.q_heads * self.head_dim * (2 if self.attn_gate else 1)
@@ -3745,9 +3877,17 @@ class PerfCostModel:
             # transient only and deliberately NOT part of this budget model.
 
         families = {
+            # #371: MLP mass is the census's FFN WIDTH FACTOR, not the layer
+            # count -- identical (== n_layers) for every uniform stack, and
+            # for a heterogeneous one it both drops the no_op-FFN layers and
+            # sums the per-layer widths instead of multiplying one width by
+            # every layer. `full_layers` already carries the attention
+            # correction (set from the census at parse time).
             "attn": _Family(self.full_layers * attn_layer, 2.0, "attn"),
             "gdn": _Family(self.gdn_layers * gdn_layer, 2.0, "gdn"),
-            "mlp": _Family(self.n_layers * mlp_layer, 2.0, "mlp"),
+            "mlp": _Family(
+                self._mlp_layer_factor() * mlp_layer, 2.0, "mlp"
+            ),
             "vocab": _Family(vocab_params, 2.0, "even"),
             "vision": _Family(vision_params, vision_bpp, "gdn_base"),
             "draft_attn": _Family(draft_attn, 2.0, "attn"),
