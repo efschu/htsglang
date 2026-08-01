@@ -6051,6 +6051,16 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            # #363: the verdict trace's summary line. THIS block is the one
+            # that runs on both stop paths that unwind -- the graceful one (a
+            # ShutdownReq broke the event loop above) and the exception one,
+            # KeyboardInterrupt included, which `except Exception` does not
+            # catch but `finally` still honours. SIGTERM unwinds through
+            # neither and is covered by the handler the observer installs at
+            # build time. Idempotent, never raises.
+            from sglang.srt.managers.regime_runtime import close_regime_trace
+
+            close_regime_trace(scheduler)
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()

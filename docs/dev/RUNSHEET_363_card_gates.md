@@ -112,6 +112,50 @@ file; take one file per rank if the launcher gives each rank its own working
 directory, otherwise pass `--ranks 1` and record in the note that the trace is
 rank-0's. The refusal text says which situation you are in.
 
+### 1a. The ready-wait, copy-pasteable
+
+Do not hand-roll this. Three separate over-matches cost one boot each in the
+first window, and a bare `until curl` with no deadline is how the #377 window
+lost 20 of its 25 minutes.
+
+```bash
+DEADLINE=$(( $(date +%s) + 540 ))          # wall clock, always
+PAT='Received sigquit|Scheduler hit an exception|Initialization failed|CUDA out of memory|torch\.OutOfMemoryError|serve: error:|NotImplementedError'
+EXCL='Ignore import error|server_args=ServerArgs'
+while :; do
+  [ $(date +%s) -ge $DEADLINE ] && { echo "VERDICT=DEADLINE"; break; }
+  [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:30000/health)" = "200" ] \
+    && { echo "VERDICT=READY"; break; }
+  if grep -vE "$EXCL" "$OUT/boot.log" | grep -qE "$PAT"; then
+    echo "VERDICT=TERMINAL"; grep -vE "$EXCL" "$OUT/boot.log" | grep -E "$PAT" | tail -2 | cut -c1-200
+    break
+  fi
+  ps -eo pid,cmd | grep -E "python.*launch_server" | grep -v grep >/dev/null \
+    || { echo "VERDICT=PROCESS_GONE"; break; }
+  sleep 10
+done
+```
+
+Why each piece is the way it is (all three learned by losing a boot):
+
+| trap | what happened | the guard |
+|---|---|---|
+| `Failed to` as a death pattern | matches the benign `Ignore import error when loading sglang.srt.models.* : ... Failed to load dynamic shared library ...` lines every boot emits | the `EXCL` list |
+| `sigquit` case-insensitively | matches `custom_sigquit_handler=None` inside the one-line `server_args=ServerArgs(...)` dump | `Received sigquit`, and `server_args=ServerArgs` in `EXCL` |
+| `pgrep -f`/`pkill -f "...launch_server..."` | **matches the checking shell itself** -- the pattern is in your own command line. Exit 144, self-kill. It bit twice, once while releasing the arb files | `ps -eo pid,cmd \| grep -E ... \| grep -v grep`, and kill by **PID captured at launch**, never by pattern |
+
+Capture the PID at launch so teardown never needs a pattern:
+
+```bash
+setsid nohup env ... python3 -m sglang.launch_server ... > $OUT/boot.log 2>&1 &
+sleep 2; ps -eo pid,cmd | grep -E "python.*launch_server" | grep -v grep \
+  | awk '{print $1}' > $OUT/server.pids
+```
+
+Shut down with `kill -INT $(cat $OUT/server.pids)`. SIGINT and SIGTERM both
+write the trace's summary line since the #363 shutdown hook landed; SIGKILL
+does not, and a summary-less trace is refused by `readout.py` on purpose.
+
 Confirm the observer armed, before spending the window on a workload:
 
 ```bash
@@ -137,6 +181,12 @@ python scripts/regime_gates/workload.py \
   2>&1 | tee $OUT/workload.log
 ```
 
+The first window reached only **6.2 % occupancy** of a 519 670-token pool, so
+nothing came near the admissibility interlock. The re-run wants a HEAVIER KV
+load -- raise `--burst` and `--drain`, and give the drain arm enough
+`--drain-tokens` that held tokens approach the 85 % ascend mark -- or the
+occupancy axis stays untested for a second window running.
+
 | phase | shape | expected regime |
 |---|---|---|
 | `prefill_burst` | 4 × 12 k-token prompts admitted at once | `PREFILL_HEAVY` |
@@ -149,9 +199,11 @@ never appears in the trace is a finding about the thresholds (§3.4 constants
 are still provisional), not a reason to re-tune mid-window — record it and
 carry it into gate 3.
 
-**Shut the server down cleanly** (`SIGINT`, not `SIGKILL`). The summary line
-is written on close, and `readout.py` refuses a trace without one: "zero
-desyncs" and "zero desyncs so far" are different claims.
+**Shut the server down cleanly**: `kill -INT $(cat $OUT/server.pids)`, or
+SIGTERM -- both write the summary line now that the #363 shutdown hook is in
+(clean exit, exception/KeyboardInterrupt, and SIGTERM are all covered).
+`SIGKILL` is not, by design: `readout.py` refuses a summary-less trace because
+"zero desyncs" and "zero desyncs so far" are different claims.
 
 ---
 
