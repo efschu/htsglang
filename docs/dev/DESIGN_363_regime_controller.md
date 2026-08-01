@@ -1261,3 +1261,68 @@ a signal that could not move.
 0.61 % to 12.5 % across boots, so 25 is an order of magnitude off and the
 signal is not boot-stable at that magnitude. Whatever replaces it must respect
 both facts, and neither is a licence to set the number from two boots.
+
+---
+
+## 18. Gates re-recorded on the #388 classifier (2026-08-01)
+
+Three boots, §1 recipe, only `--regime-trace` differing; workload identical on
+all three at `--repeats 3`.
+
+### 18.1 Early check passed, and gates 1+2 are re-recorded
+
+`prefill_share` moves: the observe log reported 100 % / 50 % / 0 % where the
+old attribution was 0.000 across 34 954 boundaries.
+
+| | old (broken attribution) | new (#388) |
+|---|---|---|
+| verdicts | 104 862 | 147 105 (3 per-rank files) |
+| desyncs | 0 | **0** |
+| regimes | mixed, decode_heavy | mixed, decode_heavy, **prefill_heavy** |
+| transitions | 7 | 36 |
+| `prefill_share` max | 0.000 | **1.000** (n = 55) |
+
+Zero desyncs holds on the fixed classifier, over more verdicts and a regime
+the old attribution structurally could not produce. Gate 2 re-recorded on the
+same trace and passes.
+
+### 18.2 Gate 3 fails on every signal, and it is a method finding — again
+
+Arm A 24 111 boundaries / **41 active**; arm B 24 762 / **56 active**. Every
+signal came back `ARMS_DISSIMILAR`.
+
+With the fixed attribution the share signals are near-BINARY at
+`window_rounds = 64`: a boundary's window is essentially all-prefill or
+all-decode, so `prefill_share` swings the full 0..1 and the within-arm
+movement is 1. A pointwise A-vs-A band on a binary sequence is 1 whenever the
+two runs' bursts do not land on the same boundary indices — and they cannot,
+because the same workload produced 41 active boundaries in one arm and 56 in
+the other, 37 % apart, which is real run-to-run variation in scheduler round
+counts.
+
+The guard is right that these arms are not comparable POINTWISE, and that is
+not evidence the rig is noisy. **For a near-binary or bursty signal the
+meaningful A-vs-A statistic is distributional** — the fraction of active
+boundaries in each state, or the per-phase dwell distribution — not a
+pointwise difference. §15.1's alignment was designed against traces in which
+the shares barely moved; the fix that made them move also invalidated the
+statistic chosen for them.
+
+Not changed here, for the third time and the same reason: altering the
+instrument in the same breath as reading its result is how a measurement
+becomes a decision about itself. It needs no cards — four archived traces
+re-analyse in seconds.
+
+### 18.3 Carried unchanged
+
+`spread_veto_pct = 25` against a measured max of **0.68** here, 0.61 and 12.5
+in the two earlier windows: an order of magnitude off the observed range and
+boot-unstable across all three. Recorded, not retuned.
+
+### 18.4 One tooling bug, found and fixed in-window
+
+`readout.py` aggregated `ranks_seen` as the MAX over trace files instead of
+the UNION across them, so three per-rank files reported "1 rank" for a 3-rank
+boot and gate 1 refused a complete group record. The per-rank layout is newer
+than the check that consumes it — §14.3's instrument-first rule, fifth
+instance.
