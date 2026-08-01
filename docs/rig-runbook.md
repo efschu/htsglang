@@ -1660,20 +1660,53 @@ fail:
   re-runs ninja on every fresh process regardless, because its version
   bookkeeping is process-local.
 
-So `benchmark/bar1_graph_check.py` cannot currently pass anywhere on this rig:
+So the proof cannot run on the host directly and cannot run in CT999 at all:
 the container has the compiler but not the device node, the host has the device
-node but not a usable compiler. **`SGLANG_BARLINK_GRAPH_ENABLE` therefore stays
-unset** — see 6.3; the switch may only be set after that proof passes, and it
-has not.
+node but not a usable compiler.
 
-The unblock is one of:
+#### The way that works: the Docker image on the host (#369)
 
-1. give CT999 the device node — `lxc.cgroup2.devices.allow: c 10:267 rwm` plus
-   a bind mount of `/dev/dmabuf_holder` in `/etc/pve/lxc/999.conf`, then a
-   container restart (kills every running agent, so it is the user's call), or
-2. install a matching toolchain on the host, or
-3. run the check in the Docker image on the host, which already carries both
-   the device node and a self-consistent toolchain (flags above).
+The htsglang image is the only place on this rig with **both**. It is
+self-consistent (python 3.12.3, torch 2.11.0+cu130, nvcc 13.0, g++ 13.3 —
+matching the container venv's python and torch exactly), it can reach
+`/dev/dmabuf_holder` through `--device`, and the Python tree can be mounted in
+read-only, so the image does not have to be rebuilt to test a working copy.
+`benchmark/bar1_graph_check.py` passed 10/10 this way on 2026-08-01:
+
+```bash
+S=/spinning/subvol-999-disk-0            # the container root as the host sees it
+docker run --rm --name bar1gate \
+  --gpus all --device /dev/dmabuf_holder \
+  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  -v /sys:/sys --shm-size=2g \
+  -v $S/spinning/<your-worktree>:/wt:ro \
+  -v $S/spinning/nvidia-open-595:/nvsrc:ro \
+  -v /root/battery-bar1/extcache_docker:/extcache \
+  -e PYTHONPATH=/wt/python -e TORCH_EXTENSIONS_DIR=/extcache \
+  -e SGLANG_BARLINK_BAR1_NV_SOURCE=/nvsrc \
+  -e TORCH_CUDA_ARCH_LIST="8.6;12.0" \
+  --entrypoint bash htsglang:cu130-nccl2307 \
+  -c "cd /wt && python3 /wt/benchmark/bar1_graph_check.py 0,1,2 29700"
+```
+
+Three details are load-bearing:
+
+- **`--rm`, always.** An orphaned container keeps its VRAM and the next agent
+  finds cards that are "busy" with nothing. Verify 0 MiB afterwards from both
+  sides.
+- **`TORCH_CUDA_ARCH_LIST="8.6;12.0"`.** The image bakes
+  `7.5 8.0 8.6 8.9 9.0 10.0 12.0`; building the BAR1 kernel for seven
+  architectures takes many minutes and produces a differently-named cache
+  entry. Pinning it to the two architectures this rig actually has cuts the
+  cold build to ~1 min.
+- **Its own `TORCH_EXTENSIONS_DIR`.** Do not point it at
+  `/spinning/barlink_extcache_shared`: ninja keys its recorded commands and
+  dependency paths by path string, and the image's paths differ again from
+  both the container's and the host's. A dedicated cache directory is the
+  cheap way to keep the three spellings from fighting.
+
+Redirect the output to a file on the host rather than relying on
+`docker logs`: with `--rm` the log dies with the container.
 
 #### Preconditions
 
@@ -1876,7 +1909,7 @@ place and not the other.
 | Transport | Capturable | Why |
 |---|---|---|
 | `device`, `host` | yes, proven | GPU-driven. Both keep their per-op sequence number in **device** memory and never call a synchronize, so a replay advances it exactly as the first run did. `host` qualifies because of who drives it, not because of where its bytes sit |
-| `bar1`, `matrix` | only with `SGLANG_BARLINK_GRAPH_ENABLE=1` | GPU-driven and believed capturable, but that was a statement about the code, not the hardware. Do **not** set the switch before `benchmark/bar1_graph_check.py` has passed on free cards (section 4.15) |
+| `bar1`, `matrix` | yes, proven 2026-08-01 (#369) | GPU-driven. Released after `benchmark/bar1_graph_check.py` passed 10/10 on three cards — all nine gate cases plus the informational `grid` case, which is the cooperative-launch question the release was waiting on. `SGLANG_BARLINK_GRAPH_ENABLE` now defaults to on; set it to `0` to opt back out (then graphs must be disabled too). Evidence: `/spinning/gpu-battery-results/2026-08-01_369_bar1_graph_gate/gate_PASS_docker.log` |
 | `shm`, `gloo`, `ucx`, any unknown name | no | host-staged: pinned allocation, `dist.*` on the CPU, `Event.synchronize()`. An unknown name silently becomes the inline gloo plane |
 
 A graph-enabled boot on a host-staged transport is rejected at startup with

@@ -40,6 +40,9 @@ import unittest
 from unittest import mock
 
 from sglang.jit_kernel import baton_health
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.device_communicators import barlink_liveness
+from sglang.srt.utils import jit_cold_build
 from sglang.srt.distributed.device_communicators.barlink_bar1_ext import (
     ENV_GROUPED_BUILD,
     build_once_per_group,
@@ -218,6 +221,117 @@ class TestAFailedBuildEndsEveryRank(CustomTestCase):
         self.assertEqual(alive, [])
         self.assertEqual(len([e for e in errors if e]), WORLD)
         self.assertEqual(loaded, [], f"ranks {loaded} loaded a missing artifact")
+
+
+class TestWaitersRunUnderABuildDeadline(CustomTestCase):
+    """The waiters' bound must fit a compile, not a healthy collective.
+
+    The first version of the grouped build used the plain 120 s peer
+    deadline. Measured in the Docker image on the PVE host, whose
+    ``TORCH_CUDA_ARCH_LIST`` carries seven architectures: rank 0 was still in
+    nvcc when ranks 1 and 2 raised ``CollectiveTimeoutError``, so a healthy
+    cold build looked exactly like a wedged peer -- one rank down per case,
+    randomly which. The window is what tells the deadline apart from the
+    defect it is meant to catch.
+    """
+
+    def test_the_barrier_is_reached_inside_the_cold_build_window(self):
+        seen = []
+
+        def body(rank, group):
+            def build():
+                return "artifact"
+
+            # Recorded where it matters: in the barrier, which is where the
+            # WAITERS are parked while the builder compiles.
+            def watching_barrier(g, label="barrier", **kw):
+                seen.append((g.rank, jit_cold_build.in_cold_build_window()))
+                g.barrier.wait()
+
+            with mock.patch(
+                "sglang.srt.distributed.device_communicators.barlink_liveness"
+                ".bounded_barrier",
+                watching_barrier,
+            ):
+                return build_once_per_group(group, "probe_ext", build)
+
+        _, errors, alive = _run_group(body)
+        self.assertEqual(alive, [])
+        self.assertEqual([e for e in errors if e], [])
+        self.assertEqual(len(seen), WORLD)
+        for rank, inside in seen:
+            self.assertTrue(
+                inside,
+                f"rank {rank} waited on the build outside the cold-build "
+                f"window, i.e. under the {120}s steady-state deadline",
+            )
+
+    def test_the_window_is_closed_again_afterwards(self):
+        def body(rank, group):
+            return build_once_per_group(group, "probe_ext", lambda: "artifact")
+
+        _run_group(body)
+        self.assertFalse(jit_cold_build.in_cold_build_window())
+
+    def test_the_multiplier_turns_the_peer_deadline_into_a_build_deadline(self):
+        """40 x 120 s. Pinned because both halves live in other modules."""
+        self.assertEqual(jit_cold_build.cold_build_timeout_mult(), 40)
+        with jit_cold_build.cold_build_window("probe"):
+            self.assertGreaterEqual(barlink_liveness.wait_timeout_s(), 1200.0)
+        self.assertEqual(barlink_liveness.wait_timeout_s(), 120.0)
+
+
+class TestTheGraphReleaseIsOn(CustomTestCase):
+    """bar1/matrix count as capturable unless someone opts out.
+
+    Released on 2026-08-01 after `benchmark/bar1_graph_check.py` passed 10/10
+    on three cards, the informational `grid` case included -- that case IS the
+    cooperative-launch question the switch was waiting on. Pinned here because
+    the default is the whole release: a silent flip back to "0" would put
+    every bar1 run back on the 1blk variant and nothing would say so.
+    """
+
+    def test_bar1_and_matrix_are_capturable_by_default(self):
+        prev = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+        try:
+            self.assertTrue(parallel_state.graph_enable_set())
+            capturable = parallel_state.capturable_transports()
+            for name in ("bar1", "matrix"):
+                self.assertIn(name, capturable)
+            # The proven base set is untouched by the release.
+            for name in ("device", "host"):
+                self.assertIn(name, capturable)
+        finally:
+            if prev is not None:
+                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
+
+    def test_the_opt_out_still_removes_them(self):
+        prev = os.environ.get("SGLANG_BARLINK_GRAPH_ENABLE")
+        os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "0"
+        try:
+            self.assertFalse(parallel_state.graph_enable_set())
+            capturable = parallel_state.capturable_transports()
+            for name in ("bar1", "matrix"):
+                self.assertNotIn(name, capturable)
+            self.assertEqual(
+                capturable, parallel_state.CAPTURABLE_BARLINK_TRANSPORTS
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+            else:
+                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
+
+    def test_host_staged_transports_are_still_refused(self):
+        """The release must not have widened anything else."""
+        prev = os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+        try:
+            capturable = parallel_state.capturable_transports()
+            for name in ("shm", "gloo", "ucx", "something-unknown"):
+                self.assertNotIn(name, capturable)
+        finally:
+            if prev is not None:
+                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = prev
 
 
 class TestTheBatonRuleThisReplaces(CustomTestCase):

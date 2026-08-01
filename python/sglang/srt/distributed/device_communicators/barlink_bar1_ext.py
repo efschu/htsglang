@@ -117,12 +117,32 @@ def build_once_per_group(cpu_group, name: str, build):
     a rank that skipped the build must not go on to load an artifact that was
     never produced -- so both outcomes travel through the same
     ``all_gather_object`` and every rank ends the same way.
+
+    THE DEADLINE IS A BUILD DEADLINE, NOT A COLLECTIVE ONE
+    ------------------------------------------------------
+    The waiting ranks sit in a bounded barrier while ONE rank runs nvcc, so
+    the bound has to be the one that fits a compile, not the 120 s that fits
+    a healthy collective. The first version of this function used the plain
+    steady-state deadline and turned a perfectly healthy cold build into
+    ``CollectiveTimeoutError`` on every rank but the builder -- measured in
+    the Docker image on the PVE host, whose ``TORCH_CUDA_ARCH_LIST`` carries
+    seven architectures and whose build therefore runs for many minutes.
+
+    ``jit_cold_build.cold_build_window`` is the mechanism that already exists
+    for exactly this, and it is what the device-side deadlines use; opening
+    it here multiplies the peer timeout by ``SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT``
+    (40 by default, so 120 s becomes 80 min) for the duration of the build and
+    nothing else. The wait is still bounded and a peer that DIES still ends it
+    immediately -- what changes is only that a slow compiler is no longer
+    mistaken for a wedged rank. Every rank opens the window, waiters included:
+    the deadline that matters is the one the WAITERS are running under.
     """
     import torch.distributed as dist
 
     from sglang.srt.distributed.device_communicators.barlink_liveness import (
         bounded_barrier,
     )
+    from sglang.srt.utils.jit_cold_build import cold_build_window
 
     if cpu_group is None or not _grouped_build_enabled():
         return build()
@@ -139,20 +159,21 @@ def build_once_per_group(cpu_group, name: str, build):
     builder = 0
     result = None
     failure = ""
-    if rank == builder:
-        try:
-            result = build()
-        except BaseException as exc:  # noqa: BLE001 -- re-raised group-wide below
-            failure = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "barlink-BAR1: rank %d failed to build %r: %s. Telling the "
-                "group before anyone waits on an artifact that will not "
-                "appear.", rank, name, failure,
-            )
-    # Everyone arrives here, builder included, whether it succeeded or not.
-    bounded_barrier(cpu_group, f"barlink JIT build of {name!r}")
-    verdicts: list = [None] * world
-    dist.all_gather_object(verdicts, failure, group=cpu_group)
+    with cold_build_window(f"barlink BAR1 JIT build of {name!r}"):
+        if rank == builder:
+            try:
+                result = build()
+            except BaseException as exc:  # noqa: BLE001 -- re-raised group-wide
+                failure = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "barlink-BAR1: rank %d failed to build %r: %s. Telling "
+                    "the group before anyone waits on an artifact that will "
+                    "not appear.", rank, name, failure,
+                )
+        # Everyone arrives here, builder included, success or not.
+        bounded_barrier(cpu_group, f"barlink JIT build of {name!r}")
+        verdicts: list = [None] * world
+        dist.all_gather_object(verdicts, failure, group=cpu_group)
     bad = [(i, v) for i, v in enumerate(verdicts) if v]
     if bad:
         raise RuntimeError(
