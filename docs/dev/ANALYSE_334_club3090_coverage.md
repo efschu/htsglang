@@ -165,7 +165,13 @@ recipes and report *which* types would be needed (**effort S, desk**) before
 anyone writes a kernel. It may be one type, in which case this is M; it may
 be five, in which case it is L and probably not worth it.
 
-### 3e. agents-a1 — no artifact, no signal
+### 3e. agents-a1 — RESOLVED: operator transcription error, strand closed
+
+Investigated 2026-08-01 at the user's request: the name appears nowhere in
+the club-3090 recipes, the model cache, ANALYSE_347, or upstream. Its first
+occurrence is the #334 task subject itself — an operator transcription
+error when the task list was composed, not a real model family. Strand
+closed; nothing to integrate.
 
 Nothing on disk, nothing upstream that matches. **Recommend closing this
 strand** unless the user can name the artifact; a survey cannot cover a name.
