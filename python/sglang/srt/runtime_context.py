@@ -724,9 +724,10 @@ class RuntimeContext:
         the default path and the SERIAL lane mode (``scope_lane_id is None``,
         deliberately shared) are unchanged; a concurrent lane gets its own.
 
-        ``resources.buffers`` entries managed directly by their owners rather
-        than through this accessor (``lora_moe_runner_marlin``'s marlin
-        workspace) keep their own raw string keys and are untouched.
+        Every production workspace now comes through this accessor: the last
+        raw-keyed holdout (``lora_moe_runner_marlin``'s marlin workspace,
+        §13.11 item 3) was routed through it once its "not on a lane path
+        today" argument became the only thing keeping it safe.
         """
         lane = None if _buffers_ignore_lane() else _LANE_SCOPE.get().lane_id
         key = (lane, name)

@@ -37,6 +37,33 @@ if _is_cuda:
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
+def _acquire_workspace(device) -> torch.Tensor:
+    """The Marlin LoRA workspace, through the lane-keyed buffer accessor.
+
+    This was the one ``resources.buffers`` entry managed past ``get_buffer``
+    with a raw name key (DESIGN_121 §13.11 item 3): harmless while nothing
+    on a lane path reached it, and the next place the workspace-family
+    question would have been asked the moment a LoRA+MoE+Marlin model ran on
+    a concurrent lane -- two threads sharing one Marlin lock buffer is the
+    same silent-wrong-output shape as the flashinfer workspace collision.
+    Routing it through the accessor gives every lane its own tensor and the
+    serving group its usual single one, and books it in the offload register
+    like the attention workspaces.
+
+    The device belongs in the NAME: the old code re-created the workspace on
+    a device change, and a keyed-lazy accessor expresses that as one entry
+    per device (the workspace is a few hundred ints -- keeping a stale
+    per-device entry is cheaper than an invalidation protocol on the hot
+    path).
+    """
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer(
+        f"marlin_lora_workspace:{device}",
+        lambda: marlin_make_workspace(device, max_blocks_per_sm=4),
+    )
+
+
 class MarlinLoraRunnerCore:
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
@@ -101,13 +128,7 @@ class MarlinLoraRunnerCore:
             topk_ids, block_size_m, E
         )
 
-        from sglang.srt.runtime_context import get_resources
-
-        buffers = get_resources().buffers
-        workspace = buffers.get("marlin_lora_workspace")
-        if workspace is None or workspace.device != hidden_states.device:
-            workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
-            buffers["marlin_lora_workspace"] = workspace
+        workspace = _acquire_workspace(hidden_states.device)
 
         scalar_type1 = get_scalar_type(num_bits, quant_info.w13_qzeros is not None)
         scalar_type2 = get_scalar_type(num_bits, quant_info.w2_qzeros is not None)
