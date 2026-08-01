@@ -159,8 +159,35 @@ class TransportIdentity:
     state_types: Tuple[str, ...] = ()
     #: Fork geometry: token-sharded KV changes which rows a rank owns.
     dcp_size: int = 1
+    #: THE ROW-OWNERSHIP DESCRIPTOR (S, lo, hi) from the weighted owner rule:
+    #: this rank owns global slot L iff ``(L % S) in [lo, hi)``, and stores it
+    #: at ``(L // S) * (hi - lo) + (L % S - lo)``. ``None`` off the
+    #: token-sharded lane, where a row is just its slot.
+    #:
+    #: This is the quantity a transfer actually has to agree on, which is why
+    #: it is compared rather than inferred. See the note on COMPARED.
+    row_ownership: Optional[Tuple[int, int, int]] = None
 
     #: Fields compared for compatibility, in the order they are reported.
+    #:
+    #: ``dcp_size`` and ``row_ownership`` ARE compared, and the review that
+    #: put them here is worth restating: the earlier exclusion reasoned that
+    #: PD already supports differing prefill/decode TP because ``KVArgs``
+    #: carries ``state_dim_per_tensor`` / ``state_dim_offsets`` so the sender
+    #: can re-slice. That argument is true and does not extend to DCP. Those
+    #: tables describe the STATE/HEAD axis; DCP shards the TOKEN axis -- slot
+    #: L lives on rank ``L % S`` at row ``L // S`` -- and no offset table
+    #: re-derives row ownership. A ``dcp_size=1`` prefill and a ``dcp_size=3``
+    #: decode have entirely different row->token mappings, so a transfer
+    #: between them moves bytes to rows that mean something else. It could not
+    #: bite while ``transfer()`` raised; the wire slice is exactly what makes
+    #: it bite.
+    #:
+    #: ``row_ownership`` is the precise invariant and ``dcp_size`` the coarse
+    #: guard that still refuses when ownership could not be computed on one
+    #: side (``None`` vs a tuple). Keeping both means a future differing-DCP
+    #: PD is legal exactly when the row mappings genuinely agree, rather than
+    #: being blocked by a proxy.
     COMPARED: Tuple[str, ...] = (
         "model_identity_hash",
         "kv_dtype",
@@ -168,16 +195,21 @@ class TransportIdentity:
         "total_kv_head_num",
         "head_dim",
         "state_types",
+        "dcp_size",
+        "row_ownership",
     )
 
     def diff(self, other: TransportIdentity) -> List[str]:
         """Field-by-field disagreement, human-readable, empty when compatible.
 
-        ``tp_size`` / ``pp_size`` / ``dcp_size`` are deliberately NOT compared:
-        PD already supports differing prefill/decode TP (KVArgs carries
+        ``tp_size`` / ``pp_size`` are deliberately NOT compared: PD already
+        supports differing prefill/decode TP (KVArgs carries
         ``state_dim_per_tensor`` and ``state_dim_offsets`` precisely so the
         sender can re-slice), so demanding equality would refuse working
         configurations. They travel in the identity for diagnostics.
+
+        ``dcp_size`` and ``row_ownership`` ARE compared -- the head-axis
+        re-slicing argument above does not reach the token axis. See COMPARED.
         """
         out: List[str] = []
         for field in self.COMPARED:
@@ -231,6 +263,23 @@ def identity_from_args(server_args: Any, kv_args: Any) -> TransportIdentity:
     state_types = tuple(
         str(getattr(s, "value", s)) for s in (getattr(kv_args, "state_types", ()) or ())
     )
+    dcp_size = int(getattr(server_args, "dcp_size", 1) or 1)
+    # The row-ownership descriptor, taken from the SAME owner rule the pools
+    # and the attention path use -- never re-derived here, because a second
+    # derivation of who owns a row is how the two drift apart. None off the
+    # token-sharded lane (and whenever no plan is installed), which the
+    # comparison then treats as "must also be None on the peer".
+    row_ownership = None
+    try:
+        from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
+
+        bounds = dcp_weighted_owner_bounds(
+            dcp_size, int(getattr(kv_args, "engine_rank", 0) or 0)
+        )
+        if bounds is not None:
+            row_ownership = (int(bounds[0]), int(bounds[1]), int(bounds[2]))
+    except Exception:  # noqa: BLE001 - absent plan/module is "not sharded"
+        row_ownership = None
     return TransportIdentity(
         model_identity_hash=compute_model_identity_hash(server_args),
         kv_dtype=str(getattr(server_args, "kv_cache_dtype", "auto") or "auto").lower(),
@@ -240,7 +289,8 @@ def identity_from_args(server_args: Any, kv_args: Any) -> TransportIdentity:
         total_kv_head_num=int(getattr(kv_args, "total_kv_head_num", 0) or 0),
         head_dim=int(getattr(kv_args, "head_dim", 0) or 0),
         state_types=state_types,
-        dcp_size=int(getattr(server_args, "dcp_size", 1) or 1),
+        dcp_size=dcp_size,
+        row_ownership=row_ownership,
     )
 
 

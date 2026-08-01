@@ -86,8 +86,13 @@ class TestIdentityHandshake(CustomTestCase):
         re-slice. Demanding equality would refuse working configurations."""
         ident(tp_size=3).assert_compatible(ident(tp_size=2), peer="p")
 
-    def test_differing_dcp_is_allowed(self):
-        ident(dcp_size=3).assert_compatible(ident(dcp_size=1), peer="p")
+    def test_differing_dcp_is_REFUSED(self):
+        """Inverted by the #111 review (Axis 5). This test previously asserted
+        the opposite and encoded the defect: differing DCP means differing
+        row->token mappings, which the state-dim offset tables do not repair
+        because they describe the head axis, not the token axis."""
+        with self.assertRaises(IncompatiblePeer):
+            ident(dcp_size=3).assert_compatible(ident(dcp_size=1), peer="p")
 
     def test_the_diff_reports_every_problem_not_just_the_first(self):
         problems = ident().diff(ident(kv_dtype="auto", head_dim=64))
@@ -312,3 +317,76 @@ class TestPlanFeedsTheLink(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDcpIsComparedNow(CustomTestCase):
+    """#111 review, Axis 5 (DEFECT): the dcp_size exclusion was unsafe.
+
+    The old reasoning -- PD supports differing prefill/decode TP because
+    KVArgs carries state_dim_per_tensor/state_dim_offsets so the sender can
+    re-slice -- is true of the STATE/HEAD axis and does not reach the TOKEN
+    axis. DCP puts slot L on rank L % S at row L // S; no offset table
+    re-derives that. A dcp=1 prefill and a dcp=3 decode have entirely
+    different row->token mappings, so a transfer between them writes bytes to
+    rows that mean something else. It could not bite while transfer() raised;
+    the wire slice is exactly what makes it bite.
+    """
+
+    def test_dcp_size_mismatch_is_now_refused(self):
+        with self.assertRaises(IncompatiblePeer) as cm:
+            ident(dcp_size=1).assert_compatible(ident(dcp_size=3), peer="p")
+        self.assertIn("dcp_size", str(cm.exception))
+
+    def test_the_exact_shape_the_review_named(self):
+        """dcp=1 prefill against dcp=3 decode -- the waved-through case."""
+        prefill = ident(dcp_size=1, row_ownership=None)
+        decode = ident(dcp_size=3, row_ownership=(64, 0, 30))
+        self.assertTrue(prefill.diff(decode))
+
+    def test_row_ownership_mismatch_is_refused(self):
+        """The precise invariant: same dcp_size, different owned range."""
+        with self.assertRaises(IncompatiblePeer) as cm:
+            ident(row_ownership=(64, 0, 30)).assert_compatible(
+                ident(row_ownership=(64, 30, 47)), peer="p"
+            )
+        self.assertIn("row_ownership", str(cm.exception))
+
+    def test_one_side_sharded_and_one_not_is_refused(self):
+        with self.assertRaises(IncompatiblePeer):
+            ident(row_ownership=None).assert_compatible(
+                ident(row_ownership=(64, 0, 30)), peer="p"
+            )
+
+    def test_matching_ownership_still_passes(self):
+        a = ident(dcp_size=3, row_ownership=(64, 0, 30))
+        a.assert_compatible(ident(dcp_size=3, row_ownership=(64, 0, 30)), peer="p")
+
+    def test_differing_tp_is_STILL_allowed(self):
+        """The head-axis re-slicing argument is untouched -- only the token
+        axis was wrong. This is the regression pin for the fix."""
+        ident(tp_size=3).assert_compatible(ident(tp_size=2), peer="p")
+
+    def test_identity_from_args_populates_the_descriptor_field(self):
+        sa = SimpleNamespace(
+            model_path="/m",
+            revision=None,
+            dtype="bfloat16",
+            quantization=None,
+            kv_cache_dtype="fp8_e4m3",
+            page_size=1,
+            tp_size=3,
+            pp_size=1,
+            dcp_size=3,
+        )
+        kv = SimpleNamespace(
+            total_kv_head_num=8, head_dim=128, state_types=["mamba"], engine_rank=0
+        )
+        got = identity_from_args(sa, kv)
+        self.assertEqual(got.dcp_size, 3)
+        # None off the token-sharded lane (no plan installed in this process)
+        self.assertIn("row_ownership", got.to_json())
+
+    def test_json_round_trip_carries_the_descriptor(self):
+        i = ident(row_ownership=(64, 0, 30))
+        back = TransportIdentity.from_json(i.to_json())
+        self.assertEqual(back.row_ownership, (64, 0, 30))
