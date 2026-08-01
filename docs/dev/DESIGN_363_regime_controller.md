@@ -1140,3 +1140,79 @@ band is 0.449 on a max of 0.614, i.e. large relative to the signal itself.
 Whatever `spread_veto_pct` eventually becomes has to respect that, and the
 current 25 is not merely unreached but an order of magnitude off the observed
 range.
+
+---
+
+## 17. #388 — the retired-batch attribution, and the alignment method
+
+Desk only, no cards. Two items: the defect §15.3 named and the method change
+§16.2 deferred. Nothing was re-recorded and no constant was re-tuned.
+
+### 17.1 Root cause: `is_prefill_only` is a request kind, not a phase
+
+`ScheduleBatch.is_prefill_only` is `all(req.is_prefill_only)`, and
+`Req.is_prefill_only` is `max_new_tokens == 0 and speculative_algorithm is
+None`. It marks embedding- and scoring-shaped requests. It is **False on every
+batch of every generating workload**, and forced False whenever spec is on —
+which is every recipe this rig runs.
+
+So the hook's three-way mapping could only ever emit `idle` (empty running
+batch) or `decode`. `prefill_share` was not low; it was unreachable. 0.000
+across all 34 954 boundaries of §14 and across both gate-3 arms of §16, 29
+active boundaries each — two independent boots agreeing on a structural zero.
+
+The name is the trap, and the timing compounds it: by the time the hook runs,
+the top of `get_next_batch_to_run` has already merged the finished extend
+batch into `running_batch`, so during a prefill burst the batch the hook
+inspects is the decode batch. Had the flag meant what it sounds like, it would
+still have been read one merge too late.
+
+### 17.2 The choice: attribute the boundary to the batch that RAN
+
+`managers/regime_runtime.py:phase_of_last_batch`, called from
+`managers/scheduler.py` with `last_batch`. Three reasons, one of them a hard
+constraint:
+
+* **The next batch does not exist yet.** `get_new_batch_prefill` runs after
+  the hook. Reading the next batch's composition means moving the hook behind
+  batch selection, which gives up the between-tick placement #287 and #364
+  share — previous forward retired, next batch not chosen, no captured graph
+  able to replay (#52/#53). That placement is *why* the device timing read
+  here is a completed measurement.
+* **`rank_forward_ms` is the just-retired forward's device time.** Phase and
+  timing on one record now describe one event. Pairing this boundary's timing
+  with the next batch's composition would be a new mismatch, not a fix.
+* **Nothing is lost or double-counted.** The batch built after the hook is
+  `last_batch` at the next boundary, so every dispatched forward is attributed
+  exactly once, one boundary later. The classifier reads a *share over a
+  window*; a uniform one-boundary shift does not move a share. Pinned by a
+  test that drives a 27-tick mixed plan and counts attributions against
+  dispatches.
+
+`TARGET_VERIFY` is excluded from prefill even though `ForwardMode.is_extend()`
+returns True for it: a spec verify is the decode lane's forward, and counting
+it as prefill would report the reference NEXTN decode drain — the recipe both
+gate-3 arms booted — as a prefill burst. `DLLM_EXTEND` is excluded for the
+same reason in a different family: a denoising step emits, it does not ingest.
+
+The falsifier keeps the **pre-#388 attribution transcribed in the test** and
+drives both through one synthetic scheduler loop that reproduces the
+merge-then-hook-then-select order. The old one reports 0 % prefill on a window
+of nothing but prefill forwards; the new one reports 1.0. A mixed window reads
+0.5 under the fix and 0.0 under the old code — the two shapes were
+indistinguishable in every trace recorded so far.
+
+### 17.4 What this invalidates
+
+Everything recorded under the old attribution describes the old classifier.
+Gates 1 and 2 were recorded in §14 and are now **stale**: `prefill_share` can
+move for the first time, so the regime histogram, the transition count and the
+F2 replay all have to be re-recorded before gate 4. §16's gate-3 numbers stand
+for the signals whose values the fix does not touch, but the
+`enter_prefill` verdict has to be re-measured too — UNREACHED was a reading of
+a signal that could not move.
+
+`spread_veto_pct` stays at 25 in the tree. Per §16.3 the observed range is
+0.61 % to 12.5 % across boots, so 25 is an order of magnitude off and the
+signal is not boot-stable at that magnitude. Whatever replaces it must respect
+both facts, and neither is a licence to set the number from two boots.

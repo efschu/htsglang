@@ -286,6 +286,7 @@ after this window and confirms the evidence file is being read.
 python3 -c '
 import sys; sys.path.insert(0,"python")
 from sglang.srt.managers.regime_stages import load_gate_evidence
+
 print(load_gate_evidence("'$OUT'/regime-gate-evidence.json").refusal())'
 ```
 
@@ -347,7 +348,9 @@ Run these numbers past the report and expect them again:
   between-tick boundary, and during a prefill burst that batch is the decode
   one, so the prefill phase essentially never reports. Fixing that changes
   what the classifier emits, so it was NOT done in the gates window; it is the
-  first desk task after gate 3 confirms the reading.
+  first desk task after gate 3 confirms the reading. **DONE (#388)** — the
+  hook now attributes the boundary to `last_batch`. See §8: gates 1+2 have to
+  be re-recorded, and gate 3's `enter_prefill` verdict with them.
 * `spread_veto_pct = 25` -> **UNREACHED**: the measured spread peaked at
   **12.5 %**, so a 25 % veto never fires.
 * `kv_ascend_mark = 0.85` -> **UNREACHED** at 16.5 % peak occupancy, unless
@@ -366,6 +369,76 @@ Three arms (`off` / `observe` / `act`) over one workload, judged on ms/verify
 file first, and it needs a boot with `--kv-reshard-vectors` covering a real
 flip target — otherwise the act arm has nowhere to go and the comparison
 measures nothing.
+
+---
+
+## 8. The RE-RECORD window after #388 (do this before gate 4)
+
+#388 changed what the classifier emits: the phase is now read off the batch
+that RAN (`last_batch`) instead of off `running_batch.is_prefill_only`, which
+was a request kind and False on every generating batch. `prefill_share` can
+move for the first time, so **every gate recorded under the old attribution
+describes the old classifier**.
+
+What has to be re-recorded, and what does not:
+
+| gate | status | why |
+|---|---|---|
+| 1 (desyncs) | **RE-RECORD** | the regime histogram and the transition count both change; a desync count is about the verdicts, and the verdicts are different now |
+| 2 (F2 replay) | **RE-RECORD** | it replays the trace of gate 1. Same boot, so it costs nothing extra |
+| 3 (`enter_prefill`) | **RE-MEASURE** | UNREACHED was a reading of a signal that could not move. The other four signals' bands stand |
+| 3 (`occupancy`, `queued_prompt_tokens`) | already re-analysed, no cards | #388 restricted them to ACTIVE boundaries and re-ran the SAME two archived traces. ARMS_DISSIMILAR was an alignment artifact and is gone; see DESIGN §17.3 |
+| 4 | not yet startable | needs 1-3 in the evidence file |
+
+**The boots.** Gates 1+2 ride on ONE boot; gate 3 needs the pair. Three boots
+total, and all three are the §1 recipe with only `--regime-trace` differing —
+nothing else may change, or the gate-3 arms stop being an A-vs-A pair.
+
+```bash
+# Boot R1 -- gates 1+2. Section 1 verbatim, new output directory.
+OUT=/spinning/gpu-battery-results/$(date +%F)_363_gates_388
+# Boots R2/R3 -- gate 3, the pair. Section 6 verbatim.
+OUT3=/spinning/gpu-battery-results/$(date +%F)_363_gate3_388_$run   # run in a b
+```
+
+Flags, unchanged from §1 and §6 — **#388 added no flag and changed no
+default**, which is the point: the same launch line now records a different
+(and correct) phase:
+
+```
+  --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance
+  --rank-auto-reserve-mib 5500,3800,3800
+  --model-path $MODEL_ROOT/Qwen3.6-27B-FP8 --context-length 32768
+  --kv-cache-dtype fp8_e4m3 --speculative-algorithm NEXTN --trust-remote-code
+  --enable-metrics --enable-metrics-for-all-schedulers
+  --regime-controller observe --regime-trace $OUT/regime.jsonl
+  SGLANG_ENABLE_METRICS_DEVICE_TIMER=1  LD_LIBRARY_PATH=<venv>/nvidia/cu13/lib
+```
+
+Workload, unchanged, and the same flags on all three boots:
+
+```bash
+python scripts/regime_gates/workload.py --repeats 2 --burst 8     --burst-tokens 900 --drain 12 --drain-tokens 900 --mixed 8 --idle-s 25
+```
+
+**One thing to add if the window allows it, and it is not free.** Both gate-3
+arms produced only **29 active boundaries** out of 15-19 k. That was survivable
+while `occupancy` drew samples from the idle stretches; now that it is
+restricted to active boundaries it draws 29 too, which is above
+`MIN_PAIRED_SAMPLES = 8` but not by much — and `UNDERPOWERED` now BLOCKS. A
+longer or busier workload buys margin on every signal at once. Do not change
+the workload flags BETWEEN the two gate-3 arms.
+
+**What to check first, before spending the window on a workload.** The whole
+point of the re-record is that `prefill_share` moves. Confirm it early:
+
+```bash
+grep -m5 REGIME-OBSERVE $OUT/boot.log | grep -o 'prefill [0-9]*%'
+```
+
+A run that still reports `prefill 0%` through a `prefill_burst` phase means
+the fix did not reach this boot — check the branch before spending the rest of
+the window.
 
 ---
 
