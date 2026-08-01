@@ -1,0 +1,74 @@
+BOX CONDITION AT RUN START (2026-08-01T12:55:59Z)
+  free -g available  = 26 GiB   (sweep-3 guard reported 15.9 GiB)
+  MemTotal_kB=103342080 MemAvailable_kB=106874413
+  NOTE: in this LXC container MemAvailable exceeds MemTotal (lxcfs reports the
+  HOST value while MemTotal is the cgroup limit), so `free -g available` is the
+  number to trust here. 119-GiB download finished before this window.
+  VRAM at start: 0, 0 MiB 1, 0 MiB 2, 0 MiB 
+
+========================================================================
+RESULT: 6 arms re-run (A_default for the band + the five under test)
+========================================================================
+arm                      sweep-3   now     what changed
+---------------------------------------------------------------------
+A_default                PASS      PASS    band source, unchanged
+G_all_axes               FAIL      FAIL    RAM guard GONE; now runtime CUDA OOM
+H_ps2_prefill_spill      FAIL      STOP    RAM guard GONE; boots, reader gap
+I_dflash_shards          FAIL      STOP    RAM guard GONE; boots, reader gap
+J_waveback_ps2           FAIL      PASS    crossing PROVEN, first time ever
+L_video_cotenancy        FAIL      FAIL    #392 prediction NOT met (below)
+
+1. THE BOX WAS THE BLOCKER, AND IT IS GONE
+   All four of G/H/I/J cleared the host-RAM guard that stopped them in
+   sweep 3 ("--kv-session-offload-host-ram-gib=8 GiB does not fit in the
+   currently available host RAM: 15.9 GiB"). Not one of them hit it this
+   time. The sweep-3 reading -- that those four said nothing about their
+   crossings and needed a quiet box -- is confirmed.
+
+2. J_waveback_ps2 PASSES. Wave-back x PS2 booted, resolved as declared and
+   stayed inside the measured A-vs-A band. That crossing had never executed
+   before; it is now known good.
+
+3. H and I now STOP, which is progress and a NEW matrix-side gap:
+     "could not confirm declared field(s) from the log: graphs --
+      the report line is incomplete, not the config wrong"
+   Both boot. The effective-config reader cannot read the `graphs` axis for
+   these two, so the check refuses to rule either way -- correctly, by the
+   absence-vs-unknown rule: `graphs` is declared with a VALUE (True), so its
+   absence is "cannot tell", not "confirmed off". Desk item, not a product
+   break: either the reader misses the capture line these configs emit, or
+   these configs legitimately emit none and the arms should stop declaring it.
+
+4. G_all_axes now fails LATER (line 541 vs 37) with a runtime CUDA OOM while
+   serving -- the same class as D_offload_x_crossalgo in sweep 3, and the
+   same class as L below. Three arms now die of VRAM at runtime rather than
+   at argument resolution.
+
+5. ARM L: THE #392 PREDICTION IS NOT MET. Verbatim, this run:
+
+     torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB.
+     GPU 0 has a total capacity of 31.34 GiB of which 63.69 MiB is free.
+     Including non-PyTorch memory, this process has 31.14 GiB memory in use.
+     Of the allocated memory 29.99 GiB is allocated ...
+
+   Byte-for-byte the same failure as sweep 3: same card (31.34 GiB), same
+   86 MiB allocation, same 63.69 MiB free. The boot does reach slightly
+   further (line 299 vs 273).
+
+   WHAT THIS SAYS ABOUT THE FIX, carefully. #392 made the budget guard
+   resolve --rank-gpu-id through the UUID/BDF identity map so rank 0's budget
+   is checked against the 32 GiB card. That part is not contradicted here --
+   rank 0 IS on the 31.34 GiB card. But the prediction attached to it, that
+   the runtime OOM would be gone, does not hold, and the numbers say why:
+   the process has 31.14 GiB IN USE on a card whose rank was given a 19000
+   MiB budget. The budget did not cap actual usage. So the remaining cause is
+   not "which card rank 0 lands on" -- it is that the dual-group lane's own
+   memory is not accounted inside the rank budget. #392 fixed the identity
+   resolution; the lane's pool is a separate, still-open item.
+
+   This is a finding about the fix's SCOPE, not a regression in it.
+
+NEXT (desk, none attempted in this window)
+  - the `graphs` axis reader for H/I (or drop the declaration)
+  - the lane's pool accounting vs --rank-gpu-memory-mib (L)
+  - the runtime-OOM class now shared by D, G and L
