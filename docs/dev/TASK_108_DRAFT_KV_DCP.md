@@ -509,3 +509,99 @@ re-opened only by H3's gap-grows outcome.
 Recommended order: do the `TP > num_kv_heads` window FIRST (it tests the
 feature where it is supposed to pay, and it exercises H2), and treat H3's
 context sweep as optional confirmation rather than a blocker.
+
+---
+
+# TP > num_kv_heads: vehicle inventory and window proposal
+
+## Why this window, and why it is not a re-run
+
+The validation arc's durable outcome is an applicability rule, not a bug fix:
+`dcp` pays only where the heads cannot be sharded further. Every number so far
+comes from a rig where they can, so the feature has never been measured where
+it is supposed to work. This window measures that, and it is also the only
+place H2's reindex is reachable.
+
+## Vehicle candidates (scan of the model cache)
+
+The trigger is `attn_kv_replicated(attn_tp_size, total_kv)`, i.e. strictly
+`TP > num_key_value_heads`. **Two vehicles reach it at NATIVE TP=3 — no #82
+co-location emulation needed**, which removes a whole axis from the window.
+
+| model | kv | q | size | format | MTP head | TP=3 trigger |
+|---|---|---|---|---|---|---|
+| **Qwen3.5-2B** | **2** | 8 | 3.5 G | bf16 dense | yes (15 tensors) | **YES** (3 > 2) |
+| **Qwen3.6-35B-A3B-FP8** | **2** | 16 | 31 G | FP8 MoE | yes (1560) | **YES** (3 > 2) |
+| Qwen3.5-35B-A3B-GPTQ-Int4 | 2 | 16 | 20 G | GPTQ MoE | yes (785) | YES |
+| Qwen3.6-35B-A3B-AWQ-4bit | 2 | 16 | 22 G | AWQ MoE | yes (2321) | YES |
+| Qwen3.5-122B-A10B-GPTQ-Int4 | 2 | 32 | — | GPTQ MoE | — | YES, but needs expert offload (#77) — too heavy for this question |
+| Qwen3.6-27B family | 4 | 24 | 20-31 G | several | yes | no at TP=3; would need TP=5 co-location |
+| Qwen3.5-4B | 4 | 16 | 7.1 G | bf16 dense | yes (15) | no at TP=3 |
+
+Recommended pair: **Qwen3.5-2B as the mechanism vehicle** (3.5 G, boots in
+seconds, leaves the whole rig free for the measurement) and
+**Qwen3.6-35B-A3B-FP8 as the realistic one** (31 G over 72 G aggregate, the
+configuration a deployment would actually run). The 27B family is deliberately
+NOT used: reaching the trigger there needs TP=5 co-location, which adds the
+#82 axis to a window that already has one lever.
+
+Note both recommended vehicles are MoE-or-dense Qwen3.5/3.6, so the
+uneven-weighted-DCP path and the NEXTN chain are the same machinery already
+validated — only the head geometry changes.
+
+## The prediction to test
+
+Under `attn_kv_replicated` every rank holds ALL `total_kv` heads because they
+cannot be split. So:
+
+* `replicated` draft pool = `C` rows x `total_kv` heads
+* `dcp` draft pool = `C * ratio_r / S` rows x `total_kv` heads
+
+The head factor is 1 on both sides — it no longer cancels the token shard — so
+the saving is the **full shard factor**. For a `[30,17,17]` vector that is
+**47 % / 27 % / 27 %** of the replicated draft pool, per rank.
+
+## Window proposal — 2 questions, 4 boots, ~25 min
+
+Minimal by construction: only the two questions the applicability rule turns on.
+
+**Q1 — does the VRAM win materialize at the predicted factor?**
+Both layouts, both vehicles, read the draft-pool rows and K/V sizes out of the
+`KV Cache is allocated` lines exactly as the previous window did. GREEN iff the
+`dcp` draft pool is the replicated one scaled by `ratio_r / S` per rank, within
+the ceil-to-a-whole-owner-block slack of `dcp_compact_pool_rows`.
+
+**Q2 — does accept hold, and does H2 behave?**
+The same instruments, unchanged: `stock_spec_control.py` for accept length and
+the in-boot A-vs-A, `chain_quality_gate.py` for the verdict. Two sub-checks
+that only exist on this hardware:
+  * `dcp_kv_replicated_heads` must be **True** — assert it from the boot log /
+    server info, because if the trigger is not actually active the window
+    measured nothing.
+  * `_replicated_kv_ragged_reindex` is now on the live path. Its failure shape
+    is documented as "corrupting short-prompt / first-chunk generation while
+    the gathered-q paged prefix/decode path stayed correct" — so the probe set
+    must include a SHORT prompt, and the gate is the instrument.
+
+Arms: `{2B, 35B-A3B-FP8} x {replicated, dcp}` = 4 boots. 2B boots are seconds;
+budget ~25 min total, standard reserve, no bar1, local CT999. Abort rules and
+process discipline exactly as the prepared runsheet.
+
+**Explicitly out of scope:** the H3 context sweep (optional confirmation of a
+benign explanation, and not a blocker), throughput comparison, and TP=5
+co-location.
+
+## Expected outcomes and what each would mean
+
+* Win materializes AND accept holds -> the applicability rule is confirmed;
+  `dcp` is a real feature on this class of hardware and the flag text stands.
+* Win materializes AND accept drops similarly (~10-16 %) -> the drift cost is
+  hardware-independent; the rule becomes "trade N % accept for the shard
+  factor", which is still a good trade where VRAM is the binding constraint.
+* Win does NOT materialize -> the sizing path has a second head-geometry
+  assumption that only shows under replication; reopen at the pool sizing, not
+  at the attention split.
+* Gate goes RED on the short prompt -> H2 is live and the reindex condition is
+  wrong for the draft. This is the outcome that would make H2 a real defect
+  rather than an inapplicable one, and it is the reason a short prompt is
+  mandatory in the probe set.
