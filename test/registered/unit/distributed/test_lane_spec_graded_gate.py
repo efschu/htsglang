@@ -355,5 +355,164 @@ class TestLaneMarginProbe(unittest.TestCase):
         self.lane._record_margin(job, 0.5)
         self.assertEqual(job["_margins"], [0.5])
 
+
+class TestVerifyMarginsCoverTheEmittedBlock(unittest.TestCase):
+    """#399: the probe has to reach the DEFAULT verify path, not just the bridge.
+
+    ``target_verify`` has been the default verify mode since R7b, and it was
+    the one call site that never recorded a margin. A speculative job
+    therefore wrote exactly one entry -- the prefill token's -- against 64
+    committed ids, while the result row advertises ``margins`` as aligned
+    with ``output_ids``. Nothing failed; the list was simply short, and
+    ``verdict.py`` indexes it positionally at the divergence.
+    """
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:  # pragma: no cover - torch is a hard dep here
+            self.skipTest("torch not importable")
+        from sglang.srt.model_executor import dual_group_lane as dgl
+
+        self.dgl = dgl
+        self.lane = dgl.DualGroupLane.__new__(dgl.DualGroupLane)
+        os.environ["SGLANG_LANE_MARGIN_PROBE"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+
+    @staticmethod
+    def _logits():
+        """Four candidate rows with hand-checkable top-2 gaps: 4, 3, 2, 1."""
+        import torch
+
+        return torch.tensor(
+            [
+                [0.0, 5.0, 1.0, 0.0],
+                [0.0, 1.0, 4.0, 0.0],
+                [3.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 2.0],
+            ]
+        )
+
+    def test_one_entry_per_emitted_token_not_per_candidate_row(self):
+        """Rows past the first rejection are dropped, exactly as in seqdecode.
+
+        A verify forward always produces K+1 rows; only ``n_accept + 1`` of
+        them decided a committed token. Recording all four would push every
+        later position of the job out of alignment by the rejected count.
+        """
+        job = {}
+        self.lane._record_verify_margins(job, self._logits(), 2)
+        self.assertEqual(job["_margins"], [4.0, 3.0])
+
+    def test_the_values_are_the_per_row_gaps(self):
+        job = {}
+        self.lane._record_verify_margins(job, self._logits(), 4)
+        self.assertEqual(job["_margins"], [4.0, 3.0, 2.0, 1.0])
+
+    def test_a_full_job_stays_aligned_with_its_committed_tokens(self):
+        """The contract the result row advertises, over several rounds.
+
+        This is the assertion that fails without the fix: three rounds of a
+        K=1 chain commit five tokens, and before the target_verify call site
+        existed the same three rounds recorded zero.
+        """
+        import torch
+
+        job = {}
+        emitted = 0
+        for n_accept in (0, 1, 1):
+            rows = torch.tensor([[0.0, 2.0], [0.0, 1.0]])
+            self.lane._record_verify_margins(job, rows, n_accept + 1)
+            emitted += n_accept + 1
+        self.assertEqual(emitted, 5)
+        self.assertEqual(len(job["_margins"]), emitted)
+
+    def test_it_records_nothing_when_the_probe_is_off(self):
+        os.environ.pop("SGLANG_LANE_MARGIN_PROBE", None)
+        job = {}
+        self.lane._record_verify_margins(job, self._logits(), 4)
+        self.assertNotIn("_margins", job)
+
+    def test_missing_logits_are_skipped_rather_than_raising(self):
+        job = {}
+        self.lane._record_verify_margins(job, None, 4)
+        self.assertNotIn("_margins", job)
+
+    def test_it_never_reads_past_the_rows_it_was_given(self):
+        """A short logits tensor truncates instead of indexing out of bounds."""
+        job = {}
+        self.lane._record_verify_margins(job, self._logits()[:2], 4)
+        self.assertEqual(job["_margins"], [4.0, 3.0])
+
+
+class TestEveryCommittingPathRecordsAMargin(unittest.TestCase):
+    """The structural guard behind #399's fix, with its own falsifier.
+
+    The defect was not a wrong value, it was a MISSING CALL, and no
+    value-level test can see one of those. Every lane method that appends to
+    a job's ``output_ids`` must also feed the margin recorder, or the
+    alignment contract on the result row is false again the next time a
+    verify path is added.
+    """
+
+    PATHS = (
+        "_prefill",
+        "_decode_step",
+        "_verify_by_decode",
+        "_verify_by_target_verify",
+    )
+
+    def setUp(self):
+        import ast
+        import inspect
+
+        from sglang.srt.model_executor import dual_group_lane as dgl
+
+        self.ast = ast
+        self.tree = ast.parse(inspect.getsource(dgl))
+
+    def _body(self, name):
+        for node in self.ast.walk(self.tree):
+            if isinstance(node, self.ast.FunctionDef) and node.name == name:
+                return node
+        raise AssertionError(f"{name} not found in dual_group_lane")
+
+    @staticmethod
+    def _calls(node, ast_mod):
+        return {
+            n.func.attr
+            for n in ast_mod.walk(node)
+            if isinstance(n, ast_mod.Call) and isinstance(n.func, ast_mod.Attribute)
+        }
+
+    def test_every_committing_path_reaches_the_recorder(self):
+        recorders = {"_record_margin", "_record_verify_margins"}
+        for name in self.PATHS:
+            with self.subTest(path=name):
+                self.assertTrue(
+                    self._calls(self._body(name), self.ast) & recorders,
+                    f"{name} commits tokens but records no margin; "
+                    "`margins` would silently stop being aligned with "
+                    "`output_ids` (#399)",
+                )
+
+    def test_the_guard_fails_on_a_path_that_records_nothing(self):
+        """Can-fail proof: a committing method with no recorder must trip it.
+
+        Without this the guard above could be vacuously green -- an AST scan
+        that cannot fail is worse than no scan.
+        """
+        planted = self.ast.parse(
+            "def _planted_path(self, job):\n"
+            "    job['output_ids'].append(1)\n"
+            "    self._something_else()\n"
+        )
+        node = planted.body[0]
+        recorders = {"_record_margin", "_record_verify_margins"}
+        self.assertFalse(self._calls(node, self.ast) & recorders)
+
+
 if __name__ == "__main__":
     unittest.main()

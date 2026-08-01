@@ -41,6 +41,9 @@ if str(_DUAL_GROUP) not in sys.path:
 
 probe = _load("lane_accept_probe", _DUAL_GROUP / "lane_accept_probe.py")
 window = _load("lane_spec_window", _DUAL_GROUP / "r8" / "lane_spec_window.py")
+# The real consumer of the arm files the gate writes (#399): their shape is
+# pinned against the tool that reads them, never against a local restatement.
+verdict = _load("verdict", _DUAL_GROUP / "r12" / "verdict.py")
 
 
 class FakeServer:
@@ -49,7 +52,7 @@ class FakeServer:
 
     RING = 8
 
-    def __init__(self, out_ids=None):
+    def __init__(self, out_ids=None, margins=None):
         self.results = []
         self.results_total = 0
         self.queued = 0
@@ -57,6 +60,10 @@ class FakeServer:
         self.decode_tokens = 0
         self.posted = []
         self.out_ids = out_ids or (lambda job: [1, 2, 3])
+        # Present only when the server runs under SGLANG_LANE_MARGIN_PROBE=1,
+        # so the default stays a server that sends none -- the state a window
+        # launched without the probe is actually in.
+        self.margins = margins
         self._lock = threading.Lock()
 
     # -- transport ------------------------------------------------------
@@ -93,8 +100,12 @@ class FakeServer:
     # -- lane behaviour --------------------------------------------------
     def complete(self, job):
         ids = self.out_ids(job)
+        extra = {}
+        if self.margins is not None:
+            extra["margins"] = self.margins(job, ids)
         self.results.append(
             {
+                **extra,
                 "spec_mode": bool(job.get("spec")),
                 "decode_steps": len(ids),
                 "spec_rounds": len(ids) if job.get("spec") else None,
@@ -476,6 +487,125 @@ class TestLaneLoadDepth(CustomTestCase):
         server = FakeServer()
         with _Patched(server):
             self.assertTrue(window.wait_lane_idle("http://x", budget_s=1.0))
+
+
+class TestTheGateKeepsTheAnswersItGraded(CustomTestCase):
+    """#399: a score is not a substitute for the answer it summarises.
+
+    The #328 window recorded ``squares 8 -> 2`` and threw the tokens away.
+    The desk phase that had to classify the failure -- wrong arithmetic, a
+    truncation or a refusal are three different defects with three different
+    owners -- could not, from a complete-looking artifact. The gate now keeps
+    the ids and the decoded text of every arm it graded.
+    """
+
+    def _run(self, out_ids, margins=None):
+        server = FakeServer(out_ids=out_ids, margins=margins)
+        with _Patched(server):
+            window.tokenize = lambda base, text, tok: [1, 2, 3]
+            return window.run_gate(
+                "http://x", "tok", ["alphabet"], 4, 1, "target_verify", 1e18
+            )
+
+    @staticmethod
+    def _diverging(job):
+        return [7, 99, 9] if job.get("spec") else [7, 8, 9]
+
+    def test_every_arm_keeps_its_ids_and_its_text(self):
+        got = self._run(self._diverging)
+        arms = got["prompts"]["alphabet"]["arms"]
+        self.assertEqual(
+            set(arms), {"no_spec", "no_spec_repeat", "spec", "spec_repeat"}
+        )
+        for name, arm in arms.items():
+            with self.subTest(arm=name):
+                self.assertTrue(arm["output_ids"], "the ids the gate graded")
+                self.assertIsInstance(arm["text"], str)
+        self.assertEqual(arms["no_spec"]["text"], "w\nx\ny")
+        self.assertEqual(arms["spec"]["text"], "w\nq\ny")
+
+    def test_the_text_is_the_text_that_was_scored(self):
+        """Not re-derived later: the graded score and the kept text are one
+        detokenisation, so a report can never show a text that disagrees with
+        the number beside it."""
+        got = self._run(self._diverging)
+        prompt = got["prompts"]["alphabet"]
+        from graded import score as graded_score
+
+        for name, arm in prompt["arms"].items():
+            with self.subTest(arm=name):
+                self.assertEqual(
+                    graded_score("alphabet", arm["text"])["score"],
+                    prompt["graded_scores"][name],
+                )
+
+    def test_the_two_arms_come_out_in_the_shape_the_verdict_tool_reads(self):
+        got = self._run(self._diverging)
+        arms = got["verdict_arms"]
+        self.assertEqual(set(arms), {"no_spec", "spec"})
+        for side in ("no_spec", "spec"):
+            run = arms[side]["prompts"]["alphabet"]["run_a"]
+            self.assertIn("output_ids", run)
+            self.assertIn("text", run)
+        self.assertEqual(
+            arms["spec"]["prompts"]["alphabet"]["run_a"]["output_ids"], [7, 99, 9]
+        )
+
+    def test_a_window_without_the_probe_says_so_instead_of_looking_answered(self):
+        """The absence-is-an-assertion rule, applied to the margin channel.
+
+        A gate run without ``SGLANG_LANE_MARGIN_PROBE`` produces arms with no
+        margins. That must READ as "this window cannot answer the margin
+        question", not as an empty list a later reader mistakes for a measured
+        zero.
+        """
+        got = self._run(self._diverging)
+        self.assertEqual(got["margins_present"], {"no_spec": [], "spec": []})
+
+    def test_a_window_with_the_probe_names_the_sides_that_carry_margins(self):
+        got = self._run(
+            self._diverging, margins=lambda job, ids: [1.0 * (i + 1) for i in ids]
+        )
+        self.assertEqual(
+            got["margins_present"], {"no_spec": ["alphabet"], "spec": ["alphabet"]}
+        )
+        run = got["verdict_arms"]["no_spec"]["prompts"]["alphabet"]["run_a"]
+        self.assertEqual(len(run["margins"]), len(run["output_ids"]))
+
+    def test_the_written_arms_feed_the_real_verdict_tool(self):
+        """Round trip through ``r12/verdict.py`` itself, not through a mock.
+
+        The two files exist so a red gate is one command from the world-A /
+        world-B answer. Pinning their shape against anything but the tool
+        that consumes them would pin the wrong thing.
+        """
+        import json
+        import tempfile
+
+        got = self._run(
+            self._diverging, margins=lambda job, ids: [1.0 * (i + 1) for i in ids]
+        )
+        report = {"gate": got}
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = window.write_verdict_arms(report, f"{tmp}/report.json")
+            self.assertEqual(set(paths), {"no_spec", "spec"})
+            with open(paths["no_spec"]) as f:
+                nospec = json.load(f)
+            with open(paths["spec"]) as f:
+                spec = json.load(f)
+
+        judged = verdict.judge_prompt(
+            "alphabet", nospec["prompts"]["alphabet"], spec["prompts"]["alphabet"]
+        )
+        self.assertEqual(judged["first_divergent_index"], 1)
+
+    def test_no_arm_files_are_written_when_the_gate_did_not_run(self):
+        """Can-fail counterpart: nothing to write must write nothing, rather
+        than leaving an empty file a reader would take for a void verdict."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(window.write_verdict_arms({}, f"{tmp}/report.json"), {})
 
 
 if __name__ == "__main__":
