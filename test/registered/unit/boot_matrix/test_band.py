@@ -24,6 +24,9 @@ So the tests below pin the mechanism rather than the wording:
 Hermetic: the runner is a stub, so no server, no card, no model.
 """
 
+import json
+import os
+import tempfile
 import unittest
 from typing import Dict, List, Optional
 
@@ -47,21 +50,45 @@ def _verdict(byte_text: str, scores: Dict[str, int]) -> Verdict:
 
 
 def _probe(name: str, tier: str, text: str, score: Optional[int]) -> ProbeResult:
-    p = ProbeResult(name=name, tier=tier, ok=True, detail="", score=score)
-    # ProbeResult carries no `text` field; the sweep reads it via getattr, so a
-    # stub supplies it the same way the real collector's dicts do.
-    object.__setattr__(p, "text", text)
-    return p
+    """A ProbeResult exactly as the real grader produces it -- no `text`.
+
+    The first version of this helper injected a ``text`` attribute with
+    ``object.__setattr__``. ProbeResult has no such field, so the stub was more
+    capable than the type it stood in for: the test passed while the real band
+    read "" for every reference and reproduced the very bug this file exists to
+    prevent. The text now travels the way it really does, through probes.json
+    on disk, which is what ``_write_probes`` below writes.
+    """
+    del text  # carried by the artifact, not by the object
+    return ProbeResult(name=name, tier=tier, ok=True, detail="", score=score)
+
+
+def _write_probes(out_dir: str, arm_name: str, byte_text: str,
+                  scores: Dict[str, int]) -> None:
+    """The artifact the real runner writes, which is where the text lives."""
+    d = os.path.join(out_dir, arm_name)
+    os.makedirs(d, exist_ok=True)
+    entries = [{"name": "byte_count", "tier": "byte", "text": byte_text}]
+    for name in scores:
+        entries.append({"name": name, "tier": "graded", "text": f"text-{name}"})
+    with open(os.path.join(d, "probes.json"), "w") as f:
+        json.dump(entries, f)
 
 
 class _Recorder:
     """A stubbed ``run_arm``: records what the band machinery hands it."""
 
-    def __init__(self, runs: List[Verdict]):
+    def __init__(self, runs: List[Verdict], texts: Optional[List[str]] = None,
+                 scores: Optional[Dict[str, int]] = None):
         self._runs = list(runs)
+        self._texts = list(texts or ["stub-text\n"])
+        self._scores = dict(scores or {"alphabet": 1})
         self.calls: List[Dict[str, object]] = []
 
     def __call__(self, arm, *, model_path, out_dir, port, **kw):
+        v = self._runs[min(len(self.calls), len(self._runs) - 1)]
+        _write_probes(out_dir, arm.name, self._texts[
+            min(len(self.calls), len(self._texts) - 1)], self._scores)
         self.calls.append(
             {
                 "arm": arm.name,
@@ -69,7 +96,7 @@ class _Recorder:
                 "band": kw.get("band"),
             }
         )
-        return self._runs[min(len(self.calls) - 1, len(self._runs) - 1)]
+        return v
 
 
 class TestTheBandIsMeasured(CustomTestCase):
@@ -81,10 +108,11 @@ class TestTheBandIsMeasured(CustomTestCase):
                 _verdict("1\n2\n3\n", {"alphabet": 8, "squares": 9}),
             ]
         )
-        ref, band, baseline = _measure_band(
-            [arm_by_name(BAND_ARM)], model_path="/m", out_dir="/tmp/x",
-            port=1, run=rec,
-        )
+        with tempfile.TemporaryDirectory() as out:
+            ref, band, baseline = _measure_band(
+                [arm_by_name(BAND_ARM)], model_path="/m", out_dir=out,
+                port=1, run=rec,
+            )
         self.assertGreaterEqual(len(rec.calls), 2, "the baseline must run twice")
         self.assertEqual(rec.calls[0]["arm"], BAND_ARM)
         self.assertEqual(rec.calls[1]["arm"], BAND_ARM)
@@ -101,12 +129,15 @@ class TestTheBandIsMeasured(CustomTestCase):
                 _verdict("FIRST-RUN\n", {"alphabet": 9}),
                 _verdict("SECOND-RUN\n", {"alphabet": 8}),
                 _verdict("SECOND-RUN\n", {"alphabet": 8}),
-            ]
+            ],
+            texts=["FIRST-RUN\n", "SECOND-RUN\n", "SECOND-RUN\n"],
+            scores={"alphabet": 9},
         )
-        ref, _, _ = _measure_band(
-            [arm_by_name(BAND_ARM)], model_path="/m", out_dir="/tmp/x",
-            port=1, run=rec,
-        )
+        with tempfile.TemporaryDirectory() as out:
+            ref, _, _ = _measure_band(
+                [arm_by_name(BAND_ARM)], model_path="/m", out_dir=out,
+                port=1, run=rec,
+            )
         self.assertIn("byte_count", ref)
         self.assertEqual(ref["byte_count"]["text"], "FIRST-RUN\n")
         self.assertNotEqual(ref["byte_count"]["text"], "")
@@ -120,10 +151,11 @@ class TestTheBandIsMeasured(CustomTestCase):
                 _verdict("b\n", {"alphabet": 7, "squares": 8}),
             ]
         )
-        _, band, _ = _measure_band(
-            [arm_by_name(BAND_ARM)], model_path="/m", out_dir="/tmp/x",
-            port=1, run=rec,
-        )
+        with tempfile.TemporaryDirectory() as out:
+            _, band, _ = _measure_band(
+                [arm_by_name(BAND_ARM)], model_path="/m", out_dir=out,
+                port=1, run=rec,
+            )
         self.assertEqual(band["alphabet"], 7)
         self.assertEqual(band["squares"], 6)
         self.assertTrue(all(v > 0 for v in band.values()), band)
@@ -131,10 +163,11 @@ class TestTheBandIsMeasured(CustomTestCase):
     def test_the_baseline_is_regraded_against_the_band_it_produced(self):
         """A_default must be held to the same standard it sets for the others."""
         rec = _Recorder([_verdict("b\n", {"alphabet": 8})] * 3)
-        _, band, baseline = _measure_band(
-            [arm_by_name(BAND_ARM)], model_path="/m", out_dir="/tmp/x",
-            port=1, run=rec,
-        )
+        with tempfile.TemporaryDirectory() as out:
+            _, band, baseline = _measure_band(
+                [arm_by_name(BAND_ARM)], model_path="/m", out_dir=out,
+                port=1, run=rec,
+            )
         self.assertEqual(len(rec.calls), 3)
         self.assertEqual(rec.calls[2]["band"], band)
         self.assertIsNotNone(baseline)
@@ -142,10 +175,11 @@ class TestTheBandIsMeasured(CustomTestCase):
     def test_no_baseline_in_the_selection_yields_an_empty_band(self):
         """--only on one arm must still run, and must not fake a band."""
         rec = _Recorder([_verdict("b\n", {"alphabet": 8})])
-        ref, band, baseline = _measure_band(
-            [arm_by_name("E_barlink")], model_path="/m", out_dir="/tmp/x",
-            port=1, run=rec,
-        )
+        with tempfile.TemporaryDirectory() as out:
+            ref, band, baseline = _measure_band(
+                [arm_by_name("E_barlink")], model_path="/m", out_dir=out,
+                port=1, run=rec,
+            )
         self.assertEqual((ref, band, baseline), ({}, {}, None))
         self.assertEqual(rec.calls, [])
 
