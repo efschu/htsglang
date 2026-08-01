@@ -3384,15 +3384,23 @@ class Scheduler(
                     rank_forward_ms_from,
                 )
 
-                # #287's own phase definition, reused rather than
-                # re-derived: two controllers holding two definitions of
-                # "this round was a decode round" is the divergence class
-                # DESIGN_363 section 7.3 argues against.
-                prefill_active = not (
-                    not running_batch.is_empty() and not running_batch.is_prefill_only
-                )
+                # THREE-way, not two. #287 asks "is this a decode round" and
+                # negates for prefill, which puts an EMPTY batch on the
+                # prefill side. That is wrong for a regime classifier: an idle
+                # window is no measurement, not 0 % prefill (DESIGN_363
+                # section 3.2), and the 2026-08-01 gate window measured the
+                # consequence -- PREFILL_HEAVY on 93 600 of 93 603 verdicts on
+                # a mostly-idle rig. The decode/prefill split below is still
+                # #287's, so the two controllers do not disagree about a
+                # round that HAS work.
+                if running_batch.is_empty():
+                    phase = "idle"
+                elif running_batch.is_prefill_only:
+                    phase = "prefill"
+                else:
+                    phase = "decode"
                 self.regime_observer.on_round(
-                    prefill_active=prefill_active,
+                    phase=phase,
                     held_tokens=sum(req.seqlen for req in running_batch.reqs),
                     capacity_tokens=self._global_kv_capacity_tokens(),
                     running_bs=running_batch.batch_size(),

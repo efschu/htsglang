@@ -228,6 +228,7 @@ class RegimeObserver:
         # Tier-R window accumulators.
         self._prefill_rounds = 0
         self._decode_rounds = 0
+        self._idle_rounds = 0
         # Tier-L accumulator. Rank-local, never branched on; it leaves this
         # object only inside the packed payload.
         self._rank_ms_sum = 0.0
@@ -277,10 +278,20 @@ class RegimeObserver:
         return self._last_record
 
     # -- the per-round hook --------------------------------------------------
+    #: Execution phase of one scheduler round. IDLE is its own value and not
+    #: a kind of prefill: an idle window is no measurement, not 0 % prefill
+    #: (DESIGN_363 section 3.2). The 2026-08-01 gate window found this the
+    #: hard way -- the hook passed a BOOLEAN, idle fell on the prefill side,
+    #: and the rig read PREFILL_HEAVY on 93 600 of 93 603 verdicts.
+    PHASE_PREFILL = "prefill"
+    PHASE_DECODE = "decode"
+    PHASE_IDLE = "idle"
+    PHASES = (PHASE_PREFILL, PHASE_DECODE, PHASE_IDLE)
+
     def on_round(
         self,
         *,
-        prefill_active: bool,
+        phase: str,
         held_tokens: int,
         capacity_tokens: int,
         running_bs: int,
@@ -291,7 +302,8 @@ class RegimeObserver:
     ) -> Optional[Dict]:
         """One between-tick boundary.
 
-        Every argument except ``rank_forward_ms`` must be REPLICATED across
+        ``phase`` is one of ``prefill`` / ``decode`` / ``idle``. Every argument
+        except ``rank_forward_ms`` must be REPLICATED across
         the TP group -- the caller's obligation, stated here because it is the
         whole uniformity argument. ``rank_forward_ms`` is the one rank-local
         input and is treated as such: accumulated, never branched on, and
@@ -300,11 +312,24 @@ class RegimeObserver:
         Returns the verdict record at a consensus boundary, ``None`` between
         boundaries.
         """
+        if phase not in self.PHASES:
+            raise ValueError(
+                f"unknown execution phase {phase!r}; known: "
+                f"{', '.join(self.PHASES)}. An idle round is IDLE, not a "
+                f"kind of prefill."
+            )
         self._round += 1
-        if prefill_active:
+        if phase == self.PHASE_PREFILL:
             self._prefill_rounds += 1
-        else:
+        elif phase == self.PHASE_DECODE:
             self._decode_rounds += 1
+        else:
+            # Counted in the round index (the replicated cadence gate) and in
+            # NEITHER share. A window of nothing but idle rounds therefore has
+            # no forward rounds at all, its shares are absent, and the
+            # classifier answers MIXED -- which is the designed behaviour and
+            # what the boolean hook silently prevented.
+            self._idle_rounds += 1
         if rank_forward_ms is not None:
             self._rank_ms_sum += float(rank_forward_ms)
             self._rank_ms_n += 1
@@ -361,6 +386,7 @@ class RegimeObserver:
             "capacity_tokens": sample.capacity_tokens,
             "queued_reqs": sample.queued_reqs,
             "queued_prompt_tokens": sample.queued_prompt_tokens,
+            "idle_rounds": self._idle_rounds,
             "would_flip_to": target.name if target is not None else None,
             "reason": why,
             "rank_mean_forward_ms": mean_ms,
@@ -401,6 +427,7 @@ class RegimeObserver:
 
         self._prefill_rounds = 0
         self._decode_rounds = 0
+        self._idle_rounds = 0
         self._rank_ms_sum = 0.0
         self._rank_ms_n = 0
         self._epoch += 1

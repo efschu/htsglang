@@ -14,6 +14,34 @@ Order is forced: **1+2 → 3 → 4.**
 
 ---
 
+## 0a. Corrections from the 2026-08-01 window (READ FIRST)
+
+The first run of this runsheet cost three boots before the server came up.
+All three are fixed in the commands below; they are recorded here because the
+next reader will otherwise re-derive them.
+
+* **sglang, not vLLM, spellings.** `--context-length`, not `--max-model-len`.
+  Radix prefix caching and chunked prefill are ON by default -- there is no
+  `--enable-prefix-caching` / `--enable-chunked-prefill`.
+* **`--speculative-algorithm NEXTN` auto-chooses all three** spec params and
+  ASSERTS the other two are unset. Do not pass
+  `--speculative-num-draft-tokens`.
+* **INT8-W8A8 does not boot on this build**: `NotImplementedError: No
+  implemented int8_scaled_mm for current compute capability` (sgl_kernel
+  0.3.21). It surfaces inside the cuda-graph cold-build window, so the
+  visible error is a `ColdBuildWindowError` and the dispatch gap is the
+  cause. The vehicle here is therefore **Qwen3.6-27B-FP8**, the documented
+  reference arm.
+* **`deep_gemm` hard-requires `libnvrtc.so.13`**, which the venv ships under
+  `nvidia/cu13/lib` but does not put on the loader path. Without the
+  `LD_LIBRARY_PATH` line below the FP8 path dies at the first GEMM.
+* **Ready-wait patterns must be anchored.** Three separate over-matches cost
+  a boot each: `Failed to` matches the benign `Ignore import error when
+  loading ...` lines, `sigquit` matches `custom_sigquit_handler=None` inside
+  the `server_args=ServerArgs(...)` dump, and any `pgrep -f`/`pkill -f`
+  pattern naming the server also matches the checking shell itself (exit
+  144, self-kill). Use the exclusion list and the PID-based kill below.
+
 ## 0. Before the window
 
 Card-less, already done — every tool below has a smoke that runs without a
@@ -46,21 +74,19 @@ OUT=/spinning/gpu-battery-results/$(date +%F)_363_gates
 mkdir -p $OUT
 
 SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 \
+LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH \
 python3 -m sglang.launch_server \
-  --model-path $MODEL_ROOT/Qwen3.6-27B-INT8-W8A8 \
+  --model-path $MODEL_ROOT/Qwen3.6-27B-FP8 \
   --served-model-name Qwen3.6-27B \
   --tp-size 3 \
   --rank-gpu-id 0,1,2 \
   --rank-tp-ratio auto-performance \
   --rank-auto-reserve-mib 5500,3800,3800 \
-  --max-model-len -1 \
+  --context-length 32768 \
   --port 30000 \
   --kv-cache-dtype fp8_e4m3 \
   --trust-remote-code \
-  --enable-prefix-caching \
-  --enable-chunked-prefill \
   --speculative-algorithm NEXTN \
-  --speculative-num-draft-tokens 4 \
   --enable-metrics --enable-metrics-for-all-schedulers \
   --regime-controller observe \
   --regime-trace $OUT/regime-rank.jsonl \

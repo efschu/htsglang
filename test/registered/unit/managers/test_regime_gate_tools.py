@@ -35,7 +35,7 @@ _PYTHON_ROOT = os.path.abspath(
 def _drive(obs, rounds, *, prefill=True, held=40_000, ms=10.0):
     for _ in range(rounds):
         obs.on_round(
-            prefill_active=prefill,
+            phase="prefill" if prefill else "decode",
             held_tokens=held,
             capacity_tokens=453_632,
             running_bs=1,

@@ -41,6 +41,7 @@ from sglang.srt.managers.regime_classifier import (
     REGIME_CODES,
     REGIME_DECODE_HEAVY,
     REGIME_KV_PRESSURE,
+    REGIME_MIXED,
     REGIME_PREFILL_HEAVY,
     DwellGate,
     RegimeSample,
@@ -395,11 +396,11 @@ class _Channel:
         return _min_reduce([payload, self._peer(payload)])
 
 
-def _drive(observer, rounds, *, prefill_active=True, held=0, capacity=453_632, ms=1.0):
+def _drive(observer, rounds, *, phase="prefill", held=0, capacity=453_632, ms=1.0):
     out = []
     for _ in range(rounds):
         rec = observer.on_round(
-            prefill_active=prefill_active,
+            phase=phase,
             held_tokens=held,
             capacity_tokens=capacity,
             running_bs=1,
@@ -422,8 +423,10 @@ class TestObserverContract(CustomTestCase):
         a subset of the group."""
         a = RegimeObserver(consensus_interval=8, tp_size=1)
         b = RegimeObserver(consensus_interval=8, tp_size=1)
-        rounds_a = [r["round"] for r in _drive(a, 32, prefill_active=True)]
-        rounds_b = [r["round"] for r in _drive(b, 32, prefill_active=False)]
+        rounds_a = [r["round"] for r in _drive(a, 32, phase="prefill")]
+        # Deliberately IDLE, not decode: an idle rank must still enter the
+        # collective in the same round, or a quiet rig splits the group.
+        rounds_b = [r["round"] for r in _drive(b, 32, phase="idle")]
         self.assertEqual(rounds_a, rounds_b)
 
     def test_it_never_actuates(self):
@@ -435,7 +438,7 @@ class TestObserverContract(CustomTestCase):
 
     def test_it_names_the_stage_it_would_have_selected(self):
         obs = RegimeObserver(consensus_interval=4, tp_size=1, table=_table())
-        records = _drive(obs, 64, prefill_active=True, held=40_000)
+        records = _drive(obs, 64, phase="prefill", held=40_000)
         self.assertTrue(any(r["would_flip_to"] == "fp8-prefill" for r in records))
         self.assertGreater(obs.summary()["proposals"], 0)
 
@@ -449,7 +452,7 @@ class TestObserverContract(CustomTestCase):
         """The observe run's most useful line: the regime asked for a stage
         and the arithmetic refused it. That is the phase-3 design input."""
         obs = RegimeObserver(consensus_interval=4, tp_size=1, table=_table())
-        records = _drive(obs, 64, prefill_active=True, held=90_000)
+        records = _drive(obs, 64, phase="prefill", held=90_000)
         refusals = [r for r in records if "96256" in r["reason"]]
         self.assertTrue(refusals, [r["reason"] for r in records])
         self.assertTrue(all(r["would_flip_to"] is None for r in refusals))
@@ -469,6 +472,68 @@ class TestObserverContract(CustomTestCase):
         _drive(obs, 8)
         self.assertTrue(obs.uncoordinated)
         self.assertTrue(obs.summary()["uncoordinated"])
+
+
+class TestIdleIsNotPrefill(CustomTestCase):
+    """The defect the 2026-08-01 card window found.
+
+    The hook used to pass a BOOLEAN, computed by negating #287's
+    "is this a decode round". An EMPTY batch fell on the prefill side, so a
+    mostly-idle rig read PREFILL_HEAVY on 93 600 of 93 603 verdicts. The
+    hermetic tests fed the boolean directly and therefore never exercised the
+    mapping that produced it -- which is why this test drives the PHASE.
+    """
+
+    def test_an_idle_window_classifies_as_mixed(self):
+        obs = RegimeObserver(consensus_interval=4, tp_size=1)
+        records = [
+            r
+            for r in (
+                obs.on_round(
+                    phase="idle",
+                    held_tokens=0,
+                    capacity_tokens=453_632,
+                    running_bs=0,
+                )
+                for _ in range(32)
+            )
+            if r is not None
+        ]
+        self.assertTrue(records)
+        self.assertTrue(all(r["regime"] == REGIME_MIXED for r in records), records[0])
+        self.assertIsNone(records[0]["prefill_share"])
+        self.assertIsNone(records[0]["decode_share"])
+
+    def test_idle_rounds_are_counted_but_in_neither_share(self):
+        obs = RegimeObserver(consensus_interval=8, tp_size=1)
+        for _ in range(4):
+            obs.on_round(
+                phase="prefill", held_tokens=0, capacity_tokens=1, running_bs=1
+            )
+        for _ in range(4):
+            obs.on_round(phase="idle", held_tokens=0, capacity_tokens=1, running_bs=0)
+        rec = obs.last_record
+        self.assertEqual(rec["idle_rounds"], 4)
+        # 4 prefill forwards out of 4 FORWARD rounds -- the idle ones are not
+        # in the denominator either.
+        self.assertEqual(rec["prefill_share"], 1.0)
+
+    def test_an_unknown_phase_is_refused_by_name(self):
+        obs = RegimeObserver(consensus_interval=2, tp_size=1)
+        with self.assertRaises(ValueError) as cm:
+            obs.on_round(phase="busy", held_tokens=0, capacity_tokens=1, running_bs=0)
+        self.assertIn("not a kind of prefill", str(cm.exception))
+
+    def test_the_scheduler_hook_maps_all_three_phases(self):
+        import pathlib
+
+        import sglang.srt.managers.scheduler as mod
+
+        src = pathlib.Path(mod.__file__).read_text()
+        block = src[src.index("self.regime_observer.on_round(") - 900 :]
+        self.assertIn('phase = "idle"', block)
+        self.assertIn('phase = "prefill"', block)
+        self.assertIn('phase = "decode"', block)
 
 
 class TestTierSplit(CustomTestCase):
@@ -543,7 +608,7 @@ class TestF5Desync(CustomTestCase):
         obs = RegimeObserver(
             consensus_interval=2, tp_size=2, collective_min=self._diverging()
         )
-        records = _drive(obs, 8, prefill_active=True, ms=10.0)
+        records = _drive(obs, 8, phase="prefill", ms=10.0)
         self.assertTrue(records)
         self.assertGreater(obs.desyncs, 0)
         self.assertFalse(records[-1]["agreed"])
@@ -555,7 +620,7 @@ class TestF5Desync(CustomTestCase):
         with self.assertLogs(
             "sglang.srt.managers.regime_runtime", level=logging.WARNING
         ) as cm:
-            _drive(obs, 2, prefill_active=True, ms=10.0)
+            _drive(obs, 2, phase="prefill", ms=10.0)
         joined = "\n".join(cm.output)
         self.assertIn("DESYNC", joined)
         self.assertIn("BLOCKS wiring any actuator", joined)
@@ -566,7 +631,7 @@ class TestF5Desync(CustomTestCase):
         obs = RegimeObserver(
             consensus_interval=2, tp_size=2, collective_min=self._diverging()
         )
-        _drive(obs, 8, prefill_active=True, ms=10.0)
+        _drive(obs, 8, phase="prefill", ms=10.0)
         self.assertEqual(obs.summary()["desyncs"], obs.desyncs)
         self.assertGreater(obs.summary()["desyncs"], 0)
 
@@ -766,7 +831,7 @@ class TestSchedulerHookContract(CustomTestCase):
         self.assertEqual(
             passed,
             {
-                "prefill_active",
+                "phase",
                 "held_tokens",
                 "capacity_tokens",
                 "running_bs",
@@ -778,14 +843,20 @@ class TestSchedulerHookContract(CustomTestCase):
         )
         self.assertEqual(calls[0].args, [], "the hook must be keyword-only")
 
-    def test_the_phase_definition_is_shared_with_287(self):
-        """Two controllers with two definitions of 'this was a decode round'
-        is the divergence class the design argues against."""
+    def test_the_phase_split_is_three_way_and_shares_287s_work_split(self):
+        """UPDATED DELIBERATELY after the 2026-08-01 gate window.
+
+        #287 asks a two-way question ("is this a decode round") and #363 used
+        to negate it, which put an EMPTY batch on the prefill side. The
+        prefill/decode split for a round that HAS work is still #287's -- so
+        the two controllers do not disagree about a working round -- but IDLE
+        is now its own answer, because an idle window is no measurement and
+        not 0 % prefill.
+        """
         src = self._scheduler_src()
-        self.assertIn(
-            "#287's own phase definition, reused rather than",
-            src,
-        )
+        self.assertIn('phase = "idle"', src)
+        self.assertNotIn("prefill_active = not (", src)
+        self.assertIn("do not disagree about a", src)
 
 
 if __name__ == "__main__":
