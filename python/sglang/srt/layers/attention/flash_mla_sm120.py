@@ -18,7 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flash_mla_arch import (
+    resolve_flashmla_fallback_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,15 +199,17 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-# SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
-# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
-_sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
-
-
 def flash_mla_with_kvcache_sm120(**kwargs):
-    """SM120 FlashMLA sparse decode entry point.
+    """Portable FlashMLA sparse decode entry point.
 
-    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+    Dispatches to FlashInfer (default where its kernels exist), Triton, or the
+    PyTorch fallback. Named for SM120, where it was introduced, but it serves
+    every device without a FlashMLA CUDA kernel -- Ampere and Ada included; see
+    :mod:`sglang.srt.layers.attention.flash_mla_arch`.
+
+    The implementation is resolved per call from the query's device rather than
+    once at import: on a heterogeneous group the ranks do not agree on the
+    answer (#343).
     """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -220,7 +224,11 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    backend = resolve_flashmla_fallback_backend(
+        q.device.index if q.device.type == "cuda" else None
+    )
+
+    if backend == "flashinfer":
         return _flash_mla_flashinfer(
             q,
             k_cache,
@@ -234,7 +242,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if backend == "triton":
         from sglang.srt.layers.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )

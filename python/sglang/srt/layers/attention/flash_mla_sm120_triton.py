@@ -25,6 +25,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.fp8_triton_compat import (
+    e4m3fn_bits_to_f32,
+    nope_cache_view,
+)
+
 logger = logging.getLogger(__name__)
 
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -50,7 +55,8 @@ def _tiled_sparse_decode_kernel(
     # Q: [B, H, D] bf16
     Q_ptr,
     # Paged KV cache — three typed views of same underlying memory
-    cache_fp8_ptr,  # float8_e4m3fn flat (1 byte/elem) — for nope
+    cache_nope_ptr,  # nope, 1 byte/elem: float8_e4m3fn, or uint8 when
+    # FP8_NATIVE is False (see fp8_triton_compat)
     cache_uint8_ptr,  # uint8 flat (1 byte/elem) — for scales
     cache_bf16_ptr,  # bfloat16 flat (2 bytes/elem) — for rope
     # Indices: [B, topk] int32
@@ -79,6 +85,7 @@ def _tiled_sparse_decode_kernel(
     NOPE_PAD: tl.constexpr,  # 512 (padded from 448)
     ROPE_DIM: tl.constexpr,  # 64
     NOPE_DIM_RT: tl.int32,  # 448 (runtime, for masking)
+    FP8_NATIVE: tl.constexpr,  # False -> decode E4M3 from raw uint8
     BLOCK_T: tl.constexpr,  # tokens per tile (16 or 32)
 ):
     """Tiled sparse decode: vectorized gather + QK + softmax + V accumulation.
@@ -139,11 +146,20 @@ def _tiled_sparse_decode_kernel(
         # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
         nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
         nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
-        kv_nope_fp8 = tl.load(
-            cache_fp8_ptr + nope_addrs,
-            mask=nope_2d_mask,
-            other=0.0,
-        )
+        if FP8_NATIVE:
+            kv_nope_f32 = tl.load(
+                cache_nope_ptr + nope_addrs,
+                mask=nope_2d_mask,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            kv_nope_f32 = e4m3fn_bits_to_f32(
+                tl.load(
+                    cache_nope_ptr + nope_addrs,
+                    mask=nope_2d_mask,
+                    other=0,
+                )
+            )
 
         # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
         scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
@@ -154,7 +170,7 @@ def _tiled_sparse_decode_kernel(
             other=127,
         )
         scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
-        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0)
+        kv_nope = tl.where(nope_2d_mask, kv_nope_f32 * scale_f32, 0.0)
 
         # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
         rope_byte_bases = token_data_bases + 448
@@ -229,7 +245,10 @@ def _run_triton_sparse_decode(
     total_elems = num_pages * page_bytes
     raw_flat = k_cache.as_strided((total_elems,), (1,))
     raw_uint8 = raw_flat.view(torch.uint8)
-    raw_fp8 = raw_uint8.view(torch.float8_e4m3fn)
+    # Below capability 8.9 Triton cannot type a pointer as fp8e4nv, and it
+    # refuses at the kernel's `def` line rather than at the load, so the
+    # argument itself must be the uint8 view there.
+    raw_nope, fp8_native = nope_cache_view(raw_uint8, torch.float8_e4m3fn)
     raw_bf16 = raw_uint8.view(torch.bfloat16)
 
     # Squeeze Q: [B, H, D]
@@ -246,7 +265,7 @@ def _run_triton_sparse_decode(
     grid = (B, H)
     _tiled_sparse_decode_kernel[grid](
         q3,
-        raw_fp8,
+        raw_nope,
         raw_uint8,
         raw_bf16,
         flat_indices,
@@ -273,6 +292,7 @@ def _run_triton_sparse_decode(
         NOPE_PAD=512,
         ROPE_DIM=_ROPE_DIM,
         NOPE_DIM_RT=_NOPE_DIM,
+        FP8_NATIVE=fp8_native,
     )
 
     # Return [B, 1, H, D] and [B, 1, H]
