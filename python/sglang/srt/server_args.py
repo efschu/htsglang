@@ -4247,6 +4247,22 @@ class ServerArgs:
             "no collectives in the graph).",
         ),
     ] = False
+    dual_group_lane_prefill_chunk: A[
+        Optional[int],
+        Arg(
+            help="Chunked lane prefill (#274, DESIGN_121 §13.10): split the "
+            "lane's whole-prompt prefill into extend forwards of at most "
+            "this many tokens over the same request. Only the last chunk "
+            "emits a token; under lane speculation the NEXTN head is primed "
+            "chunkwise alongside. Finer prefill grains are what the pairing "
+            "decider's saturation signal ages by, and per-chunk timings "
+            "land in the job record. Choose a size on the lane's prefill "
+            "tier ladder -- off-ladder chunks pad up to the next captured "
+            "tier or run eager above the top one (a warning names this). "
+            "Unset (default): the single whole-prompt forward, unchanged. "
+            "A per-job 'prefill_chunk' field overrides this flag either way.",
+        ),
+    ] = None
     dual_group_lane_concurrent: A[
         bool,
         Arg(
