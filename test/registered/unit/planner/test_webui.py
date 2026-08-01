@@ -2166,7 +2166,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
             ),
             source="nvml",
             host_ram_mib=64000,
-            cuda_index_source="torch",
+            cuda_index_source="identity-map",
         )
 
     def test_detect_payload_carries_both_indices(self):
@@ -2176,7 +2176,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
         ):
             d = webui.detect_hardware()
         self.assertTrue(d["ok"])
-        self.assertEqual(d["cuda_index_source"], "torch")
+        self.assertEqual(d["cuda_index_source"], "identity-map")
         by_nvml = {g["index"]: g for g in d["gpus"]}
         self.assertEqual(by_nvml[1]["cuda_index"], 0)   # 5090: nvml:1=cuda:0
         self.assertEqual(by_nvml[1]["total_mib"], 32607)
@@ -2244,7 +2244,7 @@ class TestDeviceIndexSpaces(CustomTestCase):
                                     name="RTX 5090", total_mib=32607,
                                     uuid="bbbb"),
             ),
-            source="torch",
+            source=dmod.IDENTITY_MAP_SOURCE,
         )
         with mock.patch(
             "sglang.srt.planner.energy.read_gpu_power_states",
@@ -2258,9 +2258,11 @@ class TestDeviceIndexSpaces(CustomTestCase):
 
     def test_js_keys_placement_inventory_in_cuda_space(self):
         html = webui.INDEX_HTML
-        # the shared dual-label helper + the heuristic marker plumbing.
+        # the shared dual-label helper + the unresolved-order plumbing
+        # (#397: there is no "emulated order" marker any more -- a card
+        # either has a resolved cuda_index or none at all).
         for token in ("function devLabel", "function noteCudaMap",
-                      "_cudaNvml", "_cudaMapHeuristic"):
+                      "_cudaNvml", "_cudaMapUnresolved"):
             self.assertIn(token, html, token)
         # landing placement inventory: keyed by cuda_index (nvml only as a
         # labeled fallback), NEVER plainly by nvml_index (the old bug that
@@ -2280,8 +2282,10 @@ class TestDeviceIndexSpaces(CustomTestCase):
         # the positional plan payload posts detected cards in CUDA order
         # (backend re-index positions == the --rank-gpu-id space).
         self.assertIn("a.cuda_index!=null?a.cuda_index:1e9", html)
-        # heuristic mappings are surfaced, not silent.
-        self.assertIn("FASTEST_FIRST emulation", html)
+        # #397: an order that could not be resolved is surfaced as such --
+        # and there is no emulated order left to surface.
+        self.assertIn("cuda indices unresolved for some cards", html)
+        self.assertNotIn("FASTEST_FIRST emulation", html)
 
 
 class TestGranularVramView(CustomTestCase):

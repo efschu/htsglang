@@ -29,9 +29,12 @@ from sglang.srt.planner.live_metrics import (
 # ---------------------------------------------------------------------------
 class _FakeCard:
     def __init__(self, name, uuid, util, mem_util, sm, mem_clk, watts, limit,
-                 temp, mem_used_mib, mem_total_mib):
+                 temp, mem_used_mib, mem_total_mib, bus_id=None):
         self.name = name
         self.uuid = uuid
+        #: PCI BDF -- the only thing the #331 identity map bridges the CUDA
+        #: ordinal over (#397). A card without one cannot be placed.
+        self.bus_id = bus_id
         self.util = util
         self.mem_util = mem_util
         self.sm = sm
@@ -83,6 +86,15 @@ class _FakeNvml:
     def nvmlDeviceGetUUID(self, h):
         return h.uuid
 
+    def nvmlDeviceGetPciInfo(self, h):
+        if h.bus_id is None:
+            raise RuntimeError("no pci info")
+
+        class _Pci:
+            busId = h.bus_id
+
+        return _Pci()
+
     def nvmlDeviceGetUtilizationRates(self, h):
         return _Util(h.util, h.mem_util)
 
@@ -102,17 +114,40 @@ class _FakeNvml:
         return h.limit * 1000.0
 
 
-def _rig():
+BDF_3080 = "00000000:01:00.0"
+BDF_5090 = "00000000:2D:00.0"
+
+
+def _rig(bus_ids=True):
     # NVML/PCI order: 3080 at index 0, 5090 at index 1 (torch order differs) --
     # UUID is what the client maps on.
     return _FakeNvml([
         _FakeCard("RTX 3080", "GPU-aaaa", util=40, mem_util=25, sm=1900,
                   mem_clk=1180, watts=280, limit=320, temp=70,
-                  mem_used_mib=8000, mem_total_mib=20480),
+                  mem_used_mib=8000, mem_total_mib=20480,
+                  bus_id=BDF_3080 if bus_ids else None),
         _FakeCard("RTX 5090", "GPU-bbbb", util=88, mem_util=60, sm=2800,
                   mem_clk=1500, watts=480, limit=575, temp=62,
-                  mem_used_mib=24000, mem_total_mib=32768),
+                  mem_used_mib=24000, mem_total_mib=32768,
+                  bus_id=BDF_5090 if bus_ids else None),
     ])
+
+
+def _cuda_fastest_first():
+    """torch's view of that rig: the 5090 is cuda:0, the 3080 cuda:1."""
+    return {BDF_5090: 0, BDF_3080: 1}
+
+
+def _inject_cuda_order(mapping):
+    from unittest import mock
+
+    from sglang.srt.registry import nvml as registry_nvml
+
+    return mock.patch.object(
+        registry_nvml,
+        "_cuda_ordinals_by_bus",
+        lambda allow_cuda_init=False: dict(mapping),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,20 +218,36 @@ class TestNvmlPerCard(unittest.TestCase):
 
     def test_cuda_index_bridged_and_marked(self):
         # Every card carries its CUDA-order index (the --rank-gpu-id /
-        # --base-gpu-id space) next to the NVML index. The fake rig's UUIDs
-        # can never match the real torch enumeration, so this exercises the
-        # documented FASTEST_FIRST emulation: the 5090 (nvml:1, the fastest
-        # card) is cuda:0, the 3080 (nvml:0) is cuda:1 -- and the mapping is
-        # honestly marked "heuristic" for the UI.
-        cards = read_gpu_live(nvml=_rig())
+        # --base-gpu-id space) next to the NVML index, resolved against the
+        # #331 identity map over the PCI BDF: the 5090 (nvml:1) is cuda:0 and
+        # the 3080 (nvml:0) is cuda:1, i.e. the two orders diverge here and
+        # the annotation has to cross them.
+        with _inject_cuda_order(_cuda_fastest_first()):
+            cards = read_gpu_live(nvml=_rig())
         by_name = {c.name: c for c in cards}
         self.assertEqual(by_name["RTX 5090"].cuda_index, 0)
         self.assertEqual(by_name["RTX 3080"].cuda_index, 1)
         for c in cards:
-            self.assertEqual(c.cuda_index_source, "heuristic")
+            self.assertEqual(c.cuda_index_source, "identity-map")
             j = c.to_json()
             self.assertIn("cuda_index", j)
             self.assertIn("cuda_index_source", j)
+
+    def test_an_unresolvable_order_leaves_the_cards_unbridged(self):
+        # #397: no emulated order. A card whose CUDA ordinal cannot be
+        # resolved carries None, and the UI shows only the NVML index --
+        # rather than a plausible number that names the wrong card.
+        with _inject_cuda_order({}):
+            cards = read_gpu_live(nvml=_rig())
+        for c in cards:
+            self.assertIsNone(c.cuda_index)
+            self.assertIsNone(c.cuda_index_source)
+
+    def test_cards_without_a_pci_bdf_stay_unbridged(self):
+        with _inject_cuda_order(_cuda_fastest_first()):
+            cards = read_gpu_live(nvml=_rig(bus_ids=False))
+        for c in cards:
+            self.assertIsNone(c.cuda_index)
 
 
 class TestPrefillSubtractsCache(unittest.TestCase):

@@ -56,6 +56,8 @@ import re
 import typing
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.registry.nvml import DeviceOrderUnresolvedError
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -1764,27 +1766,64 @@ def _cuda_index_at(gpus: Sequence, pos: int) -> Tuple[int, str]:
     DIVERGES from CUDA's FASTEST_FIRST order on mixed rigs -- list positions
     must never be written into cuda-space flags. Resolution:
       1. an explicit ``cuda_index`` on the descriptor (the detect_hardware
-         payload carries it, bridged by planner.device_map) -> "bridged";
-      2. else the FASTEST_FIRST emulation over the given list (stable sort
-         by SEED fp16 peak, descending) -> "heuristic";
-      3. else the list position itself -> "identity" (last resort, offline).
+         payload carries it, bridged by the #331 identity map) -> "bridged";
+      2. else the card's UUID looked up in that same identity map through the
+         cached planner adapter -> "bridged";
+      3. else, for an inventory that carries NO card identity at all -- the
+         offline ``--gpu NAME:MIB`` specs -- the list position, under the
+         convention #392 already fixed for manual ``HardwareSpec``s: a spec
+         that declares no CUDA order means its own order -> "declared".
+
+    A card that DOES carry identity and still cannot be placed raises
+    :class:`~sglang.srt.registry.nvml.DeviceOrderUnresolvedError` (#397).
+    Before that, this function emulated FASTEST_FIRST by sorting on the
+    SEED_CARDS fp16 peak and labelled the result "heuristic"; unknown cards
+    ranked 0.0 and silently kept NVML order, so the emulation wrote a
+    confident CUDA index for a rig it had never seen into a launch flag.
+    Callers now omit the pin instead of guessing it.
     """
 
+    def _field(g, key):
+        return g.get(key) if isinstance(g, dict) else getattr(g, key, None)
+
     def _cu(g):
-        v = g.get("cuda_index") if isinstance(g, dict) else getattr(
-            g, "cuda_index", None
-        )
+        v = _field(g, "cuda_index")
         return int(v) if v is not None else None
 
     v = _cu(gpus[pos])
     if v is not None:
         return v, "bridged"
-    try:
-        from sglang.srt.planner.device_map import emulate_cuda_order
 
-        return emulate_cuda_order(_gpu_names(gpus))[pos], "heuristic"
-    except Exception:  # pragma: no cover - defensive
-        return pos, "identity"
+    uuid = _field(gpus[pos], "uuid")
+    if not uuid:
+        # No identity on ANY card: an offline/manual inventory. There is no
+        # live order to get wrong, so the declared order is the meaning.
+        if not any(_field(g, "uuid") for g in gpus):
+            return pos, "declared"
+    else:
+        try:
+            from sglang.srt.planner.device_map import device_map
+
+            bridged = device_map().cuda_for_uuid(uuid)
+        except Exception:  # pragma: no cover - defensive
+            bridged = None
+        if bridged is not None:
+            return int(bridged), "bridged"
+
+    from sglang.srt.registry.nvml import (
+        DeviceOrderUnresolvedError,
+        cuda_bridge_diagnosis,
+    )
+
+    name = _gpu_names(gpus)[pos] if pos < len(_gpu_names(gpus)) else "?"
+    raise DeviceOrderUnresolvedError(
+        f"the flag planner: card at inventory position {pos} ({name}"
+        + (f", uuid {uuid}" if uuid else ", no uuid")
+        + ") has no CUDA-order index, so no --base-gpu-id / --rank-gpu-id "
+        "value can be written for it. Refusing to guess: the list position "
+        "is the NVML/PCI order, which differs from CUDA's on a mixed rig "
+        f"(#397). Reason: {cuda_bridge_diagnosis()}"
+    )
 
 
 def _pick_stock_subset(gpus: Sequence, totals: Sequence[int], n: int):
@@ -1792,7 +1831,10 @@ def _pick_stock_subset(gpus: Sequence, totals: Sequence[int], n: int):
     a set of IDENTICAL-VRAM cards (the stock even split fits them cleanly;
     largest such total wins -- on the reference box the two 3080s), else the
     ``n`` largest cards. Returns ``(list_positions, cuda_indices, why)`` or
-    None when the rig has fewer than ``n`` cards."""
+    None when the rig has fewer than ``n`` cards, or when the CUDA order of a
+    picked card cannot be resolved -- the preset's whole content is a set of
+    cuda-space pins, so an unplaceable card means there is no preset to emit
+    (#397), not a preset with guessed pins."""
     if len(totals) < n:
         return None
     by_total: Dict[int, List[int]] = {}
@@ -1810,7 +1852,11 @@ def _pick_stock_subset(gpus: Sequence, totals: Sequence[int], n: int):
             "No identical-VRAM set of this size; picked the largest cards "
             "(the even split is sized by the smallest of them)."
         )
-    cuda_idx = [_cuda_index_at(gpus, p)[0] for p in positions]
+    try:
+        cuda_idx = [_cuda_index_at(gpus, p)[0] for p in positions]
+    except DeviceOrderUnresolvedError as e:
+        logger.warning("stock subset preset omitted: %s", e)
+        return None
     return positions, cuda_idx, why
 
 
@@ -1821,7 +1867,14 @@ def _pick_single_gpu(gpus: Sequence):
     Rule: largest total VRAM; VRAM tie -> higher FLOPs; full tie -> first.
     ``list_pos`` indexes the given inventory list (for sizing against that
     card); ``cuda_index`` is what --base-gpu-id must pin -- the two are
-    DIFFERENT spaces (list = NVML/detect order, flag = CUDA order)."""
+    DIFFERENT spaces (list = NVML/detect order, flag = CUDA order).
+
+    ``cuda_index`` is None when the card's CUDA order cannot be resolved
+    (#397). The pick still stands -- it decides which card the preset is
+    SIZED against, which is a list-space question -- but no pin is emitted,
+    and the reason says so. Writing the list position into --base-gpu-id
+    there is the defect: on the reference box that pins a 3080 while sizing
+    for the 5090."""
     if not gpus:
         return None
 
@@ -1839,7 +1892,19 @@ def _pick_single_gpu(gpus: Sequence):
         elif _mib(gpus[i]) == _mib(gpus[best]) and _gpu_flops(gpus[i]) > _gpu_flops(gpus[best]):
             best = i
         # full tie: keep the earlier index
-    cuda_idx, cuda_src = _cuda_index_at(gpus, best)
+    try:
+        cuda_idx, cuda_src = _cuda_index_at(gpus, best)
+    except DeviceOrderUnresolvedError as e:
+        logger.warning("single-gpu preset emits no --base-gpu-id: %s", e)
+        return (
+            best,
+            None,
+            f"GPU pick: {_name(gpus[best])} ({_mib(gpus[best])} MiB) -- "
+            "largest VRAM, ties broken by FLOPs, then first. NOT pinned: "
+            "this card's CUDA-order index could not be resolved, and "
+            "--base-gpu-id is a CUDA-order index, so any value written here "
+            f"would be a guess. {e}",
+        )
     why = (
         f"GPU pick: {_name(gpus[best])} ({_mib(gpus[best])} MiB) at "
         f"cuda:{cuda_idx} -- largest VRAM, ties broken by FLOPs, then first. "
@@ -1847,9 +1912,10 @@ def _pick_single_gpu(gpus: Sequence):
         "which is a CUDA-order index (FASTEST_FIRST), NOT the NVML/"
         "nvidia-smi index."
         + (
-            " (cuda index from a FASTEST_FIRST emulation -- heuristic, no "
-            "torch/UUID bridge available)"
-            if cuda_src == "heuristic"
+            " (cuda index is the DECLARED order of this offline inventory: "
+            "the spec carries no card identity, so its own order is its "
+            "meaning -- verify it against nvidia-smi before launching)"
+            if cuda_src == "declared"
             else ""
         )
     )
@@ -2568,7 +2634,9 @@ def profiles(
     overrides: Dict[str, Any] = {"tp_size": 1}
     if pick is not None:
         _pos, cuda_idx, why = pick
-        if cuda_idx != 0:
+        # None = the card's CUDA order is unknown (#397): size against it,
+        # but emit no pin rather than a guessed one.
+        if cuda_idx is not None and cuda_idx != 0:
             overrides["base_gpu_id"] = cuda_idx
         info.append(why)
     s = _mk(overrides, info)
@@ -2698,59 +2766,67 @@ def profiles(
     # inventory list (on the reference box the 5090 is list position 1 but
     # cuda:0).
     largest_pos = totals.index(max(totals)) if totals else 0
-    largest_cuda, largest_cuda_src = _cuda_index_at(gpus, largest_pos)
-    colo_tp = ngpu + 1
-    # One rank per card + the extra rank on the largest card (cuda-space
-    # ids), emitted in the CANONICAL counts order (rank_gpu_id_from_counts:
-    # ascending cuda index, each index repeated its count) -- exactly what
-    # the Runner's per-card rank steppers derive, so applying this preset
-    # and then touching a stepper round-trips without rewriting the flag.
-    colo_counts = {c: 1 for c in range(ngpu)}
-    colo_counts[largest_cuda] = colo_counts.get(largest_cuda, 0) + 1
-    rank_gpu = rank_gpu_id_from_counts(colo_counts)
-    colo_ranks = [i for i, g in enumerate(rank_gpu) if g == largest_cuda]
-    # even budget: the scalar must fit BOTH the smallest solo card (minus a
-    # context allowance) and half of the shared largest card (minus a shared
-    # 2 GiB allowance) -- otherwise the co-located pair is physically
-    # impossible on the big card.
-    per_rank = max(
-        1024, min(min(totals) - 1024, (max(totals) - 2048) // 2)
-    )
-    info = list(base_notes) + [
-        f"tp_size={colo_tp} on {ngpu} cards: ranks "
-        + "+".join(str(r) for r in colo_ranks)
-        + " co-locate on the largest card "
-        f"({_gpu_names(gpus)[largest_pos]}, cuda:{largest_cuda}). "
-        "REQUIRES CUDA MPS (two ranks share one card). "
-        f"Uniform per-rank budget {per_rank} MiB; ensure "
-        f"2 x {per_rank} MiB fits that card's total "
-        f"({max(totals)} MiB) -- headroom is the user's responsibility."
-        + (
-            " (cuda index from a FASTEST_FIRST emulation -- heuristic)"
-            if largest_cuda_src == "heuristic"
-            else ""
-        ),
-        "Stock sglang cannot do this; it is a fork capability.",
-    ] + list(launch_env_notes)
-    s = _mk(
-        {
-            "tp_size": colo_tp,
-            "rank_gpu_id": rank_gpu,
-            "rank_gpu_memory_mib": per_rank,
-        },
-        info,
-    )
-    _apply_fork_rules(s, info)
-    _apply_capacity_rules(s, info, model_cfg, gpus)
-    out.append(
-        Profile(
-            "co-location (TP>cards, MPS)",
-            "colocation",
-            s,
-            info=info,
-            env=dict(fork_env),
+    try:
+        largest_cuda, largest_cuda_src = _cuda_index_at(gpus, largest_pos)
+    except DeviceOrderUnresolvedError as e:
+        # The preset IS a --rank-gpu-id vector; without the shared card's
+        # CUDA index there is nothing correct to emit (#397).
+        logger.warning("co-location preset omitted: %s", e)
+        largest_cuda = largest_cuda_src = None
+    if largest_cuda is not None:
+        colo_tp = ngpu + 1
+        # One rank per card + the extra rank on the largest card (cuda-space
+        # ids), emitted in the CANONICAL counts order (rank_gpu_id_from_counts:
+        # ascending cuda index, each index repeated its count) -- exactly what
+        # the Runner's per-card rank steppers derive, so applying this preset
+        # and then touching a stepper round-trips without rewriting the flag.
+        colo_counts = {c: 1 for c in range(ngpu)}
+        colo_counts[largest_cuda] = colo_counts.get(largest_cuda, 0) + 1
+        rank_gpu = rank_gpu_id_from_counts(colo_counts)
+        colo_ranks = [i for i, g in enumerate(rank_gpu) if g == largest_cuda]
+        # even budget: the scalar must fit BOTH the smallest solo card (minus a
+        # context allowance) and half of the shared largest card (minus a shared
+        # 2 GiB allowance) -- otherwise the co-located pair is physically
+        # impossible on the big card.
+        per_rank = max(
+            1024, min(min(totals) - 1024, (max(totals) - 2048) // 2)
         )
-    )
+        info = list(base_notes) + [
+            f"tp_size={colo_tp} on {ngpu} cards: ranks "
+            + "+".join(str(r) for r in colo_ranks)
+            + " co-locate on the largest card "
+            f"({_gpu_names(gpus)[largest_pos]}, cuda:{largest_cuda}). "
+            "REQUIRES CUDA MPS (two ranks share one card). "
+            f"Uniform per-rank budget {per_rank} MiB; ensure "
+            f"2 x {per_rank} MiB fits that card's total "
+            f"({max(totals)} MiB) -- headroom is the user's responsibility."
+            + (
+                " (cuda indices are the DECLARED order of this offline "
+                "inventory -- verify against nvidia-smi before launching)"
+                if largest_cuda_src == "declared"
+                else ""
+            ),
+            "Stock sglang cannot do this; it is a fork capability.",
+        ] + list(launch_env_notes)
+        s = _mk(
+            {
+                "tp_size": colo_tp,
+                "rank_gpu_id": rank_gpu,
+                "rank_gpu_memory_mib": per_rank,
+            },
+            info,
+        )
+        _apply_fork_rules(s, info)
+        _apply_capacity_rules(s, info, model_cfg, gpus)
+        out.append(
+            Profile(
+                "co-location (TP>cards, MPS)",
+                "colocation",
+                s,
+                info=info,
+                env=dict(fork_env),
+            )
+        )
 
     # --- uneven full-split: max-tokens (VRAM-auto) ------------------------
     # rank_gpu_id list(range(ngpu)) is CUDA-space identity: rank i on cuda:i,

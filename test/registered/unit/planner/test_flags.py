@@ -47,8 +47,22 @@ _DENSE_CFG = {
     "head_dim": 128,
 }
 
-# NVML/nvidia-smi enumeration of THE reference box: the 5090 sits at index 1.
+# NVML/nvidia-smi enumeration of THE reference box: the 5090 sits at index 1,
+# and its CUDA ordinal is 0 -- the two spaces diverge, which is the point of
+# every cuda-index assertion below. The ``cuda_index`` values are what
+# ``detect_hardware`` puts on a live payload, resolved against the #331
+# identity map (#397: they are never emulated from the card names any more,
+# so a fixture that omits them is testing the offline/declared convention
+# instead -- see ``_HETERO_GPUS_OFFLINE``).
 _HETERO_GPUS = [
+    {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 1},
+    {"name": "RTX 5090", "total_mib": 32607, "cuda_index": 0},
+    {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 2},
+]
+#: The same rig as an OFFLINE ``--gpu NAME:MIB`` spec: no card identity at
+#: all, so the declared list order is the meaning of the values (#392's
+#: manual-spec convention, named "declared" since #397).
+_HETERO_GPUS_OFFLINE = [
     {"name": "RTX 3080", "total_mib": 20480},
     {"name": "RTX 5090", "total_mib": 32607},
     {"name": "RTX 3080", "total_mib": 20480},
@@ -1226,12 +1240,21 @@ class TestSingleGpuPick(unittest.TestCase):
     def test_hetero_picks_largest_vram_and_emits_cuda_index(self):
         pos, cuda_idx, why = flags._pick_single_gpu(_HETERO_GPUS)
         self.assertEqual(pos, 1)  # the 5090 sits at LIST position 1 (NVML)
-        # no explicit cuda_index on the dicts -> FASTEST_FIRST emulation:
-        # the 5090 is the fastest card -> cuda:0, and the why says heuristic.
+        # its resolved cuda_index is 0 -- the pin must be that, not the list
+        # position, and the reason names the card.
         self.assertEqual(cuda_idx, 0)
         self.assertIn("5090", why)
         self.assertIn("cuda:0", why)
-        self.assertIn("heuristic", why)
+        self.assertNotIn("DECLARED", why)
+
+    def test_offline_spec_uses_its_declared_order_and_says_so(self):
+        # #397: with no card identity there is no live order to resolve, so
+        # the list position IS the meaning (#392's manual-spec convention) --
+        # stated in the reason instead of silently emulated from the names.
+        pos, cuda_idx, why = flags._pick_single_gpu(_HETERO_GPUS_OFFLINE)
+        self.assertEqual(pos, 1)
+        self.assertEqual(cuda_idx, 1)
+        self.assertIn("DECLARED", why)
 
     def test_bridged_cuda_index_wins_over_emulation(self):
         # The detect_hardware payload shape of THE reference box: NVML order
@@ -1246,7 +1269,7 @@ class TestSingleGpuPick(unittest.TestCase):
         pos, cuda_idx, why = flags._pick_single_gpu(rig)
         self.assertEqual(pos, 1)
         self.assertEqual(cuda_idx, 0)
-        self.assertNotIn("heuristic", why)  # bridged, not emulated
+        self.assertNotIn("DECLARED", why)  # bridged, not assumed
 
     def test_vram_tie_broken_by_flops(self):
         g = [
@@ -1262,7 +1285,7 @@ class TestSingleGpuPick(unittest.TestCase):
         ]
         pos, cuda_idx, _why = flags._pick_single_gpu(g)
         self.assertEqual(pos, 0)
-        self.assertEqual(cuda_idx, 0)  # identical cards: emulation keeps order
+        self.assertEqual(cuda_idx, 0)  # offline spec: declared order kept
 
     def test_single_preset_pin_is_cuda_space_and_sizes_that_card(self):
         # Box scenario: the pick names the 5090 -> base_gpu_id is its CUDA

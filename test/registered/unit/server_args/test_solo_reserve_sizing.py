@@ -252,48 +252,51 @@ class TestItReadsTheCardTheProcessRunsOn(CustomTestCase):
 
     @staticmethod
     def _nvml_rig(mapping, nvml_totals):
-        """Patch the CUDA -> NVML bridge and NVML's per-index totals.
+        """Inject an NVML card list and a CUDA ordinal -> NVML index order.
 
-        Exercises the real ``_query_gpu_total_mib``, so the renumbering is
-        crossed by the code under test and not by the fixture.
+        Since #397 the renumbering is crossed by the one card-identity map
+        (``registry.nvml.IdentityMap``), so the fixture injects at ITS two
+        seams -- the device list and the CUDA-ordinal bridge -- rather than
+        at a bridge function of ``server_args``' own. ``_query_gpu_total_mib``
+        itself is still the code under test.
+
+        ``mapping`` is ``{cuda ordinal: nvml index}``; every card gets a
+        synthetic BDF derived from its NVML index, which is what the map
+        actually bridges over.
         """
         import contextlib
 
-        class _FakePynvml:
-            NVMLError = Exception
+        from sglang.srt.registry import nvml as registry_nvml
+        from sglang.srt.registry.nvml import DeviceInfo
 
-            @staticmethod
-            def nvmlInit():
-                return None
+        def _bdf(nvml_index):
+            return f"00000000:{nvml_index + 1:02X}:00.0"
 
-            @staticmethod
-            def nvmlShutdown():
-                return None
-
-            @staticmethod
-            def nvmlDeviceGetCount():
-                return len(nvml_totals)
-
-            @staticmethod
-            def nvmlDeviceGetHandleByIndex(index):
-                return index
-
-            @staticmethod
-            def nvmlDeviceGetMemoryInfo(handle):
-                class _Mem:
-                    total = nvml_totals[handle] * 1024 * 1024
-
-                return _Mem()
+        devices = [
+            DeviceInfo(
+                index=i,
+                uuid=f"GPU-{i:08d}-0000-0000-0000-000000000000",
+                name=f"card{i}",
+                total_bytes=total * 1024 * 1024,
+                pci_bus_id=_bdf(i),
+            )
+            for i, total in enumerate(nvml_totals)
+        ]
+        bus_to_ordinal = {
+            _bdf(nvml_index): cuda_ordinal
+            for cuda_ordinal, nvml_index in mapping.items()
+            if 0 <= nvml_index < len(nvml_totals)
+        }
 
         @contextlib.contextmanager
         def _ctx():
-            import sys
-
-            with patch.dict(sys.modules, {"pynvml": _FakePynvml}):
+            with patch.object(
+                registry_nvml, "list_devices", lambda: list(devices)
+            ):
                 with patch.object(
-                    server_args_module,
-                    "_torch_to_nvml_gpu_index_mapping",
-                    lambda: dict(mapping),
+                    registry_nvml,
+                    "_cuda_ordinals_by_bus",
+                    lambda allow_cuda_init=False: dict(bus_to_ordinal),
                 ):
                     yield
 

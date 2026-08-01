@@ -11,9 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""CUDA-order <-> NVML-order device-index bridge for the planner dashboard.
+"""DEPRECATED shell (#397): the planner's view of the ONE card-identity map.
 
-Two DIFFERENT index spaces name the same physical cards:
+Card identity has a single source of truth,
+:class:`sglang.srt.registry.nvml.IdentityMap` (#331): cards are keyed on
+their NVML UUID and the three enumerations that disagree on a mixed rig --
+NVML/PCI index, CUDA ordinal, PCI BDF -- are derived views of it. New code
+uses that class directly. This module remains only as the planner-shaped
+adapter over it, so the dashboard payloads (``{nvml_index, cuda_index, name,
+total_mib, uuid}``) keep their form.
+
+Two DIFFERENT index spaces name the same physical cards, and the planner
+speaks both:
 
   * CUDA / rank space -- the space the ENGINE flags live in. ``--rank-gpu-id``
     and ``--base-gpu-id`` values end up in ``CUDA_VISIBLE_DEVICES``
@@ -24,40 +33,44 @@ Two DIFFERENT index spaces name the same physical cards:
     order. All telemetry (power, temperature, memory) is sampled here.
 
 On a mixed rig the two DIVERGE (the reference box: cuda:0 = RTX 5090 =
-nvml:1; the two RTX 3080s are cuda:1 = nvml:0 and cuda:2 = nvml:2). Any
-index that crosses between the spaces without translation silently names a
-different card. This module is the planner's ONE bridge: per physical card
-``{uuid, name, total_mib, nvml_index, cuda_index}``, resolved by
+nvml:1; the two RTX 3080s are cuda:1 = nvml:0 and cuda:2 = nvml:2).
 
-  1. torch enumeration matched to NVML by GPU UUID (source ``"torch"``) --
-     exact, the same technique as the engine's
-     ``server_args._torch_to_nvml_gpu_index_mapping`` (which bridges via PCI
-     bus IDs); skipped when ``CUDA_VISIBLE_DEVICES`` filters the process
-     (torch would then see a subset in a remapped order);
-  2. else a documented FASTEST_FIRST EMULATION (source ``"heuristic"``):
-     stable sort by the SEED_CARDS fp16 GEMM peak, descending. CUDA's
-     FASTEST_FIRST ranks by device performance and breaks ties in PCI order,
-     which the stable sort reproduces; unknown card names rank 0 and keep
-     NVML order. Callers must surface ``source == "heuristic"`` to the user.
+What #397 removed: this module used to carry its own second resolver, whose
+fallback was a documented FASTEST_FIRST EMULATION -- a stable sort of the
+cards by their SEED_CARDS fp16 GEMM peak. It was labelled "heuristic" and
+callers were asked to surface that label, but a label does not make an
+ordering right: an unknown card ranked 0.0 and silently kept NVML order, so
+the emulation answered confidently on exactly the rigs nobody had measured.
+There is now no fallback. Either the identity map places every card, or
+:class:`~sglang.srt.registry.nvml.DeviceOrderUnresolvedError` names the cards
+it could not place and why, and the caller shows no CUDA index at all.
 
-Never crashes without a GPU: no NVML -> an empty map with ``source=None``.
+``build_device_map`` raises that error; :func:`device_map`, whose callers are
+UI paths that must never crash, catches it, logs it once and caches an EMPTY
+map (``source=None``). An empty map is the honest answer -- no bridge -- and
+every caller already renders it as "unbridged".
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
-from typing import Dict, List, Optional, Sequence
+import logging
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DeviceMapEntry",
     "DeviceMap",
     "build_device_map",
     "device_map",
-    "emulate_cuda_order",
-    "seed_fp16_peak",
     "norm_uuid",
+    "IDENTITY_MAP_SOURCE",
 ]
+
+#: ``DeviceMap.source`` when the #331 identity map placed every card. The only
+#: non-``None`` value there is since #397; "torch" and "heuristic" are gone.
+IDENTITY_MAP_SOURCE = "identity-map"
 
 
 def norm_uuid(u) -> str:
@@ -65,40 +78,6 @@ def norm_uuid(u) -> str:
     plain lowercase hex, so torch / NVML / nvidia-smi spellings compare."""
     s = u.decode() if isinstance(u, bytes) else str(u)
     return "".join(ch for ch in s.lower() if ch in "0123456789abcdef")
-
-
-def seed_fp16_peak(name) -> float:
-    """Best-effort fp16 tensor-core peak for a card NAME from the planner's
-    SEED_CARDS (bidirectional substring match, mirroring
-    ``flags._gpu_flops``). Unknown names return 0.0."""
-    try:
-        from sglang.srt.planner.card_library import SEED_CARDS
-
-        low = str(name or "").lower()
-        for p in SEED_CARDS.values():
-            if p.name.lower() in low or low in p.name.lower():
-                return float(p.peak_gemm_tflops_fp16 or 0.0)
-    except Exception:
-        pass
-    return 0.0
-
-
-def emulate_cuda_order(names: Sequence[str]) -> List[int]:
-    """FASTEST_FIRST emulation: the CUDA index each input position would get.
-
-    ``names[i]`` is the card at NVML/list position ``i``; the returned list
-    gives its emulated CUDA index. Stable sort by SEED_CARDS fp16 peak
-    descending -- CUDA's FASTEST_FIRST orders by device performance and keeps
-    PCI order among equals, which a stable descending sort reproduces. This is
-    a HEURISTIC (CUDA's internal ranking is not exactly the fp16 GEMM peak);
-    callers must mark results from this path as such."""
-    order = sorted(
-        range(len(names)), key=lambda i: (-seed_fp16_peak(names[i]), i)
-    )
-    out = [0] * len(names)
-    for cuda_idx, pos in enumerate(order):
-        out[pos] = cuda_idx
-    return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,8 +98,9 @@ class DeviceMapEntry:
 @dataclasses.dataclass(frozen=True)
 class DeviceMap:
     entries: tuple
-    #: "torch" (exact, UUID-bridged) | "heuristic" (FASTEST_FIRST emulation)
-    #: | None (no GPU inventory at all).
+    #: :data:`IDENTITY_MAP_SOURCE` when every card was placed, else None (no
+    #: GPU inventory, or an order that could not be resolved -- there is no
+    #: third, guessed state since #397).
     source: Optional[str]
 
     def nvml_to_cuda(self) -> Dict[int, int]:
@@ -151,119 +131,116 @@ class DeviceMap:
         }
 
 
-def _nvml_cards(nvml=None) -> List[dict]:
-    """[{nvml_index, name, total_mib, uuid}] from pynvml (or an injected
-    module-alike; an injected ``nvml`` is NOT init/shutdown -- the caller owns
-    it, mirroring ``live_metrics.read_gpu_live``). [] when nothing is
-    readable."""
-    own = nvml is None
-    if own:
-        try:
-            import pynvml as nvml  # type: ignore[no-redef]
+def _device_infos(nvml=None):
+    """The NVML card list as :class:`registry.nvml.DeviceInfo` records.
 
-            nvml.nvmlInit()
-        except Exception:
+    ``nvml`` is an injected pynvml-alike (tests, and ``live_metrics``, which
+    already holds an open handle and owns its init/shutdown). Without it the
+    registry reads the driver itself, so the real path has exactly one NVML
+    reader. Returns ``[]`` when nothing is readable -- a GPU-less host is not
+    an error here, it is a rig with no cards, and the caller renders it as
+    such.
+    """
+    from sglang.srt.registry.nvml import DeviceInfo
+
+    if nvml is None:
+        try:
+            from sglang.srt.registry.nvml import list_devices
+
+            return list_devices()
+        except Exception as exc:  # noqa: BLE001 - GPU-less host, not an error
+            logger.debug("device map: NVML inventory unavailable: %s", exc)
             return []
+
+    def _text(v) -> str:
+        return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+
     try:
         out = []
         for i in range(nvml.nvmlDeviceGetCount()):
             h = nvml.nvmlDeviceGetHandleByIndex(i)
-            name = nvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", "replace")
             try:
-                uuid = norm_uuid(nvml.nvmlDeviceGetUUID(h))
+                uuid = _text(nvml.nvmlDeviceGetUUID(h))
             except Exception:
                 uuid = ""
             try:
-                total_mib = int(nvml.nvmlDeviceGetMemoryInfo(h).total / 2**20)
+                total = int(nvml.nvmlDeviceGetMemoryInfo(h).total)
             except Exception:
-                total_mib = 0
+                total = 0
+            try:
+                bus = _text(nvml.nvmlDeviceGetPciInfo(h).busId)
+            except Exception:
+                # No BDF means no bridge to the CUDA side for this card. The
+                # all-or-nothing check in the identity map turns that into a
+                # named error rather than a plausible-looking index.
+                bus = ""
             out.append(
-                {
-                    "nvml_index": i,
-                    "name": str(name),
-                    "total_mib": total_mib,
-                    "uuid": uuid,
-                }
+                DeviceInfo(
+                    index=i,
+                    uuid=uuid,
+                    name=_text(nvml.nvmlDeviceGetName(h)),
+                    total_bytes=total,
+                    pci_bus_id=bus,
+                )
             )
         return out
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - broken or absent NVML
+        logger.debug("device map: injected NVML inventory unreadable: %s", exc)
         return []
-    finally:
-        if own:
-            try:
-                nvml.nvmlShutdown()
-            except Exception:
-                pass
-
-
-def _torch_cuda_uuids() -> Optional[List[str]]:
-    """Normalized GPU UUIDs in torch's CUDA enumeration order, or None when
-    torch/CUDA is unavailable or the order cannot be trusted.
-
-    Untrusted when ``CUDA_VISIBLE_DEVICES`` filters THIS process: torch then
-    enumerates a remapped subset, which is not the bare CUDA order the engine
-    flags (launched without CVD) are interpreted in."""
-    if os.environ.get("CUDA_VISIBLE_DEVICES") not in (None, ""):
-        return None
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-        out = []
-        for i in range(torch.cuda.device_count()):
-            uu = getattr(torch.cuda.get_device_properties(i), "uuid", None)
-            if uu is None:
-                return None
-            out.append(norm_uuid(uu))
-        return out
-    except Exception:
-        return None
 
 
 def build_device_map(nvml=None, allow_torch: bool = True) -> DeviceMap:
-    """Build a fresh (uncached) :class:`DeviceMap`. ``nvml`` is injectable for
-    tests; an injected fake rig will not match the real torch UUIDs and thus
-    deterministically exercises the heuristic path."""
-    cards = _nvml_cards(nvml)
-    if not cards:
+    """Build a fresh (uncached) :class:`DeviceMap` from the #331 identity map.
+
+    ``nvml`` is an injectable pynvml-alike for tests and for ``live_metrics``,
+    which owns its own handle. ``allow_torch=False`` withholds the only source
+    of the CUDA side, so no card can be placed and the result is the empty
+    map -- where this used to hand back the emulated order.
+
+    Raises :class:`~sglang.srt.registry.nvml.DeviceOrderUnresolvedError` when
+    cards are present but their CUDA order cannot be resolved. Callers that
+    must not crash use :func:`device_map`.
+    """
+    from sglang.srt.registry.nvml import identity_map
+
+    infos = _device_infos(nvml)
+    if not infos or not allow_torch:
         return DeviceMap(entries=(), source=None)
-    cuda_per_card: Optional[List[int]] = None
-    source = "heuristic"
-    if allow_torch:
-        tu = _torch_cuda_uuids()
-        if tu is not None and len(tu) == len(cards):
-            by_uuid = {u: i for i, u in enumerate(tu)}
-            if all(c["uuid"] and c["uuid"] in by_uuid for c in cards):
-                cuda_per_card = [by_uuid[c["uuid"]] for c in cards]
-                source = "torch"
-    if cuda_per_card is None:
-        cuda_per_card = emulate_cuda_order([c["name"] for c in cards])
+
+    imap = identity_map(infos, allow_cuda_init=True)
+    imap.require_cuda_ordinals("the planner device map")
     entries = tuple(
         DeviceMapEntry(
-            nvml_index=c["nvml_index"],
-            cuda_index=cuda_per_card[i],
-            name=c["name"],
-            total_mib=c["total_mib"],
-            uuid=c["uuid"],
+            nvml_index=c.nvml_index,
+            cuda_index=int(c.cuda_ordinal),
+            name=c.name,
+            total_mib=c.total_mib,
+            uuid=norm_uuid(c.uuid) if c.uuid else "",
         )
-        for i, c in enumerate(cards)
+        for c in imap
     )
-    return DeviceMap(entries=entries, source=source)
+    return DeviceMap(entries=entries, source=IDENTITY_MAP_SOURCE)
 
 
 _CACHE: Optional[DeviceMap] = None
+_LOGGED_UNRESOLVED = False
 
 
 def device_map(refresh: bool = False) -> DeviceMap:
     """The cached live bridge for THIS host (built once; ``refresh=True``
-    rebuilds, e.g. after a driver reload). Never raises."""
-    global _CACHE
+    rebuilds, e.g. after a driver reload). Never raises.
+
+    An unresolvable order is logged once, in full, and cached as the EMPTY
+    map: the UI then shows cards without a CUDA index, which is what "we do
+    not know" looks like. It is not cached as a guess.
+    """
+    global _CACHE, _LOGGED_UNRESOLVED
     if _CACHE is None or refresh:
         try:
             _CACHE = build_device_map()
-        except Exception:  # pragma: no cover - defensive
+        except Exception as exc:  # noqa: BLE001 - UI path, must not crash
+            if not _LOGGED_UNRESOLVED or refresh:
+                logger.warning("planner device map unavailable: %s", exc)
+                _LOGGED_UNRESOLVED = True
             _CACHE = DeviceMap(entries=(), source=None)
     return _CACHE

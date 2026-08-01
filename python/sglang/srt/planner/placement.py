@@ -144,7 +144,7 @@ class PlacementFlags:
     #: ``rank_gpu_id`` (whose values land in CUDA_VISIBLE_DEVICES) and as the
     #: default identity map ``rank i -> gpu i``. NVML/nvidia-smi enumeration
     #: order DIVERGES from CUDA order on mixed rigs; callers must translate
-    #: NVML-sampled inventories through planner.device_map before keying
+    #: NVML-sampled inventories through registry.nvml.IdentityMap before keying
     #: these dicts (an NVML-keyed inventory attributes ranks to the WRONG
     #: cards -- on the reference box rank 0 = cuda:0 is the 32 GiB 5090, not
     #: the 20 GiB 3080 that sits at nvml:0).
