@@ -49,22 +49,24 @@ rather than inferred:
     fp8_quant           sglang_per_token_quant_fp8(x)    -- FP8 act quant only
     fp8_gemm            fp8_scaled_mm(pre-quantized)     -- FP8 GEMM only
     fp8_ct_fused        apply_fp8_linear, compressed-tensors branch
-    fp8_deployed_fused  apply_fp8_linear, the branch Fp8LinearMethod takes for
-                        the deployed Qwen3.6-27B-FP8 checkpoint
+    fp8_block_fused     w8a8_block_fp8_linear, the branch Fp8LinearMethod takes
+                        for the deployed (block-quantized) Qwen3.6-27B-FP8
 
 ``int8_fused`` is not assumed to equal ``int8_quant + int8_gemm``: the
 difference between the two is the launch-gap and allocator cost that only a
 fused measurement shows, and that difference is exactly what a fusion would
 recover. It is reported.
 
-Two FP8 references, because the two FP8 checkpoints on this rig reach the
-kernels through different branches. The compressed-tensors FP8 scheme is the
-structural twin of the INT8 scheme. The deployed Qwen3.6-27B-FP8 checkpoint
-is ``quant_method: fp8``, ``activation_scheme: dynamic``, whose per-tensor
-weight scale is widened to channelwise at load time whenever cutlass fp8 is
-supported -- it ends at the same two kernels through a different code path,
-and that path is what #354 measured end to end. Neither FP8 lane re-measures
-#354; they are the per-GEMM context for it.
+Two FP8 references, because they are genuinely different kernels. The
+compressed-tensors FP8 scheme (per-token activation scale, per-channel weight
+scale, CUTLASS scaled-mm) is the structural twin of the INT8 scheme -- same
+shape of work, so it isolates "is INT8 arithmetic slower than FP8 arithmetic
+here". The deployed Qwen3.6-27B-FP8 checkpoint is something else: it carries
+``weight_block_size [128, 128]``, so ``Fp8LinearMethod`` takes its
+``block_quant`` branch (fp8.py:1132) into ``w8a8_block_fp8_linear``, with a
+group-128 activation quant and a block-scaled GEMM. That is the lane #354
+measured end to end. Neither FP8 lane re-measures #354; they are the per-GEMM
+context for it.
 
 SHAPES
 ======
@@ -211,6 +213,7 @@ class Shape:
     module: str
     layers: int  # how many layers of the model carry this GEMM
     note: str = ""
+    plans: list = field(default_factory=list)  # which shard plans produce it
     exec_n: Optional[int] = None  # capped size actually multiplied (dry run)
     exec_k: Optional[int] = None
 
@@ -227,18 +230,56 @@ class Shape:
         return self.exec_n is not None or self.exec_k is not None
 
 
+#: Two shard-plan vectors are deployed, and the final INT8-vs-FP8 comparison
+#: uses BOTH: prefill runs on the phase-optimal vector (#354's --rank-mlp-ratio,
+#: the 16,1,1 class, which loads the 5090 with almost the whole MLP), decode
+#: runs on the auto vector. A shape table for one vector only would price half
+#: the deployment.
+DEFAULT_PLANS = "auto=30,17,17;prefopt=16,1,1"
+
 #: The three shapes #255 queued for the sm120 FP8 Triton tuner
 #: (docs/rig-runbook.md, "the three shapes #255 left queued for sm120").
-#: Carried along so the INT8 numbers land on the same operating points the
-#: FP8 tuner was measured at, even when the current shard plan moves the
-#: derived shapes. They correspond to a rank with 12 q heads / 2 kv heads
-#: (qkv 7168x5120, o_proj 5120x3072) and a GDN rank with 21 value heads
-#: (out_proj 5120x2688) -- a plan close to, but not identical with, the
-#: [30,17,17] default below.
-LEGACY_255_SHAPES = [
-    ("legacy255_qkv", 7168, 5120),
-    ("legacy255_gdn_out", 5120, 2688),
-    ("legacy255_o_proj", 5120, 3072),
+#: Carried so the INT8 numbers land on the operating points the FP8 tuner was
+#: measured at. They correspond to a rank with 12 q heads / 2 kv heads (qkv
+#: 7168x5120, o_proj 5120x3072) and a GDN rank with 21 value heads (out_proj
+#: 5120x2688) -- the last one belongs to an older auto vector that neither
+#: plan above reproduces.
+#:
+#: The MLP pair below is the one #370's idle-tuner queue targets. It is the
+#: prefopt vector seen through the FP8 checkpoint's UNIT FAMILY, which is not
+#: the INT8 one:
+#:
+#:   Qwen3.6-27B-FP8 carries weight_block_size [128,128], so
+#:   _quant_block_aligned_units coarsens the dense MLP to 17408/128 = 136
+#:   units. partition_units(136, [16,1,1]) = [121, 8, 7] -> rank 0 holds
+#:   121*128 = 15488, gate_up = 30976. Those are the numbers in the FP8 boot
+#:   logs and in IDLE_TUNER_QUEUE_370.md.
+#:
+#:   Qwen3.6-27B-INT8-W8A8 is channel/token quantized with no weight block, so
+#:   its family is 17408/gcd(17408,16) = 1088 units of 16.
+#:   partition_units(1088, [16,1,1]) = [967, 61, 60] -> rank 0 holds 15472,
+#:   gate_up = 30944.
+#:
+#: Same vector, different unit family, 16 elements apart. Both are real
+#: deployed shapes; the derived prefopt rows below are the INT8 ones, and
+#: these two reference rows are the FP8 ones, kept so the two checkpoints can
+#: be read against each other at the shapes each actually runs.
+REFERENCE_SHAPES = [
+    ("ref255_qkv", 7168, 5120, "#255 FP8 tuner queue (older auto vector)"),
+    ("ref255_gdn_out", 5120, 2688, "#255 FP8 tuner queue (older auto vector)"),
+    ("ref255_o_proj", 5120, 3072, "#255 FP8 tuner queue (older auto vector)"),
+    (
+        "ref370_fp8block_mlp_gate_up",
+        30976,
+        5120,
+        "#370 idle-tuner queue: prefopt 16,1,1 x FP8 128-block unit family",
+    ),
+    (
+        "ref370_fp8block_mlp_down",
+        5120,
+        15488,
+        "#370 idle-tuner queue: prefopt 16,1,1 x FP8 128-block unit family",
+    ),
 ]
 
 
@@ -418,6 +459,7 @@ class Kernels:
     per_token_quant_fp8: Optional[Callable]
     fp8_scaled_mm: Optional[Callable]
     apply_fp8_linear: Optional[Callable]
+    block_fp8_linear: Optional[Callable]
     fp8_dtype: torch.dtype
     stub: bool
     missing: list = field(default_factory=list)
@@ -450,6 +492,18 @@ def _stub_fp8_scaled_mm(a, b, sa, sb, out_dtype, bias=None):
     return _stub_int8_scaled_mm(a, b, sa, sb, out_dtype, bias)
 
 
+def _stub_block_fp8_linear(
+    input, weight, block_size, weight_scale, input_scale=None, bias=None
+):
+    """Stand-in for the block-wise fp8 linear. Weight is (n, k) here -- the
+    block path does NOT pre-transpose, unlike the per-channel one."""
+    acc = input.to(torch.float32) @ weight.to(torch.float32).t()
+    acc = acc * float(weight_scale.mean())
+    if bias is not None:
+        acc = acc + bias.to(torch.float32)
+    return acc.to(input.dtype)
+
+
 def load_kernels(dry_run: bool) -> Kernels:
     fp8_dtype = torch.float8_e4m3fn
     if dry_run:
@@ -465,6 +519,7 @@ def load_kernels(dry_run: bool) -> Kernels:
             per_token_quant_fp8=lambda x: _stub_per_token_quant_fp8(x, fp8_dtype),
             fp8_scaled_mm=_stub_fp8_scaled_mm,
             apply_fp8_linear=None,  # replaced by a stub closure in build_lanes
+            block_fp8_linear=_stub_block_fp8_linear,
             fp8_dtype=fp8_dtype,
             stub=True,
         )
@@ -494,6 +549,19 @@ def load_kernels(dry_run: bool) -> Kernels:
     except Exception as ex:
         apply_fp8_linear = None
         missing.append(f"apply_fp8_linear: {type(ex).__name__}: {ex}")
+    try:
+        # Same dispatcher Fp8LinearMethod uses for a block-quantized
+        # checkpoint (fp8.py:1132 `if self.block_quant:` ->
+        # self.w8a8_block_fp8_linear). Resolved for the current device, so it
+        # must be called after the device is selected.
+        from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
+            dispatch_w8a8_block_fp8_linear,
+        )
+
+        block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+    except Exception as ex:
+        block_fp8_linear = None
+        missing.append(f"dispatch_w8a8_block_fp8_linear: {type(ex).__name__}: {ex}")
 
     return Kernels(
         per_token_quant_int8=per_token_quant_int8,
@@ -501,6 +569,7 @@ def load_kernels(dry_run: bool) -> Kernels:
         per_token_quant_fp8=sglang_per_token_quant_fp8,
         fp8_scaled_mm=fp8_scaled_mm,
         apply_fp8_linear=apply_fp8_linear,
+        block_fp8_linear=block_fp8_linear,
         fp8_dtype=fp8_dtype,
         stub=False,
         missing=missing,
@@ -519,9 +588,13 @@ ALL_LANES = [
     "fp8_quant",
     "fp8_gemm",
     "fp8_ct_fused",
-    "fp8_deployed_fused",
+    "fp8_block_fused",
 ]
 OPTIONAL_LANES: list = []
+
+#: Qwen3.6-27B-FP8's ``weight_block_size``. Also the block the #255/#370
+#: idle-tuner queue tunes for (``--block-n 128 --block-k 128``).
+FP8_BLOCK = (128, 128)
 
 
 @dataclass
@@ -538,6 +611,8 @@ class Weights:
     ws_i8: torch.Tensor
     w_f8_t: Optional[torch.Tensor]
     ws_f8_chan: Optional[torch.Tensor]
+    w_f8_blk: Optional[torch.Tensor]  # (n, k), NOT transposed
+    ws_f8_blk: Optional[torch.Tensor]  # (ceil(n/128), ceil(k/128)) float32
 
 
 @dataclass
@@ -565,13 +640,28 @@ def build_weights(shape: Shape, dev: torch.device, kn: Kernels, seed: int) -> We
     w_i8 = torch.randint(-127, 127, (n, k), generator=g, dtype=torch.int8).to(dev)
     ws_i8 = torch.rand(n, 1, generator=g, dtype=torch.float32).to(dev).add_(0.01)
 
-    w_f8_t = ws_f8_chan = None
+    w_f8_t = ws_f8_chan = w_f8_blk = ws_f8_blk = None
     if kn.per_token_quant_fp8 is not None:
         w_f8_t = w_bf16.to(kn.fp8_dtype).t()
         ws_f8_chan = (
             torch.rand(n, 1, generator=g, dtype=torch.float32).to(dev).add_(0.01)
         )
-    return Weights(w_bf16, w_i8.t(), ws_i8, w_f8_t, ws_f8_chan)
+    if kn.block_fp8_linear is not None:
+        # Block-quantized layout: weight stays (n, k) and the scale is one
+        # value per 128x128 tile (Qwen3.6-27B-FP8's weight_block_size).
+        w_f8_blk = w_bf16.to(kn.fp8_dtype)
+        bn, bk = FP8_BLOCK
+        ws_f8_blk = (
+            torch.rand(
+                (n + bn - 1) // bn,
+                (k + bk - 1) // bk,
+                generator=g,
+                dtype=torch.float32,
+            )
+            .to(dev)
+            .add_(0.01)
+        )
+    return Weights(w_bf16, w_i8.t(), ws_i8, w_f8_t, ws_f8_chan, w_f8_blk, ws_f8_blk)
 
 
 def build_operand(
@@ -649,35 +739,23 @@ def build_lanes(op: Operand, kn: Kernels, want: Sequence[str]) -> dict:
                     )
 
                 out["fp8_ct_fused"] = _fp8_stub_fused
-        if "fp8_deployed_fused" in want:
-            # The lane the deployed Qwen3.6-27B-FP8 checkpoint actually runs.
-            # Fp8LinearMethod (fp8.py:1163) calls apply_fp8_linear with
-            # compressed_tensor_quant left at False, use_per_token_if_dynamic
-            # False and input_scale None (activation_scheme "dynamic"); the
-            # per-tensor checkpoint scale was widened to CHANNELWISE at load
-            # (fp8.py:~935 convert_to_channelwise) whenever cutlass fp8 is
-            # supported. So the quant step is sglang_per_token_quant_fp8 and
-            # the GEMM is fp8_scaled_mm -- the same two kernels as the
-            # compressed-tensors twin, reached through a different branch.
-            if kn.apply_fp8_linear is not None:
-                out["fp8_deployed_fused"] = lambda: kn.apply_fp8_linear(
-                    input=op.x,
-                    weight=op.w.w_f8_t,
-                    weight_scale=op.w.ws_f8_chan,
-                    input_scale=None,
-                    bias=None,
-                    use_per_token_if_dynamic=False,
-                    compressed_tensor_quant=False,
-                )
-            elif kn.fp8_scaled_mm is not None:
-
-                def _fp8_dep_stub():
-                    q, s = kn.per_token_quant_fp8(op.x)
-                    return kn.fp8_scaled_mm(
-                        q, op.w.w_f8_t, s, op.w.ws_f8_chan, out_dtype=dt, bias=None
-                    )
-
-                out["fp8_deployed_fused"] = _fp8_dep_stub
+    if "fp8_block_fused" in want and kn.block_fp8_linear is not None:
+        # The lane the deployed Qwen3.6-27B-FP8 checkpoint actually runs.
+        # Its quantization_config carries weight_block_size [128, 128], so
+        # Fp8LinearMethod takes the `if self.block_quant:` branch
+        # (fp8.py:1132) into w8a8_block_fp8_linear and NEVER reaches
+        # apply_fp8_linear. Different activation quant
+        # (per_token_group_quant_fp8 at group 128, not per-token) and a
+        # different GEMM -- so the per-channel lanes above are the structural
+        # twin of INT8, and this one is what #354 measured end to end.
+        out["fp8_block_fused"] = lambda: kn.block_fp8_linear(
+            input=op.x,
+            weight=op.w.w_f8_blk,
+            block_size=list(FP8_BLOCK),
+            weight_scale=op.w.ws_f8_blk,
+            input_scale=None,
+            bias=None,
+        )
     return out
 
 
@@ -796,7 +874,7 @@ def run_point(
         derived["int8_fused_minus_parts_ms"] = fused - parts
     for fp8_lane, key in (
         ("fp8_ct_fused", "int8_over_fp8_ct"),
-        ("fp8_deployed_fused", "int8_over_fp8_deployed"),
+        ("fp8_block_fused", "int8_over_fp8_block"),
     ):
         if "int8_fused" in lanes and fp8_lane in lanes:
             f8 = lanes[fp8_lane]["median_ms"]
@@ -891,9 +969,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     ap.add_argument("--config", default=DEFAULT_CONFIG, help="checkpoint config.json")
     ap.add_argument("--tp-size", type=int, default=3)
-    ap.add_argument("--ratio", default="30,17,17", help="--rank-tp-ratio vector")
     ap.add_argument(
-        "--mlp-ratio", default="", help="--rank-mlp-ratio vector (default: --ratio)"
+        "--plans",
+        default=DEFAULT_PLANS,
+        help="semicolon-separated label=vector shard plans to derive shapes "
+        f"for (default {DEFAULT_PLANS!r}: the auto vector decode runs on and "
+        "the phase-optimal vector prefill runs on)",
+    )
+    ap.add_argument(
+        "--ratio",
+        default="",
+        help="single --rank-tp-ratio vector; collapses --plans to one plan",
+    )
+    ap.add_argument(
+        "--mlp-ratio", default="", help="--rank-mlp-ratio vector (with --ratio)"
     )
     ap.add_argument(
         "--rank", type=int, default=0, help="which rank's shard shapes to bench"
@@ -914,9 +1003,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="cap N and K of the tensors actually multiplied (0 = no cap)",
     )
     ap.add_argument(
-        "--no-legacy255",
+        "--no-reference-shapes",
         action="store_true",
-        help="omit the three #255 FP8-tuner shapes",
+        help="omit the #255 tuner shapes and the #370 FP8-block MLP pair",
     )
     ap.add_argument("--seed", type=int, default=368)
     ap.add_argument("--out", default="", help="JSON output path")
@@ -942,6 +1031,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ("sglang_per_token_quant_fp8", kn.per_token_quant_fp8),
             ("fp8_scaled_mm", kn.fp8_scaled_mm),
             ("apply_fp8_linear", kn.apply_fp8_linear),
+            ("w8a8_block_fp8_linear (dispatched)", kn.block_fp8_linear),
         ):
             print(f"{'OK  ' if obj is not None else 'MISS'} {label}")
         for line in kn.missing:
@@ -949,29 +1039,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"cuda_available={torch.cuda.is_available()}")
         return 0 if not kn.missing else 1
 
-    ratio = int_list(args.ratio)
-    mlp_ratio = int_list(args.mlp_ratio) if args.mlp_ratio else list(ratio)
-    if args.tp_size > 1 and len(ratio) != args.tp_size:
-        ap.error(f"--ratio has {len(ratio)} entries but --tp-size is {args.tp_size}")
     if not 0 <= args.rank < max(1, args.tp_size):
         ap.error("--rank out of range")
 
+    # A plan is label=vector. --ratio (with optional --mlp-ratio) collapses
+    # the sweep to one plan, for a one-off question about a specific vector.
+    if args.ratio:
+        base = int_list(args.ratio)
+        plans = [("custom", base, int_list(args.mlp_ratio) if args.mlp_ratio else base)]
+    else:
+        plans = []
+        for chunk in args.plans.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            label, _, vec = chunk.partition("=")
+            if not vec:
+                ap.error(f"--plans entry {chunk!r} is not label=vector")
+            v = int_list(vec)
+            plans.append((label, v, v))
+    for label, v, _ in plans:
+        if args.tp_size > 1 and len(v) != args.tp_size:
+            ap.error(
+                f"plan {label!r} has {len(v)} entries but --tp-size is {args.tp_size}"
+            )
+
     with open(args.config) as fh:
         cfg = json.load(fh)
-    shapes, cases, facts = derive_shapes(cfg, args.tp_size, ratio, mlp_ratio, args.rank)
+
+    shapes: list = []
+    by_shape: dict = {}
+    cases: list = []
+    facts_by_plan: dict = {}
+    plan_layers: dict = {}
+    for label, base, mlp in plans:
+        derived_shapes, plan_cases, facts = derive_shapes(
+            cfg, args.tp_size, base, mlp, args.rank
+        )
+        cases.extend(plan_cases)
+        facts_by_plan[label] = facts
+        # Counted before dedupe: two modules of one plan can share a GEMM
+        # (attn_o and gdn_out are both 5120x3072 under the auto vector), and
+        # the per-token launch count must still see both.
+        plan_layers[label] = sum(s.layers for s in derived_shapes)
+        for s in derived_shapes:
+            key = (s.n, s.k)
+            if key in by_shape:
+                # Plans (or modules) that land on the same GEMM are measured
+                # once and attributed to all -- the kernel cannot tell them
+                # apart.
+                by_shape[key].plans.append(f"{label}/{s.name} x{s.layers}")
+                continue
+            s.plans = [f"{label}/{s.name} x{s.layers}"]
+            s.name = f"{label}_{s.name}"
+            by_shape[key] = s
+            shapes.append(s)
+    facts = facts_by_plan[plans[0][0]]
     provenance = cross_check_partition(cases)
 
-    if not args.no_legacy255:
-        seen = {(s.n, s.k) for s in shapes}
-        for name, n, k in LEGACY_255_SHAPES:
-            if (n, k) in seen:
-                continue  # the current plan already produces this exact GEMM
-            shapes.append(
-                Shape(
-                    name, n, k, "#255 FP8 tuner queue", 0, "reference operating point"
-                )
-            )
-            seen.add((n, k))
+    if not args.no_reference_shapes:
+        for name, n, k, why in REFERENCE_SHAPES:
+            if (n, k) in by_shape:
+                by_shape[(n, k)].plans.append(name)
+                continue
+            s = Shape(name, n, k, why, 0, "reference operating point", [name])
+            by_shape[(n, k)] = s
+            shapes.append(s)
 
     # Dry run defaults: real shape table, small tensors, few rounds.
     if args.dry_run:
@@ -1012,10 +1145,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Task #368 INT8 decode microbench -- shapes for rank {args.rank} of TP={args.tp_size}"
     )
     print(f"config      {args.config}")
-    print(f"ratio       {ratio}   mlp-ratio {mlp_ratio}")
+    for label, base, mlp in plans:
+        f = facts_by_plan[label]
+        print(
+            f"plan        {label:<10} tp {base}  mlp {mlp}  -> q {f['local_q_heads']} "
+            f"kv {f['local_kv_heads']} gdn-k {f['local_gdn_k_heads']} "
+            f"intermediate {f['local_intermediate']}"
+        )
     print(f"partition   {provenance}")
     print("=" * 78)
-    print(f"{'shape':<20}{'N(out)':>9}{'K(in)':>9}{'layers':>8}  module")
+    print(f"{'shape':<30}{'N(out)':>9}{'K(in)':>9}{'layers':>8}  module")
     illegal = []
     for s in shapes:
         # int8_scaled_mm's own N % 8 / K % 16 rules
@@ -1023,17 +1162,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # violates them would abort inside CUTLASS, so name it here.
         if s.n % 8 or s.k % 16:
             illegal.append(f"{s.name} N={s.n} K={s.k}")
-        print(f"{s.name:<20}{s.n:>9}{s.k:>9}{s.layers:>8}  {s.module}")
+        print(f"{s.name:<30}{s.n:>9}{s.k:>9}{s.layers:>8}  {s.module}")
+        if len(s.plans) > 1:
+            print(f"{'':<30}also: {', '.join(s.plans[1:])}")
         if s.note:
-            print(f"{'':<20}{s.note}")
+            print(f"{'':<30}{s.note}")
         if s.capped:
-            print(f"{'':<20}[dry run] tensors multiplied at N={s.run_n} K={s.run_k}")
+            print(f"{'':<30}[dry run] tensors multiplied at N={s.run_n} K={s.run_k}")
     print("-" * 78)
-    n_gemms = sum(s.layers for s in shapes)
-    print(
-        f"INT8 linear layers traversed per decoded token on this rank: "
-        f"{n_gemms}  ({2 * n_gemms} kernel launches -- quant + GEMM each)"
-    )
+    for label, n_gemms in plan_layers.items():
+        print(
+            f"plan {label}: {n_gemms} INT8 linear layers per decoded token on "
+            f"this rank ({2 * n_gemms} kernel launches -- quant + GEMM each)"
+        )
     for line in facts["not_quantized_by_ignore_list"]:
         print(f"  not INT8: {line}")
     if illegal:
@@ -1095,9 +1236,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for k, v in point["lanes"].items()
                     if "#A2" not in k
                 }
-                print(f"{s.name:<20} M={m:<6} {row['wall_s']:>6.2f}s  {med}")
+                wall = row["wall_s"]
+                print(f"{s.name:<30} M={m:<6} {wall:>6.2f}s  {med}")
             else:
-                print(f"{s.name:<20} M={m:<6} {point}")
+                print(f"{s.name:<30} M={m:<6} {point}")
         del w_a, w_b
         if cuda:
             torch.cuda.empty_cache()
@@ -1111,13 +1253,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "dry_run": bool(args.dry_run),
         "environment": env,
         "model_config": args.config,
-        "model_facts": facts,
+        "model_facts": facts_by_plan,
         "plan": {
             "tp_size": args.tp_size,
-            "ratio": ratio,
-            "mlp_ratio": mlp_ratio,
             "rank": args.rank,
+            "plans": [
+                {"label": label, "ratio": base, "mlp_ratio": mlp}
+                for label, base, mlp in plans
+            ],
             "partition_provenance": provenance,
+            "int8_layers_per_token_per_plan": plan_layers,
         },
         "settings": {
             "m": m_list,
