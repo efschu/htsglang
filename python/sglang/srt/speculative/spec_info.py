@@ -26,6 +26,13 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
+#: Names the ARG HOOK resolves before the enum sees them
+#: (``arg_groups/speculative_hook._resolve_speculative_algorithm_alias``).
+#: They are valid user input even though no enum member carries them, so the
+#: validator must accept them and the error message must list them.
+SPECULATIVE_ALGORITHM_ALIASES: frozenset[str] = frozenset({"NEXTN"})
+
+
 class SpeculativeAlgorithm(Enum):
     """Builtin speculative decoding algorithms. Plugin-registered ones are
     ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and
@@ -57,6 +64,25 @@ class SpeculativeAlgorithm(Enum):
         if spec is not None:
             return spec
         raise ValueError(f"Unknown speculative algorithm name: {name}")
+
+    @classmethod
+    def known_names(cls) -> List[str]:
+        """Every name ``from_string`` accepts right now, sorted (#379).
+
+        THE one source of truth for "what may --speculative-algorithm say":
+        the enum members plus whatever plugins have registered by the time
+        this is called, plus the aliases the arg hook resolves before the
+        enum ever sees the string. A validator that keeps its own list drifts
+        the moment an algorithm is added -- which is exactly how an
+        unregistered name reached the runtime and surfaced as an unrelated
+        guard's unactionable message.
+        """
+        from sglang.srt.speculative.spec_registry import registered_names
+
+        names = {member.name for member in cls}
+        names.update(registered_names())
+        names.update(SPECULATIVE_ALGORITHM_ALIASES)
+        return sorted(names)
 
     @classmethod
     def register(
