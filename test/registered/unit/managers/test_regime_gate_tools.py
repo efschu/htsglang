@@ -9,6 +9,7 @@ What is pinned directly here is the trace format, because both gates read it
 and one of its fields exists for a reason a reader would otherwise remove.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -30,6 +31,21 @@ _SCRIPTS = os.path.abspath(
 _PYTHON_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "python")
 )
+
+
+def _load_bands():
+    """``scripts/regime_gates/bands.py`` as a module.
+
+    Not on the import path (it is a script, not a package), and the
+    distributional statistic has to be pinned directly rather than only
+    through the script's own exit code.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_gate3_bands", os.path.join(_SCRIPTS, "bands.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _drive(obs, rounds, *, prefill=True, held=40_000, ms=10.0):
@@ -205,6 +221,163 @@ class TestGateToolSmokes(CustomTestCase):
             proc = self._run("f2_replay.py", "--trace", path)
             self.assertIn("recorded", proc.stdout)
             self.assertNotIn("cannot be replayed", proc.stdout)
+
+    def test_the_gate_3_band_smoke_passes(self):
+        proc = self._run("bands.py", "--smoke")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SMOKE OK", proc.stdout)
+
+    def test_the_gate_3_falsifier_passes_and_shows_the_old_false_alarm(self):
+        """The three cases that justify the distributional statistic.
+
+        The first one is the false alarm of record and it must still be
+        visible: the retained pointwise path reports ``ARMS_DISSIMILAR`` on
+        two arms with the SAME duty cycle whose bursts landed on different
+        boundary indices, which is what two boots of one workload always do.
+        """
+        proc = self._run("bands.py", "--falsify")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FALSIFIER OK", proc.stdout)
+        self.assertIn("OLD pointwise : band=1  ARMS_DISSIMILAR", proc.stdout)
+
+
+class TestGate3DistributionalStatistic(CustomTestCase):
+    """#363 gate 3: the statistic is chosen per signal, and both guards live.
+
+    The pointwise band assumes the value at position ``i`` describes the same
+    thing in both runs. #388 made the shares near-binary at
+    ``window_rounds = 64``, so bursts land on different boundary indices --
+    they must, the re-record's arms had 41 and 56 active boundaries -- and the
+    pointwise band went to 1 on every signal. These pin the replacement.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.bands = _load_bands()
+
+    def test_every_signal_is_classified(self):
+        """A new classifier input must not silently inherit a statistic."""
+        self.assertEqual(set(self.bands.SIGNALS), set(self.bands.STATISTIC))
+        self.assertEqual(
+            self.bands.STATISTIC["rank_ms_spread_pct"],
+            self.bands.STATISTIC_POINTWISE,
+            "the pointwise path is kept, not blanket-replaced",
+        )
+        for name in ("prefill_share", "decode_share", "occupancy"):
+            self.assertEqual(
+                self.bands.STATISTIC[name], self.bands.STATISTIC_DISTRIBUTIONAL
+            )
+
+    def test_the_duty_cycle_is_the_fraction_at_or_above_the_threshold(self):
+        self.assertEqual(self.bands.duty_cycle([0, 0, 1, 1], 0.35), 0.5)
+        self.assertEqual(self.bands.duty_cycle([0.35, 0.34], 0.35), 0.5)
+        self.assertEqual(self.bands.duty_cycle([], 0.35), 0.0)
+
+    def test_a_shifted_burst_with_the_same_duty_is_not_a_difference(self):
+        """The exact false alarm of record, as an assertion.
+
+        Ten prefill-heavy windows out of forty in both arms, early in one and
+        late in the other. Pointwise this is the maximum possible band; the
+        thing the gate actually asks -- how often does the signal cross 0.35 --
+        is identical.
+        """
+        a = self.bands._bursts(40, range(0, 10))
+        b = self.bands._bursts(40, range(20, 30))
+        va = [r["prefill_share"] for r in a]
+        vb = [r["prefill_share"] for r in b]
+        self.assertEqual(
+            self.bands.signal_band(va, vb), 1.0, "pointwise: maximally different"
+        )
+        self.assertEqual(self.bands.duty_cycle(va, 0.35), 0.25)
+        self.assertEqual(self.bands.duty_cycle(vb, 0.35), 0.25)
+        worst = self.bands.duty_disagreement(va, vb, [0.35, 0.15])
+        self.assertEqual(worst["delta"], 0.0)
+        self.assertLess(worst["z"], self.bands.DISSIMILAR_Z)
+
+    def test_a_real_duty_difference_still_trips_arms_dissimilar(self):
+        """The guard is re-stated for a distribution, not dropped."""
+        va = [r["prefill_share"] for r in self.bands._bursts(40, range(0, 10))]
+        vb = [r["prefill_share"] for r in self.bands._bursts(40, range(0, 30))]
+        worst = self.bands.duty_disagreement(va, vb, [0.35, 0.15])
+        self.assertAlmostEqual(worst["delta"], 0.5)
+        self.assertGreater(worst["z"], self.bands.DISSIMILAR_Z)
+
+    def test_the_guard_reads_the_constants_thresholds_and_not_every_value(self):
+        """Why not a sup-over-all-thresholds (Kolmogorov-Smirnov) form.
+
+        Two arms each holding steady at slightly different levels are totally
+        separated at any threshold between them, so a KS-style guard calls
+        them incomparable -- but that offset is a real, reproducible bias and
+        it IS the band. At the constants' own thresholds they agree, and the
+        0.03 offset survives as the measurement.
+        """
+        va, vb = [0.50] * 20, [0.53] * 20
+        between = self.bands.duty_disagreement(va, vb, [0.515])
+        self.assertEqual(between["delta"], 1.0)  # what a KS form would see
+        at_constants = self.bands.duty_disagreement(va, vb, [0.90, 0.70])
+        self.assertEqual(at_constants["delta"], 0.0)
+        self.assertEqual(self.bands.thresholds_for("decode_share"), [0.90, 0.70])
+
+    def test_a_barely_moving_signal_reports_the_same_band_as_before(self):
+        """Regression pin against the traces the first version was built on.
+
+        The distributional band is the peak disagreement, and for a flat
+        signal that is the number the pointwise band reported.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self.bands._pair(
+                tmp,
+                [{"decode_share": 0.50, "prefill_share": None} for _ in range(20)],
+                [{"decode_share": 0.53, "prefill_share": None} for _ in range(20)],
+            )
+            new = self.bands.report(a, b)["bands"]["decode_share"]
+            old = self.bands._old_pointwise(a, b, "decode_share")
+        self.assertAlmostEqual(new["band"], 0.03)
+        self.assertAlmostEqual(old["band"], 0.03)
+        self.assertEqual(new["status"], old["status"])
+
+    def test_underpowered_still_blocks_under_the_new_statistic(self):
+        """A distribution from two windows is a number, not a measurement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self.bands._pair(
+                tmp, self.bands._bursts(40, range(0, 10)), self.bands._bursts(2, [0])
+            )
+            rep = self.bands.report(a, b)
+        self.assertEqual(rep["bands"]["prefill_share"]["status"], "UNDERPOWERED")
+        self.assertFalse(rep["passed"])
+
+    def test_a_crossing_rate_smaller_than_its_own_disagreement_is_inside_band(self):
+        """The verdict the duty check exists to produce.
+
+        One arm never crosses 0.35 and the other crosses in two windows out of
+        forty. The threshold is reachable, and the disagreement is small enough
+        in absolute terms that the comparability guard stays quiet -- but the
+        crossing rate is smaller than twice its own run-to-run band, so the
+        decision does not reproduce and the verdict is ``INSIDE_BAND``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self.bands._pair(
+                tmp, self.bands._bursts(40, []), self.bands._bursts(40, [0, 1])
+            )
+            rep = self.bands.report(a, b)
+        self.assertEqual(rep["bands"]["prefill_share"]["status"], "OK")
+        vp = next(v for v in rep["constants"] if v["constant"] == "enter_prefill")
+        self.assertEqual(vp["verdict"], "INSIDE_BAND")
+
+    def test_every_signal_is_read_on_the_active_boundaries_only(self):
+        """Including ``rank_ms_spread_pct``, which goes stale rather than absent.
+
+        An idle window carries no forward. The shares are ``None`` there and
+        drop out by themselves; the other three report a real or stale value
+        and used to drag the band with it.
+        """
+        rows = [
+            {"prefill_share": 1.0, "decode_share": 0.0, "rank_ms_spread_pct": 3.0},
+            {"prefill_share": None, "decode_share": None, "rank_ms_spread_pct": 99.0},
+        ]
+        self.assertEqual(self.bands.series(rows, "rank_ms_spread_pct"), [3.0])
+        self.assertEqual(self.bands.series(rows, "prefill_share"), [1.0])
 
 
 if __name__ == "__main__":
