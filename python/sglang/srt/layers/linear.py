@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -21,6 +22,9 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
     attn_q_partition_groups,
@@ -29,9 +33,6 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_partition_sizes,
     tp_plan_active,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -153,8 +154,66 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
+def _marlin_min_thread_by_block_idx() -> tuple:
+    """Marlin's per-axis shard minimum, by ``block_idx`` (0 = output/n,
+    1 = input/k): ``(GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K)``.
+
+    IMPORTED, not restated -- these are the constants
+    ``marlin_utils.verify_marlin_supports_shape`` checks
+    ``output_size_per_partition`` and ``input_size_per_partition`` against, and
+    the five existing siblings already coarsen to them. They are STRICTER than
+    the repack tiles (``marlin.cuh``: tile_n 64, tile_k 16): k needs 128, so
+    aligning to the repack tile alone still fails the GEMM's own check.
+    """
+    from sglang.srt.layers.quantization.marlin_utils import (
+        GPTQ_MARLIN_MIN_THREAD_K,
+        GPTQ_MARLIN_MIN_THREAD_N,
+    )
+
+    return (GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K)
+
+
+#: Quant-config classes that repack through marlin on SOME supported device
+#: and may expose no ``weight_block_size`` to coarsen by. Matched by class
+#: name so this module does not import every quantization backend.
+_MARLIN_PACKABLE_CONFIGS = ("fp8config", "compressedtensorsconfig", "fbgemmfp8config")
+
+
+def _marlin_packable_family(quant_config) -> bool:
+    """Could THIS CHECKPOINT be marlin-packed on some rank? Rank-uniform.
+
+    DELIBERATELY DEVICE-FREE, and that is the whole design of this predicate.
+    The obvious implementation -- read the resolved scheme's ``use_marlin``,
+    which is what ``CompressedTensorsW8A16Fp8`` actually sets -- is WRONG here,
+    and wrong in a way that is worse than the bug it fixes.
+
+    ``use_marlin`` is rank-local. ``CompressedTensorsW8A8Fp8.get_min_capability()
+    is 89, so on a mixed rig the SAME checkpoint resolves differently per rank:
+    measured on this one (#377), TP0 on the 5090 (sm120) took the native FP8
+    scheme while TP1/TP2 on the 3080s (sm86) fell back to
+    ``CompressedTensorsW8A16Fp8`` + marlin -- and only TP1/TP2 raised. A unit
+    count derived from that verdict would differ BETWEEN RANKS, so the ranks
+    would disagree about the shard plan: silently mismatched shapes instead of
+    a loud repack abort. ``modelopt_fp4_uneven_tp_block`` makes the same
+    argument for the same reason -- the block must be a property of the
+    checkpoint, not of the local device.
+
+    So the question asked here is not "does this rank use marlin" but "can this
+    checkpoint be marlin-packed anywhere in the group", answered from the
+    config's class alone. Coarsening is only ever safe-but-coarser, so applying
+    it on a rank that will not use marlin costs a slightly coarser split and
+    never correctness -- while keeping every rank's plan identical.
+    """
+    if quant_config is None:
+        return False
+    return type(quant_config).__name__.lower() in _MARLIN_PACKABLE_CONFIGS
+
+
 def _quant_block_aligned_units(
-    total: int, units: Optional[int], quant_config, block_idx: int
+    total: int,
+    units: Optional[int],
+    quant_config,
+    block_idx: int,
 ) -> Optional[int]:
     """Coarsen an element-granular unit family so every rank's shard is a
     multiple of the weight-quant block (block-quantized FP8 etc.).
@@ -180,12 +239,39 @@ def _quant_block_aligned_units(
     # linear-attention output on all but the last rank (uneven-TP GGUF garbage).
     if block_idx == 0 and getattr(quant_config, "get_name", lambda: "")() == "gguf":
         return units
-    block = getattr(quant_config, "weight_block_size", None)
+    raw = getattr(quant_config, "weight_block_size", None)
+    block = raw[block_idx] if raw else None
+    # MARLIN (#383). A marlin-packed weight is repacked into 16x64 tiles, so
+    # the per-rank shard must be a multiple of the tile on its axis -- 64 on
+    # the output dim, 16 on the input dim. That constraint is INDEPENDENT of
+    # weight_block_size, and the checkpoints that hit it are exactly the ones
+    # without it: FP8-dynamic (no block size), GPTQ, AWQ. The #82 16-element
+    # MLP coarsening is finer than 64, so an uneven split lands mid-tile and
+    # the repack refuses at weight load -- measured on Mistral-Small-24B FP8
+    # at ratio [29607,17780,17780]: gate_up 65536 in 4096 units partitions to
+    # [29776, 17888, 17872] and dies with "size_n = 17888 is not divisible by
+    # tile_n_size = 64" (#377). Sixth sibling of the alignment family --
+    # and the one whose config exposes NO weight_block_size to coarsen by,
+    # which is why the other five (group-size based) never reached it.
+    #
+    # lcm, not max: for the power-of-two blocks that occur (128, 64, 32) they
+    # are the same number, and lcm stays correct if a block size ever is not a
+    # multiple of the tile.
+    # Only when NO sibling has already claimed this config. A config that
+    # exposes a block has had its alignment decided by the family member that
+    # knows its kernel -- AWQ/GPTQ/AutoRound/NVFP4 fold marlin's 128 in
+    # already, and INT8-W8A8 deliberately folds only 16 because its path is
+    # NOT marlin. Folding 64 on top of an existing block would silently
+    # re-plan those vehicles; measured, it changes the INT8-W8A8 dense MLP
+    # family (block 16 -> lcm 64), which is the fork's default serving model.
+    # The gap this closes is exactly the configs that expose nothing.
+    if block is None and _marlin_packable_family(quant_config):
+        block = _marlin_min_thread_by_block_idx()[block_idx]
     if not block:
         return units
     from sglang.srt.distributed.utils import block_aligned_units
 
-    return block_aligned_units(total, units, block[block_idx])
+    return block_aligned_units(total, units, block)
 
 
 class LinearBase(torch.nn.Module):
@@ -451,7 +537,9 @@ class ColumnParallelLinear(LinearBase):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         _layer_quant_config = (
-            None if isinstance(self.quant_method, UnquantizedLinearMethod) else quant_config
+            None
+            if isinstance(self.quant_method, UnquantizedLinearMethod)
+            else quant_config
         )
         self.tp_units = _quant_block_aligned_units(
             _units_basis, self.tp_units, _layer_quant_config, 0
@@ -1182,8 +1270,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
             else:
                 shard_offset = (
-                    (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1)
-                    // block_n
+                    (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
                 ) // self.tp_size
                 shard_size = (
                     (self.output_sizes[loaded_shard_id] + block_n - 1)
@@ -1311,10 +1398,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.tp_q_groups = attn_q_partition_groups(
                     self.total_num_kv_heads, tp_size
                 )
-                if (
-                    q_shard_groups is not None
-                    and q_shard_groups != self.tp_q_groups
-                ):
+                if q_shard_groups is not None and q_shard_groups != self.tp_q_groups:
                     raise ValueError(
                         f"QKV q_shard_groups {q_shard_groups} disagrees with "
                         f"the kv-derived value {self.tp_q_groups} "
@@ -1877,7 +1961,9 @@ class RowParallelLinear(LinearBase):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         _layer_quant_config = (
-            None if isinstance(self.quant_method, UnquantizedLinearMethod) else quant_config
+            None
+            if isinstance(self.quant_method, UnquantizedLinearMethod)
+            else quant_config
         )
         self.tp_units = _quant_block_aligned_units(
             input_size, tp_units, _layer_quant_config, 1
@@ -1987,9 +2073,7 @@ class RowParallelLinear(LinearBase):
                 weight_shape = list(loaded_weight.shape)
                 weight_shape[input_dim] = byte_size
                 param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
-                param.data.copy_(
-                    loaded_weight.narrow(input_dim, byte_start, byte_size)
-                )
+                param.data.copy_(loaded_weight.narrow(input_dim, byte_start, byte_size))
                 return
             weight_shape = list(loaded_weight.shape)
             if input_dim:
