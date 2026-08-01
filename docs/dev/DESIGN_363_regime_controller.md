@@ -1146,7 +1146,8 @@ range.
 ## 17. #388 — the retired-batch attribution, and the alignment method
 
 Desk only, no cards. Two items: the defect §15.3 named and the method change
-§16.2 deferred. Nothing was re-recorded and no constant was re-tuned.
+§16.2 deferred. The two archived gate-3 traces were re-analysed with the fixed
+method; nothing was re-recorded and no constant was re-tuned.
 
 ### 17.1 Root cause: `is_prefill_only` is a request kind, not a phase
 
@@ -1202,13 +1203,57 @@ of nothing but prefill forwards; the new one reports 1.0. A mixed window reads
 0.5 under the fix and 0.0 under the old code — the two shapes were
 indistinguishable in every trace recorded so far.
 
+### 17.3 The alignment method, applied and re-analysed
+
+`scripts/regime_gates/bands.py`: `occupancy` and `queued_prompt_tokens` are
+now restricted to ACTIVE boundaries (`ACTIVE_ONLY_SIGNALS`), the same
+subsequence the shares already get. The report marks restricted signals with
+`*` and prints each arm's active count, because a restriction the analysis
+applied has to be visible in the analysis's own output.
+
+`UNDERPOWERED` was added to the blocking set. The runsheet's table already
+said only `CLEARS` is a pass, and the omission became reachable the moment
+these two signals stopped drawing thousands of idle samples.
+
+Re-analysis of the SAME two archived traces (no cards):
+
+| signal | before | after |
+|---|---|---|
+| `occupancy` | band 0.164864, 15 504 paired, **ARMS_DISSIMILAR** | band **0.0823**, 29 paired, **OK** |
+| `queued_prompt_tokens` | band 74 802, 15 504 paired, **ARMS_DISSIMILAR** | band **64 116**, 29 paired, **OK** |
+
+`ARMS_DISSIMILAR` is gone: it was an alignment artifact, exactly as §16.2
+predicted. The constants those two signals carry:
+
+* `kv_ascend_mark = 0.85` → still **UNREACHED**, now for the honest reason —
+  occupancy genuinely peaked at 0.1649, and the comparability failure is no
+  longer standing in front of that reading.
+* `PRESTAGE_SINGLE_PROMPT_TOKENS = 8192` → **NO_GAP** (reached: the queue mass
+  peaked at 74 802). Worth carrying, though the report does not judge it: the
+  signal's band is **64 116 on a peak of 74 802**, i.e. 86 % of its own range,
+  and it clears the ARMS_DISSIMILAR guard by about five percent. A bare
+  threshold on a signal that noisy is not something to set from these two
+  boots.
+
+Gate 3 is still **NOT PASSED**, and the blocking list is now exactly the three
+the runsheet predicted in advance: `enter_prefill`, `kv_ascend_mark`,
+`spread_veto_pct`, all UNREACHED. `enter_decode` still CLEARS on a band of 0.
+
+`rank_ms_spread_pct` was deliberately left unrestricted. It is also present
+through idle stretches — the #252 sensing reports the LAST measured forward,
+so the value goes stale rather than absent — but that is a second method
+change with its own argument to make, and it is not the one gate 3 identified.
+Recorded so the omission is not mistaken for a claim that the signal is clean.
+The bands script's own smoke now pins it: on the split-halves fixture it is
+`rank_ms_spread_pct`, not `occupancy`, that trips the ARMS_DISSIMILAR guard.
+
 ### 17.4 What this invalidates
 
 Everything recorded under the old attribution describes the old classifier.
 Gates 1 and 2 were recorded in §14 and are now **stale**: `prefill_share` can
 move for the first time, so the regime histogram, the transition count and the
 F2 replay all have to be re-recorded before gate 4. §16's gate-3 numbers stand
-for the signals whose values the fix does not touch, but the
+for the four signals whose values the fix does not touch, but the
 `enter_prefill` verdict has to be re-measured too — UNREACHED was a reading of
 a signal that could not move.
 
