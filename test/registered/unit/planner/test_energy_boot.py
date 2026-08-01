@@ -132,16 +132,48 @@ class TestBootAnchorSourcing(CustomTestCase):
 
 
 class TestBootRefusesRatherThanSubstitute(CustomTestCase):
+    """Where the boot energy model gets card identity from, and what it does
+    when it cannot.
+
+    #350-validation follow-up: these used to hand ``_boot_energy_model`` a
+    ``model.gpu_names`` attribute, because that is what the first phase-4
+    implementation read. The GPU window found that attribute never existed on
+    the real cost model -- it was invented at desk time -- so the fix
+    re-sourced identity from the CACHED HARDWARE PROFILE (name + uuid keyed by
+    ``cuda_index``) and these three tests kept mocking the retired path.
+
+    They now mock the profile read, which also makes them hermetic: the
+    outcome no longer depends on whatever profile happens to be on this disk.
+    """
+
+    #: A cached-hardware-profile shape with the fields the identity read uses.
+    @staticmethod
+    def _profile(*cards):
+        return (
+            {
+                "gpus": {
+                    f"GPU-uuid-{i}": {"name": name, "cuda_index": i}
+                    for i, name in enumerate(cards)
+                }
+            },
+            [],
+        )
+
     def test_unpriceable_rig_raises_with_the_named_reason(self):
         from sglang.srt.uneven_perf import _boot_energy_model
 
-        model = SimpleNamespace(gpu_names=["Some Unlisted GPU"])
+        # A card the library has no TDP for, and no measured row either.
         with mock.patch(
+            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            return_value=self._profile("Some Unlisted GPU"),
+        ), mock.patch(
             "sglang.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             with self.assertRaises(ValueError) as ctx:
-                _boot_energy_model(SimpleNamespace(), model, [])
+                _boot_energy_model(
+                    SimpleNamespace(rank_gpu_id=[0]), SimpleNamespace(), []
+                )
         msg = str(ctx.exception)
         self.assertIn("cannot be priced", msg)
         self.assertIn("silent substitution", msg)
@@ -150,23 +182,68 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
     def test_missing_card_identities_raise(self):
         from sglang.srt.uneven_perf import _boot_energy_model
 
-        with self.assertRaises(ValueError) as ctx:
-            _boot_energy_model(SimpleNamespace(), SimpleNamespace(), [])
+        # An EMPTY profile is the "no per-rank card identities" case: the
+        # planner cannot name a single card, which is a planning-path gap
+        # rather than a pricing failure, and the two must not read alike.
+        with mock.patch(
+            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            return_value=({"gpus": {}}, []),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _boot_energy_model(SimpleNamespace(), SimpleNamespace(), [])
+        self.assertIn("no per-rank card identities", str(ctx.exception))
+
+    def test_an_unreadable_profile_also_raises_the_identity_error(self):
+        # Best-effort read: a profile that throws must not propagate a random
+        # exception out of the planner, it must land on the named refusal.
+        from sglang.srt.uneven_perf import _boot_energy_model
+
+        with mock.patch(
+            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            side_effect=OSError("unreadable"),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _boot_energy_model(SimpleNamespace(), SimpleNamespace(), [])
         self.assertIn("no per-rank card identities", str(ctx.exception))
 
     def test_a_priceable_rig_returns_a_model_and_logs_the_tier(self):
         from sglang.srt.uneven_perf import _boot_energy_model
 
         lines = []
-        model = SimpleNamespace(gpu_names=["RTX 5090", "RTX 3080 20GB"])
         with mock.patch(
+            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            return_value=self._profile("RTX 5090", "RTX 3080 20GB"),
+        ), mock.patch(
             "sglang.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
-            em = _boot_energy_model(SimpleNamespace(), model, lines)
+            em = _boot_energy_model(
+                SimpleNamespace(rank_gpu_id=[0, 1]), SimpleNamespace(), lines
+            )
         self.assertIsNotNone(em)
+        self.assertEqual(len(em.per_rank), 2)
         self.assertTrue(any("objective=energy" in ln for ln in lines))
         self.assertTrue(any("estimate" in ln for ln in lines))
+
+    def test_rank_gpu_id_selects_which_cards_and_in_what_order(self):
+        # The identity read maps ranks through rank_gpu_id -> cuda_index, so
+        # a reordered or partial rank map must be honoured rather than the
+        # profile's own ordering being assumed.
+        from sglang.srt.uneven_perf import _boot_energy_model
+
+        with mock.patch(
+            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            return_value=self._profile("RTX 5090", "RTX 3080 20GB"),
+        ), mock.patch(
+            "sglang.srt.planner.power_calibration.load_power_profile",
+            return_value={},
+        ):
+            em = _boot_energy_model(
+                SimpleNamespace(rank_gpu_id=[1]), SimpleNamespace(), []
+            )
+        # Only the 3080 was asked for: one anchor, at the 3080's TDP.
+        self.assertEqual(len(em.per_rank), 1)
+        self.assertAlmostEqual(em.per_rank[0].active_w, 320.0)
 
 
 class TestObjectiveGate(CustomTestCase):
