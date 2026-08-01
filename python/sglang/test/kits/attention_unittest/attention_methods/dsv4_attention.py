@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.flash_mla_arch import flash_mla_sparse_fwd_supported
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1606,6 +1607,13 @@ def run_dsv4_compress_attention_case(
     `sparse_prefill` pins `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`, selecting the
     dense `flash_mla_with_kvcache` extend path or `_forward_prefill_sparse`;
     the C4 seeding dispatches on the same flag.
+
+    The request is only honoured where `flash_mla_sparse_fwd` exists (SM90a /
+    SM100f). On SM120 and on Ampere production deliberately stays on the dense
+    path, so the fixture must seed and assert the dense path there or it fails
+    at the path check before ever reaching the reference comparison -- a false
+    failure that would hide a real output regression. The env override stays
+    on regardless, so removing the production gate makes this test fail.
     """
     assert case.compress_ratio in (
         4,
@@ -1622,7 +1630,10 @@ def run_dsv4_compress_attention_case(
         device=device,
         compression_ratios=[case.compress_ratio],
     )
-    fixture.seed_c4_for_sparse_prefill = sparse_prefill
+    takes_sparse_path = sparse_prefill and flash_mla_sparse_fwd_supported(
+        torch.device(device).index
+    )
+    fixture.seed_c4_for_sparse_prefill = takes_sparse_path
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
 
@@ -1650,7 +1661,7 @@ def run_dsv4_compress_attention_case(
         # Only `_forward_prefill_sparse` populates `sparse_prefill_cache`;
         # verify the intended path ran before the reference rebuilds metadata.
         sparse_cache = fixture.backend.forward_metadata.sparse_prefill_cache
-        if sparse_prefill:
+        if takes_sparse_path:
             testcase.assertIsNotNone(
                 sparse_cache, f"{case.name} did not take _forward_prefill_sparse"
             )
