@@ -1032,3 +1032,61 @@ Two consequences. The admissibility axis remains unexercised, and gate 2's
 (the workload never approached the trap) and its own output says so. And
 `enter_prefill = 0.35` is probably too high for this rig's round mix; that is
 a gate-3 calibration input, not something to re-tune by hand.
+
+---
+
+## 15. Gate 3's band script, and what the first traces already say
+
+`scripts/regime_gates/bands.py`. Deferred until real traces existed, because
+window alignment across two boots was the part that would otherwise have been
+designed against an imagined trace. The real ones decided it.
+
+### 15.1 Alignment, decided by the data
+
+The re-run wrote 34 954 consensus boundaries of which **28 were active**. So
+aligning two runs by boundary index would compare one run's idle stretch
+against the other's workload and report the difference as noise. Alignment is
+therefore per signal and over the boundaries where that signal EXISTS: drop
+the absent ones (an idle window is no measurement, not a zero), resample both
+subsequences onto `min(n_a, n_b)` positions of a normalised timeline, band via
+the controller's own `signal_band`. Resampling is nearest-neighbour, never
+interpolating: an interpolated value is one the run never produced, and the
+band would then be partly a property of the interpolation.
+
+### 15.2 A band is only a floor if the arms are comparable
+
+Three refusals, kept apart because the fixes differ: `UNDERPOWERED` (under 8
+paired samples), `ARMS_DISSIMILAR` (the band is as large as one arm's own
+internal movement — the pairing lined a quiet stretch up against a busy one),
+and `UNREACHED` (the signal never approached the constant, so the regime it
+gates cannot be entered at all).
+
+`ARMS_DISSIMILAR` came directly from the fixture: splitting the real trace in
+half gives an idle first half and a working second one, and their occupancy
+"band" equals the whole occupancy range. Compared against the WITHIN-ARM swing
+rather than the pooled range, so two arms that each hold steady at different
+levels still report their real, reproducible bias as the band instead of
+having it thrown away as misalignment.
+
+### 15.3 The calibration finding, sharper than expected
+
+`enter_prefill = 0.35` was flagged as probably too high for this rig's round
+mix. The trace says something stronger: **`prefill_share` peaked at 0.000**
+across all 34 954 boundaries. The threshold is not high — the signal never
+moved.
+
+Root cause, upstream of the constant: the hook reads `is_prefill_only` off
+`running_batch` at the between-tick boundary, and that is the batch just
+RETIRED. During a prefill burst the retired batch is the decode one, and the
+prefill batch is built after the hook returns. So the `prefill` phase
+essentially never reports, and §13.2's three-way mapping — correct as far as
+it goes — is reading the wrong batch.
+
+Deliberately NOT fixed in the gates window or here. Changing it changes what
+the classifier emits, and gates 1 and 2 were recorded under the current
+reading; re-tuning underneath recorded evidence is how a gate stops meaning
+anything. It is the first desk task after gate 3 confirms the reading on two
+boots, and gates 1+2 will need re-recording when it lands.
+
+`spread_veto_pct = 25` gets the same verdict for an ordinary reason: the
+measured spread peaked at 12.5 %, so the veto never fires.

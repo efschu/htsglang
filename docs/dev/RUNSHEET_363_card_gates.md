@@ -293,49 +293,70 @@ Archive `$OUT` and record the path in the task ledger.
 
 ---
 
-## 6. Gate 3, if time remains in the same rotation
+## 6. Gate 3 — two identical boots, per-signal bands
 
-Gate 3 is the per-signal A-vs-A band (#360): **two identical boots**, same
-recipe, same workload, same seed, and the band is what the arm measures
-against itself.
+The band script EXISTS now: `scripts/regime_gates/bands.py`, written against
+the real traces and smoke-green card-less. Alignment is settled (see its
+docstring); what the window supplies is the second boot.
 
 ```bash
 for run in a b; do
   OUT3=/spinning/gpu-battery-results/$(date +%F)_363_gate3_$run
   mkdir -p $OUT3
-  # ... the section-1 boot, with --regime-trace $OUT3/regime-rank.jsonl ...
-  python scripts/regime_gates/workload.py --repeats 2 | tee $OUT3/workload.log
-  # ... clean shutdown ...
+  # EXACTLY the section-1 boot, only --regime-trace changes.
+  #   ... --regime-controller observe --regime-trace $OUT3/regime.jsonl
+  # then EXACTLY the section-2 workload, same flags, same order:
+  python scripts/regime_gates/workload.py --repeats 2 --burst 8 \
+      --burst-tokens 900 --drain 12 --drain-tokens 900 --mixed 8 --idle-s 25 \
+      | tee $OUT3/workload.log
+  kill -INT $(cat $OUT3/server.pids)
 done
+
+python scripts/regime_gates/bands.py \
+  --arm-a .../363_gate3_a/regime.rank0.jsonl \
+  --arm-b .../363_gate3_b/regime.rank0.jsonl \
+  --evidence $OUT/regime-gate-evidence.json \
+  --note "two identical boots, workload.py identical flags"
 ```
 
-What it must produce, per classifier input signal (`prefill_share`,
-`decode_share`, `occupancy`, `queued_prompt_tokens`, `rank_ms_spread_pct`):
+**Identical means identical.** Same recipe, same workload flags, same order.
+The band is what the arm measures against ITSELF; any difference you introduce
+between the arms is measured as noise and inflates every threshold's bar.
 
-```
-band(s) = max over aligned windows of |s_runA(w) - s_runA'(w)|
-```
+### What the report says, and the three ways it can refuse
 
-and then, for every threshold in §3.4, the check that it sits outside its own
-band by at least the band again (2×, because a threshold one band away still
-spends half its time on the wrong side of itself).
+Per signal it prints the band, the paired-sample count and the observed max;
+per section-3.4 constant it prints a verdict. Only `CLEARS` is a pass, and the
+other four are different problems with different fixes:
 
-`regime_classifier.signal_band()` and `clears_band()` are the same functions
-the controller compares against — use them rather than recomputing, so the
-experiment and the runtime cannot drift.
+| verdict | meaning | what to do |
+|---|---|---|
+| `CLEARS` | the gap it defends exceeds 2x its measured band | nothing |
+| `INSIDE_BAND` | the gap is inside the signal's own noise | re-derive the constant from the band |
+| `UNREACHED` | the signal never approached the constant in either run | the regime it gates cannot be entered. Either the constant is mis-set or the workload never made the shape — the report does not choose, and does not re-tune |
+| `UNDERPOWERED` | fewer than 8 paired samples | a longer or busier workload; a band from 2 samples is a number, not a measurement |
+| `ARMS_DISSIMILAR` | the band is as large as one arm's own movement | the two boots were not doing the same thing where the alignment paired them. Check both ran the same workload and neither was truncated |
 
-**No band-computing script is written yet.** It needs the two traces to exist
-before its shape can be settled honestly (window alignment across two boots is
-the part that will be fiddly, and guessing at it at the desk would produce a
-tool that fits an imagined trace). Writing it is the first desk task after
-this window returns.
+### What the previous window already predicts it will find
 
-Provisional constants gate 3 must replace or confirm: `window_rounds` 64,
-`enter_prefill` 0.35 / `exit_prefill` 0.15, `enter_decode` 0.90 /
-`exit_decode` 0.70, `spread_veto_pct` 25, `PRESTAGE_SINGLE_PROMPT_TOKENS`
-8192. The occupancy marks are #287's and are deliberately NOT re-derived.
+Run these numbers past the report and expect them again:
 
----
+* `enter_prefill = 0.35` -> **UNREACHED**, and not marginally: `prefill_share`
+  peaked at **0.000** across 34 954 boundaries. The root cause is upstream of
+  the constant — the hook reads `is_prefill_only` off the RETIRED batch at the
+  between-tick boundary, and during a prefill burst that batch is the decode
+  one, so the prefill phase essentially never reports. Fixing that changes
+  what the classifier emits, so it was NOT done in the gates window; it is the
+  first desk task after gate 3 confirms the reading.
+* `spread_veto_pct = 25` -> **UNREACHED**: the measured spread peaked at
+  **12.5 %**, so a 25 % veto never fires.
+* `kv_ascend_mark = 0.85` -> **UNREACHED** at 16.5 % peak occupancy, unless
+  the workload is heavier than section 2's. This one is INHERITED from #287
+  and is reported for information only: a failure here is a finding for #287,
+  not a licence to set a second mark on the same pool.
+
+None of those are reasons to change a number by hand. They are the gate-3
+output.
 
 ## 7. Gate 4, for the window after
 
