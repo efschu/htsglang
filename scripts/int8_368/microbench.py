@@ -821,6 +821,39 @@ def calibrate(fn: Callable, target_ms: float, cuda: bool, max_iters: int) -> int
     return max(1, min(max_iters, int(target_ms / probe)))
 
 
+def capture_graph(fn: Callable, iters: int):
+    """A CUDA graph containing `iters` back-to-back calls of `fn`.
+
+    THE point of the whole graph mode: the eager measurement prices a launch
+    per kernel, and decode in this stack does not pay that -- it replays a
+    captured graph. Timing one replay of `iters` bodies and dividing gives
+    the per-op cost with the launch amortized to a graph-node dispatch,
+    which is the number a fusion decision must be made against. The eager
+    number alone would credit a fusion with removing a cost the graph has
+    already removed.
+
+    `iters` bodies rather than one: a single-body graph would measure the
+    replay call's own overhead as much as the work.
+
+    Warmup happens on a side stream, which the capture API requires -- the
+    first calls also JIT the Triton quant kernel and pick the CUTLASS tile,
+    and neither may happen inside the capture.
+    """
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(5):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(iters):
+            fn()
+    torch.cuda.synchronize()
+    return graph
+
+
 def summarize(samples: Sequence[float]) -> dict:
     s = sorted(samples)
     return {
@@ -846,19 +879,55 @@ def run_point(
     max_iters: int,
     cuda: bool,
     seed: int,
+    graph_iters: int = 0,
 ) -> dict:
     op_a = build_operand(w_a, shape, m, dev, kn, seed)
     op_b = build_operand(w_b, shape, m, dev, kn, seed + 977)
     lanes_a = build_lanes(op_a, kn, want)
     lanes_b = build_lanes(op_b, kn, want)
 
+    # Probe every lane ONCE before it enters the rotation. A lane can be
+    # constructible and still not runnable on this card -- measured on sm86,
+    # where the triton block-fp8 matmul rejects fp8e4nv ("not supported in
+    # this architecture", Ampere has only fp8e4b15/fp8e5) and took the whole
+    # battery down with it. An unrunnable lane is a RESULT about the card,
+    # so it is recorded by name and reason and the rest of the run proceeds.
     rotation = []
+    lane_failures: dict = {}
     for name in want:
-        if name in lanes_a:
-            rotation.append((name, lanes_a[name]))
-            rotation.append((name + "#A2", lanes_b[name]))
+        if name not in lanes_a:
+            continue
+        try:
+            lanes_a[name]()
+            lanes_b[name]()
+            if cuda:
+                torch.cuda.synchronize()
+        except Exception as ex:
+            lane_failures[name] = f"{type(ex).__name__}: {str(ex)[:220]}"
+            continue
+        rotation.append((name, lanes_a[name]))
+        rotation.append((name + "#A2", lanes_b[name]))
     if not rotation:
-        return {"skipped": "no lane could be built at this point"}
+        return {
+            "skipped": "no lane could run at this point",
+            "lane_failures": lane_failures,
+        }
+
+    # Graph variants join the SAME rotation, so eager and replay are
+    # interleaved against one clock and one thermal state -- the comparison
+    # between them is the deliverable, and measuring them in separate passes
+    # would put the drift straight into it.
+    graphs: dict = {}
+    graph_notes: dict = {}
+    if graph_iters and cuda:
+        for name, fn in list(rotation):
+            try:
+                g = capture_graph(fn, graph_iters)
+            except Exception as ex:
+                graph_notes[name] = f"{type(ex).__name__}: {str(ex)[:160]}"
+                continue
+            graphs[name] = g
+            rotation.append((name + "@graph", g.replay))
 
     iters = {name: calibrate(fn, target_ms, cuda, max_iters) for name, fn in rotation}
     samples: dict = {name: [] for name, _ in rotation}
@@ -868,8 +937,13 @@ def run_point(
 
     lanes: dict = {}
     for name, _ in rotation:
-        lanes[name] = summarize(samples[name])
+        scale = graph_iters if name.endswith("@graph") else 1
+        # One replay executes graph_iters bodies; report per-OP so graph and
+        # eager rows are the same unit.
+        lanes[name] = summarize([s / scale for s in samples[name]])
         lanes[name]["iters_per_burst"] = iters[name]
+        if scale != 1:
+            lanes[name]["ops_per_replay"] = graph_iters
         if kn.stub:
             lanes[name]["stub"] = True
 
@@ -910,8 +984,40 @@ def run_point(
             lanes["int8_fused"]["median_ms"] / bf if bf else None
         )
 
-    del op_a, op_b, lanes_a, lanes_b
-    return {"lanes": lanes, "noise_floor": noise, "derived": derived}
+    # The fusion decision input. Everything a fusion could remove that graph
+    # replay has ALREADY removed must not be credited to the fusion.
+    for name in want:
+        g = name + "@graph"
+        if name in lanes and g in lanes:
+            eager, rep = lanes[name]["median_ms"], lanes[g]["median_ms"]
+            derived[f"{name}_graph_over_eager"] = rep / eager if eager else None
+            derived[f"{name}_launch_removed_by_graph_ms"] = eager - rep
+    if "int8_quant@graph" in lanes and "int8_fused@graph" in lanes:
+        fg = lanes["int8_fused@graph"]["median_ms"]
+        derived["int8_quant_share_of_fused_graph"] = (
+            lanes["int8_quant@graph"]["median_ms"] / fg if fg else None
+        )
+        if "int8_gemm@graph" in lanes:
+            derived["int8_gemm_share_of_fused_graph"] = (
+                lanes["int8_gemm@graph"]["median_ms"] / fg if fg else None
+            )
+            derived["int8_fused_minus_parts_graph_ms"] = fg - (
+                lanes["int8_quant@graph"]["median_ms"]
+                + lanes["int8_gemm@graph"]["median_ms"]
+            )
+    if "fp8_block_fused@graph" in lanes and "int8_fused@graph" in lanes:
+        f8 = lanes["fp8_block_fused@graph"]["median_ms"]
+        derived["int8_over_fp8_block_graph"] = (
+            lanes["int8_fused@graph"]["median_ms"] / f8 if f8 else None
+        )
+
+    del op_a, op_b, lanes_a, lanes_b, graphs
+    out = {"lanes": lanes, "noise_floor": noise, "derived": derived}
+    if graph_notes:
+        out["graph_capture_failures"] = graph_notes
+    if lane_failures:
+        out["lane_failures"] = lane_failures
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1038,6 +1144,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         choices=["auto"] + sorted(BLOCK_FP8_BACKENDS),
         help="which block-fp8 backend the fp8_block_fused lane uses; 'auto' "
         "is dispatch_w8a8_block_fp8_linear's own answer for this card",
+    )
+    ap.add_argument(
+        "--graph-iters",
+        type=int,
+        default=0,
+        help="capture a CUDA graph of this many bodies per lane and measure "
+        "replay alongside eager in the same rotation (0 = eager only). This "
+        "is the mode the fusion decision needs: graph replay already removes "
+        "the per-launch cost that eager timing attributes to the quant.",
     )
     ap.add_argument("--seed", type=int, default=368)
     ap.add_argument("--out", default="", help="JSON output path")
@@ -1232,6 +1347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"lanes       {want}")
     print(f"M           {m_list}")
     print(f"rounds      {args.rounds}   target {args.target_ms} ms/burst")
+    if args.graph_iters:
+        print(f"graph       CUDA-graph replay, {args.graph_iters} bodies per capture")
     if kn.stub:
         print("!! DRY RUN: pure-torch stand-ins, NOT a measurement !!")
     print("=" * 78)
@@ -1258,6 +1375,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.max_iters,
                 cuda,
                 args.seed + m,
+                args.graph_iters,
             )
             row = {"shape": asdict(s), "m": m, "wall_s": round(time.time() - t0, 3)}
             row.update(point)
@@ -1308,6 +1426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 kn.block_fp8_linear, "__name__", str(kn.block_fp8_linear)
             ),
             "seed": args.seed,
+            "graph_iters": args.graph_iters,
         },
         "shapes": [asdict(s) for s in shapes],
         "results": results,
