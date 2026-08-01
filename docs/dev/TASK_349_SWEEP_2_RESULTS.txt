@@ -1,0 +1,153 @@
+#349 boot matrix -- SWEEP 2, on the repaired net (2026-08-01)
+Qwen3.6-27B-FP8, TP=3 uneven (5090 + 2x 3080).
+Verdicts from sglang.srt.boot_matrix.check.check_arm over the artifacts.
+
+arm                        kind   verdict reason / first error
+------------------------------------------------------------------------------------------------------------------------
+A_default                  boot   FAIL    boot that should have come up died; first fatal at 73: [2026-08-01 08:00:5
+B_offload                  boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+C_crossalgo                boot   FAIL    boot that should have come up died; first fatal at 41: Traceback (most rec
+D_offload_x_crossalgo      boot   FAIL    boot that should have come up died; first fatal at 41: Traceback (most rec
+E_barlink                  boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+G_all_axes                 boot   FAIL    boot that should have come up died; first fatal at 38: Traceback (most rec
+H_ps2_prefill_spill        boot   STOP    could not confirm declared field(s) from the log: spec_algorithm, eagle_to
+I_dflash_shards            boot   FAIL    boot that should have come up died; first fatal at 38: Traceback (most rec
+J_waveback_ps2             boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+K_bar1_graphs              boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+L_video_cotenancy          boot   FAIL    boot that should have come up died; first fatal at 385: [2026-08-01 08:05:
+M_dcp_draftextend          boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+reject_dcp_topk            reject PASS    refused cleanly at boot with the named guard
+reject_dcp_multilayer      reject PASS    refused cleanly at boot with the named guard
+reject_dcp_offlane         reject FAIL    refused, but with an unexpected error rather than the named guard (expecte
+reject_dcp_crossalgo       reject FAIL    refused, but with an unexpected error rather than the named guard (expecte
+reject_dcp_offload         reject PASS    refused cleanly at boot with the named guard
+
+tally: {'FAIL': 8, 'PASS': 8, 'STOP': 1}
+
+========================================================================
+Q1  DOES THE BAND MEASURE?
+========================================================================
+  A_default              byte byte_count   ref_len=  24
+  A_default              grad alphabet     floor=0
+  A_default              grad squares      floor=0
+  E_barlink              byte byte_count   ref_len=  24
+  E_barlink              grad alphabet     floor=4
+  E_barlink              grad squares      floor=8
+  M_dcp_draftextend      byte byte_count   ref_len=  24
+  M_dcp_draftextend      grad alphabet     floor=4
+  M_dcp_draftextend      grad squares      floor=8
+
+========================================================================
+Q2  WHAT DO THE REPAIRED ARMS SAY (first error, if any)?
+========================================================================
+  B_offload                (no error line -- booted)
+  C_crossalgo              ValueError: --speculative-cross-algorithm: requires --speculative-draft-model pointing at the DFLASH draft checkpoint (the MTP rung drafts from the ta
+  D_offload_x_crossalgo    ValueError: --speculative-cross-algorithm: requires --speculative-draft-model pointing at the DFLASH draft checkpoint (the MTP rung drafts from the ta
+  G_all_axes               ValueError: --speculative-cross-algorithm: requires --speculative-draft-model pointing at the DFLASH draft checkpoint (the MTP rung drafts from the ta
+  H_ps2_prefill_spill      (no error line -- booted)
+  I_dflash_shards          ValueError: DFLASH speculative decoding requires setting --speculative-draft-model-path.
+  J_waveback_ps2           (no error line -- booted)
+  L_video_cotenancy        ValueError: Dual-group plan is not nested -- the PD lane cannot share the Verband's weight bytes with this ratio pair.
+  reject_dcp_offlane       ValueError: --rank-gpu-id requires --rank-gpu-memory-mib to be set (or --rank-tp-ratio auto to derive the budgets from NVML).
+
+========================================================================
+Q3  REJECT ARMS: PASSED ON THEIR OWN GUARD?
+========================================================================
+  reject_dcp_topk          PASS  refusal=ValueError: --draft-kv-layout dcp is only supported for a linear draft chain (MT
+  reject_dcp_multilayer    PASS  refusal=ValueError: --draft-kv-layout dcp is not supported with --enable-multi-layer-eag
+  reject_dcp_offlane       FAIL  refusal=None
+  reject_dcp_crossalgo     FAIL  refusal=None
+  reject_dcp_offload       PASS  refusal=ValueError: --draft-kv-layout dcp is not supported together with --enable-kv-ses
+
+========================================================================
+Q4  E_barlink AXIS / K_bar1
+========================================================================
+  E_barlink                barlink=device  PASS
+  K_bar1_graphs            barlink=bar1  PASS
+
+========================================================================
+READING OF SWEEP 2
+========================================================================
+Wall time ~35 min for 17 arms (planned 80): most of the boots are warm-cache
+now, and ten arms still stop at argument resolution in seconds.
+
+THE REPAIR IS PROVEN ON ALL FOUR QUESTIONS
+
+Q1 THE BAND MEASURES. byte reference 24 chars, graded floors alphabet=4 and
+   squares=8, and both reach every later arm (E_barlink, M_dcp_draftextend,
+   K_bar1_graphs all carry them). In sweep 1 every arm carried ref_text="" and
+   min_score=0. The gate can now fail.
+   CAVEAT, and it is my own bug, not the product's: A_default itself is FAIL.
+   Its THIRD boot -- the one that regrades the baseline against the band it
+   produced -- died with "CUDA out of memory ... Process 1888263 has 18.87 GiB
+   memory in use". That is the SECOND baseline boot's VRAM, not yet released
+   when the third started. _measure_band boots the same arm three times
+   back-to-back and _terminate() returns before the child schedulers have let
+   go of the cards. Named fix: wait for VRAM release (or for the child pids to
+   exit) between band boots. The band itself is unaffected -- it is built from
+   boots 1 and 2, both of which completed and both of whose numbers threaded.
+
+Q2 THE REPAIRED ARMS REACH THEIR CROSSINGS, AND TWO OF THEM ARE SOUND.
+   B_offload  PASS -- kv-session-offload x spec booted and stayed coherent.
+   J_waveback PASS -- wave-back x PS2 likewise.
+   Both crossings had NEVER been executed before this run; in sweep 1 they
+   died on the KVSO_ALLOW_SPEC gate they now opt into. That is the point of
+   the whole exercise: two cross-feature combinations are now known good
+   rather than unknown.
+   H_ps2_prefill_spill BOOTED (no error) -- the drop_flags mechanism works --
+   but STOPs because its expect declares spec_algorithm=None/eagle_topk=None
+   and report_effective cannot confirm a field the log does not print when
+   spec is off. Matrix-side: either the reader should treat "absent" as None
+   for these two fields, or the arm should not declare them.
+
+   The remaining five hit the NEXT requirement in a chain -- each repair
+   revealed the gate behind it, which is what a first pass through an
+   untested arm looks like:
+     C, D, G   --speculative-cross-algorithm additionally requires
+               --speculative-draft-model pointing at a DFLASH checkpoint
+               (the MTP rung needs no path; the DFLASH rung does).
+     I         DFLASH requires --speculative-draft-model-path.
+     L         "Dual-group plan is not nested -- the PD lane cannot share the
+               Verband's weight bytes with this ratio pair": the 2048 MiB lane
+               budget is not compatible with the TP ratio; needs tuning, not
+               a flag.
+     offlane   --rank-gpu-id now requires --rank-gpu-memory-mib once
+               --rank-tp-ratio is not auto.
+   /spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash exists and is
+   the checkpoint C/D/G/I need.
+
+Q3 THE NAMED-GUARD RULE WORKS.
+   topk, multilayer and offload PASS on refusals that literally name BOTH the
+   layout and the crossed flag. reject_dcp_offload is the direct check: in
+   sweep 1 it passed on the KVSO bring-up gate, which never mentions
+   --draft-kv-layout; it now passes on
+   "--draft-kv-layout dcp is not supported together with
+   --enable-kv-session-offload". The other sweep-1 false pass,
+   reject_dcp_crossalgo, now correctly FAILS instead of passing, because it
+   still cannot reach its guard. A false green became a true red.
+   M_dcp_draftextend PASS: dcp resolves as declared, no silent fallback to
+   replicated -- the retired reject arm's replacement pins a contract that
+   holds.
+
+Q4 BOTH AXES READ CORRECTLY.
+   E_barlink resolves barlink=device -- a transport NAME, where sweep 1 read
+   the state word "up" off "barlink device transport up" and failed the arm
+   against its own correct declaration.
+   K_bar1_graphs PASS, ready in 76 s against a 1200 s ceiling, byte probe
+   byte-exact against the measured reference. In sweep 1 the same healthy arm
+   was FAILed by the fatal detector on the torchcodec ignore-block; that fix
+   is confirmed on the real Docker log.
+
+PRODUCT OBSERVATIONS -- NOT FIXED HERE, PROPOSED AS THEIR OWN TICKETS
+
+P1 A German word in a user-facing English error: the dual-group planner emits
+   "the PD lane cannot share the Verband's weight bytes with this ratio pair".
+   #295/#358 translated the transport strand; this message was missed. Small,
+   but it is exactly the class those tasks existed to close.
+
+P2 Two names for one thing: cross-algo refuses with "requires
+   --speculative-draft-model", DFLASH refuses with "requires
+   --speculative-draft-model-path". One of the two messages sends the reader
+   to a flag that is not the one the parser wants.
+
+Neither was touched in this window, per bugs-first.
