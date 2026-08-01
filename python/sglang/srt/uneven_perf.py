@@ -3239,13 +3239,16 @@ def _gguf_config_and_families(path: str) -> dict:
     # head_dim 256, not 512). Trusting the scalars would require a missing key
     # (hard error) and, if defaulted naively, 4x the KV-cache size + 2x the
     # q-proj mass. The weight tensors settle it unambiguously.
-    def _blk0_out(sub: str):
+    def _blk0_dim(sub: str, index: int):
         for t in tensors:
             n = t["name"]
             if n.startswith("blk.0.") and f"{sub}." in n and n.endswith(".weight"):
                 d = t.get("dims") or []
-                return int(d[-1]) if d else None  # GGML weight dims = [in, out]
+                return int(d[index]) if d else None  # GGML weight dims = [in, out]
         return None
+
+    def _blk0_out(sub: str):
+        return _blk0_dim(sub, -1)
 
     q_out = _blk0_out("attn_q")
     if q_out and q_heads and q_out % q_heads == 0:
@@ -3265,6 +3268,25 @@ def _gguf_config_and_families(path: str) -> dict:
             if (k_out and head_dim and k_out % head_dim == 0)
             else q_heads
         )
+    # DeepSeek V4's wo_a projection couples heads and o_groups (#402, see
+    # models/deepseek_v4.py MqaAttentionBase.__init__): its UNSHARDED
+    # per-group input width is `n_heads * head_dim // o_groups`, which is
+    # exactly the GGML "in" dim (dims[0]) of the on-disk attn_output_a
+    # tensor -- ColumnParallelLinear(input_size=n_heads*head_dim//o_groups,
+    # output_size=o_groups*o_lora_rank). Unlike head_dim/kv_heads above,
+    # o_groups has NO equivalent GGUF header scalar at all (it is a
+    # fork-specific unit llama.cpp's deepseek4 writer never declares), so
+    # the tensor is the ONLY source -- and it is an exact closed form, not a
+    # heuristic: any DSV4-family GGUF with this tensor yields the true
+    # o_groups, and every non-DSV4 arch simply lacks the tensor, so
+    # `o_groups` stays 0 and `PerfCostModel.attn_units` keeps gridding on
+    # kv_heads exactly as before (#414).
+    wo_a_in = _blk0_dim("attn_output_a", 0)
+    o_groups = (
+        (q_heads * head_dim) // wo_a_in
+        if wo_a_in and q_heads and head_dim and (q_heads * head_dim) % wo_a_in == 0
+        else 0
+    )
     block_count = int(need("block_count"))
     nextn = int(opt("nextn_predict_layers", 0) or 0)
     n_layers = block_count - nextn  # nextn/MTP block is not a base layer
@@ -3347,6 +3369,7 @@ def _gguf_config_and_families(path: str) -> dict:
             "num_attention_heads": q_heads,
             "num_key_value_heads": kv_heads,
             "head_dim": head_dim,
+            "o_groups": o_groups,
             "attn_output_gate": attn_gate,
             "vocab_size": int(vocab),
             "num_experts": expert_count,
