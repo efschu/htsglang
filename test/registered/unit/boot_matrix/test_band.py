@@ -28,6 +28,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from typing import Dict, List, Optional
 
 from sglang.srt.boot_matrix.arms import arm_by_name
@@ -227,3 +228,71 @@ class TestTheBandActuallyGates(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVramReleaseWait(CustomTestCase):
+    """Teardown waits for the CARDS, not just for the launcher to exit.
+
+    ``_terminate`` signals the launcher's process group. The TP scheduler ranks
+    are not in it -- run_arm starts the launcher with start_new_session=True
+    and the launcher does the same for its ranks -- so they outlive both the
+    signal and the wait, still holding the model.
+
+    Sweep 2 paid for this where the same arm boots three times in a row:
+    A_default's third boot died on "CUDA out of memory ... Process 1888263 has
+    18.87 GiB memory in use", and that process was the second boot's rank. The
+    band survived (it comes from boots one and two) but the baseline arm could
+    not pass, so the matrix reported its own reference red.
+    """
+
+    def _run(self, outputs, **kw):
+        import subprocess as sp
+
+        from sglang.srt.boot_matrix import sweep as sweep_mod
+
+        seen = {"n": 0}
+
+        class _Done:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(*_a, **_k):
+            i = min(seen["n"], len(outputs) - 1)
+            seen["n"] += 1
+            out = outputs[i]
+            if isinstance(out, Exception):
+                raise out
+            return _Done(out)
+
+        with mock.patch.object(sp, "run", fake_run):
+            got = sweep_mod.wait_for_vram_release(poll_s=0, **kw)
+        return got, seen["n"]
+
+    def test_it_returns_once_the_cards_are_idle(self):
+        ok, calls = self._run(["3\n3\n3\n"])
+        self.assertTrue(ok)
+        self.assertEqual(calls, 1)
+
+    def test_it_keeps_waiting_while_a_rank_still_holds_memory(self):
+        """The sweep-2 shape: one card busy, then released."""
+        ok, calls = self._run(["19000\n3\n3\n", "8000\n3\n3\n", "4\n3\n3\n"])
+        self.assertTrue(ok)
+        self.assertEqual(calls, 3)
+
+    def test_it_is_bounded_and_reports_rather_than_hanging(self):
+        ok, _ = self._run(["19000\n3\n3\n"], timeout_s=0.0)
+        self.assertFalse(ok, "a card that never frees must end the wait, not hang")
+
+    def test_a_card_less_host_does_not_wait_at_all(self):
+        """The pure paths and the unit suite must be unaffected."""
+        ok, calls = self._run([FileNotFoundError("nvidia-smi")])
+        self.assertTrue(ok)
+        self.assertEqual(calls, 1)
+
+    def test_the_idle_threshold_is_not_zero(self):
+        """The driver keeps a few MiB of context; zero would never be reached."""
+        from sglang.srt.boot_matrix import sweep as sweep_mod
+
+        self.assertGreater(sweep_mod.VRAM_IDLE_MIB, 0)
+        ok, _ = self._run([f"{sweep_mod.VRAM_IDLE_MIB - 1}\n"])
+        self.assertTrue(ok)

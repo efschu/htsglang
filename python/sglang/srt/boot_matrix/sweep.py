@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -40,6 +41,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from sglang.srt.boot_matrix.arms import ARMS, BASE_ENV, BASE_FLAGS, Arm, arm_by_name
 from sglang.srt.boot_matrix.check import Verdict, check_arm
 from sglang.srt.boot_matrix.effective import READY_MARKER
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Standard probes. Byte tier stays SHORT (inside the GDN reproducibility
@@ -336,6 +339,12 @@ def run_arm(
             )
     finally:
         _terminate(proc)
+        # The ranks are not in the launcher's process group, so the terminate
+        # above does not reach them; wait for the cards themselves. Placed
+        # here rather than only in _measure_band because the hazard is
+        # arm-to-arm -- the band merely hits it hardest, being the same large
+        # model three times in a row.
+        wait_for_vram_release()
 
     with open(log_path, errors="replace") as f:
         log_text = f.read()
@@ -418,6 +427,72 @@ def _terminate(proc) -> None:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, OSError):
         pass
+
+
+#: A card with less than this in use counts as released. Not zero: the driver
+#: keeps a few MiB of context around, and nvidia-smi reports it.
+VRAM_IDLE_MIB = 512
+#: Bound on the wait. Generous, because a 27B teardown across three ranks is
+#: seconds and anything approaching this is a leak worth seeing in the log.
+VRAM_RELEASE_TIMEOUT_S = 180.0
+
+
+def wait_for_vram_release(
+    timeout_s: float = VRAM_RELEASE_TIMEOUT_S,
+    idle_mib: int = VRAM_IDLE_MIB,
+    poll_s: float = 2.0,
+) -> bool:
+    """Block until every visible card is back near idle. Bounded; never raises.
+
+    WHY THE PROCESS EXIT IS NOT ENOUGH. ``_terminate`` signals the launcher's
+    process group and waits for the launcher. The TP scheduler ranks are NOT
+    in that group -- ``run_arm`` starts the launcher with
+    ``start_new_session=True`` and the launcher starts its ranks the same way,
+    so they outlive both the signal and the wait, still holding their share of
+    the model.
+
+    Sweep 2 paid for this in the one place that boots the same arm three times
+    in a row. A_default's third boot -- the one that regrades the baseline
+    against the band it just produced -- died with "CUDA out of memory ...
+    Process 1888263 has 18.87 GiB memory in use", and 1888263 was the SECOND
+    boot's rank. The band itself was fine (it comes from boots one and two),
+    but the arm that produces it could not pass, so the matrix reported its own
+    baseline red.
+
+    Returning False rather than raising is deliberate: a card that stays busy
+    is a finding for the NEXT boot to report against a real log, not a reason
+    to abort a sweep from inside a teardown helper.
+    """
+    import subprocess
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    last: Optional[int] = None
+    while True:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=20,
+            ).stdout
+            used = [int(x.strip()) for x in out.splitlines() if x.strip()]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # No nvidia-smi (card-less host, unit tests): nothing to wait for.
+            return True
+        if not used:
+            return True
+        last = max(used)
+        if last <= idle_mib:
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "boot-matrix: cards still hold %d MiB after %.0fs of waiting "
+                "for release; the next arm starts against that. A rank from "
+                "the previous boot is still alive -- it is not in the "
+                "launcher's process group, so the terminate did not reach it.",
+                last, timeout_s,
+            )
+            return False
+        time.sleep(poll_s)
 
 
 # ---------------------------------------------------------------------------

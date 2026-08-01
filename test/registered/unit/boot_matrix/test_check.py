@@ -66,6 +66,13 @@ BOOT_ARM = Arm(
     expect={"tp_size": 3, "dcp_size": 3, "dcp_engaged": True, "spec_algorithm": "EAGLE"},
     coherence="byte+graded",
 )
+#: H_ps2_prefill_spill is graded_only (no-spec runs produce long output), so
+#: its artifact carries no byte probe.
+GRADED_PROBES = [
+    {"name": "alphabet", "tier": "graded", "text": "w\nx\ny\nz", "min_score": 4},
+    {"name": "squares", "tier": "graded", "text": "12 144\n13 169", "min_score": 2},
+]
+
 GOOD_PROBES = [
     {"name": "byte_count", "tier": "byte", "text": "4\n5\n6\n", "ref_text": "4\n5\n6"},
     {"name": "alphabet", "tier": "graded", "text": "w\nx\ny\nz", "min_score": 4},
@@ -323,3 +330,72 @@ class TestArtifactContract(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAbsenceIsAnAssertion(CustomTestCase):
+    """A declared None means "this axis must be ABSENT", not "unknown".
+
+    Sweep 2 STOPped H_ps2_prefill_spill on exactly this. The arm turns
+    speculation off, so the server legitimately prints no speculative line;
+    the arm declared spec_algorithm=None and eagle_topk=None; and the check
+    reported "could not confirm spec_algorithm, eagle_topk". Absence WAS the
+    confirmation. Half of every crossing is a feature switched off, so this
+    shape recurs.
+    """
+
+    def _log_without_spec(self):
+        """What the server really prints with speculation off: the fields are
+        in the dump with the value None."""
+        return _boot_log(
+            enable_kv_session_offload="True",
+            speculative_algorithm="None",
+            speculative_eagle_topk="None",
+        )
+
+    def _log_with_spec(self):
+        return _boot_log(enable_kv_session_offload="True")
+
+    def test_a_log_without_the_spec_lines_confirms_an_absence_expect(self):
+        arm = arm_by_name("H_ps2_prefill_spill")
+        with tempfile.TemporaryDirectory() as d:
+            _write(d, arm=arm, boot_status="ready",
+                   log_text=self._log_without_spec(), probes=GRADED_PROBES)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, PASS, v.reason)
+
+    def test_a_log_that_OMITS_the_fields_entirely_also_confirms(self):
+        """The other shape of absence: no such key in the dump at all."""
+        arm = arm_by_name("H_ps2_prefill_spill")
+        body = (
+            "[2026-08-01 00:00:00] server_args=ServerArgs(tp_size=3, dcp_size=3, "
+            "enable_kv_session_offload=True, draft_kv_layout='replicated')"
+        )
+        log = "\n".join([body, _ENGAGED, _GRAPHS, f"[..] {READY_MARKER}"])
+        with tempfile.TemporaryDirectory() as d:
+            _write(d, arm=arm, boot_status="ready", log_text=log,
+                   probes=GRADED_PROBES)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, PASS, v.reason)
+
+    def test_a_log_WITH_the_spec_lines_fails_an_absence_expect(self):
+        """The falsifier: spec present where the arm declared it off is a real
+        disagreement, and must be FAIL rather than a quiet pass."""
+        arm = arm_by_name("H_ps2_prefill_spill")
+        with tempfile.TemporaryDirectory() as d:
+            _write(d, arm=arm, boot_status="ready",
+                   log_text=self._log_with_spec(), probes=GRADED_PROBES)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, FAIL, v.reason)
+            self.assertIn("declared absent", v.reason)
+
+    def test_a_field_declared_with_a_VALUE_can_still_be_unconfirmed(self):
+        """The absence rule must not swallow the genuine can't-tell case."""
+        arm = arm_by_name("A_default")
+        with tempfile.TemporaryDirectory() as d:
+            # No tp_size line at all: A_default declares tp_size=3, a VALUE, so
+            # its absence is "could not confirm" and stays a STOP.
+            _write(d, arm=arm, boot_status="ready",
+                   log_text="[..] nothing useful\n" + READY_MARKER + "\n")
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, STOP, v.reason)
+            self.assertIn("could not confirm", v.reason)

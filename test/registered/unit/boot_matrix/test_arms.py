@@ -9,6 +9,8 @@ import unittest
 from sglang.srt.boot_matrix.arms import (
     ARMS,
     BASE_EXPECT,
+    DFLASH_DRAFT_MODEL,
+    EVEN_RATIO_RANK_MIB,
     Arm,
     arm_by_name,
 )
@@ -199,3 +201,61 @@ class TestTheStaleRejectWasRetiredHonestly(CustomTestCase):
         """A silent fallback to 'replicated' is the regression to catch."""
         arm = arm_by_name("M_dcp_draftextend")
         self.assertEqual(arm.expect.get("draft_kv_layout"), "dcp")
+
+
+class TestSweep2ArmRepairs(CustomTestCase):
+    """The gates sweep 2 uncovered behind the sweep-1 ones.
+
+    Each repair revealed the next requirement, which is what a first pass
+    through a never-executed arm looks like. These pin the second layer.
+    """
+
+    def test_cross_algo_and_dflash_arms_carry_a_draft_checkpoint(self):
+        """Both rungs stay resident, so the DFLASH rung's weights are needed
+        even when the NEXTN rung is the forced one."""
+        for name in ("C_crossalgo", "D_offload_x_crossalgo", "G_all_axes",
+                     "I_dflash_shards", "reject_dcp_crossalgo"):
+            arm = arm_by_name(name)
+            self.assertIn(
+                "--speculative-draft-model-path",
+                arm.flags,
+                f"{name} refuses at boot without a draft checkpoint",
+            )
+            i = list(arm.flags).index("--speculative-draft-model-path")
+            self.assertEqual(arm.flags[i + 1], DFLASH_DRAFT_MODEL)
+
+    def test_the_canonical_draft_flag_spelling_is_used(self):
+        """#382 note: --speculative-draft-model is an ALIAS of
+        --speculative-draft-model-path, so both parse -- but the two refusal
+        messages name different ones. The arms use the canonical name."""
+        for arm in ARMS:
+            self.assertNotIn("--speculative-draft-model", arm.flags)
+
+    def test_arms_that_pin_an_even_ratio_supply_explicit_budgets(self):
+        """Once --rank-tp-ratio is not auto the server stops deriving budgets
+        from NVML and refuses without --rank-gpu-memory-mib."""
+        for name in ("L_video_cotenancy", "reject_dcp_offlane"):
+            arm = arm_by_name(name)
+            self.assertIn("--rank-tp-ratio", arm.flags)
+            self.assertIn("--rank-gpu-memory-mib", arm.flags)
+            self.assertIn(
+                "--rank-auto-reserve-mib",
+                arm.drop_flags,
+                f"{name} must drop the auto reserve it can no longer use",
+            )
+
+    def test_the_lane_arm_pins_a_nestable_ratio(self):
+        """L failed on "Dual-group plan is not nested", which is a RATIO
+        question: the base auto-performance vector does not keep the shared
+        rank on the same unit range in both groups. An even ratio divides
+        every unit count, which the server's own advice names as always
+        nested. The crossing under test is the lane, not uneven TP."""
+        arm = arm_by_name("L_video_cotenancy")
+        i = list(arm.flags).index("--rank-tp-ratio")
+        parts = arm.flags[i + 1].split(",")
+        self.assertEqual(len(set(parts)), 1, f"ratio {arm.flags[i + 1]} is not even")
+
+    def test_the_budget_fits_the_smallest_card_on_this_rig(self):
+        """20054 MiB 3080s; the value must leave room for the CUDA context."""
+        self.assertLess(int(EVEN_RATIO_RANK_MIB), 20054)
+        self.assertGreater(int(EVEN_RATIO_RANK_MIB), 8000)
