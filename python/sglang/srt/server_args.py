@@ -4703,6 +4703,21 @@ class ServerArgs:
             choices=["off", "observe", "act"],
         ),
     ] = "off"
+    regime_trace: A[
+        Optional[str],
+        Arg(
+            help="Path to append the #363 observer's verdict trace to, one "
+            "JSON object per consensus boundary plus a final summary line. "
+            "This is the artifact the card gates of DESIGN_363 section 11.7 "
+            "consume: gate 1 counts desyncs off it, gate 2 replays it "
+            "open-loop and diffs the transitions. Each rank writes its own "
+            "file (pass a per-rank path), so a reader can see whether the "
+            "ranks agreed rather than taking one rank's word for it. A "
+            "summary line present means the run ended cleanly -- without it, "
+            "'zero desyncs' only means 'zero so far'. Ignored when "
+            "--regime-controller is off.",
+        ),
+    ] = None
     regime_gate_evidence: A[
         Optional[str],
         Arg(
