@@ -1294,6 +1294,26 @@ class ServerArgs:
         bool,
         "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
     ] = False
+    attn_scratch_budget_mib: A[
+        Optional[int],
+        "Per-rank MiB budget (#395) for DeepSeek's chunked-prefix / "
+        "attention-scratch strategy switch: MHA_CHUNKED_KV / MHA_ONE_SHOT "
+        "materialize per-token K/V scratch that scales with THIS rank's "
+        "local head count and head dim, which differs per rank under "
+        "(uneven) TP. Converted once per rank, at attention-layer init, "
+        "into a token threshold via "
+        "budget_mib*MiB // (num_local_heads*(qk_head_dim+v_head_dim)*2 "
+        "bytes) -- the SAME MiB value therefore yields a DIFFERENT token "
+        "threshold on ranks with different local head counts, and that is "
+        "the point, not a bug: the scratch budget is what stays constant. "
+        "This is an absolute, entire budget -- no implicit safety margin "
+        "is subtracted. Default (640 MiB) reproduces the legacy "
+        "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=8192 token default "
+        "bit-for-bit on the reference DeepSeek-V3 TP=1 geometry. Mutually "
+        "exclusive with the deprecated SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD "
+        "env var -- set at most one; setting only the env var is honored "
+        "with a one-line deprecation notice.",
+    ] = None
     disable_overlap_schedule: A[
         bool,
         Arg(
@@ -5578,6 +5598,9 @@ class ServerArgs:
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 
+        # Handle the deprecated attention-scratch token-count env var (#395).
+        self._handle_attn_scratch_budget_deprecation()
+
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -7659,6 +7682,46 @@ class ServerArgs:
                     "--grpc-port is incompatible with --api-key/--admin-api-key: "
                     "the native gRPC listener bypasses HTTP auth middleware."
                 )
+
+    def _handle_attn_scratch_budget_deprecation(self):
+        """#395: --attn-scratch-budget-mib replaces the flat-token-count
+        SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD env var for DeepSeek's
+        chunked-prefix / attention-scratch strategy switch.
+
+        The two are mutually exclusive because they are denominated in
+        different units (MiB vs. tokens); silently letting one win over the
+        other would hide a configuration mistake instead of naming it. The
+        actual MiB->token conversion is geometry-dependent and happens
+        later, per rank, in DeepseekMHAForwardMixin.init_mha_forward, where
+        each rank's local head count and head dim are known -- ServerArgs
+        itself has no rank geometry to convert with.
+        """
+        env_threshold_set = envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.is_set()
+        if env_threshold_set and self.attn_scratch_budget_mib is not None:
+            raise ValueError(
+                "Both --attn-scratch-budget-mib and the deprecated "
+                "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD env var are set. "
+                "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD is a flat token "
+                "count that predates per-rank scratch-budget accounting "
+                "(#395); --attn-scratch-budget-mib is a MiB budget "
+                "converted to a per-rank token threshold using each rank's "
+                "local head geometry. Set only one."
+            )
+        if env_threshold_set:
+            logger.warning(
+                "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD is deprecated; use "
+                "--attn-scratch-budget-mib instead, which is a MiB scratch "
+                "budget converted per rank instead of a flat token count "
+                "(#395)."
+            )
+        if (
+            self.attn_scratch_budget_mib is not None
+            and self.attn_scratch_budget_mib <= 0
+        ):
+            raise ValueError(
+                f"--attn-scratch-budget-mib ({self.attn_scratch_budget_mib}) "
+                "must be a positive MiB value."
+            )
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():

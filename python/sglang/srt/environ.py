@@ -1141,6 +1141,13 @@ class Envs:
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
+    # Deprecated (#395): a flat token count does not scale with per-rank head
+    # count/head dim under (uneven) TP. Use --attn-scratch-budget-mib
+    # (ServerArgs), which is a MiB scratch budget converted to a per-rank
+    # token threshold at attention-layer init
+    # (attention_forward_methods/forward_mha.py). Still honored verbatim,
+    # with a deprecation warning, when explicitly set; mutually exclusive
+    # with --attn-scratch-budget-mib.
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
 
