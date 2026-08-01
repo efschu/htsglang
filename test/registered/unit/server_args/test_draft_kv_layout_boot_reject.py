@@ -36,12 +36,13 @@ decidable here -- how many attention layers the resolved draft CHECKPOINT
 carries -- is gated in the draft ModelRunner and covered by
 ``TestMultiLayerDraftCheckpointGate`` below.
 
-AND, FOR v1, THE PATH ITSELF IS REFUSED
----------------------------------------
-The draft-EXTEND forward has no uneven-DCP metadata split yet, so even the
-otherwise-admitted shape is turned away at boot -- see
-``TestDraftKvLayoutNotUsableYet``, which is also the reminder to delete that
-refusal once the split lands.
+SLICE 2 REMOVED THE BLANKET REFUSAL
+-----------------------------------
+Slice 1 additionally turned away even the otherwise-admitted shape, because
+the draft-EXTEND uneven-DCP metadata split did not exist. Slice 2 built it
+(``flashinfer_backend.call_begin_forward``, the ``EAGLE_DRAFT_EXTEND``
+branch), so that catch-all is gone and the covered shape passes. The
+per-condition surface below is unchanged and still as narrow as it was.
 """
 
 import os
@@ -126,37 +127,23 @@ class TestDraftKvLayoutDefaultIsInert(unittest.TestCase):
                 self.assertTrue(draft_pool_is_replicated(True, stub))
 
 
-class TestDraftKvLayoutNotUsableYet(unittest.TestCase):
-    """v1 stops at the draft-EXTEND gap, and says so.
+class TestDraftKvLayoutSliceTwoRemovedTheBlanketRefusal(unittest.TestCase):
+    """Slice 1 refused the whole layout at boot because the draft-EXTEND
+    uneven-DCP metadata split did not exist. Slice 2 built it, so that blanket
+    refusal is gone and the covered shape must now pass.
 
-    Boot-proven on the reference rig (TP=3, vector [30,17,17], NEXTN k=3
-    topk=1): with ``dcp`` the draft pool IS sized to this rank's owned share
-    (453632 -> 212670 / 120513 / 120513 rows) and the draft DECODE cuda graphs
-    capture. Draft EXTEND then dies in capture with AttributeError
-    '_cached_q_data_type', because flashinfer's DCP split admits only
-    ``_DCP_VERIFY_SPEC_INPUT_TYPES`` and an ``EAGLE_DRAFT_EXTEND`` falls into
-    the generic spec branch that leaves ``use_ragged`` False.
-
-    Until that split exists the flag must refuse at boot. This test is the
-    reminder to DELETE it: when draft-extend is implemented, the refusal goes
-    and ``test_the_covered_shape_passes`` below takes over.
+    This test is the inverse of the one it replaces: it pins that the
+    catch-all is NOT reinstated, while the per-condition surface below stays
+    exactly as narrow as it was.
     """
 
-    def test_the_otherwise_admitted_shape_is_refused_by_name(self):
+    def test_no_blanket_not_usable_refusal_remains(self):
         with patch.dict(os.environ, WEIGHTED_ENV):
-            with self.assertRaises(ValueError) as cm:
-                admitted_args()._reject_unsupported_draft_kv_dcp()
-            msg = str(cm.exception)
-            self.assertIn("draft-EXTEND", msg)
-            self.assertIn("_cached_q_data_type", msg)
-            # points at the analysis rather than just refusing
-            self.assertIn("TASK_108_DRAFT_KV_DCP.md", msg)
-            self.assertIn("replicated", msg)
+            # would have raised in slice 1
+            admitted_args()._reject_unsupported_draft_kv_dcp()
 
-    def test_the_specific_diagnostics_still_win(self):
-        """A user with BOTH a wrong config and the unimplemented path must get
-        the actionable message, not the catch-all -- so the not-implemented
-        raise sits last."""
+    def test_the_specific_diagnostics_still_fire(self):
+        """Removing the catch-all must not have removed the real guards."""
         with patch.dict(os.environ, WEIGHTED_ENV):
             with self.assertRaises(ValueError) as cm:
                 admitted_args(
@@ -167,9 +154,9 @@ class TestDraftKvLayoutNotUsableYet(unittest.TestCase):
 
 class TestDraftKvLayoutDcpAdmitted(unittest.TestCase):
     def test_the_covered_shape_passes(self):
-        """DISABLED until the draft-extend split lands; see
-        TestDraftKvLayoutNotUsableYet."""
-        self.skipTest("draft-extend DCP metadata split not implemented (#108 v1)")
+        """The one configuration the feature covers, admitted since slice 2."""
+        with patch.dict(os.environ, WEIGHTED_ENV):
+            admitted_args()._reject_unsupported_draft_kv_dcp()
 
     def test_the_predicates_flip_for_an_opted_in_draft(self):
         args = admitted_args()

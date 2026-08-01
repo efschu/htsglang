@@ -51,9 +51,7 @@ _SRT = pathlib.Path(__file__).resolve().parents[4] / "python" / "sglang" / "srt"
 _COMM = _SRT / "layers" / "dcp" / "comm.py"
 _FLASHINFER = _SRT / "layers" / "attention" / "flashinfer_backend.py"
 _MODEL_RUNNER = _SRT / "model_executor" / "model_runner.py"
-_GRAPH_RUNNER = (
-    _SRT / "model_executor" / "runner" / "decode_cuda_graph_runner.py"
-)
+_GRAPH_RUNNER = _SRT / "model_executor" / "runner" / "decode_cuda_graph_runner.py"
 _TP_WORKER = _SRT / "managers" / "tp_worker.py"
 
 # The lane's geometry on the reference rig: head rank owns every q/kv head, the
@@ -77,7 +75,7 @@ def _step_after_accept(accept_len: int, num_draft_tokens: int):
         is_idle=False,
         is_decode=False,
         has_prefix=weightless_has_prefix(
-            is_target_verify=True, extend_prefix_lens_cpu=None
+            forces_prefix=True, extend_prefix_lens_cpu=None
         ),
         num_full_attention_layers=_LAYERS,
         kv_head_total=_KV_HEADS,
@@ -357,9 +355,7 @@ class TestWeightlessWorkerPredicateSurvivesTheSpecWorker(CustomTestCase):
     def test_default_path_worker_without_either_attribute_is_false(self):
         # No lane, no spec: the predicate must not raise and must stay False.
         self.assertFalse(self._predicate(types.SimpleNamespace()))
-        self.assertFalse(
-            self._predicate(types.SimpleNamespace(target_worker=None))
-        )
+        self.assertFalse(self._predicate(types.SimpleNamespace(target_worker=None)))
 
     def test_base_spec_worker_really_has_no_model_runner(self):
         """The premise of the fix, pinned against the class itself.
@@ -380,9 +376,7 @@ class TestWeightlessWorkerPredicateSurvivesTheSpecWorker(CustomTestCase):
         self.assertTrue(hasattr(BaseSpecWorker, "target_worker"))
 
 
-def _function_source(
-    module_src: str, func_name: str, class_name: str = None
-) -> str:
+def _function_source(module_src: str, func_name: str, class_name: str = None) -> str:
     """Source of the def named ``func_name``, optionally inside ``class_name``.
 
     ``class_name`` matters wherever a name is reused across classes (base +

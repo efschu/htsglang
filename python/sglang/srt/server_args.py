@@ -6975,44 +6975,12 @@ class ServerArgs:
                 "other tokens' rows. Use --draft-kv-layout replicated."
             )
 
-        # NOT YET IMPLEMENTED, measured (#108 v1): the DRAFT-EXTEND forward has
-        # no uneven-DCP metadata split.
-        #
-        # Everything else on the draft side already works when the pool is
-        # token-sharded -- boot-proven on the reference rig (TP=3, vector
-        # [30,17,17], NEXTN k=3 topk=1): the pool is sized to this rank's
-        # owned share, the draft DECODE cuda graphs capture, and the owner-rule
-        # masked write / kv-head all-gather / LSE merge all run for the draft.
-        # Draft EXTEND does not. flashinfer's DCP split admits only
-        # _DCP_VERIFY_SPEC_INPUT_TYPES ({EAGLE_VERIFY, DFLASH_VERIFY}); an
-        # EAGLE_DRAFT_EXTEND falls into the generic spec branch, which leaves
-        # use_ragged False, so the ragged wrapper is never planned while
-        # _forward_extend_dcp runs the current-chunk ragged stage
-        # unconditionally -> AttributeError '_cached_q_data_type' during
-        # "Capture draft extend CUDA graph". Exactly the failure the DFLASH
-        # verify hit before it joined that set.
-        #
-        # Adding EAGLE_DRAFT_EXTEND to that SET is the wrong door -- the verify
-        # split assumes a uniform draft_token_num query block, while
-        # draft-extend's block is the per-request accept length. The likely
-        # fix is the OTHER branch, the non-spec extend DCP split, which already
-        # builds owned-prefix indices from prefix_lens and derives qo_indptr
-        # from cumsum(seq_lens - prefix_lens), i.e. handles ragged per-request
-        # query lengths natively. Full argument in
-        # docs/dev/TASK_108_DRAFT_KV_DCP.md.
-        #
-        # Refuse by name at boot. A flag that reaches graph capture and dies on
-        # an AttributeError is worse than one that says what is missing.
-        raise ValueError(
-            "--draft-kv-layout dcp is not usable yet: the draft-EXTEND "
-            "forward has no uneven-DCP metadata split, so the run dies during "
-            "draft-extend CUDA graph capture with AttributeError "
-            "'_cached_q_data_type' (the ragged wrapper is never planned). The "
-            "pool sizing, the draft decode path and the owner-rule write are "
-            "implemented and boot-proven; only the draft-extend split is "
-            "missing. See docs/dev/TASK_108_DRAFT_KV_DCP.md. Use "
-            "--draft-kv-layout replicated."
-        )
+        # NOTE (#108 slice 2): the draft-EXTEND uneven-DCP metadata split now
+        # exists (flashinfer_backend.call_begin_forward, the
+        # EAGLE_DRAFT_EXTEND branch), so the blanket "not usable yet" refusal
+        # that stood here in slice 1 is gone. What remains above is the
+        # per-condition surface: this layout is admitted on the weighted lane
+        # with a one-layer chain draft and nothing else.
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated

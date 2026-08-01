@@ -1,11 +1,13 @@
 # Task #108 — `--draft-kv-layout`: a DCP-token-sharded draft KV pool
 
-Status: **v1 lands the geometry, NOT a usable flag.** `--draft-kv-layout dcp`
-refuses at boot, by name, because the draft-EXTEND forward has no uneven-DCP
-metadata split (§"The gap that stopped v1"). Everything up to that point is
-implemented and boot-proven: the pool is token-sharded on-card, the draft
-DECODE cuda graphs capture, and the owner-rule write runs for the draft.
-Scope is the MTP/NEXTN chain; multi-layer EAGLE is out and refused by name.
+Status: **slice 1 (geometry) + slice 2 (draft-extend split) built; GPU
+validation pending.** Slice 1 unified the draft-exclusion predicate and
+token-sharded the draft pool (boot-proven on-card), but refused the layout at
+boot because the draft-EXTEND forward had no uneven-DCP metadata split. Slice 2
+built that split, so the blanket refusal is gone and the covered shape is
+admitted. Nothing on this path has run on a card yet -- see "What the GPU
+ticket must validate". Scope is the MTP/NEXTN chain; multi-layer EAGLE is out
+and refused by name.
 
 ## What the flag does
 
@@ -99,57 +101,91 @@ shrinks the POOL to `C * ratio_r / S`, which is exactly what the existing
 charge assumes. No change to `pool_configurator` was needed — the accounting
 was always written for the sharded shape.
 
-## The gap that stopped v1: draft-EXTEND has no DCP metadata split
+## Slice 2: the draft-EXTEND DCP metadata split
 
-Measured on the rig, not predicted. With `--draft-kv-layout dcp` the boot gets
-all the way through pool construction and draft-DECODE graph capture, then
-dies in draft-EXTEND capture:
+### What slice 1 hit
+
+With `--draft-kv-layout dcp` the boot got through pool construction and
+draft-DECODE graph capture, then died in draft-EXTEND capture:
 
 ```
 Capture draft decode CUDA graph end. elapsed=2.17 s      <- fine
 Capture draft extend CUDA graph begin...
 AttributeError: 'BatchPrefillWithRaggedKVCacheWrapper' object
   has no attribute '_cached_q_data_type'
-  flashinfer_backend._forward_extend_dcp -> _dcp_ragged_current
-  -> self.active_ragged_wrapper.forward_return_lse(...)
 ```
 
-The ragged wrapper was never planned. `init_forward_metadata` sets
-`use_ragged = True` in exactly two places: the non-spec extend branch
-(`spec_info is None and uneven_dcp`) and the target-verify split
-(`uneven_dcp and spec_input_type in _DCP_VERIFY_SPEC_INPUT_TYPES`, i.e.
-`{EAGLE_VERIFY, DFLASH_VERIFY}`). A draft-extend carries an
-`EAGLE_DRAFT_EXTEND` spec input, so it matches neither and falls into the
-generic spec branch, which leaves `use_ragged` False — while
-`_forward_extend_dcp` runs the current-chunk ragged stage unconditionally.
+The ragged wrapper was never planned. `init_forward_metadata` set
+`use_ragged = True` in exactly two places -- the non-spec extend branch and the
+target-verify split (`_DCP_VERIFY_SPEC_INPUT_TYPES`) -- and an
+`EAGLE_DRAFT_EXTEND` matched neither, so it fell into the generic spec branch
+while `_forward_extend_dcp` ran the ragged stage unconditionally.
 
-This is the identical failure shape the ngram/DFLASH guards already document,
-which is what makes it recognisable rather than mysterious.
+### The split contract
 
-### The likely fix, for the next pass
+Draft-extend is now decomposed exactly like target-verify, in its own branch in
+`call_begin_forward`:
 
-Adding `EAGLE_DRAFT_EXTEND` to `_DCP_VERIFY_SPEC_INPUT_TYPES` is the WRONG
-door: that branch is the verify split, which assumes a uniform
-`draft_token_num` query block per request over a committed prefix, and
-draft-extend's query block is the per-request accept length.
+| stage | reads | heads | mask | collectives |
+|---|---|---|---|---|
+| paged | this rank's OWNED slots of the committed prefix | full replicated | non-causal | Q all-gather + LSE merge |
+| ragged | the `num_tokens_per_req` tokens this step appends | LOCAL shard | causal | none |
 
-The RIGHT door is almost certainly the OTHER branch — the non-spec extend
-DCP split (`spec_info is None and uneven_dcp`). That branch is already shaped
-for exactly this: it builds owned-prefix kv indices with
-`_build_dcp_weighted_kv_indices(..., prefix_lens, ...)` and derives
-`qo_indptr` from `cumsum(seq_lens - prefix_lens)` — i.e. it handles
-PER-REQUEST RAGGED query lengths natively, which is what varying accept
-lengths need. Draft-extend is structurally a normal extend of the draft's own
-chain: paged owned prefix + local ragged current chunk + LSE merge.
+combined by the cross-rank LSE merge. Same owner rule, same index builder
+(`_build_dcp_weighted_kv_indices`), same kernels, same collectives as the
+target side. No new kernel and no new collective kind.
 
-So the hypothesis to test first is: widen that branch's condition from
-`spec_info is None` to also admit `EAGLE_DRAFT_EXTEND` on a DCP draft worker,
-provided the draft-extend call site actually supplies `prefix_lens`
-(`seq_lens - accept_len`) rather than only `spec_info`. Both the condition
-and the `prefix_lens` availability need checking against
-`eagle_draft_extend_cuda_graph_runner`, and the result needs a boot — a wrong
-guess here is the silent right-token/wrong-slot class, not a crash, so it was
-not worth guessing at inside this pass's remaining GPU window.
+**The one thing not shared with verify, and the whole correctness content of
+the branch.** For verify, `paged_kernel_lens` IS the committed prefix -- the
+draft tokens are not in `seq_lens`. For draft-extend, `seq_lens` ALREADY counts
+the tokens this step appends: they are written into the pool by the owner-rule
+masked write at the top of the same forward. So the paged read must cover
+`seq_len - num_tokens_per_req` (`lockstep.draft_extend_prefix_lens`, clamped at
+zero). Reading the full `seq_len` would let every query attend its OWN key
+through the non-causal paged stage as well as through the causal ragged stage,
+i.e. count it twice in the LSE merge -- a wrong answer, not a crash. That is
+also why this is a separate branch and not a new member of
+`_DCP_VERIFY_SPEC_INPUT_TYPES`.
+
+The slice-1 note here previously guessed the fix was the non-spec extend branch
+("it handles ragged per-request query lengths"). That guess was wrong in its
+premise: draft-extend's qo layout is a CONSTANT `num_tokens_per_req` stride, not
+the per-request accept length, precisely so it can be cuda-graph captured
+(`EagleDraftExtendInput.generate_attn_arg_prefill`). The verify-shaped branch is
+the right template; only the prefix derivation differs.
+
+### Rank-uniformity (#94 family)
+
+`has_prefix` decides whether the Q all-gather and the LSE merge are issued at
+all, so it must be identical on every rank. A draft-extend batch carries NO
+prefix vector -- `ForwardBatch` fills `extend_prefix_lens` from
+`batch.prefix_lens`, which the draft-extend batch does not populate -- so a
+length-based test answers False and skips the prefix stage entirely: the draft
+would attend only this step's tokens and silently ignore the whole context, and
+where the answer differed per rank the owner of a short prefix would sit alone
+in an all-gather nobody joins.
+
+Forward-mode first, unconditionally, as #180 established for verify. The rule is
+one shared function, `lockstep.dcp_forces_prefix(is_target_verify,
+is_draft_extend)`, read by the flashinfer forward and pinned on CPU. No new
+collective was introduced; no new rank-local branch guards an existing one.
+
+### CUDA-graph capture safety
+
+The captured draft-extend graph runs its ragged stage INSIDE the capture, which
+is the same hazard `_get_verify_ragged_cg_wrapper` exists for: the shared
+`prefill_wrapper_ragged` is not in cuda-graph mode, so its `plan()` keeps a bare
+reference to the caller's transient `torch.arange` indptr, the captured kernel
+freezes that pointer, and the allocator later reuses the block.
+
+Draft-extend therefore gets its own per-bucket graph-mode wrapper,
+`_get_draft_extend_ragged_cg_wrapper`, from a SEPARATE dict. Separate on
+purpose: draft-extend and verify are captured at the same `bs` values but are
+different graphs with different qo strides, and flashinfer latches
+`_max_total_num_rows` on a wrapper's first plan (the #274 round-7a failure one
+level up). No mask buffers -- a draft-extend chain is plain causal and topk > 1
+cannot reach this layout at all (boot-refused), and a wrapper created with a
+mask buffer would silently run CUSTOM mode on every replay.
 
 ## Measured: what the byte win actually is (and is not)
 
@@ -212,8 +248,9 @@ temperature 0); the `dcp` arm never served a request.
 
 ## Honest remainder
 
-0. **Draft-extend DCP metadata split** — the blocker above. Until it lands the
-   flag refuses at boot and nothing downstream of it can be exercised.
+0. **Nothing on the dcp path has run on a card since slice 2.** The split is
+   built and hermetically tested; correctness is argued, not measured. See
+   the GPU ticket below.
 1. Triton backend: the draft gate is wired in `flashinfer_backend` only.
    `triton_backend` has the owner rule (#173) and chain verify (#180) but its
    own `uneven_dcp` derivation still reads `is_draft_worker` directly, so
@@ -231,3 +268,39 @@ temperature 0); the `dcp` arm never served a request.
    when `can_use_store_cache` is false) carries no `kv_store_bound` clamp,
    relying on torch advanced indexing's own device assert. Pre-existing, same
    class as the registered #355 open items, not draft-specific.
+
+
+## What the GPU ticket must validate
+
+The split is desk work: its numeric behaviour has never executed. The ticket
+needs one TP=3 uneven-DCP window (the runbook 4.1 recipe, NEXTN k=3 topk=1,
+full CUDA graphs) and must answer these, in this order, because each one makes
+the next meaningful:
+
+1. **It boots at all.** `--draft-kv-layout dcp` must reach "fired up" --
+   specifically past "Capture draft extend CUDA graph", the step that died in
+   slice 1 with `AttributeError: '_cached_q_data_type'`. That single log line
+   is the whole slice-2 claim.
+2. **No hang under the forced prefix.** The prefix stage now runs on every
+   draft-extend, so every rank issues the Q all-gather and the LSE merge on
+   every such step. A hang here is the #94 family and would mean
+   `dcp_forces_prefix` is not in fact rank-uniform in some batch shape (idle
+   batches and bs=1 buckets are the ones to watch).
+3. **The answers are coherent, and the accept length is not degraded.** Two
+   completions at temperature 0, plus `meta_info.spec_accept_length` read
+   against the `replicated` arm on the same prompt. A double-counted prefix
+   (the failure mode the subtraction prevents) would most likely show as a
+   DROP in accept length rather than as garbage, because the draft would still
+   be fluent while diverging from what the target verifies -- so accept length
+   is the sensitive instrument here, not eyeballing the text.
+4. **bs > 1 replay.** The per-bucket ragged wrapper exists because bs=1 alone
+   survived by allocator luck in the verify case. Exercise several decode
+   bucket sizes so more than one captured draft-extend bucket is replayed.
+5. **Per-rank draft-KV pool bytes, both layouts**, to confirm the slice-1
+   measurement still holds after the split (it should be unchanged: the split
+   touches attention metadata, not pool sizing).
+
+Not in scope for the first window: a byte-win claim. On the reference rig the
+kv-heads are freely shardable (8 over 3 ranks) so the layout is byte-neutral
+there by the rule in the section above; demonstrating the full shard factor
+needs a `TP > num_kv_heads` configuration.

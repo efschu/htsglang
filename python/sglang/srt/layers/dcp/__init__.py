@@ -52,6 +52,8 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.dcp.lockstep import (
     chain_spec_verify_rows,
+    dcp_forces_prefix,
+    draft_extend_prefix_lens,
     spec_accept_broadcast_shapes,
     weightless_has_prefix,
     weightless_layer_op_tags,
@@ -109,6 +111,8 @@ __all__ = [
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
+    "dcp_forces_prefix",
+    "draft_extend_prefix_lens",
     "get_dcp_lens",
     "spec_accept_broadcast_shapes",
     "update_local_kv_lens_for_dcp",
