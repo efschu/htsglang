@@ -80,6 +80,16 @@ class ForwardPeakTracker:
             peak = int(torch.cuda.max_memory_allocated(self.device))
         except Exception:
             return
+        # Driver-level view alongside torch's. Window 4 measured an 18.876 GiB
+        # torch peak on a card with 19.58 GiB usable and then OOMed with 72 MiB
+        # free: ~0.63 GiB was non-torch (CUDA context, NCCL buffers, offload
+        # staging) and invisible to max_memory_allocated. A budget built from
+        # the torch number alone is optimistic by exactly that much, so the
+        # driver's own free/total is recorded in the same row.
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(self.device)
+        except Exception:
+            free_b = total_b = 0
         key = f"{self._phase}/{_bucket(self._tokens)}"
         row = self.rows.setdefault(
             key,
@@ -90,12 +100,29 @@ class ForwardPeakTracker:
                 "peak_bytes_max": 0,
                 "peak_bytes_last": 0,
                 "tokens_max": 0,
+                "nvml_free_bytes_min": None,
+                "nvml_used_bytes_max": 0,
+                "nvml_total_bytes": 0,
+                "non_torch_bytes_max": 0,
             },
         )
         row["calls"] += 1
         row["peak_bytes_last"] = peak
         row["peak_bytes_max"] = max(row["peak_bytes_max"], peak)
         row["tokens_max"] = max(row["tokens_max"], self._tokens)
+        if total_b:
+            used = total_b - free_b
+            prev_free = row["nvml_free_bytes_min"]
+            row["nvml_free_bytes_min"] = (
+                free_b if prev_free is None else min(prev_free, free_b)
+            )
+            row["nvml_used_bytes_max"] = max(row["nvml_used_bytes_max"], used)
+            row["nvml_total_bytes"] = total_b
+            # What the driver sees that torch cannot account for. This is the
+            # term that made window 4's budget wrong.
+            row["non_torch_bytes_max"] = max(
+                row["non_torch_bytes_max"], max(used - peak, 0)
+            )
 
     def dump(self) -> None:
         if not self.rows:
