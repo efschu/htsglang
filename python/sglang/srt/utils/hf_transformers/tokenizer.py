@@ -134,6 +134,22 @@ class TokenizerWarningsFilter(logging.Filter):
 # Helpers for get_tokenizer
 # ---------------------------------------------------------------------------
 
+#: Files any one of which lets ``AutoTokenizer.from_pretrained(<dir>)`` build a
+#: tokenizer without the GGUF metadata. Ordered most- to least-common so the
+#: refusal message below reads as a recommendation.
+_SIBLING_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "spiece.model",
+    "vocab.json",
+)
+
+
+def _has_sibling_tokenizer(directory: Path) -> bool:
+    """True if *directory* holds tokenizer files next to the .gguf shards."""
+    return any((directory / name).exists() for name in _SIBLING_TOKENIZER_FILES)
+
 
 def _resolve_tokenizer_name(tokenizer_name, kwargs):
     """Resolve special name formats (GGUF, remote URLs, etc.) to a local path.
@@ -144,28 +160,40 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        # Bespoke-family GGUFs (qwen35/qwen35moe/gemma4) cannot go through
-        # transformers' GGUF tokenizer path: AutoTokenizer(..., gguf_file=...)
-        # re-synthesizes the config from the GGUF metadata and either rejects
-        # the arch outright (qwen35: "architecture qwen35 is not supported")
-        # or crashes on the per-layer num_key_value_heads list (gemma4) — the
-        # same failures config.py routes around via _peek_bespoke_gguf_arch.
-        # These checkpoints ship a sibling tokenizer.json/tokenizer_config.json,
-        # so load from the parent dir directly (NO gguf_file). Any bespoke arch
-        # WITH a sibling tokenizer uses this path; otherwise fall back to the
-        # transformers gguf_file path unchanged (non-bespoke GGUFs, or the rare
-        # bespoke export that ships no sibling tokenizer files).
+        # Bespoke-family GGUFs (qwen35/qwen35moe/gemma4/deepseek4/dflash-draft)
+        # cannot go through transformers' GGUF tokenizer path:
+        # AutoTokenizer(..., gguf_file=...) re-synthesizes the config from the
+        # GGUF metadata and either rejects the arch outright ("GGUF model with
+        # architecture deepseek4 is not supported yet",
+        # modeling_gguf_pytorch_utils.py) or crashes on the per-layer
+        # num_key_value_heads list (gemma4) — the same failures config.py
+        # routes around via _peek_bespoke_gguf_arch. These checkpoints read
+        # their tokenizer from the SIBLING files next to the shards, loaded
+        # from the parent dir directly (NO gguf_file). Non-bespoke GGUFs keep
+        # the transformers gguf_file path unchanged.
         from .config import _peek_bespoke_gguf_arch
 
         parent = Path(tokenizer_name).parent
-        if _peek_bespoke_gguf_arch(tokenizer_name) is not None and (
-            (parent / "tokenizer.json").exists()
-            or (parent / "tokenizer_config.json").exists()
-        ):
-            tokenizer_name = parent
-        else:
+        bespoke_arch = _peek_bespoke_gguf_arch(tokenizer_name)
+        if bespoke_arch is None:
             kwargs["gguf_file"] = tokenizer_name
             tokenizer_name = parent
+        elif _has_sibling_tokenizer(parent):
+            tokenizer_name = parent
+        else:
+            # No sibling tokenizer and no usable transformers route: falling
+            # through to gguf_file only reaches the arch rejection above, one
+            # frame deep in transformers, naming neither the real cause nor
+            # the fix. Refuse here and say what is missing.
+            raise ValueError(
+                f"GGUF architecture {bespoke_arch!r} is loaded through the "
+                f"sibling-file route, but {parent} holds no tokenizer files. "
+                "transformers' own GGUF tokenizer reader cannot read this "
+                "architecture, so there is no fallback. Place one of "
+                f"{', '.join(_SIBLING_TOKENIZER_FILES)} next to the .gguf "
+                "(copy them from the upstream repo of this checkpoint), or "
+                "point --tokenizer-path at a directory that has them."
+            )
 
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 

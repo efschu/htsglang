@@ -686,9 +686,10 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
 
 ### 4.5.1 Community GGUFs need a sibling config.json — and it must match
 
-The bespoke families (`qwen35`, `gemma4`) cannot use transformers' GGUF
-metadata reader, so they read geometry and tokenizer from **sibling files next
-to the `.gguf`** (`config.json`, `tokenizer.json`, …; see
+The bespoke families (`qwen35`, `gemma4`, `deepseek4`, plus the `dflash-draft`
+contributor) cannot use transformers' GGUF metadata reader, so they read
+geometry and tokenizer from **sibling files next to the `.gguf`**
+(`config.json`, `tokenizer.json`, …; see
 `utils/hf_transformers/config.py::_peek_bespoke_gguf_arch`). Repos that ship
 the `.gguf` alone — which is most community quantizations, including both
 task-#154 trees — therefore do not boot until those files exist. Borrow them
@@ -726,6 +727,27 @@ the file it claims to describe, on every bespoke-family GGUF boot:
 Confirm the line in the log before trusting a depth-merge boot; for Deckard it
 reads `has 96 blocks, sibling config.json declares num_hidden_layers=64`, and
 the loader then reports `qwen35 GGUF name map: 1275 tensors for 96 layers`.
+
+Two further consequences of the sibling files being the UPSTREAM repo's files
+(#402), both automatic — neither needs a hand edit to the model directory:
+
+- **The sibling `quantization_config` is dropped**, with one log line
+  (`GGUF sibling config: dropping quantization_config (quant_method='fp8')
+  …`). It describes how the upstream checkpoint was quantized, not the file
+  being loaded, and left in place it aborts the boot in
+  `ModelConfig._verify_quantization` with `Quantization method specified in
+  the model config (fp8) does not match … (gguf)` — a conflict about a tensor
+  nobody reads. The GGUF's ggml types are the ground truth. Non-GGUF
+  checkpoints keep their `quantization_config` untouched; the drop only
+  happens on this route.
+- **The tokenizer comes from the same directory, and says so when it
+  cannot.** For a bespoke arch there is no fallback:
+  `AutoTokenizer(..., gguf_file=…)` re-enters the reader that rejected the
+  arch in the first place (`GGUF model with architecture deepseek4 is not
+  supported yet`). If none of `tokenizer.json`, `tokenizer_config.json`,
+  `tokenizer.model`, `spiece.model`, `vocab.json` is next to the shards, the
+  boot now refuses naming the directory and that list. Putting one of them
+  there is what makes `--tokenizer-path` unnecessary.
 
 An `mmproj-*.gguf` left in the directory is picked up automatically
 (`detect_gguf_multimodal`) and the model boots multimodal, which costs the
@@ -801,6 +823,61 @@ Two things to know before booting such a file:
 `SGLANG_GGUF_MXFP4_REPACK=0` switches the repack off, which restores the
 pre-#391 behaviour: the family adapter's executability gate refuses the file at
 load time, naming MXFP4. That is a debugging switch, not an operating mode.
+
+### 4.5.4 DeepSeek V4 Flash GGUF, TP=3 uneven (#391/#402)
+
+The model directory needs four sibling files next to the shards and nothing
+else. The upstream `config.json` goes in **as shipped** — do not strip
+anything out of it:
+
+```bash
+GGUF_DIR="$MODEL_ROOT/DeepSeek-V4-Flash-0731-GGUF/UD-Q3_K_XL"
+# config.json from deepseek-ai/DeepSeek-V4-Flash-0731, pristine
+# tokenizer.json / tokenizer_config.json / generation_config.json from the same repo
+```
+
+```bash
+setsid "$VENV/bin/python" -u -m sglang.launch_server \
+  --model-path "$GGUF_DIR/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00001-of-00004.gguf" \
+  --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto \
+  --kv-cache-dtype fp8_e4m3 \
+  --context-length 8192 --max-running-requests 1 \
+  --disable-cuda-graph \
+  --trust-remote-code --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+Three things that were operator workarounds up to boot attempt 5 and are now
+handled in the code — none of them belongs in a boot script any more:
+
+- **Do not strip `quantization_config` out of `config.json`.** The upstream
+  file declares fp8 and that is correct about the upstream weights; section
+  4.5.1 drops it on this route. A hand-stripped config is now indistinguishable
+  from the pristine one and just costs you the provenance.
+- **Do not pass `--tokenizer-path`.** With the tokenizer files next to the
+  shards the GGUF path resolves them itself (section 4.5.1). The flag still
+  works — it simply is not needed, and pointing it at a second directory means
+  the tokenizer and the weights can drift apart unnoticed.
+- **`--rank-tp-ratio auto` works.** It derives byte-valued weights from the
+  NVML budgets (`[29607,17780,17780]` on this rig), which used to abort in
+  `wq_b` with `32768 is not divisible by sum(weights)=65167`. V4's attention
+  now declares `o_groups` as its unit count, so any positive vector snaps to
+  whole groups — `[4,2,2]` groups, i.e. `[32,16,16]` of the 64 heads. The
+  o_group is the unit and not the head because `wo_a` consumes one whole
+  group's worth of heads at the GLOBAL width; a head-granular split would
+  satisfy the partitioner and then produce a wrong einsum.
+  `--rank-tp-ratio 30,17,17` is still accepted and now lands on the same
+  `[32,16,16]`, not the `[30,17,17]` it used to compute.
+
+Attention TP on this model is capped at `o_groups` = 8 ranks, refused by name
+above that.
+
+The open blocker is unchanged and unrelated to the above: the routed `down`
+projections are MXFP4 (section 4.5.3 repacks them to Q5_0, which costs
++14 GiB) and host RAM is the binding constraint — boot attempt 5 was killed by
+the OOM killer during weight load with `SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.36`
+and `SGLANG_MOE_SCRATCH_SLOTS=4` (~81 GiB pinned of ~88 GiB usable).
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 

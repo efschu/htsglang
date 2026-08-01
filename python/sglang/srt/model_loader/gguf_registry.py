@@ -138,6 +138,50 @@ _GEOMETRY_CHECKS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+def _drop_sibling_quantization_config(config, text_config, gguf_file: str) -> None:
+    """Remove the sibling config.json's ``quantization_config`` block.
+
+    The sibling config is the UPSTREAM checkpoint's config (that is where a
+    community GGUF tree gets one from), so it describes how the ORIGINAL
+    weights were quantized -- fp8 block-quant for DeepSeek-V4-Flash-0731.  The
+    file actually being loaded is the GGUF, whose ggml types are the ground
+    truth and which the loader already selects via ``--quantization gguf``.
+    Left in place the stale block wins the argument in
+    ``ModelConfig._verify_quantization`` and the boot dies with
+
+        Quantization method specified in the model config (fp8) does not match
+        the quantization method specified in the `quantization` argument (gguf)
+
+    which is not a real conflict: no fp8 tensor is being read.  Only reachable
+    from the bespoke-GGUF route (this function's only caller), so a non-GGUF
+    checkpoint keeps its quantization_config untouched.
+    """
+    dropped = None
+    for cfg in (config, text_config):
+        if cfg is None:
+            continue
+        value = getattr(cfg, "quantization_config", None)
+        if value is not None and dropped is None:
+            dropped = value
+        try:
+            delattr(cfg, "quantization_config")
+        except AttributeError:
+            # Not an instance attribute (class-level default / property):
+            # blanking it is what the readers downstream test for.
+            if getattr(cfg, "quantization_config", None) is not None:
+                cfg.quantization_config = None
+    if dropped is None:
+        return
+    logger.info(
+        "GGUF sibling config: dropping quantization_config (quant_method=%r) "
+        "from the config.json next to %s -- it describes the upstream "
+        "checkpoint, while the file being loaded is the GGUF, whose ggml "
+        "types are authoritative.",
+        (dropped.get("quant_method") if isinstance(dropped, dict) else dropped),
+        gguf_file,
+    )
+
+
 def _gguf_layer_index(tensor_name: str) -> Optional[int]:
     m = re.match(r"blk\.(\d+)\.", tensor_name)
     return int(m.group(1)) if m else None
@@ -181,9 +225,11 @@ def _rebuild_layer_types(
 def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     """Reconcile a sibling-config geometry against the GGUF file it describes.
 
-    Mutates ``config``'s text config in place (depth only) and raises
-    ``ValueError`` on a non-reconcilable disagreement.  Best-effort: if the
-    GGUF metadata does not carry a field, that field is simply not checked.
+    Mutates ``config`` in place -- drops the upstream ``quantization_config``
+    (see :func:`_drop_sibling_quantization_config`) and reconciles the depth --
+    and raises ``ValueError`` on a non-reconcilable disagreement.  Best-effort
+    for geometry: if the GGUF metadata does not carry a field, that field is
+    simply not checked.
     """
     import gguf  # lazy: keeps the registry import-light
 
@@ -230,6 +276,8 @@ def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     text_config = (
         config.get_text_config() if hasattr(config, "get_text_config") else config
     )
+
+    _drop_sibling_quantization_config(config, text_config, gguf_file)
 
     mismatches: List[str] = []
     for suffix, attr in _GEOMETRY_CHECKS:

@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
 )
+from sglang.srt.distributed.utils import tp_partition_offset, tp_partition_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -373,9 +374,46 @@ class MqaAttentionBase(nn.Module):
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = self.n_heads // self.attn_tp_size
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // self.attn_tp_size
+        # ---- uneven TP (--rank-tp-ratio): the o_group is the indivisible unit
+        #
+        # Every sharded dimension in this attention block is head-structured,
+        # but heads and o_groups are COUPLED, so the head is not the unit:
+        # after attention `o` is reshaped to (tokens, n_local_groups, -1) and
+        # multiplied by wo_a, whose per-group input width is the GLOBAL
+        # n_heads * head_dim // n_groups and is NOT sharded. A rank must
+        # therefore hold whole o_groups' worth of heads, i.e.
+        # n_heads // n_groups heads at a time.
+        #
+        # Declaring `n_groups` as the unit count on wq_b / wo_a / wo_b makes
+        # the shard cuts land on those boundaries for ANY positive weight
+        # vector, which is what `--rank-tp-ratio auto` needs: it derives
+        # byte-valued weights from the NVML budgets (e.g. [29607,17780,17780])
+        # whose sum divides nothing, and without a unit count
+        # `partition_sizes` refuses the 32768-wide wq_b output outright.
+        # With no ratio plan installed `tp_partition_size` reproduces the
+        # plain `// tp_size` split, so the even path is unchanged.
+        if self.n_heads % self.n_groups != 0:
+            raise ValueError(
+                f"DeepSeek V4 attention: num_attention_heads={self.n_heads} is "
+                f"not a multiple of o_groups={self.n_groups}; the wo_a "
+                "per-group width is not well defined."
+            )
+        if self.attn_tp_size > self.n_groups:
+            raise ValueError(
+                f"DeepSeek V4 attention: attention TP size {self.attn_tp_size} "
+                f"exceeds o_groups={self.n_groups}. The o_group is the "
+                "indivisible attention unit (wo_a maps one group at a time), "
+                "so at most one group per rank can be served; a finer split "
+                "would leave ranks with zero groups."
+            )
+        self.attn_tp_units = self.n_groups
+        self.n_local_heads = tp_partition_size(
+            self.n_heads, self.attn_tp_size, self.attn_tp_rank, self.attn_tp_units
+        )
+        self.n_local_groups = tp_partition_size(
+            self.n_groups, self.attn_tp_size, self.attn_tp_rank, self.attn_tp_units
+        )
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.eps = config.rms_norm_eps
@@ -462,6 +500,9 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wq_b", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            # n_heads * head_dim in n_groups units of (n_heads // n_groups)
+            # heads each -- see the coupling note in __init__.
+            tp_units=self.attn_tp_units,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -472,6 +513,10 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_a", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            # Output is n_groups x o_lora_rank; the INPUT (one group's worth
+            # of heads) stays global, which is exactly why the head split has
+            # to follow the group split.
+            tp_units=self.attn_tp_units,
             **({} if fp8 else {"params_dtype": torch.bfloat16}),
         )
         if fp8:
@@ -488,6 +533,9 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            # Row-parallel input is the same n_groups x o_lora_rank vector
+            # wo_a produced, so it takes the same unit count.
+            tp_units=self.attn_tp_units,
         )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
@@ -1096,10 +1144,19 @@ class MQALayer(MqaAttentionBase):
             if self._attn_sink_local is None:
                 # Build once on the first forward (post weight load); a per-call
                 # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
+                # Prefix-sum start, not rank * n_local_heads: under an uneven
+                # plan the shards have different widths, so the naive product
+                # would read the wrong heads on every rank but 0. Reproduces
+                # rank * n_local_heads exactly on the even path.
+                start = tp_partition_offset(
+                    self.n_heads,
+                    self.attn_tp_size,
+                    self.tp_rank,
+                    self.attn_tp_units,
+                )
                 sink = self.attn_sink.new_zeros(padded_num_heads)
                 sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                    start : start + self.n_local_heads
                 ]
                 self._attn_sink_local = sink
 
