@@ -1231,6 +1231,28 @@ def get_gguf_extra_tensor_names(
     return [gguf_to_hf_name_map[key] for key in extra_keys]
 
 
+def gguf_quantized_name(name: str, leaf: str) -> str:
+    """Rename the trailing ``.weight`` of a mapped tensor name to *leaf*.
+
+    Only the FINAL path segment is rewritten. The previous spelling was
+    ``name.replace("weight", <leaf>)``, which rewrites EVERY occurrence, so a
+    module whose own name contains "weight" was renamed along with its leaf:
+    ``...attn.indexer.weights_proj.weight`` became
+    ``...attn.indexer.qweights_proj.qweight``, a parameter no model has
+    (#391 wall 16). That tensor is F32 in the published DeepSeek V4 export and
+    F32 tensors never reach this rename, which is the only reason the defect
+    was invisible rather than fatal.
+
+    A name that does not end in ``.weight`` is returned unchanged, matching the
+    old behaviour for the bare parameters (``...attn_sink``, ``...hc_ffn_fn``,
+    ``...gate.tid2eid``) that carry no ``weight`` substring at all.
+    """
+    head, sep, tail = name.rpartition(".")
+    if tail != "weight":
+        return name
+    return f"{head}{sep}{leaf}"
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -1317,7 +1339,7 @@ def gguf_quant_weights_iterator(
             name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
-                weight_type_name = name.replace("weight", "qweight_type")
+                weight_type_name = gguf_quantized_name(name, "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
 
     # Second pass: yield actual weights
@@ -1366,7 +1388,7 @@ def gguf_quant_weights_iterator(
             name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
-                name = name.replace("weight", "qweight")
+                name = gguf_quantized_name(name, "qweight")
             param = torch.tensor(repacked_gguf_bytes(source_type, weight, tensor_name))
             yield name, param
 
