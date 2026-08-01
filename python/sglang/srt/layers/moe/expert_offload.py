@@ -163,13 +163,19 @@ def expert_offload_released_device_bytes(
 
 
 def record_expert_offload_release(
-    device_bytes: int, host_bytes: int, tensors: int = 1
+    device_bytes: int, host_bytes: int, tensors: int = 1, count_layer: bool = True
 ) -> None:
-    """Tally one layer's release. Called once per layer that actually split."""
+    """Tally one layer's release. Called once per layer that actually split.
+
+    ``count_layer=False`` is for callers that tally a layer one TENSOR at a
+    time (the #123-GGUF materialization-time staging stages w13 and w2 in
+    separate calls) and must not report the layer twice.
+    """
     _RELEASE_TALLY.device_bytes += max(0, int(device_bytes))
     _RELEASE_TALLY.host_bytes += max(0, int(host_bytes))
     _RELEASE_TALLY.tensors += max(0, int(tensors))
-    _RELEASE_TALLY.layers += 1
+    if count_layer:
+        _RELEASE_TALLY.layers += 1
 
 
 def expert_offload_release_totals() -> ExpertOffloadRelease:
@@ -483,9 +489,207 @@ def scratch_slot_count(resident_count: int) -> int:
     return max(8, resident_count // 4)
 
 
+# ===========================================================================
+# #123-GGUF: MATERIALIZATION-TIME staging (the third load-time entry point).
+#
+# fp8 / GPTQ / AWQ reach the offload through
+# ``presplit_expert_offload_after_repack``: by the time it runs, a real
+# ``[E, ...]`` expert stack already exists and is merely split. GGUF cannot use
+# that door. Its expert parameter is a ``GGUFUninitializedParameter`` with no
+# storage at all until ``materialize_gguf_weights`` stacks the per-expert
+# tensors the loader collected -- and that stack is exactly the allocation the
+# offload exists to avoid (it is built on the host and copied to the card in
+# full, so both peaks are paid before any presplit could run).
+#
+# So the GGUF half intercepts one step EARLIER: instead of splitting a stack
+# that exists, it decides residency FIRST and then materializes only the
+# resident slots on the device, streaming every other expert straight into the
+# pinned host tier. The full stack is never formed on either side.
+#
+# The three functions below are the reusable half of that: plan (pure), stage
+# (per-expert copy into the two tiers), register (hand the tiers to the cache
+# in the same ``_moe_offload_presplit`` shape the repack door uses). They take
+# a per-expert ``source(expert_id) -> Tensor`` callable rather than a stacked
+# tensor, which is what makes them usable before materialization.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class ExpertStagingPlan:
+    """Which expert lands where, decided BEFORE any tensor is allocated.
+
+    ``resident_ids[i]`` is the expert that occupies GPU slot ``i`` (``i < R``);
+    ``spill_ids[j]`` is the expert at pinned-pool row ``j``. Tuples, so the
+    plan is hashable, comparable and printable in a test.
+
+    ``pinned_experts`` (see ``plan_load_time_staging``) is why the layout is
+    carried explicitly instead of being the implicit static ``[0, R)``.
+    """
+
+    num_experts: int
+    resident_count: int
+    buffer_slots: int
+    resident_ids: Tuple[int, ...]
+    spill_ids: Tuple[int, ...]
+
+    @property
+    def is_static_layout(self) -> bool:
+        """True when the plan is exactly the default ``[0,R)`` residency."""
+        R = self.resident_count
+        return self.resident_ids == tuple(range(R)) and self.spill_ids == tuple(
+            range(R, self.num_experts)
+        )
+
+
+def plan_load_time_staging(
+    num_experts: int,
+    fraction: Optional[float] = None,
+    pinned_experts: Sequence[int] = (),
+) -> Optional[ExpertStagingPlan]:
+    """Residency plan for a load-time split, or ``None`` when there is none.
+
+    ``None`` means "do not offload this layer": either the resident fraction is
+    >= 1.0, or ceil(fraction * E) already covers every expert. Callers treat
+    ``None`` as "materialize the full stack the way you always did", which is
+    what keeps the default path byte-identical.
+
+    ``pinned_experts`` are expert ids that MUST be resident regardless of the
+    ordering. The GGUF uneven-TP expert-dim shard (#82) needs exactly this: its
+    trailing all-zero padding expert sits at id ``E-1`` -- the last id, so the
+    static ``[0,R)`` layout would put the one expert that EVERY foreign token
+    routes to in the spill pool and re-fetch it on every single forward. Pinned
+    ids take the lowest slots; the remaining slots are filled in ascending id
+    order, so the layout stays a pure function of (E, R, pinned) and therefore
+    deterministic across ranks and runs.
+    """
+    from sglang.srt.environ import envs
+
+    E = int(num_experts)
+    if E <= 0:
+        return None
+    frac = (
+        envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        if fraction is None
+        else float(fraction)
+    )
+    if frac >= 1.0:
+        return None
+    R = resident_slot_count(E, frac)
+    if R >= E:
+        return None
+    pinned = sorted({int(e) for e in pinned_experts})
+    for e in pinned:
+        if e < 0 or e >= E:
+            raise ValueError(f"pinned expert id {e} out of range [0,{E})")
+    if len(pinned) > R:
+        raise ValueError(
+            f"{len(pinned)} experts must stay resident but only {R} resident "
+            f"slots exist at fraction {frac} over {E} experts; raise "
+            f"SGLANG_MOE_RESIDENT_EXPERT_FRACTION."
+        )
+    pinned_set = set(pinned)
+    rest = [e for e in range(E) if e not in pinned_set]
+    resident_ids = pinned + rest[: R - len(pinned)]
+    resident_set = set(resident_ids)
+    spill_ids = [e for e in range(E) if e not in resident_set]
+    C = scratch_slot_count(R)
+    return ExpertStagingPlan(
+        num_experts=E,
+        resident_count=R,
+        buffer_slots=min(R + C, E),
+        resident_ids=tuple(resident_ids),
+        spill_ids=tuple(spill_ids),
+    )
+
+
+def stage_experts_into_tiers(plan: ExpertStagingPlan, source, out, release=None):
+    """Fill the two tiers from a per-expert ``source(expert_id) -> Tensor``.
+
+    ``out`` is the caller-allocated ``[buffer_slots, ...]`` device buffer; rows
+    ``[0, R)`` are written from ``plan.resident_ids`` and the scratch region
+    ``[R, buffer_slots)`` is deliberately left uninitialized (the fetch path
+    overwrites it before any read). Returns the ``[E-R, ...]`` pinned host
+    spill pool, row ``j`` holding ``plan.spill_ids[j]``.
+
+    ``source`` is called EXACTLY ONCE per expert, in staging order, and the
+    result is copied immediately -- so a source that frees its per-expert
+    tensor after handing it over (``release``) keeps host peak at one expert
+    above the two tiers, not at the full stack. Pinning is skipped when there
+    is no CUDA context (desk tests); production always has one, and the pinned
+    pool is what makes the H2D fetch async.
+
+    No reshaping, padding or re-blocking happens here: an expert's bytes are
+    copied whole. That is the property GGUF depends on -- its rows are opaque
+    quantization blocks (Q4_K 144 B / 256 values, Q6_K 210 B / 256 values), so
+    ANY split other than "whole experts on the expert axis" would cut a block
+    in half. The expert axis is the one axis with no block structure on it.
+    """
+    import torch
+
+    R = plan.resident_count
+    for slot, expert_id in enumerate(plan.resident_ids):
+        out[slot].copy_(source(expert_id))
+        if release is not None:
+            release(expert_id)
+    if R != len(plan.resident_ids):  # defensive: plan invariant
+        raise RuntimeError("staging plan resident_ids length != resident_count")
+
+    spill = None
+    for row, expert_id in enumerate(plan.spill_ids):
+        src = source(expert_id)
+        if spill is None:
+            spill = torch.empty(
+                (len(plan.spill_ids),) + tuple(src.shape),
+                dtype=src.dtype,
+                device="cpu",
+            )
+            if torch.cuda.is_available():
+                spill = spill.pin_memory()
+        spill[row].copy_(src)
+        if release is not None:
+            release(expert_id)
+    return spill
+
+
+def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
+    """Publish one staged tensor in the shape ``MoEExpertOffloadCache.install``
+    already understands, and tally the VRAM it means the layer never took.
+
+    Same contract as ``presplit_expert_offload_after_repack``'s stash
+    (``layer._moe_offload_presplit[attr] = (resident_buf, spill)`` +
+    ``_moe_offload_full_experts``), plus ``_moe_offload_frozen_layout`` for the
+    non-static case, which the cache adopts as its frozen residency map.
+    """
+    presplit = getattr(layer, "_moe_offload_presplit", None)
+    first_tensor_of_layer = presplit is None
+    if presplit is None:
+        presplit = {}
+        layer._moe_offload_presplit = presplit
+    presplit[attr] = (resident_buf, spill)
+    layer._moe_offload_full_experts = plan.num_experts
+    if not plan.is_static_layout:
+        layer._moe_offload_frozen_layout = (
+            list(plan.resident_ids),
+            list(plan.spill_ids),
+        )
+    row_bytes = (
+        (resident_buf.numel() // resident_buf.shape[0]) * resident_buf.element_size()
+        if resident_buf.shape[0]
+        else 0
+    )
+    record_expert_offload_release(
+        expert_offload_released_device_bytes(
+            plan.num_experts, plan.buffer_slots, row_bytes
+        ),
+        (spill.numel() * spill.element_size()) if spill is not None else 0,
+        1,
+        count_layer=first_tensor_of_layer,
+    )
+
+
 # --- #268: quant-path fail-fast for the expert-offload installer -----------
-# GGUF-MoE (GGUFMoEMethod / GGUFMoEAscendMethod) and MoeWNA16 (MoeWNA16Method)
-# have no load-time offload half: unlike fp8 / GPTQ-Marlin / AWQ-Marlin, their
+# Ascend GGUF-MoE (GGUFMoEAscendMethod) and MoeWNA16 (MoeWNA16Method) have no
+# load-time offload half: unlike fp8 / GPTQ-Marlin / AWQ-Marlin, their
 # per-expert tensors either aren't materialized yet at install time
 # (GGUFUninitializedParameter only takes real shape in the loader postprocess
 # step, #123) or use a quant layout the offload cache's tensor-slicing/LRU
@@ -508,8 +712,18 @@ def scratch_slot_count(resident_count: int) -> int:
 # and run with per-expert weights paired against another expert's scales:
 # silently wrong output, not a crash. Named here until an NVFP4 offload half
 # actually exists.
+#
+# #123-GGUF: ``GGUFMoEMethod`` moved out of the unconditional set into
+# _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES below. It is admitted ONLY on a layer
+# that actually carries the materialization-time staging marker
+# (``_moe_offload_gguf_staged``), which the GGUF half sets after it has staged
+# both expert tensors into the two tiers. Every GGUF path the half does not
+# cover -- a ggml type with no MoE kernel (MXFP4 type 39 among them), the
+# dense-linear-only Ascend method, a layer whose expert set is too small to
+# split -- leaves the marker unset and is refused exactly as before. The guard
+# therefore still fails fast rather than downgrading: what changed is that
+# there is now a covered case, not that the refusal got softer.
 _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
-    "GGUFMoEMethod",
     "GGUFMoEAscendMethod",
     "MoeWNA16Method",
     # NVFP4 MoE (#323b) -- ModelOpt serialized, ModelOpt online-converted, and
@@ -519,9 +733,16 @@ _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
     "CompressedTensorsW4A4Nvfp4MoE",
 )
 
+#: Quant methods with a load-time offload half that only covers PART of the
+#: paths the method can take. Value = name of the layer attribute the half sets
+#: once it has actually staged this layer; absent/False => refuse.
+_OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES = {
+    "GGUFMoEMethod": "_moe_offload_gguf_staged",
+}
+
 
 def assert_expert_offload_quant_supported(
-    quant_method, layer_id=None, scheme=None
+    quant_method, layer_id=None, scheme=None, layer=None
 ) -> None:
     """Fail-fast guard (#268/#323b) for the MoE expert-offload installer.
 
@@ -539,6 +760,12 @@ def assert_expert_offload_quant_supported(
     tensor layout is the scheme behind it, so checking only the wrapper would
     either miss NVFP4 or deny every compressed-tensors checkpoint.
 
+    ``layer`` is the FusedMoE layer about to be wrapped. It is what makes the
+    CONDITIONAL verdict possible (#123-GGUF): ``GGUFMoEMethod`` passes only on
+    a layer its half has actually staged, so an uncovered GGUF path is refused
+    with the same hard error as before instead of installing a cache over an
+    unstaged (or MXFP4-typed) expert parameter.
+
     Matched by class name (not isinstance) to avoid importing
     ``sglang.srt.layers.quantization.gguf`` / ``.moe_wna16`` /
     ``.modelopt_quant`` from this module at call sites that must stay
@@ -549,25 +776,47 @@ def assert_expert_offload_quant_supported(
         if candidate is None:
             continue
         name = type(candidate).__name__
-        if name not in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+        marker = _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES.get(name)
+        if marker is not None:
+            if getattr(layer, marker, False):
+                continue  # the half staged this layer -> covered
+            reason = (
+                f"{name!r} has a load-time offload half (#123-GGUF), but it "
+                f"did not stage this layer: the materialization-time staging "
+                f"marker {marker!r} is absent. That happens when the ggml "
+                f"quantization type has no GGUF MoE kernel (MXFP4 / type 39 "
+                f"and every other type outside MMVQ_QUANT_TYPES | "
+                f"MMQ_QUANT_TYPES), when the layer's expert parameters were "
+                f"already materialized by another path, or when the expert "
+                f"count is too small to split at this fraction. Installing "
+                f"the cache anyway would slice a parameter the half never "
+                f"tiered."
+            )
+        elif name in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+            reason = (
+                "GGUF-MoE (Ascend), MoeWNA16 and NVFP4 MoE have no load-time "
+                "offload half: the Ascend GGUF MoE method materializes and "
+                "pre-dequantizes on its own path (#123 covers the CUDA method "
+                "only), MoeWNA16's per-expert tensor layout was never "
+                "validated against the offload cache's slice/fetch path, and "
+                "the NVFP4 MoE layouts (#323b) are absent from "
+                "EXPERT_TENSOR_ATTRS and from "
+                "presplit_expert_offload_after_repack, so only part of each "
+                "expert would be staged -- installing the cache here would "
+                "either crash on an uninitialized parameter or silently run "
+                "with undefined per-expert weight contents."
+            )
+        else:
             continue
         layer_tag = f" (layer_id={layer_id})" if layer_id is not None else ""
         raise RuntimeError(
             f"MoE expert-offload (SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0) "
             f"is not supported for quant method {name!r}{layer_tag}. "
-            "GGUF-MoE, MoeWNA16 and NVFP4 MoE have no load-time offload half: "
-            "GGUFUninitializedParameter only materializes a real tensor in "
-            "the loader postprocess step (#123), MoeWNA16's per-expert "
-            "tensor layout was never validated against the offload cache's "
-            "slice/fetch path, and the NVFP4 MoE layouts (#323b) are absent "
-            "from EXPERT_TENSOR_ATTRS and from "
-            "presplit_expert_offload_after_repack, so only part of each "
-            "expert would be staged -- installing the cache here would either "
-            "crash on an uninitialized parameter or silently run with "
-            "undefined per-expert weight contents. Supported quant paths for "
+            f"{reason} Supported quant paths for "
             "--moe-resident-expert-fraction < 1.0: fp8, GPTQ (Marlin), AWQ "
-            "(Marlin). Leave --moe-resident-expert-fraction at 1.0 (or unset) "
-            "for this checkpoint's quant type, or use a supported quant path."
+            "(Marlin), GGUF-MoE (CUDA, ggml types with a MoE kernel). Leave "
+            "--moe-resident-expert-fraction at 1.0 (or unset) for this "
+            "checkpoint's quant type, or use a supported quant path."
         )
 
 
@@ -815,6 +1064,30 @@ class MoEExpertOffloadCache:
         self._hot_frozen = False
         self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
 
+        # --- #123-GGUF: residency decided at LOAD time -----------------------
+        # A load-time stager that could not use the plain [0,R) layout (the GGUF
+        # uneven-TP shard must keep its zero-padding expert resident) publishes
+        # the layout it actually built. Adopt it verbatim: the buffers on the
+        # layer are ALREADY arranged that way, so this is a map install, not a
+        # rearrange. Marked frozen so live hot calibration never permutes
+        # buffers whose physical layout the stager chose.
+        layout = getattr(layer, "_moe_offload_frozen_layout", None)
+        if layout is not None:
+            resident_ids, spill_ids = layout
+            if len(resident_ids) != self.resident_count:
+                raise RuntimeError(
+                    f"load-time residency layout has {len(resident_ids)} "
+                    f"resident experts but this cache computed "
+                    f"{self.resident_count} at fraction {fraction} over "
+                    f"{self.num_local_experts} experts -- the stager and the "
+                    f"installer disagree (did the fraction change between "
+                    f"load and install?)"
+                )
+            self.planner.resident_ids = frozenset(int(e) for e in resident_ids)
+            self.planner.resident_slot = {int(e): i for i, e in enumerate(resident_ids)}
+            self._spill_pool_index = {int(e): j for j, e in enumerate(spill_ids)}
+            self._hot_frozen = True
+
         # --- #254 prefill wave order ---------------------------------------
         # "token" (default) = disjoint token subsets, every wave re-fetches its
         # tokens' spill experts. "expert" = disjoint spill-expert groups, each
@@ -868,7 +1141,7 @@ class MoEExpertOffloadCache:
         self._cap_view_holders: List["object"] = []  # keep pinned bases alive
 
     # --- lifecycle (GPU window) --------------------------------------------
-    def install(self):  # pragma: no cover - requires CUDA
+    def install(self):
         """Build the [R+C]-slot GPU buffer (fixed resident [0,R) + scratch) and
         the [E-R]-slot pinned host spill pool. Idempotent.
 
@@ -882,8 +1155,15 @@ class MoEExpertOffloadCache:
 
         if self._installed or self.planner.fully_resident:
             return
-        self._stream = torch.cuda.Stream()
-        dev = torch.cuda.current_device()
+        # The copy stream and the ambient device are the only CUDA-only pieces
+        # of install/_fetch. Making them optional lets the whole
+        # install -> resolve -> fetch -> remap -> apply chain run on CPU
+        # tensors, which is what turns the #123-GGUF round-trip proof into a
+        # hermetic desk test instead of a GPU-window claim. Production always
+        # has a context, so the CUDA branch is unchanged.
+        cuda = torch.cuda.is_available()
+        self._stream = torch.cuda.Stream() if cuda else None
+        dev = torch.cuda.current_device() if cuda else torch.device("cpu")
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
         presplit = getattr(self.layer, "_moe_offload_presplit", None)
@@ -966,7 +1246,7 @@ class MoEExpertOffloadCache:
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
-    def _fetch(self, fetch_plan):  # pragma: no cover - requires CUDA
+    def _fetch(self, fetch_plan):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
@@ -978,6 +1258,7 @@ class MoEExpertOffloadCache:
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
         moved = 0
+
         # Write-after-read: the scratch slots this fetch overwrites are still
         # being READ by the previous wave's grouped-GEMM, which was enqueued on
         # the compute stream. Without this the copy stream can overtake that
@@ -986,8 +1267,8 @@ class MoEExpertOffloadCache:
         # enough for the copies to win the race (expert-major waves do; the
         # short token-major waves happened not to). The join below covers the
         # other direction (compute must not read before the copy lands).
-        self._stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._stream):
+        def _copies():
+            nonlocal moved
             for attr, spill in self._pinned.items():
                 dst = self._resident[attr]
                 per_expert = dst[0].numel() * dst.element_size()
@@ -999,7 +1280,15 @@ class MoEExpertOffloadCache:
                     )
                     dst[slot].copy_(spill[row], non_blocking=True)
                     moved += per_expert
-        torch.cuda.current_stream().wait_stream(self._stream)
+
+        if self._stream is None:
+            # No CUDA context (desk test): same copies, same order, no streams.
+            _copies()
+        else:
+            self._stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._stream):
+                _copies()
+            torch.cuda.current_stream().wait_stream(self._stream)
         self.planner.stats.h2d_bytes += moved
 
     def _build_lut(self, slot_of_needed, dtype, device):
@@ -1039,7 +1328,7 @@ class MoEExpertOffloadCache:
         return lut
 
     @staticmethod
-    def _remap(topk_ids, lut):  # pragma: no cover - requires CUDA
+    def _remap(topk_ids, lut):
         import torch
 
         # -1 padding stays -1; every real id maps to its resident slot.
@@ -1197,7 +1486,7 @@ class MoEExpertOffloadCache:
             path,
         )
 
-    def run_waves(self, dispatch_output, apply_fn):  # pragma: no cover - CUDA
+    def run_waves(self, dispatch_output, apply_fn):
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
 
@@ -1343,7 +1632,7 @@ class MoEExpertOffloadCache:
             gib,
         )
 
-    def _run_single_wave(self, dispatch_output, apply_fn, ids_list):  # pragma: no cover
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list):
         """One apply over the full batch: every routed expert fits the buffer at
         once (typical decode, and any prefill whose spill set fits the scratch).
         Shared by both wave orders -- with a single wave they are the same path."""

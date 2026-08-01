@@ -239,6 +239,32 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+#: ggml types the GGUF MoE expert-offload half (#123) covers.
+#:
+#: ``fused_moe_gguf`` has exactly two real expert kernels -- ``ggml_moe_a8``
+#: (MMQ, prefill) and ``ggml_moe_a8_vec`` (MMVQ, decode) -- plus a per-token
+#: Python fallback loop that is unusable at scale. MMQ is a strict subset of
+#: MMVQ, so MMVQ membership is the coverage test for both. Types outside it
+#: (MXFP4 / type 39 among them, which no GGUF kernel set contains at all)
+#: are NOT covered: the offload would tier bytes that nothing can then read
+#: at expert granularity. The #268 guard refuses those layers -- see
+#: ``gguf_moe_offload_covered_type``.
+MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES
+
+
+def gguf_moe_offload_covered_type(qweight_type) -> bool:
+    """True when a ggml type has a GGUF MoE kernel the offload can feed.
+
+    Takes the raw int the loader parked on ``w13_qweight_type.weight_type``
+    (an unknown/unnamed type id must answer False, not raise).
+    """
+    try:
+        wt = WeightType(int(qweight_type))
+    except (ValueError, TypeError):
+        return False
+    return wt in MOE_OFFLOAD_SUPPORTED_TYPES
+
+
 # MMQ (quantized GEMM) is weight-bandwidth-bound and does NOT scale with batch,
 # so it only wins for tiny token counts; above this threshold a one-shot
 # dequantize + cuBLAS fp16 GEMM is far faster (measured on RTX 3080 / Q6_K:

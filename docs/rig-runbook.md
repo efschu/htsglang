@@ -850,6 +850,66 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   as their weight; GPTQ's stay empty and are left on the default device.
 - `--disable-cuda-graph` and the fp8 caveats above apply unchanged.
 
+**GGUF-MoE variant (#123-GGUF).** The last quant family without a load-time
+offload half now has one. No new flags: the same
+`SGLANG_MOE_RESIDENT_EXPERT_FRACTION` / `SGLANG_MOE_SCRATCH_SLOTS` /
+`SGLANG_MOE_OFFLOAD_WAVE_ORDER` knobs drive it, and everything above about
+`--disable-cuda-graph` and host RAM applies unchanged. What differs is WHERE
+the split happens. fp8 / GPTQ / AWQ split an expert stack that already exists
+(`presplit_expert_offload_after_repack`, after the repack); GGUF has no such
+stack — `GGUFUninitializedParameter` has no storage until
+`materialize_gguf_weights` stacks the loader's per-expert tensors, and that
+stack is itself the peak. So the GGUF half intercepts inside
+`materialize_gguf_weights`: it decides residency first, materializes the
+parameter at `[R+C]` slots, and streams every other expert straight into the
+pinned host tier. The full `[E, ...]` stack is never formed on host or card.
+
+Acceptance lines, in this order:
+
+- one per MoE layer at materialization —
+  `GGUF MoE expert-offload staged at materialization on layer N: R/E experts
+  resident + C scratch slots, S experts in the pinned host tier; the full
+  expert stack was never allocated.`
+- then the usual `MoE expert-offload active on layer N: ...` from the
+  installer, and one `[offload-kv-regain]` line.
+
+If only the second family of lines appears the layer took the old full-stack
+path; if neither appears the boot aborted at the #268 guard (see below).
+
+Coverage limits, all fail-fast, none silent:
+
+- **ggml type.** Only types with a GGUF MoE kernel are staged, i.e.
+  `MMVQ_QUANT_TYPES` (which contains `MMQ_QUANT_TYPES`): Q4_0/Q4_1/Q5_0/Q5_1/
+  Q8_0/Q8_1, the K-quants, and the I-matrix types. **MXFP4 (type 39) is not in
+  any GGUF kernel set and is refused** — this is the open blocker for
+  DeepSeek-V4-Flash `UD-Q3_K_XL`, whose routed down projections are type 39
+  (#391). A layer whose `w13`/`w2` type is uncovered logs
+  `GGUF MoE expert-offload declined on layer N: ... has no GGUF MoE kernel`
+  and then hits the #268 guard, which names the missing
+  `_moe_offload_gguf_staged` marker. That abort is intentional: an uncovered
+  GGUF checkpoint must not run half-tiered.
+- **CUDA only.** `GGUFMoEAscendMethod` has its own materialize/pre-dequantize
+  path and is still refused outright.
+- **Uneven-TP expert-dim shard (#82).** Handled: the shard's trailing all-zero
+  padding expert is id `E-1`, the target of every foreign topk id, and the
+  static `[0,R)` residency would have put it in the spill tier and re-fetched
+  it on every forward. It is pinned to slot 0 instead, and the resulting
+  non-default layout is published to the cache as a frozen residency map
+  (`_moe_offload_frozen_layout`).
+
+Byte accounting is per whole expert on dim 0. GGUF rows are opaque quant
+blocks (Q4_K 144 B / 256 values, Q6_K 210 B / 256 values), so the expert axis
+is the only axis with no block structure on it — the same reason #82 shards
+GGUF MoE by whole experts rather than by intermediate width.
+
+Desk proof (no GPU, hermetic, synthetic Q4_K/Q6_K blocks with `gguf-py` as the
+reference decoder):
+
+```bash
+CUDA_VISIBLE_DEVICES=99 PYTHONPATH=python \
+  python -m pytest tests/moe_offload/test_gguf_moe_offload.py -q
+```
+
 ### 4.7 Pipeline parallelism intra-rig, uneven layer split (#201 slice 1)
 
 `--pp-size 2` with one rank per stage, each stage on its own card, and
