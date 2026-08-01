@@ -223,6 +223,16 @@ architecture names:
    applies everywhere — that is a statement about the launch, not a probe
    (#343's rule for `--fp8-gemm-backend`).
 
+Cut 2 also has a test-side half, the same one upstream #32464 makes for
+SM120 alone. `dsv4_attention.py`'s compact runner pins
+`SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` and then asserts `sparse_prefill_cache`
+was populated -- an assertion that is now false on every device without
+`flash_mla_sparse_fwd`, and that fires *before* the output is compared with
+the reference, so a real regression would hide behind a known false failure.
+The runner now seeds and asserts against the same predicate production uses.
+The env override deliberately stays on, so removing the production gate turns
+this test red rather than letting it follow along.
+
 **Is sparse-off lossless?** Both branches consume the *same* indexer output —
 the dense branch passes `indices=swa_page_indices, topk_length=...` to
 `flash_mla_with_kvcache` just as the sparse branch passes them to
