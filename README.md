@@ -59,6 +59,28 @@ command (as in the example above) instead of relying on env vars.
 NCCL: the image pins NCCL 2.30.7, required for multi-rank-per-GPU
 co-location.
 
+## Not yet in the Docker image
+
+The published image was built from the 2026-07-14 tree. The features below
+exist in this repository but are not in that image yet — run from source or
+wait for the next image build.
+
+- GGUF loading (Qwen3.5/3.6, Gemma-4), K-quant kernels, multimodal and
+  dynamic-quant GGUF variants
+- Asymmetric decode-context-parallelism (`--rank-kv-ratio`) and
+  ratio-weighted vocab sharding (`--rank-vocab-ratio`)
+- TP degree greater than the model's KV-head count (replicated-KV + token
+  sharding)
+- MoE expert offload to host RAM under asymmetric TP/DCP
+- Hibernate checkpoint/restore (suspend-to-disk, fast reload)
+- SWA-DCP (sliding-window hybrid decode-context-parallelism, Gemma-4)
+- Weightless-KV lane (meta-device worker, separate weight/KV roles)
+- Fast-lane priority scheduling
+- Single-node PD disaggregation
+- Cross-algorithm drafter routing, NEXTN/DFLASH bandit (in progress)
+- Session KV spill to host RAM (in progress)
+- Rig dashboard / capacity-planner UI
+
 *Upstream sglang README below.*
 
 --------------------------------------------------------------------------------
