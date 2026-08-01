@@ -3644,7 +3644,13 @@ class PerfCostModel:
 
         # Unit grids (must match the model's tp_units so candidate vectors
         # materialize identically to the real partition).
-        self.attn_units = max(self.kv_heads, 1)
+        #
+        # DeepSeek V4 declares ``o_groups`` and pins num_key_value_heads to 1:
+        # its attention block partitions in whole o_groups (heads and o_groups
+        # are coupled through wo_a, see models/deepseek_v4.py), so the kv-head
+        # count describes nothing there. Any config without ``o_groups`` keeps
+        # the kv-head grid unchanged.
+        self.attn_units = int(text.get("o_groups") or 0) or max(self.kv_heads, 1)
         self.gdn_units = max(self.gdn_k_heads, 1)
         quant_cfg = cfg.get("quantization_config") or {}
         group = self._quant_group_size(quant_cfg)
