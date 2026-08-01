@@ -48,17 +48,19 @@ that broke (:func:`check_nesting`).
 from __future__ import annotations
 
 import dataclasses
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.distributed.utils import partition_units
 
 __all__ = [
+    "LaneCardDemand",
     "NestedGroupPlan",
     "NestingProbe",
     "VramPost",
     "check_nesting",
     "derive_nested_plan",
     "format_vram_posts",
+    "lane_card_demands",
     "lane_part_device_indices",
     "lane_visible_physical_gpus",
     "lane_vram_posts",
@@ -602,6 +604,11 @@ def local_row_reduce(parts):
 SHARED = "shared"
 NESTED = "nested"
 DUPLICATED = "duplicated"
+#: A post the operator already sized with ``--rank-gpu-memory-mib``. Not a
+#: sharing status like the three above -- it marks the items that were on the
+#: card BEFORE the lane, so a card ledger can add the lane's own posts to them
+#: instead of pretending the card starts empty (#400).
+BUDGETED = "budgeted"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -716,6 +723,215 @@ def format_vram_posts(posts: Sequence[VramPost], card: str) -> str:
         "(shared items cost nothing)"
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Validation-time card ledger (#400)
+# ---------------------------------------------------------------------------
+#
+# ``lane_vram_posts`` / ``format_vram_posts`` above are the RUNTIME posting:
+# they run inside build_lane_model with mem_get_info deltas, i.e. after the
+# bytes are already on the card. That is a report, not a guard, and #349 arm L
+# is what a report costs -- the lane's complement shard and its pool were
+# never weighed against the rank's --rank-gpu-memory-mib budget, the boot was
+# accepted, and the process died at 31.14 GiB in use on a 31.34 GiB card while
+# loading the complement.
+#
+# Both of the lane's big items are decided by configuration alone:
+#
+#   * the pool is --dual-group-lane-budget-mib, mandatory with the lane;
+#   * the complement shard is a fixed unit fraction of the model weights that
+#     the nesting plan states exactly (BIG 2,1,1 -> FAST 2,2 makes the host
+#     card materialize 2 of 4 units on top of the 2 it already holds).
+#
+# So they can be charged BEFORE any card is touched. The ledger below is
+# deliberately a FLOOR: it prices the items whose size follows from the config
+# and names the ones it does not price, so a refusal is always true (the floor
+# alone already exceeds the card) and never invented.
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneCardDemand:
+    """Everything a configured dual-group lane will place on ONE card.
+
+    ``posts`` carries the serving ranks' own budgets (``BUDGETED``) plus the
+    lane's items, so ``charged_mib`` is the whole card's committed floor and
+    can be compared against ``total_mib`` directly.
+
+    ``unpriced`` names the items that exist on this card but whose size is not
+    knowable from configuration (hull residue, lane activations, the lane's
+    graph pool). ``unbounded`` names the items that SHOULD be priced here and
+    could not be -- an empty tuple is the normal case, a non-empty one means
+    the ledger cannot answer and the caller must refuse rather than guess.
+    """
+
+    gpu_id: int
+    total_mib: int
+    posts: Tuple[VramPost, ...]
+    unpriced: Tuple[str, ...] = ()
+    unbounded: Tuple[str, ...] = ()
+
+    @property
+    def charged_mib(self) -> int:
+        return sum(p.mib for p in self.posts)
+
+    @property
+    def lane_added_mib(self) -> int:
+        return sum(p.mib for p in self.posts if p.status not in (SHARED, BUDGETED))
+
+    @property
+    def fits(self) -> bool:
+        return not self.unbounded and self.charged_mib <= self.total_mib
+
+    def ledger(self, card: Optional[str] = None) -> str:
+        """The itemization a refusal (or the boot log) prints."""
+        name = card if card is not None else f"GPU {self.gpu_id}"
+        width = max([len(p.name) for p in self.posts] + [20])
+        lines = [
+            f"dual-group lane budget on {name}: "
+            f"{self.charged_mib} MiB charged of {self.total_mib} MiB total"
+        ]
+        for p in self.posts:
+            lines.append(f"  {p.name:<{width}}  {p.mib:>7} MiB  {p.status:<10} {p.why}")
+        for item in self.unbounded:
+            lines.append(f"  {item:<{width}}  {'?':>7} MiB  cannot bound")
+        if self.unpriced:
+            lines.append(
+                "  not priced here (the sum above is a FLOOR, not the full "
+                "footprint): " + ", ".join(self.unpriced)
+            )
+        return "\n".join(lines)
+
+
+#: Items that live on the lane's card but whose size does not follow from the
+#: configuration. Named rather than estimated: a number nobody measured is the
+#: defect ``pinned_reserve_shortfall_note`` exists to expose, and the guard's
+#: job is to refuse what provably cannot fit, not to predict the peak.
+LANE_UNPRICED_ITEMS: Tuple[str, ...] = (
+    "hull tree residue (composed conv/state vectors, buffers)",
+    "lane activations / scratch",
+    "lane CUDA graph capture pool",
+)
+
+
+def lane_card_demands(
+    plan: NestedGroupPlan,
+    *,
+    rank_gpu_id: Sequence[int],
+    rank_budget_mib: Sequence[int],
+    card_total_mib: Mapping[int, int],
+    lane_pool_mib: int,
+    total_weight_mib: Optional[int],
+    lane_part_gpu_id: Optional[Sequence[int]] = None,
+    host_big_rank: int = 0,
+) -> Tuple[LaneCardDemand, ...]:
+    """Per-card committed floor for a configured lane, in ``rank_gpu_id`` order.
+
+    ``total_weight_mib`` is the whole model's resident weight footprint; None
+    means it could not be derived, which yields an ``unbounded`` entry on
+    every card that has to materialize a lane part rather than a silent zero.
+
+    Pure: no NVML, no torch, no checkpoint. Everything comes from the plan, the
+    placement vectors and the two MiB numbers the operator wrote down.
+    """
+    host_gpu = int(rank_gpu_id[host_big_rank])
+    host_fast = plan.host_fast_rank(host_big_rank)
+    if lane_part_gpu_id:
+        part_gpu = [int(g) for g in lane_part_gpu_id]
+    else:
+        part_gpu = [host_gpu] * plan.fast_size
+
+    weight_units = sum(plan.big_ratio)
+    fast_ratio = plan.fast_ratio
+    per_unit = (
+        None if total_weight_mib is None else float(total_weight_mib) / weight_units
+    )
+
+    posts: Dict[int, List[VramPost]] = {}
+    unbounded: Dict[int, List[str]] = {}
+
+    def add(gpu: int, post: VramPost) -> None:
+        posts.setdefault(int(gpu), []).append(post)
+
+    # What the operator already sized, per card.
+    for rank, gpu in enumerate(rank_gpu_id):
+        add(
+            gpu,
+            VramPost(
+                name=f"serving rank {rank} budget (--rank-gpu-memory-mib)",
+                status=BUDGETED,
+                mib=int(rank_budget_mib[rank]),
+                why="the rank's ENTIRE budget: weights, KV, runtime state. "
+                "The lane's items come on top of it, not out of it",
+            ),
+        )
+
+    # The lane's materialized parts. The host's own segment is shared bytes
+    # and costs nothing; every other lane rank is a real load.
+    for f in range(plan.fast_size):
+        if f == host_fast:
+            add(
+                host_gpu,
+                VramPost(
+                    name=f"lane rank {f} shard (host's resident segment)",
+                    status=SHARED,
+                    mib=0,
+                    why="the same tensor objects the serving rank already "
+                    "holds; verified by data_ptr identity at bring-up",
+                ),
+            )
+            continue
+        gpu = part_gpu[f]
+        units = fast_ratio[f]
+        flag = (
+            "--dual-group-lane-part-gpu-id" if lane_part_gpu_id else "--dual-group-lane"
+        )
+        label = (
+            f"lane rank {f} complement shard ({units}/{weight_units} units, " f"{flag})"
+        )
+        if per_unit is None:
+            unbounded.setdefault(int(gpu), []).append(label)
+            continue
+        add(
+            gpu,
+            VramPost(
+                name=label,
+                status=NESTED if gpu == host_gpu else DUPLICATED,
+                mib=int(round(units * per_unit)),
+                why=(
+                    "bytes the other cards hold; this card must materialize "
+                    "them so the lane can run on its own"
+                    if gpu == host_gpu
+                    else "a full second copy: the resident shard on that card "
+                    "belongs to another process and cannot be aliased"
+                ),
+            ),
+        )
+
+    # The lane's own pool, always on the host card.
+    add(
+        host_gpu,
+        VramPost(
+            name="lane pool (--dual-group-lane-budget-mib)",
+            status=DUPLICATED,
+            mib=int(lane_pool_mib),
+            why="KV + linear-attention state + workspace of the lane runner; "
+            "the ENTIRE pool item, no ceiling applied on top",
+        ),
+    )
+
+    out = []
+    for gpu in sorted(set(int(g) for g in rank_gpu_id) | set(posts) | set(unbounded)):
+        out.append(
+            LaneCardDemand(
+                gpu_id=gpu,
+                total_mib=int(card_total_mib[gpu]),
+                posts=tuple(posts.get(gpu, ())),
+                unpriced=LANE_UNPRICED_ITEMS if gpu == host_gpu else (),
+                unbounded=tuple(unbounded.get(gpu, ())),
+            )
+        )
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

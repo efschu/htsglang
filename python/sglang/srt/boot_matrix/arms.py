@@ -203,6 +203,17 @@ LANE_RATIO = "2,1,1"
 #: The vector is kept as-is because it is legal on either card and the arm's
 #: subject is the co-resident lane, not the budget; runbook 5.1 still
 #: documents the two device orders.
+#:
+#: #400: this vector cannot run WITH the lane on this rig, and the server now
+#: says so at argument time instead of OOMing in _load_lane_part. The lane's
+#: complement shard is 2 of the plan's 4 units of a 28.9 GiB FP8 checkpoint --
+#: 14.8 GiB on rank 0's card, on top of the 19000 MiB budget and the 2048 MiB
+#: lane pool: ~35.9 GiB against a ~32.1 GiB card. That is the arithmetic
+#: runbook 4.11 already carried ("FP8 27B is out of reach for the SINGLE-CARD
+#: lane"); nothing enforced it, so the matrix kept launching it. The arm needs
+#: either the GGUF vehicle of the working 4.11 recipe or the two-card lane of
+#: EVAL_272 (slice C/D) before it can go green -- shrinking this vector alone
+#: does not help, because 14.8 GiB of complement leaves rank 0 no serving KV.
 LANE_RANK_MIB = "19000,15000,15000"
 
 BASE_EXPECT: Mapping[str, object] = {

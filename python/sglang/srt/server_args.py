@@ -666,6 +666,44 @@ def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
     }
 
 
+def _model_total_weight_mib(server_args) -> Optional[int]:
+    """The whole model's resident weight footprint in MiB, or None.
+
+    Config-only by construction: ``PerfCostModel`` derives its family byte
+    model from config.json plus the on-disk checkpoint size, which is what
+    the ``--rank-tp-ratio auto`` sizing path already runs on. Summing
+    ``per_rank_weight_bytes`` over the plan gives the full model back --
+    every family's bytes are distributed across the ranks exactly once -- so
+    this reuses the fork's one parse-time weight model rather than adding a
+    second one that could disagree with it (#400).
+
+    None on any failure: an unreadable checkpoint is "cannot bound", which
+    the caller states as such. It is never silently treated as zero.
+    """
+    try:
+        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+        ratio = server_args.rank_tp_ratio
+        base_plan = (
+            list(ratio) if isinstance(ratio, list) else [1] * server_args.tp_size
+        )
+        budgets = server_args.rank_gpu_memory_mib
+        if isinstance(budgets, int):
+            budgets = [budgets] * server_args.tp_size
+        model = PerfCostModel(
+            PlanInputs.from_server_args(server_args),
+            base_plan,
+            list(budgets or [1024] * server_args.tp_size),
+        )
+        total = sum(model.per_rank_weight_bytes(base_plan))
+    except Exception as e:
+        logger.debug("Could not size the model's weight footprint: %s", e)
+        return None
+    if not total or total <= 0:
+        return None
+    return int(total / 2**20)
+
+
 #: Accepted ``--rank-perf-tune`` targets. The first four are the
 #: single-vector targets (one weight split serves the whole server); the two
 #: ``phase-*`` targets are the arms of the phase-optimal recipe (#354/#357),
@@ -8255,6 +8293,128 @@ class ServerArgs:
                 "configuration and is not what this flag expresses."
             )
 
+    #: Documented door out of the #400 lane-budget guard. An operator who
+    #: knows the ledger is wrong for their checkpoint (or who is deliberately
+    #: probing the runtime failure) can proceed; the guard says the name in
+    #: its own refusal so the door is never something to go looking for.
+    LANE_BUDGET_CHECK_ENV = "SGLANG_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK"
+
+    def _validate_dual_group_lane_card_budget(self, mem_info) -> None:
+        """#400: charge the lane's own items against the cards, before boot.
+
+        The per-card physical-impossibility check above sums what the
+        operator wrote in ``--rank-gpu-memory-mib``. A ``--dual-group-lane``
+        boot puts two more things on the shared card that vector says nothing
+        about: the lane's pool (``--dual-group-lane-budget-mib``) and the
+        complement weight shard the lane has to materialize so it can run on
+        its own. Both are decided by configuration, so both are weighed here.
+
+        #349 arm L is why this exists. ``19000,15000,15000`` on a ``2,1,1``
+        plan with a 2048 MiB lane pool was accepted by every guard, rank 0
+        bound the 31.34 GiB card as intended (#392 holds), and the process
+        then OOMed at 31.14 GiB in use inside ``_load_lane_part`` -- the
+        budget never capped usage because the lane allocated outside the
+        ledger. The runtime posting in ``build_lane_model`` reported those
+        bytes accurately and far too late.
+
+        The charged sum is a FLOOR: the hull residue, the lane's activations
+        and its graph pool are named but not priced (see
+        ``LANE_UNPRICED_ITEMS``). A refusal therefore always states something
+        true -- the priced items alone do not fit -- and acceptance is not a
+        promise that the peak fits, exactly as for ``--rank-gpu-memory-mib``
+        itself, where leaving headroom is the operator's responsibility.
+        """
+        if not self.dual_group_lane:
+            return
+        if os.environ.get(self.LANE_BUDGET_CHECK_ENV, "0") == "1":
+            logger.warning(
+                "%s=1: the dual-group lane's pool and complement shard are "
+                "NOT weighed against the cards. A lane that does not fit "
+                "will OOM at bring-up instead of being refused here.",
+                self.LANE_BUDGET_CHECK_ENV,
+            )
+            return
+
+        from sglang.srt.distributed.dual_group import (
+            derive_nested_plan,
+            lane_card_demands,
+        )
+
+        # Slice B: the lane shares serving rank 0's segment (build_dual_group_
+        # lanes returns [] on every other rank), so the plan is derived for
+        # that rank. The FULL nesting verification needs the model's unit
+        # counts and stays at boot time in derive_lane_plan; what is needed
+        # here is only the segmentation, which is pure.
+        host_big_rank = 0
+        try:
+            plan = derive_nested_plan(list(self.rank_tp_ratio), host_big_rank)
+        except ValueError:
+            # A ratio the lane cannot segment is refused by derive_lane_plan
+            # at boot with the full report; a budget guard must not preempt
+            # that with a worse message.
+            return
+
+        budgets = (
+            list(self.rank_gpu_memory_mib)
+            if isinstance(self.rank_gpu_memory_mib, list)
+            else [self.rank_gpu_memory_mib] * self.tp_size
+        )
+        # The pool the lane will really take, not the one on the command
+        # line: --dual-group-lane-speed-dial only ever REDUCES it, and a
+        # ledger that charged the un-dialled value could refuse a
+        # configuration that fits. Resolved through the lane's own function
+        # so the guard and the runtime cannot disagree about the number.
+        lane_pool_mib = int(self.dual_group_lane_budget_mib or 0)
+        try:
+            from sglang.srt.model_executor.dual_group_lane import resolve_speed_dial
+
+            lane_pool_mib = resolve_speed_dial(self)[0]
+        except Exception as e:  # pragma: no cover - the raw budget is an upper bound
+            logger.debug("Could not resolve the lane speed dial: %s", e)
+        demands = lane_card_demands(
+            plan,
+            rank_gpu_id=list(self.rank_gpu_id),
+            rank_budget_mib=budgets,
+            card_total_mib={g: mem_info[g][0] for g in set(self.rank_gpu_id)},
+            lane_pool_mib=lane_pool_mib,
+            total_weight_mib=_model_total_weight_mib(self),
+            lane_part_gpu_id=self.dual_group_lane_part_gpu_id,
+            host_big_rank=host_big_rank,
+        )
+        for demand in demands:
+            if not demand.lane_added_mib and not demand.unbounded:
+                # A card the lane puts nothing on. Its budgets were already
+                # weighed by the physical-impossibility check above; printing
+                # a "lane budget" ledger for it would say the lane costs
+                # something there, which is exactly wrong.
+                continue
+            card = _describe_rank_gpu(demand.gpu_id, demand.total_mib)
+            if demand.unbounded:
+                raise ValueError(
+                    f"--dual-group-lane cannot bound its own memory on "
+                    f"{card}: the size of "
+                    + ", ".join(demand.unbounded)
+                    + " could not be derived from the checkpoint, so it is "
+                    "unknown whether the lane fits beside the serving rank's "
+                    "budget. Refusing rather than finding out at bring-up "
+                    "(#349 arm L). Ledger so far:\n"
+                    + demand.ledger(card)
+                    + f"\nSet {self.LANE_BUDGET_CHECK_ENV}=1 to boot anyway."
+                )
+            if not demand.fits:
+                raise ValueError(
+                    f"--dual-group-lane does not fit on {card}: the priced "
+                    f"items alone sum to {demand.charged_mib} MiB, of which "
+                    f"{demand.lane_added_mib} MiB is the lane's own, against "
+                    f"{demand.total_mib} MiB of card. This is a FLOOR -- the "
+                    "unpriced items come on top. Reduce "
+                    "--rank-gpu-memory-mib for the ranks on this card, "
+                    "reduce --dual-group-lane-budget-mib, or place the lane "
+                    "part on another card with --dual-group-lane-part-gpu-id."
+                    "\n" + demand.ledger(card)
+                )
+            logger.info("%s", demand.ledger(card))
+
     def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
         """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.
 
@@ -8738,6 +8898,8 @@ class ServerArgs:
         4. Pure single-node TP only (no PP/DP/EP, nnodes == 1)
         5. Conflicts: explicit --mem-fraction-static, --base-gpu-id/--gpu-id-step
         6. Physical impossibility: sum of co-located budgets <= NVML total
+        7. #400: the same, plus the items a --dual-group-lane boot puts on a
+           card outside those budgets (its pool and its complement shard)
 
         Must run before _handle_gpu_memory_settings so an explicitly passed
         --mem-fraction-static is still distinguishable (None = unset).
@@ -9149,6 +9311,12 @@ class ServerArgs:
                     "Reduce --rank-gpu-memory-mib or place fewer ranks on "
                     "this GPU."
                 )
+
+        # The same check, extended to the items a --dual-group-lane boot puts
+        # on a card OUTSIDE that budget vector (#400). Runs right after the
+        # budgets-only pass so the simpler refusal always wins when both
+        # apply, and is a no-op without --dual-group-lane.
+        self._validate_dual_group_lane_card_budget(mem_info)
 
         # MiB -> fraction, computed ONCE per rank at resolution time:
         #   fraction_for_rank = budget_mib / nvml_total_mib(rank's GPU).
