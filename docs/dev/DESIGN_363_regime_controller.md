@@ -1317,7 +1317,7 @@ re-analyse in seconds.
 
 `spread_veto_pct = 25` against a measured max of **0.68** here, 0.61 and 12.5
 in the two earlier windows: an order of magnitude off the observed range and
-boot-unstable across all three. Recorded, not retuned.
+boot-unstable across all three. Recorded, not re-tuned.
 
 ### 18.4 One tooling bug, found and fixed in-window
 
@@ -1326,3 +1326,143 @@ the UNION across them, so three per-rank files reported "1 rank" for a 3-rank
 boot and gate 1 refused a complete group record. The per-rank layout is newer
 than the check that consumes it — §14.3's instrument-first rule, fifth
 instance.
+
+---
+
+## 19. The distributional band, and the four archived traces re-analysed
+
+§18.2 left gate 3 blocked on a method finding for the third window running.
+This is the fix, built at the desk on the four archived arms (the pre-#388
+pair `2026-08-01_363_gate3_{a,b}` and the post-#388 pair
+`2026-08-01_363_gate3_388_{a,b}`), no cards.
+
+### 19.1 The statistic, chosen per signal
+
+The pointwise A-vs-A band assumes the value at position `i` describes the same
+thing in both runs. That holds for a slowly-moving signal and fails for a
+bursty one, so the choice is made per signal against exactly that criterion —
+**is the value at a given active boundary reproducible across boots, or only
+its rate?** — and not blanket-replaced.
+
+| signal | statistic | why |
+|---|---|---|
+| `prefill_share` | distributional | near-binary at `window_rounds = 64` |
+| `decode_share` | distributional | near-binary, the complement |
+| `occupancy` | distributional | near zero between bursts, a spike while one drains |
+| `queued_prompt_tokens` | distributional | median 0, peak 74 802 |
+| `rank_ms_spread_pct` | **pointwise, kept** | a within-boundary ratio across ranks, continuous, not a burst counter |
+
+For a distributional signal the compared quantities are per-run SUMMARIES and
+the band is `|summary_a - summary_b|` on those: the **peak** (the summary the
+reachability check reads, and the signal-level band in the table), the **duty
+cycle** at each constant's own value (the fraction of active boundaries at or
+above it), and the p50/p75/p90 **quantiles** for shape. A constant is then
+judged on its own crossing rate: it clears when
+`mean(duty_a, duty_b) > 2 x |duty_a - duty_b|`, which is the direct form of
+the question the gate asks — *would this signal cross the threshold
+consistently across boots?*
+
+Deliberately not used: the max quantile shift ("sort both series and
+subtract"). On a near-binary signal it is maximally sensitive exactly where
+the distribution is flat-then-jumps — on the #388 pair it reads 0.71 for
+`prefill_share`, which measures the binariness, not the noise.
+
+The hysteresis gap is still reported for a distributional signal, at both the
+enter and the exit value, but does not decide the verdict. The gap lives in
+signal units and the reproducible quantity does not; and converting it into a
+duty difference would punish the good case, because a decisive signal puts
+almost no windows inside the hysteresis interval and that is the hysteresis
+being unnecessary rather than a finding.
+
+### 19.2 Both guards survive, re-stated
+
+`UNDERPOWERED` is unchanged in meaning: fewer than `MIN_PAIRED_SAMPLES = 8`
+active boundaries in the smaller arm.
+
+`ARMS_DISSIMILAR` keeps the within-arm rule on the pointwise path and gains a
+distributional form: the two runs' duty cycles, **at the constants' own
+thresholds**, differ by more than a two-proportion difference of
+`DISSIMILAR_Z = 2.576` standard errors. Evaluated at those thresholds and
+nowhere else on purpose — a sup-over-all-thresholds (Kolmogorov-Smirnov) form
+flags two steady arms held at slightly different levels as totally separated,
+and that offset is a real reproducible bias that IS the band. The gate asks
+whether the constants' decisions reproduce; the guard asks the same question
+of the same thresholds. The active boundaries are autocorrelated, so the
+nominal level is optimistic; 1 % rather than 5 % takes some of that back.
+
+### 19.3 One more signal restricted, and what it bought
+
+`rank_ms_spread_pct` was the last signal read on ALL boundaries. It reports
+the LAST measured forward, so it goes stale through an idle stretch rather
+than absent — the same defect §17.3 fixed for `occupancy` and
+`queued_prompt_tokens`, wearing a different hat, and recorded there as an
+omission rather than a claim that the signal was clean. Restricted, its
+pointwise band on the #388 pair drops from 0.6815 (the full observed range,
+flagged `ARMS_DISSIMILAR`) to 0.5813 against a within-arm swing of 0.675.
+
+### 19.4 The falsifier
+
+`bands.py --falsify`, three cases, each able to fail:
+
+| case | old statistic | new statistic |
+|---|---|---|
+| (i) same duty cycle (10/40), bursts shifted from indices 0-9 to 20-29 | band 1.0, `ARMS_DISSIMILAR` | band 0, duty 0.25 vs 0.25, `OK`, `enter_prefill` CLEARS |
+| (ii) genuinely different duty cycles (10/40 vs 30/40) | — | duty 0.25 vs 0.75, z = 4.47 > 2.576, `ARMS_DISSIMILAR` |
+| (iii) barely-moving signal (0.50 vs 0.53, flat) | band 0.03, `OK` | band 0.03, `OK` |
+
+Case (i) is the false alarm of record and it is reproduced against code that
+still runs: the pointwise path is live for `rank_ms_spread_pct`, so the
+comparison is not against a reconstruction. Case (iii) is the regression pin
+against the traces the first version was designed on.
+
+### 19.5 The four arms, re-analysed
+
+Per signal, active boundaries and band (`*` = pointwise):
+
+| signal | pre-#388 A/B active | pre band | post-#388 A/B active | post band |
+|---|---|---|---|---|
+| `prefill_share` | 29 / 29 | 0 | 41 / 56 | 0 |
+| `decode_share` | 29 / 29 | 0 | 41 / 56 | 0 |
+| `occupancy` | 29 / 29 | 6.16e-05 | 41 / 56 | 1.19e-04 |
+| `queued_prompt_tokens` | 29 / 29 | 0 | 41 / 56 | 0 |
+| `rank_ms_spread_pct`* | 29 / 29 | 0.283 | 41 / 56 | 0.581 |
+
+Every signal `OK` on both pairs: no `ARMS_DISSIMILAR`, no `UNDERPOWERED`.
+
+Per constant:
+
+| constant | pre-#388, old | pre-#388, new | post-#388, old | post-#388, new |
+|---|---|---|---|---|
+| `enter_prefill` | UNREACHED | UNREACHED | ARMS_DISSIMILAR | **CLEARS** |
+| `enter_decode` | CLEARS | CLEARS | ARMS_DISSIMILAR | **CLEARS** |
+| `kv_ascend_mark` | UNREACHED | UNREACHED | UNREACHED | UNREACHED |
+| `spread_veto_pct` | UNREACHED | UNREACHED | UNREACHED | UNREACHED |
+| `PRESTAGE_SINGLE_PROMPT_TOKENS` | NO_GAP | CLEARS | ARMS_DISSIMILAR | **CLEARS** |
+
+The pre-#388 pair's blocking list is **unchanged** by the method change
+(`enter_prefill`, `kv_ascend_mark`, `spread_veto_pct`, all UNREACHED) — which
+is the regression pin on real data, since that pair is the barely-moving-share
+regime the pointwise statistic was designed against. The post-#388 pair's
+blocking list goes from five entries to **two**, and both survivors are
+reachability findings already on the record rather than method artefacts.
+Identical verdicts on all three per-rank trace files.
+
+### 19.6 What is left, and what was deliberately not touched
+
+Gate 3 does NOT pass. What blocks it:
+
+* `kv_ascend_mark = 0.85` against a 0.1649 peak occupancy — #287's mark, and
+  reported for information only.
+* `spread_veto_pct = 25` against a 0.68 peak. §18.3's finding, still standing.
+
+Neither is fixable by a better statistic; both need either a heavier workload
+or a calibration decision. Calibration is a separate decision with its own
+evidence rules, so no threshold constant was changed here — the observed
+ranges are recorded (`rank_ms_spread_pct` 0.0018 .. 0.679 over the #388 pair,
+0.0027 .. 0.614 over the pre-#388 pair) and the constants stand.
+
+The two passing distributional verdicts are thin and are reported as such:
+`enter_prefill` clears by 1.29x and `PRESTAGE_SINGLE_PROMPT_TOKENS` by 1.14x.
+A duty cycle estimated from 41 active windows has a standard error near 0.07,
+which is most of the disagreement that had to be cleared. The fix for that is
+a longer or busier workload, not a constant.

@@ -300,6 +300,16 @@ The band script EXISTS now: `scripts/regime_gates/bands.py`, written against
 the real traces and smoke-green card-less. Alignment is settled (see its
 docstring); what the window supplies is the second boot.
 
+**The statistic is chosen per signal, and that is not cosmetic.** Since #388
+the shares are near-binary at `window_rounds = 64` — a window is essentially
+all-prefill or all-decode — so a pointwise A-vs-A band on them is 1 whenever
+the two boots' bursts land on different boundary indices, which they always
+do. Four signals (`prefill_share`, `decode_share`, `occupancy`,
+`queued_prompt_tokens`) are therefore compared DISTRIBUTIONALLY: per-run
+summaries (peak, quantiles, and the duty cycle at each constant's own value)
+with the band `|summary_a - summary_b|`. `rank_ms_spread_pct` keeps the
+pointwise band. Every signal is read on the ACTIVE boundaries only.
+
 ```bash
 for run in a b; do
   OUT3=/spinning/gpu-battery-results/$(date +%F)_363_gate3_$run
@@ -324,42 +334,58 @@ python scripts/regime_gates/bands.py \
 The band is what the arm measures against ITSELF; any difference you introduce
 between the arms is measured as noise and inflates every threshold's bar.
 
+Card-less, before pointing it at anything:
+
+```bash
+python scripts/regime_gates/bands.py --smoke     # the pipeline
+python scripts/regime_gates/bands.py --falsify   # the statistic itself
+```
+
+`--falsify` is the argument for the distributional statistic, in three cases
+that can each fail: a same-duty burst shift (the retained pointwise path still
+calls it `ARMS_DISSIMILAR` — that is the false alarm of record), a genuine
+duty difference (the guard has to survive the reformulation), and a
+barely-moving signal (old and new must report the same band).
+
 ### What the report says, and the three ways it can refuse
 
-Per signal it prints the band, the paired-sample count and the observed max;
-per section-3.4 constant it prints a verdict. Only `CLEARS` is a pass, and the
+Per signal it prints the statistic, the band, the two active-boundary counts
+and the observed max; then the duty cycles at every constant's own threshold;
+then a verdict per section-3.4 constant. Only `CLEARS` is a pass, and the
 other four are different problems with different fixes:
 
 | verdict | meaning | what to do |
 |---|---|---|
-| `CLEARS` | the gap it defends exceeds 2x its measured band | nothing |
-| `INSIDE_BAND` | the gap is inside the signal's own noise | re-derive the constant from the band |
+| `CLEARS` | pointwise: the gap it defends exceeds 2x its band. Distributional: its crossing rate exceeds 2x the run-to-run disagreement about that rate | nothing |
+| `INSIDE_BAND` | the quantity it is judged on is inside the signal's own noise | re-derive the constant from the band |
 | `UNREACHED` | the signal never approached the constant in either run | the regime it gates cannot be entered. Either the constant is mis-set or the workload never made the shape — the report does not choose, and does not re-tune |
-| `UNDERPOWERED` | fewer than 8 paired samples | a longer or busier workload; a band from 2 samples is a number, not a measurement |
-| `ARMS_DISSIMILAR` | the band is as large as one arm's own movement | the two boots were not doing the same thing where the alignment paired them. Check both ran the same workload and neither was truncated |
+| `UNDERPOWERED` | fewer than 8 active boundaries in the smaller arm | a longer or busier workload; a band from 2 samples is a number, not a measurement |
+| `ARMS_DISSIMILAR` | pointwise: the band is as large as one arm's own movement. Distributional: the two runs' duty cycles at the constants' own thresholds differ by more than sampling one workload twice should produce | the two boots were not doing the same thing. Check both ran the same workload and neither was truncated |
 
-### What the previous window already predicts it will find
+### What the archived traces already say, re-analysed with this statistic
 
-Run these numbers past the report and expect them again:
+All four archived arms (the pre-#388 pair and the post-#388 pair) have been
+re-run through the distributional statistic at the desk, no cards. Expect
+these again:
 
-* `enter_prefill = 0.35` -> **UNREACHED**, and not marginally: `prefill_share`
-  peaked at **0.000** across 34 954 boundaries. The root cause is upstream of
-  the constant — the hook reads `is_prefill_only` off the RETIRED batch at the
-  between-tick boundary, and during a prefill burst that batch is the decode
-  one, so the prefill phase essentially never reports. Fixing that changes
-  what the classifier emits, so it was NOT done in the gates window; it is the
-  first desk task after gate 3 confirms the reading. **DONE (#388)** — the
-  hook now attributes the boundary to `last_batch`. See §8: gates 1+2 have to
-  be re-recorded, and gate 3's `enter_prefill` verdict with them.
+* `enter_prefill = 0.35` -> **CLEARS** on the post-#388 pair: crossing rate
+  0.266 of active boundaries (arm A 0.317, arm B 0.214) against 2x the
+  disagreement 0.103 = 0.206. It clears by 1.29x, which is a pass and a thin
+  one — a busier workload is the way to widen it, not a new number.
+* `enter_decode = 0.90` -> **CLEARS**: rate 0.565 against 2x 0.155 = 0.310.
 * `spread_veto_pct = 25` -> **UNREACHED**: the measured spread peaked at
-  **12.5 %**, so a 25 % veto never fires.
+  **0.68 %** here, 0.61 % and 12.5 % in the two earlier windows. Recorded, not
+  re-tuned — calibration is a separate decision with its own evidence.
 * `kv_ascend_mark = 0.85` -> **UNREACHED** at 16.5 % peak occupancy, unless
   the workload is heavier than section 2's. This one is INHERITED from #287
   and is reported for information only: a failure here is a finding for #287,
   not a licence to set a second mark on the same pool.
+* `PRESTAGE_SINGLE_PROMPT_TOKENS = 8192` -> **CLEARS**, also thinly (rate
+  0.160 against 2x 0.070 = 0.140).
 
-None of those are reasons to change a number by hand. They are the gate-3
-output.
+So the window's job for gate 3 is the two `UNREACHED` reachability findings,
+not the statistic. None of these are reasons to change a number by hand. They
+are the gate-3 output.
 
 ## 7. Gate 4, for the window after
 
@@ -386,8 +412,9 @@ What has to be re-recorded, and what does not:
 |---|---|---|
 | 1 (desyncs) | **RE-RECORD** | the regime histogram and the transition count both change; a desync count is about the verdicts, and the verdicts are different now |
 | 2 (F2 replay) | **RE-RECORD** | it replays the trace of gate 1. Same boot, so it costs nothing extra |
-| 3 (`enter_prefill`) | **RE-MEASURE** | UNREACHED was a reading of a signal that could not move. The other four signals' bands stand |
+| 3 (`enter_prefill`) | **RE-RECORDED and re-analysed** | UNREACHED was a reading of a signal that could not move. On the #388 pair it CLEARS |
 | 3 (`occupancy`, `queued_prompt_tokens`) | already re-analysed, no cards | #388 restricted them to ACTIVE boundaries and re-ran the SAME two archived traces. ARMS_DISSIMILAR was an alignment artifact and is gone; see DESIGN §17.3 |
+| 3 (all five signals, the STATISTIC) | already re-analysed, no cards | the #388 pair came back ARMS_DISSIMILAR on every signal, which was a pointwise statistic applied to a near-binary one. Fixed and all four archived arms re-analysed at the desk; see DESIGN §19 |
 | 4 | not yet startable | needs 1-3 in the evidence file |
 
 **The boots.** Gates 1+2 ride on ONE boot; gate 3 needs the pair. Three boots
@@ -421,13 +448,15 @@ Workload, unchanged, and the same flags on all three boots:
 python scripts/regime_gates/workload.py --repeats 2 --burst 8     --burst-tokens 900 --drain 12 --drain-tokens 900 --mixed 8 --idle-s 25
 ```
 
-**One thing to add if the window allows it, and it is not free.** Both gate-3
-arms produced only **29 active boundaries** out of 15-19 k. That was survivable
-while `occupancy` drew samples from the idle stretches; now that it is
-restricted to active boundaries it draws 29 too, which is above
-`MIN_PAIRED_SAMPLES = 8` but not by much — and `UNDERPOWERED` now BLOCKS. A
-longer or busier workload buys margin on every signal at once. Do not change
-the workload flags BETWEEN the two gate-3 arms.
+**One thing to add if the window allows it, and it is not free.** The pre-#388
+gate-3 arms produced only **29 active boundaries** out of 15-19 k, and the
+re-record's produced **41 and 56**. That is above `MIN_PAIRED_SAMPLES = 8` but
+not by much, and `UNDERPOWERED` BLOCKS. It is also what makes the two passing
+distributional verdicts thin: a duty cycle estimated from 41 windows has a
+standard error near 0.07, which is most of the 0.103 disagreement
+`enter_prefill` had to clear. A longer or busier workload buys margin on every
+signal at once, and it is the only thing that will. Do not change the workload
+flags BETWEEN the two gate-3 arms.
 
 **What to check first, before spending the window on a workload.** The whole
 point of the re-record is that `prefill_share` moves. Confirm it early:

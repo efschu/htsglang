@@ -11,6 +11,14 @@ one are separated -- too few samples (UNDERPOWERED), arms that do not line up
 (ARMS_DISSIMILAR), and a threshold the signal never approaches (UNREACHED) --
 because each needs a different fix and collapsing them into "failed" loses
 the instruction.
+
+Since #388 the statistic is chosen PER SIGNAL: pointwise where the value at a
+given active boundary reproduces across boots (``rank_ms_spread_pct``),
+distributional where only its rate does (the shares, the occupancy and the
+queue mass, all bursty or near-binary at ``window_rounds = 64``). Both guards
+exist in both forms and both are pinned here; the distributional statistic's
+own falsifier lives in ``test_regime_gate_tools.py`` next to the script's
+``--falsify``.
 """
 
 import json
@@ -142,13 +150,18 @@ def _busy(occ, queued=1000):
 
 
 class TestActiveOnlySignals(CustomTestCase):
-    """#388 item B. Two signals are present on EVERY boundary, so per-signal
+    """#388 item B. Three signals are present on EVERY boundary, so per-signal
     absent-dropping does not drop idle stretches for them.
 
     Gate 3 (2026-08-01) measured the consequence: two arms whose idle lengths
     differed by 25 % (19 402 against 15 504 boundaries) had a quiet stretch of
     one aligned against a busy stretch of the other, and both signals came
     back ARMS_DISSIMILAR. The guard was right; the alignment was not.
+
+    The restriction is universal now. ``rank_ms_spread_pct`` was the last
+    signal left out of it -- it goes STALE rather than absent while the rig
+    idles, which is the same defect wearing a different hat -- and leaving it
+    out cost it its own ARMS_DISSIMILAR on the post-#388 pair.
     """
 
     def test_the_idle_boundary_that_causes_it_is_real(self):
@@ -160,29 +173,33 @@ class TestActiveOnlySignals(CustomTestCase):
         self.assertIsNotNone(_IDLE["occupancy"])
         self.assertEqual(_IDLE["occupancy"], 0.0)
 
-    def test_dropping_absent_samples_does_not_drop_idle_for_these_two(self):
+    def test_dropping_absent_samples_does_not_drop_idle_for_these_three(self):
         """The defect itself, in one assertion pair. Same boundaries, and the
-        share loses the idle ones while occupancy keeps them."""
+        share loses the idle ones while occupancy reports a real 0.0 on every
+        single one of them."""
         rows = [_IDLE] * 10 + [_busy(0.16)] * 3
         with tempfile.TemporaryDirectory() as tmp:
             a, _ = _pair(tmp, rows, rows)
             got = bands.load_boundaries(a)
+            # Present on every boundary, which is what makes the restriction
+            # load-bearing rather than a no-op.
+            self.assertEqual(sum(1 for r in got if r.get("occupancy") is not None), 13)
             self.assertEqual(len(bands.series(got, "decode_share")), 3)
-            self.assertEqual(len(bands.series(got, "occupancy")), 13)
-            self.assertEqual(len(bands.series(got, "occupancy", active_only=True)), 3)
+            self.assertEqual(len(bands.series(got, "occupancy")), 3)
 
-    def test_the_two_named_signals_are_restricted_and_the_shares_need_not_be(self):
-        self.assertEqual(
-            bands.ACTIVE_ONLY_SIGNALS, {"occupancy", "queued_prompt_tokens"}
-        )
+    def test_every_signal_is_read_on_the_active_boundaries(self):
+        """No signal is exempt any more, ``rank_ms_spread_pct`` included."""
+        rows = [
+            {**_IDLE, "rank_ms_spread_pct": 99.0},
+            {**_busy(0.16), "rank_ms_spread_pct": 3.0},
+        ] * 6
         with tempfile.TemporaryDirectory() as tmp:
-            rows = [_IDLE] * 10 + [_busy(0.16)] * 10
             a, b = _pair(tmp, rows, rows)
+            got = bands.load_boundaries(a)
+            for field in bands.SIGNALS.values():
+                self.assertEqual(len(bands.series(got, field)), 6, field)
             rep = bands.report(a, b)
-            self.assertTrue(rep["bands"]["occupancy"]["active_only"])
-            self.assertTrue(rep["bands"]["queued_prompt_tokens"]["active_only"])
-            self.assertFalse(rep["bands"]["decode_share"]["active_only"])
-            self.assertFalse(rep["bands"]["rank_ms_spread_pct"]["active_only"])
+            self.assertEqual(rep["bands"]["rank_ms_spread_pct"]["observed_max"], 3.0)
 
     def test_arms_with_different_idle_lengths_are_comparable_again(self):
         """THE FALSIFIER, and it can fail: the same two arms, same identical
@@ -199,7 +216,11 @@ class TestActiveOnlySignals(CustomTestCase):
             loaded_a, loaded_b = bands.load_boundaries(a), bands.load_boundaries(b)
 
             # The unrestricted alignment, which is what gate 3 ran.
-            old = bands.band_for(loaded_a, loaded_b, "occupancy", active_only=False)
+            raw_a = [float(r["occupancy"]) for r in loaded_a]
+            raw_b = [float(r["occupancy"]) for r in loaded_b]
+            old = bands._pointwise(
+                bands._common("occupancy", raw_a, raw_b), raw_a, raw_b
+            )
             self.assertEqual(old["status"], "ARMS_DISSIMILAR")
             self.assertGreaterEqual(old["band"], 0.9 * 0.16)
 
@@ -223,17 +244,19 @@ class TestActiveOnlySignals(CustomTestCase):
             self.assertFalse(rep["passed"])
             self.assertIn("kv_ascend_mark: UNDERPOWERED", rep["blocking"])
 
-    def test_the_report_says_which_signals_were_restricted(self):
-        """A restriction the analysis applied has to be visible in the
-        analysis's own output, or the next reader compares two reports that
-        measured different things."""
+    def test_the_report_says_what_it_measured_and_how(self):
+        """A restriction and a statistic the analysis chose have to be visible
+        in the analysis's own output, or the next reader compares two reports
+        that measured different things."""
         with tempfile.TemporaryDirectory() as tmp:
             rows = [_IDLE] * 5 + [_busy(0.1 + 0.01 * i) for i in range(10)]
             a, b = _pair(tmp, rows, rows)
             rendered = bands.render(bands.report(a, b))
-            self.assertIn("occupancy*", rendered)
-            self.assertIn("restricted to boundaries that ran a forward", rendered)
+            self.assertIn("read on the ACTIVE boundaries only", rendered)
             self.assertIn("(10 active)", rendered)
+            self.assertIn("distributional", rendered)
+            self.assertIn("pointwise", rendered)
+            self.assertIn("duty cycles at the constants' own thresholds", rendered)
 
 
 class TestBandArithmetic(CustomTestCase):
@@ -275,26 +298,51 @@ class TestVerdictsThatAreNotClears(CustomTestCase):
             rep = bands.report(a, b)
             self.assertEqual(rep["bands"]["decode_share"]["status"], "UNDERPOWERED")
 
-    def test_arms_that_do_not_line_up_are_flagged_not_averaged(self):
+    def test_the_pointwise_guard_still_flags_arms_that_do_not_line_up(self):
         """A band as large as one arm's own movement is a comparability
         failure, not a floor. Found on the real trace: two halves of ONE run,
         idle first and workload second, produced a band equal to the whole
         occupancy range.
 
-        Every boundary here carries a share, i.e. is ACTIVE: since #388
-        occupancy is measured on active boundaries only, and the guard has to
+        Every boundary here carries a share, i.e. is ACTIVE: the guard has to
         keep firing on arms that differ WHILE BOTH ARE WORKING -- which is the
-        case it was written for and the one restriction cannot fix.
+        case it was written for and the one restriction cannot fix. The signal
+        is ``rank_ms_spread_pct`` because that is the one still compared
+        pointwise; the other four moved to the distributional guard below.
         """
         with tempfile.TemporaryDirectory() as tmp:
             a, b = _pair(
                 tmp,
-                [{"occupancy": 0.0, "decode_share": 1.0} for _ in range(20)],
-                [{"occupancy": i / 20.0, "decode_share": 1.0} for i in range(20)],
+                [{"rank_ms_spread_pct": 0.0, "decode_share": 1.0} for _ in range(20)],
+                [
+                    {"rank_ms_spread_pct": i / 20.0, "decode_share": 1.0}
+                    for i in range(20)
+                ],
             )
             rep = bands.report(a, b)
-            self.assertEqual(rep["bands"]["occupancy"]["status"], "ARMS_DISSIMILAR")
-            self.assertIn("within a single arm", rep["bands"]["occupancy"]["why"])
+            spread = rep["bands"]["rank_ms_spread_pct"]
+            self.assertEqual(spread["status"], "ARMS_DISSIMILAR")
+            self.assertIn("within a single arm", spread["why"])
+
+    def test_the_distributional_guard_flags_arms_whose_duty_cycles_disagree(self):
+        """The same refusal, re-stated for a distribution.
+
+        Both arms are busy throughout, so nothing is misaligned by idling --
+        one simply spent every window above the ascend mark and the other
+        every window below it. A rate that far apart is not two samples of
+        one workload.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = _pair(
+                tmp,
+                [{"occupancy": 0.90, "decode_share": 1.0} for _ in range(20)],
+                [{"occupancy": 0.10, "decode_share": 1.0} for _ in range(20)],
+            )
+            rep = bands.report(a, b)
+            occ = rep["bands"]["occupancy"]
+            self.assertEqual(occ["status"], "ARMS_DISSIMILAR")
+            self.assertIn("duty cycles", occ["why"])
+            self.assertGreater(occ["duty_worst"]["z"], bands.DISSIMILAR_Z)
 
     def test_two_steady_arms_at_different_levels_are_a_real_band(self):
         """The control on the guard above: a reproducible bias IS the
