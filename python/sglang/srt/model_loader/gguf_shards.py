@@ -328,6 +328,124 @@ def _page_cache_advice_available() -> bool:
     return _libc() is not None
 
 
+def _madvise_addr(
+    address: Optional[int],
+    map_len: Optional[int],
+    start: int,
+    length: int,
+    advice: int,
+    *,
+    log_path: str = "<mapping>",
+) -> bool:
+    """One ``madvise(address+start, length, advice)`` call. False if it did
+    not run (no libc, no live mapping, or a zero-length clamp) or the kernel
+    rejected it.
+
+    Shared between ``ConsumedPageDropper`` (a long-lived mapping it already
+    holds, one shard at a time) and any single-shot caller that owns a
+    mapping just for the length of one call (``drop_page_cache_range``
+    below).
+    """
+    libc = _libc()
+    if libc is None or address is None:
+        return False
+    if map_len and start + length > map_len:
+        length = max(0, map_len - start)
+    if length <= 0:
+        return False
+    # madvise() requires a page-aligned address. GGUF's own call sites always
+    # pass one already (the watermark only ever advises at page boundaries,
+    # see ConsumedPageDropper._flush_shard), so this is a no-op for them; a
+    # caller working from an arbitrary tensor's own data pointer (the
+    # safetensors path in weight_utils.py) will not have one, so round down
+    # to the enclosing page and extend the length to match.
+    target = address + start
+    aligned = (target // _PAGE_SIZE) * _PAGE_SIZE
+    length += target - aligned
+    target = aligned
+    import ctypes
+
+    rc = libc.madvise(ctypes.c_void_p(target), ctypes.c_size_t(length), advice)
+    if rc != 0:
+        logger.debug(
+            "page cache drop: madvise(%d) on %s [%d,+%d) failed: errno %d",
+            advice,
+            log_path,
+            start,
+            length,
+            ctypes.get_errno(),
+        )
+        return False
+    return True
+
+
+def _fadvise_dontneed(
+    fd: int, path: str, start: int, length: int, *, tag: str = "page cache drop"
+) -> None:
+    """``posix_fadvise(fd, start, length, POSIX_FADV_DONTNEED)``, logged on failure.
+
+    Classic recipe half of the fallback ladder. On its own -- over a range a
+    live mapping still covers, or on this rig's ZFS pool even after that
+    mapping is gone -- this is a measured no-op; it is kept only as the
+    fallback for kernels without ``MADV_PAGEOUT`` (pre-5.4) and filesystems
+    where ``invalidate_mapping_pages()`` does the job it advertises.
+    """
+    try:
+        os.posix_fadvise(fd, start, length, os.POSIX_FADV_DONTNEED)
+    except OSError as err:  # pragma: no cover - kernel dependent
+        logger.debug(
+            "%s: posix_fadvise(DONTNEED) on %s [%d,%d) failed: %s",
+            tag,
+            path,
+            start,
+            start + length,
+            err,
+        )
+
+
+def drop_page_cache_range(
+    path: str,
+    start: int,
+    length: int,
+    *,
+    address: Optional[int] = None,
+    map_len: Optional[int] = None,
+) -> None:
+    """Single-shot release of ``[start, start+length)`` of ``path``'s page cache.
+
+    Same ladder as ``ConsumedPageDropper._advise`` (see the module comment
+    above it for the measurements this is based on), but for a caller that
+    has no long-lived dropper object to amortise an fd across many calls --
+    it opens one for the fadvise fallback and closes it again before
+    returning.
+
+    ``address``/``map_len`` are the base and byte length of a mapping the
+    caller already has faulted PTEs in for ``[start, start+length)`` --
+    ``MADV_PAGEOUT`` reclaims through the page table, so an address with no
+    live, faulted mapping over the range makes step 1 a no-op and this falls
+    straight through to the fadvise-only fallback (a measured no-op on this
+    rig's ZFS pool; see ``weight_utils._drop_file_cache_after_load`` for how
+    the safetensors path gets itself a faulted mapping to avoid exactly that).
+    """
+    if _madvise_addr(address, map_len, start, length, _MADV_PAGEOUT, log_path=path):
+        return
+    _madvise_addr(address, map_len, start, length, _MADV_DONTNEED, log_path=path)
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as err:  # pragma: no cover - path validated by the caller
+        logger.debug("page cache drop: cannot open %s for fadvise: %s", path, err)
+        return
+    try:
+        _fadvise_dontneed(fd, path, start, length)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 class ConsumedPageDropper:
     """Release the page cache of GGUF shard regions the stream has passed.
 
@@ -395,7 +513,7 @@ class ConsumedPageDropper:
         shard_paths: Sequence[str],
         readers: Sequence[Any],
         **kwargs: Any,
-    ) -> "ConsumedPageDropper":
+    ) -> ConsumedPageDropper:
         """Build a dropper for ``gguf.GGUFReader`` objects, extents included.
 
         ``reader.data`` is the ``np.memmap`` of the whole part. A reader that
@@ -466,7 +584,7 @@ class ConsumedPageDropper:
                     self.calls,
                 )
 
-    def __enter__(self) -> "ConsumedPageDropper":
+    def __enter__(self) -> ConsumedPageDropper:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
@@ -508,31 +626,14 @@ class ConsumedPageDropper:
         self._pending[shard_index] = 0
 
     def _madvise(self, shard_index: int, start: int, length: int, advice: int) -> bool:
-        libc = _libc()
-        address = self._addrs[shard_index]
-        if libc is None or address is None:
-            return False
-        limit = self._map_len[shard_index]
-        if limit and start + length > limit:
-            length = max(0, limit - start)
-        if length <= 0:
-            return False
-        import ctypes
-
-        rc = libc.madvise(
-            ctypes.c_void_p(address + start), ctypes.c_size_t(length), advice
+        return _madvise_addr(
+            self._addrs[shard_index],
+            self._map_len[shard_index],
+            start,
+            length,
+            advice,
+            log_path=self._paths[shard_index],
         )
-        if rc != 0:
-            logger.debug(
-                "GGUF stream: madvise(%d) on %s [%d,+%d) failed: errno %d",
-                advice,
-                self._paths[shard_index],
-                start,
-                length,
-                ctypes.get_errno(),
-            )
-            return False
-        return True
 
     def _advise(self, shard_index: int, start: int, end: int) -> None:
         """Drop ``[start, end)`` of one shard. Overridden by the contract test."""
@@ -558,16 +659,9 @@ class ConsumedPageDropper:
                 )
                 return
             self._fds[shard_index] = fd
-        try:
-            os.posix_fadvise(fd, start, length, os.POSIX_FADV_DONTNEED)
-        except OSError as err:  # pragma: no cover - kernel dependent
-            logger.debug(
-                "GGUF stream: posix_fadvise(DONTNEED) on %s [%d,%d) failed: %s",
-                self._paths[shard_index],
-                start,
-                end,
-                err,
-            )
+        _fadvise_dontneed(
+            fd, self._paths[shard_index], start, length, tag="GGUF stream"
+        )
 
 
 class _NullPageDropper:

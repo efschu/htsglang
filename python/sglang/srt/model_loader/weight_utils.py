@@ -26,6 +26,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -926,13 +927,76 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
-def _drop_file_cache_after_load(path: str) -> None:
-    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+def _drop_file_cache_after_load(
+    path: str, extents: Optional[Sequence[Tuple[int, int]]] = None
+) -> None:
+    """Release checkpoint pages after weights have been copied out.
+
+    Opt-in via ``--weight-loader-drop-cache-after-load``
+    (``server_args.weight_loader_drop_cache_after_load``), used to avoid CPU
+    OOM in RL.
+
+    Whole-file drop, not incremental: unlike the GGUF stream
+    (``gguf_shards.ConsumedPageDropper``), every tensor from ``path`` has
+    already been read AND copied into its destination parameter by the
+    caller of the weights iterator by the time this runs -- there is no
+    reader still working behind us, so there is no consumed/unconsumed
+    watermark to keep; the whole file is safe to advise in one shot.
+
+    ``posix_fadvise(POSIX_FADV_DONTNEED)`` alone -- the previous
+    implementation -- is a measured no-op on this rig's ZFS pool:
+    ``invalidate_mapping_pages()`` does not free a page that is still
+    mapped, and on ZFS it does not free it even after the mapping goes away
+    either (see the ladder rationale in the ``gguf_shards.py`` module
+    comment).
+
+    ``extents``: ``(address, nbytes)`` of every tensor the call site read as
+    a live, zero-copy ``safetensors.safe_open`` mmap view, captured *before*
+    the mapping had a chance to be torn down. These are used directly:
+    ``MADV_PAGEOUT`` walks the page table of the mapping it is given, so it
+    needs addresses from a mapping that is still alive. A separate,
+    freshly-opened mapping of the same file created *after the fact* was
+    tried and measured NOT to work here -- with the original
+    ``safe_open``-backed mapping still referenced elsewhere (which its
+    lifetime does not rule out), reclaim through an unrelated second mapping
+    left the page cache untouched. Reusing the live mapping's own addresses,
+    the same principle ``gguf_shards.ConsumedPageDropper`` uses, is what
+    actually frees the pages (measured: 100% resident -> 0% resident on this
+    rig's ZFS pool).
+
+    When no live mapping is available -- ``disable_mmap=True`` reads the
+    whole file into a fresh buffer with no page-cache-backed view to advise
+    at all, or the platform has no ``madvise`` -- this falls back to plain
+    ``posix_fadvise(DONTNEED)`` on the whole file: the pre-#408 mechanism,
+    a measured no-op on this rig's ZFS pool but still the best available
+    option with nothing live to advise.
+
+    No additional utilization ceiling, safety margin, or rounding is applied
+    on top of what is advised: this reclaims pages that have already been
+    fully read and copied out, it does not discard anything a caller has not
+    consumed yet.
+    """
+    from sglang.srt.model_loader.gguf_shards import (
+        _page_cache_advice_available,
+        drop_page_cache_range,
+    )
+
+    if extents and _page_cache_advice_available():
+        for address, nbytes in extents:
+            if nbytes <= 0:
+                continue
+            # Each tensor is advised as its own live range: address is the
+            # tensor's own data pointer, so no file-offset math is needed,
+            # and map_len == nbytes bounds it exactly.
+            drop_page_cache_range(path, 0, nbytes, address=address, map_len=nbytes)
+        return
+
+    # No live mapping to advise -- fall back to plain fadvise on the whole
+    # file, exactly the pre-#408 mechanism.
     posix_fadvise = getattr(os, "posix_fadvise", None)
     dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
     if posix_fadvise is None or dontneed is None:
         return
-
     fd = None
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -973,12 +1037,27 @@ def safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
                     yield name, result[name]
+            if drop_cache_after_load:
+                # The whole file went through a plain read() into a fresh
+                # buffer, not a memory map -- there is no live mapping to
+                # hand the ladder, so this falls back to plain fadvise.
+                _drop_file_cache_after_load(st_file)
         else:
+            extents: List[Tuple[int, int]] = []
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
-        if drop_cache_after_load:
-            _drop_file_cache_after_load(st_file)
+                    tensor = f.get_tensor(name)
+                    if drop_cache_after_load:
+                        extents.append(
+                            (tensor.data_ptr(), tensor.numel() * tensor.element_size())
+                        )
+                    yield name, tensor
+                # Still inside the `with` block on purpose: the mapping the
+                # extents above point into is only guaranteed alive up to
+                # `f`'s own __exit__, so the drop has to happen before it,
+                # not after (see _drop_file_cache_after_load's docstring).
+                if drop_cache_after_load:
+                    _drop_file_cache_after_load(st_file, extents)
 
 
 def fastsafetensors_weights_iterator(
@@ -1073,11 +1152,22 @@ def multi_thread_safetensors_weights_iterator(
 
         for future in futures_iter:
             st_file, state_dict = future.result()
+            extents: Optional[List[Tuple[int, int]]] = None
+            if drop_cache_after_load and not disable_mmap:
+                # `_load_file`'s `with safe_open(...)` block has already
+                # exited by the time we get `state_dict` back, but its
+                # tensors are zero-copy views that keep the underlying
+                # mapping alive for as long as `state_dict` is -- captured
+                # here, before `del state_dict` below lets it go.
+                extents = [
+                    (t.data_ptr(), t.numel() * t.element_size())
+                    for t in state_dict.values()
+                ]
             for name, param in state_dict.items():
                 yield name, param
-            del state_dict
             if drop_cache_after_load:
-                _drop_file_cache_after_load(st_file)
+                _drop_file_cache_after_load(st_file, extents)
+            del state_dict
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -1139,13 +1229,22 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 if next_file is not None:
                     pending.append((next_file, executor.submit(_load_file, next_file)))
 
+                extents: Optional[List[Tuple[int, int]]] = None
+                if drop_cache_after_load and not disable_mmap:
+                    # `_load_file`'s `with safe_open(...)` block has already
+                    # exited by the time we get `state_dict` back, but its
+                    # tensors are zero-copy views that keep the underlying
+                    # mapping alive for as long as `state_dict` is -- capture
+                    # the live addresses before `del state_dict` lets it go.
+                    extents = [
+                        (t.data_ptr(), t.numel() * t.element_size())
+                        for t in state_dict.values()
+                    ]
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
-                del state_dict
                 if drop_cache_after_load:
-                    # DONTNEED reduces page-cache pressure after copying weights,
-                    # but later mmap-backed tensor access may fault pages again.
-                    _drop_file_cache_after_load(st_file)
+                    _drop_file_cache_after_load(st_file, extents)
+                del state_dict
                 pbar.update(1)
 
 
