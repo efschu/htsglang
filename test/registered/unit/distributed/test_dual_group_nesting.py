@@ -144,6 +144,27 @@ class TestNesting(unittest.TestCase):
         self.assertIn("FAST ratio", text)
         self.assertIn("Fix:", text)
 
+    def test_the_nesting_refusal_is_in_english(self):
+        """#381: this message said "the Verband's weight bytes".
+
+        The #295/#358 sweeps translated the barlink and bar1ep strands and did
+        not reach the dual-group planner, so one German word survived in a
+        message an operator reads when their ratio pair is rejected. It is
+        replaced by this file's own English term for the same thing -- the BIG
+        group -- so the refusal and the code that raises it use one vocabulary.
+        """
+        plan = derive_nested_plan([1, 1, 1, 3])
+        broken = next(
+            u
+            for u in range(4, 200)
+            if nesting_failures(plan, [NestingProbe("units", u)])
+        )
+        with self.assertRaises(ValueError) as ctx:
+            check_nesting(plan, [NestingProbe("units", broken)])
+        text = str(ctx.exception)
+        self.assertNotIn("Verband", text)
+        self.assertIn("BIG group's weight bytes", text)
+
     def test_differing_geometry_is_undefined_not_merely_violated(self):
         plan = derive_nested_plan([6, 1, 1])
         probe = NestingProbe(

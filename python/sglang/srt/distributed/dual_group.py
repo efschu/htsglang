@@ -484,8 +484,8 @@ def check_nesting(plan: NestedGroupPlan, probes: Sequence[NestingProbe]) -> None
     if not failures:
         return
     raise ValueError(
-        "Dual-group plan is not nested -- the PD lane cannot share the "
-        "Verband's weight bytes with this ratio pair.\n  "
+        "Dual-group plan is not nested -- the PD lane cannot share the BIG "
+        "group's weight bytes with this ratio pair.\n  "
         + plan.describe()
         + "\n  "
         + "\n  ".join(failures)
@@ -678,7 +678,7 @@ def lane_vram_posts(
             status=DUPLICATED,
             mib=lane_kv_mib,
             why="the lane needs request-disjoint slots; deliberately small, "
-            "every MiB here is missing from the Verband's pool",
+            "every MiB here is missing from the BIG group's pool",
         ),
         VramPost(
             name="lane linear-attention state pool",
@@ -692,7 +692,7 @@ def lane_vram_posts(
             status=DUPLICATED,
             mib=lane_scratch_mib,
             why="per forward, never shared. Under serial lane ticks this peak "
-            "does not overlap the Verband's peak",
+            "does not overlap the BIG group's peak",
         ),
         VramPost(
             name="CUDA context",
