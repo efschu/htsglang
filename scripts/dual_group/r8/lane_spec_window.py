@@ -415,7 +415,13 @@ def run_falsifier(
             -1
         ]
     )
-    out["reference"] = {k: v for k, v in ref.items() if k != "output_ids"}
+    # The ids and the text are KEPT, on the reference and on every arm. #399
+    # closed this gap one function up, in the gate, and the repro window then
+    # ran into it here: all four arms came back "identical" and the artifact
+    # could not say whether that meant the divergence was absent or the
+    # reference had been corrupted along with them. "Identical to a reference
+    # nobody kept" is not a measurement.
+    out["reference"] = {**ref, "text": detokenize(ref["output_ids"], tokenizer)}
 
     overrides = {
         "plain": {},
@@ -433,7 +439,8 @@ def run_falsifier(
         cmp = compare_trajectories(ref["output_ids"], row["output_ids"])
         out["arms"][label] = {
             **cmp,
-            **{k: v for k, v in row.items() if k != "output_ids"},
+            **row,
+            "text": detokenize(row["output_ids"], tokenizer),
         }
         print(
             f"  falsify {label:16s} {cmp['classification']:20s} "
@@ -441,6 +448,145 @@ def run_falsifier(
             f"accept {row['accept_len_mean']} round {row['round_ms_mean']} ms",
             flush=True,
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# phase 2b: hold the arm still and vary the HISTORY
+# ---------------------------------------------------------------------------
+
+#: What each variant sends BEFORE the measured pair, as ``(prompt, spec)``.
+#:
+#: ``gate_full`` is the gate's own twelve requests in the gate's own order --
+#: two no-spec and two speculative per prompt -- because that is the sequence
+#: the divergence was seen after. The two single-prompt variants cut it down
+#: along the only axis that separates them from it.
+_GATE_PRELUDE = [
+    (name, spec)
+    for name in ("alphabet", "squares", "repeat")
+    for spec in (False, False, True, True)
+]
+
+HISTORY_VARIANTS: Dict[str, List[Any]] = {
+    "none": [],
+    "alphabet_only": [("alphabet", spec) for spec in (False, False, True, True)],
+    "repeat_only": [("repeat", spec) for spec in (False, False, True, True)],
+    "gate_full": _GATE_PRELUDE,
+}
+
+
+def run_history_falsify(
+    base: str,
+    tokenizer: str,
+    prompt_name: str,
+    tokens: int,
+    steps: int,
+    verify: str,
+    deadline: float,
+    variants: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """One arm, four histories: WHICH preceding state carries the divergence.
+
+    The #399 window established that the lane-chain ``squares`` corruption is
+    history-dependent. It fired in the gate, twice and byte-identically, and
+    it was absent minutes later in the falsifier phase of the same boot with
+    the same arm -- so the axis that separates the two is not the arm, it is
+    what ran before. Every arm-varying falsifier is blind to that axis by
+    construction: it varies the arm.
+
+    So the arm is held fixed at ``plain`` (the unmodified speculative run) and
+    only the PRELUDE moves: nothing, the four ``alphabet`` requests, the four
+    ``repeat`` requests (the 65-token one), or the gate's full twelve. Each
+    variant then measures its own no-spec reference and its own speculative
+    arm back to back, and keeps ``output_ids``, the decoded text and the
+    margins of both.
+
+    ``none`` is only a fresh lane on the FIRST variant of the first phase of a
+    fresh boot -- variant two onwards inherits variant one's requests. That is
+    not hidden: every variant records ``lane_results_before``, the lane's own
+    monotone completion counter read immediately before its prelude, so the
+    history axis is a measured number in the artifact rather than a claim in a
+    docstring.
+    """
+    names = variants or list(HISTORY_VARIANTS)
+    ids = tokenize(base, PROMPTS[prompt_name], tokenizer)
+    out: Dict[str, Any] = {
+        "prompt": prompt_name,
+        "prompt_tokens": len(ids),
+        "arm": "plain",
+        "variants": {},
+        "order": names,
+    }
+    for name in names:
+        if name not in HISTORY_VARIANTS:
+            raise ValueError(
+                f"unknown history variant {name!r} "
+                f"(have: {', '.join(HISTORY_VARIANTS)})"
+            )
+        if time.time() > deadline:
+            out["variants"][name] = {"skipped": "deadline"}
+            continue
+        before = _lane_snapshot(base).get("results_total")
+        prelude = HISTORY_VARIANTS[name]
+        for p_name, p_spec in prelude:
+            p_ids = tokenize(base, PROMPTS[p_name], tokenizer)
+            lane_run(
+                base,
+                _lane_job(p_ids, tokens, spec=p_spec, steps=steps, verify=verify),
+            )
+        ref = _row(
+            lane_run(
+                base, _lane_job(ids, tokens, spec=False, steps=steps, verify=verify)
+            )[-1]
+        )
+        arm = _row(
+            lane_run(
+                base, _lane_job(ids, tokens, spec=True, steps=steps, verify=verify)
+            )[-1]
+        )
+        cmp = compare_trajectories(ref["output_ids"], arm["output_ids"])
+        texts = {
+            "no_spec": detokenize(ref["output_ids"], tokenizer),
+            "spec": detokenize(arm["output_ids"], tokenizer),
+        }
+        out["variants"][name] = {
+            "lane_results_before": before,
+            "prelude": [{"prompt": p, "spec": s} for p, s in prelude],
+            "prelude_requests": len(prelude),
+            **cmp,
+            "arms": {
+                "no_spec": {**ref, "text": texts["no_spec"]},
+                "spec": {**arm, "text": texts["spec"]},
+            },
+            "graded_scores": {
+                side: graded_score(prompt_name, text)["score"]
+                for side, text in texts.items()
+            },
+        }
+        print(
+            f"  history {name:14s} prelude={len(prelude):2d} "
+            f"before={before} {cmp['classification']:20s} "
+            f"first_diff={cmp['first_divergent_index']} "
+            f"score {out['variants'][name]['graded_scores']['no_spec']}"
+            f"->{out['variants'][name]['graded_scores']['spec']} "
+            f"accept {arm['accept_len_mean']}",
+            flush=True,
+        )
+    diverged = sorted(
+        n
+        for n, v in out["variants"].items()
+        if v.get("classification") == "content_divergence"
+    )
+    out["content_divergent_variants"] = diverged
+    out["verdict"] = (
+        "no variant diverged"
+        if not diverged
+        else (
+            "every variant diverged"
+            if len(diverged) == len(out["variants"])
+            else "history-dependent: " + ", ".join(diverged)
+        )
+    )
     return out
 
 
@@ -787,7 +933,16 @@ def main() -> int:
     ap.add_argument(
         "--phases",
         default="gate,e_spec",
-        help="comma list of: gate, falsify, e_spec, e_nospec",
+        help="comma list of: history, gate, falsify, e_spec, e_nospec. The "
+        "order here does not schedule them -- history always runs first, "
+        "because its 'none' variant is the only one that needs a lane no "
+        "request has touched",
+    )
+    ap.add_argument(
+        "--history-variants",
+        default=",".join(HISTORY_VARIANTS),
+        help="comma list of preceding-request sequences for the history "
+        "phase, in the order they run",
     )
     ap.add_argument(
         "--deadline-s",
@@ -839,6 +994,23 @@ def main() -> int:
         }
     except Exception as exc:  # pragma: no cover - diagnostics only
         report["server"] = {"error": repr(exc)}
+
+    # FIRST, whatever order --phases listed, and the reason is the
+    # measurement: the "none" variant is a lane that no request has touched,
+    # and any phase running before it spends that state.
+    if "history" in phases:
+        print("== phase: history falsifier (one arm, four preludes)", flush=True)
+        report["history"] = run_history_falsify(
+            base,
+            args.tokenizer,
+            args.falsify_prompt,
+            args.gate_tokens,
+            args.steps,
+            args.verify,
+            deadline,
+            [v.strip() for v in args.history_variants.split(",") if v.strip()],
+        )
+        print(f"   verdict: {report['history']['verdict']}", flush=True)
 
     if "gate" in phases:
         print("== phase: coherence gate (lane solo, spec vs no-spec)", flush=True)

@@ -3373,7 +3373,9 @@ class DualGroupLane:
         for m in row_margins[: len(emitted)]:
             self._record_margin(job, m)
         job["_kv_len"] = n_cached + n_accept + 1
-        job["_hidden"] = hidden
+        # Cloned for the reason spelled out in ``_verify_by_target_verify``:
+        # this row outlives the forward that produced it by a whole round.
+        job["_hidden"] = None if hidden is None else hidden.clone()
         job["_next"] = torch.tensor(
             [preds[n_accept]], dtype=torch.int64, device=batch.device
         )
@@ -3710,7 +3712,28 @@ class DualGroupLane:
         req.kv_allocated_len = new_len
 
         job["_kv_len"] = new_len
-        job["_hidden"] = out.hidden_states[n_accept : n_accept + 1]
+        # CLONED, for the same reason the row block below is, and the two are
+        # deliberately no longer asymmetric. ``out.hidden_states`` is the
+        # verify forward's output; under a captured replay it is a SLICE OF A
+        # RETAINED STATIC BUFFER (the graph runner returns
+        # ``output.hidden_states[: raw_num_token]`` of the tensor it kept from
+        # the capture), and holding a reference to a slice of that buffer does
+        # not stop the next replay of the same shape from writing through it.
+        # This row is read a whole round later, by ``_propose``, with the
+        # rollback's head forwards in between.
+        #
+        # What this clone does NOT do is change the committed tokens, and that
+        # is worth stating where the temptation to assume otherwise is: the
+        # only consumer of ``_hidden`` is ``_draft_forward``, so a value that
+        # arrived corrupted here can move the PROPOSALS and nothing else. The
+        # target's verify forward reads ``input_ids`` and the pool, never a
+        # hidden state, and every committed token is ``preds[i]`` for
+        # ``i <= n_accept``, whose conditioning tokens are by construction the
+        # committed prefix. The one route from a proposal to a committed token
+        # runs through what the REJECTED candidates leave behind in the pool
+        # (their KV slots, the per-step recurrent intermediates, the attention
+        # workspace) -- which is a property of the rollback, not of this row.
+        job["_hidden"] = out.hidden_states[n_accept : n_accept + 1].clone()
         job["_next"] = preds[n_accept : n_accept + 1]
         # The whole candidate row block, for ``_rollback_draft``: the accepted
         # positions have to be re-run against the TARGET's hidden states, and
@@ -3724,6 +3747,9 @@ class DualGroupLane:
         # shared-buffer defect this branch has already paid for three times
         # (round D2's share_input_buffer pool, round D3's flashinfer
         # workspace). 4 rows of bf16 hidden is ~40 KiB per round.
+        #
+        # ``_verify_last_token`` and ``_verify_hidden`` are views into these
+        # two clones and therefore carry the guarantee with them.
         if d >= 2:
             job["_verify_rows"] = out.hidden_states[: d - 1].clone()
             job["_verify_tokens"] = verify_input.draft_token[:d].clone()
@@ -3886,7 +3912,8 @@ class DualGroupLane:
             ]
             batch.token_to_kv_pool_allocator.free(surplus)
         job["_kv_len"] = n_cached + kept
-        job["_hidden"] = out.hidden_states[n_accept : n_accept + 1]
+        # Cloned for the reason spelled out in ``_verify_by_target_verify``.
+        job["_hidden"] = out.hidden_states[n_accept : n_accept + 1].clone()
         job["_next"] = preds[n_accept : n_accept + 1]
         return emitted, n_accept, ms
 
@@ -3912,7 +3939,11 @@ class DualGroupLane:
             next_token_ids = out.next_token_logits.argmax(dim=-1)
             if self._dbg_on():
                 self._dbg_prefill_rows(out, job["input_ids"])
-            job["_hidden"] = out.hidden_states[-1:]
+            # Cloned for the reason spelled out in
+            # ``_verify_by_target_verify``, and here the further forward the
+            # comment there talks about is two statements below: the head's
+            # own prefill runs before anything reads this row.
+            job["_hidden"] = out.hidden_states[-1:].clone()
             job["_kv_len"] = len(job["input_ids"])
             # Prime the head's own KV over the same prompt, using the
             # target's hidden states -- an MTP head attends over its own
@@ -4195,6 +4226,19 @@ class DualGroupLane:
         job["output_ids"].append(int(next_token_ids[0].item()))
         self._record_margin(job, self._last_margin)
         job["_next"] = next_token_ids
+        # ``prepare_for_decode`` advanced the batch by one position, so
+        # ``_kv_len`` has to follow it. It is not decoration: the K = 0 rung
+        # of the ladder routes a SPECULATIVE job through this step, and
+        # ``_verify`` takes ``n_cached = job["_kv_len"]`` as the length of the
+        # committed prefix. Left behind, the next verify round would write its
+        # candidate slot pointers over positions the plain step had already
+        # committed, place the chain at absolute positions one short, and mask
+        # a prefix that is one token too small -- a corruption of committed
+        # content, not a lost proposal. The rung ladder is the only caller
+        # that can reach it (a non-speculative job never reads the field), so
+        # the pinned single-rung recipe does not exercise it.
+        if job.get("_kv_len") is not None:
+            job["_kv_len"] = int(job["_kv_len"]) + 1
         self.work_total["decode_tokens"] += 1
 
     def drop_active(self) -> None:
