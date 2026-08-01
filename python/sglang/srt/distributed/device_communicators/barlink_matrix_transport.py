@@ -120,6 +120,54 @@ def _requested(group: str) -> tuple[int, str]:
     )
 
 
+def nvml_card_for_device(device, bdf: str = ""):
+    """The physical card behind ``device``, or a named error (#406).
+
+    A torch device carries a CUDA ordinal, and an NVML handle is addressed
+    by an NVML index. The two enumerations are different orderings of the
+    same cards -- on this rig the 5090 is CUDA ordinal 0 and NVML index 1
+    -- so passing the ordinal to ``nvmlDeviceGetHandleByIndex`` reads
+    another card's numbers. Resolution therefore goes through the #331
+    identity map: over the PCI address when the device could name one
+    (the identity that survives ``CUDA_VISIBLE_DEVICES``), otherwise over
+    the map's CUDA-ordinal side.
+
+    Raises ``DeviceOrderUnresolvedError`` when neither route places the
+    card. There is no fall-back to the index of the same number: this is
+    the sizing input for a BAR1 window, and a window sized from a card
+    other than the one that will host it is the failure mode the identity
+    map exists to remove.
+    """
+    from sglang.srt.registry.nvml import (
+        DeviceOrderUnresolvedError,
+        cuda_bridge_diagnosis,
+        identity_map,
+    )
+
+    # ``allow_cuda_init`` is free here: bar1_free is only ever asked about a
+    # device this process has already built a context on.
+    imap = identity_map(allow_cuda_init=True)
+    card = imap.by_pci_bus_id(bdf) if bdf else None
+    ordinal = None
+    if card is None:
+        try:
+            ordinal = _ordinal(device)
+        except Exception as e:  # noqa: BLE001 - no torch device, no ordinal
+            logger.debug("barlink-BAR1: device carries no usable ordinal (%r)", e)
+        if ordinal is not None:
+            card = imap.by_cuda_ordinal(ordinal)
+    if card is None:
+        raise DeviceOrderUnresolvedError(
+            "barlink-BAR1 window sizing: the physical card behind "
+            f"{device!r} could not be identified (pci address "
+            f"{bdf or 'unknown'}, CUDA ordinal "
+            f"{'unknown' if ordinal is None else ordinal}). NVML reports:\n  "
+            + ("\n  ".join(c.describe() for c in imap) or "no devices")
+            + f"\nReason: {cuda_bridge_diagnosis()}"
+        )
+    return card
+
+
 def bar1_free(device) -> tuple[Optional[int], int, str]:
     """``(free, gross, source)`` for this card's BAR1 aperture.
 
@@ -131,29 +179,58 @@ def bar1_free(device) -> tuple[Optional[int], int, str]:
     knows ``used``/``free``; sysfs only knows the aperture's gross size,
     and how much of that RM itself occupies is recorded nowhere. That is
     exactly the gap the holder's ENOMEM falls into.
+
+    Both readings are addressed by the card's PCI address rather than by
+    the device's ordinal (#406): sysfs already was, NVML now is. When the
+    card cannot be identified at all, the NVML read is SKIPPED and the
+    refusal is logged by name -- the answer degrades to "free unknown",
+    which the caller already handles and states in its arithmetic, rather
+    than to another card's free bytes, which it could not detect.
     """
-    gross = 0
+    from sglang.srt.registry.nvml import DeviceOrderUnresolvedError, nvml_session
+
+    bdf = ""
     try:
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import (
-            bar1_window,
-        )
         from sglang.srt.distributed.device_communicators.barlink_matrix import (
             bdf_of_card,
         )
 
-        gross = bar1_window(bdf_of_card(device)).size
+        bdf = bdf_of_card(device)
     except Exception as e:
-        logger.debug("barlink-BAR1: could not get BAR1 gross size from sysfs (%r)", e)
-    try:
-        import pynvml
+        logger.debug("barlink-BAR1: could not resolve the PCI address (%r)", e)
 
-        pynvml.nvmlInit()
+    gross = 0
+    if bdf:
         try:
-            h = pynvml.nvmlDeviceGetHandleByIndex(_ordinal(device))
+            from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+                bar1_window,
+            )
+
+            gross = bar1_window(bdf).size
+        except Exception as e:
+            logger.debug(
+                "barlink-BAR1: could not get BAR1 gross size from sysfs (%r)", e
+            )
+
+    try:
+        card = nvml_card_for_device(device, bdf=bdf)
+    except DeviceOrderUnresolvedError as e:
+        logger.warning(
+            "barlink-BAR1: NVML was NOT asked for this card's free BAR1 "
+            "space, because it could not be told which card that is. The "
+            "window is sized from the gross aperture instead. %s",
+            e,
+        )
+        return None, gross, "sysfs-gross"
+    except Exception as e:
+        logger.debug("barlink-BAR1: card identity unavailable (%r)", e)
+        return None, gross, "sysfs-gross"
+
+    try:
+        with nvml_session() as pynvml:
+            h = pynvml.nvmlDeviceGetHandleByIndex(card.nvml_index)
             info = pynvml.nvmlDeviceGetBAR1MemoryInfo(h)
             return int(info.bar1Free), (gross or int(info.bar1Total)), "nvml"
-        finally:
-            pynvml.nvmlShutdown()
     except Exception as e:
         logger.debug("barlink-BAR1: NVML did not provide BAR1 usage (%r)", e)
     return None, gross, "sysfs-gross"

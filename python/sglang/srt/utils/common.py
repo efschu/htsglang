@@ -273,8 +273,13 @@ class _NvmlDeviceInfo(NamedTuple):
     name: str
 
 
+#: One NVML device as this module carries it: ``(capability, name, uuid,
+#: bus_id)``.
+_NvmlDevice = Tuple[Tuple[int, int], str, str, str]
+
+
 @lru_cache(maxsize=1)
-def _nvml_all_devices() -> Tuple[Tuple[Tuple[int, int], str, str, str], ...]:
+def _nvml_all_devices() -> Tuple[_NvmlDevice, ...]:
     """Every NVML device on the box as ``(capability, name, uuid, bus_id)``,
     in NVML order, without initializing CUDA. Empty when NVML cannot answer.
     """
@@ -309,6 +314,33 @@ def _nvml_all_devices() -> Tuple[Tuple[Tuple[int, int], str, str, str], ...]:
     return tuple(devices)
 
 
+def _nvml_devices_in_cuda_order() -> Tuple[List[_NvmlDevice], bool]:
+    """The NVML device list re-ordered the way CUDA enumerates it, plus
+    whether that order is the documented one.
+
+    ``CUDA_VISIBLE_DEVICES`` entries are positions in CUDA's enumeration,
+    NOT NVML indices, and the two orders differ on a heterogeneous rig (on
+    this one the 5090 is NVML index 1 and CUDA ordinal 0). Anything that
+    resolves such an entry has to sort first; indexing the NVML-ordered
+    list with it names a different card (#406).
+
+      - PCI_BUS_ID: sort by PCI bus id, CUDA's documented order. The
+        returned flag is True: every position is then specified.
+      - FASTEST_FIRST (default): CUDA documents only that the fastest
+        device becomes device 0, the rest is unspecified. Approximated as
+        highest compute capability first, stable, so equal cards keep NVML
+        order. The flag is False, and callers must treat positions past 0
+        on a mixed rig as unresolvable rather than as an answer.
+    """
+    devices = list(_nvml_all_devices())
+    pci_order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST") == "PCI_BUS_ID"
+    if pci_order:
+        devices.sort(key=lambda d: d[3])
+    else:
+        devices.sort(key=lambda d: d[0], reverse=True)
+    return devices, pci_order
+
+
 @lru_cache(maxsize=1)
 def min_visible_cuda_capability_no_init() -> Optional[Tuple[int, int]]:
     """The LOWEST compute capability among the CUDA devices this process can
@@ -326,6 +358,12 @@ def min_visible_cuda_capability_no_init() -> Optional[Tuple[int, int]]:
 
     Answered without initializing CUDA while it is uninitialized (task #237);
     once CUDA is up, torch is the authority on what is visible.
+
+    ``CUDA_VISIBLE_DEVICES`` entries are positions in CUDA's enumeration, not
+    NVML indices, so they are resolved through ``_nvml_devices_in_cuda_order``
+    (#406). Where that order leaves a position unspecified the answer degrades
+    to the floor over every card on the box -- low is the safe direction for
+    this question; see the comment at that branch.
     """
     if not is_cuda():
         return None
@@ -343,12 +381,17 @@ def min_visible_cuda_capability_no_init() -> Optional[Tuple[int, int]]:
         return None
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None:
+        # The entries index CUDA's enumeration, not NVML's, so the list is
+        # ordered before it is indexed -- see _nvml_devices_in_cuda_order.
+        ordered, pci_order = _nvml_devices_in_cuda_order()
+        mixed = len({d[0] for d in ordered}) > 1
         visible = []
         for entry in cvd.split(","):
             entry = entry.strip()
             if not entry:
                 break
             if entry.startswith("GPU-"):
+                # A uuid names its card in either order; nothing to resolve.
                 matches = [d for d in devices if d[2].startswith(entry)]
                 if len(matches) != 1:
                     break  # includes MIG-...; CUDA stops at the first bad entry
@@ -358,9 +401,21 @@ def min_visible_cuda_capability_no_init() -> Optional[Tuple[int, int]]:
                     index = int(entry)
                 except ValueError:
                     break
-                if not 0 <= index < len(devices):
+                if not 0 <= index < len(ordered):
                     break
-                visible.append(devices[index])
+                if index > 0 and not pci_order and mixed:
+                    # FASTEST_FIRST specifies only position 0, so on a mixed
+                    # rig this entry cannot be resolved to a card. The honest
+                    # answer for a MINIMUM is then the floor over EVERY card
+                    # NVML reports, not an error and not a guess: this value
+                    # arms one kernel variant for the whole process, the floor
+                    # over a superset can only be lower than the true floor,
+                    # and too low merely forgoes an optimization while too
+                    # high hands a card a variant it cannot run. Callers that
+                    # need the identity of a card (rather than a bound over
+                    # them) must refuse instead -- see _nvml_cuda_device0.
+                    return min(d[0] for d in devices)
+                visible.append(ordered[index])
         devices = visible
     if not devices:
         return None
@@ -372,14 +427,12 @@ def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
     """Resolve CUDA device 0 (the 'current' device before any set_device)
     via NVML, honoring CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER.
 
-    Enumeration-order emulation:
-      - PCI_BUS_ID: sort NVML devices by PCI bus id (CUDA's documented order).
-      - FASTEST_FIRST (default): CUDA documents only that the fastest device
-        becomes device 0 (rest unspecified). Approximated as highest compute
-        capability first. Exotic mixes where a lower-capability card is
-        faster would be mis-ordered here -- but when every visible device
-        shares one capability the answer is order-independent, and the
-        heterogeneous first-position answer matches the max-capability card.
+    The enumeration order is emulated by ``_nvml_devices_in_cuda_order``
+    (PCI_BUS_ID sorts by bus id, FASTEST_FIRST by capability). Exotic mixes
+    where a lower-capability card is faster would be mis-ordered there --
+    but when every visible device shares one capability the answer is
+    order-independent, and the heterogeneous first-position answer matches
+    the max-capability card.
 
     CUDA_VISIBLE_DEVICES entries may be indices or GPU-<uuid> prefixes;
     parsing stops at the first unresolvable entry (CUDA semantics). MIG
@@ -387,16 +440,9 @@ def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
     cannot be answered from NVML; callers then fall back to torch (which
     initializes CUDA).
     """
-    devices = _nvml_all_devices()
-    if not devices:
+    if not _nvml_all_devices():
         return None
-    devices = list(devices)
-
-    pci_order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST") == "PCI_BUS_ID"
-    if pci_order:
-        devices.sort(key=lambda d: d[3])
-    else:
-        devices.sort(key=lambda d: d[0], reverse=True)
+    devices, pci_order = _nvml_devices_in_cuda_order()
 
     # Only the first visible position matters: it is what
     # get_device_capability() / get_device_name() read before any set_device.
