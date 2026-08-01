@@ -28,6 +28,9 @@ from sglang.srt.workbench.tenant import IdleWorkTenant
 logger = logging.getLogger(__name__)
 
 #: Registered in this order when ``--workbench-tenants`` is not given.
+#: ``boot_matrix`` (#349) is NOT in the default set: it boots full TP servers
+#: and needs a model path, so it is opt-in via ``--workbench-tenants`` with a
+#: configured model rather than a silent background consumer.
 DEFAULT_TENANTS = ("training", "fp8_tuner", "card_probe")
 
 
@@ -218,6 +221,7 @@ def build_tenants(
     quietly disables a tenant produces a rig that looks idle-managed and is
     not, which is worse than not booting.
     """
+    from sglang.srt.workbench.tenants.boot_matrix import BootMatrixTenant
     from sglang.srt.workbench.tenants.card_probe import CardProbeTenant
     from sglang.srt.workbench.tenants.fp8_tuner import Fp8BlockTunerTenant
     from sglang.srt.workbench.tenants.training import TrainingWorkTenant
@@ -255,10 +259,19 @@ def build_tenants(
                     )
                 )
             )
+        elif name == "boot_matrix":
+            out.append(
+                BootMatrixTenant(
+                    artifact_root=root / "boot_matrix",
+                    model_path=str(
+                        getattr(server_args, "workbench_boot_matrix_model", "") or ""
+                    ),
+                )
+            )
         else:
             raise ValueError(
                 f"--workbench-tenants names an unknown tenant {name!r}; known "
-                f"tenants are {', '.join(DEFAULT_TENANTS)}"
+                f"tenants are {', '.join((*DEFAULT_TENANTS, 'boot_matrix'))}"
             )
     return out
 
