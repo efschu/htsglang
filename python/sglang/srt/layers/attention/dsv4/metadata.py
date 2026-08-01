@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.indexer_arch import (
+    deepgemm_indexer_metadata_needed,
+)
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -120,9 +123,15 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        # The schedule below is a tiling plan for DeepGEMM's own kernel, and
+        # building it calls into DeepGEMM. It must be skipped in exactly the
+        # cases where that kernel is not the one selected -- including on a
+        # device that has no DeepGEMM at all, which is decided from this
+        # tensor's card rather than from device 0 (#343).
+        if not deepgemm_indexer_metadata_needed(
+            self.c4_seq_lens.device.index
+            if self.c4_seq_lens.device.type == "cuda"
+            else None
         ):
             self.deep_gemm_metadata = None
         else:

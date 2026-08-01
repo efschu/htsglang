@@ -84,8 +84,10 @@ selected on that architecture.
 | 6 | `flash_mla_sm120_triton.py:_tiled_sparse_decode_kernel` | n/a | n/a | ok | would CompilationError | fixed (Cut 1) |
 | 7 | `dsv4/quant_k_cache.py` KV write (fp8 encode) | ok | ok | ok | **CompilationError** | fixed (Cut 1b) |
 | 8 | `dsv4/index_buf_accessor.py` KV write (fp8 byte copy) | ok | ok | ok | **CompilationError** | fixed (Cut 1b) |
-| 9 | `dsv4/indexer.py:667` MQA-logits torch fallback | deepgemm | deepgemm | `..._torch_sm120` | deepgemm (needs SM90) | see "open risks" |
-| 10 | `dsv4/metadata.py` deepgemm indexer metadata | ok | ok | ok | needs SM90 | see "open risks" |
+| 9 | `dsv4/indexer.py` paged-MQA-logits selection | deepgemm | deepgemm | deepgemm → **crash** | deepgemm → crash | **torch** (Cut 3) |
+| 10 | `dsv4/metadata.py` deepgemm indexer schedule | ok | ok | built → crash | built → crash | **skipped** (Cut 3) |
+| 9b | `dsv4/indexer.py` non-paged indexer (`fp8_mqa_logits`) | ok | ok | eligible → crash | eligible → crash | **not eligible** (Cut 3) |
+| 9c | `dsv4/indexer.py` FP4 indexer | ok | ok | crash | crash | **named refusal** (Cut 3) |
 | 11 | MoE `topk_v2` JIT (`cg::this_cluster()`) | ok | ok | ok | JIT compile error | `SGLANG_OPT_USE_TOPK_V2=0`, launch-side |
 
 Rows 3, 6, 7, 8 are one bug with four call sites — the V4 KV layout is FP8
@@ -254,9 +256,79 @@ therefore already exists and is exercised today — `deepseek_v4_dspark.py:92`
 asserts `compress_ratio == 0` for the draft model. Forcing `compress_ratio=0`
 on layers 40-42 would bypass the indexer entirely, but **that would be a real
 approximation** (the layer would stop attending to its compressed history),
-so it is deliberately *not* part of this task. If the indexer turns out to be
-unrunnable on sm86 (row 9/10 of the matrix), the answer is a named refusal at
-startup, not a silent compress_ratio rewrite.
+so it is deliberately *not* part of this task. The indexer itself is given a
+route instead — Cut 3 below.
+
+---
+
+## Cut 3 — an indexer route on cards without DeepGEMM
+
+Cuts 1 and 2 get sm86 through attention; the DSpark layers (40-42, any layer
+with `compress_ratio in (4, 128)`) then run an indexer whose paged-MQA-logits
+step defaults to DeepGEMM. Matrix rows 9 and 10. Without this cut boot 12
+would stop at a wall we already knew about, which is not worth a card window.
+
+Note this is **not an Ampere-only cut**. DeepGEMM declined SM12x, so the 5090
+has no paged-MQA-logits kernel either: after Cut 2 gets TP0 through attention,
+TP0 would have hit rows 9/10 exactly like the 3080s. All three ranks of this
+rig need Cut 3.
+
+Upstream first, as always. **PR #31480** solves exactly this for the sibling
+`dsa/` package, and its structure is what is adopted: keep the explicit
+backend selections authoritative, add the capability-driven choice under
+them, and skip the DeepGEMM schedule metadata for any backend that does not
+consume it. The parts that PR had to *build* — a torch implementation and a
+metadata bypass — already exist here from #24692, so our delta is the
+dispatch half only. That is the honest framing: this cut writes no kernel.
+
+New module `dsv4/indexer_arch.py`:
+
+* `deepgemm_indexer_supported(device_id)` — `per_device_gate`, `major in
+  (9, 10)`. DeepGEMM upstream declined SM12x (deepgemm PR #318), and it is
+  Hopper-and-up, so Ampere, Ada and consumer Blackwell are all out.
+* `resolve_paged_mqa_logits_backend(device_id)` — tilelang / aiter / torch /
+  deepgemm. The three explicit environment selections are checked first and
+  win everywhere; only the otherwise-default DeepGEMM choice is overridden,
+  and only where DeepGEMM cannot run at all.
+* `deepgemm_indexer_metadata_needed(device_id)` — the companion for
+  `PagedIndexerMetadata.__post_init__`. The two decisions must not be able to
+  disagree: a rank with a DeepGEMM schedule and no DeepGEMM, or a DeepGEMM
+  kernel and no schedule, is a crash either way. Pinned as an invariant over
+  the whole env × capability matrix in the test.
+* `warn_torch_indexer_substitution_once(device_id)` — the named warning
+  (see "Open risks"; this substitution is *not* bit-identical).
+
+Call-site changes:
+
+* `indexer.py` — the `fn` selection is lifted out of `_forward_paged_indexer`
+  into module-level `select_paged_mqa_logits_fn(device, use_fp4_indexer)` so
+  the decision is testable on its own. It is the whole of this cut, and it is
+  the kind of decision that goes quietly wrong on a heterogeneous group.
+* `indexer.py::_can_use_nonpaged_indexer` — the non-paged branch calls
+  `deep_gemm.fp8_mqa_logits` directly and has **no** torch twin, so a card
+  without DeepGEMM is sent back to the paged path (which is the fallback).
+* `metadata.py::__post_init__` — schedule skipped via the companion gate,
+  device taken from `c4_seq_lens` rather than device 0 (#343).
+
+Two findings worth recording, both from writing the test:
+
+1. **The FP4 indexer has no fallback and now refuses by name.**
+   `fp8_fp4_paged_mqa_logits` is DeepGEMM-only and the FP4 index cache has a
+   different layout (68 bytes/head vs 132). Routing an FP4 checkpoint at the
+   FP8 torch path would read it wrongly and return plausible numbers, which
+   is worse than stopping. The error names the device, its capability, and
+   the missing kernel. Our GGUF checkpoint is not affected.
+2. **The two torch implementations are not interchangeable, and the
+   difference is not architectural.** The paged call site passes `seq_lens`
+   with a trailing dim of 1; only `fp8_paged_mqa_logits_torch_sm120` squeezes
+   it, while `fp8_paged_mqa_logits_torch` asserts `shape == (batch_size,)`.
+   So the old `is_sm120_supported()` split at `indexer.py:667` would have
+   sent every non-SM120 card at an implementation that *asserts* — including
+   anyone who set `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH` on a Hopper box today.
+   The dispatch now always selects the trimmed variant, which is also the one
+   that walks `ceil(max_seq_len / 64)` pages instead of the full capture-time
+   page-table width. `fp8_paged_mqa_logits_torch` stays as the reference
+   implementation `test_sm120_paged_mqa_logits.py` compares against.
 
 **Rank uniformity.** TP0 will run `flash_mla_with_kvcache_sm120` while TP1/2
 run the same entry point with a different inner backend. Every gate added
@@ -272,9 +344,22 @@ kernel produces the same-shaped `o`.
 
 ## Gates for the later GPU window (defined here, not run)
 
-Prerequisite for every arm: resolve the physical index of each card via NVML
-at runtime; never assume 0/1/2. Launch with `SGLANG_OPT_USE_TOPK_V2=0` on any
-boot that includes an sm86 rank (matrix row 11, launch-side, not code).
+**Request: all three cards (5090 + both 3080s), ~90 minutes.** The window
+assumes Cuts 1, 1b, 2 and 3 all in path — every named wall we know of is
+closed desk-side, so this window is spent finding the *unknown* one, not
+re-confirming a known one.
+
+Prerequisites for every arm:
+
+* resolve the physical index of each card via NVML at runtime; never assume
+  0/1/2;
+* launch with **`SGLANG_OPT_USE_TOPK_V2=0`** on any boot that includes an
+  sm86 rank. Matrix row 11: the `topk_v2` JIT kernel uses
+  `cg::this_cluster()` (SM90+) and has no architecture gate, but a working V1
+  path is selectable by this flag. Launch-side deliberately — a flag exists
+  and works, so this does not need code;
+* expect the Cut 3 substitution warning in the log on all three ranks. Its
+  *absence* means the DeepGEMM path was taken and the boot is about to fail.
 
 1. **A-vs-A noise floor, same boot, first.** Two identical runs in one boot
    before any comparison is reported. Nothing below this floor gets stated.
@@ -294,9 +379,19 @@ boot that includes an sm86 rank (matrix row 11, launch-side, not code).
 5. **Triton-kernel smoke on sm86.** `flash_mla_sparse_decode_triton` must
    compile and run on a 3080 — the desk falsifier proves the decode
    arithmetic, not that the kernel compiles.
-6. **TP=3 coherence.** Vector 30,17,17 (or auto), determined-answer probes,
+6. **Indexer substitution, sized (Cut 3).** On the 5090, same boot: torch
+   paged-MQA-logits vs DeepGEMM cannot be compared (DeepGEMM does not run
+   there either), so the measurable question is instead *how far the top-k
+   selection moves between two ranks of different architecture on the same
+   prompt*. Capture the indexer top-k on TP0 and TP1 for identical inputs and
+   report the overlap. This is the number that says whether the warning is
+   pedantry or a real quality axis. Also report ms/layer-call for the torch
+   path — #31480 measured the equivalent pure-torch kernel at 1.476 ms/call
+   at page-table width 131072 because it pays the full capture-time width;
+   the trimmed variant we select should not, and that is worth confirming.
+7. **TP=3 coherence.** Vector 30,17,17 (or auto), determined-answer probes,
    per-rank ms/verify and ms/prefill (the slowest rank sets the clock).
-7. **VRAM corridor** per the standing rule: free >= 400 MiB, no net waste
+8. **VRAM corridor** per the standing rule: free >= 400 MiB, no net waste
    > 1.5 GiB. No arm runs on red.
 
 ## Desk test results
@@ -315,16 +410,31 @@ All runs `CUDA_VISIBLE_DEVICES=99`, venv `/spinning/htsglang-gpu/.venv`,
   — 16 tests, 28 subtests, green.
   **Can-fail proven**: widening `_FLASH_MLA_CUDA_MAJORS` to `(8, 9, 10)`
   turns it into 7 failed / 15 passed.
-* Regression: `test/registered/unit/layers/attention/` +
-  `test/registered/unit/utils/` — 44 failed / 362 passed / 12 skipped on this
-  branch against 44 failed / 334 passed / 12 skipped on the base
+* `test/registered/unit/layers/attention/test_dsv4_indexer_arch_417.py`
+  — 21 tests, 68 subtests, green. Gate matrix, backend resolution, the
+  metadata/kernel agreement invariant over the whole env × capability matrix,
+  the named warning, the extracted dispatch, the FP4 refusal, the non-paged
+  eligibility, and `PagedIndexerMetadata` constructed on a mocked Ampere card
+  without importing DeepGEMM.
+  **Can-fail proven, three ways**: `_DEEPGEMM_MAJORS` → `(8, 9, 10)` gives
+  22 failed / 17 passed; returning `fp8_paged_mqa_logits_torch` from the
+  dispatch gives 8 failed / 21 passed; making the FP4 branch fall back
+  silently instead of refusing gives 1 failed / 20 passed.
+* Regression: `test/registered/unit/layers/` +
+  `test/registered/unit/utils/` — 47 failed / 731 passed / 42 skipped on this
+  branch against 47 failed / 682 passed / 42 skipped on the base
   (`a56f33aafd`, checked out into a throwaway detached worktree). The failing
-  set is **byte-identical** (`diff` empty); all 44 are pre-existing
-  `RuntimeError: No CUDA GPUs are available`. The +28 passes are this task's
-  new tests.
-* ruff: 1 finding on the touched files, the identical 1 on the same files at
-  the base (`F841 seq_lens_sum`, pre-existing). codespell clean, black and
-  isort clean. mypy clean on both new modules
+  set is **byte-identical** (`diff` empty); all 47 are pre-existing
+  `RuntimeError: No CUDA GPUs are available`. The +49 passes are this task's
+  new tests. This comparison earned its keep: it caught Cut 3 breaking
+  `test_dsv4_nonpaged_indexer.py::test_eligibility_is_fail_closed`, because
+  the first version of the DeepGEMM check reached into a metadata field that
+  test's stub does not provide. Asking the *current device* instead is both
+  what that test expects and the more correct question after `set_device`.
+* ruff: identical findings on the touched files at branch and base
+  (`F841 seq_lens_sum` in `deepseek_v4_backend.py`, `E712 clean_logits ==
+  False` ×3 in `indexer.py`), all pre-existing; new files clean. codespell,
+  black and isort clean. mypy clean on all three new modules
   (`--follow-imports=skip`; the repo-wide run is 10k pre-existing errors).
 
 Not proved at the desk, by construction: that any of these kernels *compiles*
@@ -333,17 +443,14 @@ which is where `fp8e4nv` is rejected. That is GPU-window gate 5.
 
 ## Open risks
 
-* **Indexer on sm86 (matrix rows 9, 10) is not addressed by this task.**
-  `dsv4/indexer.py:667` falls back to `fp8_paged_mqa_logits_torch_sm120` only
-  under `is_sm120_supported()`, and the default route is DeepGEMM, which
-  needs SM90. `metadata.py:131` likewise builds DeepGEMM metadata. On sm86
-  the indexer is reached for any layer with `compress_ratio in (4, 128)` —
-  i.e. layers 40-42 of this model. It is entirely possible that boot 12 gets
-  past attention and dies in the indexer. The shape of the fix is known
-  (widen the `is_sm120_supported()` gate at `:667` the same way Cut 2 widens
-  the others, plus a non-DeepGEMM metadata path), and upstream PR #31480 does
-  the equivalent for the sibling `dsa/` package; it is out of scope here only
-  to keep the cuts falsifiable one at a time.
+* **The indexer substitution is not bit-identical** (Cut 3). Named at boot,
+  once per device, and repeated here: DeepGEMM computes the indexer logits as
+  an FP8 tensor-core GEMM, the torch implementation dequantises to float32
+  and accumulates with `torch.bmm`. Same quantity, different arithmetic. The
+  logits feed a top-k, so a near-tie between two KV positions can be broken
+  differently, and output on this rig can differ from a Hopper run of the
+  same checkpoint. This is the one place in #417 where an architecture is not
+  merely given a different kernel for the same numbers.
 * **`flash_mla_with_kvcache_sm120` is now a misnomer** — it serves sm86 after
   Cut 2. The name is kept and documented rather than renamed (the fork's
   standing preference for a doc fix over a rename with this blast radius).
@@ -369,3 +476,29 @@ which is where `fp8e4nv` is rejected. That is GPU-window gate 5.
   group, and the langsamster-Rang rule says the slowest rank sets the clock.
   This task is about reachability, not throughput; a per-rank ms/verify split
   is the first thing to look at afterwards.
+
+---
+
+## Ticket note — ue8m0 scale divergence in `dsv4/dequant_k_cache.py`
+
+Registered as its own task; **not** to be fixed on this branch.
+
+1. `dequantize_k_cache_paged_ref` flushes a subnormal ue8m0 scale to zero
+   (`torch.where(scale_pow2 < 2**-126, 0, ...)`, line 179); the Triton kernel
+   at line 125 does not, so scale byte `0x00` (2**-127) yields `0` from the
+   reference and ~2.6e-36 from the kernel — representable in bf16, so it
+   survives the cast.
+2. Scale byte `0xFF` (2**128) overflows to `inf` in both, then `inf * 0`
+   gives `NaN`, so the extreme end is ill-defined in both directions.
+3. The file's own `__main__` self-test draws scale bytes uniformly from
+   0..255 and asserts `atol=0, rtol=0`, so it would fail on a GPU today for
+   reasons that have nothing to do with #417. It has evidently not been run
+   recently.
+4. Nothing here is architecture-specific and nothing was introduced by #417 —
+   it is reachable on Hopper exactly as on Ampere.
+5. Decide which side is authoritative (the kernel's un-flushed 2**-127 is
+   arguably the more faithful decode; the reference's flush matches what the
+   ue8m0 *encoder* in `quant_k_cache.py` can actually emit, since it derives
+   the exponent from a `max(abs, 1e-8)`-clamped scale and cannot reach 0x00
+   in practice), then make both sides agree and fix the self-test's data
+   range or its tolerance to match the decision.
