@@ -161,23 +161,46 @@ def _read_text(path: str) -> Optional[str]:
 
 
 def _mismatch_fields(arm: Arm, eff: EffectiveConfig) -> List[str]:
-    """Declared vs resolved, field by field. Returns concrete disagreements
-    only (a declared field that resolved to a DIFFERENT value). A declared
-    field that resolved to None is handled separately as STOP: 'could not
-    confirm' is not the same statement as 'resolved to the wrong thing'."""
+    """Declared vs resolved, field by field. Concrete disagreements only.
+
+    A DECLARED ``None`` IS AN ASSERTION, NOT A MISSING ONE. It says "this axis
+    must be absent from the resolved config" -- arm H declares
+    ``spec_algorithm=None`` because it turns speculation off, and a server with
+    speculation off legitimately prints no speculative line at all. So absence
+    is what confirms it, and the presence of a value is the disagreement.
+
+    Sweep 2 STOPped H on exactly this: it declared two axes absent, they were
+    absent, and the check reported "could not confirm spec_algorithm,
+    eagle_topk". Conflating "the log does not mention it" with "I could not
+    tell" makes the one arm that isolates PS2 from the spec path unable to pass
+    -- and it is a shape the matrix will meet again, because "feature off" is
+    half of every crossing.
+    """
     out: List[str] = []
     for key, want in arm.expect.items():
         got = getattr(eff, key, None)
+        if want is None:
+            if got is not None:
+                out.append(
+                    f"{key}: declared absent, resolved {got!r}"
+                )
+            continue
         if got is not None and got != want:
             out.append(f"{key}: declared {want!r}, resolved {got!r}")
     return out
 
 
 def _unconfirmed_fields(arm: Arm, eff: EffectiveConfig) -> List[str]:
+    """Declared axes the log did not let us decide either way.
+
+    Only fields declared with a VALUE can be unconfirmed. A field declared
+    ``None`` is decided by absence and is therefore always answerable -- see
+    :func:`_mismatch_fields`.
+    """
     return [
         key
-        for key, _ in arm.expect.items()
-        if getattr(eff, key, None) is None
+        for key, want in arm.expect.items()
+        if want is not None and getattr(eff, key, None) is None
     ]
 
 

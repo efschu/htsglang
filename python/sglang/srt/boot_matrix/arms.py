@@ -51,6 +51,7 @@ code reads today.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
 
@@ -154,6 +155,26 @@ BASE_FLAGS: Tuple[str, ...] = (
 #: The effective config the BASE recipe resolves to on the reference rig.
 #: Boot arms inherit this and override only what their axis changes, so each
 #: arm's ``expect`` reads as its DELTA from the baseline.
+#: The DFLASH draft checkpoint. Several arms cross the cross-algorithm or
+#: DFLASH rungs, and both refuse without a draft model path: the MTP rung
+#: drafts from the target checkpoint and needs none, the DFLASH rung has its
+#: own weights. Overridable so the matrix is not pinned to one rig's layout.
+#:
+#: NOTE for #382: the server declares this as ``--speculative-draft-model-path``
+#: with ``--speculative-draft-model`` as an alias, so both spellings parse --
+#: but the two refusal messages name different ones, which is the reported
+#: inconsistency. The canonical name is used here.
+DFLASH_DRAFT_MODEL = os.environ.get(
+    "BOOT_MATRIX_DFLASH_DRAFT",
+    "/spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash",
+)
+
+#: Per-rank budget for the arms that must pin an EVEN --rank-tp-ratio. Once the
+#: ratio is not ``auto`` the server stops deriving budgets from NVML and
+#: requires them explicitly. 15000 MiB fits the 20054 MiB 3080s with room for
+#: the CUDA context, and an even ratio makes one scalar correct for every rank.
+EVEN_RATIO_RANK_MIB = "15000"
+
 BASE_EXPECT: Mapping[str, object] = {
     "tp_size": 3,
     "dcp_size": 3,
@@ -214,6 +235,9 @@ ARMS: Tuple[Arm, ...] = (
             # Documented "(required)" on the flag itself; its default None is
             # refused by parse_cross_force. 'nextn' is the least exotic rung.
             "--speculative-cross-algorithm-force", "nextn",
+            # Cross-algo keeps BOTH rungs resident, so the DFLASH rung's
+            # weights are required even when the NEXTN rung is forced active.
+            "--speculative-draft-model-path", DFLASH_DRAFT_MODEL,
             "--speculative-cross-algorithm-lazy-capture",
         ),
         expect=_expect(cross_algorithm=True),
@@ -233,6 +257,7 @@ ARMS: Tuple[Arm, ...] = (
             "--kv-session-offload-host-ram-gib", "8",
             "--speculative-cross-algorithm",
             "--speculative-cross-algorithm-force", "nextn",
+            "--speculative-draft-model-path", DFLASH_DRAFT_MODEL,
         ),
         expect=_expect(offload=True, cross_algorithm=True),
         coherence="byte+graded",
@@ -264,6 +289,7 @@ ARMS: Tuple[Arm, ...] = (
             "--kv-session-offload-host-ram-gib", "8",
             "--speculative-cross-algorithm",
             "--speculative-cross-algorithm-force", "nextn",
+            "--speculative-draft-model-path", DFLASH_DRAFT_MODEL,
         ),
         expect=_expect(offload=True, cross_algorithm=True, barlink="device"),
         coherence="byte+graded",
@@ -304,6 +330,9 @@ ARMS: Tuple[Arm, ...] = (
         env={"KVSO_ALLOW_SPEC": "1"},
         flags=(
             "--speculative-algorithm", "DFLASH",
+            # DFLASH drafts from its own checkpoint; the server refuses by name
+            # without it.
+            "--speculative-draft-model-path", DFLASH_DRAFT_MODEL,
             "--enable-kv-session-offload",
             "--kv-session-offload-host-ram-gib", "8",
         ),
@@ -360,8 +389,18 @@ ARMS: Tuple[Arm, ...] = (
         ),
         # The lane's rank-local pool budget is mandatory -- server_args says
         # so by name ("there is no fallback to --mem-fraction-static").
+        # The lane failed sweep 2 on "Dual-group plan is not nested", which is
+        # about the RATIO, not the budget: the base auto-performance vector
+        # ([29607, 17780, 17780]) does not keep the shared rank on the same
+        # unit range in both groups. The server's own advice is a ratio that
+        # divides every unit count exactly, so this arm pins an even one --
+        # the crossing under test is the co-resident lane, not uneven TP, and
+        # an even ratio then requires explicit per-rank budgets.
+        drop_flags=("--rank-auto-reserve-mib",),
         flags=("--dual-group-lane", "--dual-group-lane-budget-mib", "2048",
-               "--dual-group-lane-concurrent"),
+               "--dual-group-lane-concurrent",
+               "--rank-tp-ratio", "1,1,1",
+               "--rank-gpu-memory-mib", EVEN_RATIO_RANK_MIB),
         expect=_expect(dual_group_lane=True),
         coherence="graded_only",
         expected_seconds=300.0,
@@ -426,7 +465,8 @@ ARMS: Tuple[Arm, ...] = (
         # this arm pins an explicit ratio; sweep 1 died on that base flag
         # before ever reaching the guard it exists to assert.
         drop_flags=("--rank-auto-reserve-mib",),
-        flags=("--draft-kv-layout", "dcp", "--rank-tp-ratio", "1,1,1"),
+        flags=("--draft-kv-layout", "dcp", "--rank-tp-ratio", "1,1,1",
+               "--rank-gpu-memory-mib", EVEN_RATIO_RANK_MIB),
         reject_markers=("--draft-kv-layout dcp", "weighted"),
         expected_seconds=60.0,
     ),
@@ -442,7 +482,8 @@ ARMS: Tuple[Arm, ...] = (
         # died there instead of at the DCP guard, and reported PASS anyway
         # because "cross-algorithm" appeared in the wrong sentence.
         flags=("--draft-kv-layout", "dcp", "--speculative-cross-algorithm",
-               "--speculative-cross-algorithm-force", "nextn"),
+               "--speculative-cross-algorithm-force", "nextn",
+               "--speculative-draft-model-path", DFLASH_DRAFT_MODEL),
         reject_markers=("--draft-kv-layout dcp", "--speculative-cross-algorithm"),
         expected_seconds=60.0,
     ),
