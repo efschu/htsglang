@@ -35,7 +35,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.boot_matrix.arms import ARMS, BASE_ENV, BASE_FLAGS, Arm, arm_by_name
 from sglang.srt.boot_matrix.check import Verdict, check_arm
@@ -74,9 +74,14 @@ def build_command(
     """Compose (env, argv) for one arm. Pure function -- the unit-tested core.
 
     Base recipe first, arm env/flags ADDED on top; a later flag wins under
-    argparse, which is how an arm overrides e.g. ``--speculative-algorithm``
-    (arm H turns spec off). The env is the process environment the arm needs;
-    the argv is the launch line.
+    argparse, which is how an arm overrides e.g. ``--rank-tp-ratio``.
+
+    ``arm.drop_flags`` REMOVES a base flag and its value beforehand. Appending
+    can override a value but cannot unset one, and sweep 1 lost two arms to
+    that gap: arm H wrote ``--speculative-algorithm none`` meaning "no spec"
+    (there is no such algorithm -- it just named one nobody registered), and
+    ``reject_dcp_offlane`` inherited ``--rank-auto-reserve-mib`` while pinning
+    an explicit ``--rank-tp-ratio``, which the server refuses outright.
     """
     env: Dict[str, str] = dict(BASE_ENV)
     env.update(arm.env)
@@ -92,9 +97,42 @@ def build_command(
         "--port",
         str(port),
     ]
-    argv.extend(BASE_FLAGS)
+    argv.extend(_without(BASE_FLAGS, arm.drop_flags))
     argv.extend(arm.flags)
     return env, argv
+
+
+def _without(flags: Sequence[str], drop: Sequence[str]) -> List[str]:
+    """``flags`` minus each name in ``drop``, taking its value with it.
+
+    A flag's value is the next token when that token is not itself a flag, so
+    store-true options drop cleanly and valued options do not leave an orphan
+    argument behind for argparse to misread as positional.
+    """
+    if not drop:
+        return list(flags)
+    unknown = [d for d in drop if d not in flags]
+    if unknown:
+        # A drop that matches nothing is a silent no-op, and a silent no-op in
+        # the arm list is how an arm ends up running something other than what
+        # it declares -- the whole failure class this matrix exists for.
+        raise ValueError(
+            f"drop_flags names {unknown}, which the base recipe does not "
+            f"contain; the arm would silently keep the flag it meant to remove"
+        )
+    out: List[str] = []
+    i = 0
+    flags = list(flags)
+    while i < len(flags):
+        token = flags[i]
+        if token in drop:
+            i += 1
+            if i < len(flags) and not flags[i].startswith("--"):
+                i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
 
 
 @dataclass
@@ -126,6 +164,99 @@ def _wait_for_boot(
             return "crashed"
         time.sleep(2.0)
     return "timeout"
+
+
+#: The arm the band is measured from. Named once so the measurement, the skip
+#: in the loop and the tests cannot drift apart.
+BAND_ARM = "A_default"
+
+
+def _measure_band(
+    selected: Sequence[Arm],
+    *,
+    model_path: str,
+    out_dir: str,
+    port: int,
+    run: Optional[Callable[..., Verdict]] = None,
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, int], Optional[Verdict]]:
+    """Boot ``A_default`` twice and derive the reference and the floor.
+
+    This is the mechanism the module docstring describes, and it is the reason
+    a later arm's coherence verdict means anything:
+
+    * the BYTE reference is the baseline's FIRST-run text. Byte probes are
+      short on purpose (inside the GDN reproducibility window), so the same
+      prompt on the same build must reproduce it exactly; a later arm that
+      does not is carrying a real difference.
+    * the GRADED floor is the MINIMUM score across the two baseline runs. Two
+      runs of the SAME configuration is an A-vs-A measurement -- whatever they
+      differ by is this rig's noise, and an arm is only red below it. A floor
+      taken from one run would call ordinary run-to-run variation a defect.
+
+    Returns ``({}, {}, None)`` when the baseline is not in the selection, so
+    ``--only`` on a single arm still runs; that arm is then graded against an
+    empty band, which the check reports rather than hides.
+    """
+    runner = run or run_arm
+    if not any(a.name == BAND_ARM for a in selected):
+        return {}, {}, None
+    arm = next(a for a in selected if a.name == BAND_ARM)
+
+    first = runner(arm, model_path=model_path, out_dir=out_dir, port=port)
+    reference: Dict[str, Dict[str, object]] = {}
+    for probe in _probes_of(first):
+        reference[str(probe["name"])] = {"text": probe.get("text", "")}
+
+    # The second run overwrites the first's artifacts on purpose: the arm
+    # directory should hold the run the verdict was computed from, and that is
+    # the second one (graded against the band the pair produced).
+    second = runner(
+        arm, model_path=model_path, out_dir=out_dir, port=port,
+        reference_probes=reference, band={},
+    )
+    band: Dict[str, int] = {}
+    for probe in _probes_of(second):
+        name = str(probe["name"])
+        if str(probe.get("tier")) != "graded":
+            continue
+        scores = [
+            int(p.get("score", 0))
+            for p in (_probe_named(first, name), probe)
+            if p is not None and p.get("score") is not None
+        ]
+        if scores:
+            band[name] = min(scores)
+    # Re-check the baseline against the band it produced, so A_default is held
+    # to the same standard as everything after it rather than exempted.
+    graded = runner(
+        arm, model_path=model_path, out_dir=out_dir, port=port,
+        reference_probes=reference, band=band,
+    )
+    return reference, band, graded
+
+
+def _probes_of(verdict: Verdict) -> List[Dict[str, object]]:
+    coh = getattr(verdict, "coherence", None)
+    if coh is None:
+        return []
+    out: List[Dict[str, object]] = []
+    for p in getattr(coh, "probes", ()) or ():
+        out.append(
+            {
+                "name": getattr(p, "name", ""),
+                "tier": getattr(p, "tier", ""),
+                "text": getattr(p, "text", ""),
+                "score": getattr(p, "score", None),
+            }
+        )
+    return out
+
+
+def _probe_named(verdict: Verdict, name: str) -> Optional[Dict[str, object]]:
+    for p in _probes_of(verdict):
+        if p["name"] == name:
+            return p
+    return None
 
 
 def run_arm(
@@ -275,10 +406,20 @@ def render_plan() -> str:
             f"{arm.axis}{note}"
         )
     lines.append("")
+    # The baseline is booted THREE times, not once: twice to measure the
+    # A-vs-A band and once more graded against the band it produced. Two extra
+    # boots is what a gate that can actually fail costs, and an estimate that
+    # hid them would be wrong by the price of the thing that makes the run
+    # worth doing.
+    band_extra = 2 * next(
+        (a.expected_seconds for a in ARMS if a.name == BAND_ARM), 0.0
+    )
     lines.append(
-        f"total estimated card time: {total/60.0:.0f} min over {len(ARMS)} arms "
-        f"({sum(1 for a in ARMS if a.kind=='boot')} boot, "
-        f"{sum(1 for a in ARMS if a.kind=='reject')} reject)."
+        f"total estimated card time: {(total + band_extra)/60.0:.0f} min over "
+        f"{len(ARMS)} arms ({sum(1 for a in ARMS if a.kind=='boot')} boot, "
+        f"{sum(1 for a in ARMS if a.kind=='reject')} reject), including "
+        f"{band_extra/60.0:.0f} min for the two extra {BAND_ARM} boots the "
+        f"A-vs-A band is measured from."
     )
     lines.append(
         "reject arms are ~60 s each (arg-resolution refusal, no weight load); "
@@ -320,9 +461,30 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     only = {n.strip() for n in args.only.split(",") if n.strip()}
     selected = [a for a in ARMS if not only or a.name in only]
     os.makedirs(args.out, exist_ok=True)
+
+    # MEASURE THE BAND FIRST. Until this existed the docstring above was a
+    # promise and nothing else: run_arm was called without reference_probes,
+    # so every arm carried ref_text="" and min_score=0 and the coherence half
+    # of the gate could not fail. Sweep 1 reported "coherence within the
+    # A-vs-A band" for arms that were never compared against anything.
+    reference_probes, band, baseline = _measure_band(
+        selected, model_path=args.model, out_dir=args.out, port=args.port
+    )
     verdicts: List[Verdict] = []
+    if baseline is not None:
+        print(baseline.render())
+        verdicts.append(baseline)
     for arm in selected:
-        v = run_arm(arm, model_path=args.model, out_dir=args.out, port=args.port)
+        if baseline is not None and arm.name == BAND_ARM:
+            continue
+        v = run_arm(
+            arm,
+            model_path=args.model,
+            out_dir=args.out,
+            port=args.port,
+            reference_probes=reference_probes,
+            band=band,
+        )
         print(v.render())
         verdicts.append(v)
     with open(os.path.join(args.out, "summary.json"), "w") as f:

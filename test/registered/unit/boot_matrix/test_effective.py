@@ -110,9 +110,50 @@ class TestReportEffective(CustomTestCase):
         self.assertTrue(eff.cross_algorithm)
         self.assertTrue(eff.offload)
 
-    def test_barlink_transport_when_engaged(self):
-        log = _args_dump() + "\nbarlink transport=device selected on TP0\n"
+    # The three lines below are copied VERBATIM from a real boot log
+    # (gpu-battery-results/2026-08-01_349_boot_matrix/E_barlink/server.log).
+    # The previous fixture invented "barlink transport=device selected on TP0",
+    # which no build has ever printed -- so the reader passed its test and
+    # still failed arm E on a real run. A parser test written against a made-up
+    # line tests the fixture, not the parser.
+    _REAL_ACHIEVED = (
+        "barlink enabled for group 'world:0': requested=device, ACHIEVED=device\n"
+        "barlink enabled for group 'tp:0': requested=device, ACHIEVED=device\n"
+        "barlink enabled for group 'dcp:0': requested=device, ACHIEVED=device\n"
+    )
+    #: Also real, and the reason the old regex answered "up": both of these
+    #: appear in the same log, so "the word after transport" was ambiguous
+    #: before it was wrong.
+    _REAL_NOISE = "barlink device transport up\nbarlink shm transport up\n"
+
+    def test_barlink_transport_read_from_the_achieved_lines(self):
+        log = _args_dump() + "\n" + self._REAL_NOISE + self._REAL_ACHIEVED
         self.assertEqual(report_effective(log).barlink, "device")
+
+    def test_the_state_word_up_is_not_mistaken_for_a_transport(self):
+        """The exact sweep-1 failure: declared 'device', resolved 'up'."""
+        log = _args_dump() + "\n" + self._REAL_NOISE + self._REAL_ACHIEVED
+        self.assertNotEqual(report_effective(log).barlink, "up")
+
+    def test_a_mixed_run_is_reported_as_mixed_not_flattened(self):
+        """One group falling back must not be hidden behind the majority."""
+        log = _args_dump() + (
+            "\nbarlink enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1\n"
+            "barlink group 'dcp:0': requested=bar1, ACHIEVED=gloo (holder missing)\n"
+        )
+        got = report_effective(log).barlink
+        self.assertTrue(got.startswith("mixed:"), got)
+        self.assertIn("bar1", got)
+        self.assertIn("gloo", got)
+
+    def test_bar1_achieved_reads_as_bar1(self):
+        """Real K_bar1_graphs shape: all three groups on the direct path."""
+        log = _args_dump() + (
+            "\nbarlink enabled for group 'world:0': requested=bar1, ACHIEVED=bar1\n"
+            "barlink enabled for group 'tp:0': requested=bar1, ACHIEVED=bar1\n"
+            "barlink enabled for group 'dcp:0': requested=bar1, ACHIEVED=bar1\n"
+        )
+        self.assertEqual(report_effective(log).barlink, "bar1")
 
     def test_eager_boot_reports_graphs_false(self):
         log = _args_dump() + "\n[..] Disabled cuda graph\n" + READY_MARKER

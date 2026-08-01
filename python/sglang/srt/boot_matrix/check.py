@@ -45,6 +45,7 @@ from sglang.srt.boot_matrix.arms import Arm
 from sglang.srt.boot_matrix.coherence import CoherenceResult, grade_probes
 from sglang.srt.boot_matrix.effective import (
     EffectiveConfig,
+    error_blocks,
     first_refusal,
     report_effective,
 )
@@ -66,7 +67,21 @@ _FATAL_MARKERS = (
 )
 _SERVER_STAMP = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]")
 _QUOTED_PREFIX = "[probe-subprocess] "
-_QUOTED_OPENERS = ("auto-performance: hardware probe failed",)
+#: Lines that OPEN a block the log itself frames as not-a-failure. Everything
+#: until the next stamped server line belongs to that block and cannot be a
+#: fatal, however many tracebacks it prints.
+#:
+#: "Ignore import error when loading" is sglang's own wording for an optional
+#: import that did not resolve, and it prints the whole chained traceback
+#: underneath. The htsglang Docker image ships torchcodec without a matching
+#: ffmpeg, so every containerised boot emits two of these blocks -- sweep 1
+#: scored K_bar1_graphs FAIL on one of them while the server was up and
+#: serving correct output. A detector that cannot tell "ignored" from "fatal"
+#: makes the whole Docker route unusable, and bar1 arms can only run there.
+_QUOTED_OPENERS = (
+    "auto-performance: hardware probe failed",
+    "Ignore import error when loading",
+)
 
 
 def _scan_fatals(log_text: str) -> Optional[str]:
@@ -87,6 +102,20 @@ def _scan_fatals(log_text: str) -> Optional[str]:
         for marker in _FATAL_MARKERS:
             if marker in line:
                 return f"{lineno}: {' '.join(line.split())[:200]}"
+    return None
+
+
+def _first_error_line(log_text: str) -> Optional[str]:
+    """The first raised-error line in the log, or None.
+
+    Separate from :func:`_scan_fatals`: that one answers "did the boot die of
+    something catastrophic", this one answers "did anything raise at all".
+    A reject arm stopped by an argument-resolution ValueError leaves no fatal
+    marker -- no traceback, no CUDA error -- and the difference between FAIL
+    and STOP hangs on noticing it.
+    """
+    for _block, head in error_blocks(log_text):
+        return head[:200]
     return None
 
 
@@ -192,16 +221,23 @@ def _check_reject(arm: Arm, log_text: str, boot_status: str) -> Verdict:
             "refused cleanly at boot with the named guard",
             refusal=refusal,
         )
-    # Did not boot, but the expected guard text is absent.
+    # Did not boot, and the arm's OWN guard did not fire. If anything else
+    # raised, this arm stopped somewhere before the crossing it exists to
+    # prove, and that is a FAIL rather than a STOP: the run is informative
+    # (the arm is unrunnable as written, or an earlier guard shadows the one
+    # under test) and a green light here is exactly the false pass sweep 1
+    # handed out twice. STOP stays for the case where nothing at all is in the
+    # log -- there, and only there, was nothing learned.
     fatal = _scan_fatals(log_text)
-    if fatal is not None:
+    other = _first_error_line(log_text)
+    if fatal is not None or other is not None:
         return Verdict(
             FAIL,
             arm.name,
             (
                 "refused, but with an unexpected error rather than the named "
-                f"guard (expected markers {list(arm.reject_markers)}); "
-                f"first fatal at {fatal}"
+                f"guard (expected markers {list(arm.reject_markers)}); the arm "
+                f"never reached its own crossing -- {fatal or other}"
             ),
         )
     return Verdict(
