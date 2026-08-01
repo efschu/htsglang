@@ -355,12 +355,48 @@ def is_mistral_model(name) -> bool:
     lower = str(name).lower()
     if "mistral-large-3" in lower or "mistral-small-4" in lower or "leanstral" in lower:
         return True
-    # EAGLE drafts for Mistral targets ship native-format only (params.json +
-    # consolidated.safetensors, no config.json), so route them through the
-    # custom parser regardless of the base model name.
+    # EAGLE drafts for Mistral targets OFTEN ship native-format only
+    # (params.json + consolidated.safetensors, no config.json), so a name
+    # carrying both "eagle" and "mistral" is a hint that the custom parser is
+    # wanted. It is only a hint: the name states what the checkpoint is CALLED,
+    # and the parser choice is about what FORMAT it is IN. Community EAGLE3
+    # drafts for the same targets ship plain HF-format (config.json, no
+    # params.json), and routing one of those here fails with
+    # "File not found <dir>, params.json" -- at argument resolution, before any
+    # weight load, with an error naming a file the checkpoint is not supposed
+    # to have. Measured on cvalgian/EAGLE3-Mistral-Small-24B-Instruct-2501
+    # against a Mistral-Small-24B FP8 target (#377).
+    #
+    # So for a LOCAL path, let the filesystem answer the format question it is
+    # the authority on; the name only decides when there is nothing to look at
+    # (a bare HF repo id that has not been fetched yet).
     if "eagle" in lower and "mistral" in lower:
+        native, hf = _local_config_formats(name)
+        if native or hf:
+            return native
         return True
     return False
+
+
+def _local_config_formats(name) -> tuple:
+    """(has params.json, has config.json) for a local dir, else (False, False).
+
+    Returning both -- rather than a single verdict -- keeps the caller's rule
+    visible: a checkpoint carrying BOTH is native-first (that is what the
+    Mistral releases look like), one carrying only config.json is HF, and a
+    path that is not a local directory answers neither so the name decides.
+    """
+    import os
+
+    try:
+        if not os.path.isdir(str(name)):
+            return (False, False)
+        return (
+            os.path.isfile(os.path.join(str(name), "params.json")),
+            os.path.isfile(os.path.join(str(name), "config.json")),
+        )
+    except OSError:
+        return (False, False)
 
 
 @lru_cache(maxsize=2)
