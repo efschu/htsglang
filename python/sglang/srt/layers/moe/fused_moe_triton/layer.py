@@ -1759,8 +1759,9 @@ class FusedMoE(torch.nn.Module):
         back to the resident (default) path and never retries.
 
         #268/#323b: the quant-path check below runs BEFORE the try/except so it
-        is a hard boot abort for GGUF-MoE / MoeWNA16 / NVFP4 MoE (no load-time
-        offload half), never the silent per-layer fallback used for genuine
+        is a hard boot abort for MoeWNA16 / NVFP4 MoE / Ascend GGUF-MoE (no
+        load-time offload half) and for any CUDA GGUF-MoE layer the #123 half
+        declined to stage, never the silent per-layer fallback used for genuine
         install failures.
         """
         from sglang.srt.layers.moe.expert_offload import (
@@ -1774,6 +1775,9 @@ class FusedMoE(torch.nn.Module):
             # compressed-tensors hides the real layout behind a delegating
             # wrapper; the scheme is the class that owns the tensor names.
             scheme=getattr(self, "scheme", None),
+            # #123-GGUF: GGUFMoEMethod is admitted only on a layer its
+            # materialization-time half actually staged.
+            layer=self,
         )
 
         try:
@@ -1930,12 +1934,189 @@ class FusedMoE(torch.nn.Module):
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
 
+    def _gguf_moe_offload_eligible(self) -> bool:
+        """Whether the #123 GGUF MoE offload half covers THIS layer.
+
+        Three conditions, all checked before a single byte is staged so an
+        uncovered checkpoint falls back to the full stack (and then hits the
+        #268 guard at install time with a named reason, rather than silently
+        running a half-tiered layer):
+
+        1. a resident fraction < 1.0 is configured at all;
+        2. the layer's quant method is the CUDA ``GGUFMoEMethod`` -- the Ascend
+           MoE method materializes and pre-dequantizes on its own path;
+        3. BOTH expert tensors carry a ggml type with a GGUF MoE kernel. This
+           is the MXFP4 stopper: DeepSeek-V4-Flash's routed down projections
+           are type 39, which is in no GGUF kernel set, so tiering their bytes
+           would produce a layer nothing can execute at expert granularity.
+        """
+        from sglang.srt.environ import envs
+
+        fraction = getattr(self, "_expert_offload_fraction", None)
+        if fraction is None:
+            fraction = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        if fraction >= 1.0:
+            return False
+        if type(getattr(self, "quant_method", None)).__name__ != "GGUFMoEMethod":
+            return False
+        from sglang.srt.layers.quantization.gguf import gguf_moe_offload_covered_type
+
+        for attr in ("w13_qweight_type", "w2_qweight_type"):
+            holder = getattr(self, attr, None)
+            if holder is None or not gguf_moe_offload_covered_type(
+                getattr(holder, "weight_type", None)
+            ):
+                logging.getLogger(__name__).warning(
+                    "GGUF MoE expert-offload declined on layer %s: %s is ggml "
+                    "type %s, which has no GGUF MoE kernel. The layer keeps "
+                    "every expert resident and the #268 guard will refuse the "
+                    "offload installer for it.",
+                    getattr(self, "layer_id", "?"),
+                    attr,
+                    getattr(holder, "weight_type", None),
+                )
+                return False
+        return True
+
+    def _finish_gguf_moe_offload_staging(self, staged_attrs, plan) -> None:
+        """Mark the layer as covered and release the loader's host copies.
+
+        The marker is what lifts the #268 guard for this layer specifically
+        (``_OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES``); it is set only after
+        BOTH expert tensors were staged, because a layer with one tiered and
+        one full tensor is precisely the half-staged state the guard exists to
+        refuse.
+        """
+        import gc as _gc
+
+        expected = {"w13_qweight", "w2_qweight"}
+        if set(staged_attrs) != expected:
+            raise RuntimeError(
+                f"GGUF MoE expert-offload staged {sorted(staged_attrs)} on "
+                f"layer {getattr(self, 'layer_id', '?')} but needs exactly "
+                f"{sorted(expected)}; a partially tiered layer would pair one "
+                f"expert's gate/up with another expert's down projection."
+            )
+        self._moe_offload_gguf_staged = True
+        # glibc/torch retain the freed per-expert CPU buffers in their
+        # allocator pools; across 40+ MoE layers that is the whole expert set
+        # squeezing a swapless host. Same per-layer trim the repack presplit
+        # does, for the same reason.
+        _gc.collect()
+        try:
+            import ctypes as _ct
+
+            _ct.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+        logging.getLogger(__name__).info(
+            "GGUF MoE expert-offload staged at materialization on layer %s: "
+            "%d/%d experts resident + %d scratch slots, %d experts in the "
+            "pinned host tier; the full expert stack was never allocated.",
+            getattr(self, "layer_id", "?"),
+            plan.resident_count,
+            plan.num_experts,
+            plan.buffer_slots - plan.resident_count,
+            len(plan.spill_ids),
+        )
+
+    @staticmethod
+    def _gguf_expert_source(
+        name, expert_weights, num_experts, expert_shard, expert_data_map=None
+    ):
+        """Per-expert accessor for one GGUF MoE parameter, without stacking.
+
+        Returns ``(count, row_shape, dtype, get, drop)`` or ``None`` when this
+        parameter has no expert data. ``get(i)`` yields the i-th expert's
+        quantized tensor -- for w13 the gate/up pair concatenated on the row
+        axis, which is exactly what the stacked path builds -- and ``drop(i)``
+        releases that expert's loaded bytes from BOTH holders (the local
+        by-expert view and the parameter's ``expert_data_map``), which is what
+        actually returns them to the allocator; dropping one while the other
+        still refers to the tensor frees nothing.
+
+        Splitting the accessor out of the stacking is the whole trick of the
+        #123 GGUF half: the load-time offload has to place experts in two
+        different tiers, so it must be able to take them ONE AT A TIME. The
+        default (fully resident) path below still stacks, byte-for-byte as
+        before.
+        """
+        ordered = []
+        if "w13" in name:
+            for e in range(num_experts):
+                shards = expert_weights.get(e)
+                if (
+                    shards
+                    and shards.get("w1") is not None
+                    and shards.get("w3") is not None
+                ):
+                    ordered.append(e)
+            keys = ("w1", "w3")
+        elif "w2" in name:
+            for e in range(num_experts):
+                shards = expert_weights.get(e)
+                if shards and shards.get("w2") is not None:
+                    ordered.append(e)
+            keys = ("w2",)
+        else:
+            return None
+        if not ordered:
+            return None
+
+        first = expert_weights[ordered[0]]
+        rows = sum(int(first[k].shape[0]) for k in keys)
+        row_shape = (rows,) + tuple(first[keys[0]].shape[1:])
+        dtype = first[keys[0]].dtype
+        # The trailing all-zero padding expert of the uneven-TP expert-dim
+        # shard (#82): target of every foreign topk id. Zero ggml bytes decode
+        # to 0 for every block type (d/min scales are zero), so it contributes
+        # exactly nothing to the TP all-reduce.
+        count = len(ordered) + (1 if expert_shard else 0)
+
+        def get(i):
+            if i >= len(ordered):
+                return torch.zeros(row_shape, dtype=dtype)
+            shards = expert_weights[ordered[i]]
+            if len(keys) == 1:
+                return shards[keys[0]]
+            return torch.cat([shards[k] for k in keys], dim=0)
+
+        def drop(i):
+            if i >= len(ordered):
+                return
+            expert_weights.pop(ordered[i], None)
+            if expert_data_map is not None:
+                for k in keys:
+                    expert_data_map.pop((ordered[i], k), None)
+
+        return count, row_shape, dtype, get, drop
+
     def materialize_gguf_weights(self) -> None:
         """Process weights after loading, especially for GGUF quantization.
 
         This materializes GGUF UninitializedParameters from their data_containers.
-        """
 
+        #123-GGUF: this is ALSO the expert-offload interception point for GGUF
+        MoE. The other quant paths split an already-materialized ``[E, ...]``
+        stack in ``presplit_expert_offload_after_repack``; GGUF has no such
+        stack to split -- it is created right here, and creating it is exactly
+        the device (and host) peak the offload exists to avoid. So when a
+        resident fraction < 1.0 is configured and the checkpoint's ggml type
+        has a MoE kernel, the loop below never builds the full stack: it
+        materializes the parameter at the ``[R+C]`` buffer size, writes only
+        the resident experts into it, and streams every other expert straight
+        into the pinned host tier. ``MoEExpertOffloadCache.install()`` then
+        picks the two tiers up from ``_moe_offload_presplit`` exactly as it
+        does for the fp8 / GPTQ / AWQ presplit.
+        """
+        from sglang.srt.layers.moe.expert_offload import (
+            plan_load_time_staging,
+            register_load_time_presplit,
+            stage_experts_into_tiers,
+        )
+
+        staged_attrs = []
+        staged_plan = None
         for name, param in list(self.named_parameters()):
             is_gguf_weight = getattr(param, "is_gguf_weight", False)
 
@@ -1958,46 +2139,57 @@ class FusedMoE(torch.nn.Module):
                     # Build the full tensor
                     expert_shard = getattr(self, "_gguf_expert_shard", False)
 
-                    if "w13" in name:
-                        # w13 is gate+up fused
-                        weight_list = []
-                        for e in range(num_experts):
-                            if e in expert_weights:
-                                w1 = expert_weights[e].get("w1")
-                                w3 = expert_weights[e].get("w3")
+                    source = self._gguf_expert_source(
+                        name,
+                        expert_weights,
+                        num_experts,
+                        expert_shard,
+                        expert_data_map=expert_data_map,
+                    )
+                    if source is None:
+                        continue
+                    count, row_shape, dtype, get, drop = source
 
-                                if w1 is not None and w3 is not None:
-                                    fused = torch.cat([w1, w3], dim=0)
-                                    weight_list.append(fused)
+                    plan = (
+                        plan_load_time_staging(
+                            count,
+                            # The layer latched its fraction at construction;
+                            # the cache will size itself from the SAME value,
+                            # so the plan must not re-read the environment.
+                            fraction=getattr(self, "_expert_offload_fraction", None),
+                            pinned_experts=(count - 1,) if expert_shard else (),
+                        )
+                        if self._gguf_moe_offload_eligible()
+                        else None
+                    )
 
-                        if weight_list:
-                            if expert_shard:
-                                # trailing all-zero padding expert: target
-                                # of foreign topk ids (zero ggml bytes
-                                # decode to 0 for every block type — d/min
-                                # scales are zero).
-                                weight_list.append(
-                                    torch.zeros_like(weight_list[0])
-                                )
-                            stacked = torch.stack(weight_list, dim=0)
-                            param.materialize(stacked.shape, dtype=stacked.dtype)
-                            param.data.copy_(stacked)
-                    elif "w2" in name:
-                        # w2 is down projection
-                        weight_list = []
-                        for e in range(num_experts):
-                            if e in expert_weights and "w2" in expert_weights[e]:
-                                w2_weight = expert_weights[e]["w2"]
-                                weight_list.append(w2_weight)
+                    if plan is None:
+                        # Default path: one [E, ...] stack, unchanged.
+                        stacked = torch.stack([get(i) for i in range(count)], dim=0)
+                        param.materialize(stacked.shape, dtype=stacked.dtype)
+                        param.data.copy_(stacked)
+                        continue
 
-                        if weight_list:
-                            if expert_shard:
-                                weight_list.append(
-                                    torch.zeros_like(weight_list[0])
-                                )
-                            stacked = torch.stack(weight_list, dim=0)
-                            param.materialize(stacked.shape, dtype=stacked.dtype)
-                            param.data.copy_(stacked)
+                    # The loader's flat list is only read for the truthiness
+                    # test above; dropping it now lets ``drop`` below actually
+                    # return each expert's bytes to the allocator as they are
+                    # consumed, instead of at the end of the layer. Holding the
+                    # loaded copies alongside the two tiers would double the
+                    # host footprint of the very set the offload exists to keep
+                    # off the card.
+                    param.data_container = []
+                    param.materialize((plan.buffer_slots,) + row_shape, dtype=dtype)
+                    spill = stage_experts_into_tiers(
+                        plan, get, param.data, release=drop
+                    )
+                    register_load_time_presplit(self, name, param.data, spill, plan)
+                    staged_attrs.append(name)
+                    staged_plan = plan
+                    param.expert_data_map = {}
+                    expert_weights.clear()
+
+        if staged_attrs:
+            self._finish_gguf_moe_offload_staging(staged_attrs, staged_plan)
 
         if getattr(self, "_gguf_expert_shard", False) and not hasattr(
             self, "_gguf_topk_remap"
