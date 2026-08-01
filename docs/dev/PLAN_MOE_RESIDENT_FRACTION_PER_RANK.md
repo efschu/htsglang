@@ -170,3 +170,140 @@ out-of-scope: `resolve_limit_bytes()` falls back to `MemTotal` when
 `memory.max` reads `max`. On this container lxcfs makes that the honest
 ceiling, but the script's own comment notes it is the wrong number on a bare
 host. Worth a ticket, not a same-pass edit.
+
+---
+
+# Window-4 plan, and the two probes that precede it
+
+## Item 1a — the prefill peak is now measured, not inferred
+
+`model_executor/forward_peak.py`: `reset_peak_memory_stats` before every
+forward and `max_memory_allocated` after, bucketed by phase and token count,
+driven from `_forward_raw` (the same place the #343 layer tap lives, for the
+same reason: the model is entered as `model.forward(...)`, so a module hook
+would never fire). A `peak_scope` context manager closes the bracket on the
+exception path too -- an OOM is exactly when the peak matters.
+
+Off unless `SGLANG_FORWARD_PEAK_PATH` is set.
+
+**It writes a file per rank, not a log line, and that is evidence-driven.**
+The explorer confirmed `/server_info` already aggregates a per-rank
+`memory_usage` dict through `get_internal_state`, which is the natural home
+for a live number. It is the wrong home for THIS one: the measurement exists
+to characterise a peak that precedes an OOM death, and `/server_info` needs a
+live server to answer. The per-rank JSON files survive the death -- that is
+how the window-3 expert_stats arrived from a boot whose rank had already
+OOMed. Worker `logger.warning` records do not reach the log at all on this rig
+(#417), which rules out the third option. Adding the same number to
+`get_internal_state` afterwards is a good follow-up, not a substitute.
+
+## Item 1b — a per-rank chunked-prefill-size is NOT possible. Named limit.
+
+Checked, and the answer is a hard no, not an omission. `chunked_prefill_size`
+**is the batch-shape knob**: it sets how many tokens each rank contributes to
+prefill's own collectives. Every rank parses the same `server_args` and reads
+one scalar; the only place it is ever divided (`dp_size`) divides it
+identically everywhere.
+
+Making it per-rank would reproduce precisely the failure class this fork
+already built machinery to prevent. From `kv_session_offload.py:2559`:
+
+> "A divergent decision makes rank 0 take the prefill branch while ranks 1/2
+> take the decode branch of get_next_batch_to_run; those branches carry
+> DIFFERENT collectives, so the ranks desync (NCCL/gloo hang, observed in
+> recv_requests one iteration later)."
+
+and `scheduler.py:3643` documents the admission budget as deliberately
+"RANK-UNIFORM". `--rank-moe-resident-fraction` is safe as a vector *because*
+it only moves bytes within a rank's own weight/host split and never changes a
+batch shape; chunk size is the opposite knob. This is a genuine
+physical/logical limit, so it is recorded as an exclusion with its reason
+rather than left as a gap.
+
+**Consequence for window 4:** the prefill transient on the 3080s can only be
+reduced by lowering the GLOBAL `--chunked-prefill-size` (which costs prefill
+throughput on all three ranks, including the 5090), or by freeing that rank's
+memory some other way. It cannot be shaved per card.
+
+## Item 2 — the load-time page-cache race, made managed
+
+Chosen: **trim coupled to consumer progress** (`ProgressCoupledTrim` in
+`model_loader/gguf_shards.py`, called from `ConsumedPageDropper._flush_shard`
+after each advice batch). Off unless
+`SGLANG_GGUF_STREAM_TRIM_SOFT_GIB` is set.
+
+Why this one of the three:
+
+* The failure is a **rate** mismatch, not a threshold error. `cachetrim.sh`
+  samples on a 5 s wall clock; window 3 moved `memory.current` 88.2 -> 102.5
+  GiB inside one 15 s window. Whether a boot lived came down to where a noisy
+  peak fell between two samples -- w3a survived the same recipe w3b died on.
+* Coupling the trim to the stream makes a faster load trim more often,
+  automatically, with no interval to tune. That is the difference between
+  managed and lucky.
+* *Loader waits on a trim watermark* (option a) is this plus a stall: strictly
+  more invasive, and it can deadlock if the watermark is unreachable because
+  the resident pool -- which reclaim cannot touch -- is already above it.
+* *A tighter load-phase threshold* (option c) only moves a number that a 5 s
+  sampler can still overshoot; it does not address the rate.
+
+`cachetrim.sh` stays as-is and is still useful (it also trims what the loader
+does not cause). The rammon guard is untouched, as instructed.
+
+Safety is the same argument as `cachetrim.sh`'s and is **checked, not
+assumed**: with no swap, cgroup reclaim cannot evict anonymous memory, so the
+pinned pool, CUDA host allocations and the Python heap are structurally out of
+reach and only page cache can be taken. With swap present it refuses to act.
+It also disables itself if `memory.reclaim` is unavailable -- a probe must
+never be why a load fails.
+
+## Item 3 — window 4
+
+**One boot, ~30 min.** w3a's vector unchanged: `--rank-moe-resident-fraction
+0.485,0.42,0.42`, `SGLANG_MOE_SCRATCH_SLOTS=6`, reserve `2200,1400,1400`,
+`SGLANG_OPT_USE_TOPK_V2=0`. That configuration reached HEALTHY with the full
+corridor (639/1830/639 MiB free) and KV 90624; it failed only on the prefill
+transient, which is the thing now being measured.
+
+New for this boot:
+* `SGLANG_FORWARD_PEAK_PATH=<run>/peak` -- the measurement that makes the next
+  fixposten arithmetic real.
+* `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB=88`, `..._TARGET_GIB=78` -- below the
+  98 GiB rammon guard with room, so the load peak is managed rather than raced.
+
+Measurement order: A-vs-A floor (byte-compare; window 3 measured the floor at
+1.02%) -> prefill point -> windowed decode bs=1 (~15 s) -> coherence probe ->
+expert_stats -> **collect the peak JSONs from all three ranks** -> cards FREI.
+
+Prefill approach, deliberately staged so the transient is characterised even
+if it still OOMs: start at a ~256-token prompt and step up (256, 512, 1024,
+2048). Each step that completes writes a peak row; the first step that fails
+brackets the ceiling between two measured numbers instead of producing one
+failed allocation size. That is the difference between this window and the
+last one.
+
+### The graphs question: named reason, and a real but non-free escape hatch
+
+`--disable-cuda-graph` is **not** a conservative choice and **not** about DSV4
+or GGUF. It is forced by MoE expert offload, with a fail-fast at layer
+construction (`fused_moe_triton/layer.py:612`):
+
+> "MoE expert-offload ... requires --disable-cuda-graph: the per-forward
+> expert residency plan is data-dependent and cannot be captured into a CUDA
+> graph."
+
+The mechanism is a device->host sync (`topk_ids.tolist()`) plus Python-side
+planning inside every forward, which is illegal during capture
+(`expert_offload.py:68`). Since window 4 runs at fraction < 1.0 on every rank,
+graphs cannot be enabled for prefill. **Stated, not forced**, as instructed.
+
+There is one genuine escape hatch worth naming rather than burying:
+`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` opens a capturable **decode-only** path
+(frozen residency, on-device index math, captured UVA gather). It would give
+the graphs decode point the brief asked about. It is not free: it *freezes*
+the resident set, so it is a different configuration, not a toggle on the same
+one, and its decode number would not be comparable to the eager number from
+the same boot. Recommendation: take the eager numbers first in window 4, and
+treat a frozen-residency graphs arm as its own later boot with its own A-vs-A
+floor -- comparing an eager and a captured number across configurations would
+be exactly the kind of cross-arm claim the benchmark rules forbid.

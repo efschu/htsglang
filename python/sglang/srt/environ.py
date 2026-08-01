@@ -1644,6 +1644,17 @@ class Envs:
     # bytes, so the streamed bytes are identical either way. Set to False to
     # restore the pre-#391 accumulation.
     SGLANG_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+    # Synchronous cgroup reclaim during the GGUF stream, in GiB of
+    # memory.current. 0 (default) = off, behaviour byte-identical to before.
+    # The dropper only releases page cache BEHIND the consumer while the
+    # kernel reads AHEAD of it, and on a swapless box that gap is the whole
+    # budget (#391). An external sampler chasing it on a wall-clock interval
+    # can be outrun -- window 3 saw memory.current move 88 -> 102 GiB inside
+    # one 15 s window. Reclaiming here instead ties the trim RATE to consumer
+    # PROGRESS, which is what generates the pressure in the first place.
+    SGLANG_GGUF_STREAM_TRIM_SOFT_GIB = EnvFloat(0.0)
+    #: Reclaim down to about here once the soft watermark is crossed.
+    SGLANG_GGUF_STREAM_TRIM_TARGET_GIB = EnvFloat(0.0)
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
