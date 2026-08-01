@@ -2081,6 +2081,27 @@ class ServerArgs:
             choices=list(_RANK_PERF_TUNE_CHOICES),
         ),
     ] = "both"
+    objective: A[
+        str,
+        Arg(
+            help="What the placement planner MAXIMISES when it ranks "
+            "candidate configurations (#350, ANALYSE_347 §6). 'throughput' "
+            "(default) maximises work/s -- tok/s for the LLM classes, "
+            "frame/s for the video classes -- today's behaviour, byte-"
+            "identical. 'energy' maximises work/J (tok/J, or frame/J for "
+            "video), i.e. minimises J/token / J/frame: on a heterogeneous "
+            "rig a config that concentrates work on the efficient card can "
+            "win tok/J while losing tok/s, so this is a genuine trade, not a "
+            "free win. Orthogonal to --rank-perf-tune (which selects WHICH "
+            "throughput lever); energy is WHAT is valued when comparing the "
+            "candidates that lever produces. Energy numbers are sourced "
+            "measured-first (the #146 harness / results store) and fall back "
+            "to the #148 roofline estimate, each carrying its provenance -- "
+            "a config with neither is reported unscorable for energy, never "
+            "silently substituted.",
+            choices=["throughput", "energy"],
+        ),
+    ] = "throughput"
     rank_mlp_ratio: A[
         Optional[List[int]],
         Arg(
@@ -5374,6 +5395,11 @@ class ServerArgs:
         # admission).
         self._handle_gdn_state_set_ladder()
 
+        # #350: the planner objective axis. Validated at argument time so a
+        # typo fails the boot rather than the first plan. `choices=` already
+        # bounds the CLI; this catches direct ServerArgs construction too.
+        self._handle_objective()
+
         # Erg. 9/9b KV pressure ladder: validate the step spec, the two
         # water marks and the asymmetric windows at argument time (a typo
         # fails the boot, not the first pressure boundary).
@@ -6210,6 +6236,16 @@ class ServerArgs:
         parse_park_target_order(
             self.lane_offload_park_targets, "--lane-offload-park-targets"
         )
+
+    def _handle_objective(self):
+        """#350: fail fast on an unknown --objective. Resolving through the
+        Objective enum keeps the accepted set in ONE place (the enum), so the
+        flag choices and the planner cannot drift."""
+        from sglang.srt.planner.objective import resolve_objective
+
+        # resolve_objective raises ValueError on an unknown value and returns
+        # the enum member otherwise; store back the canonical string.
+        self.objective = resolve_objective(self).value
 
     def _handle_gdn_state_set_ladder(self):
         """#286 Erg. 8: fail fast on an invalid --gdn-state-set-ladder spec
