@@ -46,6 +46,7 @@ the reduction, not a shortcut taken here.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Callable, Dict, List, Optional
@@ -163,6 +164,7 @@ class RegimeObserver:
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         log_every: int = DEFAULT_LOG_EVERY,
         current_stage: Optional[str] = None,
+        trace_path: Optional[str] = None,
         mode: str = MODE_OBSERVE,
         table_plan=None,
         commit_fn: Optional[Callable] = None,
@@ -207,6 +209,13 @@ class RegimeObserver:
                 f"property the no-actuator test pins."
             )
         self._mode = mode
+        # One JSON object per verdict, appended. This is the artifact both
+        # card gates read: gate 1 counts desyncs off it, gate 2 replays it
+        # open-loop. Written from the scheduler process that owns the
+        # observer, so on a multi-rank boot each rank writes its own file and
+        # the reader can see that they agreed (or did not).
+        self._trace_path = str(trace_path) if trace_path else None
+        self._trace_fh = None
         self._table_plan = table_plan
         self._commit_fn = commit_fn
         self._dwell = dwell
@@ -341,6 +350,15 @@ class RegimeObserver:
             "prefill_share": sample.prefill_share,
             "decode_share": sample.decode_share,
             "occupancy": sample.occupancy,
+            # The NUMERATOR and the denominator, not only their ratio. A
+            # replay (#363 gate 2) has to vary the denominator -- that is the
+            # whole self-conditioning mechanism -- so a trace carrying only
+            # the ratio silently holds occupancy constant under the very
+            # change it is meant to expose, and the counterfactual comes back
+            # clean for the wrong reason. Found by the gate-2 tool's own
+            # smoke.
+            "held_tokens": sample.held_tokens,
+            "capacity_tokens": sample.capacity_tokens,
             "queued_reqs": sample.queued_reqs,
             "queued_prompt_tokens": sample.queued_prompt_tokens,
             "would_flip_to": target.name if target is not None else None,
@@ -378,6 +396,7 @@ class RegimeObserver:
                 else:
                     self._count_veto("actuator refused")
         self._last_record = record
+        self._write_trace(record)
         self._maybe_log(record, reduced)
 
         self._prefill_rounds = 0
@@ -527,6 +546,49 @@ class RegimeObserver:
             ),
         )
 
+    # -- the trace, which is what the card gates actually consume -----------
+    def _write_trace(self, record: Dict) -> None:
+        """Append one verdict. Never raises into the scheduler loop: a full
+        disk must not stop a server from serving, and a trace that stops
+        mid-run is visible to the reader as a short file."""
+        if self._trace_path is None:
+            return
+        try:
+            if self._trace_fh is None:
+                self._trace_fh = open(self._trace_path, "a", buffering=1)
+                self._trace_fh.write(
+                    json.dumps({"kind": "header", "mode": self._mode}) + "\n"
+                )
+            self._trace_fh.write(json.dumps({"kind": "verdict", **record}) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "%s trace write failed (%r); disabling the trace for this "
+                "run. The classifier is unaffected.",
+                LOG_PREFIX,
+                exc,
+            )
+            self._trace_path = None
+
+    def close_trace(self) -> None:
+        """Write the summary line and close. Idempotent.
+
+        The summary is the LAST line by construction, so a reader that finds
+        one knows the run ended cleanly and a reader that does not knows the
+        server was killed -- which is the difference between "zero desyncs"
+        and "zero desyncs so far".
+        """
+        if self._trace_fh is None:
+            return
+        try:
+            self._trace_fh.write(
+                json.dumps({"kind": "summary", **self.summary()}) + "\n"
+            )
+            self._trace_fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._trace_fh = None
+
     def summary(self) -> Dict:
         """What the observe run has to show for itself.
 
@@ -627,6 +689,7 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         current_stage=current,
         commit_fn=commit_fn,
         dwell=dwell,
+        trace_path=getattr(server_args, "regime_trace", None),
     )
 
 
