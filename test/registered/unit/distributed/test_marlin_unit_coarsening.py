@@ -39,8 +39,9 @@ from sglang.srt.distributed.utils import (
     tp_partition_sizes,
 )
 from sglang.srt.layers.linear import (
-    _marlin_min_thread_by_block_idx,
+    _marlin_min_thread_pair,
     _marlin_packable_family,
+    _marlin_uneven_tp_block,
     _quant_block_aligned_units,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -100,14 +101,22 @@ class TestTheConstantsAreImportedNotRestated(_Base):
         )
 
         self.assertEqual(
-            _marlin_min_thread_by_block_idx(),
+            _marlin_min_thread_pair(),
             (GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K),
         )
+
+    def test_the_block_is_ONE_value_for_both_axes(self):
+        """#385: the per-axis reading (64 out / 128 in) is what broke the
+        coupled dimension. One value, the lcm, on both."""
+        n, k = _marlin_min_thread_pair()
+        self.assertEqual(_marlin_uneven_tp_block(), 128)
+        self.assertEqual(_marlin_uneven_tp_block() % n, 0)
+        self.assertEqual(_marlin_uneven_tp_block() % k, 0)
 
     def test_k_is_stricter_than_the_repack_tile(self):
         """The repack tile on k is 16; the GEMM wants 128. Aligning to the
         tile alone would pass the repack and fail verify_marlin_supported."""
-        n, k = _marlin_min_thread_by_block_idx()
+        n, k = _marlin_min_thread_pair()
         self.assertEqual((n, k), (64, 128))
         self.assertGreater(k, 16)
 
@@ -295,3 +304,92 @@ class TestEvenSplitUntouched(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCoupledDimensionConsistency(_Base):
+    """THE INVARIANT #383 BROKE, and the test that would have caught it.
+
+    gate_up is COLUMN-parallel and splits its OUTPUT; down_proj is
+    ROW-parallel and splits its INPUT; both are the SAME intermediate
+    dimension. Whatever coarsening applies, the per-rank intermediate implied
+    by gate_up must equal the one down_proj is built for -- otherwise the
+    weight is repacked for one k and handed an activation of another.
+
+    #383 shipped a per-axis rule (64 on output, 128 on input) and broke it:
+    gate_up implied [14880, 8960, 8928] while down_proj expected
+    [14848, 8960, 8960]. It reached hardware and surfaced as #377 gap 3,
+    ``Tensor match failed for Tensor<568, 20480>`` at gptq_marlin.cuh:836 --
+    which is not an alignment check at all but
+    ``b_q_weight.size(0) == size_k / 16`` against the ACTIVATION's k.
+
+    Every existing sibling states the rule in its own docstring
+    (``awq_uneven_tp_block``: "Both dims carry the same value ... they
+    partition the same intermediate dimension and must coarsen identically").
+    The corpus tests checked each axis on its own and could not see a
+    disagreement BETWEEN them; this class checks the pair.
+    """
+
+    #: (label, intermediate) -- gate_up is 2x this (gate and up fused).
+    COUPLED = (
+        ("Mistral-Small-24B", 32768),
+        ("Qwen3.6-27B", 17408),
+        ("small even", 8192),
+    )
+
+    def _pair(self, intermediate, marlin):
+        """(gate_up-implied per-rank intermediate, down_proj-expected).
+
+        gate_up is a MERGED column-parallel layer whose parts (gate, up) are
+        each ``intermediate`` wide and are partitioned on the intermediate
+        basis -- not one fused ``2*intermediate`` split, which rounds
+        differently and is not what the layer does. Modelling it the fused way
+        makes even the no-coarsening case look inconsistent, i.e. it encodes a
+        false invariant; that mistake is why this helper says so.
+
+        So both sides partition the SAME total on the SAME basis, and the only
+        thing that can make them disagree is the coarsening choosing different
+        blocks for idx 0 and idx 1 -- which is exactly what #383 did.
+        """
+        u = intermediate // 16
+        gu_u = self.coarsen(intermediate, u, None, marlin, idx=0)  # column: output
+        dp_u = self.coarsen(intermediate, u, None, marlin, idx=1)  # row: input
+        return self.partition(intermediate, gu_u), self.partition(intermediate, dp_u)
+
+    def test_gate_up_implied_equals_down_proj_expected(self):
+        for label, inter in self.COUPLED:
+            with self.subTest(model=label):
+                implied, expected = self._pair(inter, True)
+                self.assertEqual(
+                    implied,
+                    expected,
+                    f"{label}: gate_up implies {implied} but down_proj is "
+                    f"built for {expected} -- the weight would be repacked "
+                    f"for one k and handed an activation of another",
+                )
+
+    def test_the_packed_row_counts_agree(self):
+        """The quantity gptq_marlin.cuh:836 actually compares: k // 16."""
+        for label, inter in self.COUPLED:
+            with self.subTest(model=label):
+                implied, expected = self._pair(inter, True)
+                self.assertEqual(
+                    [x // 16 for x in implied], [x // 16 for x in expected], label
+                )
+
+    def test_the_measured_377_shapes_are_in_the_corpus(self):
+        """8960 / 9088 -- the per-rank intermediates behind the observed
+        Tensor<560,...> and Tensor<568,...>."""
+        implied, expected = self._pair(32768, True)
+        self.assertEqual(implied, expected)
+        self.assertIn(8960, expected)
+        for v in expected:
+            self.assertEqual(v % 128, 0, f"{v} is not marlin-aligned")
+            self.assertEqual(v % 16, 0)
+
+    def test_non_marlin_pairs_also_agree(self):
+        """The invariant is not marlin-specific; it must hold whatever the
+        coarsening decides, including when it decides nothing."""
+        for label, inter in self.COUPLED:
+            with self.subTest(model=label):
+                implied, expected = self._pair(inter, False)
+                self.assertEqual(implied, expected, label)
