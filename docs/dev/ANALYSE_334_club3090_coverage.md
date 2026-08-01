@@ -223,3 +223,97 @@ in the model registry. What is missing is not loaders but (a) a per-layer
 family table, which is a hetero enabler worth doing on its own merits, (b)
 GGUF type codes for a non-mainline quant family, and (c) a tenant composition
 for audio-out that belongs to a different line of work.
+
+---
+
+# Appendix (#372) — ik_llama type-code inventory
+
+The §3d cut, executed: **which GGUF quant type codes do the user's ik-llama
+recipes actually use**, and what would each cost in our loader. Desk-only, no
+kernels, no loader code.
+
+Source: every file under `club-3090/models/*/ik-llama/` (compose YAML plus
+their READMEs) for `qwen3.6-27b` and `qwen3.6-35b-a3b`.
+
+## The split that decides the verdict
+
+A raw grep over those recipes returns 121 quant-type mentions across 10
+distinct spellings, which reads like "ten types to support". It is not. The
+mentions fall on **two different axes**, and only one of them is a weight
+dequant question:
+
+| spelling | mentions | axis | what it actually is |
+| --- | --- | --- | --- |
+| `q4_0` | 57 | **KV cache** | `-ctk`/`-ctv` default in every recipe ("K and V quant type (default: q4_0)") |
+| `q8_0` | 23 | **KV cache** | the same flag's alternative ("q8_0 boots...") |
+| `q5_0` | 4 | **KV cache** | ditto |
+| `IQ4_KS` | 17 | **weights** | ubergarm MTP GGUF, Qwen3.6-27B — "imatrix IQK quant" |
+| `IQ4_XS` | 6 | **weights** | byteshape 4.19 bpw GGUF, Qwen3.6-35B-A3B |
+| `F16` / `f16` / `bf16` | 12 | **weights** | the `mmproj` vision projector |
+| `Q8_K_XL` | 1 | **weights** | mentioned in prose, no recipe pins it |
+| `Q4_K_M` | 1 | **weights** | mentioned in prose, no recipe pins it |
+
+**84 of the 121 mentions are KV-cache quantization**, an axis we address with
+`--kv-cache-dtype` and which needs no weight dequant path at all. Counting
+them as weight types is the mistake this inventory exists to prevent: it would
+have turned a one-type verdict into a five-type one, i.e. the exact M-vs-L
+question §3d was created to answer.
+
+## Weight types, per type
+
+| type | ik-specific? | our loader today | on disk | verdict |
+| --- | --- | --- | --- | --- |
+| **IQ4_KS** | **yes** — absent from mainline llama.cpp's ggml sources and from our type list | **NO** | **no artifact** | the only real gap — **M** |
+| IQ4_XS | no, mainline | **YES** (already in the supported IQ set) | **no artifact** | nothing to do |
+| Q4_K_M | no, mainline | yes | no artifact | nothing to do |
+| Q8_K_XL | no, mainline (unsloth naming) | yes | no artifact | nothing to do |
+| F16 / BF16 (mmproj) | no | yes | no artifact | nothing to do |
+| q4_0 / q8_0 / q5_0 | n/a — **KV cache, not weights** | `--kv-cache-dtype` | n/a | wrong axis |
+
+Our loader's IQ coverage today, for the record: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M, IQ4_NL, IQ4_XS. The mainline IQ
+family is complete; `IQ4_KS` is the one outside it.
+
+## The honest "no artifact" rows
+
+**Not one of these checkpoints is on this box.** Both GGUFs the recipes name —
+`Qwen3.6-27B-MTP-IQ4_KS.gguf` and `Qwen3.6-35B-A3B-IQ4_XS-4.19bpw.gguf` — are
+download URLs in compose files, not files. So:
+
+* no artifact on disk uses **IQ4_KS**;
+* no artifact on disk uses **IQ4_XS** (though our loader would already read
+  one);
+* no artifact on disk uses **Q4_K_M** or **Q8_K_XL** in an ik-llama context.
+
+The GGUFs that ARE on disk (`models-cache/`) are mainline Q3_K_M / Q4 / Q6
+builds, all already supported.
+
+## Effort and yield for IQ4_KS
+
+**Effort: M.** One type, one dequant path in the #129 registry pattern. It is
+M rather than S because of the #109 corner: the MMQ out-of-bounds bug lived in
+exactly this code, and a new block layout has to be exercised against the
+uneven-TP shard boundaries where that class of bug appears (a type whose block
+size does not divide a per-rank shard width is where the alignment failures
+have always shown up).
+
+**Yield: one checkpoint the user has a recipe for and does not currently hold.**
+The gain is access to the ubergarm MTP-IQ4_KS build of a model we already
+serve in five other formats (FP8, INT8-W8A8, AWQ, GPTQ-Int4, mainline GGUF).
+So the yield is not "a new model" — it is "one more quantization point for an
+existing model, from an ecosystem whose tooling we do not otherwise consume".
+
+Judged as a pair rather than against a threshold: the effort is a bounded,
+single-type kernel task, and the yield is narrow but real if the user wants
+that specific build. **Recommendation: do it when the user asks for that
+checkpoint, not before** — and download the GGUF first, because the block
+layout should be read off the real file rather than from a description.
+
+## What would change this verdict
+
+* A second ik-specific type appearing in a recipe (IQ2_KL, IQ5_KS and
+  relatives exist in that ecosystem). Two types is still M; the cost is mostly
+  per-type kernel work, so it scales linearly and the "when the user asks"
+  rule holds until the list grows.
+* The user actually downloading an IQ4_KS build — at that point the yield
+  stops being hypothetical and the block layout becomes readable.
