@@ -1026,6 +1026,20 @@ class Envs:
     # takes its free-memory reading; and (c) logs the reclaimed bytes. Set to
     # False to fall back to the unsynchronized, unaccounted behaviour.
     SGLANG_MOE_OFFLOAD_KV_REGAIN = EnvBool(True)
+    # #390: router-distribution and VRAM residency hit-rate counters in the
+    # expert-offload path. Opt-in; off by default and the counters are then not
+    # even constructed, so the offload path costs one `is not None` test. When
+    # on, every eager offload forward folds its already-materialized routing
+    # decision (topk_ids.tolist(), the sync run_waves pays anyway) into a
+    # per-layer expert-activation histogram plus hit/miss against the resident
+    # set. No extra device sync and nothing in the kernel. Captured decode steps
+    # (SGLANG_MOE_OFFLOAD_CUDA_GRAPH) are not counted -- counting them would
+    # require the host sync that path exists to avoid; the dump flags this.
+    SGLANG_EXPERT_STATS = EnvBool(False)
+    # Dump prefix; each rank writes "<prefix>.<rank_tag>.json". Default /tmp.
+    SGLANG_EXPERT_STATS_PATH = EnvStr("")
+    # Additionally dump every N seconds (0 = only on exit / SIGUSR2).
+    SGLANG_EXPERT_STATS_INTERVAL_SEC = EnvFloat(0.0)
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;

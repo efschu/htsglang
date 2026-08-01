@@ -623,6 +623,17 @@ class FusedMoE(torch.nn.Module):
                     "layout must be frozen BEFORE graph capture. Supply "
                     "SGLANG_MOE_HOTSET_FILE or use static residency."
                 )
+
+        # #390: the router/residency counters live in the offload path, so
+        # asking for them without an offload records nothing. Say so at boot
+        # rather than leaving an empty dump to be explained later.
+        if self._expert_offload_fraction >= 1.0 and envs.SGLANG_EXPERT_STATS.get():
+            from sglang.srt.layers.moe.expert_stats import (
+                warn_if_stats_without_offload,
+            )
+
+            warn_if_stats_without_offload()
+
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
