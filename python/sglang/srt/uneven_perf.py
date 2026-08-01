@@ -4840,10 +4840,33 @@ def _boot_energy_model(server_args, model, lines: List[str]):
     """
     from sglang.srt.planner.objective import boot_energy_anchors
 
-    names = list(getattr(model, "gpu_names", None) or [])
-    uuids = list(getattr(server_args, "_rank_gpu_uuids", None) or [])
-    if not names:
-        names = list(getattr(server_args, "_rank_gpu_names", None) or [])
+    # Per-rank card identity comes from the CACHED HARDWARE PROFILE, which is
+    # the same artifact the rest of the auto-performance path already reads.
+    # (Earlier this looked for a `gpu_names` attribute on the cost model; no
+    # such attribute exists, so the energy boot could only ever reach the
+    # refusal below -- found by running it, #350 validation window.)
+    names: List[str] = []
+    uuids: List[str] = []
+    try:
+        profile, _inv = get_cached_hardware_profile()
+        gpus = (profile or {}).get("gpus") or {}
+        by_index = {}
+        for uuid, entry in gpus.items():
+            idx = entry.get("cuda_index")
+            if idx is not None:
+                by_index[int(idx)] = (str(entry.get("name") or ""), str(uuid))
+        rank_ids = list(getattr(server_args, "rank_gpu_id", None) or [])
+        if not rank_ids:
+            rank_ids = sorted(by_index)
+        for cuda_idx in rank_ids:
+            hit = by_index.get(int(cuda_idx))
+            if hit is None:
+                names = []
+                break
+            names.append(hit[0])
+            uuids.append(hit[1])
+    except Exception:
+        names, uuids = [], []
     if not names:
         raise ValueError(
             "--objective energy: the boot planner has no per-rank card "
