@@ -33,7 +33,7 @@ deepseek-ai/DeepSeek-V4-Flash-0731.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -125,6 +125,11 @@ _COLLECTIVE_EXPERT_SUFFIXES = (
 #: Native suffixes whose payload is an integer table, not a quantized weight.
 #: The generic iterator has no notion of that (see transform_stream).
 _INTEGER_TABLE_SUFFIXES = (".gate.tid2eid",)
+
+#: Native prefix of the token embedding, whose module is dense (see
+#: transform_stream). The output projection has no counterpart here on
+#: purpose: this family does not tie the two, so ``head`` stays packed.
+_EMBED_PREFIX = "embed."
 
 
 def _supported_ggml_types() -> set:
@@ -276,30 +281,86 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
     # Weight stream
     # ------------------------------------------------------------------
 
+    def _target_dtype(self) -> torch.dtype:
+        """The model's compute dtype, for tensors this adapter dequantizes."""
+        dtype = getattr(self.config, "torch_dtype", None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if isinstance(dtype, str) and hasattr(torch, dtype):
+            return getattr(torch, dtype)
+        return torch.get_default_dtype()
+
     def transform_stream(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Iterable[Tuple[str, torch.Tensor]]:
-        """Repair the two places where the generic GGUF iterator's assumptions
-        do not hold for this family.
+        """Repair the three places where the generic GGUF iterator's
+        assumptions do not hold for this family.
 
         Everything else -- including the already-split per-expert names the
         iterator emits for the stacked ``ffn_*_exps`` tensors -- passes through
-        untouched.
+        untouched. In particular the OUTPUT projection (``head``) is left
+        packed: ``tie_word_embeddings`` is false for this family, so the head
+        is its own ``ParallelLMHead`` built with the model's quant_config, and
+        a quantized-resident vocab head is this stack's GGUF default.
         """
+        embed_qtype: Optional[int] = None
         for name, tensor in weights:
-            # (1) Integer routing table. The iterator treats every non-F32
+            # (1) Token embedding. `DeepseekV4Model` builds `embed_tokens` as a
+            # VocabParallelEmbedding with NO quant_config, i.e. a plain dense
+            # `.weight` -- while token_embd is Q8_0 in the published export and
+            # so arrives as `embed.qweight` plus a marker. Nothing downstream
+            # can put a packed payload into a dense embedding, and before this
+            # dequant the two markers were simply reported missing and the
+            # embedding stayed at its uninitialized values (#391 wall 10).
+            # Same shape of repair as the gemma4 adapter's, for the same
+            # reason.
+            if name.startswith(_EMBED_PREFIX):
+                leaf = name[len(_EMBED_PREFIX) :]
+                if leaf == "qweight_type":
+                    embed_qtype = int(tensor.item())
+                    continue
+                if leaf == "qweight":
+                    assert (
+                        embed_qtype is not None
+                    ), "embed qweight arrived before its qweight_type marker"
+                    yield (
+                        _EMBED_PREFIX + "weight",
+                        _dequantize_to(tensor, embed_qtype, self._target_dtype()),
+                    )
+                    continue
+                # An F32 export already ships `embed.weight`: fall through.
+
+            # (2) Integer routing table. The iterator treats every non-F32
             # tensor as quantized and emits a `qweight_type` marker before the
-            # payload, deriving both names by substring-replacing "weight".
-            # `...gate.tid2eid` contains no "weight", so BOTH emissions arrive
-            # under the SAME name and the 0-dim type marker would overwrite the
-            # table. Drop the marker; the table is a plain int32 tensor.
+            # payload, deriving both names from the dense one.
+            # `...gate.tid2eid` has no `.weight` leaf to rename, so BOTH
+            # emissions arrive under the SAME name and the 0-dim type marker
+            # would overwrite the table. Drop the marker; the table is a plain
+            # int32 tensor.
             if any(name.endswith(suffix) for suffix in _INTEGER_TABLE_SUFFIXES):
                 if tensor.dim() == 0:
                     continue
                 yield name, tensor
                 continue
 
-            # (2) BF16 router gate. The iterator renames every non-F32 tensor
+            # The general form of the collision the branch above handles: a
+            # name with no `.weight` leaf gets no rename, so a quantized
+            # payload and its 0-dim marker arrive under ONE name and one
+            # silently replaces the other. Every such tensor in the published
+            # export is F32 (attention sinks, compressor APEs, the
+            # hyper-connection triples) and F32 emits no marker at all, so this
+            # can only fire on a re-export that quantizes one of them. Refuse
+            # by name instead of loading whichever of the two arrived last.
+            if tensor.dim() == 0 and not name.endswith(".qweight_type"):
+                raise RuntimeError(
+                    f"{self.FAMILY} GGUF: {name!r} is a bare parameter (no "
+                    "`.weight` leaf to rename) but is stored quantized, so its "
+                    "ggml type marker and its payload both arrive under that "
+                    "one name and overwrite each other. Export it as F32, or "
+                    "give this tensor an explicit case in transform_stream."
+                )
+
+            # (3) BF16 router gate. The iterator renames every non-F32 tensor
             # to `.qweight` and hands over the raw little-endian bytes as
             # uint8. The DeepSeek V4 router gate is a plain parameter, not a
             # GGUF-quantized linear, so it must arrive as `.weight` holding
@@ -353,6 +414,20 @@ _DEEPSEEK4_LINEAR_LEAVES = frozenset(
         "w3",
     }
 )
+
+
+def _dequantize_to(
+    packed: torch.Tensor, qtype_value: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Unpack one GGUF payload into a dense tensor of *dtype*."""
+    import gguf
+    from gguf.quants import dequantize
+
+    qtype = gguf.GGMLQuantizationType(qtype_value)
+    if qtype == gguf.GGMLQuantizationType.BF16:
+        # gguf-py hands BF16 back as raw uint8 with the last dim doubled.
+        return _bytes_to_bf16(packed).to(dtype)
+    return torch.from_numpy(dequantize(packed.numpy(), qtype).copy()).to(dtype)
 
 
 def _bytes_to_bf16(tensor: torch.Tensor) -> torch.Tensor:

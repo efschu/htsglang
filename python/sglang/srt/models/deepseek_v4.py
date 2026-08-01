@@ -2609,10 +2609,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
-        if name == "embed.weight":
-            return "model.embed_tokens.weight"
-        if name == "head.weight":
-            return "lm_head.weight"
+        # The two top-level vocab tensors. Their leaf is NOT always `.weight`:
+        # a GGUF export ships a packed projection as `.qweight` plus a 0-dim
+        # `.qweight_type` marker, and an exact-match on `head.weight` left both
+        # of the head's tensors unmapped and only warned, so the lm_head never
+        # loaded (#391 wall 11). Translating the prefix and keeping the leaf is
+        # the whole job here; whether the target module actually HOLDS a packed
+        # parameter is a property of the module, not of the name.
+        for native_prefix, hf_prefix in _VOCAB_TENSOR_PREFIXES:
+            if name.startswith(native_prefix):
+                return hf_prefix + name[len(native_prefix) :]
         if name == "norm.weight":
             return "model.norm.weight"
         if name.startswith("hc_head_"):
@@ -2785,6 +2791,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
+        # {module_prefix: {leaf: tensor}} for the projections that are dense by
+        # construction but arrive packed from a GGUF file -- same two-pass
+        # arrival order as the fusion caches above.
+        cache_gguf_dense_unpack: dict[str, dict[str, torch.Tensor]] = {}
+        is_gguf = is_gguf_quant_config(getattr(self, "quant_config", None))
+
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
@@ -2941,8 +2953,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             if (
                                 name.startswith("model.hc_head_")
-                                or name == "lm_head.weight"
+                                or name.startswith("lm_head.")
                             ) and not self.pp_group.is_last_rank:
+                                # `lm_head.` by PREFIX, not `== lm_head.weight`:
+                                # a GGUF head arrives as `.qweight` plus its
+                                # marker, and on a non-last PP rank lm_head is a
+                                # PPMissingLayer, so an exact match would leave
+                                # those two to the unmatched check below.
                                 continue
                             elif COMPRESSOR_PART in name:
                                 parsed = _split_compressor_weight_name(name)
@@ -3008,6 +3025,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_wqkv_a_weight.pop(param_name)
+                            elif (
+                                dense_base := _gguf_dense_projection_base(name)
+                            ) is not None:
+                                leaf = name.rsplit(".", 1)[-1]
+                                unpack_bucket = cache_gguf_dense_unpack.setdefault(
+                                    dense_base, {}
+                                )
+                                assert (
+                                    leaf not in unpack_bucket
+                                ), f"duplicate {leaf} for {dense_base}"
+                                unpack_bucket[leaf] = loaded_weight
+                                if len(unpack_bucket) == len(_GGUF_PACKED_LEAVES):
+                                    param_name = f"{dense_base}.weight"
+                                    param = params_dict[param_name]
+                                    dense_weight = _gguf_dequantize(
+                                        unpack_bucket["qweight"],
+                                        unpack_bucket["qweight_type"],
+                                        param.dtype,
+                                    )
+                                    weight_loader = auto_weight_loader(param)
+                                    maybe_executor_submit(
+                                        executor=executor,
+                                        futures=futures,
+                                        use_async=use_async_loading,
+                                        func=weight_loader,
+                                        func_args=(param, dense_weight),
+                                    )
+                                    loaded_params.add(param_name)
+                                    cache_gguf_dense_unpack.pop(dense_base)
                             else:
                                 if (
                                     "k_scale" in name or "v_scale" in name
@@ -3019,10 +3065,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    if not name.startswith("mtp"):
-                                        logger.warning(
-                                            f"{name} not found in params_dict."
+                                    if name.startswith("mtp"):
+                                        # NEXTN weights while loading the
+                                        # target: the draft owns them and
+                                        # loads them in its own pass.
+                                        continue
+                                    if is_gguf:
+                                        raise KeyError(
+                                            _unmatched_gguf_tensor_message(name)
                                         )
+                                    logger.warning(f"{name} not found in params_dict.")
                                     continue
                                 param = params_dict[name]
 
@@ -3044,6 +3096,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+        assert len(cache_gguf_dense_unpack) == 0, cache_gguf_dense_unpack.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = [
@@ -3122,21 +3175,89 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return result.to(torch.bfloat16)
 
 
+#: ``(native prefix, sglang prefix)`` for the checkpoint's two top-level vocab
+#: tensors, matched on the PREFIX so every leaf spelling travels with it.
+_VOCAB_TENSOR_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("embed.", "model.embed_tokens."),
+    ("head.", "lm_head."),
+)
+
 #: Leaf spellings under which one projection of a weight fusion can reach
 #: ``load_weights``. A dense checkpoint ships ``.weight`` (plus
 #: ``.weight_scale_inv`` for an fp8 block-scaled tensor); a GGUF checkpoint
 #: ships the packed payload as ``.qweight`` and, ahead of it in the iterator's
 #: first pass, a 0-dim ggml type marker as ``.qweight_type``.
 _FUSION_DENSE_LEAVES: Tuple[str, ...] = ("weight", "weight_scale_inv")
-_FUSION_GGUF_LEAVES: Tuple[str, ...] = ("qweight", "qweight_type")
+
+#: Projections whose MODULE is dense by construction even when the model
+#: carries a GGUF quant_config, so a packed GGUF payload has to be unpacked at
+#: load time rather than land in a ``.qweight`` parameter that does not exist:
+#:
+#: * ``wo_a`` -- ``DeepseekV4AttentionMHC`` passes ``quant_config=None`` for it
+#:   unless the fp8 wo_a GEMM is on, and that GEMM is refused outright on a
+#:   GGUF checkpoint (see the NotImplementedError there), so under GGUF wo_a is
+#:   ALWAYS dense; ``_compute_o`` reads ``self.wo_a.weight`` directly. The
+#:   published export stores it as Q8_0, which is where boot 7's 24
+#:   ``wo_a.qweight_type not found`` warnings came from (#391 wall 12).
+#: * ``weights_proj`` -- ``C4Indexer`` passes ``quant_config=None``
+#:   unconditionally. It is F32 in the published export and therefore arrives
+#:   dense today; this entry is what keeps the load correct if a future export
+#:   quantizes it, instead of leaving a second silent hole of the same shape.
+_GGUF_DENSE_PROJECTIONS: Tuple[str, ...] = ("wo_a", "weights_proj")
+
+
+def _unmatched_gguf_tensor_message(name: str) -> str:
+    """Why an unmatched tensor is fatal on a GGUF checkpoint, not a warning.
+
+    On the dense/safetensors route an unmatched name is usually a benign
+    export artefact, so it warns. On the GGUF route it is not: every tensor
+    the adapter emits was mapped by an explicit table that already refuses
+    anything it does not recognize, so a name arriving here means the model
+    graph and the name table disagree about where that tensor belongs. Boot 7
+    is what that costs when it only warns -- the embedding, the lm_head and
+    every ``wo_a`` were reported missing one line at a time and the server
+    came up on uninitialized weights (#391 walls 10-12, 15).
+    """
+    return (
+        f"GGUF checkpoint: {name!r} matched no parameter of this model. Every "
+        "tensor of a GGUF export is mapped by an explicit name table, so this "
+        "is a mapping defect, not a spare tensor: either the table in "
+        "model_loader/gguf_deepseek4.py sends it to the wrong parameter, or "
+        "remap_weight_name_to_dpsk_hf_format does, or the module that should "
+        "hold it is built differently than the name assumes (a packed "
+        "`.qweight` arriving at a module built dense is the usual case -- see "
+        "_GGUF_DENSE_PROJECTIONS). Loading would otherwise continue with that "
+        "tensor's parameter left uninitialized."
+    )
+
+
+def _gguf_dense_projection_base(name: str) -> Optional[str]:
+    """Module prefix of a packed payload whose module is dense, else ``None``.
+
+    Only the packed spellings match: a dense ``.weight`` arrival for the same
+    module takes the ordinary parameter path, which is why the safetensors
+    route is untouched by this site.
+    """
+    for leaf in _GGUF_PACKED_LEAVES:
+        suffix = f".{leaf}"
+        if not name.endswith(suffix):
+            continue
+        base = name[: -len(suffix)]
+        if base.rsplit(".", 1)[-1] in _GGUF_DENSE_PROJECTIONS:
+            return base
+    return None
+
+
+#: Leaf spellings of a packed GGUF payload plus its 0-dim ggml type marker.
+_GGUF_PACKED_LEAVES: Tuple[str, ...] = ("qweight", "qweight_type")
 
 #: The two projections each fusion site joins, in concatenation order.
 _COMPRESSOR_PROJECTIONS: Tuple[str, ...] = ("wkv", "wgate")
 _WQKV_A_PROJECTIONS: Tuple[str, ...] = ("wq_a", "wkv")
 
 #: The compressor has no block-scaled variant, so only the plain dense leaf.
-_COMPRESSOR_LEAVES: Tuple[str, ...] = ("weight",) + _FUSION_GGUF_LEAVES
-_WQKV_A_LEAVES: Tuple[str, ...] = _FUSION_DENSE_LEAVES + _FUSION_GGUF_LEAVES
+_COMPRESSOR_LEAVES: Tuple[str, ...] = ("weight",) + _GGUF_PACKED_LEAVES
+_WQKV_A_LEAVES: Tuple[str, ...] = _FUSION_DENSE_LEAVES + _GGUF_PACKED_LEAVES
 
 
 def _split_compressor_weight_name(name: str) -> Optional[Tuple[str, str, str]]:
