@@ -4455,32 +4455,23 @@ class PerfCostModel:
         equal rates, because float addition of times is not float division of
         a param sum.
         """
-        t_comp = 0.0
-        if family_tflops:
-            denom = 1e12 * _PREDICT_GEMM_EFF
-            for r in range(self.tp_size):
-                t = 0.0
-                for name, fam in self.families.items():
-                    if fam.params <= 0 or fam.shard == "replicated":
-                        continue
-                    params_fam_r = (
-                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
-                    )
-                    rates = family_tflops.get(name)
-                    rate_r = rates[r] if rates else gemm_tflops[r]
-                    t += 2.0 * params_fam_r / (rate_r * denom)
-                t_comp = max(t_comp, t)
-        else:
-            for r in range(self.tp_size):
-                params_r = 0.0
-                for fam in self.families.values():
-                    if fam.params <= 0 or fam.shard == "replicated":
-                        continue
-                    params_r += (
-                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
-                    )
-                t = 2.0 * params_r / (gemm_tflops[r] * 1e12 * _PREDICT_GEMM_EFF)
-                t_comp = max(t_comp, t)
+        # Per-rank compute times, then their max. Factored out of this method
+        # rather than inlined so the ENERGY objective (#350 p4) can read every
+        # rank's own time -- a rank that finishes early still draws power
+        # while it waits, so the max alone cannot price joules. The max over
+        # the ranks in ascending order is the identical float to the running
+        # `max(t_comp, t)` this replaced, so the throughput path is unchanged.
+        # Called through the CLASS, not through ``self``: the arithmetic is
+        # duck-typed on (tp_size, families, _shard_fractions) and several
+        # tests bind this method to a stand-in that provides exactly those
+        # and nothing else. Going through the class keeps every such caller
+        # working, which is what lets the factoring stay a pure refactor.
+        t_comp = max(
+            PerfCostModel.per_rank_prefill_compute_times(
+                self, mlp_vector, gemm_tflops, family_tflops
+            ),
+            default=0.0,
+        )
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
         #
@@ -4502,6 +4493,46 @@ class PerfCostModel:
         ar_bytes = self.n_layers * 2 * self.hidden * 2
         t_comm = ar_bytes * 2 * (n - 1) / n / (min_link_gbs * 1e9)
         return t_comp + t_comm
+
+    def per_rank_prefill_compute_times(
+        self, mlp_vector, gemm_tflops, family_tflops=None
+    ) -> List[float]:
+        """Each rank's OWN prefill GEMM time for one lockstep round (s).
+
+        The vector ``_prefill_sharded_time`` takes the max of. Exposed
+        because the energy objective (#350) needs every rank's term: the
+        round lasts as long as the slowest rank, and the others draw
+        idle-to-active in proportion to how much of it they were busy.
+        Pure arithmetic over the same family shard fractions; no probing.
+        """
+        out: List[float] = []
+        if family_tflops:
+            denom = 1e12 * _PREDICT_GEMM_EFF
+            for r in range(self.tp_size):
+                t = 0.0
+                for name, fam in self.families.items():
+                    if fam.params <= 0 or fam.shard == "replicated":
+                        continue
+                    params_fam_r = (
+                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                    )
+                    rates = family_tflops.get(name)
+                    rate_r = rates[r] if rates else gemm_tflops[r]
+                    t += 2.0 * params_fam_r / (rate_r * denom)
+                out.append(t)
+        else:
+            for r in range(self.tp_size):
+                params_r = 0.0
+                for fam in self.families.values():
+                    if fam.params <= 0 or fam.shard == "replicated":
+                        continue
+                    params_r += (
+                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                    )
+                out.append(
+                    2.0 * params_r / (gemm_tflops[r] * 1e12 * _PREDICT_GEMM_EFF)
+                )
+        return out
 
     def prefill_time_model(
         self,
@@ -4789,6 +4820,53 @@ def _tp_drop_recommendation(
         "TP degree is never changed silently; re-launch with those flags "
         "to take this trade."
     )
+
+
+def _objective_is_energy(server_args) -> bool:
+    """True when the boot was asked to plan for joules (#350 phase 4)."""
+    from sglang.srt.planner.objective import Objective, resolve_objective
+
+    return resolve_objective(server_args) is Objective.ENERGY
+
+
+def _boot_energy_model(server_args, model, lines: List[str]):
+    """Power anchors for the boot planner, or a hard failure.
+
+    Fails LOUDLY rather than falling back. A silent throughput boot under
+    ``--objective energy`` is exactly the substitution the provenance rule
+    forbids, and the fork validates early: an unpriceable rig is a
+    configuration error the operator must see at parse time, not a plan whose
+    label lies.
+    """
+    from sglang.srt.planner.objective import boot_energy_anchors
+
+    names = list(getattr(model, "gpu_names", None) or [])
+    uuids = list(getattr(server_args, "_rank_gpu_uuids", None) or [])
+    if not names:
+        names = list(getattr(server_args, "_rank_gpu_names", None) or [])
+    if not names:
+        raise ValueError(
+            "--objective energy: the boot planner has no per-rank card "
+            "identities, so it cannot look up power anchors. This is a "
+            "planning-path gap, not a user error -- plan through "
+            "/api/key_solver with explicit power_anchors, or drop "
+            "--objective energy."
+        )
+    energy_model, notes = boot_energy_anchors(names, uuids or None)
+    if energy_model is None:
+        raise ValueError(
+            "--objective energy cannot be priced on this rig: "
+            + "; ".join(notes)
+            + ". Run the #149 power calibration, or add the card's TDP to the "
+            "card library, or drop --objective energy. Booting the "
+            "throughput vector under an energy flag would be a silent "
+            "substitution, so the boot is refused instead."
+        )
+    lines.append(
+        f"objective=energy: planning for J/token, {energy_model.provenance.value} "
+        f"power anchors ({'; '.join(notes)})"
+    )
+    return energy_model
 
 
 def apply_auto_performance(server_args) -> None:
@@ -5392,6 +5470,16 @@ def apply_auto_performance(server_args) -> None:
         )
         candidates = _mlp_candidates(model, enc_scores, base_plan)
         best_gain = 0.0
+        # #350 phase 4: the boot's own objective. Resolved and validated
+        # HERE, at parse time, so an energy request that cannot be priced
+        # fails the boot with a named reason instead of quietly booting the
+        # throughput vector under an energy flag (the fork's validate-early
+        # rule; the same refusal solve() makes in the planner).
+        energy_model, best_joules, energy_scores = None, math.inf, {}
+        if _objective_is_energy(server_args):
+            from sglang.srt.planner.objective import energy_per_work
+
+            energy_model = _boot_energy_model(server_args, model, lines)
         results = []
         for cand in candidates:
             pred = model.predict_capacity(list(cand))
@@ -5420,12 +5508,28 @@ def apply_auto_performance(server_args) -> None:
             results.append(
                 (cand, pred, gain, floor_ok, knee_ok, knee_reason, res, unfundable)
             )
-            if (
-                floor_ok
-                and (knee_ok or not knee_binding)
-                and unfundable is None
-                and gain > best_gain + 1e-9
-            ):
+            admissible = (
+                floor_ok and (knee_ok or not knee_binding) and unfundable is None
+            )
+            if energy_model is not None:
+                # #350 phase 4: the ENERGY objective changes only WHICH
+                # admissible candidate wins, never which are admissible --
+                # the context floor, the decode-knee guard and fundability
+                # are correctness gates and a joule does not buy past them.
+                # Price = lockstep time x summed board power over the SAME
+                # per-rank prefill times the throughput model maxes over.
+                if admissible:
+                    j = energy_per_work(
+                        model.per_rank_prefill_compute_times(
+                            list(cand), enc_scores, enc_family_tflops
+                        ),
+                        energy_model,
+                    )
+                    energy_scores[tuple(cand)] = j
+                    if j < best_joules - 1e-12:
+                        best_joules = j
+                        chosen = cand
+            elif admissible and gain > best_gain + 1e-9:
                 best_gain = gain
                 chosen = cand
         for (
@@ -5476,6 +5580,11 @@ def apply_auto_performance(server_args) -> None:
                     else ""
                 )
                 + f" (units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'})"
+                + (
+                    f", predicted {energy_scores[tuple(cand)]:.4g} J/token"
+                    if tuple(cand) in energy_scores
+                    else ""
+                )
             )
         if chosen is None:
             lines.extend(

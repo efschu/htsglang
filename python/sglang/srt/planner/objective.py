@@ -52,6 +52,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from sglang.srt.planner.cost_model import Provenance, Rate
 
 __all__ = [
+    "boot_energy_anchors",
     "EnergyModel",
     "RankPower",
     "energy_per_work",
@@ -384,3 +385,72 @@ def energy_rate(
     if energy_model.provenance is Provenance.MEASURED:
         return Rate.measured(value, source, unit=unit)
     return Rate.estimate(value, source, unit=unit)
+
+
+def boot_energy_anchors(gpu_names: Sequence[str], uuids: Optional[Sequence[str]] = None):
+    """Per-rank power anchors for the BOOT planner (#350 phase 4).
+
+    Sources them exactly where the rest of the tree already keeps them, so
+    nothing new is measured and nothing is invented:
+
+    * MEASURED -- ``power_calibration.load_power_profile()`` (#149), the NVML
+      board-power table keyed by card UUID. ``p_idle_w`` is the floor and
+      ``p_gemm_w`` the active ceiling (the prefill objective is compute-bound;
+      it is the same anchor ``roofline_energy`` uses for its FLOPS-utilization
+      phase).
+    * ESTIMATE -- the card library's ``tdp_w`` with #148's documented
+      ``IDLE_FRACTION_OF_TDP`` floor, i.e. the identical heuristic
+      ``roofline_energy`` falls back to.
+    * ABSENT -- a card with neither a measurement nor a known TDP. Returns
+      ``None`` for the whole rig: a partially-priced rig would silently rank
+      by whichever cards happened to be known.
+
+    Returns ``(EnergyModel, notes)`` or ``(None, notes)``. ``notes`` names the
+    tier each card resolved on, for the boot log.
+    """
+    from sglang.srt.planner.card_library import CardLibrary
+    from sglang.srt.planner.roofline import IDLE_FRACTION_OF_TDP
+
+    try:
+        from sglang.srt.planner.power_calibration import load_power_profile
+
+        measured = load_power_profile()
+    except Exception:
+        measured = {}
+
+    library = CardLibrary()
+    anchors: List[RankPower] = []
+    notes: List[str] = []
+    for i, name in enumerate(gpu_names):
+        uuid = uuids[i] if uuids and i < len(uuids) else None
+        row = measured.get(uuid) if uuid else None
+        if row is not None:
+            anchors.append(
+                RankPower(
+                    idle_w=float(row.p_idle_w),
+                    active_w=float(row.p_gemm_w),
+                    source="measured",
+                )
+            )
+            notes.append(f"rank {i} ({name}): measured NVML anchors")
+            continue
+        spec = library.get(name) if library.has(name) else None
+        tdp = float(getattr(spec, "tdp_w", 0) or 0) if spec is not None else 0.0
+        if tdp <= 0:
+            notes.append(
+                f"rank {i} ({name}): no measured power row and no TDP in the "
+                f"card library -- the rig cannot be priced in joules"
+            )
+            return None, notes
+        anchors.append(
+            RankPower(
+                idle_w=tdp * IDLE_FRACTION_OF_TDP,
+                active_w=tdp,
+                source="estimate-tdp",
+            )
+        )
+        notes.append(f"rank {i} ({name}): estimate from TDP {tdp:.0f} W")
+    if not anchors:
+        notes.append("no cards to price")
+        return None, notes
+    return EnergyModel(per_rank=tuple(anchors)), notes
