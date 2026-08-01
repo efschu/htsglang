@@ -91,7 +91,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 __all__ = [
     "RankRoofline",
@@ -689,6 +689,12 @@ def _stage0_fp8_lane_by_uuid():
 def _measured_by_index(hardware, measured_scores):
     """{gpu_index: (membw_gbs, gemm_bf16_tflops, gemm_fp8_tflops_or_None, lane)}.
 
+    ``gpu_index`` is the ``--rank-gpu-id`` (CUDA) space, because that is what
+    ``_rank_peaks`` looks the entries up by; ``rank_gpu_id_of`` puts the
+    UUID-matched cards into it. Keying those on the NVML index priced a rank's
+    roofline with a neighbouring card's measured bandwidth wherever the two
+    enumerations diverge (#392).
+
     Preference: match the live rig's cached probe by GPU **UUID** (the profile
     is keyed by UUID, and ``HardwareSpec`` carries the NVML UUID per card) — this
     sidesteps the torch-cuda-vs-NVML device-order trap that a bare index map
@@ -730,7 +736,7 @@ def _measured_by_index(hardware, measured_scores):
                     uuid = getattr(g, "uuid", None) or ""
                     ent = by_uuid.get(uuid)
                     if ent and ent.get("membw_gbs") and ent.get("gemm_tflops"):
-                        out[g.index] = (
+                        out[hardware.rank_gpu_id_of(g)] = (
                             float(ent["membw_gbs"]),
                             float(ent["gemm_tflops"]),
                             *_lane_for(uuid),
@@ -754,7 +760,7 @@ def _measured_by_index(hardware, measured_scores):
                             fp8_slot = (float(c.gemm_fp8_tflops), "fp8")
                         else:
                             fp8_slot = _lane_for(uuid)
-                        out[g.index] = (
+                        out[hardware.rank_gpu_id_of(g)] = (
                             float(c.membw_gbs),
                             float(c.gemm_bf16_tflops),
                             *fp8_slot,

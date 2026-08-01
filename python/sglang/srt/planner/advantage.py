@@ -192,7 +192,9 @@ def compute_advantage(
     if not reasons:
         stock_inputs = dataclasses.replace(
             inputs,
-            rank_gpu_id=used_cards or [g.index for g in hardware.gpus[:tp]],
+            rank_gpu_id=(
+                used_cards or [hardware.rank_gpu_id_of(g) for g in hardware.gpus[:tp]]
+            ),
             effective_vram_mib=None,
             rank_tp_ratio=None,
             rank_mlp_ratio=None,

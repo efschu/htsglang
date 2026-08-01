@@ -544,32 +544,126 @@ def _query_gpu_total_mib(gpu_ids, flag: str) -> Dict[int, int]:
         pynvml.nvmlShutdown()
 
 
-def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
-    """NVML (total_mib, free_mib) for each CUDA device index in `gpu_ids`.
+@dataclasses.dataclass(frozen=True)
+class _RankGpuCard:
+    """The physical card one ``--rank-gpu-id`` ordinal actually binds to.
 
-    Raises ValueError for indices that NVML cannot resolve.
+    Carries every name the card answers to, so a guard that refuses a budget
+    can say WHICH card it refused it for. ``cuda_ordinal`` is the value the
+    operator wrote on the command line; ``uuid`` and ``pci_bus_id`` are the
+    identity that survives a re-enumeration.
     """
-    import pynvml
 
-    mapping = _torch_to_nvml_gpu_index_mapping()
-    pynvml.nvmlInit()
+    cuda_ordinal: int
+    nvml_index: int
+    uuid: str
+    pci_bus_id: str
+    name: str
+    total_mib: int
+    free_mib: int
+
+    def describe(self) -> str:
+        return (
+            f"GPU {self.cuda_ordinal} ({self.name}, NVML total "
+            f"{self.total_mib} MiB, uuid {self.uuid}, bdf {self.pci_bus_id}, "
+            f"NVML index {self.nvml_index})"
+        )
+
+
+def _resolve_rank_gpu_cards(gpu_ids) -> Dict[int, _RankGpuCard]:
+    """The physical card behind every ``--rank-gpu-id`` ordinal (#392).
+
+    ``--rank-gpu-id`` names CUDA ordinals, not NVML indices: the launcher
+    hands each value to ``maybe_reindex_device_id``, which writes it into the
+    child process's ``CUDA_VISIBLE_DEVICES``, and CUDA resolves it in its own
+    enumeration order (FASTEST_FIRST unless ``CUDA_DEVICE_ORDER`` says
+    otherwise). NVML enumerates in PCI bus order instead. On a mixed rig the
+    two disagree -- on the reference box the RTX 5090 is CUDA ordinal 0 and
+    NVML index 1 -- so reading a card total out of NVML positionally sizes
+    the budget of a rank against a DIFFERENT card than the one it will run
+    on. #349 sweep-3 arm L is that defect in the field: the budget vector
+    19000,15000,15000 was accepted against a 20480 MiB 3080 at NVML index 0
+    and then OOMed, because rank 0 had bound the 5090.
+
+    Resolution goes through the #331 identity map, which bridges CUDA
+    ordinal <-> NVML index over the PCI BDF and keys the card on its UUID.
+    An ordinal the map cannot place is an error, never a fallback to the
+    NVML index of the same number: guessing there is precisely the bug this
+    function exists to remove (the same stance ``_query_gpu_total_mib`` took
+    for #336).
+    """
+    from sglang.srt.registry import nvml as registry_nvml
+
+    ordinals = sorted({int(g) for g in gpu_ids})
+    if any(o < 0 for o in ordinals):
+        raise ValueError(f"--rank-gpu-id entries must be >= 0, got {ordinals}.")
+
     try:
-        device_count = pynvml.nvmlDeviceGetCount()
-        result: Dict[int, Tuple[int, int]] = {}
-        for gpu_id in sorted(set(gpu_ids)):
-            nvml_idx = mapping.get(gpu_id, gpu_id)
-            if gpu_id < 0 or nvml_idx < 0 or nvml_idx >= device_count:
-                raise ValueError(
-                    f"--rank-gpu-id names GPU {gpu_id}, but NVML only "
-                    f"reports {device_count} device(s) "
-                    f"(indices 0-{device_count - 1})."
-                )
-            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            result[gpu_id] = (mem.total // 2**20, mem.free // 2**20)
-        return result
-    finally:
-        pynvml.nvmlShutdown()
+        # allow_cuda_init: the CUDA side of the map is the whole point here,
+        # and only torch can supply it.
+        imap = registry_nvml.identity_map(allow_cuda_init=True)
+    except Exception as e:
+        raise ValueError(
+            f"--rank-gpu-id needs the physical identity of the cards its "
+            f"ordinals bind to, but the NVML/CUDA identity map could not be "
+            f"built ({e}). Refusing to guess: reading another card's total "
+            "sizes every rank budget against the wrong card (#392)."
+        ) from e
+
+    missing = [o for o in ordinals if imap.by_cuda_ordinal(o) is None]
+    if missing:
+        raise ValueError(
+            f"--rank-gpu-id names CUDA device(s) {missing}, which this host "
+            "cannot resolve to a physical card. --rank-gpu-id is in CUDA "
+            "enumeration order (the order CUDA_VISIBLE_DEVICES is read in), "
+            "not NVML/nvidia-smi order. Cards present:\n"
+            + (imap.describe() or "  (no NVML devices)")
+        )
+
+    cards: Dict[int, _RankGpuCard] = {}
+    for ordinal in ordinals:
+        card = imap.by_cuda_ordinal(ordinal)
+        mem = registry_nvml.memory_info_for_uuid(card.uuid)
+        cards[ordinal] = _RankGpuCard(
+            cuda_ordinal=ordinal,
+            nvml_index=card.nvml_index,
+            uuid=card.uuid,
+            pci_bus_id=card.pci_bus_id,
+            name=card.name,
+            total_mib=mem.total_bytes // 2**20,
+            free_mib=mem.free_bytes // 2**20,
+        )
+    return cards
+
+
+def _describe_rank_gpu(cuda_ordinal: int, total_mib: int) -> str:
+    """Name the physical card behind a ``--rank-gpu-id`` ordinal for an error.
+
+    Degrades to the bare ordinal when the identity map is unavailable, so a
+    guard never fails to fire just because it could not name its subject.
+    """
+    try:
+        card = _resolve_rank_gpu_cards([cuda_ordinal])[cuda_ordinal]
+    except Exception:
+        return f"GPU {cuda_ordinal} (NVML total {total_mib} MiB)"
+    return (
+        f"GPU {cuda_ordinal} ({card.name}, NVML total {total_mib} MiB, "
+        f"uuid {card.uuid}, bdf {card.pci_bus_id}, NVML index "
+        f"{card.nvml_index})"
+    )
+
+
+def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
+    """NVML (total_mib, free_mib) per ``--rank-gpu-id`` CUDA ordinal.
+
+    The numbers belong to the card the rank will actually bind, not to the
+    card sitting at the same NVML index; see :func:`_resolve_rank_gpu_cards`.
+    Raises ValueError for ordinals that cannot be resolved.
+    """
+    return {
+        ordinal: (card.total_mib, card.free_mib)
+        for ordinal, card in _resolve_rank_gpu_cards(gpu_ids).items()
+    }
 
 
 #: Accepted ``--rank-perf-tune`` targets. The first four are the
@@ -1437,7 +1531,11 @@ class ServerArgs:
             "ceiling or safety margin is applied on top; leaving headroom "
             "for the CUDA context is the user's responsibility. Required "
             "when --rank-gpu-id is set, except with --rank-tp-ratio auto "
-            "(budgets are then derived from the NVML totals). Conflicts "
+            "(budgets are then derived from the NVML totals). Each budget is "
+            "checked against, and converted to a fraction of, the NVML total "
+            "of the card its rank's CUDA ordinal actually binds -- not the "
+            "card sitting at the same NVML index, which is a different card "
+            "on rigs where the two enumerations diverge. Conflicts "
             "with an explicitly set --mem-fraction-static.",
             type_parser=_parse_mib_scalar_or_list,
         ),
@@ -9027,6 +9125,12 @@ class ServerArgs:
         # VRAM. This is the hard physical limit — no additional safety
         # margin is enforced on top (leaving headroom for the CUDA
         # context etc. is the user's responsibility).
+        #
+        # The totals come from _resolve_rank_gpu_cards, which resolves each
+        # --rank-gpu-id ordinal to the card that ordinal BINDS at runtime
+        # (CUDA enumeration order, via the #331 identity map) rather than to
+        # the card at the same NVML index. Checking one card and binding
+        # another is #392: it accepts budgets that cannot run.
         budgets = (
             list(self.rank_gpu_memory_mib)
             if isinstance(self.rank_gpu_memory_mib, list)
@@ -9039,10 +9143,11 @@ class ServerArgs:
             total_mib = mem_info[gpu_id][0]
             if required_mib > total_mib:
                 raise ValueError(
-                    f"Physical impossibility: GPU {gpu_id} "
-                    f"(NVML total {total_mib} MiB) cannot fit ranks {ranks} "
-                    f"whose budgets sum to {required_mib} MiB. Reduce "
-                    "--rank-gpu-memory-mib or place fewer ranks on this GPU."
+                    f"Physical impossibility: "
+                    f"{_describe_rank_gpu(gpu_id, total_mib)} cannot fit "
+                    f"ranks {ranks} whose budgets sum to {required_mib} MiB. "
+                    "Reduce --rank-gpu-memory-mib or place fewer ranks on "
+                    "this GPU."
                 )
 
         # MiB -> fraction, computed ONCE per rank at resolution time:
@@ -9054,6 +9159,12 @@ class ServerArgs:
         # top. Leaving headroom for CUDA context/fragmentation inside the
         # MiB value is the user's responsibility. On heterogeneous GPUs
         # the same MiB value therefore maps to DIFFERENT fractions.
+        #
+        # The denominator must be the total of the card the rank BINDS, for
+        # the same reason the guard above must check that card: a fraction
+        # divided by a 20480 MiB 3080 and then applied on a 32768 MiB 5090
+        # asks for 1.6x the MiB the operator wrote down (#392).
+        #
         # Underscore attribute: derived (not a CLI field), pickled to the
         # scheduler child processes with the rest of the instance.
         self._rank_mem_fraction_static = [

@@ -155,7 +155,10 @@ def validate_plan_inputs(
             errors.append(
                 f"--rank-gpu-id entries must be >= 0, got {rank_gpu_id}."
             )
-        known = {g.index for g in hardware.gpus}
+        # --rank-gpu-id is in CUDA order; rank_gpu_id_of puts the spec's cards
+        # into that same space instead of comparing against their NVML
+        # indices, which name other cards on a mixed rig (#392).
+        known = {hardware.rank_gpu_id_of(g) for g in hardware.gpus}
         for gid in sorted(set(rank_gpu_id)):
             if gid not in known:
                 errors.append(
@@ -163,7 +166,7 @@ def validate_plan_inputs(
                     f"({hardware.source}) only declares "
                     f"{sorted(known)}: "
                     + ", ".join(
-                        f"[{g.index}] {g.name} {g.total_mib} MiB"
+                        f"[{hardware.rank_gpu_id_of(g)}] {g.name} {g.total_mib} MiB"
                         for g in hardware.gpus
                     )
                     + "."
@@ -293,7 +296,7 @@ def plan(
                     "--rank-gpu-id map (duplicates = ranks sharing a card)."
                 ]
             )
-        rank_gpu_id = [g.index for g in hardware.gpus[:tp_size]]
+        rank_gpu_id = [hardware.rank_gpu_id_of(g) for g in hardware.gpus[:tp_size]]
     else:
         rank_gpu_id = [int(g) for g in rank_gpu_id]
         if tp_size is None:
