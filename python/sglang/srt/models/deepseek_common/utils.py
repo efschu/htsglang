@@ -71,6 +71,43 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def dense_weight_dtype(layer: torch.nn.Module) -> Optional[torch.dtype]:
+    """dtype of a layer's dense ``weight``, or ``None`` when it has none.
+
+    Packed quantization formats register ``qweight`` and never materialize a
+    ``weight`` attribute: GGUF (``GGUFLinearMethod``) and the AWQ/GPTQ family
+    all do. Every dtype test in the DeepSeek family selects a fast path that
+    only exists for a dense, int8 or fp8 weight tensor, so "there is no dense
+    weight" has to read as "not this fast path". Reading the attribute
+    directly instead raises ``AttributeError: 'MergedColumnParallelLinear'
+    object has no attribute 'weight'`` at construction time, which is what
+    kept the whole DeepSeek family from being built under GGUF.
+
+    Behavior for the dense, int8 and fp8 paths is unchanged: those layers do
+    carry ``weight``, so the dtype returned is the one the direct attribute
+    access returned.
+    """
+    weight = getattr(layer, "weight", None)
+    return getattr(weight, "dtype", None)
+
+
+def layer_quant_method_name(layer: torch.nn.Module) -> Optional[str]:
+    """Quant method a layer was built with, or None when it is unquantized.
+
+    Read off the layer rather than off the model config, because attention
+    submodules can be built with an overridden quant config (see
+    ``DeepseekV2AttentionMLA._get_q_b_proj_quant_config`` and the DSV4
+    ``wo_a``).
+    """
+    quant_config = getattr(getattr(layer, "quant_method", None), "quant_config", None)
+    return None if quant_config is None else quant_config.get_name()
+
+
+def is_gguf_quant_config(quant_config: Optional[QuantizationConfig]) -> bool:
+    """True for GGUF checkpoints, whose linears are all packed."""
+    return quant_config is not None and quant_config.get_name() == "gguf"
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device

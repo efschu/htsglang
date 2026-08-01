@@ -9,6 +9,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
+    dense_weight_dtype,
 )
 from sglang.srt.utils import BumpAllocator, use_intel_amx_backend
 
@@ -29,16 +30,17 @@ class DeepseekMLACpuForwardMixin:
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
-        self.qkv_proj_with_rope_is_int8 = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+        # This runs from DeepseekV2AttentionMLA.__init__ on every device, so
+        # it must not assume a dense weight exists. `is_packed_weight` names
+        # the AWQ family only; GGUF and GPTQ are packed too and carry
+        # `qweight`, for which the dtype resolves to None -> neither fast path.
+        fused_a_dtype = (
+            dense_weight_dtype(self.fused_qkv_a_proj_with_mqa)
+            if self.has_fused_proj and not self.is_packed_weight
+            else None
         )
-        self.qkv_proj_with_rope_is_fp8 = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
-        )
+        self.qkv_proj_with_rope_is_int8 = fused_a_dtype == torch.int8
+        self.qkv_proj_with_rope_is_fp8 = fused_a_dtype == torch.float8_e4m3fn
 
         self.weight_block_size = None
         if self.qkv_proj_with_rope_is_fp8 and _is_cpu and _is_cpu_amx_available:
