@@ -304,3 +304,103 @@ Not in scope for the first window: a byte-win claim. On the reference rig the
 kv-heads are freely shardable (8 over 3 ranks) so the layout is byte-neutral
 there by the rule in the section above; demonstrating the full shard factor
 needs a `TP > num_kv_heads` configuration.
+
+---
+
+# Slice 3 desk pass: the GPU verdict, and what the code actually says
+
+The 2026-08-01 window (`/spinning/gpu-battery-results/2026-08-01_108-dcp-validation/`)
+returned four green points and one split: the split works, output quality is
+byte-clean, and **accept length regresses on the dcp arm** (alphabet
+4.000 -> 3.368, squares 3.368 -> 3.048 at `draft_tokens=4`; no gap at
+`draft_tokens=2`, where the arm sits at the 2.0 ceiling).
+
+## The window's hypothesis is FALSIFIED
+
+The window suspected the prefix subtraction under-read by
+`(padded - accept_len)`, because the qo layout is a padded constant while
+acceptance is variable. Reading the code settles it the other way.
+
+`base_spec_worker.prepare_for_draft_extend`:
+
+```python
+batch.prefix_lens  = batch.seq_lens            # the committed history
+batch.extend_lens  = [num_draft_tokens] * bs   # PADDED
+extend_num_tokens  = bs * num_draft_tokens     # PADDED
+# Forward sees post-write length (draft extend writes num_draft_tokens slots)
+forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+```
+
+and `eagle_worker_v2._draft_extend_for_decode` sets
+`num_tokens_per_req=self.speculative_num_draft_tokens` (padded) while carrying
+`num_accept_tokens=batch_result.accept_lens` (actual) alongside it.
+
+So `seq_lens` at draft-extend is inflated by the **padded** count, not the
+accepted one, and **the write is padded too** — the same constant on both
+sides. Subtracting `num_tokens_per_req` therefore lands exactly on
+`committed`. The subtraction is correct; the write and the read agree about
+padding; there is no sibling defect on the write side. The pads are scratch
+rows the next round overwrites, and because both stages agree on where the
+padding starts, the paged and ragged ranges stay disjoint and complete.
+
+**Graph capture and the real prefix coexist by construction**, which answers
+the design question: the padded stride lives entirely in the RAGGED stage (the
+current chunk), and the paged read stops at `committed`. No mask is needed to
+reconcile them because no padded row is ever inside the paged range. If the
+append count ever became genuinely variable per request, that would no longer
+hold and the paged stage would need a per-request length — but today it does
+not.
+
+## Consequence: the regression has another cause, not yet identified
+
+Ruled out by this pass: the subtraction, the write/read padding agreement, and
+an arm-level confound — arms C and D resolved to the **identical** effective
+configuration (vector `[30,17,17]`, ratio `[29607,17780,17780]`,
+`max_total_num_tokens=453632`), so the flag is the only difference.
+
+Still open, in the order worth checking:
+
+1. The draft's **cross-rank LSE merge and owned-slot indices**. The draft pool
+   is compacted by the owner rule while `req_to_token` (shared with the target)
+   holds global allocator ids; the compaction must agree between the draft
+   pool's row space and the index builder. A subtly wrong merge degrades the
+   draft's predictions without touching the target verify — which is exactly
+   the observed shape (accept down, quality perfect).
+2. The **ragged stage's head geometry** for the draft. The current chunk is
+   attended on LOCAL head-sharded q/kv while the paged prefix uses gathered
+   full heads; `_replicated_kv_ragged_reindex` corrects the GQA grouping only
+   when `dcp_kv_replicated_heads` is set, which it is not at 8 kv heads over 3
+   ranks.
+3. Plain numeric drift from reading a sharded prefix through an LSE merge
+   instead of one local read. Benign if so, but it must be shown, not assumed.
+
+Note the padding-width scaling that looked like evidence for the falsified
+hypothesis is **also** consistent with (1)-(3): at `draft_tokens=2` acceptance
+was at its ceiling, so there was no headroom in which a degraded draft could
+show up. The discriminator localized the effect to a regime, not to a cause.
+
+## Test-design fix
+
+`test/registered/unit/distributed/test_draft_extend_prefix_contract.py` pins
+the CONTRACT rather than the arithmetic:
+
+* C1 prefix == committed, C2 paged and ragged disjoint and complete, C3 no
+  committed token outside the paged range — over a grid of padded widths
+  (1,2,3,4,8) crossed with committed lengths.
+* The padded constant is varied **independently** of the accept count, so the
+  k=2-vs-k=4 discriminator is now a CPU case.
+* The falsified hypothesis is pinned as a counterfactual: subtracting an
+  accept-like count reads PAST the commit.
+
+Falsifier-checked: a wrong subtrahend reds 45 assertions across the grid. The
+slice-2 test, which asserted `seq_lens - k` directly, caught none of them —
+it pinned the arithmetic chosen rather than the property it had to satisfy.
+
+## Re-run scope (next window, ~10 min)
+
+The prepared runsheet unchanged, plus the k=2/4 pair as a permanent arm. But
+note that **the fix this pass was expected to produce does not exist**, because
+the defect it assumed is not there. The re-run should therefore be deferred
+until one of (1)-(3) is either confirmed at the desk or turned into an on-card
+discriminator — re-measuring the same regression without a changed hypothesis
+would spend a window to reproduce a number already in hand.
