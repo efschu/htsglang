@@ -46,9 +46,11 @@ the reduction, not a shortcut taken here.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
+import signal
 from typing import Callable, Dict, List, Optional
 
 from sglang.srt.managers.regime_classifier import (
@@ -272,6 +274,11 @@ class RegimeObserver:
     @property
     def regime(self) -> str:
         return self._sensor.regime
+
+    @property
+    def trace_path(self) -> Optional[str]:
+        """Where the verdict trace is being written, or ``None``."""
+        return self._trace_path
 
     @property
     def last_record(self) -> Optional[Dict]:
@@ -706,7 +713,7 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         commit_fn = build_regime_actuator(scheduler, table_plan).apply
         dwell = _dwell_for(table_plan)
 
-    return RegimeObserver(
+    observer = RegimeObserver(
         consensus_interval=interval,
         tp_size=tp_size,
         collective_min=collective,
@@ -718,6 +725,8 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         dwell=dwell,
         trace_path=getattr(server_args, "regime_trace", None),
     )
+    install_trace_shutdown_hook(observer)
+    return observer
 
 
 #: Rounds of dwell to assume before the live mean round time is known. The
@@ -746,6 +755,78 @@ def _dwell_for(table_plan) -> DwellGate:
     # held for the same span as a 0.3 s one.
     worst = max(costs)
     return DwellGate(min_rounds=max(BOOTSTRAP_DWELL_ROUNDS, int(worst * 128)))
+
+
+def close_regime_trace(scheduler) -> None:
+    """Close the observer's trace, from anywhere, safely.
+
+    Called from the scheduler process's ``finally`` -- the one block that runs
+    on BOTH the graceful path (a ShutdownReq breaks the event loop) and the
+    exception path (including ``KeyboardInterrupt``, which ``except
+    Exception`` does not catch but ``finally`` still honours). Idempotent, and
+    it never raises: a teardown helper that can throw turns a clean shutdown
+    into a confusing one and an already-failing shutdown into a lost
+    traceback.
+    """
+    observer = getattr(scheduler, "regime_observer", None)
+    if observer is None:
+        return
+    try:
+        observer.close_trace()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s could not close the verdict trace (%r)", LOG_PREFIX, exc)
+
+
+def install_trace_shutdown_hook(observer) -> None:
+    """Make the summary line land on every way this process actually stops.
+
+    The reader refuses a trace without a summary line, because "zero desyncs"
+    and "zero desyncs SO FAR" are different claims (DESIGN_363 section 13.3).
+    That refusal is only useful if a run which DID end cleanly always produces
+    one, so all three stop paths are covered:
+
+    * a **ShutdownReq** breaks the event loop -> the scheduler's ``finally``
+      calls :func:`close_regime_trace`;
+    * a **scheduler-loop exception** (or ``KeyboardInterrupt``) -> the same
+      ``finally``;
+    * **SIGTERM** -> nothing above runs. Python's default disposition
+      terminates the process without unwinding, so neither ``finally`` nor
+      ``atexit`` fires. Hence the handler installed here.
+
+    The SIGTERM handler CHAINS: it closes the trace and then hands the signal
+    on to whatever was installed before, or re-raises it against the default
+    disposition. It must not change how the server dies -- only what it
+    writes on the way out.
+    """
+    if observer is None or observer.trace_path is None:
+        return
+    atexit.register(observer.close_trace)
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _close_then_chain(signum, frame):
+        observer.close_trace()
+        if callable(previous):
+            return previous(signum, frame)
+        # SIG_DFL / SIG_IGN: restore it and re-deliver, so the process dies
+        # exactly as it would have without this hook.
+        signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
+        if previous is signal.SIG_IGN:
+            return None
+        os.kill(os.getpid(), signum)
+        return None
+
+    try:
+        signal.signal(signal.SIGTERM, _close_then_chain)
+    except ValueError:
+        # Not the main thread of this process. The other two paths still
+        # cover it, and a scheduler that cannot install the handler must not
+        # fail to boot over a trace file.
+        logger.info(
+            "%s: SIGTERM trace hook not installed (not the main thread); the "
+            "shutdown and exception paths still write the summary.",
+            LOG_PREFIX,
+        )
 
 
 def build_regime_stage_table(scheduler):
@@ -876,6 +957,8 @@ __all__ = [
     "RegimeObserver",
     "build_regime_observer",
     "build_regime_stage_table",
+    "close_regime_trace",
+    "install_trace_shutdown_hook",
     "observe_mode",
     "rank_forward_ms_from",
     "resolve_mode",
