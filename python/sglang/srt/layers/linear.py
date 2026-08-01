@@ -154,9 +154,36 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
-def _marlin_min_thread_by_block_idx() -> tuple:
-    """Marlin's per-axis shard minimum, by ``block_idx`` (0 = output/n,
-    1 = input/k): ``(GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K)``.
+def _marlin_uneven_tp_block() -> int:
+    """The ONE marlin block both dims coarsen by: ``lcm(MIN_THREAD_N,
+    MIN_THREAD_K)`` = 128.
+
+    SYMMETRIC, and that is the correction #385 made to this rule. The obvious
+    reading of marlin's constraints is per-axis -- 64 on the output dim, 128 on
+    the input -- and #383 shipped exactly that. It is wrong, for the reason
+    every existing sibling states in its own docstring
+    (``awq_uneven_tp_block``): "Both dims carry the same value so a
+    column-parallel OUTPUT split (gate_up) lands on the same boundary as its
+    coupled row-parallel INPUT split (down) -- they partition the same
+    intermediate dimension and must coarsen identically."
+
+    gate_up's OUTPUT and down_proj's INPUT are the same intermediate dimension.
+    Coarsening them by different blocks splits that dimension two different
+    ways: measured at the rig vector, gate_up implies per-rank intermediate
+    [14880, 8960, 8928] while down_proj is built for [14848, 8960, 8960]. The
+    weight is then repacked for one k and handed an activation of another, and
+    the GEMM's own shape check catches it --
+    ``gptq_marlin.cuh:836`` verifies ``b_q_weight.size(0) == size_k / 16``
+    against the ACTIVATION's k, which is how #377 gap 3 presented
+    (``Tensor match failed for Tensor<568, 20480>``). Not an alignment gap: a
+    coupled-dimension disagreement that asymmetric alignment created.
+    """
+    n, k = _marlin_min_thread_pair()
+    return math.lcm(n, k)
+
+
+def _marlin_min_thread_pair() -> tuple:
+    """``(GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K)`` = (64, 128).
 
     IMPORTED, not restated -- these are the constants
     ``marlin_utils.verify_marlin_supports_shape`` checks
@@ -266,7 +293,7 @@ def _quant_block_aligned_units(
     # family (block 16 -> lcm 64), which is the fork's default serving model.
     # The gap this closes is exactly the configs that expose nothing.
     if block is None and _marlin_packable_family(quant_config):
-        block = _marlin_min_thread_by_block_idx()[block_idx]
+        block = _marlin_uneven_tp_block()
     if not block:
         return units
     from sglang.srt.distributed.utils import block_aligned_units
