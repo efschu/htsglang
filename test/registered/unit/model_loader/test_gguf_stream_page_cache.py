@@ -34,6 +34,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import hashlib
+import logging
 import mmap
 import os
 import tempfile
@@ -385,6 +386,87 @@ class TestNeverAdviseAhead(unittest.TestCase):
         for _shard, _start, end in dropper.advised:
             self.assertLessEqual(end, ceiling)
         self._assert_no_overlap_with_unconsumed(dropper, [0, 1, 3, 4])
+
+
+class TestStreamProgressLine(unittest.TestCase):
+    """(e) The dropper's evidence must land IN the stream, not only at close().
+
+    ``close()`` speaks for a stream that reached its end. Boot 9 (#391) died
+    at layer 12 of 43, so its log carried no dropper line at all and said
+    nothing about whether the feature had run -- ``mincore(2)`` had to answer
+    that from outside the process. A periodic line puts the same evidence
+    ahead of the step that fails, which is the only place it is worth
+    anything on a boot that does not finish.
+    """
+
+    EXTENT = 256 << 10
+    COUNT = 32
+    STEP = 1 << 20
+
+    def _dropper(self, progress_bytes: int) -> _RecordingDropper:
+        size = self.EXTENT * self.COUNT
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.truncate(size)
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        dropper = _RecordingDropper(
+            [path], [None], batch_bytes=1, progress_bytes=progress_bytes
+        )
+        dropper.register(0, extents(size, self.EXTENT))
+        return dropper
+
+    def _consume_all(self, dropper: _RecordingDropper) -> None:
+        for index in range(self.COUNT):
+            dropper.consume(0, index)
+        dropper.flush()
+
+    def _progress_records(self, records) -> List[str]:
+        return [r.getMessage() for r in records if "so far" in r.getMessage()]
+
+    def test_progress_lines_land_before_close(self) -> None:
+        dropper = self._dropper(self.STEP)
+        with self.assertLogs(
+            "sglang.srt.model_loader.gguf_shards", level="INFO"
+        ) as captured:
+            self._consume_all(dropper)
+        lines = self._progress_records(captured.records)
+        # 8 MiB released in 1 MiB steps -> one line per step, all of them
+        # emitted while the stream was still running.
+        self.assertEqual(
+            len(lines),
+            (self.EXTENT * self.COUNT) // self.STEP,
+            captured.output,
+        )
+        self.assertIn(f"consumer at tensor {self.COUNT}/{self.COUNT}", lines[-1])
+        self.assertIn("consumer at tensor 4/32", lines[0])
+        dropper.close()
+
+    def test_no_progress_line_before_the_first_step_is_reached(self) -> None:
+        """Falsifier for "it just logs on every flush": a step larger than the
+        whole stream must produce no in-stream line at all."""
+        dropper = self._dropper(1 << 30)
+        with self.assertLogs(
+            "sglang.srt.model_loader.gguf_shards", level="INFO"
+        ) as captured:
+            self._consume_all(dropper)
+            logging.getLogger("sglang.srt.model_loader.gguf_shards").info("sentinel")
+        self.assertEqual(self._progress_records(captured.records), [])
+
+    def test_the_advised_ranges_are_identical_with_and_without_the_line(
+        self,
+    ) -> None:
+        """The line is a log and nothing else: same calls, same ranges, same
+        order, same totals."""
+        loud = self._dropper(self.STEP)
+        quiet = self._dropper(0)
+        with self.assertLogs("sglang.srt.model_loader.gguf_shards", level="INFO"):
+            self._consume_all(loud)
+        self._consume_all(quiet)
+        strip = lambda d: [(s, a, b) for s, a, b in d.advised]  # noqa: E731
+        self.assertEqual(strip(loud), strip(quiet))
+        self.assertEqual(loud.bytes_advised, quiet.bytes_advised)
+        self.assertEqual(loud.calls, quiet.calls)
+        self.assertGreater(loud.bytes_advised, 0)
 
 
 @unittest.skipIf(_MINCORE is None, "mincore(2) is not reachable through libc")

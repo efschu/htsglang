@@ -877,7 +877,16 @@ handled in the code — none of them belongs in a boot script any more:
   group's worth of heads at the GLOBAL width; a head-granular split would
   satisfy the partitioner and then produce a wrong einsum.
   `--rank-tp-ratio 30,17,17` is still accepted and now lands on the same
-  `[32,16,16]`, not the `[30,17,17]` it used to compute.
+  `[32,16,16]`, not the `[30,17,17]` it used to compute. Plain `auto` now says
+  so in the log, next to the weights it derived — the weight vector is a
+  ratio, the plan is what the ratio partitions into, and boots 8 and 9 could
+  check neither because only the ratio was printed:
+
+  ```
+  --rank-tp-ratio auto: weights [28639, 16512, 16512] partition into per-rank
+  attention [32, 16, 16] of 64 q-heads (whole units of 8 head(s): [4, 2, 2] of
+  8); MoE [119, 69, 68] of 256 routed experts.
+  ```
 
 Attention TP on this model is capped at `o_groups` = 8 ranks, refused by name
 above that.
@@ -887,6 +896,30 @@ load path is cleared as of boot attempt 8 — 26 of 43 layers streamed with zero
 weight-loading warnings and zero unmatched tensors before the host box killed
 it. What is left is a memory-budget question, and it has two halves: the page
 cache (section 4.5.5) and the watchdog that is supposed to catch the rest.
+
+**Optional, before launching: reset the page cache with
+`scripts/dsv4/preboot_cache_reset.sh`.**
+
+```bash
+bash "$WT/scripts/dsv4/preboot_cache_reset.sh" 24   # GiB to ask back
+```
+
+Boot 9 started with ~20 GiB of page cache belonging to other work on this box.
+`memory.current` counts it, so the watchdog below spent the whole run 20 GiB
+closer to firing than the load justified. Nothing in the load depends on this
+step — it only makes the headroom in `ram.log` mean what it says.
+
+`/proc/sys/vm/drop_caches` is **not** usable from this container: the file is
+owned by the unmapped `nobody` and opening it for write returns EACCES even as
+container root. It is also host-global, so on a shared Proxmox box it would
+throw away every other container's cache. The script therefore uses
+`/sys/fs/cgroup/memory.reclaim` (cgroup v2), which is writable here and
+reclaims from this cgroup only — measured: asking for 512 MiB moved `file`
+52.57 → 52.06 GiB. If neither mechanism is available the script says so and
+exits non-zero rather than pretending; the fallback is then on the PVE host,
+`sync && echo 3 > /proc/sys/vm/drop_caches`, and **that has to be noted in the
+run directory** — without the note a later reader cannot tell a clean baseline
+from a 20 GiB foreign one.
 
 **Watch host RAM with `scripts/dsv4/rammon.sh`, not with a per-boot copy.**
 
@@ -943,6 +976,20 @@ those are the same pages the stream re-maps, and the loader pages them out as it
 consumes them. The load log ends with `GGUF stream: released N GiB of checkpoint
 page cache behind the consumer in M advice call(s)`; if that line is missing the
 feature did not run and the run says nothing about the host budget.
+
+That closing line only exists for a load that reached its end. Boot 9 died at
+layer 12 of 43 and left no dropper line at all, so `mincore(2)` had to answer
+"did it run" from outside the process against the live mapping. The loader now
+also emits, every 8 GiB released,
+
+```
+GGUF stream: released 24.00 GiB of checkpoint page cache so far in 391 advice
+call(s); consumer at tensor 512/1328.
+```
+
+so the evidence lands **before** the step that fails. Grep for `so far in` on
+any load, finished or not; the closing summary stays the acceptance for a
+completed one.
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 

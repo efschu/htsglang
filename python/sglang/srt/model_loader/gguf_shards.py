@@ -275,6 +275,16 @@ def gguf_tensor_names(gguf_file: str) -> set:
 #: hundreds of thousands.
 _DEFAULT_DROP_BATCH_BYTES = 64 << 20
 
+#: How many released bytes between two in-stream progress lines.
+#:
+#: ``close()`` speaks only for a stream that reached its end. Boot 9
+#: (2026-08-01) died mid-load and its log therefore said nothing at all about
+#: whether the dropper had run -- ``mincore(2)`` had to answer that from
+#: outside the process, against the live mapping. A periodic line puts the
+#: evidence in the log BEFORE the step that fails, which is the only place it
+#: is worth anything on a boot that does not finish.
+_DEFAULT_DROP_PROGRESS_BYTES = 8 << 30
+
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 #: ``asm-generic/mman-common.h``. Identical on every Linux architecture sglang
@@ -351,11 +361,14 @@ class ConsumedPageDropper:
         mappings: Sequence[Optional[Any]],
         *,
         batch_bytes: Optional[int] = None,
+        progress_bytes: Optional[int] = None,
     ) -> None:
         if batch_bytes is None:
             # Read at call time, not bound at def time, so the module global
             # stays the single knob (and the tests can turn it down).
             batch_bytes = _DEFAULT_DROP_BATCH_BYTES
+        if progress_bytes is None:
+            progress_bytes = _DEFAULT_DROP_PROGRESS_BYTES
         if len(shard_paths) != len(mappings):
             raise ValueError("shard_paths and mappings must have the same length")
         self._paths = list(shard_paths)
@@ -388,6 +401,12 @@ class ConsumedPageDropper:
                 self._sizes.append(0)
         self.bytes_advised = 0
         self.calls = 0
+        #: Extents marked consumed so far / registered in total, reported by
+        #: the progress line as the stream's own position.
+        self.tensors_consumed = 0
+        self.tensors_registered = 0
+        self._progress_bytes = int(progress_bytes)
+        self._progress_milestone = 0
 
     @classmethod
     def for_readers(
@@ -418,12 +437,14 @@ class ConsumedPageDropper:
     def register(self, shard_index: int, extents: Iterable[Tuple[int, int]]) -> None:
         """Declare ``(offset, nbytes)`` for every tensor of one shard."""
         stored = [(int(offset), int(nbytes)) for offset, nbytes in extents]
+        previous = len(self._extents[shard_index])
         self._extents[shard_index] = stored
         self._consumed[shard_index] = [False] * len(stored)
         self._order[shard_index] = sorted(
             range(len(stored)), key=lambda i: stored[i][0]
         )
         self._cursor[shard_index] = 0
+        self.tensors_registered += len(stored) - previous
 
     def consume(self, shard_index: int, tensor_index: int) -> None:
         """Mark one registered tensor as fully read by the consumer."""
@@ -436,6 +457,7 @@ class ConsumedPageDropper:
         if consumed[tensor_index]:
             return
         consumed[tensor_index] = True
+        self.tensors_consumed += 1
         self._pending[shard_index] += self._extents[shard_index][tensor_index][1]
         if self._pending[shard_index] >= self._batch_bytes:
             self._flush_shard(shard_index)
@@ -506,6 +528,31 @@ class ConsumedPageDropper:
         self._advise(shard_index, start, end)
         self._advised_to[shard_index] = end
         self._pending[shard_index] = 0
+        self._log_progress()
+
+    def _log_progress(self) -> None:
+        """One INFO line per ``_progress_bytes`` released, in the stream.
+
+        Reports what has been released and where the consumer stands, so a
+        load that is killed before ``close()`` still leaves the evidence of
+        this feature's operation in the log ahead of the failing step. Purely
+        a log: the advice calls, their ranges and their order are untouched,
+        so the streamed bytes are identical with the line and without it.
+        """
+        if self._progress_bytes <= 0:
+            return
+        milestone = self.bytes_advised // self._progress_bytes
+        if milestone <= self._progress_milestone:
+            return
+        self._progress_milestone = milestone
+        logger.info(
+            "GGUF stream: released %.2f GiB of checkpoint page cache so far "
+            "in %d advice call(s); consumer at tensor %d/%d.",
+            self.bytes_advised / float(1 << 30),
+            self.calls,
+            self.tensors_consumed,
+            self.tensors_registered,
+        )
 
     def _madvise(self, shard_index: int, start: int, length: int, advice: int) -> bool:
         libc = _libc()
@@ -575,6 +622,8 @@ class _NullPageDropper:
 
     bytes_advised = 0
     calls = 0
+    tensors_consumed = 0
+    tensors_registered = 0
 
     def consume(self, shard_index: int, tensor_index: int) -> None:
         pass
