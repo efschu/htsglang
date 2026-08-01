@@ -177,7 +177,8 @@ precondition for #126, it is the only way to know whether WASTE's "the router
 has no tail" verdict (measured on K3 top-16 and Kimi-Linear top-8, and
 explicitly kept as a per-model instrument by its authors) applies to us, and
 it turns the hit-rate row of §4 from a hope into a number. **Do this
-regardless.**
+regardless.** — **Built (#390), see §9; the measurement itself rides along on
+the next MoE card window.**
 
 **Cut B — fetch V4 Flash's real geometry and quant sizes**, then place it on
 the ladder with the §3 arithmetic. **Effort S, desk.** *Yield: decides whether
@@ -238,3 +239,59 @@ read/compute overlap is the disk analog of our #125 prefetch, so the tier is
 a third rung under machinery we already have — which is why cut D is L and
 not XL. The reason to defer it is not difficulty; it is that **nothing we
 currently want to serve needs it.**
+
+---
+
+## 9. Cut A as built (#390) — the instrument, not yet the number
+
+`python/sglang/srt/layers/moe/expert_stats.py`, wired into
+`MoEExpertOffloadCache`. Desk work only: **no card time was spent, so §4's
+hit-rate row is still empty.** What exists now is the way to fill it.
+
+**Where it hooks.** `MoEExpertOffloadCache.run_waves`, immediately after
+`ids_list = topk_ids.tolist()`. That is the fetch-decision point: the routing
+is already on the host (the device→host sync the eager offload path pays
+regardless) and the resident set is already known
+(`planner.resident_ids` / `resident_count`). The instrument therefore adds **no
+device synchronization, no kernel-side counters, no extra tensor traffic** —
+it folds a list the path already holds into two host-side tallies.
+
+**What is counted, per layer:**
+
+| | |
+| --- | --- |
+| expert-activation histogram | which expert was chosen how often (the peakedness input) |
+| activation-grain hit/miss | each expert weighted by the tokens that routed to it — WASTE's 14 % is this grain |
+| unique-grain hit/miss | each expert once per forward — what the offload actually fetches |
+| peakedness | normalized entropy (1.0 = flat router, no resident set can help) plus top-1/8/16/32 activation share |
+| residency | the planner's existing `ResidencyStats` (fetches, waves, H2D bytes) folded into the same dump |
+
+**Gating.** Off by default; the counter object is not even constructed, so the
+offload path costs one `is not None` test. The env is parsed once, at collector
+construction — never per call.
+
+**Dump.** JSON to `<prefix>.<rank_tag>.json` on process exit (`atexit`), on
+`SIGTERM`/`SIGINT` (which `atexit` misses), on **`SIGUSR2` — dump and continue**,
+so a long run can be sampled without stopping it, and optionally on an
+interval. Signal handlers follow the `multi_ended_allocator` convention: only
+installed over `SIG_DFL`.
+
+**Known blind spot.** Captured decode under `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`
+takes the host-sync-free `prepare_capturable` path and is **not** counted —
+counting it would need exactly the sync that path exists to avoid. The dump
+flags this per layer (`graph_mode_uncounted_decode`). For a clean measurement,
+run the offload's default eager path.
+
+**Ride-along recipe for the next MoE window** (the offload's own flags are
+unchanged; these three are added):
+
+```
+SGLANG_EXPERT_STATS=1
+SGLANG_EXPERT_STATS_PATH=/tmp/expert_stats_<model>_<fraction>
+SGLANG_EXPERT_STATS_INTERVAL_SEC=0      # 0 = exit/SIGUSR2 only
+```
+
+Each TP rank writes its own file (`...tp0ep0.json`, `...tp1ep0.json`, ...).
+Read `totals.hit_rate` against WASTE's 0.14, and
+`layers[].peakedness.top{8,16,32}_share` against the resident fraction actually
+configured — that pair is what decides #126 and the §6 cut-D question.

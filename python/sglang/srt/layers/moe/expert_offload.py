@@ -835,6 +835,30 @@ class MoEExpertOffloadCache:
                 "layout must be frozen BEFORE graph capture. Supply "
                 "SGLANG_MOE_HOTSET_FILE or use static residency."
             )
+
+        # --- #390 router / residency instrument -----------------------------
+        # Opt-in (SGLANG_EXPERT_STATS=1). Resolved ONCE here: on the default
+        # path this stays None and run_waves pays a single `is not None` test.
+        from sglang.srt.layers.moe.expert_stats import get_collector, maybe_layer_stats
+
+        self._router_stats = maybe_layer_stats(
+            layer_id=getattr(layer, "layer_id", None),
+            num_experts=self.num_local_experts,
+            resident_count=self.resident_count,
+            rank_tag=(
+                f"tp{getattr(layer, 'moe_tp_rank', 0)}"
+                f"ep{getattr(layer, 'moe_ep_rank', 0)}"
+            ),
+            graph_mode=self._graph_mode,
+        )
+        self._stats_collector = None
+        if self._router_stats is not None:
+            # Hand the planner's own fetch/H2D tally to the dump so the routing
+            # histogram and what the offload actually paid for it land in one
+            # file instead of two places.
+            self._router_stats.residency = self.planner.stats
+            self._stats_collector = get_collector()
+
         self._capturable_ready = False
         self._cap_resident_slot_lut = None  # int32[E] device
         self._cap_is_spill = None  # bool[E] device
@@ -1193,6 +1217,18 @@ class MoEExpertOffloadCache:
             return apply_fn(dispatch_output)
 
         ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+
+        # #390: fold this forward's routing decision into the per-layer expert
+        # histogram and the hit/miss tally against the resident set. This is the
+        # fetch-decision point -- residency is already known here and the ids
+        # are already on the host, so the instrument adds no device sync. Taken
+        # BEFORE any hot-set freeze below, so an activation is attributed to the
+        # residency that was actually in force when it was routed.
+        if self._router_stats is not None:
+            self._router_stats.record(
+                ids_list, self.planner.resident_ids, self.resident_count
+            )
+            self._stats_collector.maybe_dump_periodic()
 
         # Stage-1 hot residency: accumulate routing counts, then freeze the R
         # hottest experts (physical rearrange) once calibration is complete. Done
