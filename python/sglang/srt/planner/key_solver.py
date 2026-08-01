@@ -1444,6 +1444,31 @@ def _energy_objective_value(
     )
 
 
+def _energy_unscorable_reason(goal: str, energy_model) -> Optional[str]:
+    """Why this request cannot be priced in joules, or ``None`` if it can.
+
+    The Rate.absent discipline at solver scope: an energy plan that cannot be
+    priced is a NAMED absence the caller sees, never a throughput plan handed
+    back under an energy label.
+    """
+    if goal not in ENERGY_PRICEABLE_GOALS:
+        return (
+            f"--objective energy cannot price the {GOAL_LABELS.get(goal, goal)} "
+            f"goal: its per-rank terms are BYTES, not seconds, so there is no "
+            f"joule in them. Energy-priceable goals: "
+            f"{', '.join(ENERGY_PRICEABLE_GOALS)}."
+        )
+    if energy_model is None:
+        return (
+            "--objective energy needs per-card power anchors and none were "
+            "supplied: pass an EnergyModel built from the NVML power "
+            "calibration (measured) or from the card library's TDP "
+            "(estimate). Planning by throughput under an energy objective "
+            "would be a silent substitution, so the solve is refused instead."
+        )
+    return None
+
+
 def solve_energy_units(
     goal: str,
     model: KeyCostModel,
@@ -2519,8 +2544,15 @@ def solve(
     search_roles: bool = True,
     front_size: int = 5,
     unit_bounds: Optional[Sequence[UnitBound]] = None,
+    objective: str = "throughput",
+    energy_model=None,
 ) -> SolverAnswer:
     """Compute the key.
+
+    ``objective="energy"`` (#350) makes the SINGLE-goal mode minimise J/work
+    instead of maximising the goal, using ``energy_model`` (per-card power
+    anchors). Defaults to ``"throughput"``, which leaves every code path
+    below byte-identical to before #350.
 
     ``goal`` alone      -> one candidate, the closed-form optimum.
     ``goal`` + ``constraints`` -> the constrained optimum (§4a).
@@ -2532,6 +2564,22 @@ def solve(
         raise ValueError(f"unknown goal {goal!r}; known: {GOALS}")
     if goal_b is not None and goal_b not in GOALS:
         raise ValueError(f"unknown goal {goal_b!r}; known: {GOALS}")
+
+    from sglang.srt.planner.objective import Objective
+
+    objective_is_energy = Objective(str(objective)) is Objective.ENERGY
+    if objective_is_energy and (goal_b is not None or constraints):
+        # Refuse rather than reinterpret: a front over two throughput goals
+        # and a constrained throughput optimum are not energy questions, and
+        # answering them with an energy argmax would hand back something the
+        # caller did not ask for. Named, not silent.
+        raise ValueError(
+            "--objective energy applies to the single-goal solve; it cannot "
+            "be combined with a second goal (Pareto front) or with "
+            "constraints, because those select among THROUGHPUT axes. Solve "
+            "the front on the throughput objective, or ask for the energy "
+            "optimum of one goal."
+        )
 
     model = build_cost_model(plan_inputs, base_plan, budgets_mib, rates)
     n = model.perf.tp_size
@@ -2640,6 +2688,102 @@ def solve(
 
     def score(c: Candidate, g: str) -> float:
         return value_of(c, g) if c.feasible else -math.inf
+
+    # -- #350 phase 3: the ENERGY objective takes over the single-goal pick --
+    #
+    # Only the single-goal mode dispatches. A Pareto front over two GOALS and
+    # a constrained optimum are questions about the throughput axes; answering
+    # either of them with an energy argmax would silently change what the
+    # caller asked for, so those modes refuse energy below rather than
+    # reinterpret it.
+    if objective_is_energy and goal_b is None and not constraints:
+        unscorable = _energy_unscorable_reason(goal, energy_model)
+        if unscorable is not None:
+            # The explicit report, never a silent throughput fallback: the
+            # caller asked to optimise joules and we cannot price them, so
+            # the answer is a named absence, not a plan from the other axis.
+            return SolverAnswer(
+                ok=False,
+                goal=goal,
+                goal_b=None,
+                mode="energy",
+                candidates=[],
+                reference=reference,
+                caveats=caveats,
+                reasons=[unscorable],
+                rates=rates,
+                model_units=model.units,
+                target_context=target_context,
+                anchors=anchors,
+            )
+        best_e: Optional[Candidate] = None
+        best_j = math.inf
+        for rset, got in best_by_role.items():
+            vec = solve_energy_units(
+                goal,
+                model,
+                rset,
+                energy_model,
+                unit_bounds=unit_bounds,
+                anchor_vectors=list(got.values()),
+            )
+            if vec is None:
+                continue
+            cand = evaluate(vec, rset)
+            if not cand.feasible:
+                continue
+            _, _, post = _role_bounds(rset, model.units, unit_bounds)
+            j = _energy_objective_value(goal, model, vec, post, energy_model)
+            if j < best_j:
+                best_e, best_j = cand, j
+        if best_e is None:
+            return SolverAnswer(
+                ok=False,
+                goal=goal,
+                goal_b=None,
+                mode="energy",
+                candidates=[],
+                reference=reference,
+                caveats=caveats,
+                reasons=[
+                    "no feasible key under the energy objective: every role "
+                    "assignment either has no representable split or leaves a "
+                    "rank without a usable KV pool"
+                ],
+                rates=rates,
+                model_units=model.units,
+                target_context=target_context,
+                anchors=anchors,
+            )
+        prov = energy_model.provenance.value
+        best_e.label = (
+            f"energy optimum for {GOAL_LABELS[goal]} "
+            f"({best_j:.4g} J/work, {prov} power anchors)"
+        )
+        best_e.tradeoff = _tradeoff(
+            best_e.raw, reference.raw, best_e.predictions, best_e.roles
+        )
+        caveats.append(
+            f"--objective energy: the key minimises J/work for "
+            f"{GOAL_LABELS[goal]} ({best_j:.4g} J/work, {prov} power "
+            f"anchors), NOT {GOAL_LABELS[goal]} itself. The throughput "
+            f"optimum is a different key on a heterogeneous rig; the "
+            f"trade-off line shows what this one gives up."
+        )
+        return SolverAnswer(
+            ok=True,
+            goal=goal,
+            goal_b=None,
+            mode="energy",
+            candidates=[best_e],
+            reference=reference,
+            caveats=caveats,
+            reasons=[],
+            rates=rates,
+            model_units=model.units,
+            target_context=target_context,
+            anchors=anchors,
+        )
 
     if goal_b is None and not constraints:
         best: Optional[Candidate] = None

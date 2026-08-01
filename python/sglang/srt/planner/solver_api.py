@@ -121,6 +121,31 @@ def _card_probe_remedy() -> dict:
     ).to_json()
 
 
+def _energy_model_from_payload(anchors):
+    """Build an ``EnergyModel`` from the request's power anchors, or ``None``.
+
+    ``anchors`` is a per-rank list of ``{"idle_w":, "active_w":, "source":}``
+    (source "measured" for NVML-calibrated cards, "estimate-tdp" otherwise --
+    the same two-tier labelling ``roofline.CardEnergy`` uses). ``None`` or an
+    empty list means "no anchors supplied", which the solver reports as an
+    unscorable energy request rather than filling in.
+    """
+    if not anchors:
+        return None
+    from sglang.srt.planner.objective import EnergyModel, RankPower
+
+    return EnergyModel(
+        per_rank=tuple(
+            RankPower(
+                idle_w=float(a["idle_w"]),
+                active_w=float(a["active_w"]),
+                source=str(a.get("source") or "estimate-tdp"),
+            )
+            for a in anchors
+        )
+    )
+
+
 def key_solver_payload(payload: Optional[dict] = None) -> dict:
     """``POST /api/key_solver`` — the distribution key, computed.
 
@@ -265,6 +290,12 @@ def key_solver_payload(payload: Optional[dict] = None) -> dict:
             constraints=constraints or None,
             target_context=int(p.get("target_context") or 8192),
             roles=(list(p["roles"]) if p.get("roles") else None),
+            # #350 phase 3: the objective axis. Absent/"throughput" keeps the
+            # call byte-identical; "energy" needs power anchors, which the
+            # caller supplies (or the solve is refused with a named reason
+            # rather than answered from the throughput axis).
+            objective=str(p.get("objective") or "throughput"),
+            energy_model=_energy_model_from_payload(p.get("power_anchors")),
         )
     except (ValueError, KeyError, OSError) as e:
         return {"ok": False, "reasons": [str(e)]}
