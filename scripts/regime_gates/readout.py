@@ -147,6 +147,7 @@ def completeness(trace: Dict) -> Dict:
             "between the first verdict and the last"
         ),
         "ranks": len(by_rank),
+        "rank_ids": sorted(str(r) for r in by_rank),
     }
 
 
@@ -177,6 +178,7 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
     all_regimes: List[str] = []
     endings: List[str] = []
     rank_count = 0
+    rank_ids: set = set()
     for t in traces:
         # FACTS FIRST, judgement second. This loop used to `continue` past a
         # missing summary, so a trace holding 93 603 verdicts was reported as
@@ -185,6 +187,12 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
         # this whole tool exists to avoid (2026-08-01 window).
         all_regimes.extend(regime_transitions(t["verdicts"]))
         comp = completeness(t)
+        # UNION across files, not the max of each. Three per-rank files each
+        # carry one rank, and taking the max reported 1 rank for a 3-rank
+        # boot -- the check then refused a complete group record. One
+        # interleaved file still reports its own multiplicity, so both
+        # layouts add up correctly.
+        rank_ids.update(comp.get("rank_ids") or [])
         rank_count = max(rank_count, comp.get("ranks", 0))
         if t["summary"] is not None:
             endings.append(f"{os.path.basename(t['path'])}: clean summary")
@@ -241,6 +249,7 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
             f"disagreement under an actuator is the #94/#194/#259 hang."
         )
 
+    rank_count = max(rank_count, len(rank_ids))
     if rank_count and rank_count < expect_ranks:
         problems.append(
             f"the traces carry {rank_count} rank(s) for a {expect_ranks}-rank "
