@@ -535,41 +535,61 @@ class PerfCalibration:
 
 
 def _nvml_gpu_inventory() -> Tuple[List[dict], str]:
-    """Per-CUDA-device {uuid, name, total_mib} (CUDA enumeration order,
-    bridged to NVML via PCI bus ids like server_args does) + driver version."""
+    """Per-CUDA-device {uuid, name, total_mib} in CUDA enumeration order,
+    plus the driver version.
+
+    Card identity comes from the #331 identity map (#397), which keys on the
+    NVML UUID and bridges CUDA ordinal <-> NVML index over the PCI BDF. This
+    used to bridge through ``server_args._torch_to_nvml_gpu_index_mapping``
+    and fill any gap with ``mapping.get(cuda_idx, cuda_idx)`` -- the identity
+    substitution that names the wrong card on exactly the rigs the bridge
+    exists for. The whole rig now resolves or the probe refuses: this
+    inventory keys the hardware profile cache, so one misattributed card
+    would persist a profile that describes a different machine.
+    """
     import pynvml
     import torch
 
-    from sglang.srt.server_args import _torch_to_nvml_gpu_index_mapping
+    from sglang.srt.registry import nvml as registry_nvml
 
-    mapping = _torch_to_nvml_gpu_index_mapping()
+    imap = registry_nvml.identity_map(allow_cuda_init=True)
+    placed = sorted(
+        (c for c in imap if c.cuda_ordinal is not None),
+        key=lambda c: c.cuda_ordinal,
+    )
+    # The probe describes the cards CUDA hands it, so a card CUDA can see and
+    # the map cannot place is the refusal case -- NVML cards masked out of
+    # this process are not (they are none of the probe's business).
+    visible = torch.cuda.device_count()
+    if len(placed) != visible:
+        raise registry_nvml.DeviceOrderUnresolvedError(
+            f"the hardware micro-probe inventory: torch sees {visible} CUDA "
+            f"device(s) but the identity map placed {len(placed)}, so at "
+            "least one card cannot be named. Refusing to guess: this "
+            "inventory keys the hardware profile cache, and one misattributed "
+            f"card persists a profile of a different machine (#397). "
+            f"Reason: {registry_nvml.cuda_bridge_diagnosis()}. Cards "
+            "present:\n" + (imap.describe() or "  (no NVML devices)")
+        )
+
     pynvml.nvmlInit()
     try:
         driver = pynvml.nvmlSystemGetDriverVersion()
         if isinstance(driver, bytes):
             driver = driver.decode()
-        gpus = []
-        for cuda_idx in range(torch.cuda.device_count()):
-            nvml_idx = mapping.get(cuda_idx, cuda_idx)
-            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
-            uuid = pynvml.nvmlDeviceGetUUID(handle)
-            if isinstance(uuid, bytes):
-                uuid = uuid.decode()
-            name = pynvml.nvmlDeviceGetName(handle)
-            if isinstance(name, bytes):
-                name = name.decode()
-            total_mib = pynvml.nvmlDeviceGetMemoryInfo(handle).total // 2**20
-            gpus.append(
-                {
-                    "cuda_index": cuda_idx,
-                    "uuid": uuid,
-                    "name": name,
-                    "total_mib": total_mib,
-                }
-            )
-        return gpus, driver
     finally:
         pynvml.nvmlShutdown()
+
+    gpus = [
+        {
+            "cuda_index": card.cuda_ordinal,
+            "uuid": card.uuid,
+            "name": card.name,
+            "total_mib": card.total_mib,
+        }
+        for card in placed
+    ]
+    return gpus, driver
 
 
 def profile_cache_path(

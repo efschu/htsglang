@@ -873,32 +873,33 @@ class EnergyHarness:
 
 
 def _norm_uuid(u) -> str:
+    """Any GPU-UUID spelling -> plain lowercase hex, so the torch, NVML and
+    nvidia-smi forms compare. Shared with ``live_metrics``, which imports it
+    from here. Identity normalisation only -- the CUDA <-> NVML bridge itself
+    lives in ``registry.nvml`` (#397)."""
     s = u.decode() if isinstance(u, bytes) else str(u)
     return "".join(ch for ch in s.lower() if ch in "0123456789abcdef")
 
 
 def _torch_to_nvml_index() -> Dict[int, int]:
-    """{torch_cuda_index: nvml_index} matched by GPU UUID. The runtime places
-    ranks in torch.cuda order (5090 first here, FASTEST_FIRST) while NVML/
-    nvidia-smi enumerate by PCI bus (5090 at index 1 on this rig) — the
-    device-order trap. UUID matching is order-independent. Identity fallback."""
-    import pynvml
+    """{CUDA ordinal: NVML index}, resolved by the #331 identity map.
 
-    pynvml.nvmlInit()
-    nvml_by_uuid = {}
-    for i in range(pynvml.nvmlDeviceGetCount()):
-        h = pynvml.nvmlDeviceGetHandleByIndex(i)
-        nvml_by_uuid[_norm_uuid(pynvml.nvmlDeviceGetUUID(h))] = i
-    mapping: Dict[int, int] = {}
-    try:
-        import torch
+    The runtime places ranks in torch.cuda order (5090 first here,
+    FASTEST_FIRST) while NVML/nvidia-smi enumerate by PCI bus (5090 at index
+    1 on this rig) -- the device-order trap.
 
-        for i in range(torch.cuda.device_count()):
-            uu = getattr(torch.cuda.get_device_properties(i), "uuid", None)
-            mapping[i] = nvml_by_uuid.get(_norm_uuid(uu), i) if uu else i
-    except Exception:
-        pass
-    return mapping
+    This was a fourth local copy of that bridge until #397. Its UUID matching
+    was order-independent and therefore usually right, but it ended in
+    ``nvml_by_uuid.get(uuid, i)``: an identity substitution whenever torch
+    could not report a card's UUID, which is the trap re-entered silently in
+    the one case the bridge exists for. Resolution goes through
+    ``registry.nvml`` now, whose partial map omits what it cannot place
+    instead of filling it in -- the caller below already handles a missing
+    entry by naming the rank in its notes.
+    """
+    from sglang.srt.registry.nvml import cuda_to_nvml_index_map
+
+    return cuda_to_nvml_index_map(allow_cuda_init=True)
 
 
 def _compute_share_by_nvml(cfg, gpu_names, notes) -> Optional[List[float]]:
@@ -917,12 +918,20 @@ def _compute_share_by_nvml(cfg, gpu_names, notes) -> Optional[List[float]]:
         t2n = {}
     per = [0.0] * len(gpu_names)
     for r, torch_dev in enumerate(ids):
-        nvml_idx = t2n.get(torch_dev, torch_dev)
-        if 0 <= nvml_idx < len(per):
+        # No identity fallback (#397): a CUDA ordinal the map cannot place
+        # gets its share left unattributed and said so, because adding it to
+        # the NVML card of the same number attributes this rank's work to a
+        # different physical card.
+        nvml_idx = t2n.get(torch_dev)
+        if nvml_idx is None:
+            notes.append(
+                f"compute-share: rank {r} cuda:{torch_dev} could not be "
+                "resolved to a physical card; share unattributed.")
+        elif 0 <= nvml_idx < len(per):
             per[nvml_idx] += ratio[r] / total
         else:
             notes.append(
-                f"compute-share: rank {r} torch dev {torch_dev} -> NVML "
+                f"compute-share: rank {r} cuda:{torch_dev} -> NVML "
                 f"{nvml_idx} out of range; share unattributed.")
     return per
 

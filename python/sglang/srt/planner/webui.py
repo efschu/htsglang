@@ -129,8 +129,8 @@ def detect_hardware() -> dict:
     ``index`` is the NVML/PCI-bus index (telemetry space); ``cuda_index`` is
     the SAME card's CUDA-order index — the space every engine flag
     (--rank-gpu-id / --base-gpu-id) is interpreted in. ``cuda_index_source``
-    is "torch" (exact UUID bridge) or "heuristic" (FASTEST_FIRST emulation;
-    the UI must say so), or None when unbridged.
+    is "identity-map" (the #331 UUID/BDF resolver) or None when the order
+    could not be resolved -- then ``cuda_index`` is None too (#397).
 
     ``pcie_gen``/``pcie_width`` (current link train, from
     ``hardware_from_nvml``) were computed here all along but dropped on the
@@ -364,8 +364,9 @@ def _cards_hardware_and_reserve(hw):
     are planned; they are re-indexed 0..k-1 -- and those positions ARE the
     ``--rank-gpu-id`` space, i.e. CUDA enumeration order, NOT NVML/nvidia-smi
     order (the client posts detected cards sorted by their bridged
-    cuda_index; see planner.device_map). ``virtual`` cards (hypothetical/
-    future GPUs the user typed) are treated identically — the whole point of
+    cuda_index; resolved through registry.nvml.IdentityMap). ``virtual``
+    cards (hypothetical/future GPUs the user typed) are treated identically
+    — the whole point of
     an offline planner. Returns ``(HardwareSpec, reserve_mib_list_or_None)``."""
     from sglang.srt.planner import hardware as hwmod
 
@@ -962,7 +963,7 @@ def landscape_from_payload(payload: dict) -> dict:
 def gpu_state_payload() -> dict:
     """Live per-card power-state tags (#149 Ebene-4 refresh button). Cards
     are NVML-sampled (nvml_index); each row is additionally annotated with
-    the card's CUDA-order index via the device_map bridge so the UI can
+    the card's CUDA-order index via the #331 identity map so the UI can
     label both spaces."""
     from sglang.srt.planner.energy import read_gpu_power_states
 
@@ -8089,12 +8090,15 @@ let HOST_RAM_MIB = null;
 // cuda_index -> nvml_index (for dual labels wherever only cuda is known),
 // maintained from the detect payload and the live snapshot.
 window._cudaNvml = {};
-window._cudaMapHeuristic = false;
+// #397: there is no third, guessed state. A card either has a resolved
+// cuda_index or none at all, so "unresolved" is read off the cards
+// themselves rather than off a source label.
+window._cudaMapUnresolved = false;
 function noteCudaMap(gpus, source){
   for (const g of (gpus||[]))
     if (g.cuda_index != null)
       window._cudaNvml[g.cuda_index] = (g.nvml_index != null ? g.nvml_index : g.index);
-  if (source === 'heuristic') window._cudaMapHeuristic = true;
+  if ((gpus||[]).some(g => g.cuda_index == null)) window._cudaMapUnresolved = true;
 }
 // Dual-space device label: 'cuda:0 / nvml:1' (either half degrades alone).
 function devLabel(cudaIdx, nvmlIdx){
@@ -8102,7 +8106,7 @@ function devLabel(cudaIdx, nvmlIdx){
   if (cudaIdx != null && nvmlIdx == null && window._cudaNvml[cudaIdx] != null)
     nvmlIdx = window._cudaNvml[cudaIdx];
   const parts = [];
-  if (cudaIdx != null) parts.push('cuda:'+cudaIdx+(window._cudaMapHeuristic?'?':''));
+  if (cudaIdx != null) parts.push('cuda:'+cudaIdx);
   if (nvmlIdx != null) parts.push('nvml:'+nvmlIdx);
   return parts.join(' / ');
 }
@@ -8128,8 +8132,10 @@ async function detectGPUs() {
     noteCudaMap(d.gpus, d.cuda_index_source);
     $('detect_note').className = 'muted';
     $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml')
-      +(d.cuda_index_source==='heuristic'
-        ? ' — cuda indices are a FASTEST_FIRST emulation (no torch bridge), marked "?"'
+      +((d.gpus||[]).some(g=>g.cuda_index==null)
+        ? ' — cuda indices unresolved for some cards (no CUDA order visible '
+          +'to this process); --base-gpu-id / --rank-gpu-id cannot be pinned '
+          +'for them'
         : '');
   } else {
     $('detect_note').className = 'muted';
@@ -10718,9 +10724,9 @@ async function renderLandingPlacement(s){
   // without the flag) is CUDA-order, while s.gpus is NVML-sampled. Keying
   // by nvml_index attributed rank 0 (= cuda:0, the 5090 on this rig) to
   // the 3080 sitting at nvml:0. cuda_index comes from the snapshot's
-  // device_map bridge; an unbridged card falls back to nvml_index (labeled
+  // #331 identity map; an unresolved card falls back to nvml_index (labeled
   // ambiguity beats a dropped card).
-  noteCudaMap(s.gpus, (s.gpus||[]).some(g=>g.cuda_index_source==='heuristic')?'heuristic':null);
+  noteCudaMap(s.gpus, null);
   const ct={},cn={};
   (s.gpus||[]).forEach(g=>{ const k=(g.cuda_index!=null?g.cuda_index:g.nvml_index);
     ct[k]=g.mem_total_mib; cn[k]=g.name; });

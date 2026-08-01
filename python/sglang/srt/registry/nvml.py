@@ -47,6 +47,19 @@ class DeviceNotFoundError(LookupError):
     """A requested device identity does not match any NVML device."""
 
 
+class DeviceOrderUnresolvedError(RuntimeError):
+    """The CUDA order of the present cards is not knowable in this process.
+
+    Raised instead of inventing one (#397). Every historical instance of the
+    device-order family -- the torch-vs-NVML memory read, runbook 6.1, the
+    #331 audit, #349 sweep-3 arm L / #392 -- is a piece of code that answered
+    "which card is index i" without being able to know, and was believed. A
+    caller that cannot get a bridge has exactly two honest options: leave the
+    CUDA-space value unset, or refuse. Both need this error to carry WHAT
+    could not be placed and WHY, which is what the message does.
+    """
+
+
 @dataclass(frozen=True)
 class DeviceInfo:
     """One physical GPU as NVML sees it.
@@ -472,6 +485,40 @@ class IdentityMap:
             )
         return card.cuda_ordinal
 
+    # -- the CUDA side, all-or-nothing (#397) ------------------------------
+
+    @property
+    def unbridged(self) -> tuple[CardIdentity, ...]:
+        """Cards whose CUDA ordinal this process could not determine."""
+        return tuple(c for c in self.cards if c.cuda_ordinal is None)
+
+    def require_cuda_ordinals(self, context: str) -> dict[str, int]:
+        """``{uuid: CUDA ordinal}`` for EVERY card, or a named error.
+
+        All-or-nothing on purpose. A partial bridge is worse than none: the
+        caller fills the gaps with the number it already has -- the NVML
+        index, or the list position -- and that silent substitution is the
+        whole device-order defect family. ``context`` names the caller so the
+        message says which decision was refused, not just that one was.
+        """
+        missing = self.unbridged
+        if missing:
+            raise DeviceOrderUnresolvedError(
+                f"{context}: the CUDA enumeration order of "
+                f"{len(missing)} of {len(self.cards)} card(s) could not be "
+                "resolved, so no CUDA-space index can be produced for them. "
+                "Unplaced:\n  "
+                + "\n  ".join(c.describe() for c in missing)
+                + f"\nReason: {cuda_bridge_diagnosis()}"
+            )
+        return {c.uuid: int(c.cuda_ordinal) for c in self.cards}
+
+    def cuda_to_nvml(self, context: str) -> dict[int, int]:
+        """``{CUDA ordinal: NVML index}``, the bridge in the direction the
+        engine flags need it. Same all-or-nothing contract."""
+        self.require_cuda_ordinals(context)
+        return {int(c.cuda_ordinal): c.nvml_index for c in self.cards}
+
     # -- legacy migration --------------------------------------------------
 
     def adopt_legacy_indices(
@@ -578,6 +625,44 @@ def _cuda_ordinals_by_bus(allow_cuda_init: bool = False) -> dict[str, int]:
         return {}
 
 
+def cuda_bridge_diagnosis() -> str:
+    """One sentence naming why the CUDA side of the map may be missing.
+
+    Called only on the failure path, to turn "unresolved" into something the
+    operator can act on. Never raises: a diagnosis that itself blows up would
+    replace the real error with its own.
+    """
+    try:
+        import torch  # noqa: PLC0415 - failure-path only
+    except ImportError:
+        return (
+            "torch is not importable in this process, and only torch can "
+            "report the CUDA enumeration order"
+        )
+    try:
+        if not torch.cuda.is_available():
+            return "torch reports no CUDA device in this process"
+        if not torch.cuda.is_initialized():
+            return (
+                "no CUDA context exists in this process and the caller did "
+                "not pass allow_cuda_init=True, so the CUDA order was not "
+                "queried (creating a context costs VRAM on every visible card)"
+            )
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            return (
+                f"CUDA_VISIBLE_DEVICES={visible!r} masks part of the rig, so "
+                "torch cannot place the cards it does not see"
+            )
+        return (
+            f"torch sees {torch.cuda.device_count()} device(s) but none of "
+            "them could be matched to an NVML card by PCI bus id (this torch "
+            "build may not expose pci_bus_id on device properties)"
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnosis must never mask the error
+        return f"the CUDA side could not be inspected ({exc})"
+
+
 def identity_map(
     devices: Sequence[DeviceInfo] | None = None,
     cuda_ordinals_by_bus: dict[str, int] | None = None,
@@ -616,6 +701,32 @@ def identity_map(
             for info in infos
         ]
     )
+
+
+def cuda_to_nvml_index_map(*, allow_cuda_init: bool = True) -> dict[int, int]:
+    """``{CUDA ordinal: NVML index}`` for the cards this process can place.
+
+    The lenient form of :meth:`IdentityMap.cuda_to_nvml`, and the single
+    delegation target of the deprecated bridges kept for their existing
+    callers (#397). ``{}`` when the map cannot be built at all or when torch
+    places no card -- which every one of those callers already treats as
+    "no bridge". It is partial by construction, so a caller that must not
+    substitute an index for a missing entry uses the strict form instead.
+    """
+    try:
+        imap = identity_map(allow_cuda_init=allow_cuda_init)
+    except Exception as exc:  # noqa: BLE001 - callers degrade, they do not crash
+        logger.warning(
+            "CUDA -> NVML index bridge unavailable (%s); %s",
+            exc,
+            cuda_bridge_diagnosis(),
+        )
+        return {}
+    return {
+        int(c.cuda_ordinal): c.nvml_index
+        for c in imap
+        if c.cuda_ordinal is not None
+    }
 
 
 def _main(argv: list[str] | None = None) -> int:

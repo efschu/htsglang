@@ -459,89 +459,65 @@ def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
         ) from e
 
 
+# DEPRECATED BRIDGE (#397) -- do not call from new code.
+#
+# Card identity has ONE source of truth: sglang.srt.registry.nvml.IdentityMap
+# (#331), which keys cards on their NVML UUID and bridges CUDA ordinal <->
+# NVML index <-> PCI BDF. This function used to build its own PCI-bus bridge,
+# which is how three separately-maintained bridges came to exist for one
+# question; #397 collapsed them. It survives only as a delegating shell for
+# the callers that still take a plain ``{cuda: nvml}`` dict
+# (disaggregation/topology.py, model_loader/hibernate.py). New callers use
+# IdentityMap directly, and callers that must not substitute an index for an
+# unresolved card use ``IdentityMap.require_cuda_ordinals`` instead of this.
 def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
-    """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
+    """DEPRECATED (#397): CUDA device index -> NVML physical index.
 
-    torch.cuda/CUDA_VISIBLE_DEVICES and NVML/nvidia-smi can enumerate GPUs
-    in different orders (CUDA defaults to FASTEST_FIRST, NVML to PCI bus
-    order), so NVML memory queries must not blindly reuse CUDA indices.
-    Returns {} when the mapping cannot be resolved (no CUDA support);
-    callers then fall back to identity.
+    Thin shell over ``registry.nvml.cuda_to_nvml_index_map``. Keeps the old
+    contract its remaining callers were written against: ``{}`` when the
+    bridge cannot be built, and a PARTIAL map when only some cards can be
+    placed. Both of those are traps, which is why nothing new should adopt
+    them -- see the module note above.
     """
-    try:
-        import pynvml
-        import torch
+    from sglang.srt.registry import nvml as registry_nvml
 
-        if not torch.cuda.is_available():
-            return {}
-        pynvml.nvmlInit()
-        try:
-            nvml_bus_to_idx: Dict[int, int] = {}
-            for nvml_idx in range(pynvml.nvmlDeviceGetCount()):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
-                bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
-                if isinstance(bus_id, bytes):
-                    bus_id = bus_id.decode("utf-8")
-                # Extract the bus number (format: "00000000:BB:00.0").
-                bus_num = int(bus_id.split(":")[1], 16)
-                nvml_bus_to_idx[bus_num] = nvml_idx
-
-            mapping: Dict[int, int] = {}
-            for torch_idx in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(torch_idx)
-                bus_num = getattr(props, "pci_bus_id", None)
-                if bus_num in nvml_bus_to_idx:
-                    mapping[torch_idx] = nvml_bus_to_idx[bus_num]
-            return mapping
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.warning(
-            "Could not resolve the CUDA -> NVML device index mapping (%s); "
-            "assuming identical enumeration orders.",
-            e,
-        )
-        return {}
+    return registry_nvml.cuda_to_nvml_index_map(allow_cuda_init=True)
 
 
 def _query_gpu_total_mib(gpu_ids, flag: str) -> Dict[int, int]:
     """NVML TOTAL MiB per CUDA device index, refusing to guess the identity.
 
-    Task #336. The strict sibling of ``_query_rank_gpu_memory_mib``: where
-    that one falls back to identity when the CUDA -> NVML bridge cannot be
-    built (the ``--rank-gpu-id`` path names physical ids, so identity is the
-    documented meaning there), this one is used by callers who must read the
-    total of the card a PROCESS is actually running on. Guessing there is the
-    defect it exists to prevent, so an unresolvable device is an error.
+    Task #336, resolved through the #331 identity map since #397. This is
+    used by callers who must read the total of the card a PROCESS is actually
+    running on; guessing there is the defect it exists to prevent, so a CUDA
+    ordinal the map cannot place is an error rather than a fallback to the
+    NVML index of the same number.
     """
-    import pynvml
+    from sglang.srt.registry import nvml as registry_nvml
 
-    mapping = _torch_to_nvml_gpu_index_mapping()
-    if not mapping:
+    try:
+        imap = registry_nvml.identity_map(allow_cuda_init=True)
+    except Exception as e:
         raise ValueError(
             f"{flag} needs the NVML identity of this process's CUDA "
-            "device(s), but the CUDA -> NVML index mapping could not be "
-            "resolved. Refusing to guess: reading the wrong card sizes the "
-            "KV pool against the wrong total (#336)."
-        )
-    pynvml.nvmlInit()
-    try:
-        device_count = pynvml.nvmlDeviceGetCount()
-        totals: Dict[int, int] = {}
-        for gpu_id in sorted(set(gpu_ids)):
-            nvml_idx = mapping.get(gpu_id)
-            if nvml_idx is None or not 0 <= nvml_idx < device_count:
-                raise ValueError(
-                    f"{flag} could not resolve CUDA device {gpu_id} to an "
-                    f"NVML device (NVML reports {device_count}). Refusing to "
-                    "guess: reading the wrong card sizes the KV pool against "
-                    "the wrong total (#336)."
-                )
-            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
-            totals[gpu_id] = pynvml.nvmlDeviceGetMemoryInfo(handle).total // 2**20
-        return totals
-    finally:
-        pynvml.nvmlShutdown()
+            f"device(s), but the identity map could not be built ({e}). "
+            "Refusing to guess: reading the wrong card sizes the KV pool "
+            "against the wrong total (#336)."
+        ) from e
+
+    totals: Dict[int, int] = {}
+    for gpu_id in sorted(set(int(g) for g in gpu_ids)):
+        card = imap.by_cuda_ordinal(gpu_id)
+        if card is None:
+            raise ValueError(
+                f"{flag} could not resolve CUDA device {gpu_id} to an NVML "
+                f"device. Refusing to guess: reading the wrong card sizes the "
+                f"KV pool against the wrong total (#336). "
+                f"{registry_nvml.cuda_bridge_diagnosis()}. Cards present:\n"
+                + (imap.describe() or "  (no NVML devices)")
+            )
+        totals[gpu_id] = card.total_mib
+    return totals
 
 
 @dataclasses.dataclass(frozen=True)

@@ -62,9 +62,10 @@ class GpuDescriptor:
     enumeration index for source="nvml" specs (list position for manual/json
     specs). The ENGINE flags (``--rank-gpu-id`` / ``--base-gpu-id``) live in
     CUDA enumeration order (FASTEST_FIRST) instead, which diverges from NVML
-    order on mixed rigs -- that is ``cuda_index``, bridged per UUID/heuristic
-    by ``planner.device_map`` (None when no bridge is available, e.g. manual
-    specs for another host)."""
+    order on mixed rigs -- that is ``cuda_index``, resolved per UUID against
+    the #331 identity map (None when it cannot be resolved: manual specs for
+    another host, or a rig whose CUDA order this process cannot see -- never
+    a guessed value, #397)."""
 
     index: int
     name: str
@@ -75,7 +76,7 @@ class GpuDescriptor:
     pcie_gen: Optional[int] = None
     pcie_width: Optional[int] = None
     #: CUDA-order index of this card (the --rank-gpu-id/--base-gpu-id space);
-    #: None when unbridged. See planner.device_map.
+    #: None when unbridged. Resolved through registry.nvml.IdentityMap.
     cuda_index: Optional[int] = None
 
 
@@ -86,9 +87,10 @@ class HardwareSpec:
     source: str
     host_ram_mib: Optional[int] = None
     driver: Optional[str] = None
-    #: How the per-gpu ``cuda_index`` values were resolved: "torch" (exact,
-    #: UUID-bridged) | "heuristic" (FASTEST_FIRST emulation -- surface this
-    #: to the user) | None (no bridge / not a live spec).
+    #: How the per-gpu ``cuda_index`` values were resolved: "identity-map"
+    #: (the #331 UUID/BDF resolver, the only way they can be resolved since
+    #: #397) | None (no bridge / not a live spec -- then cuda_index is None
+    #: too, never a guess).
     cuda_index_source: Optional[str] = None
 
     def gpu(self, index: int) -> GpuDescriptor:

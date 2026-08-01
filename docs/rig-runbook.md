@@ -2362,8 +2362,47 @@ NVML totals, and VRAM checks use **NVML/PCI order**. They differ on this rig:
 Cause: CUDA's default `CUDA_DEVICE_ORDER=FASTEST_FIRST` vs NVML's PCI-bus
 order. The order can shift with driver/boot changes — when a card is free,
 re-check with
-`python -c "import torch; [print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"`
+
+```bash
+# the canonical resolver, uuid <-> NVML index <-> CUDA ordinal <-> PCI BDF
+python -m sglang.srt.registry.nvml --map
+```
+
 against `nvidia-smi -L` before hardcoding indices anywhere.
+
+**One bridge, and no fallback (#397).** `registry/nvml.py`'s `IdentityMap`
+(#331) is the only thing in the tree that answers "which physical card is
+index *i*". It keys cards on their NVML UUID and bridges the two enumerations
+over the PCI BDF. Three separate bridges used to answer that question —
+`server_args._torch_to_nvml_gpu_index_mapping`, `planner/device_map.py`, and
+the identity map — which is three chances to disagree; this family has bitten
+four recorded times (the torch-vs-NVML memory read, this section, the #331
+audit, and #349 sweep-3 arm L / #392). The first two are now delegating
+shells, marked deprecated and carrying a `#397` comment so nothing new adopts
+them.
+
+What changed operationally: `planner/device_map.py` used to fall back to a
+FASTEST_FIRST *emulation* — cards sorted by their fp16 GEMM peak — whenever
+the real order was not readable. It was labelled "heuristic" in the UI, but
+an unknown card ranked 0.0 and silently kept NVML order, so the emulation
+answered confidently on exactly the rigs nobody had measured. That path is
+gone. When the CUDA order cannot be resolved you now get a named error saying
+which cards could not be placed and why, and:
+
+- the planner UI shows cards without a CUDA index instead of a guessed one;
+- the single-GPU preset emits no `--base-gpu-id`, and the stock-subset and
+  co-location presets are omitted entirely, rather than carrying a guessed
+  pin;
+- `--rank-auto-reserve-mib` and the hardware micro-probe refuse outright.
+
+The usual cause of an unresolved order in a container or a desk session is
+simply that torch sees no CUDA device (`CUDA_VISIBLE_DEVICES` masking, no
+driver); the error message says which of those applies.
+
+An offline `--gpu NAME:MIB` spec carries no card identity, so there is no
+live order to resolve. Its list order is taken as declared (the same
+convention manual `HardwareSpec`s follow since #392) and the preset text says
+so — verify it against `nvidia-smi -L` before launching against a real rig.
 
 ### 6.2 NCCL versions
 

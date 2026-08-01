@@ -382,10 +382,12 @@ def reindex_totals_cuda_order(
 def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
     """Total VRAM per CUDA device index.
 
-    Totals come from NVML; the CUDA-index keying comes from the PCI-bus
-    bridge ``server_args._torch_to_nvml_gpu_index_mapping`` (the same
-    resolver the --rank-tp-ratio auto budgets use, CVD-aware). Returns None
-    when NVML is unusable; the caller must then say so instead of silently
+    Totals come from NVML; the CUDA-index keying comes from the #331
+    identity map, reached through the deprecated
+    ``server_args._torch_to_nvml_gpu_index_mapping`` shell (#397 collapsed
+    the three bridges that used to answer this question onto that map; this
+    caller keeps the plain ``{cuda: nvml}`` dict shape). Returns None when
+    NVML is unusable; the caller must then say so instead of silently
     skipping.
     """
     try:

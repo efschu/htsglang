@@ -133,10 +133,10 @@ class GpuLive:
 
     ``cuda_index`` is the same card's CUDA-order index (the space
     ``--rank-gpu-id`` / ``--base-gpu-id`` / CUDA_VISIBLE_DEVICES use),
-    bridged via planner.device_map so the UI can label both spaces and key
-    rank->card attribution correctly; ``cuda_index_source`` is "torch"
-    (exact UUID bridge) or "heuristic" (FASTEST_FIRST emulation -- the UI
-    should say so), or None when unbridged.
+    resolved against the #331 identity map so the UI can label both spaces
+    and key rank->card attribution correctly; ``cuda_index_source`` is
+    "identity-map", or None when the order could not be resolved -- in which
+    case ``cuda_index`` is None as well, never an emulated order (#397).
     """
 
     nvml_index: int
