@@ -931,6 +931,40 @@ setsid bash "$WT/scripts/dsv4/rammon.sh" \
   --margin-gib 6 --interval 15 &
 ```
 
+**And start `scripts/dsv4/cachetrim.sh` alongside it.** rammon only watches;
+this is the one that acts. Boot 10 attempt B tripped the 92.6 GiB guard at
+`memory.current` 95.8 with anon at 12.7 and `file` at 79.3 — the page dropper
+was working (40.68 GiB released by tensor 565 of 1328) and still lost, because
+it can only drop *behind* the consumer while readahead pulls *ahead* of it.
+With the trim running, attempts C, D and E held at 83–85 GiB against the same
+guard and streamed all 1328 tensors on all three ranks: it converts a guard
+trip into a completed load.
+
+```bash
+setsid bash "$WT/scripts/dsv4/cachetrim.sh" \
+  --pidfile "$RUN/boot.pid" --out "$RUN/cachetrim.log" \
+  --soft-gib 78 --target-gib 68 --interval 5 &
+```
+
+It writes `/sys/fs/cgroup/memory.reclaim` whenever `memory.current` is above
+`--soft-gib`, asking for the difference to `--target-gib` (capped by
+`--max-ask-gib`, default 12). Safe by construction *on a swapless box only*:
+with no swap the cgroup cannot evict anon, so the pinned pool, the CUDA host
+allocations and the Python heap are out of reach and only page cache can be
+taken — which the loader re-reads if it needs it. The script checks that rather
+than assuming it and refuses on a box with swap unless `--allow-swap` is
+passed. `--self-test` exercises both branches (acts when over, quiet when
+under, exits when the server is gone, refuses with swap) against a fake cgroup
+root and needs no load.
+
+**Do not set `--target-gib` below the load's hard demand.** The pinned expert
+pool is inside `file` (section 4.5.6), so a target under
+`pinned + anon` is unreachable by construction and every ask comes back
+`partial`. That is exactly what boot 10 did from 18:57:36 onward with
+`--target-gib 60` against a 58.63 GiB hard demand; the trim spun for the last
+minute of the load. 78/68 leaves the trim something it can actually free and
+still keeps 14 GiB below the guard.
+
 It guards on **`memory.current`**, the number the OOM killer itself compares
 against the limit, and stops only the launched process group. The per-boot
 `rammonN.sh` scripts guarded on `anon` and that guard is structurally blind:
@@ -992,6 +1026,73 @@ call(s); consumer at tensor 512/1328.
 so the evidence lands **before** the step that fails. Grep for `so far in` on
 any load, finished or not; the closing summary stays the acceptance for a
 completed one.
+
+**The dropper is necessary and not sufficient.** It releases only what the
+consumer has already passed; readahead pulls the next pages in faster than the
+stream retires them, so `file` still climbs. Boot 10 attempt B measured the gap:
+40.68 GiB released and `file` at 79.3 GiB at the same instant. Pair it with
+`scripts/dsv4/cachetrim.sh` (section 4.5.4), which trims the part the dropper
+structurally cannot reach.
+
+### 4.5.6 Where the pinned expert pool lands in cgroup accounting (#391)
+
+The staging ledger and the cgroup disagree, and it matters, because
+`memory.current` is what rammon guards and what the OOM killer compares against
+the limit. Boot 10 attempt E ended with 44.33 GiB of pinned host pool by the
+ledger (a figure `fixposten.py` predicted independently to 0.36%) while the
+cgroup's `anon` never passed 16.3 GiB and `unevictable` read 0.00.
+
+**The pool is inside `file`, not `anon`.** Three independent readings of the
+boot-10 logs, none of which needs a card:
+
+- **Not `anon`.** Between 18:57:40 and 18:58:25 of attempt E the ledger's
+  cumulative pinned figure grew 35.04 → 43.57 GiB. Over the same 45 seconds
+  `anon` moved 13.6 → 13.8 GiB. `memory.current` grew +11.3 GiB and `file` grew
+  +12.8 GiB — the whole movement of the guard's number is the `file` term.
+- **Not mlocked anon either.** `unevictable` stayed at 0.00 for the entire
+  load. `scripts/dsv4/pinned_pool_accounting.py --mlock-control` shows what
+  mlocked anonymous memory actually looks like here: 4 MiB locked moves `anon`
+  **and** `unevictable` by 4 MiB and sets `VmLck`, with `Locked: 4100 kB` in
+  `smaps`. Boot 10 has none of that signature.
+- **No room for a third term.** `memory.current − anon − file` sat at
+  1.0–1.2 GiB at every sample of the run (kernel, slab, pagetables, sock).
+  There is no unaccounted 40 GiB inside `memory.current`, so a charged pool can
+  only be in `file`.
+
+The confirming behaviour is the trim log. While the pool was small, the asks
+returned `ok` and moved `file` by 3.5–11.7 GiB. From 18:57:36 — with the pool
+past ~34 GiB — every one of the eight remaining asks returned `partial` and
+moved 0.35–4.45 GiB, and on one of them `file` grew by 0.9 GiB while the trim
+was running. Reclaim repeatedly failing to free 2 GiB out of a
+supposed 68.8 GiB of clean checkpoint cache is not credible; a `file` term of
+which ~44 GiB is driver-pinned host memory explains it exactly. The likely
+mechanism is that `cudaHostAlloc` maps its host pages through the NVIDIA
+character device's address space, so they are charged as file pages to the
+faulting cgroup rather than as anon.
+
+**Consequences, and they are the practical point:**
+
+- **rammon's guard counts the pool exactly once.** It neither double-counts nor
+  misses it. `memory.current` is the right number to guard, unchanged.
+- **`file` is not a synonym for "reclaimable checkpoint cache".** By the end of
+  a load roughly two thirds of it is the feature's own pool. Any rule of the
+  form "`file` is large, so there is headroom" is wrong on this route, and any
+  trim target below `pinned + anon` is unreachable (section 4.5.4).
+- **The expected end-of-load `memory.current` is a floor, not a ceiling.** PREP
+  rev 3's 58.63 GiB hard demand (44.49 pinned + 14.14 anon-others) is what
+  `memory.current` cannot go *below* once the load is done; live checkpoint
+  cache sits on top of it. Reading ~59 GiB as the number to expect on the
+  monitor was a category error — 83–85 GiB, as attempts C/D/E showed, is the
+  honest expectation with a trim running.
+
+What is inferred and what is measured: `anon`, `unevictable` and the residual
+term are measured directly, and they eliminate every alternative but `file`.
+That the pool is *charged at all* rests on the reclaim behaviour rather than on
+a direct reading. `scripts/dsv4/pinned_pool_accounting.py --gib 4` settles it
+directly in about thirty seconds and is written and ready; it needs one card,
+because pinned host memory comes from `cudaHostAlloc` and that needs a CUDA
+context. Without a card it refuses instead of guessing. Run it in the next card
+window and replace this paragraph with the measurement.
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 
