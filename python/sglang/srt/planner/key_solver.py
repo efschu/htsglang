@@ -291,11 +291,13 @@ from sglang.srt.planner import cost_model
 from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED, Remeasure
 
 __all__ = [
+    "ENERGY_PRICEABLE_GOALS",
     "GOALS",
     "GOAL_LABELS",
     "ROLES",
     "REGRESSION_ANCHORS",
     "RoleSpec",
+    "solve_energy_units",
     "RigRates",
     "Candidate",
     "SolverAnswer",
@@ -1392,6 +1394,105 @@ def _objective_value(
     """The min-max objective at an integer point (lower is better)."""
     a, b = _terms(goal, model, role_post_mib)
     return max(a[r] + b[r] * units[r] for r in range(len(units)))
+
+
+#: Goals whose per-rank terms are TIMES (seconds), i.e. the ones an energy
+#: objective can price. ``maxkv``/``sessions`` terms are BYTES -- a capacity
+#: objective has no joules in it, and pretending otherwise would be the
+#: silent substitution the provenance discipline exists to prevent.
+ENERGY_PRICEABLE_GOALS: Tuple[str, ...] = ("dec", "enc")
+
+
+def _busy_seconds(
+    goal: str,
+    model: KeyCostModel,
+    units: Sequence[int],
+    role_post_mib: Sequence[float],
+) -> List[float]:
+    """Per-rank busy time of one lockstep round at an integer point.
+
+    The same ``a_r + b_r * u_r`` the min-max objective takes the MAX of --
+    energy needs every rank's own term, not just the slowest, because a rank
+    that finishes early still draws power while it waits.
+    """
+    a, b = _terms(goal, model, role_post_mib)
+    return [a[r] + b[r] * units[r] for r in range(len(units))]
+
+
+def _energy_objective_value(
+    goal: str,
+    model: KeyCostModel,
+    units: Sequence[int],
+    role_post_mib: Sequence[float],
+    energy_model,
+) -> float:
+    """J per unit of work at an integer point (lower is better).
+
+    This is the ENERGY sibling of :func:`_objective_value`, and the reason
+    phase 2 exists: ``_objective_value`` is a min-max over per-rank TIMES, so
+    its optimum is the plan that minimises the slowest rank. Energy is a
+    PRODUCT of the lockstep time and the SUM of per-rank power, so its
+    optimum can sit somewhere the time-optimal search never visits -- a plan
+    that concentrates work on the efficient card runs slower and draws much
+    less. Same physics as ``roofline.roofline_energy`` (#148), evaluated at
+    the solver's own cost terms.
+    """
+    from sglang.srt.planner.objective import energy_per_work
+
+    return energy_per_work(
+        _busy_seconds(goal, model, units, role_post_mib), energy_model
+    )
+
+
+def solve_energy_units(
+    goal: str,
+    model: KeyCostModel,
+    roles: Sequence[str],
+    energy_model,
+    *,
+    unit_bounds: Optional[Sequence[UnitBound]] = None,
+    anchor_vectors: Optional[Sequence[Sequence[int]]] = None,
+) -> Optional[List[int]]:
+    """The ENERGY optimum of one goal under one role assignment (#350 p2).
+
+    Why this is a seeded search and not a second closed form, stated plainly:
+    ``water_fill`` solves the min-max of a LINEAR per-rank form in closed
+    form, which is what makes the throughput optimum exact. The energy
+    objective is ``max_r(time_r) * sum_r P_r(time_r / max_r time_r)`` -- a
+    product of a max and a sum, not a min-max -- so no water-filling identity
+    applies. Rather than invent an approximation and call it an optimum, this
+    evaluates the honest objective over the SAME bounded candidate set §4
+    already uses for combined goals, then polishes with the same ``_repair``
+    local walk. Deterministic, and it explores exactly the region the
+    throughput anchors bracket.
+
+    Returns ``None`` when no feasible point exists under the bounds.
+    """
+    lo, hi, post = _role_bounds(roles, model.units, unit_bounds)
+    if sum(lo) > model.units or sum(hi) < model.units:
+        return None
+
+    # Seed with the single-goal optima (throughput anchors bracket the region
+    # the energy optimum lives in) plus whatever the caller supplies.
+    seeds: List[Sequence[int]] = []
+    for g in GOALS:
+        v = _solve_single(g, model, roles, unit_bounds)
+        if v is not None:
+            seeds.append(v)
+    for v in anchor_vectors or ():
+        seeds.append(list(v))
+    if not seeds:
+        return None
+
+    candidates = _candidate_set(model, roles, seeds, unit_bounds=unit_bounds)
+    if not candidates:
+        return None
+
+    def objective(u: Sequence[int]) -> float:
+        return _energy_objective_value(goal, model, u, post, energy_model)
+
+    best_vec = min(candidates, key=lambda v: objective(list(v)))
+    return _repair(list(best_vec), objective, lo, hi)
 
 
 # ---------------------------------------------------------------------------
