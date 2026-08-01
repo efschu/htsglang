@@ -119,6 +119,20 @@ long-context A/B against a reference implementation, or reading whether the
 per-layer `RadixAttention` is constructed with a window. It should be settled
 before anyone serves Ministral 3 for long context.
 
+**SETTLED (#378).** The window was NOT applied. Three gates missed at once,
+each confirmed by execution: `LlamaAttention` built `RadixAttention` without
+a window (taking the -1 "no window" default); `Ministral3ForCausalLM` had no
+`get_attention_sliding_window_size`, so `ModelRunner`'s first branch missed;
+and `"Ministral3ForCausalLM"` is absent from `is_hybrid_swa_model`'s arch
+set, so its second branch missed too. Ministral 3 therefore ran full
+attention on a model whose config declares a window — correct up to the
+window length, silently wrong past it. Fixed in #378 through the same
+plumbing Gemma4 uses (optional window on `LlamaAttention` forwarded to
+`RadixAttention`, plus the runner hook), with the hybrid-SWA classification
+deliberately left alone: a uniformly windowed model is not a two-pool
+hybrid, and the interleaving question needs a checkpoint. The #91 SWA x DCP
+interaction remains open.
+
 It also places Ministral 3 in the **#91 Gemma4 sliding-window x DCP** gap
 family: under token-sharded DCP a windowed layer's owner rule interacts with
 the window boundary, which the fork solved once for the SWA-hybrid pool
