@@ -2021,6 +2021,13 @@ class DualGroupLane:
                     # so "re-seeded against the target" and "not re-seeded" are
                     # two arms of ONE boot on the same token ids.
                     "draft_reseed": job.get("draft_reseed"),
+                    # §13.10, and the same reasoning once more: a per-job
+                    # chunk size (0 forces the single forward under a set
+                    # server flag) lets the chunked and the unchunked prefill
+                    # run as two arms of ONE boot -- the coherence gate the
+                    # chunking posten owes is a same-boot byte comparison,
+                    # not an argument.
+                    "prefill_chunk": job.get("prefill_chunk"),
                     # #404: a label the caller puts on the job so the pool
                     # checksum records say WHICH arm produced them. The lane
                     # never reads it; it only travels, which is the point -- a
@@ -4540,12 +4547,17 @@ class DualGroupLane:
             raise RuntimeError(f"lane prefill chunk plan stops at {pos} of {n} tokens")
 
         spec_on = self._job_spec_on(job)
-        req = req_d = None
-        batch = batch_d = None
-        prefix = prefix_d = None
-        out = None
-        next_token_ids = None
-        chunk_ms = []
+        # Loop-carried; the tiling guard above proves the loop runs at least
+        # once, so every one of these is set by the time the tail reads it.
+        req: Any = None
+        req_d: Any = None
+        batch: Any = None
+        batch_d: Any = None
+        prefix: Any = None
+        prefix_d: Any = None
+        out: Any = None
+        next_token_ids: Any = None
+        chunk_ms: List[float] = []
         for start, end in spans:
             last = end == n
             # -- target chunk: prefix must hold exactly [0, start) ---------
@@ -5218,6 +5230,12 @@ class DualGroupLane:
             result["prefill_wait_ms"] = round(
                 job["prefill_wall_ms"] - job["prefill_ms"], 2
             )
+        # §13.10: present only when the prefill ran chunked. ms/chunk against
+        # chunk size is measurement duty 4 of the chunking posten, and the
+        # harness reads it off the result row like everything else.
+        if job.get("prefill_chunk_ms") is not None:
+            result["prefill_chunks"] = len(job["prefill_chunk_ms"])
+            result["prefill_chunk_ms"] = [round(x, 3) for x in job["prefill_chunk_ms"]]
         with self._lock:
             self.results.append(result)
             self.results_total += 1

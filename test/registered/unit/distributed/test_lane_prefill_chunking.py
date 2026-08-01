@@ -324,6 +324,28 @@ class TestChunkedPrefill(CustomTestCase):
         self.assertEqual(job["output_ids"], [prompt[-1] + ARGMAX_OFFSET])
 
 
+class TestEnqueueWhitelist(CustomTestCase):
+    def test_prefill_chunk_travels_through_enqueue(self):
+        """The window's arms come from per-job overrides; a field the
+        enqueue whitelist drops silently costs the boot, so its presence is
+        pinned here (both the value and the absent-means-None default)."""
+        import threading
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        lane._lock = threading.Lock()
+        lane.jobs = []
+        # The enqueue tail's wake-up protocol, stubbed flat: no lending to
+        # reclaim, a no-op clock, an event nobody waits on.
+        lane.lending = None
+        lane._idle_since = None
+        lane.device_clock = SimpleNamespace(mark_busy=lambda: None)
+        lane._wake = threading.Event()
+        DualGroupLane.enqueue(lane, {"input_ids": [1, 2, 3], "prefill_chunk": 512})
+        DualGroupLane.enqueue(lane, {"input_ids": [1, 2, 3]})
+        self.assertEqual(lane.jobs[0]["prefill_chunk"], 512)
+        self.assertIsNone(lane.jobs[1]["prefill_chunk"])
+
+
 class TestDispatch(CustomTestCase):
     def test_default_stays_single_forward(self):
         prompt = list(range(10))

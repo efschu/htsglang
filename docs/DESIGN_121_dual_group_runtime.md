@@ -2738,3 +2738,72 @@ Boot 3 (beide Fixe): Policy greift (10 Picks, 4 satpicks, 3 Umordnungen,
 1 Starvation-Override, occ_r 0,761 -> 0,864). E-Wirkung mit n=1 Fenster
 nicht von der Fenstervarianz trennbar — offener Posten. Voller Bericht in
 INTEGRATION_R3_VALIDATION (Kartenfenster 08:46-09:18 UTC).
+
+## 15. Lane-Prefill-Chunking gebaut (feat/dual-group-lane-chunking-274, Basis a56f33aafd)
+
+### 15.1 Der Bau, entlang der vier Punkte von §13.10
+
+Schreibtischrunde, kein Boot. Der Entwurf aus §13.10 ist jetzt Code; die
+Messpflicht (Punkt 4) hat ihr Fenster noch vor sich (§15.4).
+
+1. **Die Schleife.** `_prefill` verzweigt auf `_prefill_chunked`, sobald ein
+   Chunk benannt ist (`--dual-group-lane-prefill-chunk` oder per-Job
+   `prefill_chunk`; Job schlaegt Flag, explizite 0 schaltet aus). Default
+   unveraendert: ohne Chunk laeuft wortgleich der bisherige
+   Ein-Forward-Zweig. Die Schleife faehrt Extend-Forwards ueber DENSELBEN
+   Req — `ReqToTokenPool.alloc` nutzt den Slot eines Requests mit
+   committetem KV weiter, und genau dieser Slot traegt den GDN-/Mamba-
+   Zustand ueber die Chunk-Grenze — und waechst `prefix_indices` je Chunk um
+   dessen `out_cache_loc`. Nur der letzte Chunk emittiert; ein Plan, der
+   `[0, n)` nicht exakt kachelt, wird VOR dem ersten Forward abgewiesen.
+   `work_total["prefill_tokens"]` rueckt an der CHUNK-Grenze vor — die
+   erklaerte Ausbeute des Postens: feinere Koerner fuer den
+   Paarungs-Entscheider, und `prefill_chunk_ms` steht als Liste am Job und
+   an der Result-Zeile.
+2. **Die Sprossenleiter.** Chunk-Groessen ausserhalb der Prefill-Tier-Liste
+   der Lane bekommen genau eine laute Warnung (padden auf die naechste Tier
+   oder eager oberhalb der obersten) — benannt, nicht verboten.
+3. **Der spekulative Zweig.** Der Kopf wird chunkweise mitgezogen, Eingang
+   um eins verschoben. Der Randtoken eines MITTLEREN Chunks ist der NAECHSTE
+   PROMPT-Token, nie der Target-Argmax (der wuerde die Accept-Laenge
+   druecken — dieselbe Begruendung wie beim unverschobenen Feed im
+   Ein-Forward-Pfad); nur der LETZTE Chunk nimmt die Target-Vorhersage.
+   Hidden-Zeilen und Token-Zeilen sind innerhalb des Chunks ausgerichtet,
+   eine Hidden-Uebergabe ueber die Grenze braucht es nicht.
+
+### 15.2 Falsifikatoren zuerst, mit Kann-failen-Beweis
+
+15 hermetische Tests (CPU, Muster test_lane_hidden_view_399): Randtoken
+gegen ein prompt-disjunktes Argmax-Alphabet gepinnt; Zaehlerstand IN den
+gemockten Forwards gelesen (Job-Grenzen-Zaehler liest 0,0,0 und faellt trotz
+korrekter Summe); prefix==start als eingebauter Falsifikator in
+prepare_for_extend; Kachel-Wache feuert auf Ueberlappung/Luecke/Kurz-Plan.
+Beide Defekte wurden GEPFLANZT (Argmax am mittleren Rand, Zaehler nicht
+vorgerueckt): jeder faellt exakt seinen Test, restauriert 15/15 gruen.
+Verteilte Suite: Failure-Set eine TEILMENGE der Basis (keine neuen roten).
+
+### 15.3 §13.11-3 nebenbei geschlossen
+
+Der Marlin-LoRA-Workspace laeuft jetzt durch den (lane,name)-Akzessor
+(Device im Namen ersetzt das Re-Create-on-Device-Change); der Akzessor-
+Docstring nennt keine Ausnahme mehr, weil keine uebrig ist. Kann-failen:
+das woertliche Vor-Fix-Muster reicht unter denselben Lane-Scopes allen
+Lanes denselben Tensor.
+
+### 15.4 Das Fenster, das der Posten noch schuldet
+
+`scripts/dual_group/chunking/`: window.sh (EIN Boot, C3-Arbeitspunkt, Arme
+nur ueber per-Job-Overrides — gechunkt und ungechunkt teilen Boot, Captures
+und Pools), probe_arms.py mit drei getrennten Urteilen: STRUKTUR (hart,
+ganzzahlig — rot = kaputtes Vehikel), KOHAERENZ (graduiert, DREI Zustaende:
+Referenz-SET aus --ref-draws Ein-Forward-Laeufen, dessen eigene Spreizung
+ist die Bande; VOID wenn die Referenz ab Position 0 uneins ist — #328/#363-
+Disziplin, nie Text-Identitaet allein), PREIS (berichtet, nie geurteilt:
+ms/Chunk je Groesse, Prefill-Rate, Solo-Boeden NEU erhoben, weil die
+Koernung des Instruments sich aendert). Desk-Smoke am Fake-Server: sauber
+gruen, vier dirty-Arme feuern jeder sein eigenes Rot bzw. VOID (der
+degenerierte Ein-Chunk-Arm bleibt beim chunks-Plant absichtlich gruen und
+ist genau so gepinnt). Offen bleiben die Karten-Posten: ms/Chunk-Kurve,
+Kohaerenz auf der Karte (spec an ist der Arm, der scheitern kann),
+E-Wirkung der feineren Koerner auf die Paarung (§14.7-Posten, mehr Fenster
+je Arm).
