@@ -77,6 +77,14 @@ MODE_OBSERVE = "observe"
 MODE_ACT = "act"
 MODES = (MODE_OFF, MODE_OBSERVE, MODE_ACT)
 
+#: Execution phase of one scheduler round. IDLE is its own value and not a
+#: kind of prefill: an idle window is no measurement, not 0 % prefill
+#: (DESIGN_363 section 3.2).
+PHASE_PREFILL = "prefill"
+PHASE_DECODE = "decode"
+PHASE_IDLE = "idle"
+PHASES = (PHASE_PREFILL, PHASE_DECODE, PHASE_IDLE)
+
 #: ``--regime-controller`` is the flag (phase 3). This env var is the phase-2
 #: spelling, kept as an OVERRIDE so an observe run already in somebody's
 #: launch script keeps working.
@@ -171,7 +179,7 @@ class RegimeObserver:
         mode: str = MODE_OBSERVE,
         table_plan=None,
         commit_fn: Optional[Callable] = None,
-        dwell: Optional["DwellGate"] = None,
+        dwell: Optional[DwellGate] = None,
     ):
         if consensus_interval < 1:
             raise ValueError(
@@ -287,16 +295,6 @@ class RegimeObserver:
         return self._last_record
 
     # -- the per-round hook --------------------------------------------------
-    #: Execution phase of one scheduler round. IDLE is its own value and not
-    #: a kind of prefill: an idle window is no measurement, not 0 % prefill
-    #: (DESIGN_363 section 3.2). The 2026-08-01 gate window found this the
-    #: hard way -- the hook passed a BOOLEAN, idle fell on the prefill side,
-    #: and the rig read PREFILL_HEAVY on 93 600 of 93 603 verdicts.
-    PHASE_PREFILL = "prefill"
-    PHASE_DECODE = "decode"
-    PHASE_IDLE = "idle"
-    PHASES = (PHASE_PREFILL, PHASE_DECODE, PHASE_IDLE)
-
     def on_round(
         self,
         *,
@@ -321,16 +319,16 @@ class RegimeObserver:
         Returns the verdict record at a consensus boundary, ``None`` between
         boundaries.
         """
-        if phase not in self.PHASES:
+        if phase not in PHASES:
             raise ValueError(
                 f"unknown execution phase {phase!r}; known: "
-                f"{', '.join(self.PHASES)}. An idle round is IDLE, not a "
+                f"{', '.join(PHASES)}. An idle round is IDLE, not a "
                 f"kind of prefill."
             )
         self._round += 1
-        if phase == self.PHASE_PREFILL:
+        if phase == PHASE_PREFILL:
             self._prefill_rounds += 1
-        elif phase == self.PHASE_DECODE:
+        elif phase == PHASE_DECODE:
             self._decode_rounds += 1
         else:
             # Counted in the round index (the replicated cadence gate) and in
@@ -984,6 +982,69 @@ def _declared_vectors(scheduler):
     return tuple(tuple(int(x) for x in v) for v in reshard_rt.allowed_vectors)
 
 
+def phase_of_last_batch(last_batch) -> str:
+    """The execution phase of the forward that JUST RAN, for one boundary.
+
+    THE ATTRIBUTION, AND THE CONSTRAINT THAT FIXES IT
+    -------------------------------------------------
+    A boundary is attributed to the batch that ran INTO it, never to the one
+    the scheduler is about to build. Three things force that and one of them
+    is a hard constraint:
+
+    * **The next batch does not exist yet.** ``get_new_batch_prefill`` runs
+      after the hook returns. Reading the next batch's composition would mean
+      moving the hook behind batch selection, which gives up the between-tick
+      placement the #287/#364 blocks share -- previous forward retired, next
+      batch not chosen, no captured graph able to replay. That placement is
+      the reason the device timing read at this boundary is a completed
+      measurement rather than a half-recorded one.
+    * **``rank_forward_ms`` is the just-retired forward's device time.** With
+      this attribution the phase and the timing on one record describe the
+      same event. Pairing this boundary's timing with the next batch's
+      composition would be the mismatch, not the fix.
+    * **Nothing is lost or double-counted.** The batch built after this hook
+      is ``last_batch`` at the next boundary, so every dispatched forward is
+      attributed exactly once, one boundary later. The classifier reads a
+      SHARE over a window of rounds, and a uniform one-boundary shift does
+      not move a share.
+
+    WHAT IT MUST NOT READ
+    ---------------------
+    ``running_batch.is_prefill_only``, which is what the hook used until #388.
+    That flag is a REQUEST KIND -- ``max_new_tokens == 0``, and forced False
+    whenever speculative decoding is on -- not an execution phase. On any
+    generating workload it is False on every batch, so ``prefill`` was
+    unreportable and ``prefill_share`` read 0.000 on all 34 954 boundaries of
+    the 2026-08-01 window and on both gate-3 arms (29 active boundaries each,
+    two independent boots). The name is the whole trap: the batch that a
+    prefill burst retires into this boundary is, by then, the DECODE batch,
+    because the top of ``get_next_batch_to_run`` has already merged the
+    finished extend batch into ``running_batch``.
+
+    TIER R. ``forward_mode`` is replicated across the TP group -- every rank
+    ran the same batch -- so this stays inside the hook's uniformity contract
+    (DESIGN_363 section 3.1). Duck-typed on the mode's own predicates so the
+    hermetic tests can drive it without a scheduler.
+    """
+    if last_batch is None:
+        # Nothing was dispatched last iteration.
+        return PHASE_IDLE
+    mode = getattr(last_batch, "forward_mode", None)
+    if mode is None or mode.is_idle():
+        return PHASE_IDLE
+    # EXTEND / MIXED / SPLIT_PREFILL are the prefill forwards. The two
+    # exclusions are the ones ``ForwardMode.is_extend()`` sweeps in and a
+    # regime classifier must not:
+    #   * TARGET_VERIFY is the speculative decode lane's forward. Counting it
+    #     as prefill would report a NEXTN decode drain -- the reference recipe
+    #     on this rig -- as a prefill burst.
+    #   * DLLM_EXTEND is a diffusion denoising step: the rig is emitting, not
+    #     ingesting.
+    if mode.is_extend() and not (mode.is_target_verify() or mode.is_dllm_extend()):
+        return PHASE_PREFILL
+    return PHASE_DECODE
+
+
 def rank_forward_ms_from(scheduler) -> Optional[float]:
     """This rank's last measured forward device ms, or ``None``.
 
@@ -1008,6 +1069,10 @@ __all__ = [
     "MODE_ACT",
     "MODE_OBSERVE",
     "MODE_OFF",
+    "PHASES",
+    "PHASE_DECODE",
+    "PHASE_IDLE",
+    "PHASE_PREFILL",
     "REGIMES",
     "RegimeObserver",
     "build_regime_observer",
@@ -1015,6 +1080,7 @@ __all__ = [
     "close_regime_trace",
     "install_trace_shutdown_hook",
     "observe_mode",
+    "phase_of_last_batch",
     "rank_forward_ms_from",
     "resolve_mode",
 ]

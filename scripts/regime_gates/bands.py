@@ -21,11 +21,29 @@ windows carry no share at all. Aligning two runs by absolute boundary index
 would therefore compare one run's idle stretch against the other's workload
 and report the difference as noise.
 
-So alignment is PER SIGNAL and on the boundaries where that signal EXISTS:
+So alignment is PER SIGNAL and on the boundaries where that signal MEANS
+something:
 
-1. take, from each run, the subsequence of boundaries where the signal is
-   present (``None`` means absent -- an idle window is no measurement, not a
-   zero, and it is dropped rather than filled);
+1. take, from each run, the subsequence of boundaries the signal is defined
+   on. Two classes, because the traces have two:
+
+   * signals that are ABSENT on an idle window -- the shares, which the
+     observer reports as ``None`` when the window ran no forward. Dropping
+     ``None`` is enough: an idle window is no measurement, not a zero, and it
+     is dropped rather than filled.
+   * signals that are PRESENT on every boundary -- ``occupancy`` and
+     ``queued_prompt_tokens``, which report a real ``0.0`` while the rig
+     idles. Dropping ``None`` drops nothing here, so these are restricted to
+     the ACTIVE boundaries explicitly (``ACTIVE_ONLY_SIGNALS``), which is the
+     same subsequence the shares already get.
+
+   Gate 3 (2026-08-01) is why the second class exists as a rule rather than
+   as a footnote. Its two arms idled for different lengths -- 19 402 against
+   15 504 boundaries, because the workload started at different delays after
+   ready -- and the alignment paired one arm's quiet stretch against the
+   other's busy one. Both signals came back ARMS_DISSIMILAR, which was the
+   guard working: the "0.1649 occupancy noise floor" it refused to publish
+   was the entire observed range of the signal.
 2. resample both subsequences onto ``K = min(len_a, len_b)`` positions on a
    normalised 0..1 timeline, so two runs whose active spans differ in length
    are still compared like-for-like;
@@ -35,6 +53,13 @@ Resampling can only INFLATE the band (it adds a small alignment error to a
 real difference), and inflation is the conservative direction: it makes a
 threshold harder to clear, never easier. The report states the two active
 span lengths so a reader can see how much work the resampling did.
+
+``rank_ms_spread_pct`` is deliberately left in the first class for now. It is
+also present through idle stretches -- the sensing reports the LAST measured
+forward, so the value goes stale rather than absent -- but restricting it is a
+second method change with its own argument to make, and it is not the one
+gate 3 identified. Recorded here so the next reader does not mistake the
+omission for a claim that the signal is clean.
 
 WHAT THIS REPORTS THAT A BAND ALONE WOULD NOT
 ----------------------------------------------
@@ -98,6 +123,13 @@ SIGNALS = {
     "queued_prompt_tokens": "queued_prompt_tokens",
     "rank_ms_spread_pct": "rank_ms_spread_pct",
 }
+
+#: Signals that report a real value on an IDLE boundary and therefore have to
+#: be restricted to the active ones by hand. See the alignment section of the
+#: module docstring: for the shares, "drop the absent samples" already does
+#: this; for these two it drops nothing, and two arms that idled for different
+#: lengths get a quiet stretch paired against a busy one.
+ACTIVE_ONLY_SIGNALS = frozenset({"occupancy", "queued_prompt_tokens"})
 
 
 class Constant:
@@ -203,14 +235,37 @@ def load_boundaries(path: str) -> List[Dict]:
     return out
 
 
-def series(boundaries: Sequence[Dict], field: str) -> List[float]:
-    """The signal's values where it EXISTS, in order.
+def is_active(boundary: Dict) -> bool:
+    """Did this window run any forward at all?
+
+    Read off the shares rather than off a separate field, because that is how
+    the observer defines it: ``RegimeSample`` returns ``None`` for both shares
+    exactly when ``forward_rounds == 0``. One definition of "active", held in
+    one place, and the analysis inherits the runtime's.
+    """
+    return (
+        boundary.get("prefill_share") is not None
+        or boundary.get("decode_share") is not None
+    )
+
+
+def series(
+    boundaries: Sequence[Dict], field: str, *, active_only: bool = False
+) -> List[float]:
+    """The signal's values where it MEANS something, in order.
 
     ``None`` is dropped, never filled: an idle window carries no share, and a
     zero there would be a different claim that would also drag the band.
+
+    ``active_only`` adds the second rule, for the signals that report a real
+    value while the rig idles: keep only the boundaries that ran a forward.
+    Without it, two arms with different idle lengths are aligned quiet-against-
+    busy and the "band" is the signal's whole range (gate 3, 2026-08-01).
     """
     out = []
     for b in boundaries:
+        if active_only and not is_active(b):
+            continue
         v = b.get(field)
         if v is None:
             continue
@@ -242,10 +297,14 @@ def resample(values: Sequence[float], k: int) -> List[float]:
 # ---------------------------------------------------------------------------
 
 
-def band_for(a: Sequence[Dict], b: Sequence[Dict], field: str) -> Dict:
-    sa, sb = series(a, field), series(b, field)
+def band_for(
+    a: Sequence[Dict], b: Sequence[Dict], field: str, *, active_only: bool = False
+) -> Dict:
+    sa = series(a, field, active_only=active_only)
+    sb = series(b, field, active_only=active_only)
     res = {
         "signal": field,
+        "active_only": bool(active_only),
         "n_a": len(sa),
         "n_b": len(sb),
         "observed_max": max(sa + sb) if (sa or sb) else None,
@@ -363,16 +422,35 @@ def judge_constant(c: Constant, bands: Dict[str, Dict]) -> Dict:
 
 def report(path_a: str, path_b: str) -> Dict:
     a, b = load_boundaries(path_a), load_boundaries(path_b)
-    bands = {name: band_for(a, b, field) for name, field in SIGNALS.items()}
+    bands = {
+        name: band_for(a, b, field, active_only=name in ACTIVE_ONLY_SIGNALS)
+        for name, field in SIGNALS.items()
+    }
     verdicts = [judge_constant(c, bands) for c in CONSTANTS]
+    # Only CLEARS is a pass -- the runsheet's own table. UNDERPOWERED belongs
+    # in this list for the same reason as the rest: a band from under
+    # MIN_PAIRED_SAMPLES samples is a number, not a measurement, so a
+    # threshold judged against it has not been checked. It became reachable
+    # once the two idle-present signals were restricted to active boundaries
+    # (#388): before that they always had thousands of paired samples,
+    # including thousands of idle ones.
     blocking = [
         v
         for v in verdicts
-        if v["verdict"] in ("INSIDE_BAND", "UNREACHED", "NO_DATA", "ARMS_DISSIMILAR")
+        if v["verdict"]
+        in ("INSIDE_BAND", "UNREACHED", "NO_DATA", "ARMS_DISSIMILAR", "UNDERPOWERED")
     ]
     return {
-        "arm_a": {"path": path_a, "boundaries": len(a)},
-        "arm_b": {"path": path_b, "boundaries": len(b)},
+        "arm_a": {
+            "path": path_a,
+            "boundaries": len(a),
+            "active": sum(1 for x in a if is_active(x)),
+        },
+        "arm_b": {
+            "path": path_b,
+            "boundaries": len(b),
+            "active": sum(1 for x in b if is_active(x)),
+        },
         "window_rounds": DEFAULT_WINDOW_ROUNDS,
         "bands": bands,
         "constants": verdicts,
@@ -400,16 +478,28 @@ def evidence_entry(rep: Dict, *, note: str = "") -> Dict:
 
 def render(rep: Dict) -> str:
     lines = [
-        f"arm A: {rep['arm_a']['boundaries']} boundaries  {rep['arm_a']['path']}",
-        f"arm B: {rep['arm_b']['boundaries']} boundaries  {rep['arm_b']['path']}",
+        f"arm A: {rep['arm_a']['boundaries']} boundaries "
+        f"({rep['arm_a'].get('active', '?')} active)  {rep['arm_a']['path']}",
+        f"arm B: {rep['arm_b']['boundaries']} boundaries "
+        f"({rep['arm_b'].get('active', '?')} active)  {rep['arm_b']['path']}",
         "",
         f"{'signal':<22}{'band':>12}{'paired':>8}{'max':>12}  status",
     ]
     for name, b in sorted(rep["bands"].items()):
         band = "absent" if b.get("band") is None else f"{b['band']:.6g}"
         top = "-" if b.get("observed_max") is None else f"{b['observed_max']:.6g}"
+        # An asterisk marks a signal restricted to the ACTIVE boundaries: it
+        # is present on idle ones too, so the restriction is the analysis's
+        # doing and a reader has to be able to see it was applied.
+        mark = "*" if b.get("active_only") else " "
         lines.append(
-            f"{name:<22}{band:>12}{b.get('paired', 0):>8}{top:>12}  {b['status']}"
+            f"{name + mark:<22}{band:>12}{b.get('paired', 0):>8}{top:>12}  "
+            f"{b['status']}"
+        )
+    if any(b.get("active_only") for b in rep["bands"].values()):
+        lines.append(
+            "  * restricted to boundaries that ran a forward; the signal "
+            "reports a real value on idle ones too"
         )
     lines += ["", f"{'constant':<32}{'value':>10}{'gap':>8}  verdict"]
     for v in rep["constants"]:
@@ -499,12 +589,28 @@ def smoke() -> int:
             print("\n[real trace, halves as pseudo-arms]")
             print(render(rep))
             ok &= rep["bands"]["occupancy"]["band"] is not None
-            # The halves of one run are NOT an A-vs-A pair, and the guard
-            # says so rather than publishing their difference as a floor.
-            ok &= rep["bands"]["occupancy"]["status"] == "ARMS_DISSIMILAR"
+            # The halves of one run are NOT an A-vs-A pair, and the report
+            # still refuses to publish their difference as a floor -- but
+            # since #388 it refuses for the accurate reason. Restricted to the
+            # boundaries that ran a forward, the idle first half contributes 2
+            # active windows against the working half's 26, so occupancy is
+            # UNDERPOWERED rather than ARMS_DISSIMILAR. Both are refusals; the
+            # second names the real problem with this fixture.
+            ok &= rep["bands"]["occupancy"]["status"] == "UNDERPOWERED"
+            ok &= not rep["passed"]
             print(
                 "\n[guard      ] occupancy status="
                 f"{rep['bands']['occupancy']['status']} (halves are not a pair)"
+            )
+            # ARMS_DISSIMILAR is still reachable, and on this fixture it is
+            # rank_ms_spread_pct that reaches it -- the signal deliberately
+            # NOT restricted to active boundaries (see the module docstring).
+            # Keeps the guard exercised and shows what the omission costs.
+            ok &= rep["bands"]["rank_ms_spread_pct"]["status"] == "ARMS_DISSIMILAR"
+            print(
+                "[guard      ] rank_ms_spread_pct status="
+                f"{rep['bands']['rank_ms_spread_pct']['status']} "
+                "(not restricted to active boundaries, and it shows)"
             )
         else:
             print(f"[real trace ] SKIPPED, {_REAL} not present")

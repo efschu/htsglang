@@ -55,10 +55,15 @@ from sglang.srt.managers.regime_runtime import (
     ENV_MODE,
     MODE_OBSERVE,
     MODE_OFF,
+    PHASE_DECODE,
+    PHASE_IDLE,
+    PHASE_PREFILL,
     RegimeObserver,
     observe_mode,
+    phase_of_last_batch,
     rank_forward_ms_from,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -525,15 +530,209 @@ class TestIdleIsNotPrefill(CustomTestCase):
         self.assertIn("not a kind of prefill", str(cm.exception))
 
     def test_the_scheduler_hook_maps_all_three_phases(self):
-        import pathlib
+        """The mapping itself, driven -- not grepped.
 
-        import sglang.srt.managers.scheduler as mod
+        It moved out of the scheduler and into ``phase_of_last_batch`` with
+        #388 precisely so it could be driven: the mapping is the thing that
+        was wrong twice now, and a test that greps for its source text cannot
+        tell a right mapping from a wrong one.
+        """
+        self.assertEqual(phase_of_last_batch(None), PHASE_IDLE)
+        self.assertEqual(
+            phase_of_last_batch(_Batch(ForwardMode.IDLE)),
+            PHASE_IDLE,
+        )
+        self.assertEqual(
+            phase_of_last_batch(_Batch(ForwardMode.EXTEND)),
+            PHASE_PREFILL,
+        )
+        self.assertEqual(
+            phase_of_last_batch(_Batch(ForwardMode.DECODE)),
+            PHASE_DECODE,
+        )
 
-        src = pathlib.Path(mod.__file__).read_text()
-        block = src[src.index("self.regime_observer.on_round(") - 900 :]
-        self.assertIn('phase = "idle"', block)
-        self.assertIn('phase = "prefill"', block)
-        self.assertIn('phase = "decode"', block)
+
+# ---------------------------------------------------------------------------
+# #388 -- the retired-batch attribution, driven through a synthetic loop.
+# ---------------------------------------------------------------------------
+
+
+class _Batch:
+    """The two fields the hook reads off a ``ScheduleBatch``, and no more.
+
+    ``is_prefill_only`` is here because the PRE-#388 attribution read it, and
+    a falsifier that cannot express the broken version cannot show it broken.
+    It defaults False for the same reason it is False on a real generating
+    batch: it means ``max_new_tokens == 0`` (and is forced False under spec),
+    not "this round is a prefill".
+    """
+
+    def __init__(self, forward_mode, reqs=(), is_prefill_only=False):
+        self.forward_mode = forward_mode
+        self.reqs = list(reqs)
+        self.is_prefill_only = is_prefill_only
+
+    def is_empty(self):
+        return not self.reqs
+
+    def merge_batch(self, other):
+        self.reqs.extend(other.reqs)
+        self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+
+
+def _old_attribution(running_batch, last_batch):
+    """The hook exactly as it stood before #388, transcribed.
+
+    Kept in the test rather than in the tree so the can-fail proof has
+    something to fail on: this is the code whose output the gate windows
+    recorded, and the assertion below is that it reports 0 % prefill on a run
+    that is nothing but prefill.
+    """
+    if running_batch.is_empty():
+        return PHASE_IDLE
+    if running_batch.is_prefill_only:
+        return PHASE_PREFILL
+    return PHASE_DECODE
+
+
+def _new_attribution(running_batch, last_batch):
+    return phase_of_last_batch(last_batch)
+
+
+def _drive_ticks(ticks, attribute):
+    """Replay a sequence of scheduler ticks through one attribution.
+
+    The ORDER is the whole point, and it is the scheduler's own
+    (``get_next_batch_to_run``):
+
+    1. a retired EXTEND batch is merged into ``running_batch`` -- which is why
+       ``running_batch`` reads as a decode batch in the middle of a prefill
+       burst;
+    2. the regime hook runs;
+    3. only THEN is this iteration's batch selected and dispatched, becoming
+       ``last_batch`` for the next boundary.
+
+    ``ticks`` names what each iteration dispatches: ``prefill`` an extend
+    batch for one freshly admitted request, ``decode`` the running batch,
+    ``idle`` nothing.
+    """
+    running = _Batch(ForwardMode.DECODE)
+    last = None
+    phases = []
+    for i, tick in enumerate(ticks):
+        if last is not None and last.forward_mode.is_extend():
+            running.merge_batch(last)
+        phases.append(attribute(running, last))
+        if tick == "prefill":
+            last = _Batch(ForwardMode.EXTEND, reqs=[f"req{i}"])
+        elif tick == "decode":
+            running.forward_mode = ForwardMode.DECODE
+            last = None if running.is_empty() else running
+        elif tick == "idle":
+            last = None
+        else:  # pragma: no cover -- a typo in a test plan, not a state
+            raise AssertionError(f"unknown tick {tick!r}")
+    return phases
+
+
+def _share(phases):
+    """``prefill_share`` as the observer computes it over one window."""
+    obs = RegimeObserver(consensus_interval=len(phases), tp_size=1)
+    record = None
+    for phase in phases:
+        record = (
+            obs.on_round(
+                phase=phase, held_tokens=0, capacity_tokens=453_632, running_bs=1
+            )
+            or record
+        )
+    return record["prefill_share"]
+
+
+class TestRetiredBatchAttribution(CustomTestCase):
+    """#388. The hook read the phase off the wrong batch.
+
+    Gate 3 measured the consequence twice, independently: ``prefill_share``
+    max **0.000** on both arms, 29 active boundaries each -- and 0.000 across
+    all 34 954 boundaries of the window before it. ``enter_prefill = 0.35``
+    was reported UNREACHED, which was true and was not the finding.
+    """
+
+    #: Eight admitted prompts, one extend forward each. Nothing else runs.
+    BURST = ["prefill"] * 8
+    #: A generation drain: the running batch decodes, no new arrivals.
+    DRAIN = ["prefill"] + ["decode"] * 7
+    #: Short arrivals during long generations -- the workload's `mixed` phase.
+    MIXED = ["prefill", "decode"] * 4
+
+    def test_the_unfixed_hook_reports_no_prefill_during_a_prefill_burst(self):
+        """THE CAN-FAIL PROOF. A window of nothing but prefill forwards, and
+        the pre-#388 attribution calls it 0 % prefill -- because the burst's
+        own retired batches have been merged into ``running_batch`` by the
+        time it looks, and ``is_prefill_only`` was never about phases."""
+        phases = _drive_ticks(self.BURST, _old_attribution)
+        self.assertNotIn(PHASE_PREFILL, phases)
+        self.assertEqual(_share(phases), 0.0)
+
+    def test_the_fixed_hook_reports_the_true_share_of_a_prefill_burst(self):
+        phases = _drive_ticks(self.BURST, _new_attribution)
+        # The first boundary has no retired batch yet: nothing had run.
+        self.assertEqual(phases[0], PHASE_IDLE)
+        self.assertEqual(phases[1:], [PHASE_PREFILL] * (len(self.BURST) - 1))
+        self.assertEqual(_share(phases), 1.0)
+
+    def test_a_decode_drain_stays_decode_under_both(self):
+        """The regression the fix must not introduce. Decode was the ONE
+        answer the broken hook got right, and it still has to be right --
+        otherwise #388 would trade a silent 0 for a silent 1."""
+        old = _drive_ticks(self.DRAIN, _old_attribution)
+        new = _drive_ticks(self.DRAIN, _new_attribution)
+        self.assertEqual(new.count(PHASE_DECODE), len(self.DRAIN) - 2)
+        self.assertEqual(_share(new), 1.0 / (len(self.DRAIN) - 1))
+        # ... and the old one saw a pure decode run here, which is why the
+        # defect was invisible on a decode-dominated rig.
+        self.assertEqual(_share(old), 0.0)
+        self.assertIn(PHASE_DECODE, old)
+
+    def test_a_mixed_window_reports_a_mixed_share(self):
+        # One trailing tick that dispatches nothing, so the last dispatched
+        # forward still gets its boundary -- the one-boundary lag, paid at the
+        # end of a window rather than hidden.
+        ticks = self.MIXED + ["idle"]
+        self.assertEqual(_share(_drive_ticks(ticks, _new_attribution)), 0.5)
+        # The broken hook flattens the same window to zero, so a mixed window
+        # and a pure decode drain were indistinguishable in the traces.
+        self.assertEqual(_share(_drive_ticks(ticks, _old_attribution)), 0.0)
+
+    def test_an_idle_stretch_is_still_no_measurement(self):
+        phases = _drive_ticks(["idle"] * 8, _new_attribution)
+        self.assertEqual(phases, [PHASE_IDLE] * 8)
+        self.assertIsNone(_share(phases))
+
+    def test_a_spec_verify_is_decode_not_prefill(self):
+        """``ForwardMode.is_extend()`` returns True for TARGET_VERIFY. Reading
+        it as prefill would report the reference NEXTN recipe's decode drain
+        -- the recipe both gate-3 arms booted -- as a prefill burst, which is
+        the same defect with the sign flipped."""
+        self.assertTrue(ForwardMode.TARGET_VERIFY.is_extend())
+        self.assertEqual(
+            phase_of_last_batch(_Batch(ForwardMode.TARGET_VERIFY)), PHASE_DECODE
+        )
+        self.assertEqual(
+            phase_of_last_batch(_Batch(ForwardMode.DLLM_EXTEND)), PHASE_DECODE
+        )
+        for mode in (ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL):
+            self.assertEqual(phase_of_last_batch(_Batch(mode)), PHASE_PREFILL, mode)
+
+    def test_every_dispatched_forward_is_attributed_exactly_once(self):
+        """The one-boundary lag, pinned. The fix trades a structural zero for
+        a shift of one boundary, and the claim that this is affordable rests
+        on the shift being uniform -- no forward dropped, none counted twice.
+        """
+        ticks = self.MIXED + self.BURST + ["idle"] * 3 + self.DRAIN
+        phases = _drive_ticks(ticks + ["idle"], _new_attribution)
+        dispatched_prefill = ticks.count("prefill")
+        self.assertEqual(phases.count(PHASE_PREFILL), dispatched_prefill)
 
 
 class TestTierSplit(CustomTestCase):
@@ -843,20 +1042,54 @@ class TestSchedulerHookContract(CustomTestCase):
         )
         self.assertEqual(calls[0].args, [], "the hook must be keyword-only")
 
-    def test_the_phase_split_is_three_way_and_shares_287s_work_split(self):
-        """UPDATED DELIBERATELY after the 2026-08-01 gate window.
+    def test_the_phase_is_attributed_to_the_retired_batch(self):
+        """UPDATED DELIBERATELY, twice, and this is the second time.
 
-        #287 asks a two-way question ("is this a decode round") and #363 used
-        to negate it, which put an EMPTY batch on the prefill side. The
-        prefill/decode split for a round that HAS work is still #287's -- so
-        the two controllers do not disagree about a working round -- but IDLE
-        is now its own answer, because an idle window is no measurement and
-        not 0 % prefill.
+        The 2026-08-01 gate window made the split three-way (idle stopped
+        falling on the prefill side). #388 changed WHICH BATCH it is read off:
+        ``running_batch`` has already absorbed the finished extend batch by
+        the time the hook runs, and ``is_prefill_only`` is a request kind
+        rather than an execution phase, so the prefill phase was unreportable.
+        The hook now hands the observer the phase of ``last_batch``.
+
+        Pinned on the source because it is a wiring property: which argument
+        reaches the hook, not what the hook does with it.
         """
-        src = self._scheduler_src()
-        self.assertIn('phase = "idle"', src)
+        import ast
+        import pathlib
+
+        import sglang.srt.managers.scheduler as mod
+
+        src = pathlib.Path(mod.__file__).read_text()
+        tree = ast.parse(src)
+        call = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "on_round"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "regime_observer"
+        )
+        phase = next(kw.value for kw in call.keywords if kw.arg == "phase")
+        # phase=phase_of_last_batch(last_batch), and nothing else.
+        self.assertIsInstance(phase, ast.Call)
+        self.assertEqual(phase.func.id, "phase_of_last_batch")
+        self.assertEqual([a.id for a in phase.args], ["last_batch"])
+        # The pre-#388 reading must not come back by another route.
         self.assertNotIn("prefill_active = not (", src)
-        self.assertIn("do not disagree about a", src)
+        self.assertNotIn('phase = "prefill"', src)
+        # And the provenance of `last_batch` itself, which is the one link in
+        # the chain the hermetic driver stands in for: both event loops
+        # publish the batch they dispatched, and only that.
+        self.assertEqual(src.count("self.last_batch = batch"), 2)
+        self.assertIn(
+            "plan = self.get_next_batch_to_run(\n"
+            "                running_batch=self.running_batch, "
+            "last_batch=self.last_batch\n"
+            "            )",
+            src,
+        )
 
 
 if __name__ == "__main__":

@@ -3381,26 +3381,33 @@ class Scheduler(
                 self.regime_observer = build_regime_observer(self)
             if self.regime_observer is not None:
                 from sglang.srt.managers.regime_runtime import (
+                    phase_of_last_batch,
                     rank_forward_ms_from,
                 )
 
-                # THREE-way, not two. #287 asks "is this a decode round" and
-                # negates for prefill, which puts an EMPTY batch on the
-                # prefill side. That is wrong for a regime classifier: an idle
-                # window is no measurement, not 0 % prefill (DESIGN_363
-                # section 3.2), and the 2026-08-01 gate window measured the
-                # consequence -- PREFILL_HEAVY on 93 600 of 93 603 verdicts on
-                # a mostly-idle rig. The decode/prefill split below is still
-                # #287's, so the two controllers do not disagree about a
-                # round that HAS work.
-                if running_batch.is_empty():
-                    phase = "idle"
-                elif running_batch.is_prefill_only:
-                    phase = "prefill"
-                else:
-                    phase = "decode"
+                # THREE-way (prefill / decode / idle), read off LAST_BATCH --
+                # the forward that just retired into this boundary -- and not
+                # off running_batch.
+                #
+                # running_batch cannot answer it. By the time control reaches
+                # here the top of this method has already merged a finished
+                # extend batch INTO running_batch, so during a prefill burst
+                # running_batch is the decode batch; and the next prefill
+                # batch is not built until get_new_batch_prefill below. The
+                # flag the hook used to read, is_prefill_only, is a REQUEST
+                # KIND (max_new_tokens == 0, forced False under spec), never
+                # an execution phase -- so prefill_share read 0.000 on all
+                # 34 954 boundaries of the 2026-08-01 window and on both
+                # gate-3 arms. #388.
+                #
+                # last_batch is the honest source at this point in the loop
+                # and it is also the CONSISTENT one: rank_forward_ms below is
+                # that same retired forward's device time, so phase and
+                # timing on one record describe one event. The attribution
+                # rules, including why one boundary of lag does not move a
+                # share, are in phase_of_last_batch.
                 self.regime_observer.on_round(
-                    phase=phase,
+                    phase=phase_of_last_batch(last_batch),
                     held_tokens=sum(req.seqlen for req in running_batch.reqs),
                     capacity_tokens=self._global_kv_capacity_tokens(),
                     running_bs=running_batch.batch_size(),
