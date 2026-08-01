@@ -380,6 +380,11 @@ class Scheduler(
         # built lazily on the first scheduler iteration when
         # --gdn-resident-state-slots is set.
         self.gdn_slot_executor = None
+        # #363 regime observer (OBSERVE-ONLY, actuates nothing): None on every
+        # default path. The mode is resolved once on the first iteration and
+        # cached, so the default path costs one attribute compare per round.
+        self.regime_observer = None
+        self._regime_observer_mode = None
         # #297 phase-boundary KV reshard runtime: None on every default path;
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
@@ -3346,6 +3351,60 @@ class Scheduler(
                 self.gdn_slot_executor = build_gdn_slot_executor(self)
             if self.gdn_slot_executor is not None:
                 self.gdn_slot_executor.on_round(running_batch, self.waiting_queue)
+
+        # #363 regime observer, OBSERVE-ONLY. Same between-tick boundary and
+        # the same lazy-build discipline as the two blocks above, and for one
+        # more reason of its own: this is where the previous batch's forward
+        # is already retired, so the per-rank device timing it reads is a
+        # completed measurement rather than a half-recorded one.
+        #
+        # It classifies and logs; it calls no actuator (DESIGN_363 section 6
+        # ships v1 observe-only). Every argument below is REPLICATED across
+        # the TP group -- the same uniformity argument the #287 block above
+        # makes -- except rank_forward_ms, which is this rank's own number and
+        # is released only through the observer's consensus reduction.
+        #
+        # Unset env = the attribute stays None and this is one predictable
+        # branch per round, byte-identical to today.
+        if self._regime_observer_mode is None:
+            from sglang.srt.managers.regime_runtime import observe_mode
+
+            self._regime_observer_mode = observe_mode()
+        if self._regime_observer_mode != "off":
+            if self.regime_observer is None:
+                from sglang.srt.managers.regime_runtime import (
+                    build_regime_observer,
+                )
+
+                self.regime_observer = build_regime_observer(self)
+            if self.regime_observer is not None:
+                from sglang.srt.managers.regime_runtime import (
+                    rank_forward_ms_from,
+                )
+
+                # #287's own phase definition, reused rather than
+                # re-derived: two controllers holding two definitions of
+                # "this round was a decode round" is the divergence class
+                # DESIGN_363 section 7.3 argues against.
+                prefill_active = not (
+                    not running_batch.is_empty()
+                    and not running_batch.is_prefill_only
+                )
+                self.regime_observer.on_round(
+                    prefill_active=prefill_active,
+                    held_tokens=sum(req.seqlen for req in running_batch.reqs),
+                    capacity_tokens=self._global_kv_capacity_tokens(),
+                    running_bs=running_batch.batch_size(),
+                    queued_reqs=len(self.waiting_queue),
+                    queued_prompt_tokens=sum(
+                        len(req.origin_input_ids) for req in self.waiting_queue
+                    ),
+                    max_queued_prompt_tokens=max(
+                        (len(req.origin_input_ids) for req in self.waiting_queue),
+                        default=0,
+                    ),
+                    rank_forward_ms=rank_forward_ms_from(self),
+                )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)

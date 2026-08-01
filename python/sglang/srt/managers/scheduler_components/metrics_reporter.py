@@ -146,6 +146,11 @@ class RankPrefillLog:
         self._pending: deque = deque()
         # (total_seconds, collective_seconds | None), completion order
         self._durations: deque = deque()
+        # #363 structured tap: the last flushed line's numbers, for the
+        # regime observer. ``None`` until the first timed prefill flushes.
+        self.last_gpu_ms: Optional[float] = None
+        self.last_wait_ms: Optional[float] = None
+        self.last_split_known: bool = False
 
     @property
     def has_pending(self) -> bool:
@@ -213,6 +218,15 @@ class RankPrefillLog:
             line += " (compute %.1f, wait %.1f)"
             args += [max(gpu_s - wait_s, 0.0) * 1000.0, wait_s * 1000.0]
         logger.info(line, *args)
+        # #363: the same numbers, kept for one structured reader instead of
+        # only being formatted into a log line. ``last_split_known`` is False
+        # for a graph-covered forward, and the two ms fields then stay at the
+        # values of the last forward that WAS measurable -- so a consumer must
+        # gate on the flag rather than on the numbers. Nothing above changed:
+        # this is three attribute writes after the line is already emitted.
+        self.last_gpu_ms = gpu_s * 1000.0
+        self.last_wait_ms = (wait_s * 1000.0) if split_known else None
+        self.last_split_known = split_known
 
 
 @dataclass(kw_only=True)

@@ -557,3 +557,181 @@ leaving `MIXED` needs only a challenger, falling back to it needs only the
 incumbent to have failed, and every other transition needs both. Caught by
 construction rather than by review, which is the argument for building the
 classifier in phase 1 instead of describing it.
+
+---
+
+## 10. Phase 2 — falsifier results
+
+All hermetic, CPU-only, no card. Suite:
+`test/registered/unit/managers/test_regime_classifier.py` (F0, F1) and
+`test_regime_observe.py` (F2–F5), **87 passed**.
+
+### F0 — interlock refusal: PASS
+
+A stage flip whose pool cannot hold the working set is refused with both
+numbers in the message. Driven on the measured #354 pair: 100 000 held tokens
+against the FP8 prefill arm's 96 256, refused; against the decode arm's
+453 632, admitted.
+
+### F1 — oscillation: PASS
+
+Two adversarial traces, one per mechanism.
+
+* Dither at the entry threshold, 512 rounds: **≤ 2 flips** (measured 0). The
+  entry window requires consecutive samples, which a dither never supplies.
+* Square wave with a 16-round half-period against a 64-round dwell, 1024
+  rounds: flips bounded by `rounds / min_dwell_rounds`, and the dwell gate
+  recorded refusals — i.e. it actually bound rather than being satisfied
+  vacuously.
+* No stage is returned to inside one dwell interval.
+
+### F2 — self-conditioning replay: PASS, and the trap is confirmed real
+
+The sharpest result of phase 2, because it demonstrates the mechanism before
+crediting the guard with closing it. Workload: 90 000 held tokens, prefill-
+heavy, shape constant for 240 rounds — so *any* regime change in the closed
+loop came from the controller.
+
+| arm | capacity source | regimes observed |
+|---|---|---|
+| open loop | fixed at the decode pool (453 632) | `PREFILL_HEAVY` only, occupancy 20 % |
+| closed loop, **naive** (no interlock) | follows the committed stage | `PREFILL_HEAVY` → flip → `KV_PRESSURE` |
+| closed loop, **guarded** | follows the committed stage | identical to its own open loop |
+
+The naive arm manufactures `KV_PRESSURE` out of its own denominator: 90 000
+tokens is 20 % of 453 632 and 93 % of 96 256, above the 85 % ascend mark. The
+guarded arm refuses that flip (F0's arithmetic) and its transition sequence
+equals the open-loop replay exactly.
+
+Control on the control: at 40 000 held tokens the prefill pool is not the
+constraint, the flip **does** commit, and the closed loop still matches its
+replay. The guard is discriminating, not simply refusing.
+
+### F3 — noise floor per input signal: PASS
+
+Band computed the house way (#360): the largest difference an arm shows
+against its own repeat. On the prefill-share traces used here the band is
+**0.02**.
+
+* The shipped threshold gap (`enter_prefill` 0.35 − `exit_prefill` 0.15 =
+  0.20) clears 2× that band.
+* Demonstrated, not asserted: a sensor whose marks are 0.01 apart — inside the
+  band — tracks a pure-noise trace and transitions repeatedly; the shipped
+  marks transition **zero** times on the identical trace.
+* The occupancy marks are #287's, so they are not re-derived and cannot
+  disagree with the pressure ladder about the same pool.
+
+Constants in §3.4 remain provisional: this fixes the *method* and proves the
+sensor is not thresholding inside noise, but the real per-signal bands are a
+card measurement (phase 3).
+
+### F4 — do-nothing baseline: hermetic half PASS, card half deferred
+
+The card comparison (off / observe / on, judged on ms/verify and ms/prefill
+against the off arm's own band, at equal or better capacity) is phase 3. What
+is settled here is the property that makes it meaningful: the observe arm
+reports `actuations: 0` by construction, calls no actuator (checked on the
+syntax tree — imports and attribute calls, not a substring grep over prose),
+and is `off` by default. It is therefore a legitimate do-nothing baseline that
+differs from `off` only in what it writes down.
+
+### F5 — consensus desync: PASS, with a deliberate departure from #287
+
+An injected channel supplies a peer that classified differently while agreeing
+on every other field. The observer **counts and logs** the disagreement at
+WARNING and does **not** raise.
+
+That is the departure and it is intentional. #287 raises because continuing
+would run a collective under a geometry the ranks disagree about; nothing here
+acts, so nothing here can hang, and an instrument that takes the server down
+while proving the classifier is safe has failed at its own job. The count is
+carried in `summary()["desyncs"]` because it is the **phase-3 gate**: a
+non-zero desync count over a real workload blocks wiring any actuator.
+
+---
+
+## 11. The observe-only wiring contract
+
+What phase 2 shipped into the loop, stated as obligations so phase 3 inherits
+them explicitly.
+
+### 11.1 Placement
+
+One block in `managers/scheduler.py`, at the same between-tick boundary as the
+#287 pressure block and the #364 GDN executor, after the #364 call and before
+batch selection. Two reasons: the previous batch is retired, so the per-rank
+device timing it reads is a completed measurement rather than a half-recorded
+one; and the next batch is not selected yet, so nothing the observer reads can
+be mid-mutation.
+
+### 11.2 Cost when off
+
+`SGLANG_REGIME_OBSERVE` unset (the default) resolves the mode once on the
+first iteration and caches it; the per-round cost is one attribute compare and
+the observer is never constructed. No import, no collective, no allocation.
+Pinned by a source-level contract test that the build sits behind the gate.
+
+The flag proper (`--regime-controller`) lands with phase 3, when there is an
+action to authorize. Registering a server-args knob for a no-op would spread
+the change across `server_args.py` and `environ.py` for nothing.
+
+### 11.3 The tier split, as an obligation on the caller
+
+Every keyword the scheduler passes is **tier R — replicated** except one:
+
+```
+prefill_active            #287's own phase definition, reused not re-derived
+held_tokens               sum(req.seqlen) over the running batch
+capacity_tokens           _global_kv_capacity_tokens()   (the #346 global span)
+running_bs                running_batch.batch_size()
+queued_reqs               len(waiting_queue)
+queued_prompt_tokens      sum(len(req.origin_input_ids))
+max_queued_prompt_tokens  max(len(req.origin_input_ids))
+--------------------------------------------------------------------
+rank_forward_ms           TIER L. This rank's own number.
+```
+
+A test asserts that exact keyword set, so adding an input to the hook forces a
+tier decision rather than allowing one by default. The hook is keyword-only
+for the same reason.
+
+`rank_forward_ms` is accumulated, never branched on, quantized into the packed
+proposal and read back only as a group spread. Reading it locally before the
+collective is the #94/#194/#259/#312 hang class.
+
+### 11.4 The collective
+
+One bounded MIN all-reduce over the TP CPU group, every
+`consensus_interval`-th round, gated by the **replicated round counter** and
+never by local state — #287 rule 2 verbatim, using #287's own
+`default_collective_min` rather than a second channel with a second idea of
+what a dead peer looks like. A multi-rank group with no channel is recorded as
+`uncoordinated` rather than refused: nothing acts on the verdict, so it is a
+degraded observation, but it must not read as a clean run.
+
+### 11.5 The one-boundary lag
+
+The spread exists only after the reduction, and the classification that
+produced the proposal ran before it. Each record therefore carries both
+`sample_spread_pct` (what went in, from the previous boundary) and
+`rank_ms_spread_pct` (what this reduction produced). In observe-only nothing
+consumes it; when it becomes a veto input in phase 3 it is one boundary stale
+**by construction**, which is a property of the reduction and not a shortcut.
+
+### 11.6 The sensing adapter, and its documented absence
+
+`rank_forward_ms_from(scheduler)` reads the #252 per-rank prefill timing
+through a structured tap added to `RankPrefillLog` (three attribute writes
+after the log line is already emitted; no behaviour change). Per §7.1 it
+returns a number only when `last_split_known` is true — a graph-covered
+forward reports nothing rather than a wrong zero, and that absence travels
+into the payload as a sentinel so a blind rank cannot read as an infinitely
+fast one.
+
+### 11.7 What phase 3 must clear before wiring an actuator
+
+1. `summary()["desyncs"] == 0` over a real workload (F5's gate).
+2. F2 re-run against a live trace, not only the synthetic one.
+3. F3's per-signal bands measured on the rig; every constant in §3.4 replaced
+   or confirmed.
+4. F4's card comparison passed at equal or better `max_total_num_tokens`.
