@@ -75,6 +75,75 @@ if _is_cuda and _has_sgl_int8_scaled_mm:
 logger = logging.getLogger(__name__)
 
 
+#: Runbook section that documents the wheel, its provenance and the pin.
+INT8_ARM_RUNBOOK_SECTION = "docs/rig-runbook.md section 2.1 (sgl-kernel INT8 arm)"
+
+#: Quantization names whose serving path needs ``sgl_kernel.int8_scaled_mm``.
+INT8_ARM_QUANTIZATIONS = ("w8a8_int8", "compressed-tensors", "compressed_tensors")
+
+
+def int8_arm_available() -> bool:
+    """Is ``sgl_kernel.int8_scaled_mm`` importable in THIS interpreter?
+
+    A function, not the module-level flag, so a test can drive both answers
+    without reimporting the package.
+    """
+    try:
+        from sgl_kernel import int8_scaled_mm  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def require_int8_arm(
+    quantization: Optional[str],
+    *,
+    is_cuda_group: bool = True,
+    available: Optional[bool] = None,
+) -> None:
+    """Refuse an INT8-W8A8 boot whose wheel has no INT8 arm -- AT BOOT (#384).
+
+    WHY THIS EXISTS WHEN A LOUD ERROR ALREADY DOES.
+    ``CompressedTensorsW8A8Int8.__init__`` already raises when the arm is
+    missing, but it raises during LAYER CONSTRUCTION -- inside the JIT
+    cold-build window -- so the operator sees ``ColdBuildWindowError`` and a
+    suggestion to lower ``--mem-fraction-static``, which is unrelated and
+    unactionable. The real cause (an sgl-kernel wheel without the arm) is
+    decidable from ``server_args.quantization`` alone, before a byte of weight
+    is read, and that is where it belongs.
+
+    Its message is also the wrong diagnosis for this case: it blames the sm75
+    gencode floor, which is right for a 2080 Ti and wrong for a modern card
+    running a pypi wheel that simply does not carry the arm. This one names
+    the wheel and the runbook section instead.
+
+    Pure: ``available`` is injectable so the refusal is testable on a host
+    where the arm happens to be present.
+    """
+    if not is_cuda_group:
+        return
+    if not quantization:
+        return
+    if str(quantization).lower().replace("-", "_") not in (
+        q.replace("-", "_") for q in INT8_ARM_QUANTIZATIONS
+    ):
+        return
+    have = int8_arm_available() if available is None else bool(available)
+    if have:
+        return
+    raise RuntimeError(
+        f"--quantization {quantization} needs sgl_kernel.int8_scaled_mm and "
+        "this interpreter's sgl-kernel does not provide it. The stock pypi "
+        "wheel ships without the INT8 arm; the fork wheel carries it. Install "
+        f"the fork wheel and pin it -- see {INT8_ARM_RUNBOOK_SECTION}. "
+        "Refused here, at argument resolution, because the same failure "
+        "during layer construction surfaces as a ColdBuildWindowError telling "
+        "you to lower --mem-fraction-static, which is neither the cause nor a "
+        "fix."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Uneven-TP alignment for the INT8 W8A8 GEMM (task #353).
 #

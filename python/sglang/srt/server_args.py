@@ -5454,6 +5454,21 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # #384: an INT8-W8A8 boot whose sgl-kernel has no int8_scaled_mm arm is
+        # decidable from the quantization name alone. Refuse HERE -- the same
+        # failure during layer construction surfaces as a ColdBuildWindowError
+        # blaming --mem-fraction-static, which is neither the cause nor a fix.
+        # Import-local: the quantization package pulls torch extensions, and
+        # __post_init__ runs in the launcher before that is wanted.
+        try:
+            from sglang.srt.layers.quantization.w8a8_int8 import require_int8_arm
+
+            require_int8_arm(self.quantization)
+        except ImportError:
+            # No quantization package available at all (CPU-only checkout):
+            # nothing to validate, and this must not become a boot blocker.
+            pass
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.

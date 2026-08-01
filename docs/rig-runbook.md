@@ -87,6 +87,100 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 | `SGLANG_SP_CAPACITY_WEIGHTS` | comma-separated positive floats, one per SP rank (e.g. `1.0,0.46,0.46`) | diffusion lane (#333-M3) only. Switches `multimodal_gen`'s sequence-parallel `build_shard_plan` from the equal split to a capacity-weighted one: a faster card is handed a proportionally longer slice of the sequence. Unset (the default) keeps the equal-and-tail-padded split byte-for-byte. A wrong-length or malformed vector is a hard error, not a silent fallback. The registry's Class-2 adapter sets this from measured `gemm_tflops` when `launch.enable_uneven_sp` is on; see `docs/dev/DESIGN_333_M3_diffusion_lane.md` |
 
+## 2.1 sgl-kernel INT8 arm — provenance, pin, and the reinstall hazard (#384)
+
+**The INT8-W8A8 production default needs `sgl_kernel.int8_scaled_mm`, and the
+stock pypi wheel does not ship it.** Without the arm the boot dies during layer
+construction, inside the JIT cold-build window, so what the operator sees is
+`ColdBuildWindowError` advising a lower `--mem-fraction-static` — neither the
+cause nor a fix. Since #384 that case is refused at argument resolution with a
+message naming the wheel and this section
+(`w8a8_int8.require_int8_arm`).
+
+### What is installed on CT999, measured
+
+Two distributions both provide the `sgl_kernel` import package:
+
+| dist-info | dist name | provides `sgl_kernel/` | has INT8 arm |
+|---|---|---|---|
+| `sgl_kernel-0.3.21.dist-info` | `sgl-kernel` (pypi) | 69 files | no |
+| `sglang_kernel-0.4.4.dist-info` | `sglang-kernel` (fork) | 74 files | **yes** |
+
+`import sgl_kernel` currently reports `0.4.4` and `int8_scaled_mm` is present,
+i.e. the fork's files are the ones on disk.
+
+Fork wheel provenance (from the fork dist's `direct_url.json`):
+
+```
+file:///spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+sha256 e7b16e1d74527ba070afeaf7bab58ed5df0fadbeb344d0fb372ff334f7e15b54
+```
+
+**THE HAZARD, and why this section exists.** The two dists have DIFFERENT
+distribution names but the SAME import package, so pip does not see a conflict:
+whichever was installed last owns the files. Any `pip install` / `pip
+install -U` / requirements sync that touches **`sgl-kernel`** will restore the
+0.3.21 files over the fork's and silently remove the INT8 arm — the dist is
+still registered at 0.3.21 and pip considers it installed. That is the shape
+this failure keeps coming back in (see also the #357 roll-forward/roll-back
+pair, which flipped the same files twice).
+
+### Pin
+
+Pin the fork wheel by path and hash; never let `sgl-kernel` be resolved from
+an index in this venv:
+
+```
+# requirements pin (CT999 venv)
+sglang-kernel @ file:///spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl \
+    --hash=sha256:e7b16e1d74527ba070afeaf7bab58ed5df0fadbeb344d0fb372ff334f7e15b54
+```
+
+### Making it durable (run when the venv is QUIET)
+
+Not executed at the time of writing, deliberately: the venv is shared and was
+in active use by another agent's INT8 microbench, and removing/reinstalling the
+`sgl_kernel` files under a running process is how a working rig becomes a
+broken one mid-measurement. Run this when nothing else is on the box:
+
+```bash
+V=/spinning/htsglang-gpu/.venv
+$V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # before
+$V/bin/pip uninstall -y sgl-kernel                 # drop the shadowing 0.3.21 dist
+$V/bin/pip install --no-deps --force-reinstall \
+  /spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+$V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # after: 0.4.4 True
+```
+
+Verify BOTH directions afterwards, as #357 did: the fork version reported AND
+the arm importable. A version bump alone is not evidence.
+
+### Docker image path (recipe only — image rebuild is a separate step)
+
+The image must not pull `sgl-kernel` from an index either. In the build:
+
+```dockerfile
+COPY sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl /tmp/
+RUN pip uninstall -y sgl-kernel || true && \
+    pip install --no-deps /tmp/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl && \
+    python -c "import sgl_kernel; assert hasattr(sgl_kernel,'int8_scaled_mm')"
+```
+
+The trailing assert is the point: it turns a silently-armless image into a
+failed build instead of a runtime `ColdBuildWindowError` months later.
+
+### Related cu13 drift item: deep_gemm and `libnvrtc.so.13`
+
+Same family, same section so they are found together. `deep_gemm` resolves
+`libnvrtc.so.13` at import; the cu13 libraries live under the venv's
+`nvidia/cu13/lib`, which is not on the default loader path. Every launch
+recipe in section 4 already exports it, and a boot that skips it fails in
+`deep_gemm` rather than anywhere informative:
+
+```bash
+export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+```
+
 ## 3. Mandatory boot flags
 
 `--enable-metrics` is required on **every** `sglang.launch_server` invocation
