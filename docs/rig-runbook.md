@@ -730,6 +730,37 @@ An `mmproj-*.gguf` left in the directory is picked up automatically
 prefill CUDA graph (`Breakable CUDA graph is incompatible with multimodal
 model`). Both #154 trees ship one. Move it aside for a text-only measurement.
 
+### 4.5.2 Split GGUFs (`-00001-of-000NN.gguf`) load as a set
+
+Exports above a few tens of GiB ship as several files written by
+`llama-gguf-split`. There is no flag and no merge step: point `--model-path` at
+**any** part and the loader resolves the whole set
+(`model_loader/gguf_shards.py`), reads metadata from part 1 and streams tensors
+from all parts. `llama-gguf-split --merge` is no longer needed, and the binary
+does not have to be on the box.
+
+What to check in the log on a split boot:
+
+- `GGUF split export: resolved N parts for <basename>` — if this line is absent
+  the file was not detected as split and only its own tensors will load.
+- The name-map line (`<family> GGUF name map: N tensors for L layers`) must
+  report the export's FULL tensor count, not one part's.
+
+The shape of the layout is worth knowing because it is what made the
+single-file assumption dangerous rather than merely limiting: part 1 carries
+the entire KV block (architecture, geometry, tokenizer) and, for a large
+export, **zero tensors**; the later parts carry tensors and a six-entry
+`split.*` KV block that does not even include `general.architecture`. Pointed
+at part 1, the old loader therefore built a correct model skeleton and loaded
+nothing into it, silently.
+
+Three refusals fire instead of a partial load, all naming the offending file:
+
+- a part of the declared set is missing from the directory;
+- a part's `split.no` / `split.count` does not match its position (two exports
+  mixed in one directory);
+- the parts hold fewer tensors than their `split.tensors.count` declares.
+
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 
 New with #256: an fp8 MoE checkpoint larger than one card now boots on one

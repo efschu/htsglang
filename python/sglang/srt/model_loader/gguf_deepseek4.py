@@ -33,8 +33,6 @@ deepseek-ai/DeepSeek-V4-Flash-0731.
 from __future__ import annotations
 
 import logging
-import os
-import re
 from typing import Dict, Iterable, List, Tuple
 
 import torch
@@ -161,77 +159,6 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
     FUSE_MAP: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
-    # Split (multi-shard) files
-    # ------------------------------------------------------------------
-
-    def shard_paths(self) -> List[str]:
-        """Every shard of a split GGUF, in order, or just the one file.
-
-        llama.cpp splits a large export into ``...-00001-of-000NN.gguf`` parts
-        and records ``split.count`` / ``split.no`` in each part's KV block. The
-        first part of an unsloth DeepSeek V4 export holds the metadata and zero
-        tensors, so an audit that looked only at ``self.gguf_file`` would see an
-        empty model.
-        """
-        import gguf
-
-        reader = gguf.GGUFReader(self.gguf_file, "r")
-        field = reader.fields.get("split.count")
-        count = int(field.contents()) if field is not None else 0
-        if count <= 1:
-            return [self.gguf_file]
-
-        directory, filename = os.path.split(self.gguf_file)
-        match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", filename)
-        if match is None:
-            return [self.gguf_file]
-        stem = filename[: match.start()]
-        total = match.group(2)
-        paths = [
-            os.path.join(directory, f"{stem}-{i + 1:05d}-of-{total}.gguf")
-            for i in range(count)
-        ]
-        missing = [p for p in paths if not os.path.isfile(p)]
-        if missing:
-            raise RuntimeError(
-                f"{self.FAMILY} GGUF: split file {self.gguf_file} declares "
-                f"{count} shards but {len(missing)} are missing: "
-                f"{[os.path.basename(p) for p in missing]}"
-            )
-        return paths
-
-    def assert_not_split(self) -> None:
-        """Fail with the fix instead of loading an empty model.
-
-        ``GGUFModelLoader._prepare_weights`` takes a single file and
-        ``gguf_quant_weights_iterator`` opens exactly that file, so a split
-        export loads only the tensors of the shard it was pointed at -- for
-        this family, the metadata shard, i.e. nothing at all.
-        """
-        paths = self.shard_paths()
-        if len(paths) <= 1:
-            return
-        raise RuntimeError(
-            f"{self.FAMILY} GGUF {self.gguf_file} is shard 1 of "
-            f"{len(paths)} of a split export. sglang's GGUF weight iterator "
-            "reads a single file, so only that shard's tensors would be "
-            "loaded. Merge the shards first:\n"
-            f"    llama-gguf-split --merge {paths[0]} <merged>.gguf\n"
-            "and point --model-path at the merged file."
-        )
-
-    def _file_tensors(self) -> set:
-        """Union of the tensor names across all shards of a split file."""
-        if self._file_tensor_names is None:
-            import gguf
-
-            names = set()
-            for path in self.shard_paths():
-                names.update(str(t.name) for t in gguf.GGUFReader(path, "r").tensors)
-            self._file_tensor_names = names
-        return self._file_tensor_names
-
-    # ------------------------------------------------------------------
     # Name map
     # ------------------------------------------------------------------
 
@@ -269,7 +196,6 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
         return gguf_to_native
 
     def build_name_map(self) -> Dict[str, str]:
-        self.assert_not_split()
         name_map = self._build_name_map_unchecked()
         self.assert_quant_types_executable()
         logger.info(
@@ -303,15 +229,14 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
         check the failure surfaces as a bare ``NotImplementedError`` from
         ``fused_mul_mat_gguf`` after the whole 119 GiB file has been read.
         """
-        import gguf
+        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
 
         supported = _supported_ggml_types()
         offenders: Dict[str, List[str]] = {}
-        for path in self.shard_paths():
-            for tensor in gguf.GGUFReader(path, "r").tensors:
-                ttype = tensor.tensor_type
-                if ttype not in supported:
-                    offenders.setdefault(ttype.name, []).append(str(tensor.name))
+        for tensor in iter_gguf_tensors(self.shard_paths()):
+            ttype = tensor.tensor_type
+            if ttype not in supported:
+                offenders.setdefault(ttype.name, []).append(str(tensor.name))
         if not offenders:
             return
         detail = "; ".join(
@@ -325,7 +250,11 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
             "I-matrix) plus F32/F16/BF16/I32; there is no dequantize or "
             "matmul kernel for the others. Use a quantization whose tensors "
             "are all within that set, or add the missing type to the GGUF "
-            "kernels first."
+            "kernels first. For MXFP4 specifically, see "
+            "test/registered/unit/model_loader/test_gguf_mxfp4_bridge.py: the "
+            "block is value-exactly convertible both to the safetensors mxfp4 "
+            "parameter pair and to GGUF Q5_0, so neither repair needs a new "
+            "quantizer -- only wiring."
         )
 
     # ------------------------------------------------------------------

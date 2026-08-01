@@ -1221,11 +1221,12 @@ def multi_thread_pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
-    import gguf
+    from sglang.srt.model_loader.gguf_shards import gguf_tensor_names
 
-    reader = gguf.GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
-    exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
+    # Union over the whole split set: a tensor that lives on part 3 is not an
+    # "extra" (i.e. absent) tensor just because part 1 does not hold it.
+    exact_gguf_keys = gguf_tensor_names(gguf_file)
     extra_keys = expected_gguf_keys - exact_gguf_keys
     return [gguf_to_hf_name_map[key] for key in extra_keys]
 
@@ -1240,7 +1241,27 @@ def gguf_quant_weights_iterator(
 
     import gguf
 
-    reader = gguf.GGUFReader(gguf_file)
+    from sglang.srt.model_loader.gguf_shards import (
+        declared_tensor_count,
+        resolve_gguf_shard_paths,
+    )
+
+    # A split export is several files; an unsplit one resolves to a single-entry
+    # list and this reads exactly like the one-reader version it replaces. Both
+    # passes below run over the CONCATENATION in shard order, which is the order
+    # a merged file would present, rather than per-shard pass1+pass2.
+    shard_paths = resolve_gguf_shard_paths(gguf_file)
+    readers = [gguf.GGUFReader(path, "r") for path in shard_paths]
+    all_tensors = [tensor for reader in readers for tensor in reader.tensors]
+
+    expected_tensors = declared_tensor_count(gguf_file)
+    if expected_tensors is not None and len(all_tensors) != expected_tensors:
+        raise RuntimeError(
+            f"GGUF split export {gguf_file}: the {len(shard_paths)} parts hold "
+            f"{len(all_tensors)} tensors but declare split.tensors.count="
+            f"{expected_tensors}. Loading them would produce a model with "
+            "silently missing weights."
+        )
 
     # MoE expert weight name patterns
     MOE_WEIGHT_PATTERNS = {
@@ -1250,7 +1271,7 @@ def gguf_quant_weights_iterator(
     }
 
     # First pass: yield weight types
-    for tensor in reader.tensors:
+    for tensor in all_tensors:
         weight_type = tensor.tensor_type
         tensor_name = tensor.name
 
@@ -1286,7 +1307,7 @@ def gguf_quant_weights_iterator(
                 yield weight_type_name, torch.tensor(weight_type)
 
     # Second pass: yield actual weights
-    for tensor in reader.tensors:
+    for tensor in all_tensors:
         weight = tensor.data
         weight_type = tensor.tensor_type
         tensor_name = tensor.name

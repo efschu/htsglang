@@ -260,10 +260,83 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         self.assertEqual(len(name_map), 1328)
         self.assertEqual(len(set(name_map.values())), 1328)
 
-    def test_split_file_is_refused_with_the_merge_instruction(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            self.adapter.assert_not_split()
-        self.assertIn("llama-gguf-split --merge", str(ctx.exception))
+    def test_the_shard_set_resolves_from_any_part(self):
+        """#391 blocker 2: split sets are loaded, not refused. ``split.count``
+        is in every part's KV block, so pointing at part 3 must resolve the same
+        four files as pointing at part 1."""
+        from sglang.srt.model_loader.gguf_shards import (
+            gguf_metadata_path,
+            resolve_gguf_shard_paths,
+        )
+
+        expected = self.adapter.shard_paths()
+        for part in expected:
+            self.assertEqual(resolve_gguf_shard_paths(part), expected)
+            self.assertEqual(gguf_metadata_path(part), expected[0])
+
+    def test_map_covers_tensors_that_are_not_on_the_metadata_shard(self):
+        """Part 1 holds ZERO tensors; a map built from it alone would be empty
+        and the unmapped-tensor audit would pass vacuously."""
+        import gguf
+
+        first_shard_tensors = {
+            str(t.name)
+            for t in gguf.GGUFReader(self.adapter.shard_paths()[0], "r").tensors
+        }
+        self.assertEqual(first_shard_tensors, set())
+        self.assertIn("token_embd.weight", self.adapter._file_tensors())
+
+    def test_a_tensor_on_a_later_part_is_readable(self):
+        """Header reads prove resolution; this proves the payload is reachable
+        through the same stream. ``attn_sinks`` is 64 floats, so it costs a
+        page, not a shard."""
+        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
+
+        wanted = "blk.0.attn_sinks.weight"
+        for tensor in iter_gguf_tensors(self.adapter.shard_paths()):
+            if str(tensor.name) == wanted:
+                self.assertEqual(tuple(tensor.shape), (64,))
+                self.assertEqual(len(tensor.data.reshape(-1)), 64)
+                return
+        self.fail(f"{wanted} not found across the shard set")
+
+    def test_sibling_config_reconciles_against_the_shard_set(self):
+        """The vocab cross-check reads ``token_embd.weight``, which lives on
+        part 2 while every KV field it compares lives on part 1."""
+        import json
+
+        from sglang.srt.model_loader.gguf_registry import reconcile_sibling_config
+
+        config_path = os.path.join(DSV4_GGUF_DIR, "config.json")
+        if not os.path.isfile(config_path):
+            self.skipTest(f"sibling config.json not placed at {config_path}")
+        with open(config_path) as handle:
+            raw = json.load(handle)
+
+        class _Sibling:
+            pass
+
+        sibling = _Sibling()
+        for attr in (
+            "hidden_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "vocab_size",
+            "num_hidden_layers",
+        ):
+            if attr in raw:
+                setattr(sibling, attr, raw[attr])
+
+        reconcile_sibling_config(sibling, DSV4_GGUF_FIRST_SHARD, DEEPSEEK4_GGUF_ARCH)
+        self.assertEqual(sibling.num_hidden_layers, NUM_LAYERS)
+
+        sibling.vocab_size = raw["vocab_size"] + 1
+        with self.assertRaises(ValueError) as ctx:
+            reconcile_sibling_config(
+                sibling, DSV4_GGUF_FIRST_SHARD, DEEPSEEK4_GGUF_ARCH
+            )
+        self.assertIn("vocab_size", str(ctx.exception))
 
     def test_unexecutable_quant_type_is_refused(self):
         # UD-Q3_K_XL stores the routed down projection as MXFP4, for which
