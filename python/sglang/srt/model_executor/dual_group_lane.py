@@ -2488,6 +2488,34 @@ class DualGroupLane:
         if value is not None:
             job.setdefault("_margins", []).append(round(float(value), 6))
 
+    def _record_verify_margins(self, job, logits, n_emitted: int) -> None:
+        """One margin per EMITTED token of a batched verify round.
+
+        Verify row ``i`` is by construction the forward that decided
+        ``emitted[i]``: rows ``0 .. n_accept`` map one-to-one onto the emitted
+        block and the rows past the first rejection are dropped. That is the
+        same rule ``_verify_by_decode`` applies to its per-candidate forwards,
+        and it has to hold here too, because the result row advertises
+        ``margins`` as aligned with ``output_ids``.
+
+        Without this the alignment breaks silently and in the direction that
+        matters. ``target_verify`` is the DEFAULT verify mode, so a
+        speculative job used to record exactly one margin -- the prefill
+        token's -- against 64 committed ids, and ``r12/verdict.py`` reads
+        ``margins[first_divergent_index]`` positionally. A short list makes
+        the lane's own perturbation band unmeasurable and hands the world-A /
+        world-B decision back to the pre-registered ``NEAR_TIE_ABS``
+        constant, which is precisely what #284 recorded must not decide it.
+
+        Costs a topk per emitted token and is therefore gated, like every
+        other call site, on ``SGLANG_LANE_MARGIN_PROBE``.
+        """
+        if not self._margin_probe_on() or logits is None:
+            return
+        rows = int(getattr(logits, "shape", (0,))[0])
+        for i in range(min(int(n_emitted), rows)):
+            self._record_margin(job, self._top2_margin(logits[i : i + 1]))
+
     def _timed_forward_raw(self, batch, capture_mode=None):
         """A lane forward that returns the LOGITS OUTPUT instead of sampled
         ids -- the verify path needs the per-candidate argmax and the hidden
@@ -3608,6 +3636,15 @@ class DualGroupLane:
                 cap = os.environ.get("SGLANG_LANE_SPEC_TV_MAX_ACCEPT")
             if cap is not None:
                 n_accept = min(n_accept, int(cap))
+            # After the cap, so a falsifier arm records exactly the block it
+            # emitted rather than the block it could have emitted.
+            if self._margin_probe_on():
+                vlogits = getattr(out, "next_token_logits", None)
+                if vlogits is None or int(vlogits.shape[0]) != d:
+                    # Same fallback ``_verify_predictions`` takes, so the
+                    # margins are read off the very rows the argmaxes were.
+                    vlogits = self._candidate_logits(out.hidden_states)
+                self._record_verify_margins(job, vlogits, n_accept + 1)
             if self._dbg_on():
                 self._dbg(
                     "tv_round",

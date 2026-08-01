@@ -104,6 +104,10 @@ def _row(res: Dict[str, Any]) -> Dict[str, Any]:
         "head_graph_forwards": res.get("head_graph_forwards"),
         "prefill_ms": res.get("prefill_ms"),
         "output_ids": res.get("output_ids"),
+        # Present only under SGLANG_LANE_MARGIN_PROBE=1 on the server. Carried
+        # through so the r12 margin verdict can run off THIS window's arms
+        # instead of needing a second boot (#284's named follow-on).
+        "margins": res.get("margins"),
     }
 
 
@@ -185,6 +189,13 @@ def run_gate(
     out: Dict[str, Any] = {"prompts": {}, "verdict": None}
     coherent = True
     identical_rate_fail = 0
+    # The two arms in exactly the shape ``r12/verdict.py`` reads, so the
+    # world-A / world-B question can be settled from THIS window. #284 wired
+    # the lane's margin probe and named the missing piece as "a few lines in
+    # lane_spec_window.py at the point the arms are assembled"; this is that
+    # point, and leaving it undone is what would have cost the repro window a
+    # second boot.
+    verdict_arms: Dict[str, Any] = {"no_spec": {"prompts": {}}, "spec": {"prompts": {}}}
     for name in prompt_names:
         if time.time() > deadline:
             out["truncated_at"] = name
@@ -244,10 +255,15 @@ def run_gate(
         # a cross-arm delta has to clear is the one the arms measure on
         # THEMSELVES (#360): a score difference is only evidence when the
         # same arm scores the same twice.
-        scored = {
-            k: graded_score(name, detokenize(v["output_ids"], tokenizer))["score"]
-            for k, v in arms.items()
-        }
+        #
+        # The decoded text is kept, not just scored and dropped. #399's desk
+        # phase opened with "read the recorded probe answers, classify the
+        # failure mode" and could not: the report carried a score of 2 out of
+        # 8 and no way to see whether that was wrong arithmetic, a truncation
+        # or a refusal. A score is a summary of an answer and cannot stand in
+        # for it when the summary is the thing under suspicion.
+        texts = {k: detokenize(v["output_ids"], tokenizer) for k, v in arms.items()}
+        scored = {k: graded_score(name, t)["score"] for k, t in texts.items()}
         band = max(
             abs(scored["no_spec"] - scored["no_spec_repeat"]),
             abs(scored["spec"] - scored["spec_repeat"]),
@@ -268,11 +284,17 @@ def run_gate(
                 "no_spec": _ms_per_token(ref_a),
                 "spec": _ms_per_token(spec),
             },
-            "arms": {
-                k: {kk: vv for kk, vv in v.items() if kk != "output_ids"}
-                for k, v in arms.items()
-            },
+            "arms": {k: {**v, "text": texts[k]} for k, v in arms.items()},
         }
+        for side, arm in (("no_spec", ref_a), ("spec", spec)):
+            verdict_arms[side]["prompts"][name] = {
+                "run_a": {
+                    "output_ids": arm["output_ids"],
+                    "margins": arm["margins"],
+                    "text": texts[side],
+                    "spec_accept_length": arm["accept_len_mean"],
+                }
+            }
         if not floor_ok:
             # Void, not failed: the instrument did not hold still, so this
             # prompt carries no verdict in either direction.
@@ -338,6 +360,17 @@ def run_gate(
         if out["prompts"]
         else None
     )
+    out["verdict_arms"] = verdict_arms
+    # Whether the margin question is answerable AT ALL from this window, said
+    # out loud rather than left for a reader to infer from an empty list. The
+    # probe is a server-side env var, so a window can be run without it and
+    # nothing on the client would otherwise complain until the analysis.
+    out["margins_present"] = {
+        side: sorted(
+            n for n, p in arms_by_prompt["prompts"].items() if p["run_a"].get("margins")
+        )
+        for side, arms_by_prompt in verdict_arms.items()
+    }
     out["verdict_criterion"] = (
         "graded score within the arms' own A-vs-A band (#360). Token identity "
         "is reported, not required: the r12 control showed stock NEXTN "
@@ -693,6 +726,33 @@ def run_card_equivalents(
     return out
 
 
+def write_verdict_arms(report: Dict[str, Any], out_path: str) -> Dict[str, str]:
+    """Drop the gate's two arms as the pair of files ``r12/verdict.py`` takes.
+
+    Written NEXT TO the report rather than folded into it, because the
+    verdict tool reads two whole files and a reader with a red gate in front
+    of them should be one command away from the margin answer::
+
+        python scripts/dual_group/r12/verdict.py \\
+            --nospec <out>.nospec_arms.json --spec <out>.spec_arms.json \\
+            --out <out>.margin_verdict.json
+
+    Returns the paths it wrote, keyed by side, so the report records where
+    they went instead of leaving the reader to guess the naming rule.
+    """
+    arms = (report.get("gate") or {}).get("verdict_arms") or {}
+    stem = os.path.splitext(os.path.abspath(out_path))[0]
+    written: Dict[str, str] = {}
+    for side, payload in arms.items():
+        if not (payload.get("prompts") or {}):
+            continue
+        path = f"{stem}.{side}_arms.json"
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        written[side] = path
+    return written
+
+
 def _ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
     if a is None or not b:
         return None
@@ -765,6 +825,16 @@ def main() -> int:
                 "dual_group_lane_spec_rungs",
                 "dual_group_lane_spec_adaptive",
                 "dual_group_lane_budget_mib",
+                # #399: the three flags a reader of a red gate reaches for
+                # first and which this block used to omit. Their absence sent
+                # the desk diagnosis to the raw server_info dump to falsify a
+                # lending hypothesis that ``lend_mib = 0`` had already ruled
+                # out. A provenance block that omits the policy flags is not
+                # provenance.
+                "dual_group_lane_pairing",
+                "dual_group_lane_lend_mib",
+                "dual_group_lane_eager",
+                "attention_backend",
             )
         }
     except Exception as exc:  # pragma: no cover - diagnostics only
@@ -832,6 +902,9 @@ def main() -> int:
     report["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=2)
+        report["arm_files"] = write_verdict_arms(report, args.out)
         with open(args.out, "w") as f:
             json.dump(report, f, indent=2)
     print(json.dumps(report, indent=2))
