@@ -1197,6 +1197,11 @@ class FusedMoE(torch.nn.Module):
                         0, start_idx, shard_size
                     ).clone()
 
+            # #391c: on an offload-covered layer this expert goes straight into
+            # its tier and is never held. Everything below accumulates.
+            if self._gguf_stream_stage(param, loaded_weight, shard_id, expert_id):
+                return True
+
             # Store in data_container with expert/shard info
             if not hasattr(param, "expert_data_map"):
                 param.expert_data_map = {}
@@ -1207,6 +1212,227 @@ class FusedMoE(torch.nn.Module):
             return True
 
         return False
+
+    # -- #391c: streaming staging into the expert-offload tiers -------------
+    #
+    # The GGUF weight iterator's first pass yields EVERY qweight_type marker
+    # before its second pass yields a single payload byte (weight_utils.py,
+    # gguf_quant_weights_iterator), and the MXFP4->Q5_0 repack rewrites both the
+    # marker and the payload inside that iterator. So by the time the first
+    # expert tensor reaches the callback below, ``w13_qweight_type`` and
+    # ``w2_qweight_type`` already hold the POST-repack ggml types and
+    # ``_gguf_moe_offload_eligible`` can answer for real -- which is what makes
+    # the residency decision available at load time rather than at
+    # process_weights_after_loading.
+
+    #: Which expert-major parameter a GGUF MoE shard belongs to.
+    _GGUF_SHARD_TO_ATTR = {"w1": "w13_qweight", "w3": "w13_qweight", "w2": "w2_qweight"}
+
+    def _gguf_stream_staging_enabled(self) -> bool:
+        """Latched: does this layer stage from the stream? Decided once."""
+        cached = getattr(self, "_gguf_stream_staging_on", None)
+        if cached is not None:
+            return cached
+        from sglang.srt.environ import envs
+
+        on = (
+            bool(envs.SGLANG_MOE_GGUF_STREAM_STAGING.get())
+            and self._gguf_moe_offload_eligible()
+        )
+        self._gguf_stream_staging_on = on
+        if on:
+            self._gguf_stream_stagers = {}
+        return on
+
+    def _gguf_owned_expert_count(self, param) -> int:
+        """Expert count the plan is built over -- the same one the pull path uses.
+
+        Under the #82 expert-dim shard that is the owned range plus the trailing
+        all-zero padding expert; otherwise the parameter's declared expert
+        dimension, exactly as ``materialize_gguf_weights`` reads it.
+        """
+        if getattr(self, "_gguf_expert_shard", False):
+            lo, hi = self._gguf_expert_range
+            return int(hi) - int(lo) + 1
+        return int(getattr(param, "tensor_shape")[0])
+
+    def _gguf_local_expert_index(self, expert_id: int) -> int:
+        """Stream expert id -> the local index the tiers are addressed by.
+
+        ``_gguf_expert_source`` numbers experts by their position in the
+        ascending list of ids this rank actually received; under the expert-dim
+        shard that is ``expert_id - lo``, and everywhere else the id itself.
+        """
+        if getattr(self, "_gguf_expert_shard", False):
+            lo, _hi = self._gguf_expert_range
+            return int(expert_id) - int(lo)
+        return int(expert_id)
+
+    def _gguf_cold_shard_context(self):
+        """#394: this rank's share of the cold pool, or ``None``.
+
+        The precondition ``ColdShardContext`` states is "the layer shards
+        experts on dim 0 and remaps foreign ids away from this rank" -- which is
+        exactly the #82 GGUF expert-dim shard and nothing else, so
+        ``_gguf_expert_shard`` IS the eligibility test. On an intermediate-dim
+        TP MoE every rank holds a slice of every expert and nothing may be
+        delegated.
+
+        No card UUIDs are passed: gathering the per-rank UUID vector needs a
+        collective, and adding one inside the weight-load loop is exactly the
+        "rank-local condition before a group collective" hazard. So the ratio
+        resolves from ``SGLANG_MOE_HOST_SHARD_RATIO`` or not at all, and without
+        that variable this returns ``None`` and the plan is the pre-#394 plan
+        field for field.
+        """
+        if not getattr(self, "_gguf_expert_shard", False):
+            return None
+        world = int(getattr(self, "moe_tp_size", 1) or 1)
+        if world < 2:
+            return None
+        from sglang.srt.layers.moe.expert_offload import cold_shard_context
+
+        return cold_shard_context(int(self.moe_tp_rank), world)
+
+    def _gguf_stream_stage(self, param, loaded_weight, shard_id, expert_id) -> bool:
+        """Route one arriving expert shard into its tier. True when consumed."""
+        if not self._gguf_stream_staging_enabled():
+            return False
+        attr = self._GGUF_SHARD_TO_ATTR.get(shard_id)
+        if attr is None or getattr(self, attr, None) is not param:
+            return False
+        stagers = self._gguf_stream_stagers
+        stager = stagers.get(attr)
+        if stager is None:
+            stager = self._new_gguf_stream_stager(attr, param)
+            if stager is None:
+                return False
+            stagers[attr] = stager
+        stager.submit(self._gguf_local_expert_index(expert_id), shard_id, loaded_weight)
+        self._maybe_close_gguf_stream_layer()
+        return True
+
+    def _maybe_close_gguf_stream_layer(self) -> None:
+        """Layer boundary DURING the stream: trim the allocator, emit the trace.
+
+        Both have to happen here rather than at the drain. The trim because
+        dropping an expert's last reference is not the same as returning its
+        pages -- glibc keeps them in its arena, and over 40+ layers that
+        retention is the whole expert set again (#256). The trace because a
+        line printed at the drain would print for every layer at once, after
+        the load, and could not be lined up against a time-series RAM monitor;
+        printed here, the cumulative pinned figure is directly comparable to
+        the monitor's anon curve at that instant.
+
+        Publishing the tiers still waits for ``process_weights_after_loading``:
+        the stream is only provably over there, and closing early would turn a
+        late-arriving expert from a hard error into a silently dropped one.
+        """
+        if getattr(self, "_gguf_stream_layer_closed", False):
+            return
+        stagers = getattr(self, "_gguf_stream_stagers", None)
+        if not stagers or set(stagers) != {"w13_qweight", "w2_qweight"}:
+            return
+        if not all(stager.is_complete for stager in stagers.values()):
+            return
+        from sglang.srt.layers.moe.expert_offload import (
+            log_streaming_staging_layer,
+            trim_host_allocator,
+        )
+
+        self._gguf_stream_layer_closed = True
+        trim_host_allocator()
+        log_streaming_staging_layer(
+            f"layer {getattr(self, 'layer_id', '?')}",
+            next(iter(stagers.values())).plan,
+        )
+
+    def _new_gguf_stream_stager(self, attr: str, param):
+        """Build the plan and the stager for one expert-major parameter.
+
+        The plan needs only config-level facts -- expert count, resident
+        fraction, the pinned #82 pad expert, the #394 ratio -- so it is
+        computable here, BEFORE the first byte, which is the whole difference
+        between this and the materialization-time door.
+        """
+        from sglang.srt.layers.moe.expert_offload import (
+            StreamingExpertStager,
+            plan_load_time_staging,
+        )
+
+        count = self._gguf_owned_expert_count(param)
+        expert_shard = getattr(self, "_gguf_expert_shard", False)
+        plan = plan_load_time_staging(
+            count,
+            # The layer latched its fraction at construction; the cache sizes
+            # itself from the SAME value, so the plan must not re-read the env.
+            fraction=getattr(self, "_expert_offload_fraction", None),
+            pinned_experts=(count - 1,) if expert_shard else (),
+            cold_shard=self._gguf_cold_shard_context(),
+        )
+        if plan is None:
+            # Too few experts to split at this fraction: fall back to the
+            # accumulate path for the whole layer, not just this tensor.
+            self._gguf_stream_staging_on = False
+            return None
+
+        def allocate(row_shape, dtype):
+            # The loader's flat list is only ever read for its truthiness; not
+            # filling it is what lets each expert's bytes go back to the
+            # allocator the moment they are copied.
+            param.data_container = []
+            param.materialize((plan.buffer_slots,) + tuple(row_shape), dtype=dtype)
+            return param.data
+
+        return StreamingExpertStager(
+            plan,
+            ("w1", "w3") if attr.startswith("w13") else ("w2",),
+            allocate,
+            zero_experts=(count - 1,) if expert_shard else (),
+            label=f"layer {getattr(self, 'layer_id', '?')} {attr}",
+        )
+
+    def _drain_gguf_stream_stagers(self) -> bool:
+        """Close the streaming stagers and publish their tiers. True if any.
+
+        Called from ``materialize_gguf_weights``, i.e. at exactly the moment the
+        old path would have STARTED building the stack -- by which time this
+        path has nothing left to do but hand the finished tiers to the cache.
+        Idempotent: the stagers are dropped here, so a second
+        ``process_weights_after_loading`` finds nothing to drain and the
+        parameters are no longer ``UninitializedParameter``.
+        """
+        from sglang.srt.layers.moe.expert_offload import (
+            log_streaming_staging_layer,
+            register_load_time_presplit,
+        )
+
+        stagers = getattr(self, "_gguf_stream_stagers", None)
+        if not stagers:
+            return False
+        self._gguf_stream_stagers = {}
+        staged_attrs = []
+        staged_plan = None
+        for attr, stager in stagers.items():
+            resident_buf, spill = stager.finalize()
+            register_load_time_presplit(self, attr, resident_buf, spill, stager.plan)
+            staged_attrs.append(attr)
+            staged_plan = stager.plan
+            param = getattr(self, attr)
+            param.expert_data_map = {}
+            param.data_container = []
+        if not getattr(self, "_gguf_stream_layer_closed", False):
+            # The layer never reached both-tensors-complete during the stream
+            # (a checkpoint with only one expert tensor, say), so its boundary
+            # is here. Exactly one trace line per layer either way.
+            self._gguf_stream_layer_closed = True
+            log_streaming_staging_layer(
+                f"layer {getattr(self, 'layer_id', '?')}", staged_plan
+            )
+        self._finish_gguf_moe_offload_staging(
+            staged_attrs, staged_plan, door="load time (streamed)"
+        )
+        return True
 
     def _weight_loader_impl(
         self,
@@ -1945,11 +2171,28 @@ class FusedMoE(torch.nn.Module):
         1. a resident fraction < 1.0 is configured at all;
         2. the layer's quant method is the CUDA ``GGUFMoEMethod`` -- the Ascend
            MoE method materializes and pre-dequantizes on its own path;
-        3. BOTH expert tensors carry a ggml type with a GGUF MoE kernel. This
-           is the MXFP4 stopper: DeepSeek-V4-Flash's routed down projections
-           are type 39, which is in no GGUF kernel set, so tiering their bytes
-           would produce a layer nothing can execute at expert granularity.
+        3. BOTH expert tensors carry a ggml type with a GGUF MoE kernel --
+           tiering bytes no kernel dispatches on would produce a layer nothing
+           can execute at expert granularity. Note what this does NOT see any
+           more: MXFP4 (type 39, DeepSeek-V4-Flash's routed down projections)
+           is rewritten to Q5_0 by the #391 load-time repack inside the weight
+           iterator, marker and payload both, so the type read here is already
+           a covered one.
+
+        Memoized: #391c asks the same question at the FIRST expert of the
+        stream and again at materialization, and both answers must be the one
+        answer (the ggml types are fixed by the iterator's first pass, before
+        either call). Memoizing also keeps the decline warning to one line per
+        layer instead of one per door.
         """
+        memo = getattr(self, "_gguf_offload_eligible_memo", None)
+        if memo is not None:
+            return memo
+        eligible = self._gguf_moe_offload_eligible_uncached()
+        self._gguf_offload_eligible_memo = eligible
+        return eligible
+
+    def _gguf_moe_offload_eligible_uncached(self) -> bool:
         from sglang.srt.environ import envs
 
         fraction = getattr(self, "_expert_offload_fraction", None)
@@ -1978,7 +2221,9 @@ class FusedMoE(torch.nn.Module):
                 return False
         return True
 
-    def _finish_gguf_moe_offload_staging(self, staged_attrs, plan) -> None:
+    def _finish_gguf_moe_offload_staging(
+        self, staged_attrs, plan, door: str = "materialization"
+    ) -> None:
         """Mark the layer as covered and release the loader's host copies.
 
         The marker is what lifts the #268 guard for this layer specifically
@@ -1987,7 +2232,7 @@ class FusedMoE(torch.nn.Module):
         one full tensor is precisely the half-staged state the guard exists to
         refuse.
         """
-        import gc as _gc
+        from sglang.srt.layers.moe.expert_offload import trim_host_allocator
 
         expected = {"w13_qweight", "w2_qweight"}
         if set(staged_attrs) != expected:
@@ -2001,18 +2246,14 @@ class FusedMoE(torch.nn.Module):
         # glibc/torch retain the freed per-expert CPU buffers in their
         # allocator pools; across 40+ MoE layers that is the whole expert set
         # squeezing a swapless host. Same per-layer trim the repack presplit
-        # does, for the same reason.
-        _gc.collect()
-        try:
-            import ctypes as _ct
-
-            _ct.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        # does, for the same reason. (The streaming door has already trimmed at
+        # its own layer boundary; one more here is idempotent and cheap.)
+        trim_host_allocator()
         logging.getLogger(__name__).info(
-            "GGUF MoE expert-offload staged at materialization on layer %s: "
+            "GGUF MoE expert-offload staged at %s on layer %s: "
             "%d/%d experts resident + %d scratch slots, %d experts in the "
             "pinned host tier; the full expert stack was never allocated.",
+            door,
             getattr(self, "layer_id", "?"),
             plan.resident_count,
             plan.num_experts,
@@ -2108,12 +2349,24 @@ class FusedMoE(torch.nn.Module):
         into the pinned host tier. ``MoEExpertOffloadCache.install()`` then
         picks the two tiers up from ``_moe_offload_presplit`` exactly as it
         does for the fp8 / GPTQ / AWQ presplit.
+
+        #391c: on a covered layer the tiers are already FULL by the time this
+        runs -- ``_load_gguf_weight`` staged every expert as it left the weight
+        stream, so all that is left here is to close the stagers and publish
+        what they built. That matters because the loader runs this hook only
+        after the COMPLETE load_weights pass: intercepting here alone means the
+        whole owned expert set has already been paid for in host RAM, which is
+        the peak boot attempt 5 of #391 was OOM-killed at. The loop below is
+        then the fallback door (streaming disabled, or a non-expert GGUF
+        parameter) and the default full-stack path, both unchanged.
         """
         from sglang.srt.layers.moe.expert_offload import (
             plan_load_time_staging,
             register_load_time_presplit,
             stage_experts_into_tiers,
         )
+
+        self._drain_gguf_stream_stagers()
 
         staged_attrs = []
         staged_plan = None
@@ -2158,6 +2411,11 @@ class FusedMoE(torch.nn.Module):
                             # so the plan must not re-read the environment.
                             fraction=getattr(self, "_expert_offload_fraction", None),
                             pinned_experts=(count - 1,) if expert_shard else (),
+                            # #394 activation point for the pull door; the
+                            # streaming door passes the same context. ``None``
+                            # -- i.e. today's plan, field for field -- unless
+                            # SGLANG_MOE_HOST_SHARD_RATIO names a ratio.
+                            cold_shard=self._gguf_cold_shard_context(),
                         )
                         if self._gguf_moe_offload_eligible()
                         else None

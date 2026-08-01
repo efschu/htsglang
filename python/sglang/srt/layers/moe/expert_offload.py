@@ -1110,6 +1110,407 @@ def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
     )
 
 
+# ===========================================================================
+# #391c: STREAMING staging -- the same two tiers, filled from the weight stream
+#
+# ``stage_experts_into_tiers`` above is a PULL loop: it asks a ``source`` for
+# expert after expert, which presumes every expert is already sitting somewhere
+# the source can hand it over from. For GGUF that "somewhere" is the loader's
+# ``param.expert_data_map``, and filling it is the whole load pass -- so the
+# residency plan only ever got to act on a set that had already been paid for
+# in host RAM. On DeepSeek-V4-Flash UD-Q3_K_XL that set is 126.19 GiB of
+# post-repack experts against 98.5 GiB of swapless host RAM, and boot attempt 5
+# of #391 was OOM-killed at 90.7 GiB of anon mid-load, before the plan existed.
+#
+# ``StreamingExpertStager`` is the same placement, PUSHED: the plan is computed
+# from config-level facts alone (expert count, resident fraction, the #82 pad
+# expert, the #394 ratio), so it exists before the first tensor arrives, and
+# each expert is copied into its resident slot or its pinned row AS IT LEAVES
+# THE STREAM and then dropped. Nothing is retained but the tiers themselves and
+# the shards of experts whose set is still incomplete -- for GGUF's w13 that is
+# at most one layer's gate shards, because the iterator emits one whole
+# ``ffn_gate_exps`` tensor before the matching ``ffn_up_exps``.
+#
+# The tiers this produces are byte-for-byte the tiers the pull loop produces
+# from the same plan and the same inputs; only the ORDER of the copies differs
+# (stream order rather than plan order), and a copy's destination is a pure
+# function of the plan.
+# ===========================================================================
+
+
+@dataclass
+class StreamingStagingLedger:
+    """The stager's own byte accounting, cumulative over a process.
+
+    Kept next to the code that does the copying rather than derived from an
+    external RAM monitor: a monitor sees the whole process, this sees only what
+    the staging is responsible for, and the interesting number is whether the
+    two move together. ``peak_host_bytes`` is the claim boot 6 has to beat --
+    pinned tier plus whatever was in flight at the worst moment.
+    """
+
+    streamed_bytes: int = 0
+    resident_bytes: int = 0
+    pinned_bytes: int = 0
+    delegated_bytes: int = 0
+    inflight_bytes: int = 0
+    peak_inflight_bytes: int = 0
+    peak_host_bytes: int = 0
+    layers: int = 0
+    tensors: int = 0
+
+    def _touch_peak(self) -> None:
+        self.peak_inflight_bytes = max(self.peak_inflight_bytes, self.inflight_bytes)
+        self.peak_host_bytes = max(
+            self.peak_host_bytes, self.pinned_bytes + self.inflight_bytes
+        )
+
+
+_STAGING_LEDGER = StreamingStagingLedger()
+
+
+def streaming_staging_ledger() -> StreamingStagingLedger:
+    """The process-wide staging ledger (read-only for callers; tests reset)."""
+    return _STAGING_LEDGER
+
+
+def reset_streaming_staging_ledger() -> None:
+    """Clear the ledger (tests; and a second model load in one process)."""
+    global _STAGING_LEDGER
+    _STAGING_LEDGER = StreamingStagingLedger()
+
+
+def trim_host_allocator() -> None:
+    """Give the per-expert buffers back to the OS, not just to glibc's arena.
+
+    The #256 lesson: dropping the last reference to an expert returns its bytes
+    to torch's CPU allocator and glibc's arena, and RSS does not move. Across
+    40+ MoE layers that retention IS the expert set, on a box with no swap.
+    Called at each layer boundary -- often enough that the arena never grows to
+    layer count x layer size, rarely enough that the arena walk is noise next to
+    a layer's copies.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 - non-glibc platforms simply have no trim
+        pass
+
+
+def _human_bytes(nbytes: int) -> str:
+    for unit, scale in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if abs(nbytes) >= scale:
+            return f"{nbytes / scale:.2f} {unit}"
+    return f"{nbytes} B"
+
+
+def log_streaming_staging_layer(label: str, plan: "ExpertStagingPlan") -> None:
+    """One trace line per finished layer, gated on SGLANG_MOE_STAGING_TRACE.
+
+    Emitted at the LAYER boundary, which is the granularity an external
+    ram-monitor can actually be lined up against: the cumulative pinned figure
+    here should track the monitor's anon curve, and ``in-flight peak`` is the
+    transient the curve is allowed to bulge by.
+    """
+    import logging
+
+    from sglang.srt.environ import envs
+
+    ledger = _STAGING_LEDGER
+    ledger.layers += 1
+    if not envs.SGLANG_MOE_STAGING_TRACE.get():
+        return
+    logging.getLogger(__name__).info(
+        "[moe-staging-trace] %s staged (#%d): %d/%d experts resident, "
+        "%d pinned, %d delegated | cumulative streamed=%s resident=%s "
+        "pinned(host)=%s delegated=%s | in-flight now=%s peak=%s | "
+        "peak host held (pinned+in-flight)=%s",
+        label,
+        ledger.layers,
+        plan.resident_count,
+        plan.num_experts,
+        len(plan.spill_ids),
+        len(plan.delegated_ids),
+        _human_bytes(ledger.streamed_bytes),
+        _human_bytes(ledger.resident_bytes),
+        _human_bytes(ledger.pinned_bytes),
+        _human_bytes(ledger.delegated_bytes),
+        _human_bytes(ledger.inflight_bytes),
+        _human_bytes(ledger.peak_inflight_bytes),
+        _human_bytes(ledger.peak_host_bytes),
+    )
+
+
+def _nbytes(tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+class StreamingExpertStager:
+    """Place each expert into its tier as the weight stream delivers it.
+
+    One instance per (layer, expert-major parameter). The caller feeds shards
+    with :meth:`submit` in whatever order the checkpoint happens to use and
+    calls :meth:`finalize` once the stream is over; the result is the same
+    ``(resident_buffer, pinned_spill_pool)`` pair
+    ``stage_experts_into_tiers`` returns.
+
+    ``shard_keys`` is the ordered tuple of per-expert shards that make up one
+    row -- ``("w1", "w3")`` for a GGUF ``w13_qweight`` (gate above up, the
+    concatenation the stacked path builds) and ``("w2",)`` for the down
+    projection. An expert is placed only once ALL of its shards have arrived,
+    which is what bounds the retained set: shards of incomplete experts.
+
+    ``allocate(row_shape, dtype) -> Tensor`` materializes the caller's
+    ``[buffer_slots, *row_shape]`` resident buffer. It is called lazily, on the
+    first complete expert, because the row shape is a property of the
+    checkpoint's quantized bytes and is not known before one has been seen.
+
+    ``zero_experts`` are ids with no bytes in the stream that must still occupy
+    their planned slot -- exactly the #82 uneven-TP shard's trailing all-zero
+    padding expert, the target of every foreign topk id. They are written in
+    :meth:`finalize`, once the row shape is known.
+    """
+
+    def __init__(
+        self,
+        plan: "ExpertStagingPlan",
+        shard_keys: Sequence[str],
+        allocate,
+        zero_experts: Sequence[int] = (),
+        label: str = "",
+    ):
+        self.plan = plan
+        self.shard_keys = tuple(shard_keys)
+        self.label = label
+        self._allocate = allocate
+        self._zero_experts = tuple(sorted({int(e) for e in zero_experts}))
+        # expert id -> ("resident", slot) | ("spill", row) | None (delegated).
+        self._dest: Dict[int, Optional[Tuple[str, int]]] = {}
+        for slot, expert_id in enumerate(plan.resident_ids):
+            self._dest[int(expert_id)] = ("resident", slot)
+        for row, expert_id in enumerate(plan.spill_ids):
+            self._dest[int(expert_id)] = ("spill", row)
+        for expert_id in plan.delegated_ids:
+            self._dest[int(expert_id)] = None
+        self._pending: Dict[int, Dict[str, Optional[object]]] = {}
+        #: Host bytes this stager is currently holding per incomplete expert.
+        #: Kept per expert rather than recomputed at placement time so the
+        #: all-zero pad expert -- which is built in finalize() and was never in
+        #: flight -- cannot subtract bytes it never added.
+        self._inflight: Dict[int, int] = {}
+        self._placed: set = set()
+        self._row_shape: Optional[Tuple[int, ...]] = None
+        self._dtype = None
+        self.resident_buf = None
+        self.spill = None
+        self.finalized = False
+
+    @property
+    def is_complete(self) -> bool:
+        """Every expert the stream owes this tensor has been placed.
+
+        The all-zero experts are excluded: they carry no stream bytes and are
+        written in :meth:`finalize`, so waiting for them would mean the layer
+        boundary never fires during the load.
+        """
+        return not self._pending and len(self._placed) == len(self._dest) - len(
+            self._zero_experts
+        )
+
+    # -- stream side --------------------------------------------------------
+
+    def submit(self, expert_id: int, shard_id: str, tensor) -> None:
+        """Take one shard of one expert out of the stream.
+
+        The tensor is either copied into its tier (when this completes the
+        expert) or held until the rest of the expert arrives. Either way the
+        caller must not keep a reference of its own -- holding one turns the
+        "one incomplete expert set" bound back into "the whole loaded set",
+        which is the #256 lesson and the whole point of this class.
+        """
+        if self.finalized:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r} got expert "
+                f"{expert_id}/{shard_id} after finalize()"
+            )
+        expert_id = int(expert_id)
+        if shard_id not in self.shard_keys:
+            raise ValueError(
+                f"streaming stager for {self.label!r} takes shards "
+                f"{list(self.shard_keys)}, got {shard_id!r}"
+            )
+        if expert_id not in self._dest:
+            raise KeyError(
+                f"streaming stager for {self.label!r} has no plan slot for "
+                f"expert {expert_id}; the plan covers "
+                f"[0,{self.plan.num_experts})"
+            )
+        if expert_id in self._placed:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: expert {expert_id} was "
+                "already placed; the stream delivered it twice"
+            )
+        parts = self._pending.setdefault(expert_id, {})
+        if shard_id in parts:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: expert {expert_id} got "
+                f"shard {shard_id!r} twice"
+            )
+        nbytes = _nbytes(tensor)
+        _STAGING_LEDGER.streamed_bytes += nbytes
+        if self._dest[expert_id] is None:
+            # #394: a peer rank's host tier owns this cold expert. Released
+            # here without ever being copied -- keeping it would trade the VRAM
+            # the feature saves for host RAM nobody reads.
+            parts[shard_id] = None
+            _STAGING_LEDGER.delegated_bytes += nbytes
+        else:
+            parts[shard_id] = tensor
+            self._inflight[expert_id] = self._inflight.get(expert_id, 0) + nbytes
+            _STAGING_LEDGER.inflight_bytes += nbytes
+            _STAGING_LEDGER._touch_peak()
+        if len(parts) == len(self.shard_keys):
+            del self._pending[expert_id]
+            self._place(expert_id, parts)
+
+    def _place(self, expert_id: int, parts) -> None:
+        import torch
+
+        self._placed.add(expert_id)
+        held = self._inflight.pop(expert_id, 0)
+        dest = self._dest[expert_id]
+        if dest is None:
+            parts.clear()
+            return
+        ordered = [parts[key] for key in self.shard_keys]
+        parts.clear()
+        row = ordered[0] if len(ordered) == 1 else torch.cat(ordered, dim=0)
+        del ordered
+        resident_buf, spill = self._ensure_tiers(row)
+        kind, index = dest
+        if kind == "resident":
+            resident_buf[index].copy_(row)
+            _STAGING_LEDGER.resident_bytes += _nbytes(row)
+        else:
+            spill[index].copy_(row)
+        _STAGING_LEDGER.inflight_bytes -= held
+        _STAGING_LEDGER._touch_peak()
+
+    def _ensure_tiers(self, row):
+        """Build the two tiers on the first complete expert; return them."""
+        import torch
+
+        row_shape = tuple(int(d) for d in row.shape)
+        if self._row_shape is None:
+            self._row_shape = row_shape
+            self._dtype = row.dtype
+            buf = self._allocate(row_shape, row.dtype)
+            if tuple(buf.shape) != (self.plan.buffer_slots,) + row_shape:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: allocate() returned "
+                    f"{tuple(buf.shape)}, expected "
+                    f"{(self.plan.buffer_slots,) + row_shape}"
+                )
+            self.resident_buf = buf
+            if self.plan.spill_ids:
+                spill = torch.empty(
+                    (len(self.plan.spill_ids),) + row_shape,
+                    dtype=row.dtype,
+                    device="cpu",
+                )
+                # Pinning is what makes the later H2D fetch async; skipped when
+                # there is no CUDA context (desk tests), as in the pull loop.
+                if torch.cuda.is_available():
+                    spill = spill.pin_memory()
+                self.spill = spill
+                _STAGING_LEDGER.pinned_bytes += _nbytes(spill)
+                _STAGING_LEDGER._touch_peak()
+            _STAGING_LEDGER.tensors += 1
+        elif row_shape != self._row_shape or row.dtype != self._dtype:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: expert row is "
+                f"{row_shape}/{row.dtype} but the tiers were built for "
+                f"{self._row_shape}/{self._dtype}; experts of one tensor must "
+                "be uniform"
+            )
+        return self.resident_buf, self.spill
+
+    # -- end of stream ------------------------------------------------------
+
+    def finalize(self):
+        """Write the zero experts, check the plan is covered, hand over tiers.
+
+        Returns ``(resident_buffer, spill_pool_or_None)`` -- the same pair
+        ``stage_experts_into_tiers`` returns, for the same
+        ``register_load_time_presplit`` call.
+        """
+        import torch
+
+        if self.finalized:
+            raise RuntimeError(f"streaming stager for {self.label!r} finalized twice")
+        if self._pending:
+            incomplete = {
+                e: sorted(k for k in parts)
+                for e, parts in sorted(self._pending.items())
+            }
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: the stream ended with "
+                f"incomplete experts {incomplete}; every expert needs all of "
+                f"{list(self.shard_keys)}"
+            )
+        if self._row_shape is None:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: the stream delivered no "
+                "expert at all, so there is no row shape to build the tiers "
+                "from"
+            )
+        zero_shard_shape = self._zero_shard_shape(self._row_shape)
+        for expert_id in self._zero_experts:
+            if expert_id in self._placed:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert {expert_id} "
+                    "is declared all-zero but the stream delivered bytes for it"
+                )
+            self._place(
+                expert_id,
+                {
+                    key: torch.zeros(zero_shard_shape, dtype=self._dtype)
+                    for key in self.shard_keys
+                },
+            )
+        missing = sorted(set(self._dest) - self._placed)
+        if missing:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: the stream never "
+                f"delivered experts {missing}; the plan reserved a tier slot "
+                "for each of them"
+            )
+        self.finalized = True
+        return self.resident_buf, self.spill
+
+    def _zero_shard_shape(self, row_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+        """Shape of ONE shard of the all-zero pad expert.
+
+        The shards of one expert are concatenated on the row axis, and the pad
+        expert's row must match every other expert's, so each of the ``k``
+        shards contributes ``rows // k``. GGUF's w13 is gate+up of identical
+        width, which is the only multi-shard case; a non-integral split means
+        the assumption no longer holds and is an error rather than a guess.
+        """
+        rows = row_shape[0]
+        k = len(self.shard_keys)
+        if rows % k:
+            raise RuntimeError(
+                f"streaming stager for {self.label!r}: {rows} rows do not "
+                f"divide over {k} shards, so the all-zero pad expert cannot be "
+                "built shard-wise"
+            )
+        return (rows // k,) + tuple(row_shape[1:])
+
+
 # --- #268: quant-path fail-fast for the expert-offload installer -----------
 # Ascend GGUF-MoE (GGUFMoEAscendMethod) and MoeWNA16 (MoeWNA16Method) have no
 # load-time offload half: unlike fp8 / GPTQ-Marlin / AWQ-Marlin, their
