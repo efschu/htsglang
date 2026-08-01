@@ -2775,7 +2775,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 num_experts=self.config.n_routed_experts
             )
 
-        cache_compressor_weight = {}
+        # {compressor_prefix: {(projection, leaf): tensor}} -- a projection may
+        # arrive as one dense `.weight` or as a GGUF `.qweight` plus a
+        # `.qweight_type` marker, and the marker comes from an earlier pass over
+        # the file than its payload, so the slots fill out of order.
+        cache_compressor_weight: dict[str, dict[Tuple[str, str], torch.Tensor]] = {}
         COMPRESSOR_PART = ".compressor.w"
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
@@ -2941,27 +2945,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                             ) and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
-                                is_kv = name.endswith(".wkv.weight")
-                                is_wgate = name.endswith(".wgate.weight")
-                                assert is_kv != is_wgate
-                                key = name.rsplit(".", 2)[0]
+                                parsed = _split_compressor_weight_name(name)
+                                assert parsed is not None, (
+                                    "unrecognized DeepSeek V4 compressor tensor "
+                                    f"{name!r}: the wkv_gate fusion knows the "
+                                    f"projections {_COMPRESSOR_PROJECTIONS} under "
+                                    f"the leaves {_COMPRESSOR_LEAVES} only"
+                                )
+                                key, projection, leaf = parsed
                                 assert key.endswith(".compressor")
-                                if key not in cache_compressor_weight:
-                                    cache_compressor_weight[key] = (
-                                        is_kv,
-                                        loaded_weight,
-                                    )
-                                else:
-                                    assert key in cache_compressor_weight
-                                    cached_is_kv, cached_weight = (
-                                        cache_compressor_weight[key]
-                                    )
-                                    assert cached_is_kv != is_kv
-                                    kv = loaded_weight if is_kv else cached_weight
-                                    wgate = loaded_weight if is_wgate else cached_weight
-                                    fused_weight = torch.cat([kv, wgate], dim=0)
+                                comp_bucket = cache_compressor_weight.setdefault(
+                                    key, {}
+                                )
+                                slot = (projection, leaf)
+                                assert (
+                                    slot not in comp_bucket
+                                ), f"duplicate {projection}.{leaf} for {key}"
+                                comp_bucket[slot] = loaded_weight
+                                if _compressor_bucket_complete(comp_bucket):
                                     param_name = key + ".wkv_gate.weight"
                                     param = params_dict[param_name]
+                                    fused_weight = torch.cat(
+                                        [
+                                            _compressor_dense_part(
+                                                comp_bucket, proj, param.dtype
+                                            )
+                                            for proj in _COMPRESSOR_PROJECTIONS
+                                        ],
+                                        dim=0,
+                                    )
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
                                         executor=executor,
@@ -2972,12 +2984,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
-                            elif fuse_wqa_wkv and (
-                                name.endswith(".wq_a.weight")
-                                or name.endswith(".wq_a.weight_scale_inv")
-                                or name.endswith(".wkv.weight")
-                                or name.endswith(".wkv.weight_scale_inv")
-                            ):
+                            elif fuse_wqa_wkv and _is_wqkv_a_fusion_input(name):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
                                     ".wq_a." if is_q else ".wkv.", ".wqkv_a."
@@ -2989,9 +2996,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 ), f"duplicate shard {shard_key} for {param_name}"
                                 bucket[shard_key] = loaded_weight
                                 if len(bucket) == 2:
-                                    fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
-                                    )
+                                    fused_weight = _fuse_wqkv_a(param_name, bucket)
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
@@ -3115,6 +3120,143 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
+
+
+#: Leaf spellings under which one projection of a weight fusion can reach
+#: ``load_weights``. A dense checkpoint ships ``.weight`` (plus
+#: ``.weight_scale_inv`` for an fp8 block-scaled tensor); a GGUF checkpoint
+#: ships the packed payload as ``.qweight`` and, ahead of it in the iterator's
+#: first pass, a 0-dim ggml type marker as ``.qweight_type``.
+_FUSION_DENSE_LEAVES: Tuple[str, ...] = ("weight", "weight_scale_inv")
+_FUSION_GGUF_LEAVES: Tuple[str, ...] = ("qweight", "qweight_type")
+
+#: The two projections each fusion site joins, in concatenation order.
+_COMPRESSOR_PROJECTIONS: Tuple[str, ...] = ("wkv", "wgate")
+_WQKV_A_PROJECTIONS: Tuple[str, ...] = ("wq_a", "wkv")
+
+#: The compressor has no block-scaled variant, so only the plain dense leaf.
+_COMPRESSOR_LEAVES: Tuple[str, ...] = ("weight",) + _FUSION_GGUF_LEAVES
+_WQKV_A_LEAVES: Tuple[str, ...] = _FUSION_DENSE_LEAVES + _FUSION_GGUF_LEAVES
+
+
+def _split_compressor_weight_name(name: str) -> Optional[Tuple[str, str, str]]:
+    """Split a compressor projection tensor name into
+    ``(compressor_prefix, projection, leaf)``, or ``None`` if it is not one.
+
+    Classification keys off the ``.wkv.`` / ``.wgate.`` NAME SEGMENT, not off a
+    ``.weight`` suffix. The branch that calls this is guarded by the
+    ``.compressor.w`` substring, so a suffix-keyed classifier disagrees with
+    its own guard the moment a checkpoint spells the leaf anything but
+    ``.weight``: on GGUF every compressor tensor entered the branch and
+    answered False to both suffix tests (#391 wall 8).
+    """
+    for projection in _COMPRESSOR_PROJECTIONS:
+        for leaf in _COMPRESSOR_LEAVES:
+            suffix = f".{projection}.{leaf}"
+            if name.endswith(suffix):
+                return name[: -len(suffix)], projection, leaf
+    return None
+
+
+def _is_wqkv_a_fusion_input(name: str) -> bool:
+    """Whether *name* is one of the projections fused into ``wqkv_a``.
+
+    Segment-keyed for the same reason as the compressor site above: the
+    previous suffix-only test silently skipped every GGUF spelling, leaving
+    the fused ``wqkv_a`` parameter unfilled and the unfused ``wq_a`` / ``wkv``
+    tensors homeless (#391 wall 9).
+    """
+    return any(
+        name.endswith(f".{projection}.{leaf}")
+        for projection in _WQKV_A_PROJECTIONS
+        for leaf in _WQKV_A_LEAVES
+    )
+
+
+def _gguf_dequantize(
+    qweight: torch.Tensor, qweight_type: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """Unpack one GGUF payload into a dense tensor of *dtype*."""
+    import gguf
+    from gguf.quants import dequantize
+
+    qtype = gguf.GGMLQuantizationType(int(qweight_type.item()))
+    dense = torch.from_numpy(dequantize(qweight.numpy(), qtype).copy())
+    return dense.to(dtype)
+
+
+def _compressor_bucket_complete(bucket: dict) -> bool:
+    """Whether both compressor projections have fully arrived.
+
+    A dense projection is complete with its ``.weight``; a GGUF one only once
+    BOTH its packed payload and its type marker are in, which are emitted in
+    two separate passes over the file.
+    """
+    return all(
+        (projection, "weight") in bucket
+        or (
+            (projection, "qweight") in bucket and (projection, "qweight_type") in bucket
+        )
+        for projection in _COMPRESSOR_PROJECTIONS
+    )
+
+
+def _compressor_dense_part(
+    bucket: dict, projection: str, dtype: torch.dtype
+) -> torch.Tensor:
+    """One compressor projection as a dense tensor ready to concatenate.
+
+    The fused target is dense by construction: ``Compressor.__init__`` builds
+    ``wkv_gate`` as a ``ReplicatedLinear`` with ``quant_config=None`` and a
+    bfloat16 ``params_dtype``, and ``compute_kv_score`` feeds
+    ``wkv_gate.weight`` straight into ``linear_bf16_fp32``. There is no packed
+    parameter for a GGUF compressor projection to land in, so the payload is
+    unpacked here.
+
+    Each projection is unpacked on its own instead of concatenating the packed
+    bytes and unpacking once. That keeps the fusion correct when the two
+    projections carry different ggml types, so no type-equality precondition
+    is needed at this site -- unlike the ``wqkv_a`` site, whose target stays
+    packed and therefore carries a single shared type marker.
+    """
+    dense = bucket.get((projection, "weight"))
+    if dense is not None:
+        return dense
+    return _gguf_dequantize(
+        bucket[(projection, "qweight")],
+        bucket[(projection, "qweight_type")],
+        dtype,
+    )
+
+
+def _fuse_wqkv_a(param_name: str, bucket: dict) -> torch.Tensor:
+    """Join the ``wq_a`` and ``wkv`` shards of one ``wqkv_a`` parameter.
+
+    ``wqkv_a`` is built with the model's ``quant_config``, so under GGUF it is
+    a packed module: the shards are joined as bytes and the fused module keeps
+    exactly ONE ``qweight_type``. Both shards must therefore use the same ggml
+    type, and that is not a formality -- ggml row widths collide across types
+    (Q4_0 and Q4_K are both 144 bytes per 256 elements, Q4_0 and IQ4_NL both
+    18 bytes per 32), so a mismatched pair can concatenate without error and
+    then be decoded with the wrong layout for one half.
+    """
+    q, kv = bucket["q"], bucket["kv"]
+    if param_name.endswith(".qweight_type"):
+        q_type, kv_type = int(q.item()), int(kv.item())
+        if q_type != kv_type:
+            import gguf
+
+            raise ValueError(
+                f"{param_name}: SGLANG_OPT_FUSE_WQA_WKV joins wq_a and wkv "
+                "into one packed parameter that carries a single GGUF type "
+                "marker, but this checkpoint stores wq_a as "
+                f"{gguf.GGMLQuantizationType(q_type).name} and wkv as "
+                f"{gguf.GGMLQuantizationType(kv_type).name}. Set "
+                "SGLANG_OPT_FUSE_WQA_WKV=0 to load the two projections "
+                "unfused."
+            )
+        return q
+    return torch.cat([q, kv], dim=0)
 
 
 def _reject_wo_a_scale_on_gguf(
