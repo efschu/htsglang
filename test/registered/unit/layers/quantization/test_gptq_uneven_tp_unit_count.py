@@ -523,8 +523,14 @@ class TestMoEGrainUnchangedForSiblingConfigs(CustomTestCase):
 
         self.assertEqual(moe_uneven_tp_units(1024, _FakeFp8BlockConfig()), 8)
 
-    def test_unquantized_experts_stay_element_granular(self):
-        self.assertEqual(moe_uneven_tp_units(512, None), 512)
+    def test_unquantized_experts_use_the_activation_vector_grain(self):
+        # #367 replaced the element-granular fall-through with the activation
+        # kernel's vector width. The property this class exists for holds
+        # either way: the GPTQ dense block does not reach the unquantized
+        # lane, and 32 units are still finer than any quant grain.
+        from sglang.srt.distributed.utils import ACTIVATION_VEC_ELEMS
+
+        self.assertEqual(moe_uneven_tp_units(512, None), 512 // ACTIVATION_VEC_ELEMS)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ import math
 import unittest
 
 from sglang.srt.distributed.utils import (
+    ACTIVATION_VEC_ELEMS,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
@@ -284,14 +285,26 @@ class TestElementGranularFamiliesNowCoarsen(CustomTestCase):
         set_tp_partition_ratios(None)
 
     def test_moe_experts_were_element_granular_and_now_are_not(self):
-        self.assertEqual(moe_uneven_tp_units(MOE_INTERMEDIATE, None), MOE_INTERMEDIATE)
+        # The int8 block is what this task added. Since #367 the UNCONSTRAINED
+        # lane also has a grain -- the activation kernel's 16-element vector --
+        # and on this dimension the two constraints happen to be the same
+        # number, so both configs and the None lane now agree on 32 units.
+        # That coincidence does not make either block redundant: int8 needs 16
+        # for scaled_mm's K, the activation kernel needs 16 for silu_and_mul,
+        # and a checkpoint can bind one without the other.
+        self.assertEqual(
+            moe_uneven_tp_units(MOE_INTERMEDIATE, None),
+            MOE_INTERMEDIATE // ACTIVATION_VEC_ELEMS,
+        )
         self.assertEqual(moe_uneven_tp_units(MOE_INTERMEDIATE, _int8_w8a8_ct()), 32)
         self.assertEqual(moe_uneven_tp_units(MOE_INTERMEDIATE, W8A8Int8Config({})), 32)
 
     def test_the_expert_shards_go_from_invalid_to_valid(self):
-        before = tp_partition_sizes(
-            MOE_INTERMEDIATE, 3, units=moe_uneven_tp_units(MOE_INTERMEDIATE, None)
-        )
+        # The pre-block geometry, stated as the literal element-granular unit
+        # count rather than routed through moe_uneven_tp_units: #367 gave that
+        # lane its own grain, so the function no longer returns it, but the
+        # split it used to produce is exactly what this task had to repair.
+        before = tp_partition_sizes(MOE_INTERMEDIATE, 3, units=MOE_INTERMEDIATE)
         self.assertEqual(before, [232, 140, 140])
         # w1/w3 are merged, so N is 2*shard; w2's K is the shard itself. Here
         # every N is even enough but no K is a multiple of 16 -- w2 aborts on
