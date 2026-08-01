@@ -2739,13 +2739,27 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            weights = list(weights)
-            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-            if exists_wo_a_scale:
-                logger.info("Execute dequant fp8 wo_a")
-                weights = _dequant_fp8_wo_a(weights)
+            if is_gguf_quant_config(getattr(self, "quant_config", None)):
+                # A GGUF wo_a is packed and carries no separate block-scale
+                # tensor by construction -- the same fact that makes
+                # SGLANG_OPT_FP8_WO_A_GEMM unsupported here (see the
+                # NotImplementedError in DeepseekV4AttentionMHC). So the
+                # lookahead below can only ever answer False, and answering it
+                # costs a list() over the entire weight stream: on a large GGUF
+                # that materializes every post-repack tensor in host RAM before
+                # the first weight loader runs, which defeats every downstream
+                # streaming/sharding step. Keep the generator intact and assert
+                # the assumption per tensor instead of buying it with a drain.
+                logger.info("Skip dequant fp8 wo_a (GGUF: wo_a carries no scale)")
+                weights = _reject_wo_a_scale_on_gguf(weights)
             else:
-                logger.info("Skip dequant fp8 wo_a")
+                weights = list(weights)
+                exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+                if exists_wo_a_scale:
+                    logger.info("Execute dequant fp8 wo_a")
+                    weights = _dequant_fp8_wo_a(weights)
+                else:
+                    logger.info("Skip dequant fp8 wo_a")
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -3101,6 +3115,32 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
+
+
+def _reject_wo_a_scale_on_gguf(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Pass the stream through, refusing a ``.wo_a.scale`` a GGUF cannot have.
+
+    ``load_weights`` skips the ``_dequant_fp8_wo_a`` lookahead on the GGUF
+    route because answering it would drain the whole stream into a list. The
+    skip rests on a structural claim -- a packed GGUF ``wo_a`` ships no
+    separate block-scale tensor -- so the claim is checked per tensor as the
+    stream flows. If one ever does show up, the dequant that should have
+    consumed it is not running, so the matching ``wo_a`` weight would be
+    loaded with the scale unapplied: wrong weights, not a crash. Refuse
+    loudly instead.
+    """
+    for name, tensor in weights:
+        if name.endswith(".wo_a.scale"):
+            raise ValueError(
+                f"unexpected .wo_a.scale on a GGUF checkpoint: {name!r}. A "
+                "packed GGUF wo_a has no separate block scale, so the fp8 "
+                "wo_a dequant is skipped on this route; loading the matching "
+                "wo_a weight without applying this scale would produce wrong "
+                "weights."
+            )
+        yield name, tensor
 
 
 def _dequant_fp8_wo_a(
