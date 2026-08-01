@@ -35,6 +35,19 @@ WHAT MOVED, and why each move is the one the previous window asked for:
    reference -- so a divergence lands on a SURFACE and a ROUND instead of on a
    token index. The tokens are still compared exactly as before; the checksum
    is an additional verdict, never a replacement for the trajectory gate.
+
+4. THE REFERENCE SET (round 2). One no-spec draw is not a reference, it is a
+   sample of one. The GDN prefill is not reproducible past ~109 tokens on this
+   family and the ``squares`` prompt is bimodal in its own right, so a
+   speculative arm that lands on the reference's OTHER mode was being reported
+   as a content divergence -- the reading, not the run, being wrong.
+   ``--ref-draws N`` (default 3) draws the no-spec reference N times and
+   classifies the arm against the SET: a divergence is a trajectory that
+   matches NONE of the draws. The single-draw classification is kept beside it
+   in the json, because the difference between the two IS the measurement of
+   how much bimodality the prompt carries. The extra draws are also the
+   control pair the checksum reading needs to measure its own floor -- one
+   change, two instruments, and neither of them guessing.
 """
 
 from __future__ import annotations
@@ -126,6 +139,47 @@ def _overrides(entry: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in entry.items() if k not in _META_KEYS}
 
 
+#: Least severe first. A trajectory is judged by its BEST match in the set.
+_SEVERITY = {"identical": 0, "length_end_only": 1, "content_divergence": 2}
+
+
+def compare_against_reference_set(
+    refs: List[List[int]], got: List[int]
+) -> Dict[str, Any]:
+    """Classify one trajectory against the SET of reference draws.
+
+    The bimodality lesson, made arithmetic. Divergence means "outside the set":
+    a trajectory that reproduces ANY draw of the reference exactly is a
+    trajectory the reference itself produced, and calling that a content
+    divergence says something about the sample size and nothing about the arm.
+
+    The single-draw reading is returned alongside rather than dropped. It is
+    what the previous windows reported, so keeping it is what lets a later
+    reader tell "this arm improved" from "the reading stopped being wrong", and
+    ``ref_modes`` says how many distinct trajectories the reference itself drew
+    -- one is a reproducible reference and more than one is not, which is a
+    property of the vehicle that belongs in the record.
+    """
+    draws = [list(r or []) for r in refs] or [[]]
+    per = [compare_trajectories(ref, got) for ref in draws]
+    best = min(range(len(per)), key=lambda i: _SEVERITY[per[i]["classification"]])
+    modes = {tuple(d) for d in draws}
+    out = dict(per[best])
+    out.update(
+        {
+            "ref_draws": len(draws),
+            "ref_modes": len(modes),
+            "ref_bimodal": len(modes) > 1,
+            "matched_ref_draw": best,
+            "per_draw_classification": [p["classification"] for p in per],
+            "single_draw_classification": per[0]["classification"],
+            "reading_changed_by_the_set": per[best]["classification"]
+            != per[0]["classification"],
+        }
+    )
+    return out
+
+
 def _kv_len_exercised(row: Dict[str, Any]) -> Dict[str, Any]:
     """Did this arm route rounds through ``_decode_step``, and MIXED?
 
@@ -210,6 +264,15 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--verify", default="target_verify")
     ap.add_argument(
+        "--ref-draws",
+        type=int,
+        default=3,
+        help="how many times the no-spec reference is drawn per arm. The arm "
+        "is classified against the SET of draws (bimodality-aware) and the "
+        "extra draws are the control pair the checksum floor is measured from. "
+        "1 restores the previous single-draw reading.",
+    )
+    ap.add_argument(
         "--prelude",
         default="none",
         help="history variant replayed before each arm (default: none)",
@@ -280,20 +343,27 @@ def main(argv=None) -> int:
                         verify=args.verify,
                     ),
                 )
-            ref_job = _lane_job(
-                ids, args.tokens, spec=False, steps=args.steps, verify=args.verify
-            )
-            ref_job["probe_tag"] = f"{key}:no_spec"
-            ref = _row2(lane_run(base, ref_job)[-1])
+            ref_draws = []
+            for draw in range(max(1, args.ref_draws)):
+                ref_job = _lane_job(
+                    ids, args.tokens, spec=False, steps=args.steps, verify=args.verify
+                )
+                ref_job["probe_tag"] = f"{key}:no_spec:{draw}"
+                ref_draws.append(_row2(lane_run(base, ref_job)[-1]))
+            ref = ref_draws[0]
             job = _lane_job(
                 ids, args.tokens, spec=True, steps=args.steps, verify=args.verify
             )
             job.update(_overrides(entry))
             job["probe_tag"] = f"{key}:spec"
             arm = _row2(lane_run(base, job)[-1])
-            cmp = compare_trajectories(ref["output_ids"], arm["output_ids"])
+            cmp = compare_against_reference_set(
+                [d["output_ids"] for d in ref_draws], arm["output_ids"]
+            )
             texts = {
-                "no_spec": detokenize(ref["output_ids"], args.tokenizer),
+                "no_spec": detokenize(
+                    ref_draws[cmp["matched_ref_draw"]]["output_ids"], args.tokenizer
+                ),
                 "spec": detokenize(arm["output_ids"], args.tokenizer),
             }
             checks = _expectations(entry, arm)
@@ -302,8 +372,13 @@ def main(argv=None) -> int:
             # clean: a missing instrument is not a passing one.
             checksum = None
             if arm.get("pool_checksums"):
+                controls = [
+                    d["pool_checksums"]
+                    for d in ref_draws[1:]
+                    if d.get("pool_checksums")
+                ]
                 checksum = checksum_analyse(
-                    arm["pool_checksums"], ref.get("pool_checksums")
+                    arm["pool_checksums"], ref.get("pool_checksums"), controls or None
                 )
             out["arms"][key] = {
                 "prompt": prompt,
@@ -322,6 +397,12 @@ def main(argv=None) -> int:
                     "no_spec": {**ref, "text": texts["no_spec"]},
                     "spec": {**arm, "text": texts["spec"]},
                 },
+                # Every draw, minus its checksum records -- those are read
+                # in-process and would multiply the json by the draw count.
+                "no_spec_draws": [
+                    {k: v for k, v in d.items() if k != "pool_checksums"}
+                    for d in ref_draws
+                ],
                 "graded_scores": {
                     side: graded_score(prompt, text)["score"]
                     for side, text in texts.items()
@@ -330,14 +411,18 @@ def main(argv=None) -> int:
             g = out["arms"][key]["graded_scores"]
             kv = checks["kv_len"]
             cap = checks["capture"]
-            ck = (
-                "off"
-                if checksum is None
-                else ("clean" if checksum["clean"] else "DIRTY")
-            )
+            if checksum is None:
+                ck = "off"
+            elif checksum.get("resolution") == "none":
+                ck = "no-resolution"
+            else:
+                ck = "clean" if checksum["clean"] else "DIRTY"
+                ck = f"{ck}({checksum.get('resolution')})"
             print(
                 f"  bracket {key:28s} before={before} "
                 f"{cmp['classification']:20s} "
+                f"modes={cmp['ref_modes']}/{cmp['ref_draws']} "
+                f"single={cmp['single_draw_classification']:20s} "
                 f"first_diff={cmp['first_divergent_index']} "
                 f"score {g['no_spec']}->{g['spec']} "
                 f"accept {arm['accept_len_mean']} rounds {arm['spec_rounds']} "
@@ -360,14 +445,30 @@ def main(argv=None) -> int:
         for n, a in out["arms"].items()
         if a.get("pool_checksum") and not a["pool_checksum"]["clean"]
     )
+    # Reported apart from clean and from dirty, because it is neither: the
+    # instrument had no resolution on that arm and saying "clean" would be the
+    # harness passing on the reading's behalf.
+    no_resolution = sorted(
+        n
+        for n, a in out["arms"].items()
+        if (a.get("pool_checksum") or {}).get("resolution") == "none"
+    )
+    bimodal = sorted(
+        n for n, a in out["arms"].items() if (a.get("ref_bimodal") is True)
+    )
     out["content_divergent_arms"] = diverged
     out["unmet_expectations"] = unmet
     out["checksum_dirty_arms"] = dirty_checksums
+    out["checksum_no_resolution_arms"] = no_resolution
+    out["bimodal_reference_arms"] = bimodal
+    out["ref_draws"] = max(1, args.ref_draws)
     out["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"divergent arms: {diverged or 'none'}", flush=True)
+    print(f"bimodal-reference arms: {bimodal or 'none'}", flush=True)
     print(f"checksum-dirty arms: {dirty_checksums or 'none'}", flush=True)
+    print(f"checksum-no-resolution arms: {no_resolution or 'none'}", flush=True)
     print(f"unmet expectations: {unmet or 'none'}", flush=True)
     # A divergence is the MEASUREMENT and never an error exit; an unmet
     # expectation is a broken vehicle and, under --strict, is.

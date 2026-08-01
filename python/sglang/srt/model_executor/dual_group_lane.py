@@ -2363,6 +2363,92 @@ class DualGroupLane:
             out = self.draft_runner.forward(fb).logits_output
         return out
 
+    # -- proposal perturbation (test-only, env-gated, off by default) -------
+    #
+    # #404 round 2. Everything else this window built OBSERVES the rollback;
+    # this one drives it. The remaining hypothesis after residue volume,
+    # captured static buffers and the ``_kv_len`` read side were eliminated is
+    # that the leak needs corrupted proposal CONTENT -- so the falsifier has to
+    # produce some, deterministically, at a chosen round, and then ask whether
+    # a single committed token moved.
+    #
+    # The property under test is an invariance, and it is the one the greedy
+    # accept rule promises: a REJECTED proposal is not a token, it is a guess
+    # that cost a KV slot and a recurrent step, and the target's own prediction
+    # decides what gets committed. Corrupting proposal ``i`` of round ``r``
+    # therefore has exactly one legal effect -- the chain stops at ``i``
+    # instead of later -- and exactly one illegal one: a committed position
+    # that differs from the unperturbed run. The second is a leak, and it is
+    # localizable by the probe above, because both runs record the same
+    # surfaces at the same committed lengths.
+    #
+    # ``SGLANG_LANE_PROPOSAL_PERTURB="round:index:delta"``, all three integers:
+    # at the round-th speculative round of a job (0-based, job-local), add
+    # ``delta`` to proposal ``index``. Unset, nothing in this file behaves
+    # differently -- there is no default, no "sometimes", and no way to reach
+    # the hook from a serving path that did not ask for it by name. A malformed
+    # value raises rather than degrading to a no-op: a falsifier that silently
+    # did not fire would be reported as evidence of an invariance it never
+    # tested.
+    @staticmethod
+    def _proposal_perturbation() -> Optional[Tuple[int, int, int]]:
+        raw = os.environ.get("SGLANG_LANE_PROPOSAL_PERTURB")
+        if not raw:
+            return None
+        parts = raw.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                "SGLANG_LANE_PROPOSAL_PERTURB must be 'round:index:delta' "
+                f"(three integers), got {raw!r}"
+            )
+        try:
+            round_index, token_index, delta = (int(p) for p in parts)
+        except ValueError:
+            raise ValueError(
+                "SGLANG_LANE_PROPOSAL_PERTURB must be 'round:index:delta' "
+                f"(three integers), got {raw!r}"
+            ) from None
+        if round_index < 0 or token_index < 0:
+            raise ValueError(
+                "SGLANG_LANE_PROPOSAL_PERTURB: round and index are 0-based and "
+                f"non-negative, got {raw!r}"
+            )
+        return round_index, token_index, delta
+
+    def _perturb_proposals(self, job, proposals: List[int]) -> List[int]:
+        """Corrupt one proposal token, if this job's round is the chosen one.
+
+        The round index is JOB-LOCAL and counted by the hook itself, so the
+        falsifier lands on the same round whatever else the lane is serving and
+        whatever else the round happens to record. A process-wide counter would
+        make it depend on the traffic around it; borrowing one of the round's
+        own lists would make it depend on which caller drove the round.
+        """
+        spec = self._proposal_perturbation()
+        if spec is None:
+            return proposals
+        round_index, token_index, delta = spec
+        seen = int(job.get("_perturb_rounds") or 0)
+        job["_perturb_rounds"] = seen + 1
+        if seen != round_index or token_index >= len(proposals):
+            return proposals
+        if not getattr(self, "_perturb_announced", False):
+            self._perturb_announced = True
+            logger.warning(
+                "dual-group lane %d: SGLANG_LANE_PROPOSAL_PERTURB is set. This "
+                "is a FALSIFIER hook -- it corrupts speculative proposals on "
+                "purpose. It must not be set on a serving boot.",
+                self.lane_id,
+            )
+        before = int(proposals[token_index])
+        after = before + int(delta)
+        proposals = list(proposals)
+        proposals[token_index] = after
+        job.setdefault("_perturbed", []).append(
+            {"round": round_index, "index": token_index, "from": before, "to": after}
+        )
+        return proposals
+
     def _propose(self, job):
         """K chain proposals from the head, greedy, topk 1.
 
@@ -2404,7 +2490,10 @@ class DualGroupLane:
                 hidden = out.hidden_states
                 proposals.append(int(token[0].item()))
                 job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
-        return proposals
+        # LAST, so the head's own KV and hidden chain are exactly what they
+        # would have been: the falsifier corrupts what the verify is asked
+        # about, not what the head believes it proposed.
+        return self._perturb_proposals(job, proposals)
 
     @contextlib.contextmanager
     def _head_graph_scope(self, job):
@@ -2578,6 +2667,31 @@ class DualGroupLane:
     #   which the allocator hands out differently to two jobs even when both are
     #   correct.
     #
+    #   Everything the cross-job side reads is addressed LOGICALLY, and since
+    #   round 2 that is a structural property rather than an assurance. ``kv``
+    #   is the digest OF THE PER-POSITION DIGEST LIST, in logical order:
+    #   position p is hashed from the pool rows ``req_to_token[idx, p]`` points
+    #   at, so two jobs whose allocators numbered the same content differently
+    #   produce the same ``kv``, and a permutation of the same rows is
+    #   distinguishable from a change of content (the multiset of per-position
+    #   digests survives the first and not the second). ``conv`` / ``ssm`` hash
+    #   the STATE CONTENT at the request's mamba slot, never the slot id.
+    #
+    #   The byte digests are the wrong instrument for the cross-job reading on a
+    #   stack whose forwards are not bitwise reproducible run to run, and this
+    #   window measured that rather than assuming it: in the 2026-08-02 STEPS=3
+    #   window, two no-spec REFERENCE jobs on the same prompt disagreed on
+    #   100 % of committed positions at round 0 -- the prefill, before any
+    #   speculation exists -- with disjoint per-position digest sets, while
+    #   their emitted tokens were identical. A hash has no tolerance, so a
+    #   last-mantissa-bit difference reads exactly like a leaked row.
+    #   ``kv_num`` / ``conv_num`` / ``ssm_num`` are the reading that survives
+    #   that: per position (and per state surface) a float32 SUM and ABSMAX of
+    #   the same bytes, so the reader can compare against a noise floor it
+    #   MEASURED from two reference draws instead of against zero. The hashes
+    #   stay -- they are exact within a job, which is where the append-only
+    #   reading lives -- and the numeric fields are what joins across jobs.
+    #
     # COST, stated rather than implied. One D2H of the committed prefix per
     # round, per full-attention layer: at 24 layers x 8 kv heads x 128 dims of
     # fp8 that is ~48 KiB per committed token, so a 700-token position costs
@@ -2662,37 +2776,66 @@ class DualGroupLane:
         num = int(getattr(kv_pool, "layer_num", 0) or 0)
         return list(range(start, start + num))
 
-    def _pool_checksum_kv(self, kv_pool, index, stable: int, per_pos: bool):
-        """Digests of the KV rows ``index`` points at.
+    @staticmethod
+    def _pool_position_stats(rows) -> List[List[float]]:
+        """Per LOGICAL position, ``[sum, absmax]`` in float32 over all layers.
 
-        Returns ``(digest, stable_digest, per_position)``. ``stable_digest``
-        covers only the first ``stable`` rows -- the positions that were
-        ALREADY committed before this round -- and it costs nothing extra: it
-        is a second pass over the same host copies, not a second D2H. That
-        second digest is what makes the probe self-sufficient. Comparing it
-        against the PREVIOUS round's full digest asks the append-only question
-        directly -- did anything this round wrote or freed change a row the
-        lane had already committed? -- and answers it without a reference job,
-        at the round it happened.
+        The cross-job join, and the reason it exists is measured rather than
+        supposed: a digest answers "the same bytes?", and two correct jobs on
+        this stack do not produce the same bytes (see the block comment). Sum
+        and absmax are the cheapest pair that separates the two failure modes a
+        reader has to tell apart -- a last-bit difference moves the sum by
+        ~1e-3 of itself and the absmax by nothing, a leaked row moves both by
+        O(1) -- and they are computed from the SAME host copies the digests
+        were, so the cost is arithmetic and not a second D2H.
+        """
+        if not rows:
+            return []
+        positions = int(rows[0][0].shape[0])
+        total = torch.zeros(positions, dtype=torch.float32)
+        peak = torch.zeros(positions, dtype=torch.float32)
+        for k, v in rows:
+            for t in (k, v):
+                flat = t.reshape(positions, -1).to(torch.float32)
+                total += flat.sum(dim=1)
+                peak = torch.maximum(peak, flat.abs().amax(dim=1))
+        return [
+            [round(float(s), 6), round(float(m), 6)]
+            for s, m in zip(total.tolist(), peak.tolist())
+        ]
+
+    def _pool_checksum_kv(self, kv_pool, index, stable: int, per_pos: bool):
+        """Digests of the KV rows ``index`` points at, in LOGICAL order.
+
+        ``index`` is ``req_to_token[idx, lo:hi]``, so entry ``p`` is the slot
+        holding logical position ``lo + p`` and every digest below is addressed
+        by position, never by slot id. The aggregate is the digest OF THE
+        PER-POSITION DIGESTS rather than of the concatenated rows: same
+        sensitivity, and it makes "the aggregate cannot depend on which slots
+        the allocator drew" a property of the construction instead of a
+        sentence in a comment.
+
+        Returns ``(digest, stable_digest, per_position, per_position_stats)``.
+        ``stable_digest`` covers only the first ``stable`` positions -- the
+        ones that were ALREADY committed before this round -- and it costs
+        nothing extra: it is a second pass over the same host copies, not a
+        second D2H. That second digest is what makes the probe self-sufficient.
+        Comparing it against the PREVIOUS round's full digest asks the
+        append-only question directly -- did anything this round wrote or freed
+        change a row the lane had already committed? -- and answers it without
+        a reference job, at the round it happened.
         """
         layers = self._pool_checksum_kv_layers(kv_pool)
         rows: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        h = hashlib.blake2b(digest_size=16)
-        hs = hashlib.blake2b(digest_size=16)
         for layer_id in layers:
-            k = self._pool_cpu(kv_pool.get_key_buffer(layer_id)[index])
-            v = self._pool_cpu(kv_pool.get_value_buffer(layer_id)[index])
-            self._pool_feed(h, k)
-            self._pool_feed(h, v)
-            if stable > 0:
-                self._pool_feed(hs, k[:stable])
-                self._pool_feed(hs, v[:stable])
-            if per_pos:
-                rows.append((k, v))
-        digest = h.hexdigest()
-        stable_digest = hs.hexdigest() if stable > 0 and layers else None
+            rows.append(
+                (
+                    self._pool_cpu(kv_pool.get_key_buffer(layer_id)[index]),
+                    self._pool_cpu(kv_pool.get_value_buffer(layer_id)[index]),
+                )
+            )
         if not rows:
-            return digest, stable_digest, None
+            return None, None, None, None
         per: List[str] = []
         for p in range(int(index.shape[0])):
             hp = hashlib.blake2b(digest_size=8)
@@ -2700,10 +2843,41 @@ class DualGroupLane:
                 self._pool_feed(hp, k[p])
                 self._pool_feed(hp, v[p])
             per.append(hp.hexdigest())
-        return digest, stable_digest, per
+        h = hashlib.blake2b(digest_size=16)
+        h.update("|".join(per).encode())
+        hs = hashlib.blake2b(digest_size=16)
+        hs.update("|".join(per[:stable]).encode())
+        digest = h.hexdigest()
+        stable_digest = hs.hexdigest() if stable > 0 else None
+        stats = self._pool_position_stats(rows)
+        return digest, stable_digest, (per if per_pos else None), stats
+
+    @staticmethod
+    def _pool_state_stats(*tensors) -> List[float]:
+        """``[sum, absmax]`` of a state surface, in float32.
+
+        The state's cross-job join, for the same reason the KV positions have
+        one. A slot id never enters it: the caller has already selected the
+        request's slot, so what is reduced here is content.
+        """
+        total = 0.0
+        peak = 0.0
+        for t in tensors:
+            flat = t.detach().reshape(-1).to(torch.float32)
+            total += float(flat.sum().item())
+            peak = max(peak, float(flat.abs().max().item()) if flat.numel() else 0.0)
+        return [round(total, 6), round(peak, 6)]
 
     def _pool_checksum_state(self, job):
-        """(conv digest, ssm digest) for THIS request's persistent state."""
+        """The request's persistent state, by CONTENT and not by slot.
+
+        Returns ``(conv digest, ssm digest, conv stats, ssm stats)``.
+        ``cache.conv`` is a per-layer list of ``[num_layers, num_slots, ...]``
+        tensors and ``cache.temporal`` is one of the same shape, so ``[:, slot]``
+        selects this request's state across every layer -- the state itself,
+        which two jobs standing at the same committed position must agree on
+        however differently the pool numbered their slots.
+        """
         req = job.get("_req")
         pool = getattr(self.runner, "req_to_token_pool", None)
         mamba_pool = getattr(pool, "mamba_pool", None)
@@ -2712,11 +2886,18 @@ class DualGroupLane:
         if cache is None or slot is None:
             # A family without recurrence has no such surface, and saying so
             # with None is not the same as saying it hashed empty.
-            return None, None
+            return None, None, None, None
         slot = int(slot)
-        conv = self._pool_digest(*[c[:, slot] for c in cache.conv])
-        ssm = self._pool_digest(cache.temporal[:, slot])
-        return conv, ssm
+        conv_rows = [c[:, slot] for c in cache.conv]
+        ssm_rows = [cache.temporal[:, slot]]
+        conv = self._pool_digest(*conv_rows)
+        ssm = self._pool_digest(*ssm_rows)
+        return (
+            conv,
+            ssm,
+            self._pool_state_stats(*conv_rows),
+            self._pool_state_stats(*ssm_rows),
+        )
 
     @staticmethod
     def _pool_committed_len(job) -> int:
@@ -2788,12 +2969,12 @@ class DualGroupLane:
             stable = 0 if tail > 0 else max(0, min(prev_len, hi - lo))
             per_pos = bool(os.environ.get("SGLANG_LANE_POOL_CHECKSUM_PER_POS"))
             kv_pool = self._pool_checksum_kv_pool()
-            kv_digest = kv_stable = kv_positions = None
+            kv_digest = kv_stable = kv_positions = kv_stats = None
             if kv_pool is not None and hi > lo:
-                kv_digest, kv_stable, kv_positions = self._pool_checksum_kv(
+                kv_digest, kv_stable, kv_positions, kv_stats = self._pool_checksum_kv(
                     kv_pool, slots.to(torch.int64), stable, per_pos
                 )
-            conv, ssm = self._pool_checksum_state(job)
+            conv, ssm, conv_stats, ssm_stats = self._pool_checksum_state(job)
             records = job.setdefault("_pool_checksums", [])
             rec: Dict[str, Any] = {
                 "tag": job.get("probe_tag"),
@@ -2816,6 +2997,13 @@ class DualGroupLane:
                 "kv_stable": kv_stable,
                 "conv": conv,
                 "ssm": ssm,
+                # The cross-job fields. Always present when their surface is,
+                # because the reading that joins two jobs is the numeric one
+                # and a diagnostic that needs a second env var to be usable is
+                # a diagnostic that will be run without it.
+                "kv_num": kv_stats,
+                "conv_num": conv_stats,
+                "ssm_num": ssm_stats,
             }
             if kv_positions is not None:
                 rec["kv_pos"] = kv_positions

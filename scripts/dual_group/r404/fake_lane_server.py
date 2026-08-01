@@ -20,8 +20,15 @@ green smoke also proves the red branches fire:
     --dirty checksum  the speculative side's pool checksums break the
                       append-only invariant at a named round (the checksum
                       verdict must go red AND name that round)
+    --dirty bimodal   the NO-SPEC reference itself draws two different
+                      trajectories and the speculative arm lands on the second
+                      one. The single-draw reading calls that a content
+                      divergence; the set-based reading of ``--ref-draws``
+                      calls it within-modes. This is the can-fail of the
+                      reference-set gating, and it is the shape the GDN
+                      bimodality actually has.
 
-Usage:  fake_lane_server.py PORT [--dirty tv|eager|mixed|checksum|none]
+Usage:  fake_lane_server.py PORT [--dirty tv|eager|mixed|checksum|bimodal|none]
 """
 
 from __future__ import annotations
@@ -33,8 +40,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List
 
 DIRTY = "none"
-if "--dirty" in sys.argv:
-    DIRTY = sys.argv[sys.argv.index("--dirty") + 1]
+
+
+def set_dirty(value: str) -> None:
+    """Which can-fail arm this server carries. Importable, for the smoke."""
+    global DIRTY
+    DIRTY = value
+
 
 STATE: Dict[str, Any] = {"total": 0, "results": []}
 
@@ -43,6 +55,11 @@ STATE: Dict[str, Any] = {"total": 0, "results": []}
 # that ref and arm ids agree (or, in the dirty arm, do not).
 _REF_IDS = list(range(1000, 1064))
 _DIRTY_IDS = _REF_IDS[:18] + [7777] + _REF_IDS[19:]
+
+#: The reference's OTHER mode under ``--dirty bimodal``. A different token at
+#: one shared position is what a mode change looks like to the token gate --
+#: indistinguishable, by construction, from the divergence it is not.
+_MODE_B_IDS = _REF_IDS[:18] + [8888] + _REF_IDS[19:]
 
 #: The verify shapes a boot with ``--dual-group-lane-spec-rungs 0,1,3`` records.
 _CAPTURED = {2, 4}
@@ -95,6 +112,16 @@ def _checksums(ids: List[int], accepts: List[int], tag, prompt_len: int):
             "ssm": _digest("ssm", prefix),
             "probe_ms": 1.0,
         }
+        # The numeric cross-job fields, with the property that decides the
+        # reading: a pure function of the committed CONTENT, so two draws that
+        # committed the same tokens are numerically equal and two that did not
+        # are apart by O(1) rather than by a last bit.
+        values = [float(1000 + i) for i in range(prompt_len)] + [
+            float(t) for t in prefix
+        ]
+        rec["kv_num"] = [[v, v] for v in values]
+        rec["conv_num"] = [sum(values), max(values or [0.0])]
+        rec["ssm_num"] = [sum(values) / 2.0, max(values or [0.0])]
         if (
             DIRTY == "checksum"
             and tag
@@ -106,6 +133,8 @@ def _checksums(ids: List[int], accepts: List[int], tag, prompt_len: int):
             # walks away from the reference from here on.
             rec["kv_stable"] = _digest("planted", round_index)
             rec["kv"] = _digest("planted-kv", round_index)
+            if rec["kv_num"]:
+                rec["kv_num"][0] = [v * 2.0 + 1.0 for v in rec["kv_num"][0]]
         prev = committed
         prev_map, prev_kv = rec["map"], rec["kv"]
         records.append(rec)
@@ -194,6 +223,16 @@ class H(BaseHTTPRequestHandler):
         ids = list(_REF_IDS)
         if spec and DIRTY == "tv" and cap == 0:
             ids = list(_DIRTY_IDS)
+        if DIRTY == "bimodal":
+            # The reference alternates modes across its draws; the arm sits on
+            # mode B. Which draw this is comes off the probe tag the harness
+            # already sends (``<arm>:no_spec:<draw>``), so the server needs no
+            # state of its own and the smoke stays order-independent.
+            if spec:
+                ids = list(_MODE_B_IDS)
+            elif str(tag).rsplit(":", 1)[-1].isdigit():
+                draw = int(str(tag).rsplit(":", 1)[-1])
+                ids = list(_MODE_B_IDS if draw % 2 else _REF_IDS)
 
         if not spec:
             accepts = [1] * len(ids)
@@ -257,4 +296,18 @@ class H(BaseHTTPRequestHandler):
         self._send({})
 
 
-HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+def make_server(port: int = 0) -> HTTPServer:
+    """A bound, unstarted server. Port 0 lets the caller ask for a free one."""
+    return HTTPServer(("127.0.0.1", int(port)), H)
+
+
+def reset_state() -> None:
+    """Forget every result. The smoke runs several arms against one server."""
+    STATE["total"] = 0
+    STATE["results"] = []
+
+
+if __name__ == "__main__":
+    if "--dirty" in sys.argv:
+        set_dirty(sys.argv[sys.argv.index("--dirty") + 1])
+    make_server(int(sys.argv[1])).serve_forever()
