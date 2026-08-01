@@ -168,7 +168,14 @@ run_bracket run2_mixed_rung --prompts squares --prelude none \
 # run3  the K=1 bracket again, captured, as the direct tie to the previous
 #       window's numbers (plain 1.145/55 there; a divergence here would be
 #       comparable to it without a second boot).
-run_bracket run3_k1_control --prompts squares --prelude none || RC=$?
+#       The trailing --steps 1 is load-bearing and NOT redundant: run_bracket
+#       passes --steps "$STEPS" (=3), and _lane_job derives an unpinned arm's
+#       spec_steps from exactly that value -- so without this override the
+#       "K=1 control" would run at K=3 and merely repeat run1 under a
+#       different tag. argparse takes the LAST occurrence, so the K=1 rung is
+#       what the control actually asks for. Verify shape 2 is captured by
+#       --dual-group-lane-spec-rungs 0,1,3, so the arm still replays.
+run_bracket run3_k1_control --prompts squares --prelude none --steps 1 || RC=$?
 # run4  other content families at the top rung.
 run_bracket run4_prompts --prompts alphabet,repeat --prelude none \
   --arms k3_plain,k3_tv0,mixed_0_3 || RC=$?
