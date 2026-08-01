@@ -52,6 +52,10 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from sglang.srt.planner.cost_model import Provenance, Rate
 
 __all__ = [
+    "EnergyModel",
+    "RankPower",
+    "energy_per_work",
+    "energy_rate",
     "Objective",
     "ScoredCandidate",
     "combine_provenance",
@@ -243,3 +247,140 @@ def resolve_objective(server_args) -> Objective:
             f"unknown --objective {value!r}; known: "
             f"{', '.join(o.value for o in Objective)}"
         ) from None
+
+
+# ---------------------------------------------------------------------------
+# Solver-side energy model (#350 phase 2)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RankPower:
+    """The two power anchors of ONE rank's card, and where they came from.
+
+    Same two-anchor shape ``roofline.CardEnergy`` uses, for the same reason:
+    a card's board power rides between an idle floor and an active ceiling
+    with its utilization. ``source`` mirrors that module's ``power_source``
+    ("measured" when the anchors are this physical card's NVML-calibrated
+    draw, "estimate-tdp" for the TDP heuristic), and it decides the
+    provenance of every number derived from it.
+    """
+
+    idle_w: float
+    active_w: float
+    source: str = "estimate-tdp"
+
+    def __post_init__(self) -> None:
+        if self.active_w < self.idle_w:
+            raise ValueError(
+                f"active anchor {self.active_w} W is below the idle floor "
+                f"{self.idle_w} W; the anchors are swapped"
+            )
+
+    @property
+    def provenance(self) -> Provenance:
+        return (
+            Provenance.MEASURED
+            if self.source == "measured"
+            else Provenance.ESTIMATE
+        )
+
+    def watts(self, util: float) -> float:
+        """Board power at a busy fraction in [0, 1]."""
+        u = 0.0 if util < 0.0 else (1.0 if util > 1.0 else float(util))
+        return self.idle_w + (self.active_w - self.idle_w) * u
+
+
+@dataclasses.dataclass(frozen=True)
+class EnergyModel:
+    """Per-rank power anchors, i.e. everything the SOLVER needs to price a
+    candidate in joules instead of seconds.
+
+    Deliberately NOT a new energy model: the physics is the one #148 already
+    documents in ``roofline_energy`` --
+
+        J_per_work = t_lockstep * sum_r P_r(util_r)
+        util_r     = (this rank's own busy time) / t_lockstep
+
+    -- with the busy times supplied by the solver's existing per-rank cost
+    terms. Ranks step together, so the slowest sets ``t_lockstep`` and a fast
+    rank that finishes early idles at its floor: that is exactly how a
+    concentrating plan buys efficiency, and it falls out of the model rather
+    than being asserted.
+
+    ``per_rank`` is indexed like every other per-rank vector in the solver.
+    """
+
+    per_rank: Tuple[RankPower, ...]
+
+    def __post_init__(self) -> None:
+        if not self.per_rank:
+            raise ValueError("EnergyModel needs at least one rank")
+
+    @property
+    def provenance(self) -> Provenance:
+        """Weakest-wins across the ranks: one estimated card makes the whole
+        rig figure an estimate."""
+        prov = Provenance.MEASURED
+        for rp in self.per_rank:
+            prov = combine_provenance(prov, rp.provenance)
+        return prov
+
+    @property
+    def source(self) -> str:
+        kinds = sorted({rp.source for rp in self.per_rank})
+        return "power anchors: " + ", ".join(kinds)
+
+
+def energy_per_work(
+    busy_seconds: Sequence[float],
+    energy_model: EnergyModel,
+    *,
+    work_per_lockstep: float = 1.0,
+) -> float:
+    """Joules per unit of work for one candidate. Lower is better.
+
+    ``busy_seconds[r]`` is rank ``r``'s OWN time for one lockstep round (the
+    quantity the solver's ``a_r + b_r * u_r`` terms already produce). The
+    round takes ``max_r busy_seconds`` -- every other rank waits, drawing
+    idle-to-active in proportion to how much of the round it was busy.
+
+    ``work_per_lockstep`` converts a round into work units (tokens, frames)
+    when one round is not one unit of work.
+    """
+    if len(busy_seconds) != len(energy_model.per_rank):
+        raise ValueError(
+            f"busy_seconds has {len(busy_seconds)} ranks, the energy model "
+            f"has {len(energy_model.per_rank)}"
+        )
+    t_lockstep = max(float(t) for t in busy_seconds)
+    if t_lockstep <= 0:
+        raise ValueError("lockstep time must be > 0 to price energy")
+    watts = 0.0
+    for busy, rp in zip(busy_seconds, energy_model.per_rank):
+        watts += rp.watts(float(busy) / t_lockstep)
+    work = float(work_per_lockstep)
+    if work <= 0:
+        raise ValueError("work_per_lockstep must be > 0")
+    return t_lockstep * watts / work
+
+
+def energy_rate(
+    busy_seconds: Sequence[float],
+    energy_model: EnergyModel,
+    *,
+    work_unit: str = "tok",
+    work_per_lockstep: float = 1.0,
+) -> Rate:
+    """:func:`energy_per_work` as a provenance-carrying J/work Rate."""
+    value = energy_per_work(
+        busy_seconds, energy_model, work_per_lockstep=work_per_lockstep
+    )
+    unit = f"J/{work_unit}"
+    source = (
+        f"solver energy model (lockstep t x sum_r P_r(util_r)); "
+        f"{energy_model.source}"
+    )
+    if energy_model.provenance is Provenance.MEASURED:
+        return Rate.measured(value, source, unit=unit)
+    return Rate.estimate(value, source, unit=unit)
