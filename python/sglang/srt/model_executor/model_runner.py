@@ -2236,10 +2236,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     wait_all_ranks=True,
                 )
-            except RuntimeError:
+            except RuntimeError as e:
+                # #386 sibling: `from None` used to drop the barrier's own
+                # message, which is the only text that NAMES the ranks that
+                # never checked in -- the generic sentence below is a guess
+                # ("likely ... OOM or a slow node") and was all the operator
+                # got. The verdict stays a ValueError with the same wording;
+                # the evidence is appended and the chain reconnected.
                 raise ValueError(
-                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-                ) from None
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node. "
+                    f"The barrier reported: {e}"
+                ) from e
 
     def _prepare_moe_topk(self):
         balancer_cls = None

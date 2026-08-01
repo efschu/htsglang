@@ -27,6 +27,10 @@ What is pinned here:
  7. #257: ...but only when a peer rank exists. On a single-rank boot the
     original exception is re-raised as itself, because "a peer may still be
     in nvcc" is not a possible explanation there.
+ 8. #386: ...and only when the failure is a cold-build SYMPTOM. Anything else
+    keeps its own type and message and carries the window as a note. Three
+    wrong diagnoses on record (#377 twice, #384 once) came from substituting
+    the window's text for a layer-construction error's.
 
 CPU only: this tests the deadline POLICY and the loop that carries it, not
 any CUDA kernel.
@@ -242,6 +246,183 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
         with self.assertRaises(KeyboardInterrupt):
             run_capture_warmups(boom, device_module=dev, tp_group=group)
         self.assertFalse(in_cold_build_window())
+
+
+class TestOnlySymptomsAreRelabelled(CustomTestCase):
+    """#386: the window ATTACHES its context, it never SUBSTITUTES a message.
+
+    The defect these pin, reproduced verbatim on the tree before the fix, with
+    a peer present so the #257 escape does not apply:
+
+        planted AttributeError("'Fp8LinearMethod' object has no attribute
+        'weight_block_size'")  ->  the operator saw
+
+        Exception: Capture cuda graph failed: Failure inside the JIT
+        cold-build window (cuda-graph capture warmup). ... Warm the cache
+        (boot once with --disable-cuda-graph), raise
+        SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT (currently 40) ...
+        Possible solutions:
+        1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
+        ...
+
+    -- the AttributeError's own text appearing nowhere in it, reachable only
+    through two ``__context__`` hops (the second frame is the graph runner's
+    ``except RuntimeError``, which catches the ColdBuildWindowError only
+    because the wrapper had already turned an AttributeError into a
+    RuntimeError). That is #377's shape, and #384's.
+    """
+
+    def _fakes(self, world_size=3):
+        class FakeDeviceModule:
+            def synchronize(self_inner):
+                pass
+
+        class FakeGroup:
+            world_size = 3
+
+            def barrier(self_inner):
+                pass
+
+        FakeGroup.world_size = world_size
+        return FakeDeviceModule(), FakeGroup()
+
+    def _run(self, fn, world_size=3):
+        dev, group = self._fakes(world_size)
+        return run_capture_warmups(fn, device_module=dev, tp_group=group)
+
+    def test_layer_construction_attribute_error_surfaces_as_itself(self):
+        """#377: an FP8 quant method missing an attribute is not a memory problem."""
+
+        def boom():
+            raise AttributeError(
+                "'Fp8LinearMethod' object has no attribute 'weight_block_size'"
+            )
+
+        with self.assertRaises(AttributeError) as ctx:
+            self._run(boom)
+        exc = ctx.exception
+        self.assertNotIsInstance(exc, ColdBuildWindowError)
+        self.assertEqual(
+            str(exc),
+            "'Fp8LinearMethod' object has no attribute 'weight_block_size'",
+            "the window rewrote a layer-construction error's message",
+        )
+        self.assertNotIn("mem-fraction-static", str(exc))
+        self.assertFalse(in_cold_build_window())
+
+    def test_the_window_is_attached_as_a_note_not_as_a_message(self):
+        def boom():
+            raise AttributeError("no attribute 'weight_block_size'")
+
+        with self.assertRaises(AttributeError) as ctx:
+            self._run(boom)
+        notes = getattr(ctx.exception, "__notes__", None)
+        if notes is None:  # add_note is 3.11+; below that the log carries it
+            self.skipTest("BaseException.add_note is unavailable on this Python")
+        joined = "\n".join(notes)
+        self.assertIn("cold-build window", joined)
+        self.assertIn("mem-fraction-static", joined)
+
+    def test_genuine_torch_oom_keeps_todays_message(self):
+        """Behaviour pin: the allocator IS a family the window explains."""
+        import torch
+
+        def boom():
+            raise torch.cuda.OutOfMemoryError(
+                "CUDA out of memory. Tried to allocate 2.37 GiB. GPU 0 has a "
+                "total capacity of 31.36 GiB of which 1.12 GiB is free."
+            )
+
+        with self.assertRaises(ColdBuildWindowError) as ctx:
+            self._run(boom)
+        self.assertIn("cold-build", str(ctx.exception).lower())
+        self.assertIsInstance(ctx.exception.__cause__, torch.cuda.OutOfMemoryError)
+        self.assertIn("2.37 GiB", str(ctx.exception.__cause__))
+
+    def test_allocator_message_variants_count_as_symptoms(self):
+        """The class is one signature, the text is the other."""
+        for message in (
+            "CUDA out of memory. Tried to allocate 512.00 MiB",
+            "CUDA error: out of memory",
+            "CUDA error: unspecified launch failure",
+        ):
+            with self.subTest(message=message):
+
+                def boom(msg=message):
+                    raise RuntimeError(msg)
+
+                with self.assertRaises(ColdBuildWindowError):
+                    self._run(boom)
+
+    def test_int8_arm_refusal_passes_through_unmasked(self):
+        """#384's instance stays fixed even where it originally fired."""
+        from sglang.srt.layers.quantization.w8a8_int8 import require_int8_arm
+
+        def boom():
+            require_int8_arm("w8a8_int8", available=False)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(boom)
+        self.assertNotIsInstance(ctx.exception, ColdBuildWindowError)
+        self.assertIn("int8_scaled_mm", str(ctx.exception))
+        self.assertIn("fork wheel", str(ctx.exception))
+
+    def test_an_unfamiliar_failure_is_passed_through(self):
+        """When in doubt, do not claim it. Conservative is the cheap direction."""
+
+        def boom():
+            raise ValueError("size_n = 17888 is not divisible by tile_n_size = 64")
+
+        with self.assertRaises(ValueError) as ctx:
+            self._run(boom)
+        self.assertIn("17888", str(ctx.exception))
+
+    def test_the_exception_chain_survives_both_branches(self):
+        """__cause__/__context__ still lead to the original in either case."""
+
+        # Symptom: the original is the wrapper's __cause__.
+        def oom():
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.00 GiB")
+
+        with self.assertRaises(ColdBuildWindowError) as ctx:
+            self._run(oom)
+        self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+        self.assertIn("1.00 GiB", str(ctx.exception.__cause__))
+
+        # Non-symptom: the raised object IS the original, and the chain it
+        # arrived with is untouched -- the wrapper adds no link of its own.
+        inner = KeyError("q_proj")
+
+        def wrapped():
+            try:
+                raise inner
+            except KeyError as e:
+                raise AttributeError("layer build failed") from e
+
+        with self.assertRaises(AttributeError) as ctx:
+            self._run(wrapped)
+        self.assertIs(ctx.exception.__cause__, inner)
+        self.assertIs(ctx.exception.__context__, inner)
+
+    def test_the_collective_deadline_is_still_a_symptom(self):
+        """The window's own instrument: a bounded wait that expired here."""
+        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            CollectiveTimeoutError,
+            PeerLostError,
+        )
+
+        def timed_out():
+            raise CollectiveTimeoutError("barlink barrier: 120.0 s elapsed")
+
+        with self.assertRaises(ColdBuildWindowError):
+            self._run(timed_out)
+
+        # ...but a peer that is provably GONE is decided and self-describing.
+        def peer_lost():
+            raise PeerLostError("rank 2 (pid 123) is gone")
+
+        with self.assertRaises(PeerLostError):
+            self._run(peer_lost)
 
 
 class TestCallSites(CustomTestCase):
