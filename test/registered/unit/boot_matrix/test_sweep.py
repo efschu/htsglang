@@ -57,11 +57,19 @@ class TestBuildCommand(CustomTestCase):
         self.assertIn("--kv-cache-dtype", argv)
 
     def test_a_later_flag_still_overrides_a_base_value(self):
-        """Removal is the new mechanism; plain override must keep working."""
-        arm = arm_by_name("reject_dcp_offlane")
+        """Removal is the new mechanism; plain override must keep working.
+
+        I_dflash_shards appends --speculative-algorithm DFLASH over the base
+        NEXTN and relies on argparse taking the last value. (This used to be
+        demonstrated on reject_dcp_offlane's ratio, which now DROPS the base
+        flag instead -- an explicit all-identical ratio is rejected by name.)
+        """
+        arm = arm_by_name("I_dflash_shards")
         _, argv = build_command(arm, model_path="/m", port=30000)
-        i_last = len(argv) - 1 - argv[::-1].index("--rank-tp-ratio")
-        self.assertEqual(argv[i_last + 1], "1,1,1")
+        i_first = argv.index("--speculative-algorithm")
+        i_last = len(argv) - 1 - argv[::-1].index("--speculative-algorithm")
+        self.assertGreater(i_last, i_first, "the arm's value must come last")
+        self.assertEqual(argv[i_last + 1], "DFLASH")
 
     def test_dropping_a_flag_takes_its_value_with_it(self):
         """An orphan value would be read as a positional argument."""
