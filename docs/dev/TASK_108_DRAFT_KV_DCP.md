@@ -304,3 +304,414 @@ Not in scope for the first window: a byte-win claim. On the reference rig the
 kv-heads are freely shardable (8 over 3 ranks) so the layout is byte-neutral
 there by the rule in the section above; demonstrating the full shard factor
 needs a `TP > num_kv_heads` configuration.
+
+---
+
+# Slice 3 desk pass: the GPU verdict, and what the code actually says
+
+The 2026-08-01 window (`/spinning/gpu-battery-results/2026-08-01_108-dcp-validation/`)
+returned four green points and one split: the split works, output quality is
+byte-clean, and **accept length regresses on the dcp arm** (alphabet
+4.000 -> 3.368, squares 3.368 -> 3.048 at `draft_tokens=4`; no gap at
+`draft_tokens=2`, where the arm sits at the 2.0 ceiling).
+
+## The window's hypothesis is FALSIFIED
+
+The window suspected the prefix subtraction under-read by
+`(padded - accept_len)`, because the qo layout is a padded constant while
+acceptance is variable. Reading the code settles it the other way.
+
+`base_spec_worker.prepare_for_draft_extend`:
+
+```python
+batch.prefix_lens  = batch.seq_lens            # the committed history
+batch.extend_lens  = [num_draft_tokens] * bs   # PADDED
+extend_num_tokens  = bs * num_draft_tokens     # PADDED
+# Forward sees post-write length (draft extend writes num_draft_tokens slots)
+forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+```
+
+and `eagle_worker_v2._draft_extend_for_decode` sets
+`num_tokens_per_req=self.speculative_num_draft_tokens` (padded) while carrying
+`num_accept_tokens=batch_result.accept_lens` (actual) alongside it.
+
+So `seq_lens` at draft-extend is inflated by the **padded** count, not the
+accepted one, and **the write is padded too** — the same constant on both
+sides. Subtracting `num_tokens_per_req` therefore lands exactly on
+`committed`. The subtraction is correct; the write and the read agree about
+padding; there is no sibling defect on the write side. The pads are scratch
+rows the next round overwrites, and because both stages agree on where the
+padding starts, the paged and ragged ranges stay disjoint and complete.
+
+**Graph capture and the real prefix coexist by construction**, which answers
+the design question: the padded stride lives entirely in the RAGGED stage (the
+current chunk), and the paged read stops at `committed`. No mask is needed to
+reconcile them because no padded row is ever inside the paged range. If the
+append count ever became genuinely variable per request, that would no longer
+hold and the paged stage would need a per-request length — but today it does
+not.
+
+## Consequence: the regression has another cause, not yet identified
+
+Ruled out by this pass: the subtraction, the write/read padding agreement, and
+an arm-level confound — arms C and D resolved to the **identical** effective
+configuration (vector `[30,17,17]`, ratio `[29607,17780,17780]`,
+`max_total_num_tokens=453632`), so the flag is the only difference.
+
+Still open, in the order worth checking:
+
+1. The draft's **cross-rank LSE merge and owned-slot indices**. The draft pool
+   is compacted by the owner rule while `req_to_token` (shared with the target)
+   holds global allocator ids; the compaction must agree between the draft
+   pool's row space and the index builder. A subtly wrong merge degrades the
+   draft's predictions without touching the target verify — which is exactly
+   the observed shape (accept down, quality perfect).
+2. The **ragged stage's head geometry** for the draft. The current chunk is
+   attended on LOCAL head-sharded q/kv while the paged prefix uses gathered
+   full heads; `_replicated_kv_ragged_reindex` corrects the GQA grouping only
+   when `dcp_kv_replicated_heads` is set, which it is not at 8 kv heads over 3
+   ranks.
+3. Plain numeric drift from reading a sharded prefix through an LSE merge
+   instead of one local read. Benign if so, but it must be shown, not assumed.
+
+Note the padding-width scaling that looked like evidence for the falsified
+hypothesis is **also** consistent with (1)-(3): at `draft_tokens=2` acceptance
+was at its ceiling, so there was no headroom in which a degraded draft could
+show up. The discriminator localized the effect to a regime, not to a cause.
+
+## Test-design fix
+
+`test/registered/unit/distributed/test_draft_extend_prefix_contract.py` pins
+the CONTRACT rather than the arithmetic:
+
+* C1 prefix == committed, C2 paged and ragged disjoint and complete, C3 no
+  committed token outside the paged range — over a grid of padded widths
+  (1,2,3,4,8) crossed with committed lengths.
+* The padded constant is varied **independently** of the accept count, so the
+  k=2-vs-k=4 discriminator is now a CPU case.
+* The falsified hypothesis is pinned as a counterfactual: subtracting an
+  accept-like count reads PAST the commit.
+
+Falsifier-checked: a wrong subtrahend reds 45 assertions across the grid. The
+slice-2 test, which asserted `seq_lens - k` directly, caught none of them —
+it pinned the arithmetic chosen rather than the property it had to satisfy.
+
+## Re-run scope (next window, ~10 min)
+
+The prepared runsheet unchanged, plus the k=2/4 pair as a permanent arm. But
+note that **the fix this pass was expected to produce does not exist**, because
+the defect it assumed is not there. The re-run should therefore be deferred
+until one of (1)-(3) is either confirmed at the desk or turned into an on-card
+discriminator — re-measuring the same regression without a changed hypothesis
+would spend a window to reproduce a number already in hand.
+
+## Cause pass: verdicts
+
+**Read the discriminator as a REGIME, not a cause.** This is the canonical
+framing; the window over-read it and the next reader should not. The k=2/k=4
+pair showed *where the effect has headroom to become visible* — at
+`draft_tokens=2` acceptance was already at its 2.0 ceiling, so a slightly worse
+draft had nowhere to show. It localized a regime. It said nothing about
+mechanism, and every hypothesis below is compatible with it.
+
+### Cause (1) — owner-rule compaction vs the draft pool's row space: CLEAN
+
+`build_dcp_weighted_kv_indices` (`layers/dcp/owner.py:448`) reads the global
+allocator ids out of `req_to_token` and then compacts every one of them through
+`dcp_weighted_read_slots` to `(loc // cp_S) * cp_ratio + (loc % cp_S - cp_lo)`
+— "the exact inverse of the `_dcp_masked_write` packing, so a token is read
+from the slot it was written to". Raw global ids never reach the pool.
+
+Draft and target **share** `req_to_token` and the allocator (handed in by
+`alloc_memory_pool`), so a token at global slot `L` is written to
+`draft_pool[compact(L)]` and read from `compact(L)` under the same
+`(cp_S, cp_lo, cp_hi, cp_ratio)`. Slice 1 sized the draft pool with the same
+`dcp_compact_pool_rows(C, S, ratio_r)`, so every compacted row is in range.
+
+The draft **decode** path was checked too, since slice 2 only built extend: its
+DCP branch is gated on `spec_info.kv_indptr is None`, and nothing in
+`speculative/` ever assigns that field for the EAGLE draft inputs — so decode
+takes the compaction branch as well. No bypass.
+
+### Cause (2) — ragged head geometry: NOT APPLICABLE here
+
+`_replicated_kv_ragged_reindex` fires only under `dcp_kv_replicated_heads =
+attn_kv_replicated(attn_tp_size, total_kv)`, i.e. `TP > num_kv_heads`. This rig
+runs 3 ranks over 8 kv heads, so it is False and the reindex is correctly
+skipped: the aligned split gives whole GQA groups per rank
+(`gqa_local == gqa_global`), which is the condition the reindex exists to
+repair when it does not hold. Its docstring symptom ("corrupting short-prompt /
+first-chunk generation while the gathered-q paged prefix/decode path stayed
+correct") is a near-match in shape, which is why it was checked — but its
+trigger is absent. **It becomes live on `TP > num_kv_heads` hardware, which is
+exactly the hardware where this layout is worth enabling**, so it must be
+re-checked there rather than considered closed.
+
+### Cause (3) — LSE-merge numeric drift: the live hypothesis, and benign-shaped
+
+The decisive evidence was already in the window's artifacts and was not read at
+the time. **Both arms emit byte-identical output token ids** — 64/64 on both
+prompts, no divergence. The whole difference is the verify count:
+
+| prompt | C verifies | D verifies | accept C | accept D |
+|---|---|---|---|---|
+| alphabet | 16 | 19 | 4.000 | 3.368 |
+| squares | 19 | 21 | 3.368 | 3.048 |
+
+An indexing or compaction defect makes the draft read *wrong rows*; that
+degrades its predictions erratically and content-dependently, and it would not
+leave the accepted trajectory untouched at 64/64. A uniform handful of extra
+rounds with identical output is instead the signature of the draft's **logits
+differing in their last bits**: the sharded prefix is read as per-rank partials
+and recombined by LSE, which reassociates the reduction relative to one local
+read. A draft proposal at a near tie flips, the target rejects it, and the
+round costs one more verify. That is the #274/#360 reassociation story one
+level down — in the DRAFT rather than in the verify.
+
+## What this means for the feature
+
+Correct, and on THIS rig not worth enabling:
+
+* VRAM: byte-neutral here (kv-heads freely shardable at 8 over 3 ranks; the
+  token-shard factor and the head-replication factor cancel — see the byte-win
+  rule above).
+* Accept: **-10 to -16 %**, at identical output.
+
+So the applicability rule is sharper than "it works": `--draft-kv-layout dcp`
+pays only where the heads cannot be sharded further (`TP > num_kv_heads`),
+where the VRAM win is the full shard factor. This rig is the configuration
+where it costs and returns nothing. That is a property of the hardware, not a
+defect, and it belongs in the flag's help text.
+
+## Re-run proposal — one falsifier per hypothesis
+
+Deferred until a hypothesis is worth falsifying; this is what would make it so.
+Two boots, ~10 min, only if the answer is wanted before the `TP > num_kv_heads`
+work.
+
+**H3 (drift, live).** Falsifier: **context-length sensitivity.** Drift flips
+near-tie draft positions at a roughly constant per-position rate, so the
+RELATIVE accept gap should stay about the same as context grows. A latent
+indexing defect that only bites when the prefix spans many owner blocks would
+make the gap GROW with context. Run both arms at ~4k prompt context and compare
+the relative gap against the 64-token measurement already in hand. Gap constant
+-> H3 confirmed, feature correct, close it. Gap grows -> reopen (1) with a
+concrete regime to bisect.
+
+**H2 (head geometry).** Not falsifiable on this rig — its trigger is absent.
+Falsifier belongs to the `TP > num_kv_heads` window: run the same two arms on a
+model with fewer kv heads than ranks and check that `dcp_kv_replicated_heads`
+is True and the reindex path is exercised.
+
+**H1 (compaction).** Reads clean; no on-card falsifier proposed. It would be
+re-opened only by H3's gap-grows outcome.
+
+Recommended order: do the `TP > num_kv_heads` window FIRST (it tests the
+feature where it is supposed to pay, and it exercises H2), and treat H3's
+context sweep as optional confirmation rather than a blocker.
+
+---
+
+# TP > num_kv_heads: vehicle inventory and window proposal
+
+## Why this window, and why it is not a re-run
+
+The validation arc's durable outcome is an applicability rule, not a bug fix:
+`dcp` pays only where the heads cannot be sharded further. Every number so far
+comes from a rig where they can, so the feature has never been measured where
+it is supposed to work. This window measures that, and it is also the only
+place H2's reindex is reachable.
+
+## Vehicle candidates (scan of the model cache)
+
+The trigger is `attn_kv_replicated(attn_tp_size, total_kv)`, i.e. strictly
+`TP > num_key_value_heads`. **Two vehicles reach it at NATIVE TP=3 — no #82
+co-location emulation needed**, which removes a whole axis from the window.
+
+| model | kv | q | size | format | MTP head | TP=3 trigger |
+|---|---|---|---|---|---|---|
+| **Qwen3.5-2B** | **2** | 8 | 3.5 G | bf16 dense | yes (15 tensors) | **YES** (3 > 2) |
+| **Qwen3.6-35B-A3B-FP8** | **2** | 16 | 31 G | FP8 MoE | yes (1560) | **YES** (3 > 2) |
+| Qwen3.5-35B-A3B-GPTQ-Int4 | 2 | 16 | 20 G | GPTQ MoE | yes (785) | YES |
+| Qwen3.6-35B-A3B-AWQ-4bit | 2 | 16 | 22 G | AWQ MoE | yes (2321) | YES |
+| Qwen3.5-122B-A10B-GPTQ-Int4 | 2 | 32 | — | GPTQ MoE | — | YES, but needs expert offload (#77) — too heavy for this question |
+| Qwen3.6-27B family | 4 | 24 | 20-31 G | several | yes | no at TP=3; would need TP=5 co-location |
+| Qwen3.5-4B | 4 | 16 | 7.1 G | bf16 dense | yes (15) | no at TP=3 |
+
+Recommended pair: **Qwen3.5-2B as the mechanism vehicle** (3.5 G, boots in
+seconds, leaves the whole rig free for the measurement) and
+**Qwen3.6-35B-A3B-FP8 as the realistic one** (31 G over 72 G aggregate, the
+configuration a deployment would actually run). The 27B family is deliberately
+NOT used: reaching the trigger there needs TP=5 co-location, which adds the
+#82 axis to a window that already has one lever.
+
+Note both recommended vehicles are MoE-or-dense Qwen3.5/3.6, so the
+uneven-weighted-DCP path and the NEXTN chain are the same machinery already
+validated — only the head geometry changes.
+
+## The prediction to test
+
+Under `attn_kv_replicated` every rank holds ALL `total_kv` heads because they
+cannot be split. So:
+
+* `replicated` draft pool = `C` rows x `total_kv` heads
+* `dcp` draft pool = `C * ratio_r / S` rows x `total_kv` heads
+
+The head factor is 1 on both sides — it no longer cancels the token shard — so
+the saving is the **full shard factor**. For a `[30,17,17]` vector that is
+**47 % / 27 % / 27 %** of the replicated draft pool, per rank.
+
+## Window proposal — 2 questions, 4 boots, ~25 min
+
+Minimal by construction: only the two questions the applicability rule turns on.
+
+**Q1 — does the VRAM win materialize at the predicted factor?**
+Both layouts, both vehicles, read the draft-pool rows and K/V sizes out of the
+`KV Cache is allocated` lines exactly as the previous window did. GREEN iff the
+`dcp` draft pool is the replicated one scaled by `ratio_r / S` per rank, within
+the ceil-to-a-whole-owner-block slack of `dcp_compact_pool_rows`.
+
+**Q2 — does accept hold, and does H2 behave?**
+The same instruments, unchanged: `stock_spec_control.py` for accept length and
+the in-boot A-vs-A, `chain_quality_gate.py` for the verdict. Two sub-checks
+that only exist on this hardware:
+  * `dcp_kv_replicated_heads` must be **True** — assert it from the boot log /
+    server info, because if the trigger is not actually active the window
+    measured nothing.
+  * `_replicated_kv_ragged_reindex` is now on the live path. Its failure shape
+    is documented as "corrupting short-prompt / first-chunk generation while
+    the gathered-q paged prefix/decode path stayed correct" — so the probe set
+    must include a SHORT prompt, and the gate is the instrument.
+
+Arms: `{2B, 35B-A3B-FP8} x {replicated, dcp}` = 4 boots. 2B boots are seconds;
+budget ~25 min total, standard reserve, no bar1, local CT999. Abort rules and
+process discipline exactly as the prepared runsheet.
+
+**Explicitly out of scope:** the H3 context sweep (optional confirmation of a
+benign explanation, and not a blocker), throughput comparison, and TP=5
+co-location.
+
+## Expected outcomes and what each would mean
+
+* Win materializes AND accept holds -> the applicability rule is confirmed;
+  `dcp` is a real feature on this class of hardware and the flag text stands.
+* Win materializes AND accept drops similarly (~10-16 %) -> the drift cost is
+  hardware-independent; the rule becomes "trade N % accept for the shard
+  factor", which is still a good trade where VRAM is the binding constraint.
+* Win does NOT materialize -> the sizing path has a second head-geometry
+  assumption that only shows under replication; reopen at the pool sizing, not
+  at the attention split.
+* Gate goes RED on the short prompt -> H2 is live and the reindex condition is
+  wrong for the draft. This is the outcome that would make H2 a real defect
+  rather than an inapplicable one, and it is the reason a short prompt is
+  mandatory in the probe set.
+
+## Pre-flight for the TP>kv window (desk, no cards)
+
+Runsheet: `/spinning/gpu-battery-results/2026-08-02_108-tpgtkv/RUNSHEET.md`.
+Verified with the rig vector `[30,17,17]` installed:
+
+| vehicle | kv | q | `attn_kv_replicated` | q split |
+|---|---|---|---|---|
+| Qwen3.5-2B | 2 | 8 | **True** | [4,2,2] |
+| Qwen3.6-35B-A3B-FP8 | 2 | 16 | **True** | [8,4,4] |
+| Qwen3.6-27B (control) | 4 | 24 | False | [12,6,6] |
+
+Two things the pre-flight changed:
+
+1. **`attn_kv_replicated` is `tp_plan_active(tp) and kv < tp`** — it needs an
+   INSTALLED plan. A bare call without one returns False and looks exactly like
+   "the trigger does not fire"; the first pre-flight made that mistake and
+   briefly appeared to falsify the whole proposal. Consequence for the window:
+   the precondition must be read off the RUNNING server, never computed.
+2. **Qwen3.5-2B at TP=3 with this vector is `8q/2kv over [4,2,2]`, which is
+   verbatim the worked example in `_replicated_kv_ragged_reindex`'s
+   docstring.** The 2B is not merely a vehicle for H2 — it is the canonical
+   one, which is a stronger reason to use it than "it is small".
+
+Straddle check (#105): with the aligned `units`/`groups` no rank's q heads
+cross a global kv-head boundary (2B rank0 = kv0 entirely, ranks 1-2 subset of
+kv1; 35B the same shape), so neither arm should hit the straddle ValueError
+that the `<=` threshold variant produced.
+
+---
+
+# TP > num_kv_heads window: results, and the rule inverted
+
+Window 2026-08-01 07:32-07:40Z, 4 arms, ~20 min. Artifacts:
+`/spinning/gpu-battery-results/2026-08-02_108-tpgtkv/`.
+
+Precondition asserted off the LIVE server (never computed — see the pre-flight
+note above): `REPLICATED-KV geometry active: kv_heads=2 < tp_size=3; all kv
+heads on every rank, q heads split [4,2,2]` on the 2B, `[8,4,4]` on the 35B.
+
+## Q1 — the VRAM win lands exactly on the prediction
+
+| | replicated | dcp | ratio | predicted |
+|---|---|---|---|---|
+| draft rows, rank 0 | 655 520 | 307 290 | 0.469 | 30/64 = 0.469 |
+| draft rows, ranks 1-2 | 655 520 | 174 131 | 0.266 | 17/64 = 0.266 |
+| draft K size (2B) | 0.31/0.31/0.31 GB | 0.15/0.08/0.08 GB | | |
+
+Total draft KV **1.86 -> 0.62 GB, -67 %** = exactly `1 - (30+17+17)/(64*3)`.
+Identical on both vehicles, as expected: the draft pool follows the vector, not
+the model size.
+
+## Q2 — the rule inverts above the threshold
+
+| vehicle | prompt | replicated | dcp |
+|---|---|---|---|
+| 2B | alphabet | accept 1.05, **61 verifies / 64 tokens** | accept 3.20, 20 |
+| 2B | squares | accept 1.64, 39 | accept 2.78, 23 |
+| 35B-A3B | alphabet | accept 2.00, 32 | accept 3.20, 20 |
+| 35B-A3B | squares | accept 3.20, 20 | accept 3.20, 20 |
+
+Output ids identical on every graded pair; `chain_quality_gate` GREEN, full
+marks, both vehicles.
+
+**Above the threshold `replicated` is the DEGRADED layout, not the cheaper
+one.** At `kv < tp` the heads cannot be split, so a draft on the replicated
+layout is asked for a head shard that does not exist: the verified output stays
+correct (the target governs it, hence identical ids) but the draft's proposals
+are almost never accepted — 61 verify rounds for 64 tokens is speculation
+paying its full cost for nothing. `dcp` puts the draft on the same
+replicated-heads + token-shard geometry as the target and restores it.
+
+So the applicability rule is two-sided and both sides are measured:
+
+* `TP > num_kv_heads` -> `dcp`, which is **both** the VRAM win and the working
+  speculation path.
+* `TP <= num_kv_heads` -> `replicated`; `dcp` is VRAM-neutral and costs
+  10-16 % accept there.
+
+H2 (`_replicated_kv_ragged_reindex`) does NOT fire: the path is live per the
+geometry log, and short determined prompts generate correctly first-chunk
+(`a b c d e f` -> ` g h i j k l m n o p`).
+
+## Probe-design rule: determined answers, not open-ended text
+
+**A short probe used as a corruption check must have a DETERMINED answer.**
+
+The runsheet's original short probe was `"Hi."`. On the 35B the two arms
+produced different — both fluent, both plausible — continuations, which looked
+like H2's documented failure shape and was in fact no evidence at all: at
+temperature 0 a last-bit logit difference at position 0 reroutes an open-ended
+prompt entirely. A probe like that can only ever report "different", never
+"wrong", which is exactly the instrument #360/#365 ruled out.
+
+The corrected form is a short prompt whose continuation is mechanically
+determined, so a corrupted first chunk reads as WRONG rather than merely
+different:
+
+```
+a b c d e f              -> " g h i j k l m n o p"
+The capital of France is -> " Paris, ..."
+2+2=                     -> "5 is a famous quote from the novel 1984"   (sic)
+```
+
+Note the third: even a "wrong" arithmetic answer can be a correct completion,
+so a determined probe still needs a scorer or a reader who knows the intended
+continuation. Prefer the mechanical sequences.
+
+This rule belongs to every corruption probe, not just this task; the 2B's short
+prompt happening to match across arms was luck, not evidence.

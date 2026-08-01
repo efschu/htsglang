@@ -70,10 +70,10 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
-    ensure_spec_kernel_backend,
     default_tree_mask_mode,
     eagle_prepare_for_verify,
     eagle_sample,
+    ensure_spec_kernel_backend,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -322,9 +322,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # that skips the draft forward and waits on one token-id broadcast
         # per round. Class-level defaults (split path) live on
         # EagleDraftWorkerBase (#136a: variants bypass this __init__).
-        if (
-            getattr(server_args, "speculative_draft_placement", "split") == "solo"
-        ):
+        if getattr(server_args, "speculative_draft_placement", "split") == "solo":
             self._spec_solo_active = True
             self._spec_solo_rank = server_args.speculative_draft_solo_rank()
             self._spec_solo_is_host = tp_rank == self._spec_solo_rank
@@ -441,9 +439,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
         # Solo host: allocate the draft pool under the weight-TP=1 override
         # so get_num_kv_heads(attn_tp_size) yields the FULL head count — the
-        # unsharded draft projects ALL kv heads. Token capacity is already
-        # full-context for draft pools (they are not DCP-token-sharded, see
-        # the M4 note in model_runner_kv_cache_mixin). nullcontext on split.
+        # unsharded draft projects ALL kv heads. Token capacity is
+        # full-context for the draft pool on THIS path: draft-solo is
+        # incompatible with --draft-kv-layout dcp (a sharded draft on a single
+        # rank has no peer group to shard across, refused at boot by
+        # ServerArgs._reject_unsupported_draft_kv_dcp), so a solo draft pool is
+        # always the replicated one. The blanket "draft pools are not
+        # DCP-token-sharded" that stood here was the M4 default and stopped
+        # being true in general with #108; it remains true HERE, for that
+        # reason. nullcontext on split.
         with self._solo_build_ctx():
             self.draft_worker.alloc_memory_pool(
                 memory_pool_config=memory_pool_config,
@@ -722,9 +726,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tp_group, embed, embed_module, vocab_size, keep
         )
         full_head = (
-            self._solo_gather_or_local(
-                tp_group, head, target_lm_head, vocab_size, keep
-            )
+            self._solo_gather_or_local(tp_group, head, target_lm_head, vocab_size, keep)
             if need_head
             else None
         )
@@ -770,18 +772,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             valid_rows = idx.num_org_elements
         else:
             valid_rows = shard.shape[0]
-        return _solo_gather_full_vocab_rows(
-            tp_group, shard, valid_rows, out_rows, keep
-        )
+        return _solo_gather_full_vocab_rows(tp_group, shard, valid_rows, out_rows, keep)
 
     def _solo_tp_group(self):
         from sglang.srt.distributed import get_tp_group
 
         return get_tp_group()
 
-    def _solo_send_draft_tokens(
-        self, draft_tokens: torch.Tensor, bs: int
-    ) -> None:
+    def _solo_send_draft_tokens(self, draft_tokens: torch.Tensor, bs: int) -> None:
         """Solo host: broadcast this round's k chain token ids — the ONE
         cross-rank transfer of the whole draft phase."""
         group = self._solo_tp_group()
@@ -1653,9 +1651,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return time.perf_counter()
             torch.cuda.synchronize()
             now = time.perf_counter()
-            logger.info(
-                "cross_warmkeep timing %s: %.2f ms", label, (now - tic) * 1e3
-            )
+            logger.info("cross_warmkeep timing %s: %.2f ms", label, (now - tic) * 1e3)
             return now
 
         tic = time.perf_counter()
@@ -1711,12 +1707,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ).logits_output
         tic = _mark(f"forward(graph={bool(can_cuda_graph)})", tic)
 
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits, "draft_extend_catchup"
-        )
-        maybe_detect_inf(
-            draft_logits_output.next_token_logits, "draft_extend_catchup"
-        )
+        maybe_detect_nan(draft_logits_output.next_token_logits, "draft_extend_catchup")
+        maybe_detect_inf(draft_logits_output.next_token_logits, "draft_extend_catchup")
 
         selected_logits = draft_logits_output.next_token_logits[select_index]
         ret_hidden_states = None
@@ -1727,9 +1719,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
         else:
-            probs = renorm_draft_probs(
-                selected_logits, batch.sampling_info, False
-            )
+            probs = renorm_draft_probs(selected_logits, batch.sampling_info, False)
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         # Same rank-sync obligation as the native extend paths (#50): the
         # step-0 pick of the next NEXTN round must be identical on all ranks.
@@ -1921,9 +1911,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # hiddens are local there); mirror the prefill shadow stub.
             return self._solo_stub_draft_input(batch, next_token_ids)
         with (
-            self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ),
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("kvso_resume_backfill"),
@@ -2176,9 +2164,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         speculative_moe_a2a_backend_context(),
                         spec_stage_span("kvso_spec_in_tick_draft"),
                     ):
-                        verify_input: EagleVerifyInput = self.draft_worker.draft(
-                            batch
-                        )
+                        verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
                 finally:
                     mgr.spec_in_tick_draft_post(surgery)
 
@@ -2484,9 +2470,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return None, None
 
         tic = time.perf_counter()
-        with self._override_worker_state(
-            num_draft_tokens - 1, num_draft_tokens
-        ):
+        with self._override_worker_state(num_draft_tokens - 1, num_draft_tokens):
             with dw._solo_build_ctx():
                 factory = DraftBackendFactory(
                     dw.server_args,
