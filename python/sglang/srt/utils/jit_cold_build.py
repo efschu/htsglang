@@ -54,6 +54,29 @@ exists. On a single-rank boot the original exception is re-raised unchanged
 cold-build collision sends the reader looking for a second rank that was
 never there.
 
+ATTACHED, NEVER SUBSTITUTED (#386)
+----------------------------------
+The hypothesis is also only about a specific FAMILY of failures: the
+allocator, and the launch failure a tripped wait kernel leaves behind. Any
+other exception that happens to be in flight when the window is open is an
+independent error, and replacing its type and message with the cold-build
+text costs the reader the only thing that identified it. Three times on
+record:
+
+  #377 (twice)  FP8 layer construction failed; the operator got the window's
+                text plus "set --mem-fraction-static to a smaller value" from
+                the graph runner one frame further out. The real message was
+                two ``__context__`` hops down.
+  #384 (once)   an sgl-kernel wheel without ``int8_scaled_mm`` failed during
+                layer construction and read as the same memory advice, with
+                the sm75 gencode floor as a false secondary diagnosis.
+
+So ``_is_cold_build_symptom`` decides, and it is deliberately conservative:
+a symptom keeps today's message, EVERYTHING else is re-raised as itself with
+the window named in a note. The asymmetry is the point -- a wrong "lower
+your memory fraction" costs hours of misdiagnosis, an honest error carrying
+one extra note costs nothing.
+
 Default path: with no barlink device transport in the process, nothing reads
 the window. ``resolve_timeout_cycles`` is the only consumer, and it is called
 only from the barlink device collectives.
@@ -164,6 +187,86 @@ class ColdBuildWindowError(RuntimeError):
     """
 
 
+#: Lower-cased message fragments that mark a failure as a cold-build-window
+#: SYMPTOM. Enumerated from this module's own history, nothing speculative:
+#:
+#:  * the allocator, in the shapes torch and the driver print it. The window
+#:    is where a peer's nvcc/ptxas and its freshly loaded modules sit on the
+#:    same card, so an allocation that fails here is plausibly the window's.
+#:  * ``cudaErrorLaunchFailure`` -- the exact aftermath described at the top
+#:    of this file: ``BARLINK_TRAP()`` poisons the context and the error
+#:    surfaces at the NEXT launch, on some unrelated kernel.
+#:
+#: Substring match on the whole message, case-folded: torch prefixes these
+#: with device ids, byte counts and "CUDA error:" in several arrangements.
+_SYMPTOM_MESSAGE_FRAGMENTS = (
+    "out of memory",  # covers "CUDA out of memory" and "CUDA error: out of memory"
+    "cudaerrormemoryallocation",
+    "cuda_error_out_of_memory",
+    "unspecified launch failure",
+    "cudaerrorlaunchfailure",
+)
+
+
+def _torch_oom_types() -> tuple:
+    """``torch.cuda.OutOfMemoryError`` and its aliases, if torch is importable.
+
+    A type check, not only a message check: the allocator's text has been
+    reworded between torch releases, the class has not. Guarded so this
+    module stays importable (and testable) without torch.
+    """
+    types: list = []
+    try:
+        import torch
+    except Exception:  # pragma: no cover - torch is present in every real boot
+        return ()
+    for holder, name in ((torch, "OutOfMemoryError"), (torch.cuda, "OutOfMemoryError")):
+        candidate = getattr(holder, name, None)
+        if isinstance(candidate, type) and candidate not in types:
+            types.append(candidate)
+    return tuple(types)
+
+
+def _is_cold_build_symptom(exc: BaseException) -> bool:
+    """Is this failure one the cold-build window's diagnosis actually explains?
+
+    True only for the enumerated families above. When in doubt the answer is
+    False, and False is the cheap direction: the caller then re-raises the
+    original exception with the window named in a note, which costs the
+    reader one line. A wrong True replaces a real error's type and message
+    with memory advice -- that is #377 and #384.
+    """
+    oom_types = _torch_oom_types()
+    if oom_types and isinstance(exc, oom_types):
+        return True
+    # The peer-liveness deadline is the window's own instrument: it expires
+    # here precisely when a peer is still in nvcc (see
+    # barlink_bar1_ext.grouped_jit_build). PeerLostError is NOT included --
+    # a dead peer is decided, self-describing, and not a cold build.
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            CollectiveTimeoutError,
+        )
+
+        if isinstance(exc, CollectiveTimeoutError):
+            return True
+    except Exception:  # pragma: no cover - barlink is optional in this process
+        pass
+    text = f"{exc}".casefold()
+    return any(fragment in text for fragment in _SYMPTOM_MESSAGE_FRAGMENTS)
+
+
+def _attach_note(exc: BaseException, note: str) -> None:
+    """Record the window on the exception without touching type or message.
+
+    ``BaseException.add_note`` is 3.11+; this package supports 3.10, where
+    the note reaches the reader through the log line the caller emits next.
+    """
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+
+
 def _peer_ranks_possible(tp_group: Any) -> bool:
     """True only when this process provably has a peer rank.
 
@@ -197,6 +300,16 @@ def _single_rank_note(reason: str) -> str:
         "is re-raised unchanged -- it IS the cause, not a symptom. (A cold "
         "kernel cache still costs minutes in this window on a first boot; "
         "it just cannot trip a collective deadline without a peer.)"
+    )
+
+
+def _passthrough_note(reason: str) -> str:
+    """The one line a non-symptom failure carries out of the window (#386)."""
+    return (
+        f"Raised during the JIT cold-build window ({reason}); the exception "
+        "above is its own cause and is passed through unchanged. If it does "
+        "turn out to be an out-of-memory symptom, --mem-fraction-static and "
+        f"{_ENV_MULT} are the knobs the window would have pointed at."
     )
 
 
@@ -252,6 +365,17 @@ def run_capture_warmups(
                 # would bury an OOM (or any other honest local failure) one
                 # __cause__ level down behind a hypothesis that cannot apply.
                 logger.error("%s", _single_rank_note(reason))
+                raise
+            if not _is_cold_build_symptom(exc):
+                # #386: a peer exists, but this failure is not one the
+                # cold-build hypothesis explains. Attach the window, keep the
+                # exception -- its type is what the reader dispatches on (an
+                # AttributeError from layer construction must arrive as an
+                # AttributeError) and its message is the only text that says
+                # what actually broke.
+                note = _passthrough_note(reason)
+                logger.error("%s: %s\n%s", type(exc).__name__, exc, note)
+                _attach_note(exc, note)
                 raise
             hint = _cold_build_hint(reason)
             logger.error("%s", hint)

@@ -107,11 +107,12 @@ def require_int8_arm(
     WHY THIS EXISTS WHEN A LOUD ERROR ALREADY DOES.
     ``CompressedTensorsW8A8Int8.__init__`` already raises when the arm is
     missing, but it raises during LAYER CONSTRUCTION -- inside the JIT
-    cold-build window -- so the operator sees ``ColdBuildWindowError`` and a
-    suggestion to lower ``--mem-fraction-static``, which is unrelated and
-    unactionable. The real cause (an sgl-kernel wheel without the arm) is
-    decidable from ``server_args.quantization`` alone, before a byte of weight
-    is read, and that is where it belongs.
+    cold-build window, which until #386 replaced it with
+    ``ColdBuildWindowError`` and a suggestion to lower
+    ``--mem-fraction-static``, unrelated and unactionable. #386 fixed the
+    substitution; this check remains the earlier answer, because the real
+    cause (an sgl-kernel wheel without the arm) is decidable from
+    ``server_args.quantization`` alone, before a byte of weight is read.
 
     Its message is also the wrong diagnosis for this case: it blames the sm75
     gencode floor, which is right for a 2080 Ti and wrong for a modern card
@@ -138,9 +139,9 @@ def require_int8_arm(
         "wheel ships without the INT8 arm; the fork wheel carries it. Install "
         f"the fork wheel and pin it -- see {INT8_ARM_RUNBOOK_SECTION}. "
         "Refused here, at argument resolution, because the same failure "
-        "during layer construction surfaces as a ColdBuildWindowError telling "
-        "you to lower --mem-fraction-static, which is neither the cause nor a "
-        "fix."
+        "during layer construction costs a full model load first -- and until "
+        "#386 arrived as a ColdBuildWindowError telling you to lower "
+        "--mem-fraction-static, which is neither the cause nor a fix."
     )
 
 

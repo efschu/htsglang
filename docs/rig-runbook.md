@@ -101,11 +101,13 @@ definitions in `python/sglang/srt/environ.py`).
 
 **The INT8-W8A8 production default needs `sgl_kernel.int8_scaled_mm`, and the
 stock pypi wheel does not ship it.** Without the arm the boot dies during layer
-construction, inside the JIT cold-build window, so what the operator sees is
-`ColdBuildWindowError` advising a lower `--mem-fraction-static` — neither the
-cause nor a fix. Since #384 that case is refused at argument resolution with a
-message naming the wheel and this section
-(`w8a8_int8.require_int8_arm`).
+construction, inside the JIT cold-build window, and until #386 what the
+operator saw was `ColdBuildWindowError` advising a lower
+`--mem-fraction-static` — neither the cause nor a fix. Since #384 that case is
+refused at argument resolution with a message naming the wheel and this section
+(`w8a8_int8.require_int8_arm`); since #386 the window no longer substitutes its
+own text for a failure it does not explain, so any error of this shape reaches
+the operator with its own type and message.
 
 ### What is installed on CT999, measured
 
