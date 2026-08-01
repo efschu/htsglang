@@ -2,6 +2,63 @@
 
 under construction
 
+## Docker
+
+Pull:
+
+```bash
+docker pull ghcr.io/efschu/htsglang:cu130-nccl2307
+```
+
+Run (even TP=2 example, validated boot):
+
+```bash
+docker run -d --name htsglang \
+  --security-opt apparmor=unconfined \
+  --gpus '"device=<gpu-uuid-0>,<gpu-uuid-1>"' \
+  --shm-size 16g --ipc host \
+  -p 8021:30000 \
+  -v <model-dir>:/model:ro \
+  ghcr.io/efschu/htsglang:cu130-nccl2307 \
+  python3 -m sglang.launch_server --model-path /model \
+    --served-model-name <served-name> --tp-size 2 \
+    --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.90 \
+    --context-length <ctx-len> --max-running-requests 8 \
+    --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+    --trust-remote-code --host 0.0.0.0 --port 30000
+```
+
+`--gpus` takes NVML GPU UUIDs (`nvidia-smi -L`), not indices, to avoid
+enumeration-order drift across driver/toolkit versions.
+
+Fork-specific flags (see `--help` for full descriptions):
+
+| Flag | Purpose |
+|---|---|
+| `--tp-size N` / `--rank-gpu-id` | one physical GPU id per rank; duplicates co-locate ranks on one GPU |
+| `--rank-tp-ratio auto` | uneven TP shard split across mismatched GPUs (requires `--rank-gpu-id`) |
+| `--rank-auto-reserve-mib` | per-GPU VRAM headroom reserved before `--rank-tp-ratio auto` sizes shards |
+| `--kv-cache-dtype fp8_e4m3` | fp8 KV cache |
+| `--speculative-algorithm NEXTN --speculative-num-steps N --speculative-num-draft-tokens N` | NEXTN speculative decoding |
+| `--enable-metrics` | Prometheus metrics endpoint |
+
+## Chat template
+
+The checkpoint's own `chat_template.jinja` is used by default. For
+Qwen3.6-class checkpoints add `--reasoning-parser qwen3
+--tool-call-parser qwen3_coder`. Clients disable thinking via
+`chat_template_kwargs: {"enable_thinking": false}`. Tool calling uses the
+standard OpenAI `tools` / `tool_choice` request fields.
+
+Caveat: the image entrypoint uses `${VAR:=default}` shell defaults, so an
+*empty* env var (`-e RANK_GPU_ID=`) is treated as unset and the baked-in
+default is re-applied, not omitted. To run without the image's defaults,
+invoke `python3 -m sglang.launch_server ...` directly as the container
+command (as in the example above) instead of relying on env vars.
+
+NCCL: the image pins NCCL 2.30.7, required for multi-rank-per-GPU
+co-location.
+
 *Upstream sglang README below.*
 
 --------------------------------------------------------------------------------
