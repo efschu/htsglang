@@ -5,7 +5,7 @@ should use that classmethod API; do not import from this module directly.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Type
 
 import torch
 
@@ -226,6 +226,15 @@ def register_algorithm(
         return factory
 
     return decorator
+
+
+def registered_names() -> List[str]:
+    """Names registered by plugins right now (#379).
+
+    Read at validation time rather than snapshotted: a plugin that registers
+    during import must be visible to the validator that runs after it.
+    """
+    return sorted(_REGISTRY)
 
 
 def get_spec(name: Optional[str]) -> Optional[CustomSpecAlgo]:

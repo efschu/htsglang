@@ -5508,6 +5508,11 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
+        # #379: validate the algorithm name AFTER the hook, which is where
+        # `.upper()` and the NEXTN alias resolution happen -- validating
+        # before it would reject spellings the runtime accepts.
+        self._handle_speculative_algorithm_name()
+
         # Draft-solo placement (--speculative-draft-placement solo): validate
         # scope and hard-reject out-of-scope modes (topk > 1, rejection
         # sampling, DP/PP/EP, non-EAGLE-family algorithms) up front, so an
@@ -6273,6 +6278,71 @@ class ServerArgs:
         parse_park_target_order(
             self.lane_offload_park_targets, "--lane-offload-park-targets"
         )
+
+    def _handle_speculative_algorithm_name(self):
+        """Resolve and validate --speculative-algorithm at parse time (#379).
+
+        Two defects this closes, both silent:
+
+        * ``--speculative-algorithm none`` produced the STRING "none", which
+          is truthy. Every ``if self.speculative_algorithm:`` in the tree --
+          the cuda-graph token budget among them -- then took the speculative
+          branch for a server that has no drafter, while
+          ``SpeculativeAlgorithm.from_string`` resolved the same input to
+          ``NONE``. The field and the enum disagreed about whether the server
+          was speculating.
+        * An unregistered name passed here untouched and surfaced much later
+          as some unrelated guard's message, which named neither the flag nor
+          the valid values.
+
+        The fix normalises "none"/"" to ``None`` -- the one representation of
+        OFF, the same one an absent flag produces -- and rejects anything the
+        runtime cannot resolve, listing what it would accept.
+
+        Runs AFTER ``handle_speculative_decoding`` on purpose: that hook
+        upper-cases the string and resolves the NEXTN alias, so validating
+        earlier would reject input the runtime accepts. Plugin algorithms are
+        read live from the registry, so a plugin registered during import is
+        visible here.
+        """
+        raw = self.speculative_algorithm
+        if raw is None:
+            return
+        name = str(raw).strip()
+        if not name or name.upper() == "NONE":
+            # OFF has exactly one representation. Leaving "NONE" in the field
+            # is what made a truthiness test disagree with the enum.
+            self.speculative_algorithm = None
+            return
+
+        from sglang.srt.speculative.spec_info import (
+            SPECULATIVE_ALGORITHM_ALIASES,
+            SpeculativeAlgorithm,
+        )
+
+        if name.upper() in SPECULATIVE_ALGORITHM_ALIASES:
+            # An alias the arg hook resolves (NEXTN -> EAGLE, or
+            # FROZEN_KV_MTP for a Gemma4 draft). The enum has no member for
+            # it, so from_string would raise -- and rejecting it would break
+            # every #349 arm and runbook recipe on this rig. This branch is
+            # why the alias set is a named constant and not a comment.
+            self.speculative_algorithm = name
+            return
+
+        try:
+            SpeculativeAlgorithm.from_string(name)
+        except ValueError:
+            known = SpeculativeAlgorithm.known_names()
+            raise ValueError(
+                f"--speculative-algorithm {raw!r} is not a registered "
+                f"speculative algorithm. Valid values: "
+                f"{', '.join(n for n in known if n != 'NONE')}; or omit the "
+                f"flag (equivalently 'none') to disable speculative decoding. "
+                f"If this is a plugin algorithm, its module must be imported "
+                f"before the server starts so SpeculativeAlgorithm.register "
+                f"has run."
+            ) from None
+        self.speculative_algorithm = name
 
     def _handle_objective(self):
         """#350: fail fast on an unknown --objective. Resolving through the

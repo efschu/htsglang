@@ -788,6 +788,14 @@ _CURATED: Dict[str, dict] = {
     "speculative_algorithm": dict(
         group="speculative",
         type="enum",
+        # #379: a UI PICK-LIST, deliberately narrower than what the server
+        # accepts -- these are the algorithms the profiles and the UI have
+        # something to say about. It is NOT a validation list and must not
+        # become one: SpeculativeAlgorithm.known_names() is the single source
+        # of truth for what --speculative-algorithm may say, and it includes
+        # plugin-registered names this static tuple cannot know. A test pins
+        # that every entry here is still resolvable, so the pick-list cannot
+        # drift into offering something the server would reject.
         allowed=("EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"),
         hover="Speculative-decoding algorithm (EAGLE/EAGLE3/NEXTN/...). "
         "Mutually exclusive with the weightless-KV fast lane.",
