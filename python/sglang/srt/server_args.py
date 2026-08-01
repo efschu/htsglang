@@ -435,6 +435,11 @@ def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
+def _parse_rank_moe_resident_fraction(value: str) -> List[float]:
+    """Parse --rank-moe-resident-fraction: comma-separated floats in (0, 1]."""
+    return [float(part.strip()) for part in value.split(",") if part.strip()]
+
+
 def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-vocab-ratio: 'auto' or a comma-separated integer list."""
     if value.strip() == "auto":
@@ -2307,6 +2312,27 @@ class ServerArgs:
             "Default OFF: without the flag, vocab sharding stays even and "
             "behavior is unchanged.",
             type_parser=_parse_rank_vocab_ratio,
+        ),
+    ] = None
+    rank_moe_resident_fraction: A[
+        Optional[List[float]],
+        Arg(
+            help="Per-rank MoE resident-expert fraction: comma-separated "
+            "floats in (0, 1], one per rank (length must equal --tp-size), or "
+            "a single value to use everywhere. The fraction is the "
+            "GPU-resident vs host-pinned split WITHIN a rank's own expert "
+            "shard -- it does NOT move experts between ranks, which is "
+            "--rank-moe-ratio. On a heterogeneous group the right split "
+            "differs per card: lowering it on the small cards frees exactly "
+            "the VRAM that binds them, while raising it on the big card "
+            "spends that card's idle VRAM and shrinks the host pinned pool, "
+            "paying back the host cost of the first move. A single scalar "
+            "cannot do either without doing the other harm everywhere. "
+            "Equivalent to SGLANG_MOE_RESIDENT_EXPERT_FRACTION, which also "
+            "accepts a comma-list; unlike the --rank-*-ratio family the env "
+            "does NOT silently win here -- if both are given and disagree the "
+            "launch is refused, because they set the same thing.",
+            type_parser=_parse_rank_moe_resident_fraction,
         ),
     ] = None
     rank_moe_ratio: A[
@@ -8999,9 +9025,7 @@ class ServerArgs:
             )
         gdn = split(model.gdn_units) if model.gdn_units > 1 else None
         if gdn is not None:
-            parts.append(
-                f"GDN {gdn} of {model.gdn_units} linear-attention head(s)"
-            )
+            parts.append(f"GDN {gdn} of {model.gdn_units} linear-attention head(s)")
         experts = split(model.num_experts) if model.num_experts > 0 else None
         if experts is not None:
             parts.append(f"MoE {experts} of {model.num_experts} routed experts")
@@ -9041,6 +9065,27 @@ class ServerArgs:
         No-op when none of the flags is used — the default path stays
         unchanged.
         """
+        # Per-rank MoE resident fraction (#417 follow-up): validated here with
+        # the rest of the rank-vector family rather than lazily at model load,
+        # so a wrong length is a CLI error and not a worker crash six minutes
+        # into a 98 GiB checkpoint stream.
+        if self.rank_moe_resident_fraction is not None:
+            vec = self.rank_moe_resident_fraction
+            if len(vec) not in (1, self.tp_size):
+                raise ValueError(
+                    f"--rank-moe-resident-fraction length ({len(vec)}) must "
+                    f"equal --tp-size ({self.tp_size}), or be a single value "
+                    f"to use the same fraction on every rank."
+                )
+            for i, f in enumerate(vec):
+                if not (0.0 < f <= 1.0):
+                    raise ValueError(
+                        f"--rank-moe-resident-fraction entry {i} is {f}; each "
+                        f"entry must be in (0.0, 1.0] -- 1.0 keeps every "
+                        f"expert on the GPU (offload off) and 0.0 would keep "
+                        f"none, which cannot run."
+                    )
+
         ratio_was_perf = self.rank_tp_ratio == "auto-performance"
         ratio_was_auto = self.rank_tp_ratio == "auto" or ratio_was_perf
         self._check_perf_flags(ratio_was_perf)

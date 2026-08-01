@@ -76,7 +76,6 @@ from __future__ import annotations
 import json
 import math
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -959,16 +958,15 @@ def plan_load_time_staging(
     are identical with and without a ratio. ``None`` (the default, and the only
     thing any caller passes today) reproduces the previous plan exactly.
     """
-    from sglang.srt.environ import envs
 
     E = int(num_experts)
     if E <= 0:
         return None
-    frac = (
-        envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
-        if fraction is None
-        else float(fraction)
-    )
+    from sglang.srt.layers.moe.resident_fraction import resident_fraction_for_rank
+
+    # SIZING: this number decides how many experts stay on THIS rank's GPU, so
+    # it must be this rank's own fraction, not a group-wide one.
+    frac = resident_fraction_for_rank() if fraction is None else float(fraction)
     if frac >= 1.0:
         return None
     R = resident_slot_count(E, frac)
@@ -2830,9 +2828,11 @@ def presplit_expert_offload_after_repack(
     """
     import torch
 
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.resident_fraction import resident_fraction_for_rank
 
-    frac = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+    # SIZING: drives plan_load_time_staging below, i.e. the resident set and
+    # every buffer booked against this rank's VRAM.
+    frac = resident_fraction_for_rank()
     if frac >= 1.0:
         return
     E = getattr(layer, "num_local_experts", None)
