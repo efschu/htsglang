@@ -28,6 +28,7 @@ both through the same verdict function, and prints the two answers.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import json
 import os
@@ -70,6 +71,85 @@ def read_trace(path: str) -> Dict:
     }
 
 
+def completeness(trace: Dict) -> Dict:
+    """Is this trace a COMPLETE record, whatever ended the process?
+
+    The summary line was the original proof, and it turned out to be
+    unobtainable: on shutdown the fork's launcher calls
+    ``kill_process_tree(..., include_parent=False)``, which SIGKILLs the
+    scheduler children. Neither a ``finally`` nor a SIGTERM handler runs under
+    SIGKILL, so a normal shutdown can never write that line and a gate that
+    requires it can never be recorded. Found on the second gates window --
+    after the shutdown hook covering the other three paths had already landed,
+    which is the point: the hook was right and the CONTRACT was wrong.
+
+    Completeness is therefore proved from the verdicts themselves. Each rank
+    emits one verdict every ``interval`` rounds, in order, so its round
+    numbers form an arithmetic sequence; contiguous per rank means nothing was
+    lost between the first verdict and the last, which is exactly the property
+    the summary line stood in for. A gap is a genuinely torn file and still
+    refuses. A summary, when present, remains the strongest ending: it proves
+    the process chose to stop rather than being stopped.
+    """
+    by_rank: Dict[object, List[int]] = {}
+    for v in trace["verdicts"]:
+        by_rank.setdefault(v.get("rank"), []).append(int(v.get("round") or 0))
+    if not by_rank:
+        return {"complete": False, "why": "no verdicts", "ranks": 0}
+    if list(by_rank) == [None]:
+        # No rank stamp (a trace from before it landed). The same proof still
+        # works on the MULTIPLICITY: N ranks writing one interleaved file
+        # produce each round exactly N times, because every rank reaches every
+        # consensus boundary. Contiguous rounds at a constant multiplicity
+        # therefore prove both completeness AND how many ranks are in the
+        # file -- a subset would show a lower or ragged multiplicity.
+        rounds = sorted(by_rank[None])
+        counts = collections.Counter(rounds)
+        mult = set(counts.values())
+        keys = sorted(counts)
+        steps = {b - a for a, b in zip(keys, keys[1:])}
+        if len(mult) == 1 and len(steps) <= 1 and keys:
+            return {
+                "complete": True,
+                "why": (
+                    f"no rank stamp, but {len(keys)} contiguous rounds each "
+                    f"appear exactly {mult.pop()} times -- every rank reached "
+                    f"every boundary and none is missing"
+                ),
+                "ranks": counts[keys[0]],
+            }
+        return {
+            "complete": False,
+            "why": (
+                f"the verdicts carry no rank and the round multiplicity is "
+                f"ragged ({sorted(mult)[:4]}) or the rounds are not contiguous "
+                f"(steps {sorted(steps)[:4]}), so neither completeness nor the "
+                f"rank count can be established"
+            ),
+            "ranks": 0,
+        }
+    gaps = []
+    for rank, rounds in sorted(by_rank.items(), key=lambda kv: str(kv[0])):
+        rounds.sort()
+        if len(rounds) < 2:
+            continue
+        step = rounds[1] - rounds[0]
+        for a, b in zip(rounds, rounds[1:]):
+            if b - a != step:
+                gaps.append(f"rank {rank}: round {a} -> {b} (step should be {step})")
+                break
+    if gaps:
+        return {"complete": False, "why": "; ".join(gaps), "ranks": len(by_rank)}
+    return {
+        "complete": True,
+        "why": (
+            "every rank's round sequence is contiguous, so nothing was lost "
+            "between the first verdict and the last"
+        ),
+        "ranks": len(by_rank),
+    }
+
+
 def regime_transitions(verdicts: List[Dict]) -> List[str]:
     """The regime sequence, collapsed to its changes."""
     out: List[str] = []
@@ -85,16 +165,18 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
     problems: List[str] = []
     if not traces:
         return {"passed": False, "problems": ["no trace files supplied"]}
-    if len(traces) < expect_ranks:
-        problems.append(
-            f"{len(traces)} trace file(s) for a {expect_ranks}-rank boot: the "
-            f"desync count is a property of the GROUP, and one rank's file "
-            f"cannot report it. Pass one --trace per rank."
-        )
+    # Checked on RANKS SEEN, not on file count. A group's desync number must
+    # come from the whole group -- but since the rank stamp (and the
+    # multiplicity proof for traces without it) one interleaved file can carry
+    # all of it honestly, and demanding one file per rank would refuse a
+    # complete record for its filename. The subset check moved to rank_count
+    # below, which is the property that actually matters.
 
     total_desyncs = 0
     total_verdicts = 0
     all_regimes: List[str] = []
+    endings: List[str] = []
+    rank_count = 0
     for t in traces:
         # FACTS FIRST, judgement second. This loop used to `continue` past a
         # missing summary, so a trace holding 93 603 verdicts was reported as
@@ -102,7 +184,10 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
         # right and the diagnostics were misleading, which is the failure mode
         # this whole tool exists to avoid (2026-08-01 window).
         all_regimes.extend(regime_transitions(t["verdicts"]))
+        comp = completeness(t)
+        rank_count = max(rank_count, comp.get("ranks", 0))
         if t["summary"] is not None:
+            endings.append(f"{os.path.basename(t['path'])}: clean summary")
             total_desyncs += int(t["summary"].get("desyncs", 0))
             total_verdicts += int(t["summary"].get("verdicts", 0))
             if t["summary"].get("uncoordinated"):
@@ -116,11 +201,17 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
             # run's size even when its ending is missing.
             total_verdicts += len(t["verdicts"])
             total_desyncs += sum(1 for v in t["verdicts"] if v.get("agreed") is False)
-            problems.append(
-                f"{t['path']}: no summary line. It is written on close, so "
-                f"its absence means the server was killed -- 'zero desyncs' "
-                f"would only mean 'zero so far'."
+            endings.append(
+                f"{os.path.basename(t['path'])}: killed, "
+                f"{'complete' if comp['complete'] else 'TORN'}"
             )
+            if not comp["complete"]:
+                problems.append(
+                    f"{t['path']}: no summary line AND the record is not "
+                    f"provably complete -- {comp['why']}. A torn trace cannot "
+                    f"report a desync count: 'zero' would only mean 'zero so "
+                    f"far'."
+                )
         if not t["verdicts"]:
             problems.append(
                 f"{t['path']}: no verdicts. The observer never reached a "
@@ -150,9 +241,17 @@ def judge(traces: List[Dict], *, expect_ranks: int = 1) -> Dict:
             f"disagreement under an actuator is the #94/#194/#259 hang."
         )
 
+    if rank_count and rank_count < expect_ranks:
+        problems.append(
+            f"the traces carry {rank_count} rank(s) for a {expect_ranks}-rank "
+            f"boot: the desync count is a property of the GROUP and a subset "
+            f"cannot report it."
+        )
     return {
         "passed": not problems,
         "problems": problems,
+        "ranks_seen": rank_count,
+        "endings": endings,
         "desyncs": total_desyncs,
         "verdicts": total_verdicts,
         "regimes_seen": distinct,
@@ -168,7 +267,8 @@ def evidence_entry(verdict: Dict, *, note: str = "") -> Dict:
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     source = (
         f"observe run {stamp}: {verdict['verdicts']} verdicts across "
-        f"{len(verdict['traces'])} rank trace(s), regimes "
+        f"{verdict.get('ranks_seen', '?')} rank(s) in "
+        f"{len(verdict['traces'])} trace file(s), regimes "
         f"{','.join(verdict['regimes_seen'])}, desyncs {verdict['desyncs']} "
         f"[{'; '.join(os.path.basename(p) for p in verdict['traces'])}]"
     )
@@ -194,10 +294,17 @@ def merge_into(path: str, entry: Dict) -> Dict:
 
 def _synth(path: str, *, desyncs: int, regimes: List[str], summary: bool = True):
     with open(path, "w") as f:
-        f.write(json.dumps({"kind": "header", "mode": "observe"}) + "\n")
+        f.write(json.dumps({"kind": "header", "mode": "observe", "rank": 0}) + "\n")
         for i, r in enumerate(regimes):
             f.write(
-                json.dumps({"kind": "verdict", "round": (i + 1) * 8, "regime": r})
+                json.dumps(
+                    {
+                        "kind": "verdict",
+                        "rank": 0,
+                        "round": (i + 1) * 8,
+                        "regime": r,
+                    }
+                )
                 + "\n"
             )
         if summary:
@@ -238,10 +345,33 @@ def smoke() -> int:
         print(f"[desync    ] passed={v['passed']} :: {v['problems'][0][:70]}")
         ok &= not v["passed"]
 
+        # THE CASE THE SECOND GATES WINDOW MADE NECESSARY: the server was
+        # SIGKILLed by its own launcher (the normal shutdown on this fork), so
+        # there is no summary -- but every rank's rounds are contiguous, so
+        # the record is provably complete and the counts stand.
+        killed_ok = os.path.join(tmp, "killed-complete.jsonl")
+        _synth(
+            killed_ok,
+            desyncs=0,
+            regimes=["mixed", "prefill_heavy", "decode_heavy", "mixed"],
+            summary=False,
+        )
+        v = judge([read_trace(killed_ok)])
+        print(f"[killed ok ] passed={v['passed']} endings={v['endings']}")
+        ok &= v["passed"]
+
         killed = os.path.join(tmp, "killed.jsonl")
-        _synth(killed, desyncs=0, regimes=["mixed", "prefill_heavy"], summary=False)
+        with open(killed, "w") as f:
+            f.write(json.dumps({"kind": "header", "mode": "observe", "rank": 0}) + "\n")
+            for rnd, r in ((8, "mixed"), (16, "prefill_heavy"), (40, "mixed")):
+                f.write(
+                    json.dumps(
+                        {"kind": "verdict", "rank": 0, "round": rnd, "regime": r}
+                    )
+                    + "\n"
+                )
         v = judge([read_trace(killed)])
-        print(f"[no summary] passed={v['passed']} :: {v['problems'][0][:70]}")
+        print(f"[torn      ] passed={v['passed']} :: {v['problems'][0][:70]}")
         ok &= not v["passed"]
 
         flat = os.path.join(tmp, "flat.jsonl")

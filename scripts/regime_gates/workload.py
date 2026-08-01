@@ -102,7 +102,11 @@ def plan(args) -> List[Dict]:
             "why": "queue carries mass before a prefill has run -> PREFILL_HEAVY",
             "concurrent": args.burst,
             "prompt_tokens": BURST_PROMPT_TOKENS,
-            "max_tokens": 16,
+            # Long generations on long prompts is what actually HOLDS KV: a
+            # burst that finishes in 16 tokens spikes the queue and empties
+            # the pool again before occupancy can rise. The first gates window
+            # peaked at 6.2 % and exercised nothing on the admissibility axis.
+            "max_tokens": args.burst_tokens,
         }
     )
     out.append(
@@ -173,6 +177,16 @@ def main(argv=None) -> int:
     ap.add_argument("--burst", type=int, default=4, help="concurrent long prompts")
     ap.add_argument("--drain", type=int, default=4, help="concurrent generations")
     ap.add_argument("--drain-tokens", type=int, default=512)
+    ap.add_argument(
+        "--burst-tokens",
+        type=int,
+        default=16,
+        help=(
+            "generation length of the burst arm. Raise it with --burst to "
+            "drive HELD TOKENS up: occupancy is what the admissibility "
+            "interlock reads, and short generations never move it."
+        ),
+    )
     ap.add_argument("--mixed", type=int, default=6)
     ap.add_argument("--idle-s", type=float, default=45.0)
     ap.add_argument(

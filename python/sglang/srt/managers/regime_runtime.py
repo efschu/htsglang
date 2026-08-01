@@ -167,6 +167,7 @@ class RegimeObserver:
         log_every: int = DEFAULT_LOG_EVERY,
         current_stage: Optional[str] = None,
         trace_path: Optional[str] = None,
+        trace_rank: Optional[int] = None,
         mode: str = MODE_OBSERVE,
         table_plan=None,
         commit_fn: Optional[Callable] = None,
@@ -218,6 +219,7 @@ class RegimeObserver:
         # the reader can see that they agreed (or did not).
         self._trace_path = str(trace_path) if trace_path else None
         self._trace_fh = None
+        self._trace_rank = trace_rank
         self._table_plan = table_plan
         self._commit_fn = commit_fn
         self._dwell = dwell
@@ -591,9 +593,20 @@ class RegimeObserver:
             if self._trace_fh is None:
                 self._trace_fh = open(self._trace_path, "a", buffering=1)
                 self._trace_fh.write(
-                    json.dumps({"kind": "header", "mode": self._mode}) + "\n"
+                    json.dumps(
+                        {
+                            "kind": "header",
+                            "mode": self._mode,
+                            "rank": self._trace_rank,
+                            "interval": self._interval,
+                        }
+                    )
+                    + "\n"
                 )
-            self._trace_fh.write(json.dumps({"kind": "verdict", **record}) + "\n")
+            self._trace_fh.write(
+                json.dumps({"kind": "verdict", "rank": self._trace_rank, **record})
+                + "\n"
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "%s trace write failed (%r); disabling the trace for this "
@@ -615,7 +628,10 @@ class RegimeObserver:
             return
         try:
             self._trace_fh.write(
-                json.dumps({"kind": "summary", **self.summary()}) + "\n"
+                json.dumps(
+                    {"kind": "summary", "rank": self._trace_rank, **self.summary()}
+                )
+                + "\n"
             )
             self._trace_fh.close()
         except Exception:  # noqa: BLE001
@@ -723,7 +739,10 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         current_stage=current,
         commit_fn=commit_fn,
         dwell=dwell,
-        trace_path=getattr(server_args, "regime_trace", None),
+        trace_path=_rank_trace_path(
+            getattr(server_args, "regime_trace", None), scheduler
+        ),
+        trace_rank=_tp_rank_of(scheduler),
     )
     install_trace_shutdown_hook(observer)
     return observer
@@ -755,6 +774,42 @@ def _dwell_for(table_plan) -> DwellGate:
     # held for the same span as a 0.3 s one.
     worst = max(costs)
     return DwellGate(min_rounds=max(BOOTSTRAP_DWELL_ROUNDS, int(worst * 128)))
+
+
+def _tp_rank_of(scheduler) -> Optional[int]:
+    ps = getattr(scheduler, "ps", None)
+    rank = getattr(ps, "tp_rank", None) if ps is not None else None
+    if rank is None:
+        rank = getattr(scheduler, "tp_rank", None)
+    return None if rank is None else int(rank)
+
+
+def _rank_trace_path(base: Optional[str], scheduler) -> Optional[str]:
+    """One trace file PER RANK, derived from the single ``--regime-trace``.
+
+    Every rank of a TP group runs its own observer and its own consensus
+    proposal, so the desync count is a property of the GROUP and the reader
+    refuses a multi-rank verdict assembled from one rank's file. Left sharing
+    a path they append into one interleaved file: the lines stay atomic (the
+    first gates window wrote 93 603 of them with none torn), but the ranks
+    become indistinguishable and the three summary lines overwrite each
+    other's meaning. Suffixing here keeps the flag a single path for the
+    operator and still gives the reader what its own contract asks for.
+    """
+    if not base:
+        return None
+    # The rank lives on the ParallelState, not on the scheduler. Reading
+    # ``scheduler.tp_rank`` returned None and every rank silently shared one
+    # file -- found in the 2026-08-01 re-run, where three ranks interleaved
+    # 104 862 verdicts into one path.
+    ps = getattr(scheduler, "ps", None)
+    rank = getattr(ps, "tp_rank", None) if ps is not None else None
+    if rank is None:
+        rank = getattr(scheduler, "tp_rank", None)
+    if rank is None:
+        return base
+    root, ext = os.path.splitext(str(base))
+    return f"{root}.rank{int(rank)}{ext or '.jsonl'}"
 
 
 def close_regime_trace(scheduler) -> None:

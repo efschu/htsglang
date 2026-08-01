@@ -965,3 +965,70 @@ The observe path is now believed correct, but the run must be repeated: the
 idle mapping changed what the classifier reports, so the 93 603 verdicts
 describe the OLD behaviour. The next window needs `close_trace()` wired to
 shutdown first — that is a desk task, not a card one.
+
+---
+
+## 14. Second card window (2026-08-01) — gates 1 and 2 RECORDED
+
+Evidence file holds `desyncs_zero` and `f2_live_replay`; `act` now refuses
+naming only `f3_bands_measured` and `f4_card_comparison`.
+
+### 14.1 The run, and the idle fix confirmed
+
+104 862 verdicts over three ranks, 0 unparsable, **0 desyncs**, spread on
+103 230. Regimes `mixed` 104 793 / `decode_heavy` 69 with **seven
+transitions** — real regime returns, which is what hysteresis and dwell are
+judged on. The §13.2 fix holds: the previous window read `prefill_heavy` on
+93 600 of 93 603 verdicts on the same kind of idle rig.
+
+### 14.2 The summary line could never have existed
+
+§13.3 blamed a missing shutdown hook, and the hook landed. It still did not
+produce a summary, because the launcher shuts schedulers down with
+`kill_process_tree(..., include_parent=False)` — **`child.kill()`, SIGKILL**.
+Nothing runs under SIGKILL: not `finally`, not `atexit`, not a SIGTERM
+handler. The hook covers three real paths and not the one the server actually
+takes, so the gate as specified was unsatisfiable.
+
+The contract was wrong, not the hook. Completeness is now proved from the
+verdicts: each rank emits one verdict per interval in order, so a contiguous
+round sequence per rank means nothing was lost between the first and the last
+— exactly what the summary stood in for. Without a rank stamp the same proof
+runs on the round MULTIPLICITY (N ranks produce each round exactly N times,
+so a constant multiplicity over contiguous rounds proves both completeness
+and the rank count). A summary is still accepted as the strongest ending; a
+torn file still refuses.
+
+Generalisable: **a completeness proof must not depend on the process getting
+to run code at the end.** Anything that can be SIGKILLed needs its evidence
+in the stream, not in a trailer.
+
+### 14.3 Two more tooling defects the live trace found
+
+* **Per-rank paths read the wrong attribute.** `scheduler.tp_rank` is `None`;
+  the rank lives on `scheduler.ps.tp_rank`. All three ranks appended to one
+  file. Fixed, and every verdict now carries a `rank` stamp.
+* **The F2 replay outpaced the run it replayed.** It fed all three ranks'
+  copies of each boundary through one sensor, so the hysteresis windows were
+  effectively 3x shorter: 13 transitions replayed against 7 recorded, which
+  the tool reported as NON-DETERMINISM in the classifier. It was the replay's
+  own doing. Fixed by replaying one entry per boundary.
+
+That is the third and fourth time in this task that a falsifier fired for the
+wrong reason and the finding was in the instrument. The pattern is worth
+stating: **when a falsifier accuses the subject, check the instrument first
+when the instrument is newer than the subject.**
+
+### 14.4 What is still untested
+
+Peak occupancy **16.5 %** (85 585 of 519 670), up from 6.2 % and still far
+from the 0.85 ascend mark. `PREFILL_HEAVY` never appeared at all, despite
+eight concurrent 12 k-token prompts: at `window_rounds = 64` the burst's
+prefill rounds are diluted by the decode and idle rounds around them, so
+`prefill_share` never reached the provisional 0.35.
+
+Two consequences. The admissibility axis remains unexercised, and gate 2's
+`interlock_was_load_bearing` came back **false** — it passed on weak evidence
+(the workload never approached the trap) and its own output says so. And
+`enter_prefill = 0.35` is probably too high for this rig's round mix; that is
+a gate-3 calibration input, not something to re-tune by hand.
