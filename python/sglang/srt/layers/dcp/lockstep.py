@@ -32,6 +32,8 @@ from typing import Optional, Sequence, Tuple
 __all__ = [
     "AG_HEADS_TAG_PREFIX",
     "LSE_MERGE_TAG",
+    "dcp_forces_prefix",
+    "draft_extend_prefix_lens",
     "weightless_has_prefix",
     "weightless_layer_op_tags",
     "weightless_step_op_tags",
@@ -48,11 +50,69 @@ AG_HEADS_TAG_PREFIX = "ag_heads:"
 LSE_MERGE_TAG = "lse_merge"
 
 
+def dcp_forces_prefix(is_target_verify: bool, is_draft_extend: bool) -> bool:
+    """Which extend-class forward modes ALWAYS read a committed prefix (#180).
+
+    Both of these carry a committed context in the token-sharded pool that a
+    length vector does not describe:
+
+    * target-VERIFY -- built out of a decode batch, so ``batch.prefix_lens`` is
+      never set and ``extend_prefix_lens_cpu`` is empty or None (#180).
+    * draft-EXTEND (#108 slice 2) -- ``seq_lens`` already counts the newly
+      accepted tokens this step appends, and the request's earlier draft
+      context is in the pool. The batch likewise carries no prefix vector for
+      it: ``ForwardBatch`` fills ``extend_prefix_lens`` from
+      ``batch.prefix_lens``, which the draft-extend batch does not populate.
+
+    Returning False for either would not read a short prefix -- it would skip
+    the prefix stage ENTIRELY, so the draft would attend only the tokens of the
+    current step and silently ignore everything before them. And because the
+    prefix stage is where the Q all-gather and the LSE merge live, a
+    length-based test that answers differently per rank leaves the owner of a
+    short prefix sitting alone in an all-gather nobody joins -- the
+    rank-local-condition-before-a-group-collective family (#94), five sightings.
+
+    Forward-mode first, unconditionally. Both inputs are replicated: the
+    forward mode is part of the batch every rank builds from the same scheduler
+    state.
+    """
+    return bool(is_target_verify) or bool(is_draft_extend)
+
+
+def draft_extend_prefix_lens(seq_lens, num_tokens_per_req: int):
+    """The COMMITTED prefix length per request on a draft-extend step (#108).
+
+    ``seq_lens`` on a draft-extend already includes the ``num_tokens_per_req``
+    tokens this very step is appending -- they are written into the pool by the
+    owner-rule masked write at the top of the forward. The paged prefix read
+    must therefore cover ``seq_len - num_tokens_per_req``; reading the full
+    ``seq_len`` would let a query attend its OWN key through the paged
+    (non-causal) stage as well as through the ragged causal stage, i.e. count
+    it twice in the LSE merge.
+
+    ``num_tokens_per_req`` is constant across the batch by construction (the
+    draft-extend qo layout is a fixed stride so it can be cuda-graph captured),
+    which is what makes this a vector op and not a per-request rebuild.
+
+    Clamped at zero: a request whose whole sequence is this step's tokens has
+    no committed prefix, and a negative length would index backwards.
+    """
+    k = int(num_tokens_per_req)
+    if k <= 0:
+        return seq_lens
+    return (seq_lens - k).clamp_(min=0)
+
+
 def weightless_has_prefix(
-    is_target_verify: bool,
+    forces_prefix: bool,
     extend_prefix_lens_cpu: Optional[Sequence[int]],
 ) -> bool:
     """Does this extend-class step read a COMMITTED prefix from the KV pool?
+
+    ``forces_prefix`` is :func:`dcp_forces_prefix` -- the forward modes whose
+    committed prefix no length vector describes (target-verify, and since #108
+    slice 2 draft-extend). It is named for what it MEANS rather than for the
+    one mode that originally set it, because a second mode now does.
 
     The answer decides whether the Q all-gather and the LSE merge are issued at
     all, so it must be identical on the head rank and on every weightless
@@ -76,7 +136,7 @@ def weightless_has_prefix(
     This is #180's ``force_prefix`` rule and the Triton twin's
     ``_dcp_batch_has_prefix`` ordering, expressed once for the flashinfer lane.
     """
-    if is_target_verify:
+    if forces_prefix:
         return True
     if extend_prefix_lens_cpu is None:
         return False

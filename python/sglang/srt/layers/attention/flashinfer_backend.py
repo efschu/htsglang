@@ -36,7 +36,11 @@ from sglang.srt.layers.dcp import (
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
-from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
+from sglang.srt.layers.dcp.lockstep import (
+    dcp_forces_prefix,
+    draft_extend_prefix_lens,
+    weightless_has_prefix,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -1138,6 +1142,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # for the DCP verify buckets and cleared everywhere else, so all
         # non-DCP / eager paths keep using the shared prefill_wrapper_ragged.
         self.verify_ragged_cg_wrappers: dict = {}
+        # #108 slice 2: the SAME problem for the DCP draft-extend graph, and a
+        # SEPARATE dict on purpose. Draft-extend and verify are captured at the
+        # same bs values but are different graphs with different qo strides
+        # (num_tokens_per_req vs draft_token_num); one wrapper per bs shared
+        # between them would have two captured graphs freezing the pointers of
+        # one set of fixed buffers, and flashinfer latches _max_total_num_rows
+        # on a wrapper's first plan (the #274 round-7a failure, one level up).
+        self.draft_extend_ragged_cg_wrappers: dict = {}
         self._ragged_wrapper_override = None
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
@@ -1419,8 +1431,13 @@ class FlashInferAttnBackend(AttentionBackend):
         # Uneven-DCP target-verify graphs run the ragged draft->draft attention
         # inside the capture; that requires the per-bucket graph-mode ragged
         # wrapper (fixed indptr buffers). All other modes use the shared one.
+        # #108 slice 2: the DCP draft-extend graph runs its current-chunk ragged
+        # attention inside the capture for the same reason, so it needs the same
+        # treatment -- from its OWN per-bucket dict (different qo stride).
         if self.uneven_dcp and forward_mode.is_target_verify():
             self._ragged_wrapper_override = self._get_verify_ragged_cg_wrapper(bs)
+        elif self.uneven_dcp and forward_mode.is_draft_extend_v2():
+            self._ragged_wrapper_override = self._get_draft_extend_ragged_cg_wrapper(bs)
         else:
             self._ragged_wrapper_override = None
 
@@ -2015,6 +2032,51 @@ class FlashInferAttnBackend(AttentionBackend):
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
 
+    def _get_draft_extend_ragged_cg_wrapper(
+        self, bs: int
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Per-bucket CUDA-graph-mode RAGGED wrapper for the uneven-DCP
+        DRAFT-EXTEND graph (#108 slice 2).
+
+        Same root cause and same fix as ``_get_verify_ragged_cg_wrapper``: the
+        DCP draft-extend path runs the current-chunk causal attention through a
+        RAGGED wrapper INSIDE the captured graph, and the shared
+        ``prefill_wrapper_ragged`` is not in cuda-graph mode -- its plan() keeps
+        a bare reference to the caller's transient ``torch.arange`` indptr,
+        which the captured kernel freezes and the allocator later reuses. Read
+        that method's docstring for the full argument; it is not repeated here,
+        because the only thing that differs is which graph the buffers belong
+        to.
+
+        NO MASK BUFFERS, and that is a guarantee rather than an omission: a
+        draft-extend chain is plain causal, and topk > 1 cannot reach this path
+        at all -- ``--draft-kv-layout dcp`` refuses a tree draft at boot
+        (ServerArgs._reject_unsupported_draft_kv_dcp). A wrapper created without
+        a custom_mask_buf runs flashinfer's CAUSAL mode, selected by the
+        ``causal`` flag ``forward_return_lse`` passes, which is what the
+        current-chunk stage wants.
+        """
+        wrapper = self.draft_extend_ragged_cg_wrappers.get(bs)
+        if wrapper is None:
+            device = self.kv_last_page_len.device
+            wrapper = _tag_adaptive_int_workspace(
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=device
+                    ),
+                    kv_indptr_buf=torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=device
+                    ),
+                    backend=self._fmha_backend,
+                ),
+                share_key=("draft_extend_ragged_cg", id(self)),
+            )
+            self.draft_extend_ragged_cg_wrappers[bs] = wrapper
+        return wrapper
+
     def _verify_cg_key(self, bs: int, forward_mode, spec_info):
         """Key for ``prefill_cuda_graph_metadata`` (#274 round 7a).
 
@@ -2137,11 +2199,21 @@ class FlashInferAttnBackend(AttentionBackend):
         q = q.contiguous()
 
         if self.uneven_dcp:
-            # target-VERIFY: the committed prefix is ALWAYS present (decode-phase
-            # verify), and its length is seq_lens (not extend_prefix_lens, which
-            # is unset for verify). Force the prefix read so the draft tokens
-            # attend the token-sharded context.
-            force_prefix = forward_batch.forward_mode.is_target_verify()
+            # Which modes ALWAYS read a committed prefix -- ONE rule, shared
+            # with the weightless worker and pinned on CPU
+            # (layers/dcp/lockstep.dcp_forces_prefix):
+            #   target-VERIFY: the prefix is the decode-phase committed context,
+            #     length seq_lens (extend_prefix_lens is unset for verify).
+            #   draft-EXTEND (#108 slice 2): seq_lens already counts the tokens
+            #     this step appends; the earlier draft context is in the pool
+            #     and likewise carries no prefix vector.
+            # A length-based test would skip the prefix stage entirely for
+            # either -- and that stage is where the Q all-gather and the LSE
+            # merge live, so a per-rank answer is a hang (#94 family).
+            force_prefix = dcp_forces_prefix(
+                forward_batch.forward_mode.is_target_verify(),
+                forward_batch.forward_mode.is_draft_extend_v2(),
+            )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, prefill_wrapper_paged, cache_loc,
                 logits_soft_cap, save_kv_cache, force_prefix=force_prefix,
@@ -6868,6 +6940,99 @@ class FlashInferIndicesUpdaterPrefill:
                 ab._dcp_extend_has_host = bool(
                     (kv_indices[:n_owned] >= ab._wl_dev_slots).any().item()
                 )
+        elif (
+            self.attn_backend.uneven_dcp
+            and spec_info is not None
+            and getattr(spec_info, "spec_input_type", None)
+            == SpecInputType.EAGLE_DRAFT_EXTEND
+        ):
+            # DRAFT-EXTEND under a token-sharded DRAFT KV pool (#108 slice 2).
+            #
+            # Structurally the target-verify split below, with two differences,
+            # which is exactly why it is its own branch and NOT a new member of
+            # _DCP_VERIFY_SPEC_INPUT_TYPES:
+            #
+            #   1. THE PREFIX IS SHORTER THAN paged_kernel_lens. For verify,
+            #      paged_kernel_lens IS the committed prefix (the draft tokens
+            #      are not in seq_lens). For draft-extend, seq_lens ALREADY
+            #      counts the num_tokens_per_req tokens this step appends --
+            #      they are written into the pool by the owner-rule masked
+            #      write at the top of the same forward. Reading the full
+            #      seq_len here would let each query attend its OWN key through
+            #      the non-causal paged stage as well as through the causal
+            #      ragged stage, i.e. count it twice in the LSE merge. That is
+            #      a wrong answer, not a crash, so the subtraction is the whole
+            #      correctness content of this branch.
+            #   2. The per-request query count is num_tokens_per_req, not
+            #      draft_token_num.
+            #
+            # Everything else is shared with verify by construction: the same
+            # weighted owner rule builds the owned-slot indices, the paged read
+            # is non-causal, the ragged wrapper does the causal current-chunk
+            # attention on LOCAL heads, and the cross-rank LSE merge combines
+            # them. No new kernel and no new collective.
+            #
+            # The draft worker only reaches this branch when its pool really is
+            # token-sharded: attn_backend.uneven_dcp is False for a draft runner
+            # under the default --draft-kv-layout replicated (slice 1's
+            # draft_pool_is_replicated predicate is the single source of that
+            # decision, and nothing here re-derives it).
+            num_tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 1) or 1)
+            # Rank-uniform: seq_lens is replicated and num_tokens_per_req is a
+            # constant of the batch (the draft-extend qo layout is a fixed
+            # stride so it can be cuda-graph captured).
+            dcp_prefix_lens = draft_extend_prefix_lens(
+                paged_kernel_lens, num_tokens_per_req
+            )
+            if self.attn_backend.uneven_dcp_weighted:
+                kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
+                    self.req_to_token,
+                    req_pool_indices,
+                    dcp_prefix_lens,
+                    kv_indptr,
+                    None,
+                    self.attn_backend.cp_S,
+                    self.attn_backend.cp_lo,
+                    self.attn_backend.cp_hi,
+                    self.attn_backend.cp_ratio,
+                    pad=256,
+                )
+            else:
+                dcp_size = self.attn_backend.dcp_size
+                dcp_rank = self.attn_backend.dcp_rank
+                dcp_lens = get_dcp_lens(dcp_prefix_lens, dcp_size, dcp_rank, None)
+                kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    int(dcp_lens.sum().item()) + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_triton_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    dcp_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+            # One query row per appended token, constant stride per request --
+            # the layout the draft-extend graph captures.
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * num_tokens_per_req,
+                step=num_tokens_per_req,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            # Paged prefix read is non-causal (every appended query sees the
+            # whole committed prefix); the causal masking among the appended
+            # tokens is the ragged wrapper's job in the forward.
+            custom_mask = None
+            use_ragged = True
         elif (
             self.attn_backend.uneven_dcp
             and spec_info is not None
