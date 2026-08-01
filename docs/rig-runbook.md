@@ -1493,6 +1493,29 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   (~3 GiB) > 32.6 GiB total. The feasible FP8 dual-group shape is the
   TWO-card PD lane of docs/EVAL_272_fp8_tp2_in_tp3.md (candidate A), which
   needs real lane collectives — slice C/D.
+- **The lane's own items are now weighed at argument time** (#400). Until
+  then that arithmetic lived only in this document and in a boot log printed
+  after the bytes were already on the card, so #349 arm L booted an FP8 27B
+  single-card lane, was accepted by every guard, and died at 31.14 GiB in
+  use inside `_load_lane_part`. The guard charges, per card:
+
+      serving rank r budget                (--rank-gpu-memory-mib)
+    + lane complement shard, U/W units     (the nesting plan's own split)
+    + lane pool                            (--dual-group-lane-budget-mib,
+                                            after --dual-group-lane-speed-dial)
+
+  against the NVML total of the card that rank BINDS (#392), and refuses
+  with the full itemization when the sum does not fit. The sum is a FLOOR:
+  the hull residue, the lane's activations and its graph capture pool are
+  named in the ledger but not priced, so a refusal is always true and
+  acceptance is not a promise that the peak fits — leaving headroom stays
+  the operator's job, exactly as for `--rank-gpu-memory-mib` itself. Read
+  the ledger off the boot log on a passing config too; it prints there.
+  `--dual-group-lane-part-gpu-id` moves the complement to another card and
+  is charged to THAT card's budget. If the model's weight footprint cannot
+  be derived from the checkpoint the guard refuses with "cannot bound"
+  rather than guessing; `SGLANG_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK=1` boots
+  anyway and is the only way past it.
 
 
 ### 4.12 Dual-group lane, CONCURRENT (#274 slice C)
