@@ -169,11 +169,37 @@ DFLASH_DRAFT_MODEL = os.environ.get(
     "/spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash",
 )
 
-#: Per-rank budget for the arms that must pin an EVEN --rank-tp-ratio. Once the
-#: ratio is not ``auto`` the server stops deriving budgets from NVML and
-#: requires them explicitly. 15000 MiB fits the 20054 MiB 3080s with room for
+#: Per-rank budget for the arms that run on the EVEN split. Those arms omit
+#: --rank-tp-ratio entirely (an all-identical explicit vector is rejected by
+#: name), and once the ratio is not ``auto`` the server stops deriving budgets
+#: from NVML and requires them explicitly. 15000 MiB fits the 20054 MiB 3080s with room for
 #: the CUDA context, and an even ratio makes one scalar correct for every rank.
 EVEN_RATIO_RANK_MIB = "15000"
+
+#: The lane arm's ratio and budgets. --dual-group-lane REQUIRES an explicit
+#: integer vector ("the lane shares the plan's rank-0 segment; without a plan
+#: there is nothing to nest", and 'auto' is refused because the nesting check
+#: needs the vector the operator intends) -- while an all-identical vector is
+#: refused by a different guard. So the lane needs a NON-UNIFORM ratio that
+#: still nests, which is a narrower target than either guard alone implies.
+#:
+#: 2,1,1 was not guessed: derive_nested_plan + transformer_nesting_probes +
+#: nesting_failures were run card-lessly over this rig's actual model geometry
+#: (24 q heads, 4 kv heads, 17408 intermediate, 16 GDN k-heads, 248320 vocab,
+#: fp8 [128,128] blocks). 2,1,1 and 3,1,1 nest on all four probes; 4,1,1 fails
+#: six and 6,1,1 / 16,1,1 fail two. 2,1,1 also matches the rig -- the 5090
+#: carries two shards, each 3080 one.
+LANE_RATIO = "2,1,1"
+#: Per-rank MiB for that ratio. A list, not a scalar: under 2,1,1 the shards
+#: differ in size, and the flag takes a per-rank list for exactly that reason.
+#:
+#: Every entry fits the SMALLEST card (3080, NVML total 20480 MiB), because
+#: --rank-gpu-id 0,1,2 is resolved against NVML order and the physical-
+#: impossibility check reads NVML per rank -- a first draft of 26000 for rank 0
+#: was rejected by name ("GPU 0 (NVML total 20480 MiB) cannot ..."), which is
+#: the guard being right: NVML index 0 on this rig is a 3080, not the 5090
+#: that CUDA order puts first (runbook 5.1, the two device orders).
+LANE_RANK_MIB = "19000,15000,15000"
 
 BASE_EXPECT: Mapping[str, object] = {
     "tp_size": 3,
@@ -396,11 +422,11 @@ ARMS: Tuple[Arm, ...] = (
         # divides every unit count exactly, so this arm pins an even one --
         # the crossing under test is the co-resident lane, not uneven TP, and
         # an even ratio then requires explicit per-rank budgets.
-        drop_flags=("--rank-auto-reserve-mib",),
+        drop_flags=("--rank-auto-reserve-mib", "--rank-tp-ratio"),
         flags=("--dual-group-lane", "--dual-group-lane-budget-mib", "2048",
                "--dual-group-lane-concurrent",
-               "--rank-tp-ratio", "1,1,1",
-               "--rank-gpu-memory-mib", EVEN_RATIO_RANK_MIB),
+               "--rank-tp-ratio", LANE_RATIO,
+               "--rank-gpu-memory-mib", LANE_RANK_MIB),
         expect=_expect(dual_group_lane=True),
         coherence="graded_only",
         expected_seconds=300.0,
@@ -464,8 +490,15 @@ ARMS: Tuple[Arm, ...] = (
         # --rank-auto-reserve-mib only applies with --rank-tp-ratio auto, and
         # this arm pins an explicit ratio; sweep 1 died on that base flag
         # before ever reaching the guard it exists to assert.
-        drop_flags=("--rank-auto-reserve-mib",),
-        flags=("--draft-kv-layout", "dcp", "--rank-tp-ratio", "1,1,1",
+        # The even split is expressed by OMITTING --rank-tp-ratio, not by
+        # spelling it out: ServerArgs hard-rejects an all-identical explicit
+        # vector ("identical entries is the even split -- omit the flag
+        # instead"). Sweep 2's repair pinned 1,1,1 and the validation that
+        # landed since is right to refuse it. Both base flags go, and the
+        # per-rank budget stays because without a ratio of `auto` the server
+        # cannot derive budgets from NVML.
+        drop_flags=("--rank-auto-reserve-mib", "--rank-tp-ratio"),
+        flags=("--draft-kv-layout", "dcp",
                "--rank-gpu-memory-mib", EVEN_RATIO_RANK_MIB),
         reject_markers=("--draft-kv-layout dcp", "weighted"),
         expected_seconds=60.0,

@@ -11,6 +11,7 @@ from sglang.srt.boot_matrix.arms import (
     BASE_EXPECT,
     DFLASH_DRAFT_MODEL,
     EVEN_RATIO_RANK_MIB,
+    LANE_RATIO,
     Arm,
     arm_by_name,
 )
@@ -152,10 +153,11 @@ class TestSweep1ArmRepairs(CustomTestCase):
         self.assertIn("--dual-group-lane-budget-mib", arm.flags)
 
     def test_the_offlane_reject_drops_the_incompatible_reserve(self):
-        """--rank-auto-reserve-mib only applies with --rank-tp-ratio auto."""
+        """--rank-auto-reserve-mib only applies with --rank-tp-ratio auto, and
+        this arm runs off that lane entirely -- so both base flags go."""
         arm = arm_by_name("reject_dcp_offlane")
         self.assertIn("--rank-auto-reserve-mib", arm.drop_flags)
-        self.assertIn("--rank-tp-ratio", arm.flags)
+        self.assertIn("--rank-tp-ratio", arm.drop_flags)
 
 
 class TestRejectArmsNameTheirOwnGuard(CustomTestCase):
@@ -231,29 +233,71 @@ class TestSweep2ArmRepairs(CustomTestCase):
         for arm in ARMS:
             self.assertNotIn("--speculative-draft-model", arm.flags)
 
-    def test_arms_that_pin_an_even_ratio_supply_explicit_budgets(self):
-        """Once --rank-tp-ratio is not auto the server stops deriving budgets
-        from NVML and refuses without --rank-gpu-memory-mib."""
+    def test_arms_on_the_even_split_omit_the_ratio_and_supply_budgets(self):
+        """The even split is expressed by OMITTING --rank-tp-ratio.
+
+        ServerArgs hard-rejects an all-identical explicit vector -- "identical
+        entries is the even split, omit the flag instead". Sweep 2's repair
+        spelled out 1,1,1 and the validation that landed afterwards refuses
+        it, which is the validation doing its job. Once the ratio is not
+        `auto` the server also stops deriving budgets from NVML, so the
+        per-rank budget has to be explicit.
+        """
         for name in ("L_video_cotenancy", "reject_dcp_offlane"):
             arm = arm_by_name(name)
-            self.assertIn("--rank-tp-ratio", arm.flags)
+            self.assertIn("--rank-tp-ratio", arm.drop_flags)
             self.assertIn("--rank-gpu-memory-mib", arm.flags)
             self.assertIn(
                 "--rank-auto-reserve-mib",
                 arm.drop_flags,
                 f"{name} must drop the auto reserve it can no longer use",
             )
+        # offlane runs on the plain even split, so it restates nothing; the
+        # lane arm must restate a ratio, because its own guard demands one.
+        self.assertNotIn(
+            "--rank-tp-ratio", arm_by_name("reject_dcp_offlane").flags
+        )
 
-    def test_the_lane_arm_pins_a_nestable_ratio(self):
-        """L failed on "Dual-group plan is not nested", which is a RATIO
-        question: the base auto-performance vector does not keep the shared
-        rank on the same unit range in both groups. An even ratio divides
-        every unit count, which the server's own advice names as always
-        nested. The crossing under test is the lane, not uneven TP."""
+    def test_the_lane_arm_carries_a_non_uniform_ratio_that_nests(self):
+        """The lane sits between two guards: it REQUIRES an explicit integer
+        vector, and an all-identical vector is refused. So it needs a
+        non-uniform ratio that still nests -- verified card-lessly against
+        this rig's model geometry with the real nesting functions, not
+        guessed."""
         arm = arm_by_name("L_video_cotenancy")
         i = list(arm.flags).index("--rank-tp-ratio")
         parts = arm.flags[i + 1].split(",")
-        self.assertEqual(len(set(parts)), 1, f"ratio {arm.flags[i + 1]} is not even")
+        self.assertGreater(len(set(parts)), 1, "an identical vector is refused")
+        self.assertEqual(parts, ["2", "1", "1"])
+
+    def test_the_lane_budget_is_per_rank_because_its_shards_differ(self):
+        """A scalar applies uniformly; under 2,1,1 the shards do not."""
+        arm = arm_by_name("L_video_cotenancy")
+        i = list(arm.flags).index("--rank-gpu-memory-mib")
+        self.assertEqual(len(arm.flags[i + 1].split(",")), 3)
+
+    def test_the_declared_lane_ratio_actually_nests(self):
+        """Pins the derivation itself, so a model or geometry change that
+        breaks 2,1,1 fails here instead of in the window."""
+        from sglang.srt.distributed.dual_group import (
+            derive_nested_plan,
+            nesting_failures,
+            transformer_nesting_probes,
+        )
+
+        ratio = [int(x) for x in LANE_RATIO.split(",")]
+        plan = derive_nested_plan(ratio)
+        probes = transformer_nesting_probes(
+            plan,
+            num_attention_heads=24,
+            num_kv_heads=4,
+            intermediate_size=17408,
+            linear_attn_units=16,
+            vocab_units=248320,
+            weight_block_size=[128, 128],
+            quant_method="fp8",
+        )
+        self.assertEqual(nesting_failures(plan, probes), [])
 
     def test_the_budget_fits_the_smallest_card_on_this_rig(self):
         """20054 MiB 3080s; the value must leave room for the CUDA context."""
