@@ -975,6 +975,58 @@ reclaimable IN TIME, which is exactly what boot 8 demonstrated. Replayed
 against `ram8.log`, the `memory.current` guard fires at 16:58:28, seven minutes
 before the kill at 17:05:19.
 
+### 4.5.4b DSV4-GGUF serving recipe: the measured defaults (#391 windows 4-5)
+
+These three are no longer taste. They come out of the GPU windows that closed
+the #391 measurement set, and a boot that ignores them fails in a known way.
+
+**1. `--chunked-prefill-size 512` is the DSV4-GGUF default on 20 GiB cards.**
+Window 4 measured the per-forward VRAM peak directly and found prefill costs
+~0.5-0.6 MiB per token above an 18.558 GiB decode baseline on a 3080 rank; a
+full 2048-token chunk needs the whole card before non-torch overhead. Window 4
+died at ~950 tokens with chunk 2048. Window 5 with chunk 512 served a
+1853-token prompt and all four staged steps, and throughput *rises* with
+prompt length (25.8 -> 45.6 tok/s from 243 to 1853 tokens) because the
+per-chunk overhead amortises. Chunk size is GLOBAL -- a per-rank chunk is
+structurally impossible, it is the batch-shape knob and divergent shapes
+desync the collectives (see PLAN_MOE_RESIDENT_FRACTION_PER_RANK.md).
+
+**2. `cachetrim.sh` must be given `--ready-url` (or `--ready-marker`).**
+It manages the LOAD-time page-cache race; that race ends at ready. Left
+running during serving it reclaims page cache out from under the host-pinned
+expert pool. Measured cost, same recipe, same boot script, one difference:
+
+| cachetrim during serving | A-vs-A floor | tok/s |
+|---|---|---|
+| running (w4) | **39.91%** | 5.086 / 3.056 |
+| stopped at ready (w5) | **2.55%** | 6.083 / 6.242 |
+
+Not just variance -- both stopped-runs are faster than either running-run. The
+script now retires itself when given a ready signal, and warns in its log when
+it is not given one.
+
+**3. The VRAM corridor is judged at PEAK, not at idle.**
+The >= 400 MiB free rule has been checked at ready in every window of this
+strand. At ready the 3080 ranks showed 639 MiB free and passed comfortably.
+Measured at the prefill peak in the same boot, with the driver's own counter:
+
+| rank | torch peak | non-torch | NVML free AT PEAK |
+|---|---|---|---|
+| 5090 | 29.458 GiB | 1.460 GiB | 0.420 GiB |
+| 3080 | 18.877 GiB | **0.640 GiB** | **0.084 GiB** |
+
+84 MiB, i.e. 7x *below* the floor the boot was certified against. A corridor
+measured at idle is not a corridor. Arm `SGLANG_FORWARD_PEAK_PATH` and read
+`nvml_free_bytes_min` from the per-rank JSON; that is the number the fixposten
+must consume.
+
+**`DSV4_NON_TORCH_GIB = 0.64` (3080-class rank), provenance:** window 4
+inferred ~0.63 GiB of non-torch VRAM (CUDA context, NCCL buffers, offload
+staging) from an OOM message; window 5 measured 0.640 GiB directly via
+`torch.cuda.mem_get_info` paired into the same probe row. `torch`'s
+`max_memory_allocated` cannot see it, so any budget built from the torch
+number alone is optimistic by that much. Use 1.46 GiB for a 5090-class rank.
+
 ### 4.5.5 The GGUF page cache is released behind the stream (#391)
 
 `gguf.GGUFReader` maps each part with `np.memmap` and hands out views into it,
