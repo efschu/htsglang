@@ -1708,6 +1708,51 @@ Three details are load-bearing:
 Redirect the output to a file on the host rather than relying on
 `docker logs`: with `--rm` the log dies with the container.
 
+#### `--moe-a2a-backend bar1ep` cannot run on this rig at all (#361)
+
+The BAR1 **collectives** work here. The BAR1 **MoE expert dispatch** does not,
+and the reason is structural rather than a bug — measured 2026-08-01, two
+boots, both refused at model load with a named error. Do not spend another
+card window on a bar1ep A/B until the hardware changes.
+
+The chain, each link verified:
+
+1. `bar1ep` maps expert `e` onto rank `e // num_local_experts`, so
+   `num_experts` must divide by the world size. The MoE vehicles here have
+   256 experts, and the mixed 5090+3080 pair is refused by the stock
+   memory-balance guard at even TP — so the only geometry is **TP=2 on the
+   two 3080s (sm86)**.
+2. On sm86 both available MoE formats land on the **Marlin** runner, and the
+   backend is hard-wired, not flag-selectable:
+   `quantization/fp8.py:2453` and
+   `hardware_backend/gpu/quantization/gptq_kernels.py:362` both construct
+   `MoeRunner(MoeRunnerBackend.MARLIN, ...)` unconditionally. FP8 goes there
+   too because sm86 has no native FP8.
+3. Marlin has `runner_core = None` and registers only
+   `@register_fused_func("none", "marlin")`, so for any a2a backend other
+   than `none` it raises:
+   `NotImplementedError: Runner backend MoeRunnerBackend.MARLIN requires a
+   fused func for a2a backend bar1ep, but none is registered.`
+4. The runner that *does* consume bar1ep's `DEEPEP_NORMAL` output for
+   quantized weights is **deep_gemm**, and it is off on **every card in this
+   rig**: `deep_gemm_wrapper/configurer.py` returns False for `sm < 90` (the
+   3080s) and has an explicit `sm_version == 120` exclusion for the 5090
+   ("requires TMEM/tcgen05 (SM100+datacenter), not available on SM120").
+5. The remaining consumer is the unquantized path
+   (`quantization/unquant.py`), which needs a **bf16** MoE. The 35B-A3B in
+   bf16 is ~70 GiB against 52 GiB of total VRAM.
+
+So bar1ep is today a Hopper / SM100-datacenter feature. What this rig *can*
+still prove about it is exactly what it already has: the availability gate
+opens correctly and every refusal is named and logged (#361), and the boot
+refuses loudly instead of silently dispatching over some other path — which
+is the behaviour that matters when the hardware does arrive.
+
+Evidence: `/spinning/gpu-battery-results/2026-08-01_361_bar1ep_ab/`.
+The arm runner is kept at `scripts/gpu_battery/bar1ep_vs_nccl_arm.sh`; it is
+correct and turnkey, and will produce numbers unchanged on a card that
+deep_gemm supports.
+
 #### Preconditions
 
 1. Patched driver with the registry key `RMSmallBarP2PPeerBar1=1`
