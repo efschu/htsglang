@@ -124,6 +124,37 @@ def _sample(v: Dict, *, capacity: int, window: int = 64) -> RegimeSample:
     )
 
 
+def one_rank(verdicts: List[Dict]) -> List[Dict]:
+    """The GROUP's verdict sequence: one entry per consensus boundary.
+
+    A TP group writes one verdict per rank per boundary. Replaying all of them
+    through a single sensor feeds it every boundary N times, which shortens
+    its hysteresis windows by N and manufactures transitions -- the live trace
+    replayed 13 where the run recorded 7, and the tool called that
+    NON-DETERMINISM. It was the replay's own doing.
+
+    The verdict at a boundary is a GROUP verdict (the ranks agree by
+    construction, and a disagreement is a desync gate 1 catches), so the
+    honest reconstruction keeps one entry per round. With a rank stamp the
+    same thing is done by selecting a rank; without one, by de-duplicating on
+    the round, which is equivalent when the ranks agree and refuses to hide it
+    when they do not.
+    """
+    ranks = {v.get("rank") for v in verdicts}
+    if ranks != {None}:
+        pick = sorted(r for r in ranks if r is not None)[0]
+        return [v for v in verdicts if v.get("rank") == pick]
+    seen = set()
+    out = []
+    for v in verdicts:
+        rnd = v.get("round")
+        if rnd in seen:
+            continue
+        seen.add(rnd)
+        out.append(v)
+    return out
+
+
 def transitions(seq: List[str]) -> List[str]:
     return [r for i, r in enumerate(seq) if i == 0 or r != seq[i - 1]]
 
@@ -174,6 +205,8 @@ def judge(verdicts: List[Dict], booted: Stage, target: Stage) -> Dict:
                 f"replaying a guess is not evidence"
             ],
         }
+    # One entry per boundary, or the replay outpaces the run it is replaying.
+    verdicts = one_rank(verdicts)
     recorded = transitions([v["regime"] for v in verdicts])
     cap = booted.max_total_num_tokens
     open_seq = transitions(replay_open(verdicts, cap))
@@ -371,12 +404,22 @@ def main(argv=None) -> int:
         print("no verdicts in the trace", file=sys.stderr)
         return 2
     if summary is None:
-        print(
-            "no summary line: the run did not end cleanly, so this trace is "
-            "not a complete record",
-            file=sys.stderr,
-        )
-        return 2
+        # Not a refusal any more: the fork's launcher SIGKILLs its scheduler
+        # children on shutdown, so a normal run never writes one. Completeness
+        # is proved from the verdicts by readout.completeness(), and this tool
+        # defers to that single definition rather than keeping a second one.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from readout import completeness  # noqa: PLC0415 -- sibling script
+
+        comp = completeness({"verdicts": verdicts})
+        if not comp["complete"]:
+            print(
+                f"the trace is neither summarised nor provably complete: "
+                f"{comp['why']}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"note: no summary line; completeness proved instead -- {comp['why']}")
     booted, target = _stages(args.booted_pool, args.target_pool)
     verdict = judge(verdicts, booted, target)
     print(json.dumps(verdict, indent=2))
