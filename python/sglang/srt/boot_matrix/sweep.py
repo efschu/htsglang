@@ -204,7 +204,7 @@ def _measure_band(
 
     first = runner(arm, model_path=model_path, out_dir=out_dir, port=port)
     reference: Dict[str, Dict[str, object]] = {}
-    for probe in _probes_of(first):
+    for probe in _probes_of(first, out_dir):
         reference[str(probe["name"])] = {"text": probe.get("text", "")}
 
     # The second run overwrites the first's artifacts on purpose: the arm
@@ -215,13 +215,13 @@ def _measure_band(
         reference_probes=reference, band={},
     )
     band: Dict[str, int] = {}
-    for probe in _probes_of(second):
+    for probe in _probes_of(second, out_dir):
         name = str(probe["name"])
         if str(probe.get("tier")) != "graded":
             continue
         scores = [
             int(p.get("score", 0))
-            for p in (_probe_named(first, name), probe)
+            for p in (_probe_named(first, name, out_dir), probe)
             if p is not None and p.get("score") is not None
         ]
         if scores:
@@ -235,25 +235,55 @@ def _measure_band(
     return reference, band, graded
 
 
-def _probes_of(verdict: Verdict) -> List[Dict[str, object]]:
+def _probes_of(verdict: Verdict, out_dir: str) -> List[Dict[str, object]]:
+    """Probe name, tier, TEXT and score for one finished baseline run.
+
+    The two halves come from two places, and that is not an accident:
+
+    * the SCORE is on the verdict's ``ProbeResult`` -- it is produced by the
+      grader inside ``check_arm``;
+    * the TEXT is only in ``probes.json`` on disk. ``ProbeResult`` has no
+      ``text`` field, and the first cut of this function read
+      ``getattr(p, "text", "")``, which is always "". That would have left the
+      byte reference empty and reproduced the exact bug this repair exists to
+      remove -- a band that measures nothing while the report says it did.
+
+    It got caught because the run was checked against the artifact rather than
+    the object; the unit test had been passing because its stub injected a
+    ``text`` attribute the real class does not have. A stub that is more
+    capable than the type it stands in for tests itself.
+    """
     coh = getattr(verdict, "coherence", None)
     if coh is None:
         return []
+    texts: Dict[str, str] = {}
+    path = os.path.join(out_dir, getattr(verdict, "arm", BAND_ARM), "probes.json")
+    try:
+        with open(path) as f:
+            for entry in json.load(f):
+                texts[str(entry.get("name", ""))] = str(entry.get("text", ""))
+    except (OSError, ValueError):
+        # No artifact to read: the caller gets empty texts and the check
+        # reports an empty band rather than a silently invented one.
+        texts = {}
     out: List[Dict[str, object]] = []
     for p in getattr(coh, "probes", ()) or ():
+        name = getattr(p, "name", "")
         out.append(
             {
-                "name": getattr(p, "name", ""),
+                "name": name,
                 "tier": getattr(p, "tier", ""),
-                "text": getattr(p, "text", ""),
+                "text": texts.get(name, ""),
                 "score": getattr(p, "score", None),
             }
         )
     return out
 
 
-def _probe_named(verdict: Verdict, name: str) -> Optional[Dict[str, object]]:
-    for p in _probes_of(verdict):
+def _probe_named(
+    verdict: Verdict, name: str, out_dir: str
+) -> Optional[Dict[str, object]]:
+    for p in _probes_of(verdict, out_dir):
         if p["name"] == name:
             return p
     return None
