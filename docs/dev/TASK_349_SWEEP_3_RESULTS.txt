@@ -1,0 +1,147 @@
+#349 boot matrix -- SWEEP 3, on the repaired net (2026-08-01)
+Qwen3.6-27B-FP8, TP=3 uneven (5090 + 2x 3080).
+Verdicts from sglang.srt.boot_matrix.check.check_arm over the artifacts.
+
+arm                        kind   verdict reason / first error
+------------------------------------------------------------------------------------------------------------------------
+A_default                  boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+B_offload                  boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+C_crossalgo                boot   FAIL    boot that should have come up died; first fatal at 38: Traceback (most rec
+D_offload_x_crossalgo      boot   FAIL    boot that should have come up died; first fatal at 466: Traceback (most re
+E_barlink                  boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+G_all_axes                 boot   FAIL    boot that should have come up died; first fatal at 37: Traceback (most rec
+H_ps2_prefill_spill        boot   FAIL    boot that should have come up died; first fatal at 37: Traceback (most rec
+I_dflash_shards            boot   FAIL    boot that should have come up died; first fatal at 37: Traceback (most rec
+J_waveback_ps2             boot   FAIL    boot that should have come up died; first fatal at 37: Traceback (most rec
+K_bar1_graphs              boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+L_video_cotenancy          boot   FAIL    boot that should have come up died; first fatal at 273: [2026-08-01 11:05:
+M_dcp_draftextend          boot   PASS    booted, resolved as declared, coherence within the A-vs-A band
+reject_dcp_topk            reject PASS    refused cleanly at boot with the named guard
+reject_dcp_multilayer      reject PASS    refused cleanly at boot with the named guard
+reject_dcp_offlane         reject PASS    refused cleanly at boot with the named guard
+reject_dcp_crossalgo       reject FAIL    refused, but with an unexpected error rather than the named guard (expecte
+reject_dcp_offload         reject PASS    refused cleanly at boot with the named guard
+
+tally: {'PASS': 9, 'FAIL': 8}
+
+========================================================================
+Q1  DOES THE BAND MEASURE?
+========================================================================
+  A_default              byte byte_count   ref_len=  24
+  A_default              grad alphabet     floor=4
+  A_default              grad squares      floor=8
+  E_barlink              byte byte_count   ref_len=  24
+  E_barlink              grad alphabet     floor=4
+  E_barlink              grad squares      floor=8
+  M_dcp_draftextend      byte byte_count   ref_len=  24
+  M_dcp_draftextend      grad alphabet     floor=4
+  M_dcp_draftextend      grad squares      floor=8
+
+========================================================================
+Q2  WHAT DO THE REPAIRED ARMS SAY (first error, if any)?
+========================================================================
+  B_offload                (no error line -- booted)
+  C_crossalgo              ValueError: --speculative-cross-algorithm: --speculative-cross-algorithm-lazy-capture requires --speculative-cross-algorithm-force auto; got force='ne
+  D_offload_x_crossalgo    AssertionError: {"error":{"message":"Internal server error: CUDA error: out of memory\nSearch for `cudaErrorMemoryAllocation' in https://docs.nvidia.c
+  G_all_axes               ValueError: --kv-session-offload-host-ram-gib=8 GiB does not fit in the currently available host RAM: 15.9 GiB available minus a 10.0 GiB OS reserve =
+  H_ps2_prefill_spill      ValueError: --kv-session-offload-host-ram-gib=8 GiB does not fit in the currently available host RAM: 15.9 GiB available minus a 10.0 GiB OS reserve =
+  I_dflash_shards          ValueError: --kv-session-offload-host-ram-gib=8 GiB does not fit in the currently available host RAM: 15.9 GiB available minus a 10.0 GiB OS reserve =
+  J_waveback_ps2           ValueError: --kv-session-offload-host-ram-gib=8 GiB does not fit in the currently available host RAM: 15.9 GiB available minus a 10.0 GiB OS reserve =
+  L_video_cotenancy        OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 31.34 GiB of which 63.69 MiB is free. Including non-P
+  reject_dcp_offlane       ValueError: --draft-kv-layout dcp requires the uneven-hybrid weighted DCP + speculative path: a speculative algorithm, SGLANG_UNEVEN_DCP=1, SGLANG_UNE
+
+========================================================================
+Q3  REJECT ARMS: PASSED ON THEIR OWN GUARD?
+========================================================================
+  reject_dcp_topk          PASS  refusal=ValueError: --draft-kv-layout dcp is only supported for a linear draft chain (MT
+  reject_dcp_multilayer    PASS  refusal=ValueError: --draft-kv-layout dcp is not supported with --enable-multi-layer-eag
+  reject_dcp_offlane       PASS  refusal=ValueError: --draft-kv-layout dcp requires the uneven-hybrid weighted DCP + spec
+  reject_dcp_crossalgo     FAIL  refusal=None
+  reject_dcp_offload       PASS  refusal=ValueError: --draft-kv-layout dcp is not supported together with --enable-kv-ses
+
+========================================================================
+Q4  E_barlink AXIS / K_bar1
+========================================================================
+  E_barlink                barlink=device  PASS
+  K_bar1_graphs            barlink=bar1  PASS
+
+========================================================================
+READING OF SWEEP 3
+========================================================================
+17/17 arms ran, ~37 min wall (planned 80). 9 PASS / 8 FAIL.
+
+THE PREP HELD, AND SO DID THE NET REPAIR
+  - 17/17 cleared argument resolution, exactly as the card-less parser pass
+    predicted. Not one arm died at arg resolution this time; sweep 2 lost ten
+    there. Every remaining failure is past that line, which is where a bug net
+    is supposed to do its work.
+  - The band measures: byte reference and graded floors (alphabet=4,
+    squares=8) reached every arm that probed.
+  - K_bar1_graphs PASS, ready in 77 s against a 1200 s ceiling, byte probe
+    byte-exact against the measured reference.
+  - M_dcp_draftextend PASS with dcp resolved as declared -- the replacement
+    for the retired reject arm pins a contract that holds.
+  - 4 of 5 reject arms PASS on their OWN named guard.
+
+FOUR CLASSES OF FAILURE, and only one of them is a matrix defect
+
+1. ENVIRONMENT, not the arms and not the product -- G, H, I, J (4 arms)
+     ValueError: --kv-session-offload-host-ram-gib=8 GiB does not fit in the
+     currently available host RAM: 15.9 GiB available minus ...
+   The box had ~15.9 GiB of host RAM free during the run. Decisive detail:
+   B_offload carries the SAME flag and PASSED earlier in the same sweep, so
+   the condition moved while the sweep ran -- something else on the box took
+   the RAM (the 27 GB models-cache download is the obvious candidate). These
+   four arms are not evidence about their crossings; they need a re-run on a
+   quiet box before anything is concluded about offload x spec.
+
+2. RUNTIME OOM, real findings for the next pass -- D and L (2 arms)
+     D_offload_x_crossalgo: CUDA error: out of memory, at line 466 -- it
+       BOOTED and died during serving, not at load.
+     L_video_cotenancy: torch.OutOfMemoryError, GPU 0 (31.34 GiB) with
+       63.69 MiB free, allocating 86 MiB.
+   L is worth a note on the two device orders. Its budget 19000,15000,15000
+   was accepted because the physical-impossibility guard reads NVML, where
+   index 0 is a 3080 (20480 MiB) -- but at RUNTIME rank 0 is the 5090
+   (31.34 GiB, torch order) and carries the double shard of the 2,1,1 ratio.
+   The budget is legal and still wrong for the card the rank lands on. That is
+   runbook 5.1 biting in a new place: the guard and the runtime disagree about
+   which card rank 0 is.
+
+3. ONE MORE COMPANION FLAG -- C_crossalgo
+     --speculative-cross-algorithm-lazy-capture requires
+     --speculative-cross-algorithm-... (next in the chain)
+   The fourth layer on this arm. Each fix has revealed the next requirement,
+   which is the normal shape for an arm that has never executed.
+
+4. MARKER DRIFT, matrix-side -- reject_dcp_crossalgo
+   The guard FIRED and it is the right one:
+     "--draft-kv-layout dcp is not supported together with cross-algorithm
+      speculative serving: the active draft rung changes at runtime, so the
+      boot-time chain guarantee the DCP-sharded draft pool relies on does not
+      hold."
+   The arm expects the marker "--speculative-cross-algorithm", and that
+   message names the feature in prose instead of by flag. So the arm reports
+   FAIL for a boot that behaved correctly.
+
+   THIS IS ALSO A LESSON ABOUT MY OWN PREP. Item 2 of the prep checked that
+   every reject marker still appears in server_args.py -- and it does, because
+   the flag is declared elsewhere in that file. "Present in the file" is not
+   "present in THIS guard's message". The check should assert the marker
+   against the specific message the arm's crossing produces, which is what the
+   named-guard rule was supposed to mean in the first place.
+
+PRODUCT BREAKS FOUND: none that this run can claim. The two OOMs are
+configuration/budget findings on first-time crossings, the four RAM failures
+are the box, and the marker drift is the net. No crossing produced a hang, a
+silent misconfiguration, or an incoherent answer.
+
+NEXT PASS, in order
+  1. reject_dcp_crossalgo's marker -> assert the guard's actual wording (and
+     tighten the prep check to compare against the specific message).
+  2. L's budget: size rank 0 for the card it actually lands on at runtime, not
+     the one the NVML-ordered guard validates against.
+  3. D's runtime OOM: needs its own look; it is the only arm that died while
+     serving rather than at load.
+  4. C's next companion flag.
+  5. Re-run G/H/I/J on a quiet box -- their crossings remain untested.
