@@ -16,6 +16,36 @@ On the desk fixture the two optima genuinely differ — `(10,1,1)` vs `(12,0,0)`
 i.e. **9.8 % fewer J/token at 18.2 % slower**. The GPU run asks whether that
 divergence survives contact with the real rig.
 
+## How each arm's plan is selected (updated for phase 3)
+
+`--objective` is honoured by the **planner**, not yet by the boot's own
+`--rank-tp-ratio auto-performance` sizing. So the two arms are not "the same
+boot with a different flag" — each arm's key is PLANNED first and then booted
+explicitly:
+
+```bash
+# energy arm: ask the solver for the energy-optimal key (needs power anchors)
+curl -s localhost:<planner-port>/api/key_solver -H 'content-type: application/json' -d '{
+  "model_path": "'"$MODEL"'", "tp_size": 3, "rank_gpu_id": [0,1,2],
+  "goal": "dec", "objective": "energy",
+  "power_anchors": [{"idle_w": 30, "active_w": 300, "source": "measured"},
+                    {"idle_w": 90, "active_w": 320, "source": "measured"},
+                    {"idle_w": 90, "active_w": 320, "source": "measured"}]
+}' | jq -r '.candidates[0].launch_flags | @sh'
+# -> --rank-mlp-ratio a,b,c   ... boot with exactly that
+```
+
+Drop `"objective"` and `"power_anchors"` for the throughput arm. The answer
+carries `mode: "energy"` and a caveat naming the J/work figure and whether the
+anchors were measured or estimated; an unpriceable request comes back
+`ok: false` with a named reason (never a throughput plan under an energy
+label), and the script must treat that as INCONCLUSIVE, not as an arm.
+
+Power anchors: use the NVML calibration from #149 (`power_calibration`) when
+present — those are the `"measured"` tier. TDP-derived anchors from the card
+library are the `"estimate-tdp"` tier and still plan, but the verdict must
+then quote the run as estimate-grade.
+
 ## Before you start
 
 1. Claim all three cards through `/spinning/gpu-arb/` (ANFRAGE, heartbeat every

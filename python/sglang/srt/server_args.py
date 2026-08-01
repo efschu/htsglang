@@ -2098,7 +2098,13 @@ class ServerArgs:
             "measured-first (the #146 harness / results store) and fall back "
             "to the #148 roofline estimate, each carrying its provenance -- "
             "a config with neither is reported unscorable for energy, never "
-            "silently substituted.",
+            "silently substituted. SCOPE TODAY (#350 phase 3): the objective "
+            "is honoured by the PLANNER (the /api/key_solver path and "
+            "key_solver.solve, which return the energy-optimal key with "
+            "mode='energy'); the boot's own --rank-tp-ratio auto-performance "
+            "sizing does not consult it yet, so setting this flag alone does "
+            "not change the vector a server boots with -- plan with it, then "
+            "boot the key it returns.",
             choices=["throughput", "energy"],
         ),
     ] = "throughput"
