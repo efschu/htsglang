@@ -19,11 +19,28 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
+    mm_frontend_gpu_enabled,
 )
 from sglang.srt.utils import get_device
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _preprocess_device() -> str:
+    """Device for the tile/normalize pipeline below.
+
+    InternVL builds its own pixel values instead of calling the HF fast image
+    processor, but it does so in the same place: the GPU-passive tokenizer
+    process. Opening a CUDA context there costs a worker rank a few hundred
+    unaccounted MiB (#403), and the tiles are copied back to the host on their
+    way to the scheduler regardless. Non-CUDA accelerators are left alone --
+    the ticket and the per-rank ledger it belongs to are CUDA.
+    """
+    device = get_device()
+    if device.startswith("cuda") and not mm_frontend_gpu_enabled():
+        return "cpu"
+    return device
 
 
 class InternVLProcessor(BaseMultimodalProcessor):
@@ -437,7 +454,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             len(base_output.videos),
         )
 
-        mean, std = self._get_normalize_tensors(device=get_device())
+        mean, std = self._get_normalize_tensors(device=_preprocess_device())
 
         # ----- Images -> tiles -----
         num_patches_list: List[int] = []
@@ -447,11 +464,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
                 tensor = (
-                    torch.from_numpy(img_np).permute(2, 0, 1).to(get_device()).float()
+                    torch.from_numpy(img_np)
+                    .permute(2, 0, 1)
+                    .to(_preprocess_device())
+                    .float()
                     / 255.0
                 )
             else:
-                tensor = image.to(get_device())
+                tensor = image.to(_preprocess_device())
 
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
@@ -502,7 +522,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                     frame_t = (
                         torch.from_numpy(img_np)
                         .permute(2, 0, 1)
-                        .to(get_device())
+                        .to(_preprocess_device())
                         .float()
                         / 255.0
                     )
@@ -576,14 +596,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
         image_offsets = []
         if image_tensor is not None:
             image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to(get_device()),
+                input_ids=input_ids_tensor.to(_preprocess_device()),
                 mm_token_id=self.img_context_token_id,
             )
 
         video_offsets = []
         if video_tensor is not None and self.video_token_id is not None:
             video_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to(get_device()),
+                input_ids=input_ids_tensor.to(_preprocess_device()),
                 mm_token_id=self.video_token_id,
             )
 
@@ -651,7 +671,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             discard_alpha_channel=True,
         )
 
-        mean, std = self._get_normalize_tensors(device=get_device())
+        mean, std = self._get_normalize_tensors(device=_preprocess_device())
 
         num_patches_list: List[int] = []
         pixel_values_list: List[torch.Tensor] = []
@@ -660,11 +680,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
                 tensor = (
-                    torch.from_numpy(img_np).permute(2, 0, 1).to(get_device()).float()
+                    torch.from_numpy(img_np)
+                    .permute(2, 0, 1)
+                    .to(_preprocess_device())
+                    .float()
                     / 255.0
                 )
             else:
-                tensor = image.to(get_device())
+                tensor = image.to(_preprocess_device())
 
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
@@ -707,7 +730,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         image_offsets = []
         if pixel_values is not None:
             image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to(get_device()),
+                input_ids=input_ids_tensor.to(_preprocess_device()),
                 mm_token_id=self.img_context_token_id,
             )
 

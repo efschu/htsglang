@@ -17,6 +17,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    mm_frontend_gpu_enabled,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 
@@ -274,7 +275,10 @@ class KimiGPUProcessorWrapper:
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
 
-        if images and torch.cuda.is_available():
+        # #403: _gpu_call resizes/normalizes on a worker's card from inside the
+        # GPU-passive tokenizer process. _cpu_call is the equivalent HF path;
+        # take it unless the frontend is explicitly allowed on a card.
+        if images and torch.cuda.is_available() and mm_frontend_gpu_enabled():
             return self._gpu_call(text, images)
         return self._cpu_call(text, images, **kwargs)
 

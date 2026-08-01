@@ -33,6 +33,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    mm_frontend_gpu_enabled,
 )
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -237,7 +238,12 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    video = video.pin_memory()
+    # Pinning allocates through the CUDA host allocator, which initializes a
+    # context in this GPU-passive tokenizer process (#403). The frames leave
+    # the process as shared memory or pickle bytes, so the pinning is not even
+    # staging an H2D copy for anyone here.
+    if mm_frontend_gpu_enabled():
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,

@@ -20,10 +20,22 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    mm_frontend_gpu_enabled,
 )
 
 Step3Image = Union[Image.Image, torch.Tensor]
 ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
+
+
+def _gpu_transform_allowed() -> bool:
+    """Is the CUDA branch of GPUToTensor available here?
+
+    The transform runs inside Step3VisionProcessor, i.e. in the
+    GPU-passive tokenizer process. A card being present is not a reason to
+    open a context on it from there (#403) -- the normalize/resize output
+    goes back to the host on its way to the scheduler either way.
+    """
+    return torch.cuda.is_available() and mm_frontend_gpu_enabled()
 
 
 class GPUToTensor(torch.nn.Module):
@@ -50,12 +62,12 @@ class GPUToTensor(torch.nn.Module):
             return image_tensor.contiguous()
         if isinstance(raw_image, Image.Image):
             image_tensor = transforms.ToTensor()(raw_image)
-            if torch.cuda.is_available():
+            if _gpu_transform_allowed():
                 image_tensor = image_tensor.to(torch.device("cuda"))
             return image_tensor
         if raw_image.ndim == 2:
             raw_image = raw_image[:, :, None].repeat(3, -1)
-        if torch.cuda.is_available():
+        if _gpu_transform_allowed():
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")

@@ -45,6 +45,64 @@ SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
+def mm_frontend_gpu_enabled() -> bool:
+    """May the GPU-passive tokenizer process preprocess multimodal data on a card?
+
+    Everything reachable from ``process_mm_data_async`` runs in the
+    TokenizerManager process (``tokenizer_manager.py`` -> the per-model
+    ``process_mm_data_async``), and so do the image loaders it submits to
+    ``io_executor``. That process holds no model weights and appears in no
+    per-rank memory ledger, so a CUDA context opened there is a few hundred MiB
+    on a worker's card that no budget, guard or profiling run can see -- once
+    per tokenizer worker. On a card already sized to its budget it is the
+    straw: #403 (arms D and G) died in ``image.to(device)`` inside the HF fast
+    image processor, not in the engine. Same family as #237 (import-time
+    contexts in GPU-passive processes) and #267.
+
+    On the default path the placement also buys nothing. Whatever the HF fast
+    image processor produces on the card is copied straight back to the host at
+    the end of ``process_mm_data``, handed to the scheduler as shared memory or
+    pickle bytes, and moved onto the *scheduler's* device by
+    ``mm_utils._move_items_to_device``. The round trip is pure overhead on top
+    of the context.
+
+    Two configurations were built to consume a device-resident feature and keep
+    the old behavior, because for them the placement is the point:
+
+    * ``SGLANG_USE_CUDA_IPC_TRANSPORT`` -- the frontend deliberately allocates
+      ``MmItemMemoryPool`` on ``base_gpu_id`` and hands the scheduler an IPC
+      handle instead of bytes.
+    * ``--keep-mm-feature-on-device`` -- "Keep multimodal feature tensors on
+      device after processing to save D2H copy".
+
+    ``SGLANG_MM_FRONTEND_GPU_PREPROCESS=1`` restores the pre-#403 behavior
+    unconditionally, for anyone who wants GPU resize/normalize in the frontend
+    and has the headroom to pay for the context.
+    """
+    if envs.SGLANG_MM_FRONTEND_GPU_PREPROCESS.get():
+        return True
+    if SGL_USE_CUDA_IPC:
+        return True
+    try:
+        server_args = get_server_args()
+    except ValueError:
+        # No process-wide ServerArgs (unit tests, bare processor use). Unknown
+        # is not permission: stay off the card.
+        return False
+    return bool(getattr(server_args, "keep_mm_feature_on_device", False))
+
+
+def mm_frontend_device(index: Optional[int] = None) -> str:
+    """Torch device string a GPU-passive frontend may build mm tensors on.
+
+    ``"cpu"`` unless :func:`mm_frontend_gpu_enabled`; otherwise ``cuda`` (with
+    ``index`` when the caller has a specific card in mind).
+    """
+    if not mm_frontend_gpu_enabled():
+        return "cpu"
+    return "cuda" if index is None else f"cuda:{index}"
+
+
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
@@ -179,7 +237,23 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    # Per-model capability: does this model's processor accept a decoded image
+    # tensor at all? Whether the decode may actually use a card is a separate,
+    # process-level question -- see gpu_image_decode_enabled.
     gpu_image_decode = True  # Enable GPU decoding by default
+
+    @classmethod
+    def gpu_image_decode_enabled(cls) -> bool:
+        """May ``_load_single_item`` hand the image to nvJPEG on a card?
+
+        The model must support it (``cls.gpu_image_decode``) *and* this process
+        must be allowed to touch a card at all (#403): the decode runs on
+        ``io_executor`` threads inside the GPU-passive tokenizer process, so on
+        the default path it opens the very context this ticket removes, and the
+        resulting CUDA tensor is only fed to a fast image processor that is
+        itself back on the CPU.
+        """
+        return cls.gpu_image_decode and mm_frontend_gpu_enabled()
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -452,8 +526,13 @@ class BaseMultimodalProcessor(ABC):
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                base_gpu_id = get_server_args().base_gpu_id
-                kwargs["device"] = f"cuda:{base_gpu_id}"
+                # #403: this runs in the GPU-passive tokenizer process. Placing
+                # the fast image processor on a worker's card opens a second
+                # CUDA context there, unaccounted by every per-rank budget, and
+                # the result is copied back to the host a few lines below
+                # anyway. See mm_frontend_gpu_enabled for the two opt-ins that
+                # keep the device placement.
+                kwargs["device"] = mm_frontend_device(get_server_args().base_gpu_id)
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",
                 "Glm46VProcessor",
@@ -551,7 +630,7 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, cls.gpu_image_decode_enabled())
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
