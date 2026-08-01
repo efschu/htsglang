@@ -193,12 +193,16 @@ LANE_RATIO = "2,1,1"
 #: Per-rank MiB for that ratio. A list, not a scalar: under 2,1,1 the shards
 #: differ in size, and the flag takes a per-rank list for exactly that reason.
 #:
-#: Every entry fits the SMALLEST card (3080, NVML total 20480 MiB), because
-#: --rank-gpu-id 0,1,2 is resolved against NVML order and the physical-
-#: impossibility check reads NVML per rank -- a first draft of 26000 for rank 0
-#: was rejected by name ("GPU 0 (NVML total 20480 MiB) cannot ..."), which is
-#: the guard being right: NVML index 0 on this rig is a 3080, not the 5090
-#: that CUDA order puts first (runbook 5.1, the two device orders).
+#: Every entry fits the SMALLEST card (3080, NVML total 20480 MiB). That was
+#: originally forced by a defect rather than by the rig: the guard resolved
+#: --rank-gpu-id against NVML order, so rank 0's budget was checked against
+#: NVML index 0 (a 3080) while the rank bound CUDA ordinal 0 (the 5090). A
+#: first draft of 26000 for rank 0 was rejected for the wrong card, and this
+#: vector was then accepted for the wrong card too -- and OOMed at runtime,
+#: which is what #392 fixed (the guard now reads the card the rank binds).
+#: The vector is kept as-is because it is legal on either card and the arm's
+#: subject is the co-resident lane, not the budget; runbook 5.1 still
+#: documents the two device orders.
 LANE_RANK_MIB = "19000,15000,15000"
 
 BASE_EXPECT: Mapping[str, object] = {

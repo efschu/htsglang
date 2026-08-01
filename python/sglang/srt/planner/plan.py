@@ -164,13 +164,21 @@ def derive_auto_plan(
                     f"--plan-free-reserve-gb for GPU {g.index} ({g.name}) "
                     "must be >= 0."
                 )
-            user_reserve_per_gpu[g.index] = int(res)
+            # Keyed in the --rank-gpu-id (CUDA) space, because that is what
+            # the lookup below uses; keying on the NVML index would charge
+            # another card's reserve on a rig where the orders differ (#392).
+            user_reserve_per_gpu[hardware.rank_gpu_id_of(g)] = int(res)
 
     counts = Counter(rank_gpu_id)
     # Boot mirror: _resolve_auto_rank_tp_ratio computes the tier defaults
     # from get_device_memory_capacity(self.device) — the FIRST visible
-    # device's total. The offline equivalent is the first declared card.
-    tier_gpu_mem = hardware.gpus[0].total_mib
+    # device's total, i.e. CUDA ordinal 0. hardware.gpu(0) resolves that
+    # ordinal; hardware.gpus[0] is the first card in NVML order, a different
+    # card on a rig where the enumerations diverge (#392).
+    try:
+        tier_gpu_mem = hardware.gpu(0).total_mib
+    except ValueError:
+        tier_gpu_mem = hardware.gpus[0].total_mib
     view = _make_view(plan_inputs)
     auto_reserve_per_gpu: Dict[int, int] = {
         gpu_id: int(view.derived_rank_auto_reserve_mib(tier_gpu_mem, cnt))

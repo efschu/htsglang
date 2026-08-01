@@ -92,6 +92,33 @@ class HardwareSpec:
     cuda_index_source: Optional[str] = None
 
     def gpu(self, index: int) -> GpuDescriptor:
+        """The card a ``--rank-gpu-id`` / ``--base-gpu-id`` value names.
+
+        Those flags live in CUDA enumeration order, so the lookup resolves
+        against ``cuda_index`` whenever this spec knows it (live NVML specs,
+        and json specs that declare it). Matching on ``index`` there returns
+        the card at the same NVML index, which on a mixed rig is a DIFFERENT
+        card -- the planner's copy of #392, and the same defect the engine's
+        budget guard carried: a per-card budget checked against one card and
+        spent on another.
+
+        Manual and unbridged specs carry no ``cuda_index``; there the list
+        position is the only declared identity and stays the meaning of the
+        value, as documented on :class:`GpuDescriptor`.
+        """
+        if any(g.cuda_index is not None for g in self.gpus):
+            for g in self.gpus:
+                if g.cuda_index == index:
+                    return g
+            declared = [
+                f"cuda {g.cuda_index} (nvml {g.index}): {g.name} {g.total_mib} MiB"
+                for g in self.gpus
+            ]
+            raise ValueError(
+                f"--rank-gpu-id names CUDA device {index}, but this hardware "
+                f"spec ({self.source}) only declares {len(self.gpus)} "
+                f"device(s): {declared}."
+            )
         for g in self.gpus:
             if g.index == index:
                 return g
@@ -100,6 +127,16 @@ class HardwareSpec:
             f"({self.source}) only declares {len(self.gpus)} device(s): "
             f"{[f'{g.index}: {g.name} {g.total_mib} MiB' for g in self.gpus]}."
         )
+
+    def rank_gpu_id_of(self, gpu: GpuDescriptor) -> int:
+        """The ``--rank-gpu-id`` value that names ``gpu``.
+
+        The inverse of :meth:`gpu`, and the only correct way to derive a
+        placement from this spec: the engine reads those values in CUDA
+        order, so a default placement written in NVML indices names other
+        cards than it means on a rig where the two diverge.
+        """
+        return gpu.index if gpu.cuda_index is None else gpu.cuda_index
 
 
 # ---------------------------------------------------------------------------
