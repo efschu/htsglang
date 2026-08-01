@@ -36,7 +36,7 @@ KEY="${BAR1_HOST_KEY:-/root/.ssh/id_root@proxmox}"
 SUB="${BAR1_HOST_SUBVOL:-/spinning/subvol-999-disk-0}"
 
 # Container paths.
-OUT=/spinning/gpu-battery-results/2026-07-31_366_bar1_formats
+OUT="${OUT:-/spinning/gpu-battery-results/2026-08-01_366_bar1_formats}"
 WT=/spinning/wt-final
 VENV=/spinning/htsglang-gpu/.venv
 # Host views of the same things.
@@ -59,11 +59,21 @@ H_PY="$H_SHIM/bin/python3.12"
 H_MODEL="$SUB/spinning/llm_stuff/club-3090/models-cache/$MODEL_SUB"
 H_NVSRC="$SUB/spinning/nvidia-open-595"
 # JIT cache on the pool, not on /root: rpool is at 95% with 11G free.
-H_EXTCACHE="$SUB/spinning/barlink_extcache_host"
+# Default is the WARM cache built during the #366 bring-up window: both the
+# collective and dma-buf extensions are already compiled here under the host's
+# spelling of the paths, so a host boot finds them and skips the ~18 min cold
+# build. torch keys its build.ninja by path string, so this cache is only warm
+# for a run whose resolved paths match how it was built -- the container alias
+# tree (/spinning/subvol-999-disk-0 -> /) is what makes the two agree.
+H_EXTCACHE="${H_EXTCACHE:-$SUB/spinning/barlink_extcache_shared}"
 H_LOG="/root/battery-bar1/366.$ARM.log"
 
 PORT="${PORT:-30366}"
 POINT_S="${POINT_S:-12}"
+# Cold BAR1 graph capture over NEXTN draft graphs took >18 min in #369's first
+# window; the readiness poll therefore allows well past that. It exits early
+# the moment the server answers, so a warm boot pays nothing for the headroom.
+READY_TRIES="${READY_TRIES:-200}"
 
 mkdir -p "$OUT"
 
@@ -100,6 +110,10 @@ export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 export SGLANG_BARLINK=1
 export SGLANG_BARLINK_TRANSPORT=bar1
+# Explicit, though it is the default since #369 released the graph gate
+# (2026-08-01, bar1_graph_check.py 10/10). Without capture, a bar1 number is
+# not comparable to #354's graph-mode NCCL baseline.
+export SGLANG_BARLINK_GRAPH_ENABLE=1
 export SGLANG_BARLINK_BAR1_NV_SOURCE="$H_NVSRC"
 # Two communicator groups exist under SGLANG_UNEVEN_DCP (tp and dcp) and they
 # share one aperture. The 3080s have 256 MiB of BAR1 gross; at the 96 MiB
@@ -126,14 +140,16 @@ echo \$! > /root/battery-bar1/366.$ARM.pid
 echo "started pid \$(cat /root/battery-bar1/366.$ARM.pid)"
 EOF
 )
+BOOT_T0=$(date +%s)
 hssh 120 "$BOOT"
 [ $? -ne 0 ] && { echo "BOOT SSH FAILED arm=$ARM"; exit 2; }
 
-# Readiness, bounded, polled from the host over its own loopback. The JIT build
-# of the BAR1 extension is paid on the FIRST arm only (shared cache), so this
-# wait is deliberately long.
+# Readiness, bounded, polled from the host over its own loopback. Time to ready
+# is recorded per arm: it is the direct measurement of the warm-cache question
+# -- if boot 2 of a config that boot 1 already captured comes up much faster,
+# the graph/JIT caches warm across boots and the 8-boot cost collapses.
 UP=0
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "$READY_TRIES"); do
     R=$(hssh 30 "curl -s -m 5 http://127.0.0.1:$PORT/health_generate >/dev/null 2>&1 && echo UP || echo NO; \
                  kill -0 \$(cat /root/battery-bar1/366.$ARM.pid 2>/dev/null) 2>/dev/null || echo DEAD")
     case "$R" in
@@ -142,6 +158,8 @@ for _ in $(seq 1 100); do
     esac
     sleep 10
 done
+BOOT_SECS=$(( $(date +%s) - BOOT_T0 ))
+echo "arm=$ARM boot_to_ready_seconds=$BOOT_SECS" | tee "$OUT/boot_secs_$ARM.txt"
 if [ "$UP" != 1 ]; then
     echo "BOOT FAILED arm=$ARM -- log tail:"
     hssh 60 "grep -nE 'ACHIEVED|barlink|out of memory|OutOfMemory|Traceback|Error' '$H_LOG' | tail -25"
