@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -50,6 +51,10 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.utils import (
+    ACTIVATION_VEC_ELEMS,
+    assert_activation_aligned_shards,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -83,6 +88,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    _quant_block_aligned_units,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -256,6 +262,57 @@ class DeepseekV2MLP(nn.Module):
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
 
+        # ---- uneven TP (--rank-tp-ratio): the intermediate dim is one unit
+        # family shared by both projections.
+        #
+        # gate_up's OUTPUT and down_proj's INPUT are the SAME intermediate
+        # dimension, so they must be cut at the same offsets; the units are
+        # derived ONCE here and handed to both layers (the #385 coupled-
+        # dimension rule).
+        #
+        # Without a unit count `partition_sizes` requires the dimension to be
+        # divisible by sum(weights), and `--rank-tp-ratio auto` derives BYTE
+        # weights from the NVML budgets -- [29607, 17780, 17780] on this rig,
+        # sum 65167, which divides nothing. That is the wall this closes for
+        # DeepSeek-V4-Flash, whose shared expert is a DeepseekV2MLP with
+        # intermediate 2048 (moe_intermediate_size * n_shared_experts):
+        #
+        #     ValueError: Cannot partition dimension of size 2048 with weight
+        #     vector [29607, 17780, 17780]: 2048 is not divisible by
+        #     sum(weights)=65167.
+        #
+        # The grain is ACTIVATION_VEC_ELEMS-element groups, not single
+        # elements, exactly as in LlamaMLP / Qwen2MoeMLP (#82 / #100): the jit
+        # activation kernel vector-loads up to kMaxVecBytes=32 bytes (16 bf16
+        # elements on Blackwell) and rejects per-rank intermediate sizes that
+        # are not a multiple of its vector width.
+        _replicated = tp_size == 1
+        if _replicated:
+            # A replicated module (tp_size=1: DeepEP/FP4-allgather shared
+            # experts, SGLANG_SHARED_EXPERT_TP1, moe-dense-fully-dp) must not
+            # contribute its units to the "mlp" family statistics -- those are
+            # partitioned over the REAL ranks and a coarsened unit count (e.g.
+            # 2048/256 = 8) says nothing about a dimension nobody shards.
+            _mlp_units = None
+            _mlp_family = None
+        else:
+            _mlp_units = intermediate_size // math.gcd(
+                intermediate_size, ACTIVATION_VEC_ELEMS
+            )
+            # Quant-block symmetry, and the reason the coarsening happens HERE
+            # instead of per layer: the layer-level `_quant_block_aligned_units`
+            # coarsens only down_proj's INPUT dim for GGUF (ggml blocks lie
+            # along the input dim, so output-dim coarsening is deliberately
+            # skipped there to keep head-granular families intact). Left to the
+            # layers, gate_up's output split and down_proj's input split of the
+            # same intermediate dimension would DISAGREE. Coarsening once with
+            # the input-dim block and passing the same count to both makes the
+            # layer-level pass idempotent.
+            _mlp_units = _quant_block_aligned_units(
+                intermediate_size, _mlp_units, quant_config, 1
+            )
+            _mlp_family = "mlp"
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -264,6 +321,13 @@ class DeepseekV2MLP(nn.Module):
             prefix=add_prefix("gate_up_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            # Merged 2x layer: tp_units is defined against the PER-PART output
+            # size (one `intermediate_size` block), not against the 2x total.
+            tp_units=_mlp_units,
+            # tp_family="mlp" lets --rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR
+            # re-balance the dense-MLP shards independently of the base plan;
+            # with no mlp vector installed it falls back to the base vector.
+            tp_family=_mlp_family,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -274,7 +338,33 @@ class DeepseekV2MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            tp_units=_mlp_units,
+            tp_family=_mlp_family,
         )
+        if not _replicated:
+            # Fail at construction, not at the first forward.
+            # 1) The coupled dimension: both layers must cut the shared
+            #    intermediate dim at the same offsets. The caller-side
+            #    coarsening above makes the layer-level quant coarsening a
+            #    pass-through, so a divergence here means an asymmetric
+            #    weight-quant block geometry this module cannot express.
+            if self.gate_up_proj.tp_units != self.down_proj.tp_units:
+                raise ValueError(
+                    "DeepseekV2MLP gate_up/down partition units diverged "
+                    f"after quant-block coarsening (gate_up "
+                    f"{self.gate_up_proj.tp_units} vs down "
+                    f"{self.down_proj.tp_units} units for intermediate "
+                    f"{intermediate_size}); the uneven-TP splits of the "
+                    "shared intermediate dimension would disagree."
+                )
+            # 2) Every rank's shard must satisfy the jit activation kernel's
+            #    vector alignment (no-op without an installed uneven plan).
+            assert_activation_aligned_shards(
+                intermediate_size,
+                self.gate_up_proj.tp_size,
+                self.gate_up_proj.tp_units,
+                _mlp_family,
+            )
         if not hasattr(self.gate_up_proj, "weight") and hasattr(
             self.gate_up_proj, "weight_packed"
         ):
