@@ -180,6 +180,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
+    dense_weight_dtype,
+    is_gguf_quant_config,
+    layer_quant_method_name,
 )
 from sglang.srt.runtime_context import (
     get_flags,
@@ -329,7 +332,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
+            and dense_weight_dtype(self.gate_up_proj) == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
@@ -343,7 +346,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
-            and self.down_proj.weight.dtype == torch.uint8
+            and dense_weight_dtype(self.down_proj) == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
             M, N = gate_up.shape
@@ -755,13 +758,17 @@ class DeepseekV2MoE(nn.Module):
                 "awq_marlin",
                 "moe_wna16",
             }
+            # The int8 / fp8 shared-expert fast paths need a dense weight
+            # tensor to read a dtype from. `is_packed_weight` only names the
+            # AWQ family; GGUF (and GPTQ) are packed too and expose `qweight`
+            # instead, so the dtype is resolved through `dense_weight_dtype`
+            # and simply comes back as None for them -> general path.
+            shared_gate_up_dtype = dense_weight_dtype(self.shared_experts.gate_up_proj)
             self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+                not is_packed_weight and shared_gate_up_dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                not is_packed_weight and shared_gate_up_dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
                 if (
@@ -1133,6 +1140,20 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if dense_weight_dtype(self.shared_experts.gate_up_proj) is None:
+            # `shared_expert_cpu` takes the two dense weight tensors directly;
+            # there is no packed-weight variant of it. Packed checkpoints
+            # (GGUF, AWQ, GPTQ) reach here only on a CPU/AMX host, and would
+            # otherwise die inside the kernel call on a missing attribute
+            # after the routed experts have already been computed.
+            raise NotImplementedError(
+                "The CPU/AMX shared-expert kernel (shared_expert_cpu) needs "
+                "dense shared-expert weights, but this checkpoint's "
+                "gate_up_proj is packed (qweight, quant method "
+                f"'{layer_quant_method_name(self.shared_experts.gate_up_proj)}'). "
+                "Run this model on a CUDA device, or use a dense checkpoint."
+            )
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
@@ -1768,12 +1789,22 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
+        # `dsv3_fused_a_gemm` reads `weight.T` directly, so the fast path is
+        # only available when a dense weight tensor exists. `is_packed_weight`
+        # above covers the AWQ family by name; GGUF and GPTQ are packed too
+        # and simply have no `weight`, which resolves to None here (and to the
+        # general `self.fused_qkv_a_proj_with_mqa(...)` call in
+        # prepare_qkv_latent, whose fast-path branch this flag gates).
+        fused_a_weight = (
+            getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
+            if self.has_fused_proj and not self.is_packed_weight
+            else None
+        )
         self.use_min_latency_fused_a_gemm = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
+            fused_a_weight is not None
+            and fused_a_weight.dtype == torch.bfloat16
+            and fused_a_weight.shape[0] % 16 == 0
+            and fused_a_weight.shape[1] % 256 == 0
             and _is_cuda
             and _device_sm >= 90
         )
@@ -2762,7 +2793,26 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         disable_reason = None
-        if server_args.enforce_shared_experts_fusion:
+        if is_gguf_quant_config(getattr(self, "quant_config", None)):
+            # Fusing remaps `mlp.shared_experts.*` onto expert slot
+            # `n_routed_experts` of the MoE kernel (see
+            # deepseek_weight_loader). The GGUF weight stream carries the
+            # shared expert as its own packed linears and has no such slot,
+            # so the fused layout would load garbage rather than fail.
+            if server_args.enforce_shared_experts_fusion:
+                raise NotImplementedError(
+                    "--enforce-shared-experts-fusion is not supported for "
+                    "GGUF checkpoints (quant method 'gguf'): the fused path "
+                    "expects the shared expert pre-packed into the routed "
+                    "expert tensors, which the GGUF weight stream does not "
+                    "provide. Drop the flag to run the shared expert as its "
+                    "own dense MLP."
+                )
+            disable_reason = (
+                "GGUF checkpoints keep the shared expert as separate packed "
+                "linears, which the fused expert slot cannot hold."
+            )
+        elif server_args.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."

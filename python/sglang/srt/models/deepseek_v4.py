@@ -114,7 +114,10 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
-from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.models.deepseek_common.utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    is_gguf_quant_config,
+)
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
     _is_cuda,
@@ -401,6 +404,17 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
+        if fp8 and is_gguf_quant_config(quant_config):
+            # The fp8 wo_a GEMM reads `wo_a.weight` and `wo_a.weight_scale_inv`
+            # as dense tensors; a GGUF wo_a has neither. Without this the
+            # assert below fires on a missing weight_scale_inv, which does not
+            # name the cause.
+            raise NotImplementedError(
+                "SGLANG_OPT_FP8_WO_A_GEMM is not supported for GGUF "
+                "checkpoints (quant method 'gguf'): the fp8 einsum reads a "
+                "dense wo_a weight plus its block scales, and a GGUF wo_a is "
+                "packed. Set SGLANG_OPT_FP8_WO_A_GEMM=0 to keep wo_a dense."
+            )
         if wo_a_keeps_quant_config is None:
             wo_a_quant_config: Optional[QuantizationConfig] = (
                 quant_config if fp8 else None
@@ -2392,7 +2406,24 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
 
         disable_reason = None
-        if get_server_args().enforce_shared_experts_fusion:
+        if is_gguf_quant_config(getattr(self, "quant_config", None)):
+            # Same reason as DeepseekV2ForCausalLM: the fused layout expects
+            # the shared expert pre-packed into the routed expert tensors,
+            # and the GGUF weight stream ships it as separate packed linears.
+            if get_server_args().enforce_shared_experts_fusion:
+                raise NotImplementedError(
+                    "--enforce-shared-experts-fusion is not supported for "
+                    "GGUF checkpoints (quant method 'gguf'): the fused path "
+                    "expects the shared expert pre-packed into the routed "
+                    "expert tensors, which the GGUF weight stream does not "
+                    "provide. Drop the flag to run the shared expert as its "
+                    "own dense MLP."
+                )
+            disable_reason = (
+                "GGUF checkpoints keep the shared expert as separate packed "
+                "linears, which the fused expert slot cannot hold."
+            )
+        elif get_server_args().enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "

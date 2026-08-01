@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    layer_quant_method_name,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -504,6 +505,23 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+
+            if layer_quant_method_name(self_attn.kv_b_proj) == "gguf":
+                # MLA absorption splits a DENSE kv_b_proj into w_kc / w_vc.
+                # A GGUF kv_b_proj carries `qweight` like an AWQ one does, so
+                # without this branch it falls into the AWQ dequantizer below
+                # and dies there on a missing `scales` -- a misleading error
+                # for a path that was never wired for GGUF. Refuse by name
+                # instead. DeepSeek V4 does not come through here: it has its
+                # own post_load_weights and no kv_b_proj.
+                raise NotImplementedError(
+                    "MLA weight absorption (kv_b_proj -> w_kc/w_vc) is not "
+                    "implemented for GGUF checkpoints (quant method 'gguf'): "
+                    "the split needs a dense kv_b_proj and there is no GGUF "
+                    "dequantization step on this path. DeepSeek V2/V3-family "
+                    "GGUF checkpoints therefore cannot be served yet; "
+                    "DeepSeek V4 is unaffected."
+                )
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
