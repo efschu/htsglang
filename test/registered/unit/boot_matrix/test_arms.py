@@ -94,3 +94,108 @@ class TestArmList(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSweep1ArmRepairs(CustomTestCase):
+    """Every arm sweep 1 could not boot, pinned to the reason it could not.
+
+    These are not style assertions. Each one names a flag or env the server
+    REQUIRES for the crossing the arm claims to exercise; without it the arm
+    dies at argument resolution in seconds and the matrix reports a defect that
+    is its own.
+    """
+
+    def test_offload_arms_opt_into_the_spec_bring_up_gate(self):
+        """--enable-kv-session-offload x spec is gated on KVSO_ALLOW_SPEC=1.
+
+        Five arms cross exactly that and none of them set it, so all five died
+        on the gate. The gate is correct; the arms have to opt in the way an
+        operator would.
+        """
+        for name in (
+            "B_offload",
+            "D_offload_x_crossalgo",
+            "G_all_axes",
+            "I_dflash_shards",
+            "J_waveback_ps2",
+        ):
+            arm = arm_by_name(name)
+            self.assertEqual(
+                arm.env.get("KVSO_ALLOW_SPEC"),
+                "1",
+                f"{name} crosses offload with spec and must opt into the gate",
+            )
+
+    def test_h_is_the_no_spec_control_and_needs_no_gate(self):
+        """If H ever needs KVSO_ALLOW_SPEC, the gate stopped meaning what it says."""
+        arm = arm_by_name("H_ps2_prefill_spill")
+        self.assertNotIn("KVSO_ALLOW_SPEC", dict(arm.env))
+        self.assertIn("--speculative-algorithm", arm.drop_flags)
+
+    def test_cross_algorithm_arms_carry_the_required_force(self):
+        """--speculative-cross-algorithm-force is documented '(required)'."""
+        for name in ("C_crossalgo", "D_offload_x_crossalgo", "G_all_axes",
+                     "reject_dcp_crossalgo"):
+            arm = arm_by_name(name)
+            if "--speculative-cross-algorithm" not in arm.flags:
+                continue
+            self.assertIn(
+                "--speculative-cross-algorithm-force",
+                arm.flags,
+                f"{name} enables cross-algo without the required force value",
+            )
+
+    def test_the_dual_lane_arm_carries_its_mandatory_budget(self):
+        arm = arm_by_name("L_video_cotenancy")
+        self.assertIn("--dual-group-lane-budget-mib", arm.flags)
+
+    def test_the_offlane_reject_drops_the_incompatible_reserve(self):
+        """--rank-auto-reserve-mib only applies with --rank-tp-ratio auto."""
+        arm = arm_by_name("reject_dcp_offlane")
+        self.assertIn("--rank-auto-reserve-mib", arm.drop_flags)
+        self.assertIn("--rank-tp-ratio", arm.flags)
+
+
+class TestRejectArmsNameTheirOwnGuard(CustomTestCase):
+    """Item 2, at the data end: a marker set that any refusal can satisfy is
+    how two arms reported PASS without reaching their crossing."""
+
+    def test_every_dcp_reject_arm_names_the_dcp_flag(self):
+        for arm in ARMS:
+            if arm.kind != "reject" or "dcp" not in arm.name:
+                continue
+            self.assertIn(
+                "--draft-kv-layout dcp",
+                arm.reject_markers,
+                f"{arm.name} could be satisfied by a refusal that never "
+                f"mentions the layout it exists to test",
+            )
+
+    def test_every_reject_arm_names_at_least_two_markers(self):
+        """One marker is a substring away from matching an unrelated guard."""
+        for arm in ARMS:
+            if arm.kind != "reject":
+                continue
+            self.assertGreaterEqual(
+                len(arm.reject_markers), 2, f"{arm.name} is too loosely pinned"
+            )
+
+
+class TestTheStaleRejectWasRetiredHonestly(CustomTestCase):
+    """Item 4. #108 slice 2 REMOVED the draft-extend refusal, so an arm that
+    still asserts it reports a defect every run and teaches everyone to ignore
+    the matrix. It is replaced by an arm that pins the contract that exists."""
+
+    def test_the_removed_refusal_is_no_longer_asserted(self):
+        self.assertNotIn("reject_dcp_draftextend", [a.name for a in ARMS])
+
+    def test_the_replacement_is_a_boot_arm_on_the_covered_lane(self):
+        arm = arm_by_name("M_dcp_draftextend")
+        self.assertEqual(arm.kind, "boot")
+        self.assertIn("--draft-kv-layout", arm.flags)
+        self.assertIn("dcp", arm.flags)
+
+    def test_the_replacement_declares_the_layout_it_must_resolve_to(self):
+        """A silent fallback to 'replicated' is the regression to catch."""
+        arm = arm_by_name("M_dcp_draftextend")
+        self.assertEqual(arm.expect.get("draft_kv_layout"), "dcp")

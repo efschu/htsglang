@@ -32,16 +32,51 @@ class TestBuildCommand(CustomTestCase):
         # base flags still there
         self.assertIn("--speculative-algorithm", argv)
 
-    def test_an_arm_can_override_a_base_flag(self):
-        """Arm H turns spec off; argparse takes the last value, so the arm's
-        --speculative-algorithm none wins over the base NEXTN."""
+    def test_arm_h_removes_the_spec_flags_instead_of_renaming_them(self):
+        """Arm H means "no speculation", and that is a REMOVAL.
+
+        It used to append ``--speculative-algorithm none`` and rely on argparse
+        taking the last value. That does not disable anything:
+        ``speculative_algorithm`` is a free-form string, so "none" is just an
+        algorithm nobody registered, truthy at every call site. Sweep 1 watched
+        the arm die on a guard whose message read "does not yet support
+        speculative decoding (--speculative-algorithm=none)".
+        """
         arm = arm_by_name("H_ps2_prefill_spill")
         _, argv = build_command(arm, model_path="/m", port=30000)
-        # base sets NEXTN, arm appends none AFTER it
-        i_base = argv.index("--speculative-algorithm")
-        i_last = len(argv) - 1 - argv[::-1].index("--speculative-algorithm")
-        self.assertGreater(i_last, i_base, "arm override must come after the base")
-        self.assertEqual(argv[i_last + 1], "none")
+        self.assertNotIn("--speculative-algorithm", argv)
+        self.assertNotIn("none", argv)
+        for gone in (
+            "--speculative-num-steps",
+            "--speculative-eagle-topk",
+            "--speculative-num-draft-tokens",
+        ):
+            self.assertNotIn(gone, argv, f"{gone} must go with the algorithm")
+        # The rest of the base recipe is untouched -- a drop must not be a rewrite.
+        self.assertIn("--tp-size", argv)
+        self.assertIn("--kv-cache-dtype", argv)
+
+    def test_a_later_flag_still_overrides_a_base_value(self):
+        """Removal is the new mechanism; plain override must keep working."""
+        arm = arm_by_name("reject_dcp_offlane")
+        _, argv = build_command(arm, model_path="/m", port=30000)
+        i_last = len(argv) - 1 - argv[::-1].index("--rank-tp-ratio")
+        self.assertEqual(argv[i_last + 1], "1,1,1")
+
+    def test_dropping_a_flag_takes_its_value_with_it(self):
+        """An orphan value would be read as a positional argument."""
+        arm = arm_by_name("reject_dcp_offlane")
+        _, argv = build_command(arm, model_path="/m", port=30000)
+        self.assertNotIn("--rank-auto-reserve-mib", argv)
+        self.assertNotIn("3000,2700,2700", argv)
+
+    def test_a_drop_that_matches_nothing_is_an_error(self):
+        """A silent no-op here is how an arm runs something it did not declare."""
+        from sglang.srt.boot_matrix.sweep import _without
+
+        with self.assertRaises(ValueError) as caught:
+            _without(("--tp-size", "3"), ("--not-a-base-flag",))
+        self.assertIn("--not-a-base-flag", str(caught.exception))
 
     def test_reject_arm_env_override(self):
         arm = arm_by_name("reject_dcp_offlane")

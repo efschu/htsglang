@@ -24,10 +24,24 @@ second change without going red. That is the bug net.
 REJECT ARMS. A reject arm is one whose configuration the server must refuse at
 boot, by name, before loading weights. A clean refusal is a PASS in this
 matrix: it proves the guard fires where it is decidable (arg resolution)
-rather than deep in a graph capture. Every #108 reject lands here, including
-the v1 draft-extend-not-implemented refusal, so that the day the draft-extend
-DCP split is built, ``reject_dcp_draftextend`` flips to a boot arm and the
-matrix tells us the guard text is now stale.
+rather than deep in a graph capture.
+
+A reject arm must be refused by ITS OWN guard, and ``reject_markers`` is what
+says which one. Sweep 1 pinned two arms with a single loose marker each and
+both reported PASS while dying on an unrelated guard they never meant to test
+-- ``reject_dcp_offload`` on the ``KVSO_ALLOW_SPEC`` bring-up gate,
+``reject_dcp_crossalgo`` on a missing ``--force``. Every marker set here now
+names the crossing (the DCP flag AND the flag it is crossed with), and
+``first_refusal`` requires all of them in ONE refusal message.
+
+That mechanism worked as designed on ``reject_dcp_draftextend`` and the arm is
+gone because of it: #108 slice 2 REMOVED the draft-extend refusal (the split
+it was waiting for now exists), the arm went red for asserting a guard that no
+longer fires, and the honest repair is to pin the contract that replaced it.
+``M_dcp_draftextend`` is that arm -- a BOOT arm declaring
+``draft_kv_layout='dcp'``, so a silent fallback to ``replicated`` is what goes
+red now. A net that keeps asserting a deleted refusal reports a defect every
+run and teaches everyone to stop reading it.
 
 FLAG / ENV SPELLINGS are current (post-#358 barlink rename). The r3 record
 used the old ``SGLANG_HTCCL*`` spelling; those runs are dated measurements and
@@ -67,6 +81,15 @@ class Arm:
     env: Mapping[str, str] = field(default_factory=dict)
     #: Extra launch flags beyond the base recipe.
     flags: Tuple[str, ...] = ()
+    #: Base flags to REMOVE before ``flags`` are appended, with their values.
+    #:
+    #: Appending a later flag is enough to OVERRIDE a base one under argparse,
+    #: but not to UNSET it, and sweep 1 paid for that difference: arm H meant
+    #: "no speculation" and wrote ``--speculative-algorithm none``, which does
+    #: not disable anything -- ``speculative_algorithm`` is a free-form string
+    #: and "none" is simply an algorithm name nobody registered. The arm has
+    #: to take the base spec flags away instead of talking over them.
+    drop_flags: Tuple[str, ...] = ()
     #: BOOT arms: the resolved facts :func:`report_effective` must confirm.
     #: Keys are :class:`EffectiveConfig` field names; a mismatch is a FAIL.
     expect: Mapping[str, object] = field(default_factory=dict)
@@ -166,6 +189,11 @@ ARMS: Tuple[Arm, ...] = (
     Arm(
         name="B_offload",
         axis="kv-session-offload x spec",
+        # KVSO_ALLOW_SPEC is the spill+MTP bring-up gate (server_args
+        # _handle_kv_session_offload). Crossing offload with spec IS the gated
+        # combination, so an arm that does not opt in cannot boot -- sweep 1
+        # lost five arms to exactly this.
+        env={"KVSO_ALLOW_SPEC": "1"},
         catches=(
             "host-RAM KV spill breaking the resident spec chain, or its P2 "
             "budget silently not engaging"
@@ -183,6 +211,9 @@ ARMS: Tuple[Arm, ...] = (
         ),
         flags=(
             "--speculative-cross-algorithm",
+            # Documented "(required)" on the flag itself; its default None is
+            # refused by parse_cross_force. 'nextn' is the least exotic rung.
+            "--speculative-cross-algorithm-force", "nextn",
             "--speculative-cross-algorithm-lazy-capture",
         ),
         expect=_expect(cross_algorithm=True),
@@ -195,11 +226,13 @@ ARMS: Tuple[Arm, ...] = (
             "the spec-in-tick draft surgery colliding with a rung swap -- two "
             "features writing the draft KV on the same tick"
         ),
+        env={"KVSO_ALLOW_SPEC": "1"},
         flags=(
             "--enable-kv-session-offload",
             "--kv-session-offload-spec-in-tick",
             "--kv-session-offload-host-ram-gib", "8",
             "--speculative-cross-algorithm",
+            "--speculative-cross-algorithm-force", "nextn",
         ),
         expect=_expect(offload=True, cross_algorithm=True),
         coherence="byte+graded",
@@ -223,12 +256,14 @@ ARMS: Tuple[Arm, ...] = (
             "appears when several features are live at once; the single "
             "highest-value arm in the matrix"
         ),
-        env={"SGLANG_BARLINK": "1", "SGLANG_BARLINK_TRANSPORT": "device"},
+        env={"SGLANG_BARLINK": "1", "SGLANG_BARLINK_TRANSPORT": "device",
+             "KVSO_ALLOW_SPEC": "1"},
         flags=(
             "--enable-kv-session-offload",
             "--kv-session-offload-spec-in-tick",
             "--kv-session-offload-host-ram-gib", "8",
             "--speculative-cross-algorithm",
+            "--speculative-cross-algorithm-force", "nextn",
         ),
         expect=_expect(offload=True, cross_algorithm=True, barlink="device"),
         coherence="byte+graded",
@@ -241,11 +276,19 @@ ARMS: Tuple[Arm, ...] = (
             "born-spilled prefill sizing wrong when speculation is OFF -- the "
             "control that isolates PS2 from the spec path"
         ),
+        # Spec is REMOVED, not overridden: see Arm.drop_flags. This arm needs
+        # no KVSO_ALLOW_SPEC precisely because it is the no-spec control -- if
+        # it ever needs one, the gate has stopped meaning what it says.
+        drop_flags=(
+            "--speculative-algorithm",
+            "--speculative-num-steps",
+            "--speculative-eagle-topk",
+            "--speculative-num-draft-tokens",
+        ),
         flags=(
             "--enable-kv-session-offload",
             "--kv-session-offload-prefill",
             "--kv-session-offload-host-ram-gib", "8",
-            "--speculative-algorithm", "none",
         ),
         # spec off: this arm deliberately overrides the base spec flags.
         expect=_expect(offload=True, spec_algorithm=None, eagle_topk=None),
@@ -258,6 +301,7 @@ ARMS: Tuple[Arm, ...] = (
             "the DFLASH block draft's per-rank MLP shards misaligning under "
             "uneven TP while a spill is active"
         ),
+        env={"KVSO_ALLOW_SPEC": "1"},
         flags=(
             "--speculative-algorithm", "DFLASH",
             "--enable-kv-session-offload",
@@ -273,6 +317,7 @@ ARMS: Tuple[Arm, ...] = (
             "the P1 wave-back restore racing the PS2 prefill-spill carve -- "
             "two spill state machines on one pool"
         ),
+        env={"KVSO_ALLOW_SPEC": "1"},
         flags=(
             "--enable-kv-session-offload",
             "--kv-session-offload-prefill",
@@ -313,26 +358,37 @@ ARMS: Tuple[Arm, ...] = (
             "with the serving engine corrupting shared input buffers -- the "
             "DESIGN #121 store_kvcache index class"
         ),
-        flags=("--dual-group-lane", "--dual-group-lane-concurrent"),
+        # The lane's rank-local pool budget is mandatory -- server_args says
+        # so by name ("there is no fallback to --mem-fraction-static").
+        flags=("--dual-group-lane", "--dual-group-lane-budget-mib", "2048",
+               "--dual-group-lane-concurrent"),
         expect=_expect(dual_group_lane=True),
         coherence="graded_only",
         expected_seconds=300.0,
     ),
+    Arm(
+        name="M_dcp_draftextend",
+        axis="#108 --draft-kv-layout=dcp on its own covered lane (slice 2)",
+        catches=(
+            "the draft-EXTEND uneven-DCP split silently regressing to the "
+            "replicated layout, or the layout being admitted OFF its covered "
+            "lane. Replaces the v1 reject arm: slice 2 removed that refusal "
+            "(server_args, 'the blanket not-usable-yet refusal is gone'), so "
+            "the net must pin the contract that exists, not the one that was "
+            "deleted -- a matrix asserting a removed refusal reports a defect "
+            "every run and teaches everyone to ignore it"
+        ),
+        flags=("--draft-kv-layout", "dcp"),
+        # The trade #108 slice 2 documents: on the weighted lane with a
+        # one-layer chain draft the layout is admitted and the draft pool is
+        # token-sharded. Declaring draft_kv_layout='dcp' is the whole point --
+        # if the resolver silently falls back to 'replicated', the effective
+        # config says so and this arm goes red.
+        expect=_expect(draft_kv_layout="dcp"),
+        coherence="byte+graded",
+    ),
     # --- reject arms: the #108 draft-kv-dcp surface -----------------------
     # A clean refusal, at arg resolution, before weight load, is a PASS.
-    Arm(
-        name="reject_dcp_draftextend",
-        axis="#108 --draft-kv-layout=dcp on its own covered lane",
-        catches=(
-            "the v1 draft-extend-not-implemented guard going stale: the day "
-            "the draft-extend DCP split lands, this arm must be reclassified "
-            "to a boot arm, and a still-firing reject tells us it was missed"
-        ),
-        kind="reject",
-        flags=("--draft-kv-layout", "dcp"),
-        reject_markers=("--draft-kv-layout dcp", "draft-EXTEND"),
-        expected_seconds=60.0,
-    ),
     Arm(
         name="reject_dcp_topk",
         axis="#108 --draft-kv-layout=dcp x tree topk>1",
@@ -342,7 +398,7 @@ ARMS: Tuple[Arm, ...] = (
         ),
         kind="reject",
         flags=("--draft-kv-layout", "dcp", "--speculative-eagle-topk", "4"),
-        reject_markers=("--speculative-eagle-topk",),
+        reject_markers=("--draft-kv-layout dcp", "--speculative-eagle-topk"),
         expected_seconds=60.0,
     ),
     Arm(
@@ -354,7 +410,7 @@ ARMS: Tuple[Arm, ...] = (
         ),
         kind="reject",
         flags=("--draft-kv-layout", "dcp", "--enable-multi-layer-eagle"),
-        reject_markers=("--enable-multi-layer-eagle",),
+        reject_markers=("--draft-kv-layout dcp", "--enable-multi-layer-eagle"),
         expected_seconds=60.0,
     ),
     Arm(
@@ -366,6 +422,10 @@ ARMS: Tuple[Arm, ...] = (
         ),
         kind="reject",
         env={"SGLANG_UNEVEN_DCP": "0", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+        # --rank-auto-reserve-mib only applies with --rank-tp-ratio auto, and
+        # this arm pins an explicit ratio; sweep 1 died on that base flag
+        # before ever reaching the guard it exists to assert.
+        drop_flags=("--rank-auto-reserve-mib",),
         flags=("--draft-kv-layout", "dcp", "--rank-tp-ratio", "1,1,1"),
         reject_markers=("--draft-kv-layout dcp", "weighted"),
         expected_seconds=60.0,
@@ -378,8 +438,12 @@ ARMS: Tuple[Arm, ...] = (
             "the sharded draft pool relies on"
         ),
         kind="reject",
-        flags=("--draft-kv-layout", "dcp", "--speculative-cross-algorithm"),
-        reject_markers=("cross-algorithm",),
+        # --force is required by the cross-algo parser; without it this arm
+        # died there instead of at the DCP guard, and reported PASS anyway
+        # because "cross-algorithm" appeared in the wrong sentence.
+        flags=("--draft-kv-layout", "dcp", "--speculative-cross-algorithm",
+               "--speculative-cross-algorithm-force", "nextn"),
+        reject_markers=("--draft-kv-layout dcp", "--speculative-cross-algorithm"),
         expected_seconds=60.0,
     ),
     Arm(
@@ -390,8 +454,11 @@ ARMS: Tuple[Arm, ...] = (
             "token-sharded draft pool -- the #60 zero-page class"
         ),
         kind="reject",
+        # Opt into the spill+MTP gate so the boot reaches the DCP guard; sweep
+        # 1 stopped at the gate and passed on its sentence instead.
+        env={"KVSO_ALLOW_SPEC": "1"},
         flags=("--draft-kv-layout", "dcp", "--enable-kv-session-offload"),
-        reject_markers=("--enable-kv-session-offload",),
+        reject_markers=("--draft-kv-layout dcp", "--enable-kv-session-offload"),
         expected_seconds=60.0,
     ),
 )

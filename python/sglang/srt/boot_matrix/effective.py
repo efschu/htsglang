@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -186,13 +186,29 @@ def report_effective(log_text: str) -> EffectiveConfig:
     draft_m = re.search(r"draft_kv_layout='?([A-Za-z_]+)'?", log_text)
     draft_kv_layout = draft_m.group(1) if draft_m else None
 
-    # barlink: read the transport the process actually selected. The parallel
-    # state prints "barlink transport=<t>" when SGLANG_BARLINK engages; absence
-    # of that line with the collectives running means stock NCCL.
+    # barlink: the transport the groups ACHIEVED, which is not the same
+    # question as whether a transport came up.
+    #
+    # This used to match r"barlink[^\n]*transport[=: ]+([a-z0-9]+)" and read
+    # the word after "transport" -- on a real log that is the line
+    # "barlink device transport up", so the axis resolved to "up" and arm
+    # E_barlink failed against its own correct declaration of "device". The
+    # same log also carries "barlink shm transport up", so whichever came
+    # first would have won.
+    #
+    # The authoritative line is per group and names both sides:
+    #   barlink enabled for group 'tp:0': requested=device, ACHIEVED=device
+    # A group that fell back prints ACHIEVED=gloo there instead. Every group
+    # is read, not the first: if they DISAGREE the run is mixed, and a mixed
+    # run must not be flattened into one reassuring name -- that is the #366
+    # gate lesson. It is reported as "mixed:<a>+<b>" so the expect comparison
+    # fails loudly instead of silently matching one of them.
     barlink: Optional[str] = None
-    bl_m = re.search(r"barlink[^\n]*transport[=: ]+([a-z0-9]+)", log_text, re.I)
-    if bl_m:
-        barlink = bl_m.group(1).lower()
+    achieved = {m.lower() for m in re.findall(r"ACHIEVED=([A-Za-z0-9_]+)", log_text)}
+    if len(achieved) == 1:
+        barlink = achieved.pop()
+    elif len(achieved) > 1:
+        barlink = "mixed:" + "+".join(sorted(achieved))
     elif re.search(r"using nccl==", log_text):
         barlink = "nccl"
 
@@ -223,24 +239,66 @@ def report_effective(log_text: str) -> EffectiveConfig:
 
 
 def first_refusal(log_text: str, markers: List[str]) -> Optional[str]:
-    """The line that carries ALL the given markers, or None.
+    """The ONE refusal message that carries ALL the given markers, or None.
 
-    A reject arm's refusal must name its condition; the check confirms the
-    refusal fired by finding one line (or one contiguous ValueError message)
-    that carries every declared marker. Returns the matching line for the
-    report so a reader sees the exact text the guard emitted.
+    A reject arm must be refused by the guard its crossing names, and this
+    function is what decides whether that happened. It used to decide it far
+    too loosely: it asked whether every marker appeared ANYWHERE in the whole
+    log, then returned the first line carrying ANY ONE of them. Two of sweep
+    1's six reject arms passed on that -- ``reject_dcp_offload`` died on the
+    ``KVSO_ALLOW_SPEC`` bring-up gate and ``reject_dcp_crossalgo`` on a missing
+    ``--speculative-cross-algorithm-force``, neither of which is the crossing
+    the arm exists to prove, and both refusals happened to contain one marker.
+    A reject arm reporting PASS while never reaching its guard is worse than
+    no arm: it is a green light nobody earned.
+
+    So: all markers must land in ONE refusal message. A message may wrap over
+    several lines in a traceback, so the candidate is the contiguous block
+    beginning at a raised-error line and continuing through its indented
+    continuation lines -- the same shape argparse and ValueError produce.
     """
-    # A ValueError message can wrap across lines in a traceback; join so a
-    # multi-line message is matched as one string, but keep the first line that
-    # starts the ValueError for the report.
-    if not all(m in log_text for m in markers):
+    if not markers:
         return None
-    for line in log_text.splitlines():
-        if "ValueError" in line and any(m in line for m in markers):
-            return line.strip()[:300]
-    # markers all present but not on a single ValueError line: still a refusal,
-    # report the first marker-bearing line.
-    for line in log_text.splitlines():
-        if any(m in line for m in markers):
-            return line.strip()[:300]
+    for block, head in error_blocks(log_text):
+        if all(m in block for m in markers):
+            return head[:300]
     return None
+
+
+def error_blocks(log_text: str) -> List[Tuple[str, str]]:
+    """(joined message, first line) for each raised error in the log.
+
+    A block starts on a line naming an exception class and runs while the
+    following lines are continuations -- indented, or not starting a new
+    stamped/exception line. That keeps a wrapped message together without
+    swallowing the next unrelated one, which is exactly the difference between
+    asserting a guard and asserting the log.
+    """
+    starter = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*Error|SystemExit)\b\s*:")
+    lines = log_text.splitlines()
+    blocks: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(lines):
+        if not starter.search(lines[i]):
+            i += 1
+            continue
+        head = lines[i].strip()
+        parts = [head]
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if not nxt.strip():
+                break
+            if starter.search(nxt) or _SERVER_STAMP_RE.match(nxt.strip()):
+                break
+            if nxt.startswith((" ", "\t")) or not nxt.startswith("["):
+                parts.append(nxt.strip())
+                j += 1
+                continue
+            break
+        blocks.append((" ".join(parts), head))
+        i = j
+    return blocks
+
+
+_SERVER_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")

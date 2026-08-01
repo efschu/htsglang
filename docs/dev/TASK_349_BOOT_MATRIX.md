@@ -50,7 +50,7 @@ is the truncation-vs-comprehensiveness trap: a matrix nobody runs is no net).
 | J_waveback_ps2 | boot | wave-back × PS2 | two spill state machines racing on one pool |
 | K_bar1_graphs | boot | bar1 transport × CUDA graphs (#369) | bar1 peer-VRAM staying graph-captured |
 | L_video_cotenancy | boot | video / dual-lane co-tenancy | a second lane corrupting shared input buffers (#121) |
-| reject_dcp_draftextend | reject | #108 dcp on its own lane | the v1 draft-extend guard going stale |
+| M_dcp_draftextend | boot | #108 dcp on its own covered lane (slice 2) | the draft-EXTEND split regressing to `replicated`, or dcp admitted off-lane |
 | reject_dcp_topk | reject | #108 dcp × tree topk>1 | #76 + #108 topk guards both failing |
 | reject_dcp_multilayer | reject | #108 dcp × multi-layer EAGLE | multi-runner draft reaching the single-owner pool |
 | reject_dcp_offlane | reject | #108 dcp off the weighted lane | dcp admitted with no vector to shard by |
@@ -58,10 +58,18 @@ is the truncation-vs-comprehensiveness trap: a matrix nobody runs is no net).
 | reject_dcp_offload | reject | #108 dcp × kv-session-offload | raw-global-slot draft writes on a sharded pool (#60) |
 
 A REJECT arm is a PASS when the server refuses the configuration by name, at
-arg resolution, before weight load. `reject_dcp_draftextend` deliberately
-encodes the #108 v1 state: the day the draft-extend DCP split lands, this arm
-must be reclassified to a boot arm, and a still-firing reject tells us the
-guard text went stale — the matrix guards its own guards.
+arg resolution, before weight load — and by **its own** guard: every marker
+set names the crossing (the DCP flag *and* the flag it is crossed with), and
+`first_refusal` requires all of them in ONE refusal message. Sweep 1 shipped
+single loose markers and two arms reported PASS while dying on a guard they
+never meant to test.
+
+`reject_dcp_draftextend` is gone, and its removal is the mechanism working:
+#108 slice 2 deleted the draft-extend refusal, the arm went red for asserting
+a guard that no longer fires, and it was replaced by `M_dcp_draftextend`, a
+BOOT arm that declares `draft_kv_layout='dcp'`. A silent fallback to
+`replicated` is now what goes red. A net that keeps asserting a deleted
+refusal reports a defect every run and teaches everyone to stop reading it.
 
 ## report_effective() shape
 

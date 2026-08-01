@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 from sglang.srt.boot_matrix.arms import Arm, arm_by_name
-from sglang.srt.boot_matrix.check import FAIL, PASS, STOP, check_arm
+from sglang.srt.boot_matrix.check import FAIL, PASS, STOP, _scan_fatals, check_arm
 from sglang.srt.boot_matrix.effective import READY_MARKER
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -155,17 +155,122 @@ class TestBootArm(CustomTestCase):
 
 class TestRejectArm(CustomTestCase):
     def test_clean_refusal_is_pass(self):
-        arm = arm_by_name("reject_dcp_draftextend")
+        arm = arm_by_name("reject_dcp_offload")
         with tempfile.TemporaryDirectory() as d:
             log = (
                 _args_dump(draft_kv_layout="'dcp'")
-                + "\nValueError: --draft-kv-layout dcp is not usable yet: the "
-                "draft-EXTEND forward has no uneven-DCP metadata split.\n"
+                + "\nValueError: --draft-kv-layout dcp is not supported together "
+                "with --enable-kv-session-offload: the spilled session's draft "
+                "rows have no owner under the token-sharded rule.\n"
             )
             _write(d, arm=arm, boot_status="refused", log_text=log)
             v = check_arm(arm, d)
             self.assertEqual(v.status, PASS, v.reason)
             self.assertIsNotNone(v.refusal)
+
+    def test_a_refusal_from_an_UNRELATED_guard_is_a_fail(self):
+        """The false-pass falsifier. This is sweep 1's headline reject bug.
+
+        ``reject_dcp_offload`` died on the KVSO_ALLOW_SPEC bring-up gate --
+        which never mentions --draft-kv-layout and never tested the crossing --
+        and reported PASS, because the old matcher asked whether each marker
+        appeared ANYWHERE in the log and then returned any line carrying ANY
+        one of them. The message below is the real one, verbatim.
+        """
+        arm = arm_by_name("reject_dcp_offload")
+        with tempfile.TemporaryDirectory() as d:
+            log = (
+                _args_dump(draft_kv_layout="'dcp'")
+                + "\nValueError: --enable-kv-session-offload does not yet support "
+                "speculative decoding (--speculative-algorithm=NEXTN). Set "
+                "KVSO_ALLOW_SPEC=1 to opt into the spill+MTP bring-up path.\n"
+            )
+            _write(d, arm=arm, boot_status="refused", log_text=log)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, FAIL, v.reason)
+
+    def test_markers_split_across_two_unrelated_messages_is_a_fail(self):
+        """Both markers present in the LOG, neither guard the arm's own."""
+        arm = arm_by_name("reject_dcp_crossalgo")
+        with tempfile.TemporaryDirectory() as d:
+            log = (
+                _args_dump(draft_kv_layout="'dcp'")
+                + "\nValueError: --speculative-cross-algorithm: --speculative-"
+                "cross-algorithm-force must be 'nextn', 'dflash', ...; got None.\n"
+                "\n[2026-08-01 00:00:00] note: --draft-kv-layout dcp requested\n"
+            )
+            _write(d, arm=arm, boot_status="refused", log_text=log)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, FAIL, v.reason)
+
+    def test_a_wrapped_refusal_message_still_matches(self):
+        """A guard whose sentence wraps must not be split into two blocks."""
+        arm = arm_by_name("reject_dcp_multilayer")
+        with tempfile.TemporaryDirectory() as d:
+            log = (
+                _args_dump(draft_kv_layout="'dcp'")
+                + "\nValueError: --draft-kv-layout dcp is not supported with\n"
+                "    --enable-multi-layer-eagle: multi-layer EAGLE holds one\n"
+                "    draft model runner per chain position.\n"
+            )
+            _write(d, arm=arm, boot_status="refused", log_text=log)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, PASS, v.reason)
+
+    def test_an_ignored_import_traceback_is_not_a_fatal(self):
+        """Verbatim from K_bar1_graphs/server.log, which served correctly.
+
+        The image ships torchcodec without a matching ffmpeg, so every
+        containerised boot prints this block -- sweep 1 scored a healthy
+        bar1-under-graphs arm FAIL on it, and bar1 arms can ONLY run in that
+        image.
+        """
+        arm = arm_by_name("A_default")
+        with tempfile.TemporaryDirectory() as d:
+            log = (
+                _args_dump()
+                + "\n[2026-08-01 07:23:08] Ignore import error when loading "
+                "sglang.srt.multimodal.processors.mimo_audio: Could not load "
+                "libtorchcodec. Likely causes:\n"
+                "        The following exceptions were raised as we tried to "
+                "load libtorchcodec:\n"
+                "[start of libtorchcodec loading traceback]\n"
+                "FFmpeg version 8:\n"
+                "Traceback (most recent call last):\n"
+                '  File "/usr/local/lib/python3.12/dist-packages/torch/_ops.py", '
+                "line 1503, in load_library\n"
+                "    ctypes.CDLL(path)\n"
+                "OSError: libavutil.so.60: cannot open shared object file\n"
+                "[2026-08-01 07:23:10] Load weight begin.\n"
+                + READY_MARKER
+                + "\n"
+            )
+            _write(d, arm=arm, boot_status="ready", log_text=log)
+            v = check_arm(arm, d)
+            # Asserted against the fatal detector specifically, not against the
+            # whole verdict: this synthetic log does not carry A_default's
+            # geometry lines, so the effective-config comparison has its own
+            # (correct) opinion. What must not happen is the ignored block
+            # being reported as a fatal.
+            self.assertNotIn("fatal", v.reason, v.reason)
+            self.assertIsNone(_scan_fatals(log))
+
+    def test_a_real_fatal_after_ready_is_still_a_fatal(self):
+        """The ignore-frame must not become a blanket amnesty."""
+        arm = arm_by_name("A_default")
+        with tempfile.TemporaryDirectory() as d:
+            log = (
+                _args_dump()
+                + "\n[2026-08-01 07:23:08] Ignore import error when loading "
+                "sglang.srt.multimodal.processors.mimo_audio: nope\n"
+                "Traceback (most recent call last):\n"
+                "[2026-08-01 07:23:10] Load weight begin.\n"
+                + READY_MARKER
+                + "\n[2026-08-01 07:30:00] NCCL error: unhandled system error\n"
+            )
+            _write(d, arm=arm, boot_status="ready", log_text=log)
+            v = check_arm(arm, d)
+            self.assertEqual(v.status, FAIL, v.reason)
 
     def test_a_config_that_must_refuse_but_booted_is_fail(self):
         arm = arm_by_name("reject_dcp_topk")
