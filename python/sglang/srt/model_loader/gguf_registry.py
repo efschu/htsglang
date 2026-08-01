@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 _FAMILIES: Tuple[Tuple[str, str, str], ...] = (
     ("qwen35", "sglang.srt.model_loader.gguf_qwen35", "Qwen35GGUFAdapter"),
     ("gemma4", "sglang.srt.model_loader.gguf_gemma4", "Gemma4GGUFAdapter"),
+    ("deepseek4", "sglang.srt.model_loader.gguf_deepseek4", "Deepseek4GGUFAdapter"),
 )
 
 # (module_path, attribute) of checkpoints that need the sibling config.json but
