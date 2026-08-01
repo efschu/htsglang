@@ -696,6 +696,88 @@ class TestPerPositionDigestsNarrowTheLocalisationToAToken(_Base):
         h.spec_round()
         self.assertNotIn("kv_pos", h.records()[0])
 
+    def test_the_aggregate_is_the_digest_of_the_positions_in_logical_order(self):
+        """Map-independence as a construction, not as an assurance.
+
+        The aggregate ``kv`` is derived from the per-position digests, which
+        are addressed by ``req_to_token[idx, p]``. Pinning the identity here is
+        what makes "two jobs that drew different slots hash the same" a thing
+        the code cannot stop doing rather than a thing it happens to do.
+        """
+        import hashlib
+
+        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        h = _Harness()
+        h.spec_round()
+        rec = h.records()[0]
+        want = hashlib.blake2b(
+            "|".join(rec["kv_pos"]).encode(), digest_size=16
+        ).hexdigest()
+        self.assertEqual(rec["kv"], want)
+
+
+class TestTheNumericCrossJobFingerprints(_Base):
+    """The fields that join two jobs on a stack that is not bitwise stable.
+
+    The 2026-08-02 window measured a 100 % byte-dirty floor between two no-spec
+    reference jobs. A reading with no tolerance cannot survive that, so the
+    probe records a float32 sum and absmax beside every digest and the reader
+    compares them against a MEASURED floor. What is checked here is the
+    separation the whole scheme rests on: a last-bit difference and a leaked
+    row are indistinguishable to the digest and an order of magnitude apart to
+    the number.
+    """
+
+    def _deviation(self, a, b):
+        scale = max(abs(a[0]), abs(b[0]), abs(a[1]), abs(b[1]), 1e-9)
+        return max(abs(x - y) for x, y in zip(a, b)) / scale
+
+    def test_each_surface_carries_a_numeric_fingerprint(self):
+        _on()
+        h = _Harness()
+        h.spec_round()
+        rec = h.records()[0]
+        self.assertEqual(len(rec["kv_num"]), rec["committed_len"])
+        self.assertEqual(len(rec["kv_num"][0]), 2)
+        self.assertEqual(len(rec["conv_num"]), 2)
+        self.assertEqual(len(rec["ssm_num"]), 2)
+
+    def test_two_jobs_with_different_slots_agree_numerically(self):
+        _on()
+        a = _Harness(slot_base=1)
+        b = _Harness(slot_base=257)
+        a.spec_round()
+        b.spec_round()
+        self.assertEqual(a.records()[0]["kv_num"], b.records()[0]["kv_num"])
+        self.assertEqual(a.records()[0]["conv_num"], b.records()[0]["conv_num"])
+
+    def test_a_last_bit_difference_breaks_the_digest_and_not_the_number(self):
+        """The defect class the cross-job reading was drowning in."""
+        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        h = _Harness()
+        h.spec_round()
+        before = h.records()[0]
+        slot = int(h.pool.req_to_token[0, 3].item())
+        value = h.kv.k[0][slot][1, 2]
+        value += float(value.item()) * 1e-6
+        h.spec_round()
+        after = h.records()[1]
+        self.assertNotEqual(before["kv_pos"][3], after["kv_pos"][3])
+        self.assertLess(self._deviation(before["kv_num"][3], after["kv_num"][3]), 1e-3)
+
+    def test_a_leaked_row_moves_the_number_by_an_order_of_magnitude_more(self):
+        _on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+        h = _Harness()
+        h.spec_round()
+        before = h.records()[0]
+        slot = int(h.pool.req_to_token[0, 3].item())
+        h.kv.k[0][slot].fill_(999.0)
+        h.spec_round()
+        after = h.records()[1]
+        self.assertGreater(
+            self._deviation(before["kv_num"][3], after["kv_num"][3]), 0.1
+        )
+
 
 class TestTheRungSchedule(_Base):
     """``spec_steps`` as a LIST: the only shape that is mixed-rung by design.
