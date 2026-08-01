@@ -1,0 +1,68 @@
+{
+  "near_tie_threshold_nats": 0.05,
+  "prompts": [
+    {
+      "prompt": "alphabet",
+      "classification": "content_divergence",
+      "first_divergent_index": 63,
+      "n_out_nospec": 64,
+      "n_out_spec": 64,
+      "spec_accept_length": 1.2549019607843137,
+      "graded": {
+        "nospec": {
+          "score": 4,
+          "max_score": 4
+        },
+        "spec": {
+          "score": 4,
+          "max_score": 4
+        },
+        "delta": 0
+      },
+      "margin_at_divergence": 0.25,
+      "margin_context": {
+        "rank_from_smallest": 0,
+        "n_positions": 64,
+        "pool_min": 0.25,
+        "pool_median": 10.5,
+        "pool_max": 13.4375
+      },
+      "perturbation_band": {
+        "n": 63,
+        "max": 1.0,
+        "median": 0.125,
+        "p90": 0.375
+      },
+      "inside_band": true,
+      "near_tie": false,
+      "explained_by_numerics": true,
+      "ref_top2": {
+        "nospec_token": 248044,
+        "spec_token": 198
+      }
+    },
+    {
+      "prompt": "squares",
+      "classification": "identical",
+      "first_divergent_index": null,
+      "n_out_nospec": 64,
+      "n_out_spec": 64,
+      "spec_accept_length": 1.1428571428571428,
+      "graded": {
+        "nospec": {
+          "score": 8,
+          "max_score": 8
+        },
+        "spec": {
+          "score": 8,
+          "max_score": 8
+        },
+        "delta": 0
+      }
+    }
+  ],
+  "judged_prompts": 2,
+  "diverging_prompts": 1,
+  "explained_by_numerics": 1,
+  "world": "A: stock speculation leaves the stock greedy trajectory WITHOUT any lane, and every flip sits inside the measured batch-shape perturbation band -- the mechanism is numerics, not the lane"
+}

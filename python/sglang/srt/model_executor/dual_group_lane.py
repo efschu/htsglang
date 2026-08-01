@@ -1738,6 +1738,11 @@ class DualGroupLane:
         self._stop = threading.Event()
         self._idle_since: Optional[float] = time.monotonic()
         self._last_wall_ms: Optional[float] = None
+        #: Top-2 logit margin of the last committed plain-decode token, or
+        #: None. Only written under SGLANG_LANE_MARGIN_PROBE (see
+        #: _margin_probe_on); the commit sites read it right after the
+        #: forward that produced it.
+        self._last_margin: Optional[float] = None
         self._busy = False
         self._admission_waits: List[float] = []
         self.lending = None  # set by the scheduler when stage-2 lending is on
@@ -2452,6 +2457,37 @@ class DualGroupLane:
         )
         return batch
 
+    # -- top-2 margin probe (env-gated, off by default) --------------------
+    #
+    # #284 -> r12: whether a speculative flip is inherent batch-shape numerics
+    # or a defect is decided by the top-2 LOGIT MARGIN at the flipped
+    # position. The r12 control answered that for stock NEXTN over
+    # /generate's logprob channel, but the lane commits its tokens itself and
+    # reports only ``output_ids``, so the same question could not be asked of
+    # the lane. This records the margin at every position the lane COMMITS.
+    #
+    # Off by default and gated on an env var for the reason the row oracle is:
+    # it costs a topk over the vocabulary and a device read per committed
+    # token, which is real money on a decode path whose whole point is round
+    # time. Nothing reads ``_margins`` unless the flag is set.
+    def _margin_probe_on(self) -> bool:
+        return bool(os.environ.get("SGLANG_LANE_MARGIN_PROBE"))
+
+    @staticmethod
+    def _top2_margin(next_token_logits) -> float:
+        """logit(top1) - logit(top2) for row 0, as a float.
+
+        Logits, not logprobs: softmax is shift-invariant, so the gap between
+        the two best entries is the same quantity either way, and this side
+        already holds the logits.
+        """
+        top2 = torch.topk(next_token_logits[0], 2)
+        return float(top2.values[0].item() - top2.values[1].item())
+
+    def _record_margin(self, job, value) -> None:
+        if value is not None:
+            job.setdefault("_margins", []).append(round(float(value), 6))
+
     def _timed_forward_raw(self, batch, capture_mode=None):
         """A lane forward that returns the LOGITS OUTPUT instead of sampled
         ids -- the verify path needs the per-candidate argmax and the hidden
@@ -2512,6 +2548,11 @@ class DualGroupLane:
             forward_batch = ForwardBatch.init_new(batch, runner)
             logits_output = runner.forward(forward_batch).logits_output
             next_token_ids = runner.sample(logits_output, forward_batch)
+            self._last_margin = (
+                self._top2_margin(logits_output.next_token_logits)
+                if self._margin_probe_on()
+                else None
+            )
             torch.cuda.synchronize(runner.gpu_id)
             ms = (time.perf_counter() - t0) * 1000.0
             self.device_clock.add_device_ms(ms)
@@ -2524,6 +2565,11 @@ class DualGroupLane:
         forward_batch = ForwardBatch.init_new(batch, runner)
         logits_output = runner.forward(forward_batch).logits_output
         next_token_ids = runner.sample(logits_output, forward_batch)
+        self._last_margin = (
+            self._top2_margin(logits_output.next_token_logits)
+            if self._margin_probe_on()
+            else None
+        )
         end_ev.record(self.stream)
         self._submitted.set()
         self.stream.synchronize()
@@ -3275,6 +3321,7 @@ class DualGroupLane:
         total_ms = 0.0
         n_accept = 0
         preds: List[int] = []
+        row_margins: List[float] = []
         hidden = None
         for i, tok in enumerate(cand):
             batch.input_ids = torch.tensor(
@@ -3284,12 +3331,19 @@ class DualGroupLane:
             out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.LAST)
             total_ms += ms
             preds.append(int(out.next_token_logits.argmax(dim=-1)[0].item()))
+            if self._margin_probe_on():
+                row_margins.append(self._top2_margin(out.next_token_logits))
             hidden = out.hidden_states[-1:]
             if i >= len(proposals) or preds[i] != proposals[i]:
                 break
             n_accept += 1
 
         emitted = list(proposals[:n_accept]) + [preds[n_accept]]
+        # One margin per EMITTED token: verify row i is the forward that
+        # decided emitted[i], so the two lists line up by construction and
+        # the tail of row_margins (rows past the first rejection) is dropped.
+        for m in row_margins[: len(emitted)]:
+            self._record_margin(job, m)
         job["_kv_len"] = n_cached + n_accept + 1
         job["_hidden"] = hidden
         job["_next"] = torch.tensor(
@@ -3871,6 +3925,7 @@ class DualGroupLane:
         job["prefill_wall_ms"] = self._last_wall_ms
         self.work_total["prefill_tokens"] += len(job["input_ids"])
         job["output_ids"].append(int(next_token_ids[0].item()))
+        self._record_margin(job, self._last_margin)
         job["_batch"] = batch
         job["_next"] = next_token_ids
         # Captured NOW for the cleanup: the batch's req list is not stable
@@ -4101,6 +4156,7 @@ class DualGroupLane:
         next_token_ids, ms = self._timed_forward(batch)
         job["decode_ms"].append(ms)
         job["output_ids"].append(int(next_token_ids[0].item()))
+        self._record_margin(job, self._last_margin)
         job["_next"] = next_token_ids
         self.work_total["decode_tokens"] += 1
 
@@ -4225,6 +4281,11 @@ class DualGroupLane:
                 round(sum(accepts) / len(accepts), 3) if accepts else None
             ),
             "output_ids": job["output_ids"],
+            # Present only under SGLANG_LANE_MARGIN_PROBE=1. One entry per
+            # committed token, aligned with output_ids, so r12's verdict.py
+            # can read a lane flip against the lane's OWN perturbation band
+            # instead of against stock's by analogy.
+            **({"margins": job["_margins"]} if job.get("_margins") else {}),
             "prefill_ms": round(job["prefill_ms"], 2),
             "decode_ms_mean": (
                 round(sum(decode_ms) / len(decode_ms), 3) if decode_ms else None

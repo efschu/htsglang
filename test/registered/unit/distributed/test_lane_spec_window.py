@@ -108,6 +108,20 @@ class FakeServer:
         self.decode_tokens += len(ids)
 
 
+#: A scorable id -> letter map for the stubbed detokenizer.
+#:
+#: The gate grades the four arms since the r12 control (#284), so a test that
+#: drives it with opaque ids has to say what those ids MEAN as text -- an
+#: identity check needed no tokenizer, a graded one does. The map is chosen so
+#: the `alphabet` scorer can see a difference: 7/8/9/10 are the determined
+#: tail w/x/y/z and 99 is a wrong letter.
+_ID_TEXT = {7: "w", 8: "x", 9: "y", 10: "z", 99: "q"}
+
+
+def _fake_detokenize(ids, tokenizer_path):
+    return "\n".join(_ID_TEXT.get(i, "?") for i in ids)
+
+
 class _Patched:
     def __init__(self, server):
         self.server = server
@@ -119,6 +133,8 @@ class _Patched:
             self._saved[(mod, "_post")] = getattr(mod, "_post", None)
             mod._get = self.server.get
             mod._post = self.server.post
+        self._saved[(window, "detokenize")] = getattr(window, "detokenize", None)
+        window.detokenize = _fake_detokenize
         return self.server
 
     def __exit__(self, *exc):
@@ -187,13 +203,40 @@ class TestGateVerdict(CustomTestCase):
         self.assertTrue(got["prompts"]["alphabet"]["spec_matches_no_spec"])
         self.assertIsNone(got["prompts"]["alphabet"]["first_divergent_index"])
 
-    def test_a_speculative_arm_that_differs_is_divergent_and_says_where(self):
+    def test_a_speculative_arm_that_scores_worse_is_divergent_and_says_where(self):
+        # w x q instead of w x y: the divergence costs a point, so it fails.
         def out_ids(job):
             return [7, 8, 99] if job.get("spec") else [7, 8, 9]
 
         got = self._run(out_ids)
         self.assertEqual(got["verdict"], "divergent")
         self.assertEqual(got["prompts"]["alphabet"]["first_divergent_index"], 2)
+        self.assertEqual(got["prompts"]["alphabet"]["graded_delta"], -1)
+
+    def test_a_divergence_that_costs_nothing_is_coherent(self):
+        """The r12 control, as a rule (#284 -> docs/dev/ANALYSE_284...).
+
+        Stock NEXTN leaves the stock greedy trajectory on this vehicle with no
+        lane in the process, at the smallest top-2 margin of the run and at an
+        identical graded score. A gate that failed on that was measuring the
+        margin at one position. Different tokens, same score -> coherent, and
+        the token-identity rate says the tokens differed.
+        """
+        # w x y z then a flip: the determined tail is complete on both arms,
+        # so the flip lands where the task no longer determines an answer --
+        # which is exactly where the rig measured it (index 63 of 64, after
+        # the alphabet had already ended).
+        def out_ids(job):
+            return [7, 8, 9, 10, 8] if job.get("spec") else [7, 8, 9, 10, 99]
+
+        got = self._run(out_ids)
+        prompt = got["prompts"]["alphabet"]
+        self.assertEqual(prompt["classification"], "content_divergence")
+        self.assertEqual(prompt["first_divergent_index"], 4)
+        self.assertEqual(prompt["graded_delta"], 0)
+        self.assertTrue(prompt["graded_within_band"])
+        self.assertEqual(got["verdict"], "coherent")
+        self.assertEqual(got["token_identity_rate"], 0.0)
 
     def test_one_extra_token_at_the_end_is_not_a_divergence(self):
         # A speculative round emits accept+1 tokens as a BLOCK, so the last
@@ -247,9 +290,9 @@ class TestGateVerdict(CustomTestCase):
         self.assertEqual(got["verdict"], "void")
         self.assertEqual(got["judged_prompts"], 0)
 
-    def test_a_reproducible_divergence_still_fails_the_gate(self):
-        # The counterpart: when BOTH floors hold and the arms still disagree,
-        # nothing explains it away and the gate is red.
+    def test_a_reproducible_divergence_that_costs_score_fails_the_gate(self):
+        # The counterpart: BOTH floors hold, the arms disagree AND the answer
+        # got worse. Nothing explains that away and the gate is red.
         def out_ids(job):
             return [7, 99, 9] if job.get("spec") else [7, 8, 9]
 
