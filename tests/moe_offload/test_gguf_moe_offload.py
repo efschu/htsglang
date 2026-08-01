@@ -259,7 +259,16 @@ def _gguf_layer(num_owned=E, expert_shard=False, declared_w2_type=None):
         # attribute access; re-wrap so the stub keeps it a staticmethod.
         _gguf_expert_source = staticmethod(FusedMoE._gguf_expert_source)
         _gguf_moe_offload_eligible = FusedMoE._gguf_moe_offload_eligible
+        _gguf_moe_offload_eligible_uncached = (
+            FusedMoE._gguf_moe_offload_eligible_uncached
+        )
         _finish_gguf_moe_offload_staging = FusedMoE._finish_gguf_moe_offload_staging
+        # #391c streaming door. Present on the stub so the pull-path tests
+        # below exercise the SAME materialize_gguf_weights the server runs,
+        # drain call included.
+        _GGUF_SHARD_TO_ATTR = FusedMoE._GGUF_SHARD_TO_ATTR
+        _drain_gguf_stream_stagers = FusedMoE._drain_gguf_stream_stagers
+        _gguf_cold_shard_context = FusedMoE._gguf_cold_shard_context
 
     layer = _StubGGUFMoELayer()
     layer.layer_id = 7

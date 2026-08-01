@@ -86,6 +86,8 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 | `SGLANG_GGUF_MXFP4_REPACK` | leave unset (default on); `0` only to refuse MXFP4 | repacks GGUF MXFP4 (ggml type 39) tensors to Q5_0 while the weight stream is read (`model_loader/gguf_mxfp4_repack.py`). Value-exact — every element dequantizes to the same fp32 number — and it is the only reason a checkpoint carrying MXFP4 boots at all: no GGUF kernel dispatches on type 39. It costs 22/17 = 1.294x the bytes of the repacked tensors, in host RAM and in VRAM; the boot log states the exact inflation. Set to `0` and the load is refused by name instead — there is no silent middle ground. See section 4.5.3 |
+| `SGLANG_MOE_GGUF_STREAM_STAGING` | leave unset (default on); `0` only to reproduce the pre-#391c load | GGUF MoE expert offload only. On, each expert is copied into its resident slot or its pinned host row **as it leaves the weight stream** and dropped, so the load's host peak is the pinned tier plus one layer's incomplete expert set. Off, the loader accumulates the complete owned expert set in host RAM first and the residency plan only acts on it at `process_weights_after_loading` — which is what OOM-killed the DeepSeek-V4-Flash boot at 90.7 GiB of anon on this 98.5 GiB swapless box. Consulted only when the offload already covers the layer, so a default GGUF boot is byte-identical either way. See section 4.6 |
+| `SGLANG_MOE_STAGING_TRACE` | `1` for diagnosis only | one INFO line per MoE layer, emitted **during** the load at the layer's staging boundary, carrying the stager's own cumulative byte accounting (streamed / resident / pinned-host / delegated, in-flight now and peak, and peak host held). Line prefix `[moe-staging-trace]`. This is what an external RAM monitor's anon curve is cross-checked against — the cumulative `pinned(host)` figure should track it, and `in-flight peak` is the bulge it is allowed |
 | `SGLANG_MM_FRONTEND_GPU_PREPROCESS` | leave unset (default off) | `1` lets the GPU-passive tokenizer process preprocess multimodal data on `base_gpu_id` again (nvJPEG decode, fast-image-processor resize/normalize, pinned video frames) — the pre-#403 behavior. The context it opens is invisible to every per-rank budget and to `--rank-auto-reserve-mib`; if you set this, subtract it from rank 0 by hand. See section 6.8 |
 | `SGLANG_SP_CAPACITY_WEIGHTS` | comma-separated positive floats, one per SP rank (e.g. `1.0,0.46,0.46`) | diffusion lane (#333-M3) only. Switches `multimodal_gen`'s sequence-parallel `build_shard_plan` from the equal split to a capacity-weighted one: a faster card is handed a proportionally longer slice of the sequence. Unset (the default) keeps the equal-and-tail-padded split byte-for-byte. A wrong-length or malformed vector is a hard error, not a silent fallback. The registry's Class-2 adapter sets this from measured `gemm_tflops` when `launch.enable_uneven_sp` is on; see `docs/dev/DESIGN_333_M3_diffusion_lane.md` |
 | `SGLANG_MOE_HOST_SHARD_RATIO` | comma-separated positive floats, one per TP rank; on this rig the measured H2D figures `6.4,13,13` (gen4 x4 / x8 / x8) | MoE expert offload (#394) only, and only on a layer that shards experts on dim 0. Sizes each rank's share of the **cold** (host-tier) expert pool by its host→device bandwidth instead of splitting it equally, so a fetch wave's three links finish their shares at the same instant instead of waiting for the narrowest one. Note the direction: the weak link gets **fewer** cold experts — the inverse of a capacity split, because what is apportioned is link seconds, not work a card must have room for. Device residency, every per-card VRAM budget and every #400 ledger figure are untouched. Unset (the default) and the split is equal, byte-for-byte as before; the fallback chain is this variable → PCIe link width × generation per rank's card, resolved **by NVML UUID** through the #331 IdentityMap → equal. A wrong-length or malformed vector is a hard error, not a silent fallback. ANALYSE_393 §7.3/§7.4 has the 145 → 86 ms/token arithmetic |
@@ -978,35 +980,75 @@ the split happens. fp8 / GPTQ / AWQ split an expert stack that already exists
 (`presplit_expert_offload_after_repack`, after the repack); GGUF has no such
 stack — `GGUFUninitializedParameter` has no storage until
 `materialize_gguf_weights` stacks the loader's per-expert tensors, and that
-stack is itself the peak. So the GGUF half intercepts inside
-`materialize_gguf_weights`: it decides residency first, materializes the
-parameter at `[R+C]` slots, and streams every other expert straight into the
+stack is itself the peak. So the GGUF half decides residency first, materializes
+the parameter at `[R+C]` slots, and puts every other expert straight into the
 pinned host tier. The full `[E, ...]` stack is never formed on host or card.
+
+**Where that split happens is the #391c change.** It used to happen only in
+`materialize_gguf_weights`, which the loader calls from its
+`process_weights_after_loading` sweep — *after* the complete `load_weights`
+pass. So the plan was correct and arrived too late: every owned expert had
+already accumulated in `param.expert_data_map`, and on
+DeepSeek-V4-Flash `UD-Q3_K_XL` (126.19 GiB of post-repack experts, TP=3, one
+98.5 GiB swapless host, no swap) rank 0 was SIGKILLed mid-load at 90.7 GiB of
+anon climbing 0.61 GiB/s. The resident fraction had **zero** leverage on that
+peak; it only shaped the state after materialization.
+
+The staging now happens in the weight-loader callback
+(`FusedMoE._load_gguf_weight` → `_gguf_stream_stage`). The plan needs only
+config-level facts — expert count, resident fraction, the #82 pad expert, the
+#394 ratio — so it exists before the first tensor arrives, and each expert is
+routed the moment it leaves the stream: resident into its slot, cold into the
+pinned host row, delegated (#394) released without a copy. The load's host peak
+becomes **pinned tier + one layer's incomplete expert set + process baseline**,
+and the resident fraction becomes a real knob on it.
+
+The eligibility question is answerable that early because the GGUF iterator
+yields every `qweight_type` marker in a first pass, before a single payload
+byte, and the MXFP4→Q5_0 repack (4.5.3) rewrites marker and payload inside that
+iterator — so the types the callback reads are already the covered ones.
+
+`materialize_gguf_weights` is still the publishing point: it closes the stagers,
+hands the two tiers to `_moe_offload_presplit`, and is a no-op when called
+again.
 
 Acceptance lines, in this order:
 
-- one per MoE layer at materialization —
-  `GGUF MoE expert-offload staged at materialization on layer N: R/E experts
-  resident + C scratch slots, S experts in the pinned host tier; the full
-  expert stack was never allocated.`
+- one per MoE layer, **during** the load —
+  `GGUF MoE expert-offload staged at load time (streamed) on layer N: R/E
+  experts resident + C scratch slots, S experts in the pinned host tier; the
+  full expert stack was never allocated.`
+  (`staged at materialization` instead of `at load time (streamed)` means the
+  layer took the old accumulate door — check `SGLANG_MOE_GGUF_STREAM_STAGING`.)
 - then the usual `MoE expert-offload active on layer N: ...` from the
   installer, and one `[offload-kv-regain]` line.
 
 If only the second family of lines appears the layer took the old full-stack
 path; if neither appears the boot aborted at the #268 guard (see below).
 
+With `SGLANG_MOE_STAGING_TRACE=1` each layer additionally prints its
+`[moe-staging-trace]` line while the load runs, so the cumulative
+`pinned(host)` figure can be lined up against a `memory.current` / anon
+sampler second by second. The two must move together; if the monitor climbs
+while the trace's pinned figure does not, something outside the staging is
+holding the bytes.
+
 Coverage limits, all fail-fast, none silent:
 
 - **ggml type.** Only types with a GGUF MoE kernel are staged, i.e.
   `MMVQ_QUANT_TYPES` (which contains `MMQ_QUANT_TYPES`): Q4_0/Q4_1/Q5_0/Q5_1/
-  Q8_0/Q8_1, the K-quants, and the I-matrix types. **MXFP4 (type 39) is not in
-  any GGUF kernel set and is refused** — this is the open blocker for
-  DeepSeek-V4-Flash `UD-Q3_K_XL`, whose routed down projections are type 39
-  (#391). A layer whose `w13`/`w2` type is uncovered logs
+  Q8_0/Q8_1, the K-quants, and the I-matrix types. A layer whose `w13`/`w2`
+  type is uncovered logs
   `GGUF MoE expert-offload declined on layer N: ... has no GGUF MoE kernel`
   and then hits the #268 guard, which names the missing
   `_moe_offload_gguf_staged` marker. That abort is intentional: an uncovered
   GGUF checkpoint must not run half-tiered.
+  **MXFP4 (type 39) no longer reaches this test.** The load-time repack (4.5.3)
+  rewrites both the type marker and the payload to Q5_0 inside the weight
+  iterator, in the iterator's first and second pass respectively — so by the
+  time either offload door reads `w13_qweight_type` / `w2_qweight_type` the
+  types are already Q5_0 and covered. That is what unblocked DeepSeek-V4-Flash
+  `UD-Q3_K_XL`, whose routed down projections are natively type 39.
 - **CUDA only.** `GGUFMoEAscendMethod` has its own materialize/pre-dequantize
   path and is still refused outright.
 - **Uneven-TP expert-dim shard (#82).** Handled: the shard's trailing all-zero
@@ -1026,8 +1068,44 @@ reference decoder):
 
 ```bash
 CUDA_VISIBLE_DEVICES=99 PYTHONPATH=python \
-  python -m pytest tests/moe_offload/test_gguf_moe_offload.py -q
+  python -m pytest tests/moe_offload/test_gguf_moe_offload.py \
+                   tests/moe_offload/test_gguf_streaming_staging.py -q
 ```
+
+The second file is the #391c peak ledger: a synthetic 4-layer / 8-expert GGUF
+stream driven through the real loader callback, with the host bytes retained at
+every instant measured over real storages. Streaming holds 50.0% of the streamed
+set at its worst moment; the same stream with `SGLANG_MOE_GGUF_STREAM_STAGING=0`
+holds 100.0%, which is the can-fail companion the bound needs.
+
+**DeepSeek-V4-Flash `UD-Q3_K_XL`, TP=3 uneven — the recipe.** 126.19 GiB of
+post-repack experts across 43 MoE layers, three cards, one 98.5 GiB swapless
+host. The fraction is now a host-RAM knob, and `0.40` is the default to start
+from:
+
+```bash
+export SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.40   # 0.60 x 126.19 = 75.7 GiB pinned
+export SGLANG_MOE_SCRATCH_SLOTS=4                 # charged PER RANK: 4 x 11.74 MiB x 43
+export SGLANG_MOE_STAGING_TRACE=1                 # cross-check the RAM monitor
+export SGLANG_DSV4_FP4_EXPERTS=0
+
+setsid "$VENV/bin/python" -m sglang.launch_server \
+  --model-path "$MODEL_ROOT/DeepSeek-V4-Flash-0731-GGUF/UD-Q3_K_XL/DeepSeek-V4-Flash-0731-UD-Q3_K_XL-00001-of-00004.gguf" \
+  --tokenizer-path "$MODEL_ROOT/DeepSeek-V4-Flash-0731-tokenizer" \
+  --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio 30,17,17 \
+  --rank-gpu-memory-mib 29607,17780,17780 \
+  --kv-cache-dtype fp8_e4m3 \
+  --context-length 8192 --max-running-requests 1 \
+  --disable-cuda-graph --trust-remote-code --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+Host-RAM arithmetic to watch against: pinned 75.7 GiB + one layer's expert set
+~2.9 GiB + ~10 GiB process baseline = **~88.5 GiB peak** against 98.5 GiB. Under
+the pre-#391c door the same configuration peaks at the full 126.19 GiB + 10 GiB
+and cannot fit at any fraction. Raise the fraction to buy host headroom and
+spend VRAM; lower it for the reverse.
 
 ### 4.7 Pipeline parallelism intra-rig, uneven layer split (#201 slice 1)
 

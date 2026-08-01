@@ -1036,6 +1036,25 @@ class Envs:
     # (SGLANG_MOE_OFFLOAD_CUDA_GRAPH) are not counted -- counting them would
     # require the host sync that path exists to avoid; the dump flags this.
     SGLANG_EXPERT_STATS = EnvBool(False)
+    # #391c: fill the GGUF MoE offload's two tiers FROM THE WEIGHT STREAM.
+    # Without this the interception point is process_weights_after_loading,
+    # which the loader runs only after the complete load_weights pass -- so
+    # every owned expert first accumulates in host anon memory and the residency
+    # plan arrives too late to prevent the peak it exists to prevent (boot
+    # attempt 5 of #391: rank 0 OOM-killed at 90.7 GiB of anon on a swapless
+    # 98.5 GiB box). With it on, each expert is routed into its tier as it
+    # leaves the stream and the peak is pinned tier + one layer's expert set.
+    # Only ever consulted on a layer the offload already covers
+    # (SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 and a ggml type with a MoE
+    # kernel), so a default GGUF boot is byte-identical either way. Set to 0 to
+    # fall back to the accumulate-then-materialize path -- a debugging switch,
+    # not an operating mode.
+    SGLANG_MOE_GGUF_STREAM_STAGING = EnvBool(True)
+    # #391c: log the streaming stager's own byte accounting at every layer
+    # boundary (cumulative pinned/resident/streamed bytes plus the in-flight
+    # peak), so a boot's external RAM monitor can be cross-checked against what
+    # the code thinks it is holding. Off by default; pure logging.
+    SGLANG_MOE_STAGING_TRACE = EnvBool(False)
     # Dump prefix; each rank writes "<prefix>.<rank_tag>.json". Default /tmp.
     SGLANG_EXPERT_STATS_PATH = EnvStr("")
     # Additionally dump every N seconds (0 = only on exit / SIGUSR2).
