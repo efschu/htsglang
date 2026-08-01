@@ -1885,6 +1885,14 @@ class ModelRunnerKVCacheMixin:
             )
 
             _profiled = int(server_args.max_mamba_cache_size)
+            # #364 slice 3: preserve the PRE-CAP profiled slot count so the
+            # concurrency ceiling (max_running_requests) is sized from the
+            # SESSION budget, not from the shrunken resident pool. Without
+            # this, _resolve_max_num_reqs reads the capped max_mamba_cache_size
+            # and craters concurrency (capped_slots // ratio -> 4 // 5 = 0).
+            # The physical pool stays capped; only the admission ceiling
+            # decouples, and the overflow sessions run vacated.
+            self._gdn_profiled_state_slots = _profiled
             if cap_is_binding(_resident_cap, _profiled):
                 _capped = effective_state_slots(_profiled, _resident_cap)
                 logger.info(
@@ -4875,9 +4883,35 @@ class ModelRunnerKVCacheMixin:
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            # #364 slice 3: the concurrency ceiling is sized from the SESSION
+            # admission budget, not from the (possibly capped) resident pool.
+            # Off the cap this is exactly max_mamba_cache_size -- byte-
+            # identical. Under a binding --gdn-resident-state-slots the pool
+            # is physically smaller but sessions beyond the cap run with their
+            # state vacated by the between-tick runtime (armed by the same
+            # flag, hence vacate_available), so admission is sized from the
+            # pre-cap profiled slot count. The budget never exceeds that
+            # profiled count (the over-admission interlock: it was already
+            # profiled to fit), and the KV backing stays guarded by the
+            # token_capacity // 2 clamp above.
+            from sglang.srt.mem_cache.gdn_slot_ladder import (
+                session_admission_slots,
             )
+
+            _resident_cap = getattr(
+                self.server_args, "gdn_resident_state_slots", None
+            )
+            _profiled = getattr(
+                self, "_gdn_profiled_state_slots", None
+            )
+            if _profiled is None:
+                _profiled = self.server_args.max_mamba_cache_size
+            _budget_slots = session_admission_slots(
+                _profiled,
+                _resident_cap,
+                vacate_available=_resident_cap is not None,
+            )
+            max_num_reqs = min(max_num_reqs, _budget_slots // ratio)
 
             if max_num_reqs <= 0:
                 raise RuntimeError(

@@ -122,6 +122,50 @@ def freed_state_bytes(
     return max(0, dropped) * max(0, int(bytes_per_slot))
 
 
+def session_admission_slots(
+    profiled_slots: int,
+    resident_cap: Optional[int],
+    *,
+    vacate_available: bool,
+) -> int:
+    """State-slot count the CONCURRENCY ceiling is sized from under the cap.
+
+    ``max_running_requests`` is derived as ``slots // mamba_ratio``. Slice 1
+    caps the physical pool (``max_mamba_cache_size``) to ``resident_cap``, so
+    feeding that capped number here divides the concurrency ceiling by the
+    cap and craters it -- cap=4, ratio=5 -> ``4 // 5 = 0`` requests, cap=32 ->
+    ``max_running_requests`` 16 drops to 6 (#364 slice 3). That defeats the
+    ladder: sessions beyond the cap are meant to live with their state
+    VACATED to the spill pager, not to be refused admission.
+
+    The admission ceiling must therefore be sized from the SESSION budget,
+    which is the PRE-CAP profiled slot count -- exactly the concurrency the
+    un-capped pool would have admitted. Three properties, each a guard:
+
+    * It is NEVER more than ``profiled_slots``. The cap frees state VRAM to
+      the KV pool; it is not a licence to admit past what the memory that was
+      profiled to fit could back. This is the over-admission interlock: the
+      un-capped baseline was affordable, and we never exceed it.
+    * It is only raised above the resident cap when ``vacate_available`` --
+      the flag that caps the pool has also armed the between-tick vacate
+      runtime that backs the overflow (same flag, same boot). Without that
+      runtime the honest budget is the resident cap itself: fewer concurrent
+      sessions, never an admit-into-OOM.
+    * Off the cap (``resident_cap`` None or non-binding) it is the identity
+      on ``profiled_slots`` -- today's behaviour, byte-identical.
+
+    The KV side of "what can actually back the sessions" is not re-checked
+    here: ``_resolve_max_num_reqs`` already clamps ``max_num_reqs`` by
+    ``token_capacity // 2``, and that clamp is unchanged.
+    """
+    profiled = int(profiled_slots)
+    if resident_cap is None or not cap_is_binding(resident_cap, profiled):
+        return profiled
+    if vacate_available:
+        return profiled
+    return effective_state_slots(profiled, resident_cap)
+
+
 def vacate_plan(
     *,
     resident_slots: int,
