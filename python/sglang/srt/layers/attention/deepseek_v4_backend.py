@@ -51,6 +51,10 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
+from sglang.srt.layers.attention.flash_mla_arch import (
+    flash_mla_cuda_kernel_supported,
+    flash_mla_sparse_fwd_supported,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -69,7 +73,6 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -132,7 +135,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     # Per device, not device 0 (#343): the backend is built once per
     # ModelRunner, under that runner's own card.
-    if is_sm120_supported() or _is_xpu:
+    if not flash_mla_cuda_kernel_supported() or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1657,9 +1660,20 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            # Sparse prefill needs `flash_mla_sparse_fwd`, which exists only on
+            # SM90a/SM100f. Everywhere else the dense branch below runs instead:
+            # it is handed the same `swa_page_indices` / `swa_topk_lengths` the
+            # indexer produced, so no token is dropped -- the kernel changes,
+            # the attention support does not. (Upstream #30272 made the same
+            # move for SM120; the gate here is phrased per device so it covers
+            # Ampere in a heterogeneous group as well.)
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and flash_mla_sparse_fwd_supported(q.device.index)
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
             ):
                 return self._forward_prefill_sparse(
                     q=q,
@@ -1671,7 +1685,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if is_sm120_supported(q.device.index):
+            if not flash_mla_cuda_kernel_supported(q.device.index):
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

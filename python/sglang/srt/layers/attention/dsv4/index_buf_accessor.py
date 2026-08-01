@@ -84,7 +84,12 @@ def _set_k_and_s_triton(
     assert k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype)
+    # The nope half moves through this kernel as opaque bytes -- it is loaded
+    # and stored with no arithmetic in between -- so both ends are viewed as
+    # uint8 rather than as fp8. That is byte-identical on every architecture
+    # and keeps the kernel compilable below capability 8.9, where Triton
+    # rejects an fp8e4nv-typed argument outright (#417).
+    k_nope = k_nope.view(torch.uint8)
     buf_bf16 = buf.view(torch.bfloat16)
     buf_uint8 = buf.view(torch.uint8)
 
@@ -92,7 +97,7 @@ def _set_k_and_s_triton(
     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
-        buf_fp8,
+        buf_uint8,
         buf_bf16,
         buf_uint8,
         loc,
@@ -118,7 +123,7 @@ def _set_k_and_s_triton(
 
 @triton.jit
 def _set_k_and_s_triton_kernel(
-    buf_fp8_ptr,
+    buf_nope_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     loc_ptr,
@@ -146,7 +151,7 @@ def _set_k_and_s_triton_kernel(
     nope_range = tl.arange(0, BLOCK_NOPE)
     nope_mask = nope_range < NUM_NOPE_ELEMS_PER_TOKEN
     in_k_nope_offsets = token_id * k_nope_ptr_stride_0 + nope_range
-    k_nope = tl.load(k_nope_ptr + in_k_nope_offsets, mask=nope_mask, other=0.0)
+    k_nope = tl.load(k_nope_ptr + in_k_nope_offsets, mask=nope_mask, other=0)
 
     rope_range = tl.arange(0, BLOCK_ROPE)
     in_k_rope_offsets = token_id * k_rope_ptr_stride_0 + rope_range
@@ -180,7 +185,7 @@ def _set_k_and_s_triton_kernel(
         + scale_range
     )
 
-    tl.store(buf_fp8_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
+    tl.store(buf_nope_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
     tl.store(buf_bf16_ptr + out_k_rope_offsets, k_rope)
     tl.store(buf_uint8_ptr + out_s_offsets, k_scale, mask=scale_mask)
 
