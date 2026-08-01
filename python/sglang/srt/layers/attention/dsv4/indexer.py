@@ -17,6 +17,15 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.indexer_arch import (
+    BACKEND_AITER,
+    BACKEND_TILELANG,
+    BACKEND_TORCH,
+    capability_for_log,
+    deepgemm_indexer_supported,
+    resolve_paged_mqa_logits_backend,
+    warn_torch_indexer_substitution_once,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
@@ -33,7 +42,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -52,6 +60,61 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+
+
+def select_paged_mqa_logits_fn(*, device: torch.device, use_fp4_indexer: bool):
+    """Pick the indexer's paged-MQA-logits implementation for one device.
+
+    Split out of ``_forward_paged_indexer`` so the choice is testable on its
+    own -- it is the whole of Cut 3 (#417), and it is the kind of decision
+    that is easy to get quietly wrong on a heterogeneous group.
+    """
+    device_id = device.index if device.type == "cuda" else None
+
+    if use_fp4_indexer:
+        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
+        if not deepgemm_indexer_supported(device_id):
+            # Named refusal, not a fallback: there is no non-DeepGEMM
+            # implementation of the FP4 indexer, so there is nothing to fall
+            # back to. Routing an FP4 checkpoint at the FP8 torch path would
+            # read the index cache with the wrong layout and return numbers.
+            raise RuntimeError(
+                "DeepSeek V4 FP4 indexer requires DeepGEMM's "
+                f"fp8_fp4_paged_mqa_logits, which does not exist on device "
+                f"{device_id} (compute capability "
+                f"{capability_for_log(device_id)}). Serve an FP8 indexer "
+                "checkpoint on this architecture."
+            )
+        from deep_gemm import fp8_fp4_paged_mqa_logits
+
+        return fp8_fp4_paged_mqa_logits
+
+    backend = resolve_paged_mqa_logits_backend(device_id)
+    if backend == BACKEND_TILELANG:
+        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+            tilelang_fp8_paged_mqa_logits,
+        )
+
+        return tilelang_fp8_paged_mqa_logits
+    if backend == BACKEND_AITER:
+        return _aiter_fp8_paged_mqa_logits
+    if backend == BACKEND_TORCH:
+        if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            # Selected because DeepGEMM does not exist here, not because anyone
+            # asked for it. Say so, once per device.
+            warn_torch_indexer_substitution_once(device_id)
+        # The trimmed variant is the one this call site can use: it squeezes the
+        # trailing dim off `seq_lens`, which arrives 2-D here, and it walks only
+        # ceil(max_seq_len / 64) pages instead of the full capture-time
+        # page-table width. Despite its name nothing in it is SM120-specific.
+        # `fp8_paged_mqa_logits_torch` keeps its 1-D `seq_lens` assert and stays
+        # the reference implementation the kernel test compares against.
+        return fp8_paged_mqa_logits_torch_sm120
+
+    from deep_gemm import fp8_paged_mqa_logits
+
+    return fp8_paged_mqa_logits
 
 
 def fp8_paged_mqa_logits_torch(
@@ -443,6 +506,13 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        # ...and reject CUDA devices that have no DeepGEMM either. This branch
+        # calls `deep_gemm.fp8_mqa_logits` directly and has no torch twin, so
+        # unlike the paged path there is nothing to fall back to within it --
+        # the paged path is the fallback. Asked of the current device, which is
+        # this rank's own card after set_device (#343).
+        if not deepgemm_indexer_supported():
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -652,24 +722,12 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        indexer_device = q_indexer[0].device if use_fp4_indexer else q_indexer.device
         if use_fp4_indexer:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
-        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
-            fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
-                fn = fp8_paged_mqa_logits_torch_sm120
-            else:
-                fn = fp8_paged_mqa_logits_torch
-        else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+        fn = select_paged_mqa_logits_fn(
+            device=indexer_device, use_fp4_indexer=use_fp4_indexer
+        )
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
