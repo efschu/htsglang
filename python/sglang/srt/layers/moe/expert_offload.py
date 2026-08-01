@@ -397,6 +397,12 @@ class ExpertResidencyPlanner:
     # (default) the resident set is the static [0, resident_count) at slot==id.
     resident_ids: Optional[frozenset] = None
     resident_slot: Optional[Dict[int, int]] = None
+    # #394 link-proportional cold shard: cold experts a PEER rank's host tier
+    # owns. This rank has no spill-pool row for them, so routing one here is a
+    # caller bug (a layer that delegated without remapping foreign expert ids
+    # away). None on every path without a host-shard ratio -> one `is not None`
+    # per resolve on the default path.
+    delegated_ids: Optional[frozenset] = None
 
     def __post_init__(self):
         if self.scratch < 1:
@@ -444,6 +450,16 @@ class ExpertResidencyPlanner:
             resident = [e for e in needed_unique if e in self.resident_ids]
             spill = [e for e in needed_unique if e not in self.resident_ids]  # sorted
             resident_slot_of = {e: self.resident_slot[e] for e in resident}
+        if self.delegated_ids is not None:
+            foreign = [e for e in spill if e in self.delegated_ids]
+            if foreign:
+                raise RuntimeError(
+                    f"experts {foreign} were delegated to a peer rank's host "
+                    f"tier by the #394 link-proportional cold shard, but this "
+                    f"rank's router asked for them. The layer must remap a "
+                    f"foreign expert id away (the #82 dim-0 shard's padding "
+                    f"expert) before delegating any cold expert."
+                )
         if len(spill) > self.scratch:
             raise RuntimeError(
                 f"resolve() got {len(spill)} spill experts but only "
@@ -490,6 +506,364 @@ def scratch_slot_count(resident_count: int) -> int:
 
 
 # ===========================================================================
+# #394: LINK-PROPORTIONAL COLD-EXPERT SHARDING
+#
+# A cold expert is paid for in PCIe seconds, and a fetch wave is over only when
+# the LAST rank's share has landed. Splitting the cold pool EQUALLY across TP
+# ranks whose links are not equal therefore lets the narrowest link set the
+# clock for all of them. On this rig the links are gen4 x4 / x8 / x8 -- 6.4 /
+# 13 / 13 GB/s measured H2D out of pinned host memory -- so the x4 rank moves
+# the same bytes over half the link and every other rank waits for it.
+#
+# ANALYSE_393 §7.3/§7.4 puts numbers on it under its parameterised 2.79
+# GB/token model: 0.93 GB over 6.4 GB/s = 145 ms/token with equal shards,
+# against 2.79 GB over the 32.4 GB/s the three links absorb together = 86
+# ms/token with proportional shares. That is a 1.69x ceiling on the cold tier,
+# and 84% of the total headroom a full host-side compute lane could reach.
+#
+# DIRECTION -- the deliberate inverse of the standing "slowest rank is the
+# metronome" rule. That rule governs CAPACITY splits: give a card work in
+# proportion to its capacity and the weakest card carries the largest RELATIVE
+# load, so it still sets the clock. What is being split here is not work a card
+# must have room for, it is BYTES THAT MUST CROSS A LINK, and the weak
+# participant is the LINK, not the card. So the weak link is handed FEWER cold
+# experts, not more, and the shares are sized so all links finish their share
+# at the same instant -- which is the only instant a wave cares about. The two
+# orderings genuinely disagree on this box: the 20 GB 3080 sits in the x4 slot,
+# so a share sized by VRAM is the worst possible share to send down that link.
+#
+# WHAT DOES NOT MOVE -- device residency. The resident tier is sized by the
+# per-card VRAM budget and is untouched: R, the [R+C] buffer and every #400
+# ledger figure derived from them are the same numbers with and without a
+# ratio. Only HOST-side ownership of the cold pool moves, and only on dim 0 in
+# whole experts, because a GGUF expert row is a run of opaque quantization
+# blocks (#82/#109) and the expert axis is the one axis with no block structure
+# on it.
+#
+# PRECONDITION for a caller -- delegating a cold expert to a peer is only legal
+# on a layer that shards experts on dim 0 and remaps a foreign expert id away
+# from this rank (the #82 GGUF expert-dim shard with its zero padding expert).
+# On an intermediate-dim TP MoE every rank holds an essential slice of EVERY
+# expert and nothing can be delegated; such a layer must not construct a
+# ColdShardContext. A delegated id that reaches this rank's router anyway is
+# caught by name in ExpertResidencyPlanner.resolve rather than surfacing as a
+# missing spill-pool row.
+# ===========================================================================
+
+#: Env override for the per-rank host-shard ratio. Comma-separated positive
+#: floats, one per TP rank, e.g. ``6.4,13,13`` for this rig's measured H2D
+#: bandwidths. Read through ``os.environ`` (same as SGLANG_MOE_SCRATCH_SLOTS)
+#: rather than ``environ.py`` so the policy stays inside this module.
+HOST_SHARD_RATIO_ENV = "SGLANG_MOE_HOST_SHARD_RATIO"
+
+#: Encoding-adjusted per-lane throughput of one PCIe generation, GB/s, one
+#: direction. Only the RATIOS between ranks are used, so these nominal figures
+#: are enough; the measured numbers (6.4 vs 13 GB/s, i.e. 1.00 : 2.03 against
+#: this table's 1 : 2) belong in HOST_SHARD_RATIO_ENV, which outranks this
+#: derivation precisely because a measurement beats a nameplate.
+_PCIE_LANE_GBPS = {1: 0.250, 2: 0.500, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
+
+#: Latch so the chosen ratio is logged once per process, not once per layer.
+_HOST_SHARD_LOGGED = False
+
+
+@dataclass(frozen=True)
+class HostShardRatio:
+    """Per-rank host->device bandwidth weights, plus where they came from.
+
+    ``weights`` is normalized to sum 1.0 and is the same tuple on every rank
+    (the partition is a pure function of it, so the ranks agree without
+    talking). ``source`` is one of ``"env"``, ``"nvml-pcie"`` or ``"equal"``,
+    and ``detail`` carries the provenance in a form fit for a log line.
+    """
+
+    weights: Tuple[float, ...]
+    source: str
+    detail: str = ""
+
+    @property
+    def is_equal(self) -> bool:
+        """True when the ratio carries no information a split could use.
+
+        This is the default-unchanged predicate: an equal ratio must produce
+        exactly today's assignment, so callers test it rather than comparing
+        floats themselves.
+        """
+        if not self.weights:
+            return True
+        hi, lo = max(self.weights), min(self.weights)
+        return (hi - lo) <= 1e-9 * hi
+
+    def describe(self) -> str:
+        shares = ", ".join(f"rank{i}={w:.4f}" for i, w in enumerate(self.weights))
+        tail = f" ({self.detail})" if self.detail else ""
+        return f"source={self.source} [{shares}]{tail}"
+
+
+def _normalize_weights(values: Sequence[float]) -> Tuple[float, ...]:
+    """Positive floats -> weights summing to 1.0. Raises on anything else."""
+    out = [float(v) for v in values]
+    for i, v in enumerate(out):
+        if not (v > 0.0) or v != v or v == float("inf"):
+            raise ValueError(
+                f"host-shard weight for rank {i} is {v!r}; every weight must be "
+                "a finite positive number"
+            )
+    total = sum(out)
+    return tuple(v / total for v in out)
+
+
+def equal_host_shard_ratio(world_size: int, detail: str = "") -> HostShardRatio:
+    """The safe default: nothing is known about the links, so split equally."""
+    n = max(1, int(world_size))
+    return HostShardRatio(tuple(1.0 / n for _ in range(n)), "equal", detail)
+
+
+def _host_shard_ratio_from_env(world_size: int) -> Optional[HostShardRatio]:
+    """``SGLANG_MOE_HOST_SHARD_RATIO`` or ``None`` when it is unset.
+
+    A malformed or wrong-length vector is a hard error, never a silent fall
+    back to the derivation below: an operator who typed a ratio meant it, and
+    quietly running a different split than the one they asked for is how a
+    measurement arm turns into a lie. (Same contract as
+    ``SGLANG_SP_CAPACITY_WEIGHTS`` on the diffusion lane.)
+    """
+    import os
+
+    raw = os.environ.get(HOST_SHARD_RATIO_ENV, "").strip()
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    try:
+        values = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(
+            f"{HOST_SHARD_RATIO_ENV}={raw!r} is not a comma-separated list of "
+            f"positive floats ({exc})"
+        ) from exc
+    if len(values) != int(world_size):
+        raise ValueError(
+            f"{HOST_SHARD_RATIO_ENV}={raw!r} has {len(values)} entries but the "
+            f"MoE group has {int(world_size)} ranks; give exactly one weight "
+            "per rank"
+        )
+    return HostShardRatio(
+        _normalize_weights(values), "env", f"{HOST_SHARD_RATIO_ENV}={raw}"
+    )
+
+
+def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
+    """Max PCIe bandwidth of the card with this NVML UUID, GB/s, or ``None``.
+
+    The card is resolved through the #331 IdentityMap by UUID and only then
+    converted to an NVML index for the two link queries. Never positionally:
+    CUDA enumerates FASTEST_FIRST and NVML in bus order, so a rank's CUDA
+    ordinal is not its NVML index on a mixed rig, and #392 is what happens when
+    those are conflated.
+    """
+    try:
+        from sglang.srt.registry.nvml import identity_map, nvml_session
+
+        card = identity_map().require(uuid)
+        with nvml_session() as pynvml:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(int(card.nvml_index))
+            gen = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle))
+            width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
+    except Exception:  # noqa: BLE001 - absent driver/binding is not an error here
+        return None
+    lane = _PCIE_LANE_GBPS.get(gen)
+    if lane is None or width <= 0:
+        return None
+    return lane * width
+
+
+def derive_link_weights(
+    card_uuids: Sequence[str], link_gbps=None
+) -> Optional[Tuple[float, ...]]:
+    """Per-rank weights from PCIe link width x generation, or ``None``.
+
+    ``card_uuids[r]`` is the NVML UUID of the card serving rank ``r``; the
+    caller gathers it (a rank knows its own via
+    ``registry.nvml.current_device_uuid``). ``link_gbps`` is the injectable
+    ``uuid -> Optional[float]`` lookup the hermetic tests use in place of a
+    driver.
+
+    Two ranks CO-LOCATED on one card share one link, so that card's bandwidth
+    is divided between them: the quantity being apportioned is link seconds,
+    and two ranks behind one x8 slot have an x4's worth each. ``None`` when any
+    card cannot be resolved -- a partial derivation is worse than no
+    derivation, because the ranks would disagree about the split.
+    """
+    from collections import Counter
+
+    if not card_uuids:
+        return None
+    lookup = _pcie_link_gbps_by_uuid if link_gbps is None else link_gbps
+    ranks_per_card = Counter(card_uuids)
+    weights = []
+    for uuid in card_uuids:
+        gbps = lookup(uuid)
+        if gbps is None or not (float(gbps) > 0.0):
+            return None
+        weights.append(float(gbps) / ranks_per_card[uuid])
+    return _normalize_weights(weights)
+
+
+def resolve_host_shard_ratio(
+    world_size: int, card_uuids: Optional[Sequence[str]] = None, link_gbps=None
+) -> HostShardRatio:
+    """The ratio and its provenance, in strict preference order.
+
+    1. ``SGLANG_MOE_HOST_SHARD_RATIO`` -- an explicit, measured vector always
+       wins; malformed input raises rather than falling through.
+    2. NVML PCIe link width x generation for each rank's card, resolved by
+       UUID through the #331 IdentityMap.
+    3. Equal -- today's behaviour, and the right answer whenever nothing is
+       known. An unknown link is not an excuse to guess.
+    """
+    n = max(1, int(world_size))
+    from_env = _host_shard_ratio_from_env(n)
+    if from_env is not None:
+        return from_env
+    if card_uuids is not None and len(card_uuids) == n:
+        derived = derive_link_weights(card_uuids, link_gbps=link_gbps)
+        if derived is not None:
+            return HostShardRatio(
+                derived,
+                "nvml-pcie",
+                "max PCIe link width x generation per rank's card (NVML, by UUID)",
+            )
+        return equal_host_shard_ratio(n, "NVML PCIe link data unavailable")
+    return equal_host_shard_ratio(n, "no per-rank card identity supplied")
+
+
+def plan_proportional_shares(total: int, weights: Sequence[float]) -> Tuple[int, ...]:
+    """Apportion ``total`` WHOLE units over ``weights`` (largest remainder).
+
+    Whole units because a cold expert cannot be cut: dim 0 is the one axis of a
+    quantized expert stack with no block structure on it (#82/#109). Largest
+    remainder (Hamilton) rather than repeated rounding, so the shares sum to
+    ``total`` exactly and the result is a pure function of the inputs -- every
+    rank computes the same partition without a collective. Ties go to the lower
+    rank index, which is arbitrary but fixed.
+    """
+    total = int(total)
+    if total < 0:
+        raise ValueError(f"total must be >= 0, got {total}")
+    norm = _normalize_weights(weights)
+    exact = [total * w for w in norm]
+    floors = [int(math.floor(x)) for x in exact]
+    remaining = total - sum(floors)
+    order = sorted(range(len(norm)), key=lambda i: (-(exact[i] - floors[i]), i))
+    for i in order[:remaining]:
+        floors[i] += 1
+    return tuple(floors)
+
+
+def partition_cold_experts(
+    cold_ids: Sequence[int], weights: Sequence[float]
+) -> Tuple[Tuple[int, ...], ...]:
+    """Split the cold pool into one ascending, contiguous block per rank.
+
+    Contiguous and ascending on purpose: the owning rank's spill pool then has
+    the same "row j holds the j-th smallest owned id" shape the static layout
+    has, so ``_spill_pool_index``, the frozen-layout adoption in
+    ``MoEExpertOffloadCache`` and the capturable LUT builder all keep working
+    unchanged. Nothing here depends on WHICH experts a rank gets, only on how
+    many -- routing is uniform enough over the cold pool that the cheapest
+    correct partition is the right one.
+    """
+    ids = [int(e) for e in cold_ids]
+    shares = plan_proportional_shares(len(ids), weights)
+    out = []
+    cursor = 0
+    for count in shares:
+        out.append(tuple(ids[cursor : cursor + count]))
+        cursor += count
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class ColdShardContext:
+    """This rank's view of the link-proportional cold-expert partition.
+
+    Constructed ONLY by a caller whose layer shards experts on dim 0 and remaps
+    foreign expert ids away from this rank (see the PRECONDITION note above).
+    ``None`` in place of a context is the default path, byte for byte.
+    """
+
+    rank: int
+    world_size: int
+    ratio: HostShardRatio
+
+    def __post_init__(self):
+        if self.world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {self.world_size}")
+        if not (0 <= self.rank < self.world_size):
+            raise ValueError(f"rank {self.rank} is outside [0,{self.world_size})")
+        if len(self.ratio.weights) != self.world_size:
+            raise ValueError(
+                f"host-shard ratio has {len(self.ratio.weights)} weights but "
+                f"the group has {self.world_size} ranks"
+            )
+
+    @property
+    def active(self) -> bool:
+        """False when the ratio says nothing -- then the plan is today's plan."""
+        return self.world_size > 1 and not self.ratio.is_equal
+
+
+def cold_shard_context(
+    rank: int,
+    world_size: int,
+    card_uuids: Optional[Sequence[str]] = None,
+    link_gbps=None,
+) -> Optional[ColdShardContext]:
+    """Resolve the ratio and wrap it, or ``None`` when there is nothing to do.
+
+    ``None`` for a single-rank group or an equal ratio, so the caller's
+    ``cold_shard=`` argument is literally absent on the default path instead of
+    being a context that happens to be a no-op. That is what makes "no ratio
+    known" and "no #394" the same code path.
+    """
+    if int(world_size) < 2:
+        return None
+    ratio = resolve_host_shard_ratio(world_size, card_uuids, link_gbps=link_gbps)
+    if ratio.is_equal:
+        return None
+    return ColdShardContext(int(rank), int(world_size), ratio)
+
+
+def _log_host_shard_choice(context: "ColdShardContext", owned: int, pool: int) -> None:
+    """One INFO line per process naming the ratio, its source and this share."""
+    global _HOST_SHARD_LOGGED
+
+    import logging
+
+    if _HOST_SHARD_LOGGED:
+        return
+    _HOST_SHARD_LOGGED = True
+    share = (owned / pool) if pool else 0.0
+    logging.getLogger(__name__).info(
+        "MoE cold-expert host shard (#394): rank %d/%d owns %d of %d cold "
+        "experts (%.1f%% of the pool) -- %s",
+        context.rank,
+        context.world_size,
+        owned,
+        pool,
+        100.0 * share,
+        context.ratio.describe(),
+    )
+
+
+def reset_host_shard_log_latch() -> None:
+    """Test hook: re-arm the once-per-process log line."""
+    global _HOST_SHARD_LOGGED
+
+    _HOST_SHARD_LOGGED = False
+
+
+# ===========================================================================
 # #123-GGUF: MATERIALIZATION-TIME staging (the third load-time entry point).
 #
 # fp8 / GPTQ / AWQ reach the offload through
@@ -524,6 +898,11 @@ class ExpertStagingPlan:
 
     ``pinned_experts`` (see ``plan_load_time_staging``) is why the layout is
     carried explicitly instead of being the implicit static ``[0, R)``.
+
+    ``delegated_ids`` (#394) are cold experts a PEER rank's host tier owns.
+    They are neither staged nor fetched here, and the three tuples together
+    always cover ``range(num_experts)`` exactly once. Empty on every path that
+    does not pass a ``ColdShardContext``, which is every path today.
     """
 
     num_experts: int
@@ -531,13 +910,17 @@ class ExpertStagingPlan:
     buffer_slots: int
     resident_ids: Tuple[int, ...]
     spill_ids: Tuple[int, ...]
+    delegated_ids: Tuple[int, ...] = ()
+    host_shard: Optional[str] = None
 
     @property
     def is_static_layout(self) -> bool:
         """True when the plan is exactly the default ``[0,R)`` residency."""
         R = self.resident_count
-        return self.resident_ids == tuple(range(R)) and self.spill_ids == tuple(
-            range(R, self.num_experts)
+        return (
+            not self.delegated_ids
+            and self.resident_ids == tuple(range(R))
+            and self.spill_ids == tuple(range(R, self.num_experts))
         )
 
 
@@ -545,6 +928,7 @@ def plan_load_time_staging(
     num_experts: int,
     fraction: Optional[float] = None,
     pinned_experts: Sequence[int] = (),
+    cold_shard: Optional[ColdShardContext] = None,
 ) -> Optional[ExpertStagingPlan]:
     """Residency plan for a load-time split, or ``None`` when there is none.
 
@@ -561,6 +945,14 @@ def plan_load_time_staging(
     ids take the lowest slots; the remaining slots are filled in ascending id
     order, so the layout stays a pure function of (E, R, pinned) and therefore
     deterministic across ranks and runs.
+
+    ``cold_shard`` (#394) narrows the SPILL set to this rank's link-proportional
+    share of the cold pool; the rest is recorded as ``delegated_ids`` and is a
+    peer's host tier to hold. Residency is decided FIRST and is not a function
+    of the ratio, so ``resident_ids``, ``resident_count`` and ``buffer_slots``
+    -- the three numbers every VRAM figure and #400 ledger entry comes from --
+    are identical with and without a ratio. ``None`` (the default, and the only
+    thing any caller passes today) reproduces the previous plan exactly.
     """
     from sglang.srt.environ import envs
 
@@ -593,12 +985,31 @@ def plan_load_time_staging(
     resident_set = set(resident_ids)
     spill_ids = [e for e in range(E) if e not in resident_set]
     C = scratch_slot_count(R)
+
+    # #394: residency above is already fixed; only the cold pool is re-owned.
+    # A pinned expert (the #82 pad expert at id E-1) is resident, so it is not
+    # in the pool and cannot be delegated -- the two features compose without
+    # either knowing about the other.
+    delegated_ids: Tuple[int, ...] = ()
+    host_shard = None
+    if cold_shard is not None and cold_shard.active:
+        shares = partition_cold_experts(spill_ids, cold_shard.ratio.weights)
+        owned = set(shares[cold_shard.rank])
+        delegated_ids = tuple(e for e in spill_ids if e not in owned)
+        spill_ids = [e for e in spill_ids if e in owned]
+        host_shard = cold_shard.ratio.describe()
+        _log_host_shard_choice(
+            cold_shard, len(spill_ids), len(spill_ids) + len(delegated_ids)
+        )
+
     return ExpertStagingPlan(
         num_experts=E,
         resident_count=R,
         buffer_slots=min(R + C, E),
         resident_ids=tuple(resident_ids),
         spill_ids=tuple(spill_ids),
+        delegated_ids=delegated_ids,
+        host_shard=host_shard,
     )
 
 
@@ -648,6 +1059,14 @@ def stage_experts_into_tiers(plan: ExpertStagingPlan, source, out, release=None)
         spill[row].copy_(src)
         if release is not None:
             release(expert_id)
+
+    # #394: a delegated cold expert belongs to a peer's host tier. Its bytes are
+    # never read here -- but the loader is still holding them, so they are
+    # released without a copy. Skipping the release instead would trade the
+    # VRAM this feature saves for host RAM it never used.
+    for expert_id in plan.delegated_ids:
+        if release is not None:
+            release(expert_id)
     return spill
 
 
@@ -672,6 +1091,10 @@ def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
             list(plan.resident_ids),
             list(plan.spill_ids),
         )
+    if plan.delegated_ids:
+        # #394: the cache turns this into a named refusal if a delegated expert
+        # ever reaches this rank's router, instead of a missing pool row.
+        layer._moe_offload_delegated_experts = list(plan.delegated_ids)
     row_bytes = (
         (resident_buf.numel() // resident_buf.shape[0]) * resident_buf.element_size()
         if resident_buf.shape[0]
@@ -1087,6 +1510,13 @@ class MoEExpertOffloadCache:
             self.planner.resident_slot = {int(e): i for i, e in enumerate(resident_ids)}
             self._spill_pool_index = {int(e): j for j, e in enumerate(spill_ids)}
             self._hot_frozen = True
+
+        # #394: cold experts a peer's host tier owns. Adopted as a planner
+        # guard, not as state: this rank simply has no row for them, and the
+        # named error is worth far more than the KeyError it replaces.
+        delegated = getattr(layer, "_moe_offload_delegated_experts", None)
+        if delegated:
+            self.planner.delegated_ids = frozenset(int(e) for e in delegated)
 
         # --- #254 prefill wave order ---------------------------------------
         # "token" (default) = disjoint token subsets, every wave re-fetches its
@@ -1891,7 +2321,9 @@ def _load_hotset_file(path: str) -> dict:
     return data
 
 
-def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - CUDA
+def presplit_expert_offload_after_repack(
+    layer, cold_shard: Optional[ColdShardContext] = None
+) -> None:  # pragma: no cover - CUDA
     """Variant-C B2b LOAD-TIME RAM cap: called right after a FusedMoE layer's
     marlin repack (the repacked expert tensors are on GPU, inside
     device_loading_context). Splits each expert-major tensor into a [R+C]-slot
@@ -1902,6 +2334,16 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     stack therefore NEVER sits in host RAM -> host peak ~= spill, not the full
     expert set. The eager installer later wires the stash into a
     MoEExpertOffloadCache. No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.
+
+    The layout now comes from ``plan_load_time_staging`` -- the same plan the
+    #123-GGUF half stages against -- so the two halves cannot drift apart and
+    both honour a non-static layout. With no ``cold_shard`` (every caller
+    today: fp8.py, gptq_moe.py, awq_moe.py) the plan is the static ``[0,R)``
+    one and the copies below are the same two slices as before.
+
+    ``cold_shard`` (#394) is only legal on a layer that shards experts on dim 0
+    and remaps foreign ids away; an intermediate-dim TP MoE holds an essential
+    slice of every expert and can delegate none of them.
     """
     import torch
 
@@ -1913,11 +2355,12 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     E = getattr(layer, "num_local_experts", None)
     if not E:
         return
-    R = resident_slot_count(int(E), frac)
-    if R >= int(E):
+    plan = plan_load_time_staging(int(E), fraction=frac, cold_shard=cold_shard)
+    if plan is None:
         return
-    C = scratch_slot_count(R)
-    buf_slots = min(R + C, int(E))
+    R = plan.resident_count
+    buf_slots = plan.buffer_slots
+    static = plan.is_static_layout
 
     presplit = {}
     freed_device = 0
@@ -1933,12 +2376,33 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
         buf = torch.empty(
             (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
         )
-        buf[:R].copy_(t[:R])
-        # Spill [R:E] -> pinned host (contiguous copy; the GPU [E] is then freed).
+        # Spill -> pinned host; the GPU [E] stack is then freed. The static
+        # plan is two contiguous slices, exactly as before; a #394 plan gathers
+        # the rows the plan names (whole experts on dim 0 either way).
         spill = torch.empty(
-            (int(E) - R,) + tuple(t.shape[1:]), dtype=t.dtype, device="cpu"
+            (len(plan.spill_ids),) + tuple(t.shape[1:]), dtype=t.dtype, device="cpu"
         ).pin_memory()
-        spill.copy_(t[R:])
+        if static:
+            buf[:R].copy_(t[:R])
+            spill.copy_(t[R:])
+        else:
+            buf[:R].copy_(
+                t.index_select(
+                    0,
+                    torch.as_tensor(
+                        plan.resident_ids, dtype=torch.long, device=t.device
+                    ),
+                )
+            )
+            if plan.spill_ids:
+                spill.copy_(
+                    t.index_select(
+                        0,
+                        torch.as_tensor(
+                            plan.spill_ids, dtype=torch.long, device=t.device
+                        ),
+                    )
+                )
         presplit[attr] = (buf, spill)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
         # step can report (and assert on) the reclaim it is about to inherit.
@@ -1958,6 +2422,15 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     if presplit:
         layer._moe_offload_presplit = presplit
         layer._moe_offload_full_experts = int(E)
+        if not static:
+            # Same publication contract as the #123-GGUF half: the buffers are
+            # already arranged this way, so the cache adopts the map verbatim.
+            layer._moe_offload_frozen_layout = (
+                list(plan.resident_ids),
+                list(plan.spill_ids),
+            )
+            if plan.delegated_ids:
+                layer._moe_offload_delegated_experts = list(plan.delegated_ids)
         record_expert_offload_release(freed_device, freed_host, len(presplit))
         # Return freed host memory to the OS NOW. create_weights loaded the full
         # [E] expert set to host CPU; the loader frees each layer's loaded tensor
