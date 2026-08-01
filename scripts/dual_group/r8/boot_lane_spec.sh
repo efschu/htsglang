@@ -55,6 +55,11 @@ STEPS="${STEPS:-1}"
 PHASES="${PHASES:-gate,e_spec,e_nospec}"
 DRIVER_DEADLINE_S="${DRIVER_DEADLINE_S:-900}"
 FALSIFY_PROMPT="${FALSIFY_PROMPT:-alphabet}"
+# Only read by the "history" phase, which holds the arm fixed and varies
+# the preceding request sequence. Unset means the driver's own default
+# order (none, alphabet_only, repeat_only, gate_full) and the flag is not
+# passed at all, so every other recipe stays byte-identical.
+HISTORY_VARIANTS="${HISTORY_VARIANTS:-}"
 # CONCURRENT=0 boots the same recipe in SERIAL tick mode. It is the one axis
 # that separates "the chain diverges" from "the concurrency machinery makes it
 # diverge": rounds 5-7a gated this chain green SERIALLY, so a red gate under
@@ -123,6 +128,7 @@ grep -E "lane budget [0-9]+ MiB =|verify graph captured|NEXTN head graph capture
   --steps "$STEPS" --gate-tokens "$GATE_TOKENS" \
   --window-s "$WINDOW_S" --phases "$PHASES" \
   --falsify-prompt "$FALSIFY_PROMPT" \
+  ${HISTORY_VARIANTS:+--history-variants "$HISTORY_VARIANTS"} \
   --deadline-s "$DRIVER_DEADLINE_S" \
   --out "$OUT/report.json" | tee "$OUT/report.txt"
 DRIVER_RC=${PIPESTATUS[0]}

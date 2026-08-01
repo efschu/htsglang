@@ -233,6 +233,7 @@ class TestGateVerdict(CustomTestCase):
         margin at one position. Different tokens, same score -> coherent, and
         the token-identity rate says the tokens differed.
         """
+
         # w x y z then a flip: the determined tail is complete on both arms,
         # so the flip lands where the task no longer determines an answer --
         # which is exactly where the rig measured it (index 63 of 64, after
@@ -606,6 +607,198 @@ class TestTheGateKeepsTheAnswersItGraded(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(window.write_verdict_arms({}, f"{tmp}/report.json"), {})
+
+
+class TestTheFalsifierKeepsItsAnswersToo(CustomTestCase):
+    """The same retention defect, one function down (#399 window, section 3).
+
+    ``run_falsifier`` graded four arms against a reference and then dropped
+    the ids of all five. The repro window reported "identical" on every arm
+    and the artifact could not distinguish that from a reference corrupted
+    along with them.
+    """
+
+    def _run(self, out_ids):
+        server = FakeServer(out_ids=out_ids)
+        with _Patched(server):
+            window.tokenize = lambda base, text, tok: [1, 2, 3]
+            return window.run_falsifier(
+                "http://x", "tok", "alphabet", 4, 1, "target_verify", 1e18
+            )
+
+    def test_the_reference_keeps_the_ids_and_the_text_it_is_compared_against(self):
+        got = self._run(lambda job: [7, 99, 9] if job.get("spec") else [7, 8, 9])
+        self.assertEqual(got["reference"]["output_ids"], [7, 8, 9])
+        self.assertEqual(got["reference"]["text"], "w\nx\ny")
+
+    def test_every_arm_keeps_the_answer_its_classification_summarises(self):
+        got = self._run(lambda job: [7, 99, 9] if job.get("spec") else [7, 8, 9])
+        self.assertEqual(
+            set(got["arms"]),
+            {"plain", "tv_max_accept_0", "verify_eager", "head_eager"},
+        )
+        for name, arm in got["arms"].items():
+            with self.subTest(arm=name):
+                self.assertEqual(arm["output_ids"], [7, 99, 9])
+                self.assertEqual(arm["text"], "w\nq\ny")
+                self.assertEqual(arm["classification"], "content_divergence")
+
+    def test_identical_arms_are_still_distinguishable_from_a_corrupted_pair(self):
+        """The case the window could not read.
+
+        Both sides wrong in the same way classifies as ``identical``. With the
+        ids kept, the artifact says WHICH tokens were identical, so a reader
+        can see that the reference is the corrupted text rather than infer
+        that nothing happened.
+        """
+        got = self._run(lambda job: [7, 99, 9])
+        self.assertEqual(got["arms"]["plain"]["classification"], "identical")
+        self.assertEqual(got["reference"]["output_ids"], [7, 99, 9])
+        self.assertEqual(got["reference"]["text"], "w\nq\ny")
+
+
+class TestTheHistoryFalsifier(CustomTestCase):
+    """One arm, four preludes: the axis an arm-varying falsifier cannot see.
+
+    Driven against the fake server so the sequencing rules -- which requests
+    each variant sends, in which order, and what it records about the state it
+    inherited -- are pinned without a card.
+    """
+
+    def _run(self, out_ids, variants=None):
+        server = FakeServer(out_ids=out_ids)
+        with _Patched(server):
+            window.tokenize = lambda base, text, tok: [1, 2, 3]
+            got = window.run_history_falsify(
+                "http://x", "tok", "squares", 4, 1, "target_verify", 1e18, variants
+            )
+        return got, server
+
+    @staticmethod
+    def _diverging(job):
+        return [7, 99, 9] if job.get("spec") else [7, 8, 9]
+
+    def test_each_variant_sends_its_prelude_and_then_the_measured_pair(self):
+        got, server = self._run(self._diverging, ["none", "alphabet_only"])
+        self.assertEqual(len(server.posted), (0 + 2) + (4 + 2))
+        self.assertEqual(got["variants"]["none"]["prelude_requests"], 0)
+        self.assertEqual(got["variants"]["alphabet_only"]["prelude_requests"], 4)
+
+    def test_the_full_gate_prelude_is_the_gate_s_own_twelve(self):
+        got, _ = self._run(self._diverging, ["gate_full"])
+        prelude = got["variants"]["gate_full"]["prelude"]
+        self.assertEqual(len(prelude), 12)
+        self.assertEqual([p["prompt"] for p in prelude[:4]], ["alphabet"] * 4)
+        self.assertEqual([p["spec"] for p in prelude[:4]], [False, False, True, True])
+
+    def test_the_inherited_state_is_recorded_rather_than_claimed(self):
+        """``none`` is only fresh once, and the artifact has to say so.
+
+        The lane's monotone completion counter is read before every prelude,
+        so a reader can tell which variants ran on a lane that had already
+        served requests instead of trusting the variant's name.
+        """
+        got, _ = self._run(self._diverging, ["none", "repeat_only"])
+        self.assertEqual(got["variants"]["none"]["lane_results_before"], 0)
+        self.assertEqual(got["variants"]["repeat_only"]["lane_results_before"], 2)
+
+    def test_both_sides_of_every_variant_keep_ids_text_and_margins(self):
+        got, _ = self._run(self._diverging, ["none"])
+        arms = got["variants"]["none"]["arms"]
+        self.assertEqual(set(arms), {"no_spec", "spec"})
+        self.assertEqual(arms["no_spec"]["output_ids"], [7, 8, 9])
+        self.assertEqual(arms["spec"]["output_ids"], [7, 99, 9])
+        self.assertEqual(arms["spec"]["text"], "w\nq\ny")
+        for side in ("no_spec", "spec"):
+            self.assertIn("margins", arms[side])
+
+    def test_a_divergence_in_some_variants_only_is_named_as_history_dependent(self):
+        """The finding the phase exists to produce.
+
+        The arm never changes, so a classification that moves between variants
+        can only be the preceding state.
+        """
+        state = {"seen": 0}
+
+        def out_ids(job):
+            if not job.get("spec"):
+                return [7, 8, 9]
+            state["seen"] += 1
+            return [7, 99, 9] if state["seen"] > 1 else [7, 8, 9]
+
+        got, _ = self._run(out_ids, ["none", "alphabet_only"])
+        self.assertEqual(got["variants"]["none"]["classification"], "identical")
+        self.assertEqual(
+            got["variants"]["alphabet_only"]["classification"], "content_divergence"
+        )
+        self.assertEqual(got["content_divergent_variants"], ["alphabet_only"])
+        self.assertEqual(got["verdict"], "history-dependent: alphabet_only")
+
+    def test_a_variant_past_the_deadline_is_skipped_rather_than_half_run(self):
+        got, server = self._run(self._diverging, ["none"])
+        self.assertNotIn("skipped", got["variants"]["none"])
+        server2 = FakeServer(out_ids=self._diverging)
+        with _Patched(server2):
+            window.tokenize = lambda base, text, tok: [1, 2, 3]
+            late = window.run_history_falsify(
+                "http://x", "tok", "squares", 4, 1, "target_verify", 0.0, ["gate_full"]
+            )
+        self.assertEqual(late["variants"]["gate_full"], {"skipped": "deadline"})
+        self.assertEqual(server2.posted, [])
+
+    def test_an_unknown_variant_is_refused_by_name(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._diverging, ["after_a_flush"])
+        self.assertIn("after_a_flush", str(ctx.exception))
+
+    def test_the_driver_runs_the_phase_end_to_end_from_its_own_flags(self):
+        """The wiring, not just the function.
+
+        A phase that is only ever called from a test is desk-written code: the
+        flag name, the dispatch and the ordering are exactly what the #328
+        harness got wrong, and they are not exercised by calling
+        ``run_history_falsify`` directly. This drives ``main`` with the flags
+        the boot recipe will pass, and asserts the phase ran FIRST -- the
+        'none' variant is only worth anything on a lane no request has
+        touched.
+        """
+        import json
+        import tempfile
+
+        server = FakeServer(out_ids=self._diverging)
+        with _Patched(server):
+            window.tokenize = lambda base, text, tok: [1, 2, 3]
+            with tempfile.TemporaryDirectory() as tmp:
+                out = f"{tmp}/report.json"
+                argv = sys.argv
+                sys.argv = [
+                    "lane_spec_window.py",
+                    "--phases",
+                    "history",
+                    "--history-variants",
+                    "none,repeat_only",
+                    "--falsify-prompt",
+                    "squares",
+                    "--gate-tokens",
+                    "4",
+                    "--out",
+                    out,
+                ]
+                try:
+                    self.assertEqual(window.main(), 0)
+                finally:
+                    sys.argv = argv
+                with open(out) as f:
+                    report = json.load(f)
+        self.assertEqual(report["history"]["order"], ["none", "repeat_only"])
+        self.assertEqual(
+            report["history"]["variants"]["none"]["lane_results_before"], 0
+        )
+        self.assertEqual(
+            report["history"]["variants"]["none"]["arms"]["spec"]["output_ids"],
+            [7, 99, 9],
+        )
+        self.assertEqual(report["history"]["verdict"], "every variant diverged")
 
 
 if __name__ == "__main__":
