@@ -80,6 +80,7 @@ class GGUFAdapterBase:
         self.arch = self._resolve_arch(config, text_config)
         self.num_layers = int(text_config.num_hidden_layers)
         self._file_tensor_names = None  # set lazily
+        self._shard_paths: Optional[List[str]] = None  # set lazily
         self._post_init(config)
 
     # ------------------------------------------------------------------
@@ -143,12 +144,31 @@ class GGUFAdapterBase:
     # Shared machinery
     # ------------------------------------------------------------------
 
-    def _file_tensors(self) -> set:
-        if self._file_tensor_names is None:
-            import gguf
+    def shard_paths(self) -> List[str]:
+        """Every file of this checkpoint, in shard order.
 
-            reader = gguf.GGUFReader(self.gguf_file)
-            self._file_tensor_names = {t.name for t in reader.tensors}
+        A plain GGUF is a one-element list, so every caller below is written
+        against the set and the unsplit case falls out of it.
+        """
+        from sglang.srt.model_loader.gguf_shards import resolve_gguf_shard_paths
+
+        if self._shard_paths is None:
+            self._shard_paths = resolve_gguf_shard_paths(self.gguf_file)
+        return self._shard_paths
+
+    def _file_tensors(self) -> set:
+        """Union of the tensor names over the whole shard set.
+
+        The union, not part 1's tensors: llama.cpp puts the KV block in part 1
+        and (for a large export) every tensor in the later parts, so the
+        unmapped-tensor audit run against part 1 alone would audit nothing.
+        """
+        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
+
+        if self._file_tensor_names is None:
+            self._file_tensor_names = {
+                str(t.name) for t in iter_gguf_tensors(self.shard_paths())
+            }
         return self._file_tensor_names
 
     def _resolve_arch_enum(self):
@@ -228,8 +248,11 @@ class GGUFAdapterBase:
         """
         import gguf
 
-        reader = gguf.GGUFReader(self.gguf_file)
-        types = {t.name: t.tensor_type for t in reader.tensors}
+        from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors
+
+        types = {
+            str(t.name): t.tensor_type for t in iter_gguf_tensors(self.shard_paths())
+        }
         unq_types = {
             gguf.GGMLQuantizationType.F32,
             gguf.GGMLQuantizationType.F16,

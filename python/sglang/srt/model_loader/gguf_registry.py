@@ -187,7 +187,18 @@ def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     """
     import gguf  # lazy: keeps the registry import-light
 
-    reader = gguf.GGUFReader(gguf_file, "r")
+    from sglang.srt.model_loader.gguf_shards import (
+        gguf_metadata_path,
+        iter_gguf_tensors,
+        resolve_gguf_shard_paths,
+    )
+
+    # Split export: the KV block lives ONLY in the first part, the tensors live
+    # ONLY in the later ones. Read each from where it actually is -- the vocab
+    # cross-check below reads token_embd.weight, which for the DeepSeek V4 Flash
+    # export is on part 2 while every KV field is on part 1.
+    shard_paths = resolve_gguf_shard_paths(gguf_file)
+    reader = gguf.GGUFReader(gguf_metadata_path(gguf_file), "r")
 
     def kv(suffix: str) -> Optional[int]:
         """The ``<arch>.<suffix>`` metadata value as an int, or None if it is
@@ -233,7 +244,7 @@ def reconcile_sibling_config(config, gguf_file: str, arch: str) -> None:
     # check) and the recurrent-block set (for layer_types) both come from it.
     embd = None
     recurrent = set()
-    for tensor in reader.tensors:
+    for tensor in iter_gguf_tensors(shard_paths):
         if tensor.name == "token_embd.weight":
             embd = tensor
         elif "ssm" in tensor.name or "conv1d" in tensor.name:

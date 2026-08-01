@@ -2203,10 +2203,17 @@ class GGUFModelLoader(BaseModelLoader):
             )
 
     def _prepare_weights(self, model_name_or_path: str):
-        if os.path.isfile(model_name_or_path):
-            return model_name_or_path
-        else:
+        if not os.path.isfile(model_name_or_path):
             raise ValueError(f"{model_name_or_path} is not a file.")
+        # A split export (`<stem>-00001-of-000NN.gguf`) is resolved to its full
+        # ordered set here, so a missing part is reported now rather than as a
+        # model that quietly loaded some of its weights. The path handed back is
+        # the METADATA part: only it carries the architecture/geometry KV block,
+        # and everything downstream re-resolves the set from whatever path it is
+        # given. An unsplit file resolves to itself and this is a no-op.
+        from sglang.srt.model_loader.gguf_shards import gguf_metadata_path
+
+        return gguf_metadata_path(model_name_or_path)
 
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """

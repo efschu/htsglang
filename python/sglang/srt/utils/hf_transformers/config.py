@@ -56,13 +56,18 @@ def _peek_bespoke_gguf_arch(gguf_path: str) -> Optional[str]:
     qwen35/qwen35moe and dflash-draft outright and crashes on gemma4: it derives
     a per-layer num_key_value_heads LIST that the strict Gemma4TextConfig
     rejects). Imported lazily so this early-config path stays cheap and
-    cycle-free."""
+    cycle-free.
+
+    For a split export only the FIRST part carries ``general.architecture`` --
+    the later parts have a six-entry ``split.*`` KV block and nothing else -- so
+    the path is resolved to the metadata part before the header is read."""
     try:
         import gguf
 
         from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
+        from sglang.srt.model_loader.gguf_shards import gguf_metadata_path
 
-        reader = gguf.GGUFReader(gguf_path)
+        reader = gguf.GGUFReader(gguf_metadata_path(gguf_path))
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
