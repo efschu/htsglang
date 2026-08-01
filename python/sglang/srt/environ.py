@@ -1533,6 +1533,17 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # GGUF loader
+    # #391: repack GGUF MXFP4 (ggml type 39) tensors to Q5_0 while reading the
+    # weight stream. The MXFP4 lattice is a subset of Q5_0's, so the conversion
+    # is value-exact (every element dequantizes to the same fp32 number) and it
+    # turns a type no GGUF kernel dispatches on into one every GGUF kernel
+    # dispatches on. It costs 22/17 = 1.294x the bytes of the repacked tensors,
+    # in host RAM and in VRAM, and that inflation is logged once at load time.
+    # Set to False to refuse MXFP4 loudly instead, which is what this build did
+    # before the repack existed. There is no silent middle ground.
+    SGLANG_GGUF_MXFP4_REPACK = EnvBool(True)
+
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================

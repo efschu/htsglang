@@ -85,6 +85,7 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_DEBUG_INPUT_BUFFER_POOL` | `1` for diagnosis only | logs one line per CUDA-graph input-buffer pool registration (scope, lane, name, numel, dtype, device, pointer, new/adopted). This is how you see two groups landing on one buffer; noisy, never for measurements |
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
+| `SGLANG_GGUF_MXFP4_REPACK` | leave unset (default on); `0` only to refuse MXFP4 | repacks GGUF MXFP4 (ggml type 39) tensors to Q5_0 while the weight stream is read (`model_loader/gguf_mxfp4_repack.py`). Value-exact — every element dequantizes to the same fp32 number — and it is the only reason a checkpoint carrying MXFP4 boots at all: no GGUF kernel dispatches on type 39. It costs 22/17 = 1.294x the bytes of the repacked tensors, in host RAM and in VRAM; the boot log states the exact inflation. Set to `0` and the load is refused by name instead — there is no silent middle ground. See section 4.5.3 |
 | `SGLANG_SP_CAPACITY_WEIGHTS` | comma-separated positive floats, one per SP rank (e.g. `1.0,0.46,0.46`) | diffusion lane (#333-M3) only. Switches `multimodal_gen`'s sequence-parallel `build_shard_plan` from the equal split to a capacity-weighted one: a faster card is handed a proportionally longer slice of the sequence. Unset (the default) keeps the equal-and-tail-padded split byte-for-byte. A wrong-length or malformed vector is a hard error, not a silent fallback. The registry's Class-2 adapter sets this from measured `gemm_tflops` when `launch.enable_uneven_sp` is on; see `docs/dev/DESIGN_333_M3_diffusion_lane.md` |
 
 ## 2.1 sgl-kernel INT8 arm — provenance, pin, and the reinstall hazard (#384)
@@ -760,6 +761,45 @@ Three refusals fire instead of a partial load, all naming the offending file:
 - a part's `split.no` / `split.count` does not match its position (two exports
   mixed in one directory);
 - the parts hold fewer tensors than their `split.tensors.count` declares.
+
+### 4.5.3 GGUF MXFP4 tensors are repacked to Q5_0 at load time
+
+Some exports store part of the model as MXFP4 (ggml type 39) — the unsloth
+DeepSeek V4 Flash `UD-*` builds keep the routed `down` projections, and on one
+layer `gate`/`up` too, in the model's native fp4. No GGUF kernel in this build
+dispatches on type 39: there is no dequantize case, no MMVQ case, no MMQ case.
+
+The loader converts those tensors to Q5_0 while reading the weight stream
+(`model_loader/gguf_mxfp4_repack.py`), because the MXFP4 lattice is a subset of
+Q5_0's: the doubled-E2M1 codes `0, ±1, ±2, ±3, ±4, ±6, ±8, ±12` all fit Q5_0's
+`[-16, 15]` integer range, so `q5 = code + 16`, `d = 2**(e - 128)` reproduces
+every element exactly. Nothing downstream of the iterator knows type 39 existed,
+including the per-expert split of the stacked `ffn_*_exps` tensors.
+
+Two things to know before booting such a file:
+
+- **It costs bytes.** 22 per block instead of 17, a factor 1.294 on the repacked
+  tensors, paid in host RAM and in VRAM. For DeepSeek V4 Flash UD-Q3_K_XL that
+  is 47.8 → 61.9 GiB across 45 tensors, i.e. the model goes from 119.4 to
+  133.5 GiB. One log line at load time states it:
+
+  ```
+  GGUF MXFP4->Q5_0 load-time repack: 45 tensor(s), 47.81 -> 61.88 GiB
+  (+14.06 GiB, x1.294). Lossless -- every element dequantizes to the same fp32
+  value. Set SGLANG_GGUF_MXFP4_REPACK=0 to refuse MXFP4 instead.
+  ```
+
+  Size the resident-expert fraction against the POST-repack figure, not the
+  file size on disk.
+- **It can refuse.** Q5_0 stores its scale as fp16, which holds `2**e` exactly
+  only for `e` in `[-24, 15]`, while e8m0 spans `[-127, 127]`. A block outside
+  that window is refused naming the tensor and the offending scale rather than
+  rounded. No published export has hit this; if one does, that tensor genuinely
+  cannot go into Q5_0 and the fix is a kernel, not a wider tolerance.
+
+`SGLANG_GGUF_MXFP4_REPACK=0` switches the repack off, which restores the
+pre-#391 behaviour: the family adapter's executability gate refuses the file at
+load time, naming MXFP4. That is a debugging switch, not an operating mode.
 
 ### 4.6 fp8 MoE expert offload, TP=1 on the 5090
 

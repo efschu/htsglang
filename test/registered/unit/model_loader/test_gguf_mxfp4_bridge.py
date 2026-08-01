@@ -33,9 +33,14 @@ What the layout bridging does NOT establish is that the safetensors mxfp4
 expert *kernels* can run this checkpoint -- they cannot, for reasons that are
 about the layer contract rather than the bytes (``Mxfp4MoEMethod`` needs BOTH
 projections in mxfp4, and this export pairs MXFP4 ``down`` with IQ3_XXS
-``gate``/``up``). The last test pins the premise of that verdict: MXFP4 is
-absent from every executable GGUF type set. If someone adds an MXFP4 kernel,
-that test fails and this whole analysis is due for revision.
+``gate``/``up``). Bridge B is the one that shipped: ``gguf_mxfp4_repack``
+performs it inside the weight stream, and the tests here call that module
+rather than a copy of it.
+
+The last two tests pin the premise the shipped repair rests on -- MXFP4 absent
+from every executable GGUF type set, Q5_0 present in all of them. If someone
+adds an MXFP4 kernel, the first fails and the repack becomes optional rather
+than load-bearing.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ from gguf.constants import GGMLQuantizationType as GGMLType
 from gguf.quants import dequantize, quantize
 
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.model_loader.gguf_mxfp4_repack import repacked_gguf_bytes
 
 #: llama.cpp's ``kvalues_mxfp4`` (ggml-common.h): the E2M1 lattice, doubled so
 #: it fits in int8. Indexed by the raw 4-bit code.
@@ -102,38 +108,12 @@ def gguf_mxfp4_to_ocp(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def gguf_mxfp4_to_q5_0(blocks: np.ndarray) -> np.ndarray:
     """Bridge B: GGUF MXFP4 blocks -> GGUF Q5_0 blocks, value-exact.
 
-    ``value = kvalues[code] * 2**(e - 128)`` maps onto Q5_0's
-    ``value = (q - 16) * d`` with ``q = kvalues[code] + 16`` and
-    ``d = 2**(e - 128)``. Q5_0 stores ``d`` as fp16, so the exponent has to land
-    in fp16's representable range; blocks whose codes are all zero are emitted
-    with ``d = 0`` instead, which is exact for them and sidesteps the e8m0
-    sentinel a fully-zero block gets from the quantizer.
+    This is the shipped repack (``model_loader/gguf_mxfp4_repack``) under a
+    block-shaped call, not a second implementation: the analysis and the loader
+    must not be able to drift apart. ``(n, 17)`` in, ``(n, 22)`` out, one block
+    per row.
     """
-    e8m0, codes = unpack_gguf_mxfp4(blocks)
-    signed = GGUF_MXFP4_KVALUES[codes]
-    q = (signed.astype(np.int16) + 16).astype(np.uint8)
-
-    exponent = e8m0.astype(np.int32) - 128
-    all_zero = (signed == 0).all(axis=-1)
-    # fp16 holds 2**-24 (smallest subnormal) .. 2**15 exactly.
-    unrepresentable = (~all_zero) & ((exponent < -24) | (exponent > 15))
-    if unrepresentable.any():
-        raise ValueError(
-            f"{int(unrepresentable.sum())} MXFP4 blocks carry an e8m0 exponent "
-            "outside fp16 range; Q5_0 cannot hold their scale exactly"
-        )
-    d = np.where(
-        all_zero,
-        np.float32(0.0),
-        np.exp2(np.clip(exponent, -24, 15).astype(np.float32)),
-    )
-
-    qs = (q[:, 0:16] & np.uint8(0x0F)) | (q[:, 16:32] << np.uint8(4))
-    qh = np.packbits(
-        (q >> np.uint8(4)).reshape(-1, 1, MXFP4_BLOCK_SIZE), axis=-1, bitorder="little"
-    ).reshape(-1, 4)
-    d_bytes = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
-    return np.concatenate([d_bytes, qh, qs], axis=-1)
+    return repacked_gguf_bytes(GGMLType.MXFP4, blocks, "test_bridge")
 
 
 class TestGGUFMXFP4BlockGeometry(unittest.TestCase):
@@ -250,7 +230,8 @@ class TestBridgeToQ5_0(unittest.TestCase):
 
 
 class TestMXFP4IsStillUnexecutable(unittest.TestCase):
-    """The premise of the blocker-1 verdict. When this fails, revisit it."""
+    """Why the repack is load-bearing. When the first of these fails, it is
+    not: an MXFP4 kernel would make the conversion a choice again."""
 
     def test_mxfp4_absent_from_every_gguf_type_set(self):
         from sglang.srt.layers.quantization.gguf import (

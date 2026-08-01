@@ -1241,6 +1241,11 @@ def gguf_quant_weights_iterator(
 
     import gguf
 
+    from sglang.srt.model_loader.gguf_mxfp4_repack import (
+        log_gguf_repack_plan,
+        repacked_gguf_bytes,
+        repacked_gguf_type,
+    )
     from sglang.srt.model_loader.gguf_shards import (
         declared_tensor_count,
         resolve_gguf_shard_paths,
@@ -1263,6 +1268,15 @@ def gguf_quant_weights_iterator(
             "silently missing weights."
         )
 
+    # #391: types with no GGUF kernel that a value-exact load-time repack turns
+    # into types that have one (MXFP4 -> Q5_0) are converted HERE, at the two
+    # points below where a tensor's type marker and its payload leave the
+    # reader. Everything downstream -- the per-expert split of the stacked
+    # ffn_*_exps tensors included -- sees only the repacked type, so no kernel,
+    # type bucket or adapter needs to know the source type existed. The repack
+    # is not free in bytes; this states the cost once, before it is paid.
+    log_gguf_repack_plan(all_tensors)
+
     # MoE expert weight name patterns
     MOE_WEIGHT_PATTERNS = {
         "ffn_gate_exps": "gate_proj",  # gate projection
@@ -1272,8 +1286,8 @@ def gguf_quant_weights_iterator(
 
     # First pass: yield weight types
     for tensor in all_tensors:
-        weight_type = tensor.tensor_type
         tensor_name = tensor.name
+        weight_type = repacked_gguf_type(tensor.tensor_type, tensor_name)
 
         # Check if this is a MoE expert weight (packed format)
         is_moe_weight = any(
@@ -1309,8 +1323,9 @@ def gguf_quant_weights_iterator(
     # Second pass: yield actual weights
     for tensor in all_tensors:
         weight = tensor.data
-        weight_type = tensor.tensor_type
         tensor_name = tensor.name
+        source_type = tensor.tensor_type
+        weight_type = repacked_gguf_type(source_type, tensor_name)
 
         # Check if this is a MoE expert weight (packed format)
         is_moe_weight = any(
@@ -1331,7 +1346,14 @@ def gguf_quant_weights_iterator(
                     # Packed format: [num_experts, ...]
                     num_experts = weight.shape[0]
                     for expert_id in range(num_experts):
-                        expert_weight = weight[expert_id]
+                        # Repack per expert, not per stacked tensor: a Q5_0
+                        # block is self-contained and the split runs on whole
+                        # blocks, so one expert's slice repacks to a valid
+                        # payload on its own -- and the transient buffer stays
+                        # one expert wide instead of one layer wide.
+                        expert_weight = repacked_gguf_bytes(
+                            source_type, weight[expert_id], tensor_name
+                        )
 
                         if weight_type.name != "F32":
                             hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
@@ -1345,7 +1367,7 @@ def gguf_quant_weights_iterator(
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
+            param = torch.tensor(repacked_gguf_bytes(source_type, weight, tensor_name))
             yield name, param
 
 
