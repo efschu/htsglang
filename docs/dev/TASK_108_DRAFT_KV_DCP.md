@@ -605,3 +605,31 @@ co-location.
   wrong for the draft. This is the outcome that would make H2 a real defect
   rather than an inapplicable one, and it is the reason a short prompt is
   mandatory in the probe set.
+
+## Pre-flight for the TP>kv window (desk, no cards)
+
+Runsheet: `/spinning/gpu-battery-results/2026-08-02_108-tpgtkv/RUNSHEET.md`.
+Verified with the rig vector `[30,17,17]` installed:
+
+| vehicle | kv | q | `attn_kv_replicated` | q split |
+|---|---|---|---|---|
+| Qwen3.5-2B | 2 | 8 | **True** | [4,2,2] |
+| Qwen3.6-35B-A3B-FP8 | 2 | 16 | **True** | [8,4,4] |
+| Qwen3.6-27B (control) | 4 | 24 | False | [12,6,6] |
+
+Two things the pre-flight changed:
+
+1. **`attn_kv_replicated` is `tp_plan_active(tp) and kv < tp`** — it needs an
+   INSTALLED plan. A bare call without one returns False and looks exactly like
+   "the trigger does not fire"; the first pre-flight made that mistake and
+   briefly appeared to falsify the whole proposal. Consequence for the window:
+   the precondition must be read off the RUNNING server, never computed.
+2. **Qwen3.5-2B at TP=3 with this vector is `8q/2kv over [4,2,2]`, which is
+   verbatim the worked example in `_replicated_kv_ragged_reindex`'s
+   docstring.** The 2B is not merely a vehicle for H2 — it is the canonical
+   one, which is a stronger reason to use it than "it is small".
+
+Straddle check (#105): with the aligned `units`/`groups` no rank's q heads
+cross a global kv-head boundary (2B rank0 = kv0 entirely, ranks 1-2 subset of
+kv1; 35B the same shape), so neither arm should hit the straddle ValueError
+that the `<=` threshold variant produced.
