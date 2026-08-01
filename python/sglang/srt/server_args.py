@@ -5209,6 +5209,14 @@ class ServerArgs:
         "factors. One week by default: those numbers move with a driver or a "
         "power-limit change, not with the hour.",
     ] = 604800.0
+    workbench_boot_matrix_model: A[
+        Optional[str],
+        "Model path the #349 integration boot matrix boots for its FEATURE-"
+        "CROSS arms, when 'boot_matrix' is named in --workbench-tenants. The "
+        "matrix boots real TP servers, so which model is a deployment fact, "
+        "not a default: without this the boot_matrix tenant reports itself "
+        "unavailable rather than guessing a path.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Universal client liveness (#344)
