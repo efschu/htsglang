@@ -297,22 +297,36 @@ def reg_all_to_all_single(
 # so a graph replay advances it exactly as the first run did.
 CAPTURABLE_BARLINK_TRANSPORTS = frozenset({"device", "host"})
 
-#: The GPU-driven transports whose graph capture has been checked but not
-#: yet proven. They are NOT in the list above -- they join it through an
-#: explicit switch, and only through it.
+#: The GPU-driven transports whose graph capture is carried by the release
+#: switch below rather than by the proven base set. They are NOT in the list
+#: above -- they join it through the switch, and only through it.
 GRAPH_ENABLE_TRANSPORTS = frozenset({"bar1", "matrix"})
 
-#: The switch. **Do not flip it before `benchmark/bar1_graph_check.py` has
-#: passed on free cards.**
+#: The switch, RELEASED on 2026-08-01 (task #369): the default is now on.
 #:
 #: Why a switch rather than two more names in the list: what stood between
-#: bar1 and a capture has been fixed by now (the fallback bolt in
-#: `barlink._select`, the kernel choice in `BarlinkBar1Transport._kern`, the
-#: direct mode in `_res_slot`) -- but "fixed" is a statement about the code,
+#: bar1 and a capture had been fixed in code (the fallback bolt in
+#: `barlink._select`, the kernel choice in `BarlinkBar1Transport._kernel`, the
+#: direct mode in `_res_slot`) -- but "fixed" was a statement about the code,
 #: not about the hardware. The one point that could not be settled without
-#: cards is whether the driver accepts `cudaLaunchCooperativeKernel` from
-#: inside a stream capture. While that is open, a captured run falls back to
-#: the 1blk variant and this line stays off.
+#: cards was whether the driver accepts `cudaLaunchCooperativeKernel` from
+#: inside a stream capture.
+#:
+#: It does. `benchmark/bar1_graph_check.py` passed 10/10 on three cards
+#: (5090 + 2x 3080), all nine gate cases plus the informational `grid` case,
+#: which is exactly the cooperative-launch question. Evidence:
+#: `/spinning/gpu-battery-results/2026-08-01_369_bar1_graph_gate/`
+#: `gate_PASS_docker.log`. It had to run inside the htsglang Docker image on
+#: the Proxmox host, because that is the only place on this rig that has both
+#: `/dev/dmabuf_holder` and a toolchain able to build the JIT extension --
+#: see `docs/rig-runbook.md` section 4.15.
+#:
+#: The switch stays as the off-ramp: `SGLANG_BARLINK_GRAPH_ENABLE=0` restores
+#: the pre-release behaviour, under which a captured run falls back to the
+#: 1blk variant. Note that reaching bar1 at all already requires a patched
+#: driver and the dma-buf holder, so this default cannot surprise a rig that
+#: has not deliberately set that up: without them the transport declines and
+#: never becomes capturable in the first place.
 _GRAPH_ENABLE_ENV = "SGLANG_BARLINK_GRAPH_ENABLE"
 
 #: Environment values that count as "off". Word for word the same tuple as
@@ -332,7 +346,7 @@ def graph_enable_set() -> bool:
     # imported, and that name would then be silently ignored.
     barlink_env_guard.check_retired_env_vars()
 
-    return os.environ.get(_GRAPH_ENABLE_ENV, "0") not in _OFF_VALUES
+    return os.environ.get(_GRAPH_ENABLE_ENV, "1") not in _OFF_VALUES
 
 
 def capturable_transports() -> frozenset:
@@ -368,36 +382,27 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
     if transport in GRAPH_ENABLE_TRANSPORTS:
-        # Different reason, so a different message. These two are NOT
-        # host-staged: their payload never touches host memory, and their
-        # round counter lives in device memory precisely so a graph replay
-        # advances it instead of reusing a stale value. What is missing is a
-        # MEASUREMENT -- nobody has captured their cooperative launch
-        # (cudaLaunchCooperativeKernel, used above
-        # SGLANG_BARLINK_BAR1_GRID_THRESHOLD) into a graph and replayed it. Saying
-        # "host-staged" here would be false, and letting them through on the
-        # strength of an argument would be the assumption this project keeps
-        # getting punished for.
-        #
-        # What has changed since: the three places where the transport
-        # genuinely would not have survived a capture are fixed
-        # (barlink._select no longer falls back to the gloo plane silently;
-        # BarlinkBar1Transport picks the 1blk kernel variant under capture;
-        # the result-slot path turns off direct mode, whose ring slot would
-        # otherwise be baked into the graph). Exactly one measurement
-        # question is left open, and there is a dedicated check program for
-        # it now.
+        # Reachable only when somebody turned the release OFF again, since
+        # #369 flipped its default on. Before that this branch said "capture
+        # is UNMEASURED" -- true then, false now, so it must not keep saying
+        # it. These two are not host-staged: their payload never touches host
+        # memory and their round counter lives in device memory precisely so
+        # a graph replay advances it instead of reusing a stale value. The
+        # one open question, whether the driver accepts
+        # cudaLaunchCooperativeKernel from inside a stream capture, was
+        # answered by bar1_graph_check.py's `grid` case on real cards.
         raise ValueError(
-            f"SGLANG_BARLINK_TRANSPORT={transport!r} is a GPU-driven transport "
-            "whose CUDA-graph capture is UNMEASURED, not one that is known to "
-            "be uncapturable: it never stages over the host and it keeps its "
-            "round counter in device memory. The code paths that would have "
-            "broken under capture are fixed; what is still missing is the "
-            "PROOF on this hardware. Run "
-            "`python benchmark/bar1_graph_check.py <dev,dev,...>` on free "
-            "cards; if it passes, set "
-            f"{_GRAPH_ENABLE_ENV}=1 to release this transport for capture. "
-            "Until then pass --disable-cuda-graph to run it eagerly."
+            f"SGLANG_BARLINK_TRANSPORT={transport!r} is capturable, but "
+            f"{_GRAPH_ENABLE_ENV} is set to an off value in this "
+            "environment, which takes it back out of the capturable set. "
+            "Its capture was proven on 2026-08-01 (task #369, "
+            "benchmark/bar1_graph_check.py, 10/10 including the cooperative "
+            "`grid` case), so the release is on by default and this is a "
+            f"deliberate opt-out. Either unset {_GRAPH_ENABLE_ENV} to let "
+            "this transport be captured, or keep it off and pass "
+            "--disable-cuda-graph to run eagerly -- the combination of an "
+            "off switch and enabled graphs is the one thing that cannot be "
+            "served."
         )
     raise ValueError(
         f"SGLANG_BARLINK_TRANSPORT={transport!r} is a host-staged transport "
