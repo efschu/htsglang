@@ -504,7 +504,23 @@ def _stub_block_fp8_linear(
     return acc.to(input.dtype)
 
 
-def load_kernels(dry_run: bool) -> Kernels:
+#: Block-FP8 backends selectable with --fp8-block-backend. "auto" is what a
+#: bare process resolves through dispatch_w8a8_block_fp8_linear, i.e. what a
+#: server WITHOUT an explicit --fp8-gemm-backend would pick for this card.
+#: On sm120 that is flashinfer_gemm_..._with_fallback, whose CUTLASS kernel
+#: prints "Arch conditional MMA instruction used without targeting
+#: appropriate compute capability" on every launch (measured 2026-08-01,
+#: millions of lines per minute) -- so the lane is pinned explicitly for a
+#: measurement and the auto verdict is recorded as a note, not benched.
+BLOCK_FP8_BACKENDS = {
+    "triton": "triton_w8a8_block_fp8_linear",
+    "cutlass": "cutlass_w8a8_block_fp8_linear_with_fallback",
+    "deepgemm": "deepgemm_w8a8_block_fp8_linear_with_fallback",
+    "flashinfer": "flashinfer_gemm_w8a8_block_fp8_linear_with_fallback",
+}
+
+
+def load_kernels(dry_run: bool, block_backend: str = "auto") -> Kernels:
     fp8_dtype = torch.float8_e4m3fn
     if dry_run:
         try:
@@ -554,11 +570,12 @@ def load_kernels(dry_run: bool) -> Kernels:
         # checkpoint (fp8.py:1132 `if self.block_quant:` ->
         # self.w8a8_block_fp8_linear). Resolved for the current device, so it
         # must be called after the device is selected.
-        from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
-            dispatch_w8a8_block_fp8_linear,
-        )
+        from sglang.srt.layers.quantization import fp8_utils  # noqa: PLC0415
 
-        block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+        if block_backend == "auto":
+            block_fp8_linear = fp8_utils.dispatch_w8a8_block_fp8_linear()
+        else:
+            block_fp8_linear = getattr(fp8_utils, BLOCK_FP8_BACKENDS[block_backend])
     except Exception as ex:
         block_fp8_linear = None
         missing.append(f"dispatch_w8a8_block_fp8_linear: {type(ex).__name__}: {ex}")
@@ -739,7 +756,15 @@ def build_lanes(op: Operand, kn: Kernels, want: Sequence[str]) -> dict:
                     )
 
                 out["fp8_ct_fused"] = _fp8_stub_fused
-    if "fp8_block_fused" in want and kn.block_fp8_linear is not None:
+    # The block-fp8 path quantizes activations in groups of block_k and
+    # asserts K % block_k == 0 (fp8_kernel.py:649). It therefore CANNOT run a
+    # shard whose K is not 128-aligned -- e.g. the auto vector's mlp_down
+    # K=8160 under the INT8 16-element unit family. That is not a harness
+    # limitation but the reason the FP8 checkpoint coarsens the same
+    # dimension to 128-element units (8192) in the first place. Skipped, not
+    # crashed, and its absence at those shapes is itself the finding.
+    block_ok = op.x.shape[-1] % FP8_BLOCK[1] == 0
+    if "fp8_block_fused" in want and kn.block_fp8_linear is not None and block_ok:
         # The lane the deployed Qwen3.6-27B-FP8 checkpoint actually runs.
         # Its quantization_config carries weight_block_size [128, 128], so
         # Fp8LinearMethod takes the `if self.block_quant:` branch
@@ -1007,6 +1032,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="omit the #255 tuner shapes and the #370 FP8-block MLP pair",
     )
+    ap.add_argument(
+        "--fp8-block-backend",
+        default="auto",
+        choices=["auto"] + sorted(BLOCK_FP8_BACKENDS),
+        help="which block-fp8 backend the fp8_block_fused lane uses; 'auto' "
+        "is dispatch_w8a8_block_fp8_linear's own answer for this card",
+    )
     ap.add_argument("--seed", type=int, default=368)
     ap.add_argument("--out", default="", help="JSON output path")
     ap.add_argument(
@@ -1024,7 +1056,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.check_imports:
-        kn = load_kernels(dry_run=False)
+        kn = load_kernels(dry_run=False, block_backend=args.fp8_block_backend)
         for label, obj in (
             ("per_token_quant_int8", kn.per_token_quant_int8),
             ("int8_scaled_mm", kn.int8_scaled_mm),
@@ -1186,7 +1218,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.shapes_only:
         return 0
 
-    kn = load_kernels(args.dry_run)
+    kn = load_kernels(args.dry_run, args.fp8_block_backend)
     cuda = (not args.dry_run) and torch.cuda.is_available()
     if not args.dry_run and not cuda:
         print(
@@ -1271,6 +1303,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "target_ms": args.target_ms,
             "max_iters": args.max_iters,
             "max_dim": args.max_dim,
+            "fp8_block_backend": args.fp8_block_backend,
+            "fp8_block_backend_resolved": getattr(
+                kn.block_fp8_linear, "__name__", str(kn.block_fp8_linear)
+            ),
             "seed": args.seed,
         },
         "shapes": [asdict(s) for s in shapes],
