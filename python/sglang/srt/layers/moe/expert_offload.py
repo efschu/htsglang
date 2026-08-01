@@ -564,7 +564,11 @@ HOST_SHARD_RATIO_ENV = "SGLANG_MOE_HOST_SHARD_RATIO"
 _PCIE_LANE_GBPS = {1: 0.250, 2: 0.500, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
 
 #: Latch so the chosen ratio is logged once per process, not once per layer.
+#: Read and set under _HOST_SHARD_LOG_LOCK: the plan that reaches it is built
+#: inside the loader's thread pool (#391), and an unguarded check-then-set latch
+#: is exactly the pattern that let two threads through at once.
 _HOST_SHARD_LOGGED = False
+_HOST_SHARD_LOG_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -840,9 +844,10 @@ def _log_host_shard_choice(context: "ColdShardContext", owned: int, pool: int) -
 
     import logging
 
-    if _HOST_SHARD_LOGGED:
-        return
-    _HOST_SHARD_LOGGED = True
+    with _HOST_SHARD_LOG_LOCK:
+        if _HOST_SHARD_LOGGED:
+            return
+        _HOST_SHARD_LOGGED = True
     share = (owned / pool) if pool else 0.0
     logging.getLogger(__name__).info(
         "MoE cold-expert host shard (#394): rank %d/%d owns %d of %d cold "
@@ -1158,6 +1163,36 @@ class StreamingStagingLedger:
     peak_host_bytes: int = 0
     layers: int = 0
     tensors: int = 0
+    #: #391: the weight loaders run on a ThreadPoolExecutor, so several stagers
+    #: (and several experts of one stager) reach this ledger at once. ``x += n``
+    #: on a field is a read-modify-write and drops updates under threads, which
+    #: would make the very number the host-RAM model is judged against
+    #: silently low. All mutation goes through :meth:`record`.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def record(
+        self,
+        *,
+        streamed: int = 0,
+        resident: int = 0,
+        pinned: int = 0,
+        delegated: int = 0,
+        inflight: int = 0,
+        tensors: int = 0,
+        layers: int = 0,
+    ) -> None:
+        """Apply one atomic set of deltas and re-touch the peaks."""
+        with self._lock:
+            self.streamed_bytes += streamed
+            self.resident_bytes += resident
+            self.pinned_bytes += pinned
+            self.delegated_bytes += delegated
+            self.inflight_bytes += inflight
+            self.tensors += tensors
+            self.layers += layers
+            self._touch_peak()
 
     def _touch_peak(self) -> None:
         self.peak_inflight_bytes = max(self.peak_inflight_bytes, self.inflight_bytes)
@@ -1220,7 +1255,7 @@ def log_streaming_staging_layer(label: str, plan: "ExpertStagingPlan") -> None:
     from sglang.srt.environ import envs
 
     ledger = _STAGING_LEDGER
-    ledger.layers += 1
+    ledger.record(layers=1)
     if not envs.SGLANG_MOE_STAGING_TRACE.get():
         return
     logging.getLogger(__name__).info(
@@ -1307,6 +1342,15 @@ class StreamingExpertStager:
         self.resident_buf = None
         self.spill = None
         self.finalized = False
+        #: #391: one stager is fed by MANY loader threads. The weight loaders
+        #: run on a ThreadPoolExecutor and every GGUF tensor is a CPU tensor, so
+        #: gate and up of one layer -- both routed into the same ``w13_qweight``
+        #: stager -- are submitted concurrently. This lock covers every piece of
+        #: shared state below: the two tiers and the row-shape guard that says
+        #: whether they exist, the pending-shard map, and the placed set. Held
+        #: only around bookkeeping; the per-expert ``copy_`` runs outside it, so
+        #: experts still land in parallel (they write disjoint rows).
+        self._lock = threading.RLock()
 
     @property
     def is_complete(self) -> bool:
@@ -1316,9 +1360,10 @@ class StreamingExpertStager:
         written in :meth:`finalize`, so waiting for them would mean the layer
         boundary never fires during the load.
         """
-        return not self._pending and len(self._placed) == len(self._dest) - len(
-            self._zero_experts
-        )
+        with self._lock:
+            return not self._pending and len(self._placed) == len(self._dest) - len(
+                self._zero_experts
+            )
 
     # -- stream side --------------------------------------------------------
 
@@ -1330,57 +1375,65 @@ class StreamingExpertStager:
         caller must not keep a reference of its own -- holding one turns the
         "one incomplete expert set" bound back into "the whole loaded set",
         which is the #256 lesson and the whole point of this class.
+
+        Concurrent-safe: the shard set of an expert is completed and CLAIMED
+        under the lock, so two threads carrying the two halves of one expert
+        cannot both decide they were the last one. Only the claiming thread
+        goes on to copy, and it copies outside the lock.
         """
-        if self.finalized:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r} got expert "
-                f"{expert_id}/{shard_id} after finalize()"
-            )
         expert_id = int(expert_id)
-        if shard_id not in self.shard_keys:
-            raise ValueError(
-                f"streaming stager for {self.label!r} takes shards "
-                f"{list(self.shard_keys)}, got {shard_id!r}"
-            )
-        if expert_id not in self._dest:
-            raise KeyError(
-                f"streaming stager for {self.label!r} has no plan slot for "
-                f"expert {expert_id}; the plan covers "
-                f"[0,{self.plan.num_experts})"
-            )
-        if expert_id in self._placed:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: expert {expert_id} was "
-                "already placed; the stream delivered it twice"
-            )
-        parts = self._pending.setdefault(expert_id, {})
-        if shard_id in parts:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: expert {expert_id} got "
-                f"shard {shard_id!r} twice"
-            )
-        nbytes = _nbytes(tensor)
-        _STAGING_LEDGER.streamed_bytes += nbytes
-        if self._dest[expert_id] is None:
-            # #394: a peer rank's host tier owns this cold expert. Released
-            # here without ever being copied -- keeping it would trade the VRAM
-            # the feature saves for host RAM nobody reads.
-            parts[shard_id] = None
-            _STAGING_LEDGER.delegated_bytes += nbytes
-        else:
-            parts[shard_id] = tensor
-            self._inflight[expert_id] = self._inflight.get(expert_id, 0) + nbytes
-            _STAGING_LEDGER.inflight_bytes += nbytes
-            _STAGING_LEDGER._touch_peak()
-        if len(parts) == len(self.shard_keys):
-            del self._pending[expert_id]
+        with self._lock:
+            if self.finalized:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r} got expert "
+                    f"{expert_id}/{shard_id} after finalize()"
+                )
+            if shard_id not in self.shard_keys:
+                raise ValueError(
+                    f"streaming stager for {self.label!r} takes shards "
+                    f"{list(self.shard_keys)}, got {shard_id!r}"
+                )
+            if expert_id not in self._dest:
+                raise KeyError(
+                    f"streaming stager for {self.label!r} has no plan slot for "
+                    f"expert {expert_id}; the plan covers "
+                    f"[0,{self.plan.num_experts})"
+                )
+            if expert_id in self._placed:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert {expert_id} was "
+                    "already placed; the stream delivered it twice"
+                )
+            parts = self._pending.setdefault(expert_id, {})
+            if shard_id in parts:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert {expert_id} got "
+                    f"shard {shard_id!r} twice"
+                )
+            nbytes = _nbytes(tensor)
+            if self._dest[expert_id] is None:
+                # #394: a peer rank's host tier owns this cold expert. Released
+                # here without ever being copied -- keeping it would trade the
+                # VRAM the feature saves for host RAM nobody reads.
+                parts[shard_id] = None
+                _STAGING_LEDGER.record(streamed=nbytes, delegated=nbytes)
+            else:
+                parts[shard_id] = tensor
+                self._inflight[expert_id] = self._inflight.get(expert_id, 0) + nbytes
+                _STAGING_LEDGER.record(streamed=nbytes, inflight=nbytes)
+            complete = len(parts) == len(self.shard_keys)
+            if complete:
+                del self._pending[expert_id]
+                self._placed.add(expert_id)
+        if complete:
             self._place(expert_id, parts)
 
     def _place(self, expert_id: int, parts) -> None:
         import torch
 
-        self._placed.add(expert_id)
-        held = self._inflight.pop(expert_id, 0)
+        with self._lock:
+            self._placed.add(expert_id)
+            held = self._inflight.pop(expert_id, 0)
         dest = self._dest[expert_id]
         if dest is None:
             parts.clear()
@@ -1393,50 +1446,71 @@ class StreamingExpertStager:
         kind, index = dest
         if kind == "resident":
             resident_buf[index].copy_(row)
-            _STAGING_LEDGER.resident_bytes += _nbytes(row)
+            _STAGING_LEDGER.record(resident=_nbytes(row), inflight=-held)
         else:
             spill[index].copy_(row)
-        _STAGING_LEDGER.inflight_bytes -= held
-        _STAGING_LEDGER._touch_peak()
+            _STAGING_LEDGER.record(inflight=-held)
 
     def _ensure_tiers(self, row):
-        """Build the two tiers on the first complete expert; return them."""
+        """Build the two tiers on the first complete expert; return them.
+
+        #391 boot 10: this used to publish ``self._row_shape`` -- the guard that
+        says "the tiers exist" -- BEFORE allocating them, and ran unlocked while
+        the loader's thread pool pushed experts of the same tensor in parallel.
+        A second thread arriving inside that window saw the guard, skipped the
+        build and got a pair whose halves were still ``None``, and ``_place``
+        subscripted it: ``TypeError: 'NoneType' object is not subscriptable``,
+        three boots out of three. ``spill.pin_memory()`` is what makes the
+        window wide enough to hit reliably -- it is a page-locking allocation of
+        the whole cold tier.
+
+        The build is therefore serialized and the guard published LAST, after
+        both tiers exist. Both halves matter: the lock alone would still let the
+        ``elif`` shape check read a half-published ``_row_shape``/``_dtype``
+        pair if the build ever raised, and the ordering alone would still race
+        two threads into two allocations of the same tier.
+        """
         import torch
 
         row_shape = tuple(int(d) for d in row.shape)
-        if self._row_shape is None:
-            self._row_shape = row_shape
-            self._dtype = row.dtype
-            buf = self._allocate(row_shape, row.dtype)
-            if tuple(buf.shape) != (self.plan.buffer_slots,) + row_shape:
-                raise RuntimeError(
-                    f"streaming stager for {self.label!r}: allocate() returned "
-                    f"{tuple(buf.shape)}, expected "
-                    f"{(self.plan.buffer_slots,) + row_shape}"
-                )
-            self.resident_buf = buf
-            if self.plan.spill_ids:
-                spill = torch.empty(
-                    (len(self.plan.spill_ids),) + row_shape,
-                    dtype=row.dtype,
-                    device="cpu",
-                )
-                # Pinning is what makes the later H2D fetch async; skipped when
-                # there is no CUDA context (desk tests), as in the pull loop.
-                if torch.cuda.is_available():
-                    spill = spill.pin_memory()
+        with self._lock:
+            if self._row_shape is None:
+                buf = self._allocate(row_shape, row.dtype)
+                if tuple(buf.shape) != (self.plan.buffer_slots,) + row_shape:
+                    raise RuntimeError(
+                        f"streaming stager for {self.label!r}: allocate() returned "
+                        f"{tuple(buf.shape)}, expected "
+                        f"{(self.plan.buffer_slots,) + row_shape}"
+                    )
+                spill = None
+                if self.plan.spill_ids:
+                    spill = torch.empty(
+                        (len(self.plan.spill_ids),) + row_shape,
+                        dtype=row.dtype,
+                        device="cpu",
+                    )
+                    # Pinning is what makes the later H2D fetch async; skipped
+                    # when there is no CUDA context (desk tests), as in the
+                    # pull loop.
+                    if torch.cuda.is_available():
+                        spill = spill.pin_memory()
+                # Publish only now: every reader of _row_shape takes it to mean
+                # that BOTH tiers below are already built.
+                self.resident_buf = buf
                 self.spill = spill
-                _STAGING_LEDGER.pinned_bytes += _nbytes(spill)
-                _STAGING_LEDGER._touch_peak()
-            _STAGING_LEDGER.tensors += 1
-        elif row_shape != self._row_shape or row.dtype != self._dtype:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: expert row is "
-                f"{row_shape}/{row.dtype} but the tiers were built for "
-                f"{self._row_shape}/{self._dtype}; experts of one tensor must "
-                "be uniform"
-            )
-        return self.resident_buf, self.spill
+                self._dtype = row.dtype
+                self._row_shape = row_shape
+                _STAGING_LEDGER.record(
+                    pinned=_nbytes(spill) if spill is not None else 0, tensors=1
+                )
+            elif row_shape != self._row_shape or row.dtype != self._dtype:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: expert row is "
+                    f"{row_shape}/{row.dtype} but the tiers were built for "
+                    f"{self._row_shape}/{self._dtype}; experts of one tensor must "
+                    "be uniform"
+                )
+            return self.resident_buf, self.spill
 
     # -- end of stream ------------------------------------------------------
 
@@ -1446,50 +1520,58 @@ class StreamingExpertStager:
         Returns ``(resident_buffer, spill_pool_or_None)`` -- the same pair
         ``stage_experts_into_tiers`` returns, for the same
         ``register_load_time_presplit`` call.
+
+        Under the same lock as the stream side: the drain happens after the
+        loader's pool has joined, but a stager that closes while a straggler is
+        still in ``submit`` has to see either the whole submission or none of
+        it, not a half-filled shard set that reads as "incomplete".
         """
         import torch
 
-        if self.finalized:
-            raise RuntimeError(f"streaming stager for {self.label!r} finalized twice")
-        if self._pending:
-            incomplete = {
-                e: sorted(k for k in parts)
-                for e, parts in sorted(self._pending.items())
-            }
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: the stream ended with "
-                f"incomplete experts {incomplete}; every expert needs all of "
-                f"{list(self.shard_keys)}"
-            )
-        if self._row_shape is None:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: the stream delivered no "
-                "expert at all, so there is no row shape to build the tiers "
-                "from"
-            )
-        zero_shard_shape = self._zero_shard_shape(self._row_shape)
-        for expert_id in self._zero_experts:
-            if expert_id in self._placed:
+        with self._lock:
+            if self.finalized:
                 raise RuntimeError(
-                    f"streaming stager for {self.label!r}: expert {expert_id} "
-                    "is declared all-zero but the stream delivered bytes for it"
+                    f"streaming stager for {self.label!r} finalized twice"
                 )
-            self._place(
-                expert_id,
-                {
-                    key: torch.zeros(zero_shard_shape, dtype=self._dtype)
-                    for key in self.shard_keys
-                },
-            )
-        missing = sorted(set(self._dest) - self._placed)
-        if missing:
-            raise RuntimeError(
-                f"streaming stager for {self.label!r}: the stream never "
-                f"delivered experts {missing}; the plan reserved a tier slot "
-                "for each of them"
-            )
-        self.finalized = True
-        return self.resident_buf, self.spill
+            if self._pending:
+                incomplete = {
+                    e: sorted(k for k in parts)
+                    for e, parts in sorted(self._pending.items())
+                }
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream ended with "
+                    f"incomplete experts {incomplete}; every expert needs all of "
+                    f"{list(self.shard_keys)}"
+                )
+            if self._row_shape is None:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream delivered no "
+                    "expert at all, so there is no row shape to build the tiers "
+                    "from"
+                )
+            zero_shard_shape = self._zero_shard_shape(self._row_shape)
+            for expert_id in self._zero_experts:
+                if expert_id in self._placed:
+                    raise RuntimeError(
+                        f"streaming stager for {self.label!r}: expert {expert_id} "
+                        "is declared all-zero but the stream delivered bytes for it"
+                    )
+                self._place(
+                    expert_id,
+                    {
+                        key: torch.zeros(zero_shard_shape, dtype=self._dtype)
+                        for key in self.shard_keys
+                    },
+                )
+            missing = sorted(set(self._dest) - self._placed)
+            if missing:
+                raise RuntimeError(
+                    f"streaming stager for {self.label!r}: the stream never "
+                    f"delivered experts {missing}; the plan reserved a tier slot "
+                    "for each of them"
+                )
+            self.finalized = True
+            return self.resident_buf, self.spill
 
     def _zero_shard_shape(self, row_shape: Tuple[int, ...]) -> Tuple[int, ...]:
         """Shape of ONE shard of the all-zero pad expert.

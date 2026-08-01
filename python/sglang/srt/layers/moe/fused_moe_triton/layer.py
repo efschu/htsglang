@@ -4,6 +4,7 @@
 
 import logging
 import math
+import threading
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -91,6 +92,15 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+#: #391: the GGUF stream-staging latches below (does this layer stage at all,
+#: which stagers exist, has the layer boundary been claimed) are read on every
+#: arriving expert shard from the weight loaders' thread pool. One process-wide
+#: lock covers all of them: every one is a check-then-build that runs at most
+#: twice per layer, so the fast path never touches it and there is nothing to
+#: gain from a per-layer lock -- while a per-layer lock would itself need to be
+#: created by a check-then-build.
+_GGUF_STREAM_LATCH_LOCK = threading.Lock()
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -1229,20 +1239,34 @@ class FusedMoE(torch.nn.Module):
     _GGUF_SHARD_TO_ATTR = {"w1": "w13_qweight", "w3": "w13_qweight", "w2": "w2_qweight"}
 
     def _gguf_stream_staging_enabled(self) -> bool:
-        """Latched: does this layer stage from the stream? Decided once."""
+        """Latched: does this layer stage from the stream? Decided once.
+
+        Double-checked: the weight loaders run on a thread pool (#391), so the
+        first shards of one layer arrive concurrently and would otherwise run
+        this latch several times over -- each run REPLACING
+        ``_gguf_stream_stagers`` with a fresh dict and losing whatever the
+        earlier thread had already staged into it. The fast path is a plain
+        attribute read; only a latch miss takes the lock.
+        """
         cached = getattr(self, "_gguf_stream_staging_on", None)
         if cached is not None:
             return cached
         from sglang.srt.environ import envs
 
-        on = (
-            bool(envs.SGLANG_MOE_GGUF_STREAM_STAGING.get())
-            and self._gguf_moe_offload_eligible()
-        )
-        self._gguf_stream_staging_on = on
-        if on:
-            self._gguf_stream_stagers = {}
-        return on
+        with _GGUF_STREAM_LATCH_LOCK:
+            cached = getattr(self, "_gguf_stream_staging_on", None)
+            if cached is not None:
+                return cached
+            on = (
+                bool(envs.SGLANG_MOE_GGUF_STREAM_STAGING.get())
+                and self._gguf_moe_offload_eligible()
+            )
+            if on:
+                self._gguf_stream_stagers = {}
+            # Published last: a fast-path reader that sees True must find the
+            # registry already there.
+            self._gguf_stream_staging_on = on
+            return on
 
     def _gguf_owned_expert_count(self, param) -> int:
         """Expert count the plan is built over -- the same one the pull path uses.
@@ -1304,10 +1328,17 @@ class FusedMoE(torch.nn.Module):
         stagers = self._gguf_stream_stagers
         stager = stagers.get(attr)
         if stager is None:
-            stager = self._new_gguf_stream_stager(attr, param)
-            if stager is None:
-                return False
-            stagers[attr] = stager
+            # Same double-check as the latch above: gate and up of one layer
+            # both route into ``w13_qweight`` and arrive on two loader threads,
+            # so an unguarded build lets the second stager overwrite the first
+            # and the shards already taken by the first are simply lost (#391).
+            with _GGUF_STREAM_LATCH_LOCK:
+                stager = stagers.get(attr)
+                if stager is None:
+                    stager = self._new_gguf_stream_stager(attr, param)
+                    if stager is None:
+                        return False
+                    stagers[attr] = stager
         stager.submit(self._gguf_local_expert_index(expert_id), shard_id, loaded_weight)
         self._maybe_close_gguf_stream_layer()
         return True
@@ -1340,7 +1371,13 @@ class FusedMoE(torch.nn.Module):
             trim_host_allocator,
         )
 
-        self._gguf_stream_layer_closed = True
+        # The two stagers can report complete to two loader threads at once
+        # (#391); claim the boundary under the lock so the trim and the trace
+        # line stay exactly one per layer. The work itself runs outside it.
+        with _GGUF_STREAM_LATCH_LOCK:
+            if getattr(self, "_gguf_stream_layer_closed", False):
+                return
+            self._gguf_stream_layer_closed = True
         trim_host_allocator()
         log_streaming_staging_layer(
             f"layer {getattr(self, 'layer_id', '?')}",
