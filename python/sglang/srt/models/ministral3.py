@@ -58,12 +58,27 @@ class Ministral3Attention(LlamaAttention):
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
 
-        # sliding window
+        # #378: the sliding window, actually applied.
+        #
+        # This used to read config.sliding_window and then `pass`, on the
+        # stated assumption that "RadixAttention handles this mostly via logic
+        # in forward/flashinfer". It does not, and THREE gates missed at once
+        # (each verified by execution, not by reading):
+        #   * LlamaAttention built RadixAttention without a window, so it took
+        #     the -1 default, which means NO window;
+        #   * Ministral3ForCausalLM had no get_attention_sliding_window_size,
+        #     so ModelRunner's first branch missed;
+        #   * "Ministral3ForCausalLM" is not in is_hybrid_swa_model's arch
+        #     set, so ModelRunner's second branch missed too.
+        # The result was FULL attention on a model whose config declares a
+        # window: correct up to the window length and silently wrong past it,
+        # which is exactly what a short smoke test cannot see.
+        #
+        # `- 1` matches Gemma4's get_attention_sliding_window_size: the
+        # backends take the maximum ATTENDED DISTANCE, not the window width.
         self.sliding_window = getattr(config, "sliding_window", None)
         if self.sliding_window is not None:
-            # Update RadixAttention with sliding window if needed
-            # currently RadixAttention in sglang handles this mostly via logic in forward/flashinfer
-            pass
+            self.attn.sliding_window_size = int(self.sliding_window) - 1
 
     def forward(
         self,
@@ -164,6 +179,23 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         return Ministral3Model(config=config, quant_config=quant_config, prefix=prefix)
+
+    def get_attention_sliding_window_size(self):
+        """#378: the hook ``ModelRunner`` asks for FIRST when sizing the KV
+        path (``model_runner.py:2138``), the same one Gemma4 provides.
+
+        Without it the runner fell through to the ``is_hybrid_swa`` branch,
+        which is False for this architecture, and ended with
+        ``sliding_window_size = None`` -- so nothing downstream of attention
+        knew about the window either.
+
+        Returns ``None`` when the config declares no window, which leaves the
+        runner exactly where it was for such a checkpoint.
+        """
+        window = getattr(self.config, "sliding_window", None)
+        if window is None:
+            return None
+        return int(window) - 1
 
 
 EntryClass = [Ministral3ForCausalLM]
