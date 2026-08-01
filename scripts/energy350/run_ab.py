@@ -153,19 +153,59 @@ def _measure(config, *, dry_run: bool) -> Dict[str, Any]:
     }
 
 
+def _capture_boot_evidence(port: int, label: str, out_dir: str) -> Dict[str, Any]:
+    """Preserve the arm's boot log and extract the INSTALLED vector (#375).
+
+    The vector is read off the LOG, never derived from the flags -- that is
+    the #340 trap, and the whole point of the check is to see what the
+    planner actually installed rather than what was asked for. Recorded
+    structurally in result.json so a later reader does not depend on a log
+    file surviving.
+    """
+    import re
+    import shutil
+
+    src = f"/tmp/energy_boot_{port}.log"
+    info: Dict[str, Any] = {"boot_log": None, "installed_vector": None}
+    if not os.path.exists(src):
+        return info
+    dst = os.path.join(out_dir, f"boot_{label}.log")
+    try:
+        shutil.copyfile(src, dst)
+        info["boot_log"] = dst
+        text = open(dst, errors="replace").read()
+        hits = re.findall(r"rank-mlp-ratio ([0-9,]+)", text)
+        if hits:
+            info["installed_vector"] = hits[-1]
+        anchors = re.search(
+            r"objective=energy: planning for J/token, (\w+) power anchors", text
+        )
+        if anchors:
+            info["power_anchor_tier"] = anchors.group(1)
+    except OSError:
+        pass
+    return info
+
+
 def run(args) -> int:
     out: Dict[str, Any] = {"arms": {}, "config": vars(args).copy()}
     os.makedirs(args.out, exist_ok=True)
 
-    for label, extra in ARMS:
+    for arm_index, (label, extra) in enumerate(ARMS):
         print(f"=== ARM {label} ===", flush=True)
+        # #375: a DISTINCT port per arm. The harness derives its boot-log path
+        # from the port (energy.py:529, /tmp/energy_boot_{port}.log), so two
+        # arms on one port truncate each other's log and the per-arm installed
+        # vector is unrecoverable after the run -- which is exactly what cost
+        # a re-boot in the first probe window.
+        arm_port = args.port + arm_index
         try:
             cfg = build_config(
                 label=label,
                 extra=extra,
                 model_path=args.model,
                 reserve_mib=args.reserve_mib,
-                port=args.port,
+                port=arm_port,
                 buckets=[args.bucket],
                 workload_name=args.workload,
                 context_length=args.context_length,
@@ -173,6 +213,14 @@ def run(args) -> int:
                 perf_tune=args.perf_tune,
             )
             out["arms"][label] = _measure(cfg, dry_run=args.dry_run)
+            out["arms"][label]["port"] = arm_port
+            if not args.dry_run:
+                # A dry run boots nothing, so any log at that path is STALE
+                # from an earlier run. Capturing it would manufacture
+                # evidence for a measurement that did not happen.
+                out["arms"][label].update(
+                    _capture_boot_evidence(arm_port, label, args.out)
+                )
         except Exception as e:  # a failed arm is a RESULT, not a crash
             out["arms"][label] = {
                 "ok": False,
@@ -198,6 +246,18 @@ def verdict(out: Dict[str, Any], args) -> int:
         bad = [k for k in ("throughput", "energy") if not out["arms"].get(k, {}).get("ok")]
         print(f"INCONCLUSIVE: arm(s) failed: {', '.join(bad)}")
         return 2
+    # #375: the installed vectors are printed BEFORE any delta, because the
+    # deltas are meaningless when both arms planned the same key -- and a
+    # reader who sees the numbers first will believe them.
+    vt, ve = t.get("installed_vector"), e.get("installed_vector")
+    if vt or ve:
+        print(f"installed vectors: throughput={vt} energy={ve}")
+        if vt and ve and vt == ve:
+            print(
+                "  SAME VECTOR -- the arms are one configuration, so what "
+                "follows is an A-vs-A spread, not a divergence. Report 'no "
+                "divergence at this point'."
+            )
     tm, em = t["measurements"][0], e["measurements"][0]
     key_s = "prefill_tok_s" if args.axis == "prefill" else "decode_tok_s"
     key_j = "j_per_prefill_token" if args.axis == "prefill" else "j_per_decode_token"

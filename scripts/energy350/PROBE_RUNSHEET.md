@@ -80,6 +80,27 @@ Identical vectors mean the A/B was an A-vs-A and the deltas are the noise
 floor, not a result. Report it as *"no divergence at this point"*, not as
 GREEN. The #350 floor for reference: **0.638 tok/s and 0.240 J/tok**.
 
+## Canon: the first boot after a cache change is a JIT outlier
+
+**Warm or repeat before comparing.** The first #375 window read AMBER --
+energy arm +23.1 % J/token *and* +33.1 % tok/s -- and it was false. Two
+repeats of the THROUGHPUT arm alone gave 1254.43 and 1188.99 tok/s prefill
+(floor 65.44 tok/s), and the energy arm's 1263.51 sits inside that span; the
+original throughput arm's 949.58 lay 239 tok/s BELOW both of its own repeats.
+It was the first arm of the first pair, measured on a cold triton/flashinfer
+JIT cache (the #370 finding), and the claimed cross-arm delta was 4.8x the
+floor purely because of it.
+
+So: never compare arm 1 of boot 1 against arm 2 of boot 1. Either discard the
+first boot, or repeat each arm and read the deltas against the arm's own
+repeat spread. This applies in BOTH directions -- the #350 window's failure
+was a degenerate A/B that looked like nothing, this one's was a cold cache
+that looked like a win.
+
+The driver now prints the installed vectors BEFORE any delta and says so
+explicitly when both arms planned the same key, because a reader who sees the
+numbers first will believe them.
+
 ## Provenance duty
 
 Confirm the boot log line `objective=energy: planning for J/token, measured
