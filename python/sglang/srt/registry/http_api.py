@@ -125,6 +125,28 @@ def build_app(registry: EngineRegistry):
     async def post_pin(engine_id: str, body: dict = Body(...)):
         instance = registry.instance(engine_id)
         pinned = bool(body.get("pinned", True))
+        # #305 cut 1: an unhonourable pin fails AT PIN TIME with the named
+        # ledger reason. Accepting a pin that cannot be kept is worse than
+        # refusing it -- the operator then believes a model is protected while
+        # it is not, and finds out at the first demotion instead of here.
+        # Unpinning is always honoured (removing a protection cannot fail).
+        from fastapi import HTTPException
+
+        from sglang.srt.registry.rungs import pin_refusal_reason, rung_of
+
+        reason = pin_refusal_reason(
+            rung=rung_of(
+                instance.state,
+                ever_staged=bool(getattr(instance, "ever_staged", True)),
+                reserved_bytes=getattr(instance, "reserved_bytes", 0),
+            ),
+            pinned=pinned,
+            can_fund=bool(getattr(instance, "can_fund", True)),
+            ledger_detail=str(getattr(instance, "ledger_detail", "") or ""),
+            cross_geometry=bool(getattr(instance, "cross_geometry", False)),
+        )
+        if reason is not None:
+            raise HTTPException(status_code=409, detail=reason)
         # Pinning is absolute: a pinned engine is never demoted automatically.
         # It is a spec property, so the spec is replaced rather than mutated.
         object.__setattr__(instance.spec, "pinned", pinned)

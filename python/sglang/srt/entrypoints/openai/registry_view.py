@@ -115,6 +115,27 @@ class RegisteredEngine:
             "reserved_mib": self.reserved_bytes // (1 << 20),
             "health": self.health,
         }
+        # #305 cut 1: the ladder view. Reported alongside the registry's own
+        # fields, never in place of them -- `promote_cost_class` is a-priori
+        # (the ladder's measured record) and says so, while
+        # `measured_promotion_ms` below stays the only per-engine measurement.
+        try:
+            from sglang.srt.registry.rungs import rung_extension
+
+            block.update(
+                rung_extension(
+                    self.state,
+                    ever_staged=bool(getattr(self, "ever_staged", True)),
+                    reserved_bytes=self.reserved_bytes,
+                    pinned=self.pinned,
+                    engine_geometry=getattr(self, "world_geometry", None),
+                    active_geometry=getattr(self, "active_geometry", None),
+                )
+            )
+        except Exception:
+            # A reporting layer must never break the listing. Without the
+            # ladder fields a client still gets the registry's own residency.
+            pass
         if self.promotion_cost_ms is not None:
             # Measured, not guessed -- the registry only fills this in after it
             # has observed the transition once.
