@@ -1,0 +1,225 @@
+# ANALYSE #334 — club-3090 model coverage
+
+Survey and task placement for "alles auswählbar" across the club-3090 model
+set. **No implementation.** Discharges the feature-analysis-file duty for
+#334.
+
+---
+
+## 1. Inventory first — what is actually on the box
+
+Two trees, and they are different things.
+
+**`club-3090/models-cache/` — real checkpoints, what can be served today.**
+Qwen3.5 (2B, 4B, 9B, 35B-A3B, 122B-A10B), Qwen3.6 (27B dense, 35B-A3B),
+Gemma-4 (12B, 26B-A4B, 31B, E4B), Llama-3.1-8B, plus drafters (EAGLE3,
+speculator-eagle3, dflash per model). Formats: FP8, INT8-W8A8, AWQ,
+GPTQ-Int4, NVFP4, AutoRound-int4, and GGUF (Q3_K_M / Q4 / Q6, several with
+MTP preserved).
+
+**`club-3090/models/` — deployment RECIPES, not weights.** Compose files and
+READMEs per model × engine (`beellama`, `llama-cpp`, `ik-llama`, `vllm`,
+`vllm-omni`), 28-80 KB per directory.
+
+### The finding that reframes the task
+
+Of the five families in the brief, **three have no artifact on this box at
+all**:
+
+| family | on disk | note |
+| --- | --- | --- |
+| Qwen3-Omni-30B-A3B | **recipe only** (`models/qwen3-omni-30b-a3b/vllm-omni/`) | runs today on 2×3090 under **vLLM-Omni**, not sglang |
+| Ornith / ik-llama quants | **recipe only** (`models/qwen3.6-{27b,35b-a3b}/ik-llama/`) | compose files for IQ-family quants |
+| DiffusionGemma | **absent** | no checkpoint, no recipe |
+| Nemotron-Puzzle | **absent** | no checkpoint, no recipe |
+| agents-a1 | **absent** | no checkpoint, no recipe, no upstream signal |
+
+So this survey is not "five models to integrate". It is: **two families the
+user already runs on another engine and might want on ours, and three that
+would first have to be downloaded and justified.** Naming that is the point
+of inventorying first.
+
+---
+
+## 2. Coverage matrix
+
+Axes: **Load** (does sglang have the architecture), **unevenTP/DCP** (the
+hetero enabler — cuttable per the standing order), **Spec/MTP**, **GGUF**,
+**Spill/Hibernate**, **Graphs**.
+
+| model | Load | unevenTP/DCP | Spec/MTP | GGUF | Spill/Hib | Graphs |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.5/3.6 dense + A3B/A10B | yes (served) | yes | yes | yes | yes | yes |
+| Gemma-4 family | yes (`gemma4_*.py`) | yes | yes (`gemma4_mtp.py`) | yes | yes | yes |
+| **Qwen3-Omni Thinker** | **yes** (`qwen3_omni_moe.py`) | inherits A3B | inherits A3B | soft gap | yes | yes |
+| **Qwen3-Omni Talker+Code2Wav** | **no** | **HARD** | **HARD** | n/a | n/a | n/a |
+| **Nemotron-Puzzle (NAS)** | **yes** (`nemotron_nas.py`) | **HARD** (see 3b) | soft | soft | likely yes | yes |
+| Nemotron-H (hybrid mamba) | yes (`nemotron_h*.py`) | GDN-shaped, likely yes | `nemotron_h_mtp.py` | soft | yes | yes |
+| **Text-diffusion LM (LLaDA-2)** | **yes** (`llada2.py` + `dllm_config`) | **needs review** (3c) | **HARD** (3c) | soft | soft | partial |
+| DiffusionGemma specifically | **no arch** | — | — | — | — | — |
+| **ik-llama IQ quants** | **no** (3d) | n/a | n/a | **HARD** | n/a | n/a |
+| agents-a1 | unknown | — | — | — | — | — |
+
+Legend: **HARD** = architectural, with the reason named in §3. *soft* =
+merely unbuilt.
+
+---
+
+## 3. Per family: upstream state, blockers, smallest cut
+
+### 3a. Qwen3-Omni — the Thinker is already ours; the audio-out is not
+
+**Upstream:** PR **#10911 "model: qwen3-omni (thinker-only)"** is **merged**
+— and the title is the whole story. sglang serves the *Thinker*, the 30B-A3B
+MoE text LLM. It does not serve the Talker (text → audio codec tokens) or
+Code2Wav (codec → waveform).
+
+**Which known gap family:** the Thinker is *not a new model family at all* —
+it is the A3B MoE geometry the fork already serves with uneven TP, DCP, spec
+and spill. Everything on the text axis is inherited for free.
+
+**Hard blocker for audio-out:** the Talker/Code2Wav stages are a **3-stage
+pipeline of separate engines**, stage-parallel by construction (the user's
+own recipe puts thinker on GPU0, talker+code2wav on GPU1). They are not
+layers a TP group shards; they are *tenants*. So audio-out is not a
+model-loading task, it is a **lane/tenant composition** task, and it belongs
+to the #333 multimodal-class line, not here.
+
+**Smallest cut:** serve the Thinker on our stack and compare against the
+user's vLLM-Omni text path — a text-only A/B that costs nothing new
+(**effort S**, it is a boot of an already-supported architecture). Audio-out
+is **L** and gated behind #333.
+
+### 3b. Nemotron-Puzzle — supported, and it lands squarely in the #100 gap
+
+**Upstream/local:** `python/sglang/srt/models/nemotron_nas.py` exists (ported
+from vLLM). Nemotron-NAS *is* the Puzzle architecture: `config.block_configs
+[layer_idx]`, `block_config.attention.no_op`, `block_config.ffn.no_op`,
+`ffn_mult` — **per-layer heterogeneous blocks, where some layers have no
+attention and some have no FFN.** No upstream PR search hits for
+"nemotron puzzle", i.e. nobody is actively working it.
+
+**Hard blocker, and it is exactly the known one:** the fork's uneven-TP unit
+partitioning assumes **every layer has the same families**. That is the
+#100 `tp_units` family-table lesson in its purest form: a layer with
+`attention.no_op` contributes zero attention units, and a family vector
+computed over a uniform layer count is wrong for this model in a way that
+does not announce itself — it produces a plausible split for a geometry that
+does not exist. The same table drives #324's per-(rank, family) GEMM scores
+and the #348b cost library, so the error propagates into the planner.
+
+**Smallest cut:** make the family table **per-layer** rather than per-model
+(**effort M-L**), which is a fork-wide improvement, not a Nemotron feature —
+it is the same change any future heterogeneous-layer model needs. Falsifier
+first: a unit test with a synthetic `block_configs` containing `no_op` layers
+that shows today's partitioner producing a wrong vector.
+
+**But: no checkpoint on the box.** Do the falsifier test now if the
+family-table work is wanted for its own sake; do not download a model to
+justify it.
+
+### 3c. Text-diffusion LM — the machinery exists, the semantics fight our axes
+
+**Upstream:** active. `#20615 [SGLang-Diffusion LLM] Add inference support`
+(open), `#17316 [DLLM] Optimize batching algorithm efficiency` (open).
+Locally: `llada2.py` plus a real serving path — `scheduler.dllm_config`,
+`get_new_batch_dllm`. **DiffusionGemma specifically is not present**, but the
+class is.
+
+**Hard blocker — spec/MTP is meaningless here.** A diffusion LM does not
+extend a causal prefix one token at a time; it iteratively denoises a masked
+block. There is no "next token" for a drafter to guess and no accept rule to
+apply, so the fork's entire spec line (MTP, EAGLE, DFLASH, the k-ladder,
+#328's chain gate) simply does not apply. That is architectural, not unbuilt.
+
+**Needs review, not yet classifiable — DCP.** Token-sharded DCP assumes a
+causal ownership rule over a growing prefix. A denoising block is rewritten
+in place across iterations, so "who owns token L" is stable but "what is at
+token L" is not. Whether the owner rule survives that is a real question and
+the honest answer today is *unknown*; it is a design question before it is a
+task.
+
+**Smallest cut:** boot `llada2` on our stack with spec explicitly OFF and
+measure whether anything in the DCP/spill path even engages (**effort M**).
+That is the cheapest way to turn the DCP question from speculation into a
+finding.
+
+### 3d. ik-llama IQ quant families — a GGUF type-code gap
+
+**Upstream:** **zero** PRs for `ik_llama` or `IQ4_KS`. These quant types
+(IQ4_KS, IQ2_KL and relatives) are **ik_llama.cpp-specific**, not mainline
+llama.cpp, so a mainline GGUF reader does not know their type codes at all.
+
+**Which known gap family:** #129's GGUF registry generalization. The gap is
+"the registry does not know these type codes and their dequant kernels", not
+anything about the model — the same shape #129 already solved once for the
+types it does support.
+
+**Hard blocker:** each IQ type needs its own dequant kernel. That is real
+kernel work per type, and the fork's own record says these are the expensive
+kind (the #109 MMQ out-of-bounds and the uneven-TP GGUF alignment bugs all
+lived here).
+
+**Smallest cut:** read the type codes actually used by the user's ik-llama
+recipes and report *which* types would be needed (**effort S, desk**) before
+anyone writes a kernel. It may be one type, in which case this is M; it may
+be five, in which case it is L and probably not worth it.
+
+### 3e. agents-a1 — no artifact, no signal
+
+Nothing on disk, nothing upstream that matches. **Recommend closing this
+strand** unless the user can name the artifact; a survey cannot cover a name.
+
+---
+
+## 4. Recommended order
+
+Per Feature-Doku-Reihenfolge (hetero enablers first, then normal-rig
+utility):
+
+1. **Nemotron-Puzzle's per-layer family table** — a HETERO ENABLER that
+   happens to be found via Nemotron. It fixes a latent wrongness in the
+   uneven-TP partitioner and the planner cost library for *any*
+   heterogeneous-layer model. Do the falsifier test even without the
+   checkpoint. **M-L.**
+2. **Qwen3-Omni Thinker on our stack** — near-free (already-supported A3B
+   geometry) and it answers a real user question: is our stack better than
+   the vLLM-Omni text path the user runs today. **S.**
+3. **ik-llama type-code inventory** — desk-only, decides whether the IQ
+   family is an M or an L before any kernel is written. **S.**
+
+Then, only if wanted: the dllm DCP question (design), and Omni audio-out
+(behind #333).
+
+---
+
+## 5. Stop rules
+
+* **No downloads to justify work.** Three of the five families have no
+  artifact. Do not fetch a checkpoint to make a task real; fetch one when a
+  user need is stated.
+* **Stop on ik-llama if more than ~two IQ types are needed.** Per-type
+  dequant kernels are the fork's historically expensive and bug-dense corner.
+* **Stop on Omni audio-out until #333 lands a tenant/stage composition.**
+  Modelling a 3-engine pipeline as a TP group is the wrong shape and would
+  have to be undone.
+* **Do not chase DiffusionGemma as a model.** If the diffusion-LM class is
+  wanted, `llada2` is on hand and upstream is actively working the path; a
+  second architecture adds nothing until the first one's DCP/spec semantics
+  are settled.
+* **Every exclusion above is a priority candidate**, per
+  alles-mit-allem-kombinierbar. The two genuinely HARD ones —
+  spec-on-diffusion-LM and TP-sharding the Talker — are hard for stated
+  architectural reasons and are the two that should stay excluded.
+
+---
+
+## 6. Summary
+
+The survey's real content is that the coverage is **much better than the
+brief assumed and the gaps are not where the model names suggest**:
+Qwen3-Omni's Thinker, Nemotron-Puzzle and a text-diffusion LM are all already
+in the model registry. What is missing is not loaders but (a) a per-layer
+family table, which is a hetero enabler worth doing on its own merits, (b)
+GGUF type codes for a non-mainline quant family, and (c) a tenant composition
+for audio-out that belongs to a different line of work.
