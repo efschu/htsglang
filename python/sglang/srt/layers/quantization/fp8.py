@@ -46,28 +46,28 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
-)
 from sglang.srt.layers.quantization.fp8_dequant_gemv import (
     fused_block_dequant_gemv,
     fused_channel_dequant_gemv,
     fused_channel_gemv_applicable,
     fused_gemv_applicable,
 )
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    cached_dequant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
-    cached_dequant,
     dequant_fp8_block_weight,
-    deterministic_fp8_marlin_disabled,
     dequant_fp8_weight,
+    deterministic_fp8_marlin_disabled,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     fp8_needs_dequant_fallback,
@@ -132,6 +132,18 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group?
+
+    Imported lazily to keep this module's import graph unchanged. Group-wide
+    on purpose: this gates where weights are placed, and a rank that answered
+    differently from its peers would build a structurally different model.
+    """
+    from sglang.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
 
 
 def _require_fp4_dtype():
@@ -523,7 +535,9 @@ class Fp8LinearMethod(LinearMethodBase):
         # never quantised. Only for plain per-tensor/per-channel checkpoints --
         # block-scaled and mxfp8 layouts have no plain-torch route here.
         self.use_dequant = (
-            not self.block_quant and not self.use_marlin and fp8_needs_dequant_fallback()
+            not self.block_quant
+            and not self.use_marlin
+            and fp8_needs_dequant_fallback()
         )
         # Block-scaled fp8 with no block-fp8 GEMM anywhere: dequantise the
         # [block_n, block_k] tiles per forward. mxfp8 is excluded -- its UE8M0
@@ -1297,9 +1311,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # at the WEIGHT_SCALES block below.
         # fraction >= 1.0 -> None -> torch.empty(..., device=None), i.e. the
         # byte-identical stock allocation.
-        _moe_dev = (
-            "cpu" if envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0 else None
-        )
+        _moe_dev = "cpu" if _moe_offload_active() else None
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
@@ -2349,9 +2361,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 n_pad,
             )
 
-        group_size = (
-            -1 if self.weight_block_size is None else self.weight_block_size[1]
-        )
+        group_size = -1 if self.weight_block_size is None else self.weight_block_size[1]
         if not check_moe_marlin_supports_layer(layer, group_size):
             raise ValueError(
                 "FP8 Marlin MoE fallback: layer does not satisfy Marlin "

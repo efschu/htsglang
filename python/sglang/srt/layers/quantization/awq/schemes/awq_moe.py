@@ -22,6 +22,18 @@ if TYPE_CHECKING:
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 
 
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group?
+
+    Imported lazily to keep this module's import graph unchanged. Group-wide
+    on purpose: this gates where weights are placed, and a rank that answered
+    differently from its peers would build a structurally different model.
+    """
+    from sglang.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
+
+
 class AWQMoEScheme(AWQMoESchemeBase):
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
@@ -72,11 +84,8 @@ class AWQMoEScheme(AWQMoESchemeBase):
         # [E]-sized tensor on GPU and defeat part of the load-time cap.
         #
         # fraction >= 1.0 -> _moe_dev is None -> byte-identical stock path.
-        from sglang.srt.environ import envs as _sgl_envs
 
-        _moe_dev = (
-            "cpu" if _sgl_envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0 else None
-        )
+        _moe_dev = "cpu" if _moe_offload_active() else None
 
         w13_qweight = torch.nn.Parameter(
             torch.empty(

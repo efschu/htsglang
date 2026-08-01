@@ -456,6 +456,104 @@ def drop_page_cache_range(
             pass
 
 
+_CGROUP = "/sys/fs/cgroup"
+
+
+class ProgressCoupledTrim:
+    """Reclaim page cache when the STREAM advances, not when a clock ticks.
+
+    ``cachetrim.sh`` samples ``memory.current`` every few seconds and reclaims
+    when it is over a watermark. That works until the load outruns the sample
+    interval: window 3 of #417 saw ``memory.current`` go 88.2 -> 102.5 GiB
+    inside one 15 s window, tripping a guard that a 5 s sampler had been
+    holding fine on the previous boot with the same recipe. Whether a boot
+    survived came down to where a noisy peak landed between two samples.
+
+    The pressure is produced by the loader reading, so the trim is driven from
+    the loader reading: :class:`ConsumedPageDropper` calls :meth:`maybe_trim`
+    after every advice batch it issues. A load that streams faster therefore
+    trims more often, automatically, with no interval to tune.
+
+    Off unless ``SGLANG_GGUF_STREAM_TRIM_SOFT_GIB`` is set; when off, nothing
+    in the load path changes.
+
+    The safety argument is ``cachetrim.sh``'s and is checked, not assumed:
+    with no swap, cgroup reclaim cannot evict anonymous pages, so the pinned
+    host expert pool, the CUDA host allocations and the Python heap are all
+    structurally out of reach and only page cache can be taken -- which the
+    loader re-reads from disk if it needs it again. Worst case is a slower
+    load, not a wrong one. WITH swap configured that argument fails, so this
+    refuses to act.
+    """
+
+    def __init__(self) -> None:
+        from sglang.srt.environ import envs
+
+        self.soft_bytes = int(envs.SGLANG_GGUF_STREAM_TRIM_SOFT_GIB.get() * (1 << 30))
+        target_gib = envs.SGLANG_GGUF_STREAM_TRIM_TARGET_GIB.get()
+        self.target_bytes = int(target_gib * (1 << 30)) if target_gib else 0
+        self.enabled = self.soft_bytes > 0
+        self.trims = 0
+        self.bytes_reclaimed = 0
+        if self.enabled and not self._swapless():
+            logger.warning(
+                "GGUF stream: SGLANG_GGUF_STREAM_TRIM_SOFT_GIB is set but this "
+                "host has swap configured, where cgroup reclaim can page out "
+                "the loader's own anonymous memory and turn a fast load into a "
+                "thrashing one. Progress-coupled trim disabled."
+            )
+            self.enabled = False
+        if self.enabled and self.target_bytes <= 0:
+            # A target below the soft mark is required, or every call reclaims.
+            self.target_bytes = int(self.soft_bytes * 0.9)
+
+    @staticmethod
+    def _swapless() -> bool:
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("SwapTotal:"):
+                        return int(line.split()[1]) == 0
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _current() -> Optional[int]:
+        try:
+            with open(f"{_CGROUP}/memory.current") as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def maybe_trim(self) -> None:
+        if not self.enabled:
+            return
+        current = self._current()
+        if current is None or current <= self.soft_bytes:
+            return
+        ask = current - self.target_bytes
+        if ask <= 0:
+            return
+        try:
+            with open(f"{_CGROUP}/memory.reclaim", "w") as fh:
+                fh.write(str(ask))
+        except OSError as err:
+            # A kernel without memory.reclaim, or a cgroup that refuses: this
+            # is an optimisation, never a requirement. Say so once and stop.
+            logger.warning(
+                "GGUF stream: progress-coupled trim could not reclaim (%s); "
+                "disabling it for this load.",
+                err,
+            )
+            self.enabled = False
+            return
+        after = self._current()
+        if after is not None:
+            self.bytes_reclaimed += max(current - after, 0)
+        self.trims += 1
+
+
 class ConsumedPageDropper:
     """Release the page cache of GGUF shard regions the stream has passed.
 
@@ -489,6 +587,7 @@ class ConsumedPageDropper:
             progress_bytes = _DEFAULT_DROP_PROGRESS_BYTES
         if len(shard_paths) != len(mappings):
             raise ValueError("shard_paths and mappings must have the same length")
+        self._trim = ProgressCoupledTrim()
         self._paths = list(shard_paths)
         # Base address + byte length of each part's mapping. ``madvise`` needs an
         # address, not a file offset, and only the numpy view knows it: numpy
@@ -646,6 +745,9 @@ class ConsumedPageDropper:
         self._advise(shard_index, start, end)
         self._advised_to[shard_index] = end
         self._pending[shard_index] = 0
+        # Progress-coupled, not clock-coupled: the batch that just advanced the
+        # stream is also what grew the cache ahead of it (#391 / #417 w3).
+        self._trim.maybe_trim()
         self._log_progress()
 
     def _log_progress(self) -> None:

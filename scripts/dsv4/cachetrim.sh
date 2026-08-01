@@ -50,12 +50,22 @@ INTERVAL=5
 ONCE=0
 ALLOW_SWAP=0
 SELF_TEST=0
+# Stop by itself once the server is serving. The trim exists to manage the
+# LOAD-time page-cache race; that race ends at ready. Window 4 vs 5 of #391
+# measured what leaving it running costs: the A-vs-A floor was 39.91% with it
+# alive during serving and 2.55% with it stopped, and both stopped-runs were
+# FASTER than either running-run -- reclaiming page cache out from under the
+# host-pinned expert pool is not free. Leaving that to the operator is a
+# 37-point throughput trap with no upside.
+READY_URL=""
+READY_MARKER=""
 
 usage() {
   cat >&2 <<'EOF'
 usage: cachetrim.sh [--pidfile FILE] [--run-dir DIR] [--out FILE]
                     [--soft-gib N] [--target-gib N] [--max-ask-gib N]
                     [--interval SECONDS] [--once] [--allow-swap]
+                    [--ready-url URL] [--ready-marker FILE]
        cachetrim.sh --self-test
 
   --pidfile      PID of the launched server; the trim ends when it is gone
@@ -67,6 +77,9 @@ usage: cachetrim.sh [--pidfile FILE] [--run-dir DIR] [--out FILE]
   --interval     seconds between samples (default 5)
   --once         one pass, then exit (the smoke; also useful by hand)
   --allow-swap   run even though this box has swap -- see the header
+  --ready-url    stop once this URL answers 200 (the server is serving and the
+                 load-time race is over; see the note at READY_URL above)
+  --ready-marker stop once this file exists (alternative to --ready-url)
   --self-test    exercise both branches against a fake cgroup and exit
 EOF
   exit 2
@@ -84,6 +97,8 @@ while [ $# -gt 0 ]; do
     --once) ONCE=1; shift ;;
     --allow-swap) ALLOW_SWAP=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
+    --ready-url) READY_URL="$2"; shift 2 ;;
+    --ready-marker) READY_MARKER="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "cachetrim.sh: unknown argument '$1'" >&2; usage ;;
   esac
@@ -107,8 +122,28 @@ stat_gib() {  # $1 = memory.stat key
     2>/dev/null || echo "?"
 }
 
-# One sample. Returns 0 normally, 10 when the watched server is gone.
+# Is the server past load and serving? Checked before every sample, so the
+# trim retires on its own the moment its job is done.
+server_ready() {
+  if [ -n "$READY_MARKER" ] && [ -e "$READY_MARKER" ]; then
+    return 0
+  fi
+  if [ -n "$READY_URL" ]; then
+    local code
+    code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$READY_URL" 2>/dev/null)
+    [ "$code" = "200" ] && return 0
+  fi
+  return 1
+}
+
+# One sample. Returns 0 normally, 10 when the watched server is gone,
+# 11 once the server is ready and this script has no further job.
 trim_pass() {
+  if server_ready; then
+    echo "$(date -u +%H:%M:%S) server ready -- load-time race is over, exiting" \
+      >> "$OUT"
+    return 11
+  fi
   if [ -n "$PIDFILE" ] && [ -f "$PIDFILE" ]; then
     kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
       echo "$(date -u +%H:%M:%S) server gone, exiting" >> "$OUT"
@@ -253,11 +288,19 @@ fi
 
 printf 'cachetrim: soft=%s GiB target=%s GiB max-ask=%s GiB interval=%ss cgroup=%s\n' \
   "$SOFT_GIB" "$TARGET_GIB" "$MAX_ASK_GIB" "$INTERVAL" "$CG" > "$OUT"
+if [ -n "$READY_URL" ] || [ -n "$READY_MARKER" ]; then
+  printf 'cachetrim: will stop itself at ready (url=%s marker=%s)\n' \
+    "${READY_URL:-none}" "${READY_MARKER:-none}" >> "$OUT"
+else
+  printf 'cachetrim: NO ready signal given -- it will run until the server exits, which costs throughput during serving (#391 w4 vs w5: floor 39.91%% vs 2.55%%). Pass --ready-url or --ready-marker.\n' >> "$OUT"
+fi
 
 while :; do
   trim_pass
   rc=$?
+  # 10 = the watched server is gone; 11 = it is ready and this script is done.
   [ "$rc" = "10" ] && exit 0
+  [ "$rc" = "11" ] && exit 0
   [ "$ONCE" = "1" ] && exit 0
   sleep "$INTERVAL"
 done

@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.fp8_triton_compat import (
+    e4m3fn_bits_to_f32,
+    nope_cache_view,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -50,8 +54,13 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Three typed views over the same underlying bytes. The nope view is fp8
+    # only where Triton can type a pointer that way; below capability 8.9 it
+    # is the uint8 view and the kernel decodes E4M3 from the raw byte. Passing
+    # the fp8 view there would fail to compile on the `def` line even though
+    # the branch taken never dereferences it.
+    buf_nope, fp8_native = nope_cache_view(quant_k_cache_u8, fp8_dtype)
+    buf_nope = buf_nope.reshape(-1)
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -67,11 +76,12 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
+        buf_nope,
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
         out.stride(0),
+        FP8_NATIVE=fp8_native,
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
         DIM_NOPE=DIM_NOPE,
@@ -88,11 +98,12 @@ def dequantize_k_cache_paged(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
+    buf_nope_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
     output_stride_0,
+    FP8_NATIVE: tl.constexpr,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
@@ -119,7 +130,10 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        if FP8_NATIVE:
+            fp8_vals = tl.load(buf_nope_ptr + fp8_off).to(tl.float32)
+        else:
+            fp8_vals = e4m3fn_bits_to_f32(tl.load(buf_nope_ptr + fp8_off))
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))

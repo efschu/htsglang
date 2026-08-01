@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.fp8_triton_compat import (
+    triton_fp8e4nv_supported,
+)
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
@@ -25,6 +28,7 @@ def _quant_k_cache_fused_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
+    FP8_NATIVE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     tile_id = tl.program_id(1)
@@ -55,12 +59,23 @@ def _quant_k_cache_fused_kernel(
         scale_pow2_fp32 = tl.exp2(ceil_log2)
         scale_inv = 1.0 / scale_pow2_fp32
         x_scaled = x_fp32 * scale_inv
-        x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX).to(k_nope_fp8_ptr.dtype.element_ty)
+        x_clamped = tl.clamp(x_scaled, FP8_MIN, FP8_MAX)
+        # Below capability 8.9 Triton has no fp8e4nv type to cast to (it
+        # refuses at the `def` line, so an in-kernel branch alone would not
+        # help either). The clamped float32 is written to a staging buffer
+        # instead and torch performs the same round-to-nearest-even, saturating
+        # cast on the host side. Staging in float32 rather than bfloat16 is
+        # deliberate: bfloat16 carries 8 mantissa bits, so bf16 -> e4m3 would
+        # round twice and could differ from the native path on ties.
+        if FP8_NATIVE:
+            x_out = x_clamped.to(k_nope_fp8_ptr.dtype.element_ty)
+        else:
+            x_out = x_clamped
 
         out_fp8_offsets = (
             token_id * k_nope_fp8_stride_0 + tile_id * TILE_SIZE + tile_range
         )
-        tl.store(k_nope_fp8_ptr + out_fp8_offsets, x_fp8)
+        tl.store(k_nope_fp8_ptr + out_fp8_offsets, x_out)
 
         exponent = ceil_log2.to(tl.int32)
         scale_uint8 = (exponent + 127).to(tl.uint8)
@@ -82,8 +97,13 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
 
     k_bf16 = k_bf16.contiguous()
 
-    k_nope_fp8 = torch.empty(
-        (num_tokens, dim_nope), dtype=fp8_dtype, device=k_bf16.device
+    fp8_native = triton_fp8e4nv_supported(
+        k_bf16.device.index if k_bf16.device.type == "cuda" else None
+    )
+    nope_out = torch.empty(
+        (num_tokens, dim_nope),
+        dtype=fp8_dtype if fp8_native else torch.float32,
+        device=k_bf16.device,
     )
     k_rope_bf16 = torch.empty(
         (num_tokens, dim_rope), dtype=torch.bfloat16, device=k_bf16.device
@@ -97,11 +117,11 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
     grid = (num_tokens, num_tiles + 1)
     _quant_k_cache_fused_kernel[grid](
         k_bf16,
-        k_nope_fp8,
+        nope_out,
         k_rope_bf16,
         scale_k_nope_ue8m0,
         k_bf16.stride(0),
-        k_nope_fp8.stride(0),
+        nope_out.stride(0),
         k_rope_bf16.stride(0),
         scale_k_nope_ue8m0.stride(0),
         DIM_NOPE=dim_nope,
@@ -111,7 +131,10 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
         FP8_MIN=fp8_dtype_info.min,
         FP8_MAX=fp8_dtype_info.max,
         EPS=1e-8,
+        FP8_NATIVE=fp8_native,
     )
+
+    k_nope_fp8 = nope_out if fp8_native else nope_out.to(fp8_dtype)
 
     return NopeFp8RopeBf16Pack(
         k_nope_fp8=k_nope_fp8,

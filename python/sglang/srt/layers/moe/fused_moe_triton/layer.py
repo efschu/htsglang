@@ -14,12 +14,6 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.distributed.utils import (
-    assert_activation_aligned_shards,
-    tp_partition_offset,
-    tp_partition_size,
-    tp_plan_active,
-)
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_tp_group,
@@ -27,6 +21,12 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+)
+from sglang.srt.distributed.utils import (
+    assert_activation_aligned_shards,
+    tp_partition_offset,
+    tp_partition_size,
+    tp_plan_active,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -474,9 +474,7 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             assert intermediate_size % self.moe_tp_size == 0
-            self.intermediate_size_per_partition = (
-                intermediate_size // self.moe_tp_size
-            )
+            self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
@@ -586,13 +584,15 @@ class FusedMoE(torch.nn.Module):
         # MoE math stays byte-identical. The offload cache itself is installed
         # lazily on the first forward (weights must already be loaded and
         # processed by then); see _apply_expert_offload / run_moe_core.
-        self._expert_offload_fraction = (
-            envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        from sglang.srt.layers.moe.resident_fraction import (
+            resident_fraction_for_rank,
         )
+
+        # SIZING: cached here and later handed to plan_load_time_staging.
+        self._expert_offload_fraction = resident_fraction_for_rank()
         self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
-        self._moe_offload_enabled = (
-            self._expert_offload_fraction < 1.0
-            or bool(self._moe_offload_trace_path)
+        self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
+            self._moe_offload_trace_path
         )
         self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
         self._expert_offload_install_failed = False
@@ -836,10 +836,7 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
 
-
-    def _moe_src_start(
-        self, loaded_total: int, shard_size: int, tp_rank: int
-    ) -> int:
+    def _moe_src_start(self, loaded_total: int, shard_size: int, tp_rank: int) -> int:
         """Source-side start of this rank's shard in a full checkpoint
         tensor. Even TP: rank * shard_size. Uneven TP: prefix sum of the
         plan partition ("moe" family, falling back to the base plan);
@@ -1937,6 +1934,7 @@ class FusedMoE(torch.nn.Module):
         remap and per-token wave assignment are loss-free, so greedy outputs are
         identical across fractions.
         """
+
         def _apply(disp):
             return self.quant_method.apply(layer=self, dispatch_output=disp)
 
@@ -2230,11 +2228,13 @@ class FusedMoE(torch.nn.Module):
         return eligible
 
     def _gguf_moe_offload_eligible_uncached(self) -> bool:
-        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.resident_fraction import (
+            resident_fraction_for_rank,
+        )
 
         fraction = getattr(self, "_expert_offload_fraction", None)
         if fraction is None:
-            fraction = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+            fraction = resident_fraction_for_rank()
         if fraction >= 1.0:
             return False
         if type(getattr(self, "quant_method", None)).__name__ != "GGUFMoEMethod":

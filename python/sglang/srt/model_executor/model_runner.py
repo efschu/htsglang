@@ -3989,11 +3989,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # submodule hook would record against an unstarted step.
         if getattr(self, "_layer_fingerprint", None) is not None:
             self._layer_fingerprint.begin_step(forward_batch)
+        # Forward-peak probe (#417 w3 follow-up). Same reasoning as the #343 tap
+        # above for living here rather than in a module hook. Off by default;
+        # `maybe_create` returns None unless SGLANG_FORWARD_PEAK_PATH is set.
+        peak_probe = getattr(self, "_forward_peak", "unset")
+        if peak_probe == "unset":
+            from sglang.srt.model_executor.forward_peak import maybe_create
+
+            peak_probe = maybe_create(
+                f"tp{getattr(self, 'tp_rank', 0)}", getattr(self, "device_id", None)
+            )
+            self._forward_peak = peak_probe
+        if peak_probe is not None:
+            peak_probe.begin(
+                "decode" if forward_batch.forward_mode.is_decode() else "extend",
+                (
+                    int(getattr(forward_batch, "input_ids").shape[0])
+                    if getattr(forward_batch, "input_ids", None) is not None
+                    else 0
+                ),
+            )
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        from sglang.srt.model_executor.forward_peak import peak_scope
+
+        with ctx_mgr, peak_scope(peak_probe):
             # Weightless-KV fast lane (Option-B, B1): reset the per-forward
             # anti-hang guard step counter on BOTH the head rank and the
             # weightless workers at the same point, so their dcp-collective step

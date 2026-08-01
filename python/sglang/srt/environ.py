@@ -172,6 +172,52 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvFloatVector(EnvField):
+    """A float that may also be given per rank as a comma-list.
+
+    ``"0.45"`` parses to the float ``0.45`` -- indistinguishable from
+    :class:`EnvFloat`, so every existing reader and the default path are
+    byte-identical. ``"0.485,0.42,0.42"`` parses to a tuple, one entry per
+    tensor-parallel rank.
+
+    ``get()`` deliberately REFUSES to answer once a vector is set. The value
+    has a dozen readers, and a reader that has not been taught about ranks
+    would otherwise compare a tuple against a float and either raise something
+    obscure or, worse, silently size a buffer from the wrong number. Failing
+    here names the sanctioned accessor instead. Use :meth:`get_vector` (or the
+    helpers in ``sglang.srt.layers.moe.resident_fraction``) to read it.
+    """
+
+    def parse(self, value: str):
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        if not parts:
+            raise ValueError(f"{self.name} is empty")
+        out = []
+        for p in parts:
+            try:
+                out.append(float(p))
+            except ValueError:
+                raise ValueError(f'"{p}" is not a valid float value in {self.name}')
+        return out[0] if len(out) == 1 else tuple(out)
+
+    def get(self):
+        value = super().get()
+        if isinstance(value, tuple):
+            raise RuntimeError(
+                f"{self.name} is set per rank ({','.join(str(v) for v in value)}), "
+                f"so there is no single value to return. Read it through "
+                f"sglang.srt.layers.moe.resident_fraction: "
+                f"resident_fraction_for_rank(rank) for anything that sizes or "
+                f"books memory, offload_active() for a plain is-offload-on check."
+            )
+        return value
+
+    def get_vector(self) -> tuple:
+        """The sanctioned reader: always a tuple, length 1 when scalar."""
+        value = super().get()
+        return value if isinstance(value, tuple) else (value,)
+
+
 class ToolStrictLevel(IntEnum):
     """
     Defines the strictness levels for tool call parsing and validation.
@@ -956,7 +1002,16 @@ class Envs:
     # H2D-fetch cache so the resident-fraction-vs-tok/s curve can be swept on a
     # model that otherwise fully fits (A3B-FP8). Cold experts are FETCHED to
     # GPU and computed on GPU (NOT CPU-computed — this AMD box has no AMX).
-    SGLANG_MOE_RESIDENT_EXPERT_FRACTION = EnvFloat(1.0)
+    # May be a single float (uniform, the original behaviour) or a comma-list
+    # with one entry per TP rank. A vector exists because the fraction is the
+    # GPU-resident / host-pinned split WITHIN a rank's own expert shard, and on
+    # a heterogeneous group the right split differs per card: on this rig a
+    # 5090 rank had ~4.0 GiB of VRAM idle while both 3080 ranks were 32 MiB
+    # short of fitting their scratch region. Lowering the fraction only on the
+    # small cards frees exactly the VRAM that binds, and raising it on the big
+    # card pays the resulting host-pinned-pool growth back. See
+    # --rank-moe-resident-fraction and docs/dev/PLAN_MOE_RESIDENT_FRACTION_PER_RANK.md.
+    SGLANG_MOE_RESIDENT_EXPERT_FRACTION = EnvFloatVector(1.0)
     # When set to a path, log per-layer routed expert IDs (topk_ids) to that
     # file for offline routing-locality / cache-hit-rate simulation (M-C).
     SGLANG_MOE_OFFLOAD_TRACE = EnvStr("")
@@ -1589,6 +1644,17 @@ class Envs:
     # bytes, so the streamed bytes are identical either way. Set to False to
     # restore the pre-#391 accumulation.
     SGLANG_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+    # Synchronous cgroup reclaim during the GGUF stream, in GiB of
+    # memory.current. 0 (default) = off, behaviour byte-identical to before.
+    # The dropper only releases page cache BEHIND the consumer while the
+    # kernel reads AHEAD of it, and on a swapless box that gap is the whole
+    # budget (#391). An external sampler chasing it on a wall-clock interval
+    # can be outrun -- window 3 saw memory.current move 88 -> 102 GiB inside
+    # one 15 s window. Reclaiming here instead ties the trim RATE to consumer
+    # PROGRESS, which is what generates the pressure in the first place.
+    SGLANG_GGUF_STREAM_TRIM_SOFT_GIB = EnvFloat(0.0)
+    #: Reclaim down to about here once the soft watermark is crossed.
+    SGLANG_GGUF_STREAM_TRIM_TARGET_GIB = EnvFloat(0.0)
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)

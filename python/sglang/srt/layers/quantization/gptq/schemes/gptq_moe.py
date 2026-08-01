@@ -17,6 +17,18 @@ if TYPE_CHECKING:
 __all__ = ["GPTQMoEAscendScheme", "GPTQMarlinMoEScheme"]
 
 
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group?
+
+    Imported lazily to keep this module's import graph unchanged. Group-wide
+    on purpose: this gates where weights are placed, and a rank that answered
+    differently from its peers would build a structurally different model.
+    """
+    from sglang.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
+
+
 class GPTQMoEAscendScheme(GPTQMoESchemeBase):
     def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
@@ -244,13 +256,8 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         # the pinned host pool. The small/unused qzeros + (desc_act=False) empty
         # g_idx stay on the default device. fraction>=1.0 -> _moe_dev is None
         # (default cuda) -> byte-identical stock path.
-        from sglang.srt.environ import envs as _sgl_envs
 
-        _moe_dev = (
-            "cpu"
-            if _sgl_envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0
-            else None
-        )
+        _moe_dev = "cpu" if _moe_offload_active() else None
 
         # Bring-up footnote, 2026-07-19. This line is why.
         # create_weights() commits the ENTIRE expert set up front: torch.empty over

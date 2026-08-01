@@ -66,8 +66,8 @@ __all__ = [
     "Placement",
 ]
 
-_MIB = 2 ** 20
-_GIB = 2 ** 30
+_MIB = 2**20
+_GIB = 2**30
 
 
 def _auto_tp_ratio(rank_gpu_id, budgets, card_total_mib, tp):
@@ -311,9 +311,9 @@ class KvTokenPlacement:
 
     rank: int
     gpu_index: Optional[int]
-    cycle_len: int          # S = sum(token vector); 0 when no vector/context
-    cycle_start: int        # lo of this rank's within-cycle prefix range
-    cycle_end: int          # hi (exclusive)
+    cycle_len: int  # S = sum(token vector); 0 when no vector/context
+    cycle_start: int  # lo of this rank's within-cycle prefix range
+    cycle_end: int  # hi (exclusive)
     tokens_owned: int
     #: KV bytes for the owned positions at full context (owned_tokens * cell).
     kv_mib_owned: float
@@ -529,7 +529,9 @@ def _build_cost_model(model_cfg: dict, flags: PlacementFlags, budgets_mib, base_
         dcp_size=flags.dcp_size,
         kv_token_vector=flags.kv_token_vector,
     )
-    return _InjectedCostModel(plan_inputs, list(base_plan), list(budgets_mib), model_cfg)
+    return _InjectedCostModel(
+        plan_inputs, list(base_plan), list(budgets_mib), model_cfg
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +561,9 @@ def _largest_remainder(total: int, weights: Sequence[int]) -> List[int]:
     quotas = [total * w / sw for w in weights]
     sizes = [int(q) for q in quotas]
     rem = total - sum(sizes)
-    order = sorted(range(n), key=lambda r: (quotas[r] - int(quotas[r]), -r), reverse=True)
+    order = sorted(
+        range(n), key=lambda r: (quotas[r] - int(quotas[r]), -r), reverse=True
+    )
     for k in range(rem):
         sizes[order[k % n]] += 1
     assert sum(sizes) == total
@@ -834,7 +838,9 @@ def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes, flags=None
             "sharded on the q-head grid)."
         )
         grid = max(q_heads, tp)
-        q_per = partition_units(grid, base_plan, groups=(kv_heads if kv_heads >= 2 else None))
+        q_per = partition_units(
+            grid, base_plan, groups=(kv_heads if kv_heads >= 2 else None)
+        )
         q_ranges = _prefix_ranges(q_per)
         k_per = [kv_heads] * tp
         v_per = [kv_heads] * tp
@@ -1061,9 +1067,7 @@ def _compute_kv_tokens(model, flags, rank_gpu, token_vector, capacity, tp, notes
                 tokens_owned=owned,
                 kv_mib_owned=owned * cell / _MIB,
                 kv_token_capacity=(float(cap) if cap is not None else None),
-                kv_mib_capacity=(
-                    float(cap) * cell / _MIB if cap is not None else None
-                ),
+                kv_mib_capacity=(float(cap) * cell / _MIB if cap is not None else None),
             )
         )
     return out
@@ -1072,13 +1076,13 @@ def _compute_kv_tokens(model, flags, rank_gpu, token_vector, capacity, tp, notes
 def _kv_replication_info(model, flags, base_plan, attn_heads):
     """Explicit KV-replication marker for the VRAM display. Two roots:
 
-      * fork path: uneven DCP in force, or TP > kv_heads -- every rank keeps
-        the FULL kv-head set, the KV CACHE is sharded on the token axis
-        (weights replicated, cache NOT duplicated);
-      * stock path (``stock_semantics``): tp >= kv with tp % kv == 0 --
-        QKVParallelLinear replicates each kv head tp/kv times
-        (num_kv_head_replicas) AND each rank keeps the KV cache for its
-        replicated head (weights + cache duplicated).
+    * fork path: uneven DCP in force, or TP > kv_heads -- every rank keeps
+      the FULL kv-head set, the KV CACHE is sharded on the token axis
+      (weights replicated, cache NOT duplicated);
+    * stock path (``stock_semantics``): tp >= kv with tp % kv == 0 --
+      QKVParallelLinear replicates each kv head tp/kv times
+      (num_kv_head_replicas) AND each rank keeps the KV cache for its
+      replicated head (weights + cache duplicated).
     """
     tp = model.tp_size
     kv = model.kv_heads
@@ -1133,10 +1137,14 @@ def _draft_weights(model, flags, mtp, base_plan, tp, notes):
     --speculative-draft-model-path config sized through the same cost model
     (tp=1 total, sharded by the base plan -- an estimate, noted)."""
     if mtp.present:
-        return "mtp", list(mtp.per_rank_mib), (
-            f"draft = the checkpoint's own {mtp.num_layers} MTP/nextn "
-            f"layer(s), appended at layers [{mtp.layer_start}.."
-            f"{mtp.layer_end})."
+        return (
+            "mtp",
+            list(mtp.per_rank_mib),
+            (
+                f"draft = the checkpoint's own {mtp.num_layers} MTP/nextn "
+                f"layer(s), appended at layers [{mtp.layer_start}.."
+                f"{mtp.layer_end})."
+            ),
         )
     if flags.speculative_algorithm and flags.speculative_draft_model_cfg:
         try:
@@ -1158,10 +1166,14 @@ def _draft_weights(model, flags, mtp, base_plan, tp, notes):
             "draft weights are an EXTERNAL --speculative-draft-model-path sized "
             "from its config and sharded by the base plan (estimate)."
         )
-        return "external", per_rank, (
-            "draft = external --speculative-draft-model-path "
-            f"({total / _GIB:.2f} GiB total), sharded by the base TP plan "
-            "(estimate)."
+        return (
+            "external",
+            per_rank,
+            (
+                "draft = external --speculative-draft-model-path "
+                f"({total / _GIB:.2f} GiB total), sharded by the base TP plan "
+                "(estimate)."
+            ),
         )
     return None, [0.0] * tp, ""
 
@@ -1245,9 +1257,7 @@ def _compute_breakdown(
 
     # KV cell layer split: with spec on, the cell spans full + MTP layers --
     # the MTP share IS the draft-KV/verify footprint per token.
-    cell_layers = model.full_layers + (
-        model.mtp_layers if model.spec_active else 0
-    )
+    cell_layers = model.full_layers + (model.mtp_layers if model.spec_active else 0)
     draft_layer_frac = (
         model.mtp_layers / cell_layers
         if (model.spec_active and model.mtp_layers and cell_layers)
@@ -1371,15 +1381,11 @@ def _compute_breakdown(
         card_name = None
         if flags.card_name and gpu_index in flags.card_name:
             card_name = flags.card_name[gpu_index]
-        budget = (
-            sum(int(budgets[r]) for r in rs) if budgets else None
-        )
+        budget = sum(int(budgets[r]) for r in rs) if budgets else None
         overcommit = None
         if card_total is not None and budget is not None:
             overcommit = budget > card_total
-        segments = _card_segments(
-            model, flags, ranks, rs, kv_repl, graph_mem, sessions
-        )
+        segments = _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions)
         cards.append(
             CardBreakdown(
                 gpu_index=gpu_index,
@@ -1443,9 +1449,7 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
             else ""
         )
         + "): "
-        + "; ".join(
-            f"{it['label']} {it['mib']:.0f} MiB" for it in graph_items
-        )
+        + "; ".join(f"{it['label']} {it['mib']:.0f} MiB" for it in graph_items)
         + (". " + str(gm.get("formula") or "") if gm.get("formula") else "")
     )
 
@@ -1455,8 +1459,7 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
             "attn_kv",
             "attn KV",
             s("attn_kv_mib"),
-            kv_heads_txt
-            + (f"; REPLICATED x{factor}: {reason}" if repl else ""),
+            kv_heads_txt + (f"; REPLICATED x{factor}: {reason}" if repl else ""),
             replicated=repl,
         ),
         seg(
@@ -1466,8 +1469,7 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
             f"dense MLP (gate/up/down, intermediate {m.intermediate}) "
             f"x {m.n_layers} layers"
             + (
-                f" + shared expert (intermediate "
-                f"{m.shared_expert_intermediate})"
+                f" + shared expert (intermediate " f"{m.shared_expert_intermediate})"
                 if m.shared_expert_intermediate
                 else ""
             ),
@@ -1498,16 +1500,18 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
             "draft wts",
             s("draft_w_mib"),
             (
-                f"draft weights ({draft_src}): "
-                + (
-                    f"{m.mtp_layers} MTP/nextn layer(s) appended after "
-                    f"layer {m.n_layers}"
-                    if draft_src == "mtp"
-                    else "external --speculative-draft-model-path (estimate)"
+                (
+                    f"draft weights ({draft_src}): "
+                    + (
+                        f"{m.mtp_layers} MTP/nextn layer(s) appended after "
+                        f"layer {m.n_layers}"
+                        if draft_src == "mtp"
+                        else "external --speculative-draft-model-path (estimate)"
+                    )
                 )
-            )
-            if draft_src
-            else "no draft weights",
+                if draft_src
+                else "no draft weights"
+            ),
         ),
         seg(
             "kv",
@@ -1520,8 +1524,9 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
                 f"; CACHE DUPLICATED x{factor}: {reason}"
                 if cache_dup
                 else (
-                    "; token-sharded across ranks (uneven DCP), not "
-                    "duplicated" if repl else ""
+                    "; token-sharded across ranks (uneven DCP), not " "duplicated"
+                    if repl
+                    else ""
                 )
             ),
             replicated=cache_dup,
@@ -1568,16 +1573,34 @@ def _compute_offload(
         return None
 
     # Resident fraction: explicit flag > env > None (report pool only).
-    frac = flags.moe_resident_expert_fraction
-    if frac is None:
+    # The env may be a comma-list, one entry per rank (#417 follow-up). A bare
+    # float() on that raises, and the old except-branch turned the raise into
+    # frac=None, which silently dropped the whole offload section from the
+    # report -- an unbooked pool in the one place whose job is to book it.
+    fracs: Optional[List[float]] = None
+    if flags.moe_resident_expert_fraction is not None:
+        fracs = [float(flags.moe_resident_expert_fraction)] * tp
+    else:
         env = os.environ.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION")
         if env:
             try:
-                frac = float(env)
+                parsed = [float(p) for p in env.split(",") if p.strip()]
             except ValueError:
-                frac = None
-    if frac is not None:
-        frac = min(max(frac, 0.0), 1.0)
+                parsed = []
+            if len(parsed) == 1:
+                fracs = parsed * tp
+            elif len(parsed) == tp:
+                fracs = parsed
+            elif parsed:
+                raise ValueError(
+                    f"SGLANG_MOE_RESIDENT_EXPERT_FRACTION has {len(parsed)} "
+                    f"entries but this plan is for {tp} ranks; give one entry "
+                    f"per rank or a single value."
+                )
+    if fracs is not None:
+        fracs = [min(max(f, 0.0), 1.0) for f in fracs]
+    # Kept for the report text below, which speaks about the plan as a whole.
+    frac = fracs[0] if fracs else None
 
     H = model.hidden
     moe_i = model.moe_intermediate or model.intermediate
@@ -1590,8 +1613,9 @@ def _compute_offload(
         off_mib = offloadable[r] / _MIB
         e = experts[r] if experts else None
         count = e.num_experts if e else 0
-        if frac is not None and e is not None:
-            resident = math.ceil(frac * count)
+        rank_frac = fracs[r] if fracs else None
+        if rank_frac is not None and e is not None:
+            resident = math.ceil(rank_frac * count)
             host_count = count - resident
             host_start = e.expert_start + resident
             host_end = e.expert_end

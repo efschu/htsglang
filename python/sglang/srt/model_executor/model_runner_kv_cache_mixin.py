@@ -71,6 +71,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group?
+
+    Imported lazily to keep this module's import graph unchanged. Group-wide
+    on purpose: this gates where weights are placed, and a rank that answered
+    differently from its peers would build a structurally different model.
+    """
+    from sglang.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
+
+
 def _current_card_uuid() -> str:
     """NVML UUID of the card this rank runs on, or ``""`` when unresolvable.
 
@@ -204,10 +216,7 @@ class ModelRunnerKVCacheMixin:
         False before any memory or collective operation, leaving the default
         sizing path byte-identical.
         """
-        return (
-            envs.SGLANG_MOE_OFFLOAD_KV_REGAIN.get()
-            and envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0
-        )
+        return envs.SGLANG_MOE_OFFLOAD_KV_REGAIN.get() and _moe_offload_active()
 
     def _assert_expert_offload_installed(self: ModelRunner) -> None:
         """Ordering invariant: no FusedMoE layer may still be waiting to install.
@@ -2622,7 +2631,6 @@ class ModelRunnerKVCacheMixin:
             cp_token_split_factor,
             get_cp_token_ratios,
         )
-
         from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
 
         # #108: --draft-kv-layout dcp lets the draft pool through to the same
@@ -3574,9 +3582,7 @@ class ModelRunnerKVCacheMixin:
                         _dial_reserve = max(_plan.max_cap, _hybrid_pool_size)
                     else:
                         _dial_reserve = max(
-                            _plan.reserve_rows_for_rank(
-                                get_parallel().attn_dcp_rank
-                            ),
+                            _plan.reserve_rows_for_rank(get_parallel().attn_dcp_rank),
                             _hybrid_pool_size,
                         )
                     _dial_initial_rows = _hybrid_pool_size
@@ -4898,12 +4904,8 @@ class ModelRunnerKVCacheMixin:
                 session_admission_slots,
             )
 
-            _resident_cap = getattr(
-                self.server_args, "gdn_resident_state_slots", None
-            )
-            _profiled = getattr(
-                self, "_gdn_profiled_state_slots", None
-            )
+            _resident_cap = getattr(self.server_args, "gdn_resident_state_slots", None)
+            _profiled = getattr(self, "_gdn_profiled_state_slots", None)
             if _profiled is None:
                 _profiled = self.server_args.max_mamba_cache_size
             _budget_slots = session_admission_slots(
