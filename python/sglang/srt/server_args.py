@@ -2948,7 +2948,14 @@ class ServerArgs:
     speculative_draft_model_path: A[
         Optional[str],
         Arg(
-            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            help="The path of the draft model weights. This can be a local "
+            "folder or a Hugging Face repo ID. CANONICAL SPELLING (#382): "
+            "--speculative-draft-model-path. The bare "
+            "--speculative-draft-model is accepted as a DEPRECATED alias and "
+            "resolves to the same field; every error and log message names "
+            "the canonical form, because two names for one flag cost a "
+            "sweep-2 arm the time it took to notice the message and the "
+            "parser disagreed.",
             aliases=["--speculative-draft-model"],
         ),
     ] = None
@@ -3103,7 +3110,7 @@ class ServerArgs:
             "ACTIVE algorithm is statically pinned via "
             "--speculative-cross-algorithm-force (per-batch runtime "
             "switching lands in stage 3). Requires --speculative-algorithm "
-            "NEXTN (the MTP rung) plus --speculative-draft-model pointing at "
+            "NEXTN (the MTP rung) plus --speculative-draft-model-path pointing at "
             "the DFLASH draft checkpoint. Placement is fixed per rung: the "
             "NEXTN draft runs split (TP-sharded), the DFLASH draft runs solo "
             "on TP rank 0. Default off -> no new code path is reached.",
@@ -5513,6 +5520,10 @@ class ServerArgs:
         # before it would reject spellings the runtime accepts.
         self._handle_speculative_algorithm_name()
 
+        # #382: one canonical flag name. Notice only, after parsing, so the
+        # operator who typed the alias learns which spelling the messages use.
+        self._handle_deprecated_flag_spellings()
+
         # Draft-solo placement (--speculative-draft-placement solo): validate
         # scope and hard-reject out-of-scope modes (topk > 1, rejection
         # sampling, DP/PP/EP, non-EAGLE-family algorithms) up front, so an
@@ -6278,6 +6289,45 @@ class ServerArgs:
         parse_park_target_order(
             self.lane_offload_park_targets, "--lane-offload-park-targets"
         )
+
+    #: #382: deprecated CLI spellings, mapped to the canonical one. A pair
+    #: belongs here when BOTH resolve to the same field -- the alias is not
+    #: broken, it is just a second name, and a second name is how an error
+    #: message and a parser end up disagreeing in front of an operator.
+    DEPRECATED_FLAG_ALIASES = {
+        "--speculative-draft-model": "--speculative-draft-model-path",
+    }
+
+    def _handle_deprecated_flag_spellings(self, argv=None):
+        """Name the canonical spelling when a deprecated alias was typed.
+
+        Argparse collapses an alias into its field, so by the time anything
+        reads ``server_args`` the spelling is gone -- which is precisely why
+        the operator who typed the alias then sees error text naming a flag
+        they did not use. This looks at the ARGV that produced the args and
+        says, once, which spelling is canonical.
+
+        A notice, not a refusal: the alias works and must keep working (the
+        sweep-2 arm definitions and the runbook recipes are the corpus). It
+        is also side-effect-free on the parsed values -- the two spellings
+        already resolve to the same field, so there is nothing to reconcile.
+        """
+        import sys as _sys
+
+        args = list(_sys.argv if argv is None else argv)
+        for typed in args:
+            # Handle both "--flag value" and "--flag=value".
+            name = typed.split("=", 1)[0]
+            canonical = self.DEPRECATED_FLAG_ALIASES.get(name)
+            if canonical:
+                logger.warning(
+                    "%s is a deprecated spelling of %s; both set the same "
+                    "field and both keep working, but every error and log "
+                    "message in this server names %s (#382).",
+                    name,
+                    canonical,
+                    canonical,
+                )
 
     def _handle_speculative_algorithm_name(self):
         """Resolve and validate --speculative-algorithm at parse time (#379).

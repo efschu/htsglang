@@ -3699,7 +3699,7 @@ class PerfCostModel:
         )
         if not (0 <= self.solo_rank < self.tp_size):
             self.solo_rank = 0
-        # External draft checkpoint (DFLASH / any --speculative-draft-model):
+        # External draft checkpoint (DFLASH / any --speculative-draft-model-path):
         # its bytes live in a SEPARATE checkpoint, so the target-config-derived
         # draft_attn/draft_mlp mass above does not describe it at all. Only
         # counted under solo, where it is unambiguously one rank's resident
