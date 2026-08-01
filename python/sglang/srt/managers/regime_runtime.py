@@ -53,6 +53,7 @@ from typing import Callable, Dict, List, Optional
 from sglang.srt.managers.regime_classifier import (
     DEFAULT_WINDOW_ROUNDS,
     REGIMES,
+    DwellGate,
     RegimeSample,
     RegimeSensor,
     StageTable,
@@ -64,17 +65,22 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "REGIME-OBSERVE"
 
-#: Mode values. ``off`` builds nothing; ``observe`` classifies and logs.
-#: Actuating modes do not exist yet and are refused by name rather than
-#: silently treated as ``observe``.
+#: Mode values. ``off`` builds nothing; ``observe`` classifies and logs;
+#: ``act`` additionally issues the reachable half of a stage flip through an
+#: INJECTED commit callable (``regime_act.RegimeActuator.apply``). This module
+#: never imports that one -- see the no-actuator property below.
 MODE_OFF = "off"
 MODE_OBSERVE = "observe"
-MODES = (MODE_OFF, MODE_OBSERVE)
+MODE_ACT = "act"
+MODES = (MODE_OFF, MODE_OBSERVE, MODE_ACT)
 
-#: Phase-2 gate. The flag proper (``--regime-controller``) lands with phase 3,
-#: when there is an action to authorize; an env read keeps the observe-only
-#: ship inside one module instead of spreading a knob for a no-op across
-#: server_args and environ.
+#: ``--regime-controller`` is the flag (phase 3). This env var is the phase-2
+#: spelling, kept as an OVERRIDE so an observe run already in somebody's
+#: launch script keeps working.
+#:
+#: RETIREMENT: it will be removed once the flag has been through one release.
+#: It can only ever select ``observe`` or ``off`` -- authorizing ``act`` needs
+#: the entry gate, and an env var is not a place to put an authorization.
 ENV_MODE = "SGLANG_REGIME_OBSERVE"
 
 #: Emit one record every N verdicts. The verdict itself is cheap (integer
@@ -84,21 +90,56 @@ DEFAULT_LOG_EVERY = 1
 
 
 def observe_mode() -> str:
-    """``off`` unless the env var explicitly asks for ``observe``.
+    """The mode the ENV OVERRIDE asks for: ``off`` or ``observe``.
 
     An unknown value is refused loudly rather than rounded to the nearest
     mode: a typo that silently disables an observability run wastes the run.
+    ``act`` is refused here by name -- the entry gate of DESIGN_363 section
+    11.7 is checked at argument time against declared evidence, and an
+    environment variable cannot carry evidence.
     """
     raw = (os.environ.get(ENV_MODE) or "").strip().lower()
     if not raw or raw in ("0", "false", "no", MODE_OFF):
         return MODE_OFF
     if raw in ("1", "true", "yes", MODE_OBSERVE):
         return MODE_OBSERVE
+    if raw == MODE_ACT:
+        raise ValueError(
+            f"{ENV_MODE}=act is refused: acting is authorized by the entry "
+            f"gate (DESIGN_363 section 11.7), which is checked at argument "
+            f"time against --regime-gate-evidence. Use "
+            f"--regime-controller act so the refusal can name what is "
+            f"missing; an env var cannot carry evidence."
+        )
     raise ValueError(
-        f"{ENV_MODE}={raw!r} is not a known mode; use one of "
-        f"{', '.join(MODES)} (or 1/0). Actuating modes do not exist yet: "
-        f"#363 phase 2 ships observe-only."
+        f"{ENV_MODE}={raw!r} is not a known mode; use {MODE_OFF} or "
+        f"{MODE_OBSERVE} (or 1/0)."
     )
+
+
+def resolve_mode(server_args=None) -> str:
+    """The effective mode: the flag, with the env override on top.
+
+    Precedence is the override direction, deliberately: the env var can turn
+    observation ON for a server whose launch script predates the flag, and it
+    can never turn acting on.
+    """
+    mode = str(getattr(server_args, "regime_controller", MODE_OFF) or MODE_OFF)
+    if mode not in MODES:
+        raise ValueError(
+            f"--regime-controller={mode!r} is not a known mode; use one of "
+            f"{', '.join(MODES)}."
+        )
+    env = observe_mode()
+    if env == MODE_OBSERVE and mode == MODE_OFF:
+        logger.info(
+            "%s: %s=observe overrides --regime-controller off. The env var is "
+            "the phase-2 spelling and will be retired; prefer the flag.",
+            LOG_PREFIX,
+            ENV_MODE,
+        )
+        return MODE_OBSERVE
+    return mode
 
 
 class RegimeObserver:
@@ -122,6 +163,10 @@ class RegimeObserver:
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         log_every: int = DEFAULT_LOG_EVERY,
         current_stage: Optional[str] = None,
+        mode: str = MODE_OBSERVE,
+        table_plan=None,
+        commit_fn: Optional[Callable] = None,
+        dwell: Optional["DwellGate"] = None,
     ):
         if consensus_interval < 1:
             raise ValueError(
@@ -144,6 +189,29 @@ class RegimeObserver:
         self._collective_min = collective_min
         self._log_every = int(log_every)
         self._current_stage = current_stage
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+        # The act path is a pair of INJECTED callables, never an import: this
+        # module must stay unable to reach #297/#330 so the phase-2 F4
+        # property survives phase 3 as a fact about the import graph.
+        if mode == MODE_ACT and commit_fn is None:
+            raise ValueError(
+                "mode 'act' needs a commit_fn (regime_act.RegimeActuator.apply). "
+                "Constructing an acting observer with nothing to act through "
+                "would run as an expensive observe under a misleading name."
+            )
+        if mode != MODE_ACT and commit_fn is not None:
+            raise ValueError(
+                f"mode {mode!r} was given a commit_fn. Observe must not hold a "
+                f"path to an actuator even an unused one -- that is the "
+                f"property the no-actuator test pins."
+            )
+        self._mode = mode
+        self._table_plan = table_plan
+        self._commit_fn = commit_fn
+        self._dwell = dwell
+        self.actuations = 0
+        self.vetoes: Dict[str, int] = {}
 
         self._round = 0
         self._epoch = 0
@@ -288,7 +356,27 @@ class RegimeObserver:
             ),
             "agreed": bool(reduced["agreed"]) if reduced else None,
             "actuated": False,
+            "action": None,
         }
+        # ACT: the only place a proposal becomes a move. Off in every other
+        # mode by construction -- ``_commit_fn`` is None and the constructor
+        # refuses to accept one outside act mode.
+        if self._mode == MODE_ACT and target is not None:
+            allowed, veto = self._act_interlocks(target, sample, reduced)
+            if not allowed:
+                self._count_veto(veto)
+                record["reason"] = f"{why}; ACT VETO: {veto}"
+            else:
+                result = self._commit_fn(target, self._table[self._current_stage])
+                record["action"] = result.as_dict()
+                record["actuated"] = bool(result.armed)
+                if result.armed:
+                    self.actuations += 1
+                    self._current_stage = target.name
+                    if self._dwell is not None:
+                        self._dwell.record_flip(self._round)
+                else:
+                    self._count_veto("actuator refused")
         self._last_record = record
         self._maybe_log(record, reduced)
 
@@ -298,6 +386,69 @@ class RegimeObserver:
         self._rank_ms_n = 0
         self._epoch += 1
         return record
+
+    # -- act-mode interlocks --------------------------------------------------
+    def _act_interlocks(self, target, sample, reduced) -> tuple:
+        """Every guard a proposal must clear before it becomes a move.
+
+        ``(allowed, veto_reason)``. Each one is carried over from a phase
+        whose falsifier proved it necessary, and each is BINDING in act mode
+        where observe only reported it.
+        """
+        # 1. Selectability (phase 3). A stage the boot table judged
+        #    unreachable -- weights differ, or the KV vector was never
+        #    declared -- is not a candidate, whatever the regime says.
+        if self._table is None or self._current_stage is None:
+            return False, (
+                "act needs a boot stage table AND a known current stage; "
+                "without both there is no 'from' for the move and no set the "
+                "'to' was validated against"
+            )
+        if self._table_plan is not None:
+            ok, why = self._table_plan.is_selectable(target.name)
+            if not ok:
+                return False, why
+
+        # 2. Dwell (F1). Hysteresis says the signal is real; dwell says the
+        #    move is affordable. A load that alternates faster than a flip
+        #    amortizes passes the first and must fail the second.
+        if self._dwell is not None:
+            ok, why = self._dwell.allows(self._round)
+            if not ok:
+                return False, why
+
+        # 3. Group agreement. Acting on a verdict the ranks did not share is
+        #    the #94/#194/#259 hang under an actuator -- the exact thing the
+        #    observe phase existed to rule out.
+        if reduced is not None and not reduced["agreed"]:
+            return False, (
+                "the TP ranks classified differently this boundary; a flip "
+                "under a disputed verdict is the hang the observe phase "
+                "existed to rule out"
+            )
+        if self._tp_size > 1 and self._collective_min is None:
+            return False, (
+                "multi-rank group with no consensus channel: the verdict's "
+                "rank-uniformity is unchecked, so it may not move anything"
+            )
+
+        # 4. The one-boundary-stale veto, BINDING in act mode (phase 2 built
+        #    it, phase 3 makes it bite). The spread is by construction one
+        #    boundary old; what act adds is that it must EXIST. Flipping with
+        #    no group timing at all means the plan has never been checked
+        #    against the rig it is about to move.
+        if self._tp_size > 1 and sample.rank_ms_spread_pct is None:
+            return False, (
+                "no group timing from the previous boundary (one-boundary-"
+                "stale veto): every rank was blind, so the planner's split "
+                "has not been checked against this rig and a flip would be "
+                "unvalidated"
+            )
+        return True, ""
+
+    def _count_veto(self, reason: str) -> None:
+        key = reason.split(":")[0][:48]
+        self.vetoes[key] = self.vetoes.get(key, 0) + 1
 
     # -- rule 2: the consensus channel ---------------------------------------
     def _consensus(
@@ -392,7 +543,9 @@ class RegimeObserver:
             "consensus_rounds": self.consensus_rounds,
             "desyncs": self.desyncs,
             "uncoordinated": self.uncoordinated,
-            "actuations": 0,
+            "mode": self._mode,
+            "actuations": self.actuations,
+            "vetoes": dict(self.vetoes),
         }
 
 
@@ -403,14 +556,19 @@ def _pct(value: Optional[float]) -> str:
 def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
     """Construct the observer for one scheduler, or ``None`` when off.
 
-    Off is the default and costs one env read at build time and nothing per
+    Off is the default and costs one flag read at build time and nothing per
     round: the scheduler's attribute stays ``None`` and the call site is one
     predictable branch.
-    """
-    if observe_mode() != MODE_OBSERVE:
-        return None
 
+    In ``act`` mode the actuator is built HERE and injected, so the observer
+    still holds no import path to #297/#330. The entry gate was already
+    cleared at argument time (``server_args._handle_regime_controller``); this
+    function does not re-litigate it, it only wires what the gate authorized.
+    """
     server_args = scheduler.server_args
+    mode = resolve_mode(server_args)
+    if mode == MODE_OFF:
+        return None
     tp_size = int(getattr(server_args, "tp_size", 1) or 1)
     collective = None
     if tp_size > 1:
@@ -426,16 +584,178 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
             collective = default_collective_min(cpu_group)
 
     interval = int(getattr(server_args, "kv_pressure_consensus_interval", 8) or 8)
+
+    # The boot stage table (#363 phase 3). Absent is a real state, not an
+    # empty table pretending to be a full one: on a rig with no probe the
+    # observer reports the regime and says the table is absent.
+    table_plan = getattr(scheduler, "regime_stage_table", None)
+    table = table_plan.table if table_plan is not None else None
+    current = table_plan.booted if table_plan is not None else None
+    if table_plan is not None:
+        logger.info(
+            "%s stage table: %d stage(s), %d reachable at runtime, %d flip "
+            "target(s), booted on %r",
+            LOG_PREFIX,
+            len(table_plan),
+            len(table_plan.reachable),
+            len(table_plan.flip_targets),
+            table_plan.booted,
+        )
+        for line in table_plan.describe():
+            logger.info("%s   stage %s", LOG_PREFIX, line)
+        for note in table_plan.notes:
+            logger.info("%s   note: %s", LOG_PREFIX, note)
+
+    commit_fn = None
+    dwell = None
+    if mode == MODE_ACT:
+        # Imported HERE, in the act branch only. A module-scope import would
+        # give observe a path to the actuators, which is the property the
+        # no-actuator test pins.
+        from sglang.srt.managers.regime_act import build_regime_actuator
+
+        commit_fn = build_regime_actuator(scheduler, table_plan).apply
+        dwell = _dwell_for(table_plan)
+
     return RegimeObserver(
         consensus_interval=interval,
         tp_size=tp_size,
         collective_min=collective,
-        # No stage table yet: the planner-solved stages are declared at boot
-        # in phase 3, when something can select between them. Until then the
-        # observer reports the regime and says the table is absent rather
-        # than inventing one.
-        table=None,
+        mode=mode,
+        table=table,
+        table_plan=table_plan,
+        current_stage=current,
+        commit_fn=commit_fn,
+        dwell=dwell,
     )
+
+
+#: Rounds of dwell to assume before the live mean round time is known. The
+#: real value is derived (DESIGN_363 section 3.3) from the flip's instrumented
+#: cost and the measured round time; until a flip has been timed this is the
+#: conservative stand-in, and it is deliberately long.
+BOOTSTRAP_DWELL_ROUNDS = 512
+
+
+def _dwell_for(table_plan) -> DwellGate:
+    """The dwell gate for the most expensive selectable flip in the table.
+
+    One gate for the table rather than one per stage: the gate answers "may
+    anything move now", and sizing it to the cheapest stage would let an
+    expensive flip follow a cheap one inside the expensive one's own
+    amortization window.
+    """
+    if table_plan is None:
+        return DwellGate(min_rounds=BOOTSTRAP_DWELL_ROUNDS)
+    costs = [p.stage.flip_cost_s for p in table_plan.flip_targets]
+    if not costs:
+        return DwellGate(min_rounds=BOOTSTRAP_DWELL_ROUNDS)
+    # Round time is not measured yet at build time; DESIGN_363 section 3.3's
+    # derivation runs once the observer has timed a window. Until then the
+    # bootstrap value stands, scaled by the worst flip so a 6 s move is not
+    # held for the same span as a 0.3 s one.
+    worst = max(costs)
+    return DwellGate(min_rounds=max(BOOTSTRAP_DWELL_ROUNDS, int(worst * 128)))
+
+
+def build_regime_stage_table(scheduler):
+    """The boot stage table for one scheduler, or ``None``.
+
+    The booted stage is assembled from what this server ACTUALLY launched with
+    -- the MLP vector, the KV token vector and the per-rank budgets in force --
+    so reachability is computed against where we are rather than against a
+    plan. Candidates come from the planner through
+    ``regime_stages.planner_candidates``; with no feed bound the table holds
+    the booted stage alone, which is the honest state on a rig with no probe
+    and is reported as such.
+
+    Never raises into the scheduler loop: a table that cannot be built is a
+    logged absence, because an observability feature must not be able to stop
+    a server from serving.
+    """
+    from sglang.srt.managers.regime_stages import (
+        build_stage_table,
+        planner_candidates,
+    )
+
+    server_args = scheduler.server_args
+    try:
+        booted = _booted_stage(scheduler)
+        if booted is None:
+            return None
+        declared = _declared_vectors(scheduler)
+        candidates, notes = planner_candidates(server_args)
+        plan = build_stage_table(
+            booted=booted, candidates=candidates, declared_vectors=declared
+        )
+        for note in notes:
+            logger.info("%s stage feed: %s", LOG_PREFIX, note)
+        return plan
+    except Exception as exc:  # noqa: BLE001 -- a table is not worth a server
+        logger.warning(
+            "%s could not build the boot stage table (%r); running without "
+            "one. The regime is still classified and logged; no stage is "
+            "named and nothing could be selected even in act mode.",
+            LOG_PREFIX,
+            exc,
+        )
+        return None
+
+
+def _booted_stage(scheduler):
+    """The configuration this server is actually running, as a Stage."""
+    from sglang.srt.managers.regime_classifier import REGIME_MIXED, Stage
+
+    server_args = scheduler.server_args
+    kv_vector = _current_kv_vector(scheduler)
+    if kv_vector is None:
+        return None
+    budgets = tuple(
+        int(x) for x in (getattr(server_args, "vram_budget_mib", None) or ())
+    )
+    if not budgets:
+        budgets = tuple(
+            int(x) for x in (getattr(server_args, "rank_gpu_memory_mib", None) or ())
+        )
+    capacity = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
+    if capacity <= 0:
+        return None
+    weights = getattr(server_args, "rank_mlp_ratio", None)
+    return Stage(
+        name="booted",
+        # The booted stage serves whatever regime the server is in; it is the
+        # reference, not a regime's optimum, so it claims the resting one.
+        regime=REGIME_MIXED,
+        weight_vector=tuple(int(x) for x in weights) if weights else None,
+        kv_token_vector=kv_vector,
+        vram_budget_mib=budgets,
+        max_total_num_tokens=capacity,
+        # The reference stage's gain against itself is zero by definition, and
+        # StageTable exempts the reference from the band rule for that reason.
+        measured_gain_pct=0.0,
+        measured_band_pct=0.0,
+        flip_cost_s=0.0,
+    )
+
+
+def _current_kv_vector(scheduler):
+    reshard_rt = getattr(scheduler, "kv_reshard_runtime", None)
+    if reshard_rt is not None:
+        return tuple(int(x) for x in reshard_rt.current_vector)
+    try:
+        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+        ratios = get_cp_token_ratios()
+    except Exception:
+        return None
+    return tuple(int(x) for x in ratios) if ratios else None
+
+
+def _declared_vectors(scheduler):
+    reshard_rt = getattr(scheduler, "kv_reshard_runtime", None)
+    if reshard_rt is None:
+        return ()
+    return tuple(tuple(int(x) for x in v) for v in reshard_rt.allowed_vectors)
 
 
 def rank_forward_ms_from(scheduler) -> Optional[float]:
@@ -459,11 +779,14 @@ __all__ = [
     "ENV_MODE",
     "LOG_PREFIX",
     "MODES",
+    "MODE_ACT",
     "MODE_OBSERVE",
     "MODE_OFF",
     "REGIMES",
     "RegimeObserver",
     "build_regime_observer",
+    "build_regime_stage_table",
     "observe_mode",
     "rank_forward_ms_from",
+    "resolve_mode",
 ]

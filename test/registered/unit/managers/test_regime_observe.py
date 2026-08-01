@@ -649,7 +649,20 @@ class TestF4DoNothingBaseline(CustomTestCase):
         with mock.patch.dict(os.environ, {ENV_MODE: "on"}):
             with self.assertRaises(ValueError) as cm:
                 observe_mode()
-            self.assertIn("observe-only", str(cm.exception))
+            self.assertIn("not a known mode", str(cm.exception))
+
+    def test_the_env_override_cannot_authorize_acting(self):
+        """UPDATED DELIBERATELY by #363 phase 3: 'act' now exists as a mode,
+        and the env override still may not select it. Acting is authorized by
+        the entry gate at argument time, and an environment variable cannot
+        carry evidence."""
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {ENV_MODE: "act"}):
+            with self.assertRaises(ValueError) as cm:
+                observe_mode()
+            self.assertIn("cannot carry evidence", str(cm.exception))
 
 
 class TestSensingAdapter(CustomTestCase):

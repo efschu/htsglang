@@ -735,3 +735,151 @@ fast one.
 3. F3's per-signal bands measured on the rig; every constant in §3.4 replaced
    or confirmed.
 4. F4's card comparison passed at equal or better `max_total_num_tokens`.
+
+---
+
+## 12. Phase 3, desk half — the stage table, the flag, and the act path
+
+Built behind an off flag. ENABLING it is still gated on §11.7, which needs
+card windows; what is settled here is everything that can be settled without
+one, so the card runs measure a finished mechanism instead of debugging it.
+
+### 12.1 The boot stage table
+
+`managers/regime_stages.py`. The #287 ladder generalized: N discrete operating
+points, declared and validated at boot, selected at runtime, never invented
+there (§1).
+
+A stage's **reachability** is a property of the pair (booted, target),
+computed rather than asserted:
+
+| code | condition | actuator |
+|---|---|---|
+| `booted` | where the server is — and the normal flip-BACK target | none needed |
+| `reshard` | same weights, target KV vector is in `--kv-reshard-vectors` | #297 |
+| `vram_dial` | same weights and KV vector, budgets differ upward | #330 grow |
+| `no_weight_mover` | the weight vector differs | **none — restart** |
+| `undeclared_vector` | KV vector not declared, so no rows were reserved | none |
+
+`reachable` includes the booted stage; `flip_targets` excludes it. That split
+is the correction the build forced (§12.4). Unreachable stages stay **visible**
+in the table with their reason — a planner-solved configuration this boot
+cannot move to is information, not something to hide.
+
+Refusals at construction, in the #287 style: two stages claiming one regime (a
+tie broken by list order is not a decision), a candidate reusing the booted
+name, a stage whose gain does not clear its own band (#360, inherited from
+`StageTable`), a booted stage missing from its own table.
+
+The planner feed is a seam (`planner_candidates(server_args, solve_fn=)`) so
+the table logic needs no probe to test. With no feed bound the table holds the
+booted stage alone and says so — the phase-2 "table absent" report becomes
+"table present, 1 stage, 0 flip targets", which is a different and more useful
+statement than an empty table pretending to be a full one.
+
+### 12.2 `--regime-controller {off,observe,act}`
+
+`off` is the default. `observe` is phase 2, now first-class.
+
+`act` is **refused at parse time** until `--regime-gate-evidence` names a
+complete set of measurements for the four §11.7 items. The refusal is in the
+#350 style — it tells the operator what to run:
+
+```
+--regime-controller act is refused: the entry gate of DESIGN_363 section 11.7
+is not clear. act moves a live server's KV placement, so it is authorized by
+measurement, not by a flag.
+  [ok]      desyncs_zero: observe run 2026-08-01
+  [MISSING] f2_live_replay -- ...
+            produce it: replay the observe run's record stream through the classifier
+  ...
+Until then use --regime-controller observe, ...
+```
+
+Two rules the evidence format enforces. A `passed: true` with no `source` is
+refused — an unattributed pass is a claim, not evidence. And a **declared but
+unparsable** file is an ERROR rather than a closed gate: a typo must not read
+as "not measured yet".
+
+A second refusal follows the gate: `act` with no `--kv-reshard-vectors` and no
+`--enable-vram-dial` is rejected, because every proposal would then be refused
+for want of an actuator and `act` would be an expensive `observe` under a
+misleading name.
+
+`SGLANG_REGIME_OBSERVE` survives as an override that can only ever select
+`observe`, with a retirement note. It is refused by name if it asks for `act`:
+an environment variable is not a place to put an authorization.
+
+### 12.3 The act path, and why observe still cannot reach it
+
+`managers/regime_act.py` is the **only** module that touches an actuator, and
+it is a separate module for exactly that reason. `regime_runtime` imports it
+inside the act branch of the builder, never at module scope, so the phase-2 F4
+property survives as a fact about the import graph: a test walks both syntax
+trees and asserts observe cannot reach #297 or #330 now that #363 can.
+
+Two further guards make it structural rather than incidental: the observer
+**refuses to be constructed** in observe mode with a `commit_fn`, and refuses
+in act mode without one. Observe may not hold an unused path to an actuator,
+so a future edit cannot quietly start calling it.
+
+`RegimeActuator` refuses by named return, never by exception — a controller
+that raises inside the scheduler loop turns a bad proposal into a dead server.
+It applies a VRAM grow before a reshard (a bigger pool cannot make a reshard
+fail; a reshard into a pool about to grow would be sized against the smaller
+one) and refuses a shrink outright before arming anything, because a shrink
+flushes the radix cache and #330 reserves that for an explicit dial.
+
+### 12.4 Interlocks, all binding in act mode
+
+Each was built in an earlier phase and reported by observe; act makes it bite.
+
+1. **Selectability** — a stage the boot table judged unreachable is not a
+   candidate, whatever the regime says.
+2. **Dwell** (F1) — hysteresis says the signal is real, dwell says the move is
+   affordable. Sized to the most expensive flip target in the table, not the
+   cheapest, so an expensive flip cannot follow a cheap one inside its own
+   amortization window.
+3. **Admissibility** (F0, and the #350 lesson) — a stage whose pool cannot hold
+   the live working set is refused with the arithmetic.
+4. **Group agreement** — a flip under a disputed verdict is the
+   #94/#194/#259 hang under an actuator, i.e. exactly what observe existed to
+   rule out. A multi-rank group with no consensus channel may not move
+   anything.
+5. **The one-boundary-stale veto, now binding** — phase 2 built the lag and
+   reported it; act requires the group timing to EXIST. Every rank blind means
+   the planner's split has never been checked against the rig it is about to
+   move.
+
+### 12.5 What building it changed
+
+**`reachable` and `flip_target` are two questions.** The first model made
+`selectable` exclude the booted stage, on the reasoning that it is where we
+are. That makes every flip a one-way door: when the prefill burst drains and
+the controller wants the decode configuration back, the flip-back reads as an
+unreachable stage. Returning to the booted stage is always legal — its KV
+vector is by definition backed by the pool reserved for it — so `reachable`
+includes it and `flip_targets` is the count that answers "does acting have
+anywhere to go". Caught by the dwell falsifier, which vetoed a flip-back for
+the wrong reason.
+
+### 12.6 Test tally and what the card gates must still prove
+
+59 hermetic cases in `test_regime_act.py`, plus the phase-1/2 suites still
+green. The gate falsifier is symmetric and both halves pass: the gate CLOSES
+(act refused, every missing item named) and the gate OPENS (a complete
+evidence file lets a proposal reach the stubbed actuator with the right
+vector and source tag).
+
+Nothing here measures anything. §11.7 stands unchanged, and every item still
+needs a card:
+
+1. `summary()["desyncs"] == 0` over a real workload.
+2. F2 re-run against a live observe trace, not the synthetic one.
+3. F3's per-signal bands measured on-rig; every §3.4 constant replaced or
+   confirmed against its own band.
+4. F4's three-arm comparison passed at equal or better
+   `max_total_num_tokens`.
+
+Until all four are recorded in an evidence file, `--regime-controller act`
+does not start a server.

@@ -127,8 +127,6 @@ from sglang.srt.managers.io_struct import (
     KvReshardReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    VramBudgetReqInput,
-    VramBudgetReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -157,6 +155,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    VramBudgetReqInput,
+    VramBudgetReqOutput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -385,6 +385,12 @@ class Scheduler(
         # cached, so the default path costs one attribute compare per round.
         self.regime_observer = None
         self._regime_observer_mode = None
+        # #363 phase 3: the boot stage table. Built once, lazily, next to the
+        # observer -- the planner-solved set the runtime may SELECT from and
+        # never adds to. None = no table, which is a real state (no probe, no
+        # declared vectors) and is reported as such rather than as an empty
+        # table pretending to be a full one.
+        self.regime_stage_table = None
         # #297 phase-boundary KV reshard runtime: None on every default path;
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
@@ -656,9 +662,7 @@ class Scheduler(
             self.congruent_prefill_lane = CongruentPrefillLane(
                 self.server_args.disaggregation_prefill_lane_interval
             )
-            self.congruent_prefill_lane.bind_model(
-                self.tp_worker.model_runner.model
-            )
+            self.congruent_prefill_lane.bind_model(self.tp_worker.model_runner.model)
 
         # Multi-group runtime (#274) slice B: build the configured in-process
         # lanes (one PD lane on the shared rank). AFTER the serving group's
@@ -732,9 +736,7 @@ class Scheduler(
                                 )
                             ),
                             spec_steps=lane.spec_steps,
-                            enabled=bool(
-                                getattr(sa, "dual_group_lane_pairing", False)
-                            ),
+                            enabled=bool(getattr(sa, "dual_group_lane_pairing", False)),
                             signal=self.lane_pairing_signal,
                         )
 
@@ -1107,9 +1109,7 @@ class Scheduler(
                     continue
                 try:
                     v = pool.get_kv_size_bytes()
-                    total += (
-                        int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
-                    )
+                    total += int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
                 except Exception:
                     continue
         except Exception:
@@ -3319,13 +3319,10 @@ class Scheduler(
                 # -- the same uniformity argument as the admission limiter's
                 # sample below at update_running_batch.
                 decode_active = (
-                    not running_batch.is_empty()
-                    and not running_batch.is_prefill_only
+                    not running_batch.is_empty() and not running_batch.is_prefill_only
                 )
                 self.kv_pressure_runtime.on_round(
-                    held_tokens=sum(
-                        req.seqlen for req in running_batch.reqs
-                    ),
+                    held_tokens=sum(req.seqlen for req in running_batch.reqs),
                     # held_tokens are GLOBAL sequence lengths, so the capacity
                     # they are weighed against has to be the global span too
                     # (#346). Identity off the token-sharded lane.
@@ -3367,15 +3364,20 @@ class Scheduler(
         # Unset env = the attribute stays None and this is one predictable
         # branch per round, byte-identical to today.
         if self._regime_observer_mode is None:
-            from sglang.srt.managers.regime_runtime import observe_mode
+            from sglang.srt.managers.regime_runtime import resolve_mode
 
-            self._regime_observer_mode = observe_mode()
+            self._regime_observer_mode = resolve_mode(self.server_args)
         if self._regime_observer_mode != "off":
             if self.regime_observer is None:
                 from sglang.srt.managers.regime_runtime import (
                     build_regime_observer,
+                    build_regime_stage_table,
                 )
 
+                # The table first: the observer reads it, and both are built
+                # once on the first iteration where the pools and the runtimes
+                # this server actually wired already exist.
+                self.regime_stage_table = build_regime_stage_table(self)
                 self.regime_observer = build_regime_observer(self)
             if self.regime_observer is not None:
                 from sglang.srt.managers.regime_runtime import (
@@ -3387,8 +3389,7 @@ class Scheduler(
                 # "this round was a decode round" is the divergence class
                 # DESIGN_363 section 7.3 argues against.
                 prefill_active = not (
-                    not running_batch.is_empty()
-                    and not running_batch.is_prefill_only
+                    not running_batch.is_empty() and not running_batch.is_prefill_only
                 )
                 self.regime_observer.on_round(
                     prefill_active=prefill_active,
@@ -3463,10 +3464,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
-        elif (
-            self.kv_session_offload is not None
-            and self.kv_session_offload.decouple
-        ):
+        elif self.kv_session_offload is not None and self.kv_session_offload.decouple:
             # kv-session-offload DECOUPLE S4b: run the DEVICE decode batch AND a
             # due spill tick CONCURRENTLY this iteration (not instead-of).
             # Select the device decode batch exactly as the default branch
@@ -3662,9 +3660,10 @@ class Scheduler(
             # BOOT-time DFLASH predicate: under cross-algorithm switching the
             # DFLASH prefill append runs on every prefill regardless of which
             # rung is active, so keying this to the active rung would miss it.
-            _dflash_prefill = bool(
-                getattr(self.server_args, "speculative_cross_algorithm", False)
-            ) or self.spec_algorithm.is_dflash_family()
+            _dflash_prefill = (
+                bool(getattr(self.server_args, "speculative_cross_algorithm", False))
+                or self.spec_algorithm.is_dflash_family()
+            )
             _spec_in_tick = bool(
                 getattr(self.kv_session_offload, "spec_in_tick_ready", False)
             )
@@ -3694,9 +3693,7 @@ class Scheduler(
             # Prefill-Spill (PS1-V1a): replicated free-region count (0 when the
             # feature is off -> the adder relaxation is inert). No collective
             # here (rank-uniform by construction, see prefill_spill_free_regions).
-            prefill_spill_regions = (
-                self.kv_session_offload.prefill_spill_free_regions()
-            )
+            prefill_spill_regions = self.kv_session_offload.prefill_spill_free_regions()
 
         # Prefill policy
         adder = PrefillAdder(
@@ -4951,9 +4948,7 @@ class Scheduler(
                 self.kv_capacity_runtime = build_kv_capacity_runtime(self)
             rt = self.kv_capacity_runtime
             if recv_req.query:
-                return VramBudgetReqOutput(
-                    success=True, message="", state=rt.status()
-                )
+                return VramBudgetReqOutput(success=True, message="", state=rt.status())
             ok, msg = rt.apply_budget_request(
                 device=recv_req.device,
                 budget_mib=recv_req.budget_mib,
@@ -4999,9 +4994,7 @@ class Scheduler(
             while chunk >= min_chunk:
                 try:
                     # torch.zeros allocates AND memsets the pages.
-                    buffers.append(
-                        torch.zeros(chunk, dtype=torch.uint8, device=device)
-                    )
+                    buffers.append(torch.zeros(chunk, dtype=torch.uint8, device=device))
                     scrubbed += chunk
                 except torch.OutOfMemoryError:
                     chunk //= 2
@@ -5321,8 +5314,7 @@ class Scheduler(
                         flipped += 1
                 if flipped:
                     logger.info(
-                        "dual-group lane pairing policy set to %s on %d "
-                        "lane(s).",
+                        "dual-group lane pairing policy set to %s on %d " "lane(s).",
                         pairing_on,
                         flipped,
                     )

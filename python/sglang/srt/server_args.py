@@ -4677,6 +4677,46 @@ class ServerArgs:
             "latency (and the collective cost) of the ladder.",
         ),
     ] = 8
+    regime_controller: A[
+        str,
+        Arg(
+            help="Dynamic regime controller (#363): watch the live load, "
+            "name its shape (prefill-heavy / decode-heavy / KV-pressure / "
+            "mixed) and select among the planner-solved stages declared at "
+            "boot. 'off' (default) builds nothing and costs one attribute "
+            "compare per scheduler round. 'observe' classifies at the "
+            "between-tick boundary and LOGS the stage it would flip to, "
+            "including the interlock that refused it, and actuates nothing -- "
+            "this is the run that produces the evidence the next mode needs. "
+            "'act' additionally issues the reachable half of a stage flip "
+            "(#297 KV reshard, #330 VRAM dial in the GROW direction only; the "
+            "MLP/GEMM weight cut has no runtime actuator, so a stage that "
+            "differs in it is reported and never selected). 'act' is REFUSED "
+            "at parse time until --regime-gate-evidence names a complete set "
+            "of measurements for the four entry-gate items of DESIGN_363 "
+            "section 11.7 -- acting moves a live server's KV placement, so it "
+            "is authorized by measurement rather than by a flag, and the "
+            "refusal names each missing item and the run that produces it. "
+            "The SGLANG_REGIME_OBSERVE env var remains as an override that "
+            "can only select 'observe'; it is the phase-2 spelling and will "
+            "be retired.",
+            choices=["off", "observe", "act"],
+        ),
+    ] = "off"
+    regime_gate_evidence: A[
+        Optional[str],
+        Arg(
+            help="Path to the JSON evidence file that authorizes "
+            "--regime-controller act (#363). One object keyed by entry-gate "
+            "item (desyncs_zero, f2_live_replay, f3_bands_measured, "
+            "f4_card_comparison), each {'passed': true, 'source': '<what "
+            "measured it>'}. A 'passed' without a 'source' is refused: an "
+            "unattributed pass is a claim, not evidence. A declared file that "
+            "cannot be parsed is an ERROR rather than a closed gate, so a "
+            "typo cannot read as 'not measured yet'. Ignored unless "
+            "--regime-controller act.",
+        ),
+    ] = None
     kv_reshard_vectors: A[
         Optional[str],
         Arg(
@@ -5436,6 +5476,12 @@ class ServerArgs:
         # typo fails the boot rather than the first plan. `choices=` already
         # bounds the CLI; this catches direct ServerArgs construction too.
         self._handle_objective()
+
+        # #363: the regime controller mode. 'act' is authorized by measured
+        # evidence, not by the flag, so the entry gate is checked HERE -- a
+        # server that cannot justify acting must fail to start rather than
+        # start and quietly observe under an acting flag.
+        self._handle_regime_controller()
 
         # Erg. 9/9b KV pressure ladder: validate the step spec, the two
         # water marks and the asymmetric windows at argument time (a typo
@@ -6353,6 +6399,48 @@ class ServerArgs:
         # resolve_objective raises ValueError on an unknown value and returns
         # the enum member otherwise; store back the canonical string.
         self.objective = resolve_objective(self).value
+
+    def _handle_regime_controller(self):
+        """#363: validate the mode and, for 'act', the entry gate.
+
+        The gate lives in ``managers.regime_stages`` so the flag and the
+        runtime read ONE definition of what the evidence is; duplicating the
+        item list here is how a flag and its feature drift apart.
+        """
+        from sglang.srt.managers.regime_runtime import MODES
+        from sglang.srt.managers.regime_stages import load_gate_evidence
+
+        mode = str(self.regime_controller or "off")
+        if mode not in MODES:
+            raise ValueError(
+                f"--regime-controller={mode!r} is not a known mode; use one "
+                f"of {', '.join(MODES)}."
+            )
+        self.regime_controller = mode
+        if self.regime_gate_evidence is not None and mode != "act":
+            # Not an error: declaring the evidence before switching the mode
+            # is the natural order. Parsed anyway, so a malformed file is
+            # found now rather than on the boot that finally flips to act.
+            load_gate_evidence(self.regime_gate_evidence)
+            return
+        if mode != "act":
+            return
+
+        gate = load_gate_evidence(self.regime_gate_evidence)
+        if not gate.open:
+            raise ValueError(gate.refusal())
+        # The gate authorizes acting; it does not conjure an actuator. A rig
+        # with neither runtime wired would run 'act' as an expensive observe.
+        if self.kv_reshard_vectors is None and not self.enable_vram_dial:
+            raise ValueError(
+                "--regime-controller act needs at least one runtime actuator "
+                "wired: --kv-reshard-vectors (the #297 KV token vector) or "
+                "--enable-vram-dial (the #330 VRAM budget). Without either, "
+                "every proposal would be refused for want of an actuator and "
+                "'act' would be an expensive 'observe' under a misleading "
+                "name. The weight (MLP/GEMM) cut is not an option here: it "
+                "has no runtime actuator at all (#354/#357)."
+            )
 
     def _handle_gdn_state_set_ladder(self):
         """#286 Erg. 8: fail fast on an invalid --gdn-state-set-ladder spec
