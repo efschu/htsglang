@@ -61,6 +61,71 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     return backend
 
 
+# Attention-scratch budget (#395, ANALYSE_393 item 1, concept from ik_llama's
+# `-amb`): MHA_CHUNKED_KV / MHA_ONE_SHOT materialize per-token K
+# [num_local_heads, qk_head_dim] and V [num_local_heads, v_head_dim] (see the
+# "Configs for kv chunking strategy" comment below), while the absorbed-MLA
+# path below the threshold keeps only the compressed
+# kv_lora_rank + qk_rope_head_dim latent. num_local_heads is a PER-RANK
+# quantity that varies with head count, head dim, and TP shard width --
+# uneven TP splits heads unevenly across ranks (e.g. V4-Flash's [32, 16, 16]).
+# A flat token-count threshold is therefore not comparable across ranks or
+# models; the scratch BYTE count is, so that is what is budgeted, once per
+# rank, using that rank's own local geometry.
+ATTN_SCRATCH_ITEMSIZE_BYTES = 2  # bf16 K/V materialization in this path
+
+# Reference geometry this default is pinned against: DeepSeek-V3 at TP=1 (the
+# "Configs for DeepSeek-V3" comment below -- num_local_heads=128,
+# qk_head_dim=192, v_head_dim=128). 8192 tokens * (128 * 320 * 2) bytes =
+# 671,088,640 bytes = exactly 640 MiB, so this constant reproduces today's
+# SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD default (8192 tokens) bit-for-bit on
+# that geometry -- the default path is unchanged there. On any OTHER
+# geometry (different head count/dim, or a TP rank with fewer local heads)
+# the derived token threshold differs from 8192 by design: it is the 640 MiB
+# scratch budget, not the token count, that stays constant.
+DEFAULT_ATTN_SCRATCH_BUDGET_MIB = 640
+
+
+def attn_scratch_bytes_per_token(
+    num_local_heads: int, qk_head_dim: int, v_head_dim: int
+) -> int:
+    """Bytes of K/V scratch materialized for ONE token, on THIS rank, by the
+    MHA_CHUNKED_KV / MHA_ONE_SHOT path. See the module-level comment above
+    `ATTN_SCRATCH_ITEMSIZE_BYTES`."""
+    return num_local_heads * (qk_head_dim + v_head_dim) * ATTN_SCRATCH_ITEMSIZE_BYTES
+
+
+def attn_scratch_token_threshold(
+    budget_mib: float,
+    num_local_heads: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+) -> int:
+    """Convert a rank-independent MiB scratch budget into THIS rank's local
+    chunked-prefix-cache token threshold, using this rank's own head
+    geometry (#395).
+
+    INVARIANCE CONTRACT: the same `budget_mib` fed to two ranks with
+    different `num_local_heads` (or head dims) yields token thresholds that
+    are INVERSELY proportional to their per-token scratch bytes -- a rank
+    with fewer local heads (e.g. the smaller shards of an uneven TP split)
+    gets a HIGHER token threshold for the same MiB budget, because its
+    per-token scratch is cheaper. This is the fix: under the old flat
+    token-count knob, every rank used the same threshold regardless of its
+    own scratch cost.
+    """
+    per_token_bytes = attn_scratch_bytes_per_token(
+        num_local_heads, qk_head_dim, v_head_dim
+    )
+    assert per_token_bytes > 0, (
+        f"attn-scratch-budget-mib: degenerate geometry "
+        f"(num_local_heads={num_local_heads}, qk_head_dim={qk_head_dim}, "
+        f"v_head_dim={v_head_dim}) yields zero scratch bytes per token"
+    )
+    budget_bytes = budget_mib * 1024 * 1024
+    return max(1, int(budget_bytes // per_token_bytes))
+
+
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
 # qk_nope_head_dim = 128
@@ -75,7 +140,12 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
 # sum_extended_length:
 #   Total number of tokens in the extended part of the current batch. (=sum(seq_lens_q))
 # chunked_prefix_cache_threshold:
-#   The minimum sum_prefix_length to enable mha with kv chunking, 8192 by default (can be changed with SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD)
+#   The minimum sum_prefix_length to enable mha with kv chunking. Derived per
+#   rank from a MiB scratch budget (--attn-scratch-budget-mib, 640 MiB
+#   default) and this rank's local head geometry -- see
+#   attn_scratch_token_threshold above (#395). The deprecated
+#   SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD env var still overrides it with a
+#   flat token count when explicitly set.
 #   For batches with smaller sum_prefix_length > 0, MLA kernel with absorption will be used instead.
 # max_kv_chunk_capacity:
 #   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be changed with SGLANG_MAX_KV_CHUNK_CAPACITY, or get with forward_batch.get_max_chunk_capacity())
@@ -117,10 +187,35 @@ class DeepseekMHAForwardMixin:
             get_server_args().disable_chunked_prefix_cache
         )
 
-        # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = (
-            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
-        )
+        # INVARIANCE CONSTRAINT (#395): this threshold must be derived from a
+        # scratch-BYTE budget, not a flat token count, because the per-token
+        # scratch this gates (materialized K/V, see
+        # `attn_scratch_bytes_per_token` above) scales with THIS rank's
+        # local head count and head dim -- a quantity that differs per rank
+        # under (uneven) TP. Deriving it here, per attention layer, keeps it
+        # keyed to this rank's actual geometry rather than a value borrowed
+        # from a different rank or model.
+        #
+        # SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD is a deprecated escape hatch:
+        # if the user set it explicitly, honor it verbatim (bypassing the
+        # MiB conversion below) so a pinned legacy value keeps behaving
+        # exactly as before. Mutual exclusivity with --attn-scratch-budget-mib
+        # is validated once at startup in
+        # ServerArgs._handle_attn_scratch_budget_deprecation.
+        if envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.is_set():
+            self.chunked_prefix_cache_threshold = (
+                envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
+            )
+        else:
+            budget_mib = get_server_args().attn_scratch_budget_mib
+            if budget_mib is None:
+                budget_mib = DEFAULT_ATTN_SCRATCH_BUDGET_MIB
+            self.chunked_prefix_cache_threshold = attn_scratch_token_threshold(
+                budget_mib,
+                num_local_heads=self.num_local_heads,
+                qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
+            )
 
     def forward_normal_prepare(
         self: DeepseekV2AttentionMLA,
