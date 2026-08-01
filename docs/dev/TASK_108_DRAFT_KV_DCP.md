@@ -633,3 +633,85 @@ Straddle check (#105): with the aligned `units`/`groups` no rank's q heads
 cross a global kv-head boundary (2B rank0 = kv0 entirely, ranks 1-2 subset of
 kv1; 35B the same shape), so neither arm should hit the straddle ValueError
 that the `<=` threshold variant produced.
+
+---
+
+# TP > num_kv_heads window: results, and the rule inverted
+
+Window 2026-08-01 07:32-07:40Z, 4 arms, ~20 min. Artifacts:
+`/spinning/gpu-battery-results/2026-08-02_108-tpgtkv/`.
+
+Precondition asserted off the LIVE server (never computed — see the pre-flight
+note above): `REPLICATED-KV geometry active: kv_heads=2 < tp_size=3; all kv
+heads on every rank, q heads split [4,2,2]` on the 2B, `[8,4,4]` on the 35B.
+
+## Q1 — the VRAM win lands exactly on the prediction
+
+| | replicated | dcp | ratio | predicted |
+|---|---|---|---|---|
+| draft rows, rank 0 | 655 520 | 307 290 | 0.469 | 30/64 = 0.469 |
+| draft rows, ranks 1-2 | 655 520 | 174 131 | 0.266 | 17/64 = 0.266 |
+| draft K size (2B) | 0.31/0.31/0.31 GB | 0.15/0.08/0.08 GB | | |
+
+Total draft KV **1.86 -> 0.62 GB, -67 %** = exactly `1 - (30+17+17)/(64*3)`.
+Identical on both vehicles, as expected: the draft pool follows the vector, not
+the model size.
+
+## Q2 — the rule inverts above the threshold
+
+| vehicle | prompt | replicated | dcp |
+|---|---|---|---|
+| 2B | alphabet | accept 1.05, **61 verifies / 64 tokens** | accept 3.20, 20 |
+| 2B | squares | accept 1.64, 39 | accept 2.78, 23 |
+| 35B-A3B | alphabet | accept 2.00, 32 | accept 3.20, 20 |
+| 35B-A3B | squares | accept 3.20, 20 | accept 3.20, 20 |
+
+Output ids identical on every graded pair; `chain_quality_gate` GREEN, full
+marks, both vehicles.
+
+**Above the threshold `replicated` is the DEGRADED layout, not the cheaper
+one.** At `kv < tp` the heads cannot be split, so a draft on the replicated
+layout is asked for a head shard that does not exist: the verified output stays
+correct (the target governs it, hence identical ids) but the draft's proposals
+are almost never accepted — 61 verify rounds for 64 tokens is speculation
+paying its full cost for nothing. `dcp` puts the draft on the same
+replicated-heads + token-shard geometry as the target and restores it.
+
+So the applicability rule is two-sided and both sides are measured:
+
+* `TP > num_kv_heads` -> `dcp`, which is **both** the VRAM win and the working
+  speculation path.
+* `TP <= num_kv_heads` -> `replicated`; `dcp` is VRAM-neutral and costs
+  10-16 % accept there.
+
+H2 (`_replicated_kv_ragged_reindex`) does NOT fire: the path is live per the
+geometry log, and short determined prompts generate correctly first-chunk
+(`a b c d e f` -> ` g h i j k l m n o p`).
+
+## Probe-design rule: determined answers, not open-ended text
+
+**A short probe used as a corruption check must have a DETERMINED answer.**
+
+The runsheet's original short probe was `"Hi."`. On the 35B the two arms
+produced different — both fluent, both plausible — continuations, which looked
+like H2's documented failure shape and was in fact no evidence at all: at
+temperature 0 a last-bit logit difference at position 0 reroutes an open-ended
+prompt entirely. A probe like that can only ever report "different", never
+"wrong", which is exactly the instrument #360/#365 ruled out.
+
+The corrected form is a short prompt whose continuation is mechanically
+determined, so a corrupted first chunk reads as WRONG rather than merely
+different:
+
+```
+a b c d e f              -> " g h i j k l m n o p"
+The capital of France is -> " Paris, ..."
+2+2=                     -> "5 is a famous quote from the novel 1984"   (sic)
+```
+
+Note the third: even a "wrong" arithmetic answer can be a correct completion,
+so a determined probe still needs a scorer or a reader who knows the intended
+continuation. Prefer the mechanical sequences.
+
+This rule belongs to every corruption probe, not just this task; the 2B's short
+prompt happening to match across arms was luck, not evidence.
