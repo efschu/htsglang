@@ -86,6 +86,7 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_LANE_SHARED_INPUT_BUFFERS` | `1` only to reproduce the defect | restores the pre-slice-D2 process-wide pool key. With a CONCURRENT dual-group lane this re-arms the `store_kvcache` index assert of DESIGN_121 §13. Never an operating mode |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 | `SGLANG_GGUF_MXFP4_REPACK` | leave unset (default on); `0` only to refuse MXFP4 | repacks GGUF MXFP4 (ggml type 39) tensors to Q5_0 while the weight stream is read (`model_loader/gguf_mxfp4_repack.py`). Value-exact — every element dequantizes to the same fp32 number — and it is the only reason a checkpoint carrying MXFP4 boots at all: no GGUF kernel dispatches on type 39. It costs 22/17 = 1.294x the bytes of the repacked tensors, in host RAM and in VRAM; the boot log states the exact inflation. Set to `0` and the load is refused by name instead — there is no silent middle ground. See section 4.5.3 |
+| `SGLANG_MM_FRONTEND_GPU_PREPROCESS` | leave unset (default off) | `1` lets the GPU-passive tokenizer process preprocess multimodal data on `base_gpu_id` again (nvJPEG decode, fast-image-processor resize/normalize, pinned video frames) — the pre-#403 behavior. The context it opens is invisible to every per-rank budget and to `--rank-auto-reserve-mib`; if you set this, subtract it from rank 0 by hand. See section 6.8 |
 | `SGLANG_SP_CAPACITY_WEIGHTS` | comma-separated positive floats, one per SP rank (e.g. `1.0,0.46,0.46`) | diffusion lane (#333-M3) only. Switches `multimodal_gen`'s sequence-parallel `build_shard_plan` from the equal split to a capacity-weighted one: a faster card is handed a proportionally longer slice of the sequence. Unset (the default) keeps the equal-and-tail-padded split byte-for-byte. A wrong-length or malformed vector is a hard error, not a silent fallback. The registry's Class-2 adapter sets this from measured `gemm_tflops` when `launch.enable_uneven_sp` is on; see `docs/dev/DESIGN_333_M3_diffusion_lane.md` |
 
 ## 2.1 sgl-kernel INT8 arm — provenance, pin, and the reinstall hazard (#384)
@@ -2401,6 +2402,57 @@ on a short one, from `topk 2` at index 49. The verify forward's batch shape
 argmax; that affects the chain exactly as it affects the tree. A temp-0
 difference between `topk 1` and `topk 2` here is therefore evidence of nothing
 on its own.
+
+### 6.8 The frontend process is on rank 0's card too (#403)
+
+The TokenizerManager is a GPU-passive process, but until #403 it opened a
+CUDA context on `base_gpu_id` the first time a request carried an image.
+`process_mm_data` handed the HF fast image processor `device="cuda:{base_gpu_id}"`
+and the processor's first act is `image.to(device)`; the nvJPEG decode on the
+`io_executor` threads did the same one step earlier. That context is a few
+hundred MiB plus the image traffic, it lands on a card already sized to its
+rank budget, and no per-rank ledger, `--rank-auto-reserve-mib` value or
+profiling run can see it — one more context per `--tokenizer-worker-num`.
+Sweep arms D and G died there with byte-identical tracebacks, in the frontend,
+not in the engine.
+
+Since #403 the frontend preprocesses on the CPU. The three ways to put it back
+on a card, all explicit:
+
+| Switch | Why it keeps the card |
+| --- | --- |
+| `--keep-mm-feature-on-device` | the feature is meant to stay device-resident |
+| `SGLANG_USE_CUDA_IPC_TRANSPORT=1` | the frontend already owns an `MmItemMemoryPool` on `base_gpu_id` and ships IPC handles, not bytes |
+| `SGLANG_MM_FRONTEND_GPU_PREPROCESS=1` | plain escape hatch: pre-#403 behavior, no other effect |
+
+If you set any of them, budget the frontend's context on `base_gpu_id`
+yourself — nothing charges it for you.
+
+**Cost of the default.** Image resize/normalize now runs on CPU threads, so
+multimodal *prefill* gets slower on large images; text-only serving is
+untouched (none of this code runs). Unmeasured on this rig — see the
+measurement the next multimodal window owes in §6.8.1.
+
+#### 6.8.1 The measurement this owes
+
+Not yet taken; no multimodal window has run since the fix. Take it with one
+VLM boot, images only, no model reload between arms:
+
+1. `SGLANG_MM_FRONTEND_GPU_PREPROCESS=1` vs unset, same prompts, same images.
+2. Report **ms/prefill** per request (not tok/s), split into the frontend's
+   own preprocessing span and the scheduler's prefill span — the frontend span
+   is the only one that can move.
+3. Sizes that matter: one ~512x512 image and one at the `SGLANG_IMAGE_MAX_PIXELS`
+   ceiling; the CPU/GPU gap grows with pixel count, and the ceiling is the
+   worst case.
+4. Establish the noise floor with an A-vs-A pair first, interleave the arms,
+   and report nothing under it.
+
+Expected shape, unverified: no change at all for text, a bounded CPU-side cost
+per image (resize + normalize over H*W*3, single-digit to low-tens of ms for
+ordinary sizes) against several hundred MiB returned to rank 0. If a
+measurement lands somewhere else, that is the interesting result and this
+paragraph is the thing it falsifies.
 
 ## 7. Operational hygiene
 

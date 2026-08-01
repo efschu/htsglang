@@ -101,7 +101,10 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             return []
         images = []
         for data in image_data:
-            img, _ = load_image(data)
+            # Never nvJPEG here: this runs in the GPU-passive tokenizer process
+            # (#403), and the lines below require a PIL image -- a GPU-decoded
+            # JPEG comes back as a tensor with no ``.mode``.
+            img, _ = load_image(data, False)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             images.append(img)

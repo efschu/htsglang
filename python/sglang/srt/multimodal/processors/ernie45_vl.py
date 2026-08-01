@@ -18,6 +18,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    mm_frontend_device,
+    mm_frontend_gpu_enabled,
 )
 from sglang.srt.utils import get_bool_env_var, is_npu, logger
 
@@ -184,7 +186,12 @@ async def preprocess_video(
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
+    # Pinning runs through the CUDA host allocator and so opens a context in
+    # this GPU-passive tokenizer process (#403); the frames are serialized on
+    # their way out, so nothing here stages an H2D copy from them.
+    video = torch.from_numpy(video_np)
+    if mm_frontend_gpu_enabled():
+        video = video.pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = VIDEO_MIN_PIXELS
@@ -208,7 +215,8 @@ async def preprocess_video(
     )
 
     video = video.permute(0, 2, 3, 1)
-    video = video.pin_memory()
+    if mm_frontend_gpu_enabled():
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
@@ -306,7 +314,8 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             and not self.disable_fast_image_processor
         ):
             if not _is_npu:
-                kwargs["device"] = "cuda"
+                # #403: GPU-passive tokenizer process -- see mm_frontend_device.
+                kwargs["device"] = mm_frontend_device()
 
         result = processor.__call__(
             text=[input_text],

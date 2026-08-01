@@ -1270,6 +1270,13 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Let the GPU-passive tokenizer process preprocess multimodal data on a
+    # worker's card again (nvJPEG decode, fast-image-processor resize/normalize,
+    # pinned video frames). Off by default since #403: the context it opens is
+    # invisible to every per-rank memory budget and the tensors are copied back
+    # to the host before they leave the process anyway. See
+    # multimodal/processors/base_processor.mm_frontend_gpu_enabled.
+    SGLANG_MM_FRONTEND_GPU_PREPROCESS = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
