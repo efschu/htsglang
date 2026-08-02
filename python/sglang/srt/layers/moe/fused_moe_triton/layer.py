@@ -610,12 +610,28 @@ class FusedMoE(torch.nn.Module):
         # MoE math stays byte-identical. The offload cache itself is installed
         # lazily on the first forward (weights must already be loaded and
         # processed by then); see _apply_expert_offload / run_moe_core.
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resident_fraction_held_at_base_plan,
+        )
         from sglang.srt.layers.moe.resident_fraction import (
             resident_fraction_for_rank,
         )
 
-        # SIZING: cached here and later handed to plan_load_time_staging.
-        self._expert_offload_fraction = resident_fraction_for_rank()
+        # SIZING: cached here and later handed to plan_load_time_staging AND to
+        # MoEExpertOffloadCache, which cross-checks the two. This is the ONE
+        # latch point for the fraction every VRAM figure on this layer derives
+        # from, which is why the #439 base-plan correction is applied here and
+        # nowhere else.
+        self._expert_offload_fraction = resident_fraction_held_at_base_plan(
+            resident_fraction_for_rank(),
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            moe_tp_size=self.moe_tp_size,
+            moe_tp_rank=self.moe_tp_rank,
+            expert_sharded=self._gguf_expert_shard,
+            intermediate_size=intermediate_size,
+            intermediate_units=self.moe_tp_units,
+        )
         self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
         self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
             self._moe_offload_trace_path

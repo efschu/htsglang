@@ -55,16 +55,30 @@ def _from_env() -> Optional[Tuple[float, ...]]:
     return _validate(envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get_vector(), _ENV)
 
 
-def _from_flag() -> Optional[Tuple[float, ...]]:
-    """The launch flag, if a ServerArgs has been published to the context."""
-    try:
-        from sglang.srt.runtime_context import get_context
+def _from_flag(server_args=None) -> Optional[Tuple[float, ...]]:
+    """The launch flag, from an explicit ServerArgs or from the context.
 
-        # `.server_args` raises rather than returning None before the launch
-        # arguments are published, which is the normal state in a GPU-passive
-        # process and in any unit test that never boots a server.
-        args = get_context().server_args
-        raw = getattr(args, "rank_moe_resident_fraction", None)
+    ``server_args`` is for the callers that HOLD the launch arguments but run
+    in a process that has not published them -- the launcher between argument
+    parsing and the spawn loop is the whole population, and #439 found it the
+    hard way: ``resolve_moe_compute_placement_flag`` runs there, the context
+    slot is still empty, the ``except`` below swallowed the resulting
+    ``ValueError``, and the solve was handed the 1.0 default while
+    ``--rank-moe-resident-fraction 0.485,0.42,0.42`` sat on the object in its
+    hand. Passing the object is preferred over publishing it process-wide in
+    the launcher: publication is observable by every other reader in that
+    process, and a fix for one resolver must not change what the frontend sees.
+    """
+    try:
+        if server_args is None:
+            from sglang.srt.runtime_context import get_context
+
+            # `.server_args` raises rather than returning None before the
+            # launch arguments are published, which is the normal state in a
+            # GPU-passive process and in any unit test that never boots a
+            # server.
+            server_args = get_context().server_args
+        raw = getattr(server_args, "rank_moe_resident_fraction", None)
     except Exception:
         return None
     if raw is None:
@@ -74,14 +88,21 @@ def _from_flag() -> Optional[Tuple[float, ...]]:
     return _validate([float(x) for x in raw], _FLAG)
 
 
-def resident_fraction_vector(tp_size: Optional[int] = None) -> Tuple[float, ...]:
+def resident_fraction_vector(
+    tp_size: Optional[int] = None, server_args=None
+) -> Tuple[float, ...]:
     """The fraction for every rank, length ``tp_size``.
 
     A scalar from either source broadcasts to every rank, which is what makes
     the default and every existing single-value launch byte-identical.
+
+    ``server_args`` supplies the flag source explicitly for a caller that holds
+    the launch arguments before they are published (see :func:`_from_flag`).
+    The env/flag cross-check is unchanged -- the point is to give the flag
+    source something to read, not to rank the two sources.
     """
     env_v = _from_env()
-    flag_v = _from_flag()
+    flag_v = _from_flag(server_args)
 
     if env_v is not None and flag_v is not None and env_v != flag_v:
         raise ValueError(

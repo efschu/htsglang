@@ -36,6 +36,14 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   name when offload is off, when the link provenance is `absent`, or under
   `ep_size>1`. Resolved ONCE in the launcher — a symbolic value that reaches a
   worker is a hard error there, never a silent fall back to the base plan.
+  Honest status: the mode is BUILT and hermetically tested, its predicted band
+  is UNMEASURED. The 2026-08-02 ARM3 battery could not boot the arm; three
+  defects were found there and fixed (resolver read the resident fraction as
+  1.0 because it runs before the ServerArgs are published; residency was sized
+  off the SOLVED expert count and inflated tp2 by 19.5 % into an OOM, now held
+  at the base plan through a derived sizing fraction the solve never reads;
+  the battery harness did not carry the arm into the boot command). One
+  confirmation window is specified and pending — `ARM3_COMPUTE.md`.
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
   shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
@@ -167,9 +175,14 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   family vector, so the slice is a SOLVE plus its wiring
   (`layers/moe/expert_compute_placement.py`, `--rank-moe-ratio link`, see §1).
   Predicted on the reference recipe from the 2026-08-02 battery's own measured
-  inputs: clock rank 858 s → 632 s (1.358x) uncalibrated, → 542 s (1.584x) with
-  the coefficients calibrated off the equal arm, against BENCH_394's 1.536x
-  ideal-placement reference. All three are PREDICTIONS; nothing has booted.
+  inputs and its OWN resolved base plan `30407,19080,19080`: clock rank 92.8 s
+  → 66.7 s (1.392x) uncalibrated, → 64.0 s (1.450x) with the coefficients
+  calibrated off the equal arm, against BENCH_394's 1.536x ideal-placement
+  reference. (The 1.358x / 1.584x pair quoted earlier is keyed to a
+  `400,256,344` base plan the recipe does not resolve to.) All of it is
+  PREDICTION: the arm has never served a token — the battery booted only the
+  baseline, and the three defects that blocked the treatment arm are fixed at
+  the desk but unvalidated on hardware.
   BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arms 1+2, plus the slice-3
   arms `ARM=compute` / `ARM=compute-cal` specified in `ARM3_COMPUTE.md`), and
   the graph seam, which refuses by name for TWO reasons (#443 named the nearer

@@ -1193,6 +1193,12 @@ class Envs:
     # expert-stats dump. An A/B arm that cannot identify itself is an A/B whose
     # null result was never tested.
     SGLANG_MOE_COMPUTE_POLICY = EnvStr("")
+    # #394 slice 3 / #439: the "moe" family vector the solve held the RESIDENT
+    # expert mass against, i.e. the plan the boot would have run without
+    # "--rank-moe-ratio link". Written by the launcher next to the policy label
+    # above; read by the residency sizing in every worker so a rank that GAINS
+    # experts does not also gain resident VRAM. Absent = today's sizing.
+    SGLANG_MOE_COMPUTE_BASE_PLAN = EnvStr("")
     # #394 slice 3: per-rank cold-traffic coefficients ("a,b,c", mean 1),
     # measured from a PRIOR boot's #390 dump with
     # cold_traffic_coefficients_from_measurement. Without them the solve uses
