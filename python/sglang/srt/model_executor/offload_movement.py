@@ -75,9 +75,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
-from sglang.srt.model_executor.offload_register import (
-    OWN_VRAM_TIER as OWN_VRAM,
-)
+from sglang.srt.model_executor.offload_register import OWN_VRAM_TIER as OWN_VRAM
 from sglang.srt.model_executor.offload_register import (
     PARK_TARGETS,
     ClassPolicy,
@@ -105,6 +103,7 @@ __all__ = [
     "RealMovementBackend",
     "MovementStats",
     "parse_park_target_order",
+    "park_target_order_from_register",
 ]
 
 logger = logging.getLogger(__name__)
@@ -114,6 +113,27 @@ logger = logging.getLogger(__name__)
 # --lane-offload-park-targets until the P2P window is measured (house rule:
 # Messpflicht before any faster default).
 DEFAULT_PARK_TARGET_ORDER = ("host_ram",)
+
+
+def park_target_order_from_register(
+    default: Tuple[str, ...] = DEFAULT_PARK_TARGET_ORDER,
+) -> Tuple[str, ...]:
+    """The operator's ``--lane-offload-park-targets`` chain, or ``default``.
+
+    #421 F2: the flag was parsed at argument time and thrown away. It now
+    reaches the register at runner init
+    (``configure_global_register_from_server_args``), and this is where the
+    movement layer picks it up -- the register is the only object that
+    exists in both phases.
+    """
+    from sglang.srt.model_executor.offload_register import get_global_register
+
+    reg = get_global_register()
+    if reg is None:
+        return default
+    order = reg.park_target_order
+    return tuple(order) if order else default
+
 
 # How a peer path whose BAR aperture is smaller than the item is handled.
 # BOTH are selectable policy, NEITHER is a settled decision; the default is
@@ -629,12 +649,19 @@ class RealMovementBackend(MovementBackend):
     def __init__(
         self,
         device_ops: DeviceOps,
-        target_order: Tuple[str, ...] = DEFAULT_PARK_TARGET_ORDER,
+        target_order: Optional[Tuple[str, ...]] = None,
         class_policies: Optional[Mapping[str, ClassPolicy]] = None,
         ledger: Optional[CapacityLedger] = None,
         probe: Optional[PeerProbe] = None,
         window_policy: str = DEFAULT_WINDOW_POLICY,
     ):
+        # #421 F2: an omitted order takes the operator's
+        # --lane-offload-park-targets chain from the configured register, so a
+        # GPU-phase construction site honours the flag without having to know
+        # it exists. Explicit beats configured; with no register (feature off)
+        # this is DEFAULT_PARK_TARGET_ORDER, i.e. today's behaviour.
+        if target_order is None:
+            target_order = park_target_order_from_register()
         for target in target_order:
             if target not in PARK_TARGETS:
                 raise ValueError(f"unknown park target {target!r}")

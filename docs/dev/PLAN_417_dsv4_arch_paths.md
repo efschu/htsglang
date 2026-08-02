@@ -329,6 +329,12 @@ Two findings worth recording, both from writing the test:
    that walks `ceil(max_seq_len / 64)` pages instead of the full capture-time
    page-table width. `fp8_paged_mqa_logits_torch` stays as the reference
    implementation `test_sm120_paged_mqa_logits.py` compares against.
+3. **Consequence of making it the production path (#426).** Because every
+   non-DeepGEMM card now lands here, the `[B, S, H]` bmm intermediate that
+   upstream sgl-project/sglang#33246 reports (~15 GiB/rank at a 1M context)
+   stopped being a fallback-only concern; `fp8_paged_mqa_logits_torch_sm120`
+   walks the sequence axis in `SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK`-wide
+   chunks, bit-identically, since `test_dsv4_indexer_seq_chunk_426.py`.
 
 **Rank uniformity.** TP0 will run `flash_mla_with_kvcache_sm120` while TP1/2
 run the same entry point with a different inner backend. Every gate added

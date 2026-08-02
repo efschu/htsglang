@@ -82,6 +82,17 @@ if _is_hip:
             )
             return
 
+        # A plan entry that names no page produces zeros, exactly as in the
+        # prefill sibling below. Without this the negative page id would be
+        # scaled into a wild address and pooled over whatever it landed on.
+        if read_page_0 < 0:
+            tl.store(
+                out_ptr + bid * out_stride_b + d,
+                tl.zeros([BLOCK_D], tl.float32),
+                mask=d_mask_hd,
+            )
+            return
+
         # Step 3: Online softmax-pool over 128 slots in the page
         page_base = read_page_0 * COMPRESS_RATIO * buf_stride_slot
         m_prev = tl.full([BLOCK_D], float("-inf"), tl.float32)
@@ -215,6 +226,14 @@ def _compress_forward_c128_triton(
 
     Fuses write + online-softmax-pool into Triton kernels.
     CUDA graph compatible.
+
+    UNWIRED: nothing calls this or :func:`_compress_forward_c128_fallback`;
+    both arrived never-called with upstream sglang#26208 and the HIP forward
+    path routes through the JIT `compress_forward` instead. They are kept
+    because upstream owns the eventual wiring, and are held to a single
+    contract so they cannot drift apart in the meantime (#427 F6):
+    float32 output, a plan entry naming no page yields a zero row, and a
+    kernel that does not launch still leaves defined (zero) output.
     """
     num_total_slots = kv_score_buffer.shape[0] * kv_score_buffer.shape[1]
     num_pages = kv_score_buffer.shape[0]
@@ -235,7 +254,7 @@ def _compress_forward_c128_triton(
         )
 
         if bs > 0 and num_total_slots > 0:
-            grid = (bs,)
+            grid = (bs,)  # kernel writes every row; no pre-zero needed
             _c128_compress_decode_kernel[grid](
                 buf_flat,
                 kv_score_input,
@@ -252,6 +271,10 @@ def _compress_forward_c128_triton(
                 COMPRESS_RATIO=compress_ratio,
                 num_warps=8,
             )
+        else:
+            # No launch means no writer, so define the output rather than
+            # returning whatever torch.empty picked up.
+            out.zero_()
         return out
     else:
         # Prefill path: separate write kernel + compress kernel
@@ -282,7 +305,7 @@ def _compress_forward_c128_triton(
 
         # Phase 2: Compress
         if num_c > 0 and num_pages > 0:
-            grid_c = (num_c,)
+            grid_c = (num_c,)  # kernel writes every row; no pre-zero needed
             _c128_compress_prefill_compress_kernel[grid_c](
                 buf_flat,
                 ape,
@@ -297,6 +320,8 @@ def _compress_forward_c128_triton(
                 COMPRESS_RATIO=compress_ratio,
                 num_warps=8,
             )
+        else:
+            out.zero_()
 
         return out
 
@@ -337,6 +362,11 @@ def _compress_forward_c128_fallback(
 
     IMPORTANT: This also performs the write to state buffer (like the JIT kernel).
     The JIT kernel does: (1) write kv_score_input to buffer, (2) compress from buffer.
+
+    UNWIRED, and holds the same contract as its triton twin
+    :func:`_compress_forward_c128_triton`: float32 output, a plan entry naming
+    no page yields a zero row, and the degenerate (no page / no token) case
+    yields zeros rather than undefined memory (#427 F6).
     """
     num_total_slots = kv_score_buffer.shape[0] * kv_score_buffer.shape[1]
     num_pages = kv_score_buffer.shape[0]
@@ -373,7 +403,9 @@ def _compress_forward_c128_fallback(
     plan_c = plan[1]  # plan_d for decode, plan_c for prefill
     num_tokens = plan_c.shape[0]
     if num_pages == 0 or num_tokens == 0:
-        return kv_score_input.new_zeros(num_tokens, head_dim)
+        return torch.zeros(
+            num_tokens, head_dim, dtype=torch.float32, device=kv_score_input.device
+        )
 
     plan_c_raw = plan_c.view(torch.int32)  # [N, 4]
     read_page_0 = plan_c_raw[:, 2].long()
@@ -389,6 +421,12 @@ def _compress_forward_c128_fallback(
     weights = score.softmax(dim=1)
     out = (weights * kv).sum(dim=1)
 
+    # Rows whose plan entry names no page are zero, not a pool over page 0.
+    # `read_page_0_safe` exists only to keep the gather in bounds; carrying its
+    # result through would hand the caller another request's compressed state
+    # under the name of an invalid row. Both triton kernels return zeros here.
+    out = torch.where(valid_read.unsqueeze(-1), out, torch.zeros_like(out))
+
     # For decode: zero out non-boundary tokens (seq_len % 128 != 0)
     # so they don't corrupt kvcache location 0 when stored.
     if plan.is_decode:
@@ -396,7 +434,10 @@ def _compress_forward_c128_fallback(
         is_boundary = (seq_lens % 128 == 0).unsqueeze(-1)  # [N, 1]
         out = torch.where(is_boundary, out, torch.zeros_like(out))
 
-    return out.to(kv_score_input.dtype)
+    # float32, matching the triton twin's output allocation. The pooling runs
+    # in float32 either way; casting down to kv_score_input.dtype here would
+    # make the two twins disagree on the dtype of the same computation.
+    return out
 
 
 class CompressorBackendMixin:

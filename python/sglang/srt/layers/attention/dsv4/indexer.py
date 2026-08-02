@@ -127,7 +127,21 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """Vectorized implementation compatible with CUDA graph capture."""
+    """Vectorized implementation compatible with CUDA graph capture.
+
+    LENGTH MASK: positions at or beyond ``seq_lens[i]`` are filled with
+    ``-inf``, so exactly ``seq_lens[i]`` entries of row ``i`` are finite. This
+    matches :func:`fp8_paged_mqa_logits_torch_sm120` bit for bit -- the two are
+    one function with two calling conventions (see that docstring), not two
+    semantics, and the top-k these logits feed must never be able to prefer one
+    over the other.
+
+    NOT reachable from the serving path: ``select_paged_mqa_logits_fn`` always
+    returns the ``_sm120`` variant for the torch backend, because this one
+    asserts on the 2-D ``seq_lens`` the paged call site passes. It is kept as
+    the reference implementation the kernel tests compare against, which is
+    precisely why its masking must agree.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -173,10 +187,16 @@ def fp8_paged_mqa_logits_torch(
         cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
     positions = cache[arange_key].unsqueeze(0)
     valid_mask = positions < seq_lens.unsqueeze(1)
-    scores = scores.masked_fill(~valid_mask, 0.0)
+    # -inf, not 0.0. These logits are the input of a top-k over KV positions
+    # and they are non-negative by construction (F.relu above, then a weighted
+    # sum), so a padding position parked at 0.0 does not sit below the real
+    # tokens -- it sits at or above the weakest of them and can take their
+    # slot. The _sm120 twin has always used -inf here; this one used 0.0, which
+    # made the reference disagree with the implementation it validates.
+    scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     if padded_seq_len < max_seq_len:
-        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=float("-inf"))
     else:
         scores = scores[:, :max_seq_len]
 
@@ -223,6 +243,23 @@ def _aiter_fp8_paged_mqa_logits(
     return logits
 
 
+def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
+    """Sequence-axis chunk width, in pages, for the torch paged-MQA logits.
+
+    Reads ``SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK`` (KV positions) and rounds it
+    down to whole pages, because the page is the unit the gather indexes in.
+    Returns ``max_pages`` when chunking is disabled or the whole sequence
+    already fits in one chunk -- in that case the caller runs exactly the
+    single-pass expression it ran before #426, which is what keeps the small
+    shapes the golden pins use bit-for-bit unchanged.
+    """
+    chunk_positions = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.get()
+    if not chunk_positions or chunk_positions <= 0:
+        return max_pages
+    chunk_pages = max(1, int(chunk_positions) // block_size)
+    return min(chunk_pages, max_pages)
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -233,7 +270,33 @@ def fp8_paged_mqa_logits_torch_sm120(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
+    """CUDA-graph-compatible FP8 paged MQA logits, vectorized, no ``.item()``.
+
+    LENGTH MASK: positions at or beyond ``seq_lens[i]`` are filled with
+    ``-inf``, so exactly ``seq_lens[i]`` entries of row ``i`` are finite.
+    Identical to :func:`fp8_paged_mqa_logits_torch`; see the note there.
+
+    Despite the ``_sm120`` suffix nothing in it is SM120-specific, and it is the
+    variant ``select_paged_mqa_logits_fn`` hands out for every card that takes
+    the torch backend. Two things distinguish it from its twin and both are
+    about the call site, not the architecture: it squeezes the trailing dim off
+    ``seq_lens``, which arrives 2-D from the paged indexer, and it walks
+    ``ceil(max_seq_len / 64)`` pages instead of the full capture-time
+    page-table width.
+
+    MEMORY (#426, upstream sgl-project/sglang#33246): the head axis of the
+    ``bmm`` result is summed away on the very next line, so materializing the
+    whole ``[B, S, H]`` product costs ``num_heads`` times what the function
+    returns -- ~15 GiB per rank for one allocation at a 1M context, and since
+    #417 Cut 3 this is the PRODUCTION path on every non-Hopper card, not a
+    fallback. The sequence axis is fully independent (relu is elementwise, the
+    reduction runs over ``head_dim`` inside the ``bmm`` and over heads inside
+    one row), so the loop below walks it in page-aligned chunks and writes each
+    chunk's ``[B, chunk]`` result straight into the output. Peak becomes
+    ``O(B x chunk x H)``. It is exact, not an approximation: no reduction
+    crosses a chunk boundary, and a single chunk reproduces the previous
+    expression op for op.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -253,36 +316,46 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert clean_logits == False
 
     max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
-
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
     page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
-
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
-
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
-
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
     q = q_fp8[:, 0].to(torch.float32)
+    q_t = q.transpose(1, 2)
+    weight_row = weight.unsqueeze(1)
 
-    score = torch.bmm(kv_value, q.transpose(1, 2))
+    logits = q.new_full((batch_size, max_seq_len), float("-inf"))
+    chunk_pages = _indexer_logits_chunk_pages(block_size, max_pages)
 
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
+    for page_start in range(0, max_pages, chunk_pages):
+        page_stop = min(max_pages, page_start + chunk_pages)
+        seq_start = page_start * block_size
+        chunk_seq = (page_stop - page_start) * block_size
 
-    score = score * kv_scale
+        kvcache_gathered = kvcache_flat[page_ids[:, page_start:page_stop]]
 
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
+        kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
+        kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+
+        kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+        kv_value = kv_value.view(batch_size, chunk_seq, head_dim)
+
+        kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
+        kv_scale = kv_scale.view(batch_size, chunk_seq)
+
+        score = torch.bmm(kv_value, q_t)
+
+        score = F.relu(score)
+        score = score * weight_row
+        score = score.sum(dim=2)
+
+        score = score * kv_scale
+
+        # Only the LAST chunk can run past max_seq_len (the padded span is a
+        # whole number of pages); everything before it copies in full.
+        out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
+        logits[:, seq_start : seq_start + out_width] = score[:, :out_width]
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
@@ -300,8 +373,17 @@ def topk_transform_512_pytorch_vectorized(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Vectorized PyTorch fallback for topk_transform_512.
+
     All helper tensors (arange, zeros) are cached to avoid device-tensor
-    creation during HIP/CUDA graph capture."""
+    creation during HIP/CUDA graph capture.
+
+    Re-masks `scores` with -inf beyond `seq_lens` before selecting, so a
+    position that does not exist can never enter the top-k whatever the
+    producer of `scores` left in its tail. The two CUDA top-k kernels get the
+    same property by construction -- they scan only `[0, seq_len)` -- so this
+    is not a redundancy, it is this implementation's share of a contract the
+    logits producers do not provide.
+    """
 
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
@@ -810,6 +892,16 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
+        # The tail of `logits` beyond `c4_seq_lens` is UNDEFINED, and the top-k
+        # below is what defines it away. The four producers disagree on what
+        # lands there: the torch pair writes -inf, tilelang leaves the trailing
+        # partial 64-block as GEMM output over stale cache slots and the rest
+        # uninitialized, the aiter wrapper hands the kernel a `torch.empty`.
+        # So no consumer may read a value out of that region or treat -inf as a
+        # guarantee. All three top-k paths below hold to that independently:
+        # `topk_transform_512` and `..._v2` scan only `[0, seq_len)`, and the
+        # torch fallback re-masks with -inf before its `torch.topk`. Anything
+        # added here has to bound itself by `c4_seq_lens` the same way.
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
                 logits,

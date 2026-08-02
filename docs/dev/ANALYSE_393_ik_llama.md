@@ -596,3 +596,238 @@ Fetched 2026-08-01 unless noted.
   `docs/dev/ANALYSE_389_nvme_expert_tier.md`
 * Host facts read this session: `/proc/cpuinfo`, `lscpu`, `numactl -H`,
   `/proc/meminfo`, `nvidia-smi --query-gpu=pcie.link.*`
+
+---
+
+## 11. §7.8 item 1 as built (#394) — the policy is live, the number is not yet
+
+Recommendation 1 above asked for link-proportional cold-expert sharding. The
+apportionment itself landed earlier as an **inert** build: `HostShardRatio`,
+`plan_proportional_shares` (largest remainder, whole experts), and
+`partition_cold_experts` were written and tested, but nothing ever handed them
+a ratio. Two things were missing, and both are now built.
+
+### 11.1 The weights are MEASURED, and the label is load-bearing
+
+The inert build derived weights from NVML's *max PCIe link generation ×
+width* — a nameplate. §7.2's numbers are not: 6.4 / 13 / 13 GB/s came off a
+timed pinned transfer. The chain is now explicit and ordered by provenance, in
+the `planner.cost_model.Provenance` vocabulary the rest of the fork prices
+with:
+
+| Rank | Source | Provenance | What it is |
+|---|---|---|---|
+| 1 | `SGLANG_MOE_HOST_SHARD_RATIO` | MEASURED | the vector an operator typed, i.e. the measurement they took |
+| 2 | `card-probe-h2d` | MEASURED | `rigmon/card_probe.py`'s 64 MiB pinned H2D, best-of wall clock, per card by UUID |
+| 3 | `nvml-pcie` | ESTIMATE | width × generation. A formula over a measured width, not a transfer anybody timed |
+| 4 | `equal` | ABSENT | the shape a **refusal** takes |
+
+`SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE` sets the floor (`measured` or
+`estimate`); `absent` is not selectable in either setting, so a split is never
+weighted by a number nobody has. An absent link produces an equal ratio, and an
+equal ratio produces **no `ColdShardContext` at all** — "nothing is known" and
+"#394 is not in this build" are deliberately the same code path.
+
+The card probe is read through `load_card_probe()`, which never triggers a
+measurement, and memoized once per process: 40+ MoE layers must not each parse
+the same JSON, and a weight load must never turn into a multi-second GPU probe
+as a side effect. Reusing that artifact rather than timing a second H2D is the
+point — two opinions about the same link measured by two kernels are
+indistinguishable after the fact.
+
+Measured against nameplate on this rig: 6.4 : 13 : 13 normalizes to
+0.198 / 0.401 / 0.401, the nameplate x4 : x8 : x8 to 0.200 / 0.400 / 0.400. The
+difference is ~1 % — which is the honest finding, and the reason the nameplate
+stays admissible as a labelled ESTIMATE rather than being rejected.
+
+### 11.2 The rank → card vector, published without a collective (#407 cut 2)
+
+`_gguf_cold_shard_context` could not supply `card_uuids` because a rank knows
+only its own card: the launcher narrows `CUDA_VISIBLE_DEVICES` to one GPU per
+scheduler process. The obvious fix — `all_gather` the UUID — is refused here.
+That call would sit **inside the weight-load loop**, which is the
+rank-local-before-group hazard: a rank that reaches the load path on a
+different schedule hangs the group with no diagnosis.
+
+`python/sglang/srt/registry/rank_cards.py` inverts it. The datum is not a
+runtime measurement at all — it is a launch decision the parent already made
+when it computed `gpu_id_for_rank` for every scheduler it spawned. So the
+launcher enumerates that same formula, resolves each CUDA ordinal through the
+#331 IdentityMap, and writes the **UUID** vector into the environment before
+the spawn loop. Workers read it. No peer is contacted.
+
+Properties that are tested rather than assumed:
+
+* **UUIDs, not ordinals.** Each child's CUDA view is narrowed, so an ordinal
+  means something different in every process; a UUID does not (#392, #397).
+* **All-or-nothing.** One unresolvable ordinal publishes nothing. A partial
+  vector would be completed by the consumer with the index it already has,
+  which is exactly the substitution being removed.
+* **Length-checked by the consumer.** A vector whose length does not match the
+  asking group describes a *different* group (a MoE-TP subgroup, a pipeline
+  stage) and is refused, not truncated.
+* **The CUDA context is not paid silently.** Building the CUDA side of the
+  identity map costs a few hundred MiB on every visible card, in the process
+  about to spawn workers onto them. It is used only when already paid — with
+  `--rank-gpu-id` (whose validation resolves the cards anyway), when a context
+  exists for other reasons, or on explicit `SGLANG_RANK_CARD_PROBE_CUDA=1`.
+  Otherwise the vector is ABSENT with that reason attached.
+* **Multi-node is refused by name.** This launcher sees only its own cards; a
+  per-node prefix is not a world-length vector. #394 is single-node by
+  construction.
+* **A hand-set vector is never overwritten.** Same contract as
+  `SGLANG_MOE_HOST_SHARD_RATIO`.
+
+### 11.3 What did not move
+
+Residency is decided before the ratio is consulted, so `resident_ids`,
+`resident_count` and `buffer_slots` — the three numbers every VRAM figure and
+every #400 ledger entry derives from — are identical with and without a ratio.
+Only HOST-side ownership of the cold pool moves. The `StreamingStagingLedger`
+already separates `pinned_bytes` from `delegated_bytes`, so the changed shard
+sizes are accounted without a new post. The capturable decode path is
+untouched: this is a placement change, not a compute-lane change.
+
+### 11.4 The instrument names its own arm (#390)
+
+An A/B whose two dumps cannot be told apart a week later is not a measurement.
+Every staged layer now publishes a `host_shard` row — policy
+(`equal` / `link-proportional`), the ratio string including its provenance,
+cold-pool size, owned and delegated counts, and the realized `owned_share` so
+whole-expert rounding is visible rather than assumed away. It rides into the
+#390 JSON dump per layer and is lifted to `totals`, where disagreement between
+layers surfaces as `mixed` rather than being averaged away.
+
+The baseline arm emits a row too, saying `policy=equal`. A missing row and a
+baseline row are different findings and must not look alike.
+
+**Blind spot, unchanged and inherited:** captured decode under
+`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` takes the host-sync-free path and is not
+counted. The A/B is therefore run on the offload's default eager path, which is
+also where the merged baseline (146.3 ms/token) was taken.
+
+### 11.5 The card window (2026-08-02): #394 does not run, and the model was optimistic
+
+Two findings, both from the merged V4-Flash recipe (UD-IQ3_XXS, TP=3 uneven,
+fraction 0.485/0.42/0.42, eager, bs=1, chunk 512).
+
+**Finding 1 — the proportional arm loads and then refuses to serve.** With the
+rank->card vector published and the ratio resolved (0.400/0.200/0.400), all 43
+MoE layers staged correctly: rank 0 owned 40.7 % of its cold pool, rank 1 (the
+x4 card) 19.5 %, rank 2 39.0 %. The server reached `Application startup
+complete` and died on the first forward, on all three ranks, in #394's own
+precondition guard:
+
+> experts [80, 83, 94] were delegated to a peer rank's host tier by the #394
+> link-proportional cold shard, but this rank's router asked for them.
+
+**This is not a wiring bug; it is the design premise.** `partition_cold_experts`
+splits *this rank's own* cold experts and drops the ones apportioned to peers.
+Under the #82 GGUF expert-dim shard the ranks hold **disjoint** expert ranges,
+so no peer holds rank 0's expert 80 — a "delegated" expert is not relocated, it
+is *absent*, and the first token routed to it has nowhere to go. Delegation is
+sound only if a delegated expert stays reachable, which requires one of:
+
+* the pinned host pools live in **shared** memory, so any rank can DMA an
+  expert out of a peer's pool (all three pools are host DRAM already, so this
+  is a mapping question, not a new tier); or
+* the experts are **replicated** across ranks plus an EP-style dispatch that
+  sends the token to whichever rank owns the copy.
+
+`_gguf_expert_shard` — the eligibility test the wiring uses — is TRUE exactly
+when experts are sharded *disjointly*, i.e. exactly the case where delegation
+is unsound. **The eligibility test is inverted with respect to the precondition
+it claims to enforce.** The guard the inert build shipped did its job: it turned
+a silent wrong-output into a named refusal at the first forward.
+
+**Finding 2 — the recoverable gain is 1.36x, not 1.69x/1.77x.** §7.3 derived
+Path A from an equal 1/3 byte split per rank. The equal-shard arm's *measured*
+split is not equal, because uneven TP already hands the x4 rank fewer experts:
+
+| rank | H2D moved | share | measured link | transfer time |
+|---|---|---|---|---|
+| tp0 (5090, x8) | 258.0 GiB | 40.0 % | 14.42 GB/s | 19.2 s |
+| tp1 (3080, **x4**) | 165.2 GiB | 25.6 % | 6.45 GB/s | **27.5 s** |
+| tp2 (3080, x8) | 222.4 GiB | 34.4 % | 13.41 GB/s | 17.8 s |
+
+The x4 rank is still the clock, at **1.28x the mean** — the effect is real and
+now measured rather than modelled. But perfect proportional placement moves
+27.5 s to 20.2 s, i.e. **1.36x on the transfer term**, and the transfer term is
+only part of a 135 ms/token decode. The 1.77x figure (and §7.3's 1.69x) assumed
+a 33/33/33 split that this configuration never had.
+
+**Consequence for §7.8.** Recommendation 1 keeps its direction and loses most of
+its size. It is now: an **M-to-L** item (a shared-memory host tier or an EP
+dispatch, not "placement policy only"), for a **1.36x** ceiling on the transfer
+term rather than 1.69x end-to-end. That materially changes its position against
+recommendation 3 (the CPU lane), whose own margin §7.4 put at 0-28 % *over* a
+working A'. With A' unbuilt and smaller than advertised, the two should be
+re-ranked together rather than sequentially.
+
+**Baseline, for the record.** Equal shards, same recipe: **135.1 / 140.1 / 135.4
+ms/token** across three passes over two boots (mean 136.9). The A-vs-A floor on
+this box today is **~5 % CV within a pass and 3.6 % between passes** — wider
+than the 2.55 % the merged baseline was judged on, so nothing below ~4 % would
+have been callable from this window even if the proportional arm had run.
+
+| what | value |
+|---|---|
+| hit rate, activation grain | 0.820 aggregate (0.772 / 0.843 / 0.841) |
+| hit rate, unique grain | 0.622 aggregate |
+| vs WASTE's 0.14 | **5.9x** |
+| decode, equal shards | 136.9 ms/token mean, floor ~5 % CV |
+| decode, proportional shards | **not measurable — arm does not serve** |
+
+### 11.6 Preflight for the proof window (not optional)
+
+`/dev/shm` was remounted 63 -> 96 GiB on 2026-08-02 so the ~88 GiB cold tier
+fits (verified: 96 G total, 93 G free, running segments untouched). **The
+remount is not restart-persistent.** A container restart puts the 63 GiB cap
+back, and the failure would land mid-load rather than at launch. So the window
+preflight runs, and reports rather than assumes:
+
+```
+df -h /dev/shm
+python -c "from sglang.srt.layers.moe.cold_tier_shm import preflight; \
+           print(preflight(88 * 2**30))"
+```
+
+The pages are RAM either way; this is the tmpfs accounting cap, not a memory
+shortage. `create_owned_segment` refuses early and names the remount when it
+does not fit.
+
+### 11.7 Two slice-2 design calls, decided
+
+**Peer views stay on a READ-ONLY mapping.** The OS write protection is the
+foundation of §11's torn-mapping guarantee, and relaxing the peer mapping to
+`PROT_WRITE` for a friendlier constructor would reintroduce the silent
+shared-buffer corruption surface the header design exists to remove.
+
+The intended API, `torch.UntypedStorage.from_buffer`, hits a hard wall and the
+wall is named rather than quietly routed around: measured 2026-08-02 it rejects
+the mapping as called (`Buffer size too small (0 instead of at least 1 bytes)`)
+**and it copies**, which at a multi-GiB cold tier defeats the whole point of
+sharing. The view therefore comes from `torch.frombuffer`, which is zero-copy
+over the read-only mapping.
+
+PyTorch warns it does not model non-writable tensors and that one "can write to
+the underlying buffer". **The kernel disagrees, and the kernel is the enforcer:
+a write through the view takes SIGSEGV (verified in a forked child, signal 11,
+committed as a test).** The guarantee is real; only its declaration in torch's
+type system is missing, which is strictly better than dropping the protection.
+
+Executing this rather than reasoning about it also caught a live defect:
+`ctypes.from_buffer()` refuses a `PROT_READ` mapping, so the `cudaHostRegister`
+call was silently failing to pin **every** peer segment. The address now comes
+from the same torch view.
+
+**The capturable path targets equivalent registration, and the refusal stays
+until a green gate.** Peer segments are already pinned by `cudaHostRegister`,
+so UVA device views over them should be graph-addressable exactly like the
+local pool — there is no hard boundary here, so no soft exclusion is written.
+Desk side prepares it; the proof belongs in the GPU window, and its falsifier
+is that **a capture with a registered peer segment must replay byte-identically
+against eager on identical inputs** (the #52/#53 graph-replay corruption
+family). Until that gate is green the named refusal under
+`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` stays active: it falls to a passing test, not
+to finished code.

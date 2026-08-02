@@ -1122,6 +1122,35 @@ class Envs:
     SGLANG_EXPERT_STATS_PATH = EnvStr("")
     # Additionally dump every N seconds (0 = only on exit / SIGUSR2).
     SGLANG_EXPERT_STATS_INTERVAL_SEC = EnvFloat(0.0)
+    # #407 cut 2: rank -> physical card UUID vector, one per WORLD rank in
+    # world_rank order, published by the launcher so no worker needs a
+    # collective to learn the group's placement (#394's link-proportional
+    # cold-expert shards are the first consumer). Normally written by
+    # _launch_subprocesses; set it by hand for a launch that does not go
+    # through it, and a hand-set value is never overwritten.
+    SGLANG_RANK_CARD_UUIDS = EnvStr("")
+    # Licence for the LAUNCHER to create a CUDA context purely to resolve that
+    # vector. Off by default: the context costs a few hundred MiB on every
+    # visible card, in the process that is about to spawn workers onto them.
+    # Unnecessary with --rank-gpu-id, whose validation resolves the cards
+    # already.
+    SGLANG_RANK_CARD_PROBE_CUDA = EnvBool(False)
+    # #394: weakest provenance the cold-expert host split may be weighted by --
+    # "measured" (the rigmon card probe's timed H2D, or an operator-supplied
+    # SGLANG_MOE_HOST_SHARD_RATIO vector) or "estimate" (the NVML PCIe
+    # width x generation nameplate derivation). "absent" is not selectable in
+    # either setting; an unknown link yields an equal split, which is exactly
+    # today's assignment.
+    SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE = EnvStr("estimate")
+    # #394: allow cold-expert delegation on a layer whose ranks hold DISJOINT
+    # expert ranges (the #82 GGUF expert-dim shard). Off, because there it is
+    # unsound: a delegated expert is not relocated to a peer, it is absent, and
+    # the first token routed to it fails. Measured 2026-08-02 on V4-Flash TP=3 --
+    # all 43 layers staged, then every rank died on the first forward. The flag
+    # exists to develop the missing reachability mechanism (a shared-memory host
+    # pool, or replicated experts with an EP dispatch) against a real boot. It
+    # is not a performance option.
+    SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE = EnvBool(False)
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;
@@ -1507,7 +1536,19 @@ class Envs:
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Sequence-axis chunk (in KV positions) of the torch paged-MQA-logits
+    # implementation. Bounds its peak intermediate at O(batch x chunk x heads)
+    # instead of O(batch x context x heads); see #426 / upstream #33246. Must
+    # be a multiple of the 64-position page; 0 disables chunking (one pass over
+    # the whole sequence, the pre-#426 shape).
+    SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK = EnvInt(8192)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    # Validate the non-negative-seq_len precondition of the DSV4 top-k
+    # wrappers (v1 and v2) before the launch. The check costs a device-to-host
+    # sync per call, so it is off on the serving path and meant for bring-up of
+    # a new producer of `seq_lens` (DP-idle companion rows, padded MTP rows).
+    # See #427 F2 and the docstrings in `sglang.jit_kernel.dsv4.topk`.
+    SGLANG_DSV4_CHECK_TOPK_SEQ_LENS = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache

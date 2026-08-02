@@ -294,12 +294,28 @@ def build_page_table_positions(
     page_size: int,
     swa_window: int,
 ) -> PageTablePositionsResult:
+    """Torch reference for :func:`build_page_table_positions_triton`.
+
+    Both implementations read `req_to_token` columns past the request's own
+    `seq_len` (the slice is by `max_seq_len`, not by length), so they see
+    never-written zeros and stale slot ids from previous occupants of the row.
+    That is safe because `req_to_token` is allocated with `torch.zeros`
+    (mem_cache/memory_pool.py `ReqToTokenPool.__init__`) and every writer
+    stores an allocator slot id, which is `arange(1, N+1)` by construction: no
+    producer puts a negative sentinel in this pool. See #427 F4.
+    """
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     positions_casual = seq_lens_casual - 1
     page_table = req_to_token[
         req_pool_indices_repeated.to(torch.int64), :max_seq_len:page_size
     ]
-    page_table = (page_table // page_size).to(torch.int32)
+    # Truncating division, not `//`. Python's `//` floors, while the triton
+    # twin's `//` on tl.int32 lowers to sdiv and truncates toward zero, so the
+    # two would disagree on a negative entry (-1: floor -1, trunc 0). The
+    # invariant above says no such entry exists today; matching the kernel's
+    # rounding costs nothing and keeps the pair identical if it ever stops
+    # holding.
+    page_table = torch.div(page_table, page_size, rounding_mode="trunc").to(torch.int32)
     swa_topk_lengths = torch.clamp(seq_lens_casual, max=swa_window)
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_casual,
@@ -439,6 +455,15 @@ def build_causal_swa_page_indices(
     swa_window: int,
     page_index_aligned_size: int,
 ) -> torch.Tensor:
+    """Torch reference for :func:`build_causal_swa_page_indices_triton`.
+
+    CONTRACT (both implementations, full width, exact equality): column ``k``
+    of row ``r`` holds the SWA cache id of the token ``k`` positions before
+    ``seq_lens_casual[r] - 1``, or ``-1`` when that column does not name a
+    real token. Two kinds of column are ``-1``: offsets that fall before the
+    start of the sequence (``seq_lens_casual[r] <= k < swa_window``), and the
+    alignment padding beyond ``swa_window``.
+    """
     device = seq_lens_casual.device
     pos_causal = seq_lens_casual - 1
     num_qo_tokens = seq_lens_casual.size(0)
@@ -449,9 +474,14 @@ def build_causal_swa_page_indices(
     offsets.masked_fill_(invalid_offset_mask, 0)
     raw_indices = req_to_token[req_pool_indices_repeated[:, None], offsets]
     assert raw_indices.shape == (num_qo_tokens, swa_window)
-    raw_indices.masked_fill_(invalid_offset_mask, -1)
-    swa_indices = full_to_swa_mapping[raw_indices]
-    swa_indices = swa_indices.to(torch.int32)
+    # Mask AFTER the mapping lookup, never before it. Writing -1 into
+    # raw_indices first and then indexing full_to_swa_mapping[-1] wraps to the
+    # LAST mapping entry, so an out-of-window column would come back holding a
+    # real SWA cache id instead of the -1 the contract (and the triton twin)
+    # promise. Advanced indexing returns a fresh tensor, so the in-place fill
+    # below cannot alias full_to_swa_mapping.
+    swa_indices = full_to_swa_mapping[raw_indices].to(torch.int32)
+    swa_indices.masked_fill_(invalid_offset_mask, -1)
 
     padded_width = (
         (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
@@ -502,6 +532,12 @@ def build_causal_swa_page_indices_triton(
     swa_window: int,
     page_index_aligned_size: int,
 ) -> torch.Tensor:
+    """Fused triton build of the causal SWA page indices.
+
+    Holds the same contract as :func:`build_causal_swa_page_indices`: every
+    column that does not name a real token is ``-1``, both inside the SWA
+    window and in the alignment padding.
+    """
     num_qo_tokens = seq_lens_casual.size(0)
     padded_width = (
         (swa_window + page_index_aligned_size - 1) // page_index_aligned_size

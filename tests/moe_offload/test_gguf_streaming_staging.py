@@ -40,6 +40,7 @@ from torch.nn.parameter import UninitializedParameter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
+from sglang.srt.layers.moe import expert_offload  # noqa: E402
 from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     plan_load_time_staging,
     reset_expert_offload_release,
@@ -53,6 +54,8 @@ SCRATCH_ENV = "SGLANG_MOE_SCRATCH_SLOTS"
 STREAM_ENV = "SGLANG_MOE_GGUF_STREAM_STAGING"
 TRACE_ENV = "SGLANG_MOE_STAGING_TRACE"
 RATIO_ENV = "SGLANG_MOE_HOST_SHARD_RATIO"
+CARD_UUIDS_ENV = "SGLANG_RANK_CARD_UUIDS"
+UNSAFE_DELEGATE_ENV = "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE"
 
 # Toy geometry. Row byte counts are whole ggml K-quant blocks (Q4_K 144 B,
 # Q6_K 210 B) so the byte arithmetic is the arithmetic of a real checkpoint;
@@ -521,6 +524,56 @@ def test_default_path_bytes_match_the_stream(monkeypatch):
 
 def test_no_ratio_means_no_cold_shard_context(monkeypatch):
     monkeypatch.delenv(RATIO_ENV, raising=False)
+    monkeypatch.delenv(CARD_UUIDS_ENV, raising=False)
+    layer = _make_layer(0, 0.5, expert_shard=True, owned=E - 1, moe_tp_size=3)
+    assert layer._gguf_cold_shard_context() is None
+
+
+def test_the_published_card_vector_activates_the_context(monkeypatch):
+    """#407 cut 2 -> #394: the layer reads the launcher's vector, not a peer.
+
+    The point of the assertion below is the ABSENCE of a collective: the only
+    thing that changed between this test and the one above is an environment
+    variable, and the context came alive.
+    """
+    monkeypatch.delenv(RATIO_ENV, raising=False)
+    monkeypatch.setenv(CARD_UUIDS_ENV, "GPU-x4,GPU-x8a,GPU-x8b")
+    monkeypatch.setenv(UNSAFE_DELEGATE_ENV, "1")
+    monkeypatch.setattr(
+        expert_offload,
+        "_measured_h2d_gbps_by_uuid",
+        lambda uuid: {"GPU-x4": 6.4, "GPU-x8a": 13.0, "GPU-x8b": 13.0}[uuid],
+    )
+    layer = _make_layer(0, 0.5, expert_shard=True, owned=E - 1, moe_tp_size=3)
+
+    context = layer._gguf_cold_shard_context()
+
+    assert context is not None
+    assert context.ratio.source == "card-probe-h2d"
+    assert context.ratio.provenance == "measured"
+    assert context.ratio.weights[0] == min(context.ratio.weights)
+
+
+def test_a_vector_for_a_wider_group_is_not_read_by_a_narrower_one(monkeypatch):
+    """A 4-entry vector against a 3-rank MoE group describes another group."""
+    monkeypatch.delenv(RATIO_ENV, raising=False)
+    monkeypatch.setenv(CARD_UUIDS_ENV, "GPU-a,GPU-b,GPU-c,GPU-d")
+    monkeypatch.setenv(UNSAFE_DELEGATE_ENV, "1")
+    layer = _make_layer(0, 0.5, expert_shard=True, owned=E - 1, moe_tp_size=3)
+    assert layer._gguf_cold_shard_context() is None
+
+
+def test_a_disjoint_expert_shard_refuses_to_delegate_by_default(monkeypatch):
+    """Measured 2026-08-02: delegation on a disjoint shard loses the expert.
+
+    The ranks hold disjoint expert ranges under #82, so a delegated cold expert
+    is not relocated to a peer -- it is absent, and the first token routed to it
+    dies in ExpertResidencyPlanner.resolve. The refusal must hold even with a
+    ratio AND a card vector both present, which is what this pins.
+    """
+    monkeypatch.setenv(RATIO_ENV, "1,2,2")
+    monkeypatch.setenv(CARD_UUIDS_ENV, "GPU-x4,GPU-x8a,GPU-x8b")
+    monkeypatch.delenv(UNSAFE_DELEGATE_ENV, raising=False)
     layer = _make_layer(0, 0.5, expert_shard=True, owned=E - 1, moe_tp_size=3)
     assert layer._gguf_cold_shard_context() is None
 
@@ -528,11 +581,13 @@ def test_no_ratio_means_no_cold_shard_context(monkeypatch):
 def test_an_intermediate_dim_layer_never_delegates(monkeypatch):
     """The ColdShardContext precondition, enforced at the construction site."""
     monkeypatch.setenv(RATIO_ENV, "1,2,2")
+    monkeypatch.setenv(UNSAFE_DELEGATE_ENV, "1")
     layer = _make_layer(0, 0.5, expert_shard=False, moe_tp_size=3)
     assert layer._gguf_cold_shard_context() is None
 
 
 def test_delegated_experts_are_released_in_stream(monkeypatch):
+    monkeypatch.setenv(UNSAFE_DELEGATE_ENV, "1")
     monkeypatch.setenv(FRACTION_ENV, "0.5")
     monkeypatch.setenv(SCRATCH_ENV, "1")
     monkeypatch.setenv(RATIO_ENV, "1,2,2")

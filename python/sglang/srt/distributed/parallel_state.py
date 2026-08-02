@@ -3128,6 +3128,37 @@ def initialize_model_parallel(
     )
 
 
+def _object_exchange_group() -> Optional[torch.distributed.ProcessGroup]:
+    """The CPU process group the rank-config exchange must run on.
+
+    Upstream sgl-project/sglang#32751: ``all_gather_object`` with no ``group=``
+    resolves to WORLD, and torch then picks the staging device for the
+    size-exchange tensor via ``_get_object_coll_device(group)``. When WORLD has
+    several registered backends and none of them is CPU, that helper takes its
+    documented "no cpu in the backend list, randomly pick the first backend"
+    branch -- so a function whose entire purpose is to build a ``gloo`` group
+    stages its metadata on whichever accelerator backend happens to be listed
+    first. On MetaX/MACA that surfaced as an intermittent
+    ``CUDA error: invalid argument`` roughly one launch in a few; on stock
+    NVIDIA it is silent and merely non-deterministic.
+
+    The world group already owns a gloo ``cpu_group`` (built for exactly this
+    class of host-side coordination), so name it. That removes the device
+    question instead of answering it -- the same rule the card-identity work
+    (#397, #406, #394) applies to ordinals: never let an implicit enumeration
+    decide which device a collective touches.
+
+    Returns ``None`` (= torch's default, the previous behavior) only when the
+    world group has not been built yet, which cannot happen at the production
+    call site (HiCache prefetch-sync groups are created during scheduler
+    init, long after parallel state) but keeps this usable from tests and
+    from a bare ``torch.distributed`` setup.
+    """
+    if _WORLD is None:
+        return None
+    return _WORLD.cpu_group
+
+
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:
@@ -3150,7 +3181,9 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    torch.distributed.all_gather_object(
+        gathered_configs, local_config, group=_object_exchange_group()
+    )
 
     unique_groups = []
     seen_signatures = set()

@@ -295,3 +295,58 @@ Each TP rank writes its own file (`...tp0ep0.json`, `...tp1ep0.json`, ...).
 Read `totals.hit_rate` against WASTE's 0.14, and
 `layers[].peakedness.top{8,16,32}_share` against the resident fraction actually
 configured — that pair is what decides #126 and the §6 cut-D question.
+
+---
+
+## 10. The hit-rate row, measured (2026-08-02, #394 window)
+
+§4's hit-rate row was empty and §9 said the instrument existed but no card time
+had been spent. It has now. **DeepSeek-V4-Flash-0731 UD-IQ3_XXS, TP=3 uneven
+(5090 + 2x 3080), resident fraction 0.485 / 0.42 / 0.42, eager, bs=1**, the
+#390 instrument's interval dump over a decode workload.
+
+| rank | card / slot | activation-grain hit rate | unique-grain hit rate |
+|---|---|---|---|
+| tp0 | RTX 5090, x8 | **0.772** | 0.612 |
+| tp1 | RTX 3080, **x4** | **0.843** | 0.622 |
+| tp2 | RTX 3080, x8 | **0.841** | 0.632 |
+| **aggregate** | | **0.820** | **0.622** |
+
+**Against WASTE's 0.14 this is 5.9x.** §4's arithmetic held the cold set
+constant and asked what a better hit rate buys; the answer for our vehicle is
+that we are already far up that curve, and the "4.5x cache" premise of §4.2 is
+confirmed rather than hoped for. The two grains differ exactly as §9 predicted:
+activation grain (0.82) weights an expert by the tokens that chose it and is
+the number comparable with WASTE; unique grain (0.62) counts each expert once
+per forward and is what the offload actually fetches.
+
+**The row that was not asked for, and matters more.** The same dumps carry
+per-rank H2D volume, and it is *not* evenly split even with equal cold shards:
+
+| rank | H2D moved | share | measured link | implied transfer time |
+|---|---|---|---|---|
+| tp0 (5090, x8) | 258.0 GiB | 40.0 % | 14.42 GB/s | 19.2 s |
+| tp1 (3080, **x4**) | 165.2 GiB | 25.6 % | 6.45 GB/s | **27.5 s** |
+| tp2 (3080, x8) | 222.4 GiB | 34.4 % | 13.41 GB/s | 17.8 s |
+
+The x4 rank is the clock at **1.28x the mean**, which is the effect #394 exists
+to remove — measured, not modelled. But the equal-shard split is already
+25.6 / 34.4 / 40.0, not 33 / 33 / 33, because uneven TP hands the x4 rank fewer
+experts to begin with. **The headroom a perfect link-proportional placement can
+recover on this workload is therefore 27.5 -> 20.2 s = 1.36x on the transfer
+term, not the 1.77x that an equal-thirds premise implies.** See
+ANALYSE_393 §11.5 — this correction is the most useful thing the window
+produced, and it lowers #394's expected yield.
+
+Instrument note: captured decode under `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` is
+still uncounted (§9's blind spot); this run is the default eager path. Dumps
+were taken on an interval (`SGLANG_EXPERT_STATS_INTERVAL_SEC=45`) rather than
+by SIGUSR2 — see the incident note in the run directory for why the signal
+route is unsafe against a process set.
+
+**Update, same window, larger sample.** The club-3090 bench (5x1000 + 5x800
+tokens) re-measured the same boot over 17.8 TiB of expert traffic:
+**0.812 activation grain** (0.764 / 0.836 / 0.837), **0.620 unique grain** —
+5.8x WASTE's 0.14. Use these figures rather than the short-probe row above;
+they differ by under a point, which is itself the finding that the hit rate is
+stable across prompt shape.

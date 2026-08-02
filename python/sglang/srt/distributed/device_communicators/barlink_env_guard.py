@@ -119,6 +119,15 @@ RETIRED_ENV_VARS = {
     "SGLANG_HTCCL_PEER_TIMEOUT_S": "SGLANG_BARLINK_PEER_TIMEOUT_S",
     "SGLANG_HTCCL_PEER_WATCHDOG": "SGLANG_BARLINK_PEER_WATCHDOG",
     "SGLANG_HTCCL_PIPE_CHUNK_MIB": "SGLANG_BARLINK_PIPE_CHUNK_MIB",
+    # #421 F7: this row is a RESERVATION, not a rename of a working knob.
+    # Neither name ever had a reader -- the predecessor was introduced by the
+    # rename commit itself, and the successor is absent from the ``_e()``
+    # suffixes ``barlink_matrix.load_config`` reads. It is kept rather than
+    # deleted because DESIGN_201 still lists SGLANG_BARLINK_PP_TRANSPORT as
+    # the stage-boundary P2P lever (ucx/torch), and #201 slice 3
+    # (feat/tpxppxtp-slice3-201) does NOT implement it either -- so whoever
+    # finally does gets the retired-name protection for free. Do not read this
+    # row as evidence that the knob exists.
     "SGLANG_HTCCL_PP_TRANSPORT": "SGLANG_BARLINK_PP_TRANSPORT",
     "SGLANG_HTCCL_ROLES": "SGLANG_BARLINK_ROLES",
     "SGLANG_HTCCL_ROLLEN": "SGLANG_BARLINK_ROLES",

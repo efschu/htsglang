@@ -8,7 +8,7 @@ Coverage:
 - Both KV-cache dtype views (uint8 raw / float8_e4m3fn) — guards against the
   historic garbled-output bug where Triton kernels treated uint8 bytes as raw
   integers instead of FP8 (dsv4_sm120_progress.md §4)
-- Variable per-batch seq_lens with -inf masking semantics
+- Variable per-batch seq_lens with -inf masking semantics, on BOTH sides (#425)
 - CUDA graph capture + replay equivalence (no .item() / data-dependent shapes)
 - Shape-assertion guards
 
@@ -138,7 +138,15 @@ def _compare(
     atol: float = 1e-3,
     rtol: float = 1e-3,
 ):
-    """Compare reference (uninitialized beyond seq_len) vs SM120 (-inf beyond)."""
+    """Compare the two implementations over the whole row.
+
+    Valid positions are compared within tolerance (the two accumulate over
+    different page counts, so CUDA may pick different GEMM tilings). Invalid
+    positions are compared exactly: BOTH must be -inf. Until #425 only the
+    SM120 side was, and this helper skipped the tail -- which is how the
+    divergence upstream sgl-project/sglang#33247 reports survived an oracle
+    comparison for as long as it did.
+    """
     # Valid positions must match
     batch_size, max_seq_len = ref.shape
     for i in range(batch_size):
@@ -146,12 +154,12 @@ def _compare(
         torch.testing.assert_close(
             ref[i, :sl], sm120[i, :sl], atol=atol, rtol=rtol, equal_nan=False
         )
-    # Invalid positions in SM120 output must be -inf
     positions = torch.arange(max_seq_len, device=sm120.device)
     invalid = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
-    assert torch.all(
-        torch.isinf(sm120[invalid]) & (sm120[invalid] < 0)
-    ), "SM120 output must fill invalid positions with -inf"
+    for name, out in (("SM120", sm120), ("reference", ref)):
+        assert torch.all(
+            torch.isinf(out[invalid]) & (out[invalid] < 0)
+        ), f"{name} output must fill invalid positions with -inf"
 
 
 class TestSM120PagedMqaLogitsTorch(CustomTestCase):
