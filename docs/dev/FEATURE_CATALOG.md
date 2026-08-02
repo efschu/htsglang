@@ -69,18 +69,18 @@ register of discarded approaches — check it before re-proposing anything.
   50s→8-14s) + suspend-to-RAM (memory saver).
 - **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
   (geometry stages instead of rejects; explicit ladders work; rung-dependency
-  refusals exist and fire). `--kv-pressure-ladder auto` was BROKEN
-  (audit #421 F1) and is fixed on the desk in task #428 — the table is
+  refusals exist and fire). `--kv-pressure-ladder auto` mode wired via
+  rig-profile bridge (#428), boot validation pending — the table is
   computed from the rig profile by the #272 planner, rank-uniformly and
   UUID-keyed, and inventories only rungs whose actuator this configuration
   wires. Capacities are labelled placeholders until the measured figures
   arrive. BOOT-PENDING: `scripts/dev/428_boot_checks/`. **KV resharding**
   at phase boundaries (delta move <1 s, `kv_reshard_vectors`), **GDN slot
   ladder** (resident-state cap + idle vacate → VRAM back to KV pool).
-  `--lane-offload-profile/-class-policy/-park-targets` were advertised and
-  DISCARDED (audit #421 F2); task #428 configures the register from them at
-  ModelRunner init, and a typo now refuses there too. The park chain reaches
-  the register and the movement layer's default reads it — but nothing in
+  `--lane-offload-profile/-class-policy/-park-targets` are wired at runner
+  init once-per-process (#428), boot validation pending; a typo now refuses
+  there too. The park chain reaches the register and the movement layer's
+  default reads it — but nothing in
   production constructs the movement backend yet, so the chain has a consumer
   PATH, not a consumer. Whole surface is behind `SGLANG_OFFLOAD_REGISTER=1`
   (dark launch). BOOT-PENDING: `scripts/dev/428_boot_checks/`.
