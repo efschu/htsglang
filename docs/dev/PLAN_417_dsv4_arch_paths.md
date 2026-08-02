@@ -6,8 +6,19 @@ Branch `feat/dsv4-sm86-sm120-417`, based on `integration/r3-probe-next2` at
 
 Ground truth is boot 11
 (`/spinning/gpu-battery-results/2026-08-01_391_dsv4flash11/WALL.txt`), running
-DeepSeek-V4-Flash GGUF, 43 layers, DSpark sparse layers 40-42, on the
-5090 (sm120) + 2x 3080 (sm86) rig:
+DeepSeek-V4-Flash GGUF, 43 layers, on the 5090 (sm120) + 2x 3080 (sm86) rig:
+
+> **Correction (#447).** Earlier revisions of this plan called the sparse
+> layers "DSpark sparse layers 40-42". Both halves were wrong and the error
+> understates the indexer's share of a forward pass by ~7x. `compress_ratios`
+> in the shipped `config.json` of DeepSeek-V4-Flash-0731 is
+> `[0, 0, 4, 128, 4, 128, ..., 128, 4]` + `[0, 0, 0]` (46 entries: 43 trunk
+> layers plus the 3 DSpark draft stages). So the trunk has **21 CSA(4) layers**
+> (the even indices 2..42, each with an indexer), **20 HCA(128) layers** (odd
+> indices 3..41) and only layers 0-1 SWA-only. `40-42` is
+> `dspark_target_layer_ids` — the layers whose hidden states feed the DSpark
+> draft head — and has nothing to do with compression. Wording below is left
+> as written; read "DSpark sparse layers 40-42" as "the 41 compressed layers".
 
 * TP0 / sm120 — `RuntimeError: Sparse Attention Forward Kernel is only
   supported on SM90a and SM100f architectures.`

@@ -1028,6 +1028,27 @@ handled in the code — none of them belongs in a boot script any more:
 Attention TP on this model is capped at `o_groups` = 8 ranks, refused by name
 above that.
 
+**No speculative flags in this recipe, and `NEXTN` is the wrong answer here
+(#447).** `config.json` of DeepSeek-V4-Flash-0731 says
+`num_nextn_predict_layers: 1`, but the tensors under `mtp.0/1/2.*` are the three
+**DSpark** stages (`markov_head.markov_w1/w2`, `confidence_head.proj`,
+`main_proj`, `main_norm`), not a NextN block — the checkpoint ships no MTP head
+at all. Two consequences:
+
+- `--speculative-algorithm NEXTN` on this model resolves to `EAGLE`
+  (`speculative/spec_info.py:32`) and then loads arch
+  `DeepseekV4ForCausalLMNextN`, which looks for `model.layers.43.*`. Nothing
+  matches; the failure is a silently under-loaded draft, not a clean error.
+  `DSPARK` is the only draft algorithm this checkpoint can drive.
+- The `UD-*` GGUF shards carry **only** the 43 backbone blocks
+  (`deepseek4.block_count = 43`, 1328 tensors, no `blk.43+`, no `markov_*`), so
+  the DSpark head is not in the model directory at all. It lives in shards
+  46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (10.12 GiB, `mtp.*` only,
+  fp8 `weight`/`scale` pairs) — the format
+  `models/deepseek_v4_dspark.py:861-889` already expects.
+
+See `docs/dev/ANALYSE_447_llamacpp_dsv4_harvest.md` for the boot arm.
+
 Host RAM is the binding constraint on this route, and every code wall in the
 load path is cleared as of boot attempt 8 — 26 of 43 layers streamed with zero
 weight-loading warnings and zero unmatched tensors before the host box killed
