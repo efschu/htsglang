@@ -795,3 +795,39 @@ python -c "from sglang.srt.layers.moe.cold_tier_shm import preflight; \
 The pages are RAM either way; this is the tmpfs accounting cap, not a memory
 shortage. `create_owned_segment` refuses early and names the remount when it
 does not fit.
+
+### 11.7 Two slice-2 design calls, decided
+
+**Peer views stay on a READ-ONLY mapping.** The OS write protection is the
+foundation of §11's torn-mapping guarantee, and relaxing the peer mapping to
+`PROT_WRITE` for a friendlier constructor would reintroduce the silent
+shared-buffer corruption surface the header design exists to remove.
+
+The intended API, `torch.UntypedStorage.from_buffer`, hits a hard wall and the
+wall is named rather than quietly routed around: measured 2026-08-02 it rejects
+the mapping as called (`Buffer size too small (0 instead of at least 1 bytes)`)
+**and it copies**, which at a multi-GiB cold tier defeats the whole point of
+sharing. The view therefore comes from `torch.frombuffer`, which is zero-copy
+over the read-only mapping.
+
+PyTorch warns it does not model non-writable tensors and that one "can write to
+the underlying buffer". **The kernel disagrees, and the kernel is the enforcer:
+a write through the view takes SIGSEGV (verified in a forked child, signal 11,
+committed as a test).** The guarantee is real; only its declaration in torch's
+type system is missing, which is strictly better than dropping the protection.
+
+Executing this rather than reasoning about it also caught a live defect:
+`ctypes.from_buffer()` refuses a `PROT_READ` mapping, so the `cudaHostRegister`
+call was silently failing to pin **every** peer segment. The address now comes
+from the same torch view.
+
+**The capturable path targets equivalent registration, and the refusal stays
+until a green gate.** Peer segments are already pinned by `cudaHostRegister`,
+so UVA device views over them should be graph-addressable exactly like the
+local pool — there is no hard boundary here, so no soft exclusion is written.
+Desk side prepares it; the proof belongs in the GPU window, and its falsifier
+is that **a capture with a registered peer segment must replay byte-identically
+against eager on identical inputs** (the #52/#53 graph-replay corruption
+family). Until that gate is green the named refusal under
+`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` stays active: it falls to a passing test, not
+to finished code.

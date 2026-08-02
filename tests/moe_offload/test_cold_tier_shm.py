@@ -282,3 +282,60 @@ def test_an_oversized_segment_names_the_tmpfs_cap_not_a_memory_shortage(monkeypa
 
     with pytest.raises(ColdTierError, match="tmpfs size cap"):
         create_owned_segment(_layout(rows=1024, row_bytes=1 << 20, expert_ids=()))
+
+
+# --------------------------------------------------------------------------
+# 4. torch views: zero-copy, and the OS keeps the write protection
+# --------------------------------------------------------------------------
+
+
+def test_a_peer_row_tensor_is_zero_copy_and_correct():
+    import torch
+
+    layout = _layout()
+    _fill(layout)
+
+    t = cts.peer_row_tensor(layout, 94)
+
+    assert t.dtype is torch.uint8 and t.numel() == ROW_BYTES
+    assert int(t[0]) == 94 and int(t[-1]) == 94
+    # Zero-copy proved by ALIASING, not by pointer arithmetic: a byte the owner
+    # writes after the view exists must be visible through the view. A copy
+    # would keep showing the old value.
+    owner = _fill(layout)  # owner keeps its writable mapping
+    row = layout.row_of(94)
+    owner[HEADER_BYTES + row * ROW_BYTES] = 7
+    owner.flush()
+    assert int(t[0]) == 7, "the peer view is a copy, not a mapping"
+    # and repeated lookups reuse one mapping rather than remapping per fetch
+    assert cts.peer_row_tensor(layout, 94).data_ptr() == t.data_ptr()
+
+
+def test_writing_through_a_peer_view_dies_rather_than_corrupting_a_peer():
+    """FALSIFIER for the read-only decision, in a forked child.
+
+    PyTorch warns that it does not model non-writable tensors and that one
+    "can write to the underlying buffer". The kernel disagrees. This pins that
+    the kernel is the one enforcing it, because a silent write here would
+    corrupt ANOTHER RANK's expert weights -- the worst failure this design has,
+    and the reason the mapping stays PROT_READ.
+    """
+    import os
+
+    layout = _layout()
+    _fill(layout)
+    cts.detach_all()
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child never returns to pytest
+        try:
+            t = cts.peer_row_tensor(layout, 80)
+            t[0] = 255
+            os._exit(42)  # silent write: catastrophic
+        except Exception:
+            os._exit(7)  # python-level refusal: also acceptable
+    _, status = os.waitpid(pid, 0)
+    signal, code = status & 0x7F, status >> 8
+
+    assert code != 42, "a write through a peer view silently succeeded"
+    assert signal in (7, 11) or code == 7, f"unexpected (signal={signal}, code={code})"

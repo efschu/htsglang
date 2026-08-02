@@ -94,6 +94,8 @@ __all__ = [
     "detach_all",
     "shm_capacity_bytes",
     "preflight",
+    "peer_row_view",
+    "peer_row_tensor",
 ]
 
 #: Bump when the HEADER or the manifest schema changes meaning. A segment
@@ -506,13 +508,15 @@ def attach_peer_segment(layout: ColdTierLayout, register_with_cuda: bool = True)
 def _register_host_memory(mm, path: str) -> None:
     """Pin a mapped peer segment for DMA, or leave it pageable and say so."""
     try:
-        import ctypes
-
         import torch
 
         if not torch.cuda.is_available():
             return
-        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        # ctypes.from_buffer() REFUSES a PROT_READ mapping ("underlying buffer
+        # is not writable"), so the address comes from a torch view instead --
+        # the same zero-copy route peer_row_tensor uses. Measured 2026-08-02;
+        # the ctypes spelling silently disabled pinning on every peer segment.
+        addr = torch.frombuffer(mm, dtype=torch.uint8, count=1).data_ptr()
         cudart = torch.cuda.cudart()
         # cudaHostRegisterReadOnly(0x08) | cudaHostRegisterPortable(0x01)
         err = cudart.cudaHostRegister(addr, len(mm), 0x09)
@@ -548,3 +552,47 @@ def peer_row_view(layout: ColdTierLayout, expert_id: int) -> memoryview:
     mm = attach_peer_segment(layout)
     start = HEADER_BYTES + row * layout.row_bytes
     return memoryview(mm)[start : start + layout.row_bytes]
+
+
+def peer_row_tensor(layout: ColdTierLayout, expert_id: int):
+    """One delegated expert as a zero-copy torch view over the peer's segment.
+
+    READ-ONLY MAPPING IS KEPT, and the tensor is built over it rather than the
+    mapping being relaxed to PROT_WRITE. That protection is the foundation of
+    the torn-mapping guarantee above; trading it for a more convenient
+    constructor would reintroduce exactly the silent-corruption surface the
+    header design removes (the shared-buffer family).
+
+    **The named wall.** ``torch.UntypedStorage.from_buffer`` is the API that
+    would express "read-only storage", and it is unusable here for two
+    independent reasons, both measured on 2026-08-02: it rejects the mapping as
+    called (``Buffer size too small (0 instead of at least 1 bytes)``), and it
+    COPIES -- which at a multi-GiB cold tier defeats the entire purpose, since
+    the point of sharing is that one copy of the bytes exists.
+
+    So the view comes from ``torch.frombuffer``. PyTorch warns that it does not
+    model non-writable tensors and that one "can write to the underlying
+    buffer". **The kernel disagrees, and the kernel is the one enforcing it:**
+    a write through this view on a ``PROT_READ`` mapping takes SIGSEGV
+    (verified in a forked child, signal 11). PyTorch's type system simply does
+    not express the guarantee the mapping already provides. The guarantee is
+    real; only its declaration is missing, and that is a strictly better
+    position than dropping the protection to satisfy a constructor.
+    """
+    import torch
+
+    row = layout.row_of(expert_id)
+    if not (0 <= row < layout.rows):
+        raise SegmentMismatch(
+            f"row {row} for expert {expert_id} is outside rank "
+            f"{layout.owner_rank}'s {layout.rows}-row cold tier"
+        )
+    mm = attach_peer_segment(layout)
+    offset = HEADER_BYTES + row * layout.row_bytes
+    flat = torch.frombuffer(
+        mm, dtype=getattr(torch, layout.dtype), count=-1, offset=offset
+    )
+    want = 1
+    for dim in layout.row_shape:
+        want *= int(dim)
+    return flat[:want].view(layout.row_shape) if layout.row_shape else flat[:want]
