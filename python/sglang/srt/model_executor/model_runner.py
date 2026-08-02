@@ -902,8 +902,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
+    def _refuse_unproven_bar1_dcp_combination(self):
+        """Fail fast on the one feature combination measured to wedge (#431).
+
+        The evidence is the #424 battery: with `SGLANG_BARLINK_TRANSPORT=bar1`
+        and uneven weighted DCP, the fp8 checkpoint wedged the prefill path in
+        BOTH layouts after a clean boot and a passing transport gate, while
+        the INT8-W8A8 checkpoint completed both layouts over the same
+        transport and the fp8 checkpoint completed both over stock NCCL. The
+        mechanism is not yet proven (the GPU repro is
+        `scripts/repro_431_fp8_bar1_dcp.sh`), so this is a scoped refusal, not
+        a fix: it names exactly the arm that failed and leaves every arm that
+        was measured to work -- including the recommended INT8 + BAR1 one --
+        untouched.
+
+        The predicate lives in `barlink_uniformity` as a pure function so it
+        can be falsified without a GPU; this method only supplies the values.
+        """
+        from sglang.srt.distributed.device_communicators.barlink_uniformity import (
+            unproven_bar1_combination,
+        )
+
+        message = unproven_bar1_combination(
+            barlink_enabled=envs.SGLANG_BARLINK.get(),
+            transport=envs.SGLANG_BARLINK_TRANSPORT.get(),
+            uneven_weighted_dcp=(
+                self.server_args.uneven_weighted_dcp_enabled()
+                and self.dcp_size > 1
+            ),
+            quantization=self.model_config.quantization,
+        )
+        if message is not None:
+            raise ValueError(message)
+
     def initialize(self):
         server_args = self.server_args
+
+        # #431: refuse barlink BAR1 x uneven weighted DCP x an fp8 checkpoint
+        # before a single weight is loaded. HERE and not in ServerArgs because
+        # the predicate needs the RESOLVED quantization: the #424 arms passed
+        # no --quantization at all and the method comes out of the
+        # checkpoint's own quant_config in ModelConfig._verify_quantization.
+        # Rank-uniform by construction (server args + model config are
+        # replicated), so the raise happens on every rank or on none.
+        self._refuse_unproven_bar1_dcp_combination()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver

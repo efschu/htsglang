@@ -41,6 +41,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators import (
     barlink_env_guard,  # noqa: F401  (rejects retired SGLANG_HTCCL* vars)
     barlink_liveness,
+    barlink_uniformity,
 )
 
 logger = logging.getLogger(__name__)
@@ -682,7 +683,49 @@ class BarlinkCommunicator:
                 f"all_reduce/all_gather/reduce_scatter/broadcast "
                 f"completely)."
             )
+        # #431: record what THIS rank decided, in issue order.
+        #
+        # Everything above is a rank-local computation whose result must be
+        # rank-uniform, and nothing enforces that: `nbytes` is the caller's
+        # own `numel * element_size`, while every predicate in
+        # `BarlinkBar1Transport.handles` documents itself as "rank-uniform,
+        # because nbytes is". For the equal-shaped ops that premise holds; it
+        # is a premise all the same, and under bar1 a single violation is
+        # absorbing (one shared device round counter, equality wait). The
+        # recorder makes the premise checkable after the fact instead of
+        # costing a GPU window every time the family recurs.
+        #
+        # Off by default: one module-global boolean test per collective, and
+        # `record_decision` returns before it touches anything else.
+        if barlink_uniformity.recording_enabled():
+            self._record_dispatch_decision(op, nbytes, chosen, t)
         return chosen
+
+    def _record_dispatch_decision(self, op: str, nbytes: int, chosen, t) -> None:
+        """Append this rank's decision to the #431 recorder. Never raises.
+
+        Out of line so the hot path carries only the boolean test, and
+        defensive because it runs on a path that is already being used to
+        diagnose a wedged run -- a recorder that throws would destroy the
+        evidence it exists to collect.
+        """
+        try:
+            rounds = 0
+            probe = t if chosen is not None else None
+            if probe is not None:
+                if op == "all_gather" and hasattr(probe, "ag_rounds"):
+                    rounds = int(probe.ag_rounds(nbytes))
+                elif op == "all_reduce" and hasattr(probe, "ar_rounds"):
+                    rounds = int(probe.ar_rounds(nbytes))
+            barlink_uniformity.record_decision(
+                str(getattr(self, "group", "?")),
+                op,
+                int(nbytes),
+                _transport_name(chosen) if chosen is not None else "gloo",
+                rounds,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("barlink decision recorder skipped one entry: %r", e)
 
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
         """One FRESH output tensor per call — never a shape-keyed cache.

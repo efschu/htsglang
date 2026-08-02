@@ -131,6 +131,17 @@ peer VRAM over 256-MiB BARs, beats NCCL 1.13-1.34x in serving.
 dmabuf GPU-RDMA works on consumer cards with the stock driver. Rig facts: NO
 P2P/NVLink here, negotiated PCIe x4/x8/x8 (NVML max-width reports x16
 NAMEPLATE — always read negotiated width), NCCL-verbs broken on our RoCE.
+**Collective-decision recorder** (`barlink_uniformity.py`, #431): per-rank
+ordered log of every `(op, nbytes, path, rounds)` dispatch decision plus a
+pure `first_divergence` comparator — the standing instrument for the
+rank-local-condition-before-a-group-collective family (#94/#194/#312/#431).
+Off by default (`SGLANG_BARLINK_RECORD_DECISIONS=1`, optional per-rank
+on-disk dump via `SGLANG_BARLINK_RECORD_DUMP_DIR` for post-mortems on a
+wedged run). **Scoped refusal**: barlink BAR1 × uneven weighted DCP × an
+fp8-quantized checkpoint is refused at ModelRunner boot (#424 evidence;
+INT8-W8A8 over BAR1 and fp8 over NCCL are untouched). Override for the repro
+window: `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1=1`. See
+`docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md` — GPU proof still pending.
 
 ## 8. GGUF stack
 Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype
