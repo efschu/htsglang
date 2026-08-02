@@ -43,6 +43,7 @@ from sglang.srt.layers.dcp.comm import (
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    lse_is_base_e,
 )
 from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
 from sglang.srt.layers.dcp.layout import (
@@ -111,6 +112,7 @@ __all__ = [
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
+    "lse_is_base_e",
     "dcp_forces_prefix",
     "draft_extend_prefix_lens",
     "get_dcp_lens",

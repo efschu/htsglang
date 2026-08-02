@@ -863,12 +863,40 @@ class FusedMoE(torch.nn.Module):
         expert_data.copy_(loaded_weight)
 
     def _moe_src_start(self, loaded_total: int, shard_size: int, tp_rank: int) -> int:
-        """Source-side start of this rank's shard in a full checkpoint
-        tensor. Even TP: rank * shard_size. Uneven TP: prefix sum of the
-        plan partition ("moe" family, falling back to the base plan);
-        works for weight AND block-scale grids because moe_tp_units
-        divides both."""
+        """Source-side start of this rank's shard in a full checkpoint tensor.
+
+        INVARIANT: the source-side start belongs to the CHECKPOINT tensor's
+        real geometry and must never be derived from the DESTINATION
+        ``shard_size``. The two are equal only while nothing pads the
+        destination, which is why ``shard_size * tp_rank`` survived so long.
+
+        Upstream sgl-project/sglang#32781 is that invariant broken on the
+        padded path: Marlin rounds a TP16 shard of 3072/16 = 192 up to 256, so
+        rank 13 asked the 3072-wide checkpoint tensor for a narrow starting at
+        256 * 13 = 3328 and got ``IndexError: start out of range (expected to
+        be in range of [-3072, 3072], but got 3328)``. Deriving the start from
+        ``loaded_total`` instead keeps every rank in range whatever the
+        destination is padded to.
+
+        Even TP: the checkpoint tensor's own even split. Identical to the old
+        ``shard_size * tp_rank`` whenever the destination is unpadded, because
+        then ``loaded_total == shard_size * tp_size``.
+        Uneven TP: prefix sum of the plan partition ("moe" family, falling
+        back to the base plan); works for weight AND block-scale grids because
+        moe_tp_units divides both -- that branch was already source-derived.
+        """
         if not tp_plan_active(self.moe_tp_size, self.moe_tp_family):
+            tp_size = self.moe_tp_size
+            # getattr: the attribute is always set on a real FusedMoE, but this
+            # helper is also driven from lightweight stand-ins that carry only
+            # the plan fields.
+            presharded = getattr(self, "use_presharded_weights", False)
+            if not presharded and tp_size > 0 and loaded_total % tp_size == 0:
+                return (loaded_total // tp_size) * tp_rank
+            # Presharded checkpoints hand each rank its own tensor (there is no
+            # full-tensor geometry to read), and a source length the TP size
+            # does not divide has no even split to speak of. Both keep the
+            # legacy expression rather than inventing an offset here.
             return shard_size * tp_rank
         return tp_partition_offset(
             loaded_total,

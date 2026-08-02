@@ -1528,6 +1528,12 @@ class Envs:
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Sequence-axis chunk (in KV positions) of the torch paged-MQA-logits
+    # implementation. Bounds its peak intermediate at O(batch x chunk x heads)
+    # instead of O(batch x context x heads); see #426 / upstream #33246. Must
+    # be a multiple of the 64-position page; 0 disables chunking (one pass over
+    # the whole sequence, the pre-#426 shape).
+    SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK = EnvInt(8192)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

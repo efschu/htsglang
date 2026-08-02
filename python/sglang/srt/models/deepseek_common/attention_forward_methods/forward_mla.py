@@ -18,6 +18,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
+    lse_is_base_e,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -806,8 +807,14 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
+            # The LSE's log base belongs to the backend that produced it, not
+            # to the collective: FlashMLA returns natural-log LSE, FlashInfer
+            # MLA base-2. Upstream #33064 / #426.
             attn_output = cp_lse_ag_out_rs_mla(
-                attn_output, lse, get_parallel().dcp_group
+                attn_output,
+                lse,
+                get_parallel().dcp_group,
+                is_lse_base_on_e=lse_is_base_e(self.current_attention_backend),
             )
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)

@@ -52,19 +52,53 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
     )
 
 
+#: Green-context SM partition granularity per architecture major version:
+#: (min_per_part, multiple). Everything from Hopper on shares the Hopper
+#: granularity; the table below is therefore a lookup for the OLDER majors
+#: only, not the list of supported architectures.
+_GREEN_CTX_CONSTRAINTS = {
+    6: (1, 1),
+    7: (2, 2),
+    8: (4, 2),
+}
+#: Applied to every major >= 9 (Hopper, Blackwell SM100/SM103, SM120, and
+#: whatever comes next).
+_GREEN_CTX_CONSTRAINTS_HOPPER_ONWARDS = (8, 8)
+#: Oldest major this function can answer for at all.
+_GREEN_CTX_MIN_MAJOR = min(_GREEN_CTX_CONSTRAINTS)
+
+
 def get_arch_constraints(compute_capability):
+    """Green-context SM partition constraints ``(min_per_part, multiple)``.
+
+    Upstream sgl-project/sglang#32933: the previous body was a closed table
+    ending at ``major == 9`` with a ``raise`` for everything else, so
+    ``--enable-pdmux`` aborted the scheduler on SM100/SM103 (B200/B300) and
+    SM120 (RTX PRO 6000, consumer Blackwell) with "Unsupported compute
+    capability: 12.0" -- architectures that are strictly newer than the last
+    entry and inherit its granularity.
+
+    An arch table is the wrong shape for a question that is really "what is
+    the SM split granularity here" (same family as #417). Newer majors are
+    therefore not enumerated: they take the Hopper-onwards granularity, which
+    is the direction CUDA has held since green contexts were introduced. If a
+    future architecture ever disagrees, the driver rejects the split with its
+    own error at ``cuDevSmResourceSplitByCount`` -- a named failure at the
+    call that actually knows -- instead of this function refusing to answer.
+
+    Older-than-Pascal majors still raise: there the granularity is not a
+    forward-extrapolation, green contexts do not exist at all.
+    """
     major, minor = compute_capability
-    # green context constraints for different architectures
-    if major == 6:
-        return 1, 1  # min_per_part, multiple
-    elif major == 7:
-        return 2, 2
-    elif major == 8:
-        return 4, 2
-    elif major == 9 and minor >= 0:
-        return 8, 8
-    else:
-        raise ValueError(f"Unsupported compute capability: {major}.{minor}")
+    if major < _GREEN_CTX_MIN_MAJOR:
+        raise ValueError(
+            f"Unsupported compute capability for PD multiplexing: "
+            f"{major}.{minor}. Green contexts require compute capability "
+            f"{_GREEN_CTX_MIN_MAJOR}.0 or newer."
+        )
+    if major in _GREEN_CTX_CONSTRAINTS:
+        return _GREEN_CTX_CONSTRAINTS[major]
+    return _GREEN_CTX_CONSTRAINTS_HOPPER_ONWARDS
 
 
 def divide_sm(total_sms, compute_capability, groups):

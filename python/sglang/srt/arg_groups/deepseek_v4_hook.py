@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.default_precedence import set_model_default
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -46,11 +47,17 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 256
-        logger.warning(
-            f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
-        )
+    # MODEL default, not a final value: the speculative hook runs later and
+    # its own default (48) is documented to win when speculative decoding is
+    # on. Writing it through set_model_default records that provenance, which
+    # is what lets the later hook tell "the model filled this in" apart from
+    # "the operator asked for 256" -- upstream #33199, adopted in #426.
+    set_model_default(
+        server_args,
+        "max_running_requests",
+        256,
+        reason=f"for {model_arch}",
+    )
 
     if server_args.speculative_algorithm is not None:
         assert server_args.speculative_algorithm in (
