@@ -260,6 +260,94 @@ def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
     return min(chunk_pages, max_pages)
 
 
+def _gather_pages(kvcache_flat: torch.Tensor, page_ids: torch.Tensor) -> torch.Tensor:
+    """Gather one ``[rows, pages, page_bytes]`` block out of the flat KV cache.
+
+    Named rather than inlined because this single expression is the B-fold
+    duplication described in ``docs/dev/ANALYSE_447_llamacpp_dsv4_harvest.md``
+    section 2.3 L1: the page table has one row per QUERY TOKEN, and for a
+    single-sequence chunked prefill every one of those rows holds the same page
+    ids, so the gather materializes ``rows`` byte-identical copies of the same
+    KV span. Giving it a name makes the size of that block observable from a
+    test (#449) instead of only from a profiler.
+    """
+    return kvcache_flat[page_ids]
+
+
+def _indexer_logits_step_bytes(chunk_seq: int, num_heads: int, head_dim: int) -> int:
+    """Transient bytes ONE query row costs in one ``(query chunk x KV chunk)``
+    step of :func:`fp8_paged_mqa_logits_torch_sm120`, on THIS rank.
+
+    Counted from the buffers the loop body holds live at its widest point, per
+    row and per KV position of the chunk:
+
+    * ``head_dim + 4`` -- the gathered page block (fp8 values plus the fp32
+      per-position scale), the L1 term above;
+    * ``head_dim * 4`` -- its fp32 dequantization, the largest single buffer;
+    * ``4`` -- the fp32 scales, reshaped out of the same gathered block;
+    * ``num_heads * 4 * 2`` -- the ``[rows, chunk, heads]`` bmm product plus one
+      elementwise temporary of it (the ``score * weight_row`` result), before
+      the head axis is summed away.
+
+    Only the last term depends on the head count, and that is the term that
+    makes a flat row count non-comparable across geometries -- see the
+    invariance contract on :func:`_indexer_logits_chunk_rows`.
+    """
+    per_position = (head_dim + 4) + head_dim * 4 + 4 + num_heads * 4 * 2
+    return chunk_seq * per_position
+
+
+def _indexer_logits_chunk_rows(
+    *,
+    chunk_seq: int,
+    num_heads: int,
+    head_dim: int,
+    num_rows: int,
+) -> int:
+    """Query-axis chunk width, in rows, for the torch paged-MQA logits (#449).
+
+    Reads ``SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`` -- a per-rank MiB budget for
+    the transient working set of one loop step, not a row count -- and converts
+    it with THIS rank's own geometry via :func:`_indexer_logits_step_bytes`.
+    Returns ``num_rows`` when the budget is disabled or the whole query axis
+    already fits, in which case the caller runs exactly the expression it ran
+    before #449.
+
+    BUDGET DISCIPLINE (same as the #395 attention-scratch knob, see
+    ``models/deepseek_common/attention_forward_methods/forward_mha.py``): the
+    quantity that has to stay comparable across ranks and models is the
+    transient BYTE count, not a token or row count. The bytes per query row
+    scale with the head count and with the KV chunk width, so a flat row knob
+    would mean a different peak on every geometry. Hence the knob is MiB and
+    the row count is derived.
+
+    INVARIANCE CONTRACT: the same ``budget_mib`` fed to two geometries with
+    different per-row bytes yields row counts INVERSELY proportional to those
+    bytes, so ``rows * step_bytes <= budget`` holds on both. The C4 indexer's
+    heads are replicated rather than TP-sharded today (``C4Indexer.__init__``
+    sets ``n_local_heads = n_heads`` and builds ``ReplicatedLinear``), so the
+    head term is currently rank-invariant; the row count is not, because
+    DP-attention shards the query axis per rank. Either way the decision is
+    rank-local: this function reads only its arguments and the env, and the
+    loop it sizes contains no collective, so ranks that pick different chunk
+    counts cannot desynchronize.
+    """
+    # Never 0: the return value is the step of a `range`, and an empty query
+    # axis (num_rows == 0) must yield an empty loop, not a ValueError.
+    budget_mib = envs.SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB.get()
+    if not budget_mib or budget_mib <= 0:
+        return max(1, num_rows)
+    step_bytes = _indexer_logits_step_bytes(
+        chunk_seq=chunk_seq,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    if step_bytes <= 0:
+        return max(1, num_rows)
+    rows = (int(budget_mib) * 1024 * 1024) // step_bytes
+    return max(1, min(int(rows), num_rows))
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -296,6 +384,22 @@ def fp8_paged_mqa_logits_torch_sm120(
     ``O(B x chunk x H)``. It is exact, not an approximation: no reduction
     crosses a chunk boundary, and a single chunk reproduces the previous
     expression op for op.
+
+    MEMORY, QUERY AXIS (#449, ANALYSE_447 section 2.3 L1/L3): ``B`` here is
+    query TOKENS at prefill, not requests, and the sequence-axis chunk above
+    leaves every intermediate ``B`` tall -- including the gather, which
+    materializes one copy of the chunk's KV span per query token
+    (``B x chunk_pages x 64 x 132`` bytes) because the page table carries one
+    row per query token. The query axis is independent in exactly the same
+    sense as the sequence axis, so it is walked in a second, outer loop whose
+    width comes from a per-rank MiB budget
+    (``SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB``, see
+    :func:`_indexer_logits_chunk_rows`). The two loops compose: peak becomes
+    ``O(rows x chunk x H)`` with both factors budgeted, and the duplication
+    factor of the gather drops from ``B`` to ``rows``. This BOUNDS the
+    duplication; it does not remove it -- gathering one row and broadcasting
+    (candidate C in ANALYSE_447 section 4) needs a row-uniformity guarantee the
+    paged call site does not give, and is not attempted here.
     """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
@@ -327,35 +431,66 @@ def fp8_paged_mqa_logits_torch_sm120(
 
     logits = q.new_full((batch_size, max_seq_len), float("-inf"))
     chunk_pages = _indexer_logits_chunk_pages(block_size, max_pages)
+    # QUERY AXIS (#449). The KV-axis loop below bounds the peak by the chunk in
+    # the SEQUENCE dimension only; every one of its intermediates is still
+    # ``batch_size`` (= query tokens) tall, and the gather in particular
+    # materializes one copy of the chunk's KV span PER QUERY TOKEN (see
+    # `_gather_pages`). The query axis is as independent as the sequence axis --
+    # row i of the output reduces over head_dim and over heads within row i and
+    # nothing else -- so walking it in budget-sized groups is a regrouping, not
+    # an approximation, and it composes with the KV chunking rather than
+    # replacing it: the peak becomes O(rows x chunk_seq x ...) in BOTH axes.
+    chunk_rows = _indexer_logits_chunk_rows(
+        chunk_seq=chunk_pages * block_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_rows=batch_size,
+    )
 
-    for page_start in range(0, max_pages, chunk_pages):
-        page_stop = min(max_pages, page_start + chunk_pages)
-        seq_start = page_start * block_size
-        chunk_seq = (page_stop - page_start) * block_size
+    for row_start in range(0, batch_size, chunk_rows):
+        row_stop = min(batch_size, row_start + chunk_rows)
+        rows = row_stop - row_start
+        page_ids_rows = page_ids[row_start:row_stop]
+        q_t_rows = q_t[row_start:row_stop]
+        weight_rows = weight_row[row_start:row_stop]
 
-        kvcache_gathered = kvcache_flat[page_ids[:, page_start:page_stop]]
+        for page_start in range(0, max_pages, chunk_pages):
+            page_stop = min(max_pages, page_start + chunk_pages)
+            seq_start = page_start * block_size
+            chunk_seq = (page_stop - page_start) * block_size
 
-        kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-        kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+            kvcache_gathered = _gather_pages(
+                kvcache_flat, page_ids_rows[:, page_start:page_stop]
+            )
 
-        kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
-        kv_value = kv_value.view(batch_size, chunk_seq, head_dim)
+            # Reinterpret the gathered block in place instead of copying the
+            # value half out of it: the block is freshly allocated and
+            # contiguous, so viewing the WHOLE row as fp8 (or as fp32 for the
+            # scale half) and slicing afterwards reads the same bytes the
+            # per-half `.contiguous()` copies used to produce, without the two
+            # extra full-size buffers. Pure data movement -- the dtype
+            # reinterpretation and the elementwise cast below are unchanged.
+            gathered_fp8 = kvcache_gathered.view(dtype=FP8_DTYPE)
+            kv_value = gathered_fp8[..., :SCALE_OFFSET].to(torch.float32)
+            kv_value = kv_value.view(rows, chunk_seq, head_dim)
 
-        kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-        kv_scale = kv_scale.view(batch_size, chunk_seq)
+            gathered_f32 = kvcache_gathered.view(dtype=torch.float32)
+            kv_scale = gathered_f32[..., SCALE_OFFSET // 4 :].reshape(rows, chunk_seq)
 
-        score = torch.bmm(kv_value, q_t)
+            score = torch.bmm(kv_value, q_t_rows)
 
-        score = F.relu(score)
-        score = score * weight_row
-        score = score.sum(dim=2)
+            score = F.relu(score)
+            score = score * weight_rows
+            score = score.sum(dim=2)
 
-        score = score * kv_scale
+            score = score * kv_scale
 
-        # Only the LAST chunk can run past max_seq_len (the padded span is a
-        # whole number of pages); everything before it copies in full.
-        out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
-        logits[:, seq_start : seq_start + out_width] = score[:, :out_width]
+            # Only the LAST chunk can run past max_seq_len (the padded span is
+            # a whole number of pages); everything before it copies in full.
+            out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
+            logits[row_start:row_stop, seq_start : seq_start + out_width] = score[
+                :, :out_width
+            ]
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)

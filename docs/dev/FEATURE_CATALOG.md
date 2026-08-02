@@ -425,6 +425,13 @@ Llama family, Mistral Small 24B FP8 + ministral3 SWA fix, Deckard-40B/Tess-27B,
 OWN sm86+sm120 attention paths (e4m3 bit-decode, f32 staging, indexer arch
 dispatch, torch/triton reference-twin parity: indexer mask oracle, SWA
 page-index wrap oracle, page-table rounding, top-k seq_len contract).
+The torch paged-MQA indexer logits are chunked on BOTH axes — KV positions
+(#426) and query rows under a per-rank MiB budget (#449,
+`SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`, converted with that rank's own head
+geometry as #395 does) — bit-identical to the single-pass form, collective-free
+inside the loops. This BOUNDS the per-query-token duplication of the KV gather
+(one copy per query token, ANALYSE_447 L1); it does not remove it, and the
+speed effect is unmeasured (no GPU window taken).
 Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure

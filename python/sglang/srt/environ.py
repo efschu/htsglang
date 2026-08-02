@@ -1592,6 +1592,15 @@ class Envs:
     # be a multiple of the 64-position page; 0 disables chunking (one pass over
     # the whole sequence, the pre-#426 shape).
     SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK = EnvInt(8192)
+    # Query-axis chunk of the same implementation, expressed as a per-rank MiB
+    # budget for the transient working set of ONE (query chunk x KV chunk)
+    # step -- not a row count, because the bytes a query row costs scale with
+    # the head count and with the KV chunk width, so a flat row count is not
+    # comparable across geometries (same reasoning as --attn-scratch-budget-mib,
+    # #395). Bounds the per-query-token duplication of the KV gather described
+    # in ANALYSE_447 section 2.3 L1. 0 disables it (one pass over the whole
+    # query axis, the pre-#449 shape). See #449.
+    SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB = EnvInt(2048)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     # Validate the non-negative-seq_len precondition of the DSV4 top-k
     # wrappers (v1 and v2) before the launch. The check costs a device-to-host
