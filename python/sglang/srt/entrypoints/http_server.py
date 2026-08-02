@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import tempfile
@@ -135,6 +136,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
+    SessionHandoverReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -1118,6 +1120,29 @@ async def kv_reshard(obj: Annotated[KvReshardReqInput, Body()], request: Request
     return ORJSONResponse(
         {"success": ret.success, "message": ret.message},
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/session_handover", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def session_handover(
+    obj: Annotated[SessionHandoverReqInput, Body()], request: Request
+):
+    """#261: live session handover without server stop. Actions: export
+    (source: quiesce + snapshot one session, returns the manifest), commit /
+    abort (source: release or roll back the parked prefix), verify_import
+    (destination: request-less check that the migrated blobs are present and
+    the model identity matches). Both servers keep serving other sessions
+    throughout."""
+    try:
+        ret = await _global_state.tokenizer_manager.session_handover(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    body = {"success": ret.success, "message": ret.message}
+    if ret.manifest_json:
+        body["manifest"] = json.loads(ret.manifest_json)
+    return ORJSONResponse(
+        body, status_code=200 if ret.success else HTTPStatus.BAD_REQUEST
     )
 
 

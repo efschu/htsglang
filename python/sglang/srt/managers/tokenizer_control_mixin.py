@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     KvReshardReqInput,
     KvReshardReqOutput,
+    SessionHandoverReqInput,
+    SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     VramBudgetReqInput,
@@ -109,6 +111,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("kv_reshard", KvReshardReqOutput),
+    ("session_handover", SessionHandoverReqOutput),
     ("vram_budget", VramBudgetReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -279,6 +282,30 @@ class TokenizerControlMixin:
                 KvReshardReqInput(target_vector=list(target_vector))
             )
         )[0]
+
+    async def session_handover(
+        self: TokenizerManager, obj: SessionHandoverReqInput
+    ) -> SessionHandoverReqOutput:
+        """#261: live session handover control (export/commit/abort on the
+        source server, verify_import on the destination). The request fans
+        out to every scheduler; per-rank verdicts are aggregated with
+        all-must-succeed semantics (verify_import is rank-local by design --
+        each rank checks its own store shards)."""
+        self.auto_create_handle_loop()
+        results = await self.session_handover_communicator(obj)
+        success = all(r.success for r in results)
+        messages = []
+        for r in results:
+            if r.message and r.message not in messages:
+                messages.append(r.message)
+        manifest_json = next(
+            (r.manifest_json for r in results if r.manifest_json), None
+        )
+        return SessionHandoverReqOutput(
+            success=success,
+            message="; ".join(messages),
+            manifest_json=manifest_json,
+        )
 
     async def vram_budget(
         self: TokenizerManager, obj: VramBudgetReqInput

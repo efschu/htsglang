@@ -1441,6 +1441,35 @@ class KvReshardReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class SessionHandoverReqInput(BaseReq, kw_only=True):
+    """#261: live session handover without server stop.
+
+    ``action`` is one of:
+    - ``export`` (source): quiesce the session identified by ``token_ids``
+      (its exact token prefix), force-flush its KV + GDN state to the store
+      and return a manifest. The prefix stays PARKED (new requests extending
+      it are refused) until ``commit`` or ``abort``.
+    - ``commit`` (source): the destination has verified its import; release
+      the parked prefix. No rollback after this.
+    - ``abort`` (source): roll back -- unpark, the session resumes here.
+    - ``verify_import`` (destination): request-less check that every
+      manifest blob is present in this server's store and the model
+      identity matches. Runs rank-local on every scheduler.
+    """
+
+    action: str
+    token_ids: Optional[List[int]] = None
+    handover_id: Optional[str] = None
+    manifest_json: Optional[str] = None
+    deadline_s: float = 30.0
+
+
+class SessionHandoverReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    manifest_json: Optional[str] = None
+
+
 class VramBudgetReqInput(BaseReq, kw_only=True):
     """#330: dial one card's VRAM budget at runtime, or query the dial state.
 

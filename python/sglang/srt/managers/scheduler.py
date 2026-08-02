@@ -125,6 +125,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
     KvReshardReqOutput,
+    SessionHandoverReqInput,
+    SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -395,6 +397,11 @@ class Scheduler(
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
         self.kv_reshard_runtime = None
+        # #261 live session handover runtime: None on every default path;
+        # built lazily on the first /session_handover control request. The
+        # admission hook in handle_generate_request is a no-op while this
+        # is None or while no handover is active.
+        self.session_handover_runtime = None
         # #330 VRAM dial / KV capacity runtime: None on every default path;
         # built lazily on the first scheduler iteration when
         # --enable-vram-dial is set.
@@ -1751,6 +1758,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (KvReshardReqInput, self.handle_kv_reshard),
+                (SessionHandoverReqInput, self.handle_session_handover),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -2587,6 +2595,32 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # #261 live handover: a prefix parked for handover must not be
+        # extended while the destination may still commit. No-op on every
+        # default path (runtime is None until the first handover request,
+        # and returns immediately while no handover is active).
+        if (
+            self.session_handover_runtime is not None
+            and recv_req.input_ids is not None
+        ):
+            parked_msg = self.session_handover_runtime.parked_conflict(
+                recv_req.input_ids
+            )
+            if parked_msg is not None:
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(parked_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -4904,6 +4938,19 @@ class Scheduler(
             )
             success = False
         return success
+
+    def handle_session_handover(
+        self, recv_req: SessionHandoverReqInput
+    ) -> SessionHandoverReqOutput:
+        """#261 control plane: live session handover (export / commit /
+        abort on the source, verify_import on the destination). Runs on the
+        scheduler thread between iterations, so the snapshot is atomic with
+        respect to the radix tree; no collective is issued anywhere."""
+        if self.session_handover_runtime is None:
+            from sglang.srt.managers.session_handover import SessionHandoverRuntime
+
+            self.session_handover_runtime = SessionHandoverRuntime(self)
+        return self.session_handover_runtime.handle(recv_req)
 
     def handle_kv_reshard(self, recv_req: KvReshardReqInput) -> KvReshardReqOutput:
         """#297 control plane: arm a phase-boundary KV reshard.

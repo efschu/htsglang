@@ -222,6 +222,77 @@ def target_mamba_name(
     return f"{entry.key}.{MAMBA_POOL}_{base_suffix}_{tp_rank}_{tp_size}.bin"
 
 
+def target_draft_name(
+    entry: StoreEntry, base_suffix: str, tp_rank: int, tp_size: int
+) -> str:
+    """Draft pages are a component pool too: per-rank in every mode."""
+    return f"{entry.key}.{DRAFT_POOL}_{base_suffix}_{tp_rank}_{tp_size}.bin"
+
+
+# ---------------------------------------------------------------------------
+# Manifest scoping (#261 live handover)
+# ---------------------------------------------------------------------------
+
+
+def load_manifest(path: str) -> Dict:
+    """Load a session-handover manifest (see ``managers/session_handover``).
+
+    Only the key inventory is consumed here; identity/geometry checks belong
+    to the destination's verify-import step."""
+    import json
+
+    with open(path) as f:
+        manifest = json.load(f)
+    for field in ("kv_keys",):
+        if field not in manifest:
+            raise ValueError(f"manifest {path} has no '{field}' field")
+    return manifest
+
+
+def manifest_key_pairs(manifest: Dict) -> List[Tuple[str, Optional[str]]]:
+    """(page hash, pool-or-None) of every store blob the manifest names.
+
+    The leaf hash may legally appear twice -- once as a KV page and once as
+    the ``.mamba`` component -- so this is a pair list, not a hash map."""
+    pairs: List[Tuple[str, Optional[str]]] = [(k, None) for k in manifest["kv_keys"]]
+    mamba_key = manifest.get("mamba_key")
+    if mamba_key:
+        pairs.append((mamba_key.split(".")[0], MAMBA_POOL))
+    for draft_key in manifest.get("draft_keys") or []:
+        pairs.append((draft_key.split(".")[0], DRAFT_POOL))
+    return pairs
+
+
+def filter_entries_by_manifest(
+    entries: Sequence[StoreEntry], manifest: Dict
+) -> List[StoreEntry]:
+    """Restrict a store scan to exactly the manifest's blobs.
+
+    This is what makes the migration safe against a LIVE source store: the
+    manifest-listed files are complete and immutable (the session is parked;
+    store files are content-addressed and written atomically), while
+    everything else in the directory -- including files other sessions are
+    writing right now -- is ignored. A manifest key with no file behind it is
+    a hard error naming the key: a partial session state would be a
+    plausible-looking but wrong session, exactly like a partial GDN state.
+    """
+    wanted = set(manifest_key_pairs(manifest))
+    selected = [e for e in entries if (e.key, e.pool) in wanted]
+    present = {(e.key, e.pool) for e in selected}
+    missing = [
+        key if pool is None else f"{key}.{pool}"
+        for key, pool in manifest_key_pairs(manifest)
+        if (key, pool) not in present
+    ]
+    if missing:
+        raise ValueError(
+            f"manifest names {len(missing)} blob(s) absent from the source "
+            f"store: {missing[:8]}{' ...' if len(missing) > 8 else ''} -- "
+            "refusing to migrate a partial session"
+        )
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Mamba blob geometry
 # ---------------------------------------------------------------------------
@@ -433,6 +504,8 @@ def plan_migration(
     mamba_spec: Optional[MambaBlobSpec],
     dcp_owner_mode: bool = True,
     skip_pools: Sequence[str] = (DRAFT_POOL,),
+    draft_spec=None,
+    draft_key_rewrite: bool = False,
 ) -> MigrationPlan:
     """Full byte-provenance plan of the migration.
 
@@ -440,6 +513,14 @@ def plan_migration(
     target order -- the concatenation of the extents IS the target file. No
     step computes a value; the plan is a permutation of source bytes into
     target files, which is exactly what the unit proof checks.
+
+    Draft (``.draft``) pages are skipped by default (see the module
+    docstring: the skip-instead-of-rename verdict). To carry them, drop
+    ``DRAFT_POOL`` from ``skip_pools`` and pass EITHER a
+    ``draft_migrate.DraftBlobSpec`` (real head split) OR
+    ``draft_key_rewrite=True`` (the declared ``attn_kv_replicated``
+    configuration: bytes are rank-independent, every target rank gets a full
+    copy under its own suffix).
     """
     if len(target_ratios) != target_tp_size:
         raise ValueError(
@@ -485,6 +566,43 @@ def plan_migration(
                 name = target_mamba_name(e, base, rank, target_tp_size)
                 plan.append((os.path.join(target_dir, name), extents))
             continue
+        if e.pool == DRAFT_POOL:
+            if draft_spec is None and not draft_key_rewrite:
+                raise ValueError(
+                    f"draft page {os.path.basename(e.path)} is in scope but "
+                    "neither a DraftBlobSpec nor draft_key_rewrite was "
+                    "declared -- refusing to guess the draft layout"
+                )
+            if draft_key_rewrite:
+                # Declared attn_kv_replicated configuration: every rank holds
+                # all draft kv-heads, so the bytes are rank-independent and
+                # each target rank gets a full copy under its own suffix
+                # (whole-file fan-out; verify_plan checks each copy).
+                for rank in range(target_tp_size):
+                    name = target_draft_name(e, base, rank, target_tp_size)
+                    plan.append(
+                        (os.path.join(target_dir, name), [(e.path, 0, e.size)])
+                    )
+                continue
+            if e.size != draft_spec.total_bytes:
+                raise ValueError(
+                    f"draft blob {os.path.basename(e.path)} is {e.size} B but "
+                    f"the declared draft geometry implies "
+                    f"{draft_spec.total_bytes} B (layers={draft_spec.num_layers}, "
+                    f"kv_heads={draft_spec.num_kv_heads}, "
+                    f"head_dim={draft_spec.head_dim}, "
+                    f"itemsize={draft_spec.itemsize})"
+                )
+            from sglang.srt.mem_cache.draft_migrate import draft_extents
+
+            for rank in range(target_tp_size):
+                extents = [
+                    (e.path, off, length)
+                    for off, length in draft_extents(draft_spec, target_ratios, rank)
+                ]
+                name = target_draft_name(e, base, rank, target_tp_size)
+                plan.append((os.path.join(target_dir, name), extents))
+            continue
         raise ValueError(
             f"unhandled component pool '{e.pool}' in {os.path.basename(e.path)}"
         )
@@ -503,6 +621,8 @@ def plan_reverse_migration(
     dcp_owner_mode: bool = True,
     target_dcp_owner_mode: bool = False,
     skip_pools: Sequence[str] = (DRAFT_POOL,),
+    draft_spec=None,
+    draft_key_rewrite: bool = False,
 ) -> MigrationPlan:
     """Full byte-provenance plan of the N -> 1 handover (reassembly).
 
@@ -537,6 +657,7 @@ def plan_reverse_migration(
     # {(key, base): {rank: entry}} -- component pools arrive as one file per
     # rank and only become a target once the set is complete.
     mamba_groups: Dict[Tuple[str, str], Dict[int, StoreEntry]] = {}
+    draft_groups: Dict[Tuple[str, str], Dict[int, StoreEntry]] = {}
     for e in entries:
         if e.pool in skip_pools:
             continue
@@ -574,6 +695,24 @@ def plan_reverse_migration(
                 )
             group[rank] = e
             continue
+        if e.pool == DRAFT_POOL:
+            if draft_spec is None and not draft_key_rewrite:
+                raise ValueError(
+                    f"draft page {os.path.basename(e.path)} is in scope but "
+                    "neither a DraftBlobSpec nor draft_key_rewrite was "
+                    "declared -- refusing to guess the draft layout"
+                )
+            rank = _rank_of(e, source_tp_size)
+            base = strip_rank_suffix(e.suffix_rest, rank, source_tp_size)
+            group = draft_groups.setdefault((e.key, base), {})
+            if rank in group:
+                raise ValueError(
+                    f"two files claim rank {rank} of {e.key}.draft: "
+                    f"{os.path.basename(group[rank].path)} and "
+                    f"{os.path.basename(e.path)}"
+                )
+            group[rank] = e
+            continue
         raise ValueError(
             f"unhandled component pool '{e.pool}' in {os.path.basename(e.path)}"
         )
@@ -590,6 +729,66 @@ def plan_reverse_migration(
         extents = [(group[rank].path, off, length) for rank, off, length in layout]
         name = target_mamba_name(group[0], base, target_tp_rank, target_tp_size)
         plan.append((os.path.join(target_dir, name), extents))
+
+    if draft_groups:
+        from sglang.srt.mem_cache.draft_migrate import draft_reverse_extents
+
+        draft_shards = (
+            None
+            if draft_spec is None
+            else [
+                draft_spec.shard_for_rank(source_ratios, r)
+                for r in range(source_tp_size)
+            ]
+        )
+        draft_layout = (
+            None
+            if draft_spec is None
+            else draft_reverse_extents(draft_spec, source_ratios)
+        )
+        for (key, base), group in draft_groups.items():
+            missing = [r for r in range(source_tp_size) if r not in group]
+            if missing:
+                raise ValueError(
+                    f"cannot reassemble {key}.draft: rank blob(s) {missing} of "
+                    f"{source_tp_size} are absent. A partial draft state would "
+                    "be a plausible-looking but wrong draft KV, so this is "
+                    "fatal."
+                )
+            name = target_draft_name(group[0], base, target_tp_rank, target_tp_size)
+            if draft_key_rewrite:
+                # Replicated draft: every rank wrote the full blob; take rank
+                # 0's bytes for the single target. Size equality across ranks
+                # is the cheap declared-geometry check available here.
+                sizes = {group[r].size for r in range(source_tp_size)}
+                if len(sizes) != 1:
+                    raise ValueError(
+                        f"draft blobs of {key} differ in size across ranks "
+                        f"({sorted(sizes)} B) -- they cannot be the declared "
+                        "replicated configuration"
+                    )
+                plan.append(
+                    (
+                        os.path.join(target_dir, name),
+                        [(group[0].path, 0, group[0].size)],
+                    )
+                )
+                continue
+            for rank in range(source_tp_size):
+                want = draft_shards[rank].total_bytes
+                if group[rank].size != want:
+                    raise ValueError(
+                        f"draft shard {os.path.basename(group[rank].path)} is "
+                        f"{group[rank].size} B but rank {rank} of ratios "
+                        f"{list(source_ratios)} implies {want} B "
+                        f"(kv_heads={draft_shards[rank].num_kv_heads}) -- "
+                        "declared draft geometry does not match this store"
+                    )
+            extents = [
+                (group[rank].path, off, length)
+                for rank, off, length in draft_layout
+            ]
+            plan.append((os.path.join(target_dir, name), extents))
     return plan
 
 
@@ -658,7 +857,27 @@ def verify_plan(plan: MigrationPlan) -> Dict[str, int]:
     the plan, only at extents and bytes. One source cut across many targets
     (1 -> N) and many sources gathered into one target (N -> 1) are the same
     statement to it, which is what lets the round-trip gate reuse it twice.
+
+    One named allowance: a source whose EVERY use in the plan is a whole-file
+    extent used by several targets is a REPLICATION (rank-independent bytes
+    fanned out under per-rank keys -- the declared ``attn_kv_replicated``
+    draft configuration, or per-rank KV outside ``dcp_owner_mode``). Each
+    copy is still byte-checked against the source in full; only the
+    consumed-exactly-once rule is waived, because fan-out is not a
+    permutation. Partial-extent double consumption stays fatal.
     """
+    # Pre-classify replication fan-out: every use is (0, full file size) and
+    # there is more than one use.
+    uses: Dict[str, List[Tuple[int, int]]] = {}
+    for _target, extents in plan:
+        for src, off, length in extents:
+            uses.setdefault(src, []).append((off, length))
+    fanout_sources = {
+        src
+        for src, ranges in uses.items()
+        if len(ranges) > 1
+        and all(off == 0 and length == os.path.getsize(src) for off, length in ranges)
+    }
     per_source: Dict[str, bytearray] = {}
     checked = {"targets": 0, "bytes": 0, "sources": 0}
     for target, extents in plan:
@@ -679,6 +898,11 @@ def verify_plan(plan: MigrationPlan) -> Dict[str, int]:
                     f"{os.path.basename(target)} differs from "
                     f"{os.path.basename(src)}[{off}:{off + length}]"
                 )
+            if src in fanout_sources:
+                # Replication: byte identity per copy is checked above; the
+                # exactly-once rule does not apply to fan-out.
+                pos += length
+                continue
             seen = per_source.setdefault(src, bytearray(os.path.getsize(src)))
             # Slice-wise rather than byte-wise: the reverse direction plans
             # hundreds of extents over blobs of tens of MiB, and a Python-level
@@ -707,7 +931,7 @@ def verify_plan(plan: MigrationPlan) -> Dict[str, int]:
                 f"source {os.path.basename(src)}: {len(seen) - covered} B "
                 "never migrated"
             )
-    checked["sources"] = len(per_source)
+    checked["sources"] = len(per_source) + len(fanout_sources)
     return checked
 
 
@@ -767,6 +991,57 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
         help="after writing, re-read every target file and prove byte identity "
         "with its source extents (permutation gate)",
     )
+    p.add_argument(
+        "--manifest",
+        help="session-handover manifest (managers/session_handover): restrict "
+        "the migration to exactly the manifest's blobs. REQUIRED for a live "
+        "source store -- everything outside the manifest, including files "
+        "other sessions are writing right now, is ignored",
+    )
+    p.add_argument(
+        "--draft-spec-algorithm",
+        help="canonical speculative algorithm name whose draft state the "
+        "store carries (same names as --speculative-algorithm). Unknown "
+        "names are refused with the known list; algorithms without a "
+        "declared re-shard capability are refused with the reason",
+    )
+    p.add_argument(
+        "--draft-num-layers",
+        type=int,
+        help="the DRAFT model's layer count (independent of the target's)",
+    )
+    p.add_argument("--draft-kv-heads", type=int, help="total draft kv-head count")
+    p.add_argument("--draft-head-dim", type=int)
+    p.add_argument("--draft-itemsize", type=int, default=2)
+    p.add_argument(
+        "--draft-mem-layout",
+        default="layer_first",
+        help="the draft pool's hicache_mem_layout (page_head is refused: its "
+        "extent family is not built)",
+    )
+    p.add_argument(
+        "--draft-units",
+        type=int,
+        default=None,
+        help="indivisible unit count for the draft head split; default is "
+        "one unit per kv-head (head granularity)",
+    )
+    p.add_argument(
+        "--draft-kv-replicated",
+        action="store_true",
+        help="declared attn_kv_replicated draft configuration (TP exceeds the "
+        "draft's kv-head count): bytes are rank-independent, migration is a "
+        "per-rank key rewrite, no split. Not visible in the store, so it "
+        "must be declared",
+    )
+    p.add_argument(
+        "--draft-cold-start",
+        action="store_true",
+        help="explicitly accept that the draft pool starts cold on the "
+        "destination. In --manifest mode this (or --draft-spec-algorithm) is "
+        "MANDATORY when the manifest names draft blobs: silent skipping is "
+        "not available on the handover path",
+    )
     a = p.parse_args(argv)
 
     if a.reverse:
@@ -794,6 +1069,87 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     entries = scan_store(a.source_dir)
+    manifest = None
+    if a.manifest:
+        manifest = load_manifest(a.manifest)
+        entries = filter_entries_by_manifest(entries, manifest)
+
+    # Draft disposition (#261 second half). Default outside --manifest mode
+    # stays the documented skip; in --manifest mode a draft blob REQUIRES an
+    # explicit disposition -- never a silent skip on the handover path.
+    from sglang.srt.mem_cache.draft_migrate import (
+        DraftBlobSpec,
+        DraftReshardCapability,
+        DraftReshardError,
+        resolve_draft_reshard,
+    )
+
+    draft_entries = [e for e in entries if e.pool == DRAFT_POOL]
+    draft_spec = None
+    draft_key_rewrite = False
+    skip_pools: Tuple[str, ...] = (DRAFT_POOL,)
+    draft_disposition = "skipped (legacy default)"
+    if a.draft_spec_algorithm and a.draft_cold_start:
+        p.error("--draft-spec-algorithm and --draft-cold-start are mutually exclusive")
+    if a.draft_spec_algorithm:
+        try:
+            verdict = resolve_draft_reshard(a.draft_spec_algorithm)
+        except DraftReshardError as err:
+            p.error(str(err))
+        if verdict.capability is DraftReshardCapability.REFUSE:
+            p.error(
+                f"draft re-shard refused for {verdict.algorithm}: {verdict.reason}"
+            )
+        if verdict.capability is DraftReshardCapability.NO_DRAFT_KV:
+            if draft_entries:
+                p.error(
+                    f"{verdict.algorithm} declares no draft KV state "
+                    f"({verdict.reason}), but the store holds "
+                    f"{len(draft_entries)} .draft blob(s) -- the declaration "
+                    "contradicts the store; refusing to guess which is wrong"
+                )
+            draft_disposition = f"none ({verdict.algorithm} has no draft KV)"
+        elif a.draft_kv_replicated:
+            skip_pools = ()
+            draft_key_rewrite = True
+            draft_disposition = (
+                f"key rewrite ({verdict.algorithm}, declared attn_kv_replicated)"
+            )
+        else:
+            if (
+                a.draft_num_layers is None
+                or a.draft_kv_heads is None
+                or a.draft_head_dim is None
+            ):
+                p.error(
+                    "--draft-spec-algorithm needs --draft-num-layers, "
+                    "--draft-kv-heads and --draft-head-dim (or "
+                    "--draft-kv-replicated for the replicated configuration)"
+                )
+            try:
+                draft_spec = DraftBlobSpec(
+                    num_layers=a.draft_num_layers,
+                    num_kv_heads=a.draft_kv_heads,
+                    head_dim=a.draft_head_dim,
+                    itemsize=a.draft_itemsize,
+                    mem_layout=a.draft_mem_layout,
+                    units=a.draft_units,
+                )
+            except DraftReshardError as err:
+                p.error(str(err))
+            skip_pools = ()
+            draft_disposition = f"re-shard ({verdict.algorithm})"
+    elif a.draft_cold_start:
+        draft_disposition = "cold start (declared)"
+    elif manifest is not None and draft_entries:
+        p.error(
+            f"the manifest names {len(draft_entries)} draft blob(s); declare "
+            "a disposition: --draft-spec-algorithm NAME (re-shard, or refusal "
+            "with the algorithm's reason) or --draft-cold-start (draft pool "
+            "starts cold on the destination). Silent skipping is not "
+            "available on the handover path."
+        )
+
     os.makedirs(a.target_dir, exist_ok=True)
     if a.reverse:
         plan = plan_reverse_migration(
@@ -805,6 +1161,9 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
             target_tp_size=a.target_tp_size,
             mamba_spec=spec,
             dcp_owner_mode=not a.no_dcp_owner_mode,
+            skip_pools=skip_pools,
+            draft_spec=draft_spec,
+            draft_key_rewrite=draft_key_rewrite,
         )
     else:
         plan = plan_migration(
@@ -816,6 +1175,9 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
             target_ratios=ratios,
             mamba_spec=spec,
             dcp_owner_mode=not a.no_dcp_owner_mode,
+            skip_pools=skip_pools,
+            draft_spec=draft_spec,
+            draft_key_rewrite=draft_key_rewrite,
         )
     kv = sum(1 for e in entries if e.is_kv)
     mamba = sum(1 for e in entries if e.pool == MAMBA_POOL)
@@ -827,8 +1189,10 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(
         f"source {a.source_dir} [{direction}]: {kv} KV pages, "
-        f"{mamba} mamba blobs, {skipped} skipped (draft/other) -> "
-        f"{len(plan)} target files"
+        f"{mamba} mamba blobs, {len(draft_entries)} draft blobs "
+        f"[{draft_disposition}], {skipped - len(draft_entries)} other "
+        f"skipped -> {len(plan)} target files"
+        + (f" (manifest-scoped: {a.manifest})" if manifest is not None else "")
     )
     if spec is not None:
         side = "source" if a.reverse else "target"
