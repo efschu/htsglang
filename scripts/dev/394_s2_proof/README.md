@@ -10,19 +10,25 @@ four can-fail arms). What only a boot can show is in this directory.
 |---|---|
 | `preflight.sh` | `/dev/shm` is large enough and clean, the NVML rank→card table is what the arm's `--rank-gpu-id` is derived from, and the ratio resolves from a MEASURED probe rather than the nameplate |
 | `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` / `ARM=compute-cal` (slice 3: the compute assignment moves) |
+| `run_arm.sh` | drives ONE arm end to end: boot, bounded readiness loop, facts, bench generations, `read_arm.py`, teardown with a VRAM check |
 | `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, and the share that came from a peer's segment |
-| `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, and what must be read out |
+| `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, what must be read out, and the confirmation-window spec |
 
 ## Run order
 
 ```
 bash scripts/dev/394_s2_proof/preflight.sh          # must print PREFLIGHT OK
-ARM=equal        bash scripts/dev/394_s2_proof/boot_ab.sh
-# ... bounded curl -m readiness loop, then the bench-length generations ...
-python3 scripts/dev/394_s2_proof/read_arm.py <run> equal
-ARM=proportional bash scripts/dev/394_s2_proof/boot_ab.sh
-python3 scripts/dev/394_s2_proof/read_arm.py <run> proportional
+bash scripts/dev/394_s2_proof/run_arm.sh equal
+bash scripts/dev/394_s2_proof/run_arm.sh proportional
 ```
+
+`run_arm.sh` EXPORTS the arm, and `boot_ab.sh` refuses an unset one. Both are
+#439 scar tissue: the 2026-08-02 ARM3 battery drove `boot_ab.sh` from an ad-hoc
+driver that assigned `ARM` without exporting it, `boot_ab.sh` defaulted to
+`equal`, and every arm booted the baseline. Nothing in the output says so — an
+A/B between two baselines reports a clean null. `DRY_RUN=1` prints the resolved
+arm and the launch argv instead of launching, which is how
+`test_expert_compute_placement_439` pins the propagation without a GPU.
 
 `/dev/shm` first, always. The reference rig was remounted 63 → 96 GiB on
 2026-08-02 to fit an ~88 GiB cold tier and **that remount does not survive a
@@ -70,8 +76,15 @@ worth having either way. The measurement uses bench-length generations
 
 Per-card free VRAM ≥ 400 MiB, no single registered posting wasting > 1.5 GiB
 net. The cold tier lives in host DRAM, so do not tighten
-`--rank-auto-reserve-mib` to buy it headroom — it does not need VRAM. Run at
-the reserve validated for this recipe (`2200,1400,1400`).
+`--rank-auto-reserve-mib` to buy it headroom — it does not need VRAM. The
+scripts default to the reserve arms 1 and 2 were measured at
+(`RESERVE_MIB=2200,1400,1400`). That reserve left both 3080s at ~515 MiB free
+on the 2026-08-02 equal arm — inside the corridor by 115 MiB, and the same
+margin the #439 residency defect overran — so the slice-3 confirmation window
+runs at `RESERVE_MIB=auto` instead (`ARM3_COMPUTE.md`, "Confirmation window").
+Whichever is chosen, every arm in one window uses the SAME value: the reserve
+moves the KV pool, so a reserve that differs between arms is a second
+treatment.
 
 ## Graph path
 

@@ -63,17 +63,49 @@ REPO_ROOT="${REPO_ROOT:?set REPO_ROOT or provide /root/rig-env.sh}"
 VENV="${VENV:?set VENV}"
 MODEL_ROOT="${MODEL_ROOT:?set MODEL_ROOT}"
 WT="${WT:-$(dirname "$REPO_ROOT")/wt-394-s2}"
-ARM="${ARM:-equal}"
+# The arm comes from the environment, or from $1 for a caller that passes it
+# positionally. It is NOT defaulted to "equal" any more (#439): a driver that
+# set ARM without exporting it ran four arms of a battery and booted the
+# baseline every time, and the only symptom was a delta of zero between two
+# baselines. An unnamed arm is a refusal, and every arm names itself in the
+# facts file below.
+ARM="${ARM:-${1:-}}"
+if [ -z "$ARM" ]; then
+  echo "FAIL ARM is not set. Pass it in the environment (ARM=compute bash" >&2
+  echo "     boot_ab.sh) or as \$1. It is deliberately not defaulted: a" >&2
+  echo "     silent fall back to the baseline is how an A/B reports a null" >&2
+  echo "     that was never tested." >&2
+  exit 2
+fi
 PORT="${PORT:-30394}"
 RUN="${RUN:-/spinning/gpu-battery-results/$(date +%F)_394_s2}"
 GGUF_DIR="${GGUF_DIR:-$MODEL_ROOT/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS}"
+# Defaults are the recipe arms 1 and 2 were measured at, verbatim. Both are
+# overridable because the #439 confirmation window runs at
+# RESERVE_MIB=auto (see ARM3_COMPUTE.md, "Confirmation window"): the pinned
+# 2200,1400,1400 left the two 3080s at ~515 MiB free on the equal arm, which is
+# above the 400 MiB corridor floor but is the same thin margin the residency
+# defect overran. Whatever is chosen, every arm in one window must use the SAME
+# value -- the reserve moves the KV pool, and a reserve that differs between
+# arms is a second treatment.
+RESERVE_MIB="${RESERVE_MIB:-2200,1400,1400}"
+# The solve holds the resident mass fixed against the BASE plan, so this value
+# is part of the treatment definition: changing it between arms changes what is
+# being compared.
+RESIDENT_FRACTION="${RESIDENT_FRACTION:-0.485,0.42,0.42}"
 # Derive from preflight.sh's NVML table. NEVER a fixed assumption: NVML order
 # and CUDA order differ on this rig and can shift between boots.
 RANK_GPU_ID="${RANK_GPU_ID:-0,1,2}"
 
 mkdir -p "$RUN"
 
-if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+# DRY_RUN=1 resolves the arm and PRINTS the launch command instead of running
+# it. That makes "does this arm's treatment actually reach the server?" a
+# question a test can ask without a GPU -- see test_expert_compute_placement_439
+# (TestTheArmHarnessCarriesTheArm), whose can-fail arm drops the export.
+DRY_RUN="${DRY_RUN:-0}"
+
+if [ "$DRY_RUN" != "1" ] && ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   echo "FAIL port $PORT is already in use" >&2
   exit 1
 fi
@@ -145,19 +177,28 @@ case "$ARM" in
     ;;
 esac
 
-setsid "$VENV/bin/python" -u -m sglang.launch_server \
-  --model-path "$GGUF_DIR/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf" \
-  --tp-size 3 --rank-gpu-id "$RANK_GPU_ID" --rank-tp-ratio auto \
-  --rank-auto-reserve-mib 2200,1400,1400 \
-  --rank-moe-resident-fraction 0.485,0.42,0.42 \
-  --kv-cache-dtype fp8_e4m3 \
-  --context-length 8192 --max-running-requests 1 \
-  --chunked-prefill-size 512 \
-  --disable-cuda-graph \
-  --trust-remote-code --enable-metrics \
-  "${ARM_ARGS[@]+"${ARM_ARGS[@]}"}" \
-  --host 127.0.0.1 --port "$PORT" \
-  > "$RUN/boot_$ARM.log" 2>&1 &
+LAUNCH=(
+  "$VENV/bin/python" -u -m sglang.launch_server
+  --model-path "$GGUF_DIR/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
+  --tp-size 3 --rank-gpu-id "$RANK_GPU_ID" --rank-tp-ratio auto
+  --rank-auto-reserve-mib "$RESERVE_MIB"
+  --rank-moe-resident-fraction "$RESIDENT_FRACTION"
+  --kv-cache-dtype fp8_e4m3
+  --context-length 8192 --max-running-requests 1
+  --chunked-prefill-size 512
+  --disable-cuda-graph
+  --trust-remote-code --enable-metrics
+  "${ARM_ARGS[@]+"${ARM_ARGS[@]}"}"
+  --host 127.0.0.1 --port "$PORT"
+)
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "ARM=$ARM"
+  printf '%s\n' "${LAUNCH[*]}"
+  exit 0
+fi
+
+setsid "${LAUNCH[@]}" > "$RUN/boot_$ARM.log" 2>&1 &
 echo $! > "$RUN/boot_$ARM.launchpid"
 echo "launched ARM=$ARM pid=$(cat "$RUN/boot_$ARM.launchpid") port=$PORT run=$RUN"
 echo "next: wait for readiness with a BOUNDED curl -m loop, then read_arm.py"

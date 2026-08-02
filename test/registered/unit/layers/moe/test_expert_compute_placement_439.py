@@ -26,6 +26,12 @@ What is pinned here, and why each pin exists:
   ranges under the #82 expert-dim shard must stay >= 1 expert per rank, sum to
   the expert count exactly, and be disjoint and gapless (#109 MMQ-OOB family,
   #112 ``moe.cuh`` nrows binding, #80 combine correctness).
+* **The three defects the 2026-08-02 ARM3 battery hit** (#439), each with the
+  can-fail arm that reproduces it: the resolver reading the resident fraction
+  as ``1.0`` because it ran before the launch arguments were published; the
+  runtime sizing residency off the SOLVED expert count instead of the base
+  plan's, which broke the VRAM-neutrality the whole arm rests on; and the arm
+  harness not carrying the arm into the boot command.
 
 Hermetic: no GPU, no NVML, no model, no shared memory. Every hardware fact is
 injected.
@@ -1404,6 +1410,114 @@ class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
             "self._expert_offload_fraction = resident_fraction_held_at_base_plan(",
             source,
         )
+
+
+class TestTheArmHarnessCarriesTheArm(CustomTestCase):
+    """Defect 3 of the ARM3 battery: every arm booted the baseline.
+
+    The battery's driver assigned ``ARM`` without EXPORTING it, and
+    ``boot_ab.sh`` read ``ARM`` from the environment with a default of
+    ``equal``. So the treatment arms ran the baseline, and the failure mode is
+    invisible in the output: an A/B between two baselines reports a clean null.
+
+    Executed rather than grepped -- the point is that the arm reaches the
+    launch command line. ``DRY_RUN=1`` resolves the arm and prints the argv
+    instead of launching, so this needs no GPU, no model and no port.
+    """
+
+    @staticmethod
+    def _root():
+        import pathlib
+
+        return pathlib.Path(__file__).resolve().parents[5]
+
+    def _dry_run(self, script_env, arm_prefix=""):
+        import subprocess
+        import tempfile
+
+        root = self._root()
+        with tempfile.TemporaryDirectory() as run:
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "REPO_ROOT": str(root),
+                "VENV": "/nonexistent/venv",
+                "MODEL_ROOT": "/nonexistent/models",
+                "WT": str(root),
+                "RUN": run,
+                "DRY_RUN": "1",
+            }
+            env.update(script_env)
+            return subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    arm_prefix + f'bash "{root}/scripts/dev/394_s2_proof/boot_ab.sh"',
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+    def test_an_exported_arm_reaches_the_launch_command(self):
+        done = self._dry_run({"ARM": "compute"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("ARM=compute", done.stdout)
+        self.assertIn("--rank-moe-ratio link", done.stdout)
+
+    def test_can_fail_an_unexported_arm_no_longer_silently_becomes_the_baseline(self):
+        """The battery's exact mistake, run.
+
+        Before the fix this printed a baseline launch line and exited 0. It
+        must now refuse: an unnamed arm is a refusal, not the baseline.
+        """
+        done = self._dry_run({}, arm_prefix="ARM=compute; ")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("ARM is not set", done.stderr)
+        self.assertNotIn("--rank-moe-ratio link", done.stdout)
+
+    def test_the_baseline_arm_carries_no_treatment_flag(self):
+        done = self._dry_run({"ARM": "equal"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("ARM=equal", done.stdout)
+        self.assertNotIn("--rank-moe-ratio", done.stdout)
+
+    def test_an_unknown_arm_is_refused_by_name(self):
+        done = self._dry_run({"ARM": "not-an-arm"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("unknown ARM", done.stderr)
+
+    def test_the_driver_in_the_repo_exports_the_arm(self):
+        """Call-site pin on the file the battery could not find in the repo.
+
+        The 2026-08-02 window drove ``boot_ab.sh`` from an ad-hoc copy because
+        there was no driver here to use. There is one now, and it exports.
+        """
+        script = (self._root() / "scripts/dev/394_s2_proof/run_arm.sh").read_text()
+        self.assertIn("export ARM", script)
+        self.assertIn('ARM="${1:?', script)
+        # Every variable boot_ab.sh reads from the environment must be
+        # exported here, not merely assigned -- a plain assignment reaches
+        # this script's own body and nothing else, which is the same defect
+        # one line further up.
+        for name in ("REPO_ROOT", "VENV", "WT", "PORT", "RUN"):
+            with self.subTest(variable=name):
+                self.assertRegex(script, rf"(?m)^export {name}=")
+                self.assertNotRegex(script, rf"(?m)^{name}=")
+
+    def test_the_reserve_and_the_fraction_are_one_value_per_window(self):
+        """Both arms of a window must launch with the SAME reserve.
+
+        The reserve moves the KV pool, so a reserve that differs between arms
+        is a second treatment. Parameterised (the confirmation window runs at
+        ``RESERVE_MIB=auto``), but read from ONE variable used by every arm.
+        """
+        script = (self._root() / "scripts/dev/394_s2_proof/boot_ab.sh").read_text()
+        self.assertEqual(script.count("--rank-auto-reserve-mib"), 1)
+        self.assertIn('--rank-auto-reserve-mib "$RESERVE_MIB"', script)
+        self.assertIn('--rank-moe-resident-fraction "$RESIDENT_FRACTION"', script)
+        done = self._dry_run({"ARM": "compute", "RESERVE_MIB": "auto"})
+        self.assertIn("--rank-auto-reserve-mib auto", done.stdout)
 
 
 if __name__ == "__main__":
