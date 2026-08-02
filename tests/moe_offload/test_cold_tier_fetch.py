@@ -34,6 +34,7 @@ Run:
 """
 
 import os
+import pathlib
 import sys
 
 import pytest
@@ -82,9 +83,22 @@ def _tier(tmp_path, monkeypatch):
     monkeypatch.setenv(COLD_TIER_INSTANCE_ENV, INSTANCE)
     monkeypatch.delenv("SGLANG_MOE_HOST_SHARD_RATIO", raising=False)
     monkeypatch.delenv("SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE", raising=False)
+    # Verify the redirection instead of trusting it. This file creates real
+    # segments with real mmaps; the ONE path on which that is not hermetic is
+    # the module default, ``/dev/shm``, which on a shared box is a live
+    # resource other sessions are measuring against. A test added later
+    # without this fixture, or a rename of the env var, must fail here rather
+    # than in somebody else's tmpfs budget.
+    assert cts.shm_dir() == str(tmp_path), (
+        f"cold-tier tests would write {cts.shm_dir()!r}, not the tmp path. "
+        "Hermetic tests never touch a shared-resource default."
+    )
     ctf.reset_for_tests()
     yield
     ctf.reset_for_tests()
+    assert not list(
+        pathlib.Path("/dev/shm").glob("sgl-cold-*")
+    ), "a cold-tier test leaked a segment into the real /dev/shm"
 
 
 def _ratio(h2d=None):
