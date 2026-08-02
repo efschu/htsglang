@@ -4,7 +4,7 @@ Decode path uses the existing ``cutedsl_fused_sigmoid_gating_delta_rule_update``
 (works on SM90+).
 
 Prefill (extend) path uses the ported vLLM SM100 chunkwise kernel
-(``chunk_gated_delta_rule_cutedsl``). Requires SM100+ and ``head_k_dim == 128``.
+(``chunk_gated_delta_rule_cutedsl``). Requires SM100/SM103 and ``head_k_dim == 128``.
 """
 
 import logging
@@ -16,22 +16,30 @@ from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rul
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import cuda_sm_at_least, get_cuda_sm
+from sglang.srt.utils import cuda_sm_in_range, get_cuda_sm
 
 logger = logging.getLogger(__name__)
 
 
-def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell) where the ported kernel is valid.
+def _supports_cutedsl_prefill() -> bool:
+    """True iff this is an SM10x part, the family this prefill kernel targets.
 
-    "Blackwell" is an NVIDIA statement, so it is asked in the NVIDIA namespace
-    (#171). The bare ``major >= 10`` this replaces was vendor-blind and the
-    namespaces collide: gfx1030 reports ``(10, 3)`` -- the same integer as a
-    B300 -- and gfx1100 reports ``(11, 0)``, so RDNA2/RDNA3 cards identified
-    as Blackwell and were routed into a tcgen05/TMA kernel that cannot exist
-    on them.
+    Two separate namespace traps meet here.
+
+    Vendor (#171): "Blackwell" is an NVIDIA statement, so it is asked in the
+    NVIDIA namespace. The bare ``major >= 10`` this replaces was vendor-blind
+    and the namespaces collide: gfx1030 reports ``(10, 3)`` -- the same
+    integer as a B300 -- and gfx1100 reports ``(11, 0)``, so RDNA2/RDNA3 cards
+    identified as Blackwell and were routed into a tcgen05/TMA kernel that
+    cannot exist on them.
+
+    Family: within NVIDIA, "SM100 or newer" is still too wide. The ported
+    chunk kernel is validated on the datacenter SM100/SM103 parts only.
+    Consumer Blackwell reports ``(12, 0)``, which is >= 10 but is a different
+    architecture -- an open upper bound silently routes an RTX 50-series card
+    into the same tcgen05 path. Hence a half-open range, not a floor.
     """
-    return cuda_sm_at_least(10)
+    return cuda_sm_in_range((10, 0), (11, 0))
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -39,15 +47,16 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).
     Extend (prefill): chunkwise ``chunk_gated_delta_rule_cutedsl``
-    (SM100+ only, ``head_k_dim`` must be 128). On SM90 the prefill path is
-    unsupported; callers should query :attr:`supports_prefill` and fall back
-    to another backend (e.g. Triton).
+    (SM100/SM103 only, ``head_k_dim`` must be 128). On every other
+    architecture the prefill path is unsupported; callers should query
+    :attr:`supports_prefill` and fall back to another backend (e.g. Triton).
     """
 
     def __init__(self):
-        # The Blackwell extend kernel uses tcgen05/TMA-bulk-swizzle features
-        # that don't exist on SM90. The decode kernel does work on SM90+.
-        self.supports_prefill = _is_blackwell()
+        # The SM10x extend kernel uses tcgen05/TMA-bulk-swizzle features that
+        # neither SM90 nor consumer Blackwell (SM12x) provides in this form.
+        # The decode kernel does work on SM90+.
+        self.supports_prefill = _supports_cutedsl_prefill()
 
         # Heavy CuteDSL imports are deferred to extend() so SM90 boxes can
         # still construct the kernel just for decode.
@@ -61,7 +70,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         if not self.supports_prefill:
             sm = get_cuda_sm()
             raise RuntimeError(
-                "CuTe DSL GDN prefill requires SM100+ (Blackwell); got "
+                "CuTe DSL GDN prefill requires SM100/SM103; got "
                 + (f"SM{sm}." if sm is not None else "a non-NVIDIA device.")
             )
         if head_k_dim != 128:
@@ -77,7 +86,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         self._extend_fn = chunk_gated_delta_rule_cutedsl
         self._prepare_meta_fn = prepare_metadata_cutedsl
         self._l2norm_fn = l2norm_fwd
-        logger.info("Using CuTe DSL GDN prefill (Blackwell)")
+        logger.info("Using CuTe DSL GDN prefill (SM10x)")
 
     def decode(
         self,

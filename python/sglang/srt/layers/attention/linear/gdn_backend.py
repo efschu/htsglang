@@ -143,15 +143,16 @@ class GDNKernelDispatcher:
                 )
 
                 cutedsl_kernel = CuteDSLGDNKernel()
-            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
-            # On SM90 (Hopper) fall back to Triton so users can pick
+            # The CuteDSL prefill kernel is validated on SM100/SM103 only.
+            # Everywhere else -- SM90 (Hopper) below it, consumer Blackwell
+            # (SM12x) above it -- fall back to Triton so users can pick
             # `cutedsl` uniformly across hardware.
             if cutedsl_kernel.supports_prefill:
                 self.extend_kernel = cutedsl_kernel
             else:
                 rank0_log(
                     "CuTe DSL GDN prefill is not supported on this GPU "
-                    "(requires SM100+). Falling back to Triton for prefill."
+                    "(requires SM100/SM103). Falling back to Triton for prefill."
                 )
                 self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
@@ -327,9 +328,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
+                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            )
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()

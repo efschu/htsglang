@@ -933,7 +933,42 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x):
-        return self.forward_native(x)
+        # The fused kernels read the weight in the activation dtype and do not
+        # validate it. `self.weight` is `nn.Parameter(torch.zeros(dim))`, so its
+        # dtype follows whatever default was in effect at construction; under
+        # the loader's `set_default_torch_dtype` that matches the activations,
+        # but a module built outside that context keeps an fp32 weight and the
+        # kernel then returns NaNs instead of raising. Fall back to the eager
+        # path in that case rather than silently producing garbage.
+        #
+        # `_has_sgl_rmsnorm` is the same guard RMSNorm and Gemma4RMSNorm carry:
+        # the import at the top of this file binds `gemma_rmsnorm` to None when
+        # sgl_kernel is absent, which it is on any CUDA GPU below sm_80
+        # (sgl_kernel's gencode floor). Without it the call below would raise
+        # "TypeError: 'NoneType' object is not callable" inside the model
+        # forward on a Turing rank.
+        if (
+            not _has_sgl_rmsnorm
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or self.weight.dtype != x.dtype
+            or self.weight.device != x.device
+            or x.shape[-1] != self.weight.numel()
+        ):
+            return self.forward_native(x)
+
+        if x.dim() == 2:
+            return gemma_rmsnorm(x, self.weight.data, self.eps)
+
+        # q_norm / k_norm are called with [tokens, heads, head_dim]. RMSNorm
+        # reduces over the last dimension only, so flattening the leading
+        # dimensions and restoring the shape afterwards is exact.
+        # `reshape` returns a view when the strides allow it, and that view is
+        # not always contiguous -- e.g. a slice along the last dimension keeps a
+        # row stride wider than the row. The kernel happens to honour a row
+        # stride today; `contiguous()` is a no-op for the shapes the model
+        # actually produces and removes the dependency on that detail.
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view_as(x)
 
     def forward_npu(self, x):
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
