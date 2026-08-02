@@ -45,8 +45,26 @@ every top-level public definition against a token index of the whole tree,
 partitioned production/test, and rank modules by the fraction of their public
 API that nothing in production references.
 
-Detectors B and C, and the formal calibration runs, were executed by a
-dedicated sub-audit; A and D are recorded here.
+Two refinements are load-bearing and were only found by running the
+calibration:
+
+- **Forwarding taint (B).** A call site that passes `foo=foo` proves nothing
+  when `foo` is the enclosing function's own always-default parameter; it
+  moves the question one frame up. B iterates a fixed point over that
+  relation. Without it, #394 is classified WIRED.
+- **Docstring stripping (B2).** Matched against raw source,
+  `resolve_host_shard_ratio` reads as `has-measured-source` purely because its
+  docstring says "an explicit, measured vector always wins" while every actual
+  source was a nameplate query. B2 unparses the AST with docstrings removed.
+
+Everything here is static analysis. Nothing was executed, no test of the
+audited code was run, no server was booted; the only tests run are this
+audit's own pins.
+
+The four detectors are committed under `scripts/dev/audit_421/` with a README
+covering invocation and the calibration contract, so this table can be
+regenerated against a later tip. A finding list without a runnable detector
+ages into folklore.
 
 ### 1.1 Verification discipline
 
@@ -95,14 +113,62 @@ found *two previously unrecorded* instances of the identical shape (F1 and F2
 below), which is the stronger evidence: the method is not merely
 re-recognising a case it was told about.
 
-**Calibration 1 (#197, asymmetric gate): NOT caught by Detectors A or D, by
-construction.** `SGLANG_GGUF_DENSE_VOCAB` had — and has — many production
-consumers, so every consumer-count and module-reachability method classifies
-it WIRED. This is the honest limitation that motivated Detector C, and it is
-stated here as a negative result rather than glossed: **the sweep recorded in
-this document would not have found #197.** The Detector C run against
-`ef6f8bc0a2^` is a separate sub-audit; until its result is folded in, treat
-partial-wiring defects as uncovered by this audit.
+**Calibration 1 (#197, asymmetric gate): PASSED — but only by Detector C.**
+`SGLANG_GGUF_DENSE_VOCAB` had, and has, many production consumers, so every
+consumer-count and module-reachability method classifies it WIRED: **the
+Detector A/D sweep recorded in §3–§6 would not have found #197.** Detector C,
+run against `ef6f8bc0a2^`, does find it, and finds it without being told the
+answer:
+
+1. The gate's own docstring (`model_loader/gguf_qwen35.py:49-62`) names both
+   halves on one line — "embed_tokens/lm_head are built with the GGUF
+   quant_config". The detector harvests `{embed_tokens, lm_head}` from that
+   text because both also exist as assignment targets in the tree.
+2. `embed_tokens` reaches the gate (`models/qwen3_5.py:1391-1399` branches on
+   `gguf_dense_vocab()` before constructing it).
+3. `lm_head` does not: `models/qwen3_vl.py:1280/1288` constructs
+   `ParallelLMHead(quant_config=quant_config)` and never mentions the gate.
+   The site is in scope because `Qwen3_5ForConditionalGeneration` inherits
+   that constructor — the inheritance edge is exactly what makes the two sites
+   structurally parallel.
+
+At HEAD the same command reports no strong candidate: `ef6f8bc0a2` added the
+`lm_head_quant_config = None if gguf_dense_vocab()` branch, so `lm_head` now
+has an honoured site. Correct negative.
+
+**Calibration 2 (#394): PASSED on both halves, by three independent routes.**
+
+- Detector D surfaced `layers/moe/cold_tier_shm.py` unprompted (§3, F4).
+- Detector B at `d71e7133d2` classifies the apportionment chain TEST-ONLY: the
+  only two callers of `cold_shard_context()` in the whole tree are two lines
+  of a unit test, so every `cold_shard=` argument in production is absent.
+  **The forwarding-taint pass is what makes this work** — a naive per-call-site
+  counter calls `plan_load_time_staging.cold_shard` WIRED because
+  `expert_offload.py:2358` does pass `cold_shard=cold_shard`, but that
+  argument is the enclosing function's own always-default parameter, so it
+  only moves the question one frame up. The untainted version was run first
+  and printed WIRED: without the fixed point over the forwarding relation the
+  detector would have missed #394.
+- Detector B2 catches the *degenerate derivation* half. At `d71e7133d2` the
+  only non-env source of the per-rank weight vector was
+  `nvmlDeviceGetMaxPcieLinkGeneration` / `…MaxPcieLinkWidth` — the card's
+  nameplate maximum, not the trained link. Every element is the same pure
+  function of a per-device capability constant, so on any rig whose cards
+  share a nameplate the vector is constant, `_normalize_weights` yields
+  `(1/n, …)`, `is_equal` is true, `cold_shard_context()` returns `None`, and
+  the feature disables itself. B2 reports the *precondition* ("constant on any
+  rig whose devices share a nameplate"), not a runtime value. At HEAD:
+  0 rows, both reclassified `has-measured-source` — `a2b21c2880` put the
+  measured H2D probe ahead of the nameplate.
+
+More convincing than either calibration: the same detector pair then found
+*previously unrecorded* instances of both shapes (F1, F2, F8, F9). The method
+is not merely re-recognising cases it was told about.
+
+**The transferable lesson: consumer counting finds absent wiring, never
+partial wiring.** A codebase with escape-hatch flags needs the doc-coverage
+check (C) and the forwarding-taint check (B) as separate passes; neither falls
+out of a reference count.
 
 The general lesson: **consumer counting finds absent wiring, never partial
 wiring.** A codebase with escape-hatch flags needs the doc-coverage check as
@@ -119,6 +185,8 @@ a separate pass.
 | F5 | `layers/fused_qk_norm.py` | DEAD | Triton fused Q/K RMSNorm ported from ATOM. No importer anywhere in the tree. The similarly-named live path is `layers/fused_qk_norm_rope_store.py`, used by `models/deepseek_v4.py`; the two are unrelated. | Low | S (delete) |
 | F6 | #407 memtier registry | INERT | `srt/memtier/` (registry, tiers, probe, profile, reservations): zero production importers and zero production symbol references outside its own package. `SGLANG_MEMTIER_PROFILE` is read at `memtier/profile.py:361`, on a path a serving process never executes. Found independently by module reachability and by the env triage. | Medium | L |
 | F7 | `SGLANG_BARLINK_PP_TRANSPORT` | DEAD | Present only as a successor value in the retired-name guard (`barlink_env_guard.py:122`) and in a design doc. Not among the `_e()` suffixes read by `barlink_matrix.load_config`. The retired predecessor `SGLANG_HTCCL_PP_TRANSPORT` was introduced by the rename commit `6a5f307260` itself and never had a reader either. | Low | S |
+| F8 | `presplit_expert_offload_after_repack(cold_shard=…)` — the #394 policy's *second* load-time door | TEST-ONLY | `layers/moe/expert_offload.py:3086`, 14 call sites; the only one passing a real value is a unit test. The four production callers (`fp8.py`, `gptq_moe.py`, `awq_moe.py`, internal) all omit it, and the docstring concedes it: *"With no `cold_shard` (every caller today: fp8.py, gptq_moe.py, awq_moe.py)"*. `a2b21c2880` wired the GGUF door (`fused_moe_triton/layer.py:1460,2505`) and not this one, so link-proportional cold sharding is live for GGUF MoE only — while the merge message claims both halves "take their layout from ONE plan object". | Medium | S, with a caveat: the docstring says `cold_shard` is only legal on a layer that shards experts on dim 0, so the right fix may be an explicit refusal rather than a wiring. |
+| F9 | `PathProfile.transport_hint` | INERT | `distributed/device_communicators/barlink_path_dispatcher.py:92`. Ten construction sites, four of them production (`barlink_path_rates.py:81,217,304,400`); none passes `transport_hint`. It *is* read in production (`:222`, `:456`), so the barlink `_select` actuation hook is always handed `None`. The field comment concedes it: *"Paths without a hint can win a comparison but not (yet) be acted on there."* | Low–Medium | M |
 
 Severity is "what does an operator lose": F1 and F2 are advertised in CLI
 help text and silently do nothing (F2) or crash late (F1), which is why they
@@ -216,6 +284,9 @@ alternative is a comment saying why it is kept.
 | A (environ.py) | 0 DEAD, 0 test-only, of 96 | 0 | Every declared env has a real consumer; the interesting env work is in the *undeclared* set (§6). |
 | A (undeclared envs) | 426 raw → 284 fork-added | 2 (F6 env, F7) | 118 turned out to be a live rejection list; 19 artefacts; 9 apparent orphans were prefix-concatenated reads. |
 | D (module reachability) | 508 no-external-ref + 619 test-only names; 1 module at 100 % | 5 (F1, F3, F4, F5, F6) | Raw name-level output is dominated by Triton kernels, `_ref` test oracles, exception classes and re-exports. The per-module aggregation is what made it usable. |
+| B (always-default param) | HEAD runtime areas: 184 rows → 12 printed | 3 (F8, F9, one deliberate test hook) | **25 %** on the printed tier. Without the injection-seam and `**dict`-builder filters it was 45 printed → 3, i.e. 6.7 %. The `planner/` run (936 rows) was left unverified. |
+| B2 (degenerate derivation) | HEAD `layers/moe`: 0 | 0 (correct negative) | Fired 2/2 at the #394 pre-fix tree. |
+| C (asymmetric gate) | HEAD, `SGLANG_GGUF_DENSE_VOCAB`: 9 weak, 0 strong | 0 (correct negative) | At the pre-fix tree: 10 weak → 10 % precision, but **strong tier 2 → 100 %**. The doc-line co-mention ranking is what separates the tiers. |
 
 The raw name-level numbers are not findings and should not be quoted as
 such — that is the #381 failure mode repeating. Only the per-module
@@ -232,7 +303,18 @@ gate that can refuse), `--disaggregation-topology` (`scheduler.py:657`),
 `scheduler.py:3348`), `registry/adapters/class2_diffusion.py` (dynamic
 `register_adapter`), `planner/placement.py` and `planner/live_metrics.py`
 (used by `planner/webui.py` and `bench_suite.py`),
-`mem_cache/hicache_migrate.py` (`python -m` operator tool).
+`mem_cache/hicache_migrate.py` (`python -m` operator tool),
+`ReservationStore(critical_section_probe=…)` (`registry/ledger.py:320` — a
+deliberate test hook that injects a `time.sleep` to widen a race window;
+recorded so it is not re-flagged).
+
+Detector B's own limitations, which bound what §3 can claim: callees are
+resolved **by simple name only** (two functions named `available_bytes` share
+a bucket — one candidate was dropped for exactly this reason rather than
+reported), there is no import resolution or type inference, and a parameter
+passed through a dict, a `partial`, a decorator or `getattr` is invisible. A
+`**kwargs` call site yields an `unknown` class that is neither positive nor
+negative; `planner/` is full of them and was not verified.
 
 A distinct class worth naming but *not* counted as a finding: features that
 are wired but gated off by an env default, e.g. the GDN state-set ladder and
@@ -342,7 +424,36 @@ branch-only endpoint as shipped. If the catalog is to be usable as an audit
 baseline, tip-state and branch-state should be visually separated rather than
 distinguished only by a parenthetical.
 
-## 8. Pins
+## 8. What this audit did NOT cover
+
+Stated explicitly, because an audit's silence is otherwise read as a clean
+bill of health:
+
+- **Detector C was never swept.** It is confirmed against the one calibration
+  env (`SGLANG_GGUF_DENSE_VOCAB`, fires pre-fix, correct negative at HEAD) and
+  nothing else — the all-envs run did not finish. **Partial-wiring defects of
+  the #197 shape are therefore essentially unaudited at HEAD.** This is the
+  single largest remaining gap and the obvious next slice: the detector
+  exists and is calibrated, it just needs to be run.
+- **`planner/` was not verified.** Detector B produced 936 raw rows there,
+  dominated by `**kwargs` call sites that the detector classes as `unknown`.
+  Left alone on the grounds that the planner is an offline CLI/webui rather
+  than serving runtime, which is a judgement call, not a proof.
+- **Detector C cannot fire on an undocumented gate.** Its entity harvest comes
+  from the flag's own docstring. A flag with a terse or absent docstring
+  produces no entities and the detector silently declines — it cannot find an
+  asymmetry that no comment ever claimed.
+- **One open question, deliberately not claimed as a finding.**
+  `PathProfile.saturation_threshold` has no writer anywhere in the tree, so it
+  is permanently `1.0`. Whether that makes the `>= 1.0` re-route at
+  `barlink_path_dispatcher.py:341` unreachable depends on the range of the
+  injected `_saturation_sensor`, which was not traced.
+- **The 142 inherited undeclared envs** were not examined (out of scope).
+- **Nothing was executed.** No test of the audited code was run, no server
+  booted, no GPU touched. Every classification above is static analysis plus
+  hand tracing, and inherits that method's blind spots (§1.2).
+
+## 9. Pins
 
 `test/registered/unit/test_unwired_features_421.py` — 8 hermetic CPU tests
 (AST over the repo tree, no torch, no CUDA). They assert that F1–F4 and F6 are
