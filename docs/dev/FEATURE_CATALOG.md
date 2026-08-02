@@ -67,12 +67,19 @@ register of discarded approaches — check it before re-proposing anything.
 - **Hibernate to disk** (weights+KV survive process exit; uneven-TP3 reload
   50s→8-14s) + suspend-to-RAM (memory saver).
 - **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
-  (geometry stages instead of rejects), **KV resharding** at phase boundaries
-  (delta move <1 s, `kv_reshard_vectors`), **GDN slot ladder** (resident-state
-  cap + idle vacate → VRAM back to KV pool).
+  (geometry stages instead of rejects; explicit ladders work, but
+  `--kv-pressure-ladder auto` is currently BROKEN — hard-fails at runtime,
+  audit #421 F1; rung-dependency refusals exist and fire), **KV resharding**
+  at phase boundaries (delta move <1 s, `kv_reshard_vectors`), **GDN slot
+  ladder** (resident-state cap + idle vacate → VRAM back to KV pool).
+  WARNING (audit #421 F2): `--lane-offload-profile/-class-policy/-park-targets`
+  are advertised in CLI help but currently DISCARDED (register never
+  configured from ServerArgs) — do not rely on them until wired.
 - **memtier registry**: tier ids with volatility + payload class and
-  provenance `measured|estimate|absent` (absent refuses use). All new
-  spill/offload consumers must pick targets from it.
+  provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
+  (audit #421): ZERO consumers wired today — "all consumers pick targets from
+  it" is the TARGET rule, not the current state; existing offload/spill paths
+  still carry their own target lists.
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream
@@ -97,8 +104,14 @@ keyed (lane,name). PD disaggregation: prefill satellite carries hybrid GDN
 A card holds ONLY KV + attention (no weights): chunked prefill/extend, fp8/int4
 worker KV, DCP comm fusion, graph-captured streaming decode, host-tier KV
 spill, chain spec. **Live session handover without server stop** + draft
-re-sharder as its own spec type: built (branch `feat/live-handover-261`,
-`POST /session_handover`, five-phase at session scope, hard GDN-blob gate).
+re-sharder as its own spec type: BRANCH-ONLY, NOT on the integration tip yet
+(branch `feat/live-handover-261`, `POST /session_handover`, five-phase at
+session scope, hard GDN-blob gate; merge pending its GPU byte gate).
+
+Also wired on the tip but easy to miss (audit #421): the regime-controller
+gate machinery, KV-pressure rung-dependency refusals, the hibernate flag
+contract (`hibernate_dir` + weights/draft CPU/disk backup flags), and a
+118-name retired-env guard that refuses stale SGLANG_* variables loudly.
 
 ## 7. Collectives / transport
 **barlink** (own vendor-neutral CCL): NCCL-parity device transport,
