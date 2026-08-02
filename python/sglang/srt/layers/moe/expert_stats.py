@@ -124,6 +124,42 @@ def peakedness(counts: Sequence[int]) -> Dict[str, float]:
     }
 
 
+def _moe_compute_policy() -> str:
+    """What chose the expert-compute assignment: ``base-plan`` or a solve.
+
+    Never raises. A dump that cannot answer this reports ``base-plan``, which
+    is the truthful answer for every launch that did not ask for a solve.
+    """
+    try:
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            compute_policy_label,
+        )
+
+        return compute_policy_label()
+    except Exception:  # noqa: BLE001 - a measurement never breaks a serve
+        return "base-plan"
+
+
+def _moe_compute_vector() -> str:
+    """The EFFECTIVE "moe" family vector, or ``even`` when no plan is installed.
+
+    Read from the process-global shard plan the layers partitioned on -- not
+    from ServerArgs -- so a launch whose vector was rejected or overridden
+    somewhere upstream reports what actually ran rather than what was asked
+    for. The accessor falls back to the base plan for a family with no vector
+    of its own, which is exactly the split the experts were placed by.
+    """
+    try:
+        from sglang.srt.distributed.utils import get_tp_partition_ratios
+
+        vector = get_tp_partition_ratios("moe")
+    except Exception:  # noqa: BLE001 - see above
+        return "unknown"
+    if not vector:
+        return "even"
+    return ",".join(str(int(v)) for v in vector)
+
+
 class LayerExpertStats:
     """Host-side counters for one MoE layer's routing and residency outcomes.
 
@@ -414,6 +450,15 @@ class ExpertStatsCollector:
             totals["host_shard_reachability"] = (
                 reach.pop() if len(reach) == 1 else "mixed"
             )
+        # #394 slice 3: WHICH RANK EXECUTES WHICH EXPERT, in the dump. The
+        # cold-tier fields above describe where the BYTES live; these describe
+        # the compute assignment, and the third proof arm is exactly the one
+        # that moves it. Read from the installed family plan rather than from
+        # ServerArgs, because the plan is what the layers actually partitioned
+        # on -- an arm that asked for a vector and got the base plan reports
+        # the base plan here.
+        totals["moe_compute_policy"] = _moe_compute_policy()
+        totals["moe_compute_vector"] = _moe_compute_vector()
         # The fetch tally the arm is actually read on. Summed here so the
         # readout does not have to walk 43 layers to answer "did any byte come
         # from a peer".

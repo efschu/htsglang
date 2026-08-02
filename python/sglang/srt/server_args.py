@@ -447,6 +447,26 @@ def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
+#: Symbolic value of --rank-moe-ratio (#394 slice 3). Duplicated here rather
+#: than imported because ``layers.moe.expert_compute_placement`` is a runtime
+#: module and argument parsing must not drag it in; the two spellings are
+#: pinned equal by test_expert_compute_placement_439.
+_COMPUTE_PLACEMENT_LINK = "link"
+
+
+def _parse_rank_moe_ratio(value: str) -> Union[str, List[int]]:
+    """Parse --rank-moe-ratio: 'link' or a comma-separated integer list.
+
+    'link' is resolved in the LAUNCHER (see
+    ``layers/moe/expert_compute_placement.py``), not here: the solve needs the
+    rank -> physical card vector, and the identity map that produces it costs a
+    CUDA context this process may not have paid for yet.
+    """
+    if value.strip() == _COMPUTE_PLACEMENT_LINK:
+        return _COMPUTE_PLACEMENT_LINK
+    return [int(part.strip()) for part in value.split(",")]
+
+
 def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-kv-ratio: 'coupled', 'capacity', 'auto' (alias of
     'capacity'), 'speed', or a comma-separated positive integer list."""
@@ -2391,7 +2411,7 @@ class ServerArgs:
         ),
     ] = None
     rank_moe_ratio: A[
-        Optional[List[int]],
+        Union[str, Optional[List[int]]],
         Arg(
             help="Uneven TP self-calibration: comma-separated positive "
             "integer weights, one per rank (length must equal --tp-size), "
@@ -2399,12 +2419,24 @@ class ServerArgs:
             "the expert weights are the bulk of the shiftable mass, so "
             "this is the main lever for growing the MIN-synced KV token "
             "pool; attention/KV splits keep following --rank-tp-ratio. "
+            "Under the expert-dim shard this vector also decides WHICH RANK "
+            "EXECUTES WHICH EXPERT, not just where the bytes sit. "
+            "'link' (#394 slice 3) solves it for that: each rank keeps "
+            "exactly the GPU-resident expert mass it has under the base "
+            "plan (VRAM-neutral) and the STREAMED remainder is "
+            "redistributed in proportion to each rank's measured "
+            "host->device bandwidth, which equalises the per-rank transfer "
+            "time the group waits on. Needs expert offload "
+            "(--rank-moe-resident-fraction < 1) and a link ratio of usable "
+            "provenance; both absences are refused by name rather than "
+            "resolved to the base plan. "
             "The server's profiling logs a suggested vector ('restart "
             "with SGLANG_UNEVEN_MOE_VECTOR=...') when rebalancing gains "
             "> 10%%. The environment variable SGLANG_UNEVEN_MOE_VECTOR "
-            "takes precedence over this flag. Requires an active "
-            "--rank-tp-ratio plan.",
-            type_parser=_parse_int_list,
+            "takes precedence over this flag (explicit vectors only; it "
+            "does not accept 'link'). Requires an active --rank-tp-ratio "
+            "plan.",
+            type_parser=_parse_rank_moe_ratio,
         ),
     ] = None
     rank_kv_ratio: A[
@@ -9216,7 +9248,11 @@ class ServerArgs:
                 ("--rank-vocab-ratio", self.rank_vocab_ratio),
                 ("--rank-moe-ratio", self.rank_moe_ratio),
             )
-            if value is not None
+            # A symbolic value is a SOLVE, not a hand-set vector: the notice
+            # below tells the reader an optimizer exists, and printing it next
+            # to a request for that optimizer would be advice to do what they
+            # just did.
+            if value is not None and value != _COMPUTE_PLACEMENT_LINK
         ]
         if pinned:
             logger.info(
@@ -9896,6 +9932,21 @@ class ServerArgs:
         self._resolve_rank_vocab_ratio()
         for field, flag, env_name in self.UNEVEN_FAMILY_RATIO_SPECS:
             env_value = getattr(envs, env_name).get()
+            if (
+                field == "rank_moe_ratio"
+                and env_value
+                and env_value.strip() == _COMPUTE_PLACEMENT_LINK
+            ):
+                # The symbol is a SOLVE, and the solve runs in the launcher
+                # against the rank -> card vector. Accepting it here would put
+                # the string in every worker's ServerArgs with nothing left to
+                # resolve it, which surfaces as an even split at the first
+                # layer rather than as a launch error.
+                raise ValueError(
+                    f"{env_name}={env_value!r}: the environment channel takes "
+                    f"an explicit vector only. Use {flag} "
+                    f"{_COMPUTE_PLACEMENT_LINK} to request the solve."
+                )
             if env_value:
                 try:
                     env_vector = _parse_int_list(env_value)
@@ -9924,6 +9975,11 @@ class ServerArgs:
                     "base plan (--rank-tp-ratio); without one every "
                     "family already uses the even split."
                 )
+            if vector == _COMPUTE_PLACEMENT_LINK:
+                # Precondition-checked here (the base plan above is the one
+                # that matters), solved in the launcher. Everything below
+                # validates an explicit vector and does not apply yet.
+                continue
             if len(vector) != self.tp_size:
                 raise ValueError(
                     f"{flag} / {env_name} length ({len(vector)}) must "

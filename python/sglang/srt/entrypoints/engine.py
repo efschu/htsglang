@@ -676,6 +676,20 @@ class Engine(EngineScoreMixin, EngineBase):
 
             publish_cold_tier_instance()
 
+            # #394 slice 3: resolve --rank-moe-ratio link into the explicit
+            # vector, in the SAME process and for a third instance of the same
+            # reason. The vector decides which rank executes which expert, so
+            # three workers re-deriving it independently from three NVML reads
+            # would put the group's expert coverage on the outcome of a race.
+            # It also has to happen after the rank -> card vector above, whose
+            # UUIDs are what the link weights are keyed by. A no-op unless the
+            # symbolic value is set.
+            from sglang.srt.layers.moe.expert_compute_placement import (
+                resolve_moe_compute_placement_flag,
+            )
+
+            resolve_moe_compute_placement_flag(server_args)
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)

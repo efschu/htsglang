@@ -5841,6 +5841,40 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
+def uneven_family_plans(server_args) -> dict:
+    """The per-family shard vectors this worker will install, or ``{}``.
+
+    "vocab" (--rank-vocab-ratio / SGLANG_UNEVEN_VOCAB_VECTOR) is read
+    exclusively through ``tp_vocab_ratios()``, which does NOT fall back to the
+    base plan: without the flag, vocab sharding stays even. It is still listed
+    here so a symbolic value in that family gets the same treatment.
+
+    A SYMBOLIC value that reaches a worker was never resolved by the launcher
+    (#394 slice 3), and falling through to the base plan is precisely the
+    failure the symbol exists to avoid: the boot would serve the baseline under
+    the treatment's name, and only a #390 dump read a week later would show it.
+    Its own function so the refusal can be exercised without spawning a
+    scheduler.
+    """
+    family_plans = {}
+    for family, field in (
+        ("mlp", "rank_mlp_ratio"),
+        ("moe", "rank_moe_ratio"),
+        ("vocab", "rank_vocab_ratio"),
+    ):
+        vector = getattr(server_args, field, None)
+        if isinstance(vector, str):
+            raise ValueError(
+                f"{field}={vector!r} is a symbolic placement that must be "
+                "resolved before the workers are spawned. It reached this "
+                "scheduler unresolved, which means the launcher path did not "
+                "run resolve_moe_compute_placement_flag()."
+            )
+        if isinstance(vector, list):
+            family_plans[family] = vector
+    return family_plans
+
+
 def configure_scheduler_process(
     server_args: ServerArgs,
     gpu_id: int,
@@ -5891,19 +5925,9 @@ def configure_scheduler_process(
         if isinstance(server_args.rank_tp_ratio, list)
         else None
     )
-    family_plans = {}
-    # "vocab" (--rank-vocab-ratio / SGLANG_UNEVEN_VOCAB_VECTOR) is read
-    # exclusively through tp_vocab_ratios(), which does NOT fall back to
-    # the base plan: without the flag, vocab sharding stays even.
-    for family, field in (
-        ("mlp", "rank_mlp_ratio"),
-        ("moe", "rank_moe_ratio"),
-        ("vocab", "rank_vocab_ratio"),
-    ):
-        vector = getattr(server_args, field, None)
-        if isinstance(vector, list):
-            family_plans[family] = vector
-    set_tp_partition_ratios(base_plan, families=family_plans or None)
+    set_tp_partition_ratios(
+        base_plan, families=uneven_family_plans(server_args) or None
+    )
 
     # Uneven DCP (M1): install the token-axis split vector so the KV pool
     # pinning and the weighted owner rule agree across ranks. None keeps the

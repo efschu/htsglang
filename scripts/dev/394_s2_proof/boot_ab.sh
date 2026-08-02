@@ -14,6 +14,17 @@
 #                     makes the delegated experts REACHABLE. Arm A of the
 #                     2026-08-02 battery could not run this: the delegated
 #                     experts were absent and the boot was refused.
+#   ARM=compute       #394 slice 3: --rank-moe-ratio link moves the COMPUTE
+#                     assignment, i.e. the #82 expert range itself, so a rank's
+#                     streamed mass is proportional to its own link. This is
+#                     the arm whose per-rank H2D delta is predicted NON-null.
+#   ARM=compute-cal   the same, with the per-rank cold-traffic coefficients
+#                     measured on the equal arm supplied through
+#                     SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS. Read ARM3_COMPUTE.md
+#                     before quoting either -- the two bracket the effect
+#                     (predicted 1.36x and 1.58x on the transfer term) and
+#                     reporting only the calibrated one would report a number
+#                     calibrated on the arm it is compared against.
 #
 # WHAT THIS ARM DOES AND DOES NOT TEST -- read before quoting a delta.
 #
@@ -29,11 +40,16 @@
 #
 # The ~27.5 -> ~20.2 s decode marker from ANALYSE_393 §7.3 belongs to Path A',
 # which additionally moves WHICH RANK COMPUTES WHICH EXPERT (the #82 expert
-# range). This arm does not do that, and reporting the marker as its target
-# would be reporting a number the mechanism cannot produce. The arm is
-# instrumented to SHOW that: the primary readout is per-rank H2D, and a null
-# delta is the expected, publishable result. If per-rank H2D DOES move, the
-# analysis above is wrong and that is the finding worth having.
+# range). The equal/proportional arms do not do that, and reporting the marker
+# as their target would be reporting a number those mechanisms cannot produce.
+# They are instrumented to SHOW that: the primary readout is per-rank H2D, and
+# a null delta is the expected, publishable result. If per-rank H2D DOES move,
+# the analysis above is wrong and that is the finding worth having.
+#
+# ARM=compute / compute-cal ARE that marker's arm, and the sign of their
+# prediction is the opposite: a null per-rank H2D delta FALSIFIES them. Their
+# predicted per-rank figures are tabulated in ARM3_COMPUTE.md; read it before
+# quoting anything.
 #
 # Corridor discipline: per-card free VRAM must stay >= 400 MiB and no single
 # registered posting may waste > 1.5 GiB net. Both arms run at the reserve
@@ -79,6 +95,10 @@ export SGLANG_MOE_STAGING_TRACE=1
 export SGLANG_OPT_FUSE_WQA_WKV=0
 export SGLANG_OPT_USE_TOPK_V2=0
 
+# Extra launch arguments the arm adds. Empty for the two slice-2 arms, so their
+# command line is byte-identical to the one the 2026-08-02 battery ran.
+ARM_ARGS=()
+
 case "$ARM" in
   equal)
     export SGLANG_MOE_HOST_SHARD_RATIO=1,1,1
@@ -91,8 +111,36 @@ case "$ARM" in
     export SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured
     export SGLANG_MOE_COLD_TIER_SHM=1
     ;;
+  compute|compute-cal)
+    # Slice 3. Byte ownership stays at the baseline on purpose -- this arm's
+    # treatment is the COMPUTE assignment, and moving both at once would
+    # produce a delta neither mechanism could claim. That is achieved by
+    # leaving the shared cold tier OFF: without it _gguf_cold_shard_context
+    # returns None and no expert is delegated, whatever the ratio says.
+    unset SGLANG_MOE_COLD_TIER_SHM || true
+    # NOT set to 1,1,1 the way the equal arm does. That variable is the FIRST
+    # source of the link weights this arm's solve is built on (resolve_host_
+    # shard_ratio), so pinning it equal here would hand the solver a uniform
+    # link profile and quietly turn the treatment into the baseline. Byte
+    # ownership is held at the baseline by the line above instead.
+    unset SGLANG_MOE_HOST_SHARD_RATIO || true
+    # Same refusal as the proportional arm: the placement must be weighted by a
+    # timed transfer, not by a datasheet.
+    export SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured
+    ARM_ARGS+=(--rank-moe-ratio link)
+    if [ "$ARM" = "compute-cal" ]; then
+      if [ -z "${SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS:-}" ]; then
+        echo "FAIL ARM=compute-cal needs SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS" >&2
+        echo "     derive them from the EQUAL arm's per-rank h2d_bytes; see" >&2
+        echo "     scripts/dev/394_s2_proof/ARM3_COMPUTE.md" >&2
+        exit 1
+      fi
+    else
+      unset SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS || true
+    fi
+    ;;
   *)
-    echo "FAIL unknown ARM=$ARM (equal|proportional)" >&2
+    echo "FAIL unknown ARM=$ARM (equal|proportional|compute|compute-cal)" >&2
     exit 1
     ;;
 esac
@@ -107,6 +155,7 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
   --chunked-prefill-size 512 \
   --disable-cuda-graph \
   --trust-remote-code --enable-metrics \
+  "${ARM_ARGS[@]+"${ARM_ARGS[@]}"}" \
   --host 127.0.0.1 --port "$PORT" \
   > "$RUN/boot_$ARM.log" 2>&1 &
 echo $! > "$RUN/boot_$ARM.launchpid"
