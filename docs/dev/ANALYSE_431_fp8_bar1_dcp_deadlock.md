@@ -166,3 +166,111 @@ Run arm A (and B). Then read `divergence_<arm>.txt`:
   per forward, not per collective) rather than to re-route anything.
 
 Only after that verdict should the refusal in §5 be narrowed or removed.
+
+---
+
+# The fix slice (branch `fix/bar1-timeout-loud-abort-431`, desk-only)
+
+Written against tip `82f414c62d`, with no GPU: the window above already
+produced the readings, and what follows is the code the readings pointed at.
+Everything here is falsifier-backed — 21 hermetic tests in
+`test/registered/unit/distributed/test_barlink_bar1_abort_431.py`, all of
+which fail on the unfixed tree.
+
+## Fix 1 — the BAR1 deadline now goes through the resolver
+
+`BarlinkBar1Transport._deadline_cycles()` is the single producer of the cycle
+budget, and it is `resolve_timeout_cycles(int(self.cap_cycles))` — the same
+call `barlink_device.py:53` makes. All three launch sites use it:
+`bar1_all_reduce`, `bar1_mesh_pipe`, `bar1_all_to_all`.
+
+Outside the cold-build window `resolve_timeout_cycles` is the identity, so
+the steady state and the default path are unchanged. The pass that RECORDS a
+CUDA graph runs outside the window by construction
+(`full_cuda_graph_backend.capture_one`: `run_capture_warmups` owns the
+window, the recorded `forward_fn()` below it does not), so a captured graph
+still carries the unmultiplied constant and serving is untouched. What
+changes is exactly the warmup forwards this window measured stalling in.
+
+Falsifiers: `_deadline_cycles` is the bare constant outside the window and
+`constant * mult` inside it; the recorded kernel ARGUMENT of a real
+`_all_reduce_one_round` call is the extended one inside the window; and no
+launch site passes `int(self.cap_cycles)` any more (three sites, pinned at
+the source, because two of them need a mapped BAR1 window to drive).
+
+## Fix 2 — a tripped kernel raises instead of continuing
+
+`BarlinkBar1Transport.check_aborted(where)` reads the sticky status word and
+raises `Bar1CollectiveAborted` with `rank`, `world`, `group`, `op`, `nbytes`,
+`rounds` and `launches` as structured attributes, not only as text.
+
+Where it runs, and why there:
+
+* **After every transport collective on the host path.**
+  `BarlinkCommunicator._after_transport` is called from `all_reduce`,
+  `all_gather`, `reduce_scatter`, `all_to_all_single` and `broadcast`. This
+  is the first host code after the collective. (There is no gap on the async
+  path: `all_reduce_async` exists only on the UCX transport, which has no
+  device deadline.)
+* **Never inside a stream capture.** Reading the word is a D2H copy plus a
+  stream synchronization; issued while the current stream is being captured
+  it is illegal. `graph_capture_running()` — the single definition of that
+  question, `barlink.py:414` — gates every check. A launch recorded under
+  capture does not advance the unchecked counter either: a recorded kernel
+  has not run.
+* **At the CUDA-graph replay boundary**, because that is the only host point
+  a captured decode has. `barlink_abort_gate.check_after_graph_replay()` is
+  called from `FullCudaGraphBackend.replay` and
+  `BreakableCudaGraphBackend.replay`. With no BAR1 transport in the process
+  it costs one truth test on an empty list.
+
+A background watchdog THREAD was considered for the captured case and
+rejected on the reasoning already recorded at `barlink_bar1._wait_abort`: the
+thread would read the same device word, that read queues behind whatever is
+on the stream, and the thing on the stream is exactly the kernel it is meant
+to report on. A thread does not change that ordering — the replay boundary
+does, because it runs after the graph has completed.
+
+Knobs, all documented in `barlink_abort_gate`:
+`SGLANG_BARLINK_BAR1_ABORT_CHECK=0` restores the pre-#431 silence exactly;
+`..._CHECK_EVERY=N` trades reporting latency for synchronizations;
+`..._CHECK_REPLAY=0` turns off only the replay-boundary check, for an
+overlap-scheduled decode that must not be forced to synchronize.
+
+## Fix 3 — the cold-build window logs its close
+
+`jit/coldwindow_fp8_bar1_decode.txt` read 6 OPEN / 0 CLOSE and looked like a
+leaked window. It was not one. `cold_build_window` logged only the open
+direction, and `attach_arm.sh:158` greps `'JIT cold-build window
+(open|close)'` — so zero closes was the only number that reading could ever
+have returned, leak or no leak. `cold_build_window` now logs a symmetric
+close line with the reason and the elapsed time, in the `finally` branch, so
+the count is falsifiable.
+
+This also settles the reading itself: the second window ("full cuda-graph
+capture warmup") was genuinely still open at the stall, because the warmup
+forward never returned. That is correct behaviour, and it means fix 1's
+extension really would have been in force for the whole stall.
+
+## What the GPU re-check must show before the refusal comes off
+
+The refusal in `barlink_uniformity.unproven_bar1_combination` STAYS. Its text
+now records that fixes 1 and 2 are merged and why neither lifts it: both are
+about how the failure is bounded and reported, not about why the flag
+rendezvous is slow. Re-run arm A with `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_
+BAR1=1`. Three outcomes, all diagnostic:
+
+1. **Capture completes** (slowly or not). The raw 30 s cap was the binding
+   constraint and the crawl was cold-build-window collisions all along. The
+   refusal can be narrowed to a documented slow-boot warning.
+2. **A named `Bar1CollectiveAborted`** arrives with rank/op/rounds. That is
+   the first identification of WHICH collective wedges, which is what the
+   FP8/Marlin round-desync hypothesis needs and could not get from py-spy.
+   The refusal stays until that root cause is fixed.
+3. **Still a silent crawl.** Then the status word is not being written, i.e.
+   the kernels are not tripping the cap at all and the ~30-40 s interval has
+   another source. That would falsify §4 of this document and is worth
+   knowing.
+
+Also worth collecting in the same run: `grep 'JIT cold-build window'` should
+now show matching open/close counts, and any mismatch is a real leak.

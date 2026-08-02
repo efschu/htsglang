@@ -164,6 +164,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from sglang.srt.distributed.device_communicators import (
+    barlink_abort_gate,
     barlink_env_guard,  # noqa: F401  (rejects retired SGLANG_HTCCL* vars)
     barlink_liveness,
 )
@@ -173,6 +174,34 @@ from sglang.srt.distributed.device_communicators.barlink_liveness import (
     bounded_device_sync,
     check_peers,
 )
+
+# NOT a module-level `from sglang.srt.utils.jit_cold_build import ...`, for the
+# reason barlink_device.py:43-49 spells out: importing the `sglang.srt.utils`
+# PACKAGE runs its __init__, which creates a CUDA context, and this file must
+# stay importable on a rank that has none. By the time a collective is
+# launched the module is long since imported, so the lookup below is a cached
+# global read.
+_resolve_timeout_cycles = None
+
+
+def resolve_timeout_cycles(base_cycles: int) -> int:
+    """Deadline for a device collective right now -- see utils/jit_cold_build.
+
+    Byte-for-byte the same lazy-lookup shape as ``barlink_device.py:53``, and
+    that is the point of #431 fix 1: BAR1 is the transport whose kernels spin
+    on a cycle deadline, and it was the one transport that did not consult
+    this resolver. Outside the cold-build window the function is the
+    identity, so the steady-state path is unchanged.
+    """
+    global _resolve_timeout_cycles
+    if _resolve_timeout_cycles is None:
+        from sglang.srt.utils.jit_cold_build import (
+            resolve_timeout_cycles as _resolver,
+        )
+
+        _resolve_timeout_cycles = _resolver
+    return _resolve_timeout_cycles(base_cycles)
+
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +223,58 @@ class Bar1KernelAborted(PeerLivenessError):
     complete. The distinction matters to a caller that wants to treat "this
     group is finished" uniformly, whichever side noticed first.
     """
+
+
+class Bar1CollectiveAborted(Bar1KernelAborted):
+    """The same fact, raised from a PRODUCTION path with its context (#431).
+
+    ``Bar1KernelAborted`` is what the three bring-up proofs raise; they know
+    which proof they are in, so "a kernel aborted" is a complete statement
+    there. On the serving path it is not: by the time anybody notices, the
+    only useful question is WHICH collective produced the corrupt buffer, and
+    the answer has to be carried, because ``ctlStatus`` is one sticky bit
+    with no history.
+
+    The attributes are structured, not only formatted into the message, so a
+    caller (a test, a supervisor, a future retry policy) can dispatch on them
+    without parsing English:
+
+    ``rank`` / ``world`` / ``group``
+        who reports it. Rank first because the #431 evidence showed three
+        ranks in three different host frames while their collective
+        sequences were identical -- the rank is the only part of that picture
+        that was ever load-bearing.
+    ``op`` / ``nbytes`` / ``rounds``
+        the last BAR1 collective this transport launched before the check.
+        ``rounds`` is recomputed at raise time from the transport's own
+        planner, never on the hot path.
+    ``launches``
+        how many collectives ran since the previous successful check. ``1``
+        means the aborting collective is exactly the one named; more means
+        the name is the most recent of several candidates and the abort is
+        somewhere in that window.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rank: int = -1,
+        world: int = -1,
+        group: str = "",
+        op: str = "",
+        nbytes: int = 0,
+        rounds: int = 0,
+        launches: int = 0,
+    ):
+        super().__init__(message)
+        self.rank = rank
+        self.world = world
+        self.group = group
+        self.op = op
+        self.nbytes = nbytes
+        self.rounds = rounds
+        self.launches = launches
 
 
 #: The values that count as "off" in this transport. Word-for-word the same
@@ -1410,6 +1491,22 @@ class BarlinkBar1Transport:
         # the behaviour this transport had before task #312.
         self._peer_table = None
         self._abort_window = None
+        # #431 fix 2: what the loud abort check needs, and nothing more.
+        # Three plain attribute stores per collective on the hot path; every
+        # derived quantity (rounds, message) is computed at raise time, where
+        # the run is already broken and cost no longer matters.
+        self._last_op = ""
+        self._last_nbytes = 0
+        #: Collectives launched on the HOST path since the last device read of
+        #: the status word. Zero means there is nothing new to look at, which
+        #: is what makes a check at a boundary free when no traffic happened.
+        self._unchecked_launches = 0
+        #: True once a kernel of this transport has been recorded into a CUDA
+        #: graph. A replay executes those kernels with no host code in
+        #: between, so this is the flag that arms the replay-boundary check --
+        #: the per-collective counter cannot see a replay at all.
+        self._captured_launches = False
+        self._registered_in_gate = False
 
         if enabled is None:
             enabled = os.environ.get("SGLANG_BARLINK_MATRIX_DIRECT", "1") not in (
@@ -2096,6 +2193,12 @@ class BarlinkBar1Transport:
             table=self._peer_table,
         )
         self._up = True
+        # #431 fix 2: only a transport that is UP can have a kernel abort, and
+        # only now does `_ctl_dev` exist for the check to read. Registering
+        # here rather than in __init__ keeps a transport that failed bring-up
+        # out of the registry entirely -- `close()` withdraws it again.
+        barlink_abort_gate.register(self)
+        self._registered_in_gate = True
         # Into the ledger. Only NOW, because only now is it established that
         # the aperture actually gave up the space -- booking before the
         # holder would be a promise on spec, and the second group's ENOMEM
@@ -2863,6 +2966,7 @@ class BarlinkBar1Transport:
             peer_flag[r] = z.flag.dev_ptr
         peer_payload[self.rank] = self._own[0]
         peer_flag[self.rank] = self._own_flag[0]
+        self._note_launch("all_reduce", nbytes)
         self._ext.bar1_all_reduce(
             inp, out, int(self.rank), int(self.world),
             0 if algo == "mesh" else 1,
@@ -2871,7 +2975,7 @@ class BarlinkBar1Transport:
             int(self._geo["chunk_max"]), int(self._geo["off_mesh"]),
             int(self._geo["off_ring"]),
             self._round_dev, self._ctl_dev,
-            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            self._deadline_cycles(), int(self.threads), int(kernel_variant),
             int(self.load_shape), int(self.read_flush),
             int(self._abort_host),
         )
@@ -3202,6 +3306,7 @@ class BarlinkBar1Transport:
             pipe_fbase,
         )
 
+        self._note_launch("all_reduce/mesh_pipe", nbytes)
         self._pipe_ext.bar1_mesh_pipe(
             inp, out, int(self.rank), int(self.world),
             peer_payload, peer_flag, peer_result,
@@ -3213,7 +3318,7 @@ class BarlinkBar1Transport:
             int(self.pipe_ack), 1 if direct else 0, int(result_slack),
             self._round_dev, self._step_dev, self._result_gen_dev,
             self._ctl_dev,
-            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            self._deadline_cycles(), int(self.threads), int(kernel_variant),
             int(self.load_shape),
             int(self._abort_host),
         )
@@ -3914,6 +4019,7 @@ class BarlinkBar1Transport:
         peer_payload[self.rank] = self._own[0]
         peer_flag[self.rank] = self._own_flag[0]
 
+        self._note_launch("all_to_all", int(moved))
         self._ext.bar1_all_to_all(
             inp, output, int(self.rank), int(R),
             [int(x) for x in send_off], [int(x) for x in send_bytes],
@@ -3923,7 +4029,7 @@ class BarlinkBar1Transport:
             int(self._geo["a2a_slot"]), int(self._geo["off_a2a"]),
             int(fbase_a2a(R)),
             self._round_dev, self._ctl_dev,
-            int(self.cap_cycles), int(self.threads), int(kernel_variant),
+            self._deadline_cycles(), int(self.threads), int(kernel_variant),
             int(self.load_shape),
             int(self._abort_host),
         )
@@ -4159,12 +4265,177 @@ class BarlinkBar1Transport:
         window = self._abort_window
         return window.device_ptr if window is not None else 0
 
+    # -- The device deadline (#431 fix 1) ------------------------------------
+
+    def _deadline_cycles(self) -> int:
+        """The cycle budget THIS launch carries. The only producer of it.
+
+        ``self.cap_cycles`` is the steady-state constant
+        (``SGLANG_BARLINK_BAR1_CAP_CYCLES``, ~30 s at 2 GHz). What actually
+        reaches the kernel is that constant put through
+        ``resolve_timeout_cycles``, which is the identity outside the JIT
+        cold-build window and multiplies by ``cold_build_timeout_mult()``
+        (default 40) inside it.
+
+        #431: this indirection is the fix. ``barlink_liveness.py`` has
+        documented since #312 that the BAR1 device cap "is multiplied by up
+        to 40x inside the JIT cold-build window", and
+        ``barlink_device.py:1239`` does exactly that -- but BAR1 passed
+        ``int(self.cap_cycles)`` raw at all three of its launch sites and
+        never called the resolver at all. The mechanism existed, was
+        documented, was used by the sibling transport, and did not reach the
+        one transport whose kernels spin on a device deadline. The #431
+        window measured the consequence: the cold-build window was open for
+        the entire 22-minute stall (6 opens, ``jit/coldwindow_*.txt``) while
+        the arm advanced at one collective per ~30-40 s -- the RAW cap, to
+        the digit.
+
+        Two properties this must keep:
+
+        * OUTSIDE the window it is byte-identical to the previous behaviour.
+          ``resolve_timeout_cycles`` returns its argument unchanged there.
+        * The CAPTURED value is the steady-state one. The pass that records
+          a CUDA graph runs outside the window by construction
+          (``full_cuda_graph_backend.capture_one``: ``run_capture_warmups``
+          owns the window, the recorded ``forward_fn()`` below it does not),
+          so the deadline baked into a graph is the unmultiplied constant --
+          which is what every replay for the rest of the process's life then
+          uses. Extending the deadline for the warmups does not extend it for
+          serving.
+        """
+        return int(resolve_timeout_cycles(int(self.cap_cycles)))
+
+    # -- The loud abort (#431 fix 2) -----------------------------------------
+
+    def _note_launch(self, op: str, nbytes: int) -> None:
+        """Record what is about to be launched. Three stores, no allocation.
+
+        Under stream capture the kernel is RECORDED, not executed, so there
+        is nothing for a status read to find and the unchecked counter must
+        not advance -- otherwise the first check after capture would report a
+        stale window of "collectives" that never ran. What capture does mean
+        is that this transport's kernels are now inside a graph and will run
+        on every replay with no host code between them; that is what
+        ``_captured_launches`` arms.
+        """
+        self._last_op = op
+        self._last_nbytes = int(nbytes)
+        from sglang.srt.distributed.device_communicators.barlink import (
+            graph_capture_running,
+        )
+
+        if graph_capture_running():
+            self._captured_launches = True
+        else:
+            self._unchecked_launches += 1
+
+    def _rounds_for(self, op: str, nbytes: int) -> int:
+        """Round count of the named collective, computed at RAISE time only.
+
+        Never on the hot path: ``ar_rounds``/``ag_rounds`` run the planner,
+        and the launch sites would pay for a number that is only ever read
+        once a run is already broken.
+        """
+        try:
+            if op.startswith("all_reduce"):
+                return int(self.ar_rounds(nbytes))
+            if op == "all_gather":
+                return int(self.ag_rounds(nbytes))
+        except Exception:  # noqa: BLE001 - a diagnostic must not be the cause
+            pass
+        return 0
+
+    def check_aborted(self, where: str) -> None:
+        """The production check: raise if a kernel took its abort path.
+
+        This is what #431 fix 2 adds. Before it, ``ctlStatus`` was written by
+        every tripped kernel and read by nothing on a serving path, so a run
+        in which every collective aborted looked exactly like a run in which
+        none did -- and the stream kept going over partially written output
+        buffers. The #431 window's ``abort_*.txt`` is empty for a 22-minute
+        stall for precisely this reason.
+
+        WHERE IT MAY RUN. Reading the status word is a device read: it
+        synchronizes the current stream, and inside a stream capture it is
+        not just expensive but illegal. So:
+
+        * inside a capture this returns immediately (``graph_capture_running``
+          is the single definition of that question, ``barlink.py:414``);
+        * on the host path it runs after the collective, from the barlink
+          dispatch sites;
+        * for kernels that only ever run inside a replayed graph -- where
+          there is no host code per collective at all -- the next host point
+          is the replay boundary, and ``barlink_abort_gate`` is called from
+          there.
+
+        A background watchdog THREAD was considered for the captured case and
+        rejected: it would read the same device word, that read queues behind
+        whatever is on the stream, and the thing on the stream is exactly the
+        kernel it is meant to report on. ``_wait_abort`` above records the
+        same reasoning for the same read; a thread does not change it.
+
+        COST. One 4-byte D2H plus a stream synchronization, once per
+        ``SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY`` host-path collectives
+        (default: every one). Free when nothing has been launched since the
+        last check, which is what makes it cheap at a boundary.
+        """
+        if self._ctl_dev is None:
+            return
+        if not barlink_abort_gate.abort_check_enabled():
+            return
+        pending = self._unchecked_launches
+        if pending <= 0 and not self._captured_launches:
+            return
+        if pending > 0 and pending < barlink_abort_gate.check_every():
+            return
+        from sglang.srt.distributed.device_communicators.barlink import (
+            graph_capture_running,
+        )
+
+        if graph_capture_running():
+            return
+        self._unchecked_launches = 0
+        if self.status() != 1:
+            return
+        op = self._last_op or "unknown"
+        nbytes = int(self._last_nbytes)
+        rounds = self._rounds_for(op, nbytes)
+        window = self._abort_window
+        reason = window.reason if window is not None and window.tripped else None
+        raise Bar1CollectiveAborted(
+            f"barlink-BAR1 rank {self.rank}/{self.world} group "
+            f"{self.group or '<unnamed>'}: a spin kernel took its abort path, "
+            f"observed at {where}. Last collective launched: {op} "
+            f"({nbytes} bytes, {rounds} rounds); {pending} collective(s) ran "
+            f"since the previous check, so the abort is in that window and "
+            f"the named one is its most recent member. Cause: either the "
+            f"kernel exceeded its cycle deadline "
+            f"(SGLANG_BARLINK_BAR1_CAP_CYCLES={self.cap_cycles}, effective "
+            f"this launch {self._deadline_cycles()}) waiting for a peer's "
+            f"flag, or the host abort word was set"
+            + (f" -- {reason}" if reason else "")
+            + ". The output buffer of that collective is partially written; "
+            "every result computed from it is garbage, which is why this "
+            "raises instead of logging. Set "
+            f"{barlink_abort_gate.ENV_ENABLE}=0 to restore the previous, "
+            "silent behaviour.",
+            rank=int(self.rank),
+            world=int(self.world),
+            group=str(self.group or ""),
+            op=op,
+            nbytes=nbytes,
+            rounds=rounds,
+            launches=int(pending),
+        )
+
     def raise_if_aborted(self, label: str) -> None:
         """Raise if a spin kernel took its abort path. NOT for the hot path.
 
-        ``status()`` has always held this answer and nothing in production
-        ever asked for it, which is why a tripped kernel was silent: the
-        stream simply continued over a partially written output buffer.
+        The bring-up form of the check. ``check_aborted`` is the production
+        one (#431 fix 2) and carries rank/op/rounds context; this one is for
+        the three byte-level proofs, which know which proof they are in and
+        need no context beyond ``label``. Both read the same sticky word.
+
         Reading the word synchronizes -- that cost is precisely what the
         direct path exists to avoid -- so this belongs at bring-up and on
         wait paths that have already failed, never inside a collective.
@@ -4243,6 +4514,12 @@ class BarlinkBar1Transport:
         # Before anything else: no kernel of this transport will run again,
         # so the abort word has nobody left to talk to. Unregistering it here
         # keeps the watchdog from holding a reference to a closed window.
+        # Same argument for the abort gate: `_ctl_dev` is about to be dropped,
+        # and a boundary check that reached a torn-down transport would fail
+        # in the teardown path instead of reporting on the run.
+        if self._registered_in_gate:
+            barlink_abort_gate.unregister(self)
+            self._registered_in_gate = False
         self._release_abort_window()
         self._peer_table = None
         # Deregister first: the space is on its way back from here on, and

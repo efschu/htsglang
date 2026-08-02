@@ -727,6 +727,28 @@ class BarlinkCommunicator:
         except Exception as e:  # noqa: BLE001
             logger.debug("barlink decision recorder skipped one entry: %r", e)
 
+    def _after_transport(self, t, op: str):
+        """The host-side touchpoint right after a transport collective (#431).
+
+        A BAR1 spin kernel that exceeds its cycle deadline writes a status
+        word and RETURNS, leaving its output buffer partially written; before
+        this call nothing on a serving path ever read that word, so a run in
+        which every collective aborted was indistinguishable from a clean one
+        (the #431 window's ``abort_*.txt`` is empty for a 22-minute stall).
+        This is the first host code after the collective, so this is where
+        the word gets read.
+
+        Deliberately a ``getattr``: only the BAR1 transport carries the
+        device deadline, and asking every transport to grow a no-op method
+        for it would put the concept in four modules that do not have the
+        problem. The check itself no-ops under stream capture -- the read
+        would be illegal there -- and the CUDA-graph replay boundary picks
+        those kernels up instead (``barlink_abort_gate``).
+        """
+        check = getattr(t, "check_aborted", None)
+        if check is not None:
+            check(f"{op} on group {getattr(self, 'group', '?') or '<unnamed>'}")
+
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
         """One FRESH output tensor per call — never a shape-keyed cache.
 
@@ -813,7 +835,9 @@ class BarlinkCommunicator:
         nbytes = inp.numel() * inp.element_size()
         t = self._select("all_reduce", nbytes)
         if t is not None:
-            return t.barlink_all_reduce(self, inp)
+            result = t.barlink_all_reduce(self, inp)
+            self._after_transport(t, "all_reduce")
+            return result
         out = self._get_out_buf(inp)
 
         reduce_dtype = (
@@ -885,7 +909,9 @@ class BarlinkCommunicator:
             "all_gather", input_.numel() * input_.element_size()
         )
         if t is not None:
-            return t.barlink_all_gather(self, input_, dim)
+            result = t.barlink_all_gather(self, input_, dim)
+            self._after_transport(t, "all_gather")
+            return result
         if dim < 0:
             dim += input_.dim()
         inp = input_.contiguous()
@@ -927,7 +953,9 @@ class BarlinkCommunicator:
             "reduce_scatter", input_.numel() * input_.element_size()
         )
         if t is not None:
-            return t.barlink_reduce_scatter(self, input_, dim)
+            result = t.barlink_reduce_scatter(self, input_, dim)
+            self._after_transport(t, "reduce_scatter")
+            return result
         if dim < 0:
             dim += input_.dim()
         # Host-staged: full all-reduce, then slice this rank's shard.
@@ -1129,9 +1157,11 @@ class BarlinkCommunicator:
                 rounds = (
                     rounds_for(largest_block) if callable(rounds_for) else None
                 )
-                return t.barlink_all_to_all_single(
+                result = t.barlink_all_to_all_single(
                     self, output, inp, send_bytes, recv_bytes, rounds=rounds
                 )
+                self._after_transport(t, "all_to_all")
+                return result
 
         # Fallback: the same decomposition over the CPU group. Pinned, so
         # the two copies don't go through a pageable intermediate buffer.
@@ -1210,7 +1240,9 @@ class BarlinkCommunicator:
         # performs. See BarlinkDeviceTransport.barlink_broadcast.
         t = self._select("broadcast", tensor.numel() * tensor.element_size())
         if t is not None:
-            return t.barlink_broadcast(self, tensor, src)
+            result = t.barlink_broadcast(self, tensor, src)
+            self._after_transport(t, "broadcast")
+            return result
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         if self.rank == src:
             host.copy_(tensor, non_blocking=False)

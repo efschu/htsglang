@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -163,6 +164,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        # #431: a captured graph contains the barlink BAR1 spin kernels but no
+        # host code between them, so the per-collective abort check cannot
+        # fire during a replay -- this is the next host point after it. Costs
+        # one truth test on an empty list unless a BAR1 transport is live in
+        # this process; see barlink_abort_gate for what it costs when one is.
+        barlink_abort_gate.check_after_graph_replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

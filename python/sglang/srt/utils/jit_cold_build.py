@@ -87,6 +87,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
@@ -154,8 +155,21 @@ def resolve_timeout_cycles(base_cycles: int) -> int:
 
 @contextmanager
 def cold_build_window(reason: str) -> Iterator[None]:
-    """Open the window for the enclosed block. Re-entrant, exception-safe."""
+    """Open the window for the enclosed block. Re-entrant, exception-safe.
+
+    Open and close are logged SYMMETRICALLY, at the same level, with the same
+    prefix. That is not cosmetic. The #431 window
+    (``/spinning/gpu-battery-results/2026-08-02_431_repro/jit/``) collected
+    ``grep -aE 'JIT cold-build window (open|close)'`` and read 6 OPEN / 0
+    CLOSE over a 22-minute stall, which looks exactly like a window that
+    leaked -- while in fact this function had never emitted a close line at
+    all, so zero was the only number that reading could ever produce. An
+    accounting instrument that can only count one direction reports a leak
+    whether or not one exists; the close line is what makes the open count
+    falsifiable.
+    """
     global _depth, _reason
+    opened_at = time.monotonic()
     with _lock:
         _depth += 1
         outermost = _depth == 1
@@ -174,8 +188,17 @@ def cold_build_window(reason: str) -> Iterator[None]:
     finally:
         with _lock:
             _depth -= 1
-            if _depth == 0:
+            closed = _depth == 0
+            if closed:
                 _reason = None
+        if closed:
+            logger.info(
+                "JIT cold-build window close (%s) after %.1fs: "
+                "deadline-bearing device collectives are back on their "
+                "steady-state deadline.",
+                reason,
+                time.monotonic() - opened_at,
+            )
 
 
 class ColdBuildWindowError(RuntimeError):
