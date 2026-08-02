@@ -776,13 +776,31 @@ def _measured_h2d_gbps_by_uuid(uuid: str):
 
 
 def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
-    """Max PCIe bandwidth of the card with this NVML UUID, GB/s, or ``None``.
+    """PCIe bandwidth of the SLOT this card sits in, GB/s, or ``None``.
 
     The card is resolved through the #331 IdentityMap by UUID and only then
-    converted to an NVML index for the two link queries. Never positionally:
-    CUDA enumerates FASTEST_FIRST and NVML in bus order, so a rank's CUDA
-    ordinal is not its NVML index on a mixed rig, and #392 is what happens when
-    those are conflated.
+    converted to an NVML index for the link queries. Never positionally: CUDA
+    enumerates FASTEST_FIRST and NVML in bus order, so a rank's CUDA ordinal is
+    not its NVML index on a mixed rig, and #392 is what happens when those are
+    conflated.
+
+    WIDTH COMES FROM THE CURRENT LINK, GENERATION FROM THE MAXIMUM, and the
+    asymmetry is measured, not stylistic. ``nvmlDeviceGetMaxPcieLinkWidth``
+    reports what the CARD can do, not what the SLOT gives it: on the reference
+    rig it returns x16 for all three cards while the slots are wired x4 / x8 /
+    x8. Deriving from it produced an equal ratio -- i.e. this whole feature
+    silently disabled on exactly the box it exists for. ``CurrPcieLinkWidth``
+    reports 4 / 8 / 8 and is the physical wiring.
+
+    Generation is the other way round. The current LINK STATE idles down (all
+    three cards report gen 1 at rest, and would report 4 under load), so a
+    current-generation read taken at weight-load time describes the power state
+    rather than the slot. Only ratios matter here and the generation is
+    uniform across a single board's slots, so the maximum is both stable and
+    sufficient.
+
+    This remains an ESTIMATE either way -- lanes x an encoding constant, not a
+    transfer anybody timed. The measured card probe outranks it.
     """
     try:
         from sglang.srt.registry.nvml import identity_map, nvml_session
@@ -791,7 +809,13 @@ def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
         with nvml_session() as pynvml:
             handle = pynvml.nvmlDeviceGetHandleByIndex(int(card.nvml_index))
             gen = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle))
-            width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
+            width = 0
+            try:
+                width = int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
+            except Exception:  # noqa: BLE001 - older binding: fall back below
+                width = 0
+            if width <= 0:
+                width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
     except Exception:  # noqa: BLE001 - absent driver/binding is not an error here
         return None
     lane = _PCIE_LANE_GBPS.get(gen)

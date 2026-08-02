@@ -95,6 +95,12 @@ class _FakePynvml:
         return self._gen[handle]
 
     def nvmlDeviceGetMaxPcieLinkWidth(self, handle):  # noqa: N802
+        # What the CARD can do. On the reference rig all three answer x16,
+        # which is why the derivation must not use it -- see the current-width
+        # test below.
+        return 16
+
+    def nvmlDeviceGetCurrPcieLinkWidth(self, handle):  # noqa: N802
         return self._width[handle]
 
 
@@ -638,3 +644,41 @@ def test_layers_staged_under_different_ratios_stay_visible_as_mixed(
         es.reset_for_tests()
 
     assert payload["totals"]["host_shard_policy"] == "mixed"
+
+
+# --------------------------------------------------------------------------
+# 6. the nameplate must read the SLOT, not the card
+# --------------------------------------------------------------------------
+
+
+def test_the_estimate_reads_the_negotiated_width_not_the_card_maximum(nvml_rig):
+    """Measured on the reference rig 2026-08-02, and it had disabled #394.
+
+    ``nvmlDeviceGetMaxPcieLinkWidth`` answers x16 for all three cards while the
+    slots are wired x4 / x8 / x8. Deriving from it yields an EQUAL ratio, an
+    equal ratio yields no ``ColdShardContext``, and the whole feature is a
+    silent no-op on exactly the box it exists for. The fake driver above
+    reproduces that shape, so this test fails if the derivation regresses to
+    the card maximum.
+    """
+    ratio = resolve_host_shard_ratio(3, UUID_BY_RANK, probe_gbps=lambda _u: None)
+
+    assert ratio.source == HOST_SHARD_SOURCE_NVML
+    assert not ratio.is_equal, "the derivation read the card maximum, not the slot"
+    assert ratio.weights == pytest.approx((0.4, 0.2, 0.4))
+
+
+def test_generation_still_comes_from_the_maximum_not_the_idle_link_state(nvml_rig):
+    """The link idles down (gen 1 at rest on all three cards here).
+
+    A current-generation read taken at weight-load time would describe the
+    power state, not the slot, and would scale every rank by the same wrong
+    constant -- harmless for the ratio, but the reason the asymmetry with width
+    is deliberate rather than an oversight. Pinned so a future "make both
+    current" tidy-up has to argue with a test.
+    """
+    from sglang.srt.layers.moe.expert_offload import _pcie_link_gbps_by_uuid
+
+    # gen 4 lane rate x the x4 slot: 1.969 * 4
+    assert _pcie_link_gbps_by_uuid("GPU-3080-a") == pytest.approx(1.969 * 4)
+    assert _pcie_link_gbps_by_uuid("GPU-5090") == pytest.approx(1.969 * 8)
