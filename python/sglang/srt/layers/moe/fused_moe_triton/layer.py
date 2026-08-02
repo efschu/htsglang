@@ -2146,18 +2146,31 @@ class FusedMoE(torch.nn.Module):
         """Captured-decode offload step (design §2): enforce the fixed-shape
         single-wave invariant, remap on device, issue the captured gather, and
         run ONE apply over the full (fixed-bs) batch. No host sync anywhere."""
+        from sglang.srt.layers.moe.expert_offload import worst_case_unique_spill
+
         cache = self._expert_offload
-        # §2 invariant: worst-case unique spill (== all routed slots) must fit
-        # the scratch region, or a captured step could silently drop spill
-        # experts (wrong output, not epsilon). Fail loudly at capture/warmup.
-        if topk_ids.numel() > cache.scratch:
+        # §2 invariant: worst-case unique spill must fit the scratch region, or
+        # a captured step could silently drop spill experts (wrong output, not
+        # epsilon). Fail loudly at capture/warmup.
+        #
+        # The bound is min(routed slots, cold experts), not routed slots alone:
+        # a step cannot route more DISTINCT experts than this rank's cold set
+        # holds. Under the #82 GGUF expert-dim shard that is the binding half,
+        # because forward_impl has already collapsed every foreign id onto the
+        # resident zero-pad expert. Reads shapes, never contents -- capture-safe.
+        needed = worst_case_unique_spill(
+            topk_ids.numel(), cache.num_local_experts, cache.resident_count
+        )
+        if needed > cache.scratch:
             raise RuntimeError(
                 f"MoE offload CUDA-graph capture: bucket needs up to "
-                f"{topk_ids.numel()} unique spill experts (tokens x top_k) but "
-                f"only {cache.scratch} scratch slots exist. Cap the captured "
+                f"{needed} unique spill experts (min of tokens x top_k = "
+                f"{topk_ids.numel()} and the cold set = "
+                f"{cache.num_local_experts - cache.resident_count}) but only "
+                f"{cache.scratch} scratch slots exist. Raise "
+                f"SGLANG_MOE_SCRATCH_SLOTS to >= {needed}, or cap the captured "
                 f"decode batch sizes (SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS or "
-                f"--cuda-graph-max-bs <= scratch // top_k) or raise "
-                f"SGLANG_MOE_SCRATCH_SLOTS."
+                f"--cuda-graph-max-bs)."
             )
         remapped = cache.prepare_capturable(topk_ids)
         sub = dispatch_output._replace(
