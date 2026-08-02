@@ -605,6 +605,48 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         tags=("c4-indexer-head-fold",),
         scope="general",
     ),
+    RejectedEntry(
+        key="slot_keyed_verify_intermediates",
+        what=(
+            "re-keying the speculative intermediate caches (intermediate_ssm, "
+            "intermediate_conv_window) by mamba slot instead of batch position"
+        ),
+        verdict=(
+            "DOES NOT FIT, AND FIXES NOTHING OPEN: the caches are sized "
+            "mamba_spec_state_size = max_num_reqs while the slot space is "
+            "max_mamba_cache_size, and max_num_reqs = max_mamba_cache_size // "
+            "mamba_ratio -- slot ids index those caches out of bounds by the "
+            "whole mamba ratio"
+        ),
+        gain=(
+            "self-owning rows: two concurrently verifying runners could share "
+            "one pool without colliding on row 0"
+        ),
+        cost=(
+            "the two largest speculative scratch buffers grow by the mamba "
+            "ratio, for a collision no configuration can reach"
+        ),
+        why=(
+            "The collision is real as a mechanism (measured in "
+            "test_verify_intermediate_row_ownership_450.py) but its "
+            "precondition is not: the #274 lane is its own ModelRunner with "
+            "its own req_to_token_pool and attention backend, and inside one "
+            "runner verifies are sequential on one stream. A per-lane offset "
+            "partition pays the same cost in miniature. Reopen if a second "
+            "verifier is ever handed an existing pool."
+        ),
+        level=BLOCKED,
+        evidence=(
+            "test/registered/unit/spec/test_verify_intermediate_row_ownership_450.py "
+            "(12 tests, 6 subtests: collision measured on a shared cache, clean "
+            "on disjoint ones, both instruments shown to report the wrong "
+            "configuration); model_runner_kv_cache_mixin.py "
+            "'if self.req_to_token_pool is None'; dual_group_lane.py "
+            "_build_lane_under_scope and _lane_server_args_view"
+        ),
+        tags=("verify-intermediate-rows", "dual-group-lane"),
+        scope="general",
+    ),
 )
 
 
