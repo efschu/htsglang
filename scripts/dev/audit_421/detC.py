@@ -38,15 +38,30 @@ Usage:
 
 import argparse
 import ast
+import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/tmp/a421")
 from astlib import Index, is_fork_file, is_test_path  # noqa: E402
 
+# Whole-tree derivations that do not depend on the gate. Memoised per Index
+# because ``--auto`` calls ``run_env`` a few hundred times and each of these
+# walks all ~5.5k trees: without the cache the sweep is ~2 h, with it ~50 min,
+# and the values are identical either way (the Index is immutable once built).
+_TREE_CACHE = {}
+
+
+def _cached(idx, key, build):
+    bucket = _TREE_CACHE.setdefault(id(idx), {})
+    if key not in bucket:
+        bucket[key] = build(idx)
+    return bucket[key]
+
+
 WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
-STOP_WORDS = set(
-    """
+STOP_WORDS = set("""
 the and for with that this from into when what only default true false none
 not but are was were has have had its it's they them their there here also
 which while every each both same other than then just like such over under
@@ -61,8 +76,7 @@ model models load loads loading weight weights tensor tensors quant config
 configs enable enabled disable disabled use uses used using build built
 builds make makes made keep keeps kept still same case cases path way ways
 half halves side sides pair pairs whole full part parts step steps
-""".split()
-)
+""".split())
 
 
 def env_reads(idx, env):
@@ -232,8 +246,8 @@ def run_env(idx, env, scope="inherit", verbose=True):
     helpers = env_reads(idx, env)
     gate = {env} | helpers
     doc = gate_doc_text(idx, gate)
-    syms = defined_symbols(idx)
-    attrs = attribute_assign_sites(idx)
+    syms = _cached(idx, "defined_symbols", defined_symbols)
+    attrs = _cached(idx, "attribute_assign_sites", attribute_assign_sites)
     words = {w for w in WORD_RE.findall(doc)}
     entities = sorted(
         w
@@ -254,8 +268,12 @@ def run_env(idx, env, scope="inherit", verbose=True):
             ref_mods.add(rel)
     scope_rels = set(ref_mods)
     if scope in ("inherit", "import"):
-        ig = import_graph(idx)
-        mod2rel = {module_of(r): r for r in idx.trees if module_of(r)}
+        ig = _cached(idx, "import_graph", import_graph)
+        mod2rel = _cached(
+            idx,
+            "mod2rel",
+            lambda i: {module_of(r): r for r in i.trees if module_of(r)},
+        )
         for r in list(ref_mods):
             want = base_class_modules(idx, r) if scope == "inherit" else ig[r]
             for m in want:
@@ -329,9 +347,13 @@ def main():
     a = ap.parse_args()
     idx = Index(a.root)
     targets = [a.env] if a.env else fork_envs(idx)
-    print(f"# DETECTOR C on {a.root} scope={a.scope} targets={len(targets)}")
+    print(
+        f"# DETECTOR C on {a.root} scope={a.scope} targets={len(targets)}",
+        flush=True,
+    )
     nfired = 0
-    for env in targets:
+    for n, env in enumerate(targets, 1):
+        print(f"[{n}/{len(targets)}] {env}", file=sys.stderr, flush=True)
         r = run_env(idx, env, a.scope)
         if not r["entities"]:
             continue
@@ -364,7 +386,7 @@ def main():
         print(
             f"  other unhonoured ({len([h for h in r['unhonoured'] if h['entity'] not in r['strong']])}) [weak tier, not reported]"
         )
-    print(f"\n# fired: {nfired}/{len(targets)}")
+    print(f"\n# fired: {nfired}/{len(targets)}", flush=True)
 
 
 if __name__ == "__main__":

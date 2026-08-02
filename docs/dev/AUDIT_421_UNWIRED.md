@@ -478,3 +478,251 @@ exclusion, or every packaged feature looks wired.
 The pins deliberately do not assert "feature is broken" — they assert a
 reachability fact with a named remedy. Relaxing one instead of deleting it
 would re-create exactly the blindness this audit exists to remove.
+
+---
+
+# 2026-08-02 — task #428: fixes, named decisions, and the Detector C sweep
+
+Desk follow-up on the audit above. Base `14d0675bbc`, branch
+`fix/unwired-421-fixes-428`. No GPU was touched; the two HIGH fixes are
+therefore reported **BOOT-PENDING** and carry a turnkey validation script
+each (§B.6).
+
+## B.1 Per-finding disposition
+
+| # | Sev | Disposition | Where |
+|---|-----|-------------|-------|
+| F1 | High | **FIXED (boot-pending)** — `auto` gets the #272 planner's table injected | `managers/kv_ladder_auto.py` (new), `managers/kv_pressure_runtime.py` |
+| F2 | High | **FIXED (boot-pending)** — the three `--lane-offload-*` flags reach the register at runner init | `model_executor/offload_register.py`, `model_executor/model_runner.py`, `model_executor/offload_movement.py` |
+| F3 | High | open (L: needs the scheduler-side transition driver, not a wiring line) | pinned, unchanged |
+| F4 | Medium | open (self-declared inert, #394 reachability slice 2) | pinned, unchanged |
+| F5 | Low | **CLOSED — deleted** | `layers/fused_qk_norm.py` removed |
+| F6 | Medium | open (#407, no consumer yet) | pinned, unchanged |
+| F7 | Low | **CLOSED — kept, as a reservation, with a pointer** | `barlink_env_guard.py:122` |
+| F8 | Medium | **CLOSED — explicit named refusal, not a wiring** | `layers/moe/expert_offload.py` |
+| F9 | Low–Med | **DOCUMENTED — belongs to #279; open question answered** | `barlink_path_dispatcher.py` |
+
+## B.2 F1 — the audit's one-line fix was wrong, and how
+
+The audit proposed: *"import `planner.kv_ladder_table.build_ladder_table` at
+that call site and pass it as `table_fn`."* Checked against the code, that
+does not compile into anything that works: `table_fn` is called as
+`table_fn()` with no arguments, while `build_ladder_table(profile,
+*, …)` requires a `RigModelProfile` — and **no production code path
+constructs one**. Every existing `RigModelProfile` in the tree is built by a
+unit test or by the planner's own offline CLI. The missing piece was not an
+import, it was the profile bridge.
+
+`managers/kv_ladder_auto.py` is that bridge. Three constraints shaped it, and
+each one rules out an easier implementation:
+
+- **Rank-uniformity.** The ladder's rung index is min-reduced across the TP
+  group; two ranks with different tables would agree on an integer that means
+  different things. So every input must be identical on every rank *by
+  construction*. That excludes `torch.cuda.mem_get_info` (a rank under
+  `CUDA_VISIBLE_DEVICES` narrowing sees only its own card) and it excludes
+  any collective (the bridge runs in the scheduler constructor, the
+  rank-local-before-group window).
+- **Card identity by UUID.** The rank → card mapping comes from the
+  launcher-published vector (`registry.rank_cards`, an environment read, the
+  same source #394 uses), and card facts from NVML by UUID. Without the
+  vector the mapping is only recoverable on a rig whose cards are
+  indistinguishable; on a mixed rig the bridge **refuses and names the two
+  remedies** rather than guessing an enumeration order (#392/#397).
+- **Only rungs whose actuator exists.** `server_args`' actuator-dependency
+  refusals apply to an explicit tuple spec only — `auto` had no equivalent
+  gate — while `KvPressureRuntime.__init__` refuses an `admission_cap` rung
+  without an armed limiter. The profile therefore inventories a relief
+  feature only when this configuration wires its actuator, so `auto` cannot
+  produce a table the runtime rejects.
+
+Deliberately **not** supplied: `kv_bytes_per_token` and
+`weight_bytes_total`. Both are per-rank runtime facts under uneven DCP /
+uneven TP, so deriving a model-wide figure from one rank's pool is the one
+input capable of making two ranks' tables disagree. Their absence means every
+rung carries the planner's `placeholder` provenance and says so in its own
+`source` field. That is the honest state; the measured figures are a
+follow-up off the ms/round chain, not an estimate inserted here.
+
+## B.3 F2 — configure before the first read, once per process
+
+`configure_global_register_from_server_args` is called at the top of
+`ModelRunner.__init__`, which is the earliest point that is also *after*
+`server_args` exists: the pools, input buffers and lane workspaces whose
+adapters call `get_global_register()` are all created later in the same
+`__init__`. Two properties the audit's one-line suggestion does not mention
+and that the fix has to get right:
+
+- **Once per process.** A draft runner and a #274 dual-group lane runner each
+  construct a further `ModelRunner` in the same process. `configure_*`
+  rebuilds the register, which would drop every item the first runner's
+  adapters already booked, so the entry point is idempotent and records that
+  it has run.
+- **The park order needed a home.** `configure_global_register` had no
+  parameter for it. It now takes one, the register exposes it, and
+  `offload_movement.park_target_order_from_register()` is where the movement
+  layer picks it up — an omitted `target_order` on `RealMovementBackend` now
+  defaults to the operator's chain instead of the module constant. Nothing in
+  production constructs that backend yet (a separate, GPU-phase gap), so this
+  is the honest reach of the fix: the flag now has a runtime consumer path,
+  not a runtime consumer.
+
+Values are **re-resolved** at configure time rather than passed down from
+argument time, so a typo refuses loudly at runner init as well — including on
+the direct-`ServerArgs`-construction path that never runs the argument-time
+validator.
+
+## B.4 F8 — refusal, not wiring, and the reason is a measurement
+
+The audit left the choice open between threading the cold-shard context into
+the fp8/GPTQ/AWQ presplit callers and an explicit refusal. Checked against
+#394's own work, it has to be the refusal, and threading would have been
+actively wrong:
+
+The parameter's documented precondition is "only legal on a layer that shards
+experts on dim 0 and remaps foreign ids away". That is exactly the
+configuration in which delegation is **unsound** — `partition_cold_experts`
+drops the experts it delegates to a peer's host tier, and under a disjoint
+expert shard no peer holds them. The GGUF door found this by booting: on the
+reference rig (V4-Flash UD-IQ3_XXS, TP=3, 2026-08-02) every rank died on the
+first forward with *"experts [80, 83, 94] were delegated to a peer rank's
+host tier … but this rank's router asked for them"*, which is why
+`_gguf_cold_shard_context` returns `None` by default today.
+
+So the repack door is shut in both directions and says which one applies: an
+intermediate-dim TP MoE has no whole expert to delegate; an EP or GGUF
+expert-shard layer could delegate structurally but the delegated experts
+would be unreachable. `SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE` — the same
+escape hatch the GGUF door carries — opens the eligible case for developing
+the missing reachability mechanism against a real boot.
+
+Note for the next sweep: a `cold_shard=refusal_helper(layer)` at the four
+call sites would have made Detector B report the parameter WIRED while it is
+still always `None`. That is the #394 forwarding-taint shape, deliberately
+avoided.
+
+## B.5 F5 and F7 — the two named decisions
+
+**F5 `layers/fused_qk_norm.py`: DELETED.** Provenance is the interesting
+part. `git log --diff-filter=A` attributes the file to `3f5e2c7688`
+(*"[AMD] Dsv4/pr2 compressor opt (#26208)"*), an upstream-titled commit — but
+that commit is **not** an ancestor of `upstream/main`, `upstream/main` has no
+commit touching the path, and the file is absent from the upstream tree. The
+consistent reading is a rebase artefact: the fork's own ATOM port
+(the docstring says *"Ported from ATOM (atom/model_ops/layernorm.py)"*) was
+folded into a rebased upstream commit. It has zero importers anywhere in the
+tree, no design doc and no catalog entry; the similarly named live path
+(`fused_qk_norm_rope_store.py`, used by `models/deepseek_v4.py`) is
+unrelated. Deleting it costs nothing and removes a name that reads like a
+live kernel.
+
+**F7 `SGLANG_BARLINK_PP_TRANSPORT`: KEPT as a reservation, with a pointer
+comment.** Cross-checked against #201 slice 3 (`feat/tpxppxtp-slice3-201`,
+unmerged) as instructed: slice 3 does **not** consume it — its only mention
+on that branch is the same retired-name guard row and the same DESIGN_201
+table line that exist at this tip. The row is therefore not a rename of a
+working knob; neither name ever had a reader. It is kept anyway because
+DESIGN_201 still lists the successor as the stage-boundary P2P lever, so
+whoever implements it inherits the retired-name protection for free. The
+comment at `barlink_env_guard.py:122` says all of this, so nobody reads the
+row as evidence the knob exists.
+
+## B.6 Boot-pending — what the desk cannot show
+
+`scripts/dev/428_boot_checks/` holds one turnkey script per HIGH fix. Neither
+fix is DONE until they pass in a GPU window.
+
+- `f1_kv_pressure_ladder_auto.sh` — boots the standard 27B recipe with
+  `--kv-pressure-ladder auto`, asserts the table was computed from the real
+  rig profile, drives KV pressure for a bounded time, asserts a rung flip
+  fires and that serving is still coherent after it.
+- `f2_lane_offload_register.sh` — boots with all three `--lane-offload-*`
+  flags under `SGLANG_OFFLOAD_REGISTER=1`, asserts the operator's profile and
+  park chain reached the register, asserts exactly one configure per process
+  with a NEXTN draft runner present, then asserts a planted typo refuses the
+  boot instead of degrading to the default preset.
+
+## B.7 Detector C: the full sweep the audit did not run
+
+§8 named this as *"the single largest remaining gap"*. It is now run.
+
+**Detector change (performance only).** `run_env` recomputed
+`defined_symbols` and `attribute_assign_sites` — two full walks of ~5.5k
+trees — for every target, which put the 381-target sweep at ~2 h. Both are
+now memoised per `Index` (the index is immutable once built), and the sweep
+runs in ~35 min. The README's calibration contract was re-verified against
+the patched detector: at `ef6f8bc0a2^` it still fires STRONG on `lm_head`
+(`models/qwen3_vl.py:1280,1288`) with `embed_tokens` honoured, and it is
+still a correct negative at HEAD.
+
+**Scope.** `--auto` enumerates envs, not flags: Detector C's entity harvest
+starts from a gate name that appears literally in function bodies, which is
+what an `SGLANG_*` read looks like and is not what a `ServerArgs` field
+access looks like. The **flag half of the sweep was not run** and is a named
+remaining gap, not a silent omission.
+
+**Result: 381 fork-scoped env names, 36 STRONG fires raw, 0 verified
+findings.**
+
+| tier | count | disposition |
+|---|---|---|
+| detector blowup (≥ 15 strong entities) | 20 | ARTEFACT, not reported |
+| hand-traced | 10 | all false positives |
+| tractable, not traced | 6 | **unverified**, named below |
+
+**The blowup tier is a detector limit worth recording.** Twenty fires carry
+73–147 strong entities against 552–6414 honoured sites — an "asymmetric gate"
+spanning most of the tree is not a finding, it is a broken gate set. The
+cause is `env_reads`: it treats any function under 40 lines whose body
+mentions the env as a predicate helper, and when the enclosing function
+happens to be named `ledger`, `all_gather`, `recv`/`send`, `get_path` or
+`process_weights_after_loading`, the gate set becomes a tree-wide token and
+every `self.X = Call()` in the codebase enters the comparison. A future
+Detector C run should require a helper name to be *unique* to the gate's
+module, or cap the gate set.
+
+**The traced tier is one recurring false-positive shape, plus two subshapes.**
+Verbatim, so the next run does not re-litigate them:
+
+| env | strong entity | why it is not a finding |
+|---|---|---|
+| `SGLANG_DFLASH_SOLO_POOL_CAP` | `num_draft_slots` | a constructor *parameter* of `DraftKVSlotMapper`, assigned in its own `__init__`; the "honoured" sibling is the site that calls it |
+| `SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY` | `device_clock` | one object, two lifecycle phases: created in `__init__`, bound to the stream in the honoured `start_worker` |
+| `SGLANG_EXPERT_STATS`, `…_PATH`, `…_INTERVAL_SEC` | `graph_mode`, `num_experts` | constructor parameters assigned to `self` inside the collector the gate governs |
+| `SGLANG_UNEVEN_DCP`, `…_WEIGHTED`, `SGLANG_UNEVEN_MLP_VECTOR` | `cmd`, `intermediate` | `cmd` is a subprocess argv builder in `planner/split_probe.py`; `intermediate` is an HF-config field parsed in `uneven_perf.py`. Prose collision, no relation to the gate |
+| `SGLANG_BARLINK_TRANSPORT` | `transport`, `host` | `barlink.py:526` assigns `self.transport = _build_transport(_TRANSPORT, …)` — `_TRANSPORT` **is** the gate value, read into a module constant. The detector matches the literal env name in the function body and cannot see the constant. This is the §1.2 prefix/indirection blind spot in a new dress |
+| `SGLANG_HACK_FLASHMLA_BACKEND` | `unified` | the def site is in `deepseek_v4_backend_hip_radix.py`, which exists in `upstream/main` — inherited, outside the audit's fork-delta scope |
+
+**Unverified, and named so the next slice starts here:**
+`SGLANG_BARLINK_SLOT_MIB`, `SGLANG_BARLINK`,
+`SGLANG_ADAPTIVE_SERVING_MARGIN_MIB`, `SGLANG_MOE_RESIDENT_EXPERT_FRACTION`,
+`SGLANG_CACHE_DIR`, `SGLANG_USE_HND_KVCACHE`. The last two have def sites in
+files that are in `upstream/main` and are very likely out of scope for the
+same reason as `SGLANG_HACK_FLASHMLA_BACKEND`; the first four each carry 2–6
+strong entities with generic names (`device`, `host`, `lock`, `planner`,
+`kernel`, `runner`) and look like the same prose-collision shape, but they
+were **not** traced and are not claimed either way.
+
+**What this does and does not license.** The #197 shape is now swept across
+every fork-scoped env at HEAD and produced nothing verified. It does *not*
+mean the fork has no partial wiring: the detector cannot fire on an
+undocumented gate (§8), cannot see a gate read through a module constant (the
+`SGLANG_BARLINK_TRANSPORT` row above proves that on live code), and the flag
+half was not run at all.
+
+## B.8 Pins
+
+Two of the eight #421 pins are retired, per their own instruction ("delete
+the pin, do NOT widen it"): `TestKvPressureLadderAutoIsUnreachable` (F1) and
+`TestOffloadRegisterProfileIsUnreachable` (F2). Four remain green (F3 ×2,
+F4, F6). `test_unwired_features_421.py` carries a comment naming what
+replaced each retired pin.
+
+Positive replacements, each with a documented can-fail proof:
+
+| file | covers |
+|---|---|
+| `test/registered/unit/managers/test_kv_ladder_auto_421.py` | F1: the runtime builds under `auto`; the profile is rank-uniform, UUID-keyed and refuses a mixed rig without a card vector; only wired reliefs are inventoried; the default path never evaluates the table source |
+| `test/registered/unit/model_executor/test_offload_register_wiring_421.py` | F2: all three flags observable in the register; planted typos refuse; once-per-process; and an AST pin on the **call site**, so a refactor cannot move the configure step after the first adapter read |
+| `test/registered/unit/layers/test_expert_offload_repack_door_421.py` | F8: eligibility classification, both refusal messages, the escape hatch, and the real entry point refusing before doing any work |
+| `test/registered/unit/distributed/test_barlink_dispatcher_inert_421.py` | F9: the overflow tier is reachable at exactly 1.0 and works with a measured threshold; `transport_hint` is pinned as an absence, and the hook is shown to work once a hint exists |

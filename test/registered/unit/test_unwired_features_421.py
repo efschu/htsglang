@@ -66,9 +66,7 @@ def _calls_named(tree, func_name):
         name = (
             callee.id
             if isinstance(callee, ast.Name)
-            else callee.attr
-            if isinstance(callee, ast.Attribute)
-            else None
+            else callee.attr if isinstance(callee, ast.Attribute) else None
         )
         if name == func_name:
             yield node
@@ -120,102 +118,26 @@ def _production_importers_of(dotted_module, exclude_package=False):
     return hits
 
 
-class TestKvPressureLadderAutoIsUnreachable(CustomTestCase):
-    """``--kv-pressure-ladder auto`` cannot be used: no caller injects a table.
-
-    ``build_ladder_from_server_args(server_args, *, table_fn=None)`` raises
-    ValueError when the spec is ``auto`` and ``table_fn`` is None. Its help
-    text advertises auto as "computed once from the rig/model profile by the
-    #272 planner", and argument-time validation accepts the value. But the
-    sole production construction site --
-    ``managers/kv_pressure_runtime.build_kv_pressure_runtime`` -- calls it
-    positionally with no ``table_fn``, so the advertised mode is a guaranteed
-    late crash rather than a feature.
-
-    The fix is to inject ``planner.kv_ladder_table.build_ladder_table``
-    (which exists, and is tested) at that call site.
-    """
-
-    CALL_SITE = "python/sglang/srt/managers/kv_pressure_runtime.py"
-
-    def test_sole_production_caller_still_omits_table_fn(self):
-        tree = _parse(_REPO_ROOT / self.CALL_SITE)
-        calls = list(_calls_named(tree, "build_ladder_from_server_args"))
-        self.assertEqual(
-            len(calls),
-            1,
-            "expected exactly one construction site; the pin needs rewriting "
-            f"if that changed (found {len(calls)})",
-        )
-        kwargs = {kw.arg for kw in calls[0].keywords}
-        self.assertNotIn(
-            "table_fn",
-            kwargs,
-            "GOOD NEWS: the auto ladder table is now injected. #421 finding "
-            "F1 is fixed -- delete this pin and its audit entry.",
-        )
-
-    def test_no_production_module_supplies_the_planner_table_builder(self):
-        callers = _production_callers_of(
-            "build_ladder_table",
-            defining_rel_paths=("python/sglang/srt/planner/kv_ladder_table.py",),
-        )
-        self.assertEqual(
-            callers,
-            [],
-            "GOOD NEWS: build_ladder_table now has a production caller "
-            f"({callers}). #421 finding F1 is fixed -- delete this pin.",
-        )
-
-
-class TestOffloadRegisterProfileIsUnreachable(CustomTestCase):
-    """The three ``--lane-offload-*`` flags never reach the offload register.
-
-    ``server_args._handle_lane_offload_register`` parses and validates
-    ``--lane-offload-profile``, ``--lane-offload-class-policy`` and
-    ``--lane-offload-park-targets``, then discards the resolved values with
-    the comment "recomputed at configure time".
-
-    ``configure_global_register(profile, class_policy_overrides, ...)`` is
-    that configure-time entry point, and its docstring says it is "called
-    once at runner init when the register is enabled". No production module
-    calls it. With ``SGLANG_OFFLOAD_REGISTER=1`` the register is instead
-    built by ``get_global_register()``'s fallback, which constructs a bare
-    ``OffloadRegister()`` on the default (latency) profile -- so the operator's
-    profile choice is silently discarded.
-    """
-
-    DEFINING = "python/sglang/srt/model_executor/offload_register.py"
-
-    def test_configure_global_register_has_no_production_caller(self):
-        callers = _production_callers_of(
-            "configure_global_register", defining_rel_paths=(self.DEFINING,)
-        )
-        self.assertEqual(
-            callers,
-            [],
-            "GOOD NEWS: the offload register is now configured from the CLI "
-            f"flags ({callers}). #421 finding F2 is fixed -- delete this pin.",
-        )
-
-    def test_park_target_order_never_reaches_the_movement_layer(self):
-        """The parsed park order is validated in server_args and dropped.
-
-        Only the defining module and the argument-time validator mention it;
-        no runtime consumer takes the operator's order.
-        """
-        callers = _production_callers_of(
-            "parse_park_target_order",
-            defining_rel_paths=(self.DEFINING,),
-        )
-        # server_args.py calls it purely to raise on bad syntax.
-        self.assertEqual(
-            callers,
-            ["python/sglang/srt/server_args.py:6542"],
-            "the only production call should be the argument-time validator; "
-            f"found {callers}. If a runtime consumer appeared, #421 finding "
-            "F2 is (partly) fixed -- re-check and update the pin.",
-        )
+# RETIRED PINS -- #421 F1 and F2 are FIXED (task #428).
+#
+# ``TestKvPressureLadderAutoIsUnreachable`` and
+# ``TestOffloadRegisterProfileIsUnreachable`` lived here. Both asserted an
+# absence that no longer holds, and the pins' own instruction is to delete
+# rather than widen them:
+#
+# * F1 -- ``--kv-pressure-ladder auto`` now gets the #272 planner's table
+#   injected at ``managers/kv_pressure_runtime.py``. Replaced by
+#   ``test/registered/unit/managers/test_kv_ladder_auto_421.py``, which
+#   asserts the POSITIVE fact (the runtime builds) at the same call site.
+# * F2 -- the three ``--lane-offload-*`` flags now reach the register through
+#   ``configure_global_register_from_server_args`` at ModelRunner init.
+#   Replaced by
+#   ``test/registered/unit/model_executor/test_offload_register_wiring_421.py``,
+#   which additionally pins the CALL SITE, so a refactor cannot move the
+#   configure step after the first adapter read and silently restore the
+#   fallback register.
+#
+# Both replacements carry a can-fail proof (see their module docstrings).
 
 
 class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):

@@ -54,8 +54,29 @@ python3 detC.py <tree_root> --env SGLANG_GGUF_DENSE_VOCAB
 ```
 
 Entities come from the gate's own docstring, so C cannot fire on an
-undocumented gate. Trust the STRONG tier (100 % precision on the one case with
-known ground truth); the weak tier ran at 10 %.
+undocumented gate.
+
+`--auto` was swept over all 381 fork-scoped envs at `14d0675bbc` (task #428,
+audit doc section B.7). Two results bound what the STRONG tier is worth:
+
+- **Trust it only after the blowup filter.** 20 of 36 fires carried 73-147
+  strong entities against thousands of honoured sites. `env_reads` promotes
+  any sub-40-line function mentioning the env to a "predicate helper", so a
+  gate whose read sits inside a function called `ledger`, `all_gather`,
+  `recv`, `get_path` or `process_weights_after_loading` acquires a tree-wide
+  token and every `self.X = Call()` enters the comparison. Cap the gate set,
+  or require the helper name to be unique to the gate's module.
+- **A gate read into a module constant is invisible.** `barlink.py` does
+  `self.transport = _build_transport(_TRANSPORT, ...)` where `_TRANSPORT` is
+  the module-level read of `SGLANG_BARLINK_TRANSPORT`; the detector matches
+  the literal env name in the function body and reports the honoured site as
+  unhonoured. Same family as the `_e(name)` prefix blind spot.
+
+The whole-tree derivations (`defined_symbols`, `attribute_assign_sites`,
+`import_graph`, the module map) are memoised per `Index` -- the index is
+immutable once built, and without the cache `--auto` takes ~2 h instead of
+~35 min. Behaviour is unchanged; the calibration below was re-verified against
+the memoised version.
 
 ## Detector D — module reachability
 
