@@ -304,6 +304,33 @@ def moe_uneven_tp_units(intermediate_size: int, quant_config) -> int:
     return _activation_vec_units(intermediate_size)
 
 
+_HOST_SHARD_UNREACHABLE_WARNED = False
+
+
+def _warn_host_shard_unreachable_once() -> None:
+    """Say once why #394 is inert on a disjoint expert shard.
+
+    Silence here would look identical to "no ratio configured", and an operator
+    who set the ratio deliberately would be left guessing.
+    """
+    global _HOST_SHARD_UNREACHABLE_WARNED
+    if _HOST_SHARD_UNREACHABLE_WARNED:
+        return
+    _HOST_SHARD_UNREACHABLE_WARNED = True
+    import logging
+
+    logging.getLogger(__name__).info(
+        "MoE cold-expert host shard (#394) is INERT on this layer: the #82 "
+        "expert-dim shard gives the ranks disjoint expert ranges, so a "
+        "delegated cold expert is not relocated to a peer -- it is absent, and "
+        "the first token routed to it fails in ExpertResidencyPlanner.resolve "
+        "(measured 2026-08-02, V4-Flash TP=3). Delegation needs a shared-memory "
+        "host pool or a replicated-expert EP dispatch first. "
+        "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE=1 re-enables it for developing "
+        "that mechanism; it is not a performance option."
+    )
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -1291,12 +1318,30 @@ class FusedMoE(torch.nn.Module):
     def _gguf_cold_shard_context(self):
         """#394: this rank's share of the cold pool, or ``None``.
 
-        The precondition ``ColdShardContext`` states is "the layer shards
-        experts on dim 0 and remaps foreign ids away from this rank" -- which is
-        exactly the #82 GGUF expert-dim shard and nothing else, so
-        ``_gguf_expert_shard`` IS the eligibility test. On an intermediate-dim
-        TP MoE every rank holds a slice of every expert and nothing may be
-        delegated.
+        REFUSED BY DEFAULT, and the reason is a measurement rather than
+        caution. Booted on the reference rig 2026-08-02 (V4-Flash UD-IQ3_XXS,
+        TP=3): all 43 layers staged, the ratio resolved, and every rank died on
+        the first forward inside ``ExpertResidencyPlanner.resolve`` --
+        "experts [80, 83, 94] were delegated to a peer rank's host tier ... but
+        this rank's router asked for them".
+
+        The premise does not hold here. ``partition_cold_experts`` keeps this
+        rank's share of ITS OWN cold experts and drops the rest. Under the #82
+        GGUF expert-dim shard the ranks hold DISJOINT expert ranges, so no peer
+        holds rank 0's expert 80: a delegated expert is not relocated, it is
+        absent, and the first token routed to it has nowhere to go. Delegation
+        is sound only when a delegated expert stays REACHABLE -- either the
+        pinned host pools are shared memory so a rank can DMA out of a peer's
+        pool (they are all host DRAM already, so this is a mapping question),
+        or the experts are replicated with an EP-style dispatch to the owner.
+
+        So ``_gguf_expert_shard`` is not the eligibility test it was documented
+        as: it is TRUE exactly when experts are sharded disjointly, i.e. exactly
+        when delegation is UNSOUND. Until a reachability mechanism exists, the
+        honest answer is ``None`` -- the pre-#394 plan, field for field. The
+        escape hatch below exists so the mechanism can be developed against a
+        real boot; it is not a performance option, and it reproduces the crash
+        above on this model.
 
         The per-rank card UUIDs come from the vector the LAUNCHER published
         (:mod:`sglang.srt.registry.rank_cards`, #407 cut 2) -- an environment
@@ -1317,6 +1362,13 @@ class FusedMoE(torch.nn.Module):
         world = int(getattr(self, "moe_tp_size", 1) or 1)
         if world < 2:
             return None
+
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.get():
+            _warn_host_shard_unreachable_once()
+            return None
+
         from sglang.srt.layers.moe.expert_offload import cold_shard_context
         from sglang.srt.registry.rank_cards import rank_card_uuids
 

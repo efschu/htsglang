@@ -1134,6 +1134,15 @@ class Envs:
     # either setting; an unknown link yields an equal split, which is exactly
     # today's assignment.
     SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE = EnvStr("estimate")
+    # #394: allow cold-expert delegation on a layer whose ranks hold DISJOINT
+    # expert ranges (the #82 GGUF expert-dim shard). Off, because there it is
+    # unsound: a delegated expert is not relocated to a peer, it is absent, and
+    # the first token routed to it fails. Measured 2026-08-02 on V4-Flash TP=3 --
+    # all 43 layers staged, then every rank died on the first forward. The flag
+    # exists to develop the missing reachability mechanism (a shared-memory host
+    # pool, or replicated experts with an EP dispatch) against a real boot. It
+    # is not a performance option.
+    SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE = EnvBool(False)
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;

@@ -705,3 +705,75 @@ baseline row are different findings and must not look alike.
 `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` takes the host-sync-free path and is not
 counted. The A/B is therefore run on the offload's default eager path, which is
 also where the merged baseline (146.3 ms/token) was taken.
+
+### 11.5 The card window (2026-08-02): #394 does not run, and the model was optimistic
+
+Two findings, both from the merged V4-Flash recipe (UD-IQ3_XXS, TP=3 uneven,
+fraction 0.485/0.42/0.42, eager, bs=1, chunk 512).
+
+**Finding 1 — the proportional arm loads and then refuses to serve.** With the
+rank->card vector published and the ratio resolved (0.400/0.200/0.400), all 43
+MoE layers staged correctly: rank 0 owned 40.7 % of its cold pool, rank 1 (the
+x4 card) 19.5 %, rank 2 39.0 %. The server reached `Application startup
+complete` and died on the first forward, on all three ranks, in #394's own
+precondition guard:
+
+> experts [80, 83, 94] were delegated to a peer rank's host tier by the #394
+> link-proportional cold shard, but this rank's router asked for them.
+
+**This is not a wiring bug; it is the design premise.** `partition_cold_experts`
+splits *this rank's own* cold experts and drops the ones apportioned to peers.
+Under the #82 GGUF expert-dim shard the ranks hold **disjoint** expert ranges,
+so no peer holds rank 0's expert 80 — a "delegated" expert is not relocated, it
+is *absent*, and the first token routed to it has nowhere to go. Delegation is
+sound only if a delegated expert stays reachable, which requires one of:
+
+* the pinned host pools live in **shared** memory, so any rank can DMA an
+  expert out of a peer's pool (all three pools are host DRAM already, so this
+  is a mapping question, not a new tier); or
+* the experts are **replicated** across ranks plus an EP-style dispatch that
+  sends the token to whichever rank owns the copy.
+
+`_gguf_expert_shard` — the eligibility test the wiring uses — is TRUE exactly
+when experts are sharded *disjointly*, i.e. exactly the case where delegation
+is unsound. **The eligibility test is inverted with respect to the precondition
+it claims to enforce.** The guard the inert build shipped did its job: it turned
+a silent wrong-output into a named refusal at the first forward.
+
+**Finding 2 — the recoverable gain is 1.36x, not 1.69x/1.77x.** §7.3 derived
+Path A from an equal 1/3 byte split per rank. The equal-shard arm's *measured*
+split is not equal, because uneven TP already hands the x4 rank fewer experts:
+
+| rank | H2D moved | share | measured link | transfer time |
+|---|---|---|---|---|
+| tp0 (5090, x8) | 258.0 GiB | 40.0 % | 14.42 GB/s | 19.2 s |
+| tp1 (3080, **x4**) | 165.2 GiB | 25.6 % | 6.45 GB/s | **27.5 s** |
+| tp2 (3080, x8) | 222.4 GiB | 34.4 % | 13.41 GB/s | 17.8 s |
+
+The x4 rank is still the clock, at **1.28x the mean** — the effect is real and
+now measured rather than modelled. But perfect proportional placement moves
+27.5 s to 20.2 s, i.e. **1.36x on the transfer term**, and the transfer term is
+only part of a 135 ms/token decode. The 1.77x figure (and §7.3's 1.69x) assumed
+a 33/33/33 split that this configuration never had.
+
+**Consequence for §7.8.** Recommendation 1 keeps its direction and loses most of
+its size. It is now: an **M-to-L** item (a shared-memory host tier or an EP
+dispatch, not "placement policy only"), for a **1.36x** ceiling on the transfer
+term rather than 1.69x end-to-end. That materially changes its position against
+recommendation 3 (the CPU lane), whose own margin §7.4 put at 0-28 % *over* a
+working A'. With A' unbuilt and smaller than advertised, the two should be
+re-ranked together rather than sequentially.
+
+**Baseline, for the record.** Equal shards, same recipe: **135.1 / 140.1 / 135.4
+ms/token** across three passes over two boots (mean 136.9). The A-vs-A floor on
+this box today is **~5 % CV within a pass and 3.6 % between passes** — wider
+than the 2.55 % the merged baseline was judged on, so nothing below ~4 % would
+have been callable from this window even if the proportional arm had run.
+
+| what | value |
+|---|---|
+| hit rate, activation grain | 0.820 aggregate (0.772 / 0.843 / 0.841) |
+| hit rate, unique grain | 0.622 aggregate |
+| vs WASTE's 0.14 | **5.9x** |
+| decode, equal shards | 136.9 ms/token mean, floor ~5 % CV |
+| decode, proportional shards | **not measurable — arm does not serve** |
