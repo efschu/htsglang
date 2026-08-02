@@ -6525,7 +6525,13 @@ class ServerArgs:
     def _handle_lane_offload_register(self):
         """#286 offload register: fail fast on invalid profile / per-class
         policy syntax. Pure validation -- the register itself is built at
-        runner init (and only with SGLANG_OFFLOAD_REGISTER=1)."""
+        runner init by
+        ``offload_register.configure_global_register_from_server_args``
+        (and only with SGLANG_OFFLOAD_REGISTER=1), which re-resolves these
+        same values. Until #421 F2 that configure step had no production
+        caller, so the three flags were validated here and then silently
+        dropped; the duplication is deliberate -- this half fails a typo at
+        argument time even when the register is disabled."""
         from sglang.srt.model_executor.offload_register import (
             parse_class_policy_overrides,
             parse_park_target_order,
@@ -6533,8 +6539,8 @@ class ServerArgs:
         )
 
         # Raises ValueError on unknown profile/class/policy/fraction/target;
-        # the resolved values are discarded here (recomputed at configure
-        # time).
+        # the resolved values are discarded here and recomputed at configure
+        # time by configure_global_register_from_server_args (#421 F2).
         resolve_class_policies(
             self.lane_offload_profile,
             parse_class_policy_overrides(self.lane_offload_class_policy),
