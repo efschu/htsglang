@@ -103,13 +103,31 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
 - **Expert offload**: MoE experts in a pinned host-RAM pool, streamed over
   PCIe on demand. **CUDA-graph-compatible path EXISTS** (decode-graph +
   eager-prefill hybrid): GPU kernels read the pinned pool via UVA zero-copy
-  indexed by device-resident router ids — no host sync. The DeepSeek-V4 GGUF
-  path still uses a `tolist()`-syncing variant: that is a PORTING item, not a
-  wall. Double-buffered prefetch with compute overlap; expert-major prefill
+  indexed by device-resident router ids — no host sync. **#443 ported the
+  DeepSeek-V4 GGUF path onto it** (it was the last `tolist()`-syncing caller,
+  and the ranked-#2 cause of the 2.6x decode gap in BENCH_394). The port added
+  no mechanism: the capture-admission bound was tightened from `tokens x top_k`
+  to `min(tokens x top_k, cold set)` — under the #82 expert-dim shard the loose
+  half refused captures that are provably safe, because `forward_impl` has
+  already collapsed foreign ids onto the resident zero-pad expert — and the
+  #394 cold-tier seam grew a device breach counter read at the replay boundary
+  (`moe/offload_capture_gate.py`, the #431 pattern) so its development switch
+  is no longer a switch into an out-of-bounds gather. Desk-proven: no host read
+  survives the ported step (interception over
+  `item/tolist/cpu/numpy/nonzero/__bool__/__int__/__float__/__index__`), and
+  the captured gather lands byte-identical scratch rows vs the eager `_fetch`
+  (`tests/moe_offload/test_capture_desync_port.py`, 63 tests, four executed
+  can-fail arms). BOOT-PENDING: actual V4 capture + replay correctness + perf,
+  `scripts/dev/443_graph_proof/`. Sizing note from that port: a captured decode
+  bucket needs `bs x top_k` scratch slots, so the recipe's own `bs=1` operating
+  point fits the battery's existing `SGLANG_MOE_SCRATCH_SLOTS=6` at no extra
+  VRAM. Double-buffered prefetch with compute overlap; expert-major prefill
   waves (`SGLANG_MOE_OFFLOAD_WAVE_ORDER`, byte-identical proven); fp8 presplit;
   load-time-aware halves for fp8/GPTQ/AWQ (GGUF-MoE half missing — guarded);
-  `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` = frozen-resident-set escape hatch (refusal
-  until its byte gate is green).
+  `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` = the opt-in that selects the capturable
+  decode path (frozen resident set required — live hot calibration is refused
+  by name, since residency must be frozen before capture). Its byte gate is
+  green at the desk (#443); the boot arm is specified, not run.
 - **#394 cold-shard chain** (slices 1+2 merged): measured H2D provenance chain
   (env > card-probe > nvml-negotiated > refusal; `absent` unselectable),
   `cold_tier_shm.py` shared-DRAM segments (UUID/BDF identity, manifest read
@@ -134,9 +152,14 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   ideal-placement reference. All three are PREDICTIONS; nothing has booted.
   BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arms 1+2, plus the slice-3
   arms `ARM=compute` / `ARM=compute-cal` specified in `ARM3_COMPUTE.md`), and
-  the graph seam,
-  which refuses by name until the UVA pointer for a `cudaHostRegister`'d peer
-  mapping is verified (`SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`). Graphs incl.
+  the graph seam, which refuses by name for TWO reasons (#443 named the nearer
+  one): the captured gather sources only this rank's pinned pool, so a routed
+  DELEGATED expert has no row — the eager path covers it with a host read of a
+  Python set, which a capture cannot contain — and the UVA pointer for a
+  `cudaHostRegister`'d peer mapping is unverified on hardware. Past
+  `SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1` the first is no longer undefined
+  behaviour: the remap clamps and counts on device, and
+  `offload_capture_gate` raises by name at the replay boundary. Graphs incl.
   CPU-MoE remain IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host
   nodes, CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
   (spill/restore under fixed buffers is legal).

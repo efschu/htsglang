@@ -65,10 +65,24 @@ Design notes
   is pure Python and is unit-tested on CPU without CUDA
   (tests/moe_offload/test_planner.py); only `MoEExpertOffloadCache` touches
   tensors.
-* CUDA-graph incompatible by nature: `prepare()`/`run_waves()` do a device->host
-  sync (`topk_ids.tolist()`) plus data-dependent Python planning, which is
-  illegal during graph capture. Offload therefore REQUIRES --disable-cuda-graph;
-  the layer fails fast at construction otherwise (see layer.py).
+* Two decode paths, and only one of them syncs. `prepare()`/`run_waves()` do a
+  device->host sync (`topk_ids.tolist()`) plus data-dependent Python planning,
+  which is illegal during graph capture, so the EAGER path requires
+  --disable-cuda-graph and the layer fails fast at construction otherwise (see
+  layer.py). `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` selects the capturable path
+  instead: frozen residency, fixed-shape on-device index math
+  (`prepare_capturable_remap`) and a captured UVA gather over the pinned pool,
+  with no host read anywhere in the step. The two are proven bit-identical for
+  the single-wave case on CPU (tests/moe_offload/test_capturable_planner.py)
+  and the sync-freedom is pinned by interception
+  (tests/moe_offload/test_capture_desync_port.py).
+* The capturable path has ONE gap, and it is named rather than latent: under
+  the #394 shared cold tier a routed expert can be delegated to a peer's
+  segment, for which this rank's pool has no row. The installer refuses that
+  combination by default; behind SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1 the gather
+  clamps to a valid row and counts the breach on device, and
+  `moe/offload_capture_gate.py` turns that count into a named exception at the
+  CUDA-graph replay boundary (the #431 pattern).
 """
 
 from __future__ import annotations
@@ -2116,6 +2130,33 @@ def build_capturable_luts(
     )
 
 
+def worst_case_unique_spill(
+    routed_slots: int, num_local_experts: int, resident_count: int
+) -> int:
+    """Scratch slots a captured step can need, exactly -- not conservatively.
+
+    ``prepare_capturable_remap`` assigns one scratch slot per DISTINCT routed
+    spill expert, so the requirement is bounded twice over: a step cannot route
+    more distinct experts than it has routed (token, k-slot) pairs, and it
+    cannot route more distinct SPILL experts than the cold set contains. The
+    binding bound is the smaller of the two.
+
+    layer.py used only the first, which is the loose one whenever a decode
+    bucket's ``tokens x top_k`` exceeds the cold set -- and under the #82 GGUF
+    expert-dim shard that is the common case, because ``forward_impl`` remaps
+    every FOREIGN expert id onto the resident zero-pad expert BEFORE the
+    offload sees it. The remapped ids that survive are drawn from this rank's
+    local table alone, so the cold set (``E - R``, both local counts) is the
+    real ceiling and the loose bound refuses captures that are provably safe.
+
+    Pure arithmetic over static shapes: no tensor is touched, so this is legal
+    on the capture path (it reads shapes, not contents).
+    """
+    slots = max(0, int(routed_slots))
+    cold = max(0, int(num_local_experts) - int(resident_count))
+    return min(slots, cold)
+
+
 def refuse_capturable_cold_tier(num_experts: int) -> None:
     """#394 slice 2 graph seam: BOOT-PENDING, and say exactly what is missing.
 
@@ -2125,20 +2166,35 @@ def refuse_capturable_cold_tier(num_experts: int) -> None:
     bytes change -- that is already how the local capturable path works
     (:func:`device_view_of_pinned`, verified on this rig).
 
-    What is unverified is one link in the chain. The local pool is a torch
-    ``pin_memory()`` allocation, so its UVA device pointer equals its host
-    pointer and ``torch.as_tensor`` aliases it. A PEER's cold row lives in a
-    ``mmap`` that this process page-locked with ``cudaHostRegister`` instead;
-    the device address for such a range is obtained from
-    ``cudaHostGetDevicePointer``, and whether ``is_pinned()``/``as_tensor``
-    reproduce the aliasing for it has NOT been exercised on hardware. Capturing
-    a graph over an address that has not been verified to alias is precisely
-    the failure mode that cannot be detected after the fact: the graph replays
-    happily and reads whatever is at that address.
+    TWO links are missing, and the first is nearer than the docstring used to
+    admit.
 
-    So the eager path is complete and the capturable installer refuses, until a
-    card window proves the pointer. ``SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`` is
-    that window's switch, not a performance option.
+    1. **There is no peer source in the captured gather at all.**
+       :meth:`MoEExpertOffloadCache._issue_fetch_capturable` reads
+       ``_cap_pool_dev``, which is built from ``self._pinned`` -- this rank's
+       own rows. A DELEGATED expert has no row there, so the frozen
+       ``spill_pool_row_lut`` holds ``-1`` for it and the gather's index is
+       out of bounds. The eager ``_fetch`` covers this with
+       ``expert_id in self._remote_ids``, a host read of a Python set, which is
+       precisely what a capture cannot contain. Proven on CPU tensors in
+       ``tests/moe_offload/test_capture_desync_port.py`` -- no card required.
+    2. **The peer pointer is unverified.** The local pool is a torch
+       ``pin_memory()`` allocation, so its UVA device pointer equals its host
+       pointer and ``torch.as_tensor`` aliases it. A PEER's cold row lives in a
+       ``mmap`` that this process page-locked with ``cudaHostRegister``
+       instead; the device address for such a range is obtained from
+       ``cudaHostGetDevicePointer``, and whether ``is_pinned()``/``as_tensor``
+       reproduce the aliasing for it has NOT been exercised on hardware.
+       Capturing a graph over an address that has not been verified to alias is
+       the failure mode that cannot be detected after the fact: the graph
+       replays happily and reads whatever is at that address.
+
+    So the eager path is complete and the capturable installer refuses.
+    ``SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`` is a development window's switch
+    past the refusal, not a performance option -- and past it, gap 1 is no
+    longer undefined behaviour: the remap clamps the index and counts the
+    breach on device, and ``moe/offload_capture_gate.py`` raises at the replay
+    boundary (see :meth:`MoEExpertOffloadCache.check_capture_breach`).
     """
     import logging
 
@@ -2147,19 +2203,26 @@ def refuse_capturable_cold_tier(num_experts: int) -> None:
     if envs.SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE.get():
         logging.getLogger(__name__).warning(
             "MoE cold tier (#394): capturing a decode graph over PEER-owned "
-            "cold rows (%d experts). The UVA device pointer for a "
-            "cudaHostRegister'd mapping is BOOT-PENDING -- verify the gathered "
-            "rows against the eager path before trusting any output.",
+            "cold rows (%d experts). TWO things are unproven: the captured "
+            "gather has no peer source (a routed delegated expert clamps to "
+            "local row 0 and trips the replay-boundary capture gate), and the "
+            "UVA device pointer for a cudaHostRegister'd mapping is "
+            "BOOT-PENDING. Verify the gathered rows against the eager path "
+            "before trusting any output.",
             num_experts,
         )
         return
     raise RuntimeError(
         "SGLANG_MOE_OFFLOAD_CUDA_GRAPH cannot yet be combined with the shared "
-        "cold tier (SGLANG_MOE_COLD_TIER_SHM, #394 slice 2): the capturable "
-        "scratch gather needs a UVA device pointer for the PEER segment's "
-        "cudaHostRegister'd mapping, and that pointer has not been verified on "
-        "hardware. This is an implementation gap, not a limit -- graphs pin "
-        "addresses, not contents. Run eager (--disable-cuda-graph), or set "
+        "cold tier (SGLANG_MOE_COLD_TIER_SHM, #394 slice 2). Two gaps: (1) the "
+        "capturable scratch gather sources only THIS rank's pinned pool, so a "
+        "routed delegated expert has no row to gather -- the eager path's "
+        "`expert_id in self._remote_ids` branch is a host read a capture "
+        "cannot contain; (2) the UVA device pointer for the PEER segment's "
+        "cudaHostRegister'd mapping has not been verified on hardware. Both "
+        "are implementation gaps, not limits -- graphs pin addresses, not "
+        "contents. Run eager (--disable-cuda-graph), leave "
+        "SGLANG_MOE_COLD_TIER_SHM unset, or set "
         "SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1 in a card window to develop it."
     )
 
@@ -2214,6 +2277,7 @@ def prepare_capturable_remap(
     spill_pool_row_lut,
     resident_count: int,
     scratch: int,
+    breach_counter=None,
 ):
     """Fixed-shape, host-sync-free reproduction of resolve()+_build_lut+_remap
     for the single-wave case. Returns (remapped_topk_ids, src_row, num_spill):
@@ -2229,6 +2293,18 @@ def prepare_capturable_remap(
     Correctness (see test_capturable_planner.py): the cumsum-rank over the
     ascending expert-id axis reproduces resolve()'s sorted(spill)->R+i loop
     index i exactly, so scratch-slot assignment and remap match the eager path.
+
+    ``breach_counter`` is an optional int32 device tensor, supplied ONLY under
+    the #394 cold tier's development seam. Without it (every default launch)
+    this function is unchanged, statement for statement. With it, a cold expert
+    whose ``spill_pool_row_lut`` entry is ``-1`` -- i.e. one DELEGATED to a
+    peer's segment, for which this rank has no row -- is counted into the
+    tensor and its index is clamped to a valid row, so the captured gather
+    reads a wrong-but-in-bounds expert instead of walking off the pool. The
+    count is what makes that survivable: ``offload_capture_gate`` reads it at
+    the replay boundary and raises. Counting on device and reading at the
+    boundary is the #431 pattern -- the alternative, testing the condition
+    here, is a host read inside a capture.
     """
     import torch
 
@@ -2259,6 +2335,17 @@ def prepare_capturable_remap(
     src_row_ext = torch.zeros(C + 1, dtype=torch.int32, device=device)
     src_row_ext.index_put_((dst,), spill_pool_row_lut, accumulate=False)
     src_row = src_row_ext[:C].contiguous()
+
+    # (3b) #394 seam only: a delegated expert carries pool row -1. Count it on
+    # device (read at the replay boundary) and clamp so the gather stays in
+    # bounds. Unused slots hold 0 from the zeros() above, so only slots a
+    # routed spill expert actually claimed can be negative -- no `< num_spill`
+    # mask is needed, and adding one would cost an extra arange per step.
+    if breach_counter is not None:
+        # add_, not `+=`: the counter's ADDRESS is what the graph captures, so
+        # the accumulation has to land in that buffer rather than rebind a name.
+        breach_counter.add_((src_row < 0).to(breach_counter.dtype).sum())
+        src_row = src_row.clamp(min=0)
 
     # (4) global-id -> slot LUT + remap (replaces _build_lut/_remap, no loop).
     slot_of = torch.where(is_spill, R + rank, resident_slot_lut)  # int32[E]
@@ -2476,6 +2563,10 @@ class MoEExpertOffloadCache:
         self._cap_pool_dev: Dict[str, "object"] = {}  # attr -> UVA view [E-R,...]
         self._cap_scratch_dst: Dict[str, "object"] = {}  # attr -> resident[R:R+C]
         self._cap_view_holders: List["object"] = []  # keep pinned bases alive
+        # #394 seam only: int32[1] device counter of captured gathers that hit
+        # a delegated expert's absent row. None on every default launch, which
+        # is what keeps prepare_capturable_remap statement-identical there.
+        self._cap_breach = None
 
     # --- lifecycle (GPU window) --------------------------------------------
     def install(self):
@@ -2740,9 +2831,16 @@ class MoEExpertOffloadCache:
                 "inconsistent frozen residency maps (resident_slot vs "
                 "spill_pool_index); freeze must install both or neither"
             )
-        if self._cold_tier is not None:
-            refuse_capturable_cold_tier(self.num_local_experts)
         device = torch.device("cuda", torch.cuda.current_device())
+        if self._cold_tier is not None:
+            # Refuses unless the development seam is open. Past it, arm the
+            # breach counter FIRST -- an unarmed capturable path under a cold
+            # tier is the out-of-bounds gather the refusal names.
+            refuse_capturable_cold_tier(self.num_local_experts)
+            from sglang.srt.layers.moe import offload_capture_gate
+
+            self._cap_breach = torch.zeros(1, dtype=torch.int32, device=device)
+            offload_capture_gate.register(self)
         (
             self._cap_resident_slot_lut,
             self._cap_is_spill,
@@ -2794,9 +2892,32 @@ class MoEExpertOffloadCache:
             self._cap_spill_pool_row_lut,
             self.resident_count,
             self.scratch,
+            breach_counter=self._cap_breach,
         )
         self._issue_fetch_capturable(src_row)
         return remapped
+
+    def check_capture_breach(self, where: str = "cuda-graph replay") -> None:
+        """Replay-boundary read of the #394 seam's breach counter.
+
+        Called from ``offload_capture_gate.check_after_graph_replay`` -- host
+        code, no capture in progress, which is the only place this device read
+        is legal. Resets the counter after reporting so a window that catches
+        the exception and continues does not re-raise on the SAME breach and
+        mistake one wrong step for a permanent state.
+        """
+        counter = self._cap_breach
+        if counter is None:
+            return
+        breaches = int(counter.item())
+        if breaches == 0:
+            return
+        counter.zero_()
+        from sglang.srt.layers.moe.offload_capture_gate import OffloadCaptureBreach
+
+        raise OffloadCaptureBreach(
+            getattr(self.layer, "layer_id", None), breaches, where
+        )
 
     def freeze_from_source(self):  # pragma: no cover - requires CUDA
         """§5 freeze-before-capture: load this layer's frozen hot set from

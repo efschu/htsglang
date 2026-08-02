@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.moe import offload_capture_gate
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -262,6 +263,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         # them, so this boundary is the next place their status word can be
         # read at all.
         barlink_abort_gate.check_after_graph_replay()
+        # Same boundary, same reason (#443): the capturable MoE expert-offload
+        # counts an unreachable cold row on device because testing for it in
+        # the step would be a host read inside the capture. Empty registry
+        # unless a #394 shared cold tier is live.
+        offload_capture_gate.check_after_graph_replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
