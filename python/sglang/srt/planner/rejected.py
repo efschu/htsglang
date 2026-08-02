@@ -373,14 +373,38 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         gain="one copy of the weights serving both PD processes",
         cost="no saving in practice, and the design loses its point",
         why=(
-            "the postprocess rewrites the tensors after import, so the shared "
-            "pages stop being shared; and once the weights are shared the "
-            "process boundary is no longer buying isolation."
+            "the IMPORTING process runs its own postprocess, which rewrites "
+            "the tensors after import, so the shared pages stop being shared; "
+            "and once the weights are shared the process boundary is no "
+            "longer buying isolation."
         ),
         level=BLOCKED,
         evidence="DESIGN_107, the fork in the road",
         tags=("pd", "cuda-ipc-weights"),
         scope="general",
+        note=(
+            "REPRICED #444d against upstream PR #33279 (weight-daemon "
+            "transport plug-in, adds a vmm_fd/SCM_RIGHTS backend next to "
+            "torch_ipc). The entry STANDS, and the re-read sharpened why. The "
+            "daemon loads through the full pipeline -- disk, TP shard, "
+            "quantize -- and exports only afterwards, so its consumers never "
+            "rewrite what they mapped. This design has no such exporter: both "
+            "PD processes are ordinary engines, each runs "
+            "process_weights_after_loading itself (model_loader/loader.py:928 "
+            "and four further sites), and that is precisely the rewrite the "
+            "verdict names. So the daemon does not reopen this key -- it is a "
+            "different construction that happens not to have this key's "
+            "defect, and the register should not be read as 'sharing weights "
+            "across processes is dead'. The daemon shape belongs to #305 as a "
+            "concrete WARM_GPU rung (registry/ledger.py TenantState.WARM_GPU, "
+            "registry/rungs.py: post-quantized weights resident while no "
+            "engine owns them), where the open question is hot-switch resume "
+            "time. It does not help #329: its export is TP-sharded, so an "
+            "elastic membership change invalidates exactly what it holds. "
+            "Cost of pursuing the daemon shape here is a PORT, not a flip -- "
+            "weight_cache/ does not exist in this tree at all. No build in "
+            "this round; taking it up is a planner decision under a new key."
+        ),
     ),
     RejectedEntry(
         key="intra_rig_collective_overlap",
