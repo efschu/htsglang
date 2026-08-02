@@ -125,9 +125,15 @@ i.e. the fork's files are the ones on disk.
 Fork wheel provenance (from the fork dist's `direct_url.json`):
 
 ```
-file:///spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
-sha256 e7b16e1d74527ba070afeaf7bab58ed5df0fadbeb344d0fb372ff334f7e15b54
+file:///spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+sha256 cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc
 ```
+
+Superseded, do NOT reinstall: `/spinning/wt-327a-wheel/sglang_kernel-0.4.4-
+cp310-abi3-linux_x86_64.whl`, sha256 `e7b16e1d74527ba070afeaf7bab58ed5df0fadbe
+b344d0fb372ff334f7e15b54`. Same source, same 39 files, same 91 registered ops
+— but built against CUDA 12.9, which is the #436 segfault. It is kept only as
+a rollback artifact. See "cu13 rebuild" below.
 
 **THE HAZARD, and why this section exists.** The two dists have DIFFERENT
 distribution names but the SAME import package, so pip does not see a conflict:
@@ -145,28 +151,122 @@ an index in this venv:
 
 ```
 # requirements pin (CT999 venv)
-sglang-kernel @ file:///spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl \
-    --hash=sha256:e7b16e1d74527ba070afeaf7bab58ed5df0fadbeb344d0fb372ff334f7e15b54
+sglang-kernel @ file:///spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl \
+    --hash=sha256:cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc
 ```
 
 ### Making it durable (run when the venv is QUIET)
 
-Not executed at the time of writing, deliberately: the venv is shared and was
-in active use by another agent's INT8 microbench, and removing/reinstalling the
-`sgl_kernel` files under a running process is how a working rig becomes a
-broken one mid-measurement. Run this when nothing else is on the box:
+The venv is shared. Removing/reinstalling the `sgl_kernel` files under a
+running process is how a working rig becomes a broken one mid-measurement, so
+check first that nothing maps them (`grep -c sgl_kernel /proc/<pid>/maps` over
+every process on the venv's interpreter), then:
 
 ```bash
 V=/spinning/htsglang-gpu/.venv
 $V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # before
 $V/bin/pip uninstall -y sgl-kernel                 # drop the shadowing 0.3.21 dist
 $V/bin/pip install --no-deps --force-reinstall \
-  /spinning/wt-327a-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+  /spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
 $V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # after: 0.4.4 True
 ```
 
 Verify BOTH directions afterwards, as #357 did: the fork version reported AND
-the arm importable. A version bump alone is not evidence.
+the arm importable. A version bump alone is not evidence. Since #436, add a
+third: the objects must link the same CUDA major as torch —
+
+```bash
+objdump -p $V/lib/python3.12/site-packages/sgl_kernel/sm100/common_ops.abi3.so | grep NEEDED
+# expected: libcudart.so.13, libcublas.so.13, libcublasLt.so.13 — no .so.12
+```
+
+### cu13 rebuild (#436) — why the wheel must match torch's CUDA major
+
+**Symptom.** The HiCache host tier segfaulted the server in
+`transfer_kv_all_layer_direct_lf_pf` → `cudaMemcpyBatchAsync`, on an unmodified
+tree. Hybrid-GDN cannot route around it: `MambaPoolHost` accepts only
+`layout="page_first_direct"`.
+
+**Cause.** CUDA 13 dropped the trailing `size_t* failIdx` from
+`cudaMemcpyBatchAsync`. `sgl-kernel/csrc/kvcacheio/transfer.cu` copes with both
+shapes at runtime: it selects the signature from `cudaRuntimeGetVersion()` and
+calls the pointer from `dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync")`. Those two
+lookups only agree when the wheel and torch share a CUDA major. On the old
+wheel they could not:
+
+| lookup | binds to | answer |
+|---|---|---|
+| `cudaRuntimeGetVersion` — a linked, *version-tagged* import; `objdump -T` showed `(libcudart.so.12)` | the cudart the wheel was built against | `12090` → "use the 9-argument form" |
+| `dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync")` — unversioned, whole-process, load order | torch's `libcudart.so.13` | the 8-argument cu13 function |
+
+So the 9-argument convention was applied to the 8-argument function and the
+stack slot meant for `failIdx` was read as the stream. The symbol versioning
+makes this deterministic, not a race.
+
+**Fix.** Rebuild the wheel against CUDA 13. No source change: the shim is
+already correct for a consistent toolchain.
+
+| item | value |
+| --- | --- |
+| wheel | `/spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl` |
+| sha256 | `cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc` |
+| size | 16 565 788 B |
+| source | `sgl-kernel/` at `integration/r3-probe-next2` — identical to the old wheel's tree at `7da6f0cb2f` apart from `README.md` |
+| build script | `/spinning/wt-436-build.sh` (log: `/spinning/wt-436-build.log`) |
+| nvcc | **13.0.88, from the venv's `nvidia/cu13`** — the only deliberate change vs. the #327 recipe, which used `/usr/local/cuda-12.9` |
+| torch | 2.11.0+cu130, from `/spinning/htsglang-gpu/.venv` (read-only during the build) |
+| arch list | `SGL_KERNEL_LIMIT_CUDA_ARCHS=86;120` — rig cards only, same as #327 |
+| variants | `SGL_KERNEL_SKIP_SM90_VARIANT=ON`, `SGL_KERNEL_ENABLE_FA3=OFF`, same as #327 |
+| parallelism | `-j4` / `MAX_JOBS=4`, one nvcc thread per TU (swapless box) |
+| ccache | `/spinning/wt-436-ccache`, created empty: 91 cacheable calls, 0 hits, 91 misses — no foreign cache contributed an object |
+| build time | ~24 min, 95 targets, no errors |
+| drop-in | identical 39-file set, 91 registered ops unchanged, `int8_scaled_mm` arm present |
+
+There is no local CUDA 13 system toolkit — `/usr/local/cuda` is 12.9. `nvcc`
+13.0.88 comes from the venv's pip toolkit
+(`site-packages/nvidia/cu13/{bin,include,lib,nvvm}`), which is complete enough
+to build against; point `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT` and
+`CUDA_HOME` at it.
+
+**Evidence.** The falsifier is
+`scripts/dev/436_kv_transfer_repro/kv_transfer_repro.py` (its `--mode abi` arm
+needs no GPU and prints `ABI_SPLIT` / `ABI_CONSISTENT`). Same script, same
+card, only the wheel swapped:
+
+| wheel | ABI probe | the call |
+|---|---|---|
+| cu12 `e7b16e1d…` | `ABI_SPLIT` | **SIGSEGV** |
+| cu13 `cc98be5d…` | `ABI_CONSISTENT` | PASS, bytes match the per-page reference |
+
+**Two guards this unblocks.** Both were added because of this bug and both are
+now suspect:
+
+* `sgl-kernel/tests/test_kvcacheio.py` skips the whole module on
+  `get_cuda_version()[0] >= 13` ("segfaults in transfer_kv kernel"), 192 tests.
+* `test/registered/unit/mem_cache/test_minimax_sparse_pool_host_unit.py`
+  disables `test_device_to_host_direct_page_first_direct` via
+  `_DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13`.
+
+With the first guard lifted the suite passes 192/192 in 249 s on one 3080.
+Flipping either guard belongs in its own change, not this one.
+
+**A separate defect, found while testing this and NOT fixed here:**
+`test_minimax_sparse_pool_host_unit.py::TestMiniMaxSparseHiCacheTransfer::
+test_device_to_host_kernel_page_first` segfaults on **both** wheels — cu12 and
+cu13, verified by swapping them under the same command. That is the
+`io_backend=kernel` + `layout=page_first` route
+(`transfer_kv_all_layer_lf_ph`), a different code path from the batch copy, and
+it needs its own ticket. It is not skipped, so it takes the whole file down
+with it; do not read a green `test_minimax_sparse_pool_host_unit.py` as
+evidence of anything until it is fixed.
+
+**One thing the rebuild does not change:** CUDA's contract for
+`cudaMemcpyBatchAsync` is that `hStream` *must not be the legacy NULL stream*.
+Issue it on torch's default stream and it is refused with
+`cudaErrorInvalidValue` no matter which wheel is installed. Production is fine
+— `cache_controller.py` runs the transfer inside
+`with device_module.stream(self.write_stream)` — but a test or repro that
+forgets the stream will see that error and it is not #436.
 
 ### Docker image path (recipe only — image rebuild is a separate step)
 
@@ -181,6 +281,17 @@ RUN pip uninstall -y sgl-kernel || true && \
 
 The trailing assert is the point: it turns a silently-armless image into a
 failed build instead of a runtime `ColdBuildWindowError` months later.
+
+**The recipe above has NOT been applied to `htsglang:cu130-nccl2307` yet
+(#384, open).** Measured inside the running container: `/usr/local/lib/
+python3.12/dist-packages/` still holds `sgl_kernel-0.3.21.dist-info` next to
+`sglang_kernel-0.4.4.dist-info`. The import is correct at runtime only because
+the boot recipe bind-mounts the venv's package directory over the image's
+(`-v $SP/sgl_kernel:/usr/local/lib/python3.12/dist-packages/sgl_kernel:ro`), so
+the stale dist-info is masked, not removed. Any `pip install` in a container
+started WITHOUT that mount restores the armless 0.3.21 files. Until the image
+is rebuilt with the block above, treat the bind mount as load-bearing and do
+not drop it from a boot line.
 
 ### Related cu13 drift item: deep_gemm and `libnvrtc.so.13`
 
