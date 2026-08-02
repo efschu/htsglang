@@ -1,7 +1,6 @@
 from typing import Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -338,6 +337,98 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        # #444: request-private conv window for TARGET_VERIFY. See
+        # `_target_verify_conv` for why the verify conv must not run on the
+        # persistent pool row. Rows are the spec-slot rows the intermediate
+        # caches already use, so the buffer is bounded by the same spec state
+        # size and carries no new indexing rule. Allocated once at backend
+        # construction (never on the hot path, never inside a graph capture)
+        # and shared across layers: within one forward the layers run in
+        # sequence on one stream, and two concurrent lanes hold different
+        # requests, hence different rows.
+        self._verify_conv_scratch: Optional[torch.Tensor] = None
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            conv = mamba_cache.conv[0]
+            intermediate = mamba_cache.intermediate_conv_window[0]
+            self._verify_conv_scratch = torch.empty(
+                (intermediate.shape[1], conv.shape[-2], conv.shape[-1]),
+                dtype=conv.dtype,
+                device=conv.device,
+            )
+
+    def _target_verify_conv(
+        self,
+        layer: RadixLinearAttention,
+        mixed_qkv_reshaped: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        retrieve_next_token: Optional[torch.Tensor],
+        retrieve_next_sibling: Optional[torch.Tensor],
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the TARGET_VERIFY conv on a request-private copy of the window.
+
+        The conv kernel is intentionally in-place: STEP 2 of
+        ``_causal_conv1d_update_kernel``
+        (``mamba/causal_conv1d_triton.py:752``) stores the shifted window back
+        into whatever ``conv_state`` it was handed, and that store is not gated
+        on ``SAVE_INTERMEDIATE``. Handing it the persistent pool row therefore
+        advanced that row over EVERY drafted step, accepted or not, and the
+        pool only became correct again once
+        ``update_mamba_state_after_mtp_verify``
+        (``hybrid_linear_attn_backend.py:1098``) scattered the accepted step
+        back out of the intermediate cache.
+
+        Between those two points the pool row held the last candidate's
+        window: a state that is neither the pre-verify state nor the committed
+        one. Single-stream that window is unobservable — nothing between the
+        verify forward and the commit reads the recurrent pool. It is
+        observable for anything that reads the same pool concurrently, which
+        is what the dual-group lane's second worker does, and mutate-then-
+        repair is only ever as correct as the absence of such a reader.
+
+        Running on a private copy removes the window instead of timing it. The
+        persistent row is now written exactly once per verify, by the commit,
+        from the intermediate cache — which already carries the full
+        ``dim x (K-1)`` window of every step, so no information is lost: the
+        commit's scatter overwrites every element of the row it touches
+        (``mamba/mamba_state_scatter_triton.py:_fused_conv_window_scatter_with_mask_kernel``),
+        and the row count it covers is the verify batch
+        (``speculative/spec_utils.py:commit_mamba_states_after_verify``).
+        The committed bytes are therefore unchanged; only the intermediate
+        window stops being published.
+        """
+        scratch = self._verify_conv_scratch
+        assert scratch is not None, (
+            "TARGET_VERIFY reached GDNAttnBackend without a speculative mamba "
+            "cache: the private conv window was never allocated."
+        )
+        batch_size = cache_indices.shape[0]
+        rows = intermediate_state_indices[:batch_size]
+        # Seed the private rows with the persistent window the kernel needs as
+        # its prior state. `rows` is the same index space the intermediate
+        # caches use, so a row is owned by exactly one in-flight request.
+        scratch.index_copy_(
+            0,
+            rows.to(torch.int64),
+            conv_states.index_select(0, cache_indices.to(torch.int64)),
+        )
+        return causal_conv1d_update(
+            mixed_qkv_reshaped,
+            scratch,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=rows,
+            intermediate_conv_window=intermediate_conv_window_cache,
+            intermediate_state_indices=rows,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -506,18 +597,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_processed = self._target_verify_conv(
+                layer,
                 mixed_qkv_reshaped,
                 conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+                cache_indices[:batch_size],
+                intermediate_conv_window_cache,
+                intermediate_state_indices,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                retrieve_parent_token,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:

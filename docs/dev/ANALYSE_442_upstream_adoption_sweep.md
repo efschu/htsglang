@@ -118,6 +118,42 @@ between the verify forward and `update_mamba_state_after_mtp_verify`, and read
 them from the lane's second worker. The existing #404 pool-checksum probe
 already has surfaces for `conv`; what it lacks is a reader inside that window.
 
+### §1-UPDATE (#444a) — channel 3 verified, and closed by construction
+
+Every file:line in the channel-3 paragraph was re-read at `bf20251126` and
+holds: the store at `causal_conv1d_triton.py:752` is unconditional, the
+spec-decoding constexpr only moves the source offset at `:715`, the persistent
+pool is what `gdn_backend.py:509-521` passed, and `hybrid_linear_attn_backend.py:1098`
+is the repair. Two things this section did not have:
+
+* **The seam is empty single-stream, and only single-stream.** Between the
+  verify forward and the commit, `eagle_worker_v2.py:2676-2716` runs
+  `eagle_sample`, an optional accept probe and a KV-side C128 clear — none of
+  them touches the recurrent pool. The lane, by contrast, builds its batches on
+  `runner.req_to_token_pool` itself (`dual_group_lane.py:2590`) and reads
+  `mamba_cache.conv` directly (`:2932`, `:3398`).
+* **The verify's in-place write is dead.** The commit's scatter overwrites
+  every `dim x (K-1)` element of every row it touches
+  (`mamba_state_scatter_triton.py:305-372`) and covers exactly the verify batch
+  (`spec_utils.py:commit_mamba_states_after_verify`, `bs = accept_lens.shape[0]`,
+  all step indices non-negative). Nothing of the in-place store survives.
+
+That second fact turns the instrumentation arm into a fix. Rather than timing
+the window, `GDNAttnBackend._target_verify_conv` removes it: the kernel is
+handed a request-private copy of the window, seeded from the pool row it needs
+as prior state and indexed by the spec rows the intermediate caches already
+use. Byte-neutral for the committed pool and for the conv output, and the
+default (non-lane) path changes no result. Falsifier
+`test/registered/unit/spec/test_conv_verify_private_window_444.py`; can-fail
+proven by reverting the call to `conv_states` / `cache_indices` (3 of 8 red).
+GPU validation is BOOT-PENDING — the Triton kernel itself was not executed
+against the private buffer in this desk round.
+
+**Not treated, same shape:** `mamba/mamba.py:685`, the Mamba2 mixer's own
+TARGET_VERIFY conv, still hands the persistent `conv_state` to the same kernel
+with the same intermediate cache. One backend was fixed, not the family.
+**Follow-up item 1 is closed for GDN and reopened, narrowed, for Mamba2.**
+
 ## 2 — PR #33278, dense Marlin W8A16 on SM80/SM90
 
 **Skip.** The format is MXFP8 (E4M3 weights, UE8M0 scales, block 32), not
@@ -154,6 +190,24 @@ Three reasons beyond "wrong format":
   asymmetric exposed block and not only over `None`. `lcm(32, 128) = 128` is
   what AWQ already imposes for its group 32 (`awq.py:91-95`), so this raises no
   partition tax; it is a missing registration.
+
+  **§2-UPDATE (#444b) — done, by the second route.** The first route is not
+  available: `[1, 32]` is not a fork choice but the OCP scale layout, and
+  `Fp8Config.from_config` overrides any checkpoint value to it deliberately, so
+  rewriting it to `[128, 128]` would change the quantization contract to fix a
+  partitioning bug. `_quant_block_aligned_units` now treats an ASYMMETRIC
+  exposed block as what it is — a quantization fact that never registered an
+  alignment — and coarsens by `lcm(raw[0], raw[1])`, then applies the family's
+  marlin fold: `lcm(1, 32) = 32`, `lcm(32, 128) = 128`, the predicted number.
+  Symmetric exposures (`[128,128]`, GGUF `[256,256]`, every group-size sibling)
+  are untouched by construction, and a plan-equality pin holds them.
+  Corpus: `test/registered/unit/distributed/test_marlin_unit_coarsening.py`,
+  class `TestEighthSiblingMxfp8`. Can-fail by reverting the branch: 10 red,
+  including the coupled-dimension disagreement in its #385 form — gate_up
+  implies `[14880, 8944, 8944]`, down_proj expects `[14880, 8960, 8928]`.
+  Still unreachable on this rig (`Fp8Config.get_min_capability` is 100 for
+  mxfp8), so this is a latent registration closed, not a bug observed.
+  **Follow-up item 2 is closed.**
 * The PR's six format-agnostic Marlin padding helpers would in principle let
   any Marlin path take non-tile-aligned uneven shards without coarsening — a
   real relaxation of the 128-block tax. Separate, larger, needs its own
@@ -229,6 +283,48 @@ non-SM120 torch paged fallback. `fp8_paged_mqa_logits_torch`
 (`indexer.py:120-204`) still gathers the whole context at `:165` and bmm's the
 full `[B,S,H]` at `:177`. That is the reference twin the #425 golden pins
 compare against, and it closes the same hole on the path this rig actually runs.
+
+### §3-UPDATE (#444c) — the two readings, resolved at the tree
+
+This section states two things about the torch paged fallback that cannot both
+be true, and the follow-up list carried the contradiction forward as item 3.
+Both readings were reproduced at `bf20251126`; the observations are right and
+the RECOMMENDATION is wrong.
+
+* **Reading A**, the opening paragraph: ours "chunks the KV/sequence axis of
+  the torch paged fallback" (`indexer.py:246-260`, `:329-357`, knob
+  `SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK`). Confirmed:
+  `_indexer_logits_chunk_pages` is at `:246-260` and its consumer is the
+  page-chunked loop inside `fp8_paged_mqa_logits_torch_sm120` at `:329-357`.
+* **Reading B**, the closing paragraph: the chunk still has to be landed for
+  the "non-SM120 torch paged fallback", `fp8_paged_mqa_logits_torch`. Its two
+  observations are also confirmed verbatim — `:165` gathers the whole context
+  and `:177` bmm's the full `[B,S,H]`, unchunked.
+
+**Reading A is authoritative, and there is no second fallback to chunk.**
+`fp8_paged_mqa_logits_torch` is not the non-SM120 path; there is no non-SM120
+path. `select_paged_mqa_logits_fn` returns `fp8_paged_mqa_logits_torch_sm120`
+for **every** card that resolves `BACKEND_TORCH` (`indexer.py:102-113`), and
+both functions say so in their own docstrings: the `_sm120` twin's reads
+"despite the `_sm120` suffix nothing in it is SM120-specific, and it is the
+variant `select_paged_mqa_logits_fn` hands out for every card that takes the
+torch backend"; its twin's reads "NOT reachable from the serving path ... It is
+kept as the reference implementation the kernel tests compare against". The
+`_sm120` name is about the CALL SITE (2-D `seq_lens`, `ceil(max_seq_len/64)`
+pages), not the architecture. The chunked function is therefore already the one
+this rig runs, and the `_sm120` docstring says as much: "since #417 Cut 3 this
+is the PRODUCTION path on every non-Hopper card, not a fallback".
+
+**No code fix, and specifically not the one item 3 proposed.** Chunking
+`fp8_paged_mqa_logits_torch` would restructure a function that never serves a
+token, and it would do it to the reference that validates the implementation —
+the two are pinned bit-for-bit against each other on purpose (the `-inf`
+correction in that function's own comment exists because they had drifted).
+Its memory cost is real but it is a property of a test fixture at large shapes,
+not of the serving path, and paying it buys nothing. **Follow-up item 3 is
+retired.** If the reference twin's peak ever blocks a kernel test at 1M
+context, the honest move is to shrink the test shape or to have the reference
+call the chunked twin, not to fork the chunking logic into both.
 
 ## 4 — PR #33276, DSpark loading for hybrid DSV4 NVFP4 (ADOPTED)
 
@@ -399,6 +495,34 @@ export is TP-sharded, so a membership change invalidates exactly what it holds.
 Revisiting `cuda_ipc_weight_import_pd` on the new grounds is a planner
 decision, not something this sweep should flip.
 
+### §-UPDATE (#444d) — the entry was re-read; it stands, with a sharper why
+
+Repriced against the current tree, no build. **The entry stays BLOCKED**, and
+the re-read narrowed rather than weakened it.
+
+The daemon's premise does answer the *sentence* the entry records, but not for
+this key. What makes the daemon work is an EXPORTER that has already run the
+whole pipeline — disk, TP shard, quantize — so its consumers never rewrite what
+they mapped. `cuda_ipc_weight_import_pd` has no exporter: both PD processes are
+ordinary engines and each runs `process_weights_after_loading` itself
+(`model_loader/loader.py:928`, and four further call sites at `:1141`, `:1531`,
+`:1633`, `:2427`), which is exactly the post-import rewrite the verdict names.
+So the daemon is not this design done properly; it is a different design that
+happens not to have this design's defect. The entry's `why` was edited to say
+"the IMPORTING process runs its own postprocess", because the original wording
+was general enough to read as "shared weights across processes cannot work",
+which the daemon disproves.
+
+Pricing of the neighbouring shape, for the planner rather than for this entry:
+`weight_cache/` does not exist in this tree, so taking it up is a PORT, not a
+flip, and it belongs under a new key. Its value is as a concrete `WARM_GPU`
+rung for #305 (`registry/ledger.py` `TenantState.WARM_GPU`, `registry/rungs.py`
+"weights resident, pools reduced") — post-quantized weights on the card while
+no engine owns them, whose open question is hot-switch resume time. For #329 it
+is worthless for the reason already recorded: the export is TP-sharded, so an
+elastic membership change invalidates precisely what it holds.
+**Follow-up item 5 is closed.**
+
 ## What was adopted in this branch
 
 Two upstream cherry-picks with authorship preserved, plus two falsifiers:
@@ -431,13 +555,19 @@ files.
 
 ## Follow-ups, ordered
 
-1. #404 next window, first arm: read the persistent `conv_states` bytes between
+1. ~~#404 next window, first arm: read the persistent `conv_states` bytes between
    the TARGET_VERIFY forward and `update_mamba_state_after_mtp_verify`, from the
-   lane's second worker. Section 1, channel 3.
-2. Register the eighth alignment sibling for mxfp8 (`[128, 128]`, not `[1, 32]`).
-   Section 2; independent of #33278.
-3. Land the sequence-axis chunk for `fp8_paged_mqa_logits_torch`
-   (`indexer.py:120-204`). Section 3; independent of #33288.
-4. Decide on the #33289 comment. Section 6.
-5. Re-price `cuda_ipc_weight_import_pd` against the daemon premise, or record
-   why the entry stands. Section on #33279.
+   lane's second worker.~~ **CLOSED for GDN in #444a** — the window is removed
+   rather than instrumented (§1-UPDATE). Reopened narrowed: `mamba/mamba.py:685`,
+   the Mamba2 mixer's twin, is untreated. GPU validation of #444a is
+   BOOT-PENDING.
+2. ~~Register the eighth alignment sibling for mxfp8.~~ **CLOSED in #444b**
+   (§2-UPDATE) — by the asymmetric-block route, not by rewriting the OCP block.
+3. ~~Land the sequence-axis chunk for `fp8_paged_mqa_logits_torch`.~~
+   **RETIRED in #444c** (§3-UPDATE) — that function is the reference twin, not a
+   fallback; there is no non-SM120 torch path, and the production one is already
+   chunked.
+4. Decide on the #33289 comment. Section 6. **Still open** — untouched by #444.
+5. ~~Re-price `cuda_ipc_weight_import_pd` against the daemon premise.~~
+   **CLOSED in #444d** — the entry stands with a sharper `why`; the daemon shape
+   belongs to #305 under a new key (§-UPDATE on #33279).

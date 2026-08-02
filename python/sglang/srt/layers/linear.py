@@ -268,6 +268,27 @@ def _quant_block_aligned_units(
         return units
     raw = getattr(quant_config, "weight_block_size", None)
     block = raw[block_idx] if raw else None
+    # ASYMMETRIC EXPOSED BLOCK (#444b) -- the eighth sibling, and the first one
+    # whose config exposes a block that was never an ALIGNMENT registration.
+    # MXFP8 pins ``weight_block_size = [1, 32]``
+    # (``quantization/fp8.py:from_config``) because the OCP spec fixes the
+    # QUANTIZATION block to one row by 32 columns; that value is a fact about
+    # the scale layout, not a decision about how a shard may be cut. Read
+    # per-axis it says "output dim: element granularity, input dim: 32", which
+    # is precisely the coupled-dimension disagreement ``_marlin_uneven_tp_block``
+    # documents for #385: gate_up's OUTPUT and down_proj's INPUT are the same
+    # intermediate dimension, so cutting one at 1 and the other at 32 builds the
+    # two halves of one MLP for two different intermediates.
+    #
+    # lcm of the two axes, then the family's usual marlin fold. For MXFP8 that
+    # is lcm(1, 32) = 32 and then lcm(32, 128) = 128 -- the same block AWQ
+    # already imposes for its group size 32, so it costs no extra partition
+    # tax. Symmetric exposures (FP8 block [128,128], GGUF [256,256], and every
+    # group-size sibling) are untouched: for them ``raw[0] == raw[1]`` and this
+    # branch does not fire.
+    asymmetric_block = bool(raw) and len(raw) == 2 and raw[0] != raw[1]
+    if asymmetric_block:
+        block = math.lcm(int(raw[0]), int(raw[1]))
     # MARLIN (#383). A marlin-packed weight is repacked into 16x64 tiles, so
     # the per-rank shard must be a multiple of the tile on its axis -- 64 on
     # the output dim, 16 on the input dim. That constraint is INDEPENDENT of
@@ -291,9 +312,11 @@ def _quant_block_aligned_units(
     # NOT marlin. Folding 64 on top of an existing block would silently
     # re-plan those vehicles; measured, it changes the INT8-W8A8 dense MLP
     # family (block 16 -> lcm 64), which is the fork's default serving model.
-    # The gap this closes is exactly the configs that expose nothing.
-    if block is None and _marlin_packable_family(quant_config):
-        block = _marlin_uneven_tp_block()
+    # The gap this closes is exactly the configs that expose nothing -- plus,
+    # since #444b, the ones whose exposed block is a quantization fact rather
+    # than an alignment registration (asymmetric, see above).
+    if (block is None or asymmetric_block) and _marlin_packable_family(quant_config):
+        block = math.lcm(block or 1, _marlin_uneven_tp_block())
     if not block:
         return units
     from sglang.srt.distributed.utils import block_aligned_units
@@ -445,13 +468,13 @@ class ReplicatedLinear(LinearBase):
                     raise ValueError(f"{loaded_weight} are not all equal")
 
             if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
-                assert (
-                    param.dtype == loaded_weight.dtype
-                ), "init para dtype and loaded weight dtype should be the same"
+                assert param.dtype == loaded_weight.dtype, (
+                    "init para dtype and loaded weight dtype should be the same"
+                )
 
-        assert (
-            param.size() == loaded_weight.size()
-        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        assert param.size() == loaded_weight.size(), (
+            f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -729,9 +752,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -1911,9 +1934,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -2158,9 +2181,9 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):

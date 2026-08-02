@@ -315,8 +315,12 @@ FP8 (sm120 GEMM tuned; per-channel fused GEMV; opt-in deterministic
 `SGLANG_DETERMINISTIC_FP8_GEMM`; e4m3 KV bit-exact on sm86), INT8-W8A8 (default
 recommendation; sm86-native lane; beware the dual-dist wheel trap — pin by
 sha256), NVFP4 (V4 class usable via dequant fallback for unpackable layers),
-Marlin alignment family (SEVEN sibling bugs fixed — device-free fold predicate,
+Marlin alignment family (EIGHT sibling bugs fixed — device-free fold predicate,
 lcm=128 on coupled dims; alignment fixes must preserve cross-layer agreement).
+The eighth (#444b) is MXFP8: its `weight_block_size [1, 32]` is the OCP scale
+layout, not an alignment registration, so an asymmetric exposed block is now
+coarsened by `lcm` of both axes before the marlin fold — latent, mxfp8 needs
+capability 100.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,
