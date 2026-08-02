@@ -436,10 +436,11 @@ def resolve_cp_token_ratios(
     gcd-reduced --rank-tp-ratio weights (a simple weights-based split).
 
     Precedence: SGLANG_UNEVEN_TOKEN_VECTOR (env) > --rank-kv-ratio a,b,c
-    (explicit pin) > budget estimate > weights fallback. --rank-kv-ratio
-    capacity keeps the estimate here (phase 1) and installs the MEASURED
-    optimal vector after the post-weight-load profiling instead (phase 2,
-    see ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector).
+    (explicit pin) > rank_kv_capacity_seed (the planner's predicted match)
+    > budget estimate > weights fallback. --rank-kv-ratio capacity keeps the
+    estimate here (phase 1) and installs the MEASURED optimal vector after
+    the post-weight-load profiling instead (phase 2, see
+    ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector).
 
     Deterministic pure function of the args so every rank computes the same
     vector (the pool pinning and owner rule must agree across ranks)."""
@@ -511,12 +512,17 @@ def resolve_cp_token_ratios(
         g = math.gcd(*kv_flag)
         return [v // g for v in kv_flag]
 
-    # Draft-solo phase-1 SEED (--rank-kv-ratio capacity only): the planner's
-    # predicted per-rank capacity vector. Below the explicit pin and the env
-    # override, above the budget estimate -- which under solo placement does
-    # not model the host's unsharded draft weights + globally-sized draft KV
-    # pool. Purely the starting vector: the measured phase-2 install
-    # (_maybe_suggest_dcp_token_vector) replaces it after profiling.
+    # Planner phase-1 SEED: the predicted per-rank capacity vector, parked by
+    # apply_auto_performance. Below the explicit pin and the env override,
+    # above the budget estimate -- which the two writers of this field both
+    # have a reason to distrust. Under draft-solo placement (--rank-kv-ratio
+    # capacity) it does not model the host's unsharded draft weights +
+    # globally-sized draft KV pool; under the phase-optimal arms (#435) the
+    # solved MLP vector has moved weight mass off the budget proportion the
+    # estimate assumes, so the boot would size its pool for a vector the plan
+    # never gated. Purely a starting vector where a phase-2 measured install
+    # exists (_maybe_suggest_dcp_token_vector replaces it after profiling in
+    # the derived modes); under 'coupled' it is the boot vector.
     seed = getattr(server_args, "rank_kv_capacity_seed", None)
     if isinstance(seed, list) and len(seed) == dcp_size and all(v > 0 for v in seed):
         if len(set(seed)) == 1:

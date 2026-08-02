@@ -207,6 +207,107 @@ large margin for a small predicted-gain cost (+8.5% / +7.3% vs `10,1,1`'s
 `residual free` line before choosing which candidate to run, rather than
 assuming the top of the ladder is the one to take.
 
+## Coupling fix built, GPU confirmation pending (#435)
+
+The #433 GPU arm ran and answered its own question, and in doing so exposed a
+defect the desk analysis above could not see: **the phase-prefill solve picks
+an MLP vector but leaves the coupled KV token vector on the VRAM-budget
+split.** Full evidence in `/root/addendum_433.md`; the short form is that the
+arm booted `--rank-mlp-ratio 8,1,1` (solved live, confirming this note's
+prediction to 0.1 pp) with token vector `[31,17,16]` while the optimizer's own
+matched vector was `[12,26,26]`. Rank 0 owned 48 % of the tokens holding 13 %
+of the capacity, and `max_total_num_tokens` came out at **125 504** against
+the **358 693** the admissibility gate had just accepted and the **431 360**
+of the decode arm. The throughput comparison in the addendum is still valid as
+measured (its probes fit inside 125 504 tokens), but that arm was not running
+the configuration the optimizer thought it had solved.
+
+**Built (desk, no GPU):** `_phase_solve_owns_kv_ratio` in `uneven_perf.py`
+gates a new install at the end of `apply_auto_performance`: under
+`--rank-perf-tune phase-*`, non-solo placement, and the default
+`--rank-kv-ratio coupled`, the chosen candidate's own
+`predict_capacity()["token_vector"]` is parked in `rank_kv_capacity_seed`,
+which `resolve_cp_token_ratios` consumes above the budget estimate and below
+`SGLANG_UNEVEN_TOKEN_VECTOR` and an explicit `--rank-kv-ratio`. The plan log
+gains a `coupled KV ratio MATCHED to the solve:` line naming the vector.
+Hermetic regression on a synthetic foreign rig:
+`test/registered/unit/planner/test_phase_kv_coupling.py`.
+
+Two limits of the fix, both deliberate and both things the confirmation arm
+has to read off the boot rather than assume:
+
+1. **The seed is the PREDICTED match, not the measured one.** #433's own
+   numbers separate the two: `[12,26,26]` (from predicted capacity) funds
+   355 958 tokens, `[8,28,28]` (from the capacity the boot actually measured)
+   funds 464 342. Only the second clears the decode arm's 431 360. Converging
+   onto the measured optimum is what `--rank-kv-ratio capacity` already does
+   (phase-2 install after profiling), and the fix leaves that mode untouched.
+2. **The fundability gate still prices the base-plan token vector.** Its
+   reject term is capacity the vector does NOT use, which a matched vector has
+   none of; re-basing it collapses every residual to the bare reserve and the
+   gate stops discriminating -- measured on the #264/#354 fixture,
+   `--rank-kv-ratio capacity` (which already prices per-candidate) accepts
+   `16,1,1` at reserve `3000,2700,2700`, the configuration #264 booted into an
+   OOM. Not widened here. The consequence for this arm: post-fix the
+   non-binding ranks no longer keep the unused-capacity slack the gate credits
+   them with, so **the corridor risk moves off rank 0 and onto ranks 1 and 2**
+   -- #433 measured 7045 / 7109 MiB idle there, and matching spends it.
+
+### Confirmation arm spec
+
+Same rig, same INT8-W8A8 checkpoint, same context and probes and transport as
+`bench845_update_table.md`'s `int8_decode` row, so the comparison stays
+one-variable. Resolve `--rank-gpu-id` at runtime
+(`python -m sglang.srt.registry.nvml --map`), never from a fixed index.
+
+```
+--tp-size 3 --rank-gpu-id <resolved> \
+--rank-tp-ratio auto-performance --rank-perf-tune phase-prefill \
+--rank-auto-reserve-mib auto --context-length 131072 \
+--kv-cache-dtype fp8_e4m3 --trust-remote-code
+(no --rank-mlp-ratio, no --rank-kv-ratio)  + barlink BAR1
+```
+
+**Sub-arm A -- the fix does what it says.** Exactly the command above.
+Read from the boot's own logs:
+
+* the plan log must carry `coupled KV ratio MATCHED to the solve: ... -> v`;
+* the `Uneven-DCP token sizing` line must report that same `v`, not
+  `[31,17,16]`;
+* `max_total_num_tokens` must land within 10 % of the plan's own
+  `predicted ctx ~N` for the chosen vector, and must be **>= 300 000**
+  (the 125 504 baseline is the falsifier: anything near it means the seed did
+  not reach the boot).
+
+A is a pass/fail on the coupling, not on throughput, and it does not by itself
+decide anything about the INT8 layout.
+
+**Sub-arm B -- the arm that can flip the recommendation.** Same command plus
+`--rank-kv-ratio capacity`, so the measured phase-2 install converges the
+vector onto the profiled per-rank capacity. Pass requires BOTH:
+
+* `max_total_num_tokens >= 431 360` (the decode arm's pool), and
+* prefill at s=1 and s=8 at **within-floor parity** with the decode arm --
+  i.e. the delta is inside the LOOSER of the two boots' same-boot A-vs-A
+  floors, which must be re-measured in this boot (3 identical draws each;
+  #433's own boot floored at 3.5 % prefill / 27.5 % decode, and #424's at
+  3.0 % / 12.9 %).
+
+If both hold, the INT8 recommendation flips from "ship the decode layout" to
+**prefill-layout-with-match**: the same pool as the decode arm plus the
+prefill vector, with no measurable prefill cost. The #845 addendum decision
+follows sub-arm B's outcome, not sub-arm A's.
+
+**Corridor gate, both sub-arms:** sample min-free on ALL THREE cards for the
+whole window (not only rank 0, per limit 2 above). The 400 MiB absolute floor
+applies per card. If ranks 1/2 come in under it, the arm is invalid regardless
+of the pool number, and the retry raises `--rank-auto-reserve-mib` on those
+two cards rather than re-pinning a vector.
+
+**Not in this arm:** any hand-pinned `--rank-mlp-ratio` or `--rank-kv-ratio`
+vector. The whole point is that the optimizer now pairs them itself; pinning
+either half re-creates the #354/#424 manual pairing this fix retires.
+
 ## Commands run (for reproduction)
 
 ```
