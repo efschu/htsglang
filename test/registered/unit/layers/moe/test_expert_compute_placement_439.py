@@ -1091,5 +1091,320 @@ class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
             _resident_fraction_vector(self._args(), 3)
         self.assertIn("disagree", str(caught.exception))
 
+    def test_the_launcher_publishes_the_base_plan_for_the_workers(self):
+        import os
+
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            COMPUTE_BASE_PLAN_ENV,
+            compute_base_plan,
+            resolve_moe_compute_placement_flag,
+        )
+
+        resolve_moe_compute_placement_flag(self._args())
+        self.assertEqual(
+            os.environ[COMPUTE_BASE_PLAN_ENV],
+            ",".join(str(b) for b in BATTERY_BASE_PLAN),
+        )
+        self.assertEqual(compute_base_plan(3), tuple(BATTERY_BASE_PLAN))
+        # Never guesses: a wrong-length or malformed value reads as absent, so
+        # sizing falls back to today's behaviour rather than to a wrong plan.
+        self.assertIsNone(compute_base_plan(4))
+        os.environ[COMPUTE_BASE_PLAN_ENV] = "not,a,vector"
+        self.assertIsNone(compute_base_plan(3))
+
+
+class TestResidencyIsHeldAtTheBasePlan(CustomTestCase):
+    """Defect 2 of the ARM3 battery: the arm was not VRAM-neutral.
+
+    ``ARM3_COMPUTE.md`` states the arm is "VRAM-neutral by construction -- the
+    solve holds each rank's GPU-RESIDENT expert mass at exactly what the base
+    plan gives it". The solve does. The RUNTIME did not: residency is sized
+    from ``R = resident_slot_count(E, f)`` with ``E`` the rank's OWN expert
+    count, and the installed vector is exactly what changes that count. On the
+    battery's solved vector tp2 went from 71 to 85 experts and its resident
+    mass rose 19.5 % -- on a 20 GiB 3080 the baseline already left ~515 MiB
+    free, and the boot died in ``_ensure_tiers -> allocate``.
+
+    THE FIXED POINT, and the decision. Correcting by lowering the resident
+    fraction feeds back into the solve, which reads the fractions as an input:
+    the battery's second boot measured 161,91,113 instead of 160,79,119 for
+    exactly that reason. The loop is broken by construction rather than
+    iterated -- the SOLVE keeps reading the operator's fractions against the
+    BASE plan, and the runtime correction is a DERIVED sizing quantity carried
+    on a channel the solve never reads. See the block comment above
+    ``compute_base_plan``.
+
+    Residency is pinned in SLOTS rather than in bytes because slots are what
+    the runtime allocates: every buffer on the layer is ``[R + C]`` rows of a
+    fixed row shape, so equal ``resident_count`` and equal ``buffer_slots``
+    over an unchanged row shape IS equal bytes, and it is exact where a byte
+    figure would need a model geometry the test would have to invent.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import os
+
+        from sglang.srt.distributed import utils as du
+
+        self._saved_plan = os.environ.get("SGLANG_MOE_COMPUTE_BASE_PLAN")
+        self._saved_ratios = (du._TP_PARTITION_RATIOS, du._TP_PARTITION_FAMILIES)
+
+    def tearDown(self):
+        import os
+
+        from sglang.srt.distributed import utils as du
+
+        du._TP_PARTITION_RATIOS, du._TP_PARTITION_FAMILIES = self._saved_ratios
+        if self._saved_plan is None:
+            os.environ.pop("SGLANG_MOE_COMPUTE_BASE_PLAN", None)
+        else:
+            os.environ["SGLANG_MOE_COMPUTE_BASE_PLAN"] = self._saved_plan
+        super().tearDown()
+
+    @staticmethod
+    def _install(base_plan, installed):
+        import os
+
+        from sglang.srt.distributed.utils import set_tp_partition_ratios
+
+        os.environ["SGLANG_MOE_COMPUTE_BASE_PLAN"] = ",".join(str(b) for b in base_plan)
+        set_tp_partition_ratios(list(base_plan), {"moe": list(installed)})
+
+    @staticmethod
+    def _staging_plan(num_experts, vector, rank, fraction):
+        """The residency the RUNTIME would build for one rank.
+
+        ``plan_load_time_staging`` is the production sizing function; the
+        expert count and the pinned pad expert are derived the way
+        ``FusedMoE._gguf_owned_expert_count`` derives them under the #82
+        expert-dim shard.
+        """
+        from sglang.srt.distributed.utils import partition_units
+        from sglang.srt.layers.moe.expert_offload import plan_load_time_staging
+
+        count = partition_units(num_experts, list(vector))[rank] + 1
+        return plan_load_time_staging(
+            count, fraction=fraction, pinned_experts=(count - 1,)
+        )
+
+    def _corrected(self, rank, fraction, num_experts=BATTERY_EXPERTS, world=3):
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resident_fraction_held_at_base_plan,
+        )
+
+        return resident_fraction_held_at_base_plan(
+            fraction,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            moe_tp_size=world,
+            moe_tp_rank=rank,
+            expert_sharded=True,
+        )
+
+    def test_can_fail_the_uncorrected_fraction_inflates_the_starved_rank(self):
+        """Reproduce the defect, so the pin below is not merely green.
+
+        Numbers asserted against the battery's own record: tp1 71 -> 57
+        experts, tp2 71 -> 85, and tp2's resident slots up 31 -> 37.
+        """
+        solved = (160, 79, 119)
+        base_counts, link_counts, base_R, link_R = [], [], [], []
+        for rank, fraction in enumerate(BATTERY_FRACTIONS):
+            b = self._staging_plan(BATTERY_EXPERTS, BATTERY_BASE_PLAN, rank, fraction)
+            k = self._staging_plan(BATTERY_EXPERTS, solved, rank, fraction)
+            base_counts.append(b.num_experts - 1)
+            link_counts.append(k.num_experts - 1)
+            base_R.append(b.resident_count)
+            link_R.append(k.resident_count)
+        self.assertEqual(base_counts, [114, 71, 71])
+        self.assertEqual(link_counts, [114, 57, 85])
+        self.assertEqual(base_R, [56, 31, 31])
+        self.assertEqual(link_R, [56, 25, 37])
+        self.assertGreater(link_R[2], base_R[2])
+        self.assertAlmostEqual(link_R[2] / base_R[2] - 1.0, 0.195, places=2)
+
+    def test_the_corrected_fraction_reproduces_the_base_plan_residency(self):
+        """The pin: identical resident slots and identical buffer slots.
+
+        Slot for slot on every rank, which over an unchanged row shape is byte
+        for byte -- the property ``ARM3_COMPUTE.md`` claims and the corridor
+        the confirmation window is run against depends on.
+        """
+        solved = (160, 79, 119)
+        self._install(BATTERY_BASE_PLAN, solved)
+        for rank, fraction in enumerate(BATTERY_FRACTIONS):
+            with self.subTest(rank=rank):
+                base = self._staging_plan(
+                    BATTERY_EXPERTS, BATTERY_BASE_PLAN, rank, fraction
+                )
+                link = self._staging_plan(
+                    BATTERY_EXPERTS, solved, rank, self._corrected(rank, fraction)
+                )
+                self.assertEqual(link.resident_count, base.resident_count)
+                self.assertEqual(link.buffer_slots, base.buffer_slots)
+                # The pad expert stays resident on both, which is the #82
+                # invariant the correction must not spend its slot budget on.
+                self.assertIn(link.num_experts - 1, link.resident_ids)
+
+    def test_the_streamed_remainder_still_follows_the_links(self):
+        """VRAM-neutrality must not neutralise the treatment as well.
+
+        Holding residency fixed while the expert count moves means the COLD
+        set is where the whole delta lands -- which is the arm's mechanism, so
+        this is the check that the fix did not turn the arm back into its own
+        baseline.
+        """
+        solved = (160, 79, 119)
+        self._install(BATTERY_BASE_PLAN, solved)
+        base_cold, link_cold = [], []
+        for rank, fraction in enumerate(BATTERY_FRACTIONS):
+            base = self._staging_plan(
+                BATTERY_EXPERTS, BATTERY_BASE_PLAN, rank, fraction
+            )
+            link = self._staging_plan(
+                BATTERY_EXPERTS, solved, rank, self._corrected(rank, fraction)
+            )
+            base_cold.append(len(base.spill_ids))
+            link_cold.append(len(link.spill_ids))
+        self.assertEqual(sum(base_cold) + sum(link_cold) > 0, True)
+        # tp1 sits on the x4 slot: it must stream strictly less than before,
+        # and the two x8 ranks strictly more.
+        self.assertLess(link_cold[1], base_cold[1])
+        self.assertGreater(link_cold[2], base_cold[2])
+        self.assertGreaterEqual(link_cold[0], base_cold[0])
+
+    def test_no_base_plan_published_is_the_untouched_fraction(self):
+        """Byte-identity gate: every launch without the flag is unaffected.
+
+        Asserted as identity of the returned value, not merely equality, so a
+        future correction that "does nothing" numerically but rounds through
+        a float still shows up here.
+        """
+        import os
+
+        from sglang.srt.distributed.utils import set_tp_partition_ratios
+
+        os.environ.pop("SGLANG_MOE_COMPUTE_BASE_PLAN", None)
+        set_tp_partition_ratios(list(BATTERY_BASE_PLAN), {"moe": [160, 79, 119]})
+        for rank, fraction in enumerate(BATTERY_FRACTIONS):
+            self.assertEqual(self._corrected(rank, fraction), fraction)
+
+    def test_an_identity_solve_leaves_the_fraction_alone(self):
+        self._install(BATTERY_BASE_PLAN, BATTERY_BASE_PLAN)
+        for rank, fraction in enumerate(BATTERY_FRACTIONS):
+            self.assertEqual(self._corrected(rank, fraction), fraction)
+        # And a gcd-equivalent spelling of the same split is the same split.
+        self._install([2, 1, 1], [4, 2, 2])
+        self.assertEqual(self._corrected(0, 0.5), 0.5)
+
+    def test_offload_off_is_never_turned_on_by_the_correction(self):
+        self._install(BATTERY_BASE_PLAN, [160, 79, 119])
+        self.assertEqual(self._corrected(2, 1.0), 1.0)
+
+    def test_the_correction_holds_the_product_on_the_width_sharded_path(self):
+        """The other MoE geometry: the vector moves WIDTH, not expert count.
+
+        Every rank still owns every expert there, so residency is held by
+        scaling the slot count against the width ratio instead. Same invariant
+        (resident slots x width), one expression.
+
+        EXACT on the expert-sharded path and only NEAREST-INTEGER here, and the
+        difference is a property of the geometry rather than of the code: a
+        slot is indivisible, so a width ratio that is not a rational multiple
+        of the slot count has no exact representation. Pinned as "within one
+        slot, and the closest integer" -- overstating it as exact is how a
+        residual becomes invisible. Uncorrected, the same case is off by the
+        full width ratio.
+        """
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            vram_neutral_resident_fraction,
+        )
+        from sglang.srt.layers.moe.expert_offload import resident_slot_count
+
+        experts, base_w, link_w = 64, 1024, 1536
+        fraction = 0.5
+        base_R = resident_slot_count(experts, fraction)
+        corrected = vram_neutral_resident_fraction(
+            fraction, experts, experts, base_w, link_w
+        )
+        link_R = resident_slot_count(experts, corrected)
+        target = base_R * base_w / link_w
+        self.assertEqual(link_R, round(target))
+        self.assertLessEqual(abs(link_R * link_w - base_R * base_w), link_w)
+        # Can-fail control: the UNCORRECTED fraction keeps all 32 slots at the
+        # wider row, which is the 1.5x residency blow-up the correction exists
+        # to remove.
+        uncorrected = resident_slot_count(experts, fraction)
+        self.assertEqual(uncorrected * link_w, 3 * base_R * base_w // 2)
+
+    def test_a_rank_that_cannot_hold_its_baseline_warns_by_name(self):
+        """The clamp, executed rather than reasoned about.
+
+        A rank whose solved extent is SMALLER than its own baseline residency
+        cannot hold that residency, and then the arm is not VRAM-neutral for
+        it. The solve never produces this -- a solved share is the resident
+        share plus a positive cold term -- so it is reachable only through a
+        hand-installed vector, which is exactly the case worth naming in the
+        boot log rather than absorbing.
+        """
+        self._install([3, 1], [1, 3])
+        with self.assertLogs(
+            "sglang.srt.layers.moe.expert_compute_placement", level="WARNING"
+        ) as logs:
+            corrected = self._corrected(0, 0.9, num_experts=8, world=2)
+        text = "\n".join(logs.output)
+        self.assertIn("cannot be held at the base plan on rank 0", text)
+        self.assertIn("not VRAM-neutral", text)
+        # Clamped to everything this rank still owns, never above it.
+        from sglang.srt.distributed.utils import partition_units
+        from sglang.srt.layers.moe.expert_offload import resident_slot_count
+
+        local = partition_units(8, [1, 3])[0] + 1
+        self.assertEqual(resident_slot_count(local, corrected), local)
+
+    def test_the_correction_never_leaves_the_unit_interval(self):
+        """Swept, because a fraction outside (0, 1] is refused downstream."""
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            vram_neutral_resident_fraction,
+        )
+
+        for base_e in (1, 2, 7, 64, 256):
+            for local_e in (1, 2, 7, 64, 256):
+                for fraction in (0.01, 0.42, 0.485, 0.999):
+                    with self.subTest(base=base_e, local=local_e, f=fraction):
+                        got = vram_neutral_resident_fraction(fraction, base_e, local_e)
+                        self.assertGreater(got, 0.0)
+                        self.assertLessEqual(got, 1.0)
+
+    def test_the_layer_latches_the_corrected_fraction_and_nothing_else_does(self):
+        """Call-site pin: consumer counting would miss a removed call.
+
+        ``_expert_offload_fraction`` is the ONE value the staging plan and
+        ``MoEExpertOffloadCache`` both size from -- and they cross-check, so a
+        correction applied at only one of them is a hard error at install
+        rather than a wrong number. Pin that it is applied at the latch.
+        """
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[5]
+        source = (
+            root / "python/sglang/srt/layers/moe/fused_moe_triton/layer.py"
+        ).read_text()
+        tree = ast.parse(source)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "resident_fraction_held_at_base_plan"
+        ]
+        self.assertEqual(len(calls), 1, "the correction belongs at the one latch")
+        self.assertIn(
+            "self._expert_offload_fraction = resident_fraction_held_at_base_plan(",
+            source,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

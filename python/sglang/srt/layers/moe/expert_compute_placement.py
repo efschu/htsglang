@@ -127,15 +127,19 @@ from typing import List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "COMPUTE_BASE_PLAN_ENV",
     "COMPUTE_PLACEMENT_LINK",
     "COMPUTE_POLICY_ENV",
     "TRAFFIC_COEFFICIENT_ENV",
     "ComputePlacement",
     "NoComputeLever",
     "cold_traffic_coefficients_from_measurement",
+    "compute_base_plan",
     "compute_policy_label",
+    "resident_fraction_held_at_base_plan",
     "resolve_moe_compute_placement_flag",
     "solve_link_proportional_expert_vector",
+    "vram_neutral_resident_fraction",
 ]
 
 #: The symbolic value ``--rank-moe-ratio`` accepts in place of a vector.
@@ -148,6 +152,13 @@ COMPUTE_PLACEMENT_LINK = "link"
 #: whose null result was never tested. Same channel and same reason as the
 #: rank->card vector (#407 cut 2) and the cold-tier launch id (#394 slice 2).
 COMPUTE_POLICY_ENV = "SGLANG_MOE_COMPUTE_POLICY"
+
+#: The "moe" family vector the solve held the RESIDENT mass against, i.e. the
+#: plan the boot would have run without the flag. Published by the launcher
+#: next to :data:`COMPUTE_POLICY_ENV` and read by the residency sizing in every
+#: worker; see :func:`resident_fraction_held_at_base_plan` for why residency
+#: cannot be sized off the installed vector.
+COMPUTE_BASE_PLAN_ENV = "SGLANG_MOE_COMPUTE_BASE_PLAN"
 
 #: Optional per-rank cold-traffic coefficients, comma-separated, mean-1. The
 #: operator computes them from a PRIOR boot's #390 dump with
@@ -509,6 +520,206 @@ def compute_policy_label() -> str:
     return os.environ.get(COMPUTE_POLICY_ENV, "").strip() or "base-plan"
 
 
+# ===========================================================================
+# VRAM neutrality, and the fixed point the first battery walked into (#439).
+#
+# The solve above holds ``resident_r = f_r * b_r`` FIXED -- that invariant is
+# the reason the arm is installable without re-deriving the VRAM ledger, and
+# it is asserted on the solve's own output. The RUNTIME did not honour it.
+# Residency is sized from the rank's own shard extent
+# (``expert_offload.plan_load_time_staging``: ``R = resident_slot_count(E,
+# f)``), and the installed vector is exactly what changes that extent. So the
+# realised resident mass was ``f_r * share_r``, not ``f_r * b_r``: on the
+# 2026-08-02 reference recipe the solved vector 160,79,119 raised tp2's
+# resident expert mass by 19.5 % over a card the baseline already left ~515 MiB
+# free, and the boot died in ``_ensure_tiers -> allocate``.
+#
+# THE FIXED POINT. The obvious correction -- lower the resident FRACTION until
+# the mass comes back -- feeds straight back into the solve, because the solve
+# reads the fractions as an input. The night battery measured that: rescaled
+# fractions 0.4812,0.5296,0.3516 produced 161,91,113 instead of 160,79,119, a
+# placement for which the correction just computed is already wrong. Iterating
+# to a fixed point is not in the spec and would make the installed vector a
+# function of a numerical process rather than of the rig.
+#
+# THE DECISION, and it breaks the loop by construction rather than solving it:
+#
+#   * The SOLVE keeps reading the fractions the OPERATOR set, against the BASE
+#     plan. Its inputs are untouched, so 160,79,119 is the vector, once.
+#   * Residency is then held at the PRE-LINK baseline in the runtime: rank r
+#     keeps exactly the resident slots ``resident_slot_count(base_extent_r,
+#     f_r)`` gives it, sized off the base plan the launcher published here.
+#   * That correction is expressed as a DERIVED per-rank fraction, and it is
+#     carried on a channel the solve does not read. Nothing feeds back; there
+#     is no iteration and no second solve.
+#
+# The derived fraction is a SIZING quantity only. ``--rank-moe-resident-
+# fraction`` and ``SGLANG_MOE_RESIDENT_EXPERT_FRACTION`` keep meaning exactly
+# what they meant -- the operator's fraction of the BASE shard -- which is also
+# what keeps the treatment arm comparable with the baseline arm that shares it.
+# ===========================================================================
+
+
+def compute_base_plan(world: int) -> Optional[Tuple[int, ...]]:
+    """The pre-link "moe" family vector, or ``None`` when link mode is off.
+
+    Never raises and never guesses: a malformed or wrong-length value reads as
+    absent, which restores today's sizing exactly. The channel only ever
+    carries a vector the launcher itself wrote.
+    """
+    raw = os.environ.get(COMPUTE_BASE_PLAN_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        values = tuple(int(p) for p in raw.replace(";", ",").split(",") if p.strip())
+    except ValueError:
+        return None
+    if len(values) != int(world) or any(v <= 0 for v in values):
+        return None
+    return values
+
+
+def vram_neutral_resident_fraction(
+    fraction: float,
+    base_experts: int,
+    local_experts: int,
+    base_width: int = 1,
+    local_width: int = 1,
+) -> float:
+    """The fraction that reproduces the BASE plan's resident bytes. Pure.
+
+    Resident bytes on a rank are ``R * width``: ``R`` resident expert slots of
+    ``width`` elements each. Under the #82 expert-dim shard the vector moves
+    ``R``'s domain (the rank's expert count) and leaves ``width`` alone; on
+    every other MoE path it moves ``width`` and leaves the expert count alone.
+    One expression covers both, because the invariant is the product:
+
+        target_slots = R_base * base_width / local_width
+
+    The returned fraction is the midpoint of the interval that ``ceil`` maps
+    onto ``round(target_slots)``, i.e. ``(target - 0.5) / local_experts``.
+    The midpoint rather than ``target / local_experts`` because the latter does
+    not survive its own round trip in binary floating point -- 56/114 times 114
+    is 56.000000000000014, whose ceiling is 57, which would put one extra
+    expert on the card this function exists to protect.
+
+    Clamped into ``[1, local_experts]`` slots. The upper clamp is reachable
+    only if a rank was solved BELOW its own resident mass, which the solve
+    forbids (``share_r = resident_r + cold_total * u_r`` with both terms
+    positive) except through integer rounding. It is not silent: the caller
+    warns by name, because a rank in that state holds LESS than its baseline
+    and the arm is no longer VRAM-neutral for it.
+    """
+    f = float(fraction)
+    if f >= 1.0:
+        return f
+    from sglang.srt.layers.moe.expert_offload import resident_slot_count
+
+    e_base = max(1, int(base_experts))
+    e_local = max(1, int(local_experts))
+    target = resident_slot_count(e_base, f) * float(base_width) / float(local_width)
+    target = min(max(target, 1.0), float(e_local))
+    return (target - 0.5) / e_local
+
+
+def resident_fraction_held_at_base_plan(
+    fraction: float,
+    *,
+    num_experts: int,
+    num_local_experts: int,
+    moe_tp_size: int,
+    moe_tp_rank: int,
+    expert_sharded: bool,
+    intermediate_size: Optional[int] = None,
+    intermediate_units: Optional[int] = None,
+) -> float:
+    """``fraction``, corrected so this rank's resident bytes do not move.
+
+    A no-op -- returning ``fraction`` unchanged, identity object and all --
+    whenever link mode did not publish a base plan, the installed vector is the
+    base plan, or offload is off. That is what keeps every launch that does not
+    pass ``--rank-moe-ratio link`` byte-identical.
+
+    ``expert_sharded`` selects which dimension the "moe" family actually
+    partitions on this layer (see :func:`vram_neutral_resident_fraction`). The
+    ``+ 1`` on the expert-shard counts is the #82 zero padding expert, which
+    ``_gguf_owned_expert_count`` includes and which is resident on every rank.
+    """
+    f = float(fraction)
+    if f >= 1.0:
+        return f
+    world = int(moe_tp_size)
+    base = compute_base_plan(world)
+    if base is None:
+        return f
+
+    from sglang.srt.distributed.utils import (
+        get_tp_partition_ratios,
+        partition_sizes,
+        partition_units,
+    )
+
+    installed = get_tp_partition_ratios("moe")
+    if not installed or len(installed) != world:
+        return f
+    if _reduce(list(base)) == _reduce(list(installed)):
+        # The solve was the identity, or the operator installed the base plan
+        # by hand. Nothing moved, so nothing is corrected.
+        return f
+
+    rank = int(moe_tp_rank)
+    if expert_sharded:
+        e_base = partition_units(int(num_experts), list(base))[rank] + 1
+        e_local = partition_units(int(num_experts), list(installed))[rank] + 1
+        w_base = w_local = 1
+    else:
+        if not intermediate_size or not intermediate_units:
+            # Nothing to hold the width against; leave the fraction alone
+            # rather than invent a geometry.
+            return f
+        e_base = e_local = int(num_local_experts)
+        w_base = partition_sizes(
+            int(intermediate_size), list(base), int(intermediate_units)
+        )[rank]
+        w_local = partition_sizes(
+            int(intermediate_size), list(installed), int(intermediate_units)
+        )[rank]
+
+    from sglang.srt.layers.moe.expert_offload import resident_slot_count
+
+    desired = resident_slot_count(e_base, f) * w_base / w_local
+    corrected = vram_neutral_resident_fraction(f, e_base, e_local, w_base, w_local)
+    if desired > e_local:
+        logger.warning(
+            "MoE residency cannot be held at the base plan on rank %d: the "
+            "base plan gives it %.1f resident slots but the solved placement "
+            "leaves it only %d slots to hold them in. This rank will hold "
+            "LESS than its baseline, so the arm is not VRAM-neutral for it. "
+            "The solve does not produce this (a rank's solved share is always "
+            "its resident share plus a positive cold term); check for a "
+            "hand-installed --rank-moe-ratio.",
+            rank,
+            desired,
+            e_local,
+        )
+    if corrected != f:
+        logger.info(
+            "MoE resident fraction held at the base plan (#439): rank %d "
+            "%.6f -> %.6f (base extent %d x %d, installed %d x %d). The "
+            "operator's fraction always means a fraction of the BASE shard, "
+            "so the resident bytes are the ones the VRAM ledger was solved "
+            "for; only the STREAMED remainder follows the links.",
+            rank,
+            f,
+            corrected,
+            e_base,
+            w_base,
+            e_local,
+            w_local,
+        )
+    return corrected
+
+
 def _resident_fraction_vector(server_args, world: int) -> Tuple[float, ...]:
     """The per-rank resident fraction as the RUNTIME will read it.
 
@@ -684,6 +895,12 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
     else:
         policy = "link-proportional"
     os.environ[COMPUTE_POLICY_ENV] = policy
+    # The plan the resident mass is held against, published on the same
+    # environment channel and in the same process as the policy label, and for
+    # the same reason: the workers must not re-derive it. Without it the
+    # residency sizing in every worker would follow the vector it just
+    # installed, and the arm would stop being VRAM-neutral (#439).
+    os.environ[COMPUTE_BASE_PLAN_ENV] = ",".join(str(int(b)) for b in base_plan)
     if placement.is_identity:
         # Loud, because an identity resolution under a flag that was asked for
         # explicitly is nearly always a configuration accident rather than a

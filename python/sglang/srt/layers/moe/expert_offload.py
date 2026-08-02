@@ -1278,6 +1278,16 @@ def plan_load_time_staging(
 
     # SIZING: this number decides how many experts stay on THIS rank's GPU, so
     # it must be this rank's own fraction, not a group-wide one.
+    #
+    # ``R = resident_slot_count(E, frac)`` below is sized off ``E``, the rank's
+    # OWN expert count -- which "--rank-moe-ratio" is precisely what changes.
+    # A caller running under a solved compute placement must therefore hand in
+    # the fraction ALREADY corrected to the base plan
+    # (``expert_compute_placement.resident_fraction_held_at_base_plan``), which
+    # is what ``FusedMoE`` latches at construction and what every production
+    # caller passes. The ``fraction=None`` default reads the raw operator
+    # fraction and is for callers with no layer -- tests, and the doors that
+    # run before any placement exists (#439).
     frac = resident_fraction_for_rank() if fraction is None else float(fraction)
     if frac >= 1.0:
         return None
@@ -3491,8 +3501,14 @@ def presplit_expert_offload_after_repack(
         refuse_cold_shard_at_repack_door(layer)
 
     # SIZING: drives plan_load_time_staging below, i.e. the resident set and
-    # every buffer booked against this rank's VRAM.
-    frac = resident_fraction_for_rank()
+    # every buffer booked against this rank's VRAM. Prefer the value the LAYER
+    # latched at construction: it is the same number by default, and under
+    # "--rank-moe-ratio link" it is the one corrected to hold this rank's
+    # resident bytes at the base plan (#439). MoEExpertOffloadCache sizes
+    # itself from the layer's value and hard-errors if the two disagree.
+    frac = getattr(layer, "_expert_offload_fraction", None)
+    if frac is None:
+        frac = resident_fraction_for_rank()
     if frac >= 1.0:
         return
     E = getattr(layer, "num_local_experts", None)
