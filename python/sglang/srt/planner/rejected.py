@@ -326,8 +326,7 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         key="spill_with_pp_dp",
         what="session KV spill with --pp-size > 1 or --dp-size > 1",
         verdict=(
-            "BLOCKED by the engine: spill S1 supports single-node pure "
-            "TP/DCP only"
+            "BLOCKED by the engine: spill S1 supports single-node pure TP/DCP only"
         ),
         gain="session spill on a pipeline- or data-parallel server",
         cost="refused at argument parse",
@@ -543,6 +542,44 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         evidence="the #244 + #263 + #266 chain",
         tags=("crossrig-tp-push",),
         scope="rig",
+    ),
+    RejectedEntry(
+        key="c4_indexer_head_fold",
+        what="folding the C4 indexer's head axis into one effective query",
+        verdict=(
+            "WRONG OPERATOR: the fold needs the per-head product to enter the "
+            "head sum linearly, and the C4 indexer applies a per-head ReLU "
+            "between the two. Measured 0.94 relative divergence and 0.41-0.56 "
+            "top-k overlap against the production torch path; the same fold "
+            "reproduces a relu-free operator to 3.6e-07"
+        ),
+        gain=(
+            "the quadratic term would lose the index_n_heads=64 factor, "
+            "reported 37-99x on 8xA800 at KV 16K-64K"
+        ),
+        cost=(
+            "silently different page selection on every long-context prefill, "
+            "with no error bound"
+        ),
+        why=(
+            "logits[i,j] = sum_h w[i,h] * relu(q[i,h,:] . k[j,:]) * "
+            "k_scale[j]. ReLU is not linear, so the head sum cannot cross it "
+            "and the head axis is irreducible -- MQA is necessary for the "
+            "fold and is genuinely present here, but it is not sufficient. "
+            "Reopen only if the GPU arm in NOTE_440 shows the ReLU is inert "
+            "on the real checkpoint, and then only as a labelled "
+            "approximation, never as an identity."
+        ),
+        level=BLOCKED,
+        evidence=(
+            "docs/dev/NOTE_440_c4_indexer_head_fold.md; "
+            "test_dsv4_indexer_head_fold_440.py (18 tests); "
+            "sgl-project/sglang#33246 comment 5159510149 and PR #33271, "
+            "whose folded Triton kernel carries no ReLU while the per-head "
+            "fallback in the same file does"
+        ),
+        tags=("c4-indexer-head-fold",),
+        scope="general",
     ),
 )
 
