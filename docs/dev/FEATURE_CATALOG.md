@@ -356,6 +356,32 @@ qwen3_coder` (server-side fix, no template patches); fast lane, priority
 scheduling, admission throttle, prefill delayer; training tenant + idle
 workbench (ledger + pause rung); `/session_handover`; `/kv_reshard`.
 
+Class-3 video enhance, adaptive chain planner (#451,
+`video_enhance/chain_policy.py`): given an ffprobe source and a target, it
+generates the chain shapes that reach it (`full`, `rife_only`,
+`pre_downscale` with the SR entry point solved off the measured frontier,
+opt-in `decimate_resynth`), prices each against the per-stage rate table AND
+the §6.2 reservation through `plan_job`, and picks the least lossy feasible
+one or refuses with every candidate's numbers. `full` wins automatically
+whenever it fits. Absent stage rates make a candidate unpriceable rather than
+optimistic; `allow_estimates` prices them by a labelled linear-in-pixels
+extrapolation. `pre_downscale` and `decimate_resynth` are *recommendable but
+not runnable* on the M2 executor (no scaled/strided decode) and say so;
+`require_runnable` excludes them. Mode + one-line reason are in the job
+status. Tipping points are correct for the 4.6/fp32-parity P1 table; the
+fp16-TRT operating point is unmeasured.
+
+Class-3 video enhance, streaming-input admission (#448 desk half,
+`video_enhance/streaming.py`): source kinds finished/growing/live with named
+refusals (no growing source on the chunk executor — the split is verified
+against a final frame count that does not exist; no live source under
+`stall` — back-pressure cannot reach the feed, so the frames lost during a
+stall would be uncounted), a bounded output buffer whose depth is a declared
+seconds-deep watermark converted through the output rate, a growing-source
+adapter that distinguishes "not yet" from "no more" (with an idle timeout),
+and a sliding-window in/out fps accounting exposed on the job status for the
+#344 live watch. Finished sources keep the depth-1 bridge unchanged.
+
 ## 14. Dashboard
 Guided config wizard with honest refusals, comm benchmark suite with
 anonymization gate, energy metering (tok/s + J/token), benchmark tiles with

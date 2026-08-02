@@ -24,6 +24,8 @@ its own CUDA context, pinned to one physical GPU through
 | `mux.py` | ffprobe inventory, track selection, retiming, ffmpeg remux | ffmpeg |
 | `server.py` | the HTTP surface, job registry, response bridge | no |
 | `tenant.py` | tenant config, budget, `plan_job`, stage factory | no |
+| `chain_policy.py` | which chain shape to run: candidates, pricing against the frontier and the reservation, the refusal | no |
+| `streaming.py` | streaming-input admission, the seconds-deep output watermark, sustained in/out rate | no |
 | `engine_cache.py` | engine identity keying and the provenance manifest | no |
 | `parity.py` | PSNR/SSIM gate against the fp32 reference | torch |
 | `backends.py` | ONNX Runtime CUDA/TensorRT backends, native-TRT seam | torch, onnxruntime |
@@ -916,3 +918,153 @@ next to the pipeline's.
     client would need one, and that is a follow-on.
 *   **No adaptive `fps_divisor`.** The cost is measured and the lever is
     exposed, but nothing turns it automatically when the chain falls behind.
+
+---
+
+## 14. Adaptive chain planning (#451)
+
+`chain_policy.py`. `plan_job` answers "does the chain the caller asked for
+fit"; this answers "which chain should the caller have asked for", which a
+client cannot answer for itself because it would need the per-stage rate
+table, the reservation formula and the geometry rules.
+
+### 14.1 The four shapes and how one is picked
+
+`full`, `rife_only`, `pre_downscale` and `decimate_resynth`. Which of them
+*exist* for a request is geometry, not economy: a `rife_only` chain on a
+source below the target is not a cheaper option, it is a chain `build_chain`
+refuses to build. Which of the existing ones is *chosen* is
+`Candidate.quality_cost` -- tier, then detail thrown away, then input frames
+thrown away -- with throughput headroom only breaking ties between shapes
+that cost the viewer the same. That is what makes `full` automatic rather than
+configured: it is tier 0 with no losses, so nothing below it can outrank it
+however much faster the cheaper shape is. A test asserts exactly that against
+a table where the pre-downscale ladder is eleven times faster and still loses.
+
+`pre_downscale`'s entry point is **solved, not guessed**: the ladder is the SR
+input resolutions somebody measured, filtered to those that still reach the
+target after the x`sr_scale` upscale, and the boundary moves when one row of
+the table moves. `decimate_resynth` is opt-in by name and reports both the
+fraction of input discarded and the fraction of output that is synthetic.
+
+### 14.2 Two shapes are recommendable and not runnable, and say so
+
+`build_chain` places resize strictly after SR (§8.1), so a pre-SR resize is
+not expressible as a chain at all. The nearest thing that exists is the ffmpeg
+decode backend, whose command already carries `scale=W:H` -- but
+`codec.DecodeStage._open` refuses outright when the source size differs from
+the planned size, the PyNvVideoCodec backend has no scaler, and ffmpeg's
+`scale` is not the chain's Lanczos-3. Decimation is worse off: `DecodeStage`
+takes a contiguous `start_frame`/`frame_limit` range and has no stride at all.
+
+Both are therefore named requirements on the candidate rather than silently
+available, and `PolicyRequest.require_runnable` -- which the HTTP surface sets
+unconditionally -- excludes them. The policy is still allowed to *answer* that
+a pre-downscale would fit, because that is the answer, and a caller that has
+to start a job filters it out rather than discovering at runtime that the
+decoder ignored the plan.
+
+### 14.3 Three pricing decisions that would otherwise flatter a mode
+
+*   **A RIFE cell is per interpolated frame, not per pair invocation.**
+    `shard_plan.stage_stream_factors` returns one invocation per pair at any
+    multiplier, which is right at x2 -- the only multiplier it was written
+    for -- and would make every decimated candidate free at the RIFE stage.
+    The planner charges `arity_out`.
+*   **The decoder is charged for the frames decimation throws away.** A
+    decoder cannot skip them, and the decode column is what a high input rate
+    makes expensive.
+*   **A pre-downscale is charged decode at the source size.** The chain's own
+    `source` is the entry resolution, so pricing every stage off the chain
+    would credit the mode with a decode saving it does not make.
+
+Each of the three has a test, and each test was shown to fail against the
+version of the code without the correction.
+
+### 14.4 What is unpriced, and what is absent
+
+The two colour conversions are in no probe grid and are reported as
+`unpriced_stages` on every candidate rather than as free. They are the same
+two stages in every candidate, so they cannot reorder a ranking, but an
+absolute fps figure from this module is a chain-stage figure and slightly
+optimistic.
+
+A stage that *should* have a row and does not makes the candidate
+UNPRICEABLE, and the refusal names it. `allow_estimates` prices it instead by
+a linear-in-pixels extrapolation off a measured row of the same stage on the
+same card, and then the whole decision is labelled `estimate`. An
+extrapolation still needs a row to start from: a stage with no measurement at
+any resolution stays `absent` with the flag on.
+
+**The shipped P1 report is not enough to price a full chain**, and the test
+suite says so with the real files rather than in prose:
+`docs/dev/measurements/333-m2/` has SR, resize and RIFE on one card and no
+decode or encode row at all, so `choose_chain` against it refuses -- with
+`allow_estimates` too.
+
+### 14.5 What the tipping points are worth today
+
+The synthetic tables in `test_chain_policy.py` are anchored on the measured
+5090 column and the §9.4 per-stage ratios, with decode and encode invented
+because nothing measured them. Against that table and this rig the target
+scenario (1080p at 25 fps to 2160p at 50 fps) does **not** reach `full`: the
+three cards aggregate 8.9 chain fps against 25 required, and the planner drops
+to a 960x540 SR entry point at 27.2 fps -- a shape the executor cannot run.
+
+That is a statement about the fp32-parity-era numbers, not about the feature.
+The operating point is the fp16/bf16 TensorRT engine from the pinned ONNX and
+RIFE 4.26; neither is measured, so **the production tipping points wait on
+that measurement**. Nothing in the module hard-codes a threshold, so the move
+is a re-read of the table.
+
+---
+
+## 15. Streaming input, the desk half (#448)
+
+`streaming.py`. Everything upstream of it assumes a finished source, and the
+failure when that is not true is not a clean one: a growing file simply ends
+at whatever the writer had flushed and the job looks successful over a prefix.
+
+**The admission is the point.** Three refusals, each of which would otherwise
+be a job that looked like it worked:
+
+*   A growing or live source on the chunk executor. `verify_chunk_arithmetic`
+    checks the whole split against a final frame count before a card is
+    touched, and such a source has none; cutting it against the count it
+    happens to have right now plans for a prefix. The multi-card seam and the
+    scheduler are untouched -- this is the gate in front of them.
+*   A chunked run with no frame count at all, for the same reason.
+*   A live source under the `stall` overload policy. Stalling is only
+    back-pressure when the producer can be slowed down; a live feed cannot be,
+    so the frames arriving during a stall are lost either way and the only
+    difference is that `drop_frames` counts them. Silent loss is what §8.4
+    rule 4 exists to prevent.
+
+**The watermark is a duration.** A file job keeps the depth-1 response bridge,
+because anything deeper is a buffer between the socket and the chain that
+back-pressure must cross. A streaming job accepts that crossing deliberately
+in exchange for not underrunning a player, and what it accepts is stated in
+seconds and converted to frames through the output rate.
+
+**"Not yet" is not "no more."** `growing_frames` is the adapter that keeps the
+two apart, with an idle timeout measured from the last *frame* rather than the
+last call. It is a pull source and buffers nothing, so the executor's rings
+remain the only thing bounding memory.
+
+**Sustained rate is sampled off the hot path.** `RateWindow` takes the
+pipeline's own cumulative counters at two moments that are already outside the
+chain: when the job status is rendered, and after a chunk the transport has
+accepted -- the same moment the liveness watchdog uses, and for the same
+reason. Fewer than two samples reports `None` rather than 0.0, because a live
+watch showing zero for "not measured yet" is reporting a stall that is not
+there.
+
+### 15.1 What the desk half does not do
+
+*   **No decode-side streaming backend.** `growing_frames` adapts a producer;
+    nothing yet makes `codec.DecodeStage` into one that answers `NOT_YET` on a
+    file that is still being written. That is the card-side half of #448.
+*   **No cross-chunk streaming.** By construction, per the first refusal.
+*   **The watermark is not adaptive.** It is declared and bounded; nothing
+    widens it when the measured in/out rates say the chain is falling behind,
+    although `RateWindow` is the instrument that would drive it.
