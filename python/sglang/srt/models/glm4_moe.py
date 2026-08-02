@@ -80,6 +80,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import dense_weight_dtype
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -482,21 +483,18 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
-            )
-            self.shared_experts_is_fp8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
-            )
+            # The int8 / fp8 shared-expert fast paths need a dense weight
+            # tensor to read a dtype from, so packed-vs-dense is decided by
+            # what the layer actually built: `dense_weight_dtype` answers None
+            # for every packed format (awq, awq_marlin, moe_wna16, gptq,
+            # auto-round, gguf, ...), which selects the general path. The
+            # quantization-name list this used to carry named the AWQ family
+            # only, so under GGUF or the GPTQ family the guard read False and
+            # the `.weight.dtype` access below raised AttributeError while the
+            # block was still being constructed.
+            shared_gate_up_dtype = dense_weight_dtype(self.shared_experts.gate_up_proj)
+            self.shared_experts_is_int8 = shared_gate_up_dtype == torch.int8
+            self.shared_experts_is_fp8 = shared_gate_up_dtype == torch.float8_e4m3fn
             if self.shared_experts_is_fp8:
                 if (
                     _use_aiter

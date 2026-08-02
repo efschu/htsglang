@@ -56,6 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
@@ -1542,16 +1543,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            cat_dim = 0
-                            if self.quant_config is not None and (
-                                self.quant_config.get_name() == "awq"
-                                or self.quant_config.get_name() == "awq_marlin"
-                                or self.quant_config.get_name() == "moe_wna16"
-                            ):
-                                cat_dim = 1
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                            )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
@@ -1563,6 +1554,9 @@ class BailingMoELinearForCausalLM(nn.Module):
                             if param_name not in params_dict:
                                 continue
                             param = params_dict[param_name]
+                            fused_weight = fuse_q_kv_a_proj(
+                                param, param_name, q_a_proj_weight, kv_a_proj_weight
+                            )
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )

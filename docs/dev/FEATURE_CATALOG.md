@@ -343,6 +343,12 @@ capture-cost illusion); reference-twin drift family (#418 #425 #427 -- a torch
 reference that disagrees with the kernel it validates, hidden by an oracle
 that compares only the region where they agree; fix the reference AND widen
 the comparison, and pin whether the reference is reachable from serving).
+Quant-name-list family (#443 #446 -- packed-vs-dense and fused-a-proj cat_dim
+decided by an `{awq, awq_marlin, moe_wna16}` enumeration instead of by the
+layer: GGUF GLM-4-MoE blocks now construct instead of raising on
+`.weight.dtype`, glm4_moe_lite can reach its fp8 shared-expert path at all,
+GPTQ-family MLA fuses on its real output axis, and GPTQ `desc_act=True` is
+refused by name rather than fused wrong -- see docs/dev/NOTE_446_gptq_cat_dim.md).
 
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser

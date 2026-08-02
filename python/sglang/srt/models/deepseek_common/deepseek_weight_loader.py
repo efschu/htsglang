@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    fuse_q_kv_a_proj,
     layer_quant_method_name,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
@@ -360,23 +361,6 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
-                                    []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
-                                else:
-                                    cat_dim = 0
-                                    if self.quant_config is not None and (
-                                        self.quant_config.get_name() == "awq"
-                                        or self.quant_config.get_name() == "awq_marlin"
-                                        or self.quant_config.get_name() == "moe_wna16"
-                                    ):
-                                        cat_dim = 1
-
-                                    fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                    )
-
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"
@@ -388,6 +372,13 @@ class DeepseekV2WeightLoaderMixin:
                                     )
                                 )
                                 param = params_dict[param_name]
+
+                                fused_weight = fuse_q_kv_a_proj(
+                                    param,
+                                    param_name,
+                                    q_a_proj_weight,
+                                    kv_a_proj_weight,
+                                )
 
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
