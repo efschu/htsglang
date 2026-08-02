@@ -555,11 +555,43 @@ def scratch_slot_count(resident_count: int) -> int:
 #: rather than ``environ.py`` so the policy stays inside this module.
 HOST_SHARD_RATIO_ENV = "SGLANG_MOE_HOST_SHARD_RATIO"
 
+#: Lowest provenance this rank will WEIGHT a split on: ``measured`` or
+#: ``estimate``. ``absent`` is not accepted in either setting -- a split has to
+#: come from a number, and "nobody measured this link" is not a number. The
+#: default admits the nameplate derivation below, whose ratios land within 2 %
+#: of the measured ones on this rig; a run that must not be weighted by a
+#: datasheet at all sets ``measured`` and gets an equal split until the probe
+#: has run.
+HOST_SHARD_MIN_PROVENANCE_ENV = "SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE"
+
+#: Ratio sources, strongest first. The label is not decoration: it is what
+#: decides whether the number may weight a split at all, and it is written into
+#: the log line and the #390 dump so an A/B arm names its own policy.
+HOST_SHARD_SOURCE_ENV = "env"
+HOST_SHARD_SOURCE_PROBE = "card-probe-h2d"
+HOST_SHARD_SOURCE_NVML = "nvml-pcie"
+HOST_SHARD_SOURCE_EQUAL = "equal"
+
+#: source -> provenance, in the #348b/#407 vocabulary
+#: (:class:`sglang.srt.planner.cost_model.Provenance`). ``env`` counts as
+#: MEASURED because the vector an operator types is the measurement they took;
+#: the nameplate derivation is an ESTIMATE by construction (a formula over a
+#: measured link width, not a transfer anybody timed); ``equal`` is ABSENT --
+#: it is the shape a refusal takes, not a ratio.
+_HOST_SHARD_PROVENANCE = {
+    HOST_SHARD_SOURCE_ENV: "measured",
+    HOST_SHARD_SOURCE_PROBE: "measured",
+    HOST_SHARD_SOURCE_NVML: "estimate",
+    HOST_SHARD_SOURCE_EQUAL: "absent",
+}
+
+_PROVENANCE_RANK = {"measured": 0, "estimate": 1, "absent": 2}
+
 #: Encoding-adjusted per-lane throughput of one PCIe generation, GB/s, one
 #: direction. Only the RATIOS between ranks are used, so these nominal figures
 #: are enough; the measured numbers (6.4 vs 13 GB/s, i.e. 1.00 : 2.03 against
-#: this table's 1 : 2) belong in HOST_SHARD_RATIO_ENV, which outranks this
-#: derivation precisely because a measurement beats a nameplate.
+#: this table's 1 : 2) come from the card probe, which outranks this derivation
+#: precisely because a measurement beats a nameplate.
 _PCIE_LANE_GBPS = {1: 0.250, 2: 0.500, 3: 0.985, 4: 1.969, 5: 3.938, 6: 7.563}
 
 #: Latch so the chosen ratio is logged once per process, not once per layer.
@@ -585,6 +617,16 @@ class HostShardRatio:
     detail: str = ""
 
     @property
+    def provenance(self) -> str:
+        """``measured`` / ``estimate`` / ``absent``, derived from the source.
+
+        Derived rather than stored so the two can never be set to disagree:
+        the source IS the provenance claim, and a second field would let a
+        caller construct a nameplate ratio labelled as a measurement.
+        """
+        return _HOST_SHARD_PROVENANCE.get(self.source, "absent")
+
+    @property
     def is_equal(self) -> bool:
         """True when the ratio carries no information a split could use.
 
@@ -600,7 +642,7 @@ class HostShardRatio:
     def describe(self) -> str:
         shares = ", ".join(f"rank{i}={w:.4f}" for i, w in enumerate(self.weights))
         tail = f" ({self.detail})" if self.detail else ""
-        return f"source={self.source} [{shares}]{tail}"
+        return f"source={self.source} provenance={self.provenance} [{shares}]{tail}"
 
 
 def _normalize_weights(values: Sequence[float]) -> Tuple[float, ...]:
@@ -651,18 +693,155 @@ def _host_shard_ratio_from_env(world_size: int) -> Optional[HostShardRatio]:
             "per rank"
         )
     return HostShardRatio(
-        _normalize_weights(values), "env", f"{HOST_SHARD_RATIO_ENV}={raw}"
+        _normalize_weights(values),
+        HOST_SHARD_SOURCE_ENV,
+        f"{HOST_SHARD_RATIO_ENV}={raw}",
     )
 
 
+def _min_provenance() -> str:
+    """The weakest provenance this process will weight a split on."""
+    import os
+
+    raw = os.environ.get(HOST_SHARD_MIN_PROVENANCE_ENV, "").strip().lower()
+    if not raw:
+        return "estimate"
+    if raw not in ("measured", "estimate"):
+        raise ValueError(
+            f"{HOST_SHARD_MIN_PROVENANCE_ENV}={raw!r} must be 'measured' or "
+            "'estimate'. 'absent' is not selectable: a split weighted by a "
+            "number nobody has is not a split, it is a guess."
+        )
+    return raw
+
+
+def _provenance_admitted(provenance: str, minimum: str) -> bool:
+    """True when a ratio of this provenance may weight the split."""
+    return _PROVENANCE_RANK.get(provenance, 2) <= _PROVENANCE_RANK[minimum]
+
+
+#: Process-wide memo of the card probe, so 40+ MoE layers do not each read and
+#: parse the same JSON. ``False`` distinguishes "looked, found nothing" from
+#: "have not looked yet"; both are reached from the loader's thread pool
+#: (#391), hence the lock.
+_CARD_PROBE_MEMO = None
+_CARD_PROBE_LOCK = threading.Lock()
+
+
+def _card_probe_h2d_table():
+    """``{uuid: measured pinned H2D GB/s}`` from the rigmon card probe, or ``{}``.
+
+    The probe (``rigmon/card_probe.py``, #271) times a 64 MiB pinned host->device
+    copy per card, best-of wall clock, and caches the result under a path keyed
+    on the sorted card UUIDs AND the driver version. Reading it here is a pure
+    lookup: ``load_card_probe`` never triggers a measurement, so a weight load
+    can never turn into a multi-second GPU probe as a side effect.
+
+    THE PATH IS BUILT FROM NVML'S CARD SET, NOT THE PROCESS'S CUDA VIEW, and
+    that is the whole reason this helper exists instead of a bare
+    ``load_card_probe()``. The cache key is a digest over the SORTED UUIDS of
+    the cards the caller can see, and a worker's ``CUDA_VISIBLE_DEVICES`` is
+    narrowed to one GPU (``SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS``, forced by
+    ``--rank-gpu-id``). A worker therefore computes a one-card digest, misses
+    the three-card profile the probe actually wrote, and silently falls through
+    to the nameplate ESTIMATE. Measured on the reference rig 2026-08-02: the
+    same call returns the profile with all cards visible and ``None`` under
+    ``CUDA_VISIBLE_DEVICES=1``. NVML is not masked by that variable, so the full
+    card set is still available here and the digest can be reconstructed.
+
+    This is the SAME artifact the planner and the dashboard price cards from
+    (``planner.cost_model.memory_rates_from_entries``, kind ``h2d``), which is
+    the point -- a second H2D opinion measured by a second kernel would be
+    indistinguishable from this one after the fact.
+    """
+    global _CARD_PROBE_MEMO
+
+    with _CARD_PROBE_LOCK:
+        if _CARD_PROBE_MEMO is not None:
+            return _CARD_PROBE_MEMO or {}
+        table = {}
+        try:
+            from sglang.srt.rigmon.card_probe import load_card_probe
+
+            profile = load_card_probe(_nvml_card_probe_path())
+            if profile is None:
+                # Last resort: the process's own view. Correct whenever the
+                # caller can see every card (the launcher, the dashboard, a
+                # desk test), and no worse than nothing when it cannot.
+                profile = load_card_probe()
+            if profile is not None:
+                for card in profile.cards:
+                    if card.h2d_gbs and float(card.h2d_gbs) > 0.0:
+                        table[card.uuid] = float(card.h2d_gbs)
+        except Exception:  # noqa: BLE001 - an unreadable probe is an absence
+            table = {}
+        _CARD_PROBE_MEMO = table or False
+        return table
+
+
+def _nvml_card_probe_path():
+    """The probe cache path keyed on EVERY physical card, or ``None``.
+
+    NVML enumerates the whole rig regardless of ``CUDA_VISIBLE_DEVICES``, so
+    this reconstructs the key the probe was written under even inside a worker
+    that can only see its own GPU. The driver version must come from the same
+    place the probe took it, or the digest differs for that reason instead.
+    """
+    try:
+        from sglang.srt.registry.nvml import list_devices, nvml_session
+        from sglang.srt.rigmon.card_probe import card_probe_cache_path
+
+        uuids = [d.uuid for d in list_devices()]
+        if not uuids:
+            return None
+        with nvml_session() as pynvml:
+            driver = pynvml.nvmlSystemGetDriverVersion()
+        if isinstance(driver, bytes):
+            driver = driver.decode()
+        return card_probe_cache_path(uuids, driver)
+    except Exception:  # noqa: BLE001 - no NVML here is simply no reconstruction
+        return None
+
+
+def reset_card_probe_memo() -> None:
+    """Test hook: re-read the card probe on the next resolution."""
+    global _CARD_PROBE_MEMO
+
+    with _CARD_PROBE_LOCK:
+        _CARD_PROBE_MEMO = None
+
+
+def _measured_h2d_gbps_by_uuid(uuid: str):
+    """Measured pinned H2D GB/s for this card, or ``None`` if unmeasured."""
+    return _card_probe_h2d_table().get(uuid)
+
+
 def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
-    """Max PCIe bandwidth of the card with this NVML UUID, GB/s, or ``None``.
+    """PCIe bandwidth of the SLOT this card sits in, GB/s, or ``None``.
 
     The card is resolved through the #331 IdentityMap by UUID and only then
-    converted to an NVML index for the two link queries. Never positionally:
-    CUDA enumerates FASTEST_FIRST and NVML in bus order, so a rank's CUDA
-    ordinal is not its NVML index on a mixed rig, and #392 is what happens when
-    those are conflated.
+    converted to an NVML index for the link queries. Never positionally: CUDA
+    enumerates FASTEST_FIRST and NVML in bus order, so a rank's CUDA ordinal is
+    not its NVML index on a mixed rig, and #392 is what happens when those are
+    conflated.
+
+    WIDTH COMES FROM THE CURRENT LINK, GENERATION FROM THE MAXIMUM, and the
+    asymmetry is measured, not stylistic. ``nvmlDeviceGetMaxPcieLinkWidth``
+    reports what the CARD can do, not what the SLOT gives it: on the reference
+    rig it returns x16 for all three cards while the slots are wired x4 / x8 /
+    x8. Deriving from it produced an equal ratio -- i.e. this whole feature
+    silently disabled on exactly the box it exists for. ``CurrPcieLinkWidth``
+    reports 4 / 8 / 8 and is the physical wiring.
+
+    Generation is the other way round. The current LINK STATE idles down (all
+    three cards report gen 1 at rest, and would report 4 under load), so a
+    current-generation read taken at weight-load time describes the power state
+    rather than the slot. Only ratios matter here and the generation is
+    uniform across a single board's slots, so the maximum is both stable and
+    sufficient.
+
+    This remains an ESTIMATE either way -- lanes x an encoding constant, not a
+    transfer anybody timed. The measured card probe outranks it.
     """
     try:
         from sglang.srt.registry.nvml import identity_map, nvml_session
@@ -671,7 +850,13 @@ def _pcie_link_gbps_by_uuid(uuid: str) -> Optional[float]:
         with nvml_session() as pynvml:
             handle = pynvml.nvmlDeviceGetHandleByIndex(int(card.nvml_index))
             gen = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle))
-            width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
+            width = 0
+            try:
+                width = int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
+            except Exception:  # noqa: BLE001 - older binding: fall back below
+                width = 0
+            if width <= 0:
+                width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle))
     except Exception:  # noqa: BLE001 - absent driver/binding is not an error here
         return None
     lane = _PCIE_LANE_GBPS.get(gen)
@@ -713,31 +898,75 @@ def derive_link_weights(
 
 
 def resolve_host_shard_ratio(
-    world_size: int, card_uuids: Optional[Sequence[str]] = None, link_gbps=None
+    world_size: int,
+    card_uuids: Optional[Sequence[str]] = None,
+    link_gbps=None,
+    probe_gbps=None,
 ) -> HostShardRatio:
     """The ratio and its provenance, in strict preference order.
 
-    1. ``SGLANG_MOE_HOST_SHARD_RATIO`` -- an explicit, measured vector always
-       wins; malformed input raises rather than falling through.
-    2. NVML PCIe link width x generation for each rank's card, resolved by
-       UUID through the #331 IdentityMap.
-    3. Equal -- today's behaviour, and the right answer whenever nothing is
-       known. An unknown link is not an excuse to guess.
+    1. ``SGLANG_MOE_HOST_SHARD_RATIO`` -- an explicit vector always wins;
+       malformed input raises rather than falling through.
+    2. MEASURED pinned H2D bandwidth per rank's card, read from the rigmon
+       card probe by UUID. This is a timed 64 MiB transfer over the link the
+       cold experts will actually cross, which is the quantity being
+       apportioned -- nothing else in the chain measures it.
+    3. ESTIMATE: NVML PCIe link width x generation for each rank's card, again
+       resolved by UUID through the #331 IdentityMap. A formula over a measured
+       link width, not a transfer anybody timed, and admitted only while
+       ``SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE`` allows an estimate.
+    4. Equal -- the shape a REFUSAL takes. An unknown link is not an excuse to
+       guess, and an equal ratio reproduces today's assignment exactly, so
+       refusing costs nothing beyond the speedup nobody could justify.
+
+    ``link_gbps`` / ``probe_gbps`` are the injectable ``uuid -> Optional[float]``
+    lookups the hermetic tests use in place of a driver and a probe cache.
     """
     n = max(1, int(world_size))
+    minimum = _min_provenance()
+
     from_env = _host_shard_ratio_from_env(n)
     if from_env is not None:
         return from_env
-    if card_uuids is not None and len(card_uuids) == n:
-        derived = derive_link_weights(card_uuids, link_gbps=link_gbps)
-        if derived is not None:
-            return HostShardRatio(
-                derived,
-                "nvml-pcie",
-                "max PCIe link width x generation per rank's card (NVML, by UUID)",
-            )
-        return equal_host_shard_ratio(n, "NVML PCIe link data unavailable")
-    return equal_host_shard_ratio(n, "no per-rank card identity supplied")
+
+    if card_uuids is None:
+        return equal_host_shard_ratio(n, "no per-rank card identity supplied")
+    if len(card_uuids) != n:
+        return equal_host_shard_ratio(
+            n,
+            f"the card vector names {len(card_uuids)} ranks but the group has "
+            f"{n}; that vector describes a different group",
+        )
+
+    measured = derive_link_weights(
+        card_uuids, link_gbps=probe_gbps or _measured_h2d_gbps_by_uuid
+    )
+    if measured is not None:
+        return HostShardRatio(
+            measured,
+            HOST_SHARD_SOURCE_PROBE,
+            "measured pinned H2D per rank's card (rigmon card probe, by UUID)",
+        )
+
+    if not _provenance_admitted("estimate", minimum):
+        return equal_host_shard_ratio(
+            n,
+            "no measured H2D bandwidth for every rank's card and "
+            f"{HOST_SHARD_MIN_PROVENANCE_ENV}=measured forbids weighting on "
+            "the nameplate derivation; run the card probe "
+            "(python -m sglang.srt.rigmon.card_probe) to fill it in",
+        )
+
+    derived = derive_link_weights(card_uuids, link_gbps=link_gbps)
+    if derived is not None:
+        return HostShardRatio(
+            derived,
+            HOST_SHARD_SOURCE_NVML,
+            "max PCIe link width x generation per rank's card (NVML, by UUID)",
+        )
+    return equal_host_shard_ratio(
+        n, "neither a measured H2D rate nor NVML PCIe link data for these cards"
+    )
 
 
 def plan_proportional_shares(total: int, weights: Sequence[float]) -> Tuple[int, ...]:
@@ -821,6 +1050,7 @@ def cold_shard_context(
     world_size: int,
     card_uuids: Optional[Sequence[str]] = None,
     link_gbps=None,
+    probe_gbps=None,
 ) -> Optional[ColdShardContext]:
     """Resolve the ratio and wrap it, or ``None`` when there is nothing to do.
 
@@ -831,7 +1061,9 @@ def cold_shard_context(
     """
     if int(world_size) < 2:
         return None
-    ratio = resolve_host_shard_ratio(world_size, card_uuids, link_gbps=link_gbps)
+    ratio = resolve_host_shard_ratio(
+        world_size, card_uuids, link_gbps=link_gbps, probe_gbps=probe_gbps
+    )
     if ratio.is_equal:
         return None
     return ColdShardContext(int(rank), int(world_size), ratio)
@@ -865,6 +1097,49 @@ def reset_host_shard_log_latch() -> None:
     global _HOST_SHARD_LOGGED
 
     _HOST_SHARD_LOGGED = False
+
+
+def host_shard_row(plan: "ExpertStagingPlan") -> dict:
+    """The #394 policy this layer was staged under, as a dump row.
+
+    Written into the #390 expert-stats file so a measurement arm identifies its
+    own placement policy. Two runs of an A/B differ in exactly this row, and
+    reading which arm produced a JSON file out of the file itself is what stops
+    a pair of dumps from being un-attributable a week later.
+
+    ``owned`` and ``delegated`` are counts of THIS rank's cold pool, so
+    ``owned / (owned + delegated)`` is the realized share against the ratio the
+    policy asked for -- the whole-expert rounding error is visible rather than
+    assumed away.
+    """
+    owned = len(plan.spill_ids)
+    delegated = len(plan.delegated_ids)
+    pool = owned + delegated
+    return {
+        "policy": "link-proportional" if delegated else "equal",
+        "ratio": plan.host_shard or "",
+        "cold_pool": pool,
+        "owned_cold_experts": owned,
+        "delegated_cold_experts": delegated,
+        "owned_share": (owned / pool) if pool else 0.0,
+        "resident_count": plan.resident_count,
+        "num_experts": plan.num_experts,
+    }
+
+
+def publish_host_shard_on_layer(layer, plan: "ExpertStagingPlan") -> None:
+    """Attach the #394 row to the layer, for the #390 instrument to pick up.
+
+    On the layer rather than passed down a call chain because the two staging
+    doors reach the cache by different routes and only the layer is common to
+    both. Always written, including on the equal/default path -- a row saying
+    ``policy=equal`` is what makes the baseline arm of an A/B self-describing
+    instead of merely silent.
+    """
+    try:
+        layer._moe_offload_host_shard = host_shard_row(plan)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail a load
+        pass
 
 
 # ===========================================================================
@@ -1098,6 +1373,7 @@ def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
         # #394: the cache turns this into a named refusal if a delegated expert
         # ever reaches this rank's router, instead of a missing pool row.
         layer._moe_offload_delegated_experts = list(plan.delegated_ids)
+    publish_host_shard_on_layer(layer, plan)
     row_bytes = (
         (resident_buf.numel() // resident_buf.shape[0]) * resident_buf.element_size()
         if resident_buf.shape[0]
@@ -2041,6 +2317,11 @@ class MoEExpertOffloadCache:
             # histogram and what the offload actually paid for it land in one
             # file instead of two places.
             self._router_stats.residency = self.planner.stats
+            # #394: the placement policy this layer was staged under, so the
+            # dump names its own A/B arm (see publish_host_shard_on_layer).
+            self._router_stats.host_shard = getattr(
+                layer, "_moe_offload_host_shard", None
+            )
             self._stats_collector = get_collector()
 
         self._capturable_ready = False
@@ -2914,6 +3195,7 @@ def presplit_expert_offload_after_repack(
             )
             if plan.delegated_ids:
                 layer._moe_offload_delegated_experts = list(plan.delegated_ids)
+        publish_host_shard_on_layer(layer, plan)
         record_expert_offload_release(freed_device, freed_host, len(presplit))
         # Return freed host memory to the OS NOW. create_weights loaded the full
         # [E] expert set to host CPU; the loader frees each layer's loaded tensor

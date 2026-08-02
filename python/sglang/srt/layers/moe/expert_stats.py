@@ -154,6 +154,7 @@ class LayerExpertStats:
         "forwards",
         "unique_experts_total",
         "residency",
+        "host_shard",
     )
 
     def __init__(
@@ -185,6 +186,11 @@ class LayerExpertStats:
         # by attribute name rather than by type to keep this module free of an
         # import cycle with expert_offload.
         self.residency = None
+        # #394: the cold-expert placement policy this layer was staged under
+        # (a plain dict from ``expert_offload.host_shard_row``). ``None`` on any
+        # path that never built a staging plan, which is how a dump says "this
+        # question does not apply here" rather than implying an equal split.
+        self.host_shard = None
 
     def record(
         self,
@@ -275,6 +281,8 @@ class LayerExpertStats:
             )[:TOP_EXPERTS_IN_SUMMARY],
             "expert_activations": list(self.expert_activations),
         }
+        if self.host_shard is not None:
+            out["host_shard"] = dict(self.host_shard)
         residency = self.residency
         if residency is not None:
             out["residency"] = {
@@ -365,6 +373,31 @@ class ExpertStatsCollector:
         totals["unique_hit_rate"] = (
             totals["unique_hits"] / uniq_total if uniq_total else 1.0
         )
+        # #394: lift the placement policy to the top level when every layer
+        # that reported one agrees. Disagreement is left visible as "mixed"
+        # rather than resolved -- layers staged under different ratios in one
+        # process is a defect, and averaging it away would hide it.
+        policies = {
+            entry["host_shard"]["policy"] for entry in layers if entry.get("host_shard")
+        }
+        ratios = {
+            entry["host_shard"]["ratio"] for entry in layers if entry.get("host_shard")
+        }
+        if policies:
+            totals["host_shard_policy"] = (
+                policies.pop() if len(policies) == 1 else "mixed"
+            )
+            totals["host_shard_ratio"] = ratios.pop() if len(ratios) == 1 else "mixed"
+            totals["owned_cold_experts"] = sum(
+                entry["host_shard"]["owned_cold_experts"]
+                for entry in layers
+                if entry.get("host_shard")
+            )
+            totals["delegated_cold_experts"] = sum(
+                entry["host_shard"]["delegated_cold_experts"]
+                for entry in layers
+                if entry.get("host_shard")
+            )
         return {
             "schema": "sglang.expert_stats/1",
             "reason": reason,

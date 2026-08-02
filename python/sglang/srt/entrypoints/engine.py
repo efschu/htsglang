@@ -654,6 +654,16 @@ class Engine(EngineScoreMixin, EngineBase):
                 # processes inherit them.
                 _configure_nccl_env_for_colocation(server_args)
 
+            # #407 cut 2: publish rank -> physical card, in the ONE process that
+            # knows the whole placement, so no worker has to rediscover it with
+            # a collective. Best-effort by construction: an absent vector leaves
+            # every consumer on its previous behaviour (see rank_cards). Placed
+            # before the spawn loop because the channel is the environment, and
+            # a spawned scheduler inherits it only if it is set by now.
+            from sglang.srt.registry.rank_cards import publish_rank_card_uuids
+
+            publish_rank_card_uuids(server_args)
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
