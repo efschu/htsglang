@@ -1754,6 +1754,41 @@ that reads `num_hidden_layers` alone will mis-size every hybrid.
 both stages here), so the tighter stage sets the capacity for both — the open
 slice-3 item from 4.7, unchanged by going cross-rig.
 
+### 4.9.1 Slice 3 levers: world sizing, stage scores, shape cache (#201 slice 3)
+
+Slice 3 (branch `feat/tpxppxtp-slice3-201`) closes the sizing items the two
+sections above left open. What changes operationally:
+
+* **World agreement is now proven, not assumed.** The #79/#90 hybrid KV
+  ceilings fold in BEFORE the world MIN-reduce, and every boot with
+  `--pp-size > 1` cross-checks that all stages resolved the same
+  `max_total_num_tokens` — a divergence is a named boot failure, not a
+  runtime overflow. The mamba slot count is min-synced across stages too.
+* **Mamba budgets are stage-local.** Each stage charges only its own
+  window's GDN layers (previously every stage budgeted ALL stages' state:
+  `max_mamba_cache_size` ~pp_size too small, KV budget overcharged). A
+  stage without GDN layers never binds the world minimum.
+* **`--pp-stage-ratio 3,1`** derives the layer split from per-stage
+  capability scores instead of hand-counting layers, full-attention-aware
+  (the 4.9 finding above is exactly what it encodes): boundaries snap so
+  each stage gets its score-proportional share of layers AND of
+  full-attention layers. Refuses when a hybrid stage would end with zero
+  full-attention layers. Mutually exclusive with `--pp-layer-ratio`.
+* **`--rank-tp-ratio auto` now works under a pipeline** when every stage's
+  card group derives the same vector (matching hetero stages included);
+  divergent stages are refused with each stage's honest vector named. On
+  tp_size=1 pipelines this derives the per-stage `--rank-gpu-memory-mib`
+  list from NVML for free. `auto-performance` stays refused under PP.
+* **`SGLANG_PP_SHAPE_CACHE=1`** replaces repeat metadata crossings at the
+  stage boundary with a 16-byte reference header (slice-2 measured the
+  pickled metadata at 249 us vs 142 us payload at bs=1 — 64% of the
+  crossing). Off by default. MUST be set to the same value on both nodes
+  of a cross-rig boot; `pp_crossrig_rank.sh` pins it on every rank.
+* **`SGLANG_MEASURED_KV_BUDGET` is PP-safe now:** one record per stage
+  (`...-stageN.json`); previously both stages' tp_rank-0 overwrote the
+  same record and the next boot sized one stage from the other's leftover
+  (#188 in cross-stage form).
+
 ### 4.10 Dual-group runtime: picking a nestable `--rank-tp-ratio` (#121 slice A)
 
 The dual-group runtime puts a second, self-sufficient PD lane on a card that

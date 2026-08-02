@@ -2172,3 +2172,120 @@ unabhaengiges Argument fuer die Doppel-Geometrie auf geteilten
 Bytes. Einzige entscheidende Probe-Frage: laufen Allreduce/
 Broadcast unter diesem P2P geraetedirekt (daran haengen die
 +20..+69 %); Apertur/Fenster sind demgegenueber nachrangig.
+
+---
+
+# TEIL 4 — Slice 3: TPxPPxTP-Welt-Sizing (Auftrag #201, 2026-08-02)
+
+Basis `integration/r3-probe-next2` @ 1960957e3b, Branch
+`feat/tpxppxtp-slice3-201`. Alle sechs Posten aus Teil 3 §14 sind
+umgesetzt oder benannt geschlossen; Entwicklung desk-first mit
+hermetischen Tests (CUDA_VISIBLE_DEVICES=99), Falsifikator vor Fix.
+
+## 15. Posten 1 — Welt-MIN per Konstruktion (der grosse Posten)
+
+Der Befund gegen den Stand nach Slice 2: die Welt-MIN-Reduktion in
+`_apply_token_constraints` existierte, aber `_apply_hybrid_kv_token_cap`
+(die #79/#90-Decken) lief NACH der Reduktion, rank-lokal. Ein Stage, deren
+Decke unter dem vereinbarten Wert liegt, endete still darunter — Stage 0
+admittiert dann Token, die die andere Stage nicht halten kann. Solange die
+Decken welt-uniform waren, war das latent; mit Posten 3 (stage-lokale
+Mamba-Budgets) waere es scharf geworden.
+
+Fix in drei Schichten (`model_runner_kv_cache_mixin.py`):
+1. **Cap-vor-Reduce:** unter `pp_size > 1` falten die Decken VOR der
+   Welt-MIN in die Kapazitaet; die Nach-Reduce-Anwendung ist dann ein
+   No-op. `pp_size == 1` behaelt die Stock-Reihenfolge byte-identisch
+   (Test erzwingt beides ueber ein Reihenfolge-Log).
+2. **Welt-Einigungs-Beweis:** `_assert_pp_world_kv_capacity_agreement`
+   gathert am Constraint-Ausgang (pp>1) alle finalen Kapazitaeten und
+   bricht benannt ab, wenn sie divergieren — jede kuenftige rank-lokale
+   Klammer NACH der Reduce faellt beim Boot auf, nicht im Betrieb.
+   Kollektiv-Disziplin: Gate nur ueber welt-uniforme Praedikate; der
+   dual-group-Lane-Pfad returnt VOR der Stelle (kein Kollektiv auf der
+   Lane).
+3. **Mamba-Slot-MIN auch unter PP:** `_sync_uneven_mamba_cache_size` und
+   der Nach-Branch-MIN greifen jetzt auch bei `pp_size > 1` mit uniformen
+   Budgets — jede Stage sizet aus eigenem freien Speicher und eigenem
+   Layer-Fenster, ein admittierter Request belegt aber auf JEDER Stage mit
+   Linear-Layern einen Slot.
+
+**#188 cross-stage entschaerft:** beide Stages' tp_rank-0 schrieben
+DENSELBEN Measured-Budget-Record (Fingerprint kennt kein pp_rank), und der
+Welt-Gather faltete beide Stages in denselben tp_rank-Index. Jetzt:
+Record-Pfad `-stage{pp_rank}`-suffigiert, pp_rank im Gather-Payload mit
+Stage-Filter, pp-Felder im Fingerprint NUR bei pp>1 (pp==1-Digests
+unveraendert; der Launcher-seitige Weight-Planner liest den unsuffigierten
+Pfad und bleibt unter PP korrekt kalt).
+
+## 16. Posten 3 — mamba_cache_per_req stage-lokal
+
+`handle_max_mamba_cache` rechnete jede Stage mit dem GLOBALEN
+per-Request-State (Teil 2 §6.2 Defekt 1): `max_mamba_cache_size` um
+~Faktor pp_size unterdimensioniert, KV-Budget um fremde Stage-States
+ueberbelastet. Jetzt: `_stage_local_mamba_cache_per_req` (exakte Division,
+per-Layer-Bytes x Stage-Fenster) in ALLEN Sizing-Zweigen und in der
+finalen Budget-Subtraktion. Eine Stage OHNE Linear-Layer traegt die
+Sentinel `PP_STAGE_NO_MAMBA_STATE_SLOTS` in die Welt-MIN (bindet nie) und
+subtrahiert nichts. Legacy-Stubs (mehrere Unit-Suiten treiben die Funktion
+direkt) laufen ueber getattr-Gates unveraendert.
+
+## 17. Posten 2+5 — --pp-stage-ratio, voll-attention-bewusst
+
+`derive_pp_layer_split(scores, is_full_attention)` (distributed/utils.py):
+Grenzen proportional im LAYER-Raum, dann in das Fenster gesnappt, das die
+score-proportionale Zahl VOLL-ATTENTION-Layer je Seite ergibt (13d: ein
+Hybrid teilt seinen KV nach Voll-Attention-Layern). Ablehnungen benannt:
+Tiefe unlesbar, mehr Stages als Layer, Hybrid-Stage mit null
+Voll-Attention-Layern (leerer KV-Pool). CLI `--pp-stage-ratio` (exklusiv
+gegen `--pp-layer-ratio`) materialisiert `pp_layer_ratio` und laeuft durch
+die bestehende Validierung; Layer-Arten aus config.json (`layer_types` /
+`layers_block_type` / `full_attention_interval`), GGUF-Vorbehalt wie bei
+`--pp-layer-ratio` (get_pp_indices bleibt autoritativ).
+
+## 18. Posten 4 — auto-Ratio je Stage, Einigungs-Gate
+
+Der Blanket-Reject faellt. `--rank-tp-ratio auto` leitet die
+NVML-Budgets fuer alle WELT-Raenge ab und gcd-reduziert den Vektor JE
+STAGE aus deren Budget-Slice. Da `_TP_PARTITION_RATIOS` prozess-global
+installiert wird, muessen die Stage-Vektoren uebereinstimmen: gleiche
+(auch gleich-heterogene) Stages installieren den gemeinsamen Vektor;
+divergente Stages werden mit beiden ehrlichen Vektoren benannt abgelehnt
+(#202: nie stiller Even-Split). tp_size=1-Pipelines bekommen ihre
+per-Stage-Budgetliste jetzt gratis aus `auto`. `auto-performance` bleibt
+unter PP benannt abgelehnt (Ein-Gruppen-Leiter). **Benannter Follow-up:**
+per-Stage-Vektor-Installation (pp_rank liegt in
+configure_scheduler_process bereits vor) hebt das Einigungs-Gate.
+
+## 19. Posten 6 — Formen-Cache an der Stage-Grenze
+
+`SGLANG_PP_SHAPE_CACHE` (default aus, Draht byte-identisch ohne Flag):
+`send/recv_tensor_dict` ersetzen wiederholte Metadata-Crossings durch
+einen 16-Byte-Referenz-Header ueber gespiegelte per-Peer-Caches in
+FIFO-Lockstep (neue Eintraege haengen beidseitig an; ueber der
+1024er-Kappe reisen Blobs ungecacht mit code 0, die Spiegel driften nie).
+Erwartung aus der Slice-2-Messung: −249 us Metadata je bs=1-Crossing
+(64 % des Grenzuebergangs), auf dem Draht noch zu bepreisen. Das Flag muss
+welt-uniform sein — `pp_crossrig_rank.sh` pinnt es deshalb auf beiden
+Knoten explizit.
+
+## 20. Teststand und Restrisiken
+
+37 neue Faelle gruen (test_pp_world_sizing 18, test_pp_stage_ratio 16
+[+2 Handler-Negativ in pp_layer_ratio-Suite], test_pp_shape_cache 5 inkl.
+echtem 2-Prozess-gloo-Roundtrip); Kann-fehlschlagen bewiesen (12/18
+world-sizing-Faelle fallen auf dem Vor-Fix-Baum). Nachbarschafts-Suiten:
+identische 19 Vorbestands-Fehler wie die Basis, keine neuen.
+
+Offene Risiken:
+- Kein GPU-Boot in diesem Slice-Schnitt; die Welt-MIN-Kette und die
+  Sentinel-Pfade sind kollektiv-simuliert, nicht NCCL-gefahren. Erster
+  Fenster-Kandidat: intra-rig pp=2 nach Runbook §4.7 mit
+  `--pp-stage-ratio` und SGLANG_PP_SHAPE_CACHE=1, Grenzkosten via
+  SGLANG_PP_BOUNDARY_STATS gegen die 249-us-Marke.
+- Formen-Cache: Nutzen haengt an der Hit-Rate realer Batch-Geometrien
+  (Decode: wenige; chunked Prefill: Dutzende — Kappe 1024 grosszuegig).
+- Stage ohne Voll-Attention-Layer bleibt im Planner abgelehnt; der
+  Sizing-Pfad dafuer (Token-Kapazitaet einer KV-losen Stage) ist
+  ungebaut und wuerde erst mit einem expliziten --pp-layer-ratio
+  erreichbar.
