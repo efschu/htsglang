@@ -41,6 +41,7 @@ and re-tokenizing generated text does not reliably reproduce it.
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -61,6 +62,37 @@ SEED_PROMPT = (
 )
 
 UNRELATED_PROMPT = "List three prime numbers below twenty.\nAnswer:"
+
+# Deterministic filler for --seed-prompt-tokens. The destination only
+# prefetches a prefix from storage once it is at least
+# UnifiedRadixCache.prefetch_threshold (256) tokens long, and on a hybrid
+# GDN model the handover length is further clamped to the deepest GDN
+# checkpoint. A short seed therefore can never produce a store hit on the
+# destination, which would make --expect-cached unpassable for reasons
+# that have nothing to do with the handover. Padding is content-stable
+# (numbered lines, no randomness) so the prompt stays a determined answer.
+FILLER_LINE = (
+    "Shelf {i:03d} holds spare cable {i:03d}, rated for bay {j:02d}, "
+    "checked on day {k:02d}.\n"
+)
+
+
+def build_seed_prompt(tok, target_tokens: int) -> str:
+    """SEED_PROMPT padded with deterministic inventory lines until the
+    tokenized prompt reaches ``target_tokens`` (0 = no padding)."""
+    if not target_tokens:
+        return SEED_PROMPT
+    head, tail = SEED_PROMPT.split("\n\nWrite a short continuation", 1)
+    tail = "\n\nWrite a short continuation" + tail
+    filler = ""
+    i = 0
+    while True:
+        candidate = head + "\n\n" + filler + tail
+        if len(tok.encode(candidate, add_special_tokens=False)) >= target_tokens:
+            return candidate
+        i += 1
+        filler += FILLER_LINE.format(i=i, j=i % 12, k=i % 28)
+
 
 
 def post(url: str, payload: dict, timeout: float = 600.0) -> dict:
@@ -130,7 +162,26 @@ def main() -> int:
     ap.add_argument("--other-label")
     ap.add_argument("--max-new-tokens", type=int, default=48)
     ap.add_argument("--seed-new-tokens", type=int, default=64)
+    ap.add_argument(
+        "--seed-prompt-tokens",
+        type=int,
+        default=0,
+        help="pad the seed prompt with deterministic filler until it is at "
+        "least N tokens. Needed because the destination only prefetches a "
+        "prefix of at least 256 tokens from storage",
+    )
     ap.add_argument("--expect-cached", action="store_true")
+    ap.add_argument(
+        "--export-len",
+        type=int,
+        help="hand over only the first N session tokens (default: all)",
+    )
+    ap.add_argument(
+        "--no-gdn-align",
+        action="store_true",
+        help="do not re-export at the GDN checkpoint boundary the server "
+        "names; report the refusal instead (negative arms want this)",
+    )
     ap.add_argument("--deadline-s", type=float, default=60.0)
     args = ap.parse_args()
 
@@ -141,7 +192,8 @@ def main() -> int:
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-        ids = tok.encode(SEED_PROMPT, add_special_tokens=False)
+        prompt = build_seed_prompt(tok, args.seed_prompt_tokens)
+        ids = tok.encode(prompt, add_special_tokens=False)
         t0 = time.time()
         ret = generate(base, ids, args.seed_new_tokens)
         out = output_ids(ret["meta_info"])
@@ -174,14 +226,56 @@ def main() -> int:
         return 0
 
     if args.cmd == "export":
-        ret = post(
-            f"{base}/session_handover",
-            {
-                "action": "export",
-                "token_ids": state["session_ids"],
-                "deadline_s": args.deadline_s,
-            },
-        )
+        ids = state["session_ids"]
+        if args.export_len:
+            ids = ids[: args.export_len]
+
+        def _try_export(tok_ids):
+            """Returns (response, None) or (None, refusal-body)."""
+            try:
+                return (
+                    post(
+                        f"{base}/session_handover",
+                        {
+                            "action": "export",
+                            "token_ids": tok_ids,
+                            "deadline_s": args.deadline_s,
+                        },
+                    ),
+                    None,
+                )
+            except urllib.error.HTTPError as e:
+                # A refused export answers HTTP 400 with the NAMED reason in
+                # the body (the GDN gate among them). Surfacing that message
+                # is the whole point of the negative arms, so it must not be
+                # lost behind a traceback.
+                return None, e.read().decode()
+
+        ret, refusal = _try_export(ids)
+        if refusal is not None:
+            # On a hybrid-GDN model the resumable prefix ends at the deepest
+            # GDN checkpoint, not at the last generated token, so an export of
+            # the whole session is refused for almost every session length.
+            # That boundary is a property of the running server, so the probe
+            # asks once, then hands over exactly at the boundary the server
+            # named. The remaining few tokens are re-prefilled on top of the
+            # imported recurrent state -- which is precisely the property the
+            # byte gate is there to check.
+            m = re.search(r"only (\d+) of (\d+) tokens are resident", refusal)
+            if not m or args.no_gdn_align:
+                print(f"export FAILED: HTTP 400: {refusal[:600]}")
+                return 1
+            resident = int(m.group(1))
+            print(
+                f"export: session is {m.group(2)} tokens but only {resident} "
+                "are resident (GDN checkpoint boundary); re-exporting at that "
+                "boundary"
+            )
+            ids = ids[:resident]
+            ret, refusal = _try_export(ids)
+            if refusal is not None:
+                print(f"export FAILED: HTTP 400: {refusal[:600]}")
+                return 1
         manifest = ret.get("manifest")
         if not ret.get("success") or not manifest:
             print(f"export FAILED: {ret.get('message')}")
