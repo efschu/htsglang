@@ -343,3 +343,10 @@ still uncounted (§9's blind spot); this run is the default eager path. Dumps
 were taken on an interval (`SGLANG_EXPERT_STATS_INTERVAL_SEC=45`) rather than
 by SIGUSR2 — see the incident note in the run directory for why the signal
 route is unsafe against a process set.
+
+**Update, same window, larger sample.** The club-3090 bench (5x1000 + 5x800
+tokens) re-measured the same boot over 17.8 TiB of expert traffic:
+**0.812 activation grain** (0.764 / 0.836 / 0.837), **0.620 unique grain** —
+5.8x WASTE's 0.14. Use these figures rather than the short-probe row above;
+they differ by under a point, which is itself the finding that the hit rate is
+stable across prompt shape.
