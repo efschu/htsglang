@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -327,9 +328,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
-                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-            )
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
@@ -339,13 +340,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # #444: request-private conv window for TARGET_VERIFY. See
         # `_target_verify_conv` for why the verify conv must not run on the
-        # persistent pool row. Rows are the spec-slot rows the intermediate
-        # caches already use, so the buffer is bounded by the same spec state
-        # size and carries no new indexing rule. Allocated once at backend
-        # construction (never on the hot path, never inside a graph capture)
-        # and shared across layers: within one forward the layers run in
-        # sequence on one stream, and two concurrent lanes hold different
-        # requests, hence different rows.
+        # persistent pool row. Rows are the rows the intermediate caches
+        # already use, so the buffer is bounded by the same spec state size and
+        # carries no new indexing rule. Allocated once at backend construction
+        # (never on the hot path, never inside a graph capture) and shared
+        # across layers: within one forward the layers run in sequence on one
+        # stream.
+        #
+        # #450b correction: those rows are BATCH POSITIONS, not slots, so they
+        # are not self-owning -- two batches both start at row 0. What keeps
+        # concurrent verifies apart is that this buffer and the intermediate
+        # caches are per-runner: the #274 lane is its own ModelRunner with its
+        # own req_to_token_pool and its own attention backend. That is a
+        # precondition, pinned in
+        # test/registered/unit/spec/test_verify_intermediate_row_ownership_450.py.
         self._verify_conv_scratch: Optional[torch.Tensor] = None
         mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
         if isinstance(mamba_cache, MambaPool.SpeculativeState):
@@ -386,9 +394,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         window: a state that is neither the pre-verify state nor the committed
         one. Single-stream that window is unobservable — nothing between the
         verify forward and the commit reads the recurrent pool. It is
-        observable for anything that reads the same pool concurrently, which
-        is what the dual-group lane's second worker does, and mutate-then-
-        repair is only ever as correct as the absence of such a reader.
+        observable for anything that reads the same pool concurrently, and
+        mutate-then-repair is only ever as correct as the absence of such a
+        reader. (#450b: the #274 dual-group lane is NOT that reader -- it is a
+        second ModelRunner with its own pool, `_build_lane_under_scope`. The
+        window is real; the concurrent reader named in #444 was not.)
 
         Running on a private copy removes the window instead of timing it. The
         persistent row is now written exactly once per verify, by the commit,
@@ -410,7 +420,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         rows = intermediate_state_indices[:batch_size]
         # Seed the private rows with the persistent window the kernel needs as
         # its prior state. `rows` is the same index space the intermediate
-        # caches use, so a row is owned by exactly one in-flight request.
+        # caches use, so the private buffer inherits their ownership rule
+        # instead of introducing a second one (#450b: that rule is per-runner
+        # isolation, not per-row identity).
         scratch.index_copy_(
             0,
             rows.to(torch.int64),
