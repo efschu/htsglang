@@ -4852,6 +4852,46 @@ _PHASE_DECODE = "phase-decode"
 _PHASE_TUNES = (_PHASE_PREFILL, _PHASE_DECODE)
 
 
+def _phase_solve_owns_kv_ratio(server_args, model, tune: str) -> bool:
+    """True when the phase solve's own matched KV token vector becomes the
+    boot's DCP token vector (#435).
+
+    The defect this names: the optimizer derives a capacity-MATCHED token
+    vector for every candidate, gates the candidate on the context that
+    vector funds, and then -- before #435 -- let the boot resolve the coupled
+    KV ratio from the VRAM-BUDGET split instead. The two agree only while the
+    weight vector is the base plan, which is precisely what the phase-prefill
+    arm exists to change.
+
+    Conditions, each for a reason:
+
+    ``tune in _PHASE_TUNES``
+        Only the phase recipe concentrates weight mass away from the budget
+        proportion, which is what makes the two vectors diverge. Every other
+        target keeps the previous behavior byte-identically. ``phase-decode``
+        cannot reach the install (it solves the plain VRAM-auto split and
+        clears ``chosen``), so in practice this is the prefill arm; it is
+        written as the family because the condition is about the recipe, not
+        about which of its two arms happens to install a vector today.
+    ``not model.solo_active``
+        Draft-solo placement has its own, older seeding rule (the host's
+        unsharded draft weights and globally-sized draft KV pool are not in
+        the budget estimate). It is left exactly as it was.
+    ``rank_kv_ratio == 'coupled'``
+        An explicit ``--rank-kv-ratio`` -- a pinned vector or a derived mode
+        string -- always wins (#88 family-flag precedence). ``'coupled'`` is
+        the default, i.e. "no opinion expressed"; an explicit
+        ``--rank-kv-ratio coupled`` is deliberately indistinguishable from it,
+        the same convention ``_check_perf_flags`` uses for the ``dec`` and
+        ``maxkv`` targets.
+    """
+    return (
+        tune in _PHASE_TUNES
+        and not model.solo_active
+        and getattr(server_args, "rank_kv_ratio", "coupled") == "coupled"
+    )
+
+
 def _binding_gate(entry, knee_binding: bool = True) -> str:
     """Which gate rejected this candidate, in verdict precedence order.
 
@@ -5127,9 +5167,11 @@ def apply_auto_performance(server_args) -> None:
     # capacity predictions below (predict_capacity's ctx = min(sum P,
     # 64*min P)) always assume the CONVERGED capacity-optimal token
     # vector. Under 'capacity' that assumption is realized on the first
-    # boot (measured install after profiling); under 'coupled' it needs
-    # the SGLANG_UNEVEN_TOKEN_VECTOR restart hint. Either way the KV
-    # ownership vector is chosen independently of the MLP/GEMM vector
+    # boot (measured install after profiling); under 'coupled' the phase
+    # arms seed the predicted match themselves (#435,
+    # _phase_solve_owns_kv_ratio) and every other target still needs the
+    # SGLANG_UNEVEN_TOKEN_VECTOR restart hint. Except for that seed, the
+    # KV ownership vector is chosen independently of the MLP/GEMM vector
     # this optimizer picks.
     if server_args.uneven_kv_flag_active():
         kv_mode = server_args.rank_kv_ratio
@@ -5429,6 +5471,28 @@ def apply_auto_performance(server_args) -> None:
         elif server_args.uneven_kv_derived_mode():
             _fund_token_vec = None  # per-candidate: the converged optimum
         else:
+            # DELIBERATELY the base plan, including under the phase arms whose
+            # chosen candidate now boots on the MATCHED vector (#435).
+            #
+            # The residual term this gate rejects on is
+            # ``(P_r - unit * v_r) * kv_cell`` -- capacity the token vector
+            # does NOT use. A matched vector has none by construction, so
+            # pricing candidates against it collapses every residual to the
+            # bare reserve and the gate stops discriminating: measured on the
+            # #264/#354 fixture, the `capacity` mode (which already prices
+            # per-candidate) accepts 16,1,1 at reserve 3000,2700,2700 -- the
+            # exact configuration #264 booted into an OOM, 41.69 MiB free on
+            # GPU 0 -- while the base-plan pricing here still reports it
+            # UNBOOTABLE.
+            #
+            # Re-basing this gate is therefore a loosening of an OOM guard
+            # with measured evidence behind it, not a follow-on edit, and it
+            # is not in #435's scope. What #435 does change is the direction
+            # of its error: once the chosen vector is matched, the co-located
+            # ranks no longer keep the unused-capacity slack this term credits
+            # them with, so the reported residual is OPTIMISTIC for every rank
+            # that is not the binding one. Read the real corridor off the boot
+            # on all ranks (docs/dev/NOTE_433_int8_prefill_vector.md).
             _fund_token_vec = partition_units(_PREDICT_TOKEN_UNITS, base_plan)
 
     def _residual(cand: Sequence[int]) -> Optional[List[float]]:
@@ -5863,28 +5927,33 @@ def apply_auto_performance(server_args) -> None:
                 "actuator moves weights (#297 moves KV tokens, #330 moves the "
                 "VRAM budget)."
             )
-        # Solo placement: seed the DCP token vector from the PREDICTED per-rank
-        # capacity instead of letting resolve_cp_token_ratios fall back to its
-        # budget estimate. That estimate splits tokens proportionally to raw
-        # VRAM budget minus a weight-share term, which under solo is wrong on
-        # the host by two large, unmodelled costs: the whole unsharded draft and
-        # a draft KV pool sized to the GLOBAL context. The host therefore gets a
-        # token share it cannot fund, the global pool is
-        # min_r(P_r * S / ratio_r) -- so the host binds it -- and the other
-        # cards sit half empty. The predicted vector already accounts for both
-        # (see _solo_rank_token_capacity).
+        # Seed the DCP token vector from the PREDICTED per-rank capacity
+        # instead of letting resolve_cp_token_ratios fall back to its budget
+        # estimate. Two placements need this, for two different reasons; both
+        # are cases where the estimate ("tokens proportional to VRAM budget
+        # minus a weight share") no longer describes the boot.
         #
-        # Precedence is respected: SGLANG_UNEVEN_TOKEN_VECTOR and an explicit
-        # --rank-kv-ratio pin both still win, because this only fills in the
-        # unpinned default. Guarded on solo so non-solo planning is untouched.
-        if model.solo_active and pred.get("token_vector"):
+        # Precedence is respected in both: SGLANG_UNEVEN_TOKEN_VECTOR and an
+        # explicit --rank-kv-ratio pin still win, because this only fills in
+        # the unpinned default.
+        if pred.get("token_vector"):
             existing_kv = getattr(server_args, "rank_kv_ratio", None)
             if not isinstance(existing_kv, list):
                 tok_vec = [int(v) for v in pred["token_vector"]]
                 if len(tok_vec) == model.tp_size and all(v > 0 for v in tok_vec):
                     g = math.gcd(*tok_vec)
                     tok_vec = [v // g for v in tok_vec]
-                    if len(set(tok_vec)) > 1:
+                    if len(set(tok_vec)) > 1 and model.solo_active:
+                        # Solo placement: the estimate is wrong on the HOST by
+                        # two large, unmodelled costs -- the whole unsharded
+                        # draft and a draft KV pool sized to the GLOBAL
+                        # context. The host therefore gets a token share it
+                        # cannot fund, the global pool is
+                        # min_r(P_r * S / ratio_r) -- so the host binds it --
+                        # and the other cards sit half empty. The predicted
+                        # vector already accounts for both (see
+                        # _solo_rank_token_capacity).
+                        #
                         # 'capacity' mode: keep the MODE STRING intact and park
                         # the prediction in the dedicated seed field. Writing
                         # the vector into rank_kv_ratio itself would turn the
@@ -5906,6 +5975,53 @@ def apply_auto_performance(server_args) -> None:
                             f"({seeded_as}; the budget-estimate fallback does not model the "
                             "solo host's draft weights + global draft KV pool, "
                             "which would leave the shadow ranks half empty)."
+                        )
+                    elif len(set(tok_vec)) > 1 and _phase_solve_owns_kv_ratio(
+                        server_args, model, tune
+                    ):
+                        # PHASE SOLVE (#435): the estimate is wrong because the
+                        # MLP vector just moved weight mass AWAY from the
+                        # budget proportion the estimate assumes. Every number
+                        # printed above -- the predicted per-rank capacity, the
+                        # predicted ctx, and therefore the floor gate the
+                        # candidate had to clear -- is computed with the
+                        # capacity-MATCHED token vector
+                        # (predict_capacity: ctx = min(sum P, 64 * min P), which
+                        # is exactly the capacity of partition_units(64, P)).
+                        # The boot resolved the budget split instead, so the
+                        # gate passed on a context the runtime then did not
+                        # deliver.
+                        #
+                        # Measured, #433 addendum: solved MLP vector 8,1,1 on
+                        # INT8, matched token vector [12,26,26], booted vector
+                        # [31,17,16] -- rank 0 asked to own 48 % of the tokens
+                        # while holding 13 % of the capacity, and the global
+                        # pool (min-reduced over ratio-normalised capacity)
+                        # came out at 125 504 tokens against a predicted
+                        # 358 693.
+                        #
+                        # Written to rank_kv_capacity_seed, never to
+                        # rank_kv_ratio: the mode STRING carries side effects
+                        # of its own (uneven_kv_flag_active() gates the
+                        # dcp_size auto-set and the weighted owner rule, both
+                        # resolved AFTER this call), and matching a token
+                        # vector must not silently switch a parallelism mode
+                        # on. In resolve_cp_token_ratios the seed sits below
+                        # the env override and the explicit pin and above the
+                        # budget estimate, which is exactly the precedence
+                        # this needs.
+                        server_args.rank_kv_capacity_seed = tok_vec
+                        lines.append(
+                            "coupled KV ratio MATCHED to the solve: seeded the "
+                            "DCP token vector from the chosen candidate's "
+                            "predicted per-rank capacity -> "
+                            f"{','.join(map(str, tok_vec))} (the budget-split "
+                            "estimate no longer matches the MLP vector, and "
+                            "the floor gate above is evaluated with this "
+                            "vector). Pass --rank-kv-ratio explicitly to "
+                            "override; --rank-kv-ratio capacity additionally "
+                            "re-installs the MEASURED optimum after profiling, "
+                            "which this pre-boot prediction only approximates."
                         )
     else:
         lines.append(

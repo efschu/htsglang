@@ -2414,12 +2414,18 @@ class ServerArgs:
             type_parser=_parse_rank_kv_ratio,
         ),
     ] = "coupled"
-    # Internal (no CLI flag): the draft-solo planner's PREDICTED KV-token
-    # vector. Used as the phase-1 estimate in resolve_cp_token_ratios when
-    # --rank-kv-ratio is a MODE string ('capacity'), so seeding a start
-    # vector does not silently downgrade the mode to an explicit pin and
-    # cancel the phase-2 measured install. An explicit --rank-kv-ratio
-    # vector or SGLANG_UNEVEN_TOKEN_VECTOR still wins over this seed.
+    # Internal (no CLI flag): the planner's PREDICTED KV-token vector, used as
+    # the phase-1 estimate in resolve_cp_token_ratios. Two writers, both in
+    # apply_auto_performance:
+    #   * draft-solo placement, when --rank-kv-ratio is a MODE string
+    #     ('capacity'), so seeding a start vector does not silently downgrade
+    #     the mode to an explicit pin and cancel the phase-2 measured install;
+    #   * the phase-optimal arms (--rank-perf-tune phase-*) under the default
+    #     'coupled' ratio (#435), where the solved MLP vector moves weight
+    #     mass off the budget proportion and the budget-split estimate stops
+    #     describing the boot the plan was gated on.
+    # An explicit --rank-kv-ratio vector or SGLANG_UNEVEN_TOKEN_VECTOR still
+    # wins over this seed.
     rank_kv_capacity_seed: Optional[List[int]] = None
     # Internal (no CLI flag): integer weights proportional to the per-rank
     # MEASURED memory bandwidth, parked here by the auto-performance planner

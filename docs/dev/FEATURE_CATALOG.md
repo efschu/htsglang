@@ -39,8 +39,14 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
 Key solver: water-filling over an affine cost model, pair-matrix collective
 term, roles/nesting as box bounds, Pareto+knee, admissibility gates,
 `coresident_budgets()`. Measured phase optima: prefill 10,1,1 (+ decoupled KV
-2,11,10 keeps capacity), decode ~3,2,2. `--objective energy` end to end with
-refusal over silent substitution. `planner/rejected.py` = machine-readable
+2,11,10 keeps capacity), decode ~3,2,2. Under `--rank-perf-tune phase-*` the
+solve now also OWNS the coupled KV token vector (#435): the chosen candidate's
+matched `predict_capacity` vector is seeded into the boot instead of the
+VRAM-budget split, so the pool the runtime sizes is the one the admissibility
+gate accepted (#433 measured the gap: 125 504 vs a predicted 358 693 tokens).
+An explicit `--rank-kv-ratio` still wins; the hand-paired
+`--rank-mlp-ratio X + --rank-kv-ratio Y` of #354/#424 is no longer needed.
+`--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
 
 ## 3. Memory tiers / offload / spill
