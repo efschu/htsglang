@@ -182,19 +182,25 @@ class TestRefusals(_EnvMixin, CustomTestCase):
         import sglang.srt.layers.moe.resident_fraction as mod
 
         self._set("0.485,0.42,0.42")
-        with mock.patch.object(mod, "_from_flag", lambda: (0.5, 0.5, 0.5)):
+        with mock.patch.object(
+            mod, "_from_flag", lambda server_args=None: (0.5, 0.5, 0.5)
+        ):
             with self.assertRaises(ValueError) as ctx:
                 resident_fraction_vector(3)
             self.assertIn("disagree", str(ctx.exception))
         # Identical values from both sources are fine.
-        with mock.patch.object(mod, "_from_flag", lambda: (0.485, 0.42, 0.42)):
+        with mock.patch.object(
+            mod, "_from_flag", lambda server_args=None: (0.485, 0.42, 0.42)
+        ):
             self.assertEqual(resident_fraction_vector(3), (0.485, 0.42, 0.42))
 
     def test_flag_wins_when_env_is_absent(self):
         import sglang.srt.layers.moe.resident_fraction as mod
 
         self._set(None)
-        with mock.patch.object(mod, "_from_flag", lambda: (0.6, 0.3, 0.3)):
+        with mock.patch.object(
+            mod, "_from_flag", lambda server_args=None: (0.6, 0.3, 0.3)
+        ):
             self.assertEqual(resident_fraction_vector(3), (0.6, 0.3, 0.3))
 
 

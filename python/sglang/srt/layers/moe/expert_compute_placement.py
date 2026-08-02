@@ -517,10 +517,18 @@ def _resident_fraction_vector(server_args, world: int) -> Tuple[float, ...]:
     the environment variable is a second source, and the two are cross-checked
     rather than ranked. A solve that used a different fraction than the one the
     cache sizes itself from would be solving a different rig.
+
+    ``server_args`` is handed DOWN into that module rather than left for it to
+    find. This resolver runs in the launcher, before the arguments reach the
+    runtime context, so the module's own flag source could not see them: #439's
+    first battery attempt read ``[1.0, 1.0, 1.0]`` here while the launch
+    carried ``--rank-moe-resident-fraction 0.485,0.42,0.42``, and the arm was
+    refused as having "nothing to move". The cross-check against the
+    environment variable is unaffected.
     """
     from sglang.srt.layers.moe.resident_fraction import resident_fraction_vector
 
-    values = resident_fraction_vector(tp_size=world)
+    values = resident_fraction_vector(tp_size=world, server_args=server_args)
     if len(values) == 1 and world > 1:
         values = tuple(values) * world
     if len(values) != world:

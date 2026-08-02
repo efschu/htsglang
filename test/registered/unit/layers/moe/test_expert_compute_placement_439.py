@@ -931,5 +931,165 @@ class TestTheArmCanIdentifyItself(CustomTestCase):
         self.assertIn("measured", text)
 
 
+#: The 2026-08-02 ARM3 battery's own configuration, as one more synthetic
+#: profile. Every number is read off that battery's record
+#: (`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md`): the base
+#: plan is the resolved `--rank-tp-ratio` from its boot log, the fractions are
+#: its launch flag, and 256 is V4-Flash's routed expert count. Nothing branches
+#: on it -- it is here because it is the configuration the three defects below
+#: were found in, so the falsifiers reproduce them exactly.
+BATTERY_BASE_PLAN = [30407, 19080, 19080]
+BATTERY_FRACTIONS = [0.485, 0.42, 0.42]
+BATTERY_LINKS = [14.42, 6.45, 13.41]
+BATTERY_EXPERTS = 256
+
+
+class TestTheResolverReadsTheLaunchFLAG(CustomTestCase):
+    """Defect 1 of the ARM3 battery: the solve saw ``[1.0, 1.0, 1.0]``.
+
+    ``resolve_moe_compute_placement_flag`` runs in the LAUNCHER, before the
+    ServerArgs reach the runtime context. ``resident_fraction._from_flag()``
+    read them through that context and swallowed the resulting ValueError, so
+    the flag source returned None, the default 1.0 broadcast, and the arm was
+    refused with "nothing to move" while
+    ``--rank-moe-resident-fraction 0.485,0.42,0.42`` sat on the object in the
+    resolver's hand.
+
+    The suite above never caught it because ``TestTheResolverRunsEndToEnd``
+    supplies the fraction through the ENVIRONMENT, which is the other, working
+    source. These cases use the flag and nothing but the flag.
+    """
+
+    _ENVS = (
+        "SGLANG_RANK_CARD_UUIDS",
+        "SGLANG_MOE_HOST_SHARD_RATIO",
+        "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+        "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS",
+        COMPUTE_POLICY_ENV,
+        "SGLANG_MOE_COMPUTE_BASE_PLAN",
+    )
+
+    def setUp(self):
+        super().setUp()
+        import os
+
+        self._saved = {k: os.environ.get(k) for k in self._ENVS}
+        os.environ["SGLANG_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb,GPU-ccc"
+        os.environ["SGLANG_MOE_HOST_SHARD_RATIO"] = ",".join(
+            str(w) for w in BATTERY_LINKS
+        )
+        # The defect's precondition: NOTHING in the environment. The launch
+        # carries the fraction on the flag only, which is how the battery ran.
+        for key in (
+            "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+            "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS",
+            COMPUTE_POLICY_ENV,
+            "SGLANG_MOE_COMPUTE_BASE_PLAN",
+        ):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        import os
+
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        super().tearDown()
+
+    @staticmethod
+    def _args(**overrides):
+        class _Args:
+            tp_size = 3
+            ep_size = 1
+            nnodes = 1
+            rank_tp_ratio = list(BATTERY_BASE_PLAN)
+            rank_moe_ratio = COMPUTE_PLACEMENT_LINK
+            rank_moe_resident_fraction = list(BATTERY_FRACTIONS)
+
+            def override(self, source, **fields):
+                self.override_source = source
+                for key, value in fields.items():
+                    setattr(self, key, value)
+
+        args = _Args()
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_the_context_really_is_unpublished_here(self):
+        """The defect's precondition, asserted rather than assumed."""
+        from sglang.srt.runtime_context import get_context
+
+        with self.assertRaises(ValueError) as caught:
+            get_context().server_args
+        self.assertIn("not set yet", str(caught.exception))
+
+    def test_can_fail_the_context_route_alone_still_reads_the_default(self):
+        """The unfixed behaviour, pinned so the fix cannot be quietly undone.
+
+        Without an explicit ServerArgs there is genuinely nothing to read in
+        this process, and 1.0 is the honest answer -- the bug was asking the
+        question that way from a caller that HELD the object.
+        """
+        from sglang.srt.layers.moe.resident_fraction import (
+            _from_flag,
+            resident_fraction_vector,
+        )
+
+        self.assertIsNone(_from_flag())
+        self.assertEqual(resident_fraction_vector(tp_size=3), (1.0, 1.0, 1.0))
+
+    def test_the_resolver_reads_the_per_rank_fractions_off_the_launch_args(self):
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            _resident_fraction_vector,
+        )
+
+        seen = _resident_fraction_vector(self._args(), 3)
+        self.assertEqual(seen, tuple(BATTERY_FRACTIONS))
+
+    def test_the_battery_arm_now_solves_instead_of_being_refused(self):
+        """End to end through the resolver, on the battery's own inputs.
+
+        The vector is asserted exactly: it is the one the battery reached only
+        after hand-setting the environment variable as a workaround, so a
+        different answer here means the fix resolved something else.
+        """
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resolve_moe_compute_placement_flag,
+        )
+
+        args = self._args()
+        placement = resolve_moe_compute_placement_flag(args)
+        self.assertIsNotNone(placement)
+        self.assertEqual(placement.weights, (160, 79, 119))
+        self.assertEqual(args.rank_moe_ratio, [160, 79, 119])
+
+    def test_a_scalar_flag_broadcasts_to_every_rank(self):
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            _resident_fraction_vector,
+        )
+
+        args = self._args(rank_moe_resident_fraction=[0.5])
+        self.assertEqual(_resident_fraction_vector(args, 3), (0.5, 0.5, 0.5))
+
+    def test_the_env_flag_cross_check_survives_the_fix(self):
+        """The fix hands the module a source; it does not RANK the sources.
+
+        A launch that says two different things is still refused -- dropping
+        that check would have been the easy way to make the defect go away.
+        """
+        import os
+
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            _resident_fraction_vector,
+        )
+
+        os.environ["SGLANG_MOE_RESIDENT_EXPERT_FRACTION"] = "0.3,0.3,0.3"
+        with self.assertRaises(ValueError) as caught:
+            _resident_fraction_vector(self._args(), 3)
+        self.assertIn("disagree", str(caught.exception))
+
 if __name__ == "__main__":
     unittest.main()
