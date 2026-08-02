@@ -1062,7 +1062,16 @@ class Envs:
     # dominates single-token decode). Requires a residency layout frozen BEFORE
     # capture (static [0,R) or SGLANG_MOE_HOTSET_FILE); live hot-calibration is
     # rejected on this path. Default False = eager run_waves (unchanged).
+    #
+    # #452: REFUTED on hardware and refused by name at boot
+    # (moe/offload_capture_gate.refuse_capturable_offload_decode). Setting this
+    # to True aborts the launch unless the override below is also set.
     SGLANG_MOE_OFFLOAD_CUDA_GRAPH = EnvBool(False)
+    # Development override past the #452 refusal, for a card window that wants
+    # to localise B2 or measure a candidate fix. Not a performance option: the
+    # measured operating point is 6.60x slower than the eager offload path and
+    # decodes different text.
+    SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE = EnvBool(False)
     # Path to a per-layer frozen hot-set file (produced offline from the M-C
     # routing trace). Enables hot-residency under CUDA-graph capture by freezing
     # the resident set from the file before capture, instead of live calibration.

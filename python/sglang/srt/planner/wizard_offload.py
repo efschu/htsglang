@@ -269,9 +269,11 @@ def _step(src: OffloadSources, fraction: float) -> dict:
     if fraction < 1.0:
         if not src.cuda_graph_allowed:
             notes.append(
-                "Needs --disable-cuda-graph unless SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1. "
-                "Losing the decode graphs is its own cost and is not part of "
-                "the PCIe term above."
+                "Needs --disable-cuda-graph. Losing the decode graphs is its "
+                "own cost and is not part of the PCIe term above. "
+                "SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 is NOT an alternative: it was "
+                "refuted on hardware (#452, 6.60x decode regression plus "
+                "content divergence) and refuses at boot."
             )
         if host_fits is False:
             notes.append(

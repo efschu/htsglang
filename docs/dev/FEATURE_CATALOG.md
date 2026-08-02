@@ -117,19 +117,37 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   `item/tolist/cpu/numpy/nonzero/__bool__/__int__/__float__/__index__`), and
   the captured gather lands byte-identical scratch rows vs the eager `_fetch`
   (`tests/moe_offload/test_capture_desync_port.py`, 63 tests, four executed
-  can-fail arms). BOOT-PENDING: actual V4 capture + replay correctness + perf,
-  B1-B4 spec in `scripts/dev/443_graph_proof/` (B1 capture succeeds, B2 replay
-  is correct, B3 UVA view holds under capture, B4 perf) — no GPU boot run yet,
-  no measured perf number to publish. Sizing note from that port: a captured decode
+  can-fail arms). **REFUTED-AT-BOOT (#452)**: the B1-B4 window of
+  `scripts/dev/443_graph_proof/` ran 2026-08-02 (evidence
+  `/spinning/gpu-battery-results/2026-08-02_desync_graph_proof/RESULTS.md`).
+  **B1 PASS** — capture succeeds, 13 of 18 decode batches captured.
+  **B2 FAIL** — the graph arm and the eager arm decode different text from the
+  same greedy prompt (each arm internally deterministic over 3 runs, so
+  systematic); the cause is NOT localised and the window lacked its control arm
+  (graphs-vs-eager without the offload), so "the gather moved wrong rows" stays
+  an unproven hypothesis — both arms' texts are fluent and on-topic, which a
+  wrong-expert gather would not be.
+  **B4 6.60x REGRESSION** — 984.4 ms/token captured vs 149.1 ms/token eager,
+  localised to the captured decode step (prefill +1.5 %). B4 is STRUCTURAL: a
+  graph cannot vary its work with the data, so the captured gather moves the
+  worst-case scratch set every layer every step (2.128 GiB/token measured from
+  the run's own expert-stats) where the eager fetch moves only the missed
+  experts (0.366–0.535 GiB/token) — a 5.35x PCIe multiplier on a PCIe-bound
+  step. **The gate is restored**: `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` now refuses
+  by name at boot (`moe/offload_capture_gate.resolve_graph_mode`,
+  `tests/moe_offload/test_capture_regate_452.py`, 15 tests, executed can-fail);
+  `SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE=1` re-opens it for a card window. The
+  mechanism stays in-tree behind the refusal so a candidate fix can be measured
+  against these numbers. Verdict, repricing and what a real fix would require:
+  `docs/dev/NOTE_452_desync_boot_refutation.md`.
+  **The shipped offload path is the eager one** (`--disable-cuda-graph`,
+  149.1 ms/token), unchanged and unaffected. Sizing note from that port: a
+  captured decode
   bucket needs `bs x top_k` scratch slots, so the recipe's own `bs=1` operating
   point fits the battery's existing `SGLANG_MOE_SCRATCH_SLOTS=6` at no extra
   VRAM. Double-buffered prefetch with compute overlap; expert-major prefill
   waves (`SGLANG_MOE_OFFLOAD_WAVE_ORDER`, byte-identical proven); fp8 presplit;
-  load-time-aware halves for fp8/GPTQ/AWQ (GGUF-MoE half missing — guarded);
-  `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` = the opt-in that selects the capturable
-  decode path (frozen resident set required — live hot calibration is refused
-  by name, since residency must be frozen before capture). Its byte gate is
-  green at the desk (#443); the boot arm is specified, not run.
+  load-time-aware halves for fp8/GPTQ/AWQ (GGUF-MoE half missing — guarded).
 - **#394 cold-shard chain** (slices 1+2 merged): measured H2D provenance chain
   (env > card-probe > nvml-negotiated > refusal; `absent` unselectable),
   `cold_tier_shm.py` shared-DRAM segments (UUID/BDF identity, manifest read
@@ -161,10 +179,16 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   `cudaHostRegister`'d peer mapping is unverified on hardware. Past
   `SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1` the first is no longer undefined
   behaviour: the remap clamps and counts on device, and
-  `offload_capture_gate` raises by name at the replay boundary. Graphs incl.
+  `offload_capture_gate` raises by name at the replay boundary. Since #452 that
+  seam is behind a SECOND refusal — the capturable decode path itself refuses at
+  boot — so reaching it now takes both overrides. Graphs incl.
   CPU-MoE remain IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host
   nodes, CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
-  (spill/restore under fixed buffers is legal).
+  (spill/restore under fixed buffers is legal). #452 adds the measured caveat
+  that "capturable" and "offload" pull against each other on a PCIe-bound step:
+  the graph must move the worst case, the offload's whole economy is moving only
+  the miss. Conditional nodes are the mechanism that would reconcile them, and
+  torch exposes none.
 - **HiCache** L1-L3 prefix cache (validated with uneven DCP/TP; storage key
   includes kv-dtype; runtime attach/detach works on UnifiedRadixCache). The
   L2 host tier's `page_first_direct` transfer path was blocked on this rig by
