@@ -78,6 +78,7 @@ __all__ = [
     "model_kv_heads",
     "model_is_hybrid",
     "model_has_mtp",
+    "model_bundles_dspark_draft",
     "model_quant_kind",
     "model_max_context",
     "rig_has_sm86",
@@ -186,10 +187,41 @@ def model_is_hybrid(model_cfg: Optional[dict]) -> bool:
     return False
 
 
+def model_bundles_dspark_draft(model_cfg: Optional[dict]) -> bool:
+    """True when the checkpoint bundles a DSpark draft head, marked by the
+    prefixed ``dspark_*`` keys on the target config. Mirrors
+    ``speculative.dspark_components.dspark_config.checkpoint_bundles_dspark_draft``
+    on the planner's flat/nested dict shape (the planner reads config.json
+    directly and must not import the runtime)."""
+    return any(
+        _cfg_get(model_cfg, key) is not None
+        for key in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        )
+    )
+
+
 def model_has_mtp(model_cfg: Optional[dict]) -> bool:
     """True when the checkpoint ships MTP draft layers (NEXTN speculative
     decoding is possible): ``mtp_num_hidden_layers`` or
-    ``num_nextn_predict_layers`` > 0."""
+    ``num_nextn_predict_layers`` > 0.
+
+    A DSpark-bundled checkpoint is excluded even when it declares
+    ``num_nextn_predict_layers``. Every published DeepSeek-V4 config carries
+    ``num_nextn_predict_layers: 1``, but on the DSpark variants the ``mtp.*``
+    namespace holds the three DSpark stages (``markov_head.*``,
+    ``confidence_head.proj``, ``main_proj``) and no NextN block at all --
+    checked against the safetensors index of ``DeepSeek-V4-Flash`` (1 stage,
+    ``enorm``/``hnorm`` = NextN, no ``dspark_*`` keys) versus
+    ``DeepSeek-V4-Flash-DSpark`` and ``DeepSeek-V4-Flash-0731`` (3 stages,
+    markov/confidence, ``dspark_*`` keys). Reading the field as "NEXTN is
+    possible" on the latter produces a preset whose draft weights cannot
+    load."""
+    if model_bundles_dspark_draft(model_cfg):
+        return False
     v = _cfg_get(model_cfg, "mtp_num_hidden_layers")
     if v is None:
         v = _cfg_get(model_cfg, "num_nextn_predict_layers")
@@ -798,9 +830,12 @@ _CURATED: Dict[str, dict] = {
         # plugin-registered names this static tuple cannot know. A test pins
         # that every entry here is still resolvable, so the pick-list cannot
         # drift into offering something the server would reject.
-        allowed=("EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"),
+        allowed=("EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "DSPARK"),
         hover="Speculative-decoding algorithm (EAGLE/EAGLE3/NEXTN/...). "
-        "Mutually exclusive with the weightless-KV fast lane.",
+        "DSPARK is the block draft bundled in DeepSeek-V4 checkpoints "
+        "(dspark_* config keys); it needs --speculative-dspark-block-size "
+        "semantics, not the NEXTN chain shape. Mutually exclusive with the "
+        "weightless-KV fast lane.",
     ),
     "enable_mixed_chunk": dict(
         group="scheduling",
@@ -2554,6 +2589,21 @@ def profiles(
                     "speculative decoding: NEXTN chain, steps 3, topk 1, "
                     "draft 4, adaptive (the validated shape; topk stays 1 "
                     "-- tree spec is rejected under uneven DCP)."
+                )
+            elif model_bundles_dspark_draft(model_cfg):
+                # DeepSeek-V4-Flash-0731 ships a DSpark block draft under
+                # mtp.* and NO NextN head, so neither the NEXTN branch above
+                # nor a local-draft match applies. DSPARK is not auto-enabled:
+                # it uses the block shape (num_steps 1, num_draft_tokens =
+                # gamma + 1, see arg_groups/speculative_hook.py) rather than
+                # the NEXTN chain this generator emits, and DSpark on
+                # DeepSeek-V4 is not boot-proven in this fork yet (#447).
+                info.append(
+                    "checkpoint bundles a DSpark draft head (dspark_* config "
+                    "keys) and has no NextN head: speculative decoding needs "
+                    "--speculative-algorithm DSPARK plus the block shape "
+                    "(--speculative-dspark-block-size), which this generator "
+                    "does not emit -- spec stays off."
                 )
             elif draft is not None:
                 algo = str(draft.get("algorithm") or "EAGLE3")

@@ -1,8 +1,14 @@
 """Which paged-MQA-logits implementation the DSV4 indexer gets, per device.
 
-The DSpark layers of DeepSeek-V4 (any layer with ``compress_ratio in (4, 128)``
--- layers 40-42 of DeepSeek-V4-Flash) run an indexer whose paged-MQA-logits
-step has four implementations, with four different hardware domains:
+The compressed-attention layers of DeepSeek-V4 (any layer with
+``compress_ratio in (4, 128)``) run an indexer whose paged-MQA-logits step has
+four implementations, with four different hardware domains. On
+DeepSeek-V4-Flash-0731 that is 41 of the 43 backbone layers: ``compress_ratios``
+in the shipped ``config.json`` is ``[0, 0, 4, 128, 4, 128, ..., 128, 4]`` for
+the trunk, so layers 0-1 are SWA-only, the 21 even layers 2..42 are CSA(4) and
+carry the indexer, and the 20 odd layers 3..41 are HCA(128). (Not to be confused
+with ``dspark_target_layer_ids = [40, 41, 42]``, which names the layers whose
+hidden states feed the DSpark *draft head* -- an unrelated mechanism.)
 
 * **DeepGEMM** (``deep_gemm.fp8_paged_mqa_logits``, the default) -- Hopper and
   datacenter Blackwell. It asserts ``Unsupported architecture`` in compiled C++

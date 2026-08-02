@@ -1498,3 +1498,89 @@ class TestColocationRankHelpers(CustomTestCase):
         )
         self.assertIsNotNone(res["rank_gpu_id"]["error"])
         self.assertIn("4 entries", res["rank_gpu_id"]["error"])
+
+
+# DeepSeek-V4-Flash-0731, reduced to the fields the planner reads. The
+# combination is the whole point: num_nextn_predict_layers == 1 (every
+# published DeepSeek-V4 config carries it) together with the dspark_* block,
+# which is what actually says the mtp.* tensors are DSpark stages and NOT a
+# NextN head.
+_DSV4_FLASH_0731_CFG = {
+    "num_attention_heads": 64,
+    "num_key_value_heads": 1,
+    "num_experts": 256,
+    "num_experts_per_tok": 6,
+    "num_hidden_layers": 43,
+    "head_dim": 512,
+    "num_nextn_predict_layers": 1,
+    "dspark_block_size": 5,
+    "dspark_markov_rank": 256,
+    "dspark_noise_token_id": 128799,
+    "dspark_target_layer_ids": [40, 41, 42],
+}
+#: The June DeepSeek-V4-Flash: same nextn field, NO dspark_* block. Its mtp.*
+#: namespace really is a NextN block (enorm/hnorm), so NEXTN stays available.
+_DSV4_FLASH_JUNE_CFG = {
+    k: v for k, v in _DSV4_FLASH_0731_CFG.items() if not k.startswith("dspark_")
+}
+
+
+class TestDsparkBundledCheckpointIsNotMtp447(CustomTestCase):
+    """#447: DeepSeek-V4-Flash-0731 declares ``num_nextn_predict_layers: 1``
+    but ships no NextN head -- the tensors under ``mtp.*`` are the three
+    DSpark stages. Reading that field as "NEXTN is possible" produced a preset
+    whose draft weights cannot load."""
+
+    def test_dspark_keys_are_detected(self):
+        self.assertTrue(flags.model_bundles_dspark_draft(_DSV4_FLASH_0731_CFG))
+        self.assertFalse(flags.model_bundles_dspark_draft(_DSV4_FLASH_JUNE_CFG))
+        self.assertFalse(flags.model_bundles_dspark_draft(_MOE_CFG))
+        self.assertFalse(flags.model_bundles_dspark_draft(None))
+
+    def test_any_single_dspark_key_is_enough(self):
+        # The runtime's checkpoint_bundles_dspark_draft() is an ANY over the
+        # four keys; the planner mirror must not require all four.
+        for key in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        ):
+            cfg = dict(_DSV4_FLASH_JUNE_CFG)
+            cfg[key] = _DSV4_FLASH_0731_CFG[key]
+            self.assertTrue(flags.model_bundles_dspark_draft(cfg), key)
+
+    def test_dspark_bundled_checkpoint_does_not_report_an_mtp_head(self):
+        # THE falsifier: without the guard this returns True and the preset
+        # generator emits --speculative-algorithm NEXTN for a checkpoint that
+        # has no NextN block.
+        self.assertFalse(flags.model_has_mtp(_DSV4_FLASH_0731_CFG))
+
+    def test_the_june_checkpoint_keeps_its_mtp_head(self):
+        # The guard must not disarm NEXTN for the release that really has one.
+        self.assertTrue(flags.model_has_mtp(_DSV4_FLASH_JUNE_CFG))
+
+    def test_nested_text_config_shape_is_handled(self):
+        self.assertFalse(
+            flags.model_has_mtp({"text_config": dict(_DSV4_FLASH_0731_CFG)})
+        )
+
+    def test_no_preset_offers_nextn_for_a_dspark_checkpoint(self):
+        # End to end through the preset generator: no profile may set
+        # speculative_algorithm, and the note must name DSPARK rather than
+        # claiming there is no head.
+        profs = flags.profiles(_DSV4_FLASH_0731_CFG, _HETERO_GPUS)
+        self.assertTrue(profs)
+        for p in profs:
+            self.assertIsNone(
+                p.settings.get("speculative_algorithm"),
+                f"{p.kind} offered spec for a DSpark-only checkpoint",
+            )
+            notes = " ".join(p.info)
+            self.assertIn("DSpark", notes, p.kind)
+            self.assertNotIn("no MTP head and no matching local draft", notes)
+
+    def test_dspark_is_offerable_in_the_pick_list(self):
+        # server_args.py accepts DSPARK; the UI pick-list must not be the
+        # thing that makes it unreachable.
+        self.assertIn("DSPARK", flags.catalog()["speculative_algorithm"].allowed)
