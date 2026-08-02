@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_server_args
@@ -755,6 +755,27 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
             ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
 
+        # #450a: request-private conv window for TARGET_VERIFY, the Mamba2 twin
+        # of the GDN buffer #444 introduced (`GDNAttnBackend.__init__`). See
+        # `MambaMixer2._target_verify_conv` for why the verify conv must not run
+        # on the persistent pool row. Rows are the same rows the intermediate
+        # caches use, so the buffer is bounded by the spec state size and
+        # carries no new indexing rule. Allocated once at backend construction
+        # (never on the hot path, never inside a graph capture) and shared
+        # across mamba layers: the mixers are per-layer modules but this backend
+        # is one object for all of them, and within one forward the layers run
+        # in sequence on one stream.
+        self.verify_conv_window: Optional[torch.Tensor] = None
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            conv = mamba_cache.conv[0]
+            intermediate = mamba_cache.intermediate_conv_window[0]
+            self.verify_conv_window = torch.empty(
+                (intermediate.shape[1], conv.shape[-2], conv.shape[-1]),
+                dtype=conv.dtype,
+                device=conv.device,
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -814,6 +835,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            verify_conv_window=self.verify_conv_window,
         )
 
         if forward_batch.mamba_track_mask is not None:

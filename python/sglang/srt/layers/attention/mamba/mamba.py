@@ -140,7 +140,11 @@ def mamba_v2_sharded_weight_loader(
             #   groups to accompany head shards.
 
             # - size of the loaded shard
-            if tp_units is not None and tp_plan_active(tp_size) and not duplicate_groups:
+            if (
+                tp_units is not None
+                and tp_plan_active(tp_size)
+                and not duplicate_groups
+            ):
                 # Uneven TP: this rank's unit-based partition of the
                 # group, offset by the prefix sum of the earlier ranks.
                 shard_size = tp_partition_size(full_dim, tp_size, tp_rank, tp_units)
@@ -457,6 +461,80 @@ class MambaMixer2(torch.nn.Module):
 
         self.prefix = prefix
 
+    def _target_verify_conv(
+        self,
+        hidden_states_reshaped: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_state_indices: torch.Tensor,
+        intermediate_conv_window: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        retrieve_next_token: Optional[torch.Tensor],
+        retrieve_next_sibling: Optional[torch.Tensor],
+        retrieve_parent_token: Optional[torch.Tensor],
+        verify_conv_window: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the TARGET_VERIFY conv on a request-private copy of the window.
+
+        The Mamba2 twin of ``GDNAttnBackend._target_verify_conv`` (#444), same
+        defect and same remedy; #444 named this site as untreated and #450a
+        treats it.
+
+        The conv kernel is intentionally in-place: STEP 2 of
+        ``_causal_conv1d_update_kernel``
+        (``mamba/causal_conv1d_triton.py:752``) stores the shifted window back
+        into whatever ``conv_state`` it was handed, and that store is not gated
+        on ``SAVE_INTERMEDIATE`` -- the speculative branch only moves the source
+        offset (``:715``). Handing it the persistent pool row therefore advanced
+        that row over EVERY drafted step, accepted or not, and the pool only
+        became correct again once ``update_mamba_state_after_mtp_verify``
+        (``hybrid_linear_attn_backend.py``) scattered the accepted step back out
+        of the intermediate cache.
+
+        Between those two points the pool row held the last candidate's window:
+        a state that is neither the pre-verify state nor the committed one.
+        Single-stream that window is unobservable -- nothing between the verify
+        forward and the commit reads the recurrent pool. It is observable for
+        anything that reads the same pool concurrently, and mutate-then-repair
+        is only ever as correct as the absence of such a reader.
+
+        Running on a private copy removes the window instead of timing it. The
+        persistent row is now written exactly once per verify, by the commit,
+        from the intermediate cache -- which already carries the full
+        ``dim x (K-1)`` window of every step, so no information is lost: the
+        commit's scatter overwrites every element of the row it touches
+        (``mamba/mamba_state_scatter_triton.py``
+        ``:_fused_conv_window_scatter_with_mask_kernel``) over exactly the
+        verify batch. The committed bytes are therefore unchanged; only the
+        intermediate window stops being published.
+        """
+        assert verify_conv_window is not None, (
+            "TARGET_VERIFY reached MambaMixer2 without a speculative mamba "
+            "cache: the private conv window was never allocated."
+        )
+        # Seed the private rows with the persistent window the kernel needs as
+        # its prior state. `intermediate_state_indices` is the row space the
+        # intermediate caches already use, so the private buffer inherits their
+        # ownership rule instead of introducing a second one.
+        verify_conv_window.index_copy_(
+            0,
+            intermediate_state_indices.to(torch.int64),
+            conv_state.index_select(0, conv_state_indices.to(torch.int64)),
+        )
+        return causal_conv1d_update_triton(
+            hidden_states_reshaped,
+            verify_conv_window,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=intermediate_state_indices,
+            intermediate_conv_window=intermediate_conv_window,
+            intermediate_state_indices=intermediate_state_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+
     def forward(
         self,
         *,
@@ -467,6 +545,7 @@ class MambaMixer2(torch.nn.Module):
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
+        verify_conv_window: Optional[torch.Tensor] = None,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -675,18 +754,17 @@ class MambaMixer2(torch.nn.Module):
                     num_decodes, draft_token_num, -1
                 ).transpose(1, 2)
 
-                hidden_states_B_C_d_processed = causal_conv1d_update_triton(
+                hidden_states_B_C_d_processed = self._target_verify_conv(
                     hidden_states_B_C_d_reshaped,
                     conv_state,
                     conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_tensor_d[:num_decodes],
-                    intermediate_conv_window=layer_cache.intermediate_conv_window[0],
-                    intermediate_state_indices=self.intermediate_state_indices,
-                    retrieve_next_token=metadata.retrieve_next_token,
-                    retrieve_next_sibling=metadata.retrieve_next_sibling,
-                    retrieve_parent_token=metadata.retrieve_parent_token,
+                    state_indices_tensor_d[:num_decodes],
+                    layer_cache.intermediate_conv_window[0],
+                    self.intermediate_state_indices,
+                    metadata.retrieve_next_token,
+                    metadata.retrieve_next_sibling,
+                    metadata.retrieve_parent_token,
+                    verify_conv_window,
                 )
                 hidden_states_B_C_d = hidden_states_B_C_d_processed.transpose(
                     1, 2
