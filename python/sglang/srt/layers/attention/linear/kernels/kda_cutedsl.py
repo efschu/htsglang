@@ -7,32 +7,36 @@ from sglang.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_updat
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import cuda_sm_at_least, get_cuda_sm
+from sglang.srt.utils import cuda_sm_in_range, get_cuda_sm
 
 logger = logging.getLogger(__name__)
 
 
-def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell), where the chunk prefill kernels run.
+def _supports_cutedsl_prefill() -> bool:
+    """True iff this is an SM10x part, the family the chunk prefill targets.
 
     Asked in the NVIDIA namespace (#171): the bare ``major >= 10`` this
     replaces also matched gfx1030 ``(10, 3)`` and gfx1100 ``(11, 0)``, i.e.
-    AMD cards were identified as Blackwell.
+    AMD cards were identified as Blackwell. The upper bound is the second
+    half: consumer Blackwell reports ``(12, 0)`` and is not an SM100/SM103
+    part, so a floor would route an RTX 50-series card into a kernel
+    validated only on the datacenter line.
     """
-    return cuda_sm_at_least(10)
+    return cuda_sm_in_range((10, 0), (11, 0))
 
 
 class CuteDSLKDAKernel(LinearAttnKernelBase):
     """CuTe DSL kernel for KDA.
 
     Decode: ``cutedsl_fused_sigmoid_gating_kda_update`` (SM90+).
-    Extend (prefill): SM100 chunk pipeline ``chunk_kda_cutedsl`` (SM100+ only,
-    ``head_k_dim`` must be 128). On SM90 the prefill path is unsupported; callers
-    query :attr:`supports_prefill` and fall back to Triton.
+    Extend (prefill): SM10x chunk pipeline ``chunk_kda_cutedsl``
+    (SM100/SM103 only, ``head_k_dim`` must be 128). On every other
+    architecture the prefill path is unsupported; callers query
+    :attr:`supports_prefill` and fall back to Triton.
     """
 
     def __init__(self):
-        self.supports_prefill = _is_blackwell()
+        self.supports_prefill = _supports_cutedsl_prefill()
         self._extend_fn: Optional[callable] = None
         self._l2norm_fn: Optional[callable] = None
 
@@ -42,7 +46,7 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         if not self.supports_prefill:
             sm = get_cuda_sm()
             raise RuntimeError(
-                "CuTe DSL KDA prefill requires SM100+ (Blackwell); got "
+                "CuTe DSL KDA prefill requires SM100/SM103; got "
                 + (f"SM{sm}." if sm is not None else "a non-NVIDIA device.")
             )
         if head_k_dim != 128:
@@ -56,7 +60,7 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
 
         self._extend_fn = chunk_kda_cutedsl
         self._l2norm_fn = l2norm_fwd
-        logger.info("Using CuTe DSL KDA prefill (Blackwell)")
+        logger.info("Using CuTe DSL KDA prefill (SM10x)")
 
     def decode(
         self,
