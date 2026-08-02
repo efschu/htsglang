@@ -8825,23 +8825,28 @@ class ServerArgs:
         a fixed reserve (shared between co-located ranks); the weights are
         the gcd-reduced budgets — capacity is maximized when each rank's
         share of every sharded dimension is proportional to its memory
-        budget. Explicit integer weights keep working unchanged."""
+        budget. Explicit integer weights keep working unchanged.
+
+        Under a pipeline (#201 slice 3 item 4) the budgets are derived for
+        every WORLD rank (the per-stage memory lists slice 1 introduced),
+        and the weight vector is derived PER STAGE from that stage's
+        budget slice. --rank-tp-ratio is a process-global singleton that
+        every stage installs identically, so the derived stage vectors
+        must AGREE; if the stage card groups would need different vectors,
+        the boot refuses and names each stage's honest answer instead of
+        silently splitting evenly (the #202 lesson). Per-stage vector
+        installation (keyed by pp_rank in configure_scheduler_process) is
+        the named follow-up that lifts this refusal.
+        """
         if self.rank_gpu_id is None:
             raise ValueError("--rank-tp-ratio auto requires --rank-gpu-id.")
-        if self.pp_size > 1:
-            # The auto planner derives ONE weight vector from the whole card
-            # set named by --rank-gpu-id. Under a pipeline that set spans
-            # every stage, so the derived vector is world-length while
-            # --rank-tp-ratio must be tp_size long, and the per-stage weights
-            # would have to come from a per-stage capacity model that does not
-            # exist yet (#201 slice 3). Explicit vectors only.
+        if self.pp_size > 1 and len(self.rank_gpu_id) != self.pp_size * self.tp_size:
             raise ValueError(
-                "--rank-tp-ratio auto/auto-performance is not available "
-                f"under --pp-size > 1 (current: {self.pp_size}): the planner "
-                "derives a single weight vector from all cards in "
-                "--rank-gpu-id, which under a pipeline spans every stage. "
-                "Pass an explicit per-stage ratio vector of length "
-                f"--tp-size ({self.tp_size})."
+                "--rank-tp-ratio auto with --pp-size > 1 needs a world-length "
+                f"--rank-gpu-id ({self.pp_size} x {self.tp_size} = "
+                f"{self.pp_size * self.tp_size} entries, world-rank order "
+                "pp_rank * tp_size + tp_rank); got "
+                f"{len(self.rank_gpu_id)} entries."
             )
 
         if self.rank_gpu_memory_mib is None:
@@ -8965,8 +8970,58 @@ class ServerArgs:
         budgets = (
             list(self.rank_gpu_memory_mib)
             if isinstance(self.rank_gpu_memory_mib, list)
-            else [self.rank_gpu_memory_mib] * self.tp_size
+            else [self.rank_gpu_memory_mib] * self.tp_size * self.pp_size
         )
+        if self.pp_size > 1:
+            # Per-stage derivation: each stage's TP group shards by its own
+            # budget slice. The vectors must agree because the ratio
+            # singleton is installed identically in every scheduler process.
+            stage_vectors = []
+            for stage in range(self.pp_size):
+                stage_budgets = budgets[
+                    stage * self.tp_size : (stage + 1) * self.tp_size
+                ]
+                g = math.gcd(*stage_budgets)
+                stage_vectors.append([b // g for b in stage_budgets])
+            if any(vec != stage_vectors[0] for vec in stage_vectors[1:]):
+                per_stage = "; ".join(
+                    f"stage {s}: cards {budgets[s * self.tp_size:(s + 1) * self.tp_size]} "
+                    f"MiB -> {vec}"
+                    for s, vec in enumerate(stage_vectors)
+                )
+                raise ValueError(
+                    "--rank-tp-ratio auto under --pp-size > 1: the stages' "
+                    f"card groups derive DIFFERENT weight vectors ({per_stage}). "
+                    "The TP partition ratio is installed process-globally, so "
+                    "all stages must shard by the same vector; per-stage "
+                    "vectors are the #201 follow-up. Pass an explicit "
+                    f"--rank-tp-ratio of length --tp-size ({self.tp_size}) "
+                    "as the compromise for all stages, or regroup the cards "
+                    "so the stages match."
+                )
+            weights = stage_vectors[0]
+            if len(set(weights)) == 1:
+                logger.info(
+                    "--rank-tp-ratio auto (pipeline): every stage's budgets "
+                    "are uniform within the stage, using the classic even "
+                    "split per stage (per-stage budgets stay as derived: "
+                    "%s MiB).",
+                    budgets,
+                )
+                # Keep the WORLD-length budget list: stages legitimately
+                # carry different budgets (layer windows differ), only the
+                # within-stage ratio collapsed.
+                self.rank_tp_ratio = None
+                self.rank_gpu_memory_mib = budgets
+                return
+            self.rank_tp_ratio = weights
+            logger.info(
+                "--rank-tp-ratio auto (pipeline): derived the shared stage "
+                "vector %s from per-stage budgets %s MiB.",
+                weights,
+                budgets,
+            )
+            return
         g = math.gcd(*budgets)
         weights = [b // g for b in budgets]
         if len(set(weights)) == 1:
@@ -9018,6 +9073,11 @@ class ServerArgs:
             budgets = self.rank_gpu_memory_mib
             if isinstance(budgets, int):
                 budgets = [budgets] * self.tp_size
+            elif self.pp_size > 1 and len(budgets) == self.pp_size * self.tp_size:
+                # Pipeline: the vector is per stage (all stages agree by the
+                # gate in _resolve_auto_rank_tp_ratio); stage 0's budget
+                # slice is representative for this diagnostic line.
+                budgets = budgets[: self.tp_size]
             inputs = PlanInputs.from_server_args(self)
             # For a GGUF checkpoint the parse-time config is synthesized from
             # the GGUF KV block, which does not carry every geometry key the
@@ -9155,6 +9215,19 @@ class ServerArgs:
         # (decode is flat across splits — M22 — so attention/GDN/KV splits
         # are not performance levers) and then derives a dense-MLP family
         # vector from the measured hardware profile on top.
+        if ratio_was_perf and self.pp_size > 1:
+            # #201 slice 3 opens plain 'auto' for pipelines (per-stage budget
+            # derivation with an agreement gate); the measured-profile ladder
+            # is still a single-group planner. Refusal by name, never a
+            # silent fallback to plain auto.
+            raise ValueError(
+                "--rank-tp-ratio auto-performance is not available under "
+                f"--pp-size > 1 (current: {self.pp_size}): the measured "
+                "hardware ladder plans one TP group, not per-stage groups. "
+                "Use --rank-tp-ratio auto (per-stage VRAM derivation with "
+                "an agreement gate) or an explicit vector of length "
+                f"--tp-size ({self.tp_size})."
+            )
         if ratio_was_auto:
             self._resolve_auto_rank_tp_ratio()
         if ratio_was_perf:

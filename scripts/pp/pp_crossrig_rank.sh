@@ -49,6 +49,10 @@ ATTN_SECOND=${ATTN_SECOND:-triton}
 
 export SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1
 export SGLANG_PP_BOUNDARY_STATS=$BOUNDARY_STATS
+# #201 slice 3: metadata shape cache at the stage boundary. Must be set to
+# the SAME value on BOTH nodes (the wire format differs with it); this
+# script pins it explicitly on every rank for exactly that reason.
+export SGLANG_PP_SHAPE_CACHE=${SGLANG_PP_SHAPE_CACHE:-0}
 export SGLANG_MAMBA_SSM_DTYPE=${SGLANG_MAMBA_SSM_DTYPE:-float32}
 export TORCHDYNAMO_DISABLE=1
 export MAX_JOBS=4

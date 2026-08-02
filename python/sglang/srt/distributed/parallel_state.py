@@ -2073,6 +2073,108 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
+    # ------------------------------------------------------------------
+    # #201 slice 3: tensor-dict metadata shape cache (SGLANG_PP_SHAPE_CACHE).
+    #
+    # At the pipeline stage boundary the pickled metadata costs MORE than
+    # the bs=1 hidden-state payload itself (measured slice 2 on the 40G
+    # link: 249 us metadata vs 142 us payload one-way, 64% of the
+    # crossing), and the metadata is a pure function of the batch geometry
+    # -- static across decode rounds. With the cache on, a repeat crossing
+    # sends a 16-byte reference header instead of size + pickle.
+    #
+    # Protocol (per (peer, direction) channel, over the same FIFO gloo
+    # p2p ordering the stock size+pickle pair uses):
+    #   header [code, size] (2 x int64) --
+    #     code -k  : reuse mirrored cache entry k-1, no payload follows;
+    #     code  1  : `size` pickle bytes follow, BOTH ends append to their
+    #                mirror (ids assigned by arrival order, so they agree
+    #                without negotiation);
+    #     code  0  : `size` pickle bytes follow, uncached (sender mirror
+    #                full) -- the receiver must not append either.
+    # The env flag must be uniform across the world (it is inherited from
+    # the launcher; the cross-rig rank script exports it on both nodes) --
+    # a mixed setting would desynchronize the wire format.
+    # ------------------------------------------------------------------
+
+    #: Upper bound on mirrored shape-cache entries per peer. Distinct
+    #: metadata blobs are one per batch geometry (a handful for decode,
+    #: dozens for chunked prefill). Beyond the cap new blobs travel
+    #: uncached (code 0), so the mirrors stay in lockstep without any
+    #: eviction coordination.
+    SHAPE_CACHE_MAX_ENTRIES = 1024
+
+    @property
+    def _pp_shape_cache_enabled(self) -> bool:
+        cached = getattr(self, "_pp_shape_cache_flag", None)
+        if cached is None:
+            from sglang.srt.environ import envs
+
+            cached = bool(envs.SGLANG_PP_SHAPE_CACHE.get())
+            self._pp_shape_cache_flag = cached
+        return cached
+
+    def _send_tensor_dict_metadata(
+        self, metadata_list: List[Any], dst: int, async_send: bool
+    ) -> List[P2PWork]:
+        """Send a tensor dict's metadata list, through the shape cache when
+        SGLANG_PP_SHAPE_CACHE is on; stock send_object otherwise."""
+        if not self._pp_shape_cache_enabled:
+            return self.send_object(metadata_list, dst=dst, async_send=async_send)
+        send_func = torch.distributed.isend if async_send else torch.distributed.send
+        caches = getattr(self, "_shape_cache_send", None)
+        if caches is None:
+            caches = self._shape_cache_send = {}
+        cache: Dict[bytes, int] = caches.setdefault(dst, {})
+        blob = pickle.dumps(metadata_list)
+        p2p_works: List[P2PWork] = []
+        entry = cache.get(blob)
+        if entry is not None:
+            header = torch.tensor([-(entry + 1), 0], dtype=torch.long, device="cpu")
+            work = send_func(header, self.ranks[dst], group=self.cpu_group, tag=0)
+            if async_send:
+                p2p_works.append(P2PWork(work, header))
+            return p2p_works
+        code = 0
+        if len(cache) < self.SHAPE_CACHE_MAX_ENTRIES:
+            cache[blob] = len(cache)
+            code = 1
+        object_tensor = torch.frombuffer(blob, dtype=torch.uint8)
+        header = torch.tensor(
+            [code, object_tensor.numel()], dtype=torch.long, device="cpu"
+        )
+        work = send_func(header, self.ranks[dst], group=self.cpu_group, tag=0)
+        if async_send:
+            p2p_works.append(P2PWork(work, header))
+        work = send_func(object_tensor, self.ranks[dst], group=self.cpu_group, tag=0)
+        if async_send:
+            p2p_works.append(P2PWork(work, object_tensor))
+        return p2p_works
+
+    def _recv_tensor_dict_metadata(self, src: int) -> List[Any]:
+        """Receive what _send_tensor_dict_metadata sent (mirror side)."""
+        if not self._pp_shape_cache_enabled:
+            return self.recv_object(src=src)
+        caches = getattr(self, "_shape_cache_recv", None)
+        if caches is None:
+            caches = self._shape_cache_recv = {}
+        cache: List[Any] = caches.setdefault(src, [])
+        header = torch.empty(2, dtype=torch.long, device="cpu")
+        torch.distributed.irecv(
+            header, src=self.ranks[src], group=self.cpu_group, tag=0
+        ).wait()
+        code, size = int(header[0].item()), int(header[1].item())
+        if code < 0:
+            return cache[-code - 1]
+        object_tensor = torch.empty(size, dtype=torch.uint8, device="cpu")
+        torch.distributed.irecv(
+            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=0
+        ).wait()
+        obj = pickle.loads(object_tensor.numpy())
+        if code == 1:
+            cache.append(obj)
+        return obj
+
     def send_tensor_dict(
         self,
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
@@ -2111,7 +2213,7 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works = self._send_tensor_dict_metadata(metadata_list, dst, async_send)
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -2152,7 +2254,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self._recv_tensor_dict_metadata(src)
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):

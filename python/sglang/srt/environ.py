@@ -521,6 +521,14 @@ class Envs:
     # bytes and wall time at the two chokepoints every crossing passes through,
     # which is the only way to put a number on a boundary that spans two hosts.
     SGLANG_PP_BOUNDARY_STATS = EnvInt(0)
+    # #201 slice 3: cache the pickled tensor-dict METADATA at the pipeline
+    # stage boundary. At bs=1 the gloo-pickled metadata costs MORE than the
+    # hidden-state payload itself (measured slice 2: 249 us vs 142 us
+    # one-way), and the shapes are static per batch geometry -- so a repeat
+    # crossing sends a 16-byte reference instead of size+pickle. Mirrored
+    # sender/receiver caches stay in lockstep over the FIFO p2p channel.
+    # Off by default (byte-identical wire protocol unless set).
+    SGLANG_PP_SHAPE_CACHE = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
