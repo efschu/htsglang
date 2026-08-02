@@ -181,7 +181,7 @@ a separate pass.
 | F1 | `--kv-pressure-ladder auto` | INERT (hard-fails) | `build_ladder_from_server_args(sa, *, table_fn=None)` raises on `auto` when `table_fn is None`; the sole production caller `managers/kv_pressure_runtime.py:461` omits it. `planner/kv_ladder_table.build_ladder_table` exists and is tested but has zero production callers. | High | S |
 | F2 | `--lane-offload-profile` / `--lane-offload-class-policy` / `--lane-offload-park-targets` | INERT | `server_args._handle_lane_offload_register` validates then discards ("recomputed at configure time"). The configure-time entry `configure_global_register` has no production caller — only `test_offload_movement.py:640`. `get_global_register()` instead builds a bare `OffloadRegister()` on the default latency profile. | High | S–M |
 | F3 | #309 runtime drafter attach/detach | DEAD | `speculative/runtime_draft.py` (9 public defs, 65 tests, `docs/dev/TASK_309_RUNTIME_DRAFT.md`) has no production importer. Sibling `speculative/draft_selection.arms_from_server_args` likewise test-only. | High | L |
-| F4 | #394 cold expert tier | INERT (declared) | `layers/moe/cold_tier_shm.py`: no production importer. Self-declared in the merge message as "inert pending reachability slice 2" — recorded here so the state is visible to the suite, not only to git log. | Medium | L |
+| F4 | #394 cold expert tier | INERT (declared) — **FIXED**, see §7 | `layers/moe/cold_tier_shm.py`: no production importer. Self-declared in the merge message as "inert pending reachability slice 2" — recorded here so the state is visible to the suite, not only to git log. | Medium | L |
 | F5 | `layers/fused_qk_norm.py` | DEAD | Triton fused Q/K RMSNorm ported from ATOM. No importer anywhere in the tree. The similarly-named live path is `layers/fused_qk_norm_rope_store.py`, used by `models/deepseek_v4.py`; the two are unrelated. | Low | S (delete) |
 | F6 | #407 memtier registry | INERT | `srt/memtier/` (registry, tiers, probe, profile, reservations): zero production importers and zero production symbol references outside its own package. `SGLANG_MEMTIER_PROFILE` is read at `memtier/profile.py:361`, on a path a serving process never executes. Found independently by module reachability and by the env triage. | Medium | L |
 | F7 | `SGLANG_BARLINK_PP_TRANSPORT` | DEAD | Present only as a successor value in the retired-name guard (`barlink_env_guard.py:122`) and in a design doc. Not among the `_e()` suffixes read by `barlink_matrix.load_config`. The retired predecessor `SGLANG_HTCCL_PP_TRANSPORT` was introduced by the rename commit `6a5f307260` itself and never had a reader either. | Low | S |
@@ -270,6 +270,25 @@ slice 2", and `d71e7133d2` says "DELIBERATELY UNWIRED […] branch inert by
 construction". The audit's contribution is that Detector D found it from the
 code, and that the state is now pinned by a test instead of living only in a
 commit message.
+
+**Resolution (task #394 slice 2).** The routing half
+(`layers/moe/cold_tier_fetch.py`) now reaches the storage half from three
+production sites: the launcher mints the launch id
+(`entrypoints/engine.py`), the GGUF streaming door builds the owner handle
+and stashes the rank-uniform owner map
+(`layers/moe/fused_moe_triton/layer.py`), and `MoEExpertOffloadCache` turns
+the slice-1 refusal into a fetch route (`layers/moe/expert_offload.py`).
+The absence pin in `test_unwired_features_421.py` is retired per this
+document's own rule and replaced by a CALL-SITE pin,
+`test/registered/unit/layers/moe/test_cold_tier_wiring_394.py` — consumer
+counting finds absent wiring, only a call-site pin finds wiring a later
+refactor removes. The chain's behaviour is covered hermetically by
+`tests/moe_offload/test_cold_tier_fetch.py`.
+
+Two things stay honestly open, and neither is a wiring gap: the eager path is
+BOOT-PENDING (`scripts/dev/394_s2_proof/`), and the capturable path refuses by
+name until the UVA device pointer for a `cudaHostRegister`'d peer mapping is
+verified on hardware.
 
 ### F5 — dead ATOM port
 
@@ -495,7 +514,7 @@ each (§B.6).
 | F1 | High | **FIXED (boot-pending)** — `auto` gets the #272 planner's table injected | `managers/kv_ladder_auto.py` (new), `managers/kv_pressure_runtime.py` |
 | F2 | High | **FIXED (boot-pending)** — the three `--lane-offload-*` flags reach the register at runner init | `model_executor/offload_register.py`, `model_executor/model_runner.py`, `model_executor/offload_movement.py` |
 | F3 | High | open (L: needs the scheduler-side transition driver, not a wiring line) | pinned, unchanged |
-| F4 | Medium | open (self-declared inert, #394 reachability slice 2) | pinned, unchanged |
+| F4 | Medium | **FIXED (boot-pending)** — #394 slice 2 wires the fetch path; the tier has production importers and call-site pins | `layers/moe/cold_tier_fetch.py` (new), `layers/moe/expert_offload.py`, `layers/moe/fused_moe_triton/layer.py`, `entrypoints/engine.py` |
 | F5 | Low | **CLOSED — deleted** | `layers/fused_qk_norm.py` removed |
 | F6 | Medium | open (#407, no consumer yet) | pinned, unchanged |
 | F7 | Low | **CLOSED — kept, as a reservation, with a pointer** | `barlink_env_guard.py:122` |
@@ -712,17 +731,19 @@ half was not run at all.
 
 ## B.8 Pins
 
-Two of the eight #421 pins are retired, per their own instruction ("delete
-the pin, do NOT widen it"): `TestKvPressureLadderAutoIsUnreachable` (F1) and
-`TestOffloadRegisterProfileIsUnreachable` (F2). Four remain green (F3 ×2,
-F4, F6). `test_unwired_features_421.py` carries a comment naming what
-replaced each retired pin.
+Three of the eight #421 pins are retired, per their own instruction ("delete
+the pin, do NOT widen it"): `TestKvPressureLadderAutoIsUnreachable` (F1),
+`TestOffloadRegisterProfileIsUnreachable` (F2) and
+`TestColdTierShmIsUnreachable` (F4). Three remain green (F3 ×2, F6).
+`test_unwired_features_421.py` carries a comment naming what replaced each
+retired pin.
 
 Positive replacements, each with a documented can-fail proof:
 
 | file | covers |
 |---|---|
 | `test/registered/unit/managers/test_kv_ladder_auto_421.py` | F1: the runtime builds under `auto`; the profile is rank-uniform, UUID-keyed and refuses a mixed rig without a card vector; only wired reliefs are inventoried; the default path never evaluates the table source |
+| `test/registered/unit/layers/moe/test_cold_tier_wiring_394.py` | F4: the three call sites that carry the cold-tier chain (launcher launch id, GGUF owner handle, cache fetch route), an inverted importer pin, and the default path taking no cold-tier branch |
 | `test/registered/unit/model_executor/test_offload_register_wiring_421.py` | F2: all three flags observable in the register; planted typos refuse; once-per-process; and an AST pin on the **call site**, so a refactor cannot move the configure step after the first adapter read |
 | `test/registered/unit/layers/test_expert_offload_repack_door_421.py` | F8: eligibility classification, both refusal messages, the escape hatch, and the real entry point refusing before doing any work |
 | `test/registered/unit/distributed/test_barlink_dispatcher_inert_421.py` | F9: the overflow tier is reachable at exactly 1.0 and works with a measured threshold; `transport_hint` is pinned as an absence, and the hook is shown to work once a hint exists |

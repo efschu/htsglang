@@ -1392,8 +1392,17 @@ class FusedMoE(torch.nn.Module):
             return None
 
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.cold_tier_fetch import cold_tier_enabled
 
-        if not envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.get():
+        # #394 slice 2: the shared cold tier IS the reachability mechanism the
+        # refusal above names as missing. With it on, a delegated expert lives
+        # in a peer's named segment and any rank can DMA its row, so the
+        # premise of the refusal no longer holds. With it off the refusal is
+        # unchanged, because without a shared tier the expert really is absent.
+        if (
+            not cold_tier_enabled()
+            and not envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.get()
+        ):
             _warn_host_shard_unreachable_once()
             return None
 
@@ -1485,13 +1494,14 @@ class FusedMoE(torch.nn.Module):
 
         count = self._gguf_owned_expert_count(param)
         expert_shard = getattr(self, "_gguf_expert_shard", False)
+        cold_shard = self._gguf_cold_shard_context()
         plan = plan_load_time_staging(
             count,
             # The layer latched its fraction at construction; the cache sizes
             # itself from the SAME value, so the plan must not re-read the env.
             fraction=getattr(self, "_expert_offload_fraction", None),
             pinned_experts=(count - 1,) if expert_shard else (),
-            cold_shard=self._gguf_cold_shard_context(),
+            cold_shard=cold_shard,
         )
         if plan is None:
             # Too few experts to split at this fraction: fall back to the
@@ -1513,7 +1523,49 @@ class FusedMoE(torch.nn.Module):
             allocate,
             zero_experts=(count - 1,) if expert_shard else (),
             label=f"layer {getattr(self, 'layer_id', '?')} {attr}",
+            cold_tier=self._gguf_cold_tier_owner(plan, cold_shard),
+            param_attr=attr,
         )
+
+    def _gguf_cold_tier_owner(self, plan, cold_shard):
+        """#394 slice 2: the shared-segment handle for this layer, or ``None``.
+
+        Built once per layer and shared by the two stagers (``w13``/``w2``), so
+        one manifest entry describes both tensors and the layer is sealed once.
+        The owner map is stashed on the layer here rather than recomputed in
+        the cache: it is a pure function of the plan's cold pool and the
+        resolved ratio, so computing it twice could only introduce a way for
+        the two copies to disagree.
+        """
+        if plan is None or cold_shard is None or not plan.delegated_ids:
+            return None
+        from sglang.srt.layers.moe.cold_tier_fetch import (
+            assign_cold_experts,
+            cold_tier_enabled,
+            layer_key_for,
+            owner_for_layer,
+        )
+        from sglang.srt.registry.rank_cards import rank_card_uuids
+
+        if not cold_tier_enabled():
+            return None
+        existing = getattr(self, "_moe_cold_tier_owner", None)
+        if existing is not None:
+            return existing
+        world = int(self.moe_tp_size)
+        # The pool BEFORE the split: the owner map has to cover every cold
+        # expert, not just the ones this rank kept.
+        cold_pool = tuple(sorted(set(plan.spill_ids) | set(plan.delegated_ids)))
+        layer_key = layer_key_for(self)
+        self._moe_cold_tier_assignment = assign_cold_experts(
+            cold_pool, cold_shard.ratio, int(self.moe_tp_rank), world
+        )
+        self._moe_cold_tier_layer_key = layer_key
+        owner = owner_for_layer(
+            layer_key, int(self.moe_tp_rank), world, rank_card_uuids(world)
+        )
+        self._moe_cold_tier_owner = owner
+        return owner
 
     def _drain_gguf_stream_stagers(self) -> bool:
         """Close the streaming stagers and publish their tiers. True if any.
@@ -1544,6 +1596,16 @@ class FusedMoE(torch.nn.Module):
             param = getattr(self, attr)
             param.expert_data_map = {}
             param.data_container = []
+        # #394 slice 2: every cold row of this layer is now written, so the
+        # segment headers can be stamped and the manifest (re)published. Seal
+        # LAST, always: before it the magic is zero and a peer that maps the
+        # segment early refuses instead of reading a half-filled pool.
+        cold_tier_owner = getattr(self, "_moe_cold_tier_owner", None)
+        if cold_tier_owner is not None:
+            # Dropped before sealing so a second drain (the method is
+            # idempotent by contract) cannot re-stamp a live segment.
+            self._moe_cold_tier_owner = None
+            cold_tier_owner.seal()
         if not getattr(self, "_gguf_stream_layer_closed", False):
             # The layer never reached both-tensors-complete during the stream
             # (a checkpoint with only one expert tensor, say), so its boundary

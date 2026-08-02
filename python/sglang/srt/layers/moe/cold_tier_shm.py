@@ -92,6 +92,7 @@ __all__ = [
     "read_peer_manifest",
     "attach_peer_segment",
     "detach_all",
+    "register_for_dma",
     "shm_capacity_bytes",
     "preflight",
     "peer_row_view",
@@ -503,6 +504,17 @@ def attach_peer_segment(layout: ColdTierLayout, register_with_cuda: bool = True)
         _register_host_memory(mm, path)
     _ATTACHED[path] = mm
     return mm
+
+
+def register_for_dma(mm, label: str) -> None:
+    """Pin a mapping this process OWNS, so its own H2D stays async (#394 s2).
+
+    Same call as the peer path below, exported because the owner has the same
+    need: once a rank's cold pool lives in a shared segment rather than in a
+    ``pin_memory()`` allocation, nothing else page-locks it, and an unpinned
+    source silently turns every local spill fetch into a synchronous copy.
+    """
+    _register_host_memory(mm, label)
 
 
 def _register_host_memory(mm, path: str) -> None:

@@ -296,6 +296,10 @@ class LayerExpertStats:
                     "overflow_forwards",
                     "waves",
                     "h2d_bytes",
+                    # #394 slice 2: the share of the above that came out of a
+                    # PEER's shared cold-tier segment.
+                    "remote_fetches",
+                    "remote_h2d_bytes",
                 )
                 if hasattr(residency, name)
             }
@@ -398,6 +402,27 @@ class ExpertStatsCollector:
                 for entry in layers
                 if entry.get("host_shard")
             )
+            # #394 slice 2: HOW a delegated expert is reached, lifted the same
+            # way. A proportional arm whose reachability is not
+            # "shared-cold-tier" ran the baseline, and a dump that only carried
+            # the policy could not tell the two apart a week later.
+            reach = {
+                entry["host_shard"].get("reachability", "unknown")
+                for entry in layers
+                if entry.get("host_shard")
+            }
+            totals["host_shard_reachability"] = (
+                reach.pop() if len(reach) == 1 else "mixed"
+            )
+        # The fetch tally the arm is actually read on. Summed here so the
+        # readout does not have to walk 43 layers to answer "did any byte come
+        # from a peer".
+        totals["h2d_bytes"] = sum(
+            entry.get("residency", {}).get("h2d_bytes", 0) for entry in layers
+        )
+        totals["remote_h2d_bytes"] = sum(
+            entry.get("residency", {}).get("remote_h2d_bytes", 0) for entry in layers
+        )
         return {
             "schema": "sglang.expert_stats/1",
             "reason": reason,

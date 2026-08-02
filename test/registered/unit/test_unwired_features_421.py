@@ -174,24 +174,21 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
         )
 
 
-class TestColdTierShmIsUnreachable(CustomTestCase):
-    """#394 reachability slice 1: the cold expert tier has no production user.
-
-    ``layers/moe/cold_tier_shm.py`` provides the shared-host-memory segment
-    primitive (create/seal/publish/attach/peer views). The merge that landed
-    it recorded the placement policy as "inert pending reachability slice 2".
-    This pin makes that state visible to the test suite instead of only to a
-    commit message.
-    """
-
-    def test_no_production_importer(self):
-        importers = _production_importers_of("sglang.srt.layers.moe.cold_tier_shm")
-        self.assertEqual(
-            importers,
-            [],
-            "GOOD NEWS: the cold tier is now attached from production "
-            f"({importers}). #421 finding F4 is fixed -- delete this pin.",
-        )
+# RETIRED PIN -- #421 F4 is FIXED (task #394 slice 2).
+#
+# ``TestColdTierShmIsUnreachable`` asserted that
+# ``layers/moe/cold_tier_shm.py`` had no production importer. It has one now:
+# ``layers/moe/cold_tier_fetch.py`` is the routing half, reached from the GGUF
+# streaming door (``fused_moe_triton/layer.py``) and from the launcher
+# (``entrypoints/engine.py``). Per this file's own rule the pin is deleted
+# rather than widened, and replaced by
+# ``test/registered/unit/moe/test_cold_tier_wiring_394.py``, which asserts the
+# POSITIVE fact and pins the CALL SITES -- so a refactor cannot quietly drop
+# the fetch route and leave the module importable but unreached again.
+#
+# The replacement carries can-fail proofs (see its module docstring), and the
+# hermetic behaviour of the chain is covered by
+# ``tests/moe_offload/test_cold_tier_fetch.py``.
 
 
 class TestMemTierRegistryHasNoConsumers(CustomTestCase):

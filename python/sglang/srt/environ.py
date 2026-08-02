@@ -1151,6 +1151,26 @@ class Envs:
     # pool, or replicated experts with an EP dispatch) against a real boot. It
     # is not a performance option.
     SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE = EnvBool(False)
+    # #394 slice 2: put this rank's cold expert pool in a NAMED SHARED segment
+    # (/dev/shm) instead of a private pinned allocation, and publish a manifest
+    # so peers can DMA a delegated expert's row out of it. This is the
+    # reachability mechanism the refusal above names as missing: with it on, a
+    # delegated cold expert is relocated rather than absent. Off by default --
+    # the tier costs a tmpfs-visible allocation and the shm size cap is not
+    # restart-persistent, so it is an explicit operator decision.
+    SGLANG_MOE_COLD_TIER_SHM = EnvBool(False)
+    # Bounded wait for a peer's cold-tier manifest at the FIRST fetch, which is
+    # long after every rank has loaded. Not a barrier: it expires with a named
+    # error rather than hanging the group.
+    SGLANG_MOE_COLD_TIER_MANIFEST_TIMEOUT_S = EnvFloat(30.0)
+    # #394 slice 2, graph seam: capture a decode graph over a layer whose cold
+    # rows live in a peer's segment. BOOT-PENDING -- the UVA device pointer for
+    # a peer mapping needs cudaHostGetDevicePointer on the registered range and
+    # has not been exercised on hardware, so the capturable installer refuses
+    # by default rather than capturing a graph over an address it has not
+    # verified. Graphs pin ADDRESSES, not contents, so the seam is sound in
+    # principle; this flag exists to prove it in a card window.
+    SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE = EnvBool(False)
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;
