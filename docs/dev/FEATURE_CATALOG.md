@@ -179,7 +179,9 @@ measured/estimate/absent provenance, one-click knee-point probe, self-update
 with auto-rollback, GitHub result posting (opt-in PAT).
 
 ## 15. Model bring-ups (boot-proven)
-Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip),
+Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;
+Gemma3RMSNorm runs the fused sgl-kernel path for 2-D and high-rank inputs,
+adopted from upstream #32670 — do not re-add an eager-only forward_cuda),
 Llama family, Mistral Small 24B FP8 + ministral3 SWA fix, Deckard-40B/Tess-27B,
 122B-A10B offloaded, 35B-A3B, DeepSeek-V4-Flash-0731 GGUF TP=3 offloaded with
 OWN sm86+sm120 attention paths (e4m3 bit-decode, f32 staging, indexer arch
