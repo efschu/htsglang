@@ -148,6 +148,11 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             presplit_expert_offload_after_repack,
         )
 
+        # #421 F8: no ``cold_shard=`` here, deliberately. The #394
+        # link-proportional cold-expert policy is REFUSED at this door --
+        # see expert_offload.refuse_cold_shard_at_repack_door for the
+        # measured reason. Passing one raises rather than staging a plan
+        # whose delegated experts no rank can reach.
         presplit_expert_offload_after_repack(layer)
 
     def apply_weights(
@@ -441,6 +446,11 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
             presplit_expert_offload_after_repack,
         )
 
+        # #421 F8: no ``cold_shard=`` here, deliberately. The #394
+        # link-proportional cold-expert policy is REFUSED at this door --
+        # see expert_offload.refuse_cold_shard_at_repack_door for the
+        # measured reason. Passing one raises rather than staging a plan
+        # whose delegated experts no rank can reach.
         presplit_expert_offload_after_repack(layer)
 
     def apply_weights(

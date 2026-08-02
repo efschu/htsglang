@@ -3083,6 +3083,86 @@ def _load_hotset_file(path: str) -> dict:
     return data
 
 
+def repack_door_shards_experts_on_dim0(layer) -> bool:
+    """Does this marlin-repack layer hold a DISJOINT slice of the expert set?
+
+    The two ways a FusedMoE layer ends up expert-major-sharded: expert
+    parallelism (``moe_ep_size > 1``, with ``expert_map`` remapping foreign
+    ids away) and the #82 GGUF expert-dim shard. Anything else is an
+    intermediate-dim TP MoE, which holds an essential slice of EVERY expert
+    and can therefore delegate none of them.
+    """
+    if getattr(layer, "_gguf_expert_shard", False):
+        return True
+    return int(getattr(layer, "moe_ep_size", 1) or 1) > 1
+
+
+def refuse_cold_shard_at_repack_door(layer) -> None:
+    """#421 F8 / #394: the marlin-repack door does not take a cold shard.
+
+    The #394 link-proportional cold-expert policy has two load-time doors.
+    ``a2b21c2880`` wired the GGUF one; this one stayed at ``cold_shard=None``
+    at every production call site, and the merge message nonetheless claimed
+    both halves "take their layout from ONE plan object". The audit recorded
+    that as partial wiring. This function is the resolution, and it is a
+    refusal rather than a wiring for a reason that was measured, not assumed:
+
+    ``partition_cold_experts`` keeps this rank's share of ITS OWN cold experts
+    and drops the rest -- delegating the remainder to a peer's host tier. That
+    is sound only if a delegated expert stays REACHABLE from the rank whose
+    router asks for it. It does not: booted on the reference rig 2026-08-02
+    (V4-Flash UD-IQ3_XXS, TP=3) the GGUF door died on the first forward inside
+    ``ExpertResidencyPlanner.resolve`` -- "experts [80, 83, 94] were delegated
+    to a peer rank's host tier ... but this rank's router asked for them".
+    A delegated expert under a disjoint expert shard is not relocated, it is
+    absent.
+
+    The precondition documented for THIS door -- "only legal on a layer that
+    shards experts on dim 0 and remaps foreign ids away" -- is exactly the
+    disjoint-shard case, i.e. exactly the case in which delegation is unsound.
+    So the door is shut in both directions:
+
+    * an intermediate-dim TP MoE cannot delegate at all (nothing is
+      expert-major here);
+    * an EP / GGUF-expert-shard layer could delegate structurally, but the
+      delegated experts would be unreachable.
+
+    Until a reachability mechanism exists (shared pinned host pools a rank can
+    DMA out of, or EP-style dispatch to the owner), the honest answer is that
+    no production caller passes a cold shard, and one that does gets this
+    error instead of a load that dies on the first token.
+    ``SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE`` -- the same escape hatch the
+    GGUF door carries -- exists so the mechanism can be developed against a
+    real boot. It is not a performance option.
+    """
+    from sglang.srt.environ import envs
+
+    eligible = repack_door_shards_experts_on_dim0(layer)
+    if eligible and envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.get():
+        return
+    if not eligible:
+        why = (
+            "this layer is an intermediate-dim TP MoE: it holds an essential "
+            "slice of EVERY expert (moe_ep_size=1, no GGUF expert-dim shard), "
+            "so there is no whole expert it could delegate"
+        )
+    else:
+        why = (
+            "this layer shards experts disjointly, which is exactly when a "
+            "delegated expert becomes UNREACHABLE rather than relocated -- "
+            "measured on the reference rig 2026-08-02, the router asks for "
+            "experts no rank holds and the first forward dies. Set "
+            "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE=1 only to develop the "
+            "missing reachability mechanism against a real boot"
+        )
+    raise ValueError(
+        "presplit_expert_offload_after_repack(cold_shard=...) is refused "
+        f"(#394 / #421 F8): {why}. Every production caller (fp8.py, "
+        "gptq_moe.py, awq_moe.py) passes no cold shard, and that is the "
+        "intended state, not an oversight."
+    )
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -3099,17 +3179,24 @@ def presplit_expert_offload_after_repack(
 
     The layout now comes from ``plan_load_time_staging`` -- the same plan the
     #123-GGUF half stages against -- so the two halves cannot drift apart and
-    both honour a non-static layout. With no ``cold_shard`` (every caller
-    today: fp8.py, gptq_moe.py, awq_moe.py) the plan is the static ``[0,R)``
-    one and the copies below are the same two slices as before.
+    both honour a non-static layout. With no ``cold_shard`` (every production
+    caller today: fp8.py, gptq_moe.py, awq_moe.py) the plan is the static
+    ``[0,R)`` one and the copies below are the same two slices as before.
 
-    ``cold_shard`` (#394) is only legal on a layer that shards experts on dim 0
-    and remaps foreign ids away; an intermediate-dim TP MoE holds an essential
-    slice of every expert and can delegate none of them.
+    ``cold_shard`` (#394) is REFUSED here by default, and the refusal is a
+    measurement rather than caution -- see
+    :func:`refuse_cold_shard_at_repack_door` for the reason and the escape
+    hatch. #421 F8 recorded this door as the second, unwired half of the #394
+    policy; the honest resolution is the named refusal, not a wiring, because
+    the door's own precondition (experts sharded on dim 0) is exactly the case
+    in which delegation was measured to be unsound.
     """
     import torch
 
     from sglang.srt.layers.moe.resident_fraction import resident_fraction_for_rank
+
+    if cold_shard is not None:
+        refuse_cold_shard_at_repack_door(layer)
 
     # SIZING: drives plan_load_time_staging below, i.e. the resident set and
     # every buffer booked against this rank's VRAM.
