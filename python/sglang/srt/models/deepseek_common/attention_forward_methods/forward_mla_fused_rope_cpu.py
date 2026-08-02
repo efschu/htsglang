@@ -31,9 +31,9 @@ class DeepseekMLACpuForwardMixin:
             )
 
         # This runs from DeepseekV2AttentionMLA.__init__ on every device, so
-        # it must not assume a dense weight exists. `is_packed_weight` names
-        # the AWQ family only; GGUF and GPTQ are packed too and carry
-        # `qweight`, for which the dtype resolves to None -> neither fast path.
+        # it must not assume a dense weight exists. Every packed format (awq,
+        # gptq, auto-round, gguf, ...) carries `qweight` instead, for which
+        # the dtype resolves to None -> neither fast path.
         fused_a_dtype = (
             dense_weight_dtype(self.fused_qkv_a_proj_with_mqa)
             if self.has_fused_proj and not self.is_packed_weight

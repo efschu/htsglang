@@ -17,7 +17,7 @@ Anything not read is marked UNVERIFIED and is not stated as fact.
 | 4 | PR #33276 DSpark NVFP4 (mmangkad) | **adopt now** | same gap in our tree, merged upstream, one line |
 | 5 | PR #33287 DSpark DP counts | **adopt now** | same gap in our tree, one line, latent here |
 | 6 | Issue #33289 multi-node deadlock | watch + draft comment | diagnosis stuck at zero comments; the reporter asks for exactly our #431 pattern |
-| — | PR #33272 closed unmerged | confirmed folded into #33271 | author's own closing comment; defect not reachable here |
+| — | PR #33272 closed unmerged | confirmed folded into #33271; classification adopted in #443 | author's own closing comment; the crash is not reachable here, the misclassification was |
 | — | PR #33279 Weight Daemon | note only | re-opens the grounds of a BLOCKED planner entry |
 
 ## 1 — PR #33291, Decode-Verify-Rollback
@@ -344,15 +344,38 @@ attribute 'weight'` at `deepseek_v2.py:783`) — every number he had reported on
 #33271 was produced with this fix applied out of tree. The commit is unchanged
 as `9c13c04f` on `sm80-dsv4-sparse-decode`. The briefing's guess was right.
 
-**Not applicable here.** Our tree already immunized all three `.weight`-read
-sites by a different route — a `dense_weight_dtype()` helper that returns `None`
-for a packed layer: `models/deepseek_v2.py:425`, `:439`, `:856-862`. The
-quant-name enumeration still exists at `:844-850` and `:1876-1881`, but it no
-longer feeds an unguarded `.weight.dtype`, and the comments at `:851-856` and
-`:1882-1887` name GGUF and GPTQ explicitly. The fourth site #33272 guards
-(`_q_b_proj_verified_shape`) does not exist here at all. Upstream's
-classify-by-built-layer is arguably the cleaner rule; adopting it would be a
-style change, not a fix.
+**The crash is not reachable here; the misclassification was.** Our tree had
+already immunized all three `.weight`-read sites by a different route — a
+`dense_weight_dtype()` helper that returns `None` for a packed layer:
+`models/deepseek_v2.py:425`, `:439`, `:856-862`. The fourth site #33272 guards
+(`_q_b_proj_verified_shape`) does not exist here at all.
+
+What the sweep got wrong was calling the remaining quant-name enumeration at
+`:844-850` and `:1876-1881` a style question. `DeepseekV2AttentionMLA.is_packed_weight`
+is a published attribute — `kimi_k25_eagle3` writes it, the CPU fused-rope
+selector reads it — and it answered `False` for a layer that carries `qweight`
+and no `weight`. That is a wrong answer to a question other code asks, whether
+or not today's readers happen to survive it.
+
+**Resolved in #443** (`fix/dsv2-packed-classify-443`): packed-ness is now
+`getattr(layer, "weight", None) is None` via
+`deepseek_common/utils.py::is_packed_layer`, at both DeepSeek sites and at the
+`kimi_k25_eagle3` writer. Falsifier
+`test/registered/unit/models/test_deepseek_packed_layer_classification_443.py`.
+The sweep of that task also found three same-shaped sites that are NOT
+defanged and are still open: `glm4_moe.py:485-498` (unguarded `.weight.dtype`
+behind the same name list — a live `AttributeError` for a GGUF/GPTQ GLM-4 MoE
+checkpoint), `glm4_moe_lite.py:269-278` (classifies every quantized layer as
+packed, so its fp8/int8 shared-expert path can never be selected), and the
+`cat_dim` layout enumeration at `deepseek_weight_loader.py:369-374` plus its
+copies in `longcat_flash.py:999`, `longcat_flash_nextn.py:632` and
+`bailing_moe_linear.py:1548`. That last family is a layout question rather than
+a packed/dense one, and it needs its own task: GPTQ's `qweight` is
+`(in/pack, out)` with `output_dim=1`
+(`quantization/gptq/schemes/gptq_linear.py:81-89`), i.e. it needs the same
+`cat_dim=1` the list grants AWQ and does not get, while its `g_idx` is a
+`RowvLLMParameter` with no output dim at all and cannot be concatenated on
+either axis. Do not patch that one from the desk.
 
 ## PR #33279 — Weight Daemon, relevance to #305 / #329
 
