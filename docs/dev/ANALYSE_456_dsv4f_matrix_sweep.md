@@ -82,6 +82,53 @@ existing `expert_stats_*.json` artifacts (§2.2 cell 4's path) at desk cost
 before any GPU arm, and the GPU confirmation follows in the next window
 (`ROADMAP_456_matrix_execution.md` WAVE 1/WAVE 2).
 
+> **CORRECTION / UPDATE, 2026-08-03 (#302a desk falsifier ran).** The cell above
+> was written as a prediction. It has now been falsified against data, and the
+> prediction was conservative. Evidence:
+> `scripts/dev/302a_heat_desk/RESULTS.md`, computed over the recorded
+> `expert_stats_*.json` of four independent boots.
+>
+> * The static layout is reconstructed from `plan_load_time_staging`'s own rule
+>   and reproduces the recorded per-rank hit rates 0.7623 / 0.8427 / 0.8463 with
+>   **delta 0.0000** — the gate that says the simulation measures the real
+>   placement rather than a model of it.
+> * The **oracle ceiling at the SAME resident-set size** is
+>   **0.9836 / 0.9844 / 0.9850**, i.e. **+22.12 / +14.18 / +13.87 pp**. The
+>   "0.81 toward 0.9+" this section estimated understates the headroom: the
+>   ceiling is 0.98, and with the #82 pad expert's structural always-hit
+>   excluded the static set catches 0.42-0.48 of the routed mass against an
+>   oracle 0.94-0.96.
+> * **Achievable, not just ceiling**: a ranking trained on one boot and scored on
+>   another — a different day, a different workload, i.e. the limit case of
+>   staleness — captures **40-83 %** of that ceiling (+1.24 to +18.26 pp across
+>   the 4x4 x 3-rank matrix, 57-83 % within the same-day family). Every
+>   off-diagonal cell is positive.
+> * Verdict **MATERIAL**, far above the 2-3 pp weak threshold. Built and merged
+>   off by default as `SGLANG_MOE_HEAT_MIGRATION`
+>   (`layers/moe/expert_heat_migration.py`); the GPU arm is
+>   `scripts/dev/302a_heat_desk/AB_SPEC.md` and is **BOOT-PENDING**. Hit rate is
+>   a necessary condition for the H2D reduction this section prices, not a
+>   decode measurement — no tok/s figure exists for this cell yet.
+>
+> **Honest scope of what the artifacts could answer.** They hold whole-run
+> per-expert totals, not a per-token routing trace, so an intra-run WINDOWED
+> simulation (re-rank every N steps from the preceding N steps) is not computable
+> from them; the cross-run transfer test above is the substitute and is harsher
+> than the thing it substitutes for.
+>
+> **Sub-cell #302-lookahead ("does layer N's top-k predict layer N+1's"):
+> REFUTED at the aggregate grain.** Adjacent-layer heat correlation is
+> indistinguishable from zero — mean Spearman between -0.03 and +0.01 with no
+> consistent sign across ranks, top-R set overlap on the chance line `R/E` to
+> within 2.5 pp, and top-8 overlap at or below chance once the pad expert (which
+> is the top expert in every layer) is removed. Two consequences worth carrying:
+> a cross-layer prefetch hint has nothing to work with at this grain, and one
+> shared heat ranking cannot serve several layers, so #302a being per-layer is a
+> measured requirement rather than a conservative default. This does NOT refute a
+> PER-TOKEN cross-layer correlation, which these artifacts cannot see;
+> `SGLANG_MOE_OFFLOAD_TRACE` already logs what that would need and it is a
+> separate cheap desk item.
+
 **#302b — cold experts under CUDA graphs.** A decode graph is captured
 against **slot addresses**, not against which expert occupies a slot at
 replay time — this is the structural fact `NOTE_452_desync_boot_refutation.md`

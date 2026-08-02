@@ -42,7 +42,7 @@ BOOT-PENDING in full; nothing in this wave has run as of this document.
 
 | order | item | task # | prerequisite / gate | evidence expected |
 |---|---|---|---|---|
-| 1 | #302a heat migration — build the falsifier | #302a | none — runs against existing `expert_stats_*.json` (`ANALYSE_456` §2.2 cell 4 path) | desk-computed layer-to-layer top-k correlation and a projected hit-rate lift; GPU arm follows in WAVE 2 |
+| 1 | #302a heat migration — build the falsifier | #302a | none — runs against existing `expert_stats_*.json` (`ANALYSE_456` §2.2 cell 4 path) | **DONE 2026-08-03.** Falsifier + feature merged off by default. Oracle ceiling +13.9 to +22.1 pp at unchanged residency, cross-boot transfer captures 40-83 % of it; the layer-to-layer top-k correlation this row asked for came back at CHANCE and the lookahead sub-cell is refuted (`scripts/dev/302a_heat_desk/RESULTS.md`, `ANALYSE_456` §2.2 correction). GPU arm spec: `scripts/dev/302a_heat_desk/AB_SPEC.md`, BOOT-PENDING |
 | 2 | #450 dual-lane collision family | #450 | already running per user note; no new gate | whatever that family's own falsifiers report |
 | 3 | #306 lossless cold-tier compression — desk falsification | #306 | none — sample-based, no card (`ANALYSE_456` §2.2 cell 2) | achievable zstd-after-byte-plane-split ratio, per asset type (expert tensors, fp8-KV blocks, GDN blobs, hibernate images), honest verdict per type including "not worth it" |
 | 4 | #363 slice 1: worth-it autocheck + rung-0 dual residency | #363 | **this docs merge** (the present task) | `DESIGN_363_regime_controller.md` §20.1/§20.3 move from decided-on-paper to built |
@@ -54,7 +54,7 @@ BOOT-PENDING in full; nothing in this wave has run as of this document.
 
 | item | task # | prerequisite / gate | evidence expected |
 |---|---|---|---|
-| Heat-migration A/B (hit-rate + decode) | #302a | WAVE 1 item 1's desk falsifier passing | hit-rate delta (0.81 -> target) and decode tok/s delta, both against an A-vs-A floor on the SAME workload |
+| Heat-migration A/B (hit-rate + decode) | #302a | WAVE 1 item 1's desk falsifier passing — **cleared 2026-08-03** | hit-rate delta and decode delta against an A-vs-A floor on the SAME workload. Spec written: `scripts/dev/302a_heat_desk/AB_SPEC.md` (three boots, floor inside the control boot, per-rank read, four named falsifiers). The desk projection to beat is 0.7623/0.8427/0.8463 -> the in-family transfer band; the ceiling is 0.98 |
 | #452 sizing probe, if not done in WAVE 0 | #452 | WAVE 0's optional slot, deferred if skipped | VRAM/launch-overhead price of the breakable route for DSV4-Flash |
 | FP8xbar1 fresh speed run | #431/#438 unlock | barlink-default order (cross-cutting rule above) | headline barlink row for FP8, current state per `docs/rig-runbook.md` note: "unlocked since #431/#438, fresh speed run pending" |
 | 128K/256K long-context arm on the proven HiCache host tier | #441c | HiCache shim-free tier proven (tonight, per `ANALYSE_456` §3) | `max_total_num_tokens` at 128K/256K without additional VRAM, against the current 42240-class cap (flagged as an unverified figure in `ANALYSE_456` §3 — re-confirm on this boot's own plan log) |

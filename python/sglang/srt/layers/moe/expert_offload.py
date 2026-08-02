@@ -1237,6 +1237,12 @@ class ExpertStagingPlan:
     spill_ids: Tuple[int, ...]
     delegated_ids: Tuple[int, ...] = ()
     host_shard: Optional[str] = None
+    # The ``pinned_experts`` argument, carried forward. #302a needs it: a
+    # migration must never demote an expert that was pinned for a structural
+    # reason (the #82 pad expert every foreign token collapses onto), and
+    # re-deriving that rule at the consumer is exactly the "private list"
+    # duplication the plan object exists to prevent.
+    pinned_ids: Tuple[int, ...] = ()
 
     @property
     def is_static_layout(self) -> bool:
@@ -1344,6 +1350,7 @@ def plan_load_time_staging(
         spill_ids=tuple(spill_ids),
         delegated_ids=delegated_ids,
         host_shard=host_shard,
+        pinned_ids=tuple(pinned),
     )
 
 
@@ -1457,6 +1464,10 @@ def register_load_time_presplit(layer, attr, resident_buf, spill, plan):
             list(plan.resident_ids),
             list(plan.spill_ids),
         )
+    if plan.pinned_ids:
+        # #302a: which ids are pinned for a structural reason, so a later
+        # migration cannot demote them.
+        layer._moe_offload_pinned_experts = list(plan.pinned_ids)
     if plan.delegated_ids:
         # #394: the cache turns this into a named refusal if a delegated expert
         # ever reaches this rank's router, instead of a missing pool row.
@@ -2459,6 +2470,24 @@ class MoEExpertOffloadCache:
         self._hot_frozen = False
         self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
 
+        # --- #302a Stage-2 heat migration -----------------------------------
+        # Stage-1 above freezes a residency choice once. This keeps re-ranking
+        # it against a decayed window of live routing, swapping EQUAL COUNTS
+        # (hot in, cold out) so residency size -- the #439 sizing latch's
+        # invariant -- never moves. Off by default; the default path pays one
+        # `if self._heat is not None` per forward.
+        from sglang.srt.layers.moe.expert_heat_migration import (
+            HeatMigrationConfig,
+            HeatWindow,
+            refuse_heat_migration_under_graph_capture,
+        )
+
+        heat_cfg = HeatMigrationConfig.from_env()
+        refuse_heat_migration_under_graph_capture(heat_cfg)
+        self._heat: Optional[HeatWindow] = (
+            HeatWindow(heat_cfg) if heat_cfg.enabled else None
+        )
+
         # --- #123-GGUF: residency decided at LOAD time -----------------------
         # A load-time stager that could not use the plain [0,R) layout (the GGUF
         # uneven-TP shard must keep its zero-padding expert resident) publishes
@@ -2558,6 +2587,14 @@ class MoEExpertOffloadCache:
             # histogram and what the offload actually paid for it land in one
             # file instead of two places.
             self._router_stats.residency = self.planner.stats
+            # #302a: the migration counters, so a dump says how often the
+            # resident set was re-ranked and what the window hit rate was doing
+            # while it happened. Held by reference; `None` when the feature is
+            # off, which is how a dump distinguishes "no migrations happened"
+            # from "migration was not enabled".
+            self._router_stats.heat_migration = (
+                self._heat.stats if self._heat is not None else None
+            )
             # #394: the placement policy this layer was staged under, so the
             # dump names its own A/B arm (see publish_host_shard_on_layer),
             # plus how a delegated expert is REACHED. Without the second field
@@ -3031,6 +3068,18 @@ class MoEExpertOffloadCache:
             if self._hot_seen >= self._hot_calib_steps:
                 self._freeze_hotset()
 
+        # #302a Stage-2: fold this forward into the heat window and, when the
+        # period is up, migrate. Placed here for the same reason the Stage-1
+        # freeze is: this is BETWEEN two forwards' compute, before this
+        # forward's own resolve/fetch, so no wave is reading a slot while it is
+        # rewritten and the triggering forward already sees the new layout.
+        if self._heat is not None:
+            self._heat.observe(
+                ids_list, self.planner.resident_ids, self.resident_count
+            )
+            if self._heat.due():
+                self._migrate_heat()
+
         if self._wave_order == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave
             # case is bit-for-bit the token-major fast path below.
@@ -3366,6 +3415,125 @@ class MoEExpertOffloadCache:
         self._spill_pool_index = spill_pool_index
         self._hot_frozen = True
 
+    # --- #302a Stage-2 heat migration --------------------------------------
+    def _current_layout_maps(self):
+        """``(resident_ids, resident_slot, spill_pool_index)``, materialised.
+
+        On the untouched static layout all three are implicit (``[0,R)`` at
+        ``slot == id``, pool row ``id - R``). A migration has to permute them,
+        so the first one materialises the implicit form rather than special-
+        casing every later read.
+        """
+        R = self.resident_count
+        E = self.num_local_experts
+        resident_ids = self.planner.resident_ids
+        resident_slot = self.planner.resident_slot
+        pool_index = self._spill_pool_index
+        if resident_ids is None:
+            resident_ids = frozenset(range(R))
+        if resident_slot is None:
+            resident_slot = {e: e for e in range(R)}
+        if pool_index is None:
+            pool_index = {e: e - R for e in range(R, E)}
+        return resident_ids, dict(resident_slot), dict(pool_index)
+
+    def _migrate_heat(self):
+        """One re-rank round: plan equal-count swaps, execute them, close the
+        window. Called between two forwards, never inside a wave."""
+        import logging
+
+        heat = self._heat
+        resident_ids, resident_slot, pool_index = self._current_layout_maps()
+        pinned = frozenset(
+            int(e)
+            for e in getattr(self.layer, "_moe_offload_pinned_experts", ()) or ()
+        )
+        swaps = heat.plan(
+            resident_ids,
+            pinned=pinned,
+            delegated=self.planner.delegated_ids,
+        )
+        if swaps:
+            self._apply_heat_swaps(swaps, resident_ids, resident_slot, pool_index)
+            heat.stats.rounds_migrating += 1
+            logging.getLogger(__name__).debug(
+                "MoE heat migration on layer %s: %d swap(s) %s",
+                getattr(self.layer, "layer_id", "?"),
+                len(swaps),
+                [f"{h}<-in/{c}->out" for h, c in swaps],
+            )
+        heat.close_round()
+
+    def _apply_heat_swaps(self, swaps, resident_ids, resident_slot, pool_index):
+        """Exchange each ``(promote, demote)`` pair in place.
+
+        VRAM-neutral by construction: no tensor is allocated on the device and
+        no tensor changes shape. Per pair and per expert-major attribute the
+        exchange is three copies through ONE host row of scratch --
+
+            tmp        <- pool[j]     (host->host; the promoted expert's bytes)
+            pool[j]    <- buf[i]      (D2H; the victim takes the freed pool row)
+            buf[i]     <- tmp         (H2D; the promoted expert takes the slot)
+
+        -- so the resident buffer keeps its ``R + C`` rows, the pinned pool
+        keeps its ``E - R`` rows, and the only thing that changed is which
+        expert is addressed by which index.
+
+        The two ``torch.cuda.synchronize()`` calls are load-bearing. Slot ``i``
+        may still be under read by the previous forward's grouped GEMM enqueued
+        on the compute stream (the write-after-read hazard ``_fetch`` documents
+        for the scratch region applies verbatim to the resident region), and the
+        D2H must land before the maps are installed. A round happens once per
+        ``SGLANG_MOE_HEAT_PERIOD`` forwards, so a full sync is the cheap,
+        obviously correct choice over an event dance.
+        """
+        import torch
+
+        if self._capturable_ready:
+            raise RuntimeError(
+                "heat migration after install_capturable_buffers(); a captured "
+                "gather's LUTs pin the residency layout, so the slot contents "
+                "must not move underneath them (#302a / #452)"
+            )
+        stats = self._heat.stats
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        for attr in list(self._resident.keys()):
+            buf = self._resident.get(attr)
+            pool = self._pinned.get(attr)
+            if buf is None or pool is None:
+                continue
+            per_expert = buf[0].numel() * buf.element_size()
+            for hot, cold in swaps:
+                i = resident_slot[cold]
+                j = pool_index[hot]
+                tmp = pool[j].clone()
+                pool[j].copy_(buf[i])
+                buf[i].copy_(tmp)
+                stats.d2h_bytes += per_expert
+                stats.h2d_bytes += per_expert
+                del tmp
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # Install the permuted maps only after every byte has landed.
+        new_resident = set(resident_ids)
+        for hot, cold in swaps:
+            i = resident_slot.pop(cold)
+            j = pool_index.pop(hot)
+            resident_slot[hot] = i
+            pool_index[cold] = j
+            new_resident.discard(cold)
+            new_resident.add(hot)
+        self.planner.resident_ids = frozenset(new_resident)
+        self.planner.resident_slot = resident_slot
+        self._spill_pool_index = pool_index
+        stats.swaps += len(swaps)
+        stats.promoted += len(swaps)
+        stats.demoted += len(swaps)
+
     @property
     def stats(self) -> ResidencyStats:
         return self.planner.stats
@@ -3597,6 +3765,8 @@ def presplit_expert_offload_after_repack(
                 list(plan.resident_ids),
                 list(plan.spill_ids),
             )
+            if plan.pinned_ids:  # #302a: never-demote set
+                layer._moe_offload_pinned_experts = list(plan.pinned_ids)
             if plan.delegated_ids:
                 layer._moe_offload_delegated_experts = list(plan.delegated_ids)
         publish_host_shard_on_layer(layer, plan)
