@@ -1381,6 +1381,26 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    pp_stage_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Relative capability scores per pipeline stage, one entry "
+            "per stage in stage order (analogous to --rank-tp-ratio, but "
+            "across stages) -- e.g. --pp-size 2 --pp-stage-ratio 3,1 for a "
+            "stage-0 card set about 3x as capable as stage 1's. The layer "
+            "split is DERIVED from the scores instead of being spelled out "
+            "as --pp-layer-ratio. For hybrid linear+full-attention models "
+            "the derivation is full-attention-aware: a hybrid splits its "
+            "KV after FULL-ATTENTION layers, not after layers (#201 "
+            "slice 2 finding), so stage boundaries are snapped to give "
+            "each stage its score-proportional share of BOTH axes. "
+            "Mutually exclusive with --pp-layer-ratio. Refuses (never a "
+            "silent even split) when the model depth or layer kinds "
+            "cannot be read, or when a hybrid stage would end with zero "
+            "full-attention layers.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -12403,6 +12423,7 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+        self._handle_pp_stage_ratio()
         self._handle_pp_layer_ratio()
 
     #: Config keys that carry a model's backbone depth, in probe order.
@@ -12450,6 +12471,109 @@ class ServerArgs:
             )
         except OSError:  # pragma: no cover - advisory only
             return False
+
+    def declared_layer_kinds(self) -> Optional[List[bool]]:
+        """Per-layer full-attention markers as ``config.json`` declares them,
+        or None when they cannot be read here.
+
+        Sources, in probe order (mirroring configs/qwen3_next.py:
+        layers_block_type and configs/model_config.py):
+          * an explicit ``layer_types`` / ``layers_block_type`` list
+            ("full_attention" marks the KV-bearing layers);
+          * ``full_attention_interval`` (Qwen3.5/3.6 GDN hybrids: every
+            interval-th layer, 1-based, is full attention);
+          * neither present: a homogeneous all-attention model -- every
+            layer True.
+        Advisory like declared_num_hidden_layers: the loader-authoritative
+        depth check stays in get_pp_indices.
+        """
+        depth = self.declared_num_hidden_layers()
+        if depth is None:
+            return None
+        model_path = getattr(self, "model_path", None)
+        cfg_path = os.path.join(model_path, "config.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:  # pragma: no cover - advisory only
+            return None
+        text_cfg = cfg.get("text_config") or {}
+
+        def probe(key):
+            value = cfg.get(key)
+            return value if value is not None else text_cfg.get(key)
+
+        for key in ("layer_types", "layers_block_type"):
+            kinds = probe(key)
+            if isinstance(kinds, list) and len(kinds) == depth:
+                return [k == "full_attention" for k in kinds]
+        interval = probe("full_attention_interval")
+        if isinstance(interval, int) and interval > 0:
+            return [(i + 1) % interval == 0 for i in range(depth)]
+        return [True] * depth
+
+    def _handle_pp_stage_ratio(self):
+        """--pp-stage-ratio: derive the uneven layer split from per-stage
+        capability scores (#201 slice 3 item 2).
+
+        Materializes ``pp_layer_ratio`` and lets _handle_pp_layer_ratio do
+        the rest (validation against the declared depth, the
+        SGLANG_PP_LAYER_PARTITION export, the conflict matrix). Refusal
+        over a silent even split throughout -- the #202 lesson.
+        """
+        scores = self.pp_stage_ratio
+        if scores is None:
+            return
+
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--pp-stage-ratio scores pipeline stages, but --pp-size is "
+                f"{self.pp_size} (no pipeline). Set --pp-size to the number "
+                "of stages, or drop the flag."
+            )
+        if len(scores) != self.pp_size:
+            raise ValueError(
+                f"--pp-stage-ratio length ({len(scores)}) must equal "
+                f"--pp-size ({self.pp_size}): one score per stage."
+            )
+        if self.pp_layer_ratio is not None:
+            raise ValueError(
+                "--pp-stage-ratio derives the layer split that "
+                "--pp-layer-ratio spells out explicitly. Pass one of the "
+                "two, not both."
+            )
+
+        depth = self.declared_num_hidden_layers()
+        if depth is None:
+            raise ValueError(
+                "--pp-stage-ratio cannot derive a layer split: the model's "
+                f"hidden layer count is not readable from {self.model_path} "
+                "(no config.json depth). Pass --pp-layer-ratio explicitly."
+            )
+        kinds = self.declared_layer_kinds()
+        if kinds is None:
+            kinds = [True] * depth
+
+        from sglang.srt.distributed.utils import derive_pp_layer_split
+
+        counts = derive_pp_layer_split(scores, is_full_attention=kinds)
+        n_full = sum(kinds)
+        per_stage_full = []
+        start = 0
+        for count in counts:
+            per_stage_full.append(sum(1 for k in kinds[start : start + count] if k))
+            start += count
+        self.pp_layer_ratio = counts
+        logger.info(
+            "--pp-stage-ratio %s: derived --pp-layer-ratio %s over %d layers "
+            "(full-attention per stage: %s of %d total -- a hybrid's KV mass "
+            "follows the full-attention count, not the layer count).",
+            ",".join(str(s) for s in scores),
+            ",".join(str(c) for c in counts),
+            depth,
+            per_stage_full,
+            n_full,
+        )
 
     def _handle_pp_layer_ratio(self):
         """--pp-layer-ratio: uneven layer split across pipeline stages.

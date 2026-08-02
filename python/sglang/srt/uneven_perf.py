@@ -73,7 +73,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -2550,6 +2549,18 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
     drafter_policy = getattr(sa, "speculative_drafter_policy", None)
     if drafter_policy is not None:
         fields["spec_drafter_policy"] = drafter_policy
+    # #201 slice 3: a pipeline's stages have different footprints (layer
+    # windows, embed/lm_head asymmetry), so a record measured under one
+    # pp geometry must not be replayed under another. Included ONLY when a
+    # pipeline is configured -- same rationale as spec_drafter_policy
+    # above: pp_size == 1 keeps every pre-existing digest valid. The
+    # per-STAGE identity is a runner-side path suffix
+    # (model_runner_kv_cache_mixin._measured_kv_budget_cache_path), because
+    # this fingerprint is parse-time and has no pp_rank.
+    pp_size = getattr(sa, "pp_size", 1) or 1
+    if pp_size > 1:
+        fields["pp_size"] = pp_size
+        fields["pp_layer_ratio"] = getattr(sa, "pp_layer_ratio", None)
     return fields
 
 
