@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from array import array
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Sequence
 
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -31,6 +31,22 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+def _concat(head, tail):
+    """Type-preserving concatenation of two token sequences.
+
+    ``array("q") + list`` is a TypeError, and the streaming session's token
+    arrays ARE ``array("q")`` -- the in-place share path builds them that way.
+    The copy path used to reach for ``+`` and therefore only ever worked on
+    list-typed histories; #410's rewind is the first caller that takes the
+    copy path on a streaming session, which is where that surfaced.
+    ``extend`` accepts any iterable, so a slice of the head keeps its type and
+    the tail can be either.
+    """
+    out = head[:]
+    out.extend(tail)
+    return out
 
 
 class SessionReqNode:
@@ -101,6 +117,13 @@ class Session:
         self.committed_origin_len: Optional[int] = None
         self.committed_unpadded_len: Optional[int] = None
         self.committed_fill_len: Optional[int] = None
+        # #410 checkpoint rewind / branch: a token-level splice point the NEXT
+        # turn starts from, consumed once. It reuses SessionParams.offset --
+        # the mechanism that already rewrites session history
+        # (``context[:offset] + new_tokens``) -- rather than adding a second
+        # way to do the same thing. An explicit per-request offset always
+        # wins; this is the server-side default when the client sends none.
+        self.pending_rewind_offset: Optional[int] = None
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -176,28 +199,34 @@ class Session:
 
     @staticmethod
     def _concat_token_arrays(
-        last_req: Req, req: TokenizedGenerateReqInput, session_params
+        last_req: Req,
+        req: TokenizedGenerateReqInput,
+        session_params,
+        offset: Optional[int] = None,
     ):
-        """Copy-based assembly for replace/offset/drop_previous_output turns."""
+        """Copy-based assembly for replace/offset/drop_previous_output turns.
+
+        ``offset`` is the EFFECTIVE splice point (the request's own, or the
+        session's pending #410 rewind offset), resolved by the caller so this
+        function has one notion of where history is cut.
+        """
         out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
 
-        input_ids = last_req.origin_input_ids + out_tail
+        input_ids = _concat(last_req.origin_input_ids, out_tail)
         if session_params.drop_previous_output:
             input_ids = last_req.origin_input_ids[:]
-        if session_params.offset and session_params.offset != 0:
-            input_ids = input_ids[: session_params.offset] + req.input_ids
+        if offset:
+            input_ids = _concat(input_ids[:offset], req.input_ids)
         else:
-            input_ids += req.input_ids
+            input_ids = _concat(input_ids, req.input_ids)
 
-        input_ids_unpadded = last_req.origin_input_ids_unpadded + out_tail
+        input_ids_unpadded = _concat(last_req.origin_input_ids_unpadded, out_tail)
         if session_params.drop_previous_output:
             input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-        if session_params.offset and session_params.offset != 0:
-            input_ids_unpadded = (
-                input_ids_unpadded[: session_params.offset] + req.input_ids
-            )
+        if offset:
+            input_ids_unpadded = _concat(input_ids_unpadded[:offset], req.input_ids)
         else:
-            input_ids_unpadded += req.input_ids
+            input_ids_unpadded = _concat(input_ids_unpadded, req.input_ids)
         return input_ids, input_ids_unpadded
 
     def create_req(
@@ -210,6 +239,14 @@ class Session:
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
         session_params = req.session_params
+        # #410: the session's pending rewind/branch splice point applies to
+        # this turn unless the client named its own. Consumed here, so a
+        # rewind moves the session once and the turns after it append
+        # normally.
+        effective_offset = session_params.offset
+        if not effective_offset:
+            effective_offset = self.pending_rewind_offset
+        self.pending_rewind_offset = None
 
         last_req_node = None
         last_req = None
@@ -229,6 +266,11 @@ class Session:
                     "Streaming sessions do not support drop_previous_output."
                 )
             elif session_params.offset and session_params.offset != 0:
+                # A CLIENT-supplied offset stays refused on a streaming
+                # session. The #410 rewind offset is not refused here: it is
+                # set by the scheduler, only while the session has no request
+                # in flight, and it takes the copy path below like any other
+                # history rewrite.
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
@@ -275,7 +317,7 @@ class Session:
                 self.streaming
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
-                and not (session_params.offset and session_params.offset != 0)
+                and not effective_offset
             )
             if can_share_token_arrays:
                 input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
@@ -283,7 +325,7 @@ class Session:
                 )
             else:
                 input_ids, input_ids_unpadded = self._concat_token_arrays(
-                    last_req, req, session_params
+                    last_req, req, session_params, effective_offset
                 )
         else:
             input_ids = req.input_ids
@@ -380,6 +422,97 @@ class SessionController:
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"
             )
             return OpenSessionReqOutput(session_id=session_id, success=True)
+
+    # -- #410 checkpoint branch / rewind ------------------------------------
+    #
+    # Both are expressed as a token-level splice point on the session, which
+    # is the mechanism SessionParams.offset already implements. Neither copies
+    # a KV page: the branch's first turn matches the checkpoint prefix in the
+    # radix tree and shares the nodes that hold it, and the tree splits at the
+    # point where the branch diverges. Copy-on-restore is what the radix tree
+    # does anyway.
+
+    def _checkpoint_node(self, session: Session) -> SessionReqNode:
+        if not session.req_nodes:
+            raise ValueError(
+                f"session {session.session_id!r} has no completed turn to "
+                "branch from or rewind to"
+            )
+        if len(session.req_nodes) > 1:
+            raise ValueError(
+                f"session {session.session_id!r} holds "
+                f"{len(session.req_nodes)} request nodes; branch/rewind of a "
+                "non-streaming session tree is not supported -- close the "
+                "branches you do not want first"
+            )
+        [node] = session.req_nodes.values()
+        return node
+
+    def branch_from(
+        self,
+        *,
+        parent_session_id: str,
+        checkpoint_tokens: Sequence[int],
+        new_session_id: Optional[str] = None,
+    ) -> str:
+        """Open a new session that continues from a checkpoint of another.
+
+        The new session references the SAME last request node as the parent
+        and carries the checkpoint's token count as its splice point, so its
+        first turn assembles ``parent_context[:len(checkpoint)] + new_tokens``.
+        Because a splice point is set, that turn takes the copy path -- the
+        parent's token arrays are never mutated by its child, which is the one
+        way a branch could corrupt the session it came from.
+        """
+        parent = self.sessions.get(parent_session_id)
+        if parent is None:
+            raise ValueError(
+                f"unknown parent session {parent_session_id!r}; a branch is "
+                "taken from a live server-side session"
+            )
+        node = self._checkpoint_node(parent)
+        session_id = new_session_id or uuid.uuid4().hex
+        if session_id in self.sessions:
+            raise ValueError(f"session id {session_id} already exists, cannot branch")
+        child = Session(
+            parent.capacity_of_str_len,
+            session_id,
+            streaming=parent.streaming,
+            timeout=parent.timeout,
+        )
+        # Share the parent's node object: the branch reads its token arrays
+        # and never writes them (the splice point forces the copy path).
+        child.req_nodes[node.req.rid] = SessionReqNode(node.req)
+        child.committed_origin_len = parent.committed_origin_len
+        child.committed_unpadded_len = parent.committed_unpadded_len
+        child.committed_fill_len = parent.committed_fill_len
+        child.pending_rewind_offset = len(checkpoint_tokens)
+        self.sessions[session_id] = child
+        log_info_on_rank0(
+            logger,
+            f"Session {session_id} branched from {parent_session_id} at "
+            f"{len(checkpoint_tokens)} tokens (active={len(self.sessions)})",
+        )
+        return session_id
+
+    def rewind_to(self, session_id: str, checkpoint_tokens: Sequence[int]) -> int:
+        """Move a session's continuation point back to a checkpoint prefix.
+
+        Only the splice point moves. The tokens beyond it stay in the radix
+        tree, where they are ordinary cached pages: a later branch of the same
+        checkpoint that regenerates the same continuation hits them, and the
+        eviction policy reclaims them otherwise. Deleting them here would
+        throw away a cache hit to save nothing.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"unknown session {session_id!r}, cannot rewind")
+        self._checkpoint_node(session)
+        offset = len(checkpoint_tokens)
+        session.pending_rewind_offset = offset
+        session.last_active_time = time.monotonic()
+        log_info_on_rank0(logger, f"Session {session_id} rewound to {offset} tokens")
+        return offset
 
     def close(self, recv_req: CloseSessionReqInput):
         session_id = recv_req.session_id

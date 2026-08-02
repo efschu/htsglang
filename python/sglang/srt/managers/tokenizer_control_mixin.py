@@ -41,12 +41,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     KvReshardReqInput,
     KvReshardReqOutput,
-    SessionHandoverReqInput,
-    SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    VramBudgetReqInput,
-    VramBudgetReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -64,6 +60,10 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionCheckpointReqInput,
+    SessionCheckpointReqOutput,
+    SessionHandoverReqInput,
+    SessionHandoverReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -76,6 +76,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    VramBudgetReqInput,
+    VramBudgetReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
@@ -112,6 +114,7 @@ _COMMUNICATOR_SPECS = [
     ("flush_cache", FlushCacheReqOutput),
     ("kv_reshard", KvReshardReqOutput),
     ("session_handover", SessionHandoverReqOutput),
+    ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -305,6 +308,37 @@ class TokenizerControlMixin:
             success=success,
             message="; ".join(messages),
             manifest_json=manifest_json,
+        )
+
+    async def session_checkpoint(
+        self: TokenizerManager, obj: SessionCheckpointReqInput
+    ) -> SessionCheckpointReqOutput:
+        """#410: session checkpoint / branch / rewind control.
+
+        The request fans out to every scheduler and every verdict must
+        succeed. On a TP=1 server -- the only geometry the feature admits --
+        that is one rank; the fan-out exists so a TP>1 server refuses on
+        every rank with the same named message rather than on rank 0 only.
+        """
+        self.auto_create_handle_loop()
+        results = await self.session_checkpoint_communicator(obj)
+        success = all(r.success for r in results)
+        messages = []
+        for r in results:
+            if r.message and r.message not in messages:
+                messages.append(r.message)
+        head = results[0] if results else None
+        return SessionCheckpointReqOutput(
+            success=success,
+            message="; ".join(messages),
+            checkpoint_id=next(
+                (r.checkpoint_id for r in results if r.checkpoint_id), None
+            ),
+            session_id=next((r.session_id for r in results if r.session_id), None),
+            manifest_json=next(
+                (r.manifest_json for r in results if r.manifest_json), None
+            ),
+            info=None if head is None else head.info,
         )
 
     async def vram_budget(

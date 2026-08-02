@@ -191,43 +191,54 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
 # ``tests/moe_offload/test_cold_tier_fetch.py``.
 
 
-class TestMemTierRegistryHasNoConsumers(CustomTestCase):
-    """#407 memory-tier registry: no production code picks tiers from it.
+# #421 finding F6 -- "the memtier registry has zero production consumers" --
+# was FIXED by #410 (server-side session checkpoints), which resolves its
+# checkpoint tier through ``memtier.consumers.checkpoint_tier_targets`` on a
+# real control request. The inverted pin that asserted the absence is
+# therefore retired, and replaced below by the POSITIVE pin that keeps the
+# call site from quietly disappearing again -- the same substitution the #394
+# cold tier made when it was wired.
+#
+# The catalog rule ("all new spill/offload consumers must pick targets from
+# it") is still not enforced for the PRE-EXISTING consumers: the #286 offload
+# register and the #394 cold tier both still carry their own target lists,
+# and migrating them is memtier cuts 4 and 5. That remains an open item in
+# ``docs/dev/AUDIT_421_UNWIRED.md``; what changed is only that the rule now
+# has one consumer honouring it instead of none.
 
-    ``FEATURE_CATALOG.md`` §3 states "All new spill/offload consumers must
-    pick targets from it" -- a normative rule. At this tip the package
-    ``srt/memtier/`` (registry, tiers, probe, profile, reservations) has zero
-    production importers and zero production symbol references; every
-    reference outside the package is a unit test. The two offload consumers
-    audited under #421 (the #286 offload register and the #394 cold tier)
-    both pick targets without it.
 
-    So the rule is aspirational. That is a legitimate state for a freshly cut
-    node layer -- the merge said "no consumers yet" -- but a catalog that
-    states it as an active constraint invites the next author to assume a
-    reconciler exists.
+class TestMemTierRegistryHasItsFirstConsumer(CustomTestCase):
+    """#407 memory-tier registry: #410 picks its checkpoint tier from it.
+
+    Pins the CALL SITE, not the module: a refactor that leaves
+    ``consumers.py`` importable but unreached would restore F6 without
+    failing any other test in the suite, which is exactly how the #197 escape
+    hatch and the #394 apportionment stayed invisible.
     """
 
-    MEMTIER_MODULES = (
-        "sglang.srt.memtier.registry",
-        "sglang.srt.memtier.tiers",
-        "sglang.srt.memtier.probe",
-        "sglang.srt.memtier.profile",
-        "sglang.srt.memtier.reservations",
-    )
+    CONSUMER_MODULE = "sglang.srt.memtier.consumers"
+    EXPECTED_CALLER = "python/sglang/srt/managers/session_checkpoint.py"
 
-    def test_no_production_importer_of_any_memtier_module(self):
-        found = {}
-        for dotted in self.MEMTIER_MODULES:
-            importers = _production_importers_of(dotted, exclude_package=True)
-            if importers:
-                found[dotted] = importers
-        self.assertEqual(
-            found,
-            {},
-            "GOOD NEWS: the memtier registry now has a production consumer "
-            f"({found}). #421 finding F6 is fixed -- delete this pin and "
-            "re-check whether the catalog rule is now enforced.",
+    def test_the_checkpoint_runtime_imports_the_consumer_shim(self):
+        importers = _production_importers_of(self.CONSUMER_MODULE, exclude_package=True)
+        self.assertTrue(
+            any(hit.startswith(self.EXPECTED_CALLER) for hit in importers),
+            "#410's checkpoint runtime no longer imports "
+            f"{self.CONSUMER_MODULE}. If the tier selection moved, move this "
+            "pin with it; do NOT delete it -- an unreached registry is #421 "
+            f"finding F6 all over again. Importers found: {importers}",
+        )
+
+    def test_the_checkpoint_runtime_calls_the_selection_helper(self):
+        callers = _production_callers_of(
+            "checkpoint_tier_targets",
+            defining_rel_paths=("python/sglang/srt/memtier/consumers.py",),
+        )
+        self.assertTrue(
+            any(hit.startswith(self.EXPECTED_CALLER) for hit in callers),
+            "nothing in production calls checkpoint_tier_targets any more; "
+            "the #410 checkpoint would then be placing bytes without asking "
+            f"the registry. Callers found: {callers}",
         )
 
 

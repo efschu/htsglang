@@ -172,11 +172,14 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   (dark launch). BOOT-PENDING: `scripts/dev/428_boot_checks/`.
 - **memtier registry**: tier ids with volatility + payload class and
   provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
-  (audit #421): ZERO consumers wired today — "all consumers pick targets from
-  it" is the TARGET rule, not the current state; existing offload/spill paths
-  still carry their own target lists. The #421 pin test
-  (`test_unwired_features_421.py`) enforces that statement and must be updated
-  in the same merge as the first real consumer.
+  (audit #421 + #410): exactly ONE production consumer — #410's session
+  checkpoints, through `memtier/consumers.py` (`checkpoint_tier_targets`, the
+  write-path selection helper, memtier cut 3 credit). "All consumers pick
+  targets from it" remains the TARGET rule: the PRE-EXISTING offload/spill
+  paths (#286 register, #394 cold tier) still carry their own target lists,
+  and migrating them is cuts 4/5. The #421 pin test
+  (`test_unwired_features_421.py`) no longer asserts "zero consumers"; it pins
+  the #410 CALL SITE, so an unreached registry cannot come back unnoticed.
   Slice 1b (#407 / directive #434) made it hardware-general:
   `TierRegistry.for_machine()` fingerprints the box from NVML UUIDs (#397
   canon), applies a stored profile ONLY at the scope its hardware match
@@ -224,6 +227,31 @@ limit stands unchanged: a booted TP>1 destination still needs the offline
 manifest-scoped umsharder (`page_size == 1`, inherited from
 `dcp_owner_mode`) to reshape into its geometry first, live handover does not
 do that reshape in-process.
+
+**Server-side conversation checkpoints, branching and rewind** (#410) reuse
+that same export: a checkpoint IS a handover snapshot whose destination is a
+storage TIER instead of a peer group, so there is exactly ONE session
+serialization in the fork (the versioned #261 manifest, additively extended
+with a `checkpoint` envelope; the task ledger also names it as #411's
+portable-session format). `POST /session/{id}/checkpoint` freezes KV pages AND
+the GDN blob (#212 gate inherited, keyed on `supports_mamba()`);
+`/session/{id}/branch` opens a new session from it and `/session/{id}/rewind`
+moves an existing one back, both WITHOUT re-prefilling. Branching copies
+nothing — the radix tree already shares a common prefix and splits at the
+divergence point, so #410 adds only the `inc_lock_ref` pin, and the reported
+accounting asserts `copied_pages == 0`. The tier comes from the #407 registry
+(VRAM → RAM → Disk by age/durability, provenance-labelled, named refusal when
+nothing is admissible). Restore is #261's `verify_import` (#241 identity) plus
+a geometry gate; cross-geometry is a NAMED refusal pointing at the offline
+umsharder, never a silent conversion. Same v1 limits as #261: TP=1/PP=1,
+`page_size == 1`, `file` backend; plus `--hicache-mem-layout page_head`
+refused by name, because its host write-back is the `lf_ph` route that
+segfaults (#441a) and a checkpoint writes a whole session through it.
+Behind `--enable-session-checkpoints`
+(default off). BOOT-PENDING: the byte gate in
+`docs/dev/DESIGN_410_session_checkpoints.md` §8 (resume trajectory vs
+never-paused reference, branch-then-continue vs fresh-prefill,
+parent-untouched) has NOT been run — nothing in #410 has executed on a GPU.
 
 Also wired on the tip but easy to miss (audit #421): the regime-controller
 gate machinery, KV-pressure rung-dependency refusals, the hibernate flag
@@ -323,7 +351,8 @@ the comparison, and pin whether the reference is reachable from serving).
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
 qwen3_coder` (server-side fix, no template patches); fast lane, priority
 scheduling, admission throttle, prefill delayer; training tenant + idle
-workbench (ledger + pause rung); `/session_handover`; `/kv_reshard`.
+workbench (ledger + pause rung); `/session_handover`; `/kv_reshard`;
+`/session/{id}/checkpoint|branch|rewind|checkpoints` (#410).
 
 ## 14. Dashboard
 Guided config wizard with honest refusals, comm benchmark suite with
