@@ -6,6 +6,13 @@
   "title": "The htsglang development rig, as measured on it",
   "caveat": "Every number in this file was measured on ONE machine (5090 + 2x 3080, DDR4 host, ZFS on NVMe, 40G RoCE to rig-2). It is a rig profile, not a hardware truth: ANALYSE_389's own words about the 1.8 GB/s NVMe figure -- 'this verdict must not be recorded as a verdict on the approach' -- apply to every row here. A different rig loads a different profile; nothing in the registry hardcodes these values.",
   "sources": "DESIGN_407_memory_tier_registry.md section 1.1, which cites each figure to the runbook / EVAL / ANALYSE line it came from.",
+  "hardware": {
+    "version": 1,
+    "label": "1x RTX 5090:32GiB + 2x RTX 3080:20GiB",
+    "models": ["1x RTX 5090:32GiB", "2x RTX 3080:20GiB"],
+    "cards": [],
+    "cards_note": "EMPTY DELIBERATELY, and it is a functional statement rather than a TODO. With no card rows this profile has no exact hardware key, so it can only ever match at MODEL scope -- which licenses the device_models templates below and NOTHING else. Its host, filesystem and rig-2 tiers are therefore not applied on any machine, including the one they were measured on, until a session with cards writes the UUID rows here (memtier.fingerprint.hardware_block produces them). That is the correct default for a file that ships in the repository: a profile checked into a public tree must not be able to assert facts about a reader's host RAM or disks, and the two card MODEL templates are the only rows in it that generalise beyond one box."
+  },
   "device_models": {
     "NVIDIA GeForce RTX 5090": {
       "capacity": {
@@ -155,7 +162,7 @@
         "ledger_key": "rig2_host_ram"
       },
       "health": {"reachable": false, "verdict": "warn", "reason": "reachability is not probed at enumeration time in cut 1 -- the registry opens no socket to build a record. The last measured contact is the #266 cross-rig run; treat the tier as unreachable until a probe says otherwise."},
-      "transport": {"name": "roce-40g", "handle": "barlink / UCX; scripts/r3val/link_collective_cost.py", "stages_through": "host:rig-1"},
+      "transport": {"name": "roce-40g", "handle": "barlink / UCX; scripts/r3val/link_collective_cost.py", "stages_through": "host:rig-1", "link_path": ["nic:crossrig-40g"], "link_path_complete": false},
       "properties": {
         "medium": "dram",
         "nic_relay_serialises": "three pairs in parallel cost 2.34x latency for only 1.28x aggregate -- the single Gen3-x4 NIC is the wall (#278 V5). A remote tier is not width-scalable on this rig.",
@@ -185,7 +192,7 @@
         "ledger_key": "rig2_vram"
       },
       "health": {"reachable": false, "verdict": "block", "reason": "GPU-to-GPU across the rig boundary was never demonstrated on this hardware, and #280's userspace workaround is closed as impossible (cudaHostRegisterIoMemory -> CUDA_ERROR_INVALID_VALUE, driver guard osCheckGpuBarsOverlapAddrRange). Declared with a blocking verdict rather than omitted, so a rig where it works needs a data change and not a code change (DESIGN_407 X3)."},
-      "transport": {"name": "roce-40g", "handle": "GDR bench; scripts/p2p_readiness/", "stages_through": "host:rig-2"},
+      "transport": {"name": "roce-40g", "handle": "GDR bench; scripts/p2p_readiness/", "stages_through": "host:rig-2", "link_path": ["nic:crossrig-40g"], "link_path_complete": false},
       "properties": {
         "medium": "vram",
         "nordstern": "this is the NORDSTERN shape (TP=5 across two rigs). Enumerating it with a blocking verdict makes the gap a dashboard row instead of an invisible absence.",

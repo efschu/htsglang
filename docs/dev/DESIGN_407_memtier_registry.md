@@ -1,0 +1,494 @@
+# DESIGN #407 — the memory-tier registry, made general
+
+Charter (user directive, verbatim): *every memory you have access to must be a
+"level cache", a spill target or an offload target depending on volatility —
+disk / RAM / VRAM, local as well as remote.* Local VRAM, host RAM, NVMe, peer
+VRAM over barlink BAR1, rig-2's RAM and VRAM over 40G, remote disk: **one**
+registry with measured metrics and volatility classes, from which all
+consumers pick targets instead of carrying private lists.
+
+Binding addition (directive #434, same day): **generality**. No rig-specific
+constant anywhere. Every metric comes from a probe or from a stored
+per-hardware profile keyed on the #397 identity canon (NVML UUID primary, PCI
+BDF secondary). Provenance is `measured | estimate | absent`, and `absent` is a
+named refusal. It must work automatically on unknown hardware — probe-first
+bootstrap — and the tests must prove no local-rig constant leaks, using
+synthetic foreign profiles.
+
+Desk work, no cards (`CUDA_VISIBLE_DEVICES=99`). Branch
+`feat/memtier-registry-407`, base `022fb3872b`.
+
+This document is scoped to what directive #434 changes and to slice 1.
+`DESIGN_407_memory_tier_registry.md` remains the design of record for the node
+layer, the consumer survey (§2), the tier interface (§3), the measurement plan
+(§4) and the cut plan (§5); it is cited rather than restated. Where the two
+disagree, this one wins, and every such point is listed in §2.
+
+---
+
+## 0. Verdict: EXTEND the existing package, do not replace it
+
+`python/sglang/srt/memtier/` already exists at the base commit: 2760 lines over
+five modules, 82 hermetic tests, and a design document. Audit #421 classified
+it **INERT** (F6) — zero production importers — which is a statement about its
+*wiring*, not about its quality. Reading it against this brief's requirements,
+the node layer is not merely adequate, it already implements most of what a
+"one registry" brief asks for, and it implements it in the shapes the rest of
+the tree uses. Rebuilding would discard that and re-derive the same decisions
+worse.
+
+What is already right, with the file and line:
+
+| Requirement in the brief | Already built | Where |
+|---|---|---|
+| tier id, never positional | `TierId` grammar; a bare device index is refused *by name* | `tiers.py:190` `parse_tier_id`, `tiers.py:233-243` |
+| kind + reach (local / peer / remote-host) | `TierKind` without locality; `host` is a field; `role()` derives `vram-peer-bar1` / `ram-remote` per query | `tiers.py:96-110`, `tiers.py:559-588` |
+| metrics + provenance | `TierCaps` of `cost_model.Rate`; `measured / estimate / absent`, no fourth case | `tiers.py:405-429` |
+| volatility classes | `Volatility` × `PayloadClass` × `ADMITTED_PAYLOADS`, admission as a refusal | `tiers.py:255-315`, `tiers.py:613` |
+| capacity accounting into the #260/#400 ledger family | `TierCapacity` total/floor/reserved/corridor; `VramLedgerHook` forwards to `registry.ledger` — "one ledger, no second accounting" | `tiers.py:333-402`, `reservations.py:248` |
+| ordered candidates + named refusals | `TierSelection` with `order_key` public and one `Refusal` per rejected tier | `registry.py:141-177`, `registry.py:300` |
+| absent → refusal, not a low score | `RefusalRule.BANDWIDTH_ABSENT`; `require_measured` raises naming the probe | `registry.py:362-384`, `probe.py:414` |
+| probe catalogue with named harnesses | `PROBES` M1–M8 as data, each naming who would take it | `probe.py:130-247` |
+| unreachable tiers enumerated, not omitted | `TierHealth(verdict="block")` with a reason; `vram:unenumerated@<host>` | `tiers.py:437`, `tiers.py:228` |
+
+**Verdict: extend.** Nothing above is rebuilt. Slice 1 adds the four things the
+package does not have and fixes the one thing it has wrong.
+
+### 0.1 The one thing it has wrong
+
+`TierRegistry.from_profile()` defaulted its `profile` argument to
+`bundled_profile()` (`registry.py:248` at base), and `bundled_profile()` loads
+`profiles/rig1.json` — a document whose own caveat says *"Every number in this
+file was measured on ONE machine"*.
+
+So an argument-less registry on **any** machine returned rig-1's host RAM at an
+estimated 38 GB/s, rig-1's ZFS pool at a measured 1.8 GB/s, `fs:rig-1:/spinning`,
+`host:rig-2` and `vram:unenumerated@rig-2`. The module docstring
+(`profile.py:14-41`) states that preventing exactly this is why profiles are a
+file format; the default undid the format's whole purpose in one keyword
+argument.
+
+It survived 82 tests because every one of them either constructed tiers by
+hand or ran on the machine the profile describes. That is the shape of the
+blind spot, and §4's synthetic foreign rigs are its permanent fix.
+
+**This is the direct answer to directive #434's "no rig-specific constants
+anywhere"**: the constants were not in the code, they were in a document the
+code loaded unconditionally, which is the same thing with an extra hop.
+
+---
+
+## 1. The registry interface, and the four additions
+
+### 1.1 What is unchanged
+
+`TierDescriptor`, `TierCapacity`, `TierCaps`, `TierHealth`, `Volatility`,
+`PayloadClass`, `ADMITTED_PAYLOADS`, `TierQuery`, `TierSelection`, `Refusal`,
+`ProbeSpec`, the reservation hooks. See
+`DESIGN_407_memory_tier_registry.md` §3 for their design and §8 for the
+deviations cut 1 already recorded.
+
+### 1.2 Addition A — hardware identity (`memtier/fingerprint.py`)
+
+Two keys, because two claims have two scopes.
+
+```
+hardware_key  digest over sorted (uuid, model, total_bytes)      -> "this box"
+model_key     digest over the model multiset, "1x RTX 5090:32GiB" -> "a box like this"
+```
+
+`hardware_key` deliberately excludes host RAM size and the mount set: adding a
+DIMM or mounting a disk does not make a machine a different machine, and it
+must not orphan the profile holding that machine's card measurements. A host
+tier whose size changed is re-read live on every boot by `apply_local_facts`
+anyway.
+
+`model_key` uses the VRAM-rounded `model:NGiB` spelling `rig_artifact.
+rig_fingerprint` already uses, so a memtier key and a shared-artifact key read
+the same on a dashboard.
+
+**Why not reuse `rig_artifact.rig_fingerprint` outright.** It is the right
+identity for *sharing* a measurement and the wrong one for *selecting a local
+profile*, for two structural reasons: it deliberately excludes the UUID
+(`rig_artifact.py:337-352`), so it can only say "a box like this" and must
+therefore never license a host or disk row; and it reads `/proc/cpuinfo`,
+`/sys/class/net` and `platform.release()` inside itself (`rig_artifact.py:273`,
+`:288`, `:315`), so it is not injectable and a hermetic test cannot compute the
+key of a *synthetic foreign* rig without the local machine leaking into it.
+Every function in `fingerprint.py` is pure over its arguments for that reason,
+and the leak falsifier in §4 depends on it.
+
+**Match scopes.** `match_profile(document, fingerprint) -> ProfileMatch`:
+
+| Scope | Condition | Licenses |
+|---|---|---|
+| `EXACT` | stored `hardware_key` equals the live one | every tier and every device template |
+| `MODEL` | stored `model_key` equals the live one, `hardware_key` does not | **device model templates only** |
+| `NONE` | neither, or no `hardware` block at all | nothing |
+
+The `MODEL` rung is the load-bearing one. A membw figure is a property of a
+5090 and not of one particular 5090, so templates travel. A host tier does not:
+two machines with identical cards routinely have different RAM, different disks
+and a different wire. `licensed_document()` is the single choke point — under
+`MODEL` the `tiers` list is *removed* from the document before parsing, not
+filtered afterwards, so no caller can read a tier row it was not licensed.
+
+**A document with no `hardware` block matches nothing.** No escape hatch, no
+"assume it is ours". An unverifiable claim is refused rather than trusted.
+
+**Keys are derived, never stored as digests.** The `hardware` block states
+`cards: [{uuid, model, total_bytes}]` and `models: [...]`; the code hashes
+them. A hand-edited profile therefore cannot carry a stale digest that makes it
+silently unmatchable forever — and "no profile matched" is the normal path, so
+that failure would never be noticed.
+
+### 1.3 Addition B — profile persistence (`memtier/profile_store.py`)
+
+A profile is a *cache of measurements*, not a configuration file: written once
+the probes have run, read back next boot so a rig does not pay twice.
+
+Search order, every candidate matched, best match wins, `NONE` contributes
+nothing:
+
+1. `$SGLANG_MEMTIER_PROFILE` — one explicit file, still matched.
+   `$SGLANG_MEMTIER_PROFILE_TRUST=1` overrides the verdict for the one
+   legitimate case (a profile just measured on hardware whose keys are not
+   written back yet) and logs what it overrode.
+2. `$SGLANG_MEMTIER_PROFILE_DIR`, else `$XDG_CACHE_HOME/sglang/memtier`, else
+   `~/.cache/sglang/memtier` — one file per hardware key, written atomically.
+3. `memtier/profiles/` in the package. Shipping a profile gives it no standing;
+   it is matched like any other.
+
+`save_profile` keys what it writes from the **live fingerprint**, never from
+the document. Letting a caller supply the key would make the one field that
+prevents cross-rig leakage the one field a caller can get wrong. It refuses on
+a cardless machine: a profile with no exact key can never match at `EXACT`, so
+writing one is a silent no-op dressed as a save.
+
+`ProfileSelection.rejected` is not decoration. A registry that found no profile
+and one that found four and matched none look identical from outside, and only
+one of those means the operator has a typo.
+
+### 1.4 Addition C — probe-first bootstrap (`memtier/bootstrap.py`)
+
+What an unmatched machine gets, and the replacement for the rig-1 default:
+
+* **capacity measured** — NVML per card, `/proc/meminfo` for host RAM,
+  `statvfs` per mount. Readings, available on any Linux box, driver or not;
+* **every cost absent, naming its probe** — no membw, no DRAM bandwidth, no
+  NVMe latency is invented. The absence carries the `PROBES` id that fills it,
+  so a dashboard shows a work item instead of a blank cell;
+* **nothing declared that was not seen** — no remote host, no peer rig, no
+  mount the caller did not name.
+
+Volatility and admission are assigned here and introduce no rig constant,
+because they are properties of the *kind*: VRAM is `DEVICE_BOUND_ONLY` on every
+machine ever built, host RAM dies with the process. The one genuinely
+path-dependent property — does a mount survive a reboot — is read from the
+mount's **filesystem type**, not guessed from its path. That makes #89's
+silent-correctness hole checkable: `--hibernate-dir /dev/shm/img` is a tmpfs
+even though it is not itself a mount point, `collect_fs_types` resolves it by
+longest matching mount, and the tier comes out `EXPENSIVE_OK` rather than
+`PERSISTENT`. `flock` is reported `no` on network filesystems and `unknown`
+when the type could not be read — and `unknown` fails a
+`require={"flock": "yes"}` query, which is the point.
+
+`TierRegistry.for_machine(facts) -> (registry, selection)` composes all of it
+and is the entry point production should use. `from_profile(profile, facts)`
+keeps working with `profile` now **required**.
+
+### 1.5 Addition D — link identity, for #423's striping gate
+
+Striping a payload across two tiers only pays when the two moves do not queue
+behind one wire, and this tree already carries the counterexample as data:
+three RDMA pairs in parallel cost 2.34× the latency for 1.28× the aggregate
+because one NIC serialises them (#278 V5). A striping planner that assumed
+disjointness would report a speed-up and deliver a slowdown.
+
+`TierTransport` gains two fields:
+
+```
+link_path: Tuple[str, ...]     ordered opaque segments, leaf first
+                               ("pcie:0000:07:00.0", "root:0000:00:01.1")
+                               ("nic:crossrig-40g",)   ("blk:nvme0n1",)
+link_path_complete: bool       does the path name EVERY segment up to a
+                               possible convergence point
+```
+
+`link_disjointness(a, b) -> LinkDisjointness` returns one of three verdicts,
+and the asymmetry between them is the design:
+
+* **`SHARED`** needs one segment in common and an *incomplete* path can
+  establish it. Evidence of contention is evidence.
+* **`DISJOINT`** needs **both** paths complete. Absence of a shared segment in
+  a partial record is not absence of a shared segment: two cards with different
+  BDFs can still converge on one root port.
+* **`UNKNOWN`** is a refusal the caller must handle, in the #400 shape — an
+  unpriceable item makes the caller refuse rather than guess.
+
+Bootstrap records a device tier's own BDF as a leaf segment and marks the path
+**incomplete**, so #423 gets `UNKNOWN` rather than a false all-clear. Filling
+the upstream segments needs a topology parse (`capability_matrix.json` carries
+`topo_raw`) and is a later cut; the interface is here now so #423 can be built
+against it and so the field is a data change when the parse lands.
+
+---
+
+## 2. Where this supersedes `DESIGN_407_memory_tier_registry.md`
+
+Three points, each a consequence of directive #434 rather than a change of mind.
+
+1. **§8 deviation 6 and the profile default.** That document describes
+   `profiles/rig1.json` as "this rig, and only this rig" and treats loading it
+   as the normal path. Under #434 a profile applies only to hardware it
+   matches, and the bundled file is a *candidate*, not a default.
+
+2. **`rig1.json` ships with an empty `cards` list, and that is functional, not
+   a TODO.** With no card rows it has no exact key and can only ever match at
+   `MODEL` scope, which licenses its two device templates and **nothing else** —
+   its host, filesystem and rig-2 tiers are not applied on any machine,
+   including the one they were measured on, until a session with cards writes
+   the UUID rows. This is the correct default for a file checked into a public
+   tree: a repository profile must not be able to assert facts about a reader's
+   host RAM or disks, and the two card MODEL templates are the only rows in it
+   that generalise beyond one box. Recording the UUIDs is a one-command GPU
+   follow-up (`memtier.fingerprint.hardware_block` produces the rows).
+
+3. **`TierCaps` values may now enter from an artifact adapter, not only a
+   probe.** The provenance law is unchanged and unchanged in strength —
+   `apply_outcome` is still the only writer, still refuses an `ok` outcome
+   carrying a non-`MEASURED` rate, still refuses to overwrite a measurement
+   with a different one. What is new is *who* produces the outcome.
+
+Everything else in that document stands, including all four exclusions
+(X1 HiCache ladder, X2 GDN state, X3 cross-rig GPU-to-GPU, X4 compute
+placement) and the C1/C2 contradictions with their planned resolutions.
+
+---
+
+## 3. Probe and measurement plan
+
+### 3.1 The principle: #407 adds no probe
+
+Three harnesses already write measurements to disk, each with a schema, a
+status vocabulary and an absent-value rule. Slice 1 **reads** them. A parallel
+artifact format would be the #348b defect one layer down — two sources of one
+physical fact, disagreeing quietly.
+
+`memtier/adapters.py`, one adapter per format:
+
+| Adapter | Artifact | Keyed by | Fills |
+|---|---|---|---|
+| `from_card_probe` | `card_probe` (#213 / E4), `{"version":1,"cards":[…],"pairs":[…]}` at `~/.cache/sglang/card_probe-<sha1>.json` | card UUID | `caps.bandwidth_gbs` on DEVICE tiers, from `membw_read_gbs` |
+| `from_rig_artifact` | rig artifact (#271), `{"schema":"htsglang-rig-artifact/v1","measurements":[…]}` | measurement `id` | whatever `ARTIFACT_ROUTES` declares |
+| `from_capability_matrix` | `capability_matrix.json` (#278 / p2p_readiness), `{"schema_version":3,"kind":"capability_matrix","devices":[…],"directed_pairs":[…]}` | PCI BDF, with a `devices` table carrying both names | `caps.aperture_bytes` on DEVICE tiers |
+
+Every adapter returns `ProbeOutcome` values; `apply_outcome` remains the only
+writer. `IngestReport` separates `unrouted` (a gap in the route table) from
+`skipped` (a gap in the measurement) from `errors` (a defect in the artifact),
+because folding them together is how the first stops being noticed.
+
+### 3.2 Four rules the adapters enforce
+
+1. **A row that did not succeed yields no value.** The four statuses
+   `ok | warn | error | absent` are shared with comm-suite deliberately; a
+   translation table would be a place for them to drift. `warn` keeps its value
+   and carries the reservation into the rate's `source`.
+2. **A number is never re-labelled.** `h2d_gbs` is the PCIe *edge* between a
+   card and the host; it does not become the host tier's DRAM bandwidth by
+   being the only host-adjacent number available. That is the #214/#271 rule
+   `cost_model._reject_loopback` already enforces for pair rows.
+3. **A unit is never converted on a guess.** A row whose `unit` is not the
+   route's declared `artifact_unit` is skipped.
+4. **A row that cannot be assigned to exactly one tier is skipped, not
+   guessed.** A shared artifact is anonymised by construction
+   (`rig_artifact.assert_anonymized`), so the tier comes from the row's own
+   `context["tier_id"]` or from a route matching exactly one tier. Writing a
+   measured figure onto the wrong one of two host tiers is worse than leaving
+   both absent.
+
+The `pairs` list in a card-probe artifact is an **edge** fact and stays with
+`cost_model.pair_matrix_from_card_probe`, which already parses that exact
+shape. The adapter does not re-parse it.
+
+### 3.3 The aperture reduction, stated because it is a choice
+
+`capability_matrix` rows are directed and BDF-keyed; a tier's aperture is
+neither. The reduction is the **narrowest effective window any source has into
+this card**. A minimum rather than a maximum or a mean, because the aperture
+decides reject-vs-chunk in #286's window policy: a tier advertising the widest
+window some peer happens to enjoy would let a mover attempt a copy through the
+narrow one. The sources it was reduced over are named in the rate's `source`,
+so it is auditable rather than folded away.
+
+The BDF → UUID resolution comes out of the artifact's own `devices` table,
+which carries both names. No live `IdentityMap` is consulted, and an artifact
+whose devices table lacks UUIDs is **refused whole**: re-keying a previous
+boot's rows through the current enumeration is precisely the #331/#392 defect.
+
+### 3.4 The probe catalogue
+
+`PROBES` M1–M8 are unchanged (`DESIGN_407_memory_tier_registry.md` §4). Slice 1
+adds one:
+
+| # | Missing | Producer | Cost | Unblocks |
+|---|---|---|---|---|
+| **M9** | per-card device-memory read bandwidth | `rigmon/card_probe.py` membw read arm — **already implemented and already cached**; needs only `from_card_probe` | none | `caps.bandwidth_gbs` on every DEVICE tier. Without it a card tier is refused against any floor: correct, and useless |
+
+M9 is on the list because it is the one measurement the tree already takes and
+the registry did not read. Everything else stays open, and the BAR1
+point-latency ladder (M1) keeps its structural caveat verbatim: it cannot come
+from the barlink harness, which implements collectives only and has no
+send/recv (`scripts/probe/barlink_vs_nccl.py:4-22`) — the smallest figure it
+can produce is a 20 KiB three-rank all-reduce, a collective and not a point
+latency. It needs the `p2p_readiness` `d2d_bench` path.
+
+**Route ids are declared before their arms exist.** `ARTIFACT_ROUTES` names
+`comm/memtier_host_dram/read` (M4), `comm/memtier_nvme/read_latency` (M5) and
+`comm/memtier_bar1_ladder/point_latency` (M1) following
+`comm_suite.to_sections`'s own `comm/<arm_id>/<cell_name>` spelling. None of
+the three arms exists. Declaring the route first fixes the arm id and cell name
+the arm must emit, so adding the measurement is a comm-suite change and not
+also a memtier change. Until then the rows never match and the fields stay
+absent, naming the probe.
+
+---
+
+## 4. Generality: what is tested, and how it can fail
+
+`test/registered/unit/memtier/test_tier_generality.py`, three groups.
+
+### 4.1 Synthetic foreign rigs
+
+None resembles the development box; each is chosen for a different way a
+registry can smuggle a local assumption.
+
+| Rig | Shape | What it would catch |
+|---|---|---|
+| `NVLINK_ISLAND` | 4 × 80 GB, small host | code believing peer VRAM is exotic and host RAM plentiful |
+| `EIGHT_EQUAL` | 8 identical cards | the shape this fork is *least* like; positional card handling reads wrong here, and a model signature collapses to one counted entry |
+| `INT8_SMALL_MIX` | 5 small cards, 3 models, large host | the inversion: host RAM plentiful, VRAM scarce, so any "VRAM is the biggest number" ordering comes out backwards |
+
+Pinned for all three: the bundled profile never applies; no tier belongs to a
+machine that was not enumerated; every card becomes exactly one device tier;
+sizes are `MEASURED` and **every** cost is `ABSENT`; every absence names a
+probe.
+
+### 4.2 The leak falsifier
+
+A test that passes whatever the profile says is not testing selection. So the
+profile is perturbed and the selection must move:
+
+* change one card UUID → `EXACT` becomes `MODEL`;
+* change the model multiset → `MODEL` becomes `NONE`;
+* a `MODEL`-scoped profile carrying a host tier at 999 GB/s contributes **zero**
+  tiers — and the can-fail half of the same test shows that on the machine it
+  *was* measured on, that same tier does arrive.
+
+### 4.3 The grep guard
+
+The package's **executable** source contains none of the development rig's
+measured numbers or names: 1558.0, 723.0, 38.0, 1.8, 2.83, 1.47, 4.99, 0.83,
+the card totals, the corridor, the BAR1 windows; `rig-1`, `rig-2`, `CT999`,
+`/spinning`, `RTX 5090`, `RTX 3080`, `2080 Ti`.
+
+Prose may explain the rig — an explanation of *why* a number is absent is worth
+more than the absence. Code may not encode it. The two are separated with
+#421's own detector-B2 technique: parse, strip docstrings, `ast.unparse` (which
+drops comments as a side effect), search what remains. A separate test proves
+the stripper can fire — it keeps an executable string and drops a docstring
+carrying the same literal — because a guard that cannot fail is not a guard.
+
+Two further pins: `bundled_profile()` is **called** nowhere (checked as an AST
+call, so the re-export in `__init__` survives and a call would not), and
+`TierRegistry.from_profile()` with no argument raises `TypeError`.
+
+---
+
+## 5. Consumer inventory and migration cuts
+
+`DESIGN_407_memory_tier_registry.md` §2 has the full survey per consumer. This
+is the cut order under the generality constraint, with the two entries that
+document did not carry.
+
+| Cut | Consumer | Migration | Value | Risk | Blocked on |
+|---|---|---|---|---|---|
+| **1 (done)** | — | node layer, no consumers | inspectability | none | — |
+| **1b (this slice)** | — | fingerprint, store, bootstrap, adapters, link identity, one read-only shim | the registry becomes usable on hardware nobody measured; the rig-1 default is gone | none — still zero production importers, pinned by #421's own test | — |
+| **2** | #77/#123 expert offload, half A | publish the rank → card-UUID vector at startup from `IdentityMap`, feed `resolve_host_shard_ratio` | **the only measured yield in the plan: 145 → 86 ms/token on the cold tier** (ANALYSE_393 §7.3/§7.4); revives #394's merged, tested link-proportional sharding | low — one datum, no allocator change | nothing |
+| **3** | #224 kvso | `SUPPORTED_PARK_BACKENDS` / `ALL_STORAGE_BACKENDS` → capability queries; the `local`-first law → staging-graph reachability | retires vocabulary V2; resolves C1; makes GDN's device-bound invariant machine-checked | medium — changes a shipped validation error | staging graph |
+| **4** | #286 short-term register | `CapacityLedger` becomes a view of `registry/ledger.py`; keys widen `(target, ordinal)` → `TierId` | resolves C2; satisfies DESIGN_305 §6; makes `peer_vram` reachable in practice | medium — touches the live movement path | cut 3 |
+| **5** | #77/#123 half B | the five `device="cpu"` literals and three `_moe_dev` sites resolve a tier | retires the last consumer with no tier vocabulary | medium — must answer at weight-creation time, very early in load | cut 4 |
+| **6** | #89 hibernate | `--hibernate-dir` resolves through a `persistent=True`, `flock`-capable tier | closes the tmpfs-hibernate silent-correctness hole | low | driver-free enumeration — **shipped in 1b** |
+| **7** | #305 residency ladder | consume the registry as the mechanism `transition_refusal()` names as missing | fewer refusals | medium | cut 4 (no second ledger) |
+| **8** | HiCache L1/L2/L3 | `choices=` list and `_create_builtin_backend` become registry lookups; L2 gets a declared capacity. **Ladder untouched (X1)** | retires V4 and V3-as-a-second-enumeration | low | — |
+| **9** | #389 NVMe expert tier, #306 cold compression | declare the tier and the capability flag | both become a data change | low | M5/M6 |
+| **10** | **#423 striping** | gate on `link_disjointness`; refuse to stripe on `UNKNOWN` | prevents the 2.34×-for-1.28× failure mode from being shipped as an optimisation | low | complete link paths (topology parse) |
+
+**Ordering rationale.** Cut 2 first because it is the only cut whose yield is
+already measured, it is S, and it does not depend on cut 1 landing (only on the
+UUID vector). #224 next because it resolves C1 and unblocks the ordering
+question everything downstream inherits. Cut 4 before 5 and 7 because both need
+one ledger. Cut 6 is now cheap and could be pulled forward at any point — it is
+a correctness fix, not an optimisation, and its prerequisite shipped in 1b.
+Cut 10 is last only because it needs the topology parse; the interface it gates
+on exists now, so #423 can be built against it before the parse lands.
+
+### 5.1 Two consumers the earlier survey did not carry
+
+* **#423 striping** — needs `link_disjointness`, and needs it to refuse rather
+  than default. Added in 1b. The gate is the deliverable: #423 must treat
+  `UNKNOWN` as "do not stripe", and the registry makes that a verdict rather
+  than a judgement call.
+* **#286's park-target ladder as a *donor*** — `PARK_TARGETS`,
+  `_select_target`'s per-rung refusals and `CapacityLedger` are the closest
+  existing thing to this registry. Cut 4 lifts them in rather than paralleling
+  them; `PARK_TARGETS` survives as a CLI alias so shipped strings keep working.
+
+---
+
+## 6. Non-goals for slice 1
+
+Stated so the gaps read as decisions.
+
+1. **No consumer is switched.** Zero production importers, and #421's own pin
+   test (`test_unwired_features_421.py:222`) still passes unmodified. The one
+   shim in `consumers.py` is exercised only by tests — its docstring is where
+   that stops being true when cut 5 lands.
+2. **No staging graph, so C1 is still open.** The ordering key remains
+   `(provenance_rank, -bandwidth, tier_id)` and stays public on every candidate
+   so the substitution is visible when cut 3 makes it.
+3. **No new probe is run and no card time is spent.** Desk only. The adapters
+   are written against the artifact schemas; whether the adapters agree with a
+   real artifact on this rig is a GPU follow-up, and until it runs this slice
+   carries the **desk-written-never-executed** label for the adapter paths that
+   no synthetic fixture covers.
+4. **No topology parse.** Link paths are leaf-only and marked incomplete, so
+   #423's gate answers `UNKNOWN` rather than `DISJOINT`. Correct and
+   conservative; not yet useful.
+5. **No HTTP route.** `GET /registry/tiers` is a consumer.
+   `TierRegistry.to_json()` and `gate_rows()` are the payload, ready to mount.
+6. **`rig1.json`'s UUID rows are not written.** They cannot be, at a desk with
+   `CUDA_VISIBLE_DEVICES=99`, and inventing them would be the exact failure
+   this slice exists to prevent. Until then the file matches at `MODEL` scope.
+7. **The E1/E2/E3 reconciliation stays deferred to cut 4**, unchanged: doing it
+   earlier means reconciling a UUID-keyed matrix against an ordinal-keyed one,
+   which is how #392 happened.
+
+---
+
+## 7. Open items
+
+1. **GPU follow-up, one command:** enumerate the rig, write the `hardware.cards`
+   rows into `rig1.json` via `hardware_block()`, and run `from_card_probe`
+   against the real cached artifact. That turns rig-1's own profile from
+   `MODEL` to `EXACT` and fills M9 on three cards.
+2. **M1–M8 unchanged.** M4 and M5 are two new comm-suite arms whose ids are
+   already declared in `ARTIFACT_ROUTES`.
+3. **The topology parse for complete link paths.** `capability_matrix.json`
+   carries `topo_raw` (`nvidia-smi topo -m`); parsing it is what turns #423's
+   gate from `UNKNOWN` into an answer.
+4. **`expert_stats.py` is wired and empty** (carried over): without hit rates
+   the registry can price a move but not predict how often one happens.
+5. **The 3.43 GB/s / 1.47 µs pairing in `destinations_error`** still mixes the
+   100G and 40G lines. Cosmetic, user-facing; fix when cut 3 touches it.
