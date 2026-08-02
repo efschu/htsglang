@@ -66,7 +66,9 @@ register of discarded approaches — check it before re-proposing anything.
   only, GDN stays resident), budgets (volume/rate/window, demote to HiCache),
   idle-first victim choice, decoupled from speculation.
 - **Hibernate to disk** (weights+KV survive process exit; uneven-TP3 reload
-  50s→8-14s) + suspend-to-RAM (memory saver).
+  50s→8-14s) + suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA
+  `SWAKVPool` since upstream #32213 — before that it was silently a no-op
+  there, while `UnifiedSWAKVPool` already honoured it).
 - **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
   (geometry stages instead of rejects; explicit ladders work, but
   `--kv-pressure-ladder auto` is currently BROKEN — hard-fails at runtime,

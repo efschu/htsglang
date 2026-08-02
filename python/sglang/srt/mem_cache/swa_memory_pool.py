@@ -47,7 +47,11 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        # setdefault, not assignment: the sub-pools are the only allocation
+        # this class makes, so hardcoding False here made --enable-memory-saver
+        # a no-op for every hybrid-SWA model. Callers that say nothing keep the
+        # old behaviour.
+        kwargs.setdefault("enable_memory_saver", False)
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
