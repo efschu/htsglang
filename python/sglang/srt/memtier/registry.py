@@ -44,13 +44,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import msgspec
 
+from sglang.srt.memtier.bootstrap import bootstrap_profile, default_host_name
+from sglang.srt.memtier.fingerprint import fingerprint_from_facts
 from sglang.srt.memtier.profile import (
     LocalFacts,
     RigProfile,
     apply_local_facts,
     bind_device_tiers,
-    bundled_profile,
 )
+from sglang.srt.memtier.profile_store import ProfileSelection, select_profile
 from sglang.srt.memtier.tiers import (
     PayloadClass,
     TierDescriptor,
@@ -241,11 +243,18 @@ class TierRegistry:
     @classmethod
     def from_profile(
         cls,
-        profile: Optional[RigProfile] = None,
+        profile: RigProfile,
         facts: Optional[LocalFacts] = None,
     ) -> TierRegistry:
-        """Declared tiers plus whatever the live facts bind and update."""
-        profile = profile if profile is not None else bundled_profile()
+        """Declared tiers plus whatever the live facts bind and update.
+
+        ``profile`` is **required**. It used to default to the bundled rig-1
+        record, which meant every machine that built a registry without
+        arguments received one particular development box's host RAM, ZFS pool
+        and 40G peer -- the exact failure ``profile.py``'s docstring says the
+        file format exists to prevent. :meth:`for_machine` is the entry point
+        that decides which profile, if any, applies here.
+        """
         facts = facts if facts is not None else LocalFacts()
         tiers: List[TierDescriptor] = list(profile.tiers)
         tiers.extend(bind_device_tiers(profile, facts.cards))
@@ -255,6 +264,40 @@ class TierRegistry:
             local_host=profile.host,
             caveat=profile.caveat,
         )
+
+    @classmethod
+    def for_machine(
+        cls,
+        facts: LocalFacts,
+        *,
+        selection: Optional[ProfileSelection] = None,
+        fs_types: Optional[Mapping[str, str]] = None,
+        host: Optional[str] = None,
+    ) -> Tuple[TierRegistry, ProfileSelection]:
+        """The registry for THIS machine, and the record of how it was chosen.
+
+        The whole generality contract in one call:
+
+        1. fingerprint the machine from ``facts`` alone (no ``/proc/cpuinfo``,
+           no hostname, nothing this function did not receive);
+        2. match every stored profile against it; a profile that does not match
+           contributes nothing, and a profile that matches only by card MODEL
+           contributes device templates and no host/filesystem/remote tier;
+        3. when nothing matches, bootstrap from the live facts -- measured
+           sizes, absent costs, every absence naming its probe.
+
+        The selection is returned rather than logged, because "which profile
+        did this rig use and what did it pass over" is the first question
+        anybody asks about a wrong number, and a caller that has to grep a log
+        for it will not.
+        """
+        resolved_host = host or default_host_name()
+        fingerprint = fingerprint_from_facts(facts, host=resolved_host)
+        chosen = selection if selection is not None else select_profile(fingerprint)
+        if chosen.profile is None:
+            profile = bootstrap_profile(facts, host=resolved_host, fs_types=fs_types)
+            return cls.from_profile(profile, LocalFacts(source=facts.source)), chosen
+        return cls.from_profile(chosen.profile, facts), chosen
 
     # -- enumeration ------------------------------------------------------
 

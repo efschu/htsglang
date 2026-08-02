@@ -181,6 +181,8 @@ def _transport_from_json(data: Mapping[str, Any]) -> TierTransport:
         name=str(data.get("name", "")),
         handle=str(data.get("handle", "")),
         stages_through=data.get("stages_through") or None,
+        link_path=tuple(str(s) for s in data.get("link_path", ())),
+        link_path_complete=bool(data.get("link_path_complete", False)),
     )
 
 
@@ -213,6 +215,12 @@ class RigProfile(msgspec.Struct, frozen=True, kw_only=True):
     device_models: Mapping[str, DeviceModelTemplate] = {}
     tiers: Tuple[TierDescriptor, ...] = ()
     path: str = ""
+    #: The hardware this profile's numbers were measured on, verbatim as the
+    #: document states it: ``{"version", "cards": [...], "models": [...]}``.
+    #: :func:`sglang.srt.memtier.fingerprint.match_profile` derives the keys
+    #: from it. An empty block means the profile makes an unverifiable claim,
+    #: and the matcher refuses it wholesale rather than trusting it.
+    hardware: Mapping[str, Any] = {}
 
     def tier(self, tier_id: TierId) -> Optional[TierDescriptor]:
         for tier in self.tiers:
@@ -322,6 +330,7 @@ def profile_from_json(
         raise ProfileError(f"{path or '<document>'}: duplicate tier ids {duplicates}")
     return RigProfile(
         profile_id=profile_id,
+        hardware=dict(data.get("hardware") or {}),
         host=str(data["host"]),
         hostnames=tuple(str(h) for h in data.get("hostnames", ())),
         title=str(data.get("title", "")),
@@ -373,11 +382,19 @@ def bundled_profile() -> RigProfile:
 
 
 class CardFact(msgspec.Struct, frozen=True, kw_only=True):
-    """One card as NVML sees it. UUID-keyed; no ordinal, ever."""
+    """One card as NVML sees it. UUID-keyed; no ordinal, ever.
+
+    ``bdf`` is the #397 readable secondary and is carried because the
+    ``p2p_readiness`` capability matrix keys its rows by PCI address rather
+    than by UUID (``barlink_path_rates.py:145-147``); the adapter that ingests
+    it needs a BDF -> UUID resolution and refuses without one. It is NOT part
+    of the hardware fingerprint: a card that moves slots keeps its UUID.
+    """
 
     uuid: str
     model: str
     total_bytes: int
+    bdf: str = ""
 
 
 class FilesystemFact(msgspec.Struct, frozen=True, kw_only=True):
@@ -608,6 +625,11 @@ def nvml_card_facts() -> Tuple[CardFact, ...]:
     from sglang.srt.registry.nvml import list_devices
 
     return tuple(
-        CardFact(uuid=d.uuid, model=d.name, total_bytes=int(d.total_bytes))
+        CardFact(
+            uuid=d.uuid,
+            model=d.name,
+            total_bytes=int(d.total_bytes),
+            bdf=getattr(d, "pci_bus_id", "") or "",
+        )
         for d in list_devices()
     )

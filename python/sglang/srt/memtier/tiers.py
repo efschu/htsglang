@@ -59,6 +59,8 @@ from sglang.srt.planner.cost_model import Provenance, Rate
 __all__ = [
     "ADMITTED_PAYLOADS",
     "HEALTH_VERDICTS",
+    "LinkDisjointness",
+    "LinkVerdict",
     "PayloadClass",
     "TierCapacity",
     "TierCaps",
@@ -74,6 +76,7 @@ __all__ = [
     "device_tier_id",
     "filesystem_tier_id",
     "host_tier_id",
+    "link_disjointness",
     "parse_tier_id",
     "unenumerated_card_key",
 ]
@@ -485,13 +488,115 @@ class TierTransport(msgspec.Struct, frozen=True, kw_only=True):
     #: The tier a mover must pass through to get here, or ``None`` for a
     #: direct edge.
     stages_through: Optional[TierId] = None
+    #: The ordered physical segments a byte traverses to reach this tier, leaf
+    #: first: ``("pcie:0000:01:00.0", "pcie-root:0000:00:01.1")``,
+    #: ``("nic:mlx5_0",)``, ``("blk:nvme0n1",)``. Segment names are opaque
+    #: strings compared for equality; nothing parses them. Empty means
+    #: "nobody recorded a path", which is NOT the same as "no shared segment"
+    #: -- see :func:`link_disjointness`.
+    link_path: Tuple[str, ...] = ()
+    #: True only when ``link_path`` is known to name EVERY segment up to the
+    #: point where two paths could converge. A leaf-only path (just the card's
+    #: own BDF) is incomplete: two cards with different BDFs may still share a
+    #: root port, and reporting them disjoint on that evidence is how #423
+    #: would stripe two streams down one wire.
+    link_path_complete: bool = False
 
     def to_json(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "handle": self.handle,
             "stages_through": self.stages_through,
+            "link_path": list(self.link_path),
+            "link_path_complete": self.link_path_complete,
         }
+
+
+class LinkVerdict(str, enum.Enum):
+    """Whether two tiers' transports contend for the same physical segment."""
+
+    #: No segment in common, and both paths are complete enough to say so.
+    DISJOINT = "disjoint"
+    #: At least one segment in common. A positive finding, safe to act on
+    #: even from incomplete paths.
+    SHARED = "shared"
+    #: Not enough recorded path to answer. The caller must refuse, not assume.
+    UNKNOWN = "unknown"
+
+
+class LinkDisjointness(msgspec.Struct, frozen=True, kw_only=True):
+    """The answer to "may these two run in parallel", with its reason."""
+
+    verdict: LinkVerdict
+    shared: Tuple[str, ...] = ()
+    reason: str = ""
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "verdict": self.verdict.value,
+            "shared": list(self.shared),
+            "reason": self.reason,
+        }
+
+
+def link_disjointness(a: TierDescriptor, b: TierDescriptor) -> LinkDisjointness:
+    """Do ``a`` and ``b`` share a physical segment? The #423 striping gate.
+
+    Striping a payload across two tiers only pays when the two moves do not
+    queue behind the same wire, and this rig already carries the counterexample
+    as data: three RDMA pairs in parallel cost 2.34x the latency for 1.28x the
+    aggregate, because one NIC serialises them. A striping planner that assumed
+    disjointness would have reported a speed-up and delivered a slowdown.
+
+    The asymmetry between the three verdicts is deliberate:
+
+    * ``SHARED`` needs only one segment in common, and an incomplete path can
+      establish it. Evidence of contention is evidence.
+    * ``DISJOINT`` needs BOTH paths complete. Absence of a shared segment in a
+      partial record is not absence of a shared segment.
+    * ``UNKNOWN`` is a refusal the caller has to handle, in the #400 shape:
+      an unpriceable item makes the caller refuse rather than guess.
+    """
+    pa, pb = a.transport.link_path, b.transport.link_path
+    if not pa or not pb:
+        missing = [t.id for t, p in ((a, pa), (b, pb)) if not p]
+        return LinkDisjointness(
+            verdict=LinkVerdict.UNKNOWN,
+            reason=(
+                f"no link path recorded for {', '.join(missing)}; whether the "
+                "two moves contend for one wire is unknown, and an unknown "
+                "answer is not a 'no'"
+            ),
+        )
+    shared = tuple(s for s in pa if s in set(pb))
+    if shared:
+        return LinkDisjointness(
+            verdict=LinkVerdict.SHARED,
+            shared=shared,
+            reason=(
+                f"{a.id} and {b.id} both traverse {', '.join(shared)}; traffic "
+                "to the two tiers queues behind the same segment"
+            ),
+        )
+    incomplete = [t.id for t in (a, b) if not t.transport.link_path_complete]
+    if incomplete:
+        return LinkDisjointness(
+            verdict=LinkVerdict.UNKNOWN,
+            reason=(
+                f"no segment is shared between the recorded paths, but "
+                f"{', '.join(incomplete)} carry an INCOMPLETE path "
+                f"({' / '.join('+'.join(t.transport.link_path) for t in (a, b))}). "
+                "Two leaves with different names can still converge upstream, "
+                "so this is not a disjointness proof."
+            ),
+        )
+    return LinkDisjointness(
+        verdict=LinkVerdict.DISJOINT,
+        reason=(
+            f"{a.id} traverses {'+'.join(pa)} and {b.id} traverses "
+            f"{'+'.join(pb)}; both paths are complete and share no segment"
+        ),
+    )
 
 
 class TierDescriptor(msgspec.Struct, frozen=True, kw_only=True):

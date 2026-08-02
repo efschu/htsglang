@@ -233,6 +233,24 @@ PROBES: Tuple[ProbeSpec, ...] = (
         requires_verdict=("block",),
     ),
     ProbeSpec(
+        id="M9",
+        label="Per-card device-memory read bandwidth",
+        question="What does this card's own VRAM deliver to its own SMs?",
+        target=ProbeTarget.BANDWIDTH,
+        kinds=(TierKind.DEVICE,),
+        harness=(
+            "rigmon/card_probe.py membw read arm, already implemented and "
+            "already cached at ~/.cache/sglang/card_probe-<sha1>.json. Read by "
+            "memtier.adapters.from_card_probe -- this is the one arm on the "
+            "list that needs no new harness, only an adapter"
+        ),
+        unblocks=(
+            "TierCaps.bandwidth_gbs on every DEVICE tier. Without it a card "
+            "tier is enumerated with an absent bandwidth and is refused "
+            "against any floor, which is correct and also useless"
+        ),
+    ),
+    ProbeSpec(
         id="M8",
         label="Memory-region registration cost",
         question="Can a remote tier be allocated per session, or must it be a static pool?",

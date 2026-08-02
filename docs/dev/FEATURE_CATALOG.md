@@ -90,7 +90,23 @@ register of discarded approaches — check it before re-proposing anything.
   provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
   (audit #421): ZERO consumers wired today — "all consumers pick targets from
   it" is the TARGET rule, not the current state; existing offload/spill paths
-  still carry their own target lists.
+  still carry their own target lists. The #421 pin test
+  (`test_unwired_features_421.py`) enforces that statement and must be updated
+  in the same merge as the first real consumer.
+  Slice 1b (#407 / directive #434) made it hardware-general:
+  `TierRegistry.for_machine()` fingerprints the box from NVML UUIDs (#397
+  canon), applies a stored profile ONLY at the scope its hardware match
+  licenses (`EXACT` = every tier; `MODEL` = card templates only, no host /
+  filesystem / remote row), and otherwise bootstraps from live facts with
+  measured sizes and every cost ABSENT naming its probe. `from_profile()` no
+  longer defaults to the bundled rig profile — that default handed one
+  development box's host RAM, ZFS pool and 40G peer to every machine.
+  Measurements are ingested from the EXISTING artifacts (`card_probe` #213,
+  rig artifact #271, `capability_matrix` #278) by `memtier/adapters.py`;
+  #407 adds no probe of its own. `TierTransport.link_path` +
+  `link_disjointness()` expose PATH identity for #423's striping gate, with
+  `DISJOINT` requiring complete paths on both sides and `UNKNOWN` being a
+  refusal. Design: `docs/dev/DESIGN_407_memtier_registry.md`.
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream
