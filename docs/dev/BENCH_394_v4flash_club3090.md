@@ -17,7 +17,9 @@ GPU state at finish: 82 / 94 / 87 % util, 19841 / 30829 / 19841 MiB,
 ## Deviations from the standard setup
 
 1. **Engine is sglang (htsglang fork), not vLLM.** Endpoint-first mode.
-   Model: DeepSeek-V4-Flash-0731, GGUF UD-IQ3_XXS (unsloth dynamic).
+   Model: DeepSeek-V4-Flash-0731, GGUF unsloth dynamic **UD-IQ3_XXS** —
+   verified against the load log (IQ3_XXS, not Q3_K_XL). `--served-model-name`
+   was not set, so the served id is the checkpoint path itself.
 
 2. **Geometry: TP=3 across mismatched cards** — one RTX 5090 (x8) and two
    RTX 3080 (x4 / x8), `--rank-tp-ratio auto` (uneven shards sized per card),
@@ -44,7 +46,8 @@ GPU state at finish: 82 / 94 / 87 % util, 19841 / 30829 / 19841 MiB,
    The arm is refused at boot rather than crashing at the first forward. No A/B
    delta is reported because there is no second arm to compare against.
 
-6. **Speculative decoding: off.** No draft model in this configuration.
+6. **Speculative decoding: OFF** — `speculative_algorithm=None` at launch (read
+   from the boot log, not assumed): no draft model, no NEXTN, no steps or topk.
 
 7. **Docker log scrape skipped, by the script's own design.** The closing
    "SpecDecoding metrics" section reads `docker logs $CONTAINER`; there is no
