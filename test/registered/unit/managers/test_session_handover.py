@@ -241,12 +241,18 @@ class _FakeTree:
         )
         self._hybrid = hybrid
         self._withhold_mamba = withhold_mamba
-        if hybrid:
-            # Presence of this attribute is how the runtime detects a
-            # hybrid-GDN tree.
-            self.mamba_archive_transfers = lambda node: None
 
     # -- runtime-facing API --
+    def supports_mamba(self):
+        # The BasePrefixCache capability every real tree implements, and the
+        # ONE thing the runtime may key the #212 gate on. An earlier version
+        # of this fake grew a ``mamba_archive_transfers`` attribute instead,
+        # which exists only on HiMambaRadixCache -- so the fake declared a
+        # hybrid tree in a way the UnifiedRadixCache the server actually
+        # builds never does, and the gate passed here while silently doing
+        # nothing on a real boot.
+        return self._hybrid
+
     def match_prefix(self, params):
         return self._match
 

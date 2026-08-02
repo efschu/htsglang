@@ -478,10 +478,19 @@ class SessionHandoverRuntime:
         return manifest
 
     def _snapshot(self, tree, record, token_ids, deadline_s: float) -> Dict:
+        from array import array
+
         from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        # RadixKey.match asserts both sides carry the SAME sequence type, and
+        # every key already in the tree was built from the scheduler's
+        # array("q") fill ids. token_ids arrives over the control plane as a
+        # plain JSON list, so it must be converted here -- a list would abort
+        # the match with a bare AssertionError instead of matching the prefix.
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        )
         matched = len(result.device_indices) + (result.host_hit_length or 0)
         if matched < len(token_ids):
             raise SessionHandoverError(
@@ -536,7 +545,15 @@ class SessionHandoverRuntime:
                 "alignment mismatch, refusing to guess the mapping"
             )
 
-        hybrid_gdn = hasattr(tree, "mamba_archive_transfers")
+        # ONE source for "does this model carry recurrent state": the
+        # BasePrefixCache capability, which every tree implements. Sniffing a
+        # concrete class's helper (``mamba_archive_transfers`` lives only on
+        # HiMambaRadixCache) silently reports False on the UnifiedRadixCache
+        # that --enable-hierarchical-cache actually builds for a hybrid SSM
+        # model -- and a False here disables the #212 gate on BOTH sides, so
+        # the recurrent state never travels and the destination re-prefills a
+        # WRONG session. That is the exact failure this gate exists to catch.
+        hybrid_gdn = bool(tree.supports_mamba())
         mamba_key = f"{kv_keys[-1]}.mamba" if hybrid_gdn else None
 
         exists = self._backend_exists(tree)
