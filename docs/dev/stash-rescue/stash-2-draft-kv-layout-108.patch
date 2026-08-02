@@ -1,0 +1,378 @@
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index 0c00f155bf..55325e1b7c 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -462,15 +462,28 @@ class FlashInferAttnBackend(AttentionBackend):
+         self.dcp_size = get_parallel().attn_dcp_size
+         self.dcp_rank = get_parallel().attn_dcp_rank
+         # M4 (MTP+DCP): the DRAFT worker (EAGLE/NEXTN) does NOT token-shard its
+-        # tiny 1-layer KV pool. It runs as a plain uneven-TP model -- head-sharded
+-        # kv (whole GQA groups per rank, [2,1,1]) with the FULL token context
+-        # resident on every rank -- so its draft/verify KV indices never need the
+-        # weighted DCP owner rule. Only the TARGET model uses DCP token-sharding.
+-        # This is the coordinator's "keep the draft heads local, not DCP-split"
+-        # simplification (minimal variant: head-sharded across ranks, reusing the
+-        # existing uneven-TP weight loading, rather than whole-on-one-card).
+-        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size) and not getattr(
+-            model_runner, "is_draft_worker", False
++        # tiny 1-layer KV pool BY DEFAULT (--draft-kv-layout replicated). It runs
++        # as a plain uneven-TP model -- head-sharded kv (whole GQA groups per
++        # rank, [2,1,1]) with the FULL token context resident on every rank -- so
++        # its draft/verify KV indices never need the weighted DCP owner rule.
++        # Only the TARGET model uses DCP token-sharding.
++        #
++        # #108 (--draft-kv-layout dcp): opt in to token-sharding the DRAFT KV
++        # pool with the SAME weighted owner rule + replicated-kv-heads + LSE-merge
++        # as the target. When enabled the draft worker takes the identical
++        # uneven_dcp path below (owner-rule masked write, per-layer kv-head
++        # all-gather, cross-rank LSE-merge); the draft pool is sized per-rank and
++        # its heads replicated in model_runner_kv_cache_mixin. This is a lossless
++        # memory optimization: at temp=0 the verified output is byte-identical to
++        # 'replicated' (the target verify path is untouched). Gated OFF by
++        # default so the replicated path stays bit-identical.
++        _is_draft = getattr(model_runner, "is_draft_worker", False)
++        _draft_kv_layout = getattr(
++            getattr(model_runner, "server_args", None), "draft_kv_layout", "replicated"
++        )
++        _draft_replicated = _is_draft and _draft_kv_layout != "dcp"
++        self.uneven_dcp = (
++            uneven_dcp_kv_replicated(self.dcp_size) and not _draft_replicated
+         )
+         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
+         # vector is installed, so this rank owns the contiguous virtual-block
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index a95cf28c9d..4dee0ba681 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -1493,7 +1493,18 @@ class ModelRunnerKVCacheMixin:
+                 # (LOCAL head-sharded kv, FULL token context) -- it is NOT
+                 # DCP-token-sharded (see FlashInferAttnBackend.__init__ draft
+                 # gate). Only the TARGET model replicates heads + token-shards.
+-                _draft_non_dcp = self.is_draft_worker
++                #
++                # #108 (--draft-kv-layout dcp): opt in to token-sharding the
++                # draft pool exactly like the target -- replicate the kv heads
++                # (get_total_num_kv_heads below) and size the pool to this rank's
++                # owned share C*ratio_r/S (the uneven_dcp_active branch below).
++                # Gated OFF by default (replicated) so the default path is
++                # bit-identical.
++                _draft_dcp = (
++                    self.is_draft_worker
++                    and self.server_args.draft_kv_layout == "dcp"
++                )
++                _draft_non_dcp = self.is_draft_worker and not _draft_dcp
+                 if uneven_dcp_kv_replicated(self.dcp_size) and not _draft_non_dcp:
+                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
+                 else:
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 155e9aca64..1ae8446595 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1062,6 +1062,24 @@ class ServerArgs:
+             aliases=["--decode-context-parallel-size"],
+         ),
+     ] = 1
++    draft_kv_layout: A[
++        str,
++        Arg(
++            help=(
++                "Memory layout of the speculative DRAFT KV pool across TP "
++                "ranks. 'replicated' (default) keeps the full token context on "
++                "every rank (today's behavior, unchanged). 'dcp' token-shards "
++                "the draft KV pool across ranks using the SAME weighted DCP "
++                "owner rule + replicated-kv-heads + LSE-merge as the target "
++                "model, making the draft KV token-addressable (granular "
++                "draft-VRAM control; foundation for spec in PD-disaggregation). "
++                "'dcp' is only valid under the uneven-weighted-DCP + MTP/chain "
++                "(topk=1) path; it is a lossless memory optimization: at temp=0 "
++                "the verified output is byte-identical to 'replicated'."
++            ),
++            choices=("replicated", "dcp"),
++        ),
++    ] = "replicated"
+     enable_prefill_cp: A[
+         bool,
+         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
+@@ -2753,6 +2771,47 @@ class ServerArgs:
+         int,
+         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
+     ] = 0
++    pd_prefill_topology: A[
++        str,
++        Arg(
++            help=(
++                "Single-node PD-disaggregation topology preset (#107). Set on "
++                "the DECODE server. "
++                "'solo' (default): unchanged legacy behavior — the decode "
++                "server uses whatever --tp / --rank-gpu-id / --rank-tp-ratio "
++                "you pass (e.g. #99's TP=3 over the 5090 + 2x3080, with the "
++                "5090 shared between prefill and decode rank 0). "
++                "'disjoint' (Variant A): the big card is a PURE prefill card "
++                "and decode runs on a GPU set DISJOINT from prefill as even, "
++                "uniform-TP DCP replicated-KV. This preset auto-enables the "
++                "replicated-KV token-sharded layout (sets SGLANG_UNEVEN_DCP=1 "
++                "and, if you did not pass --rank-tp-ratio, installs a uniform "
++                "one-per-rank ratio) so you do not have to hand-assemble that "
++                "incantation; it also hard-aborts on PP/DP/EP (V1 is pure "
++                "single-node TP only). Removes the prefill/decode coexistence "
++                "constraint so prefill gets the whole big card and full "
++                "context. "
++                "'uneven:RATIO' is RESERVED for Variant B (uneven-prefill "
++                "group) and is not yet implemented."
++            ),
++        ),
++    ] = "solo"
++    pd_prefill_gpu_id: A[
++        Optional[int],
++        Arg(
++            help=(
++                "Optional physical (torch-order) GPU index of the PURE prefill "
++                "card, for the --pd-prefill-topology disjoint fail-fast "
++                "disjointness check on the DECODE server. When set, the decode "
++                "server hard-errors if this index appears in its own "
++                "--rank-gpu-id (an accidental overlap would silently "
++                "re-introduce prefill/decode coexistence contention, defeating "
++                "the whole point of the disjoint topology). When omitted, "
++                "keeping the prefill card out of the decode set is the "
++                "operator's responsibility."
++            ),
++        ),
++    ] = None
+ 
+     # -------------------------------------------------------------------------
+     # Encode prefill disaggregation
+@@ -3131,6 +3190,13 @@ class ServerArgs:
+         # Validate PD disaggregation flags before CUDA graph config.
+         self._handle_pd_disaggregation()
+ 
++        # Expand the single-node PD topology preset (#107 Variant A). Must run
++        # BEFORE _handle_uneven_tp() so the preset's SGLANG_UNEVEN_DCP env and
++        # auto-uniform --rank-tp-ratio are visible when dcp_size is resolved
++        # (dcp_size auto-set to tp_size, then the existing decode replicated-KV
++        # validation, both live in _handle_uneven_tp).
++        self._handle_pd_prefill_topology()
++
+         # Normalize deprecated CP aliases before validations or model-specific
+         # defaults inspect enable_prefill_cp/cp_strategy.
+         self._handle_legacy_cp_arguments()
+@@ -3336,10 +3402,192 @@ class ServerArgs:
+ 
+         handle_pd_disaggregation(self)
+ 
++    def _handle_pd_prefill_topology(self):
++        """Expand + validate the single-node PD topology preset (#107).
++
++        'solo' (default) is a strict no-op so the legacy #99 path stays
++        byte-identical. 'disjoint' (Variant A) makes the big card a PURE
++        prefill card and runs decode on a GPU set disjoint from prefill as
++        even/uniform-TP DCP replicated-KV: the preset auto-installs the
++        replicated-KV token-sharded layout (the SGLANG_UNEVEN_DCP env + a
++        uniform --rank-tp-ratio) so operators do not hand-assemble that
++        footgun, and hard-aborts on PP/DP/EP (V1 = pure single-node TP).
++
++        Runs BEFORE _handle_uneven_tp so the env/ratio it sets are visible
++        when dcp_size is resolved to tp_size; the dcp_size==tp_size check
++        itself is enforced downstream by the existing decode replicated-KV
++        validation in _handle_uneven_tp.
++        """
++        topology = (self.pd_prefill_topology or "solo").strip()
++
++        if topology == "solo":
++            # Legacy path unchanged. --pd-prefill-gpu-id only has meaning for
++            # the disjoint disjointness check; reject it here so it cannot be
++            # silently ignored.
++            if self.pd_prefill_gpu_id is not None:
++                raise ValueError(
++                    "--pd-prefill-gpu-id only applies with "
++                    "--pd-prefill-topology disjoint."
++                )
++            return
++
++        if topology == "uneven" or topology.startswith("uneven:"):
++            raise ValueError(
++                f"--pd-prefill-topology {topology!r} is RESERVED for Variant B "
++                "(uneven-prefill-group, #82 co-location) and is not yet "
++                "implemented. Use 'solo' (default, current #99 behavior) or "
++                "'disjoint' (Variant A: pure-prefill big card + even-TP decode "
++                "on a disjoint GPU set)."
++            )
++
++        if topology != "disjoint":
++            raise ValueError(
++                f"Invalid --pd-prefill-topology {topology!r}. Expected one of: "
++                "'solo' (default), 'disjoint', or 'uneven:RATIO' (reserved)."
++            )
++
++        # ---- disjoint (Variant A) ----
++        # The preset governs the DECODE server (that is where the topology
++        # differs; the prefill server is always solo TP=1). Requiring decode
++        # mode keeps the flag unambiguous.
++        if self.disaggregation_mode != "decode":
++            raise ValueError(
++                "--pd-prefill-topology disjoint must be set on the DECODE "
++                "server (--disaggregation-mode decode). The prefill server is "
++                "always solo TP=1 and needs no topology flag; passing "
++                f"disjoint with --disaggregation-mode={self.disaggregation_mode!r} "
++                "is a configuration error."
++            )
++
++        # V1 is pure single-node Tensor Parallelism. Combining disjoint decode
++        # with Pipeline/Data/Expert Parallelism is out of scope — abort hard
++        # rather than silently producing a wrong or hanging topology.
++        parallel_violations = []
++        if self.pp_size and self.pp_size > 1:
++            parallel_violations.append(f"pp_size={self.pp_size}")
++        if self.dp_size and self.dp_size > 1:
++            parallel_violations.append(f"dp_size={self.dp_size}")
++        if self.ep_size and self.ep_size > 1:
++            parallel_violations.append(f"ep_size={self.ep_size}")
++        if parallel_violations:
++            raise ValueError(
++                "--pd-prefill-topology disjoint (Variant A) supports pure "
++                "single-node Tensor Parallelism only, but got "
++                f"{', '.join(parallel_violations)}. Pipeline/Data/Expert "
++                "Parallelism combinations are not supported in V1."
++            )
++
++        if not self.tp_size or self.tp_size < 2:
++            raise ValueError(
++                "--pd-prefill-topology disjoint runs decode as multi-rank TP on "
++                f"the decode-only GPU set, but got --tp {self.tp_size}. Use "
++                "--tp 2 (or more) with --rank-gpu-id naming the decode cards."
++            )
++
++        # The decode cards must be named explicitly: disjoint places decode on
++        # a specific GPU set (the small cards), leaving the big card pure
++        # prefill. This is also required to install the replicated-KV ratio.
++        if not self.rank_gpu_id:
++            raise ValueError(
++                "--pd-prefill-topology disjoint requires --rank-gpu-id (and "
++                "--rank-gpu-memory-mib) naming the decode-only GPU set, e.g. "
++                "--tp 2 --rank-gpu-id <gpuA>,<gpuB> --rank-gpu-memory-mib "
++                "<mib>. Leave the pure-prefill big card OUT of this list."
++            )
++        if len(self.rank_gpu_id) != self.tp_size:
++            raise ValueError(
++                f"--pd-prefill-topology disjoint: --rank-gpu-id length "
++                f"({len(self.rank_gpu_id)}) must equal --tp ({self.tp_size})."
++            )
++        # Co-locating two decode ranks on one card contradicts the even/uniform
++        # disjoint intent; keep it one rank per card.
++        if len(set(self.rank_gpu_id)) != len(self.rank_gpu_id):
++            raise ValueError(
++                "--pd-prefill-topology disjoint expects one decode rank per "
++                f"card (distinct --rank-gpu-id), got {self.rank_gpu_id}."
++            )
++
++        # Fail-fast disjointness insurance: the pure-prefill card must not be
++        # in the decode set, else prefill/decode coexistence contention (the
++        # exact constraint this variant removes) silently returns.
++        if self.pd_prefill_gpu_id is not None:
++            if self.pd_prefill_gpu_id in self.rank_gpu_id:
++                raise ValueError(
++                    "--pd-prefill-topology disjoint requires the prefill and "
++                    "decode GPU sets to be DISJOINT, but the prefill card "
++                    f"--pd-prefill-gpu-id {self.pd_prefill_gpu_id} appears in "
++                    f"the decode --rank-gpu-id {self.rank_gpu_id}. Remove the "
++                    "prefill card from the decode set (that overlap is exactly "
++                    "the coexistence contention this topology eliminates)."
++                )
++
++        # Footgun-encoding: the decode replicated-KV token-sharded layout is
++        # activated by SGLANG_UNEVEN_DCP=1 PLUS an installed --rank-tp-ratio
++        # (uniform is fine). Without the ratio the fork's PD receive path
++        # hard-errors ("requires the uneven-TP replicated-KV layout"); the
++        # preset installs both so the operator does not have to know that.
++        if os.environ.get("SGLANG_UNEVEN_DCP", "0") != "1":
++            os.environ["SGLANG_UNEVEN_DCP"] = "1"
++            logger.info(
++                "--pd-prefill-topology disjoint: auto-set SGLANG_UNEVEN_DCP=1 "
++                "for the decode replicated-KV token-sharded layout."
++            )
++        # Even/uniform DCP: DO NOT set SGLANG_UNEVEN_DCP_WEIGHTED (weighting is
++        # for the heterogeneous-card #99 layout); the even-modulo owner rule
++        # (L mod tp == rank) is what we want on identical decode cards.
++        if self.rank_tp_ratio is None:
++            self.rank_tp_ratio = [1] * self.tp_size
++            logger.info(
++                "--pd-prefill-topology disjoint: auto-set uniform "
++                "--rank-tp-ratio %s (installs the replicated-KV partition "
++                "plan; even-modulo DCP owner rule).",
++                self.rank_tp_ratio,
++            )
++
+     def _handle_dcp_validation(self):
+         # Decode context parallel (DCP) is currently implemented and validated
+         # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+         # early instead of letting them fail deeper in model initialization.
++        #
++        # --draft-kv-layout dcp: token-shard the DRAFT KV pool exactly like the
++        # target. It reuses the uneven-weighted-DCP owner rule + LSE-merge, so it
++        # is ONLY valid on that same path (SGLANG_UNEVEN_DCP=1 +
++        # SGLANG_UNEVEN_DCP_WEIGHTED=1, non-uniform --rank-tp-ratio,
++        # dcp_size==tp_size, a spec algo set, MTP/chain topk==1). The topk>1 tree
++        # case is rejected by the check below (shared with the verify path).
++        # Fail fast here so a misconfigured 'dcp' can never fall through to the
++        # default replicated path silently (or deadlock later on a non-uniform
++        # collective).
++        if self.draft_kv_layout == "dcp":
++            _uneven_weighted_dcp = (
++                self.speculative_algorithm is not None
++                and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
++                and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
++                and self.rank_tp_ratio is not None
++                and len(set(self.rank_tp_ratio)) > 1
++                and self.dcp_size > 1
++                and self.dcp_size == self.tp_size
++            )
++            if not _uneven_weighted_dcp:
++                raise ValueError(
++                    "--draft-kv-layout dcp requires the uneven-hybrid weighted "
++                    "DCP + speculative path: a spec algorithm, "
++                    "SGLANG_UNEVEN_DCP=1, SGLANG_UNEVEN_DCP_WEIGHTED=1, a "
++                    "non-uniform --rank-tp-ratio, and dcp_size==tp_size (>1). "
++                    "Leave --draft-kv-layout at its default 'replicated' for "
++                    "every other configuration."
++                )
++            if (
++                self.speculative_eagle_topk is not None
++                and self.speculative_eagle_topk > 1
++            ):
++                raise ValueError(
++                    "--draft-kv-layout dcp is only supported for a linear draft "
++                    "chain (MTP/NEXTN, --speculative-eagle-topk 1). Tree/"
++                    "branching speculation (topk>1) under DCP-sharded draft KV "
++                    "is not implemented; use --speculative-eagle-topk 1 or "
++                    "--draft-kv-layout replicated."
++                )
+         if self.dcp_size < 1:
+             raise ValueError(
+                 "Decode context parallel size (--dcp-size / "
+@@ -4368,10 +4616,23 @@ class ServerArgs:
+                     f"got {self.rank_tp_ratio}."
+                 )
+             if len(set(self.rank_tp_ratio)) == 1:
+-                raise ValueError(
+-                    "--rank-tp-ratio with identical entries is the even "
+-                    "split — omit the flag instead."
+-                )
++                # A uniform ratio is normally pointless (it IS the even split),
++                # so reject it to catch mistakes. EXCEPTION: under the DCP
++                # replicated-KV path (SGLANG_UNEVEN_DCP=1 — e.g.
++                # --pd-prefill-topology disjoint even-TP decode, #107 Variant A),
++                # the ratio's PRESENCE is load-bearing: it installs the base
++                # partition plan that flips on token-sharded replicated KV
++                # (uneven_dcp_kv_replicated) so the PD receive path has a
++                # compact-owned-rows layout, here with the EVEN-modulo owner
++                # rule (L % tp == rank). Allow a uniform ratio in that case.
++                if os.environ.get("SGLANG_UNEVEN_DCP", "0") != "1":
++                    raise ValueError(
++                        "--rank-tp-ratio with identical entries is the even "
++                        "split — omit the flag instead (unless enabling the "
++                        "DCP replicated-KV token-sharded layout with "
++                        "SGLANG_UNEVEN_DCP=1, e.g. --pd-prefill-topology "
++                        "disjoint)."
++                    )
+ 
+         # Per-rank MiB list checks.
+         if isinstance(self.rank_gpu_memory_mib, list):

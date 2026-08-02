@@ -1,0 +1,607 @@
+diff --git a/python/sglang/srt/distributed/utils.py b/python/sglang/srt/distributed/utils.py
+index 106601b248..f327d57914 100644
+--- a/python/sglang/srt/distributed/utils.py
++++ b/python/sglang/srt/distributed/utils.py
+@@ -140,6 +140,21 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
+     return _TP_PARTITION_RATIOS
+ 
+ 
++def tp_vocab_ratios(tp_size: int) -> Optional[list]:
++    """The vocab family's OWN weight vector (--rank-vocab-ratio), or None.
++
++    Unlike the other families ("mlp"/"moe", which fall back to the base
++    --rank-tp-ratio plan), the vocab dimension deliberately does NOT
++    inherit the base vector: without an EXPLICIT vocab vector the
++    embedding / LM-head split stays the classic even one (M22: "vocab
++    always even by design"), keeping the default and plain-uneven-TP
++    paths byte-identical. A uniform vector collapses to None (= even)."""
++    vec = _TP_PARTITION_FAMILIES.get("vocab")
++    if not vec or len(vec) != tp_size or len(set(vec)) == 1:
++        return None
++    return vec
++
++
+ # ---------------------------------------------------------------------------
+ # Uneven decode context parallel (uneven DCP) token-axis split.
+ #
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 1936f2c909..9a59cc7015 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -480,6 +480,12 @@ class Envs:
+     # family, MOE = fused expert-weight family.
+     SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
+     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
++    # Uneven TP: ratio-weighted VOCAB sharding of embedding/LM head
++    # ("a,b,c", one positive integer per TP rank). Takes precedence over
++    # --rank-vocab-ratio. Unlike the MLP/MOE families the vocab dimension
++    # does NOT follow the base --rank-tp-ratio plan by default -- without
++    # an explicit vector it stays evenly split (stock behavior).
++    SGLANG_UNEVEN_VOCAB_VECTOR = EnvStr(None)
+     # Uneven DCP token-axis split vector ("a,b,c", one positive integer per
+     # DCP rank). Overrides the budget-estimate vector resolve_cp_token_ratios
+     # would otherwise derive. Emitted by the KV-pool self-calibration as a
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 391cbbb25f..597f7edab5 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -24,6 +24,7 @@ from torch import nn
+ from sglang.kernels.ops.activation.softcap import (
+     softcap_inplace_logits as fused_softcap,
+ )
++from sglang.srt.distributed import tensor_model_parallel_all_gather
+ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import (
+@@ -364,11 +365,32 @@ class LogitsProcessor(nn.Module):
+         self.enable_mis = get_server_args().enable_mis
+         self.rl_on_policy_target = get_server_args().rl_on_policy_target
+ 
++        # Ratio-weighted vocab sharding (--rank-vocab-ratio): the per-rank
++        # PADDED lm_head shard sizes (from the shared helper, so the gather
++        # layout matches the layer sharding exactly), or None (default even
++        # split). The equal-shard gatherers cannot express uneven shards, so
++        # the gather goes through _all_gather_uneven_vocab_logits instead.
++        self.uneven_vocab_shard_sizes = None
++        if self.do_tensor_parallel_all_gather and not self.use_attn_tp_group:
++            from sglang.srt.layers.vocab_parallel_embedding import (
++                DEFAULT_VOCAB_PADDING_SIZE,
++                uneven_vocab_padded_shard_sizes,
++            )
++
++            self.uneven_vocab_shard_sizes = uneven_vocab_padded_shard_sizes(
++                self.vocab_size,
++                DEFAULT_VOCAB_PADDING_SIZE,
++                get_parallel().tp_size,
++            )
++            self._uneven_vocab_tp_rank = get_parallel().tp_rank
++
+         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                 include_prefill=False, floor=128
+             ),
+-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
++            enabled=self.do_tensor_parallel_all_gather
++            and not self.use_attn_tp_group
++            and self.uneven_vocab_shard_sizes is None,
+             skip_entry_sync=True,
+         )
+ 
+@@ -926,7 +948,9 @@ class LogitsProcessor(nn.Module):
+             logits.mul_(self.logit_scale)
+ 
+         if self.do_tensor_parallel_all_gather:
+-            if self.use_attn_tp_group:
++            if self.uneven_vocab_shard_sizes is not None:
++                logits = self._all_gather_uneven_vocab_logits(logits)
++            elif self.use_attn_tp_group:
+                 logits = self._gather_attn_tp_logits(logits)
+             else:
+                 logits = self._logits_gatherer(logits)
+@@ -1006,6 +1030,40 @@ class LogitsProcessor(nn.Module):
+             return hidden_states, local_hidden_states
+         return hidden_states, hidden_states
+ 
++    def _all_gather_uneven_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
++        """All-gather logits when the per-rank lm_head vocab shards differ
++        (--rank-vocab-ratio).
++
++        NCCL all-gather requires EQUAL shapes on every rank, so the uneven
++        shards use the pad-to-max sync trick (same pattern as the uneven
++        head gather in layers/dcp/comm.cp_all_gather_heads_uneven): pad this
++        rank's logits to max(shard sizes), all-gather the equal-shaped
++        padded tensor, then slice out each rank's TRUE shard and
++        re-concatenate in rank order (= global vocab order, since vocab
++        shards are contiguous prefix-sum slices). Every op is functional
++        with per-rank-static shapes: F.pad rewrites both the copied and the
++        zero region on each graph replay and the slices/cat allocate from
++        the capture pool, so no buffer can go stale across replays
++        (cuda-graph safe; the pad garbage is sliced away before compute).
++        """
++        sizes = self.uneven_vocab_shard_sizes
++        local = logits.shape[-1]
++        assert local == sizes[self._uneven_vocab_tp_rank], (
++            f"uneven vocab gather: local logits width {local} != this rank's "
++            f"shard size {sizes[self._uneven_vocab_tp_rank]} (plan {sizes})"
++        )
++        max_size = max(sizes)
++        if local < max_size:
++            padded = torch.nn.functional.pad(logits, (0, max_size - local))
++        else:
++            padded = logits
++        gathered = tensor_model_parallel_all_gather(padded.contiguous(), dim=-1)
++        parts = [
++            gathered[:, r * max_size : r * max_size + sizes[r]]
++            for r in range(len(sizes))
++        ]
++        return torch.cat(parts, dim=-1)
++
+     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+         if self.vocab_size % self.attn_tp_size == 0:
+             global_logits = torch.empty(
+diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
+index 5bb8fe6374..48ccf2a2bd 100644
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -15,7 +15,11 @@ from sglang.srt.distributed import (
+     get_tp_group,
+     tensor_model_parallel_all_reduce,
+ )
+-from sglang.srt.distributed.utils import tp_plan_active
++from sglang.srt.distributed.utils import (
++    partition_sizes,
++    tp_plan_active,
++    tp_vocab_ratios,
++)
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+@@ -75,6 +79,34 @@ def vocab_range_from_global_vocab_size(
+     )
+ 
+ 
++def uneven_vocab_padded_shard_sizes(
++    org_vocab_size: int,
++    padding_size: int,
++    tp_size: int,
++) -> Optional[List[int]]:
++    """Per-rank PADDED vocab shard sizes under --rank-vocab-ratio, or None
++    when no (non-uniform) vocab family vector is installed.
++
++    The padded vocab is treated as ``org_vocab_size_padded / padding_size``
++    indivisible units of ``padding_size`` rows, distributed by
++    largest-remainder rounding (partition_sizes), so every shard stays a
++    multiple of the padding size and the prefix-sum shard bounds stay
++    aligned. Ratio-weighted shards do NOT need the padded vocab to be
++    divisible by tp_size, so the lcm(padding, tp_size) bump of the even
++    uneven-TP path is skipped -- the base padding (default 64) applies.
++
++    Shared single source of truth for the layer sharding
++    (VocabParallelEmbedding/ParallelLMHead) and the logits gather
++    (LogitsProcessor), which must agree on the exact per-rank sizes."""
++    ratios = tp_vocab_ratios(tp_size)
++    if ratios is None:
++        return None
++    org_vocab_size_padded = pad_vocab_size(org_vocab_size, padding_size)
++    return partition_sizes(
++        org_vocab_size_padded, ratios, units=org_vocab_size_padded // padding_size
++    )
++
++
+ @dataclass
+ class VocabParallelEmbeddingShardIndices:
+     """Indices for a shard of a vocab parallel embedding."""
+@@ -257,9 +289,33 @@ class VocabParallelEmbedding(torch.nn.Module):
+         self.num_embeddings = num_embeddings
+         self.org_vocab_size = org_num_embeddings or num_embeddings
+ 
++        # Ratio-weighted vocab sharding (--rank-vocab-ratio): per-rank
++        # PADDED shard sizes, or None (the default) for the classic even
++        # split. Only an EXPLICIT non-uniform vocab family vector activates
++        # this; a plain --rank-tp-ratio plan keeps vocab even (M22).
++        # use_attn_tp_group (enable_dp_lm_head) is rejected in server_args.
++        self.uneven_vocab_shard_sizes: Optional[List[int]] = None
++        if self.enable_tp and self.tp_size > 1 and not use_attn_tp_group:
++            self.uneven_vocab_shard_sizes = uneven_vocab_padded_shard_sizes(
++                self.org_vocab_size, padding_size, self.tp_size
++            )
++        if self.uneven_vocab_shard_sizes is not None:
++            if num_embeddings != self.org_vocab_size:
++                raise NotImplementedError(
++                    "--rank-vocab-ratio does not support added (LoRA) "
++                    f"vocab embeddings (num_embeddings={num_embeddings}, "
++                    f"org_vocab_size={self.org_vocab_size})."
++                )
++            if use_presharded_weights:
++                raise NotImplementedError(
++                    "--rank-vocab-ratio does not support presharded "
++                    "vocab weights (the checkpoint is pre-split evenly)."
++                )
++
+         # Support the case where the vocab size is not divisible by the TP size.
+         if (
+             _is_cpu
++            and self.uneven_vocab_shard_sizes is None
+             and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
+         ):
+             padding_size *= self.tp_size
+@@ -268,8 +324,14 @@ class VocabParallelEmbedding(torch.nn.Module):
+         # embedding all-reduce stay symmetric). The default padding (64)
+         # only guarantees even divisibility for power-of-two TP sizes;
+         # with e.g. TP=3 pad to a multiple of lcm(padding, tp_size).
+-        # Never taken on the default path (no plan installed).
+-        if self.tp_size > 1 and tp_plan_active(self.tp_size):
++        # Never taken on the default path (no plan installed). With an
++        # explicit --rank-vocab-ratio the per-unit partition handles any
++        # tp_size, so the base padding is kept.
++        if (
++            self.tp_size > 1
++            and self.uneven_vocab_shard_sizes is None
++            and tp_plan_active(self.tp_size)
++        ):
+             padding_size = math.lcm(padding_size, self.tp_size)
+         self.padding_size = padding_size
+ 
+@@ -295,6 +357,7 @@ class VocabParallelEmbedding(torch.nn.Module):
+             self.org_vocab_size,
+             tp_rank,
+             self.tp_size,
++            uneven_shard_sizes=self.uneven_vocab_shard_sizes,
+         )
+         self.embedding_dim = embedding_dim
+ 
+@@ -323,9 +386,16 @@ class VocabParallelEmbedding(torch.nn.Module):
+             params_dtype = torch.get_default_dtype()
+         # Divide the weight matrix along the vocaburaly dimension.
+         self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
+-        self.num_embeddings_per_partition = divide(
+-            self.num_embeddings_padded, self.tp_size
+-        )
++        if self.uneven_vocab_shard_sizes is not None:
++            # Ratio-weighted shards: this rank's padded shard size (per-rank
++            # sizes differ by design; even TP keeps the classic divide()).
++            self.num_embeddings_per_partition = self.uneven_vocab_shard_sizes[
++                tp_rank
++            ]
++        else:
++            self.num_embeddings_per_partition = divide(
++                self.num_embeddings_padded, self.tp_size
++            )
+         assert (
+             self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
+         )
+@@ -357,19 +427,40 @@ class VocabParallelEmbedding(torch.nn.Module):
+         org_vocab_size: int,
+         tp_rank: int,
+         tp_size: int,
++        uneven_shard_sizes: Optional[List[int]] = None,
+     ) -> VocabParallelEmbeddingShardIndices:
+         """Get start and end indices for vocab parallel embedding, following the
+         layout outlined in the class docstring, based on the given tp_rank and
+-        tp_size."""
+-        num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
+-        padded_org_vocab_start_index, padded_org_vocab_end_index = (
+-            vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
+-        )
+-        padded_added_vocab_start_index, padded_added_vocab_end_index = (
+-            vocab_range_from_global_vocab_size(
+-                num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
++        tp_size.
++
++        With `uneven_shard_sizes` (--rank-vocab-ratio; no added/LoRA vocab,
++        enforced in __init__), the padded org-vocab bounds are the prefix-sum
++        slices of the per-rank padded shard sizes instead of the even split;
++        the (empty) added-vocab range degenerates to [org_vocab_size,
++        org_vocab_size) exactly like the even zero-added case."""
++        if uneven_shard_sizes is not None:
++            assert vocab_size_padded == org_vocab_size_padded  # no added vocab
++            padded_org_vocab_start_index = sum(uneven_shard_sizes[:tp_rank])
++            padded_org_vocab_end_index = (
++                padded_org_vocab_start_index + uneven_shard_sizes[tp_rank]
++            )
++            padded_added_vocab_start_index = org_vocab_size
++            padded_added_vocab_end_index = org_vocab_size
++        else:
++            num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
++            padded_org_vocab_start_index, padded_org_vocab_end_index = (
++                vocab_range_from_global_vocab_size(
++                    org_vocab_size_padded, tp_rank, tp_size
++                )
++            )
++            padded_added_vocab_start_index, padded_added_vocab_end_index = (
++                vocab_range_from_global_vocab_size(
++                    num_added_embeddings_padded,
++                    tp_rank,
++                    tp_size,
++                    offset=org_vocab_size,
++                )
+             )
+-        )
+         # remove padding
+         org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
+         org_vocab_end_index = min(padded_org_vocab_end_index, org_vocab_size)
+@@ -400,6 +491,14 @@ class VocabParallelEmbedding(torch.nn.Module):
+         if self.tp_size < 2:
+             return None
+ 
++        # Per-rank padded shard sizes: uniform on the even path, the ratio
++        # partition under --rank-vocab-ratio (prefix sums replace the
++        # `per_partition * rank` formula; identical for uniform sizes).
++        if self.uneven_vocab_shard_sizes is not None:
++            per_rank_sizes = self.uneven_vocab_shard_sizes
++        else:
++            per_rank_sizes = [self.num_embeddings_per_partition] * self.tp_size
++
+         base_embeddings: List[int] = []
+         added_embeddings: List[int] = []
+         padding: List[int] = []
+@@ -411,9 +510,10 @@ class VocabParallelEmbedding(torch.nn.Module):
+                 self.org_vocab_size,
+                 tp_rank,
+                 self.tp_size,
++                uneven_shard_sizes=self.uneven_vocab_shard_sizes,
+             )
+-            range_start = self.num_embeddings_per_partition * tp_rank
+-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
++            range_start = sum(per_rank_sizes[:tp_rank])
++            range_end = range_start + per_rank_sizes[tp_rank]
+             base_embeddings.extend(
+                 range(range_start, range_start + shard_indices.num_org_elements)
+             )
+@@ -461,6 +561,18 @@ class VocabParallelEmbedding(torch.nn.Module):
+             param.weight_type = loaded_weight.item()
+             return
+         elif isinstance(param, UninitializedParameter):
++            if self.uneven_vocab_shard_sizes is not None:
++                # Lazily-materialized vocab params (quantized GGUF qweight)
++                # bake the even `full // tp_size` split into their shape and
++                # row-block layout; ratio-weighted shards would need
++                # quant-block-aware offsets. Qwen3.5/3.6 GGUF de-quantizes
++                # embed/lm_head to dense before loading, so this path is
++                # never hit there.
++                raise NotImplementedError(
++                    "--rank-vocab-ratio does not support lazily-materialized "
++                    "(quantized) vocab weights; only dense embed/lm_head "
++                    "checkpoints are supported."
++                )
+             shape = list(loaded_weight.shape)
+             if output_dim is not None:
+                 shape[output_dim] = shape[output_dim] // self.tp_size
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a487cc5cd0..b29c411bbd 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -4486,7 +4486,15 @@ def configure_scheduler_process(
+         else None
+     )
+     family_plans = {}
+-    for family, field in (("mlp", "rank_mlp_ratio"), ("moe", "rank_moe_ratio")):
++    for family, field in (
++        ("mlp", "rank_mlp_ratio"),
++        ("moe", "rank_moe_ratio"),
++        # "vocab" (--rank-vocab-ratio / SGLANG_UNEVEN_VOCAB_VECTOR) is
++        # consumed ONLY via the strict tp_vocab_ratios() accessor: unlike
++        # mlp/moe it never falls back to the base plan, so vocab stays
++        # even unless the flag is explicitly set.
++        ("vocab", "rank_vocab_ratio"),
++    ):
+         vector = getattr(server_args, field, None)
+         if isinstance(vector, list):
+             family_plans[family] = vector
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index a92ab4fdd9..0bf0fc77c7 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -429,6 +429,13 @@ def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
+     return [int(part.strip()) for part in value.split(",")]
+ 
+ 
++def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
++    """Parse --rank-vocab-ratio: 'auto' or a comma-separated integer list."""
++    if value.strip() == "auto":
++        return "auto"
++    return [int(part.strip()) for part in value.split(",")]
++
++
+ def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
+     """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
+ 
+@@ -1241,6 +1248,29 @@ class ServerArgs:
+             type_parser=_parse_int_list,
+         ),
+     ] = None
++    rank_vocab_ratio: A[
++        Optional[Union[List[int], str]],
++        Arg(
++            help="Uneven TP: ratio-weighted VOCAB sharding of the embedding "
++            "and LM head (comma-separated positive integer weights, one per "
++            "rank, or 'auto'). By default (flag unset) the vocab dimension "
++            "ALWAYS keeps the classic even split, even under an uneven "
++            "--rank-tp-ratio plan — the LM-head matvec then runs at the "
++            "SLOWEST card's weight-read time. This flag splits the vocab "
++            "rows proportionally to the given weights instead (e.g. 13,6,6 "
++            "on one fast + two slow cards), balancing the per-rank lm_head "
++            "read TIME. 'auto' derives the weights from the cached hardware "
++            "profile's memory-bandwidth scores (written by --rank-tp-ratio "
++            "auto-performance) and falls back to the resolved "
++            "--rank-tp-ratio weights when no profile is cached. Affects the "
++            "target model AND any NEXTN/EAGLE draft that shares its "
++            "embed/lm_head. The environment variable "
++            "SGLANG_UNEVEN_VOCAB_VECTOR takes precedence over this flag. "
++            "Requires an active --rank-tp-ratio plan; incompatible with "
++            "--enable-dp-lm-head.",
++            type_parser=_parse_rank_vocab_ratio,
++        ),
++    ] = None
+     random_seed: A[Optional[int], "The random seed."] = None
+     watchdog_timeout: A[
+         float,
+@@ -4447,6 +4477,7 @@ class ServerArgs:
+     UNEVEN_FAMILY_RATIO_SPECS = (
+         ("rank_mlp_ratio", "--rank-mlp-ratio", "SGLANG_UNEVEN_MLP_VECTOR"),
+         ("rank_moe_ratio", "--rank-moe-ratio", "SGLANG_UNEVEN_MOE_VECTOR"),
++        ("rank_vocab_ratio", "--rank-vocab-ratio", "SGLANG_UNEVEN_VOCAB_VECTOR"),
+     )
+ 
+     def _handle_uneven_mlp_ratio(self):
+@@ -4462,6 +4493,7 @@ class ServerArgs:
+         splits, which follow --rank-tp-ratio. Runs after the base plan is
+         resolved ('auto' may collapse to None on uniform budgets), so a
+         vector without a resolved plan is a hard error."""
++        self._resolve_auto_rank_vocab_ratio()
+         for field, flag, env_name in self.UNEVEN_FAMILY_RATIO_SPECS:
+             env_value = getattr(envs, env_name).get()
+             if env_value:
+@@ -4503,6 +4535,67 @@ class ServerArgs:
+                     f"integers, got {vector}."
+                 )
+ 
++        # Vocab-family-specific constraints: the ratio-weighted logits
++        # gather runs over the FULL TP group; the attn-TP-group LM head
++        # (--enable-dp-lm-head) keeps the even vocab layout.
++        if self.rank_vocab_ratio is not None and self.enable_dp_lm_head:
++            raise ValueError(
++                "--rank-vocab-ratio is incompatible with "
++                "--enable-dp-lm-head (the attn-TP-group logits gather "
++                "assumes even vocab shards)."
++            )
++
++    def _resolve_auto_rank_vocab_ratio(self):
++        """Resolve --rank-vocab-ratio 'auto' into an integer vector.
++
++        Runs after the base plan is resolved ('auto'/'auto-performance'
++        have collapsed to a list or None). Preference order:
++        1. memory-bandwidth scores from the CACHED hardware profile (the
++           lm_head matvec is a pure streamed weight read, so shards
++           proportional to membw equalize the per-rank read time). Cache
++           only -- 'auto' never triggers the stage-0 probe subprocess;
++           boot with --rank-tp-ratio auto-performance once to create it.
++        2. fallback: the resolved --rank-tp-ratio weights (gcd-reduced).
++        A uniform result collapses to None (vocab stays even)."""
++        if self.rank_vocab_ratio != "auto":
++            return
++        if not isinstance(self.rank_tp_ratio, list):
++            raise ValueError(
++                "--rank-vocab-ratio auto requires an active uneven-TP "
++                "base plan (--rank-tp-ratio); without one the vocab "
++                "split is already the even optimum."
++            )
++
++        vector = None
++        source = None
++        if self.rank_gpu_id is not None:
++            from sglang.srt.uneven_perf import derive_vocab_ratio_from_cache
++
++            vector = derive_vocab_ratio_from_cache(self.rank_gpu_id)
++            if vector is not None:
++                source = "cached hardware profile membw scores"
++        if vector is None:
++            weights = list(self.rank_tp_ratio)
++            g = math.gcd(*weights)
++            vector = [w // g for w in weights]
++            source = "resolved --rank-tp-ratio weights (no cached profile)"
++
++        if len(set(vector)) == 1:
++            logger.info(
++                "--rank-vocab-ratio auto resolved to a uniform vector %s "
++                "(%s); keeping the classic even vocab split.",
++                vector,
++                source,
++            )
++            self.rank_vocab_ratio = None
++            return
++        logger.info(
++            "--rank-vocab-ratio auto resolved to %s (%s).",
++            vector,
++            source,
++        )
++        self.rank_vocab_ratio = vector
++
+     def _handle_gpu_memory_settings(self, gpu_mem):
+         """
+         Configure GPU memory-dependent settings including
+diff --git a/python/sglang/srt/uneven_perf.py b/python/sglang/srt/uneven_perf.py
+index e613c77682..176d12925b 100644
+--- a/python/sglang/srt/uneven_perf.py
++++ b/python/sglang/srt/uneven_perf.py
+@@ -394,6 +394,60 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
+         return None, "probe failed", gpus
+ 
+ 
++def _integerize_membw_ratio(membw_gbs: Sequence[float]) -> List[int]:
++    """Small positive-integer vector proportional to the per-rank memory
++    bandwidths: the weakest card gets 6 units (quantization error < ~9%),
++    then gcd-reduced. E.g. [1558, 723, 723] GB/s -> [13, 6, 6]."""
++    scale = 6.0 / min(membw_gbs)
++    vec = [max(1, round(bw * scale)) for bw in membw_gbs]
++    g = math.gcd(*vec)
++    return [v // g for v in vec]
++
++
++def derive_vocab_ratio_from_cache(rank_gpu_id: Sequence[int]) -> Optional[List[int]]:
++    """Per-rank vocab shard weights from the CACHED hardware profile's
++    memory-bandwidth scores, or None when no valid cache entry exists.
++
++    Used by --rank-vocab-ratio 'auto': the lm_head matvec is a pure
++    streamed weight read, so vocab rows proportional to each rank's membw
++    equalize the per-rank read TIME (M20). Cache-only by design -- this
++    never launches the stage-0 probe subprocess (boot once with
++    --rank-tp-ratio auto-performance to create the cache)."""
++    try:
++        gpus, driver = _nvml_gpu_inventory()
++    except Exception as e:
++        logger.warning("--rank-vocab-ratio auto: NVML inventory failed (%s).", e)
++        return None
++    uuids = [g["uuid"] for g in gpus]
++    path = profile_cache_path(uuids, driver)
++    if not os.path.exists(path):
++        return None
++    try:
++        with open(path) as f:
++            profile = json.load(f)
++    except Exception as e:
++        logger.warning(
++            "--rank-vocab-ratio auto: could not read cached profile %s (%s).",
++            path,
++            e,
++        )
++        return None
++    if (
++        profile.get("version") != PROFILE_VERSION
++        or profile.get("driver") != driver
++        or profile.get("uuids") != sorted(uuids)
++    ):
++        return None
++    uuid_by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
++    membw = []
++    for gid in rank_gpu_id:
++        entry = (profile.get("gpus") or {}).get(uuid_by_idx.get(gid, ""))
++        if entry is None or not entry.get("membw_gbs"):
++            return None
++        membw.append(float(entry["membw_gbs"]))
++    return _integerize_membw_ratio(membw)
++
++
+ # ---------------------------------------------------------------------------
+ # Cost model: per-rank weight bytes + capacity prediction from the model
+ # config, mirroring the terms the real pool sizing pays (M22 cost-model
+@@ -965,6 +1019,19 @@ def apply_auto_performance(server_args) -> None:
+             f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS, "
+             f"membw {rank_scores_bw[r]:.0f} GB/s"
+         )
++    # Ratio-weighted vocab sharding recommendation (task #57 / M20): the
++    # embedding/LM-head vocab split stays EVEN unless --rank-vocab-ratio is
++    # set explicitly, so surface the membw-derived vector as a hint only.
++    if getattr(server_args, "rank_vocab_ratio", None) is None:
++        vocab_vec = _integerize_membw_ratio(rank_scores_bw)
++        if len(set(vocab_vec)) > 1:
++            lines.append(
++                "VOCAB HINT: the embed/lm_head vocab split stays EVEN by "
++                "default; add --rank-vocab-ratio "
++                f"{','.join(map(str, vocab_vec))} (or 'auto') to balance "
++                "the per-rank lm_head read time (M20: the lm_head matvec "
++                "is bound by the slowest card under the even split)."
++            )
+     links = profile.get("links") or {}
+     pair_bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
+     min_link = min(pair_bws) if pair_bws else 8.0
