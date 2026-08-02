@@ -4118,12 +4118,23 @@ def _wizard_context(payload: dict, profiles: dict, plan: Optional[dict]):
             tags.append("gguf")
     if payload.get("moe_resident_expert_fraction") not in (None, "", 1.0, "1.0"):
         tags.append("moe-offload")
+    # Architecture tags select which measured evidence a family may cite, so
+    # they come from the ONE arch table (``rig_coupling._ARCH_PATTERNS``), not
+    # from a second list local to this endpoint. The local list used to name
+    # six cards -- the reference rig's and its neighbours' -- which meant a
+    # card that IS sm86 (an A40, an A5000, a 3070) never got the sm86 tag and
+    # silently lost the evidence that applies to it (#434). A card the table
+    # does not know keeps no arch tag at all, which is the honest answer.
+    from sglang.srt.planner.rig_coupling import arch_of_card_name
+
     for g in gpus:
-        name = str(g.get("name") or "").lower()
-        if "2080" in name or "titan rtx" in name or " t4" in name:
-            tags.append("sm75")
-        if "3080" in name or "3090" in name or "a6000" in name:
-            tags.append("sm86")
+        # A card that carries its real compute capability wins over inference
+        # from the model string.
+        arch = str(g.get("arch") or g.get("sm_arch") or g.get("compute_cap") or "")
+        if not arch:
+            arch, _vendor = arch_of_card_name(str(g.get("name") or ""))
+        if arch and arch not in tags:
+            tags.append(str(arch))
 
     # KV bytes per token and the length-independent state block: both come
     # from the plan's own balance report, so the link gate is priced on the

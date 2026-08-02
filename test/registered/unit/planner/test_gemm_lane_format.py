@@ -431,12 +431,34 @@ class TestTheObjectiveConsumesTheLanes(CustomTestCase):
         self.assertIn((10, 1, 1), _ladder(fp8))
         self.assertNotIn((10, 1, 1), _ladder(bf16))
 
-    def test_dec_stays_a_documented_no_op(self):
-        """``dec`` has no compute-ratio objective to correct: it keeps the
-        VRAM-auto split by design (M22), so the lanes must not move it."""
-        sa, log = _plan(tune="dec")
-        self.assertIsNone(sa.rank_mlp_ratio)
+    def test_dec_is_scored_on_bandwidth_so_the_gemm_lanes_do_not_move_it(self):
+        """``dec`` has no compute-ratio objective to correct.
+
+        It used to express that by not solving at all (M22's reference-rig
+        "decode is flat" asserted as a property of every rig). #434 replaced
+        the assertion with a solve on the DECODE cost model, which reads the
+        profile's bandwidth entries and none of its GEMM lanes -- so the
+        original claim of this test still holds and is now testable as a
+        property rather than as a constant: switching the checkpoint's weight
+        format, which is what selects the lane, must not change ``dec``'s
+        answer. It does change ``enc``'s (see the fp8/bf16 ladder tests
+        above), which is the anti-vacuity half.
+        """
+        sa_fp8, log = _plan(tune="dec", lanes=True)
+        sa_bf16, _ = _plan(tune="dec", lanes=False)
         self.assertIn("tune=dec:", log)
+        self.assertEqual(sa_fp8.rank_mlp_ratio, sa_bf16.rank_mlp_ratio)
+        # It solved something rather than returning early, and it scored the
+        # candidates on decode: the per-candidate line names the metric.
+        self.assertIn("predicted decode gain", log)
+        self.assertIsNotNone(sa_fp8.rank_mlp_ratio)
+        # Anti-vacuity: the lanes DO move the compute-scored objective on
+        # this same fixture, so the equality above is a property of what
+        # ``dec`` reads and not of a planner that ignores its profile.
+        self.assertNotEqual(
+            _ladder(_plan(tune="enc", lanes=True)[1]),
+            _ladder(_plan(tune="enc", lanes=False)[1]),
+        )
 
     def test_both_rides_the_same_corrected_objective_as_enc(self):
         sa_enc, _l1 = _plan(tune="enc")

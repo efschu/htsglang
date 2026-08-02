@@ -481,11 +481,17 @@ def read_gpu_live(nvml=None) -> List[GpuLive]:
 
 def _annotate_cuda_indices(cards: List[GpuLive], nvml, injected: bool) -> None:
     """Fill each card's ``cuda_index`` via the device_map bridge (by UUID,
-    NVML index as fallback). An injected test ``nvml`` builds a fresh map
-    from that same fake rig (its UUIDs will not match the real torch
-    enumeration, so it deterministically exercises the documented
-    FASTEST_FIRST-emulation path); the real path uses the cached host map.
-    Best-effort: cards stay unbridged (None) on any failure."""
+    NVML index as fallback). An injected test ``nvml`` builds a fresh map from
+    that same fake rig; the real path uses the cached host map.
+
+    There is no emulated device order behind this any more. #397 removed the
+    FASTEST_FIRST emulation ``build_device_map`` used to fall back to, so a
+    fake rig whose UUIDs cannot be placed against the real CUDA enumeration
+    raises ``DeviceOrderUnresolvedError``, which this function swallows and
+    leaves every card unbridged (``cuda_index=None``). Best-effort by design:
+    "we do not know which CUDA ordinal this card is" is a state the dashboard
+    renders, and it is the only honest answer when the bridge cannot be
+    built."""
     try:
         from sglang.srt.planner import device_map as _dm
 

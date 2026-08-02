@@ -447,19 +447,38 @@ class TestFundability(CustomTestCase):
     _MODEL and os.path.isdir(_MODEL),
     "HTSGLANG_TEST_MODEL_DIR/Qwen3.6-27B-FP8 not present",
 )
-class TestDecIsStillADocumentedNoOp(CustomTestCase):
-    """The one target that was ALREADY honest stays untouched: dec says it
-    keeps the auto split and why, and it does."""
+class TestDecSolvesInsteadOfAssertingM22(CustomTestCase):
+    """``dec`` used to print M22's reference-rig finding ("decode is FLAT
+    across all representable splits") and return the base split without
+    evaluating a single candidate.
 
-    def test_dec_keeps_the_auto_split_and_says_so(self):
-        sa, log = _plan(tune="dec")
-        self.assertIsNone(sa.rank_mlp_ratio)
-        self.assertIn("tune=dec:", log)
-        self.assertIn("documented no-op", log)
+    That is a measurement from one rig asserted as a property of every rig,
+    and #434 replaced it with a solve on the decode cost model. The target
+    still has to be HONEST -- which is what the old class was pinning -- so
+    the pins move from "it does nothing" to "it does the solve, on the
+    decode metric, and reports the outcome as a result".
 
-    def test_dec_evaluates_no_candidates(self):
+    FALSIFIER: both tests below fail on the pre-#434 tree, where the branch
+    returns before the ladder.
+    """
+
+    def test_dec_evaluates_candidates_and_scores_them_on_decode(self):
         _sa, log = _plan(tune="dec")
-        self.assertEqual(_candidate_lines(log), [])
+        self.assertTrue(
+            _candidate_lines(log),
+            "dec evaluated no candidate -- it is asserting, not solving",
+        )
+        self.assertIn("predicted decode gain", log)
+        self.assertNotIn("predicted prefill gain", log)
+
+    def test_dec_names_its_objective_and_the_other_decode_lever(self):
+        _sa, log = _plan(tune="dec")
+        self.assertIn("tune=dec:", log)
+        self.assertIn("DECODE round time", log)
+        # The KV-token lever is the other half and is selected by a different
+        # flag; the plan must not let a flat weight lever read as "decode has
+        # no lever".
+        self.assertIn("--rank-kv-ratio speed", log)
 
 
 if __name__ == "__main__":

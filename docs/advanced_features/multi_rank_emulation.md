@@ -105,7 +105,9 @@ Two practical points learned on real hardware:
   (not at compute). Give co-located GPUs a generous reserve.
 - Pass reserve as a per-rank list aligned with `--rank-gpu-id` (per-physical-GPU
   max wins), e.g. `--rank-auto-reserve-mib 11500,11500,11500,3500,3500` for the
-  `0,0,0,1,2` layout, and add
+  `0,0,0,1,2` layout on the reference rig (RIG EXAMPLE: 3 ranks co-located on
+  a 32 GiB RTX 5090 + 1 rank each on two 20 GiB RTX 3080s; a different
+  card/co-location count needs its own reserve, sized as above), and add
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to recover fragmentation
   during the multi-rank capture.
 
@@ -114,7 +116,7 @@ every physical GPU, `sum(co-located rank budgets) <= NVML total`. Leaving
 enough headroom above that for context + fragmentation is the user's
 responsibility.
 
-## Validated example (5090 + 2x 3080, 32 + 20 + 20 GB)
+## Validated example (5090 + 2x 3080, 32 + 20 + 20 GB) — RIG EXAMPLE, see above
 
 Dense Qwen3.6-27B GGUF (Q4_K_XL), full-perf (CUDA graphs ON + NEXTN/MTP),
 NCCL 2.30.7 side-loaded, MPS on:

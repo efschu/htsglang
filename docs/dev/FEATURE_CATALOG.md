@@ -38,8 +38,11 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
 ## 2. Planner / solver
 Key solver: water-filling over an affine cost model, pair-matrix collective
 term, roles/nesting as box bounds, Pareto+knee, admissibility gates,
-`coresident_budgets()`. Measured phase optima: prefill 10,1,1 (+ decoupled KV
-2,11,10 keeps capacity), decode ~3,2,2. Under `--rank-perf-tune phase-*` the
+`coresident_budgets()`. Measured phase optima on the reference rig (1x RTX
+5090 + 2x RTX 3080, Qwen3.6-27B, ctx 32768; RIG EXAMPLE, not a portable
+default): prefill 10,1,1 (+ decoupled KV 2,11,10 keeps capacity), decode
+~3,2,2 — solve your own via `--rank-perf-tune phase-prefill|phase-decode`
+and read the `CHOSEN` vector off your boot's log. Under `--rank-perf-tune phase-*` the
 solve now also OWNS the coupled KV token vector (#435): the chosen candidate's
 matched `predict_capacity` vector is seeded into the boot instead of the
 VRAM-budget split, so the pool the runtime sizes is the one the admissibility
@@ -48,6 +51,25 @@ An explicit `--rank-kv-ratio` still wins; the hand-paired
 `--rank-mlp-ratio X + --rank-kv-ratio Y` of #354/#424 is no longer needed.
 `--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
+
+**Generality (#434 slice 1).** Plain `--rank-tp-ratio auto` is the documented
+CAPACITY-FIRST default (byte-proportional to the VRAM budgets, no probe); it
+now names the per-task optimizer and the flag that engages it in the CLI help
+and in one boot log line, and calls out a hand-pinned `--rank-mlp-ratio` as the
+solution of some earlier operating point. `--rank-perf-tune dec` no longer
+returns the base split on the strength of M22's reference-rig "decode is flat"
+finding: it SOLVES the bs=1 decode round time from the rig's own effective
+bandwidth, and reports flatness as a result when that is what the profile says.
+Every objective therefore solves from per-(rank, family) profile scores.
+Constant audit: `docs/dev/AUDIT_434_planner_constants.md` (62 classified;
+19 RIG-FITTED, 16 named follow-ups FU-434-1..16). The cost model now prints
+which calibration scalars are BORROWED from the development rig rather than
+only which were overridden. Standing hermetic proof suites on synthetic
+foreign rigs: `test/registered/unit/planner/test_planner_generality_434.py`
+(profile-follows, symmetry-has-no-lever, relabeling/scale/name invariance,
+AST leak guard) and `test_borrowed_calibration_434.py` (a measurement may only
+be applied to hardware it matches). Probe-first bootstrap on unknown hardware
+is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
 
 ## 3. Memory tiers / offload / spill
 - **Expert offload**: MoE experts in a pinned host-RAM pool, streamed over

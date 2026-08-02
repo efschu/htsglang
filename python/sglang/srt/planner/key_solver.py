@@ -336,6 +336,7 @@ __all__ = [
     "ADDITIVE_ANCHOR",
     "COLLECTIVE_EFFICIENCY",
     "NOISE_FLOOR_PCT",
+    "NOISE_FLOOR_SOURCE",
 ]
 
 
@@ -462,7 +463,24 @@ def gemm_dtype_for_checkpoint(model_path: str) -> str:
 
 #: Benchmark noise floor of this project's harness, in percent. Anything the
 #: solver reports below it is reported WITH the caveat, never as a win.
+#:
+#: MEASURED ON THE REFERENCE RIG (5090 + 2x 3080, PCIe without P2P): the
+#: split_probe / bench arms spread 2.7-4.2 % boot to boot there. A noise floor
+#: is a property of a machine, so on any other rig this is a BORROWED number,
+#: and :func:`noise_floor_provenance` says so rather than letting the value
+#: travel unlabelled. Replacing it with a local measurement needs an A-vs-A
+#: campaign on the same harness (see ``runner.noise_floor_from_points``);
+#: that is a follow-up, not something this constant can do by itself.
 NOISE_FLOOR_PCT: float = 4.2
+
+#: Where :data:`NOISE_FLOOR_PCT` came from, emitted next to the value so a
+#: consumer cannot mistake the reference rig's floor for its own.
+NOISE_FLOOR_SOURCE: str = (
+    "reference rig (RTX 5090 + 2x RTX 3080, PCIe without P2P): 2.7-4.2 % "
+    "boot-to-boot spread per harness arm. NOT measured on this machine -- "
+    "run an A-vs-A noise-floor arm (planner.runner, noise_floor_boots >= 3) "
+    "to establish this rig's own floor."
+)
 
 
 # ---------------------------------------------------------------------------

@@ -699,6 +699,29 @@ _RANK_PERF_TUNE_CHOICES: Tuple[str, ...] = (
     "phase-decode",
 )
 
+#: What ``--rank-tp-ratio auto`` optimizes and what it does NOT (#434).
+#:
+#: The capacity-first split is a defensible default -- it needs no probe and
+#: maximum context is what most boots want -- but a default that never names
+#: its alternative reads as "this IS the optimum", which is the complaint this
+#: notice answers. Module-level so the class attribute, the boot log and the
+#: tests all quote one sentence; the targets are spelled out because the whole
+#: point is that the reader learns the flag exists.
+_CAPACITY_FIRST_DEFAULT_NOTICE = (
+    "--rank-tp-ratio auto is the CAPACITY-FIRST default: the weights are "
+    "proportional to each rank's VRAM budget, which maximizes the KV pool "
+    "and is deliberately independent of how fast the cards are. It does NOT "
+    "solve for speed, and it is not the per-task optimum. The per-task "
+    "optimizer is a different flag: --rank-tp-ratio auto-performance solves "
+    "the weight vector against a measured hardware profile of THIS rig, per "
+    "--rank-perf-tune target ("
+    + "|".join(_RANK_PERF_TUNE_CHOICES)
+    + "). The solve is valid for one operating point only -- this phase, "
+    "this weight format, this checkpoint, these cards, this context length "
+    "and this reserve -- so a vector solved elsewhere is not a portable "
+    "default and must not be copied between rigs, formats or context lengths."
+)
+
 
 @dataclasses.dataclass
 class ServerArgs:
@@ -2151,12 +2174,19 @@ class ServerArgs:
             "derives the weights from the --rank-gpu-memory-mib list, or, "
             "when that is omitted, from the NVML totals of the GPUs named "
             "in --rank-gpu-id (minus --rank-auto-reserve-mib). "
+            "'auto' is the CAPACITY-FIRST default and does NOT optimize for "
+            "speed: it maximizes the KV pool and ignores how fast the cards "
+            "are. It is not the per-task optimum, and it does not probe. "
             "'auto-performance' starts from the same VRAM-auto split and "
-            "additionally derives a dense-MLP family vector "
-            "(--rank-mlp-ratio) from a measured hardware profile to "
-            "maximize prefill/throughput, subject to the "
-            "--rank-perf-loose-ctx-percent context floor (see also "
-            "--rank-perf-tune). Requires --rank-gpu-id. "
+            "additionally SOLVES a dense-MLP family vector "
+            "(--rank-mlp-ratio) against a measured hardware profile of this "
+            "rig, for the target named by --rank-perf-tune, subject to the "
+            "--rank-perf-loose-ctx-percent context floor. That solve is the "
+            "per-task optimizer: engage it whenever the boot's phase, weight "
+            "format, checkpoint, card set, context length or reserve differ "
+            "from the last one -- its answer is valid for one operating "
+            "point and is not portable between rigs or formats. "
+            "Requires --rank-gpu-id. "
             "Pure tensor parallelism only: combining it with --pp-size > 1 "
             "is rejected, not silently applied.",
             type_parser=_parse_rank_tp_ratio,
@@ -2237,11 +2267,16 @@ class ServerArgs:
             "throughput, which ride the same lever; 'maxkv' targets maximum "
             "context and is an alias for the capacity semantics (it also "
             "selects --rank-kv-ratio capacity when that flag is left at its "
-            "default). 'dec' targets decode: the WEIGHT split is a near-no-op "
-            "for it (decode is flat across representable splits, so only free "
-            "gains apply there), but the decode lever is not the weight split "
-            "-- it is the KV-TOKEN split, because under DCP each rank runs "
-            "attention over the tokens it owns and at bs=1 the slowest rank "
+            "default). 'dec' targets decode and pulls on both decode levers. "
+            "The WEIGHT split is SOLVED against the bs=1 decode round time "
+            "built from this rig's own measured effective bandwidth "
+            "(streamed weight bytes per rank over that rank's decode rate); "
+            "where a card's VRAM share already matches its bandwidth share "
+            "the lever is flat and the plan log reports that as the RESULT "
+            "of the solve, not as an assumption carried in from another rig. "
+            "The larger lever at depth is the KV-TOKEN split, because under "
+            "DCP each rank runs attention over the tokens it owns and at "
+            "bs=1 the slowest rank "
             "sets the pace. 'dec' therefore also selects --rank-kv-ratio "
             "speed when that flag is left at its default; measured worth "
             "-24.5 %% of the context-dependent part of the decode step at "
@@ -9154,6 +9189,48 @@ class ServerArgs:
             "; ".join(parts),
         )
 
+    #: What ``--rank-tp-ratio auto`` optimizes, named once so the CLI help,
+    #: the boot log and the tests quote the same sentence (#434).
+    CAPACITY_FIRST_DEFAULT_NOTICE = _CAPACITY_FIRST_DEFAULT_NOTICE
+
+    def _announce_capacity_first_default(self):
+        """Name the capacity-first default and the flag that replaces it.
+
+        #434: plain ``auto`` silently returned a byte-proportional split and
+        nothing in the boot log said that a per-task solve exists. Keeping
+        capacity-first as the default is defensible -- it is the only choice
+        that needs no probe, and maximum context is what most boots want --
+        but a default that never names its alternative reads as "this IS the
+        optimum". This is one INFO line and changes no plan.
+
+        Also fires when a family vector is PINNED on top of plain ``auto``:
+        that is the #354/#424 pattern (read a vector off one boot's log, then
+        hand-pin it), and the operating point a pin was solved for is not
+        recorded anywhere the next boot can check.
+        """
+        logger.info(_CAPACITY_FIRST_DEFAULT_NOTICE)
+        pinned = [
+            name
+            for name, value in (
+                ("--rank-mlp-ratio", self.rank_mlp_ratio),
+                ("--rank-vocab-ratio", self.rank_vocab_ratio),
+                ("--rank-moe-ratio", self.rank_moe_ratio),
+            )
+            if value is not None
+        ]
+        if pinned:
+            logger.info(
+                "%s pinned on top of --rank-tp-ratio auto: this boot serves a "
+                "HAND-SET family vector, and neither the hardware profile nor "
+                "the optimizer is consulted. A pinned vector is the solution "
+                "of one earlier operating point; nothing here can check that "
+                "it is still the one. Re-solve with --rank-tp-ratio "
+                "auto-performance at the context length, reserve and "
+                "checkpoint this boot actually runs, and read the CHOSEN MLP "
+                "vector line off this boot's own log.",
+                " + ".join(pinned),
+            )
+
     def _handle_uneven_tp(self):
         """Validate --rank-gpu-id / --rank-gpu-memory-mib / --rank-tp-ratio
         (heterogeneous rank placement and uneven tensor parallelism).
@@ -9251,6 +9328,7 @@ class ServerArgs:
             # block a few lines later, and printing the base vectors first
             # would name numbers it is about to replace.
             self._log_derived_plan_vectors()
+            self._announce_capacity_first_default()
         if not ratio_was_auto and isinstance(self.rank_tp_ratio, str):
             raise ValueError(
                 f"Invalid --rank-tp-ratio value {self.rank_tp_ratio!r}: "

@@ -454,6 +454,10 @@ def key_solver_model_payload(payload: Optional[dict] = None) -> dict:
         "ok": True,
         "model_path": model_path,
         "noise_floor_pct": key_solver.NOISE_FLOOR_PCT,
+        # The floor travels with its provenance: it was measured on the
+        # reference rig, and a reader on other hardware has to be able to see
+        # that from the payload alone (#434).
+        "noise_floor_source": key_solver.NOISE_FLOOR_SOURCE,
         "collective_efficiency": key_solver.COLLECTIVE_EFFICIENCY,
         "anchors": rows,
         "additive": additive,

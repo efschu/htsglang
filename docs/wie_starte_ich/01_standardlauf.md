@@ -31,6 +31,9 @@ export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 
 ```bash
 LOG=/root/.claude/jobs/<deine-job-id>/tmp/std_run.log   # eigener tmp, NICHT /tmp
+# --rank-gpu-id / --rank-auto-reserve-mib: RIG EXAMPLE (geloest fuer DIESES
+# Rig + Modell + Kontext + Reserve, siehe "Feste Fakten dazu" unten). Eigenen
+# Wert ermitteln: --rank-tp-ratio auto-performance + CHOSEN-Zeile im Boot-Log.
 setsid /spinning/htsglang-gpu/.venv/bin/python -m sglang.launch_server \
   --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8 \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
@@ -48,7 +51,8 @@ Feste Fakten dazu:
 - `cuda:0` = 5090, `cuda:1`/`cuda:2` = 3080 (NVML-Reihenfolge weicht ab —
   nie ueber nvidia-smi-Indizes auf torch-Indizes schliessen).
 - `--rank-auto-reserve-mib`: **2700 auf den 3080ern ist die belegte
-  Untergrenze.** 2200 kippt (OOM im GDN-Prefill-Scratch beim ersten
+  Untergrenze** fuer DIESES Rig/Modell/Kontext (RIG EXAMPLE, siehe oben).
+  2200 kippt (OOM im GDN-Prefill-Scratch beim ersten
   2048er-Chunk; der 80-Token-Warmup ueberlebt und taeuscht Erfolg vor).
 - `--enable-metrics` ist PFLICHT in jedem Boot (Dashboard sonst blind).
 - Boot-Dauer bis READY: normal 60-120 s (JIT-Kaltbau kann laenger sein).

@@ -220,6 +220,19 @@ Runs in the development container. One rank per card, proportional shards
 (5090 gets the largest), token-sharded KV, NEXTN speculative decoding.
 `--enable-metrics` is included below and is mandatory (section 3).
 
+**RIG EXAMPLE, applies to every concrete per-rank vector and reserve value in
+this runbook (`--rank-gpu-id`, `--rank-tp-ratio`, `--rank-mlp-ratio`,
+`--rank-vocab-ratio`, `--rank-kv-ratio`, `--rank-auto-reserve-mib`,
+`--rank-gpu-memory-mib`).** Every such number below is the solved output of
+one solver run on the reference rig (1x RTX 5090 32 GiB + 2x RTX 3080 20 GiB),
+one model, one quant format, one context length and one reserve — it is not a
+portable default for a different hardware combination, model, or quant. Solve
+your own operating point with `--rank-tp-ratio auto` / `auto-performance`
+(add `--rank-perf-tune phase-prefill|phase-decode` for a phase-specific
+split) and read the `CHOSEN MLP vector` / `CHOSEN <axis> vector` line off
+your own boot's log. Later occurrences in this file mark themselves
+"(RIG EXAMPLE, see above)" rather than repeating this paragraph.
+
 ```bash
 # Load real values from the local env file (never committed). Scripts fall
 # back to the placeholder text if a variable isn't set, so this recipe stays
@@ -238,6 +251,9 @@ export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 
+# --rank-gpu-id / --rank-auto-reserve-mib below are RIG EXAMPLE values
+# (reference rig, solved for this model/quant/context/reserve) -- see the
+# note above this recipe for how to solve your own.
 cd "$WT"
 setsid "$VENV/bin/python" -m sglang.launch_server \
   --model-path "$MODEL_ROOT/Qwen3.6-27B-FP8" \
@@ -268,9 +284,11 @@ Non-obvious points, each load-bearing:
   (`3000,3200,3200`, an even more generous 3080 reserve than shown here) on
   its first 10K-token needle probe — same crash site, same GDN prefill
   scratch (§6.5). `5500,3800,3800` is the reserve #360 validated against
-  actual 10K+/25K+/30K+-token prompts across four full boots; use that for
-  anything that will see a real long prompt, and treat the numbers above as
-  sized for the warmup-only case they were validated against.
+  actual 10K+/25K+/30K+-token prompts across four full boots on the reference
+  rig; use that as a starting point for anything on THIS rig that will see a
+  real long prompt (RIG EXAMPLE, see above — a different rig/model/context
+  needs its own probe), and treat the numbers above as sized for the
+  warmup-only case they were validated against.
 - `--tp-size` is canonical (`--tensor-parallel-size` is the declared alias;
   `--tp` also works, but only via argparse prefix matching — do not rely on
   it in scripts).
@@ -294,10 +312,10 @@ Non-obvious points, each load-bearing:
   leaves a rank below its derived reserve demand, so raising
   `--rank-perf-loose-ctx-percent` buys an OOM in the first real prefill
   rather than a slower server. The knob for it is
-  `--rank-auto-reserve-mib` on the named GPU. Measured instance: pinning
-  `--rank-mlp-ratio 6,1,1` needs `4500,2700,2700` where the auto split runs
-  at `3000,2700,2700` (at 3000 rank 0 ends the boot with 0.38 GB free and
-  dies in the first prefill).
+  `--rank-auto-reserve-mib` on the named GPU. Measured instance (RIG EXAMPLE,
+  see above): pinning `--rank-mlp-ratio 6,1,1` needs `4500,2700,2700` where
+  the auto split runs at `3000,2700,2700` (at 3000 rank 0 ends the boot with
+  0.38 GB free and dies in the first prefill).
 - `setsid` + pid file: so you can later kill exactly this process group and
   nothing else (section 7).
 - Pick the port yourself and check it is free (`ss -ltn`); several agents
@@ -326,7 +344,10 @@ vector per phase, two boots:
   --rank-auto-reserve-mib 3000,2700,2700 \
 ```
 
-Measured at the 27B point (#354, four boots, 16 points each):
+Measured at the 27B point (#354, four boots, 16 points each) on the reference
+rig; the `16,1,1` / `10,1,1` vectors are what the planner solved for THIS
+model/quant/reserve (RIG EXAMPLE, see above) — on other hardware or a
+different checkpoint, `--rank-perf-tune` solves its own vector and prints it:
 
 | Arm | Vector | Prefill s=1 | Decode bs=1 | `max_total_num_tokens` |
 |---|---|---|---|---|
@@ -367,7 +388,10 @@ Non-obvious points:
 ### 4.1.1 Phase-boundary KV resharding (#297): `--kv-reshard-vectors`
 
 Add to the 4.1 recipe to make the KV token vector re-shardable at runtime
-(the physical actuator behind the #287 ladder's `dcp_ratio` rung):
+(the physical actuator behind the #287 ladder's `dcp_ratio` rung). `7,3,3`
+and `2,11,10` below are the reference rig's own solved vectors (RIG EXAMPLE,
+see above) — pick your own with `--rank-kv-ratio capacity` or `auto` and read
+them off your boot's plan log:
 
 ```bash
   --rank-kv-ratio 7,3,3 \
@@ -1345,7 +1369,10 @@ holds 100.0%, which is the can-fail companion the bound needs.
 **DeepSeek-V4-Flash `UD-Q3_K_XL`, TP=3 uneven — the recipe.** 126.19 GiB of
 post-repack experts across 43 MoE layers, three cards, one 98.5 GiB swapless
 host. The fraction is now a host-RAM knob, and `0.40` is the default to start
-from:
+from. `--rank-tp-ratio 30,17,17` and `--rank-gpu-memory-mib 29607,17780,17780`
+are the reference rig's own solved values (RIG EXAMPLE, see above) — replace
+with plain `auto` (section 4.5.4) or your own NVML-derived budgets on other
+hardware:
 
 ```bash
 export SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.40   # 0.60 x 126.19 = 75.7 GiB pinned
@@ -1851,7 +1878,10 @@ no communicator — neither the NCCL >= 2.30 co-location threshold nor MPS
 applies). Lane jobs run as SERIAL ticks with PD priority (one whole-prompt
 prefill or one greedy decode step per scheduler iteration, rank-local).
 
-Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
+Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF).
+Every vector below is a RIG EXAMPLE (see above): it is the nesting-checked
+split for this model's unit counts on this hardware, not a portable default —
+re-derive with the §4.10 nesting check for a different model or card mix.
 
 ```bash
 # plus the stock 4.5 GGUF flags (flashinfer, NEXTN 3/1/4, metrics, nvrtc)
@@ -2760,10 +2790,11 @@ dies on the first (10K) rung. `--rank-auto-reserve-mib 3000,3200,3200`
 (TP=3, 5090+2x3080, Qwen3.6-27B-FP8, `--rank-tp-ratio auto`) OOMs in the GDN
 prefill scratch — `python/sglang/srt/layers/attention/fla/chunk_delta_h.py:324`,
 `h = k.new_empty(B, NT, H, V, K)` — with the 5090 (rank 0) at 10.38 MiB free
-of 31.34 GiB. 5500 MiB on rank 0 (the 5090) holds through all four #360
-arms; the small-card reserve that holds depends on the MLP vector — `3800`
-for the three arms on the flat/auto split (FP8 x2, INT8-W8A8) and `2700`
-for the MLP-concentrated phase-prefill arm (INT8-W8A8,
+of 31.34 GiB. All numbers in this paragraph are RIG EXAMPLE values (see
+above), specific to this rig/model/context. 5500 MiB on rank 0 (the 5090)
+holds through all four #360 arms; the small-card reserve that holds depends
+on the MLP vector — `3800` for the three arms on the flat/auto split (FP8 x2,
+INT8-W8A8) and `2700` for the MLP-concentrated phase-prefill arm (INT8-W8A8,
 `--rank-mlp-ratio 16,2,3`), which needs less
 small-card headroom because the concentration moves weight and activation
 work onto rank 0. Minimum free VRAM after load across all four arms and both
@@ -3669,6 +3700,8 @@ UI=http://127.0.0.1:8791
 M=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
 # The per-rank budget is the planner's derive_auto_plan output, i.e. NVML
 # total minus the reserve. Reserve 3000/2700/2700 is the recipe of 4.1.
+# BUDGET itself is a RIG EXAMPLE (see above) -- derive your own the same way
+# from your own NVML totals and reserve.
 BUDGET='[29607,17780,17780]'
 
 # ONE goal -> one key. goal is maxkv | sessions | dec | enc.
@@ -3701,6 +3734,8 @@ curl -s -X POST $UI/api/key_solver -d "{... , \"goal\": \"enc\",
 # shared card) -- a property of the runtime, so it is asked, not assumed.
 # THROUGHPUT is summed; KV is NOT: lanes that share a card are re-sized
 # against their co-residence share first, or the cell comes back absent.
+# gpu_total_mib and rank_gpu_memory_mib below are this rig's own NVML
+# totals/budgets (RIG EXAMPLE, see above) -- substitute your own.
 curl -s -X POST $UI/api/key_solver/aggregate -d '{
   "gpu_total_mib": {"0": 32607, "1": 20480, "2": 20480},
   "instances": [

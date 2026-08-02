@@ -27,9 +27,11 @@ server log into anybody's context; they grep and report.
 
 ## Reserve
 
-`5500,3800,3800` — the reserve validated against real long prompts (runbook
-§4.9). F1 deliberately drives the KV pool towards full, so the run must not
-be sitting on a reserve that only survives a warmup.
+`5500,3800,3800` — the reserve validated against real long prompts on the
+reference rig (runbook §4.9; RIG EXAMPLE, see there — a different
+rig/model/context needs its own probe). F1 deliberately drives the KV pool
+towards full, so the run must not be sitting on a reserve that only survives
+a warmup.
 
 ## What a failure means
 
