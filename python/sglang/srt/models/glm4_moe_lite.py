@@ -72,7 +72,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+from sglang.srt.models.deepseek_common.utils import (
+    _is_cuda,
+    _use_aiter,
+    dense_weight_dtype,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import (
     get_forward,
@@ -266,17 +270,16 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            )
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
-            )
-            self.shared_experts_is_fp8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
-            )
+            # Same rule as `DeepseekV2MoE` and `Glm4MoeSparseMoeBlock`: the
+            # int8 / fp8 fast paths exist only for a dense weight tensor, so
+            # ask the layer what it built. The predicate this replaces was
+            # `hasattr(gate_up_proj.quant_method, "quant_config")`, which is
+            # true for every linear method that keeps its config -- including
+            # `Fp8LinearMethod` -- so `shared_experts_is_fp8` could never
+            # become True no matter what the checkpoint contained.
+            shared_gate_up_dtype = dense_weight_dtype(self.shared_experts.gate_up_proj)
+            self.shared_experts_is_int8 = shared_gate_up_dtype == torch.int8
+            self.shared_experts_is_fp8 = shared_gate_up_dtype == torch.float8_e4m3fn
 
         self.top_k = config.num_experts_per_tok
 
