@@ -23,9 +23,9 @@ inherited from the VRAM plan.
 
 The solve (`layers/moe/expert_compute_placement.py`) holds each rank's
 GPU-RESIDENT expert mass at exactly what the base plan gives it — arm 3 is
-VRAM-neutral by construction, so the reserve, the ledger and the corridor are
-the ones arm 1 was validated at — and redistributes only the STREAMED remainder
-in proportion to the measured link weights:
+VRAM-neutral, so the reserve, the ledger and the corridor are the ones arm 1
+was validated at — and redistributes only the STREAMED remainder in proportion
+to the measured link weights:
 
     resident_r = f_r * b_r                      # fixed
     share_r    = resident_r + (1 - sum resident) * normalise(l_r / c_r)
@@ -33,6 +33,40 @@ in proportion to the measured link weights:
 `l` comes from the same #394 provenance chain arm 2 uses (env > card-probe H2D
 > NVML nameplate > refusal; `absent` is refused, never guessed). `c` is the
 per-rank cold-traffic coefficient, 1.0 unless a prior boot calibrated it.
+
+## NOTE — VRAM neutrality, and the fixed point (#439, 2026-08-02)
+
+The sentence above said "by construction" and the SOLVE honoured it. The
+RUNTIME did not, and the 2026-08-02 battery died of it: residency is sized as
+`R = resident_slot_count(E, f)` with `E` the rank's OWN expert count, and the
+installed vector is exactly what changes `E`. tp2 went 71 → 85 experts, its
+resident mass rose 19.5 %, and a 20 GiB 3080 that the baseline already left
+~515 MiB free OOM'd in `_ensure_tiers -> allocate`.
+
+The obvious correction — lower the resident FRACTION until the mass comes
+back — is circular, because the solve reads the fractions as an input. The
+battery measured the loop: rescaled fractions `0.4812,0.5296,0.3516` returned
+`161,91,113` instead of `160,79,119`, a placement for which the correction just
+computed is already wrong.
+
+**Decision: break the loop by construction, do not iterate it.**
+
+* The SOLVE keeps reading the fractions the OPERATOR set, against the BASE
+  plan. Its inputs are untouched, so the vector is solved once, from the rig.
+* The RUNTIME holds residency at the pre-link baseline: rank `r` keeps exactly
+  `resident_slot_count(base_extent_r, f_r)` slots, sized off the base plan the
+  launcher publishes on `SGLANG_MOE_COMPUTE_BASE_PLAN`.
+* That correction is expressed as a DERIVED per-rank fraction on a channel the
+  solve never reads (`resident_fraction_held_at_base_plan`). Nothing feeds
+  back; there is no second solve and no fixed-point iteration.
+
+`--rank-moe-resident-fraction` therefore keeps meaning exactly what it meant —
+the operator's fraction of the BASE shard — which is also what keeps the
+treatment arm comparable with the baseline arm that shares it. Exact (slot for
+slot) under the #82 expert-dim shard; nearest-integer on the width-sharded MoE
+path, where a slot is indivisible and no exact representation exists. Pinned in
+`test_expert_compute_placement_439.TestResidencyIsHeldAtTheBasePlan`, whose
+can-fail arm reproduces the 31 → 37 slot inflation on tp2.
 
 ## Resolution point, and why it is not in the worker
 
@@ -43,6 +77,17 @@ reads would put the group's expert COVERAGE on the outcome of a race — a hole 
 an overlap in the ranges is a silently wrong all-reduce, not a hang. A symbolic
 value that reaches a worker anyway is a hard error there
 (`scheduler.uneven_family_plans`), never a fall-back to the base plan.
+
+## Predicted numbers — READ THE BASE PLAN FIRST
+
+The table below is keyed to a base plan of `400,256,344`. **The reference
+recipe does not produce that plan.** `--rank-tp-ratio auto` on the 2026-08-02
+battery resolved to `30407,19080,19080` (shares 0.44346 / 0.27827 / 0.27827),
+and every number keyed to `400,256,344` — the vector, the H2D, the 1.358x /
+1.584x band — is a prediction for a rig configuration that boot did not have.
+The numbers for the plan the recipe actually resolves are in "Confirmation
+window" below. Read the resolved plan off the boot log, as this file has always
+said, and use the section that matches it.
 
 ## Predicted numbers for the reference recipe
 
@@ -68,8 +113,9 @@ TP=3, bench-length generations) and the arm-1 launch:
 | which rank is the clock | tp1 -> **tp0** |
 | `moe_compute_policy` | `link-proportional` |
 
-That is the 1.36x class ANALYSE_393 predicted for the short-probe mix, and it is
-the number to hold arm 3 to. It falls short of BENCH_394's 1.54x "ideal
+That is the 1.36x class ANALYSE_393 predicted for the short-probe mix. It is
+the number to hold arm 3 to ON THIS BASE PLAN, which is not the one the recipe
+resolves — see "Confirmation window". It falls short of BENCH_394's 1.54x "ideal
 proportional placement" for a reason that is measured rather than hand-waved:
 the first-order model says a rank's H2D share is `b_r (1 - f_r)`, i.e.
 37.2 / 26.8 / 36.0 %, and arm 1 measured 42.1 / 28.9 / 29.0 %. The ranks re-fetch
@@ -88,11 +134,86 @@ the MODELLED cold mass does not equalise the MEASURED bytes.
 | clock | 858 -> **542 s = 1.584x** |
 | `moe_compute_policy` | `link-proportional-calibrated` |
 
-**Report the band, not one end of it.** The honest statement for this recipe is
-1.36x uncalibrated / 1.58x calibrated on the transfer term, against BENCH_394's
-1.54x ideal-placement reference. Running both sub-arms is what turns that band
-into a measurement; running only `compute-cal` would report a number whose
-calibration came from the arm it is being compared against.
+**Report the band, not one end of it.** On this base plan the honest statement
+is 1.36x uncalibrated / 1.58x calibrated on the transfer term, against
+BENCH_394's 1.54x ideal-placement reference; on the plan the recipe resolves it
+is 1.39x / 1.45x. Either way, running both sub-arms is what turns a band into a
+measurement; running only `compute-cal` would report a number whose calibration
+came from the arm it is being compared against.
+
+## Confirmation window (the next boot window, spec)
+
+One window, three boots, in this order. The three defects the 2026-08-02
+battery found are fixed at the desk and are unvalidated on hardware until this
+window runs: **BOOT-PENDING**.
+
+Inputs, all read off that battery's own record
+(`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md`) rather than
+assumed:
+
+| input | value | where it came from |
+|---|---|---|
+| base plan | `30407,19080,19080` | resolved `--rank-tp-ratio` in `boot_equal.log` |
+| base expert counts | 114 / 71 / 71 of 256 | `partition_units(256, base)` |
+| resident fraction | `0.485,0.42,0.42` | the launch flag, unchanged across arms |
+| link weights | 14.42 / 6.45 / 13.41 GB/s | measured card probe, `provenance=measured` |
+| measured H2D | 888.6 / 557.7 / 598.2 GiB | equal arm's #390 dump |
+| baseline transfer | 66.2 / **92.8** / 47.9 s | H2D / link; tp1 (x4) is the clock |
+| traffic coefficients | `1.0561,0.9379,1.0060` | `cold_traffic_coefficients_from_measurement` on the four rows above |
+| same-boot A-vs-A floor | CV 1.19 %, spread 2.35 % | equal arm, 3 x 450-token generations |
+
+Predictions for THIS base plan (all four inputs above fed through the module's
+own functions; the group H2D total is held at the measured 2044.5 GiB, since
+the same tokens reach the same experts and only ownership moves):
+
+| arm | vector | expert counts | predicted H2D (GiB) | transfer (s) | clock |
+|---|---|---|---|---|---|
+| `equal` | 30407,19080,19080 | 114 / 71 / 71 | 888.6 / 557.7 / 598.2 | 66.2 / 92.8 / 47.9 | 92.8 |
+| `compute` | 160,79,119 | 114 / 57 / 85 | 895.5 / 355.7 / 793.3 | 66.7 / 59.2 / 63.5 | **66.7 = 1.392x** |
+| `compute-cal` | 258,135,197 | 112 / 59 / 85 | 860.0 / 384.7 / 799.8 | 64.0 / 64.0 / 64.0 | **64.0 = 1.450x** |
+
+**The band to confirm is 1.39x / 1.45x on the transfer term, not 1.358x /
+1.584x.** The latter belongs to the `400,256,344` worked example above. The
+window's job is to measure this band, not to reproduce a number from a
+different plan.
+
+Discipline for the window:
+
+* **One boot per arm.** Three boots: `equal`, `compute`, `compute-cal`. Each
+  ~7 minutes of load; nothing here is worth a re-boot to re-read.
+* **A-vs-A floor first, in the `equal` boot**, before any delta is quoted. The
+  2026-08-02 value (CV 1.19 %) is the expectation, not a substitute — a floor
+  measured in another window does not cover this one.
+* **`--rank-auto-reserve-mib auto`** (`RESERVE_MIB=auto bash run_arm.sh ...`).
+  The pinned `2200,1400,1400` left both 3080s at ~515 MiB free — above the
+  400 MiB corridor floor, but by 115 MiB, and that is the exact margin the
+  residency defect overran. `auto` derives the reserve per card instead of
+  carrying one window's tuning into the next. Same value on every arm of the
+  window; a reserve that differs between arms is a second treatment.
+* **Same recipe, same fraction, same reserve on all three arms.** The solve
+  holds the resident mass fixed against the base plan, so changing the fraction
+  between arms changes the treatment rather than the measurement.
+* **Check the arm identified itself** before reading anything else:
+  `facts_<arm>.txt` must show `moe_compute_policy=link-proportional` (or
+  `-calibrated`), the solved vector, and — on the two compute arms — the
+  per-rank `resident fraction held at the base plan` lines. A compute arm
+  without those lines is not VRAM-neutral and its corridor is not arm 1's.
+* **Corridor** per card >= 400 MiB free, sampled at 5 s into `corridor.csv`.
+
+```
+export RUN=/spinning/gpu-battery-results/$(date +%F)_439_confirm
+export REPO_ROOT=/spinning/htsglang VENV=/spinning/htsglang-gpu/.venv
+export WT=<the worktree> PORT=30439 RANK_GPU_ID=<from preflight.sh> RESERVE_MIB=auto
+bash "$WT/scripts/dev/394_s2_proof/preflight.sh"          # must print PREFLIGHT OK
+bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" equal
+bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" compute
+SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS=1.0561,0.9379,1.0060 \
+  bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" compute-cal
+```
+
+Re-derive the coefficients from THIS window's own `equal` arm if its H2D
+differs from the row above by more than the A-vs-A floor; a coefficient
+measured on one recipe is not a property of the rig.
 
 ## What must be read out, per rank
 
@@ -188,14 +309,25 @@ do not assume it).
 
 ## Status
 
-DESK-WRITTEN, NEVER EXECUTED against a GPU. The solve, the launcher resolver
-and the worker refusal are hermetically tested
-(`test/registered/unit/layers/moe/test_expert_compute_placement_439.py`,
-53 tests + 33 subtests), including an execution smoke of the full resolver path
+**The band is UNMEASURED. The arm has never served a token.**
+
+The 2026-08-02 battery ran the `equal` baseline in full (that half is real, and
+is where every measured input above comes from) and could not boot `compute` at
+all. Three defects, all found on hardware, all fixed at the desk since:
+
+| # | defect | fix | falsifier |
+|---|---|---|---|
+| 1 | the resolver read the resident fraction as `1.0` — it runs in the launcher, before the ServerArgs reach the runtime context, and the flag source swallowed the resulting error | the resolver hands its own `server_args` down to `resident_fraction_vector`; the env/flag cross-check is unchanged | `TestTheResolverReadsTheLaunchFLAG`, can-fail = restore the context-only route (5 tests fail) |
+| 2 | the arm was not VRAM-neutral: residency was sized off the SOLVED expert count, +19.5 % on tp2 → OOM during staging. Correcting the fraction feeds back into the solve (a fixed point the spec did not address) | residency held at the pre-link base plan through a DERIVED sizing fraction on a channel the solve never reads — see the NOTE above | `TestResidencyIsHeldAtTheBasePlan`, can-fail = drop the correction (tp1 25≠31, tp2 37≠31) |
+| 3 | the battery's driver set `ARM` without exporting it, so every arm booted the baseline; `boot_ab.sh` defaulted to `equal` rather than refusing | `run_arm.sh` is in the repo and exports; `boot_ab.sh` refuses an unset arm and has a `DRY_RUN=1` mode | `TestTheArmHarnessCarriesTheArm`, can-fail = restore the `equal` default (the unexported-arm case fails) |
+
+Hermetically tested: `test/registered/unit/layers/moe/test_expert_compute_placement_439.py`,
+76 tests + 141 subtests, including an execution smoke of the full resolver path
 with the hardware facts injected through `SGLANG_RANK_CARD_UUIDS` +
-`SGLANG_MOE_HOST_SHARD_RATIO`, and four proven can-fail arms (solve ignores the
+`SGLANG_MOE_HOST_SHARD_RATIO`, and seven proven can-fail arms (solve ignores the
 links; resident mass allowed to float; launcher call removed; worker refusal
-removed). Every number in this file is a prediction from measured inputs, and
-none of it has been observed on hardware. The standing risk label applies until
-arm 3 boots. The catalog-first analysis behind the design is
-`docs/dev/ANALYSE_439_expert_compute_placement.md`.
+removed; plus the three above). None of it has been observed on hardware.
+The standing DESK-WRITTEN risk label applies until the confirmation window
+above runs. The catalog-first analysis behind the design is
+`docs/dev/ANALYSE_439_expert_compute_placement.md`; the battery record is
+`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md`.
