@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import AsyncIterator
 
@@ -51,6 +51,14 @@ from sglang.srt.liveness import (
     ResourceClaim,
 )
 from sglang.srt.video_enhance.chain import ChainError, ChainRequest
+from sglang.srt.video_enhance.chain_policy import (
+    ChainDecision,
+    ChainPolicyError,
+    PolicyInputs,
+    PolicyRequest,
+    SourceProbe,
+    require_chain,
+)
 from sglang.srt.video_enhance.engine_cache import EngineCache
 from sglang.srt.video_enhance.frame_math import Resolution
 from sglang.srt.video_enhance.mux import (
@@ -74,6 +82,16 @@ from sglang.srt.video_enhance.preview import (
 )
 from sglang.srt.video_enhance.probes import answer_capability, load_frontier
 from sglang.srt.video_enhance.ring import BoundedRing, OverloadPolicy, RingClosed
+from sglang.srt.video_enhance.streaming import (
+    DEFAULT_RATE_WINDOW_S,
+    DEFAULT_WATERMARK_S,
+    RateWindow,
+    SourceKind,
+    StreamingAdmission,
+    StreamingAdmissionError,
+    StreamingPolicy,
+    admit_streaming_source,
+)
 from sglang.srt.video_enhance.tenant import (
     PlannedJob,
     TenantConfig,
@@ -338,6 +356,38 @@ class EnhanceRequestBody:
     #: tap costs the chain, exposed because the right value depends on how
     #: much throughput the operator is willing to spend on being able to look.
     preview_fps_divisor: int = 1
+    #: #451 adaptive chain planning. ``"off"`` -- the default -- runs exactly
+    #: the chain the request names, which is what every existing client does
+    #: and what keeps this path what it was. ``"adaptive"`` hands the source
+    #: probe and the target to ``chain_policy`` and runs the shape it picks,
+    #: reporting the mode and the reason in the job status.
+    chain_policy: str = "off"
+    #: Delivered frame rate the adaptive planner should reach, as ``"50"`` or
+    #: ``"60000/1001"``. Absent means source rate times ``fps_multiplier``,
+    #: which is what the non-adaptive path would have produced.
+    target_fps: str | None = None
+    #: Let the planner consider dropping input frames. Off by default: the
+    #: mode discards source content and must be asked for by name.
+    allow_decimation: bool = False
+    max_decimation: int = 2
+    #: Let the planner price a stage nobody measured by extrapolation. Off by
+    #: default; when on, the reported provenance says ``estimate``.
+    allow_estimates: bool = False
+    #: Seconds of lead the client is willing to buffer before playback. 0.0
+    #: makes the aggregate throughput gate strict.
+    watch_ahead_s: float = 0.0
+    #: #448 streaming input. ``"finished"`` is the default and the unchanged
+    #: path; ``"growing"`` is a file still being written and ``"live"`` a feed
+    #: with no end. See ``streaming.admit_streaming_source`` for what each
+    #: kind is and is not allowed to do.
+    source_kind: str = SourceKind.FINISHED.value
+    #: Seconds of finished output an admitted streaming job may hold back.
+    #: Ignored on a finished source, whose bridge stays at depth 1.
+    output_watermark_s: float = DEFAULT_WATERMARK_S
+    #: Sliding window the reported in/out rates are averaged over.
+    rate_window_s: float = DEFAULT_RATE_WINDOW_S
+    #: How long a growing source may produce nothing before it counts as done.
+    stream_idle_timeout_s: float = 30.0
 
     def has_time_range(self) -> bool:
         return bool(self.start_s) or self.duration_s is not None
@@ -380,6 +430,53 @@ class EnhanceRequestBody:
     def policy(self) -> OverloadPolicy:
         return OverloadPolicy(self.overload_policy)
 
+    def is_adaptive(self) -> bool:
+        return self.chain_policy == "adaptive"
+
+    def policy_request(self, source_rate: Fraction | None) -> PolicyRequest:
+        """The #451 target, resolved against whatever rate is known.
+
+        ``require_runnable`` is set unconditionally here. The policy is
+        allowed to answer "a pre-downscale would fit" as a *question*, but the
+        two shapes that need a decode stage this executor does not have must
+        never be started -- the decoder would ignore the plan and the muxer
+        would retime against a frame count that never arrives.
+        """
+        if self.target_fps:
+            num, _, den = self.target_fps.partition("/")
+            target_rate = Fraction(int(num), int(den or 1))
+        elif source_rate is not None:
+            target_rate = Fraction(source_rate) * self.fps_multiplier
+        else:
+            raise ChainPolicyError(
+                "adaptive chain planning needs a target frame rate: pass "
+                "target_fps, or use a source whose rate ffprobe can read"
+            )
+        return PolicyRequest(
+            target=Resolution.parse(self.target),
+            target_frame_rate=target_rate,
+            dtype=self.dtype,
+            sr_scale=self.sr_scale,
+            rife_scale=self.rife_scale,
+            rife_version=self.rife_version,
+            streams_in_flight=self.streams_in_flight,
+            allow_decimation=self.allow_decimation,
+            max_decimation=self.max_decimation,
+            allow_estimates=self.allow_estimates,
+            require_runnable=True,
+            max_watch_ahead_s=self.watch_ahead_s,
+        )
+
+    def streaming_policy(self, output_rate: Fraction | None) -> StreamingPolicy:
+        return StreamingPolicy(
+            kind=SourceKind(self.source_kind),
+            output_frame_rate=output_rate or Fraction(self.fps_multiplier * 25),
+            watermark_s=self.output_watermark_s,
+            overload=self.policy(),
+            rate_window_s=self.rate_window_s,
+            idle_timeout_s=self.stream_idle_timeout_s,
+        )
+
 
 @dataclass
 class Job:
@@ -395,6 +492,16 @@ class Job:
     #: them. Built with the job so a viewer can attach at any point while it
     #: runs; they cost nothing until they are started.
     previews: PreviewLanes | None = None
+    #: #451 adaptive planning verdict, or None when the request named its own
+    #: chain. Client-visible in the job status: a client handed a chain it did
+    #: not ask for is owed the mode and the reason.
+    decision: ChainDecision | None = None
+    #: #448 streaming verdict, always present. A finished source carries the
+    #: unchanged-path admission.
+    admission: StreamingAdmission | None = None
+    #: #448 sustained in/out rate over a sliding window, sampled where the
+    #: status is rendered and after each chunk the transport accepted.
+    rates: RateWindow | None = None
 
 
 class VideoEnhanceService:
@@ -420,7 +527,72 @@ class VideoEnhanceService:
 
     # -- planning ---------------------------------------------------------
     def plan(self, body: EnhanceRequestBody) -> PlannedJob:
-        return plan_job(self.config, body.to_chain_request())
+        return self.plan_with_policy(body)[0]
+
+    def plan_with_policy(
+        self, body: EnhanceRequestBody, info: MediaInfo | None = None
+    ) -> tuple[PlannedJob, EnhanceRequestBody, ChainDecision | None]:
+        """Resolve the chain, adaptively when the request asks for it (#451).
+
+        Returns the plan, the request body the rest of the pipeline should
+        use, and the decision. The body comes back because an adaptive plan
+        may change the frame-rate multiplier and the SR flag, and the remuxer
+        retimes against the multiplier -- leaving the caller's original value
+        in place would produce a container whose declared rate does not match
+        the frames in it.
+        """
+        if not body.is_adaptive():
+            return plan_job(self.config, body.to_chain_request()), body, None
+        probe_result = self.source_probe(body, info)
+        decision = require_chain(
+            probe_result,
+            body.policy_request(probe_result.frame_rate),
+            PolicyInputs.from_probe_dir(self.config.measurement_dir),
+            self.config,
+        )
+        chosen = decision.request
+        assert chosen is not None
+        resolved = replace(
+            body,
+            source_width=chosen.source.width,
+            source_height=chosen.source.height,
+            target=str(chosen.target),
+            fps_multiplier=chosen.fps_multiplier,
+            enable_sr=chosen.enable_sr,
+            sr_scale=chosen.sr_scale,
+            enable_resize=chosen.enable_resize,
+        )
+        return plan_job(self.config, chosen), resolved, decision
+
+    def source_probe(
+        self, body: EnhanceRequestBody, info: MediaInfo | None = None
+    ) -> SourceProbe:
+        """The #451 planner's view of the input.
+
+        ``MediaInfo`` when there is one, because it carries the duration a
+        watch-ahead calculation needs; the request's own fields otherwise, so
+        a caller that already knows its source can plan without an ffprobe.
+        """
+        if info is not None:
+            return SourceProbe.from_media_info(info, body.enhance_video_index)
+        if not body.source_frame_rate:
+            raise ChainPolicyError(
+                "adaptive chain planning needs the source frame rate: pass "
+                "source_frame_rate, or a source that can be probed"
+            )
+        num, _, den = body.source_frame_rate.partition("/")
+        return SourceProbe(
+            resolution=Resolution(body.source_width, body.source_height),
+            frame_rate=Fraction(int(num), int(den or 1)),
+        )
+
+    def admit(
+        self, body: EnhanceRequestBody, output_rate: Fraction | None
+    ) -> StreamingAdmission:
+        """The #448 gate. Refuses rather than returns for an inadmissible source."""
+        return admit_streaming_source(
+            body.streaming_policy(output_rate), chunked=False
+        ).require()
 
     def track_plan(
         self, body: EnhanceRequestBody, info: MediaInfo | None = None
@@ -501,15 +673,36 @@ class VideoEnhanceService:
         process: the remuxer's ``feed`` awaits a drain, and its stdout is only
         read when the bounded response bridge has room.
         """
-        planned = self.plan(body)
+        planned, body, decision = self.plan_with_policy(body, media_info)
         time_range = self.resolve_range(body, media_info)
         job_id = self.claim_job_id(job_id)
-        bridge = BoundedRing(
-            f"muxer->socket:{job_id}", RESPONSE_BRIDGE_DEPTH, body.policy()
-        )
 
+        # The remuxer is built before the bridge because it is what resolves
+        # the source rate, and the #448 watermark is a duration that only
+        # becomes a depth once the output rate is known.
         remuxer, source_rate = (
             self._make_remuxer(body, media_info, time_range) if remux else (None, None)
+        )
+        output_rate = (
+            retimed_rate(source_rate, body.fps_multiplier)
+            if source_rate is not None
+            else None
+        )
+        admission = self.admit(body, output_rate)
+        # A finished source keeps the depth-1 bridge exactly as it was: any
+        # deeper is a buffer between the socket and the chain that
+        # back-pressure has to cross (§8.4 rule 3). A streaming job accepts
+        # that crossing deliberately, in exchange for not underrunning a
+        # player, and the depth it accepts is the declared watermark.
+        bridge_depth = (
+            admission.buffer_depth_frames
+            if admission.is_streaming
+            else RESPONSE_BRIDGE_DEPTH
+        )
+        bridge = BoundedRing(f"muxer->socket:{job_id}", bridge_depth, body.policy())
+        rates = RateWindow(
+            window_s=body.rate_window_s,
+            target_output_fps=float(output_rate) if output_rate else None,
         )
 
         if remuxer is None:
@@ -577,6 +770,9 @@ class VideoEnhanceService:
             created_at=time.time(),
             time_range=time_range,
             previews=previews,
+            decision=decision,
+            admission=admission,
+            rates=rates,
         )
         self.jobs[job_id] = job
 
@@ -669,6 +865,13 @@ class VideoEnhanceService:
                 # the transport has taken the chunk, so this is the one place
                 # in the process that knows the peer is still there.
                 watchdog.note_progress(len(chunk))
+                # Same moment, same reason (#448): a rate sampled here is a
+                # rate the transport accepted, and the sample costs one
+                # append on a path that has already left the chain.
+                rates.observe(
+                    frames_in=executor.stats.frames_decoded,
+                    frames_out=executor.stats.frames_encoded,
+                )
         finally:
             await watchdog.stop()
             if not job.task.done():
@@ -822,6 +1025,20 @@ class VideoEnhanceService:
             # claim that a tap costs the chain nothing is checkable from one
             # response, by reading preview drops against frames_encoded.
             snapshot["previews"] = job.previews.snapshot()
+        if job.rates is not None:
+            # Sampled here as well as in the response loop, so a status poll
+            # keeps the window fresh on a job whose client is reading slowly.
+            job.rates.observe(
+                frames_in=stats.frames_decoded, frames_out=stats.frames_encoded
+            )
+            snapshot["sustained_rate"] = job.rates.snapshot()
+        if job.admission is not None and job.admission.is_streaming:
+            snapshot["streaming"] = job.admission.as_dict()
+        if job.decision is not None:
+            # The client-visible half of #451: which chain shape it is getting
+            # and the one line saying why. A client handed a decimated stream
+            # without being told is being lied to.
+            snapshot["chain_policy"] = job.decision.as_dict()
         if job.source_rate is not None:
             multiplier = job.planned.chain.request.fps_multiplier
             out_rate = retimed_rate(job.source_rate, multiplier)
@@ -1036,7 +1253,13 @@ def create_app(
             service.plan(parsed)
             service.resolve_range(parsed)
             job_id = service.claim_job_id(requested_id)
-        except (ChainError, TenantConfigError, RangeError) as exc:
+        except (
+            ChainError,
+            TenantConfigError,
+            RangeError,
+            ChainPolicyError,
+            StreamingAdmissionError,
+        ) as exc:
             # Refusal carries the arithmetic, so the caller can fix the request
             # rather than guess.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1106,7 +1329,13 @@ def create_app(
             service.plan(parsed)
             service.resolve_range(parsed)
             claimed = service.claim_job_id(job_id)
-        except (ChainError, TenantConfigError, RangeError) as exc:
+        except (
+            ChainError,
+            TenantConfigError,
+            RangeError,
+            ChainPolicyError,
+            StreamingAdmissionError,
+        ) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except JobIdError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
