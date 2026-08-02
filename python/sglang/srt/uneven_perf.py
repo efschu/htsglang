@@ -526,6 +526,23 @@ class PerfCalibration:
             if getattr(self, f.name) is not None
         ]
 
+    def borrowed_fields(self) -> List[str]:
+        """Names of the fields still at the REFERENCE-RIG fit (#434).
+
+        The mirror of :meth:`overridden_fields`, and the more consequential
+        half on any machine that is not the rig these were fitted on: they
+        are scalars from one rig, one checkpoint family and one prefill mode,
+        and a plan that reports only the OVERRIDDEN case makes silence mean
+        "reference fit" without saying so. Each constant's own definition
+        above carries the campaign that produced it and the recipe for a
+        refit; this method is what puts the fact in the boot's log.
+        """
+        return [
+            f.name
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) is None
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Stage 0: hardware micro-probe (runs in a SUBPROCESS so the launcher stays
@@ -4495,6 +4512,27 @@ class PerfCostModel:
         streamed = self.streamed_bytes(list(mlp_vector))
         return max(s / b for s, b in zip(streamed, bw))
 
+    def per_rank_decode_times(
+        self,
+        mlp_vector: List[int],
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """Each rank's OWN bs=1 weight-streaming time for one decode round.
+
+        The vector ``decode_round_time`` takes the max of, in the same
+        arbitrary-but-consistent units. Exposed for the energy objective
+        under ``--rank-perf-tune dec`` (#434), which needs every rank's busy
+        term: the round lasts as long as the slowest rank and the others draw
+        idle-to-active in proportion to how much of it they were busy --
+        exactly what ``per_rank_prefill_compute_times`` supplies on the
+        prefill side. Pure arithmetic over the profile's own rates; no
+        probing.
+        """
+        bw = self.effective_decode_bw(membw_gbs, gemv_gbs)
+        streamed = self.streamed_bytes(list(mlp_vector))
+        return [s / b for s, b in zip(streamed, bw)]
+
     def decode_cost_percent(
         self,
         mlp_vector: List[int],
@@ -4912,7 +4950,11 @@ def _binding_gate(entry, knee_binding: bool = True) -> str:
 
 
 def _no_lever_lines(
-    tune: str, loose: float, results, knee_binding: bool = True
+    tune: str,
+    loose: float,
+    results,
+    knee_binding: bool = True,
+    metric: str = "prefill",
 ) -> List[str]:
     """The refusal, when no candidate survives the gates (#265).
 
@@ -4948,20 +4990,32 @@ def _no_lever_lines(
             "the phase-optimal prefill arm has no lever at this operating "
             "point"
             if tune in _PHASE_TUNES
-            else "no candidate survives the gates"
+            else (
+                # #434: the answer for 'dec' is now SOLVED on this rig's own
+                # bandwidth profile rather than asserted from M22's
+                # reference-rig measurement, so the refusal has to read as a
+                # result: on this profile the weight split is flat for
+                # decode. The other decode lever (--rank-kv-ratio speed) is
+                # selected independently and is unaffected by this verdict.
+                "the weight split is FLAT for decode on this rig's measured "
+                "bandwidth profile -- the VRAM-auto split already sits at "
+                "the decode optimum this MLP grid can represent"
+                if tune == "dec"
+                else "no candidate survives the gates"
+            )
         )
     )
     head = (
         f"tune={tune}: {lever}. {len(results)} concentration candidates "
         f"evaluated, none accepted ({tally}). The best of them, "
         f"{','.join(map(str, best[0]))}, would have predicted "
-        f"{best[2] * 100:+.1f}% prefill and is rejected by: {best_gate}. "
+        f"{best[2] * 100:+.1f}% {metric} and is rejected by: {best_gate}. "
         "Keeping the plain VRAM-auto split."
     )
     tail = {
         "floor": (
             "The floor is what binds: raise --rank-perf-loose-ctx-percent "
-            f"(now {loose:g}) to trade predicted context for prefill speed."
+            f"(now {loose:g}) to trade predicted context for {metric} speed."
         ),
         "knee": (
             "The decode-knee guard is what binds: the candidate would make "
@@ -4983,9 +5037,9 @@ def _no_lever_lines(
             "budgets are too small for this concentration."
         ),
         "no gain": (
-            "No gate binds -- the model simply predicts no prefill gain from "
-            "concentration here, so the VRAM-auto split already sits at the "
-            "prefill optimum this rig can represent."
+            f"No gate binds -- the model simply predicts no {metric} gain "
+            "from concentration here, so the VRAM-auto split already sits at "
+            f"the {metric} optimum this rig can represent."
         ),
     }.get(best_gate)
     return [head] + ([tail] if tail else [])
@@ -5389,6 +5443,24 @@ def apply_auto_performance(server_args) -> None:
         )
     )
 
+    # #434: the borrowed case is the one worth printing. These four scalars
+    # were fitted on the machine this fork was developed on; on any other
+    # machine they are a hypothesis the plan is priced with, and reporting
+    # only the OVERRIDDEN case let silence stand for "reference fit".
+    borrowed = model.calibration.borrowed_fields()
+    if borrowed:
+        lines.append(
+            "calibration BORROWED (not measured here): "
+            + ", ".join(borrowed)
+            + " -- scalars fitted on the fork's development rig against one "
+            "checkpoint family and one prefill mode, applied to this plan "
+            "because nothing has refitted them for this machine. They set "
+            "the decode roofline's residual exponent and the split-invariant "
+            "time fractions, i.e. HOW MUCH a candidate is predicted to gain, "
+            "not which cards are fast (that comes from the profile). Refit "
+            "via the matching SGLANG_PERF_* env vars; each constant's "
+            "definition in uneven_perf.py carries its campaign and recipe."
+        )
     overridden = model.calibration.overridden_fields()
     if overridden:
         lines.append(
@@ -5664,17 +5736,6 @@ def apply_auto_performance(server_args) -> None:
                 "measured model -- keeping plain auto (registry stale? "
                 "budgets shrank?)."
             )
-    elif tune == "dec":
-        lines.append(
-            "tune=dec: M22 measured decode as FLAT (+-2%) across all "
-            "representable splits -- the VRAM-auto split already sits near "
-            "the decode bandwidth optimum, and over-concentration makes the "
-            "strong card the lockstep bottleneck (-6-8%). auto-performance "
-            "therefore keeps the auto split unchanged (documented no-op; "
-            "only free gains apply, and none exceed auto for decode). Use "
-            "--rank-perf-tune enc|both for the measured prefill/throughput "
-            "lever."
-        )
     else:
         # The decode-knee guard REJECTS in the single-vector modes and only
         # REPORTS in the phase-optimal modes (#357). It is not being softened:
@@ -5693,6 +5754,35 @@ def apply_auto_performance(server_args) -> None:
                 "MLP-concentration lever (M22: +10% prefill / +7% conc-8 "
                 "for the C6-class vector), so 'both' optimizes the same "
                 "objective as 'enc'."
+            )
+        elif tune == "dec":
+            # #434: this target used to print M22's reference-rig finding
+            # ("decode is FLAT across all representable splits") and return
+            # the base split WITHOUT running the optimizer. That is a
+            # measurement from one rig (5090 + 2x 3080) asserted as a
+            # property of every rig. It is not one: the base plan is
+            # proportional to VRAM BUDGET and the decode round time is set by
+            # streamed weight bytes over EFFECTIVE BANDWIDTH, so the two
+            # coincide only while a card's VRAM share equals its bandwidth
+            # share. On the reference rig they nearly do, which is what M22
+            # measured; on a rig whose capacity and bandwidth rankings
+            # disagree -- a large slow card next to a small fast one, an
+            # NVLink island, an 8x-equal box with one throttled card -- the
+            # decode lever is real and the old branch could never find it.
+            # The objective below is solved from THIS rig's own profile
+            # scores; where decode really is flat, no candidate beats the
+            # base and the refusal says so by name.
+            lines.append(
+                "tune=dec: objective = minimize the lockstep bs=1 DECODE "
+                "round time (streamed weight bytes / effective decode "
+                "bandwidth, per rank), solved from this rig's own measured "
+                "profile. The weight split is only one of the two decode "
+                "levers -- the other is the KV-TOKEN split, which this "
+                "target selects separately via --rank-kv-ratio speed. On a "
+                "rig whose VRAM shares already match its bandwidth shares "
+                "the weight lever is flat (M22 measured exactly that on the "
+                "reference rig) and the refusal below names it; that is a "
+                "result of the solve here, not an assumption."
             )
         elif tune in _PHASE_TUNES:
             lines.append(
@@ -5755,7 +5845,27 @@ def apply_auto_performance(server_args) -> None:
         t_base = model.prefill_time_model(
             base_plan, enc_scores, min_link, enc_family_tflops
         )
+        # #434: which quantity the ladder MAXIMIZES the gain of. Every target
+        # but 'dec' scores the prefill time model; 'dec' scores the bs=1
+        # decode round time. Both are built from THIS rig's own profile
+        # entries -- GEMM lanes for prefill, effective decode bandwidth for
+        # decode -- so neither carries a reference-rig verdict into the
+        # answer.
+        decode_objective = tune == "dec"
+        dec_scores = model.effective_decode_bw(rank_scores_bw, rank_scores_gemv)
+        objective_metric = "decode" if decode_objective else "prefill"
         candidates = _mlp_candidates(model, enc_scores, base_plan)
+        if decode_objective:
+            # Concentration toward the BANDWIDTH-strong rank is the decode
+            # ladder; the compute ladder is kept in the set because on a rig
+            # where the two rankings agree it names the same vectors, and
+            # where they disagree an operator reading the log gets to see
+            # both priced. Union, deduplicated, base excluded.
+            seen_cands = {tuple(c) for c in candidates}
+            for cand in _mlp_candidates(model, list(dec_scores), base_plan):
+                if tuple(cand) not in seen_cands:
+                    seen_cands.add(tuple(cand))
+                    candidates.append(cand)
         best_gain = 0.0
         # #350 phase 4: the boot's own objective. Resolved and validated
         # HERE, at parse time, so an energy request that cannot be priced
@@ -5777,6 +5887,15 @@ def apply_auto_performance(server_args) -> None:
             knee_ok, knee_reason = model.decode_knee_detail(
                 list(cand), rank_scores_bw, rank_scores_gemv
             )
+            if decode_objective:
+                # Speedup fraction of the whole decode STEP, so the number is
+                # comparable with the prefill gain above and with the
+                # per-candidate decode line printed further down (which is
+                # the same quantity expressed as a cost).
+                step_ratio = 1.0 + model.decode_cost_percent(
+                    list(cand), rank_scores_bw, rank_scores_gemv
+                ) / 100.0
+                gain = (1.0 / step_ratio - 1.0) if step_ratio > 0 else -1.0
             # Tolerance, not slop (#265): re-partitioning the MLP family
             # CONSERVES total weight bytes, so sum_r P_r -- and with it the
             # predicted context whenever the sum is the binding term -- is
@@ -5804,10 +5923,18 @@ def apply_auto_performance(server_args) -> None:
                 # the context floor, the decode-knee guard and fundability
                 # are correctness gates and a joule does not buy past them.
                 # Price = lockstep time x summed board power over the SAME
-                # per-rank prefill times the throughput model maxes over.
+                # per-rank times the throughput model maxes over -- prefill
+                # GEMM times for every target but 'dec', decode weight-stream
+                # times for 'dec' (#434). Pricing a decode objective on
+                # prefill times would rank the candidates by a round the
+                # target does not optimize.
                 if admissible:
                     j = energy_per_work(
-                        model.per_rank_prefill_compute_times(
+                        model.per_rank_decode_times(
+                            list(cand), rank_scores_bw, rank_scores_gemv
+                        )
+                        if decode_objective
+                        else model.per_rank_prefill_compute_times(
                             list(cand), enc_scores, enc_family_tflops
                         ),
                         energy_model,
@@ -5859,8 +5986,8 @@ def apply_auto_performance(server_args) -> None:
             lines.append(
                 f"candidate MLP vector {','.join(map(str, cand))}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
-                f"predicted prefill gain {gain * 100:+.1f}%, predicted decode "
-                f"step {dec_pct:+.1f}%"
+                f"predicted {objective_metric} gain {gain * 100:+.1f}%, "
+                f"predicted decode step {dec_pct:+.1f}%"
                 + (
                     f", residual free {[int(x) for x in res]} MiB"
                     if res is not None
@@ -5875,7 +6002,9 @@ def apply_auto_performance(server_args) -> None:
             )
         if chosen is None:
             lines.extend(
-                _no_lever_lines(tune, loose, results, knee_binding)
+                _no_lever_lines(
+                    tune, loose, results, knee_binding, objective_metric
+                )
             )
         elif tune == _PHASE_DECODE:
             # The decode arm of the recipe IS the VRAM-auto split. The
@@ -5914,6 +6043,24 @@ def apply_auto_performance(server_args) -> None:
             f"--rank-tp-ratio auto --rank-mlp-ratio "
             f"{','.join(map(str, chosen))}"
         )
+        if tune == "dec":
+            # #434: the weight lever for decode is small wherever a card's
+            # VRAM share is close to its bandwidth share, and the model that
+            # sizes it was calibrated against step times whose boot-to-boot
+            # floor is of the same order as the deltas it now reports. State
+            # that next to the number instead of letting a predicted percent
+            # read as a measured one. No numeric gate is applied: a threshold
+            # would be a constant fitted somewhere, which is the defect this
+            # target was changed to remove.
+            lines.append(
+                "tune=dec: the decode weight lever is a PREDICTION from the "
+                "bandwidth profile, not a measurement. Confirm it against a "
+                "same-boot A-vs-A floor (identical draws, both vectors, one "
+                "boot each) before treating the delta as real -- and note "
+                "that the KV-TOKEN lever this target also selects "
+                "(--rank-kv-ratio speed) is the larger of the two decode "
+                "levers wherever context is deep."
+            )
         if tune == _PHASE_PREFILL:
             # State the other arm of the recipe, and what switching costs
             # today: the MLP vector is a WEIGHT split, and no runtime actuator

@@ -71,9 +71,13 @@ measured by the very number the table prints -- the reported context IS
 ``predict_capacity(v)["ctx"]``, and the reported throughput move IS the ranked
 one. ``test_lever_profiles`` pins all three.
 
-A speed move smaller than :data:`_SPEED_TIE_TOL_PCT` keeps the base split. The
-tolerance is this rig's measured boot-to-boot noise floor, so a difference no
-boot could demonstrate never becomes a different configuration.
+A speed move smaller than the tie tolerance keeps the base split, so a
+difference no boot could demonstrate never becomes a different configuration.
+:func:`_speed_tie_tol` resolves that tolerance from THIS rig's A-vs-A
+boot-to-boot spread when the crossover store holds one, and otherwise borrows
+the reference rig's floor (:data:`_SPEED_TIE_TOL_PCT_FALLBACK`) and says so in
+the profile's reason line -- a borrowed threshold is never presented as a
+local measurement.
 
 WHAT THIS MODULE REFUSES TO DO
 ------------------------------
@@ -295,12 +299,57 @@ METRICS: Tuple[MetricSpec, ...] = (
 # Selection
 # ---------------------------------------------------------------------------
 
-#: A predicted SPEED move smaller than this does not move the vector: the
-#: profile keeps the base split. 1 % is the boot-to-boot noise floor measured
-#: on this rig for the decode step (#210: 1.07 %), so below it the model is
-#: predicting a difference no boot could demonstrate, and changing the
-#: configuration for it would be changing it for nothing.
-_SPEED_TIE_TOL_PCT = 1.0
+#: FALLBACK for the speed tie tolerance: a predicted SPEED move smaller than
+#: this does not move the vector, because a difference no boot could
+#: demonstrate is not a reason to change the configuration.
+#:
+#: 1 % is the boot-to-boot decode noise floor measured on the REFERENCE rig
+#: (5090 + 2x 3080, PCIe without P2P; #210: 1.07 %). A noise floor is a
+#: property of a machine -- its clock behaviour, its thermals, its scheduler
+#: -- so this number is a HYPOTHESIS anywhere else and is only used when the
+#: rig has measured none of its own. :func:`_speed_tie_tol` prefers the local
+#: A-vs-A measurement whenever the crossover store holds one, and returns the
+#: provenance alongside so the profile's reason line does not claim "this
+#: rig's measured floor" for a number measured on a different rig.
+_SPEED_TIE_TOL_PCT_FALLBACK = 1.0
+
+#: Which of a crossover finding's A-vs-A spreads is the decode-side floor.
+#: ``ms_per_spec_step`` is the same quantity the tolerance gates: boot-to-boot
+#: spread of the decode step time, in percent.
+_NOISE_FLOOR_METRIC = "ms_per_spec_step"
+
+
+def _speed_tie_tol(crossover=None) -> Tuple[float, str]:
+    """``(tolerance_pct, provenance)`` for the speed objectives.
+
+    Prefers the rig's OWN boot-to-boot spread, taken from a crossover finding
+    that :meth:`~sglang.srt.planner.crossover.CrossoverFinding.usable_for_advice`
+    accepts -- i.e. measured HERE, cache-bypass proven and not stale. The
+    upper end of the ``(lo, hi)`` A-vs-A band is used: the tolerance has to
+    clear the worst spread the rig showed, not the best one.
+
+    Falls back to :data:`_SPEED_TIE_TOL_PCT_FALLBACK` with a provenance that
+    says the number came from the reference rig and how to replace it.
+    """
+    try:
+        if crossover is not None and crossover.usable_for_advice():
+            band = (crossover.noise_floor_pct or {}).get(_NOISE_FLOOR_METRIC)
+            if band:
+                tol = float(max(band))
+                if tol > 0.0:
+                    return tol, (
+                        f"this rig's measured boot-to-boot noise floor "
+                        f"({tol:.2f} %, A-vs-A over the crossover study's "
+                        f"interleaved cold boots)"
+                    )
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _SPEED_TIE_TOL_PCT_FALLBACK, (
+        f"the REFERENCE rig's {_SPEED_TIE_TOL_PCT_FALLBACK:.0f} % boot-to-boot "
+        "noise floor -- this rig has measured none of its own, so the "
+        "threshold is borrowed. Run the crossover study to replace it"
+    )
+
 
 #: Capacity is deterministic arithmetic rather than a timing, so there is no
 #: noise floor to hide behind: only an exact tie falls back to the base split.
@@ -479,7 +528,14 @@ def _margin_txt(margin: Optional[float], fmt: str = "%+.1f %%") -> str:
 
 
 def _choose(
-    spec: ProfileSpec, model, base: List[int], cands, scores, min_link, uniform=False
+    spec: ProfileSpec,
+    model,
+    base: List[int],
+    cands,
+    scores,
+    min_link,
+    uniform=False,
+    speed_tol: Optional[Tuple[float, str]] = None,
 ):
     """(vector, reason) for one profile over the shared candidate set.
 
@@ -490,7 +546,14 @@ def _choose(
     error #216 recorded -- it reported -22 % for a vector that measured
     +16.5 % -- so the roofline's peak-based decode number is never the ranker
     here, only the level the ranked move is applied to.
+
+    ``speed_tol`` is the ``(tolerance_pct, provenance)`` pair from
+    :func:`_speed_tie_tol`. It is threaded in rather than read here so that
+    the reason lines can name WHERE the threshold came from -- claiming "this
+    rig's measured floor" for a borrowed number is the kind of statement this
+    module exists to avoid.
     """
+    tol_pct, tol_source = speed_tol or _speed_tie_tol()
     if spec.objective == "base":
         return list(base), "the VRAM-auto split, by definition of this profile"
     if len(cands) <= 1:
@@ -540,14 +603,13 @@ def _choose(
             cands,
             lambda c: 1.0 / max(model.decode_round_time(c, scores["membw_gbs"]), 1e-12),
             base,
-            _SPEED_TIE_TOL_PCT,
+            tol_pct,
         )
         if list(vec) == list(base):
             return vec, (
-                "the best candidate stays inside this rig's measured "
-                f"boot-to-boot noise floor ({_margin_txt(margin)} modelled), "
-                "so this profile keeps the base split -- which is the M22 "
-                "decode-flatness result, reached from this rig's own numbers"
+                f"the best candidate stays inside {tol_source} "
+                f"({_margin_txt(margin)} modelled), so this profile keeps the "
+                "base split -- which is the M22 decode-flatness result"
             )
         return vec, (
             f"shortest modelled bs=1 decode round time over {len(cands)} "
@@ -556,14 +618,14 @@ def _choose(
     if spec.objective == "prefill":
         if min_link is None:
             # The objective is not an argmax alone: ``_pick_best`` compares the
-            # winner's MARGIN against the 1 % boot-to-boot noise floor, and a
+            # winner's MARGIN against the boot-to-boot noise floor, and a
             # compute-only margin overstates the move by exactly the collective
             # term it does not charge. A threshold decision taken through an
             # unmeasured quantity is the #216/#264 defect, so the objective
             # reports itself unresolved instead (#359).
             return None, (
-                "the prefill objective compares a modelled move against this "
-                "rig's 1 % noise floor, and no pair matrix was measured for "
+                f"the prefill objective compares a modelled move against "
+                f"{tol_source}, and no pair matrix was measured for "
                 "these cards: the per-layer all-reduce cannot be priced, a "
                 "compute-only margin overstates every move, and this surface "
                 "does not rank through a number nobody measured. Run the card "
@@ -574,7 +636,7 @@ def _choose(
             cands,
             lambda c: 1.0 / max(model.prefill_time_model(c, gemm, min_link), 1e-12),
             base,
-            _SPEED_TIE_TOL_PCT,
+            tol_pct,
         )
         if list(vec) == list(base):
             return vec, (
@@ -916,10 +978,22 @@ def build_profiles(
                 planned[key] = None
         return planned[key]
 
+    # Resolved once for the whole table: the tie threshold is a property of
+    # the rig, not of the profile, and every profile has to be gated on the
+    # same one (and name the same provenance).
+    speed_tol = _speed_tie_tol(crossover)
+
     rows: List[Dict[str, Any]] = []
     for idx, spec in enumerate(PROFILES):
         vec, why = _choose(
-            spec, model, base_plan, cands, scores, min_link, uniform=uniform
+            spec,
+            model,
+            base_plan,
+            cands,
+            scores,
+            min_link,
+            uniform=uniform,
+            speed_tol=speed_tol,
         )
         if vec is None:
             vec, unresolved = list(base_plan), why

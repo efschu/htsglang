@@ -2210,7 +2210,27 @@ def _apply_capacity_rules(
 # and gets the same rank-space vectors. Any other rig gets no calibration
 # (the caller falls back to a derived estimate and says so) -- never remap
 # measured per-rank vectors onto a rig we did not measure.
+#
+# The gate also checks the VRAM TOTALS, not only the model names (#434). A
+# token vector and a reserve are budget-space quantities: they were solved
+# against 32607 / 20480 / 20480 MiB. The reference rig's 3080s are the 20 GB
+# variant, and the STOCK RTX 3080 is a 10 GB card (see
+# ``card_library.SEED_CARDS``) -- a name-only gate hands a stock 5090 + 2x
+# 3080 10 GB rig a KV split and a 3000 MiB reserve solved for cards with
+# twice the memory, which is a boot-time OOM rather than a calibration.
 # ---------------------------------------------------------------------------
+
+#: NVML totals (MiB) of the calibrated rig, in the same NAME order the gate
+#: counts: the 5090 first, then the two 20 GB 3080s.
+_CALIBRATED_RIG_TOTALS_MIB = {"5090": 32607, "3080": 20480}
+
+#: How far a card's NVML total may sit from the calibrated one and still count
+#: as the same card. NVML totals of nominally identical cards differ by a few
+#: MiB (ECC state, driver version, vBIOS), so an exact match would reject the
+#: reference rig itself on a driver upgrade; a whole VRAM tier is far outside
+#: this band (10240 vs 20480 is 100 % away).
+_CALIBRATED_RIG_TOTAL_TOLERANCE = 0.05
+
 
 def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
     """A measured calibration for this exact rig shape + checkpoint quant, or
@@ -2218,12 +2238,33 @@ def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
 
     The gate is ORDER-INSENSITIVE (exact name multiset: one 5090 + two
     3080s): inventory listing order is NVML/detect order, while the vectors
-    are rank-space (cuda order) -- see the block comment above."""
+    are rank-space (cuda order) -- see the block comment above. It is also
+    TOTAL-SENSITIVE: a card whose NVML total is a different VRAM tier from
+    the calibrated one is a different card for budget purposes, whatever its
+    model name says."""
     names = [n.lower() for n in _gpu_names(gpus)]
+    totals = _gpu_totals(gpus)
+
+    def _totals_match() -> bool:
+        if len(totals) != len(names):
+            return False
+        for name, total in zip(names, totals):
+            for key, want in _CALIBRATED_RIG_TOTALS_MIB.items():
+                if key in name:
+                    if not total:
+                        # No total to check against: the inventory is a manual
+                        # or offline spec. Refuse rather than assume -- the
+                        # whole point of the check is not to guess a budget.
+                        return False
+                    if abs(total - want) > want * _CALIBRATED_RIG_TOTAL_TOLERANCE:
+                        return False
+        return True
+
     if (
         len(names) == 3
         and sum(1 for n in names if "5090" in n) == 1
         and sum(1 for n in names if "3080" in n) == 2
+        and _totals_match()
     ):
         if quant == "fp8":
             return {

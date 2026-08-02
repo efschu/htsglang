@@ -30,7 +30,9 @@
    `cuda:0` ist hier die 5090. Karten im Zweifel ueber PCI-Adresse/Namen
    aufloesen, nie ueber feste Indizes aus anderer Quelle.
 10. **Reserve-Falle**: `--rank-auto-reserve-mib` 2200 auf den 3080ern kippt
-    im ersten echten Prefill (Warmup ueberlebt!). 2700 ist die Grenze.
+    im ersten echten Prefill (Warmup ueberlebt!). 2700 ist die Grenze fuer
+    DIESES Rig/Modell/Kontext (RIG EXAMPLE — andere Kombination braucht
+    eigene Probe, nicht 2700 blind uebernehmen).
 11. **NCCL 2.28.9 auf dem Host**: mehrere Raenge je physischer GPU
     (Co-Location) brauchen >= 2.30 -> nur im Container. Der Standardlauf
     (1 Rang je Karte) ist davon NICHT betroffen.

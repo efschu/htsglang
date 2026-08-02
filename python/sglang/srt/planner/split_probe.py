@@ -91,6 +91,17 @@ PROVENANCE = (MEASURED, IMPORTED)
 #: in ascending concentration, with "auto" (let the optimizer choose) first.
 #: A ladder entry is a ROW in the table whether or not it was ever measured;
 #: an unmeasured one carries a button, never a number.
+#:
+#: RANK COUNT IS BAKED IN (#434). Every entry but ``auto`` is a THREE-rank
+#: vector, because this table was built for the TP=3 reference class. On a rig
+#: of another rank count the concentrated rows are not merely unmeasured, they
+#: are unmeasurable -- the vector length does not match ``--tp-size`` and the
+#: boot the "not measured" reason invites would be rejected at parse time.
+#: The candidate set is also fixed rather than derived, so it does not follow
+#: the profile the way ``uneven_perf._mlp_candidates`` does. Deriving the
+#: ladder from the rig's own solver candidates is FU-434-16; until then, pass
+#: an explicit ``ladder=`` to :func:`tipping_point_table` on any rig that is
+#: not TP=3.
 LADDER: Tuple[str, ...] = (
     "auto",
     "2,1,1",
@@ -107,10 +118,26 @@ LADDER: Tuple[str, ...] = (
 #: point says nothing about whether concentrating is worth it.
 BASELINE_CANDIDATE = "auto"
 
-#: Runbook 4.1 reserve for the 27B-FP8 TP=3 class, in CUDA device order
-#: (device 0 = the 5090). The request may override it; the concentration bump
-#: below is applied on top of whichever is in force.
+#: Runbook 4.1 reserve for the 27B-FP8 TP=3 class ON THE REFERENCE RIG, in
+#: CUDA device order (device 0 = the 5090). The request may override it; the
+#: concentration bump below is applied on top of whichever is in force.
+#:
+#: These are three MEASURED numbers for three specific cards, not a formula.
+#: A rig with other cards, another card count or another checkpoint has a
+#: different reserve, and ``reserve_for_candidate`` says so in its note
+#: instead of presenting a borrowed vector as this rig's runbook value (#434).
 DEFAULT_RESERVE_MIB: Tuple[int, ...] = (3000, 2700, 2700)
+
+#: The rank count :data:`DEFAULT_RESERVE_MIB` was measured at. Past it the
+#: vector is being stretched over ranks nobody measured.
+DEFAULT_RESERVE_TP_SIZE = len(DEFAULT_RESERVE_MIB)
+
+#: What an unmeasured extra rank is charged when the default vector has to be
+#: stretched: the smallest measured entry. Deliberately the smallest rather
+#: than the largest -- a reserve that is too small OOMs loudly on the first
+#: boot and is retried, while one that is too large silently eats KV on every
+#: boot and looks like a correct answer.
+DEFAULT_RESERVE_FILL_MIB = min(DEFAULT_RESERVE_MIB)
 
 #: A boot that OOMs anyway is retried once with the concentrated rank's
 #: reserve raised by this fraction of the reserve already planned there. The
@@ -403,13 +430,31 @@ def reserve_for_candidate(
     reserve the failure asked for, and the row records both.
     """
     reserve = [int(x) for x in base_reserve][:tp_size]
+    # A reserve vector shorter than the rig is being stretched over ranks it
+    # was never measured on. That is allowed -- the probe's job is to boot and
+    # find out -- but it is stated, because the default vector is three
+    # measured numbers for three specific cards, not a per-rank formula (#434).
+    stretched = len(reserve) < tp_size
     while len(reserve) < tp_size:
-        reserve.append(reserve[-1] if reserve else 2700)
+        reserve.append(DEFAULT_RESERVE_FILL_MIB)
+    stretch_note = (
+        f" ({tp_size} ranks against a {len(base_reserve)}-entry reserve: "
+        f"ranks {len(base_reserve)}..{tp_size - 1} were filled with "
+        f"{DEFAULT_RESERVE_FILL_MIB} MiB, an UNMEASURED value for this rig -- "
+        "pass --rank-auto-reserve-mib to set them)"
+        if stretched
+        else ""
+    )
     vec = _vector_of(candidate, tp_size)
     if vec is None:
-        return reserve, "runbook reserve, unbumped: the optimizer's own choice"
+        return reserve, (
+            "runbook reserve, unbumped: the optimizer's own choice" + stretch_note
+        )
     if not model_path:
-        return reserve, "runbook reserve, unbumped: no model path to size the scratch"
+        return reserve, (
+            "runbook reserve, unbumped: no model path to size the scratch"
+            + stretch_note
+        )
 
     total = float(sum(vec))
     base_share = 1.0 / tp_size
@@ -417,7 +462,8 @@ def reserve_for_candidate(
     if base_scratch is None:
         return (
             reserve,
-            "runbook reserve, unbumped: this checkpoint has no GDN layers to size",
+            "runbook reserve, unbumped: this checkpoint has no GDN layers to "
+            "size" + stretch_note,
         )
     bumped: List[int] = []
     parts: List[str] = []
@@ -441,7 +487,7 @@ def reserve_for_candidate(
         if parts
         else "runbook reserve, unbumped: the scratch does not grow at this share"
     )
-    return bumped, note
+    return bumped, note + stretch_note
 
 
 # ---------------------------------------------------------------------------

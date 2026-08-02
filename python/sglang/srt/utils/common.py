@@ -337,6 +337,18 @@ def _nvml_devices_in_cuda_order() -> Tuple[List[_NvmlDevice], bool]:
     if pci_order:
         devices.sort(key=lambda d: d[3])
     else:
+        # FASTEST_FIRST is not a capability sort. CUDA ranks by device
+        # PERFORMANCE and capability is only a proxy for it -- a proxy that
+        # holds on the rig this fork was developed on, where the fastest card
+        # is also the highest-sm_ one, and that fails wherever the two
+        # disagree (an A100 at sm_80 beside an RTX 4060 at sm_89, #434). So
+        # position 0 is a GUESS here too whenever the visible cards do not
+        # share a capability, not only the positions past it. The returned
+        # flag already tells callers the order is unspecified, and
+        # ``_nvml_cuda_device0`` refuses outright on a mixed rig; resolving
+        # position 0 through the #331 identity map is the named follow-up
+        # (FU-434-15), because it changes what
+        # ``min_visible_cuda_capability_no_init`` can answer there.
         devices.sort(key=lambda d: d[0], reverse=True)
     return devices, pci_order
 
