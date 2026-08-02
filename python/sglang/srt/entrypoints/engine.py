@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
-from collections import Counter
 import logging
 import multiprocessing as mp
 import os
@@ -31,6 +30,7 @@ import signal
 import tempfile
 import threading
 import time
+from collections import Counter
 from typing import (
     Any,
     AsyncIterator,
@@ -102,7 +102,6 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda,
-    sgl_kernel_runnable,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -110,6 +109,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    sgl_kernel_runnable,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
@@ -663,6 +663,18 @@ class Engine(EngineScoreMixin, EngineBase):
             from sglang.srt.registry.rank_cards import publish_rank_card_uuids
 
             publish_rank_card_uuids(server_args)
+
+            # #394 slice 2: mint the shared cold tier's launch id in the SAME
+            # place and for the same reason. It has to be in the environment
+            # before the spawn loop, and it has to be one value for the whole
+            # group -- a worker that minted its own would name segments no peer
+            # can find, and the divergence would only surface at the first
+            # fetch, one process at a time.
+            from sglang.srt.layers.moe.cold_tier_fetch import (
+                publish_cold_tier_instance,
+            )
+
+            publish_cold_tier_instance()
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:

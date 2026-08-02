@@ -60,14 +60,26 @@ register of discarded approaches — check it before re-proposing anything.
   load-time-aware halves for fp8/GPTQ/AWQ (GGUF-MoE half missing — guarded);
   `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` = frozen-resident-set escape hatch (refusal
   until its byte gate is green).
-- **#394 cold-shard chain** (slice 1 merged): measured H2D provenance chain
+- **#394 cold-shard chain** (slices 1+2 merged): measured H2D provenance chain
   (env > card-probe > nvml-negotiated > refusal; `absent` unselectable),
   `cold_tier_shm.py` shared-DRAM segments (UUID/BDF identity, manifest read
   lazily after load, header sealed last, PROT_READ views with kernel-enforced
-  write protection), boot-time refusal for delegation on disjoint expert
-  shards. Fetch-path wiring (slice 2) open. Graphs incl. CPU-MoE are
-  IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host nodes,
-  CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
+  write protection). **Slice 2 wires the fetch path** (`cold_tier_fetch.py`):
+  a rank-uniform owner map derived from the same `partition_cold_experts` the
+  staging plan uses (plan `digest()` pins the uniformity), the cold pool
+  ALLOCATED IN the segment rather than copied into it, and
+  `MoEExpertOffloadCache._fetch` sourcing a delegated expert from the owner's
+  `PROT_READ` view over this rank's own link. Behind
+  `SGLANG_MOE_COLD_TIER_SHM=1`; with it off the slice-1 boot refusal for
+  delegation on disjoint expert shards is unchanged, field for field.
+  **Honest scope**: byte ownership moves, COMPUTE does not, so per-rank H2D is
+  predicted unchanged — ANALYSE_393's Path A′ (1.54x on the transfer term)
+  additionally needs the #82 expert RANGE to move and is a separate slice.
+  BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arm), and the graph seam,
+  which refuses by name until the UVA pointer for a `cudaHostRegister`'d peer
+  mapping is verified (`SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`). Graphs incl.
+  CPU-MoE remain IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host
+  nodes, CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
   (spill/restore under fixed buffers is legal).
 - **HiCache** L1-L3 prefix cache (validated with uneven DCP/TP; storage key
   includes kv-dtype; runtime attach/detach works on UnifiedRadixCache).

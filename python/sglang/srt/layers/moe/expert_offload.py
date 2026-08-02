@@ -205,6 +205,13 @@ class ResidencyStats:
     overflow_forwards: int = 0  # forwards that needed >n_slots unique experts
     waves: int = 0  # total waves run across all forwards
     h2d_bytes: int = 0  # bytes streamed host->device by _fetch()
+    # #394 slice 2: the subset of the above that came out of a PEER rank's
+    # shared cold-tier segment rather than this rank's own pinned pool. Kept
+    # separate because it is the direct measure of whether the shared tier is
+    # being used at all -- a proportional arm whose remote counters stay zero
+    # is an arm that silently ran the baseline.
+    remote_fetches: int = 0
+    remote_h2d_bytes: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -402,6 +409,14 @@ class ExpertResidencyPlanner:
     # away). None on every path without a host-shard ratio -> one `is not None`
     # per resolve on the default path.
     delegated_ids: Optional[frozenset] = None
+    # #394 slice 2: True once a shared cold tier makes those ids REACHABLE --
+    # the bytes live in a peer's segment and this rank can DMA the row. The
+    # planner then treats a delegated expert exactly like any other spill
+    # expert (scratch slot, fetch entry) and only the fetch SOURCE differs;
+    # ``MoEExpertOffloadCache._fetch`` is the one place that knows which. False
+    # keeps the slice-1 behaviour, which is a named refusal, because without a
+    # shared tier a delegated expert really is absent.
+    delegated_reachable: bool = False
 
     def __post_init__(self):
         if self.scratch < 1:
@@ -451,14 +466,22 @@ class ExpertResidencyPlanner:
             resident_slot_of = {e: self.resident_slot[e] for e in resident}
         if self.delegated_ids is not None:
             foreign = [e for e in spill if e in self.delegated_ids]
-            if foreign:
+            if foreign and not self.delegated_reachable:
                 raise RuntimeError(
                     f"experts {foreign} were delegated to a peer rank's host "
                     f"tier by the #394 link-proportional cold shard, but this "
-                    f"rank's router asked for them. The layer must remap a "
+                    f"rank's router asked for them and no shared cold tier is "
+                    f"attached, so they are absent rather than relocated. "
+                    f"Either enable the shared tier "
+                    f"(SGLANG_MOE_COLD_TIER_SHM=1, #394 slice 2) or remap the "
                     f"foreign expert id away (the #82 dim-0 shard's padding "
                     f"expert) before delegating any cold expert."
                 )
+            if foreign:
+                # Reachable: the row comes from a peer's segment instead of
+                # this rank's pool. Counted here rather than in _fetch so the
+                # tally survives the desk path, which has no CUDA stream.
+                self.stats.remote_fetches += len(foreign)
         if len(spill) > self.scratch:
             raise RuntimeError(
                 f"resolve() got {len(spill)} spill experts but only "
@@ -1291,7 +1314,39 @@ def plan_load_time_staging(
     )
 
 
-def stage_experts_into_tiers(plan: ExpertStagingPlan, source, out, release=None):
+def allocate_spill_pool(spill_ids, row_shape, dtype, cold_tier=None, param_attr=""):
+    """The pinned host cold pool for one expert-major tensor.
+
+    One function for the two #123-GGUF doors (the pull loop and the streaming
+    stager) so they cannot drift on WHERE the cold bytes live. The marlin
+    repack door keeps its own allocation because it refuses a cold shard
+    outright (:func:`refuse_cold_shard_at_repack_door`) and therefore never has
+    a tier to share. Without a ``cold_tier`` this is the allocation it was: a
+    private ``torch.empty(...).pin_memory()``, page-locked only when a CUDA
+    context exists (desk tests have none).
+
+    With one (#394 slice 2), the storage IS the shared segment -- not a copy
+    into it. That distinction is the difference between a feature that shares
+    the cold tier and one that doubles it, and the reference rig's host RAM was
+    already the binding constraint.
+    """
+    import torch
+
+    shape = tuple(int(d) for d in row_shape)
+    ids = tuple(int(e) for e in spill_ids)
+    if cold_tier is not None:
+        return cold_tier.allocate_spill_pool(param_attr, ids, shape, dtype)
+    if not ids:
+        return None
+    pool = torch.empty((len(ids),) + shape, dtype=dtype, device="cpu")
+    if torch.cuda.is_available():
+        pool = pool.pin_memory()
+    return pool
+
+
+def stage_experts_into_tiers(
+    plan: ExpertStagingPlan, source, out, release=None, cold_tier=None, param_attr=""
+):
     """Fill the two tiers from a per-expert ``source(expert_id) -> Tensor``.
 
     ``out`` is the caller-allocated ``[buffer_slots, ...]`` device buffer; rows
@@ -1327,13 +1382,13 @@ def stage_experts_into_tiers(plan: ExpertStagingPlan, source, out, release=None)
     for row, expert_id in enumerate(plan.spill_ids):
         src = source(expert_id)
         if spill is None:
-            spill = torch.empty(
-                (len(plan.spill_ids),) + tuple(src.shape),
-                dtype=src.dtype,
-                device="cpu",
+            spill = allocate_spill_pool(
+                plan.spill_ids,
+                tuple(src.shape),
+                src.dtype,
+                cold_tier=cold_tier,
+                param_attr=param_attr,
             )
-            if torch.cuda.is_available():
-                spill = spill.pin_memory()
         spill[row].copy_(src)
         if release is not None:
             release(expert_id)
@@ -1590,10 +1645,17 @@ class StreamingExpertStager:
         allocate,
         zero_experts: Sequence[int] = (),
         label: str = "",
+        cold_tier=None,
+        param_attr: str = "",
     ):
         self.plan = plan
         self.shard_keys = tuple(shard_keys)
         self.label = label
+        # #394 slice 2: when set, this stager's cold rows are written straight
+        # into the shared segment a peer will read them from. ``None`` is the
+        # default and the previous private pinned pool.
+        self._cold_tier = cold_tier
+        self._param_attr = param_attr
         self._allocate = allocate
         self._zero_experts = tuple(sorted({int(e) for e in zero_experts}))
         # expert id -> ("resident", slot) | ("spill", row) | None (delegated).
@@ -1756,18 +1818,17 @@ class StreamingExpertStager:
                         f"{tuple(buf.shape)}, expected "
                         f"{(self.plan.buffer_slots,) + row_shape}"
                     )
-                spill = None
-                if self.plan.spill_ids:
-                    spill = torch.empty(
-                        (len(self.plan.spill_ids),) + row_shape,
-                        dtype=row.dtype,
-                        device="cpu",
-                    )
-                    # Pinning is what makes the later H2D fetch async; skipped
-                    # when there is no CUDA context (desk tests), as in the
-                    # pull loop.
-                    if torch.cuda.is_available():
-                        spill = spill.pin_memory()
+                # Pinning is what makes the later H2D fetch async; skipped when
+                # there is no CUDA context (desk tests), as in the pull loop.
+                # With a #394 cold tier the pool IS the shared segment and the
+                # page-locking is a cudaHostRegister on the mapping instead.
+                spill = allocate_spill_pool(
+                    self.plan.spill_ids,
+                    row_shape,
+                    row.dtype,
+                    cold_tier=self._cold_tier,
+                    param_attr=self._param_attr,
+                )
                 # Publish only now: every reader of _row_shape takes it to mean
                 # that BOTH tiers below are already built.
                 self.resident_buf = buf
@@ -2055,6 +2116,54 @@ def build_capturable_luts(
     )
 
 
+def refuse_capturable_cold_tier(num_experts: int) -> None:
+    """#394 slice 2 graph seam: BOOT-PENDING, and say exactly what is missing.
+
+    Nothing here is blocked in principle, and the corrected canon says so: a
+    CUDA graph pins ADDRESSES, not CONTENTS, so a captured ``index_select``
+    over a stable device-addressable source replays correctly after the host
+    bytes change -- that is already how the local capturable path works
+    (:func:`device_view_of_pinned`, verified on this rig).
+
+    What is unverified is one link in the chain. The local pool is a torch
+    ``pin_memory()`` allocation, so its UVA device pointer equals its host
+    pointer and ``torch.as_tensor`` aliases it. A PEER's cold row lives in a
+    ``mmap`` that this process page-locked with ``cudaHostRegister`` instead;
+    the device address for such a range is obtained from
+    ``cudaHostGetDevicePointer``, and whether ``is_pinned()``/``as_tensor``
+    reproduce the aliasing for it has NOT been exercised on hardware. Capturing
+    a graph over an address that has not been verified to alias is precisely
+    the failure mode that cannot be detected after the fact: the graph replays
+    happily and reads whatever is at that address.
+
+    So the eager path is complete and the capturable installer refuses, until a
+    card window proves the pointer. ``SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`` is
+    that window's switch, not a performance option.
+    """
+    import logging
+
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE.get():
+        logging.getLogger(__name__).warning(
+            "MoE cold tier (#394): capturing a decode graph over PEER-owned "
+            "cold rows (%d experts). The UVA device pointer for a "
+            "cudaHostRegister'd mapping is BOOT-PENDING -- verify the gathered "
+            "rows against the eager path before trusting any output.",
+            num_experts,
+        )
+        return
+    raise RuntimeError(
+        "SGLANG_MOE_OFFLOAD_CUDA_GRAPH cannot yet be combined with the shared "
+        "cold tier (SGLANG_MOE_COLD_TIER_SHM, #394 slice 2): the capturable "
+        "scratch gather needs a UVA device pointer for the PEER segment's "
+        "cudaHostRegister'd mapping, and that pointer has not been verified on "
+        "hardware. This is an implementation gap, not a limit -- graphs pin "
+        "addresses, not contents. Run eager (--disable-cuda-graph), or set "
+        "SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1 in a card window to develop it."
+    )
+
+
 class _PinnedDeviceViewHolder:
     """Minimal ``__cuda_array_interface__`` producer used to alias PINNED host
     memory as a CUDA tensor (UVA zero-copy). Under CUDA UVA every page-locked
@@ -2269,11 +2378,37 @@ class MoEExpertOffloadCache:
             self._hot_frozen = True
 
         # #394: cold experts a peer's host tier owns. Adopted as a planner
-        # guard, not as state: this rank simply has no row for them, and the
-        # named error is worth far more than the KeyError it replaces.
+        # guard, not as state: without a shared tier this rank simply has no
+        # row for them, and the named error is worth far more than the KeyError
+        # it replaces.
         delegated = getattr(layer, "_moe_offload_delegated_experts", None)
         if delegated:
             self.planner.delegated_ids = frozenset(int(e) for e in delegated)
+
+        # #394 slice 2: turn that guard into a fetch route when the shared cold
+        # tier is on. ``resolver_for_layer`` returns None on every launch that
+        # did not ask for the tier, so the default path takes one attribute
+        # read and keeps the refusal above.
+        self._cold_tier = None
+        self._remote_ids: frozenset = frozenset()
+        if delegated:
+            from sglang.srt.layers.moe.cold_tier_fetch import resolver_for_layer
+
+            resolver = resolver_for_layer(layer)
+            if resolver is not None:
+                self._cold_tier = resolver
+                self._remote_ids = resolver.remote_ids
+                self.planner.delegated_reachable = True
+                missing = self.planner.delegated_ids - self._remote_ids
+                if missing:
+                    raise RuntimeError(
+                        f"the staging plan delegated experts {sorted(missing)} "
+                        f"but the cold-tier assignment gives them no remote "
+                        f"owner. The plan and the assignment were built from "
+                        f"different cold pools, and fetching under that "
+                        f"disagreement is how a rank reads a plausible wrong "
+                        f"row (#394)."
+                    )
 
         # --- #254 prefill wave order ---------------------------------------
         # "token" (default) = disjoint token subsets, every wave re-fetches its
@@ -2318,10 +2453,20 @@ class MoEExpertOffloadCache:
             # file instead of two places.
             self._router_stats.residency = self.planner.stats
             # #394: the placement policy this layer was staged under, so the
-            # dump names its own A/B arm (see publish_host_shard_on_layer).
-            self._router_stats.host_shard = getattr(
-                layer, "_moe_offload_host_shard", None
-            )
+            # dump names its own A/B arm (see publish_host_shard_on_layer),
+            # plus how a delegated expert is REACHED. Without the second field
+            # a proportional arm and a proportional arm whose shared tier never
+            # attached look identical in the dump, and only one of them is the
+            # thing being measured.
+            row = getattr(layer, "_moe_offload_host_shard", None)
+            if row is not None:
+                row = dict(row)
+                row["reachability"] = (
+                    "shared-cold-tier"
+                    if self._cold_tier is not None
+                    else ("refused" if delegated else "local-only")
+                )
+            self._router_stats.host_shard = row
             self._stats_collector = get_collector()
 
         self._capturable_ready = False
@@ -2442,14 +2587,22 @@ class MoEExpertOffloadCache:
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
-        (expert_id - resident_count)."""
+        (expert_id - resident_count).
+
+        #394 slice 2: an expert in ``self._remote_ids`` is not in this rank's
+        pool at all -- its row is a zero-copy view of a PEER's shared segment,
+        resolved through ``self._cold_tier``. The copy itself is the same
+        ``copy_`` over the same link; only the source address differs, which is
+        the whole design (the storage moved, the transport did not)."""
         import torch
 
         if not fetch_plan:
             return
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
+        remote = self._cold_tier
         moved = 0
+        remote_moved = 0
 
         # Write-after-read: the scratch slots this fetch overwrites are still
         # being READ by the previous wave's grouped-GEMM, which was enqueued on
@@ -2460,11 +2613,22 @@ class MoEExpertOffloadCache:
         # short token-major waves happened not to). The join below covers the
         # other direction (compute must not read before the copy lands).
         def _copies():
-            nonlocal moved
-            for attr, spill in self._pinned.items():
+            nonlocal moved, remote_moved
+            # With no shared tier the iteration set is exactly what it always
+            # was. With one, a rank can own ZERO local cold rows for a tensor
+            # (a lopsided ratio is legal), so the attr set has to come from the
+            # resident buffers -- the pinned pool may not be there at all.
+            attrs = self._pinned if remote is None else self._resident
+            for attr in attrs:
+                spill = self._pinned.get(attr)
                 dst = self._resident[attr]
                 per_expert = dst[0].numel() * dst.element_size()
                 for expert_id, slot in fetch_plan:
+                    if remote is not None and expert_id in self._remote_ids:
+                        dst[slot].copy_(remote.row(attr, expert_id), non_blocking=True)
+                        moved += per_expert
+                        remote_moved += per_expert
+                        continue
                     row = (
                         pool_index[expert_id]
                         if pool_index is not None
@@ -2482,6 +2646,7 @@ class MoEExpertOffloadCache:
                 _copies()
             torch.cuda.current_stream().wait_stream(self._stream)
         self.planner.stats.h2d_bytes += moved
+        self.planner.stats.remote_h2d_bytes += remote_moved
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave
@@ -2575,6 +2740,8 @@ class MoEExpertOffloadCache:
                 "inconsistent frozen residency maps (resident_slot vs "
                 "spill_pool_index); freeze must install both or neither"
             )
+        if self._cold_tier is not None:
+            refuse_capturable_cold_tier(self.num_local_experts)
         device = torch.device("cuda", torch.cuda.current_device())
         (
             self._cap_resident_slot_lut,
@@ -3151,9 +3318,13 @@ def refuse_cold_shard_at_repack_door(layer) -> None:
             "this layer shards experts disjointly, which is exactly when a "
             "delegated expert becomes UNREACHABLE rather than relocated -- "
             "measured on the reference rig 2026-08-02, the router asks for "
-            "experts no rank holds and the first forward dies. Set "
-            "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE=1 only to develop the "
-            "missing reachability mechanism against a real boot"
+            "experts no rank holds and the first forward dies. The #394 slice-2 "
+            "shared cold tier (SGLANG_MOE_COLD_TIER_SHM=1) is that missing "
+            "reachability mechanism, and it is wired at the GGUF streaming "
+            "door -- not here, because this door's own callers are "
+            "intermediate-dim TP MoEs. Set "
+            "SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE=1 only to develop it "
+            "against a real boot"
         )
     raise ValueError(
         "presplit_expert_offload_after_repack(cold_shard=...) is refused "

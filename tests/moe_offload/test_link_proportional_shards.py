@@ -54,10 +54,10 @@ from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     plan_load_time_staging,
     plan_proportional_shares,
     presplit_expert_offload_after_repack,
-    resolve_host_shard_ratio,
     reset_expert_offload_release,
     reset_host_shard_log_latch,
     resident_slot_count,
+    resolve_host_shard_ratio,
     scratch_slot_count,
     stage_experts_into_tiers,
 )
@@ -449,11 +449,21 @@ def test_gguf_staging_half_stages_exactly_the_owned_cold_experts():
         assert torch.equal(out[slot], experts[e])
 
 
-def test_presplit_half_produces_the_same_split_from_the_same_plan(desk_pinning):
-    """The fp8 / GPTQ / AWQ door and the GGUF door must not drift apart: both
-    take their layout from ``plan_load_time_staging``."""
+def test_presplit_half_refuses_a_cold_shard_by_name(desk_pinning):
+    """The marlin-repack door does not take a cold shard, and says why.
+
+    This test used to assert that the two load-time doors produce the SAME
+    split from the same plan. ``8dd2ad1a38`` (#421 F8) shut this door instead,
+    and did not update the test -- it has been red at the integration tip since
+    then. The property that survives is the one the refusal encodes: an
+    intermediate-dim TP MoE holds an essential slice of EVERY expert, so there
+    is no whole expert it could delegate, and a caller that passes a cold shard
+    anyway gets a named error rather than a load that dies on the first token.
+
+    The GGUF door is where the policy is live (see the staging tests above),
+    and #394 slice 2 gives it the reachability mechanism the message names.
+    """
     ctx = ColdShardContext(0, 3, HostShardRatio(_norm(MEASURED), "test", "measured"))
-    plan = plan_load_time_staging(E, fraction=0.25, cold_shard=ctx)
 
     layer = torch.nn.Module()
     layer.num_local_experts = E
@@ -463,21 +473,13 @@ def test_presplit_half_produces_the_same_split_from_the_same_plan(desk_pinning):
     )
     reference = layer.w13_weight.data.clone()
 
-    presplit_expert_offload_after_repack(layer, cold_shard=ctx)
+    with pytest.raises(ValueError, match="intermediate-dim TP MoE"):
+        presplit_expert_offload_after_repack(layer, cold_shard=ctx)
 
-    buf, spill = layer._moe_offload_presplit["w13_weight"]
-    assert buf.shape[0] == plan.buffer_slots
-    assert spill.shape[0] == len(plan.spill_ids)
-    for slot, e in enumerate(plan.resident_ids):
-        assert torch.equal(buf[slot], reference[e])
-    for row, e in enumerate(plan.spill_ids):
-        assert torch.equal(spill[row], reference[e])
-    # Non-static layout is published, so the cache adopts it verbatim.
-    assert layer._moe_offload_frozen_layout == (
-        list(plan.resident_ids),
-        list(plan.spill_ids),
-    )
-    assert layer._moe_offload_delegated_experts == list(plan.delegated_ids)
+    # Refused BEFORE anything was staged: the layer is untouched, so a caller
+    # that catches the error is not left with a half-split parameter.
+    assert not hasattr(layer, "_moe_offload_presplit")
+    assert torch.equal(layer.w13_weight.data, reference)
 
 
 def test_presplit_half_is_byte_identical_without_a_ratio(desk_pinning):
