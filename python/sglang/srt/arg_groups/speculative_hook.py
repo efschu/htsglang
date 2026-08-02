@@ -5,10 +5,37 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.default_precedence import set_feature_default
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+#: Speculative decoding runs a draft plus a verify pass per step, so the
+#: running-request ceiling that fits the KV pool is much lower than the
+#: autoregressive one. Five algorithm handlers below fill the same value.
+SPECULATIVE_MAX_RUNNING_REQUESTS = 48
+
+
+def _set_speculative_max_running_requests(server_args: ServerArgs) -> None:
+    """Apply the speculative-decoding default for ``--max-running-requests``.
+
+    FEATURE default: it overrides a model hook's fill (the DeepSeek-V4 hook
+    runs earlier and writes 256) but never an explicit ``--max-running-requests``.
+    Before #426 the guard here was ``is None``, so on DeepSeek-V4 the model's
+    256 stood and the documented MTP default of 48 never applied -- upstream
+    sgl-project/sglang#33199.
+    """
+    set_feature_default(
+        server_args,
+        "max_running_requests",
+        SPECULATIVE_MAX_RUNNING_REQUESTS,
+        reason=(
+            "for speculative decoding. You can override this by explicitly "
+            "setting --max-running-requests"
+        ),
+    )
 
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
@@ -269,11 +296,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     _resolve_dflash_draft_attention_backend(server_args)
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _set_speculative_max_running_requests(server_args)
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -408,11 +431,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             f"got {server_args.speculative_num_draft_tokens}."
         )
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _set_speculative_max_running_requests(server_args)
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -492,11 +511,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _set_speculative_max_running_requests(server_args)
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -521,11 +536,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Currently standalone speculative decoding does not support dp attention."
         )
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _set_speculative_max_running_requests(server_args)
 
     _disable_overlap_schedule_for_cpu(server_args)
 
@@ -673,11 +684,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
 
     _disable_overlap_schedule_for_cpu(server_args)
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _set_speculative_max_running_requests(server_args)
 
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth

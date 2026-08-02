@@ -168,6 +168,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    LSE_BASE_E: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -183,6 +184,11 @@ def _correct_attn_cp_out_kernel(
             Pointer to output tensor of shape [ H, B, D ]
         vlse_ptr (triton.PointerType):
             Pointer to output tensor of shape [ B, H ]
+        LSE_BASE_E (bool):
+            Log base the incoming ``lses`` are expressed in. False (default)
+            = base 2, which is what FlashInfer MLA emits. True = natural log,
+            which is what FlashMLA emits. The base must match the attention
+            backend that produced the LSE; see :func:`correct_attn_out`.
     """
     batch_idx = tl.program_id(axis=0).to(tl.int64)
     head_idx = tl.program_id(axis=1).to(tl.int64)
@@ -208,9 +214,15 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
     lse = lse - lse_max
-    lse_exp = tl.exp2(lse)
+    if LSE_BASE_E:
+        lse_exp = tl.exp(lse)
+    else:
+        lse_exp = tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    if LSE_BASE_E:
+        final_lse = tl.log(lse_acc) + lse_max
+    else:
+        final_lse = tl.log2(lse_acc) + lse_max
 
     # Compute correction factor
     lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
@@ -221,7 +233,10 @@ def _correct_attn_cp_out_kernel(
         neg_inf,
         lse_diff,
     )
-    factor = tl.exp2(lse_diff)
+    if LSE_BASE_E:
+        factor = tl.exp(lse_diff)
+    else:
+        factor = tl.exp2(lse_diff)
 
     # Store final LSE
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
@@ -246,16 +261,27 @@ def _correct_attn_cp_out_kernel(
 
 
 class CPTritonContext:
-    """The CPTritonContext is used to avoid recompilation of the Triton JIT."""
+    """The CPTritonContext is used to avoid recompilation of the Triton JIT.
+
+    The cache is keyed by the constexpr arguments. It used to be a single
+    slot, which is only safe while every launch through one context shares one
+    specialization -- the replay path passes ``regular_args`` alone, so a
+    second launch with different constexprs would silently re-run the FIRST
+    kernel. That became reachable when ``LSE_BASE_E`` joined the constexprs
+    (#426), and it is the "shared buffer plus an ordering assumption written
+    only in a comment" shape, so the key is explicit rather than assumed.
+    """
 
     def __init__(self):
-        self.inner_kernel = None
+        self.inner_kernels = {}
 
     def call_kernel(self, kernel, grid, *regular_args, **const_args):
-        if self.inner_kernel is None:
-            self.inner_kernel = kernel[grid](*regular_args, **const_args)
+        key = tuple(sorted(const_args.items()))
+        inner_kernel = self.inner_kernels.get(key)
+        if inner_kernel is None:
+            self.inner_kernels[key] = kernel[grid](*regular_args, **const_args)
         else:
-            self.inner_kernel[grid](*regular_args)
+            inner_kernel[grid](*regular_args)
 
 
 def correct_attn_out(
@@ -264,6 +290,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
+    is_lse_base_on_e: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -272,9 +299,29 @@ def correct_attn_out(
         lses: Tensor of shape [ N, B, H ]
         cp_rank: Current rank in the context-parallel group
         ctx: Triton context to avoid recompilation
+        is_lse_base_on_e: True when ``lses`` are natural-log log-sum-exps
+            (FlashMLA), False when they are base-2 (FlashInfer MLA, the
+            default and the previous unconditional behavior).
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
+
+    LOG BASE (upstream sgl-project/sglang#33064): this reduction re-normalizes
+    each rank's partial attention output by ``exp(local_lse - global_lse)``,
+    and the kernel used ``exp2``/``log2`` unconditionally. That is correct for
+    FlashInfer MLA, which returns base-2 LSE, and wrong for FlashMLA, which
+    returns natural-log LSE (its AOT tests validate against
+    ``torch.logsumexp``). Feeding natural-log values through the base-2 form
+    does not merely lose precision, it computes different softmax weights:
+    with partition functions ``Z = [2, 8]`` and a local output of 10 on the
+    second shard the corrected contribution is 8.0, while the base-2 reading
+    of ``[ln 2, ln 8]`` yields 7.2330317.
+
+    Latent for this fork rather than academic: the rig has no FlashMLA-capable
+    card (sm86/sm120 route through FlashInfer MLA), so uneven DCP is not hit
+    today -- but ``correct_attn_out`` is load-bearing for that feature (#345,
+    #346, #297) and the divergence would appear as silently wrong attention
+    the day a Hopper-class card joins the group, not as an error.
     """
     if ctx is None:
         ctx = CPTritonContext()
@@ -327,7 +374,11 @@ def correct_attn_out(
         no_sD,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+    const_args = {
+        "HEAD_DIM": D,
+        "N_ROUNDED": N,
+        "LSE_BASE_E": bool(is_lse_base_on_e),
+    }
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse

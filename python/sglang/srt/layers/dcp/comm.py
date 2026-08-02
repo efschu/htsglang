@@ -17,7 +17,10 @@
 The two LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
-  - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
+  - cp_lse_ag_out_rs_mla: Triton correction / reduce-scatter. The correction
+    kernel's log base follows the attention backend that produced the LSE
+    (base-2 for FlashInfer MLA, natural log for FlashMLA -- upstream #33064);
+    it is not a property of this collective.
 """
 
 import warnings
@@ -33,6 +36,22 @@ from sglang.srt.distributed.utils import get_tp_partition_ratios, weightless_kv_
 from sglang.srt.layers.dcp.collective_guard import guard_dcp_step
 from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
+
+#: Attention backends whose softmax LSE is a NATURAL log. Everything else in
+#: this tree emits base-2 (FlashInfer MLA and the Triton/aiter MLA paths), so
+#: the set is small and stated positively -- a backend that is not named here
+#: keeps the pre-#426 base-2 correction. Upstream #33064.
+NATURAL_LOG_LSE_ATTENTION_BACKENDS = frozenset({"flashmla"})
+
+
+def lse_is_base_e(attention_backend: Optional[str]) -> bool:
+    """True when ``attention_backend`` emits natural-log LSE.
+
+    One named predicate instead of a string comparison at the call site: the
+    log base is a property of the producing backend, and the DCP reduction is
+    only one of its consumers.
+    """
+    return attention_backend in NATURAL_LOG_LSE_ATTENTION_BACKENDS
 
 
 def _reject_uneven_tp_mla(fn: str, detail: str) -> None:
@@ -248,11 +267,16 @@ def cp_lse_ag_out_rs_mla(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     ctx: Optional[CPTritonContext] = None,
+    is_lse_base_on_e: bool = False,
 ):
     """Merge DCP partial attention outputs via Triton correction (PR #14194).
 
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
+    is_lse_base_on_e: True when the attention backend emits natural-log LSE
+        (FlashMLA), False for base-2 LSE (FlashInfer MLA). The caller decides,
+        because only it knows which backend produced ``cp_attn_lse``; see the
+        LOG BASE note on ``correct_attn_out`` (upstream #33064).
     """
     if cp_group.world_size == 1:
         return cp_attn_out
@@ -276,7 +300,12 @@ def cp_lse_ag_out_rs_mla(
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx,
+        new_output,
+        is_lse_base_on_e=is_lse_base_on_e,
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)

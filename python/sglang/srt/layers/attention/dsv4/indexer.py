@@ -243,6 +243,23 @@ def _aiter_fp8_paged_mqa_logits(
     return logits
 
 
+def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
+    """Sequence-axis chunk width, in pages, for the torch paged-MQA logits.
+
+    Reads ``SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK`` (KV positions) and rounds it
+    down to whole pages, because the page is the unit the gather indexes in.
+    Returns ``max_pages`` when chunking is disabled or the whole sequence
+    already fits in one chunk -- in that case the caller runs exactly the
+    single-pass expression it ran before #426, which is what keeps the small
+    shapes the golden pins use bit-for-bit unchanged.
+    """
+    chunk_positions = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.get()
+    if not chunk_positions or chunk_positions <= 0:
+        return max_pages
+    chunk_pages = max(1, int(chunk_positions) // block_size)
+    return min(chunk_pages, max_pages)
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -266,6 +283,19 @@ def fp8_paged_mqa_logits_torch_sm120(
     ``seq_lens``, which arrives 2-D from the paged indexer, and it walks
     ``ceil(max_seq_len / 64)`` pages instead of the full capture-time
     page-table width.
+
+    MEMORY (#426, upstream sgl-project/sglang#33246): the head axis of the
+    ``bmm`` result is summed away on the very next line, so materializing the
+    whole ``[B, S, H]`` product costs ``num_heads`` times what the function
+    returns -- ~15 GiB per rank for one allocation at a 1M context, and since
+    #417 Cut 3 this is the PRODUCTION path on every non-Hopper card, not a
+    fallback. The sequence axis is fully independent (relu is elementwise, the
+    reduction runs over ``head_dim`` inside the ``bmm`` and over heads inside
+    one row), so the loop below walks it in page-aligned chunks and writes each
+    chunk's ``[B, chunk]`` result straight into the output. Peak becomes
+    ``O(B x chunk x H)``. It is exact, not an approximation: no reduction
+    crosses a chunk boundary, and a single chunk reproduces the previous
+    expression op for op.
     """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
@@ -286,36 +316,46 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert clean_logits == False
 
     max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
-
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
     page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
-
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
-
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
-
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
     q = q_fp8[:, 0].to(torch.float32)
+    q_t = q.transpose(1, 2)
+    weight_row = weight.unsqueeze(1)
 
-    score = torch.bmm(kv_value, q.transpose(1, 2))
+    logits = q.new_full((batch_size, max_seq_len), float("-inf"))
+    chunk_pages = _indexer_logits_chunk_pages(block_size, max_pages)
 
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
+    for page_start in range(0, max_pages, chunk_pages):
+        page_stop = min(max_pages, page_start + chunk_pages)
+        seq_start = page_start * block_size
+        chunk_seq = (page_stop - page_start) * block_size
 
-    score = score * kv_scale
+        kvcache_gathered = kvcache_flat[page_ids[:, page_start:page_stop]]
 
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
+        kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
+        kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+
+        kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+        kv_value = kv_value.view(batch_size, chunk_seq, head_dim)
+
+        kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
+        kv_scale = kv_scale.view(batch_size, chunk_seq)
+
+        score = torch.bmm(kv_value, q_t)
+
+        score = F.relu(score)
+        score = score * weight_row
+        score = score.sum(dim=2)
+
+        score = score * kv_scale
+
+        # Only the LAST chunk can run past max_seq_len (the padded span is a
+        # whole number of pages); everything before it copies in full.
+        out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
+        logits[:, seq_start : seq_start + out_width] = score[:, :out_width]
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
