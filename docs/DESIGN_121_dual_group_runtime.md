@@ -2738,3 +2738,123 @@ Boot 3 (beide Fixe): Policy greift (10 Picks, 4 satpicks, 3 Umordnungen,
 1 Starvation-Override, occ_r 0,761 -> 0,864). E-Wirkung mit n=1 Fenster
 nicht von der Fenstervarianz trennbar — offener Posten. Voller Bericht in
 INTEGRATION_R3_VALIDATION (Kartenfenster 08:46-09:18 UTC).
+
+## 15. Lane-Prefill-Chunking gebaut (feat/dual-group-lane-chunking-274, Basis a56f33aafd)
+
+### 15.1 Der Bau, entlang der vier Punkte von §13.10
+
+Schreibtischrunde, kein Boot. Der Entwurf aus §13.10 ist jetzt Code; die
+Messpflicht (Punkt 4) hat ihr Fenster noch vor sich (§15.4).
+
+1. **Die Schleife.** `_prefill` verzweigt auf `_prefill_chunked`, sobald ein
+   Chunk benannt ist (`--dual-group-lane-prefill-chunk` oder per-Job
+   `prefill_chunk`; Job schlaegt Flag, explizite 0 schaltet aus). Default
+   unveraendert: ohne Chunk laeuft wortgleich der bisherige
+   Ein-Forward-Zweig. Die Schleife faehrt Extend-Forwards ueber DENSELBEN
+   Req — `ReqToTokenPool.alloc` nutzt den Slot eines Requests mit
+   committetem KV weiter, und genau dieser Slot traegt den GDN-/Mamba-
+   Zustand ueber die Chunk-Grenze — und waechst `prefix_indices` je Chunk um
+   dessen `out_cache_loc`. Nur der letzte Chunk emittiert; ein Plan, der
+   `[0, n)` nicht exakt kachelt, wird VOR dem ersten Forward abgewiesen.
+   `work_total["prefill_tokens"]` rueckt an der CHUNK-Grenze vor — die
+   erklaerte Ausbeute des Postens: feinere Koerner fuer den
+   Paarungs-Entscheider, und `prefill_chunk_ms` steht als Liste am Job und
+   an der Result-Zeile.
+2. **Die Sprossenleiter.** Chunk-Groessen ausserhalb der Prefill-Tier-Liste
+   der Lane bekommen genau eine laute Warnung (padden auf die naechste Tier
+   oder eager oberhalb der obersten) — benannt, nicht verboten.
+3. **Der spekulative Zweig.** Der Kopf wird chunkweise mitgezogen, Eingang
+   um eins verschoben. Der Randtoken eines MITTLEREN Chunks ist der NAECHSTE
+   PROMPT-Token, nie der Target-Argmax (der wuerde die Accept-Laenge
+   druecken — dieselbe Begruendung wie beim unverschobenen Feed im
+   Ein-Forward-Pfad); nur der LETZTE Chunk nimmt die Target-Vorhersage.
+   Hidden-Zeilen und Token-Zeilen sind innerhalb des Chunks ausgerichtet,
+   eine Hidden-Uebergabe ueber die Grenze braucht es nicht.
+
+### 15.2 Falsifikatoren zuerst, mit Kann-failen-Beweis
+
+15 hermetische Tests (CPU, Muster test_lane_hidden_view_399): Randtoken
+gegen ein prompt-disjunktes Argmax-Alphabet gepinnt; Zaehlerstand IN den
+gemockten Forwards gelesen (Job-Grenzen-Zaehler liest 0,0,0 und faellt trotz
+korrekter Summe); prefix==start als eingebauter Falsifikator in
+prepare_for_extend; Kachel-Wache feuert auf Ueberlappung/Luecke/Kurz-Plan.
+Beide Defekte wurden GEPFLANZT (Argmax am mittleren Rand, Zaehler nicht
+vorgerueckt): jeder faellt exakt seinen Test, restauriert 15/15 gruen.
+Verteilte Suite: Failure-Set eine TEILMENGE der Basis (keine neuen roten).
+
+### 15.3 §13.11-3 nebenbei geschlossen
+
+Der Marlin-LoRA-Workspace laeuft jetzt durch den (lane,name)-Akzessor
+(Device im Namen ersetzt das Re-Create-on-Device-Change); der Akzessor-
+Docstring nennt keine Ausnahme mehr, weil keine uebrig ist. Kann-failen:
+das woertliche Vor-Fix-Muster reicht unter denselben Lane-Scopes allen
+Lanes denselben Tensor.
+
+### 15.4 Das Fenster, das der Posten noch schuldet
+
+`scripts/dual_group/chunking/`: window.sh (EIN Boot, C3-Arbeitspunkt, Arme
+nur ueber per-Job-Overrides — gechunkt und ungechunkt teilen Boot, Captures
+und Pools), probe_arms.py mit drei getrennten Urteilen: STRUKTUR (hart,
+ganzzahlig — rot = kaputtes Vehikel), KOHAERENZ (graduiert, DREI Zustaende:
+Referenz-SET aus --ref-draws Ein-Forward-Laeufen, dessen eigene Spreizung
+ist die Bande; VOID wenn die Referenz ab Position 0 uneins ist — #328/#363-
+Disziplin, nie Text-Identitaet allein), PREIS (berichtet, nie geurteilt:
+ms/Chunk je Groesse, Prefill-Rate, Solo-Boeden NEU erhoben, weil die
+Koernung des Instruments sich aendert). Desk-Smoke am Fake-Server: sauber
+gruen, vier dirty-Arme feuern jeder sein eigenes Rot bzw. VOID (der
+degenerierte Ein-Chunk-Arm bleibt beim chunks-Plant absichtlich gruen und
+ist genau so gepinnt). Offen bleiben die Karten-Posten: ms/Chunk-Kurve,
+Kohaerenz auf der Karte (spec an ist der Arm, der scheitern kann),
+E-Wirkung der feineren Koerner auf die Paarung (§14.7-Posten, mehr Fenster
+je Arm).
+
+### 15.5 Kartenfenster 2026-08-01 23:29-23:47 UTC: alle drei Urteile geliefert
+
+**Chunking-Fenster (EIN Boot, C3-Punkt, rc=0, Rohdaten
+/spinning/gpu-battery-results/2026-08-01_274_chunking/).** Referenzboeden
+exakt: je 3 Draws byte-identisch (nospec 578,38-578,59 ms; spec
+461,3-465,25 ms — A-vs-A-Spreizung 0,2 bzw. 4 ms). STRUKTUR 12/12 gruen,
+KOHAERENZ 6/6 gruen IN der Referenzmenge (byte), beide Spec-Arme
+eingeschlossen — der §13.10-Punkt-3-Arm hat also auf der Karte NICHT
+verloren. Preis (1600-Token-Prompt):
+
+    nospec  512: 722,8 ms (+144,3, +24,9 %)   ms/Chunk 182,8/193,4/189,3/157,3
+    nospec 1024: 638,8 ms (+60,3, +10,4 %)    317,1/321,7
+    nospec 2048: 581,1 ms (+2,6 — degenerierter Ein-Chunk-Arm = Ref)
+    spec    512: 1330,0 ms (+867,1, +187 %)   184,8/372,1/376,5/396,6
+    spec   1024: 736,2 ms (+273,4, +59 %)     315,9/420,4
+    spec   2048: 463,3 ms (+0,4)
+
+  Lesart: ab Chunk 2 traegt jeder Spec-Chunk den Kopf-Primer (~2x nospec-
+  Chunkkosten). Accept-PARITAET gechunkt==ungechunkt (1,0 == 1,0, 63 Runden
+  beidseits, Kopf-Graph-Replay 189/189) — der Accept-Boden 1,0 ist der der
+  Lane an diesem Arbeitspunkt (auch die UNGECHUNKTEN Referenzen liegen dort),
+  kein Chunking-Schaden. VRAM-Peak 5090 29913/32607 (min frei 2694, Korridor
+  gehalten). Instrumenten-Notiz: prefill_wall_ms spiegelt auf gechunkten
+  Spec-Zeilen den stalen _last_wall_ms des Ein-Forward-Pfads — Desk-Posten:
+  Wall je Chunk summieren statt spiegeln.
+
+**dense2 (Radix-Verdacht aus §11.21): BESTAETIGT.** Erstboot des Fensters
+lief versehentlich aus dem VERALTETEN wt-lane-fam2-Checkout (df08e51baa,
+vor aeaa7fe06d): das EXTRA_ARGS-Geschirr fehlte dort, die Flagge landete
+nicht (disable_radix_cache=False), Serving-Boeden 0/3 reproduzierbar,
+Lane-Boeden 3/3 gruen -> VOID wie in §11.21. Re-Boot vom Tip-Checkout mit
+gelandeter Flagge (disable_radix_cache=True): GATE GRUEN, byte-identisch
+3/3 (alphabet/squares/code), rc=0 in 76 s. Der Traeger der Serving-
+Irreproduzibilitaet ist der Radix-Cache-Pfad (zweite identische Anfrage
+nimmt eine andere Kernelbahn), nicht die Lane.
+
+**fp82 (#340-Kartenbeweis): GELIEFERT.** Der Stale-Checkout-Boot
+reproduzierte ungewollt den Vor-Fix-Stand als Kontrolle: erste Lane-Forward
+-> "ValueError: Pointer argument (at 0) cannot be accessed from Triton" in
+w8a8_block_fp8_matmul_triton, dann asynchrone IMA — exakt die Signatur, die
+#340 am Schreibtisch benannt hat; die Serving-Forwards desselben Boots
+liefen sauber (Budget-Hypothese aus §11.21 damit endgueltig raus). Post-Fix-
+Boot (Tip + _active_device): GATE GRUEN, byte-identisch 3/3, rc=0 in 77 s —
+die 27B-FP8-Lane ueber zwei Karten (Teil 7036 MiB auf der Fremdkarte,
+erzwungen EAGER) rechnet dasselbe Modell wie der Verband.
+
+**Fahrzeug-Lehre, festgehalten:** ein veralteter Worktree ist eine
+unbeabsichtigte Vor-Fix-Kontrolle. Fenster-Skripte muessen den WT-Stand
+gegen den Tip pruefen (git merge-base --is-ancestor des Fix-Commits), bevor
+eine Karte angefasst wird — die #404-Schlussrunde hat genau das vorgemacht.

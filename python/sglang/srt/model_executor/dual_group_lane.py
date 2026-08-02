@@ -1674,6 +1674,31 @@ def _lane_server_args_view(server_args):
     return view
 
 
+def plan_prefill_chunks(prefix_len: int, total_len: int, chunk: int):
+    """The chunk spans of a chunked lane prefill: ``[(start, end), ...]``
+    tiling ``[prefix_len, total_len)`` exactly once, in order, each span at
+    most ``chunk`` tokens (§13.10 point 1).
+
+    Pure and total: every valid input yields a plan whose spans are
+    contiguous and whose last end is ``total_len``; invalid inputs raise
+    instead of degrading to an empty plan (an empty plan would skip the
+    prefill silently and surface as a KV-less decode much later).
+    """
+    if chunk <= 0:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+    if not 0 <= prefix_len < total_len:
+        raise ValueError(
+            f"prefix_len {prefix_len} outside [0, {total_len}) -- nothing to " "prefill"
+        )
+    spans = []
+    start = prefix_len
+    while start < total_len:
+        end = min(start + chunk, total_len)
+        spans.append((start, end))
+        start = end
+    return spans
+
+
 class DualGroupLane:
     """One lane of the multi-group runtime: its plan, its runner, and a
     serial job driver (a lane TICK runs instead of a serving-group iteration,
@@ -1740,6 +1765,9 @@ class DualGroupLane:
         self._stop = threading.Event()
         self._idle_since: Optional[float] = time.monotonic()
         self._last_wall_ms: Optional[float] = None
+        # Off-ladder chunk sizes already warned about (once per size per
+        # lane; the warning names a capture-economics fact, not an error).
+        self._chunk_ladder_warned: set = set()
         #: Top-2 logit margin of the last committed plain-decode token, or
         #: None. Only written under SGLANG_LANE_MARGIN_PROBE (see
         #: _margin_probe_on); the commit sites read it right after the
@@ -1993,6 +2021,13 @@ class DualGroupLane:
                     # so "re-seeded against the target" and "not re-seeded" are
                     # two arms of ONE boot on the same token ids.
                     "draft_reseed": job.get("draft_reseed"),
+                    # §13.10, and the same reasoning once more: a per-job
+                    # chunk size (0 forces the single forward under a set
+                    # server flag) lets the chunked and the unchunked prefill
+                    # run as two arms of ONE boot -- the coherence gate the
+                    # chunking posten owes is a same-boot byte comparison,
+                    # not an argument.
+                    "prefill_chunk": job.get("prefill_chunk"),
                     # #404: a label the caller puts on the job so the pool
                     # checksum records say WHICH arm produced them. The lane
                     # never reads it; it only travels, which is the point -- a
@@ -2517,7 +2552,7 @@ class DualGroupLane:
         finally:
             runner._lane_draft_captured = saved
 
-    def _make_batch(self, job, runner=None):
+    def _make_batch(self, job, runner=None, req=None):
         from array import array
 
         from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -2525,19 +2560,25 @@ class DualGroupLane:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         runner = runner or self.runner
-        sampling_params = SamplingParams(
-            temperature=0, max_new_tokens=job["max_new_tokens"]
-        )
-        sampling_params.normalize(None)
-        req = Req(
-            rid=f"dual-group-lane-{self.lane_id}",
-            origin_input_text="",
-            origin_input_ids=array("q", job["input_ids"]),
-            sampling_params=sampling_params,
-        )
-        req.full_untruncated_fill_ids = req.origin_input_ids
-        req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        if req is None:
+            sampling_params = SamplingParams(
+                temperature=0, max_new_tokens=job["max_new_tokens"]
+            )
+            sampling_params.normalize(None)
+            req = Req(
+                rid=f"dual-group-lane-{self.lane_id}",
+                origin_input_text="",
+                origin_input_ids=array("q", job["input_ids"]),
+                sampling_params=sampling_params,
+            )
+            req.full_untruncated_fill_ids = req.origin_input_ids
+            req.logprob_start_len = -1
+            req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        # else: a CONTINUING chunked-prefill request (#274 §13.10). The req
+        # keeps its req_pool_idx and mamba slot -- ReqToTokenPool.alloc
+        # reuses the slot of a request with committed KV, which is what
+        # carries the GDN/mamba recurrent state across chunk forwards -- and
+        # the caller has already advanced prefix_indices and extend_range.
 
         tree_cache = _LaneTreeCacheStub(
             page_size=runner.server_args.page_size,
@@ -4426,7 +4467,207 @@ class DualGroupLane:
         job["_next"] = preds[n_accept : n_accept + 1]
         return emitted, n_accept, ms
 
+    def _prefill_chunk_size(self, job) -> int:
+        """Chunk size (tokens) for THIS job's prefill; 0 means the single
+        whole-prompt forward of slices A-D.
+
+        The job's ``prefill_chunk`` wins over the lane flag
+        (``--dual-group-lane-prefill-chunk``), including an explicit job 0
+        that switches chunking OFF under a set flag. The DEFAULT is 0 on
+        both: nothing about the existing path depends on this method.
+        """
+        explicit = job.get("prefill_chunk")
+        if explicit is None:
+            explicit = getattr(
+                self.runner.server_args, "dual_group_lane_prefill_chunk", None
+            )
+        chunk = int(explicit or 0)
+        return chunk if chunk > 0 else 0
+
+    def _warn_off_ladder_chunk(self, chunk: int) -> None:
+        """§13.10 point 2: the chunk size is not a free parameter.
+
+        The lane's prefill forwards run against its captured prefill tier
+        ladder; a chunk on a rung replays that rung's graph exactly, a chunk
+        between rungs pads up to the next tier, and a chunk above the top
+        tier falls back to eager. None of these are errors -- but the second
+        and third quietly change what a "chunk" costs, so choosing an
+        off-ladder size is worth one loud line, once per size.
+        """
+        if chunk in self._chunk_ladder_warned:
+            return
+        cfg = getattr(self.runner.server_args, "cuda_graph_config", None)
+        tiers = getattr(getattr(cfg, "prefill", None), "bs", None)
+        if not tiers:
+            return
+        self._chunk_ladder_warned.add(chunk)
+        if chunk not in tiers:
+            logger.warning(
+                "dual-group lane %d: prefill chunk %d is not on the lane's "
+                "prefill tier ladder %s -- chunks pad up to the next tier "
+                "or run eager above the top one, so the measured ms/chunk "
+                "will not be the rung's",
+                self.lane_id,
+                chunk,
+                sorted(tiers),
+            )
+
+    def _prefill_chunked(self, job, chunk: int):
+        """Chunked lane prefill (#274 D2-Posten 4, DESIGN_121 §13.10).
+
+        The single whole-prompt forward becomes a loop of extend forwards
+        over the SAME request: each chunk writes its KV (and, under spec,
+        primes the NEXTN head over the same span), only the last chunk emits
+        a token. ``work_total["prefill_tokens"]`` advances at the CHUNK
+        boundary -- the finer grain is the declared yield of this posten
+        (the pairing decider's saturation signal ages per forward).
+
+        Reached only when a chunk size was configured by name; the default
+        path is the untouched single-forward branch of ``_prefill``.
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+        )
+
+        input_ids = job["input_ids"]
+        n = len(input_ids)
+        spans = plan_prefill_chunks(0, n, chunk)
+        # Tiling guard, before any forward: a plan that does not tile [0, n)
+        # exactly would write some KV position twice or never, and nothing
+        # downstream of here raises for that.
+        pos = 0
+        for start, end in spans:
+            if start != pos or end <= start:
+                raise RuntimeError(
+                    f"lane prefill chunk plan does not tile the prompt: span "
+                    f"({start}, {end}) at position {pos} of {n}"
+                )
+            pos = end
+        if pos != n:
+            raise RuntimeError(f"lane prefill chunk plan stops at {pos} of {n} tokens")
+
+        spec_on = self._job_spec_on(job)
+        # Loop-carried; the tiling guard above proves the loop runs at least
+        # once, so every one of these is set by the time the tail reads it.
+        req: Any = None
+        req_d: Any = None
+        batch: Any = None
+        batch_d: Any = None
+        prefix: Any = None
+        prefix_d: Any = None
+        out: Any = None
+        next_token_ids: Any = None
+        chunk_ms: List[float] = []
+        for start, end in spans:
+            last = end == n
+            # -- target chunk: prefix must hold exactly [0, start) ---------
+            if req is None:
+                batch = self._make_batch(job)
+            else:
+                req.prefix_indices = prefix
+                batch = self._make_batch(job, req=req)
+            req = batch.reqs[0]
+            req.set_extend_range(start, end)
+            batch.prepare_for_extend()
+            self._resolve_extend_input_ids(batch)
+            if spec_on:
+                out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+                if last:
+                    next_token_ids = out.next_token_logits.argmax(dim=-1)
+                if self._dbg_on():
+                    self._dbg_prefill_rows(out, list(input_ids[start:end]))
+            elif last:
+                next_token_ids, ms = self._timed_forward(batch)
+            else:
+                # Middle chunk: KV writes are the product; the last-row
+                # logits the runner computes anyway are discarded.
+                _, ms = self._timed_forward_raw(batch)
+            chunk_ms.append(ms)
+            prefix = (
+                batch.out_cache_loc
+                if prefix is None
+                else torch.cat((prefix, batch.out_cache_loc))
+            )
+            # -- head chunk (spec): same span, input shifted one left ------
+            if spec_on:
+                if req_d is None:
+                    batch_d = self._make_batch(job, runner=self.draft_runner)
+                else:
+                    req_d.prefix_indices = prefix_d
+                    batch_d = self._make_batch(job, runner=self.draft_runner, req=req_d)
+                req_d = batch_d.reqs[0]
+                req_d.set_extend_range(start, end)
+                batch_d.prepare_for_extend()
+                self._resolve_extend_input_ids(batch_d)
+                ids = batch_d.input_ids
+                # §13.10 point 3, the part with the real risk: the head's
+                # rows for [start, end) consume tokens [start+1, end+1).
+                # For a MIDDLE chunk the token at ``end`` is the PROMPT's
+                # own -- the target's argmax there is a prediction the
+                # prompt overrules, and priming with it would depress the
+                # accept length for the same reason the unshifted feed in
+                # the single-forward path would. Only the FINAL chunk has
+                # no prompt token at ``end`` and takes the target's.
+                if last:
+                    tail = next_token_ids.to(ids.dtype).reshape(1)
+                else:
+                    tail = torch.tensor(
+                        [int(input_ids[end])], dtype=ids.dtype, device=ids.device
+                    )
+                batch_d.input_ids = torch.cat((ids[1:], tail))
+                self._draft_forward(batch_d, out.hidden_states)
+                prefix_d = (
+                    batch_d.out_cache_loc
+                    if prefix_d is None
+                    else torch.cat((prefix_d, batch_d.out_cache_loc))
+                )
+            # The counter's chunk-boundary advance: after this line the
+            # tokens of THIS chunk are work done, visible to any reader
+            # between two chunk forwards.
+            self.work_total["prefill_tokens"] += end - start
+
+        if spec_on:
+            # Cloned for the reason spelled out in ``_verify_by_target_verify``
+            # (same as the single-forward path).
+            job["_hidden"] = out.hidden_states[-1:].clone()
+            job["_kv_len"] = n
+            job["_batch_d"] = batch_d
+            job["_kv_len_draft"] = n
+        # Sum of the chunk forwards' wall times -- the same quantity the
+        # single-forward path records, at the same instrument (the head
+        # primes are outside it there too). The per-chunk list is the
+        # posten's own product: ms/chunk against chunk size is measurement
+        # duty 4 of §13.10.
+        job["prefill_ms"] = sum(chunk_ms)
+        job["prefill_wall_ms"] = self._last_wall_ms
+        job["prefill_chunk_ms"] = chunk_ms
+        job["output_ids"].append(int(next_token_ids[0].item()))
+        self._record_margin(job, self._last_margin)
+        job["_batch"] = batch
+        job["_next"] = next_token_ids
+        job["_req"] = batch.reqs[0]
+        job["_req_pool_idx"] = int(batch.reqs[0].req_pool_idx)
+        # #404 anchor record, same position as the single-forward path.
+        self._record_pool_checksum(job, path="prefill")
+
+    @staticmethod
+    def _resolve_extend_input_ids(batch) -> None:
+        """H2D shim for deferred pinned input ids -- the chunked path's copy
+        of the inline block in the single-forward branch."""
+        if (
+            batch.input_ids is None
+            and getattr(batch, "prefill_input_ids_cpu", None) is not None
+        ):
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
     def _prefill(self, job):
+        chunk = self._prefill_chunk_size(job)
+        if chunk:
+            self._warn_off_ladder_chunk(chunk)
+            return self._prefill_chunked(job, chunk)
         batch = self._make_batch(job)
         batch.prepare_for_extend()
         if (
@@ -4989,6 +5230,12 @@ class DualGroupLane:
             result["prefill_wait_ms"] = round(
                 job["prefill_wall_ms"] - job["prefill_ms"], 2
             )
+        # §13.10: present only when the prefill ran chunked. ms/chunk against
+        # chunk size is measurement duty 4 of the chunking posten, and the
+        # harness reads it off the result row like everything else.
+        if job.get("prefill_chunk_ms") is not None:
+            result["prefill_chunks"] = len(job["prefill_chunk_ms"])
+            result["prefill_chunk_ms"] = [round(x, 3) for x in job["prefill_chunk_ms"]]
         with self._lock:
             self.results.append(result)
             self.results_total += 1
