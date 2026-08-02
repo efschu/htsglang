@@ -93,6 +93,7 @@ __all__ = [
     "attach_peer_segment",
     "detach_all",
     "shm_capacity_bytes",
+    "preflight",
 ]
 
 #: Bump when the HEADER or the manifest schema changes meaning. A segment
@@ -126,6 +127,26 @@ class ManifestUnavailable(ColdTierError):
 def shm_dir() -> str:
     """Where segments and manifests live. Overridable for tests."""
     return os.environ.get("SGLANG_MOE_COLD_TIER_SHM_DIR", "/dev/shm")
+
+
+def preflight(required_bytes: int, path: Optional[str] = None) -> str:
+    """One line for a window preflight: does the cold tier fit in tmpfs today?
+
+    MUST be run at the start of every card window rather than assumed. The
+    reference rig was remounted from 63 to 96 GiB on 2026-08-02 to fit an
+    ~88 GiB cold tier, and **that remount is not restart-persistent** -- a
+    container restart silently puts the cap back and the failure would land
+    mid-load. Cheap to check, expensive to discover.
+    """
+    cap = shm_capacity_bytes(path)
+    where = path or shm_dir()
+    if cap is None:
+        return f"{where}: capacity unknown (statvfs failed); cannot preflight"
+    verdict = "FITS" if cap >= required_bytes else "TOO SMALL -- remount with size="
+    return (
+        f"{where}: {cap / 2**30:.1f} GiB capacity vs "
+        f"{required_bytes / 2**30:.1f} GiB needed -> {verdict}"
+    )
 
 
 def shm_capacity_bytes(path: Optional[str] = None) -> Optional[int]:

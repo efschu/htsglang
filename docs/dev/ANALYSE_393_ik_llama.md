@@ -777,3 +777,21 @@ have been callable from this window even if the proportional arm had run.
 | vs WASTE's 0.14 | **5.9x** |
 | decode, equal shards | 136.9 ms/token mean, floor ~5 % CV |
 | decode, proportional shards | **not measurable — arm does not serve** |
+
+### 11.6 Preflight for the proof window (not optional)
+
+`/dev/shm` was remounted 63 -> 96 GiB on 2026-08-02 so the ~88 GiB cold tier
+fits (verified: 96 G total, 93 G free, running segments untouched). **The
+remount is not restart-persistent.** A container restart puts the 63 GiB cap
+back, and the failure would land mid-load rather than at launch. So the window
+preflight runs, and reports rather than assumes:
+
+```
+df -h /dev/shm
+python -c "from sglang.srt.layers.moe.cold_tier_shm import preflight; \
+           print(preflight(88 * 2**30))"
+```
+
+The pages are RAM either way; this is the tmpfs accounting cap, not a memory
+shortage. `create_owned_segment` refuses early and names the remount when it
+does not fit.
