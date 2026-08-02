@@ -492,3 +492,62 @@ Stated so the gaps read as decisions.
    the registry can price a move but not predict how often one happens.
 5. **The 3.43 GB/s / 1.47 µs pairing in `destinations_error`** still mixes the
    100G and 40G lines. Cosmetic, user-facing; fix when cut 3 touches it.
+
+---
+
+## 8. Global eviction doctrine (user directive 2026-08-03)
+
+Scope note: this is a doctrine for what the registry decides once cut 4/7
+land (§5), not new code in slice 1. It is recorded here, ahead of the
+consumers that will implement it, because a feature should register against
+this policy rather than invent its own — the same "one registry, no private
+lists" charter this document opens with, applied to eviction specifically
+rather than to tier discovery.
+
+**All targets are considered for spill, including local tiers.** There is no
+tier a spill decision is barred from looking at, own-VRAM included. If an
+asset does not fit fully at its current tier, only the **overflowing part**
+spills — partial spill is the norm, not an all-or-nothing move. An asset that
+is 90 % coverable locally and 10 % not stays 90 % local; the registry does not
+round that down to a single destination for the whole asset.
+
+**Victim selection is one global importance ladder, maintained by the
+registry, not a per-feature victim list.** Every eviction — regardless of
+which feature triggered the pressure that required it — walks the same
+least-important-first order:
+
+1. A cold-provisioned second model migrates first. The #305 COLD/WARM rungs
+   (`DESIGN_305_multi_model_serving.md` §"the residency ladder") are the
+   first candidates: nothing actively decoding is more disposable than a
+   model nobody is currently serving.
+2. Inactive layout/graph families — `DESIGN_363_regime_controller.md` §20.3's
+   RUNG 1 eviction is a **named instance** of this doctrine, not a parallel
+   mechanism: when the residency ladder there evicts a layout's non-shared
+   slabs, it is asking this ladder who goes first, not deciding on its own.
+3. Cold experts, quantised per #126's spill-quant tier
+   (`ANALYSE_363_dynamic_regime_controller.md`'s "harder-quant tier #126" and
+   `ANALYSE_389_nvme_expert_tier.md`).
+4. Idle sessions, per #242's idle-first policy and latency class
+   (`DESIGN_305_multi_model_serving.md`: "sessions beyond the reduced pool
+   spill to host through kv-session-offload (FCFS victim order, #236/#242)").
+5. Active work, last — and never out of FCFS order. The #273 fairness
+   guarantee (`DESIGN_305_multi_model_serving.md` §"Fairness during
+   demotion is #273's rule, unchanged") is never violated by an eviction: the
+   oldest running session of a demoted asset is not the one made to pay for
+   space it did not ask to give up.
+
+**Importance is a registry attribute per asset, not a policy a feature
+implements for itself.** Each asset registers with a class, a heat value and
+a user-visible latency class; every spill decision consumes that attribute
+rather than re-deriving disposability from feature-local knowledge. A feature
+that wants its assets to survive contention longer raises their registered
+importance — it does not write a second eviction policy that competes with
+this one, which is exactly the "private victim list" failure mode the #286
+park-target ladder is cut 4's donor for (§5, cut 4) and the failure mode
+generalising it to `TierId` (rather than each consumer inventing its own
+ranking) exists to close for good.
+
+Cross-reference: `DESIGN_363_regime_controller.md` §20.3's residency ladder
+is the first named instance of this doctrine outside the registry itself; a
+future consumer describing its own eviction order should point here rather
+than restate the ladder above.

@@ -1068,3 +1068,73 @@ there.
 *   **The watermark is not adaptive.** It is declared and bounded; nothing
     widens it when the measured in/out rates say the chain is falling behind,
     although `RateWindow` is the instrument that would drive it.
+
+---
+
+## 16. Target scenario and admission decisions (2026-08-02/03)
+
+### 16.1 The latency release
+
+The gate this module admits against is **aggregate output fps >= input fps,
+summed across cards** — not a per-frame `<= 40 ms` deadline. A few seconds of
+steady-state lag behind real-time is acceptable; what is not acceptable is
+falling permanently behind, which the aggregate-throughput gate already
+catches on its own (a chain that cannot sustain the input rate accumulates
+backlog without bound, and the back-pressure policy of §4/§8.4 is what a
+sustained-lag job actually hits). This is a release of the framing used
+through §14's tipping-point language ("does not reach `full`" reads there as
+a per-target-fps question); it is not a change to `chain_policy.py` itself,
+which already answers in aggregate fps.
+
+### 16.2 The chunk executor is the primary live design
+
+The full chain per chunk runs on-card: compressed source in, encoded segments
+out. This structurally satisfies the NVENC -> NVDEC transport idea from
+§10's prior-art comparison without building it as a separate mechanism — no
+raw frame ever crosses a card boundary, because a chunk's chain (decode
+through encode) stays on the one card it was scheduled to. barlink BAR1 and
+lossless-HEVC intermediates are the named escalation tools **if** a stage
+ever needs to split across cards (a chunk larger than one card's chain
+budget, or a future per-stage placement rather than per-chunk); neither is
+needed for the chunk-executor design as it stands, and neither is built for
+this scenario.
+
+### 16.3 Target: 1080p@25 -> 2160p@50, and the budget math
+
+Input 25 fps means a 40 ms budget per input frame at 1x. The rig's own
+measured aggregate ceiling against a single 5090 is **1.78x**
+(`TASK_333_M2_VIDEO_ENHANCE.md` §9.4 / `TASK_333_M2_MEASUREMENTS.md`
+§"three-card weighting": "Ceiling from the measured rates: 1.78x. A 3080 is
+0.39 of a 5090"), so the per-input-frame budget the rig's aggregate throughput
+actually buys is `40 ms x 1.78 ~= 71 ms`.
+
+Two of the three stages in the 2160p-target chain are measured
+(`TASK_333_M2_MEASUREMENTS.md` P1/P4, single-card fp32/fp16 figures, 2026-07-31
+window, 2.77 % A-vs-A floor):
+
+| stage | measured | source |
+|---|---:|---|
+| Lanczos-3 resize, 4320p -> 2160p | 24.4 ms/frame (24.37 ± 0.14) | P1 table |
+| RIFE pair @ 2160p, `scale=1.0` | 20.7 ms/pair (20.68 ± 0.12) | P1/P4 table |
+| RIFE pair @ 2160p, `scale=0.5` | 11.4 ms/pair (11.40 ± 0.10) | P1/P4 table |
+
+That leaves `71 - 24.4 - 20.7 ~= 25.9 ms` (~25 ms) at `scale=1.0`, or
+`71 - 24.4 - 11.4 ~= 35.2 ms` (~35 ms) at `scale=0.5`, for the fp16/bf16-TRT
+SR step — **the one unmeasured number** in this chain. §14.5 already recorded
+that the fp32 ONNX Runtime SR figures (35-146 ms/frame at 960x540-1920x1080,
+P1 table) are the wrong operating point for this budget; the TensorRT engine
+built under #337 is the number this budget needs, and it has not been probed
+against this specific chain yet.
+
+### 16.4 RIFE `scale=0.5` as the 4K-point default candidate
+
+The capability frontier (`TASK_333_M2_MEASUREMENTS.md` §"Capability frontier",
+RIFE-only, 5090 alone) is the frontier this default is read off:
+**48.4 fps at `scale=1.0` against 87.8 fps at `scale=0.5`** for a 3840x2160
+input. §16.3's SR headroom follows directly — 25 ms vs 35 ms — from the same
+two rows. `scale=1.0` at 4K/48 sits within 0.8 % of its own measured ceiling
+(§"Capability frontier": "well inside the noise floor ... at the limit, not
+above it"), so `scale=0.5` is the candidate that leaves the fp16/bf16-TRT SR
+step room to be measured at all, not only the candidate with a faster RIFE
+pair. Not yet a shipped default — it is a candidate pending the SR engine's
+own measured ms/frame at this chain's resolutions, per §16.3.

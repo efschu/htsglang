@@ -318,6 +318,17 @@ If a recipe below is ever found missing the flag, that is a bug in the
 recipe — fix it in the same commit you notice it, per "Keeping this file
 current" above.
 
+**Collective transport default (2026-08-03 user order):** barlink is the
+default transport wherever the combination in use supports it —
+`SGLANG_BARLINK=1` on every recipe below unless that recipe's own notes say
+otherwise. Stock NCCL is used only as an explicit control arm (an A-vs-A
+comparison that needs the baseline) or as a named fallback with the reason
+stated (e.g. an unresolved deadlock on a given format/transport pair); a
+published number leads with its barlink row. Current state: INT8xbar1xuneven-DCP
+is the standard operating point on this rig; FP8xbar1 has been unlocked since
+#431/#438 (§2, `SGLANG_BARLINK` entry, and the #431 scoped slow-boot warning)
+and a fresh speed run on it is pending.
+
 ## 4. Launch recipes
 
 Flag names and defaults below are verified against
