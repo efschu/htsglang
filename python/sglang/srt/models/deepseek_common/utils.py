@@ -108,6 +108,86 @@ def is_packed_layer(layer: torch.nn.Module) -> bool:
     return getattr(layer, "weight", None) is None
 
 
+class UnfusableAProjParameter(ValueError):
+    """Raised when ``q_a_proj`` and ``kv_a_proj_with_mqa`` cannot be fused.
+
+    The fused ``fused_qkv_a_proj_with_mqa`` layer holds exactly one copy of
+    every per-input-channel parameter, so the two source projections have to
+    agree on it. GPTQ with ``desc_act=True`` is the case that can disagree:
+    each projection is quantized independently, so each gets its own
+    activation-order permutation in ``g_idx``.
+    """
+
+
+def fuse_q_kv_a_proj(
+    param: torch.nn.Parameter,
+    param_name: str,
+    q_a_proj_weight: torch.Tensor,
+    kv_a_proj_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Build one ``fused_qkv_a_proj_with_mqa`` tensor from the two sources.
+
+    The two MLA down-projections read the same hidden state and are fused
+    along the OUTPUT axis. Which axis of the checkpoint tensor that is depends
+    on the quantization format, and the destination parameter already records
+    it: every ``create_weights`` sets ``output_dim`` on the parameters it
+    registers. Reading it there is exact for any format, present or future:
+
+    ==========================  ==========  ============================
+    format                      output_dim  registered parameters
+    ==========================  ==========  ============================
+    unquantized / fp8 / int8    0           ``weight``, scales
+    gguf                        0           ``qweight``
+    compressed-tensors wNa16    0           ``weight_packed``, scales
+    awq / awq_marlin            1           ``qweight``, ``qzeros``, scales
+    gptq / gptq_marlin          1           ``qweight``, ``qzeros``, scales
+    ==========================  ==========  ============================
+
+    The quantization-name list this replaces granted axis 1 to ``awq``,
+    ``awq_marlin`` and ``moe_wna16`` only, so the GPTQ family -- whose
+    ``qweight`` is ``[in // pack_factor, out]``, the same output-on-axis-1
+    layout as AWQ -- was concatenated along the input axis instead.
+
+    Two parameter kinds are not concatenations:
+
+    * A 0-d checkpoint tensor is a marker rather than a shard: the GGUF
+      ``qweight_type`` byte and the AutoFP8 per-tensor scale. The fused layer
+      takes one value, as it did before this helper existed.
+    * A parameter with an ``input_dim`` and no ``output_dim`` holds one entry
+      per INPUT channel: ``g_idx`` (GPTQ) and ``weight_g_idx``
+      (compressed-tensors wNa16). Both sources describe the same input
+      channels, so the fused layer needs one copy of the vector, not a
+      doubled one. When the two copies disagree the fusion has no answer at
+      all and is refused by name.
+    """
+    if q_a_proj_weight.shape == torch.Size([]) and kv_a_proj_weight.shape == torch.Size(
+        []
+    ):
+        return q_a_proj_weight
+
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim is None and getattr(param, "input_dim", None) is not None:
+        if q_a_proj_weight.shape != kv_a_proj_weight.shape or not torch.equal(
+            q_a_proj_weight, kv_a_proj_weight
+        ):
+            raise UnfusableAProjParameter(
+                f"Cannot fuse q_a_proj and kv_a_proj_with_mqa into {param_name}: "
+                f"the per-input-channel parameter differs between the two "
+                f"projections (shapes {tuple(q_a_proj_weight.shape)} and "
+                f"{tuple(kv_a_proj_weight.shape)}). The fused layer holds a "
+                f"single copy of it, so the two projections must agree. This is "
+                f"what a GPTQ checkpoint quantized with desc_act=True produces: "
+                f"each projection carries its own activation-order permutation "
+                f"in g_idx. Re-quantize with desc_act=False, or serve a format "
+                f"without a per-input-channel index."
+            )
+        return q_a_proj_weight
+
+    return torch.cat(
+        [q_a_proj_weight, kv_a_proj_weight], dim=0 if output_dim is None else output_dim
+    )
+
+
 def layer_quant_method_name(layer: torch.nn.Module) -> Optional[str]:
     """Quant method a layer was built with, or None when it is unquantized.
 
