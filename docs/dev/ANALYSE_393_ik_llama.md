@@ -596,3 +596,112 @@ Fetched 2026-08-01 unless noted.
   `docs/dev/ANALYSE_389_nvme_expert_tier.md`
 * Host facts read this session: `/proc/cpuinfo`, `lscpu`, `numactl -H`,
   `/proc/meminfo`, `nvidia-smi --query-gpu=pcie.link.*`
+
+---
+
+## 11. §7.8 item 1 as built (#394) — the policy is live, the number is not yet
+
+Recommendation 1 above asked for link-proportional cold-expert sharding. The
+apportionment itself landed earlier as an **inert** build: `HostShardRatio`,
+`plan_proportional_shares` (largest remainder, whole experts), and
+`partition_cold_experts` were written and tested, but nothing ever handed them
+a ratio. Two things were missing, and both are now built.
+
+### 11.1 The weights are MEASURED, and the label is load-bearing
+
+The inert build derived weights from NVML's *max PCIe link generation ×
+width* — a nameplate. §7.2's numbers are not: 6.4 / 13 / 13 GB/s came off a
+timed pinned transfer. The chain is now explicit and ordered by provenance, in
+the `planner.cost_model.Provenance` vocabulary the rest of the fork prices
+with:
+
+| Rank | Source | Provenance | What it is |
+|---|---|---|---|
+| 1 | `SGLANG_MOE_HOST_SHARD_RATIO` | MEASURED | the vector an operator typed, i.e. the measurement they took |
+| 2 | `card-probe-h2d` | MEASURED | `rigmon/card_probe.py`'s 64 MiB pinned H2D, best-of wall clock, per card by UUID |
+| 3 | `nvml-pcie` | ESTIMATE | width × generation. A formula over a measured width, not a transfer anybody timed |
+| 4 | `equal` | ABSENT | the shape a **refusal** takes |
+
+`SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE` sets the floor (`measured` or
+`estimate`); `absent` is not selectable in either setting, so a split is never
+weighted by a number nobody has. An absent link produces an equal ratio, and an
+equal ratio produces **no `ColdShardContext` at all** — "nothing is known" and
+"#394 is not in this build" are deliberately the same code path.
+
+The card probe is read through `load_card_probe()`, which never triggers a
+measurement, and memoized once per process: 40+ MoE layers must not each parse
+the same JSON, and a weight load must never turn into a multi-second GPU probe
+as a side effect. Reusing that artifact rather than timing a second H2D is the
+point — two opinions about the same link measured by two kernels are
+indistinguishable after the fact.
+
+Measured against nameplate on this rig: 6.4 : 13 : 13 normalizes to
+0.198 / 0.401 / 0.401, the nameplate x4 : x8 : x8 to 0.200 / 0.400 / 0.400. The
+difference is ~1 % — which is the honest finding, and the reason the nameplate
+stays admissible as a labelled ESTIMATE rather than being rejected.
+
+### 11.2 The rank → card vector, published without a collective (#407 cut 2)
+
+`_gguf_cold_shard_context` could not supply `card_uuids` because a rank knows
+only its own card: the launcher narrows `CUDA_VISIBLE_DEVICES` to one GPU per
+scheduler process. The obvious fix — `all_gather` the UUID — is refused here.
+That call would sit **inside the weight-load loop**, which is the
+rank-local-before-group hazard: a rank that reaches the load path on a
+different schedule hangs the group with no diagnosis.
+
+`python/sglang/srt/registry/rank_cards.py` inverts it. The datum is not a
+runtime measurement at all — it is a launch decision the parent already made
+when it computed `gpu_id_for_rank` for every scheduler it spawned. So the
+launcher enumerates that same formula, resolves each CUDA ordinal through the
+#331 IdentityMap, and writes the **UUID** vector into the environment before
+the spawn loop. Workers read it. No peer is contacted.
+
+Properties that are tested rather than assumed:
+
+* **UUIDs, not ordinals.** Each child's CUDA view is narrowed, so an ordinal
+  means something different in every process; a UUID does not (#392, #397).
+* **All-or-nothing.** One unresolvable ordinal publishes nothing. A partial
+  vector would be completed by the consumer with the index it already has,
+  which is exactly the substitution being removed.
+* **Length-checked by the consumer.** A vector whose length does not match the
+  asking group describes a *different* group (a MoE-TP subgroup, a pipeline
+  stage) and is refused, not truncated.
+* **The CUDA context is not paid silently.** Building the CUDA side of the
+  identity map costs a few hundred MiB on every visible card, in the process
+  about to spawn workers onto them. It is used only when already paid — with
+  `--rank-gpu-id` (whose validation resolves the cards anyway), when a context
+  exists for other reasons, or on explicit `SGLANG_RANK_CARD_PROBE_CUDA=1`.
+  Otherwise the vector is ABSENT with that reason attached.
+* **Multi-node is refused by name.** This launcher sees only its own cards; a
+  per-node prefix is not a world-length vector. #394 is single-node by
+  construction.
+* **A hand-set vector is never overwritten.** Same contract as
+  `SGLANG_MOE_HOST_SHARD_RATIO`.
+
+### 11.3 What did not move
+
+Residency is decided before the ratio is consulted, so `resident_ids`,
+`resident_count` and `buffer_slots` — the three numbers every VRAM figure and
+every #400 ledger entry derives from — are identical with and without a ratio.
+Only HOST-side ownership of the cold pool moves. The `StreamingStagingLedger`
+already separates `pinned_bytes` from `delegated_bytes`, so the changed shard
+sizes are accounted without a new post. The capturable decode path is
+untouched: this is a placement change, not a compute-lane change.
+
+### 11.4 The instrument names its own arm (#390)
+
+An A/B whose two dumps cannot be told apart a week later is not a measurement.
+Every staged layer now publishes a `host_shard` row — policy
+(`equal` / `link-proportional`), the ratio string including its provenance,
+cold-pool size, owned and delegated counts, and the realized `owned_share` so
+whole-expert rounding is visible rather than assumed away. It rides into the
+#390 JSON dump per layer and is lifted to `totals`, where disagreement between
+layers surfaces as `mixed` rather than being averaged away.
+
+The baseline arm emits a row too, saying `policy=equal`. A missing row and a
+baseline row are different findings and must not look alike.
+
+**Blind spot, unchanged and inherited:** captured decode under
+`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` takes the host-sync-free path and is not
+counted. The A/B is therefore run on the offload's default eager path, which is
+also where the merged baseline (146.3 ms/token) was taken.

@@ -139,10 +139,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
-        # bar1ep faellt hier unter is_deepep(): derselbe Vertrag, dieselben
-        # Argumente, dasselbe Ausgabeformat. Welche Klasse gebaut wird,
-        # entscheidet MaybeTboDeepEPDispatcher -- das ist die einzige Stelle,
-        # die ein Objekt baut.
+        # bar1ep falls under is_deepep() here: same contract, same arguments,
+        # same output format. Which class actually gets built is decided by
+        # MaybeTboDeepEPDispatcher -- the single place that constructs one.
         if a2a_backend.is_bar1ep():
             from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
                 bar1ep_available,
@@ -1299,12 +1298,19 @@ class FusedMoE(torch.nn.Module):
         TP MoE every rank holds a slice of every expert and nothing may be
         delegated.
 
-        No card UUIDs are passed: gathering the per-rank UUID vector needs a
-        collective, and adding one inside the weight-load loop is exactly the
-        "rank-local condition before a group collective" hazard. So the ratio
-        resolves from ``SGLANG_MOE_HOST_SHARD_RATIO`` or not at all, and without
-        that variable this returns ``None`` and the plan is the pre-#394 plan
-        field for field.
+        The per-rank card UUIDs come from the vector the LAUNCHER published
+        (:mod:`sglang.srt.registry.rank_cards`, #407 cut 2) -- an environment
+        read, not a collective. That distinction is the whole reason the vector
+        exists: this method runs inside the weight-load loop, and a group
+        collective there is the rank-local-before-group hazard (a rank that
+        reaches the load path on a different schedule hangs the group with no
+        diagnosis). An absent vector is not an error; the ratio then resolves
+        from ``SGLANG_MOE_HOST_SHARD_RATIO`` or not at all, and without either
+        this returns ``None`` and the plan is the pre-#394 plan field for field.
+
+        The vector is length-checked against THIS group's world size inside
+        ``rank_card_vector``: a MoE-TP subgroup narrower than the serving group
+        would otherwise read another rank's card as its own.
         """
         if not getattr(self, "_gguf_expert_shard", False):
             return None
@@ -1312,8 +1318,11 @@ class FusedMoE(torch.nn.Module):
         if world < 2:
             return None
         from sglang.srt.layers.moe.expert_offload import cold_shard_context
+        from sglang.srt.registry.rank_cards import rank_card_uuids
 
-        return cold_shard_context(int(self.moe_tp_rank), world)
+        return cold_shard_context(
+            int(self.moe_tp_rank), world, card_uuids=rank_card_uuids(world)
+        )
 
     def _gguf_stream_stage(self, param, loaded_weight, shard_id, expert_id) -> bool:
         """Route one arriving expert shard into its tier. True when consumed."""

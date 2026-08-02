@@ -1114,6 +1114,26 @@ class Envs:
     SGLANG_EXPERT_STATS_PATH = EnvStr("")
     # Additionally dump every N seconds (0 = only on exit / SIGUSR2).
     SGLANG_EXPERT_STATS_INTERVAL_SEC = EnvFloat(0.0)
+    # #407 cut 2: rank -> physical card UUID vector, one per WORLD rank in
+    # world_rank order, published by the launcher so no worker needs a
+    # collective to learn the group's placement (#394's link-proportional
+    # cold-expert shards are the first consumer). Normally written by
+    # _launch_subprocesses; set it by hand for a launch that does not go
+    # through it, and a hand-set value is never overwritten.
+    SGLANG_RANK_CARD_UUIDS = EnvStr("")
+    # Licence for the LAUNCHER to create a CUDA context purely to resolve that
+    # vector. Off by default: the context costs a few hundred MiB on every
+    # visible card, in the process that is about to spawn workers onto them.
+    # Unnecessary with --rank-gpu-id, whose validation resolves the cards
+    # already.
+    SGLANG_RANK_CARD_PROBE_CUDA = EnvBool(False)
+    # #394: weakest provenance the cold-expert host split may be weighted by --
+    # "measured" (the rigmon card probe's timed H2D, or an operator-supplied
+    # SGLANG_MOE_HOST_SHARD_RATIO vector) or "estimate" (the NVML PCIe
+    # width x generation nameplate derivation). "absent" is not selectable in
+    # either setting; an unknown link yields an equal split, which is exactly
+    # today's assignment.
+    SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE = EnvStr("estimate")
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;
