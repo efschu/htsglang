@@ -1466,3 +1466,179 @@ The two passing distributional verdicts are thin and are reported as such:
 A duty cycle estimated from 41 active windows has a standard error near 0.07,
 which is most of the disagreement that had to be cleared. The fix for that is
 a longer or busier workload, not a constant.
+
+---
+
+## 20. 2026-08-03 decisions
+
+Three operator decisions on the weight-mover half of the controller (§4.4,
+"weight cut: none — restart"), recorded per the fork's standing rule that a
+design decision lives in this file, not only in a chat transcript.
+
+### 20.1 WORTH-IT AUTOCHECK
+
+The controller is not authorized to attempt a layout switch by a flag; it is
+authorized by a computation. For every (checkpoint format) x (model) x (rig)
+point, the planner decides FROM THE MEASURED PHASE TABLE whether a stage flip
+beats its own switch cost at all — the same measured-gain-vs-band discipline
+§4.3 already applies to a single stage's admission, generalised to the pair.
+No manual flag is a precondition for either answer, and a no-op verdict is
+stated with its reason exactly as an acting one is: "one layout, checked, it
+does not pay" is the autocheck's output on that point, not silence.
+
+Canon examples, both read off the #424 phase-layout table (§4.1,
+`comparison_table.md` / `RESULTS.md` §2 of
+`/spinning/gpu-battery-results/2026-08-02_424_phase_record_bench/`):
+
+* **INT8-27B: one layout.** The decode layout beats the prefill layout even ON
+  PREFILL — 1890.6 vs 1847.2 tok/s at s=1, a -2.3 % cost to concentrate — so
+  every axis measured there says do-not-switch and the autocheck returns that
+  verdict with the comparison as its reason.
+* **FP8-27B: a real divergence.** +24.1 % prefill-layout gain (1231.7 ->
+  1528.9 tok/s s=1) against a -32.8 % decode-layout cost (125.1 -> 84.1 tok/s
+  bs=1) on the same #424 window — the autocheck returns "switch", carrying
+  both directions of the divergence in the reason.
+
+**Evidence tension, flagged rather than resolved here.** The INT8 "one
+layout" canon rests on #424's `10,1,1` prefill arm, and `NOTE_433_int8_prefill_vector.md`
+(§1, §5) documents that this vector was a *manually re-pinned* pair borrowed
+from a different task's corridor-safety decision — never re-solved by the
+phase-prefill optimiser at #424's own context length and reserve. NOTE_433's
+own desk re-solve found a real, if narrow, optimum at that point (`8,1,1`,
++8.5 % predicted) and its verdict is explicit: "the one-layout recommendation
+... is not confirmed." The GPU confirmation this note called for then ran
+(`/root/addendum_435.md`, `2026-08-02_435_coupling_fp8bar1`): the
+optimiser-matched vector plus `--rank-kv-ratio capacity` produced a technical
+flip on capacity (443 840 tokens, above the decode arm's 431 360) but an
+explicitly **weak** flip on throughput — both prefill probes moved the wrong
+way (-8.5 % / -4.3 %), the governing A-vs-A floor was that boot's own 13.0 %
+rather than #424's 3.0 %, and the tighter `bench.sh` instrument disagreed
+outright (-9.8 % to -11.5 % on decode). The addendum's own conclusion: "What
+it does not license: retiring the decode layout as the one-layout default."
+So the canon this section states (decode-only, do not switch) is the standing
+decision and is not contradicted by #435 — but it rests on a weaker
+foundation than "switching does not pay" alone suggests, and a reader
+re-deriving the INT8 autocheck output from first principles should read
+NOTE_433 and addendum_435 first rather than the #424 table alone.
+
+### 20.2 WEIGHT MOVER = diff spill within the same TP group (not a #329 re-form)
+
+A layout switch under a fixed rank set is **not** a #329 elastic-membership
+event. #329's 12-20 s silence budget (`DESIGN_329_elastic_world_membership.md`
+§1: "12-20 s of silence for a membership change") is scoped to membership
+*changes* — quiesce, snapshot, RE-FORM, restore, a different member set. A
+layout flip keeps the same ranks, the same process group, the same
+communicators: the collective geometry does not change, so there is no NCCL
+rebuild.
+
+What moves is a **diff**, not a re-form: only the slabs whose ownership
+changes between the two layouts move. For the 27B-INT8 class the estimate is
+~1-2 s via host staging, overlappable with the round(s) around the switch.
+Repack is charged only on the affected slabs and differs by format — INT8
+per-channel requant is cheap, a Marlin-packed layout costs more per moved
+slab. The KV vector moves through the existing #297 phase-boundary reshard
+actuator (§4.4 already lists it as the KV axis's mover), whose own measured
+target is < 1 s for the delta (`DESIGN_297_kv_resharding.md`: "move duration
+(measured, target < 1 s for the delta)"); #363 reuses that actuator as-is, no
+new KV mover is invented for the switch.
+
+The #329 budget is unchanged by this: it applies only when the rank set
+itself changes, never to a same-group layout flip.
+
+### 20.3 GRAPH PRE-CAPTURE (primary route; lazy recapture demoted to fallback)
+
+User directive, 2026-08-03: capture **all** layout families at program start
+rather than recapturing on the fly. Boot time is where the ANALYSE §Sequencing
+estimate of 3-6 s per flip (`ANALYSE_363_dynamic_regime_controller.md`:
+"moving the MLP delta ... order 3-6 s including quantized repack and
+re-capture from pre-staged pools (#102/#286)") was always going to be paid —
+this decision moves the re-capture component of it off the live switch path
+entirely, an option that document's own phrasing already named ("re-capture
+from pre-staged pools").
+
+The inactive family's graph-capture pools are offloaded as the #286
+"graph rungs" offload class (`ANALYSE_363_dynamic_regime_controller.md:121`:
+"#286: graph rungs, drafter, lane workspaces, cold lane") — VRAM -> host RAM
+or disk, the same short-term offload register the fork already routes
+graph-capture pools and IO buffers through. The VA reservation survives via
+the #93 VMM remap (the same physical-remap machinery §"Physics of a flip"
+already names as an existing piece: "VMM remap (#93)"), so a captured graph
+for the inactive family stays **valid without recapture** when its family
+reactivates — only its backing pages moved, not its addresses.
+
+At switch time the visible cost is: weight diff spill (§20.2, ~1-2 s) plus a
+graph-state reload. The per-state size comes from #102's own measured figure
+for a full independent capture state — "1,5 -> 0,3 GB je State"
+(`INTEGRATION_R3_VALIDATION.md:7601`) — carried over here by analogy from the
+spec-ladder rung case to the layout-family case; the ~25 ms host-link figure
+that follows from it is a **projection, not yet measured on this mechanism**,
+and is flagged as provisional the same way §3.4's constants are, pending a
+card window that actually times a reload. Visible switch time under this
+route is therefore seconds-class with no eager gap, not the 3-6 s of a cold
+recapture.
+
+**Named precondition.** Capturing family B requires family-B's weights mapped
+at their VAs at capture time — a VMM reservation plus a temporary mapping
+during boot, held only long enough for that family's graphs to record.
+
+**Residency ladder, coupled to the #287 pressure ladder.** Whether a family's
+graphs and weights stay resident, get partially evicted, or fall back to lazy
+recapture is not a fixed policy — it is driven by the same occupancy marks
+§3.2 already gives `KV_PRESSURE` priority over:
+
+* **RUNG 0 (KV pressure low, below the #287 descend mark).** Both weight
+  layouts and both graph families stay fully resident. A switch is a pointer
+  flip plus the §20.2 KV delta move (< 1 s via #297) — near-zero visible cost,
+  no copying, because each layout lives at its own addresses with graphs
+  already captured against them. This rung is cheaper than its own byte count
+  suggests because the two layouts' shards **overlap** when the unit ordering
+  is kept consistent: for the INT8-27B `10,1,1` <-> even-split pair, the big
+  card's decode shard is a *prefix* of its prefill shard, so the 5090 carries
+  zero extra bytes; only the two smaller cards hold disjoint ranges (union
+  ~5/12 against ~4/12 of the MLP each). Total dual-residency overhead for that
+  pair is ~3 GB, and it is paid only while the KV pool does not need the
+  space back.
+* **RUNG 1 (KV pressure rising).** The inactive layout's *non-shared* slabs —
+  the disjoint ranges above, not the shared prefix — are evicted through the
+  #286 graph-rungs/offload class **before** any KV admission is refused. A
+  switch under this rung is the diff reload (~1-2 s, §20.2) plus the
+  graph-state reload above (~25 ms, provisional).
+* **RUNG 2 (fallback).** A family that was never pre-captured — outside the
+  boot's declared set — falls back to lazy recapture, at the original 3-6 s
+  cost. This is the only rung where the ANALYSE §Sequencing estimate still
+  applies unamortised.
+
+Rung transitions are driven by the #287 pressure ladder's own marks, not by a
+second occupancy sensor, for the same reason §7.3 gives KV_PRESSURE joint
+ownership rather than a second controller: one arbiter on one axis. Victim
+selection *within* a rung — which slabs of the inactive family actually get
+evicted first when RUNG 1 fires — is not a rung-1-local policy either: it
+selects victims via the `DESIGN_407_memtier_registry.md` global importance
+ladder ("Global eviction doctrine"), of which this residency ladder is one
+named instance, not a parallel mechanism. And the §20.1 WORTH-IT AUTOCHECK
+still gates whether any of this — pre-capture, dual residency, rung eviction —
+is engaged for a given (format, model, rig) point at all; a point whose
+autocheck says "one layout" never allocates the second family's capture pool
+in the first place.
+
+**Planner consequence, named explicitly.** Because RUNG 0's cost is set by
+how much the layout pair's shards overlap, layout **pairs** should be solved
+with maximal shard overlap (the prefix/nested property above) as a secondary
+objective on top of each layout's own per-rank speed. This minimises the
+dual-residency bytes and the switch diff size at once — the same overlap that
+makes RUNG 0 cheap also makes a RUNG 1 diff smaller, because a diff is
+exactly the non-overlapping remainder.
+
+**Measurement duty when built.** Report the switch-time decomposition — diff
+move / repack / KV move / graph-state reload — separately, A-vs-A on the
+target layout, per the #360 standard already governing every other constant
+in this document (§8 F3-F4). None of the numbers in this section are card
+measurements; they are the physics estimate and the #102 analogy that the
+next card window is expected to replace with real per-component numbers.
+
+Cross-reference: `DESIGN_121_dual_group_runtime.md` §11.12 (the dual-group
+lane's family-neutral vs. family-specific building blocks) is the nearest
+existing account of what "the same mechanism across model families" already
+means in this fork's runtime, and the #286 register (§2.6 of
+`DESIGN_407_memtier_registry.md`) is the offload class this rung's eviction
+routes through.
