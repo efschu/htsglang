@@ -202,6 +202,36 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   the graph must move the worst case, the offload's whole economy is moving only
   the miss. Conditional nodes are the mechanism that would reconcile them, and
   torch exposes none.
+- **#302a dynamic expert heat migration** (`layers/moe/expert_heat_migration.py`,
+  `SGLANG_MOE_HEAT_MIGRATION=1`, OFF by default): keeps re-ranking the resident
+  expert set against a decayed window of live router traffic, instead of the
+  load-time one-shot choice (or Stage-1 `SGLANG_MOE_HOT_RESIDENCY`'s one-shot
+  freeze). Swaps are EQUAL-COUNT pairs — hot in, cold out — so residency size,
+  and every VRAM figure derived from it, is invariant by construction; victims
+  are coldest-first per `DESIGN_407` §8's ladder; the #82 pad expert is never
+  demoted and a #394-delegated expert is never promoted. Two-sided hysteresis
+  (relative margin plus an absolute `min_gain` floor, because a purely relative
+  margin churns on sampling noise in the tail of the routing distribution).
+  Eager path only: refused by name under `SGLANG_MOE_OFFLOAD_CUDA_GRAPH` and
+  after `install_capturable_buffers()`, since a captured gather's LUTs pin the
+  layout. Counters land in the #390 dump under `heat_migration` / `heat_*`
+  totals.
+  **DESK-PROVEN, BOOT-PENDING — it has never served a token.** The desk
+  falsifier (`scripts/dev/302a_heat_desk/`, run over four independent boots'
+  recorded `expert_stats_*.json`) reproduces the recorded static hit rates
+  0.7623 / 0.8427 / 0.8463 exactly (delta 0.0000), puts the ORACLE ceiling at
+  the same resident-set size at 0.9836 / 0.9844 / 0.9850, and shows a ranking
+  learned on a DIFFERENT boot on a different day still capturing 40-83 % of that
+  ceiling (+1.24 to +18.26 pp). Hit rate is a necessary condition for the H2D
+  reduction, not a decode measurement: no tok/s claim exists until the A/B in
+  `scripts/dev/302a_heat_desk/AB_SPEC.md` runs. Tests:
+  `tests/moe_offload/test_heat_migration_302a.py`, 33 hermetic, two executed
+  can-fail arms (policy neutered -> 12 fail; executor's D2H dropped -> 3 fail),
+  output bit-identity across a migration pinned end-to-end through `run_waves`.
+  Sub-cell **#302-lookahead is REFUTED at the aggregate grain**: adjacent-layer
+  heat correlation is indistinguishable from zero (|mean Spearman| <= 0.03,
+  top-R overlap on the chance line), which also settles that one shared ranking
+  cannot serve several layers.
 - **HiCache** L1-L3 prefix cache (validated with uneven DCP/TP; storage key
   includes kv-dtype; runtime attach/detach works on UnifiedRadixCache). The
   L2 host tier's `page_first_direct` transfer path was blocked on this rig by
@@ -452,3 +482,18 @@ gpu-arb (UUID-based holder + heartbeat — stop the heartbeat BEFORE releasing),
 forward_peak.py (VRAM corridor judged AT PEAK, not idle), cachetrim with
 --ready-url self-retirement, expert_stats (router distribution + hit rate),
 CollectiveClock (compute vs wait per rank), measured-KV-budget stale-boot trap.
+
+## 17. META: combination matrix + eviction doctrine
+Every "can asset X live at tier Y under primitive Z" question is a matrix-cell
+lookup before it is a design question, and the cells are already enumerated:
+`ANALYSE_456_dsv4f_matrix_sweep.md` is the asset x tier x primitive x control
+sweep (§2.1 lists the occupied cells with their evidence, §2.2 names the empty
+ones explicitly, so "nobody looked" and "somebody looked and rejected it" are
+distinguishable rather than both reading as silence); anything that EVICTS
+consumes `DESIGN_407_memtier_registry.md` §8's one global importance ladder
+(cold second model, inactive layout/graph families, cold experts, idle sessions,
+active work last and never out of FCFS order — coldest-first within a class)
+instead of writing a local victim policy; and anything that decides at runtime
+whether a path is worth its cost is an instance of `DESIGN_363_regime_controller.md`
+§20.1's worth-it autocheck rather than a new flag. Read those three before
+adding a cell, and register the answer back into them in the same merge.
