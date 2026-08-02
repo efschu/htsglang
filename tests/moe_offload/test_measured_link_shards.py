@@ -682,3 +682,49 @@ def test_generation_still_comes_from_the_maximum_not_the_idle_link_state(nvml_ri
     # gen 4 lane rate x the x4 slot: 1.969 * 4
     assert _pcie_link_gbps_by_uuid("GPU-3080-a") == pytest.approx(1.969 * 4)
     assert _pcie_link_gbps_by_uuid("GPU-5090") == pytest.approx(1.969 * 8)
+
+
+def test_the_probe_path_is_keyed_on_nvml_not_on_the_process_cuda_view(monkeypatch):
+    """Measured on the reference rig 2026-08-02, and it had silently downgraded
+    every worker to the nameplate.
+
+    The cache key is a digest over the SORTED UUIDs the caller can see. A
+    scheduler's CUDA_VISIBLE_DEVICES is narrowed to one GPU, so it computes a
+    one-card digest and misses the three-card profile the probe wrote. NVML is
+    not masked by that variable, so the full key is reconstructible -- this test
+    pins that the reconstruction is what gets tried FIRST.
+    """
+    from sglang.srt.registry import nvml as nvml_mod
+    from sglang.srt.rigmon import card_probe as probe_mod
+
+    class _Dev:
+        def __init__(self, uuid):
+            self.uuid = uuid
+
+    @contextlib.contextmanager
+    def _session():
+        class _P:
+            def nvmlSystemGetDriverVersion(self):  # noqa: N802 - NVML spelling
+                return "580.00"
+
+        yield _P()
+
+    monkeypatch.setattr(
+        nvml_mod, "list_devices", lambda: [_Dev(u) for u in MEASURED_H2D]
+    )
+    monkeypatch.setattr(nvml_mod, "nvml_session", _session)
+
+    full_key = probe_mod.card_probe_cache_path(list(MEASURED_H2D), "580.00")
+    asked = []
+
+    def _load(path=None):
+        asked.append(path)
+        return _probe_profile(MEASURED_H2D) if path == full_key else None
+
+    monkeypatch.setattr(probe_mod, "load_card_probe", _load)
+    reset_card_probe_memo()
+
+    table = eo._card_probe_h2d_table()
+
+    assert asked and asked[0] == full_key, "the NVML-keyed path was not tried first"
+    assert table == MEASURED_H2D

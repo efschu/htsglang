@@ -737,6 +737,18 @@ def _card_probe_h2d_table():
     lookup: ``load_card_probe`` never triggers a measurement, so a weight load
     can never turn into a multi-second GPU probe as a side effect.
 
+    THE PATH IS BUILT FROM NVML'S CARD SET, NOT THE PROCESS'S CUDA VIEW, and
+    that is the whole reason this helper exists instead of a bare
+    ``load_card_probe()``. The cache key is a digest over the SORTED UUIDS of
+    the cards the caller can see, and a worker's ``CUDA_VISIBLE_DEVICES`` is
+    narrowed to one GPU (``SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS``, forced by
+    ``--rank-gpu-id``). A worker therefore computes a one-card digest, misses
+    the three-card profile the probe actually wrote, and silently falls through
+    to the nameplate ESTIMATE. Measured on the reference rig 2026-08-02: the
+    same call returns the profile with all cards visible and ``None`` under
+    ``CUDA_VISIBLE_DEVICES=1``. NVML is not masked by that variable, so the full
+    card set is still available here and the digest can be reconstructed.
+
     This is the SAME artifact the planner and the dashboard price cards from
     (``planner.cost_model.memory_rates_from_entries``, kind ``h2d``), which is
     the point -- a second H2D opinion measured by a second kernel would be
@@ -751,7 +763,12 @@ def _card_probe_h2d_table():
         try:
             from sglang.srt.rigmon.card_probe import load_card_probe
 
-            profile = load_card_probe()
+            profile = load_card_probe(_nvml_card_probe_path())
+            if profile is None:
+                # Last resort: the process's own view. Correct whenever the
+                # caller can see every card (the launcher, the dashboard, a
+                # desk test), and no worse than nothing when it cannot.
+                profile = load_card_probe()
             if profile is not None:
                 for card in profile.cards:
                     if card.h2d_gbs and float(card.h2d_gbs) > 0.0:
@@ -760,6 +777,30 @@ def _card_probe_h2d_table():
             table = {}
         _CARD_PROBE_MEMO = table or False
         return table
+
+
+def _nvml_card_probe_path():
+    """The probe cache path keyed on EVERY physical card, or ``None``.
+
+    NVML enumerates the whole rig regardless of ``CUDA_VISIBLE_DEVICES``, so
+    this reconstructs the key the probe was written under even inside a worker
+    that can only see its own GPU. The driver version must come from the same
+    place the probe took it, or the digest differs for that reason instead.
+    """
+    try:
+        from sglang.srt.registry.nvml import list_devices, nvml_session
+        from sglang.srt.rigmon.card_probe import card_probe_cache_path
+
+        uuids = [d.uuid for d in list_devices()]
+        if not uuids:
+            return None
+        with nvml_session() as pynvml:
+            driver = pynvml.nvmlSystemGetDriverVersion()
+        if isinstance(driver, bytes):
+            driver = driver.decode()
+        return card_probe_cache_path(uuids, driver)
+    except Exception:  # noqa: BLE001 - no NVML here is simply no reconstruction
+        return None
 
 
 def reset_card_probe_memo() -> None:
