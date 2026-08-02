@@ -26,10 +26,13 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   attention backend (FlashMLA = natural log).
 - **TPxPPxTP**: pipeline across rigs with per-stage TP groups. Slices 1+2
   merged (cross-rig PP=2 over 40G, full decode graphs on both stages incl.
-  sm75). Slice 3 built (branch `feat/tpxppxtp-slice3-201`): world-MIN
+  sm75). Slice 3 merged and cross-rig pp=2 validated: world-MIN
   `max_total_num_tokens` before the reduce, `--pp-stage-ratio`
   (score-proportional, snaps to full-attention boundaries), stage-local mamba
-  slots, `auto` under PP with an agreement gate, `SGLANG_PP_SHAPE_CACHE`.
+  slots, `auto` under PP with an agreement gate, `SGLANG_PP_SHAPE_CACHE` cuts
+  boundary-send by −9.8/−9.2 % at bs=1 (0-1 % floor otherwise) — note the
+  in-server counter reads 249 µs, which is not the standalone wire-transfer
+  figure.
 - **TP5+ emulation** via NCCL multi-rank co-location (several ranks per card).
 
 ## 2. Planner / solver
