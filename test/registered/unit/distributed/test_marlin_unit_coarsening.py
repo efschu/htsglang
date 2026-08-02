@@ -302,10 +302,6 @@ class TestEvenSplitUntouched(_Base):
             self.assertEqual(tp_partition_sizes(total, TP, units=u), even)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCoupledDimensionConsistency(_Base):
     """THE INVARIANT #383 BROKE, and the test that would have caught it.
 
@@ -393,3 +389,141 @@ class TestCoupledDimensionConsistency(_Base):
             with self.subTest(model=label):
                 implied, expected = self._pair(inter, False)
                 self.assertEqual(implied, expected, label)
+
+
+class TestEighthSiblingMxfp8(_Base):
+    """#444b: MXFP8's ``[1, 32]`` is a QUANTIZATION fact, not an alignment one.
+
+    Every sibling before this one either exposed no block (marlin, #383) or
+    exposed a symmetric block it had registered on purpose. ``Fp8Config``
+    pins ``weight_block_size = [1, 32]`` for ``use_mxfp8`` because the OCP
+    spec fixes the scale layout to one row by 32 columns -- a statement about
+    the checkpoint, not about how a shard may be cut. Read per-axis by
+    ``_quant_block_aligned_units`` it said "output: element granularity,
+    input: 32", which is the coupled-dimension disagreement #385 exists to
+    prevent: gate_up's OUTPUT and down_proj's INPUT are the same intermediate
+    and were coarsened by 1 and by 32.
+
+    NOT REACHABLE ON THIS RIG TODAY. ``Fp8Config.get_min_capability`` returns
+    100 for mxfp8, so no card here resolves the config at all; this is a
+    latent registration gap, closed on the same terms as its seven siblings.
+    """
+
+    #: What ``Fp8Config.from_config`` pins for ``use_mxfp8``.
+    MXFP8_BLOCK = [1, 32]
+
+    def _cfg(self):
+        # Fp8Config by CLASS NAME -- that is what _marlin_packable_family reads.
+        return Fp8Config(list(self.MXFP8_BLOCK))
+
+    def test_the_block_this_corpus_models_is_the_one_fp8_py_pins(self):
+        """The corpus must not drift from the config it claims to model."""
+        import inspect
+
+        from sglang.srt.layers.quantization.fp8 import Fp8Config as RealFp8
+
+        src = inspect.getsource(RealFp8.from_config)
+        self.assertIn("weight_block_size = [1, 32]", src)
+
+    def test_the_exposed_block_is_asymmetric(self):
+        """The premise. If MXFP8 ever exposes a symmetric block upstream this
+        sibling is obsolete and should be retired rather than kept green."""
+        self.assertNotEqual(self.MXFP8_BLOCK[0], self.MXFP8_BLOCK[1])
+
+    def test_both_axes_coarsen_by_the_same_block(self):
+        for total in (34816, 32768, 17408, 65536):
+            with self.subTest(total=total):
+                u = total // 16
+                out = _quant_block_aligned_units(total, u, self._cfg(), 0)
+                inp = _quant_block_aligned_units(total, u, self._cfg(), 1)
+                self.assertEqual(out, inp, f"{total}: {out} vs {inp}")
+
+    def test_the_coupled_dimension_partitions_identically(self):
+        """The invariant that matters: gate_up's OUTPUT split of the
+        intermediate equals down_proj's INPUT split of the same number."""
+        for label, inter in (("Mistral-Small-24B", 32768), ("Qwen3.6-27B", 17408)):
+            with self.subTest(model=label):
+                u = inter // 16
+                implied = self.partition(
+                    inter, _quant_block_aligned_units(inter, u, self._cfg(), 0)
+                )
+                expected = self.partition(
+                    inter, _quant_block_aligned_units(inter, u, self._cfg(), 1)
+                )
+                self.assertEqual(
+                    implied,
+                    expected,
+                    f"{label}: gate_up implies {implied}, down_proj expects {expected}",
+                )
+
+    def test_the_resulting_block_is_marlin_valid(self):
+        """``Fp8Config`` is in ``_MARLIN_PACKABLE_CONFIGS``, so the shard must
+        also satisfy marlin's minimum thread shape on both axes."""
+        inter = 32768
+        u = _quant_block_aligned_units(inter, inter // 16, self._cfg(), 0)
+        sizes = self.partition(inter, u)
+        self.assertEqual([x % _marlin_uneven_tp_block() for x in sizes], [0] * TP)
+        self.assertEqual(sum(sizes), inter)
+        self.assertTrue(all(s > 0 for s in sizes))
+
+    def test_no_partition_tax_over_the_awq_group_32_vehicle(self):
+        """ANALYSE_442's argument, executed: ``lcm(32, 128) == 128`` is the
+        block AWQ already imposes for group size 32, so registering MXFP8
+        costs nothing a shipped vehicle does not already pay."""
+        from sglang.srt.layers.quantization.awq.awq import awq_uneven_tp_block
+
+        awq_block = awq_uneven_tp_block(32)
+        for total in (34816, 32768, 17408):
+            with self.subTest(total=total):
+                u = total // 16
+                mx = self.partition(
+                    total, _quant_block_aligned_units(total, u, self._cfg(), 0)
+                )
+                awq = self.partition(
+                    total,
+                    _quant_block_aligned_units(total, u, _plain_cfg(awq_block), 0),
+                )
+                self.assertEqual(mx, awq)
+
+    def test_symmetric_exposures_are_untouched(self):
+        """PLAN-EQUALITY PIN for the seven siblings: the new branch keys on
+        ``raw[0] != raw[1]``, so every symmetric block must be unaffected."""
+        from sglang.srt.layers.quantization.awq.awq import awq_uneven_tp_block
+        from sglang.srt.layers.quantization.gptq.gptq import gptq_uneven_tp_block
+
+        for label, blk in (
+            ("fp8 block", [128, 128]),
+            ("gguf", [256, 256]),
+            ("awq gs=128", awq_uneven_tp_block(128)),
+            ("gptq gs=128", gptq_uneven_tp_block(128)),
+            ("int8 16", [16, 16]),
+        ):
+            for total in (34816, 32768, 17408):
+                for idx in (0, 1):
+                    with self.subTest(cfg=label, total=total, idx=idx):
+                        u = total // 16
+                        self.assertEqual(
+                            _quant_block_aligned_units(total, u, _plain_cfg(blk), idx),
+                            _quant_block_aligned_units(
+                                total, u, _plain_cfg(list(blk)), idx
+                            ),
+                        )
+                        # and the value is the one the pre-#444b rule produced
+                        self.assertEqual(
+                            _quant_block_aligned_units(total, u, _plain_cfg(blk), idx),
+                            _legacy_block_aligned_units(total, u, blk[idx]),
+                        )
+
+
+def _legacy_block_aligned_units(total, units, block):
+    """The pre-#444b arithmetic for a config that exposes a block, restated so
+    the plan-equality pin compares against a value and not against itself."""
+    from sglang.srt.distributed.utils import block_aligned_units
+
+    if not block:
+        return units
+    return block_aligned_units(total, units, block)
+
+
+if __name__ == "__main__":
+    unittest.main()
