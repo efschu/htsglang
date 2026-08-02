@@ -1178,6 +1178,20 @@ class Envs:
     # verified. Graphs pin ADDRESSES, not contents, so the seam is sound in
     # principle; this flag exists to prove it in a card window.
     SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE = EnvBool(False)
+    # #394 slice 3: which policy produced the installed --rank-moe-ratio, so a
+    # #390 dump can tell a SOLVED vector from one an operator typed. Written by
+    # the launcher when it resolves "--rank-moe-ratio link"; read only by the
+    # expert-stats dump. An A/B arm that cannot identify itself is an A/B whose
+    # null result was never tested.
+    SGLANG_MOE_COMPUTE_POLICY = EnvStr("")
+    # #394 slice 3: per-rank cold-traffic coefficients ("a,b,c", mean 1),
+    # measured from a PRIOR boot's #390 dump with
+    # cold_traffic_coefficients_from_measurement. Without them the solve uses
+    # the first-order model (a cold expert is fetched, a resident one is not),
+    # which the reference-rig battery shows has a per-rank residual. There is
+    # deliberately no automatic dump -> launch path: a coefficient measured on
+    # one recipe is not a property of the rig.
+    SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS = EnvStr("")
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;

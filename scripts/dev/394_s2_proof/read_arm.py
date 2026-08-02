@@ -9,11 +9,17 @@ nothing else -- a server log is never read into anybody's context.
      shared-cold-tier). A proportional arm whose reachability says anything
      other than ``shared-cold-tier`` silently ran the baseline, which is the
      way an A/B most often reports a null that was never tested.
+     For a slice-3 arm the same question is ``moe_compute_policy``: an arm that
+     reads ``base-plan`` served the baseline.
   2. PER-RANK H2D, the primary readout. Slice 2 moves byte ownership, not
      compute, so the prediction is a null delta here; see boot_ab.sh. The
-     remote share says how much of it came out of a peer's segment.
+     remote share says how much of it came out of a peer's segment. For the
+     slice-3 arms the sign is inverted: a null delta FALSIFIES them, and the
+     predicted per-rank figures are tabulated in ARM3_COMPUTE.md.
   3. The x4 rank's implied transfer time, which is the clock the whole feature
      is aimed at.
+  4. The per-rank hit rate, which fills the row ANALYSE_389 left open and is
+     the input the calibrated slice-3 sub-arm needs.
 
 Usage:
   python3 read_arm.py <run_dir> <arm>
@@ -37,6 +43,11 @@ def main() -> int:
     run_dir = pathlib.Path(sys.argv[1])
     arm = sys.argv[2]
 
+    #: Arms whose treatment is the COMPUTE assignment (#394 slice 3). Their
+    #: prediction has the opposite sign to slice 2's, so they are named rather
+    #: than inferred: an arm nobody listed here is read as a slice-2 arm.
+    compute_arms = ("compute", "compute-cal")
+
     print(f"== arm {arm!r} in {run_dir} ==")
     total_h2d = 0
     total_remote = 0
@@ -44,6 +55,8 @@ def main() -> int:
         totals = payload.get("totals", {})
         policy = totals.get("host_shard_policy", "?")
         reach = totals.get("host_shard_reachability", "?")
+        compute_policy = totals.get("moe_compute_policy", "?")
+        vector = totals.get("moe_compute_vector", "?")
         h2d = int(totals.get("h2d_bytes", 0))
         remote = int(totals.get("remote_h2d_bytes", 0))
         total_h2d += h2d
@@ -51,8 +64,10 @@ def main() -> int:
         share = (100.0 * remote / h2d) if h2d else 0.0
         print(
             f"  {name}: policy={policy} reachability={reach} "
+            f"compute={compute_policy} vector={vector} "
             f"h2d={h2d / 2**30:.1f} GiB remote={remote / 2**30:.1f} GiB "
-            f"({share:.1f} %) hit_rate={totals.get('hit_rate', '?')}"
+            f"({share:.1f} %) hit_rate={totals.get('hit_rate', '?')} "
+            f"unique_hit_rate={totals.get('unique_hit_rate', '?')}"
         )
         if arm == "proportional" and reach != "shared-cold-tier":
             print(
@@ -60,15 +75,36 @@ def main() -> int:
                 "Any delta reported against it is a delta between two "
                 "baselines."
             )
+        if arm in compute_arms and not str(compute_policy).startswith("link-"):
+            print(
+                "    WARNING: this arm did NOT move the compute assignment "
+                f"(moe_compute_policy={compute_policy!r}). Any delta reported "
+                "against it is a delta between two baselines."
+            )
+        if arm == "compute-cal" and compute_policy != "link-proportional-calibrated":
+            print(
+                "    WARNING: the calibrated sub-arm ran UNCALIBRATED "
+                "(SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS did not reach the "
+                "launcher); it is a duplicate of the 'compute' arm."
+            )
 
     print(
         f"  group h2d={total_h2d / 2**30:.1f} GiB remote={total_remote / 2**30:.1f} GiB"
     )
-    print(
-        "  Reminder: a null per-rank H2D delta is the PREDICTED result for "
-        "slice 2 (byte ownership moved, compute did not). A non-null one "
-        "falsifies the analysis in boot_ab.sh and is the finding."
-    )
+    if arm in compute_arms:
+        print(
+            "  Reminder: for a slice-3 arm a NON-null per-rank H2D delta is "
+            "the predicted result, and a null one falsifies it. Compare "
+            "per-rank against the table in ARM3_COMPUTE.md, never the group "
+            "total -- the group total is predicted ~unchanged and the whole "
+            "effect is in which rank carries which part of it."
+        )
+    else:
+        print(
+            "  Reminder: a null per-rank H2D delta is the PREDICTED result for "
+            "slice 2 (byte ownership moved, compute did not). A non-null one "
+            "falsifies the analysis in boot_ab.sh and is the finding."
+        )
     return 0
 
 

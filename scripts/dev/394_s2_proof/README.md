@@ -9,8 +9,9 @@ four can-fail arms). What only a boot can show is in this directory.
 | script | proves |
 |---|---|
 | `preflight.sh` | `/dev/shm` is large enough and clean, the NVML rank→card table is what the arm's `--rank-gpu-id` is derived from, and the ratio resolves from a MEASURED probe rather than the nameplate |
-| `boot_ab.sh` | the two arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field) and `ARM=proportional` (measured ratio + shared cold tier) |
-| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, and the share that came from a peer's segment |
+| `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` / `ARM=compute-cal` (slice 3: the compute assignment moves) |
+| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, and the share that came from a peer's segment |
+| `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, and what must be read out |
 
 ## Run order
 
@@ -50,8 +51,13 @@ bytes came from its private pinned pool or from a peer's shared segment. So:
 Path A′ of `ANALYSE_393 §7.3` — 2.79 GB across the group's aggregate 32.4 GB/s
 instead of 0.93 GB down one 6.4 GB/s link — and reaching it additionally
 requires moving WHICH RANK COMPUTES WHICH EXPERT, i.e. the #82 expert range.
-That is a load-time shard question and a separate slice. Quoting the marker
-here would be quoting a number this mechanism cannot produce.
+Quoting the marker here would be quoting a number this mechanism cannot
+produce. That marker is `ARM=compute`'s target instead (#394 slice 3, task
+#439): `--rank-moe-ratio link` solves the expert range so each rank's streamed
+mass matches its own link, with the GPU-resident mass held fixed. Its
+predictions and readouts are in `ARM3_COMPUTE.md`; its per-rank H2D delta is
+predicted NON-null, which is the one place in this window where a null result
+is a falsification rather than a confirmation.
 
 So the arm is instrumented to falsify rather than to confirm: the primary
 readout is per-rank H2D, a null delta is the expected and publishable result,

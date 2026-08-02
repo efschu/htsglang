@@ -19,6 +19,22 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   WITHIN a rank), `--rank-kv-ratio` (`coupled|speed|vector` — decouples KV
   split from weight split), `--rank-auto-reserve-mib`, `--rank-gpu-memory-mib`
   (absolute per-rank MiB budget with a line-item ledger incl. lane pools).
+  Read `--rank-moe-ratio` precisely: under the **#82 GGUF expert-dim shard** it
+  moves whole experts and therefore the COMPUTE assignment (owner runs the
+  expert, foreign ids remap to a zero pad, the TP all-reduce sums the disjoint
+  partials); on every other MoE path it splits the expert INTERMEDIATE dim, so
+  every rank still computes every routed expert and only the weight slice
+  moves. `--rank-moe-ratio link` (#394 slice 3) solves the vector instead of
+  taking it: the GPU-resident expert mass stays exactly where the base plan put
+  it (VRAM-neutral) and the STREAMED remainder is apportioned by the measured
+  link weights, which equalises the per-rank transfer time the group waits on.
+  Optional per-rank cold-traffic coefficients
+  (`SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, measured from a prior boot's #390
+  dump) replace the first-order "a cold expert is fetched, a resident one is
+  not" model; without them the solve labels itself UNCALIBRATED. Refused by
+  name when offload is off, when the link provenance is `absent`, or under
+  `ep_size>1`. Resolved ONCE in the launcher — a symbolic value that reaches a
+  worker is a hard error there, never a silent fall back to the base plan.
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
   shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
@@ -105,10 +121,19 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   `PROT_READ` view over this rank's own link. Behind
   `SGLANG_MOE_COLD_TIER_SHM=1`; with it off the slice-1 boot refusal for
   delegation on disjoint expert shards is unchanged, field for field.
-  **Honest scope**: byte ownership moves, COMPUTE does not, so per-rank H2D is
-  predicted unchanged — ANALYSE_393's Path A′ (1.54x on the transfer term)
-  additionally needs the #82 expert RANGE to move and is a separate slice.
-  BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arm), and the graph seam,
+  **Honest scope of slice 2**: byte ownership moves, COMPUTE does not, so
+  per-rank H2D is predicted unchanged.
+  **Slice 3 (#439) moves the compute assignment** and is where ANALYSE_393's
+  Path A′ lives. It needed no new mechanism: the #82 expert range IS the "moe"
+  family vector, so the slice is a SOLVE plus its wiring
+  (`layers/moe/expert_compute_placement.py`, `--rank-moe-ratio link`, see §1).
+  Predicted on the reference recipe from the 2026-08-02 battery's own measured
+  inputs: clock rank 858 s → 632 s (1.358x) uncalibrated, → 542 s (1.584x) with
+  the coefficients calibrated off the equal arm, against BENCH_394's 1.536x
+  ideal-placement reference. All three are PREDICTIONS; nothing has booted.
+  BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arms 1+2, plus the slice-3
+  arms `ARM=compute` / `ARM=compute-cal` specified in `ARM3_COMPUTE.md`), and
+  the graph seam,
   which refuses by name until the UVA pointer for a `cudaHostRegister`'d peer
   mapping is verified (`SGLANG_MOE_COLD_TIER_GRAPH_UNSAFE=1`). Graphs incl.
   CPU-MoE remain IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host
