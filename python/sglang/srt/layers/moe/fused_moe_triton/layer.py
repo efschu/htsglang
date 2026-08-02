@@ -631,9 +631,19 @@ class FusedMoE(torch.nn.Module):
         # (prepare_capturable) + a captured UVA gather -- no host dependency,
         # so the decode graph is allowed. Without the opt-in, keep the original
         # fail-fast guard requiring --disable-cuda-graph.
-        self._moe_offload_graph_mode = (
-            self._expert_offload_fraction < 1.0
-            and envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get()
+        #
+        # #452: that opt-in is REFUTED on hardware (B2 content divergence, B4
+        # 6.60x decode regression) and refuses by name here -- at the one point
+        # where the mode is selected, before any weight is staged. The mechanism
+        # stays in-tree behind the refusal; SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE=1
+        # re-opens it for a card window. Nothing on the default path reaches the
+        # call: it needs fraction < 1.0 AND the opt-in env.
+        from sglang.srt.layers.moe.offload_capture_gate import resolve_graph_mode
+
+        self._moe_offload_graph_mode = resolve_graph_mode(
+            self._expert_offload_fraction,
+            envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get(),
+            self.layer_id,
         )
         if self._moe_offload_enabled:
             try:

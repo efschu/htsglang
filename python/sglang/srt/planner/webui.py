@@ -4429,8 +4429,12 @@ def _wizard_offload(payload: dict, ctx, plan: Optional[dict]) -> dict:
             if off.get("host_ram_total_mib")
             else None
         ),
+        # #452: the opt-in alone no longer allows graphs -- it refuses at boot.
+        # Only the development override actually reaches a captured decode, so
+        # that is what the wizard must report, or it advises a launch that dies.
         cuda_graph_allowed=(
             str(os.environ.get("SGLANG_MOE_OFFLOAD_CUDA_GRAPH") or "") == "1"
+            and str(os.environ.get("SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE") or "") == "1"
         ),
         blocked_verdict=(entry.verdict if entry else ""),
         blocked_evidence=(entry.evidence if entry else ""),

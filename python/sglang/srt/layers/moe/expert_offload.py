@@ -76,6 +76,15 @@ Design notes
   the single-wave case on CPU (tests/moe_offload/test_capturable_planner.py)
   and the sync-freedom is pinned by interception
   (tests/moe_offload/test_capture_desync_port.py).
+  #452: the capturable path is REFUTED on hardware and
+  `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` now refuses at boot
+  (`moe/offload_capture_gate.resolve_graph_mode`). B4 is structural: the
+  captured gather has a static index length, so it moves the WORST-CASE
+  scratch set every layer every step (2.128 GiB/token measured) where the
+  eager fetch moves only the missed experts (0.366-0.535 GiB/token) -- a 5.30x
+  PCIe multiplier on a step that is bandwidth-bound. The mechanism below is
+  kept so a candidate fix can be measured against those numbers; see
+  docs/dev/NOTE_452_desync_boot_refutation.md.
 * The capturable path has ONE gap, and it is named rather than latent: under
   the #394 shared cold tier a routed expert can be delegated to a peer's
   segment, for which this rank's pool has no row. The installer refuses that

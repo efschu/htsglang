@@ -1490,8 +1490,8 @@ def _modifiers(ctx: MatrixContext) -> List[dict]:
             "source": (entry.evidence if (moe and gguf and entry) else ""),
             "note": (
                 "Composes with every family above. Requires "
-                "--disable-cuda-graph unless SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1, "
-                "and moves the budget to host RAM."
+                "--disable-cuda-graph (the capturable decode path was refuted "
+                "on hardware, #452) and moves the budget to host RAM."
             ),
         }
     )
