@@ -134,9 +134,15 @@ keyed (lane,name). PD disaggregation: prefill satellite carries hybrid GDN
 A card holds ONLY KV + attention (no weights): chunked prefill/extend, fp8/int4
 worker KV, DCP comm fusion, graph-captured streaming decode, host-tier KV
 spill, chain spec. **Live session handover without server stop** + draft
-re-sharder as its own spec type: BRANCH-ONLY, NOT on the integration tip yet
-(branch `feat/live-handover-261`, `POST /session_handover`, five-phase at
-session scope, hard GDN-blob gate; merge pending its GPU byte gate).
+re-sharder as its own spec type: MERGED and GPU-gate-passed
+(`POST /session_handover`, five-phase at session scope, hard GDN-blob gate
+keyed on `BasePrefixCache.supports_mamba()`; proven byte-identical to a
+never-moved reference via a real cached-tokens import, `cached_tokens=1152`
+on resume, plus seven named-refusal negative controls) — the declared v1
+limit stands unchanged: a booted TP>1 destination still needs the offline
+manifest-scoped umsharder (`page_size == 1`, inherited from
+`dcp_owner_mode`) to reshape into its geometry first, live handover does not
+do that reshape in-process.
 
 Also wired on the tip but easy to miss (audit #421): the regime-controller
 gate machinery, KV-pressure rung-dependency refusals, the hibernate flag
