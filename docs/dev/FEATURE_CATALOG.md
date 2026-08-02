@@ -15,10 +15,11 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   intermediate dim and must coarsen identically); per-layer family table for
   `block_configs` models (Nemotron-Puzzle class).
 - Sibling flags: `--rank-mlp-ratio`, `--rank-vocab-ratio`, `--rank-moe-ratio`
-  (experts BETWEEN ranks), `--rank-moe-resident-fraction` (GPU/host split
-  WITHIN a rank), `--rank-kv-ratio` (`coupled|speed|vector` — decouples KV
-  split from weight split), `--rank-auto-reserve-mib`, `--rank-gpu-memory-mib`
-  (absolute per-rank MiB budget with a line-item ledger incl. lane pools).
+  (per-path meaning below — do not read this as "experts between ranks" in
+  general), `--rank-moe-resident-fraction` (GPU/host split WITHIN a rank),
+  `--rank-kv-ratio` (`coupled|speed|vector` — decouples KV split from weight
+  split), `--rank-auto-reserve-mib`, `--rank-gpu-memory-mib` (absolute
+  per-rank MiB budget with a line-item ledger incl. lane pools).
   Read `--rank-moe-ratio` precisely: under the **#82 GGUF expert-dim shard** it
   moves whole experts and therefore the COMPUTE assignment (owner runs the
   expert, foreign ids remap to a zero pad, the TP all-reduce sums the disjoint
