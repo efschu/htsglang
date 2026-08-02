@@ -163,6 +163,18 @@ fp8-quantized checkpoint is refused at ModelRunner boot (#424 evidence;
 INT8-W8A8 over BAR1 and fp8 over NCCL are untouched). Override for the repro
 window: `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1=1`. See
 `docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md` — GPU proof still pending.
+**BAR1 deadline + loud abort** (#431 fix slice): the three BAR1 kernel launch
+sites go through `resolve_timeout_cycles`, so the documented 40x JIT
+cold-build extension finally reaches the one transport whose kernels spin on
+a device deadline (identity outside the window, so serving and the captured
+graph are unchanged). A tripped spin kernel now raises
+`Bar1CollectiveAborted` with rank/op/rounds instead of continuing over a
+partially written buffer — checked after every host-path collective and, for
+captured decode, at the CUDA-graph replay boundary
+(`barlink_abort_gate.py`); never inside a stream capture, where the device
+read would be illegal. Knobs:
+`SGLANG_BARLINK_BAR1_ABORT_CHECK=0` (restore the old silence),
+`..._CHECK_EVERY=N`, `..._CHECK_REPLAY=0`.
 
 ## 8. GGUF stack
 Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype

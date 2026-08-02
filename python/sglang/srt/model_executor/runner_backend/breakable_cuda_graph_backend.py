@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -256,6 +257,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        # #431: same reason as in FullCudaGraphBackend.replay -- a replayed
+        # graph runs the barlink BAR1 spin kernels with no host code between
+        # them, so this boundary is the next place their status word can be
+        # read at all.
+        barlink_abort_gate.check_after_graph_replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

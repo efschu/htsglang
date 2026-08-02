@@ -409,6 +409,22 @@ def unproven_bar1_combination(
     is refused, and only until the GPU repro in
     ``scripts/repro_431_fp8_bar1_dcp.sh`` has a fix-proof attached.
 
+    STILL IN FORCE AFTER THE 2026-08-02 WINDOW. That window replaced the
+    hypothesis with a measurement (``docs/dev/ANALYSE_431_fp8_bar1_dcp_
+    deadlock.md``): the ranks' collective sequences are byte-identical, so
+    the dispatch-divergence theory is dead for this arm, and the wedge is
+    BAR1-internal -- roughly one collective per 30-40 s, matching the raw
+    cycle cap. Two code-level defects that reading exposed have since been
+    fixed (the BAR1 launch sites bypassed ``resolve_timeout_cycles``, so the
+    documented 40x cold-build extension never reached them; and a tripped
+    kernel wrote a status word no production path read). NEITHER lifts this
+    refusal: both were about how the failure is BOUNDED and REPORTED, not
+    about why the flag rendezvous is slow, and that root cause is still
+    unexplained. The refusal comes off when a GPU re-run of the fp8 arm --
+    with the extension in force and aborts loud -- either completes, or
+    fails with a named ``Bar1CollectiveAborted`` that identifies the
+    collective. Not before.
+
     ``override`` exists so the very window that has to reproduce the hang can
     still boot the failing arm. Default is read from the environment.
     """
@@ -438,7 +454,17 @@ def unproven_bar1_combination(
         "checkpoint over BAR1 with identical DCP settings through both "
         "layouts without a hang, and the fp8 checkpoint over stock NCCL "
         "likewise -- so the refusal is scoped to exactly the arm that "
-        "failed, not to BAR1 and not to uneven DCP. Take the run over stock "
+        "failed, not to BAR1 and not to uneven DCP. The 2026-08-02 repro "
+        "window narrowed it further: the ranks' collective sequences are "
+        "byte-identical, so this is not a dispatch divergence but a "
+        "BAR1-internal crawl at ~30-40 s per collective. Two defects that "
+        "reading exposed are fixed (#431 fix 1: the BAR1 launch sites now go "
+        "through resolve_timeout_cycles, so the 40x JIT cold-build extension "
+        "finally reaches them; #431 fix 2: a tripped spin kernel now raises "
+        "Bar1CollectiveAborted with rank/op/rounds instead of continuing "
+        "silently over a partially written buffer). Neither addresses why "
+        "the flag rendezvous is slow, which is why this refusal stays until "
+        "a GPU re-run of this arm is on record. Take the run over stock "
         "NCCL (unset the SGLANG_BARLINK* block) or use the INT8-W8A8 "
         f"checkpoint. To reproduce the hang deliberately, set "
         f"{ENV_ALLOW_FP8_UNEVEN_DCP_BAR1}=1."

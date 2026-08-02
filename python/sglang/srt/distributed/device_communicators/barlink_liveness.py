@@ -18,9 +18,17 @@ unbounded burn of card time:
    (``SGLANG_BARLINK_BAR1_CAP_CYCLES``, ~30 s at 2 GHz), but it is
    rank-local, it is multiplied by up to 40x inside the JIT cold-build window
    (``jit_cold_build``) -- which is exactly the capture window where the OOM
-   kill happens -- and its expiry writes ``ctlStatus`` into rank-local VRAM
-   that no production code path reads. A tripped kernel is therefore silent:
-   the stream continues over a partially written output buffer.
+   kill happens -- and its expiry writes ``ctlStatus`` into rank-local VRAM.
+
+   Both halves of that sentence were, until #431, statements about the
+   DEVICE transport only. BAR1 passed its cap constant to the kernels raw
+   and never called ``resolve_timeout_cycles``, so the 40x extension did not
+   in fact apply to it; and no production path read the status word, so a
+   tripped kernel was silent and the stream continued over a partially
+   written output buffer. ``BarlinkBar1Transport._deadline_cycles`` and
+   ``check_aborted`` close both, and ``barlink_abort_gate`` carries the
+   check to the one place a per-collective host check cannot reach -- the
+   CUDA-graph replay boundary.
 
 Neither mechanism can see that a peer process no longer exists. That is the
 one fact that turns an indefinite wait into a decidable one.
