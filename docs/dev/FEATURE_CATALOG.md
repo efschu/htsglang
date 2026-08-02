@@ -115,7 +115,11 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   nodes, CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
   (spill/restore under fixed buffers is legal).
 - **HiCache** L1-L3 prefix cache (validated with uneven DCP/TP; storage key
-  includes kv-dtype; runtime attach/detach works on UnifiedRadixCache).
+  includes kv-dtype; runtime attach/detach works on UnifiedRadixCache). The
+  L2 host tier's `page_first_direct` transfer path was blocked on this rig by
+  a segfault in `transfer_kv_all_layer_direct_lf_pf` (#436, cu12/cu13
+  `cudaMemcpyBatchAsync` ABI split); unblocked by the cu13 `sgl_kernel`
+  rebuild.
 - **KV session offload (kvso)**: FCFS spill of youngest sessions to RAM (KV
   only, GDN stays resident), budgets (volume/rate/window, demote to HiCache),
   idle-first victim choice, decoupled from speculation.
