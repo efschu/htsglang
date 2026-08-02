@@ -188,6 +188,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     dense_weight_dtype,
     is_gguf_quant_config,
+    is_packed_layer,
     layer_quant_method_name,
 )
 from sglang.srt.runtime_context import (
@@ -841,25 +842,16 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
             # The int8 / fp8 shared-expert fast paths need a dense weight
-            # tensor to read a dtype from. `is_packed_weight` only names the
-            # AWQ family; GGUF (and GPTQ) are packed too and expose `qweight`
-            # instead, so the dtype is resolved through `dense_weight_dtype`
-            # and simply comes back as None for them -> general path.
+            # tensor to read a dtype from, so packed-vs-dense is decided by
+            # what the layer actually built: `dense_weight_dtype` answers None
+            # for every packed format (awq, awq_marlin, moe_wna16, gptq,
+            # auto-round, gguf, ...), which selects the general path. The
+            # quantization-name list this used to carry named the AWQ family
+            # only and answered "dense" for the rest.
             shared_gate_up_dtype = dense_weight_dtype(self.shared_experts.gate_up_proj)
-            self.shared_experts_is_int8 = (
-                not is_packed_weight and shared_gate_up_dtype == torch.int8
-            )
-            self.shared_experts_is_fp8 = (
-                not is_packed_weight and shared_gate_up_dtype == torch.float8_e4m3fn
-            )
+            self.shared_experts_is_int8 = shared_gate_up_dtype == torch.int8
+            self.shared_experts_is_fp8 = shared_gate_up_dtype == torch.float8_e4m3fn
             if self.shared_experts_is_fp8:
                 if (
                     _use_aiter
@@ -1873,18 +1865,20 @@ class DeepseekV2AttentionMLA(
         )
 
         self.has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        self.is_packed_weight = (
-            self.has_fused_proj
-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+        # Packed-vs-dense is decided by what the layer built, not by the
+        # quantization method's name: the name list this used to carry
+        # ({"awq", "awq_marlin", "moe_wna16"}) answered False for gptq,
+        # auto-round, gguf and the packed compressed-tensors schemes, so a
+        # consumer of this public flag would read `weight` off a layer that
+        # only has `qweight`.
+        self.is_packed_weight = self.has_fused_proj and is_packed_layer(
+            self.fused_qkv_a_proj_with_mqa
         )
         # `dsv3_fused_a_gemm` reads `weight.T` directly, so the fast path is
-        # only available when a dense weight tensor exists. `is_packed_weight`
-        # above covers the AWQ family by name; GGUF and GPTQ are packed too
-        # and simply have no `weight`, which resolves to None here (and to the
-        # general `self.fused_qkv_a_proj_with_mqa(...)` call in
-        # prepare_qkv_latent, whose fast-path branch this flag gates).
+        # only available when a dense weight tensor exists; a packed layer
+        # resolves to None here and takes the general
+        # `self.fused_qkv_a_proj_with_mqa(...)` call in `prepare_qkv_latent`,
+        # whose fast-path branch this flag gates.
         fused_a_weight = (
             getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
             if self.has_fused_proj and not self.is_packed_weight

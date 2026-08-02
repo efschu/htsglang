@@ -91,6 +91,23 @@ def dense_weight_dtype(layer: torch.nn.Module) -> Optional[torch.dtype]:
     return getattr(weight, "dtype", None)
 
 
+def is_packed_layer(layer: torch.nn.Module) -> bool:
+    """True when a layer stores packed weights instead of a dense ``weight``.
+
+    Classify by what was actually built, not by the quantization method's
+    name. A name list has to enumerate every packed format and silently
+    misclassifies the ones it forgot: ``{"awq", "awq_marlin", "moe_wna16"}``
+    answers "dense" for ``gptq``, ``auto-round``, ``gguf`` and every packed
+    ``compressed-tensors`` scheme, all of which register ``qweight`` (or
+    ``weight_packed``) and no ``weight``. The structural test cannot go stale
+    when a new packed format is added.
+
+    This is the same predicate ``dense_weight_dtype`` answers with, phrased as
+    a boolean for the sites that only need packed-vs-dense and not the dtype.
+    """
+    return getattr(layer, "weight", None) is None
+
+
 def layer_quant_method_name(layer: torch.nn.Module) -> Optional[str]:
     """Quant method a layer was built with, or None when it is unquantized.
 

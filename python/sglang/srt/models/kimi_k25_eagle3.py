@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import is_packed_layer
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.utils import BumpAllocator, add_prefix
 
@@ -124,14 +125,9 @@ class Eagle3MLADecoderLayer(nn.Module):
         # Recompute fused-proj-dependent flags so they reflect the new input dim.
         attn.has_fused_proj = True
         attn.use_min_latency_fused_a_gemm = False
-        quant_method = getattr(attn.fused_qkv_a_proj_with_mqa, "quant_method", None)
-        attn.is_packed_weight = (
-            quant_method is not None
-            and hasattr(quant_method, "quant_config")
-            and quant_method.quant_config is not None
-            and quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
-        )
+        # Same rule as DeepseekV2AttentionMLA: packed-vs-dense follows what the
+        # replacement layer built, not the quantization method's name.
+        attn.is_packed_weight = is_packed_layer(attn.fused_qkv_a_proj_with_mqa)
 
         self.mlp = DeepseekV2MLP(
             hidden_size=config.hidden_size,
