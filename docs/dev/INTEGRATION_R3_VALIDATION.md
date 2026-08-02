@@ -20858,3 +20858,74 @@ under the weighted rule, off DCP, and on stock even DCP.
 
 CPU, hermetic, `test/registered/unit/distributed/test_dcp_context_ceiling.py`,
 17 cases / 21 subtests, `CUDA_VISIBLE_DEVICES=""`.
+
+# #261 second half — live session handover + draft re-sharder (desk record, 2026-08-02)
+
+Design: `docs/dev/DESIGN_261_live_session_handover.md` (the full decision
+record; this section is the validation summary).
+
+**Built.**
+
+1. Live handover without server stop, at SESSION scope with the #329
+   vocabulary: `managers/session_handover.py` (ledger + manifest gates +
+   scheduler adapter), `POST /session_handover` (export / commit / abort /
+   verify_import) through the standard FanOut control plane, a parked-prefix
+   admission refusal in `handle_generate_request` (no-op on every default
+   path), and `hicache_migrate --manifest` (migration reads exactly the
+   manifest's blobs — complete and immutable because the session is parked —
+   which is what makes a LIVE source store safe). Rollback legal strictly
+   before commit; every export failure path unparks. No group collective
+   anywhere in the path; all waits are bounded deadlines that roll back on
+   expiry. Declared v1 limits: TP=1/PP=1 source, `file` backend,
+   `page_size == 1`, full residency required.
+2. Draft re-sharder as the second blob-spec type: `mem_cache/draft_migrate.py`
+   (`DraftBlobSpec`, `[2][layer][head][dim]` extent family, `page_head`
+   refused; `partition_sizes` imported from the runtime), capability registry
+   keyed by canonical `SpeculativeAlgorithm` names and AUDITED against the
+   enum (one source; unknown names refused with `known_names()`), wired into
+   both plan directions and the CLI. In `--manifest` mode a draft blob
+   REQUIRES an explicit disposition (`--draft-spec-algorithm` or
+   `--draft-cold-start`) — silent skipping is gone from the handover path;
+   the legacy whole-store default skip is unchanged. `verify_plan` gained the
+   named whole-file fan-out allowance (replication is not a permutation);
+   partial-extent double consumption stays fatal.
+
+**Desk evidence (hermetic, CUDA_VISIBLE_DEVICES=99, venv htsglang-gpu).**
+
+- 79 tests green: 28 pre-existing `test_hicache_migrate` (unchanged), 28 new
+  `test_draft_migrate`, 23 new `test_session_handover`.
+- Falsifiers all two-sided: planted GDN omission fails the completeness gate
+  AND unparks (and the same export with the blob present passes); a
+  corrupted replica fails the fan-out verify; partial double consumption
+  still dies; wrong declared draft geometry dies naming both byte counts;
+  missing rank shard fatal; abort-after-commit refused; in-flight quiesce
+  refused; unknown algorithm refused at parse time listing known names;
+  DFLASH/EAGLE3/STANDALONE/DSPARK/FROZEN_KV_MTP are named refusals.
+- CLI executed, not just written: manifest-scoped forward 1->2 with EAGLE
+  draft re-shard and reverse 2->1 through the real module entry point,
+  permutation gate passed both directions, draft blob byte-identical after
+  the round trip; the no-disposition refusal, cold-start path, DFLASH
+  refusal and unknown-name refusal all exercised. (This smoke caught a real
+  defect: the CLI's `--draft-units` default of 1 contradicted the
+  head-granularity default — fixed, test added at head granularity.)
+- Neighbor suites green: io_struct, fanout_communicator, kv_reshard,
+  spec_registry, boot_constructor_integrity. `test_module_state_ratchet`
+  fails on BASE (1960957e3b, `layers/moe/utils.py`
+  `_barlink_overlap_announced`) — inherited, not introduced; failing set is
+  a subset of base.
+
+**Open (named).**
+
+- The card-window trajectory byte gate (`scripts/handover/live_handover_gate.sh`
+  chains seed -> A-vs-A floor -> export/park/liveness -> manifest umsharder ->
+  verify_import -> commit -> resume-with-cached -> byte compare). Cards were
+  held by a sibling window (#394) at desk-completion time; the gate is
+  ready to run and is the acceptance test for the live path.
+- Live export from a TP>1 source (per-rank manifest merge) — stop-based flow
+  covers that direction meanwhile.
+- Destination byte-size probe in verify_import (presence+identity today;
+  sizes are gated in the umsharder and at read time).
+- `page_head` draft layout case.
+- #411 is cited from the task briefing as the never-silent-conversion
+  contract; the number has no anchor in this repo's history — the contract
+  is enforced regardless.
