@@ -167,6 +167,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 from sglang.srt.model_executor.ngram_token_table import (
     update_ngram_token_table_after_sampling,
 )
+from sglang.srt.model_executor.offload_register import (
+    configure_global_register_from_server_args,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -558,6 +561,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        # #421 F2: build the #286 offload register from the operator's
+        # --lane-offload-* flags. Must run BEFORE the first adapter read: the
+        # pools, input buffers and lane workspaces created further down all go
+        # through get_global_register(), whose fallback would otherwise build a
+        # bare latency-profile register and silently discard the flags. No-op
+        # (and no side effect) unless SGLANG_OFFLOAD_REGISTER=1; once per
+        # process, so a draft runner or a #274 lane runner does not rebuild the
+        # register out from under the items the first runner booked.
+        configure_global_register_from_server_args(server_args)
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.device_timer = None

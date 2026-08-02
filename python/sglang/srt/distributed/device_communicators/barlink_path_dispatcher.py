@@ -112,9 +112,29 @@ class PathProfile:
     # and deliberately NOT presumed here.
     aperture_bytes: Optional[int] = None
     # Utilization (0..1) at and above which the path counts as saturated.
+    #
+    # #421 F9, and the audit's open question answered: nothing in the tree
+    # writes this field, so every path is saturated only at utilization
+    # EXACTLY 1.0 (``_utilization_locked`` does not clamp, and the injected
+    # sensor's documented range is [0, 1]). The ``>= threshold`` overflow tier
+    # at ``_select`` is therefore reachable but, in practice, off. That is the
+    # intended skeleton state, not an oversight: a per-path threshold below 1
+    # is a MEASURED figure -- the utilization at which a given BAR window or
+    # link starts degrading -- and belongs to the #279 measured slice, which
+    # is the one that also supplies the sensor. Setting it from a guess here
+    # would re-route traffic on an invented number.
     saturation_threshold: float = 1.0
     # Actuation handle for the barlink _select hook (HINT_* above). Paths
     # without a hint can win a comparison but not (yet) be acted on there.
+    #
+    # #421 F9: no production construction site passes one -- the four in
+    # ``barlink_path_rates.py`` build profiles out of MEASUREMENT sources
+    # (capability matrix, comm-suite rows, split-probe rows), and which
+    # transport object can carry a given path is a #279 dispatcher-side fact
+    # those sources do not know. So ``select_transport`` always falls through
+    # to the status quo and says so in a warning. Wiring this is #279's
+    # actuation slice; it is pinned by
+    # ``test_barlink_dispatcher_inert_421.py`` so the state stays visible.
     transport_hint: Optional[str] = None
     # Offload class whose PARKED items this path depends on; their wave-in
     # latency (OffloadRegister.latency_term_ms) is added to the cost.
@@ -222,9 +242,7 @@ class PathDispatcher:
             return p.transport_hint if p is not None else None
 
     # -- injectable hooks (placeholder pattern, cf. OffloadRegister) ---------
-    def set_saturation_sensor(
-        self, sensor: Optional[Callable[[str], float]]
-    ) -> None:
+    def set_saturation_sensor(self, sensor: Optional[Callable[[str], float]]) -> None:
         """Attach the 13e group-wide saturation signal:
         ``sensor(path_name) -> utilization in [0, 1]``. MUST be
         group-uniform (see module docstring). None = nothing saturated."""
@@ -305,9 +323,7 @@ class PathDispatcher:
                 reason=f"no paths registered for class "
                 f"{request.message_class!r} (status quo = #240 class choice)",
             )
-        unmeasured = [
-            p.name for p in candidates if p.provenance != PROVENANCE_MEASURED
-        ]
+        unmeasured = [p.name for p in candidates if p.provenance != PROVENANCE_MEASURED]
         if unmeasured:
             return DispatchDecision(
                 STATUS_QUO,
@@ -340,10 +356,7 @@ class PathDispatcher:
             )
         if self._utilization_locked(best.name) >= best.saturation_threshold:
             for alt in ranked[1:]:
-                if (
-                    self._utilization_locked(alt.name)
-                    < alt.saturation_threshold
-                ):
+                if self._utilization_locked(alt.name) < alt.saturation_threshold:
                     return DispatchDecision(
                         alt.name,
                         status_quo=False,
@@ -448,9 +461,7 @@ def refine_transport_choice(
     """
     if dispatcher is None:
         return chosen
-    decision = dispatcher.decide(
-        DispatchRequest("collective", nbytes, lane=lane)
-    )
+    decision = dispatcher.decide(DispatchRequest("collective", nbytes, lane=lane))
     if decision.status_quo:
         return chosen
     hint = dispatcher.transport_hint(decision.path)

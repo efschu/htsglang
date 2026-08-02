@@ -84,6 +84,7 @@ Everything here is pure Python and CPU-testable
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -95,8 +96,11 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Union,
 )
+
+logger = logging.getLogger(__name__)
 
 OFFLOAD_CLASSES = (
     "graph_rungs",
@@ -418,9 +422,7 @@ class MovementBackend:
     def wave_in(self, item: OffloadItem) -> None:
         raise NotImplementedError
 
-    def bind(
-        self, item_id: str, payload: object, source_device: int = 0
-    ) -> None:
+    def bind(self, item_id: str, payload: object, source_device: int = 0) -> None:
         """Attach an item's movement payload (which route moves it). The
         base interface accepts and ignores it so adapters may bind
         unconditionally; the real backend stores it."""
@@ -442,9 +444,7 @@ class CpuFakeMovementBackend(MovementBackend):
     def wave_in(self, item: OffloadItem) -> None:
         self.waved_in_ids.append(item.item_id)
 
-    def bind(
-        self, item_id: str, payload: object, source_device: int = 0
-    ) -> None:
+    def bind(self, item_id: str, payload: object, source_device: int = 0) -> None:
         self.bound[item_id] = payload
 
 
@@ -528,6 +528,7 @@ class OffloadRegister:
         phase_hysteresis_window_s: float = DEFAULT_PHASE_HYSTERESIS_WINDOW_S,
         clock: Callable[[], float] = time.monotonic,
         overlap_budget_fn: Optional[Callable[[OffloadItem, str, str], bool]] = None,
+        park_target_order: Optional[Sequence[str]] = None,
     ):
         if policies is None:
             # Default preset is latency (all resident) until the measurement
@@ -573,6 +574,25 @@ class OffloadRegister:
         # None = ladder off (today's behavior: every set stays resident and
         # on_admission_boundary plans nothing).
         self._session_ladder = None
+        # Erg. 7c park-target ladder (--lane-offload-park-targets). Held here
+        # because the register is the one object that exists at runner init
+        # and is reachable from every adapter; the MovementEngine that
+        # consumes it is built later, in the GPU phase, and reads it from
+        # ``park_target_order``. None = the movement layer's own default.
+        if park_target_order is not None:
+            for target in park_target_order:
+                if target == OWN_VRAM_TIER:
+                    raise ValueError(
+                        f"{OWN_VRAM_TIER!r} is tier 0 of the ladder (= stay "
+                        f"resident) and cannot be a park target"
+                    )
+                if target not in PARK_TARGETS:
+                    raise ValueError(
+                        f"unknown park target {target!r}; known targets: "
+                        f"{', '.join(PARK_TARGETS)}."
+                    )
+            park_target_order = tuple(park_target_order)
+        self._park_target_order: Optional[tuple] = park_target_order
         self.stats = OffloadRegisterStats()
 
     # --- configuration ------------------------------------------------------
@@ -584,6 +604,12 @@ class OffloadRegister:
     def backend(self) -> MovementBackend:
         """The movement backend (adapters use this to bind payloads)."""
         return self._backend
+
+    @property
+    def park_target_order(self) -> Optional[tuple]:
+        """The operator's ``--lane-offload-park-targets`` chain, or None when
+        none was given (the movement layer then uses its own default)."""
+        return self._park_target_order
 
     @property
     def hysteresis_window_s(self) -> float:
@@ -969,8 +995,7 @@ class OffloadRegister:
                         already = self._parked_bytes_locked("gdn_state_sets")
                         if already + planned_bytes + item.size_bytes > cap:
                             plan.skipped[item.item_id] = (
-                                f"class fraction cap ({policy.fraction}) "
-                                f"exhausted"
+                                f"class fraction cap ({policy.fraction}) " f"exhausted"
                             )
                             continue
                     plan.park_candidates.append(item.item_id)
@@ -978,9 +1003,7 @@ class OffloadRegister:
                     planned_bytes += item.size_bytes
 
             resident_after = (
-                len(resident)
-                - len(plan.park_candidates)
-                + len(plan.wave_in_candidates)
+                len(resident) - len(plan.park_candidates) + len(plan.wave_in_candidates)
             )
             if resident_after < needed_resident:
                 raise RuntimeError(
@@ -1128,6 +1151,12 @@ class _GlobalRegisterHolder:
     def __init__(self):
         self.register: Optional[OffloadRegister] = None
         self.lock = threading.Lock()
+        # True once the register was built FROM the server args, as opposed to
+        # by get_global_register()'s bare-default fallback. Two runners can
+        # exist in one process (#274 dual-group lanes, draft runners), and a
+        # rebuild would drop every item the first runner's adapters booked --
+        # so the configure step is once-per-process and says so.
+        self.configured_from_server_args = False
 
 
 _HOLDER = _GlobalRegisterHolder()
@@ -1145,6 +1174,7 @@ def configure_global_register(
     backend: Optional[MovementBackend] = None,
     hysteresis_window_s: float = DEFAULT_HYSTERESIS_WINDOW_S,
     phase_hysteresis_window_s: float = DEFAULT_PHASE_HYSTERESIS_WINDOW_S,
+    park_target_order: Optional[Sequence[str]] = None,
 ) -> OffloadRegister:
     """Build (or rebuild) the process-global register from the server-args
     knobs. Called once at runner init when the register is enabled."""
@@ -1154,9 +1184,65 @@ def configure_global_register(
         backend=backend,
         hysteresis_window_s=hysteresis_window_s,
         phase_hysteresis_window_s=phase_hysteresis_window_s,
+        park_target_order=park_target_order,
     )
     with _HOLDER.lock:
         _HOLDER.register = reg
+    return reg
+
+
+def configure_global_register_from_server_args(
+    server_args,
+) -> Optional[OffloadRegister]:
+    """Runner-init entry point: build the register the operator asked for.
+
+    #421 F2: ``server_args._handle_lane_offload_register`` validated
+    ``--lane-offload-profile`` / ``--lane-offload-class-policy`` /
+    ``--lane-offload-park-targets`` and then discarded the resolved values
+    ("recomputed at configure time"), but nothing in production ever reached
+    configure time. ``get_global_register()``'s fallback then built a bare
+    latency-profile register, so the three flags were accepted, validated,
+    and silently ignored. This is the missing half.
+
+    Contract:
+
+    * ``None`` and no side effect when ``SGLANG_OFFLOAD_REGISTER`` is off --
+      the default path stays byte-identical.
+    * Once per process. A second runner in the same process (draft runner,
+      #274 dual-group lane) must NOT rebuild: a rebuild drops every item the
+      first runner's adapters already booked.
+    * The values are re-resolved here rather than passed down from argument
+      time, so a typo refuses LOUDLY at runner init too -- including on the
+      direct-``ServerArgs``-construction path that never runs
+      ``__post_init__``'s validator.
+    """
+    if not offload_register_enabled():
+        return None
+    with _HOLDER.lock:
+        already = _HOLDER.configured_from_server_args
+    if already:
+        return get_global_register()
+
+    profile = getattr(server_args, "lane_offload_profile", "latency")
+    overrides = getattr(server_args, "lane_offload_class_policy", None)
+    park_spec = getattr(server_args, "lane_offload_park_targets", None)
+    # Raises on an unknown profile / class / policy / fraction / target. A
+    # planted typo must fail the boot here, not degrade to the default preset.
+    order = parse_park_target_order(park_spec, "--lane-offload-park-targets")
+    reg = configure_global_register(
+        profile,
+        overrides,
+        park_target_order=order,
+    )
+    with _HOLDER.lock:
+        _HOLDER.configured_from_server_args = True
+    logger.info(
+        "[offload-register] configured from server args: profile=%s, "
+        "class-policy=%s, park-targets=%s",
+        profile,
+        overrides or "(none)",
+        ">".join(order),
+    )
     return reg
 
 
@@ -1176,6 +1262,7 @@ def reset_global_register() -> None:
     """Tests (and a second in-process model load): drop the global register."""
     with _HOLDER.lock:
         _HOLDER.register = None
+        _HOLDER.configured_from_server_args = False
 
 
 def maybe_register_item(

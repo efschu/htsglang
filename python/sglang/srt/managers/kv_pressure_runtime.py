@@ -453,12 +453,20 @@ def build_kv_pressure_runtime(scheduler) -> Optional[KvPressureRuntime]:
     """Construct the runtime for one scheduler group, or ``None`` when the
     ladder flag is unset (today's behavior: nothing is constructed, no
     sample is taken, no collective is added)."""
+    from sglang.srt.managers.kv_ladder_auto import auto_ladder_table_fn
     from sglang.srt.model_executor.kv_pressure_ladder import (
         build_ladder_from_server_args,
     )
 
     server_args = scheduler.server_args
-    ladder = build_ladder_from_server_args(server_args)
+    # #421 F1: ``--kv-pressure-ladder auto`` needs the #272 planner's table
+    # source injected here -- ``kv_pressure_ladder.py`` deliberately never
+    # imports the planner, so without this the advertised mode raised at
+    # scheduler construction. ``auto_ladder_table_fn`` returns a THUNK, so the
+    # profile (and NVML) is only touched when the spec really is ``auto``.
+    ladder = build_ladder_from_server_args(
+        server_args, table_fn=auto_ladder_table_fn(server_args)
+    )
     if ladder is None:
         return None
     tp_size = getattr(server_args, "tp_size", 1)

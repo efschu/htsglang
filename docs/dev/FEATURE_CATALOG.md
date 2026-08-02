@@ -68,14 +68,22 @@ register of discarded approaches — check it before re-proposing anything.
 - **Hibernate to disk** (weights+KV survive process exit; uneven-TP3 reload
   50s→8-14s) + suspend-to-RAM (memory saver).
 - **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
-  (geometry stages instead of rejects; explicit ladders work, but
-  `--kv-pressure-ladder auto` is currently BROKEN — hard-fails at runtime,
-  audit #421 F1; rung-dependency refusals exist and fire), **KV resharding**
+  (geometry stages instead of rejects; explicit ladders work; rung-dependency
+  refusals exist and fire). `--kv-pressure-ladder auto` was BROKEN
+  (audit #421 F1) and is fixed on the desk in task #428 — the table is
+  computed from the rig profile by the #272 planner, rank-uniformly and
+  UUID-keyed, and inventories only rungs whose actuator this configuration
+  wires. Capacities are labelled placeholders until the measured figures
+  arrive. BOOT-PENDING: `scripts/dev/428_boot_checks/`. **KV resharding**
   at phase boundaries (delta move <1 s, `kv_reshard_vectors`), **GDN slot
   ladder** (resident-state cap + idle vacate → VRAM back to KV pool).
-  WARNING (audit #421 F2): `--lane-offload-profile/-class-policy/-park-targets`
-  are advertised in CLI help but currently DISCARDED (register never
-  configured from ServerArgs) — do not rely on them until wired.
+  `--lane-offload-profile/-class-policy/-park-targets` were advertised and
+  DISCARDED (audit #421 F2); task #428 configures the register from them at
+  ModelRunner init, and a typo now refuses there too. The park chain reaches
+  the register and the movement layer's default reads it — but nothing in
+  production constructs the movement backend yet, so the chain has a consumer
+  PATH, not a consumer. Whole surface is behind `SGLANG_OFFLOAD_REGISTER=1`
+  (dark launch). BOOT-PENDING: `scripts/dev/428_boot_checks/`.
 - **memtier registry**: tier ids with volatility + payload class and
   provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
   (audit #421): ZERO consumers wired today — "all consumers pick targets from
