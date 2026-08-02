@@ -253,6 +253,29 @@ has to read off the boot rather than assume:
    them with, so **the corridor risk moves off rank 0 and onto ranks 1 and 2**
    -- #433 measured 7045 / 7109 MiB idle there, and matching spends it.
 
+   **Closed by #437.** Limit 2 above is no longer the state of the tree: the
+   gate now follows the vector the boot runs. A FIXED token vector (the plain
+   coupled default, an explicit `--rank-kv-ratio` pin) keeps the relative
+   base-plan pricing unchanged -- there the slack really does move with the
+   candidate. A MATCHED vector (`capacity`/`speed`, and the phase arms via
+   `_phase_solve_owns_kv_ratio`) is priced ABSOLUTELY instead: every rank's
+   predicted residual free VRAM must cover the derived reserve demand, on ALL
+   cards rather than only on the binding one, which is exactly the risk shift
+   this note predicted. The plan log states which basis it used, and when the
+   VRAM-auto split itself does not clear the demand it says so instead of
+   quietly installing nothing. #330's 400 MiB corridor is priced next to the
+   demand and REPORTED (`CORRIDOR-TIGHT`) rather than enforced -- #354's
+   `16,1,1` booted and served at 87 MiB free, so a candidate between the
+   demand and the corridor is a decision, not an error, and the operator is
+   now told before the boot rather than after.
+
+   Practical consequence for the confirmation arm below: at
+   `4500,2700,2700` the phase-prefill solve now refuses every candidate on
+   ranks 1 and 2 and says so, which is the same remedy this note's corridor
+   gate already prescribed ("the retry raises `--rank-auto-reserve-mib` on
+   those two cards"). Pin the reserve for all three cards above the derived
+   demand before the arm runs.
+
 ### Confirmation arm spec
 
 Same rig, same INT8-W8A8 checkpoint, same context and probes and transport as

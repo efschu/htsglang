@@ -52,9 +52,12 @@ WHAT THIS MODULE PROVIDES
    that names the first index at which the ranks stop agreeing, and on which
    field. Pure means it is testable without GPUs, without torch.distributed
    and without a model: hand it recorded sequences from anywhere.
-3. :func:`unproven_bar1_combination` -- the named refusal for the one
-   feature combination that is known to wedge and not yet understood
-   (#431 / #424 evidence), kept as a pure predicate for the same reason.
+3. :func:`bar1_fp8_uneven_dcp_notice` -- the named notice for the one feature
+   combination whose first boot is slow enough to be mistaken for a hang
+   (#431 / #424 / #431-recheck evidence), kept as a pure predicate for the
+   same reason. It was a hard refusal until the 2026-08-02 re-check measured
+   the arm completing; it is a warning now, with the refusal still reachable
+   on request.
 
 The recorder is deliberately transport-agnostic: it records ``(op, nbytes,
 path, rounds)``, which is the full input to the dispatch decision and the
@@ -77,7 +80,20 @@ DEFAULT_CAPACITY = 4096
 
 ENV_RECORD = "SGLANG_BARLINK_RECORD_DECISIONS"
 ENV_DUMP_DIR = "SGLANG_BARLINK_RECORD_DUMP_DIR"
+
+#: Pre-#431-recheck name. Its "1" meaning ("admit the arm") is now the
+#: default, so the variable is redundant in that direction -- but it is NOT a
+#: no-op: an explicit "0" still means what it always meant, "do not admit
+#: this arm", and now restores the hard refusal. See
+#: :func:`bar1_fp8_uneven_dcp_notice` for the full compatibility argument.
 ENV_ALLOW_FP8_UNEVEN_DCP_BAR1 = "SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1"
+
+#: The explicit force-off. "1" restores the pre-#431-recheck hard refusal for
+#: operators who want a boot-time error instead of a slow first boot; "0"
+#: states the default in the affirmative. Wins over the legacy variable.
+ENV_REFUSE_FP8_UNEVEN_DCP_BAR1 = "SGLANG_BARLINK_REFUSE_FP8_UNEVEN_DCP_BAR1"
+
+_FALSE_STRINGS = ("0", "false", "no", "off", "")
 
 #: File name a rank's dump lands in. The RANK, not the pid: the comparison is
 #: per rank and a pid says nothing about which rank wedged.
@@ -371,7 +387,8 @@ def load_dump_dir(
 
 
 # --------------------------------------------------------------------------
-# The named refusal (#431, belt and suspenders until the GPU proof lands)
+# The named notice (#431; a refusal until the 2026-08-02 re-check, a warning
+# since)
 # --------------------------------------------------------------------------
 def _is_fp8_weight_quant(quantization: Optional[str]) -> bool:
     """True for the fp8 WEIGHT quantizations, not for an fp8 KV cache.
@@ -391,42 +408,161 @@ def _is_fp8_weight_quant(quantization: Optional[str]) -> bool:
     return True
 
 
-def unproven_bar1_combination(
+#: Where the measurement that turned the refusal into a warning lives.
+RECHECK_EVIDENCE = "/spinning/gpu-battery-results/2026-08-02_431_recheck/RESULTS.md"
+#: The second, independent proof: #435's coupling window carried BOTH FP8
+#: layouts through real serving load over BAR1 with an uneven weighted DCP
+#: token vector -- nine ACHIEVED=bar1 lines per arm, full probe sets, and no
+#: Bar1CollectiveAborted / PeerLost / CollectiveTimeout in any log. The
+#: re-check above proves the boot completes; this one proves it serves.
+LOAD_EVIDENCE = "/spinning/gpu-battery-results/2026-08-02_435_coupling_fp8bar1/"
+
+
+@dataclass(frozen=True)
+class Bar1Fp8DcpNotice:
+    """What to do about the #431 combination, and what to say about it.
+
+    ``refuse``  raise instead of booting. False on the default path.
+    ``message`` the full text for the log line or the exception.
+    ``source``  what decided ``refuse`` -- "default", or the variable that
+                overrode it. Carried separately so a caller can act on the
+                decision without parsing the prose.
+    """
+
+    refuse: bool
+    message: str
+    source: str = "default"
+
+
+def _forced_refusal_from_env() -> tuple[Optional[bool], str]:
+    """``(force_refusal, what decided it)`` from the environment.
+
+    ``(None, "default")`` when neither variable is set.
+
+    THE COMPATIBILITY ARGUMENT, in one place because it is the only
+    surprising part of this module. Before the 2026-08-02 re-check the
+    combination was refused and :data:`ENV_ALLOW_FP8_UNEVEN_DCP_BAR1` was the
+    escape hatch: "1" admitted the arm, unset or "0" refused it. The re-check
+    measured the arm completing, so admitting it is now the default. Rather
+    than let the old variable rot into a no-op, its two values keep their
+    literal meanings and one of them now does the work:
+
+    * ``ALLOW=1`` -- "admit this arm". Still honoured, now redundant; the
+      notice says so instead of pretending the variable was consulted.
+    * ``ALLOW=0`` -- "do not admit this arm". Still honoured, and it is
+      exactly the old behaviour: a hard refusal at boot. A launch script that
+      pinned ``ALLOW=0`` therefore behaves identically before and after this
+      change.
+
+    :data:`ENV_REFUSE_FP8_UNEVEN_DCP_BAR1` is the same switch under a name
+    that reads correctly now that refusing is the non-default direction, and
+    it wins when both are set -- the explicit name beats the legacy one.
+    """
+    raw = os.environ.get(ENV_REFUSE_FP8_UNEVEN_DCP_BAR1)
+    if raw is not None:
+        forced = raw.strip().lower() not in _FALSE_STRINGS
+        return forced, f"{ENV_REFUSE_FP8_UNEVEN_DCP_BAR1}={raw!r}"
+    raw = os.environ.get(ENV_ALLOW_FP8_UNEVEN_DCP_BAR1)
+    if raw is not None:
+        allowed = raw.strip().lower() not in _FALSE_STRINGS
+        return (not allowed), f"legacy {ENV_ALLOW_FP8_UNEVEN_DCP_BAR1}={raw!r}"
+    return None, "default"
+
+
+def _slow_boot_warning(source: str) -> str:
+    legacy_note = ""
+    if source.startswith("legacy "):
+        legacy_note = (
+            f" Note: {source} is set. Admitting this combination is the "
+            f"default since the re-check, so that variable no longer changes "
+            f"anything in this direction; set "
+            f"{ENV_REFUSE_FP8_UNEVEN_DCP_BAR1}=1 if what you wanted was the "
+            f"old hard refusal."
+        )
+    return (
+        "barlink BAR1 transport + uneven WEIGHTED DCP + an fp8-quantized "
+        "checkpoint: this combination has a SLOW FIRST BOOT. It is not a "
+        "hang. On a cold JIT kernel cache the first CUDA-graph capture batch "
+        "spends roughly 190 s per rank inside the JIT cold-build window "
+        "(measured 184-197 s on three ranks concurrently), during which "
+        "deadline-bearing BAR1 collectives run on the 40x extended device "
+        "deadline and nothing appears to progress. The full capture pass took "
+        "4 min 58 s and the server reached READY 6 min 5 s after launch, then "
+        "served 176/176 requests with no aborted collective. Warm boots run "
+        "at normal speed. Do not kill the process during those windows -- "
+        "grep the server log for 'JIT cold-build window' to see them open and "
+        "close. This was a hard refusal until the arm was re-measured on the "
+        "tip carrying the BAR1 deadline fix (the launch sites now go through "
+        "resolve_timeout_cycles) and the loud abort (Bar1CollectiveAborted "
+        "via barlink_abort_gate); under the raw ~30 s cap the same windows "
+        "tripped the deadline about six times over and produced the crawl "
+        "#424 recorded as a wedge. A second window carried both fp8 layouts "
+        "through real serving load over the same transport, also clean. "
+        "Evidence: "
+        f"{RECHECK_EVIDENCE} (capture), {LOAD_EVIDENCE} (load) and "
+        "docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md."
+        f"{legacy_note} To refuse this combination at boot instead of warning, "
+        f"set {ENV_REFUSE_FP8_UNEVEN_DCP_BAR1}=1."
+    )
+
+
+def _forced_refusal_message(source: str) -> str:
+    return (
+        "barlink BAR1 transport + uneven WEIGHTED DCP + an fp8-quantized "
+        f"checkpoint is refused because {source} asked for it. This is no "
+        "longer the default: the arm was re-measured on the tip carrying the "
+        "BAR1 deadline fix and completed at the stock-NCCL twin's speed "
+        "(capture 12/12 in 4 min 58 s, READY after 6 min 5 s, 176/176 "
+        f"requests, no Bar1CollectiveAborted -- {RECHECK_EVIDENCE}). What "
+        "remains is a slow FIRST boot: roughly 190 s per rank in the initial "
+        "JIT cold-build window on a cold kernel cache. Unset "
+        f"{ENV_REFUSE_FP8_UNEVEN_DCP_BAR1} (and "
+        f"{ENV_ALLOW_FP8_UNEVEN_DCP_BAR1}, whose '0' means the same thing) to "
+        "get the warning instead. Alternatives that avoid the slow window "
+        "altogether: run over stock NCCL by unsetting the SGLANG_BARLINK* "
+        "block, or use the INT8-W8A8 checkpoint, which the #424 battery ran "
+        "over BAR1 with identical DCP settings without any of this."
+    )
+
+
+def bar1_fp8_uneven_dcp_notice(
     *,
     barlink_enabled: bool,
     transport: Optional[str],
     uneven_weighted_dcp: bool,
     quantization: Optional[str],
-    override: Optional[bool] = None,
-) -> Optional[str]:
-    """The refusal message for the combination #424 caught wedging, or ``None``.
+    force_refusal: Optional[bool] = None,
+) -> Optional[Bar1Fp8DcpNotice]:
+    """Notice for the #431 combination, or ``None`` if it is not in play.
 
-    Scope, stated narrowly on purpose: the SAME battery ran the INT8-W8A8
-    checkpoint over bar1 with uneven weighted DCP through both layouts and it
-    completed -- that arm is the fork's recommended INT8 operating point
-    (+18.6 %/+21.9 % prefill). Refusing bar1 for uneven DCP in general would
-    regress a measured, published configuration. Only the fp8-checkpoint arm
-    is refused, and only until the GPU repro in
-    ``scripts/repro_431_fp8_bar1_dcp.sh`` has a fix-proof attached.
+    Scope, stated narrowly on purpose and unchanged: the #424 battery ran the
+    INT8-W8A8 checkpoint over bar1 with uneven weighted DCP through both
+    layouts and it completed -- that arm is the fork's recommended INT8
+    operating point (+18.6 %/+21.9 % prefill). Nothing here touches any arm
+    that was measured to work.
 
-    STILL IN FORCE AFTER THE 2026-08-02 WINDOW. That window replaced the
-    hypothesis with a measurement (``docs/dev/ANALYSE_431_fp8_bar1_dcp_
-    deadlock.md``): the ranks' collective sequences are byte-identical, so
-    the dispatch-divergence theory is dead for this arm, and the wedge is
-    BAR1-internal -- roughly one collective per 30-40 s, matching the raw
-    cycle cap. Two code-level defects that reading exposed have since been
-    fixed (the BAR1 launch sites bypassed ``resolve_timeout_cycles``, so the
-    documented 40x cold-build extension never reached them; and a tripped
-    kernel wrote a status word no production path read). NEITHER lifts this
-    refusal: both were about how the failure is BOUNDED and REPORTED, not
-    about why the flag rendezvous is slow, and that root cause is still
-    unexplained. The refusal comes off when a GPU re-run of the fp8 arm --
-    with the extension in force and aborts loud -- either completes, or
-    fails with a named ``Bar1CollectiveAborted`` that identifies the
-    collective. Not before.
+    HISTORY, because the direction of this predicate has flipped once. #424
+    saw the fp8 arm wedge and this function refused it. The 2026-08-02 repro
+    window then showed the ranks' collective sequences byte-identical -- not
+    a dispatch divergence, a BAR1-internal crawl at ~30-40 s per collective,
+    which is the raw ``SGLANG_BARLINK_BAR1_CAP_CYCLES`` deadline -- and
+    exposed two defects: the BAR1 launch sites bypassed
+    ``resolve_timeout_cycles``, so the documented 40x JIT cold-build
+    extension never reached them, and a tripped kernel wrote a status word no
+    production path read. Both were fixed. The re-check on the fixed tip
+    (:data:`RECHECK_EVIDENCE`) then ran the same arm to completion at the
+    stock-NCCL twin's speed. So the crawl WAS the raw cap firing repeatedly
+    inside three ~190 s capture-warmup windows, outcome 1 of the three the
+    analysis listed, and the refusal became this warning.
 
-    ``override`` exists so the very window that has to reproduce the hang can
-    still boot the failing arm. Default is read from the environment.
+    What is still unmeasured, and why the notice is loud rather than absent:
+    the re-check ran with a warm ``extcache_docker``, so the BAR1 extension's
+    own build cost 0.1 s. A genuinely cold first boot adds that build on top
+    of the capture windows.
+
+    ``force_refusal`` restores the hard error. ``None`` reads the
+    environment; see :func:`_forced_refusal_from_env` for the two variables
+    and the backward-compatibility argument.
     """
     if not barlink_enabled:
         return None
@@ -436,36 +572,15 @@ def unproven_bar1_combination(
         return None
     if not _is_fp8_weight_quant(quantization):
         return None
-    if override is None:
-        override = os.environ.get(ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, "0") not in (
-            "0",
-            "",
-            "false",
-            "False",
+
+    if force_refusal is None:
+        forced, source = _forced_refusal_from_env()
+    else:
+        forced, source = force_refusal, "force_refusal argument"
+    if forced:
+        return Bar1Fp8DcpNotice(
+            refuse=True, message=_forced_refusal_message(source), source=source
         )
-    if override:
-        return None
-    return (
-        "barlink BAR1 + uneven WEIGHTED DCP + an fp8-quantized checkpoint is "
-        "refused: this combination wedged the prefill path in both measured "
-        "layouts (#424 battery, 2026-08-02, arms `fp8_decode` and "
-        "`fp8_prefill`; py-spy evidence in pyspy_fp8_decode_stall.txt / "
-        "pyspy_fp8_prefill_stall.txt). The same battery ran the INT8-W8A8 "
-        "checkpoint over BAR1 with identical DCP settings through both "
-        "layouts without a hang, and the fp8 checkpoint over stock NCCL "
-        "likewise -- so the refusal is scoped to exactly the arm that "
-        "failed, not to BAR1 and not to uneven DCP. The 2026-08-02 repro "
-        "window narrowed it further: the ranks' collective sequences are "
-        "byte-identical, so this is not a dispatch divergence but a "
-        "BAR1-internal crawl at ~30-40 s per collective. Two defects that "
-        "reading exposed are fixed (#431 fix 1: the BAR1 launch sites now go "
-        "through resolve_timeout_cycles, so the 40x JIT cold-build extension "
-        "finally reaches them; #431 fix 2: a tripped spin kernel now raises "
-        "Bar1CollectiveAborted with rank/op/rounds instead of continuing "
-        "silently over a partially written buffer). Neither addresses why "
-        "the flag rendezvous is slow, which is why this refusal stays until "
-        "a GPU re-run of this arm is on record. Take the run over stock "
-        "NCCL (unset the SGLANG_BARLINK* block) or use the INT8-W8A8 "
-        f"checkpoint. To reproduce the hang deliberately, set "
-        f"{ENV_ALLOW_FP8_UNEVEN_DCP_BAR1}=1."
+    return Bar1Fp8DcpNotice(
+        refuse=False, message=_slow_boot_warning(source), source=source
     )

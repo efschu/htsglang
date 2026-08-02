@@ -49,14 +49,15 @@ Exhaustive, not sampled:
 ## Summary counts
 
 Counted over the constants that survived filtering and are individually
-tabled below (grouped rows count once).
+tabled below (grouped rows count once). One row was added after the first
+pass (#437's corridor floor), which is why `POLICY` is 15 rather than 14.
 
 | verdict | count |
 | --- | --- |
 | `PROBE-FED` | 11 |
 | `STRUCTURAL` | 17 |
 | `RIG-FITTED` | **19** |
-| `POLICY` | 14 |
+| `POLICY` | 15 |
 | `UNKNOWN-PROVENANCE` | 1 |
 
 The 19 `RIG-FITTED` findings split into:
@@ -101,6 +102,7 @@ The 19 `RIG-FITTED` findings split into:
 | `_PREDICT_MAMBA_ACT_RESERVE_MIB` | `uneven_perf.py:186` | `1024` | Mirrors the engine's `MAMBA_AUTO_ACTIVATION_RESERVE_MIB`. | `STRUCTURAL` | Mirrors an engine constant; keep in sync. OK. |
 | `_PREDICT_MIN_RANK_TOKENS` | `uneven_perf.py:201` | `4096` | Below this the weighted-DCP owner rule degenerates (a rank must own ≥1 of every virtual block). | `STRUCTURAL` | An algorithmic floor of the owner rule, not a hardware measurement. OK. |
 | `_PREDICT_TOKEN_UNITS` | `uneven_perf.py:203` | `64` | Token-vector granularity of the weighted-DCP optimum. | `STRUCTURAL` | Grid step of the algorithm. OK. |
+| `planner_corridor_mib()` -> `registry.ledger.DEFAULT_CORRIDOR_BYTES` | `ledger.py:69`, read at `uneven_perf.py` | `400` MiB | #330's absolutely-free corridor: VRAM that must stay unallocated on every card after a boot. The planner's fundability gate prices it (#437). | `POLICY` | Added after this audit's first pass. Not a rig fit -- the same number on a 3080 and on a 5090, and a statement about how much room a boot must leave rather than a measurement of anything. One definition on the rig (`ledger.py:69`, #330), two named overrides: `--corridor-mib` on the ledger daemon and `SGLANG_PLANNER_CORRIDOR_MIB` for the planner. OK. |
 | `_PREDICT_GEMM_EFF` | `uneven_perf.py:206` | `0.6` | GEMM efficiency for converting probe TFLOPS to per-token prefill time. | `POLICY` | Comment states it "cancels in candidate ratios; kept for logging" — it does not affect ranking. OK. |
 | `_PREDICT_LINK_ALPHA` | `uneven_perf.py:209` | `0.25` | Exponent of the link-bandwidth penalty in the prefill score. | `UNKNOWN-PROVENANCE` | The comment states what it does, not where `0.25` came from. No fit, no measurement, no seam is cited anywhere in the file. FU-434-6. |
 | `_TP_DROP_LINK_FRACTION`, `_TP_DROP_FIT_FACTOR` | `uneven_perf.py:423,426` | `0.7`, `0.85` | Thresholds for recommending a GPU be dropped from the TP group. | `POLICY` | Advisory heuristics for a *recommendation*, expressed as fractions of this rig's own best link (i.e. relative, not absolute), so they transfer in form. No seam; low harm. |

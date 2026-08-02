@@ -49,6 +49,17 @@ VRAM-budget split, so the pool the runtime sizes is the one the admissibility
 gate accepted (#433 measured the gap: 125 504 vs a predicted 358 693 tokens).
 An explicit `--rank-kv-ratio` still wins; the hand-paired
 `--rank-mlp-ratio X + --rank-kv-ratio Y` of #354/#424 is no longer needed.
+**The fundability gate prices the vector the boot runs (#437).** A FIXED KV
+token vector keeps the relative base-plan pricing; a MATCHED one
+(`--rank-kv-ratio capacity|speed`, and the phase arms since #435) has no
+unused capacity to price, so every rank is checked ABSOLUTELY against the
+derived reserve demand on ALL cards. Before #437 `capacity` mode accepted
+16,1,1 at reserve 3000,2700,2700 -- #264's OOM config -- because it compared
+a matched residual against an identical matched base; the capacity-directed
+objective did not consult the gate at all. #330's 400 MiB corridor is priced
+alongside the demand and REPORTED (`CORRIDOR-TIGHT`), never binding
+(`SGLANG_PLANNER_CORRIDOR_MIB` overrides it; the number itself lives once in
+`registry/ledger.py`).
 `--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
 
@@ -204,11 +215,25 @@ pure `first_divergence` comparator — the standing instrument for the
 rank-local-condition-before-a-group-collective family (#94/#194/#312/#431).
 Off by default (`SGLANG_BARLINK_RECORD_DECISIONS=1`, optional per-rank
 on-disk dump via `SGLANG_BARLINK_RECORD_DUMP_DIR` for post-mortems on a
-wedged run). **Scoped refusal**: barlink BAR1 × uneven weighted DCP × an
-fp8-quantized checkpoint is refused at ModelRunner boot (#424 evidence;
-INT8-W8A8 over BAR1 and fp8 over NCCL are untouched). Override for the repro
-window: `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1=1`. See
-`docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md` — GPU proof still pending.
+wedged run). **Scoped slow-boot warning**: barlink BAR1 × uneven weighted DCP × an
+fp8-quantized checkpoint warns loudly at ModelRunner boot instead of refusing
+(#438a). What #424 recorded as a wedge is a slow FIRST boot: on a cold JIT
+kernel cache the first CUDA-graph capture batch spends ~190 s per rank
+(184-197 s, three ranks concurrently) inside the JIT cold-build window, and
+under the raw ~30 s BAR1 cap the peers' spin kernels tripped their deadline
+about six times over inside it — which is the "~30-40 s per collective"
+crawl. Two proofs, both 2026-08-02: capture (`.../2026-08-02_431_recheck/`,
+12/12 in 4:58, READY after 6:05, 176/176 requests, no
+`Bar1CollectiveAborted`) and full serving load
+(`.../2026-08-02_435_coupling_fp8bar1/`, both FP8 layouts, 9× `ACHIEVED=bar1`
+per arm, full probe sets, no abort/PeerLost/CollectiveTimeout in any log).
+Warm boots are normal speed. Restore the old hard refusal with
+`SGLANG_BARLINK_REFUSE_FP8_UNEVEN_DCP_BAR1=1`; the legacy
+`SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1` is kept and is not a no-op — `=0`
+still means "do not admit this arm" and still refuses, `=1` is still honoured
+but now redundant and says so. INT8-W8A8 over BAR1 and fp8 over NCCL remain
+untouched. See `docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md`. Still
+unmeasured: a boot from a genuinely empty `extcache_docker`.
 **BAR1 deadline + loud abort** (#431 fix slice): the three BAR1 kernel launch
 sites go through `resolve_timeout_cycles`, so the documented 40x JIT
 cold-build extension finally reaches the one transport whose kernels spin on

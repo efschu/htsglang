@@ -127,9 +127,20 @@ WARMUP = 10
 JOB_TTL_S = 3600.0
 
 #: Card locks, runbook §7.1 (v2: one lock per physical card + a quiet flag).
-LOCK_DIR_FMT = "/tmp/gpu-card-{}.lock"
-LEGACY_LOCK_DIR = "/tmp/gpu-owner.lock"
-QUIET_LOCK_DIR = "/tmp/gpu-quiet.lock"
+#:
+#: The production values are the rig-wide arbitration names and must stay
+#: exactly these -- five independent tools meet on them (see _CardWindow's
+#: docstring). ``HTSGLANG_CARD_LOCK_ROOT`` exists so a TEST can move the whole
+#: family somewhere disposable in one place: before it, redirecting the locks
+#: meant patching three module attributes by hand, and a test that forgot one
+#: created real debris under /tmp that the rig's arbitration then read as a
+#: live claim. The bash side of the same arbitration already had this seam
+#: (``BATTERY_LOCK_ROOT`` in scripts/gpu_battery/battery_common.sh); this is
+#: its Python counterpart, with the same default.
+CARD_LOCK_ROOT = os.environ.get("HTSGLANG_CARD_LOCK_ROOT", "/tmp")
+LOCK_DIR_FMT = os.path.join(CARD_LOCK_ROOT, "gpu-card-{}.lock")
+LEGACY_LOCK_DIR = os.path.join(CARD_LOCK_ROOT, "gpu-owner.lock")
+QUIET_LOCK_DIR = os.path.join(CARD_LOCK_ROOT, "gpu-quiet.lock")
 #: A quiet flag older than this is presumed stale (§7.1).
 QUIET_STALE_S = 15 * 60
 

@@ -147,10 +147,13 @@ proven** — section D of the repro script reads the abort word for exactly it.
 * `ModelRunner._refuse_unproven_bar1_dcp_combination` — the scoped, named
   refusal (BAR1 × uneven weighted DCP × fp8 checkpoint only), before any
   weight is loaded. Every arm #424 ran to completion still boots.
+  *Superseded: since the re-check below this is
+  `_check_bar1_fp8_uneven_dcp_combination` and it warns.*
 * `test/registered/unit/distributed/test_barlink_collective_uniformity_431.py`
   — 21 hermetic tests, including the structural falsifier that drives the
   **real** `_select` and `_handles_all_gather` per rank and shows the
-  bar1/gloo split-brain that unequal `nbytes` produces.
+  bar1/gloo split-brain that unequal `nbytes` produces. *31 after the
+  re-check rewrote the refusal tests into notice tests.*
 * `scripts/repro_431_fp8_bar1_dcp.sh` in the #424 battery dir — the four #424
   arms verbatim, with recording on and the refusal overridden.
 
@@ -274,3 +277,128 @@ BAR1=1`. Three outcomes, all diagnostic:
 
 Also worth collecting in the same run: `grep 'JIT cold-build window'` should
 now show matching open/close counts, and any mismatch is a real leak.
+
+---
+
+# Verdict: OUTCOME 1, and the refusal is now a warning (#438a)
+
+The re-check ran on 2026-08-02 14:34-14:48Z, tree `/spinning/wt-431-recheck`
+at `8a699e3eaf` (contains the fix-slice merge `10372e902e`). Artifacts:
+`/spinning/gpu-battery-results/2026-08-02_431_recheck/`, verdict in its
+`RESULTS.md`.
+
+**Outcome 1.** Arm A did not merely complete — it completed at the stock-NCCL
+twin's speed, and there was no `Bar1CollectiveAborted`, no `PeerLost` and no
+`CollectiveTimeout`. So it was never a deadlock; it is a slow first boot.
+
+| | #431 repro (`022fb3872b`) | re-check (`8a699e3eaf`) |
+|---|---|---|
+| target-verify capture | not past batch 0 of 12 after 22 min | 12/12 in 04:58 |
+| boot -> READY | never | 06:05 (`driver_A.log:4`) |
+| load window | never reached | `COMPLETED: ok=176 fail=0 waves=44` |
+| decision sequences | 103/95/94 `tp-0`, still growing | 28762 on all three ranks, identical, equal depth |
+
+The transport was genuinely BAR1 throughout — nine `ACHIEVED=bar1` lines,
+three ranks x three groups, in `gate_fp8_bar1_decode.txt`.
+
+## What the timing actually looks like
+
+`raw/server_fp8_bar1_decode.log` records 111 `JIT cold-build window` opens and
+111 closes, balanced, so fix 3's symmetric close line works and there is no
+leaked window. The close-duration histogram is
+`<1s: 93   1-10s: 15   10-60s: 0   >60s: 3`. The three long ones are **one per
+rank and concurrent**, not sequential: all three open at 14:38:01-14:38:13 on
+the first CUDA-graph capture batch and all three close together at 14:41:18.
+
+```
+[14:41:18 TP0] JIT cold-build window close (full cuda-graph capture warmup) after 197.1s
+[14:41:18 TP2] JIT cold-build window close (full cuda-graph capture warmup) after 184.4s
+[14:41:18 TP1] JIT cold-build window close (full cuda-graph capture warmup) after 184.4s
+```
+
+That single ~190 s stretch is the whole phenomenon: batch 1 of 12 took
+289 s (`04:49`), batch 2 took 1 s, and the pass finished in 4 min 58 s. One
+rank sits in a first-call kernel build while its peers wait inside a
+deadline-bearing BAR1 collective. Under the raw ~30 s cap a peer's spin kernel
+gives up roughly six times inside one such window, which is exactly the
+"~30-40 s per collective" crawl §4 measured and read as a wedge. With fix 1
+routing the launch sites through `resolve_timeout_cycles`, the deadline inside
+the window is ~20 minutes and the peers wait it out.
+
+§4 is therefore confirmed in its mechanism (the cap-cycle deadline was the
+binding constraint) and corrected in its conclusion (it is a timing artefact
+of the cold-build window, not a wedge). Outcome 2 was reachable and did not
+fire: the stall was in `run_capture_warmups`, which runs outside stream
+capture, so the per-collective `check_aborted` was live there and no kernel
+took its abort path.
+
+## Consequence, implemented
+
+`barlink_uniformity.unproven_bar1_combination` is replaced by
+`bar1_fp8_uneven_dcp_notice`, which returns a `Bar1Fp8DcpNotice` with a
+`refuse` flag instead of a refusal string. `ModelRunner` calls it from the
+same point in `initialize()` — before any weight is loaded, so the notice is
+on screen before the operator starts waiting — and now logs a warning where it
+used to raise. The message names the three axes, states that the first boot
+can spend ~190 s per rank in the JIT cold-build window, that this is not a
+hang, that warm boots are normal, and where the artifacts are.
+
+Overrides, with the compatibility argument stated once in
+`_forced_refusal_from_env`:
+
+* `SGLANG_BARLINK_REFUSE_FP8_UNEVEN_DCP_BAR1=1` restores the hard refusal.
+  This is the explicit force-off and the name that reads correctly now that
+  refusing is the non-default direction.
+* `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1` is kept and is not a no-op. Its
+  two values keep their literal meanings: `0` still means "do not admit this
+  arm" and still produces the hard refusal, so a launch script that pinned
+  `ALLOW=0` behaves identically before and after; `1` still means "admit this
+  arm", is still honoured, and the warning says in so many words that it no
+  longer changes anything in that direction.
+* The explicit name wins when both are set.
+
+## Second, independent proof: full serving load, both FP8 layouts
+
+The re-check above is a CAPTURE proof — it shows the boot completes. A second
+window on the same day carried the same combination through real serving load:
+`/spinning/gpu-battery-results/2026-08-02_435_coupling_fp8bar1/` (#435's
+coupling window, raw per-arm server logs in the same directory).
+
+Both FP8 layouts ran over barlink BAR1 with an uneven weighted DCP token
+vector and the `Qwen3.6-27B-FP8` checkpoint, launched with the (then still
+required) `SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1=1`
+(`scripts/run_rest.sh:25-32`):
+
+* `fp8_prefill_bar1` — `--rank-mlp-ratio 10,1,1 --rank-kv-ratio 2,11,10`,
+  reserve `4500,4200,4200`;
+* `fp8_decode_bar1` — `--rank-perf-tune phase-decode`, auto split.
+
+Read off those artifacts:
+
+* nine `ACHIEVED=bar1` lines per arm (three ranks x three groups) in
+  `gate_fp8_prefill_bar1.txt` and `gate_fp8_decode_bar1.txt` — the transport
+  was BAR1 for the whole run, not a silent fallback;
+* no `Bar1CollectiveAborted`, no `PeerLost` and no `CollectiveTimeout` in any
+  `.log` of the directory;
+* both arms completed their full probe sets (`bench_fp8_prefill_bar1.txt`,
+  `bench_fp8_decode_bar1.txt`) with the per-arm A-vs-A floors measured in the
+  same boots (`floor_fp8_*.log`).
+
+This is the evidence `barlink_uniformity.py` was written to wait for: not only
+does the arm boot, it serves. Capture proof plus load proof is what makes the
+refusal a warning rather than a hedge.
+
+## What is still unmeasured
+
+The re-check ran with a warm `extcache_docker`: the BAR1 extension's own build
+(`barlink_bar1_ext_cuda_86_120`) opened and closed in 0.1 s on all three
+ranks, so the boot was carried entirely by the capture-warmup windows. A boot
+from a genuinely empty kernel cache adds that build on top. This is why the
+notice is a loud warning rather than nothing at all.
+
+One reading caveat carried over from `RESULTS.md`: the driver's built-in
+`JIT VERDICT` line in `jit_fp8_bar1_decode.txt` claims no cold build ran and
+the cap was therefore not multiplied. The premise (no `.so` rewritten) is
+true and the inference is false — `run_capture_warmups` opens the window
+unconditionally, and the 111 logged windows settle it. Do not take that
+printed verdict at face value.

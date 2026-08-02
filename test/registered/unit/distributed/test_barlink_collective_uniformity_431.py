@@ -20,10 +20,13 @@ that into a desk-diagnosable, hermetic failure:
    (some ranks bar1, some gloo) that follows from it. No GPU, no
    torch.distributed, no transport is constructed.
 
-3. THE #431 REFUSAL. The scoped, named refusal for barlink BAR1 x uneven
-   weighted DCP x an fp8 checkpoint, including its can-fail direction: with
-   the override set -- i.e. with the refusal reverted -- the configuration is
-   admitted again and the recorded sequences diverge.
+3. THE #431 NOTICE. The scoped, named notice for barlink BAR1 x uneven
+   weighted DCP x an fp8 checkpoint. It was a hard refusal until the
+   2026-08-02 re-check measured that arm completing; it is a loud slow-boot
+   WARNING now, with the refusal still reachable on request. Both directions
+   are pinned here, including the can-fail ones: a test that goes red if the
+   warning stops being emitted, and a test that goes red if the force-off
+   stops raising.
 
 CPU only: nothing here allocates on a device or builds a process group.
 """
@@ -298,37 +301,79 @@ class TestRealPredicateSplitsOnRankLocalNbytes(CustomTestCase):
         self.assertIn("rounds", uniformity.first_divergence(seqs))
 
 
-class TestUnprovenCombinationRefusal(CustomTestCase):
-    """The #431 refusal predicate: scoped to the arm that actually failed."""
+class TestBar1Fp8UnevenDcpNotice(CustomTestCase):
+    """The #431 notice predicate: warns by default, refuses on request.
+
+    The direction of this predicate flipped once (#424 refusal -> #431
+    re-check warning), so every test here states which direction it pins and
+    why, and the two override variables are pinned by VALUE, not only by
+    presence -- the whole compatibility argument is that
+    `ALLOW=0` still refuses while `ALLOW=1` no longer decides anything.
+    """
 
     BASE = dict(
         barlink_enabled=True,
         transport="bar1",
         uneven_weighted_dcp=True,
         quantization="fp8",
-        override=False,
+        force_refusal=False,
     )
 
-    def test_the_failing_arm_is_refused_and_names_its_evidence(self):
-        msg = uniformity.unproven_bar1_combination(**self.BASE)
-        self.assertIsNotNone(msg)
-        self.assertIn("BAR1", msg)
-        self.assertIn("fp8", msg)
-        self.assertIn("#424", msg)
-        self.assertIn(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, msg)
+    def _clean_env(self, **extra):
+        """The two override variables removed unless a test sets them."""
+        from unittest import mock
+
+        env = dict(os.environ)
+        env.pop(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, None)
+        env.pop(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, None)
+        env.update(extra)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_the_measured_arm_warns_and_names_all_three_axes(self):
+        """Default direction: a notice, not a refusal, and a specific one.
+
+        A warning that does not name the combination is a warning the
+        operator cannot act on, so the three axes are asserted individually.
+        """
+        notice = uniformity.bar1_fp8_uneven_dcp_notice(**self.BASE)
+        self.assertIsNotNone(notice)
+        self.assertFalse(notice.refuse)
+        self.assertIn("BAR1", notice.message)
+        self.assertIn("uneven WEIGHTED DCP", notice.message)
+        self.assertIn("fp8", notice.message)
+
+    def test_the_warning_states_the_timing_and_where_the_evidence_is(self):
+        """CAN-FAIL #1 for the text: the numbers an operator waits on.
+
+        Goes red if the slow-boot text loses the per-rank window length, the
+        'not a hang' statement, the warm-boot statement, or the pointer to
+        the artifacts -- i.e. if the warning degrades back into a bare label.
+        """
+        notice = uniformity.bar1_fp8_uneven_dcp_notice(**self.BASE)
+        message = notice.message
+        self.assertIn("190 s", message)
+        self.assertIn("not a hang", message)
+        self.assertIn("Warm boots", message)
+        self.assertIn(uniformity.RECHECK_EVIDENCE, message)
+        self.assertIn("ANALYSE_431_fp8_bar1_dcp_deadlock.md", message)
+        self.assertIn(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, message)
 
     def test_modelopt_fp8_is_the_same_arm(self):
         for q in ("modelopt_fp8", "fbgemm_fp8", "FP8"):
-            self.assertIsNotNone(
-                uniformity.unproven_bar1_combination(
-                    **{**self.BASE, "quantization": q}
-                ),
-                q,
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "quantization": q}
             )
+            self.assertIsNotNone(notice, q)
+            self.assertFalse(notice.refuse, q)
 
-    def test_the_measured_good_arms_are_untouched(self):
-        """Every arm the #424 battery ran to completion must still boot."""
-        good = [
+    def test_the_other_arms_get_no_notice_at_all(self):
+        """Every arm outside the combination stays completely silent.
+
+        Unchanged from the refusal era: the scope was never BAR1 in general
+        or uneven DCP in general, and a warning on the recommended INT8 +
+        BAR1 operating point would be noise on a measured-good path.
+        """
+        quiet = [
             # INT8-W8A8 over BAR1 with the same DCP settings -- the fork's
             # recommended INT8 operating point.
             {"quantization": "w8a8_int8"},
@@ -343,32 +388,108 @@ class TestUnprovenCombinationRefusal(CustomTestCase):
             # Unquantized.
             {"quantization": None},
         ]
-        for delta in good:
+        for delta in quiet:
             with self.subTest(**delta):
                 self.assertIsNone(
-                    uniformity.unproven_bar1_combination(**{**self.BASE, **delta})
+                    uniformity.bar1_fp8_uneven_dcp_notice(**{**self.BASE, **delta})
                 )
 
-    def test_can_fail_direction_the_override_readmits_the_failing_arm(self):
-        """Revert the fix -> the arm boots again, and the sequences diverge.
+    def test_the_other_arms_stay_quiet_even_with_the_force_off_set(self):
+        """The force-off widens nothing. It only changes what happens to the
+        one combination that is already in scope."""
+        with self._clean_env(**{uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1: "1"}):
+            for delta in ({"quantization": "w8a8_int8"}, {"transport": "device"}):
+                with self.subTest(**delta):
+                    self.assertIsNone(
+                        uniformity.bar1_fp8_uneven_dcp_notice(
+                            **{**self.BASE, "force_refusal": None, **delta}
+                        )
+                    )
 
-        This is the honest can-fail proof the refusal needs: with the override
-        the guard is gone, and what the run then walks into is the split-brain
-        the falsifier above reproduces structurally.
-        """
-        self.assertIsNone(
-            uniformity.unproven_bar1_combination(**{**self.BASE, "override": True})
+    def test_force_refusal_argument_restores_the_hard_error_text(self):
+        notice = uniformity.bar1_fp8_uneven_dcp_notice(
+            **{**self.BASE, "force_refusal": True}
         )
+        self.assertTrue(notice.refuse)
+        self.assertIn("is refused", notice.message)
+        self.assertIn("force_refusal argument", notice.message)
+
+    def test_the_explicit_force_off_env_refuses(self):
+        with self._clean_env(**{uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1: "1"}):
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertTrue(notice.refuse)
+        self.assertIn(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, notice.source)
+
+    def test_the_force_off_env_set_to_zero_states_the_default(self):
+        with self._clean_env(**{uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1: "0"}):
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertFalse(notice.refuse)
+
+    def test_legacy_allow_zero_still_means_what_it_always_meant(self):
+        """Backward compatibility, the direction that matters.
+
+        A launch script pinning ALLOW=0 asked for 'do not admit this arm'.
+        That must still be a hard refusal, or the flip would have silently
+        turned an operator's opt-out into an opt-in.
+        """
+        with self._clean_env(**{uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1: "0"}):
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertTrue(notice.refuse)
+        self.assertIn(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, notice.source)
+
+    def test_legacy_allow_one_is_honoured_and_says_it_is_now_redundant(self):
+        """The other direction must not become a silent no-op.
+
+        ALLOW=1 still means 'admit this arm' and is still obeyed -- it just
+        no longer decides anything, and the notice says so rather than
+        letting the operator believe the variable is load-bearing.
+        """
+        with self._clean_env(**{uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1: "1"}):
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertFalse(notice.refuse)
+        self.assertIn(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, notice.message)
+        self.assertIn("no longer changes anything", notice.message)
+
+    def test_the_explicit_name_wins_over_the_legacy_one(self):
+        with self._clean_env(
+            **{
+                uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1: "0",
+                uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1: "0",
+            }
+        ):
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertFalse(notice.refuse)
+        self.assertIn(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, notice.source)
+
+    def test_neither_variable_set_is_the_warning(self):
+        with self._clean_env():
+            notice = uniformity.bar1_fp8_uneven_dcp_notice(
+                **{**self.BASE, "force_refusal": None}
+            )
+        self.assertFalse(notice.refuse)
+        self.assertEqual(notice.source, "default")
 
 
-class TestModelRunnerRefusalIsWired(CustomTestCase):
-    """The refusal is REACHED, not just written.
+class TestModelRunnerNoticeIsWired(CustomTestCase):
+    """The notice is REACHED, not just written.
 
     A predicate that no code path calls is a comment. This drives the real
-    `ModelRunner._refuse_unproven_bar1_dcp_combination` on a `__new__`
+    `ModelRunner._check_bar1_fp8_uneven_dcp_combination` on a `__new__`
     stand-in -- no CUDA, no weights, no process group -- so the wiring
     itself is executed at least once outside a GPU window.
     """
+
+    RUNNER_LOGGER = "sglang.srt.model_executor.model_runner"
 
     def _runner(self, quantization, uneven=True, dcp_size=3):
         from sglang.srt.model_executor.model_runner import ModelRunner
@@ -388,35 +509,60 @@ class TestModelRunnerRefusalIsWired(CustomTestCase):
         r.dcp_size = dcp_size
         return r
 
-    def test_failing_arm_raises_before_any_weight_is_loaded(self):
-        import os
+    def _env(self, **extra):
         from unittest import mock
 
-        env = {
-            "SGLANG_BARLINK": "1",
-            "SGLANG_BARLINK_TRANSPORT": "bar1",
-            uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1: "0",
-        }
-        with mock.patch.dict(os.environ, env, clear=False):
+        env = dict(os.environ)
+        env.pop(uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1, None)
+        env.pop(uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1, None)
+        env["SGLANG_BARLINK"] = "1"
+        env["SGLANG_BARLINK_TRANSPORT"] = "bar1"
+        env.update(extra)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_can_fail_the_arm_warns_on_the_real_logger_and_does_not_raise(self):
+        """CAN-FAIL #2: red if the warning stops being emitted.
+
+        `assertLogs` fails the test when no record arrives on that logger, so
+        deleting the `logger.warning(...)` call, downgrading it to INFO, or
+        making the predicate return `None` for this arm all turn this red.
+        The `assertNotIn` half is the other direction: booting must not be
+        blocked any more.
+        """
+        with self._env():
+            with self.assertLogs(self.RUNNER_LOGGER, level="WARNING") as caught:
+                self._runner("fp8")._check_bar1_fp8_uneven_dcp_combination()
+        joined = "\n".join(caught.output)
+        self.assertIn("SLOW FIRST BOOT", joined)
+        self.assertIn("190 s", joined)
+        self.assertNotIn("is refused", joined)
+
+    def test_can_fail_the_force_off_still_raises_before_any_weight_is_loaded(self):
+        """CAN-FAIL #3: red if the force-off stops refusing.
+
+        The operator escape hatch back to pre-#431-recheck behaviour. If the
+        override is ever dropped or inverted, no ValueError is raised here
+        and this goes red.
+        """
+        with self._env(**{uniformity.ENV_REFUSE_FP8_UNEVEN_DCP_BAR1: "1"}):
             with self.assertRaises(ValueError) as cm:
-                self._runner("fp8")._refuse_unproven_bar1_dcp_combination()
-            self.assertIn("#424", str(cm.exception))
+                self._runner("fp8")._check_bar1_fp8_uneven_dcp_combination()
+        self.assertIn("is refused", str(cm.exception))
 
-    def test_int8_arm_over_bar1_still_boots(self):
-        import os
-        from unittest import mock
+    def test_legacy_allow_zero_raises_exactly_as_it_used_to(self):
+        with self._env(**{uniformity.ENV_ALLOW_FP8_UNEVEN_DCP_BAR1: "0"}):
+            with self.assertRaises(ValueError):
+                self._runner("fp8")._check_bar1_fp8_uneven_dcp_combination()
 
-        env = {"SGLANG_BARLINK": "1", "SGLANG_BARLINK_TRANSPORT": "bar1"}
-        with mock.patch.dict(os.environ, env, clear=False):
-            self._runner("w8a8_int8")._refuse_unproven_bar1_dcp_combination()
+    def test_int8_arm_over_bar1_boots_without_a_word(self):
+        with self._env():
+            with self.assertNoLogs(self.RUNNER_LOGGER, level="WARNING"):
+                self._runner("w8a8_int8")._check_bar1_fp8_uneven_dcp_combination()
 
     def test_even_dcp_is_untouched(self):
-        import os
-        from unittest import mock
-
-        env = {"SGLANG_BARLINK": "1", "SGLANG_BARLINK_TRANSPORT": "bar1"}
-        with mock.patch.dict(os.environ, env, clear=False):
-            self._runner("fp8", dcp_size=1)._refuse_unproven_bar1_dcp_combination()
+        with self._env():
+            with self.assertNoLogs(self.RUNNER_LOGGER, level="WARNING"):
+                self._runner("fp8", dcp_size=1)._check_bar1_fp8_uneven_dcp_combination()
 
 
 if __name__ == "__main__":
