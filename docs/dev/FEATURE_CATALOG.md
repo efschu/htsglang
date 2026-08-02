@@ -22,7 +22,8 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
   shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
-  TP>kv_heads, replicated is the DEGRADED layout).
+  TP>kv_heads, replicated is the DEGRADED layout). LSE log base follows the
+  attention backend (FlashMLA = natural log).
 - **TPxPPxTP**: pipeline across rigs with per-stage TP groups. Slices 1+2
   merged (cross-rig PP=2 over 40G, full decode graphs on both stages incl.
   sm75). Slice 3 built (branch `feat/tpxppxtp-slice3-201`): world-MIN
@@ -151,6 +152,8 @@ underdetermined text can only report "different", never "wrong".
 torch order != NVML order on multi-vendor-generation rigs. The ONLY bridge is
 the IdentityMap (registry/nvml.py) keyed by UUID/PCI-BDF. Never feed a CUDA
 ordinal to NVML or vice versa; never key caches on the masked CUDA view.
+This also covers the custom-group object exchange: it names the world gloo
+cpu_group instead of letting torch pick a staging device.
 
 ## 12. Robustness canon
 Rank-local condition BEFORE any group collective (hang family); bounded waits
