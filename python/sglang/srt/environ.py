@@ -1535,6 +1535,12 @@ class Envs:
     # the whole sequence, the pre-#426 shape).
     SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK = EnvInt(8192)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    # Validate the non-negative-seq_len precondition of the DSV4 top-k
+    # wrappers (v1 and v2) before the launch. The check costs a device-to-host
+    # sync per call, so it is off on the serving path and meant for bring-up of
+    # a new producer of `seq_lens` (DP-idle companion rows, padded MTP rows).
+    # See #427 F2 and the docstrings in `sglang.jit_kernel.dsv4.topk`.
+    SGLANG_DSV4_CHECK_TOPK_SEQ_LENS = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
     # SWA radix cache

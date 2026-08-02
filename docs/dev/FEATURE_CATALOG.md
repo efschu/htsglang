@@ -161,7 +161,10 @@ with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real
 error); quant guards fail loudly instead of silently downgrading; JIT cache
 poisoning family (stale batons, foreign-worktree kernels, cold-JIT =
-capture-cost illusion).
+capture-cost illusion); reference-twin drift family (#418 #425 #427 -- a torch
+reference that disagrees with the kernel it validates, hidden by an oracle
+that compares only the region where they agree; fix the reference AND widen
+the comparison, and pin whether the reference is reachable from serving).
 
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
@@ -180,8 +183,9 @@ Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip),
 Llama family, Mistral Small 24B FP8 + ministral3 SWA fix, Deckard-40B/Tess-27B,
 122B-A10B offloaded, 35B-A3B, DeepSeek-V4-Flash-0731 GGUF TP=3 offloaded with
 OWN sm86+sm120 attention paths (e4m3 bit-decode, f32 staging, indexer arch
-dispatch, mask-oracle fix). Nemotron-Puzzle class structurally covered,
-unbooted.
+dispatch, torch/triton reference-twin parity: indexer mask oracle, SWA
+page-index wrap oracle, page-table rounding, top-k seq_len contract).
+Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure
 gpu-arb (UUID-based holder + heartbeat — stop the heartbeat BEFORE releasing),

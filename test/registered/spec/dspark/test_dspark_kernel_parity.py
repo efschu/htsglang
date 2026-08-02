@@ -185,11 +185,21 @@ def _case_causal_swa_page_indices(tc):
         got = cls.triton(seq_lens_casual=lens, **kw)
         tc.assertEqual(got.shape, ref.shape)
         tc.assertEqual(got.dtype, ref.dtype)
-        # Parity holds on the attended region; padding slots must be -1.
+        # Full-width equality, padding included. The earlier version of this
+        # check compared only the attended region and then asserted -1 on the
+        # triton side alone, which is exactly the region where the torch
+        # reference used to disagree (it indexed full_to_swa_mapping[-1] and
+        # got a real cache id back). Comparing the whole tensor is what makes
+        # this a parity test rather than a restatement of one side (#427 F1).
+        tc.assertTrue(torch.equal(got, ref))
+        # And the out-of-window columns really are -1 on BOTH sides.
         col = torch.arange(ref.shape[1], device=DEVICE).view(1, -1)
         attended = col < torch.clamp(lens, max=swa).view(-1, 1)
-        tc.assertTrue(torch.equal(got[attended], ref[attended]))
         tc.assertTrue(bool((got[~attended] == -1).all()))
+        tc.assertTrue(bool((ref[~attended] == -1).all()))
+        # Non-degenerate: some row must actually have an out-of-window column,
+        # otherwise the two assertions above are vacuous.
+        tc.assertTrue(bool((~attended).any()))
 
 
 def _case_commit_inject_layout(tc):

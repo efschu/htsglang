@@ -16,6 +16,24 @@ def _select_group_value(group, v0, v1, v2, v3):
 
 @triton.jit
 def _ceil_ue8m0_exp(x):
+    """Round a positive float32 up to the next power of two, as a ue8m0 byte.
+
+    This is one of the fork's two ue8m0 exponent encoders, and it is the
+    authoritative one for FP4 indexer scale factors. The other lives in
+    `quant_k_cache._quant_k_cache_fused_kernel` and encodes FP8 K-cache tile
+    scales through `ceil(log2(x)) + 127` with no clamp. They are deliberately
+    not unified (#427 F9): this one works on the float bit pattern, which is
+    exact and needs no libm, while the K-cache one needs `exp2(ceil_log2)` as
+    a float anyway to build the reciprocal it divides by, so folding it into
+    the bit form would buy nothing and would move bytes on a live serving path.
+
+    The clamp here is load-bearing at both ends and has no counterpart there:
+    an input of +inf/NaN would give exponent 255, and the `+= mantissa != 0`
+    ceiling step can carry 254 up to 255, so both are pulled back to 254; 0 is
+    excluded because a ue8m0 byte of 0 denotes a subnormal scale. The K-cache
+    encoder needs none of that: with an EPS floor of 1e-8 and a finite bf16
+    input its biased exponent stays inside [92, 248].
+    """
     bits = x.to(tl.int32, bitcast=True)
     exp = (bits >> 23) & 0xFF
     mantissa = bits & 0x7FFFFF

@@ -77,6 +77,15 @@ def _quant_k_cache_fused_kernel(
         )
         tl.store(k_nope_fp8_ptr + out_fp8_offsets, x_out)
 
+        # ue8m0 encoder #2 of two in the fork; the other is
+        # `fp4_indexer._ceil_ue8m0_exp`, which clamps to [1, 254]. Unclamped
+        # here on purpose (#427 F9): `scale` is `max(max_abs, EPS) / FP8_MAX`
+        # with EPS = 1e-8, so for any finite bf16 input the biased exponent
+        # lands in [92, 248] -- 1e-8/448 gives 92 and the largest finite bf16
+        # over 448 gives 247 (93 / 248 for the fnuz max of 240). A clamp would
+        # be dead code that hides a non-finite input instead of letting it
+        # surface. The two encoders are documented as separate rather than
+        # unified; see the docstring on `_ceil_ue8m0_exp` for why.
         exponent = ceil_log2.to(tl.int32)
         scale_uint8 = (exponent + 127).to(tl.uint8)
 
