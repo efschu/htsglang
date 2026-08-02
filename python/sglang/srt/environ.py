@@ -1041,6 +1041,35 @@ class Envs:
     # GEMM, same buffer size R+C, per-expert token sets unchanged). Frozen-after-
     # calibration => self-deterministic. Default False = static [0,R) (unchanged).
     SGLANG_MOE_HOT_RESIDENCY = EnvBool(False)
+    # #302a Stage-2 heat migration: keep re-ranking the resident set against a
+    # DECAYED window of live router traffic instead of freezing it once. Stage-1
+    # above improves the choice but keeps the one-shot shape; this reacts to a
+    # workload that drifts after calibration. Swaps are EQUAL-COUNT pairs, so
+    # residency size -- and every VRAM figure derived from it -- is unchanged.
+    # Eager offload path only (refused under SGLANG_MOE_OFFLOAD_CUDA_GRAPH: a
+    # captured gather's LUTs pin the layout). Default False = unchanged.
+    SGLANG_MOE_HEAT_MIGRATION = EnvBool(False)
+    # Forwards between two re-rank decisions, per layer. Small = re-ranks on
+    # noise and pays PCIe for it; large = tracks a drifting workload slowly.
+    SGLANG_MOE_HEAT_PERIOD = EnvInt(512)
+    # Decay multiplied into every expert's count at each round boundary.
+    # 1.0 = whole-run heat, 0.0 = only the last period counts.
+    SGLANG_MOE_HEAT_DECAY = EnvFloat(0.5)
+    # A candidate must be (1+x) times hotter than the victim it would displace.
+    # This is the anti-thrash term: without it a one-activation difference
+    # swaps back and forth every round.
+    SGLANG_MOE_HEAT_HYSTERESIS = EnvFloat(0.25)
+    # Absolute companion to the margin above, in observed activations. A purely
+    # relative margin is scale-free and churns on sampling noise down in the
+    # tail of the routing distribution, where "40 % hotter" is three
+    # activations. A swap costs two expert-row transfers; both conditions must
+    # hold before it is taken.
+    SGLANG_MOE_HEAT_MIN_GAIN = EnvFloat(8.0)
+    # Upper bound on swaps per layer per round; the burst is swaps x expert
+    # bytes and lands between two forwards.
+    SGLANG_MOE_HEAT_MAX_SWAPS = EnvInt(4)
+    # Minimum activations observed in a window before it is allowed to re-rank.
+    SGLANG_MOE_HEAT_MIN_OBS = EnvInt(32)
     # #286 offload register (DESIGN_201 Nachtrag-13 Erg. 7/7b/7c): enable the
     # generic VRAM item register's ADAPTERS (registration + size/access
     # bookkeeping at the item creation sites: capture rungs, drafter heads,

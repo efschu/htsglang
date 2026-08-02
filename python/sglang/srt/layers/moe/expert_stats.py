@@ -191,6 +191,7 @@ class LayerExpertStats:
         "unique_experts_total",
         "residency",
         "host_shard",
+        "heat_migration",
     )
 
     def __init__(
@@ -227,6 +228,10 @@ class LayerExpertStats:
         # path that never built a staging plan, which is how a dump says "this
         # question does not apply here" rather than implying an equal split.
         self.host_shard = None
+        # #302a: reference to the offload cache's HeatMigrationStats when
+        # dynamic heat migration is enabled, otherwise None. Held by attribute
+        # name for the same no-import-cycle reason as ``residency`` above.
+        self.heat_migration = None
 
     def record(
         self,
@@ -339,6 +344,9 @@ class LayerExpertStats:
                 )
                 if hasattr(residency, name)
             }
+        heat = self.heat_migration
+        if heat is not None:
+            out["heat_migration"] = heat.as_dict()
         return out
 
 
@@ -468,6 +476,15 @@ class ExpertStatsCollector:
         totals["remote_h2d_bytes"] = sum(
             entry.get("residency", {}).get("remote_h2d_bytes", 0) for entry in layers
         )
+        # #302a: the migration tally, summed the same way and for the same
+        # reason -- an A/B arm is read on "did the resident set actually move,
+        # and what did that cost in bytes", and neither question should require
+        # walking 43 layer entries. Absent entirely when no layer had migration
+        # enabled, so a dump never implies the feature ran with zero effect.
+        migrating = [e["heat_migration"] for e in layers if e.get("heat_migration")]
+        if migrating:
+            for name in ("rounds", "rounds_migrating", "swaps", "h2d_bytes", "d2h_bytes"):
+                totals[f"heat_{name}"] = sum(int(m.get(name, 0)) for m in migrating)
         return {
             "schema": "sglang.expert_stats/1",
             "reason": reason,
