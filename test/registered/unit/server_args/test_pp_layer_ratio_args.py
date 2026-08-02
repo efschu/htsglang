@@ -366,14 +366,87 @@ class TestPipelineRejectMatrix(PartitionEnvTestCase):
                 )
             )
 
-    def test_auto_ratio_is_refused_under_a_pipeline(self):
-        with self.assertRaisesRegex(ValueError, r"auto/auto-performance"):
+    def test_auto_ratio_divergent_stage_vectors_are_refused(self):
+        # #201 slice 3 item 4: plain 'auto' now derives PER-STAGE vectors.
+        # Stage 0 (32 GiB + 20 GiB) and stage 1 (20 GiB + 20 GiB) derive
+        # different vectors, and the ratio singleton is process-global ->
+        # refusal naming each stage's honest answer, never a silent even
+        # split (the #202 lesson).
+        with self.assertRaisesRegex(ValueError, r"DIFFERENT weight vectors"):
             run_uneven_tp(
                 make_args(
                     tp_size=2,
                     pp_size=2,
                     rank_tp_ratio="auto",
                     rank_gpu_id=[0, 1, 2, 3],
+                    rank_auto_reserve_mib="2048",
+                )
+            )
+
+    def test_auto_ratio_agreeing_stages_derive_budgets(self):
+        # tp_size 1 per stage: every stage vector is [1], the world-length
+        # budget list is derived from NVML totals minus the reserve --
+        # 'auto' now funds a pure-PP placement without hand-written
+        # --rank-gpu-memory-mib lists.
+        args = run_uneven_tp(
+            make_args(
+                tp_size=1,
+                pp_size=2,
+                rank_tp_ratio="auto",
+                rank_gpu_id=[1, 2],
+                rank_auto_reserve_mib="2048",
+            )
+        )
+        self.assertIsNone(args.rank_tp_ratio)
+        self.assertEqual(args.rank_gpu_memory_mib, [18432, 18432])
+
+    def test_auto_ratio_matching_hetero_stages_share_the_vector(self):
+        # Two structurally identical hetero stages (32 GiB + 20 GiB each)
+        # derive the SAME vector -> accepted, installed for both stages,
+        # and the budget list stays world-length.
+        four_gpus = {
+            0: (32768, 30000),
+            1: (20480, 19000),
+            2: (32768, 30000),
+            3: (20480, 19000),
+        }
+
+        def fake_query(gpu_ids):
+            return {g: four_gpus[g] for g in sorted(set(gpu_ids))}
+
+        with patch.object(server_args_module, "_query_rank_gpu_memory_mib", fake_query):
+            args = make_args(
+                tp_size=2,
+                pp_size=2,
+                rank_tp_ratio="auto",
+                rank_gpu_id=[0, 1, 2, 3],
+                rank_auto_reserve_mib="2048",
+            )
+            args._handle_uneven_tp()
+        self.assertEqual(args.rank_tp_ratio, [5, 3])
+        self.assertEqual(args.rank_gpu_memory_mib, [30720, 18432, 30720, 18432])
+
+    def test_auto_performance_stays_refused_under_a_pipeline(self):
+        with self.assertRaisesRegex(ValueError, r"auto-performance is not"):
+            run_uneven_tp(
+                make_args(
+                    tp_size=2,
+                    pp_size=2,
+                    rank_tp_ratio="auto-performance",
+                    rank_gpu_id=[0, 1, 2, 3],
+                    rank_auto_reserve_mib="2048",
+                )
+            )
+
+    def test_auto_ratio_needs_world_length_gpu_ids(self):
+        with self.assertRaisesRegex(ValueError, r"world-length"):
+            run_uneven_tp(
+                make_args(
+                    tp_size=2,
+                    pp_size=2,
+                    rank_tp_ratio="auto",
+                    rank_gpu_id=[0, 1],
+                    rank_auto_reserve_mib="2048",
                 )
             )
 

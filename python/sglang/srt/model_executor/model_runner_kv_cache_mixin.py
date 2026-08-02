@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -153,6 +154,15 @@ MAMBA_CEILING_FIT_MIN_KV_MIB = 256
 MAMBA_BUDGET_POST = (
     "mamba state pool + speculative intermediate state + prefill activation reserve"
 )
+
+#: State-slot count a pipeline stage WITHOUT any linear-attention layers in
+#: its layer window contributes to the world MIN-agreement on
+#: max_mamba_cache_size (#201 slice 3). Such a stage allocates zero state
+#: bytes, so its memory budget puts no bound on the slot count -- it must
+#: not be the rank that binds the world minimum. Large but far below
+#: int64 overflow territory for the downstream `size * per_req` products
+#: (its per_req is 0 by construction).
+PP_STAGE_NO_MAMBA_STATE_SLOTS = 1 << 30
 
 logger = logging.getLogger(__name__)
 
@@ -767,7 +777,18 @@ class ModelRunnerKVCacheMixin:
         # uneven_perf so writer and reader can never drift apart.
         from sglang.srt.uneven_perf import measured_kv_budget_cache_path
 
-        return measured_kv_budget_cache_path(self.server_args)
+        path = measured_kv_budget_cache_path(self.server_args)
+        if self.pp_size > 1:
+            # #201 slice 3 / #188 family: without this suffix BOTH stages'
+            # tp_rank-0 processes write the SAME record (the fingerprint is
+            # parse-time and knows no pp_rank), so the next boot sizes one
+            # stage from the other stage's measured leftover -- the exact
+            # "previous boot's leftover" trap, in cross-stage form. One
+            # record per stage; the launcher-side weight planner reads the
+            # UNSUFFIXED path and correctly stays cold under a pipeline.
+            root, ext = os.path.splitext(path)
+            path = f"{root}-stage{self.pp_rank}{ext}"
+        return path
 
     def _measured_safety_mib(self: ModelRunner) -> int:
         """This rank's configured safety margin (MiB). Scalar env value, or a
@@ -1355,16 +1376,29 @@ class ModelRunnerKVCacheMixin:
         my_correction = prev_b + delta_b
 
         world = get_world_group().world_size
-        payload = (self.tp_rank, int(my_correction), int(free_b), my_component)
+        # #201 slice 3: the gather spans the WORLD group; under a pipeline
+        # that is every stage, and two stages share the tp_rank index space.
+        # The payload therefore carries pp_rank and each stage's writer only
+        # folds in its OWN stage's entries -- without the filter, stage 1's
+        # balance silently overwrote stage 0's in the shared index (and the
+        # record itself is per-stage now, see _measured_kv_budget_cache_path).
+        payload = (
+            int(getattr(self, "pp_rank", 0) or 0),
+            self.tp_rank,
+            int(my_correction),
+            int(free_b),
+            my_component,
+        )
         gathered: list = [None] * world
         torch.distributed.all_gather_object(
             gathered, payload, group=get_world_group().cpu_group
         )
+        my_pp_rank = int(getattr(self, "pp_rank", 0) or 0)
         corrections = [0] * self.server_args.tp_size
         leftovers = [0] * self.server_args.tp_size
         components: list = [{}] * self.server_args.tp_size
-        for rank, corr, left, comp in gathered:
-            if 0 <= rank < self.server_args.tp_size:
+        for pp, rank, corr, left, comp in gathered:
+            if pp == my_pp_rank and 0 <= rank < self.server_args.tp_size:
                 corrections[rank] = corr
                 leftovers[rank] = left
                 components[rank] = comp
@@ -1471,8 +1505,20 @@ class ModelRunnerKVCacheMixin:
         (Mamba)RadixCache assume to be identical on every rank, so — like
         the KV token capacity — the ranks agree on the minimum. With
         budgets proportional to the head ratio the min is nearly lossless.
+
+        Under a pipeline (#201 slice 3) the same agreement is needed even
+        with uniform budgets: every stage sizes from its OWN free memory
+        and (stage-locally) its OWN linear-layer count, so the derived
+        request counts legitimately differ per stage -- while an admitted
+        request occupies one state slot on EVERY stage that holds linear
+        layers. A stage without linear layers contributes the
+        PP_STAGE_NO_MAMBA_STATE_SLOTS sentinel and never binds.
+
         No-op on the default path (byte-level MIN already unified it)."""
-        if not self.server_args.uneven_memory_budgets_active():
+        if not (
+            self.server_args.uneven_memory_budgets_active()
+            or getattr(self, "pp_size", 1) > 1
+        ):
             return
         if get_world_group().world_size <= 1:
             return
@@ -1488,6 +1534,45 @@ class ModelRunnerKVCacheMixin:
             self.server_args.override(
                 "mamba_pool.uneven_tp_min", max_mamba_cache_size=agreed
             )
+
+    def _stage_mamba_layer_counts(self: ModelRunner, config) -> Tuple[int, int]:
+        """(stage-local, global) linear-attention (GDN/Mamba) layer counts.
+
+        Under PP every pool CONSTRUCTION site already filters the layer list
+        to this stage's [start_layer, end_layer) window, so the state bytes
+        actually allocated are stage-local -- but the budget arithmetic in
+        handle_max_mamba_cache still counted every stage's layers (#201
+        slice 3 item 3; Teil 2 par. 6.2 defect 1). This helper is the single
+        source for the stage-local count. pp_size == 1 returns
+        (global, global), keeping every consumer byte-identical.
+        """
+        layers = config.mamba2_cache_params.layers
+        n_global = len(layers)
+        if self.pp_size <= 1:
+            return n_global, n_global
+        n_local = sum(
+            1 for lid in layers if self.start_layer <= lid < self.end_layer
+        )
+        return n_local, n_global
+
+    def _stage_local_mamba_cache_per_req(self: ModelRunner, config) -> int:
+        """Per-request linear-state bytes THIS STAGE actually allocates.
+
+        ``mamba_cache_per_req`` is (per-layer state bytes) x (GLOBAL layer
+        count) by construction (configs/mamba_utils.py), so the division
+        below is exact. Under PP the sizing must charge only the layers in
+        this stage's window; without this every stage budgeted the state of
+        ALL stages and under-dimensioned max_mamba_cache_size by roughly a
+        factor of pp_size. Returns 0 for a stage whose window holds no
+        linear layers -- its sizing branches then contribute the
+        PP_STAGE_NO_MAMBA_STATE_SLOTS sentinel to the world MIN instead of
+        dividing by zero. pp_size == 1: byte-identical global value.
+        """
+        per_req = config.mamba2_cache_params.mamba_cache_per_req
+        n_local, n_global = self._stage_mamba_layer_counts(config)
+        if n_local == n_global or n_global == 0:
+            return per_req
+        return (per_req // n_global) * n_local
 
     def _auto_mamba_demand_active(self: ModelRunner) -> bool:
         """Whether to size the mamba state pool by DEMAND (concurrency) rather
@@ -1651,6 +1736,21 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        # #201 slice 3: the per-request state bytes THIS rank's budget pays
+        # for. Identical to the global value at pp_size == 1 (byte-identical
+        # default path); under PP it counts only this stage's layer window,
+        # and is 0 for a stage without linear layers (the sizing branches
+        # then produce the PP_STAGE_NO_MAMBA_STATE_SLOTS sentinel and the
+        # world MIN-sync below replaces it with the real binding count).
+        # getattr: the non-PP arm must stay reachable from minimal runner
+        # stubs that predate pp_size (several unit suites drive this
+        # function directly).
+        if getattr(self, "pp_size", 1) > 1:
+            per_req = self._stage_local_mamba_cache_per_req(config)
+        else:
+            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert per_req > 0
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.override(
@@ -1667,7 +1767,7 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    per_req
                     * capped_reqs
                     # Max width: adaptive k-ladder rungs / the cross-algorithm
                     # secondary rung can exceed the boot shape's draft tokens.
@@ -1682,14 +1782,19 @@ class ModelRunnerKVCacheMixin:
             # manual --mamba-full-memory-ratio flag (the "self-determined +
             # optimal" requirement). See the module-level constants for the
             # rationale.
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
-            assert per_req > 0
             ratio = self._calculate_mamba_ratio()
             D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
             demand_size = self._auto_mamba_demand_size(ratio)
             # Never exceed what the post-weights budget can physically hold
             # (main state + spec-decode intermediate state per admitted req).
-            fit_cap = int(total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio)))
+            # A stage without linear layers (per_req == 0, PP only) holds no
+            # state bytes, so nothing needs fitting.
+            if per_req > 0:
+                fit_cap = int(
+                    total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio))
+                )
+            else:
+                fit_cap = demand_size
             size = min(demand_size, max(fit_cap, 0))
             reserve_gb = MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0
             # #307: fit_cap above ignores the activation reserve and leaves
@@ -1758,8 +1863,6 @@ class ModelRunnerKVCacheMixin:
             # per_req * size * (1 + D) bytes regardless of budget, which on
             # small per-rank budgets ate the whole KV headroom and surfaced
             # as a misleading "no memory for KV cache" error downstream.
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
-            assert per_req > 0
             requested_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
@@ -1773,7 +1876,12 @@ class ModelRunnerKVCacheMixin:
             # joint solve of the radix-enabled branch.
             ratio = self._calculate_mamba_ratio()
             D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
-            budget_size = int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
+            if per_req > 0:
+                budget_size = int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
+            else:
+                # PP stage without linear layers: no state bytes, no budget
+                # bound -- the world MIN-sync below carries the real bound.
+                budget_size = requested_size
             size = min(requested_size, budget_size)
             if size < requested_size:
                 logger.warning(
@@ -1803,9 +1911,6 @@ class ModelRunnerKVCacheMixin:
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
-
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
@@ -1824,8 +1929,10 @@ class ModelRunnerKVCacheMixin:
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    max_mamba_cache_size=(
+                        int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
+                        if per_req > 0
+                        else PP_STAGE_NO_MAMBA_STATE_SLOTS
                     ),
                 )
                 # Uneven TP: the size was derived from rank-local bytes /
@@ -1844,9 +1951,14 @@ class ModelRunnerKVCacheMixin:
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                    max_mamba_cache_size=(
+                        int(mamba_budget_bytes // per_req)
+                        if per_req > 0
+                        else PP_STAGE_NO_MAMBA_STATE_SLOTS
+                    ),
                 )
-                # Uneven TP: agree on the min across ranks (see above).
+                # Uneven TP / PP stages: agree on the min across ranks
+                # (see _sync_uneven_mamba_cache_size).
                 self._sync_uneven_mamba_cache_size()
 
         # Uneven TP (--rank-gpu-memory-mib): the ratio-based auto-sizing
@@ -1855,10 +1967,14 @@ class ModelRunnerKVCacheMixin:
         # each rank's head share, so proportional budgets give near-equal
         # counts). The schedulers run in lockstep and must agree on one
         # count — min-reduce it before anything consumes it.
+        # #201 slice 3: a pipeline needs the same agreement even with
+        # uniform budgets -- each stage sized from its own free memory and
+        # its own stage-local layer window, and every admitted request
+        # occupies a slot on every stage that holds linear layers.
         if (
             self.server_args.uneven_memory_budgets_active()
-            and get_world_group().world_size > 1
-        ):
+            or getattr(self, "pp_size", 1) > 1
+        ) and get_world_group().world_size > 1:
             tensor = torch.tensor(server_args.max_mamba_cache_size, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -1912,9 +2028,7 @@ class ModelRunnerKVCacheMixin:
                     _profiled,
                     _capped,
                     int(_resident_cap),
-                    (_profiled - _capped)
-                    * config.mamba2_cache_params.mamba_cache_per_req
-                    / (1 << 30),
+                    (_profiled - _capped) * per_req / (1 << 30),
                 )
                 server_args.override(
                     "mamba_pool.gdn_resident_state_slots",
@@ -1938,18 +2052,26 @@ class ModelRunnerKVCacheMixin:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"mamba_cache_per_req={per_req / (1 << 20):.2f} MB"
+                + (
+                    f" stage-local, {self._stage_mamba_layer_counts(config)[0]} of "
+                    f"{self._stage_mamba_layer_counts(config)[1]} linear layers on "
+                    f"pp_rank {self.pp_rank}"
+                    if getattr(self, "pp_size", 1) > 1
+                    else ""
+                )
+                + "). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
                 f"(4) use GPUs with more memory."
             )
 
-        mamba_state_memory = (
-            server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
-            / (1 << 30)
-        )
+        # Stage-local bytes: what THIS rank's pools will actually allocate
+        # (the construction sites filter to the stage window). Charging the
+        # global per-request bytes here would subtract other stages' state
+        # from this rank's KV budget (#201 slice 3 item 3).
+        mamba_state_memory = server_args.max_mamba_cache_size * per_req / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
@@ -4230,6 +4352,19 @@ class ModelRunnerKVCacheMixin:
             and get_world_group().world_size > 1
         )
         if needs_capacity_sync:
+            if self.pp_size > 1:
+                # #201 slice 3 (world-MIN by construction): apply every
+                # PER-RANK cap BEFORE the world reduce. The hybrid #79/#90
+                # ceilings are computed rank-locally; applied only after the
+                # reduce (the old order) a stage whose cap undercuts the
+                # agreed value would silently end below it -- stage 0 then
+                # admits tokens another stage's pool cannot hold. With the
+                # caps folded in first, the MIN below is the final word and
+                # the post-reduce re-application is a no-op. pp_size == 1
+                # keeps the stock order byte-identically.
+                token_capacity = self._apply_hybrid_kv_token_cap(
+                    token_capacity, hybrid_cap, hybrid_cap_kind
+                )
             local_capacity = int(token_capacity)
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
@@ -4265,7 +4400,48 @@ class ModelRunnerKVCacheMixin:
         token_capacity = self._apply_hybrid_kv_token_cap(
             token_capacity, hybrid_cap, hybrid_cap_kind
         )
+        if self.pp_size > 1:
+            self._assert_pp_world_kv_capacity_agreement(int(token_capacity))
         return token_capacity
+
+    def _assert_pp_world_kv_capacity_agreement(
+        self: ModelRunner, token_capacity: int
+    ) -> None:
+        """Prove -- do not assume -- that every rank of the pipeline world
+        resolved the SAME token capacity (#201 slice 3).
+
+        max_total_num_tokens is the admission currency: a request's tokens
+        occupy KV on EVERY stage (each in its own layers), so the ceiling is
+        only meaningful as a world minimum. The reduce above establishes it;
+        this check makes any future rank-local adjustment AFTER the reduce
+        (a re-ordered cap, a new clamp) fail the boot loudly instead of
+        letting stage 0 admit tokens another stage cannot hold.
+
+        Collective discipline: gated on pp_size (world-uniform by
+        construction) and world_size only -- every rank participates in the
+        gather or none does.
+        """
+        if get_world_group().world_size <= 1:
+            return
+        gathered: list = [None] * get_world_group().world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (int(self.pp_rank), int(self.tp_rank), int(token_capacity)),
+            group=get_world_group().cpu_group,
+        )
+        distinct = {cap for (_, _, cap) in gathered}
+        if len(distinct) > 1:
+            per_rank = ", ".join(
+                f"pp{pp}/tp{tp}={cap}" for (pp, tp, cap) in sorted(gathered)
+            )
+            raise RuntimeError(
+                "Pipeline KV world agreement violated: the stages resolved "
+                f"different max_total_num_tokens ({per_rank}). Admission "
+                "would follow stage 0 while another stage's pool is smaller "
+                "-- a guaranteed overflow. This means a rank-local cap or "
+                "clamp ran AFTER the world MIN-reduce; fold it in before "
+                "the reduce (see _apply_token_constraints)."
+            )
 
     #: Weight families the self-calibration can shift, mapped to the
     #: environment variable of the restart hint. "mlp" = dense-MLP /
@@ -4602,7 +4778,6 @@ class ModelRunnerKVCacheMixin:
         an early return on the local value would let one rank skip the
         collective the others entered (distributed hang)."""
         from sglang.srt.distributed.utils import (
-            cp_token_split_factor,
             get_cp_token_ratios,
             partition_units,
             uneven_dcp_active,

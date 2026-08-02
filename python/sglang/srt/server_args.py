@@ -1381,6 +1381,26 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    pp_stage_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Relative capability scores per pipeline stage, one entry "
+            "per stage in stage order (analogous to --rank-tp-ratio, but "
+            "across stages) -- e.g. --pp-size 2 --pp-stage-ratio 3,1 for a "
+            "stage-0 card set about 3x as capable as stage 1's. The layer "
+            "split is DERIVED from the scores instead of being spelled out "
+            "as --pp-layer-ratio. For hybrid linear+full-attention models "
+            "the derivation is full-attention-aware: a hybrid splits its "
+            "KV after FULL-ATTENTION layers, not after layers (#201 "
+            "slice 2 finding), so stage boundaries are snapped to give "
+            "each stage its score-proportional share of BOTH axes. "
+            "Mutually exclusive with --pp-layer-ratio. Refuses (never a "
+            "silent even split) when the model depth or layer kinds "
+            "cannot be read, or when a hybrid stage would end with zero "
+            "full-attention layers.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -8811,23 +8831,28 @@ class ServerArgs:
         a fixed reserve (shared between co-located ranks); the weights are
         the gcd-reduced budgets — capacity is maximized when each rank's
         share of every sharded dimension is proportional to its memory
-        budget. Explicit integer weights keep working unchanged."""
+        budget. Explicit integer weights keep working unchanged.
+
+        Under a pipeline (#201 slice 3 item 4) the budgets are derived for
+        every WORLD rank (the per-stage memory lists slice 1 introduced),
+        and the weight vector is derived PER STAGE from that stage's
+        budget slice. --rank-tp-ratio is a process-global singleton that
+        every stage installs identically, so the derived stage vectors
+        must AGREE; if the stage card groups would need different vectors,
+        the boot refuses and names each stage's honest answer instead of
+        silently splitting evenly (the #202 lesson). Per-stage vector
+        installation (keyed by pp_rank in configure_scheduler_process) is
+        the named follow-up that lifts this refusal.
+        """
         if self.rank_gpu_id is None:
             raise ValueError("--rank-tp-ratio auto requires --rank-gpu-id.")
-        if self.pp_size > 1:
-            # The auto planner derives ONE weight vector from the whole card
-            # set named by --rank-gpu-id. Under a pipeline that set spans
-            # every stage, so the derived vector is world-length while
-            # --rank-tp-ratio must be tp_size long, and the per-stage weights
-            # would have to come from a per-stage capacity model that does not
-            # exist yet (#201 slice 3). Explicit vectors only.
+        if self.pp_size > 1 and len(self.rank_gpu_id) != self.pp_size * self.tp_size:
             raise ValueError(
-                "--rank-tp-ratio auto/auto-performance is not available "
-                f"under --pp-size > 1 (current: {self.pp_size}): the planner "
-                "derives a single weight vector from all cards in "
-                "--rank-gpu-id, which under a pipeline spans every stage. "
-                "Pass an explicit per-stage ratio vector of length "
-                f"--tp-size ({self.tp_size})."
+                "--rank-tp-ratio auto with --pp-size > 1 needs a world-length "
+                f"--rank-gpu-id ({self.pp_size} x {self.tp_size} = "
+                f"{self.pp_size * self.tp_size} entries, world-rank order "
+                "pp_rank * tp_size + tp_rank); got "
+                f"{len(self.rank_gpu_id)} entries."
             )
 
         if self.rank_gpu_memory_mib is None:
@@ -8951,8 +8976,58 @@ class ServerArgs:
         budgets = (
             list(self.rank_gpu_memory_mib)
             if isinstance(self.rank_gpu_memory_mib, list)
-            else [self.rank_gpu_memory_mib] * self.tp_size
+            else [self.rank_gpu_memory_mib] * self.tp_size * self.pp_size
         )
+        if self.pp_size > 1:
+            # Per-stage derivation: each stage's TP group shards by its own
+            # budget slice. The vectors must agree because the ratio
+            # singleton is installed identically in every scheduler process.
+            stage_vectors = []
+            for stage in range(self.pp_size):
+                stage_budgets = budgets[
+                    stage * self.tp_size : (stage + 1) * self.tp_size
+                ]
+                g = math.gcd(*stage_budgets)
+                stage_vectors.append([b // g for b in stage_budgets])
+            if any(vec != stage_vectors[0] for vec in stage_vectors[1:]):
+                per_stage = "; ".join(
+                    f"stage {s}: cards {budgets[s * self.tp_size:(s + 1) * self.tp_size]} "
+                    f"MiB -> {vec}"
+                    for s, vec in enumerate(stage_vectors)
+                )
+                raise ValueError(
+                    "--rank-tp-ratio auto under --pp-size > 1: the stages' "
+                    f"card groups derive DIFFERENT weight vectors ({per_stage}). "
+                    "The TP partition ratio is installed process-globally, so "
+                    "all stages must shard by the same vector; per-stage "
+                    "vectors are the #201 follow-up. Pass an explicit "
+                    f"--rank-tp-ratio of length --tp-size ({self.tp_size}) "
+                    "as the compromise for all stages, or regroup the cards "
+                    "so the stages match."
+                )
+            weights = stage_vectors[0]
+            if len(set(weights)) == 1:
+                logger.info(
+                    "--rank-tp-ratio auto (pipeline): every stage's budgets "
+                    "are uniform within the stage, using the classic even "
+                    "split per stage (per-stage budgets stay as derived: "
+                    "%s MiB).",
+                    budgets,
+                )
+                # Keep the WORLD-length budget list: stages legitimately
+                # carry different budgets (layer windows differ), only the
+                # within-stage ratio collapsed.
+                self.rank_tp_ratio = None
+                self.rank_gpu_memory_mib = budgets
+                return
+            self.rank_tp_ratio = weights
+            logger.info(
+                "--rank-tp-ratio auto (pipeline): derived the shared stage "
+                "vector %s from per-stage budgets %s MiB.",
+                weights,
+                budgets,
+            )
+            return
         g = math.gcd(*budgets)
         weights = [b // g for b in budgets]
         if len(set(weights)) == 1:
@@ -9004,6 +9079,11 @@ class ServerArgs:
             budgets = self.rank_gpu_memory_mib
             if isinstance(budgets, int):
                 budgets = [budgets] * self.tp_size
+            elif self.pp_size > 1 and len(budgets) == self.pp_size * self.tp_size:
+                # Pipeline: the vector is per stage (all stages agree by the
+                # gate in _resolve_auto_rank_tp_ratio); stage 0's budget
+                # slice is representative for this diagnostic line.
+                budgets = budgets[: self.tp_size]
             inputs = PlanInputs.from_server_args(self)
             # For a GGUF checkpoint the parse-time config is synthesized from
             # the GGUF KV block, which does not carry every geometry key the
@@ -9141,6 +9221,19 @@ class ServerArgs:
         # (decode is flat across splits — M22 — so attention/GDN/KV splits
         # are not performance levers) and then derives a dense-MLP family
         # vector from the measured hardware profile on top.
+        if ratio_was_perf and self.pp_size > 1:
+            # #201 slice 3 opens plain 'auto' for pipelines (per-stage budget
+            # derivation with an agreement gate); the measured-profile ladder
+            # is still a single-group planner. Refusal by name, never a
+            # silent fallback to plain auto.
+            raise ValueError(
+                "--rank-tp-ratio auto-performance is not available under "
+                f"--pp-size > 1 (current: {self.pp_size}): the measured "
+                "hardware ladder plans one TP group, not per-stage groups. "
+                "Use --rank-tp-ratio auto (per-stage VRAM derivation with "
+                "an agreement gate) or an explicit vector of length "
+                f"--tp-size ({self.tp_size})."
+            )
         if ratio_was_auto:
             self._resolve_auto_rank_tp_ratio()
         if ratio_was_perf:
@@ -12409,6 +12502,7 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+        self._handle_pp_stage_ratio()
         self._handle_pp_layer_ratio()
 
     #: Config keys that carry a model's backbone depth, in probe order.
@@ -12456,6 +12550,109 @@ class ServerArgs:
             )
         except OSError:  # pragma: no cover - advisory only
             return False
+
+    def declared_layer_kinds(self) -> Optional[List[bool]]:
+        """Per-layer full-attention markers as ``config.json`` declares them,
+        or None when they cannot be read here.
+
+        Sources, in probe order (mirroring configs/qwen3_next.py:
+        layers_block_type and configs/model_config.py):
+          * an explicit ``layer_types`` / ``layers_block_type`` list
+            ("full_attention" marks the KV-bearing layers);
+          * ``full_attention_interval`` (Qwen3.5/3.6 GDN hybrids: every
+            interval-th layer, 1-based, is full attention);
+          * neither present: a homogeneous all-attention model -- every
+            layer True.
+        Advisory like declared_num_hidden_layers: the loader-authoritative
+        depth check stays in get_pp_indices.
+        """
+        depth = self.declared_num_hidden_layers()
+        if depth is None:
+            return None
+        model_path = getattr(self, "model_path", None)
+        cfg_path = os.path.join(model_path, "config.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:  # pragma: no cover - advisory only
+            return None
+        text_cfg = cfg.get("text_config") or {}
+
+        def probe(key):
+            value = cfg.get(key)
+            return value if value is not None else text_cfg.get(key)
+
+        for key in ("layer_types", "layers_block_type"):
+            kinds = probe(key)
+            if isinstance(kinds, list) and len(kinds) == depth:
+                return [k == "full_attention" for k in kinds]
+        interval = probe("full_attention_interval")
+        if isinstance(interval, int) and interval > 0:
+            return [(i + 1) % interval == 0 for i in range(depth)]
+        return [True] * depth
+
+    def _handle_pp_stage_ratio(self):
+        """--pp-stage-ratio: derive the uneven layer split from per-stage
+        capability scores (#201 slice 3 item 2).
+
+        Materializes ``pp_layer_ratio`` and lets _handle_pp_layer_ratio do
+        the rest (validation against the declared depth, the
+        SGLANG_PP_LAYER_PARTITION export, the conflict matrix). Refusal
+        over a silent even split throughout -- the #202 lesson.
+        """
+        scores = self.pp_stage_ratio
+        if scores is None:
+            return
+
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--pp-stage-ratio scores pipeline stages, but --pp-size is "
+                f"{self.pp_size} (no pipeline). Set --pp-size to the number "
+                "of stages, or drop the flag."
+            )
+        if len(scores) != self.pp_size:
+            raise ValueError(
+                f"--pp-stage-ratio length ({len(scores)}) must equal "
+                f"--pp-size ({self.pp_size}): one score per stage."
+            )
+        if self.pp_layer_ratio is not None:
+            raise ValueError(
+                "--pp-stage-ratio derives the layer split that "
+                "--pp-layer-ratio spells out explicitly. Pass one of the "
+                "two, not both."
+            )
+
+        depth = self.declared_num_hidden_layers()
+        if depth is None:
+            raise ValueError(
+                "--pp-stage-ratio cannot derive a layer split: the model's "
+                f"hidden layer count is not readable from {self.model_path} "
+                "(no config.json depth). Pass --pp-layer-ratio explicitly."
+            )
+        kinds = self.declared_layer_kinds()
+        if kinds is None:
+            kinds = [True] * depth
+
+        from sglang.srt.distributed.utils import derive_pp_layer_split
+
+        counts = derive_pp_layer_split(scores, is_full_attention=kinds)
+        n_full = sum(kinds)
+        per_stage_full = []
+        start = 0
+        for count in counts:
+            per_stage_full.append(sum(1 for k in kinds[start : start + count] if k))
+            start += count
+        self.pp_layer_ratio = counts
+        logger.info(
+            "--pp-stage-ratio %s: derived --pp-layer-ratio %s over %d layers "
+            "(full-attention per stage: %s of %d total -- a hybrid's KV mass "
+            "follows the full-attention count, not the layer count).",
+            ",".join(str(s) for s in scores),
+            ",".join(str(c) for c in counts),
+            depth,
+            per_stage_full,
+            n_full,
+        )
 
     def _handle_pp_layer_ratio(self):
         """--pp-layer-ratio: uneven layer split across pipeline stages.

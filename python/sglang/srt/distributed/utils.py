@@ -15,7 +15,7 @@ import pickle
 import time
 from collections import deque
 from contextlib import contextmanager
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.distributed import TCPStore
@@ -1420,6 +1420,111 @@ def get_pp_indices(
             end_layer = start_layer + base_layers
 
     return (start_layer, end_layer)
+
+
+def derive_pp_layer_split(
+    scores: List[int],
+    is_full_attention: Optional[List[bool]] = None,
+    num_hidden_layers: Optional[int] = None,
+) -> List[int]:
+    """Derive per-stage layer counts from per-stage capability scores
+    (#201 slice 3 item 2, the --pp-stage-ratio planner).
+
+    ``scores`` are relative per-stage weights (analogous to
+    --rank-tp-ratio, but across pipeline stages). The split is contiguous
+    (stage boundaries only), like SGLANG_PP_LAYER_PARTITION itself.
+
+    Hybrid awareness (the slice-2 finding, DESIGN_201 par. 13d): a hybrid
+    linear+full-attention model splits its KV after FULL-ATTENTION layers,
+    not after layers -- a planner reading num_hidden_layers alone mis-sizes
+    every hybrid. When ``is_full_attention`` marks a genuine hybrid
+    (0 < full < all), each boundary is first targeted proportionally in
+    LAYER space (compute tracks all layers) and then snapped into the
+    layer range that puts the score-proportional number of FULL-ATTENTION
+    layers on each side (KV mass tracks the scores too). For homogeneous
+    models the snap window is the whole axis and the split is the plain
+    proportional rounding.
+
+    Refusals (never a silent even split -- the #202 lesson):
+      * fewer layers than stages;
+      * a hybrid stage that would end with ZERO full-attention layers
+        (its KV pool would be empty; give the stage a larger score or use
+        fewer stages).
+    """
+    if is_full_attention is not None:
+        n_layers = len(is_full_attention)
+        if num_hidden_layers is not None and num_hidden_layers != n_layers:
+            raise ValueError(
+                f"derive_pp_layer_split: num_hidden_layers={num_hidden_layers} "
+                f"disagrees with len(is_full_attention)={n_layers}."
+            )
+    elif num_hidden_layers is not None:
+        n_layers = num_hidden_layers
+        is_full_attention = [True] * n_layers
+    else:
+        raise ValueError(
+            "derive_pp_layer_split needs is_full_attention or num_hidden_layers."
+        )
+    n_stages = len(scores)
+    if n_stages < 1 or any((not isinstance(s, int)) or s < 1 for s in scores):
+        raise ValueError(
+            f"--pp-stage-ratio entries must be positive integers, got {scores}."
+        )
+    if n_layers < n_stages:
+        raise ValueError(
+            f"--pp-stage-ratio: {n_stages} stages cannot split "
+            f"{n_layers} layers (every stage needs at least one)."
+        )
+    total_score = sum(scores)
+    full_positions = [i for i, f in enumerate(is_full_attention) if f]
+    n_full = len(full_positions)
+    hybrid = 0 < n_full < n_layers
+
+    bounds: List[int] = []
+    prev = 0
+    cum_score = 0
+    for i in range(n_stages - 1):
+        cum_score += scores[i]
+        target_layers = round(n_layers * cum_score / total_score)
+        if hybrid:
+            target_full = round(n_full * cum_score / total_score)
+            target_full = min(max(target_full, 0), n_full)
+            # All boundaries b with exactly target_full full-attention
+            # layers in [0, b): the window between the target_full-th and
+            # the following full-attention position.
+            lo = full_positions[target_full - 1] + 1 if target_full >= 1 else 0
+            hi = full_positions[target_full] if target_full < n_full else n_layers
+            boundary = min(max(target_layers, lo), hi)
+        else:
+            boundary = target_layers
+        # Contiguity floor/ceiling: at least one layer per stage on both
+        # sides of every boundary.
+        boundary = min(max(boundary, prev + 1), n_layers - (n_stages - 1 - i))
+        bounds.append(boundary)
+        prev = boundary
+    bounds.append(n_layers)
+
+    counts = [bounds[0]] + [bounds[i] - bounds[i - 1] for i in range(1, n_stages)]
+    if hybrid:
+        per_stage_full = []
+        start = 0
+        for count in counts:
+            per_stage_full.append(
+                sum(1 for p in full_positions if start <= p < start + count)
+            )
+            start += count
+        if any(f == 0 for f in per_stage_full):
+            zero_stage = per_stage_full.index(0)
+            raise ValueError(
+                f"--pp-stage-ratio {scores}: the derived split {counts} gives "
+                f"stage {zero_stage} zero of the model's {n_full} "
+                f"full-attention layers -- its KV pool would be empty. A "
+                f"hybrid model splits its KV after FULL-ATTENTION layers "
+                f"(#201 slice 2 finding); give stage {zero_stage} a larger "
+                f"score, use fewer stages, or pass --pp-layer-ratio "
+                f"explicitly."
+            )
+    return counts
 
 
 @dataclasses.dataclass

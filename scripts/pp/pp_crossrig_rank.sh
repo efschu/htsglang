@@ -49,6 +49,10 @@ ATTN_SECOND=${ATTN_SECOND:-triton}
 
 export SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1
 export SGLANG_PP_BOUNDARY_STATS=$BOUNDARY_STATS
+# #201 slice 3: metadata shape cache at the stage boundary. Must be set to
+# the SAME value on BOTH nodes (the wire format differs with it); this
+# script pins it explicitly on every rank for exactly that reason.
+export SGLANG_PP_SHAPE_CACHE=${SGLANG_PP_SHAPE_CACHE:-0}
 export SGLANG_MAMBA_SSM_DTYPE=${SGLANG_MAMBA_SSM_DTYPE:-float32}
 export TORCHDYNAMO_DISABLE=1
 export MAX_JOBS=4
@@ -94,7 +98,10 @@ if [ "$SIDE" = main ]; then
   export CPATH=$CUDA_HOME/include:${CPATH:-}
   PY=/spinning/miniforge3_local_install/bin/python3.12
   # Worktree FIRST so it wins over the venv's editable sglang install.
-  export PYTHONPATH=$R/wt-201/python:$R/htsglang-gpu/.venv/lib/python3.12/site-packages
+  # #201 slice-3 validation: the worktree name is overridable so the same
+  # launcher can drive the slice-2 tree (wt-201) and the slice-3 merge
+  # worktree (wt-201-slice3) without editing paths.
+  export PYTHONPATH=$R/${WTNAME:-wt-201}/python:$R/htsglang-gpu/.venv/lib/python3.12/site-packages
   ATTN=$ATTN_MAIN
 else
   MODEL=${MODEL_SECOND:-/root/models/$(echo "$MODEL_NAME" | tr 'A-Z' 'a-z')}
@@ -114,7 +121,7 @@ fi
 # SIGQUIT on a crash. Orphaned, that parent is PID 1.
 "$PY" -u -m sglang.launch_server \
   --model-path "$MODEL" --dtype "$DTYPE" \
-  --tp-size 1 --pp-size 2 --pp-layer-ratio "$RATIO" \
+  --tp-size 1 --pp-size 2 "${RATIO_FLAG:---pp-layer-ratio}" "$RATIO" \
   --nnodes 2 --node-rank "$NODE" --dist-init-addr "$MASTER:$PORT" \
   --base-gpu-id 0 \
   --disable-overlap-schedule \

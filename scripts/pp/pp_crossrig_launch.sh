@@ -32,18 +32,20 @@ PVEF="ssh -f -n -i $PVEKEY $SSHOPT root@${RIG1_HOST:-192.168.0.1}"
 RIG2F="ssh -f -n -i $RIG2KEY $SSHOPT root@${RIG2_HOST:-192.168.0.89}"
 
 R=/spinning/subvol-999-disk-0/spinning
-RANKSH=$R/wt-201/scripts/pp/pp_crossrig_rank.sh
+WTNAME=${WTNAME:-wt-201}
+RANKSH=$R/$WTNAME/scripts/pp/pp_crossrig_rank.sh
 LOGDIR=/spinning/subvol-999-disk-0/root/ppcrossrig   # host-side log dir
 LOCAL_LOGDIR=/root/ppcrossrig                        # same dir seen from the container
 
 ENVCOMMON="CTX=$CTX MEMFRAC=$MEMFRAC RATIO=$RATIO MODEL_NAME=$MODEL_NAME PORT=$PORT \
 MAXREQ=$MAXREQ NCCL_IB=$NCCL_IB ATTN_MAIN=$ATTN_MAIN ATTN_SECOND=$ATTN_SECOND \
-MASTER=${RDMA_R1:-10.10.10.1} PP_CROSSRIG_RUN_TAG=$TAG EXTRA='${EXTRA:-}' ${EXTRAENV:-}"
+MASTER=${RDMA_R1:-10.10.10.1} PP_CROSSRIG_RUN_TAG=$TAG EXTRA='${EXTRA:-}' \
+WTNAME=$WTNAME RATIO_FLAG=${RATIO_FLAG:---pp-layer-ratio} ${EXTRAENV:-}"
 
 mkdir -p $LOCAL_LOGDIR; rm -f $LOCAL_LOGDIR/n*.log
 $RIG2 "mkdir -p /root/ppcrossrig; rm -f /root/ppcrossrig/n*.log"
 
-scp -q -i "$RIG2KEY" $SSHOPT /spinning/wt-201/scripts/pp/pp_crossrig_rank.sh \
+scp -q -i "$RIG2KEY" $SSHOPT /spinning/$WTNAME/scripts/pp/pp_crossrig_rank.sh \
   root@"${RIG2_HOST:-192.168.0.89}":/root/ppcrossrig/pp_crossrig_rank.sh
 $RIG2 "chmod +x /root/ppcrossrig/pp_crossrig_rank.sh"
 
