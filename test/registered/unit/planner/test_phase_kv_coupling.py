@@ -83,7 +83,13 @@ _CARDS = (
     ("SYNTH-UUID-1", 1, "SYNTH Accel S 24G", 24564, 90.0, 640.0, 620.0),
     ("SYNTH-UUID-2", 2, "SYNTH Accel S 24G", 24564, 88.0, 630.0, 610.0),
 )
-_RESERVE = (4600, 2600, 2600)
+#: Per-card reserve. Every card carries more than the derived demand below,
+#: on purpose: once the phase arm boots the MATCHED token vector (#435) no
+#: rank keeps unused capacity as free VRAM, so a rank whose reserve is under
+#: the demand is UNBOOTABLE and #437's gate refuses it. A fixture that
+#: under-pins ranks 1/2 would therefore solve no vector at all and could not
+#: test the coupling this file is about.
+_RESERVE = (4600, 4400, 4400)
 #: ``derived_rank_auto_reserve_mib`` for this synthetic boot shape.
 _DEMAND = 4200
 _BUDGETS = [total - res for (*_, total, _, _, _), res in zip(_CARDS, _RESERVE)]
@@ -139,20 +145,22 @@ def _profile():
     return profile, inventory
 
 
-def _args(model_path, tune="phase-prefill", kv_ratio="coupled"):
+def _args(model_path, tune="phase-prefill", kv_ratio="coupled", reserve=None):
     """Duck-typed ServerArgs with exactly the fields the optimizer reads."""
+    reserve = tuple(reserve or _RESERVE)
+    budgets = [total - res for total, res in zip(_TOTALS, reserve)]
     sa = types.SimpleNamespace(
         model_path=model_path,
         tp_size=3,
         rank_gpu_id=[0, 1, 2],
-        rank_gpu_memory_mib=list(_BUDGETS),
-        rank_tp_ratio=list(_BUDGETS),
+        rank_gpu_memory_mib=list(budgets),
+        rank_tp_ratio=list(budgets),
         rank_mlp_ratio=None,
         rank_vocab_ratio=None,
         rank_moe_ratio=None,
         rank_kv_ratio=kv_ratio,
         rank_kv_capacity_seed=None,
-        rank_auto_reserve_mib=",".join(map(str, _RESERVE)),
+        rank_auto_reserve_mib=",".join(map(str, reserve)),
         rank_perf_tune=tune,
         rank_perf_loose_ctx_percent=0.0,
         kv_cache_dtype="fp8_e4m3",
@@ -371,39 +379,45 @@ class TestTheOtherPathsAreUntouched(PhaseKvCouplingTestCase):
         self.assertIsNone(sa.rank_kv_capacity_seed)
 
 
-class TestTheFundabilityGateIsNotRebased(PhaseKvCouplingTestCase):
-    """The gate that rejects UNBOOTABLE candidates keeps pricing them against
-    the BASE-PLAN token vector, deliberately, and #435 does not touch it.
+class TestTheFundabilityGateFollowsTheVectorTheBootRuns(PhaseKvCouplingTestCase):
+    """#437: the gate prices the vector the boot will actually run.
 
-    Its residual term is ``(P_r - unit * v_r) * kv_cell`` -- capacity the
-    token vector does not use. A MATCHED vector has none by construction, so
-    re-basing the gate on the vector the phase arm now boots collapses every
-    residual to the bare reserve and the gate stops discriminating. That is
-    not hypothetical: ``--rank-kv-ratio capacity`` already prices
-    per-candidate, and on the #264/#354 fixture it accepts ``16,1,1`` at
-    reserve ``3000,2700,2700`` -- the configuration #264 booted into an OOM.
-    Widening that hole to the phase arm's default path is a loosening of a
-    measured OOM guard, and it is not what #435 was asked to do.
+    #435 deferred this and said so: while the gate priced the BASE-PLAN token
+    vector, its reject term was ``(P_r - unit * v_r) * kv_cell`` -- capacity
+    the token vector does not use -- which a MATCHED vector has none of. Once
+    the phase arm boots the matched vector, that term is ~0 on every rank for
+    every candidate INCLUDING the base, so a comparison against the base
+    compares two identical numbers and can never fire. Measured on the
+    #264/#354 fixture: ``--rank-kv-ratio capacity``, which already priced
+    per-candidate, accepted ``16,1,1`` at reserve ``3000,2700,2700`` -- the
+    configuration #264 booted into an OOM at 41.69 MiB free.
 
-    What #435 does change is the direction of the gate's error: post-fix the
-    non-binding ranks no longer keep the slack this term credits them with,
-    so the reported residual is optimistic for them. Named in the code and in
-    NOTE_433's arm spec rather than silently taken.
+    So the basis now follows the vector: a FIXED vector keeps the relative
+    base-plan pricing (the slack really does move with the candidate), and a
+    MATCHED vector is priced absolutely against the derived reserve demand on
+    EVERY rank. The "every rank" half is #435's other consequence -- matching
+    spends the slack the non-binding ranks used to keep (#433 measured
+    7045 / 7109 MiB idle on ranks 1 and 2).
     """
 
-    def test_the_reference_line_still_prices_the_base_plan_vector(self):
-        sa, log = self.plan(tune="phase-prefill")
-        model = self.cost_model(sa)
-        base = list(_BUDGETS)
-        on_base_plan = model.residual_free_mib(
-            base, _TOTALS, _RANKS_ON_GPU, partition_units(64, base)
+    def test_the_matched_arm_announces_the_matched_basis(self):
+        _sa, log = self.plan(tune="phase-prefill")
+        line = next(
+            ln for ln in log.splitlines() if "fundability basis" in ln
         )
-        line = next(ln for ln in log.splitlines() if "fundability reference" in ln)
-        self.assertIn(str([int(x) for x in on_base_plan]), line)
+        self.assertIn("MATCHED KV token vector", line)
+        self.assertNotIn("fundability reference:", log)
 
-    def test_the_matched_pricing_would_be_a_different_number(self):
-        """Anti-vacuity guard: the two references really do differ here, so
-        the assertion above pins a choice rather than a coincidence."""
+    def test_a_fixed_vector_keeps_the_base_plan_reference(self):
+        """An explicit ``--rank-kv-ratio`` pin is a FIXED vector, so the
+        relative pricing is meaningful and is kept byte-for-byte."""
+        _sa, log = self.plan(tune="phase-prefill", kv_ratio=[5, 3, 3])
+        self.assertIn("fundability reference:", log)
+        self.assertNotIn("fundability basis:", log)
+
+    def test_the_two_bases_are_genuinely_different_numbers(self):
+        """Anti-vacuity guard: the choice above pins a real difference, not a
+        coincidence of this fixture."""
         sa, _log = self.plan(tune="phase-prefill")
         model = self.cost_model(sa)
         base = list(_BUDGETS)
@@ -417,6 +431,53 @@ class TestTheFundabilityGateIsNotRebased(PhaseKvCouplingTestCase):
             base, _TOTALS, _RANKS_ON_GPU, partition_units(64, base)
         )
         self.assertNotEqual([int(x) for x in matched], [int(x) for x in on_base_plan])
+
+
+class TestTheAbsoluteBasisRefusesAnUnderPinnedRank(PhaseKvCouplingTestCase):
+    """#437's falsifier, on the synthetic rig so it runs without a model
+    cache: under a MATCHED vector a rank that cannot cover the derived
+    reserve demand is UNBOOTABLE, on EVERY rank rather than on the binding
+    one, and no vector is installed over it.
+
+    Both directions are pinned, because a gate that refuses everything is as
+    useless as one that accepts everything: the under-pinned reserve is
+    refused, the adequate one installs.
+    """
+
+    #: Rank 2 alone is under the 4200 MiB demand. Ranks 0/1 are unchanged
+    #: from the fixture, so nothing but that one card differs.
+    _UNDER_PINNED = (4600, 4400, 2600)
+
+    def test_an_under_pinned_rank_is_refused_in_every_matched_mode(self):
+        for kv_ratio in ("coupled", "capacity", "speed"):
+            with self.subTest(kv_ratio=kv_ratio):
+                sa, log = self.plan(
+                    tune="phase-prefill",
+                    kv_ratio=kv_ratio,
+                    reserve=self._UNDER_PINNED,
+                )
+                self.assertIn("fundability basis: MATCHED KV token vector", log)
+                self.assertIn("UNBOOTABLE (rank 2 residual free", log)
+                self.assertIn(f"derived reserve demand {_DEMAND} MiB", log)
+                self.assertIsNone(sa.rank_mlp_ratio)
+
+    def test_the_refusal_names_the_reserve_flag_not_the_context_slider(self):
+        _sa, log = self.plan(
+            tune="phase-prefill", reserve=self._UNDER_PINNED
+        )
+        line = next(ln for ln in log.splitlines() if "UNBOOTABLE" in ln)
+        self.assertIn("raise --rank-auto-reserve-mib", line)
+        self.assertNotIn("REJECTED by floor", line)
+
+    def test_the_same_fixture_at_an_adequate_reserve_still_installs(self):
+        """Anti-over-tightening control: the only difference is rank 2's
+        reserve, and the absolute basis is not a blanket refusal."""
+        for kv_ratio in ("coupled", "capacity", "speed"):
+            with self.subTest(kv_ratio=kv_ratio):
+                sa, log = self.plan(tune="phase-prefill", kv_ratio=kv_ratio)
+                self.assertIsNotNone(sa.rank_mlp_ratio)
+                self.assertNotIn("UNBOOTABLE", log)
+                self.assertNotIn("fundability WARNING", log)
 
 
 class TestTheOwnershipPredicate(CustomTestCase):

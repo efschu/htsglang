@@ -1,9 +1,70 @@
 """Tree-wide pytest guards.
 
-Currently: neutralize process-wide torch state leaked during collection.
+Currently:
+* neutralize process-wide torch state leaked during collection;
+* fail the run if it wrote to the cross-session GPU arbitration paths (#438).
 """
 
+import os
 import sys
+
+#: The cross-session arbitration paths a test run must never write. They are
+#: shared with every other session on the box: a card lock is acquired with
+#: ``mkdir`` and a holder is a claim line, so a test that plants either one
+#: blocks somebody else's window with a claim nobody can explain or release.
+#: #438 chased exactly that -- four 0-byte regular files with identical
+#: nanosecond mtimes, the signature of one ``touch a b c d``.
+_ARB_PATHS = (
+    "/tmp/gpu-card-0.lock",
+    "/tmp/gpu-card-1.lock",
+    "/tmp/gpu-card-2.lock",
+    "/tmp/gpu-owner.lock",
+    "/tmp/gpu-quiet.lock",
+    "/spinning/gpu-arb/holder",
+)
+
+
+def _arb_state():
+    """``{path: (exists, is_dir, inode)}``.
+
+    Deliberately not mtime: a window held by ANOTHER session runs its own
+    heartbeat, which legitimately refreshes an existing holder while an
+    unrelated test run is in progress. Creation, deletion, and a change of
+    type or inode cannot happen that way -- each of those is a write, and a
+    write to these paths from inside pytest is the bug this guard is for.
+    """
+    state = {}
+    for path in _ARB_PATHS:
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            state[path] = (False, False, None)
+        else:
+            state[path] = (True, os.path.isdir(path), st.st_ino)
+    return state
+
+
+def pytest_sessionstart(session):
+    session.config._arb_state_at_start = _arb_state()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    before = getattr(session.config, "_arb_state_at_start", None)
+    if before is None:
+        return
+    after = _arb_state()
+    leaked = {p: (before[p], after[p]) for p in before if before[p] != after[p]}
+    if not leaked:
+        return
+    lines = [f"  {p}: {was} -> {now}" for p, (was, now) in sorted(leaked.items())]
+    print(
+        "\nARB PATH GUARD: this run wrote to the cross-session GPU "
+        "arbitration paths. Redirect them (HTSGLANG_CARD_LOCK_ROOT, "
+        "ArbDirectory(root=...), BATTERY_LOCK_ROOT) instead of using the "
+        "production defaults:\n" + "\n".join(lines),
+        file=sys.stderr,
+    )
+    session.exitstatus = 1
 
 
 def pytest_collection_finish(session):

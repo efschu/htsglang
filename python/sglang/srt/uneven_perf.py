@@ -4890,6 +4890,37 @@ _PHASE_DECODE = "phase-decode"
 _PHASE_TUNES = (_PHASE_PREFILL, _PHASE_DECODE)
 
 
+def planner_corridor_mib() -> int:
+    """#330's absolutely-free corridor, in MiB, as the planner prices it.
+
+    AUDIT_434 class ``POLICY``: a deliberate rig-independent rule ("at least
+    this much VRAM stays unallocated on every card"), not a constant fitted on
+    the reference rig -- it is the same number on a 3080 and on a 5090, and it
+    is a choice about how much room a boot must leave, not a measurement of
+    anything. There is exactly one definition of it on this rig,
+    ``registry.ledger.DEFAULT_CORRIDOR_BYTES`` (#330), and this reads that one
+    rather than restating 400; the ledger daemon already exposes it as
+    ``--corridor-mib``, and the override seam for the planner's use of it is
+    ``SGLANG_PLANNER_CORRIDOR_MIB``.
+
+    Why the planner needs it at all: the fundability gate compares a rank's
+    predicted residual free VRAM against the derived reserve DEMAND, i.e.
+    against the modelled non-budget posts. Clearing that demand exactly means
+    a boot that allocates every last modelled byte and leaves nothing -- the
+    #424 window measured 87 MiB free on the 5090 at one such operating point
+    and 286-316 MiB at another, and both were treated as corridor breaches by
+    hand. Pricing the corridor here is what turns that hand judgement into
+    something the plan log states before the boot.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.registry.ledger import DEFAULT_CORRIDOR_BYTES, MIB
+
+    override = envs.SGLANG_PLANNER_CORRIDOR_MIB.get()
+    if override is not None:
+        return max(int(override), 0)
+    return int(DEFAULT_CORRIDOR_BYTES // MIB)
+
+
 def _phase_solve_owns_kv_ratio(server_args, model, tune: str) -> bool:
     """True when the phase solve's own matched KV token vector becomes the
     boot's DCP token vector (#435).
@@ -5516,6 +5547,11 @@ def apply_auto_performance(server_args) -> None:
     _fund_demand: Optional[List[int]] = None
     _fund_token_vec: Optional[List[int]] = None
     _fund_base: Optional[List[float]] = None
+    #: True when the KV token vector the BOOT will run is MATCHED to the
+    #: candidate being priced instead of fixed across candidates. Selects the
+    #: gate's basis; see the comment at its assignment below.
+    _fund_matched = False
+    _fund_corridor = planner_corridor_mib()
     demand_by_gpu = getattr(server_args, "_derived_rank_auto_reserve_per_gpu", None)
     if demand_by_gpu:
         from collections import Counter
@@ -5537,34 +5573,47 @@ def apply_auto_performance(server_args) -> None:
         # capacity optimum predict_capacity reports: 'coupled' (the default)
         # follows the base plan, a pinned vector follows itself, and the
         # derived modes install the capacity optimum after profiling.
+        # #437: WHICH vector the boot runs decides which of two bases the
+        # check can use, and the two are not interchangeable.
+        #
+        # A FIXED vector (the plain coupled default, or an explicit
+        # --rank-kv-ratio pin) is the same for every candidate, so the
+        # residual's second term -- ``(P_r - unit * v_r) * kv_cell``, capacity
+        # the vector does not use -- really does move with the candidate.
+        # Concentration relocates the tight rank and spends exactly that
+        # slack, which is what #264 walked into, so pricing a candidate
+        # RELATIVE to the base plan is both meaningful and correctly narrow:
+        # a rank the operator already under-pinned is not the candidate's
+        # fault.
+        #
+        # A MATCHED vector has no unused capacity by construction: the token
+        # vector IS the capacity partition, so the slack term is ~0 on every
+        # rank, for every candidate, including the base. Relative pricing then
+        # compares two identical numbers and can never fire -- measured on the
+        # #264/#354 fixture, `--rank-kv-ratio capacity` accepted 16,1,1 at
+        # reserve 3000,2700,2700, the exact configuration #264 booted into an
+        # OOM (41.69 MiB free on GPU 0), while the fixed-vector pricing
+        # reported the same candidate UNBOOTABLE. The matched basis therefore
+        # prices the reserve slack EXPLICITLY and ABSOLUTELY instead
+        # (_unfundable_reason below), on every card rather than only on the
+        # binding one: #435 moved the risk off rank 0 and onto the ranks that
+        # used to keep the slack (#433 measured 7045 / 7109 MiB idle on ranks
+        # 1 and 2 -- matching spends it; NOTE_433, "Corridor gate, both
+        # sub-arms").
         kv_ratio = getattr(server_args, "rank_kv_ratio", "coupled")
         if isinstance(kv_ratio, list):
             _fund_token_vec = [max(int(v), 1) for v in kv_ratio]
         elif server_args.uneven_kv_derived_mode():
-            _fund_token_vec = None  # per-candidate: the converged optimum
+            # 'capacity'/'speed': the converged optimum, per candidate.
+            _fund_token_vec = None
+            _fund_matched = True
+        elif _phase_solve_owns_kv_ratio(server_args, model, tune):
+            # #435: the phase solve seeds the chosen candidate's own matched
+            # vector into the boot, so the boot no longer runs the base-plan
+            # split this gate used to price it against.
+            _fund_token_vec = None
+            _fund_matched = True
         else:
-            # DELIBERATELY the base plan, including under the phase arms whose
-            # chosen candidate now boots on the MATCHED vector (#435).
-            #
-            # The residual term this gate rejects on is
-            # ``(P_r - unit * v_r) * kv_cell`` -- capacity the token vector
-            # does NOT use. A matched vector has none by construction, so
-            # pricing candidates against it collapses every residual to the
-            # bare reserve and the gate stops discriminating: measured on the
-            # #264/#354 fixture, the `capacity` mode (which already prices
-            # per-candidate) accepts 16,1,1 at reserve 3000,2700,2700 -- the
-            # exact configuration #264 booted into an OOM, 41.69 MiB free on
-            # GPU 0 -- while the base-plan pricing here still reports it
-            # UNBOOTABLE.
-            #
-            # Re-basing this gate is therefore a loosening of an OOM guard
-            # with measured evidence behind it, not a follow-on edit, and it
-            # is not in #435's scope. What #435 does change is the direction
-            # of its error: once the chosen vector is matched, the co-located
-            # ranks no longer keep the unused-capacity slack this term credits
-            # them with, so the reported residual is OPTIMISTIC for every rank
-            # that is not the binding one. Read the real corridor off the boot
-            # on all ranks (docs/dev/NOTE_433_int8_prefill_vector.md).
             _fund_token_vec = partition_units(_PREDICT_TOKEN_UNITS, base_plan)
 
     def _residual(cand: Sequence[int]) -> Optional[List[float]]:
@@ -5582,35 +5631,111 @@ def apply_auto_performance(server_args) -> None:
         )
 
     def _unfundable_reason(res: Optional[List[float]]) -> Optional[str]:
-        """Verdict text for the first rank a candidate pushes below the
-        derived reserve demand that the BASE plan still clears, or None."""
-        if res is None or _fund_base is None or _fund_demand is None:
+        """Verdict text for the first rank that cannot fund its own boot, or
+        None. Two bases, per ``_fund_matched`` above.
+
+        FIXED vector (relative): the first rank the candidate pushes below
+        the derived reserve demand that the BASE plan still clears.
+
+        MATCHED vector (absolute): the first rank whose residual does not
+        cover the derived reserve demand at all. There is nothing to compare
+        against here -- the base spends the same slack -- so the demand is
+        the whole test, on every rank rather than on the binding one.
+        """
+        if res is None or _fund_demand is None:
+            return None
+        if not _fund_matched and _fund_base is None:
             return None
         for r in range(server_args.tp_size):
-            if res[r] < _fund_demand[r] <= _fund_base[r]:
+            if _fund_matched:
+                unfunded = res[r] < _fund_demand[r]
+                context = (
+                    "matched KV vector: the boot spends this rank's unused "
+                    "capacity, so the reserve is its whole remaining headroom"
+                )
+            else:
+                unfunded = res[r] < _fund_demand[r] <= _fund_base[r]
+                context = (
+                    f"the base plan leaves it {int(_fund_base[r])} MiB"
+                )
+            if unfunded:
                 # Deliberately worded away from the floor: an unbootable
                 # candidate has no context to trade, so pointing at
                 # --rank-perf-loose-ctx-percent would buy an OOM (#264).
                 return (
                     f"UNBOOTABLE (rank {r} residual free {int(res[r])} MiB < "
-                    f"derived reserve demand {_fund_demand[r]} MiB; the base "
-                    f"plan leaves it {int(_fund_base[r])} MiB). Not "
+                    f"derived reserve demand {_fund_demand[r]} MiB; "
+                    f"{context}). Not "
                     "acceptable at any --rank-perf-loose-ctx-percent -- raise "
                     "--rank-auto-reserve-mib on that GPU instead"
                 )
         return None
 
+    def _corridor_note(res: Optional[List[float]]) -> Optional[str]:
+        """Advisory text for ranks that clear the demand but land inside
+        #330's absolutely-free corridor, or None.
+
+        Reported, never binding. The demand is a MODEL of the non-budget
+        posts and the corridor is what a boot must leave beyond them; a
+        candidate sitting between the two is one the operator may still want
+        (#354's 16,1,1 booted and served at 87 MiB free on the 5090), but it
+        is not one anybody should choose without being told. #424 made that
+        call by hand off a post-boot number; this states it before the boot.
+        """
+        if res is None or _fund_demand is None or _fund_corridor <= 0:
+            return None
+        tight = [
+            (r, int(res[r] - _fund_demand[r]))
+            for r in range(server_args.tp_size)
+            if 0 <= res[r] - _fund_demand[r] < _fund_corridor
+        ]
+        if not tight:
+            return None
+        return (
+            "CORRIDOR-TIGHT ("
+            + ", ".join(
+                f"rank {r} predicted free-after-boot {m} MiB" for r, m in tight
+            )
+            + f" < the {_fund_corridor} MiB absolutely-free corridor of #330)"
+        )
+
     _fund_base = _residual(base_plan)
     if _fund_base is not None and _fund_demand is not None:
-        lines.append(
-            "fundability reference: residual free VRAM at the VRAM-auto "
-            f"split {[int(x) for x in _fund_base]} MiB per rank (reserve the "
-            "budget never claims + capacity the KV token vector does not "
-            f"use), against the derived reserve demand {_fund_demand} MiB. A "
-            "candidate that pushes a rank from above that demand to below it "
-            "is reported UNBOOTABLE and is never accepted, whatever "
-            "--rank-perf-loose-ctx-percent says."
-        )
+        if _fund_matched:
+            lines.append(
+                "fundability basis: MATCHED KV token vector -- the boot runs "
+                "each candidate's own capacity partition, so no rank keeps "
+                "unused capacity as free VRAM and every candidate is priced "
+                "ABSOLUTELY, on all ranks: residual free VRAM must cover the "
+                f"derived reserve demand {_fund_demand} MiB. At the VRAM-auto "
+                f"split that residual is {[int(x) for x in _fund_base]} MiB "
+                "per rank. Pricing this relative to the base instead would "
+                "compare two identical numbers and accept everything (#437; "
+                "#264 measured the OOM it accepted)."
+            )
+            base_unfundable = _unfundable_reason(_fund_base)
+            if base_unfundable:
+                lines.append(
+                    "fundability WARNING: the VRAM-auto split ITSELF does not "
+                    f"clear the demand on this reserve -- {base_unfundable}. "
+                    "No MLP candidate can repair that; every candidate is "
+                    "reported UNBOOTABLE and the plain split this falls back "
+                    "to carries the same risk. Raise --rank-auto-reserve-mib "
+                    "on the named GPU(s) or lower --context-length."
+                )
+        else:
+            lines.append(
+                "fundability reference: residual free VRAM at the VRAM-auto "
+                f"split {[int(x) for x in _fund_base]} MiB per rank (reserve the "
+                "budget never claims + capacity the KV token vector does not "
+                f"use), against the derived reserve demand {_fund_demand} MiB. A "
+                "candidate that pushes a rank from above that demand to below it "
+                "is reported UNBOOTABLE and is never accepted, whatever "
+                "--rank-perf-loose-ctx-percent says."
+            )
+        base_corridor = _corridor_note(_fund_base)
+        if base_corridor:
+            lines.append(f"fundability corridor at the VRAM-auto split: {base_corridor}")
 
     # Tuning target (per M22: decode is flat across representable splits;
     # prefill/aggregate is the lever, and 'both' rides the same lever).
@@ -5660,14 +5785,29 @@ def apply_auto_performance(server_args) -> None:
         cand_set.add(_gcd_reduce(base_plan))
 
         scored = []
+        unfundable_seen = 0
         for cand in sorted(cand_set):
             pred = model.predict_capacity(list(cand))
             if not pred["feasible"]:
+                continue
+            # #437: this branch used to filter on ``feasible`` alone, i.e. on
+            # "the capacity model returns a positive per-rank capacity", and
+            # never consulted the fundability gate at all -- so the one
+            # objective that maximizes context was also the one with no check
+            # that the winning context can be allocated. Fundability is a
+            # correctness gate in every other objective and it is one here.
+            if _unfundable_reason(_residual(cand)) is not None:
+                unfundable_seen += 1
                 continue
             t_cand = model.prefill_time_model(
                 list(cand), enc_scores, min_link, base_family_tflops
             )
             scored.append((cand, pred, t_cand))
+        if unfundable_seen:
+            lines.append(
+                f"capacity objective: {unfundable_seen} candidate(s) dropped "
+                "as UNBOOTABLE by the fundability gate before scoring."
+            )
         if scored:
             best_ctx = max(p["ctx"] for _, p, _ in scored)
             near = [x for x in scored if x[1]["ctx"] >= 0.99 * best_ctx]
@@ -5710,11 +5850,13 @@ def apply_auto_performance(server_args) -> None:
                 base_plan, enc_scores, min_link, base_family_tflops
             )
             for c2, p2, t2 in sorted(scored, key=lambda x: -x[1]["ctx"])[:6]:
+                note2 = _corridor_note(_residual(c2))
                 lines.append(
                     f"capacity candidate {','.join(map(str, c2))}: predicted "
                     f"ctx ~{int(p2['ctx'])}, per-rank weights "
                     f"{[round(w, 2) for w in p2['weights_gib']]} GiB, "
                     f"prefill {t_base / t2 - 1.0:+.1%} vs base"
+                    + (f" -- {note2}" if note2 else "")
                 )
             lines.append(
                 f"capacity objective: best predicted ctx ~{int(best_ctx)}; "
@@ -5732,9 +5874,10 @@ def apply_auto_performance(server_args) -> None:
                 )
         else:
             lines.append(
-                "capacity-directed planning: no feasible candidate on the "
-                "measured model -- keeping plain auto (registry stale? "
-                "budgets shrank?)."
+                "capacity-directed planning: no feasible AND fundable "
+                "candidate on the measured model -- keeping plain auto "
+                "(registry stale? budgets shrank? reserve too low -- see the "
+                "fundability lines above)."
             )
     else:
         # The decode-knee guard REJECTS in the single-vector modes and only
@@ -5975,6 +6118,14 @@ def apply_auto_performance(server_args) -> None:
                 )
             else:
                 verdict = "floor OK, knee OK, fundable"
+            if unfundable is None:
+                # #437: a candidate can clear the demand and still leave the
+                # card with no absolutely-free room. That is a decision, not a
+                # rejection, so it rides along with the verdict instead of
+                # replacing it.
+                note = _corridor_note(res)
+                if note:
+                    verdict = f"{verdict}; {note}"
             # The decode cost is stated for EVERY candidate, including the
             # ones the guard accepts. A silent pass is how a +16.5 % decode
             # regression got proposed as a default (task #216): the guard's

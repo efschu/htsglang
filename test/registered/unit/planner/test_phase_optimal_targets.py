@@ -28,8 +28,21 @@ only one of them was wrong:
 
 So ``phase-prefill`` makes the decode-knee guard ADVISORY and keeps
 fundability and the context floor binding, and the tests below pin exactly
-that split: the two #354 vectors are accepted at the reserve that booted
-them, and the unbootable ones stay rejected at the reserve that OOMs.
+that split: a concentrated vector is accepted at a reserve that funds it, and
+the unbootable ones stay rejected at the reserve that OOMs.
+
+What #435 and #437 changed about the reserve in that sentence. #354's boots
+ran the VRAM-BUDGET KV split, under which a rank that is not the tightest
+keeps its unused capacity as free VRAM -- #433 measured 7045 / 7109 MiB idle
+on ranks 1 and 2 of exactly this shape. #435 makes the phase arm boot the
+solve's own MATCHED token vector, which spends that slack, and #437 makes the
+fundability gate price what the boot will run: under a matched vector every
+rank is checked ABSOLUTELY against the derived reserve demand, not relative to
+a base plan whose residual is the same number. ``4500,2700,2700`` therefore no
+longer funds 16,1,1 -- not because the gate got stricter about rank 0, but
+because ranks 1 and 2 no longer have the slack the old pricing credited them
+with. The phase-arm tests run at ``_RESERVE_MATCHED``; the #264 negative
+control keeps its own runbook reserve unchanged.
 
 Fixture note: this is the #264/#265 fixture shape with the v3 profile that
 carries the measured GEMM LANES of the #354 window (fp8_native 568.48 /
@@ -57,6 +70,13 @@ _MODELS = {
 }
 #: The vector #354 booted for each format, and its measured prefill delta.
 _PHASE_VECTOR = {"fp8": "16,1,1", "int8": "10,1,1"}
+#: What the phase arm solves at ``_RESERVE_MATCHED`` below. FP8 keeps #354's
+#: own vector; INT8 moves one rung down the ladder because the raised 3080
+#: reserve shrinks their budgets -- the SAME re-solve the pre-#437 optimizer
+#: performs at that reserve (verified against the base tree), and the vector
+#: NOTE_433 section 4 already recorded as INT8's optimum once the reserve
+#: goes up. Nothing about #437 picks it.
+_PHASE_VECTOR_MATCHED = {"fp8": "16,1,1", "int8": "8,1,1"}
 
 #: NVML totals of the reference rig in rank order (5090, 3080, 3080).
 _TOTALS = [32607, 20480, 20480]
@@ -66,6 +86,17 @@ _DEMAND = 4160
 #: same vector cannot boot on.
 _RESERVE_BOOTED = (4500, 2700, 2700)
 _RESERVE_RUNBOOK = (3000, 2700, 2700)
+#: The reserve the phase arm needs AFTER #435, and why it is not
+#: ``_RESERVE_BOOTED``. #354's boots ran the VRAM-budget KV split, under which
+#: the non-binding ranks keep their unused capacity as free VRAM -- #433
+#: measured 7045 / 7109 MiB idle on ranks 1 and 2. #435 makes the boot run the
+#: solve's own MATCHED token vector, which spends exactly that, so at
+#: 2700 MiB the two 3080s no longer cover the 4160 MiB derived reserve demand
+#: and #437's gate refuses every candidate on them. NOTE_433's confirmation-arm
+#: spec names the same remedy from the other side ("the retry raises
+#: --rank-auto-reserve-mib on those two cards"). 4600 clears 4160 + #330's
+#: 400 MiB corridor on all three.
+_RESERVE_MATCHED = (4600, 4600, 4600)
 
 #: Measured GEMM lanes of the #354 window (lanes.txt of the result set).
 _LANES = {
@@ -126,7 +157,13 @@ def _profile():
 _ENV = {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}
 
 
-def _args(model, reserve=_RESERVE_BOOTED, tune="phase-prefill", loose=0.0):
+def _args(
+    model,
+    reserve=_RESERVE_MATCHED,
+    tune="phase-prefill",
+    loose=0.0,
+    kv_ratio="coupled",
+):
     """Duck-typed ServerArgs with exactly the fields the optimizer reads."""
     budgets = [t - r for t, r in zip(_TOTALS, reserve)]
     sa = types.SimpleNamespace(
@@ -138,7 +175,7 @@ def _args(model, reserve=_RESERVE_BOOTED, tune="phase-prefill", loose=0.0):
         rank_mlp_ratio=None,
         rank_vocab_ratio=None,
         rank_moe_ratio=None,
-        rank_kv_ratio="coupled",
+        rank_kv_ratio=kv_ratio,
         rank_kv_capacity_seed=None,
         rank_auto_reserve_mib=",".join(map(str, reserve)),
         rank_perf_tune=tune,
@@ -241,11 +278,19 @@ class TestFixtureReproducesThe354Ladder(CustomTestCase):
 
 @_SKIP
 class TestPhasePrefillAcceptsWhatBooted(CustomTestCase):
-    """The regression: the planner must propose what #354 measured.
+    """The regression: the planner must propose a concentrated prefill vector,
+    the shape #354 measured.
 
-    FALSIFIER: on the shipped ladder every one of these runs returns None and
-    the log says "rejected by: knee" -- at the very reserve whose boot served
+    FALSIFIER: on the pre-#357 ladder every one of these runs returns None and
+    the log says "rejected by: knee" -- at a reserve whose boot served
     1540.3 tok/s prefill.
+
+    FP8 still solves #354's own 16,1,1 here. INT8 solves 8,1,1 rather than
+    #354's 10,1,1 because ``_RESERVE_MATCHED`` shrinks the 3080 budgets; the
+    pre-#437 optimizer re-solves it the same way at the same reserve, and
+    NOTE_433 section 4 recorded 8,1,1 as INT8's optimum once the reserve goes
+    up. The property under test is that a real lopsided vector is proposed,
+    not that one frozen number survives every operating point.
     """
 
     def test_the_354_prefill_vector_is_installed_for_both_formats(self):
@@ -254,8 +299,8 @@ class TestPhasePrefillAcceptsWhatBooted(CustomTestCase):
                 sa, log = _plan(model=_MODELS[fmt], tune="phase-prefill")
                 self.assertEqual(
                     ",".join(map(str, sa.rank_mlp_ratio or [])),
-                    _PHASE_VECTOR[fmt],
-                    "the planner does not propose the vector #354 booted",
+                    _PHASE_VECTOR_MATCHED[fmt],
+                    "the planner does not propose the phase-prefill vector",
                 )
                 self.assertIn("CHOSEN MLP vector", log)
 
@@ -271,11 +316,26 @@ class TestPhasePrefillAcceptsWhatBooted(CustomTestCase):
 
     def test_the_advisory_verdict_still_prints_the_decode_number(self):
         """Advisory is not silent: the number that would have rejected the
-        candidate stays in the log, so a reader can disagree with the mode."""
+        candidate stays in the log, so a reader can disagree with the mode.
+
+        The number is +23.8 % at ``_RESERVE_MATCHED`` and +24.7 % at
+        ``_RESERVE_BOOTED``: the reserve sets the budgets, the budgets set the
+        MLP unit grid, and the grid sets which streamed-byte share 16,1,1
+        materializes. Both are the same prediction of the same cost, and #354
+        measured +20.2 % (bs=8) to +25.0 % (bs=1) for it."""
         _sa, log = _plan(model=_MODELS["fp8"], tune="phase-prefill")
         line = _line_for(log, "16,1,1")
         self.assertIn("decode-knee ADVISORY", line)
-        self.assertIn("predicted decode step +24.7%", line)
+        self.assertIn("predicted decode step +23.8%", line)
+        # And the number is printed even where the verdict is something else
+        # entirely -- at _RESERVE_BOOTED the same candidate is UNBOOTABLE
+        # post-#435, and the decode cost is still stated next to it.
+        _sa, log = _plan(
+            model=_MODELS["fp8"], reserve=_RESERVE_BOOTED, tune="phase-prefill"
+        )
+        self.assertIn(
+            "predicted decode step +24.7%", _line_for(log, "16,1,1")
+        )
 
     def test_the_installed_arm_names_its_companion_and_the_restart(self):
         _sa, log = _plan(model=_MODELS["fp8"], tune="phase-prefill")
@@ -304,7 +364,7 @@ class TestPhaseDecodeIsTheOtherArm(CustomTestCase):
                 self.assertIn("phase-optimal DECODE arm", log)
                 self.assertIn(
                     f"companion PREFILL vector for this rig and checkpoint is "
-                    f"{_PHASE_VECTOR[fmt]}",
+                    f"{_PHASE_VECTOR_MATCHED[fmt]}",
                     log,
                 )
 
@@ -369,6 +429,90 @@ class TestTheGateStillRejectsWhatDoesNotBoot(CustomTestCase):
             sa, log = _plan(model=_MODELS["fp8"], tune="phase-prefill")
         self.assertIn("REJECTED by floor", log)
         self.assertIsNone(sa.rank_mlp_ratio)
+
+
+@_SKIP
+class TestTheCapacityModeGateIsNotBlind(CustomTestCase):
+    """#437: the same negative control, in the mode that used to be exempt.
+
+    ``--rank-kv-ratio capacity`` derives a token vector PER CANDIDATE, so the
+    residual's slack term -- capacity the vector does not use -- is ~0 for
+    every candidate including the base. The shipped gate compared the two and
+    could never fire: it accepted ``16,1,1`` at reserve ``3000,2700,2700``,
+    the configuration #264 booted into an OOM at 41.69 MiB free on GPU 0,
+    while the identical command on the default coupled ratio called the same
+    candidate UNBOOTABLE.
+
+    FALSIFIER: revert ``_fund_matched`` in ``uneven_perf`` and
+    ``test_the_264_config_is_refused_in_capacity_mode`` goes red -- the
+    planner installs 16,1,1 at the OOM reserve again.
+    """
+
+    def test_the_264_config_is_refused_in_capacity_mode(self):
+        for mode in ("capacity", "speed"):
+            with self.subTest(mode=mode):
+                sa, log = _plan(
+                    model=_MODELS["fp8"],
+                    reserve=_RESERVE_RUNBOOK,
+                    tune="phase-prefill",
+                    kv_ratio=mode,
+                )
+                line = _line_for(log, "16,1,1")
+                self.assertIn("UNBOOTABLE", line)
+                self.assertIn("derived reserve demand 4160 MiB", line)
+                self.assertIsNone(
+                    sa.rank_mlp_ratio,
+                    "the OOM configuration of #264 was installed anyway",
+                )
+
+    def test_the_matched_basis_is_named_and_the_base_is_warned_about(self):
+        """When no candidate can be funded, the reader has to be told that the
+        split it falls back to carries the same risk -- otherwise 'no vector
+        installed' reads as 'safe'."""
+        _sa, log = _plan(
+            model=_MODELS["fp8"],
+            reserve=_RESERVE_RUNBOOK,
+            tune="phase-prefill",
+            kv_ratio="capacity",
+        )
+        self.assertIn("fundability basis: MATCHED KV token vector", log)
+        self.assertIn("fundability WARNING", log)
+        self.assertIn("--rank-auto-reserve-mib", log)
+
+    def test_a_matched_vector_at_an_adequate_reserve_still_passes(self):
+        """The anti-over-tightening control. The absolute basis is not a
+        blanket refusal: at a reserve that covers the derived demand on all
+        three cards the same mode installs the same concentrated vector the
+        coupled arm installs."""
+        for mode in ("capacity", "speed"):
+            with self.subTest(mode=mode):
+                sa, log = _plan(
+                    model=_MODELS["fp8"], tune="phase-prefill", kv_ratio=mode
+                )
+                self.assertEqual(
+                    ",".join(map(str, sa.rank_mlp_ratio or [])),
+                    _PHASE_VECTOR_MATCHED["fp8"],
+                )
+                self.assertNotIn("fundability WARNING", log)
+                self.assertNotIn("UNBOOTABLE", _line_for(log, "16,1,1"))
+
+    def test_the_corridor_is_reported_and_is_not_binding(self):
+        """#330's 400 MiB absolutely-free corridor is priced explicitly and
+        stated per card, but it does not reject: #354's 16,1,1 booted and
+        served at 87 MiB free, so a candidate between the demand and the
+        corridor is a decision, not an error. Forced here by setting the
+        corridor so wide that the accepted vector must fall inside it."""
+        with mock.patch.dict(
+            os.environ, {"SGLANG_PLANNER_CORRIDOR_MIB": "100000"}
+        ):
+            sa, log = _plan(model=_MODELS["fp8"], tune="phase-prefill")
+        self.assertIn("CORRIDOR-TIGHT", log)
+        self.assertIn("100000 MiB absolutely-free corridor", log)
+        self.assertEqual(
+            ",".join(map(str, sa.rank_mlp_ratio or [])),
+            _PHASE_VECTOR_MATCHED["fp8"],
+            "the corridor rejected a candidate it may only report on",
+        )
 
 
 class TestTheFlagAcceptsTheArmsByName(CustomTestCase):

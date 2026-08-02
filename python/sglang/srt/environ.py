@@ -612,6 +612,13 @@ class Envs:
     SGLANG_PERF_DECODE_PEAK_COMPRESSION_EXP = EnvFloat(None)
     SGLANG_PERF_DECODE_NONWEIGHT_FRACTION = EnvFloat(None)
     SGLANG_PERF_PREFILL_INVARIANT_FRACTION = EnvFloat(None)
+    # Override seam for #330's absolutely-free VRAM corridor (MiB per card)
+    # as the PLANNER prices it in the fundability gate. Not a measurement and
+    # not rig-fitted: it is the policy "a boot must leave this much
+    # unallocated on every card". The single definition is
+    # registry.ledger.DEFAULT_CORRIDOR_BYTES (400 MiB, #330), which the ledger
+    # daemon exposes as --corridor-mib; unset (None) reads that one.
+    SGLANG_PLANNER_CORRIDOR_MIB = EnvInt(None)
 
     # --- barlink: vendor-neutral host-staged collectives (task #117) ---------
     # Route this group's TP collectives over barlink instead of NCCL. Needed

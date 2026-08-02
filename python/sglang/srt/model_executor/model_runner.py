@@ -902,50 +902,61 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
-    def _refuse_unproven_bar1_dcp_combination(self):
-        """Fail fast on the one feature combination measured to wedge (#431).
+    def _check_bar1_fp8_uneven_dcp_combination(self):
+        """Warn about the slow first boot of the #431 combination (#431).
 
-        The evidence is the #424 battery: with `SGLANG_BARLINK_TRANSPORT=bar1`
-        and uneven weighted DCP, the fp8 checkpoint wedged the prefill path in
-        BOTH layouts after a clean boot and a passing transport gate, while
-        the INT8-W8A8 checkpoint completed both layouts over the same
-        transport and the fp8 checkpoint completed both over stock NCCL. The
-        mechanism is not yet proven (the GPU repro is
-        `scripts/repro_431_fp8_bar1_dcp.sh`), so this is a scoped refusal, not
-        a fix: it names exactly the arm that failed and leaves every arm that
-        was measured to work -- including the recommended INT8 + BAR1 one --
-        untouched.
+        This was a hard refusal. The #424 battery saw barlink BAR1 x uneven
+        weighted DCP x an fp8 checkpoint wedge the prefill path in both
+        layouts, and this method refused the combination before a weight was
+        loaded. The 2026-08-02 re-check on the tip carrying the BAR1 deadline
+        fix ran the same arm to completion at the stock-NCCL twin's speed, so
+        what #424 recorded as a wedge is a slow first boot -- roughly 190 s
+        per rank inside the initial JIT cold-build window on a cold kernel
+        cache. The refusal is a warning now, and it is deliberately verbose:
+        the failure mode it prevents is an operator killing a boot that is
+        working. Evidence and the full history are in the predicate's
+        docstring and in docs/dev/ANALYSE_431_fp8_bar1_dcp_deadlock.md.
+
+        An operator who wants the old behaviour still has it -- see
+        SGLANG_BARLINK_REFUSE_FP8_UNEVEN_DCP_BAR1 and the legacy
+        SGLANG_BARLINK_ALLOW_FP8_UNEVEN_DCP_BAR1=0 -- in which case this
+        raises exactly as before.
 
         The predicate lives in `barlink_uniformity` as a pure function so it
         can be falsified without a GPU; this method only supplies the values.
         """
         from sglang.srt.distributed.device_communicators.barlink_uniformity import (
-            unproven_bar1_combination,
+            bar1_fp8_uneven_dcp_notice,
         )
 
-        message = unproven_bar1_combination(
+        notice = bar1_fp8_uneven_dcp_notice(
             barlink_enabled=envs.SGLANG_BARLINK.get(),
             transport=envs.SGLANG_BARLINK_TRANSPORT.get(),
             uneven_weighted_dcp=(
-                self.server_args.uneven_weighted_dcp_enabled()
-                and self.dcp_size > 1
+                self.server_args.uneven_weighted_dcp_enabled() and self.dcp_size > 1
             ),
             quantization=self.model_config.quantization,
         )
-        if message is not None:
-            raise ValueError(message)
+        if notice is None:
+            return
+        if notice.refuse:
+            raise ValueError(notice.message)
+        logger.warning(notice.message)
 
     def initialize(self):
         server_args = self.server_args
 
-        # #431: refuse barlink BAR1 x uneven weighted DCP x an fp8 checkpoint
-        # before a single weight is loaded. HERE and not in ServerArgs because
-        # the predicate needs the RESOLVED quantization: the #424 arms passed
-        # no --quantization at all and the method comes out of the
-        # checkpoint's own quant_config in ModelConfig._verify_quantization.
-        # Rank-uniform by construction (server args + model config are
-        # replicated), so the raise happens on every rank or on none.
-        self._refuse_unproven_bar1_dcp_combination()
+        # #431: warn about barlink BAR1 x uneven weighted DCP x an fp8
+        # checkpoint before a single weight is loaded, so the slow-first-boot
+        # notice is on screen BEFORE the operator starts waiting. HERE and not
+        # in ServerArgs because the predicate needs the RESOLVED quantization:
+        # the #424 arms passed no --quantization at all and the method comes
+        # out of the checkpoint's own quant_config in
+        # ModelConfig._verify_quantization. Rank-uniform by construction
+        # (server args + model config are replicated), so the notice fires on
+        # every rank or on none -- which also means the opt-in refusal raises
+        # on every rank or on none.
+        self._check_bar1_fp8_uneven_dcp_combination()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
