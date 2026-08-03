@@ -123,18 +123,24 @@ Two distributions both provide the `sgl_kernel` import package:
 `import sgl_kernel` currently reports `0.4.4` and `int8_scaled_mm` is present,
 i.e. the fork's files are the ones on disk.
 
-Fork wheel provenance (from the fork dist's `direct_url.json`):
+Fork wheel provenance (from the fork dist's `direct_url.json`) — this is the
+single authority for what is installed; every ticket that builds a wheel points
+here rather than keeping its own copy:
 
 ```
-file:///spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
-sha256 cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc
+file:///spinning/wt-398-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+sha256 67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664
 ```
 
-Superseded, do NOT reinstall: `/spinning/wt-327a-wheel/sglang_kernel-0.4.4-
-cp310-abi3-linux_x86_64.whl`, sha256 `e7b16e1d74527ba070afeaf7bab58ed5df0fadbe
-b344d0fb372ff334f7e15b54`. Same source, same 39 files, same 91 registered ops
-— but built against CUDA 12.9, which is the #436 segfault. It is kept only as
-a rollback artifact. See "cu13 rebuild" below.
+Superseded, do NOT reinstall, newest first:
+
+| wheel | sha256 | why it was replaced |
+| --- | --- | --- |
+| `/spinning/wt-436-wheel/…whl` | `cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc` | cu13 fix, but predates the #398 MXFP4 kernel set |
+| `/spinning/wt-327a-wheel/…whl` | `e7b16e1d74527ba070afeaf7bab58ed5df0fadbeb344d0fb372ff334f7e15b54` | built against CUDA 12.9 — the #436 segfault |
+
+Both are kept only as rollback artifacts. Same source, same 39 files. See
+"cu13 rebuild" below for why the CUDA major matters.
 
 **THE HAZARD, and why this section exists.** The two dists have DIFFERENT
 distribution names but the SAME import package, so pip does not see a conflict:
@@ -152,8 +158,8 @@ an index in this venv:
 
 ```
 # requirements pin (CT999 venv)
-sglang-kernel @ file:///spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl \
-    --hash=sha256:cc98be5d1ffc6aff0bb3675400bec5d95a1a309a25a48a06336d291656fedbbc
+sglang-kernel @ file:///spinning/wt-398-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl \
+    --hash=sha256:67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664
 ```
 
 ### Making it durable (run when the venv is QUIET)
@@ -168,7 +174,7 @@ V=/spinning/htsglang-gpu/.venv
 $V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # before
 $V/bin/pip uninstall -y sgl-kernel                 # drop the shadowing 0.3.21 dist
 $V/bin/pip install --no-deps --force-reinstall \
-  /spinning/wt-436-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
+  /spinning/wt-398-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl
 $V/bin/python -c "import sgl_kernel;print(sgl_kernel.__version__, hasattr(sgl_kernel,'int8_scaled_mm'))"  # after: 0.4.4 True
 ```
 
@@ -229,12 +235,30 @@ There is no local CUDA 13 system toolkit — `/usr/local/cuda` is 12.9. `nvcc`
 to build against; point `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT` and
 `CUDA_HOME` at it.
 
-### MXFP4 rebuild (#398) — BUILT, NOT INSTALLED
+### MXFP4 rebuild (#398) — INSTALLED (window 4)
 
-The native GGUF MXFP4 kernels (§4.5.3) need a wheel rebuild. One exists; it is
-deliberately **not installed**, because at build time another session's pytest
-still mapped `sgl_kernel` and this section's own rule is to swap the files only
-while the venv is quiet.
+The native GGUF MXFP4 kernels (§4.5.3) needed a wheel rebuild. That wheel is
+now the installed one — it is the pin at the top of this section — and the
+table below is kept as its build record.
+
+**Install verified, read-only, no import (#519, 2026-08-03):**
+
+| check | command | observed |
+| --- | --- | --- |
+| origin + hash | `cat $SP/sglang_kernel-*.dist-info/direct_url.json` | `file:///spinning/wt-398-wheel/…whl`, `sha256=67f03cfa…4664` |
+| #398 marker in the installed object | `strings $SP/sgl_kernel/sm100/common_ops.abi3.so \| grep -c ggml_mxfp4_native` | `3` — the count this table predicted |
+| CUDA major (the #436 trap) | `objdump -p …/common_ops.abi3.so \| grep NEEDED` | `libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`; no `.so.12` |
+| object on disk | `stat -c '%s %y' …/common_ops.abi3.so` | 11 021 280 B, 2026-08-03 |
+
+(`SP=$V/lib/python3.12/site-packages`.) These are deliberately all
+file-inspection checks: `import sgl_kernel` on a busy box is exactly what this
+section warns about, and the dist-info plus the symbol strings answer the
+question without it.
+
+**Next pending wheel.** `docs/dev/TICKET_511_kernel_bundle_wheel.md` carries
+the #512/#518 kernel changes and is NOT built. When it is, its §4 replaces the
+pin above — that ticket references this section rather than duplicating it, so
+there is one pin table in the tree, here.
 
 | item | value |
 | --- | --- |
@@ -257,9 +281,13 @@ $V/bin/python -c "import torch,sgl_kernel; \
   print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"   # expect True
 ```
 
-Until it is installed, the tree behaves exactly as before #398: the probe
-answers False, MXFP4 stays out of the GGUF type sets, and the Q5_0 repack
-carries the type. Numerical gates: `docs/dev/TICKET_398_mxfp4_validation.md`.
+Before it was installed the tree behaved exactly as before #398: the probe
+answered False, MXFP4 stayed out of the GGUF type sets, and the Q5_0 repack
+carried the type. That is still the behaviour of any environment running an
+older wheel, and `SGLANG_GGUF_MXFP4_NATIVE=0` reproduces it on this one (the
+A/B lever). Numerical gates: `docs/dev/TICKET_398_mxfp4_validation.md` — Gate A
+ran for the first time on a real wheel in window 4 at **12/14 per arch**, with
+both failures traced to #518 and fixed on `fix/kernel-bundle-511`.
 
 **Evidence.** The falsifier is
 `scripts/dev/436_kv_transfer_repro/kv_transfer_repro.py` (its `--mode abi` arm
