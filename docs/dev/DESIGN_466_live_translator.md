@@ -28,6 +28,8 @@ them.
 | 2026-08-03 | **Target phone:** OnePlus 10 Pro NE2213_11, Android 16, unlocked bootloader, **not rooted**. Nothing may require root. |
 | 2026-08-03 | **TLS comes from the existing reverse proxy.** The rig already runs an nginx reverse proxy in an LXC container with Certbot-managed Let's Encrypt certificates and a public hostname. The translator is published as one more `location` there. The `chrome://flags` workaround is **demoted to fallback**; it is no longer the primary path. Consequence: risk #1 collapses from "design a secure-context story" to "verify once through the proxy from mobile data". |
 | 2026-08-03 | **REVOKED: the vLLM-Omni TTS sidecar. No external serving engines at all.** Everything runs inside htsglang. Reason, and it is architectural rather than aesthetic: the whole memory-hierarchy program — spill/offload/eviction across ALL assets, one ledger, the #286 register, the #305 residency ladder — can only arbitrate between assets that live under one runtime. A second serving engine owns VRAM the ledger cannot see, so every cross-asset decision silently becomes wrong. Phase 2's `serve_tts.sh` / `setup_tts_venv.sh` are dead and the running server was killed. A dependency-pin conflict is now a named engineering item, never a reason to add an engine. The pluggable TTS backend interface is what makes this cheap: the backend swaps, the pipeline, the session, the journal and the client all stand. |
+| 2026-08-03 | **Scheduler unblock deferred to #488, not built in rung B.** The `self.input_embeds = None` clear in `prepare_for_decode` is a rung-A prerequisite: rung B runs its own generation loop and never enters the scheduler, so a gated patch here would have no caller and no falsifier — unvalidated ballast of exactly the kind the desk-written-never-executed rule forbids. Recorded as a named #488 prerequisite (§11.2) so it is not lost. |
+| 2026-08-03 | **Path routing, not a subdomain.** The translator is mounted as `/translate/` under an existing `server_name` with the existing certificate. No DNS record, no `certbot --expand`, nothing touched in the user's certificate setup — zero user action and zero risk to a cert that fronts a dozen other services. A dedicated subdomain is a post-vacation item. |
 | 2026-08-03 | **No enrollment before the trip.** The user has no time to record voice samples. The user's voice therefore runs the *same* path as every other speaker: a rolling reference buffer accumulated from live speech, with preset mode covering the cold start. No special user-enrollment flow in the MVP. The enrollment endpoint stays (it costs nothing and already works) but is a post-vacation upgrade slot, and the GPU A/B must score cloning from **10-30 s of accumulated live speech**, not from clean curated audio. |
 
 ---
@@ -622,48 +624,52 @@ is a userspace VPN):
 6. Toggle on, then open `http://${WG_SERVER_ADDR%%/*}:30800/` in Chrome.
 7. Chrome menu → *Add to Home screen* for standalone PWA mode.
 
-### 6.2.1 Secure context — solved by the existing reverse proxy
+### 6.2.1 Secure context — solved by a path mount on the existing proxy
 
 `getUserMedia` needs a secure context, and `http://` over the tunnel is not one
-on Android Chrome unless the origin is a loopback. **The rig already has the
-answer**: an nginx reverse proxy in an LXC container, with Certbot-managed
-Let's Encrypt certificates and a public hostname, already fronting a dozen
-services. The translator becomes one more `location` there, and the phone gets
-a real HTTPS origin with no client-side workaround at all.
+on Android Chrome unless the origin is a loopback. The rig already runs an nginx
+reverse proxy in an LXC container with Certbot-managed certificates, so the
+translator is published there — **as a path under an existing hostname, not as
+a new subdomain**. That choice removes the last two user actions entirely: no
+DNS record to create and no `certbot --expand` to run against a certificate
+that fronts a dozen other services.
 
-`scripts/translator/nginx-translator.conf.template` is the snippet, written in
-the proxy's existing house style (Certbot cert paths, the shared
-`options-ssl-nginx.conf` include, upgrade headers on every location,
-`proxy_buffering off`, and a port-80 server that redirects the known host and
-answers 444 to everything else). Render and apply:
+The host already path-mounts several services (`/go2rtc/`, `/llama/`,
+`/plex/`), so `/translate/` is idiomatic there and collision-free. The trailing
+slash on `proxy_pass` strips the prefix, so the backend sees its own paths
+unchanged; only the client has to know where it lives.
 
-```bash
-source /root/rig-env.sh
-envsubst < scripts/translator/nginx-translator.conf.template > /tmp/translator.conf
-# the OPERATOR installs it in the proxy container and reloads nginx
-```
+**What the client had to change**, and it is small: every URL is now built
+relative to `location.pathname` rather than from `/`, and the manifest's
+`start_url`/`scope` are `"./"` so the installed PWA scope follows the mount
+point without the server being told where it is. The same file therefore works
+at the site root and under any prefix.
 
-Two settings in it are load-bearing rather than cosmetic:
+Three settings in the location are load-bearing rather than cosmetic:
 
-* **`proxy_read_timeout 3600s` on `/api/translator/stream`.** The default 60 s
-  kills the WebSocket during any pause longer than a minute. The socket is
-  long-lived by design; the client's own ping is what proves liveness.
-* **`proxy_buffering off`.** Buffered synthesized audio arrives in bursts and
-  destroys the streaming playback the entire latency budget is built on.
+* **`proxy_read_timeout 3600s`** — a conversation idles between turns and the
+  client's own ping proves liveness; the 60 s default reaps the socket
+  mid-conversation.
+* **`proxy_buffering off`** — buffered synthesized audio arrives in bursts and
+  destroys the streaming playback the entire latency budget rests on.
+* **`client_max_body_size 32m`** — enrollment posts a base64 PCM clip and the
+  1 MB default truncates it.
 
-Plus `client_max_body_size 32m`, because the enrollment endpoint posts a
-base64 PCM clip and the 1 MB default truncates anything past a few seconds.
+Procedure used, and to be repeated for any future change: back up
+(`/root/nginx-backup/`), edit, `nginx -t`, **reload only** (never restart),
+then verify. Verified on 2026-08-03 through the real front door: the health
+endpoint and the PWA serve correctly under the prefix, the manifest carries the
+relative scope, and the WebSocket handshake returns **`HTTP/1.1 101 Switching
+Protocols`**. A diff of the live config against the pre-change backup shows
+**29 added lines and zero deletions or modifications** — neighbouring locations
+are provably untouched.
 
-The translator itself still binds to the tunnel address, never `0.0.0.0` — the
-proxy is the only thing that reaches it. `scripts/translator/check_tunnel.sh`
-verifies the whole chain (interface, forwarding, service, upstreams, and the
-HTTPS front door) and prints the phone-side steps.
+`scripts/translator/nginx-translator.conf.template` remains in the repository
+as the standalone-subdomain variant, for a deployment that wants its own
+hostname.
 
-**Fallback only**, if the proxy path is unavailable: `chrome://flags` →
-*Insecure origins treated as secure* → add the tunnel origin. One setting, no
-certificate, and it must be re-applied whenever Chrome's flags are reset.
-Documented so it exists; not recommended.
-
+**Fallback only**, if a proxy is unavailable: `chrome://flags` → *Insecure
+origins treated as secure*. Documented so it exists; not needed here.
 
 ### 6.3 The PWA wall, evaluated (not silently switched)
 
@@ -972,6 +978,11 @@ both directions and it matters:
   (`schedule_batch.py:3045-3062`) — and that is exactly what we want, because
   16 codebook entries are **one audio frame at one sequence position**, not 16
   positions. The residual codes must never enter the KV sequence.
+
+**#488 PREREQUISITE, not built in rung B** (operator ruling 2026-08-03).
+Rung B runs its own generation loop and never enters the scheduler, so this
+patch would have no caller and no falsifier here. It is recorded as a named
+prerequisite of the native lane rather than shipped as unexercised gated code.
 
 The real blocker is one line:
 

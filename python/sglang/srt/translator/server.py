@@ -548,11 +548,17 @@ def build_app(service: TranslatorService) -> FastAPI:
 
     @app.get("/manifest.webmanifest")
     async def manifest() -> JSONResponse:
+        # start_url and scope are RELATIVE ("./"), which resolves against the
+        # manifest's own URL. Served at the site root that is "/"; served
+        # behind a reverse-proxy prefix it becomes that prefix, so the PWA's
+        # installed scope follows the mount point without the server having to
+        # be told where it lives.
         return JSONResponse(
             {
                 "name": "htsglang live translator",
                 "short_name": "translate",
-                "start_url": "/",
+                "start_url": "./",
+                "scope": "./",
                 "display": "standalone",
                 "background_color": "#101014",
                 "theme_color": "#101014",

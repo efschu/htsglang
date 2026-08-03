@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>live translator</title>
-<link rel="manifest" href="/manifest.webmanifest">
+<link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#101014">
 <!--
   The whole client: one file, no build system, no external asset.
@@ -85,8 +85,13 @@
 // ---------------------------------------------------------------------------
 // Configuration derived from the page, never hardcoded.
 // ---------------------------------------------------------------------------
+// Everything is addressed RELATIVE to where the page was served from, so the
+// same file works at the site root and under a reverse-proxy path prefix
+// (/translate/). The prefix is stripped by nginx, so the backend still sees
+// its own paths; only the client has to know where it lives.
+const BASE = location.pathname.replace(/[^/]*$/, "");
 const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
-  + location.host + "/api/translator/stream";
+  + location.host + BASE + "api/translator/stream";
 const PIPELINE_RATE = 16000;   // confirmed by the server on handshake
 const FRAME_MS = 20;
 
@@ -472,7 +477,7 @@ el("voice").addEventListener("change", async (e) => {
   const mode = e.target.value;
   if (!connection.sessionId) { sys("no session yet", true); return; }
   const response = await fetch(
-    "/api/translator/sessions/" + connection.sessionId + "/voice",
+    BASE + "api/translator/sessions/" + connection.sessionId + "/voice",
     { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ mode }) });
   if (response.ok) {
@@ -519,7 +524,7 @@ el("enroll").addEventListener("click", async () => {
     let binary = "";
     for (let i = 0; i < merged.length; i++) binary += String.fromCharCode(merged[i]);
     const response = await fetch(
-      "/api/translator/enroll/" + connection.sessionId,
+      BASE + "api/translator/enroll/" + connection.sessionId,
       { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({
           label: "user",
@@ -533,7 +538,7 @@ el("enroll").addEventListener("click", async () => {
 // The language picker is filled from the server's runtime-derived set. No
 // language is written into this page: what the deployment can do is whatever
 // the intersection of its backends says it can do.
-fetch("/api/translator/languages").then((r) => r.json()).then((info) => {
+fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
   const picker = el("langs");
   picker.size = Math.min(6, Math.max(2, info.bidirectional.length));
   for (const lang of info.bidirectional) {
