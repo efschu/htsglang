@@ -251,6 +251,36 @@ class OpenAiMt:
         except (KeyError, IndexError, AttributeError, TypeError) as exc:
             raise BackendError("mt", f"unexpected response shape: {exc}")
 
+    async def ask(self, system: str, user: str, max_tokens: int = 200) -> str:
+        """One non-translation question to the same LLM.
+
+        Used by the name extractor (§17.3). It shares the endpoint and the
+        model but NOT the translation prompt or the conversation history: a
+        classification carrying twenty turns of dialogue context would answer
+        about the conversation instead of about the utterance.
+        """
+        body: Dict[str, object] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        body.update(self.config.extra_body)
+        try:
+            response = await self._http().post("/chat/completions", json=body)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            raise BackendError("mt", f"request to {self.config.base_url} failed: {exc}")
+        try:
+            return payload["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, AttributeError, TypeError) as exc:
+            raise BackendError("mt", f"unexpected response shape: {exc}")
+
     async def translate_stream(
         self, text: str, source: str, target: str
     ) -> AsyncIterator[str]:

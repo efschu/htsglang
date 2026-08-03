@@ -409,6 +409,31 @@ class _Connection:
             # actually is.
             logger.debug("session %s client acked seq %s",
                          self._sid(), message.get("seq"))
+        elif kind == "suggestion.confirm":
+            try:
+                changed = self.session.confirm_suggestion(
+                    str(message.get("suggestion_id", "")),
+                    str(message.get("speaker_id") or "") or None,
+                )
+            except (KeyError, ValueError) as exc:
+                await self._send(
+                    {"kind": "error", "stage": "speaker", "message": str(exc)}
+                )
+                return
+            await self._send(
+                {"kind": "suggestion.applied",
+                 "suggestion_id": message.get("suggestion_id"),
+                 "lines_updated": len(changed)}
+            )
+        elif kind == "suggestion.discard":
+            dropped = self.session.discard_suggestion(
+                str(message.get("suggestion_id", ""))
+            )
+            await self._send(
+                {"kind": "suggestion.discarded",
+                 "suggestion_id": message.get("suggestion_id"),
+                 "known": dropped}
+            )
         elif kind == "line.resolve":
             # A tap on an uncertain badge (§17.4). ``speaker_id`` absent or
             # null means the "speaker-N (new)" candidate.

@@ -67,6 +67,13 @@ from sglang.srt.translator.languages import (
     RoutingTable,
 )
 from sglang.srt.translator.mt import SentenceAccumulator
+from sglang.srt.translator.name_hints import (
+    EXTRACTION_PROMPT,
+    NameSuggestion,
+    SuggestionTracker,
+    looks_like_naming,
+    parse_candidates,
+)
 from sglang.srt.translator.segmenter import (
     Segment,
     SegmentReason,
@@ -131,6 +138,9 @@ class EventKind(str, enum.Enum):
     TRANSCRIPT_LINE = "transcript.line"
     TRANSCRIPT_UPDATE = "transcript.update"
     TRANSCRIPT_CLEARED = "transcript.cleared"
+    #: A name the LLM heard, waiting for the user to confirm it (§17.3).
+    #: Never applied automatically -- the event IS the chip.
+    SPEAKER_SUGGESTION = "speaker.suggestion"
     ERROR = "error"
 
 
@@ -418,6 +428,11 @@ class TranslatorSession:
         self._last_embedding = None
         self._last_uncertain = False
         self._last_candidates: List[Dict[str, object]] = []
+        # Name suggestions (§17.3). The adjacency lives in the tracker; the
+        # LLM only ever classifies one utterance's text.
+        self.name_hints = SuggestionTracker(clock=clock)
+        self.suggestions: Dict[str, NameSuggestion] = {}
+        self.name_suggestions_enabled = True
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
@@ -525,6 +540,70 @@ class TranslatorSession:
              "lines_updated": len(changed)},
         )
         return changed
+
+    # -- name suggestions (§17.3) -------------------------------------------
+
+    async def _suggest_names(
+        self, turn_id: str, speaker_id: str, text: str
+    ) -> List[NameSuggestion]:
+        """Offer names heard in this turn. Never applies any of them."""
+        if not self.name_suggestions_enabled:
+            return []
+        candidates = []
+        # The pre-filter decides whether the LLM is asked at all. An earlier
+        # turn's addressed candidate still has to be OFFERED this turn, so the
+        # tracker runs either way -- only the extraction is skipped.
+        if looks_like_naming(text):
+            ask = getattr(self.mt, "ask", None)
+            if callable(ask):
+                try:
+                    answer = await maybe_await(ask(EXTRACTION_PROMPT, text))
+                    candidates = parse_candidates(answer)
+                except BackendError as exc:
+                    # A failed suggestion is a missing convenience, not a
+                    # failed turn: the translation already happened.
+                    logger.info("name extraction failed: %s", exc)
+                    candidates = []
+        suggestions = self.name_hints.observe(
+            turn_id, speaker_id, candidates, uncertain=self._last_uncertain
+        )
+        for suggestion in suggestions:
+            self.suggestions[suggestion.suggestion_id] = suggestion
+            self.journal.append(
+                EventKind.SPEAKER_SUGGESTION, suggestion.to_json()
+            )
+        return suggestions
+
+    def confirm_suggestion(
+        self, suggestion_id: str, speaker_id: Optional[str] = None
+    ) -> List[TranscriptLine]:
+        """Apply a suggested name. The tap is what applies it, never the model.
+
+        ``speaker_id`` is required for a floating third-party suggestion,
+        which by construction belongs to nobody yet, and is otherwise taken
+        from the suggestion.
+        """
+        suggestion = self.suggestions.pop(suggestion_id, None)
+        if suggestion is None:
+            raise KeyError(f"unknown suggestion {suggestion_id!r}")
+        target = speaker_id or suggestion.speaker_id
+        if not target:
+            raise ValueError(
+                f"suggestion {suggestion_id!r} is a third-party name and "
+                "belongs to nobody yet; name the speaker it applies to"
+            )
+        return self.name_speaker(target, suggestion.name)
+
+    def discard_suggestion(self, suggestion_id: str) -> bool:
+        suggestion = self.suggestions.pop(suggestion_id, None)
+        if suggestion is None:
+            return False
+        self.name_hints.discard(suggestion.speaker_id, suggestion.name)
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {"suggestion_discarded": suggestion_id, "name": suggestion.name},
+        )
+        return True
 
     # -- uncertain attributions (§17.4) -------------------------------------
 
@@ -1018,6 +1097,7 @@ class TranslatorSession:
                 remember(transcript.text, translations[first_target])
 
         self.turns_completed += 1
+        await self._suggest_names(turn_id, speaker_id, transcript.text)
         # Later audio may have settled an earlier ambiguity. Run after this
         # turn's centroid update, which is the thing that could have changed
         # the answer.
