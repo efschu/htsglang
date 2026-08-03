@@ -466,6 +466,9 @@ class TranslatorSession:
         #: turn_id and an ack that cannot say which turn died is not
         #: actionable.
         self._active_turn_id: Optional[str] = None
+        #: Audio of the turn being processed, so voice classification has an
+        #: input on a speaker's FIRST turn (§19.10). Cleared with the turn.
+        self._turn_audio: Optional[AudioChunk] = None
         #: Increments on every stop. Not used to gate anything server-side --
         #: it is the client's cheap "is this frame from before my stop"
         #: check, and a counter is the smallest thing that answers it.
@@ -1067,6 +1070,7 @@ class TranslatorSession:
                 # the cancellation a stop delivers. A stale active turn would
                 # make the NEXT stop name a turn that finished long ago.
                 self._active_turn_id = None
+                self._turn_audio = None
 
     async def _split_at_speaker_changes(self, segment: Segment) -> List[Segment]:
         """Re-cut a segment wherever the voice changes inside it.
@@ -1152,6 +1156,7 @@ class TranslatorSession:
     async def _run_turn_locked(self, segment: Segment) -> Optional[TurnResult]:
         turn_id = uuid.uuid4().hex[:12]
         self._active_turn_id = turn_id
+        self._turn_audio = segment.audio
         t0 = self._clock()
         watch = Stopwatch(segment_closed_at=t0)
         self.journal.append(
@@ -1623,27 +1628,71 @@ class TranslatorSession:
                     audio=piece,
                 )
 
-        async for delta in self.mt.translate_stream(transcript.text, source, target):
-            if first_token_at is None:
-                first_token_at = self._clock()
-                watch.mt_first_token_ms = (first_token_at - mt_start) * 1000.0
-            for unit in accumulator.push(delta):
-                pieces.append(unit)
+        # TEXT MUST NOT WAIT FOR AUDIO (§19.13, user field report: "the
+        # translated text should be there much earlier than the audio; it
+        # somehow waits for it").
+        #
+        # It did, and this is where. `speak(unit)` used to be AWAITED inside
+        # the MT loop, so the loop stopped consuming translation deltas for
+        # the whole duration of a clause's synthesis -- a measured 3.4 s
+        # (§18.4). The first clause's TEXT was already emitted before its
+        # synthesis, so the defect was invisible on a one-clause turn; from
+        # the second clause on, every line of text arrived at the speed of
+        # the SPEAKER, not of the translator.
+        #
+        # The units are handed to a worker instead. Text is journalled the
+        # moment MT produces it; synthesis follows at its own pace. One
+        # worker, a FIFO queue: the audio order is exactly the text order,
+        # which is what keeps `turn_id` attribution and playback sequencing
+        # correct. This also makes `mt_total_ms` mean what its name says --
+        # it used to include synthesis.
+        speech: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+
+        async def speech_worker() -> None:
+            while True:
+                unit = await speech.get()
+                if unit is None:
+                    return
+                await speak(unit)
+
+        worker = asyncio.create_task(speech_worker())
+        try:
+            async for delta in self.mt.translate_stream(
+                transcript.text, source, target
+            ):
+                if first_token_at is None:
+                    first_token_at = self._clock()
+                    watch.mt_first_token_ms = (first_token_at - mt_start) * 1000.0
+                for unit in accumulator.push(delta):
+                    pieces.append(unit)
+                    self.journal.append(
+                        EventKind.TURN_TRANSLATION,
+                        {"turn_id": turn_id, "target": target, "text": unit,
+                         "partial": True},
+                    )
+                    speech.put_nowait(unit)
+            tail = accumulator.flush()
+            watch.mt_total_ms = (self._clock() - mt_start) * 1000.0
+            if tail:
+                pieces.append(tail)
                 self.journal.append(
                     EventKind.TURN_TRANSLATION,
-                    {"turn_id": turn_id, "target": target, "text": unit,
+                    {"turn_id": turn_id, "target": target, "text": tail,
                      "partial": True},
                 )
-                await speak(unit)
-        tail = accumulator.flush()
-        watch.mt_total_ms = (self._clock() - mt_start) * 1000.0
-        if tail:
-            pieces.append(tail)
-            self.journal.append(
-                EventKind.TURN_TRANSLATION,
-                {"turn_id": turn_id, "target": target, "text": tail, "partial": True},
-            )
-            await speak(tail)
+                speech.put_nowait(tail)
+            # Close the queue and let the backlog drain. The turn is not done
+            # until its audio is, so the result still carries every chunk --
+            # what changed is when the TEXT became visible, not what the turn
+            # eventually contains.
+            speech.put_nowait(None)
+            await worker
+        except BaseException:
+            # Includes the CancelledError a playback.stop delivers: the
+            # worker holds the talker's lock, so leaving it running would
+            # keep the card busy for a turn nobody is listening to.
+            worker.cancel()
+            raise
 
         text = " ".join(p for p in pieces if p).strip()
         self.journal.append(
@@ -1744,14 +1793,31 @@ class TranslatorSession:
         )
 
     def _speaker_audio(self, speaker_id: str) -> Optional[AudioChunk]:
-        """Whatever audio we hold for this speaker, for voice classification."""
+        """Whatever audio we hold for this speaker, for voice classification.
+
+        THE TURN'S OWN AUDIO IS THE FALLBACK, and it is the case that matters
+        (§19.10, user field report: "at the start I am still rendered with a
+        female voice"). The reference buffer is empty exactly when a
+        placeholder voice is needed -- the downgrade path fires BECAUSE there
+        is not enough reference to clone from -- so classifying off the
+        buffer meant classifying off nothing on every first turn, and
+        `classify()` answers UNKNOWN for `None`. The pool then allocated by
+        availability instead of by class, which is how a man gets a woman's
+        preset.
+
+        The mechanism was there the whole time: a classifier, a class-matched
+        pool, sticky assignment. Its reach was zero at the only moment it was
+        asked to act. The audio of the turn being spoken is already in hand
+        and is a better classification input than a reference buffer anyway --
+        it is this speaker, now, by construction.
+        """
         try:
             profile = self.speakers.get(speaker_id)
         except KeyError:
-            return None
-        if not profile.references:
-            return None
-        return profile.reference_audio(self.tts.sample_rate)
+            profile = None
+        if profile is not None and profile.references:
+            return profile.reference_audio(self.tts.sample_rate)
+        return self._turn_audio
 
     def _choose_voice(self, speaker_id: str, target: str) -> VoiceAssignment:
         """Which voice this turn is spoken in, and why.
