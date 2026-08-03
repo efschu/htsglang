@@ -1642,3 +1642,75 @@ existing account of what "the same mechanism across model families" already
 means in this fork's runtime, and the #286 register (§2.6 of
 `DESIGN_407_memtier_registry.md`) is the offload class this rung's eviction
 routes through.
+
+### 20.4 SLICE 1 BUILT (2026-08-03) — the decision layer, and only that
+
+`planner/regime_switch.py` + `test/registered/unit/planner/test_regime_switch_363.py`
+(65 hermetic tests, five executed can-fail arms). WAVE 1 item 4 of
+`ROADMAP_456_matrix_execution.md`. What moved from decided-on-paper to built,
+and what still cannot execute:
+
+**What decides today.**
+
+* `autocheck(table, ...)` returns a named verdict object — `NO_SWITCH`,
+  `SWITCH_KV_ONLY`, `SWITCH_FULL`, `UNPRICEABLE` — with the reason and every
+  number it used, from a `PhaseTable` whose cells are `cost_model.Rate`s and
+  therefore carry `measured|estimate|absent`. Four steps in order:
+  completeness (all four cells of the 2x2 priced, or `UNPRICEABLE` naming the
+  missing arms), dominance against the table's own A-vs-A floor, the
+  same-weight-vector `SWITCH_KV_ONLY` case, and finally a per-round pricing
+  of the divergence against the switch cost at the rung the ledger reports.
+  A no-op verdict is an output, exactly as §20.1 demands; the canon-INT8
+  shape returns "one layout, checked ... there is nothing to pay for" and the
+  canon-FP8 shape returns the +24.1 % / -32.8 % divergence in its reason.
+  The autocheck knows nothing about the §20.1 canon sentence or about
+  NOTE_433 / addendum_435: it decides from the table it is handed, which is
+  the only way that evidence tension can be settled by re-running an arm
+  rather than by editing a document.
+* `layout_overlap()` computes the per-rank shard-range overlap of a pair,
+  `residency_rung()` does the RUNG 0/1/2 ledger arithmetic, and
+  `solve_layout_pair()` implements the "planner consequence" as a bounded
+  secondary objective (default tolerance 2.0 %, deliberately below the
+  reference rig's 4.2 % measured A-vs-A floor, so overlap may only break
+  ties, never knowingly buy a slower layout).
+* Surfaces: `planner.plan(..., regime_phase_table=...)` fills
+  `PlanResult.regime` from the plan's OWN capacity report; the planner CLI
+  gains `--regime-phase-table` / `--regime-workload` /
+  `--regime-not-pre-captured` and prints the verdict in both text and
+  `--json`; `solver_api.regime_switch_payload()` is the
+  `POST /api/regime_switch` surface (webui binding left to the UI strand, per
+  that module's convention). All opt-in: with no phase table the plan answer
+  is unchanged field for field.
+
+**Two corrections this section's own numbers needed, found by building it.**
+
+1. **§20.3 mixes two baselines for "extra bytes".** Run on Qwen3.6-27B's real
+   544-unit quant-group MLP grid, the `10,1,1` <-> even pair partitions to
+   453/46/45 against 182/181/181. The big card's decode shard `[0,182)` IS a
+   strict prefix of its prefill shard `[0,453)`, so it costs zero extra
+   *against the larger of the two layouts* — but against the ACTIVE (decode)
+   layout, which is what a ledger must charge, that same card owes 271 of 544
+   units. The two readings differ by 317 vs 46 units, about 7x. The module
+   therefore reports `extra_vs_active` (the ledger item) and
+   `extra_vs_larger` (§20.3's "zero extra") separately and calls neither "the"
+   cost.
+2. **"the two smaller cards hold disjoint ranges ... each" over-counts by one
+   card.** Only the MIDDLE card is disjoint — union 227/544 = 0.4173 against
+   the decode layout's 181/544 = 0.3327, which is the section's "~5/12
+   against ~4/12" to two decimals. The third card's prefill range `[499,544)`
+   is a SUFFIX nested inside its decode range `[363,544)`, so it holds no
+   extra bytes at all. The "~3 GB total" figure is consistent with the
+   vs-active reading at some MLP byte masses and not at others; it is left
+   standing as the estimate it was labelled as, now with the unit geometry
+   pinned by a test instead.
+
+**What still cannot execute — BOOT-PENDING in full.** Nothing in this build
+flips a pointer, spills a diff, pre-captures a family or evicts a slab. The
+verdict object carries `executes: false` and says so in its own text
+rendering. Specifically still absent: the §20.2 diff-spill mover, the §20.3
+boot-time pre-capture of all layout families (which needs #286, WAVE 1 item
+5), the VMM remap wiring for an inactive family's pools, and the runtime
+consumption of the verdict — today it is reported to a planner reader, not to
+a controller. The switch-cost constants remain the §20.2 physics estimate and
+the #102 analogy; only the KV delta inherits a measurement (#297). §20.3's
+measurement duty is unchanged and unmet.

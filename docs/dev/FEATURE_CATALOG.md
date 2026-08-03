@@ -88,6 +88,27 @@ alongside the demand and REPORTED (`CORRIDOR-TIGHT`), never binding
 `--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
 
+**#363 slice 1 — worth-it autocheck + layout-pair overlap + rung ledger**
+(`planner/regime_switch.py`, `--regime-phase-table`, `PlanResult.regime`,
+`solver_api.regime_switch_payload`). Given a per-phase layout table for one
+(format, model, rig) triple, the planner returns a named verdict —
+`NO_SWITCH` / `SWITCH_KV_ONLY` / `SWITCH_FULL` / `UNPRICEABLE` — with the
+reason and every number it used; an absent cell yields UNPRICEABLE naming the
+missing arm, never a guess. Also: per-rank shard-range overlap of a layout
+pair with the dual-residency bytes (reported against BOTH baselines, since
+`DESIGN_363` §20.3's "zero extra" and its ledger cost are different
+quantities — 46 vs 317 units on the real 27B geometry), a pair-solving mode
+that prefers maximal overlap among near-optimal candidates within a stated
+tolerance (default 2.0 %, below the 4.2 % measured A-vs-A floor so it can only
+break ties), and the §20.3 RUNG 0/1/2 feasibility arithmetic against the
+plan's own capacity report. **DECISION LAYER ONLY — nothing in this build
+executes a layout switch**: no pointer flip, no diff spill, no pre-capture
+(#363 slices 2+, `ROADMAP_456` WAVE 4, gated on #286). Switch-cost constants
+are the §20.2 physics estimate and the #102 graph-state analogy; only the KV
+delta inherits a measurement (#297). 65 hermetic tests, five executed can-fail
+arms (`test_regime_switch_363.py`); anything that decides at runtime whether a
+path is worth its cost registers here rather than adding a flag (§17).
+
 **Generality (#434 slice 1).** Plain `--rank-tp-ratio auto` is the documented
 CAPACITY-FIRST default (byte-proportional to the VRAM budgets, no probe); it
 now names the per-task optimizer and the flag that engages it in the CLI help
