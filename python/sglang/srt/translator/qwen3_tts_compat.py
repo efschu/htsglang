@@ -54,6 +54,7 @@ __all__ = [
     "load_codec_modeling",
     "CompatError",
     "refresh_rotary_buffers",
+    "restore_cache_position",
     "applied_shims",
 ]
 
@@ -187,6 +188,49 @@ _BASE_CONFIG_DEFAULTS = ("pad_token_id", "bos_token_id", "eos_token_id",
                          "sep_token_id", "decoder_start_token_id")
 
 
+def librosa_resample(y, orig_sr, target_sr, **_kwargs):
+    """``librosa.resample``, delegated to ``scipy.signal.resample_poly``.
+
+    The raising stub found this one the same way it found the mel filterbank:
+    the assumption that the audio path never reaches librosa was wrong twice.
+    The reference wrapper resamples every reference clip from the codec's rate
+    to the speaker encoder's before extracting the x-vector
+    (``qwen3_tts_model.py:441-447``), so this is on the voice-cloning path, not
+    a corner of it.
+
+    Delegated rather than reimplemented. ``resample_poly`` is a polyphase
+    rational resampler with a Kaiser-windowed anti-alias filter -- the same
+    algorithm librosa itself uses under ``res_type="polyphase"`` -- and scipy
+    is already in this venv. librosa's *default* is soxr, so this is a
+    different high-quality resampler rather than a bit-exact twin: the
+    difference is far below what a speaker embedding can resolve, and
+    :mod:`test_resample` pins the properties that would actually move if the
+    conversion were wrong (frequency preserved, no aliasing, correct length).
+
+    Not routed through :func:`translator.audio.resample`: that one deliberately
+    REFUSES rate pairs without a small rational ratio, which is right for the
+    transport (a wrong pair there means a pitch-shifted conversation) and wrong
+    here, where the reference clip's rate is whatever the phone produced.
+    """
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    orig_sr = int(orig_sr)
+    target_sr = int(target_sr)
+    y = np.asarray(y, dtype=np.float32)
+    if orig_sr == target_sr:
+        return y
+    if orig_sr <= 0 or target_sr <= 0:
+        raise CompatError(
+            f"cannot resample {orig_sr} Hz -> {target_sr} Hz: rates must be positive"
+        )
+    from math import gcd
+
+    divisor = gcd(orig_sr, target_sr)
+    up, down = target_sr // divisor, orig_sr // divisor
+    return resample_poly(y, up, down, axis=-1).astype(np.float32)
+
+
 def _config_token_defaults() -> None:
     """Give the Qwen3-TTS config classes back the base attributes 5.x dropped."""
     try:
@@ -266,6 +310,12 @@ def ensure_qwen3_tts_importable() -> Tuple[str, ...]:
 
         sys.modules["librosa.filters"].mel = mel_filterbank
         applied.append("librosa.filters.mel:validated-reimplementation")
+        # ... and exactly one more: the reference clip is resampled to the
+        # speaker encoder's rate before the x-vector is extracted. Same
+        # discovery mechanism, same treatment -- a real implementation, not a
+        # softer stub. See librosa_resample.
+        sys.modules["librosa"].resample = librosa_resample
+        applied.append("librosa.resample:scipy-polyphase")
         applied.append("librosa,sox:raising-stub")
 
         # Drift 4, found by going past import into CONSTRUCTION: 4.57's
@@ -356,6 +406,88 @@ def refresh_rotary_buffers(model) -> int:
     if refreshed:
         logger.info("recomputed %d rotary inv_freq buffers after load", refreshed)
     return refreshed
+
+
+def restore_cache_position(model_class) -> bool:
+    """Drift 6: give a model back the ``cache_position`` 5.x stopped creating.
+
+    This is the decode-seam bug, and it is worth stating precisely because the
+    obvious diagnosis is wrong.
+
+    The talker picks its position bookkeeping by branching on
+    ``cache_position`` (``modeling_qwen3_tts.py:1693-1711``):
+
+    * ``cache_position is None`` **or** ``cache_position[0] == 0`` -- prefill.
+      Rebuild the whole sequence's M-RoPE positions from the attention mask via
+      ``get_rope_index``, which returns one position per MASK entry.
+    * otherwise -- decode. ``arange(query_len) + cache_position[0] +
+      rope_deltas``, i.e. one position per QUERY token.
+
+    transformers 4.57 created ``cache_position`` in
+    ``prepare_inputs_for_generation`` for every model. 5.x removed it, and now
+    creates it only for remote-code models (``generation/utils.py:596-604``,
+    behind ``self.is_remote_code()``). ``qwen-tts`` is an ordinary installed
+    package, so it never qualifies: the talker sees ``None`` on every step and
+    takes the PREFILL branch forever.
+
+    The consequence is silent for exactly one step and then fatal. On a decode
+    step the attention mask has already grown to the cache length, so
+    ``get_rope_index`` hands M-RoPE one position per CACHED token while the
+    query is one token. ``cos``/``sin`` come back at cache length, the
+    single-token query broadcasts across them instead of raising, and the first
+    complaint is a matmul several frames away::
+
+        mat1 and mat2 shapes cannot be multiplied (1x22528 and 2048x1024)
+
+    where 22528 = 11 cached positions x 2048. Prefill is unaffected -- there
+    query length IS the cache length -- which is why the model loads, prefills
+    correctly, and dies on the first decode step.
+
+    **Not the earlier suspicion.** The talker's ``arange(seq_length)`` reads
+    ``input_ids.shape``, and 5.x does still slice ``input_ids`` to the query
+    width for cached generation (``next_sequence_length = 1``,
+    ``generation/utils.py:2793``), so that line was never the defect. It is
+    simply unreachable. That is also why slicing ``input_ids`` in a wrapper
+    changed nothing.
+
+    The fix restores the input the talker's own position math was written
+    against rather than reimplementing that math: ``arange(query_len) +
+    past_seen_tokens``, which is what 4.57 supplied and what 5.x still supplies
+    to remote-code models. The talker's decode branch then runs verbatim,
+    including its ``rope_deltas`` correction for left padding -- which a
+    reimplementation would have had to rediscover.
+
+    Idempotent; returns whether it installed anything.
+    """
+    if getattr(model_class, "_htsglang_cache_position_restored", False):
+        return False
+
+    import functools
+
+    import torch
+
+    base = model_class.prepare_inputs_for_generation
+
+    @functools.wraps(base)
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        model_inputs = base(self, *args, **kwargs)
+        if model_inputs.get("cache_position") is not None:
+            return model_inputs
+        probe = model_inputs.get("input_ids")
+        if probe is None:
+            probe = model_inputs.get("inputs_embeds")
+        if probe is None or probe.ndim < 2:
+            return model_inputs
+        past = model_inputs.get("past_key_values")
+        past_seen = past.get_seq_length() if past is not None else 0
+        model_inputs["cache_position"] = (
+            torch.arange(probe.shape[1], device=probe.device) + past_seen
+        )
+        return model_inputs
+
+    model_class.prepare_inputs_for_generation = prepare_inputs_for_generation
+    model_class._htsglang_cache_position_restored = True
+    return True
 
 
 def load_talker_modeling():

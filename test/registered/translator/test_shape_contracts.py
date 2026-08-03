@@ -25,6 +25,7 @@ it exists to reject.
 
 import unittest
 
+import numpy as np
 import torch
 
 from sglang.srt.translator.talker_config import (
@@ -185,6 +186,155 @@ class TestTheAsymmetryThatHidTheBug(unittest.TestCase):
             assert_position_contract(
                 full_positions, query_length=1, cache_length=PREFILL_LEN
             )
+
+
+class _FakeCache:
+    def __init__(self, seen: int) -> None:
+        self._seen = seen
+
+    def get_seq_length(self) -> int:
+        return self._seen
+
+
+class _FakeGenerativeModel:
+    """The parts of a transformers model the restoration actually touches."""
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, custom_kwarg=None, **kwargs
+    ):
+        return {"input_ids": input_ids, "past_key_values": past_key_values}
+
+
+class TestCachePositionRestoration(unittest.TestCase):
+    """The decode-seam fix, without the checkpoint.
+
+    transformers 5.x stopped creating ``cache_position`` for installed
+    (non-remote-code) models. The talker branches on it to tell prefill from
+    decode, so its absence pinned every step to the prefill branch and handed
+    M-RoPE cache-length positions for a one-token query -- the bug the
+    contracts above describe. Restoring the input is the fix; these are its
+    falsifiers.
+    """
+
+    def setUp(self):
+        from sglang.srt.translator.qwen3_tts_compat import restore_cache_position
+
+        self.restore = restore_cache_position
+
+        class Model(_FakeGenerativeModel):
+            pass
+
+        self.model_class = Model
+
+    def test_prefill_positions_start_at_zero(self):
+        self.assertTrue(self.restore(self.model_class))
+        inputs = self.model_class().prepare_inputs_for_generation(
+            torch.zeros(1, PREFILL_LEN, dtype=torch.long)
+        )
+        self.assertEqual(
+            inputs["cache_position"].tolist(), list(range(PREFILL_LEN))
+        )
+
+    def test_a_decode_step_gets_ONE_position_at_the_cache_offset(self):
+        # THE FIX. One query token, one position, offset by what is cached --
+        # which is exactly what makes the talker take its per-step branch
+        # instead of rebuilding the whole sequence's positions.
+        self.restore(self.model_class)
+        inputs = self.model_class().prepare_inputs_for_generation(
+            torch.zeros(1, 1, dtype=torch.long),
+            past_key_values=_FakeCache(PREFILL_LEN),
+        )
+        self.assertEqual(inputs["cache_position"].tolist(), [PREFILL_LEN])
+        # And the invariant the contract states, on the real object.
+        assert_position_contract(
+            inputs["cache_position"].view(1, -1),
+            query_length=1,
+            cache_length=CACHE_LEN,
+        )
+
+    def test_an_existing_cache_position_is_not_overwritten(self):
+        class Model(_FakeGenerativeModel):
+            def prepare_inputs_for_generation(self, input_ids, **kwargs):
+                return {"input_ids": input_ids, "cache_position": torch.tensor([7])}
+
+        self.restore(Model)
+        inputs = Model().prepare_inputs_for_generation(
+            torch.zeros(1, 1, dtype=torch.long)
+        )
+        self.assertEqual(inputs["cache_position"].tolist(), [7])
+
+    def test_it_is_idempotent(self):
+        self.assertTrue(self.restore(self.model_class))
+        self.assertFalse(self.restore(self.model_class))
+
+    def test_the_SIGNATURE_survives_the_wrapper(self):
+        """The functools.wraps lesson, pinned.
+
+        ``generate()`` validates its ``model_kwargs`` by inspecting the
+        signatures of ``forward`` and ``prepare_inputs_for_generation``. A
+        wrapper written as ``(*args, **kwargs)`` erases the parameter names,
+        and every legitimate extra kwarg the talker needs is then reported as
+        unused -- which is a hard error, not a warning. This cost an afternoon
+        once already, in a different wrapper around the same model.
+        """
+        import inspect
+
+        before = set(
+            inspect.signature(
+                self.model_class.prepare_inputs_for_generation
+            ).parameters
+        )
+        self.restore(self.model_class)
+        after = set(
+            inspect.signature(
+                self.model_class.prepare_inputs_for_generation
+            ).parameters
+        )
+        self.assertEqual(before, after)
+        self.assertIn("custom_kwarg", after)
+
+
+class TestResampleShim(unittest.TestCase):
+    """``librosa.resample``, the second stub the audio path turned out to need.
+
+    Not a reimplementation -- it delegates to ``scipy.signal.resample_poly`` --
+    so what is worth pinning is that it is wired to the right rates and does
+    not alias, both of which would silently degrade the x-vector the whole
+    cloning path conditions on.
+    """
+
+    def setUp(self):
+        from sglang.srt.translator.qwen3_tts_compat import librosa_resample
+
+        self.resample = librosa_resample
+
+    def test_the_length_follows_the_rate_ratio(self):
+        signal = np.zeros(24000, dtype=np.float32)
+        out = self.resample(signal, 24000, 16000)
+        self.assertEqual(len(out), 16000)
+
+    def test_a_tone_keeps_its_frequency(self):
+        rate, target, hz = 24000, 16000, 440.0
+        t = np.arange(rate, dtype=np.float32) / rate
+        tone = np.sin(2 * np.pi * hz * t).astype(np.float32)
+        out = self.resample(tone, rate, target)
+        spectrum = np.abs(np.fft.rfft(out))
+        peak = np.fft.rfftfreq(len(out), 1.0 / target)[int(np.argmax(spectrum))]
+        self.assertAlmostEqual(peak, hz, delta=2.0)
+
+    def test_downsampling_does_not_ALIAS_a_high_tone_into_the_band(self):
+        # 10 kHz is representable at 24 kHz but above the 8 kHz Nyquist of the
+        # 16 kHz output. Naive decimation would fold it back INTO the speech
+        # band and nothing would raise; the anti-alias filter must remove it.
+        rate, target, hz = 24000, 16000, 10000.0
+        t = np.arange(rate, dtype=np.float32) / rate
+        tone = np.sin(2 * np.pi * hz * t).astype(np.float32)
+        out = self.resample(tone, rate, target)
+        self.assertLess(float(np.abs(out).max()), 0.2)
+
+    def test_an_identical_rate_is_a_pass_through(self):
+        signal = np.linspace(-1, 1, 100).astype(np.float32)
+        np.testing.assert_allclose(self.resample(signal, 16000, 16000), signal)
 
 
 if __name__ == "__main__":

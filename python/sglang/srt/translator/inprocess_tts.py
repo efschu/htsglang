@@ -144,12 +144,23 @@ class InProcessQwen3Tts:
         from sglang.srt.translator.qwen3_tts_compat import (
             ensure_qwen3_tts_importable,
             refresh_rotary_buffers,
+            restore_cache_position,
         )
 
         shims = ensure_qwen3_tts_importable()
         logger.info("qwen3-tts compat shims: %s", ", ".join(shims))
 
+        from qwen_tts.core.models.modeling_qwen3_tts import (
+            Qwen3TTSTalkerForConditionalGeneration,
+        )
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+        # Drift 6, and the one that blocked every decode step: transformers 5.x
+        # stopped creating `cache_position`, which is the flag the talker
+        # branches on to tell prefill from decode. Must be installed on the
+        # CLASS before any generate call. See qwen3_tts_compat.
+        if restore_cache_position(Qwen3TTSTalkerForConditionalGeneration):
+            logger.info("restored cache_position on the talker for decode steps")
 
         dtype = getattr(torch, self.config.dtype)
         kwargs = {"dtype": dtype}
