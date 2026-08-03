@@ -46,11 +46,15 @@ Whole standing reserve posten on the production shape: 0.133 / 1.062 /
 **2.125 MiB** at bs 1 / 8 / 16 — **0.153 %** of the smallest rank's pool
 (83 775 tokens, the `auto-performance` capacity from `NOTE_433`) at bs=16.
 
-DSV4F offload recipe: same structure with the DFLASH block as `W` and `L`
-(`block_size` both terms under overlap), so its delta is 0 as well; the
-per-slot bytes there are MLA-shaped (`kv_lora_rank + qk_rope_head_dim`,
-replicated not TP-split) and should be measured on the boot rather than
-predicted.
+DSV4F offload recipe (`TICKET_462_f2_and_replay.md` boot line): that recipe
+runs **without speculative decoding**, so its reserve is the plain-decode
+`W + L = 1 + 1 = 2` slots per request, unchanged by #486. Its KV rows are MLA
+and REPLICATED, not TP-split (`DeepSeekV4TokenToKVPool` has no `tp_size`, and
+uneven-TP MLA is hard-refused by `_reject_uneven_tp_mla`): 43 layers x 584 B
+= **24.5 KiB/slot on every rank** in the dense window. At
+`--max-running-requests 1` the whole reserve posten there is **49 KiB**. There
+is nothing for #486 to reclaim on this recipe either; if it is measured at
+all, it is as a second confirmation that the posten is negligible.
 
 ---
 

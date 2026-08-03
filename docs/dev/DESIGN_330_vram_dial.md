@@ -108,6 +108,23 @@ therefore also shrink: `schedule_batch._new_tokens_required_next_decode_spec_v2`
 (the eviction demand handed to `evict_from_tree_cache`) and
 `kv_session_offload`'s spec-in-tick headroom gate.
 
+Coverage: the tree has exactly TWO per-decode watermark sites, and both now
+derive the reserve from the formula above — `eagle_utils.eagle_prepare_for_decode`
+(EAGLE / EAGLE3 / NEXTN-MTP / STANDALONE / frozen-KV-MTP / multi-layer, none of
+which override it) and `dflash_info_v2.prepare_for_decode` (DFLASH and DSpark;
+`dspark_components/` contains no allocation code of its own). The ngram lane
+does not hold a reserve at all: `ngram_worker._prepare_for_speculative_decoding`
+allocates a flat `draft_token_num` from `batch.seq_lens` each step and never
+advances `kv_allocated_len`, so it touches the formula only through the
+admission estimator.
+
+Trap for future readers: `EagleDraftInput.ALLOC_LEN_PER_DECODE` (assigned in
+`multi_layer_eagle_worker_v2` and `standalone_worker_v2`) is a DEAD WRITE — the
+class has no such attribute and nothing in the tree reads it. It is not the W
+term and never was; `get_alloc_len_per_decode` is. It happens to be harmless
+today because adaptive spec requires topk=1, where the two expressions agree;
+do not "restore" it without re-deriving.
+
 ## 4. Rank-uniform protocol (the #287/#297 consensus pattern)
 
 `KvCapacityRuntime` (managers/vram_dial.py) runs in the scheduler loop of
