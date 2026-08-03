@@ -1206,6 +1206,24 @@ counter split out of an existing one is added to every gate that read the old
 one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
 gates all four counters, each with its own can-fail proof).
 
+Rank-local-verdict family (#505-A2-03, fixed in #514): a decline that hands the
+caller to a NAMED FALLBACK must rest on replicated inputs, or the fallback is
+taken by some ranks and not others. `try_spill`'s host-region check compared
+THIS rank's owned tail rows (`n_own`, derived from the rank-local owner window
+`cp_prefix[dcp_rank : dcp_rank+1]`, whose width differs per rank under uneven
+DCP) against the replicated `region_tokens`, then returned False -- sending only
+that rank down stock retraction while its peers spilled. The caller's own
+comment claimed "no second collective, no branch-count divergence"
+(`scheduler.py:4058-4059`), which the rank-local verdict falsified; the
+prefill-spill twin RAISES on the identical condition (`:3906-3913`). Fixed by
+taking the verdict on the WIDEST rank (`spill_tail_rows_max_over_ranks`) --
+computable locally, with no new collective, because the `req_to_token` row
+carries global slot ids and `cp_prefix` is replicated, the same trick `_restore`
+already uses. `plain`/single-rank is byte-identical to the old path. Raising
+like the twin was rejected deliberately: the decode path HAS a named fallback
+the prefill path lacks. #501 ordering untouched -- still a `return False` ahead
+of the reclaim commit.
+
 Fabricated-identity family (#505-A2-04, fixed in #514): a bridge that cannot
 answer must return UNKNOWN, never the index it already has.
 `nvml_card_totals_mib` logged "assuming identical enumeration orders" and fell
@@ -1260,6 +1278,23 @@ the defect is written up. Registering to silence the test is the one forbidden
 resolution. #496 discharged the backlog this rule was written for -- the
 dual-group lane (#274) and the kv-session-offload spill had both landed
 mutation sites without an entry.
+
+**Verified carve-outs (#505-A2-01, #514).** A size/budget carve-out written
+onto an allocator is VERIFIED BY READ-BACK and refused by name if it did not
+take. `kv_session_offload` did `self.allocator.size -= mtp_resident_slices`
+inside `except Exception: pass` and then logged "reserved %d draft-read scratch
+slots"; on `UnifiedMambaTokenToKVPoolAllocator` / `UnifiedSWATokenToKVPoolAllocator`
+`size` is a COMPUTED property whose setter is literally `pass`
+(`multi_ended_allocator.py:1764-1766`, `:1974-1976`), so the write vanished with
+no exception -- the handler hid nothing and the success message was the only
+evidence. The damage is a standing false leak report: the invariant checker
+reads exactly that value (`invariant_checker.py:124`), and on the composite the
+permanent `alloc()` moves `schedulable_available -> allocated_count` leaving
+`size` unchanged, so the accounting is off by `mtp_resident_slices` forever. The
+composite setters deliberately STAY no-op absorbers -- `BaseTokenToKVPoolAllocator.__init__`
+and the inherited `resize()` (#330 VRAM dial) legitimately write there and a
+raise would break them -- so the obligation is the caller's. This is the
+SUCCESS-CLAIMS law as a code rule: where a write can be absorbed, read it back.
 
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the

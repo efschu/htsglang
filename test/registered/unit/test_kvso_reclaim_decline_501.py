@@ -93,6 +93,7 @@ def _manager(*, region_tokens=4096, budget_armed=False):
     # plain owner rule: this rank owns the whole tail (dcp_size == 1)
     mgr.mode = "plain"
     mgr.S = 1
+    mgr.cp_prefix = [0, 1]  # single owner class, as __init__ builds it
     mgr.lo = 0
     mgr.hi = 1
     mgr.dcp_size = 1
