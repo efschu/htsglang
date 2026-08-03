@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
@@ -462,21 +463,43 @@ class MqaAttentionBase(nn.Module):
         else:
             wo_a_quant_config = None
 
-        self.fuse_wqa_wkv = fuse
+        # Whether the fusion was ASKED for, as opposed to inherited from the
+        # default-on env: an explicit request is refused rather than silently
+        # turned off when the checkpoint format cannot carry it.
+        fuse_requested_explicitly: bool = (
+            bool(fuse_wqa_wkv)
+            if fuse_wqa_wkv is not None
+            else envs.SGLANG_OPT_FUSE_WQA_WKV.is_set()
+        )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = (
             self.attn_sink if self.attn_tp_size == 1 else None
         )
         if fuse:
-            self.wqkv_a = ReplicatedLinear(
+            # Built before it is adopted: the leaf inventory that decides
+            # whether the fusion can be filled at all is a property of the
+            # module the quant method constructs, and a packed integer format
+            # (GPTQ / AWQ / auto-round) adds qzeros / scales / g_idx, none of
+            # which the join in load_weights can route. Keeping the candidate
+            # in a local means an unusable one is simply never adopted.
+            candidate = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("wqkv_a", prefix),
             )
-        else:
+            fuse = _wqkv_a_fusion_survives_quant_format(
+                candidate, fuse_requested_explicitly
+            )
+            if fuse:
+                self.wqkv_a = candidate
+            del candidate
+
+        self.fuse_wqa_wkv = fuse
+
+        if not fuse:
             self.wq_a = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank,
@@ -2755,6 +2778,38 @@ class DeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        # Which attention blocks were built fused is a property of the BUILT
+        # MODEL, not of the environment. `MqaAttentionBase.__init__` reads the
+        # env, but it also turns the fusion off for a quant format whose
+        # parameters the wq_a/wkv join cannot route; re-reading the env here
+        # would send those tensors into a fusion whose target parameter does
+        # not exist, and the same divergence appears whenever a caller passes
+        # `fuse_wqa_wkv=` explicitly. The parameter names are the ground truth.
+        #
+        # Collected PER BLOCK rather than as one flag, because the topology can
+        # legitimately be mixed: a checkpoint that leaves some layers
+        # unquantized (GPTQ `dynamic`, AWQ `modules_to_not_convert`) gives
+        # those blocks an unquantized wqkv_a while the packed ones stay split.
+        wqkv_a_params = [name for name in params_dict if _WQKV_A_PART in name]
+        fused_wqkv_a_blocks = {
+            name[: name.index(_WQKV_A_PART)] for name in wqkv_a_params
+        }
+
+        # Backstop for a fused build the construction-time gate did not stop.
+        # Decided before the stream is touched: the non-GGUF route below buys
+        # its `.wo_a.scale` lookahead with a `list()` over every weight, and a
+        # load that cannot succeed should not pay for that first.
+        unroutable_wqkv_a = _unroutable_wqkv_a_leaves(
+            name.rsplit(".", 1)[-1] for name in wqkv_a_params
+        )
+        if unroutable_wqkv_a:
+            raise ValueError(
+                f"cannot load the fused wqkv_a of this checkpoint: "
+                f"{_unroutable_leaves_detail(unroutable_wqkv_a, 'this model')}. "
+                "Set SGLANG_OPT_FUSE_WQA_WKV=0 to load the two projections "
+                "unfused."
+            )
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2811,7 +2866,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight: dict[str, dict[Tuple[str, str], torch.Tensor]] = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         # {module_prefix: {leaf: tensor}} for the projections that are dense by
@@ -3024,7 +3078,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
-                            elif fuse_wqa_wkv and _is_wqkv_a_fusion_input(name):
+                            elif (
+                                _is_wqkv_a_fusion_input(name)
+                                and name.rsplit(".", 2)[0] in fused_wqkv_a_blocks
+                            ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
                                     ".wq_a." if is_q else ".wkv.", ".wqkv_a."
@@ -3281,6 +3338,90 @@ _WQKV_A_PROJECTIONS: Tuple[str, ...] = ("wq_a", "wkv")
 #: The compressor has no block-scaled variant, so only the plain dense leaf.
 _COMPRESSOR_LEAVES: Tuple[str, ...] = ("weight",) + _GGUF_PACKED_LEAVES
 _WQKV_A_LEAVES: Tuple[str, ...] = _FUSION_DENSE_LEAVES + _GGUF_PACKED_LEAVES
+
+#: Name segment of the fused parameter, i.e. of the fused build's topology.
+_WQKV_A_PART: str = ".wqkv_a."
+
+
+def _unroutable_wqkv_a_leaves(leaves: Iterable[str]) -> Tuple[str, ...]:
+    """The *leaves* the ``wq_a`` + ``wkv`` join cannot route, sorted.
+
+    The join knows exactly ``_WQKV_A_LEAVES``: a dense ``.weight`` plus, for an
+    fp8 block-scaled tensor, its ``.weight_scale_inv``; and the GGUF pair
+    ``.qweight`` / ``.qweight_type``. Everything it joins it joins by
+    concatenating along dim 0, which is the OUTPUT-ROW axis for all four.
+
+    A packed integer format (GPTQ, AWQ, auto-round) builds its linear from
+    other leaves entirely -- per-group zero points, per-group scales, and for
+    act-order an index permutation. Two things go wrong if such a module is
+    fused, and neither of them is loud:
+
+    * the leaves outside this set never match ``_is_wqkv_a_fusion_input``, so
+      they fall through to the unmatched-name branch and, on a non-GGUF
+      checkpoint, are DROPPED with a warning while the fused parameter keeps
+      its uninitialised contents;
+    * the one leaf that does match, ``qweight``, is not a row-major payload
+      there. GPTQ packs the INPUT dim into dim 0 and AWQ packs the OUTPUT dim
+      into dim 1, so a dim-0 concatenation is either a silently wrong join or a
+      shape error far from its cause -- never the intended output-row join.
+
+    Callers pass the parameter leaves the quant method ACTUALLY built (or, at
+    load time, the leaves of the built parameters). This deliberately keys off
+    the constructed module rather than a list of quant-method names, so a
+    format added later is covered without editing this file.
+    """
+    return tuple(sorted({leaf for leaf in leaves if leaf not in _WQKV_A_LEAVES}))
+
+
+def _unroutable_leaves_detail(unroutable: Tuple[str, ...], built_by: str) -> str:
+    """The shared body of the auto-off notice and the load-time refusal."""
+    return (
+        f"the wq_a/wkv fusion joins the leaves {_WQKV_A_LEAVES} only, but "
+        f"{built_by} builds wqkv_a with {unroutable} as well. Those tensors "
+        "have no route through the fusion: they would be dropped while the "
+        "fused parameter stays uninitialised, and the leaves that do match are "
+        "concatenated along dim 0, which is an output-row axis for a dense or "
+        "GGUF payload but a pack axis for a packed integer format"
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_wqkv_a_fusion_auto_off(detail: str) -> None:
+    """Emit the auto-off notice once per distinct cause, not once per layer."""
+    logger.warning(
+        "SGLANG_OPT_FUSE_WQA_WKV is disabled for this checkpoint: %s. Loading "
+        "wq_a and wkv unfused instead.",
+        detail,
+    )
+
+
+def _wqkv_a_fusion_survives_quant_format(
+    fused_linear: nn.Module, requested_explicitly: bool
+) -> bool:
+    """Whether the fused ``wqkv_a`` *fused_linear* can be filled by the join.
+
+    The inventory comes from the module the quant method just built, so a
+    format this file has never heard of is classified by what it constructs
+    rather than by its name. When the join cannot carry it, an inherited
+    default-on fusion is turned off with a named notice and an explicit request
+    is refused -- the one thing that must not happen is loading on.
+    """
+    unroutable = _unroutable_wqkv_a_leaves(
+        name for name, _ in fused_linear.named_parameters(recurse=False)
+    )
+    if not unroutable:
+        return True
+
+    detail = _unroutable_leaves_detail(
+        unroutable, type(getattr(fused_linear, "quant_method", None)).__name__
+    )
+    if requested_explicitly:
+        raise NotImplementedError(
+            f"SGLANG_OPT_FUSE_WQA_WKV was requested explicitly, but {detail}. "
+            "Set SGLANG_OPT_FUSE_WQA_WKV=0 to load the two projections unfused."
+        )
+    _warn_wqkv_a_fusion_auto_off(detail)
+    return False
 
 
 def _split_compressor_weight_name(name: str) -> Optional[Tuple[str, str, str]]:
