@@ -3677,3 +3677,136 @@ falsified with numbers (§17.8.12) -- the talker's onset rises over 11.6 ms,
 seams are not the step outlier, and 1 of 268 schedules started in the past
 and it was the benign initialization. The talker module is not implicated
 and remains the #488 agent's.
+
+#### 17.8.14 Auto-scroll fixed, roster management built, 2026-08-03 (seventh session)
+
+**Live: server `da46f2759b` (tenant PID 3857538, UNCHANGED -- no restart taken
+this session), client `01ed65f1e2`.** The page is served from this worktree
+per request, so both client cuts went live on merge; verified by reading
+`CLIENT_BUILD` back off the tenant rather than assuming it.
+
+**The MT neighbour that reddened §17.8.13 is gone, and the number says so.**
+Same tiny request, same instant: **26.5 s on the default lane, 0.19 s with
+`lane:fast`** -- the tenant sends `lane:fast` (`launch.py:351-352`), so it is
+on the fast side. Gating now measures the build, which §17.8.13 explicitly
+said it could not. `mt_first_token` across the runs: **0.13-0.37 s**, against
+19.7 s in the state that forced the previous session to stop gating.
+
+**AUTO-SCROLL. The mechanism the previous session suspected is confirmed, and
+it is worse than a missed turn -- it is a LATCH.** The old shape sampled
+`atBottom()` at append time and scrolled once; a bubble then keeps growing
+(`turn.queued` writes the waiting notice, every `turn.translation` partial
+adds a clause, the final event replaces the accumulation) and none of those
+paths scrolls. Measured per mutation on the pre-fix client:
+
+```
+  turn 1 clause 1  visible True,  overflow below   -38px, at bottom True
+  turn 1 clause 2  visible False, overflow below    +5px, at bottom True
+  turn 1 clause 3  visible False, overflow below   +59px, at bottom False
+  turn 4 final     visible False, overflow below +1045px, at bottom False
+```
+
+The FIRST growth pushes the box off the bottom; `atBottom()` reads false from
+then on and the follow never fires again for the rest of the conversation.
+The gate's +95px was one sample per turn of a number that keeps climbing.
+
+Re-measuring at growth time cannot fix it -- the growth is what moved the
+content past the fold. The fix is a `following` flag written only by the
+scroll event (the one signal that is actually the reader's), plus a
+MutationObserver and a ResizeObserver over the stream that re-pin on any size
+change. Every future event handler is covered without knowing about it, which
+is how this got in one handler at a time. The reader who scrolled up keeps the
+60 px exception and now gets a small "new message" pill.
+
+**ONE OF THE TWO REDS WAS THE ARM.** With the client provably pinned
+(`overflow below -4px, at bottom True`) the predicate still said False: it
+demanded the whole newest line fit inside the box, and one long turn makes a
+bubble TALLER than the box on a phone, where that is unsatisfiable at any
+scroll position. The assertion is the bottom edge; the top edge is only
+required when the line is short enough to have one. Corrected in
+`probe_autoscroll.py` and in `client_gate.py`, which carried the same
+predicate.
+
+**New arm: `scripts/translator/probe_autoscroll.py`.** Executes the shipped
+page in Chromium, drives the real `onEvent` with the real event order, and
+samples the geometry after EVERY mutation -- seconds, no server, no GPU,
+against the gate's ~40 s per turn and one sample per turn. Can-fail proven
+against `8011c6fb05` (21 of 24 samples red) with the corrected predicate in
+both runs. It also refuses to pass a run in which the transcript never
+overflowed, because that run could not have seen the defect.
+
+**Gate: 2x PASS on client `e2650d75df`** (`gate_scroll_a.log`,
+`gate_scroll_b.log`), 4 turns each with the reload arm and the stop arm, 0
+frames after the stop, console clean. The scroll arm is green on every sample
+including the 3-line shape that was `+95px` red. Note for the next reader: run
+B never reached 3 lines, because the reload after turn 2 resets the DOM -- the
+decisive live sample is run A turn 2, and the probe is what covers the deeper
+overflow.
+
+**ROSTER MANAGEMENT (user order).** Delete was complete server-side
+(`delete_speaker`, `speakers.remove` keeping the transcript) and unreachable:
+a 600 ms long press into a sheet. It is now an "x" on the entry, deliberately
+NOT a long press -- that gesture is the merge drag, and one gesture must not
+mean two irreversible things.
+
+Merge did not exist. `SpeakerRegistry.merge` unions the clusters
+(observation-weighted centroid, concatenated reference buffers re-evicted
+through the normal budget, `enrolled` OR-ed); `Session.merge_speakers` moves
+the transcript attribution retroactively, the armed button, name suggestions
+and the typed-name protection, and gives the source's preset voice back. It
+reads both profiles before mutating, so an unknown id leaves nothing
+half-done. `speaker.merge` on the socket, `POST .../speakers/{target}/merge`
+over REST.
+
+**THE FIRST MERGE ARM DID NOT DISCRIMINATE.** With `merge` replaced by a plain
+`remove`, "the follow-up segment lands on the merged speaker" still passed --
+deleting the other cluster also leaves one speaker standing. What only a real
+union can do is inherit the source's identity, so the arm is now two clusters
+at cosine 0.30, below the 0.637 bar: the source's voice does not reach the
+target before the merge (**0.300**) and does after (**0.806**). Red under
+sabotage, green whole. The pipeline-level arm was also merging in the
+direction that wins on its own and now merges the other way.
+
+**The drag hint was moving the drop targets.** As a flow row it made the
+footer taller mid-gesture, so the targets slid out from under a finger already
+on its way to one -- caught by `probe_roster.py`, whose coordinates are taken
+before the lift exactly as a user's aim is. It is absolutely positioned now
+and takes no layout.
+
+**CAPABILITY GATE, and it is the general answer to this worktree's deploy
+asymmetry.** The page is live on merge; its server half needs a restart. In
+that window a merge drag would look like the app ignoring the user. The
+gesture is bound only when the connected server announces
+`supports.speaker_merge` in its state frame (`session.state()`); an older
+server omits the key and the long press keeps its old meaning. **No second
+client deploy is needed** -- the restart arms it. Delete needs no server
+change and is live now.
+
+**Arms and results:** `probe_roster.py` PASS (delete incl. its cancel path and
+that it does not reach the speak button underneath, the full drag with drop
+zones and highlighted target, a drop on nobody falling back to the sheet, the
+capability gate); 11 new hermetic server tests; full translator suite **487
+passed**. Screenshots recorded for the drag mid-gesture and for the unread
+pill.
+
+**THE RESTART BUNDLE has grown and is now the top item.** One tenant restart
+carries: `turn.speech`, the MT retry, `--mt-timeout-s`, `--mt-lane` (all from
+Cut A, still undeployed), PLUS `speaker.merge` + its REST route + the
+`supports` capability key. Still to build before taking it: the `require_pair`
+degradation (`languages.py:362-366` -> `matrix.require_pair`, called from
+`session.py:411`; client constant `PARTIAL_PARTICIPANTS_SUPPORTED` waiting on
+it) and the boot warmup synthesis (a dummy sentence through the talker before
+"status ok", which removes the ~15 s cold start of turn 1). The `turn.unrouted`
+event and its client case already exist for the manual-routing path and are the
+shape the degradation should reuse -- a participant language whose direction
+this deployment cannot serve should open the session and tag the turn, not
+refuse the session.
+
+**Then:** §19.5 Opus 48k uplink (the resampler is rate-agnostic and goes to
+pass-through), the man-02 listening check, the `getSettings()` telemetry of the
+next phone connect (§19.8(b)), and §19.9.
+
+**Do not re-litigate:** the auto-scroll mechanism is measured, not suspected
+-- do not "simplify" it back to a per-append `atBottom()` sample. The gate's
+visibility predicate is deliberately asymmetric about the top edge and the
+reason is written at both copies.
