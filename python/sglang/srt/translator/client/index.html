@@ -54,6 +54,10 @@
   #meter > i { display:block; height:100%; width:0; border-radius:3px;
                background:var(--accent); }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #demo { display:none; padding:10px 14px; background:#4a3a12; color:#ffd479;
+          border-bottom:1px solid #6b5418; font-size:13px; line-height:1.35; }
+  #demo.on { display:block; }
+  #demo b { color:#ffb340; }
 </style>
 
 <header>
@@ -72,6 +76,7 @@
   <button id="enroll" title="record 15 s of your voice">enroll</button>
 </header>
 
+<div id="demo"></div>
 <div id="log"></div>
 
 <footer>
@@ -538,7 +543,28 @@ el("enroll").addEventListener("click", async () => {
 // The language picker is filled from the server's runtime-derived set. No
 // language is written into this page: what the deployment can do is whatever
 // the intersection of its backends says it can do.
+// Fake backends must announce themselves. A tester who does not know the
+// recognizer is a stub reads the resulting nonsense as "the translator is
+// broken", which wastes their time and mine. The banner names exactly which
+// stages are stubbed rather than saying "demo mode", because a partially real
+// stack is the normal state during bring-up.
+function announceFakeBackends(backends) {
+  const stubbed = Object.entries(backends || {})
+    .filter(([, name]) => String(name).startsWith("fake"))
+    .map(([stage]) => stage);
+  if (!stubbed.length) return;
+  const box = el("demo");
+  box.innerHTML =
+    "<b>Transport test build.</b> These stages are stubs, not real models: "
+    + "<b>" + stubbed.join(", ") + "</b>. "
+    + "Connection, push-to-talk, reconnect and the UI are real and worth "
+    + "testing. Transcripts and audio are placeholders \u2014 nonsense output "
+    + "here is expected and is not a translator fault.";
+  box.classList.add("on");
+}
+
 fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
+  announceFakeBackends(info.backends);
   const picker = el("langs");
   picker.size = Math.min(6, Math.max(2, info.bidirectional.length));
   for (const lang of info.bidirectional) {
