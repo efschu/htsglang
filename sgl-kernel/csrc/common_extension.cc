@@ -453,22 +453,31 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int type, SymInt row, SymInt tokens) -> Tensor");
   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
+  // #518: the three ops below take NO tensor, so a kCUDA-only impl is
+  // unreachable -- the dispatcher has nothing to infer a device key from and
+  // raises "Could not run ... no dispatchable fallback" on EVERY call, on
+  // every arch. They are compile-time lookups with no device work at all
+  // (a switch over the ggml type, a build-flag read), so the catch-all
+  // registration below is both correct and the only one that can be called.
+  // Same family as #81; the keyless m.impl form is what
+  // apply_token_bitmask_inplace_cuda and the es_* grouped-mm ops already use
+  // in this file.
   m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+  m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
   // Task #73: capability probe for the tuned K-quant batched MMVQ kernel.
   // Returns 1 when the tuned kernel is compiled in and not disabled via
   // SGLANG_GGUF_KQ_KERNEL=0. Old wheels lack this op entirely, so the
   // python dispatch keeps its legacy MMVQ->MMQ crossover on them.
   m.def("ggml_mmvq_kq_tuned() -> int");
-  m.impl("ggml_mmvq_kq_tuned", torch::kCUDA, &ggml_mmvq_kq_tuned);
+  m.impl("ggml_mmvq_kq_tuned", &ggml_mmvq_kq_tuned);
 
   // Task #398: capability probe for the native GGUF MXFP4 (ggml type 39)
   // kernel set. Old wheels lack this op entirely, so the python dispatch
   // keeps MXFP4 out of the GGUF type sets on them and the load-time
   // MXFP4 -> Q5_0 repack stays the only executable route.
   m.def("ggml_mxfp4_native() -> int");
-  m.impl("ggml_mxfp4_native", torch::kCUDA, &ggml_mxfp4_native);
+  m.impl("ggml_mxfp4_native", &ggml_mxfp4_native);
 
   /*
    * From csrc/mamba

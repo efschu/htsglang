@@ -193,8 +193,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "int type, SymInt row, SymInt tokens) -> Tensor");
   m.impl("ggml_moe_a8_vec", torch::kMUSA, &ggml_moe_a8_vec);
 
+  // #518: no tensor argument, so a device-only dispatch key is unreachable --
+  // see the note in common_extension.cc. Catch-all here for the same reason.
   m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kMUSA, &ggml_moe_get_block_size);
+  m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
   /*
    * From csrc/kvcacheio
