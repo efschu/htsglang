@@ -106,6 +106,63 @@ measured), plus a host-side wall clock around the four terms. Report per-layer
 mean and the 43-layer sum, per rank. Per-rank matters: the capacity split loads
 the weakest card most, and overlap only moves the bottleneck.
 
+**The instrument exists (#494)** — this step is now a measurement, not an
+implementation. `srt/utils/break_cost_clock.py` brackets every segment and
+every break slot inside `BreakableCUDAGraph.replay()` with a CUDA event pair,
+reads them `SGLANG_BREAK_COST_DEFER_ROUNDS` (default 2) rounds later through
+`Event.query()` only — there is no `synchronize()` on the path — and writes one
+JSON object per round per rank. Per crossing it reports `gap_in_ms`
+(segment end → slot: device idle while the host runs the rendezvous, WAIT),
+`slot_ms` (the slot's own device span, COMPUTE), `gap_out_ms` (slot → next
+segment, WAIT) and `host_ms`, the last split into F2's four terms by the phase
+brackets in `MoEExpertOffloadCache.prepare_breakable` (`rendezvous`,
+`planning`, `publish`, `fetch`). Per round it reports `compute_ms`, `wait_ms`,
+`span_ms` and the coherence `residual_ms`. Crossings are named after the break
+function, so the 43 MoE crossings are separable from any other break point in
+the step. OFF by default and byte-neutral when off (no event, no allocation);
+`tests/moe_offload/test_break_cost_probe_494.py`, 21 hermetic, executed
+can-fail arms.
+
+**Arming it (add to the `breakable` arm only, keep the eager control clean):**
+
+```bash
+export SGLANG_BREAK_COST_PROBE=1
+export SGLANG_BREAK_COST_PATH="$RUN/break_cost.jsonl"   # becomes one file per rank
+export SGLANG_BREAK_COST_WARMUP_ROUNDS=20               # skip capture/warmup rounds
+export SGLANG_BREAK_COST_DEFER_ROUNDS=2                 # never read in the recording round
+```
+
+`SGLANG_BREAK_COST_PATH` unset defaults to `/tmp/break_cost.<rank_tag>.jsonl`;
+set it into `$RUN` so the artifact survives with the window. Each rank appends
+to its own file (rank tag from `torch.distributed`, else `RANK`), so with TP=3
+expect `break_cost.rank0.jsonl`, `.rank1.jsonl`, `.rank2.jsonl`. Set
+`SGLANG_BREAK_COST_DETAIL=0` to drop the per-crossing array and keep only the
+per-break-point aggregate if the file grows inconvenient (43 crossings/step at
+~7 steps/s is ~30 KB/s with detail on).
+
+The probe's own harvest+emit cost during a round is reported per record as
+`probe_sink_ms` — subtract it before quoting any end-to-end ms/token taken in
+the same run, or take the ms/verify A/B of §5 with the probe OFF, which is the
+cleaner order: F2 first with the probe on, then §5 with it off.
+
+**Reading it:**
+
+```bash
+python3 scripts/dev/494_break_cost/summarise.py --drop-rounds 20 \
+  "$RUN"/break_cost.rank*.jsonl | tee "$RUN/F2_break_cost.txt"
+```
+
+which prints, per rank and per break point: crossings/round (must be **43** on
+DSV4F — a different number means the arm is not the one you think it is),
+per-crossing and per-step sums of `gap_in`/`slot`/`gap_out`/`host`, the four
+host terms, and `BREAK COST/step`. That last figure is the left-hand side of
+the verdict below. Cross-check `crossings/round` against the DEBUG
+`Break graph due to function: _moe_offload_fetch_step` count from §2 — two
+independent counts of the same event.
+
+Expected artifacts of this step: `$RUN/break_cost.rank{0,1,2}.jsonl` and
+`$RUN/F2_break_cost.txt`.
+
 **The verdict F2 produces:** `43 x (break + rendezvous + planning + publish)`
 against the launch-overhead saving the graph buys. Report both numbers and the
 ratio. No kill threshold — Aufwand/Ertrag decides, and a small win that is
