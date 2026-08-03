@@ -226,6 +226,7 @@ class Microphone {
     this.source = null;
     this.script = null;
     this.carry = new Float32Array(0);
+    this.pending = new Float32Array(0);
     this.open = false;
     this.path = "worklet";
     this.tapCalls = 0;
@@ -363,21 +364,44 @@ class Microphone {
     }
     this.carry = merged.slice(Math.floor(outLength * ratio));
 
+    // ACCUMULATE the downsampled output across calls. This line is the whole
+    // bug the first three phone tests were spent on: `out` used to be packed
+    // into frames and then dropped, while only the INPUT remainder was
+    // carried. A worklet quantum is 128 samples; at the 48 kHz Android picks,
+    // that is ~42 samples at the pipeline rate, and a 20 ms frame needs 320.
+    // So `start + frame <= out.length` was false on every single call and not
+    // one frame was ever produced -- with the microphone open, the context
+    // running and the worklet delivering (the phone reported 400 worklet
+    // calls and 537 chunks against 0 frames, which is what finally located
+    // it). Nothing on the server could see this, and the front-door harness
+    // cannot: it pushes PCM straight into the socket and never runs a line of
+    // this file.
+    const held = this.pending || new Float32Array(0);
+    const pending = new Float32Array(held.length + out.length);
+    pending.set(held, 0);
+    pending.set(out, held.length);
+
     const frame = Math.round(PIPELINE_RATE * FRAME_MS / 1000);
-    for (let start = 0; start + frame <= out.length; start += frame) {
+    let start = 0;
+    for (; start + frame <= pending.length; start += frame) {
       const pcm = new DataView(new ArrayBuffer(frame * 2));
       for (let i = 0; i < frame; i++) {
-        const s = Math.max(-1, Math.min(1, out[start + i]));
+        const s = Math.max(-1, Math.min(1, pending[start + i]));
         pcm.setInt16(i * 2, s * 32767, true);
       }
       this.frames = (this.frames || 0) + 1;
       this.onFrame(pcm.buffer);
     }
+    this.pending = pending.slice(start);
   }
 
   setOpen(open) {
     this.open = open;
-    if (!open) { this.carry = new Float32Array(0); return; }
+    if (!open) {
+      this.carry = new Float32Array(0);
+      this.pending = new Float32Array(0);
+      return;
+    }
     this.frames = 0;
     // Android suspends the capture context whenever the page is backgrounded,
     // and resuming it is not automatic on return. Cheap to repeat, silent to

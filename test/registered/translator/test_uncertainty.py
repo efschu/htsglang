@@ -85,7 +85,7 @@ class TestTheBand(unittest.TestCase):
         return ranked, self.registry.uncertainty(ranked, "speaker-2")
 
     def test_the_three_bands_produce_the_three_verdicts(self):
-        for cosine, expected in ((0.90, False), (0.65, True), (0.30, False)):
+        for cosine, expected in ((0.90, False), (0.61, True), (0.30, False)):
             with self.subTest(cosine=cosine):
                 ranked, (uncertain, _candidates) = self._verdict(cosine)
                 self.assertAlmostEqual(ranked[0][1], cosine, places=2)
@@ -102,7 +102,7 @@ class TestTheBand(unittest.TestCase):
         self.assertTrue(above)
 
     def test_the_candidates_are_the_similarities_the_assignment_used(self):
-        ranked, (_uncertain, candidates) = self._verdict(0.65)
+        ranked, (_uncertain, candidates) = self._verdict(0.61)
         known = [c for c in candidates if not c["new"]]
         self.assertEqual(known[0]["speaker_id"], ranked[0][0])
         self.assertAlmostEqual(known[0]["similarity"], round(ranked[0][1], 3))
@@ -152,7 +152,7 @@ class TestUncertaintyInSession(unittest.IsolatedAsyncioTestCase):
         """A session whose second turn lands inside the band."""
         session, _asr, _mt, _tts = make_session()
         anchor = unit(1.0, 0.0)
-        probe = at_similarity(anchor, 0.65)
+        probe = at_similarity(anchor, 0.61)
         vectors = iter([anchor, probe, probe])
 
         class ScriptedEmbedder:

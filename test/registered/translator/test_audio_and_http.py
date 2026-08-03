@@ -311,6 +311,38 @@ class TestWebSocketProtocol(unittest.TestCase):
             self.assertEqual(done["targets"], [LANG_B])
             self.assertIn("first_audio_ms", done["timings"])
 
+    def test_the_announced_rate_is_the_rate_on_the_wire(self):
+        """The Mickey Mouse falsifier.
+
+        The codec resamples to its own rate on the way out, so announcing the
+        session-side rate described samples that no longer existed: the TTS
+        produces 24 kHz, the codec ships 16 kHz, and a client that trusts the
+        announcement plays it 1.5x too fast and a fifth too high. The
+        front-door harness cannot catch this -- it decodes with the codec and
+        ignores the field -- so only a client ever suffered it.
+        """
+        codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="s1")
+            wire_rate = ready["codec"]["sample_rate"]
+            speech = AudioChunk(tone(VOICE_A_HZ, 2.0), RATE)
+            for frame in codec.encode(speech):
+                ws.send_bytes(frame)
+            ws.send_text(json.dumps({"kind": "release"}))
+            done, seen = drain_until(ws, lambda e: e.get("kind") == "turn.done")
+            self.assertIsNotNone(done, [e.get("kind") for e in seen])
+            announced = [
+                e["sample_rate"] for e in seen
+                if e.get("audio_follows") and "sample_rate" in e
+            ]
+            self.assertTrue(announced, "an audio event must announce its rate")
+            for rate in announced:
+                self.assertEqual(
+                    rate, wire_rate,
+                    "the announced rate must be the codec's, not the "
+                    "session's -- anything else is a pitch shift on a phone",
+                )
+
     def test_reconnect_resumes_the_journal_from_the_cursor(self):
         codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
         with self.client.websocket_connect("/api/translator/stream") as ws:

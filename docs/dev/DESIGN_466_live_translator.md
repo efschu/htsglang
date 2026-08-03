@@ -2042,16 +2042,21 @@ operating band:
 
 | similarity to nearest profile | verdict |
 |---|---|
-| `>= 0.70` (`match_threshold`) | confident same speaker — assign, fold, no badge |
-| `0.583 .. 0.70` | **uncertain** — the assignment is made as usual, the LINE is badged, candidates offered |
+| `>= 0.637` (`match_threshold`) | confident same speaker — assign, fold, no badge |
+| `0.583 .. 0.637` | **uncertain** — the assignment is made as usual, the LINE is badged, candidates offered |
 | `< 0.583` | confident new speaker — mint `speaker-N`, no badge |
 
-**Corrected against the code** (2026-08-03): an earlier draft of this table
-put the upper edge at the within-speaker p05 of 0.637. The band's upper edge
-is `match_threshold` (0.70), because that — not 0.637 — is where the
-assignment actually changes its answer, and a badge that disagreed with the
-decision it describes would mark lines the code was never in doubt about.
-0.637 keeps its own job: it is the bar for auto-resolution below.
+**`match_threshold` moved 0.70 → 0.637, and the first real conversation is
+why** (2026-08-03). 0.70 was the conventional ECAPA operating point taken from
+the literature; our own sweep says the same-speaker population on THIS
+embedder reaches down to 0.624, p05 0.637. A match bar above the floor of the
+same-speaker population is not a match bar — it splits one person into a new
+profile every few utterances, which is exactly what the first working phone
+conversation did: one speaker, a different identity every turn. Between-speaker
+p95 is 0.583, so 0.637 still clears the other population.
+
+An interim draft of this table put the upper edge at 0.70 to match the code as
+it then stood. The measurement won instead, and the two now agree.
 
 The verdict never changes WHO gets assigned. It only decides whether the line
 carries a badge, which is what keeps this feature free of the risk that a

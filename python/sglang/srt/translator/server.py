@@ -595,6 +595,15 @@ class _Connection:
             # Audio rides the binary channel; the JSON event announces it so
             # the client can attribute the frames that follow to a turn.
             payload["audio_follows"] = True
+            # The rate on the WIRE, which is the codec's, not the rate the
+            # audio had in the session. Pcm16Codec.encode() resamples to its
+            # own rate, so announcing event.audio.sample_rate described the
+            # samples BEFORE the codec touched them: the TTS produces 24 kHz,
+            # the codec ships 16 kHz, and the client faithfully played 16 kHz
+            # samples at 24 kHz -- 1.5x too fast and a fifth too high. The
+            # front-door harness could not see it because it decodes with the
+            # codec and ignores this field; only a real client trusts it.
+            payload["sample_rate"] = self.codec.sample_rate
             await self._send(payload)
             for frame in self.codec.encode(event.audio):
                 await self.ws.send_bytes(frame)

@@ -170,7 +170,16 @@ class SpeakerRegistryConfig:
     would otherwise mint a profile.
     """
 
-    match_threshold: float = 0.70
+    #: Measured on THIS embedder rather than taken from the literature.
+    #: `probe_speaker_change.py --pool` over the 17-voice pool at the shipped
+    #: 2.5 s window gives within-speaker p05 0.637 (min 0.624) against
+    #: between-speaker p95 0.583. The conventional ECAPA operating point of
+    #: 0.70 sits ABOVE the floor of the same-speaker population, so it splits
+    #: one person into a new profile on every few utterances -- which is
+    #: exactly what the first working phone conversation did: one speaker,
+    #: a different identity every turn. A match bar has to sit at or below
+    #: the same-speaker floor to be a match bar at all.
+    match_threshold: float = 0.637
     #: Below this cosine a segment is definitely a new speaker. Between the
     #: two thresholds the segment is assigned to the nearest speaker but is
     #: NOT admitted to their reference buffer -- an ambiguous segment is fine
