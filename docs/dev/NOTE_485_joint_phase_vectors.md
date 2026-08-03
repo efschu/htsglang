@@ -3,6 +3,20 @@
 DESK / PREDICTED. No boot was run for this note. The deciding arm is
 `TICKET_485_int8_joint_arm.md`.
 
+> **CORRECTION (#492, 2026-08-03).** Everything this note says about the
+> attention family being **grid-pinned** is **REFUTED**. It is kept, not
+> deleted, because the correction history is the point: the mistake was to
+> search ONE distribution axis, find it empty, and write the verdict down
+> about the FAMILY. The attention/KV family has two axes — head-partitioning
+> AND replication + token-sharding — and the second one is this fork's own
+> #62/#116 machinery, already active on every uneven-DCP boot. Read §4.2's
+> `(grid-pinned)` line, §4.3's framing, §6's "kv-head grid cannot express it",
+> and §7 item 2 as superseded by `NOTE_492_attention_replication_axis.md`.
+> The §4.1 regression column and every number in §4.2/§4.3 are unchanged and
+> still reproduce — the correction adds an axis, it does not move the old
+> arithmetic. The predicted gains carried into `TICKET_485_int8_joint_arm.md`
+> stay valid as the CORE-FREE endpoint of the wider bracket.
+
 The law this implements (CLAUDE.md, *PER-FAMILY x PER-PHASE OPTIMA*): every
 weight family has its own optimum per phase, so a single-family arm is a
 diagnostic and never a phase verdict. Slice 1 delivers the **prefill column**
@@ -87,7 +101,7 @@ Constraints hit, in the order they bite on Qwen3.6-27B (tp=3):
 
 | constraint | value here | effect |
 |---|---|---|
-| attention grid (#62/#116) | `attn_units = 4` kv heads | every rank keeps >= 1 unit, so the ONLY representable split is `[2,1,1]` — the base. **The attention family has no lever on this checkpoint.** |
+| attention grid (#62/#116) | `attn_units = 4` kv heads | every rank keeps >= 1 unit, so the ONLY representable split is `[2,1,1]` — the base. ~~**The attention family has no lever on this checkpoint.**~~ **REFUTED (#492)**: the HEAD AXIS has no lever. The family also has the replication + token-shard axis, which is continuous. |
 | GDN grid | `gdn_units = 16` k heads | the resolving grid; the whole ladder lives here |
 | MLP grid | 136 quant-group units | unchanged |
 | GDN state coupling (#299) | ~4.7 MiB/req/unit | pool follows the units; priced into `predict_capacity` |
@@ -144,8 +158,11 @@ mlp     38.78 / 82.72 / 82.15    56.01 / 51.42 / 50.20     82.72 -> 56.01
 ```
 
 Note what the joint gain is NOT: it is not skew removal. Skew barely moves
-(5.69 -> 5.55) because the attention family is pinned to `[2,1,1]` and keeps
-pacing on rank 2. The gain is the GDN barrier's own maximum falling 25 %,
+(5.69 -> 5.55) because the attention family's HEAD partition is pinned to
+`[2,1,1]` and keeps pacing on rank 2. (The `(grid-pinned)` label on the `attn`
+row above is REFUTED as a statement about the family — #492. It is correct
+only about the head axis; the family's core term follows the token vector and
+is not pinned at all.) The gain is the GDN barrier's own maximum falling 25 %,
 which the MLP vector cannot touch at any value. On FP8 the optimizer goes the
 other way and ACCEPTS skew (0 -> 9.53) to buy a much larger GDN rebalance —
 the objective is the lockstep time, not the skew, and the two only coincide
@@ -255,9 +272,13 @@ accepted — not bypassed.
    family as diverging, so #324 hands it the checkpoint-wide lane. The
    bracket contains the right answer but does not know it is the right
    answer. Fixing it would narrow the bracket to a point on both checkpoints.
-2. The attention family is grid-pinned at `attn_units = 4` on this
+2. ~~The attention family is grid-pinned at `attn_units = 4` on this
    checkpoint. A checkpoint with more kv heads (or DeepSeek V4's `o_groups`)
    would resolve it, and this machinery already handles that — untested on
-   hardware.
+   hardware.~~ **REFUTED (#492).** The HEAD AXIS is pinned at
+   `attn_units = 4`; the family is not. Replication + token-sharding is the
+   second axis and it is continuous, already live under uneven DCP, and
+   priced since #492. What actually blocks it on this rig is CAPACITY, not
+   the grid: see `NOTE_492_attention_replication_axis.md`.
 3. Whether the joint layout is worth its restart at all is a decision-layer
    question that belongs with #363's `regime_switch` rungs, not here.

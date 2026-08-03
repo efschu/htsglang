@@ -58,8 +58,29 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
   shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
-  TP>kv_heads, replicated is the DEGRADED layout). LSE log base follows the
-  attention backend (FlashMLA = natural log).
+  TP>kv_heads, replicated is the DEGRADED layout — and the rule is two-sided:
+  at TP <= kv_heads `replicated` is right and `dcp` costs 10-16 % accept,
+  `planner/rejected.py::draft_kv_dcp_below_kv_threshold`). LSE log base
+  follows the attention backend (FlashMLA = natural log).
+- **THE ATTENTION/KV FAMILY HAS TWO DISTRIBUTION AXES (#492).** Read this
+  before ever calling that family "pinned". (a) HEAD-partitioning, on the
+  kv-head grid (`attn_units`), which on a checkpoint whose kv-head count does
+  not divide across the ranks can be degenerate — Qwen3.6-27B at tp=3 admits
+  only `[2,1,1]`. (b) REPLICATION + TOKEN-SHARDING: **kv heads are
+  cloneable**. `uneven_dcp_kv_replicated` is gated on `dcp_size > 1 AND a base
+  plan installed` — **not** on kv-heads vs ranks — so on every uneven-TP boot
+  each rank already stores the FULL replicated kv-heads and only its own token
+  shard (`_pool_kv_head_num`), and runs the attention core over the
+  all-gathered head set (`cp_all_gather_heads_uneven`). The core's per-rank
+  mass therefore follows the TOKEN vector, which is continuous (the owner rule
+  takes any positive integer per rank — no grid, no >= 1-unit floor), and
+  replicating the compute role costs NO extra KV bytes because the bytes are
+  token-proportional already. A coarse kv-head grid therefore NEVER pins the
+  family. Separately: PROJECTION-weight replication (`attn_kv_replicated`) is
+  strictly `kv < tp`, the `<=` flip is measured-rejected, and at 24q/4kv over
+  3 ranks it is structurally unrepresentable (`units % groups != 0` and
+  `groups >= n` in the #116 alignment repair) — generalizing it is an unbuilt
+  #169-family posten, named in `NOTE_492_attention_replication_axis.md` §2.2.
 - **TPxPPxTP**: pipeline across rigs with per-stage TP groups. Slices 1+2
   merged (cross-rig PP=2 over 40G, full decode graphs on both stages incl.
   sm75). Slice 3 merged and cross-rig pp=2 validated: world-MIN
@@ -117,7 +138,10 @@ the whole concentration ladder is +3.0 to +4.6 % — inside the boots' own
 Details, backtest and the GPU confirmation ticket:
 `NOTE_475_phase_prefill_prediction.md`.
 
-**THE MATRIX DOCTRINE — rows are FAMILIES, columns are PHASES (#485).** A
+**THE MATRIX DOCTRINE — rows are FAMILIES, columns are PHASES (#485), and a
+row can have more than one AXIS (#492).** A family's optimum is not searched
+until every axis it distributes on has been searched: finding one axis empty
+and reporting the FAMILY as pinned is the #485 error. A
 layout is not one vector. It is a table: every weight family (MLP / routed
 experts, attention projections, GDN or mamba state, KV cache, vocab head,
 vision tower, ...) has its own optimum in every phase or regime (prefill-class,
@@ -138,10 +162,22 @@ per-candidate family pacers, and prints a `JOINT PREFILL LAYOUT` launch line):
 the attention/GDN family is cut on its own #324 lane and its own grids, the GDN
 state pool and the coupled KV vector follow it, and every candidate keeps >= 1
 unit on the kv-head and GDN k-head grids (#62/#116). On the reference rig the
-attention family is grid-PINNED (4 kv heads, 3 ranks -> only `[2,1,1]` is
-representable), so in practice the lever is the 16-unit GDN grid: desk-predicted
-+1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on FP8, both bracketed
-(see below). The solve REPORTS the pair and does not install it — the only
+attention HEAD AXIS is grid-pinned (4 kv heads, 3 ranks -> only `[2,1,1]` is
+representable), so on that axis the lever is the 16-unit GDN grid:
+desk-predicted +1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on FP8,
+both bracketed (see below). **#492 CORRECTION — that is NOT "the family is
+pinned", and slice 1 said so wrongly (user-caught, 2026-08-03).** The family's
+second axis (replication + token-sharding, §1) is continuous and live today;
+the solve now prices it at both ends of a CORE-FREE / CORE-PACED bracket,
+prints the geometric core/projection crossover depth (8,533 attended tokens on
+Qwen3.6-27B — pure geometry, no fitted constant), and applies the same context
+floor the main solve does. The corrected verdict on THIS rig: the axis is
+blocked by **capacity, not the grid** — every token candidate is refused at
+`--rank-perf-loose-ctx-percent 0` (the weighted owner rule funds
+`min_r(P_r/v_r)` blocks, so concentrating the token vector discards the slow
+cards' pools), and it only becomes reachable at loose 80-95 for +0.1 to +1.9
+points against a 4-17x context loss. `NOTE_492_attention_replication_axis.md`.
+The solve REPORTS the pair and does not install it — the only
 runtime actuator for an attention vector is `--rank-tp-ratio`, since "mlp" is
 the sole named family plan. Where the flash/scan core's per-token mass would be
 needed the model BRACKETS instead of estimating: the same solve is run at the

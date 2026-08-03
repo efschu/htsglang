@@ -700,6 +700,48 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "refuses while that variable is set)"
         ),
     ),
+    RejectedEntry(
+        key="draft_kv_dcp_below_kv_threshold",
+        what=(
+            "putting the DRAFT KV cache on the token-sharded layout "
+            "(--draft-kv-layout dcp) at tp <= num_kv_heads, to extend the "
+            "#492 replication+token axis from the target to the draft"
+        ),
+        verdict=(
+            "NOT A DEFAULT below the threshold: the applicability rule is "
+            "two-sided and both sides are measured. Above tp > kv_heads 'dcp' "
+            "is right and 'replicated' is the DEGRADED layout (accept 1.05, "
+            "61 verify rounds for 64 tokens); at or below it 'replicated' is "
+            "right and 'dcp' is VRAM-neutral and costs 10-16 % acceptance."
+        ),
+        gain=(
+            "the target's token-vector attention lever would also apply to "
+            "the draft's attention barrier instead of only the target's"
+        ),
+        cost="10-16 % acceptance, for no VRAM saving at this threshold",
+        why=(
+            "below the threshold every rank can hold a real kv-head shard, so "
+            "the draft has a head split to run on; token-sharding it splits "
+            "the draft's own context instead and buys nothing, while the "
+            "verify round still pays the full speculative cost."
+        ),
+        level=NOT_DEFAULT,
+        evidence=(
+            "docs/dev/TASK_108_DRAFT_KV_DCP.md, 'TP > num_kv_heads window' "
+            "Q2 table and the two-sided rule below it "
+            "(/spinning/gpu-battery-results/2026-08-02_108-tpgtkv/)"
+        ),
+        tags=("uneven-dcp", "draft-kv-layout", "spec"),
+        scope="general",
+        note=(
+            "This is the SPEC cross-charge of the #492 replication axis. The "
+            "axis itself is not rejected -- the target's KV is already "
+            "replicated-heads + token-sharded under uneven DCP and costs "
+            "nothing extra there. Only dragging the draft onto it below the "
+            "threshold is."
+        ),
+        unlock="--draft-kv-layout dcp",
+    ),
 )
 
 
