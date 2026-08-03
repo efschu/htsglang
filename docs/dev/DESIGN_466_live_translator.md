@@ -2599,6 +2599,56 @@ his real device audio, per-decision candidate-cosine logging persisted
 server-side, rolling reference growth, and speaker MERGE with reference-buffer
 union and history relabelling.
 
+#### 17.8.9 Handover, 2026-08-03 (third session, context exhausted)
+
+**Live build `78865baf74`**, tenant restarted from
+`/root/.claude/jobs/1481bb40/tmp/boot_tenant.sh`, log `tenant15_fixed.log`.
+Branch pushed to `origin/feat/live-translator-466` at `2b51657d6d`. GPU
+holder heartbeat is `hb466.sh` (PID reparented to init, survives the session).
+
+**Done this session**
+
+* the live-delivery regression: root-caused from his session, fixed on both
+  sides, falsifier green in both directions (§17.8.7). CONFIRMED BY THE USER
+  on his device afterwards -- "quality almost great";
+* the gate's replay-then-live arm, with the can-fail proof that took two
+  false greens to earn (§17.8.7);
+* the language whitelist reach hole, root-caused with evidence and recorded
+  but NOT fixed (§17.8.8). This is the top build item;
+* two new standing orders recorded: reset button (§19.3b), temporal
+  continuity prior (§19.7).
+
+**Open, in the order the user's reports set**
+
+1. **§17.8.8, the decode-side language fix.** Root cause is proven and the
+   remedy is stated; only the build and its gate arm remain.
+2. **The speaker complex.** Nothing of §19.2 is built yet, and the first step
+   is forced: `speakers.py` contains NO logging at all, so every assignment
+   decision is currently unreadable after the fact. Persist the per-decision
+   candidate cosines FIRST or the calibration is blind again. Thresholds in
+   force are `match_threshold 0.637` / `uncertain_floor 0.583`
+   (`speakers.py:182,230`). His turn-3 mis-mint therefore sat BELOW 0.583
+   against his own profile, which on clean audio is the number that wants
+   explaining -- and the contaminated pre-fix references are gone now (the
+   tenant restarts purged every profile), so the re-measurement is finally on
+   clean input. Then the §19.7 prior, then merge.
+3. **§18.4 item 1, the first-clause split.** Checked this session and worth
+   recording so nobody re-checks it: MT-to-TTS streaming is ALREADY built --
+   `session.py:1566-1578` runs `async for delta in mt.translate_stream(...)`,
+   pushes each delta through `SentenceAccumulator`, and calls `speak(unit)`
+   per completed unit. So the "does TTS wait for the whole translation"
+   intermediate win does not exist; it is already streamed. What remains is
+   exactly §18.4's item 1, shortening the FIRST unit: the accumulator emits at
+   SENTENCE boundaries, so first audio still costs a whole sentence of
+   synthesis. Note also that `speak()` is AWAITED inside the MT loop, so the
+   `mt_total` figure in gate output includes synthesis and is not pure MT.
+4. §19.3 UI redesign (unstarted), §19.5 quality ladder, §19.6.
+
+**Second speaker exists now.** His wife's turns are the first real
+second-speaker data in the project and the practical test case for §19.7's
+language-change counter-signal -- once §17.8.8 makes her turns decode
+correctly at all.
+
 #### 17.8.7 A cursor outliving its session silenced every live event
 
 User, on the build that had just fixed the replayed-history noise: "nothing
