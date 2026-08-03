@@ -1182,6 +1182,43 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Resolution-ordering family (#499): a `server_args` field read on both sides of
+`materialize_declarations` is TWO values. The #89 hibernate manifest identity
+(`model_loader/hibernate.py:_model_identity`) is computed at the MATCH inside
+`ServerArgs._handle_load_format` (`server_args.py:13332`, reached from
+`__post_init__` at `:5939`) and again at the PARK in the worker
+(`weight_updater._hibernate_park_weights` -> `hibernate.py:518`) -- the first
+BEFORE `materialize_declarations(self)` (`server_args.py:5984`), the second
+long after it. `quantization` is declared `"gguf"` by the `_gguf_quantization`
+pass (`arg_groups/overrides.py:2091`), invoked at the HEAD of that same handler
+(`:13300`), so every manifest was written with `"gguf"` while every subsequent
+boot compared `None`: the identity could never match its own park, and #89's
+fast restore was unreachable on GGUF -- the only checkpoint class #89 supports
+(`if self.load_format != "gguf": raise`, `:13327`). The park kept reporting
+success and the mismatch fell back to a cold load that works, so nothing
+surfaced (SUCCESS-CLAIMS family). Fixed by computing the identity through
+`resolved_view` (`overrides.py:230-235`), the mid-resolution equivalent of the
+post-materialization fields, so both sides read the same value.
+`HIBERNATE_VERSION` stays 2: the park side's bytes do not move, the match side
+joins it, and manifests parked before the fix become matchable rather than
+invalid. Reach of the hazard read off the metadata, not off prose: of the nine
+identity fields only `quantization` and `dtype` are declarable at all
+(`Arg(resolvable=True)`) -- `validate_declarations` (`overrides.py:2176`)
+refuses the other seven by name, so they can only be written imperatively, and
+every such writer runs before `:5939` (`rank_tp_ratio`/`dcp_size` in
+`_handle_uneven_tp`, `:5785`). So the rule: **a value read during
+`__post_init__` and again after it is two values unless it is read through
+`resolved_view`**, and a fingerprint compared across processes is computed by
+ONE function at ONE pipeline stage. Residual, named and NOT fixed: a field
+resolved in the WORKER after the match via `declare_load_time_override` --
+concretely `ModelRunner._sm80_dtype_fallback` declaring `dtype="float16"` on
+pre-Ampere cards (`model_executor/model_runner.py:1980`) -- still diverges;
+unreachable on sm80+ (this rig is sm86/sm120), live on the sm75 hetero host.
+Falsifier: `test/registered/unit/model_loader/test_hibernate_identity_499.py`
+(6 tests incl. a metadata-derived sibling sweep and an end-to-end "park, then
+reboot the same command" arm; 4 executed red against the pre-fix file, the
+sweep red on both declarable fields).
+
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
 `kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the

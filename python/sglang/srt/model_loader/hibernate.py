@@ -86,16 +86,64 @@ def _rank_file_name(tp_rank: int, nvml_uuid: str) -> str:
 
 
 def _model_identity(server_args) -> Dict[str, Any]:
+    """The launch-arg fingerprint, read through the DECLARATION OVERLAY.
+
+    #499: the two callers sit on opposite banks of the resolution pipeline.
+    The MATCH runs inside ``ServerArgs._handle_load_format``
+    (``server_args.py:13332``), which ``__post_init__`` calls at
+    ``server_args.py:5939`` -- BEFORE ``materialize_declarations(self)`` at
+    ``server_args.py:5984``. The PARK runs in the worker
+    (``weight_updater._hibernate_park_weights``) on a fully materialized
+    ``server_args``. A field resolved by a DECLARATION therefore still carried
+    its raw value on the match side and the resolved one on the park side.
+
+    For GGUF -- the only checkpoint class #89 supports -- that field is
+    ``quantization``: ``_gguf_quantization`` (``arg_groups/overrides.py:2091``)
+    declares ``"gguf"``, and it is invoked at the HEAD of the very handler that
+    then runs the match (``server_args.py:13300``), so the stash already holds
+    it while the field is still ``None``. Every manifest was written with
+    ``"gguf"`` and every subsequent boot compared against ``None`` -- the fast
+    restore was unreachable.
+
+    ``resolved_view`` is the mid-resolution equivalent of the post-
+    materialization fields (``overrides.py:230-235``): it overlays the
+    accumulated declarations (last writer wins, same rule as materialization)
+    on the pristine fields. After materialization the two agree by
+    construction, so the same function now yields the same value on both
+    sides. Reach: only ``quantization`` and ``dtype`` are declarable at all
+    (``Arg(resolvable=True)``); ``validate_declarations``
+    (``overrides.py:2176``) refuses the other identity fields by name, so they
+    can only be written imperatively -- and every such writer runs before
+    :5939.
+
+    Residual (NOT covered here, and it cannot be): a value resolved in the
+    WORKER after the match, via ``declare_load_time_override`` -- concretely
+    ``ModelRunner._sm80_dtype_fallback`` (``model_executor/model_runner.py:
+    1980``) declaring ``dtype="float16"`` on pre-Ampere cards. That lands in
+    another process after this boot's match already ran, so a park on such a
+    card writes ``float16`` while the next boot parses ``auto``. Not reachable
+    on sm80+ hardware; tracked separately.
+
+    Manifest compatibility: neither the key set nor the value a PARK writes
+    changes (the park side was already materialized), so ``HIBERNATE_VERSION``
+    stays 2 -- the fix moves the MATCH side onto the same value, which turns
+    already-parked manifests from never-matching into matching. It cannot make
+    a previously matching manifest stop matching: without a declaration the
+    overlay read is the field read.
+    """
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    cfg = resolved_view(server_args)
     return {
-        "model_path": server_args.model_path,
-        "quantization": server_args.quantization,
+        "model_path": cfg.model_path,
+        "quantization": cfg.quantization,
         "load_format_original": "gguf",
-        "dtype": str(server_args.dtype),
-        "tp_size": server_args.tp_size,
-        "dcp_size": getattr(server_args, "dcp_size", None),
-        "rank_tp_ratio": getattr(server_args, "rank_tp_ratio", None),
-        "rank_gpu_id": getattr(server_args, "rank_gpu_id", None),
-        "context_length": server_args.context_length,
+        "dtype": str(cfg.dtype),
+        "tp_size": cfg.tp_size,
+        "dcp_size": getattr(cfg, "dcp_size", None),
+        "rank_tp_ratio": getattr(cfg, "rank_tp_ratio", None),
+        "rank_gpu_id": getattr(cfg, "rank_gpu_id", None),
+        "context_length": cfg.context_length,
     }
 
 
