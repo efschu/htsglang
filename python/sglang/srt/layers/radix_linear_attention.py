@@ -21,6 +21,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.layers.radix_attention import (
+    narrow_pcg_token_views,
+    restore_pcg_token_views,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -138,10 +142,12 @@ def unified_linear_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
-    original_out_cache_loc = forward_batch.out_cache_loc
-    # Keep the original ForwardBatch object and only narrow cache locations for
-    # this backend call so model/backend state is still written to the same batch.
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    # Keep the original ForwardBatch object and only narrow its token-axis
+    # views for this backend call so model/backend state is still written to
+    # the same batch. Same pair as the attention ops (#472): the linear-attn
+    # backends do not read ``positions`` today, and narrowing it here is what
+    # keeps that from becoming a latent hazard the day one does.
+    _pcg_originals = narrow_pcg_token_views(forward_batch, real_num_tokens)
 
     ret = get_attn_backend().forward(
         layer=attention_layer,
@@ -150,7 +156,7 @@ def unified_linear_attention_with_output(
         a=a[:real_num_tokens],
         b=b[:real_num_tokens],
     )
-    forward_batch.out_cache_loc = original_out_cache_loc
+    restore_pcg_token_views(forward_batch, _pcg_originals)
 
     output[:, :real_num_tokens].copy_(ret)
     return

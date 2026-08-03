@@ -51,6 +51,43 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
         buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
 
 
+def narrow_pcg_token_views(forward_batch, real_num_tokens):
+    """Narrow the token-axis ForwardBatch views the backend must see under PCG.
+
+    The piecewise / breakable CUDA graph pads every token-axis buffer to the
+    captured bucket. Q/K/V are narrowed to ``real_num_tokens`` before the
+    backend call, so the token-axis FB fields the backend indexes ALONGSIDE
+    them have to be narrowed identically or row ``i`` of the query no longer
+    describes row ``i`` of the metadata.
+
+    Both fields matter and for different reasons:
+      * ``out_cache_loc`` -- the write target; a padded row's ZERO-filled slot
+        would be written with garbage.
+      * ``positions`` -- the EVEN DCP owner rule derives KV ownership from it
+        (``dcp_even_write_mask``). Leaving it padded while ``out_cache_loc`` is
+        narrowed makes the two lengths disagree, which used to silently drop
+        the owner mask altogether (#472, upstream sgl-project/sglang#33253).
+        Our WEIGHTED owner rule reads ``out_cache_loc`` instead and is immune,
+        but both rules ship in this tree, so the narrowing is unconditional.
+
+    Returns the originals; hand them to ``restore_pcg_token_views`` right after
+    the backend call so the shared ForwardBatch leaves the op untouched. Stated
+    once because every custom op under the piecewise context needs the exact
+    same pair -- one op narrowing a different set is the drift that produced
+    this bug in the first place.
+    """
+    originals = (forward_batch.out_cache_loc, forward_batch.positions)
+    forward_batch.out_cache_loc = originals[0][:real_num_tokens]
+    if originals[1] is not None:
+        forward_batch.positions = originals[1][:real_num_tokens]
+    return originals
+
+
+def restore_pcg_token_views(forward_batch, originals) -> None:
+    """Undo ``narrow_pcg_token_views`` on the shared ForwardBatch."""
+    forward_batch.out_cache_loc, forward_batch.positions = originals
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -249,10 +286,10 @@ def unified_attention_with_output(
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_num_tokens]
 
-    original_out_cache_loc = forward_batch.out_cache_loc
-    # Keep the original ForwardBatch object and only narrow cache locations for
-    # this backend call so model/backend state is still written to the same batch.
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    # Keep the original ForwardBatch object and only narrow its token-axis
+    # views for this backend call so model/backend state is still written to
+    # the same batch.
+    _pcg_originals = narrow_pcg_token_views(forward_batch, real_num_tokens)
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_num_tokens to match the narrowed query shape —
@@ -268,7 +305,7 @@ def unified_attention_with_output(
         save_kv_cache,
         **kwargs,
     )
-    forward_batch.out_cache_loc = original_out_cache_loc
+    restore_pcg_token_views(forward_batch, _pcg_originals)
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
@@ -314,8 +351,7 @@ def unified_sparse_attention_with_output(
     if idx_v is not None:
         idx_v = idx_v[:real_num_tokens]
 
-    original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    _pcg_originals = narrow_pcg_token_views(forward_batch, real_num_tokens)
 
     ret_idx, ret_out = get_attn_backend().forward(
         query,
@@ -328,7 +364,7 @@ def unified_sparse_attention_with_output(
         idx_k=idx_k,
         idx_v=idx_v,
     )
-    forward_batch.out_cache_loc = original_out_cache_loc
+    restore_pcg_token_views(forward_batch, _pcg_originals)
 
     attn_out[:real_num_tokens].view(ret_out.shape).copy_(ret_out)
     # disable_value layers return ret_idx=None; the guard keeps idx_out's
