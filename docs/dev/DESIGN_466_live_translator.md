@@ -796,3 +796,51 @@ Still open:
 - **Enrollment from curated samples.** Implemented and tested, but per the
   2026-08-03 decision it is deliberately unused before the trip; it becomes a
   per-speaker upgrade slot afterwards.
+
+---
+
+## 10. First contact, and the serving-runtime reversal (2026-08-03)
+
+The GPU window ran step (b)(0)'s prerequisite — standing the TTS stage up — and
+the run was cut short by a standing user order partway through: **no vLLM
+anywhere, ever.** Everything serves inside htsglang, because cross-asset
+spill/offload/eviction arbitration requires one runtime with one ledger, and a
+foreign serving process is invisible to that register. vLLM-Omni is therefore
+struck as the serving choice of §2.3, and a native bring-up (task #488)
+replaces it.
+
+The measurements survive the reversal and are the reason this section exists.
+They are a *contract*, observed rather than read, and #488 has to implement it.
+
+**The §9 warning was correct, and cost nine defects.** Every one would have
+passed the desk suite, because the stub was built from the same documentation
+as the adapter. Full list with evidence in
+`/spinning/gpu-battery-results/2026-08-03_w3_t0_translator/RESULTS.md`. The
+load-bearing ones:
+
+* `--omni` is a `sys.argv` sentinel, not a flag — omitting it does not fail, it
+  silently serves a *plain LLM* whose only symptom is a missing `/v1/audio/*`.
+  Silent-wrong-mode beats loud-failure as a time sink, and it is the shape of
+  bug to expect again in a native port.
+* The voice registry takes `audio_sample` + a required `consent`, not `file` +
+  `model`, and answers `{"success":…,"voice":{"name":…}}`.
+* `language` is an English name (`German`), not an ISO code — the translator
+  speaks ISO codes everywhere, so a mapping layer is structural, not cosmetic.
+* `reference_text` is `ref_text`, and unknown keys are **silently dropped** —
+  the reference transcript would have disappeared without an error.
+* `x_vector_only_mode` is real but rejected on the registry path. This matters
+  for §2.3: registering a clip **without** `ref_text` already keeps the
+  reference transcript out of the LM context, which is the whole property the
+  flag was selected for. The mechanism the four leaders converge on survives
+  the reversal; only its spelling was wrong.
+
+**Latency: the stage is not the risk.** Warm streaming first-audio on a 3080
+measured **71 ms** against a 150–300 ms budget, RTF 0.16. Cold start is 27–29 s
+of warmup and must never be quoted against the budget. A native implementation
+inherits 71 ms as the bar, not as a target.
+
+**Still owed, and now owed to #488:** the 36 preset clips. The render mechanism
+was proven on a single clip (`task_type="VoiceDesign"` + `instructions` +
+`seed`) immediately before the reversal; the batch never ran. §8 risk 7 stands
+unchanged and is now the cheapest high-value step on the list — the pool is
+what every other path degrades to, and nothing degrades to an empty pool.

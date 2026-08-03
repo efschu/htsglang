@@ -45,6 +45,23 @@ echo "installing the serving stack (this pulls its own torch -- expected)"
   "soundfile" \
   "numpy"
 
+# vllm-omni does NOT depend on vllm (observed 2026-08-03: `vllm` appears
+# nowhere in its Requires-Dist). It is a plugin, so the core has to be
+# installed explicitly or `vllm-omni serve` dies with ModuleNotFoundError on
+# the first import. The two projects version in lockstep -- vllm-omni X.Y is
+# released "aligned with vLLM X.Y" -- so the core pin is derived from the
+# installed plugin version rather than hardcoded, and installing it correctly
+# pins torch back down (vllm-omni's own deps float torch upward past what the
+# core supports: 2.13.0 vs the 2.11.0 vLLM 0.24 wants).
+OMNI_VERSION="$("$VENV/bin/python" - <<'PY'
+import importlib.metadata as md
+print(".".join(md.version("vllm-omni").split(".")[:2]))
+PY
+)"
+[ -n "$OMNI_VERSION" ] || die "could not read the installed vllm-omni version"
+echo "installing the matching vLLM core: vllm==${OMNI_VERSION}.*"
+"$VENV/bin/pip" install "vllm==${OMNI_VERSION}.*"
+
 if [ ! -d "$MODEL_DIR" ]; then
   cat >&2 <<EOF
 warning: no checkpoint at $MODEL_DIR

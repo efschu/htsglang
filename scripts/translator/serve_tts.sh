@@ -27,7 +27,7 @@ PID_FILE="${LOG_DIR}/tts.pid"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[ -x "$VENV/bin/vllm" ] || die "no vllm in $VENV; run scripts/translator/setup_tts_venv.sh first"
+[ -x "$VENV/bin/vllm-omni" ] || die "no vllm-omni in $VENV; run scripts/translator/setup_tts_venv.sh first"
 [ -d "$MODEL_DIR" ] || die "no checkpoint at $MODEL_DIR"
 
 case "$CARD_UUID" in
@@ -45,9 +45,19 @@ fi
 
 echo "serving $(basename "$MODEL_DIR") on ${HOST}:${PORT}, card ${CARD_UUID}"
 
-# --omni is what adds the audio surfaces: POST /v1/audio/speech and the
+# `--omni` is what adds the audio surfaces: POST /v1/audio/speech and the
 # /v1/audio/voices registry the cloning path needs.
-CUDA_VISIBLE_DEVICES="$CARD_UUID" setsid "$VENV/bin/vllm" serve "$MODEL_DIR" \
+#
+# Observed on first contact (2026-08-03), correcting the binary this script was
+# written against: the flag belongs to the `vllm-omni` console script, not to
+# stock `vllm`. vllm-omni is a PLUGIN whose entry point registers omni models
+# into vLLM; its CLI wrapper decides which server to run by scanning argv for
+# the literal "--omni" BEFORE argparse runs, and delegates to stock vLLM when
+# it is absent. Two consequences worth knowing, because both cost time here:
+# the flag is invisible to every `--help` listing, and omitting it does not
+# fail -- it silently boots a plain LLM server whose only symptom is that
+# /v1/audio/* is missing from /openapi.json.
+CUDA_VISIBLE_DEVICES="$CARD_UUID" setsid "$VENV/bin/vllm-omni" serve "$MODEL_DIR" \
   --omni \
   --served-model-name "${TRANSLATOR_TTS_MODEL_NAME:-qwen3-tts}" \
   --host "$HOST" \
