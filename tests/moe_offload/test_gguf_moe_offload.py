@@ -23,7 +23,7 @@ What is pinned here:
   * a full round trip: install -> resolve -> fetch -> remap -> apply over the
     two tiers reproduces the all-resident reference BIT-FOR-BIT after dequant;
   * the #268 guard both ways: a staged layer is admitted, an unstaged one
-    (uncovered ggml type, e.g. MXFP4) is still refused;
+    (a ggml type outside MOE_OFFLOAD_SUPPORTED_TYPES) is still refused;
   * the #390 expert_stats instrument counts on the GGUF path.
 
 The fetch in the round-trip test is a host->host copy (no CUDA context), so it
@@ -68,6 +68,34 @@ W2_ROWS = 3  # down rows per expert
 BLOCKS_PER_ROW = 2
 W13_TYPE = WeightType.Q4_K
 W2_TYPE = WeightType.Q6_K
+
+
+def _uncovered_ggml_type() -> WeightType:
+    """A ggml type the GGUF MoE offload cannot feed, on ANY wheel.
+
+    This used to be MXFP4 (39) hardcoded, which #398 turned into a COVERED
+    type on a wheel carrying the native kernels -- so the two tests below
+    asserted the opposite of the truth and went red the moment the wheel was
+    built (#479 finding). Derive it from the coverage set instead: the answer
+    then follows the code rather than a build-time assumption. TQ1_0/TQ2_0 are
+    the preferred candidates because they are quantized types with no CUDA
+    kernel in this stack at all; the search is the backstop if that ever
+    changes.
+    """
+    from sglang.srt.layers.quantization.gguf import MOE_OFFLOAD_SUPPORTED_TYPES
+
+    covered = {int(t) for t in MOE_OFFLOAD_SUPPORTED_TYPES}
+    for name in ("TQ1_0", "TQ2_0", "Q8_K"):
+        candidate = getattr(WeightType, name, None)
+        if candidate is not None and int(candidate) not in covered:
+            return candidate
+    raise AssertionError(
+        "no quantized ggml type is outside MOE_OFFLOAD_SUPPORTED_TYPES; the "
+        "#268 guard's refusal direction can no longer be exercised"
+    )
+
+
+UNCOVERED_TYPE = _uncovered_ggml_type()
 
 
 def _row_bytes(qtype):
@@ -279,9 +307,9 @@ def _gguf_layer(num_owned=E, expert_shard=False, declared_w2_type=None):
     layer._gguf_expert_range = (0, num_owned)
     layer.w13_qweight_type = _QType(W13_TYPE)
     # ``declared_w2_type`` decouples the ggml type the layer ADVERTISES from
-    # the byte layout the synthetic tensors use, so an uncovered type (MXFP4 /
-    # 39, which gguf-py cannot even size) can be exercised without inventing
-    # its block format.
+    # the byte layout the synthetic tensors use, so an uncovered type
+    # (``UNCOVERED_TYPE``, which gguf-py cannot even size here) can be
+    # exercised without inventing its block format.
     layer.w2_qweight_type = _QType(
         W2_TYPE if declared_w2_type is None else declared_w2_type
     )
@@ -399,9 +427,9 @@ def test_materialize_pins_the_padding_expert_under_expert_shard(monkeypatch):
 
 
 def test_materialize_declines_uncovered_ggml_type(monkeypatch):
-    """MXFP4 (type 39) has no GGUF MoE kernel: no staging, no marker."""
+    """A type with no GGUF MoE kernel: no staging, no marker."""
     monkeypatch.setenv(FRACTION_ENV, "0.25")
-    layer = _gguf_layer(declared_w2_type=39)
+    layer = _gguf_layer(declared_w2_type=int(UNCOVERED_TYPE))
     layer.materialize_gguf_weights()
 
     assert not getattr(layer, "_moe_offload_gguf_staged", False)
@@ -430,7 +458,7 @@ def test_guard_admits_a_staged_gguf_layer(monkeypatch):
 def test_guard_still_refuses_an_unstaged_gguf_layer(monkeypatch):
     """Can-fail proof: same quant method, uncovered ggml type -> still hard."""
     monkeypatch.setenv(FRACTION_ENV, "0.25")
-    layer = _gguf_layer(declared_w2_type=39)
+    layer = _gguf_layer(declared_w2_type=int(UNCOVERED_TYPE))
     layer.materialize_gguf_weights()
     with pytest.raises(RuntimeError) as excinfo:
         assert_expert_offload_quant_supported(
@@ -439,7 +467,9 @@ def test_guard_still_refuses_an_unstaged_gguf_layer(monkeypatch):
     msg = str(excinfo.value)
     assert "GGUFMoEMethod" in msg
     assert "_moe_offload_gguf_staged" in msg
-    assert "MXFP4" in msg
+    # #479: the refusal names the layer's OWN declared types, not a
+    # hardcoded example type that a later kernel set can make covered.
+    assert f"w2_qweight_type={int(UNCOVERED_TYPE)}" in msg
 
 
 def test_guard_refuses_gguf_without_a_layer():
