@@ -104,7 +104,13 @@ class TestDsparkNvfp4Exclusion(unittest.TestCase):
 
         mapper = DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name
         mapped = mapper(
-            types.SimpleNamespace(confidence_head=None),
+            types.SimpleNamespace(
+                confidence_head=None,
+                # The suffix-anchored rename lives in a staticmethod the
+                # unbound call reaches through `self` (#491); hand the fake
+                # self the real one instead of restating the rules here.
+                _remap_mtp_rest=DeepseekV4ForCausalLMDSpark._remap_mtp_rest,
+            ),
             "mtp.0.ffn.experts.0.w1.weight",
         )
         self.assertIsNotNone(mapped)

@@ -90,6 +90,16 @@ Same residency as Boot A step 2, plus the arm from `rig-runbook.md` §4.5.4:
   of magnitude only). Below ~0.45 on a comparable mix means the block/Markov
   chaining is wrong, not merely slow.
 
+**Pre-boot blockers cleared (#491, branch `fix/dspark-probe-scale-491`).** Two
+desk-fixable defects that Boot B/C would have hit on a packed draft are fixed,
+each with a falsifier arm run in both directions (see
+`NOTE_490_pr33271_abgleich.md` §C): the DSpark fused-KV-projection *support
+probe* now answers `False` for marlin/AWQ/GPTQ linears instead of raising
+`AttributeError` on the first speculative CUDA forward (a scheduler kill under
+check 3 below), and the draft's `.scale` checkpoint rename is anchored at the
+suffix so a packed draft no longer drops every scale with a warning and pins
+the accept rate to zero. Boot on a branch that carries both.
+
 ### 3.1 First-boot checks, in order (cheap before expensive)
 
 1. The log says `Draft-solo placement: rank N HOSTS the unsharded solo draft`
