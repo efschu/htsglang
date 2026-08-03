@@ -541,7 +541,10 @@ language ID -> speaker embedding + incremental clustering -> MT **through our
 own OpenAI endpoint** (the dogfood hop; nothing imports `srt` internals) ->
 zero-shot cross-lingual cloning TTS. Own process, own CUDA context, NVML-UUID
 card pin, absolute MiB budget — the same Class-3 escape hatch `video_enhance`
-took, because DESIGN_333 §2.3's Class-3 scheduler does not exist yet.
+took, because DESIGN_333 §2.3's Class-3 scheduler does not exist yet. Every
+model it loads is an in-process `nn.Module` registered as the `audio_modules`
+asset class in the #286 ledger (parkable, evictable): ONE RUNTIME, no second
+serving engine.
 **The language pair is never in the code**: the supported set is derived at
 runtime as ASR x MT x TTS (`/api/translator/languages` also returns the
 per-stage sets, so a missing language is attributable to a checkpoint rather
@@ -560,18 +563,35 @@ byte-budgeted audio eviction that keeps the *events*, explicit `resume.gap`,
 and a session that outlives its socket so the reference buffers survive a
 roaming dropout. Client is a single-file PWA (no build, no external asset;
 getUserMedia AEC/NS/AGC is what dissolves the half-duplex feedback loop).
-Real TTS is an HTTP client (`tts_backends.py`) against vLLM-Omni's
-`/v1/audio/speech` + `/v1/audio/voices`, in its OWN venv -- every candidate TTS
-package pins a `transformers` that conflicts with sglang's, so the process
-boundary is forced, not stylistic; the language set is read from the
+Real TTS is Qwen3-TTS-12Hz-0.6B driven IN PROCESS (`inprocess_tts.py`,
+rung B of DESIGN_466 §12) -- the vLLM-Omni HTTP sidecar is REVOKED under the
+one-runtime law, and the `transformers` pin that appeared to force a second
+venv turned out to be conservative: seven measured 4.57->5.12 drifts, all in
+`qwen3_tts_compat.py`. Two of them are the kind worth knowing about, because
+neither fails loudly: 5.x stopped creating `cache_position` (which the talker
+branches on to tell prefill from decode, so every decode step got
+cache-length M-RoPE positions for a one-token query), and `from_pretrained`
+reported loading 478 tensors while loading NONE -- a randomly initialised
+talker in front of a trained vocoder emits fluent babble that no cheap signal
+distinguishes from a working model, so `verify_and_load_weights` compares a
+strided sample of every tensor against the checkpoint BYTES on every load and
+refuses to run rather than sound plausible. The language set is read from the
 checkpoint's own `talker_config.codec_language_id`. Transport is Opus ~24 kbps
 (measured 23.8 kbps) with a pcm16 floor. Segments are re-cut at intra-segment
 speaker changes BEFORE recognition, so two people in one VAD segment cannot
-poison each other's reference buffer. Desk state: 165 hermetic tests under
-`CUDA_VISIBLE_DEVICES=99` plus a live boot smoke; the TTS adapter is tested
-against a real loopback server, but the vLLM-Omni serving side is
-desk-written and unstarted -- GPU latency numbers and the 36 preset clips are
-the open half. End-to-end S2ST was surveyed and **rejected on evidence** — no
+poison each other's reference buffer. Manual routing is a set of UNORDERED
+language pairs: one row routes both directions, two rows sharing a language
+FAN OUT (one utterance rendered into every partner language, sequentially
+tagged), a repeated pair deduplicates, capability refusal is named per pair
+and per direction, and the table's languages become the recognizer's
+constrained-detection candidate set -- the source language is still
+identified, never configured, and a weak decision resolves to the best in-set
+language TAGGED rather than discarded. Desk state: 273 hermetic tests under
+`CUDA_VISIBLE_DEVICES=99` plus a live boot smoke, and an executed audio-out
+run -- real German reference clip -> Spanish in that voice, 3.76 s against
+the reference implementation's own 3.85 s for the same checkpoint and
+direction, Opus round trip 20.8 kbps. Open: GPU latency numbers, an ASR
+intelligibility round trip, and the 36 preset clips. End-to-end S2ST was surveyed and **rejected on evidence** — no
 open-weight model does DE<->ES with speaker preservation (Hibiki fr->en only,
 StreamSpeech X->en, Seamless fixed synthetic voice, Qwen3-Omni three preset
 voices) — so the cascade is the only architecture meeting the requirement.
