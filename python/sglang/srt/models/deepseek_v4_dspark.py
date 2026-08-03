@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -33,7 +33,7 @@ from sglang.srt.models.deepseek_v4 import (
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
-    gather_and_crop_vocab,
+    logits_from_normed_hidden,
     run_markov_block,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -634,6 +634,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        # Draft-solo placement only (None on the default 'split' path, where
+        # every rank reaches the normed hidden states on its own). Set by the
+        # worker to a callable that publishes x to the shadow ranks; see
+        # _logits_from_x_post_hc.
+        self._solo_normed_publisher: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+
+    def set_solo_normed_publisher(self, publisher) -> None:
+        self._solo_normed_publisher = publisher
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -729,14 +739,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head:
-            local_logits = F.linear(x.float(), weight.float())
-        else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
-        if self._opt_markov_w2_tp_shard:
-            return local_logits
-        return gather_and_crop_vocab(local_logits, self.lm_head)
+        publisher = self._solo_normed_publisher
+        if publisher is not None:
+            # Draft-solo: this point is the seam between the last DRAFT weight
+            # (which only the host holds) and the first TARGET vocab shard
+            # (which every rank holds). The host publishes x here so both roles
+            # enter the vocab all_gather below together and with identical
+            # bytes; the publisher returns the staged buffer for exactly that
+            # reason. No-op on the default 'split' path.
+            x = publisher(x)
+        return logits_from_normed_hidden(
+            x,
+            lm_head=self.lm_head,
+            use_fp32_lm_head=self._use_fp32_lm_head,
+            skip_vocab_gather=self._opt_markov_w2_tp_shard,
+        )
 
     def compute_confidence(
         self,

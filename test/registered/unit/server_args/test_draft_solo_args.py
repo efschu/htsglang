@@ -171,9 +171,10 @@ class TestSoloValidation(CustomTestCase):
             )._handle_speculative_draft_placement()
 
     def test_solo_other_algorithms_rejected(self):
-        # DFLASH is now supported (self-drafting block model, weight-TP=1 host);
-        # the remaining non-EAGLE algorithms stay rejected.
-        for algo in ("STANDALONE", "NGRAM", "DSPARK"):
+        # The DFLASH FAMILY (DFLASH + DSPARK) is supported: self-drafting block
+        # models on a weight-TP=1 host. The remaining non-EAGLE algorithms stay
+        # rejected.
+        for algo in ("STANDALONE", "NGRAM"):
             with self.assertRaises(ValueError, msg=algo):
                 solo_args(
                     speculative_algorithm=algo
@@ -182,9 +183,34 @@ class TestSoloValidation(CustomTestCase):
     def test_solo_dflash_accepted(self):
         # DFLASH goes solo; it must pass placement validation (block model is
         # non-adaptive, so no topk/rejection-sampling guards apply).
-        solo_args(
-            speculative_algorithm="DFLASH"
-        )._handle_speculative_draft_placement()
+        solo_args(speculative_algorithm="DFLASH")._handle_speculative_draft_placement()
+
+    def test_solo_dspark_accepted(self):
+        # #470: DSPARK has the same shape as DFLASH (self-drafting block model,
+        # post-all-reduce hidden-state input, token-id round output). Its one
+        # delta -- the confidence head's variable block length -- rides the
+        # same per-round broadcast as an extra integer per request; see
+        # speculative/dspark_components/dspark_solo.py.
+        solo_args(speculative_algorithm="DSPARK")._handle_speculative_draft_placement()
+
+    def test_solo_dspark_rejects_adaptive(self):
+        with self.assertRaisesRegex(ValueError, "adaptive"):
+            solo_args(
+                speculative_algorithm="DSPARK", speculative_adaptive=True
+            )._handle_speculative_draft_placement()
+
+    def test_solo_dspark_still_rejects_the_structural_modes(self):
+        # Lifting the ALGORITHM refusal must not lift the placement invariants.
+        for kwargs in (
+            dict(dp_size=2),
+            dict(pp_size=2),
+            dict(ep_size=2),
+            dict(disaggregation_mode="prefill"),
+        ):
+            with self.assertRaises(ValueError, msg=str(kwargs)):
+                solo_args(
+                    speculative_algorithm="DSPARK", **kwargs
+                )._handle_speculative_draft_placement()
 
     def test_solo_dflash_rejects_adaptive(self):
         with self.assertRaisesRegex(ValueError, "adaptive"):
@@ -224,8 +250,6 @@ class TestSoloRankResolution(CustomTestCase):
         args = solo_args(tp_size=2, speculative_draft_gpu=7)
         with self.assertRaisesRegex(ValueError, "rank 0 -> cuda:0"):
             args._handle_speculative_draft_placement()
-
-
 
 
 class TestSoloDraftGpuResolution(CustomTestCase):

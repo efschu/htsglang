@@ -1054,11 +1054,58 @@ at all. Two consequences:
 - The `UD-*` GGUF shards carry **only** the 43 backbone blocks
   (`deepseek4.block_count = 43`, 1328 tensors, no `blk.43+`, no `markov_*`), so
   the DSpark head is not in the model directory at all. It lives in shards
-  46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (10.12 GiB, `mtp.*` only,
-  fp8 `weight`/`scale` pairs) — the format
-  `models/deepseek_v4_dspark.py:861-889` already expects.
+  46-48 of `deepseek-ai/DeepSeek-V4-Flash-0731` (10.12 GiB, `mtp.*` only) —
+  the namespace `models/deepseek_v4_dspark.py:861-889` already expects. They
+  are already on disk, filtered, at
+  `$MODEL_ROOT/DeepSeek-V4-Flash-0731-dspark-head-filtered/`.
 
-See `docs/dev/ANALYSE_447_llamacpp_dsv4_harvest.md` for the boot arm.
+  **The routed experts in those shards are MXFP4, not fp8** (2 304 `I8` =
+  9.000 GiB + 2 329 `F8_E8M0` = 0.563 GiB; only 25 tensors are `F8_E4M3`).
+  Measured in `ANALYSE_463_dspark_formats.md` §1; the earlier fp8 claim in
+  `ANALYSE_447` §1.5 is corrected there. This is what decides the placement:
+  `Mxfp4MarlinMoEMethod` needs SM90 or SM120, so the head runs on the 5090 and
+  on neither 3080.
+
+#### The DSpark draft arm (#470) — flags
+
+The head goes on the SM120 card whole, via draft-solo placement, and its
+routed experts take the marlin MoE runner:
+
+```
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$MODEL_ROOT/DeepSeek-V4-Flash-0731-dspark-head-filtered" \
+  --speculative-draft-placement solo \
+  --speculative-draft-gpu <NVML index of the 5090> \
+  --speculative-moe-runner-backend marlin \
+  --speculative-dspark-block-size 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 1 --speculative-eagle-topk 1
+```
+
+- `--speculative-moe-runner-backend` is the EXISTING per-draft flag; #470 only
+  wired it through `build_draft_tp_worker`, which previously let the DFLASH
+  family inherit the target's runner. `marlin` is what puts the MXFP4 experts
+  on `Mxfp4MarlinMoEMethod`. On a rank whose card is below SM90 the flag is now
+  refused by name at draft-build time instead of dying inside
+  `process_weights_after_loading`.
+- The last three values are pinned by
+  `arg_groups/speculative_hook.py:367-430`, not free choices.
+- `SGLANG_DSV4_FP4_DEQUANT` must stay **0**: at 1 it both trips
+  `assert get_moe_runner_backend().is_auto()` (`fp8.py:426-430`) and inflates
+  the head from 10.1 to 18.6 GiB.
+- Solo v1 limits, all refused by name rather than approximated: greedy
+  acceptance only, no DP/PP/EP, no PD disaggregation, `tp >= 2`. The
+  default-on `SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD` is switched off under solo
+  with a logged reason.
+- Rank 0's resident expert budget has to make ~11 GiB of room for the head.
+  That trade — not the dtype — is the price of this arm, and it is priced in
+  `docs/dev/TICKET_470_dspark_boots.md` Boot A before any draft exists.
+
+**DESK-WRITTEN until TICKET_470's window runs.** No DSpark arm has booted on
+this rig.
+
+See `docs/dev/ANALYSE_463_dspark_formats.md` for why this is the cheapest
+route and `docs/dev/TICKET_470_dspark_boots.md` for the boots.
 
 Host RAM is the binding constraint on this route, and every code wall in the
 load path is cleared as of boot attempt 8 — 26 of 43 layers streamed with zero

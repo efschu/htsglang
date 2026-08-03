@@ -29,8 +29,10 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
     make_next_draft_input,
     maybe_build_draft_sampler,
+    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -44,6 +46,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+)
+from sglang.srt.speculative.dspark_components.dspark_solo import (
+    DsparkSoloDraftMirror,
+    DsparkSoloRoundCodec,
+    apply_solo_dspark_overrides,
+    refuse_solo_nongreedy_round,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -155,10 +163,42 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
+        # Draft-solo placement (--speculative-draft-placement solo). Resolved
+        # from the runner roles the model layer already computed
+        # (ModelRunner.compute_draft_solo_role), exactly like DFLASH. Resolved
+        # BEFORE attach_shared_modules: that call configures the markov_w2 TP
+        # shard, which solo has to switch off first.
+        self._spec_solo_is_host = bool(
+            getattr(self.draft_model_runner, "is_draft_solo_host", False)
+        )
+        self._spec_solo_is_shadow = bool(
+            getattr(self.draft_model_runner, "is_draft_solo_shadow", False)
+        )
+        self._spec_solo_active = self._spec_solo_is_host or self._spec_solo_is_shadow
+        if self._spec_solo_active:
+            apply_solo_dspark_overrides(self.draft_model, tp_rank=tp_rank)
+
         self.draft_model.attach_shared_modules(
             embed_tokens=self._resolve_target_embed_tokens(target_model),
             lm_head=lm_head,
         )
+
+        self._solo_mirror = None
+        self._solo_codec = None
+        self._solo_rank = 0
+        if self._spec_solo_active:
+            self._solo_rank = server_args.speculative_draft_solo_rank()
+            self._solo_mirror = DsparkSoloDraftMirror(
+                is_host=self._spec_solo_is_host,
+                solo_rank=self._solo_rank,
+                lm_head=lm_head,
+                device=self.device,
+            )
+            self._solo_codec = DsparkSoloRoundCodec(
+                gamma=self.gamma,
+                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                device=self.device,
+            )
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -197,7 +237,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            solo_mirror=self._solo_mirror,
         )
+        if self._solo_mirror is not None:
+            # The host publishes its post-norm draft hidden states from inside
+            # compute_base_logits, right before the vocab all_gather that the
+            # shadows are waiting in. See dspark_solo.DsparkSoloDraftMirror.
+            self.draft_model.set_solo_normed_publisher(self._solo_publish_normed)
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
@@ -259,6 +305,87 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
+        )
+
+    # ---- draft-solo placement -------------------------------------------
+    @property
+    def _solo_is_shadow(self) -> bool:
+        return self._spec_solo_is_shadow
+
+    def _solo_publish_normed(self, x: torch.Tensor) -> torch.Tensor:
+        """Publisher installed on the draft model under solo; see
+        DsparkSoloDraftMirror.publish_normed."""
+        from sglang.srt.distributed import get_tp_group
+
+        return self._solo_mirror.publish_normed(get_tp_group(), int(x.shape[0]), x)
+
+    def _solo_shadow_mirror_draft(
+        self, *, draft_input: DFlashDraftInputV2, bs: int
+    ) -> torch.Tensor:
+        """A shadow rank's whole draft phase: join the host's collectives, in
+        the host's order, and produce nothing.
+
+        Order (must match DraftBlockProposer / compute_base_logits exactly):
+          1. vocab-parallel embedding all_reduce over the rank-uniform block,
+          2. the host's post-norm hidden-state broadcast,
+          3. the vocab all_gather over this rank's own lm_head shard.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = self._resolve_target_embed_tokens(target_model)
+        gamma = int(self.gamma)
+        block_ids = torch.full(
+            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=self.device
+        )
+        block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        self._solo_mirror.embed_block(embed_module, block_ids.flatten())
+        recv = self._solo_mirror.publish_normed(get_tp_group(), bs * gamma, None)
+        self._solo_mirror.vocab_logits(
+            recv,
+            lm_head=target_model.lm_head,
+            use_fp32=bool(getattr(self.draft_model, "_use_fp32_lm_head", False)),
+        )
+        return block_ids
+
+    def _solo_send_round(
+        self, *, bs: int, draft_tokens: torch.Tensor, layout, run_compact: bool
+    ) -> None:
+        """Host: the ONE payload broadcast that closes the round."""
+        from sglang.srt.distributed import get_tp_group
+
+        buf = self._solo_codec.encode(
+            bs=bs,
+            draft_tokens=draft_tokens,
+            verify_lens=None if layout is None else layout.verify_lens,
+            graph_num_tokens=None if layout is None else layout.graph_num_tokens,
+            run_compact=run_compact,
+        )
+        self._solo_mirror.broadcast_round(get_tp_group(), buf)
+
+    def _solo_recv_round(self, *, bs: int):
+        """Shadow: receive and validate the round payload. The buffer is sized
+        from rank-uniform state (bs, gamma), never from the host."""
+        from sglang.srt.distributed import get_tp_group
+
+        buf = self._solo_codec.buffer(bs)
+        self._solo_mirror.broadcast_round(get_tp_group(), buf)
+        return self._solo_codec.decode(buf, bs=bs)
+
+    def _solo_rebuild_layout(self, solo_round, *, bs: int, graph_num_tokens: int):
+        """Rebuild the host's ragged verify layout from the broadcast block
+        lengths. Every derived field (indptr, start locs, totals) is a pure
+        function of verify_lens + graph_num_tokens, so nothing else has to
+        travel over the wire."""
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        if not solo_round.has_layout:
+            return None
+        return RaggedVerifyLayout._assemble_device(
+            verify_lens=solo_round.verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            verify_lens_cpu=solo_round.verify_lens_cpu,
+            total_verify_tokens=sum(solo_round.verify_lens_cpu),
         )
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -335,6 +462,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _maybe_build_draft_sampler(self):
+        if self._spec_solo_active:
+            # The folded sampler calls compute_base_logits INSIDE the draft
+            # cuda graph, and that call carries the vocab all_gather. The
+            # shadow ranks capture no draft graphs, so a captured collective
+            # would have no participant. Solo therefore samples eagerly --
+            # the same trade DFLASH makes (dflash_worker_v2, "Never taken
+            # under solo").
+            if self.tp_rank == 0:
+                logger.info(
+                    "DSpark draft greedy proposal kept eager "
+                    "(reason=draft-solo placement; the vocab all_gather must "
+                    "stay outside the capture so the shadow ranks can join)."
+                )
+            return None
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -532,53 +673,101 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
-            )
-        draft_block_ids = proposal.draft_block_ids
-        draft_block = proposal.draft_block
-        draft_tokens = draft_block.draft_tokens
+        if self._spec_solo_active:
+            refuse_solo_nongreedy_round(sampling_info)
 
-        confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
+        if self._solo_is_shadow:
+            # SHADOW: no draft forward at all. Join the host's draft-side
+            # collectives in order, then take the whole round -- block ids AND
+            # the confidence head's truncation length -- from one broadcast.
+            with self._observers.segment(InfoSegment.DRAFT):
+                draft_block_ids = self._solo_shadow_mirror_draft(
+                    draft_input=draft_input, bs=bs
+                )
+                solo_round = self._solo_recv_round(bs=bs)
+            draft_tokens = solo_round.draft_tokens
+            draft_block = DraftBlockResult(
                 draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
+                # Greedy acceptance only under solo (refuse_solo_nongreedy_round
+                # above), and AcceptGreedy never reads the corrected logits.
+                corrected_logits=None,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+                temperatures=(
+                    torch.ones(bs, dtype=torch.float32, device=device)
+                    if sampling_info is None
+                    else sampling_info.temperatures.view(-1)
+                    .to(torch.float32)
+                    .clamp_min(1e-5)
+                ),
+            )
+            proposal_folded = False
+            confidence = None
+            verify_token_budget = None
+            layout = self._solo_rebuild_layout(
+                solo_round, bs=bs, graph_num_tokens=solo_round.graph_num_tokens or 0
+            )
+            run_compact = solo_round.run_compact
+        else:
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
+            draft_block_ids = proposal.draft_block_ids
+            draft_block = proposal.draft_block
+            draft_tokens = draft_block.draft_tokens
+            proposal_folded = proposal.folded
+
+            confidence = proposal.confidence
+            if confidence is None:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+
+            verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+                draft_input=draft_input,
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=batch.req_pool_indices,
             )
 
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
-            draft_input=draft_input,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=batch.req_pool_indices,
-        )
-
-        global_num_reqs = (
-            max(batch.global_num_tokens)
-            if self._draft_is_moe
-            and self.server_args.enable_dp_attention
-            and batch.global_num_tokens is not None
-            else None
-        )
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+            global_num_reqs = (
+                max(batch.global_num_tokens)
+                if self._draft_is_moe
+                and self.server_args.enable_dp_attention
+                and batch.global_num_tokens is not None
+                else None
+            )
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
+            run_compact = self._verify_planner.should_run_compact(layout=layout)
+            if self._spec_solo_is_host:
+                # HOST: close the round. Everything the shadows still need --
+                # the block ids and the per-request block LENGTH the confidence
+                # head just decided -- goes out as one packed broadcast.
+                self._solo_send_round(
+                    bs=bs,
+                    draft_tokens=draft_tokens,
+                    layout=layout,
+                    run_compact=run_compact,
+                )
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -586,7 +775,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
-            and proposal.folded
+            and proposal_folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
@@ -652,7 +841,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
             bs=bs,
-            proposal_folded=proposal.folded,
+            proposal_folded=proposal_folded,
             verify_ids_2d=verify_ids_2d,
             target_logits=logits_output.next_token_logits,
             layout=layout,

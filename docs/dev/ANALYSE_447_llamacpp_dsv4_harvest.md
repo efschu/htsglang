@@ -179,8 +179,39 @@ Verified against the HF index of `deepseek-ai/DeepSeek-V4-Flash-0731`
 * They live **exclusively** in shards 46, 47, 48 of 48 — those three shards
   contain 1 568 + 1 565 + 1 572 = 4 705 tensors and **no** non-`mtp` tensor.
 * Combined size 3 610 455 184 + 3 560 111 960 + 3 692 775 244 =
-  **10.12 GiB**, fp8 (`.weight` + `.scale` pairs, `quantization_config.fmt
-  = e4m3`, `scale_fmt = ue8m0`, block `[128, 128]`).
+  **10.12 GiB**. **The routed experts are MXFP4, not fp8** — see the
+  correction directly below.
+
+> **CORRECTION (task #463, 2026-08-03).** This section originally read
+> *"10.12 GiB, fp8 (`.weight` + `.scale` pairs, `quantization_config.fmt =
+> e4m3`, `scale_fmt = ue8m0`, block `[128, 128]`)"*. The size is right, the
+> dtype is not. The claim came from the top-level `quantization_config` in
+> `config.json`, which describes the TARGET's non-`mtp` tensors; it was never
+> read per tensor. Measured from the safetensors headers of the three local
+> shards:
+>
+> | dtype | tensors | bytes |
+> |---|---:|---:|
+> | `I8` (MXFP4 nibble pairs) | 2 304 | **9.000 GiB** |
+> | `F8_E8M0` (block scales) | 2 329 | 0.563 GiB |
+> | `F8_E4M3` | 25 | 0.416 GiB |
+> | `BF16` | 20 | 0.129 GiB |
+> | `F32` | 27 | 0.009 GiB |
+> | **total** | **4 705** | **10.117 GiB** |
+>
+> The 2 304 expert tensors `mtp.{0,1,2}.ffn.experts.{0..255}.w{1,2,3}` are
+> `I8` 4-bit E2M1 pairs with `F8_E8M0 [·, ·/32]` block scales — MXFP4,
+> 9.5625 GiB of the 10.117. Only the 25 `F8_E4M3` tensors (attention, shared
+> experts, `main_proj`) are fp8 block-`[128,128]`.
+>
+> §1.6 risk 1 ("fp8 on sm86") therefore names the wrong mechanism. The real
+> per-card constraint is MXFP4: `Mxfp4MarlinMoEMethod` accepts SM90 and SM120
+> (`mxfp4_marlin_moe.py:116-117`), so the head runs natively on the 5090 and
+> on neither 3080. The conclusion of that risk — keep the whole draft on the
+> 5090 — is unchanged; only its reason is.
+>
+> Full measurement and the resulting route ranking:
+> `ANALYSE_463_dspark_formats.md` §1 and §5.
 * Per-stage pattern (from the index): `attn.{wq_a,wq_b,wkv,wo_a,wo_b}` +
   scales, `attn.attn_sink`, `attn.{q_norm,kv_norm}`, `hc_{attn,ffn}_{fn,base,scale}`,
   `ffn.experts.{0..255}.w{1,2,3}` + scales, `ffn.shared_experts.w{1,2,3}`,
@@ -193,8 +224,14 @@ That is the exact namespace
 `stages.{stage_id}.*`. **Effort to use it: a targeted 10.12 GiB download plus
 the pristine `config.json` (which already carries `dspark_block_size = 5`,
 `dspark_noise_token_id = 128799`, `dspark_target_layer_ids = [40, 41, 42]`,
-`dspark_markov_rank = 256`). No loader change.** Compare against the GGUF
-route's three new extension points plus an MXFP4 dequant path.
+`dspark_markov_rank = 256`). No loader change** — this part survives the dtype
+correction above: the loader reads the `mtp.` namespace either way, and MXFP4
+experts reach `Mxfp4MarlinMoEMethod` through the existing
+`--speculative-moe-runner-backend` selection. What does NOT survive is the
+implied "and it runs on any of the three cards": MXFP4-marlin is SM90/SM120
+only, which is what makes the placement question (§4 of `ANALYSE_463`) the
+decisive one rather than the format question. Compare against the GGUF route's
+three new extension points plus an MXFP4 dequant path.
 
 Note the local UD-Q3_K_XL target **does not** contain the head: read with
 `GGUFReader` over all four shards, `deepseek4.block_count = 43`,
@@ -539,7 +576,7 @@ Gain and effort, no kill thresholds; the ratio is the reader's call.
 
 | # | candidate | gain | effort | note |
 | --- | --- | --- | --- | --- |
-| A | Fetch the native DSpark head (shards 46-48, 10.12 GiB fp8) and boot the §1.6 arm | first DSpark-on-DSV4 boot in this fork; external ladder 0.6-0.77 accept, 1.4-1.8x decode | small (download + one GPU window) — **no loader change** | blocked only by GPU-window availability; §2.4 must be answered inside the window |
+| A | Fetch the native DSpark head (shards 46-48, 10.12 GiB — **MXFP4 experts**, see the §1.5 correction) and boot the §1.6 arm | first DSpark-on-DSV4 boot in this fork; external ladder 0.6-0.77 accept, 1.4-1.8x decode | small (download + one GPU window) — **no loader change**, but the head is SM90/SM120-only, so it must be placed on the 5090 | head is downloaded; the remaining work is the solo placement unlock (#470) and one GPU window; §2.4 must be answered inside it |
 | B | Wire `dsa/`'s query-axis chunking into `dsv4/` (L3) | bounds the B-fold gather; the cheap 80 % of L1 | small-medium | code already exists in-tree at `dsa_indexer.py:1242-1299` |
 | C | Deduplicate the per-query-token page table (L1) | the dominant prefill memory-traffic term at long context | medium-large | shared with the SWA path; `NOTE_440:257-273` |
 | D | Fused sm86/sm120 indexer kernel (L2) | removes ~1 700-6 700 launches + all fp32 intermediates per long-context forward | large | llama.cpp's `lightning-indexer.cu` (588 lines) + `ggml.h:2586-2596` are a usable spec |
