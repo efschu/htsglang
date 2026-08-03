@@ -57,20 +57,29 @@ TP = 3
 class _QC:
     """A non-marlin-family quant config (a block, or nothing)."""
 
+    marlin_packable_linear = False
+
     def __init__(self, block=None):
         self.weight_block_size = block
 
 
-class Fp8Config(_QC):  # noqa: N801 - the CLASS NAME is the signal under test
-    pass
+class _MarlinFamilyQC(_QC):
+    """A marlin-family stand-in.
 
+    It DECLARES the capability, because that is what the predicate reads since
+    #500-B18. Before that these stand-ins were named ``Fp8Config`` /
+    ``CompressedTensorsConfig`` and the class NAME was the signal -- which is
+    exactly the defect: a stand-in that borrows a production class's name
+    proves nothing about the production class, and the real ``MarlinConfig``
+    (not in the list) got no coarsening at all. ``TestTheDeclarationIsTheSignal``
+    below anchors the same predicate on the production classes.
+    """
 
-class CompressedTensorsConfig(_QC):  # noqa: N801 - ditto
-    pass
+    marlin_packable_linear = True
 
 
 def _marlin_cfg(block=None):
-    return CompressedTensorsConfig(block)
+    return _MarlinFamilyQC(block)
 
 
 def _plain_cfg(block=None):
@@ -268,13 +277,85 @@ class TestTheVerdictIsRankUniform(_Base):
             )
 
     def test_the_real_marlin_capable_configs_match(self):
+        """#500-B18: anchored on the PRODUCTION classes, including the two the
+        name list missed. ``MarlinConfig`` is the headline -- it exposes no
+        ``weight_block_size`` at all, so with no coarsening its uneven-TP
+        shards land mid-tile, which is the #377/#383 abort reached through the
+        one config that is marlin by definition."""
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsConfig as RealCT,
         )
         from sglang.srt.layers.quantization.fp8 import Fp8Config as RealFp8
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 
-        self.assertTrue(_marlin_packable_family(RealFp8.__new__(RealFp8)))
-        self.assertTrue(_marlin_packable_family(RealCT.__new__(RealCT)))
+        for cls in (RealFp8, RealCT, FBGEMMFp8Config):
+            with self.subTest(config=cls.__name__):
+                self.assertTrue(_marlin_packable_family(cls.__new__(cls)))
+
+    def test_marlin_config_itself_declares_and_exposes_no_block(self):
+        """``MarlinConfig`` is marlin by definition and exposes no
+        ``weight_block_size``, so it had nothing to coarsen by and the name
+        list did not name it.
+
+        REACH, stated honestly (CLAUDE.md: a mechanism that never binds has
+        reach zero). It is NOT in ``QUANTIZATION_METHODS`` and does not
+        implement the abstract ``get_scaled_act_names``, so no launch can
+        instantiate it today -- this is a latent hole, not a live boot
+        failure. It is pinned here because the declaration is what makes the
+        hole closeable at all: a checkpoint routed to this config would
+        otherwise repeat #377 with no way for the alignment module to know."""
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.layers.quantization.marlin_utils import MarlinConfig
+
+        self.assertTrue(MarlinConfig.marlin_packable_linear)
+        self.assertNotIn("weight_block_size", MarlinConfig.__init__.__code__.co_names)
+        self.assertNotIn(MarlinConfig, set(QUANTIZATION_METHODS.values()))
+
+    def test_every_registered_marlin_repacking_backend_is_covered(self):
+        """The structural sweep the name list could not do: for each
+        REGISTERED quantization method whose module reaches a marlin repack
+        entry point, either it declares the capability or it exposes a block
+        of its own. Neither -- and its uneven-TP shards land mid-tile."""
+        import inspect
+        import pathlib
+
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
+        entry_points = (
+            "prepare_fp8_layer_for_marlin",
+            "prepare_moe_fp8_layer_for_marlin",
+            "verify_marlin_supports_shape",
+            "check_marlin_supported",
+            "gptq_marlin_repack",
+            "awq_marlin_repack",
+            "marlin_permute_scales",
+        )
+        for name, cls in sorted(QUANTIZATION_METHODS.items()):
+            src_file = inspect.getsourcefile(cls)
+            if src_file is None:  # pragma: no cover - env-dependent
+                continue
+            src = pathlib.Path(src_file).read_text()
+            if not any(ep in src for ep in entry_points):
+                continue
+            with self.subTest(method=name):
+                self.assertTrue(
+                    getattr(cls, "marlin_packable_linear", False)
+                    or "weight_block_size" in src,
+                    f"{name} repacks through marlin with neither a declaration "
+                    f"nor a weight_block_size to coarsen by",
+                )
+
+    def test_backends_that_do_not_repack_through_marlin_stay_out(self):
+        """The audit proposed ``W8A8Fp8Config`` and ``QuarkConfig`` as further
+        gaps. They are not: neither module reaches any marlin repack entry
+        point (``prepare_fp8_layer_for_marlin`` / ``verify_marlin_supports_shape``
+        / ``*_marlin_repack``), so declaring them would only tax their split."""
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
+        for cls in (W8A8Fp8Config, QuarkConfig):
+            with self.subTest(config=cls.__name__):
+                self.assertFalse(_marlin_packable_family(cls.__new__(cls)))
 
     def test_unrelated_and_none(self):
         self.assertFalse(_marlin_packable_family(_plain_cfg()))
@@ -413,8 +494,10 @@ class TestEighthSiblingMxfp8(_Base):
     MXFP8_BLOCK = [1, 32]
 
     def _cfg(self):
-        # Fp8Config by CLASS NAME -- that is what _marlin_packable_family reads.
-        return Fp8Config(list(self.MXFP8_BLOCK))
+        # A marlin-family stand-in -- it DECLARES marlin_packable_linear, which
+        # is what _marlin_packable_family reads since #500-B18 (the real
+        # Fp8Config declares the same).
+        return _MarlinFamilyQC(list(self.MXFP8_BLOCK))
 
     def test_the_block_this_corpus_models_is_the_one_fp8_py_pins(self):
         """The corpus must not drift from the config it claims to model."""
@@ -457,8 +540,8 @@ class TestEighthSiblingMxfp8(_Base):
                 )
 
     def test_the_resulting_block_is_marlin_valid(self):
-        """``Fp8Config`` is in ``_MARLIN_PACKABLE_CONFIGS``, so the shard must
-        also satisfy marlin's minimum thread shape on both axes."""
+        """``Fp8Config`` declares ``marlin_packable_linear``, so the shard
+        must also satisfy marlin's minimum thread shape on both axes."""
         inter = 32768
         u = _quant_block_aligned_units(inter, inter // 16, self._cfg(), 0)
         sizes = self.partition(inter, u)

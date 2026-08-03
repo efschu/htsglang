@@ -123,6 +123,45 @@ task proposals in §5.
 
 ## 5. Bug candidates — proposed tasks
 
+**Status, 2026-08-03 (#504, branch `fix/audit-bundle-504`).** Six of the rows
+below are FIXED, with a falsifier each: **B3** (draft-KV-DCP now keys on the
+installer's own predicate `uneven_weighted_dcp_enabled()`, so the
+`--rank-kv-ratio` route is admitted), **B8** (`validate_breakable_boot`'s
+`None` arm split into a `NO_SERVER_ARGS` sentinel that skips and an
+unresolvable backend that refuses by name), **B10** (verdict: the refusal is
+DELIBERATE, not stale — the reason and the one unobserved round are now in the
+message, and `KVSO_ALLOW_SPEC` is surfaced in the CLI help, which it never
+was), **B2** (`--rank-kv-ratio` without a placement refuses by name instead of
+being accepted-and-inert), **B18** (the marlin fold reads a per-backend
+`marlin_packable_linear` declaration instead of a class-name list), and
+**I-2/I-3** (`planner/flags.py`'s two inverted edges, plus a contract test that
+drives every declared uneven-TP edge against the runtime).
+
+**B1 is separately REFUTED, not fixed** — recorded here for one place to read
+the whole board: `fix/enum-geometry-503` (merged onto this line ahead of
+#504) executed the check and found the audit itself wrong, not the code.
+Two independent predicates govern the family and B1 conflated them:
+`attn_kv_replicated` (`kv < tp`, strictly) shards the k/v PROJECTIONS
+whenever `kv_heads >= tp`, so the phase-prefill enumerator's kv-head grid was
+the runtime's grid all along; `uneven_dcp_kv_replicated` only replicates the
+KV POOL, never the projection weights. The real (narrower) defect this
+uncovered is in `planner/placement.py:813`, which still reports projection
+heads as replicated under uneven DCP where the runtime shards them — see
+FEATURE_CATALOG.md §1 and `NOTE_485_joint_phase_vectors.md` for the full
+correction chain. Combined board after both merges: **B1 REFUTED (#503)**;
+**B2/B3/B8/B10/B18 + the flags.py registry edges FIXED (#504)**; **B4-B7,
+B9, B11-B17, B19, B20 still OPEN**.
+
+Two corrections to rows below, from executing rather than reading. **B18**:
+of the three configs named, only `MarlinConfig` is genuinely marlin-served and
+blockless, and it is neither registered in `QUANTIZATION_METHODS` nor concrete
+(no `get_scaled_act_names`) — a LATENT hole, not a live boot failure;
+`W8A8Fp8Config` and `QuarkConfig` reach no marlin repack entry point at all, so
+they were not gaps. **I-2**: the `rank_gpu_id` x `dp_size`/`ep_size`/`nnodes`
+edges the audit recorded as declared-but-unverified are REAL runtime refusals
+(driven in the contract test), so those edges stay.
+
+
 Sixteen [NARROWER] rows carry real user harm rather than a sloppy catalog line.
 Ranked by leverage. Every one is a named, self-contained task; none of them was
 fixed in this audit (the audit changed documentation only).

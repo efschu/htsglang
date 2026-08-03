@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 class FBGEMMFp8Config(QuantizationConfig):
     """Config class for FBGEMM Fp8."""
 
+    # Repacks through ``prepare_fp8_layer_for_marlin`` (:184); its non-marlin
+    # branch needs a native/cutlass fp8 GEMM, so on Ampere marlin is the path.
+    marlin_packable_linear = True
+
     def __init__(self, ignore_list: list[str], input_scale_ub: float):
         super().__init__()
         self.ignore_list = ignore_list if ignore_list else []

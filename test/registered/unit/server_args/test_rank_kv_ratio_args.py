@@ -298,5 +298,115 @@ class TestSoloPlannerSeed(KvRatioTestCase):
         self.assertIsNone(make_args().rank_kv_capacity_seed)
 
 
+class TestRankKvRatioIsNeverSilentlyInert(CustomTestCase):
+    """#500-B2: accepted-and-then-inert is the #421 wiring failure mode.
+
+    ``--rank-kv-ratio``'s validation was deliberately hoisted ABOVE the
+    ``if self.rank_gpu_id is None: ... return`` early return
+    (``server_args.py:9644``) because it describes the PARTITION, not the
+    placement. The uneven-DCP auto-engage that MAKES it act --
+    ``self.dcp_size = self.tp_size`` (``server_args.py:9845``) -- sits BELOW
+    that return. So without ``--rank-gpu-id`` the flag passed every check,
+    ``uneven_weighted_dcp_enabled()`` answered True, and ``dcp_size`` stayed 1:
+
+        --rank-kv-ratio 'speed' without --rank-gpu-id ->
+            rank_kv_ratio='speed' dcp_size=1
+            uneven_weighted_dcp_enabled=True kv_replicated=False
+
+    ``uneven_dcp_kv_replicated`` is False there, ``configure_scheduler_process``
+    installs no token vector (its gate is ``_dcp_size > 1``,
+    ``managers/scheduler.py:5952``), and the existing honesty guard
+    ``reject_silently_inert_dcp`` cannot help because it is itself gated on
+    ``dcp_size``. The operator asked for the #210 decode lever and was served
+    the coupled layout with no line in the log.
+
+    The refusal is chosen over auto-engaging DCP on the no-placement path for
+    two reasons. (1) Nothing that works today changes: the combination is inert
+    by construction, so no boot can be relying on it. (2) The no-placement path
+    exists for the cross-vendor two-launcher arm (``server_args.py:9540-9548``),
+    which has no coverage on this rig -- silently switching its KV layout to
+    token-sharded DCP is the opposite of what the decoupling was for. The
+    refusal names both ways out instead.
+    """
+
+    def _refusal(self, **overrides):
+        kw = dict(tp_size=3, rank_tp_ratio=[2, 1, 1], rank_kv_ratio="speed")
+        kw.update(overrides)
+        args = make_args(**kw)
+        with self.assertRaises(ValueError) as cm:
+            args._handle_uneven_tp()
+        return str(cm.exception)
+
+    def test_every_active_mode_is_refused_without_a_placement(self):
+        for mode in ("speed", "capacity", "auto", [2, 1, 1]):
+            with self.subTest(mode=mode):
+                msg = self._refusal(rank_kv_ratio=mode)
+                self.assertIn("--rank-kv-ratio", msg)
+                # both ways out must be named, not just the problem
+                self.assertIn("--rank-gpu-id", msg)
+                self.assertIn("--dcp-size", msg)
+
+    def test_the_default_no_placement_path_is_untouched(self):
+        """'coupled' is the default and is not a request for anything, so the
+        cross-vendor two-launcher arm keeps booting exactly as before."""
+        args = make_args(tp_size=3, rank_tp_ratio=[2, 1, 1])
+        args._handle_uneven_tp()
+        self.assertEqual(args.rank_kv_ratio, "coupled")
+        self.assertEqual(args.dcp_size, 1)
+
+    def test_an_explicit_dcp_size_is_the_documented_way_out(self):
+        """With DCP engaged by hand the flag is NOT inert, so it must pass."""
+        args = make_args(tp_size=3, rank_tp_ratio=[2, 1, 1], rank_kv_ratio="speed")
+        args.dcp_size = 3
+        args._handle_uneven_tp()
+        self.assertEqual(args.rank_kv_ratio, "speed")
+        self.assertEqual(args.dcp_size, 3)
+        self.assertTrue(args.uneven_weighted_dcp_enabled())
+
+    def test_the_pre_existing_bare_flag_guard_is_unchanged(self):
+        """With no uneven-TP flag at all the refusal was ALREADY there
+        (``server_args.py:9424``, inside the all-three-None early return) --
+        which is why the hole was easy to miss: the bare form refused, and only
+        the form WITH a base plan walked through. The new guard completes that
+        edge; it must not replace or shadow this one."""
+        args = make_args(tp_size=3, rank_kv_ratio="speed")
+        with self.assertRaises(ValueError) as cm:
+            args._handle_uneven_tp()
+        self.assertIn("requires --rank-gpu-id", str(cm.exception))
+
+    def test_the_perf_tune_auto_selection_cannot_trip_this_guard(self):
+        """The one false-refusal risk, checked rather than assumed.
+
+        ``--rank-perf-tune dec`` SETS ``rank_kv_ratio = 'speed'`` itself
+        (``server_args.py:8981``), so a boot that never typed ``--rank-kv-ratio``
+        could in principle land in the new refusal. It cannot: ``_check_perf_flags``
+        refuses any ``--rank-perf-tune`` outside ``--rank-tp-ratio
+        auto-performance`` (``:8950-8955``), and ``auto-performance`` itself
+        requires ``--rank-gpu-id`` (``:8971``). The auto-selection is therefore
+        unreachable without a placement."""
+        with self.assertRaises(ValueError) as cm:
+            make_args(
+                tp_size=3, rank_tp_ratio=[2, 1, 1], rank_perf_tune="dec"
+            )._handle_uneven_tp()
+        self.assertIn("auto-performance", str(cm.exception))
+
+    def test_the_reachable_shape_is_exactly_the_explicit_vector_one(self):
+        """Every other no-placement shape is already refused upstream, which
+        is the reason this hole was a single narrow one: a per-rank budget
+        needs a placement (``--rank-gpu-memory-mib requires --rank-gpu-id``)
+        and ``--rank-tp-ratio auto`` needs one too (``:8971``). An EXPLICIT
+        base vector needs neither -- and that is the shape that fell through."""
+        with self.assertRaises(ValueError) as cm:
+            make_args(
+                tp_size=3, rank_kv_ratio="speed", rank_gpu_memory_mib=15000
+            )._handle_uneven_tp()
+        self.assertIn("--rank-gpu-memory-mib requires --rank-gpu-id", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            make_args(
+                tp_size=3, rank_kv_ratio="speed", rank_tp_ratio="auto"
+            )._handle_uneven_tp()
+        self.assertIn("--rank-tp-ratio auto requires --rank-gpu-id", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
