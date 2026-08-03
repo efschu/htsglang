@@ -257,6 +257,28 @@
            overflow:hidden; }
   #meter > i { display:block; height:100%; width:0; background:var(--accent);
                transition:width .06s linear; }
+  /* The stop control. Round, amber, and floating clear of the footer so it
+     shares no edge with the talk button -- shape, colour and position all
+     differ, which is what keeps a blind tap unambiguous. It is only in the
+     DOM's flow when there is something to stop. */
+  /* While it is on screen the chip and toast rows keep clear of it: the
+     screenshots caught the circle sitting on top of a suggestion chip's
+     "name" button, which is a mis-tap waiting to happen in exactly the moment
+     the user is reaching for the stop. */
+  body.playing #chips, body.playing #toasts { padding-right:96px; }
+  #stopplay { position:fixed; right:14px; z-index:15;
+              bottom:calc(158px + env(safe-area-inset-bottom));
+              width:74px; height:74px; border-radius:50%; padding:0;
+              background:var(--warn); border:3px solid var(--bg);
+              color:#1a1206; box-shadow:0 6px 18px rgba(0,0,0,.45);
+              display:none; }
+  #stopplay.on { display:inline-flex; }
+  #stopplay svg { width:30px; height:30px; }
+  :root[data-theme="light"] #stopplay { color:#fff; }
+  /* The muted state is a colour AND a glyph, never colour alone. */
+  #mute.muted { color:var(--warn); border-color:var(--warn);
+                background:var(--surface2); }
+  .line.stopped .stopmark { color:var(--warn); border-color:var(--warn); }
 
   /* --- sheets and modal ------------------------------------------------ */
   #scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
@@ -322,6 +344,12 @@
   <span class="pill"><i id="dot"></i><span id="status">starting</span></span>
   <span class="pill quiet" id="link" title="link">&mdash;</span>
   <span class="grow"></span>
+  <!-- The mute toggle sits in the header because it is a CONVERSATION mode,
+       not a per-turn action: a phone passed around a quiet table stays silent
+       for the rest of the evening. It is the same server state as the reading
+       mode (output.mode) -- one concept, one control, never two toggles that
+       do the same thing. -->
+  <button class="icon ghost" id="mute" aria-label="speak translations aloud"></button>
   <button class="icon ghost" id="theme" aria-label="light or dark"></button>
   <button class="icon ghost" id="gear" aria-label="settings"></button>
 </header>
@@ -356,6 +384,14 @@
   <div id="meter"><i></i></div>
 </footer>
 
+<!-- Stop the playback (user order). Deliberately NOT shaped like the talk
+     control: a circle against a full-width bar, amber against the surface
+     colour, and anchored clear of the talk button's rectangle -- it appears
+     only while something is being spoken, and the one thing it must never be
+     is a button somebody hits when they meant to speak. Large enough to be
+     found without looking. -->
+<button id="stopplay" aria-label="stop speaking"></button>
+
 <div id="scrim"></div>
 <section class="sheet" id="sheet">
   <header>
@@ -372,14 +408,13 @@
           <button data-value="vad">automatic</button>
         </div>
       </div>
+      <!-- The output mode used to have a segmented control here as well as
+           the header toggle. Two controls for one server state is how a UI
+           starts disagreeing with itself, so this pane explains the mode and
+           the header owns it. -->
       <div class="group">
-        <h3>output</h3>
-        <div class="seg" id="segoutput">
-          <button data-value="voice" class="on">speak aloud</button>
-          <button data-value="silent">read only</button>
-        </div>
-        <p>Reading mode runs the whole pipeline and skips only the synthesis,
-           so the transcript and the voice references keep filling.</p>
+        <h3>sound</h3>
+        <p id="outputnote"></p>
       </div>
       <div class="group">
         <h3>voice</h3>
@@ -472,6 +507,8 @@ const ICON = {
   swap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v13M7 4L4 7M7 4l3 3"/><path d="M17 20V7M17 20l3-3M17 20l-3-3"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
   play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l10-6.5z"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M16 9a4.2 4.2 0 0 1 0 6"/><path d="M18.7 6a8 8 0 0 1 0 12"/></svg>',
+  muted: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M16.5 9.5l5 5M21.5 9.5l-5 5"/></svg>',
   eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2.5 12S6 6 12 6s9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="2.6"/></svg>',
   sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>',
   moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
@@ -557,6 +594,13 @@ class Playback {
     this.blocked = false;
     this.dropped = 0;
     this.skippedReplay = 0;
+    //: Sources already booked on the output clock, with the time each ends.
+    //: They exist so a stop can cut what is ALREADY playing (user order).
+    this.live = [];
+    this.stops = 0;
+    //: The turn whose audio is currently on the clock, so a stop can say on
+    //: WHICH bubble it happened rather than only in the header.
+    this.currentTurn = null;
   }
 
   /** Create and START the output context. MUST be called on a user gesture.
@@ -607,7 +651,19 @@ class Playback {
   }
 
   /** Forget any schedule made against an old clock. */
-  reset() { this.cursor = 0; }
+  reset() { this.cursor = 0; this.forget(); }
+
+  /** Drop the handles to buffers that have already been heard.
+   *
+   * Every scheduled source is retained so it can be stopped again; without
+   * this the list would grow for the length of the conversation. A source
+   * whose end time is behind the clock cannot be stopped any more anyway.
+   */
+  forget() {
+    if (!this.ctx) { this.live = []; return; }
+    const now = this.ctx.currentTime;
+    this.live = (this.live || []).filter((entry) => entry.endsAt > now);
+  }
 
   /** Put samples on the output clock. Shared by live audio and by replay. */
   schedule(float32, rate) {
@@ -633,6 +689,12 @@ class Playback {
       if (this.cursor < now + 0.02) this.cursor = now + 0.05;
       source.start(this.cursor);
       this.cursor += buffer.duration;
+      // Kept so the whole queue can be silenced on one tap. A buffer that is
+      // already scheduled plays whatever happens to the socket, so "stop"
+      // without these handles could only ever stop the NEXT chunk -- which,
+      // for a listener who has heard enough, is not stopping.
+      this.forget();
+      (this.live = this.live || []).push({ source: source, endsAt: this.cursor });
       return true;
     } catch (err) {
       this.errors.push("push: " + err);
@@ -644,6 +706,29 @@ class Playback {
     this.pushed += 1;
     if (this.schedule(float32, rate)) this.scheduled += 1;
     else this.dropped += 1;
+  }
+
+  /** Silence everything scheduled, now. Local and immediate by design.
+   *
+   * The stop frame goes to the server as well, so no further audio is
+   * produced for the turn -- but the audio ALREADY on the output clock is
+   * the part the listener is hearing, and waiting for a round trip to cut it
+   * would make the button feel broken on exactly the connection where it
+   * matters most. The two halves are independent: this one always works,
+   * even offline.
+   */
+  stopAll() {
+    const stopped = (this.live || []).length;
+    for (const entry of this.live || []) {
+      try { entry.source.stop(); } catch (err) { /* already finished */ }
+      try { entry.source.disconnect(); } catch (err) { /* already detached */ }
+    }
+    this.live = [];
+    // Back to "nothing is booked", so the next turn schedules against the
+    // real clock rather than behind the tail we just cut away.
+    this.cursor = this.ctx ? this.ctx.currentTime : 0;
+    this.stops += 1;
+    return stopped;
   }
 
   /** Play a turn's audio again, on demand (design 19.6). Deliberately not
@@ -669,6 +754,7 @@ class Playback {
       scheduled: this.scheduled,
       dropped: this.dropped,
       skipped_replay: this.skippedReplay,
+      stops: this.stops,
       last_resume: this.lastResume,
       blocked: this.blocked,
       errors: this.errors.slice(-3),
@@ -1094,8 +1180,18 @@ class Connection {
       keepAudio(turnId, samples, rate);
       return;
     }
+    // A turn the listener already cut off must not resume because more of its
+    // audio was still in flight. The stop is remembered per turn, so the rest
+    // of the frames are kept for the replay button and never scheduled.
+    if (stoppedTurns.has(turnId)) {
+      keepAudio(turnId, samples, rate);
+      playback.skippedReplay += 1;
+      return;
+    }
     keepAudio(turnId, samples, rate);
+    playback.currentTurn = turnId;
     playback.push(samples, rate);
+    showStop();
     if (uiState !== "recording") setState("speaking", "speaking");
     // Audio arrived and the output is not running: say it, once, in words the
     // person can act on. Silence here is the failure that cost five rounds --
@@ -1216,7 +1312,8 @@ function bubbleFor(turnId) {
   node.innerHTML =
     '<div class="meta"><i class="avatar">?</i><span class="who"></span>'
     + '<span class="tag lang"></span><span class="tag badge" hidden></span>'
-    + '<span class="tag voice" hidden></span></div>'
+    + '<span class="tag voice" hidden></span>'
+    + '<span class="tag stopmark" hidden>stopped</span></div>'
     + '<div class="dst"></div><div class="src"></div>'
     + '<div class="cands" hidden></div><div class="tools"></div>';
   node.addEventListener("click", (event) => {
@@ -1277,6 +1374,8 @@ function renderLine(line) {
   node.querySelector(".lang").textContent = line.source_language || "";
   node.querySelector(".src").textContent = line.source_text || "";
 
+  const stopmark = node.querySelector(".stopmark");
+  if (stopmark) stopmark.hidden = !node.classList.contains("stopped");
   const badge = node.querySelector(".badge");
   if (line.confidence === "uncertain") {
     badge.hidden = false;
@@ -1852,6 +1951,85 @@ const microphone = new Microphone(
   (text, bad) => sys(text, bad),
 );
 
+// ---------------------------------------------------------------------------
+// Stopping the playback (user order).
+//
+// Two halves that do not depend on each other. The LOCAL half cuts what is
+// already on the output clock and is instant; the REMOTE half asks the server
+// to stop producing the rest of the turn. If the socket is down, the local
+// half still works -- which is the case that decides whether this button is
+// trusted.
+// ---------------------------------------------------------------------------
+//: Named by the server side, which is building the other half: it discards
+//: the frames it has planned, cancels the queue, aborts a running synthesis
+//: and answers with an ack. Kept as ONE constant, and the client's half is
+//: complete and useful before that half lands -- the local cut does not
+//: depend on it.
+const STOP_FRAME_KIND = "playback.stop";
+//: Turns whose playback the listener cut. Their remaining audio is kept for
+//: the replay button and never scheduled.
+const stoppedTurns = new Set();
+//: Set while a stop frame the server may not know yet is in flight, so its
+//: protocol complaint is not shown to the user as a fault of theirs.
+let stopFramePending = 0;
+//: The server's stop counter. Monotonic, and the cheap way to tell a frame
+//: that was already in flight when the stop happened from a fresh one.
+let stopEpoch = 0;
+
+function showStop() {
+  if (outputMode === "silent") return;
+  el("stopplay").classList.add("on");
+  document.body.classList.add("playing");
+}
+/** A conversation that has been reset or cleared has nothing left to resume. */
+function forgetStops() { stoppedTurns.clear(); }
+function hideStop() {
+  el("stopplay").classList.remove("on");
+  document.body.classList.remove("playing");
+}
+
+/** Record on the line that its audio was cut short.
+ *
+ * On the bubble, not only in the header: the record must say which turn was
+ * cut, or a scrollback read later is misleading. Idempotent, because three
+ * paths reach it -- the local tap, the server's ack, and the journalled
+ * event that replays on a reconnect.
+ */
+function markStopped(turnId) {
+  if (!turnId) return;
+  stoppedTurns.add(turnId);
+  const node = bubbles.get(turnId);
+  if (!node) return;
+  node.classList.add("stopped");
+  const mark = node.querySelector(".stopmark");
+  if (mark) mark.hidden = false;
+  const line = node.dataset.line ? lineData.get(Number(node.dataset.line)) : null;
+  renderTools(node, line);
+}
+
+function stopPlayback() {
+  const turnId = playback.currentTurn;
+  const cut = playback.stopAll();
+  hideStop();
+  playback.currentTurn = null;
+  // Our own guess at which turn was speaking; the ack corrects it if the
+  // server aborted a different one.
+  markStopped(turnId);
+  setState(uiState === "recording" ? "recording" : "ready",
+           uiState === "recording" ? "recording" : "stopped");
+  // The remote half. Sent after the local cut, never before it. The server
+  // discards its queue, aborts the running synthesis and answers with an ack
+  // carrying the turn it aborted and how many queued turns went with it.
+  stopFramePending += 1;
+  connection.sendControl({ kind: STOP_FRAME_KIND, reason: "user" });
+  reportCapture("playback-stopped");
+  return cut;
+}
+
+el("stopplay").innerHTML = ICON.stop;
+el("stopplay").addEventListener("contextmenu", (e) => e.preventDefault());
+el("stopplay").onclick = stopPlayback;
+
 function updateLink() {
   const open = connection.ws && connection.ws.readyState === WebSocket.OPEN;
   const parts = [];
@@ -2146,11 +2324,62 @@ segBind("segvoice", async (mode, previous) => {
   }
 });
 
-// Reading mode (design 17.1): the pipeline is identical up to and excluding
-// synthesis, so the transcript and the voice references keep filling.
-segBind("segoutput", (mode) => {
-  connection.sendControl({ kind: "output.mode", mode });
-});
+// ---------------------------------------------------------------------------
+// Silence, which is the SAME THING as the reading mode (design 17.1).
+//
+// Checked at the code before being merged into one control rather than
+// assumed from the two orders' wording: `session.py:1505` reads the session's
+// output mode, and `speak()` returns at `session.py:1538` -- before the
+// `tts.synthesize` call at :1553. So in `silent` the synthesis is never
+// computed, which is exactly what the mute order asks for, and everything
+// upstream of it (recognition, identification, routing, translation, the
+// reference buffers) keeps running. One server state, therefore one control.
+//
+// It survives a reload because it lives in `state()` (`session.py:545`) and
+// this client renders that state on every handshake -- it is not stored here.
+// ---------------------------------------------------------------------------
+let outputMode = "voice";
+
+function setOutputMode(mode, tell) {
+  outputMode = mode === "silent" ? "silent" : "voice";
+  const muted = outputMode === "silent";
+  const button = el("mute");
+  button.innerHTML = muted ? ICON.muted : ICON.speaker;
+  button.classList.toggle("muted", muted);
+  button.setAttribute("aria-label",
+    muted ? "translations are written only" : "translations are spoken aloud");
+  button.title = muted ? "muted - tap to speak translations aloud"
+                       : "spoken aloud - tap to mute";
+  const note = el("outputnote");
+  if (note) {
+    note.textContent = muted
+      ? "Muted. The whole pipeline still runs and only the synthesis is "
+        + "skipped, so the transcript and the voice references keep filling. "
+        + "The speaker icon in the header switches it back."
+      : "Translations are spoken aloud. The speaker icon in the header mutes "
+        + "them; muting skips the synthesis entirely rather than turning the "
+        + "volume down, so nothing is computed that nobody will hear.";
+  }
+  if (muted) {
+    // Nothing further will be synthesized, but a turn already on the clock
+    // would keep talking through the switch -- which reads as a mute that
+    // does not mute.
+    playback.stopAll();
+    hideStop();
+  }
+  if (tell) {
+    sys(muted ? "muted: translations are written, not spoken"
+              : "translations are spoken again");
+  }
+}
+
+el("mute").onclick = () => {
+  const next = outputMode === "silent" ? "voice" : "silent";
+  // Painted immediately, then corrected by the server's own answer if it
+  // refuses -- the control must not feel dead for a round trip.
+  setOutputMode(next, false);
+  connection.sendControl({ kind: "output.mode", mode: next });
+};
 
 segBind("segroute", async (value) => {
   const manual = value === "manual";
@@ -2238,6 +2467,9 @@ el("reset").onclick = async () => {
   clearStream();
   el("chips").innerHTML = "";
   audioStore.clear();
+  forgetStops();
+  playback.stopAll();
+  hideStop();
   renderSpeakers([]);
   connection.sessionId = null;
   connection.cursor = 0;
@@ -2464,7 +2696,7 @@ function applyState(state) {
   if (state.speakers) renderSpeakers(state.speakers);
   if (state.armed_speaker !== undefined) markArmed(state.armed_speaker);
   if (state.voice_mode) segSet("segvoice", state.voice_mode);
-  if (state.output_mode) segSet("segoutput", state.output_mode);
+  if (state.output_mode) setOutputMode(state.output_mode, false);
   if (state.routing_mode) {
     segSet("segroute", state.routing_mode);
     el("routing").style.display = state.routing_mode === "manual"
@@ -2507,6 +2739,7 @@ function onEvent(event) {
       break;
     case "transcript.cleared":
       clearStream();
+      forgetStops();
       sys("transcript cleared");
       break;
     case "speaker.suggestion":
@@ -2532,10 +2765,9 @@ function onEvent(event) {
       markArmed(event.speaker_id);
       break;
     case "output.mode":
-      segSet("segoutput", event.mode);
-      sys(event.mode === "silent"
-        ? "reading mode: translations are written, not spoken"
-        : "translations are spoken again");
+      // The server's answer is the truth; the optimistic paint above is only
+      // a guess until this arrives, and a refusal corrects it here.
+      setOutputMode(event.mode, event.mode !== outputMode);
       break;
     case "turn.opened":
       setState("working", "translating");
@@ -2650,7 +2882,38 @@ function onEvent(event) {
     case "resume.gap":
       sys("some turns were lost while offline", true);
       break;
+    // The ACK. Confirmation, not precondition: the audio was already cut when
+    // the frame went out, so nothing here has to happen for the button to
+    // have worked. What it adds is the server's own account -- which turn it
+    // aborted (ours was a guess from the last frame seen) and how many queued
+    // turns went with it, which is a real loss and therefore said out loud.
+    case "playback.stop.ack":
+      stopFramePending = Math.max(0, stopFramePending - 1);
+      stopEpoch = Math.max(stopEpoch, Number(event.stop_epoch) || 0);
+      markStopped(event.aborted_turn_id);
+      if (event.dropped_queued) {
+        sys("stopped: " + event.dropped_queued + " queued turn"
+            + (event.dropped_queued === 1 ? "" : "s") + " dropped with it");
+      }
+      break;
+    // The journalled event. Unlike the ack this REPLAYS, so it also arrives
+    // on a reconnect -- which is what makes a stop survive in the record
+    // rather than being something only the tab that did it remembers.
+    case "playback.stopped":
+      stopEpoch = Math.max(stopEpoch, Number(event.stop_epoch) || 0);
+      markStopped(event.aborted_turn_id);
+      break;
     case "error":
+      // A protocol complaint about the stop frame is OUR problem, not the
+      // user's: the client half shipped first, and the local cut already
+      // happened. Swallow exactly one such complaint per frame sent, and
+      // nothing else -- an error that is merely inconvenient must still be
+      // shown, or this becomes the hole every later defect hides in.
+      if (event.stage === "protocol" && stopFramePending > 0
+          && String(event.message || "").indexOf(STOP_FRAME_KIND) >= 0) {
+        stopFramePending -= 1;
+        break;
+      }
       sys(event.stage + ": " + event.message, true);
       break;
   }
@@ -2686,12 +2949,24 @@ document.addEventListener("visibilitychange", () => {
 // The speaking state has no event of its own -- the output clock is the only
 // thing that knows when the last buffer has been heard. Polled, cheaply,
 // rather than guessed from a timer per turn.
+let tick = 0;
 setInterval(() => {
+  tick += 1;
   if (uiState === "speaking" && !playback.busy) setState("ready", "ready");
-  if (uiState === "ready" || uiState === "speaking") connection.ping();
-}, 5000);
+  // The stop control exists exactly as long as there is something to stop --
+  // including while the microphone is open, because a listener who starts
+  // talking over the playback is precisely the person who wants it cut.
+  if (playback.busy && outputMode !== "silent") showStop();
+  else hideStop();
+  // The link measurement is a background reading, not a heartbeat: once every
+  // fifth tick is plenty and keeps the socket quiet.
+  if (tick % 5 === 0 && (uiState === "ready" || uiState === "speaking")) {
+    connection.ping();
+  }
+}, 1000);
 
 initTheme();
+setOutputMode("voice", false);
 el("gear").innerHTML = ICON.gear;
 el("sheetclose").innerHTML = ICON.close;
 updateLink();
