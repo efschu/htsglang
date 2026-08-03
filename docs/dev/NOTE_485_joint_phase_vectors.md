@@ -34,6 +34,25 @@ DESK / PREDICTED. No boot was run for this note. The deciding arm is
 > continuous token vector, and the numbers below are an optimum over an
 > incomplete candidate set. Fix tracked as #500-B1; see
 > `docs/dev/AUDIT_500_mechanism_reach.md`.
+>
+> **#503 (2026-08-03): the correction above is itself REFUTED, executed.**
+> Two independent predicates govern this family and #500-B1 conflated them.
+> `attn_kv_replicated(tp_size, total_num_kv_heads)` is strictly `kv < tp`
+> (`distributed/utils.py:1081`) and is what `linear.py:1423` and
+> `model_config.py:1332` read to build the q/k/v shards — so at 4 kv heads
+> over 3 ranks the PROJECTIONS head-shard and the enumerator's kv-head grid
+> is the runtime's. `uneven_dcp_kv_replicated` replicates the KV **pool**:
+> "the attention write gathers this rank's uneven projection shard up to
+> `get_total_num_kv_heads()`"
+> (`model_executor/model_runner_kv_cache_mixin.py:2721`). Pricing the WEIGHTS
+> on the second predicate models a layout the #105 ragged-kernel guard
+> refuses at the first forward — it was implemented, measured and reverted
+> under #503. The `attn_units = 4` pin, the `(grid-pinned)` column and
+> conclusion 2 are therefore correct as written about the head axis, and
+> §4.1's rms 2.2 against the four measured arms is unchanged. What #503 did
+> change: the token axis is now reported only where
+> `uneven_dcp_kv_replicated` holds, and `placement.py:813` is recorded as the
+> site that still conflates pool and projection replication.
 
 The law this implements (CLAUDE.md, *PER-FAMILY x PER-PHASE OPTIMA*): every
 weight family has its own optimum per phase, so a single-family arm is a
@@ -119,7 +138,7 @@ Constraints hit, in the order they bite on Qwen3.6-27B (tp=3):
 
 | constraint | value here | effect |
 |---|---|---|
-| attention grid (#62/#116) | `attn_units = 4` kv heads *(enumerator only — see the #500 correction above)* | every rank keeps >= 1 unit, so the only split the ENUMERATOR represents is `[2,1,1]` — the base. ~~**The attention family has no lever on this checkpoint.**~~ **REFUTED (#492)**: the HEAD AXIS has no lever; the family also has the replication + token-shard axis, which is continuous — and per audit #500 this is the geometry the RUNTIME actually uses here (q-head grid + token vector), so "no lever on this checkpoint" does not follow. |
+| attention grid (#62/#116) | `attn_units = 4` kv heads *(the runtime's grid too — #503 re-checked #500's claim that it is not)* | every rank keeps >= 1 unit, so the ONLY representable split is `[2,1,1]` — the base. ~~**The attention family has no lever on this checkpoint.**~~ **REFUTED (#492)**: the HEAD AXIS has no lever; the family also has the replication + token-shard axis, which is continuous. Audit #500 claimed the head grid itself was wrong (q-head grid instead); #503 executed that against `attn_kv_replicated` (`kv < tp`, strictly) and refuted it. |
 | GDN grid | `gdn_units = 16` k heads | the resolving grid; the whole ladder lives here |
 | MLP grid | 136 quant-group units | unchanged |
 | GDN state coupling (#299) | ~4.7 MiB/req/unit | pool follows the units; priced into `predict_capacity` |
@@ -297,13 +316,12 @@ accepted — not bypassed.
    `attn_units = 4`; the family is not. Replication + token-sharding is the
    second axis and it is continuous, already live under uneven DCP, and
    priced since #492. What actually blocks it on this rig is CAPACITY, not
-   the grid: see `NOTE_492_attention_replication_axis.md`. **Refined by audit
-   #500:** the pin above is a property of the ENUMERATOR
-   (`uneven_perf.py:4133-4148` leaves the kv-head grid only at `attn_units <
-   tp`), not of the checkpoint or the runtime — the boot this arm runs in is
-   always on the replicated-KV geometry (`distributed/utils.py:346`), whose
-   axes are the q-head grid and the token vector. Pricing those in the cost
-   model is #500-B1 and is the change that would make this arm's number an
-   optimum over the real feasible set.
+   the grid: see `NOTE_492_attention_replication_axis.md`. ~~**Refined by audit
+   #500:** the pin above is a property of the ENUMERATOR, not of the runtime.~~
+   **That refinement is REFUTED (#503):** `attn_kv_replicated` is strictly
+   `kv < tp` (`distributed/utils.py:1081`), the projections really do
+   head-shard here, and the pin is a property of the checkpoint. The
+   replicated-KV *pool* (`:346`) is a different mechanism and gates the token
+   axis only.
 3. Whether the joint layout is worth its restart at all is a decision-layer
    question that belongs with #363's `regime_switch` rungs, not here.

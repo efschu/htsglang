@@ -66,7 +66,7 @@ _MIN_LINK = 5.1
 _FUNDED_BUDGETS = (49152, 32768, 32768)
 
 
-def _model(model_path, base_plan=None, budgets=None):
+def _model(model_path, base_plan=None, budgets=None, dcp_size=3):
     plan = list(base_plan or _BUDGETS)
     budget = list(budgets or _BUDGETS)
     pi = PlanInputs(
@@ -78,6 +78,15 @@ def _model(model_path, base_plan=None, budgets=None):
         rank_gpu_id=[0, 1, 2],
         effective_vram_mib=budget,
         rank_tp_ratio=plan,
+        # #503: this suite is ABOUT the second axis, so the fixture has to
+        # declare the geometry that HAS one. The axis is gated on
+        # ``uneven_dcp_kv_replicated`` (dcp_size > 1 AND a rank-ratio plan),
+        # which a boot gets from a non-'coupled' ``--rank-kv-ratio``
+        # auto-setting ``dcp_size = tp_size`` (server_args.py:9845-9853).
+        # Before #503 the report was emitted unconditionally, so this fixture
+        # could leave it unset and still be answered -- about a boot that
+        # head-shards the KV cache and installs no token vector at all.
+        dcp_size=dcp_size,
     )
     return PerfCostModel(pi, plan, budget)
 
@@ -416,6 +425,67 @@ class TestTheCoreShareBracket(CustomTestCase):
                 best,
                 msg=f"{tok} must fund less than the matched vector",
             )
+
+
+@unittest.skipUnless(
+    _INT8 and os.path.isdir(_INT8),
+    "HTSGLANG_TEST_MODEL_DIR/Qwen3.6-27B-INT8-W8A8 not present",
+)
+class TestTheAxisIsGatedOnThePredicateThatInstallsIt(CustomTestCase):
+    """#503 (audit #500-B1, in the direction the audit did not look).
+
+    #492 added the second axis and reported it for EVERY configuration. The
+    axis only exists where the KV pool runs replicated-heads + token-shard,
+    i.e. where ``uneven_dcp_kv_replicated`` holds -- ``dcp_size > 1 and
+    get_tp_partition_ratios() is not None``. A boot on the default
+    ``--rank-kv-ratio coupled`` with no ``SGLANG_UNEVEN_DCP`` never reaches
+    ``dcp_size > 1`` (``server_args.py:9845-9853``), head-shards the KV cache,
+    and has no token vector to solve for. Reporting a priced lever with a
+    ``funds ctx`` number to that operator is an offer the boot cannot honour.
+
+    FALSIFIER: on the pre-#503 tree the first assertion below fails -- the
+    full axis report is emitted for a configuration that cannot actuate it.
+    """
+
+    def _lines(self, **kw):
+        m = _model(_INT8, **kw)
+        mlp = [list(c) for c in _mlp_candidates(m, _GEMM_INT8, _BUDGETS)]
+        attn = [list(c) for c in _attn_candidates(m, _GEMM_INT8, _BUDGETS)]
+        return "\n".join(
+            _replication_axis_lines(
+                m, _BUDGETS, mlp + [tuple(_BUDGETS)], attn,
+                _GEMM_INT8, _GEMM_INT8, None, _MIN_LINK,
+            )
+        )
+
+    def test_no_uneven_dcp_means_the_axis_is_refused_by_name(self):
+        text = self._lines(dcp_size=None)
+        self.assertIn("NOT AVAILABLE", text)
+        # The refusal quotes the gate, so a reader can check it without
+        # trusting this string (MECHANISM REACH).
+        self.assertIn("uneven_dcp_kv_replicated = dcp_size > 1", text)
+        self.assertIn("--rank-kv-ratio", text)
+        # ... and it must not price a lever it just refused.
+        self.assertNotIn("CORE-PACED", text)
+        self.assertNotIn("funds ctx", text)
+
+    def test_a_uniform_base_plan_is_refused_for_the_same_reason(self):
+        """The other term of the predicate: an all-equal plan takes the even
+        fast path, so ``get_tp_partition_ratios() is not None`` is False even
+        at ``dcp_size == tp_size``."""
+        m = _model(_INT8, base_plan=[1, 1, 1], dcp_size=3)
+        text = "\n".join(
+            _replication_axis_lines(
+                m, [1, 1, 1], [(1, 1, 1)], [],
+                _GEMM_INT8, _GEMM_INT8, None, _MIN_LINK,
+            )
+        )
+        self.assertIn("NOT AVAILABLE", text)
+
+    def test_the_axis_is_reported_where_the_predicate_holds(self):
+        text = self._lines(dcp_size=3)
+        self.assertNotIn("NOT AVAILABLE", text)
+        self.assertIn("REPLICATION+TOKEN axis", text)
 
 
 @unittest.skipUnless(

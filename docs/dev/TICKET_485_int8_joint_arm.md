@@ -14,6 +14,20 @@ DESK/PREDICTED; this ticket is the only thing that can turn it into a result.
 > factually correct about the HEAD partition; read it as such, not as a
 > statement about the family. Details:
 > `NOTE_492_attention_replication_axis.md` §5-6.
+>
+> **#503 re-check (2026-08-03) — the gate on this ticket.** Audit #500-B1
+> proposed that the whole head ladder was priced on the wrong grid, which
+> would have invalidated arm A's desk expectation before it booted. Executed
+> against the runtime predicates, it is REFUTED: the projection split follows
+> `attn_kv_replicated` (`kv < tp`, strictly, `distributed/utils.py:1081`),
+> not `uneven_dcp_kv_replicated` (which replicates the KV *pool*). The
+> `[2,1,1]` head partition and the desk expectation in §2 are unchanged, the
+> #475 backtest still reproduces its four measured arms at rms 2.2, and this
+> ticket is CLEAR TO BOOT on the numbers it already carries. One flag fact
+> that belongs in RESULTS.md: pinning `--rank-kv-ratio <matched vector>` is
+> what auto-sets `dcp_size = tp_size` (`server_args.py:9845-9853`), so arm A
+> runs the replicated-KV-**pool** geometry and arm B (`coupled`) does not.
+> The arms differ on that axis; record it rather than assuming they match.
 
 One boot pair, two arms, same session ordering, one checkpoint. It settles
 three questions at once: whether the joint cut moves the prefill window at

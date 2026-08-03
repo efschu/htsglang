@@ -766,22 +766,18 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
 # Sub-computations.
 # ---------------------------------------------------------------------------
 def _uneven_dcp_active(flags, base_plan) -> bool:
-    """Mirror of the runtime's ``uneven_dcp_kv_replicated`` condition
-    (distributed/utils.py): the KV-replication + token-split path is in force
-    when DCP spans the TP group AND a NON-UNIFORM rank ratio plan is installed
-    -- regardless of kv_heads vs tp. Signals available at plan time: an
-    explicit dcp_size > 1, an explicit kv_token_vector, or the
-    SGLANG_UNEVEN_DCP env pair (auto-sets dcp_size at launch)."""
-    non_uniform = base_plan is not None and len(set(base_plan)) > 1
-    if not non_uniform:
-        return False
-    if flags is None:
-        return False
-    if (getattr(flags, "dcp_size", None) or 0) > 1:
-        return True
-    if getattr(flags, "kv_token_vector", None):
-        return True
-    return False
+    """Plan-time mirror of the runtime's ``uneven_dcp_kv_replicated``.
+
+    The body used to be spelled out here; #503 moved it next to the runtime
+    predicate it mirrors (``distributed/utils.py``) so the two cannot drift,
+    and so the phase-prefill enumerator reads the SAME function instead of a
+    third spelling of it. Kept as a named wrapper because this module's own
+    readers and tests know the condition by this name, and because
+    ``placement`` imports ``distributed.utils`` lazily throughout.
+    """
+    from sglang.srt.distributed.utils import plan_uneven_dcp_kv_replicated
+
+    return plan_uneven_dcp_kv_replicated(flags, base_plan)
 
 
 def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes, flags=None):

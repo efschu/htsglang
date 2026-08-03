@@ -354,6 +354,56 @@ def uneven_dcp_kv_replicated(dcp_size: int) -> bool:
     return dcp_size > 1 and get_tp_partition_ratios() is not None
 
 
+def plan_uneven_dcp_kv_replicated(flags, base_plan) -> bool:
+    """PLAN-TIME mirror of :func:`uneven_dcp_kv_replicated` (#503).
+
+    The runtime predicate one function above reads PROCESS state -- the
+    installed ``--rank-tp-ratio`` (``get_tp_partition_ratios()``) and the
+    resolved ``dcp_size``. A planner runs before any of that exists, so it has
+    to answer the same question from the flags it is about to emit. This lives
+    next to the runtime gate deliberately: it is the same statement twice, and
+    two files apart is how the two spellings drift.
+
+    It answers one question only -- **is the KV POOL replicated-heads +
+    token-sharded**. It does NOT say whether the k/v PROJECTIONS are
+    replicated; that is :func:`attn_kv_replicated` (``kv < tp``, strictly),
+    and the two are independent. At 4 kv heads over 3 ranks with uneven DCP
+    the pool is replicated and the projections are not: "the attention write
+    gathers this rank's uneven projection shard up to
+    ``get_total_num_kv_heads()``"
+    (``model_executor/model_runner_kv_cache_mixin.py:2721``). Conflating them
+    is what audit #500-B1 did, and pricing attention WEIGHTS on this predicate
+    would model a layout the #105 ragged-kernel guard refuses at the first
+    forward. Use it for the token axis and the core term; never for the
+    weight split.
+
+    Term for term against ``uneven_dcp_kv_replicated``:
+
+    * ``get_tp_partition_ratios() is not None`` -- a NON-UNIFORM rank ratio
+      plan is installed. An all-equal plan takes the even fast path, so
+      ``len(set(base_plan)) > 1`` is the plan-time spelling.
+    * ``dcp_size > 1`` -- DCP spans the TP group. At plan time that is either
+      an explicit ``dcp_size``, or an explicit KV token vector (which is what
+      ``--rank-kv-ratio <vector>`` installs, and a non-``coupled``
+      ``--rank-kv-ratio`` is exactly what auto-sets ``dcp_size = tp_size``:
+      ``server_args.py:9845-9853``, ``uneven_kv_flag_active()`` at
+      ``server_args.py:8433``).
+
+    ``flags`` is anything carrying those two attributes -- ``ServerArgs``,
+    ``PlacementFlags`` or ``PlanInputs``.
+    """
+    non_uniform = base_plan is not None and len(set(base_plan)) > 1
+    if not non_uniform:
+        return False
+    if flags is None:
+        return False
+    if (getattr(flags, "dcp_size", None) or 0) > 1:
+        return True
+    if getattr(flags, "kv_token_vector", None):
+        return True
+    return False
+
+
 def cp_token_prefix(dcp_size: int) -> list:
     """Prefix sums of the token ratios: cp_token_prefix()[r] is the first slot
     index (within a virtual block of cp_token_split_factor tokens) owned by
