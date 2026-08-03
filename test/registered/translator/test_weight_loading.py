@@ -140,3 +140,33 @@ class TestWeightVerification(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTalkerEmbedderShape(unittest.TestCase):
+    """The talker-backed embedder satisfies the diarization contract.
+
+    Hermetic on purpose: instantiating it needs the checkpoint, but the thing
+    most likely to silently break is the CONTRACT -- a backend that does not
+    satisfy the protocol is only discovered when a real turn arrives, which
+    on this project means during a conversation in Spain.
+    """
+
+    def test_it_satisfies_the_SpeakerEmbedder_contract(self):
+        import inspect
+
+        from sglang.srt.translator.inprocess_tts import TalkerSpeakerEmbedder
+
+        # `issubclass` is unavailable here: the protocol carries non-method
+        # members (`name`, `min_seconds`), which is deliberate -- they are
+        # part of the contract the session reads. So the check is structural.
+        self.assertTrue(hasattr(TalkerSpeakerEmbedder, "min_seconds"))
+        self.assertTrue(inspect.iscoroutinefunction(TalkerSpeakerEmbedder.embed))
+        signature = inspect.signature(TalkerSpeakerEmbedder.embed)
+        self.assertEqual(list(signature.parameters), ["self", "audio"])
+
+    def test_it_declares_a_minimum_segment_length(self):
+        from sglang.srt.translator.inprocess_tts import TalkerSpeakerEmbedder
+
+        # A vector from 300 ms of speech is noise with a norm; the registry
+        # relies on this bound to refuse embedding such a segment at all.
+        self.assertGreater(TalkerSpeakerEmbedder.min_seconds, 0.0)

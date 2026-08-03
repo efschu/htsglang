@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--embedder", default="fake", choices=("fake", "onnx"),
+        "--embedder", default="fake", choices=("fake", "onnx", "talker"),
         help="speaker embedding backend",
     )
     parser.add_argument("--embedder-model", type=Path, default=None)
@@ -247,16 +247,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         asr = FakeAsr(languages=participants, pitch_map=[(150.0, participants[0])])
 
-    # Speaker embedding
-    if args.embedder == "onnx":
-        from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
-
-        if args.embedder_model is None:
-            raise SystemExit("--embedder onnx requires --embedder-model")
-        embedder = OnnxSpeakerEmbedder(args.embedder_model)
-    else:
-        embedder = FakeEmbedder()
-
+    # TTS first: the talker embedder borrows this backend's speaker
+    # encoder, so the order is a real dependency, not a preference.
     if args.tts == "inprocess":
         from sglang.srt.translator.inprocess_tts import (
             InProcessQwen3Tts,
@@ -284,6 +276,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sample_rate=args.tts_sample_rate,
             min_reference_seconds=args.min_reference_seconds,
         )
+
+    # Speaker embedding
+    if args.embedder == "talker":
+        # Reuses the speaker encoder the TTS checkpoint already loaded, so
+        # clustering and cloning cannot disagree about who is speaking.
+        # See TalkerSpeakerEmbedder for why this beats a second model here.
+        from sglang.srt.translator.inprocess_tts import TalkerSpeakerEmbedder
+
+        if args.tts != "inprocess":
+            raise SystemExit(
+                "--embedder talker needs --tts inprocess: it borrows that "
+                "backend's speaker encoder rather than loading a second model"
+            )
+        embedder = TalkerSpeakerEmbedder(tts)
+    elif args.embedder == "onnx":
+        from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
+
+        if args.embedder_model is None:
+            raise SystemExit("--embedder onnx requires --embedder-model")
+        embedder = OnnxSpeakerEmbedder(args.embedder_model)
+    else:
+        embedder = FakeEmbedder()
 
     mt = OpenAiMt(
         MtConfig(
