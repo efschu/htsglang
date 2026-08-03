@@ -50,6 +50,20 @@ def _clean_env():
     return env
 
 
+# The probe's answer is a single marked line. Reading the child's WHOLE stdout
+# instead used to work only by luck: the import chain under test reaches
+# `sglang.srt.layers.quantization.marlin_utils`, whose module-level
+# `from vllm import _custom_ops as ops` (marlin_utils.py:41) initialises vllm's
+# platform layer, and on a rig with cards of different names that logs
+# "Detected different devices in the system: ..." -- to stdout. Every word of
+# that warning landed in the module set and the comparison against `set()`
+# failed while the property under test held. The marker keeps foreign stdout
+# out of the answer without weakening it: the set compared below is still the
+# full list of matching `sys.modules` entries, and a missing marker is a hard
+# failure rather than a silently empty set.
+_MARK = "MODULES:"
+
+
 class TestNothingIsImported(CustomTestCase):
     def _imports(self, code, env):
         proc = subprocess.run(
@@ -62,14 +76,20 @@ class TestNothingIsImported(CustomTestCase):
         self.assertEqual(
             proc.returncode, 0, msg=f"subprocess failed:\n{proc.stderr[-3000:]}"
         )
-        return set(proc.stdout.split())
+        marked = [ln for ln in proc.stdout.splitlines() if ln.startswith(_MARK)]
+        self.assertEqual(
+            len(marked),
+            1,
+            msg=f"probe printed no {_MARK} line; stdout:\n{proc.stdout[-3000:]}",
+        )
+        return set(marked[0][len(_MARK) :].split())
 
     def test_distributed_import_does_not_pull_the_bar1_modules(self):
         code = (
             "import sglang.srt.distributed.parallel_state\n"
             "import sglang.srt.distributed.device_communicators.barlink\n"
             "import sys\n"
-            "print(' '.join(m for m in sys.modules if 'bar1' in m))\n"
+            "print('MODULES:' + ' '.join(m for m in sys.modules if 'bar1' in m))\n"
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
 
@@ -88,7 +108,8 @@ class TestNothingIsImported(CustomTestCase):
             "import sglang.srt.layers.moe.utils\n"
             "import sglang.srt.layers.moe.token_dispatcher as td\n"
             "import sys\n"
-            "print(' '.join(m for m in sys.modules if 'barlink_bar1' in m))\n"
+            "print('MODULES:' + ' '.join(m for m in sys.modules "
+            "if 'barlink_bar1' in m))\n"
         )
         self.assertEqual(self._imports(code, _clean_env()), set())
 
@@ -99,7 +120,7 @@ class TestNothingIsImported(CustomTestCase):
             "for m in ('sglang.srt.distributed.device_communicators.barlink_bar1',"
             "'sglang.srt.layers.moe.token_dispatcher.bar1ep'):\n"
             "    importlib.import_module(m)\n"
-            "print(' '.join(m for m in sys.modules if 'bar1' in m))\n"
+            "print('MODULES:' + ' '.join(m for m in sys.modules if 'bar1' in m))\n"
         )
         got = self._imports(code, _clean_env())
         self.assertTrue(any("barlink_bar1" in m for m in got))

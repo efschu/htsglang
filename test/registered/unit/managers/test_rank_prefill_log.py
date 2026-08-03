@@ -374,6 +374,13 @@ class TestReporterEmitsAheadOfLoggingGate(unittest.TestCase):
             rank_prefill_log=RankPrefillLog(),
             is_stats_logging_rank=False,
             current_scheduler_metrics_enabled=False,
+            # Fixture drift, 2026-07-29: #274 slice D R1 (9d4c495fcf) added a
+            # MONOTONE prefill-token counter and deliberately placed the
+            # increment AHEAD of the logging-rank gate -- i.e. in exactly the
+            # region this stub exercises. The real reporter initialises it
+            # unconditionally in __init__ (metrics_reporter.py:277), so the
+            # stub simply has to carry it too.
+            prefill_tokens_total=0,
         )
 
     def test_prefill_stats_on_silent_rank_emits_rank_line(self):

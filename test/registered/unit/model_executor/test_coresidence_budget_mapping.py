@@ -68,9 +68,27 @@ class _FakeServerArgs:
     def __init__(self, budget_mib, rank_gpu_id):
         self.rank_gpu_memory_mib = budget_mib
         self.rank_gpu_id = list(rank_gpu_id)
+        # Fixture drift, 2026-07-31: #307 (84e5d3e265) made the budget message
+        # name the --max-running-requests-ceiling this budget WOULD carry, so
+        # the field is read on the exhausted-budget path. This fixture pins
+        # the budget directly and sets no ceiling, which is what ``None``
+        # means here -- with it the message keeps exactly the shape the
+        # assertions below were written against (no ceiling clause).
+        self.max_running_requests_ceiling = None
 
     def uneven_memory_budgets_active(self):
         return self.rank_gpu_memory_mib is not None
+
+    def derived_reserve_infeasible_note(self, rank_index, short_mib):
+        """Fixture drift, 2026-08-03: #458 (b59e442a2c) appends a note when
+        the budget was DERIVED by ``--rank-auto-reserve-mib auto``.
+
+        The real method returns ``None`` for any pinned reserve, and this
+        fixture hands ``rank_gpu_memory_mib`` in directly rather than deriving
+        it from ``auto`` -- so ``None`` is the answer the production method
+        would give for this configuration, not a suppression of the note.
+        """
+        return None
 
 
 class _FakeRunner:
@@ -119,6 +137,18 @@ class _FakeRunner:
     budget_exhausted_message = staticmethod(
         M.ModelRunnerKVCacheMixin.budget_exhausted_message
     )
+
+    # Fixture drift, 2026-07-28: this file was written against a
+    # ``_ranks_on_my_gpu`` that indexed the per-rank vectors with ``tp_rank``
+    # directly. [PP] #201 slice 1 (358522e207) put ``_rank_vector_index``
+    # between the two, because under a pipeline the vectors are laid out in
+    # WORLD-rank order (pp_rank * tp_size + tp_rank) and every stage would
+    # otherwise read stage 0's entry. The fake wires the mixin methods one by
+    # one, so it has to carry the new helper as well; its ``world_rank``
+    # lookup on ``server_args`` is a getattr with a ``tp_rank`` fallback, so
+    # _FakeServerArgs needs no new field.
+    def _rank_vector_index(self):
+        return M.ModelRunnerKVCacheMixin._rank_vector_index(self)
 
     def _ranks_on_my_gpu(self):
         return M.ModelRunnerKVCacheMixin._ranks_on_my_gpu(self)
