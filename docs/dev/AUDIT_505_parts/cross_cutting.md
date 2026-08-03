@@ -1,9 +1,25 @@
 ## Cross-cutting — the reach of the C1 remedy itself
 
-The C1 incident (a packed draft weight name that matched no parameter, logged as a
-warning, `continue`, speculative accept rate 0) was fixed by a completeness check in
-the direction the loop does not cover. That fix exists and is well argued
-(`models/deepseek_v4_dspark.py:868-886`):
+**There are TWO completeness remedies in this tree, at different altitudes, and
+neither covers the other's surface.** Read this section together with axis A1's
+finding #505-A1-01, which audits the loader-level one in depth; this section audits
+the model-level one and states the combined picture.
+
+- **Loader-level:** `model_loader/weight_utils.raise_on_unloaded_draft_parameters`
+  (`:2032`), called once, from `DefaultModelLoader` (`model_loader/loader.py:903`).
+  Its own docstring states the ambition — *"Hoisting the check to the loader makes
+  it a property of loading A DRAFT, not of one model class"* — and immediately below
+  it, two silent-return arms bound it: `if loaded_params is None: return` (`:2058`)
+  and a `if not loaded: return` for the empty-set case (`:2063-2067`). Reach and the
+  GGUF / QuantizedRL gaps are quantified in **#505-A1-01**.
+- **Model-level:** `models/deepseek_v4_dspark.py:868` `_assert_required_params_loaded`,
+  counted below.
+
+The two do not compose: the loader guard fires only for DRAFT loads through
+`DefaultModelLoader` on self-reporting models, and the model-level check exists in
+two files. Everything else in `models/` is on the warning path.
+
+The model-level fix is well argued (`models/deepseek_v4_dspark.py:868-886`):
 
 > Every parameter the draft DECLARES must have been written. / The loop above drops
 > a checkpoint tensor it cannot match to a parameter with only a warning, and that
@@ -28,14 +44,16 @@ Pinned by `test/registered/unit/models/test_dspark_draft_load_completeness.py:28
 | where it logs at a computed level | `gemma4_unified.py:434` (`logger.log(level, ...)`, DEBUG bucket for non-persistent buffers) |
 | where it is commented out | `gemma3_causal.py:903-907` (upstream, `9d02bb3e2a`, 2025 — not a fork defect) |
 
-So the remedy for the defect class this audit is named after currently binds in two
-model files out of 186. Both are fork files, both are speculative-draft loaders —
-i.e. exactly where the incident happened, and nowhere else. That is a REACH INCLUDES
-PARAMETERS result in the structural rather than the numeric sense: the mechanism
-exists, is correct, is tested, and covers ~1 % of the surface where the same silence
-is possible.
+So the model-level remedy binds in two files out of 186, both fork files, both
+speculative-draft loaders — i.e. exactly where the incident happened and nowhere
+else — and the loader-level remedy that was written to generalise it reaches, per
+#505-A1-01, three draft classes and no GGUF boot. That is a REACH INCLUDES PARAMETERS
+result in the structural rather than the numeric sense: the mechanism exists, is
+correct, is tested, and covers a few percent of the surface on which the same silence
+is possible. The remedy was hoisted once already, for exactly this reason, and the
+hoist did not travel.
 
-*Task #505-X1:* `promote the load-completeness check to a shared helper and apply it to the fork's own bring-ups (Qwen3.5/3.6, Gemma4, DSV4/GGUF), not only the two draft loaders`
+*Task #505-X1:* `promote the load-completeness check to a shared helper and apply it to the TARGET bring-ups (Qwen3.5/3.6, Gemma4, DSV4/GGUF), not only the draft path` — this is the target-side twin of #505-A1-01 and #505-A1-08; the three should be scoped together rather than fixed one loader at a time.
 
 Note on `gemma3_causal.py`: independently of the commented-out check, `loaded_params.add(name)`
 sits at `:902`, one indent level OUT of the block that assigns `name` in the inner
