@@ -34,6 +34,11 @@ SESSIONS="${S12_SESSIONS:-1 4 8 16}"
 POINT_S="${S12_POINT_SECONDS:-15}"
 WARMUP_S="${S12_WARMUP_SECONDS:-8}"
 PROMPT_TOKENS="${S12_PROMPT_TOKENS:-2048}"
+# A-vs-A floor draws per point, back to back inside ONE driver invocation after
+# one discarded warm-up draw (#475 SS6). 1 = the single point this step always
+# took; >1 turns the point into a floor series whose draws are filed as
+# <arm>_floorPn and whose gaps land in the artifact.
+FLOOR_DRAWS="${S12_FLOOR_DRAWS:-1}"
 
 mkdir -p "$DIR/belege" "$DIR/logs"
 DIR_HOST="$(host_path "$DIR")" || exit 2
@@ -90,7 +95,7 @@ set -uo pipefail
 /spinning/miniforge3_local_install/bin/python3.12 $DRIVER_HOST \\
   --mode messen --port $PORT --out-dir $DIR_HOST \\
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
-  --prompt-tokens $PROMPT_TOKENS \\
+  --prompt-tokens $PROMPT_TOKENS --floor-draws $FLOOR_DRAWS \\
   --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4"
 EOF
 chmod +x "$DIR/remote_messen.sh"

@@ -388,14 +388,17 @@ def tick_aggregate(ticks: list, bs: int, drop_edges: int = 1) -> dict:
     if not core:
         return {"ticks_window": len(ticks), "ticks_bs": 0, "ticks_counted": 0}
     rate = [t["gen_tok_s"] for t in core]
-    accept = [t["accept_len"] for t in core]
+    # None, not 0.0, on a boot without speculation (#459): no accept block is
+    # written there, and the rate half of the window is measured either way.
+    accept = [t["accept_len"] for t in core if t["accept_len"] is not None]
     rate_med = statistics.median(rate)
-    accept_med = statistics.median(accept)
+    accept_med = statistics.median(accept) if accept else None
     out = {
         "ticks_window": len(ticks),
         "ticks_bs": len(matching),
         "ticks_other_bs": other,
         "ticks_counted": len(core),
+        "ticks_with_accept": len(accept),
         "gen_tok_s_median": rate_med,
         "gen_tok_s_min": min(rate),
         "gen_tok_s_max": max(rate),
@@ -406,8 +409,14 @@ def tick_aggregate(ticks: list, bs: int, drop_edges: int = 1) -> dict:
         out["gen_tok_s_stdev"] = statistics.stdev(rate)
     if rate_med:
         out["ms_per_token"] = 1000.0 / rate_med
-        out["ms_per_verify"] = 1000.0 / rate_med * accept_med
-        out["ms_per_step"] = 1000.0 / rate_med * accept_med * bs
+        # Present with an explicit None rather than absent: a consumer must see
+        # the absence instead of a KeyError.
+        out["ms_per_verify"] = (
+            1000.0 / rate_med * accept_med if accept_med is not None else None
+        )
+        out["ms_per_step"] = (
+            1000.0 / rate_med * accept_med * bs if accept_med is not None else None
+        )
     return out
 
 

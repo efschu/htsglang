@@ -316,14 +316,18 @@ def _tick_aggregate(ticks: list, bs: int, drop_edges: int = 1) -> dict:
     if not core:
         return {"ticks_fenster": len(ticks), "ticks_bs": 0, "ticks_gewertet": 0}
     rate = [t["gen_tok_s"] for t in core]
-    accept = [t["accept_len"] for t in core]
+    # None, not 0.0, on a boot without speculation: the scheduler writes no
+    # accept block there at all (#459). The rate half of the window is measured
+    # either way, so it is reported either way.
+    accept = [t["accept_len"] for t in core if t["accept_len"] is not None]
     rate_med = statistics.median(rate)
-    accept_med = statistics.median(accept)
+    accept_med = statistics.median(accept) if accept else None
     out = {
         "ticks_fenster": len(ticks),
         "ticks_bs": len(matching),
         "ticks_fremde_bs": foreign,
         "ticks_gewertet": len(core),
+        "ticks_with_accept": len(accept),
         "gen_tok_s_median": rate_med,
         "gen_tok_s_min": min(rate),
         "gen_tok_s_max": max(rate),
@@ -334,11 +338,18 @@ def _tick_aggregate(ticks: list, bs: int, drop_edges: int = 1) -> dict:
         out["gen_tok_s_stdev"] = statistics.stdev(rate)
     if rate_med:
         out["ms_pro_token"] = 1000.0 / rate_med
-        out["ms_pro_verify"] = 1000.0 / rate_med * accept_med
+        # Both keys stay present with an explicit None when there is no accept
+        # length: a consumer that reads them must see the absence, not a
+        # KeyError that reads as "this harness never produced the field".
+        out["ms_pro_verify"] = (
+            1000.0 / rate_med * accept_med if accept_med is not None else None
+        )
         # The wall clock of one verify step. ``ms_pro_verify`` is that divided
         # by bs, because the scheduler's gen throughput counts the whole batch;
         # both are kept so neither can be mistaken for the other.
-        out["ms_pro_schritt"] = 1000.0 / rate_med * accept_med * bs
+        out["ms_pro_schritt"] = (
+            1000.0 / rate_med * accept_med * bs if accept_med is not None else None
+        )
     return out
 
 

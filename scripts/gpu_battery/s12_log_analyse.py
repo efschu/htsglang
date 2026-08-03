@@ -53,11 +53,30 @@ RE_PREFILL_RANK = re.compile(
     r"gpu-ms: (?P<gpu_ms>[\d.]+) "
     r"\(compute (?P<compute_ms>[\d.]+), wait (?P<wait_ms>[\d.]+)\)"
 )
+# The optional segments below are not defensive padding: the emitter BUILDS the
+# line by appending blocks, and every one of them is conditional
+# (managers/scheduler_components/metrics_reporter.py):
+#   :962-963   "Decode batch[ [iter]], #running-req: N, <pool usage parts>, "
+#              -- the iteration tag only under LOG_FORWARD_ITERS
+#   :968-972   the ENTIRE accept block is skipped when spec_algorithm.is_none()
+#   :1018      "accept len: X, accept rate: Y, "
+#   :1020      "cap len: Z, "                 (ragged verify CAP_ACCEPT only)
+#   :1022      "block accept len: Z, "
+#   :1028      the dspark block-accept estimate suffix
+#   :1039-1051 disaggregation-decode and language-only fields
+#   :1053-1057 "<backend> graph: B, gen throughput (token/s): R, #queue-req: Q"
+# The pre-#459 pattern REQUIRED the accept block and allowed nothing between it
+# and the graph flag. Consequence: a boot with speculation OFF matched zero
+# decode lines and s12 reported 0/0 ticks -- and a CAP_ACCEPT boot, which does
+# write an accept block, matched zero as well because "cap len: " sits in
+# between. The graph label is a device lookup (:284-288, cuda/cpu/npu/musa), so
+# it is captured rather than spelled out.
 RE_DECODE = re.compile(
     r"\[(?P<zeit>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) TP(?P<rang>\d+)\] "
-    r"Decode batch, #running-req: (?P<running_req>\d+),.*?"
-    r"accept len: (?P<accept_len>[\d.]+), accept rate: (?P<accept_rate>[\d.]+), "
-    r"cuda graph: (?P<cuda_graph>\w+), "
+    r"Decode batch(?: \[\d+\])?, #running-req: (?P<running_req>\d+),.*?"
+    r"(?:accept len: (?P<accept_len>[\d.]+), "
+    r"accept rate: (?P<accept_rate>[\d.]+), .*?)?"
+    r"(?P<graph_backend>\w+) graph: (?P<cuda_graph>\w+), "
     r"gen throughput \(token/s\): (?P<gen_tok_s>[\d.]+)"
 )
 # #315: this used to match "Aufbau in ... Peer-Ziele ... Region ... je Rang
@@ -115,18 +134,28 @@ def parse_prefill_rang(lines) -> list:
 
 
 def parse_decode(lines) -> list:
-    """Every ``Decode batch`` line. One per scheduler tick, not per request."""
+    """Every ``Decode batch`` line. One per scheduler tick, not per request.
+
+    ``accept_len`` and ``accept_rate`` are ``None`` -- never ``0.0`` -- on a
+    boot without speculative decoding, because the scheduler writes no accept
+    block at all there (metrics_reporter.py:968-972). A zero would survive
+    every arithmetic it enters and read downstream as a MEASURED accept length
+    of zero; ``spec`` says which of the two line shapes the tick had, so the
+    absence is visible instead of being inferred from a number.
+    """
     out = []
     for line in lines:
         m = RE_DECODE.search(line)
-        if m:
-            d = _numbers(
-                m,
-                ("rang", "running_req"),
-                ("accept_len", "accept_rate", "gen_tok_s"),
-            )
-            d["cuda_graph"] = d["cuda_graph"] == "True"
-            out.append(d)
+        if not m:
+            continue
+        d = _numbers(m, ("rang", "running_req"), ("gen_tok_s",))
+        d["cuda_graph"] = d["cuda_graph"] == "True"
+        d["spec"] = d["accept_len"] is not None
+        d["accept_len"] = float(d["accept_len"]) if d["accept_len"] is not None else None
+        d["accept_rate"] = (
+            float(d["accept_rate"]) if d["accept_rate"] is not None else None
+        )
+        out.append(d)
     return out
 
 
@@ -291,11 +320,17 @@ def decode_tick_aggregat(
     if not warm:
         return {"ticks": len(r), "ticks_gewertet": 0}
     rate = statistics.median(t["gen_tok_s"] for t in warm)
-    accept = statistics.median(t["accept_len"] for t in warm)
+    # An absent accept block is an absence, not a zero (#459). With speculation
+    # off the ticks still carry a real rate, so the point is reported WITH its
+    # rate and WITHOUT an accept number, instead of the whole point vanishing
+    # because no line parsed.
+    accepts = [t["accept_len"] for t in warm if t["accept_len"] is not None]
+    accept = statistics.median(accepts) if accepts else None
     return {
         "ticks": len(r),
         "ticks_gewertet": len(warm),
         "ticks_warmup_verworfen": len(r) - len(warm),
+        "ticks_with_accept": len(accepts),
         "accept_len_median": accept,
         "gen_tok_s_median": rate,
         "ms_pro_token": 1000.0 / rate if rate else None,
