@@ -1227,7 +1227,7 @@ Target text: one Spanish sentence, nine words.
 | audio produced | 40.88 s (hit the 512-token cap) | **3.76 s** (terminated on `codec_eos`) |
 | peak | 1.000 | 0.399 |
 | Opus round trip | 24.6 kbps, decoded in full | **20.8 kbps**, decoded in full |
-| speaker similarity | 0.986 *(spurious — see above)* | **0.980** *(loaded encoder)* |
+| speaker similarity | 0.986 *(spurious — unloaded encoder)* | 0.980 *(loaded — but see §15: this encoder has 0.04 of dynamic range and the number carries no information either way)* |
 
 3.76 s against the reference implementation's own **3.85 s** for the same
 checkpoint and direction (`base_de2es_xvec.wav`, §10) — the independent
@@ -1369,19 +1369,81 @@ green, and unchanged by any of this.
   serving venv is byte-unchanged (transformers 5.12.1, tokenizers 0.22.2,
   numpy 2.3.5 before and after), which mattered because two long-running
   services map it.
-* **The 36 preset clips.** Renderer ported from a desk-written API that never
-  existed to the real `generate_voice_design(text, instruct, language)`, and
-  the first clip is rendered and gated (WER 0.105 → PASS; both substitutions
-  are the recognizer writing digits for the number words in the render
-  sentence, a standing ~0.1 orthographic cost of this gate rather than a
-  synthesis error). **The VoiceDesign checkpoint carries the same silent
-  weight fault — `404 checked, 404 repaired`** — so without §13.1's guard the
-  batch would have produced 36 plausible, useless clips, and the pool is what
-  every other path degrades TO. Two checkpoints now confirm the fault is a
-  property of this transformers version rather than a one-off. Batch running
-  on CPU; `check_preset_pool.py` then has to certify distinctness (pairwise
-  x-vector cosine within each class against
-  `SpeakerRegistryConfig.match_threshold`, imported rather than copied) and
-  cross-language identity stability.
+* **The 36 preset clips — rendering, with two real defects found and one open.**
+  The renderer was ported from a desk-written API that never existed to the
+  real `generate_voice_design(text, instruct, language)`. **The VoiceDesign
+  checkpoint carries the same silent weight fault (`404 checked, 404
+  repaired`)**, so without §13.1's guard the batch would have produced 36
+  plausible, useless clips — and the pool is what every other path degrades
+  TO. Three loads now confirm the fault is a property of this transformers
+  version rather than a one-off.
+
+  **Defect 1 — the measuring instrument (fixed).** See §15.
+
+  **Defect 2 — presets had no identity across languages (fix written, not yet
+  verified).** Rendering each preset independently per language gives the same
+  descriptor and the same pinned seed a different sentence, and a model that
+  designs a voice from a natural-language description constrains the voice
+  CLASS, not the timbre. Measured on the validated encoder, the German and
+  Spanish renders of the same preset scored **0.044–0.505** against each
+  other, against a different-speaker median of 0.627. Every preset was two
+  different people wearing one name — the exact failure §4.3 exists to
+  prevent. `derive_preset_languages.py` fixes it by rendering ONE anchor
+  language with VoiceDesign and producing every other language by CLONING that
+  anchor with the serving checkpoint: the same cross-lingual zero-shot path a
+  real turn takes, measured at WER 0.100. Accent carry-over from the anchor is
+  explicitly fine per the 2026-08-03 dated decision. **Not yet re-measured** —
+  the German anchors are still rendering.
+
+  Within-class distinctness, on the other hand, is *mostly fine* on the
+  validated encoder: man de median 0.458, man es 0.400, woman es 0.312,
+  against the registry's 0.70 merge line. One pair sits above it
+  (woman-02.de / woman-04.de at 0.734) and needs a re-render or a descriptor
+  edit.
+
 * **True incremental streaming** remains a #488 item; rung B chunks a finished
   utterance (module docstring in `inprocess_tts.py` states the gap).
+
+---
+
+## 15. The instrument-validation rule (2026-08-03, learned the hard way)
+
+**Before a similarity number is used as evidence, measure its SPREAD on inputs
+whose answer is already known.**
+
+This project has now hit the reference-twin family five times. The fifth was a
+new shape and worth naming separately, because the previous four were all "the
+thing that validates agrees with the thing it validates" and this one is not.
+
+Diarization was briefly moved onto the TTS checkpoint's own speaker encoder,
+on a genuinely good argument: it is loaded anyway, it is what the cloning
+conditions on, and using one encoder for both clustering and cloning makes
+"the registry merges two speakers the cloner considers different" impossible
+by construction. The argument was sound. The encoder cannot tell anyone apart:
+
+| | TTS speaker encoder | wespeaker resnet34-LM |
+|---|---|---|
+| eight unrelated speakers | 0.949 – 0.990 | −0.048 – 0.784 |
+| a voice vs its own clone | 0.981 (*inside* the above) | 0.608 |
+| dynamic range | **0.04** | **0.83** |
+
+Its mean vector has norm 9.83 against a median sample norm of 10.06 — the
+shared component is ~98 % of every vector, so cosine is ~0.98 between any two
+clips. Mean-centering restores range but not separation. The encoder is
+trained to *condition synthesis*, not to *discriminate identity*, and those
+are different jobs.
+
+Had it shipped, `speakers.py` clusters at 0.70, so every participant would
+have merged into one speaker, their reference buffers would have blended, and
+the cloner would have synthesized an average of everyone — the voice-merge
+failure §4.2 calls out, reached by a change whose own docstring claimed to
+make it unrepresentable.
+
+It was caught because `check_preset_pool.py` ran and declared the preset pool
+collapsed at 0.94–0.99. The pool was fine. **The verdict was the instrument.**
+That script now refuses to report anything until the encoder clears a spread
+check on clips that are not the same voice, and the same discipline belongs on
+every similarity claim in this design — including the 0.980 speaker-similarity
+figure in §13.2, which on this evidence carries **no information** and should
+not be quoted as a cloning-quality result. §7(b)(3)'s ranking step must use
+the verification encoder, never the synthesis one.
