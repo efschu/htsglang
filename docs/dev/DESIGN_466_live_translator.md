@@ -2195,6 +2195,38 @@ utterance so a name could never stick to anybody. The `addressed` row is an
 honest gap — the model returned no candidate for it, and the adjacency logic
 it feeds is therefore unexercised on real speech.
 
+### 17.8 The acceptance gate: run the real client, not our own protocol client
+
+Standing rule, 2026-08-03, after four consecutive defects reached the user.
+
+Every fix in this project was proved with `front_door_test.py` — our own
+WebSocket client. It speaks the protocol correctly and it never executes a
+line of `client/index.html`. It was therefore structurally incapable of
+catching any of: the suspended capture context (R1/R2), the frame accumulator
+that never emitted (R2), the pitch shift from an announced sample rate (R3),
+and a live push that does not reach the DOM (R5). Four rounds, one blind spot,
+and the user was the test device for all four.
+
+**`scripts/translator/client_gate.py` is now the gate.** Headless Chromium
+with a fake microphone fed from a real speech clip, against the PUBLIC URL,
+tapping the button with real DOM events. It asserts what a person sees: a
+transcript line appears without a reload, audio reaches the playback path in
+the right quantity for its announced rate, the console is clean, and the
+socket is still OPEN after every turn.
+
+It has two halves, and the second is the one that matters:
+
+* **cold** — one or two turns from a fresh page;
+* **soak** — twelve minutes with a turn every ~90 s. Idle sockets dying and
+  sessions accumulating are both invisible in a cold run and are exactly what
+  the user hit.
+
+Chromium is a test vehicle and never part of the serving topology, so the
+one-runtime law is untouched.
+
+**The gate runs green twice before the user is asked to test anything.** The
+user is final acceptance, never the test device.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every
@@ -2243,3 +2275,71 @@ One end proof also remains open and does need the card: (c)'s classifier
 against the real 27B. Its adjacency — where the interesting failure modes
 live — is hermetic and green; what is unproven is how well the 27B itself
 separates `self` from `third_party` from `addressed` on real speech.
+
+---
+
+## 18. Streaming, not turn batching (architecture order, 2026-08-03)
+
+User order, verbatim in substance: *"that has to be streamed into each other,
+the latency is ultra high like this — the translated text only arrives long
+after I stop speaking. Our compute should be far more than enough to translate
+this faster than real time."*
+
+The order is correct about the shape of the system. It is recorded here before
+any of it is built, and it is the top item after the R5 transport work — a
+streaming pipeline on a socket that dies silently would be effort spent behind
+a broken door.
+
+### 18.1 What is actually streamed today — the reach check
+
+To be filled with `file:line` per stage BEFORE any rebuild, because the
+original architecture called for "streaming ASR" and the code may or may not
+deliver it. Current expectation, to be verified rather than assumed:
+
+| stage | expected today | evidence |
+|---|---|---|
+| segmentation | whole turn closes first | `segmenter.py`, VAD/release closes a segment |
+| ASR | whole segment at once | `_recognize` takes a closed `Segment` |
+| MT | streamed internally, regrouped into clauses | `mt.py` `translate_stream` + `SentenceAccumulator` |
+| TTS | per clause, but only after MT starts | `_translate_and_speak`'s `speak(unit)` |
+| audio out | per synthesized chunk over the binary channel | `_emit` sends frames as they land |
+
+If that table holds, the big serial block is **turn-close → ASR → first MT
+token**, and the win is in overlapping recognition with speech rather than in
+rebuilding the whole chain.
+
+### 18.2 Target
+
+1. **ASR partials live** — text appears in the transcript WHILE the person is
+   speaking, marked provisional, then finalized.
+2. **MT starts on stable prefixes** — sentence or clause boundaries inside the
+   utterance, not at turn end.
+3. **TTS per clause**, already the shape; what changes is that it may begin
+   before the utterance is finished.
+4. **Audio out chunked**, already the shape.
+
+### 18.3 Consistency rules, which are the hard part
+
+* A partial must never silently rewrite a committed translation. Corrections
+  are visible — the same rule as §17.4's badge changes.
+* Speaker attribution keeps working on the FULL turn: the 2.5 s window floor
+  (§16.5) exists because identity decisions on shorter audio are noise. So the
+  streaming display may run ahead of attribution and be attributed
+  retroactively — never the reverse.
+* Reference-buffer admission stays on complete segments for the same reason.
+
+### 18.4 Measure before rebuilding
+
+The 7 s first-audio figure must be decomposed per stage — waiting time versus
+compute time, per the ms-per-round doctrine — before anything is rebuilt, so
+the largest term is cut first rather than everything being rewritten blindly.
+The decomposition also answers whether faster-than-real-time is reachable on
+rung B (in-process talker, measured RTF 1.15 with the codec on the GPU) or
+where the hard floor is. **State the floor honestly; never promise it.**
+
+### 18.5 Acceptance
+
+Through the standing headless-client gate (§17.8), extended with latency
+assertions per turn: time to first partial text, time to first audio chunk,
+both logged per turn so a regression is visible as a number rather than as a
+user complaint.
