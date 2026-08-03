@@ -2042,9 +2042,20 @@ operating band:
 
 | similarity to nearest profile | verdict |
 |---|---|
-| `>= 0.637` | confident — assign, no badge |
-| `0.583 .. 0.637` | **uncertain** — assign to nearest, badge the line, offer candidates |
+| `>= 0.70` (`match_threshold`) | confident same speaker — assign, fold, no badge |
+| `0.583 .. 0.70` | **uncertain** — the assignment is made as usual, the LINE is badged, candidates offered |
 | `< 0.583` | confident new speaker — mint `speaker-N`, no badge |
+
+**Corrected against the code** (2026-08-03): an earlier draft of this table
+put the upper edge at the within-speaker p05 of 0.637. The band's upper edge
+is `match_threshold` (0.70), because that — not 0.637 — is where the
+assignment actually changes its answer, and a badge that disagreed with the
+decision it describes would mark lines the code was never in doubt about.
+0.637 keeps its own job: it is the bar for auto-resolution below.
+
+The verdict never changes WHO gets assigned. It only decides whether the line
+carries a badge, which is what keeps this feature free of the risk that a
+display concern silently re-tunes diarization.
 
 **The populations overlap and no threshold closes the gap.** The pool's own
 worst collision is `boy-03` against `girl-01` at **0.734** — two genuinely
@@ -2070,6 +2081,13 @@ the machine cannot be made right, so it must be made **correctable**.
   uncertain line unambiguous, the badge CHANGES (uncertain → resolved, with the
   new label) through a line-update event. It is never rewritten silently, and a
   user-confirmed line is never re-decided at all (rule 17.0.4).
+  The ranking for this excludes the line's OWN current speaker. That profile
+  was seeded by this very embedding, so it matches itself at ~1.0 for ever;
+  counting it would clear every badge on the following turn while learning
+  nothing. The open question is whether the utterance belonged to somebody
+  else, so only somebody else can answer it — concretely, a known speaker
+  whose centroid has moved far enough to claim the stored embedding above
+  `match_threshold`.
 
 Falsifier: a synthetic embedding sequence placed deliberately in each of the
 three bands must produce exactly the three verdicts; a centroid snapshot before

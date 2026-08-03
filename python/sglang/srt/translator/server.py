@@ -409,6 +409,29 @@ class _Connection:
             # actually is.
             logger.debug("session %s client acked seq %s",
                          self._sid(), message.get("seq"))
+        elif kind == "line.resolve":
+            # A tap on an uncertain badge (§17.4). ``speaker_id`` absent or
+            # null means the "speaker-N (new)" candidate.
+            changed = self.session.resolve_line(
+                int(message.get("line_id", 0)),
+                str(message.get("speaker_id") or "") or None,
+            )
+            if changed is None:
+                await self._send(
+                    {"kind": "error", "stage": "transcript",
+                     "message": f"no line {message.get('line_id')!r}"}
+                )
+                return
+            await self._send({"kind": "line.resolved", "line": changed.to_json()})
+        elif kind == "line.undo":
+            reverted = self.session.undo_resolution(int(message.get("line_id", 0)))
+            if reverted is None:
+                await self._send(
+                    {"kind": "error", "stage": "transcript",
+                     "message": f"nothing to undo on line {message.get('line_id')!r}"}
+                )
+                return
+            await self._send({"kind": "line.resolved", "line": reverted.to_json()})
         elif kind == "speaker.arm":
             # The speaker button (§17.5). Arming is per-utterance, so the
             # client sends this immediately before the user speaks, and the
@@ -706,6 +729,33 @@ def build_app(service: TranslatorService) -> FastAPI:
         return JSONResponse(
             {"speaker_id": speaker_id, "label": label, "lines_updated": len(changed)}
         )
+
+    @app.post("/api/translator/sessions/{session_id}/lines/{line_id}/speaker")
+    async def resolve_line(
+        session_id: str, line_id: int, body: Dict[str, Any]
+    ) -> JSONResponse:
+        """Settle an uncertain attribution (§17.4). No body key => new speaker."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        changed = session.resolve_line(
+            line_id, str(body.get("speaker_id") or "") or None
+        )
+        if changed is None:
+            raise HTTPException(status_code=404, detail=f"no line {line_id}")
+        return JSONResponse(changed.to_json())
+
+    @app.delete("/api/translator/sessions/{session_id}/lines/{line_id}/speaker")
+    async def undo_line(session_id: str, line_id: int) -> JSONResponse:
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        reverted = session.undo_resolution(line_id)
+        if reverted is None:
+            raise HTTPException(
+                status_code=404, detail=f"nothing to undo on line {line_id}"
+            )
+        return JSONResponse(reverted.to_json())
 
     @app.post("/api/translator/sessions/{session_id}/speakers")
     async def add_speaker(session_id: str, body: Dict[str, Any]) -> JSONResponse:

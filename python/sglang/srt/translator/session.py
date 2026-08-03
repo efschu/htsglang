@@ -81,6 +81,8 @@ from sglang.srt.translator.speakers import (
     split_points_by_dispersion,
 )
 from sglang.srt.translator.transcript_log import (
+    CONFIDENCE_EXACT,
+    CONFIDENCE_UNCERTAIN,
     ORIGIN_AUTO,
     ORIGIN_MANUAL,
     TranscriptLine,
@@ -405,6 +407,17 @@ class TranslatorSession:
         # The speaker button the user armed for the NEXT utterance (§17.5).
         # One utterance only; consumed at identification.
         self._armed_speaker: Optional[str] = None
+        # Uncertainty bookkeeping (§17.4). The embedding of every unresolved
+        # ambiguous line is kept so a tap can fold it into the chosen speaker
+        # -- and ONLY a tap can, which is why it is parked here instead of
+        # being folded on the way past.
+        self._pending: Dict[int, object] = {}
+        self._max_pending = 200
+        #: line_id -> (speaker_id, confidence, candidates) before the last tap.
+        self._undo: Dict[int, Tuple[str, str, List[Dict[str, object]]]] = {}
+        self._last_embedding = None
+        self._last_uncertain = False
+        self._last_candidates: List[Dict[str, object]] = []
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
@@ -511,6 +524,106 @@ class TranslatorSession:
             {"speaker_named": speaker_id, "label": label,
              "lines_updated": len(changed)},
         )
+        return changed
+
+    # -- uncertain attributions (§17.4) -------------------------------------
+
+    def resolve_line(
+        self, line_id: int, speaker_id: Optional[str] = None
+    ) -> Optional[TranscriptLine]:
+        """Settle an ambiguous line by hand. Returns the changed line.
+
+        ``speaker_id`` None mints a new speaker for it -- the "speaker-N
+        (new)" candidate, which for two similar young voices is frequently
+        the right answer and must therefore be a real option rather than a
+        fallback.
+
+        The centroid moves HERE and only here. Folding an ambiguous slice at
+        assignment time would corrupt an identity permanently, with nothing
+        downstream able to tell it had happened.
+        """
+        line = self.transcript.get(line_id)
+        if line is None:
+            return None
+        previous = (line.speaker_id, line.confidence, list(line.candidates))
+        embedding = self._pending.pop(line_id, None)
+        if speaker_id is None:
+            speaker_id = self.speakers.create_speaker().speaker_id
+        if embedding is not None:
+            self.speakers.fold_confirmed(speaker_id, embedding)
+        changed = self.transcript.reassign_speaker(
+            line_id,
+            speaker_id,
+            self._speaker_label(speaker_id),
+            resolved_by="user",
+        )
+        if changed is None:
+            return None
+        self._undo[line_id] = previous
+        self._emit_line(changed, update=True)
+        return changed
+
+    def undo_resolution(self, line_id: int) -> Optional[TranscriptLine]:
+        """Put a line back the way it was before the last tap."""
+        if line_id not in self._undo:
+            return None
+        speaker_id, confidence, candidates = self._undo.pop(line_id)
+        line = self.transcript.get(line_id)
+        if line is None:
+            return None
+        line.speaker_id = speaker_id
+        line.speaker_label = self._speaker_label(speaker_id)
+        line.confidence = confidence
+        line.candidates = candidates
+        line.origin = ORIGIN_AUTO
+        line.resolved_by = None
+        self._emit_line(line, update=True)
+        return line
+
+    def _auto_resolve(self) -> List[TranscriptLine]:
+        """Settle earlier ambiguity that later audio made unambiguous.
+
+        Visible, never silent: the badge CHANGES through an update event. A
+        line the user already settled is never re-decided -- their tap is
+        ground truth and outranks any later measurement.
+        """
+        if not self._pending:
+            return []
+        changed: List[TranscriptLine] = []
+        for line_id in list(self._pending):
+            line = self.transcript.get(line_id)
+            if line is None or line.origin == ORIGIN_MANUAL:
+                self._pending.pop(line_id, None)
+                continue
+            if line.resolved_by is not None:
+                self._pending.pop(line_id, None)
+                continue
+            # Ranked against everybody EXCEPT the line's current speaker. That
+            # profile was seeded by this very embedding, so it matches itself
+            # at ~1.0 forever; counting it would clear every badge on the next
+            # turn while learning nothing. The open question is whether this
+            # was somebody else, so only somebody else can answer it.
+            ranked = [
+                pair
+                for pair in self.speakers.rank(self._pending[line_id])
+                if pair[0] != line.speaker_id
+            ]
+            if not ranked:
+                continue
+            best_id, best_sim = ranked[0]
+            if best_sim < self.speakers.config.match_threshold:
+                continue
+            self._pending.pop(line_id, None)
+            updated = self.transcript.reassign_speaker(
+                line_id,
+                best_id,
+                self._speaker_label(best_id),
+                origin=ORIGIN_AUTO,
+                resolved_by="auto",
+            )
+            if updated is not None:
+                self._emit_line(updated, update=True)
+                changed.append(updated)
         return changed
 
     # -- speaker buttons (§17.5) --------------------------------------------
@@ -816,7 +929,19 @@ class TranslatorSession:
             source_language=source,
             source_text=transcript.text,
             origin=ORIGIN_MANUAL if manual else ORIGIN_AUTO,
+            confidence=(
+                CONFIDENCE_UNCERTAIN if self._last_uncertain else CONFIDENCE_EXACT
+            ),
+            candidates=self._last_candidates if self._last_uncertain else (),
         )
+        if self._last_uncertain and self._last_embedding is not None:
+            # Kept so a later tap can fold it into whichever speaker the user
+            # picks. Bounded: an hour of ambiguous turns must not become a
+            # memory leak, and the oldest unresolved line is the least likely
+            # to be corrected.
+            self._pending[line.line_id] = self._last_embedding
+            while len(self._pending) > self._max_pending:
+                self._pending.pop(next(iter(self._pending)))
         self._emit_line(line)
         targets = self._targets_for(source)
         if targets is None:
@@ -893,6 +1018,10 @@ class TranslatorSession:
                 remember(transcript.text, translations[first_target])
 
         self.turns_completed += 1
+        # Later audio may have settled an earlier ambiguity. Run after this
+        # turn's centroid update, which is the thing that could have changed
+        # the answer.
+        self._auto_resolve()
         self.journal.append(
             EventKind.TURN_DONE,
             {
@@ -936,6 +1065,9 @@ class TranslatorSession:
         (§17.5). It is ground truth: the line is never badged uncertain and no
         later similarity computation re-decides it.
         """
+        self._last_embedding = None
+        self._last_uncertain = False
+        self._last_candidates = []
         armed = self._armed_speaker
         if armed is not None:
             # Spent on this utterance whatever happens next, which is what
@@ -993,6 +1125,10 @@ class TranslatorSession:
                 recent = max(profiles, key=lambda p: p.last_seen)
                 return recent.speaker_id, 0.0, False, False
             return "speaker-unknown", 0.0, False, False
+        # Ranked BEFORE the assignment, against the centroids the assignment
+        # is about to decide on. Ranking afterwards would score the segment
+        # against a centroid it had already moved.
+        ranked = self.speakers.rank(embedding)
         profile, similarity, admitted = self.speakers.assign(
             embedding=embedding,
             audio=segment.audio,
@@ -1000,6 +1136,10 @@ class TranslatorSession:
             language=transcript.language,
             language_confidence=transcript.language_confidence,
         )
+        uncertain, candidates = self.speakers.uncertainty(ranked, profile.speaker_id)
+        self._last_embedding = embedding
+        self._last_uncertain = uncertain
+        self._last_candidates = candidates
         return profile.speaker_id, similarity, admitted, False
 
     def _targets_for(self, source: str) -> Optional[Tuple[str, ...]]:

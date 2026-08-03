@@ -211,6 +211,18 @@ class SpeakerRegistryConfig:
     #: Embedding centroid update rate. Low, because a speaker's identity does
     #: not drift; this only absorbs channel variation.
     centroid_alpha: float = 0.15
+    #: Below this cosine a segment is confidently somebody NEW, and the line
+    #: carries no uncertainty badge. Measured, not chosen: it is the
+    #: between-speaker p95 of `probe_speaker_change.py --pool` over the
+    #: 17-voice pool at the shipped 2.5 s window (design §17.4). Between it
+    #: and ``match_threshold`` the assignment is made as usual and the LINE is
+    #: marked uncertain, because that is the range where the embedder cannot
+    #: separate "same person" from "different person".
+    uncertain_floor: float = 0.583
+    #: Within-speaker p05 from the same sweep. Used for auto-resolution: a
+    #: stored embedding that later scores above this against an updated
+    #: centroid is no longer ambiguous.
+    within_speaker_floor: float = 0.637
 
 
 class SpeakerRegistry:
@@ -296,6 +308,94 @@ class SpeakerRegistry:
                 enrolled=True,
             )
         )
+        return profile
+
+    def rank(
+        self, embedding: SpeakerEmbedding, limit: int = 8
+    ) -> List[Tuple[str, float]]:
+        """Every known speaker by similarity, best first.
+
+        The same cosine the assignment decides on -- the candidate list on an
+        uncertain line must not be a second, differently-derived opinion, or
+        the user would be choosing between numbers the machine did not use.
+        """
+        scored = [
+            (sid, profile.centroid.similarity(embedding))
+            for sid, profile in self._profiles.items()
+            if profile.centroid is not None
+        ]
+        scored.sort(key=lambda pair: -pair[1])
+        return scored[:limit]
+
+    def uncertainty(
+        self, ranked: Sequence[Tuple[str, float]], assigned_id: str
+    ) -> Tuple[bool, List[Dict[str, object]]]:
+        """Is this attribution ambiguous, and what are the alternatives (§17.4)?
+
+        ``assigned_id`` is what the assignment actually chose, so a freshly
+        minted speaker appears in the list as itself.
+
+        The new-speaker option is ranked at ``uncertain_floor`` rather than
+        appended after the known ones. That gives it a defensible meaning: a
+        known speaker outranks "somebody new" exactly when their similarity
+        beats the between-speaker p95 -- the point above which the population
+        of DIFFERENT people has essentially run out. Without it, the children
+        case (two similar young voices where the answer is often "neither of
+        the two you know") could never surface the right answer.
+        """
+        best_sim = ranked[0][1] if ranked else -1.0
+        known = {sid for sid, _ in ranked}
+        uncertain = (
+            self.config.uncertain_floor <= best_sim < self.config.match_threshold
+        )
+        entries: List[Dict[str, object]] = [
+            {
+                "speaker_id": sid,
+                "label": self._profiles[sid].label or sid,
+                "similarity": round(sim, 3),
+                "new": False,
+            }
+            for sid, sim in ranked
+        ]
+        entries.append(
+            {
+                "speaker_id": assigned_id,
+                "label": (
+                    self._profiles[assigned_id].label
+                    if assigned_id in self._profiles
+                    else assigned_id
+                )
+                or assigned_id,
+                "similarity": round(self.config.uncertain_floor, 3),
+                "new": True,
+            }
+            if assigned_id not in known
+            else {
+                "speaker_id": f"speaker-{self._next_id}",
+                "label": f"speaker-{self._next_id}",
+                "similarity": round(self.config.uncertain_floor, 3),
+                "new": True,
+            }
+        )
+        entries.sort(key=lambda entry: -float(entry["similarity"]))
+        return uncertain, entries[:3]
+
+    def fold_confirmed(
+        self, speaker_id: str, embedding: SpeakerEmbedding
+    ) -> SpeakerProfile:
+        """Absorb an embedding a human confirmed (§17.4).
+
+        Only ever called after a confirmation. An unconfirmed ambiguous slice
+        that moved a centroid would corrupt that identity permanently, and
+        nothing downstream could tell it had happened.
+        """
+        profile = self.get(speaker_id)
+        if profile.centroid is None:
+            profile.centroid = embedding
+            profile.observations = 1
+        else:
+            self._fold(profile, embedding)
+        profile.last_seen = self._clock()
         return profile
 
     def create_speaker(self, label: Optional[str] = None) -> SpeakerProfile:
