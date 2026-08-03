@@ -1826,6 +1826,54 @@ and it needs an audio counter-arm before it ships.
 * **Do not render preset languages independently.** Measured, §14 defect 2.
   Same descriptor and seed do not give the same voice; derive from an anchor.
 
+### 16.8 Window 7 — the front door is public, and a phone can use it
+
+The one step between the working chain and a real phone test was exposure.
+It is done, and it was smaller than expected because §6.2.1's nginx location
+was already live from the earlier verification; what was missing was that the
+tenant behind it had been left running with **fake backends**. A health
+endpoint answering `200` through the proxy therefore proved routing and
+nothing about the pipeline — the exact shape of the success-claims rule.
+
+Boot, both processes, cards held under `/spinning/gpu-arb/holder` with a
+bounded heartbeat:
+
+* MT: `Qwen3.6-27B-FP8`, TP=3 uneven, `--rank-auto-reserve-mib 8000,2700,2700`,
+  `127.0.0.1:30030`, `--enable-metrics` (verified by reading `/metrics`, not by
+  the flag being present on the line).
+* Tenant: pinned to the 5090 by NVML UUID, **bound to `192.168.0.101:30800`**
+  — the LAN address the CT208 location proxies to. §16.1 says `--host <wg-addr>`
+  and that is the wrong instruction for this deployment: WireGuard does not
+  terminate in this container, the phone reaches nginx over the public
+  hostname, and nginx reaches the tenant over the LAN. Binding to a WG address
+  here would have produced a 502 from the front door.
+
+**Measured through the public URL**, `front_door_test.py --url
+wss://efeu.ddnss.de/translate --repeats 2` (artefacts and full numbers in
+`/spinning/gpu-battery-results/2026-08-03_466_frontdoor_public/`):
+
+```
+voice mode  clone            WER 0.000  (threshold 0.15)
+control     1.000            peak 0.513 over 4.64 s (non-silence gate)
+turn wall   14.55 s / 2 turns
+```
+
+Free VRAM with both tenants up: **647 / 3419 / 839 MiB**, all above the
+corridor's 400 MiB floor, with no headroom to spare on the two 3080s.
+
+What a phone test can and cannot do, stated honestly:
+
+| | |
+|---|---|
+| works | full DE↔ES conversation, own voice from the second utterance on |
+| first utterance | preset voice **by design** — the clone reference is built from a speaker's own completed turns |
+| first audio | ~4 s after release; rung B has no incremental streaming (§12), so first audio is whole-utterance |
+| capacity | one conversation at a time in practice; `max_sessions` is 8 but the 5090 budget is not |
+| network | the public hostname works from anywhere; WireGuard is the private path and is not required for the front door |
+| screen | must stay on (§6.3) |
+| `--mt-thinking` | stays **off**; on, the 27B narrates its reasoning and it would be read aloud |
+| `--preset-voice-dir` | not optional — without it a first utterance has no voice at all |
+
 ---
 
 ## 17. The conversation surface — five ordered features
