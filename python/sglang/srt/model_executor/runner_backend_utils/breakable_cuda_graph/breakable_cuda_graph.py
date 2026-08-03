@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
     checkCudaErrors,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.break_cost_clock import break_cost_clock
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,12 @@ def eager_on_graph(enable: bool):
                 new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
+            # Name the crossing after the function that caused it. Set once per
+            # break per capture (never at replay), and read by the #494
+            # break-cost probe so its records say "_moe_offload_fetch_step"
+            # rather than only a segment index.
+            replay_fn.break_name = inner.__name__
+
             capture.cuda_graph._break_fns.append(replay_fn)
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
@@ -286,12 +293,39 @@ class BreakableCUDAGraph:
         stream = torch.cuda.current_stream()
         token = _current_stream_var.set(stream)
         try:
-            for i, seg in enumerate(self._segments):
-                seg.replay()
-                if i < len(self._break_fns):
-                    self._break_fns[i]()
+            # #494 break-cost probe. OFF by default: break_cost_clock() is two
+            # module-global reads returning None, and the loop below is then
+            # the unmeasured one, statement for statement. Nothing is recorded,
+            # nothing is allocated. Armed, the measured loop is used instead.
+            clock = break_cost_clock()
+            if clock is None:
+                for i, seg in enumerate(self._segments):
+                    seg.replay()
+                    if i < len(self._break_fns):
+                        self._break_fns[i]()
+            else:
+                self._replay_measured(clock)
         finally:
             _current_stream_var.reset(token)
+
+    def _replay_measured(self, clock) -> None:
+        """The replay loop with a CUDA event pair around every segment and
+        every break slot (#494). Same order of operations as the default loop;
+        the events only bracket it, and they are read rounds later.
+        """
+        rnd = clock.begin_round(f"g{id(self):x}/{len(self._segments)}")
+        try:
+            for i, seg in enumerate(self._segments):
+                clock.segment_begin(rnd)
+                seg.replay()
+                clock.segment_end(rnd)
+                if i < len(self._break_fns):
+                    fn = self._break_fns[i]
+                    clock.slot_begin(rnd, getattr(fn, "break_name", "break"))
+                    fn()
+                    clock.slot_end(rnd)
+        finally:
+            clock.end_round(rnd)
 
     def _append_segment(
         self, graph: torch.cuda.CUDAGraph, needs_instantiate: bool
