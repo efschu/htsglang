@@ -391,6 +391,95 @@ def default_cache_path() -> Optional[str]:
     return card_probe_cache_path([g["uuid"] for g in gpus], driver)
 
 
+def matching_cached_probe_json(
+    *,
+    cache_dir: Optional[str] = None,
+    inventory: Optional[Tuple[Optional[Sequence[str]], Optional[str]]] = None,
+) -> Optional[dict]:
+    """The cached probe that describes THIS rig, as raw JSON, or ``None``.
+
+    #513 (audit #506, finding A3-1): the key above is deliberate -- a driver
+    update moves clock behaviour and the p2p verdict -- but the two callers
+    that wanted the raw payload (``planner/solver_api.cached_card_probe`` and
+    ``planner/rig_profile_source._latest_card_probe``) globbed
+    ``card_probe-*.json`` and took the NEWEST by mtime. A probe taken while
+    the arbiter had handed out only two of three cards, or one measured under
+    a driver that has since been rolled back, then became the rig's profile
+    for every later solver call. This resolves by key instead.
+
+    A miss is the correct answer when nothing matches: every consumer already
+    has a "no probe" remedy path, and that includes the case where the
+    inventory itself cannot be read -- a probe we cannot attribute to this rig
+    is exactly what this function exists to refuse.
+
+    ``cache_dir`` and ``inventory`` are injection points for tests; production
+    callers pass neither.
+    """
+    directory = cache_dir or CACHE_DIR
+    if inventory is None:
+        try:
+            gpus, driver = _inventory()
+            uuids: Optional[Sequence[str]] = [g["uuid"] for g in gpus]
+        except Exception:
+            uuids, driver = None, None
+    else:
+        uuids, driver = inventory
+    if not uuids:
+        logger.info(
+            "card probe: the live card inventory could not be read, so no "
+            "cached probe can be attributed to this rig; reporting no probe "
+            "rather than the newest file on disk."
+        )
+        return None
+
+    want_uuids = sorted(str(u) for u in uuids)
+
+    def _read(path: str) -> Optional[dict]:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not data.get("cards"):
+            return None
+        if int(data.get("version", -1)) != CARD_PROBE_VERSION:
+            return None
+        return data
+
+    exact = os.path.join(
+        directory, os.path.basename(card_probe_cache_path(want_uuids, driver))
+    )
+    if os.path.exists(exact):
+        data = _read(exact)
+        if data is not None:
+            return dict(data)
+
+    # Second chance by CONTENT, for a file whose name was written by a
+    # different path convention. Still a match on the rig, never on the mtime.
+    candidates = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for name in names:
+        if not (name.startswith("card_probe-") and name.endswith(".json")):
+            continue
+        path = os.path.join(directory, name)
+        data = _read(path)
+        if data is None:
+            continue
+        got = sorted(str(c.get("uuid")) for c in data.get("cards") or [])
+        if got != want_uuids:
+            continue
+        if str(data.get("driver") or "") != str(driver or ""):
+            continue
+        candidates.append((os.path.getmtime(path), data))
+    if not candidates:
+        return None
+    # Among probes of the SAME rig and driver, newest is the right tie-break.
+    return dict(max(candidates, key=lambda pair: pair[0])[1])
+
+
 def save_card_probe(profile: CardProbeProfile, path: Optional[str] = None) -> str:
     path = path or card_probe_cache_path(
         [c.uuid for c in profile.cards], profile.driver

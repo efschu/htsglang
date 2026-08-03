@@ -1166,6 +1166,36 @@ caller-supplied path needs `utils/path_confinement.confine_to_root` against
 the flag that configures it — both pinned by
 `test/registered/unit/entrypoints/test_endpoint_security_510.py`, which
 enumerates the routes rather than sampling them.
+Incomplete-cache-key family (#241 #513, from audit #506): a persisted
+artifact whose CONTENT depends on a dimension its KEY does not carry is a
+silent wrong hit, not a miss -- and where the artifact is labelled
+"measured", the wrongness inherits that label. #241 closed it for HiCache
+pages (kv dtype); #513 closed four more, and the shape of each is worth more
+than the fix. (a) `rigmon/card_probe.py` WROTE a correct key -- sorted UUIDs,
+driver, probe version, with the rationale in the docstring -- and both
+readers (`planner/solver_api.py`, `planner/rig_profile_source.py`) then took
+the newest file by mtime; a key that the read path ignores is not a key.
+`card_probe.matching_cached_probe_json()` is now the single reader and a
+non-match is a miss, including when the live inventory cannot be read at all.
+(b) HiCache page keys carried tp_rank/tp_size, which under uneven TP do not
+determine a rank's kv-head count; `--rank-tp-ratio`/`--rank-kv-ratio` now
+enter `compute_model_identity_hash`, appended only when set so an even-TP rig
+keeps its persisted pages. (c) The measured-KV-budget fingerprint keys the
+post-capture VRAM leftover and omitted `attention_backend`,
+`disable_cuda_graph`, `dtype` and `enable_hierarchical_cache` -- all of which
+change that quantity; added on the file's own only-when-non-default
+convention, so existing digests stay valid. (d) `planner/graphmem.py` keyed
+the NUMBER of capture batch sizes, so two different `--cuda-graph-bs` lists
+of equal length shared an anchor and the second got the first's numbers with
+provenance "measured"; the key is now versioned (`ANCHOR_KEY_VERSION`, v2)
+and carries the list, the attention backend and the page size. Two existing
+graphmem tests had been passing BECAUSE of (d) -- they looked up
+`list(range(12))` against an anchor written for `[1,2,3,4,5,6,7,8,10,12,14,16]`
+-- which is the general warning: a test written against an incomplete key
+records the collision as expected behaviour. Reference implementations for a
+complete key already in this tree:
+`managers/kv_session_spill_destination.py:215-239` and
+`video_enhance/engine_cache.py:79-121`.
 Rank-local condition BEFORE any group collective (hang family); bounded waits
 with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real

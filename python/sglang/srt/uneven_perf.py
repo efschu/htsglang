@@ -2578,6 +2578,31 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
     if pp_size > 1:
         fields["pp_size"] = pp_size
         fields["pp_layer_ratio"] = getattr(sa, "pp_layer_ratio", None)
+    # #513 (audit #506, finding A3-3): the record this keys is the POST-CAPTURE
+    # VRAM leftover (model_runner_kv_cache_mixin.note_post_capture_leftover),
+    # i.e. allocator/reserved state after CUDA-graph capture. Four settings
+    # change that quantity and were not in the fingerprint, so a correction
+    # measured under one of them was applied under another:
+    #   attention_backend        -- backend workspaces ARE part of the reserved
+    #                               bytes; planner/graphmem.py calls the fixed
+    #                               per-graph term a "flashinfer workspace".
+    #   disable_cuda_graph       -- with capture off there is no graph
+    #                               residency, so it is a different quantity.
+    #   dtype                    -- weight bytes; `quantization` was keyed but
+    #                               `dtype` was not.
+    #   enable_hierarchical_cache -- adds device-side buffers to the balance.
+    # Included ONLY when set to a non-default, for the same reason as
+    # spec_drafter_policy and pp_size above: every pre-existing registry digest
+    # stays valid on a rig that runs the defaults.
+    for name, default in (
+        ("attention_backend", None),
+        ("disable_cuda_graph", False),
+        ("dtype", "auto"),
+        ("enable_hierarchical_cache", False),
+    ):
+        value = getattr(sa, name, default)
+        if value != default:
+            fields[name] = value
     return fields
 
 

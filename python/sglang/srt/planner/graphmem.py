@@ -32,10 +32,13 @@ mem usage=0.27 GB, avail mem=...
    that rung's token count (``num_tokens_per_bs``).
 
 2. ANCHOR STORE -- every parsed boot is persisted keyed by (model, tp, spec
-   shape, kv dtype): ``~/.cache/sglang/graph_mem_anchors.json`` (override:
+   shape, kv dtype, attention backend, page size, capture-bs list):
+   ``~/.cache/sglang/graph_mem_anchors.json`` (override:
    ``SGLANG_PLANNER_GRAPH_ANCHORS``). A prospective config whose key matches
    an anchor gets the MEASURED numbers (provenance "measured"), never the
-   heuristic.
+   heuristic -- which is why the key has to be complete: an incomplete one
+   does not degrade to an estimate, it hands over another config's
+   measurement still labelled "measured" (#513).
 
 3. HEURISTIC -- when no anchor matches::
 
@@ -66,6 +69,7 @@ __all__ = [
     "parse_boot_meta",
     "summarize_captures",
     "anchor_key",
+    "ANCHOR_KEY_VERSION",
     "AnchorStore",
     "scan_boot_logs",
     "heuristic_estimate",
@@ -200,6 +204,9 @@ _META_PATTERNS = {
     "model_path": r"model_path='([^']*)'",
     "tp_size": r"tp_size=(\d+)",
     "kv_cache_dtype": r"kv_cache_dtype='([^']*)'",
+    # #513: both change captured graph memory and were missing from the key.
+    "attention_backend": r"attention_backend='([^']*)'",
+    "page_size": r"page_size=(\d+)",
     "speculative_algorithm": r"speculative_algorithm='([^']*)'",
     "speculative_num_steps": r"speculative_num_steps=(\d+)",
     "speculative_num_draft_tokens": r"speculative_num_draft_tokens=(\d+)",
@@ -295,17 +302,38 @@ def summarize_captures(entries: Sequence[dict]) -> dict:
 # ---------------------------------------------------------------------------
 # Anchor store (measured-overrides-estimate, like the power calibration).
 # ---------------------------------------------------------------------------
+#: Bumped whenever the key composition changes, so a reader can tell "this
+#: anchor was written under a different key recipe" from "this rig never
+#: booted that shape". v2 (#513) added the attention backend, the page size
+#: and the capture-bs LIST; v1 anchors no longer match and are rebuilt by
+#: re-running ``scan_boot_logs`` over the boot logs they came from.
+ANCHOR_KEY_VERSION = "v2"
+
+
 def anchor_key(meta: dict) -> str:
-    """Stable anchor key from a boot/prospective config. Key fields: model
-    basename, tp, spec shape (algo/steps/draft/adaptive), kv dtype, and the
-    decode capture-bs count -- exactly the knobs that change graph memory, so
-    changing k or adaptive in the runner changes the key (and falls back to
-    the ladder-aware heuristic unless that shape was booted before)."""
+    """Stable anchor key from a boot/prospective config.
+
+    Key fields: model basename, tp, spec shape (algo/steps/draft/adaptive),
+    kv dtype, attention backend, page size, and the decode capture-bs LIST --
+    exactly the knobs that change graph memory, so changing k or adaptive in
+    the runner changes the key (and falls back to the ladder-aware heuristic
+    unless that shape was booted before).
+
+    #513 (audit #506, finding A3-4) fixed two omissions. The key carried
+    ``nbs:{len(bs)}``, the NUMBER of capture batch sizes, so two different
+    ``--cuda-graph-bs`` lists of equal length shared an anchor and the second
+    one was handed the first one's MEASURED numbers -- provenance "measured",
+    not "estimate", which is what makes that failure silent. And the
+    attention backend was absent although ``BASE_MIB`` below is documented as
+    the "flashinfer workspace", i.e. the module's own account of the quantity
+    is backend-dependent. ``page_size`` joins them for the same reason.
+    """
     model = os.path.basename(str(meta.get("model_path") or "").rstrip("/"))
     algo = meta.get("speculative_algorithm") or "off"
-    bs = meta.get("decode_bs")
+    bs = meta.get("decode_bs") or []
     return "|".join(
         [
+            ANCHOR_KEY_VERSION,
             model,
             f"tp{meta.get('tp_size') or 1}",
             f"spec:{algo}",
@@ -313,7 +341,9 @@ def anchor_key(meta: dict) -> str:
             f"draft:{meta.get('speculative_num_draft_tokens') or 0}",
             f"adaptive:{int(bool(meta.get('speculative_adaptive')))}",
             f"kv:{meta.get('kv_cache_dtype') or 'auto'}",
-            f"nbs:{len(bs) if bs else 0}",
+            f"attn:{meta.get('attention_backend') or 'auto'}",
+            f"page:{meta.get('page_size') or 1}",
+            "bs:" + ",".join(str(int(x)) for x in bs),
         ]
     )
 

@@ -128,21 +128,18 @@ def _card_key_map(cards: List[dict]) -> Dict[str, str]:
     return out
 
 
-def _latest_card_probe() -> Optional[dict]:
-    d = _cache_dir()
-    try:
-        files = [os.path.join(d, f) for f in os.listdir(d)
-                 if f.startswith("card_probe-") and f.endswith(".json")]
-    except OSError:
-        return None
-    if not files:
-        return None
-    newest = max(files, key=lambda p: os.path.getmtime(p))
-    try:
-        with open(newest) as f:
-            return json.load(f)
-    except Exception:
-        return None
+def _latest_card_probe(*, cache_dir=None, inventory=None) -> Optional[dict]:
+    """The cached card probe for THIS rig, or None.
+
+    #513: was newest-by-mtime, which accepted a probe of another card set or
+    another driver. Keyed lookup now; see
+    ``rigmon.card_probe.matching_cached_probe_json``.
+    """
+    from sglang.srt.rigmon.card_probe import matching_cached_probe_json
+
+    return matching_cached_probe_json(
+        cache_dir=cache_dir or _cache_dir(), inventory=inventory
+    )
 
 
 def _split_probe_rows() -> List[dict]:

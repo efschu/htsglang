@@ -53,9 +53,6 @@ the tests call the functions directly).
 
 from __future__ import annotations
 
-import glob
-import json
-import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.planner import key_solver
@@ -72,26 +69,18 @@ __all__ = [
 ]
 
 
-def cached_card_probe() -> Optional[dict]:
-    """The newest ``card_probe-*.json`` artifact on disk, or ``None``.
+def cached_card_probe(*, cache_dir=None, inventory=None) -> Optional[dict]:
+    """The cached ``card_probe-*.json`` for THIS rig, or ``None``.
 
-    A torn or unreadable file is skipped rather than raised on: the next
-    older artifact is a usable answer, and "no probe" already has a remedy
-    path in the payload below.
+    #513: this used to take the newest file by mtime, which silently accepted
+    a probe measured over a different card set or under a different driver --
+    the exact reuse ``card_probe.card_probe_cache_path`` keys against. The
+    lookup is by key now; a torn, foreign or version-mismatched file is a
+    miss, and "no probe" already has a remedy path in the payload below.
     """
-    pattern = os.path.join(
-        os.path.expanduser("~"), ".cache", "sglang", "card_probe-*.json"
-    )
-    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    for path in files:
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("cards"):
-            return dict(data)
-    return None
+    from sglang.srt.rigmon.card_probe import matching_cached_probe_json
+
+    return matching_cached_probe_json(cache_dir=cache_dir, inventory=inventory)
 
 
 def cached_hardware_profile() -> Optional[dict]:
