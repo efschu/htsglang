@@ -381,6 +381,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     service = TranslatorService(config, Stack(asr=asr, embedder=embedder, mt=mt, tts=tts))
     app = build_app(service)
 
+    # BEFORE the readiness line and before the port opens, in that order. The
+    # port ordering is what protects turn 1 (see `TranslatorService.warmup`);
+    # the LOG ordering is a separate obligation -- a line saying "translator
+    # ready" while the talker is still cold is a success claim that is not yet
+    # true, and the first boot with this flag printed exactly that.
+    if args.warmup:
+        report = asyncio.run(service.warmup())
+        if report["ran"]:
+            logger.info(
+                "talker warm after %.2fs (%d chunks, %s, voice %s) -- turn 1 "
+                "no longer pays the cold start",
+                report["seconds"], report["chunks"], report["language"],
+                report["voice_id"],
+            )
+        else:
+            # Never fatal, and never silent: a boot that quietly skipped the
+            # warmup looks identical to one that did it, right up to the 15 s
+            # the user waits for their first sentence.
+            logger.warning(
+                "talker warmup did not run (%s) -- turn 1 will pay the cold "
+                "start", report["reason"],
+            )
+
     languages = service.languages()
     logger.info(
         "translator ready on %s:%d | asr=%s tts=%s mt=%s | %d routable pairs | "
@@ -400,27 +423,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "the default conversation cannot run here: %s",
             languages["default_participants_error"],
         )
-
-    # BEFORE the port opens, not behind a ready flag: there must be no window
-    # in which health says ok and a turn would still pay the cold start. See
-    # `TranslatorService.warmup` for the ~15 s this buys back on turn 1.
-    if args.warmup:
-        report = asyncio.run(service.warmup())
-        if report["ran"]:
-            logger.info(
-                "talker warm after %.2fs (%d chunks, %s, voice %s) -- turn 1 "
-                "no longer pays the cold start",
-                report["seconds"], report["chunks"], report["language"],
-                report["voice_id"],
-            )
-        else:
-            # Never fatal, and never silent: a boot that quietly skipped the
-            # warmup looks identical to one that did it, right up to the 15 s
-            # the user waits for their first sentence.
-            logger.warning(
-                "talker warmup did not run (%s) -- turn 1 will pay the cold "
-                "start", report["reason"],
-            )
 
     import uvicorn
 
