@@ -1614,7 +1614,7 @@ clone reference buffer is empty on a speaker's first turn BY DESIGN).
 | routing (pairs, fan-out, constrained detection) | real, tested |
 | MT | **real** — our own 27B on TP=3, end-to-end WER 0.000 through the front door |
 | preset voices | **real and in use** — 17 voices, sticky per session |
-| **own-voice cloning** | **does not engage** — see §16.4 finding 1 |
+| **own-voice cloning** | engages (buffer fills, one identity) but the audio is silent — §16.6 |
 
 So: a full DE↔ES conversation runs today, end to end, with nothing stubbed.
 What it does NOT yet do is the headline requirement — every speaker currently
@@ -1747,7 +1747,77 @@ person two different preset voices mid-conversation.
 Neither is a regression from this window; both were invisible until the chain
 ran end to end from outside, which is the argument for the front-door harness.
 
-### 16.5 Two things not to re-litigate
+### 16.5 Window 6 — the two findings were ONE defect, plus a third behind them
+
+**Check the accused component first.** The segmenter was blamed for the ~1.5 s
+turns and is innocent: fed the real clips it emits ONE segment
+(`de_sample.wav` 3.11 s → 1 × 3.10 s; `de_long.wav` 9.34 s → 1 × 9.34 s). The
+pieces came from `_split_at_speaker_changes`.
+
+`probe_speaker_change.py --pool` (new) reads the numbers that re-cut actually
+decides on, over all 17 pool voices — adjacent windows of ONE voice against
+windows of DIFFERENT voices:
+
+| window | within-speaker min | between-speaker max | 0.62 cuts same-speaker |
+|---|---|---|---|
+| **1.5 s (shipped)** | 0.392 | 0.679 | **27 of 60 (45 %)** |
+| 2.0 s | 0.515 | 0.694 | 7 of 40 |
+| 2.5 s | 0.624 | 0.734 | 0 of 26 |
+| 3.0 s | 0.695 | 0.738 | 0 of 18 |
+
+At 1.5 s the embedder's own within-speaker similarity falls to 0.392 — below
+the 0.62 meant to separate two *people*. **The threshold was never the root
+cause; the window was too short for the embedder to be stable on.** That one
+defect produced both §16.4 findings: each half fell under `min_slice_s`, so
+nothing was admitted (finding 1), and the halves did not match each other
+(0.533 < the 0.70 match threshold), so one person became two (finding 2).
+Lowering `min_slice_s` — the obvious move — would have papered over a
+corrupted identity.
+
+Window 1.5 → 2.5 s, `speaker_change_min_segment_s` 3.0 → 5.0 (it must stay
+≥ 2 × window or `count < 2` returns early and the re-cut is *silently* dead —
+now checked at construction, not asserted in a comment). Cost, stated: two
+people alternating inside a segment shorter than 5 s are no longer split.
+
+**Then a third bug, behind those two.** With the buffer finally filling
+(`admitted=True`, 3.1 s → 6.22 s, one identity), every turn died with
+`tts: reference is 0.00s, need >= 3.0s`. `SpeakerProfile.reference_audio()`
+did not resample a slice at a different rate — it `continue`d past it. The
+registry stores at 16 kHz, Qwen3-TTS asks for 24 kHz, so every slice was
+dropped and an empty clip was returned *silently*, because the caller's
+`reference_seconds()` guard had already passed on the stored durations. Guard
+and returned buffer disagreed and nothing in between noticed.
+
+**Three bugs of one family in one session** — desk fake and real backend
+differing in a single attribute, invisible until the real one runs: the
+wrapper's device snapshot, the codec's detached holder, and now the fake TTS
+sharing the pipeline's sample rate. Any new desk fake should differ from its
+real counterpart on purpose.
+
+### 16.6 The one thing still between here and own-voice output
+
+The clone path now engages and returns **4.24 s of exact zeros**. Located:
+
+* the reference reaching the TTS is good — the 24k→16k→24k round trip on the
+  real clip preserves the peak (0.591 → 0.579 → 0.594), concatenation
+  included;
+* the same TTS, same checkpoint, same 6.23 s doubled German reference, driven
+  **directly** by `audio_out_smoke.py`, returns good audio (peak 0.398,
+  speaker similarity 0.985, RTF 1.34);
+* therefore the defect is in how `session.speak()` drives the synthesizer in
+  clone mode — not in the synthesizer, the checkpoint or the reference.
+
+Next reader: diff that call against the smoke path. `voice.backend_voice_id`
+and `reference_text` are the two arguments the smoke path does not set.
+
+Also recorded, deliberately not built: cumulative admission of sub-2 s slices.
+`min_slice_s` exists because splices are audible, so counting six separate
+1.5 s slices toward one budget would trade a silent identity bug for a silent
+quality one. The right shape is to MERGE slices that are genuinely contiguous
+(adjacent VAD segments across a 550 ms pause are one breath, not a splice),
+and it needs an audio counter-arm before it ships.
+
+### 16.7 Two things not to re-litigate
 
 * **Do not diarize on the TTS speaker encoder.** Measured, reverted, §15. It
   has 0.04 of dynamic range and would merge every participant into one
