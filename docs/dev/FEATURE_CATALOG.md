@@ -2043,6 +2043,38 @@ adapter that distinguishes "not yet" from "no more" (with an idle timeout),
 and a sliding-window in/out fps accounting exposed on the job status for the
 #344 live watch. Finished sources keep the depth-1 bridge unchanged.
 
+**The Anthropic Messages front is complete enough to back a Claude Code agent
+loop** (#530): `POST /v1/messages` (`http_server.py:2578`) plus
+`POST /v1/messages/count_tokens` (`:2588`), SSE deltas in Anthropic event
+shape, and NO model-name validation — an unknown id is echoed back
+(`{"model":"claude-sonnet-4-5"}` and `{"model":"default"}` both answer 200).
+That last property is what makes a checkpoint switch invisible to clients that
+pin a name, the #466 translator's `--mt-model default` included. Reach, stated
+at the width of what was checked: a real `claude` CLI process (2.1.220) driven
+against a live 27B boot returned correct determined answers, so no
+LiteLLM-class OpenAI translation proxy is needed for this — but two client-side
+settings are load-bearing and are NOT defaults: `MAX_THINKING_TOKENS=0`,
+because Claude Code requests an Anthropic `thinking` block and a boot without
+`--reasoning-parser` answers `400 Anthropic thinking is not supported for
+models without a reasoning parser`; and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, because
+the default 32000-token completion request plus the ~20k-token system prompt
+overruns a 32k-context boot. Claude Code itself has NO per-subagent endpoint
+binding (the subagent frontmatter schema carries no `baseUrl`/`provider`/`env`
+key; every `ANTHROPIC_*_BASE_URL` is process-global), so the fork ships the
+named fallback rather than the feature: `scripts/dev/local_model_agent.sh`
+starts a separate `claude` process with a process-scoped environment, and
+`scripts/dev/register_local_model.sh` regenerates `.claude/agents/local-model.md`
+from `GET /v1/models` so the entry follows a serving switch. Runbook §13.
+**Checkpoint switching is a RESTART, and the three live routes were priced at
+their source before that verdict** (runbook §14): `update_weights_from_disk`
+refills the EXISTING module tree and rebuilds neither the quant methods nor the
+pool geometry (`model_runner.py:2536-2563`, with its own rollback branch at
+`:2548-2556`); the #305 registry's HOT promotion boots a SEPARATE PROCESS on
+its own port (`registry/adapters/class1_srt.py:220-241`, `build_argv` at
+`:279-290`) and its demotion actuator refuses an engine it did not start
+(`:411-415`); the #274 dual-group lane is a second GROUP over the SAME tensors
+by `data_ptr` identity (`dual_group_lane.py:15-27`), not a second model.
+
 ## 14. Dashboard
 Guided config wizard whose refusals each cite their source and which never emits
 a flag it cannot explain (`planner/wizard.py:703-714`, `:1521`, plus

@@ -4778,3 +4778,151 @@ protocol in §7.1 before every segment and releases it afterwards. It:
 It never performs a destructive action and never waits: a refused claim is
 logged with the reason and retried on a later tick.
 
+
+## 13. The served model as a Claude Code subagent backend (#530)
+
+Goal: launch subagents from a Claude Code session that reason on the LOCAL
+served checkpoint, and have that entry follow every serving switch, while the
+parent session keeps talking to the Anthropic API.
+
+**No proxy is needed.** htsglang already speaks the Anthropic Messages wire
+format natively: `POST /v1/messages` (`entrypoints/http_server.py:2578`) and
+`POST /v1/messages/count_tokens` (`:2588`), backed by
+`entrypoints/anthropic/serving.py`. It is listed in section 9's endpoint table
+as "the Anthropic emulation, same lanes". A LiteLLM-class OpenAI translation
+proxy would be redundant here — checked before writing one.
+
+The endpoint does not validate the model name: an unknown id is echoed back
+verbatim (`"model":"claude-sonnet-4-5"` and `"model":"default"` both answer
+200). That is what makes a serving switch invisible to existing clients — the
+translator's `--mt-model default` keeps working across a checkpoint change.
+
+**What Claude Code cannot do, and the reason this is a wrapper.** There is no
+per-subagent endpoint binding. The subagent frontmatter schema is closed
+(`name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`,
+`maxTurns`, `skills`, `mcpServers`, `hooks`, `memory`, `background`, `effort`,
+`isolation`, `color`, `initialPrompt`) and has no `baseUrl`/`provider`/`env`
+key; `model` takes an alias or a Claude model id, not an endpoint.
+`CLAUDE_CODE_SUBAGENT_MODEL` remaps the model NAME on the endpoint the session
+already uses — the docs state outright that `ANTHROPIC_BASE_URL` "changes where
+requests are sent, not which model answers them". And `env` in `settings.json`
+applies "to every session and to subprocesses Claude Code spawns from it", so
+putting `ANTHROPIC_BASE_URL` there would reroute the parent session too. Claude
+Code also speaks only the Anthropic/Bedrock/Vertex wire shapes, never
+OpenAI-compatible ones — which is exactly why the `/v1/messages` front above is
+the load-bearing piece.
+
+So the local model runs in a SEPARATE `claude` process with a process-scoped
+environment. That process is a full agent loop, not a single completion call.
+
+```bash
+# after every serving switch -- regenerates the agent entry from the LIVE server
+scripts/dev/register_local_model.sh -b http://127.0.0.1:30030
+
+# writes:
+#   .claude/agents/local-model.md              the agent definition
+#   ~/.config/htsglang/local_model_agent.env   defaults for the wrapper
+
+# run the local model as an agent loop
+scripts/dev/local_model_agent.sh -t 1024 -T 360 -- "your prompt"
+```
+
+Nothing about the checkpoint is hardcoded in either file: the id, the context
+length and the residency are read out of `GET /v1/models` (including the
+`x-htsglang` block from section 9), so the entry migrates from INT8 to NVFP4 to
+GGUF by re-running the script. `register_local_model.sh` probes
+`POST /v1/messages` before it writes anything and refuses a config pointing at
+a boot that cannot serve it.
+
+Two environment settings inside the wrapper are load-bearing, both discovered
+by boot:
+
+| Variable | Value | Without it |
+|---|---|---|
+| `MAX_THINKING_TOKENS` | `0` | Claude Code requests an Anthropic `thinking` block; a boot without `--reasoning-parser` answers `400 Anthropic thinking is not supported for models without a reasoning parser` |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `<= ctx - 20000` | the default completion request is 32000 tokens, and the ~20k-token Claude Code system prompt alone overruns a 32k-context boot |
+
+Serve the main instance with `--reasoning-parser qwen3` (section 13 of the
+feature catalog) or the local model's chain-of-thought arrives with a literal
+`</think>` marker in the answer text; the wrapper works either way.
+
+**Boot proof, 2026-08-03**, against the live Qwen3.6-27B-FP8 instance on port
+30030 (`--reasoning-parser` NOT set on that boot, hence the visible `</think>`):
+
+```
+$ scripts/dev/local_model_agent.sh -t 1024 -T 360 -- \
+    "Answer in exactly two lines. Line 1: 17*23. Line 2: capital of Portugal."
+...
+</think>
+
+391
+Lisbon
+```
+
+A Claude Code subagent driving the same wrapper returned `384 / Au / Jupiter`
+for `128+256`, the symbol for gold and the sixth planet — two right, one wrong,
+which is itself the evidence that the answer came from the served 27B and not
+from the agent's own model.
+
+## 14. Switching the served checkpoint: what moves at runtime, what needs a restart (#530)
+
+Asked before every serving switch, because a restart of the main instance is
+also an outage for every tenant using it as a backend (the #466 translator
+takes its MT from this server). Three candidate live routes exist; each was
+read at its source rather than assumed.
+
+**(a) `POST /update_weights_from_disk` — real, but same-shape only.**
+`model_runner.update_weights_from_disk` (`model_executor/model_runner.py:2502`)
+sets `self.model_config.model_path = model_path` and then loads the new tensors
+into the EXISTING module tree: `loader.load_weights_and_postprocess(self.model,
+iter, target_device)` (`:2536-2547`), `self.model = model` (`:2558`). Nothing
+rebuilds the model, the quant method objects, the KV dtype or the pool
+geometry, and the only `server_args.override` it performs carries exactly
+`model_path` and `load_format` (`:2559-2563`). A different quant lane
+(FP8 `weight`+`weight_scale` vs INT8-W8A8 `weight`+per-channel `weight_scale`
+with dynamic input activations) presents different parameter names, shapes and
+dtypes to a tree that was built for the old lane, so the load raises and the
+function takes its own rollback branch — `"Failed to update weights: {e}.
+Rolling back to original weights."` (`:2548-2556`). This route is for refreshing
+weights of the SAME architecture and quant (RL-style), not for a checkpoint-class
+change. It also cannot change `--context-length`, `--max-running-requests`,
+`--rank-auto-reserve-mib` or `--reasoning-parser`: none of those is in the
+override list, and the KV pool was sized at boot.
+
+**(b) The #305 registry — real, and it boots a SEPARATE PROCESS.**
+`POST /registry/engines` registers a spec and explicitly "does NOT boot"
+(`registry/http_api.py:111-116`); `POST /registry/engines/{id}/state` with
+`target: HOT` reaches `Class1SrtAdapter.promote`, whose COLD→HOT arm calls
+`self._boot()` (`registry/adapters/class1_srt.py:220-241`), and `build_argv`
+is `[sys.executable, "-m", "sglang.launch_server", "--model-path", ...,
+"--port", ...]` (`:279-290`). So the registry route puts the new checkpoint in
+its own process on its own port — it never loads a second model into a running
+server. Its demotion actuator only reaches engines the registry itself started:
+`_post_memory` raises `engine {id!r} has no process to release_memory_occupation`
+when `self._process is None` (`:411-415`), so a tenant server booted by hand
+outside the registry cannot be demoted to WARM_GPU by it.
+
+**(c) The #274 multi-group runtime — a second GROUP, not a second model.**
+`model_executor/dual_group_lane.py` builds "a full-width (weight-TP=1) module
+tree whose parallel linears are SHELLS over N sharded part trees living in the
+same process", whose parts are "the resident serving-group rank's modules
+(SHARED bytes -- the same tensor objects, verified by `data_ptr` identity,
+never copied)" (`:15-27`). It re-groups the weights that are already there. It
+has no mechanism for a second checkpoint.
+
+**Consequence for a lane change on this rig.** Route (b) is the only one that
+would give zero MT downtime — new engine on a new port, tenant repointed, old
+engine stopped — and it costs BOTH models resident at once. At the reference
+27B point that is ~27 GiB of weights each plus two KV pools against 73.6 GiB of
+NVML total across the three cards; it does not fund. Demoting the incumbent to
+WARM_GPU first would fund it but also ends MT service, which is the outage the
+route was meant to avoid, and route (b)'s actuator cannot reach a hand-booted
+incumbent anyway (`:411-415`).
+
+So a quant-lane change on the single serving instance is a RESTART, named as a
+fallback with the predicates above, not as a first reflex. Keep the window
+short, take it at tenant `sessions: 0`, and reuse the same port so the tenant's
+`--mt-base-url` and `--mt-model` need no edit: the OpenAI and Anthropic fronts
+do not validate the model name — `{"model": "default"}` and
+`{"model": "claude-sonnet-4-5"}` both answer 200 and echo the name back — so
+`--mt-model default` survives any checkpoint change on the same port.
