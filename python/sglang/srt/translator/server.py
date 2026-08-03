@@ -409,6 +409,33 @@ class _Connection:
             # actually is.
             logger.debug("session %s client acked seq %s",
                          self._sid(), message.get("seq"))
+        elif kind == "speaker.arm":
+            # The speaker button (§17.5). Arming is per-utterance, so the
+            # client sends this immediately before the user speaks, and the
+            # server answers so a lit button reflects server state rather
+            # than an optimistic local guess.
+            try:
+                armed = self.session.arm_speaker(message.get("speaker_id") or None)
+            except KeyError:
+                await self._send(
+                    {"kind": "error", "stage": "speaker",
+                     "message": f"no speaker {message.get('speaker_id')!r}"}
+                )
+                return
+            await self._send({"kind": "speaker.armed", "speaker_id": armed})
+        elif kind == "speaker.add":
+            speaker_id = self.session.add_speaker(
+                str(message.get("label") or "").strip() or None
+            )
+            # Arm it at once: the "+" button exists because somebody new is
+            # about to speak, and requiring a second tap to say so would make
+            # the first utterance -- the one that seeds the centroid -- the
+            # one that goes through automatic matching.
+            self.session.arm_speaker(speaker_id)
+            await self._send(
+                {"kind": "speaker.added", "speaker_id": speaker_id,
+                 "armed": True, "state": self.session.state()}
+            )
         elif kind == "output.mode":
             try:
                 mode = self.session.set_output_mode(
@@ -679,6 +706,31 @@ def build_app(service: TranslatorService) -> FastAPI:
         return JSONResponse(
             {"speaker_id": speaker_id, "label": label, "lines_updated": len(changed)}
         )
+
+    @app.post("/api/translator/sessions/{session_id}/speakers")
+    async def add_speaker(session_id: str, body: Dict[str, Any]) -> JSONResponse:
+        """The "+" button: declare a new speaker and arm them (§17.5)."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        speaker_id = session.add_speaker(
+            str(body.get("label") or "").strip() or None
+        )
+        session.arm_speaker(speaker_id)
+        return JSONResponse({"speaker_id": speaker_id, "armed": True})
+
+    @app.post("/api/translator/sessions/{session_id}/arm")
+    async def arm_speaker(session_id: str, body: Dict[str, Any]) -> JSONResponse:
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        try:
+            armed = session.arm_speaker(body.get("speaker_id") or None)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"no speaker {body.get('speaker_id')!r}"
+            ) from exc
+        return JSONResponse({"armed_speaker": armed})
 
     @app.delete("/api/translator/sessions/{session_id}")
     async def close_session(session_id: str) -> JSONResponse:

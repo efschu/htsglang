@@ -80,7 +80,12 @@ from sglang.srt.translator.speakers import (
     SpeakerRegistryConfig,
     split_points_by_dispersion,
 )
-from sglang.srt.translator.transcript_log import TranscriptLine, TranscriptLog
+from sglang.srt.translator.transcript_log import (
+    ORIGIN_AUTO,
+    ORIGIN_MANUAL,
+    TranscriptLine,
+    TranscriptLog,
+)
 from sglang.srt.translator.voices import (
     OutputMode,
     VoiceAssignment,
@@ -397,6 +402,9 @@ class TranslatorSession:
         # Reading mode (§17.1). Orthogonal to voice_mode: `silent` decides
         # WHETHER anything is spoken, `voice_mode` decides in WHOSE voice.
         self.output_mode = output_mode
+        # The speaker button the user armed for the NEXT utterance (§17.5).
+        # One utterance only; consumed at identification.
+        self._armed_speaker: Optional[str] = None
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
@@ -452,6 +460,7 @@ class TranslatorSession:
             "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
             "output_mode": self.output_mode.value,
+            "armed_speaker": self._armed_speaker,
             "routing_mode": "manual" if self.routing_table else "auto",
             "routing_pairs": self.routing_table.to_json(),
             # Per-pair usability with the refusing stage named, so the UI
@@ -503,6 +512,44 @@ class TranslatorSession:
              "lines_updated": len(changed)},
         )
         return changed
+
+    # -- speaker buttons (§17.5) --------------------------------------------
+
+    @property
+    def armed_speaker(self) -> Optional[str]:
+        return self._armed_speaker
+
+    def arm_speaker(self, speaker_id: Optional[str]) -> Optional[str]:
+        """Attribute the NEXT utterance to this speaker, skipping the embedder.
+
+        Passing ``None`` disarms, which is what tapping the lit button again
+        does. Arming an unknown speaker is refused rather than remembered: a
+        button that silently does nothing is worse than no button.
+        """
+        if speaker_id is None:
+            self._armed_speaker = None
+        else:
+            self.speakers.get(speaker_id)  # raises KeyError if unknown
+            self._armed_speaker = speaker_id
+        self.journal.append(
+            EventKind.SESSION_STATE, {"armed_speaker": self._armed_speaker}
+        )
+        return self._armed_speaker
+
+    def add_speaker(self, label: Optional[str] = None) -> str:
+        """The "+" button: somebody new is here, and the user says so.
+
+        No audio yet, so no centroid yet. Their first attributed utterance
+        seeds it, which is why this is not the same as waiting for the
+        clustering to notice — the clustering would have compared the new
+        person against the existing ones and could have merged them.
+        """
+        profile = self.speakers.create_speaker(label=label)
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {"speaker_added": profile.speaker_id, "label": label},
+        )
+        return profile.speaker_id
 
     def clear_transcript(self) -> int:
         """The only thing that empties the record. Returns lines removed."""
@@ -733,7 +780,9 @@ class TranslatorSession:
 
         # 2. Who said it.
         t_embed = self._clock()
-        speaker_id, similarity, admitted = await self._identify(segment, transcript)
+        speaker_id, similarity, admitted, manual = await self._identify(
+            segment, transcript
+        )
         watch.embed_ms = (self._clock() - t_embed) * 1000.0
         self.journal.append(
             EventKind.TURN_SPEAKER,
@@ -742,6 +791,7 @@ class TranslatorSession:
                 "speaker_id": speaker_id,
                 "similarity": round(similarity, 3),
                 "reference_admitted": admitted,
+                "manual": manual,
                 "reference_seconds": round(
                     self.speakers.get(speaker_id).reference_seconds(), 2
                 )
@@ -765,6 +815,7 @@ class TranslatorSession:
             speaker_label=self._speaker_label(speaker_id),
             source_language=source,
             source_text=transcript.text,
+            origin=ORIGIN_MANUAL if manual else ORIGIN_AUTO,
         )
         self._emit_line(line)
         targets = self._targets_for(source)
@@ -878,7 +929,48 @@ class TranslatorSession:
 
     async def _identify(
         self, segment: Segment, transcript: Transcript
-    ) -> Tuple[str, float, bool]:
+    ) -> Tuple[str, float, bool, bool]:
+        """Returns ``(speaker_id, similarity, admitted, manual)``.
+
+        ``manual`` marks an attribution the user made with a speaker button
+        (§17.5). It is ground truth: the line is never badged uncertain and no
+        later similarity computation re-decides it.
+        """
+        armed = self._armed_speaker
+        if armed is not None:
+            # Spent on this utterance whatever happens next, which is what
+            # "exactly one utterance" means: the button overrides
+            # IDENTIFICATION, and identification is happening right now.
+            self._armed_speaker = None
+            self.journal.append(
+                EventKind.SESSION_STATE, {"armed_speaker": None, "consumed_by": armed}
+            )
+            embedding = None
+            try:
+                if segment.duration_s >= getattr(self.embedder, "min_seconds", 0.0):
+                    embedding = await self.embedder.embed(segment.audio)
+            except BackendError:
+                # The attribution stands regardless: the user said who spoke,
+                # and an embedder failure has no standing against that. Only
+                # the centroid update is lost.
+                embedding = None
+            try:
+                profile, admitted = self.speakers.assign_manual(
+                    speaker_id=armed,
+                    audio=segment.audio,
+                    embedding=embedding,
+                    text=transcript.text,
+                    language=transcript.language,
+                )
+            except KeyError:
+                logger.error(
+                    "session %s was armed for unknown speaker %s; falling back "
+                    "to automatic identification",
+                    self.session_id, armed,
+                )
+            else:
+                return profile.speaker_id, 1.0, admitted, True
+
         min_s = getattr(self.embedder, "min_seconds", 0.0)
         if segment.duration_s < min_s:
             # Too short to embed. Attributing it to the most recent speaker is
@@ -889,18 +981,18 @@ class TranslatorSession:
             profiles = self.speakers.profiles()
             if profiles:
                 recent = max(profiles, key=lambda p: p.last_seen)
-                return recent.speaker_id, 0.0, False
+                return recent.speaker_id, 0.0, False, False
             # Nobody known yet and nothing embeddable: mint a provisional id
             # so the turn still has a speaker to attach to.
-            return "speaker-unknown", 0.0, False
+            return "speaker-unknown", 0.0, False, False
         try:
             embedding = await self.embedder.embed(segment.audio)
         except BackendError:
             profiles = self.speakers.profiles()
             if profiles:
                 recent = max(profiles, key=lambda p: p.last_seen)
-                return recent.speaker_id, 0.0, False
-            return "speaker-unknown", 0.0, False
+                return recent.speaker_id, 0.0, False, False
+            return "speaker-unknown", 0.0, False, False
         profile, similarity, admitted = self.speakers.assign(
             embedding=embedding,
             audio=segment.audio,
@@ -908,7 +1000,7 @@ class TranslatorSession:
             language=transcript.language,
             language_confidence=transcript.language_confidence,
         )
-        return profile.speaker_id, similarity, admitted
+        return profile.speaker_id, similarity, admitted, False
 
     def _targets_for(self, source: str) -> Optional[Tuple[str, ...]]:
         """Where this utterance goes -- possibly to more than one place.

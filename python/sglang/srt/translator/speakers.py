@@ -87,8 +87,10 @@ class SpeakerProfile:
     """Everything the pipeline knows about one voice in the conversation."""
 
     speaker_id: str
-    #: Running centroid of this speaker's embeddings, unit-norm.
-    centroid: SpeakerEmbedding
+    #: Running centroid of this speaker's embeddings, unit-norm. ``None`` for
+    #: a speaker the user DECLARED with the "+" button but who has not been
+    #: heard yet (§17.5); their first audio seeds it.
+    centroid: Optional[SpeakerEmbedding]
     #: How many segments have been folded into the centroid.
     observations: int = 1
     #: Human label, set by enrollment ("matthias") or left None.
@@ -296,6 +298,65 @@ class SpeakerRegistry:
         )
         return profile
 
+    def create_speaker(self, label: Optional[str] = None) -> SpeakerProfile:
+        """Mint an empty profile for the client's "+" button (§17.5).
+
+        The centroid is left unset: this speaker has been DECLARED, not heard.
+        Their first audio seeds it in :meth:`assign_manual` rather than being
+        matched against the existing profiles, which is the whole point of the
+        button — the user already knows this is somebody new, and a match
+        against a similar-sounding participant would overrule them.
+        """
+        sid = f"speaker-{self._next_id}"
+        self._next_id += 1
+        profile = SpeakerProfile(
+            speaker_id=sid,
+            centroid=None,
+            observations=0,
+            label=label,
+            last_seen=self._clock(),
+        )
+        self._profiles[sid] = profile
+        return profile
+
+    def assign_manual(
+        self,
+        speaker_id: str,
+        audio: AudioChunk,
+        embedding: Optional[SpeakerEmbedding] = None,
+        text: str = "",
+        language: Optional[str] = None,
+    ) -> Tuple[SpeakerProfile, bool]:
+        """Attribute a segment to a speaker the user named (§17.5).
+
+        Ground truth: no comparison happens and no threshold can overrule it.
+        The identity thresholds exist to keep MISIDENTIFIED audio out of a
+        reference buffer, and identification is exactly what was skipped — so
+        ``reference_threshold`` does not apply here.
+
+        The audio QUALITY criteria still do. A human can vouch for who spoke;
+        they cannot vouch for whether the microphone clipped or the segment is
+        four tenths of a second long, and a splice-length slice degrades the
+        clone for everything that speaker says afterwards.
+        """
+        profile = self.get(speaker_id)
+        now = self._clock()
+        profile.last_seen = now
+        if embedding is not None:
+            if profile.centroid is None:
+                # First audio for a declared speaker seeds the centroid, so
+                # later automatic turns can find them without another tap.
+                profile.centroid = embedding
+                profile.observations = 1
+            else:
+                self._fold(profile, embedding)
+        if language:
+            profile.last_language = language
+        admitted = self._maybe_admit_reference(
+            profile, audio, text, language, similarity=1.0, enforce_identity=False
+        )
+        return profile, admitted
+
     def assign(
         self,
         embedding: SpeakerEmbedding,
@@ -352,6 +413,11 @@ class SpeakerRegistry:
         best_id: Optional[str] = None
         best_sim = -1.0
         for sid, profile in self._profiles.items():
+            if profile.centroid is None:
+                # Declared but never heard: there is nothing to compare
+                # against, and treating a missing centroid as a distance of
+                # zero would make every declared speaker the nearest match.
+                continue
             sim = profile.centroid.similarity(embedding)
             if sim > best_sim:
                 best_id, best_sim = sid, sim
@@ -370,9 +436,14 @@ class SpeakerRegistry:
         text: str,
         language: Optional[str],
         similarity: float,
+        enforce_identity: bool = True,
     ) -> bool:
         cfg = self.config
-        if similarity < cfg.reference_threshold and profile.observations > 1:
+        if (
+            enforce_identity
+            and similarity < cfg.reference_threshold
+            and profile.observations > 1
+        ):
             return False
         if audio.duration_s < cfg.min_slice_s:
             return False
