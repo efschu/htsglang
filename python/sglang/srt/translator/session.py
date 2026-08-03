@@ -392,7 +392,12 @@ class TranslatorSession:
             "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
             "routing_mode": "manual" if self.routing_table else "auto",
-            "routing_rules": self.routing_table.to_json(),
+            "routing_pairs": self.routing_table.to_json(),
+            # Per-pair usability with the refusing stage named, so the UI
+            # can grey a row out and say WHY instead of dropping it.
+            "routing_capability": list(
+                self.routing_table.capability_report(self.matrix)
+            ),
             "voice_pool": self.voice_pool.to_json() if self.voice_pool else None,
             "speaking": self.segmenter.speaking,
             "journal_seq": self.journal.next_seq,
@@ -452,7 +457,12 @@ class TranslatorSession:
                     "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
             "routing_mode": "manual" if self.routing_table else "auto",
-            "routing_rules": self.routing_table.to_json(),
+            "routing_pairs": self.routing_table.to_json(),
+            # Per-pair usability with the refusing stage named, so the UI
+            # can grey a row out and say WHY instead of dropping it.
+            "routing_capability": list(
+                self.routing_table.capability_report(self.matrix)
+            ),
             "voice_pool": self.voice_pool.to_json() if self.voice_pool else None,
                 },
             )
@@ -656,13 +666,13 @@ class TranslatorSession:
                     "speaker_id": speaker_id,
                     "source": source,
                     "text": transcript.text,
-                    "reason": f"no routing rule for {source!r}",
-                    "known_sources": list(self.routing_table.sources()),
+                    "reason": f"no routing pair for {source!r}",
+                    "known_languages": list(self.routing_table.languages()),
                 },
             )
             self.journal.append(
                 EventKind.TURN_DONE,
-                {"turn_id": turn_id, "empty": True, "reason": "no_routing_rule",
+                {"turn_id": turn_id, "empty": True, "reason": "no_routing_pair",
                  "source": source},
             )
             return None
@@ -783,30 +793,60 @@ class TranslatorSession:
         return profile.speaker_id, similarity, admitted
 
     def _targets_for(self, source: str) -> Optional[Tuple[str, ...]]:
-        """Where this utterance goes.
+        """Where this utterance goes -- possibly to more than one place.
 
         Manual mode is a deterministic table lookup and deliberately does NOT
-        fall back to elimination: once the user has written rules, a guessed
+        fall back to elimination: once the user has written pairs, a guessed
         direction is exactly what they asked to be rid of. ``None`` means the
         table is in force and has nothing for this source -- distinct from an
         empty tuple, which means auto mode found no target.
+
+        The table returns every PARTNER of the source language, so
+        ``{de<->es, de<->fr}`` renders a German turn twice. That fan-out is the
+        intent; the loop that consumes this already handles several targets.
         """
         if self.routing_table:
-            target = self.routing_table.target_for(source)
-            return None if target is None else (target,)
+            partners = self.routing_table.partners_for(source)
+            return partners or None
         return self.conversation.targets_for(source)
 
-    def set_routing_rules(self, rules: Sequence[Tuple[str, str]]) -> None:
-        """Replace the manual routing table. Empty restores auto mode."""
+    def set_routing_pairs(self, pairs: Sequence[Tuple[str, str]]) -> None:
+        """Replace the manual routing table. Empty restores auto mode.
+
+        Each entry is an UNORDERED pair: ``(de, es)`` routes both ways, and
+        passing ``(es, de)`` as well is a no-op rather than an error.
+        """
         table = RoutingTable()
-        table.replace_all(rules)
+        table.replace_all(pairs)
         table.validate_against(self.matrix)
         self.routing_table = table
+        self._push_asr_whitelist()
         self.journal.append(
             EventKind.SESSION_STATE,
             {"routing_mode": "manual" if table else "auto",
-             "routing_rules": table.to_json()},
+             "routing_pairs": table.to_json()},
         )
+
+    def _push_asr_whitelist(self) -> None:
+        """Constrain language identification to the languages actually routed.
+
+        The recognizer keeps IDENTIFYING the source language -- the direction
+        stays observed, never configured, which is requirement 5. What changes
+        is the candidate set: a table naming ``{de, es}`` makes any other
+        answer a misdetection by construction, and an unconstrained identifier
+        that picks Dutch for a German sentence costs the whole turn. Restricted
+        detection returns the best IN-SET language with its own probability as
+        the confidence, so a weak decision is TAGGED rather than discarded.
+
+        Duck-typed: a backend that cannot restrict simply does not implement
+        the method, and the session neither requires nor pretends otherwise.
+        In auto mode the whitelist is cleared, because there the participant
+        set -- not the table -- bounds the conversation.
+        """
+        setter = getattr(self.asr, "set_restrict_languages", None)
+        if not callable(setter):
+            return
+        setter(self.routing_table.languages() if self.routing_table else ())
 
     def _resolve_source(self, transcript: Transcript, speaker_id: str) -> str:
         """Detected language, with a low-confidence fallback to speaker history.

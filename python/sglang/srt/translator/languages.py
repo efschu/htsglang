@@ -50,7 +50,7 @@ __all__ = [
     "LanguageMatrix",
     "canonical_code",
     "canonical_set",
-    "DirectionRule",
+    "LanguagePair",
     "RoutingTable",
     "display_name",
 ]
@@ -367,89 +367,198 @@ class ConversationLanguages:
 
 
 @dataclasses.dataclass(frozen=True)
-class DirectionRule:
-    """One explicit source -> target routing rule."""
+class LanguagePair:
+    """One UNORDERED pair of languages: ``a <-> b`` means both directions.
 
-    source: str
-    target: str
+    Stored canonically with ``a <= b`` so that ``(de, es)`` and ``(es, de)``
+    are the same object and cannot both be added. The ordering is a storage
+    detail and carries no direction; :meth:`partner` is how the pipeline asks
+    the question it actually has.
+    """
+
+    a: str
+    b: str
+
+    @classmethod
+    def of(cls, first: str, second: str) -> "LanguagePair":
+        one, two = canonical_code(first), canonical_code(second)
+        if one == two:
+            raise LanguageError(
+                f"pair {one}<->{two} is a no-op; a language pair needs two "
+                "different languages"
+            )
+        return cls(*sorted((one, two)))
+
+    def partner(self, language: str) -> Optional[str]:
+        """The other side, or ``None`` when this pair does not involve it."""
+        code = canonical_code(language)
+        if code == self.a:
+            return self.b
+        if code == self.b:
+            return self.a
+        return None
 
     def to_json(self) -> Dict[str, str]:
-        return {"source": self.source, "target": self.target}
+        return {"a": self.a, "b": self.b}
 
 
 class RoutingTable:
-    """The manual routing mode: several source -> target rules at once.
+    """The manual routing mode: a set of unordered language pairs.
 
-    The user's point, and the reason this is not just "pick a pair": with a
-    table in place the system no longer has to GUESS a direction. The ASR's
-    language identification still classifies the source of every utterance --
-    that is needed and cheap -- but the target then comes deterministically
-    from the table instead of by elimination over the participant set.
+    **The semantics are the user's, and they invert two earlier decisions.**
 
-    One source maps to exactly one target. A duplicate source is refused
-    rather than resolved, because two rules for one source make the routing
-    ambiguous and any tie-break would be a silent guess -- which is precisely
-    what this mode exists to remove.
+    *A pair is bidirectional.* Adding ``de <-> es`` means a German utterance is
+    rendered in Spanish AND a Spanish one in German. Nobody configuring a
+    conversation wants to state the same relationship twice, and a table that
+    accepted only one direction would silently drop every reply.
 
-    A language with no rule is NOT an error and NOT dropped: the utterance is
-    passed through untranslated and tagged, so the user sees "no rule for X"
-    in the transcript rather than silence and a shrug.
+    *Fan-out is the intent, not an ambiguity.* With ``{de<->es, de<->fr}`` a
+    German utterance goes to Spanish AND French -- two outputs, played
+    sequentially with a language tag. The earlier "one source routes to exactly
+    one target, a duplicate source is refused" rule was the wrong reading: it
+    made the second pair unaddable and the three-language case unexpressible.
+    A repeated pair is therefore DEDUPLICATED rather than refused -- adding
+    ``es <-> de`` to a table that already has ``de <-> es`` is a no-op, not an
+    error, because the user asked for a relationship that already holds.
+
+    What survives from the first version, because it was right: the ASR still
+    classifies every utterance's source language (the direction is observed,
+    never configured), and a language with no pair is passed through
+    untranslated and TAGGED rather than dropped.
+
+    Capability refusal moved to the pair level for the same reason: with
+    unordered pairs, "es is unusable" is not a useful thing to say when the
+    real fact is "de <-> es cannot run because the TTS cannot speak es". See
+    :meth:`capability_report`.
     """
 
-    def __init__(self, rules: Iterable[DirectionRule] = ()) -> None:
-        self._rules: Dict[str, str] = {}
-        for rule in rules:
-            self.add(rule.source, rule.target)
+    def __init__(self, pairs: Iterable[LanguagePair] = ()) -> None:
+        # Insertion-ordered, so the UI can render the rows in the order the
+        # user typed them; membership is by canonical pair.
+        self._pairs: Dict[Tuple[str, str], LanguagePair] = {}
+        for pair in pairs:
+            self.add_pair(pair.a, pair.b)
 
     def __len__(self) -> int:
-        return len(self._rules)
+        return len(self._pairs)
 
     def __bool__(self) -> bool:
         # Explicit: an empty table means "fall back to auto", and relying on
         # __len__ alone would make that read as a bug at the call site.
-        return bool(self._rules)
+        return bool(self._pairs)
 
-    def add(self, source: str, target: str) -> DirectionRule:
-        src, tgt = canonical_code(source), canonical_code(target)
-        if src == tgt:
-            raise LanguageError(
-                f"rule {src}->{tgt} is a no-op; a routing rule needs two "
-                "different languages"
-            )
-        if src in self._rules:
-            raise LanguageError(
-                f"a rule for source {src!r} already exists "
-                f"({src}->{self._rules[src]}); one source routes to exactly "
-                "one target, so change or remove it instead of adding a second"
-            )
-        self._rules[src] = tgt
-        return DirectionRule(src, tgt)
+    def __iter__(self):
+        return iter(self._pairs.values())
 
-    def remove(self, source: str) -> bool:
-        return self._rules.pop(canonical_code(source), None) is not None
+    def add_pair(self, first: str, second: str) -> LanguagePair:
+        """Add ``first <-> second``. Adding it twice is a no-op, not an error."""
+        pair = LanguagePair.of(first, second)
+        key = (pair.a, pair.b)
+        if key in self._pairs:
+            return self._pairs[key]
+        self._pairs[key] = pair
+        return pair
 
-    def replace_all(self, rules: Iterable[Tuple[str, str]]) -> None:
+    def remove_pair(self, first: str, second: str) -> bool:
+        pair = LanguagePair.of(first, second)
+        return self._pairs.pop((pair.a, pair.b), None) is not None
+
+    def replace_all(self, pairs: Iterable[Tuple[str, str]]) -> None:
         """Set the whole table at once, atomically.
 
         Validation happens on a scratch table first, so a rejected update
         leaves the live one untouched rather than half-applied.
         """
         scratch = RoutingTable()
-        for source, target in rules:
-            scratch.add(source, target)
-        self._rules = dict(scratch._rules)
+        for first, second in pairs:
+            scratch.add_pair(first, second)
+        self._pairs = dict(scratch._pairs)
 
-    def target_for(self, source: str) -> Optional[str]:
-        return self._rules.get(canonical_code(source))
+    def partners_for(self, language: str) -> Tuple[str, ...]:
+        """Every language ``language`` is paired with, sorted.
 
-    def sources(self) -> Tuple[str, ...]:
-        return tuple(sorted(self._rules))
+        This is the fan-out: two entries means the utterance is rendered twice.
+        An empty tuple means the table has no pair for this language, which the
+        session reports as an unrouted turn rather than as silence.
+        """
+        code = canonical_code(language)
+        partners = {
+            partner
+            for pair in self._pairs.values()
+            if (partner := pair.partner(code)) is not None
+        }
+        return tuple(sorted(partners))
+
+    def languages(self) -> Tuple[str, ...]:
+        """Every language named by any pair, sorted.
+
+        This is the ASR whitelist. Constraining language identification to the
+        set the table can actually route is strictly better than letting it
+        choose from ninety-nine: a misdetection into an unrouted language costs
+        the whole turn, and the languages in the table are by construction the
+        only ones the user expects to be spoken.
+        """
+        codes = set()
+        for pair in self._pairs.values():
+            codes.add(pair.a)
+            codes.add(pair.b)
+        return tuple(sorted(codes))
+
+    def capability_report(
+        self, matrix: "LanguageMatrix"
+    ) -> Tuple[Dict[str, object], ...]:
+        """Per-pair usability, with the refusing stage named.
+
+        Named rather than filtered: a pair the deployment cannot run is shown
+        greyed out with its reason, so the user learns that the TTS checkpoint
+        does not speak the language instead of watching a row vanish. Both
+        directions are reported separately -- an asymmetric backend set can
+        make ``a->b`` routable while ``b->a`` is not, and collapsing that into
+        one flag would hide exactly the case worth seeing.
+        """
+        report = []
+        for pair in self._pairs.values():
+            directions = []
+            for source, target in ((pair.a, pair.b), (pair.b, pair.a)):
+                try:
+                    matrix.require_pair(source, target)
+                except LanguageError as exc:
+                    directions.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "usable": False,
+                            "reason": str(exc),
+                        }
+                    )
+                else:
+                    directions.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "usable": True,
+                            "reason": None,
+                        }
+                    )
+            report.append(
+                {
+                    **pair.to_json(),
+                    "usable": all(d["usable"] for d in directions),
+                    "directions": tuple(directions),
+                }
+            )
+        return tuple(report)
 
     def validate_against(self, matrix: "LanguageMatrix") -> None:
-        for source, target in sorted(self._rules.items()):
-            matrix.require_pair(source, target)
+        """Hard check: refuse a table this deployment cannot run at all.
+
+        Used where a silent partial table would be worse than a refusal (the
+        HTTP endpoint that accepts a new table). The UI path uses
+        :meth:`capability_report` instead, which names rather than raises.
+        """
+        for pair in self._pairs.values():
+            matrix.require_pair(pair.a, pair.b)
+            matrix.require_pair(pair.b, pair.a)
 
     def to_json(self) -> List[Dict[str, str]]:
-        return [
-            {"source": s, "target": t} for s, t in sorted(self._rules.items())
-        ]
+        return [pair.to_json() for pair in self._pairs.values()]

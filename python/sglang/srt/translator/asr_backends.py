@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -46,6 +46,7 @@ from sglang.srt.translator.backends import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "constrained_language_choice",
     "FasterWhisperAsr",
     "NemoStreamingAsr",
     "SileroVad",
@@ -104,6 +105,55 @@ NEMOTRON_35_LANGUAGES: Sequence[str] = (
     "en es fr de it pt nl pl ru uk cs sk sl hr bg ro hu el da sv no fi et lv "
     "lt mt ga ja ko zh ar he hi tr vi th id ms ca eu"
 ).split()
+
+
+def constrained_language_choice(
+    detected: str,
+    probability: float,
+    all_probabilities: Optional[Sequence[Tuple[str, float]]],
+    restrict: Sequence[str],
+) -> Tuple[str, float]:
+    """Pick the best IN-SET language, never discard the utterance.
+
+    The routing table names the languages the conversation can actually route.
+    Anything else the identifier proposes is a misdetection by construction --
+    a German sentence classified as Dutch costs the entire turn -- so the
+    candidate set is narrowed to the table's languages.
+
+    Three cases, and the third is the one worth spelling out:
+
+    1. no restriction: the identifier's answer stands unchanged;
+    2. the top answer is in the set: it stands, with its own probability;
+    3. the top answer is OUT of the set: fall back to the highest-probability
+       in-set language and report ITS probability as the confidence.
+
+    Case 3 is deliberately not "return confidence 0", which the first version
+    did. Zero says "we know nothing", and the session's low-confidence
+    fallback then reaches for the speaker's history -- fine for a returning
+    speaker, useless for the first turn of a new one. Reporting the real in-set
+    probability keeps the decision honest AND keeps the number that lets the
+    UI tag it as uncertain. Nothing is ever dropped: an utterance always
+    resolves to some language in the table.
+
+    When probabilities are unavailable the choice degenerates to the first
+    restricted language with a confidence of ``0.0`` -- an explicit guess,
+    tagged as one.
+    """
+    allowed = [str(code).lower() for code in restrict]
+    if not allowed:
+        return detected, probability
+    if detected in allowed:
+        return detected, probability
+    if all_probabilities:
+        in_set = [
+            (code, float(score))
+            for code, score in all_probabilities
+            if str(code).lower() in allowed
+        ]
+        if in_set:
+            best_code, best_score = max(in_set, key=lambda item: item[1])
+            return str(best_code).lower(), best_score
+    return allowed[0], 0.0
 
 
 class FasterWhisperAsr:
@@ -184,17 +234,20 @@ class FasterWhisperAsr:
         language = getattr(info, "language", None)
         if not language:
             raise BackendError("asr", "recognizer returned no language identification")
-        if self._restrict and language not in self._restrict:
-            # A restricted deployment that hears something outside its set is
-            # reported honestly with low confidence rather than snapped to the
-            # nearest allowed language; the session's low-confidence fallback
-            # then uses the speaker's history, which is a better guess.
-            return Transcript(text, language, language_confidence=0.0)
-        return Transcript(
-            text,
-            language,
-            language_confidence=float(getattr(info, "language_probability", 1.0) or 0.0),
+        probability = float(getattr(info, "language_probability", 1.0) or 0.0)
+        # Whisper reports the full posterior when asked, which is what makes
+        # constrained detection a real narrowing rather than a veto.
+        language, probability = constrained_language_choice(
+            str(language).lower(),
+            probability,
+            getattr(info, "all_language_probs", None),
+            self._restrict,
         )
+        return Transcript(text, language, language_confidence=probability)
+
+    def set_restrict_languages(self, codes: Sequence[str]) -> None:
+        """Narrow language identification at runtime, from the routing table."""
+        self._restrict = [str(c).lower() for c in codes]
 
 
 class NemoStreamingAsr:
@@ -264,9 +317,22 @@ class NemoStreamingAsr:
                 "asr", "recognizer returned no language identification"
             )
         confidence = float(getattr(best, "lang_prob", 1.0) or 1.0)
-        if self._restrict and str(language).lower().split("-")[0] not in self._restrict:
-            confidence = 0.0
-        return Transcript(str(text).strip(), str(language), confidence)
+        # NeMo's LID emits one locale tag, not a posterior, so constrained
+        # detection here can only fall back to the first allowed language with
+        # an honest confidence of zero. That is a real limitation of the
+        # backend rather than of the contract, and it is why the shared helper
+        # takes the posterior as optional rather than assuming one exists.
+        code, confidence = constrained_language_choice(
+            str(language).lower().split("-")[0],
+            confidence,
+            None,
+            self._restrict,
+        )
+        return Transcript(str(text).strip(), code, confidence)
+
+    def set_restrict_languages(self, codes: Sequence[str]) -> None:
+        """Narrow language identification at runtime, from the routing table."""
+        self._restrict = [str(c).lower() for c in codes]
 
 
 class SileroVad:

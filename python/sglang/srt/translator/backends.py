@@ -302,9 +302,17 @@ class FakeAsr:
         self._pitch_map = list(pitch_map or [])
         self._confidence = confidence
         self.calls: List[Tuple[float, Optional[str]]] = []
+        #: Whatever the session last pushed as the constrained-detection
+        #: whitelist. Recorded rather than acted on: the point of the fake is
+        #: to prove the WIRING, and a fake that also reimplemented the
+        #: restriction would be testing itself.
+        self.restrict_languages: Tuple[str, ...] = ()
 
     def supported_languages(self) -> Iterable[str]:
         return tuple(self._languages)
+
+    def set_restrict_languages(self, codes: Sequence[str]) -> None:
+        self.restrict_languages = tuple(codes)
 
     async def transcribe(
         self, audio: AudioChunk, hint_language: Optional[str] = None

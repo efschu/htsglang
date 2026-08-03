@@ -523,20 +523,25 @@ def build_app(service: TranslatorService) -> FastAPI:
 
     @app.post("/api/translator/sessions/{session_id}/routing")
     async def set_routing(session_id: str, body: Dict[str, Any]) -> JSONResponse:
-        """Replace a session's manual routing table. Empty list = auto mode."""
+        """Replace a session's manual routing table. Empty list = auto mode.
+
+        Entries are UNORDERED pairs ``{"a": ..., "b": ...}``: one row per
+        relationship, both directions, and a repeated pair is deduplicated
+        rather than refused.
+        """
         session = service.sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
-        raw = body.get("rules", [])
+        raw = body.get("pairs", body.get("rules", []))
         try:
-            rules = [(str(r["source"]), str(r["target"])) for r in raw]
+            pairs = [(str(entry["a"]), str(entry["b"])) for entry in raw]
         except (KeyError, TypeError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail="each rule needs a 'source' and a 'target'",
+                detail="each pair needs an 'a' and a 'b' language code",
             ) from exc
         try:
-            session.set_routing_rules(rules)
+            session.set_routing_pairs(pairs)
         except LanguageError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(session.state())

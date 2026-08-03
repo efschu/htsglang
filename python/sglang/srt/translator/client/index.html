@@ -58,6 +58,16 @@
           border-bottom:1px solid #6b5418; font-size:13px; line-height:1.35; }
   #demo.on { display:block; }
   #demo b { color:#ffb340; }
+  #routing { display:none; padding:10px 14px; border-bottom:1px solid #2a2a2a;
+             font-size:13px; background:#161616; }
+  #routing.on { display:block; }
+  #routing .pair { display:flex; gap:6px; align-items:center; margin:4px 0; }
+  #routing .pair select { flex:1; min-width:0; }
+  #routing .arrows { color:var(--dim); font-size:15px; }
+  #routing button.small { padding:2px 9px; font-size:15px; line-height:1.2; }
+  #routing .note { color:var(--dim); margin-top:6px; line-height:1.35; }
+  #routing .note.warn { color:#ffd479; }
+  #routing option:disabled { color:#6a6a6a; }
 </style>
 
 <header>
@@ -69,6 +79,10 @@
     <option value="vad">auto (voice detect)</option>
   </select>
   <select id="langs" multiple size="1" title="conversation languages"></select>
+  <select id="routemode" title="how a turn picks its target language">
+    <option value="auto">auto routing</option>
+    <option value="manual">language pairs</option>
+  </select>
   <select id="voice" title="output voice">
     <option value="clone">own voices</option>
     <option value="preset">preset voices</option>
@@ -77,6 +91,14 @@
 </header>
 
 <div id="demo"></div>
+<div id="routing">
+  <div id="pairs"></div>
+  <div class="row" style="margin-top:6px">
+    <button id="addpair" class="small">+ pair</button>
+    <button id="applypairs">apply</button>
+  </div>
+  <div class="note" id="routingnote"></div>
+</div>
 <div id="log"></div>
 
 <footer>
@@ -563,8 +585,142 @@ function announceFakeBackends(backends) {
   box.classList.add("on");
 }
 
+// ---------------------------------------------------------------------------
+// Routing: a set of UNORDERED language pairs.
+// ---------------------------------------------------------------------------
+// One row is one relationship, both directions. A language appearing in two
+// rows FANS OUT -- the utterance is rendered in both, played one after the
+// other -- which is why the note below turns into a latency warning rather
+// than an error: fan-out is what the user asked for, it just costs a second
+// synthesis per extra target.
+//
+// The dropdowns are built from the capability endpoint's `selectable` list, so
+// a language this deployment cannot run appears GREYED OUT WITH ITS REASON
+// instead of quietly missing. "es is not in the list" is unactionable;
+// "es -- TTS cannot speak it" tells the user which checkpoint is the problem.
+const routing = { selectable: [], rows: [] };
+
+function languageOptions(select, chosen) {
+  select.innerHTML = "";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "—";
+  select.appendChild(blank);
+  for (const entry of routing.selectable) {
+    const option = document.createElement("option");
+    option.value = entry.code;
+    option.textContent = entry.endonym + " (" + entry.code + ")"
+      + (entry.usable ? "" : " — " + entry.reason);
+    option.disabled = !entry.usable;
+    option.selected = entry.code === chosen;
+    select.appendChild(option);
+  }
+}
+
+function renderPairs() {
+  const box = el("pairs");
+  box.innerHTML = "";
+  routing.rows.forEach((row, index) => {
+    const line = document.createElement("div");
+    line.className = "pair";
+    const left = document.createElement("select");
+    const arrows = document.createElement("span");
+    arrows.className = "arrows";
+    arrows.textContent = "↔";
+    const right = document.createElement("select");
+    languageOptions(left, row.a);
+    languageOptions(right, row.b);
+    left.addEventListener("change", () => { row.a = left.value; describeRouting(); });
+    right.addEventListener("change", () => { row.b = right.value; describeRouting(); });
+    const drop = document.createElement("button");
+    drop.className = "small";
+    drop.textContent = "−";
+    drop.title = "remove this pair";
+    drop.addEventListener("click", () => {
+      routing.rows.splice(index, 1);
+      renderPairs();
+    });
+    line.append(left, arrows, right, drop);
+    box.appendChild(line);
+  });
+  describeRouting();
+}
+
+function describeRouting() {
+  const note = el("routingnote");
+  const counts = {};
+  let complete = 0;
+  for (const row of routing.rows) {
+    if (!row.a || !row.b || row.a === row.b) continue;
+    complete += 1;
+    counts[row.a] = (counts[row.a] || 0) + 1;
+    counts[row.b] = (counts[row.b] || 0) + 1;
+  }
+  const fanned = Object.entries(counts).filter(([, n]) => n > 1);
+  if (!complete) {
+    note.className = "note";
+    note.textContent = "No complete pair yet. With none applied the system "
+      + "routes automatically over the conversation languages.";
+    return;
+  }
+  if (!fanned.length) {
+    note.className = "note";
+    note.textContent = complete + " pair" + (complete === 1 ? "" : "s")
+      + ", both directions each.";
+    return;
+  }
+  note.className = "note warn";
+  note.textContent = fanned
+    .map(([code, n]) => code + " → " + n + " languages")
+    .join("; ")
+    + ". Each extra target is a second translation and synthesis, played "
+    + "after the first — so a turn takes noticeably longer than with a "
+    + "single pair.";
+}
+
+el("routemode").addEventListener("change", async (e) => {
+  const manual = e.target.value === "manual";
+  el("routing").classList.toggle("on", manual);
+  if (manual && !routing.rows.length) {
+    routing.rows.push({ a: "", b: "" });
+    renderPairs();
+  }
+  if (!manual) await sendPairs([]);
+});
+
+el("addpair").addEventListener("click", () => {
+  routing.rows.push({ a: "", b: "" });
+  renderPairs();
+});
+
+el("applypairs").addEventListener("click", async () => {
+  const pairs = routing.rows
+    .filter((row) => row.a && row.b && row.a !== row.b)
+    .map((row) => ({ a: row.a, b: row.b }));
+  await sendPairs(pairs);
+});
+
+async function sendPairs(pairs) {
+  if (!connection.sessionId) { sys("not connected yet", true); return; }
+  const response = await fetch(
+    BASE + "api/translator/sessions/" + connection.sessionId + "/routing",
+    { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pairs }) });
+  if (!response.ok) {
+    let detail = "routing rejected";
+    try { detail = (await response.json()).detail || detail; } catch (_) {}
+    sys(detail, true);
+    return;
+  }
+  const state = await response.json();
+  sys(state.routing_mode === "manual"
+    ? "routing: " + state.routing_pairs.map((p) => p.a + "↔" + p.b).join(", ")
+    : "routing: automatic");
+}
+
 fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
   announceFakeBackends(info.backends);
+  routing.selectable = info.selectable || [];
   const picker = el("langs");
   picker.size = Math.min(6, Math.max(2, info.bidirectional.length));
   for (const lang of info.bidirectional) {
