@@ -10,8 +10,24 @@ preset is the wrong gender. Nothing about rendering guarantees that: the
 VoiceDesign model is given eighteen natural-language descriptions and may well
 collapse several of them onto one voice.
 
-So this measures it, with the same instrument the pipeline itself uses to tell
-speakers apart: the checkpoint's speaker encoder. For every pair of presets it
+So this measures it -- with the instrument the pipeline itself uses, and only
+after PROVING that instrument can tell anyone apart at all.
+
+**That validation is not ceremony; it caught a wrong verdict here.** The first
+version of this script scored the pool on the TTS checkpoint's own speaker
+encoder, which is loaded anyway and conditions the cloning. Every preset pair
+came back at 0.94-0.99 and the pool was declared collapsed. It was not: that
+encoder returns x-vectors whose shared component is ~98 % of the norm (mean
+vector 9.83 against a median sample norm of 10.06), so cosine is ~0.98 between
+ANY two clips. Measured on eight unrelated speakers it spans 0.949-0.990, and a
+voice against its own clone scores 0.981 -- INSIDE that range. It is trained to
+condition synthesis, not to discriminate identity, and mean-centering does not
+rescue it either. A verdict from an instrument with 0.04 of dynamic range is
+noise wearing a number.
+
+So the encoder is `wespeaker_en_voxceleb_resnet34_LM` through ONNX Runtime --
+the design's original §2.2 choice, which this detour vindicated -- and the
+script refuses to report anything until the instrument clears a floor check. For every pair of presets it
 reports the cosine similarity of their x-vectors, and it flags any pair above
 the registry's own speaker-merge threshold -- because a pair that similar is,
 by the system's own definition, the SAME speaker, and handing them to two
@@ -31,6 +47,7 @@ language.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import sys
 from collections import defaultdict
@@ -41,13 +58,26 @@ import numpy as np
 from sglang.srt.translator.speakers import SpeakerRegistryConfig
 
 DEFAULT_POOL = Path("/spinning/llm_stuff/translator-models/preset-voices")
-DEFAULT_MODEL = Path("/spinning/llm_stuff/translator-models/qwen3-tts-0.6b-base")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pool-root", type=Path, default=DEFAULT_POOL)
-    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--embedder-model", type=Path,
+        default=Path("/spinning/llm_stuff/translator-models/embedder/"
+                     "wespeaker_resnet34_LM.onnx"),
+    )
+    parser.add_argument(
+        "--control-dir", type=Path,
+        default=Path("/spinning/llm_stuff/translator-models/xtts-v2/samples"),
+        help="clips that are NOT the same voice; used to prove the encoder "
+             "discriminates before the pool is judged",
+    )
+    parser.add_argument(
+        "--min-instrument-range", type=float, default=0.30,
+        help="required cosine spread over the control clips",
+    )
     #: Taken from the speaker registry rather than invented here, and it must
     #: STAY taken from there: `match_threshold` is the cosine above which the
     #: live pipeline calls two clips the same person. Two presets at or above
@@ -63,14 +93,9 @@ def main() -> int:
     args = parser.parse_args()
 
     import soundfile as sf
-    import torch
 
-    from sglang.srt.translator.qwen3_tts_compat import (
-        ensure_qwen3_tts_importable,
-        librosa_resample,
-        refresh_rotary_buffers,
-        verify_and_load_weights,
-    )
+    from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
+    from sglang.srt.translator.backends import AudioChunk
 
     clips = sorted(args.pool_root.glob("*/*.wav"))
     if not clips:
@@ -86,31 +111,45 @@ def main() -> int:
         print(f"[pool]   {name:6s} {len(by_class[name]):3d} clips, "
               f"{len(voices)} voices: {', '.join(voices)}")
 
-    ensure_qwen3_tts_importable()
-    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+    embedder = OnnxSpeakerEmbedder(args.embedder_model)
+    print(f"[pool] embedder {embedder.name}")
 
-    model = Qwen3TTSModel.from_pretrained(str(args.model_dir), dtype=torch.float32)
-    inner = getattr(model, "model", model)
-    inner.to("cpu")
-    refresh_rotary_buffers(inner)
-    # Same reason as everywhere else: an unloaded speaker encoder produces
-    # x-vectors that agree beautifully with each other and mean nothing.
-    verify_and_load_weights(inner, args.model_dir)
-    rate = inner.speaker_encoder_sample_rate
-
-    vectors = {}
-    for clip in clips:
-        samples, source_rate = sf.read(str(clip), dtype="float32")
+    def load(path: Path) -> AudioChunk:
+        samples, source_rate = sf.read(str(path), dtype="float32")
         if samples.ndim > 1:
             samples = samples.mean(axis=1)
-        resampled = librosa_resample(samples, source_rate, rate)
-        with torch.inference_mode():
-            vector = inner.extract_speaker_embedding(audio=resampled, sr=rate)
-        vector = vector.detach().float().reshape(-1)
-        vectors[clip] = vector / vector.norm()
+        return AudioChunk(np.ascontiguousarray(samples), source_rate)
+
+    async def embed_all(paths):
+        out = {}
+        for path in paths:
+            out[path] = (await embedder.embed(load(path))).vector
+        return out
+
+    controls = sorted(args.control_dir.glob("*.wav")) if args.control_dir else []
+    vectors = asyncio.run(embed_all(list(clips) + controls))
 
     def cosine(a: Path, b: Path) -> float:
-        return float(torch.dot(vectors[a], vectors[b]))
+        return float(np.dot(vectors[a], vectors[b]))
+
+    # -- INSTRUMENT FLOOR, before any verdict -----------------------------
+    # An encoder that scores everything alike would declare any pool
+    # collapsed; one that scores everything different would pass any pool.
+    # Neither failure is visible in the pool numbers themselves.
+    if len(controls) >= 3:
+        spread = [cosine(a, b) for a, b in itertools.combinations(controls, 2)]
+        observed = max(spread) - min(spread)
+        print(f"[pool] instrument floor over {len(controls)} unrelated clips: "
+              f"cosine {min(spread):.3f}..{max(spread):.3f} "
+              f"(range {observed:.3f})")
+        if observed < args.min_instrument_range:
+            print(f"[pool] REFUSING to judge the pool: this encoder only "
+                  f"spans {observed:.3f} across clips that are not the same "
+                  f"voice. Any verdict would be noise wearing a number.")
+            return 1
+    else:
+        print("[pool] no control clips given (--control-dir); the instrument "
+              "is UNVALIDATED and the verdict below is provisional")
 
     # -- distinctness within each class -----------------------------------
     print("\n[pool] pairwise similarity WITHIN each class "

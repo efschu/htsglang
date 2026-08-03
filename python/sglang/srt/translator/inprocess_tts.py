@@ -51,7 +51,7 @@ from sglang.srt.translator.tts_backends import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["InProcessQwen3Tts", "InProcessTtsConfig", "TalkerSpeakerEmbedder"]
+__all__ = ["InProcessQwen3Tts", "InProcessTtsConfig"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -371,77 +371,6 @@ class InProcessQwen3Tts:
                 "changed and coercing it blindly would be a silent audio bug",
             )
         return np.concatenate(parts).astype(np.float32)
-
-
-class TalkerSpeakerEmbedder:
-    """Diarization on the TTS checkpoint's OWN speaker encoder.
-
-    DESIGN_466 §2.2 picked ``pyannote/wespeaker-voxceleb-resnet34-LM`` for
-    this, and that was the right call when the talker was going to be a
-    separate serving process. It is the wrong one now, for a reason that is
-    architectural rather than about saving a download.
-
-    The checkpoint ships an ECAPA-class x-vector extractor (8.9 M params)
-    because that is what voice cloning conditions on. It is therefore already
-    loaded, already weight-verified, and already the model whose opinion
-    decides what a cloned voice sounds like. Running clustering on a DIFFERENT
-    encoder means the registry and the cloner can disagree: wespeaker says two
-    segments are one speaker, merges their reference buffers, and the talker
-    -- which measures similarity differently -- then clones a blend of two
-    people. Using one encoder for both makes that class of bug unrepresentable
-    rather than unlikely, and §4.2 is explicit that a voice merge corrupts
-    both voices audibly while a split only costs a duplicated buffer.
-
-    It also removes a model, a download and an ONNX Runtime session from the
-    tenant, which is a real saving on a card shared with a 27B -- but that is
-    the smaller argument and it is not why this exists.
-
-    The trade the honest version of this note has to state: wespeaker is
-    trained for verification and is very likely the better *discriminator* in
-    isolation. This one is trained to condition synthesis. If clustering
-    quality turns out to bind in the field, the interface is unchanged and
-    wespeaker drops back in -- `OnnxSpeakerEmbedder` is still there.
-    """
-
-    #: Below this a vector is noise with a norm. Matches the ONNX embedder's
-    #: bar rather than inventing a second one.
-    min_seconds: float = 0.6
-
-    def __init__(self, tts: "InProcessQwen3Tts") -> None:
-        self.name = f"talker-speaker-encoder:{tts.config.model_dir.name}"
-        self._tts = tts
-        self._lock = asyncio.Lock()
-
-    async def embed(self, audio: AudioChunk):
-        from sglang.srt.translator.backends import SpeakerEmbedding
-
-        if self._tts._model is None:
-            self._tts.load()
-        if audio.duration_s < self.min_seconds:
-            raise BackendError(
-                "diarization",
-                f"segment is {audio.duration_s:.2f}s, need "
-                f">= {self.min_seconds}s for a usable speaker vector",
-            )
-        # The encoder is shared mutable state with synthesis; serialise.
-        async with self._lock:
-            vector = await asyncio.get_running_loop().run_in_executor(
-                None, self._extract, audio
-            )
-        return SpeakerEmbedding(vector)
-
-    def _extract(self, audio: AudioChunk) -> np.ndarray:
-        import torch
-
-        from sglang.srt.translator.qwen3_tts_compat import librosa_resample
-
-        inner = getattr(self._tts._model, "model", self._tts._model)
-        rate = inner.speaker_encoder_sample_rate
-        samples = np.asarray(audio.samples, dtype=np.float32)
-        resampled = librosa_resample(samples, audio.sample_rate, rate)
-        with torch.inference_mode():
-            vector = inner.extract_speaker_embedding(audio=resampled, sr=rate)
-        return vector.detach().float().cpu().numpy().reshape(-1)
 
 
 def build_inprocess_tts(

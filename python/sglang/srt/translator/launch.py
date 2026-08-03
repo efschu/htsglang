@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--embedder", default="fake", choices=("fake", "onnx", "talker"),
+        "--embedder", default="fake", choices=("fake", "onnx"),
         help="speaker embedding backend",
     )
     parser.add_argument("--embedder-model", type=Path, default=None)
@@ -278,19 +278,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     # Speaker embedding
-    if args.embedder == "talker":
-        # Reuses the speaker encoder the TTS checkpoint already loaded, so
-        # clustering and cloning cannot disagree about who is speaking.
-        # See TalkerSpeakerEmbedder for why this beats a second model here.
-        from sglang.srt.translator.inprocess_tts import TalkerSpeakerEmbedder
-
-        if args.tts != "inprocess":
-            raise SystemExit(
-                "--embedder talker needs --tts inprocess: it borrows that "
-                "backend's speaker encoder rather than loading a second model"
-            )
-        embedder = TalkerSpeakerEmbedder(tts)
-    elif args.embedder == "onnx":
+    if args.embedder == "onnx":
         from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
 
         if args.embedder_model is None:
