@@ -1256,6 +1256,23 @@ reference), so they are correctly out. Every REGISTERED backend whose module
 reaches a marlin repack either declares the capability or exposes a
 `weight_block_size` — asserted per method in
 `test_marlin_unit_coarsening.py::test_every_registered_marlin_repacking_backend_is_covered`.
+**auto-round GPTQ MoE could never reach Marlin** (port of upstream
+`00cdd4b85f`, PR #33271): `apply_gptq_quant_layer` delegates a FusedMoE layer
+to `MoeWNA16Config`, which re-runs the eligibility check itself
+(`moe_wna16.py:98`) — but the config it was handed omitted `desc_act`, and
+`is_gptq_marlin_compatible` treats a MISSING key as ineligible (`if num_bits is
+None or group_size is None or sym is None or desc_act is None: return False`,
+`gptq/gptq.py:575`), so the delegation always landed on the Triton runner while
+the same checkpoint's DENSE layers ran on Marlin. The `use_marlin=False` arm
+was additionally a latent `NameError` (it built `GPTQMarlinMoEMethod` from a
+variable bound only in the other branch), so neither arm worked. Now one
+delegation with a complete config; auto-round has no act-order concept, so
+`desc_act` is always False. Reach: auto-round checkpoints only — plain GPTQ
+takes its own path. Tests:
+`test/registered/unit/layers/quantization/test_auto_round_moe_delegation.py`,
+7 hermetic, two executed can-fail arms (`desc_act` dropped → 3 red; the
+pre-port split restored → 4 red). Unmeasured — no auto-round MoE boot exists on
+this rig.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,
@@ -2061,6 +2078,25 @@ and is itemized in `pinned_reserve_shortfall_note` as the sixth term no reserve
 charges. GPU arm packaged, not run: `scripts/dev/493_indexer_transient/`,
 falsifier = `peak_bytes_max` must fall ~326 MiB/rank between the arms.
 `NOTE_493_indexer_prefill_transient.md`.
+**Two DSpark pre-boot blockers closed by upstream ports (unbooted).** (1)
+#33312: `DeepseekV4ForCausalLMDSpark` never resolved
+`num_fused_shared_experts`, so its expert mapping covered `n_routed_experts`
+alone and a checkpoint shipping the shared expert FUSED lost every such tensor
+to the loader's "unexpected weight" drop — the #491 silent class, different
+name family. The decision now lives in
+`deepseek_v4._resolve_num_fused_shared_experts`, which the target model's
+`determine_num_fused_shared_experts` delegates to, so the two cannot drift;
+this fork's GGUF branch (a GGUF stream keeps the shared expert as separate
+packed linears) survives the extraction, `--enforce-shared-experts-fusion`
+refusal included. (2) #33098: `_fill_dp_moe_sync_metadata` filled the DP
+vectors but not `num_token_non_padded`/`_cpu`, the fields the EP token
+accounting reads (`layers/moe/topk.py`, `hash_topk.py`, `mega_moe.py`) — the
+device tensor only under `moe_ep_size > 1` (`forward_batch_info.py:1527-1528`),
+so a non-EP boot allocates nothing new. Tests:
+`test/registered/unit/models/test_dspark_shared_expert_fusion_33312.py` (11
+hermetic, four can-fail arms) and the extended
+`test/registered/spec/dspark/test_dspark_dp_original_global_num_tokens_442.py`
+(8 hermetic, four can-fail arms).
 Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure
