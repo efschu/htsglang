@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>live translator</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#101014">
+<!--
+  The whole client: one file, no build system, no external asset.
+
+  It must load over the tunnel with no internet route available, which rules
+  out every CDN and every bundler output. It also has to survive a mobile
+  network that drops: the connection layer at the bottom reconnects with
+  backoff and resumes the journal from the last sequence it processed, so a
+  dropout costs the current utterance and nothing else.
+
+  Microphone capture goes through getUserMedia with echo cancellation, gain
+  control and noise suppression enabled. That is the reason this is a browser
+  client rather than a native one for the MVP: it dissolves the loudspeaker to
+  microphone feedback loop that half-duplex playback would otherwise create,
+  for free, on every platform.
+-->
+<style>
+  :root { color-scheme: dark; --bg:#101014; --fg:#e8e8ef; --dim:#8a8a9a;
+          --accent:#5ac8fa; --warn:#ffb340; --bad:#ff6b6b; --good:#63d471; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45
+         system-ui, -apple-system, sans-serif; display:flex;
+         flex-direction:column; height:100dvh; overscroll-behavior:none; }
+  header { padding:10px 14px; display:flex; gap:10px; align-items:center;
+           border-bottom:1px solid #24242e; flex-wrap:wrap; }
+  #dot { width:10px; height:10px; border-radius:50%; background:var(--bad);
+         flex:0 0 auto; }
+  #dot.on { background:var(--good); } #dot.wait { background:var(--warn); }
+  select, button { font:inherit; color:var(--fg); background:#1c1c26;
+                   border:1px solid #33333f; border-radius:8px; padding:7px 10px; }
+  button:active { background:#2a2a38; }
+  button[disabled] { opacity:.45; }
+  #log { flex:1; overflow-y:auto; padding:12px 14px; display:flex;
+         flex-direction:column; gap:10px; -webkit-overflow-scrolling:touch; }
+  .turn { border-left:3px solid #33333f; padding-left:10px; }
+  .turn .who { font-size:12px; color:var(--dim); letter-spacing:.03em; }
+  .turn .src { color:var(--dim); }
+  .turn .dst { font-size:18px; }
+  .turn.borrowed .who::after { content:" · borrowed voice"; color:var(--warn); }
+  .sys { font-size:12px; color:var(--dim); }
+  .sys.err { color:var(--bad); }
+  footer { padding:12px 14px calc(12px + env(safe-area-inset-bottom));
+           border-top:1px solid #24242e; display:flex; gap:10px;
+           align-items:center; }
+  #talk { flex:1; padding:20px; font-size:19px; border-radius:14px;
+          background:#1c1c26; touch-action:none; user-select:none; }
+  #talk.live { background:#2f5d7c; border-color:var(--accent); }
+  #meter { height:6px; border-radius:3px; background:#24242e; flex:0 0 70px; }
+  #meter > i { display:block; height:100%; width:0; border-radius:3px;
+               background:var(--accent); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+
+<header>
+  <span id="dot" title="connection"></span>
+  <span id="status" class="sys">starting</span>
+  <span style="flex:1"></span>
+  <select id="mode" title="turn taking">
+    <option value="ptt">push to talk</option>
+    <option value="vad">auto (voice detect)</option>
+  </select>
+  <select id="langs" multiple size="1" title="conversation languages"></select>
+  <select id="voice" title="output voice">
+    <option value="clone">own voices</option>
+    <option value="preset">preset voices</option>
+  </select>
+  <button id="enroll" title="record 15 s of your voice">enroll</button>
+</header>
+
+<div id="log"></div>
+
+<footer>
+  <div id="meter"><i></i></div>
+  <button id="talk" disabled>hold to speak</button>
+</footer>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Configuration derived from the page, never hardcoded.
+// ---------------------------------------------------------------------------
+const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
+  + location.host + "/api/translator/stream";
+const PIPELINE_RATE = 16000;   // confirmed by the server on handshake
+const FRAME_MS = 20;
+
+const el = (id) => document.getElementById(id);
+const logBox = el("log");
+
+function sys(text, bad) {
+  const div = document.createElement("div");
+  div.className = "sys" + (bad ? " err" : "");
+  div.textContent = text;
+  logBox.appendChild(div);
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function setStatus(text, cls) {
+  el("status").textContent = text;
+  el("dot").className = cls || "";
+}
+
+// ---------------------------------------------------------------------------
+// Playback queue.
+//
+// Synthesized audio arrives as a sequence of binary frames. Scheduling each
+// one at "now" would produce clicks between chunks, so every buffer is
+// scheduled at the end of the previous one on a shared clock. A gap of more
+// than a few hundred milliseconds resets the clock, otherwise a long pause
+// would leave the queue scheduling into the past.
+// ---------------------------------------------------------------------------
+class Playback {
+  constructor() { this.ctx = null; this.cursor = 0; }
+  ensure() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === "suspended") this.ctx.resume();
+    return this.ctx;
+  }
+  push(float32, rate) {
+    const ctx = this.ensure();
+    const buffer = ctx.createBuffer(1, float32.length, rate);
+    buffer.copyToChannel(float32, 0);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    const now = ctx.currentTime;
+    if (this.cursor < now + 0.02) this.cursor = now + 0.05;
+    source.start(this.cursor);
+    this.cursor += buffer.duration;
+  }
+  get busy() { return this.ctx && this.cursor > this.ctx.currentTime; }
+}
+const playback = new Playback();
+
+// ---------------------------------------------------------------------------
+// Microphone capture.
+//
+// The AudioWorklet is defined inline and loaded from a blob so the page stays
+// a single file. It hands raw float frames to the main thread, which
+// downsamples to the pipeline rate and packs PCM16. Downsampling here rather
+// than server-side keeps the uplink small, which is the whole game on mobile
+// data.
+// ---------------------------------------------------------------------------
+const WORKLET_SOURCE = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor("tap", Tap);
+`;
+
+class Microphone {
+  constructor(onFrame, onLevel) {
+    this.onFrame = onFrame;
+    this.onLevel = onLevel;
+    this.ctx = null;
+    this.node = null;
+    this.stream = null;
+    this.carry = new Float32Array(0);
+    this.open = false;
+  }
+
+  async start() {
+    if (this.ctx) return;
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // These three are why the client is a browser: they remove the
+        // loudspeaker-into-microphone feedback loop for half-duplex playback
+        // without any work on our side.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const blob = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await this.ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    const source = this.ctx.createMediaStreamSource(this.stream);
+    this.node = new AudioWorkletNode(this.ctx, "tap");
+    this.node.port.onmessage = (event) => this.handle(event.data);
+    source.connect(this.node);
+    // A zero-gain sink keeps the graph alive without echoing to the speaker.
+    const sink = this.ctx.createGain();
+    sink.gain.value = 0;
+    this.node.connect(sink).connect(this.ctx.destination);
+  }
+
+  handle(chunk) {
+    let peak = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const v = Math.abs(chunk[i]);
+      if (v > peak) peak = v;
+    }
+    this.onLevel(peak);
+    if (!this.open) return;
+
+    const ratio = this.ctx.sampleRate / PIPELINE_RATE;
+    const merged = new Float32Array(this.carry.length + chunk.length);
+    merged.set(this.carry, 0);
+    merged.set(chunk, this.carry.length);
+
+    const outLength = Math.floor(merged.length / ratio);
+    const out = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+      // Box-average decimation. The browser already band-limited the signal
+      // at its own rate and speech energy above 8 kHz is not what the
+      // recognizer uses, so a full polyphase filter would be cost without an
+      // audible return on the uplink.
+      const start = Math.floor(i * ratio);
+      const end = Math.min(merged.length, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      for (let j = start; j < end; j++) sum += merged[j];
+      out[i] = end > start ? sum / (end - start) : 0;
+    }
+    this.carry = merged.slice(Math.floor(outLength * ratio));
+
+    const frame = Math.round(PIPELINE_RATE * FRAME_MS / 1000);
+    for (let start = 0; start + frame <= out.length; start += frame) {
+      const pcm = new DataView(new ArrayBuffer(frame * 2));
+      for (let i = 0; i < frame; i++) {
+        const s = Math.max(-1, Math.min(1, out[start + i]));
+        pcm.setInt16(i * 2, s * 32767, true);
+      }
+      this.onFrame(pcm.buffer);
+    }
+  }
+
+  setOpen(open) {
+    this.open = open;
+    if (!open) this.carry = new Float32Array(0);
+  }
+
+  stop() {
+    if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+    if (this.ctx) this.ctx.close();
+    this.ctx = null; this.node = null; this.stream = null; this.open = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connection with resume.
+//
+// The session id and the journal cursor live here and survive the socket.
+// Reconnect is not error handling: on a mobile network it is the normal case,
+// so the backoff is short at first and the resume cursor is always sent.
+// ---------------------------------------------------------------------------
+class Connection {
+  constructor(handlers) {
+    this.handlers = handlers;
+    this.ws = null;
+    this.sessionId = sessionStorage.getItem("translator.session") || null;
+    this.cursor = Number(sessionStorage.getItem("translator.cursor") || 0);
+    this.participants = null;
+    this.attempt = 0;
+    this.closedByUser = false;
+    this.pendingAudio = null;   // the turn a binary frame belongs to
+  }
+
+  connect() {
+    this.closedByUser = false;
+    setStatus("connecting", "wait");
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        kind: "hello",
+        codecs: ["pcm16"],
+        session_id: this.sessionId,
+        resume_from: this.cursor,
+        participants: this.participants,
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        this.onControl(JSON.parse(event.data));
+      } else {
+        this.onBinary(event.data);
+      }
+    };
+
+    ws.onclose = () => {
+      if (this.closedByUser) { setStatus("closed", ""); return; }
+      const delay = Math.min(500 * Math.pow(1.7, this.attempt++), 15000);
+      setStatus("reconnecting in " + Math.round(delay / 100) / 10 + "s", "wait");
+      setTimeout(() => this.connect(), delay);
+    };
+
+    ws.onerror = () => { /* onclose does the work; avoid a double retry */ };
+  }
+
+  onControl(event) {
+    if (typeof event.seq === "number") {
+      this.cursor = Math.max(this.cursor, event.seq + 1);
+      sessionStorage.setItem("translator.cursor", String(this.cursor));
+    }
+    if (event.kind === "ready") {
+      this.attempt = 0;
+      this.sessionId = event.session_id;
+      sessionStorage.setItem("translator.session", this.sessionId);
+      setStatus(event.resumed ? "resumed" : "connected", "on");
+    }
+    if (event.audio_follows) this.pendingAudio = event;
+    this.handlers.onEvent(event);
+  }
+
+  onBinary(buffer) {
+    const view = new DataView(buffer);
+    const samples = new Float32Array(buffer.byteLength / 2);
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = view.getInt16(i * 2, true) / 32768;
+    }
+    const rate = (this.pendingAudio && this.pendingAudio.sample_rate)
+      || PIPELINE_RATE;
+    playback.push(samples, rate);
+  }
+
+  sendFrame(buffer) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(buffer);
+  }
+
+  sendControl(payload) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Turn rendering.
+// ---------------------------------------------------------------------------
+const turns = new Map();
+
+function turnNode(id) {
+  let node = turns.get(id);
+  if (!node) {
+    node = document.createElement("div");
+    node.className = "turn";
+    node.innerHTML = '<div class="who"></div><div class="src"></div>'
+                   + '<div class="dst"></div>';
+    turns.set(id, node);
+    logBox.appendChild(node);
+  }
+  logBox.scrollTop = logBox.scrollHeight;
+  return node;
+}
+
+function onEvent(event) {
+  switch (event.kind) {
+    case "turn.transcript": {
+      const node = turnNode(event.turn_id);
+      node.querySelector(".src").textContent = event.text;
+      node.dataset.lang = event.language;
+      break;
+    }
+    case "turn.speaker": {
+      const node = turnNode(event.turn_id);
+      node.dataset.speaker = event.speaker_id;
+      node.querySelector(".who").textContent =
+        event.speaker_id + " · " + (node.dataset.lang || "?");
+      break;
+    }
+    case "turn.voice": {
+      const node = turnNode(event.turn_id);
+      const who = node.querySelector(".who");
+      const voice = event.mode === "preset"
+        ? (event.preset_label || event.preset)
+        : "own voice";
+      who.textContent = (node.dataset.speaker || "?") + " · "
+        + (node.dataset.lang || "?") + " · " + voice;
+      // A downgrade or a shared base voice is a real quality change and the
+      // listener is told, rather than left to wonder why someone sounds
+      // different from last turn.
+      if (event.downgraded) node.classList.add("borrowed");
+      if (event.notice) sys(event.notice, true);
+      break;
+    }
+    case "turn.translation": {
+      if (event.partial) break;
+      const node = turnNode(event.turn_id);
+      node.querySelector(".dst").textContent = event.text;
+      break;
+    }
+    case "turn.done": {
+      if (event.fallback_voice) turnNode(event.turn_id).classList.add("borrowed");
+      break;
+    }
+    case "turn.dropped":
+      sys("dropped a queued turn (" + event.reason + ")", true);
+      break;
+    case "resume.gap":
+      sys("some turns were lost while offline", true);
+      break;
+    case "error":
+      sys(event.stage + ": " + event.message, true);
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wiring.
+// ---------------------------------------------------------------------------
+const connection = new Connection({ onEvent });
+const microphone = new Microphone(
+  (frame) => connection.sendFrame(frame),
+  (peak) => { el("meter").firstElementChild.style.width =
+                Math.min(100, peak * 260) + "%"; },
+);
+
+const talk = el("talk");
+let holding = false;
+
+async function beginTalking() {
+  if (holding) return;
+  holding = true;
+  await microphone.start();
+  playback.ensure();          // unlock audio output on the same gesture
+  acquireWakeLock();          // keep the screen alive for the conversation
+  microphone.setOpen(true);
+  talk.classList.add("live");
+}
+
+function endTalking() {
+  if (!holding) return;
+  holding = false;
+  microphone.setOpen(false);
+  connection.sendControl({ kind: "release" });
+  talk.classList.remove("live");
+}
+
+for (const [down, up] of [["pointerdown", "pointerup"],
+                          ["pointerdown", "pointercancel"]]) {
+  talk.addEventListener(down, (e) => { e.preventDefault(); beginTalking(); });
+  talk.addEventListener(up, (e) => { e.preventDefault(); endTalking(); });
+}
+talk.addEventListener("pointerleave", endTalking);
+
+el("mode").addEventListener("change", async (e) => {
+  if (e.target.value === "vad") {
+    await microphone.start();
+    playback.ensure();
+    acquireWakeLock();
+    microphone.setOpen(true);         // server-side VAD segments the stream
+    talk.textContent = "listening (auto)";
+    talk.disabled = true;
+  } else {
+    microphone.setOpen(false);
+    talk.textContent = "hold to speak";
+    talk.disabled = false;
+  }
+});
+
+// Voice mode. Applies to the live session immediately; the server refuses
+// preset mode when no pool is loaded and the refusal is shown rather than
+// swallowed, because a toggle that appears to work and does not is worse than
+// one that is greyed out.
+el("voice").addEventListener("change", async (e) => {
+  const mode = e.target.value;
+  if (!connection.sessionId) { sys("no session yet", true); return; }
+  const response = await fetch(
+    "/api/translator/sessions/" + connection.sessionId + "/voice",
+    { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode }) });
+  if (response.ok) {
+    sys("voice mode: " + mode);
+  } else {
+    const detail = await response.json().catch(() => ({}));
+    sys("voice mode refused: " + (detail.detail || response.status), true);
+    e.target.value = mode === "preset" ? "clone" : "preset";
+  }
+});
+
+// Screen-off operation is the known PWA wall: Android suspends a backgrounded
+// page's AudioContext and no web API overrides that. A wake lock keeps the
+// screen on while the app is in use, which makes screen-on the MVP's stated
+// constraint rather than an unexplained failure. Losing the lock is not an
+// error -- it is released automatically when the page hides.
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!("wakeLock" in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch (err) {
+    sys("screen wake lock unavailable; the screen may sleep mid-conversation");
+  }
+}
+
+el("enroll").addEventListener("click", async () => {
+  sys("enrollment: speak for 15 seconds after the beep");
+  await microphone.start();
+  const collected = [];
+  const capture = (frame) => collected.push(new Uint8Array(frame));
+  const original = microphone.onFrame;
+  microphone.onFrame = capture;
+  microphone.setOpen(true);
+  setTimeout(async () => {
+    microphone.setOpen(false);
+    microphone.onFrame = original;
+    let total = 0;
+    collected.forEach((c) => (total += c.length));
+    const merged = new Uint8Array(total);
+    let at = 0;
+    for (const c of collected) { merged.set(c, at); at += c.length; }
+    let binary = "";
+    for (let i = 0; i < merged.length; i++) binary += String.fromCharCode(merged[i]);
+    const response = await fetch(
+      "/api/translator/enroll/" + connection.sessionId,
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          label: "user",
+          audio: { encoding: "pcm16", sample_rate: PIPELINE_RATE,
+                   data: btoa(binary) },
+        }) });
+    sys(response.ok ? "enrolled your voice" : "enrollment failed", !response.ok);
+  }, 15000);
+});
+
+// The language picker is filled from the server's runtime-derived set. No
+// language is written into this page: what the deployment can do is whatever
+// the intersection of its backends says it can do.
+fetch("/api/translator/languages").then((r) => r.json()).then((info) => {
+  const picker = el("langs");
+  picker.size = Math.min(6, Math.max(2, info.bidirectional.length));
+  for (const lang of info.bidirectional) {
+    const option = document.createElement("option");
+    option.value = lang.code;
+    option.textContent = lang.endonym + " (" + lang.code + ")";
+    option.selected = info.default_participants.includes(lang.code);
+    picker.appendChild(option);
+  }
+  picker.addEventListener("change", () => {
+    const chosen = Array.from(picker.selectedOptions).map((o) => o.value);
+    if (chosen.length < 2) { sys("pick at least two languages", true); return; }
+    connection.participants = chosen;
+    sys("languages set to " + chosen.join(", ") + "; reconnecting");
+    connection.sessionId = null;
+    connection.cursor = 0;
+    if (connection.ws) connection.ws.close();
+  });
+  if (!info.default_participants_supported) {
+    sys("default pair unsupported: " + info.default_participants_error, true);
+  }
+  talk.disabled = false;
+}).catch(() => sys("could not read the language set", true));
+
+document.addEventListener("visibilitychange", () => {
+  // Backgrounding a PWA suspends its AudioContext on Android. Nothing here can
+  // prevent that; the reconnect path picks the conversation back up when the
+  // page returns. Lock-screen operation needs a native client.
+  if (!document.hidden) {
+    acquireWakeLock();
+    if (connection.ws && connection.ws.readyState !== WebSocket.OPEN) {
+      connection.connect();
+    }
+  }
+});
+
+connection.connect();
+</script>
