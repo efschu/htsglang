@@ -753,6 +753,25 @@ backend indexes alongside Q/K/V is narrowed with them, and an owner rule with
 no usable mask fails loudly -- there is no correct maskless DCP write. See
 docs/dev/NOTE_472_pad_positions_dcp.md.
 
+**MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
+accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
+`kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the
+`maybe_evict_swa()` call have a closed owner register:
+`test/registered/unit/spec/test_decode_bookkeeping_ownership.py::_OWNER_SITES`.
+It is an AST scan of the whole `srt/` tree, so ANY merge that adds, removes or
+recounts such a mutation turns it red -- including merges that never touch a
+scheduler file. **A merge that introduces a new mutation site pulls
+`_OWNER_SITES` along in the SAME merge, and the entry carries the audit, not
+just the count**: under which lock/owner the mutation runs, whether it can
+advance a clock (a fast clock fires SWA eviction inside the overlap race
+window and releases the SWA prefix lock early -- the hazard the register
+exists for), and whether it shares a pool with a second worker (#444/#450).
+A site that does not survive that audit is NOT registered: it stays red and
+the defect is written up. Registering to silence the test is the one forbidden
+resolution. #496 discharged the backlog this rule was written for -- the
+dual-group lane (#274) and the kv-session-offload spill had both landed
+mutation sites without an entry.
+
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
 qwen3_coder` (server-side fix, no template patches); fast lane, priority
