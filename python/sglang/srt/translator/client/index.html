@@ -1369,6 +1369,8 @@ function renderLine(line) {
   if (line.turn_id) bubbles.set(line.turn_id, node);
 
   node.classList.toggle("uncertain", line.confidence === "uncertain");
+  // The line knows a name the button row does not: ask the session, once.
+  if (rosterLags(line)) refreshRoster();
   paintSpeaker(node, line.speaker_id, line.speaker_label);
   setSide(node, line.source_language);
   node.querySelector(".lang").textContent = line.source_language || "";
@@ -1572,6 +1574,39 @@ function renderSpeakers(speakers) {
   add.setAttribute("aria-label", "somebody new is speaking");
   add.onclick = openAddSpeakerSheet;
   row.appendChild(add);
+}
+
+/** Ask the session for the roster, coalescing a burst into one request.
+ *
+ * THE FIELD DEFECT THIS EXISTS FOR (2026-08-03): a self-introduction was
+ * applied server-side, the transcript lines came back relabelled "Matthias",
+ * and the speaker buttons underneath still said `speaker-1` until a reload.
+ * The bubbles render the line payload, which carries `speaker_label`; the
+ * button row renders the SESSION STATE, and nothing was asking for it again.
+ *
+ * The fix is deliberately not "read the name off the line": that would give
+ * the roster a second source and let the two disagree. The line is used only
+ * as a HINT that something changed -- the answer still comes from `state()`,
+ * which is the one place a name lives. It therefore also works for any server
+ * path that relabels a speaker without emitting a roster frame at all.
+ */
+let rosterRefresh = null;
+function refreshRoster() {
+  if (rosterRefresh) return;
+  rosterRefresh = setTimeout(() => {
+    rosterRefresh = null;
+    connection.sendControl({ kind: "state" });
+  }, 150);
+}
+
+/** Does this line disagree with the roster about who its speaker is? */
+function rosterLags(line) {
+  if (!line || !line.speaker_id) return false;
+  const known = knownSpeakers.find((s) => s.speaker_id === line.speaker_id);
+  if (!known) return true;                       // a voice with no button yet
+  const label = line.speaker_label || line.speaker_id;
+  const shown = known.label || known.speaker_id;
+  return label !== shown;
 }
 
 function markArmed(speakerId) {
@@ -1817,13 +1852,84 @@ function openAddSpeakerSheet() {
 // participant with an add control; the first two are the pair the bubbles are
 // sided by.
 // ---------------------------------------------------------------------------
-const catalogue = { bidirectional: [], selectable: [] };
+const catalogue = { bidirectional: [], selectable: [], all: [] };
 let slots = [];
 
+//: Flips when the server accepts a participant language it cannot speak.
+//: TODAY it cannot: `TranslatorSession.__init__` calls
+//: `conversation.validate_against(matrix)` (`session.py:370`), and that
+//: requires EVERY direction between participants (`languages.py:362-366` ->
+//: `matrix.require_pair`), which needs ASR for the source and TTS for the
+//: target. So a text-only participant does not degrade -- the session
+//: refuses to open at all. The picker therefore SHOWS every language and
+//: says exactly what is missing, rather than offering a tap that produces a
+//: dead session; this constant is the single line that opens it up once the
+//: server side lands.
+const PARTIAL_PARTICIPANTS_SUPPORTED = false;
+
+/** The picker's data source, in ONE shape, from whatever the server sends.
+ *
+ * Today the capability report carries `selectable` with `as_source` /
+ * `as_target` / `usable` / `reason`; a per-stage frame is being added on the
+ * server side. Both are folded here so the list itself never has to know
+ * which one it got -- and an explicit `stages` block, when it arrives, wins
+ * over the derived flags.
+ */
+function normalizeLanguages(info) {
+  const byCode = new Map();
+  const add = (raw, fallbackUsable) => {
+    if (!raw || !raw.code) return;
+    const stages = raw.stages || {};
+    const asr = stages.asr !== undefined ? !!stages.asr : !!raw.as_source;
+    const tts = stages.tts !== undefined ? !!stages.tts : !!raw.as_target;
+    const usable = raw.usable !== undefined ? !!raw.usable : !!fallbackUsable;
+    const previous = byCode.get(raw.code);
+    byCode.set(raw.code, {
+      code: raw.code,
+      endonym: raw.endonym || (previous && previous.endonym) || raw.code,
+      english: raw.english || (previous && previous.english) || "",
+      asr: asr || (previous ? previous.asr : false),
+      tts: tts || (previous ? previous.tts : false),
+      usable: usable || (previous ? previous.usable : false),
+      reason: raw.reason || (previous && previous.reason) || "",
+    });
+  };
+  for (const entry of info.selectable || []) add(entry, false);
+  // A bidirectional language is by definition usable in both directions, so
+  // it is folded in even if it never appeared in `selectable`.
+  for (const entry of info.bidirectional || []) {
+    add({ ...entry, as_source: true, as_target: true, usable: true }, true);
+  }
+  return Array.from(byCode.values()).sort(
+    (a, b) => a.endonym.localeCompare(b.endonym)
+  );
+}
+
+function languageEntry(code) {
+  return catalogue.all.find((entry) => entry.code === code) || null;
+}
+
 function endonymOf(code) {
-  const found = catalogue.bidirectional.find((entry) => entry.code === code)
-    || catalogue.selectable.find((entry) => entry.code === code);
+  const found = languageEntry(code);
   return (found && found.endonym) || code;
+}
+
+/** Languages this device picked before, most recent first (Google/DeepL do
+ *  this, and with a three-figure list it is the difference between two taps
+ *  and a scroll). Device-local: it is a convenience, not conversation state. */
+function recentLanguages() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("translator.recent") || "[]");
+    return Array.isArray(raw) ? raw.filter((c) => typeof c === "string") : [];
+  } catch (err) {
+    return [];
+  }
+}
+function rememberLanguage(code) {
+  try {
+    const list = [code].concat(recentLanguages().filter((c) => c !== code));
+    localStorage.setItem("translator.recent", JSON.stringify(list.slice(0, 6)));
+  } catch (err) { /* private mode; the list is a convenience */ }
 }
 
 function renderLangBar() {
@@ -1875,9 +1981,23 @@ function resideBubbles() {
   }
 }
 
+/** The language picker: every language the deployment knows, searchable.
+ *
+ * The two big buttons stay -- that is the pattern every established mobile
+ * translator settled on -- but the LIST behind them is now the full
+ * capability report rather than the bidirectional pair. At a hundred entries
+ * a plain list is unusable on a phone, so it carries what Google and DeepL
+ * carry: a search field, and the languages this device used before at the
+ * top.
+ *
+ * Nothing is hidden. A language this deployment cannot hear or cannot speak
+ * is LISTED, with the missing stage named on the row -- "text only" is a fact
+ * the user is entitled to before choosing, not a surprise afterwards.
+ */
 function openLanguageSheet(index) {
   const pane = el("pane-language");
   pane.innerHTML = "";
+
   const group = document.createElement("div");
   group.className = "group";
   const note = document.createElement("p");
@@ -1885,34 +2005,110 @@ function openLanguageSheet(index) {
     + "session, because the routing is decided when the session opens.";
   group.appendChild(note);
 
-  for (const entry of catalogue.bidirectional) {
+  const search = document.createElement("input");
+  search.type = "text";
+  search.placeholder = "search " + catalogue.all.length + " languages";
+  search.setAttribute("aria-label", "search languages");
+  search.style.margin = "8px 0";
+  group.appendChild(search);
+
+  const list = document.createElement("div");
+  group.appendChild(list);
+
+  const row = (entry, recent) => {
     const button = document.createElement("button");
-    button.className = "listrow" + (slots[index] === entry.code ? " on" : "");
+    const chosen = slots[index] === entry.code;
+    const taken = slots.indexOf(entry.code) >= 0 && !chosen;
+    const speakable = entry.tts;
+    const hearable = entry.asr;
+    // A language that cannot be a participant here is shown and explained,
+    // never silently dropped -- "es is not in the list" is unactionable.
+    const blocked = taken
+      || (!entry.usable && !PARTIAL_PARTICIPANTS_SUPPORTED);
+    button.className = "listrow" + (chosen ? " on" : "");
+    button.disabled = taken;
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = entry.endonym;
-    const code = document.createElement("span");
-    code.className = "code";
-    code.textContent = entry.code;
-    button.append(name, code);
-    button.disabled = slots.indexOf(entry.code) >= 0
-      && slots[index] !== entry.code;
-    if (button.disabled) {
-      // Greyed WITH THE REASON, the same rule the routing selects follow: a
-      // dimmed row with no explanation reads as a broken deployment.
+    name.textContent = entry.endonym
+      + (entry.english && entry.english !== entry.endonym
+         ? "  \u00b7  " + entry.english : "");
+    button.appendChild(name);
+    if (taken) {
       const why = document.createElement("span");
       why.className = "why";
       why.textContent = "already in the conversation";
-      button.insertBefore(why, code);
+      button.appendChild(why);
+    } else if (!speakable || !hearable) {
+      const why = document.createElement("span");
+      why.className = "why";
+      why.textContent = !speakable && !hearable ? "text only, and not heard"
+        : (!speakable ? "text only for this direction"
+                      : "cannot be recognised from speech");
+      button.appendChild(why);
     }
+    if (recent) {
+      const tag = document.createElement("span");
+      tag.className = "code";
+      tag.textContent = "recent";
+      button.appendChild(tag);
+    }
+    const code = document.createElement("span");
+    code.className = "code";
+    code.textContent = entry.code;
+    button.appendChild(code);
     button.onclick = () => {
+      if (blocked) {
+        // Named refusal, with the deployment's own reason. Applying it would
+        // not degrade to text -- the session would refuse to open.
+        sys(entry.endonym + " cannot be a conversation language on this "
+            + "deployment yet: " + (entry.reason || "a stage is missing")
+            + ". It is still available as a translation target in the "
+            + "language pairs.", true);
+        return;
+      }
+      rememberLanguage(entry.code);
       if (index < 0) slots.push(entry.code);
       else slots[index] = entry.code;
       closeSheet();
       applyParticipants();
     };
-    group.appendChild(button);
-  }
+    return button;
+  };
+
+  const heading = (text) => {
+    const head = document.createElement("h3");
+    head.textContent = text;
+    head.style.marginTop = "14px";
+    return head;
+  };
+
+  const paint = () => {
+    const needle = search.value.trim().toLowerCase();
+    const matches = (entry) => !needle
+      || entry.code.toLowerCase().indexOf(needle) >= 0
+      || entry.endonym.toLowerCase().indexOf(needle) >= 0
+      || String(entry.english).toLowerCase().indexOf(needle) >= 0;
+    list.innerHTML = "";
+    const shown = catalogue.all.filter(matches);
+    const recent = recentLanguages()
+      .map(languageEntry)
+      .filter((entry) => entry && matches(entry));
+    if (recent.length && !needle) {
+      list.appendChild(heading("recent"));
+      for (const entry of recent) list.appendChild(row(entry, true));
+      list.appendChild(heading("all languages"));
+    }
+    if (!shown.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No language matches " + search.value.trim() + ".";
+      list.appendChild(empty);
+      return;
+    }
+    for (const entry of shown) list.appendChild(row(entry, false));
+  };
+  search.addEventListener("input", paint);
+  paint();
+
   if (index >= 0 && slots.length > 2) {
     const remove = document.createElement("button");
     remove.className = "listrow danger";
@@ -2744,9 +2940,13 @@ function onEvent(event) {
       break;
     case "speaker.suggestion":
       chip(event);
+      // An `applied` suggestion is a rename that already happened (design
+      // 17.3b: a self-introduction applies rather than queueing). The event
+      // carries no roster, so the roster is asked for.
+      if (event.applied) refreshRoster();
       break;
     case "suggestion.applied":
-      connection.sendControl({ kind: "state" });
+      refreshRoster();
       break;
     case "speaker.deleted":
       sys("deleted " + (event.label || event.speaker_id)
@@ -2757,9 +2957,17 @@ function onEvent(event) {
     case "speaker.added":
     case "name.undone":
       applyState(event.state);
+      if (!event.state) refreshRoster();
+      break;
+    // Whatever the server side settles on for "this speaker changed", it
+    // lands here: with a roster it is applied, without one it is asked for.
+    case "speaker.updated":
+    case "speaker.renamed":
+      if (event.state) applyState(event.state);
+      else refreshRoster();
       break;
     case "speaker.named":
-      connection.sendControl({ kind: "state" });
+      refreshRoster();
       break;
     case "speaker.armed":
       markArmed(event.speaker_id);
@@ -2792,9 +3000,13 @@ function onEvent(event) {
       // A voice the row does not know yet gets a button, so the correction
       // is available on the very next utterance rather than a turn later.
       if (!knownSpeakers.some((sp) => sp.speaker_id === event.speaker_id)) {
+        // Optimistic, so the correction is available on the very next
+        // utterance -- and then reconciled against the session, which stays
+        // the only authority on who exists and what they are called.
         renderSpeakers(
           knownSpeakers.concat([{ speaker_id: event.speaker_id, label: null }])
         );
+        refreshRoster();
       }
       paintSpeaker(node, event.speaker_id, null);
       break;
@@ -2926,6 +3138,11 @@ fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
   announceFakeBackends(info.backends);
   catalogue.bidirectional = info.bidirectional || [];
   catalogue.selectable = info.selectable || [];
+  // ONE normalized list feeds the picker, whatever shape the capability
+  // report arrives in. Every language any stage knows is in it -- the picker
+  // marks what is missing rather than hiding the entry, because "es is not in
+  // the list" is unactionable and "es -- TTS cannot speak it" is not.
+  catalogue.all = normalizeLanguages(info);
   slots = (info.default_participants || []).slice();
   renderLangBar();
   if (!info.default_participants_supported) {
