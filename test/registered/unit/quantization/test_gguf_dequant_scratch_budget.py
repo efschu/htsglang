@@ -48,6 +48,22 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _MIB = 1 << 20
 _CPU = torch.device("cpu")
+_CUDA0 = torch.device("cuda", 0)
+_CUDA1 = torch.device("cuda", 1)
+
+
+def _key(dtype, device=_CPU) -> tuple:
+    """A registry key built by the PRODUCTION key function (#529).
+
+    These tests used to hand-write ``(device, dtype)`` tuples. #274 slice C
+    added a lane component in front, and the hand-written form silently stopped
+    matching: six tests here died on ``KeyError`` / a 3-vs-2 unpack for weeks
+    while saying nothing about the budget arithmetic they exist to pin.
+    Building the key through ``_dequant_ws_key`` means the next component
+    travels with them. ``torch.device("cuda", i)`` is only read for ``.type``
+    and ``.index``, so it needs no device.
+    """
+    return G._dequant_ws_key(dtype, device)
 
 
 class _CleanRegistries(CustomTestCase):
@@ -78,7 +94,7 @@ class PeakIsRecordedThroughBothRefusalsTest(_CleanRegistries):
             numel = 128 * _MIB // 2  # 128 MiB in bf16, i.e. 2x the cap
             G._reserve_dequant_workspace(numel, torch.bfloat16, _CPU)
 
-        key = (_CPU, torch.bfloat16)
+        key = _key(torch.bfloat16)
         self.assertEqual(
             G._DEQUANT_PEAK_TARGET[key],
             128 * _MIB,
@@ -126,7 +142,7 @@ class ResidualSubtractsWhatIsAlreadyHeldTest(_CleanRegistries):
         ):
             G._reserve_dequant_workspace(16 * _MIB // 2, torch.bfloat16, _CPU)
 
-        self.assertIn((_CPU, torch.bfloat16), G._DEQUANT_WS)
+        self.assertIn(_key(torch.bfloat16), G._DEQUANT_WS)
         self.assertEqual(
             G.gguf_dequant_scratch_residual_bytes(),
             0,
@@ -136,20 +152,20 @@ class ResidualSubtractsWhatIsAlreadyHeldTest(_CleanRegistries):
 
     def test_residual_is_peak_minus_held(self):
         """Stubbed workspace value: 40 MiB held against a 100 MiB peak."""
-        key = (_CPU, torch.bfloat16)
+        key = _key(torch.bfloat16)
         G._DEQUANT_PEAK_TARGET[key] = 100 * _MIB
         G._DEQUANT_WS[key] = torch.empty(40 * _MIB // 2, dtype=torch.bfloat16)
         self.assertEqual(G.gguf_dequant_scratch_residual_bytes(), 60 * _MIB)
 
     def test_max_not_sum_across_dtypes(self):
         """Over-cap dequants are transient and sequential on one stream."""
-        G._DEQUANT_PEAK_TARGET[(0, torch.bfloat16)] = 100 * _MIB
-        G._DEQUANT_PEAK_TARGET[(0, torch.float16)] = 60 * _MIB
+        G._DEQUANT_PEAK_TARGET[_key(torch.bfloat16, _CUDA0)] = 100 * _MIB
+        G._DEQUANT_PEAK_TARGET[_key(torch.float16, _CUDA0)] = 60 * _MIB
         self.assertEqual(G.gguf_dequant_scratch_residual_bytes(), 100 * _MIB)
 
     def test_device_filter_keeps_a_foreign_rank_out_of_this_budget(self):
-        G._DEQUANT_PEAK_TARGET[(0, torch.bfloat16)] = 100 * _MIB
-        G._DEQUANT_PEAK_TARGET[(1, torch.bfloat16)] = 900 * _MIB
+        G._DEQUANT_PEAK_TARGET[_key(torch.bfloat16, _CUDA0)] = 100 * _MIB
+        G._DEQUANT_PEAK_TARGET[_key(torch.bfloat16, _CUDA1)] = 900 * _MIB
         self.assertEqual(G.gguf_dequant_scratch_residual_bytes(0), 100 * _MIB)
         self.assertEqual(G.gguf_dequant_scratch_residual_bytes(1), 900 * _MIB)
 
@@ -178,7 +194,7 @@ class BudgetSiteTest(_CleanRegistries):
         return ModelRunnerKVCacheMixin._gguf_dequant_scratch_gb(runner)
 
     def test_helper_reports_the_recorded_residual_in_gib(self):
-        G._DEQUANT_PEAK_TARGET[(_CPU, torch.bfloat16)] = 2048 * _MIB
+        G._DEQUANT_PEAK_TARGET[_key(torch.bfloat16)] = 2048 * _MIB
         self.assertAlmostEqual(self._scratch_gb(self._runner()), 2.0, places=6)
 
     def test_helper_is_zero_without_gguf_layers(self):

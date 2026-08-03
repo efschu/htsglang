@@ -25,6 +25,20 @@ The end-to-end test writes a small GGUF containing MXFP4 tensors and runs the
 real iterator over it, which is the only way to check that ALL consumers --
 dense linear, stacked experts, embedding -- see Q5_0 and that no ``qweight_type``
 marker still says 39.
+
+WHICH PATH THIS FILE PINS (#529). Since #398 the shipped wheel executes MXFP4
+directly, which makes ``gguf_mxfp4_repack`` the identity -- so every assertion
+below silently stopped describing anything: the value tests failed against
+17-byte payloads that were never rewritten, and the ones that still passed
+(``test_slice_of_repack_equals_repack_of_slice``, for instance) passed
+VACUOUSLY, because slicing the identity trivially commutes with it. The repack
+is nevertheless still shipped and still reachable -- the wheel is pinned
+separately from the source, and ``SGLANG_GGUF_MXFP4_NATIVE=0`` is the standing
+A/B lever -- so this file now forces that state in-process
+(``ForcesRepackPath``) instead of inheriting whatever the wheel happens to do.
+Deterministic on every wheel, and no capability skip that would sleep forever
+on a native one. The NATIVE path -- the one this rig actually serves -- is
+pinned separately in ``test_gguf_mxfp4_native_path_529.py``.
 """
 
 from __future__ import annotations
@@ -45,6 +59,7 @@ from sglang.srt.model_loader.gguf_mxfp4_repack import (
     repacked_gguf_bytes,
     repacked_gguf_type,
 )
+from sglang.test.gguf_mxfp4_state import ForcesRepackPath
 
 MXFP4_TYPE_SIZE = 17
 Q5_0_TYPE_SIZE = 22
@@ -72,7 +87,7 @@ def _assert_dequant_identical(mxfp4_bytes: np.ndarray, name: str = "t") -> np.nd
     return q5
 
 
-class TestRepackValueExactness(unittest.TestCase):
+class TestRepackValueExactness(ForcesRepackPath, unittest.TestCase):
     """Synthetic blocks, including the ones a bridge gets wrong."""
 
     def test_random_rows_dequantize_identically(self):
@@ -129,7 +144,7 @@ class TestRepackValueExactness(unittest.TestCase):
         _assert_dequant_identical(_mxfp4_bytes(x))
 
 
-class TestRepackGatesCanFail(unittest.TestCase):
+class TestRepackGatesCanFail(ForcesRepackPath, unittest.TestCase):
     """A gate that has never failed is not known to be a gate."""
 
     def _out_of_range_block(self, e8m0: int) -> np.ndarray:
@@ -203,7 +218,7 @@ class TestRepackGatesCanFail(unittest.TestCase):
             self.assertNotIn(GGMLType.MXFP4, _supported_ggml_types())
 
 
-class TestPerExpertSplitInteraction(unittest.TestCase):
+class TestPerExpertSplitInteraction(ForcesRepackPath, unittest.TestCase):
     """The stacked ``ffn_*_exps`` tensors are split into per-expert tensors.
     A Q5_0 block is self-contained, so the split and the repack commute."""
 
@@ -268,7 +283,7 @@ def _write_synthetic_gguf(path: str) -> dict:
     return payloads
 
 
-class TestIteratorEndToEnd(unittest.TestCase):
+class TestIteratorEndToEnd(ForcesRepackPath, unittest.TestCase):
     """The real iterator over a real (small) file: no consumer sees type 39."""
 
     def test_stream_is_q5_0_everywhere_and_value_identical(self):
@@ -364,7 +379,7 @@ class TestIteratorEndToEnd(unittest.TestCase):
 
 
 @unittest.skipUnless(os.path.exists(REAL_GGUF), f"{REAL_GGUF} not present")
-class TestRealFileBlocks(unittest.TestCase):
+class TestRealFileBlocks(ForcesRepackPath, unittest.TestCase):
     """The published DeepSeek V4 Flash export, one real block at a time.
 
     Header-only reads plus a handful of bytes: the shards are memory-mapped and
