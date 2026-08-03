@@ -164,19 +164,19 @@ class InProcessQwen3Tts:
             logger.info("restored cache_position on the talker for decode steps")
 
         dtype = getattr(torch, self.config.dtype)
-        kwargs = {"dtype": dtype}
-        # device_map routes through accelerate, which this venv does not carry
-        # and which is not worth adding for a single-device tenant. On CUDA it
-        # is the convenient path; on CPU we load plainly and move afterwards.
-        if self.config.device.startswith("cuda"):
-            kwargs["device_map"] = self.config.device
+        # NO `device_map`. transformers 5.x routes it through `accelerate`
+        # (integrations/accelerate.py:134 raises without it), and accelerate is
+        # not in this venv -- deliberately, since two long-running services map
+        # that venv and it buys nothing for a single-device tenant. Loading
+        # plainly and moving afterwards is the same end state for a 0.6 B model
+        # and keeps CPU and CUDA on ONE code path, so the desk path and the
+        # window path cannot diverge.
         self._model = Qwen3TTSModel.from_pretrained(
-            str(self.config.model_dir), **kwargs
+            str(self.config.model_dir), dtype=dtype
         )
-        if not self.config.device.startswith("cuda"):
-            inner = getattr(self._model, "model", self._model)
-            if hasattr(inner, "to"):
-                inner.to(self.config.device)
+        inner = getattr(self._model, "model", self._model)
+        if hasattr(inner, "to"):
+            inner.to(self.config.device)
         # Non-persistent rotary buffers do not survive 5.x's meta-device
         # construction; unrefreshed they are NaN and the failure only surfaces
         # as a NaN probability tensor at sampling time. See

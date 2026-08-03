@@ -411,12 +411,16 @@ def refresh_rotary_buffers(model) -> int:
 
 
 def _sample_elements(tensor, count: int = 32):
+    import torch
+
     """A deterministic, cheap fingerprint of a tensor's contents."""
     flat = tensor.reshape(-1)
     if flat.numel() == 0:
-        return flat
+        return flat.detach().to("cpu", torch.float32)
     step = max(1, flat.numel() // count)
-    return flat[::step][:count].float()
+    # Always land on CPU float32: the model may be on CUDA while the
+    # checkpoint sample is read on CPU, and `allclose` across devices raises.
+    return flat[::step][:count].detach().to("cpu", torch.float32)
 
 
 def verify_and_load_weights(model, model_dir, files=("model.safetensors",)) -> Dict[str, int]:

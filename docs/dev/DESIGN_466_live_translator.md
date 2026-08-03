@@ -1598,7 +1598,33 @@ the 27B endpoint is up. Nothing else in the tenant is a stub.
    exist. Cross-language identity is fixed; within-class distinctness
    regressed and five pairs now collide. Next action is the §15b step 1 drop
    of `girl-03` / `man-06` / `woman-04`, which needs no GPU.
-2. **GPU latency.** `latency_window.py` is written and unused; window 4 held
+2. **GPU latency — FIRST WINDOW TAKEN, blocked on a device bug.** Two faults
+   found on the CUDA path, which had never been executed before (everything to
+   date ran on CPU):
+
+   * `device_map` routes through `accelerate` in transformers 5.x
+     (`integrations/accelerate.py:134` raises without it), and accelerate is
+     deliberately not in this venv. **Fixed** — the model now loads plainly and
+     is moved afterwards, which is the same end state for 0.6 B and puts CPU
+     and CUDA on ONE code path so the desk and the window cannot diverge.
+     `_sample_elements` also had to land on CPU float32, since the model is on
+     CUDA while the checkpoint sample is read on CPU and `allclose` across
+     devices raises.
+   * **STILL OPEN:** the first warm-up synthesis dies with
+     `Expected all tensors to be on the same device, but got index is on cpu,
+     different from other tensors on cuda:0 (wrapper_CUDA__index_select)`.
+     Something in the reference wrapper's prompt assembly builds an index
+     tensor without a device — it works on CPU because everything is CPU
+     there. Next step is to instrument the assembly the way
+     `probe_decode_seam.py` instrumented the decode seam and give the
+     offending tensor the model's device. This is a small, well-localised bug,
+     but it needs a card to reproduce.
+
+   The card was released cleanly rather than held while blocked (heartbeat
+   stopped BEFORE holder removal; cards verified at 0/0/0). Re-grab the holder
+   before the next attempt.
+
+   `latency_window.py` itself is unexercised beyond load; window 4 held
    all three cards for this entire session. It prints an A-vs-A floor before
    any number and is time-boxed. The MT row stays empty until the 27B is up.
 3. **MT end to end.** Start the 27B, point `--mt-base-url` at it, run one real
