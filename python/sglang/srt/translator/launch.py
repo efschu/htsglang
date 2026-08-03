@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0
 """Start the translator tenant.
 
-    python -m sglang.srt.translator.launch --asr faster-whisper --tts fake
+    python -m sglang.srt.translator.launch --asr faster-whisper --tts inprocess
 
 The process pins itself to one physical card by NVML UUID before importing any
 backend, so ``cuda:0`` is unambiguous inside it -- the same process-level
@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -42,6 +43,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asr-model", default="large-v3-turbo")
     parser.add_argument("--asr-compute-type", default="int8_float16")
     parser.add_argument("--asr-budget-mib", type=int, default=3000)
+    parser.add_argument("--asr-device", default="cuda")
+    parser.add_argument(
+        "--asr-cache",
+        type=Path,
+        default=Path("/spinning/llm_stuff/translator-models/asr-models"),
+        help="shared with the gate script; a second root re-downloads 1.5 GB",
+    )
+    parser.add_argument(
+        "--asr-lib",
+        type=Path,
+        default=Path("/spinning/llm_stuff/translator-models/asr-lib"),
+        help=(
+            "tree holding faster-whisper. APPENDED to sys.path, never "
+            "prepended: the shared serving venv must keep priority for every "
+            "package it already provides, and must not be modified at all"
+        ),
+    )
 
     parser.add_argument(
         "--tts", default="fake", choices=("fake", "inprocess"),
@@ -192,12 +210,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # ASR
     if args.asr == "faster-whisper":
+        # faster-whisper is not installed into the serving venv and must not
+        # be: two long-running services map that venv, and the wheel's
+        # dependency closure would upgrade numpy and tokenizers underneath
+        # them. It lives in its own tree, APPENDED to sys.path so the venv
+        # keeps priority for everything it already provides -- only the
+        # genuinely missing modules resolve from the tree.
+        if args.asr_lib and args.asr_lib.exists():
+            path = str(args.asr_lib)
+            if path not in sys.path:
+                sys.path.append(path)
+                logger.info("appended %s to sys.path for the recognizer", path)
+        elif args.asr_lib:
+            raise SystemExit(
+                f"--asr faster-whisper needs its library tree at {args.asr_lib}; "
+                "install it with\n"
+                f"  pip install --target {args.asr_lib} faster-whisper\n"
+                "and do NOT install it into the serving venv"
+            )
+
         from sglang.srt.translator.asr_backends import FasterWhisperAsr
 
         asr = FasterWhisperAsr(
             model=args.asr_model,
+            device=args.asr_device,
             compute_type=args.asr_compute_type,
-            download_root=config.model_root / "asr",
+            # The gate script and the tenant must share one cache: a second
+            # root silently re-downloads 1.5 GB and, worse, lets the two
+            # disagree about which revision is being measured.
+            download_root=args.asr_cache,
         )
     elif args.asr == "nemo":
         from sglang.srt.translator.asr_backends import NemoStreamingAsr
