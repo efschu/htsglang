@@ -393,6 +393,32 @@ def combine_topk_partials(partials, out, routed_scaling_factor):  # pragma: no c
     return out
 
 
+def remap_ids_host(ids_list, slot_of_needed) -> List[int]:
+    """Host-side twin of ``MoEExpertOffloadCache._remap``, flattened.
+
+    ``_remap`` is ``torch.where(ids >= 0, lut[ids.clamp(min=0)], ids)`` over the
+    LUT ``_build_lut`` fills with ``slot_of_needed`` and ``-1`` everywhere else.
+    The same answer, element for element:
+
+    * ``e < 0``  -> ``e`` (the unrouted / pad marker survives untouched, which is
+      what makes a graph-PADDED batch legal here -- #444's pad-slot family);
+    * ``e >= 0`` -> ``slot_of_needed[e]``, or ``-1`` when the id is absent from
+      the resolved set, which is exactly the value ``_build_lut`` left in that
+      LUT row.
+
+    This exists because the #462 breakable route already paid for the ids on the
+    host (the one D2H rendezvous per layer per step) and can therefore publish a
+    finished slot vector with ONE pinned H2D, instead of shipping a LUT to the
+    device and gathering there. ``_build_lut``'s two pageable H2D copies per
+    layer -- host-blocking, because ``non_blocking`` is only honoured for pinned
+    memory -- disappear with it. Pure Python over ints, so the equivalence is a
+    hermetic test rather than a GPU-window claim
+    (``tests/moe_offload/test_breakable_route_462.py``).
+    """
+    get = slot_of_needed.get
+    return [(e if e < 0 else get(e, -1)) for row in ids_list for e in row]
+
+
 @dataclass
 class ExpertResidencyPlanner:
     """Pure-python FIXED-RESIDENT + SCRATCH residency for one MoE layer.
@@ -3040,6 +3066,85 @@ class MoEExpertOffloadCache:
             R,
             path,
         )
+
+    def prepare_breakable(self, topk_ids, bridge, stage=None):
+        """#462 breakable route: the EAGER pre-replay phase, in one call.
+
+        Runs inside an ``eager_on_graph`` break -- the captured segment before
+        it has ended, the one after it has not begun -- so every host read here
+        is legal, and it re-runs on every replay through the break function the
+        decorator registers. What it must leave behind when it returns is the
+        whole contract the captured compute depends on:
+
+        1. the routed experts' bytes materialised in the FIXED slot arena
+           (``self._resident[attr]``, whose device addresses ``install()`` bound
+           into the layer's parameters and which therefore never move), and
+        2. ``bridge`` -- a static device buffer at a fixed address -- holding
+           this step's expert -> slot vector, which is the only thing the
+           captured kernels read to find out WHICH expert occupies which slot.
+
+        That is the whole of #302b: the graph addresses slots, and the mapping
+        from slot to expert is republished eagerly before every replay.
+
+        SYNC POINTS -- one host/device rendezvous, one pinned H2D, per layer per
+        step. The rendezvous is ``topk_ids.tolist()`` and it is IRREDUCIBLE on
+        this route: which rows to fetch is host knowledge by construction, and
+        MoE routing is sequential across layers (layer L+1's router consumes
+        layer L's output), so the 43 rendezvous a DeepSeek-V4-Flash step pays
+        cannot be batched into fewer. What this route does remove is the eager
+        path's ``_build_lut`` pair of PAGEABLE H2D copies per layer, which block
+        the host because ``non_blocking`` is honoured only for pinned memory:
+        3 host-blocking crossings per layer become 1 rendezvous + 1 pinned copy.
+        See ``docs/dev/DESIGN_462_breakable_route.md`` §4.
+
+        ``stage`` is the pinned host mirror of ``bridge``, owned by the same
+        arena entry so no two bridges can ever share one; ``None`` selects the
+        CPU desk path, where ``bridge`` is host memory and is filled directly.
+        """
+        import numpy as np
+
+        ids_list = topk_ids.tolist()  # SYNC POINT 1/1: the D2H rendezvous.
+        self._observe_routing(ids_list)
+
+        needed = sorted({e for row in ids_list for e in row if e >= 0})
+        # Fixed-shape invariant, checked BEFORE resolve() so a refusal does not
+        # move a forward counter and the message can name the real numbers. A
+        # captured segment cannot wave-split: its work is fixed at capture time,
+        # so an overflow here is a wrong answer, not a slow one.
+        spill = self.planner.split_needed(needed)[1]
+        if len(spill) > self.scratch:
+            from sglang.srt.layers.moe.breakable_offload import (
+                BreakableScratchOverflow,
+            )
+
+            raise BreakableScratchOverflow(
+                layer_id=getattr(self.layer, "layer_id", None),
+                spill=len(spill),
+                scratch=self.scratch,
+                routed_slots=int(topk_ids.numel()),
+                cold=self.num_local_experts - self.resident_count,
+            )
+
+        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+
+        # Publish the slot vector BEFORE issuing the fetch. The copy below is
+        # deliberately BLOCKING: a non_blocking copy out of a reused pinned
+        # staging buffer is only safe if the DMA lands before the next write to
+        # that buffer, and an ordering rule that lives in a comment is the
+        # shared-buffer family this fork keeps rediscovering (htccl
+        # _get_out_buf, GraphSharedOutput, _DEQUANT_WS). Blocking makes it safe
+        # by construction. It is issued here, ahead of _fetch, so it waits only
+        # on an already-drained stream (the tolist() above drained it) rather
+        # than on this step's expert DMAs; the payload is tokens x top_k ints.
+        flat = remap_ids_host(ids_list, slot_of_needed)
+        if stage is None:
+            np.asarray(bridge.reshape(-1))[:] = flat
+        else:
+            np.asarray(stage)[:] = flat
+            bridge.reshape(-1).copy_(stage, non_blocking=False)
+
+        self._fetch(fetch_plan)
+        return bridge
 
     def _observe_routing(self, ids_list):
         """Fold one forward's host-side routing decision into the instruments

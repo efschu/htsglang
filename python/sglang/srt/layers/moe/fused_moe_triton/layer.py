@@ -654,28 +654,50 @@ class FusedMoE(torch.nn.Module):
         # stays in-tree behind the refusal; SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE=1
         # re-opens it for a card window. Nothing on the default path reaches the
         # call: it needs fraction < 1.0 AND the opt-in env.
-        from sglang.srt.layers.moe.offload_capture_gate import resolve_graph_mode
+        # #462 adds a THIRD outcome to that same selection point: `breakable`.
+        # It keeps the fetch eager -- the whole economy of the offload is moving
+        # only the miss -- and captures the compute around it, with the graph
+        # addressing fixed SLOTS whose occupant the eager phase republishes
+        # before every replay. That is the one shape #452 did not refute.
+        from sglang.srt.layers.moe.offload_capture_gate import (
+            MODE_BREAKABLE,
+            MODE_CAPTURABLE,
+            resolve_offload_graph_mode,
+            validate_breakable_boot,
+        )
 
-        self._moe_offload_graph_mode = resolve_graph_mode(
+        self._moe_offload_mode = resolve_offload_graph_mode(
             self._expert_offload_fraction,
             envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get(),
             self.layer_id,
         )
+        self._moe_offload_graph_mode = self._moe_offload_mode == MODE_CAPTURABLE
+        self._moe_offload_breakable = self._moe_offload_mode == MODE_BREAKABLE
+        # Per-layer bridge-buffer registry for the breakable route; built on the
+        # first captured forward, never on the default path.
+        self._moe_offload_arena = None
+        if self._moe_offload_breakable:
+            validate_breakable_boot(self._expert_offload_fraction, self.layer_id)
         if self._moe_offload_enabled:
             try:
                 _disable_cg = bool(get_server_args().disable_cuda_graph)
             except Exception:
                 _disable_cg = True  # server args not wired (unit/test context)
-            if not _disable_cg and not self._moe_offload_graph_mode:
+            _graph_ok = self._moe_offload_graph_mode or self._moe_offload_breakable
+            if not _disable_cg and not _graph_ok:
                 raise RuntimeError(
                     "MoE expert-offload / routing-trace "
                     "(SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 or "
                     "SGLANG_MOE_OFFLOAD_TRACE) requires --disable-cuda-graph: "
                     "the per-forward expert residency plan is data-dependent and "
                     "cannot be captured into a CUDA graph. Re-launch with "
-                    "--disable-cuda-graph, or opt in to the capturable offload "
-                    "decode path with SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 "
-                    "(requires offload fraction < 1.0)."
+                    "--disable-cuda-graph, or select an offload graph mode with "
+                    "SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable (eager fetch before "
+                    "replay, compute captured; needs "
+                    "--cuda-graph-backend-decode=breakable and "
+                    "--cuda-graph-backend-prefill=disabled). "
+                    "SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 selects the in-graph fetch "
+                    "instead, which is REFUTED on hardware (#452)."
                 )
             if self._moe_offload_graph_mode and envs.SGLANG_MOE_HOT_RESIDENCY.get():
                 # §5 fail-fast: live calibration cannot be frozen pre-capture.
@@ -2152,6 +2174,18 @@ class FusedMoE(torch.nn.Module):
             if self._expert_offload is None:  # install declined / failed
                 return _apply(dispatch_output)
 
+        # #462 breakable decode: inside a breakable-graph window, split the
+        # graph at the fetch. The eager phase (host plan + H2D into the fixed
+        # slot arena + one pinned publish of the slot vector) runs in the break;
+        # the segment after it captures the apply, reading slot addresses only.
+        # Prefill is NOT captured under this mode (validate_breakable_boot
+        # requires --cuda-graph-backend-prefill=disabled), so prefill forwards
+        # fall through to run_waves and keep their wave splitting.
+        if self._moe_offload_breakable and get_is_capture_mode():
+            return self._run_moe_core_offload_breakable(
+                dispatch_output, topk_output, topk_ids, _apply
+            )
+
         # Stage-3 captured decode: under graph capture (and the opt-in), take
         # the host-sync-free capturable path -- on-device remap + captured UVA
         # gather + a SINGLE-wave apply. Everything else (prefill, eager decode,
@@ -2165,6 +2199,58 @@ class FusedMoE(torch.nn.Module):
         # the full batch) and the multi-wave prefill-overflow path (disjoint
         # token subsets, each fully computed once -> byte-identical accumulation).
         return self._expert_offload.run_waves(dispatch_output, _apply)
+
+    def _run_moe_core_offload_breakable(
+        self, dispatch_output, topk_output, topk_ids, apply_fn
+    ):
+        """#462 breakable decode step: eager fetch in a graph break, then ONE
+        captured apply that addresses slots.
+
+        The three lines below are the whole route, and the order is the
+        contract:
+
+        1. ``breakable_moe_offload_fetch`` is ``eager_on_graph``-decorated, so
+           calling it ENDS the segment captured so far, runs the fetch eagerly,
+           registers that same fetch as a break function re-run before every
+           replay, and opens a fresh segment.
+        2. the bridge is read back off the arena -- by the same shape key the
+           fetch just used, so it is the identical buffer, not a copy -- and
+           carries this step's expert -> slot vector at a FIXED address.
+        3. ``apply_fn`` is captured into the fresh segment. Everything it reads
+           is address-stable: the ``[R+C]``-slot arena ``install()`` bound into
+           the layer's parameters, and the bridge.
+
+        #302c EXTENSION POINT (per-expert runtime dispatch), named here so it is
+        not rediscovered as a surprise: a contribution computed OUTSIDE this
+        graph -- on CPU, or on the remote lane of ``NOTE_453`` -- cannot be a
+        graph tensor, so it has to be added into the layer's weighted sum after
+        the replay that needed it. The seam is deliberately left open: the
+        dispatch DECISION is host knowledge available in step 1 (it decides
+        routing, not arithmetic), so a future #302c writes its verdict into the
+        bridge -- marking a foreign-dispatched expert with a slot the captured
+        apply treats as contributing zero -- and adds the foreign result at a
+        SECOND break placed after this apply. Nothing here forecloses that: the
+        combine stays a plain sum over slot outputs, and the bridge is the one
+        channel between the eager decision and the captured compute.
+        See ``docs/dev/DESIGN_462_breakable_route.md`` §5.
+        """
+        from sglang.srt.layers.moe.breakable_offload import (
+            BreakableOffloadArena,
+            breakable_moe_offload_fetch,
+        )
+
+        cache = self._expert_offload
+        if self._moe_offload_arena is None:
+            self._moe_offload_arena = BreakableOffloadArena(self.layer_id)
+        arena = self._moe_offload_arena
+
+        breakable_moe_offload_fetch(cache, arena, topk_ids)
+        bridge = arena.bridge_for(topk_ids)
+
+        sub = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=bridge.buf)
+        )
+        return apply_fn(sub)
 
     def _run_moe_core_offload_capturable(
         self, dispatch_output, topk_output, topk_ids, apply_fn

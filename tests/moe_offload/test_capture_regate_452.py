@@ -166,8 +166,13 @@ def test_the_layer_selects_the_mode_through_this_gate():
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     src = inspect.getsource(FusedMoE.__init__)
-    assert "resolve_graph_mode(" in src
-    assert "self._moe_offload_graph_mode = resolve_graph_mode(" in src
+    # #462 widened the gate to three outcomes, so the layer now calls
+    # resolve_offload_graph_mode() and derives the capturable boolean from it.
+    # The property this pins is unchanged: the mode is decided in the gate
+    # module, never inline in the layer.
+    assert "resolve_offload_graph_mode(" in src
+    assert "self._moe_offload_mode = resolve_offload_graph_mode(" in src
+    assert "self._moe_offload_graph_mode = self._moe_offload_mode == MODE_CAPTURABLE" in src
     # ...and the inline expression it replaced is gone, so a half-revert that
     # leaves both in place (the #444 lesson: a revert must be complete) is red
     # too.
