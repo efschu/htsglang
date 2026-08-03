@@ -402,6 +402,23 @@ source, parse-time refusal); canonical `--speculative-draft-model-path`.
 Tree-spec topk>1 under DCP is HARD-GATED (silently wrong + perf-negative — do
 not re-attempt without new evidence; see rejected register).
 
+Draft-solo placement now admits the whole DFLASH FAMILY (#470): DSPARK joins
+DFLASH because it has the same shape — self-drafting block model, token-id
+round output, post-all-reduce hidden-state input — and its one delta, the
+confidence head's per-request block truncation, rides the SAME per-round
+broadcast as one extra integer per request (`dspark_components/dspark_solo.py`
+packs ids + lengths into one int64 tensor, so the round still costs one
+collective). `FROZEN_KV_MTP` stays refused and is pinned by a test: its draft
+reads the target KV in place, which no single rank holds. Solo DSpark v1 is
+greedy-acceptance-only (a non-greedy round would need `[bs, gamma, vocab]`
+corrected logits on every verifying rank) and switches the default-on
+`SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD` off, with reasons logged rather than
+inferred. `--speculative-moe-runner-backend` (the existing per-draft flag) now
+actually reaches DFLASH/DSPARK draft builds, which is what puts an MXFP4
+DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **DESK-WRITTEN — no DSpark arm
+has booted; `docs/dev/TICKET_470_dspark_boots.md` is the only evidence path,
+and its Boot A prices the ~21 % rank-0 residency cut the arm costs.**
+
 ## 5. Multi-group runtime (dual lane)
 Slices A-D merged: lane-correct context overlays (~370 callsites), own thread +
 high-priority stream, lend/reclaim in ms, SM-contention pairing rule,

@@ -224,6 +224,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        solo_mirror=None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -232,6 +233,8 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # Draft-solo placement only (None on the default 'split' path).
+        self._solo_mirror = solo_mirror
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -358,7 +361,18 @@ class DraftBlockProposer:
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
-        if not draft_owns_embed:
+        if self._solo_mirror is not None and draft_owns_embed:
+            # Draft-solo: the draft's own forward_embed calls the TARGET's
+            # vocab-parallel embedding, i.e. an all_reduce -- inside the draft
+            # forward, which may be a captured graph and which the shadow ranks
+            # never run. Hoist it out so the shadows enter the same collective
+            # from their mirror, and hand the result in as input_embeds.
+            hc_mult = int(self.draft_model.hc_mult)
+            flat_embed = self._solo_mirror.embed_block(
+                embed_module, draft_block_ids.flatten()
+            )
+            draft_input_embeds = flat_embed.unsqueeze(1).repeat(1, hc_mult, 1)
+        elif not draft_owns_embed:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 

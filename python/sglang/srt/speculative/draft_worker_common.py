@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context, get_server_args
@@ -53,6 +54,48 @@ def _resolve_draft_attention_backend_fallback(
     return draft_backend
 
 
+def _refuse_unsupported_speculative_moe_backend(
+    *, server_args: ServerArgs, algo_label: str
+) -> None:
+    """Refuse a draft MoE runner backend this rank's card cannot run, by name.
+
+    The kernel-level gate exists already, but it fires deep inside
+    ``process_weights_after_loading`` as a bare
+    ``RuntimeError("MXFP4 Marlin requires SM90 or SM120.")`` -- after the
+    weights are on the card and with nothing said about which rank, which
+    flag, or what to do. Under draft-solo placement the answer is usually
+    "put the draft on the SM120 card", which is a placement flag away, so the
+    refusal names it.
+
+    Deliberately per-rank: a heterogeneous group (this rig is sm120 + 2x sm86)
+    has different answers on different ranks, and only the ranks that actually
+    build draft weights are affected -- a solo SHADOW builds on the ``meta``
+    device and never reaches a kernel.
+    """
+    from sglang.srt.layers.moe.utils import get_speculative_moe_runner_backend
+
+    if not torch.cuda.is_available():
+        return
+    backend = get_speculative_moe_runner_backend()
+    if not backend.is_marlin():
+        return
+    from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
+
+    if is_sm90_supported() or is_sm120_supported():
+        return
+    major, minor = torch.cuda.get_device_capability()
+    raise ValueError(
+        f"--speculative-moe-runner-backend marlin is not runnable on this "
+        f"rank's GPU (compute capability {major}.{minor}, device "
+        f"{torch.cuda.get_device_name()!r}): the MXFP4 Marlin MoE kernel "
+        f"needs SM90 or SM120. The {algo_label} draft would load and then die "
+        "in process_weights_after_loading. On a heterogeneous group, put the "
+        "whole draft on the capable card with "
+        "--speculative-draft-placement solo --speculative-draft-gpu <index>; "
+        "otherwise choose a runner backend all ranks can run."
+    )
+
+
 def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
@@ -93,20 +136,35 @@ def build_draft_tp_worker(
         context_length=target_model_config.context_len,
     )
 
+    _refuse_unsupported_speculative_moe_backend(
+        server_args=server_args, algo_label=algo_label
+    )
+
     saved_server_args = get_server_args()
     try:
-        draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-        )
+        # --speculative-moe-runner-backend applies to the DRAFT model's MoE
+        # layers. The EAGLE-family workers already enter this context around
+        # their model build; the self-drafting block models (DFLASH / DSPARK)
+        # did not, so their draft silently inherited the TARGET's runner
+        # backend. That is load-bearing for a DSpark head whose routed experts
+        # are MXFP4: Mxfp4MarlinMoEMethod is selected from
+        # get_moe_runner_backend() at get_quant_method time (fp8.py), i.e.
+        # inside this build, and a GGUF target's backend is not marlin.
+        # Extending the existing flag rather than adding a draft-specific one
+        # is deliberate (#382 canonical-flag rule).
+        with speculative_moe_backend_context():
+            draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+            )
     finally:
         get_context().set_server_args(saved_server_args)
 

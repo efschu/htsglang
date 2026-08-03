@@ -7119,19 +7119,43 @@ class ServerArgs:
         # DFLASH. DFLASH goes solo cleanly because its draft is a self-drafting
         # block model built weight-TP=1 on the host (heads%tp never binds at
         # tp=1) whose per-round output is a fixed block of token ids -- exactly
-        # the one-broadcast-per-round contract. STANDALONE / NGRAM / DSPARK are
-        # still unsupported.
-        if not (algo.is_eagle() or algo.is_dflash()):
+        # the one-broadcast-per-round contract.
+        #
+        # v3 scope adds DSPARK (#470). It is the same SHAPE as DFLASH: a
+        # self-drafting semi-autoregressive block model whose round output is a
+        # block of token ids, with the Markov head chaining positions INSIDE
+        # the draft graph, and whose target-hidden-state input (main_proj over
+        # the captured target layers) is post-all-reduce and therefore already
+        # replicated on every rank -- so the solo host has everything it needs.
+        # The one delta versus DFLASH is that DSpark's confidence head
+        # truncates the block early, so the block LENGTH is a runtime value:
+        # the per-round payload carries it next to the ids, one integer per
+        # request (speculative/dspark_components/dspark_solo.py). That is a
+        # wider payload, not a second collective -- the contract holds.
+        #
+        # DSPARK was on this refusal list as UNREVIEWED SCOPE, not as an
+        # architectural exclusion; contrast FROZEN_KV_MTP two branches above,
+        # which carries a physical reason and stays. STANDALONE / NGRAM remain
+        # unsupported.
+        #
+        # Two DSpark-specific limits are enforced closer to the runtime, where
+        # the message can name the actual state (dspark_solo.py): greedy
+        # acceptance only (a non-greedy round would need the draft's corrected
+        # logits [bs, gamma, vocab] on every verifying rank), and
+        # SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD off (it all-gathers a markov_w2
+        # shard the shadows do not have).
+        if not (algo.is_eagle() or algo.is_dflash_family()):
             raise ValueError(
                 "--speculative-draft-placement solo supports the EAGLE-family "
-                "v2 worker (EAGLE / EAGLE3 / NEXTN) and DFLASH only; got "
-                f"--speculative-algorithm={self.speculative_algorithm} "
-                "(STANDALONE / NGRAM / DSPARK are not yet supported)."
+                "v2 worker (EAGLE / EAGLE3 / NEXTN), DFLASH and DSPARK only; "
+                f"got --speculative-algorithm={self.speculative_algorithm} "
+                "(STANDALONE / NGRAM are not yet supported)."
             )
-        # DFLASH is inherently greedy-block and non-adaptive; the EAGLE-only
-        # guards below (topk trees, rejection sampling, multi-layer eagle) do
-        # not apply to it, so return after the pure-TP / single-node checks.
-        _algo_is_dflash = algo.is_dflash()
+        # DFLASH and DSPARK are inherently greedy-block and non-adaptive; the
+        # EAGLE-only guards below (topk trees, rejection sampling, multi-layer
+        # eagle) do not apply to them, so return after the pure-TP /
+        # single-node checks.
+        _algo_is_dflash = algo.is_dflash_family()
         if not _algo_is_dflash and self.enable_multi_layer_eagle:
             raise ValueError(
                 "--speculative-draft-placement solo does not support "
@@ -7158,13 +7182,15 @@ class ServerArgs:
                 "per-step draft PROBABILITIES on every verifying rank. Use "
                 "threshold acceptance, or placement 'split'."
             )
-        # DFLASH is non-adaptive by construction; reject the combination
-        # up front rather than silently ignoring the adaptive controller.
+        # The DFLASH family is non-adaptive by construction; reject the
+        # combination up front rather than silently ignoring the adaptive
+        # controller.
         if _algo_is_dflash and getattr(self, "speculative_adaptive", False):
             raise ValueError(
-                "--speculative-draft-placement solo with DFLASH does not "
-                "support --speculative-adaptive (DFLASH drafts a fixed block; "
-                "adaptive step control is EAGLE-only)."
+                "--speculative-draft-placement solo with "
+                f"{self.speculative_algorithm} does not support "
+                "--speculative-adaptive (the DFLASH family drafts a fixed "
+                "block; adaptive step control is EAGLE-only)."
             )
         # Pure single-node TP only.
         if self.dp_size > 1 or self.enable_dp_attention:

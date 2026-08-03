@@ -5,6 +5,7 @@ from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -27,6 +28,31 @@ def gather_and_crop_vocab(
 ) -> torch.Tensor:
     full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
+
+
+def logits_from_normed_hidden(
+    x: torch.Tensor,
+    *,
+    lm_head: nn.Module,
+    use_fp32_lm_head: bool,
+    skip_vocab_gather: bool,
+) -> torch.Tensor:
+    """Vocab logits from already-normed hidden states.
+
+    Factored out of ``DeepseekV4ForCausalLMDSpark._logits_from_x_post_hc`` so
+    that draft-solo SHADOW ranks -- which own an lm_head vocab shard but no
+    draft weights, and therefore cannot reach the normed hidden states
+    themselves -- enter the same all_gather with the same arithmetic as the
+    host. Two implementations of this tail would be two chances to diverge.
+    """
+    weight = lm_head.weight
+    if use_fp32_lm_head:
+        local_logits = F.linear(x.float(), weight.float())
+    else:
+        local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+    if skip_vocab_gather:
+        return local_logits
+    return gather_and_crop_vocab(local_logits, lm_head)
 
 
 def run_markov_block(
