@@ -3586,6 +3586,44 @@ def _config_quant_bpp(cfg: dict, is_moe: bool) -> Optional[Dict[str, float]]:
     return out or None
 
 
+#: Weight-family shards the ATTENTION/GDN family vector drives (#485). The
+#: vision tower ("gdn_base") rides along because its runtime actuator is the
+#: same base plan -- see ``PerfCostModel._shard_fractions``. "mlp"/"even"/
+#: "replicated"/"solo_host" are unaffected by that vector by construction.
+_ATTN_VECTOR_SHARDS = ("attn", "gdn", "gdn_base")
+
+
+def _with_attn(fn, *args, attn_vector=None):
+    """Call ``fn(*args)`` when there is no #485 attention vector, and
+    ``fn(*args, attn_vector)`` when there is.
+
+    Same reason as ``_shard_fractions_of``: the cost model's public surface is
+    monkey-patched and duck-typed in several suites (``test_perf_tune_targets``
+    replaces ``predict_capacity`` with a two-argument stand-in to shave the
+    predicted context, ``test_energy_boot`` binds a minimal object), and those
+    stand-ins carry the pre-#485 signature. Passing the extra argument only
+    when it is meaningful keeps them working AND guarantees that a solve with
+    no attention vector executes the identical call the pre-#485 tree made.
+    """
+    return fn(*args) if attn_vector is None else fn(*args, attn_vector)
+
+
+def _shard_fractions_of(model, shard, mlp_vector, attn_vector):
+    """``model._shard_fractions`` with the #485 attention vector applied.
+
+    Dispatched through a free function rather than a plain call because the
+    prefill arithmetic below is duck-typed: several tests bind
+    ``PerfCostModel.per_family_prefill_compute_times`` (and friends) to a
+    stand-in that provides only ``(tp_size, families, _shard_fractions)``, and
+    those stand-ins define the pre-#485 two-argument signature. Passing the
+    third argument ONLY when a vector is actually in play keeps every such
+    caller working and keeps the no-vector path byte-identical.
+    """
+    if attn_vector is None:
+        return model._shard_fractions(shard, mlp_vector)
+    return model._shard_fractions(shard, mlp_vector, attn_vector)
+
+
 class PerfCostModel:
     """Parse-time capacity/speed predictor for MLP-vector candidates.
 
@@ -4060,10 +4098,29 @@ class PerfCostModel:
                 families[name].bytes_per_param = bpp
         return families
 
-    def _shard_fractions(self, shard: str, mlp_vector: List[int]) -> List[float]:
+    def _shard_fractions(
+        self,
+        shard: str,
+        mlp_vector: List[int],
+        attn_vector: Optional[List[int]] = None,
+    ) -> List[float]:
         from sglang.srt.distributed.utils import partition_units
 
         n = self.tp_size
+        # #485: the attention/GDN families carry their OWN weight vector when
+        # one is passed. ``None`` means "follow the base plan", which is what
+        # every caller outside the joint phase-prefill solve passes, so those
+        # paths stay byte-identical.
+        #
+        # The actuator for a non-None vector is ``--rank-tp-ratio``: at runtime
+        # attention, GDN, the vision tower and the draft's attention shadow all
+        # read the BASE plan (only "mlp" is a named family plan today, see
+        # distributed/utils._TP_PARTITION_FAMILIES). So a candidate attention
+        # vector is installed by re-pointing the base plan, and everything the
+        # base plan drives moves with it -- which is why the vision family is
+        # priced on it here too. The model must price the layout a flag can
+        # actually install, not a layout that would need a runtime change.
+        attn_plan = list(attn_vector) if attn_vector else self.base_plan
         if shard == "even":
             return [1.0 / n] * n
         if shard == "replicated":
@@ -4087,16 +4144,16 @@ class PerfCostModel:
                 # ranks. Only reached when attn_units < tp -- the classic
                 # kv_heads>=tp path is untouched (byte-identical).
                 grid = max(self.q_heads, n)
-            units = partition_units(grid, self.base_plan)
+            units = partition_units(grid, attn_plan)
             return [u / grid for u in units]
         if shard in ("gdn", "gdn_base"):
             # vision ("gdn_base") has no own family vector; it follows the
             # base plan on a fine grid -> approximate with exact proportion.
             if shard == "gdn" and self.gdn_units >= n:
-                units = partition_units(self.gdn_units, self.base_plan)
+                units = partition_units(self.gdn_units, attn_plan)
                 return [u / self.gdn_units for u in units]
-            total = float(sum(self.base_plan))
-            return [w / total for w in self.base_plan]
+            total = float(sum(attn_plan))
+            return [w / total for w in attn_plan]
         if shard == "mlp":
             units = partition_units(self.mlp_units, mlp_vector)
             return [u / self.mlp_units for u in units]
@@ -4107,19 +4164,25 @@ class PerfCostModel:
 
         return partition_units(self.mlp_units, mlp_vector)
 
-    def gdn_unit_partition(self) -> List[int]:
+    def gdn_unit_partition(
+        self, attn_vector: Optional[List[int]] = None
+    ) -> List[int]:
         from sglang.srt.distributed.utils import partition_units
 
         if self.gdn_units >= self.tp_size:
-            return partition_units(self.gdn_units, self.base_plan)
+            return partition_units(
+                self.gdn_units, list(attn_vector) if attn_vector else self.base_plan
+            )
         return [0] * self.tp_size
 
-    def per_rank_weight_bytes(self, mlp_vector: List[int]) -> List[float]:
+    def per_rank_weight_bytes(
+        self, mlp_vector: List[int], attn_vector: Optional[List[int]] = None
+    ) -> List[float]:
         totals = [0.0] * self.tp_size
         for fam in self.families.values():
             if fam.params <= 0:
                 continue
-            fracs = self._shard_fractions(fam.shard, mlp_vector)
+            fracs = _shard_fractions_of(self, fam.shard, mlp_vector, attn_vector)
             for r in range(self.tp_size):
                 totals[r] += fam.bytes * fracs[r]
         return totals
@@ -4149,7 +4212,9 @@ class PerfCostModel:
         fracs = self._shard_fractions(fam.shard, mlp_vector)
         return [fam.bytes * fracs[r] * routed_frac for r in range(self.tp_size)]
 
-    def _mamba_pool_bytes(self) -> List[float]:
+    def _mamba_pool_bytes(
+        self, attn_vector: Optional[List[int]] = None
+    ) -> List[float]:
         """Per-rank mamba/SSM pool bytes (state pool + spec-decode
         intermediate), the M22 "SSM pool moves with GDN units" term. Sized
         like the auto-mamba demand path: slots = ceil(target * ratio * 1.25),
@@ -4178,8 +4243,26 @@ class PerfCostModel:
         d = self.spec_draft_tokens if self.spec_active else 0
         eff_slots = slots + min(target, slots // ratio) * d
 
-        gdn_units = self.gdn_unit_partition()
+        gdn_units = self.gdn_unit_partition(attn_vector)
         return [per_req_per_unit * u * eff_slots for u in gdn_units]
+
+    def mamba_pool_bytes_for(
+        self, attn_vector: Optional[List[int]] = None
+    ) -> List[float]:
+        """Per-rank mamba/SSM pool bytes under a candidate attention/GDN
+        vector (#485). Returns the cached base-plan value when no vector is
+        given, so every pre-#485 caller reads the identical list object's
+        contents and never re-runs the arithmetic.
+
+        The pool "sticks to the rank" that owns the GDN units (ANALYSE_299
+        §"GDN state moves with the units", ~4.7 MiB per request per unit on
+        the reference rig), so a joint cut that concentrates GDN also
+        concentrates this pool -- which is precisely the VRAM term that makes
+        the attention lever cheap on paper and expensive in a boot.
+        """
+        if attn_vector is None:
+            return self.mamba_pool_bytes
+        return self._mamba_pool_bytes(list(attn_vector))
 
     # -- capacity prediction ------------------------------------------------
 
@@ -4237,17 +4320,25 @@ class PerfCostModel:
         p[self.solo_rank] = ctx - q
         return p
 
-    def predict_capacity(self, mlp_vector: List[int]) -> dict:
+    def predict_capacity(
+        self, mlp_vector: List[int], attn_vector: Optional[List[int]] = None
+    ) -> dict:
         """Predicted per-rank KV token capacity P_r and max context for a
-        candidate MLP vector (the base plan's attention/GDN/DCP splits are
-        held fixed -- decode is flat across splits per M22, so they are not
-        levers). Same math family as the pool sizing: budget minus weight
-        bytes minus mamba pool minus reserves, divided by the full-kv-head
-        cell; context C = min_r(P_r/ratio_r) * sum(ratios), whose converged
-        optimum is min(sum_r P_r, 64 * min_r P_r)."""
+        candidate MLP vector. Same math family as the pool sizing: budget
+        minus weight bytes minus mamba pool minus reserves, divided by the
+        full-kv-head cell; context C = min_r(P_r/ratio_r) * sum(ratios), whose
+        converged optimum is min(sum_r P_r, 64 * min_r P_r).
+
+        ``attn_vector`` (#485) prices a JOINT candidate: the attention, GDN
+        and vision families follow it instead of the base plan, and the
+        mamba/SSM pool follows the GDN units it implies. ``None`` holds the
+        base plan's attention/GDN/DCP splits fixed, which is the pre-#485
+        behaviour and stays byte-identical.
+        """
         from sglang.srt.distributed.utils import partition_units
 
-        weights = self.per_rank_weight_bytes(mlp_vector)
+        weights = self.per_rank_weight_bytes(mlp_vector, attn_vector)
+        mamba = self.mamba_pool_bytes_for(attn_vector)
         if self.measured is not None:
             # MEASURED budget model (registry-backed, cross/solo planning):
             # every non-weight post is a measured value from the previous
@@ -4296,7 +4387,7 @@ class PerfCostModel:
                     total_share
                     - float(c["residual_residency_bytes"])
                     - (weights[r] + self.measured_weight_bias[r])
-                    - float(c["mamba_aux_pool_bytes"])
+                    - self._measured_mamba_aux_bytes(c, r, attn_vector)
                     - float(c["required_free_bytes"])
                 )
         else:
@@ -4329,11 +4420,7 @@ class PerfCostModel:
                     else 0.0
                 )
                 free_bytes.append(
-                    budget
-                    - weights[r]
-                    - self.mamba_pool_bytes[r]
-                    - overhead
-                    - extra
+                    budget - weights[r] - mamba[r] - overhead - extra
                 )
         if self.solo_active:
             p = self._solo_rank_token_capacity(free_bytes)
@@ -4357,12 +4444,33 @@ class PerfCostModel:
             "weights_gib": [w / 2**30 for w in weights],
         }
 
+    def _measured_mamba_aux_bytes(self, component, rank, attn_vector) -> float:
+        """The measured mamba/aux pool of one rank, re-scaled to a candidate
+        attention/GDN vector (#485).
+
+        The measured post was recorded under the BASE plan's GDN units. It is
+        constant across MLP candidates -- which is why the pre-#485 code read
+        it straight -- but not across GDN candidates: the state pool is
+        per-unit. Scaling by the unit ratio is exact for the state term and
+        approximate only for whatever fixed aux bytes ride in the same post.
+        ``attn_vector=None`` returns the recorded value unchanged.
+        """
+        measured = float(component["mamba_aux_pool_bytes"])
+        if attn_vector is None or measured <= 0:
+            return measured
+        base_units = self.gdn_unit_partition()
+        cand_units = self.gdn_unit_partition(attn_vector)
+        if base_units[rank] <= 0:
+            return measured
+        return measured * cand_units[rank] / base_units[rank]
+
     def residual_free_mib(
         self,
         mlp_vector: List[int],
         device_total_mib: Sequence[int],
         ranks_on_gpu: Sequence[int],
         kv_token_vector: Sequence[int],
+        attn_vector: Optional[List[int]] = None,
     ) -> List[float]:
         """Per-rank VRAM (MiB) a candidate leaves UNALLOCATED after the pools.
 
@@ -4393,7 +4501,9 @@ class PerfCostModel:
         only ever counts a candidate that pushes a rank from above that
         demand to below it.
         """
-        pred = self.predict_capacity(list(mlp_vector))
+        pred = _with_attn(
+            self.predict_capacity, list(mlp_vector), attn_vector=attn_vector
+        )
         p = pred["p"]
         vec = [max(int(v), 1) for v in kv_token_vector]
         unit = min(x / v for x, v in zip(p, vec))
@@ -4408,14 +4518,16 @@ class PerfCostModel:
 
     # -- speed prediction ---------------------------------------------------
 
-    def streamed_bytes(self, mlp_vector: List[int]) -> List[float]:
+    def streamed_bytes(
+        self, mlp_vector: List[int], attn_vector: Optional[List[int]] = None
+    ) -> List[float]:
         """Per-rank weight bytes STREAMED per decode token (bs=1 decode is
         weight-bandwidth-bound; replicated families stream on every rank)."""
         totals = [0.0] * self.tp_size
         for fam in self.families.values():
             if fam.params <= 0:
                 continue
-            fracs = self._shard_fractions(fam.shard, mlp_vector)
+            fracs = _shard_fractions_of(self, fam.shard, mlp_vector, attn_vector)
             for r in range(self.tp_size):
                 totals[r] += fam.bytes * fracs[r]
         return totals
@@ -4504,12 +4616,18 @@ class PerfCostModel:
         mlp_vector: List[int],
         membw_gbs: Sequence[float],
         gemv_gbs: Optional[Sequence[float]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> float:
         """Relative bs=1 decode round time: the lockstep max over ranks of
         (streamed weight bytes / effective bandwidth). Only ratios between
-        candidates are consumed."""
+        candidates are consumed.
+
+        ``attn_vector`` (#485) is REPORTING-ONLY in this slice: the decode
+        solve never passes one, so its own candidate ranking is untouched.
+        It exists so the decode cost printed next to a JOINT prefill pair is
+        the cost of that pair rather than of its MLP half."""
         bw = self.effective_decode_bw(membw_gbs, gemv_gbs)
-        streamed = self.streamed_bytes(list(mlp_vector))
+        streamed = self.streamed_bytes(list(mlp_vector), attn_vector)
         return max(s / b for s, b in zip(streamed, bw))
 
     def per_rank_decode_times(
@@ -4517,6 +4635,7 @@ class PerfCostModel:
         mlp_vector: List[int],
         membw_gbs: Sequence[float],
         gemv_gbs: Optional[Sequence[float]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> List[float]:
         """Each rank's OWN bs=1 weight-streaming time for one decode round.
 
@@ -4530,7 +4649,7 @@ class PerfCostModel:
         probing.
         """
         bw = self.effective_decode_bw(membw_gbs, gemv_gbs)
-        streamed = self.streamed_bytes(list(mlp_vector))
+        streamed = self.streamed_bytes(list(mlp_vector), attn_vector)
         return [s / b for s, b in zip(streamed, bw)]
 
     def decode_cost_percent(
@@ -4538,6 +4657,7 @@ class PerfCostModel:
         mlp_vector: List[int],
         membw_gbs: Sequence[float],
         gemv_gbs: Optional[Sequence[float]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> float:
         """Predicted change of the bs=1 decode STEP time against the base
         plan, in percent. Positive = the candidate makes decode slower.
@@ -4555,7 +4675,10 @@ class PerfCostModel:
         base = self.decode_round_time(self.base_plan, membw_gbs, gemv_gbs)
         if base <= 0:
             return 0.0
-        ratio = self.decode_round_time(mlp_vector, membw_gbs, gemv_gbs) / base
+        ratio = (
+            self.decode_round_time(mlp_vector, membw_gbs, gemv_gbs, attn_vector)
+            / base
+        )
         f = self.calibration.nonweight_fraction
         return (f + (1.0 - f) * ratio - 1.0) * 100.0
 
@@ -4602,11 +4725,12 @@ class PerfCostModel:
         mlp_vector: List[int],
         membw_gbs: Sequence[float],
         gemv_gbs: Optional[Sequence[float]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> Tuple[bool, Optional[str]]:
         """Like ``decode_knee_ok`` but also returns a human-readable reason
         for the first violating rank, naming the unit granularity (for the
         optimizer's per-candidate log line)."""
-        cand = self.streamed_bytes(mlp_vector)
+        cand = self.streamed_bytes(mlp_vector, attn_vector)
         base = self.streamed_bytes(self.base_plan)
         total = sum(cand)
         # EFFECTIVE, not peak: the ceiling has to be the bandwidth a rank
@@ -4674,6 +4798,7 @@ class PerfCostModel:
         gemm_tflops: List[float],
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> float:
         """The shard-PROPORTIONAL part of the prefill step: the lockstep
         compute time (per-token flops ~ 2 x sharded params, the param-proxy)
@@ -4702,7 +4827,7 @@ class PerfCostModel:
         # and nothing else. Going through the class keeps every such caller
         # working.
         t_comp = PerfCostModel.prefill_lockstep_compute_time(
-            self, mlp_vector, gemm_tflops, family_tflops
+            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
         )
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
@@ -4727,7 +4852,7 @@ class PerfCostModel:
         return t_comp + t_comm
 
     def per_family_prefill_compute_times(
-        self, mlp_vector, gemm_tflops, family_tflops=None
+        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
     ) -> "Dict[str, List[float]]":
         """``family name -> that family's per-rank prefill GEMM time`` (s).
 
@@ -4744,7 +4869,9 @@ class PerfCostModel:
         for name, fam in self.families.items():
             if fam.params <= 0 or fam.shard == "replicated":
                 continue
-            fractions = self._shard_fractions(fam.shard, mlp_vector)
+            fractions = _shard_fractions_of(
+                self, fam.shard, mlp_vector, attn_vector
+            )
             rates = family_tflops.get(name) if family_tflops else None
             out[name] = [
                 2.0
@@ -4756,7 +4883,7 @@ class PerfCostModel:
         return out
 
     def prefill_lockstep_compute_time(
-        self, mlp_vector, gemm_tflops, family_tflops=None
+        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
     ) -> float:
         """The compute time one lockstep prefill round really costs (s).
 
@@ -4790,12 +4917,12 @@ class PerfCostModel:
         vector), which is why the #216/#230 calibration anchor is unmoved.
         """
         fam_times = PerfCostModel.per_family_prefill_compute_times(
-            self, mlp_vector, gemm_tflops, family_tflops
+            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
         )
         return sum(max(times) for times in fam_times.values())
 
     def prefill_barrier_skew(
-        self, mlp_vector, gemm_tflops, family_tflops=None
+        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
     ) -> float:
         """Lockstep time this vector spends because the slowest rank is not
         the same rank in every family (s, >= 0).
@@ -4807,16 +4934,16 @@ class PerfCostModel:
         that it is.
         """
         return PerfCostModel.prefill_lockstep_compute_time(
-            self, mlp_vector, gemm_tflops, family_tflops
+            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
         ) - max(
             PerfCostModel.per_rank_prefill_compute_times(
-                self, mlp_vector, gemm_tflops, family_tflops
+                self, mlp_vector, gemm_tflops, family_tflops, attn_vector
             ),
             default=0.0,
         )
 
     def per_rank_prefill_compute_times(
-        self, mlp_vector, gemm_tflops, family_tflops=None
+        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
     ) -> List[float]:
         """Each rank's OWN prefill GEMM time for one lockstep round (s).
 
@@ -4838,7 +4965,10 @@ class PerfCostModel:
                     if fam.params <= 0 or fam.shard == "replicated":
                         continue
                     params_fam_r = (
-                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                        fam.params
+                        * _shard_fractions_of(
+                            self, fam.shard, mlp_vector, attn_vector
+                        )[r]
                     )
                     rates = family_tflops.get(name)
                     rate_r = rates[r] if rates else gemm_tflops[r]
@@ -4851,7 +4981,10 @@ class PerfCostModel:
                     if fam.params <= 0 or fam.shard == "replicated":
                         continue
                     params_r += (
-                        fam.params * self._shard_fractions(fam.shard, mlp_vector)[r]
+                        fam.params
+                        * _shard_fractions_of(
+                            self, fam.shard, mlp_vector, attn_vector
+                        )[r]
                     )
                 out.append(
                     2.0 * params_r / (gemm_tflops[r] * 1e12 * _PREDICT_GEMM_EFF)
@@ -4864,6 +4997,7 @@ class PerfCostModel:
         gemm_tflops: List[float],
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
+        attn_vector: Optional[List[int]] = None,
     ) -> float:
         """Relative prefill step time. Only ratios between candidates are
         consumed. ``family_tflops`` switches the sharded term to the
@@ -4892,10 +5026,14 @@ class PerfCostModel:
         (predicted +21.6 % for 6,1,1 where +13.0 % was measured)."""
         f = self.calibration.prefill_invariant
         t_sharded = self._prefill_sharded_time(
-            mlp_vector, gemm_tflops, min_link_gbs, family_tflops
+            mlp_vector, gemm_tflops, min_link_gbs, family_tflops, attn_vector
         )
         if f <= 0.0:
             return t_sharded
+        # The invariant is charged against the BASE plan in BOTH families:
+        # the reference a candidate pair is measured against is the plain
+        # VRAM-auto layout, not "the same attention vector with a different
+        # MLP vector". Deliberately no ``attn_vector`` here.
         t_base = self._prefill_sharded_time(
             self.base_plan, gemm_tflops, min_link_gbs, family_tflops
         )
@@ -4960,6 +5098,143 @@ def _mlp_candidates(
             seen.add(c)
             out.append(c)
     return out
+
+
+def _attn_partition_key(model: PerfCostModel, vec: Sequence[int]) -> tuple:
+    """What an attention/GDN weight vector MATERIALIZES to (#485).
+
+    Two different integer vectors that round to the same unit partition on
+    both grids are the same layout, and pricing them twice only inflates the
+    plan log. The key is the pair of realized partitions, never the wish
+    vector -- the attention grid on this class of checkpoint is 4 kv heads
+    wide, so most of the ladder collapses onto ``[2,1,1]`` there and only the
+    GDN grid (16 k-heads) actually resolves the ladder.
+    """
+    return (
+        tuple(model._shard_fractions("attn", model.base_plan, list(vec))),
+        tuple(model._shard_fractions("gdn", model.base_plan, list(vec))),
+    )
+
+
+def _attn_candidates(
+    model: PerfCostModel, scores: Sequence[float], base_plan: Sequence[int]
+) -> List[Tuple[int, ...]]:
+    """Candidate ATTENTION/GDN family vectors (#485).
+
+    Under the per-barrier lockstep max (#475) the prefill objective is
+    SEPARABLE over weight families: the round costs ``sum_family max_rank``,
+    so each family's contribution is minimized independently by equalizing
+    that family's per-rank time, i.e. by a share proportional to the rate the
+    family's own lane runs at on each rank. There is no cross-family
+    compensation to solve for -- compensating one family's imbalance with
+    another family's vector is exactly what MANUFACTURES barrier skew, which
+    is the term #475 added.
+
+    The ladder is therefore the same shape as ``_mlp_candidates``' first
+    ladder (score^alpha at several resolutions), with the exact balance point
+    (alpha=1 at the GDN grid's own resolution) always in the set. The balance
+    ladder of ``_mlp_candidates`` has no counterpart here: it exists to
+    absorb the OTHER families' fixed work into the MLP vector, which is the
+    compensation this decomposition removes.
+
+    Feasibility is delegated to ``partition_units`` (every rank keeps >= 1
+    unit on both grids, #62/#116) and deduplication to the materialized
+    partitions, not to the wish vectors.
+    """
+    n = model.tp_size
+    smax = max(scores)
+    resolutions = sorted({3, 5, 8, max(int(model.gdn_units), n)})
+    cands: List[Tuple[int, ...]] = []
+    for alpha in (0.5, 1.0, 1.5, 2.0):
+        for k in resolutions:
+            vec = tuple(max(1, round(k * (s / smax) ** alpha)) for s in scores)
+            cands.append(_gcd_reduce(vec))
+    out: List[Tuple[int, ...]] = []
+    seen = {_attn_partition_key(model, base_plan)}
+    for c in cands:
+        if len(set(c)) <= 1:
+            continue
+        key = _attn_partition_key(model, c)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _cand_vectors(cand) -> Tuple[List[int], Optional[List[int]]]:
+    """``(mlp_vector, attn_vector or None)`` from a candidate entry.
+
+    Every target but the joint phase-prefill arm produces a plain MLP vector;
+    that arm produces a ``(mlp, attn)`` pair (#485). One accessor so the
+    verdict/refusal paths read both shapes.
+    """
+    if cand and isinstance(cand[0], (tuple, list)):
+        return list(cand[0]), (list(cand[1]) if cand[1] else None)
+    return list(cand), None
+
+
+def _cand_label(cand) -> str:
+    """How a candidate is named in the plan log."""
+    mlp, attn = _cand_vectors(cand)
+    txt = ",".join(map(str, mlp))
+    if attn is not None:
+        txt += " + attn/GDN " + ",".join(map(str, attn))
+    return txt
+
+
+def _attn_lane_bracket(
+    model: PerfCostModel,
+    family_tflops: Optional[Dict[str, List[float]]],
+    gemm_tflops: Sequence[float],
+    bw_scores: Optional[Sequence[float]],
+) -> Optional[Tuple[Dict[str, List[float]], Dict[str, List[float]]]]:
+    """The attention/GDN barrier priced at the BANDWIDTH lane instead of the
+    GEMM lane (#485), as the second endpoint of a bracket.
+
+    Why a bracket and not a point estimate. The attention block's per-rank
+    time is a GEMM part (the qkv/o projections, exactly what the param proxy
+    already prices) plus a part that is not weight-proportional at all -- the
+    flash/scan core, which is bandwidth-shaped and whose per-token mass
+    depends on the context length, a quantity this parse-time model does not
+    carry. Inventing that mass would put a hand-made constant inside the one
+    term #475 got right by having none. What IS known without inventing
+    anything: both parts scale with the SAME per-rank unit fraction, and the
+    two lanes have different per-rank RATIOS (on the reference rig the
+    measured GEMV ratio is 2.13:1 where the int8 GEMM ratio is 3.7:1 and the
+    fp8-Marlin one 9.8:1). So the pacer of the attention barrier is bounded
+    by the two pure-lane extremes, and the only question that matters is
+    whether the argmax is the same at both -- if it is, the unmeasured mass
+    split cannot change the answer.
+
+    The bandwidth rates are rescaled so the family's TOTAL time at the base
+    plan is unchanged: only the inter-rank ratio is varied, never the mass.
+
+    Returns ``(gemm_lane, bandwidth_lane)`` -- two complete per-family rate
+    tables that differ ONLY in the attention/GDN rows, so the two rankings
+    they produce are comparable float-for-float. ``None`` when the profile
+    carries no bandwidth vector.
+    """
+    if not bw_scores or len(bw_scores) != model.tp_size:
+        return None
+    bw = [max(float(b), 1e-9) for b in bw_scores]
+    gemm_lane: Dict[str, List[float]] = {
+        name: list((family_tflops or {}).get(name) or list(gemm_tflops))
+        for name in model.families
+    }
+    out: Dict[str, List[float]] = {k: list(v) for k, v in gemm_lane.items()}
+    for name, fam in model.families.items():
+        if fam.shard not in _ATTN_VECTOR_SHARDS or fam.params <= 0:
+            continue
+        fr = model._shard_fractions(fam.shard, model.base_plan)
+        rates = out[name]
+        t_bw = sum(f / b for f, b in zip(fr, bw))
+        t_gemm = sum(f / r for f, r in zip(fr, rates))
+        if t_bw <= 0 or t_gemm <= 0:
+            continue
+        scale = t_bw / t_gemm  # preserves the family's base-plan total time
+        out[name] = [b * scale for b in bw]
+    return gemm_lane, out
 
 
 #: Gate names in the order the per-candidate verdict applies them.
@@ -5125,7 +5400,7 @@ def _no_lever_lines(
     head = (
         f"tune={tune}: {lever}. {len(results)} concentration candidates "
         f"evaluated, none accepted ({tally}). The best of them, "
-        f"{','.join(map(str, best[0]))}, would have predicted "
+        f"{_cand_label(best[0])}, would have predicted "
         f"{best[2] * 100:+.1f}% {metric} and is rejected by: {best_gate}. "
         "Keeping the plain VRAM-auto split."
     )
@@ -5308,7 +5583,10 @@ def apply_auto_performance(server_args) -> None:
     ServerArgs._handle_uneven_tp AFTER the VRAM-auto base split is resolved
     and BEFORE the family-vector validation. Derives --rank-mlp-ratio from
     the hardware profile, subject to the context floor; logs one block with
-    every decision input. Never touches the base (attention/GDN/DCP) split.
+    every decision input. Never touches the base (attention/GDN/DCP) split:
+    the phase arms SOLVE a joint (MLP, attention/GDN) pair (#485) and print
+    it with a launch line, but the only vector this function writes to
+    ``server_args`` is ``rank_mlp_ratio`` (plus the #435 KV seed).
     """
     lines: List[str] = ["auto-performance (--rank-tp-ratio auto-performance):"]
 
@@ -5702,18 +5980,31 @@ def apply_auto_performance(server_args) -> None:
         else:
             _fund_token_vec = partition_units(_PREDICT_TOKEN_UNITS, base_plan)
 
-    def _residual(cand: Sequence[int]) -> Optional[List[float]]:
+    def _residual(
+        cand: Sequence[int], attn: Optional[Sequence[int]] = None
+    ) -> Optional[List[float]]:
         """Per-rank residual free MiB for a candidate, or None when the
         inputs for the check are not available."""
         if _fund_demand is None or _fund_totals is None or _fund_counts is None:
             return None
+        attn = list(attn) if attn else None
         vec = _fund_token_vec
-        if vec is None:
-            vec = model.predict_capacity(list(cand))["token_vector"]
+        if vec is None or attn is not None:
+            # A joint candidate moves attention/GDN weight bytes and the SSM
+            # pool, so its matched token vector is its own -- reusing the
+            # MLP-only one would price a layout the boot would not run.
+            vec = _with_attn(
+                model.predict_capacity, list(cand), attn_vector=attn
+            )["token_vector"]
             if not vec:
                 return None
-        return model.residual_free_mib(
-            list(cand), _fund_totals, _fund_counts, vec
+        return _with_attn(
+            model.residual_free_mib,
+            list(cand),
+            _fund_totals,
+            _fund_counts,
+            vec,
+            attn_vector=attn,
         )
 
     def _unfundable_reason(res: Optional[List[float]]) -> Optional[str]:
@@ -5826,6 +6117,11 @@ def apply_auto_performance(server_args) -> None:
     # Tuning target (per M22: decode is flat across representable splits;
     # prefill/aggregate is the lever, and 'both' rides the same lever).
     chosen: Optional[Tuple[int, ...]] = None
+    #: #485: the best JOINT (MLP, attention/GDN) pair. Solved and reported by
+    #: the phase arms, never installed in this slice; None on every other
+    #: target, which is what keeps their solve single-vector.
+    chosen_joint: Optional[Sequence[int]] = None
+    chosen_attn: Optional[Sequence[int]] = None
     # Capacity-directed planning (T156 option 1): under the cross gate the
     # solo host's non-weight posts (global-context DFLASH draft cell,
     # measured graph/workspace residency) make the GLOBAL capacity a steep
@@ -6095,7 +6391,66 @@ def apply_auto_performance(server_args) -> None:
                 if tuple(cand) not in seen_cands:
                     seen_cands.add(tuple(cand))
                     candidates.append(cand)
+        # -- #485: the JOINT per-family cut -----------------------------------
+        # Under the per-barrier lockstep max the prefill round is
+        # ``sum_family max_rank``, so the MLP vector and the attention/GDN
+        # vector are two INDEPENDENT minimizations that only the shared VRAM
+        # budget couples. Solving one of them and holding the other at the
+        # VRAM-auto split is what produces barrier skew: the MLP-slowest and
+        # the attention-slowest rank end up being different ranks, and the
+        # round pays both. The candidate space of the prefill arm is therefore
+        # a space of PAIRS.
+        #
+        # Gated to the phase-prefill recipe. 'enc'/'both'/'dec'/'maxkv' keep a
+        # single-vector space and pass attn_vector=None everywhere, so their
+        # arithmetic is byte-identical. 'phase-decode' reaches this arm only to
+        # NAME the companion prefill layout, and naming a pair is the point.
+        joint = (
+            tune in _PHASE_TUNES
+            and not decode_objective
+            and not _objective_is_energy(server_args)
+        )
+        attn_scores: List[float] = list(enc_scores)
+        attn_cands: List[Tuple[int, ...]] = []
+        pairs: List[Tuple[Sequence[int], Optional[Sequence[int]]]] = [
+            (c, None) for c in candidates
+        ]
+        lane_bracket = None
+        if joint:
+            # The attention/GDN barrier is paced by ITS own lane, not by the
+            # MLP lane the enc score resolves to (#324: attn/GDN carry their
+            # own GEMM score family whenever the checkpoint's formats
+            # diverge). Resolve it the same way the enc score is resolved,
+            # rather than reusing a number that belongs to another family.
+            attn_scores, attn_score_source = gemm.resolve(GEMM_FAMILY_ATTN_GDN)
+            attn_cands = _attn_candidates(model, attn_scores, base_plan)
+            lane_bracket = _attn_lane_bracket(
+                model, enc_family_tflops, enc_scores, rank_scores_gemv
+                or rank_scores_bw
+            )
+            mlp_options = list(candidates) + [_gcd_reduce(base_plan)]
+            for acand in attn_cands:
+                for cand in mlp_options:
+                    pairs.append((cand, acand))
+            lines.append(
+                f"JOINT per-family cut (#485): {len(attn_cands)} attention/GDN "
+                f"vectors x {len(mlp_options)} MLP vectors (+ the MLP-only "
+                f"ladder) = {len(pairs)} candidate pairs. The attention/GDN "
+                f"family is scored on the '{attn_score_source}' lane "
+                f"{[round(x, 1) for x in attn_scores]} TFLOPS; its grids are "
+                f"{model.attn_units} kv-head units and {model.gdn_units} GDN "
+                "k-head units, and every rank keeps >= 1 unit on both "
+                "(#62/#116). Under the per-barrier max the two families are "
+                "SEPARABLE minimizations -- an aligned pair balances each "
+                "family on its own lane and drives the barrier skew to 0; a "
+                "single-family cut can only trade one family's imbalance for "
+                "the other's."
+            )
         best_gain = 0.0
+        #: #485: best JOINT pair, reported next to the installed MLP-only
+        #: winner. Seeded at the MLP-only best so a pair only earns the line
+        #: if it beats what the arm already installs.
+        best_joint_gain = 0.0
         # #350 phase 4: the boot's own objective. Resolved and validated
         # HERE, at parse time, so an energy request that cannot be priced
         # fails the boot with a named reason instead of quietly booting the
@@ -6107,22 +6462,38 @@ def apply_auto_performance(server_args) -> None:
 
             energy_model = _boot_energy_model(server_args, model, lines)
         results = []
-        for cand in candidates:
-            pred = model.predict_capacity(list(cand))
-            t_cand = model.prefill_time_model(
-                list(cand), enc_scores, min_link, enc_family_tflops
+        for cand, acand in pairs:
+            entry = (tuple(cand), tuple(acand) if acand else None) if joint else cand
+            pred = _with_attn(
+                model.predict_capacity, list(cand), attn_vector=acand
+            )
+            t_cand = _with_attn(
+                model.prefill_time_model,
+                list(cand),
+                enc_scores,
+                min_link,
+                enc_family_tflops,
+                attn_vector=acand,
             )
             gain = t_base / t_cand - 1.0
-            knee_ok, knee_reason = model.decode_knee_detail(
-                list(cand), rank_scores_bw, rank_scores_gemv
+            knee_ok, knee_reason = _with_attn(
+                model.decode_knee_detail,
+                list(cand),
+                rank_scores_bw,
+                rank_scores_gemv,
+                attn_vector=acand,
             )
             if decode_objective:
                 # Speedup fraction of the whole decode STEP, so the number is
                 # comparable with the prefill gain above and with the
                 # per-candidate decode line printed further down (which is
                 # the same quantity expressed as a cost).
-                step_ratio = 1.0 + model.decode_cost_percent(
-                    list(cand), rank_scores_bw, rank_scores_gemv
+                step_ratio = 1.0 + _with_attn(
+                    model.decode_cost_percent,
+                    list(cand),
+                    rank_scores_bw,
+                    rank_scores_gemv,
+                    attn_vector=acand,
                 ) / 100.0
                 gain = (1.0 / step_ratio - 1.0) if step_ratio > 0 else -1.0
             # Tolerance, not slop (#265): re-partitioning the MLP family
@@ -6138,10 +6509,10 @@ def apply_auto_performance(server_args) -> None:
                 pred["ctx"] >= floor
                 or math.isclose(pred["ctx"], floor, rel_tol=1e-9)
             )
-            res = _residual(cand)
+            res = _residual(cand, acand)
             unfundable = _unfundable_reason(res)
             results.append(
-                (cand, pred, gain, floor_ok, knee_ok, knee_reason, res, unfundable)
+                (entry, pred, gain, floor_ok, knee_ok, knee_reason, res, unfundable)
             )
             admissible = (
                 floor_ok and (knee_ok or not knee_binding) and unfundable is None
@@ -6163,20 +6534,42 @@ def apply_auto_performance(server_args) -> None:
                             list(cand), rank_scores_bw, rank_scores_gemv
                         )
                         if decode_objective
-                        else model.per_rank_prefill_compute_times(
-                            list(cand), enc_scores, enc_family_tflops
+                        else _with_attn(
+                            model.per_rank_prefill_compute_times,
+                            list(cand),
+                            enc_scores,
+                            enc_family_tflops,
+                            attn_vector=acand,
                         ),
                         energy_model,
                     )
-                    energy_scores[tuple(cand)] = j
+                    energy_scores[entry if joint else tuple(cand)] = j
                     if j < best_joules - 1e-12:
                         best_joules = j
                         chosen = cand
             elif admissible and gain > best_gain + 1e-9:
-                best_gain = gain
-                chosen = cand
+                # The INSTALLED decision stays single-vector and therefore
+                # byte-identical to the pre-#485 solve: slice 1 solves the
+                # pair, it does not install its attention half (see the
+                # JOINT PREFILL LAYOUT line below for why). The comparison
+                # itself is deliberately left verbatim -- test_energy_boot
+                # asserts this exact line by source text, as the guard that
+                # the throughput branch is still a plain argmax over gain.
+                if acand is None:
+                    best_gain = gain
+                    chosen = cand
+            if admissible and acand is not None and gain > best_joint_gain + 1e-9:
+                best_joint_gain = gain
+                chosen_joint, chosen_attn = cand, acand
+        # #485: the two spaces are reported SEPARATELY. The single-family
+        # ladder keeps its own top-6 -- a joint pair generally out-ranks every
+        # one of them, and letting pairs crowd the list would hide the vector
+        # the arm actually installs behind layouts it does not. The pair
+        # section is a second, shorter block below it.
+        _single = [e for e in results if _cand_vectors(e[0])[1] is None]
+        _joint = [e for e in results if _cand_vectors(e[0])[1] is not None]
         for (
-            cand,
+            entry,
             pred,
             gain,
             floor_ok,
@@ -6184,7 +6577,11 @@ def apply_auto_performance(server_args) -> None:
             knee_reason,
             res,
             unfundable,
-        ) in sorted(results, key=lambda x: -x[2])[:6]:
+        ) in (
+            sorted(_single, key=lambda x: -x[2])[:6]
+            + sorted(_joint, key=lambda x: -x[2])[:4]
+        ):
+            cand, acand = _cand_vectors(entry)
             if not pred["feasible"]:
                 verdict = "INFEASIBLE"
             elif unfundable is not None:
@@ -6217,8 +6614,12 @@ def apply_auto_performance(server_args) -> None:
             # regression got proposed as a default (task #216): the guard's
             # verdict is a model, the number next to it is what lets a reader
             # disagree with the model.
-            dec_pct = model.decode_cost_percent(
-                list(cand), rank_scores_bw, rank_scores_gemv
+            dec_pct = _with_attn(
+                model.decode_cost_percent,
+                list(cand),
+                rank_scores_bw,
+                rank_scores_gemv,
+                attn_vector=acand,
             )
             # #475: how much of this candidate's lockstep round is spent
             # because the MLP-slowest and the attention-slowest rank are not
@@ -6226,8 +6627,12 @@ def apply_auto_performance(server_args) -> None:
             # because it is the term that decides whether a concentrated
             # candidate is worth anything on a rig whose weak card is only
             # weak in SOME families, and it is invisible in the gain alone.
-            skew = model.prefill_barrier_skew(
-                list(cand), enc_scores, enc_family_tflops
+            skew = _with_attn(
+                model.prefill_barrier_skew,
+                list(cand),
+                enc_scores,
+                enc_family_tflops,
+                attn_vector=acand,
             )
             base_time = model.prefill_time_model(
                 base_plan, enc_scores, min_link, enc_family_tflops
@@ -6237,30 +6642,137 @@ def apply_auto_performance(server_args) -> None:
                 if not decode_objective and base_time > 0 and skew > 0
                 else ""
             )
+            # #485: which family paces which barrier, in the same line. This
+            # is the quantity the joint cut moves; the skew above is only its
+            # aggregate, and an aggregate cannot say WHICH family is
+            # misaligned.
+            pacer_note = ""
+            if joint and pred["feasible"]:
+                fam_times = _with_attn(
+                    model.per_family_prefill_compute_times,
+                    list(cand),
+                    enc_scores,
+                    enc_family_tflops,
+                    attn_vector=acand,
+                )
+                pacer_note = ", pacers " + "/".join(
+                    f"{name}:r{times.index(max(times))}"
+                    for name, times in sorted(fam_times.items())
+                    if max(times) > 0
+                )
             lines.append(
-                f"candidate MLP vector {','.join(map(str, cand))}: "
+                (
+                    "candidate PAIR (#485) MLP "
+                    if acand is not None
+                    else "candidate MLP vector "
+                )
+                + f"{_cand_label(entry)}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
                 f"predicted {objective_metric} gain {gain * 100:+.1f}%"
                 + skew_note
+                + pacer_note
                 + f", predicted decode step {dec_pct:+.1f}%"
                 + (
                     f", residual free {[int(x) for x in res]} MiB"
                     if res is not None
                     else ""
                 )
-                + f" (units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'})"
+                + f" (units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'}"
                 + (
-                    f", predicted {energy_scores[tuple(cand)]:.4g} J/token"
-                    if tuple(cand) in energy_scores
+                    f" / attn {model.gdn_unit_partition(acand)}"
+                    if acand and pred["feasible"]
+                    else ""
+                )
+                + ")"
+                + (
+                    f", predicted {energy_scores[entry]:.4g} J/token"
+                    if entry in energy_scores
                     else ""
                 )
             )
+        if joint and lane_bracket is not None and results:
+            # #485 LANE BRACKET: is the winning pair the same when the
+            # attention/GDN barrier is paced by the bandwidth lane instead of
+            # the GEMM lane? The flash/scan core's per-token mass is not
+            # something this parse-time model can know (it depends on the
+            # context length), so it is not estimated -- it is BRACKETED. If
+            # the argmax is invariant across the two pure-lane extremes, the
+            # unmeasured mass split cannot change the answer and the solve is
+            # safe without it. If it is not, the log says which pair each
+            # endpoint prefers and that becomes the question the GPU arm has
+            # to settle, rather than a number nobody measured.
+            gemm_lane, bw_lane = lane_bracket
+
+            def _lane_best(rates):
+                ref = model.prefill_time_model(
+                    base_plan, enc_scores, min_link, rates
+                )
+                best_e, best_g = None, 0.0
+                for e, pr, _g, ok_floor, _ok_knee, _rs, _res, unf in results:
+                    if not (pr["feasible"] and ok_floor and unf is None):
+                        continue
+                    mv, av = _cand_vectors(e)
+                    t = _with_attn(
+                        model.prefill_time_model,
+                        mv,
+                        enc_scores,
+                        min_link,
+                        rates,
+                        attn_vector=av,
+                    )
+                    g = ref / t - 1.0
+                    if g > best_g + 1e-9:
+                        best_e, best_g = e, g
+                return best_e, best_g
+
+            e_gemm, g_gemm = _lane_best(gemm_lane)
+            e_bw, g_bw = _lane_best(bw_lane)
+            if e_gemm is None and e_bw is None:
+                lines.append(
+                    "lane bracket (#485): no admissible pair at either lane "
+                    "endpoint -- nothing to bracket."
+                )
+            elif e_gemm == e_bw:
+                lines.append(
+                    "lane bracket (#485): LANE-INVARIANT -- the same pair "
+                    f"({_cand_label(e_gemm)}) wins whether the attention/GDN "
+                    "barrier is paced by the GEMM lane "
+                    f"({g_gemm * 100:+.1f}%) or by the measured bandwidth "
+                    f"lane ({g_bw * 100:+.1f}%). The unpriced flash/scan core "
+                    "term cannot change this argmax."
+                )
+            else:
+                lines.append(
+                    "lane bracket (#485): LANE-SENSITIVE -- the GEMM-lane "
+                    f"endpoint prefers {_cand_label(e_gemm)} "
+                    f"({g_gemm * 100:+.1f}%) and the bandwidth-lane endpoint "
+                    f"prefers {_cand_label(e_bw)} ({g_bw * 100:+.1f}%). The "
+                    "attention block's flash/scan core is bandwidth-shaped "
+                    "and its per-token mass is not modelled here, so which "
+                    "endpoint is nearer the truth is a MEASUREMENT, not a "
+                    "model output. Treat the joint layout as unresolved until "
+                    "one boot decides it."
+                )
         if chosen is None:
+            # Deliberately the SINGLE-family results: the refusal is about the
+            # vector this arm would have installed. The joint space cannot
+            # rescue it in this slice -- nothing installs an attention vector
+            # here -- so naming a pair as "the best of them" would read as an
+            # offer the arm cannot honour.
             lines.extend(
                 _no_lever_lines(
-                    tune, loose, results, knee_binding, objective_metric
+                    tune, loose, _single, knee_binding, objective_metric
                 )
             )
+            if _joint:
+                best_j = max(_joint, key=lambda e: e[2])
+                lines.append(
+                    "joint space (#485): the best PAIR was "
+                    f"{_cand_label(best_j[0])} at {best_j[2] * 100:+.1f}% "
+                    f"({_binding_gate(best_j, knee_binding)}). It is reported, "
+                    "not installed -- the attention/GDN half needs "
+                    "--rank-tp-ratio, which this arm does not write."
+                )
         elif tune == _PHASE_DECODE:
             # The decode arm of the recipe IS the VRAM-auto split. The
             # concentrated vector is still solved and named, so one plan run
@@ -6270,9 +6782,17 @@ def apply_auto_performance(server_args) -> None:
                 "phase-optimal DECODE arm: keeping the plain VRAM-auto split "
                 "(the measured decode optimum). The companion PREFILL vector "
                 f"for this rig and checkpoint is {','.join(map(str, chosen))} "
-                f"(predicted prefill gain {best_gain * 100:+.1f}%); launch "
-                "with --rank-perf-tune phase-prefill to serve the prefill "
-                "arm."
+                f"(predicted prefill gain {best_gain * 100:+.1f}%)"
+                + (
+                    "; its JOINT companion (#485) is MLP "
+                    f"{','.join(map(str, chosen_joint))} + attn/GDN "
+                    f"{','.join(map(str, chosen_attn))} at "
+                    f"{best_joint_gain * 100:+.1f}%"
+                    if chosen_attn
+                    else ""
+                )
+                + "; launch with --rank-perf-tune phase-prefill to serve the "
+                "prefill arm."
             )
             chosen = None
 
@@ -6293,6 +6813,43 @@ def apply_auto_performance(server_args) -> None:
             f"{int(pred['ctx'])} >= {int(floor)} "
             f"({100 - loose:g}% of VRAM-auto {int(base_pred['ctx'])}) -- OK"
         )
+        if chosen_attn is not None and chosen_joint is not None:
+            # #485 slice 1 SOLVES the pair and does not INSTALL its attention
+            # half. The runtime actuator for the attention/GDN vector is the
+            # base plan (--rank-tp-ratio): only "mlp" is a named family plan
+            # today, so re-pointing the base plan is what moves the attention
+            # heads, the GDN k-heads, the SSM state pool and the vision
+            # tower together. Writing it here would change the base split of
+            # every boot that asks for phase-prefill on the strength of a
+            # DESK prediction; the pair is stated as a launch line instead
+            # and the GPU arm (docs/dev/TICKET_485_int8_joint_arm.md) decides
+            # whether it installs by default.
+            #
+            # The KV vector is pinned explicitly in that line because the
+            # #435 seed is only reachable through the auto-performance path,
+            # and an explicit --rank-tp-ratio takes the pin path. The pinned
+            # value IS the solve's own matched vector, so the boot runs the
+            # layout the gate accepted -- the #435 rule honoured, not
+            # bypassed.
+            jpred = model.predict_capacity(list(chosen_joint), list(chosen_attn))
+            kv_hint = jpred.get("token_vector")
+            lines.append(
+                "JOINT PREFILL LAYOUT (#485, DESK/PREDICTED -- SOLVED, NOT "
+                f"INSTALLED): MLP {','.join(map(str, chosen_joint))} + attn/GDN "
+                f"{','.join(map(str, chosen_attn))} -> GDN units "
+                f"{model.gdn_unit_partition(list(chosen_attn))}, predicted "
+                f"prefill gain {best_joint_gain * 100:+.1f}% against "
+                f"{best_gain * 100:+.1f}% for the installed MLP-only vector, "
+                f"predicted ctx ~{int(jpred['ctx'])} (floor {int(floor)}). "
+                "Launch it with: --rank-tp-ratio "
+                f"{','.join(map(str, chosen_attn))} --rank-mlp-ratio "
+                f"{','.join(map(str, chosen_joint))}"
+                + (
+                    f" --rank-kv-ratio {','.join(map(str, kv_hint))}"
+                    if kv_hint
+                    else ""
+                )
+            )
         lines.append(
             f"PIN HINT: skip probe+optimizer on later boots with "
             f"--rank-tp-ratio auto --rank-mlp-ratio "
@@ -6339,6 +6896,11 @@ def apply_auto_performance(server_args) -> None:
         # explicit --rank-kv-ratio pin still win, because this only fills in
         # the unpinned default.
         if pred.get("token_vector"):
+            # NOTE (#485): ``pred`` is the INSTALLED (MLP-only) layout's
+            # prediction, deliberately -- the seed has to match the layout the
+            # boot runs, not the joint pair the log names but does not
+            # install. The joint layout's own matched vector is printed on its
+            # launch line instead.
             existing_kv = getattr(server_args, "rank_kv_ratio", None)
             if not isinstance(existing_kv, list):
                 tok_vec = [int(v) for v in pred["token_vector"]]

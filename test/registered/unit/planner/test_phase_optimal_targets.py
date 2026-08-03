@@ -435,9 +435,13 @@ class TestTheGateStillRejectsWhatDoesNotBoot(CustomTestCase):
         above the summation noise the tolerance absorbs."""
         real = uneven_perf.PerfCostModel.predict_capacity
 
-        def shaved(self, mlp_vector):
-            out = dict(real(self, mlp_vector))
-            if list(mlp_vector) != list(self.base_plan):
+        def shaved(self, mlp_vector, attn_vector=None):
+            # ``attn_vector`` (#485): the phase arm now prices JOINT
+            # (MLP, attention/GDN) pairs, so a stand-in for this method has
+            # to carry the pair too -- shaving only the MLP half would let a
+            # pair slip past the floor this test exists to keep binding.
+            out = dict(real(self, mlp_vector, attn_vector))
+            if list(mlp_vector) != list(self.base_plan) or attn_vector is not None:
                 out["ctx"] = out["ctx"] * 0.999
             return out
 
