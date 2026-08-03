@@ -138,24 +138,58 @@ def resident_fraction_vector(
             f"indexed by the MoE rank while its length is specified per TP "
             f"rank. Use a single value, which is unambiguous."
         )
+    # #481b: under pipeline parallelism the vector may be world-length
+    # (pp_size x tp_size, world-rank order pp_rank * tp_size + tp_rank), which
+    # is the order every other rank vector in this family uses. A tp-length
+    # vector keeps its old meaning: the same pattern repeated on every stage.
+    pp_size = _pp_size() or 1
+    if tp_size is not None and pp_size > 1 and len(values) == pp_size * tp_size:
+        return values
     if tp_size is not None and len(values) != tp_size:
+        expected = (
+            f"{tp_size} (one per rank in a stage) or {pp_size * tp_size} "
+            f"(one per world rank)"
+            if pp_size > 1
+            else f"{tp_size}"
+        )
         raise ValueError(
             f"the resident-fraction vector has {len(values)} entries "
             f"({','.join(str(v) for v in values)}) but tensor parallelism is "
-            f"{tp_size}. Give exactly one entry per rank, or a single value to "
+            f"{tp_size}. Give exactly {expected} entries, or a single value to "
             f"use the same fraction everywhere."
         )
     return values
 
 
 def resident_fraction_for_rank(rank: Optional[int] = None) -> float:
-    """This rank's fraction. Every site that SIZES or BOOKS memory uses this."""
+    """This rank's fraction. Every site that SIZES or BOOKS memory uses this.
+
+    ``rank`` defaults to this rank's position in the vector: the MoE-TP rank
+    for a stage-length vector, and the WORLD rank
+    (``pp_rank * tp_size + moe_tp_rank``) for a world-length one (#481b).
+    Without pipeline parallelism the two are the same number, which is what
+    keeps every existing launch byte-identical.
+    """
     vec = resident_fraction_vector()
     if rank is None:
-        rank = _tp_rank()
+        rank = _rank_in_vector(len(vec))
     if rank is None or rank >= len(vec):
         return vec[0]
     return vec[rank]
+
+
+def _rank_in_vector(length: int) -> Optional[int]:
+    """This rank's index into a resident-fraction vector of ``length``."""
+    tp_rank = _tp_rank()
+    if tp_rank is None:
+        return None
+    tp_size = _tp_size()
+    pp_size = _pp_size() or 1
+    if pp_size > 1 and tp_size and length == pp_size * tp_size:
+        pp_rank = _pp_rank()
+        if pp_rank is not None:
+            return pp_rank * tp_size + tp_rank
+    return tp_rank
 
 
 def offload_active() -> bool:
@@ -203,6 +237,26 @@ def _tp_size() -> Optional[int]:
         from sglang.srt.runtime_context import get_parallel
 
         return int(get_parallel().tp_size)
+    except Exception:
+        return None
+
+
+def _pp_size() -> Optional[int]:
+    """Pipeline depth, or None before distributed init / in passive processes."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        return int(get_parallel().pp_size)
+    except Exception:
+        return None
+
+
+def _pp_rank() -> Optional[int]:
+    """This process's pipeline stage, or None when there is no group yet."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        return int(get_parallel().pp_rank)
     except Exception:
         return None
 

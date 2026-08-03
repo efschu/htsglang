@@ -574,6 +574,41 @@ def _install_dump_triggers_once() -> None:
             pass
 
 
+def moe_rank_tag(
+    moe_tp_rank: int = 0,
+    moe_ep_rank: int = 0,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+) -> str:
+    """The per-rank dump tag, unique across the whole world.
+
+    #481c: the tag used to be ``tp{moe_tp_rank}ep{moe_ep_rank}``, which is not
+    unique under pipeline parallelism -- stage 0 rank 0 and stage 1 rank 0 are
+    two processes that both produce ``tp0ep0`` and therefore both write
+    ``<path>.tp0ep0.json``, so whichever dumps last silently replaces the
+    other's file. The stage is prefixed only when there IS a pipeline, so every
+    existing non-PP dump keeps its filename byte for byte.
+
+    ``pp_rank`` / ``pp_size`` default to the live parallel context; passing
+    them explicitly is for callers that hold the numbers already and for tests.
+    """
+    if pp_size is None or pp_rank is None:
+        try:
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+            if pp_size is None:
+                pp_size = int(parallel.pp_size)
+            if pp_rank is None:
+                pp_rank = int(parallel.pp_rank)
+        except Exception:
+            # No group yet (GPU-passive process, unit test): a pipeline cannot
+            # be running either, so the historical tag is the right answer.
+            pp_size, pp_rank = 1, 0
+    prefix = f"pp{int(pp_rank)}" if int(pp_size or 1) > 1 else ""
+    return f"{prefix}tp{int(moe_tp_rank)}ep{int(moe_ep_rank)}"
+
+
 def expert_stats_enabled() -> bool:
     """Read the opt-in switch. Call at init time, not on the hot path."""
     from sglang.srt.environ import envs

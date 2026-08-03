@@ -9399,7 +9399,25 @@ class ServerArgs:
         # into a 98 GiB checkpoint stream.
         if self.rank_moe_resident_fraction is not None:
             vec = self.rank_moe_resident_fraction
-            if len(vec) not in (1, self.tp_size):
+            # #481b: under PP the world is pp_size x tp_size ranks, and the
+            # rest of this flag family already takes a world-length vector in
+            # world-rank order pp_rank * tp_size + tp_rank (--rank-gpu-id at
+            # :9029-9036, --rank-gpu-memory-mib at :9262). Validating against
+            # tp_size alone made this the one vector a pipeline over
+            # heterogeneous cards could not express. A tp-length vector keeps
+            # its old meaning -- the same per-rank pattern on every stage.
+            world_size = self.pp_size * self.tp_size
+            allowed = {1, self.tp_size, world_size}
+            if len(vec) not in allowed:
+                if self.pp_size > 1:
+                    raise ValueError(
+                        f"--rank-moe-resident-fraction length ({len(vec)}) must "
+                        f"equal the world ({self.pp_size} x {self.tp_size} = "
+                        f"{world_size} entries, world-rank order pp_rank * "
+                        f"tp_size + tp_rank), or --tp-size ({self.tp_size}) to "
+                        f"repeat the same pattern on every stage, or be a "
+                        f"single value for every rank."
+                    )
                 raise ValueError(
                     f"--rank-moe-resident-fraction length ({len(vec)}) must "
                     f"equal --tp-size ({self.tp_size}), or be a single value "
@@ -12980,6 +12998,47 @@ class ServerArgs:
     #: Config keys that carry a model's backbone depth, in probe order.
     _NUM_LAYER_CONFIG_KEYS = ("num_hidden_layers", "n_layer", "num_layers")
 
+    def declared_config_path(self) -> Optional[str]:
+        """Path of the ``config.json`` that describes ``--model-path``.
+
+        Two shapes, and the second one is why this exists (#481a): a GGUF
+        launch names the ``.gguf`` FILE, not a directory (rig-runbook §4.5.4b),
+        so its sibling ``config.json`` -- the one the loader reconciles against
+        in ``gguf_registry.reconcile_sibling_config`` -- lives in that file's
+        DIRECTORY. Joining ``config.json`` onto the model path finds
+        ``<...>.gguf/config.json``, which never exists, and every consumer of
+        the declared depth then behaved as if the model had no config at all.
+        Same canon as ``_log_rank_plan_vectors`` (#402/#414), which already
+        addresses the sibling directory this way.
+
+        Returns None when neither candidate is a readable file; the depth
+        remains advisory either way (see :meth:`declared_num_hidden_layers`).
+        """
+        model_path = getattr(self, "model_path", None)
+        if not model_path:
+            return None
+        candidates = [os.path.join(model_path, "config.json")]
+        if model_path.endswith(".gguf"):
+            candidates.append(
+                os.path.join(os.path.dirname(model_path), "config.json")
+            )
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _read_declared_config(self) -> Optional[dict]:
+        """The parsed ``config.json``, or None when it cannot be read."""
+        cfg_path = self.declared_config_path()
+        if cfg_path is None:
+            return None
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:  # pragma: no cover - advisory only
+            return None
+        return cfg if isinstance(cfg, dict) else None
+
     def declared_num_hidden_layers(self) -> Optional[int]:
         """The model's backbone depth as its ``config.json`` declares it, or
         None when it cannot be read here.
@@ -12991,16 +13050,8 @@ class ServerArgs:
         know. The authoritative sum check therefore stays where the real
         depth exists -- distributed/utils.py: get_pp_indices.
         """
-        model_path = getattr(self, "model_path", None)
-        if not model_path:
-            return None
-        cfg_path = os.path.join(model_path, "config.json")
-        if not os.path.isfile(cfg_path):
-            return None
-        try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-        except Exception:  # pragma: no cover - advisory only
+        cfg = self._read_declared_config()
+        if cfg is None:
             return None
         text_cfg = cfg.get("text_config") or {}
         for key in self._NUM_LAYER_CONFIG_KEYS:
@@ -13041,12 +13092,8 @@ class ServerArgs:
         depth = self.declared_num_hidden_layers()
         if depth is None:
             return None
-        model_path = getattr(self, "model_path", None)
-        cfg_path = os.path.join(model_path, "config.json")
-        try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-        except Exception:  # pragma: no cover - advisory only
+        cfg = self._read_declared_config()
+        if cfg is None:  # pragma: no cover - advisory only
             return None
         text_cfg = cfg.get("text_config") or {}
 

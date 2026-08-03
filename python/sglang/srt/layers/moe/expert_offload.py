@@ -2626,15 +2626,22 @@ class MoEExpertOffloadCache:
         # --- #390 router / residency instrument -----------------------------
         # Opt-in (SGLANG_EXPERT_STATS=1). Resolved ONCE here: on the default
         # path this stays None and run_waves pays a single `is not None` test.
-        from sglang.srt.layers.moe.expert_stats import get_collector, maybe_layer_stats
+        from sglang.srt.layers.moe.expert_stats import (
+            get_collector,
+            maybe_layer_stats,
+            moe_rank_tag,
+        )
 
         self._router_stats = maybe_layer_stats(
             layer_id=getattr(layer, "layer_id", None),
             num_experts=self.num_local_experts,
             resident_count=self.resident_count,
-            rank_tag=(
-                f"tp{getattr(layer, 'moe_tp_rank', 0)}"
-                f"ep{getattr(layer, 'moe_ep_rank', 0)}"
+            # #481c: the tag carries the pipeline stage when there is one, so
+            # two stages' rank 0 stop writing the same dump file. Unchanged
+            # without PP.
+            rank_tag=moe_rank_tag(
+                moe_tp_rank=getattr(layer, "moe_tp_rank", 0),
+                moe_ep_rank=getattr(layer, "moe_ep_rank", 0),
             ),
             graph_mode=self._graph_mode,
         )

@@ -210,6 +210,28 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   boundary-send by −9.8/−9.2 % at bs=1 (0-1 % floor otherwise) — note the
   in-server counter reads 249 µs, which is not the standalone wire-transfer
   figure.
+  **#481 closed three PP defects from the #445 window.** (a) The declared-depth
+  probe joined `config.json` onto `--model-path`, which for EVERY GGUF launch
+  is the `.gguf` FILE (rig-runbook §4.5.4b) — so `--pp-stage-ratio` refused
+  every GGUF checkpoint with "hidden layer count is not readable". It now
+  applies the #402/#414 sibling-directory canon (`declared_config_path`,
+  `server_args.py`), the same one `_log_rank_plan_vectors` already used at
+  `:9276-9280`. (b) `--rank-moe-resident-fraction` was the one rank vector in
+  this family validated against `tp_size` alone; it now also accepts the
+  world-length form (`pp_size x tp_size`, world-rank order
+  `pp_rank * tp_size + tp_rank`) that `--rank-gpu-id` (`:9029-9036`) and
+  `--rank-gpu-memory-mib` (`:9262`) already take, and the consumer indexes a
+  world-length vector by world rank (`resident_fraction._rank_in_vector`). A
+  tp-length vector keeps its old meaning (same pattern on every stage) and
+  every non-PP launch is byte-identical. (c) `expert_stats` tagged its dump
+  `tp{moe_tp_rank}ep{moe_ep_rank}`, which two stages' rank 0 share — both wrote
+  `<path>.tp0ep0.json` and the later dump replaced the earlier. The tag is now
+  built by `expert_stats.moe_rank_tag`, which prefixes `pp{rank}` ONLY when
+  `pp_size > 1`, so existing dump filenames do not move. Tests:
+  `test/registered/unit/test_pp_defects_481.py`, 16 hermetic, four executed
+  can-fail arms (sibling-dir candidate removed → 3 red; world length dropped
+  from the validator → 1; consumer re-indexed by the in-stage rank → 1; call
+  site back to the pp-blind inline tag → 1).
 - **TP5+ emulation** via multi-rank co-location (several ranks per card),
   gated ONLY on duplicate entries in `--rank-gpu-id`
   (`entrypoints/engine.py:1563`). The NCCL settings that follow
