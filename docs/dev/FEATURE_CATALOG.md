@@ -2116,6 +2116,28 @@ result posting is opt-in per-use PAT, redacted from every error path
 the only redaction.
 
 ## 15. Model bring-ups (boot-proven)
+**Qwen3-TTS talker (#488) is NOT boot-proven and is listed here so nobody reads
+its presence as a working lane.** Slice 1 landed: `configs/qwen3_tts.py` (three
+`model_type`-keyed configs, #497 canon) and `models/qwen3_tts.py` (uneven-TP
+trunk, code predictor over a PRIVATE scratch cache — the 16 residual codes are
+one talker sequence position and must never enter the paged KV pool). Proven
+hermetically only: construction, registry resolution, tp=3 head geometry, and
+every one of the checkpoint's 478 tensor names classified, with an executed
+can-fail arm (`test/registered/unit/models/test_qwen3_tts_talker_lane_488.py`,
+13/13). NOT built: the `schedule_batch.py:3006-3008` embeds-channel unblock the
+decode regime needs, the nested-predictor decode regime itself, graph capture,
+the 1596-line prompt/embeds builder, the vocoder, and the native
+`/v1/audio/speech` path — `entrypoints/openai/serving_speech.py` is still a
+proxy stub with no lane behind it. **Layout verdict, priced not assumed**
+(`ANALYSE_488_talker_lane_layout.md`): the trunk IS partitionable at tp=3
+(`--rank-tp-ratio 5,3,3` → q `[8,4,4]`, kv `[4,2,2]`, MLP `[1392,840,840]`,
+executed against `distributed/utils.py`), but TP=3 LOSES to a solo 5090 by
+2-5x — 192 forwards per audio-second at batch 1 over a 0.6 B model make the
+step latency-bound, and TP=3 adds 2472 small all-reduces per audio-second over
+a PHB-only rig against a sub-millisecond bandwidth term. The three-card win for
+this workload is one instance per card serving independent SESSIONS, not one
+utterance split three ways.
+
 Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;
 Gemma3RMSNorm runs the fused sgl-kernel path for 2-D and high-rank inputs,
 adopted from upstream #32670 — do not re-add an eager-only forward_cuda),
