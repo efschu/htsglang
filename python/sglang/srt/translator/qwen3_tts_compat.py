@@ -621,8 +621,11 @@ def restore_cache_position(model_class) -> bool:
     return True
 
 
-def retarget_wrapper_device(wrapper) -> "object":
-    """Refresh the reference wrapper's CACHED device after the model was moved.
+def retarget_wrapper_device(wrapper, device=None) -> Dict[str, str]:
+    """Put the whole model where the caller thinks it is, and prove it.
+
+    Two faults of one shape, both invisible on CPU because there every
+    snapshot is accidentally right.
 
     ``Qwen3TTSModel.__init__`` snapshots the device once
     (``inference/qwen3_tts_model.py:75-80``: ``self.device = getattr(model,
@@ -656,10 +659,38 @@ def retarget_wrapper_device(wrapper) -> "object":
     (``generate_voice_clone``, ``generate_custom_voice``,
     ``generate_voice_design``) instead of one call path.
 
-    Returns the device now recorded on the wrapper. Raises :class:`CompatError`
-    if the model has no parameters to read a device from, since silently
-    leaving a stale snapshot in place is the bug this exists to remove.
+    **The same shape, one level deeper, and far more expensive.** The codec is
+    held as ``model.speech_tokenizer``, and ``Qwen3TTSTokenizer`` is a PLAIN
+    class, not an ``nn.Module`` (``inference/qwen3_tts_tokenizer.py:44``). So
+    it is not in ``model._modules``, ``model.to(device)`` does not reach it,
+    and it carries its own construction-time device snapshot
+    (``:88-95``) which its ``encode``/``decode`` use to place their inputs.
+    The result is not a crash but a silent split placement: talker on the GPU,
+    the whole 12 Hz codec left on the CPU in bfloat16.
+
+    Measured on a 5090, ``probe_stage_timing.py``, 49 codec frames:
+    talker 4.3 s, codec decode **85.2 s** -- 90 % of a call whose total was
+    94.8 s for 3.9 s of audio (RTF 24). That is the entire reason the first
+    warm GPU measurement looked two orders of magnitude wrong. Nothing failed;
+    bfloat16 convolutions are simply that slow on a CPU.
+
+    So this function does both halves: it refreshes the wrapper's snapshot AND
+    it moves every detached holder of that shape onto the target device and
+    refreshes its snapshot too. A holder is recognised structurally -- a plain
+    attribute of the model that is not itself an ``nn.Module``, but owns a
+    ``.model`` that is one, and caches a ``.device`` -- rather than by name, so
+    a second such holder cannot be stranded silently the way this one was.
+
+    Every move is VERIFIED afterwards by walking the parameters and buffers,
+    because "we called ``.to()``" is a success claim, and a stranded module is
+    exactly the kind of wrongness that stays silent.
+
+    Returns a report mapping each retargeted holder to its device. Raises
+    :class:`CompatError` if the device cannot be determined or if anything is
+    still off-target after the move.
     """
+    import torch
+
     inner = getattr(wrapper, "model", None)
     if inner is None:
         raise CompatError(
@@ -667,7 +698,8 @@ def retarget_wrapper_device(wrapper) -> "object":
             "device cannot be refreshed and prompts would be built on the "
             "wrong device"
         )
-    device = getattr(inner, "device", None)
+    if device is None:
+        device = getattr(inner, "device", None)
     if device is None:
         try:
             device = next(inner.parameters()).device
@@ -677,8 +709,61 @@ def retarget_wrapper_device(wrapper) -> "object":
                 "cannot be determined; refusing to leave the cached device "
                 "stale"
             ) from exc
+    device = torch.device(device)
+
     wrapper.device = device
-    return device
+    report: Dict[str, str] = {"wrapper": str(device)}
+
+    for name, held in list(vars(inner).items()):
+        if name.startswith("_") or isinstance(held, torch.nn.Module):
+            continue
+        submodel = getattr(held, "model", None)
+        if not isinstance(submodel, torch.nn.Module):
+            continue
+        if not hasattr(held, "device"):
+            continue
+        submodel.to(device)
+        held.device = device
+        report[name] = str(device)
+
+    stranded = _off_device(inner, device)
+    for name in report:
+        if name == "wrapper":
+            continue
+        stranded += _off_device(getattr(inner, name).model, device, prefix=name + ".")
+    if stranded:
+        raise CompatError(
+            f"{len(stranded)} tensors are still not on {device} after "
+            f"retargeting (e.g. {', '.join(stranded[:3])}). A split placement "
+            "does not fail -- it runs on the CPU at a hundredth of the speed -- "
+            "so it is refused here rather than measured later."
+        )
+    return report
+
+
+def _off_device(module, device, prefix: str = "") -> List[str]:
+    """Names of this module's parameters and buffers that are not on ``device``.
+
+    The independent state probe behind :func:`retarget_wrapper_device`: a
+    ``.to()`` call that quietly did nothing looks exactly like one that worked.
+    """
+    import torch
+
+    target = torch.device(device)
+    bad: List[str] = []
+    for name, tensor in list(module.named_parameters()) + list(module.named_buffers()):
+        if tensor is None:
+            continue
+        # cuda:0 and cuda compare unequal as torch.device objects while naming
+        # the same card; the index is only meaningful when both sides have one.
+        same = tensor.device.type == target.type and (
+            target.index is None
+            or tensor.device.index is None
+            or tensor.device.index == target.index
+        )
+        if not same:
+            bad.append(f"{prefix}{name}@{tensor.device}")
+    return bad
 
 
 def load_talker_modeling():

@@ -178,15 +178,15 @@ class InProcessQwen3Tts:
         inner = getattr(self._model, "model", self._model)
         if hasattr(inner, "to"):
             inner.to(self.config.device)
-        # The wrapper cached its device in __init__, BEFORE that move, and its
-        # tokenizer builds every prompt on the cached value. Loading plainly
-        # and moving afterwards is what makes the snapshot stale, so the
-        # snapshot is refreshed in the same breath as the move. Unrefreshed,
-        # the first embedding lookup of the prompt assembly raises an
-        # index-on-cpu/weights-on-cuda device error. See
-        # qwen3_tts_compat.retarget_wrapper_device.
+        # `inner.to()` does NOT finish the job, and both halves of what it
+        # misses are silent on CPU. The wrapper cached its device in
+        # __init__ (stale prompts -> a device error), and the codec hangs off a
+        # PLAIN holder that is not in the module tree at all, so it stays on
+        # the CPU and costs 90% of every call. Both are repaired and verified
+        # here. See qwen3_tts_compat.retarget_wrapper_device.
         logger.info(
-            "wrapper device retargeted to %s", retarget_wrapper_device(self._model)
+            "device placement: %s",
+            retarget_wrapper_device(self._model, self.config.device),
         )
         # Non-persistent rotary buffers do not survive 5.x's meta-device
         # construction; unrefreshed they are NaN and the failure only surfaces
@@ -218,20 +218,31 @@ class InProcessQwen3Tts:
         victim choice at a grain that reflects that.
         """
         inner = getattr(self._model, "model", self._model)
+        # `code2wav` is not an attribute of THIS checkpoint's model -- the codec
+        # lives behind the plain `speech_tokenizer` holder. The old path
+        # therefore registered nothing for it and logged a warning nobody read,
+        # so the largest single audio asset was invisible to the register that
+        # exists to arbitrate exactly such assets. A registration that never
+        # binds has the same reach as no registration at all.
         candidates = [
             ("talker_trunk", self._resolve(inner, "talker.model")),
             ("code_predictor", self._resolve(inner, "talker.code_predictor")),
             ("speaker_encoder", self._resolve(inner, "speaker_encoder")),
-            ("codec_decoder", self._resolve(inner, "code2wav")),
+            ("codec", self._resolve(inner, "speech_tokenizer.model")),
         ]
+        missing = [name for name, module in candidates if module is None]
+        if missing:
+            # Loud, not a warning: an unledgered module is memory the #286
+            # register cannot see, park or evict, and the one-runtime law rests
+            # on that register being complete.
+            raise BackendError(
+                "tts",
+                f"audio modules {missing} were not found on the loaded model, "
+                "so their weights would be invisible to the asset register. "
+                "The checkpoint's module layout changed; fix the paths rather "
+                "than run with an incomplete ledger.",
+            )
         for name, module in candidates:
-            if module is None:
-                logger.warning(
-                    "audio module %s not found on the loaded model; it will "
-                    "not be ledger-visible and cannot be parked",
-                    name,
-                )
-                continue
             try:
                 self.ledger.register(name, module)
             except Exception as exc:  # pragma: no cover - defensive

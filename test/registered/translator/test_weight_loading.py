@@ -139,8 +139,31 @@ class TestWeightVerification(unittest.TestCase):
         )
 
 
+class _DetachedHolder:
+    """``Qwen3TTSTokenizer``'s shape: a PLAIN object owning an ``nn.Module``.
+
+    Not an ``nn.Module`` itself, so assigning it to a model does not register a
+    submodule and ``model.to(device)`` never reaches the weights inside. It
+    caches its own device at construction and places its inputs on that cache.
+    That is the whole bug, in five lines.
+    """
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.device = next(model.parameters()).device
+
+
+class _HostModel(torch.nn.Module):
+    """A model that owns a real submodule AND a detached holder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.talker = torch.nn.Linear(8, 8)
+        self.speech_tokenizer = _DetachedHolder(_TinyModel())
+
+
 class _StaleWrapper:
-    """The reference wrapper's device handling, reduced to its two lines.
+    """The outer wrapper's device handling, reduced to its two lines.
 
     ``Qwen3TTSModel`` snapshots ``self.device`` in ``__init__`` and its
     tokenizer moves every prompt onto that snapshot. Both are reproduced
@@ -158,14 +181,14 @@ class _StaleWrapper:
 
 
 class TestWrapperDeviceRetarget(unittest.TestCase):
-    """``meta`` stands in for ``cuda`` so the falsifier runs without a card.
+    """``meta`` stands in for ``cuda`` so the falsifiers run without a card.
 
     What matters is only that the model is moved to a device OTHER than the one
     the wrapper snapshotted; ``meta`` is such a device and needs no hardware.
     """
 
     def test_a_moved_model_leaves_the_snapshot_stale(self):
-        """THE FALSIFIER, negative half: this is the shipped bug, reproduced."""
+        """FALSIFIER 1, negative half: the shipped device error, reproduced."""
         model = _TinyModel()
         wrapper = _StaleWrapper(model)
         model.to("meta")
@@ -174,20 +197,77 @@ class TestWrapperDeviceRetarget(unittest.TestCase):
         self.assertEqual(next(model.parameters()).device.type, "meta")
 
     def test_retargeting_puts_the_prompt_where_the_weights_are(self):
-        """THE FALSIFIER, positive half: same setup, one call, prompt follows."""
+        """FALSIFIER 1, positive half: same setup, one call, prompt follows."""
         model = _TinyModel()
         wrapper = _StaleWrapper(model)
         model.to("meta")
-        returned = retarget_wrapper_device(wrapper)
-        self.assertEqual(returned.type, "meta")
+        report = retarget_wrapper_device(wrapper)
+        self.assertEqual(report["wrapper"], "meta")
         self.assertEqual(wrapper.device.type, "meta")
         self.assertEqual(wrapper.tokenize().device.type, "meta")
+
+    def test_a_detached_holder_is_NOT_moved_by_the_models_own_to(self):
+        """FALSIFIER 2, negative half: the RTF-24 bug, reproduced.
+
+        This is the one that cost 90% of every call: no exception, no warning,
+        just the codec left behind on the CPU.
+        """
+        host = _HostModel()
+        host.to("meta")
+        self.assertEqual(next(host.talker.parameters()).device.type, "meta")
+        self.assertNotIn("speech_tokenizer", host._modules)
+        held = host.speech_tokenizer
+        self.assertEqual(next(held.model.parameters()).device.type, "cpu")
+        self.assertEqual(held.device.type, "cpu")
+
+    def test_retargeting_takes_the_detached_holder_with_it(self):
+        """FALSIFIER 2, positive half."""
+        host = _HostModel()
+        wrapper = _StaleWrapper(host)
+        host.to("meta")
+        report = retarget_wrapper_device(wrapper)
+        self.assertEqual(report["speech_tokenizer"], "meta")
+        held = host.speech_tokenizer
+        self.assertEqual(next(held.model.parameters()).device.type, "meta")
+        self.assertEqual(held.device.type, "meta")
+
+    def test_an_explicit_device_is_held_against_the_model_not_assumed(self):
+        """The caller names where it moved the model; the probe checks it.
+
+        Passing a device the model is not actually on is the caller and the
+        weights disagreeing, which is the failure this whole function exists to
+        make impossible -- so it is refused rather than recorded.
+        """
+        host = _HostModel()
+        wrapper = _StaleWrapper(host)
+        with self.assertRaises(CompatError) as caught:
+            retarget_wrapper_device(wrapper, "meta")
+        self.assertIn("talker.weight@cpu", str(caught.exception))
+
+    def test_a_stranded_tensor_after_the_move_is_a_LOUD_failure(self):
+        """The independent state probe: a `.to()` that did nothing is caught.
+
+        A holder whose `.to()` is a no-op is exactly what a silent split
+        placement looks like from the outside, and it must not pass.
+        """
+
+        class _DeafHolder(_DetachedHolder):
+            def __init__(self, model):
+                super().__init__(model)
+                self.model.to = lambda *a, **k: self.model
+
+        host = _HostModel()
+        host.speech_tokenizer = _DeafHolder(_TinyModel())
+        wrapper = _StaleWrapper(host)
+        with self.assertRaises(CompatError) as caught:
+            retarget_wrapper_device(wrapper, "meta")
+        self.assertIn("still not on meta", str(caught.exception))
 
     def test_it_is_idempotent_and_safe_on_an_unmoved_model(self):
         model = _TinyModel()
         wrapper = _StaleWrapper(model)
         for _ in range(3):
-            self.assertEqual(retarget_wrapper_device(wrapper).type, "cpu")
+            self.assertEqual(retarget_wrapper_device(wrapper)["wrapper"], "cpu")
         self.assertEqual(wrapper.tokenize().device.type, "cpu")
 
     def test_a_wrapper_without_a_model_is_a_LOUD_failure(self):
