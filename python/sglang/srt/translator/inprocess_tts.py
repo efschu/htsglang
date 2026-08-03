@@ -145,6 +145,7 @@ class InProcessQwen3Tts:
             ensure_qwen3_tts_importable,
             refresh_rotary_buffers,
             restore_cache_position,
+            retarget_wrapper_device,
             verify_and_load_weights,
         )
 
@@ -177,6 +178,16 @@ class InProcessQwen3Tts:
         inner = getattr(self._model, "model", self._model)
         if hasattr(inner, "to"):
             inner.to(self.config.device)
+        # The wrapper cached its device in __init__, BEFORE that move, and its
+        # tokenizer builds every prompt on the cached value. Loading plainly
+        # and moving afterwards is what makes the snapshot stale, so the
+        # snapshot is refreshed in the same breath as the move. Unrefreshed,
+        # the first embedding lookup of the prompt assembly raises an
+        # index-on-cpu/weights-on-cuda device error. See
+        # qwen3_tts_compat.retarget_wrapper_device.
+        logger.info(
+            "wrapper device retargeted to %s", retarget_wrapper_device(self._model)
+        )
         # Non-persistent rotary buffers do not survive 5.x's meta-device
         # construction; unrefreshed they are NaN and the failure only surfaces
         # as a NaN probability tensor at sampling time. See

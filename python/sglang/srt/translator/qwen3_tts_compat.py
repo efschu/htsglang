@@ -56,6 +56,7 @@ __all__ = [
     "CompatError",
     "refresh_rotary_buffers",
     "restore_cache_position",
+    "retarget_wrapper_device",
     "verify_and_load_weights",
     "applied_shims",
 ]
@@ -618,6 +619,66 @@ def restore_cache_position(model_class) -> bool:
     model_class.prepare_inputs_for_generation = prepare_inputs_for_generation
     model_class._htsglang_cache_position_restored = True
     return True
+
+
+def retarget_wrapper_device(wrapper) -> "object":
+    """Refresh the reference wrapper's CACHED device after the model was moved.
+
+    ``Qwen3TTSModel.__init__`` snapshots the device once
+    (``inference/qwen3_tts_model.py:75-80``: ``self.device = getattr(model,
+    "device", None)``) and never looks at the model again. That snapshot is the
+    only thing ``_tokenize_texts`` uses (line 282, ``input_id =
+    input["input_ids"].to(self.device)``), so every tokenised prompt lands on
+    whatever device the model happened to be on at CONSTRUCTION time.
+
+    The reference always passed ``device_map=`` to ``from_pretrained``, so for
+    it the snapshot was correct by construction. We cannot: ``device_map``
+    routes through ``accelerate`` in transformers 5.x and accelerate is
+    deliberately absent from this venv, so the model is loaded plainly and
+    moved afterwards. That ordering leaves the snapshot saying ``cpu`` while
+    the weights sit on ``cuda:0``, and the first embedding lookup of the prompt
+    assembly dies with::
+
+        Expected all tensors to be on the same device, but got index is on
+        cpu, different from other tensors on cuda:0
+        (wrapper_CUDA__index_select)
+
+    at ``modeling_qwen3_tts.py:2178``. Note WHY the failure is at that exact
+    line and not earlier: every other tensor in the prompt assembly is built
+    with an explicit ``device=self.talker.device``, read live off the module.
+    ``input_id`` is the one tensor that comes in from outside carrying the
+    stale snapshot. On CPU the snapshot happens to be right, which is why the
+    whole desk path never saw it.
+
+    Fixing the snapshot rather than moving ``input_ids`` at the call site is
+    deliberate: the wrapper's own tokeniser is the single place prompts are
+    built, so one correct value there covers every generate entry point
+    (``generate_voice_clone``, ``generate_custom_voice``,
+    ``generate_voice_design``) instead of one call path.
+
+    Returns the device now recorded on the wrapper. Raises :class:`CompatError`
+    if the model has no parameters to read a device from, since silently
+    leaving a stale snapshot in place is the bug this exists to remove.
+    """
+    inner = getattr(wrapper, "model", None)
+    if inner is None:
+        raise CompatError(
+            "the TTS wrapper has no .model to read a device from; its cached "
+            "device cannot be refreshed and prompts would be built on the "
+            "wrong device"
+        )
+    device = getattr(inner, "device", None)
+    if device is None:
+        try:
+            device = next(inner.parameters()).device
+        except StopIteration as exc:
+            raise CompatError(
+                "the TTS wrapper's model has no parameters, so its device "
+                "cannot be determined; refusing to leave the cached device "
+                "stale"
+            ) from exc
+    wrapper.device = device
+    return device
 
 
 def load_talker_modeling():

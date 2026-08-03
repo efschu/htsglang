@@ -39,6 +39,7 @@ from safetensors.torch import save_file
 
 from sglang.srt.translator.qwen3_tts_compat import (
     CompatError,
+    retarget_wrapper_device,
     verify_and_load_weights,
 )
 
@@ -136,6 +137,83 @@ class TestWeightVerification(unittest.TestCase):
         torch.testing.assert_close(
             model.proj.bias, self.trained["proj.bias"], atol=1e-2, rtol=1e-2
         )
+
+
+class _StaleWrapper:
+    """The reference wrapper's device handling, reduced to its two lines.
+
+    ``Qwen3TTSModel`` snapshots ``self.device`` in ``__init__`` and its
+    tokenizer moves every prompt onto that snapshot. Both are reproduced
+    verbatim in shape, because the bug lives entirely in the gap between them.
+    """
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.device = getattr(model, "device", None)
+        if self.device is None:
+            self.device = next(model.parameters()).device
+
+    def tokenize(self):
+        return torch.zeros(3, dtype=torch.long).to(self.device)
+
+
+class TestWrapperDeviceRetarget(unittest.TestCase):
+    """``meta`` stands in for ``cuda`` so the falsifier runs without a card.
+
+    What matters is only that the model is moved to a device OTHER than the one
+    the wrapper snapshotted; ``meta`` is such a device and needs no hardware.
+    """
+
+    def test_a_moved_model_leaves_the_snapshot_stale(self):
+        """THE FALSIFIER, negative half: this is the shipped bug, reproduced."""
+        model = _TinyModel()
+        wrapper = _StaleWrapper(model)
+        model.to("meta")
+        self.assertEqual(wrapper.device.type, "cpu")
+        self.assertEqual(wrapper.tokenize().device.type, "cpu")
+        self.assertEqual(next(model.parameters()).device.type, "meta")
+
+    def test_retargeting_puts_the_prompt_where_the_weights_are(self):
+        """THE FALSIFIER, positive half: same setup, one call, prompt follows."""
+        model = _TinyModel()
+        wrapper = _StaleWrapper(model)
+        model.to("meta")
+        returned = retarget_wrapper_device(wrapper)
+        self.assertEqual(returned.type, "meta")
+        self.assertEqual(wrapper.device.type, "meta")
+        self.assertEqual(wrapper.tokenize().device.type, "meta")
+
+    def test_it_is_idempotent_and_safe_on_an_unmoved_model(self):
+        model = _TinyModel()
+        wrapper = _StaleWrapper(model)
+        for _ in range(3):
+            self.assertEqual(retarget_wrapper_device(wrapper).type, "cpu")
+        self.assertEqual(wrapper.tokenize().device.type, "cpu")
+
+    def test_a_wrapper_without_a_model_is_a_LOUD_failure(self):
+        """A stale snapshot left in place would be a silent wrong-device bug."""
+
+        class _Empty:
+            model = None
+
+        with self.assertRaises(CompatError):
+            retarget_wrapper_device(_Empty())
+
+    def test_a_model_without_parameters_is_a_LOUD_failure(self):
+        class _NoParams(torch.nn.Module):
+            pass
+
+        class _Wrapper:
+            def __init__(self):
+                self.model = _NoParams()
+                self.device = torch.device("cpu")
+
+        wrapper = _Wrapper()
+        # transformers' `.device` property is what a real model would expose;
+        # a bare nn.Module has none, so this exercises the parameter fallback.
+        self.assertIsNone(getattr(wrapper.model, "device", None))
+        with self.assertRaises(CompatError):
+            retarget_wrapper_device(wrapper)
 
 
 if __name__ == "__main__":
