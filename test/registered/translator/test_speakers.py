@@ -242,6 +242,39 @@ class TestIntraSegmentSpeakerChange(unittest.TestCase):
         windows = [_vec(0), _vec(3), _vec(1), _vec(2)]
         self.assertEqual(split_points_by_dispersion(windows), ())
 
+    def test_a_reference_survives_a_rate_change_instead_of_vanishing(self):
+        """THE FALSIFIER for the empty-reference bug.
+
+        The registry stores at the 16 kHz pipeline rate; the real synthesizer
+        asks for 24 kHz. Asking at a DIFFERENT rate used to drop every slice
+        and return an empty clip silently, and the turn then died in the TTS
+        with "reference is 0.00s" for a speaker holding seconds of admitted
+        audio. Every desk test asked at the storage rate, which is why none of
+        them could see it.
+        """
+        registry = SpeakerRegistry(SpeakerRegistryConfig(min_slice_s=0.5))
+        audio = _speech(3.0, rate=16000)
+        profile, _sim, admitted = registry.assign(
+            embedding=_vec(0.0),
+            audio=audio,
+            text="hallo",
+            language="de",
+            language_confidence=0.9,
+        )
+        self.assertTrue(admitted)
+
+        at_storage_rate = profile.reference_audio(16000)
+        self.assertAlmostEqual(at_storage_rate.duration_s, 3.0, places=1)
+
+        # The rate the real backend actually asks for.
+        at_backend_rate = profile.reference_audio(24000)
+        self.assertEqual(at_backend_rate.sample_rate, 24000)
+        self.assertAlmostEqual(
+            at_backend_rate.duration_s, 3.0, places=1,
+            msg="the reference vanished when asked for at the backend's rate",
+        )
+        self.assertGreater(float(np.abs(at_backend_rate.samples).max()), 0.0)
+
     def test_a_back_to_back_speaker_change_is_located(self):
         windows = [_vec(0), _vec(2), _vec(85), _vec(87)]
         self.assertEqual(split_points_by_dispersion(windows), (2,))

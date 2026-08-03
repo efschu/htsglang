@@ -114,16 +114,37 @@ class SpeakerProfile:
 
         Ordered best-first so that a backend which truncates its reference
         (several do, at 10-15 s) truncates the *worst* material.
+
+        A slice recorded at a different rate is RESAMPLED, never skipped. It
+        used to be skipped, and the consequence was invisible until a real
+        backend ran: the registry stores at the 16 kHz pipeline rate while
+        Qwen3-TTS asks for 24 kHz, so every slice was dropped and this
+        returned an EMPTY clip -- silently, because the caller's
+        ``reference_seconds()`` guard had already passed on the stored
+        durations. The turn then died in the synthesizer with "reference is
+        0.00s, need >= 3.0s" for a speaker holding 6.2 s of admitted audio.
+        The desk suite could not see it: its fake TTS runs at the pipeline
+        rate, so the rates always matched and the filter never dropped
+        anything.
         """
+        from sglang.srt.translator.audio import resample
+
         if not self.references:
             raise ReferenceTooShort(self.speaker_id, 0.0, 0.0)
         ordered = sorted(self.references, key=lambda i: (-i.score, -i.added_at))
         rate = sample_rate or ordered[0].audio.sample_rate
         merged = AudioChunk(np.zeros(0, dtype=np.float32), rate)
         for item in ordered:
-            if item.audio.sample_rate != rate:
-                continue
-            merged = merged.concat(item.audio)
+            audio = item.audio
+            if audio.sample_rate != rate:
+                audio = resample(audio, rate)
+            merged = merged.concat(audio)
+        if merged.duration_s <= 0.0:
+            # Unreachable by construction (`references` is non-empty and every
+            # slice now survives), which is exactly why it is asserted: this
+            # method returning an empty clip is not an error anywhere
+            # downstream, it is a turn that dies three layers away.
+            raise ReferenceTooShort(self.speaker_id, 0.0, 0.0)
         return merged
 
     def reference_text(self) -> str:
