@@ -1981,6 +1981,23 @@ Llama family, Mistral Small 24B FP8 + ministral3 SWA fix, Deckard-40B/Tess-27B,
 OWN sm86+sm120 attention paths (e4m3 bit-decode, f32 staging, indexer arch
 dispatch, torch/triton reference-twin parity: indexer mask oracle, SWA
 page-index wrap oracle, page-table rounding, top-k seq_len contract).
+**The sm120 SWA page-split is MASKED since #471** (port of upstream #32320,
+`204e0fbac0`): `_page_split_kernel` no longer rewrites the whole pbs=256 pool
+into its pbs=64 view every decode step. `_page_mark_kernel` sets one int8 byte
+per source page from the token indices (`mask[token // src_pbs] = 1`, -1
+skipped) and the split kernel returns early for an unmarked page, so ~2*batch
+pages are copied instead of the pool. Untouched destination pages keep stale
+bytes by design — sound because the caller reads only the pages the same
+indices address. Upstream's ITL/TPOT numbers are NOT reproduced here; the port
+is desk-pinned only (`TICKET_471_masked_page_split.md` carries the window
+recipe, incl. a one-line in-tree control arm). The page-split region is
+byte-identical to upstream before and after the port; only `_flash_mla_flashinfer`
+is fork-adapted (idx computed before the split). Tests:
+`test/registered/unit/layers/attention/test_flash_mla_page_split_mask_471.py`,
+10 hermetic, four executed can-fail arms — they run the REAL Triton kernels
+through `TRITON_INTERPRET=1` on CPU, which is how an SM120-only kernel becomes
+falsifiable at the desk; the compiled arm is
+`test_flash_mla_backends.py::TestTouchedPageSplit` (SM120-gated, unrun).
 The torch paged-MQA indexer logits are chunked on BOTH axes — KV positions
 (#426) and query rows under a per-rank MiB budget (#449,
 `SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`, converted with that rank's own head
