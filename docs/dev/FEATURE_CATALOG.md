@@ -2094,6 +2094,75 @@ adapter that distinguishes "not yet" from "no more" (with an idle timeout),
 and a sliding-window in/out fps accounting exposed on the job status for the
 #344 live watch. Finished sources keep the depth-1 bridge unchanged.
 
+**The Anthropic Messages front is complete enough to back a Claude Code agent
+loop** (#530): `POST /v1/messages` (`http_server.py:2578`) plus
+`POST /v1/messages/count_tokens` (`:2588`), SSE deltas in Anthropic event
+shape, and NO model-name validation — an unknown id is echoed back
+(`{"model":"claude-sonnet-4-5"}` and `{"model":"default"}` both answer 200).
+That last property is what makes a checkpoint switch invisible to clients that
+pin a name, the #466 translator's `--mt-model default` included. Reach, stated
+at the width of what was checked: a real `claude` CLI process (2.1.220) driven
+against a live 27B boot returned correct determined answers, so no
+LiteLLM-class OpenAI translation proxy is needed for this — but two client-side
+settings are load-bearing and are NOT defaults: `MAX_THINKING_TOKENS=0`,
+because Claude Code requests an Anthropic `thinking` block and a boot without
+`--reasoning-parser` answers `400 Anthropic thinking is not supported for
+models without a reasoning parser`; and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, because
+the default 32000-token completion request plus the ~20k-token system prompt
+overruns a 32k-context boot. Claude Code itself has NO per-subagent endpoint
+binding (the subagent frontmatter schema carries no `baseUrl`/`provider`/`env`
+key; every `ANTHROPIC_*_BASE_URL` is process-global), so the fork ships the
+named fallback rather than the feature: `scripts/dev/local_model_agent.sh`
+starts a separate `claude` process with a process-scoped environment, and
+`scripts/dev/register_local_model.sh` regenerates `.claude/agents/local-model.md`
+from `GET /v1/models` so the entry follows a serving switch. Runbook §13.
+**The usability trias — chat template + `--reasoning-parser` +
+`--tool-call-parser` — is a STANDARD boot setting, not a tuning knob** (user
+standing order 2026-08-03, #531). A boot missing them answers HTTP 200 while
+degrading silently in three separate ways, all observed on this rig's FP8 boot:
+chain-of-thought lands in `content` as raw `</think>` text, an Anthropic
+`thinking` block is refused with `400 Anthropic thinking is not supported for
+models without a reasoning parser`, and a tool call returns as a JSON-looking
+STRING rather than a structured `tool_calls` entry. The mapping is CODE, not a
+doc table: `planner/flags.py::usability_parsers` resolves the pair from the
+checkpoint's `architectures` (path as fallback) over a squashed identity
+string, so `Qwen3.6-27B`, `qwen3_5` and `Qwen3_5ForConditionalGeneration` all
+resolve alike; the table is ordered specific-first because `v3` is a substring
+of `v32`; and `validate_usability_parsers()` checks every emitted name against
+the live `ReasoningParser.DetectorMap` / `FunctionCallParser.ToolCallParserEnum`
+so a registry rename turns the mapping red instead of shipping a flag the
+server rejects. Both planner command generators emit it
+(`feasibility.py::_launch_flags`, `key_solver.py::_usability_launch_flags`) and
+an unrecognised family emits a NAMED HINT instead of a bare command.
+`register_local_model.sh` reads the live `/server_info` and writes
+`current boot lacks <what>; agentic tool use degraded` into the generated agent
+header. Scope is deliberately serving-only: the measurement arms under
+`gpu_battery/`, `dual_group/`, `probe*/`, `determinism/`, `nordstern/` are NOT
+patched, because a reasoning parser moves text out of `content` and would shift
+the very token accounting those arms produce. Boot-proven on the INT8 instance:
+template applied (system rule obeyed two turns later, zero marker leak),
+reasoning split into `reasoning_content` (1103 chars, no `</think>` in
+content), tool call parsed to `get_weather{"city":"Oslo"}`. Tests:
+`test/registered/unit/test_usability_parsers_531.py`, 11 hermetic + 13
+subtests, three executed can-fail arms (pre-fix token-set match → dotted
+families go None; `v3` row moved ahead of `v32` → wrong point-release parser;
+bogus name injected → registry check fires).
+**Coexistence reserves come from a co-tenant's DECLARED budget, never from a
+momentary observation** (#530, runbook §4.1): the #466 translator held 4204 MiB
+on the 5090 while declaring 7500, so the INT8 boot reserved `13000,3800,3800`
+(5500 long-prompt + 7500 declared) rather than sizing against what nvidia-smi
+happened to show. Cost ~135k KV tokens, bought a coexistence that survives the
+tenant growing into its own budget.
+**Checkpoint switching is a RESTART, and the three live routes were priced at
+their source before that verdict** (runbook §14): `update_weights_from_disk`
+refills the EXISTING module tree and rebuilds neither the quant methods nor the
+pool geometry (`model_runner.py:2536-2563`, with its own rollback branch at
+`:2548-2556`); the #305 registry's HOT promotion boots a SEPARATE PROCESS on
+its own port (`registry/adapters/class1_srt.py:220-241`, `build_argv` at
+`:279-290`) and its demotion actuator refuses an engine it did not start
+(`:411-415`); the #274 dual-group lane is a second GROUP over the SAME tensors
+by `data_ptr` identity (`dual_group_lane.py:15-27`), not a second model.
+
 ## 14. Dashboard
 Guided config wizard whose refusals each cite their source and which never emits
 a flag it cannot explain (`planner/wizard.py:703-714`, `:1521`, plus

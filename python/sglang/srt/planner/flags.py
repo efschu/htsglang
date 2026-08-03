@@ -3322,3 +3322,141 @@ class ProfileStore:
         del by_name[name]
         self._write(by_name)
         return True
+
+
+# ---------------------------------------------------------------------------
+# Usability parsers (#531): every generated boot command carries the
+# model-family reasoning + tool-call parser.
+#
+# User standing order 2026-08-03: --reasoning-parser and --tool-call-parser are
+# STANDARD boot settings, not tuning knobs -- "damit man die modelle auch
+# nutzen kann". Without them a reasoning checkpoint's chain-of-thought lands in
+# `content` as raw `</think>` text and a tool call arrives as a JSON-looking
+# STRING instead of a structured `tool_calls` entry, so every agentic client
+# silently degrades while the server reports HTTP 200.
+#
+# The mapping is keyed on identity TOKENS of the architecture/name, and the
+# emitted names are CHECKED against the live parser registries (see
+# `validate_usability_parsers`) rather than trusted -- a registry rename must
+# turn this red, not ship a boot command with a flag value the server rejects.
+# ---------------------------------------------------------------------------
+
+#: (identity tokens that must ALL appear, reasoning parser, tool-call parser).
+#: Ordered: the first match wins, so more specific rows come first.
+_USABILITY_PARSER_TABLE: Tuple[Tuple[Tuple[str, ...], Optional[str], Optional[str]], ...] = (
+    # DeepSeek: the V4 family has its own detector pair; V3.x shares deepseek-v3
+    # reasoning with a point-release tool-call parser.
+    (("deepseek", "v4"), "deepseek-v4", "deepseekv4"),
+    (("deepseek", "v32"), "deepseek-v3", "deepseekv32"),
+    (("deepseek", "v31"), "deepseek-v3", "deepseekv31"),
+    (("deepseek", "v3"), "deepseek-v3", "deepseekv3"),
+    (("deepseek", "r1"), "deepseek-r1", "deepseekv3"),
+    # Qwen3.x (this rig's default family). Token stays undotted-joined because
+    # _name_tokens does not split on '.', so "qwen3.6" contains "qwen3".
+    (("qwen3",), "qwen3", "qwen3_coder"),
+    (("qwen2",), None, "qwen25"),
+    # Others with a registered pair.
+    (("glm", "47"), "glm45", "glm47"),
+    (("glm", "45"), "glm45", "glm45"),
+    (("gpt", "oss"), "gpt-oss", "gpt-oss"),
+    (("kimi", "k2"), "kimi_k2", "kimi_k2"),
+    (("minimax", "m3"), "minimax-m3", "minimax-m3"),
+    # Written "Step-3.5" on disk, which squashes to "step35"; the registered
+    # parser names spell it "step3p5".
+    (("step35",), "step3p5", "step3p5"),
+    (("gemma4",), "gemma4", "gemma4"),
+    (("hunyuan",), "hunyuan", "hunyuan"),
+    (("mistral",), "mistral", "mistral"),
+    (("llama3",), None, "llama3"),
+)
+
+
+def _usability_identity(model_path: str, model_cfg: Optional[dict] = None) -> str:
+    """One SQUASHED lowercase identity string for parser selection: the
+    checkpoint's ``architectures`` (authoritative -- a renamed directory cannot
+    fool it) concatenated with the path basename, with every separator AND dot
+    removed.
+
+    Squashing rather than tokenising is deliberate: the family marker is
+    written five different ways across real checkpoints -- ``Qwen3.6-27B``,
+    ``qwen3_5``, ``Qwen3_5ForConditionalGeneration``, ``DeepSeek-V4-Flash``,
+    ``glm-4.7`` -- and only a separator-free form makes ``qwen3``, ``v4`` and
+    ``glm47`` all findable by one rule. Table rows are matched as SUBSTRINGS of
+    this string, which is why the table is ordered specific-first (``v32``
+    before ``v3``): ``v3`` is a substring of ``v32``.
+    """
+    raw: List[str] = []
+    archs = _cfg_get(model_cfg, "architectures")
+    if isinstance(archs, list):
+        raw.extend(str(a) for a in archs)
+    elif isinstance(archs, str):
+        raw.append(archs)
+    if not raw:
+        raw.append(_draft_config_arch(str(model_path or "")))
+    raw.append(os.path.basename(str(model_path or "").rstrip("/")))
+    joined = " ".join(chunk for chunk in raw if chunk)
+    return re.sub(r"[^a-z0-9]+", "", joined.lower())
+
+
+def usability_parsers(
+    model_path: str, model_cfg: Optional[dict] = None
+) -> Tuple[Optional[str], Optional[str], str]:
+    """Resolve ``(reasoning_parser, tool_call_parser, note)`` for a checkpoint.
+
+    An unrecognised family returns ``(None, None, <named hint>)`` -- the
+    caller must surface the hint rather than emit a bare command, because a
+    silently parser-less boot is exactly the failure this exists to prevent.
+    """
+    identity = _usability_identity(model_path, model_cfg)
+    for needed, reasoning, toolcall in _USABILITY_PARSER_TABLE:
+        if all(n in identity for n in needed):
+            note = f"parser family resolved from {'+'.join(needed)}"
+            if reasoning is None:
+                note += " (no reasoning parser registered for this family)"
+            return reasoning, toolcall, note
+    return (
+        None,
+        None,
+        "UNKNOWN MODEL FAMILY for --reasoning-parser/--tool-call-parser: "
+        f"{os.path.basename(str(model_path or '')) or model_path!r} matched no "
+        "entry in the parser table. Pick the parsers by hand from the "
+        "registered names (sglang.srt.parser.reasoning_parser.ReasoningParser."
+        "DetectorMap and sglang.srt.function_call.function_call_parser."
+        "FunctionCallParser.ToolCallParserEnum) and add the family here. "
+        "Booting WITHOUT them serves the model with its chain-of-thought as "
+        "raw text in `content` and tool calls as unparsed strings.",
+    )
+
+
+def usability_argv(
+    model_path: str, model_cfg: Optional[dict] = None
+) -> Tuple[List[str], str]:
+    """``usability_parsers`` rendered as argv plus the note to print."""
+    reasoning, toolcall, note = usability_parsers(model_path, model_cfg)
+    argv: List[str] = []
+    if reasoning:
+        argv += ["--reasoning-parser", reasoning]
+    if toolcall:
+        argv += ["--tool-call-parser", toolcall]
+    return argv, note
+
+
+def validate_usability_parsers() -> List[str]:
+    """Every name in the table must exist in the live registries. Returns the
+    list of problems (empty = consistent). Import-guarded: a registry that
+    cannot be imported yields no verdict rather than a false failure."""
+    try:
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+    except Exception as exc:  # noqa: BLE001 - absence is not a mapping error
+        return [f"registries unavailable, mapping unchecked: {exc}"]
+    known_reasoning = set(ReasoningParser.DetectorMap)
+    known_toolcall = set(FunctionCallParser.ToolCallParserEnum)
+    problems: List[str] = []
+    for needed, reasoning, toolcall in _USABILITY_PARSER_TABLE:
+        key = "+".join(needed)
+        if reasoning is not None and reasoning not in known_reasoning:
+            problems.append(f"{key}: reasoning parser {reasoning!r} is not registered")
+        if toolcall is not None and toolcall not in known_toolcall:
+            problems.append(f"{key}: tool-call parser {toolcall!r} is not registered")
+    return problems

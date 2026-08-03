@@ -38,6 +38,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --context-length 8192 \
   --max-running-requests 4 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --trust-remote-code --disable-custom-all-reduce \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
