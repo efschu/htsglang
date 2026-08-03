@@ -1450,6 +1450,60 @@ the verification encoder, never the synthesis one.
 
 ---
 
+## 15b. The preset pool, measured — and the trade-off the fix exposed
+
+All 36 clips exist: 18 German anchors from VoiceDesign, 18 Spanish derived by
+cloning those anchors. Measured with `wespeaker_en_voxceleb_resnet34_LM`
+(instrument spread 0.832 over the control clips, so the numbers mean
+something).
+
+**The derive fix worked on its target.** Cross-language identity went from
+0.044–0.505 to only three presets below the 0.60 floor, and those three sit at
+0.586 / 0.592 / 0.594 — marginally under an arbitrary line rather than being
+different people. That defect is closed.
+
+**It also cost within-class distinctness, exactly as the script warned it
+might.** Cloning every Spanish clip from one reference compresses the voice
+space: all clones come from one model and sound more alike than the
+independently designed originals.
+
+| class | before derive (es) | after derive (es) |
+|---|---|---|
+| man, median | 0.400 | 0.556 |
+| man, closest pair | 0.599 | **0.743** |
+| woman, closest pair | 0.453 | **0.777** |
+
+Five pairs now sit at or above the registry's 0.70 same-speaker line:
+`girl-01/girl-03` (0.738 de, 0.873 es), `man-03/man-06` (0.743 es),
+`woman-02/woman-04` (0.734 de, 0.777 es). Two participants handed those two
+presets would be indistinguishable to the listener — and to the registry.
+
+**Verdict: the pool is NOT ready to hand out.** Recommended fix, cheapest
+first and reversible:
+
+1. **Drop one member of each colliding pair** (`girl-03`, `man-06`,
+   `woman-04`). That leaves 5 man / 5 woman / 2 girl / 3 boy = 15 mutually
+   distinct voices. The design's own priority is explicit — "distinctness
+   beats class match" — so a distinct 15 is worth more than a colliding 18,
+   and 15 still covers the stated realistic worst case of 6–8 participants.
+2. Only if a fuller pool is wanted: re-render the dropped descriptors with new
+   seeds and re-measure. Seeds are pinned so that a re-render reproduces the
+   same voices; changing one is therefore a deliberate, recordable act, not a
+   retry.
+
+**A caveat on the absolute numbers, stated rather than buried.** The control
+set is the XTTS demo clips, whose speaker identities are not independently
+verified; two of them score 0.784, which is above the same-speaker line. So
+the control proves the encoder HAS dynamic range — which is what it is used
+for — but it does not calibrate an absolute threshold. The 0.70 line comes
+from the registry, which is the operationally meaningful place, and the
+relative before/after comparisons above are unaffected either way.
+
+Nothing here blocks `clone` mode, which is the primary path; the pool is the
+fallback.
+
+---
+
 ## 16. Handover, 2026-08-03 (end of Phase 3 working session)
 
 Branch `feat/live-translator-466`, pushed, tree clean, 286 hermetic tests
@@ -1477,21 +1531,17 @@ CUDA_VISIBLE_DEVICES=99 PYTHONPATH=<repo>/python \
 | TTS | **real** — Qwen3-TTS in process, cross-lingual clone at WER 0.100 |
 | routing (pairs, fan-out, constrained detection) | real, tested |
 | **MT** | **the one gap** — HTTP client to our own 27B; that server must be running |
-| preset voices | pool incomplete (see 16.2); `clone` mode is unaffected |
+| preset voices | all 36 clips rendered, but 5 pairs collide (§15b) — `preset` mode not ready; **`clone` mode is unaffected and is the primary path** |
 
 So: a full DE↔ES conversation in `clone` voice mode is reachable as soon as
 the 27B endpoint is up. Nothing else in the tenant is a stub.
 
 ### 16.2 Immediate next steps, in order
 
-1. **Finish the pool.** German anchors were rendering when this session ended
-   (12/18 at last check, `--languages de`, ~3 min/clip on CPU). Then:
-   `derive_preset_languages.py --anchor de --languages es`, then
-   `check_preset_pool.py`. The verdict must show cross-language similarity
-   clearing 0.60 AND within-class distinctness not having regressed — cloning
-   one anchor into two languages could in principle pull two presets together,
-   which is why the checker reports both. `woman-02.de` / `woman-04.de` at
-   0.734 already needs a re-render or a descriptor edit.
+1. ~~**Finish the pool.**~~ **Rendered and measured — see §15b.** All 36 clips
+   exist. Cross-language identity is fixed; within-class distinctness
+   regressed and five pairs now collide. Next action is the §15b step 1 drop
+   of `girl-03` / `man-06` / `woman-04`, which needs no GPU.
 2. **GPU latency.** `latency_window.py` is written and unused; window 4 held
    all three cards for this entire session. It prints an A-vs-A floor before
    any number and is time-boxed. The MT row stays empty until the 27B is up.
