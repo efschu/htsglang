@@ -4880,12 +4880,35 @@ environment. That process is a full agent loop, not a single completion call.
 scripts/dev/register_local_model.sh -b http://127.0.0.1:30030
 
 # writes:
-#   .claude/agents/local-model.md              the agent definition
+#   ~/.claude/agents/local-model.md            the agent definition (USER-GLOBAL)
 #   ~/.config/htsglang/local_model_agent.env   defaults for the wrapper
+# and then VERIFIES the agent file at the path that is actually read, printing
+#   register_local_model: VERIFIED agent 'local-model' at /root/.claude/agents/local-model.md
 
 # run the local model as an agent loop
 scripts/dev/local_model_agent.sh -t 1024 -T 360 -- "your prompt"
 ```
+
+**The agent file must land where a session READS it, and the script now proves
+it does** (#531 follow-up, user-caught defect). The first version wrote to
+`$REPO_ROOT/.claude/agents` — for a worktree checkout that is a directory no
+Claude Code session ever loads, because project agents come from the SESSION's
+own project directory. The `local-model` type therefore appeared in no agent
+list at all while the script cheerfully printed `wrote …`. The wrapper
+round-trip did not catch it and structurally could not: `local_model_agent.sh`
+reads `~/.config/htsglang/local_model_agent.env`, never the agent file, so it
+proved the WRAPPER and never the REGISTRATION. Two things changed: the default
+target is the user-global `~/.claude/agents`, and the script's closing probe
+re-reads the written file at that path, checks the `name:` frontmatter and
+prints the absolute path, exiting non-zero if it is missing or unusable. A
+`--agent-dir` pointing at neither the user-global dir nor the current project
+exits 7 with a named refusal (`--allow-unread-agent-dir` opts out for test
+harnesses).
+
+Note the session-lifetime rule that follows from this: **a session loads its
+agent list at START.** After a re-registration the `local-model` type appears
+in NEW sessions; the session that ran the script keeps the list it booted with
+and must drive the model through `local_model_agent.sh` directly.
 
 Nothing about the checkpoint is hardcoded in either file: the id, the context
 length and the residency are read out of `GET /v1/models` (including the
