@@ -3818,3 +3818,83 @@ next phone connect (§19.8(b)), and §19.9.
 -- do not "simplify" it back to a per-append `atBottom()` sample. The gate's
 visibility predicate is deliberately asymmetric about the top edge and the
 reason is written at both copies.
+
+#### 17.8.15 The restart bundle is deployed, and the warmup is unproven (seventh session, end)
+
+**Live: tenant PID 3893121, client `e777cd20dd`.** One restart carried the
+whole bundle: `turn.speech`, the MT retry, `--mt-timeout-s`, `--mt-lane` (all
+Cut A, undeployed since §17.8.12), plus `speaker.merge` + its REST route + the
+`supports` key, plus the `require_pair` degradation and the boot warmup. Read
+back off the live socket: `supports {'speaker_merge': True,
+'partial_participants': True}`.
+
+**Gate: 2x PASS on `e777cd20dd`** (`gate_bundle_a.log`, `gate_bundle_b.log`),
+4 turns each with the reload and stop arms, `frames after stop 0, quiet
+20.2 s`, console clean, the auto-scroll arm green on every sample. The merge
+capability arms only now, so it was exercised against the LIVE server directly:
+target survives with its label, source gone, and the three refusals answer
+404 / 400 / 400.
+
+**REQUIRE_PAIR DEGRADATION.** The constructor's
+`conversation.validate_against(matrix)` raised on the first unservable
+direction, so one participant language without a TTS voice refused the whole
+conversation and took every other chosen language with it. The turn path
+already degraded per target; only the constructor was all-or-nothing. It now
+opens on the servable directions and tags the rest with `turn.unrouted` (an
+error toast per utterance would make a conversation working in one direction
+look broken in both). No servable direction at all is still refused.
+`PARTIAL_PARTICIPANTS_SUPPORTED` is gone -- the picker asks the server, same
+capability mechanism as the merge gesture.
+
+A PIN HAD TO CHANGE: `test_an_unroutable_pair_is_refused_not_guessed` asserted
+the constructor raises. Rewritten rather than deleted, around what did NOT
+change and what its name is about -- nothing is guessed: the unservable
+direction produces no translation and no substituted target (`mt.calls == []`),
+it produces a tagged turn naming the stage.
+
+**THE WARMUP IS UNPROVEN AND THE CONTROL SAYS SO.** It was built to remove the
+~15 s first-turn cold start. Same build, two boots differing only in the flag,
+gate turns:
+
+```
+  --no-warmup   turn 1 tts_first_audio  7.38 s   turn 2 2.36 s
+  --warmup      turn 1 tts_first_audio 12.75 s (tts_wait 5.83 s)
+  --warmup      turn 1 tts_first_audio  5.71 s   (final boot)
+```
+
+Two things fall out. **The 15 s cold start did not reproduce** -- the
+first-turn penalty without any warmup is about 5 s (7.38 against a 2.36 warm
+turn). And **the warmup shows no measurable benefit**: its two first-turn
+samples, 12.75 s and 5.71 s, straddle the control. The coordinator's
+acceptance criterion (first turn under 3 s of talker share) is **RED in both
+configurations**.
+
+Single samples, no repetition, so none of these is an estimate; what they
+jointly refuse is the claim that the warmup removes the cold start. The
+mechanism is left on -- it costs ~4 s of boot and this rig's "cold" boot still
+reuses a hot driver and page cache, so it is not the cold start a fresh
+machine has -- but the log line now states only what it did (`talker warmup:
+6 chunks in 4.35s`), the flag help says UNPROVEN with the numbers, and the
+docstring carries the control. **The next session either produces a repeated
+A-vs-A or turns the default off.** Do not restore the "turn 1 no longer pays
+the cold start" wording; it is the exact success-claim-without-evidence class
+this repo has a rule about, and it survived one commit before the control
+caught it.
+
+**Also caught here:** the first boot with the warmup printed `translator
+ready` five seconds BEFORE `talker warm`. The port ordering was always right
+(uvicorn starts after the synthesis, so no turn can reach the cold path), but
+the log announced readiness while the talker was still cold. Fixed by moving
+the call above the readiness line.
+
+**Harness note for the next session:** gate runs launched into the background
+from a tool call are reaped and exit after two log lines with no error. Run
+the gate in the FOREGROUND with a bounded `timeout`; four runs were lost to
+this before it was diagnosed. The same session lost time to `until ! pgrep -f
+"<pattern>"` wait loops whose own command line matches `<pattern>` -- they
+never exit. Wait on a PID.
+
+**Next:** §19.5 Opus 48k uplink, the man-02 listening check, the
+`getSettings()` telemetry of the next phone connect (§19.8(b)), §19.9 -- all
+behind the DSV4F focus window, which takes serving and this tenant down for a
+while; its agent reboots the tenant at the end of that window.

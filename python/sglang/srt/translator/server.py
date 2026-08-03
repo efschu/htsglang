@@ -193,12 +193,30 @@ class TranslatorService:
     async def warmup(self) -> Dict[str, object]:
         """Synthesize one throwaway sentence before the port is opened.
 
-        THE DEFECT THIS EXISTS FOR: the first real turn of every boot paid
-        ~15 s that no later turn pays. A zero-shot cloning backend does its
-        kernel autotuning, its CUDA graph capture and its first weight touch
-        on the first `synthesize` call, and turn 1 of a live conversation is
-        the worst possible place to spend it -- it is also the turn on which
-        somebody decides whether this thing works.
+        WHAT THIS WAS WRITTEN FOR: the first real turn of every boot was
+        reported to pay ~15 s that no later turn pays -- a zero-shot cloning
+        backend does its kernel autotuning, its graph capture and its first
+        weight touch on the first `synthesize` call, and turn 1 of a live
+        conversation is the worst possible place to spend it.
+
+        AND IT IS NOT PROVEN TO DO IT. Measured on this rig, same build, two
+        boots differing only in this flag, one gate turn each:
+
+            --no-warmup   turn 1 tts_first_audio 7.38 s, turn 2 2.36 s
+            --warmup      turn 1 tts_first_audio 12.75 s (tts_wait 5.83 s)
+
+        So (a) the 15 s cold start did not reproduce -- the first-turn penalty
+        without any warmup is about 5 s, and (b) the boot that DID warm up was
+        slower on its first turn, most of the difference sitting in a
+        `tts_wait` this has not explained. Single samples, no repetition, so
+        neither number is an estimate; what they jointly refuse is the claim
+        that this removes the cold start.
+
+        It is left on by default because it is cheap (~4 s of boot) and the
+        rig's "cold" boot still reuses a hot driver and page cache, so this is
+        not the cold start a fresh machine has. But the honest state is
+        UNPROVEN, the log line says only what it did, and the next session
+        should either produce a repeated A-vs-A or turn the default off.
 
         Run BEFORE `uvicorn.run`, so the port is not open until the talker is
         warm. That is stronger than warming behind a ready flag: there is no

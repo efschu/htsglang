@@ -110,13 +110,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mt-model", default="default")
     parser.add_argument(
         "--warmup", dest="warmup", action="store_true", default=True,
-        help="synthesize one throwaway sentence before opening the port, so "
-             "the first real turn does not pay the talker's one-off "
-             "initialisation (~15 s measured). On by default",
+        help="synthesize one throwaway sentence before opening the port. "
+             "UNPROVEN on this rig: the same-build control boot measured a "
+             "first-turn talker share of 7.38 s without it against 12.75 s "
+             "with it (single samples each), so it has shown no benefit here "
+             "and the 15 s cold start it was written for did not reproduce. "
+             "Kept on by default pending a proper A-vs-A -- see "
+             "TranslatorService.warmup",
     )
     parser.add_argument(
         "--no-warmup", dest="warmup", action="store_false",
-        help="open the port immediately and let turn 1 pay the cold start",
+        help="open the port as soon as the backends are loaded",
     )
     parser.add_argument(
         "--mt-lane", default="fast",
@@ -389,20 +393,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.warmup:
         report = asyncio.run(service.warmup())
         if report["ran"]:
+            # States what it DID, not what it is hoped to buy. The first
+            # version of this line said "turn 1 no longer pays the cold
+            # start"; the control boot says otherwise (see
+            # `TranslatorService.warmup`), and a log asserting an unmeasured
+            # benefit is how an unproven default survives review.
             logger.info(
-                "talker warm after %.2fs (%d chunks, %s, voice %s) -- turn 1 "
-                "no longer pays the cold start",
-                report["seconds"], report["chunks"], report["language"],
+                "talker warmup: %d chunks in %.2fs (%s, voice %s)",
+                report["chunks"], report["seconds"], report["language"],
                 report["voice_id"],
             )
         else:
             # Never fatal, and never silent: a boot that quietly skipped the
             # warmup looks identical to one that did it, right up to the 15 s
             # the user waits for their first sentence.
-            logger.warning(
-                "talker warmup did not run (%s) -- turn 1 will pay the cold "
-                "start", report["reason"],
-            )
+            logger.warning("talker warmup did not run (%s)", report["reason"])
 
     languages = service.languages()
     logger.info(
