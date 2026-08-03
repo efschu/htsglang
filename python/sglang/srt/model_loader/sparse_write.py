@@ -245,7 +245,7 @@ class SparseFileWriter:
                 self._punch((e - s) * page)
                 self.stats.hole_pages += e - s
 
-    def __enter__(self) -> "SparseFileWriter":
+    def __enter__(self) -> SparseFileWriter:
         return self
 
     def __exit__(self, *exc) -> None:
