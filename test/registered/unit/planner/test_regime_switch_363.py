@@ -35,7 +35,7 @@ shard. It is pinned on a readable 12-unit toy grid in
 
 import unittest
 
-from sglang.srt.planner.cost_model import Rate
+from sglang.srt.planner.cost_model import Provenance, Rate
 from sglang.srt.planner.regime_switch import (
     DEFAULT_PAIR_TOLERANCE_PCT,
     GIB,
@@ -44,6 +44,7 @@ from sglang.srt.planner.regime_switch import (
     PhaseTable,
     WorkloadShape,
     layout_overlap,
+    residency_rung,
     solve_layout_pair,
     unit_ranges,
 )
@@ -95,6 +96,19 @@ FP8_SHAPED = dict(p_on_p=1528.9, p_on_d=84.1, d_on_p=1231.7, d_on_d=125.1)
 #: round), which two RUNG 0 switches (2.0 s) clear and two RUNG 1 switches
 #: (6.05 s) do not.
 FP8_ROUND = WorkloadShape(prefill_tokens=20000, decode_tokens=2048)
+
+
+def _rung0_ledger():
+    """A ledger with room for both layouts and both graph families."""
+    overlap = layout_overlap(
+        PREFILL, DECODE, units=12, bytes_per_unit=1.6 * GIB, active="decode"
+    )
+    return overlap, residency_rung(
+        overlap,
+        card_total_bytes=[48 * GIB, 40 * GIB, 40 * GIB],
+        committed_bytes=[18 * GIB, 12 * GIB, 12 * GIB],
+        graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+    )
 
 
 class TestOverlapMath(CustomTestCase):
@@ -190,6 +204,101 @@ class TestOverlapMath(CustomTestCase):
     def test_too_few_units_for_the_ranks_refuse(self):
         with self.assertRaises(ValueError):
             layout_overlap(PREFILL, DECODE, units=2, bytes_per_unit=1.0)
+
+
+class TestResidencyLadder(CustomTestCase):
+    """§20.3's rungs, as ledger arithmetic on the 27B geometry."""
+
+    def _overlap(self):
+        # 12 units over an MLP mass of ~19.2 GiB -> 1.6 GiB per unit.
+        return layout_overlap(
+            PREFILL, DECODE, units=12, bytes_per_unit=1.6 * GIB, active="decode"
+        )
+
+    def test_rung0_when_everything_fits(self):
+        rep = residency_rung(
+            self._overlap(),
+            card_total_bytes=[64 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[20 * GIB, 12 * GIB, 12 * GIB],
+            graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+        )
+        self.assertEqual(rep.rung, 0)
+        self.assertTrue(rep.rung0_feasible)
+        self.assertIn("both layouts and both graph families fit", rep.reason)
+        # Graph-state sizes are an ESTIMATE until #286/#102 measures them.
+        self.assertIs(rep.provenance, Provenance.ESTIMATE)
+        self.assertIn("ESTIMATE", rep.reason)
+
+    def test_rung1_when_the_dual_extra_does_not_fit(self):
+        # The big card owes 6 units = 9.6 GiB of dual-residency extra; give
+        # it only 4 GiB of headroom past the active layout and its graphs.
+        rep = residency_rung(
+            self._overlap(),
+            card_total_bytes=[32 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[25 * GIB, 12 * GIB, 12 * GIB],
+            graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+        )
+        self.assertEqual(rep.rung, 1)
+        self.assertEqual(rep.per_rank[0].rung, 1)
+        self.assertIn("does not fit", rep.reason)
+        self.assertIn("rank 0 governs", rep.reason)
+        # The other two cards would have served RUNG 0 on their own; the
+        # worst rank governs, because everyone waits for its diff reload.
+        self.assertEqual(rep.per_rank[1].rung, 0)
+        self.assertEqual(rep.per_rank[2].rung, 0)
+
+    def test_rung2_when_not_even_the_graph_families_fit(self):
+        rep = residency_rung(
+            self._overlap(),
+            card_total_bytes=[32 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[30 * GIB, 12 * GIB, 12 * GIB],
+            graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+        )
+        self.assertEqual(rep.rung, 2)
+        self.assertIn("cannot be pre-captured here at all", rep.reason)
+
+    def test_rung2_when_the_family_was_never_pre_captured(self):
+        rep = residency_rung(
+            self._overlap(),
+            card_total_bytes=[64 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[20 * GIB, 12 * GIB, 12 * GIB],
+            pre_captured=False,
+        )
+        self.assertEqual(rep.rung, 2)
+        self.assertIn("lazy recapture", rep.reason)
+
+    def test_corridor_is_charged(self):
+        overlap = self._overlap()
+        common = dict(
+            card_total_bytes=[43.2 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[30.0 * GIB, 12 * GIB, 12 * GIB],
+            graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+        )
+        # 30 + 3 + 9.6 = 42.6 GiB against 43.2 GiB -> fits with 0.6 GiB to
+        # spare, but not once a 1 GiB corridor must stay free.
+        self.assertEqual(residency_rung(overlap, **common).rung, 0)
+        self.assertEqual(
+            residency_rung(overlap, corridor_bytes=1 * GIB, **common).rung, 1
+        )
+
+    def test_measured_graph_state_upgrades_the_provenance(self):
+        rep = residency_rung(
+            self._overlap(),
+            card_total_bytes=[64 * GIB, 40 * GIB, 40 * GIB],
+            committed_bytes=[20 * GIB, 12 * GIB, 12 * GIB],
+            graph_state_bytes=[3 * GIB, 3 * GIB, 3 * GIB],
+            graph_state_provenance=Provenance.MEASURED,
+        )
+        self.assertIs(rep.provenance, Provenance.MEASURED)
+        self.assertNotIn("ESTIMATE", rep.reason)
+
+    def test_rank_count_mismatch_refuses(self):
+        with self.assertRaises(ValueError):
+            residency_rung(
+                self._overlap(),
+                card_total_bytes=[64 * GIB, 40 * GIB],
+                committed_bytes=[20 * GIB, 12 * GIB],
+            )
 
 
 class TestPairObjective(CustomTestCase):

@@ -20,6 +20,11 @@ module builds the part of them that is a computation:
   per-rank shard-range overlap of a layout PAIR and the dual-residency extra
   bytes; :func:`solve_layout_pair` adds the secondary objective (maximal
   overlap among near-optimal candidates, bounded by a stated tolerance).
+* **§20.3 residency ladder** — :func:`residency_rung` does the ledger
+  arithmetic that says whether RUNG 0 (both layouts + both graph families
+  resident) is affordable next to the current KV pool, or whether the
+  configuration lands on RUNG 1 (evict the non-shared slabs) or RUNG 2
+  (never pre-captured -> lazy recapture).
 
 **What this module does NOT do, deliberately.** Nothing here moves a byte,
 flips a pointer, spills a diff or captures a graph. Those are #363 slices 2+
@@ -64,9 +69,12 @@ __all__ = [
     "SwitchCostModel",
     "RankOverlap",
     "OverlapReport",
+    "RankResidency",
+    "ResidencyReport",
     "PairSolution",
     "unit_ranges",
     "layout_overlap",
+    "residency_rung",
     "solve_layout_pair",
     "DEFAULT_PAIR_TOLERANCE_PCT",
     "DEFAULT_SWITCH_COST_MODEL",
@@ -626,6 +634,205 @@ def layout_overlap(
         per_rank=tuple(rows),
     )
 
+
+# ---------------------------------------------------------------------------
+# §20.3 — the residency ladder, as ledger arithmetic
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RankResidency:
+    """One rank's rung, with the byte math that produced it."""
+
+    rank: int
+    card_total_bytes: float
+    #: Everything already committed on this rank that is not the layout pair:
+    #: the active layout's own weights, the KV pool, the corridor, reserves.
+    committed_bytes: float
+    #: Dual-residency extra for the inactive layout's non-shared slabs.
+    dual_extra_bytes: float
+    #: Both graph families' capture state (ESTIMATE until #286/#102 measures
+    #: the layout-family case; the constant is #102's spec-ladder figure
+    #: carried over by analogy, as §20.3 states).
+    graph_state_bytes: float
+    graph_state_provenance: Provenance
+    rung: int
+    reason: str
+    free_at_rung0_bytes: float
+    free_at_rung1_bytes: float
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "rank": self.rank,
+            "card_total_mib": self.card_total_bytes / MIB,
+            "committed_mib": self.committed_bytes / MIB,
+            "dual_extra_mib": self.dual_extra_bytes / MIB,
+            "graph_state_mib": self.graph_state_bytes / MIB,
+            "graph_state_provenance": self.graph_state_provenance.value,
+            "rung": self.rung,
+            "reason": self.reason,
+            "free_at_rung0_mib": self.free_at_rung0_bytes / MIB,
+            "free_at_rung1_mib": self.free_at_rung1_bytes / MIB,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidencyReport:
+    """The pair's rung on this rig: the WORST rank governs.
+
+    §20.3's ladder is per-configuration, not per-rank — a switch that RUNG 0
+    can serve on two cards and not on the third is a RUNG 1 switch, because
+    the third card still has to reload its diff and everybody waits for it.
+    """
+
+    rung: int
+    reason: str
+    per_rank: Tuple[RankResidency, ...]
+    provenance: Provenance
+    pre_captured: bool
+
+    @property
+    def rung0_feasible(self) -> bool:
+        return self.rung == 0
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "rung": self.rung,
+            "rung0_feasible": self.rung0_feasible,
+            "reason": self.reason,
+            "provenance": self.provenance.value,
+            "pre_captured": self.pre_captured,
+            "per_rank": [r.to_json() for r in self.per_rank],
+        }
+
+
+#: #102's measured figure for one full independent capture state, carried to
+#: the layout-family case BY ANALOGY (DESIGN_363 §20.3, citing
+#: INTEGRATION_R3_VALIDATION.md:7601 "1,5 -> 0,3 GB je State"). Upper end
+#: taken. This is the number #286/#102 is expected to replace with a real
+#: per-family measurement; until then every report built on it is tagged
+#: ESTIMATE and says which constant it used.
+GRAPH_FAMILY_STATE_BYTES_ESTIMATE = 1.5 * GIB
+GRAPH_FAMILY_STATE_SOURCE = (
+    "DESIGN_363 §20.3 / #102 analogy (INTEGRATION_R3_VALIDATION.md:7601, "
+    "1.5 -> 0.3 GB per state); ESTIMATE until #286 measures the layout-family "
+    "case"
+)
+
+
+def residency_rung(
+    overlap: OverlapReport,
+    *,
+    card_total_bytes: Sequence[float],
+    committed_bytes: Sequence[float],
+    graph_state_bytes: Optional[Sequence[float]] = None,
+    graph_state_provenance: Provenance = Provenance.ESTIMATE,
+    graph_state_source: str = GRAPH_FAMILY_STATE_SOURCE,
+    pre_captured: bool = True,
+    corridor_bytes: float = 0.0,
+) -> ResidencyReport:
+    """Which rung of §20.3's residency ladder this configuration lands on.
+
+    The question, per rank: do BOTH weight layouts and BOTH graph families
+    fit next to what is already committed (the active layout, the current KV
+    pool, reserves) plus the #330 corridor?
+
+    * fits -> **RUNG 0**: pointer flip, nothing copies.
+    * only the active layout + the graph families fit -> **RUNG 1**: the
+      inactive layout's non-shared slabs are evicted through the #286 class
+      before any KV admission is refused, and a switch reloads the diff.
+    * not even that, or the family was never pre-captured -> **RUNG 2**:
+      lazy recapture, the un-amortised ANALYSE estimate.
+
+    ``committed_bytes`` must already contain the ACTIVE layout's own weights;
+    ``overlap.extra_bytes_vs_active`` is what dual residency adds on top, and
+    counting the active layout twice is the easiest way to get this wrong.
+    ``graph_state_bytes`` defaults to two families at
+    :data:`GRAPH_FAMILY_STATE_BYTES_ESTIMATE` each; passing measured numbers
+    (with ``graph_state_provenance=MEASURED``) is how #286 will upgrade it.
+    """
+    n = len(overlap.per_rank)
+    if len(card_total_bytes) != n or len(committed_bytes) != n:
+        raise ValueError(
+            f"residency_rung: overlap covers {n} ranks but got "
+            f"{len(card_total_bytes)} card totals and {len(committed_bytes)} "
+            "committed figures"
+        )
+    if graph_state_bytes is None:
+        graph_state_bytes = [2.0 * GRAPH_FAMILY_STATE_BYTES_ESTIMATE] * n
+    elif len(graph_state_bytes) != n:
+        raise ValueError(
+            f"graph_state_bytes has {len(graph_state_bytes)} entries for "
+            f"{n} ranks"
+        )
+
+    rows: List[RankResidency] = []
+    for i, row in enumerate(overlap.per_rank):
+        total = float(card_total_bytes[i])
+        committed = float(committed_bytes[i]) + float(corridor_bytes)
+        graphs = float(graph_state_bytes[i])
+        extra = row.extra_bytes_vs_active
+        free0 = total - committed - graphs - extra
+        free1 = total - committed - graphs
+        if not pre_captured:
+            rung, why = 2, (
+                "this layout family is outside the boot's declared pre-capture "
+                "set, so a switch falls back to lazy recapture (§20.3 RUNG 2)"
+            )
+        elif free0 >= 0.0:
+            rung, why = 0, (
+                f"both layouts and both graph families fit: "
+                f"{free0 / MIB:.0f} MiB free after the "
+                f"{extra / MIB:.0f} MiB dual-residency extra"
+            )
+        elif free1 >= 0.0:
+            rung, why = 1, (
+                f"the {extra / MIB:.0f} MiB dual-residency extra does not fit "
+                f"({-free0 / MIB:.0f} MiB short), but the active layout and "
+                f"the graph families do ({free1 / MIB:.0f} MiB free): the "
+                "inactive layout's non-shared slabs are evictable"
+            )
+        else:
+            rung, why = 2, (
+                f"not even the active layout plus both graph families fit "
+                f"({-free1 / MIB:.0f} MiB short): the second family cannot be "
+                "pre-captured here at all"
+            )
+        rows.append(
+            RankResidency(
+                rank=row.rank,
+                card_total_bytes=total,
+                committed_bytes=committed,
+                dual_extra_bytes=extra,
+                graph_state_bytes=graphs,
+                graph_state_provenance=graph_state_provenance,
+                rung=rung,
+                reason=why,
+                free_at_rung0_bytes=free0,
+                free_at_rung1_bytes=free1,
+            )
+        )
+
+    worst = max(rows, key=lambda r: r.rung)
+    prov = (
+        Provenance.MEASURED
+        if graph_state_provenance is Provenance.MEASURED
+        else Provenance.ESTIMATE
+    )
+    return ResidencyReport(
+        rung=worst.rung,
+        reason=(
+            f"rank {worst.rank} governs: {worst.reason}"
+            + (
+                ""
+                if graph_state_provenance is Provenance.MEASURED
+                else f" [graph-state size is an ESTIMATE: {graph_state_source}]"
+            )
+        ),
+        per_rank=tuple(rows),
+        provenance=prov,
+        pre_captured=bool(pre_captured),
+    )
 
 # ---------------------------------------------------------------------------
 # §20.3 planner consequence — the pair objective
