@@ -542,8 +542,11 @@ def main() -> int:
     totals, names = read_nvml()
     if args.rank_gpu_id:
         # rank r runs on NVML index rank_gpu_id[r]. The rig model is indexed by
-        # RANK, so permute. This must never be assumed: the 5090 sat at NVML
-        # index 0 on 2026-08-02 and sits at index 1 today.
+        # RANK, so permute. Note the index space: --rank-gpu-id is CUDA-indexed
+        # (server_args.py:8476-8477), and CUDA order (FASTEST_FIRST) is NOT NVML
+        # order on this rig -- the 5090 is cuda:0 but nvidia-smi index 1. This
+        # argument takes NVML indices because that is what read_nvml() returns,
+        # so pass the NVML index, not the value you would give --rank-gpu-id.
         order = [int(x) for x in args.rank_gpu_id.split(",")]
         totals = [totals[i] for i in order]
         names = [names[i] for i in order]

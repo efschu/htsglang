@@ -25,44 +25,51 @@ a warning label):
 
 ---
 
-## 1. Finding A — the device order has shifted since the proven recipe
+## 1. Finding A — two device index spaces, permanently offset
+
+Recorded here because this desk pass first got it **wrong**, and the wrong
+version is the more intuitive one.
 
 The proven recipe (`/spinning/gpu-battery-results/2026-08-02_394_linkshards/boot394.sh`)
-passes `--rank-gpu-id 0,1,2` together with per-rank vectors that are NOT
-symmetric: `--rank-auto-reserve-mib 2200,1400,1400` and
+passes `--rank-gpu-id 0,1,2` with per-rank vectors that are NOT symmetric:
+`--rank-auto-reserve-mib 2200,1400,1400` and
 `--rank-moe-resident-fraction 0.485,0.42,0.42`. The large entries belong to the
-5090.
-
-That boot's own launcher line records which card rank0 actually got:
+5090, and that boot's own launcher line confirms rank0 got it:
 
 ```
 rank->card vector (launcher placement (gpu_id_for_rank -> #331 IdentityMap)):
-  rank0=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d [00000000:0A:00.0], rank1=GPU-5c648f96-...
+  rank0=GPU-31d7ef41-...-e773fd938f6d [00000000:0A:00.0], rank1=GPU-5c648f96-...
 ```
 (`2026-08-02_394_linkshards/boot394_equal.log:25`)
 
-`GPU-31d7ef41-...` is the RTX 5090. On 2026-08-02 it enumerated at **NVML index
-0**. Today it enumerates at **NVML index 1**:
+`GPU-31d7ef41` is the 5090. Today `nvidia-smi` reports that UUID at **index 1**,
+which reads like the enumeration order moved and the recipe had gone stale. It
+did not. The two libraries simply index differently, and always have:
 
-```
-0, NVIDIA GeForce RTX 3080, GPU-5c648f96-be1d-42d5-0221-34d11ab137f7
-1, NVIDIA GeForce RTX 5090, GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d
-2, NVIDIA GeForce RTX 3080, GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4
-```
+| | idx 0 | idx 1 | idx 2 |
+|---|---|---|---|
+| NVML / `nvidia-smi` (PCI bus order) | 3080 `05:00.0` | **5090** `0A:00.0` | 3080 `0B:00.0` |
+| CUDA / torch (`CUDA_DEVICE_ORDER` unset ⇒ FASTEST_FIRST) | **5090** | 3080 `05` | 3080 `0B` |
 
-**Replaying the recipe verbatim today would hand the 5090's reserve and
-resident-expert budget to a 20 GiB 3080 and the 3080's budget to the 5090.**
-The 3080 would be over-subscribed by roughly 9 GiB and the boot would die, at
-best after the ~6 minute weight load. This is precisely the trap CLAUDE.md
-names ("torch order != NVML order on this rig") and it has now bitten the
-recorded recipe itself, because the recipe stores a *positional* answer to a
-question whose answer moves.
+`--rank-gpu-id` is **CUDA**-indexed: `gpu_id_for_rank()` returns
+`rank_gpu_id[world_rank]` (`server_args.py:8476-8477`) and the per-rank vectors
+are zipped against it positionally (`server_args.py:9111`). So `0,1,2` puts
+rank0 on cuda:0 = the 5090 — exactly what the log recorded, in 2026-08-02 and
+today alike. **The recipe is correct as written and must not be "fixed".**
 
-**Action:** every boot script in this window resolves rank→card by **UUID** at
-runtime and derives `--rank-gpu-id` from that. With today's enumeration the
-recipe's semantics require `--rank-gpu-id 1,0,2`. The scripts must not contain
-`0,1,2` as a literal. The recipe file in the results tree should be annotated,
-not silently reused.
+The real hazard is the inverse, and it is a silent one. `--speculative-draft-gpu`
+is likewise a CUDA index — the code says so by name
+(`server_args.py:7274-7276`): *"it is a CUDA DEVICE INDEX, resolved through
+gpu_id_for_rank()"*. Deriving it from `nvidia-smi` output would yield 1 for the
+5090. That does **not** raise: rank1 legitimately maps to cuda:1, so the DSpark
+draft head would be placed on a 3080, where the MXFP4 Marlin path does not exist
+at all (SM90/SM120 only, ANALYSE_447 §1.5). Wrong card, no error.
+
+**Action:** resolve the 5090 by **UUID through CUDA device properties**, never
+by NVML index equality. Any per-rank quantity read from `nvidia-smi` (the #493
+free-VRAM corridor, power tags, per-rank VRAM) must be mapped NVML→CUDA by UUID
+before it is lined up against a rank. Every arm writes both orderings to
+`$RUN/device_order.json` so each artifact records which index space it used.
 
 ---
 
@@ -226,7 +233,8 @@ same-power-state comparison arm for #478.
   known-bootable, and it produces the one measurement that decides whether the
   Q3_K_XL arm is worth a 6-minute load. The briefing's order is inverted here
   for that reason.
-* The `--rank-gpu-id` literal from the recipe must not be reused (Finding A).
+* `--rank-gpu-id 0,1,2` is kept verbatim; what must be resolved by UUID is
+  `--speculative-draft-gpu` and every NVML-sourced per-rank reading (Finding A).
 * The stream-trim marks must be raised, not lowered, for the Q3_K_XL arm
   (Finding C).
 * Quality comparison between the tiers is a genuine question and not a
