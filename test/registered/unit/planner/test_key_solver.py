@@ -108,6 +108,39 @@ _PROBE = {
     ],
 }
 
+#: The same rig's hardware profile, carrying the ONE thing the card probe
+#: above cannot measure: the fp8 weight-only Marlin lane an Ampere card
+#: dispatches an fp8 checkpoint to (``gemm_fp8_tflops: None`` in the probe is
+#: "not measurable here", not "not used"). Both regression anchors are FP8
+#: checkpoints, so without this they are scored on the dense bf16 fallback --
+#: a 3.5:1 rank spread where the measured boots ran 9.7:1 (the rig's own
+#: 2026-08-02 plan log prints 563.1 / 57.6 / 60.8 TFLOPS for this
+#: checkpoint). Rates from ``test_cost_model_open_items._LANES``, the same
+#: profile fixture the #324 lane-resolution tests use.
+_PROFILE_WITH_FP8_LANES = {
+    "version": 3,
+    "gpus": {
+        card["uuid"]: {
+            "name": card["name"],
+            "cuda_index": card["cuda_index"],
+            "total_mib": card["total_mib"],
+            "gemm_tflops": card["gemm_bf16_tflops"],
+            "membw_gbs": card["membw_read_gbs"],
+            "membw_gemv_gbs": card["membw_gemv_gbs"],
+            "gemm_lanes": lanes,
+            "gemm_lane_notes": {},
+        }
+        for card, lanes in zip(
+            _PROBE["cards"],
+            (
+                {"fp8_native": 566.88, "fp8_marlin": 216.34},
+                {"fp8_marlin": 58.44},
+                {"fp8_marlin": 59.15},
+            ),
+        )
+    },
+}
+
 
 def _have(path: str) -> bool:
     return os.path.exists(path)
@@ -395,7 +428,12 @@ class TestRegressionAnchors(_Bf16StateEnv):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.rows = {r["key"]: r for r in ks.check_regressions(_FP8, _PROBE)}
+        cls.rows = {
+            r["key"]: r
+            for r in ks.check_regressions(
+                _FP8, _PROBE, hardware_profile=_PROFILE_WITH_FP8_LANES
+            )
+        }
 
     def test_gate1_611_is_net_negative(self):
         # #264: concentrating to 6,1,1 buys +8.2 % prefill and pays -13.7 %

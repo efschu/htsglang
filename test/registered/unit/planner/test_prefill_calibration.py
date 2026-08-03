@@ -45,11 +45,26 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 _CACHE = os.environ.get("HTSGLANG_TEST_MODEL_DIR", "")
 _MODEL = os.path.join(_CACHE, "Qwen3.6-27B-FP8") if _CACHE else ""
 
-#: Probed GEMM rate of the reference rig, rank order 5090, 3080, 3080
-#: (cached stage-0 profile, the same inputs apply_auto_performance feeds).
-_GEMM = [233.91, 63.17, 61.24]
-#: Narrowest pairwise link of the same rig (GB/s).
-_MIN_LINK = 5.11
+#: Probed GEMM rate of the reference rig for THIS checkpoint's own format,
+#: rank order 5090, 3080, 3080 -- the numbers the same rig's boot log prints
+#: for Qwen3.6-27B-FP8 (`2026-08-02_424_phase_record_bench/raw/
+#: server_fp8_decode.log`: "rank 0 ... GEMM 563.1 TFLOPS [fp8 native
+#: (_scaled_mm)]", "rank 1 ... 57.6 [fp8 Marlin (weight-only)]", "rank 2 ...
+#: 60.8").
+#:
+#: These replace the pre-#298a fixture [233.91, 63.17, 61.24] (#475). That
+#: vector came from the generic stage-0 lane, which scored the 5090 and the
+#: 3080s in a format neither card runs an fp8 checkpoint in; #298a
+#: (2026-07-30, "score the prefill objective in the checkpoint's own GEMM
+#: format") replaced it, three days after this fixture was written. The
+#: HARDWARE did not change between the #216 measurement and today -- the
+#: 3080s always went through Marlin at ~1/10 the 5090's native fp8 rate --
+#: only the probe's reading of it did, from a 3.7x rank spread to the real
+#: 9.8x. The measured gains below are unchanged; what changes is that the
+#: model is now fed the rates the measured boots actually ran at.
+_GEMM = [563.1, 57.6, 60.8]
+#: Narrowest pairwise link of the same rig (GB/s), same log's link matrix.
+_MIN_LINK = 5.1
 #: The #216 follow-up campaign's base plan and budgets.
 _BASE_PLAN = [63, 37, 36]
 _BUDGETS = [28447, 16320, 16320]

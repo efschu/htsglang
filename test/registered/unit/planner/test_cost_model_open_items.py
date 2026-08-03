@@ -453,9 +453,15 @@ class TestSolverUsesTheLaneResolution(_Checkpoints):
         GEMM rate does not enter their objective.
         """
         profile = _profile_with_lanes()
-        self.assertEqual(self._solve(self.int8, "enc"), ([104, 15, 17], 1.130001))
+        # #475 re-priced every raw ratio here (the lockstep max is now
+        # taken per barrier, not once per step: 1.130001 -> 1.041817 and
+        # 1.074886 -> 1.033062) and moved NEITHER integer key. That is the
+        # property this test is about -- the lane resolution decides a
+        # different vector, and #475 decides a different magnitude for both
+        # vectors, which are independent changes.
+        self.assertEqual(self._solve(self.int8, "enc"), ([104, 15, 17], 1.041817))
         self.assertEqual(
-            self._solve(self.int8, "enc", profile), ([108, 15, 13], 1.074886)
+            self._solve(self.int8, "enc", profile), ([108, 15, 13], 1.033062)
         )
         for goal in ("maxkv", "dec", "sessions"):
             self.assertEqual(
@@ -470,8 +476,10 @@ class TestSolverUsesTheLaneResolution(_Checkpoints):
         integer key at the optimum is the same vector either way, which is the
         difference between a re-tune and a better-measured prediction."""
         profile = _profile_with_lanes()
-        self.assertEqual(self._solve(self.fp8, "enc"), ([136, 0, 0], 1.23466))
-        self.assertEqual(self._solve(self.fp8, "enc", profile), ([136, 0, 0], 1.252042))
+        # 1.23466 / 1.252042 before #475; same vector both ways, re-priced
+        # ratio (see the int8 case above).
+        self.assertEqual(self._solve(self.fp8, "enc"), ([136, 0, 0], 1.128045))
+        self.assertEqual(self._solve(self.fp8, "enc", profile), ([136, 0, 0], 1.148964))
 
     def test_a_bf16_key_and_ratio_are_untouched_by_the_profile(self):
         profile = _profile_with_lanes()
