@@ -28,7 +28,7 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.planner.cost_model import Provenance
+from sglang.srt.planner.cost_model import Provenance, Rate
 from sglang.srt.video_enhance.chain_policy import (
     REQUIRES_FRAME_DECIMATION,
     REQUIRES_SCALED_DECODE,
@@ -43,6 +43,10 @@ from sglang.srt.video_enhance.chain_policy import (
     sr_entry_points,
 )
 from sglang.srt.video_enhance.frame_math import MIB, Resolution
+from sglang.srt.video_enhance.rife_ladder import (
+    RifeFrontier,
+    default_ladder,
+)
 from sglang.srt.video_enhance.tenant import TenantConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -116,6 +120,9 @@ def inputs(rows=None, **kwargs):
 
 CONFIG = TenantConfig(budget_mib=20000, rife_measured_bytes_per_pair=RIFE_PAIR_BYTES)
 
+#: The stage names the synthetic table carries, for the ``scale=`` helper.
+BASE_MS_STAGES = ("sr", "resize", "rife", "encode", "decode")
+
 #: The user's target scenario: 1080p at 25 fps in, 2160p at 50 fps out.
 SOURCE_1080P25 = SourceProbe(Resolution(1920, 1080), Fraction(25), duration_s=600.0)
 TARGET_4K50 = dict(target=Resolution(3840, 2160), target_frame_rate=Fraction(50))
@@ -144,7 +151,9 @@ class FullWinsWheneverItFitsTest(CustomTestCase):
     """Tier 0 is not a preference the caller can express; it is the ranking."""
 
     def test_full_is_chosen_when_the_frontier_carries_it(self):
-        fast = frontier(scale={k: 0.1 for k in ("sr", "resize", "rife", "encode", "decode")})
+        fast = frontier(
+            scale={k: 0.1 for k in ("sr", "resize", "rife", "encode", "decode")}
+        )
         decision = decide(SOURCE_1080P25, fast, **TARGET_4K50)
         self.assertTrue(decision.feasible)
         self.assertIs(decision.mode, ChainMode.FULL)
@@ -159,7 +168,9 @@ class FullWinsWheneverItFitsTest(CustomTestCase):
         planner ranking by headroom would take the fastest; this one takes
         the one that keeps every source pixel.
         """
-        fast = frontier(scale={k: 0.1 for k in ("sr", "resize", "rife", "encode", "decode")})
+        fast = frontier(
+            scale={k: 0.1 for k in ("sr", "resize", "rife", "encode", "decode")}
+        )
         decision = decide(SOURCE_1080P25, fast, **TARGET_4K50)
         chosen = decision.price
         faster = [
@@ -433,9 +444,7 @@ class RefusalNamesTheNumbersTest(CustomTestCase):
         tiny = PolicyInputs.from_samples(
             frontier(), budgets_mib={"5090": 30000, "3080a": 1200, "3080b": 1200}
         )
-        decision = choose_chain(
-            SOURCE_4K24, PolicyRequest(**TARGET_4K48), tiny, CONFIG
-        )
+        decision = choose_chain(SOURCE_4K24, PolicyRequest(**TARGET_4K48), tiny, CONFIG)
         excluded = [c for c in decision.price.per_card if not c.admitted]
         self.assertEqual({c.card for c in excluded}, {"3080a", "3080b"})
         for card in excluded:
@@ -502,7 +511,11 @@ class ProvenanceTest(CustomTestCase):
     """Measured, estimate, absent -- and never a fourth quiet case."""
 
     def test_a_missing_row_makes_the_candidate_unpriceable(self):
-        rows = [r for r in frontier() if r["resolution"] != "3840x2160" or r["stage"] != "encode"]
+        rows = [
+            r
+            for r in frontier()
+            if r["resolution"] != "3840x2160" or r["stage"] != "encode"
+        ]
         decision = decide(SOURCE_4K24, rows, **TARGET_4K48)
         self.assertFalse(decision.feasible)
         self.assertIs(decision.provenance, Provenance.ABSENT)
@@ -511,7 +524,11 @@ class ProvenanceTest(CustomTestCase):
 
     def test_the_same_gap_is_priced_and_labelled_when_estimates_are_allowed(self):
         """Can-fail proof for the estimate flag: one boolean, two outcomes."""
-        rows = [r for r in frontier() if r["resolution"] != "3840x2160" or r["stage"] != "encode"]
+        rows = [
+            r
+            for r in frontier()
+            if r["resolution"] != "3840x2160" or r["stage"] != "encode"
+        ]
         decision = decide(SOURCE_4K24, rows, allow_estimates=True, **TARGET_4K48)
         self.assertTrue(decision.feasible)
         self.assertIs(decision.provenance, Provenance.ESTIMATE)
@@ -528,10 +545,12 @@ class ProvenanceTest(CustomTestCase):
         self.assertIs(decision.provenance, Provenance.ABSENT)
 
     def test_the_extrapolation_is_linear_in_pixels(self):
-        rows = [r for r in frontier() if r["resolution"] != "1920x1080" or r["stage"] != "sr"]
-        decision = decide(
-            SOURCE_1080P25, rows, allow_estimates=True, **TARGET_4K50
-        )
+        rows = [
+            r
+            for r in frontier()
+            if r["resolution"] != "1920x1080" or r["stage"] != "sr"
+        ]
+        decision = decide(SOURCE_1080P25, rows, allow_estimates=True, **TARGET_4K50)
         full = next(
             p for p in decision.considered if p.candidate.mode is ChainMode.FULL
         )
@@ -566,9 +585,7 @@ class TheShippedMeasurementIsNotEnoughTest(CustomTestCase):
         real = PolicyInputs.from_probe_dir(self.REPORTS)
         self.assertIn("sr", real.rates.stages)
         self.assertNotIn("encode", real.rates.stages)
-        decision = choose_chain(
-            SOURCE_4K24, PolicyRequest(**TARGET_4K48), real, CONFIG
-        )
+        decision = choose_chain(SOURCE_4K24, PolicyRequest(**TARGET_4K48), real, CONFIG)
         self.assertFalse(decision.feasible)
         self.assertIn("unpriceable", decision.reason)
         for missing in ("decode", "encode"):
@@ -627,6 +644,239 @@ class TheClientVisibleAnswerTest(CustomTestCase):
         for entry in payload["considered"]:
             self.assertFalse(entry["feasible"])
             self.assertIn("cards", entry)
+
+
+# --------------------------------------------------------------------------
+# The #460 RIFE ladder, wired into the chain decision
+# --------------------------------------------------------------------------
+
+#: A weight directory that does not exist, so every rung is PINNED rather than
+#: PRESENT and the ladder is identical on any host.
+NO_WEIGHTS_ON_DISK = Path("/nonexistent/rife-weights-for-a-hermetic-test")
+
+
+def ladder_with(ms_by_version, *, resolution="3840x2160", scale=1.0):
+    """A ladder whose frontier has exactly these ``{version: ms}`` cells,
+    measured on every card the synthetic table uses."""
+    cells = {}
+    for version, ms in ms_by_version.items():
+        for card in CARD_RATIO:
+            cells[(version, card, resolution, scale)] = Rate.measured(
+                ms * CARD_RATIO[card], "synthetic ladder frontier", unit="ms"
+            )
+    return default_ladder(
+        weight_dir=NO_WEIGHTS_ON_DISK,
+        frontier=RifeFrontier(cells=cells, source="synthetic"),
+    )
+
+
+def decide_with_ladder(probe, rows, ladder, **request_kwargs):
+    request = PolicyRequest(**request_kwargs)
+    return choose_chain(probe, request, inputs(rows, rife_ladder=ladder), CONFIG)
+
+
+class RifeLadderWiringTest(CustomTestCase):
+    """#460: the version is chosen, not configured -- and it is priced.
+
+    Falsifier-first throughout: every claim is a pair of runs whose only
+    difference is the thing under test, because a decision that reported
+    ``4.6`` unconditionally would satisfy any single-run assertion.
+    """
+
+    def test_off_by_default_leaves_the_callers_version_alone(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        decision = decide(SOURCE_1080P25, fast, **TARGET_4K50)
+        self.assertTrue(decision.feasible)
+        self.assertEqual(decision.rife_version, "4.6")
+        self.assertIsNone(decision.rife_choice)
+
+    def test_auto_without_a_ladder_says_so_rather_than_pretending(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        decision = decide(SOURCE_1080P25, fast, auto_rife_version=True, **TARGET_4K50)
+        self.assertTrue(decision.feasible)
+        self.assertEqual(decision.rife_version, "4.6")
+        self.assertIsNotNone(decision.rife_choice)
+        self.assertIn("no ladder was supplied", decision.rife_choice.reason)
+
+    def test_auto_climbs_to_the_best_version_the_chain_can_carry(self):
+        # A generous table: every version fits, so the ranking decides and the
+        # top rung wins.
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.26": 2.0, "4.18": 1.5, "4.6": 1.0})
+        decision = decide_with_ladder(
+            SOURCE_1080P25, fast, generous, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertTrue(decision.feasible)
+        self.assertEqual(decision.rife_version, "4.26")
+
+        # The flip: make only the top rung ruinous and the walk must fall to
+        # the next one down rather than refusing or staying put.
+        lopsided = ladder_with({"4.26": 4000.0, "4.18": 1.5, "4.6": 1.0})
+        fallen = decide_with_ladder(
+            SOURCE_1080P25, fast, lopsided, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertTrue(fallen.feasible)
+        self.assertEqual(fallen.rife_version, "4.18")
+        self.assertIn("passed over: 4.26", fallen.rife_choice.reason)
+
+    def test_the_walk_never_enters_an_unmeasured_variant(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        # 4.17 outranks 4.6 and has no cell; 4.18 outranks both and has none
+        # either. Only 4.6 is measured, so only 4.6 can be chosen.
+        thin = ladder_with({"4.6": 1.0})
+        decision = decide_with_ladder(
+            SOURCE_1080P25, fast, thin, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertTrue(decision.feasible)
+        self.assertEqual(decision.rife_version, "4.6")
+        measure_first = decision.rife_choice.selection.measure_first
+        self.assertIn("4.26", measure_first)
+        self.assertIn("4.18", measure_first)
+        self.assertNotIn("4.6", measure_first)
+        self.assertIn("no measured frontier", decision.reason)
+
+    def test_an_entirely_unmeasured_ladder_refuses_with_the_work_list(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        empty = default_ladder(
+            weight_dir=NO_WEIGHTS_ON_DISK,
+            frontier=RifeFrontier(source="nobody measured anything"),
+        )
+        decision = decide_with_ladder(
+            SOURCE_1080P25, fast, empty, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertFalse(decision.feasible)
+        self.assertIn("Run TICKET_460's frontier sweep", decision.reason)
+        self.assertEqual(len(decision.rife_choice.selection.measure_first), 8)
+
+    def test_the_version_actually_changes_the_price(self):
+        # The defect this guards: the shared rate table is keyed by
+        # (stage, card, resolution) and cannot tell 4.6 from 4.26, so a chain
+        # priced off it would cost the same whichever version the ladder
+        # picked -- and the walk would be theatre.
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        cheap = ladder_with({"4.6": 1.0})
+        dear = ladder_with({"4.6": 40.0})
+        cheap_price = decide_with_ladder(
+            SOURCE_1080P25, fast, cheap, auto_rife_version=True, **TARGET_4K50
+        )
+        dear_price = decide_with_ladder(
+            SOURCE_1080P25, fast, dear, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertEqual(cheap_price.rife_version, "4.6")
+        self.assertEqual(dear_price.rife_version, "4.6")
+        self.assertGreater(
+            cheap_price.price.aggregate_chain_fps,
+            dear_price.price.aggregate_chain_fps,
+        )
+
+    def test_a_pin_wins_and_is_reported_as_a_pin(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.26": 2.0, "4.18": 1.5, "4.6": 1.0})
+        auto = decide_with_ladder(
+            SOURCE_1080P25, fast, generous, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertEqual(auto.rife_version, "4.26")
+        pinned = decide_with_ladder(
+            SOURCE_1080P25,
+            fast,
+            generous,
+            auto_rife_version=True,
+            pin_rife_version="4.6",
+            **TARGET_4K50,
+        )
+        self.assertEqual(pinned.rife_version, "4.6")
+        self.assertTrue(pinned.rife_choice.selection.pinned)
+        self.assertIn("was pinned explicitly", pinned.reason)
+
+    def test_a_pin_works_without_auto(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.26": 2.0, "4.6": 1.0})
+        pinned = decide_with_ladder(
+            SOURCE_1080P25,
+            fast,
+            generous,
+            pin_rife_version="4.26",
+            **TARGET_4K50,
+        )
+        self.assertEqual(pinned.rife_version, "4.26")
+
+    def test_an_explicit_budget_short_circuits_the_walk(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.26": 20.0, "4.18": 10.0, "4.6": 5.0})
+        # The ladder's own budget gate is judged on the slowest card, and the
+        # 3080 columns are 2.55x the 5090 ones: 4.26 costs 51 ms there, 4.18
+        # 25.5 ms, 4.6 12.75 ms.
+        for budget, expected in ((60.0, "4.26"), (30.0, "4.18"), (20.0, "4.6")):
+            with self.subTest(budget=budget):
+                decision = decide_with_ladder(
+                    SOURCE_1080P25,
+                    fast,
+                    generous,
+                    auto_rife_version=True,
+                    rife_budget_ms=budget,
+                    **TARGET_4K50,
+                )
+                self.assertEqual(decision.rife_version, expected)
+
+    def test_a_budget_nothing_fits_refuses_before_the_chain_is_priced(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.6": 5.0})
+        decision = decide_with_ladder(
+            SOURCE_1080P25,
+            fast,
+            generous,
+            auto_rife_version=True,
+            rife_budget_ms=1.0,
+            **TARGET_4K50,
+        )
+        self.assertFalse(decision.feasible)
+        self.assertIn("cheapest measured rung is 4.6", decision.reason)
+
+    def test_the_decision_serialises_the_whole_ladder(self):
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        generous = ladder_with({"4.26": 2.0, "4.6": 1.0})
+        payload = decide_with_ladder(
+            SOURCE_1080P25, fast, generous, auto_rife_version=True, **TARGET_4K50
+        ).as_dict()
+        self.assertEqual(payload["rife_version"], "4.26")
+        self.assertIn("ASSUMPTION", payload["rife_choice"]["ladder"]["quality_basis"])
+        self.assertEqual(len(payload["rife_choice"]["ladder"]["ladder"]), 8)
+
+    def test_a_ladder_with_no_opinion_falls_back_to_the_shared_table(self):
+        # The two rate sources must not fight. A ladder that has never heard of
+        # this card at this geometry has no opinion, and refusing there would
+        # break every deployment whose probe reports use other card keys.
+        fast = frontier(scale={k: 0.1 for k in BASE_MS_STAGES})
+        elsewhere = ladder_with({"4.6": 1.0}, resolution="1280x720")
+        decision = decide_with_ladder(
+            SOURCE_1080P25, fast, elsewhere, **TARGET_4K50
+        )
+        self.assertTrue(decision.feasible)
+        self.assertEqual(
+            stage_price(decision.price, "rife").provenance, Provenance.MEASURED
+        )
+
+        # The flip: once the ladder DOES know the point, a version it has no
+        # cell for is unmeasured and the shared table must not stand in.
+        knows_46_only = ladder_with({"4.6": 1.0})
+        priced = decide_with_ladder(
+            SOURCE_1080P25,
+            fast,
+            knows_46_only,
+            pin_rife_version="4.18",
+            **TARGET_4K50,
+        )
+        self.assertFalse(priced.feasible)
+        self.assertIn("no measured rate for rife", priced.reason)
+
+    def test_nothing_feasible_at_any_version_names_every_one_tried(self):
+        glacial = frontier(scale={k: 40.0 for k in ("sr", "rife", "resize", "encode")})
+        generous = ladder_with({"4.26": 2000.0, "4.6": 1000.0})
+        decision = decide_with_ladder(
+            SOURCE_1080P25, glacial, generous, auto_rife_version=True, **TARGET_4K50
+        )
+        self.assertFalse(decision.feasible)
+        self.assertIn("tried 4.26, 4.6 in quality order", decision.reason)
 
 
 if __name__ == "__main__":

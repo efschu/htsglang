@@ -117,6 +117,7 @@ __all__ = [
     "CardPrice",
     "PolicyInputs",
     "PolicyRequest",
+    "RifeLadderChoice",
     "SourceProbe",
     "StagePrice",
     "candidate_chains",
@@ -266,7 +267,24 @@ class PolicyRequest:
     dtype: str = "fp16"
     sr_scale: int = 4
     rife_scale: float = 1.0
+    #: The RIFE version the chain is built with. Left alone this is the
+    #: baseline; set :attr:`auto_rife_version` to have the #460 ladder replace
+    #: it with the highest-ranked variant that measurably fits the budget, or
+    #: :attr:`pin_rife_version` to force one and say so in the report.
     rife_version: str = "4.6"
+    #: Opt-in for the #460 ladder. Off by default so an existing caller's plan
+    #: does not silently change version underneath it; the server surface turns
+    #: it on. A ladder that cannot pick anything leaves ``rife_version``
+    #: untouched and records why.
+    auto_rife_version: bool = False
+    #: Explicit version override. Beats the ladder and beats
+    #: :attr:`rife_version`; the decision reports ``pinned``.
+    pin_rife_version: str | None = None
+    #: Milliseconds per frame pair the chain can spend on interpolation. The
+    #: ladder needs a budget to choose against; ``None`` means "pick the
+    #: highest-ranked variant that is measured at all", which is the right
+    #: question only when the caller has no frame deadline.
+    rife_budget_ms: float | None = None
     streams_in_flight: int = 2
     #: Opt-in for :attr:`ChainMode.DECIMATE_RESYNTH`. Off by default and that
     #: is the point: a mode that discards real input frames must be asked for
@@ -305,6 +323,28 @@ class PolicyRequest:
 
 
 @dataclass(frozen=True)
+class RifeLadderChoice:
+    """The #460 ladder's answer, folded into the chain decision.
+
+    Kept as its own object rather than collapsed into ``rife_version`` because
+    a version and the reason it was chosen are not the same fact: a caller has
+    to be able to see that the ladder passed over three higher-ranked variants
+    for want of a measurement, and a report that only carried the winner would
+    make an unmeasured rig look like a decided one.
+    """
+
+    version: str
+    selection: object | None
+    reason: str
+
+    def as_dict(self) -> dict:
+        out: dict = {"rife_version": self.version, "reason": self.reason}
+        if self.selection is not None:
+            out["ladder"] = self.selection.as_dict()  # type: ignore[attr-defined]
+        return out
+
+
+@dataclass(frozen=True)
 class PolicyInputs:
     """Everything measured that the policy prices against.
 
@@ -320,6 +360,11 @@ class PolicyInputs:
 
     rates: StageRateTable
     frontier: tuple[Mapping, ...] = ()
+    #: The #460 RIFE version ladder. ``None`` leaves the caller's
+    #: ``rife_version`` alone even when ``auto_rife_version`` is set, and says
+    #: so in the decision -- a ladder that was never supplied is a different
+    #: fact from a ladder that could not choose.
+    rife_ladder: object | None = None
     #: Cards in play. Defaults to every card the rate table knows.
     cards: tuple[str, ...] = ()
     #: Per-card device budget in MiB. A card with no entry uses the tenant
@@ -338,6 +383,7 @@ class PolicyInputs:
         budgets_mib: Mapping[str, int] | None = None,
         noise_floor_pct: float | None = None,
         source: str = "probe_samples",
+        rife_ladder: object | None = None,
     ) -> "PolicyInputs":
         """Build both views from one list of probe samples.
 
@@ -374,6 +420,7 @@ class PolicyInputs:
         return cls(
             rates=rates,
             frontier=frontier,
+            rife_ladder=rife_ladder,
             cards=tuple(cards) if cards is not None else (),
             budgets_mib=dict(budgets_mib or {}),
         )
@@ -385,6 +432,7 @@ class PolicyInputs:
         *,
         cards: Sequence[str] | None = None,
         budgets_mib: Mapping[str, int] | None = None,
+        rife_ladder: object | None = None,
     ) -> "PolicyInputs":
         """Read a tenant's configured measurement directory.
 
@@ -398,6 +446,7 @@ class PolicyInputs:
         if directory is None:
             return cls(
                 rates=StageRateTable(cells={}, source="no measurement directory"),
+                rife_ladder=rife_ladder,
                 cards=tuple(cards) if cards is not None else (),
                 budgets_mib=dict(budgets_mib or {}),
             )
@@ -413,6 +462,7 @@ class PolicyInputs:
             budgets_mib=budgets_mib,
             noise_floor_pct=max(floors) if floors else None,
             source=f"probe reports under {directory}",
+            rife_ladder=rife_ladder,
         )
 
 
@@ -506,7 +556,9 @@ class Candidate:
             "sr_scale": self.request.sr_scale,
             "decimation": self.decimation,
             "pre_downscale_from": (
-                None if self.pre_downscale_from is None else str(self.pre_downscale_from)
+                None
+                if self.pre_downscale_from is None
+                else str(self.pre_downscale_from)
             ),
             "discarded_input_fraction": round(self.discarded_input_fraction, 4),
             "synthetic_output_fraction": round(self.synthetic_output_fraction, 4),
@@ -650,9 +702,7 @@ def candidate_chains(
                 out.append(
                     Candidate(
                         ChainMode.DECIMATE_RESYNTH,
-                        replace(
-                            candidate.request, fps_multiplier=multiplier * d
-                        ),
+                        replace(candidate.request, fps_multiplier=multiplier * d),
                         decimation=d,
                         pre_downscale_from=candidate.pre_downscale_from,
                         requires=candidate.requires + (REQUIRES_FRAME_DECIMATION,),
@@ -783,7 +833,11 @@ class CandidatePrice:
         }
 
 
-_PROVENANCE_ORDER = {Provenance.MEASURED: 0, Provenance.ESTIMATE: 1, Provenance.ABSENT: 2}
+_PROVENANCE_ORDER = {
+    Provenance.MEASURED: 0,
+    Provenance.ESTIMATE: 1,
+    Provenance.ABSENT: 2,
+}
 
 
 def _worst(values: Iterable[Provenance]) -> Provenance:
@@ -839,6 +893,52 @@ def _stage_rate(
         f"({ms:.2f} ms, {source})",
         unit="ms",
         label=f"{stage}@{card}",
+    )
+
+
+def _rife_rate(
+    inputs: PolicyInputs,
+    candidate: Candidate,
+    card: str,
+    resolution: Resolution,
+    *,
+    allow_estimates: bool,
+) -> Rate:
+    """The interpolation cell for the version this candidate actually runs.
+
+    The shared :class:`~sglang.srt.planner.cost_model.StageRateTable` is keyed
+    by ``(stage, card, resolution)`` and therefore cannot tell 4.6 from 4.26 --
+    which is fine while there is one version, and wrong the moment the #460
+    ladder can choose between eight. Ticket V measured 4.26 at 45-123 % above
+    4.6 at every point, so pricing a 4.26 chain off a 4.6 row would make the
+    ladder's walk vacuous: every version would cost the same and the
+    highest-ranked one would always "fit".
+
+    So when a ladder is supplied its version-keyed frontier is the authority
+    for this one stage, and the version-blind table is the fallback for a
+    deployment that has no ladder. A ladder that has no cell for this version
+    at this point yields an ABSENT rate, which makes the candidate unpriceable
+    -- exactly as it should, because nobody timed it.
+    """
+    ladder = inputs.rife_ladder
+    if ladder is None or not ladder.knows_point(
+        card, resolution, candidate.request.rife_scale
+    ):
+        # No ladder, or a ladder with no opinion about this card at this
+        # geometry. The version-blind table is then the only evidence there
+        # is, and using it beats refusing a chain somebody did measure.
+        return _stage_rate(
+            inputs,
+            StageKind.RIFE.value,
+            card,
+            resolution,
+            allow_estimates=allow_estimates,
+        )
+    return ladder.rate_for(
+        candidate.request.rife_version,
+        card,
+        resolution,
+        candidate.request.rife_scale,
     )
 
 
@@ -925,13 +1025,22 @@ def _price_card(
             if spec.kind is StageKind.DECODE and candidate.pre_downscale_from
             else spec.in_res
         )
-        rate = _stage_rate(
-            inputs,
-            spec.kind.value,
-            card,
-            priced_res,
-            allow_estimates=allow_estimates,
-        )
+        if spec.kind is StageKind.RIFE:
+            rate = _rife_rate(
+                inputs,
+                candidate,
+                card,
+                priced_res,
+                allow_estimates=allow_estimates,
+            )
+        else:
+            rate = _stage_rate(
+                inputs,
+                spec.kind.value,
+                card,
+                priced_res,
+                allow_estimates=allow_estimates,
+            )
         stage_ms = None if rate.value is None else float(rate.value) * invocations
         prices.append(
             StagePrice(
@@ -1007,9 +1116,10 @@ def price_candidate(
         if c.admitted and c.ms_per_chain_frame is not None
     }
     if not admitted:
-        blockers = "; ".join(
-            f"{c.card}: {c.blocker or 'no rate'}" for c in per_card
-        ) or "no cards were offered to the planner"
+        blockers = (
+            "; ".join(f"{c.card}: {c.blocker or 'no rate'}" for c in per_card)
+            or "no cards were offered to the planner"
+        )
         return CandidatePrice(
             candidate=candidate,
             per_card=tuple(per_card),
@@ -1017,9 +1127,7 @@ def price_candidate(
             required_chain_fps=required,
             watch_ahead_s=float("inf") if probe.duration_s else 0.0,
             feasible=False,
-            reason=(
-                f"{candidate.mode.value}: no card can run this chain. {blockers}"
-            ),
+            reason=(f"{candidate.mode.value}: no card can run this chain. {blockers}"),
             unpriced_stages=unpriced,
         )
 
@@ -1113,6 +1221,12 @@ class ChainDecision:
     planned: PlannedJob | None = None
     #: Cards the chosen candidate would run on, in the planner's order.
     cards: tuple[str, ...] = ()
+    #: The #460 ladder's answer, when one was asked for.
+    rife_choice: RifeLadderChoice | None = None
+
+    @property
+    def rife_version(self) -> str | None:
+        return None if self.request is None else self.request.rife_version
 
     @property
     def mode(self) -> ChainMode | None:
@@ -1145,12 +1259,16 @@ class ChainDecision:
             "provenance": self.provenance.value,
             "requires": list(self.requires),
             "cards": list(self.cards),
+            "rife_version": self.rife_version,
+            "rife_choice": (
+                None if self.rife_choice is None else self.rife_choice.as_dict()
+            ),
             "chosen": chosen,
             "considered": [p.as_dict() for p in self.considered],
         }
 
 
-def choose_chain(
+def _choose_chain_for_version(
     probe: SourceProbe,
     request: PolicyRequest,
     inputs: PolicyInputs,
@@ -1245,9 +1363,8 @@ def choose_chain(
             "(allow_estimates was set)"
         )
     if best.candidate.requires:
-        reason += (
-            ". Not runnable on the M2 executor: needs "
-            + ", ".join(best.candidate.requires)
+        reason += ". Not runnable on the M2 executor: needs " + ", ".join(
+            best.candidate.requires
         )
     return ChainDecision(
         feasible=True,
@@ -1256,6 +1373,172 @@ def choose_chain(
         considered=ordered,
         planned=planned,
         cards=admitted,
+    )
+
+
+def choose_chain(
+    probe: SourceProbe,
+    request: PolicyRequest,
+    inputs: PolicyInputs,
+    config: TenantConfig,
+) -> ChainDecision:
+    """Pick a RIFE version off the #460 ladder, then pick a chain shape.
+
+    The two decisions are nested rather than sequential, and that is what makes
+    the ladder honest about "fits the budget". A budget for the interpolation
+    stage alone is not a thing this planner can derive without inventing a
+    split of the frame budget across unequal cards -- so it does not invent
+    one. Instead it walks the ladder in quality order and asks the *existing*
+    aggregate-throughput gate whether the whole chain carries that version.
+    The first version whose chain is feasible wins, which is exactly
+    "the highest-quality variant that can be computed" with the gate the rest
+    of the module already uses.
+
+    Three shortcuts around that walk:
+
+    *   ``pin_rife_version`` forces one version and reports ``pinned``.
+    *   ``rife_budget_ms`` asks the ladder directly against an explicit
+        per-pair budget, for a caller that has done its own arithmetic.
+    *   ``auto_rife_version`` off (the default) leaves ``rife_version`` alone,
+        so an existing caller's plan does not change version underneath it.
+
+    A variant with no measured frontier is never entered into the walk. It is
+    reported in the ladder rows as *measure me first*, which is where
+    TICKET_460's work list comes from.
+    """
+    ladder = inputs.rife_ladder
+    pin = request.pin_rife_version
+    cards = inputs.card_keys()
+
+    if pin is None and (not request.auto_rife_version or ladder is None):
+        decision = _choose_chain_for_version(probe, request, inputs, config)
+        if request.auto_rife_version and ladder is None:
+            return replace(
+                decision,
+                rife_choice=RifeLadderChoice(
+                    version=request.rife_version,
+                    selection=None,
+                    reason=(
+                        "auto_rife_version was set but no ladder was supplied in "
+                        f"PolicyInputs, so RIFE {request.rife_version} was kept "
+                        "unchanged"
+                    ),
+                ),
+            )
+        return decision
+
+    if not cards:
+        return _choose_chain_for_version(probe, request, inputs, config)
+
+    try:
+        selection = ladder.select(  # type: ignore[union-attr]
+            card=cards,
+            resolution=request.target,
+            scale=request.rife_scale,
+            budget_ms=request.rife_budget_ms,
+            pin=pin,
+        )
+    except Exception as exc:  # noqa: BLE001 - a refusal with a reason, not a stack
+        return ChainDecision(
+            feasible=False,
+            reason=f"the RIFE ladder could not answer: {type(exc).__name__}: {exc}",
+            price=None,
+            considered=(),
+            cards=cards,
+        )
+
+    if pin is not None or request.rife_budget_ms is not None:
+        if selection.version is None:
+            return ChainDecision(
+                feasible=False,
+                reason=selection.reason,
+                price=None,
+                considered=(),
+                cards=cards,
+                rife_choice=RifeLadderChoice(
+                    version=request.rife_version,
+                    selection=selection,
+                    reason=selection.reason,
+                ),
+            )
+        decision = _choose_chain_for_version(
+            probe, replace(request, rife_version=selection.version), inputs, config
+        )
+        return replace(
+            decision,
+            reason=decision.reason + ". " + selection.reason,
+            rife_choice=RifeLadderChoice(
+                version=selection.version,
+                selection=selection,
+                reason=selection.reason,
+            ),
+        )
+
+    # The walk. ``selection.rows`` is already in quality order.
+    measured = [
+        row.variant.version
+        for row in selection.rows
+        if row.provenance is Provenance.MEASURED
+    ]
+    if not measured:
+        return ChainDecision(
+            feasible=False,
+            reason=selection.reason,
+            price=None,
+            considered=(),
+            cards=cards,
+            rife_choice=RifeLadderChoice(
+                version=request.rife_version,
+                selection=selection,
+                reason=selection.reason,
+            ),
+        )
+
+    last: ChainDecision | None = None
+    tried: list[str] = []
+    for version in measured:
+        attempt = _choose_chain_for_version(
+            probe, replace(request, rife_version=version), inputs, config
+        )
+        tried.append(version)
+        last = attempt
+        if attempt.feasible:
+            note = (
+                f"RIFE {version} is the highest-ranked variant whose whole chain "
+                f"clears the aggregate gate"
+                + (f" (passed over: {', '.join(tried[:-1])})" if len(tried) > 1 else "")
+                + (
+                    f". Never considered, no measured frontier at {request.target} "
+                    f"scale {request.rife_scale}: " + ", ".join(selection.measure_first)
+                    if selection.measure_first
+                    else ""
+                )
+            )
+            return replace(
+                attempt,
+                reason=attempt.reason + ". " + note,
+                rife_choice=RifeLadderChoice(
+                    version=version, selection=selection, reason=note
+                ),
+            )
+
+    note = (
+        "no RIFE variant on the ladder produces a feasible chain here; tried "
+        + ", ".join(tried)
+        + " in quality order"
+        + (
+            ". Not tried, no measured frontier: " + ", ".join(selection.measure_first)
+            if selection.measure_first
+            else ""
+        )
+    )
+    assert last is not None
+    return replace(
+        last,
+        reason=last.reason + "\n" + note,
+        rife_choice=RifeLadderChoice(
+            version=tried[-1], selection=selection, reason=note
+        ),
     )
 
 

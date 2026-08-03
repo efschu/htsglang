@@ -81,7 +81,10 @@ class TestVersionGating(unittest.TestCase):
     def test_alias_group_members_share_one_vendored_module(self):
         # The alias mapping is the thing that could go wrong silently: pointing
         # 4.15 at the wrong module would load real weights onto a wrong graph.
-        for group in (("4.15", "4.17", "4.18"), ("4.15.lite", "4.16.lite", "4.17.lite")):
+        for group in (
+            ("4.15", "4.17", "4.18"),
+            ("4.15.lite", "4.16.lite", "4.17.lite"),
+        ):
             modules = {rife.require_supported(v).module for v in group}
             self.assertEqual(len(modules), 1, f"{group} must share one module")
         self.assertNotEqual(

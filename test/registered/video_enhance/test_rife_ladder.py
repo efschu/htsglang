@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.video_enhance.frame_math import R1080P, R4K, Resolution
+from sglang.srt.video_enhance.frame_math import R4K, R1080P, Resolution
 from sglang.srt.video_enhance.rife import KNOWN_WEIGHT_SHA256, SUPPORTED_VERSIONS
 from sglang.srt.video_enhance.rife_ladder import (
     CARD_3080,
@@ -82,7 +82,9 @@ class TheRegistryTest(CustomTestCase):
     def test_rungs_are_pinned_when_nothing_is_on_disk(self):
         for variant in ladder().variants:
             self.assertIs(variant.weight_state, WeightState.PINNED)
-            self.assertEqual(variant.weight_sha256, KNOWN_WEIGHT_SHA256[variant.version])
+            self.assertEqual(
+                variant.weight_sha256, KNOWN_WEIGHT_SHA256[variant.version]
+            )
             self.assertTrue(variant.runnable)
 
     def test_a_rung_present_on_disk_reports_present(self):
@@ -179,9 +181,7 @@ class TheRegistryTest(CustomTestCase):
         thinned = {k: v for k, v in DEFAULT_QUALITY_RANK.items() if k != "4.18"}
         with mock.patch.object(module, "DEFAULT_QUALITY_RANK", thinned):
             with self.assertRaises(LadderError) as ctx:
-                default_ladder(
-                    weight_dir=NO_WEIGHTS_ON_DISK, versions=("4.6", "4.18")
-                )
+                default_ladder(weight_dir=NO_WEIGHTS_ON_DISK, versions=("4.6", "4.18"))
             self.assertIn("no quality rank for '4.18'", str(ctx.exception))
             # The flip: supply the missing rank and the same call succeeds.
             built = default_ladder(
@@ -301,9 +301,7 @@ class AutoSelectionTest(CustomTestCase):
 
         # Below the cheapest rung nothing is chosen, and the refusal names the
         # cheapest measured cost so the caller knows how far off it is.
-        nothing = built.select(
-            card=CARD_5090, resolution=R4K, scale=1.0, budget_ms=5.0
-        )
+        nothing = built.select(card=CARD_5090, resolution=R4K, scale=1.0, budget_ms=5.0)
         self.assertIsNone(nothing.version)
         self.assertIn("cheapest measured rung is 4.6 at 10.000 ms", nothing.reason)
 
@@ -468,9 +466,7 @@ class AutoSelectionTest(CustomTestCase):
         for row in payload["ladder"]:
             self.assertTrue(row["verdict"])
             self.assertTrue(row["source"])
-            self.assertIn(
-                row["provenance"], {"measured", "estimate", "absent"}
-            )
+            self.assertIn(row["provenance"], {"measured", "estimate", "absent"})
         self.assertIn("ASSUMPTION", payload["quality_basis"])
 
 

@@ -510,6 +510,36 @@ class RifeLadder:
 
     # -- the policy -------------------------------------------------------
 
+    def knows_point(self, card: str, resolution: Resolution, scale: float) -> bool:
+        """True when the frontier has *any* version measured at this point.
+
+        The distinction that keeps the two rate sources from fighting. If the
+        ladder has cells for this card at this geometry, then a version with no
+        cell is genuinely unmeasured and must price as absent -- otherwise the
+        version-blind :class:`~sglang.srt.planner.cost_model.StageRateTable`
+        would quietly supply a 4.6 number for a 4.26 chain and the ladder's
+        walk would be theatre. If the ladder has never heard of this card at
+        all, it has no opinion, and the shared table is the only evidence there
+        is: refusing there would break every deployment whose probe reports use
+        card keys this seed does not carry.
+        """
+        target = str(resolution)
+        return any(
+            c == card and r == target and s == float(scale)
+            for _v, c, r, s in self.frontier.cells
+        )
+
+    def rate_for(
+        self, version: str, card: str, resolution: Resolution, scale: float
+    ) -> Rate:
+        """One version's cost on one card. The chain pricer's entry point.
+
+        Thin on purpose: it exists so ``chain_policy`` can price the
+        interpolation stage against the *version it is actually going to run*
+        without importing the frontier's key layout.
+        """
+        return self.frontier.rate(version, card, resolution, scale)
+
     def worst_case_rate(
         self, version: str, cards: Sequence[str], resolution: Resolution, scale: float
     ) -> Rate:
@@ -603,7 +633,9 @@ class RifeLadder:
                 verdict = f"measured at {ms:.3f} ms/pair; no budget was given"
                 fits = True
             elif ms <= budget_ms:
-                verdict = f"measured {ms:.3f} ms/pair fits the {budget_ms:.3f} ms budget"
+                verdict = (
+                    f"measured {ms:.3f} ms/pair fits the {budget_ms:.3f} ms budget"
+                )
                 fits = True
             else:
                 verdict = (
@@ -693,11 +725,7 @@ class RifeLadder:
             f"measured cost fits: {best.verdict} on card {card_label!r} at {resolution} "
             f"scale {scale} (rank {best.variant.quality_rank}, "
             f"{best.variant.vram_class.value} VRAM class). "
-            + (
-                f"Passed over: {', '.join(skipped)}. "
-                if skipped
-                else ""
-            )
+            + (f"Passed over: {', '.join(skipped)}. " if skipped else "")
             + QUALITY_BASIS_ASSUMPTION
         )
         return Selection(
@@ -725,15 +753,13 @@ def default_ladder(
     case every rung is :attr:`WeightState.PINNED`, which is still runnable
     because the pin makes the fetch reproducible.
     """
-    directory = (
-        Path(weight_dir)
-        if weight_dir is not None
-        else _default_weight_dir()
-    )
+    directory = Path(weight_dir) if weight_dir is not None else _default_weight_dir()
     ranks = dict(DEFAULT_QUALITY_RANK)
     if quality_ranks:
         ranks.update(quality_ranks)
-    wanted = tuple(versions) if versions is not None else tuple(sorted(SUPPORTED_VERSIONS))
+    wanted = (
+        tuple(versions) if versions is not None else tuple(sorted(SUPPORTED_VERSIONS))
+    )
 
     entries: list[RifeVariant] = []
     for version in wanted:
