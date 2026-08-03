@@ -188,7 +188,91 @@ split. Establish whether a 4K fp16 frame can cross a 256-MiB BAR1 window at all
 on this rig, and at what rate. If it can, `CardProfile.link_gib_s` takes the
 number and nothing else in the pricer changes.
 
-## 5. Re-derivation to repeat once the numbers land
+## 5. The fused SR tail (#457 build half)
+
+Added 2026-08-03. `TASK_333_M2_VIDEO_ENHANCE.md` §17.7 built the fusion and
+graded the artifact on the CPU provider; the parity of the *filter* is settled
+(145 dB against the two-stage reference, and the deliberately-wrong `nearest`
+arm is rejected at 17 dB). What a desk cannot answer is what the fused engine
+costs on silicon, and every re-priced chain figure in §17.7 is ESTIMATE until
+these rows exist. They join this window rather than opening a competing one —
+the same cards, the same corridor rule, the same floor discipline as §1.
+
+### 5.1 Build the fused engine on both arches
+
+```
+PYTHONPATH=python:/tmp/onnxtools python scripts/video_enhance/export_sr_fused_tail.py \
+    --arm lanczos3 --grade --report <out>/fused_tail_cpu.json
+```
+
+then build the TensorRT engine from the derived artifact exactly as ticket V
+built the unfused one: `NetworkDefinitionCreationFlag.STRONGLY_TYPED`, dynamic
+profile min 960x540 / opt 1280x720 / max 1920x1080 **on the input**, which is
+unchanged — the tail is shape-agnostic and the profile does not move. Record
+build seconds, engine bytes and the consumer matrix per arch, the same three
+columns ticket V's §1 table has.
+
+The #339 engine-build discipline applies unchanged and there is one addition
+worth checking explicitly: the engine's **output** signature is now
+`1x3x(2*h)x(2*w)`, not `1x3x(4*h)x(4*w)`. A consumer that derives the output
+shape from `SrModel.scale` gets it right (the derived model's scale is the
+**net** scale, x2); one that assumes x4 does not. Verify all three profile
+resolutions produce half-size output before timing anything.
+
+### 5.2 Parity on the card, both arches
+
+The desk gate compared fp32-graph against fp32-graph and measured float
+rounding. The window gate is the one that matters: **fused fp16 TRT engine vs
+the fp32 unfused ONNX followed by `resize.lanczos3_resize`**, which is
+`fused_tail.grade_fused_tail`, thresholds 40 dB / 0.995, 3 samples at 960x540
+as in ticket V.
+
+Expect it to land near ticket V's 48.1 dB rather than near the desk's 145 dB:
+the fp16 conversion dominates, and the tail adds a 12-tap sum whose fp16
+accumulation is the one genuinely new numerical risk. **If it fails on one
+arch, that is the finding** — the fallback is `--io-cast-only` on the fused
+artifact (the fp16 export composes with the fused one; verified at the desk),
+not abandoning the fusion.
+
+### 5.3 The row the whole re-pricing hangs on
+
+`sr_fused` ms/frame at 1920x1080 input, TRT fp16, both arches, per-boot A-vs-A
+floor first. Against ticket V's 25.424 (5090) / 90.343 (3080) for `sr` alone
+and 24.367 (5090) for `resize`:
+
+* the fused stage cannot be cheaper than `sr` alone;
+* §17.7.4's verdict of 21.24 src-fps holds for any fused cost up to
+  **21.66 ms** above the unfused `sr` figure on the 5090, i.e. the fusion only
+  has to beat the separate resize's 24.367 ms by 2.7 ms;
+* if the fused cost lands *above* `sr + resize`, the fusion is a regression
+  and that is a publishable negative result. Report it as one.
+
+Take the 4K-output payload check alongside it: peak device bytes for the fused
+stage should drop by roughly the 8K intermediate (189.84 MiB per in-flight
+frame) against the unfused pair, which is the other half of what the fusion
+buys and is a `forward_peak`-style corridor observation, not a timing.
+
+### 5.4 The three rows that were already missing
+
+These are §17.5's named absences. They gate the pipeline-vs-replication
+comparison and are cheap next to the sweep:
+
+1.  **`resize` on a 3080** at 7680x4320 -> 3840x2160. Still wanted even though
+    the fusion removes the stage: it is the before-number the fused row is
+    judged against on that arch, and it is what makes the *unfused* Regime-A
+    figure a value instead of the 8.67/18.299 bound.
+2.  **`color_to_rgb` at 1920x1080** and **`color_to_yuv` at 3840x2160**. Both
+    are carried as `unpriced_stages` on every report, so every absolute fps
+    figure in §17.5 and §17.7 is optimistic by an unknown amount.
+
+### 5.5 Re-price and re-pin
+
+With the real `sr_fused` row, re-run §17.7.4 and update both the table and
+`test_stage_pipeline.FusedVerdictTest`, which pins it. Replace `tail_ms=0.0`
+with the measured difference and drop the ESTIMATE label from the cells that
+earned it. The test exists so the document cannot drift from the pricer.
+
+## 6. Re-derivation to repeat once the numbers land
 
 `TASK_333_M2_VIDEO_ENHANCE.md` §17.5 is pinned by
 `test_stage_pipeline.TicketVVerdictTest`. With real frontier rows for the six

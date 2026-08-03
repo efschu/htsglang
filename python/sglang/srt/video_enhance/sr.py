@@ -115,12 +115,18 @@ REALESRGAN_X2PLUS = SrModel(
 #: immediately reduces to 47 MiB. Fusing the Lanczos-3 downscale in as the
 #: engine's last layer removes that round trip and one kernel launch per
 #: frame, and it is exactly the operation ``efschu/vs-mlrt``'s
-#: ``lanczos3_kernel.cu`` already implements. This is a registered follow-on
-#: post; M2 runs the resize as its own stage and measures it (post P1) so the
-#: fusion has a before number to beat.
+#: ``lanczos3_kernel.cu`` already implements.
+#:
+#: **Built in #457** as ONNX graph surgery on the pinned artifact --
+#: ``video_enhance/fused_tail.py``. Ticket V supplied the before numbers this
+#: note asked for: SR 25.42 ms, resize 24.37 ms on the 5090. The fused engine
+#: emits 4K directly, so the 8K intermediate is never materialised. The fused
+#: stage's own ms/frame is a GPU row and is BOOT-PENDING (TICKET_460 §5);
+#: until it lands, every re-priced chain figure is labelled ESTIMATE.
 FUSED_TAIL_RESIZE_NOTE = (
-    "resize-fused-into-SR-tail is a registered follow-on post; M2 measures the "
-    "separate stage so the fusion has a baseline"
+    "resize-fused-into-SR-tail is BUILT (#457, video_enhance/fused_tail.py): "
+    "the pinned graph gains a stride-2 depthwise Lanczos-3 tail and the engine "
+    "emits 4K directly. Its ms/frame is BOOT-PENDING (TICKET_460 §5)"
 )
 
 SR_MODELS: dict[str, SrModel] = {
@@ -254,6 +260,66 @@ def derived_fp16_model(
         note=(
             f"derived locally from {base.filename} by {manifest.get('method')}; "
             "graded by the parity gate before use"
+        ),
+    )
+
+
+def derived_fused_tail_model(
+    model_dir: Path = DEFAULT_MODEL_DIR,
+    base: SrModel = REALESR_GENERAL_WDN_X4V3,
+    *,
+    kind: str = "lanczos3",
+) -> SrModel:
+    """The locally derived fused-tail sibling of a pinned artifact (#457).
+
+    Identity comes from the sidecar the surgery wrote, on the same terms as
+    :func:`derived_fp16_model`: the source hash, this file's hash, and the
+    method. The returned model's ``scale`` is the **net** scale -- x2 for an
+    x4 network with a 2:1 tail -- so a stage built from it computes the right
+    output resolution without knowing that a fusion happened.
+    """
+    from sglang.srt.video_enhance.fused_tail import (
+        FUSED_TAIL_SUFFIX,
+        PROVENANCE_SUFFIX as FUSED_PROVENANCE_SUFFIX,
+    )
+
+    path = Path(model_dir) / (Path(base.filename).stem + FUSED_TAIL_SUFFIX)
+    sidecar = path.with_suffix(path.suffix + FUSED_PROVENANCE_SUFFIX)
+    if not sidecar.is_file():
+        raise ArtifactError(
+            f"no fused-tail artifact derived yet: {sidecar} is absent. Run "
+            "scripts/video_enhance/export_sr_fused_tail.py, which writes both "
+            "the ONNX and the provenance it is verified against."
+        )
+    manifest = json.loads(sidecar.read_text())
+    if manifest.get("derived_from_sha256") != base.sha256:
+        raise ArtifactError(
+            f"{path.name} was derived from an artifact hashing to "
+            f"{manifest.get('derived_from_sha256')}, but the pinned source now "
+            f"hashes to {base.sha256}. Re-export rather than use a derivative "
+            "of a different model."
+        )
+    method = manifest.get("method", "")
+    if method != f"append_halving_tail:{kind}":
+        raise ArtifactError(
+            f"{path.name} carries tail {method!r}, not the requested {kind!r}. "
+            "The comparison arms (nearest, bicubic_antialias) exist to be "
+            "graded, not to be served."
+        )
+    return SrModel(
+        model_id=f"{base.model_id}-fusedtail-{kind}",
+        url="",
+        filename=path.name,
+        sha256=manifest["sha256"],
+        size_bytes=int(manifest["bytes"]),
+        scale=int(manifest["net_scale"]),
+        exported_precision=base.exported_precision,
+        opset=int(manifest.get("opset", {}).get("", base.opset)),
+        architecture=base.architecture,
+        note=(
+            f"derived locally from {base.filename} by {method}; the tail resize "
+            "is inside the graph, so this model's scale is the net scale and no "
+            "separate resize stage follows it"
         ),
     )
 
@@ -418,11 +484,13 @@ __all__ = [
     "ArtifactError",
     "BackendUnavailable",
     "DEFAULT_MODEL_DIR",
+    "FUSED_TAIL_RESIZE_NOTE",
     "REALESR_GENERAL_WDN_X4V3",
     "SR_MODELS",
     "SrModel",
     "SuperResolutionStage",
     "derived_fp16_model",
+    "derived_fused_tail_model",
     "fetch_model",
     "run_parity_gate",
     "sr_engine_key",

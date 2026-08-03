@@ -29,9 +29,12 @@ from sglang.srt.video_enhance.stage_pipeline import (
     EIGHT_K_FP16_MIB,
     UNPRICED_CHAIN_STAGES,
     CardProfile,
+    PipelineError,
+    absorbed_tail_rates,
     barlink_link,
     best_placement,
     compare_regimes,
+    fuse_stages,
     host_bounce_links,
     price_placement,
     replicated_throughput,
@@ -554,6 +557,223 @@ class TicketVVerdictTest(CustomTestCase):
         self.assertEqual(best.binding_stage, "encode")
         self.assertAlmostEqual(best.throughput_fps, 21.24, places=2)
         self.assertLess(best.throughput_fps, 25.0)
+
+
+def fused_ticket_v(*, rife_5090: float, rife_3080: float, tail_ms: float = 0.0):
+    """Ticket V's table with sr+resize collapsed, as #457 built it."""
+    stages = ticket_v_stages(rife_5090=rife_5090, rife_3080=rife_3080)
+    rates = absorbed_tail_rates(
+        stages, ("sr", "resize"), tail_ms=tail_ms, source=TICKET_V
+    )
+    return fuse_stages(stages, ("sr", "resize"), name="sr_fused", ms=rates)
+
+
+class FuseStagesTest(CustomTestCase):
+    """Fusion is three changes, not one, and each of them is asserted here.
+
+    The failure this guards against is a re-priced verdict that lowers a cost
+    and forgets that the fused stage also emits a different frame and no
+    longer needs its partner on the same card. That verdict would be
+    arithmetically fine and structurally wrong.
+    """
+
+    def test_the_fused_stage_hands_on_the_tail_geometry(self):
+        fused = fused_ticket_v(rife_5090=11.359, rife_3080=31.999)
+        stage = next(s for s in fused if s.name == "sr_fused")
+        self.assertEqual(stage.out_resolution, R4K)
+        # 47.46 MiB, not 189.84: the engine stops emitting the 8K frame, which
+        # is the entire point of the exercise.
+        self.assertAlmostEqual(stage.payload_mib(), 47.46, places=2)
+        self.assertLess(stage.payload_mib(), EIGHT_K_FP16_MIB)
+
+    def test_the_co_residency_requirement_is_discharged(self):
+        fused = fused_ticket_v(rife_5090=11.359, rife_3080=31.999)
+        self.assertEqual([s.name for s in fused if s.co_resident_with], [])
+        self.assertNotIn("resize", [s.name for s in fused])
+
+    def test_the_8k_payload_never_crosses_a_card_again(self):
+        best, refusals = best_placement(
+            fused_ticket_v(rife_5090=11.359, rife_3080=31.999),
+            rig_cards(),
+            prefetch_depth=1,
+        )
+        self.assertEqual(refusals, ())
+        for transfer in best.transfers:
+            self.assertLess(transfer.boundary.payload_mib, EIGHT_K_FP16_MIB)
+
+    def test_the_unfused_table_does_refuse_placements(self):
+        # The falsifier for the assertion above. If the unfused table had no
+        # refusals either, "fusion removed them" would be vacuous.
+        _best, refusals = best_placement(
+            ticket_v_stages(rife_5090=11.359, rife_3080=31.999),
+            rig_cards(),
+            prefetch_depth=1,
+        )
+        self.assertTrue(any("co-residency violated" in r.reason for r in refusals))
+
+    def test_the_absorbed_stage_takes_its_absent_cells_with_it(self):
+        # The 3080 resize row was never measured and is what makes the
+        # Regime-A comparison a bound. After the fusion there is no separate
+        # resize pass on a 3080 to have measured, so the cell stops being a
+        # question -- at the price of the fused cell itself being an estimate.
+        rates = absorbed_tail_rates(
+            ticket_v_stages(rife_5090=11.359, rife_3080=31.999),
+            ("sr", "resize"),
+            tail_ms=0.0,
+            source=TICKET_V,
+        )
+        self.assertEqual(sorted(rates), ["3080_x4", "3080_x8", "5090"])
+        for card, rate in rates.items():
+            self.assertFalse(rate.is_absent, card)
+            self.assertIs(rate.provenance, Provenance.ESTIMATE)
+        self.assertAlmostEqual(float(rates["5090"].value), 25.424, places=3)
+        self.assertAlmostEqual(float(rates["3080_x8"].value), 90.343, places=3)
+
+    def test_a_kept_absent_cell_stays_absent(self):
+        # Absorbing the tail must not launder an absence in a stage that is
+        # still being run.
+        stages = stage_table(
+            [
+                ("sr", {"5090": 25.424, "3080_x8": None}),
+                ("resize", {"5090": 24.367, "3080_x8": None}),
+            ],
+            source="synthetic",
+            geometry=GEOMETRY,
+        )
+        rates = absorbed_tail_rates(
+            stages, ("sr", "resize"), tail_ms=0.0, source="synthetic"
+        )
+        self.assertFalse(rates["5090"].is_absent)
+        self.assertTrue(rates["3080_x8"].is_absent)
+
+    def test_non_adjacent_stages_are_refused(self):
+        stages = ticket_v_stages(rife_5090=11.359, rife_3080=31.999)
+        with self.assertRaises(PipelineError) as caught:
+            absorbed_tail_rates(stages, ("sr", "encode"), tail_ms=0.0, source=TICKET_V)
+        self.assertIn("not consecutive", str(caught.exception))
+
+    def test_an_outside_co_residency_survives_and_is_repointed(self):
+        stages = stage_table(
+            [
+                ("sr", {"a": 10.0}),
+                ("resize", {"a": 10.0}),
+                ("rife", {"a": 10.0}),
+            ],
+            source="synthetic",
+            geometry={
+                "sr": (R8K, PixelFormat.RGB_FP16, 1.0),
+                "resize": (R4K, PixelFormat.RGB_FP16, 1.0),
+                "rife": (None, PixelFormat.RGB_FP16, 0.0),
+            },
+            co_residency={"rife": ("resize",), "resize": ("rife",)},
+        )
+        rates = absorbed_tail_rates(
+            stages, ("sr", "resize"), tail_ms=0.0, source="synthetic"
+        )
+        fused = fuse_stages(stages, ("sr", "resize"), name="sr_fused", ms=rates)
+        by_name = {s.name: s for s in fused}
+        self.assertEqual(by_name["rife"].co_resident_with, ("sr_fused",))
+        self.assertEqual(by_name["sr_fused"].co_resident_with, ("rife",))
+
+
+class FusedVerdictTest(CustomTestCase):
+    """The re-priced 1080p@25 -> 2160p@50 verdict, pinned to §17.7 of the doc.
+
+    Every number here is ESTIMATE: the fused stage has never been timed, and
+    ``tail_ms=0`` is the optimistic end of the band. The GPU row is
+    TICKET_460 §5.
+    """
+
+    def test_scale_half_gains_and_the_bind_moves_to_encode(self):
+        best, _refusals = best_placement(
+            fused_ticket_v(rife_5090=11.359, rife_3080=31.999),
+            rig_cards(),
+            prefetch_depth=1,
+            unpriced_stages=UNPRICED_CHAIN_STAGES,
+        )
+        self.assertAlmostEqual(best.period_ms, 47.080, places=3)
+        self.assertAlmostEqual(best.throughput_fps, 21.24, places=2)
+        self.assertEqual(best.binding_stage, "encode")
+        self.assertIs(best.provenance, Provenance.ESTIMATE)
+
+    def test_scale_one_gains_far_more_than_scale_half(self):
+        # The finding worth reading off the fusion: freeing the 5090 lets it
+        # carry RIFE at full flow resolution, so the 3080's 63.1 ms RIFE bind
+        # disappears and the two scales converge on the same period. The
+        # fusion is worth 34 % at s1.0 against 5.8 % at s0.5.
+        before, _ = best_placement(
+            ticket_v_stages(rife_5090=20.539, rife_3080=63.108),
+            rig_cards(),
+            prefetch_depth=1,
+        )
+        after, _ = best_placement(
+            fused_ticket_v(rife_5090=20.539, rife_3080=63.108),
+            rig_cards(),
+            prefetch_depth=1,
+        )
+        self.assertAlmostEqual(before.throughput_fps, 15.85, places=2)
+        self.assertAlmostEqual(after.throughput_fps, 21.24, places=2)
+        self.assertEqual(after.binding_stage, "encode")
+        self.assertEqual(after.placement["rife"], "5090")
+
+    def test_the_fused_chain_still_does_not_reach_25(self):
+        # Stated as a test because the briefing for this work expected it to.
+        # It does not: the ffmpeg encode round trip binds at 47.08 ms and no
+        # amount of tail fusion moves it.
+        for rife_5090, rife_3080 in ((20.539, 63.108), (11.359, 31.999)):
+            with self.subTest(rife_5090=rife_5090):
+                best, _ = best_placement(
+                    fused_ticket_v(rife_5090=rife_5090, rife_3080=rife_3080),
+                    rig_cards(),
+                    prefetch_depth=1,
+                )
+                self.assertLess(best.throughput_fps, 25.0)
+
+    def test_the_verdict_survives_a_tail_that_is_not_free(self):
+        # tail_ms=0 is the optimistic end. The paper verdict is unchanged for
+        # any fused tail up to 21.66 ms on the 5090 -- so the fusion has to
+        # beat the separate resize's 24.37 ms by only 2.7 ms to deliver it.
+        for tail_ms in (0.0, 3.0, 21.6):
+            with self.subTest(tail_ms=tail_ms):
+                best, _ = best_placement(
+                    fused_ticket_v(rife_5090=11.359, rife_3080=31.999, tail_ms=tail_ms),
+                    rig_cards(),
+                    prefetch_depth=1,
+                )
+                self.assertAlmostEqual(best.throughput_fps, 21.24, places=2)
+        binds_again, _ = best_placement(
+            fused_ticket_v(rife_5090=11.359, rife_3080=31.999, tail_ms=21.7),
+            rig_cards(),
+            prefetch_depth=1,
+        )
+        self.assertEqual(binds_again.binding_stage, "sr_fused")
+
+    def test_regime_a_becomes_a_value_instead_of_a_bound(self):
+        fused = fused_ticket_v(rife_5090=11.359, rife_3080=31.999)
+        strict, _prov, gaps = replicated_throughput(fused, rig_cards())
+        loose, _prov2, gaps2 = replicated_throughput(
+            fused, rig_cards(), omit_absent_stages=True
+        )
+        self.assertEqual(gaps, ())
+        self.assertEqual(gaps2, ())
+        self.assertAlmostEqual(strict, loose, places=6)
+        self.assertAlmostEqual(strict, 23.550, places=2)
+
+    def test_replication_overtakes_the_pipeline_once_the_tail_is_fused(self):
+        # Before the fusion the pipeline was the only regime with a value at
+        # all. After it, whole-chain replication is ahead -- which is a
+        # placement decision the planner has to be allowed to reach.
+        fused = fused_ticket_v(rife_5090=11.359, rife_3080=31.999)
+        best, comparison = compare_regimes(fused, rig_cards(), prefetch_depth=1)
+        self.assertEqual(comparison.winner, "replicated")
+        self.assertGreater(comparison.replicated_fps, best.throughput_fps)
+
+    def test_the_pessimistic_column_is_still_below_the_optimistic_one(self):
+        fused = fused_ticket_v(rife_5090=11.359, rife_3080=31.999)
+        pessimistic, _ = best_placement(fused, rig_cards(), prefetch_depth=0)
+        optimistic, _ = best_placement(fused, rig_cards(), prefetch_depth=1)
+        self.assertAlmostEqual(pessimistic.throughput_fps, 18.57, places=2)
+        self.assertAlmostEqual(optimistic.throughput_fps, 21.24, places=2)
 
 
 if __name__ == "__main__":
