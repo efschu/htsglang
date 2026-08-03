@@ -65,6 +65,12 @@ gpu_id_for_rank()"*. Deriving it from `nvidia-smi` output would yield 1 for the
 draft head would be placed on a 3080, where the MXFP4 Marlin path does not exist
 at all (SM90/SM120 only, ANALYSE_447 §1.5). Wrong card, no error.
 
+Independent cross-check: the #530 serving boot script already encodes exactly
+this, and transposes its own thresholds because of it
+(`/tmp/w530_boot.sh:34-37`) — *"NVML index 1 is the 5090 and carries rank 0
+(CUDA order != NVML order on this rig), so the budgets transpose"*. The rig
+knew; this analysis briefly forgot.
+
 **Action:** resolve the 5090 by **UUID through CUDA device properties**, never
 by NVML index equality. Any per-rank quantity read from `nvidia-smi` (the #493
 free-VRAM corridor, power tags, per-rank VRAM) must be mapped NVML→CUDA by UUID
