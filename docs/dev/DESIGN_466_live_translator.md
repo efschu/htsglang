@@ -1,6 +1,6 @@
 # DESIGN #466 — Live speech-to-speech translator, voice-preserving
 
-Status: **Phase 2 complete, desk only.** Phase 1 was survey + architecture +
+Status: **Phase 3: audio out works.** Rung B synthesises cross-lingual cloned speech end to end (talker, code predictor, codec, Opus) on the desk; see §13. Routing v2 (unordered pairs, fan-out, constrained ASR whitelist) is in with its UI. Open: GPU latency, an ASR intelligibility round trip, the preset clips (§14). Phase 1 was survey + architecture +
 selection + MVP skeleton; Phase 2 added the real TTS serving path, the Opus
 transport, the preset pool descriptors, the ops scripts, and intra-segment
 speaker splitting. No GPU was taken; every python invocation ran under
@@ -30,6 +30,7 @@ them.
 | 2026-08-03 | **REVOKED: the vLLM-Omni TTS sidecar. No external serving engines at all.** Everything runs inside htsglang. Reason, and it is architectural rather than aesthetic: the whole memory-hierarchy program — spill/offload/eviction across ALL assets, one ledger, the #286 register, the #305 residency ladder — can only arbitrate between assets that live under one runtime. A second serving engine owns VRAM the ledger cannot see, so every cross-asset decision silently becomes wrong. Phase 2's `serve_tts.sh` / `setup_tts_venv.sh` are dead and the running server was killed. A dependency-pin conflict is now a named engineering item, never a reason to add an engine. The pluggable TTS backend interface is what makes this cheap: the backend swaps, the pipeline, the session, the journal and the client all stand. |
 | 2026-08-03 | **Scheduler unblock deferred to #488, not built in rung B.** The `self.input_embeds = None` clear in `prepare_for_decode` is a rung-A prerequisite: rung B runs its own generation loop and never enters the scheduler, so a gated patch here would have no caller and no falsifier — unvalidated ballast of exactly the kind the desk-written-never-executed rule forbids. Recorded as a named #488 prerequisite (§11.2) so it is not lost. |
 | 2026-08-03 | **Path routing, not a subdomain.** The translator is mounted as `/translate/` under an existing `server_name` with the existing certificate. No DNS record, no `certbot --expand`, nothing touched in the user's certificate setup — zero user action and zero risk to a cert that fronts a dozen other services. A dedicated subdomain is a post-vacation item. |
+| 2026-08-03 | **Routing v2: a rule is an unordered PAIR, and fan-out is the intent.** `de <-> es` routes both directions from one row. Two rows sharing a language (`{de<->es, de<->fr}`) render one German utterance in BOTH targets, played sequentially with a language tag. This inverts two v1 decisions that were the wrong reading of the requirement: "one source routes to exactly one target" made the three-language case unexpressible, and "a duplicate source is refused" refused the very thing the user wants. A repeated pair is deduplicated, not rejected. Capability refusal moves to the pair level, named and greyed out per direction. The ASR keeps identifying the source language (the direction stays observed, never configured) but from a candidate set narrowed to the table's languages; a low-confidence decision resolves to the best in-set language and is TAGGED, never discarded. |
 | 2026-08-03 | **No enrollment before the trip.** The user has no time to record voice samples. The user's voice therefore runs the *same* path as every other speaker: a rolling reference buffer accumulated from live speech, with preset mode covering the cold start. No special user-enrollment flow in the MVP. The enrollment endpoint stays (it costs nothing and already works) but is a post-vacation upgrade slot, and the GPU A/B must score cloning from **10-30 s of accumulated live speech**, not from clean curated audio. |
 
 ---
@@ -1145,7 +1146,102 @@ costs a backend and not a pipeline.
 
 ---
 
-## 13. Rung B status, 2026-08-03 (current blocker)
+## 13. Rung B status, 2026-08-03 — CLOSED, audio out works
+
+**The decode seam and the weight load are both fixed, and the audio-out path
+runs end to end.** Reference German speech in, Spanish out in that speaker's
+voice, through talker -> code predictor -> codec -> Opus. Superseded blocker
+narrative preserved in §13.3 because the wrong turns are the useful part.
+
+### 13.1 What the fixes were
+
+**Drift 6 — the decode seam. One missing input, not the position arithmetic.**
+The talker branches on `cache_position` to tell prefill from decode
+(`modeling_qwen3_tts.py:1693-1711`). transformers 4.57 created it in
+`prepare_inputs_for_generation` for every model; 5.x removed it and now
+creates it only for **remote-code** models (`generation/utils.py:596-604`,
+behind `is_remote_code()`). `qwen-tts` is an ordinary installed package, so it
+never qualifies: the talker saw `None` on every step and took the PREFILL
+branch forever, rebuilding whole-sequence M-RoPE positions from an attention
+mask that had already grown to the cache length while the query was one token.
+
+Both reported symptoms collapse into this one cause — the `o_proj` failure
+(`1x22528` = 11 cached positions x 2048) and the `text_projection` failure
+(`1x36864` = 18 x 2048). **The prompt-builder suspicion of §13.3 is retired:
+the builder was never the problem.**
+
+The earlier narrowing was also wrong in a way worth recording. The talker's
+`arange(seq_length)` reads `input_ids.shape`, but 5.x **does** still slice
+`input_ids` to the query width for cached generation
+(`next_sequence_length = 1`, `generation/utils.py:2793`). That line was never
+defective, only unreachable — which is exactly why slicing `input_ids` in a
+wrapper changed nothing.
+
+The fix restores the input the talker's own position math was written against
+rather than reimplementing that math, so its `rope_deltas` correction for left
+padding keeps working unchanged.
+
+**Drift 7 — the weights were never loaded, and this one nearly won.**
+`from_pretrained` printed `Loading weights: 478/478` and loaded none of them.
+Every talker and speaker-encoder tensor was still at transformers' random
+initialisation while the checkpoint held trained values:
+
+```
+FILE  talker.text_projection.linear_fc2.bias  [0.00227, -0.00110, 0.00616, ...]
+MODEL talker.text_projection.linear_fc2.bias  [0.0, 0.0, 0.0, ...]
+```
+
+An explicit `load_state_dict` resolves every key (0 missing, 0 unexpected,
+0 mismatched), so the fault is 5.x's key remapping for this multi-prefix
+checkpoint, not the checkpoint.
+
+**Why it survived three rounds of investigation is the transferable part.** A
+randomly initialised talker in front of a correctly loaded vocoder does not
+fail — the vocoder turns any code sequence into speech, so the output was
+fluent, finite, speech-shaped babble at a plausible level. The only external
+symptom was that it never emitted the end-of-utterance code and ran to
+`max_new_tokens`: 40.9 s of audio for a nine-word sentence. That looks exactly
+like a sampling or conditioning bug, and the investigation went there first.
+Greedy decoding and both streaming modes ran away identically, which correctly
+ruled out sampling and pointed at something structural — the structural thing
+being that there was no trained model.
+
+It also produced a **spuriously excellent measurement**: 0.986 cosine
+similarity between the reference clip's x-vector and the output's, both
+extracted by the same randomly initialised speaker encoder. Two garbage
+vectors from one garbage encoder agree perfectly. Fourth instance of the
+reference-twin family in this project, and the reason `verify_and_load_weights`
+compares against the checkpoint **bytes** and never against another copy of
+the model. It runs on every load rather than behind a flag, because silent
+non-loading is invisible to every cheap signal, and it raises rather than
+continuing: a talker that cannot be loaded must fail loudly instead of
+sounding plausible.
+
+### 13.2 Measured, CPU, `CUDA_VISIBLE_DEVICES=99`
+
+Reference: `xtts-v2/samples/de_sample.wav`, 3.11 s of real German speech.
+Target text: one Spanish sentence, nine words.
+
+| | before the weight fix | after |
+|---|---|---|
+| audio produced | 40.88 s (hit the 512-token cap) | **3.76 s** (terminated on `codec_eos`) |
+| peak | 1.000 | 0.399 |
+| Opus round trip | 24.6 kbps, decoded in full | **20.8 kbps**, decoded in full |
+| speaker similarity | 0.986 *(spurious — see above)* | **0.980** *(loaded encoder)* |
+
+3.76 s against the reference implementation's own **3.85 s** for the same
+checkpoint and direction (`base_de2es_xvec.wav`, §10) — the independent
+cross-check that the port now behaves like the thing it ports.
+
+RTF 5.19 on CPU is not a latency number and must not be quoted as one; the
+GPU window replaces it. §11.6's 71 ms warm first-audio remains the bar.
+
+Scripts, both re-runnable and both used to produce the numbers above:
+`scripts/translator/probe_decode_seam.py` (the seam, with `--no-shim` to
+reproduce the failure) and `scripts/translator/audio_out_smoke.py` (the
+audible run, with structure and speaker-similarity reporting).
+
+### 13.3 Superseded blocker narrative (kept for the wrong turns)
 
 **Working, executed, not merely written:**
 
@@ -1223,7 +1319,27 @@ preserved reference at
 `/spinning/llm_stuff/translator-models/vllm-omni-reference/` is the source of
 truth for it, and reading it against the qwen-tts path is the next step.
 
-**Ladder position unchanged.** Rungs C (preset-only) and D (text-only) remain
-reachable and are unaffected by this blocker: everything above the TTS backend
-interface -- session, journal, reconnect, voice modes, preset pool, client,
-transport -- is done and green.
+**Ladder position: rung B ships.** Audio out works, so rungs C (preset-only)
+and D (text-only) are now the fallbacks they were meant to be rather than the
+likely outcome. Everything above the TTS backend interface -- session,
+journal, reconnect, voice modes, preset pool, client, transport -- is done and
+green, and unchanged by any of this.
+
+---
+
+## 14. What is open after Phase 3
+
+* **No GPU measurement yet.** Everything in §13.2 is CPU. The latency budget
+  in §3, the VRAM corridor entry in §6.1 and the ASR numbers all still need an
+  arbitrated window. The audio-out path is correct; how fast it is on a 3080
+  or the 5090 is unmeasured here.
+* **No ASR round trip.** Intelligibility is argued from structure (voiced
+  fraction, syllabic band) and from matching the reference implementation's
+  duration, not from transcribing the output. `faster-whisper` is not
+  installed in this venv, and installing into it while another agent held the
+  GPU window would have been the wrong kind of shared-box behaviour. The
+  intelligibility gate of §7(b)(3) is therefore still owed.
+* **The 36 preset clips.** Unchanged from §10: still the cheapest
+  high-value item on the list, still needs a window.
+* **True incremental streaming** remains a #488 item; rung B chunks a finished
+  utterance (module docstring in `inprocess_tts.py` states the gap).
