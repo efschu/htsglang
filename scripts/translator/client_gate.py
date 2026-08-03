@@ -153,6 +153,36 @@ PROBE_JS = """
 }
 """
 
+#: Translation text a PERSON can see: rendered, non-empty, and laid out with
+#: a non-zero box. Read off the live DOM, never off the socket.
+#:
+#: Adopted from the UI agent's harness (`live_gate_cut3.log`), which is where
+#: it caught the field defect: `case turn.translation` opened with
+#: `if (event.partial) break;`, so every streamed clause was discarded and the
+#: screen showed a placeholder until the whole-translation frame arrived at
+#: speaking time. Every wire-level assertion in this gate passed throughout --
+#: the text WAS early, 2.6-7.1 s before the first audio frame, and invisible.
+#:
+#: That is the THIRD instance of the §17.8 class (the arm reads the channel
+#: the code writes to instead of the surface the user reads), after the
+#: whitelist that bound the label and not the decode, and the cursor that
+#: outlived its session. It belongs in the standard repertoire rather than in
+#: one agent's harness, which is why it lives here now.
+VISIBLE_TEXT_JS = """
+() => {
+  const rows = document.querySelectorAll('#transcript .line .dst .tr .txt');
+  let best = '';
+  for (const row of rows) {
+    const box = row.getBoundingClientRect();
+    const shown = box.width > 0 && box.height > 0;
+    if (shown && row.textContent.trim().length > best.length) {
+      best = row.textContent.trim();
+    }
+  }
+  return best;
+}
+"""
+
 #: Stage keys carried by ``turn.done``, in pipeline order, with the two that
 #: are cumulative-from-segment-close marked. ``first_audio_ms`` is THE number:
 #: what a listener waits after the speaker stops.
@@ -365,6 +395,7 @@ async def one_turn(
 
     line_at = None
     audio_at = None
+    text_visible_at = None
     # Did the page ever SAY it was waiting (§17.8.2)? Polled rather than
     # checked at the end, because the notice is deliberately transient: the
     # translation that clears it is the same event that ends the wait.
@@ -385,6 +416,11 @@ async def one_turn(
             )
             if now_lines > before_lines:
                 line_at = time.monotonic() - started
+        # The surface a person reads, polled beside the wire so the two can be
+        # compared on one clock. See ``VISIBLE_TEXT_JS``.
+        if text_visible_at is None:
+            if await page.evaluate(VISIBLE_TEXT_JS):
+                text_visible_at = time.monotonic() - started
         if audio_at is None:
             if await page.evaluate("window.__gate.frames") > before_frames:
                 audio_at = time.monotonic() - started
@@ -453,6 +489,9 @@ async def one_turn(
         "turn": index,
         "line_s": None if line_at is None else round(line_at, 1),
         "audio_s": None if audio_at is None else round(audio_at, 1),
+        "text_visible_s": (
+            None if text_visible_at is None else round(text_visible_at, 1)
+        ),
         "audio_frames": after["frames"] - before_frames,
         "audio_seconds": round(
             (after["samples"]) / max(after["rate"] or 1, 1), 2
@@ -631,6 +670,7 @@ async def run_gate(args) -> tuple:
             )
             results.append(turn)
             print(f"[gate] turn {turn['turn']}: line {turn['line_s']}s "
+                  f"text-visible {turn['text_visible_s']}s "
                   f"audio {turn['audio_s']}s frames {turn['audio_frames']} "
                   f"@{turn['rate']}Hz | client {turn['client']} | "
                   f"{turn['text']}")
@@ -677,6 +717,25 @@ async def run_gate(args) -> tuple:
             # MARGIN is printed rather than only the verdict, so a future
             # narrowing is visible long before it becomes a failure instead of
             # arriving as one.
+            # THE ARM THE FIELD DEFECT WALKED THROUGH (§17.8, third instance).
+            # Skipped on the stop turn only because that turn is cancelled
+            # before MT can finish, so it owes no translation at all.
+            if not stop_mode:
+                if turn["text_visible_s"] is None:
+                    failures.append(
+                        f"turn {turn['turn']}: no translated text was ever "
+                        f"VISIBLE in the DOM within {budgets['line']}s -- "
+                        f"every wire assertion can still pass while the "
+                        f"screen shows a placeholder"
+                    )
+                elif (turn["audio_s"] is not None
+                        and turn["text_visible_s"] > turn["audio_s"] + 0.5):
+                    failures.append(
+                        f"turn {turn['turn']}: the translation became "
+                        f"readable at {turn['text_visible_s']}s, AFTER the "
+                        f"audio started at {turn['audio_s']}s -- the text was "
+                        f"early on the wire and the screen threw that away"
+                    )
             if not stop_mode:
                 order = text_order(turn)
                 print(f"[gate]   text/audio: {order['events']} streamed "
