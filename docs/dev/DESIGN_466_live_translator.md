@@ -1567,30 +1567,58 @@ green under `CUDA_VISIBLE_DEVICES=99`.
 
 ### 16.1 What a phone test can do TODAY
 
-Boot (CPU works and is slow; swap `--tts-device cuda:0 --tts-dtype bfloat16`
-and `--asr-device cuda` inside a window):
+Two processes, in this order — the tenant is an HTTP client of the first, so
+it must be healthy before the second starts. Both need the GPU arbitration
+holder. Verified together in window 5.
 
 ```bash
-CUDA_VISIBLE_DEVICES=99 PYTHONPATH=<repo>/python \
-  python -m sglang.srt.translator.launch \
-    --host <wg-addr> --port 30800 --participants de,es \
-    --asr faster-whisper --asr-device cpu --asr-compute-type int8 \
-    --tts inprocess --tts-device cpu --tts-dtype float32 \
-    --embedder onnx
+# 1. MT backend. Reserve 8000 on rank 0 (the 5090 in CUDA order) instead of the
+# runbook's 3000: the translator tenant shares that card and needs ~5 GB.
+VENV=/spinning/htsglang-gpu/.venv
+export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH"
+export PYTHONPATH=<repo>/python
+export SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1
+export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+setsid $VENV/bin/python -m sglang.launch_server \
+  --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8 \
+  --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
+  --rank-auto-reserve-mib 8000,2700,2700 \
+  --kv-cache-dtype fp8_e4m3 --context-length 32768 --trust-remote-code \
+  --max-running-requests 16 \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --enable-metrics --host 127.0.0.1 --port 30030 > <log> 2>&1 &
+
+# 2. The tenant. --card-uuid pins it to the 5090 before any CUDA context.
+setsid $VENV/bin/python -m sglang.srt.translator.launch \
+  --host <wg-addr> --port 30800 --participants de,es \
+  --card-uuid GPU-<5090-uuid-from-nvidia-smi> \
+  --asr faster-whisper --asr-device cuda --asr-compute-type int8_float16 \
+  --tts inprocess --tts-device cuda:0 --tts-dtype bfloat16 \
+  --embedder onnx \
+  --embedder-model /spinning/llm_stuff/translator-models/embedder/wespeaker_resnet34_LM.onnx \
+  --preset-voice-dir /spinning/llm_stuff/translator-models/preset-voices \
+  --mt-base-url http://127.0.0.1:30030/v1 --mt-model default > <log> 2>&1 &
 ```
+
+`--preset-voice-dir` is not optional in practice: without it a first
+utterance has no voice at all and the turn returns no audio (measured — the
+clone reference buffer is empty on a speaker's first turn BY DESIGN).
 
 | stage | state |
 |---|---|
 | VAD, segmenter, journal, reconnect, PWA, `/translate/` mount | real, tested |
-| ASR | **real** — faster-whisper large-v3-turbo, 98 languages |
+| ASR | **real** — faster-whisper large-v3-turbo, 98 languages, 96.9 ms/utterance |
 | speaker embedding | **real** — wespeaker resnet34-LM via ONNX |
-| TTS | **real** — Qwen3-TTS in process, cross-lingual clone at WER 0.100 |
+| TTS | **real** — Qwen3-TTS in process on the GPU, RTF 1.15 |
 | routing (pairs, fan-out, constrained detection) | real, tested |
-| **MT** | **the one gap** — HTTP client to our own 27B; that server must be running |
-| preset voices | all 36 clips rendered, but 5 pairs collide (§15b) — `preset` mode not ready; **`clone` mode is unaffected and is the primary path** |
+| MT | **real** — our own 27B on TP=3, end-to-end WER 0.000 through the front door |
+| preset voices | **real and in use** — 17 voices, sticky per session |
+| **own-voice cloning** | **does not engage** — see §16.4 finding 1 |
 
-So: a full DE↔ES conversation in `clone` voice mode is reachable as soon as
-the 27B endpoint is up. Nothing else in the tenant is a stub.
+So: a full DE↔ES conversation runs today, end to end, with nothing stubbed.
+What it does NOT yet do is the headline requirement — every speaker currently
+gets a preset voice rather than their own.
 
 ### 16.2 Immediate next steps, in order
 
