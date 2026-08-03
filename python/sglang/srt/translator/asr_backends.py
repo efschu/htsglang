@@ -188,7 +188,21 @@ class FasterWhisperAsr:
                 "faster-whisper is not installed (pip install faster-whisper)",
             ) from exc
         self.name = f"faster-whisper:{model}"
-        self._restrict = [str(c).lower() for c in restrict_languages]
+        # TWO DIFFERENT THINGS, and they were one attribute (§19.14).
+        #
+        # `_deployment_languages` is what this deployment is CONFIGURED to
+        # hear -- an operator's bound, set once here, and a genuine capability
+        # statement. `_restrict` is the live decode whitelist that
+        # `set_restrict_languages` pushes before EVERY recognition from the
+        # session's participant set (§17.8.6). Sharing one attribute made the
+        # advertised capability collapse onto the current selection: one
+        # recognizer serves every session, so `GET /api/translator/languages`
+        # answered with whichever conversation spoke last. Measured on the
+        # live service: `stages.asr = ["de", "es"]` from a model that hears
+        # 102, which is why nothing but German and Spanish was ever
+        # selectable.
+        self._deployment_languages = [str(c).lower() for c in restrict_languages]
+        self._restrict = list(self._deployment_languages)
         self._beam_size = beam_size
         self._vad_filter = vad_filter
         self._model = WhisperModel(
@@ -199,8 +213,12 @@ class FasterWhisperAsr:
         )
 
     def supported_languages(self) -> Iterable[str]:
-        if self._restrict:
-            return tuple(self._restrict)
+        # The DEPLOYMENT bound, never the live decode whitelist. A capability
+        # answer that narrows itself to the current selection can only ever
+        # confirm the selection -- which is exactly how a picker offering
+        # "every supported language" ended up offering the two already in use.
+        if self._deployment_languages:
+            return tuple(self._deployment_languages)
         try:
             from whisper.tokenizer import LANGUAGES  # type: ignore
 
@@ -323,7 +341,10 @@ class NemoStreamingAsr:
                 "use the faster-whisper backend instead",
             ) from exc
         self.name = f"nemo:{model}"
-        self._restrict = [str(c).lower() for c in restrict_languages]
+        # Same split as FasterWhisperAsr: the constructor's bound is a
+        # capability, the runtime whitelist is a decode constraint.
+        self._deployment_languages = [str(c).lower() for c in restrict_languages]
+        self._restrict = list(self._deployment_languages)
         if declared_languages is not None:
             self._languages = list(declared_languages)
         elif "parakeet" in model:
@@ -334,7 +355,7 @@ class NemoStreamingAsr:
         self._model = self._model.to(device).eval()
 
     def supported_languages(self) -> Iterable[str]:
-        return tuple(self._restrict or self._languages)
+        return tuple(self._deployment_languages or self._languages)
 
     async def transcribe(
         self, audio: AudioChunk, hint_language: Optional[str] = None
