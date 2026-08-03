@@ -2245,6 +2245,61 @@ result posting is opt-in per-use PAT, redacted from every error path
 (`github_share.py:97-105`); env-value redaction keys on five NAME suffixes
 (`:89`) — since #505-D3 that is a second layer on top of the shared scrub, not
 the only redaction.
+**Live-rate baselines are PER TARGET KEY, #533.** The delta state
+`live_metrics.snapshot` needs between polls used to live in one module-global
+slot (`_LANDING_SNAPSHOT_STATE` + `_LANDING_TARGET_KEY`), reset on every key
+change. That is correct for exactly one client: the landing page resolves its
+target three ways (explicit `?endpoint=`, supervisor-managed,
+auto-detected), so a browser tab and any second poller resolving differently
+alternate the key and wipe each other's baseline on every request —
+`live_metrics._rates()` returns `None` without one, so both saw `rates: null`
+permanently while the underlying counters kept moving (measured before the
+fix: 8/8 consecutive polls at a STABLE key still returned null while
+`generation_tokens_total` climbed 24253 -> 27134, because a concurrent poller
+on a different key kept re-triggering the reset branch). Storage is now
+`_LANDING_STATE_BY_KEY: OrderedDict[tuple, dict]` (`webui.py:1958`), capped at
+`_LANDING_STATE_MAX_KEYS = 8` with oldest-key eviction, and the no-target path
+no longer clears anything — a poll that resolves no target cannot destroy a
+poll that did. `_store_landing_baseline` (`webui.py:2005`) also holds the
+older baseline rather than replacing it when a new scrape lands less than
+`_LANDING_MIN_RATE_DT_S = 0.75` s after it (`webui.py:1973`), because the
+counters this rate is built from advance in decode-batch steps, so a
+sub-second window typically spans zero updates and divides to a hard 0.0 —
+exactly what a second poller does to the first one's window even after the
+keying fix, by landing between its ticks; correctness is unaffected since the
+rate is still delta/dt over the real elapsed interval, only the replacement is
+deferred. The serialization lock's purpose is corrected in the same change: it
+orders concurrent read-modify-writes of the per-key mapping, it does not make
+a single shared baseline meaningful across clients — no baseline shared
+across differing keys was ever correct, keyed storage is the fix, not the
+lock. **Same #533 branch, two follow-on fixes.** (a) `_fetch_server_info`
+(`live_metrics.py:713`) now caches the start-config fetch per `base_url`
+(`_SERVER_INFO_CACHE`, TTL `_SERVER_INFO_TTL_S = 60.0`, `live_metrics.py:697`,
+`:704`): `/get_server_info` is served by the same HTTP app as `/v1` and
+inherits scheduler back-pressure — measured 10-35 s under a 46k-token
+prefill against `/metrics`' 14 ms on the SAME process — while the landing page
+aborts its own poll at 1800 ms, so an uncached fetch blew the deadline on
+EVERY tick and the page never left its "reading the running server..."
+placeholder although every individual backend call was fine; the data is
+boot-constant so re-reading it 30x a minute bought nothing. A timed-out tick
+still serves the last cached value rather than blanking the config section.
+(b) `_detect_external_endpoint` (`webui.py:2997`) used a four-port shortlist
+(`_MONITOR_DETECT_PORTS`, now dead) while the manual "Find a server" sweep
+used `_DETECT_SWEEP_PORTS = range(30000, 30101) + (8000, 8080)`
+(`webui.py:2049`) — this rig serves on 30030, inside the sweep range and
+outside the shortlist, so automatic detection could never find the
+production server and only ever worked by inheriting a hand-triggered sweep's
+result from module memory; a dashboard restart silently read as "no server
+running" against a healthy one. Auto-detect now runs the same sweep, made
+cheap by the existing two-stage `_tcp_open` pre-filter (a closed port refuses
+instantly, so only ports that actually answer pay for an HTTP probe). **UI
+decision, same branch:** the rate tiles now headline the PROCESSING-window
+MEDIAN, not the instantaneous per-poll rate (`rateTokPerS`, `webui.py:10787`)
+— the 2 s instantaneous window routinely spans zero counter updates and reads
+a hard 0.0 next to a median reading 75-150 tok/s, so headlining the instant
+made a working server look dead; the instant is kept as a labelled secondary
+line, and an empty (no-completed-window) state renders an explicit
+"no median yet" note rather than either a synthetic zero or a blank cell.
 
 ## 15. Model bring-ups (boot-proven)
 Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;

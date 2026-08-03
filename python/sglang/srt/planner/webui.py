@@ -45,6 +45,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -1938,14 +1939,38 @@ def _reference_png_bytes() -> Optional[bytes]:
 # the model reference, forward the call, and JSON-shape the result.
 # ===========================================================================
 
-#: The delta ``state`` live_metrics.snapshot returns between polls. Kept ONLY
-#: module-side for delta math (rates / cache-hit); nothing is persisted to disk
-#: and the client owns the 60s ring buffers.
-_LANDING_SNAPSHOT_STATE = None
+#: The delta ``state`` live_metrics.snapshot returns between polls, PER TARGET
+#: KEY. Kept ONLY module-side for delta math (rates / cache-hit); nothing is
+#: persisted to disk and the client owns the 60s ring buffers.
+#:
+#: #533: this used to be ONE global baseline plus a single ``_LANDING_TARGET_KEY``,
+#: reset whenever the key changed. That is correct for exactly one client and
+#: silently broken for two: the dashboard resolves its target three ways
+#: (explicit ?endpoint=, supervisor-managed, auto-detected), so a browser tab
+#: polling one way and any second poller resolving another way alternate the
+#: key and reset each other's baseline on EVERY request. ``_rates()`` returns
+#: None without a baseline, so both clients saw ``rates: null`` forever -- the
+#: reported "tiles are constantly empty", with the underlying counters moving
+#: the whole time. Measured before the fix: 8/8 consecutive polls at a stable
+#: key returned null while ``generation_tokens_total`` climbed 24253 -> 27134.
+#: Keyed storage makes concurrent monitors independent instead of mutually
+#: destructive.
+_LANDING_STATE_BY_KEY: "OrderedDict[tuple, dict]" = OrderedDict()
 
-#: Which monitor target the delta state belongs to -- switching targets resets
-#: the delta math (counters from different servers must never be subtracted).
-_LANDING_TARGET_KEY = None
+#: Bound: a handful of monitor targets is the realistic ceiling (one server,
+#: maybe a second one being compared) and the state is two floats plus a
+#: counter dict, but the key is caller-influenced (?endpoint= is user input),
+#: so it is capped rather than left to grow.
+_LANDING_STATE_MAX_KEYS = 8
+
+#: Below this gap, a new scrape does NOT replace the stored baseline (#533).
+#: The counters this rate is built from advance in decode-batch steps, so a
+#: sub-second window usually spans ZERO counter updates and divides to a hard
+#: 0.0 -- which is what a second poller does to the first one's window even
+#: after the keying fix, by landing between its ticks. Holding the older
+#: baseline lets the window grow until it is long enough to mean something;
+#: the rate stays correct because it is still delta/dt over the real interval.
+_LANDING_MIN_RATE_DT_S = 0.75
 
 #: Round 5 bug: the dashboard server is a ThreadingHTTPServer, and the client
 #: aborts a poll that is still in flight when the next one is due (see the
@@ -1953,7 +1978,7 @@ _LANDING_TARGET_KEY = None
 #: request -- an /metrics scrape that runs long while a real inference load
 #: is competing for it keeps going, and the next poll's request can overtake
 #: it on a second thread. Two requests then read-modify-write
-#: _LANDING_SNAPSHOT_STATE / _LANDING_TARGET_KEY out of order: whichever
+#: the target's stored baseline out of order: whichever
 #: finishes LAST wins, even if it started first and holds an OLDER counter
 #: snapshot, which regresses the stored state and hands the NEXT poll a
 #: t_prev that lands at or after its own t_cur. live_metrics._rates() treats
@@ -1964,9 +1989,41 @@ _LANDING_TARGET_KEY = None
 #: be rebuilt. The critical section below (read prev, scrape, write new
 #: state) is serialized so no two requests can interleave their read and
 #: write halves -- one poll's full read-compute-write always completes
-#: before the next one's begins, which is the only granularity at which a
-#: single shared delta baseline is meaningful at all.
+#: before the next one's begins.
+#:
+#: The original form of that last sentence read "...which is the only
+#: granularity at which a single shared delta baseline is meaningful at all",
+#: and #533 falsified it: serialization made concurrent writes ORDERED but a
+#: single SHARED baseline was never meaningful across clients in the first
+#: place, because the target key differs per client and every key change wiped
+#: it. Serializing correctly ordered a destructive operation. The baselines are
+#: now per-key (see ``_LANDING_STATE_BY_KEY``); this lock still guards the
+#: read-modify-write of that mapping, which is what it is actually good for.
 _LANDING_STATE_LOCK = threading.Lock()
+
+
+def _store_landing_baseline(key, prev_state, new_state, dt) -> bool:
+    """Decide whether ``new_state`` becomes the delta baseline for ``key``.
+
+    Returns True when it was stored. Caller must hold ``_LANDING_STATE_LOCK``.
+
+    Two rules, both from #533:
+      * baselines are PER KEY, so concurrent monitors of different targets do
+        not reset one another;
+      * a scrape that lands closer than ``_LANDING_MIN_RATE_DT_S`` to the
+        existing baseline does NOT replace it. The counters advance in
+        decode-batch steps, so a sub-second window typically spans zero
+        updates and divides to a hard 0.0; holding the older baseline lets the
+        window grow until it carries signal. Correctness is unaffected -- the
+        rate is still delta/dt over the real elapsed interval.
+    """
+    if prev_state is not None and dt is not None and dt < _LANDING_MIN_RATE_DT_S:
+        return False
+    _LANDING_STATE_BY_KEY[key] = new_state
+    _LANDING_STATE_BY_KEY.move_to_end(key)
+    while len(_LANDING_STATE_BY_KEY) > _LANDING_STATE_MAX_KEYS:
+        _LANDING_STATE_BY_KEY.popitem(last=False)
+    return True
 
 #: Persistent joule-per-token counter (opt-in, default OFF): lazily loaded
 #: ONCE and kept as the single in-process source of truth for the lifetime of
@@ -2944,14 +3001,33 @@ def _detect_external_endpoint(
     last hit is cached and re-verified FIRST, so a stable hand-started server
     costs one probe per poll instead of a sweep. Returns a base URL or None."""
     global _DETECTED_ENDPOINT
-    candidates: List[str] = []
-    if _DETECTED_ENDPOINT:
-        candidates.append(_DETECTED_ENDPOINT)
-    for p in ports or _MONITOR_DETECT_PORTS:
-        url = f"http://{host}:{p}"
-        if url not in candidates:
-            candidates.append(url)
-    for url in candidates:
+    # Re-verify the last hit first: a stable hand-started server costs exactly
+    # one cheap probe per poll and never reaches the sweep below.
+    if _DETECTED_ENDPOINT and _probe_sglang(_DETECTED_ENDPOINT, timeout=timeout):
+        return _DETECTED_ENDPOINT
+
+    # #533: the automatic path used to try a FOUR-port shortlist
+    # (30000, 30001, 30100, 8000) while the "Find a server" button swept
+    # _DETECT_SWEEP_PORTS = range(30000, 30101) + (8000, 8080). This rig serves
+    # on 30030, which is inside the button's range and outside the shortlist,
+    # so auto-detection could never find the production server: it worked only
+    # for as long as a hand-clicked sweep's _DETECTED_ENDPOINT survived in
+    # module memory, and a dashboard restart silently turned the landing page
+    # into "no server running" against a healthy server. Same ports as the
+    # button now, made cheap by the two-stage scan _tcp_open exists for -- a
+    # closed port refuses instantly, so only the ports that actually answer
+    # pay for an HTTP probe.
+    from concurrent.futures import ThreadPoolExecutor
+
+    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS)]
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        open_ports = [
+            prt
+            for prt, is_open in zip(scan, ex.map(lambda q: _tcp_open(host, q), scan))
+            if is_open
+        ]
+    for prt in open_ports:
+        url = f"http://{host}:{prt}"
         if _probe_sglang(url, timeout=timeout):
             _DETECTED_ENDPOINT = url
             return url
@@ -3065,7 +3141,7 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
     persisted) and is reset whenever the target changes."""
     from sglang.srt.planner import live_metrics
 
-    global _LANDING_SNAPSHOT_STATE, _LANDING_TARGET_KEY
+    global _LANDING_STATE_BY_KEY
     payload = payload or {}
     explicit = (payload.get("endpoint") or "").strip()
 
@@ -3100,9 +3176,10 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             label = det
 
     if target is None:
-        with _LANDING_STATE_LOCK:
-            _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
-            _LANDING_TARGET_KEY = None
+        # #533: nothing to reset. Per-key baselines mean a poll that resolves
+        # NO target cannot destroy the baseline of a poll that resolved one --
+        # the old single-slot wipe here was one of the two paths that made
+        # every concurrent monitor reset every other one.
         # No target at all resolved: that is NOT_RUNNING with no probe spent,
         # and it is stated as such rather than left for the page to infer.
         from sglang.srt.planner import server_state as _sstate
@@ -3128,10 +3205,10 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
     # newer state with an older one.
     with _LANDING_STATE_LOCK:
         key = (kind, label)
-        if key != _LANDING_TARGET_KEY:
-            # Never subtract counters from two different servers.
-            _LANDING_SNAPSHOT_STATE = None
-            _LANDING_TARGET_KEY = key
+        # Per-key baseline: counters from two different servers are never
+        # subtracted because they live under different keys, rather than
+        # because the single slot was wiped on every target change (#533).
+        prev_state = _LANDING_STATE_BY_KEY.get(key)
         try:
             # ``managed_state`` is the STARTING evidence for a boot this
             # dashboard launched: it is known the moment the child is
@@ -3139,13 +3216,15 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             # of claiming anything about a server that is not answering yet.
             snap, new_state = live_metrics.snapshot(
                 target,
-                prev_state=_LANDING_SNAPSHOT_STATE,
+                prev_state=prev_state,
                 managed_state=(status or {}).get("state") if kind == "managed" else None,
                 managed_detail=("this dashboard launched the process"
                                 + (f" (pid {(status or {}).get('pid')})"
                                    if (status or {}).get("pid") else "") + "."),
             )
-            _LANDING_SNAPSHOT_STATE = new_state
+            _store_landing_baseline(
+                key, prev_state, new_state, (snap.get("rates") or {}).get("dt")
+            )
         except Exception as e:  # pragma: no cover - defensive
             return {"ok": False, "running": True, "error": str(e),
                     "target": target_info}
@@ -6246,10 +6325,13 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .mtile .mt-s { font-size: var(--t-xs); color: var(--fg-muted);
                  line-height: 1.4; min-height: 1.7em;
                  font-variant-numeric: tabular-nums; }
-  /* median-of-recent-PROCESSING badge next to a rate that reads 0 while idle.
-     Deliberately quieter than the headline: it is history, not a reading. */
-  .mtile .mt-med { font-size: var(--t-xs); font-weight: 400;
-                   color: var(--fg-muted); }
+  /* Secondary line of a rate tile. Since #533 the HEADLINE is the median and
+     this carries the instantaneous reading, so it must be readable rather
+     than merely present: .mt-v is white-space:nowrap, which silently clipped
+     this to "insta..." in the narrow strip tiles. Own line, wrapping allowed. */
+  .mtile .mt-med { display: block; font-size: var(--t-xs); font-weight: 400;
+                   color: var(--fg-muted); white-space: normal;
+                   line-height: 1.35; }
   /* spill/offload tier rows: one row per tier (type x place). An ABSENT row
      is drawn at the same weight as a measured one -- dimmed, never hidden,
      because "this rig has no remote tier" is information. */
@@ -10690,6 +10772,31 @@ function stripTile(id,label,value,sub,sparkKey,tip){
 // median that counted them would read 0 on an idle rig and mean nothing.
 // An EMPTY window renders no badge at all -- "nothing processed yet" is not a
 // zero, and a tile must not be able to be read as if it were.
+// #533 (user decision 2026-08-03): for the tok/s rate tiles the MEDIAN is the
+// HEADLINE number and the instantaneous rate is the labelled secondary.
+// Reason, from the measurement that found it: these counters advance in
+// decode-batch steps, so a 2 s instantaneous window routinely spans ZERO
+// counter updates and reads a hard 0.0 while the median beside it reads
+// 75-150 tok/s. Headlining the instant made a working server look dead -- the
+// success-claim-vs-state trap in UI form, where the prominent figure is the
+// one that cannot be trusted. The instant is kept, not dropped: it is the only
+// thing that moves within a single poll and is worth seeing.
+// With no completed processing window there is NO median, and the instant
+// carries the tile with an explicit note -- an empty window is "nothing
+// processed yet", never a zero (the invariant medBadge already documents).
+function rateTokPerS(s,key,instTxt){
+  const m=(s&&s.rate_medians)?s.rate_medians[key]:null;
+  if(!m||m.median==null){
+    return instTxt+'<small> tok/s</small>'
+      +'<span class="mt-med" title="no completed processing window yet, so there is no median; this headline is the instantaneous rate"> (no median yet)</span>';
+  }
+  return Number(m.median).toFixed(1)+'<small> tok/s</small>'
+    +'<span class="mt-med" title="headline is the median of the last '+m.n
+    +' processing window'+(m.n===1?'':'s')+' (idle polls excluded; window '
+    +m.window+'). instant is the latest poll window, which spans zero counter '
+    +'updates often enough to read 0 on a busy server."> median &middot; instant '
+    +instTxt+'</span>';
+}
 function medBadge(s,key,dgt,unit,scale){
   const m=(s&&s.rate_medians)?s.rate_medians[key]:null;
   if(!m||m.median==null) return '';
@@ -10778,13 +10885,13 @@ function renderLandingStrip(s){
   $('landing_strip').innerHTML=
     stripTile('strip_decode','decode tok/s',
       noMetrics?STRIP_DASH
-        :num(dec)+'<small> tok/s</small>'+medBadge(s,'decode_tok_s'),
+        :rateTokPerS(s,'decode_tok_s',num(dec)),
       sub(rates?('server gauge '+num(rates.gen_throughput_server)+' tok/s')
                :'(rates on next tick)'),
       'st_dec')
    +stripTile('strip_prefill','prefill tok/s (non-cached)',
       noMetrics?STRIP_DASH
-        :num(pfx)+'<small> tok/s</small>'+medBadge(s,'prefill_tok_s'),
+        :rateTokPerS(s,'prefill_tok_s',num(pfx)),
       sub(rates?('gross incl. cache-served: '+num(rates.prefill_tok_s_gross)+' tok/s')
                :'(rates on next tick)'),
       'st_pfx',
@@ -11829,14 +11936,14 @@ function renderLivePanel(s, envelope){
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
     liveTile('decode per request',
-      n1(decPer)+'<small> tok/s</small>'
-      +(noMetrics?'':medBadge(s,'decode_tok_s_per_request')),
+      noMetrics?(n1(decPer)+'<small> tok/s</small>')
+              :rateTokPerS(s,'decode_tok_s_per_request',n1(decPer)),
       'server total '+n1(dec)+' tok/s &middot; '
       +(running==null?'parallel requests n/a':running+' running')
       +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
    +liveTile('prefill per request',
-      n1(pfxPer)+'<small> tok/s</small>'
-      +(noMetrics?'':medBadge(s,'prefill_tok_s_per_request')),
+      noMetrics?(n1(pfxPer)+'<small> tok/s</small>')
+              :rateTokPerS(s,'prefill_tok_s_per_request',n1(pfxPer)),
       'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
    +liveTile('tokens per watt (total)',
       n2(tpwTotal)+'<small> tok/W</small>',
