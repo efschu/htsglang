@@ -1429,9 +1429,10 @@ forward_peak.py judges the VRAM corridor AT PEAK rather than idle — wired into
 (`forward_peak.py:150-155`), and that variable has no `environ.py` entry (#505-D11).
 cachetrim with --ready-url self-retirement, which refuses a missing ready signal
 with its own measured counter-number (`scripts/dsv4/cachetrim.sh:295`).
-expert_stats (router distribution + hit rate), CollectiveClock (compute vs wait
-per rank, `utils/collective_clock.py`, consumed by
-`managers/scheduler_components/metrics_reporter.py:144`).
+expert_stats (router distribution + hit rate). CollectiveClock gives compute vs wait
+per rank for **plain-prefill forwards on the target runner only**, and only on cuda
+with `pp_size == 1` (`managers/scheduler_components/metrics_reporter.py:341-352`,
+`:134-136`, `:342-344`) — there is no decode/verify-round equivalent (#505-D14).
 The measured-KV-budget stale-boot trap (`rigmon/kvbudget.py:16-22`, ~4x shifts from
 boot order alone) applies only when the feature is switched on —
 `SGLANG_MEASURED_KV_BUDGET` defaults to False (`environ.py:373`, consumed at

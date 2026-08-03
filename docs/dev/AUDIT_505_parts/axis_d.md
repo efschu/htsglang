@@ -11,8 +11,9 @@ predicate located.
 
 ### Coverage
 
-§14 carries 7 conditional claims, §16 carries 6. All 13 were resolved to a predicate
-except one (D-14), which is recorded as UNVERIFIED rather than asserted.
+§14 carries 7 conditional claims, §16 carries 6. All 13 were resolved to a predicate.
+`expert_stats (router distribution + hit rate)` is the one §16 item taken at face
+value from module presence rather than traced to a consumer — recorded as such.
 
 Not done, stated plainly: **Direction 2 for these sections** — the inverse sweep
 ("wired but not written down"). §14's six lines describe `planner/webui.py` (14,816
@@ -151,7 +152,7 @@ exists for.
 | D-11 | "forward_peak.py (VRAM corridor judged AT PEAK, not idle)" | `model_executor/forward_peak.py:150-155`; wired at `model_executor/model_runner.py:4060-4081` | [NARROWER / BUG-CANDIDATE] |
 | D-12 | "cachetrim with --ready-url self-retirement" | `scripts/dsv4/cachetrim.sh:80-82`, `:295` | [WIDER] |
 | D-13 | "measured-KV-budget stale-boot trap" | `environ.py:373`; `uneven_perf.py:2617`; `rigmon/kvbudget.py:16-22`; `planner/runner.py:203`, `:231-238` | [NARROWER / DOC] |
-| D-14 | "expert_stats …", "CollectiveClock (compute vs wait per rank)" | `utils/collective_clock.py:24-30`, `:143-146`; `managers/scheduler_components/metrics_reporter.py:29`, `:144` | UNVERIFIED (present; default-arming not resolved) |
+| D-14 | "CollectiveClock (compute vs wait per rank)" | `managers/scheduler_components/metrics_reporter.py:341-360`, `:134-136` | [NARROWER / DOC] — prefill only |
 
 **D-10 [NARROWER] — gpu-arb is a convention with no runtime enforcement.** The code
 says so itself, three times: `registry/ledger.py:17` *"the ``/spinning/gpu-arb``
@@ -198,6 +199,27 @@ order"*) and the benchmark harness neutralises it by default
 there is no measured KV budget and therefore no stale budget to inherit. §16's line
 reads as a standing hazard; the predicate makes it opt-in.
 
+**D-14 [NARROWER / DOC] — "compute vs wait per rank" covers prefill only.** The clock
+is installed unconditionally for the reference recipe (no env gate) but with three
+named narrowings, `metrics_reporter.py:341-352`:
+
+```python
+if (getattr(self.scheduler, "device", "") != "cuda"
+        or self.scheduler.server_args.pp_size != 1):
+    return
+self.rank_prefill_log.clock = collective_clock()
+```
+
+and a fourth in `RankPrefillLog`'s own docstring (`:134-136`): *"only
+ForwardMode.is_plain_prefill forwards are wrapped, and those are exactly the ones
+reported through ``report_prefill_stats``"*, plus target-runner-only
+(`:342-344`: *"Deliberately NOT the draft runners"*). Every narrowing is argued at
+its site. The consequence for the ms/round rule is that the per-rank compute-vs-wait
+split exists for prefill and **not for decode**, which is the phase the
+slowest-rank/bandwidth reasoning turns on. Recorded, not proposed as a fix — pairing
+a decode-side clock to speculative verify rounds is its own task.
+*Task #505-D14:* `per-rank compute-vs-wait for the decode/verify round, not only plain prefill`
+
 ### Top findings, ranked
 
 1. **#505-D3** — the #152 GitHub result share posts the start command's argv verbatim
@@ -210,7 +232,9 @@ reads as a standing hazard; the predicate makes it opt-in.
    a version that serves but computes wrong.
 4. **#505-D11** — `SGLANG_FORWARD_PEAK_PATH` is off by default and absent from
    `environ.py`, so the VRAM-corridor instrument is both opt-in and uncatalogued.
-5. **#505-D5** — three independent declarations of the measured/estimate/absent
+5. **#505-D14** — the per-rank compute-vs-wait clock covers plain prefill only;
+   the decode/verify round, where the slowest-rank argument lives, has no equivalent.
+6. **#505-D5** — three independent declarations of the measured/estimate/absent
    vocabulary.
-6. **#505-D10** — gpu-arb is a convention; no code enforces it (recorded, not
+7. **#505-D10** — gpu-arb is a convention; no code enforces it (recorded, not
    proposed as a fix — enforcement may be deliberate).
