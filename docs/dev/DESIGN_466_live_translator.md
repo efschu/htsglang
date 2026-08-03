@@ -1447,3 +1447,61 @@ every similarity claim in this design — including the 0.980 speaker-similarity
 figure in §13.2, which on this evidence carries **no information** and should
 not be quoted as a cloning-quality result. §7(b)(3)'s ranking step must use
 the verification encoder, never the synthesis one.
+
+---
+
+## 16. Handover, 2026-08-03 (end of Phase 3 working session)
+
+Branch `feat/live-translator-466`, pushed, tree clean, 286 hermetic tests
+green under `CUDA_VISIBLE_DEVICES=99`.
+
+### 16.1 What a phone test can do TODAY
+
+Boot (CPU works and is slow; swap `--tts-device cuda:0 --tts-dtype bfloat16`
+and `--asr-device cuda` inside a window):
+
+```bash
+CUDA_VISIBLE_DEVICES=99 PYTHONPATH=<repo>/python \
+  python -m sglang.srt.translator.launch \
+    --host <wg-addr> --port 30800 --participants de,es \
+    --asr faster-whisper --asr-device cpu --asr-compute-type int8 \
+    --tts inprocess --tts-device cpu --tts-dtype float32 \
+    --embedder onnx
+```
+
+| stage | state |
+|---|---|
+| VAD, segmenter, journal, reconnect, PWA, `/translate/` mount | real, tested |
+| ASR | **real** — faster-whisper large-v3-turbo, 98 languages |
+| speaker embedding | **real** — wespeaker resnet34-LM via ONNX |
+| TTS | **real** — Qwen3-TTS in process, cross-lingual clone at WER 0.100 |
+| routing (pairs, fan-out, constrained detection) | real, tested |
+| **MT** | **the one gap** — HTTP client to our own 27B; that server must be running |
+| preset voices | pool incomplete (see 16.2); `clone` mode is unaffected |
+
+So: a full DE↔ES conversation in `clone` voice mode is reachable as soon as
+the 27B endpoint is up. Nothing else in the tenant is a stub.
+
+### 16.2 Immediate next steps, in order
+
+1. **Finish the pool.** German anchors were rendering when this session ended
+   (12/18 at last check, `--languages de`, ~3 min/clip on CPU). Then:
+   `derive_preset_languages.py --anchor de --languages es`, then
+   `check_preset_pool.py`. The verdict must show cross-language similarity
+   clearing 0.60 AND within-class distinctness not having regressed — cloning
+   one anchor into two languages could in principle pull two presets together,
+   which is why the checker reports both. `woman-02.de` / `woman-04.de` at
+   0.734 already needs a re-render or a descriptor edit.
+2. **GPU latency.** `latency_window.py` is written and unused; window 4 held
+   all three cards for this entire session. It prints an A-vs-A floor before
+   any number and is time-boxed. The MT row stays empty until the 27B is up.
+3. **MT end to end.** Start the 27B, point `--mt-base-url` at it, run one real
+   turn through the WebSocket.
+
+### 16.3 Two things not to re-litigate
+
+* **Do not diarize on the TTS speaker encoder.** Measured, reverted, §15. It
+  has 0.04 of dynamic range and would merge every participant into one
+  speaker.
+* **Do not render preset languages independently.** Measured, §14 defect 2.
+  Same descriptor and seed do not give the same voice; derive from an anchor.
