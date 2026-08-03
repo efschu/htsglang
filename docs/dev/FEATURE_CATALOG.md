@@ -1206,6 +1206,28 @@ counter split out of an existing one is added to every gate that read the old
 one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
 gates all four counters, each with its own can-fail proof).
 
+Fabricated-identity family (#505-A2-04, fixed in #514): a bridge that cannot
+answer must return UNKNOWN, never the index it already has.
+`nvml_card_totals_mib` logged "assuming identical enumeration orders" and fell
+back to the identity map, so on the reference rig (5090 = CUDA 0 / NVML 1) the
+PD feasibility check compared each card's plan against ANOTHER card's capacity
+and passed a plan that cannot fit -- warn-only downstream, so it booted with no
+error. Two aggravations found while fixing it: the `except` arm was not the main
+entrance (`registry/nvml.py:706-729` returns `{}` NON-exceptionally whenever
+torch cannot place cards, so the fabrication was on the ordinary success path),
+and an existing test PINNED the defect (`test_empty_mapping_is_identity`
+asserted `reindex_totals_cuda_order(nvml, {}) == nvml`). It was the one caller
+#397 never migrated -- `test_device_order_bridges_397.py::NoCudaBridgeTest`
+pins the refusal for every other. Now routed through the IdentityMap
+(`registry_nvml.identity_map`, PCI-BDF), an empty bridge yields `None` with a
+named warning (the barlink `"sysfs-gross"` shape), a partial bridge keeps the
+placeable cards and names the unplaced ones, and a single-GPU host stays
+identity because `cuda:0` can only be that card. What BOOTS is unchanged: the
+unverified state is loud, not fatal -- a strict mode belongs behind an explicit
+flag rather than a silent default flip. So the rule: an unavailable bridge
+degrades to a NAMED unknown, and a test asserting `f({}) == identity` is pinning
+the defect.
+
 **VALUE PINNING for bounding defaults (#505-C-05, convention adopted in #514).**
 A numeric default that exists to BOUND something (cap/budget/threshold/limit/
 reserve/margin/watermark/timeout) ships with a test that FAILS when the value

@@ -50,6 +50,12 @@ the capacity — not discovered as a runtime OOM. There is no additional safety
 margin and no implicit context-overhead subtraction: the named items are the
 whole sum, headroom is the operator's responsibility.
 
+Which physical card a CUDA index names is answered by the #331/#397 identity
+map (UUID / PCI-BDF), never by assuming that torch and NVML enumerate in the
+same order. Where that identity cannot be resolved the affected cards are
+reported as UNVERIFIED — a capacity attributed to the wrong card would let
+the check pass a plan that cannot fit (#505-A2-04).
+
 Without any of the ``--disaggregation-topology*`` flags this module is inert:
 ``apply_pd_topology`` returns before touching anything.
 """
@@ -186,8 +192,7 @@ def validate_pd_topology_args(args: Any) -> None:
 
     if topology not in TOPOLOGY_CHOICES:
         raise ValueError(
-            f"--disaggregation-topology={topology!r} is not one of "
-            f"{TOPOLOGY_CHOICES}."
+            f"--disaggregation-topology={topology!r} is not one of {TOPOLOGY_CHOICES}."
         )
 
     if prefill_gpus is None or len(prefill_gpus) == 0:
@@ -263,8 +268,7 @@ def validate_pd_topology_args(args: Any) -> None:
         interval = getattr(args, "disaggregation_prefill_lane_interval", 1)
         if interval < 1:
             raise ValueError(
-                "--disaggregation-prefill-lane-interval must be >= 1, got "
-                f"{interval}."
+                f"--disaggregation-prefill-lane-interval must be >= 1, got {interval}."
             )
         # Congruence is enforced, not hoped for: the lane forward is a TP
         # forward through the WHOLE decode group (a card cannot opt out of
@@ -279,8 +283,7 @@ def validate_pd_topology_args(args: Any) -> None:
             detail = []
             if missing:
                 detail.append(
-                    f"GPU(s) {missing} carry no decode rank (no shard to "
-                    "reuse)"
+                    f"GPU(s) {missing} carry no decode rank (no shard to reuse)"
                 )
             if absent:
                 detail.append(
@@ -361,17 +364,34 @@ def validate_pd_topology_args(args: Any) -> None:
 
 def reindex_totals_cuda_order(
     nvml_totals: Mapping[int, int], cuda_to_nvml: Mapping[int, int]
-) -> Dict[int, int]:
-    """Re-key NVML-ordered totals to CUDA device indices.
+) -> Optional[Dict[int, int]]:
+    """Re-key NVML-ordered totals to CUDA device indices, or None if unknown.
 
     The placement flags speak CUDA order (torch.cuda), NVML enumerates by
     PCI bus — on this project's rig CUDA's FASTEST_FIRST puts the 5090 at
     cuda:0 while NVML lists it at index 1, so blindly reusing indices
     attributes the wrong capacity to a card (measured during the #107 GPU
-    validation). An empty mapping means identity (orders agree or the
-    bridge is unavailable)."""
+    validation).
+
+    An EMPTY mapping means the CUDA side of the #331/#397 identity map could
+    not place a single card. It does NOT mean the two enumerations agree,
+    and this function must not act as if it did: filling the index it could
+    not resolve with the index it already has is the device-order defect
+    family verbatim (#392 / #397, and #505-A2-04 for this caller). The
+    honest answer is ``None`` — "which physical card cuda:i is cannot be
+    told here" — which the caller reports per card instead of handing the
+    feasibility check a mis-attributed capacity.
+
+    The single exception is a host with exactly one physical GPU: there is
+    only one card cuda:0 can be, so no bridge is needed to name it.
+
+    A PARTIAL mapping keeps the cards it can place and drops the rest; a
+    dropped card surfaces downstream as an unknown total, never as a guess.
+    """
     if not cuda_to_nvml:
-        return dict(nvml_totals)
+        if len(nvml_totals) == 1:
+            return {0: next(iter(nvml_totals.values()))}
+        return None
     out: Dict[int, int] = {}
     for cuda_idx, nvml_idx in cuda_to_nvml.items():
         if nvml_idx in nvml_totals:
@@ -380,52 +400,67 @@ def reindex_totals_cuda_order(
 
 
 def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
-    """Total VRAM per CUDA device index.
+    """Total VRAM per CUDA device index, or None when identity is unknown.
 
-    Totals come from NVML; the CUDA-index keying comes from the #331
-    identity map, reached through the deprecated
-    ``server_args._torch_to_nvml_gpu_index_mapping`` shell (#397 collapsed
-    the three bridges that used to answer this question onto that map; this
-    caller keeps the plain ``{cuda: nvml}`` dict shape). Returns None when
-    NVML is unusable; the caller must then say so instead of silently
-    skipping.
+    Both halves of the answer come from the #331/#397 identity map
+    (``registry.nvml``): NVML supplies each card's total, and the card's
+    CUDA ordinal is bridged over its PCI bus id — never over its index.
+
+    Returns None when NVML is unusable AND when the CUDA enumeration order
+    cannot be resolved. The two arms agree on purpose: a total keyed by a
+    card this process cannot identify is not a weaker answer than no answer,
+    it is a wrong one. The caller must say so instead of silently skipping.
     """
-    try:
-        import pynvml  # type: ignore[import-not-found]
+    from sglang.srt.registry import nvml as registry_nvml
 
-        pynvml.nvmlInit()
-    except Exception as exc:  # pragma: no cover - host dependent
-        logger.warning("PD topology: NVML unavailable (%s)", exc)
-        return None
     try:
-        nvml_totals: Dict[int, int] = {}
-        for nvml_idx in range(pynvml.nvmlDeviceGetCount()):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
-            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            nvml_totals[nvml_idx] = int(info.total // (1024 * 1024))
-    except Exception as exc:  # pragma: no cover - host dependent
-        logger.warning("PD topology: NVML query failed (%s)", exc)
-        return None
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
-    try:
-        # Function-level import: server_args imports this module at its top
-        # (TOPOLOGY_CHOICES), so the reverse import must not run at import
-        # time. Fully resolved by the time a topology is applied.
-        from sglang.srt.server_args import _torch_to_nvml_gpu_index_mapping
-
-        mapping = _torch_to_nvml_gpu_index_mapping()
+        # allow_cuda_init: this runs in the launcher, where a CUDA context
+        # may not exist yet. Building one costs VRAM on every visible card,
+        # which is accepted here because the alternative is an unverifiable
+        # VRAM plan — matching what this caller already paid through the
+        # deprecated server_args bridge shell.
+        imap = registry_nvml.identity_map(allow_cuda_init=True)
     except Exception as exc:  # pragma: no cover - host dependent
         logger.warning(
-            "PD topology: CUDA->NVML index bridge unavailable (%s); "
-            "assuming identical enumeration orders.",
+            "PD topology: NVML device identity unavailable (%s); the "
+            "per-card VRAM feasibility of this topology cannot be checked.",
             exc,
         )
-        mapping = {}
-    return reindex_totals_cuda_order(nvml_totals, mapping)
+        return None
+
+    if len(imap) == 0:  # pragma: no cover - host dependent
+        logger.warning(
+            "PD topology: NVML reports no device; the per-card VRAM "
+            "feasibility of this topology cannot be checked."
+        )
+        return None
+
+    nvml_totals = {card.nvml_index: card.total_mib for card in imap}
+    cuda_to_nvml = {
+        int(card.cuda_ordinal): card.nvml_index
+        for card in imap
+        if card.cuda_ordinal is not None
+    }
+    totals = reindex_totals_cuda_order(nvml_totals, cuda_to_nvml)
+    if totals is None:
+        logger.warning(
+            "PD topology: the CUDA->NVML index bridge is unavailable, so no "
+            "card's capacity can be attributed to a CUDA device index. "
+            "Refusing to assume identical enumeration orders — on a rig "
+            "where they diverge that check would pass a plan that cannot "
+            "fit. Reason: %s",
+            registry_nvml.cuda_bridge_diagnosis(),
+        )
+    elif imap.unbridged:
+        logger.warning(
+            "PD topology: %d of %d card(s) could not be placed in CUDA "
+            "order and are left without a capacity; unplaced: %s. Reason: %s",
+            len(imap.unbridged),
+            len(imap),
+            ", ".join(card.describe() for card in imap.unbridged),
+            registry_nvml.cuda_bridge_diagnosis(),
+        )
+    return totals
 
 
 def estimate_model_weight_mib(model_path: str) -> Optional[int]:
@@ -563,9 +598,7 @@ def plan_pd_topology(
             layers = int(prefill_layer_split[i])
             e["prefill_layers"] = layers
             if model_weight_mib is not None and num_hidden_layers:
-                e["prefill_weight"] = int(
-                    model_weight_mib * layers / num_hidden_layers
-                )
+                e["prefill_weight"] = int(model_weight_mib * layers / num_hidden_layers)
         elif model_weight_mib is not None:
             # Even TP prefill group: equal shard per card.
             e["prefill_weight"] = int(model_weight_mib / len(prefill_gpus))
@@ -711,9 +744,7 @@ def apply_pd_topology(
         check_process_colocation_prerequisites(probe_env)
 
     mode = getattr(server_args, "disaggregation_mode", "null")
-    decode_gpus = (
-        decode_gpu_of_ranks(server_args) if mode in ("null", "decode") else []
-    )
+    decode_gpus = decode_gpu_of_ranks(server_args) if mode in ("null", "decode") else []
 
     if card_totals_mib is None:
         card_totals_mib = nvml_card_totals_mib()
@@ -739,8 +770,23 @@ def apply_pd_topology(
         model_weight_mib=model_weight_mib,
         num_hidden_layers=num_hidden_layers,
     )
-    for warning in check_vram_feasibility(plan):
+    unverified = check_vram_feasibility(plan)
+    for warning in unverified:
         logger.warning("PD topology: %s", warning)
+    if unverified:
+        # Unknown stays unknown: the plan is NOT declared feasible for these
+        # cards, it is declared unchecked. Whether an unchecked card should
+        # refuse the launch outright is a boot-behaviour question (a host
+        # without pynvml, or a launcher that cannot bridge the CUDA order,
+        # would stop booting), so it is reported rather than decided here.
+        logger.warning(
+            "PD topology '%s': the per-card VRAM plan is UNVERIFIED for %d "
+            "of %d card(s) — an infeasible placement on those cards will "
+            "surface as a runtime OOM, not as this check.",
+            topology,
+            len(unverified),
+            len(plan.cards),
+        )
 
     # Process-level isolation: every scheduler process sees exactly its own
     # GPU via CUDA_VISIBLE_DEVICES (maybe_reindex_device_id) — no in-process
@@ -751,9 +797,7 @@ def apply_pd_topology(
         if layer_split is not None:
             # Uneven layer placement rides the existing uneven-PP machinery.
             server_args.pp_size = len(layer_split)
-            env["SGLANG_PP_LAYER_PARTITION"] = ",".join(
-                str(n) for n in layer_split
-            )
+            env["SGLANG_PP_LAYER_PARTITION"] = ",".join(str(n) for n in layer_split)
         if "CUDA_VISIBLE_DEVICES" not in env:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in prefill_gpus)
             logger.info(
@@ -775,7 +819,8 @@ def apply_pd_topology(
         "; ".join(
             f"GPU {c.gpu_id}: decode ranks {list(c.decode_ranks)}, "
             f"prefill {'shared shard' if c.weights_shared else (str(c.prefill_layers) + ' layers' if c.prefill_layers is not None else ('slice' if c.prefill_weight_mib else 'none'))}, "
-            f"sum {c.sum_mib()} MiB / total {c.total_mib} MiB"
+            f"sum {c.sum_mib()} MiB / total "
+            f"{'unknown' if c.total_mib is None else str(c.total_mib) + ' MiB'}"
             for c in plan.cards
         ),
     )

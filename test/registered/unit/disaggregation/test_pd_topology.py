@@ -588,11 +588,15 @@ class TestCudaOrderReindex(CustomTestCase):
             {0: 32607, 1: 20480, 2: 20480},
         )
 
-    def test_empty_mapping_is_identity(self):
+    def test_empty_mapping_is_unknown_not_identity(self):
+        # #505-A2-04: an empty bridge used to be read as "the orders agree".
+        # On a rig where they do not, that hands the feasibility check
+        # another card's capacity. The falsifier lives in
+        # test_pd_topology_device_order_505.py.
         from sglang.srt.disaggregation.topology import reindex_totals_cuda_order
 
         nvml = {0: 1, 1: 2}
-        self.assertEqual(reindex_totals_cuda_order(nvml, {}), nvml)
+        self.assertIsNone(reindex_totals_cuda_order(nvml, {}))
 
 
 class TestServerArgsSurface(CustomTestCase):
@@ -608,9 +612,7 @@ class TestServerArgsSurface(CustomTestCase):
         ):
             self.assertIn(name, fields)
             self.assertIsNone(fields[name].default)
-        self.assertEqual(
-            fields["disaggregation_prefill_lane_interval"].default, 1
-        )
+        self.assertEqual(fields["disaggregation_prefill_lane_interval"].default, 1)
 
     def test_scheduler_default_lane_is_none(self):
         # The lane attribute exists and defaults to None on every path that
