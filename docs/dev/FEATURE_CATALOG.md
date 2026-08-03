@@ -1408,10 +1408,27 @@ and a sliding-window in/out fps accounting exposed on the job status for the
 #344 live watch. Finished sources keep the depth-1 bridge unchanged.
 
 ## 14. Dashboard
-Guided config wizard with honest refusals, comm benchmark suite with
-anonymization gate, energy metering (tok/s + J/token), benchmark tiles with
-measured/estimate/absent provenance, one-click knee-point probe, self-update
-with auto-rollback, GitHub result posting (opt-in PAT).
+Guided config wizard whose refusals each cite their source and which never emits
+a flag it cannot explain (`planner/wizard.py:703-714`, `:1521`, plus
+`wizard_islands/_lanes/_links/_offload/_tipping`). Comm benchmark suite; its
+anonymization gate (`rig_artifact.assert_anonymized`, `rig_artifact.py:558`,
+reachable only through `build_digest`, `:784-795`) covers the **rig-artifact
+share route only** — the #152 result-share route renders the start command's
+argv verbatim (`github_share.py:186`, `:214`) and passes through neither
+`scrub_tree` nor the gate (#505-D3). Energy metering (tok/s + J/token) is
+NVML board power integrated per phase (`energy.py:23-24`, `:383-412`) and is
+therefore **GPU power only — not wall-socket energy** (`energy.py:278-279`).
+Benchmark tiles carry measured/estimate/absent provenance with no "probably"
+tier (`cost_model.py:142-146`); the decode-knee guard is **modelled**, and
+reports ABSENT rather than "safe" when the membw scores it needs are missing
+(`wizard_tipping.py:587-607`) — there is no knee-point probe: `power_limit_sweep`
+(`energy.py:1217`) would measure one but has test callers only (#505-D6).
+Self-update installs in any serve mode; **switching + auto-rollback need
+`--serve-supervised`** (`webui.py:3632`, `self_update.py:659-688`), and the
+health gate is HTTP 200 on `/` (`self_update.py:691-712`, #505-D8). GitHub
+result posting is opt-in per-use PAT, redacted from every error path
+(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes only
+(`:89`).
 
 ## 15. Model bring-ups (boot-proven)
 Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;
@@ -1447,19 +1464,36 @@ falsifier = `peak_bytes_max` must fall ~326 MiB/rank between the arms.
 Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure
-gpu-arb (UUID-based holder + heartbeat — stop the heartbeat BEFORE releasing),
-forward_peak.py (VRAM corridor judged AT PEAK, not idle), cachetrim with
---ready-url self-retirement, expert_stats (router distribution + hit rate),
-CollectiveClock (compute vs wait per rank), measured-KV-budget stale-boot trap.
+gpu-arb (UUID-based holder + heartbeat — stop the heartbeat BEFORE releasing).
+It is a **convention, not an enforcement**: the code names it as such
+(`registry/ledger.py:17`, `:607`, `registry/arbiter.py:1025`) and no path refuses
+GPU work without a holder; the only enforced direction is `test/conftest.py:47-67`,
+which fails a pytest run that WROTE the shared arb paths (#438).
+forward_peak.py judges the VRAM corridor AT PEAK rather than idle — wired into
+`model_runner.py:4060-4081` but **off unless `SGLANG_FORWARD_PEAK_PATH` is set**
+(`forward_peak.py:150-155`), and that variable has no `environ.py` entry (#505-D11).
+cachetrim with --ready-url self-retirement, which refuses a missing ready signal
+with its own measured counter-number (`scripts/dsv4/cachetrim.sh:295`).
+expert_stats (router distribution + hit rate). CollectiveClock gives compute vs wait
+per rank for **plain-prefill forwards on the target runner only**, and only on cuda
+with `pp_size == 1` (`managers/scheduler_components/metrics_reporter.py:341-352`,
+`:134-136`, `:342-344`) — there is no decode/verify-round equivalent (#505-D14).
+The measured-KV-budget stale-boot trap (`rigmon/kvbudget.py:16-22`, ~4x shifts from
+boot order alone) applies only when the feature is switched on —
+`SGLANG_MEASURED_KV_BUDGET` defaults to False (`environ.py:373`, consumed at
+`uneven_perf.py:2617`); the benchmark harness clears the file per point regardless
+(`planner/runner.py:203`, `:231-238`).
 **Transients need a transient-rate sampler (#493):** a 1 Hz `nvidia-smi` loop
 undersamples a sub-second prefill excursion by ~12x, so its minimum is a LOWER
 bound and its apparent ramp is extreme-value statistics, not a signal — use
 `scripts/dev/493_indexer_transient/sample_corridor.sh` (`nvidia-smi -lms`, 100 ms)
 for the shape and `forward_peak`'s per-forward `nvml_free_bytes_min` for the
-number. And `--rank-auto-reserve-mib` shapes the BUDGET, never a transient: it
-trades KV capacity for steady-state free memory and moves a peak not at all
-(runbook §4.5.4 items 4-7 carry the evidence, incl. "a corridor repair applies to
-every violating card, not the one the briefing named").
+number (remember forward_peak itself is gated off by default per #505-D11
+above — set `SGLANG_FORWARD_PEAK_PATH` first). And `--rank-auto-reserve-mib`
+shapes the BUDGET, never a transient: it trades KV capacity for steady-state
+free memory and moves a peak not at all (runbook §4.5.4 items 4-7 carry the
+evidence, incl. "a corridor repair applies to every violating card, not the
+one the briefing named").
 
 ## 17. META: combination matrix + eviction doctrine
 Every "can asset X live at tier Y under primitive Z" question is a matrix-cell
