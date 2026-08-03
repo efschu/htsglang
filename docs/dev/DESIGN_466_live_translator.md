@@ -27,6 +27,7 @@ them.
 | 2026-08-03 | **Crash-safety backup.** Every restrictive or irreplaceable component (weights, pinned wheels, patched libs) is backed up to a PRIVATE GitHub repo. Private forever — CPML and NC terms permit private copies, not redistribution. The public fork never points at it. |
 | 2026-08-03 | **Target phone:** OnePlus 10 Pro NE2213_11, Android 16, unlocked bootloader, **not rooted**. Nothing may require root. |
 | 2026-08-03 | **TLS comes from the existing reverse proxy.** The rig already runs an nginx reverse proxy in an LXC container with Certbot-managed Let's Encrypt certificates and a public hostname. The translator is published as one more `location` there. The `chrome://flags` workaround is **demoted to fallback**; it is no longer the primary path. Consequence: risk #1 collapses from "design a secure-context story" to "verify once through the proxy from mobile data". |
+| 2026-08-03 | **REVOKED: the vLLM-Omni TTS sidecar. No external serving engines at all.** Everything runs inside htsglang. Reason, and it is architectural rather than aesthetic: the whole memory-hierarchy program — spill/offload/eviction across ALL assets, one ledger, the #286 register, the #305 residency ladder — can only arbitrate between assets that live under one runtime. A second serving engine owns VRAM the ledger cannot see, so every cross-asset decision silently becomes wrong. Phase 2's `serve_tts.sh` / `setup_tts_venv.sh` are dead and the running server was killed. A dependency-pin conflict is now a named engineering item, never a reason to add an engine. The pluggable TTS backend interface is what makes this cheap: the backend swaps, the pipeline, the session, the journal and the client all stand. |
 | 2026-08-03 | **No enrollment before the trip.** The user has no time to record voice samples. The user's voice therefore runs the *same* path as every other speaker: a rolling reference buffer accumulated from live speech, with preset mode covering the cold start. No special user-enrollment flow in the MVP. The enrollment endpoint stays (it costs nothing and already works) but is a post-vacation upgrade slot, and the GPU A/B must score cloning from **10-30 s of accumulated live speech**, not from clean curated audio. |
 
 ---
@@ -67,21 +68,83 @@ TTS side. The cascade is therefore the only architecture that meets
 requirement 1, and it also keeps our 27B multilingual LLM — by far the
 strongest translator in the stack — on the translation hop.
 
-### 1.1 Why a separate process, not an `srt` tenant
+### 1.1 One runtime — the sidecar is revoked (2026-08-03)
 
-Same escape hatch the Class-3 video tenant took (`video_enhance/tenant.py`).
-Per DESIGN_333 §2.3 the scheduler class that would host ASR/TTS (Class 3)
-**does not exist yet**; building it is L-effort and this feature has a deadline
-in days. So the translator runs as its own process with its own CUDA context,
-pinned to one card by NVML UUID, with an absolute MiB budget meaning the whole
-budget (no implicit ceiling, no safety factor — leaving headroom is the
-operator's job). Nothing in `sglang/srt/translator/` imports `srt` internals,
-so it becomes a Class-3 citizen later without its interfaces changing.
+**Superseded.** Phase 2 argued for a separate process on two grounds: that
+DESIGN_333 §2.3's Class-3 scheduler does not exist yet, and that every
+candidate TTS package pins a `transformers` version conflicting with sglang's.
+The first is still true. The second turned out to be **largely false** (§1.1.2).
+Neither survives the user order: cross-asset arbitration requires one runtime,
+so an external engine is excluded regardless of convenience.
 
-A second, decisive reason emerged from the survey: **dependency incompatibility
-is structural**. `qwen-tts` pins `transformers==4.57.3` while the venv carries
-5.12.1 and sglang; vLLM-Omni pulls vLLM against sglang's torch. A separate venv
-per audio tenant is not tidiness, it is the only way these coexist.
+What replaces it:
+
+* **TTS talker** — a native htsglang model on a #305/#274 lane. The talker is a
+  Qwen3-architecture AR model that emits audio-codec tokens; #333/#334 named
+  exactly this as the audio-out route.
+* **12 Hz codec / vocoder** — an in-process module in the translator's process
+  tree, its VRAM a ledgered asset class in the #286 register, parkable and
+  evictable like everything else.
+* **ASR and speaker embeddings** — in-process modules under the same ledger.
+  faster-whisper (CTranslate2, int8) is now the primary and runs in-process
+  cleanly; **the NeMo-venv spike is cancelled**, because its only delivery
+  vehicle was a second environment.
+
+The translator process still owns its own CUDA context and card pin. The
+difference is that nothing it loads is invisible to the ledger.
+
+#### 1.1.1 What the checkpoint actually contains
+
+Measured from the downloaded weights, not from the model card:
+
+| Module | Params | bf16 | Role |
+|---|---|---|---|
+| `talker.model` | 754.8 M | ~1.5 GB | Qwen3-arch AR backbone, 28 layers, hidden 1024, 16 heads / 8 KV, head_dim 128, **M-RoPE** (`mrope_section [24,20,20]`, interleaved) |
+| `talker.code_predictor` | 141.6 M | ~283 MB | 5-layer depth transformer, `num_code_groups 16`, vocab 2048 |
+| `talker.codec_head` | 3.1 M | ~6 MB | first-codebook head, 1024 → 3072 |
+| `talker.text_projection` | 6.3 M | ~13 MB | text hidden 2048 → talker 1024 |
+| `speaker_encoder` | 8.9 M | ~18 MB | ECAPA-class x-vector extractor — **this is the cloning conditioner** |
+| codec **decoder** | 114.3 M | **229 MB** | `Qwen3TTSTokenizerV2Decoder`: causal convnets, ConvNeXt blocks, a small rotary transformer, SnakeBeta, split RVQ |
+| codec **encoder** | 56.3 M | ~113 MB | subclasses transformers' `MimiModel`; only needed for in-context-learning mode |
+
+**The generation shape is the crux.** One autoregressive step is *not* one
+token. The backbone produces a hidden state, `codec_head` samples codebook 0,
+and then `code_predictor` — its own 5-layer transformer — produces the
+remaining 15 residual codes for that same audio frame. All 16 are embedded and
+summed to form the next step's input. At 12.5 Hz, one second of audio is 12.5
+backbone steps plus 12.5 depth-transformer invocations, i.e. 200 codes.
+
+The upside of that frame rate is real: 10 s of speech is 125 decode steps with
+a tiny KV cache. The 0.6 B backbone is not the cost; the per-step nested
+transformer is the architectural problem.
+
+**In `x_vector_only_mode` the codec ENCODER is not needed** — cloning
+conditions on the speaker encoder's x-vector, not on tokenized reference audio.
+That drops 56 M params and the `MimiModel` dependency from the serving path.
+
+#### 1.1.2 The transformers pin is conservative, not real — measured
+
+`qwen-tts` 0.1.1 pins `transformers==4.57.3`; this venv carries 5.12.1 for
+sglang. Phase 2 treated that as unresolvable and routed around it. It is not.
+
+Executed on the desk, no GPU (`CUDA_VISIBLE_DEVICES=99`), with the wheel merely
+unpacked on `PYTHONPATH` and nothing installed into the venv:
+
+* All **20** `transformers` symbols the modeling files import resolve in 5.12.1.
+* Both modeling modules import and construct after **three** small shims:
+  1. `check_model_inputs` became a plain decorator (was a decorator factory) —
+     **one** call site;
+  2. `ROPE_INIT_FUNCTIONS` no longer has a `"default"` key (now `dynamic`,
+     `linear`, `llama3`, `longrope`, `proportional`, `yarn`);
+  3. the mask helpers renamed `input_embeds` → `inputs_embeds` and dropped
+     `cache_position`.
+* **The codec decoder then loaded all 496 tensors and produced audio.** On CPU,
+  fp32: 25 frames → 2.00 s of audio in 0.73 s (**RTF 0.36**); 125 frames →
+  10.00 s in 3.18 s (**RTF 0.32**). Output finite, peak 0.96.
+
+So the vocoder half of the native path is not a plan, it is a thing that has
+run. The port is roughly fifteen lines of compatibility, not a version war —
+and on a GPU the codec cost is negligible against a 2-3 s budget.
 
 ### 1.2 Transport: WebSocket over WireGuard, not WebRTC
 
@@ -495,9 +558,13 @@ it** — the same lesson `integration/r2` recorded.
 | ASR (Nemotron-3.5 0.6B or faster-whisper) | 5090 | 3000 MiB | own process, own venv, pinned by NVML UUID |
 | Speaker embedder (ResNet34-LM ONNX) | CPU or 5090 | ~500 MiB | ~26 M params; CPU is viable |
 | VAD (silero) | CPU | 0 | <1 ms per chunk, one thread |
-| TTS (Qwen3-TTS-0.6B via vLLM-Omni) | 5090 | 4000 MiB | own venv — `transformers` pin conflict is structural |
+| TTS talker (Qwen3-TTS-0.6B) | 5090 | ~2200 MiB | native htsglang model on a #305/#274 lane |
+| TTS codec decoder (12 Hz) | 5090 | ~300 MiB | in-process module, ledgered asset class (#286); 229 MB bf16 measured |
+| Speaker encoder (x-vector) | 5090 or CPU | ~30 MiB | 8.9 M params, ships inside the TTS checkpoint |
 
-Total additional ~7.5 GB, taken from the 5090's allocation. **This directly
+Every row is now inside one runtime and visible to the ledger — which is the
+point of the 2026-08-03 order, not a detail of it. Total additional ~6 GB,
+taken from the 5090's allocation. **This directly
 competes with the LLM's budget** and must be entered in the reserve per the
 VRAM corridor rule (free ≥400 MiB absolute, waste ≤1.5 GiB net) before the GPU
 window — the LLM boot line needs its per-rank budget reduced accordingly. That
@@ -735,17 +802,34 @@ noise, and cross-lingual cloning quality. **Re-ranked on the evidence:**
    reference buffer, and preset mode sidesteps voice identity entirely. Still
    real in a Spanish street or bar, and the mitigation lever is silero-vad
    (never `EnergyVad`) plus preset mode as the noisy-environment default.
-4. **NeMo dependency risk.** Contained by design: faster-whisper is the
-   fallback and the spike is step 1 of the window, so this cannot consume the
-   deadline.
-5. **VRAM contention with the 27B.** ~7.5 GB from the 5090's allocation is real
-   and must go through the corridor rule before the window.
-6. **Secure context** (was #1, now last). Collapsed by the 2026-08-03 decision
+4. **Talker bring-up under one runtime** (new, and now the schedule risk).
+   The blocker is not the 0.6 B backbone, which is ordinary Qwen3 geometry; it
+   is that one decode step must emit 16 codes through a nested 5-layer
+   transformer, and a standard decode loop assumes one token per step. The
+   fallback ladder in §10 exists precisely because this is the item most likely
+   to miss 08-10. Note it is a *schedule* risk, not a feasibility one: rung B
+   is already partly executed.
+
+5. **`transformers` pin drift** (was routed around, now a named engineering
+   item per the user order). Measured as three shims and one call site
+   (§1.1.2), so it is small — but "imports and constructs" is not "numerically
+   identical". The talker's attention/RoPE path under 5.12.1 is unverified, and
+   M-RoPE with `interleaved: true` is exactly where a silent numerical
+   difference would hide. Gate: byte-compare a short generation against the
+   pinned-4.57.3 reference before trusting it.
+
+6. **NeMo dependency risk — CLOSED.** Cancelled by the user order: its only
+   delivery vehicle was a second environment. faster-whisper in-process is the
+   primary. This removes step 1 from the GPU window.
+7. **VRAM contention with the 27B.** ~6 GB from the 5090's allocation is real
+   and must go through the corridor rule before the window — and now genuinely
+   *can*, because every asset is ledger-visible.
+8. **Secure context** (was #1, now last). Collapsed by the 2026-08-03 decision
    to publish through the existing nginx proxy: the mechanism already exists
    and is in daily use for a dozen other services. What remains is a single
    verification — load the PWA over HTTPS from mobile data once — rather than
    a design question.
-7. **Preset pool renders late.** The 18 clips are produced in the GPU window by
+9. **Preset pool renders late.** The 18 clips are produced in the GPU window by
    a second model (VoiceDesign). If that step is skipped or fails, preset mode
    and the cloning downgrade path both fall back to borrowing another
    participant's voice, which is the outcome the pool exists to avoid. Cheap
@@ -782,14 +866,17 @@ Still open:
 - **The preset clips themselves.** Descriptors, seeds, render plan and pool
   loader are done and tested against synthetic tones; the 36 wav files need a
   GPU (step 0 of the ticket).
-- **The TTS serving stack is installed by script but never started.** Neither
-  `setup_tts_venv.sh` nor `serve_tts.sh` has run — both need a card. They are
-  desk-written, and that label stands until the window: the vLLM-Omni flag
-  spelling (`--omni`), the `/v1/audio/voices` form-field names and the `pcm`
-  streaming format are all read from documentation, not observed. The adapter
-  is tested against a stub built from the *same* documentation, so a
-  documentation error would pass every test here and fail on first contact.
-  **This is the single largest unvalidated assumption in Phase 2.**
+- **DEAD as of 2026-08-03: the vLLM-Omni serving path.** `setup_tts_venv.sh`
+  and `serve_tts.sh` are revoked and should be deleted in Phase 3, along with
+  the `OpenAiSpeechTts` adapter's HTTP transport. Phase 2 flagged this stack as
+  its largest unvalidated assumption; it is now moot, and the flag was
+  well-placed — the assumption was never tested and now never will be. What
+  survives and is worth keeping: the **backend interface** it was written
+  against, the voice-registry *concept* (which maps onto preset voice ids
+  in-process), and the 18 tests, which move to whatever backend replaces it.
+- **The talker has never been run.** Only the codec decoder has (§1.1.2). The
+  M-RoPE attention path under transformers 5.12.1 is unverified, and that is
+  where a silent numerical difference would hide.
 - **No real audio has ever gone through a real model.** Every clip in every
   test is a synthetic tone.
 - **Full-duplex / barge-in.** Explicitly a stretch goal, not MVP.
@@ -844,3 +931,64 @@ was proven on a single clip (`task_type="VoiceDesign"` + `instructions` +
 `seed`) immediately before the reversal; the batch never ran. §8 risk 7 stands
 unchanged and is now the cheapest high-value step on the list — the pool is
 what every other path degrades to, and nothing degrades to an empty pool.
+
+---
+
+## 10. Audio-out fallback ladder (Phase 3, task #488)
+
+Every rung is **architecture-compliant**: one process tree, all VRAM visible to
+the ledger. No rung is an external serving engine — that option no longer
+exists, so the ladder is about *how much of the runtime the talker uses*, not
+about whether it escapes it.
+
+Descend only on evidence, and record which rung shipped.
+
+**Rung A — native htsglang model on a #305/#274 lane.** The talker is
+registered like any other model; the codec decoder is an in-process ledgered
+module. Full benefit: lane scheduling, the residency ladder, spill/park, CUDA
+graphs, batching across concurrent turns.
+*Blocker*: one decode step must emit 16 codes through a nested 5-layer
+transformer. This is not a normal LM head, and the decode loop is built around
+one-token-per-step. The nearest precedent in the fork is the per-step draft
+head in the speculative stack — same *shape* (a small transformer invoked
+inside a decode step), different *purpose* (draft-and-verify, not residual
+expansion), so it is a pattern to learn from rather than machinery to reuse
+unchanged.
+*Honest read against 08-10*: this is the right destination and an unlikely
+one-week delivery, because it lands in the decode loop — the most
+correctness-sensitive code in the runtime — days before a flight.
+
+**Rung B — in-process torch module inside the translator process.** The talker
+and codec run as plain `nn.Module`s in the translator's own process, weights
+and activations registered as ledgered asset classes, driven by our own small
+generation loop (the model is 0.6 B and the sequences are ~125 steps, so a
+hand-written loop is not a performance problem at this scale).
+*Compliant*: one process, one ledger, no second engine.
+*Status*: **partly executed already.** The codec decoder loaded all 496 tensors
+and produced 10 s of audio at RTF 0.32 on CPU under transformers 5.12.1 with
+three shims (§1.1.2).
+*Cost*: no lane scheduling, no CUDA-graph capture, no cross-request batching —
+acceptable for one conversation at a time, which is the MVP.
+*Honest read*: **this is the rung that ships before the flight.**
+
+**Rung B− — rung B with the reference implementation vendored instead of
+ported.** Same process and ledger, but the ~2 300-line talker modeling file is
+carried as third-party source under `3rdparty/` with the three shims applied,
+rather than reimplemented against our layers. Ugly, reviewable, and fast.
+Only if rung B's port slips.
+
+**Rung C — preset-only, no cloning.** Ship with the 18 rendered preset voices
+and drop voice cloning for the trip. Requirement 1 is not met, but the
+translator works and everyone is comprehensible. This rung needs *no* talker
+work at all beyond rendering the pool once.
+*Trigger*: audio-out not trustworthy by 08-08.
+
+**Rung D — no audio out.** Text-only translation on the phone screen. The
+segmenter, ASR, routing, diarization, journal, reconnect and PWA are all done
+and tested; this rung is reachable today and is the floor.
+
+**What the ladder protects.** Nothing above the TTS backend interface changes
+between rungs: the session, the journal, reconnect, the voice-mode machinery,
+the preset pool and the client are rung-independent. That is the concrete
+payoff of having built the interface first, and it is why revoking the sidecar
+costs a backend and not a pipeline.
