@@ -373,6 +373,158 @@ class TestWebSocketProtocol(unittest.TestCase):
             self.assertEqual(error["stage"], "protocol")
 
 
+class TestTranscriptOverTheWire(unittest.TestCase):
+    """The written record through the socket and the REST surface (§17.2)."""
+
+    def setUp(self):
+        self.service = build_service()
+        self.client = TestClient(build_app(self.service))
+        self.codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
+
+    def _hello(self, ws, **overrides):
+        payload = {
+            "kind": "hello",
+            "codecs": ["pcm16"],
+            "participants": [LANG_A, LANG_B],
+        }
+        payload.update(overrides)
+        ws.send_text(json.dumps(payload))
+        return json.loads(ws.receive_text())
+
+    def _one_turn(self, ws):
+        for frame in self.codec.encode(AudioChunk(tone(VOICE_A_HZ, 2.0), RATE)):
+            ws.send_bytes(frame)
+        ws.send_text(json.dumps({"kind": "release"}))
+        done, seen = drain_until(ws, lambda e: e.get("kind") == "turn.done")
+        self.assertIsNotNone(done, [e.get("kind") for e in seen])
+        return seen
+
+    def test_the_handshake_delivers_the_record_before_anything_else(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="s1")
+            self.assertEqual(ready["kind"], "ready")
+            record = json.loads(ws.receive_text())
+            self.assertEqual(record["kind"], "transcript")
+            self.assertEqual(record["lines"], [])
+
+    def test_a_reconnect_from_zero_restores_the_conversation_whole(self):
+        """The phone whose tab was evicted.
+
+        It has no lines and no cursor, so it asks from zero. If the record
+        lived on the client this would come back empty, and if it were
+        derived from the journal it would come back truncated.
+        """
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()  # the empty record
+            self._one_turn(ws)
+
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="s1", transcript_from=0)
+            self.assertTrue(ready["resumed"])
+            record = json.loads(ws.receive_text())
+            self.assertEqual(record["kind"], "transcript")
+            self.assertEqual(len(record["lines"]), 1)
+            line = record["lines"][0]
+            self.assertEqual(line["source_language"], LANG_A)
+            self.assertTrue(line["source_text"])
+            self.assertIn(LANG_B, line["translations"])
+
+    def test_a_client_that_kept_its_lines_asks_only_for_the_tail(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+            self._one_turn(ws)
+
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1", transcript_from=1)
+            record = json.loads(ws.receive_text())
+            self.assertEqual([line["line_id"] for line in record["lines"]], [2])
+
+    def test_the_rest_surface_reads_and_clears_the_record(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+
+        got = self.client.get("/api/translator/sessions/s1/transcript").json()
+        self.assertEqual(len(got["lines"]), 1)
+        self.assertEqual(got["dropped"], 0)
+
+        cleared = self.client.delete("/api/translator/sessions/s1/transcript").json()
+        self.assertEqual(cleared["removed"], 1)
+        after = self.client.get("/api/translator/sessions/s1/transcript").json()
+        self.assertEqual(after["lines"], [])
+        # And it is gone for a reconnecting client too -- the clear is
+        # server-side, so a second device sees the same empty record.
+        self.assertEqual(
+            self.client.get(
+                "/api/translator/sessions/s1/transcript?since=0"
+            ).json()["lines"],
+            [],
+        )
+
+    def test_transcript_of_an_unknown_session_is_a_404(self):
+        self.assertEqual(
+            self.client.get("/api/translator/sessions/nope/transcript").status_code,
+            404,
+        )
+
+    def test_naming_a_speaker_over_the_socket_rewrites_the_record(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+            speaker_id = self.service.sessions.get("s1").transcript.lines()[0].speaker_id
+            ws.send_text(
+                json.dumps(
+                    {"kind": "speaker.name", "speaker_id": speaker_id,
+                     "label": "Matthias"}
+                )
+            )
+            named, seen = drain_until(
+                ws, lambda e: e.get("kind") == "speaker.named", budget_s=5.0
+            )
+            self.assertIsNotNone(named, [e.get("kind") for e in seen])
+            self.assertEqual(named["lines_updated"], 1)
+        record = self.client.get("/api/translator/sessions/s1/transcript").json()
+        self.assertEqual(record["lines"][0]["speaker_label"], "Matthias")
+
+    def test_naming_an_unknown_speaker_is_reported_not_ignored(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            ws.send_text(
+                json.dumps({"kind": "speaker.name", "speaker_id": "ghost",
+                            "label": "x"})
+            )
+            error, _ = drain_until(
+                ws, lambda e: e.get("kind") == "error", budget_s=5.0
+            )
+            self.assertIsNotNone(error)
+            self.assertEqual(error["stage"], "speaker")
+
+    def test_the_rest_naming_endpoint_matches_the_socket(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+        speaker_id = self.service.sessions.get("s1").transcript.lines()[0].speaker_id
+        answer = self.client.post(
+            f"/api/translator/sessions/s1/speakers/{speaker_id}/name",
+            json={"label": "Larisa"},
+        ).json()
+        self.assertEqual(answer["lines_updated"], 1)
+        self.assertEqual(
+            self.client.post(
+                "/api/translator/sessions/s1/speakers/ghost/name",
+                json={"label": "x"},
+            ).status_code,
+            404,
+        )
+
+
 class TestClientAsset(unittest.TestCase):
     def test_the_pwa_is_served_and_is_self_contained(self):
         client = TestClient(build_app(build_service()))

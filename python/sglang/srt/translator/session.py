@@ -80,6 +80,7 @@ from sglang.srt.translator.speakers import (
     SpeakerRegistryConfig,
     split_points_by_dispersion,
 )
+from sglang.srt.translator.transcript_log import TranscriptLine, TranscriptLog
 from sglang.srt.translator.voices import (
     VoiceAssignment,
     VoiceClass,
@@ -116,6 +117,12 @@ class EventKind(str, enum.Enum):
     TURN_AUDIO = "turn.audio"
     TURN_DONE = "turn.done"
     TURN_DROPPED = "turn.dropped"
+    # The written record (§17.2). Separate from TURN_TRANSCRIPT, which
+    # reports one stage of one turn: these carry the durable line the reader
+    # scrolls, and they are the only events that may mutate history.
+    TRANSCRIPT_LINE = "transcript.line"
+    TRANSCRIPT_UPDATE = "transcript.update"
+    TRANSCRIPT_CLEARED = "transcript.cleared"
     ERROR = "error"
 
 
@@ -381,6 +388,10 @@ class TranslatorSession:
                 session_id,
             )
             self.voice_mode = VoiceMode.CLONE
+        # The written record. Deliberately NOT derived from the journal: the
+        # journal evicts under a byte budget, the transcript ends only at an
+        # explicit clear (§17.2).
+        self.transcript = TranscriptLog(clock=clock)
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
@@ -446,7 +457,55 @@ class TranslatorSession:
             "speaking": self.segmenter.speaking,
             "journal_seq": self.journal.next_seq,
             "journal_floor": self.journal.floor,
+            "transcript_lines": len(self.transcript),
+            "transcript_next_line_id": self.transcript.next_line_id,
+            "transcript_floor": self.transcript.floor,
         }
+
+    # -- the written record (§17.2) -----------------------------------------
+
+    def _speaker_label(self, speaker_id: str) -> str:
+        """Confirmed name if there is one, else the id itself."""
+        if not speaker_id:
+            return ""
+        try:
+            profile = self.speakers.get(speaker_id)
+        except KeyError:
+            return speaker_id
+        return profile.label or speaker_id
+
+    def _emit_line(self, line: TranscriptLine, update: bool = False) -> None:
+        self.journal.append(
+            EventKind.TRANSCRIPT_UPDATE if update else EventKind.TRANSCRIPT_LINE,
+            {"line": line.to_json()},
+        )
+
+    def name_speaker(self, speaker_id: str, label: str) -> List[TranscriptLine]:
+        """Give a speaker a name; applies retroactively AND forward (§17.3).
+
+        Returns the transcript lines that changed. The rename is stored on the
+        profile, so lines created later carry it without a second pass.
+        """
+        profile = self.speakers.get(speaker_id)
+        profile.label = label or None
+        changed = self.transcript.relabel_speaker(speaker_id, label or speaker_id)
+        for line in changed:
+            self._emit_line(line, update=True)
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {"speaker_named": speaker_id, "label": label,
+             "lines_updated": len(changed)},
+        )
+        return changed
+
+    def clear_transcript(self) -> int:
+        """The only thing that empties the record. Returns lines removed."""
+        removed = self.transcript.clear()
+        self.journal.append(
+            EventKind.TRANSCRIPT_CLEARED,
+            {"removed": removed, "next_line_id": self.transcript.next_line_id},
+        )
+        return removed
 
     # -- enrollment ---------------------------------------------------------
 
@@ -697,6 +756,20 @@ class TranslatorSession:
         # 3. Which way does it go. Elimination over the conversation's
         #    participant set -- no pair is named anywhere in this file.
         source = self._resolve_source(transcript, speaker_id)
+
+        # The written record gets its line HERE, before routing and before
+        # translation. A turn that is never routed (no rule for its language)
+        # or whose synthesis fails still happened and still belongs in the
+        # transcript -- writing the line only on success would make the
+        # record disagree with what the user heard themselves say.
+        line = self.transcript.append(
+            turn_id=turn_id,
+            speaker_id=speaker_id,
+            speaker_label=self._speaker_label(speaker_id),
+            source_language=source,
+            source_text=transcript.text,
+        )
+        self._emit_line(line)
         targets = self._targets_for(source)
         if targets is None:
             # Manual mode with no rule for this language. Passed through
@@ -759,6 +832,10 @@ class TranslatorSession:
         watch.total_ms = (self._clock() - t0) * 1000.0
 
         if translations:
+            updated = self.transcript.set_translations(line.line_id, translations)
+            if updated is not None:
+                self._emit_line(updated, update=True)
+
             # Only the first target feeds the MT history: a multi-target fan-out
             # would otherwise stack N assistant turns per user turn and skew the
             # context window towards whichever language happened to sort first.

@@ -334,6 +334,20 @@ class _Connection:
             }
         )
 
+        # The written record travels with the handshake, not with the journal
+        # replay (§17.2). A phone whose tab was evicted comes back with
+        # ``transcript_from=0`` and gets the whole conversation; one that kept
+        # its lines asks for the tail. The journal cannot serve this: it
+        # evicts, and a conversation older than its budget would come back
+        # truncated with no way for the client to know.
+        transcript_from = int(hello.get("transcript_from", 0))
+        await self._send(
+            {
+                "kind": "transcript",
+                **self.session.transcript.to_json(since=transcript_from),
+            }
+        )
+
         # Seed the delivery cursor BEFORE replaying. A fresh connection starts
         # at zero, and if the resume window happens to be empty nothing would
         # advance it -- the pump would then re-send the whole journal from the
@@ -394,6 +408,38 @@ class _Connection:
             # actually is.
             logger.debug("session %s client acked seq %s",
                          self._sid(), message.get("seq"))
+        elif kind == "transcript":
+            await self._send(
+                {
+                    "kind": "transcript",
+                    **self.session.transcript.to_json(
+                        since=int(message.get("since", 0))
+                    ),
+                }
+            )
+        elif kind == "transcript.clear":
+            # Destructive and explicit: the client confirms before sending it,
+            # and nothing else in the protocol empties the record.
+            removed = self.session.clear_transcript()
+            await self._send({"kind": "transcript.cleared", "removed": removed})
+        elif kind == "speaker.name":
+            try:
+                changed = self.session.name_speaker(
+                    str(message.get("speaker_id", "")),
+                    str(message.get("label", "")).strip(),
+                )
+            except KeyError:
+                await self._send(
+                    {"kind": "error", "stage": "speaker",
+                     "message": f"no speaker {message.get('speaker_id')!r}"}
+                )
+                return
+            await self._send(
+                {"kind": "speaker.named",
+                 "speaker_id": message.get("speaker_id"),
+                 "label": message.get("label"),
+                 "lines_updated": len(changed)}
+            )
         elif kind == "ping":
             await self._send({"kind": "pong", "at": time.time()})
         elif kind == "close":
@@ -577,6 +623,46 @@ def build_app(service: TranslatorService) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(session.state())
+
+    @app.get("/api/translator/sessions/{session_id}/transcript")
+    async def get_transcript(session_id: str, since: int = 0) -> JSONResponse:
+        """The written record (§17.2), server-held so a reconnect restores it.
+
+        ``since`` is a line cursor, not a sequence number: a client that kept
+        its lines asks only for what it is missing, and one that lost them
+        (fresh tab, evicted page) asks from zero and gets the conversation
+        back whole.
+        """
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        return JSONResponse(session.transcript.to_json(since=since))
+
+    @app.delete("/api/translator/sessions/{session_id}/transcript")
+    async def clear_transcript(session_id: str) -> JSONResponse:
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        return JSONResponse({"removed": session.clear_transcript()})
+
+    @app.post("/api/translator/sessions/{session_id}/speakers/{speaker_id}/name")
+    async def name_speaker(
+        session_id: str, speaker_id: str, body: Dict[str, Any]
+    ) -> JSONResponse:
+        """Name a speaker by hand — retroactively over the whole record."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        label = str(body.get("label", "")).strip()
+        try:
+            changed = session.name_speaker(speaker_id, label)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"no speaker {speaker_id!r}"
+            ) from exc
+        return JSONResponse(
+            {"speaker_id": speaker_id, "label": label, "lines_updated": len(changed)}
+        )
 
     @app.delete("/api/translator/sessions/{session_id}")
     async def close_session(session_id: str) -> JSONResponse:
