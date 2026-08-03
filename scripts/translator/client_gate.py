@@ -442,7 +442,19 @@ async def one_turn(
                     stop_report["first_frame_after_stop_at"] - started
                 )
             break
-        if line_at is not None and audio_at is not None:
+        # The exit condition must include EVERY property the turn is judged
+        # on, or the arm races itself. It used to leave as soon as the line
+        # and the audio were present, so on a fast turn -- first audio 1.74 s,
+        # line and audio landing in the SAME poll -- the loop left before the
+        # translation could render and reported "text was never visible" for a
+        # turn whose text arrived a moment later. That is the §17.8 lesson
+        # again, one level up: an arm that stops looking before the thing it
+        # measures can appear is measuring its own timing.
+        #
+        # The stop turn is exempt: it is cancelled before MT finishes and
+        # therefore owes no visible translation.
+        done_text = text_visible_at is not None or bool(stop_mode)
+        if line_at is not None and audio_at is not None and done_text:
             break
         await asyncio.sleep(0.25)
 
