@@ -140,6 +140,25 @@ class EventKind(str, enum.Enum):
     #: other turn -- the event exists so the client can say that instead of
     #: appearing to have frozen.
     TURN_QUEUED = "turn.queued"
+    #: What the synthesizer is doing with ONE unit of a turn, per transition:
+    #: ``queued`` -> ``synthesizing`` -> ``spoken``. Nothing announced this
+    #: before, and the interval between a clause's text appearing and its
+    #: audio starting is exactly the gap the user experiences as the pause --
+    #: it was unlabelled, so the screen could not distinguish "working on it"
+    #: from "stuck".
+    #:
+    #: ``spoken`` means the unit's audio has all been handed to the wire, NOT
+    #: that a person has heard it: how much is still playing out is the
+    #: client's audio clock to know, and it is the one that draws the
+    #: "about N s left" strip. The server does not model playback position.
+    #:
+    #: These replay like every other journal event, and they replay CORRECTLY
+    #: because the three states are ordered and terminal-last: a client that
+    #: takes the last event per ``(turn_id, unit_index)`` ends where the turn
+    #: actually ended. A unit left at ``synthesizing`` after a replay is a
+    #: turn that was cancelled mid-clause, and the ``playback.stopped`` event
+    #: that follows it says so.
+    TURN_SPEECH = "turn.speech"
     #: The user pressed stop. Everything not yet spoken is abandoned: the
     #: in-flight turn is cancelled and the queued segments are dropped. It is
     #: a journal event and not only a live ack because the record must show
@@ -1599,7 +1618,22 @@ class TranslatorSession:
         mt_start = self._clock()
         first_token_at: Optional[float] = None
 
-        async def speak(unit: str) -> None:
+        # Whether this turn is spoken at ALL is a turn-level fact -- reading
+        # mode, or no reference to clone from. Only emptiness is per unit.
+        # Hoisted because `turn.speech` must never announce a unit that will
+        # never be synthesized: a `queued` with no terminal state is a spinner
+        # that never stops.
+        will_speak = not silent and reference is not None
+        unit_index = 0
+
+        def announce(index: int, state: str) -> None:
+            self.journal.append(
+                EventKind.TURN_SPEECH,
+                {"turn_id": turn_id, "target": target,
+                 "unit_index": index, "state": state},
+            )
+
+        async def speak(index: int, unit: str) -> None:
             nonlocal first_audio_at
             # The silent check is explicit rather than left to `reference is
             # None`. Both are true in reading mode today, but a future path
@@ -1620,6 +1654,10 @@ class TranslatorSession:
                     {"turn_id": turn_id, "target": target, "reason": "tts_busy"},
                 )
             TTS_QUEUE_WAIT_S.set(0.0)
+            # Emitted before the call, not after the first chunk: the whole
+            # point is to name the interval BEFORE any audio exists, which is
+            # the one the user sits through.
+            announce(index, "synthesizing")
             async for piece in self.tts.synthesize(
                 unit, target, reference, reference_text, voice.backend_voice_id
             ):
@@ -1633,6 +1671,7 @@ class TranslatorSession:
                     {"turn_id": turn_id, "target": target, "speaker_id": speaker_id},
                     audio=piece,
                 )
+            announce(index, "spoken")
 
         # TEXT MUST NOT WAIT FOR AUDIO (§19.13, user field report: "the
         # translated text should be there much earlier than the audio; it
@@ -1652,14 +1691,24 @@ class TranslatorSession:
         # which is what keeps `turn_id` attribution and playback sequencing
         # correct. This also makes `mt_total_ms` mean what its name says --
         # it used to include synthesis.
-        speech: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        speech: "asyncio.Queue[Optional[Tuple[int, str]]]" = asyncio.Queue()
+
+        def enqueue_speech(unit: str) -> None:
+            """Hand one unit to the worker, announcing the wait it just joined."""
+            nonlocal unit_index
+            if not (will_speak and unit.strip()):
+                return
+            index = unit_index
+            unit_index += 1
+            announce(index, "queued")
+            speech.put_nowait((index, unit))
 
         async def speech_worker() -> None:
             while True:
-                unit = await speech.get()
-                if unit is None:
+                item = await speech.get()
+                if item is None:
                     return
-                await speak(unit)
+                await speak(*item)
 
         worker = asyncio.create_task(speech_worker())
         try:
@@ -1676,7 +1725,7 @@ class TranslatorSession:
                         {"turn_id": turn_id, "target": target, "text": unit,
                          "partial": True},
                     )
-                    speech.put_nowait(unit)
+                    enqueue_speech(unit)
             tail = accumulator.flush()
             watch.mt_total_ms = (self._clock() - mt_start) * 1000.0
             if tail:
@@ -1686,7 +1735,7 @@ class TranslatorSession:
                     {"turn_id": turn_id, "target": target, "text": tail,
                      "partial": True},
                 )
-                speech.put_nowait(tail)
+                enqueue_speech(tail)
             # Close the queue and let the backlog drain. The turn is not done
             # until its audio is, so the result still carries every chunk --
             # what changed is when the TEXT became visible, not what the turn
