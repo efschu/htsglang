@@ -62,8 +62,15 @@ server {
         proxy_buffering off;
     }
 
-    # The PWA itself and the REST surface.
-    location / {
+    # The PWA itself. EXACT match, not a prefix: `location /` would be a
+    # catch-all, and a catch-all is only harmless as long as the upstream is
+    # the translator's own port. The moment this template is pointed at the
+    # runtime -- which is exactly what someone will try when the translator
+    # moves onto a lane -- a catch-all publishes /hibernate and /vram_budget
+    # to the internet behind a valid certificate. Whitelist the translator's
+    # own endpoints instead; anything not listed gets 404 from nginx and never
+    # reaches the upstream. (#506 audit, 2026-08-03.)
+    location = / {
         proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
@@ -75,6 +82,37 @@ server {
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
         proxy_buffering off;
+    }
+
+    # The rest of the translator's surface, enumerated. Add a line here when
+    # an endpoint is added -- the cost of forgetting is a 404, which is the
+    # right direction to fail.
+    location /api/translator/ {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_buffering off;
+        client_max_body_size 32m;
+    }
+
+    # PWA assets served from the page root (manifest, icons, service worker).
+    location ~ ^/(manifest\.webmanifest|favicon\.ico|sw\.js|icon-[0-9]+\.png)$ {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+
+    # Everything else is not ours. Explicit, so a future endpoint is a
+    # deliberate addition rather than something that silently became public.
+    location / {
+        return 404;
     }
 }
 
