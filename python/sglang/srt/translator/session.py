@@ -82,6 +82,7 @@ from sglang.srt.translator.speakers import (
 )
 from sglang.srt.translator.transcript_log import TranscriptLine, TranscriptLog
 from sglang.srt.translator.voices import (
+    OutputMode,
     VoiceAssignment,
     VoiceClass,
     VoiceMode,
@@ -298,6 +299,7 @@ class TranslatorSession:
         min_reference_seconds: float = 3.0,
         max_queued_turns: int = 2,
         voice_mode: VoiceMode = VoiceMode.CLONE,
+        output_mode: OutputMode = OutputMode.VOICE,
         voice_pool: Optional[VoicePool] = None,
         speaker_change_detection: bool = True,
         speaker_change_threshold: float = 0.62,
@@ -392,6 +394,9 @@ class TranslatorSession:
         # journal evicts under a byte budget, the transcript ends only at an
         # explicit clear (§17.2).
         self.transcript = TranscriptLog(clock=clock)
+        # Reading mode (§17.1). Orthogonal to voice_mode: `silent` decides
+        # WHETHER anything is spoken, `voice_mode` decides in WHOSE voice.
+        self.output_mode = output_mode
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
@@ -446,6 +451,7 @@ class TranslatorSession:
             "turns_dropped": self.turns_dropped,
             "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
+            "output_mode": self.output_mode.value,
             "routing_mode": "manual" if self.routing_table else "auto",
             "routing_pairs": self.routing_table.to_json(),
             # Per-pair usability with the refusing stage named, so the UI
@@ -558,15 +564,6 @@ class TranslatorSession:
                     "segment_index": stale.index,
                     "reason": "queue_overrun",
                     "queued": len(self._queue),
-            "voice_mode": self.voice_mode.value,
-            "routing_mode": "manual" if self.routing_table else "auto",
-            "routing_pairs": self.routing_table.to_json(),
-            # Per-pair usability with the refusing stage named, so the UI
-            # can grey a row out and say WHY instead of dropping it.
-            "routing_capability": list(
-                self.routing_table.capability_report(self.matrix)
-            ),
-            "voice_pool": self.voice_pool.to_json() if self.voice_pool else None,
                 },
             )
         self._queue.append(segment)
@@ -995,14 +992,31 @@ class TranslatorSession:
         speaker_id: str,
         watch: Stopwatch,
     ) -> Tuple[str, Optional[AudioChunk], bool, Optional[float]]:
-        voice = self._choose_voice(speaker_id, target)
-        reference, reference_text = voice.reference, voice.reference_text
-        fallback = voice.downgraded
-        self.journal.append(
-            EventKind.TURN_VOICE,
-            {"turn_id": turn_id, "target": target, "speaker_id": speaker_id,
-             **voice.to_json()},
-        )
+        # Reading mode (§17.1): everything up to here has already run -- the
+        # recognizer, the speaker assignment and its reference admission, the
+        # routing decision -- and everything after MT still runs. Only the
+        # synthesizer is skipped, and no voice is chosen at all: reporting a
+        # clone downgrade for a turn nobody was going to hear would be a
+        # reason attached to a non-event.
+        silent = self.output_mode is OutputMode.SILENT
+        if silent:
+            voice = None
+            reference, reference_text = None, ""
+            fallback = False
+            self.journal.append(
+                EventKind.TURN_VOICE,
+                {"turn_id": turn_id, "target": target, "speaker_id": speaker_id,
+                 "output_mode": OutputMode.SILENT.value, "spoken": False},
+            )
+        else:
+            voice = self._choose_voice(speaker_id, target)
+            reference, reference_text = voice.reference, voice.reference_text
+            fallback = voice.downgraded
+            self.journal.append(
+                EventKind.TURN_VOICE,
+                {"turn_id": turn_id, "target": target, "speaker_id": speaker_id,
+                 **voice.to_json()},
+            )
 
         accumulator = SentenceAccumulator()
         pieces: List[str] = []
@@ -1013,7 +1027,11 @@ class TranslatorSession:
 
         async def speak(unit: str) -> None:
             nonlocal first_audio_at
-            if not unit.strip() or reference is None:
+            # The silent check is explicit rather than left to `reference is
+            # None`. Both are true in reading mode today, but a future path
+            # that supplies a reference without wanting speech would then
+            # start talking, and nothing here would say why.
+            if silent or not unit.strip() or reference is None:
                 return
             tts_start = self._clock()
             async for piece in self.tts.synthesize(
@@ -1125,6 +1143,19 @@ class TranslatorSession:
             EventKind.SESSION_STATE, {"voice_mode": mode.value}
         )
         return self.voice_mode
+
+    def set_output_mode(self, mode: OutputMode) -> OutputMode:
+        """Switch between speaking and reading mode at runtime (§17.1).
+
+        Unconditional: unlike preset voice mode there is nothing that can make
+        silence impossible, and unlike a TTS failure this is a user decision,
+        so it never needs a refusal path.
+        """
+        self.output_mode = mode
+        self.journal.append(
+            EventKind.SESSION_STATE, {"output_mode": mode.value}
+        )
+        return self.output_mode
 
     def override_voice_class(self, speaker_id: str, voice_class: VoiceClass) -> None:
         """Correct the heuristic class for one speaker and re-assign them."""

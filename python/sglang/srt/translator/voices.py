@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "VoiceMode",
+    "OutputMode",
     "VoiceClass",
     "PresetVoice",
     "VoicePool",
@@ -85,6 +86,34 @@ class VoiceMode(str, enum.Enum):
                 return mode
         raise VoicePoolError(
             f"unknown voice mode {value!r}; expected one of "
+            f"{[m.value for m in cls]}"
+        )
+
+
+class OutputMode(str, enum.Enum):
+    """Whether a session speaks its translations aloud (§17.1).
+
+    ``silent`` is the reading mode: the pipeline is identical up to and
+    excluding synthesis, so the transcript, the speaker attribution and the
+    reference buffers all keep filling. It exists for the case where a phone
+    is passed around a quiet table, and it is never selected automatically --
+    a TTS failure stays a per-turn failure with a reason rather than silently
+    becoming a mode.
+    """
+
+    VOICE = "voice"
+    SILENT = "silent"
+
+    @classmethod
+    def parse(cls, value: object) -> "OutputMode":
+        if isinstance(value, cls):
+            return value
+        text = str(value or "").strip().lower()
+        for mode in cls:
+            if mode.value == text:
+                return mode
+        raise VoicePoolError(
+            f"unknown output mode {value!r}; expected one of "
             f"{[m.value for m in cls]}"
         )
 

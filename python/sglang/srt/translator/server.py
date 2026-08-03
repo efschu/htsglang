@@ -71,6 +71,7 @@ from sglang.srt.translator.session import (
     TranslatorSession,
 )
 from sglang.srt.translator.voices import (
+    OutputMode,
     VoiceClass,
     VoiceMode,
     VoicePool,
@@ -408,6 +409,17 @@ class _Connection:
             # actually is.
             logger.debug("session %s client acked seq %s",
                          self._sid(), message.get("seq"))
+        elif kind == "output.mode":
+            try:
+                mode = self.session.set_output_mode(
+                    OutputMode.parse(message.get("mode"))
+                )
+            except VoicePoolError as exc:
+                await self._send(
+                    {"kind": "error", "stage": "voice", "message": str(exc)}
+                )
+                return
+            await self._send({"kind": "output.mode", "mode": mode.value})
         elif kind == "transcript":
             await self._send(
                 {
@@ -612,6 +624,10 @@ def build_app(service: TranslatorService) -> FastAPI:
         try:
             if "mode" in body:
                 session.set_voice_mode(VoiceMode.parse(body["mode"]))
+            if "output_mode" in body:
+                # Reading mode rides the voice endpoint because it is the
+                # same user-facing control: "how does this session come out".
+                session.set_output_mode(OutputMode.parse(body["output_mode"]))
             if "speaker_id" in body and "voice_class" in body:
                 session.override_voice_class(
                     str(body["speaker_id"]), VoiceClass(str(body["voice_class"]))

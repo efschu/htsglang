@@ -465,6 +465,30 @@ class TestTranscriptOverTheWire(unittest.TestCase):
             [],
         )
 
+    def test_reading_mode_switches_over_the_socket_and_over_rest(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="s1")
+            self.assertEqual(ready["state"]["output_mode"], "voice")
+            ws.receive_text()  # the record
+            ws.send_text(json.dumps({"kind": "output.mode", "mode": "silent"}))
+            answer, seen = drain_until(
+                ws, lambda e: e.get("kind") == "output.mode", budget_s=5.0
+            )
+            self.assertIsNotNone(answer, [e.get("kind") for e in seen])
+            self.assertEqual(answer["mode"], "silent")
+            # An unknown mode is refused by name rather than ignored.
+            ws.send_text(json.dumps({"kind": "output.mode", "mode": "mute"}))
+            error, _ = drain_until(
+                ws, lambda e: e.get("kind") == "error", budget_s=5.0
+            )
+            self.assertIsNotNone(error)
+            self.assertIn("mute", error["message"])
+
+        state = self.client.post(
+            "/api/translator/sessions/s1/voice", json={"output_mode": "voice"}
+        ).json()
+        self.assertEqual(state["output_mode"], "voice")
+
     def test_transcript_of_an_unknown_session_is_a_404(self):
         self.assertEqual(
             self.client.get("/api/translator/sessions/nope/transcript").status_code,
