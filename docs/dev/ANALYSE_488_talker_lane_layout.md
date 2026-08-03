@@ -133,6 +133,38 @@ collective term were free. It is not free, which is the point of §4.
 3. **TP=2 on 5090+3080** is not a middle ground: it keeps 2/3 of the collective
    count and lands the clock on the slower card. Not recommended.
 
+### 6a. Reach check on "#274 lanes carry multi-instance naturally" — they do NOT, yet
+
+Read before acting on it, per MECHANISM REACH. The #274 lane is **not** a host
+for three independent talker instances, and the shorthand is wider than the
+code in three separate ways:
+
+* `model_executor/dual_group_lane.py:35` — *"the scheduler holds a LIST of
+  lanes. **Slice B instantiates exactly one lane.**"* The N-lane form is
+  designed for and explicitly not built.
+* `dual_group_lane.py:16-25` — a lane is a **full-width (weight-TP=1) module
+  tree whose parallel linears are SHELLS** over the serving group's own
+  sharded parts plus freshly loaded complements. It reconstitutes *the serving
+  model* at full width; it is not a slot a *different* model occupies.
+* `server_args.py:9524-9531` — `--dual-group-lane` requires an explicit
+  `--rank-tp-ratio` integer list because *"the lane shares the plan's rank-0
+  segment; without a plan there is nothing to nest"*, plus a mandatory
+  `--dual-group-lane-budget-mib` with no fallback.
+
+The shape #488's "one instance per card" actually needs is #305 multi-model,
+which `DESIGN_305_multi_model_serving.md:4-5` states is design-only ("no
+implementation") — the same finding the #466 feasibility cut recorded.
+
+What slice 1 does about it, which is the part that costs nothing now: the model
+file holds **no process-global state**. Every geometry decision is taken from
+the parallel context at construction (`get_parallel()` in each attention
+`__init__`), which is exactly the axis #274's context overlays already
+substitute per lane. So N instances become a host problem, never a model-file
+rewrite. That is the whole of "designed multi-instance-capable" that can be
+honestly claimed today.
+
+### 6b. The falsifying window
+
 The GPU arm that would falsify §4 directly, once a window opens: boot the lane
 solo on the 5090 and at `--rank-tp-ratio 5,3,3 --rank-gpu-id <5090>,<3080a>,
 <3080b>`, measure ms/frame on identical clause lengths (fixed cost + slope

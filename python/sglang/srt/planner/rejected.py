@@ -746,6 +746,56 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         ),
         unlock="--draft-kv-layout dcp",
     ),
+    RejectedEntry(
+        key="tts_talker_tensor_parallel",
+        what=(
+            "splitting the Qwen3-TTS talker across the three cards with "
+            "tensor parallelism (--rank-tp-ratio over --rank-gpu-id 0,1,2)"
+        ),
+        verdict=(
+            "NOT_DEFAULT: representable but LOSES to a single 5090 by 2-5x. "
+            "Predicted RTF 0.043 (at an optimistic 10 us per collective) to "
+            "0.117 (at 40 us) against 0.022 solo, and worse than a solo 3080 "
+            "(0.052) from ~20 us upward. Not a geometry refusal -- the uneven "
+            "plan carries the shard fine (see gain)"
+        ),
+        gain=(
+            "a third of the per-rank weight read: 37.0 GiB per audio-second "
+            "split as q [8,4,4], kv [4,2,2], MLP [1392,840,840]"
+        ),
+        cost=(
+            "2472 extra all-reduces per audio-second, each a 2 KiB round trip "
+            "on a rig with no P2P and no NVLink"
+        ),
+        why=(
+            "the talker is LATENCY-bound, not bandwidth-bound: 192 forward "
+            "passes per audio-second at batch 1 over a 0.6 B model leave a "
+            "per-step bandwidth term of 0.09-0.50 ms on the 5090 against a "
+            "measured 6.4 ms step. TP divides the negligible term and "
+            "multiplies the dominant one. The three-card win here is one "
+            "INSTANCE per card serving independent sessions."
+        ),
+        level=NOT_DEFAULT,
+        evidence=(
+            "docs/dev/ANALYSE_488_talker_lane_layout.md SS2-5: weight census "
+            "of the 478-tensor checkpoint, the sequential frame loop at "
+            "qwen_tts modeling_qwen3_tts.py:1671/:1684, the head/MLP vectors "
+            "executed against distributed/utils.py and pinned in "
+            "test/registered/unit/models/test_qwen3_tts_talker_lane_488.py, "
+            "and the no-P2P rig fact in FEATURE_CATALOG SS7. FIXED-COST "
+            "CALCULATION, not a GPU measurement -- the falsifying window is "
+            "specified in ANALYSE_488 SS6 and has not run"
+        ),
+        tags=("tts-talker", "uneven-tp"),
+        scope="rig",
+        note=(
+            "The arithmetic is rig-scoped because the collective term is: on "
+            "a fabric with sub-microsecond small-message latency the balance "
+            "moves. The 192-steps-per-audio-second shape is a property of the "
+            "architecture and travels; the verdict is the two together."
+        ),
+        unlock="--rank-tp-ratio 5,3,3 --rank-gpu-id <5090>,<3080a>,<3080b>",
+    ),
 )
 
 
