@@ -287,6 +287,34 @@ class TestWebSocketProtocol(unittest.TestCase):
                 [LANG_A, LANG_B],
             )
 
+    def test_a_stop_frame_is_acked_and_names_what_it_abandoned(self):
+        """The wiring, which every session-level test would pass without.
+
+        A frame the dispatcher does not know is silently ignored, so the
+        button would be dead on a server whose `abort_playback` is perfect.
+        """
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="stop-1")
+            ws.send_text(json.dumps({"kind": "playback.stop"}))
+            ack, seen = drain_until(
+                ws, lambda e: e.get("kind") == "playback.stop.ack"
+            )
+            self.assertIsNotNone(ack, [e.get("kind") for e in seen])
+            self.assertEqual(ack["dropped_queued"], 0)
+            self.assertEqual(ack["stop_epoch"], 1)
+            self.assertIn("aborted_turn_id", ack)
+
+    def test_a_stop_is_delivered_to_the_client_as_an_event_too(self):
+        """The ack is for the presser; the event is for the record."""
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="stop-2")
+            ws.send_text(json.dumps({"kind": "playback.stop"}))
+            event, seen = drain_until(
+                ws, lambda e: e.get("kind") == "playback.stopped"
+            )
+            self.assertIsNotNone(event, [e.get("kind") for e in seen])
+            self.assertEqual(event["reason"], "user")
+
     def test_a_non_hello_first_frame_is_refused(self):
         with self.client.websocket_connect("/api/translator/stream") as ws:
             ws.send_text(json.dumps({"kind": "audio"}))
@@ -645,7 +673,12 @@ class TestClientAsset(unittest.TestCase):
         self.assertIn('kind: "suggestion.confirm"', html)
         # Auto-scroll that yields to a reader who scrolled up.
         self.assertIn("function atBottom", html)
-        self.assertIn("if (follow) transcriptBox.scrollTop", html)
+        # The §19.3 rebuild renamed the transcript box and split the
+        # follow decision into a helper, but the BEHAVIOUR pinned here is
+        # unchanged and is the one that matters: auto-scroll happens only
+        # when the reader was already at the bottom, so it never yanks the
+        # page away from somebody reading back.
+        self.assertIn("if (wasAtBottom) streamBox().scrollTop", html)
         # Tap-to-toggle, not press-and-hold: on Android a long press is the
         # text-selection gesture and it cancelled the recording mid-word.
         self.assertIn("function toggleTalk", html)
@@ -657,8 +690,12 @@ class TestClientAsset(unittest.TestCase):
             self.assertIn(guard, html, guard)
         # Both texts on every line. The original is the only thing a speaker
         # can check the translation against.
-        self.assertIn("txt.textContent = line.source_text", html)
-        self.assertIn('target + ": " + line.translations[target]', html)
+        # Same invariant after the §19.3 rebuild, different selectors: the
+        # source text is rendered on every line beside its translation, per
+        # target. The bilingual line is the point -- a speaker can only check
+        # a translation against their own words.
+        self.assertIn('.src").textContent = line.source_text', html)
+        self.assertIn("text.textContent = line.translations[target]", html)
 
         manifest = client.get("/manifest.webmanifest").json()
         self.assertEqual(manifest["display"], "standalone")

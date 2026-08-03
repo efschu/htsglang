@@ -283,6 +283,8 @@ class _Connection:
         self.codec: AudioCodec = Pcm16Codec()
         self.sent_seq = 0
         self._pump: Optional[asyncio.Task] = None
+        #: The running drain, so a stop can cancel it (§19.12).
+        self._drain_task: Optional[asyncio.Task] = None
         self._closing = False
 
     async def run(self) -> None:
@@ -609,6 +611,28 @@ class _Connection:
                  "label": message.get("label"),
                  "lines_updated": len(changed)}
             )
+        elif kind == "playback.stop":
+            # "Stop talking, now." (§19.12) Three things have to happen
+            # together or the button lies: the queued turns go, the in-flight
+            # turn is cancelled, and the client is told WHICH turns are dead
+            # so it can drop audio that is already on the wire.
+            if self.session is None:
+                await self._send(
+                    {"kind": "error", "stage": "playback.stop",
+                     "message": "no session"}
+                )
+                return
+            reason = str(message.get("reason") or "user")[:32]
+            # Journal and drop the queue FIRST. If the cancellation below
+            # raced ahead of it, a queued segment could start running between
+            # the two and survive its own stop.
+            outcome = self.session.abort_playback(reason)
+            task = self._drain_task
+            if task is not None and not task.done():
+                task.cancel()
+            self._drain_task = None
+            await self._send({"kind": "playback.stop.ack", **outcome})
+
         elif kind == "diag":
             # Client-side capture telemetry, logged where it can be read
             # against the session it belongs to. This is the only channel by
@@ -646,12 +670,21 @@ class _Connection:
         assert self.session is not None
         if self.session.pending() == 0:
             return
-        asyncio.create_task(self._drain_guarded())
+        # The handle is kept, not fire-and-forget: a stop has to be able to
+        # CANCEL this, and cancelling the task is what frees the talker --
+        # the cancellation propagates into the synthesis generator and out of
+        # `inprocess_tts`'s `async with self._lock`, so the next conversation
+        # gets the card back immediately instead of after the current clause.
+        self._drain_task = asyncio.create_task(self._drain_guarded())
 
     async def _drain_guarded(self) -> None:
         assert self.session is not None
         try:
             await self.session.drain()
+        except asyncio.CancelledError:
+            # A stop, not a fault. Nothing to report and nothing to repair:
+            # `abort_playback` has already journalled what was abandoned.
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("turn pipeline failed in session %s", self._sid())
             await self._send(

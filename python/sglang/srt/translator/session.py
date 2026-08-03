@@ -139,6 +139,13 @@ class EventKind(str, enum.Enum):
     #: other turn -- the event exists so the client can say that instead of
     #: appearing to have frozen.
     TURN_QUEUED = "turn.queued"
+    #: The user pressed stop. Everything not yet spoken is abandoned: the
+    #: in-flight turn is cancelled and the queued segments are dropped. It is
+    #: a journal event and not only a live ack because the record must show
+    #: WHY a turn stops mid-sentence -- a line that simply ends looks like a
+    #: defect, and this is the difference between a cut-off turn and a lost
+    #: one.
+    PLAYBACK_STOPPED = "playback.stopped"
     # The written record (§17.2). Separate from TURN_TRANSCRIPT, which
     # reports one stage of one turn: these carry the durable line the reader
     # scrolls, and they are the only events that may mutate history.
@@ -454,6 +461,15 @@ class TranslatorSession:
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
         self._turn_lock = asyncio.Lock()
+        #: The turn currently being translated/synthesized, or None. Kept so a
+        #: stop can NAME what it abandoned; the client discards audio per
+        #: turn_id and an ack that cannot say which turn died is not
+        #: actionable.
+        self._active_turn_id: Optional[str] = None
+        #: Increments on every stop. Not used to gate anything server-side --
+        #: it is the client's cheap "is this frame from before my stop"
+        #: check, and a counter is the smallest thing that answers it.
+        self._stop_epoch = 0
         self._closed = False
         self.last_activity = clock()
         self._attached = 0
@@ -973,6 +989,42 @@ class TranslatorSession:
     def pending(self) -> int:
         return len(self._queue)
 
+    def abort_playback(self, reason: str = "user") -> Dict[str, object]:
+        """Abandon everything not yet spoken (§19.12).
+
+        Two halves, and only the first is visible here. This drops the QUEUED
+        segments and records the stop; cancelling the in-flight turn is the
+        caller's half, because the task handle lives with the connection that
+        created it. Both are needed: dropping the queue while a synthesis runs
+        would leave the talker busy for the rest of that clause, which is
+        exactly the "I pressed stop and it kept talking" the button exists to
+        prevent.
+
+        Returns what was abandoned rather than nothing, because the ack has to
+        carry it: the client discards audio per ``turn_id``, so it needs to be
+        told which ids are dead. Any binary frame for an aborted turn that is
+        already in flight arrives AFTER this event, which is what makes the
+        rule "drop frames whose turn is aborted" sufficient on the client.
+        """
+        dropped = len(self._queue)
+        self._queue.clear()
+        aborted = self._active_turn_id
+        self._stop_epoch += 1
+        self.journal.append(
+            EventKind.PLAYBACK_STOPPED,
+            {
+                "reason": reason,
+                "aborted_turn_id": aborted,
+                "dropped_queued": dropped,
+                "stop_epoch": self._stop_epoch,
+            },
+        )
+        return {
+            "aborted_turn_id": aborted,
+            "dropped_queued": dropped,
+            "stop_epoch": self._stop_epoch,
+        }
+
     async def drain(self) -> List[TurnResult]:
         """Run every queued segment through the pipeline, in order."""
         results: List[TurnResult] = []
@@ -1002,13 +1054,19 @@ class TranslatorSession:
         languages, and no amount of later attribution repairs that.
         """
         async with self._turn_lock:
-            pieces = await self._split_at_speaker_changes(segment)
-            results: List[TurnResult] = []
-            for piece in pieces:
-                result = await self._run_turn_locked(piece)
-                if result is not None:
-                    results.append(result)
-            return results
+            try:
+                pieces = await self._split_at_speaker_changes(segment)
+                results: List[TurnResult] = []
+                for piece in pieces:
+                    result = await self._run_turn_locked(piece)
+                    if result is not None:
+                        results.append(result)
+                return results
+            finally:
+                # Cleared on the way out however we leave -- return, error, or
+                # the cancellation a stop delivers. A stale active turn would
+                # make the NEXT stop name a turn that finished long ago.
+                self._active_turn_id = None
 
     async def _split_at_speaker_changes(self, segment: Segment) -> List[Segment]:
         """Re-cut a segment wherever the voice changes inside it.
@@ -1093,6 +1151,7 @@ class TranslatorSession:
 
     async def _run_turn_locked(self, segment: Segment) -> Optional[TurnResult]:
         turn_id = uuid.uuid4().hex[:12]
+        self._active_turn_id = turn_id
         t0 = self._clock()
         watch = Stopwatch(segment_closed_at=t0)
         self.journal.append(
