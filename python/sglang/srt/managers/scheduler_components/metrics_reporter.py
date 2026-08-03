@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability import spill_tiers
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -889,6 +890,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._log_spill_tier_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1158,6 +1160,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._log_spill_tier_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1235,6 +1238,22 @@ class SchedulerMetricsReporter:
             host_pool.size - host_pool.available_size()
         )
         self.stats.hicache_host_total_tokens = host_pool.size
+
+    def _log_spill_tier_stats(self):
+        """Populate spill/offload tier occupancy on self.stats (#522).
+
+        Read from each consumer's OWN bookkeeping (see
+        ``observability/spill_tiers.py`` for which ledger each tier speaks
+        through, and for the list of tiers that have no live source and are
+        therefore deliberately not reported). Pushed to Prometheus by
+        SchedulerMetricsCollector.log_stats().
+
+        A tier that is not configured contributes no key, so the scrape stays
+        silent about it and the dashboard renders it absent rather than empty.
+        """
+        used, total = spill_tiers.collect_spill_tiers(self.scheduler)
+        self.stats.spill_tier_used_bytes = used
+        self.stats.spill_tier_total_bytes = total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

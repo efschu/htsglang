@@ -1897,6 +1897,50 @@ tier (`cost_model.py:142-146`); the decode-knee guard is **modelled**, and
 reports ABSENT rather than "safe" when the membw scores it needs are missing
 (`wizard_tipping.py:587-607`) — there is no knee-point probe: `power_limit_sweep`
 (`energy.py:1217`) would measure one but has test callers only (#505-D6).
+**Monitor tab, #522.** Three additions, all computed SERVER-side so `curl
+/api/live_snapshot` is the same view the page draws (runbook §8's rule).
+(1) **Four-state server diagnosis** (`planner/server_state.py`): the old page
+printed "started without --enable-metrics" for ANY failed scrape, including
+connection-refused — a guessed cause, not a diagnosis. The discriminator is a
+second, metrics-independent API probe (`/get_model_info`, then `/health`), and
+it is spent ONLY when the scrape failed (a 200 on /metrics already proves the
+API, same HTTP server). `RUNNING_NO_METRICS` sits inside the `api.ok` branch of
+`classify` and nowhere else (`server_state.py:194-208`), so the old claim
+cannot return; `STARTING` requires NAMED evidence — the supervisor's own
+`booting` state, or the port accepting TCP while the API does not answer —
+and falls back to `NOT_RUNNING` where neither holds, never a heuristic
+"probably coming up". (2) **Median badges** on the rate tiles
+(`planner/rate_medians.py`): an idle tile reads `0 (median 43.2)`, where the
+median covers the last `RATE_MEDIAN_WINDOW` = 30 PROCESSING windows only —
+60 s of actual processing at the 2 s poll, the same horizon the per-card rings
+use. Idle polls never enter the window (per-key activity predicates on the
+counter DELTAS, not on the rate value), because a median over the idle zeros
+would be 0 and the badge would carry nothing; an empty window renders no badge
+rather than a zero. (3) **Spill/offload tier panel** under the per-card
+placement (`planner/tier_occupancy.py` + `observability/spill_tiers.py`): one
+row per tier = type x place, from local VRAM through host RAM and local disk
+out to the paired rig. Occupancy comes from each consumer's OWN ledger through
+new `sglang:spill_tier_used_bytes{spill_tier=…}` / `_total_bytes` gauges —
+expert pool summed from the live per-layer pinned tensors, kvso from occupied
+regions x region bytes, #224 park from parked-session rows x bytes-per-token,
+HiCache-L3 from the file backend's evictor total. **Reach note, and it is the
+point of the entry:** the #407 `memtier.TierRegistry` is NOT the data source
+and cannot be — it is a capability/profile description with no production
+consumer (`memtier/registry.py:34-36` "no consumer is wired to it yet",
+`memtier/__init__.py:65` "No consumer reads any of this yet";
+`TierCapacity.reserved` defaults to 0, `tiers.py:365`, and no `reserved=` is
+ever passed in `bootstrap.py`), and the #286
+short-term register's `CapacityLedger` is real but unreachable
+(`OffloadRegister` always falls back to `CpuFakeMovementBackend`, which counts
+ids and no bytes, `offload_register.py:563`). Both are therefore drawn as
+ABSENT rows with that reason, as are the NVMe expert tier (#389, design only),
+hibernate staging (a state, not a live gauge), and every unconfigured remote
+tier. The cumulative ledgers are deliberately NOT used as occupancy
+(`StreamingStagingLedger` only ever adds; `park_bytes_out` is bytes ever
+moved). /proc is consulted for exactly one thing — MemTotal as the host-RAM
+denominator — and the row says it is the DASHBOARD host's. Provenance is #218's
+`measured`/`absent` with no "probably" tier; the token-valued HiCache-L2 row is
+excluded from the byte sum by name rather than blended into it.
 Self-update installs in any serve mode; **switching + auto-rollback need
 `--serve-supervised`** (`webui.py:3632`, `self_update.py:659-688`), and the
 health gate is HTTP 200 on `/` (`self_update.py:691-712`, #505-D8). GitHub

@@ -150,6 +150,13 @@ class SchedulerStats:
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
 
+    # Spill / offload tier occupancy (#522), keyed by tier id as defined in
+    # observability/spill_tiers.py. A tier that is NOT configured contributes
+    # no key at all -- absence is the signal the dashboard renders as an
+    # honest "absent" row, so no inactive consumer is given a placeholder 0.
+    spill_tier_used_bytes: Dict[str, int] = field(default_factory=dict)
+    spill_tier_total_bytes: Dict[str, int] = field(default_factory=dict)
+
     # Streaming session metrics
     num_streaming_sessions: int = 0
     streaming_session_held_tokens: int = 0
@@ -715,6 +722,35 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
 
         # =================================================================
+        # Spill / offload tier occupancy (#522)
+        #
+        # One metric family, one row per tier, so a tier that is not
+        # configured emits NO sample -- which is exactly how the dashboard
+        # tells "tier absent" from "tier empty". Created unconditionally
+        # because the set of active tiers is only known per scrape, not at
+        # construction; a family with no rows costs a HELP/TYPE line.
+        # =================================================================
+        self.spill_tier_used_bytes = Gauge(
+            name="sglang:spill_tier_used_bytes",
+            documentation=(
+                "Bytes currently held by a spill/offload tier, by tier id "
+                "(expert_host_ram, kv_session_host_ram, hicache_file_disk, "
+                "park:<backend>)."
+            ),
+            labelnames=list(labels.keys()) + ["spill_tier"],
+            multiprocess_mode="mostrecent",
+        )
+        self.spill_tier_total_bytes = Gauge(
+            name="sglang:spill_tier_total_bytes",
+            documentation=(
+                "Capacity in bytes of a spill/offload tier, by tier id. Only "
+                "emitted for tiers whose capacity is a known fixed figure."
+            ),
+            labelnames=list(labels.keys()) + ["spill_tier"],
+            multiprocess_mode="mostrecent",
+        )
+
+        # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
         # =================================================================
         if self.enable_streaming_session:
@@ -1174,6 +1210,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
 
+    def _log_gauge_by_tier(self, gauge: Gauge, data: Dict[str, int]) -> None:
+        # One sample per ACTIVE spill tier. An empty mapping emits nothing at
+        # all, which is the signal "no such tier in this configuration" --
+        # never a zero that would read as "tier present and empty".
+        for tier, value in (data or {}).items():
+            labels = dict(self.labels)
+            labels["spill_tier"] = str(tier)
+            gauge.labels(**labels).set(value)
+
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
         # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
         # NOTE: When priority scheduling is enabled, the total is recorded under
@@ -1456,6 +1501,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+
+        # Spill / offload tier occupancy (#522)
+        self._log_gauge_by_tier(
+            self.spill_tier_used_bytes, stats.spill_tier_used_bytes
+        )
+        self._log_gauge_by_tier(
+            self.spill_tier_total_bytes, stats.spill_tier_total_bytes
+        )
 
         # Streaming session metrics
         if self.enable_streaming_session:

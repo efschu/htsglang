@@ -73,9 +73,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
+import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from sglang.srt.planner import rate_medians, server_state, tier_occupancy
 from sglang.srt.planner.energy import (
     LiveSnapshot,
     _import_pynvml,
@@ -711,6 +713,27 @@ def _fetch_metrics_text(base_url: str, timeout: float) -> str:
         return r.read().decode("utf-8", "replace")
 
 
+def _scrape_metrics(base_url: str, timeout: float) -> Tuple[str, server_state.Probe]:
+    """The scrape, as (text, probe). The PROBE is what the four-state machine
+    reads: it distinguishes "answered 404" from "connection refused", which a
+    bare exception string does not, and which is the whole difference between
+    a server without ``--enable-metrics`` and a server that is not there.
+    """
+    url = base_url.rstrip("/") + "/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            code = r.getcode()
+            text = r.read().decode("utf-8", "replace")
+        return text, server_state.Probe(
+            ok=code == 200, path="/metrics", status=code)
+    except urllib.error.HTTPError as e:
+        return "", server_state.Probe(
+            ok=False, path="/metrics", status=e.code, error=f"HTTP {e.code}")
+    except Exception as e:
+        return "", server_state.Probe(
+            ok=False, path="/metrics", error=f"{type(e).__name__}: {e}")
+
+
 # ===========================================================================
 # Public entry point.
 # ===========================================================================
@@ -724,6 +747,11 @@ def snapshot(
     launch_config: Optional[dict] = None,
     now: Optional[float] = None,
     timeout: float = 5.0,
+    metrics_probe: Optional[server_state.Probe] = None,
+    managed_state: Optional[str] = None,
+    managed_detail: str = "",
+    probe_opener: Optional[Callable] = None,
+    tcp_probe: Optional[Callable[[str, int], bool]] = None,
 ) -> Tuple[dict, dict]:
     """One live snapshot of a running sglang server + local NVML.
 
@@ -756,15 +784,22 @@ def snapshot(
                  "t": t_cur},
                 prev_state or {},
             )
-        try:
-            metrics_text = _fetch_metrics_text(base_url, timeout)
-        except Exception as e:
-            # /metrics absent (server booted without --enable-metrics) is NOT
-            # fatal: still return NVML GPU telemetry + the launch config so the
-            # landing page renders. Only the token-rate / spec / cache-hit
-            # metrics drop out; metrics_error tells the UI why.
-            metrics_error = f"scrape of {base_url}/metrics failed: {e}"
-            metrics_text = ""
+        # A failed scrape is NOT fatal: NVML telemetry and the launch config
+        # still render. What it is NOT, either, is a diagnosis -- see the
+        # server_state block below; naming the CAUSE takes a second probe.
+        metrics_text, metrics_probe = _scrape_metrics(base_url, timeout)
+        if not metrics_probe.ok:
+            metrics_error = (
+                f"scrape of {base_url}/metrics failed: "
+                f"{metrics_probe.error or metrics_probe.status}"
+            )
+    elif metrics_probe is None:
+        # Injected text (tests / a caller that already scraped): a non-empty
+        # body is the evidence that the scrape worked.
+        metrics_probe = server_state.Probe(
+            ok=bool(metrics_text), path="/metrics",
+            status=200 if metrics_text else None,
+            error=None if metrics_text else "empty injected metrics text")
 
     cur = _parse_counters(metrics_text)
     prev_counters = (prev_state or {}).get("counters")
@@ -772,6 +807,32 @@ def snapshot(
 
     rates = _rates(prev_counters, cur, t_prev, t_cur)
     hit_rates = _cache_hit_rates(prev_counters, cur)
+
+    # --- rolling medians over PROCESSING windows only --------------------
+    # Idle polls contribute nothing (see rate_medians' module docstring): a
+    # median that counted the idle zeros would itself be zero and the badge
+    # would carry no information.
+    samples = rate_medians.processing_samples(rates, prev_counters, cur, hit_rates)
+    windows = rate_medians.update_windows(
+        (prev_state or {}).get("rate_windows"), samples)
+    medians = rate_medians.medians(windows)
+
+    # --- four-state server diagnosis -------------------------------------
+    # The metrics scrape alone cannot tell a dead server from a live one
+    # without --enable-metrics. Only when the scrape FAILED is a second,
+    # metrics-independent API probe spent to separate the two.
+    host, port = _host_port(base_url)
+    srv_state = server_state.resolve(
+        base_url,
+        metrics=metrics_probe,
+        timeout=min(timeout, 2.0),
+        opener=probe_opener,
+        managed_state=managed_state,
+        managed_detail=managed_detail,
+        host=host,
+        port=port,
+        tcp_probe=tcp_probe,
+    )
 
     # --- NVML per-card telemetry ----------------------------------------
     try:
@@ -791,9 +852,16 @@ def snapshot(
         "t": t_cur,
         "endpoint": base_url,
         "rates": rates,                 # None on first sample
+        "rate_medians": medians,         # per key; missing key = empty window
+        "server_state": srv_state.to_json(),
         "cache_hit_rates": hit_rates,   # per-tier, None on first sample
         "spec": cur["spec"],            # None if spec metrics absent
         "hicache": cur["hicache"],      # None if no hierarchical cache
+        # One row per spill/offload tier (type x place), absent rows included
+        # on purpose -- see tier_occupancy.py.
+        "spill_tiers": tier_occupancy.tier_view(
+            metrics_text, hicache=cur["hicache"],
+            metrics_available=bool(metrics_probe and metrics_probe.ok)),
         "gen_throughput_server": cur["gen_throughput"],
         "num_running_reqs": cur["num_running_reqs"],
         "num_queue_reqs": cur["num_queue_reqs"],
@@ -810,5 +878,18 @@ def snapshot(
         "server_info": server_info,       # /get_server_info + /get_model_info, or None
     }
 
-    new_state = {"t": t_cur, "counters": cur}
+    new_state = {"t": t_cur, "counters": cur, "rate_windows": windows}
     return snap, new_state
+
+
+def _host_port(base_url: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
+    """(host, port) of a base URL, for the TCP boot-evidence probe."""
+    if not base_url:
+        return None, None
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(base_url)
+        return parts.hostname, (parts.port if parts.port else None)
+    except Exception:
+        return None, None

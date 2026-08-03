@@ -3103,12 +3103,17 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
         with _LANDING_STATE_LOCK:
             _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
             _LANDING_TARGET_KEY = None
+        # No target at all resolved: that is NOT_RUNNING with no probe spent,
+        # and it is stated as such rather than left for the page to infer.
+        from sglang.srt.planner import server_state as _sstate
+
         return {
             "ok": True,
             "running": False,
             "snapshot": None,
             "target": None,
             "status": status,
+            "server_state": _sstate.resolve(None).to_json(),
         }
 
     target_info = {
@@ -3128,8 +3133,17 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             _LANDING_SNAPSHOT_STATE = None
             _LANDING_TARGET_KEY = key
         try:
+            # ``managed_state`` is the STARTING evidence for a boot this
+            # dashboard launched: it is known the moment the child is
+            # spawned, so the page says "starting" from that tick on instead
+            # of claiming anything about a server that is not answering yet.
             snap, new_state = live_metrics.snapshot(
-                target, prev_state=_LANDING_SNAPSHOT_STATE
+                target,
+                prev_state=_LANDING_SNAPSHOT_STATE,
+                managed_state=(status or {}).get("state") if kind == "managed" else None,
+                managed_detail=("this dashboard launched the process"
+                                + (f" (pid {(status or {}).get('pid')})"
+                                   if (status or {}).get("pid") else "") + "."),
             )
             _LANDING_SNAPSHOT_STATE = new_state
         except Exception as e:  # pragma: no cover - defensive
@@ -3147,6 +3161,9 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
         "snapshot": snap,
         "target": target_info,
         "status": status,
+        # Lifted out of the snapshot so a caller (curl, the loadbar poll) can
+        # read the four-state diagnosis without walking into the snapshot.
+        "server_state": snap.get("server_state"),
         # LIVE CUDA-graph memory of the running server: managed boot-log
         # parse first (per-kind + per-ladder-rung itemization), then the
         # orchestrator's conventional /tmp log for detected servers, then
@@ -6229,6 +6246,31 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .mtile .mt-s { font-size: var(--t-xs); color: var(--fg-muted);
                  line-height: 1.4; min-height: 1.7em;
                  font-variant-numeric: tabular-nums; }
+  /* median-of-recent-PROCESSING badge next to a rate that reads 0 while idle.
+     Deliberately quieter than the headline: it is history, not a reading. */
+  .mtile .mt-med { font-size: var(--t-xs); font-weight: 400;
+                   color: var(--fg-muted); }
+  /* spill/offload tier rows: one row per tier (type x place). An ABSENT row
+     is drawn at the same weight as a measured one -- dimmed, never hidden,
+     because "this rig has no remote tier" is information. */
+  .tierrow { display: grid; grid-template-columns: 1fr auto; gap: var(--s1);
+             padding: var(--s1) 0; border-top: 1px solid var(--bd-weak); }
+  .tierrow:first-child { border-top: none; }
+  .tierrow .tr-l { font-size: var(--t-sm); color: var(--fg-strong); }
+  .tierrow .tr-v { font-size: var(--t-sm); text-align: right;
+                   font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tierrow .tr-s { grid-column: 1 / -1; font-size: var(--t-xs);
+                   color: var(--fg-muted); }
+  .tierrow.absent .tr-l { color: var(--fg-muted); }
+  .tierbar { grid-column: 1 / -1; height: 5px; border-radius: 3px;
+             background: var(--bg-input); overflow: hidden; }
+  .tierbar > i { display: block; height: 100%; background: var(--accent);
+                 border-radius: 3px; }
+  #landing_tiers .p { display: inline-block; border-radius: 9999px;
+                      padding: 0 7px; font-size: var(--t-xs);
+                      border: 1px solid var(--bd-medium); }
+  #landing_tiers .p.measured { color: var(--ok); border-color: var(--ok-dim); }
+  #landing_tiers .p.absent { color: var(--fg-disabled); }
   /* fixed-pixel sparkline: sized in JS as samples*px so ONE sample = ONE
      pixel bucket; never stretched by CSS (stretching would alias samples). */
   .mtile svg.spk { display: block; margin-top: var(--s1);
@@ -7470,6 +7512,16 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     <fieldset>
       <legend>per-card VRAM placement + live telemetry (RUNNING config, 60s)</legend>
       <div id="landing_placement" class="muted">computing&hellip;</div>
+    </fieldset>
+    <!-- Directly under the GPU picture, because it answers the question the
+         GPU picture raises: what did NOT fit on the cards, and where is it
+         now. One row per tier = type x place, from local VRAM through host
+         RAM and local disk out to the paired rig. Tiers with no live source
+         are DRAWN as absent with their reason; a tier that is not configured
+         on this rig is a visible absence, never a hidden row and never a 0. -->
+    <fieldset>
+      <legend>spill / offload tiers &mdash; where the bytes that left VRAM are</legend>
+      <div id="landing_tiers" class="muted">waiting for first snapshot&hellip;</div>
     </fieldset>
     <fieldset>
       <legend>energy &mdash; live GPU power state (per-card power CALIBRATION lives in the Energy tab)</legend>
@@ -10529,8 +10581,7 @@ function renderLanding(s, tgt){
   // Patched, not replaced: this block carries two <details> ("full launch
   // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
   // wholesale on every 2 s tick is what used to slam them shut.
-  setHTML($('landing_config'), renderStartConfig(s, tgt)
-    +(s.metrics_error?noMetricsBanner(s.metrics_error, s):''));
+  setHTML($('landing_config'), renderStartConfig(s, tgt)+serverStateBanner(s));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -10546,6 +10597,74 @@ function renderLanding(s, tgt){
   renderLandingStrip(s);
 
   renderLandingPlacement(s);
+  renderLandingTiers(s);
+}
+// ===========================================================================
+// Spill / offload tier panel (#522, the #407 tier picture drawn from the
+// sources that exist today). Everything here is computed server-side
+// (tier_occupancy.py) so `curl /api/live_snapshot | jq .snapshot.spill_tiers`
+// is the same view -- the runbook's rule that no figure may exist only inside
+// the page.
+//
+// The two things this panel must never do: hide a tier that is not
+// configured, and print 0 for a tier whose occupancy is unknown. An absent
+// row is drawn, dimmed, with the reason it is absent.
+// ===========================================================================
+function fmtBytes(b){
+  if(b==null) return '&ndash;';
+  const u=['B','KiB','MiB','GiB','TiB']; let i=0, v=Number(b);
+  while(v>=1024&&i<u.length-1){ v/=1024; i++; }
+  return v.toFixed(v<10&&i>0?1:0)+' '+u[i];
+}
+function fmtTierAmount(r){
+  if(r.unit==='tokens')
+    return (r.used==null?'&ndash;':Number(r.used).toLocaleString())
+      +(r.total?(' / '+Number(r.total).toLocaleString()):'')+' <small>tok</small>';
+  return fmtBytes(r.used)+(r.total?(' / '+fmtBytes(r.total)):'');
+}
+function tierRowHtml(r){
+  const absent=r.provenance==='absent';
+  let h='<div class="tierrow'+(absent?' absent':'')+'" data-key="tier_'+esc(r.id)+'">'
+    +'<div class="tr-l"><span class="p '+esc(r.provenance)+'">'+esc(r.provenance)
+    +'</span> '+esc(r.label)
+    +' <span class="muted">&middot; '+esc(r.kind)+' &middot; '+esc(r.location)
+    +'</span></div>'
+    +'<div class="tr-v">'+(absent?'<span class="muted">no data</span>'
+                                 :fmtTierAmount(r))+'</div>';
+  if(!absent&&r.used_frac!=null)
+    h+='<div class="tierbar" title="'+esc(r.total_scope||'')+'">'
+      +'<i style="width:'+(r.used_frac*100).toFixed(1)+'%"></i></div>';
+  const note=absent?r.missing_reason
+    :((r.consumer?('held by '+r.consumer):'')
+      +(r.source?(' &middot; from '+r.source):'')
+      +(r.total_scope?(' &middot; total: '+r.total_scope):''));
+  if(note) h+='<div class="tr-s">'+esc(note)+'</div>';
+  return h+'</div>';
+}
+function renderLandingTiers(s){
+  const box=$('landing_tiers'); if(!box) return;
+  const t=s&&s.spill_tiers;
+  if(!t||!t.rows){ setHTML(box,'<span class="muted">no tier view in this '
+    +'snapshot</span>'); return; }
+  let h='';
+  for(const r of t.rows) h+=tierRowHtml(r);
+  // The host-RAM sum is drawn against total RAM, and it says WHICH rows it
+  // added: the HiCache row speaks tokens, and adding tokens to bytes is how a
+  // plausible wrong total gets made, so it is excluded and named as excluded.
+  const parts=[];
+  if(t.host_ram_used_bytes!=null)
+    parts.push('local host-RAM tiers hold <b>'+fmtBytes(t.host_ram_used_bytes)
+      +'</b>'+(t.host_ram_total_bytes?(' of '+fmtBytes(t.host_ram_total_bytes)
+        +' ('+esc(t.host_ram_total_scope||'')+')'):''));
+  else parts.push('no local host-RAM tier reported bytes');
+  if((t.host_ram_excluded_non_byte||[]).length)
+    parts.push('excluded from that sum (not byte-valued): '
+      +esc(t.host_ram_excluded_non_byte.join(', ')));
+  parts.push((t.measured_tiers||[]).length+' measured &middot; '
+    +(t.absent_tiers||[]).length+' absent');
+  h+='<div class="tr-s" style="margin-top:var(--s2)">'+parts.join(' &middot; ')
+    +'</div>';
+  setHTML(box,h);
 }
 // ===========================================================================
 // Landing TOP STRIP: full-width headline tiles + 60s freeze-at-zero activity
@@ -10563,6 +10682,21 @@ function stripTile(id,label,value,sub,sparkKey,tip){
     +(sparkKey?stripSpark(sparkKey)
       :'<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'"></svg>')
     +'</div>';
+}
+// Median badge for a rate tile: the median of the last N PROCESSING windows
+// (server-side, rate_medians.py -- the runbook's rule is that every figure the
+// page shows is computable with curl too, so the history is not a browser
+// ring). Idle polls never enter that window, which is the entire point: a
+// median that counted them would read 0 on an idle rig and mean nothing.
+// An EMPTY window renders no badge at all -- "nothing processed yet" is not a
+// zero, and a tile must not be able to be read as if it were.
+function medBadge(s,key,dgt,unit,scale){
+  const m=(s&&s.rate_medians)?s.rate_medians[key]:null;
+  if(!m||m.median==null) return '';
+  const v=Number(m.median)*(scale==null?1:scale);
+  return '<span class="mt-med" title="median of the last '+m.n
+    +' processing window'+(m.n===1?'':'s')+' (idle polls excluded; window '
+    +m.window+')"> (median '+v.toFixed(dgt==null?1:dgt)+(unit||'')+')</span>';
 }
 function stripFetchSaved(){  // throttled read of the #147 savings accumulator
   const now=Date.now();
@@ -10643,26 +10777,31 @@ function renderLandingStrip(s){
   }
   $('landing_strip').innerHTML=
     stripTile('strip_decode','decode tok/s',
-      noMetrics?STRIP_DASH:num(dec)+'<small> tok/s</small>',
+      noMetrics?STRIP_DASH
+        :num(dec)+'<small> tok/s</small>'+medBadge(s,'decode_tok_s'),
       sub(rates?('server gauge '+num(rates.gen_throughput_server)+' tok/s')
                :'(rates on next tick)'),
       'st_dec')
    +stripTile('strip_prefill','prefill tok/s (non-cached)',
-      noMetrics?STRIP_DASH:num(pfx)+'<small> tok/s</small>',
+      noMetrics?STRIP_DASH
+        :num(pfx)+'<small> tok/s</small>'+medBadge(s,'prefill_tok_s'),
       sub(rates?('gross incl. cache-served: '+num(rates.prefill_tok_s_gross)+' tok/s')
                :'(rates on next tick)'),
       'st_pfx',
       'REAL computed prefill only: cache-served tokens are subtracted. '
       +'The gross figure incl. cached tokens is the small line, never the headline.')
    +stripTile('strip_spec','MTP accept',
-      (noMetrics||!spec)?STRIP_DASH:((spec.accept_rate||0)*100).toFixed(1)+'<small>%</small>',
+      (noMetrics||!spec)?STRIP_DASH
+        :((spec.accept_rate||0)*100).toFixed(1)+'<small>%</small>'
+         +medBadge(s,'spec_accept_rate',1,'%',100),
       sub(spec?('adaptive-k <b>'+(spec.adaptive_k!=null?spec.adaptive_k:'--')
         +'</b> &middot; ema accept-len '
         +(spec.ema_accept_len!=null?Number(spec.ema_accept_len).toFixed(2):'--'))
         :'spec decode off / no data'),
       'st_acc')
    +stripTile('strip_cache','cache hit per tier',
-      noMetrics?STRIP_DASH:hitBig, sub(tierTxt), 'st_hit',
+      noMetrics?STRIP_DASH:hitBig+medBadge(s,'cache_hit_overall',0,'%',100),
+      sub(tierTxt), 'st_hit',
       'Per-tier hit rate over the last prompt window: device = VRAM hot tier, '
       +'host = system RAM, storage = disk. Headline = overall across tiers.')
    +stripTile('strip_energy','energy / token &mdash; DECODE',
@@ -11536,19 +11675,40 @@ function targetLabel(s){
   return esc(String(name))+(port?(' @ :'+esc(String(port))):'')
         +(pid?(' &middot; pid '+esc(String(pid))):'');
 }
-function noMetricsBanner(err, s){
-  return '<div class="verdict offload" style="font-size:var(--t-sm);'
-    +'font-weight:400;margin:var(--s2) 0 0">'
-    +'<b>Server started without --enable-metrics</b>'
-    +(s?(' &mdash; <b>'+targetLabel(s)+'</b>'):'')
-    +' &mdash; live rates (decode / prefill tok/s, per-request throughput, '
-    +'MTP acceptance, cache hit) are not available from this server. Per-card '
-    +'VRAM, power and utilisation come from NVML and keep working. Restart '
-    +'the server with <code>--enable-metrics</code>; a server booted from '
-    +'this dashboard always has it.'
-    +(err?'<div class="muted" style="margin-top:var(--s1)">'+esc(err)+'</div>':'')
-    +'</div>';
+// FOUR states, one banner, and each state says only what its own evidence
+// supports (server_state.py). The bug this replaces: a failed /metrics scrape
+// was rendered as "started without --enable-metrics" no matter WHY it failed,
+// so a connection-refused (dead server) printed a claim about a launch flag
+// that nothing had observed. State 3 below is now reachable only after the
+// API probe answered.
+function serverStateBanner(s){
+  const ss=(s&&s.server_state)||null;
+  if(!ss) return '';
+  if(ss.state==='running_with_metrics') return '';
+  const box=(ss.state==='running_no_metrics')
+    ? 'class="verdict offload" style="font-size:var(--t-sm);font-weight:400;'
+      +'margin:var(--s2) 0 0"'
+    : 'class="muted" style="margin:var(--s2) 0 0"';
+  let h='<div '+box+'><b>'+esc(ss.headline)+'</b>'
+    +((s&&ss.running)?(' &mdash; <b>'+targetLabel(s)+'</b>'):'')
+    +' &mdash; '+esc(ss.detail);
+  // The probes ARE the evidence; showing them is what makes the state
+  // checkable instead of merely asserted.
+  const pr=[];
+  if(ss.api) pr.push('API '+esc(ss.api.path||'-')+': '
+    +(ss.api.attempted===false?('skipped ('+esc(ss.api.reason||'')+')')
+      :(ss.api.ok?'ok':esc(ss.api.error||('HTTP '+ss.api.status)))));
+  if(ss.metrics) pr.push('/metrics: '
+    +(ss.metrics.attempted===false?('skipped ('+esc(ss.metrics.reason||'')+')')
+      :(ss.metrics.ok?'ok':esc(ss.metrics.error||('HTTP '+ss.metrics.status)))));
+  if(ss.boot&&ss.boot.starting) pr.push('boot evidence: '+esc(ss.boot.source));
+  if(pr.length) h+='<div class="muted" style="margin-top:var(--s1)">'
+    +pr.join(' &middot; ')+'</div>';
+  return h+'</div>';
 }
+// Kept as the single call site for the metrics-less state so the page has one
+// banner function, not two that can drift apart.
+function noMetricsBanner(err, s){ return serverStateBanner(s); }
 function vramClass(frac){
   if(frac==null) return '';
   if(frac>=0.90) return ' over';
@@ -11594,14 +11754,31 @@ function liveTile(label, value, sub, spark){
     +'<div class="mt-s">'+(sub||'&nbsp;')+'</div>'
     +(spark?stripSpark(spark):'')+'</div>';
 }
-// Exactly three states, and the panel is in one of them after EVERY poll:
-//   1. no inference server running        -- neutral, not an error;
-//   2. a server that serves no /metrics   -- warning, names the target;
-//   3. a server with metrics              -- the live readings.
+// Exactly FOUR states, and the panel is in one of them after EVERY poll
+// (server_state.py is the machine; this only draws it):
+//   1. NOT_RUNNING           -- neutral, not an error, and says nothing about
+//                               flags a server that is not there was given;
+//   2. STARTING              -- a boot is KNOWN to be in progress (managed
+//                               launch, or the port accepts TCP while the API
+//                               does not answer yet), shown from that tick on;
+//   3. RUNNING_NO_METRICS    -- the API answered and /metrics did not; only
+//                               here is "--enable-metrics is missing" evidence;
+//   4. RUNNING_WITH_METRICS  -- the live readings.
 // The banner is a function of the current tick, never something set once.
 function renderLivePanel(s, envelope){
   const note=$('live_note'), strip=$('live_strip'), cards=$('live_cards');
   if(!note) return;
+  // States 1 and 2: a target may well have resolved and NVML may well be
+  // readable, but there is no server behind it. Draw the state, not the
+  // readings -- and never the metrics diagnosis.
+  const ss0=(s&&s.server_state)||(envelope&&envelope.server_state)||null;
+  if(ss0 && !ss0.running){
+    note.style.display=''; strip.style.display='none';
+    $('live_legend').style.display='none';
+    setHTML(cards,'');
+    setHTML(note, serverStateBanner(s||{server_state:ss0}));
+    return;
+  }
   if(!s||!s.ok||!s.gpus){
     note.style.display=''; strip.style.display='none';
     $('live_legend').style.display='none';
@@ -11648,16 +11825,18 @@ function renderLivePanel(s, envelope){
   const n1=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(1));
   const n2=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(2));
   note.style.display=noMetrics?'':'none';
-  if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error, s));
+  if(noMetrics) setHTML(note, serverStateBanner(s));
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
     liveTile('decode per request',
-      n1(decPer)+'<small> tok/s</small>',
+      n1(decPer)+'<small> tok/s</small>'
+      +(noMetrics?'':medBadge(s,'decode_tok_s_per_request')),
       'server total '+n1(dec)+' tok/s &middot; '
       +(running==null?'parallel requests n/a':running+' running')
       +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
    +liveTile('prefill per request',
-      n1(pfxPer)+'<small> tok/s</small>',
+      n1(pfxPer)+'<small> tok/s</small>'
+      +(noMetrics?'':medBadge(s,'prefill_tok_s_per_request')),
       'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
    +liveTile('tokens per watt (total)',
       n2(tpwTotal)+'<small> tok/W</small>',

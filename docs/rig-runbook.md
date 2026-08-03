@@ -3500,6 +3500,65 @@ The dashboard listens on `127.0.0.1:8780` by default
 theirs** — read from it freely, but start your own on another port
 (`--serve --port 8791`) before you POST anything that measures.
 
+### 8.0 The Monitor tab from the shell: state, medians, tiers (#522)
+
+Three blocks the landing poll now returns, all computed server-side so the
+shell client sees exactly what the page draws.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# 1. WHICH of the four states the monitored server is in, with the evidence.
+#    The discriminator between "not running" and "running without
+#    --enable-metrics" is the API probe, never the metrics scrape alone -- a
+#    connection-refused scrape used to be rendered as a launch-flag diagnosis.
+curl -s "$UI/api/live_snapshot" | python3 -c 'import json,sys
+d=json.load(sys.stdin); s=d.get("server_state") or {}
+print(s.get("state"), "|", s.get("headline"))
+print("  api    :", s.get("api"))
+print("  metrics:", s.get("metrics"))
+print("  boot   :", s.get("boot"))'
+# state is one of: not_running | starting | running_no_metrics |
+#                  running_with_metrics
+# running_no_metrics is only ever reported with api.ok == true. If you see it
+# with a failed API probe, that is a bug, not a server without the flag.
+
+# 2. The medians behind the rate tiles. n counts PROCESSING windows only --
+#    idle polls never enter the window, so an idle server still reports the
+#    median of what it did while it was working. Needs at least two polls.
+for i in 1 2 3; do curl -s "$UI/api/live_snapshot" > /tmp/ls.json; sleep 2; done
+python3 -c 'import json
+d=json.load(open("/tmp/ls.json"))["snapshot"]
+for k,v in sorted((d.get("rate_medians") or {}).items()):
+    print(k.ljust(28), round(v["median"],2), "over", v["n"], "of", v["window"])'
+
+# 3. The spill/offload tiers, one row per type x place. Absent rows are
+#    PRINTED with their reason: a tier that is not configured on this rig is a
+#    visible absence, not a hidden row and not a zero.
+python3 -c 'import json
+t=json.load(open("/tmp/ls.json"))["snapshot"]["spill_tiers"]
+for r in t["rows"]:
+    val = "-" if r["used"] is None else f"{r[\"used\"]:,.0f} {r[\"unit\"]}"
+    print(r["provenance"].ljust(9), r["id"].ljust(26), r["kind"].ljust(9),
+          r["location"].ljust(7), val, "|", (r["missing_reason"] or r["source"])[:60])
+print("host-RAM tiers:", t["host_ram_used_bytes"], "of", t["host_ram_total_bytes"],
+      "(", t["host_ram_total_scope"], ")")'
+```
+
+Two things the tier view will NOT tell you, by construction rather than by
+omission: the #407 `memtier` registry is not its data source (that registry has
+no production consumer, so reading it would yield zeros that look measured),
+and the #286 short-term register has no reachable byte ledger in this build.
+Both appear as absent rows naming that reason. `MemTotal` is read from the
+DASHBOARD host's `/proc/meminfo` and the row says so -- when the monitored
+server is on another host, that denominator is the wrong one and the label is
+how you notice.
+
+Restarting the dashboard after a merge that touches these: it serves from one
+process (`python -m sglang.planner --serve`), so the change is live only after
+that process is restarted. Do it as the merge step, not mid-session -- a
+dashboard someone else started is theirs (§8).
+
 ### 8.1 The limiting factors, one at a time
 
 `POST /api/bench_factors` reads every factor's own study and answers with its
