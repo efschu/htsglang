@@ -182,6 +182,13 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+# #525: the s12 parser test family needs the real run's points fixture
+# checked in (test_s12_log_analyse.py::TestBefund /
+# ::TestHarnessLuecke::test_the_run_recorded_no_accept_at_all) -- the blanket
+# rule above silently ate it (git add reported nothing, working tree stayed
+# "clean") and the family fell back to the "no window basis" path with wrong
+# numbers instead of failing to load.
+!test/registered/unit/distributed/fixtures/gpu_battery/s12_wait_analyse/punkte.jsonl
 tmp*.txt
 /tmp/
 
