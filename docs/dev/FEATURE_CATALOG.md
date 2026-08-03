@@ -1185,6 +1185,17 @@ resolution. #496 discharged the backlog this rule was written for -- the
 dual-group lane (#274) and the kv-session-offload spill had both landed
 mutation sites without an entry.
 
+**MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
+how fast it does it, or which claim about it still holds also UPDATES the
+matching head section of `STATUS.md` in the private dev-log repo
+(`efschu/htsglang-dev-log`) and APPENDS a log paragraph -- two distinct
+actions, not one. The head is maintained state and is corrected in place, so a
+claim it supersedes is deleted rather than softened; the log is append-only and
+is never rewritten. Every head claim carries an evidence anchor (catalog
+section, task number, merge hash or RESULTS path), and a conditional claim
+there is a pointer to its predicate under the same MECHANISM REACH rule this
+file follows.
+
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
 qwen3_coder` (server-side fix, no template patches); fast lane, priority
