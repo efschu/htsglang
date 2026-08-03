@@ -105,3 +105,70 @@ class TestRatesActuallyComputeFromStoredBaseline(_BaselineTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestServerInfoIsCachedNotRefetchedPerPoll(unittest.TestCase):
+    """#533 part 2: the landing page aborts its own poll at LAND_POLL_MS-200
+    (1800 ms). ``/get_server_info`` is served by the same app as ``/v1`` and
+    awaits the scheduler, so it inherits inference back-pressure: measured
+    2.97 s idle-ish and 10-35 s under a 46k-token prefill, while ``/metrics``
+    on the SAME process stayed at 14 ms. Fetched per poll it blew the deadline
+    every tick -- every /api/live_snapshot came back ERR_ABORTED and the page
+    never left its placeholder. The data is boot-constant, so it is cached.
+    """
+
+    def setUp(self):
+        from sglang.srt.planner import live_metrics
+
+        self.lm = live_metrics
+        live_metrics._SERVER_INFO_CACHE.clear()
+        self.addCleanup(live_metrics._SERVER_INFO_CACHE.clear)
+
+    def test_second_call_does_not_hit_the_network(self):
+        calls = []
+
+        def fake_get(url, timeout):
+            calls.append(url)
+            return {"ok": True}
+
+        orig = self.lm._http_get_json
+        self.lm._http_get_json = fake_get
+        self.addCleanup(lambda: setattr(self.lm, "_http_get_json", orig))
+
+        first = self.lm._fetch_server_info("http://x:1", 10.0)
+        n_after_first = len(calls)
+        second = self.lm._fetch_server_info("http://x:1", 10.0)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), n_after_first,
+                         "second call re-fetched: the cache is not binding")
+
+    def test_fetch_budget_is_capped_below_the_page_deadline(self):
+        """The caller's timeout must not be able to exceed the cap -- that is
+        the parameter that actually binds (a cap that never binds is reach 0).
+        """
+        seen = []
+
+        def fake_get(url, timeout):
+            seen.append(timeout)
+            return {"ok": True}
+
+        orig = self.lm._http_get_json
+        self.lm._http_get_json = fake_get
+        self.addCleanup(lambda: setattr(self.lm, "_http_get_json", orig))
+
+        self.lm._fetch_server_info("http://y:1", 30.0)
+        self.assertTrue(seen, "no fetch happened")
+        self.assertLessEqual(max(seen), self.lm._SERVER_INFO_TIMEOUT_S)
+        self.assertLess(max(seen), 1.8, "budget must stay under the 1800 ms "
+                                        "client abort deadline")
+
+    def test_a_failing_refresh_keeps_the_last_known_config(self):
+        orig = self.lm._http_get_json
+        self.lm._http_get_json = lambda url, timeout: {"ok": True}
+        self.addCleanup(lambda: setattr(self.lm, "_http_get_json", orig))
+        good = self.lm._fetch_server_info("http://z:1", 10.0)
+        self.assertIsNotNone(good)
+        # Expire the entry, then make the server unreachable.
+        self.lm._SERVER_INFO_CACHE["http://z:1"] = (0.0, good)
+        self.lm._http_get_json = lambda url, timeout: None
+        self.assertEqual(self.lm._fetch_server_info("http://z:1", 10.0), good)

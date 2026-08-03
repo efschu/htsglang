@@ -692,19 +692,64 @@ def _http_get_json(url: str, timeout: float) -> Optional[dict]:
         return None
 
 
+#: Cached START config per base_url: {base_url: (fetched_at, info)}. See
+#: _fetch_server_info for why this is a cache and not a per-poll fetch.
+_SERVER_INFO_CACHE: Dict[str, Tuple[float, Optional[dict]]] = {}
+
+#: How long a cached start config is reused. This is BOOT-CONSTANT data --
+#: the flags a running server started with do not change while it runs -- so
+#: the TTL only bounds how quickly the panel notices a RESTART on the same
+#: URL, not how fresh the live numbers are (those come from /metrics, which is
+#: scraped every poll).
+_SERVER_INFO_TTL_S = 60.0
+
+#: Hard ceiling for the start-config fetch, independent of the caller's
+#: timeout. The landing page aborts its own poll at LAND_POLL_MS-200 = 1800 ms,
+#: so anything this call spends beyond that budget cannot help the page -- it
+#: can only make the whole snapshot miss the deadline.
+_SERVER_INFO_TIMEOUT_S = 1.0
+
+
 def _fetch_server_info(base_url: str, timeout: float) -> Optional[dict]:
     """Fall back to the server's own view of its start config when no managed
     LaunchSettings is available (e.g. a URL the user typed for an external
     server). Merges /get_server_info + /get_model_info; None if neither answers.
+
+    CACHED, and that is load-bearing (#533). ``/get_server_info`` is served by
+    the same HTTP app as ``/v1`` and awaits the scheduler's internal state, so
+    it inherits inference back-pressure: measured 2.97 s on an idle-ish server
+    and 10-35 s under a 46k-token prefill, while ``/metrics`` on the SAME
+    process stayed at 14 ms. Fetching it on every poll therefore blew the
+    landing page's own 1800 ms abort deadline on EVERY tick -- every
+    ``/api/live_snapshot`` came back ERR_ABORTED and the page never left its
+    "reading the running server..." placeholder while all backend calls were
+    individually fine. The data is boot-constant, so re-reading it 30x a minute
+    bought nothing and cost the entire panel.
     """
+    now = time.time()
+    hit = _SERVER_INFO_CACHE.get(base_url)
+    if hit is not None and (now - hit[0]) < _SERVER_INFO_TTL_S:
+        return hit[1]
+
+    budget = min(timeout, _SERVER_INFO_TIMEOUT_S)
     info: Dict[str, Any] = {}
-    si = _http_get_json(base_url.rstrip("/") + "/get_server_info", timeout)
+    si = _http_get_json(base_url.rstrip("/") + "/get_server_info", budget)
     if si:
         info["server_info"] = si
-    mi = _http_get_json(base_url.rstrip("/") + "/get_model_info", timeout)
+    mi = _http_get_json(base_url.rstrip("/") + "/get_model_info", budget)
     if mi:
         info["model_info"] = mi
-    return info or None
+    result = info or None
+    if result is None and hit is not None:
+        # A loaded server that timed out this tick: keep serving the last known
+        # start config rather than blanking the panel's config section. Do not
+        # refresh the timestamp -- the next poll retries.
+        return hit[1]
+    _SERVER_INFO_CACHE[base_url] = (now, result)
+    if len(_SERVER_INFO_CACHE) > 16:
+        oldest = min(_SERVER_INFO_CACHE, key=lambda k: _SERVER_INFO_CACHE[k][0])
+        _SERVER_INFO_CACHE.pop(oldest, None)
+    return result
 
 
 def _fetch_metrics_text(base_url: str, timeout: float) -> str:
