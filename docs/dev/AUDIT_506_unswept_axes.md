@@ -52,6 +52,7 @@ happens (CUDA / Triton / Python).
 | A1-7 | `sgl-kernel/csrc/elementwise/copy.cu:49` | `int N = static_cast<int>(input.numel())` | `TORCH_CHECK`ed to N in {32,64,72} | Pin (non-issue) |
 | A1-8 | `python/sglang/srt/mem_cache/unified_memory_pool.py:1110`, `python/sglang/srt/mem_cache/multi_ended_allocator.py:2233` | `(swa_phys_pages * ps + offsets).to(torch.int32)` | product is a token slot id, bounded by pool size in tokens (<= ~1e7 here) | Pin |
 | A1-9 | `python/sglang/srt/mem_cache/unified_memory_pool.py:216` | `self._raw = torch.empty(total_bytes, dtype=torch.uint8)` — one flat multi-GiB buffer | numel > 2^31 for any pool > 2 GiB, but every consumer indexes through torch views (int64 strides) | Pin — becomes live the moment a custom kernel takes `_raw` and an `int` offset |
+| A1-10 | `python/sglang/srt/layers/attention/dsv4/unified_kv_kernels/paged_decode.py:274,287,440` | `slot[:, None] * kv_stride_n` — `slot` is int32 (`kv_indices` is int32, `:20/:193`), `kv_stride_n` is `unified_kv.stride(0)` (`:743`), so the product is a Triton i32 multiply with no `.to(tl.int64)` anywhere in the directory | `stride(0)` = DSV4 head_dim 512; overflow at slot >= 2^31/512 = **4 194 304 rows in ONE layer's pool** | Pin — see 1.4b for the threshold in GiB |
 
 ### 1.2 A1-1 in detail (the one with a number that actually crosses)
 
@@ -128,6 +129,46 @@ tensor above 2.1e9 elements (about 300k tokens at hidden 7168), far above the
 `--max-num-batched-tokens` values this rig runs, hence Pin — but the fix is a
 one-token change and removes a latent divergence between the two files.
 
+### 1.4b A1-10 in detail (the one that looked like the biggest find and is not)
+
+`paged_decode.py:272-278` gathers KV with
+
+```
+unified_kv_ptr + slot[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d
+```
+
+`slot` comes from `tl.load(kv_indices_ptr + ...)` and `kv_indices` is
+documented and passed as **int32** (`:20`, `:193`, `:736`); `kv_stride_n` is
+`unified_kv.stride(0)` (`:743`), a small Python int that Triton specializes to
+`i32`. Triton does not promote on multiplication, so the product is an i32
+multiply that wraps to a negative offset past its ceiling — the classic paged
+attention overflow shape. Nothing in
+`python/sglang/srt/layers/attention/dsv4/unified_kv_kernels/` casts to
+`tl.int64` (checked across the whole directory); the same expression is at
+`:287` (scales) and `:440` (the second kernel in that file), and the prefill
+twin repeats it with `tl.constexpr` strides at
+`unified_kv_kernels/paged_prefill.py:135,173` (`pkv_stride_n` / `ekv_stride_n`,
+declared at `:79`/`:81`) — a constexpr operand does not widen the result.
+
+It does not currently bind, and the reason is the layout, not luck.
+`unified_kv` is **per layer**:
+`unified_kv[L]: [swa_pages + padded_compress_rows, head_dim]`
+(`python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py:389-393`, accessor
+`get_unified_kv(local_layer_id)` at `:445`), with
+`head_dim = qk_nope_head_dim + qk_rope_head_dim` (`:415`) = 448 + 64 = 512 for
+DSV4-Flash, and 576 bytes per row (FP8 nope + BF16 rope, `:101`, `:114`).
+
+Threshold: 2^31 / 512 = **4 194 304 rows in a single layer's pool**, i.e.
+4 194 304 x 576 B = **2.25 GiB of KV for ONE layer**, which at 43 layers means
+about **97 GiB of KV on one rank**. That is out of reach on any single rank
+this fork targets, so Pin.
+
+What re-opens it, explicitly: a model with few layers and a large per-layer
+pool, a unified pool that stops being per-layer, or a head_dim large enough
+to pull the row threshold down (the threshold scales as 1/head_dim, so it is
+`2^31 / head_dim` rows regardless of model). The fix, if it is ever wanted, is
+one `.to(tl.int64)` on `slot` — the same shape upstream applies elsewhere.
+
 ### 1.4 What Axis 1 did NOT cover (honest coverage)
 
 - `sgl-kernel/csrc` was swept for **byte-pointer arithmetic** (`(char*)p + x`
@@ -138,10 +179,15 @@ one-token change and removes a latent divergence between the two files.
   gguf (moe, moe_vec, mmvq, mmq, dequantize, gguf_kernel), kvcacheio,
   elementwise/copy, elementwise/pos_enc, gemm/per_token_group_quant (v1+v2),
   moe/moe_align_kernel, barlink BAR1 inline CUDA.
-- Triton: `layers/dcp/kernels.py` read in full; `layers/attention/dsv4/*`
-  read for offset dtype (the heavy indexer math is chunked torch, not a
-  custom flat-offset kernel — `indexer.py:237,552,585,826,1081` are id
-  tensors bounded by page/topk counts). The ~40 other Triton files with
+- Triton: `layers/dcp/kernels.py` read in full;
+  `layers/attention/dsv4/unified_kv_kernels/paged_decode.py` read in full
+  (A1-10) and the directory swept for `tl.int64` (no hits);
+  `layers/attention/dsv4/indexer.py` read for offset dtype (the heavy indexer
+  math is chunked torch, not a custom flat-offset kernel —
+  `indexer.py:237,552,585,826,1081` are id tensors bounded by page/topk
+  counts). `paged_prefill.py` was NOT read in
+  full; only its `slot * stride` sites (`:79,81,135,173`) were matched and
+  they share A1-10's threshold. The ~40 other Triton files with
   `tl.arange`/`tl.int32` hits (fla/, mamba/, moe/ep_moe, quantization/*) were
   **not** read line-by-line.
 - Python: `torch.int32` sites in `mem_cache/`, `managers/kv_session_offload.py`,
