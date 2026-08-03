@@ -145,6 +145,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--silero-model", type=Path, default=None)
     parser.add_argument("--hangover-ms", type=int, default=550)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--enable-metrics", action="store_true",
+        help="serve Prometheus metrics on /metrics: per-stage turn latencies "
+             "(ASR, MT, tts_wait), plus the live queue depths and talker "
+             "state. Carried by every boot in this repo -- a server without "
+             "it cannot say WHERE a slow turn was slow",
+    )
     return parser
 
 
@@ -180,6 +187,13 @@ def require_websocket_library() -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     websocket_library = require_websocket_library()
+    if args.enable_metrics:
+        # Before the service is built: the depth gauges register at app build
+        # time, and a flag flipped after that would leave a /metrics endpoint
+        # that answers without them.
+        from sglang.srt.translator import metrics as _metrics
+
+        _metrics.enable()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

@@ -67,6 +67,7 @@ from sglang.srt.translator.languages import (
     LanguageMatrix,
     RoutingTable,
 )
+from sglang.srt.translator import metrics
 from sglang.srt.translator.mt import SentenceAccumulator
 from sglang.srt.translator.name_hints import (
     EXTRACTION_PROMPT,
@@ -1341,6 +1342,11 @@ class TranslatorSession:
                 "timings": watch.to_json(),
             },
         )
+        # Same numbers the client gets, folded into the serving aggregates.
+        # Recorded here rather than in the connection layer so a turn driven
+        # by any path (drain, replay harness, test) is counted once and only
+        # once -- at the single place a turn is declared done.
+        metrics.record_turn(watch.to_json())
         return TurnResult(
             turn_id=turn_id,
             speaker_id=speaker_id,

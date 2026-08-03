@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from sglang.srt.translator.audio import (
     PIPELINE_SAMPLE_RATE,
@@ -59,6 +59,7 @@ from sglang.srt.translator.audio import (
 )
 from sglang.srt.translator.backends import AudioChunk
 from sglang.srt.translator.config import TranslatorConfig
+from sglang.srt.translator import metrics
 from sglang.srt.translator.languages import (
     ConversationLanguages,
     LanguageError,
@@ -779,6 +780,52 @@ def build_app(service: TranslatorService) -> FastAPI:
     )
     app.state.service = service
 
+    # Live depths, read from the objects that own them at scrape time. These
+    # are the three the §17.8.10 backlog could not be localised without: a
+    # queue that grows while the talker is busy is contention, a queue that
+    # grows while it is NOT busy is the pipeline, and neither shows up in the
+    # stage timings of turns that already finished.
+    def _sessions_open() -> float:
+        return float(len(service.sessions.ids()))
+
+    def _queue_depth_max() -> float:
+        depths = []
+        for sid in service.sessions.ids():
+            session = service.sessions.get(sid)
+            if session is not None:
+                depths.append(session.pending())
+        return float(max(depths)) if depths else 0.0
+
+    def _talker_busy() -> float:
+        return 1.0 if getattr(service.stack.tts, "busy", False) else 0.0
+
+    def _journal_depth_max() -> float:
+        depths = []
+        for sid in service.sessions.ids():
+            session = service.sessions.get(sid)
+            if session is not None:
+                depths.append(session.journal.next_seq)
+        return float(max(depths)) if depths else 0.0
+
+    metrics.register_depths(
+        "translator_sessions_open", "Open conversations.", _sessions_open
+    )
+    metrics.register_depths(
+        "translator_session_queue_depth_max",
+        "Deepest per-session queue of segments waiting for the pipeline.",
+        _queue_depth_max,
+    )
+    metrics.register_depths(
+        "translator_talker_busy",
+        "1 while the single synthesizer lock is held.",
+        _talker_busy,
+    )
+    metrics.register_depths(
+        "translator_journal_seq_max",
+        "Highest journal sequence across sessions.",
+        _journal_depth_max,
+    )
+
     @app.get("/api/translator/languages")
     async def languages() -> JSONResponse:
         return JSONResponse(service.languages())
@@ -786,6 +833,21 @@ def build_app(service: TranslatorService) -> FastAPI:
     @app.get("/api/translator/health")
     async def health() -> JSONResponse:
         return JSONResponse(service.health())
+
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        # 404 rather than an empty page when disabled: a scrape that succeeds
+        # with no series looks like a healthy idle server, which is the one
+        # answer that must not be given by a server that is not measuring.
+        if not metrics.enabled():
+            raise HTTPException(
+                status_code=404,
+                detail="metrics are disabled; boot with --enable-metrics",
+            )
+        return Response(
+            content=metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/api/translator/sessions")
     async def list_sessions() -> JSONResponse:
