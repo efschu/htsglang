@@ -117,6 +117,31 @@ cmd_add_file() {
   echo "backed up $name"
 }
 
+cmd_add_dir() {
+  local path="$1" license="$2" source="$3"
+  [ -d "$path" ] || die "no such directory: $path"
+  local name dest sum
+  name="$(basename "$path")"
+  dest="$WORK/source/$name"
+  mkdir -p "$WORK/source"
+  rm -rf "$dest"
+  cp -r "$path" "$dest"
+  # One hash over the whole tree, computed from the per-file hashes in a
+  # stable order, so a restore can be verified as a UNIT rather than file by
+  # file. Sorting matters: find's order is filesystem-dependent and would
+  # otherwise make the digest irreproducible.
+  sum="$(cd "$dest" && find . -type f -print0 | LC_ALL=C sort -z \
+        | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+  local count
+  count="$(find "$dest" -type f | wc -l)"
+  printf '| `%s/` | source tree (%s files) | `source/%s/` | `%s` (tree) | %s | %s |\n' \
+    "$name" "$count" "$name" "$sum" "$license" "$source" >> "$WORK/MANIFEST.md"
+  git -C "$WORK" add -A
+  git -C "$WORK" commit -m "Add source tree ${name} (${count} files, ${license})" 2>&1 | redact
+  git -C "$WORK" push 2>&1 | redact
+  echo "backed up ${name}/ (${count} files, tree sha256 ${sum})"
+}
+
 cmd_add_asset() {
   local path="$1" tag="$2" license="$3" source="$4"
   [ -f "$path" ] || die "no such file: $path"
@@ -181,6 +206,7 @@ cmd_add_asset() {
 case "${1:-}" in
   init)      cmd_init ;;
   add-file)  shift; [ $# -eq 3 ] || die "add-file <path> <license> <source-url>"; cmd_add_file "$@" ;;
+  add-dir)   shift; [ $# -eq 3 ] || die "add-dir <path> <license> <source-url>"; cmd_add_dir "$@" ;;
   add-asset) shift; [ $# -eq 4 ] || die "add-asset <path> <tag> <license> <source-url>"; cmd_add_asset "$@" ;;
-  *) die "usage: $0 {init|add-file|add-asset}" ;;
+  *) die "usage: $0 {init|add-dir|add-file|add-asset}" ;;
 esac
