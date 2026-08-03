@@ -12,7 +12,7 @@ four can-fail arms). What only a boot can show is in this directory.
 | `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` (slice 3: the compute assignment moves — CONFIRMED 1.4307x work-matched on the transfer term, green corridor, 2026-08-03), `ARM=compute-cal` (the calibrated variant, FALSIFIED on its end-to-end and mechanism legs) |
 | `run_arm.sh` | drives ONE arm end to end: boot, bounded readiness loop, facts, bench generations, a pre-teardown `read_arm.py` liveness check, teardown with a VRAM check, and then the quotable post-teardown `read_arm.py` on the final work-matched revision (`read_final_<arm>.txt`) |
 | `corridor_sampler.sh` | per-card free VRAM at 1 Hz into a CSV for the whole serving window; the corridor is judged on the MINIMUM, and a post-boot snapshot overstates free by 250-330 MiB here |
-| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, the share that came from a peer's segment, and the arm's WORK POINT. Run it AFTER teardown — the value to quote is the final, work-matched revision, and the tool warns when the ranks disagree because that is a non-final one |
+| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, the share that came from a peer's segment, and the arm's WORK POINT. Run it AFTER teardown. `--against <other arm>` is the ONLY path to a cross-arm number (per-rank delta, group delta, transfer term, speedup) and it REFUSES by name — non-zero exit, no number printed — when the two arms did not do the same work: `non-final-revision`, `work-mismatch`, `missing-counter`, `rank-count-mismatch`, `link-count-mismatch` (#482 rule, enforced in #523) |
 | `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, what must be read out, and the confirmation-window spec |
 
 ## Run order
@@ -21,6 +21,9 @@ four can-fail arms). What only a boot can show is in this directory.
 bash scripts/dev/394_s2_proof/preflight.sh          # must print PREFLIGHT OK
 bash scripts/dev/394_s2_proof/run_arm.sh equal
 bash scripts/dev/394_s2_proof/run_arm.sh proportional
+# the window's number, and the only place it comes from:
+python3 scripts/dev/394_s2_proof/read_arm.py "$RUN" equal --against proportional \
+    --links <the preflight table's per-rank GB/s>
 ```
 
 `run_arm.sh` EXPORTS the arm, and `boot_ab.sh` refuses an unset one. Both are

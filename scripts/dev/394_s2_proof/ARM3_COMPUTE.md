@@ -305,10 +305,35 @@ This retro-corrects the night window as well. Re-read on the work-matched basis:
 The two windows agree to 0.4 % work-matched and the model's prediction sits
 between them.
 
-Operationally: run `read_arm.py` AFTER teardown, and read the `work=` line it
-prints. Two arms may be divided by each other only when their `tokens` /
-`forwards` / `activations` counters agree; the tool warns when a dump's own
-ranks disagree, which is how a non-final revision announces itself.
+Operationally: run `read_arm.py` AFTER teardown, and take every cross-arm number
+from `--against`:
+
+    python3 read_arm.py <run> equal --against compute --links 14.42,6.45,13.41
+
+**The rule is enforced there, not by the reader (#523).** Until #523 this file
+said "compare the two `work=` lines before dividing" and the tool printed them
+and stopped. That is the check both #439 windows skipped, and it is why 1.5028x
+and 1.496x were published. `--against` is now the ONLY path in this directory
+that produces a cross-arm number — per-rank H2D delta, group delta, transfer
+term, speedup — and it REFUSES with a named reason, a non-zero exit and no
+number at all when:
+
+| reason | what it caught |
+|---|---|
+| `non-final-revision` | the ranks of one arm disagree: a pre-teardown read, each rank on its own 45 s tick |
+| `work-mismatch` | the two arms are internally final but sit at different work points (default tolerance 0.5 %, below the window's own A-vs-A floor) |
+| `missing-counter` | a dump revision from before the work counters — the work point is unknown, so the ratio is unfalsifiable |
+| `rank-count-mismatch` | the arms are not the same group |
+| `link-count-mismatch` | the link vector does not cover every rank, so there is no clock |
+
+The single-arm readout is unchanged and still prints `work=`; what it can no
+longer do is be the input to a hand-computed ratio, because it never prints one.
+
+A note on the quoted figure: **1.4307x** is `199.3 / 139.3`, the two clock
+seconds as this file displays them to one decimal. From the full-precision
+`h2d_bytes` the same dumps give **1.4304x**, which is what the tool prints. The
+0.02 % between the two readings is a quoting artifact, 20x under this window's
+own 0.424 % A-vs-A floor; both are pinned in the #523 test so neither can drift.
 
 ## Corridor: BREACHED at the measured recipe, and the arithmetic that repairs it
 
@@ -369,9 +394,30 @@ The repaired column is a prediction and the green-corridor window measured it
 slightly differently: base extents came out **116 / 72 / 71** and installed
 extents **116 / 57 / 86** (conserved, 259 either way), against the 115/71/70 and
 115/56/85 predicted here. The vector `213,104,157` and the base plan
-`30407,18680,18680` are exactly as predicted. The off-by-one on the extents is
-not reconciled in this file — the measured values are the ones in
-`2026-08-03_439_green/RESULTS.md`, Gate 3.
+`30407,18680,18680` are exactly as predicted.
+
+**The off-by-one, reconciled (#523).** It is not a measurement difference and
+neither number is wrong: they are two readings of the same partition, and they
+differ by the **#82 zero padding expert**, exactly one slot per rank.
+
+    partition_units(256, [30407,18680,18680]) = 115, 71, 70   sum 256
+    partition_units(256, [213,104,157])       = 115, 56, 85   sum 256
+
+The predicted table above counts REAL experts, which is why it sums to
+`num_experts`. The LOGGED extent counts the pad slot as well: the residency
+correction builds its counts as `partition_units(...)[rank] + 1`
+(`expert_compute_placement.py:708-709`, and the reason is stated at :681-682 —
+foreign top-k ids remap onto that expert and it is resident on every rank), so
+Gate 3's table reads 116 / 72 / 71 and 116 / 57 / 86 and sums to 259 = 256 + 3.
+Nothing to do with a warmup discard or a teardown boundary; the extents are not
+a counter at all.
+
+Both readings are load-bearing and neither may be "corrected" into the other:
+drop the pad from the logged reading and the resident-mass arithmetic that
+consumes it loses a slot per rank; add it to the predicted reading and the
+extents stop summing to `num_experts`. Both are pinned in
+`test/registered/unit/layers/moe/test_work_matched_counters_523.py`
+(`TestTheExpertExtentOffByOne`), against the exact vectors of this window.
 
 Second-order effect to watch, not to correct in advance: the 3080s' share of the
 weight plan drops 0.27827 -> 0.27565 each, so ~0.5 pp of total weight mass moves
@@ -448,8 +494,9 @@ touch "$RUN/corridor_compute.csv.stop"
   a corridor breach into a different experiment.
 * The reserve is ONE value for the whole window, identical on both arms. A
   reserve that differs between arms is a second treatment.
-* Quote the FINAL, WORK-MATCHED dump revision: run `read_arm.py` AFTER teardown
-  and check the `work=` line before dividing two arms by each other. The old
+* Quote the FINAL, WORK-MATCHED dump revision: run `read_arm.py <run> A
+  --against B` AFTER teardown, which is the only path that produces a cross-arm
+  number and which refuses when the two arms did not do the same work. The old
   rule ("quote the pre-teardown numbers, never the post-SIGTERM revision") is
   WITHDRAWN — see "Which revision to read", where it is measured to inflate the
   ratio by ~5 %.
@@ -574,13 +621,19 @@ ARM=equal   bash scripts/dev/394_s2_proof/boot_ab.sh
 python3 scripts/dev/394_s2_proof/read_arm.py <run> equal
 ARM=compute bash scripts/dev/394_s2_proof/boot_ab.sh
 python3 scripts/dev/394_s2_proof/read_arm.py <run> compute
+# and the only place a cross-arm number comes from -- it refuses if the two
+# arms did not do the same work:
+python3 scripts/dev/394_s2_proof/read_arm.py <run> equal --against compute \
+    --links 14.42,6.45,13.41
 ```
 
 `run_arm.sh <arm>` does the whole sequence for one arm and is the driver to use;
 the lines above are what it runs. It reads the dump twice — a pre-teardown
 liveness check into `read_<arm>.txt` and the quotable post-teardown one into
-`read_final_<arm>.txt`. Quote the latter, and only after checking that the two
-arms' `work point of this arm:` lines agree.
+`read_final_<arm>.txt`. Neither of those is a comparison: after both arms have
+run, the window's number comes from the `--against` invocation, which reads both
+final revisions itself and refuses rather than letting the work points be
+checked by eye.
 
 The `compute-cal` sub-arm is FALSIFIED and is not part of a measurement window
 any more. To test a replacement hit-rate model against it, derive coefficients

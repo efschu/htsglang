@@ -655,15 +655,19 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "(--rank-moe-ratio link-calibrated)"
         ),
         verdict=(
-            "FALSIFIED MODEL, and it LOSES to the uncalibrated solve it was "
-            "supposed to improve: 1.439x on the transfer term against 1.496x, "
-            "and -0.94 % end to end against -7.67 %, i.e. inside the "
-            "same-window A-vs-A floor of 4.09 % spread while the uncalibrated "
-            "arm is well outside it"
+            "FALSIFIED MODEL on exactly TWO load-bearing legs, and the "
+            "transfer term is NOT one of them. (1) END TO END: -0.94 % "
+            "against the baseline, inside the same-window A-vs-A floor of "
+            "4.09 % spread, while the uncalibrated arm is well outside it at "
+            "-7.67 %. (2) MECHANISM: see below. Work-matched, it reads "
+            "1.4573x on the transfer term against the uncalibrated 1.4253x "
+            "and slightly WINS that term; the earlier '1.439x against 1.496x' "
+            "divided two counters sampled at different work points and is "
+            "withdrawn (#482/#523)"
         ),
         gain=(
-            "removing the first-order traffic model's residual; predicted "
-            "1.498x against the uncalibrated arm's 1.411x"
+            "removing the first-order traffic model's residual; its predicted "
+            "1.498x is withdrawn with the pre-teardown revision"
         ),
         cost=(
             "a prior boot of the same recipe, spent on overloading whichever "

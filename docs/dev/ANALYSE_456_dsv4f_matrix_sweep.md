@@ -40,11 +40,16 @@ cells:
   only the bytes, onto the #82 expert-range mechanism. **Status: CONFIRMED
   2026-08-03, corridor-red.** The window
   (`/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`) measured
-  the clock rank at 192.7 s -> 128.8 s = **1.496x** on the transfer term,
-  ahead of the 1.411x its own model predicted for the resolved base plan
-  `30407,19080,19080`, and **-7.67 %** end-to-end against a same-window floor
-  of 4.09 %. The calibrated sub-arm was FALSIFIED in the same window (1.439x,
-  inside the floor end to end): a per-rank cold-traffic coefficient treats the
+  the clock rank at **1.4253x** on the transfer term, read work-matched off
+  both arms' final dump revisions, against the 1.411x its own model predicted
+  for the resolved base plan `30407,19080,19080`, and **-7.67 %** end-to-end
+  against a same-window floor of 4.09 %. (The 192.7 s -> 128.8 s = 1.496x this
+  paragraph carried is the PRE-TEARDOWN revision, ~5 % high because the two
+  arms' dumps land at different fractions of their runs; withdrawn per
+  #482/#523.) The calibrated sub-arm was FALSIFIED in the same window on its
+  END-TO-END leg (-0.94 %, inside the floor) and on its mechanism — NOT on the
+  transfer term, where work-matched it reads 1.4573x and slightly wins: a
+  per-rank cold-traffic coefficient treats the
   hit rate as a rank property and it tracks the owned range SIZE. Two things
   keep the cell from being closed: every arm ran outside the 400 MiB corridor
   (3080s at 211-251 MiB during load), so one green-corridor re-proof is owed

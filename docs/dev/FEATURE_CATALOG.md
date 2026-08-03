@@ -134,15 +134,15 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   `link` REFUSES while the coefficient variable is set rather than silently
   running the falsified solve — before #458 that env alone selected it.
   Registered in `planner/rejected.py` (`moe_link_calibrated_coefficients`).
-  **Not yet propagated into code (#482 was a docs/harness post).** The
-  pre-teardown numbers still stand in `server_args.py:2443-2456` (help text),
-  `planner/rejected.py:659-666` (verdict) and
-  `planner/expert_compute_placement.py`, and two assertions in
-  `test/registered/unit/layers/moe/test_expert_compute_placement_439.py` pin
-  the old strings (`"1.496x" in help_text`, `"1.439x" in entry.verdict`). Docs
-  and code disagree by design until a code+test post lands; the docs are the
-  corrected side. Same for `ROADMAP_456_matrix_execution.md:32-33` and
-  `ANALYSE_456_dsv4f_matrix_sweep.md:43-46`.
+  **Propagated into code in #523** (#482 was the docs/harness half): the help
+  text (`server_args.py:2450-2477`), the rejection verdict
+  (`planner/rejected.py:657-672`) and the module docstring + resolver strings
+  (`layers/moe/expert_compute_placement.py:74-89`, `:166`, `:847`, `:868`) now
+  carry the WORK-MATCHED figures and rest the rejection on the end-to-end and
+  mechanism legs only; the two test assertions that pinned `"1.496x"` /
+  `"1.439x"` now pin the corrected strings AND assert the withdrawn pair does
+  not reappear as a measurement. `ROADMAP_456_matrix_execution.md:32-33` and
+  `ANALYSE_456_dsv4f_matrix_sweep.md:43-46` are corrected in the same change.
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support. The replication+token-shard axis is
   NOT kv-head-count-gated: the predicate is
@@ -2017,6 +2017,29 @@ shapes the BUDGET, never a transient: it trades KV capacity for steady-state
 free memory and moves a peak not at all (runbook §4.5.4 items 4-7 carry the
 evidence, incl. "a corridor repair applies to every violating card, not the
 one the briefing named").
+
+**Work-matched counters are enforced, not advised (#523, rule from #482).**
+An ACCUMULATING counter (`h2d_bytes` above all) may only be divided by another
+arm's at a COMMON work point: each rank writes its #390 dump on its own 45 s
+timer, so a pre-teardown read catches an arm at whatever fraction of its run the
+last tick landed on, and the #439 green window's two arms sat at 96.8 % against
+91.9 % — a ~5 % gap that inflated the published transfer term from 1.4307x to
+1.5028x. `scripts/dev/394_s2_proof/read_arm.py --against <arm>` is now the ONLY
+path in that harness to a cross-arm number (per-rank H2D delta, group delta,
+transfer term, speedup); it REFUSES by name with a non-zero exit and prints no
+number at all on `non-final-revision` (an arm's own ranks disagree),
+`work-mismatch` (the arms sit at different work points, default tolerance 0.5 %,
+which is the window's own 0.424 % A-vs-A floor rounded once and BINDS in both
+directions), `missing-counter`, `rank-count-mismatch` and `link-count-mismatch`.
+The single-arm readout is unchanged and prints no ratio, so a silent comparison
+is unreachable. `test_work_matched_counters_523.py` (33 hermetic) pins the gate,
+the refusals, and the falsifier: the same real dumps with the gate disarmed
+reproduce the withdrawn 1.5028x to four decimals. What it does NOT cover, and
+the negative finding is deliberate: s12's cross-arm columns are per-batch
+medians and self-normalised shares, i.e. intensive, so the rule does not bind
+there — what can diverge silently is the WINDOW BASIS (`punkt_fenster` falls
+through to "the whole log incl. warmup" when punkte.jsonl has no request count),
+and `s12_log_analyse.fenster_basis_pruefen` now names that on stderr.
 
 **A floor round is one invocation, not three (#459, from #475 §6).**
 `s12_prefill_kurve.py --floor-draws N` runs the N A-vs-A draws back to back in
